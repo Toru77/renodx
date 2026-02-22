@@ -100,21 +100,3 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
   return color;
 }
 
-
-float3 GammaCorrectHuePreserving(float3 incorrect_color, float gamma = 2.2f) {
-  float3 ch = renodx::color::correct::GammaSafe(incorrect_color, false, gamma);
-
-  // return ch;
-  const float y_in = renodx::color::y::from::BT709(incorrect_color);
-  const float y_out = max(0, renodx::color::correct::Gamma(y_in, false, gamma));
-
-  float3 lum = incorrect_color * (y_in > 0 ? y_out / y_in : 0.f);
-
-  // use chrominance from channel gamma correction and apply hue shifting from per channel tonemap
-  // float3 result = renodx::color::correct::ChrominanceICtCp(lum, ch);
-  float3 result = renodx::color::correct::Chrominance(lum, ch);
-
-  return result;
-}
-
-

@@ -36,11 +36,11 @@ void main(
       renodx::draw::Config config = renodx::draw::BuildConfig();
 
       if (config.gamma_correction == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-          o0.rgb = GammaCorrectHuePreserving(o0.rgb, 2.2f);
+          o0.rgb = renodx::color::correct::GammaSafe(o0.rgb, false, 2.2f);
       } else if (config.gamma_correction == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-          o0.rgb = GammaCorrectHuePreserving(o0.rgb, 2.4f);
+          o0.rgb = renodx::color::correct::GammaSafe(o0.rgb, false, 2.4f);
       } else if (config.gamma_correction == 3.f) {
-          o0.rgb = GammaCorrectHuePreserving(o0.rgb, 2.3f);
+          o0.rgb = renodx::color::correct::GammaSafe(o0.rgb, false, 2.3f);
       } 
 
       float3 color = o0.rgb;

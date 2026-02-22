@@ -126,7 +126,10 @@ cbuffer shader_injection : register(b13) {
 // #define RENODX_INTERMEDIATE_ENCODING         shader_injection.intermediate_encoding
 // #define RENODX_SWAP_CHAIN_DECODING           shader_injection.swap_chain_decoding
 #define RENODX_INTERMEDIATE_ENCODING         1.f
-#define RENODX_SWAP_CHAIN_DECODING           1.f
+// ys10pn applies swap-chain style decoding in output_0x2388DAAC already.
+// Keep proxy decoding at NONE to avoid a latent double-decode path if proxy
+// passes are enabled later.
+#define RENODX_SWAP_CHAIN_DECODING           0.f
 #define RENODX_SWAP_CHAIN_GAMMA_CORRECTION   shader_injection.swap_chain_gamma_correction
 // #define RENODX_SWAP_CHAIN_DECODING_COLOR_SPACE shader_injection.swap_chain_decoding_color_space
 #define RENODX_SWAP_CHAIN_CUSTOM_COLOR_SPACE shader_injection.swap_chain_custom_color_space
