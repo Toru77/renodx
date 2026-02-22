@@ -623,11 +623,21 @@ foreach(FILE ${ADDON_FILES})
   target_include_directories(${ADDON} SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_include_directories(${ADDON} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include)
   #target_compile_definitions(${ADDON} PRIVATE _UNICODE)
-  set_target_properties(${ADDON}
-    PROPERTIES
-    PREFIX "renodx-"
-    SUFFIX ${TARGET_SUFFIX}
-  )
+  if(ADDON STREQUAL "kai" OR ADDON STREQUAL "kai-vanillaplus")
+    target_compile_options(${ADDON} PRIVATE /utf-8)
+    set_target_properties(${ADDON}
+      PROPERTIES
+      PREFIX ""
+      OUTPUT_NAME "kai-vanilla-plus"
+      SUFFIX ${TARGET_SUFFIX}
+    )
+  else()
+    set_target_properties(${ADDON}
+      PROPERTIES
+      PREFIX "renodx-"
+      SUFFIX ${TARGET_SUFFIX}
+    )
+  endif()
 endforeach()
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
