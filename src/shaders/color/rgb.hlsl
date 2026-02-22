@@ -79,6 +79,12 @@ static const float3x3 XYZ_TO_CAT97_LMS_MAT = float3x3(
     -0.8360f, +1.8327f, +0.0033f,
     +0.0357f, -0.0469f, +1.0112f);
 
+// Manually recomputed from CIE 1931 XYZ 1nm to Stockman 2deg 1nm 8dp with MB2 Weights
+static const float3x3 XYZ_TO_STOCKMAN_SHARP_LMS_MAT = float3x3(
+    0.185082982238733f, 0.584081279463687f, -0.0240722415044404f,
+    -0.134433056469973f, 0.405752392775348f, 0.0358252602217631f,
+    0.000789456671966863f, -0.000912281325916184f, 0.0198490812339463f);
+
 // Stockman & Sharpe 2 degree
 static const float3x3 XYZf_TO_STOCKMAN_SHARP_LMS_MAT = float3x3(
     1.94735469f, -1.41445123f, 0.36476327f,
@@ -214,6 +220,12 @@ static const float3 BOURGIN_D65_Y = float3(0.222015, 0.706655, 0.071330);
 // 1931 2 degree standard observer
 static const float2 WHITE_POINT_D65 = float2(0.31272, 0.32903);
 
+// https://www.arri.com/resource/blob/31918/66f56e6abb6e5b6553929edf9aa7483e/2017-03-alexa-logc-curve-in-vfx-data.pdf
+static const float3x3 ALEXA_WIDE_GAMUT_TO_BT709_MAT = float3x3(
+    1.485007, -0.401216, -0.083791,
+    -0.033732, 1.282887, -0.249155,
+    0.010776, -0.122018, 1.111242);
+
 namespace xyz {
 namespace from {
 float3 xyY(float3 xyY) {
@@ -228,6 +240,10 @@ float3 xyY(float3 xyY) {
 
 float3 BT709(float3 bt709) {
   return mul(BT709_TO_XYZ_MAT, bt709);
+}
+
+float3 BT2020(float3 bt2020) {
+  return mul(BT2020_TO_XYZ_MAT, bt2020);
 }
 
 }  // namespace from
@@ -308,6 +324,10 @@ float3 BT709(float3 bt709) {
 
 float3 AP1(float3 ap1) {
   return mul(AP1_TO_BT2020_MAT, ap1);
+}
+
+float3 XYZ(float3 XYZ) {
+  return mul(XYZ_TO_BT2020_MAT, XYZ);
 }
 
 }  // namespace from
