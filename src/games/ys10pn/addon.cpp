@@ -22,8 +22,6 @@ namespace {
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x2388DAAC),  // output
     CustomShaderEntry(0x557E2C4E),  // post
-    CustomShaderEntry(0x271EE07C),  // godray blur
-    CustomShaderEntry(0x4B9BED15),  // godray composite
 };
 
 ShaderInjectData shader_injection;
