@@ -19,6 +19,70 @@
 
 namespace {
 
+constexpr uint32_t kSkipResourceUpgradeShader = 0x976FCD64u;
+
+bool UseVanillaRenderTargetsForDraw(reshade::api::command_list* cmd_list) {
+  auto& rtvs = renodx::utils::swapchain::GetRenderTargets(cmd_list);
+  if (rtvs.empty()) return true;
+
+  bool changed = false;
+  for (const auto& rtv : rtvs) {
+    if (rtv.handle == 0u) continue;
+    auto* view_info = renodx::utils::resource::GetResourceViewInfo(rtv);
+    if (view_info == nullptr || view_info->resource_info == nullptr) continue;
+    auto* target = view_info->resource_info->clone_target;
+    if (target == nullptr) continue;
+    if (target->usage_include != reshade::api::resource_usage::render_target) continue;
+    if (target->old_format != reshade::api::format::r8g8b8a8_unorm
+        || target->new_format != reshade::api::format::r16g16b16a16_float) {
+      continue;
+    }
+    if (renodx::mods::swapchain::DeactivateCloneHotSwap(cmd_list->get_device(), rtv)) {
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    renodx::mods::swapchain::RewriteRenderTargets(
+        cmd_list,
+        static_cast<uint32_t>(rtvs.size()),
+        rtvs.data(),
+        renodx::utils::swapchain::GetDepthStencil(cmd_list));
+  }
+
+  return true;
+}
+
+void RestoreUpgradedRenderTargetsAfterDraw(reshade::api::command_list* cmd_list) {
+  auto& rtvs = renodx::utils::swapchain::GetRenderTargets(cmd_list);
+  if (rtvs.empty()) return;
+
+  bool changed = false;
+  for (const auto& rtv : rtvs) {
+    if (rtv.handle == 0u) continue;
+    auto* view_info = renodx::utils::resource::GetResourceViewInfo(rtv);
+    if (view_info == nullptr || view_info->resource_info == nullptr) continue;
+    auto* target = view_info->resource_info->clone_target;
+    if (target == nullptr) continue;
+    if (target->usage_include != reshade::api::resource_usage::render_target) continue;
+    if (target->old_format != reshade::api::format::r8g8b8a8_unorm
+        || target->new_format != reshade::api::format::r16g16b16a16_float) {
+      continue;
+    }
+    if (renodx::mods::swapchain::ActivateCloneHotSwap(cmd_list->get_device(), rtv)) {
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    renodx::mods::swapchain::RewriteRenderTargets(
+        cmd_list,
+        static_cast<uint32_t>(rtvs.size()),
+        rtvs.data(),
+        renodx::utils::swapchain::GetDepthStencil(cmd_list));
+  }
+}
+
 renodx::mods::shader::CustomShaders custom_shaders = {
     // post shaders
     CustomShaderEntry(0x06CB76E4),  // post with glow, filter
@@ -37,7 +101,15 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xF9769AB8),  // post with glow, filter, monotone, fade color
     // UI shaders (saturate output for R8->R16 upgrade)
     CustomShaderEntry(0xA8859457),  // UI: tex * vertex color + specular
-    CustomShaderEntry(0x976FCD64),  // UI: tex * vertex color + specular + alpha threshold
+    {
+        kSkipResourceUpgradeShader,
+        {
+            .crc32 = kSkipResourceUpgradeShader,
+            .code = __0x976FCD64,
+            .on_draw = &UseVanillaRenderTargetsForDraw,
+            .on_drawn = &RestoreUpgradedRenderTargetsAfterDraw,
+        },
+    },                              // UI: tex * vertex color + specular + alpha threshold (keep RTV vanilla)
     CustomShaderEntry(0x1EE56570),  // UI: tex * vertex color + specular + depth alpha
     CustomShaderEntry(0x91F42481),  // UI: minimap
     CustomShaderEntry(0x3A2360B2),  // output: color buffer passthrough
@@ -750,12 +822,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       }
 
       // Resource Upgrade
-    renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
-            .old_format = reshade::api::format::r8g8b8a8_unorm,
-            .new_format = reshade::api::format::r16g16b16a16_float,
-            .aspect_ratio = renodx::mods::swapchain::SwapChainUpgradeTarget::BACK_BUFFER,
-            .usage_include = reshade::api::resource_usage::render_target
-        });
+      renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+          .old_format = reshade::api::format::r8g8b8a8_unorm,
+          .new_format = reshade::api::format::r16g16b16a16_float,
+          .use_resource_view_cloning = true,
+          .aspect_ratio = renodx::mods::swapchain::SwapChainUpgradeTarget::BACK_BUFFER,
+          .usage_include = reshade::api::resource_usage::render_target,
+      });
 
       break;
     case DLL_PROCESS_DETACH:
