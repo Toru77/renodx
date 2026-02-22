@@ -219,7 +219,7 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 
-#include "./kai-vanillaplıs.h"
+#include "./kai-vanillaplus.h"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -287,11 +287,12 @@ static float ComputeScreenSpaceShadowBend(float2 uv, float3 normalWS)
   float2 stepUV = (-lightViewXY * rsqrt(lightLenSq)) * invVPSize_g.xy;
 
   // Small per-pixel jitter to reduce regular banding.
-  float jitter = 0.0;
+  float jitter = dot(uv * vpSize_g.xy, float2(0.0671105608, 0.00583714992));
   if (useJitter) {
-    jitter = dot(uv * vpSize_g.xy, float2(0.0671105608, 0.00583714992)) + (sceneTime_g * 77.0);
-    jitter = frac(52.9829178 * frac(jitter));
+    jitter += (sceneTime_g * 77.0);
   }
+  jitter = frac(jitter);
+  jitter = frac(52.9829178 * jitter);
   float2 sampleUV = uv + stepUV * (2.0 + jitter);
 
   float depthThickness = max(abs(SSS_FAR_DEPTH_VALUE - startDepth) * surfaceThickness, 1e-5);
@@ -796,15 +797,15 @@ void main(
         r21.xy = r16.ww ? r21.xy : 0;
         if (shadow_use_jitter) {
           // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-          r16.w = frac(r16.w);
-          r16.w = 52.9829178 * r16.w;
-          r16.w = frac(r16.w);
-          r16.w = 6.28318548 * r16.w;
+          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992))+ (sceneTime_g * 77.0);
         } else {
           r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
         }
-        r22.z = 2;
+        r16.w = frac(r16.w);
+        r16.w = 52.9829178 * r16.w;
+        r16.w = frac(r16.w);
+        r16.w = 6.28318548 * r16.w;
+        r22.z = 1;
         r21.zw = r21.xy;
         r17.w = 0;
         while (true) {
@@ -982,17 +983,17 @@ void main(
       r21.zw = r16.ww ? r21.zw : 0;
       if (shadow_use_jitter) {
         // add jitter to shadow filtering
-        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        r16.w = frac(r16.w);
-        r16.w = 52.9829178 * r16.w;
-        r16.w = frac(r16.w);
-        r16.w = 6.28318548 * r16.w;
+        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992)) + (sceneTime_g * 77.0);
       } else {
-        r16.w = 0;
+        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
       }
+      r16.w = frac(r16.w);
+      r16.w = 52.9829178 * r16.w;
+      r16.w = frac(r16.w);
+      r16.w = 6.28318548 * r16.w;
       r22.z = r20.w;
-      r23.xy = r21.zw;
       r17.w = 0;
+      r18.w = 0;
       while (true) {
         r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
         if (r18.w != 0) break;
