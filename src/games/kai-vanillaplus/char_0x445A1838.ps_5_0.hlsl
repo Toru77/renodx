@@ -86,7 +86,7 @@ Texture2D<float4> depthTexture : register(t0);
 Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<float4> prevTexture : register(t3);
 
-#include "./kai-vanillaplıs.h"
+#include "./kai-vanillaplus.h"
 
 // 3Dmigoto declarations
 #define cmp -

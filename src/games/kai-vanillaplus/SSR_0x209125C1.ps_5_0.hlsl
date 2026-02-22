@@ -73,7 +73,7 @@ Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<uint4> mrtTexture1 : register(t3);
 Texture2D<float4> prevSSRTexture : register(t4);
 
-#include "./kai-vanillaplıs.h"
+#include "./kai-vanillaplus.h"
 
 
 // 3Dmigoto declarations

@@ -14,7 +14,7 @@
 
 #include "../../mods/shader.hpp"
 #include "../../utils/settings.hpp"
-#include "./kai-vanillaplıs.h"
+#include "./kai-vanillaplus.h"
 
 namespace {
 
