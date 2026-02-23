@@ -60,7 +60,7 @@ void main(
   float3 color = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).rgb;
   float4 filterTex = FilterTexture.SampleLevel(LinearClampSampler_s, w1.xy, 0);
 
-  o0.rgb = ApplyRenoDX_FilterDof(color, glare, filterTex.rgb * FilterColor.rgb, filterTex.a,
+  o0.rgb = ApplyRenoDX_FilterDof(color, glare, filterTex.rgb * FilterColor.rgb, filterTex.a * FilterColor.a,
                                  dofFactor, ToneFactor.xxx, GlowIntensity.w);
   o0.a = 1.0;
 }

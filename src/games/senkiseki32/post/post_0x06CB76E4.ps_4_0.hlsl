@@ -56,7 +56,7 @@ void main(
           color, 
           glare, 
           filterTex.rgb * FilterColor.rgb, 
-          filterTex.a, 
+          filterTex.a * FilterColor.a, 
           ToneFactor.xxx, 
           GlowIntensity.w
       );

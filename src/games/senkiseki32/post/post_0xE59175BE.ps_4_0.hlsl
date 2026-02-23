@@ -39,6 +39,13 @@ Texture2D<float4> FadingTexture : register(t2);
 // 3Dmigoto declarations
 #define cmp -
 
+float3 ApplySmartFadeBlendSrgb(float3 sceneSrgb, float3 fadeSrgb, float fadeAmount)
+{
+  float3 sceneLinear = renodx::color::srgb::DecodeSafe(sceneSrgb);
+  float3 blendedLinear = _MultiplyBlendSrgb(sceneLinear, fadeSrgb, fadeAmount);
+  return renodx::color::srgb::EncodeSafe(blendedLinear);
+}
+
 
 void main(
   float4 v0 : SV_POSITION0,
@@ -50,7 +57,21 @@ void main(
   float3 color = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).rgb;
   float4 fadeTex = FadingTexture.SampleLevel(LinearClampSampler_s, v1.xy, 0);
 
-  o0.rgb = ApplyRenoDX_FadeTex(color, glare, ToneFactor.xxx, GlowIntensity.w,
-                               fadeTex.rgb, fadeTex.a, FadingColor);
+  // Match vanilla math exactly in SDR/gamma space.
+  float3 scene = color * ToneFactor.xxx + glare * GlowIntensity.w;
+  if (shader_injection.debug_disable_fading == 0.f) {
+    float fadeMask = FadingColor.w * fadeTex.a;
+    float3 fadeTarget = fadeTex.rgb * FadingColor.rgb;
+    scene = ApplySmartFadeBlendSrgb(scene, fadeTarget, fadeMask);
+  }
+
+  if (shader_injection.tone_map_type == 0.f) {
+    o0.rgb = scene;
+  } else {
+    // Preserve SDR transition behavior, then apply HDR tonemapping.
+    float3 linearScene = renodx::color::srgb::DecodeSafe(scene);
+    o0.rgb = _Tonemap(linearScene);
+    o0.rgb = renodx::draw::RenderIntermediatePass(o0.rgb);
+  }
   o0.a = 1.0;
 }

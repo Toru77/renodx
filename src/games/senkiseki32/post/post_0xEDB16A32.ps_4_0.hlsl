@@ -49,9 +49,10 @@ void main(
   float3 glare = GlareBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).rgb;
   float3 color = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).rgb;
   float4 fadeTex = FadingTexture.SampleLevel(LinearClampSampler_s, v1.xy, 0);
+  float fadeMask = fadeTex.a;
 
   o0.rgb = ApplyRenoDX_MonoFadeTex(color, glare, ToneFactor.xxx, GlowIntensity.w,
                                    MonotoneMul, MonotoneAdd,
-                                   fadeTex.rgb, fadeTex.a, FadingColor);
+                                   fadeTex.rgb, fadeMask, FadingColor);
   o0.a = 1.0;
 }
