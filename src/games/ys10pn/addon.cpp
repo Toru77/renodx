@@ -19,12 +19,14 @@
 
 namespace {
 
+ShaderInjectData shader_injection;
+
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x2388DAAC),  // output
     CustomShaderEntry(0x557E2C4E),  // post
+    CustomShaderEntry(0x44DFE546),  // ui brightness
+    CustomShaderEntry(0x36B738AD),  // ui secondary
 };
-
-ShaderInjectData shader_injection;
 
 float current_settings_mode = 0;
 
