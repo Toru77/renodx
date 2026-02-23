@@ -303,6 +303,22 @@ renodx::utils::settings::Settings settings = {
             "JPN CRT",
         },
     },
+     new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = " - Please enable Native HDR in game! In game sliders don't work, use RenoDX. \r\n - Addon made by Toru. Thanks to Shortfuse and the community.",
+        .section = "Notes",
+    },
+
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Get more RenoDX mods!",
+        .section = "About",
+        .group = "button-line-1",
+        .tint = 0x5865F2,
+        .on_change = []() {
+          system("start https://github.com/clshortfuse/renodx/wiki/Mods");
+        },
+    },
 };
 
 void OnPresetOff() {
