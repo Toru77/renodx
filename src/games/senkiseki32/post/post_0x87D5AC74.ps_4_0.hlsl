@@ -51,9 +51,10 @@ void main(
   float3 color = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).rgb;
   float4 filterTex = FilterTexture.SampleLevel(LinearClampSampler_s, w1.xy, 0);
   float4 fadeTex = FadingTexture.SampleLevel(LinearClampSampler_s, v1.xy, 0);
+  float fadeMask = fadeTex.a;
 
-  o0.rgb = ApplyRenoDX_FilterFadeTex(color, glare, filterTex.rgb * FilterColor.rgb, filterTex.a,
+  o0.rgb = ApplyRenoDX_FilterFadeTex(color, glare, filterTex.rgb * FilterColor.rgb, filterTex.a * FilterColor.a,
                                      ToneFactor.xxx, GlowIntensity.w,
-                                     fadeTex.rgb, fadeTex.a, FadingColor);
+                                     fadeTex.rgb, fadeMask, FadingColor);
   o0.a = 1.0;
 }

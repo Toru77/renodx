@@ -1,5 +1,6 @@
 #include "./shared.h"
 #include "./DICE.hlsl"
+#include "./macleod_boynton.hlsli"
 
 // --- SAFETY CLAMP (The Fix) ---
 // This function cleans up "illegal" pixels before they hit the Tone Mapper.
@@ -22,6 +23,22 @@ float3 Sanitize(float3 color)
 
 // --- INTERNAL HELPERS ---
 
+float3 _CorrectHueMacLeodBoynton(float3 color, float3 reference_color)
+{
+    if (RENODX_TONE_MAP_TYPE == 0.f) return color;
+    if (RENODX_TONE_MAP_HUE_CORRECTION <= 0.f) return color;
+
+    float hue_correction_strength = saturate(RENODX_TONE_MAP_HUE_CORRECTION);
+    return CorrectHueAndPurityMBGated(
+        color,
+        reference_color,
+        hue_correction_strength,
+        0.5f,
+        2.f,
+        hue_correction_strength,
+        1.f);
+}
+
 float3 _CombineScene(float3 color, float3 glare, float3 toneFactor, float glowIntensity)
 {
     color = renodx::color::srgb::DecodeSafe(color);
@@ -29,20 +46,24 @@ float3 _CombineScene(float3 color, float3 glare, float3 toneFactor, float glowIn
     return (color * toneFactor) + (glare * glowIntensity);
 }
 
+float3 _MultiplyBlendSrgb(float3 sceneColor, float3 tintColorSrgb, float blendFactor)
+{
+    blendFactor = saturate(blendFactor);
+    float3 tintColor = renodx::color::srgb::DecodeSafe(tintColorSrgb);
+    return sceneColor + (sceneColor * tintColor * blendFactor);
+}
+
 float3 _SmartBlendFilter(float3 sceneColor, float3 filterColor, float mixFactor)
 {
     if (shader_injection.debug_disable_filter != 0.f) return sceneColor;
-    filterColor = renodx::color::srgb::DecodeSafe(filterColor);
-    float3 tint = filterColor * mixFactor;
-    return sceneColor + (sceneColor * tint);
+    return _MultiplyBlendSrgb(sceneColor, filterColor, mixFactor);
 }
 
 float3 _SmartBlendFilterDof(float3 sceneColor, float3 filterColor, float mixFactor, float dofFactor)
 {
     if (shader_injection.debug_disable_filter != 0.f) return sceneColor;
-    filterColor = renodx::color::srgb::DecodeSafe(filterColor);
-    float3 tint = filterColor * mixFactor * dofFactor;
-    return sceneColor + (sceneColor * tint);
+    dofFactor = saturate(dofFactor);
+    return _MultiplyBlendSrgb(sceneColor, filterColor, mixFactor * dofFactor);
 }
 
 float3 _ApplyMonotone(float3 color, float4 monotoneMul, float4 monotoneAdd)
@@ -55,27 +76,34 @@ float3 _ApplyMonotone(float3 color, float4 monotoneMul, float4 monotoneAdd)
 float3 _Tonemap(float3 color)
 {
     color = Sanitize(color);
+    float3 hue_reference_color = renodx::tonemap::Reinhard(max(0.f, color));
 
     if (shader_injection.tone_map_type == 1.f) {
         color = DICEToneMap(color);
-        return color;
+        return _CorrectHueMacLeodBoynton(color, hue_reference_color);
     }
 
-    color = renodx::draw::ToneMapPass(color);
-    return color;
+    renodx::draw::Config draw_config = renodx::draw::BuildConfig();
+    // Disable RenoDRT internal hue correction/shift so MB is the only hue path.
+    draw_config.tone_map_hue_correction = 0.f;
+    draw_config.tone_map_hue_shift = 0.f;
+    color = renodx::draw::ToneMapPass(color, draw_config);
+    return _CorrectHueMacLeodBoynton(color, hue_reference_color);
 }
 
 float3 _FadeColor(float3 color, float4 fadingColor)
 {
     if (shader_injection.debug_disable_fading != 0.f) return color;
-    return lerp(color, fadingColor.rgb, fadingColor.w);
+    float fadeAlpha = saturate(fadingColor.w);
+    float3 fadeTarget = renodx::color::srgb::DecodeSafe(fadingColor.rgb);
+    return lerp(color, fadeTarget, fadeAlpha);
 }
 
 float3 _FadeTex(float3 color, float3 fadingTexRGB, float fadingTexA, float4 fadingColor)
 {
     if (shader_injection.debug_disable_fading != 0.f) return color;
-    float3 fadeTarget = fadingTexRGB * fadingColor.rgb;
-    float fadeAlpha = fadingColor.w * fadingTexA;
+    float fadeAlpha = saturate(fadingColor.w * fadingTexA);
+    float3 fadeTarget = renodx::color::srgb::DecodeSafe(fadingTexRGB * fadingColor.rgb);
     return lerp(color, fadeTarget, fadeAlpha);
 }
 
@@ -113,8 +141,8 @@ float3 ApplyRenoDX_FadeColor(float3 color, float3 glare, float3 toneFactor, floa
                              float4 fadingColor)
 {
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
-    scene = _Tonemap(scene);
     scene = _FadeColor(scene, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -123,8 +151,8 @@ float3 ApplyRenoDX_FadeTex(float3 color, float3 glare, float3 toneFactor, float 
                            float3 fadingTexRGB, float fadingTexA, float4 fadingColor)
 {
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
-    scene = _Tonemap(scene);
     scene = _FadeTex(scene, fadingTexRGB, fadingTexA, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -134,8 +162,8 @@ float3 ApplyRenoDX_MonoFadeColor(float3 color, float3 glare, float3 toneFactor, 
 {
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
     scene = _ApplyMonotone(scene, monotoneMul, monotoneAdd);
-    scene = _Tonemap(scene);
     scene = _FadeColor(scene, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -150,7 +178,6 @@ float3 ApplyRenoDX_MonoFadeColor_Vanilla(float3 color, float3 glare, float3 tone
     // Decode to linear for HDR tonemapping
     scene = renodx::color::srgb::DecodeSafe(scene);
     scene = _Tonemap(scene);
-    // Fade after tonemap (matching vanilla order)
     scene = _FadeColor(scene, fadingColor);
     return renodx::draw::RenderIntermediatePass(scene);
 }
@@ -162,8 +189,8 @@ float3 ApplyRenoDX_MonoFadeTex(float3 color, float3 glare, float3 toneFactor, fl
 {
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
     scene = _ApplyMonotone(scene, monotoneMul, monotoneAdd);
-    scene = _Tonemap(scene);
     scene = _FadeTex(scene, fadingTexRGB, fadingTexA, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -185,8 +212,8 @@ float3 ApplyRenoDX_FilterFadeColor(float3 color, float3 glare, float3 filterColo
 {
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
     scene = _SmartBlendFilter(scene, filterColor, mixFactor);
-    scene = _Tonemap(scene);
     scene = _FadeColor(scene, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -197,8 +224,8 @@ float3 ApplyRenoDX_FilterFadeTex(float3 color, float3 glare, float3 filterColor,
 {
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
     scene = _SmartBlendFilter(scene, filterColor, mixFactor);
-    scene = _Tonemap(scene);
     scene = _FadeTex(scene, fadingTexRGB, fadingTexA, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -210,8 +237,8 @@ float3 ApplyRenoDX_FilterMonoFadeColor(float3 color, float3 glare, float3 filter
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
     scene = _SmartBlendFilter(scene, filterColor, mixFactor);
     scene = _ApplyMonotone(scene, monotoneMul, monotoneAdd);
-    scene = _Tonemap(scene);
     scene = _FadeColor(scene, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -224,8 +251,8 @@ float3 ApplyRenoDX_FilterMonoFadeTex(float3 color, float3 glare, float3 filterCo
     float3 scene = _CombineScene(color, glare, toneFactor, glowIntensity);
     scene = _SmartBlendFilter(scene, filterColor, mixFactor);
     scene = _ApplyMonotone(scene, monotoneMul, monotoneAdd);
-    scene = _Tonemap(scene);
     scene = _FadeTex(scene, fadingTexRGB, fadingTexA, fadingColor);
+    scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
 
@@ -244,11 +271,10 @@ float3 ApplyRenoDX_FilterDofFadeTex_Vanilla(float3 color, float3 glare, float3 f
                                             float dofFactor, float3 toneFactor, float glowIntensity,
                                             float3 fadingTexRGB, float fadingTexA, float4 fadingColor)
 {
-    // Apply fade in gamma space (matching vanilla order — before decode)
     float3 scene = color * toneFactor + glare * glowIntensity;
     if (shader_injection.debug_disable_fading == 0.f) {
         float3 fadeTarget = fadingTexRGB * fadingColor.rgb;
-        float fadeAlpha = fadingColor.w * fadingTexA;
+        float fadeAlpha = saturate(fadingColor.w * fadingTexA);
         scene = lerp(scene, fadeTarget, fadeAlpha);
     }
     // Decode to linear, then apply filter via proven smart blend
@@ -257,3 +283,5 @@ float3 ApplyRenoDX_FilterDofFadeTex_Vanilla(float3 color, float3 glare, float3 f
     scene = _Tonemap(scene);
     return renodx::draw::RenderIntermediatePass(scene);
 }
+
+

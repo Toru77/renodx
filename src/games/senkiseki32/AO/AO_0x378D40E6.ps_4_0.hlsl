@@ -1,4 +1,5 @@
 // ---- Created with 3Dmigoto v1.4.1 on Mon Feb 16 23:43:56 2026
+#include "../shared.h"
 #define cmp -
 
 cbuffer _Globals : register(b0)
@@ -30,7 +31,6 @@ cbuffer _Globals : register(b0)
   float GlobalTexcoordFactor : packoffset(c29);
 }
 
-#include "./shared.h"
 
 SamplerState LinearClampSampler_s : register(s0);
 Texture2D<float4> AOBuffer : register(t0);

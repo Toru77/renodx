@@ -50,7 +50,7 @@ void main(
   float3 color = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).rgb;
   float4 filterTex = FilterTexture.SampleLevel(LinearClampSampler_s, w1.xy, 0);
 
-  o0.rgb = ApplyRenoDX_FilterMonoFadeColor(color, glare, filterTex.rgb * FilterColor.rgb, filterTex.a,
+  o0.rgb = ApplyRenoDX_FilterMonoFadeColor(color, glare, filterTex.rgb * FilterColor.rgb, filterTex.a * FilterColor.a,
                                            ToneFactor.xxx, GlowIntensity.w,
                                            MonotoneMul, MonotoneAdd, FadingColor);
   o0.a = 1.0;
