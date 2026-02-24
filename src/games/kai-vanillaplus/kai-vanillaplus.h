@@ -3,18 +3,6 @@
 
 // Must remain 32-bit aligned for shader injection push constants.
 struct SssInjectData {
-  // Screen Space Shadows (lighting_0x430ED091)
-  float sss_enabled;
-  float sss_sample_count;
-  float sss_hard_shadow_samples;
-  float sss_fade_out_samples;
-  float sss_surface_thickness;
-  float sss_shadow_contrast;
-  float sss_light_screen_fade_start;
-  float sss_light_screen_fade_end;
-  float sss_min_occluder_depth_scale;
-  float sss_jitter_enabled;
-
   // Character Shadowing (char_0x445A1838)
   float char_shadow_mode;
   float char_shadow_sample_count;

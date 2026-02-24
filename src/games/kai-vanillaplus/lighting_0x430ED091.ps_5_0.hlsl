@@ -224,131 +224,6 @@ Texture2D<float4> texMirror_g : register(t21);
 // 3Dmigoto declarations
 #define cmp -
 
-// Bend-style screen-space directional shadowing adapted for this deferred PS.
-// Uses only resources already bound by this shader.
-//
-// Screen Space Shadow tuning (in-game):
-// - Increase sample count for longer shadow reach and less noise; decrease for lower cost and shorter reach.
-// - Increase hard samples for stronger contact shadows; decrease to reduce near-contact aliasing/shimmer.
-// - Increase fade-out samples to soften the far-end cutoff; decrease for a sharper tail and slightly darker far shadows.
-// - Increase surface thickness if thin casters fail to shadow; decrease if shadows feel too thick or bleed onto neighbors.
-// - Increase shadow contrast for darker/crisper transitions; decrease for softer/lighter transitions.
-// Reversed-Z far depth value from this game's depth setup; keep unless projection/depth setup changes.
-static const float SSS_FAR_DEPTH_VALUE = 0.0;
-
-static float ComputeScreenSpaceShadowBend(float2 uv, float3 normalWS)
-{
-  if (sss_injection_data.sss_enabled < 0.5) {
-    return 1.0;
-  }
-
-  int sampleCount = max((int)round(sss_injection_data.sss_sample_count), 1);
-  int hardShadowSamples = clamp((int)round(sss_injection_data.sss_hard_shadow_samples), 0, sampleCount);
-  int fadeOutSamples = clamp((int)round(sss_injection_data.sss_fade_out_samples), 0, sampleCount);
-  if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
-    fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
-  }
-
-  float surfaceThickness = max(sss_injection_data.sss_surface_thickness, 1e-5);
-  float shadowContrast = max(sss_injection_data.sss_shadow_contrast, 0.0);
-  float fadeStart = min(sss_injection_data.sss_light_screen_fade_start, sss_injection_data.sss_light_screen_fade_end);
-  float fadeEnd = max(sss_injection_data.sss_light_screen_fade_start, sss_injection_data.sss_light_screen_fade_end);
-  float minOccluderDepthScale = max(sss_injection_data.sss_min_occluder_depth_scale, 0.0);
-  bool useJitter = sss_injection_data.sss_jitter_enabled >= 0.5;
-
-  float startDepth = depthTexture.SampleLevel(samPoint_s, uv, 0).x;
-  if (startDepth <= SSS_FAR_DEPTH_VALUE) {
-    return 1.0;
-  }
-
-  float3 lightToPixel = normalize(lightDirection_g.xyz);
-  float3 pixelToLight = -lightToPixel;
-  float ndotl = saturate(dot(normalWS, pixelToLight));
-  if (ndotl <= 0.001) {
-    return 1.0;
-  }
-
-  float2 lightViewXY;
-  lightViewXY.x = dot(lightDirection_g.xyz, view_g._m00_m10_m20);
-  lightViewXY.y = dot(lightDirection_g.xyz, view_g._m01_m11_m21);
-  float lightLenSq = dot(lightViewXY, lightViewXY);
-  if (lightLenSq <= 1e-6) {
-    return 1.0;
-  }
-
-  float lightScreenLen = sqrt(lightLenSq);
-  float lightScreenFade = saturate((lightScreenLen - fadeStart) /
-                                   max(fadeEnd - fadeStart, 1e-5));
-  if (lightScreenFade <= 0.001) {
-    return 1.0;
-  }
-
-  // March toward the light source (opposite projected light direction).
-  float2 stepUV = (-lightViewXY * rsqrt(lightLenSq)) * invVPSize_g.xy;
-
-  // Small per-pixel jitter to reduce regular banding.
-  float jitter = dot(uv * vpSize_g.xy, float2(0.0671105608, 0.00583714992));
-  if (useJitter) {
-    jitter += (sceneTime_g * 77.0);
-  }
-  jitter = frac(jitter);
-  jitter = frac(52.9829178 * jitter);
-  float2 sampleUV = uv + stepUV * (2.0 + jitter);
-
-  float depthThickness = max(abs(SSS_FAR_DEPTH_VALUE - startDepth) * surfaceThickness, 1e-5);
-  float2 receiverDepthSlope = float2(ddx(startDepth), ddy(startDepth));
-  float hardShadow = 1.0;
-  float4 shadowValue = 1.0;
-  int validSamples = 0;
-
-  [loop]
-  for (int i = 0; i < sampleCount; ++i) {
-    sampleUV += stepUV;
-
-    if (sampleUV.x <= invVPSize_g.x || sampleUV.y <= invVPSize_g.y ||
-        sampleUV.x >= (1.0 - invVPSize_g.x) || sampleUV.y >= (1.0 - invVPSize_g.y)) {
-      break;
-    }
-
-    validSamples++;
-
-    float sampleDepth = depthTexture.SampleLevel(samPoint_s, sampleUV, 0).x;
-    float shadowSample = 1.0;
-
-    // Compensate for receiver-plane slope so camera pitch doesn't inflate false occluders.
-    float2 sampleOffsetPx = (sampleUV - uv) * vpSize_g.xy;
-    float expectedDepth = startDepth + dot(receiverDepthSlope, sampleOffsetPx);
-
-    // Reversed Z: larger depth values are closer to camera.
-    float depthDelta = sampleDepth - expectedDepth;
-    if (depthDelta > (depthThickness * minOccluderDepthScale)) {
-      // Center matching around one "thickness" offset (prevents self-shadow from near-zero deltas).
-      float depthMatch = abs(depthDelta / depthThickness - 1.0);
-      shadowSample = saturate(depthMatch * shadowContrast + (1.0 - shadowContrast));
-    }
-
-    if (i < hardShadowSamples) {
-      hardShadow = min(hardShadow, shadowSample);
-    } else {
-      if (i >= (sampleCount - fadeOutSamples)) {
-        float fadeOut = (float)(i + 1 - (sampleCount - fadeOutSamples)) / (float)(fadeOutSamples + 1) * 0.75;
-        shadowSample = saturate(shadowSample + fadeOut);
-      }
-      int bucket = i & 3;
-      if (bucket == 0) shadowValue.x = min(shadowValue.x, shadowSample);
-      if (bucket == 1) shadowValue.y = min(shadowValue.y, shadowSample);
-      if (bucket == 2) shadowValue.z = min(shadowValue.z, shadowSample);
-      if (bucket == 3) shadowValue.w = min(shadowValue.w, shadowSample);
-    }
-  }
-
-  float result = dot(shadowValue, 0.25);
-  result = min(result, hardShadow);
-  float validSampleFade = saturate((float)validSamples / (float)sampleCount);
-  validSampleFade = validSampleFade * validSampleFade;
-  return lerp(1.0, result, ndotl * lightScreenFade * validSampleFade);
-}
-
 void main(
   float4 v0 : SV_Position0,
   float4 v1 : TEXCOORD0,
@@ -763,7 +638,6 @@ void main(
   r18.xyz = r17.xyz * r3.yyy;
   r6.w = r8.w * r3.z;
   r7.z = dot(r5.xyw, r18.xyz);
-  bool sss_directional_light_active = (((uint)r1.x & 1u) != 0u);
   r19.xyzw = (int4)r1.xxxx & int4(1,2,4,16);
   if (r19.x != 0) {
     r16.xyz = -r16.xyz + r2.xyz;
@@ -1157,9 +1031,6 @@ void main(
     }
   } else {
     r8.w = 1;
-  }
-  if (sss_directional_light_active) {
-    r8.w = r8.w * ComputeScreenSpaceShadowBend(v1.xy, r5.xyw);
   }
   r16.xyz = r17.xyz * r3.yyy + -lightDirection_g.xyz;
   r7.w = dot(r16.xyz, r16.xyz);
