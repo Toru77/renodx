@@ -27,7 +27,15 @@ struct SssInjectData {
   float ssgi_pow;
 
   // SSR controls (SSR_0x209125C1)
-  float ssr_ray_count_mode;
+  float ssr_mode;
+  float ssr_ray_count_scale;
+
+  float ssr_temporal_clamp_enable;
+  float ssr_temporal_clamp_radius;
+  float ssr_temporal_clamp_strength;
+
+  float ssr_temporal_jitter_enable;
+  float ssr_temporal_jitter_amount;
 
   float padding;
 };
