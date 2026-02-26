@@ -1,5 +1,4 @@
-// Fixed by Gemini for DLS_0x430ED091.ps_5_0
-// Based on assembly reconstruction
+// ---- Created with 3Dmigoto v1.4.1 on Thu Feb 26 13:41:21 2026
 
 struct DeferredParam
 {
@@ -193,11 +192,9 @@ cbuffer cb_deferred : register(b4)
 
 SamplerState samPoint_s : register(s0);
 SamplerState samLinear_s : register(s1);
-SamplerState SmplMirror_s : register(s12);
 SamplerState SmplCube_s : register(s14);
 SamplerState SmplLinearClamp_s : register(s15);
 SamplerComparisonState SmplShadow_s : register(s13);
-
 Texture2D<float4> colorTexture : register(t0);
 Texture2D<uint4> mrtTexture0 : register(t1);
 Texture2D<uint4> mrtTexture1 : register(t2);
@@ -224,14 +221,14 @@ Texture2D<float4> texMirror_g : register(t21);
 // 3Dmigoto declarations
 #define cmp -
 
+
 void main(
   float4 v0 : SV_Position0,
   float4 v1 : TEXCOORD0,
   out float4 o0 : SV_Target0,
   out uint4 o1 : SV_Target1)
 {
-  // Define registers used in assembly
-  float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24,r25;
+  float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24;
   uint4 bitmask, uiDest;
   float4 fDest;
   float cubemap_mode = sss_injection_data.cubemap_improvements_enabled;
@@ -282,8 +279,7 @@ void main(
     r6.x = 0.00392156886;
     r6.y = r0.y;
     r6.xy = r6.xy * r3.xw;
-    if (1 == 0) r3.x = 0; else if (1+8 < 32) {     r3.x = (uint)r3.z << (32-(1 + 8));
-    r3.x = (uint)r3.x >> (32-1);    } else r3.x = (uint)r3.z >> 8;
+    if (1 == 0) r3.x = 0; else if (1+8 < 32) {     r3.x = (uint)r3.z << (32-(1 + 8)); r3.x = (uint)r3.x >> (32-1);    } else r3.x = (uint)r3.z >> 8;
     if (r3.x != 0) {
       r3.x = (int)r1.z & 255;
       r3.x = (uint)r3.x;
@@ -423,7 +419,7 @@ void main(
         r3.x = r3.x * r3.w;
         r7.xyz = r7.xyz * float3(0.0666666701,0.0666666701,0.0666666701) + -r4.yzw;
         r7.xyz = r3.xxx * r7.xyz + r4.yzw;
-        r4.yzw = r6.yyy ? r7.xyz : r4.yzw;
+        r4.yzw = r6.y ? r7.xyz : r4.yzw;
       }
     } else {
       r3.x = 1 + -r4.x;
@@ -519,10 +515,7 @@ void main(
   while (true) {
     r11.w = cmp((uint)r7.w >= (uint)r6.w);
     if (r11.w != 0) break;
-    
-    // Fixed dynamic lookup:
-    int probeIdx = lightIndices_g[r5.z].lightProbeIndices[r7.w];
-    
+    int probeIdx = lightIndices_g[r5.z].lightProbeIndices[(int)r7.w];
     r12.x = localLightProbes_g[probeIdx].pos.x;
     r12.y = localLightProbes_g[probeIdx].pos.y;
     r12.z = localLightProbes_g[probeIdx].pos.z;
@@ -608,29 +601,13 @@ void main(
   r12.xyz = lightProbe_g[7].xyz * r3.yyy + r12.xyz;
   r12.xyz = lightProbe_g[8].xyz * r7.zzz + r12.xyz;
   r12.xyz = r12.xyz * r6.www;
-  r12.xyz = r7.www ? r12.xyz : 0;
+  r12.xyz = r7.w ? r12.xyz : 0;
   r12.xyz = max(float3(0,0,0), r12.xyz);
   r12.xyz = r12.xyz + r11.xyz;
   r15.xyzw = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
-  bool ssgi_enabled = sss_injection_data.ssgi_mod_enabled >= 0.5;
-  bool shadow_use_jitter = sss_injection_data.shadow_pcss_jitter_enabled >= 0.5;
-  int pcss_sample_count = 32;
-  int pcss_sample_count_minus_one = max(pcss_sample_count - 1, 0);
-  float pcss_sample_inv = rcp((float)pcss_sample_count);
-  float pcss_blocker_radius_scale = rsqrt((float)max(pcss_sample_count_minus_one, 1));
-  float pcss_filter_radius_scale = rsqrt((float)pcss_sample_count);
-  float ssgi_color_boost = max(sss_injection_data.ssgi_color_boost, 0.0);
-  float ssgi_alpha_boost = max(sss_injection_data.ssgi_alpha_boost, 0.0);
-  float ssgi_pow = max(sss_injection_data.ssgi_pow, 0.01);
-  if (!ssgi_enabled) {
-    // Fully disable SSGI contribution (not just the custom tuning).
+  if (sss_injection_data.ssgi_mod_enabled < 0.5) {
+    // Keep soft-lighting SSGI default behavior unless explicitly disabled.
     r15.xyzw = float4(0, 0, 0, 0);
-  } else {
-    // Increase the weight/alpha of the SSGI.
-    r15.xyz = r15.xyz * ssgi_color_boost;
-    r15.w = saturate(r15.w * ssgi_alpha_boost);
-    // Shape dark-vs-bright bounced light response.
-    r15.xyz = pow(abs(r15.xyz), ssgi_pow);
   }
   r16.x = viewInv_g._m30;
   r16.y = viewInv_g._m31;
@@ -662,88 +639,37 @@ void main(
       if (r8.w != 0) {
         r8.w = 1;
       } else {
-        r17.w = 30 / shadowSplitDistance_g.y;
-        r20.xy = float2(0.00124999997,0.000624999986) * r17.ww;
-        r17.w = -6 + r16.z;
-        r20.zw = r20.xy * r17.ww;
-        r20.zw = r20.zw / r16.zz;
-        r16.w = 2;
-        r21.y = shadowMaps.SampleLevel(SmplMirror_s, r16.xyw, 0).x;
-        r16.w = cmp(r21.y < r16.z);
-        r21.x = 1;
-        r21.xy = r16.ww ? r21.xy : 0;
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992))+ (sceneTime_g * 77.0);
-        } else {
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        }
+        r16.w = 30 / shadowSplitDistance_g.y;
+        r20.xy = float2(0.000500000024,0.000250000012) * r16.ww;
+        shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+        r20.zw = fDest.xy;
+        r20.zw = float2(1,1) / r20.zw;
+        r20.xy = max(r20.zw, r20.xy);
+        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
         r16.w = frac(r16.w);
         r16.w = 52.9829178 * r16.w;
         r16.w = frac(r16.w);
         r16.w = 6.28318548 * r16.w;
-        // Cascade 2 blocker search (matches original disassembly layer selection).
-        r22.z = 2;
-        r21.zw = r21.xy;
+        r21.z = 2;
         r17.w = 0;
+        r18.w = 0;
         while (true) {
-          r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
-          if (r18.w != 0) break;
-          r18.w = (int)r17.w;
-          r19.x = 0.5 + r18.w;
-          r19.x = sqrt(r19.x);
-          r19.x = pcss_blocker_radius_scale * r19.x;
-          r18.w = r18.w * 2.4000001 + r16.w;
-          sincos(r18.w, r23.x, r24.x);
-          r24.x = r24.x * r19.x;
-          r24.y = r23.x * r19.x;
-          r22.xy = r24.xy * r20.zw + r16.xy;
-          r18.w = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
-          r19.x = cmp(r18.w < r16.z);
-          r22.y = r21.w + r18.w;
-          r22.x = 1 + r21.z;
-          r21.zw = r19.xx ? r22.xy : r21.zw;
-          r17.w = (int)r17.w + 1;
+          r19.x = cmp((int)r18.w >= 16);
+          if (r19.x != 0) break;
+          r19.x = (int)r18.w;
+          r20.z = 0.5 + r19.x;
+          r20.z = sqrt(r20.z);
+          r20.z = 0.25 * r20.z;
+          r19.x = r19.x * 2.4000001 + r16.w;
+          sincos(r19.x, r19.x, r22.x);
+          r22.x = r22.x * r20.z;
+          r22.y = r20.z * r19.x;
+          r21.xy = r22.xy * r20.xy + r16.xy;
+          r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
+          r17.w = r19.x + r17.w;
+          r18.w = (int)r18.w + 1;
         }
-        r17.w = cmp(r21.z >= 1);
-        if (r17.w != 0) {
-          r17.w = r21.w / r21.z;
-          r17.w = -r17.w + r16.z;
-          r17.w = min(0.0500000007, r17.w);
-		  // add base softness
-          r17.w = (60.0 * r17.w) + sss_injection_data.shadow_base_softness;
-          r20.xy = r17.ww * r20.xy;
-          
-          // Fixed GetDimensions
-          float3 dims; float numMips;
-          shadowMaps.GetDimensions(0, dims.x, dims.y, dims.z, numMips);
-          r20.zw = float2(dims.x, dims.y);
-          
-          r20.zw = float2(1,1) / r20.zw;
-          r20.xy = max(r20.zw, r20.xy);
-          r21.z = 2;
-          r17.w = 0;
-          r18.w = 0;
-          while (true) {
-            r19.x = cmp((int)r18.w >= pcss_sample_count);
-            if (r19.x != 0) break;
-            r19.x = (int)r18.w;
-            r20.z = 0.5 + r19.x;
-            r20.z = sqrt(r20.z);
-            r20.z = pcss_filter_radius_scale * r20.z;
-            r19.x = r19.x * 2.4000001 + r16.w;
-            sincos(r19.x, r19.x, r22.x);
-            r22.x = r22.x * r20.z;
-            r22.y = r20.z * r19.x;
-            r21.xy = r22.xy * r20.xy + r16.xy;
-            r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
-            r17.w = r19.x + r17.w;
-            r18.w = (int)r18.w + 1;
-          }
-          r8.w = pcss_sample_inv * r17.w;
-        } else {
-          r8.w = 1;
-        }
+        r8.w = 0.0625 * r17.w;
       }
       r16.x = cmp(r7.w < shadowSplitDistance_g.y);
       if (r16.x != 0) {
@@ -752,91 +678,40 @@ void main(
         r16.z = dot(r2.xyzw, shadowMtx_g[1]._m02_m12_m22_m32);
         r16.w = dot(r2.xyzw, shadowMtx_g[1]._m03_m13_m23_m33);
         r16.xyz = r16.xyz / r16.www;
-        r17.w = 30 / shadowSplitDistance_g.y;
-        r20.xy = float2(0.00124999997,0.000624999986) * r17.ww;
-        r17.w = -6 + r16.z;
-        r20.zw = r20.xy * r17.ww;
-        r20.zw = r20.zw / r16.zz;
-        r16.w = 1;
-        r21.y = shadowMaps.SampleLevel(SmplMirror_s, r16.xyw, 0).x;
-        r16.w = cmp(r21.y < r16.z);
-        r21.x = 1;
-        r21.xy = r16.ww ? r21.xy : 0;
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992))+ (sceneTime_g * 77.0);
-        } else {
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        }
-      r16.w = frac(r16.w);
-      r16.w = 52.9829178 * r16.w;
-      r16.w = frac(r16.w);
-      r16.w = 6.28318548 * r16.w;
-      r22.z = r20.w;
-      r23.xy = r21.zw;
-      r17.w = 0;
+        r16.w = 30 / shadowSplitDistance_g.y;
+        r20.xy = float2(0.000500000024,0.000250000012) * r16.ww;
+        shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+        r20.zw = fDest.xy;
+        r20.zw = float2(1,1) / r20.zw;
+        r20.xy = max(r20.zw, r20.xy);
+        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
+        r16.w = frac(r16.w);
+        r16.w = 52.9829178 * r16.w;
+        r16.w = frac(r16.w);
+        r16.w = 6.28318548 * r16.w;
+        r21.z = 1;
+        r17.w = 0;
+        r18.w = 0;
         while (true) {
-          r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
-          if (r18.w != 0) break;
-          r18.w = (int)r17.w;
-          r19.x = 0.5 + r18.w;
-          r19.x = sqrt(r19.x);
-          r19.x = pcss_blocker_radius_scale * r19.x;
-          r18.w = r18.w * 2.4000001 + r16.w;
-          sincos(r18.w, r23.x, r24.x);
-          r24.x = r24.x * r19.x;
-          r24.y = r23.x * r19.x;
-          r22.xy = r24.xy * r20.zw + r16.xy;
-          r18.w = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
-          r19.x = cmp(r18.w < r16.z);
-          r22.y = r21.w + r18.w;
-          r22.x = 1 + r21.z;
-          r21.zw = r19.xx ? r22.xy : r21.zw;
-          r17.w = (int)r17.w + 1;
+          r19.x = cmp((int)r18.w >= 16);
+          if (r19.x != 0) break;
+          r19.x = (int)r18.w;
+          r20.z = 0.5 + r19.x;
+          r20.z = sqrt(r20.z);
+          r20.z = 0.25 * r20.z;
+          r19.x = r19.x * 2.4000001 + r16.w;
+          sincos(r19.x, r19.x, r22.x);
+          r22.x = r22.x * r20.z;
+          r22.y = r20.z * r19.x;
+          r21.xy = r22.xy * r20.xy + r16.xy;
+          r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
+          r17.w = r19.x + r17.w;
+          r18.w = (int)r18.w + 1;
         }
-        r17.w = cmp(r21.z >= 1);
-        if (r17.w != 0) {
-          r17.w = r21.w / r21.z;
-          r17.w = -r17.w + r16.z;
-          r17.w = min(0.0500000007, r17.w);
-		  // add base softness
-          r17.w = (60.0 * r17.w) + sss_injection_data.shadow_base_softness;
-          r20.xy = r17.ww * r20.xy;
-          
-          // Fixed GetDimensions
-          float3 dims; float numMips;
-          shadowMaps.GetDimensions(0, dims.x, dims.y, dims.z, numMips);
-          r20.zw = float2(dims.x, dims.y);
-          
-          r20.zw = float2(1,1) / r20.zw;
-          r20.xy = max(r20.zw, r20.xy);
-          r21.z = 1;
-          r17.w = 0;
-          r18.w = 0;
-          while (true) {
-            r19.x = cmp((int)r18.w >= pcss_sample_count);
-            if (r19.x != 0) break;
-            r19.x = (int)r18.w;
-            r20.z = 0.5 + r19.x;
-            r20.z = sqrt(r20.z);
-            r20.z = pcss_filter_radius_scale * r20.z;
-            r19.x = r19.x * 2.4000001 + r16.w;
-            sincos(r19.x, r19.x, r22.x);
-            r22.x = r22.x * r20.z;
-            r22.y = r20.z * r19.x;
-            r21.xy = r22.xy * r20.xy + r16.xy;
-            r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
-            r17.w = r19.x + r17.w;
-            r18.w = (int)r18.w + 1;
-          }
-          r16.x = pcss_sample_inv * r17.w;
-        } else {
-          r16.x = 1;
-        }
-        r16.y = shadowSplitDistance_g.y + -r7.w;
-        r16.y = 0.200000003 * r16.y;
-        r16.x = r16.x + -r8.w;
-        r8.w = r16.y * r16.x + r8.w;
+        r16.x = shadowSplitDistance_g.y + -r7.w;
+        r16.x = 0.200000003 * r16.x;
+        r16.y = r17.w * 0.0625 + -r8.w;
+        r8.w = r16.x * r16.y + r8.w;
       }
       r16.x = -shadowFadeNear_g + r7.w;
       r16.x = saturate(shadowFadeRangeInv_g * r16.x);
@@ -844,192 +719,85 @@ void main(
       r8.w = r16.x * r16.y + r8.w;
     } else {
       r16.x = cmp(r7.w < shadowSplitDistance_g.x);
-      r20.xw = r16.xx ? float2(0,0) : float2(4,1);
-      r21.x = dot(r2.xyzw, shadowMtx_g[r20.x/4]._m00_m10_m20_m30);
-      r21.y = dot(r2.xyzw, shadowMtx_g[r20.x/4]._m01_m11_m21_m31);
-      r21.z = dot(r2.xyzw, shadowMtx_g[r20.x/4]._m02_m12_m22_m32);
-      r16.y = dot(r2.xyzw, shadowMtx_g[r20.x/4]._m03_m13_m23_m33);
-      r20.xyz = r21.xyz / r16.yyy;
-      r16.y = 30 / shadowSplitDistance_g.x;
-      r16.yz = float2(0.00124999997,0.000624999986) * r16.yy;
-      r16.w = -6 + r20.z;
-      r21.xy = r16.yz * r16.ww;
-      r21.xy = r21.xy / r20.zz;
-      r21.w = shadowMaps.SampleLevel(SmplMirror_s, r20.xyw, 0).x;
-      r16.w = cmp(r21.w < r20.z);
-      r21.z = 1;
-      r21.zw = r16.ww ? r21.zw : 0;
-      if (shadow_use_jitter) {
-        // add jitter to shadow filtering
-        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992)) + (sceneTime_g * 77.0);
-      } else {
-        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-      }
-      r16.w = frac(r16.w);
-      r16.w = 52.9829178 * r16.w;
-      r16.w = frac(r16.w);
-      r16.w = 6.28318548 * r16.w;
-      r22.z = r20.w;
-      r17.w = 0;
+      uint shadow_split_idx = (r16.x != 0) ? 0u : 1u;
+      r20.z = shadow_split_idx * 4;
+      r20.w = shadow_split_idx;
+      r21.x = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m00_m10_m20_m30);
+      r21.y = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m01_m11_m21_m31);
+      r21.z = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m02_m12_m22_m32);
+      r16.y = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m03_m13_m23_m33);
+      r16.yzw = r21.xyz / r16.yyy;
+      r17.w = 30 / shadowSplitDistance_g.x;
+      r21.xy = float2(0.000500000024,0.000250000012) * r17.ww;
+      shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+      r21.zw = fDest.xy;
+      r21.zw = float2(1,1) / r21.zw;
+      r21.zw = max(r21.zw, r21.xy);
+      r17.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
+      r17.w = frac(r17.w);
+      r17.w = 52.9829178 * r17.w;
+      r17.w = frac(r17.w);
+      r17.w = 6.28318548 * r17.w;
       r18.w = 0;
+      r19.x = 0;
       while (true) {
-        r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
-        if (r18.w != 0) break;
-        r18.w = (int)r17.w;
-        r19.x = 0.5 + r18.w;
-        r19.x = sqrt(r19.x);
-        r19.x = pcss_blocker_radius_scale * r19.x;
-        r18.w = r18.w * 2.4000001 + r16.w;
-        sincos(r18.w, r24.x, r25.x);
-        r25.x = r25.x * r19.x;
-        r25.y = r24.x * r19.x;
-        r22.xy = r25.xy * r21.xy + r20.xy;
-        r18.w = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
-        r19.x = cmp(r18.w < r20.z);
-        r22.y = r23.y + r18.w;
-        r22.x = 1 + r23.x;
-        r23.xy = r19.xx ? r22.xy : r23.xy;
-        r17.w = (int)r17.w + 1;
+        r20.z = cmp((int)r19.x >= 16);
+        if (r20.z != 0) break;
+        r20.z = (int)r19.x;
+        r22.x = 0.5 + r20.z;
+        r22.x = sqrt(r22.x);
+        r22.x = 0.25 * r22.x;
+        r20.z = r20.z * 2.4000001 + r17.w;
+        sincos(r20.z, r23.x, r24.x);
+        r24.x = r24.x * r22.x;
+        r24.y = r23.x * r22.x;
+        r20.xy = r24.xy * r21.zw + r16.yz;
+        r20.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r20.xyw, r16.w).x;
+        r18.w = r20.x + r18.w;
+        r19.x = (int)r19.x + 1;
       }
-      r16.w = cmp(r23.x >= 1);
-      if (r16.w != 0) {
-        r16.w = r23.y / r23.x;
-        r16.w = r20.z + -r16.w;
-        r16.w = min(0.0500000007, r16.w);
-		// add base softness
-        r16.w = (60.0 * r16.w) + sss_injection_data.shadow_base_softness;
-        r21.xy = r16.ww * r16.yz;
-        
-        // Fixed GetDimensions
-        float3 dims; float numMips;
-        shadowMaps.GetDimensions(0, dims.x, dims.y, dims.z, numMips);
-        r21.zw = float2(dims.x, dims.y);
-        
-        r21.zw = float2(1,1) / r21.zw;
-        r21.xy = max(r21.zw, r21.xy);
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608, 0.00583714992)) + (sceneTime_g * 77.0);
-        } else {
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        }
+      r8.w = 0.0625 * r18.w;
+      r16.y = shadowSplitDistance_g.x + -5;
+      r16.y = cmp(r16.y < r7.w);
+      r16.x = r16.y ? r16.x : 0;
+      if (r16.x != 0) {
+        r16.x = dot(r2.xyzw, shadowMtx_g[1]._m00_m10_m20_m30);
+        r16.y = dot(r2.xyzw, shadowMtx_g[1]._m01_m11_m21_m31);
+        r16.z = dot(r2.xyzw, shadowMtx_g[1]._m02_m12_m22_m32);
+        r16.w = dot(r2.xyzw, shadowMtx_g[1]._m03_m13_m23_m33);
+        r16.xyz = r16.xyz / r16.www;
+        shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+        r20.xy = fDest.xy;
+        r20.xy = float2(1,1) / r20.xy;
+        r20.xy = max(r20.xy, r21.xy);
+        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
         r16.w = frac(r16.w);
         r16.w = 52.9829178 * r16.w;
         r16.w = frac(r16.w);
         r16.w = 6.28318548 * r16.w;
-        r22.z = r20.w;
+        r21.z = 1;
         r17.w = 0;
-        r18.w = 0;
+        r19.x = 0;
         while (true) {
-            r19.x = cmp((int)r18.w >= pcss_sample_count);
-          if (r19.x != 0) break;
-          r19.x = (int)r18.w;
-          r20.w = 0.5 + r19.x;
+          r20.z = cmp((int)r19.x >= 16);
+          if (r20.z != 0) break;
+          r20.z = (int)r19.x;
+          r20.w = 0.5 + r20.z;
           r20.w = sqrt(r20.w);
-          r20.w = pcss_filter_radius_scale * r20.w;
-          r19.x = r19.x * 2.4000001 + r16.w;
-          sincos(r19.x, r19.x, r23.x);
+          r20.w = 0.25 * r20.w;
+          r20.z = r20.z * 2.4000001 + r16.w;
+          sincos(r20.z, r22.x, r23.x);
           r23.x = r23.x * r20.w;
-          r23.y = r20.w * r19.x;
-          r22.xy = r23.xy * r21.xy + r20.xy;
-          r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r22.xyz, r20.z).x;
-          r17.w = r19.x + r17.w;
-          r18.w = (int)r18.w + 1;
+          r23.y = r22.x * r20.w;
+          r21.xy = r23.xy * r20.xy + r16.xy;
+          r20.z = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
+          r17.w = r20.z + r17.w;
+          r19.x = (int)r19.x + 1;
         }
-        r8.w = pcss_sample_inv * r17.w;
-      } else {
-        r8.w = 1;
-      }
-      r16.w = shadowSplitDistance_g.x + -5;
-      r16.w = cmp(r16.w < r7.w);
-      r16.x = r16.w ? r16.x : 0;
-      if (r16.x != 0) {
-        r20.x = dot(r2.xyzw, shadowMtx_g[1]._m00_m10_m20_m30);
-        r20.y = dot(r2.xyzw, shadowMtx_g[1]._m01_m11_m21_m31);
-        r20.z = dot(r2.xyzw, shadowMtx_g[1]._m02_m12_m22_m32);
-        r16.x = dot(r2.xyzw, shadowMtx_g[1]._m03_m13_m23_m33);
-        r20.xyz = r20.xyz / r16.xxx;
-        r16.x = -6 + r20.z;
-        r16.xw = r16.yz * r16.xx;
-        r16.xw = r16.xw / r20.zz;
-        r20.w = 1;
-        r21.y = shadowMaps.SampleLevel(SmplMirror_s, r20.xyw, 0).x;
-        r17.w = cmp(r21.y < r20.z);
-        r21.x = 1;
-        r21.xy = r17.ww ? r21.xy : 0;
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r17.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-          r17.w = frac(r17.w);
-          r17.w = 52.9829178 * r17.w;
-          r17.w = frac(r17.w);
-          r17.w = 6.28318548 * r17.w;
-        } else {
-          r17.w = 0;
-        }
-        r22.z = 1;
-        r21.zw = r21.xy;
-        r18.w = 0;
-        while (true) {
-          r19.x = cmp((int)r18.w >= pcss_sample_count_minus_one);
-          if (r19.x != 0) break;
-          r19.x = (int)r18.w;
-          r20.w = 0.5 + r19.x;
-          r20.w = sqrt(r20.w);
-          r20.w = pcss_blocker_radius_scale * r20.w;
-          r19.x = r19.x * 2.4000001 + r17.w;
-          sincos(r19.x, r19.x, r23.x);
-          r23.x = r23.x * r20.w;
-          r23.y = r20.w * r19.x;
-          r22.xy = r23.xy * r16.xw + r20.xy;
-          r19.x = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
-          r20.w = cmp(r19.x < r20.z);
-          r22.y = r21.w + r19.x;
-          r22.x = 1 + r21.z;
-          r21.zw = r20.ww ? r22.xy : r21.zw;
-          r18.w = (int)r18.w + 1;
-        }
-        r16.x = cmp(r21.z >= 1);
-        if (r16.x != 0) {
-          r16.x = r21.w / r21.z;
-          r16.x = r20.z + -r16.x;
-          r16.x = min(0.0500000007, r16.x);
-		  // add base softness
-          r16.x = (60.0 * r16.x) + sss_injection_data.shadow_base_softness;
-          r16.xy = r16.xx * r16.yz;
-          
-          // Fixed GetDimensions
-          float3 dims; float numMips;
-          shadowMaps.GetDimensions(0, dims.x, dims.y, dims.z, numMips);
-          r16.zw = float2(dims.x, dims.y);
-          
-          r16.zw = float2(1,1) / r16.zw;
-          r16.xy = max(r16.zw, r16.xy);
-          r21.z = 1;
-          r16.zw = float2(0,0);
-          while (true) {
-            r18.w = cmp((int)r16.w >= pcss_sample_count);
-            if (r18.w != 0) break;
-            r18.w = (int)r16.w;
-            r19.x = 0.5 + r18.w;
-            r19.x = sqrt(r19.x);
-            r19.x = pcss_filter_radius_scale * r19.x;
-            r18.w = r18.w * 2.4000001 + r17.w;
-            sincos(r18.w, r22.x, r23.x);
-            r23.x = r23.x * r19.x;
-            r23.y = r22.x * r19.x;
-            r21.xy = r23.xy * r16.xy + r20.xy;
-            r18.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r20.z).x;
-            r16.z = r18.w + r16.z;
-            r16.w = (int)r16.w + 1;
-          }
-          r16.x = pcss_sample_inv * r16.z;
-        } else {
-          r16.x = 1;
-        }
+        r16.x = 0.0625 * r17.w;
         r7.w = shadowSplitDistance_g.x + -r7.w;
         r7.w = 0.200000003 * r7.w;
-        r16.y = -r16.x + r8.w;
+        r16.y = r18.w * 0.0625 + -r16.x;
         r8.w = r7.w * r16.y + r16.x;
       }
     }
@@ -1061,17 +829,13 @@ void main(
     } else {
       r7.w = r7.z + r7.z;
       r21.xyz = r5.xyw * -r7.www + r18.xyz;
-      
-      // Fixed GetDimensions
-      uint w, h, levels;
-      texEnvMap_g.GetDimensions(0, w, h, levels);
-      r7.w = levels;
-      
+      uint env_w, env_h, env_levels;
+      texEnvMap_g.GetDimensions(0, env_w, env_h, env_levels);
+      r7.w = env_levels;
       r21.xyz = float3(1,-1,-1) * r21.xyz;
       r7.w = (int)r7.w + -1;
       r7.w = (uint)r7.w;
       r7.w = r16.y * r7.w;
-	  // cube
       r20.xyz = texEnvMap_g.SampleLevel(
           SmplCube_s,
           r21.xyz,
@@ -1107,7 +871,7 @@ void main(
       r16.xyz = max(float3(0,0,0), r16.xyz * r13.www);
     }
     r16.xyz = r16.xyz * r6.xxx + r9.xyz;
-    r9.xyz = r4.yyy ? r9.xyz : r16.xyz;
+    r9.xyz = r4.y ? r9.xyz : r16.xyz;
   } else {
     r4.y = (int)r1.x & 8;
     if (r4.y != 0) {
@@ -1123,14 +887,11 @@ void main(
       r7.w = cmp(r7.w >= 0);
       r20.xyz = r6.xxx * r5.xyw;
       r18.xyz = r4.yyy * -r18.xyz + -r20.xyz;
-      r18.xyz = r7.www ? r18.xyz : 0;
+      r18.xyz = r7.w ? r18.xyz : 0;
       r4.y = r13.z * r4.z;
-      
-      // Fixed GetDimensions
-      uint w, h, levels;
-      texEnvMap_g.GetDimensions(0, w, h, levels);
-      r6.x = levels;
-      
+      uint env_w2, env_h2, env_levels2;
+      texEnvMap_g.GetDimensions(0, env_w2, env_h2, env_levels2);
+      r6.x = env_levels2;
       r16.xyz = float3(1,-1,-1) * r16.xyz;
       r6.x = (int)r6.x + -1;
       r6.x = (uint)r6.x;
@@ -1196,10 +957,7 @@ void main(
     while (true) {
       r9.w = cmp((uint)r4.z >= (uint)r4.y);
       if (r9.w != 0) break;
-      
-      // Fixed dynamic lookup:
-      int lightIdx = lightIndices_g[r5.z].pointLightIndices[r4.z];
-      
+      int lightIdx = lightIndices_g[r5.z].pointLightIndices[(int)r4.z];
       r10.x = dynamicLights_g[lightIdx].pos.x;
       r10.y = dynamicLights_g[lightIdx].pos.y;
       r10.z = dynamicLights_g[lightIdx].pos.z;
@@ -1253,10 +1011,7 @@ void main(
     while (true) {
       r9.w = cmp((uint)r4.z >= (uint)r4.y);
       if (r9.w != 0) break;
-      
-      // Fixed dynamic lookup:
-      int lightIdx = lightIndices_g[r5.z].spotLightIndices[r4.z];
-      
+      int lightIdx = lightIndices_g[r5.z].spotLightIndices[(int)r4.z];
       r12.x = dynamicLights_g[lightIdx].pos.x;
       r12.y = dynamicLights_g[lightIdx].pos.y;
       r12.z = dynamicLights_g[lightIdx].pos.z;
@@ -1357,10 +1112,7 @@ void main(
     while (true) {
       r4.y = cmp((uint)r9.w >= (uint)r3.y);
       if (r4.y != 0) break;
-      
-      // Fixed dynamic lookup:
-      int lightIdx = lightIndices_g[r5.z].pointLightIndices[r9.w];
-      
+      int lightIdx = lightIndices_g[r5.z].pointLightIndices[(int)r9.w];
       r10.x = dynamicLights_g[lightIdx].pos.x;
       r10.y = dynamicLights_g[lightIdx].pos.y;
       r10.z = dynamicLights_g[lightIdx].pos.z;
@@ -1397,10 +1149,7 @@ void main(
     while (true) {
       r4.y = cmp((uint)r9.w >= (uint)r3.y);
       if (r4.y != 0) break;
-      
-      // Fixed dynamic lookup:
-      int lightIdx = lightIndices_g[r5.z].spotLightIndices[r9.w];
-      
+      int lightIdx = lightIndices_g[r5.z].spotLightIndices[(int)r9.w];
       r10.x = dynamicLights_g[lightIdx].pos.x;
       r10.y = dynamicLights_g[lightIdx].pos.y;
       r10.z = dynamicLights_g[lightIdx].pos.z;
@@ -1644,7 +1393,7 @@ void main(
             r5.x = r5.w ? 0 : r5.x;
             r5.x = r5.z ? r5.x : 0;
             r5.y = r5.z ? r5.w : -1;
-            r4.zw = r4.xx ? r5.xy : 0;
+            r4.zw = r4.x ? r5.xy : 0;
           }
         }
         r4.x = log2(r4.z);
@@ -1653,7 +1402,7 @@ void main(
         r4.x = r4.x * r7.w;
         r4.x = r4.x * r0.z;
         r7.w = r4.x * r4.y;
-        r4.xyzw = r4.wwww ? float4(0,0,0,0) : r7.xyzw;
+        r4.xyzw = r4.w ? float4(0,0,0,0) : r7.xyzw;
       } else {
         r4.xyzw = float4(0,0,0,0);
       }

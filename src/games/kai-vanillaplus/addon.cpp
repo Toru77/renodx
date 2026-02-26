@@ -29,6 +29,7 @@
 namespace {
 
 constexpr uint32_t kLightingShader = 0x430ED091u;
+constexpr uint32_t kLightingSoftShader = 0xF6C55E5Fu;
 constexpr uint32_t kCharacterShader = 0x445A1838u;
 
 void OnLightingShaderDrawnApplyCharacterSSGI(reshade::api::command_list* cmd_list);
@@ -42,6 +43,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_drawn = &OnLightingShaderDrawnApplyCharacterSSGI,
         },
     },                                             // lighting
+    {
+        kLightingSoftShader,
+        {
+            .crc32 = kLightingSoftShader,
+            .code = __0xF6C55E5F,
+            .on_drawn = &OnLightingShaderDrawnApplyCharacterSSGI,
+        },
+    },                                             // lighting soft shadows
     CustomShaderEntry(0x445A1838),                 // character lighting
     CustomShaderEntry(0x209125C1),                 // SSR
     CustomShaderEntry(0xB1CCBCAE),                 // glass
@@ -182,14 +191,15 @@ void CaptureTrackedTextureView(
     const reshade::api::resource_view view) {
   if (view.handle == 0u) return;
   if (space != 0u) return;
+  const bool is_lighting_shader = shader_hash == kLightingShader || shader_hash == kLightingSoftShader;
 
-  if (shader_hash == kLightingShader && reg == 9u) {
+  if (is_lighting_shader && reg == 9u) {
     g_lighting_ssgi_view.store(view.handle, std::memory_order_relaxed);
-  } else if (shader_hash == kLightingShader && reg == 2u) {
+  } else if (is_lighting_shader && reg == 2u) {
     g_lighting_mrt1_view.store(view.handle, std::memory_order_relaxed);
-  } else if (shader_hash == kLightingShader && reg == 3u) {
+  } else if (is_lighting_shader && reg == 3u) {
     g_lighting_depth_view.store(view.handle, std::memory_order_relaxed);
-  } else if (shader_hash == kLightingShader && reg == 4u) {
+  } else if (is_lighting_shader && reg == 4u) {
     g_lighting_ssao_view.store(view.handle, std::memory_order_relaxed);
   } else if (shader_hash == kCharacterShader && reg == 0u) {
     // Character pass depth texture.
@@ -197,7 +207,7 @@ void CaptureTrackedTextureView(
   } else if (shader_hash == kCharacterShader && reg == 2u) {
     // Character pass uses mrtTexture0 at t2.
     g_character_mrt0_view.store(view.handle, std::memory_order_relaxed);
-  } else if (shader_hash == kLightingShader && reg == 1u) {
+  } else if (is_lighting_shader && reg == 1u) {
     // Keep lighting mrt0 as fallback in case character pass capture is unavailable.
     g_lighting_mrt0_view.store(view.handle, std::memory_order_relaxed);
   }
@@ -215,7 +225,8 @@ void OnPushDescriptorsCaptureLightingTextures(
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return;
   const auto shader_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
-  const bool is_tracked_shader = shader_hash == kLightingShader || shader_hash == kCharacterShader;
+  const bool is_tracked_shader =
+      shader_hash == kLightingShader || shader_hash == kLightingSoftShader || shader_hash == kCharacterShader;
 
   for (uint32_t i = 0; i < update.count; ++i) {
     uint32_t reg = 0u;
@@ -297,7 +308,7 @@ void OnBindDescriptorTablesCaptureLightingTextures(
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return;
   const auto shader_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
-  if (shader_hash != kLightingShader && shader_hash != kCharacterShader) return;
+  if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader && shader_hash != kCharacterShader) return;
 
   auto* layout_data = renodx::utils::pipeline_layout::GetPipelineLayoutData(layout);
   if (layout_data == nullptr) return;
@@ -1156,6 +1167,11 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "Disable jitter options if you are not using TAA or upscalers!",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Enable Soft/PCSS Shadows and Ultra SSR.",
         .section = "Info",
     },
 };
