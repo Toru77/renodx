@@ -44,13 +44,11 @@ jobs:
       - name: Configure CMake (x64)
         run: cmake --preset clang-x64
 
-      
       - name: Build Trails Beyond Horizon Vanilla Plus
         run: cmake --build --preset clang-x64-release --target kai-vanillaplus --verbose
       
       - name: Build YS X Proud Nordics
         run: cmake --build --preset clang-x64-release --target ys10pn --verbose
--
       
       - name: Set up Clang (x86)
         uses: egor-tensin/setup-clang@v1
@@ -68,7 +66,6 @@ jobs:
 
       - name: Build Trails of Cold Steel II
         run: cmake --build --preset clang-x86-release --target senkiseki32 --verbose
-
 
       - name: Prepare Release folder
         run: |
