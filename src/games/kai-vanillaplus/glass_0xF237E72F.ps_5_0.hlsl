@@ -202,6 +202,8 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture3D<float4> volumeFogTexture_g : register(t26);
 
+#include "./kai-vanillaplus.h"
+
 // 3Dmigoto declarations
 #define cmp -
 
@@ -324,7 +326,7 @@ void main(
   // Modify glass cubemap
   r5.x += 0.0; // Adds X mip levels of blur
   r3.yzw = texEnvMap_g.SampleLevel(SmplCube_s, r3.yzw, r5.x).xyz;
-  r3.yzw *= 0.25; // Reduces the reflection intensity by X
+  r3.yzw *= lerp(1.0, 0.25, saturate(sss_injection_data.cubemap_improvements_enabled)); // Reduces the reflection intensity by X
   r5.x = cmp(0 < fresnel0_g);
   r8.x = 1 + -abs(r8.x);
   r8.x = max(0, r8.x);
