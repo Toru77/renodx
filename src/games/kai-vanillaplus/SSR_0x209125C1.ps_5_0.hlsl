@@ -122,8 +122,6 @@ void main(
   float3 ssr_origin_view_pos = float3(0, 0, 0);
   float3 ssr_origin_normal_vs = float3(0, 0, 1);
   float ssr_current_view_z = 0;
-  float ssr_temporal_jitter_amount = 0;
-  bool ssr_use_temporal_jitter = false;
   float2 ssr_sample_uv = float2(0, 0);
   float2 ssr_sample_uv_scaled = float2(0, 0);
   float2 ssr_reproj_uv = float2(0, 0);
@@ -318,33 +316,13 @@ void main(
     r0.y = r0.y + r0.y;
     r1.x = r0.y * r0.y;
     r0.x = -r0.y * r1.x + 1;
-    if (ssr_improved_mode) {
-      r0.x *= 0.35;
-    }
   }
 
   ssr_sample_uv = r0.zw;
-  if (ssr_improved_mode && sss_injection_data.ssr_temporal_jitter_enable >= 0.5) {
-    ssr_temporal_jitter_amount = max(0.0, sss_injection_data.ssr_temporal_jitter_amount);
-    ssr_use_temporal_jitter = (ssr_temporal_jitter_amount > 0.0);
-    if (ssr_use_temporal_jitter) {
-      float2 jitter_seed = v0.xy + sceneTime_g * float2(17.0, 31.0);
-      float jitter_x = frac(sin(dot(jitter_seed, float2(12.9898005, 78.2330017))) * 43758.5469);
-      float jitter_y = frac(sin(dot(jitter_seed.yx + 19.19, float2(4.89800024, 7.23000002))) * 23421.6309);
-      float2 stochastic_jitter_uv = (float2(jitter_x, jitter_y) + float2(-0.5, -0.5)) * invVPSize_g.xy * ssr_temporal_jitter_amount;
-      float2 camera_jitter_uv = curJitterOffset_g.xy * invVPSize_g.xy * ssr_temporal_jitter_amount;
-      float2 jitter_uv = stochastic_jitter_uv + camera_jitter_uv;
-      ssr_sample_uv = saturate(ssr_sample_uv + jitter_uv);
-    }
-  }
 
   ssr_sample_uv_scaled = resolutionScaling_g.xy * ssr_sample_uv;
   r0.yz = ssr_sample_uv_scaled;
-  if (ssr_use_temporal_jitter) {
-    r1.xyz = colorTexture.SampleLevel(samLinear_s, r0.yz, 0).xyz;
-  } else {
-    r1.xyz = colorTexture.SampleLevel(samPoint_s, r0.yz, 0).xyz;
-  }
+  r1.xyz = colorTexture.SampleLevel(samPoint_s, r0.yz, 0).xyz;
   r1.w = max(0, r0.x);
   r0.x = dot(r2.xyzw, viewProjInv_g._m00_m10_m20_m30);
   r0.y = dot(r2.xyzw, viewProjInv_g._m01_m11_m21_m31);
@@ -368,50 +346,6 @@ void main(
   r0.xz = prevResolutionScaling_g.xy * r0.xz;
   r2.xyzw = prevSSRTexture.SampleLevel(samLinear_s, r0.xz, 0).xyzw;
 
-  float history_confidence = 1.0;
-  if (all(ssr_reproj_uv >= float2(0.0, 0.0)) && all(ssr_reproj_uv <= float2(1.0, 1.0))) {
-    float2 reproj_depth_uv = resolutionScaling_g.xy * ssr_reproj_uv;
-    float reproj_depth = depthTexture.SampleLevel(samPoint_s, reproj_depth_uv, 0).x;
-    float reproj_view_z = ViewZFromDepth(reproj_depth);
-    float depth_conf = exp2(-abs(reproj_view_z - ssr_current_view_z) * 8.0);
-
-    int2 reproj_mrt0_pixel = (int2)min(ssr_reproj_uv * ssr_mrt0_dims, ssr_mrt0_max);
-    int2 reproj_mrt1_pixel = (int2)min(ssr_reproj_uv * ssr_mrt1_dims, ssr_mrt1_max);
-    uint4 reproj_mrt0 = mrtTexture0.Load(int3(reproj_mrt0_pixel, 0));
-    uint4 reproj_mrt1 = mrtTexture1.Load(int3(reproj_mrt1_pixel, 0));
-    float3 reproj_normal_vs = DecodeMrt0NormalView(reproj_mrt0);
-    float normal_conf = saturate(dot(reproj_normal_vs, ssr_origin_normal_vs));
-    normal_conf *= normal_conf;
-    float reproj_material = (float)(reproj_mrt1.y & 255u) * kInvU8;
-    float material_conf = exp2(-abs(reproj_material - ssr_origin_material) * 16.0);
-    history_confidence = depth_conf * normal_conf * material_conf;
-  } else {
-    history_confidence = 0.0;
-  }
-
-  if (ssr_improved_mode && sss_injection_data.ssr_temporal_clamp_enable >= 0.5) {
-    float history_reject_strength = saturate(sss_injection_data.ssr_temporal_clamp_strength);
-    float applied_history_confidence = lerp(1.0, history_confidence, history_reject_strength);
-    r0.y = max(r0.y, 1.0 - applied_history_confidence);
-  }
-
-  if (ssr_improved_mode && sss_injection_data.ssr_temporal_clamp_enable >= 0.5) {
-    float clamp_radius_px = max(0.0, sss_injection_data.ssr_temporal_clamp_radius);
-    float clamp_strength = saturate(sss_injection_data.ssr_temporal_clamp_strength);
-    if (clamp_radius_px > 0.0 && clamp_strength > 0.0) {
-      float2 clamp_offset = invVPSize_g.xy * clamp_radius_px * resolutionScaling_g.xy;
-      float3 c0 = colorTexture.SampleLevel(samLinear_s, ssr_sample_uv_scaled, 0).xyz;
-      float3 c1 = colorTexture.SampleLevel(samLinear_s, saturate(ssr_sample_uv_scaled + float2(-clamp_offset.x, 0.0)), 0).xyz;
-      float3 c2 = colorTexture.SampleLevel(samLinear_s, saturate(ssr_sample_uv_scaled + float2(clamp_offset.x, 0.0)), 0).xyz;
-      float3 c3 = colorTexture.SampleLevel(samLinear_s, saturate(ssr_sample_uv_scaled + float2(0.0, -clamp_offset.y)), 0).xyz;
-      float3 c4 = colorTexture.SampleLevel(samLinear_s, saturate(ssr_sample_uv_scaled + float2(0.0, clamp_offset.y)), 0).xyz;
-      float3 local_min = min(c0, min(c1, min(c2, min(c3, c4))));
-      float3 local_max = max(c0, max(c1, max(c2, max(c3, c4))));
-      float3 clamped_history = clamp(r2.xyz, local_min, local_max);
-      r2.xyz = r2.xyz + clamp_strength * (clamped_history - r2.xyz);
-      r2.w = clamp(r2.w, max(0.0, r1.w - 0.25), min(1.0, r1.w + 0.25));
-    }
-  }
   r1.xyzw = -r2.xyzw + r1.xyzw;
   o0.xyzw = r0.yyyy * r1.xyzw + r2.xyzw;
   return;

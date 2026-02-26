@@ -37,7 +37,15 @@ struct SssInjectData {
   float ssr_temporal_jitter_enable;
   float ssr_temporal_jitter_amount;
 
-  float padding;
+  // Cubemap controls (lighting + glass): 0 = Vanilla, 1 = Improved
+  float cubemap_improvements_enabled;
+  // Lighting cubemap mip boost scale (applies in lighting shader only)
+  float cubemap_lighting_mip_boost;
+
+  // Lighting shadow controls
+  float shadow_base_softness;
+
+  float padding0;
 };
 
 #ifndef __cplusplus

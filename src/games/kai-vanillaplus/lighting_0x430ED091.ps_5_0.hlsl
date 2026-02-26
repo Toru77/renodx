@@ -234,6 +234,9 @@ void main(
   float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24,r25;
   uint4 bitmask, uiDest;
   float4 fDest;
+  float cubemap_mode = sss_injection_data.cubemap_improvements_enabled;
+  float cubemap_improved_factor = saturate(cubemap_mode);
+  float cubemap_lighting_mip_boost = clamp(sss_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0);
 
   r0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -707,7 +710,7 @@ void main(
           r17.w = -r17.w + r16.z;
           r17.w = min(0.0500000007, r17.w);
 		  // add base softness
-          r17.w = (60.0 * r17.w) + 0.2;
+          r17.w = (60.0 * r17.w) + sss_injection_data.shadow_base_softness;
           r20.xy = r17.ww * r20.xy;
           
           // Fixed GetDimensions
@@ -796,7 +799,7 @@ void main(
           r17.w = -r17.w + r16.z;
           r17.w = min(0.0500000007, r17.w);
 		  // add base softness
-          r17.w = (60.0 * r17.w) + 0.2;
+          r17.w = (60.0 * r17.w) + sss_injection_data.shadow_base_softness;
           r20.xy = r17.ww * r20.xy;
           
           // Fixed GetDimensions
@@ -893,7 +896,7 @@ void main(
         r16.w = r20.z + -r16.w;
         r16.w = min(0.0500000007, r16.w);
 		// add base softness
-        r16.w = (60.0 * r16.w) + 0.2;
+        r16.w = (60.0 * r16.w) + sss_injection_data.shadow_base_softness;
         r21.xy = r16.ww * r16.yz;
         
         // Fixed GetDimensions
@@ -991,7 +994,7 @@ void main(
           r16.x = r20.z + -r16.x;
           r16.x = min(0.0500000007, r16.x);
 		  // add base softness
-          r16.x = (60.0 * r16.x) + 0.2;
+          r16.x = (60.0 * r16.x) + sss_injection_data.shadow_base_softness;
           r16.xy = r16.xx * r16.yz;
           
           // Fixed GetDimensions
@@ -1068,7 +1071,10 @@ void main(
       r7.w = (uint)r7.w;
       r7.w = r16.y * r7.w;
 	  // cube
-      r20.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r21.xyz, r7.w * 2.0).xyz;
+      r20.xyz = texEnvMap_g.SampleLevel(
+          SmplCube_s,
+          r21.xyz,
+          r7.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
     }
     r7.w = cmp(0 < r6.x);
     r13.y = 1 + -abs(r7.z);
@@ -1090,6 +1096,15 @@ void main(
     r16.xyz = r20.xyz * r7.www;
     r16.xyz = r16.xyz * r6.xxx;
     r6.x = -r4.z * r13.z + 1;
+    if (cubemap_improved_factor >= 0.5 && r4.y == 0) {
+      // Improved: skylight luminance modulation with roughness/AO shaping.
+      r13.y = max(0, dot(r20.xyz, float3(0.2126,0.7152,0.0722)));
+      r13.w = smoothstep(0.0, 0.25, r13.y);
+      r13.w = r13.w * lerp(0.5, 1.0, saturate(r13.z));
+      r13.w = r13.w * lerp(0.4, 1.0, saturate(r6.x));
+      r13.w = lerp(0.3, 1.0, r13.w);
+      r16.xyz = max(float3(0,0,0), r16.xyz * r13.www);
+    }
     r16.xyz = r16.xyz * r6.xxx + r9.xyz;
     r9.xyz = r4.yyy ? r9.xyz : r16.xyz;
   } else {

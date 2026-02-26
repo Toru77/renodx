@@ -74,9 +74,13 @@ SssInjectData shader_injection = {
     .ssr_temporal_clamp_strength = 1.f,
     .ssr_temporal_jitter_enable = 1.f,
     .ssr_temporal_jitter_amount = 1.f,
-    .padding = 0.f,
+    .cubemap_improvements_enabled = 1.f,
+    .cubemap_lighting_mip_boost = 1.5f,
+    .shadow_base_softness = 0.2f,
+    .padding0 = 0.f,
 };
 
+float settings_mode = 0.f;
 float char_ssgi_composite_enabled = 1.f;
 
 struct CharacterGiCompositeData {
@@ -620,15 +624,65 @@ void OnPresentAdvanceFrame(
   g_present_frame_index.fetch_add(1u, std::memory_order_relaxed);
 }
 
+bool IsAdvancedSettingsMode() {
+  return settings_mode >= 0.5f;
+}
+
 renodx::utils::settings::Settings settings = {
+    new renodx::utils::settings::Setting{
+        .key = "SettingsMode",
+        .binding = &settings_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .can_reset = false,
+        .label = "Settings Mode",
+        .section = "Settings",
+        .labels = {"Basic", "Advanced"},
+        .is_global = true,
+    },
     new renodx::utils::settings::Setting{
         .key = "ShadowPCSSJitter",
         .binding = &shader_injection.shadow_pcss_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Shadow Jitter",
+        .label = "Jitter",
         .section = "Shadows",
+        .tooltip = "Disable if you are not using TAA or Upscaler.",
         .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ShadowBaseSoftness",
+        .binding = &shader_injection.shadow_base_softness,
+        .default_value = 0.2f,
+        .label = "Base Softness",
+        .section = "Shadows",
+        .tooltip = "Adds a constant to the PCSS filter radius. 0.0 is Vanilla.",
+        .min = 0.f,
+        .max = 0.5f,
+        .format = "%.2f",
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CubemapImprovements",
+        .binding = &shader_injection.cubemap_improvements_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "Cubemap",
+        .labels = {"Vanilla", "Improved"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "LightingCubemapMipBoost",
+        .binding = &shader_injection.cubemap_lighting_mip_boost,
+        .default_value = 1.5f,
+        .label = "Lighting Mip Boost",
+        .section = "Cubemap",
+        .tooltip = "Lighting shader cubemap mip scale. Default is 1.5x.",
+        .min = 0.5f,
+        .max = 4.f,
+        .format = "%.1fx",
+        .is_enabled = []() { return shader_injection.cubemap_improvements_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "SSGIEnable",
@@ -650,6 +704,7 @@ renodx::utils::settings::Settings settings = {
         .max = 3.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "SSGIAlphaBoost",
@@ -662,6 +717,7 @@ renodx::utils::settings::Settings settings = {
         .max = 3.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "SSGIPower",
@@ -674,6 +730,7 @@ renodx::utils::settings::Settings settings = {
         .max = 3.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "SSRMode",
@@ -687,7 +744,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "SSRRayCountScale",
         .binding = &shader_injection.ssr_ray_count_scale,
-        .default_value = 2.f,
+        .default_value = 2.5f,
         .label = "Ray Count Scale",
         .section = "SSR",
         .tooltip = "Scales the game's SSR ray count budget. 1.0x is Vanilla.",
@@ -695,71 +752,7 @@ renodx::utils::settings::Settings settings = {
         .max = 8.f,
         .format = "%.1fx",
         .is_enabled = []() { return shader_injection.ssr_mode >= 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SSRTemporalClampEnable",
-        .binding = &shader_injection.ssr_temporal_clamp_enable,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
-        .label = "Temporal Clamp",
-        .section = "SSR",
-        .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.ssr_mode >= 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SSRTemporalClampRadius",
-        .binding = &shader_injection.ssr_temporal_clamp_radius,
-        .default_value = 1.f,
-        .label = "Clamp Radius",
-        .section = "SSR",
-        .tooltip = "Neighborhood radius (in pixels) for temporal history clamp.",
-        .min = 0.f,
-        .max = 3.f,
-        .format = "%.2f",
-        .is_enabled = []() {
-          return shader_injection.ssr_mode >= 0.5f &&
-                 shader_injection.ssr_temporal_clamp_enable >= 0.5f;
-        },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SSRTemporalClampStrength",
-        .binding = &shader_injection.ssr_temporal_clamp_strength,
-        .default_value = 1.f,
-        .label = "Clamp Strength",
-        .section = "SSR",
-        .tooltip = "Blend factor for clamped history versus raw history.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.2f",
-        .is_enabled = []() {
-          return shader_injection.ssr_mode >= 0.5f &&
-                 shader_injection.ssr_temporal_clamp_enable >= 0.5f;
-        },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SSRTemporalJitterEnable",
-        .binding = &shader_injection.ssr_temporal_jitter_enable,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
-        .label = "Temporal Jitter",
-        .section = "SSR",
-        .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.ssr_mode >= 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SSRTemporalJitterAmount",
-        .binding = &shader_injection.ssr_temporal_jitter_amount,
-        .default_value = 1.f,
-        .label = "Jitter Amount",
-        .section = "SSR",
-        .tooltip = "Sub-pixel SSR jitter amount in pixel units.",
-        .min = 0.f,
-        .max = 2.f,
-        .format = "%.2f",
-        .is_enabled = []() {
-          return shader_injection.ssr_mode >= 0.5f &&
-                 shader_injection.ssr_temporal_jitter_enable >= 0.5f;
-        },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowMode",
@@ -781,6 +774,7 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
         .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.f; },
         .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowSampleCount",
@@ -794,6 +788,7 @@ renodx::utils::settings::Settings settings = {
         .max = 64.f,
         .format = "%d",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowHardSamples",
@@ -807,6 +802,7 @@ renodx::utils::settings::Settings settings = {
         .max = 64.f,
         .format = "%d",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowFadeSamples",
@@ -820,6 +816,7 @@ renodx::utils::settings::Settings settings = {
         .max = 64.f,
         .format = "%d",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowSurfaceThickness",
@@ -832,6 +829,7 @@ renodx::utils::settings::Settings settings = {
         .max = 0.2f,
         .format = "%.4f",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowContrast",
@@ -844,6 +842,7 @@ renodx::utils::settings::Settings settings = {
         .max = 12.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowLightFadeStart",
@@ -856,6 +855,7 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowLightFadeEnd",
@@ -868,6 +868,7 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowMinOccluderDepthScale",
@@ -880,14 +881,16 @@ renodx::utils::settings::Settings settings = {
         .max = 4.f,
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowJitter",
         .binding = &shader_injection.char_shadow_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Use Jitter",
+        .label = "Jitter",
         .section = "Character Shadowing",
+        .tooltip = "Disable if you are not using TAA or Upscaler.",
         .labels = {"Off", "On"},
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
     },
@@ -911,6 +914,7 @@ renodx::utils::settings::Settings settings = {
         .max = 3.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeAlphaScale",
@@ -923,6 +927,7 @@ renodx::utils::settings::Settings settings = {
         .max = 3.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeChroma",
@@ -935,6 +940,7 @@ renodx::utils::settings::Settings settings = {
         .max = 2.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeLuma",
@@ -947,6 +953,7 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.3f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeShadowPower",
@@ -959,6 +966,7 @@ renodx::utils::settings::Settings settings = {
         .max = 4.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDarkBoost",
@@ -971,6 +979,7 @@ renodx::utils::settings::Settings settings = {
         .max = 4.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeBrightBoost",
@@ -983,6 +992,7 @@ renodx::utils::settings::Settings settings = {
         .max = 3.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeHeadroomPower",
@@ -995,6 +1005,7 @@ renodx::utils::settings::Settings settings = {
         .max = 4.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeMaxAdd",
@@ -1007,6 +1018,7 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.3f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositePeakLumaCap",
@@ -1019,6 +1031,7 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.3f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDepthReject",
@@ -1031,6 +1044,7 @@ renodx::utils::settings::Settings settings = {
         .max = 16.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeNormalReject",
@@ -1043,6 +1057,7 @@ renodx::utils::settings::Settings settings = {
         .max = 8.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeAOInfluence",
@@ -1055,6 +1070,7 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeRejectStrength",
@@ -1067,6 +1083,7 @@ renodx::utils::settings::Settings settings = {
         .max = 8.f,
         .format = "%.2f",
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDebugMode",
@@ -1094,6 +1111,7 @@ renodx::utils::settings::Settings settings = {
             "Reject Factor",
         },
         .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDebugScale",
@@ -1109,6 +1127,7 @@ renodx::utils::settings::Settings settings = {
           return char_ssgi_composite_enabled >= 0.5f
                  && character_gi_composite_data.debug_mode >= 1.f;
         },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDebugCharsOnly",
@@ -1122,6 +1141,22 @@ renodx::utils::settings::Settings settings = {
           return char_ssgi_composite_enabled >= 0.5f
                  && character_gi_composite_data.debug_mode >= 1.f;
         },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Addon made by Toru.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Thanks to Shortfuse for RenoDX.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Disable jitter options if you are not using TAA or upscalers!",
+        .section = "Info",
     },
 };
 
