@@ -216,7 +216,8 @@ void main(
   r1.xyz = w1.xxx * r0.xyz + r1.xyz;
   r0.xyzw = v2.xyzw * r1.xyzw;
 
-  // --- 3. RENODX LINEAR UI SCALING HOOK ---
+  if (RENODX_TONE_MAP_TYPE > 0.f) {
+    // SDR UI path: apply bloom-style brightening to match the game's bloom output.
   float3 ui_sdr_color = r0.xyz + v3.xyz;
   
   // Decode SDR UI texture into linear space to match our linear HDR game buffer
@@ -225,6 +226,10 @@ void main(
   // Scale by exact UI nits requested
   float reno_ui_brightness = shader_injection.graphics_white_nits / 80.f;
   r0.xyz = ui_linear_color * reno_ui_brightness;
+  }
+  else {
+   r0.xyz = r0.xyz * hdr_ui_brightness_g + v3.xyz;
+  } 
   // ---------------------------------
   r1.x = r1.w * v2.w + -1;
   r1.x = v1.z * r1.x + 1;

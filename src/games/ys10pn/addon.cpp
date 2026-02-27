@@ -206,7 +206,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .max = 2.f,
         .format = "%.2f",
-        .is_visible = []() { return current_settings_mode >= 1; },
+        .is_visible = []() { return current_settings_mode >= 1 && shader_injection.tone_map_type >= 1.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHighlights",
@@ -248,6 +248,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
+        .is_visible = []() { return current_settings_mode >= 1 && shader_injection.tone_map_type >= 1.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHighlightSaturation",
