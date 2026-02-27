@@ -105,7 +105,7 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
 
   color *= RENODX_DIFFUSE_WHITE_NITS / 80.f;
 
-  color = renodx::color::srgb::EncodeSafe(color);
+  //color = renodx::color::srgb::EncodeSafe(color);
   return color;
 }
 
