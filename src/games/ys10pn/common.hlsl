@@ -73,7 +73,26 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
   
   color = ToneMap(color);
   color = correctHue(color, hue_reference_color);
-  color = renodx::color::bt709::clamp::BT2020(color);
+  
+  // --- COLOR SPACES MOVED FROM OUTPUT ---
+  renodx::draw::Config config = renodx::draw::BuildConfig();
+  [branch]
+  if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_BT709D93) {
+    color = renodx::color::convert::ColorSpaces(color, config.swap_chain_decoding_color_space, renodx::color::convert::COLOR_SPACE_BT709);
+    color = renodx::color::bt709::from::BT709D93(color);
+    config.swap_chain_decoding_color_space = renodx::color::convert::COLOR_SPACE_BT709;
+  } else if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_NTSCU) {
+    color = renodx::color::convert::ColorSpaces(color, config.swap_chain_decoding_color_space, renodx::color::convert::COLOR_SPACE_BT709);
+    color = renodx::color::bt709::from::BT601NTSCU(color);
+    config.swap_chain_decoding_color_space = renodx::color::convert::COLOR_SPACE_BT709;
+  } else if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_NTSCJ) {
+    color = renodx::color::convert::ColorSpaces(color, config.swap_chain_decoding_color_space, renodx::color::convert::COLOR_SPACE_BT709);
+    color = renodx::color::bt709::from::ARIBTRB9(color);
+    config.swap_chain_decoding_color_space = renodx::color::convert::COLOR_SPACE_BT709;
+  }
+
+  // Use AP1 clamp to prevent invalid colors
+  color = renodx::color::bt709::clamp::AP1(color);
 
   [branch]
   if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
@@ -83,18 +102,8 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
   } else if (RENODX_GAMMA_CORRECTION == 3.f) {
     color = renodx::color::correct::GammaSafe(color, false, 2.3f);
   } 
-  
-  // This is RenderIntermediatePass, simply brightness scaling and srgb encoding
-  color *= RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
 
-  [branch]
-  if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-    color = renodx::color::correct::GammaSafe(color, true, 2.2f);
-  } else if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-    color = renodx::color::correct::GammaSafe(color, true, 2.4f);
-  } else if (RENODX_GAMMA_CORRECTION == 3.f) {
-    color = renodx::color::correct::GammaSafe(color, true, 2.3f);
-  }
+  color *= RENODX_DIFFUSE_WHITE_NITS / 80.f;
 
   color = renodx::color::srgb::EncodeSafe(color);
   return color;

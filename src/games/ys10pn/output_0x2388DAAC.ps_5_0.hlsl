@@ -28,43 +28,9 @@ void main(
     r0.xyz = tex.SampleLevel(smpl_s, v1.xy, 0).xyz;
 
     if (RENODX_TONE_MAP_TYPE > 0) {
-
+      // Decode the final composited image (Game + Native UI)
       r0.rgb = renodx::color::srgb::DecodeSafe(r0.rgb);
-
       o0 = r0;
-
-      renodx::draw::Config config = renodx::draw::BuildConfig();
-
-      if (config.gamma_correction == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-          o0.rgb = renodx::color::correct::GammaSafe(o0.rgb, false, 2.2f);
-      } else if (config.gamma_correction == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-          o0.rgb = renodx::color::correct::GammaSafe(o0.rgb, false, 2.4f);
-      } else if (config.gamma_correction == 3.f) {
-          o0.rgb = renodx::color::correct::GammaSafe(o0.rgb, false, 2.3f);
-      } 
-
-      float3 color = o0.rgb;
-      
-      [branch]
-      if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_BT709D93) {
-        color = renodx::color::convert::ColorSpaces(color, config.swap_chain_decoding_color_space, renodx::color::convert::COLOR_SPACE_BT709);
-        color = renodx::color::bt709::from::BT709D93(color);
-        config.swap_chain_decoding_color_space = renodx::color::convert::COLOR_SPACE_BT709;
-      } else if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_NTSCU) {
-        color = renodx::color::convert::ColorSpaces(color, config.swap_chain_decoding_color_space, renodx::color::convert::COLOR_SPACE_BT709);
-        color = renodx::color::bt709::from::BT601NTSCU(color);
-        config.swap_chain_decoding_color_space = renodx::color::convert::COLOR_SPACE_BT709;
-      } else if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_NTSCJ) {
-        color = renodx::color::convert::ColorSpaces(color, config.swap_chain_decoding_color_space, renodx::color::convert::COLOR_SPACE_BT709);
-        color = renodx::color::bt709::from::ARIBTRB9(color);
-        config.swap_chain_decoding_color_space = renodx::color::convert::COLOR_SPACE_BT709;
-      }
-      o0.rgb = color;
-      
-      o0.rgb = renodx::color::bt709::clamp::AP1(o0.rgb);
-
-      o0.rgb *= RENODX_GRAPHICS_WHITE_NITS / 80.f;
-
       o0.w = 1;
     }
     else {
