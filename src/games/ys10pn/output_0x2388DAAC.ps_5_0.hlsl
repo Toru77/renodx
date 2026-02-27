@@ -34,7 +34,7 @@ void main(
       o0.w = 1;
     }
     else {
-
+      r0.xyz = renodx::color::srgb::EncodeSafe(r0.xyz);
       r0.xyz = log2(r0.xyz);
       r0.xyz = float3(2.29999995,2.29999995,2.29999995) * r0.xyz;
       r0.xyz = exp2(r0.xyz);
