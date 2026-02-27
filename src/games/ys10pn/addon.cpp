@@ -133,6 +133,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Sets the brightness of UI and HUD elements in nits",
         .min = 48.f,
         .max = 500.f,
+        //.is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "GammaCorrection",

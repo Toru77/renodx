@@ -1,4 +1,5 @@
-// ---- Created with 3Dmigoto v1.4.1 on Mon Feb 23 12:03:37 2026
+// ---- Created with 3Dmigoto v1.4.1 on Fri Feb 27 14:56:55 2026
+
 #include "./shared.h"
 
 cbuffer cb_ui_hdr_cbuffer : register(b4)
@@ -36,12 +37,15 @@ void main(
   r0.y = colorTexture.CalculateLevelOfDetail(samLinear_s, v1.xy);
   r0.y = trunc(r0.y);
   r0.z = (uint)r0.y;
-// --- MANUAL RESINFO FIX ---
-  uint texWidth, texHeight, texMips;
-  colorTexture.GetDimensions((uint)r0.z, texWidth, texHeight, texMips);
-  r0.z = (float)texWidth;
-  r0.w = (float)texHeight;
-  // --------------------------
+  
+  // --- 1. RESINFO FIX ---
+  // Replaces the broken resinfo_indexable with valid HLSL GetDimensions
+  uint resWidth, resHeight, resMips;
+  colorTexture.GetDimensions((uint)r0.z, resWidth, resHeight, resMips);
+  r0.z = (float)resWidth;
+  r0.w = (float)resHeight;
+  // ----------------------
+
   r1.xyzw = float4(1,1,1,1) / r0.zwzw;
   if (r0.x != 0) {
     r0.z = ddx_coarse(v1.x);
@@ -101,7 +105,12 @@ void main(
       r0.z = cmp(0.000600000028 < r0.z);
       if (r0.z != 0) {
         r3.xyzw = float4(0,0,0,0);
-        r0.zw = float2(0,0);
+        
+        // --- 2. -NAN FIX ---
+        // 3Dmigoto misreads the assembly "l(0,0,0,-1)" as a -nan float. 
+        r0.zw = float2(0, -1);
+        // -------------------
+
         while (true) {
           r4.x = cmp(1 < (int)r0.w);
           if (r4.x != 0) break;
@@ -206,11 +215,12 @@ void main(
   r0.xyz = r0.xxx + -r1.xyz;
   r1.xyz = w1.xxx * r0.xyz + r1.xyz;
   r0.xyzw = v2.xyzw * r1.xyzw;
-  float ui_brightness = hdr_ui_brightness_g;
-  if (RENODX_TONE_MAP_TYPE > 0.f) {
-    ui_brightness = 1.f;
-  }
-  r0.xyz = r0.xyz * ui_brightness + v3.xyz;
+
+  // We completely bypass the game's hdr_ui_brightness_g variable,
+  float reno_ui_brightness = shader_injection.graphics_white_nits / 170.f;
+  r0.xyz = r0.xyz * reno_ui_brightness + v3.xyz;
+  // ---------------------------------
+
   r1.x = r1.w * v2.w + -1;
   r1.x = v1.z * r1.x + 1;
   o0.xyz = r1.xxx * r0.xyz;
