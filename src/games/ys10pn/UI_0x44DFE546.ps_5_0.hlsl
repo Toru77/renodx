@@ -210,9 +210,15 @@ void main(
   }
   r0.xyzw = v2.xyzw * r1.xyzw;
 
-  // We completely bypass the game's hdr_ui_brightness_g variable,
-  float reno_ui_brightness = shader_injection.graphics_white_nits / 170.f;
-  r0.xyz = r0.xyz * reno_ui_brightness + v3.xyz;
+  // --- 3. RENODX LINEAR UI SCALING HOOK ---
+  float3 ui_sdr_color = r0.xyz + v3.xyz;
+  
+  // Decode SDR UI texture into linear space to match our linear HDR game buffer
+  float3 ui_linear_color = renodx::color::srgb::DecodeSafe(ui_sdr_color);
+  
+  // Scale by exact UI nits requested
+  float reno_ui_brightness = shader_injection.graphics_white_nits / 80.f;
+  r0.xyz = ui_linear_color * reno_ui_brightness;
   // ---------------------------------
 
   r1.x = r1.w * v2.w + -1;

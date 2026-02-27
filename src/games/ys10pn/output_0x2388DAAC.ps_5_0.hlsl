@@ -29,7 +29,7 @@ void main(
 
     if (RENODX_TONE_MAP_TYPE > 0) {
       // Decode the final composited image (Game + Native UI)
-      r0.rgb = renodx::color::srgb::DecodeSafe(r0.rgb);
+      //r0.rgb = renodx::color::srgb::DecodeSafe(r0.rgb);
       o0 = r0;
       o0.w = 1;
     }
