@@ -37,7 +37,6 @@ void main(
     // HDR path: additive blend in scene space.
     o0.xyz = scene.xyz + blur * bloom_scale;
   }
-  
   o0.rgb = ApplyPostToneMap(o0.rgb, true);
   o0.w = scene.w;
   return;
