@@ -28,13 +28,12 @@ void main(
     r0.xyz = tex.SampleLevel(smpl_s, v1.xy, 0).xyz;
 
     if (RENODX_TONE_MAP_TYPE > 0) {
-      // Decode the final composited image (Game + Native UI)
-      //r0.rgb = renodx::color::srgb::DecodeSafe(r0.rgb);
-      o0 = r0;
+      r0.rgb = renodx::color::srgb::DecodeSafe(r0.rgb);
+      o0 = r0;     
       o0.w = 1;
     }
     else {
-      r0.xyz = renodx::color::srgb::EncodeSafe(r0.xyz);
+      //r0.xyz = renodx::color::srgb::EncodeSafe(r0.xyz);
       r0.xyz = log2(r0.xyz);
       r0.xyz = float3(2.29999995,2.29999995,2.29999995) * r0.xyz;
       r0.xyz = exp2(r0.xyz);

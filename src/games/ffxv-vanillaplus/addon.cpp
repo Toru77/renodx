@@ -59,6 +59,15 @@ float ambient_gi_bleed_radius = 1.f;
 float ambient_gi_tint_source_a = 2.f;
 float ambient_gi_tint_source_b = 0.f;
 float ambient_gi_tint_source_blend = 0.f;
+float ambient_gi_tint_luma_influence = 30.f;
+float ambient_gi_detail_suppression = 35.f;
+float ambient_gi_negative_clamp = 100.f;
+float ambient_gi_shadow_mode = 0.f;
+float ambient_gi_shadow_curve = 100.f;
+float ambient_gi_shadow_bias = 0.f;
+float ambient_gi_shadow_smoothness = 60.f;
+float ambient_gi_shadow_floor = 15.f;
+float ambient_gi_tint_floor = 0.f;
 float ambient_gi_debug_mode = 0.f;
 float ambient_gi_debug_scale = 1.f;
 
@@ -70,6 +79,12 @@ std::atomic_uint64_t g_ambient_ao_view{0u};
 std::atomic_uint64_t g_ambient_shadow_view{0u};
 std::atomic_uint64_t g_ambient_env_lut_view{0u};
 std::atomic_uint64_t g_ambient_ssr_view{0u};
+std::atomic_uint64_t g_ambient_diffuse_pass_albedo_view{0u};
+std::atomic_uint64_t g_ambient_diffuse_pass_specular_view{0u};
+std::atomic_uint64_t g_ambient_specular_pass_albedo_view{0u};
+std::atomic_uint64_t g_ambient_specular_pass_specular_view{0u};
+std::atomic_uint64_t g_ambient_lpv_pass_diffuse_view{0u};
+std::atomic_uint64_t g_ambient_lpv_pass_specular_view{0u};
 std::atomic_uint64_t g_present_frame_index{0u};
 std::atomic_uint64_t g_last_composite_frame_index{static_cast<uint64_t>(-1)};
 
@@ -188,9 +203,11 @@ void CaptureTrackedTextureView(
         break;
       case 1u:
         g_ambient_albedo_view.store(view.handle, std::memory_order_relaxed);
+        g_ambient_lpv_pass_diffuse_view.store(view.handle, std::memory_order_relaxed);
         break;
       case 2u:
         g_ambient_specular_view.store(view.handle, std::memory_order_relaxed);
+        g_ambient_lpv_pass_specular_view.store(view.handle, std::memory_order_relaxed);
         break;
       case 3u:
         g_ambient_ao_view.store(view.handle, std::memory_order_relaxed);
@@ -207,9 +224,19 @@ void CaptureTrackedTextureView(
   switch (reg) {
     case kAmbientAlbedoRegister:
       g_ambient_albedo_view.store(view.handle, std::memory_order_relaxed);
+      if (shader_hash == kAmbientDiffuseShader) {
+        g_ambient_diffuse_pass_albedo_view.store(view.handle, std::memory_order_relaxed);
+      } else if (shader_hash == kAmbientSpecularShader) {
+        g_ambient_specular_pass_albedo_view.store(view.handle, std::memory_order_relaxed);
+      }
       break;
     case kAmbientSpecularRegister:
       g_ambient_specular_view.store(view.handle, std::memory_order_relaxed);
+      if (shader_hash == kAmbientDiffuseShader) {
+        g_ambient_diffuse_pass_specular_view.store(view.handle, std::memory_order_relaxed);
+      } else if (shader_hash == kAmbientSpecularShader) {
+        g_ambient_specular_pass_specular_view.store(view.handle, std::memory_order_relaxed);
+      }
       break;
     case kAmbientNormalRegister:
       g_ambient_normal_view.store(view.handle, std::memory_order_relaxed);
@@ -518,6 +545,12 @@ bool ApplyAmbientGiComposite(
   reshade::api::resource_view shadow_view = {g_ambient_shadow_view.load(std::memory_order_relaxed)};
   reshade::api::resource_view env_lut_view = {g_ambient_env_lut_view.load(std::memory_order_relaxed)};
   reshade::api::resource_view ssr_view = {g_ambient_ssr_view.load(std::memory_order_relaxed)};
+  reshade::api::resource_view diffuse_pass_albedo_view = {g_ambient_diffuse_pass_albedo_view.load(std::memory_order_relaxed)};
+  reshade::api::resource_view diffuse_pass_specular_view = {g_ambient_diffuse_pass_specular_view.load(std::memory_order_relaxed)};
+  reshade::api::resource_view specular_pass_albedo_view = {g_ambient_specular_pass_albedo_view.load(std::memory_order_relaxed)};
+  reshade::api::resource_view specular_pass_specular_view = {g_ambient_specular_pass_specular_view.load(std::memory_order_relaxed)};
+  reshade::api::resource_view lpv_pass_diffuse_view = {g_ambient_lpv_pass_diffuse_view.load(std::memory_order_relaxed)};
+  reshade::api::resource_view lpv_pass_specular_view = {g_ambient_lpv_pass_specular_view.load(std::memory_order_relaxed)};
 
   bool has_albedo = IsViewAlive(albedo_view);
   const bool has_depth = IsViewAlive(depth_view);
@@ -530,6 +563,12 @@ bool ApplyAmbientGiComposite(
   bool has_specular = IsViewAlive(specular_view);
   bool has_env_lut = IsViewAlive(env_lut_view);
   bool has_ssr = IsViewAlive(ssr_view);
+  bool has_diffuse_pass_albedo = IsViewAlive(diffuse_pass_albedo_view);
+  bool has_diffuse_pass_specular = IsViewAlive(diffuse_pass_specular_view);
+  bool has_specular_pass_albedo = IsViewAlive(specular_pass_albedo_view);
+  bool has_specular_pass_specular = IsViewAlive(specular_pass_specular_view);
+  bool has_lpv_pass_diffuse = IsViewAlive(lpv_pass_diffuse_view);
+  bool has_lpv_pass_specular = IsViewAlive(lpv_pass_specular_view);
   if (!has_normal) normal_view = albedo_view;
   if (!has_shadow) shadow_view = ao_view;
   if (!has_specular) specular_view = albedo_view;
@@ -541,6 +580,12 @@ bool ApplyAmbientGiComposite(
 
   if (!has_env_lut) env_lut_view = data->composite_source_texture_view;
   if (!has_ssr) ssr_view = data->composite_source_texture_view;
+  if (!has_diffuse_pass_albedo) diffuse_pass_albedo_view = albedo_view;
+  if (!has_diffuse_pass_specular) diffuse_pass_specular_view = specular_view;
+  if (!has_specular_pass_albedo) specular_pass_albedo_view = albedo_view;
+  if (!has_specular_pass_specular) specular_pass_specular_view = specular_view;
+  if (!has_lpv_pass_diffuse) lpv_pass_diffuse_view = albedo_view;
+  if (!has_lpv_pass_specular) lpv_pass_specular_view = specular_view;
 
   {
     const reshade::api::resource resources[2] = {target_resource, data->composite_source_texture};
@@ -555,19 +600,27 @@ bool ApplyAmbientGiComposite(
     cmd_list->barrier(2, resources, state_new, state_old);
   }
 
-  std::array<float, 12> composite_data = {
+  std::array<float, 20> composite_data = {
       (ambient_gi_composite_enabled >= 0.5f && shader_injection.mod_enabled >= 0.5f) ? 1.f : 0.f,
       std::clamp(shader_injection.slider_1, 0.f, 100.f),
       std::clamp(shader_injection.slider_2, 0.f, 100.f),
       std::clamp(shader_injection.slider_3, 0.f, 100.f),
       std::clamp(ambient_gi_color_boost, 0.f, 400.f),
-      std::clamp(ambient_gi_debug_mode, 0.f, 14.f),
+      std::clamp(ambient_gi_debug_mode, 0.f, 16.f),
       std::clamp(ambient_gi_debug_scale, 0.f, 8.f),
       std::clamp(ambient_gi_bleed_radius, 0.f, 4.f),
-      std::clamp(ambient_gi_tint_source_a, 0.f, 7.f),
-      std::clamp(ambient_gi_tint_source_b, 0.f, 7.f),
+      std::clamp(ambient_gi_tint_source_a, 0.f, 13.f),
+      std::clamp(ambient_gi_tint_source_b, 0.f, 13.f),
       std::clamp(ambient_gi_tint_source_blend, 0.f, 100.f),
-      0.f,
+      std::clamp(ambient_gi_tint_luma_influence, 0.f, 100.f),
+      std::clamp(ambient_gi_detail_suppression, 0.f, 100.f),
+      std::clamp(ambient_gi_negative_clamp, 0.f, 100.f),
+      std::clamp(ambient_gi_shadow_mode, 0.f, 3.f),
+      std::clamp(ambient_gi_shadow_curve, 1.f, 400.f),
+      std::clamp(ambient_gi_shadow_bias, -100.f, 100.f),
+      std::clamp(ambient_gi_shadow_smoothness, 0.f, 100.f),
+      std::clamp(ambient_gi_shadow_floor, 0.f, 100.f),
+      std::clamp(ambient_gi_tint_floor, 0.f, 100.f),
   };
 
   data->composite_pass.InvalidateRenderTargets(cmd_list);
@@ -582,6 +635,12 @@ bool ApplyAmbientGiComposite(
       specular_view,
       ssr_view,
       env_lut_view,
+      diffuse_pass_albedo_view,
+      diffuse_pass_specular_view,
+      specular_pass_albedo_view,
+      specular_pass_specular_view,
+      lpv_pass_diffuse_view,
+      lpv_pass_specular_view,
   };
   data->composite_pass.sampler_descs = {reshade::api::sampler_desc{}};
   data->composite_pass.pipeline_subobjects.vertex_shader = __0xFFFFFFFD;
@@ -717,6 +776,12 @@ renodx::utils::settings::Settings settings = {
             "Shadow",
             "Normal",
             "Env LUT",
+            "Amb Diffuse T1",
+            "Amb Diffuse T2",
+            "Amb Spec T1",
+            "Amb Spec T2",
+            "LPV Diffuse T1",
+            "LPV Specular T2",
         },
     },
     new renodx::utils::settings::Setting{
@@ -735,6 +800,12 @@ renodx::utils::settings::Settings settings = {
             "Shadow",
             "Normal",
             "Env LUT",
+            "Amb Diffuse T1",
+            "Amb Diffuse T2",
+            "Amb Spec T1",
+            "Amb Spec T2",
+            "LPV Diffuse T1",
+            "LPV Specular T2",
         },
     },
     new renodx::utils::settings::Setting{
@@ -744,6 +815,100 @@ renodx::utils::settings::Settings settings = {
         .label = "Tint Blend",
         .section = "Vanilla+",
         .tooltip = "Blends between Tint Source A (0) and B (100).",
+        .min = 0.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGITintLumaInfluence",
+        .binding = &ambient_gi_tint_luma_influence,
+        .default_value = 30.f,
+        .label = "Tint Luma Influence",
+        .section = "Vanilla+",
+        .tooltip = "Lower values reduce grime-like luma transfer from albedo/spec textures.",
+        .min = 0.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGIDetailSuppression",
+        .binding = &ambient_gi_detail_suppression,
+        .default_value = 35.f,
+        .label = "Detail Suppression",
+        .section = "Vanilla+",
+        .tooltip = "Suppresses high-frequency texture detail from tint sources.",
+        .min = 0.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGINegativeClamp",
+        .binding = &ambient_gi_negative_clamp,
+        .default_value = 100.f,
+        .label = "Negative Clamp",
+        .section = "Vanilla+",
+        .tooltip = "Clamps negative GI channels to prevent darkening on hair/skin/specular.",
+        .min = 0.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGIShadowMode",
+        .binding = &ambient_gi_shadow_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Shadow Mode",
+        .section = "Vanilla+",
+        .labels = {
+            "Shadow",
+            "AO",
+            "Min(Shadow,AO)",
+            "Max(Shadow,AO)",
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGIShadowCurve",
+        .binding = &ambient_gi_shadow_curve,
+        .default_value = 100.f,
+        .label = "Shadow Curve",
+        .section = "Vanilla+",
+        .tooltip = "Shapes shadow mask response (100 = linear, lower = stronger, higher = softer).",
+        .min = 1.f,
+        .max = 400.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGIShadowBias",
+        .binding = &ambient_gi_shadow_bias,
+        .default_value = 0.f,
+        .label = "Shadow Bias",
+        .section = "Vanilla+",
+        .tooltip = "Offsets shadow mask before curve (-100..100).",
+        .min = -100.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGIShadowSmoothness",
+        .binding = &ambient_gi_shadow_smoothness,
+        .default_value = 60.f,
+        .label = "Shadow Smoothness",
+        .section = "Vanilla+",
+        .tooltip = "Blurs shadow/AO mask used by GI to reduce dirt-like texture imprint.",
+        .min = 0.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGIShadowFloor",
+        .binding = &ambient_gi_shadow_floor,
+        .default_value = 15.f,
+        .label = "Shadow Floor",
+        .section = "Vanilla+",
+        .tooltip = "Minimum shadow term so GI remains visible without pushing Shadow Bias.",
+        .min = 0.f,
+        .max = 100.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "AmbientGITintFloor",
+        .binding = &ambient_gi_tint_floor,
+        .default_value = 0.f,
+        .label = "Tint Floor",
+        .section = "Vanilla+",
+        .tooltip = "Lifts very dark tint values to prevent muddy or dirty indirect color.",
         .min = 0.f,
         .max = 100.f,
     },
@@ -770,6 +935,8 @@ renodx::utils::settings::Settings settings = {
             "Tint Source",
             "A Bleed",
             "B Bleed",
+            "Shadow Shaped",
+            "GI Raw",
         },
     },
     new renodx::utils::settings::Setting{

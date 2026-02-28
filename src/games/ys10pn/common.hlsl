@@ -74,7 +74,6 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
   color = ToneMap(color);
   color = correctHue(color, hue_reference_color);
   
-  // --- COLOR SPACES MOVED FROM OUTPUT ---
   renodx::draw::Config config = renodx::draw::BuildConfig();
   [branch]
   if (config.swap_chain_custom_color_space == renodx::draw::COLOR_SPACE_CUSTOM_BT709D93) {
@@ -94,18 +93,9 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
   // Use AP1 clamp to prevent invalid colors
   color = renodx::color::bt709::clamp::AP1(color);
 
-  [branch]
-  if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_2) {
-    color = renodx::color::correct::GammaSafe(color, false, 2.2f);
-  } else if (RENODX_GAMMA_CORRECTION == renodx::draw::GAMMA_CORRECTION_GAMMA_2_4) {
-    color = renodx::color::correct::GammaSafe(color, false, 2.4f);
-  } else if (RENODX_GAMMA_CORRECTION == 3.f) {
-    color = renodx::color::correct::GammaSafe(color, false, 2.3f);
-  } 
-
-  color *= RENODX_DIFFUSE_WHITE_NITS / 80.f;
-
+  //color *= RENODX_DIFFUSE_WHITE_NITS / 80.f;
   //color = renodx::color::srgb::EncodeSafe(color);
+  color = renodx::draw::RenderIntermediatePass(color, config);
   return color;
 }
 

@@ -26,6 +26,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x557E2C4E),  // post
     CustomShaderEntry(0x44DFE546),  // ui brightness
     CustomShaderEntry(0x36B738AD),  // ui secondary
+    CustomShaderEntry(0x51BF62D8),  // charmenu character
 };
 
 float current_settings_mode = 0;
