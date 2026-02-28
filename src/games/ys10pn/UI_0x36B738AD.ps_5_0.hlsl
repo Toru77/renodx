@@ -216,20 +216,18 @@ void main(
   r1.xyz = w1.xxx * r0.xyz + r1.xyz;
   r0.xyzw = v2.xyzw * r1.xyzw;
 
+  // Reno HDR path: cancel game UI gain so Reno nits is the only UI control.
+  float ui_game_scale = max(hdr_ui_brightness_g, 1e-4f);
+  float3 ui_native = r0.xyz * ui_game_scale + v3.xyz;
   if (RENODX_TONE_MAP_TYPE > 0.f) {
-    // SDR UI path: apply bloom-style brightening to match the game's bloom output.
-  float3 ui_sdr_color = r0.xyz + v3.xyz;
-  
-  // Decode SDR UI texture into linear space to match our linear HDR game buffer
-  float3 ui_linear_color = renodx::color::srgb::DecodeSafe(ui_sdr_color);
-  
-  // Scale by exact UI nits requested
-  float reno_ui_brightness = shader_injection.graphics_white_nits / 80.f;
-  r0.xyz = ui_linear_color * reno_ui_brightness;
+    float3 ui_linear = renodx::color::srgb::DecodeSafe(ui_native);
+    float reno_ui_scale = shader_injection.graphics_white_nits / renodx::color::bt2408::GRAPHICS_WHITE;
+    r0.xyz = ui_linear * (reno_ui_scale / ui_game_scale);
+    r0.xyz = r0.xyz *2.3f;
+  } else {
+    float3 ui_linear = renodx::color::srgb::DecodeSafe(ui_native);
+    r0.xyz = r0.xyz * hdr_ui_brightness_g + v3.xyz;
   }
-  else {
-   r0.xyz = r0.xyz * hdr_ui_brightness_g + v3.xyz;
-  } 
   // ---------------------------------
   r1.x = r1.w * v2.w + -1;
   r1.x = v1.z * r1.x + 1;
