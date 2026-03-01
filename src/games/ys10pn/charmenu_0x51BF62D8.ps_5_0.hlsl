@@ -1,4 +1,5 @@
 // ---- Created with 3Dmigoto v1.4.1 on Sat Feb 28 21:15:33 2026
+#include "./shared.h"
 
 struct ShaderDeferredParam
 {
@@ -1336,6 +1337,10 @@ void main(
     r2.w = mad((int)r0.z, 0x00010000, (int)r0.x);
   }
   o0.xyzw = r3.xyzw;
+  o0.xyz = renodx::tonemap::renodrt::BT709(o0.xyz);
+  //o0.xyz = renodx::color::srgb::DecodeSafe(o0.xyz);
+  o0.xyz = renodx::draw::ToneMapPass(o0.xyz); 
+  //o0.xyz = renodx::draw::RenderIntermediatePass(o0.xyz);
   o1.xy = r1.yx;
   o2.xy = r2.xw;
   return;
