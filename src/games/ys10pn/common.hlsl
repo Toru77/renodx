@@ -65,9 +65,9 @@ float3 correctHue(float3 color, float3 reference_color) {
 
 float3 ApplyPostToneMap(float3 color, bool decoding = true) {
 
-  if (decoding) {
+  //if (decoding) {
     color = renodx::color::srgb::DecodeSafe(color);
-  }
+  //}
 
   float3 hue_reference_color = renodx::tonemap::Reinhard(max(0.f, color));
   
@@ -93,9 +93,9 @@ float3 ApplyPostToneMap(float3 color, bool decoding = true) {
   // Use AP1 clamp to prevent invalid colors
   color = renodx::color::bt709::clamp::AP1(color);
 
-  //color *= RENODX_DIFFUSE_WHITE_NITS / 80.f;
-  //color = renodx::color::srgb::EncodeSafe(color);
-  color = renodx::draw::RenderIntermediatePass(color, config);
+  color *= RENODX_DIFFUSE_WHITE_NITS / 80.f;
+  color = renodx::color::srgb::EncodeSafe(color);
+  //color = renodx::draw::RenderIntermediatePass(color, config);
   return color;
 }
 

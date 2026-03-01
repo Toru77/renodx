@@ -214,7 +214,7 @@ void main(
   float ui_game_scale = max(hdr_ui_brightness_g, 1e-4f);
   float3 ui_native = r0.xyz * ui_game_scale + v3.xyz;
   if (RENODX_TONE_MAP_TYPE > 0.f){
-    //float3 ui_linear = renodx::color::srgb::DecodeSafe(ui_native);
+    //float3 ui_linear = renodx::color::srgb::EncodeSafe(ui_native);
     float reno_ui_scale = shader_injection.graphics_white_nits / renodx::color::bt2408::GRAPHICS_WHITE;
     r0.xyz = ui_native * (reno_ui_scale / ui_game_scale);
     r0.xyz = r0.xyz*1.15f;
