@@ -201,7 +201,7 @@ SamplerComparisonState SmplShadow_s : register(s13);
 Texture2D<float4> colorTexture : register(t0);
 Texture2D<uint4> mrtTexture0 : register(t1);
 Texture2D<uint4> mrtTexture1 : register(t2);
-Texture2D<float4> depthTexture : register(t3);
+Texture2D<float> depthTexture : register(t3);
 Texture2D<float4> ssaoTexture : register(t4);
 StructuredBuffer<DeferredParam> deferredParams_g : register(t5);
 StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t6);
@@ -220,6 +220,7 @@ Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 
 #include "./kai-vanillaplus.h"
+#include "./rendering.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -237,6 +238,23 @@ void main(
   float cubemap_mode = sss_injection_data.cubemap_improvements_enabled;
   float cubemap_improved_factor = saturate(cubemap_mode);
   float cubemap_lighting_mip_boost = clamp(sss_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0);
+  bool exp_master_improved = sss_injection_data.exp_master_improved >= 0.5;
+  bool exp_env_brdf_enabled = exp_master_improved && (sss_injection_data.exp_env_brdf_enabled >= 0.5);
+  float exp_env_brdf_strength = saturate(sss_injection_data.exp_env_brdf_strength);
+  bool exp_probe_sampling_enabled = exp_master_improved && (sss_injection_data.exp_probe_sampling_enabled >= 0.5);
+  float exp_probe_sampling_strength = saturate(sss_injection_data.exp_probe_sampling_strength);
+  float exp_probe_direction_strength = saturate(sss_injection_data.exp_probe_direction_strength);
+  float exp_probe_mip_strength = saturate(sss_injection_data.exp_probe_mip_strength);
+  bool exp_horizon_occlusion_enabled = exp_master_improved && (sss_injection_data.exp_horizon_occlusion_enabled >= 0.5);
+  float exp_horizon_occlusion_strength = saturate(sss_injection_data.exp_horizon_occlusion_strength);
+  float exp_horizon_energy_fraction = clamp(sss_injection_data.exp_horizon_energy_fraction, 0.1, 0.99);
+  float exp_horizon_power = clamp(sss_injection_data.exp_horizon_power, 0.25, 4.0);
+  bool exp_fog_color_correction_enabled = exp_master_improved && (sss_injection_data.exp_fog_color_correction_enabled >= 0.5);
+  float exp_fog_hue = clamp(sss_injection_data.exp_fog_hue, 0.0, 2.0);
+  float exp_fog_chrominance = clamp(sss_injection_data.exp_fog_chrominance, 0.0, 2.0);
+  float exp_fog_avg_brightness = clamp(sss_injection_data.exp_fog_avg_brightness, 0.0, 2.0);
+  float exp_fog_min_brightness = clamp(sss_injection_data.exp_fog_min_brightness, -0.5, 1.0);
+  float exp_fog_color_correction_strength = saturate(sss_injection_data.exp_fog_color_correction_strength);
 
   r0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -1061,16 +1079,33 @@ void main(
     } else {
       r7.w = r7.z + r7.z;
       r21.xyz = r5.xyw * -r7.www + r18.xyz;
+      float3 exp_probe_dir_ws = normalize(r21.xyz);
+      if (exp_probe_sampling_enabled) {
+        float exp_probe_dir_blend = saturate(exp_probe_sampling_strength * exp_probe_direction_strength);
+        float3 exp_probe_dir_improved = renodx::rendering::DominantDirectionCorrection(
+            exp_probe_dir_ws,
+            normalize(r5.xyw),
+            saturate(r13.z));
+        exp_probe_dir_ws = normalize(lerp(exp_probe_dir_ws, exp_probe_dir_improved, exp_probe_dir_blend));
+      }
       
       // Fixed GetDimensions
       uint w, h, levels;
       texEnvMap_g.GetDimensions(0, w, h, levels);
       r7.w = levels;
       
-      r21.xyz = float3(1,-1,-1) * r21.xyz;
-      r7.w = (int)r7.w + -1;
-      r7.w = (uint)r7.w;
-      r7.w = r16.y * r7.w;
+      float exp_env_mip_vanilla = r16.y * max(r7.w - 1.0, 0.0);
+      float exp_env_mip = exp_env_mip_vanilla;
+      if (exp_probe_sampling_enabled) {
+        float exp_probe_mip_blend = saturate(exp_probe_mip_strength);
+        float exp_probe_roughness = saturate(r13.z);
+        float exp_env_mip_improved = renodx::rendering::ProbeMipFromRoughness(
+            sqrt(exp_probe_roughness),
+            r7.w);
+        exp_env_mip = lerp(exp_env_mip_vanilla, exp_env_mip_improved, exp_probe_mip_blend);
+      }
+      r21.xyz = float3(1,-1,-1) * exp_probe_dir_ws;
+      r7.w = exp_env_mip;
 	  // cube
       r20.xyz = texEnvMap_g.SampleLevel(
           SmplCube_s,
@@ -1096,6 +1131,25 @@ void main(
     r7.w = r16.x * r13.y + r7.w;
     r16.xyz = r20.xyz * r7.www;
     r16.xyz = r16.xyz * r6.xxx;
+    if (exp_env_brdf_enabled) {
+      float3 exp_env_brdf_applied = renodx::rendering::ApplyEnvBRDF(
+          r20.xyz,
+          saturate(r9.xyz),
+          saturate(r7.z),
+          saturate(r13.z));
+      r16.xyz = lerp(r16.xyz, exp_env_brdf_applied, exp_env_brdf_strength);
+    }
+    if (exp_horizon_occlusion_enabled) {
+      float exp_horizon = renodx::rendering::HorizonOcclusionApprox(
+          r2.xyz,
+          normalize(r5.xyw),
+          normalize(r21.xyz * float3(1,-1,-1)),
+          saturate(r13.z),
+          exp_horizon_energy_fraction);
+      exp_horizon = pow(saturate(exp_horizon), exp_horizon_power);
+      exp_horizon = lerp(1.0, exp_horizon, exp_horizon_occlusion_strength);
+      r16.xyz = r16.xyz * exp_horizon.xxx;
+    }
     r6.x = -r4.z * r13.z + 1;
     if (cubemap_improved_factor >= 0.5 && r4.y == 0) {
       // Improved: skylight luminance modulation with roughness/AO shaping.
@@ -1512,6 +1566,18 @@ void main(
   r0.z = r0.z * r0.w;
   r3.xyz = fogColor_g.xyz + -r4.xyz;
   r3.xyz = r0.zzz * r3.xyz + r4.xyz;
+  if (exp_fog_color_correction_enabled) {
+    float3 exp_fog_fade = r0.zzz * (fogColor_g.xyz - r4.xyz);
+    float exp_fog_hdr_norm = max(max(r4.x, max(r4.y, r4.z)), 1.0);
+    r3.xyz = renodx::rendering::FogColorCorrection(
+        r4.xyz / exp_fog_hdr_norm,
+        exp_fog_fade / exp_fog_hdr_norm,
+        exp_fog_hue,
+        exp_fog_chrominance,
+        exp_fog_avg_brightness,
+        exp_fog_min_brightness,
+        exp_fog_color_correction_strength) * exp_fog_hdr_norm;
+  }
   r0.z = (int)r1.x & 64;
   r0.z = cmp((int)r0.z == 0);
   r0.w = cmp(0 != isEnableSky_g);
@@ -1681,3 +1747,4 @@ void main(
   o1.z = r0.y;
   return;
 }
+
