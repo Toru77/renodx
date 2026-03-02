@@ -45,6 +45,38 @@ struct SssInjectData {
   // Lighting shadow controls
   float shadow_base_softness;
 
+  // Car shading controls (car_0xDC173E86)
+  float car_mode;
+  float car_diffuse_scale;
+  float car_specular_scale;
+  float car_reflection_scale;
+  float car_local_light_scale;
+  float car_ambient_scale;
+  float car_rim_scale;
+  float car_shadow_scale;
+  float car_ssr_scale;
+  float car_cubemap_mip_scale;
+  float car_cubemap_brightness;
+
+  // Experimental lighting controls (lighting_0x430ED091 / lightingsoft_0xF6C55E5F)
+  float exp_master_improved;
+  float exp_env_brdf_enabled;
+  float exp_env_brdf_strength;
+  float exp_probe_sampling_enabled;
+  float exp_probe_sampling_strength;
+  float exp_probe_direction_strength;
+  float exp_probe_mip_strength;
+  float exp_horizon_occlusion_enabled;
+  float exp_horizon_occlusion_strength;
+  float exp_horizon_energy_fraction;
+  float exp_horizon_power;
+  float exp_fog_color_correction_enabled;
+  float exp_fog_hue;
+  float exp_fog_chrominance;
+  float exp_fog_avg_brightness;
+  float exp_fog_min_brightness;
+  float exp_fog_color_correction_strength;
+
   float padding0;
 };
 
@@ -59,3 +91,4 @@ cbuffer sss_injection : register(b13) {
 #endif
 
 #endif  // SRC_GAMES_KAI_VANILLAPLUS_INJECTION_H_
+

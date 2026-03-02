@@ -56,6 +56,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xB1CCBCAE),                 // glass
     CustomShaderEntry(0xE1E0ACBB),                 // glass
     CustomShaderEntry(0xF237E72F),                 // glass
+    CustomShaderEntry(0xDC173E86),                 // car
 };
 
 SssInjectData shader_injection = {
@@ -86,6 +87,34 @@ SssInjectData shader_injection = {
     .cubemap_improvements_enabled = 1.f,
     .cubemap_lighting_mip_boost = 1.5f,
     .shadow_base_softness = 0.2f,
+    .car_mode = 0.f,
+    .car_diffuse_scale = 1.f,
+    .car_specular_scale = 1.f,
+    .car_reflection_scale = 1.f,
+    .car_local_light_scale = 1.f,
+    .car_ambient_scale = 1.f,
+    .car_rim_scale = 1.f,
+    .car_shadow_scale = 1.f,
+    .car_ssr_scale = 1.f,
+    .car_cubemap_mip_scale = 1.f,
+    .car_cubemap_brightness = 1.f,
+    .exp_master_improved = 1.f,
+    .exp_env_brdf_enabled = 1.f,
+    .exp_env_brdf_strength = 1.f,
+    .exp_probe_sampling_enabled = 1.f,
+    .exp_probe_sampling_strength = 1.f,
+    .exp_probe_direction_strength = 1.f,
+    .exp_probe_mip_strength = 1.f,
+    .exp_horizon_occlusion_enabled = 1.f,
+    .exp_horizon_occlusion_strength = 0.75f,
+    .exp_horizon_energy_fraction = 0.85f,
+    .exp_horizon_power = 2.0f,
+    .exp_fog_color_correction_enabled = 1.f,
+    .exp_fog_hue = 0.35f,
+    .exp_fog_chrominance = 0.45f,
+    .exp_fog_avg_brightness = 0.85f,
+    .exp_fog_min_brightness = 0.f,
+    .exp_fog_color_correction_strength = 1.f,
     .padding0 = 0.f,
 };
 
@@ -636,7 +665,11 @@ void OnPresentAdvanceFrame(
 }
 
 bool IsAdvancedSettingsMode() {
-  return settings_mode >= 0.5f;
+  return settings_mode >= 0.5f && settings_mode < 1.5f;
+}
+
+bool IsExperimentalSettingsMode() {
+  return settings_mode >= 1.5f;
 }
 
 renodx::utils::settings::Settings settings = {
@@ -648,7 +681,7 @@ renodx::utils::settings::Settings settings = {
         .can_reset = false,
         .label = "Settings Mode",
         .section = "Settings",
-        .labels = {"Basic", "Advanced"},
+        .labels = {"Basic", "Advanced", "Experimental"},
         .is_global = true,
     },
     new renodx::utils::settings::Setting{
@@ -703,6 +736,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Enable",
         .section = "SSGI",
         .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "SSGIColorBoost",
@@ -764,6 +798,135 @@ renodx::utils::settings::Settings settings = {
         .format = "%.1fx",
         .is_enabled = []() { return shader_injection.ssr_mode >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarMode",
+        .binding = &shader_injection.car_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Mode",
+        .section = "Car",
+        .labels = {"Vanilla", "Improved"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarDiffuseScale",
+        .binding = &shader_injection.car_diffuse_scale,
+        .default_value = 1.f,
+        .label = "Diffuse Scale",
+        .section = "Car",
+        .tooltip = "Scales directional/body diffuse response. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarSpecularScale",
+        .binding = &shader_injection.car_specular_scale,
+        .default_value = 1.f,
+        .label = "Specular Scale",
+        .section = "Car",
+        .tooltip = "Scales directional/specular highlights. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarReflectionScale",
+        .binding = &shader_injection.car_reflection_scale,
+        .default_value = 1.f,
+        .label = "Reflection Scale",
+        .section = "Car",
+        .tooltip = "Scales cubemap/mirror reflection strength. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarCubemapMipScale",
+        .binding = &shader_injection.car_cubemap_mip_scale,
+        .default_value = 1.f,
+        .label = "Cubemap Mip Scale",
+        .section = "Car",
+        .tooltip = "Scales cubemap sample mip level. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarCubemapBrightness",
+        .binding = &shader_injection.car_cubemap_brightness,
+        .default_value = 1.f,
+        .label = "Cubemap Brightness",
+        .section = "Car",
+        .tooltip = "Cubemap reflection brightness/strength. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarSSRScale",
+        .binding = &shader_injection.car_ssr_scale,
+        .default_value = 1.f,
+        .label = "SSR Blend Scale",
+        .section = "Car",
+        .tooltip = "Scales screen-space reflection blend weight. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarAmbientScale",
+        .binding = &shader_injection.car_ambient_scale,
+        .default_value = 1.f,
+        .label = "Ambient Scale",
+        .section = "Car",
+        .tooltip = "Scales ambient/probe lighting. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarLocalLightScale",
+        .binding = &shader_injection.car_local_light_scale,
+        .default_value = 1.f,
+        .label = "Local Light Scale",
+        .section = "Car",
+        .tooltip = "Scales point/spot light influence. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarRimScale",
+        .binding = &shader_injection.car_rim_scale,
+        .default_value = 1.f,
+        .label = "Rim Scale",
+        .section = "Car",
+        .tooltip = "Scales rim-light contribution. 1.0 = Vanilla.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "CarShadowScale",
+        .binding = &shader_injection.car_shadow_scale,
+        .default_value = 1.f,
+        .label = "Shadow Strength",
+        .section = "Car",
+        .tooltip = "0 = no shadowing, 1 = Vanilla, >1 darker shadows.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.car_mode >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "CharShadowMode",
@@ -1156,6 +1319,250 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Set Global Mode to Vanilla to force vanilla code for all experimental effects.",
+        .section = "Experimental",
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpGlobalMode",
+        .binding = &shader_injection.exp_master_improved,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Global Mode",
+        .section = "Experimental",
+        .tooltip = "Vanilla forces vanilla path for all effects. Improved allows per-effect mode.",
+        .labels = {"Vanilla", "Improved"},
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpEnvBRDF",
+        .binding = &shader_injection.exp_env_brdf_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Env BRDF",
+        .section = "Experimental",
+        .tooltip = "Split-sum environment BRDF on cubemap reflections.",
+        .labels = {"Vanilla", "Improved"},
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpEnvBRDFStrength",
+        .binding = &shader_injection.exp_env_brdf_strength,
+        .default_value = 1.f,
+        .label = "Env BRDF Strength",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_env_brdf_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpProbeSampling",
+        .binding = &shader_injection.exp_probe_sampling_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Probe Sampling",
+        .section = "Experimental",
+        .tooltip = "Dominant direction + roughness-aware probe mip mapping.",
+        .labels = {"Vanilla", "Improved"},
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpProbeSamplingStrength",
+        .binding = &shader_injection.exp_probe_sampling_strength,
+        .default_value = 1.f,
+        .label = "Probe Sampling Strength",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_probe_sampling_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpProbeDirectionStrength",
+        .binding = &shader_injection.exp_probe_direction_strength,
+        .default_value = 1.f,
+        .label = "Probe Direction",
+        .section = "Experimental",
+        .tooltip = "Blend toward dominant-direction corrected reflection vector.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_probe_sampling_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpProbeMipStrength",
+        .binding = &shader_injection.exp_probe_mip_strength,
+        .default_value = 1.f,
+        .label = "Probe Mip",
+        .section = "Experimental",
+        .tooltip = "Blend toward roughness-based probe mip selection.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_probe_sampling_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpHorizonOcclusion",
+        .binding = &shader_injection.exp_horizon_occlusion_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Horizon Occlusion",
+        .section = "Experimental",
+        .tooltip = "Reduces impossible below-horizon specular IBL.",
+        .labels = {"Vanilla", "Improved"},
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpHorizonOcclusionStrength",
+        .binding = &shader_injection.exp_horizon_occlusion_strength,
+        .default_value = 0.75f,
+        .label = "Horizon Strength",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_horizon_occlusion_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpHorizonEnergyFraction",
+        .binding = &shader_injection.exp_horizon_energy_fraction,
+        .default_value = 0.85f,
+        .label = "Horizon Energy",
+        .section = "Experimental",
+        .tooltip = "Visible GGX lobe energy fraction used by horizon occlusion cone.",
+        .min = 0.1f,
+        .max = 0.99f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_horizon_occlusion_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpHorizonPower",
+        .binding = &shader_injection.exp_horizon_power,
+        .default_value = 2.0f,
+        .label = "Horizon Power",
+        .section = "Experimental",
+        .tooltip = "Response curve for horizon occlusion. Higher = stronger darkening.",
+        .min = 0.25f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_horizon_occlusion_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpFogColorCorrection",
+        .binding = &shader_injection.exp_fog_color_correction_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Fog Color Correction",
+        .section = "Experimental",
+        .labels = {"Vanilla", "Improved"},
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpFogHue",
+        .binding = &shader_injection.exp_fog_hue,
+        .default_value = 0.35f,
+        .label = "Fog Hue",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_fog_color_correction_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpFogChrominance",
+        .binding = &shader_injection.exp_fog_chrominance,
+        .default_value = 0.45f,
+        .label = "Fog Chroma",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_fog_color_correction_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpFogAvgBrightness",
+        .binding = &shader_injection.exp_fog_avg_brightness,
+        .default_value = 0.85f,
+        .label = "Fog Avg Bright",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_fog_color_correction_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpFogMinBrightness",
+        .binding = &shader_injection.exp_fog_min_brightness,
+        .default_value = 0.f,
+        .label = "Fog Min Bright",
+        .section = "Experimental",
+        .min = -0.5f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_fog_color_correction_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExpFogColorCorrectionStrength",
+        .binding = &shader_injection.exp_fog_color_correction_strength,
+        .default_value = 1.f,
+        .label = "Fog Correction Strength",
+        .section = "Experimental",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.exp_master_improved >= 0.5f
+                 && shader_injection.exp_fog_color_correction_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsExperimentalSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "Addon made by Toru.",
         .section = "Info",
     },
@@ -1225,3 +1632,4 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   return TRUE;
 }
+
