@@ -6,7 +6,8 @@ Texture2D<uint4> mrtTexture1 : register(t3);
 Texture2D<float4> depthTexture : register(t4);
 Texture2D<float4> ssaoTexture : register(t5);
 
-static const uint CHARACTER_MASK_SHIFT = 8u;
+static const uint CHARACTER_MRT_VALUE_A = 2303u;  // 0x08FF
+static const uint CHARACTER_MRT_VALUE_B = 3327u;  // 0x0CFF
 static const float3 LUMA_WEIGHTS = float3(0.299, 0.587, 0.114);
 static const float INV_U16 = 1.0 / 32767.0;
 static const float INV_U8 = 1.0 / 255.0;
@@ -25,7 +26,7 @@ cbuffer character_ssgi_composite_settings : register(b13) {
   float4 characterGiParams2;
   // x=peak_luma_cap, y=depth_reject, z=normal_reject, w=ao_influence
   float4 characterGiParams3;
-  // x=reject_strength, yzw=reserved
+  // x=reject_strength, y=unused, z=unused, w=unused
   float4 characterGiParams4;
 }
 
@@ -49,6 +50,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   float4 source = sourceTexture.SampleLevel(samLinear_s, uv, 0);
   float3 source_base = source.rgb;
   float4 ssgi = ssgiTexture.SampleLevel(samLinear_s, uv, 0);
+
+  // Sanitize SSGI: NaN/Inf in the GI buffer will propagate through all math
+  // (NaN * 0.0 = NaN), corrupting even non-character pixels.
+  // Use bitwise NaN check — FXC fast-math can optimize away isnan().
+  uint4 ssgi_bits = asuint(ssgi);
+  bool4 ssgi_nan = ((ssgi_bits & 0x7F800000u) == 0x7F800000u) & ((ssgi_bits & 0x007FFFFFu) != 0u);
+  bool4 ssgi_inf = ((ssgi_bits & 0x7FFFFFFFu) == 0x7F800000u);
+  if (any(ssgi_nan) || any(ssgi_inf)) ssgi = float4(0, 0, 0, 0);
 
   uint mrt0_width, mrt0_height;
   mrtTexture0.GetDimensions(mrt0_width, mrt0_height);
@@ -81,8 +90,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   float4 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, uv, 0);
   float ao_raw = saturate(max(ssao_sample.x, ssao_sample.y * ssao_sample.z));
 
-  uint material_flags = (mrt.z >> CHARACTER_MASK_SHIFT);
-  uint is_character = (material_flags & 1u);
+  uint material_flags = mrt.z;
+  uint is_character = (material_flags == CHARACTER_MRT_VALUE_A || material_flags == CHARACTER_MRT_VALUE_B) ? 1u : 0u;
   float char_mask = (is_character != 0u) ? 1.0 : 0.0;
 
   float3 normal_center = DecodeMrt0Normal(mrt);
@@ -149,6 +158,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   }
   gi_contrib *= char_mask;
   source.rgb = source_base + gi_contrib;
+
+
 
   uint debug_mode = (uint)(max(characterGiParams2.x, 0.0) + 0.5);
   if (debug_mode != 0u) {

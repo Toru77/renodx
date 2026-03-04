@@ -235,23 +235,16 @@ void main(
   float cubemap_mode = sss_injection_data.cubemap_improvements_enabled;
   float cubemap_improved_factor = saturate(cubemap_mode);
   float cubemap_lighting_mip_boost = clamp(sss_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0);
-  bool exp_master_improved = sss_injection_data.exp_master_improved >= 0.5;
-  bool exp_env_brdf_enabled = exp_master_improved && (sss_injection_data.exp_env_brdf_enabled >= 0.5);
-  float exp_env_brdf_strength = saturate(sss_injection_data.exp_env_brdf_strength);
-  bool exp_probe_sampling_enabled = exp_master_improved && (sss_injection_data.exp_probe_sampling_enabled >= 0.5);
-  float exp_probe_sampling_strength = saturate(sss_injection_data.exp_probe_sampling_strength);
-  float exp_probe_direction_strength = saturate(sss_injection_data.exp_probe_direction_strength);
-  float exp_probe_mip_strength = saturate(sss_injection_data.exp_probe_mip_strength);
-  bool exp_horizon_occlusion_enabled = exp_master_improved && (sss_injection_data.exp_horizon_occlusion_enabled >= 0.5);
-  float exp_horizon_occlusion_strength = saturate(sss_injection_data.exp_horizon_occlusion_strength);
-  float exp_horizon_energy_fraction = clamp(sss_injection_data.exp_horizon_energy_fraction, 0.1, 0.99);
-  float exp_horizon_power = clamp(sss_injection_data.exp_horizon_power, 0.25, 4.0);
-  bool exp_fog_color_correction_enabled = exp_master_improved && (sss_injection_data.exp_fog_color_correction_enabled >= 0.5);
-  float exp_fog_hue = clamp(sss_injection_data.exp_fog_hue, 0.0, 2.0);
-  float exp_fog_chrominance = clamp(sss_injection_data.exp_fog_chrominance, 0.0, 2.0);
-  float exp_fog_avg_brightness = clamp(sss_injection_data.exp_fog_avg_brightness, 0.0, 2.0);
-  float exp_fog_min_brightness = clamp(sss_injection_data.exp_fog_min_brightness, -0.5, 1.0);
-  float exp_fog_color_correction_strength = saturate(sss_injection_data.exp_fog_color_correction_strength);
+  bool exp_fog_color_correction_enabled = sss_injection_data.fog_color_correction_enabled >= 0.5;
+  float exp_fog_hue = clamp(sss_injection_data.fog_hue, 0.0, 2.0);
+  float exp_fog_chrominance = clamp(sss_injection_data.fog_chrominance, 0.0, 2.0);
+  float exp_fog_avg_brightness = clamp(sss_injection_data.fog_avg_brightness, 0.0, 2.0);
+  float exp_fog_min_brightness = clamp(sss_injection_data.fog_min_brightness, -0.5, 1.0);
+  float exp_fog_min_chroma_change = clamp(sss_injection_data.fog_min_chroma_change, 0.0, 4.0);
+  float exp_fog_max_chroma_change = clamp(sss_injection_data.fog_max_chroma_change, 0.0, 8.0);
+  exp_fog_max_chroma_change = max(exp_fog_max_chroma_change, exp_fog_min_chroma_change);
+  float exp_fog_lightness_strength = clamp(sss_injection_data.fog_lightness_strength, 0.0, 2.0);
+  float exp_fog_color_correction_strength = saturate(sss_injection_data.fog_color_correction_strength);
 
   r0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -279,6 +272,12 @@ void main(
   r3.xyz = mrtTexture0.Load(r3.xyz).xyz;
   r4.xyz = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
   r0.w = (uint)r3.z >> 8;
+  // Detect foliage by vanilla mrtTexture0.z values (2303=0x8FF, 3327=0xCFF)
+  uint mrt0z_raw = (uint)r3.z;
+  bool is_foliage_pixel = (mrt0z_raw == 2303u || mrt0z_raw == 3327u);
+  float foliage_saved_shadow = r4.z;                  // save shadow channel for foliage SSS
+  float3 foliage_debug_ssao = r4.xyz;                 // debug: full ssaoTexture sample
+  float foliage_debug_mrt0z = r3.z;                   // debug: raw mrtTexture0.z value
   r3.xy = (uint2)r3.xy;
   r5.zw = r3.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
   r3.x = 3.14159274 * r5.z;
@@ -848,27 +847,10 @@ void main(
       r7.w = r7.z + r7.z;
       r21.xyz = r5.xyw * -r7.www + r18.xyz;
       float3 exp_probe_dir_ws = normalize(r21.xyz);
-      if (exp_probe_sampling_enabled) {
-        float exp_probe_dir_blend = saturate(exp_probe_sampling_strength * exp_probe_direction_strength);
-        float3 exp_probe_dir_improved = renodx::rendering::DominantDirectionCorrection(
-            exp_probe_dir_ws,
-            normalize(r5.xyw),
-            saturate(r13.z));
-        exp_probe_dir_ws = normalize(lerp(exp_probe_dir_ws, exp_probe_dir_improved, exp_probe_dir_blend));
-      }
       uint env_w, env_h, env_levels;
       texEnvMap_g.GetDimensions(0, env_w, env_h, env_levels);
       r7.w = env_levels;
-      float exp_env_mip_vanilla = r16.y * max(r7.w - 1.0, 0.0);
-      float exp_env_mip = exp_env_mip_vanilla;
-      if (exp_probe_sampling_enabled) {
-        float exp_probe_mip_blend = saturate(exp_probe_mip_strength);
-        float exp_probe_roughness = saturate(r13.z);
-        float exp_env_mip_improved = renodx::rendering::ProbeMipFromRoughness(
-            sqrt(exp_probe_roughness),
-            r7.w);
-        exp_env_mip = lerp(exp_env_mip_vanilla, exp_env_mip_improved, exp_probe_mip_blend);
-      }
+      float exp_env_mip = r16.y * max(r7.w - 1.0, 0.0);
       r21.xyz = float3(1,-1,-1) * exp_probe_dir_ws;
       r7.w = exp_env_mip;
       r20.xyz = texEnvMap_g.SampleLevel(
@@ -895,25 +877,6 @@ void main(
     r7.w = r16.x * r13.y + r7.w;
     r16.xyz = r20.xyz * r7.www;
     r16.xyz = r16.xyz * r6.xxx;
-    if (exp_env_brdf_enabled) {
-      float3 exp_env_brdf_applied = renodx::rendering::ApplyEnvBRDF(
-          r20.xyz,
-          saturate(r9.xyz),
-          saturate(r7.z),
-          saturate(r13.z));
-      r16.xyz = lerp(r16.xyz, exp_env_brdf_applied, exp_env_brdf_strength);
-    }
-    if (exp_horizon_occlusion_enabled) {
-      float exp_horizon = renodx::rendering::HorizonOcclusionApprox(
-          r2.xyz,
-          normalize(r5.xyw),
-          normalize(r21.xyz * float3(1,-1,-1)),
-          saturate(r13.z),
-          exp_horizon_energy_fraction);
-      exp_horizon = pow(saturate(exp_horizon), exp_horizon_power);
-      exp_horizon = lerp(1.0, exp_horizon, exp_horizon_occlusion_strength);
-      r16.xyz = r16.xyz * exp_horizon.xxx;
-    }
     r6.x = -r4.z * r13.z + 1;
     if (cubemap_improved_factor >= 0.5 && r4.y == 0) {
       // Improved: skylight luminance modulation with roughness/AO shaping.
@@ -1302,6 +1265,18 @@ void main(
   r0.y = 1 + -r4.x;
   r4.xyz = r5.xyz * r6.xyz + -r5.xyz;
   r4.xyz = r0.yyy * r4.xyz + r5.xyz;
+  // --- RenoDx SSS Shadow ---
+  if (is_foliage_pixel && foliage_saved_shadow < 0.999) {
+    float sss_shadow = foliage_saved_shadow;
+    // Brightness rejection: reduce shadow on bright pixels (lamps, emissives)
+    float bright_reject_thresh = sss_injection_data.foliage_sss_bright_reject_threshold;
+    float bright_reject_fade = max(sss_injection_data.foliage_sss_bright_reject_fade, 1e-5);
+    float pixel_luma = dot(r4.xyz, float3(0.2126, 0.7152, 0.0722));
+    float bright_mask = smoothstep(bright_reject_thresh, bright_reject_thresh + bright_reject_fade, pixel_luma);
+    sss_shadow = lerp(sss_shadow, 1.0, bright_mask);
+    r4.xyz *= sss_shadow;
+  }
+  // --- End RenoDx SSS Shadow ---
   r0.y = -fogNearDistance_g + -r4.w;
   r0.y = saturate(fogFadeRangeInv_g * r0.y);
   r0.z = -fogHeight_g + r2.y;
@@ -1325,6 +1300,9 @@ void main(
         exp_fog_chrominance,
         exp_fog_avg_brightness,
         exp_fog_min_brightness,
+          exp_fog_min_chroma_change,
+          exp_fog_max_chroma_change,
+          exp_fog_lightness_strength,
         exp_fog_color_correction_strength) * exp_fog_hdr_norm;
   }
   r0.z = (int)r1.x & 64;
@@ -1491,6 +1469,37 @@ void main(
   r0.x = 255 * r0.x;
   r0.x = (uint)r0.x;
   o1.w = r19.w ? r0.x : 0;
+  // --- Foliage Debug Visualization ---
+  int foliage_dbg = (int)sss_injection_data.foliage_debug_mode;
+  if (foliage_dbg == 1) {
+    r3.xyz = is_foliage_pixel ? float3(0, 1, 0) : r3.xyz * 0.3;
+  } else if (foliage_dbg == 2) {
+    r3.xyz = is_foliage_pixel ? foliage_saved_shadow.xxx : r3.xyz * 0.3;
+  } else if (foliage_dbg == 3) {
+    r3.xyz = is_foliage_pixel ? foliage_debug_ssao : r3.xyz * 0.3;
+  } else if (foliage_dbg == 4) {
+    float mrt_val = foliage_debug_mrt0z / 4096.0;
+    bool raw_bit9 = (((uint)foliage_debug_mrt0z >> 9u) & 1u) != 0u;
+    r3.xyz = raw_bit9 ? float3(0, mrt_val, 0) : float3(mrt_val, 0, 0);
+  } else if (foliage_dbg == 5) {
+    bool raw_bit9 = (((uint)foliage_debug_mrt0z >> 9u) & 1u) != 0u;
+    r3.xyz = raw_bit9 ? float3(1, 1, 1) : float3(0, 0, 0);
+  } else if (foliage_dbg == 6) {
+    uint raw_z = (uint)foliage_debug_mrt0z;
+    if (raw_z == 2815u || raw_z == 3839u) {
+      r3.xyz = float3(0, 0, 1);
+    } else if (raw_z == 2303u) {
+      r3.xyz = float3(0, 1, 0);
+    } else if (raw_z == 3327u) {
+      r3.xyz = float3(0, 1, 1);
+    } else {
+      r3.xyz = float3(raw_z / 4096.0, 0, 0);
+    }
+  } else if (foliage_dbg == 7) {
+    uint raw_z = (uint)foliage_debug_mrt0z;
+    r3.xyz = float3((raw_z & 0xFFu) / 255.0, ((raw_z >> 8u) & 0xFFu) / 255.0, ((raw_z >> 16u) & 0xFFu) / 255.0);
+  }
+  // --- End Foliage Debug ---
   o0.xyz = r3.xyz;
   o0.w = 1;
   o1.z = r0.y;

@@ -514,6 +514,9 @@ float3 RestoreHueAndChrominance(
 //   chrominance – chroma restoration strength (default 1.0)
 //   avgBrightness  – lightness restoration scale from scene  (default 1.0)
 //   minBrightness  – lightness restoration floor              (default 0.0)
+//   minChromaChange – minimum chroma ratio clamp              (default 0.0)
+//   maxChromaChange – maximum chroma ratio clamp              (default FLT_MAX)
+//   lightnessStrength – scales the computed lightness restore (default 1.0)
 //   intensity      – overall blend toward corrected result    (default 1.0)
 //
 // Returns:  scene + fog with hue/chroma preserved, linear BT.709.
@@ -525,6 +528,9 @@ float3 FogColorCorrection(
     float  chrominance    = 1.0,
     float  avgBrightness  = 1.0,
     float  minBrightness  = 0.0,
+  float  minChromaChange = 0.0,
+  float  maxChromaChange = 3.402823466e+38,
+  float  lightnessStrength = 1.0,
     float  intensity      = 1.0)
 {
   float3 sceneWithFog     = sceneColor + fadeColor;
@@ -543,11 +549,11 @@ float3 FogColorCorrection(
   float fogHue     = hue * saturate(fogChroma / 1.41421356);  // sqrt(2)
 
   // Lightness: restore an optional minimum + proportional amount.
-  float fogBright  = saturate(avgBrightness * sceneLab.x + minBrightness);
+    float fogBright  = saturate((avgBrightness * sceneLab.x + minBrightness) * lightnessStrength);
 
   sceneWithFog = RestoreHueAndChrominance(
       sceneColor, sceneWithFog,
-      fogHue, chrominance, 0.0, 3.402823466e+38, fogBright);
+      fogHue, chrominance, minChromaChange, maxChromaChange, fogBright);
 
   return lerp(prevSceneWithFog, sceneWithFog, intensity);
 }
