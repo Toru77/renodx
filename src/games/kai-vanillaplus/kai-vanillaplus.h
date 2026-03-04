@@ -41,43 +41,45 @@ struct SssInjectData {
   float cubemap_improvements_enabled;
   // Lighting cubemap mip boost scale (applies in lighting shader only)
   float cubemap_lighting_mip_boost;
+  // Floor cubemap mip scale (applies in floor_0x8337B262)
+  float floor_cubemap_mip_scale;
 
   // Lighting shadow controls
   float shadow_base_softness;
 
-  // Car shading controls (car_0xDC173E86)
-  float car_mode;
-  float car_diffuse_scale;
-  float car_specular_scale;
-  float car_reflection_scale;
-  float car_local_light_scale;
-  float car_ambient_scale;
-  float car_rim_scale;
-  float car_shadow_scale;
-  float car_ssr_scale;
-  float car_cubemap_mip_scale;
-  float car_cubemap_brightness;
+  // Fog color correction controls (lighting_0x430ED091 / lightingsoft_0xF6C55E5F)
+  float fog_color_correction_enabled;
+  float fog_hue;
+  float fog_chrominance;
+  float fog_avg_brightness;
+  float fog_min_brightness;
+  float fog_min_chroma_change;
+  float fog_max_chroma_change;
+  float fog_lightness_strength;
+  float fog_color_correction_strength;
 
-  // Experimental lighting controls (lighting_0x430ED091 / lightingsoft_0xF6C55E5F)
-  float exp_master_improved;
-  float exp_env_brdf_enabled;
-  float exp_env_brdf_strength;
-  float exp_probe_sampling_enabled;
-  float exp_probe_sampling_strength;
-  float exp_probe_direction_strength;
-  float exp_probe_mip_strength;
-  float exp_horizon_occlusion_enabled;
-  float exp_horizon_occlusion_strength;
-  float exp_horizon_energy_fraction;
-  float exp_horizon_power;
-  float exp_fog_color_correction_enabled;
-  float exp_fog_hue;
-  float exp_fog_chrominance;
-  float exp_fog_avg_brightness;
-  float exp_fog_min_brightness;
-  float exp_fog_color_correction_strength;
+  // Volumetric fog improvements (volfog_0xBD7DFE49)
+  float volfog_tricubic_enabled;
 
-  float padding0;
+  // SSS controls (0x534E54EA)
+  float foliage_translucency_scale;
+  float foliage_opacity_scale;
+  float foliage_ssao_scale;
+  float foliage_sss_enabled;
+  float foliage_sss_strength;
+  float foliage_sss_sample_count;
+  float foliage_sss_surface_thickness;
+  float foliage_sss_contrast;
+  float foliage_sss_jitter_enabled;
+  float foliage_debug_mode;
+  float foliage_sss_height_enabled;
+  float foliage_sss_height_min;
+  float foliage_sss_height_max;
+  float foliage_sss_height_fade;
+  float foliage_sss_vertical_reject;
+  float foliage_sss_max_darkening;
+  float foliage_sss_bright_reject_threshold;
+  float foliage_sss_bright_reject_fade;
 };
 
 #ifndef __cplusplus
