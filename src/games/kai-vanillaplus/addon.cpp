@@ -7,8 +7,17 @@
 
 #define DEBUG_LEVEL_0
 
+#include <array>
 #include <atomic>
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <span>
+#include <string>
 #include <vector>
 
 #include <deps/imgui/imgui.h>
@@ -30,8 +39,15 @@ namespace {
 constexpr uint32_t kLightingShader = 0x430ED091u;
 constexpr uint32_t kLightingSoftShader = 0xF6C55E5Fu;
 constexpr uint32_t kCharacterShader = 0x445A1838u;
+constexpr uint32_t kVolFogShader = 0xBD7DFE49u;
+constexpr uint32_t kIsFastTextureBinding = 15u;
+constexpr uint32_t kIsFastSamplerBinding = 15u;
 
 bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
+bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list);
+void OnInitDevice(reshade::api::device* device);
+void OnDestroyDevice(reshade::api::device* device);
+void ReloadIsFastResources(reshade::api::device* device, const char* reason);
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     {
@@ -57,7 +73,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xF237E72F),                 // glass
     CustomShaderEntry(0x8337B262),                 // floor
     CustomShaderEntry(0x534E54EA),                 // sss source pass
-    CustomShaderEntry(0xBD7DFE49),                 // volumetric fog composite
+    {
+        kVolFogShader,
+        {
+            .crc32 = kVolFogShader,
+            .code = __0xBD7DFE49,
+            .on_draw = &OnBeforeVolFogShaderDraw,
+        },
+    },  // volumetric fog composite
 };
 
 SssInjectData shader_injection = {
@@ -74,6 +97,9 @@ SssInjectData shader_injection = {
     .char_shadow_strength = 1.f,
     .shadow_pcss_jitter_enabled = 1.f,
     .shadow_pcss_sample_mode = 1.f,
+    .shadow_isfast_cosine_warp_enabled = 0.f,
+    .shadow_isfast_jitter_amount = 1.f,
+    .shadow_isfast_jitter_speed = 237.f,
     .ssgi_mod_enabled = 1.f,
     .ssgi_color_boost = 1.f,
     .ssgi_alpha_boost = 1.f,
@@ -99,6 +125,8 @@ SssInjectData shader_injection = {
     .fog_lightness_strength = 1.f,
     .fog_color_correction_strength = 0.5f,
     .volfog_tricubic_enabled = 1.f,
+    .volfog_is_fast_enabled = 1.f,
+    .isfast_noise_bound = 0.f,
     .volfog_color_correction_strength = 0.5f,
     .foliage_translucency_scale = 1.f,
     .foliage_opacity_scale = 1.f,
@@ -142,6 +170,414 @@ float char_ssgi_composite_method = 1.f;  // 0=Off, 1=On
 
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
 std::atomic_uint64_t g_character_mrt0_view{0u};
+HMODULE g_hmodule = nullptr;
+reshade::api::resource g_isfast_texture = {0u};
+reshade::api::resource_view g_isfast_reshade_srv = {0u};
+reshade::api::sampler g_isfast_reshade_sampler = {0u};
+bool g_isfast_bind_logged = false;
+bool g_isfast_using_debug_texture = false;
+bool g_isfast_bind_failed_logged = false;
+bool g_isfast_compute_bind_logged = false;
+bool g_isfast_mode_use_fast_texture = true;
+float isfast_texture_source_enabled = 1.f;  // 0=Off(debug), 1=On(real DDS)
+
+#pragma pack(push, 1)
+struct DdsPixelFormat {
+  uint32_t size;
+  uint32_t flags;
+  uint32_t four_cc;
+  uint32_t rgb_bit_count;
+  uint32_t r_bit_mask;
+  uint32_t g_bit_mask;
+  uint32_t b_bit_mask;
+  uint32_t a_bit_mask;
+};
+
+struct DdsHeader {
+  uint32_t size;
+  uint32_t flags;
+  uint32_t height;
+  uint32_t width;
+  uint32_t pitch_or_linear_size;
+  uint32_t depth;
+  uint32_t mip_map_count;
+  uint32_t reserved1[11];
+  DdsPixelFormat ddspf;
+  uint32_t caps;
+  uint32_t caps2;
+  uint32_t caps3;
+  uint32_t caps4;
+  uint32_t reserved2;
+};
+
+struct DdsHeaderDx10 {
+  uint32_t dxgi_format;
+  uint32_t resource_dimension;
+  uint32_t misc_flag;
+  uint32_t array_size;
+  uint32_t misc_flags2;
+};
+#pragma pack(pop)
+
+constexpr uint32_t kDdsMagic = 0x20534444u;  // "DDS "
+constexpr uint32_t kDdsFourCCDx10 = 0x30315844u;  // "DX10"
+constexpr uint32_t kDxgiFormatR8G8Unorm = 49u;
+constexpr uint32_t kD3D10ResourceDimensionTexture3D = 4u;
+constexpr uint32_t kExpectedIsFastWidth = 128u;
+constexpr uint32_t kExpectedIsFastHeight = 128u;
+constexpr uint32_t kExpectedIsFastDepth = 32u;
+constexpr uint32_t kIsFastBytesPerTexel = 2u;
+
+void LogIsFast(reshade::log::level level, const std::string& message) {
+  if (level == reshade::log::level::debug) return;
+  const std::string tagged = "IS-FAST: " + message;
+  reshade::log::message(level, tagged.c_str());
+}
+
+std::filesystem::path GetModuleDirectory() {
+  if (g_hmodule == nullptr) return std::filesystem::current_path();
+
+  std::array<wchar_t, MAX_PATH> module_path = {};
+  const DWORD length = GetModuleFileNameW(g_hmodule, module_path.data(), static_cast<DWORD>(module_path.size()));
+  if (length == 0 || length >= module_path.size()) return std::filesystem::current_path();
+  return std::filesystem::path(module_path.data()).parent_path();
+}
+
+bool ReadFileBytes(const std::filesystem::path& path, std::vector<uint8_t>* out_bytes) {
+  if (out_bytes == nullptr) return false;
+  out_bytes->clear();
+
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file) return false;
+
+  const auto file_size = file.tellg();
+  if (file_size <= 0) return false;
+  const size_t file_size_bytes = static_cast<size_t>(file_size);
+  file.seekg(0, std::ios::beg);
+
+  out_bytes->resize(file_size_bytes);
+  if (!file.read(reinterpret_cast<char*>(out_bytes->data()), static_cast<std::streamsize>(file_size_bytes))) {
+    out_bytes->clear();
+    return false;
+  }
+
+  return true;
+}
+
+bool ValidateAndExtractIsFastDds(
+    const std::vector<uint8_t>& file_bytes,
+    std::span<const uint8_t>* out_pixel_data) {
+  if (out_pixel_data == nullptr) return false;
+
+  LogIsFast(reshade::log::level::debug, "DDS HEADER VALIDATION begin.");
+
+  constexpr size_t kHeaderSize = sizeof(uint32_t) + sizeof(DdsHeader) + sizeof(DdsHeaderDx10);
+  if (file_bytes.size() < kHeaderSize) {
+    LogIsFast(reshade::log::level::error, "DDS too small to contain required headers.");
+    return false;
+  }
+
+  uint32_t magic = 0u;
+  std::memcpy(&magic, file_bytes.data(), sizeof(uint32_t));
+  if (magic != kDdsMagic) {
+    LogIsFast(reshade::log::level::error, "DDS magic mismatch (expected 'DDS ').");
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "DDS magic bytes OK.");
+
+  DdsHeader header = {};
+  std::memcpy(&header, file_bytes.data() + sizeof(uint32_t), sizeof(DdsHeader));
+  if (header.size != 124u || header.ddspf.size != 32u) {
+    LogIsFast(reshade::log::level::error, "DDS header size mismatch.");
+    return false;
+  }
+  if (header.ddspf.four_cc != kDdsFourCCDx10) {
+    LogIsFast(reshade::log::level::error, "DDS does not use required DX10 extended header.");
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "DDS DX10 extended header tag OK.");
+
+  DdsHeaderDx10 header_dx10 = {};
+  std::memcpy(&header_dx10, file_bytes.data() + sizeof(uint32_t) + sizeof(DdsHeader), sizeof(DdsHeaderDx10));
+  if (header_dx10.dxgi_format != kDxgiFormatR8G8Unorm) {
+    LogIsFast(reshade::log::level::error, "DDS format is not R8G8_UNORM.");
+    return false;
+  }
+  if (header_dx10.resource_dimension != kD3D10ResourceDimensionTexture3D || header_dx10.array_size != 1u) {
+    LogIsFast(reshade::log::level::error, "DDS is not a Texture3D with array_size=1.");
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "DDS texture type/dimension OK (Texture3D).");
+  if (header.width != kExpectedIsFastWidth || header.height != kExpectedIsFastHeight || header.depth != kExpectedIsFastDepth) {
+    LogIsFast(reshade::log::level::error, "DDS dimensions are invalid (expected 128x128x32).");
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "DDS dimensions OK (128x128x32).");
+
+  const size_t pixel_data_offset = sizeof(uint32_t) + sizeof(DdsHeader) + sizeof(DdsHeaderDx10);
+  const size_t expected_pixel_bytes =
+      static_cast<size_t>(header.width) * static_cast<size_t>(header.height) * static_cast<size_t>(header.depth) * kIsFastBytesPerTexel;
+
+  if (file_bytes.size() < (pixel_data_offset + expected_pixel_bytes)) {
+    LogIsFast(reshade::log::level::error, "DDS file is truncated (pixel data too small).");
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "DDS file size check OK.");
+
+  const uint8_t* pixel_data_ptr = file_bytes.data() + pixel_data_offset;
+  std::span<const uint8_t> pixel_data(pixel_data_ptr, expected_pixel_bytes);
+
+  const size_t inspect_bytes_count = std::min<size_t>(32u, pixel_data.size());
+  std::ostringstream inspect;
+  inspect << "Pixel[0..31]:";
+  for (size_t i = 0; i < inspect_bytes_count; ++i) {
+    inspect << ' ' << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
+            << static_cast<uint32_t>(pixel_data[i]);
+  }
+  LogIsFast(reshade::log::level::debug, inspect.str());
+
+  const size_t non_zero_count = std::count_if(
+      pixel_data.begin(), pixel_data.end(),
+      [](uint8_t value) { return value != 0u; });
+  {
+    std::ostringstream non_zero_message;
+    non_zero_message << "Pixel non-zero bytes: " << non_zero_count << "/" << pixel_data.size();
+    LogIsFast(reshade::log::level::debug, non_zero_message.str());
+  }
+
+  *out_pixel_data = pixel_data;
+  LogIsFast(reshade::log::level::debug, "DDS HEADER VALIDATION passed.");
+  return true;
+}
+
+void DestroyIsFastResources(reshade::api::device* device) {
+  if (device == nullptr) return;
+
+  LogIsFast(reshade::log::level::debug, "Destroying IS-FAST resources.");
+
+  if (g_isfast_reshade_sampler.handle != 0u) {
+    device->destroy_sampler(g_isfast_reshade_sampler);
+    g_isfast_reshade_sampler = {0u};
+  }
+  if (g_isfast_reshade_srv.handle != 0u) {
+    device->destroy_resource_view(g_isfast_reshade_srv);
+    g_isfast_reshade_srv = {0u};
+  }
+  if (g_isfast_texture.handle != 0u) {
+    device->destroy_resource(g_isfast_texture);
+    g_isfast_texture = {0u};
+  }
+
+  shader_injection.isfast_noise_bound = 0.f;
+  g_isfast_using_debug_texture = false;
+  g_isfast_bind_logged = false;
+  g_isfast_bind_failed_logged = false;
+  g_isfast_compute_bind_logged = false;
+}
+
+bool CreateIsFastTexture(
+    reshade::api::device* device,
+    uint32_t width,
+    uint32_t height,
+    uint32_t depth,
+    void* pixel_data,
+    uint32_t row_pitch,
+    uint32_t slice_pitch,
+    bool debug_texture) {
+  if (device == nullptr || pixel_data == nullptr) return false;
+
+  {
+    std::ostringstream message;
+    message << "Create Texture3D begin (" << width << "x" << height << "x" << depth
+            << ", " << (debug_texture ? "debug" : "dds") << ").";
+    LogIsFast(reshade::log::level::debug, message.str());
+  }
+
+  reshade::api::resource_desc desc = {};
+  desc.type = reshade::api::resource_type::texture_3d;
+  desc.texture = {
+      width,
+      height,
+      static_cast<uint16_t>(depth),
+      1,
+      reshade::api::format::r8g8_unorm,
+      1,
+  };
+  desc.heap = reshade::api::memory_heap::gpu_only;
+  desc.usage = reshade::api::resource_usage::shader_resource;
+  desc.flags = reshade::api::resource_flags::none;
+
+  reshade::api::subresource_data initial_data = {
+      pixel_data,
+      row_pitch,
+      slice_pitch,
+  };
+
+  if (!device->create_resource(desc, &initial_data, reshade::api::resource_usage::shader_resource, &g_isfast_texture)) {
+    LogIsFast(reshade::log::level::error, "Create Texture3D failed.");
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "Create Texture3D OK.");
+
+  reshade::api::resource_view_desc view_desc(
+      reshade::api::resource_view_type::texture_3d,
+      reshade::api::format::r8g8_unorm,
+      0,
+      UINT32_MAX,
+      0,
+      UINT32_MAX);
+  if (!device->create_resource_view(
+          g_isfast_texture,
+          reshade::api::resource_usage::shader_resource,
+          view_desc,
+          &g_isfast_reshade_srv)) {
+    LogIsFast(reshade::log::level::error, "Create SRV failed.");
+    device->destroy_resource(g_isfast_texture);
+    g_isfast_texture = {0u};
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "Create SRV OK.");
+
+  reshade::api::sampler_desc sampler_desc = {};
+  sampler_desc.filter = reshade::api::filter_mode::min_mag_mip_point;
+  sampler_desc.address_u = reshade::api::texture_address_mode::wrap;
+  sampler_desc.address_v = reshade::api::texture_address_mode::wrap;
+  sampler_desc.address_w = reshade::api::texture_address_mode::wrap;
+
+  if (!device->create_sampler(sampler_desc, &g_isfast_reshade_sampler)) {
+    LogIsFast(reshade::log::level::error, "Create sampler failed.");
+    device->destroy_resource_view(g_isfast_reshade_srv);
+    device->destroy_resource(g_isfast_texture);
+    g_isfast_reshade_srv = {0u};
+    g_isfast_texture = {0u};
+    return false;
+  }
+  LogIsFast(reshade::log::level::debug, "Create point-wrap sampler OK.");
+
+  g_isfast_using_debug_texture = debug_texture;
+  g_isfast_bind_logged = false;
+  return true;
+}
+
+void OnInitDevice(reshade::api::device* device) {
+  if (device == nullptr) return;
+  ReloadIsFastResources(device, "init_device");
+}
+
+void OnDestroyDevice(reshade::api::device* device) {
+  LogIsFast(reshade::log::level::debug, "OnDestroyDevice begin.");
+  DestroyIsFastResources(device);
+  LogIsFast(reshade::log::level::debug, "OnDestroyDevice complete. isfast_noise_bound=0.");
+}
+
+void ReloadIsFastResources(reshade::api::device* device, const char* reason) {
+  if (device == nullptr) return;
+
+  const bool use_fast_texture = isfast_texture_source_enabled >= 0.5f;
+  g_isfast_mode_use_fast_texture = use_fast_texture;
+
+  {
+    std::ostringstream message;
+    message << "Reload requested (" << (reason != nullptr ? reason : "unknown")
+            << "), IS-FAST texture mode=" << (use_fast_texture ? "On" : "Off");
+    LogIsFast(reshade::log::level::info, message.str());
+  }
+
+  DestroyIsFastResources(device);
+
+  if (!use_fast_texture) {
+    LogIsFast(reshade::log::level::info, "IS-FAST texture mode Off: forcing debug 1x1x1 test texture.");
+
+    std::array<uint8_t, 2> debug_texel = {
+        static_cast<uint8_t>(0.75f * 255.0f + 0.5f),
+        static_cast<uint8_t>(0.75f * 255.0f + 0.5f),
+    };
+    const bool debug_created = CreateIsFastTexture(
+        device,
+        1u,
+        1u,
+        1u,
+        debug_texel.data(),
+        2u,
+        2u,
+        true);
+    if (debug_created) {
+      shader_injection.isfast_noise_bound = 1.f;
+      LogIsFast(reshade::log::level::info, "Debug 1x1x1 test texture created OK.");
+    } else {
+      shader_injection.isfast_noise_bound = 0.f;
+      LogIsFast(reshade::log::level::error, "Failed to create debug 1x1x1 test texture.");
+    }
+    return;
+  }
+
+  const std::filesystem::path dds_path = GetModuleDirectory() / L"fast_noise_ea.dds";
+  {
+    std::ostringstream message;
+    message << "Searching for fast_noise_ea.dds at: " << dds_path.string();
+    LogIsFast(reshade::log::level::debug, message.str());
+  }
+
+  std::vector<uint8_t> dds_bytes;
+  std::span<const uint8_t> pixel_data;
+  bool loaded_noise = false;
+
+  if (ReadFileBytes(dds_path, &dds_bytes)) {
+    {
+      std::ostringstream message;
+      message << "Read DDS file OK (" << dds_bytes.size() << " bytes).";
+      LogIsFast(reshade::log::level::debug, message.str());
+    }
+
+    if (ValidateAndExtractIsFastDds(dds_bytes, &pixel_data)) {
+      const uint32_t row_pitch = kExpectedIsFastWidth * kIsFastBytesPerTexel;
+      const uint32_t slice_pitch = kExpectedIsFastWidth * kExpectedIsFastHeight * kIsFastBytesPerTexel;
+      loaded_noise = CreateIsFastTexture(
+          device,
+          kExpectedIsFastWidth,
+          kExpectedIsFastHeight,
+          kExpectedIsFastDepth,
+          const_cast<uint8_t*>(pixel_data.data()),
+          row_pitch,
+          slice_pitch,
+          false);
+      if (loaded_noise) {
+        shader_injection.isfast_noise_bound = 1.f;
+        LogIsFast(reshade::log::level::info, "Loaded noise texture (128x128x32 RG8_UNORM).");
+      } else {
+        shader_injection.isfast_noise_bound = 0.f;
+        LogIsFast(reshade::log::level::error, "Failed to create GPU resources from validated DDS.");
+      }
+    } else {
+      shader_injection.isfast_noise_bound = 0.f;
+      LogIsFast(reshade::log::level::warning, "DDS validation failed. IS-FAST noise is disabled.");
+    }
+  } else {
+    shader_injection.isfast_noise_bound = 0.f;
+    LogIsFast(reshade::log::level::warning, "Could not read fast_noise_ea.dds. IS-FAST noise is disabled.");
+  }
+
+  if (!loaded_noise) {
+    std::array<uint8_t, 2> debug_texel = {
+        static_cast<uint8_t>(0.75f * 255.0f + 0.5f),
+        static_cast<uint8_t>(0.75f * 255.0f + 0.5f),
+    };
+    const bool debug_created = CreateIsFastTexture(
+        device,
+        1u,
+        1u,
+        1u,
+        debug_texel.data(),
+        2u,
+        2u,
+        true);
+    if (debug_created) {
+      LogIsFast(reshade::log::level::info, "Debug 1x1x1 test texture created OK.");
+    } else {
+      LogIsFast(reshade::log::level::error, "Failed to create debug 1x1x1 test texture.");
+    }
+  }
+}
 
 bool TryResolveTextureRegister(
     reshade::api::pipeline_layout layout,
@@ -387,6 +823,66 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return true;
+  if (g_isfast_reshade_srv.handle == 0u || g_isfast_reshade_sampler.handle == 0u) {
+    if (!g_isfast_bind_failed_logged) {
+      LogIsFast(reshade::log::level::warning, "BindISFASTNoisePixel match=NO (SRV/sampler unavailable).");
+      g_isfast_bind_failed_logged = true;
+    }
+    return true;
+  }
+
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel,
+      reshade::api::pipeline_layout{0},
+      0,
+      reshade::api::descriptor_table_update{
+          {},
+          kIsFastTextureBinding,
+          0,
+          1,
+          reshade::api::descriptor_type::texture_shader_resource_view,
+          &g_isfast_reshade_srv,
+      });
+
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel,
+      reshade::api::pipeline_layout{0},
+      0,
+      reshade::api::descriptor_table_update{
+          {},
+          kIsFastSamplerBinding,
+          0,
+          1,
+          reshade::api::descriptor_type::sampler,
+          &g_isfast_reshade_sampler,
+      });
+
+  if (!g_isfast_bind_logged) {
+    if (shader_injection.isfast_noise_bound > 0.5f) {
+      LogIsFast(
+          reshade::log::level::debug,
+          g_isfast_using_debug_texture
+              ? "BindISFASTNoisePixel match=YES (debug texture bound)"
+              : "BindISFASTNoisePixel match=YES");
+    } else {
+      LogIsFast(
+          reshade::log::level::debug,
+          g_isfast_using_debug_texture
+              ? "BindISFASTNoisePixel match=YES (debug texture bound, sampling disabled)"
+              : "BindISFASTNoisePixel match=YES (sampling disabled)");
+    }
+    if (!g_isfast_compute_bind_logged) {
+      LogIsFast(reshade::log::level::debug, "BindISFASTNoiseCompute match=YES (N/A, no compute target in this addon).");
+      g_isfast_compute_bind_logged = true;
+    }
+    g_isfast_bind_logged = true;
+  }
+
+  return true;
+}
+
 void OnPresentAdvanceFrame(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -394,7 +890,12 @@ void OnPresentAdvanceFrame(
     const reshade::api::rect* dest_rect,
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects) {
-  (void)queue;
+  if (queue != nullptr) {
+    const bool desired_fast_texture = isfast_texture_source_enabled >= 0.5f;
+    if (desired_fast_texture != g_isfast_mode_use_fast_texture) {
+      ReloadIsFastResources(queue->get_device(), "settings_change");
+    }
+  }
   (void)swapchain;
   (void)source_rect;
   (void)dest_rect;
@@ -448,10 +949,34 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.shadow_pcss_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Jitter",
+        .label = "IS-FAST jitter",
         .section = "Shadows",
-        .tooltip = "Disable if you are not using TAA or Upscaler.",
+        .tooltip = "Enables IS-FAST temporal jitter for PCSS shadow filtering.",
         .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ShadowISFASTCosineWarp",
+        .binding = &shader_injection.shadow_isfast_cosine_warp_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "IS-FAST cosine warp",
+        .section = "Shadows",
+        .tooltip = "Off uses the current PCSS spiral sampling. On uses ISFASTCosineHemisphere distribution warping for PCSS offsets.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ShadowISFASTJitterSpeed",
+        .binding = &shader_injection.shadow_isfast_jitter_speed,
+        .default_value = 237.f,
+        .label = "IS-FAST jitter speed",
+        .section = "Shadows",
+        .tooltip = "Controls temporal progression speed for IS-FAST jitter in PCSS shadows.",
+        .min = 0.f,
+        .max = 480.f,
+        .format = "%.0f",
+        .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "ShadowBaseSoftness",
@@ -704,9 +1229,9 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.char_shadow_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Jitter",
+        .label = "IS-FAST jitter",
         .section = "Character Shadowing",
-        .tooltip = "Disable if you are not using TAA or Upscaler.",
+        .tooltip = "Enables IS-FAST temporal jitter for character shadow sampling.",
         .labels = {"Off", "On"},
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
     },
@@ -779,9 +1304,9 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.foliage_sss_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Jitter",
+        .label = "IS-FAST jitter",
         .section = "Screen Space Shadows",
-        .tooltip = "Disable if you are not using TAA or Upscaler.",
+        .tooltip = "Enables IS-FAST temporal jitter for foliage screen-space shadow sampling.",
         .labels = {"Off", "On"},
         .is_enabled = []() { return shader_injection.foliage_sss_enabled >= 0.5f; },
     },
@@ -1170,6 +1695,27 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
+        .key = "VolFogISFAST",
+        .binding = &shader_injection.volfog_is_fast_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "IS-FAST jitter",
+        .section = "Volumetric Fog",
+        .tooltip = "Enables IS-FAST temporal jitter for volumetric fog sampling. Vanilla keeps the original sample coordinates.",
+        .labels = {"Vanilla", "Enabled"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "VolFogISFASTTexture",
+        .binding = &isfast_texture_source_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "IS-FAST Texture",
+        .section = "Volumetric Fog",
+        .tooltip = "Off forces the 1x1 debug texture. On uses fast_noise_ea.dds if it validates.",
+        .labels = {"Off", "On"},
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "VolFogColorCorrectionStrength",
         .binding = &shader_injection.volfog_color_correction_strength,
         .default_value = 0.5f,
@@ -1320,7 +1866,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Disable jitter options if you are not using TAA or upscalers!",
+        .label = "Disable IS-FAST jitter options if you are not using TAA or upscalers!",
         .section = "Info",
     },
     new renodx::utils::settings::Setting{
@@ -1339,7 +1885,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+      g_hmodule = h_module;
 
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::present>(OnPresentAdvanceFrame);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCaptureLightingTextures);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTablesCaptureLightingTextures);
@@ -1355,6 +1904,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::present>(OnPresentAdvanceFrame);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCaptureLightingTextures);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTablesCaptureLightingTextures);

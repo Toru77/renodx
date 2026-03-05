@@ -85,9 +85,11 @@ cbuffer cb_volume_fog : register(b7)
 
 SamplerState samLinear_s : register(s0);
 SamplerState samPoint_s : register(s1);
+SamplerState isfast_sampler : register(s15);
 Texture2D<float4> colorTexture : register(t0);
 Texture2D<float4> depthTexture : register(t1);
 Texture3D<float4> volumeScatter : register(t2);
+Texture3D<float2> isfast_noise : register(t15);
 
 
 void main(
@@ -108,8 +110,34 @@ void main(
   volumeScatter.GetDimensions(volW, volH, volD);
   float3 volSize = float3((float)volW, (float)volH, (float)volD);
 
-  // ---- Sample volume: tricubic B-spline or vanilla trilinear ----
+  // ---- Optional IS-FAST temporal jitter (bound texture or fallback) ----
   float3 uvw = float3(v1.xy, volZ);
+  if (sss_injection_data.volfog_is_fast_enabled > 0.5) {
+    float2 pixelCoord = floor(v0.xy);
+    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
+    float jitterZ = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
+    if (sss_injection_data.isfast_noise_bound > 0.5) {
+      uint noiseW, noiseH, noiseD;
+      isfast_noise.GetDimensions(noiseW, noiseH, noiseD);
+      if (noiseW > 0 && noiseD > 0) {
+        float2 xi = renodx::rendering::SampleISFAST_RG(
+            isfast_noise,
+            isfast_sampler,
+            pixelCoord,
+            frameIndex,
+            (float)noiseW,
+            (float)noiseD);
+        jitterZ = xi.x;
+      }
+    }
+
+    float3 texelSize = 1.0 / max(volSize, float3(1.0, 1.0, 1.0));
+    float halfSlice = 0.5 * texelSize.z;
+
+    uvw.z = clamp(uvw.z + (jitterZ - 0.5) * texelSize.z, halfSlice, 1.0 - halfSlice);
+  }
+
+  // ---- Sample volume: tricubic B-spline or vanilla trilinear ----
   float4 fogSample;
   if (sss_injection_data.volfog_tricubic_enabled > 0.5) {
     fogSample = renodx::rendering::SampleTricubicBSpline(volumeScatter, samLinear_s, uvw, volSize);
