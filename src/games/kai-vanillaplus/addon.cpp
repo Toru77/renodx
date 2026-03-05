@@ -100,6 +100,7 @@ SssInjectData shader_injection = {
     .fog_lightness_strength = 1.f,
     .fog_color_correction_strength = 0.5f,
     .volfog_tricubic_enabled = 1.f,
+    .volfog_color_correction_strength = 0.5f,
     .foliage_translucency_scale = 1.f,
     .foliage_opacity_scale = 1.f,
     .foliage_ssao_scale = 1.f,
@@ -1409,6 +1410,21 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
+        .key = "VolFogColorCorrectionStrength",
+        .binding = &shader_injection.volfog_color_correction_strength,
+        .default_value = 0.5f,
+        .label = "Color Correction Strength",
+        .section = "Volumetric Fog",
+        .tooltip = "Independent strength for volumetric fog color correction.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.fog_color_correction_enabled >= 0.5f;
+        },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FogColorCorrection",
         .binding = &shader_injection.fog_color_correction_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -1522,7 +1538,7 @@ renodx::utils::settings::Settings settings = {
         .key = "FogColorCorrectionStrength",
         .binding = &shader_injection.fog_color_correction_strength,
       .default_value = 0.5f,
-        .label = "Fog Correction Strength",
+        .label = "2D Fog Correction Strength",
         .section = "Fog Color Correction",
         .min = 0.f,
         .max = 1.f,
@@ -1603,4 +1619,3 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   return TRUE;
 }
-
