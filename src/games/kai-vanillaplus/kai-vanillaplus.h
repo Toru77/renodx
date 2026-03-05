@@ -81,6 +81,26 @@ struct SssInjectData {
   float foliage_sss_max_darkening;
   float foliage_sss_bright_reject_threshold;
   float foliage_sss_bright_reject_fade;
+
+  // Character SSGI Composite (lighting_0x430ED091 / lightingsoft_0xF6C55E5F in-shader mode)
+  float char_gi_enabled;  // 0=off, 1=on
+  float char_gi_strength;
+  float char_gi_alpha_scale;
+  float char_gi_chroma_strength;
+  float char_gi_luma_strength;
+  float char_gi_shadow_power;
+  float char_gi_headroom_power;
+  float char_gi_max_add;
+  float char_gi_dark_boost;
+  float char_gi_debug_mode;
+  float char_gi_debug_scale;
+  float char_gi_debug_chars_only;
+  float char_gi_bright_boost;
+  float char_gi_peak_luma_cap;
+  float char_gi_depth_reject;
+  float char_gi_normal_reject;
+  float char_gi_ao_influence;
+  float char_gi_reject_strength;
 };
 
 #ifndef __cplusplus

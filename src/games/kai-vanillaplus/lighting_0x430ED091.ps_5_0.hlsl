@@ -208,6 +208,7 @@ StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t6);
 Texture2D<float4> outlineShapeMask : register(t7);
 Texture2D<float4> cloudsTexture : register(t8);
 Texture2D<float4> ssgiTexture : register(t9);
+Texture2D<uint4> charMaskTexture : register(t10);
 StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 StructuredBuffer<LightProbeParam> localLightProbes_g : register(t13);
@@ -449,6 +450,79 @@ void main(
       r6.xyz = r0.xyz * mapAOColor_g.xyz + -r0.xyz;
       r4.yzw = r3.xxx * r6.xyz + r0.xyz;
     }
+
+    // --- In-Shader Character SSGI Composite (early-return path) ---
+    // Characters (bit 8 set) exit here and never reach the main composite block,
+    // so we must apply SSGI and debug views before this early return.
+    {
+      bool er_is_char = ((mrt0z_raw >> 8u) & 1u) != 0u;
+      bool er_gi_on = sss_injection_data.char_gi_enabled >= 0.5;
+      uint er_dbg = (uint)(max(sss_injection_data.char_gi_debug_mode, 0.0) + 0.5);
+
+      if (er_gi_on && er_is_char) {
+        // Sample & process SSGI (not yet sampled in early-return path)
+        float4 er_ssgi = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0);
+        if (sss_injection_data.ssgi_mod_enabled >= 0.5) {
+          er_ssgi.xyz = pow(abs(er_ssgi.xyz * max(sss_injection_data.ssgi_color_boost, 0.0)),
+                           max(sss_injection_data.ssgi_pow, 0.01));
+          er_ssgi.w = saturate(er_ssgi.w * max(sss_injection_data.ssgi_alpha_boost, 0.0));
+        } else {
+          er_ssgi = float4(0, 0, 0, 0);
+        }
+
+        static const float3 ER_LUMA = float3(0.299, 0.587, 0.114);
+        float er_ao = saturate(r4.x);
+        float er_ao_f = lerp(1.0, er_ao, saturate(sss_injection_data.char_gi_ao_influence));
+        float er_rej = pow(saturate(er_ao_f), max(sss_injection_data.char_gi_reject_strength, 0.0));
+        float er_sl = dot(r4.yzw, ER_LUMA);
+        float er_sp = max(sss_injection_data.char_gi_shadow_power, 0.1);
+        float er_sr = pow(saturate(1.0 - er_sl), er_sp);
+        float er_bb = max(sss_injection_data.char_gi_bright_boost, 0.0);
+        float er_bbs = max(er_bb - 1.0, 0.0);
+        float er_bm = saturate(1.0 - er_sr);
+        float er_sm = saturate(er_sr + er_bm * er_bbs);
+        float er_df = lerp(1.0, max(sss_injection_data.char_gi_dark_boost, 0.0), er_sr);
+        float3 er_gc = max(er_ssgi.rgb, 0.0);
+        float er_gl = dot(er_gc, ER_LUMA);
+        float3 er_gf = (er_gc - er_gl.xxx) * max(sss_injection_data.char_gi_chroma_strength, 0.0)
+                      + (er_gl * max(sss_injection_data.char_gi_luma_strength, 0.0)).xxx;
+        float er_gw = saturate(er_ssgi.a * max(sss_injection_data.char_gi_alpha_scale, 0.0))
+                    * er_sm * er_df * er_rej;
+        float er_hp = max(sss_injection_data.char_gi_headroom_power, 0.1);
+        float3 er_hr = max(pow(saturate(1.0 - r4.yzw), er_hp), saturate(er_bbs * 0.35).xxx);
+        float er_str = max(sss_injection_data.char_gi_strength, 0.0);
+        float er_ma = max(sss_injection_data.char_gi_max_add, 0.0);
+        float3 er_contrib = er_gf * (er_gw * er_str * er_hr);
+        er_contrib = min(er_contrib, (er_ma * (1.0 + er_bbs * er_bm) * sqrt(max(er_rej, 0.0))).xxx);
+        float er_plc = max(sss_injection_data.char_gi_peak_luma_cap, 0.0);
+        if (er_plc > 0.0) {
+          float er_cl = dot(max(er_contrib, 0.0), ER_LUMA);
+          er_contrib *= min(1.0, er_plc / max(er_cl, 1e-6));
+        }
+        r4.yzw = r4.yzw + er_contrib;
+
+        // Debug views
+        if (er_dbg != 0u) {
+          float er_ds = max(sss_injection_data.char_gi_debug_scale, 0.001);
+          float3 er_dc = r4.yzw;
+          if (er_dbg == 1u) er_dc = float3(1.0, 0.2, 0.2);
+          else if (er_dbg == 2u) er_dc = er_gc * er_ds;
+          else if (er_dbg == 3u) er_dc = er_ssgi.aaa * er_ds;
+          else if (er_dbg == 4u) er_dc = er_gf * er_ds;
+          else if (er_dbg == 5u) er_dc = er_gw.xxx * er_ds;
+          else if (er_dbg == 6u) er_dc = abs(er_contrib) * er_ds;
+          else if (er_dbg == 7u) er_dc = r4.yzw;
+          r4.yzw = saturate(er_dc);
+        }
+      } else if (er_gi_on && er_dbg != 0u) {
+        // Non-character in early-return: handle debug blackout / grey
+        bool er_co = sss_injection_data.char_gi_debug_chars_only >= 0.5;
+        if (er_co) r4.yzw = float3(0, 0, 0);
+        else if (er_dbg == 1u) r4.yzw = float3(0.1, 0.1, 0.1);
+      }
+    }
+    // --- End early-return Character SSGI Composite ---
+
     o0.xyz = r4.yzw;
     o0.w = 1;
     o1.xyzw = r1.xyzw;
@@ -650,6 +724,14 @@ void main(
     // Shape dark-vs-bright bounced light response.
     r15.xyz = pow(abs(r15.xyz), ssgi_pow);
   }
+
+  // Save SSGI and character mask for in-shader character GI composite
+  float4 chargi_ssgi_saved = r15;
+  // Use mrt0z_raw from mrtTexture0 (t1) which already has the character bit
+  bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
+  float chargi_ao_raw = saturate(max(r4.x, r4.y * r4.z));
+  float chargi_depth_center = max(r2.z, 1e-6);
+
   r16.x = viewInv_g._m30;
   r16.y = viewInv_g._m31;
   r16.z = viewInv_g._m32;
@@ -1720,6 +1802,124 @@ void main(
   r0.x = 255 * r0.x;
   r0.x = (uint)r0.x;
   o1.w = r19.w ? r0.x : 0;
+
+  // --- In-Shader Character SSGI Composite ---
+  if (sss_injection_data.char_gi_enabled >= 0.5) {
+    static const float3 CHARGI_LUMA = float3(0.299, 0.587, 0.114);
+    float chargi_char_mask = chargi_is_character ? 1.0 : 0.0;
+
+    // Sanitize saved SSGI
+    uint4 cg_bits = asuint(chargi_ssgi_saved);
+    bool4 cg_nan = ((cg_bits & 0x7F800000u) == 0x7F800000u) & ((cg_bits & 0x007FFFFFu) != 0u);
+    bool4 cg_inf = ((cg_bits & 0x7FFFFFFFu) == 0x7F800000u);
+    if (any(cg_nan) || any(cg_inf)) chargi_ssgi_saved = float4(0, 0, 0, 0);
+
+    // AO factor
+    float cg_ao_influence = saturate(sss_injection_data.char_gi_ao_influence);
+    float cg_ao_factor = lerp(1.0, chargi_ao_raw, cg_ao_influence);
+
+    // Reject factor (simplified: AO-only for in-shader since we don't have neighbor depth/normal cheaply)
+    float cg_reject_strength = max(sss_injection_data.char_gi_reject_strength, 0.0);
+    float cg_reject_factor = pow(saturate(cg_ao_factor), cg_reject_strength);
+
+    // Shadow/brightness masking
+    float cg_source_luma = dot(r3.xyz, CHARGI_LUMA);
+    float cg_shadow_power = max(sss_injection_data.char_gi_shadow_power, 0.1);
+    float cg_shadow_raw = pow(saturate(1.0 - cg_source_luma), cg_shadow_power);
+    float cg_bright_boost = max(sss_injection_data.char_gi_bright_boost, 0.0);
+    float cg_bright_boost_scale = max(cg_bright_boost - 1.0, 0.0);
+    float cg_bright_mask = saturate(1.0 - cg_shadow_raw);
+    float cg_shadow_mask = saturate(cg_shadow_raw + cg_bright_mask * cg_bright_boost_scale);
+    float cg_dark_boost = max(sss_injection_data.char_gi_dark_boost, 0.0);
+    float cg_dark_factor = lerp(1.0, cg_dark_boost, cg_shadow_raw);
+
+    // GI color decomposition
+    float3 cg_gi_color = max(chargi_ssgi_saved.rgb, 0.0);
+    float cg_gi_luma = dot(cg_gi_color, CHARGI_LUMA);
+    float3 cg_gi_chroma = cg_gi_color - cg_gi_luma.xxx;
+    float cg_chroma_strength = max(sss_injection_data.char_gi_chroma_strength, 0.0);
+    float cg_luma_strength = max(sss_injection_data.char_gi_luma_strength, 0.0);
+    float3 cg_gi_filtered = cg_gi_chroma * cg_chroma_strength + (cg_gi_luma * cg_luma_strength).xxx;
+
+    // Weight
+    float cg_alpha_scale = max(sss_injection_data.char_gi_alpha_scale, 0.0);
+    float cg_gi_weight = saturate(chargi_ssgi_saved.a * cg_alpha_scale) * cg_shadow_mask * cg_dark_factor;
+    cg_gi_weight *= cg_reject_factor;
+
+    // Headroom
+    float cg_headroom_power = max(sss_injection_data.char_gi_headroom_power, 0.1);
+    float3 cg_headroom = pow(saturate(1.0 - r3.xyz), cg_headroom_power);
+    float cg_bright_headroom_floor = saturate(cg_bright_boost_scale * 0.35);
+    float3 cg_headroom_adjusted = max(cg_headroom, cg_bright_headroom_floor.xxx);
+
+    // Final contribution
+    float cg_strength = max(sss_injection_data.char_gi_strength, 0.0);
+    float cg_max_add = max(sss_injection_data.char_gi_max_add, 0.0);
+    float cg_max_add_boost = 1.0 + cg_bright_boost_scale * cg_bright_mask;
+    float3 cg_final_gain = cg_gi_weight * cg_strength * cg_headroom_adjusted;
+    float3 cg_gi_contrib = cg_gi_filtered * cg_final_gain;
+    float cg_cap_scale = sqrt(max(cg_reject_factor, 0.0));
+    float cg_gi_cap = cg_max_add * cg_max_add_boost * cg_cap_scale;
+    cg_gi_contrib = min(cg_gi_contrib, cg_gi_cap.xxx);
+    float cg_peak_luma_cap = max(sss_injection_data.char_gi_peak_luma_cap, 0.0);
+    if (cg_peak_luma_cap > 0.0) {
+      float cg_contrib_luma = dot(max(cg_gi_contrib, 0.0), CHARGI_LUMA);
+      float cg_luma_scale = min(1.0, cg_peak_luma_cap / max(cg_contrib_luma, 1e-6));
+      cg_gi_contrib *= cg_luma_scale;
+    }
+    cg_gi_contrib *= chargi_char_mask;
+    r3.xyz = r3.xyz + cg_gi_contrib;
+
+    // Debug views
+    uint cg_debug_mode = (uint)(max(sss_injection_data.char_gi_debug_mode, 0.0) + 0.5);
+    if (cg_debug_mode != 0u) {
+      float cg_debug_scale = max(sss_injection_data.char_gi_debug_scale, 0.001);
+      bool cg_debug_chars_only = sss_injection_data.char_gi_debug_chars_only >= 0.5;
+      float3 cg_debug_color = r3.xyz;
+
+      if (cg_debug_mode == 1u) {
+        cg_debug_color = (chargi_char_mask > 0.5) ? float3(1.0, 0.2, 0.2) : float3(0.1, 0.1, 0.1);
+      } else if (cg_debug_mode == 2u) {
+        cg_debug_color = cg_gi_color * cg_debug_scale;
+      } else if (cg_debug_mode == 3u) {
+        cg_debug_color = chargi_ssgi_saved.aaa * cg_debug_scale;
+      } else if (cg_debug_mode == 4u) {
+        cg_debug_color = cg_gi_filtered * cg_debug_scale;
+      } else if (cg_debug_mode == 5u) {
+        cg_debug_color = cg_gi_weight.xxx * cg_debug_scale;
+      } else if (cg_debug_mode == 6u) {
+        cg_debug_color = abs(cg_gi_contrib) * cg_debug_scale;
+      } else if (cg_debug_mode == 7u) {
+        cg_debug_color = r3.xyz;
+      } else if (cg_debug_mode == 8u) {
+        float cg_cl = dot(abs(cg_gi_contrib), CHARGI_LUMA) * cg_debug_scale;
+        cg_debug_color = cg_cl.xxx;
+      } else if (cg_debug_mode == 9u) {
+        cg_debug_color = cg_headroom_adjusted * cg_debug_scale;
+      } else if (cg_debug_mode == 10u) {
+        float cg_gl = dot(cg_final_gain, CHARGI_LUMA) * cg_debug_scale;
+        cg_debug_color = cg_gl.xxx;
+      } else if (cg_debug_mode == 11u) {
+        cg_debug_color = cg_shadow_mask.xxx * cg_debug_scale;
+      } else if (cg_debug_mode == 12u) {
+        cg_debug_color = float3(0, 0, 0);  // No depth reject in in-shader mode
+      } else if (cg_debug_mode == 13u) {
+        cg_debug_color = float3(0, 0, 0);  // No normal reject in in-shader mode
+      } else if (cg_debug_mode == 14u) {
+        cg_debug_color = cg_ao_factor.xxx * cg_debug_scale;
+      } else if (cg_debug_mode == 15u) {
+        cg_debug_color = cg_reject_factor.xxx * cg_debug_scale;
+      }
+
+      if (cg_debug_chars_only && chargi_char_mask < 0.5) {
+        cg_debug_color = float3(0, 0, 0);
+      }
+
+      r3.xyz = saturate(cg_debug_color);
+    }
+  }
+  // --- End In-Shader Character SSGI Composite ---
+
   // --- Foliage Debug Visualization ---
   int foliage_dbg = (int)sss_injection_data.foliage_debug_mode;
   if (foliage_dbg == 1) {
