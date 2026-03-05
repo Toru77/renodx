@@ -19,7 +19,6 @@ struct SssInjectData {
   // Lighting shadow controls (lighting_0x430ED091)
   float shadow_pcss_jitter_enabled;
   float shadow_pcss_sample_mode;
-  float shadow_isfast_cosine_warp_enabled;
   float shadow_isfast_jitter_amount;
   float shadow_isfast_jitter_speed;
 

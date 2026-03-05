@@ -229,26 +229,12 @@ float2 ISFASTShadowSampleOffset(
     float jitter_angle,
     float radius_scale,
     bool use_cosine_warp) {
-  if (!use_cosine_warp) {
-    float sample_radius = sqrt(sample_index + 0.5) * radius_scale;
-    float sample_angle = sample_index * 2.4000001 + jitter_angle;
-    float sample_sin;
-    float sample_cos;
-    sincos(sample_angle, sample_sin, sample_cos);
-    return float2(sample_cos, sample_sin) * sample_radius;
-  }
-
-  const float inv_two_pi = 0.15915494309;
-  const float golden_a1 = 0.7548776662466927;
-  const float golden_a2 = 0.5698402909980532;
-
-  float jitter_phase = frac(jitter_angle * inv_two_pi);
-  float r2x = frac((sample_index + 0.5) * golden_a1 + jitter_phase);
-  float r2y = frac((sample_index + 0.5) * golden_a2 + jitter_phase * golden_a1);
-  float3 hemisphere = renodx::rendering::ISFASTCosineHemisphere(r2x, r2y);
-
-  float disk_scale = sqrt(max(sample_count, 1.0)) * radius_scale;
-  return hemisphere.xy * disk_scale;
+  float sample_radius = sqrt(sample_index + 0.5) * radius_scale;
+  float sample_angle = sample_index * 2.4000001 + jitter_angle;
+  float sample_sin;
+  float sample_cos;
+  sincos(sample_angle, sample_sin, sample_cos);
+  return float2(sample_cos, sample_sin) * sample_radius;
 }
 
 
@@ -731,8 +717,6 @@ void main(
   float chargi_ao_raw = saturate(max(r4.x, r4.y * r4.z));
   float chargi_depth_center = max(r2.z, 1e-6);
   bool shadow_use_jitter = sss_injection_data.shadow_pcss_jitter_enabled >= 0.5;
-  bool shadow_use_isfast_cosine_warp =
-      sss_injection_data.shadow_isfast_cosine_warp_enabled >= 0.5;
   float shadow_jitter_amount = saturate(sss_injection_data.shadow_isfast_jitter_amount);
   float shadow_jitter_speed = max(sss_injection_data.shadow_isfast_jitter_speed, 0.0);
   float2 shadow_jitter_pixel = floor(v0.xy);
@@ -800,7 +784,7 @@ void main(
               16.0,
               r16.w,
               0.25,
-              shadow_use_isfast_cosine_warp);
+              false);
           r21.xy = filter_offset * r20.xy + r16.xy;
           r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
           r17.w = r19.x + r17.w;
@@ -836,7 +820,7 @@ void main(
               16.0,
               r16.w,
               0.25,
-              shadow_use_isfast_cosine_warp);
+              false);
           r21.xy = filter_offset * r20.xy + r16.xy;
           r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
           r17.w = r19.x + r17.w;
@@ -881,7 +865,7 @@ void main(
             16.0,
             r17.w,
             0.25,
-            shadow_use_isfast_cosine_warp);
+            false);
         r20.xy = filter_offset * r21.zw + r16.yz;
         r20.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r20.xyw, r16.w).x;
         r18.w = r20.x + r18.w;
@@ -916,7 +900,7 @@ void main(
               16.0,
               r16.w,
               0.25,
-              shadow_use_isfast_cosine_warp);
+              false);
           r21.xy = filter_offset * r20.xy + r16.xy;
           r20.z = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
           r17.w = r20.z + r17.w;
