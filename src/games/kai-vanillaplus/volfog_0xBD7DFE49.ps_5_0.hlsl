@@ -126,8 +126,9 @@ void main(
   // ---- Fog color correction (OKLab hue/chroma preservation) ----
   // Treats extinction+inscatter as: extincted_scene + inscatter, matching
   // FogColorCorrection's expected sceneColor + fadeColor decomposition.
+  float volfog_fog_cc_strength = saturate(sss_injection_data.volfog_color_correction_strength);
   if (sss_injection_data.fog_color_correction_enabled > 0.5
-      && sss_injection_data.fog_color_correction_strength > 0.001) {
+      && volfog_fog_cc_strength > 0.001) {
     float3 extincted = sceneColor.xyz * fogSample.w;
     foggedColor = renodx::rendering::FogColorCorrection(
         extincted,
@@ -139,7 +140,7 @@ void main(
         sss_injection_data.fog_min_chroma_change,
         sss_injection_data.fog_max_chroma_change,
         sss_injection_data.fog_lightness_strength,
-        sss_injection_data.fog_color_correction_strength);
+        volfog_fog_cc_strength);
   }
 
   // ---- Final blend by combineAlpha (vanilla) ----

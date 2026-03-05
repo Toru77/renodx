@@ -60,6 +60,7 @@ struct SssInjectData {
 
   // Volumetric fog improvements (volfog_0xBD7DFE49)
   float volfog_tricubic_enabled;
+  float volfog_color_correction_strength;
 
   // SSS controls (0x534E54EA)
   float foliage_translucency_scale;
@@ -93,4 +94,3 @@ cbuffer sss_injection : register(b13) {
 #endif
 
 #endif  // SRC_GAMES_KAI_VANILLAPLUS_INJECTION_H_
-
