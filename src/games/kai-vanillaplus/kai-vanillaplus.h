@@ -19,6 +19,9 @@ struct SssInjectData {
   // Lighting shadow controls (lighting_0x430ED091)
   float shadow_pcss_jitter_enabled;
   float shadow_pcss_sample_mode;
+  float shadow_isfast_cosine_warp_enabled;
+  float shadow_isfast_jitter_amount;
+  float shadow_isfast_jitter_speed;
 
   // SSGI controls (lighting_0x430ED091)
   float ssgi_mod_enabled;
@@ -60,6 +63,8 @@ struct SssInjectData {
 
   // Volumetric fog improvements (volfog_0xBD7DFE49)
   float volfog_tricubic_enabled;
+  float volfog_is_fast_enabled;
+  float isfast_noise_bound;
   float volfog_color_correction_strength;
 
   // SSS controls (0x534E54EA)

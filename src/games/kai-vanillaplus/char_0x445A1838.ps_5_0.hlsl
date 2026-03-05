@@ -87,6 +87,7 @@ Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<float4> prevTexture : register(t3);
 
 #include "./kai-vanillaplus.h"
+#include "./rendering.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -194,8 +195,9 @@ static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
 
   float jitter = 0.0;
   if (useJitter) {
-    jitter = dot(uv * vpSize_g.xy, float2(0.0671105608, 0.00583714992));
-    jitter = frac(52.9829178 * frac(jitter));
+    float2 pixelCoord = floor(uv * vpSize_g.xy);
+    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
+    jitter = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
   }
 
   float3 viewForwardWS = float3(viewInv_g._m20, viewInv_g._m21, viewInv_g._m22);
@@ -341,8 +343,9 @@ static float ComputeCharacterSunShadow(float2 uv, float3 normalWS)
 
   float jitter = 0.0;
   if (useJitter) {
-    jitter = dot(uv * vpSize_g.xy, float2(0.0671105608, 0.00583714992));
-    jitter = frac(52.9829178 * frac(jitter));
+    float2 pixelCoord = floor(uv * vpSize_g.xy);
+    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
+    jitter = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
   }
 
   float3 viewForwardWS = float3(viewInv_g._m20, viewInv_g._m21, viewInv_g._m22);

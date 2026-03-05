@@ -226,6 +226,34 @@ Texture2D<float4> texMirror_g : register(t21);
 // 3Dmigoto declarations
 #define cmp -
 
+float2 ISFASTShadowSampleOffset(
+    float sample_index,
+    float sample_count,
+    float jitter_angle,
+    float radius_scale,
+    bool use_cosine_warp) {
+  if (!use_cosine_warp) {
+    float sample_radius = sqrt(sample_index + 0.5) * radius_scale;
+    float sample_angle = sample_index * 2.4000001 + jitter_angle;
+    float sample_sin;
+    float sample_cos;
+    sincos(sample_angle, sample_sin, sample_cos);
+    return float2(sample_cos, sample_sin) * sample_radius;
+  }
+
+  const float inv_two_pi = 0.15915494309;
+  const float golden_a1 = 0.7548776662466927;
+  const float golden_a2 = 0.5698402909980532;
+
+  float jitter_phase = frac(jitter_angle * inv_two_pi);
+  float r2x = frac((sample_index + 0.5) * golden_a1 + jitter_phase);
+  float r2y = frac((sample_index + 0.5) * golden_a2 + jitter_phase * golden_a1);
+  float3 hemisphere = renodx::rendering::ISFASTCosineHemisphere(r2x, r2y);
+
+  float disk_scale = sqrt(max(sample_count, 1.0)) * radius_scale;
+  return hemisphere.xy * disk_scale;
+}
+
 void main(
   float4 v0 : SV_Position0,
   float4 v1 : TEXCOORD0,
@@ -706,6 +734,23 @@ void main(
   r15.xyzw = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
   bool ssgi_enabled = sss_injection_data.ssgi_mod_enabled >= 0.5;
   bool shadow_use_jitter = sss_injection_data.shadow_pcss_jitter_enabled >= 0.5;
+  bool shadow_use_isfast_cosine_warp =
+      sss_injection_data.shadow_isfast_cosine_warp_enabled >= 0.5;
+  float shadow_jitter_amount = saturate(sss_injection_data.shadow_isfast_jitter_amount);
+  float shadow_jitter_speed = max(sss_injection_data.shadow_isfast_jitter_speed, 0.0);
+  float2 shadow_jitter_pixel = floor(v0.xy);
+  uint shadow_jitter_frame = (uint)max(sceneTime_g * shadow_jitter_speed, 0.0);
+  float shadow_jitter_phase_temporal =
+      renodx::rendering::InterleavedGradientNoiseTemporal(
+          shadow_jitter_pixel, shadow_jitter_frame);
+  float shadow_jitter_phase_static =
+      renodx::rendering::InterleavedGradientNoise(shadow_jitter_pixel);
+  float shadow_jitter_phase = lerp(
+      shadow_jitter_phase_static,
+      shadow_jitter_phase_temporal,
+      shadow_jitter_amount);
+  float shadow_jitter_angle_temporal = 6.28318548 * shadow_jitter_phase;
+  float shadow_jitter_angle_static = 6.28318548 * shadow_jitter_phase_static;
   int pcss_sample_count = 32;
   int pcss_sample_count_minus_one = max(pcss_sample_count - 1, 0);
   float pcss_sample_inv = rcp((float)pcss_sample_count);
@@ -772,16 +817,9 @@ void main(
         r16.w = cmp(r21.y < r16.z);
         r21.x = 1;
         r21.xy = r16.ww ? r21.xy : 0;
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992))+ (sceneTime_g * 77.0);
-        } else {
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        }
-        r16.w = frac(r16.w);
-        r16.w = 52.9829178 * r16.w;
-        r16.w = frac(r16.w);
-        r16.w = 6.28318548 * r16.w;
+        r16.w = shadow_use_jitter
+                    ? shadow_jitter_angle_temporal
+                    : shadow_jitter_angle_static;
         // Cascade 2 blocker search (matches original disassembly layer selection).
         r22.z = 2;
         r21.zw = r21.xy;
@@ -790,14 +828,13 @@ void main(
           r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
           if (r18.w != 0) break;
           r18.w = (int)r17.w;
-          r19.x = 0.5 + r18.w;
-          r19.x = sqrt(r19.x);
-          r19.x = pcss_blocker_radius_scale * r19.x;
-          r18.w = r18.w * 2.4000001 + r16.w;
-          sincos(r18.w, r23.x, r24.x);
-          r24.x = r24.x * r19.x;
-          r24.y = r23.x * r19.x;
-          r22.xy = r24.xy * r20.zw + r16.xy;
+          float2 blocker_offset = ISFASTShadowSampleOffset(
+              r18.w,
+              (float)max(pcss_sample_count_minus_one, 1),
+              r16.w,
+              pcss_blocker_radius_scale,
+              shadow_use_isfast_cosine_warp);
+          r22.xy = blocker_offset * r20.zw + r16.xy;
           r18.w = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
           r19.x = cmp(r18.w < r16.z);
           r22.y = r21.w + r18.w;
@@ -828,14 +865,13 @@ void main(
             r19.x = cmp((int)r18.w >= pcss_sample_count);
             if (r19.x != 0) break;
             r19.x = (int)r18.w;
-            r20.z = 0.5 + r19.x;
-            r20.z = sqrt(r20.z);
-            r20.z = pcss_filter_radius_scale * r20.z;
-            r19.x = r19.x * 2.4000001 + r16.w;
-            sincos(r19.x, r19.x, r22.x);
-            r22.x = r22.x * r20.z;
-            r22.y = r20.z * r19.x;
-            r21.xy = r22.xy * r20.xy + r16.xy;
+            float2 filter_offset = ISFASTShadowSampleOffset(
+                r19.x,
+                (float)pcss_sample_count,
+                r16.w,
+                pcss_filter_radius_scale,
+                shadow_use_isfast_cosine_warp);
+            r21.xy = filter_offset * r20.xy + r16.xy;
             r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
             r17.w = r19.x + r17.w;
             r18.w = (int)r18.w + 1;
@@ -862,16 +898,9 @@ void main(
         r16.w = cmp(r21.y < r16.z);
         r21.x = 1;
         r21.xy = r16.ww ? r21.xy : 0;
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992))+ (sceneTime_g * 77.0);
-        } else {
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        }
-      r16.w = frac(r16.w);
-      r16.w = 52.9829178 * r16.w;
-      r16.w = frac(r16.w);
-      r16.w = 6.28318548 * r16.w;
+        r16.w = shadow_use_jitter
+                    ? shadow_jitter_angle_temporal
+                    : shadow_jitter_angle_static;
       r22.z = r20.w;
       r23.xy = r21.zw;
       r17.w = 0;
@@ -879,14 +908,13 @@ void main(
           r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
           if (r18.w != 0) break;
           r18.w = (int)r17.w;
-          r19.x = 0.5 + r18.w;
-          r19.x = sqrt(r19.x);
-          r19.x = pcss_blocker_radius_scale * r19.x;
-          r18.w = r18.w * 2.4000001 + r16.w;
-          sincos(r18.w, r23.x, r24.x);
-          r24.x = r24.x * r19.x;
-          r24.y = r23.x * r19.x;
-          r22.xy = r24.xy * r20.zw + r16.xy;
+          float2 blocker_offset = ISFASTShadowSampleOffset(
+              r18.w,
+              (float)max(pcss_sample_count_minus_one, 1),
+              r16.w,
+              pcss_blocker_radius_scale,
+              shadow_use_isfast_cosine_warp);
+          r22.xy = blocker_offset * r20.zw + r16.xy;
           r18.w = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
           r19.x = cmp(r18.w < r16.z);
           r22.y = r21.w + r18.w;
@@ -917,14 +945,13 @@ void main(
             r19.x = cmp((int)r18.w >= pcss_sample_count);
             if (r19.x != 0) break;
             r19.x = (int)r18.w;
-            r20.z = 0.5 + r19.x;
-            r20.z = sqrt(r20.z);
-            r20.z = pcss_filter_radius_scale * r20.z;
-            r19.x = r19.x * 2.4000001 + r16.w;
-            sincos(r19.x, r19.x, r22.x);
-            r22.x = r22.x * r20.z;
-            r22.y = r20.z * r19.x;
-            r21.xy = r22.xy * r20.xy + r16.xy;
+            float2 filter_offset = ISFASTShadowSampleOffset(
+                r19.x,
+                (float)pcss_sample_count,
+                r16.w,
+                pcss_filter_radius_scale,
+                shadow_use_isfast_cosine_warp);
+            r21.xy = filter_offset * r20.xy + r16.xy;
             r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
             r17.w = r19.x + r17.w;
             r18.w = (int)r18.w + 1;
@@ -959,16 +986,9 @@ void main(
       r16.w = cmp(r21.w < r20.z);
       r21.z = 1;
       r21.zw = r16.ww ? r21.zw : 0;
-      if (shadow_use_jitter) {
-        // add jitter to shadow filtering
-        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992)) + (sceneTime_g * 77.0);
-      } else {
-        r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-      }
-      r16.w = frac(r16.w);
-      r16.w = 52.9829178 * r16.w;
-      r16.w = frac(r16.w);
-      r16.w = 6.28318548 * r16.w;
+      r16.w = shadow_use_jitter
+                  ? shadow_jitter_angle_temporal
+                  : shadow_jitter_angle_static;
       r22.z = r20.w;
       r17.w = 0;
       r18.w = 0;
@@ -976,14 +996,13 @@ void main(
         r18.w = cmp((int)r17.w >= pcss_sample_count_minus_one);
         if (r18.w != 0) break;
         r18.w = (int)r17.w;
-        r19.x = 0.5 + r18.w;
-        r19.x = sqrt(r19.x);
-        r19.x = pcss_blocker_radius_scale * r19.x;
-        r18.w = r18.w * 2.4000001 + r16.w;
-        sincos(r18.w, r24.x, r25.x);
-        r25.x = r25.x * r19.x;
-        r25.y = r24.x * r19.x;
-        r22.xy = r25.xy * r21.xy + r20.xy;
+        float2 blocker_offset = ISFASTShadowSampleOffset(
+            r18.w,
+            (float)max(pcss_sample_count_minus_one, 1),
+            r16.w,
+            pcss_blocker_radius_scale,
+            shadow_use_isfast_cosine_warp);
+        r22.xy = blocker_offset * r21.xy + r20.xy;
         r18.w = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
         r19.x = cmp(r18.w < r20.z);
         r22.y = r23.y + r18.w;
@@ -1007,16 +1026,9 @@ void main(
         
         r21.zw = float2(1,1) / r21.zw;
         r21.xy = max(r21.zw, r21.xy);
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r16.w = dot(v0.xy, float2(0.0671105608, 0.00583714992)) + (sceneTime_g * 77.0);
-        } else {
-          r16.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-        }
-        r16.w = frac(r16.w);
-        r16.w = 52.9829178 * r16.w;
-        r16.w = frac(r16.w);
-        r16.w = 6.28318548 * r16.w;
+        r16.w = shadow_use_jitter
+                    ? shadow_jitter_angle_temporal
+                    : shadow_jitter_angle_static;
         r22.z = r20.w;
         r17.w = 0;
         r18.w = 0;
@@ -1024,14 +1036,13 @@ void main(
             r19.x = cmp((int)r18.w >= pcss_sample_count);
           if (r19.x != 0) break;
           r19.x = (int)r18.w;
-          r20.w = 0.5 + r19.x;
-          r20.w = sqrt(r20.w);
-          r20.w = pcss_filter_radius_scale * r20.w;
-          r19.x = r19.x * 2.4000001 + r16.w;
-          sincos(r19.x, r19.x, r23.x);
-          r23.x = r23.x * r20.w;
-          r23.y = r20.w * r19.x;
-          r22.xy = r23.xy * r21.xy + r20.xy;
+          float2 filter_offset = ISFASTShadowSampleOffset(
+              r19.x,
+              (float)pcss_sample_count,
+              r16.w,
+              pcss_filter_radius_scale,
+              shadow_use_isfast_cosine_warp);
+          r22.xy = filter_offset * r21.xy + r20.xy;
           r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r22.xyz, r20.z).x;
           r17.w = r19.x + r17.w;
           r18.w = (int)r18.w + 1;
@@ -1057,16 +1068,7 @@ void main(
         r17.w = cmp(r21.y < r20.z);
         r21.x = 1;
         r21.xy = r17.ww ? r21.xy : 0;
-        if (shadow_use_jitter) {
-          // add jitter to shadow filtering
-          r17.w = dot(v0.xy, float2(0.0671105608,0.00583714992));
-          r17.w = frac(r17.w);
-          r17.w = 52.9829178 * r17.w;
-          r17.w = frac(r17.w);
-          r17.w = 6.28318548 * r17.w;
-        } else {
-          r17.w = 0;
-        }
+        r17.w = shadow_use_jitter ? shadow_jitter_angle_temporal : 0;
         r22.z = 1;
         r21.zw = r21.xy;
         r18.w = 0;
@@ -1074,14 +1076,13 @@ void main(
           r19.x = cmp((int)r18.w >= pcss_sample_count_minus_one);
           if (r19.x != 0) break;
           r19.x = (int)r18.w;
-          r20.w = 0.5 + r19.x;
-          r20.w = sqrt(r20.w);
-          r20.w = pcss_blocker_radius_scale * r20.w;
-          r19.x = r19.x * 2.4000001 + r17.w;
-          sincos(r19.x, r19.x, r23.x);
-          r23.x = r23.x * r20.w;
-          r23.y = r20.w * r19.x;
-          r22.xy = r23.xy * r16.xw + r20.xy;
+          float2 blocker_offset = ISFASTShadowSampleOffset(
+              r19.x,
+              (float)max(pcss_sample_count_minus_one, 1),
+              r17.w,
+              pcss_blocker_radius_scale,
+              shadow_use_isfast_cosine_warp);
+          r22.xy = blocker_offset * r16.xw + r20.xy;
           r19.x = shadowMaps.SampleLevel(SmplMirror_s, r22.xyz, 0).x;
           r20.w = cmp(r19.x < r20.z);
           r22.y = r21.w + r19.x;
@@ -1111,14 +1112,13 @@ void main(
             r18.w = cmp((int)r16.w >= pcss_sample_count);
             if (r18.w != 0) break;
             r18.w = (int)r16.w;
-            r19.x = 0.5 + r18.w;
-            r19.x = sqrt(r19.x);
-            r19.x = pcss_filter_radius_scale * r19.x;
-            r18.w = r18.w * 2.4000001 + r17.w;
-            sincos(r18.w, r22.x, r23.x);
-            r23.x = r23.x * r19.x;
-            r23.y = r22.x * r19.x;
-            r21.xy = r23.xy * r16.xy + r20.xy;
+            float2 filter_offset = ISFASTShadowSampleOffset(
+                r18.w,
+                (float)pcss_sample_count,
+                r17.w,
+                pcss_filter_radius_scale,
+                shadow_use_isfast_cosine_warp);
+            r21.xy = filter_offset * r16.xy + r20.xy;
             r18.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r20.z).x;
             r16.z = r18.w + r16.z;
             r16.w = (int)r16.w + 1;
