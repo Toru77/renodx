@@ -19,7 +19,6 @@
 #include "../../mods/shader.hpp"
 #include "../../utils/descriptor.hpp"
 #include "../../utils/pipeline_layout.hpp"
-#include "../../utils/render.hpp"
 #include "../../utils/resource.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
@@ -32,7 +31,7 @@ constexpr uint32_t kLightingShader = 0x430ED091u;
 constexpr uint32_t kLightingSoftShader = 0xF6C55E5Fu;
 constexpr uint32_t kCharacterShader = 0x445A1838u;
 
-void OnLightingShaderDrawnApplyCharacterSSGI(reshade::api::command_list* cmd_list);
+bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     {
@@ -40,7 +39,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kLightingShader,
             .code = __0x430ED091,
-            .on_drawn = &OnLightingShaderDrawnApplyCharacterSSGI,
+            .on_draw = &OnBeforeLightingShaderDraw,
         },
     },                                             // lighting
     {
@@ -48,7 +47,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kLightingSoftShader,
             .code = __0xF6C55E5F,
-            .on_drawn = &OnLightingShaderDrawnApplyCharacterSSGI,
+            .on_draw = &OnBeforeLightingShaderDraw,
         },
     },                                             // lighting soft shadows
     CustomShaderEntry(0x445A1838),                 // character lighting
@@ -118,53 +117,31 @@ SssInjectData shader_injection = {
     .foliage_sss_max_darkening = 0.50f,
     .foliage_sss_bright_reject_threshold = 0.19f,
     .foliage_sss_bright_reject_fade = 0.5f,
+    .char_gi_enabled = 1.f,
+    .char_gi_strength = 3.0f,
+    .char_gi_alpha_scale = 1.0f,
+    .char_gi_chroma_strength = 0.50f,
+    .char_gi_luma_strength = 0.0f,
+    .char_gi_shadow_power = 1.25f,
+    .char_gi_headroom_power = 1.25f,
+    .char_gi_max_add = 0.020f,
+    .char_gi_dark_boost = 0.0f,
+    .char_gi_debug_mode = 0.f,
+    .char_gi_debug_scale = 1.f,
+    .char_gi_debug_chars_only = 1.f,
+    .char_gi_bright_boost = 3.0f,
+    .char_gi_peak_luma_cap = 0.0f,
+    .char_gi_depth_reject = 2.0f,
+    .char_gi_normal_reject = 0.15f,
+    .char_gi_ao_influence = 0.66f,
+    .char_gi_reject_strength = 8.0f,
 };
 
 float settings_mode = 0.f;
-float char_ssgi_composite_enabled = 1.f;
+float char_ssgi_composite_method = 1.f;  // 0=Off, 1=On
 
-struct CharacterGiCompositeData {
-  float strength = 3.0f;
-  float alpha_scale = 0.75f;
-  float chroma_strength = 0.50f;
-  float luma_strength = 0.0f;
-  float shadow_power = 1.25f;
-  float headroom_power = 1.25f;
-  float max_add = 0.020f;
-  float dark_boost = 0.50f;
-  float debug_mode = 0.f;
-  float debug_scale = 1.f;
-  float debug_chars_only = 1.f;
-  float bright_boost = 3.0f;
-  float peak_luma_cap = 0.0f;
-  float depth_reject = 2.0f;
-  float normal_reject = 0.15f;
-  float ao_influence = 0.66f;
-  float reject_strength = 8.0f;
-  float _pad0 = 0.f;
-  float _pad1 = 0.f;
-  float _pad2 = 0.f;
-};
-static_assert(sizeof(CharacterGiCompositeData) == sizeof(float) * 20);
-
-CharacterGiCompositeData character_gi_composite_data = {};
-
-std::atomic_uint64_t g_lighting_ssgi_view{0u};
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
-std::atomic_uint64_t g_lighting_mrt1_view{0u};
-std::atomic_uint64_t g_lighting_depth_view{0u};
-std::atomic_uint64_t g_lighting_ssao_view{0u};
 std::atomic_uint64_t g_character_mrt0_view{0u};
-std::atomic_uint64_t g_character_depth_view{0u};
-std::atomic_uint64_t g_present_frame_index{0u};
-std::atomic_uint64_t g_last_composite_frame_index{static_cast<uint64_t>(-1)};
-
-struct __declspec(uuid("1f4fe7b8-271a-4d04-af0d-a52578061ef1")) DeviceData {
-  reshade::api::resource composite_source_texture = {};
-  reshade::api::resource_view composite_source_texture_view = {};
-  reshade::api::resource_desc composite_source_desc = {};
-  renodx::utils::render::RenderPass composite_pass = {};
-};
 
 bool TryResolveTextureRegister(
     reshade::api::pipeline_layout layout,
@@ -222,23 +199,11 @@ void CaptureTrackedTextureView(
     const reshade::api::resource_view view) {
   if (view.handle == 0u) return;
   if (space != 0u) return;
-  const bool is_lighting_shader = shader_hash == kLightingShader || shader_hash == kLightingSoftShader;
 
-  if (is_lighting_shader && reg == 9u) {
-    g_lighting_ssgi_view.store(view.handle, std::memory_order_relaxed);
-  } else if (is_lighting_shader && reg == 2u) {
-    g_lighting_mrt1_view.store(view.handle, std::memory_order_relaxed);
-  } else if (is_lighting_shader && reg == 3u) {
-    g_lighting_depth_view.store(view.handle, std::memory_order_relaxed);
-  } else if (is_lighting_shader && reg == 4u) {
-    g_lighting_ssao_view.store(view.handle, std::memory_order_relaxed);
-  } else if (shader_hash == kCharacterShader && reg == 0u) {
-    // Character pass depth texture.
-    g_character_depth_view.store(view.handle, std::memory_order_relaxed);
-  } else if (shader_hash == kCharacterShader && reg == 2u) {
+  if (shader_hash == kCharacterShader && reg == 2u) {
     // Character pass uses mrtTexture0 at t2.
     g_character_mrt0_view.store(view.handle, std::memory_order_relaxed);
-  } else if (is_lighting_shader && reg == 1u) {
+  } else if ((shader_hash == kLightingShader || shader_hash == kLightingSoftShader) && reg == 1u) {
     // Keep lighting mrt0 as fallback in case character pass capture is unavailable.
     g_lighting_mrt0_view.store(view.handle, std::memory_order_relaxed);
   }
@@ -391,264 +356,35 @@ void OnBindDescriptorTablesCaptureLightingTextures(
   }
 }
 
-void DestroyCompositeResources(reshade::api::device* device, DeviceData* data) {
-  if (device == nullptr || data == nullptr) return;
+bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
+  // Bind character shader's MRT texture to t10 so the lighting shader
+  // can read the character mask from it (the lighting shader's own t1
+  // may not contain the character flag bits).
+  if (cmd_list == nullptr) return true;
+  if (shader_injection.char_gi_enabled < 0.5f) return true;
 
-  data->composite_pass.DestroyAll(device);
-
-  if (data->composite_source_texture_view.handle != 0u) {
-    device->destroy_resource_view(data->composite_source_texture_view);
-    data->composite_source_texture_view = {0u};
+  reshade::api::resource_view char_mrt0 = {g_character_mrt0_view.load(std::memory_order_relaxed)};
+  if (char_mrt0.handle == 0u) {
+    char_mrt0 = {g_lighting_mrt0_view.load(std::memory_order_relaxed)};
   }
-  if (data->composite_source_texture.handle != 0u) {
-    device->destroy_resource(data->composite_source_texture);
-    data->composite_source_texture = {0u};
-  }
-  data->composite_source_desc = {};
-}
+  if (char_mrt0.handle == 0u) return true;
 
-void OnInitDevice(reshade::api::device* device) {
-  device->create_private_data<DeviceData>();
-}
+  auto* info = renodx::utils::resource::GetResourceViewInfo(char_mrt0);
+  if (info == nullptr || info->destroyed) return true;
 
-void OnDestroyDevice(reshade::api::device* device) {
-  auto* data = device->get_private_data<DeviceData>();
-  if (data != nullptr) {
-    DestroyCompositeResources(device, data);
-  }
-  device->destroy_private_data<DeviceData>();
-}
-
-void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
-  (void)resize;
-  auto* device = swapchain->get_device();
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr) return;
-
-  DestroyCompositeResources(device, data);
-  data->composite_pass.auto_generate_render_target_formats = true;
-  data->composite_pass.auto_generate_descriptor_table_updates = true;
-}
-
-void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
-  (void)resize;
-  auto* device = swapchain->get_device();
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr) return;
-  DestroyCompositeResources(device, data);
-}
-
-bool EnsureCompositeSourceTexture(
-    reshade::api::device* device,
-    DeviceData* data,
-    const reshade::api::resource_desc& target_desc) {
-  if (device == nullptr || data == nullptr) return false;
-  if (target_desc.type != reshade::api::resource_type::texture_2d) return false;
-  if (target_desc.texture.samples != 1) return false;
-
-  const auto target_typeless = reshade::api::format_to_typeless(target_desc.texture.format);
-  const bool texture_matches =
-      data->composite_source_texture.handle != 0u
-      && data->composite_source_desc.type == reshade::api::resource_type::texture_2d
-      && data->composite_source_desc.texture.width == target_desc.texture.width
-      && data->composite_source_desc.texture.height == target_desc.texture.height
-      && data->composite_source_desc.texture.depth_or_layers == 1u
-      && data->composite_source_desc.texture.levels == 1u
-      && data->composite_source_desc.texture.samples == 1u
-      && data->composite_source_desc.texture.format == target_typeless;
-  if (texture_matches && data->composite_source_texture_view.handle != 0u) return true;
-
-  if (data->composite_source_texture_view.handle != 0u) {
-    device->destroy_resource_view(data->composite_source_texture_view);
-    data->composite_source_texture_view = {0u};
-  }
-  if (data->composite_source_texture.handle != 0u) {
-    device->destroy_resource(data->composite_source_texture);
-    data->composite_source_texture = {0u};
-  }
-  data->composite_source_desc = {};
-
-  reshade::api::resource_desc source_desc = {};
-  source_desc.type = reshade::api::resource_type::texture_2d;
-  source_desc.texture = {
-      target_desc.texture.width,
-      target_desc.texture.height,
-      1,
-      1,
-      target_typeless,
-      1,
-  };
-  source_desc.heap = reshade::api::memory_heap::gpu_only;
-  source_desc.usage = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::shader_resource;
-  source_desc.flags = reshade::api::resource_flags::none;
-
-  if (!device->create_resource(
-          source_desc,
-          nullptr,
-          reshade::api::resource_usage::shader_resource,
-          &data->composite_source_texture)) {
-    return false;
-  }
-
-  if (!device->create_resource_view(
-          data->composite_source_texture,
-          reshade::api::resource_usage::shader_resource,
-          reshade::api::resource_view_desc(reshade::api::format_to_default_typed(source_desc.texture.format)),
-          &data->composite_source_texture_view)) {
-    device->destroy_resource(data->composite_source_texture);
-    data->composite_source_texture = {0u};
-    return false;
-  }
-
-  data->composite_source_desc = source_desc;
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel,
+      reshade::api::pipeline_layout{0},
+      0,
+      reshade::api::descriptor_table_update{
+          {},
+          10,
+          0,
+          1,
+          reshade::api::descriptor_type::texture_shader_resource_view,
+          &char_mrt0,
+      });
   return true;
-}
-
-bool ApplyCharacterSSGIComposite(
-    reshade::api::command_list* cmd_list,
-    reshade::api::resource_view target_rtv) {
-  if (cmd_list == nullptr || target_rtv.handle == 0u) return false;
-
-  auto* device = cmd_list->get_device();
-  if (device == nullptr) return false;
-  auto* data = device->get_private_data<DeviceData>();
-  if (data == nullptr) return false;
-
-  reshade::api::resource_view ssgi_view = {g_lighting_ssgi_view.load(std::memory_order_relaxed)};
-  reshade::api::resource_view mrt0_view = {g_character_mrt0_view.load(std::memory_order_relaxed)};
-  reshade::api::resource_view mrt1_view = {g_lighting_mrt1_view.load(std::memory_order_relaxed)};
-  reshade::api::resource_view depth_view = {g_character_depth_view.load(std::memory_order_relaxed)};
-  if (depth_view.handle == 0u) {
-    depth_view = {g_lighting_depth_view.load(std::memory_order_relaxed)};
-  }
-  reshade::api::resource_view ssao_view = {g_lighting_ssao_view.load(std::memory_order_relaxed)};
-  if (mrt0_view.handle == 0u) {
-    mrt0_view = {g_lighting_mrt0_view.load(std::memory_order_relaxed)};
-  }
-  if (mrt0_view.handle == 0u) return false;
-
-  auto* target_view_info = renodx::utils::resource::GetResourceViewInfo(target_rtv);
-  auto* mrt0_view_info = renodx::utils::resource::GetResourceViewInfo(mrt0_view);
-  if (target_view_info == nullptr || mrt0_view_info == nullptr) return false;
-  if (target_view_info->destroyed || mrt0_view_info->destroyed) return false;
-
-  bool has_ssgi = ssgi_view.handle != 0u;
-  bool has_mrt1 = mrt1_view.handle != 0u;
-  bool has_depth = depth_view.handle != 0u;
-  bool has_ssao = ssao_view.handle != 0u;
-  if (has_ssgi) {
-    auto* info = renodx::utils::resource::GetResourceViewInfo(ssgi_view);
-    has_ssgi = info != nullptr && !info->destroyed;
-  }
-  if (has_mrt1) {
-    auto* info = renodx::utils::resource::GetResourceViewInfo(mrt1_view);
-    has_mrt1 = info != nullptr && !info->destroyed;
-  }
-  if (has_depth) {
-    auto* info = renodx::utils::resource::GetResourceViewInfo(depth_view);
-    has_depth = info != nullptr && !info->destroyed;
-  }
-  if (has_ssao) {
-    auto* info = renodx::utils::resource::GetResourceViewInfo(ssao_view);
-    has_ssao = info != nullptr && !info->destroyed;
-  }
-
-  auto target_resource = device->get_resource_from_view(target_rtv);
-  if (target_resource.handle == 0u) return false;
-  auto target_desc = device->get_resource_desc(target_resource);
-  if (!EnsureCompositeSourceTexture(device, data, target_desc)) return false;
-
-  if (!has_ssgi) {
-    ssgi_view = data->composite_source_texture_view;
-  }
-  if (!has_mrt1) {
-    mrt1_view = mrt0_view;
-  }
-  if (!has_depth) {
-    depth_view = data->composite_source_texture_view;
-  }
-  if (!has_ssao) {
-    ssao_view = data->composite_source_texture_view;
-  }
-
-  CharacterGiCompositeData composite_data = character_gi_composite_data;
-  if (char_ssgi_composite_enabled < 0.5f) {
-    composite_data.strength = 0.0f;
-    composite_data.alpha_scale = 0.0f;
-    composite_data.chroma_strength = 0.0f;
-    composite_data.luma_strength = 0.0f;
-  }
-
-  if (!has_ssgi) {
-    composite_data.strength = 0.0f;
-    composite_data.alpha_scale = 0.0f;
-  }
-  if (!has_mrt1) {
-    composite_data.normal_reject = 0.0f;
-  }
-  if (!has_depth) {
-    composite_data.depth_reject = 0.0f;
-  }
-  if (!has_ssao) {
-    composite_data.ao_influence = 0.0f;
-  }
-
-  {
-    const reshade::api::resource resources[2] = {target_resource, data->composite_source_texture};
-    const reshade::api::resource_usage state_old[2] = {
-        reshade::api::resource_usage::render_target,
-        reshade::api::resource_usage::shader_resource};
-    const reshade::api::resource_usage state_new[2] = {
-        reshade::api::resource_usage::copy_source,
-        reshade::api::resource_usage::copy_dest};
-    cmd_list->barrier(2, resources, state_old, state_new);
-    cmd_list->copy_texture_region(target_resource, 0, nullptr, data->composite_source_texture, 0, nullptr);
-    cmd_list->barrier(2, resources, state_new, state_old);
-  }
-
-  data->composite_pass.InvalidateRenderTargets(cmd_list);
-  data->composite_pass.render_target_slots.views = {target_rtv};
-  data->composite_pass.shader_resource_slots.views = {
-      data->composite_source_texture_view,
-      ssgi_view,
-      mrt0_view,
-      mrt1_view,
-      depth_view,
-      ssao_view,
-  };
-  data->composite_pass.sampler_descs = {reshade::api::sampler_desc{}};
-  data->composite_pass.pipeline_subobjects.vertex_shader = __0xFFFFFFFD;
-  data->composite_pass.pipeline_subobjects.pixel_shader = __0xFFFFFFFE;
-  data->composite_pass.pipeline_subobjects.compute_shader = {};
-  data->composite_pass.push_constants.clear();
-  data->composite_pass.push_constants[renodx::utils::render::ConstantBuffersSlots{
-      .slot = 13,
-      .space = 0,
-  }] = std::span<const float>(
-      reinterpret_cast<const float*>(&composite_data),
-      sizeof(composite_data) / sizeof(float));
-  data->composite_pass.auto_generate_descriptor_table_updates = true;
-  data->composite_pass.revert_state_after_render = true;
-  data->composite_pass.flush_after_render = false;
-  return data->composite_pass.Render(cmd_list);
-}
-
-void OnLightingShaderDrawnApplyCharacterSSGI(reshade::api::command_list* cmd_list) {
-  if (char_ssgi_composite_enabled < 0.5f) return;
-  if (cmd_list == nullptr) return;
-
-  const auto frame_index = g_present_frame_index.load(std::memory_order_relaxed);
-  if (g_last_composite_frame_index.load(std::memory_order_relaxed) == frame_index) return;
-
-  auto* swapchain_state = renodx::utils::swapchain::GetCurrentState(cmd_list);
-  if (swapchain_state == nullptr) return;
-  if (swapchain_state->current_render_targets.empty()) return;
-  auto target_rtv = swapchain_state->current_render_targets.at(0);
-  if (target_rtv.handle == 0u) return;
-
-  if (ApplyCharacterSSGIComposite(cmd_list, target_rtv)) {
-    g_last_composite_frame_index.store(frame_index, std::memory_order_relaxed);
-  }
 }
 
 void OnPresentAdvanceFrame(
@@ -664,7 +400,31 @@ void OnPresentAdvanceFrame(
   (void)dest_rect;
   (void)dirty_rect_count;
   (void)dirty_rects;
-  g_present_frame_index.fetch_add(1u, std::memory_order_relaxed);
+
+  // Sync char_gi_enabled: 1 when On (method>=0.5), 0 when Off
+  shader_injection.char_gi_enabled =
+      (char_ssgi_composite_method >= 0.5f) ? 1.f : 0.f;
+
+  // Basic mode: force all char_gi params to their defaults so sliders have no effect
+  if (settings_mode < 0.5f) {
+    shader_injection.char_gi_strength = 3.0f;
+    shader_injection.char_gi_alpha_scale = 1.0f;
+    shader_injection.char_gi_chroma_strength = 0.50f;
+    shader_injection.char_gi_luma_strength = 0.0f;
+    shader_injection.char_gi_shadow_power = 1.25f;
+    shader_injection.char_gi_headroom_power = 1.25f;
+    shader_injection.char_gi_max_add = 0.020f;
+    shader_injection.char_gi_dark_boost = 0.0f;
+    shader_injection.char_gi_debug_mode = 0.f;
+    shader_injection.char_gi_debug_scale = 1.f;
+    shader_injection.char_gi_debug_chars_only = 1.f;
+    shader_injection.char_gi_bright_boost = 3.0f;
+    shader_injection.char_gi_peak_luma_cap = 0.0f;
+    shader_injection.char_gi_depth_reject = 2.0f;
+    shader_injection.char_gi_normal_reject = 0.15f;
+    shader_injection.char_gi_ao_influence = 0.66f;
+    shader_injection.char_gi_reject_strength = 8.0f;
+  }
 }
 
 bool IsAdvancedSettingsMode() {
@@ -680,7 +440,7 @@ renodx::utils::settings::Settings settings = {
         .can_reset = false,
         .label = "Settings Mode",
         .section = "Settings",
-        .labels = {"Basic", "Advanced"},
+        .labels = {"Basic", "Intermediate"},
         .is_global = true,
     },
     new renodx::utils::settings::Setting{
@@ -1151,9 +911,9 @@ renodx::utils::settings::Settings settings = {
     },
 
     new renodx::utils::settings::Setting{
-        .key = "CharacterSSGICompositeEnable",
-        .binding = &char_ssgi_composite_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .key = "CharacterSSGICompositeMethod",
+        .binding = &char_ssgi_composite_method,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 1.f,
         .label = "Apply Game SSGI",
         .section = "Character SSGI Composite",
@@ -1161,7 +921,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeStrength",
-        .binding = &character_gi_composite_data.strength,
+        .binding = &shader_injection.char_gi_strength,
         .default_value = 3.0f,
         .label = "Strength",
         .section = "Character SSGI Composite",
@@ -1169,25 +929,25 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 3.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeAlphaScale",
-        .binding = &character_gi_composite_data.alpha_scale,
-        .default_value = 0.75f,
+        .binding = &shader_injection.char_gi_alpha_scale,
+        .default_value = 1.0f,
         .label = "Alpha Scale",
         .section = "Character SSGI Composite",
         .tooltip = "Scales sampled SSGI alpha before blending.",
         .min = 0.f,
         .max = 3.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeChroma",
-        .binding = &character_gi_composite_data.chroma_strength,
+        .binding = &shader_injection.char_gi_chroma_strength,
         .default_value = 0.50f,
         .label = "Chroma",
         .section = "Character SSGI Composite",
@@ -1195,12 +955,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 2.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeLuma",
-        .binding = &character_gi_composite_data.luma_strength,
+        .binding = &shader_injection.char_gi_luma_strength,
         .default_value = 0.0f,
         .label = "Luma",
         .section = "Character SSGI Composite",
@@ -1208,12 +968,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.3f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeShadowPower",
-        .binding = &character_gi_composite_data.shadow_power,
+        .binding = &shader_injection.char_gi_shadow_power,
         .default_value = 1.25f,
         .label = "Shadow Power",
         .section = "Character SSGI Composite",
@@ -1221,25 +981,25 @@ renodx::utils::settings::Settings settings = {
         .min = 0.1f,
         .max = 4.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDarkBoost",
-        .binding = &character_gi_composite_data.dark_boost,
-        .default_value = 0.50f,
+        .binding = &shader_injection.char_gi_dark_boost,
+        .default_value = 0.0f,
         .label = "Dark Boost",
         .section = "Character SSGI Composite",
         .tooltip = "Extra GI multiplier in darker regions (after shadow mask).",
         .min = 0.f,
         .max = 4.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeBrightBoost",
-        .binding = &character_gi_composite_data.bright_boost,
+        .binding = &shader_injection.char_gi_bright_boost,
         .default_value = 3.0f,
         .label = "Bright Boost",
         .section = "Character SSGI Composite",
@@ -1247,12 +1007,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 3.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeHeadroomPower",
-        .binding = &character_gi_composite_data.headroom_power,
+        .binding = &shader_injection.char_gi_headroom_power,
         .default_value = 1.25f,
         .label = "Headroom Power",
         .section = "Character SSGI Composite",
@@ -1260,12 +1020,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.1f,
         .max = 4.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeMaxAdd",
-        .binding = &character_gi_composite_data.max_add,
+        .binding = &shader_injection.char_gi_max_add,
         .default_value = 0.020f,
         .label = "Max Add",
         .section = "Character SSGI Composite",
@@ -1273,12 +1033,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.3f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositePeakLumaCap",
-        .binding = &character_gi_composite_data.peak_luma_cap,
+        .binding = &shader_injection.char_gi_peak_luma_cap,
         .default_value = 0.0f,
         .label = "Peak Luma Cap",
         .section = "Character SSGI Composite",
@@ -1286,12 +1046,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.3f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDepthReject",
-        .binding = &character_gi_composite_data.depth_reject,
+        .binding = &shader_injection.char_gi_depth_reject,
         .default_value = 2.0f,
         .label = "Depth Reject",
         .section = "Character SSGI Composite",
@@ -1299,12 +1059,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 16.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeNormalReject",
-        .binding = &character_gi_composite_data.normal_reject,
+        .binding = &shader_injection.char_gi_normal_reject,
         .default_value = 0.15f,
         .label = "Normal Reject",
         .section = "Character SSGI Composite",
@@ -1312,12 +1072,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 8.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeAOInfluence",
-        .binding = &character_gi_composite_data.ao_influence,
+        .binding = &shader_injection.char_gi_ao_influence,
         .default_value = 0.66f,
         .label = "AO Influence",
         .section = "Character SSGI Composite",
@@ -1325,12 +1085,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 1.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeRejectStrength",
-        .binding = &character_gi_composite_data.reject_strength,
+        .binding = &shader_injection.char_gi_reject_strength,
         .default_value = 8.0f,
         .label = "Reject Strength",
         .section = "Character SSGI Composite",
@@ -1338,12 +1098,12 @@ renodx::utils::settings::Settings settings = {
         .min = 0.f,
         .max = 8.f,
         .format = "%.2f",
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDebugMode",
-        .binding = &character_gi_composite_data.debug_mode,
+        .binding = &shader_injection.char_gi_debug_mode,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
         .label = "Debug View",
@@ -1366,12 +1126,12 @@ renodx::utils::settings::Settings settings = {
             "AO Factor",
             "Reject Factor",
         },
-        .is_enabled = []() { return char_ssgi_composite_enabled >= 0.5f; },
+        .is_enabled = []() { return char_ssgi_composite_method >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDebugScale",
-        .binding = &character_gi_composite_data.debug_scale,
+        .binding = &shader_injection.char_gi_debug_scale,
         .default_value = 1.f,
         .label = "Debug Scale",
         .section = "Character SSGI Composite",
@@ -1380,22 +1140,22 @@ renodx::utils::settings::Settings settings = {
         .max = 32.f,
         .format = "%.2f",
         .is_enabled = []() {
-          return char_ssgi_composite_enabled >= 0.5f
-                 && character_gi_composite_data.debug_mode >= 1.f;
+          return char_ssgi_composite_method >= 0.5f
+                 && shader_injection.char_gi_debug_mode >= 1.f;
         },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "CharacterSSGICompositeDebugCharsOnly",
-        .binding = &character_gi_composite_data.debug_chars_only,
+        .binding = &shader_injection.char_gi_debug_chars_only,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
         .label = "Debug Characters Only",
         .section = "Character SSGI Composite",
         .labels = {"Off", "On"},
         .is_enabled = []() {
-          return char_ssgi_composite_enabled >= 0.5f
-                 && character_gi_composite_data.debug_mode >= 1.f;
+          return char_ssgi_composite_method >= 0.5f
+                 && shader_injection.char_gi_debug_mode >= 1.f;
         },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -1580,10 +1340,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
 
-      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-      reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresentAdvanceFrame);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCaptureLightingTextures);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTablesCaptureLightingTextures);
@@ -1599,10 +1355,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
-      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-      reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::present>(OnPresentAdvanceFrame);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCaptureLightingTextures);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTablesCaptureLightingTextures);

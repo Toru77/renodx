@@ -56,7 +56,20 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   uint4 ssgi_bits = asuint(ssgi);
   bool4 ssgi_nan = ((ssgi_bits & 0x7F800000u) == 0x7F800000u) & ((ssgi_bits & 0x007FFFFFu) != 0u);
   bool4 ssgi_inf = ((ssgi_bits & 0x7FFFFFFFu) == 0x7F800000u);
-  if (any(ssgi_nan) || any(ssgi_inf)) ssgi = float4(0, 0, 0, 0);
+  bool had_nan = any(ssgi_nan);
+  bool had_inf = any(ssgi_inf);
+  if (had_nan || had_inf) ssgi = float4(0, 0, 0, 0);
+
+  // Integer-addressed Load() for debug comparison (bypasses sampler)
+  uint src_width, src_height;
+  sourceTexture.GetDimensions(src_width, src_height);
+  uint2 src_pixel = ComputePixelCoord(uv, src_width, src_height);
+  float4 source_loaded = sourceTexture.Load(int3(src_pixel, 0));
+
+  uint ssgi_width, ssgi_height;
+  ssgiTexture.GetDimensions(ssgi_width, ssgi_height);
+  uint2 ssgi_pixel = ComputePixelCoord(uv, ssgi_width, ssgi_height);
+  float4 ssgi_loaded = ssgiTexture.Load(int3(ssgi_pixel, 0));
 
   uint mrt0_width, mrt0_height;
   mrtTexture0.GetDimensions(mrt0_width, mrt0_height);
@@ -198,9 +211,83 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
       debug_color = ao_factor.xxx * debug_scale;
     } else if (debug_mode == 15u) {
       debug_color = reject_factor.xxx * debug_scale;
+    } else if (debug_mode == 16u) {
+      debug_color = source_loaded.rgb * debug_scale;
+    } else if (debug_mode == 17u) {
+      debug_color = ssgi_loaded.rgb * debug_scale;
+    } else if (debug_mode == 18u) {
+      debug_color = ssgi.rrr * debug_scale;
+    } else if (debug_mode == 19u) {
+      debug_color = ssgi.ggg * debug_scale;
+    } else if (debug_mode == 20u) {
+      debug_color = ssgi.bbb * debug_scale;
+    } else if (debug_mode == 21u) {
+      debug_color = float3(had_nan ? 1.0 : 0.0, had_inf ? 1.0 : 0.0, (!had_nan && !had_inf) ? 0.15 : 0.0);
+    } else if (debug_mode == 22u) {
+      debug_color = float3(
+          (float)(material_flags & 0xFFu) * INV_U8,
+          (float)((material_flags >> 8u) & 0xFFu) * INV_U8,
+          (float)((material_flags >> 16u) & 0xFFu) * INV_U8);
+      debug_color *= debug_scale;
+    } else if (debug_mode == 23u) {
+      uint is_char_right = (mrt_right.z >> CHARACTER_MASK_SHIFT) & 1u;
+      uint is_char_down = (mrt_down.z >> CHARACTER_MASK_SHIFT) & 1u;
+      float boundary = (is_character != is_char_right || is_character != is_char_down) ? 1.0 : 0.0;
+      debug_color = boundary.xxx;
+    } else if (debug_mode == 24u) {
+      debug_color = source.aaa * debug_scale;
+    } else if (debug_mode == 25u) {
+      float cyan_amount = saturate((source_base.g + source_base.b) * 0.5 - source_base.r);
+      debug_color = float3(0.0, cyan_amount, cyan_amount) * debug_scale;
+    } else if (debug_mode == 26u) {
+      float3 diff = abs(source_base - source_loaded.rgb);
+      debug_color = diff * debug_scale * 100.0;
+    } else if (debug_mode == 27u) {
+      float3 diff = abs(ssgi.rgb - ssgi_loaded.rgb);
+      debug_color = diff * debug_scale * 100.0;
+    } else if (debug_mode == 28u) {
+      // NUKE TEST: writes solid magenta everywhere.
+      // Enable for 1 frame, then switch to Source Color (7).
+      // If magenta persists in some areas next frame => those pixels
+      // are NOT overwritten by the lighting shader => feedback loop.
+      return float4(1.0, 0.0, 1.0, 1.0);
+    } else if (debug_mode == 29u) {
+      // UV GRID: checkerboard pattern from UV coordinates.
+      // If the pattern is misaligned with pixel grid or has discontinuities,
+      // the copy or UV mapping is wrong.
+      float2 grid = floor(uv * float2((float)src_width, (float)src_height));
+      float checker = fmod(grid.x + grid.y, 2.0);
+      debug_color = lerp(float3(0.1, 0.1, 0.3), float3(0.9, 0.9, 0.3), checker);
+    } else if (debug_mode == 30u) {
+      // FEEDBACK DETECT: shows pixels where source has cyan tint.
+      // Red channel = cyan strength, green = source changed from last frame.
+      float cyan_strength = saturate((source_base.g + source_base.b) * 0.5 - source_base.r);
+      float high_cyan = (cyan_strength > 0.05) ? 1.0 : 0.0;
+      debug_color = float3(high_cyan, cyan_strength * debug_scale, 0.0);
+    } else if (debug_mode == 31u) {
+      // FLAT GRAY OUTPUT: Writes constant 50% gray to every pixel.
+      // Run for 2-3 seconds, then switch to Source Color (7).
+      // If Source Color shows cyan areas after flat gray:
+      //   => game temporal system creates cyan from neutral input (unlikely)
+      // If Source Color is clean:
+      //   => the GI content specifically causes temporal contamination
+      return float4(0.5, 0.5, 0.5, 1.0);
+    } else if (debug_mode == 32u) {
+      // NO-GI PASSTHROUGH: Runs the full copy+draw pipeline but
+      // forces EXACT source passthrough (zero GI for all pixels).
+      // Uses Load() for pixel-exact addressing. If cyan disappears
+      // with this mode running continuously: GI content leaks into temporal.
+      // If cyan persists: the copy+draw mechanism itself causes it.
+      return float4(source_loaded.rgb, source.a);
+    } else if (debug_mode == 33u) {
+      // ACCUMULATION TEST: outputs source + tiny constant offset.
+      // If the game temporal system accumulates this, the screen
+      // will gradually shift towards bright white over ~30 frames.
+      // Confirms temporal feedback accumulation rate.
+      return float4(source_base + float3(0.01, 0.01, 0.01), source.a);
     }
 
-    if (debug_chars_only && char_mask < 0.5) {
+    if (debug_chars_only && char_mask < 0.5 && debug_mode <= 15u) {
       debug_color = float3(0.0, 0.0, 0.0);
     }
 
