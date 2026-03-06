@@ -66,6 +66,16 @@ struct SssInjectData {
   float isfast_noise_bound;
   float volfog_color_correction_strength;
 
+  // Depth of Field improvements (DOF_0xAB6DBF4D / DOF_0x2734F870)
+  float dof_mode;                  // 0=Vanilla, 1=Improved (Method 3 / gather)
+  float dof_strength;              // final blend strength
+  float dof_radius_scale;          // scales cocMaxRadius from game constants
+  float dof_sample_count;          // gather tap budget
+  float dof_near_scale;            // near CoC shaping
+  float dof_far_scale;             // far CoC shaping
+  float dof_coc_curve;             // CoC power curve
+  float dof_edge_threshold;        // CoC mismatch rejection
+
   // SSS controls (0x534E54EA)
   float foliage_translucency_scale;
   float foliage_opacity_scale;
