@@ -45,6 +45,7 @@ constexpr uint32_t kIsFastSamplerBinding = 15u;
 
 bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list);
+bool BindISFastNoisePixel(reshade::api::command_list* cmd_list);
 void OnInitDevice(reshade::api::device* device);
 void OnDestroyDevice(reshade::api::device* device);
 void ReloadIsFastResources(reshade::api::device* device, const char* reason);
@@ -73,6 +74,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xF237E72F),                 // glass
     CustomShaderEntry(0x8337B262),                 // floor
     CustomShaderEntry(0x534E54EA),                 // sss source pass
+    CustomShaderEntry(0xAB6DBF4D),                 // dof coc
+    CustomShaderEntry(0x2734F870),                 // dof blur composite
     {
         kVolFogShader,
         {
@@ -127,6 +130,14 @@ SssInjectData shader_injection = {
     .volfog_is_fast_enabled = 1.f,
     .isfast_noise_bound = 0.f,
     .volfog_color_correction_strength = 0.5f,
+    .dof_mode = 1.f,
+    .dof_strength = 1.f,
+    .dof_radius_scale = 1.33f,
+    .dof_sample_count = 24.f,
+    .dof_near_scale = 1.f,
+    .dof_far_scale = 1.f,
+    .dof_coc_curve = 1.f,
+    .dof_edge_threshold = 0.25f,
     .foliage_translucency_scale = 1.f,
     .foliage_opacity_scale = 1.f,
     .foliage_ssao_scale = 1.f,
@@ -822,7 +833,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
+bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return true;
   if (g_isfast_reshade_srv.handle == 0u || g_isfast_reshade_sampler.handle == 0u) {
     if (!g_isfast_bind_failed_logged) {
@@ -880,6 +891,10 @@ bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
   }
 
   return true;
+}
+
+bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
+  return BindISFastNoisePixel(cmd_list);
 }
 
 void OnPresentAdvanceFrame(
@@ -1081,6 +1096,108 @@ renodx::utils::settings::Settings settings = {
         .max = 8.f,
         .format = "%.1fx",
         .is_enabled = []() { return shader_injection.ssr_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFMode",
+        .binding = &shader_injection.dof_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "Depth of Field",
+        .tooltip = "Vanilla keeps the original blur shader. Improved uses DOF method 3 (gather).",
+        .labels = {"Vanilla", "Improved"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFStrength",
+        .binding = &shader_injection.dof_strength,
+        .default_value = 1.f,
+        .label = "Strength",
+        .section = "Depth of Field",
+        .tooltip = "Overall blend strength for improved DOF output.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFRadiusScale",
+        .binding = &shader_injection.dof_radius_scale,
+        .default_value = 1.33f,
+        .label = "Radius Scale",
+        .section = "Depth of Field",
+        .tooltip = "Scales blur radius derived from game CoC.",
+        .min = 0.25f,
+        .max = 2.5f,
+        .format = "%.2fx",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFSampleCount",
+        .binding = &shader_injection.dof_sample_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 24.f,
+        .label = "Sample Count",
+        .section = "Depth of Field",
+        .tooltip = "Higher values produce smoother bokeh at higher cost.",
+        .min = 4.f,
+        .max = 64.f,
+        .format = "%d",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFNearScale",
+        .binding = &shader_injection.dof_near_scale,
+        .default_value = 1.f,
+        .label = "Near Scale",
+        .section = "Depth of Field",
+        .tooltip = "Scales near-field CoC response.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFFarScale",
+        .binding = &shader_injection.dof_far_scale,
+        .default_value = 1.f,
+        .label = "Far Scale",
+        .section = "Depth of Field",
+        .tooltip = "Scales far-field CoC response.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFCoCCurve",
+        .binding = &shader_injection.dof_coc_curve,
+        .default_value = 1.f,
+        .label = "CoC Curve",
+        .section = "Depth of Field",
+        .tooltip = "Applies pow(CoC, Curve) before blur; >1 tightens focus transition.",
+        .min = 0.25f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DOFEdgeThreshold",
+        .binding = &shader_injection.dof_edge_threshold,
+        .default_value = 0.25f,
+        .label = "Edge Threshold",
+        .section = "Depth of Field",
+        .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
+        .min = 0.02f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
