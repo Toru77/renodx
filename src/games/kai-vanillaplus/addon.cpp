@@ -70,6 +70,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x445A1838),                 // character lighting
     CustomShaderEntry(0x209125C1),                 // SSR
     CustomShaderEntry(0xB1CCBCAE),                 // glass
+    CustomShaderEntry(0x1A17A133),                 // glass
+    CustomShaderEntry(0xCA715B78),                 // glass
     CustomShaderEntry(0xE1E0ACBB),                 // glass
     CustomShaderEntry(0xF237E72F),                 // glass
     CustomShaderEntry(0x8337B262),                 // floor
