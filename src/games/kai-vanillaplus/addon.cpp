@@ -40,12 +40,16 @@ constexpr uint32_t kLightingShader = 0x430ED091u;
 constexpr uint32_t kLightingSoftShader = 0xF6C55E5Fu;
 constexpr uint32_t kCharacterShader = 0x445A1838u;
 constexpr uint32_t kVolFogShader = 0xBD7DFE49u;
+constexpr uint32_t kWireFenceShader = 0x26F1598Bu;
 constexpr uint32_t kIsFastTextureBinding = 15u;
 constexpr uint32_t kIsFastSamplerBinding = 15u;
+constexpr uint32_t kWireIsFastTextureBinding = 14u;
 
 bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list);
+bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list);
 bool BindISFastNoisePixel(reshade::api::command_list* cmd_list);
+bool BindISFastNoiseTexturePixel(reshade::api::command_list* cmd_list, uint32_t texture_binding);
 void OnInitDevice(reshade::api::device* device);
 void OnDestroyDevice(reshade::api::device* device);
 void ReloadIsFastResources(reshade::api::device* device, const char* reason);
@@ -78,6 +82,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x534E54EA),                 // sss source pass
     CustomShaderEntry(0xAB6DBF4D),                 // dof coc
     CustomShaderEntry(0x2734F870),                 // dof blur composite
+    {
+        kWireFenceShader,
+        {
+            .crc32 = kWireFenceShader,
+            .code = __0x26F1598B,
+            .on_draw = &OnBeforeWireFenceShaderDraw,
+        },
+    },  // wire fence
     {
         kVolFogShader,
         {
@@ -132,6 +144,11 @@ SssInjectData shader_injection = {
     .volfog_is_fast_enabled = 1.f,
     .isfast_noise_bound = 0.f,
     .volfog_color_correction_strength = 0.5f,
+    .wire_alpha_mode = 2.f,
+    .wire_alpha_sharpen = 1.0f,
+    .wire_alpha_threshold_offset = 0.0f,
+    .wire_alpha_temporal_amount = 0.77f,
+    .wire_alpha_temporal_speed = 237.0f,
     .dof_mode = 1.f,
     .dof_strength = 1.f,
     .dof_radius_scale = 1.33f,
@@ -178,6 +195,7 @@ SssInjectData shader_injection = {
 };
 
 float settings_mode = 0.f;
+float isfast_jitter_master = 1.f;
 float char_ssgi_composite_method = 1.f;  // 0=Off, 1=On
 
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
@@ -835,11 +853,11 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
+bool BindISFastNoiseTexturePixel(reshade::api::command_list* cmd_list, uint32_t texture_binding) {
   if (cmd_list == nullptr) return true;
-  if (g_isfast_reshade_srv.handle == 0u || g_isfast_reshade_sampler.handle == 0u) {
+  if (g_isfast_reshade_srv.handle == 0u) {
     if (!g_isfast_bind_failed_logged) {
-      LogIsFast(reshade::log::level::warning, "BindISFASTNoisePixel match=NO (SRV/sampler unavailable).");
+      LogIsFast(reshade::log::level::warning, "BindISFASTNoisePixel match=NO (SRV unavailable).");
       g_isfast_bind_failed_logged = true;
     }
     return true;
@@ -851,12 +869,27 @@ bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
       0,
       reshade::api::descriptor_table_update{
           {},
-          kIsFastTextureBinding,
+          texture_binding,
           0,
           1,
           reshade::api::descriptor_type::texture_shader_resource_view,
           &g_isfast_reshade_srv,
       });
+
+  return true;
+}
+
+bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return true;
+  if (g_isfast_reshade_sampler.handle == 0u) {
+    if (!g_isfast_bind_failed_logged) {
+      LogIsFast(reshade::log::level::warning, "BindISFASTNoisePixel match=NO (sampler unavailable).");
+      g_isfast_bind_failed_logged = true;
+    }
+    return true;
+  }
+
+  if (!BindISFastNoiseTexturePixel(cmd_list, kIsFastTextureBinding)) return false;
 
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
@@ -899,6 +932,12 @@ bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
   return BindISFastNoisePixel(cmd_list);
 }
 
+bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list) {
+  if (shader_injection.wire_alpha_mode < 1.5f) return true;
+  if (shader_injection.isfast_noise_bound < 0.5f) return true;
+  return BindISFastNoiseTexturePixel(cmd_list, kWireIsFastTextureBinding);
+}
+
 void OnPresentAdvanceFrame(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -917,6 +956,19 @@ void OnPresentAdvanceFrame(
   (void)dest_rect;
   (void)dirty_rect_count;
   (void)dirty_rects;
+
+  const float isfast_enabled = isfast_jitter_master >= 0.5f ? 1.f : 0.f;
+  shader_injection.shadow_pcss_jitter_enabled = isfast_enabled;
+  shader_injection.shadow_isfast_jitter_amount = isfast_enabled;
+  shader_injection.shadow_isfast_jitter_speed = 237.f;
+  shader_injection.char_shadow_jitter_enabled = isfast_enabled;
+  shader_injection.foliage_sss_jitter_enabled = isfast_enabled;
+  shader_injection.volfog_is_fast_enabled = isfast_enabled;
+  shader_injection.wire_alpha_mode = isfast_enabled > 0.5f ? 2.f : 0.f;
+  shader_injection.wire_alpha_threshold_offset = 0.f;
+  shader_injection.wire_alpha_sharpen = 1.f;
+  shader_injection.wire_alpha_temporal_amount = isfast_enabled > 0.5f ? 0.77f : 0.f;
+  shader_injection.wire_alpha_temporal_speed = 237.f;
 
   // Sync char_gi_enabled: 1 when On (method>=0.5), 0 when Off
   shader_injection.char_gi_enabled =
@@ -961,27 +1013,16 @@ renodx::utils::settings::Settings settings = {
         .is_global = true,
     },
     new renodx::utils::settings::Setting{
-        .key = "ShadowPCSSJitter",
-        .binding = &shader_injection.shadow_pcss_jitter_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .key = "ISFastJitterMaster",
+        .binding = &isfast_jitter_master,
         .default_value = 1.f,
-        .label = "IS-FAST jitter",
-        .section = "Shadows",
-        .tooltip = "Enables IS-FAST temporal jitter for PCSS shadow filtering.",
-        .labels = {"Off", "On"},
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ShadowISFASTJitterSpeed",
-        .binding = &shader_injection.shadow_isfast_jitter_speed,
-        .default_value = 237.f,
-        .label = "IS-FAST jitter speed",
-        .section = "Shadows",
-        .tooltip = "Controls temporal progression speed for IS-FAST jitter in PCSS shadows.",
+        .label = "Master",
+        .section = "IS-FAST Jitter (Dont enable if you are not using Temporal Solution.)",
+        .tooltip = "0 disables all IS-FAST jitter features. 1 enables them.",
         .min = 0.f,
-        .max = 480.f,
+        .max = 1.f,
         .format = "%.0f",
-        .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .is_global = true,
     },
     new renodx::utils::settings::Setting{
         .key = "ShadowBaseSoftness",
@@ -1331,17 +1372,6 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    new renodx::utils::settings::Setting{
-        .key = "CharShadowJitter",
-        .binding = &shader_injection.char_shadow_jitter_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
-        .label = "IS-FAST jitter",
-        .section = "Character Shadowing",
-        .tooltip = "Enables IS-FAST temporal jitter for character shadow sampling.",
-        .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
-    },
     // â”€â”€ SSS â”€â”€
     new renodx::utils::settings::Setting{
         .key = "FoliageSSSEnabled",
@@ -1405,17 +1435,6 @@ renodx::utils::settings::Settings settings = {
         .format = "%.2f",
         .is_enabled = []() { return shader_injection.foliage_sss_enabled >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "FoliageSSSJitter",
-        .binding = &shader_injection.foliage_sss_jitter_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
-        .label = "IS-FAST jitter",
-        .section = "Screen Space Shadows",
-        .tooltip = "Enables IS-FAST temporal jitter for foliage screen-space shadow sampling.",
-        .labels = {"Off", "On"},
-        .is_enabled = []() { return shader_injection.foliage_sss_enabled >= 0.5f; },
     },
       new renodx::utils::settings::Setting{
         .key = "FoliageSSSHeightEnable",
@@ -1802,27 +1821,6 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-        .key = "VolFogISFAST",
-        .binding = &shader_injection.volfog_is_fast_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
-        .label = "IS-FAST jitter",
-        .section = "Volumetric Fog",
-        .tooltip = "Enables IS-FAST temporal jitter for volumetric fog sampling. Vanilla keeps the original sample coordinates.",
-        .labels = {"Vanilla", "Enabled"},
-    },
-    new renodx::utils::settings::Setting{
-        .key = "VolFogISFASTTexture",
-        .binding = &isfast_texture_source_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
-        .label = "IS-FAST Texture",
-        .section = "Volumetric Fog",
-        .tooltip = "Off forces the 1x1 debug texture. On uses fast_noise_ea.dds if it validates.",
-        .labels = {"Off", "On"},
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
         .key = "VolFogColorCorrectionStrength",
         .binding = &shader_injection.volfog_color_correction_strength,
         .default_value = 0.5f,
@@ -1973,7 +1971,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Disable IS-FAST jitter options if you are not using TAA or upscalers!",
+        .label = "IS-FAST Jitter: Dont enable if you are not using Temporal Solution.",
         .section = "Info",
     },
     new renodx::utils::settings::Setting{
