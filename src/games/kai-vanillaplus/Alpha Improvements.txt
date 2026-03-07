@@ -1,0 +1,434 @@
+// ============================================================================
+// 1.17  Stochastic Transparency & Alpha Improvements
+// ----------------------------------------------------------------------------
+// Inspired by AC Shadows (SIGGRAPH 2025) stochastic alpha testing and
+// multi-layer transparency, adapted to techniques feasible via RenoDX
+// shader replacement.
+//
+// BACKGROUND:
+//   Most games use hard alpha testing:  clip(alpha - 0.5);
+//   This produces jaggy, binary edges on foliage, hair, fences, and any
+//   alpha-tested geometry.  Shadows from alpha-tested geometry also have
+//   hard, unnatural silhouettes.
+//
+//   AC Shadows replaced deterministic alpha testing with STOCHASTIC alpha
+//   testing — each fragment is accepted or rejected probabilistically
+//   based on its alpha value.  Over multiple frames, temporal accumulation
+//   (TAA / DLSS / FSR / XeSS) converges the noisy result to correct
+//   smooth transparency.  This produces:
+//     • Soft, anti-aliased foliage and hair edges
+//     • Natural, dappled shadow maps from foliage canopies
+//     • Smooth LOD cross-fade transitions
+//     • Correct multi-layer transparency without sorting
+//
+//   For RT any-hit shaders, stochastic alpha is also a major performance
+//   win — each intersection becomes a binary accept/reject decision,
+//   avoiding expensive transparency accumulation along rays.
+//
+// NOISE SOURCE — IS-FAST (§1.12):
+//   The quality of stochastic alpha testing depends critically on the
+//   noise source.  White noise produces slow convergence and visible
+//   grain.  The IS-FAST (Importance-Sampled Fast Approximation of
+//   Spatio-Temporal) blue noise system in §1.12 is ideal because:
+//
+//     • Spatially blue — neighboring pixels get well-separated threshold
+//       values, preventing clumpy accept/reject patterns.  This means
+//       edges appear smooth even before temporal accumulation.
+//
+//     • Temporally stratified — successive frames sample different parts
+//       of the threshold space, ensuring fast convergence.  TAA/DLSS
+//       typically converges the result in 4–8 frames.
+//
+//     • Importance-sampled — the sampling distribution can be shaped to
+//       concentrate samples where they matter most (near the alpha
+//       threshold boundary), accelerating convergence further.
+//
+//   To bind IS-FAST noise for use in an existing game shader:
+//     1. Generate or pre-compute a blue noise texture (64×64 or 128×128,
+//        R8_UNORM, tiled).  The texture can be the same one used for
+//        SSAO, shadow dithering, or other stochastic effects.
+//     2. Inject it as an SRV via RenoDX push_descriptors into the
+//        foliage/hair pixel shader's descriptor table.
+//     3. Sample it using the IS-FAST functions from §1.12, passing
+//        SV_Position.xy as the pixel coordinate and the frame counter
+//        from the shader_injection CB as the temporal index.
+//
+//   If an IS-FAST blue noise texture is not available, the algebraic
+//   hash fallback (StochasticAlphaHash) is provided — it generates
+//   acceptable spatio-temporal noise from screen position + frame index
+//   alone, requiring no additional texture bindings.
+//
+// Three techniques are provided:
+//
+//   a) Stochastic alpha test       — replaces clip(alpha - threshold)
+//   b) Stochastic shadow alpha     — variant tuned for shadow map passes
+//   c) Improved alpha-to-coverage  — blue-noise-driven SV_Coverage mask
+//
+// PREREQUISITES:
+//   • The game must have temporal accumulation active (TAA, DLSS, FSR,
+//     or XeSS) for the stochastic result to converge.  Without temporal
+//     filtering, the output is just noisy.  Nearly all modern titles
+//     ship with at least one of these.
+//   • A frame counter must be available.  In RenoDX mods, this is
+//     typically injected via the shader_injection constant buffer.
+//   • For best quality: an IS-FAST blue noise texture (§1.12) bound
+//     as an SRV.  For acceptable quality: use the hash fallback.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// 1.17a  Stochastic Alpha Test
+// ---------------------------------------------------------------------------
+// Replaces a game's deterministic alpha test with a probabilistic one.
+//
+// Traditional:  clip(alpha - 0.5);        // hard binary edge
+// Stochastic:   clip(alpha - noise);      // soft probabilistic edge
+//
+// Over N frames of temporal accumulation, a texel with alpha = 0.7 will
+// pass the test ~70% of the time, converging to correct transparency.
+//
+// Two variants:
+//   (i)  Texture-based — uses an IS-FAST blue noise SRV (best quality)
+//   (ii) Hash-based    — algebraic hash, no extra textures needed
+//
+// Parameters:
+//   alpha          – the fragment's alpha value [0,1] from the albedo texture
+//   screenPos      – SV_Position.xy (pixel coordinates, not UV)
+//   frameIndex     – frame counter for temporal jitter (from shader_injection
+//                    CB or any per-frame counter).  Can be uint or float.
+//   sharpen        – edge sharpening factor (default 1.0).
+//                    Values > 1 tighten the stochastic band around the
+//                    alpha threshold, producing sharper edges with slower
+//                    convergence.  Values < 1 widen it for softer edges
+//                    with faster convergence.
+//                    Recommended: 0.8–1.5 depending on TAA quality.
+//
+// Usage:
+//   // In the foliage / hair pixel shader, replace:
+//   //   clip(alpha - 0.5);
+//   // With:
+//   renodx::rendering::StochasticAlphaTest(alpha, input.position.xy, frameIndex);
+// ---------------------------------------------------------------------------
+
+// -- 1.17a-i.  Stochastic Alpha Test — IS-FAST Blue Noise (best quality) ------
+//
+// Uses an IS-FAST blue noise texture (§1.12) for the threshold.  This
+// produces the smoothest edges and fastest temporal convergence because
+// the blue noise ensures neighboring pixels receive well-separated
+// thresholds (no clumping) and successive frames are temporally stratified.
+//
+// The blue noise texture should be:
+//   • R8_UNORM or R16_FLOAT, 64×64 or larger, tiling
+//   • Injected as SRV via push_descriptors
+//   • The same texture can be shared with SSAO, shadow dithering, etc.
+//
+// Parameters:
+//   alpha         – fragment alpha [0,1]
+//   blueNoiseTex  – the IS-FAST blue noise texture (Texture2D<float>)
+//   noiseSampler  – point-wrap sampler (wrap mode is essential for tiling)
+//   screenPos     – SV_Position.xy
+//   noiseSize     – blue noise texture dimensions, e.g. float2(64.0, 64.0)
+//   frameIndex    – frame counter for temporal jitter
+//   sharpen       – edge sharpening (default 1.0)
+void StochasticAlphaTestBlueNoise(
+    float              alpha,
+    Texture2D<float>   blueNoiseTex,
+    SamplerState       noiseSampler,
+    float2             screenPos,
+    float2             noiseSize,
+    uint               frameIndex,
+    float              sharpen = 1.0)
+{
+  // Sample blue noise, tiled across screen
+  float2 noiseUV = screenPos / noiseSize;
+  float  noise   = blueNoiseTex.SampleLevel(noiseSampler, noiseUV, 0);
+
+  // Temporal jitter: offset the noise by golden ratio per frame.
+  // This is the standard temporal blue noise animation technique —
+  // adding an irrational offset each frame produces a low-discrepancy
+  // sequence in [0,1] that is temporally stratified.
+  // See §1.12 IS-FAST for the theoretical basis.
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;  // (√5 - 1) / 2
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  // Sharpen: remap noise to concentrate around 0.5
+  // At sharpen = 1.0 this is identity.  Higher values steepen the
+  // transition band, making the stochastic edge thinner.
+  if (sharpen != 1.0)
+  {
+    noise = saturate((noise - 0.5) * sharpen + 0.5);
+  }
+
+  clip(alpha - noise);
+}
+
+// -- 1.17a-ii.  Stochastic Alpha Test — Hash Fallback (no extra textures) -----
+//
+// When no blue noise texture is available, this variant uses an algebraic
+// hash for the stochastic threshold.  The hash combines screen position
+// and frame index to produce spatially and temporally varying noise.
+//
+// Quality is lower than IS-FAST blue noise (the spatial spectrum is not
+// strictly blue, so some clumping may be visible), but it's sufficient
+// for most use cases and requires ZERO additional texture bindings —
+// making it the easiest to integrate into any shader.
+//
+// Parameters:
+//   alpha      – fragment alpha [0,1]
+//   screenPos  – SV_Position.xy
+//   frameIndex – frame counter
+//   sharpen    – edge sharpening (default 1.0)
+void StochasticAlphaTestHash(
+    float  alpha,
+    float2 screenPos,
+    uint   frameIndex,
+    float  sharpen = 1.0)
+{
+  // Spatial hash: interleaved gradient noise (Jimenez 2014)
+  // Produces reasonably well-distributed values across screen pixels
+  float noise = frac(52.9829189 * frac(
+      dot(screenPos, float2(0.06711056, 0.00583715))));
+
+  // Temporal jitter via golden ratio offset
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  // Sharpen
+  if (sharpen != 1.0)
+  {
+    noise = saturate((noise - 0.5) * sharpen + 0.5);
+  }
+
+  clip(alpha - noise);
+}
+
+// ---------------------------------------------------------------------------
+// 1.17b  Stochastic Shadow Alpha
+// ---------------------------------------------------------------------------
+// Variant of the stochastic alpha test specifically for shadow map passes.
+//
+// Shadow maps that use hard alpha testing produce sharp, unnatural shadow
+// silhouettes from foliage, fences, and hair.  Replacing the alpha test
+// with a stochastic version produces soft, dappled shadows that look
+// dramatically more natural — tree canopy shadows get realistic light
+// filtering, fence shadows get soft penumbra-like edges.
+//
+// This works particularly well because shadow maps are typically sampled
+// with PCF (Percentage Closer Filtering) or VSM, which inherently average
+// multiple texels.  The stochastic variation across shadow map texels acts
+// as a built-in soft shadow filter — each texel independently decides
+// whether it's in shadow based on alpha, and the PCF kernel averages
+// these binary decisions into a smooth result.
+//
+// KEY DIFFERENCE from 1.17a:
+//   The noise should use WORLD-SPACE or OBJECT-SPACE hashing rather than
+//   screen-space, so shadow texels remain stable as the light source moves.
+//   Screen-space noise would cause the shadow map to shimmer as the light
+//   pans.  World-space noise is view-independent and stable.
+//
+// Two variants:
+//   (i)  World-space hash — stable across light movement (recommended)
+//   (ii) Shadow-UV hash   — uses shadow map UVs (simpler, slightly less stable)
+//
+// Parameters:
+//   alpha      – fragment alpha [0,1] from the albedo texture
+//   worldPos   – world-space position of the fragment being shadow-tested
+//   frameIndex – frame counter for temporal jitter
+//   softness   – controls shadow edge softness (default 1.0)
+//                Higher = softer edges (wider stochastic band)
+//                Lower  = harder edges (narrower band)
+//                0.5–1.5 is a good range.
+//
+// Usage:
+//   // In the shadow pass pixel shader, replace:
+//   //   clip(alpha - 0.5);
+//   // With:
+//   renodx::rendering::StochasticShadowAlpha(alpha, worldPos, frameIndex);
+// ---------------------------------------------------------------------------
+
+// -- 1.17b-i.  Stochastic Shadow Alpha — World-Space Hash ---------------------
+void StochasticShadowAlphaWorld(
+    float  alpha,
+    float3 worldPos,
+    uint   frameIndex,
+    float  softness = 1.0)
+{
+  // World-space hash: stable regardless of camera/light movement.
+  // Uses a 3D variant of interleaved gradient noise.
+  float3 quantized = floor(worldPos * 50.0);  // quantize to ~2cm grid
+  float noise = frac(52.9829189 * frac(
+      quantized.x * 0.06711056 +
+      quantized.y * 0.00583715 +
+      quantized.z * 0.05413927));
+
+  // Temporal jitter
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  // Softness: inverse of sharpen — wider band = softer shadow edges
+  float sharpen = 1.0 / max(softness, 0.01);
+  noise = saturate((noise - 0.5) * sharpen + 0.5);
+
+  clip(alpha - noise);
+}
+
+// -- 1.17b-ii.  Stochastic Shadow Alpha — Shadow UV Hash ----------------------
+// Simpler variant that uses the shadow map UV as the hash seed.
+// Slightly less stable than world-space when shadow cascades shift,
+// but requires no world position — only the interpolated UV.
+//
+// Parameters:
+//   alpha      – fragment alpha [0,1]
+//   shadowUV   – shadow map UV (from the light-space projection)
+//   frameIndex – frame counter
+//   softness   – shadow softness (default 1.0)
+void StochasticShadowAlphaUV(
+    float  alpha,
+    float2 shadowUV,
+    uint   frameIndex,
+    float  softness = 1.0)
+{
+  // Hash from shadow map UV coordinates
+  float noise = frac(52.9829189 * frac(
+      dot(shadowUV * 1000.0, float2(0.06711056, 0.00583715))));
+
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  float sharpen = 1.0 / max(softness, 0.01);
+  noise = saturate((noise - 0.5) * sharpen + 0.5);
+
+  clip(alpha - noise);
+}
+
+// ---------------------------------------------------------------------------
+// 1.17c  Improved Alpha-to-Coverage
+// ---------------------------------------------------------------------------
+// Replaces hardware alpha-to-coverage with a blue-noise-driven coverage
+// mask written via SV_Coverage.
+//
+// Hardware A2C uses an implementation-defined ordered dither pattern that
+// produces visible banding — especially at low MSAA sample counts (2× or
+// 4×).  By generating the coverage mask from IS-FAST blue noise (§1.12)
+// with temporal jitter, we get:
+//
+//   • Per-pixel variation instead of repeating dither patterns
+//   • Temporal stratification for fast TAA/DLSS convergence
+//   • Smoother apparent edges, especially on foliage and hair
+//
+// REQUIREMENTS:
+//   • MSAA must be enabled (this technique outputs SV_Coverage bits)
+//   • The game's foliage/hair shader must be using A2C or alpha test
+//   • A blue noise texture (IS-FAST §1.12) for best quality, OR use
+//     the hash fallback variant
+//
+// HOW TO USE:
+//   In your replacement pixel shader, instead of relying on hardware A2C
+//   or the game's alpha test, call this function and output the returned
+//   coverage mask via the SV_Coverage semantic:
+//
+//     struct PSOutput {
+//       float4 color    : SV_Target0;
+//       uint   coverage : SV_Coverage;   // <-- add this
+//     };
+//
+//     PSOutput main(...) {
+//       PSOutput o;
+//       o.color = ...;
+//       o.coverage = renodx::rendering::AlphaToCoverageBlueNoise(
+//           alpha, blueNoiseTex, sampler, screenPos, noiseSize,
+//           frameIndex, sampleCount);
+//       return o;
+//     }
+//
+// Parameters:
+//   alpha        – fragment alpha [0,1]
+//   noise        – blue noise value [0,1] (from IS-FAST §1.12 or hash).
+//                  Should already include temporal jitter.
+//   sampleCount  – MSAA sample count (2, 4, or 8)
+//
+// Returns:  uint coverage mask with bits set per MSAA sample.
+// ---------------------------------------------------------------------------
+uint AlphaToCoverageBlueNoise(
+    float alpha,
+    float noise,
+    uint  sampleCount)
+{
+  uint coverage = 0;
+
+  // Dither the alpha threshold per sample using the noise value.
+  // Each sample gets a slightly offset threshold derived from the single
+  // noise value, producing a coverage ramp across samples.
+  for (uint s = 0; s < sampleCount; s++)
+  {
+    // Per-sample threshold: evenly spaced across [0,1], offset by noise
+    float sampleThreshold = frac(noise + (float)s / (float)sampleCount);
+
+    if (alpha > sampleThreshold)
+      coverage |= (1u << s);
+  }
+
+  return coverage;
+}
+
+// ---------------------------------------------------------------------------
+// 1.17c′  Alpha-to-Coverage — Convenience wrapper with IS-FAST texture
+// ---------------------------------------------------------------------------
+// Combines blue noise sampling, temporal jitter, and coverage mask
+// generation in a single call.
+//
+// Parameters:
+//   alpha         – fragment alpha [0,1]
+//   blueNoiseTex  – IS-FAST blue noise texture (Texture2D<float>)
+//   noiseSampler  – point-wrap sampler
+//   screenPos     – SV_Position.xy
+//   noiseSize     – blue noise texture dimensions
+//   frameIndex    – frame counter
+//   sampleCount   – MSAA sample count (2, 4, or 8)
+//
+// Returns:  uint coverage mask for SV_Coverage output.
+uint AlphaToCoverageISFAST(
+    float              alpha,
+    Texture2D<float>   blueNoiseTex,
+    SamplerState       noiseSampler,
+    float2             screenPos,
+    float2             noiseSize,
+    uint               frameIndex,
+    uint               sampleCount)
+{
+  // Sample and animate blue noise (same pattern as §1.17a-i)
+  float2 noiseUV = screenPos / noiseSize;
+  float  noise   = blueNoiseTex.SampleLevel(noiseSampler, noiseUV, 0);
+
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  return AlphaToCoverageBlueNoise(alpha, noise, sampleCount);
+}
+
+// ---------------------------------------------------------------------------
+// 1.17c″  Alpha-to-Coverage — Hash Fallback (no texture)
+// ---------------------------------------------------------------------------
+// Same as above but uses the algebraic hash instead of a blue noise
+// texture.  Lower quality but zero additional resource bindings.
+//
+// Parameters:
+//   alpha       – fragment alpha [0,1]
+//   screenPos   – SV_Position.xy
+//   frameIndex  – frame counter
+//   sampleCount – MSAA sample count (2, 4, or 8)
+//
+// Returns:  uint coverage mask for SV_Coverage output.
+uint AlphaToCoverageHash(
+    float  alpha,
+    float2 screenPos,
+    uint   frameIndex,
+    uint   sampleCount)
+{
+  float noise = frac(52.9829189 * frac(
+      dot(screenPos, float2(0.06711056, 0.00583715))));
+
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  return AlphaToCoverageBlueNoise(alpha, noise, sampleCount);
+}

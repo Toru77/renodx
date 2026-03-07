@@ -66,6 +66,27 @@ struct SssInjectData {
   float isfast_noise_bound;
   float volfog_color_correction_strength;
 
+  // Wire alpha improvements (wirefence_0x26F1598B)
+  float wire_alpha_mode;              // 0=Vanilla, 1=Stochastic Hash, 2=Stochastic IS-FAST
+  float wire_alpha_sharpen;           // stochastic threshold shaping
+  float wire_alpha_threshold_offset;  // additive offset to game alpha threshold
+  float wire_alpha_temporal_amount;   // 0=static, 1=fully temporal
+  float wire_alpha_temporal_speed;    // frame progression speed for temporal noise
+
+  // Face shadow jitter improvements (face_0x0C968FD4)
+  float face_jitter_mode;             // 0=Off, 1=Hash, 2=IS-FAST
+  float face_jitter_amount;           // shadow-kernel jitter radius scale
+  float face_jitter_speed;            // temporal progression speed
+  float face_jitter_temporal_amount;  // 0=static, 1=fully temporal
+
+  // Jar transparency jitter improvements (jar_0x4CB77B59)
+  float jar_jitter_mode;             // 0=Off, 1=Hash, 2=IS-FAST
+  float jar_jitter_amount;           // blend strength from vanilla to stochastic alpha
+  float jar_jitter_speed;            // temporal progression speed
+  float jar_jitter_temporal_amount;  // 0=static, 1=fully temporal
+  float jar_alpha_threshold_offset;  // additive alpha threshold bias for stochastic compare
+  float jar_alpha_sharpen;           // stochastic noise shaping
+
   // Depth of Field improvements (DOF_0xAB6DBF4D / DOF_0x2734F870)
   float dof_mode;                  // 0=Vanilla, 1=Improved (Method 3 / gather)
   float dof_strength;              // final blend strength
