@@ -267,6 +267,11 @@ void LogIsFast(reshade::log::level level, const std::string& message) {
   reshade::log::message(level, tagged.c_str());
 }
 
+bool IsIsFastSupportedDevice(reshade::api::device* device) {
+  if (device == nullptr) return false;
+  return device->get_api() == reshade::api::device_api::d3d11;
+}
+
 std::filesystem::path GetModuleDirectory() {
   if (g_hmodule == nullptr) return std::filesystem::current_path();
 
@@ -494,10 +499,12 @@ bool CreateIsFastTexture(
 
 void OnInitDevice(reshade::api::device* device) {
   if (device == nullptr) return;
+  if (!IsIsFastSupportedDevice(device)) return;
   ReloadIsFastResources(device, "init_device");
 }
 
 void OnDestroyDevice(reshade::api::device* device) {
+  if (!IsIsFastSupportedDevice(device)) return;
   LogIsFast(reshade::log::level::debug, "OnDestroyDevice begin.");
   DestroyIsFastResources(device);
   LogIsFast(reshade::log::level::debug, "OnDestroyDevice complete. isfast_noise_bound=0.");
@@ -505,6 +512,7 @@ void OnDestroyDevice(reshade::api::device* device) {
 
 void ReloadIsFastResources(reshade::api::device* device, const char* reason) {
   if (device == nullptr) return;
+  if (!IsIsFastSupportedDevice(device)) return;
 
   const bool use_fast_texture = isfast_texture_source_enabled >= 0.5f;
   g_isfast_mode_use_fast_texture = use_fast_texture;
@@ -858,13 +866,20 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
 bool BindISFastNoiseTexturePixel(reshade::api::command_list* cmd_list, uint32_t texture_binding) {
   if (cmd_list == nullptr) return true;
+  if (!IsIsFastSupportedDevice(cmd_list->get_device())) {
+    shader_injection.isfast_noise_bound = 0.f;
+    return true;
+  }
   if (g_isfast_reshade_srv.handle == 0u) {
+    shader_injection.isfast_noise_bound = 0.f;
     if (!g_isfast_bind_failed_logged) {
       LogIsFast(reshade::log::level::warning, "BindISFASTNoisePixel match=NO (SRV unavailable).");
       g_isfast_bind_failed_logged = true;
     }
     return true;
   }
+
+  shader_injection.isfast_noise_bound = 1.f;
 
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
@@ -884,7 +899,12 @@ bool BindISFastNoiseTexturePixel(reshade::api::command_list* cmd_list, uint32_t 
 
 bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return true;
+  if (!IsIsFastSupportedDevice(cmd_list->get_device())) {
+    shader_injection.isfast_noise_bound = 0.f;
+    return true;
+  }
   if (g_isfast_reshade_sampler.handle == 0u) {
+    shader_injection.isfast_noise_bound = 0.f;
     if (!g_isfast_bind_failed_logged) {
       LogIsFast(reshade::log::level::warning, "BindISFASTNoisePixel match=NO (sampler unavailable).");
       g_isfast_bind_failed_logged = true;
@@ -932,12 +952,23 @@ bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
 }
 
 bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
+  // Volumetric fog has no dedicated toggle: mirror master state at draw time.
+  shader_injection.volfog_is_fast_enabled = isfast_jitter_master >= 0.5f ? 1.f : 0.f;
   return BindISFastNoisePixel(cmd_list);
 }
 
 bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return true;
   if (shader_injection.wire_alpha_mode < 1.5f) return true;
-  if (shader_injection.isfast_noise_bound < 0.5f) return true;
+  if (!IsIsFastSupportedDevice(cmd_list->get_device())) {
+    shader_injection.isfast_noise_bound = 0.f;
+    return true;
+  }
+  if (g_isfast_reshade_srv.handle == 0u) {
+    shader_injection.isfast_noise_bound = 0.f;
+    return true;
+  }
+  shader_injection.isfast_noise_bound = 1.f;
   return BindISFastNoiseTexturePixel(cmd_list, kWireIsFastTextureBinding);
 }
 
@@ -948,7 +979,7 @@ void OnPresentAdvanceFrame(
     const reshade::api::rect* dest_rect,
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects) {
-  if (queue != nullptr) {
+  if (queue != nullptr && IsIsFastSupportedDevice(queue->get_device())) {
     const bool desired_fast_texture = isfast_texture_source_enabled >= 0.5f;
     if (desired_fast_texture != g_isfast_mode_use_fast_texture) {
       ReloadIsFastResources(queue->get_device(), "settings_change");
@@ -1018,13 +1049,12 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ISFastJitterMaster",
         .binding = &isfast_jitter_master,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
         .label = "Master",
         .section = "IS-FAST Jitter (Dont enable if you are not using Temporal Solution.)",
-        .tooltip = "0 disables all IS-FAST jitter features. 1 enables them.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.0f",
+        .tooltip = "Off disables all IS-FAST jitter features. On enables them.",
+        .labels = {"Off", "On"},
         .is_global = true,
     },
     new renodx::utils::settings::Setting{

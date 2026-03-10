@@ -112,10 +112,13 @@ void main(
 
   // ---- Optional IS-FAST temporal jitter (bound texture or fallback) ----
   float3 uvw = float3(v1.xy, volZ);
+  // volfog_is_fast_enabled is driven by the single master IS-FAST setting.
   if (sss_injection_data.volfog_is_fast_enabled > 0.5) {
     float2 pixelCoord = floor(v0.xy);
-    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
-    float jitterZ = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
+    // Use shared IS-FAST temporal speed to avoid weak progression at high FPS.
+    float jitterSpeed = max(sss_injection_data.shadow_isfast_jitter_speed, 1.0);
+    uint frameIndex = (uint)max(sceneTime_g * jitterSpeed, 0.0);
+    float2 jitter2 = renodx::rendering::InterleavedGradientNoiseTemporal2D(pixelCoord, frameIndex);
     if (sss_injection_data.isfast_noise_bound > 0.5) {
       uint noiseW, noiseH, noiseD;
       isfast_noise.GetDimensions(noiseW, noiseH, noiseD);
@@ -127,14 +130,18 @@ void main(
             frameIndex,
             (float)noiseW,
             (float)noiseD);
-        jitterZ = xi.x;
+        jitter2 = xi;
       }
     }
 
     float3 texelSize = 1.0 / max(volSize, float3(1.0, 1.0, 1.0));
+    float2 halfTexelXY = 0.5 * texelSize.xy;
     float halfSlice = 0.5 * texelSize.z;
+    float jitterZ = frac(jitter2.x + jitter2.y * 0.5);
+    float jitterStrength = 1.5;
 
-    uvw.z = clamp(uvw.z + (jitterZ - 0.5) * texelSize.z, halfSlice, 1.0 - halfSlice);
+    uvw.xy = clamp(uvw.xy + (jitter2 - 0.5) * texelSize.xy * jitterStrength, halfTexelXY, 1.0 - halfTexelXY);
+    uvw.z = clamp(uvw.z + (jitterZ - 0.5) * texelSize.z * jitterStrength, halfSlice, 1.0 - halfSlice);
   }
 
   // ---- Sample volume: tricubic B-spline or vanilla trilinear ----
