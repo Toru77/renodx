@@ -2012,6 +2012,11 @@ renodx::utils::settings::Settings settings = {
         .label = "Enable Soft/PCSS Shadows and Ultra SSR.",
         .section = "Info",
     },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Enable High or Ultra Local Shadowing.",
+        .section = "Info",
+    },
 };
 
 }  // namespace
