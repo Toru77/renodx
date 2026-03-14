@@ -136,6 +136,29 @@ struct SssInjectData {
   float char_gi_normal_reject;
   float char_gi_ao_influence;
   float char_gi_reject_strength;
+
+  // Dedicated SSS binding state for lighting fallback control.
+  float sss_dedicated_bound;  // 0=no dedicated t15 SSS bound this draw, 1=valid
+  // Dedicated XeGTAO binding state for lighting AO override control.
+  float xegtao_dedicated_bound;  // 0=no dedicated t22 XeGTAO bound this draw, 1=valid
+  // XeGTAO debug visualization mode for lighting shaders.
+  float xegtao_debug_mode;  // 0=off, >0=debug view
+  // XeGTAO MRT normal mode: 0=off(depth fallback), 1=view-transformed.
+  float xegtao_normal_input_mode;
+  // XeGTAO MRT normal source status this frame: 0=fallback depth normal path, 1=MRT normal path.
+  float xegtao_mrt_normal_valid;
+  // XeGTAO bent normals application in lighting: 0=off, 1=environment-only.
+  float xegtao_bent_normals;
+  // XeGTAO bent diffuse directional shading strength.
+  float xegtao_bent_diffuse_strength;
+  // XeGTAO bent diffuse cone softness (cosine-space transition width).
+  float xegtao_bent_diffuse_softness;
+  // XeGTAO bent specular-proxy attenuation strength.
+  float xegtao_bent_specular_strength;
+  // XeGTAO bent specular-proxy roughness control.
+  float xegtao_bent_specular_proxy_roughness;
+  // Maximum extra darkening from bent-normal modulation.
+  float xegtao_bent_max_darkening;
 };
 
 #ifndef __cplusplus
