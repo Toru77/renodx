@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <span>
 #include <string>
@@ -31,6 +32,7 @@
 #include "../../utils/resource.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
+#include "../../utils/state.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./kai-vanillaplus.h"
 
@@ -39,20 +41,44 @@ namespace {
 constexpr uint32_t kLightingShader = 0x430ED091u;
 constexpr uint32_t kLightingSoftShader = 0xF6C55E5Fu;
 constexpr uint32_t kCharacterShader = 0x445A1838u;
+constexpr uint32_t kAoPass0Shader = 0x0E83E74Eu;
+constexpr uint32_t kAoPass1Shader = 0x3CA978C6u;
+constexpr uint32_t kAoPass2Shader = 0x928A59DAu;
+constexpr uint32_t kAoPass3Shader = 0xA385AB53u;
+constexpr uint32_t kAoPass4Shader = 0xBEA381A1u;
+constexpr uint32_t kAoFinalShader = 0x036B0D74u;
 constexpr uint32_t kVolFogShader = 0xBD7DFE49u;
 constexpr uint32_t kWireFenceShader = 0x26F1598Bu;
 constexpr uint32_t kIsFastTextureBinding = 15u;
 constexpr uint32_t kIsFastSamplerBinding = 15u;
 constexpr uint32_t kWireIsFastTextureBinding = 14u;
+constexpr uint32_t kLightingMrtNormalRegister = 1u;
+constexpr uint32_t kLightingDepthRegister = 3u;
+constexpr uint32_t kLightingSsaoRegister = 4u;
+constexpr uint32_t kLightingSceneCbRegister = 0u;
+constexpr uint32_t kLightingXeGtaoRegister = 22u;
+constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;
+constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
+
+struct DeviceData;
 
 bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
+bool OnBeforeVanillaAoDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list);
+void OnCharacterShaderDrawn(reshade::api::command_list* cmd_list);
+void OnAoFinalPassDrawn(reshade::api::command_list* cmd_list);
 bool BindISFastNoisePixel(reshade::api::command_list* cmd_list);
 bool BindISFastNoiseTexturePixel(reshade::api::command_list* cmd_list, uint32_t texture_binding);
 void OnInitDevice(reshade::api::device* device);
 void OnDestroyDevice(reshade::api::device* device);
+void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize);
+void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize);
 void ReloadIsFastResources(reshade::api::device* device, const char* reason);
+void DestroyXeGTAOResources(reshade::api::device* device, DeviceData* data);
+void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data);
+void DestroyDedicatedSssViews(reshade::api::device* device, DeviceData* data);
+void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list, DeviceData* data);
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     {
@@ -71,7 +97,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = &OnBeforeLightingShaderDraw,
         },
     },                                             // lighting soft shadows
-    CustomShaderEntry(0x445A1838),                 // character lighting
+    {
+        kCharacterShader,
+        {
+            .crc32 = kCharacterShader,
+            .code = __0x445A1838,
+            .on_drawn = &OnCharacterShaderDrawn,
+        },
+    },                                             // character lighting
     CustomShaderEntry(0x209125C1),                 // SSR
     CustomShaderEntry(0xB1CCBCAE),                 // glass
     CustomShaderEntry(0x1A17A133),                 // glass
@@ -82,9 +115,59 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xFDC5CDBF),                 // glass
     CustomShaderEntry(0x8337B262),                 // floor
     CustomShaderEntry(0xD97BD91B),                 // glass
+    CustomShaderEntry(0xEFB6AC0F),                 // glass
     CustomShaderEntry(0x534E54EA),                 // sss source pass
     CustomShaderEntry(0xAB6DBF4D),                 // dof coc
     CustomShaderEntry(0x2734F870),                 // dof blur composite
+    {
+        kAoPass0Shader,
+        {
+            .crc32 = kAoPass0Shader,
+            .code = __0x0E83E74E,
+            .on_draw = &OnBeforeVanillaAoDraw,
+        },
+    },                                             // vanilla ao pass 0
+    {
+        kAoPass1Shader,
+        {
+            .crc32 = kAoPass1Shader,
+            .code = __0x3CA978C6,
+            .on_draw = &OnBeforeVanillaAoDraw,
+        },
+    },                                             // vanilla ao pass 1
+    {
+        kAoPass2Shader,
+        {
+            .crc32 = kAoPass2Shader,
+            .code = __0x928A59DA,
+            .on_draw = &OnBeforeVanillaAoDraw,
+        },
+    },                                             // vanilla ao pass 2
+    {
+        kAoPass3Shader,
+        {
+            .crc32 = kAoPass3Shader,
+            .code = __0xA385AB53,
+            .on_draw = &OnBeforeVanillaAoDraw,
+        },
+    },                                             // vanilla ao pass 3
+    {
+        kAoPass4Shader,
+        {
+            .crc32 = kAoPass4Shader,
+            .code = __0xBEA381A1,
+            .on_draw = &OnBeforeVanillaAoDraw,
+        },
+    },                                             // vanilla ao pass 4
+    {
+        kAoFinalShader,
+        {
+            .crc32 = kAoFinalShader,
+            .code = __0x036B0D74,
+            .on_draw = &OnBeforeVanillaAoDraw,
+            .on_drawn = &OnAoFinalPassDrawn,
+        },
+    },                                             // vanilla ao final pass hook
     {
         kWireFenceShader,
         {
@@ -174,7 +257,7 @@ SssInjectData shader_injection = {
     .foliage_sss_height_max = 1.f,
     .foliage_sss_height_fade = 0.1f,
     .foliage_sss_vertical_reject = 0.3f,
-    .foliage_sss_max_darkening = 0.50f,
+    .foliage_sss_max_darkening = 0.40f,
     .foliage_sss_bright_reject_threshold = 0.19f,
     .foliage_sss_bright_reject_fade = 0.5f,
     .char_gi_enabled = 1.f,
@@ -195,11 +278,51 @@ SssInjectData shader_injection = {
     .char_gi_normal_reject = 0.15f,
     .char_gi_ao_influence = 0.66f,
     .char_gi_reject_strength = 8.0f,
+    .sss_dedicated_bound = 0.f,
+    .xegtao_dedicated_bound = 0.f,
+    .xegtao_debug_mode = 0.f,
+    .xegtao_normal_input_mode = 1.f,
+    .xegtao_mrt_normal_valid = 0.f,
+    .xegtao_bent_normals = 0.f,
+    .xegtao_bent_diffuse_strength = 0.35f,
+    .xegtao_bent_diffuse_softness = 0.15f,
+    .xegtao_bent_specular_strength = 0.25f,
+    .xegtao_bent_specular_proxy_roughness = 0.40f,
+    .xegtao_bent_max_darkening = 0.35f,
 };
 
 float settings_mode = 0.f;
 float isfast_jitter_master = 1.f;
 float char_ssgi_composite_method = 1.f;  // 0=Off, 1=On
+float xegtao_mode = 1.f;                  // 0=Off, 1=On
+float xegtao_quality = 0.f;               // 0=High, 1=Very High, 2=Ultra
+float xegtao_precision = 1.f;             // 0=R16 depth mips, 1=R32 depth mips
+float xegtao_normal_input_mode = 1.f;     // 0=Off(depth fallback), 1=View-Transformed
+float xegtao_normal_influence = 0.05f;
+float xegtao_normal_depth_blend = 0.45f;
+float xegtao_normal_sharpness = 1.f;
+float xegtao_normal_edge_rejection = 1.f;
+float xegtao_normal_z_preservation = 1.f;
+float xegtao_normal_detail_response = 4.f;
+float xegtao_normal_max_darkening = 0.6f;
+float xegtao_normal_darkening_mode = 0.f;  // 0=Fast, 1=Exact
+float xegtao_bent_normals = 0.f;           // 0=Off, 1=Environment-only
+float xegtao_bent_diffuse_strength = 0.35f;
+float xegtao_bent_diffuse_softness = 0.15f;
+float xegtao_bent_specular_strength = 0.25f;
+float xegtao_bent_specular_proxy_roughness = 0.40f;
+float xegtao_bent_max_darkening = 0.35f;
+float xegtao_skip_vanilla_ao = 1.f;       // 0=Off, 1=On
+float xegtao_denoise_pass_count = 1.f;    // 0..3
+float xegtao_radius = 0.5f;
+float xegtao_falloff_range = 0.615f;
+float xegtao_radius_multiplier = 1.5f;
+float xegtao_final_value_power = 2.2f;
+float xegtao_sample_distribution_power = 1.5f;
+float xegtao_thin_occluder_compensation = 0.50f;
+float xegtao_depth_mip_sampling_offset = 3.3f;
+float xegtao_denoise_blur_beta = 8.f;
+float xegtao_debug_mode = 0.f;
 
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
 std::atomic_uint64_t g_character_mrt0_view{0u};
@@ -213,6 +336,88 @@ bool g_isfast_bind_failed_logged = false;
 bool g_isfast_compute_bind_logged = false;
 bool g_isfast_mode_use_fast_texture = true;
 float isfast_texture_source_enabled = 1.f;  // 0=Off(debug), 1=On(real DDS)
+thread_local bool g_skip_descriptor_capture = false;
+
+constexpr uint64_t kInvalidFrameIndex = std::numeric_limits<uint64_t>::max();
+constexpr uint32_t kXeGtaoDepthMipLevels = 5u;
+
+enum class XeGTAOMode : uint32_t {
+  kOff = 0u,
+  kLightingOverride = 1u,
+};
+
+enum class XeGTAOPrecision : uint32_t {
+  kHalf = 0u,
+  kFull = 1u,
+};
+
+struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
+  reshade::api::resource_view captured_mrt_normal_srv = {};
+  reshade::api::resource_view captured_depth_srv = {};
+  reshade::api::resource_view captured_ssao_srv = {};
+  reshade::api::buffer_range captured_scene_cbv = {};
+  bool captured_scene_cbv_valid = false;
+  uint64_t captured_scene_cbv_frame = kInvalidFrameIndex;
+  reshade::api::buffer_range fallback_scene_cbv = {};
+  bool fallback_scene_cbv_seen = false;
+  uint64_t fallback_scene_cbv_frame = kInvalidFrameIndex;
+
+  reshade::api::sampler point_clamp_sampler = {};
+
+  uint32_t working_width = 0u;
+  uint32_t working_height = 0u;
+  uint32_t working_precision = std::numeric_limits<uint32_t>::max();
+  reshade::api::format working_ao_format = reshade::api::format::unknown;
+
+  reshade::api::resource depth_mips_texture = {};
+  reshade::api::resource_view depth_mips_srv = {};
+  std::array<reshade::api::resource_view, kXeGtaoDepthMipLevels> depth_mips_uavs = {};
+
+  reshade::api::resource ao_term_a_texture = {};
+  reshade::api::resource_view ao_term_a_srv = {};
+  reshade::api::resource_view ao_term_a_uav = {};
+
+  reshade::api::resource ao_term_b_texture = {};
+  reshade::api::resource_view ao_term_b_srv = {};
+  reshade::api::resource_view ao_term_b_uav = {};
+
+  reshade::api::resource edges_texture = {};
+  reshade::api::resource_view edges_srv = {};
+  reshade::api::resource_view edges_uav = {};
+
+  reshade::api::resource composite_texture = {};
+  reshade::api::resource_view composite_srv = {};
+  reshade::api::resource_view composite_uav = {};
+  reshade::api::resource_desc composite_desc = {};
+
+  reshade::api::resource character_sss_current_resource = {};
+  reshade::api::resource_view character_sss_current_srv = {};
+  reshade::api::resource character_sss_last_valid_resource = {};
+  reshade::api::resource_view character_sss_last_valid_srv = {};
+  uint64_t character_sss_current_frame = kInvalidFrameIndex;
+
+  reshade::api::pipeline_layout xegtao_prefilter_layout = {};
+  reshade::api::pipeline_layout xegtao_main_layout = {};
+  reshade::api::pipeline_layout xegtao_denoise_layout = {};
+  reshade::api::pipeline_layout xegtao_composite_layout = {};
+  reshade::api::pipeline_layout xegtao_normal_cap_layout = {};
+
+  reshade::api::pipeline xegtao_prefilter_pipeline = {};
+  reshade::api::pipeline xegtao_main_pipeline = {};
+  reshade::api::pipeline xegtao_denoise_pipeline = {};
+  reshade::api::pipeline xegtao_composite_pipeline = {};
+  reshade::api::pipeline xegtao_normal_cap_pipeline = {};
+
+  uint64_t present_frame_index = 0u;
+  uint64_t last_gtao_frame = kInvalidFrameIndex;
+  uint64_t last_ao_hook_frame = kInvalidFrameIndex;
+  uint64_t last_copyback_frame = kInvalidFrameIndex;
+  uint64_t last_gtao_failure_log_frame = kInvalidFrameIndex;
+  uint64_t last_skip_vanilla_ao_ignored_log_frame = kInvalidFrameIndex;
+  uint64_t xegtao_mrt_normal_frame = kInvalidFrameIndex;
+  bool xegtao_mrt_normal_valid = false;
+  bool copyback_succeeded = false;
+};
 
 #pragma pack(push, 1)
 struct DdsPixelFormat {
@@ -500,14 +705,62 @@ bool CreateIsFastTexture(
 void OnInitDevice(reshade::api::device* device) {
   if (device == nullptr) return;
   if (!IsIsFastSupportedDevice(device)) return;
+  device->create_private_data<DeviceData>();
+  if (auto* data = device->get_private_data<DeviceData>(); data != nullptr) {
+    data->present_frame_index = 0u;
+    data->last_gtao_frame = kInvalidFrameIndex;
+    data->last_ao_hook_frame = kInvalidFrameIndex;
+    data->last_copyback_frame = kInvalidFrameIndex;
+    data->last_gtao_failure_log_frame = kInvalidFrameIndex;
+    data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
+    data->xegtao_mrt_normal_valid = false;
+    data->copyback_succeeded = false;
+    data->character_sss_current_frame = kInvalidFrameIndex;
+  }
   ReloadIsFastResources(device, "init_device");
 }
 
 void OnDestroyDevice(reshade::api::device* device) {
   if (!IsIsFastSupportedDevice(device)) return;
   LogIsFast(reshade::log::level::debug, "OnDestroyDevice begin.");
+  if (auto* data = device->get_private_data<DeviceData>(); data != nullptr) {
+    DestroyXeGTAOState(device, data);
+  }
   DestroyIsFastResources(device);
+  device->destroy_private_data<DeviceData>();
   LogIsFast(reshade::log::level::debug, "OnDestroyDevice complete. isfast_noise_bound=0.");
+}
+
+void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
+  (void)resize;
+  if (swapchain == nullptr) return;
+  auto* device = swapchain->get_device();
+  if (!IsIsFastSupportedDevice(device)) return;
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+
+  DestroyXeGTAOResources(device, data);
+  DestroyDedicatedSssViews(device, data);
+  data->captured_mrt_normal_srv = {};
+  data->last_gtao_frame = kInvalidFrameIndex;
+  data->last_ao_hook_frame = kInvalidFrameIndex;
+  data->last_copyback_frame = kInvalidFrameIndex;
+  data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
+  data->xegtao_mrt_normal_valid = false;
+  data->character_sss_current_frame = kInvalidFrameIndex;
+  data->copyback_succeeded = false;
+}
+
+void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
+  (void)resize;
+  if (swapchain == nullptr) return;
+  auto* device = swapchain->get_device();
+  if (!IsIsFastSupportedDevice(device)) return;
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+  DestroyXeGTAOResources(device, data);
+  DestroyDedicatedSssViews(device, data);
+  data->captured_mrt_normal_srv = {};
 }
 
 void ReloadIsFastResources(reshade::api::device* device, const char* reason) {
@@ -620,6 +873,1171 @@ void ReloadIsFastResources(reshade::api::device* device, const char* reason) {
   }
 }
 
+bool IsViewAlive(reshade::api::device* device, const reshade::api::resource_view view) {
+  if (device == nullptr || view.handle == 0u) return false;
+  return device->get_resource_from_view(view).handle != 0u;
+}
+
+XeGTAOMode GetXeGTAOModeSetting() {
+  const auto mode = static_cast<uint32_t>(std::clamp(xegtao_mode, 0.f, 1.f));
+  return static_cast<XeGTAOMode>(mode);
+}
+
+uint32_t ClampXeGTAOQuality() {
+  return static_cast<uint32_t>(std::clamp(xegtao_quality, 0.f, 2.f));
+}
+
+uint32_t ClampXeGTAOPrecision() {
+  return static_cast<uint32_t>(std::clamp(xegtao_precision, 0.f, 1.f));
+}
+
+uint32_t ClampXeGTAONormalInputMode() {
+  return static_cast<uint32_t>(std::clamp(xegtao_normal_input_mode, 0.f, 1.f));
+}
+
+uint32_t ClampXeGTAONormalDarkeningMode() {
+  return static_cast<uint32_t>(std::clamp(std::round(xegtao_normal_darkening_mode), 0.f, 1.f));
+}
+
+uint32_t ClampXeGTAODenoisePasses() {
+  return static_cast<uint32_t>(std::clamp(xegtao_denoise_pass_count, 0.f, 3.f));
+}
+
+bool IsSceneCbvCandidateValid(reshade::api::device* device, const reshade::api::buffer_range& range) {
+  if (device == nullptr) return false;
+  if (range.buffer.handle == 0u) return false;
+
+  const auto desc = device->get_resource_desc(range.buffer);
+  if (desc.type != reshade::api::resource_type::buffer) return false;
+  if (desc.buffer.size < kSceneCbMinimumBytes) return false;
+  if (range.offset >= desc.buffer.size) return false;
+
+  // In D3D11-style paths size may be UINT64_MAX (whole buffer) or 0 (unknown),
+  // so only validate explicit ranges.
+  if (range.size != 0u && range.size != UINT64_MAX) {
+    if (range.size < kSceneCbMinimumBytes) return false;
+    if (range.size > desc.buffer.size) return false;
+    if (range.offset > desc.buffer.size - range.size) return false;
+  }
+
+  return true;
+}
+
+void CacheFallbackSceneCbv(reshade::api::command_list* cmd_list, const reshade::api::buffer_range& range) {
+  if (cmd_list == nullptr) return;
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return;
+
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+
+  if (range.buffer.handle == 0u) return;
+  data->fallback_scene_cbv = range;
+  data->fallback_scene_cbv_seen = true;
+  data->fallback_scene_cbv_frame = data->present_frame_index;
+}
+
+bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return false;
+
+  if (data->captured_scene_cbv_valid && IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
+    return true;
+  }
+
+  data->captured_scene_cbv = {};
+  data->captured_scene_cbv_valid = false;
+  data->captured_scene_cbv_frame = kInvalidFrameIndex;
+
+  if (!data->fallback_scene_cbv_seen) return false;
+  if (data->fallback_scene_cbv_frame != data->present_frame_index) return false;
+  if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) return false;
+
+  data->captured_scene_cbv = data->fallback_scene_cbv;
+  data->captured_scene_cbv_valid = true;
+  data->captured_scene_cbv_frame = data->fallback_scene_cbv_frame;
+  return true;
+}
+
+void DestroyResourceViewIfValid(reshade::api::device* device, reshade::api::resource_view* view) {
+  if (device == nullptr || view == nullptr) return;
+  if (view->handle == 0u) return;
+  device->destroy_resource_view(*view);
+  *view = {0u};
+}
+
+void DestroyResourceIfValid(reshade::api::device* device, reshade::api::resource* resource) {
+  if (device == nullptr || resource == nullptr) return;
+  if (resource->handle == 0u) return;
+  device->destroy_resource(*resource);
+  *resource = {0u};
+}
+
+void DestroyPipelineLayoutIfValid(reshade::api::device* device, reshade::api::pipeline_layout* layout) {
+  if (device == nullptr || layout == nullptr) return;
+  if (layout->handle == 0u) return;
+  device->destroy_pipeline_layout(*layout);
+  *layout = {0u};
+}
+
+void DestroyPipelineIfValid(reshade::api::device* device, reshade::api::pipeline* pipeline) {
+  if (device == nullptr || pipeline == nullptr) return;
+  if (pipeline->handle == 0u) return;
+  device->destroy_pipeline(*pipeline);
+  *pipeline = {0u};
+}
+
+void DestroyXeGTAOResources(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return;
+
+  DestroyResourceViewIfValid(device, &data->depth_mips_srv);
+  for (auto& mip_uav : data->depth_mips_uavs) {
+    DestroyResourceViewIfValid(device, &mip_uav);
+  }
+  DestroyResourceIfValid(device, &data->depth_mips_texture);
+
+  DestroyResourceViewIfValid(device, &data->ao_term_a_srv);
+  DestroyResourceViewIfValid(device, &data->ao_term_a_uav);
+  DestroyResourceIfValid(device, &data->ao_term_a_texture);
+
+  DestroyResourceViewIfValid(device, &data->ao_term_b_srv);
+  DestroyResourceViewIfValid(device, &data->ao_term_b_uav);
+  DestroyResourceIfValid(device, &data->ao_term_b_texture);
+
+  DestroyResourceViewIfValid(device, &data->edges_srv);
+  DestroyResourceViewIfValid(device, &data->edges_uav);
+  DestroyResourceIfValid(device, &data->edges_texture);
+
+  DestroyResourceViewIfValid(device, &data->composite_srv);
+  DestroyResourceViewIfValid(device, &data->composite_uav);
+  DestroyResourceIfValid(device, &data->composite_texture);
+  data->composite_desc = {};
+
+  data->working_width = 0u;
+  data->working_height = 0u;
+  data->working_precision = std::numeric_limits<uint32_t>::max();
+  data->working_ao_format = reshade::api::format::unknown;
+}
+
+void DestroyDedicatedSssViews(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return;
+
+  DestroyResourceViewIfValid(device, &data->character_sss_current_srv);
+  DestroyResourceViewIfValid(device, &data->character_sss_last_valid_srv);
+  data->character_sss_current_resource = {};
+  data->character_sss_last_valid_resource = {};
+  data->character_sss_current_frame = kInvalidFrameIndex;
+}
+
+void DestroyXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return;
+
+  DestroyPipelineIfValid(device, &data->xegtao_prefilter_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_main_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_denoise_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_composite_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_normal_cap_pipeline);
+
+  DestroyPipelineLayoutIfValid(device, &data->xegtao_prefilter_layout);
+  DestroyPipelineLayoutIfValid(device, &data->xegtao_main_layout);
+  DestroyPipelineLayoutIfValid(device, &data->xegtao_denoise_layout);
+  DestroyPipelineLayoutIfValid(device, &data->xegtao_composite_layout);
+  DestroyPipelineLayoutIfValid(device, &data->xegtao_normal_cap_layout);
+}
+
+void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return;
+  DestroyXeGTAOResources(device, data);
+  DestroyXeGTAOPipelines(device, data);
+  DestroyDedicatedSssViews(device, data);
+
+  if (data->point_clamp_sampler.handle != 0u) {
+    device->destroy_sampler(data->point_clamp_sampler);
+    data->point_clamp_sampler = {0u};
+  }
+
+  data->captured_depth_srv = {};
+  data->captured_ssao_srv = {};
+  data->captured_mrt_normal_srv = {};
+  data->captured_scene_cbv = {};
+  data->captured_scene_cbv_valid = false;
+  data->captured_scene_cbv_frame = kInvalidFrameIndex;
+  data->fallback_scene_cbv = {};
+  data->fallback_scene_cbv_seen = false;
+  data->fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->last_gtao_frame = kInvalidFrameIndex;
+  data->last_ao_hook_frame = kInvalidFrameIndex;
+  data->last_copyback_frame = kInvalidFrameIndex;
+  data->last_gtao_failure_log_frame = kInvalidFrameIndex;
+  data->last_skip_vanilla_ao_ignored_log_frame = kInvalidFrameIndex;
+  data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
+  data->xegtao_mrt_normal_valid = false;
+  data->copyback_succeeded = false;
+}
+
+bool CreateCharacterSssSrv(
+    reshade::api::device* device,
+    reshade::api::resource source_resource,
+    reshade::api::resource_view source_rtv,
+    reshade::api::resource_view* out_srv) {
+  if (device == nullptr || out_srv == nullptr) return false;
+  *out_srv = {0u};
+  if (source_resource.handle == 0u || source_rtv.handle == 0u) return false;
+
+  const auto resource_desc = device->get_resource_desc(source_resource);
+  if (resource_desc.type != reshade::api::resource_type::texture_2d) return false;
+
+  auto view_format = device->get_resource_view_desc(source_rtv).format;
+  if (view_format == reshade::api::format::unknown) {
+    view_format = reshade::api::format_to_default_typed(resource_desc.texture.format);
+  }
+  if (view_format == reshade::api::format::unknown) return false;
+
+  if (device->create_resource_view(
+          source_resource,
+          reshade::api::resource_usage::shader_resource,
+          reshade::api::resource_view_desc(view_format),
+          out_srv)) {
+    return true;
+  }
+
+  const auto fallback_format = reshade::api::format_to_default_typed(resource_desc.texture.format);
+  if (fallback_format == reshade::api::format::unknown) return false;
+  return device->create_resource_view(
+      source_resource,
+      reshade::api::resource_usage::shader_resource,
+      reshade::api::resource_view_desc(fallback_format),
+      out_srv);
+}
+
+bool UpdateCharacterSssCapture(
+    reshade::api::device* device,
+    DeviceData* data,
+    reshade::api::resource_view source_rtv) {
+  if (device == nullptr || data == nullptr) return false;
+  if (!IsViewAlive(device, source_rtv)) return false;
+
+  const auto source_resource = device->get_resource_from_view(source_rtv);
+  if (source_resource.handle == 0u) return false;
+
+  if (data->character_sss_current_resource.handle == source_resource.handle
+      && IsViewAlive(device, data->character_sss_current_srv)) {
+    data->character_sss_current_frame = data->present_frame_index;
+    return true;
+  }
+
+  reshade::api::resource_view new_srv = {};
+  if (!CreateCharacterSssSrv(device, source_resource, source_rtv, &new_srv)) return false;
+
+  if (IsViewAlive(device, data->character_sss_current_srv)) {
+    DestroyResourceViewIfValid(device, &data->character_sss_last_valid_srv);
+    data->character_sss_last_valid_srv = data->character_sss_current_srv;
+    data->character_sss_last_valid_resource = data->character_sss_current_resource;
+  }
+
+  data->character_sss_current_srv = new_srv;
+  data->character_sss_current_resource = source_resource;
+  data->character_sss_current_frame = data->present_frame_index;
+  return true;
+}
+
+bool EnsurePointClampSampler(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return false;
+  if (data->point_clamp_sampler.handle != 0u) return true;
+
+  reshade::api::sampler_desc sampler_desc = {};
+  sampler_desc.filter = reshade::api::filter_mode::min_mag_mip_point;
+  sampler_desc.address_u = reshade::api::texture_address_mode::clamp;
+  sampler_desc.address_v = reshade::api::texture_address_mode::clamp;
+  sampler_desc.address_w = reshade::api::texture_address_mode::clamp;
+  return device->create_sampler(sampler_desc, &data->point_clamp_sampler);
+}
+
+bool CreateXeGTAOTexture2D(
+    reshade::api::device* device,
+    uint32_t width,
+    uint32_t height,
+    uint16_t levels,
+    reshade::api::format create_format,
+    reshade::api::resource_usage usage,
+    reshade::api::resource* out_resource) {
+  if (device == nullptr || out_resource == nullptr) return false;
+  *out_resource = {0u};
+
+  reshade::api::resource_desc desc = {};
+  desc.type = reshade::api::resource_type::texture_2d;
+  desc.texture = {
+      width,
+      height,
+      1u,
+      levels,
+      create_format,
+      1u,
+  };
+  desc.heap = reshade::api::memory_heap::gpu_only;
+  desc.usage = usage;
+  desc.flags = reshade::api::resource_flags::none;
+  return device->create_resource(desc, nullptr, usage, out_resource);
+}
+
+bool CreateXeGTAOTextureView(
+    reshade::api::device* device,
+    reshade::api::resource resource,
+    reshade::api::resource_usage usage,
+    reshade::api::resource_view_type type,
+    reshade::api::format format,
+    uint32_t first_level,
+    uint32_t level_count,
+    reshade::api::resource_view* out_view) {
+  if (device == nullptr || out_view == nullptr) return false;
+  *out_view = {0u};
+  reshade::api::resource_view_desc view_desc(type, format, first_level, level_count, 0, 1);
+  return device->create_resource_view(resource, usage, view_desc, out_view);
+}
+
+bool EnsureXeGTAOLayout(
+    reshade::api::device* device,
+    uint32_t srv_count,
+    uint32_t uav_count,
+    reshade::api::pipeline_layout* out_layout) {
+  if (device == nullptr || out_layout == nullptr) return false;
+  if (out_layout->handle != 0u) return true;
+
+  reshade::api::descriptor_range sampler_range = {};
+  sampler_range.binding = 0;
+  sampler_range.dx_register_index = 0;
+  sampler_range.dx_register_space = 0;
+  sampler_range.count = 1;
+  sampler_range.visibility = reshade::api::shader_stage::all_compute;
+  sampler_range.type = reshade::api::descriptor_type::sampler;
+
+  reshade::api::descriptor_range cbv_range = {};
+  cbv_range.binding = 0;
+  cbv_range.dx_register_index = 0;
+  cbv_range.dx_register_space = 0;
+  cbv_range.count = 1;
+  cbv_range.visibility = reshade::api::shader_stage::all_compute;
+  cbv_range.type = reshade::api::descriptor_type::constant_buffer;
+
+  reshade::api::descriptor_range srv_range = {};
+  srv_range.binding = 0;
+  srv_range.dx_register_index = 0;
+  srv_range.dx_register_space = 0;
+  srv_range.count = srv_count;
+  srv_range.visibility = reshade::api::shader_stage::all_compute;
+  srv_range.type = reshade::api::descriptor_type::texture_shader_resource_view;
+
+  reshade::api::descriptor_range uav_range = {};
+  uav_range.binding = 0;
+  uav_range.dx_register_index = 0;
+  uav_range.dx_register_space = 0;
+  uav_range.count = uav_count;
+  uav_range.visibility = reshade::api::shader_stage::all_compute;
+  uav_range.type = reshade::api::descriptor_type::texture_unordered_access_view;
+
+  reshade::api::constant_range push_constants_range = {};
+  push_constants_range.binding = 0;
+  push_constants_range.dx_register_index = 13;
+  push_constants_range.dx_register_space = 0;
+  // Max push constant payload used by compute passes (xesss uses 32 floats).
+  push_constants_range.count = 32;
+  push_constants_range.visibility = reshade::api::shader_stage::all_compute;
+
+  std::array<reshade::api::pipeline_layout_param, 5> params = {
+      reshade::api::pipeline_layout_param{sampler_range},
+      reshade::api::pipeline_layout_param{cbv_range},
+      reshade::api::pipeline_layout_param{srv_range},
+      reshade::api::pipeline_layout_param{uav_range},
+      reshade::api::pipeline_layout_param{push_constants_range},
+  };
+  return device->create_pipeline_layout(static_cast<uint32_t>(params.size()), params.data(), out_layout);
+}
+
+bool EnsureXeGTAOComputePipeline(
+    reshade::api::device* device,
+    reshade::api::pipeline_layout layout,
+    std::span<const uint8_t> shader_code,
+    reshade::api::pipeline* out_pipeline) {
+  if (device == nullptr || out_pipeline == nullptr) return false;
+  if (out_pipeline->handle != 0u) return true;
+  if (layout.handle == 0u || shader_code.empty()) return false;
+
+  reshade::api::shader_desc shader_desc = {};
+  shader_desc.code = shader_code.data();
+  shader_desc.code_size = shader_code.size();
+
+  reshade::api::pipeline_subobject pipeline_subobject = {};
+  pipeline_subobject.type = reshade::api::pipeline_subobject_type::compute_shader;
+  pipeline_subobject.count = 1;
+  pipeline_subobject.data = &shader_desc;
+
+  return device->create_pipeline(layout, 1, &pipeline_subobject, out_pipeline);
+}
+
+bool DispatchXeGTAOCompute(
+    reshade::api::command_list* cmd_list,
+    reshade::api::pipeline_layout layout,
+    reshade::api::pipeline pipeline,
+    std::span<const reshade::api::descriptor_table_update> descriptor_updates,
+    std::span<const float> push_constants,
+    uint32_t group_count_x,
+    uint32_t group_count_y,
+    uint32_t group_count_z) {
+  if (cmd_list == nullptr) return false;
+  if (layout.handle == 0u || pipeline.handle == 0u) return false;
+  if (group_count_x == 0u || group_count_y == 0u || group_count_z == 0u) return false;
+
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, pipeline);
+
+  for (uint32_t i = 0u; i < descriptor_updates.size(); ++i) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::all_compute,
+        layout,
+        i,
+        descriptor_updates[i]);
+  }
+
+  cmd_list->push_constants(
+      reshade::api::shader_stage::all_compute,
+      layout,
+      kXeGtaoPushConstantsLayoutParam,
+      0u,
+      static_cast<uint32_t>(push_constants.size()),
+      push_constants.data());
+
+  cmd_list->dispatch(group_count_x, group_count_y, group_count_z);
+  return true;
+}
+
+void TransitionResource(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource resource,
+    reshade::api::resource_usage before,
+    reshade::api::resource_usage after) {
+  if (cmd_list == nullptr) return;
+  if (resource.handle == 0u) return;
+  const reshade::api::resource resources[1] = {resource};
+  const reshade::api::resource_usage before_states[1] = {before};
+  const reshade::api::resource_usage after_states[1] = {after};
+  cmd_list->barrier(1, resources, before_states, after_states);
+}
+
+bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return false;
+  if (!EnsureXeGTAOLayout(device, 1u, 5u, &data->xegtao_prefilter_layout)) return false;
+  if (!EnsureXeGTAOLayout(device, 1u, 2u, &data->xegtao_main_layout)) return false;
+  if (!EnsureXeGTAOLayout(device, 2u, 1u, &data->xegtao_denoise_layout)) return false;
+  if (!EnsureXeGTAOLayout(device, 2u, 1u, &data->xegtao_composite_layout)) return false;
+  if (!EnsureXeGTAOLayout(device, 2u, 1u, &data->xegtao_normal_cap_layout)) return false;
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_prefilter_layout,
+          __xegtao_prefilter,
+          &data->xegtao_prefilter_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_main_layout,
+          __xegtao_main,
+          &data->xegtao_main_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_denoise_layout,
+          __xegtao_denoise,
+          &data->xegtao_denoise_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_composite_layout,
+          __xegtao_composite_x_only,
+          &data->xegtao_composite_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_normal_cap_layout,
+          __xegtao_normal_cap,
+          &data->xegtao_normal_cap_pipeline)) {
+    return false;
+  }
+  return true;
+}
+
+bool EnsureXeGTAOResources(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return false;
+  if (!IsViewAlive(device, data->captured_ssao_srv) || !IsViewAlive(device, data->captured_depth_srv)) return false;
+
+  const auto ssao_resource = device->get_resource_from_view(data->captured_ssao_srv);
+  if (ssao_resource.handle == 0u) return false;
+
+  const auto ssao_desc = device->get_resource_desc(ssao_resource);
+  if (ssao_desc.type != reshade::api::resource_type::texture_2d) return false;
+  if (ssao_desc.texture.samples != 1u) return false;
+
+  auto ssao_view_format = device->get_resource_view_desc(data->captured_ssao_srv).format;
+  if (ssao_view_format == reshade::api::format::unknown) {
+    ssao_view_format = reshade::api::format_to_default_typed(ssao_desc.texture.format);
+  } else {
+    const auto typed = reshade::api::format_to_default_typed(ssao_view_format);
+    if (typed != reshade::api::format::unknown) {
+      ssao_view_format = typed;
+    }
+  }
+  if (ssao_view_format == reshade::api::format::unknown) return false;
+
+  const uint32_t precision_mode = ClampXeGTAOPrecision();
+  const reshade::api::format depth_mips_format =
+      precision_mode == static_cast<uint32_t>(XeGTAOPrecision::kFull)
+      ? reshade::api::format::r32_float
+      : reshade::api::format::r16_float;
+
+  const bool should_recreate =
+      data->depth_mips_texture.handle == 0u
+      || data->ao_term_a_texture.handle == 0u
+      || data->ao_term_b_texture.handle == 0u
+      || data->edges_texture.handle == 0u
+      || data->composite_texture.handle == 0u
+      || data->working_width != ssao_desc.texture.width
+      || data->working_height != ssao_desc.texture.height
+      || data->working_precision != precision_mode
+      || data->working_ao_format != ssao_view_format;
+  if (!should_recreate) return true;
+
+  DestroyXeGTAOResources(device, data);
+
+  data->working_width = ssao_desc.texture.width;
+  data->working_height = ssao_desc.texture.height;
+  data->working_precision = precision_mode;
+  data->working_ao_format = ssao_view_format;
+
+  const auto gpu_rw_usage =
+      reshade::api::resource_usage::shader_resource
+      | reshade::api::resource_usage::unordered_access
+      | reshade::api::resource_usage::copy_source
+      | reshade::api::resource_usage::copy_dest;
+
+  if (!CreateXeGTAOTexture2D(
+          device,
+          data->working_width,
+          data->working_height,
+          static_cast<uint16_t>(kXeGtaoDepthMipLevels),
+          depth_mips_format,
+          gpu_rw_usage,
+          &data->depth_mips_texture)) {
+    return false;
+  }
+  if (!CreateXeGTAOTextureView(
+          device,
+          data->depth_mips_texture,
+          reshade::api::resource_usage::shader_resource,
+          reshade::api::resource_view_type::texture_2d,
+          depth_mips_format,
+          0u,
+          kXeGtaoDepthMipLevels,
+          &data->depth_mips_srv)) {
+    return false;
+  }
+  for (uint32_t mip_level = 0; mip_level < kXeGtaoDepthMipLevels; ++mip_level) {
+    if (!CreateXeGTAOTextureView(
+            device,
+            data->depth_mips_texture,
+            reshade::api::resource_usage::unordered_access,
+            reshade::api::resource_view_type::texture_2d,
+            depth_mips_format,
+            mip_level,
+            1u,
+            &data->depth_mips_uavs[mip_level])) {
+      return false;
+    }
+  }
+
+  if (!CreateXeGTAOTexture2D(
+          device,
+          data->working_width,
+          data->working_height,
+          1u,
+          reshade::api::format::r32_uint,
+          gpu_rw_usage,
+          &data->ao_term_a_texture)) {
+    return false;
+  }
+  if (!CreateXeGTAOTextureView(
+          device,
+          data->ao_term_a_texture,
+          reshade::api::resource_usage::shader_resource,
+          reshade::api::resource_view_type::texture_2d,
+          reshade::api::format::r32_uint,
+          0u,
+          1u,
+          &data->ao_term_a_srv)) {
+    return false;
+  }
+  if (!CreateXeGTAOTextureView(
+          device,
+          data->ao_term_a_texture,
+          reshade::api::resource_usage::unordered_access,
+          reshade::api::resource_view_type::texture_2d,
+          reshade::api::format::r32_uint,
+          0u,
+          1u,
+          &data->ao_term_a_uav)) {
+    return false;
+  }
+
+  if (!CreateXeGTAOTexture2D(
+          device,
+          data->working_width,
+          data->working_height,
+          1u,
+          reshade::api::format::r32_uint,
+          gpu_rw_usage,
+          &data->ao_term_b_texture)) {
+    return false;
+  }
+  if (!CreateXeGTAOTextureView(
+          device,
+          data->ao_term_b_texture,
+          reshade::api::resource_usage::shader_resource,
+          reshade::api::resource_view_type::texture_2d,
+          reshade::api::format::r32_uint,
+          0u,
+          1u,
+          &data->ao_term_b_srv)) {
+    return false;
+  }
+  if (!CreateXeGTAOTextureView(
+          device,
+          data->ao_term_b_texture,
+          reshade::api::resource_usage::unordered_access,
+          reshade::api::resource_view_type::texture_2d,
+          reshade::api::format::r32_uint,
+          0u,
+          1u,
+          &data->ao_term_b_uav)) {
+    return false;
+  }
+
+  const reshade::api::format preferred_edges_format =
+      precision_mode == static_cast<uint32_t>(XeGTAOPrecision::kFull)
+      ? reshade::api::format::r16_unorm
+      : reshade::api::format::r8_unorm;
+  auto create_edges_resources = [&](reshade::api::format edges_format) -> bool {
+    return CreateXeGTAOTexture2D(
+               device,
+               data->working_width,
+               data->working_height,
+               1u,
+               edges_format,
+               gpu_rw_usage,
+               &data->edges_texture)
+        && CreateXeGTAOTextureView(
+            device,
+            data->edges_texture,
+            reshade::api::resource_usage::shader_resource,
+            reshade::api::resource_view_type::texture_2d,
+            edges_format,
+            0u,
+            1u,
+            &data->edges_srv)
+        && CreateXeGTAOTextureView(
+            device,
+            data->edges_texture,
+            reshade::api::resource_usage::unordered_access,
+            reshade::api::resource_view_type::texture_2d,
+            edges_format,
+            0u,
+            1u,
+            &data->edges_uav);
+  };
+  if (!create_edges_resources(preferred_edges_format)) {
+    DestroyResourceViewIfValid(device, &data->edges_srv);
+    DestroyResourceViewIfValid(device, &data->edges_uav);
+    DestroyResourceIfValid(device, &data->edges_texture);
+    if (!create_edges_resources(reshade::api::format::r16_float)) {
+      return false;
+    }
+  }
+
+  reshade::api::format composite_create_format = reshade::api::format_to_typeless(ssao_view_format);
+  if (composite_create_format == reshade::api::format::unknown) {
+    composite_create_format = ssao_view_format;
+  }
+
+  if (!CreateXeGTAOTexture2D(
+          device,
+          data->working_width,
+          data->working_height,
+          1u,
+          composite_create_format,
+          gpu_rw_usage,
+          &data->composite_texture)
+      || !CreateXeGTAOTextureView(
+          device,
+          data->composite_texture,
+          reshade::api::resource_usage::shader_resource,
+          reshade::api::resource_view_type::texture_2d,
+          ssao_view_format,
+          0u,
+          1u,
+          &data->composite_srv)
+      || !CreateXeGTAOTextureView(
+          device,
+          data->composite_texture,
+          reshade::api::resource_usage::unordered_access,
+          reshade::api::resource_view_type::texture_2d,
+          ssao_view_format,
+          0u,
+          1u,
+          &data->composite_uav)) {
+    DestroyResourceViewIfValid(device, &data->composite_srv);
+    DestroyResourceViewIfValid(device, &data->composite_uav);
+    DestroyResourceIfValid(device, &data->composite_texture);
+    if (!CreateXeGTAOTexture2D(
+            device,
+            data->working_width,
+            data->working_height,
+            1u,
+            reshade::api::format::r16g16b16a16_float,
+            gpu_rw_usage,
+            &data->composite_texture)
+        || !CreateXeGTAOTextureView(
+            device,
+            data->composite_texture,
+            reshade::api::resource_usage::shader_resource,
+            reshade::api::resource_view_type::texture_2d,
+            reshade::api::format::r16g16b16a16_float,
+            0u,
+            1u,
+            &data->composite_srv)
+        || !CreateXeGTAOTextureView(
+            device,
+            data->composite_texture,
+            reshade::api::resource_usage::unordered_access,
+            reshade::api::resource_view_type::texture_2d,
+            reshade::api::format::r16g16b16a16_float,
+            0u,
+            1u,
+            &data->composite_uav)) {
+      return false;
+    }
+  }
+  data->composite_desc = device->get_resource_desc(data->composite_texture);
+  return true;
+}
+
+std::array<float, 26> BuildXeGTAOPushConstants(const DeviceData* data, bool denoise_last_pass) {
+  std::array<float, 26> constants = {};
+  const uint32_t denoise_passes = ClampXeGTAODenoisePasses();
+  constants[0] = static_cast<float>(ClampXeGTAOQuality());
+  constants[1] = static_cast<float>(denoise_passes);
+  constants[2] = std::max(0.001f, xegtao_radius);
+  constants[3] = std::clamp(xegtao_falloff_range, 0.f, 1.f);
+  constants[4] = std::clamp(xegtao_radius_multiplier, 0.3f, 3.f);
+  constants[5] = std::clamp(xegtao_final_value_power, 0.5f, 5.f);
+  constants[6] = std::clamp(xegtao_sample_distribution_power, 1.f, 3.f);
+  constants[7] = std::clamp(xegtao_thin_occluder_compensation, 0.f, 0.7f);
+  constants[8] = std::clamp(xegtao_depth_mip_sampling_offset, 0.f, 30.f);
+  constants[9] = denoise_passes == 0u ? 10000.f : std::max(0.01f, xegtao_denoise_blur_beta);
+  constants[10] = denoise_passes == 0u
+      ? 0.f
+      : static_cast<float>((data != nullptr ? data->present_frame_index : 0u) % 64u);
+  constants[11] = std::clamp(xegtao_debug_mode, 0.f, 19.f);
+  constants[12] = denoise_last_pass ? 1.f : 0.f;
+  constants[13] = static_cast<float>(ClampXeGTAONormalInputMode());
+  constants[14] = 0.f;
+  constants[15] = std::clamp(xegtao_normal_influence, 0.f, 2.f);
+  constants[16] = std::clamp(xegtao_normal_depth_blend, 0.f, 1.f);
+  constants[17] = std::clamp(xegtao_normal_sharpness, 0.5f, 2.5f);
+  constants[18] = std::clamp(xegtao_normal_edge_rejection, 0.f, 4.f);
+  constants[19] = std::clamp(xegtao_normal_z_preservation, 0.f, 2.f);
+  constants[20] = std::clamp(xegtao_normal_detail_response, 0.25f, 4.f);
+  constants[21] = std::clamp(xegtao_normal_max_darkening, 0.f, 1.f);
+  constants[22] = static_cast<float>(ClampXeGTAONormalDarkeningMode());
+  constants[23] = xegtao_bent_normals >= 0.5f ? 1.f : 0.f;
+  constants[24] = 0.f;
+  constants[25] = 0.f;
+  return constants;
+}
+
+bool TryCopyBackXeGTAOResult(reshade::api::command_list* cmd_list, DeviceData* data) {
+  if (cmd_list == nullptr || data == nullptr) return false;
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return false;
+  if (!IsViewAlive(device, data->captured_ssao_srv)) return false;
+  if (data->composite_texture.handle == 0u) return false;
+
+  const auto src_resource = data->composite_texture;
+  const auto dst_resource = device->get_resource_from_view(data->captured_ssao_srv);
+  if (dst_resource.handle == 0u) return false;
+
+  const auto src_desc = device->get_resource_desc(src_resource);
+  const auto dst_desc = device->get_resource_desc(dst_resource);
+  if (src_desc.type != reshade::api::resource_type::texture_2d
+      || dst_desc.type != reshade::api::resource_type::texture_2d) {
+    return false;
+  }
+  if (src_desc.texture.width != dst_desc.texture.width
+      || src_desc.texture.height != dst_desc.texture.height
+      || src_desc.texture.samples != dst_desc.texture.samples) {
+    return false;
+  }
+
+  const auto src_typeless = reshade::api::format_to_typeless(src_desc.texture.format);
+  const auto dst_typeless = reshade::api::format_to_typeless(dst_desc.texture.format);
+  if (src_typeless != dst_typeless) return false;
+
+  const reshade::api::resource resources[2] = {src_resource, dst_resource};
+  const reshade::api::resource_usage before[2] = {
+      reshade::api::resource_usage::unordered_access,
+      reshade::api::resource_usage::shader_resource,
+  };
+  const reshade::api::resource_usage copy_states[2] = {
+      reshade::api::resource_usage::copy_source,
+      reshade::api::resource_usage::copy_dest,
+  };
+  const reshade::api::resource_usage after[2] = {
+      reshade::api::resource_usage::shader_resource,
+      reshade::api::resource_usage::shader_resource,
+  };
+
+  cmd_list->barrier(2, resources, before, copy_states);
+  cmd_list->copy_texture_region(src_resource, 0, nullptr, dst_resource, 0, nullptr);
+  cmd_list->barrier(2, resources, copy_states, after);
+  return true;
+}
+
+bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, bool request_copy_back) {
+  if (cmd_list == nullptr || data == nullptr) return false;
+  auto fail = [data](const std::string& reason) -> bool {
+    if (data != nullptr && data->last_gtao_failure_log_frame != data->present_frame_index) {
+      data->last_gtao_failure_log_frame = data->present_frame_index;
+      std::string message = "XeGTAO: skipped this frame (";
+      message += reason;
+      message += ")";
+      reshade::log::message(reshade::log::level::warning, message.c_str());
+    }
+    return false;
+  };
+
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return fail("device is null");
+
+  data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
+  data->xegtao_mrt_normal_valid = false;
+
+  if (data->captured_scene_cbv_valid && !IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
+    data->captured_scene_cbv = {};
+    data->captured_scene_cbv_valid = false;
+    data->captured_scene_cbv_frame = kInvalidFrameIndex;
+  }
+
+  if (data->captured_scene_cbv_valid && data->captured_scene_cbv_frame != data->present_frame_index) {
+    data->captured_scene_cbv = {};
+    data->captured_scene_cbv_valid = false;
+    data->captured_scene_cbv_frame = kInvalidFrameIndex;
+  }
+
+  if (!data->captured_scene_cbv_valid || data->captured_scene_cbv.buffer.handle == 0u) {
+    (void)TryAdoptFallbackSceneCbv(device, data);
+  }
+
+  if (!IsViewAlive(device, data->captured_mrt_normal_srv)) {
+    data->captured_mrt_normal_srv = {};
+  }
+
+  if (!IsViewAlive(device, data->captured_depth_srv)
+      || !IsViewAlive(device, data->captured_ssao_srv)
+      || !IsViewAlive(device, data->captured_mrt_normal_srv)
+      || !data->captured_scene_cbv_valid
+      || data->captured_scene_cbv_frame != data->present_frame_index
+      || data->captured_scene_cbv.buffer.handle == 0u) {
+    ResolveXeGTAOInputsFromCurrentBindings(cmd_list, data);
+  }
+
+  if (!IsViewAlive(device, data->captured_depth_srv)) return fail("lighting depth t3 is not captured/alive");
+  if (!IsViewAlive(device, data->captured_ssao_srv)) return fail("lighting AO t4 is not captured/alive");
+  if (!data->captured_scene_cbv_valid
+      || data->captured_scene_cbv_frame != data->present_frame_index
+      || data->captured_scene_cbv.buffer.handle == 0u
+      || !IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
+    std::string reason = "lighting scene CB b0 is not captured";
+    if (!data->fallback_scene_cbv_seen) {
+      reason += " (tracked + fallback cache missing)";
+    } else if (data->fallback_scene_cbv_frame != data->present_frame_index) {
+      reason += " (fallback cache is stale this frame)";
+    } else if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) {
+      reason += " (fallback cache rejected by validation)";
+    } else {
+      reason += " (descriptor-table resolve did not expose a valid b0)";
+    }
+    return fail(reason);
+  }
+  if (!EnsurePointClampSampler(device, data)) return fail("point clamp sampler creation failed");
+  if (!EnsureXeGTAOPipelines(device, data)) return fail("pipeline/layout setup failed");
+  if (!EnsureXeGTAOResources(device, data)) return fail("working resource setup failed");
+
+  const uint32_t width = data->working_width;
+  const uint32_t height = data->working_height;
+  if (width == 0u || height == 0u) return fail("working texture dimensions are zero");
+
+  std::array<reshade::api::resource_view, 1> prefilter_srvs = {
+      data->captured_depth_srv,
+  };
+  std::array<reshade::api::resource_view, 5> prefilter_uavs = {
+      data->depth_mips_uavs[0],
+      data->depth_mips_uavs[1],
+      data->depth_mips_uavs[2],
+      data->depth_mips_uavs[3],
+      data->depth_mips_uavs[4],
+  };
+  auto prefilter_constants = BuildXeGTAOPushConstants(data, false);
+  std::array<reshade::api::descriptor_table_update, 4> prefilter_updates = {
+      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
+      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
+      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, prefilter_srvs.data()},
+      reshade::api::descriptor_table_update{{}, 0, 0, 5, reshade::api::descriptor_type::texture_unordered_access_view, prefilter_uavs.data()},
+  };
+  TransitionResource(
+      cmd_list,
+      data->depth_mips_texture,
+      reshade::api::resource_usage::shader_resource,
+      reshade::api::resource_usage::unordered_access);
+  if (!DispatchXeGTAOCompute(
+          cmd_list,
+          data->xegtao_prefilter_layout,
+          data->xegtao_prefilter_pipeline,
+          std::span<const reshade::api::descriptor_table_update>(prefilter_updates.data(), prefilter_updates.size()),
+          std::span<const float>(prefilter_constants.data(), prefilter_constants.size()),
+          (width + 15u) / 16u,
+          (height + 15u) / 16u,
+          1u)) {
+    return fail("prefilter dispatch failed");
+  }
+  TransitionResource(
+      cmd_list,
+      data->depth_mips_texture,
+      reshade::api::resource_usage::unordered_access,
+      reshade::api::resource_usage::shader_resource);
+
+  const bool mrt_normal_valid = IsViewAlive(device, data->captured_mrt_normal_srv);
+  auto dispatch_main_pass = [&](bool force_depth_only, reshade::api::resource_view ao_uav, reshade::api::resource ao_texture, const char* pass_name) {
+    std::array<reshade::api::resource_view, 2> main_srvs = {
+        data->depth_mips_srv,
+        data->captured_mrt_normal_srv,
+    };
+    const uint32_t main_srv_count = (!force_depth_only && mrt_normal_valid) ? 2u : 1u;
+    std::array<reshade::api::resource_view, 2> main_uavs = {
+        ao_uav,
+        data->edges_uav,
+    };
+    auto main_constants = BuildXeGTAOPushConstants(data, false);
+    main_constants[13] = force_depth_only ? 0.f : main_constants[13];
+    main_constants[14] = (!force_depth_only && mrt_normal_valid) ? 1.f : 0.f;
+
+    std::array<reshade::api::descriptor_table_update, 4> main_updates = {
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
+        reshade::api::descriptor_table_update{{}, 0, 0, main_srv_count, reshade::api::descriptor_type::texture_shader_resource_view, main_srvs.data()},
+        reshade::api::descriptor_table_update{{}, 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, main_uavs.data()},
+    };
+    TransitionResource(
+        cmd_list,
+        ao_texture,
+        reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_usage::unordered_access);
+    TransitionResource(
+        cmd_list,
+        data->edges_texture,
+        reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_usage::unordered_access);
+    if (!DispatchXeGTAOCompute(
+            cmd_list,
+            data->xegtao_main_layout,
+            data->xegtao_main_pipeline,
+            std::span<const reshade::api::descriptor_table_update>(main_updates.data(), main_updates.size()),
+            std::span<const float>(main_constants.data(), main_constants.size()),
+            (width + 7u) / 8u,
+            (height + 7u) / 8u,
+            1u)) {
+      return fail(std::string(pass_name) + " dispatch failed");
+    }
+    TransitionResource(
+        cmd_list,
+        ao_texture,
+        reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_usage::shader_resource);
+    TransitionResource(
+        cmd_list,
+        data->edges_texture,
+        reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_usage::shader_resource);
+    return true;
+  };
+
+  const bool exact_normal_cap_enabled =
+      ClampXeGTAONormalDarkeningMode() == 1u
+      && ClampXeGTAONormalInputMode() == 1u
+      && mrt_normal_valid
+      && xegtao_normal_max_darkening < 0.999f;
+
+  if (exact_normal_cap_enabled) {
+    if (!dispatch_main_pass(true, data->ao_term_b_uav, data->ao_term_b_texture, "main baseline")) return false;
+    if (!dispatch_main_pass(false, data->ao_term_a_uav, data->ao_term_a_texture, "main")) return false;
+
+    std::array<reshade::api::resource_view, 2> normal_cap_srvs = {
+        data->ao_term_b_srv,
+        data->ao_term_a_srv,
+    };
+    std::array<reshade::api::resource_view, 1> normal_cap_uavs = {
+        data->ao_term_a_uav,
+    };
+    auto normal_cap_constants = BuildXeGTAOPushConstants(data, false);
+    std::array<reshade::api::descriptor_table_update, 4> normal_cap_updates = {
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
+        reshade::api::descriptor_table_update{{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, normal_cap_srvs.data()},
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, normal_cap_uavs.data()},
+    };
+    TransitionResource(
+        cmd_list,
+        data->ao_term_a_texture,
+        reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_usage::unordered_access);
+    if (!DispatchXeGTAOCompute(
+            cmd_list,
+            data->xegtao_normal_cap_layout,
+            data->xegtao_normal_cap_pipeline,
+            std::span<const reshade::api::descriptor_table_update>(normal_cap_updates.data(), normal_cap_updates.size()),
+            std::span<const float>(normal_cap_constants.data(), normal_cap_constants.size()),
+            (width + 7u) / 8u,
+            (height + 7u) / 8u,
+            1u)) {
+      return fail("normal cap dispatch failed");
+    }
+    TransitionResource(
+        cmd_list,
+        data->ao_term_a_texture,
+        reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_usage::shader_resource);
+  } else {
+    if (!dispatch_main_pass(false, data->ao_term_a_uav, data->ao_term_a_texture, "main")) return false;
+  }
+
+  data->xegtao_mrt_normal_frame = data->present_frame_index;
+  data->xegtao_mrt_normal_valid = mrt_normal_valid;
+
+  const uint32_t denoise_passes = ClampXeGTAODenoisePasses();
+  const uint32_t denoise_total_passes = std::max(1u, denoise_passes);
+  bool denoise_source_is_a = true;
+
+  for (uint32_t pass_index = 0u; pass_index < denoise_total_passes; ++pass_index) {
+    const bool is_last_pass = pass_index + 1u == denoise_total_passes;
+    const reshade::api::resource_view denoise_source = denoise_source_is_a ? data->ao_term_a_srv : data->ao_term_b_srv;
+    const reshade::api::resource_view denoise_output = denoise_source_is_a ? data->ao_term_b_uav : data->ao_term_a_uav;
+
+    std::array<reshade::api::resource_view, 2> denoise_srvs = {
+        denoise_source,
+        data->edges_srv,
+    };
+    std::array<reshade::api::resource_view, 1> denoise_uavs = {
+        denoise_output,
+    };
+    auto denoise_constants = BuildXeGTAOPushConstants(data, is_last_pass);
+    std::array<reshade::api::descriptor_table_update, 4> denoise_updates = {
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
+        reshade::api::descriptor_table_update{{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, denoise_srvs.data()},
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, denoise_uavs.data()},
+    };
+    const reshade::api::resource denoise_output_resource =
+        denoise_source_is_a ? data->ao_term_b_texture : data->ao_term_a_texture;
+    TransitionResource(
+        cmd_list,
+        denoise_output_resource,
+        reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_usage::unordered_access);
+    if (!DispatchXeGTAOCompute(
+            cmd_list,
+            data->xegtao_denoise_layout,
+            data->xegtao_denoise_pipeline,
+            std::span<const reshade::api::descriptor_table_update>(denoise_updates.data(), denoise_updates.size()),
+            std::span<const float>(denoise_constants.data(), denoise_constants.size()),
+            (width + 15u) / 16u,
+            (height + 7u) / 8u,
+            1u)) {
+      return fail("denoise dispatch failed");
+    }
+    TransitionResource(
+        cmd_list,
+        denoise_output_resource,
+        reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_usage::shader_resource);
+    denoise_source_is_a = !denoise_source_is_a;
+  }
+
+  const bool denoise_result_is_a = denoise_source_is_a;
+  const reshade::api::resource_view gtao_result_srv = denoise_result_is_a ? data->ao_term_a_srv : data->ao_term_b_srv;
+  if (!IsViewAlive(device, gtao_result_srv)) return fail("AO result SRV is invalid");
+
+  std::array<reshade::api::resource_view, 2> composite_srvs = {
+      data->captured_ssao_srv,
+      gtao_result_srv,
+  };
+  std::array<reshade::api::resource_view, 1> composite_uavs = {
+      data->composite_uav,
+  };
+  auto composite_constants = BuildXeGTAOPushConstants(data, true);
+  std::array<reshade::api::descriptor_table_update, 4> composite_updates = {
+      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
+      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
+      reshade::api::descriptor_table_update{{}, 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, composite_srvs.data()},
+      reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, composite_uavs.data()},
+  };
+  TransitionResource(
+      cmd_list,
+      data->composite_texture,
+      reshade::api::resource_usage::shader_resource,
+      reshade::api::resource_usage::unordered_access);
+  if (!DispatchXeGTAOCompute(
+          cmd_list,
+          data->xegtao_composite_layout,
+          data->xegtao_composite_pipeline,
+          std::span<const reshade::api::descriptor_table_update>(composite_updates.data(), composite_updates.size()),
+          std::span<const float>(composite_constants.data(), composite_constants.size()),
+          (width + 7u) / 8u,
+          (height + 7u) / 8u,
+          1u)) {
+    return fail("composite dispatch failed");
+  }
+  if (!request_copy_back) {
+    TransitionResource(
+        cmd_list,
+        data->composite_texture,
+        reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_usage::shader_resource);
+  }
+
+  if (request_copy_back) {
+    data->last_copyback_frame = data->present_frame_index;
+    data->copyback_succeeded = TryCopyBackXeGTAOResult(cmd_list, data);
+    if (!data->copyback_succeeded) {
+      TransitionResource(
+          cmd_list,
+          data->composite_texture,
+          reshade::api::resource_usage::unordered_access,
+          reshade::api::resource_usage::shader_resource);
+    }
+  } else {
+    data->last_copyback_frame = kInvalidFrameIndex;
+    data->copyback_succeeded = false;
+  }
+  data->last_gtao_frame = data->present_frame_index;
+  return true;
+}
+
 bool TryResolveTextureRegister(
     reshade::api::pipeline_layout layout,
     uint32_t layout_param,
@@ -670,20 +2088,65 @@ bool TryResolveTextureRegister(
 }
 
 void CaptureTrackedTextureView(
+    reshade::api::command_list* cmd_list,
     const uint32_t shader_hash,
     const uint32_t reg,
     const uint32_t space,
     const reshade::api::resource_view view) {
+  if (g_skip_descriptor_capture) return;
+  if (cmd_list == nullptr) return;
   if (view.handle == 0u) return;
   if (space != 0u) return;
+
+  auto* device = cmd_list->get_device();
+  auto* data = device != nullptr ? device->get_private_data<DeviceData>() : nullptr;
 
   if (shader_hash == kCharacterShader && reg == 2u) {
     // Character pass uses mrtTexture0 at t2.
     g_character_mrt0_view.store(view.handle, std::memory_order_relaxed);
-  } else if ((shader_hash == kLightingShader || shader_hash == kLightingSoftShader) && reg == 1u) {
+    return;
+  }
+
+  if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return;
+
+  if (reg == kLightingMrtNormalRegister) {
     // Keep lighting mrt0 as fallback in case character pass capture is unavailable.
     g_lighting_mrt0_view.store(view.handle, std::memory_order_relaxed);
+    if (data != nullptr) {
+      data->captured_mrt_normal_srv = view;
+    }
+    return;
   }
+
+  if (data == nullptr) return;
+  if (reg == kLightingDepthRegister) {
+    data->captured_depth_srv = view;
+  } else if (reg == kLightingSsaoRegister) {
+    data->captured_ssao_srv = view;
+  }
+}
+
+void CaptureTrackedConstantBuffer(
+    reshade::api::command_list* cmd_list,
+    const uint32_t shader_hash,
+    const uint32_t reg,
+    const uint32_t space,
+    const reshade::api::buffer_range& range) {
+  if (g_skip_descriptor_capture) return;
+  if (cmd_list == nullptr) return;
+  if (space != 0u) return;
+  if (range.buffer.handle == 0u) return;
+  if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return;
+  if (reg != kLightingSceneCbRegister) return;
+
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return;
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+  if (!IsSceneCbvCandidateValid(device, range)) return;
+  data->captured_scene_cbv = range;
+  data->captured_scene_cbv_valid = true;
+  data->captured_scene_cbv_frame = data->present_frame_index;
 }
 
 void OnPushDescriptorsCaptureLightingTextures(
@@ -692,14 +2155,20 @@ void OnPushDescriptorsCaptureLightingTextures(
     reshade::api::pipeline_layout layout,
     uint32_t layout_param,
     const reshade::api::descriptor_table_update& update) {
+  if (g_skip_descriptor_capture) return;
   if (cmd_list == nullptr) return;
   if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) return;
 
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
-  if (shader_state == nullptr) return;
-  const auto shader_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
+  const auto shader_hash = shader_state != nullptr
+      ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state)
+      : 0u;
   const bool is_tracked_shader =
       shader_hash == kLightingShader || shader_hash == kLightingSoftShader || shader_hash == kCharacterShader;
+  // On D3D11, b0 updates may happen before the tracked lighting hash is visible.
+  // Accept unknown hash as fallback capture source for b0.
+  const bool allow_fallback_scene_cb_capture =
+      shader_hash == 0u || shader_hash == kLightingShader || shader_hash == kLightingSoftShader;
 
   for (uint32_t i = 0; i < update.count; ++i) {
     uint32_t reg = 0u;
@@ -708,10 +2177,23 @@ void OnPushDescriptorsCaptureLightingTextures(
       reg = update.binding + i;
       space = 0u;
     }
-    if (update.type == reshade::api::descriptor_type::constant_buffer) continue;
+
+    if (update.type == reshade::api::descriptor_type::constant_buffer) {
+      const auto* ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
+      if (ranges == nullptr) continue;
+      if (allow_fallback_scene_cb_capture && reg == kLightingSceneCbRegister && space == 0u) {
+        CacheFallbackSceneCbv(cmd_list, ranges[i]);
+      }
+      if (is_tracked_shader) {
+        CaptureTrackedConstantBuffer(cmd_list, shader_hash, reg, space, ranges[i]);
+      }
+      continue;
+    }
+
     if (!is_tracked_shader) continue;
+
     const auto view = renodx::utils::descriptor::GetResourceViewFromDescriptorUpdate(update, i);
-    CaptureTrackedTextureView(shader_hash, reg, space, view);
+    CaptureTrackedTextureView(cmd_list, shader_hash, reg, space, view);
   }
 }
 
@@ -768,6 +2250,46 @@ bool TryGetResourceViewFromBoundDescriptorTable(
   return true;
 }
 
+bool TryGetBufferRangeFromBoundDescriptorTable(
+    reshade::api::device* device,
+    const reshade::api::descriptor_table& table,
+    const reshade::api::descriptor_range& range,
+    const uint32_t descriptor_index,
+    reshade::api::buffer_range* out_range) {
+  if (device == nullptr || out_range == nullptr) return false;
+  if (table.handle == 0u) return false;
+  if (range.count == UINT32_MAX) return false;
+  if (descriptor_index >= range.count) return false;
+
+  auto* descriptor_data = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
+  if (descriptor_data == nullptr) return false;
+
+  uint32_t base_offset = 0u;
+  reshade::api::descriptor_heap heap = {0u};
+  device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &base_offset);
+  if (heap.handle == 0u) return false;
+
+  const std::shared_lock lock(descriptor_data->mutex);
+
+  auto heap_pair = descriptor_data->heaps.find(heap.handle);
+  if (heap_pair == descriptor_data->heaps.end()) return false;
+
+  const uint32_t offset = base_offset + descriptor_index;
+  const auto& heap_entries = heap_pair->second;
+  if (offset >= heap_entries.size()) return false;
+
+  const auto& [descriptor_type, descriptor_value] = heap_entries[offset];
+  if (descriptor_type != reshade::api::descriptor_type::constant_buffer
+      && descriptor_type != reshade::api::descriptor_type::shader_storage_buffer) {
+    return false;
+  }
+
+  const auto buffer_range = std::get<reshade::api::buffer_range>(descriptor_value);
+  if (buffer_range.buffer.handle == 0u) return false;
+  *out_range = buffer_range;
+  return true;
+}
+
 void OnBindDescriptorTablesCaptureLightingTextures(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -775,6 +2297,7 @@ void OnBindDescriptorTablesCaptureLightingTextures(
     uint32_t first,
     uint32_t count,
     const reshade::api::descriptor_table* tables) {
+  if (g_skip_descriptor_capture) return;
   if (cmd_list == nullptr || tables == nullptr || count == 0u) return;
   if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) return;
 
@@ -815,6 +2338,7 @@ void OnBindDescriptorTablesCaptureLightingTextures(
         case reshade::api::descriptor_type::sampler_with_resource_view:
         case reshade::api::descriptor_type::buffer_shader_resource_view:
         case reshade::api::descriptor_type::texture_shader_resource_view:
+        case reshade::api::descriptor_type::constant_buffer:
           break;
         default:
           continue;
@@ -825,30 +2349,244 @@ void OnBindDescriptorTablesCaptureLightingTextures(
       }
 
       for (uint32_t k = 0; k < range.count; ++k) {
+        const uint32_t reg = range.dx_register_index + k;
+        if (range.type == reshade::api::descriptor_type::constant_buffer) {
+          reshade::api::buffer_range buffer_range = {};
+          if (!TryGetBufferRangeFromBoundDescriptorTable(device, table, range, k, &buffer_range)) continue;
+          CaptureTrackedConstantBuffer(cmd_list, shader_hash, reg, range.dx_register_space, buffer_range);
+          continue;
+        }
+
         reshade::api::resource_view view = {};
         if (!TryGetResourceViewFromBoundDescriptorTable(device, table, range, k, &view)) continue;
-        CaptureTrackedTextureView(shader_hash, range.dx_register_index + k, range.dx_register_space, view);
+        CaptureTrackedTextureView(cmd_list, shader_hash, reg, range.dx_register_space, view);
       }
     }
   }
 }
 
-bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
-  // Bind character shader's MRT texture to t10 so the lighting shader
-  // can read the character mask from it (the lighting shader's own t1
-  // may not contain the character flag bits).
+void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list, DeviceData* data) {
+  if (cmd_list == nullptr || data == nullptr) return;
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return;
+
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr) return;
+  const auto shader_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
+  if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return;
+
+  auto* state = renodx::utils::state::GetCurrentState(cmd_list);
+  if (state == nullptr) return;
+
+  auto required_inputs_captured = [data, device]() -> bool {
+    return IsViewAlive(device, data->captured_depth_srv)
+        && IsViewAlive(device, data->captured_ssao_srv)
+        && data->captured_scene_cbv_valid
+        && data->captured_scene_cbv_frame == data->present_frame_index
+        && data->captured_scene_cbv.buffer.handle != 0u;
+  };
+  auto optional_normal_input_captured = [data, device]() -> bool {
+    return IsViewAlive(device, data->captured_mrt_normal_srv);
+  };
+  if (required_inputs_captured() && optional_normal_input_captured()) return;
+
+  for (const auto& [stages, descriptor_state] : state->descriptor_tables) {
+    if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) continue;
+
+    const auto& [layout, tables] = descriptor_state;
+    if (layout.handle == 0u || tables.empty()) continue;
+
+    auto* layout_data = renodx::utils::pipeline_layout::GetPipelineLayoutData(layout);
+    if (layout_data == nullptr) continue;
+
+    for (uint32_t table_index = 0u; table_index < static_cast<uint32_t>(tables.size()); ++table_index) {
+      if (table_index >= layout_data->params.size()) break;
+      const auto& table = tables[table_index];
+      if (table.handle == 0u) continue;
+
+      const auto& param = layout_data->params.at(table_index);
+      uint32_t range_count = 0u;
+      const reshade::api::descriptor_range* ranges = nullptr;
+      if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table) {
+        range_count = param.descriptor_table.count;
+        ranges = param.descriptor_table.ranges;
+      } else if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
+        range_count = param.descriptor_table_with_static_samplers.count;
+        ranges = param.descriptor_table_with_static_samplers.ranges;
+      } else {
+        continue;
+      }
+      if (ranges == nullptr || range_count == 0u) continue;
+
+      for (uint32_t range_index = 0u; range_index < range_count; ++range_index) {
+        const auto& range = ranges[range_index];
+        if (range.count == UINT32_MAX) continue;
+        if ((static_cast<uint32_t>(range.visibility) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) continue;
+        if (range.dx_register_space != 0u) continue;
+
+        if (range.type == reshade::api::descriptor_type::constant_buffer) {
+          if ((!data->captured_scene_cbv_valid || data->captured_scene_cbv.buffer.handle == 0u)
+              && kLightingSceneCbRegister >= range.dx_register_index
+              && kLightingSceneCbRegister < (range.dx_register_index + range.count)) {
+            reshade::api::buffer_range cbv = {};
+            const uint32_t descriptor_index = kLightingSceneCbRegister - range.dx_register_index;
+            if (TryGetBufferRangeFromBoundDescriptorTable(device, table, range, descriptor_index, &cbv)
+                && IsSceneCbvCandidateValid(device, cbv)) {
+              data->captured_scene_cbv = cbv;
+              data->captured_scene_cbv_valid = true;
+              data->captured_scene_cbv_frame = data->present_frame_index;
+            }
+          }
+          continue;
+        }
+
+        if (range.type != reshade::api::descriptor_type::sampler_with_resource_view
+            && range.type != reshade::api::descriptor_type::buffer_shader_resource_view
+            && range.type != reshade::api::descriptor_type::texture_shader_resource_view) {
+          continue;
+        }
+
+        auto resolve_texture_register = [&](uint32_t reg, reshade::api::resource_view* out_view) {
+          if (out_view == nullptr) return;
+          if (IsViewAlive(device, *out_view)) return;
+          if (reg < range.dx_register_index || reg >= (range.dx_register_index + range.count)) return;
+          reshade::api::resource_view view = {};
+          const uint32_t descriptor_index = reg - range.dx_register_index;
+          if (TryGetResourceViewFromBoundDescriptorTable(device, table, range, descriptor_index, &view)) {
+            *out_view = view;
+          }
+        };
+        resolve_texture_register(kLightingDepthRegister, &data->captured_depth_srv);
+        resolve_texture_register(kLightingSsaoRegister, &data->captured_ssao_srv);
+        resolve_texture_register(kLightingMrtNormalRegister, &data->captured_mrt_normal_srv);
+      }
+
+      if (required_inputs_captured() && optional_normal_input_captured()) return;
+    }
+  }
+}
+
+void OnCharacterShaderDrawn(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return;
+  auto* device = cmd_list->get_device();
+  if (device == nullptr || !IsIsFastSupportedDevice(device)) return;
+
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+
+  auto* state = renodx::utils::state::GetCurrentState(cmd_list);
+  if (state == nullptr || state->render_targets.empty()) return;
+
+  const auto source_rtv = state->render_targets.at(0);
+  if (source_rtv.handle == 0u) return;
+  (void)UpdateCharacterSssCapture(device, data, source_rtv);
+}
+
+void OnAoFinalPassDrawn(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return;
+
+  auto* device = cmd_list->get_device();
+  if (device == nullptr || !IsIsFastSupportedDevice(device)) return;
+
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+}
+
+bool OnBeforeVanillaAoDraw(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return true;
+  auto* device = cmd_list->get_device();
+  if (device == nullptr || !IsIsFastSupportedDevice(device)) return true;
+  if (GetXeGTAOModeSetting() == XeGTAOMode::kOff) return true;
+  if (xegtao_skip_vanilla_ao >= 0.5f) {
+    auto* data = device->get_private_data<DeviceData>();
+    if (data != nullptr) {
+      if (data->last_skip_vanilla_ao_ignored_log_frame == kInvalidFrameIndex) {
+        data->last_skip_vanilla_ao_ignored_log_frame = data->present_frame_index;
+        reshade::log::message(
+            reshade::log::level::warning,
+            "XeGTAO: 'Skip Vanilla AO' is ignored while XeGTAO is active (AO.z remains the SSS source).");
+      }
+    }
+  }
+
+  // "Use Vanilla Z" SSS policy: AO.z must stay populated from vanilla AO.
+  return true;
+}
+
+bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return true;
+
+  shader_injection.sss_dedicated_bound = 0.f;
+  shader_injection.xegtao_dedicated_bound = 0.f;
+  shader_injection.xegtao_normal_input_mode = static_cast<float>(ClampXeGTAONormalInputMode());
+  shader_injection.xegtao_mrt_normal_valid = 0.f;
+  shader_injection.xegtao_bent_normals = xegtao_bent_normals >= 0.5f ? 1.f : 0.f;
+  shader_injection.xegtao_bent_diffuse_strength = std::clamp(xegtao_bent_diffuse_strength, 0.f, 1.f);
+  shader_injection.xegtao_bent_diffuse_softness = std::clamp(xegtao_bent_diffuse_softness, 0.02f, 0.35f);
+  shader_injection.xegtao_bent_specular_strength = std::clamp(xegtao_bent_specular_strength, 0.f, 1.f);
+  shader_injection.xegtao_bent_specular_proxy_roughness =
+      std::clamp(xegtao_bent_specular_proxy_roughness, 0.f, 1.f);
+  shader_injection.xegtao_bent_max_darkening = std::clamp(xegtao_bent_max_darkening, 0.f, 1.f);
+
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  const auto shader_hash = shader_state != nullptr
+      ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state)
+      : 0u;
+  if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return true;
+  const bool is_main_lighting_draw = shader_hash == kLightingShader;
+  const float resolved_xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 19.f);
+  shader_injection.xegtao_debug_mode = is_main_lighting_draw ? resolved_xegtao_debug_mode : 0.f;
+
+  auto* device = cmd_list->get_device();
+  if (device != nullptr && IsIsFastSupportedDevice(device)) {
+    auto* data = device->get_private_data<DeviceData>();
+    const auto mode = GetXeGTAOModeSetting();
+    if (data != nullptr && mode != XeGTAOMode::kOff) {
+      const uint64_t frame = data->present_frame_index;
+      bool has_result_this_frame = data->last_gtao_frame == frame;
+
+      if (!has_result_this_frame && is_main_lighting_draw) {
+        if (mode == XeGTAOMode::kLightingOverride) {
+          has_result_this_frame = RunXeGTAOForFrame(cmd_list, data, false);
+        }
+      }
+
+      const bool should_bind_xegtao_srv = has_result_this_frame;
+
+      if (should_bind_xegtao_srv && IsViewAlive(device, data->composite_srv)) {
+        shader_injection.xegtao_dedicated_bound = 1.f;
+        if (data->xegtao_mrt_normal_frame == frame && data->xegtao_mrt_normal_valid) {
+          shader_injection.xegtao_mrt_normal_valid = 1.f;
+        }
+        g_skip_descriptor_capture = true;
+        cmd_list->push_descriptors(
+            reshade::api::shader_stage::pixel,
+            reshade::api::pipeline_layout{0},
+            0,
+            reshade::api::descriptor_table_update{
+                {},
+                kLightingXeGtaoRegister,
+                0,
+                1,
+                reshade::api::descriptor_type::texture_shader_resource_view,
+                &data->composite_srv,
+            });
+        g_skip_descriptor_capture = false;
+      }
+    }
+  }
+
+  // Bind character shader's MRT texture to t10 so the lighting shader can read the
+  // character mask from it (the lighting shader's own t1 may not contain the bits).
   if (shader_injection.char_gi_enabled < 0.5f) return true;
 
   reshade::api::resource_view char_mrt0 = {g_character_mrt0_view.load(std::memory_order_relaxed)};
   if (char_mrt0.handle == 0u) {
     char_mrt0 = {g_lighting_mrt0_view.load(std::memory_order_relaxed)};
   }
-  if (char_mrt0.handle == 0u) return true;
+  if (!IsViewAlive(device, char_mrt0)) return true;
 
-  auto* info = renodx::utils::resource::GetResourceViewInfo(char_mrt0);
-  if (info == nullptr || info->destroyed) return true;
-
+  g_skip_descriptor_capture = true;
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
       reshade::api::pipeline_layout{0},
@@ -861,6 +2599,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           reshade::api::descriptor_type::texture_shader_resource_view,
           &char_mrt0,
       });
+  g_skip_descriptor_capture = false;
   return true;
 }
 
@@ -979,10 +2718,17 @@ void OnPresentAdvanceFrame(
     const reshade::api::rect* dest_rect,
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects) {
-  if (queue != nullptr && IsIsFastSupportedDevice(queue->get_device())) {
+  auto* device = queue != nullptr
+      ? queue->get_device()
+      : (swapchain != nullptr ? swapchain->get_device() : nullptr);
+  if (device != nullptr && IsIsFastSupportedDevice(device)) {
     const bool desired_fast_texture = isfast_texture_source_enabled >= 0.5f;
     if (desired_fast_texture != g_isfast_mode_use_fast_texture) {
-      ReloadIsFastResources(queue->get_device(), "settings_change");
+      ReloadIsFastResources(device, "settings_change");
+    }
+    auto* data = device->get_private_data<DeviceData>();
+    if (data != nullptr) {
+      data->present_frame_index += 1u;
     }
   }
   (void)swapchain;
@@ -1028,6 +2774,20 @@ void OnPresentAdvanceFrame(
     shader_injection.char_gi_ao_influence = 0.66f;
     shader_injection.char_gi_reject_strength = 8.0f;
   }
+
+  shader_injection.sss_dedicated_bound = 0.f;
+  shader_injection.xegtao_dedicated_bound = 0.f;
+  xegtao_mode = std::clamp(std::round(xegtao_mode), 0.f, 1.f);
+  shader_injection.xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 19.f);
+  shader_injection.xegtao_normal_input_mode = static_cast<float>(ClampXeGTAONormalInputMode());
+  shader_injection.xegtao_mrt_normal_valid = 0.f;
+  shader_injection.xegtao_bent_normals = xegtao_bent_normals >= 0.5f ? 1.f : 0.f;
+  shader_injection.xegtao_bent_diffuse_strength = std::clamp(xegtao_bent_diffuse_strength, 0.f, 1.f);
+  shader_injection.xegtao_bent_diffuse_softness = std::clamp(xegtao_bent_diffuse_softness, 0.02f, 0.35f);
+  shader_injection.xegtao_bent_specular_strength = std::clamp(xegtao_bent_specular_strength, 0.f, 1.f);
+  shader_injection.xegtao_bent_specular_proxy_roughness =
+      std::clamp(xegtao_bent_specular_proxy_roughness, 0.f, 1.f);
+  shader_injection.xegtao_bent_max_darkening = std::clamp(xegtao_bent_max_darkening, 0.f, 1.f);
 }
 
 bool IsAdvancedSettingsMode() {
@@ -1056,6 +2816,388 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Off disables all IS-FAST jitter features. On enables them.",
         .labels = {"Off", "On"},
         .is_global = true,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOMode",
+        .binding = &xegtao_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "XeGTAO",
+        .tooltip = "Enable or disable XeGTAO.",
+        .labels = {"Off", "On"},
+        .min = 0.f,
+        .max = 1.f,
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOQualityV2",
+        .binding = &xegtao_quality,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Quality",
+        .section = "XeGTAO",
+        .tooltip = "High, Very High, and Ultra only. Low/Medium were removed to avoid noisy output.",
+        .labels = {"High", "Very High", "Ultra"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOPrecision",
+        .binding = &xegtao_precision,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Depth Precision",
+        .section = "XeGTAO",
+        .tooltip = "Controls XeGTAO depth mip precision. Full precision improves stability at higher GPU cost.",
+        .labels = {"Depth R16", "Depth R32"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalInputMode",
+        .binding = &xegtao_normal_input_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Normal Input",
+        .section = "XeGTAO",
+        .tooltip = "Off uses depth-fallback normals. View-Transformed uses MRT normals transformed to view space.",
+        .labels = {"Off", "View-Transformed"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOBentNormals",
+        .binding = &xegtao_bent_normals,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bent Normals",
+        .section = "XeGTAO",
+        .tooltip = "Enables XeGTAO bent-normal shading on environment pixels.",
+        .labels = {"Off", "Env Only"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOBentDiffuseStrength",
+        .binding = &xegtao_bent_diffuse_strength,
+        .default_value = 0.35f,
+        .label = "Bent Diffuse Str",
+        .section = "XeGTAO",
+        .tooltip = "Strength of bent-normal directional diffuse shadowing.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOBentDiffuseSoftness",
+        .binding = &xegtao_bent_diffuse_softness,
+        .default_value = 0.15f,
+        .label = "Bent Diffuse Soft",
+        .section = "XeGTAO",
+        .tooltip = "Cosine-space transition width for bent diffuse shading.",
+        .min = 0.02f,
+        .max = 0.35f,
+        .format = "%.3f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOBentSpecularStrength",
+        .binding = &xegtao_bent_specular_strength,
+        .default_value = 0.25f,
+        .label = "Bent Specular Str",
+        .section = "XeGTAO",
+        .tooltip = "Strength of conservative bent-normal specular proxy attenuation.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOBentSpecularProxyRoughness",
+        .binding = &xegtao_bent_specular_proxy_roughness,
+        .default_value = 0.40f,
+        .label = "Bent Spec Proxy R",
+        .section = "XeGTAO",
+        .tooltip = "Roughness proxy used by conservative bent-normal specular attenuation.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOBentMaxDarkening",
+        .binding = &xegtao_bent_max_darkening,
+        .default_value = 0.35f,
+        .label = "Bent Max Dark",
+        .section = "XeGTAO",
+        .tooltip = "Caps maximum extra darkening from bent-normal modulation.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalInfluence",
+        .binding = &xegtao_normal_influence,
+        .default_value = 0.05f,
+        .label = "Normal Influence",
+        .section = "XeGTAO",
+        .tooltip = "Scales MRT normal XY contribution before blending.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalDepthBlend",
+        .binding = &xegtao_normal_depth_blend,
+        .default_value = 0.45f,
+        .label = "Normal-Depth Blend",
+        .section = "XeGTAO",
+        .tooltip = "0 uses depth fallback normals, 1 fully uses tuned MRT normals.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalSharpness",
+        .binding = &xegtao_normal_sharpness,
+        .default_value = 1.f,
+        .label = "Normal Sharpness",
+        .section = "XeGTAO",
+        .tooltip = "Shapes the normal-depth blend response; higher values sharpen MRT normal influence.",
+        .min = 0.5f,
+        .max = 2.5f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalEdgeRejection",
+        .binding = &xegtao_normal_edge_rejection,
+        .default_value = 1.f,
+        .label = "Normal Edge Reject",
+        .section = "XeGTAO",
+        .tooltip = "Suppresses MRT normal influence near depth edges to reduce halo artifacts.",
+        .min = 0.f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalZPreservation",
+        .binding = &xegtao_normal_z_preservation,
+        .default_value = 1.f,
+        .label = "Normal Z Preserve",
+        .section = "XeGTAO",
+        .tooltip = "Preserves or flattens MRT normal Z before blending into depth fallback normals.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalDetailResponse",
+        .binding = &xegtao_normal_detail_response,
+        .default_value = 4.f,
+        .label = "Normal Detail Resp",
+        .section = "XeGTAO",
+        .tooltip = "Controls how strongly MRT-vs-depth normal deltas boost blend weight.",
+        .min = 0.25f,
+        .max = 4.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalMaxDarkening",
+        .binding = &xegtao_normal_max_darkening,
+        .default_value = 0.6f,
+        .label = "Normal Max Dark",
+        .section = "XeGTAO",
+        .tooltip = "Limits how much additional darkening normal input can contribute.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAONormalDarkeningMode",
+        .binding = &xegtao_normal_darkening_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Normal Dark Mode",
+        .section = "XeGTAO",
+        .tooltip = "Fast clamps normal influence directly. Exact compares depth-only vs normal AO and clamps only extra darkening.",
+        .labels = {"Fast", "Exact"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_normal_input_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOSkipVanillaAO",
+        .binding = &xegtao_skip_vanilla_ao,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Skip Vanilla AO",
+        .section = "XeGTAO",
+        .tooltip =
+            "Visible for A/B only. Ignored while XeGTAO is active because AO.z remains the SSS source.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return xegtao_mode < 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAODenoisePasses",
+        .binding = &xegtao_denoise_pass_count,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Denoise Passes",
+        .section = "XeGTAO",
+        .tooltip = "0 to 3 denoise passes. 0 still runs the final resolve pass.",
+        .min = 0.f,
+        .max = 3.f,
+        .format = "%d",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAORadius",
+        .binding = &xegtao_radius,
+        .default_value = 0.5f,
+        .label = "Radius",
+        .section = "XeGTAO",
+        .min = 0.01f,
+        .max = 10.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOFalloffRange",
+        .binding = &xegtao_falloff_range,
+        .default_value = 0.615f,
+        .label = "Falloff Range",
+        .section = "XeGTAO",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.3f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAORadiusMultiplier",
+        .binding = &xegtao_radius_multiplier,
+        .default_value = 1.5f,
+        .label = "Radius Multiplier",
+        .section = "XeGTAO",
+        .min = 0.3f,
+        .max = 3.f,
+        .format = "%.3f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOFinalPower",
+        .binding = &xegtao_final_value_power,
+        .default_value = 2.2f,
+        .label = "Final Power",
+        .section = "XeGTAO",
+        .min = 0.5f,
+        .max = 5.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOSampleDistribution",
+        .binding = &xegtao_sample_distribution_power,
+        .default_value = 1.5f,
+        .label = "Sample Distribution",
+        .section = "XeGTAO",
+        .min = 1.f,
+        .max = 3.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOThinOccluderCompensation",
+        .binding = &xegtao_thin_occluder_compensation,
+        .default_value = 0.50f,
+        .label = "Thin Occluder Comp",
+        .section = "XeGTAO",
+        .min = 0.f,
+        .max = 0.7f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAODepthMipOffset",
+        .binding = &xegtao_depth_mip_sampling_offset,
+        .default_value = 3.3f,
+        .label = "Depth MIP Offset",
+        .section = "XeGTAO",
+        .min = 0.f,
+        .max = 30.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAODenoiseBlurBeta",
+        .binding = &xegtao_denoise_blur_beta,
+        .default_value = 8.f,
+        .label = "Denoise Blur Beta",
+        .section = "XeGTAO",
+        .min = 0.01f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAODebugMode",
+        .binding = &xegtao_debug_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Debug",
+        .section = "XeGTAO",
+        .labels = {
+            "00 Off",
+            "01 XeGTAO AO",
+            "02 Vanilla AO",
+            "03 AO Delta",
+            "04 XeGTAO RGB",
+            "05 Vanilla AO YZ",
+            "06 Depth Raw",
+            "07 Depth Edge",
+            "08 SSS Shadow",
+            "09 AO YZ Active",
+            "10 MRT Normal XY",
+            "11 MRT Normal Z",
+            "12 Selected Normal",
+            "13 Normal Length",
+            "14 Normal Source Mask",
+            "15 Pixel Class Mask",
+            "16 XeGTAO Bind Mask",
+            "17 AO X Source Compare",
+            "18 AO Live XYZ",
+            "19 AO Effective Proxy",
+        },
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "ShadowBaseSoftness",
@@ -1545,7 +3687,7 @@ renodx::utils::settings::Settings settings = {
       new renodx::utils::settings::Setting{
         .key = "FoliageSSSMaxDarkening",
         .binding = &shader_injection.foliage_sss_max_darkening,
-        .default_value = 0.50f,
+        .default_value = 0.40f,
         .label = "Max Darkening",
         .section = "Screen Space Shadows",
         .tooltip = "Limits how dark shadows can get. 1.0 = full darkening allowed, 0.0 = no darkening at all.",
@@ -2032,6 +4174,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresentAdvanceFrame);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCaptureLightingTextures);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTablesCaptureLightingTextures);
@@ -2049,6 +4193,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::present>(OnPresentAdvanceFrame);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCaptureLightingTextures);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTablesCaptureLightingTextures);
@@ -2060,6 +4206,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::utils::swapchain::Use(fdw_reason);
   renodx::utils::descriptor::trace_descriptor_tables = true;
   renodx::utils::descriptor::Use(fdw_reason);
+  renodx::utils::state::Use(fdw_reason);
   renodx::utils::settings::Use(fdw_reason, &settings);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 

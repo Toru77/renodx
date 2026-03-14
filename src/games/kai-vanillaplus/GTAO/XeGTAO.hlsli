@@ -191,7 +191,7 @@ uint XeGTAO_EncodeVisibilityBentNormal( lpfloat visibility, lpfloat3 bentNormal 
 void XeGTAO_DecodeVisibilityBentNormal( const uint packedValue, out lpfloat visibility, out lpfloat3 bentNormal )
 {
     lpfloat4 decoded = XeGTAO_R8G8B8A8_UNORM_to_FLOAT4( packedValue );
-    bentNormal = decoded.xyz * 2.0.xxx - 1.0.xxx;   // could normalize - don't want to since it's done so many times, better to do it at the final step only
+    bentNormal = decoded.xyz * lpfloat3( 2.0, 2.0, 2.0 ) - lpfloat3( 1.0, 1.0, 1.0 );   // could normalize - don't want to since it's done so many times, better to do it at the final step only
     visibility = decoded.w;
 }
 
@@ -245,7 +245,7 @@ lpfloat3x3 XeGTAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
 void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
     Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<unorm float> outWorkingEdges )
 {                                                                       
-    float2 normalizedScreenPos = (pixCoord + 0.5.xx) * consts.ViewportPixelSize;
+    float2 normalizedScreenPos = (pixCoord + float2( 0.5, 0.5 )) * consts.ViewportPixelSize;
 
     lpfloat4 valuesUL   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize )               );
     lpfloat4 valuesBR   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2( 1, 1 ) );
@@ -335,7 +335,7 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         const lpfloat pixelTooCloseThreshold  = 1.3;      // if the offset is under approx pixel size (pixelTooCloseThreshold), push it out to the minimum distance
 
         // approx viewspace pixel size at pixCoord; approximation of NDCToViewspace( normalizedScreenPos.xy + consts.ViewportPixelSize.xy, pixCenterPos.z ).xy - pixCenterPos.xy;
-        const float2 pixelDirRBViewspaceSizeAtCenterZ = viewspaceZ.xx * consts.NDCToViewMul_x_PixelSize;
+        const float2 pixelDirRBViewspaceSizeAtCenterZ = float2( viewspaceZ, viewspaceZ ) * consts.NDCToViewMul_x_PixelSize;
 
         lpfloat screenspaceRadius   = effectRadius / (lpfloat)pixelDirRBViewspaceSizeAtCenterZ.x;
 
@@ -638,7 +638,7 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
 
     // MIP 2
     [branch]
-    if( all( ( groupThreadID.xy % 2.xx ) == 0 ) )
+    if( all( ( groupThreadID.xy % uint2( 2, 2 ) ) == uint2( 0, 0 ) ) )
     {
         lpfloat inTL = g_scratchDepths[groupThreadID.x+0][groupThreadID.y+0];
         lpfloat inTR = g_scratchDepths[groupThreadID.x+1][groupThreadID.y+0];
@@ -654,7 +654,7 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
 
     // MIP 3
     [branch]
-    if( all( ( groupThreadID.xy % 4.xx ) == 0 ) )
+    if( all( ( groupThreadID.xy % uint2( 4, 4 ) ) == uint2( 0, 0 ) ) )
     {
         lpfloat inTL = g_scratchDepths[groupThreadID.x+0][groupThreadID.y+0];
         lpfloat inTR = g_scratchDepths[groupThreadID.x+2][groupThreadID.y+0];
@@ -670,7 +670,7 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
 
     // MIP 4
     [branch]
-    if( all( ( groupThreadID.xy % 8.xx ) == 0 ) )
+    if( all( ( groupThreadID.xy % uint2( 8, 8 ) ) == uint2( 0, 0 ) ) )
     {
         lpfloat inTL = g_scratchDepths[groupThreadID.x+0][groupThreadID.y+0];
         lpfloat inTR = g_scratchDepths[groupThreadID.x+4][groupThreadID.y+0];
@@ -771,7 +771,7 @@ void XeGTAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Textu
 
 #if 1   // this allows some small amount of AO leaking from neighbours if there are 3 or 4 edges; this reduces both spatial and temporal aliasing
         const lpfloat leak_threshold = 2.5; const lpfloat leak_strength = 0.5;
-        lpfloat edginess = (saturate(4.0 - leak_threshold - dot( edgesC_LRTB[side], 1.xxxx )) / (4-leak_threshold)) * leak_strength;
+        lpfloat edginess = (saturate(4.0 - leak_threshold - dot( edgesC_LRTB[side], lpfloat4( 1.0, 1.0, 1.0, 1.0 ) )) / (4-leak_threshold)) * leak_strength;
         edgesC_LRTB[side] = saturate( edgesC_LRTB[side] + edginess );
 #endif
 
@@ -829,7 +829,7 @@ void XeGTAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Textu
 // Generic viewspace normal generate pass
 float3 XeGTAO_ComputeViewspaceNormal( const uint2 pixCoord, const GTAOConstants consts, Texture2D<float> sourceNDCDepth, SamplerState depthSampler )
 {
-    float2 normalizedScreenPos = (pixCoord + 0.5.xx) * consts.ViewportPixelSize;
+    float2 normalizedScreenPos = (pixCoord + float2( 0.5, 0.5 )) * consts.ViewportPixelSize;
 
     float4 valuesUL   = sourceNDCDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize )               );
     float4 valuesBR   = sourceNDCDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2( 1, 1 ) );

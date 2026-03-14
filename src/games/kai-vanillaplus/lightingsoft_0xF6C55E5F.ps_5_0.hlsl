@@ -210,18 +210,85 @@ StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 StructuredBuffer<LightProbeParam> localLightProbes_g : register(t13);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
+Texture2D<float4> sssShadowTexture : register(t15);
 Texture2DArray<float4> shadowMaps : register(t16);
 TextureCube<float4> texEnvMap_g : register(t17);
 Texture2DArray<float4> spotShadowMaps : register(t18);
 Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
+Texture2D<float4> xegtaoTexture : register(t22);
 
 #include "./kai-vanillaplus.h"
 #include "./rendering.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
+
+float3 DecodeXeGTAOBentNormal(float2 packed_xy) {
+  float2 bent_xy = packed_xy * 2.0 + float2(-1.0, -1.0);
+  float bent_z = sqrt(saturate(1.0 - dot(bent_xy, bent_xy)));
+  float3 bent = float3(bent_xy, bent_z);
+  float len2 = dot(bent, bent);
+  return len2 > 1e-5 ? bent * rsqrt(len2) : float3(0.0, 0.0, 1.0);
+}
+
+float3 GetMainLightDirectionViewToLight() {
+  float3 light_dir_view;
+  light_dir_view.x = dot(lightDirection_g.xyz, view_g._m00_m10_m20);
+  light_dir_view.y = dot(lightDirection_g.xyz, view_g._m01_m11_m21);
+  light_dir_view.z = dot(lightDirection_g.xyz, view_g._m02_m12_m22);
+  float len2 = dot(light_dir_view, light_dir_view);
+  if (len2 <= 1e-5) return float3(0.0, 0.0, -1.0);
+  // lightDirection_g points from the light to the scene; invert to get direction TO light.
+  return -light_dir_view * rsqrt(len2);
+}
+
+float ApplyXeGTAOBentVisibility(float ao_visibility, float2 bent_payload_xy) {
+  float3 bent_normal = DecodeXeGTAOBentNormal(bent_payload_xy);
+  float3 light_dir_to_light = GetMainLightDirectionViewToLight();
+
+  float diffuse_strength = saturate(sss_injection_data.xegtao_bent_diffuse_strength);
+  float diffuse_softness = clamp(sss_injection_data.xegtao_bent_diffuse_softness, 0.02, 0.35);
+  float spec_strength = saturate(sss_injection_data.xegtao_bent_specular_strength);
+  float spec_proxy_roughness = saturate(sss_injection_data.xegtao_bent_specular_proxy_roughness);
+  float max_darkening = saturate(sss_injection_data.xegtao_bent_max_darkening);
+
+  float ao_clamped = saturate(ao_visibility);
+  float cos_cone = 1.0 - ao_clamped;
+  float cos_light = clamp(dot(bent_normal, light_dir_to_light), -1.0, 1.0);
+
+  // Directional diffuse visibility (cosine-space cone test).
+  float diffuse_vis = smoothstep(cos_cone - diffuse_softness, cos_cone + diffuse_softness, cos_light);
+  // Conservative specular proxy visibility (reflection-aware path intentionally not used).
+  float spec_threshold = lerp(cos_cone, -1.0, saturate(spec_proxy_roughness * spec_proxy_roughness));
+  float spec_vis = smoothstep(spec_threshold - 0.1, spec_threshold + 0.1, cos_light);
+
+  float bent_vis = lerp(1.0, diffuse_vis, diffuse_strength) * lerp(1.0, spec_vis, spec_strength);
+  float bent_cap = lerp(1.0 - max_darkening, 1.0, saturate(bent_vis));
+  return saturate(ao_visibility * bent_cap);
+}
+
+uint2 XeGTAODebugPixelCoord(float2 uv, uint width, uint height) {
+  width = max(width, 1u);
+  height = max(height, 1u);
+  float2 pixel_f = saturate(uv) * float2((float)width, (float)height);
+  return min((uint2)pixel_f, uint2(width - 1u, height - 1u));
+}
+
+float4 XeGTAODebugLoad4(Texture2D<float4> texture_obj, float2 uv) {
+  uint width, height;
+  texture_obj.GetDimensions(width, height);
+  uint2 pixel = XeGTAODebugPixelCoord(uv, width, height);
+  return texture_obj.Load(int3(pixel, 0));
+}
+
+float XeGTAODebugLoad1(Texture2D<float> texture_obj, float2 uv) {
+  uint width, height;
+  texture_obj.GetDimensions(width, height);
+  uint2 pixel = XeGTAODebugPixelCoord(uv, width, height);
+  return texture_obj.Load(int3(pixel, 0));
+}
 
 float2 ISFASTShadowSampleOffset(
     float sample_index,
@@ -285,13 +352,149 @@ void main(
   r3.xy = (int2)r3.xy;
   r3.zw = float2(0,0);
   r3.xyz = mrtTexture0.Load(r3.xyz).xyz;
-  r4.xyz = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
-  r0.w = (uint)r3.z >> 8;
-  // Detect foliage by vanilla mrtTexture0.z values (2303=0x8FF, 3327=0xCFF)
   uint mrt0z_raw = (uint)r3.z;
-  bool is_foliage_pixel = (mrt0z_raw == 2303u || mrt0z_raw == 3327u);
-  float foliage_saved_shadow = r4.z;                  // save shadow channel for foliage SSS
-  float3 foliage_debug_ssao = r4.xyz;                 // debug: full ssaoTexture sample
+  const bool is_character_pixel = ((mrt0z_raw >> 8u) & 1u) != 0u;
+  const bool is_foliage_pixel = (mrt0z_raw == 2303u || mrt0z_raw == 3327u);
+  const bool is_environment_pixel = !is_character_pixel && !is_foliage_pixel;
+  float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
+  const bool xegtao_bound = sss_injection_data.xegtao_dedicated_bound >= 0.5;
+  const bool xegtao_bent_normals_enabled = sss_injection_data.xegtao_bent_normals >= 0.5;
+  float3 xegtao_sample = ssao_sample;
+  if (xegtao_bound) {
+    xegtao_sample = xegtaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
+  }
+  float3 ao_sample = ssao_sample;
+  if (xegtao_bound) {
+    // XeGTAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
+    ao_sample.x = xegtao_sample.x;
+    if (xegtao_bent_normals_enabled && is_environment_pixel) {
+      ao_sample.x = ApplyXeGTAOBentVisibility(ao_sample.x, xegtao_sample.yz);
+    }
+  }
+  r4.xyz = ao_sample;
+  float sss_shadow_sample = saturate(ssao_sample.z);
+  if (sss_injection_data.sss_dedicated_bound >= 0.5) {
+    sss_shadow_sample = saturate(sssShadowTexture.SampleLevel(samLinear_s, v1.xy, 0).z);
+  }
+  uint xegtao_debug_mode_ui = (uint)round(max(sss_injection_data.xegtao_debug_mode, 0.0));
+  const bool run_xegtao_debug = xegtao_debug_mode_ui > 0u
+      && (xegtao_bound || xegtao_debug_mode_ui >= 10u);
+  if (run_xegtao_debug) {
+    if (is_character_pixel) {
+      o0 = float4(0.0, 0.0, 0.0, 1.0);
+      o1 = r1;
+      return;
+    }
+    float3 ssao_debug_sample = ssao_sample;
+    float3 xegtao_debug_source = xegtao_sample;
+    float sss_shadow_debug = sss_shadow_sample;
+    float depth_raw = saturate(r2.z);
+    if (xegtao_debug_mode_ui <= 9u) {
+      ssao_debug_sample = XeGTAODebugLoad4(ssaoTexture, v1.xy).xyz;
+      xegtao_debug_source = xegtao_bound ? XeGTAODebugLoad4(xegtaoTexture, v1.xy).xyz : ssao_debug_sample;
+      sss_shadow_debug = saturate(ssao_debug_sample.z);
+      if (sss_injection_data.sss_dedicated_bound >= 0.5) {
+        sss_shadow_debug = saturate(XeGTAODebugLoad4(sssShadowTexture, v1.xy).z);
+      }
+      depth_raw = saturate(XeGTAODebugLoad1(depthTexture, v1.xy));
+    }
+
+    const bool xegtao_effective_character_masked = xegtao_bound && !is_character_pixel;
+    float3 xegtao_debug_sample = xegtao_effective_character_masked ? xegtao_debug_source : ssao_debug_sample;
+    float3 ao_debug_sample = is_character_pixel ? ssao_debug_sample : ao_sample;
+    float xegtao_ao = saturate(xegtao_debug_sample.x);
+    float vanilla_ao = saturate(ssao_debug_sample.x);
+    float ao_delta = xegtao_ao - vanilla_ao;
+    float ao_delta_mag = saturate(abs(ao_delta) * 8.0);
+    float3 ao_delta_color = (ao_delta >= 0.0)
+        ? float3(ao_delta_mag, ao_delta_mag * 0.2, 0.0)
+        : float3(0.0, ao_delta_mag * 0.3, ao_delta_mag);
+    float depth_edge = saturate(length(float2(ddx(depth_raw), ddy(depth_raw))) * 800.0);
+    uint2 mrt_packed_xy = (uint2)r3.xy;
+    float2 mrt_encoded = mrt_packed_xy * float2(3.05180438e-05, 3.05180438e-05) + float2(-1.0, -1.0);
+    float mrt_angle = 3.14159274 * mrt_encoded.x;
+    float mrt_sin;
+    float mrt_cos;
+    sincos(mrt_angle, mrt_sin, mrt_cos);
+    float mrt_ring = sqrt(saturate(1.0 - mrt_encoded.y * mrt_encoded.y));
+    float3 mrt_normal_as_is = float3(mrt_cos * mrt_ring, mrt_sin * mrt_ring, mrt_encoded.y);
+    float mrt_as_is_len2 = max(dot(mrt_normal_as_is, mrt_normal_as_is), 1e-5);
+    mrt_normal_as_is *= rsqrt(mrt_as_is_len2);
+    float3 mrt_normal_view = mul((float3x3)view_g, mrt_normal_as_is);
+    float mrt_view_len2 = max(dot(mrt_normal_view, mrt_normal_view), 1e-5);
+    mrt_normal_view *= rsqrt(mrt_view_len2);
+    const bool mrt_use_transform = sss_injection_data.xegtao_normal_input_mode >= 0.5;
+    float3 selected_mrt_normal = mrt_use_transform ? mrt_normal_view : mrt_normal_as_is;
+    float selected_normal_length = sqrt(max(dot(selected_mrt_normal, selected_mrt_normal), 0.0));
+    float reconstructed_z = sqrt(saturate(1.0 - dot(mrt_normal_as_is.xy, mrt_normal_as_is.xy)));
+    const bool mrt_source_valid = sss_injection_data.xegtao_mrt_normal_valid >= 0.5;
+    bool env_pixel = is_environment_pixel;
+
+    float3 debug_color = xegtao_ao.xxx;
+    if (xegtao_debug_mode_ui == 1u) {
+      debug_color = xegtao_ao.xxx;
+    } else if (xegtao_debug_mode_ui == 2u) {
+      debug_color = vanilla_ao.xxx;
+    } else if (xegtao_debug_mode_ui == 3u) {
+      debug_color = ao_delta_color;
+    } else if (xegtao_debug_mode_ui == 4u) {
+      debug_color = saturate(xegtao_debug_sample);
+    } else if (xegtao_debug_mode_ui == 5u) {
+      debug_color = float3(0.0, saturate(ssao_debug_sample.y), saturate(ssao_debug_sample.z));
+    } else if (xegtao_debug_mode_ui == 6u) {
+      debug_color = depth_raw.xxx;
+    } else if (xegtao_debug_mode_ui == 7u) {
+      debug_color = depth_edge.xxx;
+    } else if (xegtao_debug_mode_ui == 8u) {
+      debug_color = sss_shadow_debug.xxx;
+    } else if (xegtao_debug_mode_ui == 9u) {
+      debug_color = float3(0.0, saturate(ao_sample.y), saturate(ao_sample.z));
+    } else if (xegtao_debug_mode_ui == 10u) {
+      debug_color = float3(mrt_normal_as_is.x * 0.5 + 0.5, mrt_normal_as_is.y * 0.5 + 0.5, 0.5);
+    } else if (xegtao_debug_mode_ui == 11u) {
+      debug_color = float3(mrt_normal_as_is.z * 0.5 + 0.5, reconstructed_z, 0.0);
+    } else if (xegtao_debug_mode_ui == 12u) {
+      debug_color = saturate(selected_mrt_normal * 0.5 + 0.5);
+    } else if (xegtao_debug_mode_ui == 13u) {
+      debug_color = saturate(selected_normal_length).xxx;
+    } else if (xegtao_debug_mode_ui == 14u) {
+      if (!xegtao_bound || !mrt_source_valid) {
+        debug_color = float3(0.0, 0.0, 1.0);
+      } else if (mrt_use_transform) {
+        debug_color = float3(0.0, 1.0, 0.0);
+      } else {
+        debug_color = float3(1.0, 0.0, 0.0);
+      }
+    } else if (xegtao_debug_mode_ui == 15u) {
+      debug_color = float3(
+          is_character_pixel ? 1.0 : 0.0,
+          is_foliage_pixel ? 1.0 : 0.0,
+          env_pixel ? 1.0 : 0.0);
+    } else if (xegtao_debug_mode_ui == 16u) {
+      if (!xegtao_bound) {
+        debug_color = float3(0.0, 0.0, 1.0);
+      } else if (mrt_source_valid) {
+        debug_color = float3(1.0, 1.0, 1.0);
+      } else {
+        debug_color = float3(0.0, 1.0, 1.0);
+      }
+    } else if (xegtao_debug_mode_ui == 17u) {
+      debug_color = float3(xegtao_ao, vanilla_ao, ao_delta_mag);
+    } else if (xegtao_debug_mode_ui == 18u) {
+      debug_color = saturate(ao_debug_sample);
+    } else if (xegtao_debug_mode_ui == 19u) {
+      float ao_effective = saturate(max(ao_debug_sample.x, ao_debug_sample.y * sss_shadow_sample));
+      debug_color = ao_effective.xxx;
+    }
+
+    o0 = float4(debug_color, 1.0);
+    o1 = r1;
+    return;
+  }
+  r0.w = (uint)r3.z >> 8;
+  // mrt0z_raw/is_foliage_pixel are decoded above and reused below.
+  float foliage_saved_shadow = sss_shadow_sample;     // active SSS source (vanilla AO.z policy)
+  float3 foliage_debug_ssao = ssao_sample;            // debug: full ssaoTexture sample
   float foliage_debug_mrt0z = r3.z;                   // debug: raw mrtTexture0.z value
   r3.xy = (uint2)r3.xy;
   r5.zw = r3.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
@@ -319,7 +522,7 @@ void main(
       r7.x = r0.x;
       r7.yz = float2(0.00392156886,0.00392156886);
       r8.xyz = r7.xyz * r6.xyz;
-      r3.x = r4.y * r4.z;
+      r3.x = r4.y * sss_shadow_sample;
       r4.yzw = -r7.xyz * r6.xyz + r0.xyz;
       r4.yzw = r3.xxx * r4.yzw + r8.xyz;
       r3.x = (int)r0.w & 4;
@@ -714,7 +917,7 @@ void main(
   float4 chargi_ssgi_saved = r15;
   // Use mrt0z_raw from mrtTexture0 (t1) which already has the character bit
   bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
-  float chargi_ao_raw = saturate(max(r4.x, r4.y * r4.z));
+  float chargi_ao_raw = saturate(max(r4.x, r4.y * sss_shadow_sample));
   float chargi_depth_center = max(r2.z, 1e-6);
   bool shadow_use_jitter = sss_injection_data.shadow_pcss_jitter_enabled >= 0.5;
   float shadow_jitter_amount = saturate(sss_injection_data.shadow_isfast_jitter_amount);
