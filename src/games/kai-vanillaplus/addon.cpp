@@ -351,6 +351,12 @@ enum class XeGTAOPrecision : uint32_t {
   kFull = 1u,
 };
 
+enum class XeGTAOSceneCbvSource : uint32_t {
+  kNone = 0u,
+  kCurrentLighting = 1u,
+  kFallback = 2u,
+};
+
 struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::resource_view captured_mrt_normal_srv = {};
   reshade::api::resource_view captured_depth_srv = {};
@@ -358,6 +364,8 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::buffer_range captured_scene_cbv = {};
   bool captured_scene_cbv_valid = false;
   uint64_t captured_scene_cbv_frame = kInvalidFrameIndex;
+  XeGTAOSceneCbvSource captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  bool resolved_scene_cbv_from_current_bindings = false;
   reshade::api::buffer_range fallback_scene_cbv = {};
   bool fallback_scene_cbv_seen = false;
   uint64_t fallback_scene_cbv_frame = kInvalidFrameIndex;
@@ -417,6 +425,32 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint64_t xegtao_mrt_normal_frame = kInvalidFrameIndex;
   bool xegtao_mrt_normal_valid = false;
   bool copyback_succeeded = false;
+  bool last_gate_state_valid = false;
+  bool last_gate_passed = false;
+  uint64_t last_gate_diag_hash = 0u;
+
+  uint64_t xegtao_warmup_signature = 0u;
+  uint32_t xegtao_warmup_stable_count = 0u;
+  uint64_t last_warmup_enter_signature = 0u;
+  uint64_t last_warmup_complete_signature = 0u;
+
+  uint64_t last_capture_diag_log_frame = kInvalidFrameIndex;
+  uint64_t last_logged_depth_view_handle = 0u;
+  uint64_t last_logged_ssao_view_handle = 0u;
+  uint32_t last_logged_depth_width = 0u;
+  uint32_t last_logged_depth_height = 0u;
+  uint32_t last_logged_ssao_width = 0u;
+  uint32_t last_logged_ssao_height = 0u;
+  reshade::api::format last_logged_depth_view_format = reshade::api::format::unknown;
+  reshade::api::format last_logged_depth_resource_format = reshade::api::format::unknown;
+  reshade::api::format last_logged_ssao_view_format = reshade::api::format::unknown;
+  reshade::api::format last_logged_ssao_resource_format = reshade::api::format::unknown;
+  XeGTAOSceneCbvSource last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  uint64_t last_logged_scene_cbv_buffer_handle = 0u;
+  bool last_logged_scene_cbv_valid = false;
+  bool last_logged_fallback_scene_cbv_seen = false;
+  uint64_t last_logged_fallback_scene_cbv_buffer_handle = 0u;
+  uint64_t last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
 };
 
 #pragma pack(push, 1)
@@ -715,7 +749,17 @@ void OnInitDevice(reshade::api::device* device) {
     data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
     data->xegtao_mrt_normal_valid = false;
     data->copyback_succeeded = false;
+    data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+    data->resolved_scene_cbv_from_current_bindings = false;
     data->character_sss_current_frame = kInvalidFrameIndex;
+    data->last_capture_diag_log_frame = kInvalidFrameIndex;
+    data->last_gate_state_valid = false;
+    data->last_gate_passed = false;
+    data->last_gate_diag_hash = 0u;
+    data->xegtao_warmup_signature = 0u;
+    data->xegtao_warmup_stable_count = 0u;
+    data->last_warmup_enter_signature = 0u;
+    data->last_warmup_complete_signature = 0u;
   }
   ReloadIsFastResources(device, "init_device");
 }
@@ -749,6 +793,32 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_mrt_normal_valid = false;
   data->character_sss_current_frame = kInvalidFrameIndex;
   data->copyback_succeeded = false;
+  data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->resolved_scene_cbv_from_current_bindings = false;
+  data->last_capture_diag_log_frame = kInvalidFrameIndex;
+  data->last_gate_state_valid = false;
+  data->last_gate_passed = false;
+  data->last_gate_diag_hash = 0u;
+  data->xegtao_warmup_signature = 0u;
+  data->xegtao_warmup_stable_count = 0u;
+  data->last_warmup_enter_signature = 0u;
+  data->last_warmup_complete_signature = 0u;
+  data->last_logged_depth_view_handle = 0u;
+  data->last_logged_ssao_view_handle = 0u;
+  data->last_logged_depth_width = 0u;
+  data->last_logged_depth_height = 0u;
+  data->last_logged_ssao_width = 0u;
+  data->last_logged_ssao_height = 0u;
+  data->last_logged_depth_view_format = reshade::api::format::unknown;
+  data->last_logged_depth_resource_format = reshade::api::format::unknown;
+  data->last_logged_ssao_view_format = reshade::api::format::unknown;
+  data->last_logged_ssao_resource_format = reshade::api::format::unknown;
+  data->last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->last_logged_scene_cbv_buffer_handle = 0u;
+  data->last_logged_scene_cbv_valid = false;
+  data->last_logged_fallback_scene_cbv_seen = false;
+  data->last_logged_fallback_scene_cbv_buffer_handle = 0u;
+  data->last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
 }
 
 void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
@@ -761,6 +831,22 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   DestroyXeGTAOResources(device, data);
   DestroyDedicatedSssViews(device, data);
   data->captured_mrt_normal_srv = {};
+  data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->resolved_scene_cbv_from_current_bindings = false;
+  data->last_capture_diag_log_frame = kInvalidFrameIndex;
+  data->last_gate_state_valid = false;
+  data->last_gate_passed = false;
+  data->last_gate_diag_hash = 0u;
+  data->xegtao_warmup_signature = 0u;
+  data->xegtao_warmup_stable_count = 0u;
+  data->last_warmup_enter_signature = 0u;
+  data->last_warmup_complete_signature = 0u;
+  data->last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->last_logged_scene_cbv_buffer_handle = 0u;
+  data->last_logged_scene_cbv_valid = false;
+  data->last_logged_fallback_scene_cbv_seen = false;
+  data->last_logged_fallback_scene_cbv_buffer_handle = 0u;
+  data->last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
 }
 
 void ReloadIsFastResources(reshade::api::device* device, const char* reason) {
@@ -878,6 +964,373 @@ bool IsViewAlive(reshade::api::device* device, const reshade::api::resource_view
   return device->get_resource_from_view(view).handle != 0u;
 }
 
+struct XeGTAOCapturedViewInfo {
+  reshade::api::resource_view view = {};
+  reshade::api::resource resource = {};
+  reshade::api::resource_desc resource_desc = {};
+  reshade::api::resource_view_desc view_desc = {};
+  bool alive = false;
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+};
+
+XeGTAOCapturedViewInfo GetXeGTAOCapturedViewInfo(
+    reshade::api::device* device,
+    reshade::api::resource_view view) {
+  XeGTAOCapturedViewInfo info = {};
+  info.view = view;
+  if (device == nullptr || view.handle == 0u) return info;
+
+  info.resource = device->get_resource_from_view(view);
+  if (info.resource.handle == 0u) return info;
+
+  info.alive = true;
+  info.resource_desc = device->get_resource_desc(info.resource);
+  info.view_desc = device->get_resource_view_desc(view);
+  if (info.resource_desc.type == reshade::api::resource_type::texture_2d) {
+    info.width = info.resource_desc.texture.width;
+    info.height = info.resource_desc.texture.height;
+  }
+  return info;
+}
+
+std::string FormatXeGTAOCapturedViewInfo(const char* label, const XeGTAOCapturedViewInfo& info) {
+  std::ostringstream stream;
+  stream << label << "(view=0x" << std::hex << info.view.handle << std::dec;
+  if (!info.alive) {
+    stream << ", alive=0)";
+    return stream.str();
+  }
+
+  const auto resource_format = info.resource_desc.type == reshade::api::resource_type::texture_2d
+      ? info.resource_desc.texture.format
+      : reshade::api::format::unknown;
+  auto view_format = info.view_desc.format;
+  if (view_format == reshade::api::format::unknown && resource_format != reshade::api::format::unknown) {
+    view_format = reshade::api::format_to_default_typed(resource_format);
+  }
+
+  stream << ", alive=1";
+  stream << ", res=0x" << std::hex << info.resource.handle << std::dec;
+  stream << ", type=" << static_cast<uint32_t>(info.resource_desc.type);
+  if (info.width != 0u || info.height != 0u) {
+    stream << ", size=" << info.width << "x" << info.height;
+  }
+  stream << ", view_fmt=" << static_cast<uint32_t>(view_format);
+  stream << ", res_fmt=" << static_cast<uint32_t>(resource_format);
+  stream << ")";
+  return stream.str();
+}
+
+const char* GetXeGTAOSceneCbvSourceName(XeGTAOSceneCbvSource source) {
+  switch (source) {
+    case XeGTAOSceneCbvSource::kCurrentLighting:
+      return "current_lighting";
+    case XeGTAOSceneCbvSource::kFallback:
+      return "fallback";
+    default:
+      return "none";
+  }
+}
+
+std::string FormatXeGTAOSceneCbvInfo(const DeviceData* data) {
+  if (data == nullptr) return "b0(source=none, valid=0)";
+  std::ostringstream stream;
+  stream << "b0(source=" << GetXeGTAOSceneCbvSourceName(data->captured_scene_cbv_source)
+         << ", valid=" << (data->captured_scene_cbv_valid ? 1 : 0);
+  if (data->captured_scene_cbv_valid && data->captured_scene_cbv.buffer.handle != 0u) {
+    stream << ", buffer=0x" << std::hex << data->captured_scene_cbv.buffer.handle << std::dec
+           << ", offset=" << data->captured_scene_cbv.offset
+           << ", size=" << data->captured_scene_cbv.size
+           << ", frame=" << data->captured_scene_cbv_frame;
+  }
+  stream << ")";
+  return stream.str();
+}
+
+uint32_t RoundToUint(float value) {
+  const float positive = std::max(0.0f, value);
+  return static_cast<uint32_t>(positive + 0.5f);
+}
+
+uint64_t HashCombineU64(uint64_t seed, uint64_t value) {
+  seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u);
+  return seed;
+}
+
+uint64_t HashString(const std::string& value) {
+  uint64_t seed = 1469598103934665603ull;
+  for (const char c : value) {
+    seed ^= static_cast<uint8_t>(c);
+    seed *= 1099511628211ull;
+  }
+  return seed;
+}
+
+uint32_t AbsDiffU32(uint32_t a, uint32_t b) {
+  return a > b ? (a - b) : (b - a);
+}
+
+bool IsCloseWithinOnePixel(uint32_t a, uint32_t b) {
+  return AbsDiffU32(a, b) <= 1u;
+}
+
+const char* ClassifyXeGTAOT4ScaleClass(
+    uint32_t viewport_width,
+    uint32_t viewport_height,
+    uint32_t t4_width,
+    uint32_t t4_height) {
+  if (viewport_width == 0u || viewport_height == 0u || t4_width == 0u || t4_height == 0u) return "invalid";
+
+  if (IsCloseWithinOnePixel(t4_width, viewport_width) && IsCloseWithinOnePixel(t4_height, viewport_height)) {
+    return "1x";
+  }
+
+  const uint32_t half_width = RoundToUint(static_cast<float>(viewport_width) * 0.5f);
+  const uint32_t half_height = RoundToUint(static_cast<float>(viewport_height) * 0.5f);
+  if (IsCloseWithinOnePixel(t4_width, half_width) && IsCloseWithinOnePixel(t4_height, half_height)) {
+    return "1/2";
+  }
+
+  const uint32_t quarter_width = RoundToUint(static_cast<float>(viewport_width) * 0.25f);
+  const uint32_t quarter_height = RoundToUint(static_cast<float>(viewport_height) * 0.25f);
+  if (IsCloseWithinOnePixel(t4_width, quarter_width) && IsCloseWithinOnePixel(t4_height, quarter_height)) {
+    return "1/4";
+  }
+
+  return "invalid";
+}
+
+uint32_t GetXeGTAOT4ScaleClassCode(const char* scale_class) {
+  if (scale_class == nullptr) return 0u;
+  if (std::strcmp(scale_class, "1x") == 0) return 1u;
+  if (std::strcmp(scale_class, "1/2") == 0) return 2u;
+  if (std::strcmp(scale_class, "1/4") == 0) return 4u;
+  return 0u;
+}
+
+bool EvaluateXeGTAODrawCandidate(
+    reshade::api::command_list* cmd_list,
+    DeviceData* data,
+    std::string* out_reason,
+    std::string* out_diag,
+    uint64_t* out_signature) {
+  if (out_reason != nullptr) out_reason->clear();
+  if (out_diag != nullptr) out_diag->clear();
+  if (out_signature != nullptr) *out_signature = 0u;
+  if (cmd_list == nullptr || data == nullptr) {
+    if (out_reason != nullptr) *out_reason = "command list or device data is null";
+    return false;
+  }
+
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) {
+    if (out_reason != nullptr) *out_reason = "device is null";
+    return false;
+  }
+
+  auto* state = renodx::utils::state::GetCurrentState(cmd_list);
+  if (state == nullptr) {
+    if (out_reason != nullptr) *out_reason = "state is unavailable";
+    return false;
+  }
+  if (state->viewports.empty()) {
+    if (out_reason != nullptr) *out_reason = "viewport is unavailable";
+    return false;
+  }
+  if (state->render_targets.empty() || state->render_targets.at(0).handle == 0u) {
+    if (out_reason != nullptr) *out_reason = "RTV0 is unavailable";
+    return false;
+  }
+
+  ResolveXeGTAOInputsFromCurrentBindings(cmd_list, data);
+
+  const auto depth_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
+  const auto ssao_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+  const auto rtv_info = GetXeGTAOCapturedViewInfo(device, state->render_targets.at(0));
+  const auto viewport = state->viewports.at(0);
+  const uint32_t viewport_width = RoundToUint(viewport.width);
+  const uint32_t viewport_height = RoundToUint(viewport.height);
+  const char* t4_scale_class = ClassifyXeGTAOT4ScaleClass(
+      viewport_width, viewport_height, ssao_info.width, ssao_info.height);
+
+  if (!depth_info.alive || depth_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    if (out_reason != nullptr) *out_reason = "t3 depth is missing or not texture2D";
+  } else if (!ssao_info.alive || ssao_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    if (out_reason != nullptr) *out_reason = "t4 AO is missing or not texture2D";
+  } else if (!rtv_info.alive || rtv_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    if (out_reason != nullptr) *out_reason = "RTV0 is missing or not texture2D";
+  } else if (viewport_width == 0u || viewport_height == 0u) {
+    if (out_reason != nullptr) *out_reason = "viewport size is zero";
+  } else if (!IsCloseWithinOnePixel(viewport_width, depth_info.width)
+      || !IsCloseWithinOnePixel(viewport_height, depth_info.height)
+      || !IsCloseWithinOnePixel(viewport_width, rtv_info.width)
+      || !IsCloseWithinOnePixel(viewport_height, rtv_info.height)) {
+    if (out_reason != nullptr) *out_reason = "viewport/RTV/t3 dimensions do not match";
+  } else if (std::strcmp(t4_scale_class, "invalid") == 0) {
+    if (out_reason != nullptr) *out_reason = "t4 ratio not allowed";
+  } else {
+    if (out_signature != nullptr) {
+      uint64_t signature = 1469598103934665603ull;
+      signature = HashCombineU64(signature, viewport_width);
+      signature = HashCombineU64(signature, viewport_height);
+      signature = HashCombineU64(signature, rtv_info.view.handle);
+      signature = HashCombineU64(signature, rtv_info.width);
+      signature = HashCombineU64(signature, rtv_info.height);
+      signature = HashCombineU64(signature, depth_info.view.handle);
+      signature = HashCombineU64(signature, depth_info.width);
+      signature = HashCombineU64(signature, depth_info.height);
+      signature = HashCombineU64(signature, ssao_info.view.handle);
+      signature = HashCombineU64(signature, ssao_info.width);
+      signature = HashCombineU64(signature, ssao_info.height);
+      signature = HashCombineU64(signature, GetXeGTAOT4ScaleClassCode(t4_scale_class));
+      *out_signature = signature;
+    }
+    if (out_diag != nullptr) {
+      std::ostringstream diag;
+      diag << "viewport=" << viewport_width << "x" << viewport_height
+           << ", rtv0=" << rtv_info.width << "x" << rtv_info.height
+           << ", t3=" << depth_info.width << "x" << depth_info.height
+           << ", t4=" << ssao_info.width << "x" << ssao_info.height
+           << ", t4_scale_class=" << t4_scale_class;
+      *out_diag = diag.str();
+    }
+    return true;
+  }
+
+  if (out_diag != nullptr) {
+    std::ostringstream diag;
+    diag << "viewport=" << viewport_width << "x" << viewport_height
+         << ", rtv0=" << rtv_info.width << "x" << rtv_info.height
+         << ", t3=" << depth_info.width << "x" << depth_info.height
+         << ", t4=" << ssao_info.width << "x" << ssao_info.height
+         << ", t4_scale_class=" << t4_scale_class;
+    *out_diag = diag.str();
+  }
+
+  return false;
+}
+
+void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return;
+  if (data->last_capture_diag_log_frame == data->present_frame_index) return;
+
+  const auto depth_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
+  const auto ssao_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+  const auto depth_resource_format = depth_info.resource_desc.type == reshade::api::resource_type::texture_2d
+      ? depth_info.resource_desc.texture.format
+      : reshade::api::format::unknown;
+  const auto ssao_resource_format = ssao_info.resource_desc.type == reshade::api::resource_type::texture_2d
+      ? ssao_info.resource_desc.texture.format
+      : reshade::api::format::unknown;
+  auto depth_view_format = depth_info.view_desc.format;
+  if (depth_view_format == reshade::api::format::unknown && depth_resource_format != reshade::api::format::unknown) {
+    depth_view_format = reshade::api::format_to_default_typed(depth_resource_format);
+  }
+  auto ssao_view_format = ssao_info.view_desc.format;
+  if (ssao_view_format == reshade::api::format::unknown && ssao_resource_format != reshade::api::format::unknown) {
+    ssao_view_format = reshade::api::format_to_default_typed(ssao_resource_format);
+  }
+
+  const bool depth_transition =
+      data->last_logged_depth_view_handle != depth_info.view.handle
+      || data->last_logged_depth_width != depth_info.width
+      || data->last_logged_depth_height != depth_info.height
+      || data->last_logged_depth_view_format != depth_view_format
+      || data->last_logged_depth_resource_format != depth_resource_format;
+  if (depth_transition) {
+    std::ostringstream message;
+    message << "XeGTAO capture transition t3: "
+            << "view 0x" << std::hex << data->last_logged_depth_view_handle
+            << " -> 0x" << depth_info.view.handle << std::dec
+            << ", size " << data->last_logged_depth_width << "x" << data->last_logged_depth_height
+            << " -> " << depth_info.width << "x" << depth_info.height
+            << ", view_fmt " << static_cast<uint32_t>(data->last_logged_depth_view_format)
+            << " -> " << static_cast<uint32_t>(depth_view_format)
+            << ", res_fmt " << static_cast<uint32_t>(data->last_logged_depth_resource_format)
+            << " -> " << static_cast<uint32_t>(depth_resource_format);
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+
+  const bool ssao_transition =
+      data->last_logged_ssao_view_handle != ssao_info.view.handle
+      || data->last_logged_ssao_width != ssao_info.width
+      || data->last_logged_ssao_height != ssao_info.height
+      || data->last_logged_ssao_view_format != ssao_view_format
+      || data->last_logged_ssao_resource_format != ssao_resource_format;
+  if (ssao_transition) {
+    std::ostringstream message;
+    message << "XeGTAO capture transition t4: "
+            << "view 0x" << std::hex << data->last_logged_ssao_view_handle
+            << " -> 0x" << ssao_info.view.handle << std::dec
+            << ", size " << data->last_logged_ssao_width << "x" << data->last_logged_ssao_height
+            << " -> " << ssao_info.width << "x" << ssao_info.height
+            << ", view_fmt " << static_cast<uint32_t>(data->last_logged_ssao_view_format)
+            << " -> " << static_cast<uint32_t>(ssao_view_format)
+            << ", res_fmt " << static_cast<uint32_t>(data->last_logged_ssao_resource_format)
+            << " -> " << static_cast<uint32_t>(ssao_resource_format);
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+
+  const bool scene_cbv_valid = data->captured_scene_cbv_valid && data->captured_scene_cbv.buffer.handle != 0u;
+  const uint64_t scene_cbv_handle = scene_cbv_valid ? data->captured_scene_cbv.buffer.handle : 0u;
+  const bool scene_cbv_transition =
+      data->last_logged_scene_cbv_source != data->captured_scene_cbv_source
+      || data->last_logged_scene_cbv_valid != scene_cbv_valid
+      || data->last_logged_scene_cbv_buffer_handle != scene_cbv_handle;
+  if (scene_cbv_transition) {
+    std::ostringstream message;
+    message << "XeGTAO capture transition b0: source "
+            << GetXeGTAOSceneCbvSourceName(data->last_logged_scene_cbv_source)
+            << " -> " << GetXeGTAOSceneCbvSourceName(data->captured_scene_cbv_source)
+            << ", valid " << static_cast<uint32_t>(data->last_logged_scene_cbv_valid ? 1u : 0u)
+            << " -> " << static_cast<uint32_t>(scene_cbv_valid ? 1u : 0u)
+            << ", buffer 0x" << std::hex << data->last_logged_scene_cbv_buffer_handle
+            << " -> 0x" << scene_cbv_handle << std::dec;
+    if (scene_cbv_valid) {
+      message << ", frame=" << data->captured_scene_cbv_frame;
+    }
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+
+  const bool fallback_scene_cbv_seen = data->fallback_scene_cbv_seen && data->fallback_scene_cbv.buffer.handle != 0u;
+  const uint64_t fallback_scene_cbv_handle = fallback_scene_cbv_seen ? data->fallback_scene_cbv.buffer.handle : 0u;
+  const uint64_t fallback_scene_cbv_frame = fallback_scene_cbv_seen ? data->fallback_scene_cbv_frame : kInvalidFrameIndex;
+  const bool fallback_scene_cbv_transition =
+      data->last_logged_fallback_scene_cbv_seen != fallback_scene_cbv_seen
+      || data->last_logged_fallback_scene_cbv_buffer_handle != fallback_scene_cbv_handle;
+  if (fallback_scene_cbv_transition) {
+    std::ostringstream message;
+    message << "XeGTAO fallback b0 transition: seen "
+            << static_cast<uint32_t>(data->last_logged_fallback_scene_cbv_seen ? 1u : 0u)
+            << " -> " << static_cast<uint32_t>(fallback_scene_cbv_seen ? 1u : 0u)
+            << ", buffer 0x" << std::hex << data->last_logged_fallback_scene_cbv_buffer_handle
+            << " -> 0x" << fallback_scene_cbv_handle << std::dec;
+    if (fallback_scene_cbv_seen) {
+      message << ", last_seen_frame=" << fallback_scene_cbv_frame;
+    }
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+
+  data->last_capture_diag_log_frame = data->present_frame_index;
+  data->last_logged_depth_view_handle = depth_info.view.handle;
+  data->last_logged_depth_width = depth_info.width;
+  data->last_logged_depth_height = depth_info.height;
+  data->last_logged_depth_view_format = depth_view_format;
+  data->last_logged_depth_resource_format = depth_resource_format;
+  data->last_logged_ssao_view_handle = ssao_info.view.handle;
+  data->last_logged_ssao_width = ssao_info.width;
+  data->last_logged_ssao_height = ssao_info.height;
+  data->last_logged_ssao_view_format = ssao_view_format;
+  data->last_logged_ssao_resource_format = ssao_resource_format;
+  data->last_logged_scene_cbv_source = data->captured_scene_cbv_source;
+  data->last_logged_scene_cbv_buffer_handle = scene_cbv_handle;
+  data->last_logged_scene_cbv_valid = scene_cbv_valid;
+  data->last_logged_fallback_scene_cbv_seen = fallback_scene_cbv_seen;
+  data->last_logged_fallback_scene_cbv_buffer_handle = fallback_scene_cbv_handle;
+  data->last_logged_fallback_scene_cbv_frame = fallback_scene_cbv_frame;
+}
+
 XeGTAOMode GetXeGTAOModeSetting() {
   const auto mode = static_cast<uint32_t>(std::clamp(xegtao_mode, 0.f, 1.f));
   return static_cast<XeGTAOMode>(mode);
@@ -940,21 +1393,24 @@ void CacheFallbackSceneCbv(reshade::api::command_list* cmd_list, const reshade::
 bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
   if (device == nullptr || data == nullptr) return false;
 
-  if (data->captured_scene_cbv_valid && IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
+  if (data->captured_scene_cbv_valid
+      && data->captured_scene_cbv_source == XeGTAOSceneCbvSource::kCurrentLighting
+      && IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
     return true;
   }
 
   data->captured_scene_cbv = {};
   data->captured_scene_cbv_valid = false;
   data->captured_scene_cbv_frame = kInvalidFrameIndex;
+  data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
 
   if (!data->fallback_scene_cbv_seen) return false;
-  if (data->fallback_scene_cbv_frame != data->present_frame_index) return false;
   if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) return false;
 
   data->captured_scene_cbv = data->fallback_scene_cbv;
   data->captured_scene_cbv_valid = true;
-  data->captured_scene_cbv_frame = data->fallback_scene_cbv_frame;
+  data->captured_scene_cbv_frame = data->present_frame_index;
+  data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kFallback;
   return true;
 }
 
@@ -1061,6 +1517,8 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->captured_scene_cbv = {};
   data->captured_scene_cbv_valid = false;
   data->captured_scene_cbv_frame = kInvalidFrameIndex;
+  data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->resolved_scene_cbv_from_current_bindings = false;
   data->fallback_scene_cbv = {};
   data->fallback_scene_cbv_seen = false;
   data->fallback_scene_cbv_frame = kInvalidFrameIndex;
@@ -1072,6 +1530,30 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
   data->xegtao_mrt_normal_valid = false;
   data->copyback_succeeded = false;
+  data->last_gate_state_valid = false;
+  data->last_gate_passed = false;
+  data->last_gate_diag_hash = 0u;
+  data->xegtao_warmup_signature = 0u;
+  data->xegtao_warmup_stable_count = 0u;
+  data->last_warmup_enter_signature = 0u;
+  data->last_warmup_complete_signature = 0u;
+  data->last_capture_diag_log_frame = kInvalidFrameIndex;
+  data->last_logged_depth_view_handle = 0u;
+  data->last_logged_ssao_view_handle = 0u;
+  data->last_logged_depth_width = 0u;
+  data->last_logged_depth_height = 0u;
+  data->last_logged_ssao_width = 0u;
+  data->last_logged_ssao_height = 0u;
+  data->last_logged_depth_view_format = reshade::api::format::unknown;
+  data->last_logged_depth_resource_format = reshade::api::format::unknown;
+  data->last_logged_ssao_view_format = reshade::api::format::unknown;
+  data->last_logged_ssao_resource_format = reshade::api::format::unknown;
+  data->last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->last_logged_scene_cbv_buffer_handle = 0u;
+  data->last_logged_scene_cbv_valid = false;
+  data->last_logged_fallback_scene_cbv_seen = false;
+  data->last_logged_fallback_scene_cbv_buffer_handle = 0u;
+  data->last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
 }
 
 bool CreateCharacterSssSrv(
@@ -1711,18 +2193,27 @@ bool TryCopyBackXeGTAOResult(reshade::api::command_list* cmd_list, DeviceData* d
 
 bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, bool request_copy_back) {
   if (cmd_list == nullptr || data == nullptr) return false;
-  auto fail = [data](const std::string& reason) -> bool {
+  auto* device = cmd_list->get_device();
+  auto fail = [data, device](const std::string& reason) -> bool {
     if (data != nullptr && data->last_gtao_failure_log_frame != data->present_frame_index) {
       data->last_gtao_failure_log_frame = data->present_frame_index;
       std::string message = "XeGTAO: skipped this frame (";
       message += reason;
+      if (device != nullptr) {
+        const auto depth_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
+        const auto ssao_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+        message += "; ";
+        message += FormatXeGTAOCapturedViewInfo("t3", depth_info);
+        message += "; ";
+        message += FormatXeGTAOCapturedViewInfo("t4", ssao_info);
+        message += "; ";
+        message += FormatXeGTAOSceneCbvInfo(data);
+      }
       message += ")";
       reshade::log::message(reshade::log::level::warning, message.c_str());
     }
     return false;
   };
-
-  auto* device = cmd_list->get_device();
   if (device == nullptr) return fail("device is null");
 
   data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
@@ -1732,30 +2223,44 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     data->captured_scene_cbv = {};
     data->captured_scene_cbv_valid = false;
     data->captured_scene_cbv_frame = kInvalidFrameIndex;
+    data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   }
 
-  if (data->captured_scene_cbv_valid && data->captured_scene_cbv_frame != data->present_frame_index) {
+  if (data->captured_scene_cbv_valid
+      && data->captured_scene_cbv_source == XeGTAOSceneCbvSource::kCurrentLighting
+      && data->captured_scene_cbv_frame != data->present_frame_index) {
     data->captured_scene_cbv = {};
     data->captured_scene_cbv_valid = false;
     data->captured_scene_cbv_frame = kInvalidFrameIndex;
-  }
-
-  if (!data->captured_scene_cbv_valid || data->captured_scene_cbv.buffer.handle == 0u) {
-    (void)TryAdoptFallbackSceneCbv(device, data);
+    data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   }
 
   if (!IsViewAlive(device, data->captured_mrt_normal_srv)) {
     data->captured_mrt_normal_srv = {};
   }
 
-  if (!IsViewAlive(device, data->captured_depth_srv)
-      || !IsViewAlive(device, data->captured_ssao_srv)
-      || !IsViewAlive(device, data->captured_mrt_normal_srv)
-      || !data->captured_scene_cbv_valid
-      || data->captured_scene_cbv_frame != data->present_frame_index
-      || data->captured_scene_cbv.buffer.handle == 0u) {
-    ResolveXeGTAOInputsFromCurrentBindings(cmd_list, data);
+  // Always refresh from currently bound lighting descriptors so quality-path transitions
+  // (e.g. high <-> ultra resolution) cannot keep stale-but-alive captures.
+  ResolveXeGTAOInputsFromCurrentBindings(cmd_list, data);
+
+  const bool has_current_scene_cbv = data->resolved_scene_cbv_from_current_bindings
+      && data->captured_scene_cbv_valid
+      && data->captured_scene_cbv_frame == data->present_frame_index
+      && data->captured_scene_cbv.buffer.handle != 0u
+      && IsSceneCbvCandidateValid(device, data->captured_scene_cbv);
+
+  if (!has_current_scene_cbv) {
+    data->captured_scene_cbv = {};
+    data->captured_scene_cbv_valid = false;
+    data->captured_scene_cbv_frame = kInvalidFrameIndex;
+    data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   }
+
+  if (!has_current_scene_cbv) {
+    (void)TryAdoptFallbackSceneCbv(device, data);
+  }
+
+  LogXeGTAOCaptureDiagnostics(device, data);
 
   if (!IsViewAlive(device, data->captured_depth_srv)) return fail("lighting depth t3 is not captured/alive");
   if (!IsViewAlive(device, data->captured_ssao_srv)) return fail("lighting AO t4 is not captured/alive");
@@ -1766,8 +2271,6 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     std::string reason = "lighting scene CB b0 is not captured";
     if (!data->fallback_scene_cbv_seen) {
       reason += " (tracked + fallback cache missing)";
-    } else if (data->fallback_scene_cbv_frame != data->present_frame_index) {
-      reason += " (fallback cache is stale this frame)";
     } else if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) {
       reason += " (fallback cache rejected by validation)";
     } else {
@@ -2147,6 +2650,7 @@ void CaptureTrackedConstantBuffer(
   data->captured_scene_cbv = range;
   data->captured_scene_cbv_valid = true;
   data->captured_scene_cbv_frame = data->present_frame_index;
+  data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kCurrentLighting;
 }
 
 void OnPushDescriptorsCaptureLightingTextures(
@@ -2157,7 +2661,12 @@ void OnPushDescriptorsCaptureLightingTextures(
     const reshade::api::descriptor_table_update& update) {
   if (g_skip_descriptor_capture) return;
   if (cmd_list == nullptr) return;
-  if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) return;
+  const uint32_t stage_mask = static_cast<uint32_t>(stages);
+  const uint32_t pixel_mask = static_cast<uint32_t>(reshade::api::shader_stage::pixel);
+  const uint32_t vertex_mask = static_cast<uint32_t>(reshade::api::shader_stage::vertex);
+  const bool has_pixel_stage = (stage_mask & pixel_mask) != 0u;
+  const bool has_vertex_or_pixel_stage = (stage_mask & (pixel_mask | vertex_mask)) != 0u;
+  if (!has_vertex_or_pixel_stage) return;
 
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   const auto shader_hash = shader_state != nullptr
@@ -2181,7 +2690,7 @@ void OnPushDescriptorsCaptureLightingTextures(
     if (update.type == reshade::api::descriptor_type::constant_buffer) {
       const auto* ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
       if (ranges == nullptr) continue;
-      if (allow_fallback_scene_cb_capture && reg == kLightingSceneCbRegister && space == 0u) {
+      if (allow_fallback_scene_cb_capture && has_pixel_stage && reg == kLightingSceneCbRegister && space == 0u) {
         CacheFallbackSceneCbv(cmd_list, ranges[i]);
       }
       if (is_tracked_shader) {
@@ -2190,6 +2699,7 @@ void OnPushDescriptorsCaptureLightingTextures(
       continue;
     }
 
+    if (!has_pixel_stage) continue;
     if (!is_tracked_shader) continue;
 
     const auto view = renodx::utils::descriptor::GetResourceViewFromDescriptorUpdate(update, i);
@@ -2299,7 +2809,12 @@ void OnBindDescriptorTablesCaptureLightingTextures(
     const reshade::api::descriptor_table* tables) {
   if (g_skip_descriptor_capture) return;
   if (cmd_list == nullptr || tables == nullptr || count == 0u) return;
-  if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) return;
+  const uint32_t stage_mask = static_cast<uint32_t>(stages);
+  const uint32_t pixel_mask = static_cast<uint32_t>(reshade::api::shader_stage::pixel);
+  const uint32_t vertex_mask = static_cast<uint32_t>(reshade::api::shader_stage::vertex);
+  const bool has_pixel_stage = (stage_mask & pixel_mask) != 0u;
+  const bool has_vertex_or_pixel_stage = (stage_mask & (pixel_mask | vertex_mask)) != 0u;
+  if (!has_vertex_or_pixel_stage) return;
 
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return;
@@ -2345,7 +2860,10 @@ void OnBindDescriptorTablesCaptureLightingTextures(
       }
 
       if ((static_cast<uint32_t>(range.visibility) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) {
-        continue;
+        if (range.type != reshade::api::descriptor_type::constant_buffer
+            || (static_cast<uint32_t>(range.visibility) & vertex_mask) == 0u) {
+          continue;
+        }
       }
 
       for (uint32_t k = 0; k < range.count; ++k) {
@@ -2357,6 +2875,7 @@ void OnBindDescriptorTablesCaptureLightingTextures(
           continue;
         }
 
+        if (!has_pixel_stage) continue;
         reshade::api::resource_view view = {};
         if (!TryGetResourceViewFromBoundDescriptorTable(device, table, range, k, &view)) continue;
         CaptureTrackedTextureView(cmd_list, shader_hash, reg, range.dx_register_space, view);
@@ -2369,6 +2888,9 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
   if (cmd_list == nullptr || data == nullptr) return;
   auto* device = cmd_list->get_device();
   if (device == nullptr) return;
+  data->resolved_scene_cbv_from_current_bindings = false;
+  const uint32_t pixel_mask = static_cast<uint32_t>(reshade::api::shader_stage::pixel);
+  const uint32_t vertex_mask = static_cast<uint32_t>(reshade::api::shader_stage::vertex);
 
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   if (shader_state == nullptr) return;
@@ -2377,6 +2899,7 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
 
   auto* state = renodx::utils::state::GetCurrentState(cmd_list);
   if (state == nullptr) return;
+  bool resolved_scene_cbv_from_current = false;
 
   auto required_inputs_captured = [data, device]() -> bool {
     return IsViewAlive(device, data->captured_depth_srv)
@@ -2388,10 +2911,11 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
   auto optional_normal_input_captured = [data, device]() -> bool {
     return IsViewAlive(device, data->captured_mrt_normal_srv);
   };
-  if (required_inputs_captured() && optional_normal_input_captured()) return;
 
   for (const auto& [stages, descriptor_state] : state->descriptor_tables) {
-    if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) continue;
+    const uint32_t stage_mask = static_cast<uint32_t>(stages);
+    const bool has_pixel_stage = (stage_mask & pixel_mask) != 0u;
+    if ((stage_mask & (pixel_mask | vertex_mask)) == 0u) continue;
 
     const auto& [layout, tables] = descriptor_state;
     if (layout.handle == 0u || tables.empty()) continue;
@@ -2421,12 +2945,12 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
       for (uint32_t range_index = 0u; range_index < range_count; ++range_index) {
         const auto& range = ranges[range_index];
         if (range.count == UINT32_MAX) continue;
-        if ((static_cast<uint32_t>(range.visibility) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) continue;
         if (range.dx_register_space != 0u) continue;
+        const uint32_t visibility_mask = static_cast<uint32_t>(range.visibility);
 
         if (range.type == reshade::api::descriptor_type::constant_buffer) {
-          if ((!data->captured_scene_cbv_valid || data->captured_scene_cbv.buffer.handle == 0u)
-              && kLightingSceneCbRegister >= range.dx_register_index
+          if ((visibility_mask & (pixel_mask | vertex_mask)) == 0u) continue;
+          if (kLightingSceneCbRegister >= range.dx_register_index
               && kLightingSceneCbRegister < (range.dx_register_index + range.count)) {
             reshade::api::buffer_range cbv = {};
             const uint32_t descriptor_index = kLightingSceneCbRegister - range.dx_register_index;
@@ -2435,6 +2959,8 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
               data->captured_scene_cbv = cbv;
               data->captured_scene_cbv_valid = true;
               data->captured_scene_cbv_frame = data->present_frame_index;
+              data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kCurrentLighting;
+              resolved_scene_cbv_from_current = true;
             }
           }
           continue;
@@ -2445,10 +2971,10 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
             && range.type != reshade::api::descriptor_type::texture_shader_resource_view) {
           continue;
         }
+        if (!has_pixel_stage || (visibility_mask & pixel_mask) == 0u) continue;
 
         auto resolve_texture_register = [&](uint32_t reg, reshade::api::resource_view* out_view) {
           if (out_view == nullptr) return;
-          if (IsViewAlive(device, *out_view)) return;
           if (reg < range.dx_register_index || reg >= (range.dx_register_index + range.count)) return;
           reshade::api::resource_view view = {};
           const uint32_t descriptor_index = reg - range.dx_register_index;
@@ -2461,9 +2987,16 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
         resolve_texture_register(kLightingMrtNormalRegister, &data->captured_mrt_normal_srv);
       }
 
-      if (required_inputs_captured() && optional_normal_input_captured()) return;
+      if (required_inputs_captured()
+          && optional_normal_input_captured()
+          && resolved_scene_cbv_from_current) {
+        data->resolved_scene_cbv_from_current_bindings = resolved_scene_cbv_from_current;
+        return;
+      }
     }
   }
+
+  data->resolved_scene_cbv_from_current_bindings = resolved_scene_cbv_from_current;
 }
 
 void OnCharacterShaderDrawn(reshade::api::command_list* cmd_list) {
@@ -2547,7 +3080,62 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
       if (!has_result_this_frame && is_main_lighting_draw) {
         if (mode == XeGTAOMode::kLightingOverride) {
-          has_result_this_frame = RunXeGTAOForFrame(cmd_list, data, false);
+          std::string gate_reason;
+          std::string gate_diag;
+          uint64_t gate_signature = 0u;
+          const bool gate_passed =
+              EvaluateXeGTAODrawCandidate(cmd_list, data, &gate_reason, &gate_diag, &gate_signature);
+          if (!gate_passed) {
+            const uint64_t gate_diag_hash = HashCombineU64(HashString(gate_reason), HashString(gate_diag));
+            if (!data->last_gate_state_valid || data->last_gate_passed || data->last_gate_diag_hash != gate_diag_hash) {
+              std::ostringstream message;
+              message << "XeGTAO draw-gate rejected on frame " << frame
+                      << " (" << gate_reason << ", " << gate_diag
+                      << ", " << FormatXeGTAOSceneCbvInfo(data) << ")";
+              reshade::log::message(reshade::log::level::info, message.str().c_str());
+            }
+            data->last_gate_state_valid = true;
+            data->last_gate_passed = false;
+            data->last_gate_diag_hash = gate_diag_hash;
+            data->xegtao_warmup_signature = 0u;
+            data->xegtao_warmup_stable_count = 0u;
+          } else {
+            data->last_gate_state_valid = true;
+            data->last_gate_passed = true;
+            data->last_gate_diag_hash = gate_signature;
+
+            bool warmup_ready = false;
+            if (data->xegtao_warmup_signature != gate_signature) {
+              data->xegtao_warmup_signature = gate_signature;
+              data->xegtao_warmup_stable_count = 1u;
+              if (data->last_warmup_enter_signature != gate_signature) {
+                data->last_warmup_enter_signature = gate_signature;
+                std::ostringstream message;
+                message << "XeGTAO warmup started on frame " << frame
+                        << " (stabilizing capture for 2 matching draws, " << gate_diag << ")";
+                reshade::log::message(reshade::log::level::info, message.str().c_str());
+              }
+            } else {
+              if (data->xegtao_warmup_stable_count < 2u) {
+                data->xegtao_warmup_stable_count += 1u;
+              }
+              if (data->xegtao_warmup_stable_count >= 2u) {
+                warmup_ready = true;
+              }
+            }
+
+            if (warmup_ready && data->last_warmup_complete_signature != gate_signature) {
+              data->last_warmup_complete_signature = gate_signature;
+              std::ostringstream message;
+              message << "XeGTAO warmup completed on frame " << frame
+                      << " (" << gate_diag << ")";
+              reshade::log::message(reshade::log::level::info, message.str().c_str());
+            }
+
+            if (warmup_ready) {
+              has_result_this_frame = RunXeGTAOForFrame(cmd_list, data, false);
+            }
+          }
         }
       }
 
