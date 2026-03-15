@@ -99,7 +99,8 @@ void main(uint2 dispatch_thread_id : SV_DispatchThreadID, uint2 group_thread_id 
 {
   uint width;
   uint height;
-  g_srcRawDepth.GetDimensions(width, height);
+  // Build constants in the AO working domain (matches prefilter output/dispatch size).
+  g_outWorkingDepthMIP0.GetDimensions(width, height);
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
   XeGTAO_PrefilterDepths16x16(
