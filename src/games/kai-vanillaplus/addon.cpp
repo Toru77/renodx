@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -59,10 +59,12 @@ constexpr uint32_t kLightingSceneCbRegister = 0u;
 constexpr uint32_t kLightingXeGtaoRegister = 22u;
 constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
+constexpr bool kEnableAddonLogs = false;
 
 struct DeviceData;
 
 bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
+void OnAfterLightingShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeVanillaAoDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list);
@@ -78,7 +80,22 @@ void ReloadIsFastResources(reshade::api::device* device, const char* reason);
 void DestroyXeGTAOResources(reshade::api::device* device, DeviceData* data);
 void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data);
 void DestroyDedicatedSssViews(reshade::api::device* device, DeviceData* data);
+void TransitionResource(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource resource,
+    reshade::api::resource_usage before,
+    reshade::api::resource_usage after);
 void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list, DeviceData* data);
+
+inline void AddonLog(reshade::log::level level, const char* message) {
+  if (!kEnableAddonLogs || message == nullptr) return;
+  reshade::log::message(level, message);
+}
+
+inline void AddonLog(reshade::log::level level, const std::string& message) {
+  if (!kEnableAddonLogs) return;
+  reshade::log::message(level, message.c_str());
+}
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     {
@@ -87,6 +104,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .crc32 = kLightingShader,
             .code = __0x430ED091,
             .on_draw = &OnBeforeLightingShaderDraw,
+            .on_drawn = &OnAfterLightingShaderDraw,
         },
     },                                             // lighting
     {
@@ -95,6 +113,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .crc32 = kLightingSoftShader,
             .code = __0xF6C55E5F,
             .on_draw = &OnBeforeLightingShaderDraw,
+            .on_drawn = &OnAfterLightingShaderDraw,
         },
     },                                             // lighting soft shadows
     {
@@ -284,11 +303,15 @@ SssInjectData shader_injection = {
     .xegtao_normal_input_mode = 1.f,
     .xegtao_mrt_normal_valid = 0.f,
     .xegtao_bent_normals = 0.f,
-    .xegtao_bent_diffuse_strength = 0.35f,
-    .xegtao_bent_diffuse_softness = 0.15f,
-    .xegtao_bent_specular_strength = 0.25f,
-    .xegtao_bent_specular_proxy_roughness = 0.40f,
-    .xegtao_bent_max_darkening = 0.35f,
+    .xegtao_bent_diffuse_strength = 0.f,
+    .xegtao_bent_diffuse_softness = 0.f,
+    .xegtao_bent_specular_strength = 0.f,
+    .xegtao_bent_specular_proxy_roughness = 0.f,
+    .xegtao_bent_max_darkening = 0.f,
+    .xegtao_force_neutral_x = 0.f,
+    .xegtao_debug_blackout = 0.f,
+    .xegtao_ao_active_for_draw = 0.f,
+    .xegtao_foliage_ao_blend = 1.0f,
 };
 
 float settings_mode = 0.f;
@@ -296,7 +319,7 @@ float isfast_jitter_master = 1.f;
 float char_ssgi_composite_method = 1.f;  // 0=Off, 1=On
 float xegtao_mode = 1.f;                  // 0=Off, 1=On
 float xegtao_quality = 0.f;               // 0=High, 1=Very High, 2=Ultra
-float xegtao_precision = 1.f;             // 0=R16 depth mips, 1=R32 depth mips
+float xegtao_precision = 2.f;             // Runtime-forced to Full FP32 (legacy key kept for compatibility)
 float xegtao_normal_input_mode = 1.f;     // 0=Off(depth fallback), 1=View-Transformed
 float xegtao_normal_influence = 0.05f;
 float xegtao_normal_depth_blend = 0.45f;
@@ -306,23 +329,27 @@ float xegtao_normal_z_preservation = 1.f;
 float xegtao_normal_detail_response = 4.f;
 float xegtao_normal_max_darkening = 0.6f;
 float xegtao_normal_darkening_mode = 0.f;  // 0=Fast, 1=Exact
-float xegtao_bent_normals = 0.f;           // 0=Off, 1=Environment-only
-float xegtao_bent_diffuse_strength = 0.35f;
-float xegtao_bent_diffuse_softness = 0.15f;
-float xegtao_bent_specular_strength = 0.25f;
-float xegtao_bent_specular_proxy_roughness = 0.40f;
-float xegtao_bent_max_darkening = 0.35f;
+float xegtao_denoiser_mode = 0.f;  // 0=Vanilla, 1=IS-FAST Only, 2=Hybrid
+float xegtao_isfast_passes = 2.f;
+float xegtao_isfast_samples = 8.f;
+float xegtao_isfast_radius = 1.0f;
+float xegtao_isfast_edge_sensitivity = 2.0f;
+float xegtao_isfast_spatial_sigma = 1.0f;
+float xegtao_isfast_hybrid_blend = 0.5f;
+float xegtao_isfast_jitter = 1.f;         // 0=Off, 1=On
+float xegtao_isfast_jitter_amount = 1.f;  // 0..1
 float xegtao_skip_vanilla_ao = 1.f;       // 0=Off, 1=On
 float xegtao_denoise_pass_count = 1.f;    // 0..3
 float xegtao_radius = 0.5f;
 float xegtao_falloff_range = 0.615f;
 float xegtao_radius_multiplier = 1.5f;
-float xegtao_final_value_power = 2.2f;
+float xegtao_final_value_power = 2.0f;
 float xegtao_sample_distribution_power = 1.5f;
 float xegtao_thin_occluder_compensation = 0.50f;
 float xegtao_depth_mip_sampling_offset = 3.3f;
 float xegtao_denoise_blur_beta = 8.f;
 float xegtao_debug_mode = 0.f;
+float xegtao_foliage_ao_blend = 1.0f;
 
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
 std::atomic_uint64_t g_character_mrt0_view{0u};
@@ -346,9 +373,16 @@ enum class XeGTAOMode : uint32_t {
   kLightingOverride = 1u,
 };
 
+enum class XeGTAOFixMode : uint32_t {
+  kStrictCustomBind = 0u,
+  kDownscaledCopyback = 1u,
+  kAlwaysCopyback = 2u,
+};
+
 enum class XeGTAOPrecision : uint32_t {
-  kHalf = 0u,
-  kFull = 1u,
+  kDepthR16 = 0u,
+  kDepthR32 = 1u,
+  kFullFP32 = 2u,
 };
 
 enum class XeGTAOSceneCbvSource : uint32_t {
@@ -407,14 +441,21 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::pipeline_layout xegtao_prefilter_layout = {};
   reshade::api::pipeline_layout xegtao_main_layout = {};
   reshade::api::pipeline_layout xegtao_denoise_layout = {};
+  reshade::api::pipeline_layout xegtao_denoise_isfast_layout = {};
   reshade::api::pipeline_layout xegtao_composite_layout = {};
   reshade::api::pipeline_layout xegtao_normal_cap_layout = {};
 
   reshade::api::pipeline xegtao_prefilter_pipeline = {};
+  reshade::api::pipeline xegtao_prefilter_fp32_pipeline = {};
   reshade::api::pipeline xegtao_main_pipeline = {};
+  reshade::api::pipeline xegtao_main_fp32_pipeline = {};
   reshade::api::pipeline xegtao_denoise_pipeline = {};
+  reshade::api::pipeline xegtao_denoise_fp32_pipeline = {};
+  reshade::api::pipeline xegtao_denoise_isfast_pipeline = {};
+  reshade::api::pipeline xegtao_denoise_isfast_fp32_pipeline = {};
   reshade::api::pipeline xegtao_composite_pipeline = {};
   reshade::api::pipeline xegtao_normal_cap_pipeline = {};
+  reshade::api::pipeline xegtao_normal_cap_fp32_pipeline = {};
 
   uint64_t present_frame_index = 0u;
   uint64_t last_gtao_frame = kInvalidFrameIndex;
@@ -425,9 +466,43 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint64_t xegtao_mrt_normal_frame = kInvalidFrameIndex;
   bool xegtao_mrt_normal_valid = false;
   bool copyback_succeeded = false;
+  uint64_t xegtao_copyback_frame = kInvalidFrameIndex;
+  bool xegtao_copyback_requested_for_frame = false;
+  bool xegtao_copyback_succeeded_for_frame = false;
+  bool xegtao_copyback_active_for_apply = false;
+  bool xegtao_result_signature_valid = false;
+  uint64_t xegtao_result_signature_frame = kInvalidFrameIndex;
+  uint64_t xegtao_result_t3_resource_handle = 0u;
+  uint64_t xegtao_result_t4_resource_handle = 0u;
+  uint64_t xegtao_result_t3_view_handle = 0u;
+  uint64_t xegtao_result_t4_view_handle = 0u;
+  uint32_t xegtao_result_t3_width = 0u;
+  uint32_t xegtao_result_t3_height = 0u;
+  uint32_t xegtao_result_t4_width = 0u;
+  uint32_t xegtao_result_t4_height = 0u;
+  uint64_t xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
+  uint32_t xegtao_lighting_draw_counter = 0u;
+  bool xegtao_owner_valid = false;
+  uint64_t xegtao_owner_frame = kInvalidFrameIndex;
+  uint32_t xegtao_owner_shader_hash = 0u;
+  uint32_t xegtao_owner_draw_ordinal = 0u;
+  uint64_t xegtao_owner_gate_signature = 0u;
+  bool xegtao_owner_downscaled = false;
+  bool last_owner_state_valid = false;
+  uint64_t last_owner_diag_hash = 0u;
   bool last_gate_state_valid = false;
   bool last_gate_passed = false;
   uint64_t last_gate_diag_hash = 0u;
+  bool last_apply_gate_main_state_valid = false;
+  bool last_apply_gate_main_passed = false;
+  uint64_t last_apply_gate_main_diag_hash = 0u;
+  bool last_apply_gate_soft_state_valid = false;
+  bool last_apply_gate_soft_passed = false;
+  uint64_t last_apply_gate_soft_diag_hash = 0u;
+  bool last_apply_path_main_state_valid = false;
+  uint64_t last_apply_path_main_hash = 0u;
+  bool last_apply_path_soft_state_valid = false;
+  uint64_t last_apply_path_soft_hash = 0u;
 
   uint64_t xegtao_warmup_signature = 0u;
   uint32_t xegtao_warmup_stable_count = 0u;
@@ -437,14 +512,19 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint64_t last_capture_diag_log_frame = kInvalidFrameIndex;
   uint64_t last_logged_depth_view_handle = 0u;
   uint64_t last_logged_ssao_view_handle = 0u;
+  uint64_t last_logged_mrt_normal_view_handle = 0u;
   uint32_t last_logged_depth_width = 0u;
   uint32_t last_logged_depth_height = 0u;
   uint32_t last_logged_ssao_width = 0u;
   uint32_t last_logged_ssao_height = 0u;
+  uint32_t last_logged_mrt_normal_width = 0u;
+  uint32_t last_logged_mrt_normal_height = 0u;
   reshade::api::format last_logged_depth_view_format = reshade::api::format::unknown;
   reshade::api::format last_logged_depth_resource_format = reshade::api::format::unknown;
   reshade::api::format last_logged_ssao_view_format = reshade::api::format::unknown;
   reshade::api::format last_logged_ssao_resource_format = reshade::api::format::unknown;
+  reshade::api::format last_logged_mrt_normal_view_format = reshade::api::format::unknown;
+  reshade::api::format last_logged_mrt_normal_resource_format = reshade::api::format::unknown;
   XeGTAOSceneCbvSource last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   uint64_t last_logged_scene_cbv_buffer_handle = 0u;
   bool last_logged_scene_cbv_valid = false;
@@ -503,7 +583,7 @@ constexpr uint32_t kIsFastBytesPerTexel = 2u;
 void LogIsFast(reshade::log::level level, const std::string& message) {
   if (level == reshade::log::level::debug) return;
   const std::string tagged = "IS-FAST: " + message;
-  reshade::log::message(level, tagged.c_str());
+  AddonLog(level, tagged.c_str());
 }
 
 bool IsIsFastSupportedDevice(reshade::api::device* device) {
@@ -749,6 +829,30 @@ void OnInitDevice(reshade::api::device* device) {
     data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
     data->xegtao_mrt_normal_valid = false;
     data->copyback_succeeded = false;
+    data->xegtao_copyback_frame = kInvalidFrameIndex;
+    data->xegtao_copyback_requested_for_frame = false;
+    data->xegtao_copyback_succeeded_for_frame = false;
+    data->xegtao_copyback_active_for_apply = false;
+    data->xegtao_result_signature_valid = false;
+    data->xegtao_result_signature_frame = kInvalidFrameIndex;
+    data->xegtao_result_t3_resource_handle = 0u;
+    data->xegtao_result_t4_resource_handle = 0u;
+    data->xegtao_result_t3_view_handle = 0u;
+    data->xegtao_result_t4_view_handle = 0u;
+    data->xegtao_result_t3_width = 0u;
+    data->xegtao_result_t3_height = 0u;
+    data->xegtao_result_t4_width = 0u;
+    data->xegtao_result_t4_height = 0u;
+    data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
+    data->xegtao_lighting_draw_counter = 0u;
+    data->xegtao_owner_valid = false;
+    data->xegtao_owner_frame = kInvalidFrameIndex;
+    data->xegtao_owner_shader_hash = 0u;
+    data->xegtao_owner_draw_ordinal = 0u;
+    data->xegtao_owner_gate_signature = 0u;
+    data->xegtao_owner_downscaled = false;
+    data->last_owner_state_valid = false;
+    data->last_owner_diag_hash = 0u;
     data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
     data->resolved_scene_cbv_from_current_bindings = false;
     data->character_sss_current_frame = kInvalidFrameIndex;
@@ -756,6 +860,16 @@ void OnInitDevice(reshade::api::device* device) {
     data->last_gate_state_valid = false;
     data->last_gate_passed = false;
     data->last_gate_diag_hash = 0u;
+    data->last_apply_gate_main_state_valid = false;
+    data->last_apply_gate_main_passed = false;
+    data->last_apply_gate_main_diag_hash = 0u;
+    data->last_apply_gate_soft_state_valid = false;
+    data->last_apply_gate_soft_passed = false;
+    data->last_apply_gate_soft_diag_hash = 0u;
+    data->last_apply_path_main_state_valid = false;
+    data->last_apply_path_main_hash = 0u;
+    data->last_apply_path_soft_state_valid = false;
+    data->last_apply_path_soft_hash = 0u;
     data->xegtao_warmup_signature = 0u;
     data->xegtao_warmup_stable_count = 0u;
     data->last_warmup_enter_signature = 0u;
@@ -793,26 +907,65 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_mrt_normal_valid = false;
   data->character_sss_current_frame = kInvalidFrameIndex;
   data->copyback_succeeded = false;
+  data->xegtao_copyback_frame = kInvalidFrameIndex;
+  data->xegtao_copyback_requested_for_frame = false;
+  data->xegtao_copyback_succeeded_for_frame = false;
+  data->xegtao_copyback_active_for_apply = false;
+  data->xegtao_result_signature_valid = false;
+  data->xegtao_result_signature_frame = kInvalidFrameIndex;
+  data->xegtao_result_t3_resource_handle = 0u;
+  data->xegtao_result_t4_resource_handle = 0u;
+  data->xegtao_result_t3_view_handle = 0u;
+  data->xegtao_result_t4_view_handle = 0u;
+  data->xegtao_result_t3_width = 0u;
+  data->xegtao_result_t3_height = 0u;
+  data->xegtao_result_t4_width = 0u;
+  data->xegtao_result_t4_height = 0u;
+  data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
+  data->xegtao_lighting_draw_counter = 0u;
+  data->xegtao_owner_valid = false;
+  data->xegtao_owner_frame = kInvalidFrameIndex;
+  data->xegtao_owner_shader_hash = 0u;
+  data->xegtao_owner_draw_ordinal = 0u;
+  data->xegtao_owner_gate_signature = 0u;
+  data->xegtao_owner_downscaled = false;
+  data->last_owner_state_valid = false;
+  data->last_owner_diag_hash = 0u;
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->resolved_scene_cbv_from_current_bindings = false;
   data->last_capture_diag_log_frame = kInvalidFrameIndex;
   data->last_gate_state_valid = false;
   data->last_gate_passed = false;
   data->last_gate_diag_hash = 0u;
+  data->last_apply_gate_main_state_valid = false;
+  data->last_apply_gate_main_passed = false;
+  data->last_apply_gate_main_diag_hash = 0u;
+  data->last_apply_gate_soft_state_valid = false;
+  data->last_apply_gate_soft_passed = false;
+  data->last_apply_gate_soft_diag_hash = 0u;
+  data->last_apply_path_main_state_valid = false;
+  data->last_apply_path_main_hash = 0u;
+  data->last_apply_path_soft_state_valid = false;
+  data->last_apply_path_soft_hash = 0u;
   data->xegtao_warmup_signature = 0u;
   data->xegtao_warmup_stable_count = 0u;
   data->last_warmup_enter_signature = 0u;
   data->last_warmup_complete_signature = 0u;
   data->last_logged_depth_view_handle = 0u;
   data->last_logged_ssao_view_handle = 0u;
+  data->last_logged_mrt_normal_view_handle = 0u;
   data->last_logged_depth_width = 0u;
   data->last_logged_depth_height = 0u;
   data->last_logged_ssao_width = 0u;
   data->last_logged_ssao_height = 0u;
+  data->last_logged_mrt_normal_width = 0u;
+  data->last_logged_mrt_normal_height = 0u;
   data->last_logged_depth_view_format = reshade::api::format::unknown;
   data->last_logged_depth_resource_format = reshade::api::format::unknown;
   data->last_logged_ssao_view_format = reshade::api::format::unknown;
   data->last_logged_ssao_resource_format = reshade::api::format::unknown;
+  data->last_logged_mrt_normal_view_format = reshade::api::format::unknown;
+  data->last_logged_mrt_normal_resource_format = reshade::api::format::unknown;
   data->last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->last_logged_scene_cbv_buffer_handle = 0u;
   data->last_logged_scene_cbv_valid = false;
@@ -833,10 +986,46 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->captured_mrt_normal_srv = {};
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->resolved_scene_cbv_from_current_bindings = false;
+  data->last_copyback_frame = kInvalidFrameIndex;
+  data->copyback_succeeded = false;
+  data->xegtao_copyback_frame = kInvalidFrameIndex;
+  data->xegtao_copyback_requested_for_frame = false;
+  data->xegtao_copyback_succeeded_for_frame = false;
+  data->xegtao_copyback_active_for_apply = false;
+  data->xegtao_result_signature_valid = false;
+  data->xegtao_result_signature_frame = kInvalidFrameIndex;
+  data->xegtao_result_t3_resource_handle = 0u;
+  data->xegtao_result_t4_resource_handle = 0u;
+  data->xegtao_result_t3_view_handle = 0u;
+  data->xegtao_result_t4_view_handle = 0u;
+  data->xegtao_result_t3_width = 0u;
+  data->xegtao_result_t3_height = 0u;
+  data->xegtao_result_t4_width = 0u;
+  data->xegtao_result_t4_height = 0u;
+  data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
+  data->xegtao_lighting_draw_counter = 0u;
+  data->xegtao_owner_valid = false;
+  data->xegtao_owner_frame = kInvalidFrameIndex;
+  data->xegtao_owner_shader_hash = 0u;
+  data->xegtao_owner_draw_ordinal = 0u;
+  data->xegtao_owner_gate_signature = 0u;
+  data->xegtao_owner_downscaled = false;
+  data->last_owner_state_valid = false;
+  data->last_owner_diag_hash = 0u;
   data->last_capture_diag_log_frame = kInvalidFrameIndex;
   data->last_gate_state_valid = false;
   data->last_gate_passed = false;
   data->last_gate_diag_hash = 0u;
+  data->last_apply_gate_main_state_valid = false;
+  data->last_apply_gate_main_passed = false;
+  data->last_apply_gate_main_diag_hash = 0u;
+  data->last_apply_gate_soft_state_valid = false;
+  data->last_apply_gate_soft_passed = false;
+  data->last_apply_gate_soft_diag_hash = 0u;
+  data->last_apply_path_main_state_valid = false;
+  data->last_apply_path_main_hash = 0u;
+  data->last_apply_path_soft_state_valid = false;
+  data->last_apply_path_soft_hash = 0u;
   data->xegtao_warmup_signature = 0u;
   data->xegtao_warmup_stable_count = 0u;
   data->last_warmup_enter_signature = 0u;
@@ -1048,6 +1237,21 @@ std::string FormatXeGTAOSceneCbvInfo(const DeviceData* data) {
   return stream.str();
 }
 
+std::string FormatXeGTAOResultSignatureInfo(const DeviceData* data) {
+  if (data == nullptr || !data->xegtao_result_signature_valid) {
+    return "signature(valid=0)";
+  }
+  std::ostringstream stream;
+  stream << "signature(valid=1, frame=" << data->xegtao_result_signature_frame
+         << ", t3(res=0x" << std::hex << data->xegtao_result_t3_resource_handle
+         << ", view=0x" << data->xegtao_result_t3_view_handle << std::dec
+         << ", size=" << data->xegtao_result_t3_width << "x" << data->xegtao_result_t3_height << ")"
+         << ", t4(res=0x" << std::hex << data->xegtao_result_t4_resource_handle
+         << ", view=0x" << data->xegtao_result_t4_view_handle << std::dec
+         << ", size=" << data->xegtao_result_t4_width << "x" << data->xegtao_result_t4_height << "))";
+  return stream.str();
+}
+
 uint32_t RoundToUint(float value) {
   const float positive = std::max(0.0f, value);
   return static_cast<uint32_t>(positive + 0.5f);
@@ -1107,6 +1311,153 @@ uint32_t GetXeGTAOT4ScaleClassCode(const char* scale_class) {
   if (std::strcmp(scale_class, "1/2") == 0) return 2u;
   if (std::strcmp(scale_class, "1/4") == 0) return 4u;
   return 0u;
+}
+
+uint64_t BuildXeGTAODrawSignature(
+    uint32_t viewport_width,
+    uint32_t viewport_height,
+    const XeGTAOCapturedViewInfo& rtv_info,
+    const XeGTAOCapturedViewInfo& depth_info,
+    const XeGTAOCapturedViewInfo& ssao_info,
+    const char* t4_scale_class) {
+  uint64_t signature = 1469598103934665603ull;
+  signature = HashCombineU64(signature, viewport_width);
+  signature = HashCombineU64(signature, viewport_height);
+  signature = HashCombineU64(signature, rtv_info.view.handle);
+  signature = HashCombineU64(signature, rtv_info.width);
+  signature = HashCombineU64(signature, rtv_info.height);
+  signature = HashCombineU64(signature, depth_info.view.handle);
+  signature = HashCombineU64(signature, depth_info.width);
+  signature = HashCombineU64(signature, depth_info.height);
+  signature = HashCombineU64(signature, ssao_info.view.handle);
+  signature = HashCombineU64(signature, ssao_info.width);
+  signature = HashCombineU64(signature, ssao_info.height);
+  signature = HashCombineU64(signature, GetXeGTAOT4ScaleClassCode(t4_scale_class));
+  return signature;
+}
+
+bool IsXeGTAOResultDownscaled(const DeviceData* data) {
+  if (data == nullptr || !data->xegtao_result_signature_valid) return false;
+  if (data->xegtao_result_t3_width == 0u || data->xegtao_result_t3_height == 0u) return false;
+  const char* scale_class = ClassifyXeGTAOT4ScaleClass(
+      data->xegtao_result_t3_width,
+      data->xegtao_result_t3_height,
+      data->xegtao_result_t4_width,
+      data->xegtao_result_t4_height);
+  return std::strcmp(scale_class, "1/2") == 0 || std::strcmp(scale_class, "1/4") == 0;
+}
+
+bool IsXeGTAOCurrentInputDownscaled(reshade::api::device* device, const DeviceData* data) {
+  if (device == nullptr || data == nullptr) return false;
+  const auto depth_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
+  const auto ssao_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+  if (!depth_info.alive || !ssao_info.alive) return false;
+  if (depth_info.resource_desc.type != reshade::api::resource_type::texture_2d
+      || ssao_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    return false;
+  }
+  const char* scale_class = ClassifyXeGTAOT4ScaleClass(
+      depth_info.width,
+      depth_info.height,
+      ssao_info.width,
+      ssao_info.height);
+  return std::strcmp(scale_class, "1/2") == 0 || std::strcmp(scale_class, "1/4") == 0;
+}
+
+std::string FormatXeGTAOOwnerInfo(const DeviceData* data) {
+  if (data == nullptr || !data->xegtao_owner_valid) return "owner(valid=0)";
+  std::ostringstream stream;
+  stream << "owner(valid=1, frame=" << data->xegtao_owner_frame
+         << ", shader=0x" << std::hex << data->xegtao_owner_shader_hash << std::dec
+         << ", draw=" << data->xegtao_owner_draw_ordinal
+         << ", downscaled=" << (data->xegtao_owner_downscaled ? 1 : 0)
+         << ", gate_sig=0x" << std::hex << data->xegtao_owner_gate_signature << std::dec
+         << ")";
+  return stream.str();
+}
+
+bool TryBuildXeGTAODrawSignatureForState(
+    reshade::api::command_list* cmd_list,
+    reshade::api::device* device,
+    const XeGTAOCapturedViewInfo& depth_info,
+    const XeGTAOCapturedViewInfo& ssao_info,
+    uint64_t* out_signature,
+    std::string* out_diag) {
+  if (out_signature != nullptr) *out_signature = 0u;
+  if (out_diag != nullptr) out_diag->clear();
+  if (cmd_list == nullptr || device == nullptr) return false;
+
+  auto* state = renodx::utils::state::GetCurrentState(cmd_list);
+  if (state == nullptr || state->viewports.empty() || state->render_targets.empty()) {
+    if (out_diag != nullptr) *out_diag = "state/viewport/rtv unavailable";
+    return false;
+  }
+  if (state->render_targets.at(0).handle == 0u) {
+    if (out_diag != nullptr) *out_diag = "rtv0 is null";
+    return false;
+  }
+
+  const auto rtv_info = GetXeGTAOCapturedViewInfo(device, state->render_targets.at(0));
+  const auto viewport = state->viewports.at(0);
+  const uint32_t viewport_width = RoundToUint(viewport.width);
+  const uint32_t viewport_height = RoundToUint(viewport.height);
+  const char* t4_scale_class = ClassifyXeGTAOT4ScaleClass(
+      viewport_width, viewport_height, ssao_info.width, ssao_info.height);
+
+  bool valid = true;
+  const char* invalid_reason = nullptr;
+  if (!depth_info.alive || depth_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    valid = false;
+    invalid_reason = "depth view invalid";
+  } else if (!ssao_info.alive || ssao_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    valid = false;
+    invalid_reason = "AO view invalid";
+  } else if (!rtv_info.alive || rtv_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+    valid = false;
+    invalid_reason = "RTV0 invalid";
+  } else if (viewport_width == 0u || viewport_height == 0u) {
+    valid = false;
+    invalid_reason = "viewport size is zero";
+  } else if (!IsCloseWithinOnePixel(viewport_width, depth_info.width)
+             || !IsCloseWithinOnePixel(viewport_height, depth_info.height)
+             || !IsCloseWithinOnePixel(viewport_width, rtv_info.width)
+             || !IsCloseWithinOnePixel(viewport_height, rtv_info.height)) {
+    valid = false;
+    invalid_reason = "viewport/RTV/t3 dimensions mismatch";
+  } else if (std::strcmp(t4_scale_class, "invalid") == 0) {
+    valid = false;
+    invalid_reason = "t4 ratio invalid";
+  }
+
+  std::ostringstream diag;
+  if (!valid) {
+    diag << (invalid_reason != nullptr ? invalid_reason : "invalid");
+    diag << ", viewport=" << viewport_width << "x" << viewport_height
+         << ", rtv0=" << rtv_info.width << "x" << rtv_info.height
+         << ", t3=" << depth_info.width << "x" << depth_info.height
+         << ", t4=" << ssao_info.width << "x" << ssao_info.height
+         << ", t4_scale_class=" << t4_scale_class;
+    if (out_diag != nullptr) *out_diag = diag.str();
+    return false;
+  }
+
+  if (out_signature != nullptr) {
+    *out_signature = BuildXeGTAODrawSignature(
+        viewport_width,
+        viewport_height,
+        rtv_info,
+        depth_info,
+        ssao_info,
+        t4_scale_class);
+  }
+
+  diag << "viewport=" << viewport_width << "x" << viewport_height
+       << ", rtv0=" << rtv_info.width << "x" << rtv_info.height
+       << ", t3=" << depth_info.width << "x" << depth_info.height
+       << ", t4=" << ssao_info.width << "x" << ssao_info.height
+       << ", t4_scale_class=" << t4_scale_class;
+  if (out_diag != nullptr) *out_diag = diag.str();
+  return true;
 }
 
 bool EvaluateXeGTAODrawCandidate(
@@ -1171,20 +1522,13 @@ bool EvaluateXeGTAODrawCandidate(
     if (out_reason != nullptr) *out_reason = "t4 ratio not allowed";
   } else {
     if (out_signature != nullptr) {
-      uint64_t signature = 1469598103934665603ull;
-      signature = HashCombineU64(signature, viewport_width);
-      signature = HashCombineU64(signature, viewport_height);
-      signature = HashCombineU64(signature, rtv_info.view.handle);
-      signature = HashCombineU64(signature, rtv_info.width);
-      signature = HashCombineU64(signature, rtv_info.height);
-      signature = HashCombineU64(signature, depth_info.view.handle);
-      signature = HashCombineU64(signature, depth_info.width);
-      signature = HashCombineU64(signature, depth_info.height);
-      signature = HashCombineU64(signature, ssao_info.view.handle);
-      signature = HashCombineU64(signature, ssao_info.width);
-      signature = HashCombineU64(signature, ssao_info.height);
-      signature = HashCombineU64(signature, GetXeGTAOT4ScaleClassCode(t4_scale_class));
-      *out_signature = signature;
+      *out_signature = BuildXeGTAODrawSignature(
+          viewport_width,
+          viewport_height,
+          rtv_info,
+          depth_info,
+          ssao_info,
+          t4_scale_class);
     }
     if (out_diag != nullptr) {
       std::ostringstream diag;
@@ -1217,11 +1561,16 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
 
   const auto depth_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
   const auto ssao_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+  const auto mrt_normal_info = GetXeGTAOCapturedViewInfo(device, data->captured_mrt_normal_srv);
   const auto depth_resource_format = depth_info.resource_desc.type == reshade::api::resource_type::texture_2d
       ? depth_info.resource_desc.texture.format
       : reshade::api::format::unknown;
   const auto ssao_resource_format = ssao_info.resource_desc.type == reshade::api::resource_type::texture_2d
       ? ssao_info.resource_desc.texture.format
+      : reshade::api::format::unknown;
+  const auto mrt_normal_resource_format =
+      mrt_normal_info.resource_desc.type == reshade::api::resource_type::texture_2d
+      ? mrt_normal_info.resource_desc.texture.format
       : reshade::api::format::unknown;
   auto depth_view_format = depth_info.view_desc.format;
   if (depth_view_format == reshade::api::format::unknown && depth_resource_format != reshade::api::format::unknown) {
@@ -1230,6 +1579,11 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
   auto ssao_view_format = ssao_info.view_desc.format;
   if (ssao_view_format == reshade::api::format::unknown && ssao_resource_format != reshade::api::format::unknown) {
     ssao_view_format = reshade::api::format_to_default_typed(ssao_resource_format);
+  }
+  auto mrt_normal_view_format = mrt_normal_info.view_desc.format;
+  if (mrt_normal_view_format == reshade::api::format::unknown
+      && mrt_normal_resource_format != reshade::api::format::unknown) {
+    mrt_normal_view_format = reshade::api::format_to_default_typed(mrt_normal_resource_format);
   }
 
   const bool depth_transition =
@@ -1249,7 +1603,7 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
             << " -> " << static_cast<uint32_t>(depth_view_format)
             << ", res_fmt " << static_cast<uint32_t>(data->last_logged_depth_resource_format)
             << " -> " << static_cast<uint32_t>(depth_resource_format);
-    reshade::log::message(reshade::log::level::info, message.str().c_str());
+    AddonLog(reshade::log::level::info, message.str().c_str());
   }
 
   const bool ssao_transition =
@@ -1269,7 +1623,27 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
             << " -> " << static_cast<uint32_t>(ssao_view_format)
             << ", res_fmt " << static_cast<uint32_t>(data->last_logged_ssao_resource_format)
             << " -> " << static_cast<uint32_t>(ssao_resource_format);
-    reshade::log::message(reshade::log::level::info, message.str().c_str());
+    AddonLog(reshade::log::level::info, message.str().c_str());
+  }
+
+  const bool mrt_normal_transition =
+      data->last_logged_mrt_normal_view_handle != mrt_normal_info.view.handle
+      || data->last_logged_mrt_normal_width != mrt_normal_info.width
+      || data->last_logged_mrt_normal_height != mrt_normal_info.height
+      || data->last_logged_mrt_normal_view_format != mrt_normal_view_format
+      || data->last_logged_mrt_normal_resource_format != mrt_normal_resource_format;
+  if (mrt_normal_transition) {
+    std::ostringstream message;
+    message << "XeGTAO capture transition t1: "
+            << "view 0x" << std::hex << data->last_logged_mrt_normal_view_handle
+            << " -> 0x" << mrt_normal_info.view.handle << std::dec
+            << ", size " << data->last_logged_mrt_normal_width << "x" << data->last_logged_mrt_normal_height
+            << " -> " << mrt_normal_info.width << "x" << mrt_normal_info.height
+            << ", view_fmt " << static_cast<uint32_t>(data->last_logged_mrt_normal_view_format)
+            << " -> " << static_cast<uint32_t>(mrt_normal_view_format)
+            << ", res_fmt " << static_cast<uint32_t>(data->last_logged_mrt_normal_resource_format)
+            << " -> " << static_cast<uint32_t>(mrt_normal_resource_format);
+    AddonLog(reshade::log::level::info, message.str().c_str());
   }
 
   const bool scene_cbv_valid = data->captured_scene_cbv_valid && data->captured_scene_cbv.buffer.handle != 0u;
@@ -1290,7 +1664,7 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
     if (scene_cbv_valid) {
       message << ", frame=" << data->captured_scene_cbv_frame;
     }
-    reshade::log::message(reshade::log::level::info, message.str().c_str());
+    AddonLog(reshade::log::level::info, message.str().c_str());
   }
 
   const bool fallback_scene_cbv_seen = data->fallback_scene_cbv_seen && data->fallback_scene_cbv.buffer.handle != 0u;
@@ -1309,7 +1683,7 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
     if (fallback_scene_cbv_seen) {
       message << ", last_seen_frame=" << fallback_scene_cbv_frame;
     }
-    reshade::log::message(reshade::log::level::info, message.str().c_str());
+    AddonLog(reshade::log::level::info, message.str().c_str());
   }
 
   data->last_capture_diag_log_frame = data->present_frame_index;
@@ -1323,6 +1697,11 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
   data->last_logged_ssao_height = ssao_info.height;
   data->last_logged_ssao_view_format = ssao_view_format;
   data->last_logged_ssao_resource_format = ssao_resource_format;
+  data->last_logged_mrt_normal_view_handle = mrt_normal_info.view.handle;
+  data->last_logged_mrt_normal_width = mrt_normal_info.width;
+  data->last_logged_mrt_normal_height = mrt_normal_info.height;
+  data->last_logged_mrt_normal_view_format = mrt_normal_view_format;
+  data->last_logged_mrt_normal_resource_format = mrt_normal_resource_format;
   data->last_logged_scene_cbv_source = data->captured_scene_cbv_source;
   data->last_logged_scene_cbv_buffer_handle = scene_cbv_handle;
   data->last_logged_scene_cbv_valid = scene_cbv_valid;
@@ -1336,12 +1715,21 @@ XeGTAOMode GetXeGTAOModeSetting() {
   return static_cast<XeGTAOMode>(mode);
 }
 
+uint32_t ClampXeGTAOFixMode() {
+  return static_cast<uint32_t>(XeGTAOFixMode::kStrictCustomBind);
+}
+
+const char* GetXeGTAOFixModeName(uint32_t fix_mode) {
+  (void)fix_mode;
+  return "strict_t22";
+}
+
 uint32_t ClampXeGTAOQuality() {
   return static_cast<uint32_t>(std::clamp(xegtao_quality, 0.f, 2.f));
 }
 
 uint32_t ClampXeGTAOPrecision() {
-  return static_cast<uint32_t>(std::clamp(xegtao_precision, 0.f, 1.f));
+  return static_cast<uint32_t>(XeGTAOPrecision::kFullFP32);
 }
 
 uint32_t ClampXeGTAONormalInputMode() {
@@ -1352,8 +1740,28 @@ uint32_t ClampXeGTAONormalDarkeningMode() {
   return static_cast<uint32_t>(std::clamp(std::round(xegtao_normal_darkening_mode), 0.f, 1.f));
 }
 
+uint32_t ClampXeGTAODenoiserMode() {
+  return static_cast<uint32_t>(std::clamp(std::round(xegtao_denoiser_mode), 0.f, 2.f));
+}
+
 uint32_t ClampXeGTAODenoisePasses() {
   return static_cast<uint32_t>(std::clamp(xegtao_denoise_pass_count, 0.f, 3.f));
+}
+
+uint32_t ClampXeGTAOIsFastPasses() {
+  return static_cast<uint32_t>(std::clamp(std::round(xegtao_isfast_passes), 1.f, 4.f));
+}
+
+uint32_t ClampXeGTAOIsFastSamples() {
+  return static_cast<uint32_t>(std::clamp(std::round(xegtao_isfast_samples), 2.f, 16.f));
+}
+
+uint32_t ClampXeGTAOIsFastJitterMode() {
+  return static_cast<uint32_t>(std::clamp(std::round(xegtao_isfast_jitter), 0.f, 1.f));
+}
+
+float ClampXeGTAOIsFastJitterAmount() {
+  return std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
 }
 
 bool IsSceneCbvCandidateValid(reshade::api::device* device, const reshade::api::buffer_range& range) {
@@ -1488,14 +1896,21 @@ void DestroyXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   if (device == nullptr || data == nullptr) return;
 
   DestroyPipelineIfValid(device, &data->xegtao_prefilter_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_prefilter_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_main_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_main_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_denoise_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_denoise_fp32_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_denoise_isfast_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_denoise_isfast_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_composite_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_normal_cap_pipeline);
+  DestroyPipelineIfValid(device, &data->xegtao_normal_cap_fp32_pipeline);
 
   DestroyPipelineLayoutIfValid(device, &data->xegtao_prefilter_layout);
   DestroyPipelineLayoutIfValid(device, &data->xegtao_main_layout);
   DestroyPipelineLayoutIfValid(device, &data->xegtao_denoise_layout);
+  DestroyPipelineLayoutIfValid(device, &data->xegtao_denoise_isfast_layout);
   DestroyPipelineLayoutIfValid(device, &data->xegtao_composite_layout);
   DestroyPipelineLayoutIfValid(device, &data->xegtao_normal_cap_layout);
 }
@@ -1530,9 +1945,43 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
   data->xegtao_mrt_normal_valid = false;
   data->copyback_succeeded = false;
+  data->xegtao_copyback_frame = kInvalidFrameIndex;
+  data->xegtao_copyback_requested_for_frame = false;
+  data->xegtao_copyback_succeeded_for_frame = false;
+  data->xegtao_copyback_active_for_apply = false;
+  data->xegtao_result_signature_valid = false;
+  data->xegtao_result_signature_frame = kInvalidFrameIndex;
+  data->xegtao_result_t3_resource_handle = 0u;
+  data->xegtao_result_t4_resource_handle = 0u;
+  data->xegtao_result_t3_view_handle = 0u;
+  data->xegtao_result_t4_view_handle = 0u;
+  data->xegtao_result_t3_width = 0u;
+  data->xegtao_result_t3_height = 0u;
+  data->xegtao_result_t4_width = 0u;
+  data->xegtao_result_t4_height = 0u;
+  data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
+  data->xegtao_lighting_draw_counter = 0u;
+  data->xegtao_owner_valid = false;
+  data->xegtao_owner_frame = kInvalidFrameIndex;
+  data->xegtao_owner_shader_hash = 0u;
+  data->xegtao_owner_draw_ordinal = 0u;
+  data->xegtao_owner_gate_signature = 0u;
+  data->xegtao_owner_downscaled = false;
+  data->last_owner_state_valid = false;
+  data->last_owner_diag_hash = 0u;
   data->last_gate_state_valid = false;
   data->last_gate_passed = false;
   data->last_gate_diag_hash = 0u;
+  data->last_apply_gate_main_state_valid = false;
+  data->last_apply_gate_main_passed = false;
+  data->last_apply_gate_main_diag_hash = 0u;
+  data->last_apply_gate_soft_state_valid = false;
+  data->last_apply_gate_soft_passed = false;
+  data->last_apply_gate_soft_diag_hash = 0u;
+  data->last_apply_path_main_state_valid = false;
+  data->last_apply_path_main_hash = 0u;
+  data->last_apply_path_soft_state_valid = false;
+  data->last_apply_path_soft_hash = 0u;
   data->xegtao_warmup_signature = 0u;
   data->xegtao_warmup_stable_count = 0u;
   data->last_warmup_enter_signature = 0u;
@@ -1540,14 +1989,19 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->last_capture_diag_log_frame = kInvalidFrameIndex;
   data->last_logged_depth_view_handle = 0u;
   data->last_logged_ssao_view_handle = 0u;
+  data->last_logged_mrt_normal_view_handle = 0u;
   data->last_logged_depth_width = 0u;
   data->last_logged_depth_height = 0u;
   data->last_logged_ssao_width = 0u;
   data->last_logged_ssao_height = 0u;
+  data->last_logged_mrt_normal_width = 0u;
+  data->last_logged_mrt_normal_height = 0u;
   data->last_logged_depth_view_format = reshade::api::format::unknown;
   data->last_logged_depth_resource_format = reshade::api::format::unknown;
   data->last_logged_ssao_view_format = reshade::api::format::unknown;
   data->last_logged_ssao_resource_format = reshade::api::format::unknown;
+  data->last_logged_mrt_normal_view_format = reshade::api::format::unknown;
+  data->last_logged_mrt_normal_resource_format = reshade::api::format::unknown;
   data->last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->last_logged_scene_cbv_buffer_handle = 0u;
   data->last_logged_scene_cbv_valid = false;
@@ -1819,6 +2273,13 @@ bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   }
   if (!EnsureXeGTAOComputePipeline(
           device,
+          data->xegtao_prefilter_layout,
+          __xegtao_prefilter_fp32,
+          &data->xegtao_prefilter_fp32_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
           data->xegtao_main_layout,
           __xegtao_main,
           &data->xegtao_main_pipeline)) {
@@ -1826,9 +2287,23 @@ bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   }
   if (!EnsureXeGTAOComputePipeline(
           device,
+          data->xegtao_main_layout,
+          __xegtao_main_fp32,
+          &data->xegtao_main_fp32_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
           data->xegtao_denoise_layout,
           __xegtao_denoise,
           &data->xegtao_denoise_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_denoise_layout,
+          __xegtao_denoise_fp32,
+          &data->xegtao_denoise_fp32_pipeline)) {
     return false;
   }
   if (!EnsureXeGTAOComputePipeline(
@@ -1843,6 +2318,13 @@ bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
           data->xegtao_normal_cap_layout,
           __xegtao_normal_cap,
           &data->xegtao_normal_cap_pipeline)) {
+    return false;
+  }
+  if (!EnsureXeGTAOComputePipeline(
+          device,
+          data->xegtao_normal_cap_layout,
+          __xegtao_normal_cap_fp32,
+          &data->xegtao_normal_cap_fp32_pipeline)) {
     return false;
   }
   return true;
@@ -1872,9 +2354,9 @@ bool EnsureXeGTAOResources(reshade::api::device* device, DeviceData* data) {
 
   const uint32_t precision_mode = ClampXeGTAOPrecision();
   const reshade::api::format depth_mips_format =
-      precision_mode == static_cast<uint32_t>(XeGTAOPrecision::kFull)
-      ? reshade::api::format::r32_float
-      : reshade::api::format::r16_float;
+      precision_mode == static_cast<uint32_t>(XeGTAOPrecision::kDepthR16)
+      ? reshade::api::format::r16_float
+      : reshade::api::format::r32_float;
 
   const bool should_recreate =
       data->depth_mips_texture.handle == 0u
@@ -2003,7 +2485,7 @@ bool EnsureXeGTAOResources(reshade::api::device* device, DeviceData* data) {
   }
 
   const reshade::api::format preferred_edges_format =
-      precision_mode == static_cast<uint32_t>(XeGTAOPrecision::kFull)
+      precision_mode != static_cast<uint32_t>(XeGTAOPrecision::kDepthR16)
       ? reshade::api::format::r16_unorm
       : reshade::api::format::r8_unorm;
   auto create_edges_resources = [&](reshade::api::format edges_format) -> bool {
@@ -2110,10 +2592,14 @@ bool EnsureXeGTAOResources(reshade::api::device* device, DeviceData* data) {
   return true;
 }
 
-std::array<float, 26> BuildXeGTAOPushConstants(const DeviceData* data, bool denoise_last_pass) {
-  std::array<float, 26> constants = {};
-  const uint32_t denoise_passes = ClampXeGTAODenoisePasses();
-  constants[0] = static_cast<float>(ClampXeGTAOQuality());
+std::array<float, 32> BuildXeGTAOPushConstants(
+    const DeviceData* data,
+    bool denoise_last_pass,
+    bool force_downscaled_quality) {
+  std::array<float, 32> constants = {};
+  const uint32_t denoise_passes = force_downscaled_quality ? 3u : ClampXeGTAODenoisePasses();
+  const uint32_t quality = force_downscaled_quality ? 2u : ClampXeGTAOQuality();
+  constants[0] = static_cast<float>(quality);
   constants[1] = static_cast<float>(denoise_passes);
   constants[2] = std::max(0.001f, xegtao_radius);
   constants[3] = std::clamp(xegtao_falloff_range, 0.f, 1.f);
@@ -2138,9 +2624,19 @@ std::array<float, 26> BuildXeGTAOPushConstants(const DeviceData* data, bool deno
   constants[20] = std::clamp(xegtao_normal_detail_response, 0.25f, 4.f);
   constants[21] = std::clamp(xegtao_normal_max_darkening, 0.f, 1.f);
   constants[22] = static_cast<float>(ClampXeGTAONormalDarkeningMode());
-  constants[23] = xegtao_bent_normals >= 0.5f ? 1.f : 0.f;
-  constants[24] = 0.f;
-  constants[25] = 0.f;
+  // XeGTAO denoiser is forced to Vanilla-only at runtime.
+  constants[23] = 0.f;
+  // Copyback-safe composite mode flag:
+  // 0 = normal composite contract (x = AO, yz = payload),
+  // 1 = preserve original AO.yzw for copyback consumption.
+  constants[24] = (data != nullptr && data->xegtao_copyback_requested_for_frame) ? 1.f : 0.f;
+  constants[25] = static_cast<float>(ClampXeGTAOIsFastPasses());
+  constants[26] = static_cast<float>(ClampXeGTAOIsFastSamples());
+  constants[27] = std::clamp(xegtao_isfast_radius, 0.25f, 8.f);
+  constants[28] = std::clamp(xegtao_isfast_edge_sensitivity, 0.f, 8.f);
+  constants[29] = std::clamp(xegtao_isfast_spatial_sigma, 0.1f, 8.f);
+  constants[30] = std::clamp(xegtao_isfast_hybrid_blend, 0.f, 1.f);
+  constants[31] = g_isfast_reshade_srv.handle != 0u ? 1.f : 0.f;
   return constants;
 }
 
@@ -2210,11 +2706,23 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
         message += FormatXeGTAOSceneCbvInfo(data);
       }
       message += ")";
-      reshade::log::message(reshade::log::level::warning, message.c_str());
+      AddonLog(reshade::log::level::warning, message.c_str());
     }
     return false;
   };
   if (device == nullptr) return fail("device is null");
+
+  data->xegtao_copyback_frame = data->present_frame_index;
+  data->xegtao_copyback_requested_for_frame = request_copy_back;
+  data->xegtao_copyback_succeeded_for_frame = false;
+  data->xegtao_copyback_active_for_apply = false;
+
+  if (data->xegtao_result_signature_frame != data->present_frame_index) {
+    data->xegtao_result_signature_valid = false;
+    if (data->xegtao_owner_frame != data->present_frame_index) {
+      data->xegtao_owner_valid = false;
+    }
+  }
 
   data->xegtao_mrt_normal_frame = kInvalidFrameIndex;
   data->xegtao_mrt_normal_valid = false;
@@ -2285,6 +2793,18 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   const uint32_t width = data->working_width;
   const uint32_t height = data->working_height;
   if (width == 0u || height == 0u) return fail("working texture dimensions are zero");
+  const bool force_downscaled_quality = IsXeGTAOCurrentInputDownscaled(device, data);
+
+  const bool use_full_fp32 =
+      ClampXeGTAOPrecision() == static_cast<uint32_t>(XeGTAOPrecision::kFullFP32);
+  const reshade::api::pipeline prefilter_pipeline =
+      use_full_fp32 ? data->xegtao_prefilter_fp32_pipeline : data->xegtao_prefilter_pipeline;
+  const reshade::api::pipeline main_pipeline =
+      use_full_fp32 ? data->xegtao_main_fp32_pipeline : data->xegtao_main_pipeline;
+  const reshade::api::pipeline denoise_pipeline =
+      use_full_fp32 ? data->xegtao_denoise_fp32_pipeline : data->xegtao_denoise_pipeline;
+  const reshade::api::pipeline normal_cap_pipeline =
+      use_full_fp32 ? data->xegtao_normal_cap_fp32_pipeline : data->xegtao_normal_cap_pipeline;
 
   std::array<reshade::api::resource_view, 1> prefilter_srvs = {
       data->captured_depth_srv,
@@ -2296,7 +2816,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
       data->depth_mips_uavs[3],
       data->depth_mips_uavs[4],
   };
-  auto prefilter_constants = BuildXeGTAOPushConstants(data, false);
+  auto prefilter_constants = BuildXeGTAOPushConstants(data, false, force_downscaled_quality);
   std::array<reshade::api::descriptor_table_update, 4> prefilter_updates = {
       reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
       reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
@@ -2311,7 +2831,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   if (!DispatchXeGTAOCompute(
           cmd_list,
           data->xegtao_prefilter_layout,
-          data->xegtao_prefilter_pipeline,
+          prefilter_pipeline,
           std::span<const reshade::api::descriptor_table_update>(prefilter_updates.data(), prefilter_updates.size()),
           std::span<const float>(prefilter_constants.data(), prefilter_constants.size()),
           (width + 15u) / 16u,
@@ -2336,7 +2856,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
         ao_uav,
         data->edges_uav,
     };
-    auto main_constants = BuildXeGTAOPushConstants(data, false);
+    auto main_constants = BuildXeGTAOPushConstants(data, false, force_downscaled_quality);
     main_constants[13] = force_depth_only ? 0.f : main_constants[13];
     main_constants[14] = (!force_depth_only && mrt_normal_valid) ? 1.f : 0.f;
 
@@ -2359,7 +2879,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     if (!DispatchXeGTAOCompute(
             cmd_list,
             data->xegtao_main_layout,
-            data->xegtao_main_pipeline,
+            main_pipeline,
             std::span<const reshade::api::descriptor_table_update>(main_updates.data(), main_updates.size()),
             std::span<const float>(main_constants.data(), main_constants.size()),
             (width + 7u) / 8u,
@@ -2397,7 +2917,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     std::array<reshade::api::resource_view, 1> normal_cap_uavs = {
         data->ao_term_a_uav,
     };
-    auto normal_cap_constants = BuildXeGTAOPushConstants(data, false);
+    auto normal_cap_constants = BuildXeGTAOPushConstants(data, false, force_downscaled_quality);
     std::array<reshade::api::descriptor_table_update, 4> normal_cap_updates = {
         reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
         reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
@@ -2412,7 +2932,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     if (!DispatchXeGTAOCompute(
             cmd_list,
             data->xegtao_normal_cap_layout,
-            data->xegtao_normal_cap_pipeline,
+            normal_cap_pipeline,
             std::span<const reshade::api::descriptor_table_update>(normal_cap_updates.data(), normal_cap_updates.size()),
             std::span<const float>(normal_cap_constants.data(), normal_cap_constants.size()),
             (width + 7u) / 8u,
@@ -2432,14 +2952,15 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   data->xegtao_mrt_normal_frame = data->present_frame_index;
   data->xegtao_mrt_normal_valid = mrt_normal_valid;
 
-  const uint32_t denoise_passes = ClampXeGTAODenoisePasses();
-  const uint32_t denoise_total_passes = std::max(1u, denoise_passes);
+  const uint32_t denoise_passes = force_downscaled_quality ? 3u : ClampXeGTAODenoisePasses();
   bool denoise_source_is_a = true;
 
-  for (uint32_t pass_index = 0u; pass_index < denoise_total_passes; ++pass_index) {
-    const bool is_last_pass = pass_index + 1u == denoise_total_passes;
-    const reshade::api::resource_view denoise_source = denoise_source_is_a ? data->ao_term_a_srv : data->ao_term_b_srv;
-    const reshade::api::resource_view denoise_output = denoise_source_is_a ? data->ao_term_b_uav : data->ao_term_a_uav;
+  auto dispatch_vanilla_denoise_pass =
+      [&](bool is_last_pass, uint32_t pass_index) -> bool {
+    const reshade::api::resource_view denoise_source =
+        denoise_source_is_a ? data->ao_term_a_srv : data->ao_term_b_srv;
+    const reshade::api::resource_view denoise_output =
+        denoise_source_is_a ? data->ao_term_b_uav : data->ao_term_a_uav;
 
     std::array<reshade::api::resource_view, 2> denoise_srvs = {
         denoise_source,
@@ -2448,7 +2969,9 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     std::array<reshade::api::resource_view, 1> denoise_uavs = {
         denoise_output,
     };
-    auto denoise_constants = BuildXeGTAOPushConstants(data, is_last_pass);
+    auto denoise_constants = BuildXeGTAOPushConstants(data, is_last_pass, force_downscaled_quality);
+    denoise_constants[10] = denoise_constants[10] + static_cast<float>(pass_index);
+    denoise_constants[31] = 0.f;
     std::array<reshade::api::descriptor_table_update, 4> denoise_updates = {
         reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
         reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
@@ -2465,13 +2988,13 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     if (!DispatchXeGTAOCompute(
             cmd_list,
             data->xegtao_denoise_layout,
-            data->xegtao_denoise_pipeline,
+            denoise_pipeline,
             std::span<const reshade::api::descriptor_table_update>(denoise_updates.data(), denoise_updates.size()),
             std::span<const float>(denoise_constants.data(), denoise_constants.size()),
             (width + 15u) / 16u,
             (height + 7u) / 8u,
             1u)) {
-      return fail("denoise dispatch failed");
+      return false;
     }
     TransitionResource(
         cmd_list,
@@ -2479,6 +3002,15 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
         reshade::api::resource_usage::unordered_access,
         reshade::api::resource_usage::shader_resource);
     denoise_source_is_a = !denoise_source_is_a;
+    return true;
+  };
+
+  const uint32_t vanilla_total_passes = std::max(1u, denoise_passes);
+  for (uint32_t pass_index = 0u; pass_index < vanilla_total_passes; ++pass_index) {
+    const bool is_last_pass = pass_index + 1u == vanilla_total_passes;
+    if (!dispatch_vanilla_denoise_pass(is_last_pass, pass_index)) {
+      return fail("vanilla denoise dispatch failed");
+    }
   }
 
   const bool denoise_result_is_a = denoise_source_is_a;
@@ -2492,7 +3024,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   std::array<reshade::api::resource_view, 1> composite_uavs = {
       data->composite_uav,
   };
-  auto composite_constants = BuildXeGTAOPushConstants(data, true);
+  auto composite_constants = BuildXeGTAOPushConstants(data, true, force_downscaled_quality);
   std::array<reshade::api::descriptor_table_update, 4> composite_updates = {
       reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
       reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &data->captured_scene_cbv},
@@ -2526,6 +3058,8 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   if (request_copy_back) {
     data->last_copyback_frame = data->present_frame_index;
     data->copyback_succeeded = TryCopyBackXeGTAOResult(cmd_list, data);
+    data->xegtao_copyback_succeeded_for_frame = data->copyback_succeeded;
+    data->xegtao_copyback_active_for_apply = data->copyback_succeeded;
     if (!data->copyback_succeeded) {
       TransitionResource(
           cmd_list,
@@ -2536,7 +3070,28 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   } else {
     data->last_copyback_frame = kInvalidFrameIndex;
     data->copyback_succeeded = false;
+    data->xegtao_copyback_succeeded_for_frame = false;
+    data->xegtao_copyback_active_for_apply = false;
   }
+
+  const auto signature_t3 = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
+  const auto signature_t4 = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+  data->xegtao_result_signature_valid =
+      signature_t3.alive
+      && signature_t4.alive
+      && signature_t3.resource_desc.type == reshade::api::resource_type::texture_2d
+      && signature_t4.resource_desc.type == reshade::api::resource_type::texture_2d
+      && signature_t3.resource.handle != 0u
+      && signature_t4.resource.handle != 0u;
+  data->xegtao_result_signature_frame = data->present_frame_index;
+  data->xegtao_result_t3_resource_handle = signature_t3.resource.handle;
+  data->xegtao_result_t4_resource_handle = signature_t4.resource.handle;
+  data->xegtao_result_t3_view_handle = signature_t3.view.handle;
+  data->xegtao_result_t4_view_handle = signature_t4.view.handle;
+  data->xegtao_result_t3_width = signature_t3.width;
+  data->xegtao_result_t3_height = signature_t3.height;
+  data->xegtao_result_t4_width = signature_t4.width;
+  data->xegtao_result_t4_height = signature_t4.height;
   data->last_gtao_frame = data->present_frame_index;
   return true;
 }
@@ -2884,6 +3439,91 @@ void OnBindDescriptorTablesCaptureLightingTextures(
   }
 }
 
+bool ResolveCurrentLightingTextureViewsForDraw(
+    reshade::api::command_list* cmd_list,
+    uint32_t expected_shader_hash,
+    reshade::api::resource_view* out_depth_srv,
+    reshade::api::resource_view* out_ssao_srv) {
+  if (out_depth_srv == nullptr || out_ssao_srv == nullptr) return false;
+  *out_depth_srv = {};
+  *out_ssao_srv = {};
+  if (cmd_list == nullptr) return false;
+
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return false;
+
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr) return false;
+  const uint32_t shader_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
+  if (shader_hash != expected_shader_hash) return false;
+  if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return false;
+
+  auto* state = renodx::utils::state::GetCurrentState(cmd_list);
+  if (state == nullptr) return false;
+
+  const uint32_t pixel_mask = static_cast<uint32_t>(reshade::api::shader_stage::pixel);
+
+  for (const auto& [stages, descriptor_state] : state->descriptor_tables) {
+    if ((static_cast<uint32_t>(stages) & pixel_mask) == 0u) continue;
+
+    const auto& [layout, tables] = descriptor_state;
+    if (layout.handle == 0u || tables.empty()) continue;
+
+    auto* layout_data = renodx::utils::pipeline_layout::GetPipelineLayoutData(layout);
+    if (layout_data == nullptr) continue;
+
+    for (uint32_t table_index = 0u; table_index < static_cast<uint32_t>(tables.size()); ++table_index) {
+      if (table_index >= layout_data->params.size()) break;
+
+      const auto& table = tables[table_index];
+      if (table.handle == 0u) continue;
+
+      const auto& param = layout_data->params.at(table_index);
+      uint32_t range_count = 0u;
+      const reshade::api::descriptor_range* ranges = nullptr;
+      if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table) {
+        range_count = param.descriptor_table.count;
+        ranges = param.descriptor_table.ranges;
+      } else if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
+        range_count = param.descriptor_table_with_static_samplers.count;
+        ranges = param.descriptor_table_with_static_samplers.ranges;
+      } else {
+        continue;
+      }
+      if (ranges == nullptr || range_count == 0u) continue;
+
+      for (uint32_t range_index = 0u; range_index < range_count; ++range_index) {
+        const auto& range = ranges[range_index];
+        if (range.count == UINT32_MAX) continue;
+        if (range.dx_register_space != 0u) continue;
+        if ((static_cast<uint32_t>(range.visibility) & pixel_mask) == 0u) continue;
+        if (range.type != reshade::api::descriptor_type::sampler_with_resource_view
+            && range.type != reshade::api::descriptor_type::buffer_shader_resource_view
+            && range.type != reshade::api::descriptor_type::texture_shader_resource_view) {
+          continue;
+        }
+
+        auto resolve_texture_register = [&](uint32_t reg, reshade::api::resource_view* out_view) {
+          if (out_view == nullptr || out_view->handle != 0u) return;
+          if (reg < range.dx_register_index || reg >= (range.dx_register_index + range.count)) return;
+          reshade::api::resource_view view = {};
+          const uint32_t descriptor_index = reg - range.dx_register_index;
+          if (TryGetResourceViewFromBoundDescriptorTable(device, table, range, descriptor_index, &view)) {
+            *out_view = view;
+          }
+        };
+
+        resolve_texture_register(kLightingDepthRegister, out_depth_srv);
+        resolve_texture_register(kLightingSsaoRegister, out_ssao_srv);
+      }
+
+      if (out_depth_srv->handle != 0u && out_ssao_srv->handle != 0u) return true;
+    }
+  }
+
+  return out_depth_srv->handle != 0u && out_ssao_srv->handle != 0u;
+}
+
 void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list, DeviceData* data) {
   if (cmd_list == nullptr || data == nullptr) return;
   auto* device = cmd_list->get_device();
@@ -3025,6 +3665,19 @@ void OnAoFinalPassDrawn(reshade::api::command_list* cmd_list) {
   if (data == nullptr) return;
 }
 
+void OnAfterLightingShaderDraw(reshade::api::command_list* cmd_list) {
+  (void)cmd_list;
+  // Safety reset to prevent per-draw XeGTAO state leaking into later draws that
+  // may not pass through our lighting on_draw callback on some runtime paths.
+  shader_injection.sss_dedicated_bound = 0.f;
+  shader_injection.xegtao_dedicated_bound = 0.f;
+  shader_injection.xegtao_force_neutral_x = 0.f;
+  shader_injection.xegtao_mrt_normal_valid = 0.f;
+  shader_injection.xegtao_debug_mode = 0.f;
+  shader_injection.xegtao_debug_blackout = 0.f;
+  shader_injection.xegtao_ao_active_for_draw = 0.f;
+}
+
 bool OnBeforeVanillaAoDraw(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return true;
   auto* device = cmd_list->get_device();
@@ -3035,7 +3688,7 @@ bool OnBeforeVanillaAoDraw(reshade::api::command_list* cmd_list) {
     if (data != nullptr) {
       if (data->last_skip_vanilla_ao_ignored_log_frame == kInvalidFrameIndex) {
         data->last_skip_vanilla_ao_ignored_log_frame = data->present_frame_index;
-        reshade::log::message(
+        AddonLog(
             reshade::log::level::warning,
             "XeGTAO: 'Skip Vanilla AO' is ignored while XeGTAO is active (AO.z remains the SSS source).");
       }
@@ -3051,15 +3704,18 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   shader_injection.sss_dedicated_bound = 0.f;
   shader_injection.xegtao_dedicated_bound = 0.f;
+  shader_injection.xegtao_force_neutral_x = 0.f;
+  shader_injection.xegtao_debug_blackout = 0.f;
+  shader_injection.xegtao_ao_active_for_draw = 0.f;
   shader_injection.xegtao_normal_input_mode = static_cast<float>(ClampXeGTAONormalInputMode());
   shader_injection.xegtao_mrt_normal_valid = 0.f;
-  shader_injection.xegtao_bent_normals = xegtao_bent_normals >= 0.5f ? 1.f : 0.f;
-  shader_injection.xegtao_bent_diffuse_strength = std::clamp(xegtao_bent_diffuse_strength, 0.f, 1.f);
-  shader_injection.xegtao_bent_diffuse_softness = std::clamp(xegtao_bent_diffuse_softness, 0.02f, 0.35f);
-  shader_injection.xegtao_bent_specular_strength = std::clamp(xegtao_bent_specular_strength, 0.f, 1.f);
-  shader_injection.xegtao_bent_specular_proxy_roughness =
-      std::clamp(xegtao_bent_specular_proxy_roughness, 0.f, 1.f);
-  shader_injection.xegtao_bent_max_darkening = std::clamp(xegtao_bent_max_darkening, 0.f, 1.f);
+  shader_injection.xegtao_bent_normals = 0.f;
+  shader_injection.xegtao_bent_diffuse_strength = 0.f;
+  shader_injection.xegtao_bent_diffuse_softness = 0.f;
+  shader_injection.xegtao_bent_specular_strength = 0.f;
+  shader_injection.xegtao_bent_specular_proxy_roughness = 0.f;
+  shader_injection.xegtao_bent_max_darkening = 0.f;
+  shader_injection.xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
 
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   const auto shader_hash = shader_state != nullptr
@@ -3076,7 +3732,15 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     const auto mode = GetXeGTAOModeSetting();
     if (data != nullptr && mode != XeGTAOMode::kOff) {
       const uint64_t frame = data->present_frame_index;
+      if (data->xegtao_lighting_draw_counter_frame != frame) {
+        data->xegtao_lighting_draw_counter_frame = frame;
+        data->xegtao_lighting_draw_counter = 0u;
+      }
+      data->xegtao_lighting_draw_counter += 1u;
+      const uint32_t lighting_draw_ordinal = data->xegtao_lighting_draw_counter;
       bool has_result_this_frame = data->last_gtao_frame == frame;
+      bool dispatched_xegtao_this_draw = false;
+      uint64_t dispatched_gate_signature = 0u;
 
       if (!has_result_this_frame && is_main_lighting_draw) {
         if (mode == XeGTAOMode::kLightingOverride) {
@@ -3092,7 +3756,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               message << "XeGTAO draw-gate rejected on frame " << frame
                       << " (" << gate_reason << ", " << gate_diag
                       << ", " << FormatXeGTAOSceneCbvInfo(data) << ")";
-              reshade::log::message(reshade::log::level::info, message.str().c_str());
+              AddonLog(reshade::log::level::info, message.str().c_str());
             }
             data->last_gate_state_valid = true;
             data->last_gate_passed = false;
@@ -3113,7 +3777,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                 std::ostringstream message;
                 message << "XeGTAO warmup started on frame " << frame
                         << " (stabilizing capture for 2 matching draws, " << gate_diag << ")";
-                reshade::log::message(reshade::log::level::info, message.str().c_str());
+                AddonLog(reshade::log::level::info, message.str().c_str());
               }
             } else {
               if (data->xegtao_warmup_stable_count < 2u) {
@@ -3129,19 +3793,80 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               std::ostringstream message;
               message << "XeGTAO warmup completed on frame " << frame
                       << " (" << gate_diag << ")";
-              reshade::log::message(reshade::log::level::info, message.str().c_str());
+              AddonLog(reshade::log::level::info, message.str().c_str());
             }
 
             if (warmup_ready) {
-              has_result_this_frame = RunXeGTAOForFrame(cmd_list, data, false);
+              const bool request_copy_back = false;
+              has_result_this_frame = RunXeGTAOForFrame(cmd_list, data, request_copy_back);
+              if (has_result_this_frame) {
+                dispatched_xegtao_this_draw = true;
+                dispatched_gate_signature = gate_signature;
+              }
             }
           }
         }
       }
 
-      const bool should_bind_xegtao_srv = has_result_this_frame;
+      if (dispatched_xegtao_this_draw) {
+        data->xegtao_owner_valid =
+            data->xegtao_result_signature_valid
+            && data->xegtao_result_signature_frame == frame;
+        data->xegtao_owner_frame = frame;
+        data->xegtao_owner_shader_hash = shader_hash;
+        data->xegtao_owner_draw_ordinal = lighting_draw_ordinal;
+        data->xegtao_owner_gate_signature = dispatched_gate_signature;
+        data->xegtao_owner_downscaled = data->xegtao_owner_valid && IsXeGTAOResultDownscaled(data);
 
-      if (should_bind_xegtao_srv && IsViewAlive(device, data->composite_srv)) {
+        uint64_t owner_diag_hash = 0u;
+        owner_diag_hash = HashCombineU64(owner_diag_hash, data->xegtao_owner_valid ? 1u : 0u);
+        owner_diag_hash = HashCombineU64(owner_diag_hash, data->xegtao_owner_shader_hash);
+        owner_diag_hash = HashCombineU64(owner_diag_hash, data->xegtao_owner_draw_ordinal);
+        owner_diag_hash = HashCombineU64(owner_diag_hash, data->xegtao_owner_gate_signature);
+        owner_diag_hash = HashCombineU64(owner_diag_hash, data->xegtao_owner_downscaled ? 1u : 0u);
+        if (!data->last_owner_state_valid || data->last_owner_diag_hash != owner_diag_hash) {
+          std::ostringstream message;
+          message << "XeGTAO owner captured on frame " << frame
+                  << " (" << FormatXeGTAOOwnerInfo(data) << ")";
+          AddonLog(reshade::log::level::info, message.str().c_str());
+        }
+        data->last_owner_state_valid = true;
+        data->last_owner_diag_hash = owner_diag_hash;
+      }
+
+      bool should_force_neutral_x = false;
+      bool apply_gate_passed = false;
+      std::string apply_gate_reason;
+      std::string apply_gate_diag;
+      std::string apply_gate_source = "none";
+      XeGTAOCapturedViewInfo apply_t3_info = {};
+      XeGTAOCapturedViewInfo apply_t4_info = {};
+      uint64_t apply_draw_signature = 0u;
+      bool apply_draw_signature_valid = false;
+      std::string apply_draw_signature_diag;
+      const bool copyback_requested = has_result_this_frame
+          && data->xegtao_copyback_frame == frame
+          && data->xegtao_copyback_requested_for_frame;
+      const bool copyback_active_for_apply = copyback_requested
+          && data->xegtao_copyback_succeeded_for_frame
+          && data->xegtao_copyback_active_for_apply;
+      const bool copyback_failed_for_apply = copyback_requested && !copyback_active_for_apply;
+      const bool downscaled_result_for_apply =
+          has_result_this_frame
+          && data->xegtao_result_signature_valid
+          && data->xegtao_result_signature_frame == frame
+          && IsXeGTAOResultDownscaled(data);
+      const bool owner_ready_for_draw =
+          data->xegtao_owner_valid
+          && data->xegtao_owner_frame == frame
+          && shader_hash == data->xegtao_owner_shader_hash
+          && lighting_draw_ordinal == data->xegtao_owner_draw_ordinal;
+      const bool downscaled_owner_token_available =
+          data->xegtao_owner_valid
+          && data->xegtao_owner_frame == frame
+          && data->xegtao_owner_downscaled;
+
+      auto bind_xegtao_srv = [&]() {
         shader_injection.xegtao_dedicated_bound = 1.f;
         if (data->xegtao_mrt_normal_frame == frame && data->xegtao_mrt_normal_valid) {
           shader_injection.xegtao_mrt_normal_valid = 1.f;
@@ -3160,7 +3885,258 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                 &data->composite_srv,
             });
         g_skip_descriptor_capture = false;
+      };
+
+      if (copyback_active_for_apply) {
+        if (downscaled_result_for_apply) {
+          if (owner_ready_for_draw) {
+            apply_gate_passed = true;
+            apply_gate_source = "copyback_active_owner";
+            apply_gate_reason = "copyback-active owner draw";
+            if (resolved_xegtao_debug_mode > 0.f && IsViewAlive(device, data->composite_srv)) {
+              bind_xegtao_srv();
+            }
+          } else {
+            apply_gate_passed = false;
+            apply_gate_source = "copyback_active_non_owner";
+            apply_gate_reason = downscaled_owner_token_available
+                ? "downscaled non-owner draw rejected"
+                : "downscaled owner token is unavailable";
+            should_force_neutral_x = true;
+            shader_injection.xegtao_debug_mode = 0.f;
+            shader_injection.xegtao_debug_blackout = 1.f;
+          }
+        } else {
+          apply_gate_passed = true;
+          apply_gate_source = "copyback_active_t4";
+          apply_gate_reason = "copyback-active path";
+
+          if (resolved_xegtao_debug_mode > 0.f && resolved_xegtao_debug_mode <= 9.f) {
+            if (owner_ready_for_draw && IsViewAlive(device, data->composite_srv)) {
+              bind_xegtao_srv();
+            } else {
+              shader_injection.xegtao_debug_blackout = 1.f;
+            }
+          }
+        }
+      } else {
+        const bool should_try_apply = has_result_this_frame && IsViewAlive(device, data->composite_srv);
+        if (should_try_apply) {
+          reshade::api::resource_view current_t3 = {};
+          reshade::api::resource_view current_t4 = {};
+          const bool has_current_views =
+              ResolveCurrentLightingTextureViewsForDraw(cmd_list, shader_hash, &current_t3, &current_t4);
+          const auto current_t3_info = GetXeGTAOCapturedViewInfo(device, current_t3);
+          const auto current_t4_info = GetXeGTAOCapturedViewInfo(device, current_t4);
+          const auto tracked_t3_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
+          const auto tracked_t4_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
+          const bool signature_ready =
+              data->xegtao_result_signature_valid
+              && data->xegtao_result_signature_frame == frame
+              && data->xegtao_result_t3_resource_handle != 0u
+              && data->xegtao_result_t4_resource_handle != 0u;
+
+          if (!signature_ready) {
+            apply_gate_reason = "XeGTAO result signature unavailable for this frame";
+          } else {
+            if (has_current_views) {
+              apply_gate_source = "current_draw";
+              if (!current_t3_info.alive || current_t3_info.resource.handle == 0u
+                  || current_t3_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+                apply_gate_reason = "current draw t3 is invalid";
+              } else if (!current_t4_info.alive || current_t4_info.resource.handle == 0u
+                         || current_t4_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+                apply_gate_reason = "current draw t4 is invalid";
+              } else if (current_t3_info.resource.handle != data->xegtao_result_t3_resource_handle
+                         || current_t4_info.resource.handle != data->xegtao_result_t4_resource_handle
+                         || current_t3_info.width != data->xegtao_result_t3_width
+                         || current_t3_info.height != data->xegtao_result_t3_height
+                         || current_t4_info.width != data->xegtao_result_t4_width
+                         || current_t4_info.height != data->xegtao_result_t4_height) {
+                apply_gate_reason = "current draw t3/t4 does not match XeGTAO source signature";
+              } else {
+                apply_gate_passed = true;
+                apply_t3_info = current_t3_info;
+                apply_t4_info = current_t4_info;
+              }
+            } else if (is_main_lighting_draw) {
+              apply_gate_source = "tracked_main_fallback";
+              if (!tracked_t3_info.alive || tracked_t3_info.resource.handle == 0u
+                  || tracked_t3_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+                apply_gate_reason = "tracked fallback t3 is invalid";
+              } else if (!tracked_t4_info.alive || tracked_t4_info.resource.handle == 0u
+                         || tracked_t4_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
+                apply_gate_reason = "tracked fallback t4 is invalid";
+              } else if (tracked_t3_info.resource.handle != data->xegtao_result_t3_resource_handle
+                         || tracked_t4_info.resource.handle != data->xegtao_result_t4_resource_handle
+                         || tracked_t3_info.width != data->xegtao_result_t3_width
+                         || tracked_t3_info.height != data->xegtao_result_t3_height
+                         || tracked_t4_info.width != data->xegtao_result_t4_width
+                         || tracked_t4_info.height != data->xegtao_result_t4_height) {
+                apply_gate_reason = "tracked fallback t3/t4 does not match XeGTAO source signature";
+              } else {
+                apply_gate_passed = true;
+                apply_t3_info = tracked_t3_info;
+                apply_t4_info = tracked_t4_info;
+              }
+            } else {
+              apply_gate_reason = "current draw t3/t4 bindings not found (soft draw fallback disabled)";
+            }
+          }
+
+          if (apply_gate_passed) {
+            apply_draw_signature_valid = TryBuildXeGTAODrawSignatureForState(
+                cmd_list,
+                device,
+                apply_t3_info,
+                apply_t4_info,
+                &apply_draw_signature,
+                &apply_draw_signature_diag);
+            const bool result_is_downscaled =
+                signature_ready
+                && data->xegtao_result_signature_frame == frame
+                && IsXeGTAOResultDownscaled(data);
+            if (result_is_downscaled) {
+              const bool owner_ready =
+                  data->xegtao_owner_valid
+                  && data->xegtao_owner_frame == frame
+                  && data->xegtao_owner_downscaled;
+              if (!owner_ready) {
+                apply_gate_passed = false;
+                apply_gate_reason = "downscaled owner token is unavailable";
+              } else {
+                const bool owner_match =
+                    shader_hash == data->xegtao_owner_shader_hash
+                    && lighting_draw_ordinal == data->xegtao_owner_draw_ordinal
+                    && apply_draw_signature_valid
+                    && apply_draw_signature == data->xegtao_owner_gate_signature;
+                if (!owner_match) {
+                  apply_gate_passed = false;
+                  apply_gate_reason = "downscaled non-owner draw rejected";
+                }
+              }
+            }
+          }
+
+          std::ostringstream diag_stream;
+          diag_stream
+              << "shader=" << (is_main_lighting_draw ? "main" : "soft")
+              << ", draw_ordinal=" << lighting_draw_ordinal
+              << ", apply_source=" << apply_gate_source
+              << ", current_t3=" << FormatXeGTAOCapturedViewInfo("t3", current_t3_info)
+              << ", current_t4=" << FormatXeGTAOCapturedViewInfo("t4", current_t4_info)
+              << ", tracked_t3=" << FormatXeGTAOCapturedViewInfo("t3", tracked_t3_info)
+              << ", tracked_t4=" << FormatXeGTAOCapturedViewInfo("t4", tracked_t4_info)
+              << ", apply_sig=";
+          if (apply_draw_signature_valid) {
+            diag_stream << "0x" << std::hex << apply_draw_signature << std::dec;
+          } else {
+            diag_stream << "invalid(" << apply_draw_signature_diag << ")";
+          }
+          diag_stream
+              << ", " << FormatXeGTAOOwnerInfo(data)
+              << ", " << FormatXeGTAOResultSignatureInfo(data);
+          apply_gate_diag = diag_stream.str();
+        } else {
+          apply_gate_reason = has_result_this_frame
+              ? "XeGTAO composite SRV is not alive"
+              : "XeGTAO result unavailable this frame";
+          std::ostringstream diag_stream;
+          diag_stream
+              << "shader=" << (is_main_lighting_draw ? "main" : "soft")
+              << ", draw_ordinal=" << lighting_draw_ordinal
+              << ", apply_source=" << apply_gate_source
+              << ", " << FormatXeGTAOOwnerInfo(data)
+              << ", " << FormatXeGTAOResultSignatureInfo(data);
+          apply_gate_diag = diag_stream.str();
+        }
+
+        uint64_t apply_gate_diag_hash = 1469598103934665603ull;
+        apply_gate_diag_hash = HashCombineU64(apply_gate_diag_hash, apply_gate_passed ? 1u : 0u);
+        apply_gate_diag_hash = HashCombineU64(apply_gate_diag_hash, HashString(apply_gate_reason));
+        apply_gate_diag_hash = HashCombineU64(apply_gate_diag_hash, HashString(apply_gate_source));
+        apply_gate_diag_hash = HashCombineU64(
+            apply_gate_diag_hash, apply_draw_signature_valid ? apply_draw_signature : 0u);
+        bool* apply_gate_state_valid = is_main_lighting_draw
+            ? &data->last_apply_gate_main_state_valid
+            : &data->last_apply_gate_soft_state_valid;
+        bool* apply_gate_last_passed = is_main_lighting_draw
+            ? &data->last_apply_gate_main_passed
+            : &data->last_apply_gate_soft_passed;
+        uint64_t* apply_gate_last_hash = is_main_lighting_draw
+            ? &data->last_apply_gate_main_diag_hash
+            : &data->last_apply_gate_soft_diag_hash;
+        if (apply_gate_state_valid != nullptr && apply_gate_last_passed != nullptr && apply_gate_last_hash != nullptr) {
+          const bool expected_non_owner_reject = !apply_gate_passed
+              && apply_gate_reason == "downscaled non-owner draw rejected";
+          if (!expected_non_owner_reject) {
+            if (!*apply_gate_state_valid
+                || *apply_gate_last_passed != apply_gate_passed
+                || *apply_gate_last_hash != apply_gate_diag_hash) {
+              std::ostringstream message;
+              message << "XeGTAO apply-gate " << (apply_gate_passed ? "accepted" : "rejected")
+                      << " on frame " << frame;
+              if (apply_gate_passed) {
+                message << " (signature match via " << apply_gate_source << ", " << apply_gate_diag << ")";
+              } else {
+                message << " (" << apply_gate_reason << ", " << apply_gate_diag << ")";
+              }
+              AddonLog(reshade::log::level::info, message.str().c_str());
+            }
+            *apply_gate_state_valid = true;
+            *apply_gate_last_passed = apply_gate_passed;
+            *apply_gate_last_hash = apply_gate_diag_hash;
+          }
+        }
+
+        if (apply_gate_passed && IsViewAlive(device, data->composite_srv)) {
+          bind_xegtao_srv();
+        } else {
+          should_force_neutral_x = true;
+          shader_injection.xegtao_debug_mode = 0.f;
+        }
       }
+
+      std::string apply_path = "strict_t22";
+      if (copyback_active_for_apply) {
+        if (downscaled_result_for_apply) {
+          apply_path = owner_ready_for_draw ? "copyback_active_owner" : "non_owner_neutral";
+        } else {
+          apply_path = "copyback_active_t4";
+        }
+      } else if (copyback_failed_for_apply) {
+        apply_path = "copyback_failed_fallback_t22";
+      } else if (!apply_gate_passed && should_force_neutral_x) {
+        apply_path = "non_owner_neutral";
+      }
+      uint64_t apply_path_hash = 1469598103934665603ull;
+      apply_path_hash = HashCombineU64(apply_path_hash, HashString(apply_path));
+      apply_path_hash = HashCombineU64(apply_path_hash, is_main_lighting_draw ? 1u : 2u);
+      bool* apply_path_state_valid = is_main_lighting_draw
+          ? &data->last_apply_path_main_state_valid
+          : &data->last_apply_path_soft_state_valid;
+      uint64_t* last_apply_path_hash = is_main_lighting_draw
+          ? &data->last_apply_path_main_hash
+          : &data->last_apply_path_soft_hash;
+      if (apply_path_state_valid != nullptr && last_apply_path_hash != nullptr) {
+        if (!*apply_path_state_valid || *last_apply_path_hash != apply_path_hash) {
+          std::ostringstream message;
+          message << "XeGTAO apply-path switched on frame " << frame
+                  << " (path=" << apply_path
+                  << ", mode=" << GetXeGTAOFixModeName(ClampXeGTAOFixMode())
+                  << ", shader=" << (is_main_lighting_draw ? "main" : "soft")
+                  << ", draw_ordinal=" << lighting_draw_ordinal << ")";
+          AddonLog(reshade::log::level::info, message.str().c_str());
+        }
+        *apply_path_state_valid = true;
+        *last_apply_path_hash = apply_path_hash;
+      }
+
+      shader_injection.xegtao_force_neutral_x = should_force_neutral_x ? 1.f : 0.f;
+      const bool xegtao_ao_active_for_draw =
+          !should_force_neutral_x
+          && (shader_injection.xegtao_dedicated_bound >= 0.5f || copyback_active_for_apply);
+      shader_injection.xegtao_ao_active_for_draw = xegtao_ao_active_for_draw ? 1.f : 0.f;
     }
   }
 
@@ -3365,17 +4341,23 @@ void OnPresentAdvanceFrame(
 
   shader_injection.sss_dedicated_bound = 0.f;
   shader_injection.xegtao_dedicated_bound = 0.f;
+  shader_injection.xegtao_force_neutral_x = 0.f;
+  shader_injection.xegtao_debug_blackout = 0.f;
+  shader_injection.xegtao_ao_active_for_draw = 0.f;
   xegtao_mode = std::clamp(std::round(xegtao_mode), 0.f, 1.f);
+  xegtao_denoiser_mode = 0.f;
+  xegtao_isfast_jitter_amount = std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
+  xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
   shader_injection.xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 19.f);
   shader_injection.xegtao_normal_input_mode = static_cast<float>(ClampXeGTAONormalInputMode());
   shader_injection.xegtao_mrt_normal_valid = 0.f;
-  shader_injection.xegtao_bent_normals = xegtao_bent_normals >= 0.5f ? 1.f : 0.f;
-  shader_injection.xegtao_bent_diffuse_strength = std::clamp(xegtao_bent_diffuse_strength, 0.f, 1.f);
-  shader_injection.xegtao_bent_diffuse_softness = std::clamp(xegtao_bent_diffuse_softness, 0.02f, 0.35f);
-  shader_injection.xegtao_bent_specular_strength = std::clamp(xegtao_bent_specular_strength, 0.f, 1.f);
-  shader_injection.xegtao_bent_specular_proxy_roughness =
-      std::clamp(xegtao_bent_specular_proxy_roughness, 0.f, 1.f);
-  shader_injection.xegtao_bent_max_darkening = std::clamp(xegtao_bent_max_darkening, 0.f, 1.f);
+  shader_injection.xegtao_bent_normals = 0.f;
+  shader_injection.xegtao_bent_diffuse_strength = 0.f;
+  shader_injection.xegtao_bent_diffuse_softness = 0.f;
+  shader_injection.xegtao_bent_specular_strength = 0.f;
+  shader_injection.xegtao_bent_specular_proxy_roughness = 0.f;
+  shader_injection.xegtao_bent_max_darkening = 0.f;
+  shader_injection.xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
 }
 
 bool IsAdvancedSettingsMode() {
@@ -3432,13 +4414,13 @@ renodx::utils::settings::Settings settings = {
         .key = "XeGTAOPrecision",
         .binding = &xegtao_precision,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 2.f,
         .label = "Depth Precision",
         .section = "XeGTAO",
-        .tooltip = "Controls XeGTAO depth mip precision. Full precision improves stability at higher GPU cost.",
-        .labels = {"Depth R16", "Depth R32"},
-        .is_enabled = []() { return xegtao_mode >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
+        .tooltip = "Internal-only compatibility key. XeGTAO precision is runtime-forced to Full FP32.",
+        .labels = {"Depth R16", "Depth R32", "Full FP32"},
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "XeGTAONormalInputMode",
@@ -3450,83 +4432,6 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Off uses depth-fallback normals. View-Transformed uses MRT normals transformed to view space.",
         .labels = {"Off", "View-Transformed"},
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "XeGTAOBentNormals",
-        .binding = &xegtao_bent_normals,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
-        .label = "Bent Normals",
-        .section = "XeGTAO",
-        .tooltip = "Enables XeGTAO bent-normal shading on environment pixels.",
-        .labels = {"Off", "Env Only"},
-        .is_enabled = []() { return xegtao_mode >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "XeGTAOBentDiffuseStrength",
-        .binding = &xegtao_bent_diffuse_strength,
-        .default_value = 0.35f,
-        .label = "Bent Diffuse Str",
-        .section = "XeGTAO",
-        .tooltip = "Strength of bent-normal directional diffuse shadowing.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.2f",
-        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "XeGTAOBentDiffuseSoftness",
-        .binding = &xegtao_bent_diffuse_softness,
-        .default_value = 0.15f,
-        .label = "Bent Diffuse Soft",
-        .section = "XeGTAO",
-        .tooltip = "Cosine-space transition width for bent diffuse shading.",
-        .min = 0.02f,
-        .max = 0.35f,
-        .format = "%.3f",
-        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "XeGTAOBentSpecularStrength",
-        .binding = &xegtao_bent_specular_strength,
-        .default_value = 0.25f,
-        .label = "Bent Specular Str",
-        .section = "XeGTAO",
-        .tooltip = "Strength of conservative bent-normal specular proxy attenuation.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.2f",
-        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "XeGTAOBentSpecularProxyRoughness",
-        .binding = &xegtao_bent_specular_proxy_roughness,
-        .default_value = 0.40f,
-        .label = "Bent Spec Proxy R",
-        .section = "XeGTAO",
-        .tooltip = "Roughness proxy used by conservative bent-normal specular attenuation.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.2f",
-        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
-        .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "XeGTAOBentMaxDarkening",
-        .binding = &xegtao_bent_max_darkening,
-        .default_value = 0.35f,
-        .label = "Bent Max Dark",
-        .section = "XeGTAO",
-        .tooltip = "Caps maximum extra darkening from bent-normal modulation.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.2f",
-        .is_enabled = []() { return xegtao_mode >= 0.5f && xegtao_bent_normals >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3660,6 +4565,123 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "XeGTAODenoiserMode",
+        .binding = &xegtao_denoiser_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Denoiser Mode",
+        .section = "XeGTAO",
+        .tooltip = "Vanilla uses XeGTAO denoise only. IS-FAST Only replaces it. Hybrid runs vanilla then IS-FAST.",
+        .labels = {"Vanilla", "IS-FAST Only", "Hybrid"},
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTJitter",
+        .binding = &xegtao_isfast_jitter,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Temporal Jitter",
+        .section = "XeGTAO",
+        .tooltip = "Off freezes IS-FAST temporal noise. On enables temporal jitter.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTJitterAmount",
+        .binding = &xegtao_isfast_jitter_amount,
+        .default_value = 1.f,
+        .label = "Temporal Jitter Amt",
+        .section = "XeGTAO",
+        .tooltip = "0 = static sampling pattern, 1 = full temporal jitter movement.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTPasses",
+        .binding = &xegtao_isfast_passes,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "IS-FAST Passes",
+        .section = "XeGTAO",
+        .tooltip = "Number of IS-FAST denoise passes.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%d",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTSamples",
+        .binding = &xegtao_isfast_samples,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 8.f,
+        .label = "IS-FAST Samples",
+        .section = "XeGTAO",
+        .tooltip = "Per-pixel stochastic samples used by each IS-FAST pass.",
+        .min = 2.f,
+        .max = 16.f,
+        .format = "%d",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTRadius",
+        .binding = &xegtao_isfast_radius,
+        .default_value = 1.0f,
+        .label = "IS-FAST Radius",
+        .section = "XeGTAO",
+        .tooltip = "Filter radius in pixels for IS-FAST denoise.",
+        .min = 0.25f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTEdgeSensitivity",
+        .binding = &xegtao_isfast_edge_sensitivity,
+        .default_value = 2.0f,
+        .label = "IS-FAST Edge Sens",
+        .section = "XeGTAO",
+        .tooltip = "Higher values preserve edge discontinuities more aggressively.",
+        .min = 0.f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTSpatialSigma",
+        .binding = &xegtao_isfast_spatial_sigma,
+        .default_value = 1.0f,
+        .label = "IS-FAST Sigma",
+        .section = "XeGTAO",
+        .tooltip = "Spatial Gaussian sigma for IS-FAST denoise.",
+        .min = 0.1f,
+        .max = 8.f,
+        .format = "%.2f",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOISFASTHybridBlend",
+        .binding = &xegtao_isfast_hybrid_blend,
+        .default_value = 0.5f,
+        .label = "IS-FAST Hybrid Mix",
+        .section = "XeGTAO",
+        .tooltip = "Blend amount of IS-FAST output in Hybrid mode.",
+        .min = 0.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .is_enabled = []() { return false; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "XeGTAORadius",
         .binding = &xegtao_radius,
         .default_value = 0.5f,
@@ -3698,7 +4720,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "XeGTAOFinalPower",
         .binding = &xegtao_final_value_power,
-        .default_value = 2.2f,
+        .default_value = 2.0f,
         .label = "Final Power",
         .section = "XeGTAO",
         .min = 0.5f,
@@ -4135,7 +5157,7 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // â”€â”€ SSS â”€â”€
+    // ── SSS ──
     new renodx::utils::settings::Setting{
         .key = "FoliageSSSEnabled",
         .binding = &shader_injection.foliage_sss_enabled,
@@ -4800,3 +5822,4 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   return TRUE;
 }
+
