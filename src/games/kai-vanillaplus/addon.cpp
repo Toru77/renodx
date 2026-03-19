@@ -138,6 +138,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x534E54EA),                 // sss source pass
     CustomShaderEntry(0xAB6DBF4D),                 // dof coc
     CustomShaderEntry(0x2734F870),                 // dof blur composite
+    CustomShaderEntry(0xBD7DFE49),                 // volumetric fog composite
     {
         kAoPass0Shader,
         {
@@ -195,14 +196,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = &OnBeforeWireFenceShaderDraw,
         },
     },  // wire fence
-    {
-        kVolFogShader,
-        {
-            .crc32 = kVolFogShader,
-            .code = __0xBD7DFE49,
-            .on_draw = &OnBeforeVolFogShaderDraw,
-        },
-    },  // volumetric fog composite
+    //{
+       // kVolFogShader,
+       // {
+          //  .crc32 = kVolFogShader,
+           // .code = __0xBD7DFE49,
+           // .on_draw = &OnBeforeVolFogShaderDraw,
+       // },
+    //},  // volumetric fog composite
 };
 
 SssInjectData shader_injection = {
