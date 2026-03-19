@@ -944,7 +944,8 @@ void main(
   bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
   float chargi_ao_raw = saturate(max(r4.x, r4.y * sss_shadow_sample));
   float chargi_depth_center = max(r2.z, 1e-6);
-  bool shadow_use_jitter = sss_injection_data.shadow_pcss_jitter_enabled >= 0.5;
+  // Soft-lighting variant uses a stable shadow kernel (no temporal jitter).
+  bool shadow_use_jitter = false;
   float shadow_jitter_amount = saturate(sss_injection_data.shadow_isfast_jitter_amount);
   float shadow_jitter_speed = max(sss_injection_data.shadow_isfast_jitter_speed, 0.0);
   float2 shadow_jitter_pixel = floor(v0.xy);

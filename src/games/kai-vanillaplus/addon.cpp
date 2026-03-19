@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -3724,7 +3724,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return true;
   const bool is_main_lighting_draw = shader_hash == kLightingShader;
   const float resolved_xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 19.f);
-  shader_injection.xegtao_debug_mode = is_main_lighting_draw ? resolved_xegtao_debug_mode : 0.f;
+  shader_injection.xegtao_debug_mode = 0.f;
 
   auto* device = cmd_list->get_device();
   if (device != nullptr && IsIsFastSupportedDevice(device)) {
@@ -3742,7 +3742,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       bool dispatched_xegtao_this_draw = false;
       uint64_t dispatched_gate_signature = 0u;
 
-      if (!has_result_this_frame && is_main_lighting_draw) {
+      if (!has_result_this_frame) {
         if (mode == XeGTAOMode::kLightingOverride) {
           std::string gate_reason;
           std::string gate_diag;
@@ -3861,6 +3861,8 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           && data->xegtao_owner_frame == frame
           && shader_hash == data->xegtao_owner_shader_hash
           && lighting_draw_ordinal == data->xegtao_owner_draw_ordinal;
+      // Owner-only debug policy: only the owning lighting draw emits XeGTAO debug.
+      shader_injection.xegtao_debug_mode = owner_ready_for_draw ? resolved_xegtao_debug_mode : 0.f;
       const bool downscaled_owner_token_available =
           data->xegtao_owner_valid
           && data->xegtao_owner_frame == frame
@@ -3893,7 +3895,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             apply_gate_passed = true;
             apply_gate_source = "copyback_active_owner";
             apply_gate_reason = "copyback-active owner draw";
-            if (resolved_xegtao_debug_mode > 0.f && IsViewAlive(device, data->composite_srv)) {
+            if (shader_injection.xegtao_debug_mode > 0.f && IsViewAlive(device, data->composite_srv)) {
               bind_xegtao_srv();
             }
           } else {
@@ -3911,7 +3913,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           apply_gate_source = "copyback_active_t4";
           apply_gate_reason = "copyback-active path";
 
-          if (resolved_xegtao_debug_mode > 0.f && resolved_xegtao_debug_mode <= 9.f) {
+          if (shader_injection.xegtao_debug_mode > 0.f && shader_injection.xegtao_debug_mode <= 9.f) {
             if (owner_ready_for_draw && IsViewAlive(device, data->composite_srv)) {
               bind_xegtao_srv();
             } else {
@@ -3959,8 +3961,8 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                 apply_t3_info = current_t3_info;
                 apply_t4_info = current_t4_info;
               }
-            } else if (is_main_lighting_draw) {
-              apply_gate_source = "tracked_main_fallback";
+            } else {
+              apply_gate_source = "tracked_fallback";
               if (!tracked_t3_info.alive || tracked_t3_info.resource.handle == 0u
                   || tracked_t3_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
                 apply_gate_reason = "tracked fallback t3 is invalid";
@@ -3979,8 +3981,6 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                 apply_t3_info = tracked_t3_info;
                 apply_t4_info = tracked_t4_info;
               }
-            } else {
-              apply_gate_reason = "current draw t3/t4 bindings not found (soft draw fallback disabled)";
             }
           }
 
@@ -5822,4 +5822,3 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   return TRUE;
 }
-
