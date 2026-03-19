@@ -431,11 +431,13 @@ void main(
   r1.xy = fDest.xy;
   r1.xy = v1.xy * r1.xy + float2(-0.5,-0.5);
   r1.xy = max(float2(0,0), r1.xy);
-  r1.xy = (int2)r1.xy;
-  r1.zw = float2(0,0);
-  r1.xyz = mrtTexture0.Load(r1.xyz).xyz;
-  uint mrt0_z_raw = (uint)r1.z;  // Save for SSS target flag extraction
-  if (1 == 0) r1.z = 0; else if (1+8 < 32) {   r1.z = (uint)r1.z << (32-(1 + 8)); r1.z = (uint)r1.z >> (32-1);  } else r1.z = (uint)r1.z >> 8;
+  int2 mrt0_coord = (int2)r1.xy;
+  uint4 mrt0_raw = mrtTexture0.Load(int3(mrt0_coord, 0));
+  r1.xy = mrt0_raw.xy;
+  uint mrt0_z_raw = mrt0_raw.z;  // Save for SSS target flag extraction
+  const uint kFoliageMarkerBit = 0x80000000u;
+  uint mrt0_z_class = mrt0_z_raw & ~kFoliageMarkerBit;
+  r1.z = (float)((mrt0_z_class >> 8u) & 1u);
   if (r1.z != 0) {
     r0.xy = v1.zw * float2(2,-2) + float2(-1,1);
     r0.w = 1;
@@ -562,7 +564,7 @@ void main(
   } else {
     r1.z = 0;
     // Detect SSS target mask by vanilla mrtTexture0.z values (2303=0x8FF, 3327=0xCFF)
-    bool is_foliage = (mrt0_z_raw == 2303u || mrt0_z_raw == 3327u);
+    bool is_foliage = (mrt0_z_class == 2303u || mrt0_z_class == 3327u);
     if (is_foliage && sss_injection_data.foliage_sss_enabled >= 0.5) {
       // Decode normal from mrtTexture0.xy (spherical encoding)
       float2 enc = (float2)((uint2)r1.xy) * float2(3.05180438e-05, 3.05180438e-05) + float2(-1, -1);
@@ -611,10 +613,10 @@ void main(
 
   // --- SSS Debug in char shader ---
   int foliage_dbg_char = (int)sss_injection_data.foliage_debug_mode;
-  bool dbg_is_foliage = (mrt0_z_raw == 2303u || mrt0_z_raw == 3327u);
+  bool dbg_is_foliage = (mrt0_z_class == 2303u || mrt0_z_class == 3327u);
   if (foliage_dbg_char == 1) {
     // SSS mask: green = target, red dim = character, black = other
-    bool dbg_is_char = (((mrt0_z_raw >> 8u) & 1u) != 0u);
+    bool dbg_is_char = (((mrt0_z_class >> 8u) & 1u) != 0u);
     o0.xyz = dbg_is_foliage ? float3(0, 1, 0)
            : dbg_is_char    ? float3(0.3, 0, 0)
            :                  float3(0, 0, 0);
@@ -625,7 +627,7 @@ void main(
     o0.w = 1;
   } else if (foliage_dbg_char == 6) {
     // Vanilla value detect (same as lighting debug)
-    uint raw_z = mrt0_z_raw;
+    uint raw_z = mrt0_z_class;
     if (raw_z == 2303u)
       o0.xyz = float3(0, 1, 0);
     else if (raw_z == 3327u)

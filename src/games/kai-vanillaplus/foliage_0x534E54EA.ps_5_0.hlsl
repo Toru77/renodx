@@ -187,8 +187,9 @@ void main(
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
   r0.x = r0.y ? 0 : 1;
-  o1.z = r0.y ? 3327 : 2303;
-  // Foliage is now detected by vanilla values (2303/3327) in other shaders
+  uint foliage_class = r0.y ? 3327u : 2303u;
+  foliage_class |= 0x80000000u;
+  o1.z = foliage_class;
   r0.y = (ssaoIntensity_g * sss_injection_data.foliage_ssao_scale) * r1.w;
   o0.xyz = r1.xyz;
   o0.w = r0.y * r0.x;

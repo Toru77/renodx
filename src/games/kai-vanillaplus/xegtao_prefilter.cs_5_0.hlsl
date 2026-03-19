@@ -40,9 +40,15 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_normal_detail_response;
   float xegtao_normal_max_darkening;
   float xegtao_normal_darkening_mode;
-  float xegtao_bent_normals;
-  float xegtao_reserved0;
-  float xegtao_reserved1;
+  float xegtao_denoiser_mode;
+  float xegtao_copyback_preserve_yzw;
+  float xegtao_isfast_passes;
+  float xegtao_isfast_samples;
+  float xegtao_isfast_radius;
+  float xegtao_isfast_edge_sensitivity;
+  float xegtao_isfast_spatial_sigma;
+  float xegtao_isfast_hybrid_blend;
+  float xegtao_isfast_noise_available;
 };
 
 #include "./GTAO/XeGTAO.hlsli"

@@ -25,9 +25,15 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_normal_detail_response;
   float xegtao_normal_max_darkening;
   float xegtao_normal_darkening_mode;
-  float xegtao_bent_normals;
-  float xegtao_reserved0;
-  float xegtao_reserved1;
+  float xegtao_denoiser_mode;
+  float xegtao_copyback_preserve_yzw;
+  float xegtao_isfast_passes;
+  float xegtao_isfast_samples;
+  float xegtao_isfast_radius;
+  float xegtao_isfast_edge_sensitivity;
+  float xegtao_isfast_spatial_sigma;
+  float xegtao_isfast_hybrid_blend;
+  float xegtao_isfast_noise_available;
 };
 
 Texture2D<float4> g_srcOriginalAO : register(t0);
@@ -65,9 +71,14 @@ void main(uint2 dispatch_thread_id : SV_DispatchThreadID)
   float4 original_ao = g_srcOriginalAO.Load(load_coord);
   float4 gtao_term = DecodeAOTerm(g_srcGTAOTerm.Load(load_coord).x);
   // Contract:
-  //   x = visibility (decoded .w),
-  //   yz = bent normal payload (decoded .xy),
-  //   w = original alpha.
-  g_outComposite[dispatch_thread_id] = float4(gtao_term.w, gtao_term.x, gtao_term.y, original_ao.w);
+  //   x = visibility (decoded .w)
+  //   yzw = preserved AO yzw in copyback path to avoid AO semantic corruption.
+  //   non-copyback path keeps existing payload behavior for dedicated t22 consumers.
+  float4 composite_value = float4(gtao_term.w, gtao_term.x, gtao_term.y, original_ao.w);
+  if (xegtao_copyback_preserve_yzw >= 0.5)
+  {
+    composite_value = float4(gtao_term.w, original_ao.y, original_ao.z, original_ao.w);
+  }
+  g_outComposite[dispatch_thread_id] = composite_value;
 }
 

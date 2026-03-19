@@ -355,14 +355,25 @@ void main(
   r3.xy = v1.xy * r3.xy;
   r3.xy = (int2)r3.xy;
   r3.zw = float2(0,0);
-  r3.xyz = mrtTexture0.Load(r3.xyz).xyz;
-  uint mrt0z_raw = (uint)r3.z;
+  uint4 mrt0_raw = mrtTexture0.Load(r3.xyz);
+  const uint kFoliageMarkerBit = 0x80000000u;
+  uint mrt0z_marked = mrt0_raw.z;
+  uint mrt0z_raw = mrt0z_marked & ~kFoliageMarkerBit;
+  r3.xy = mrt0_raw.xy;
+  r3.z = mrt0z_raw;
   const bool is_character_pixel = ((mrt0z_raw >> 8u) & 1u) != 0u;
-  const bool is_foliage_pixel = (mrt0z_raw == 2303u || mrt0z_raw == 3327u);
+  const bool is_foliage_marker = (mrt0z_marked & kFoliageMarkerBit) != 0u;
+  const bool is_foliage_id = (mrt0z_raw == 2303u) || (mrt0z_raw == 3327u);
+  // Keep marker authoritative, but tolerate legacy/raw-ID cases for stable SSS targeting.
+  const bool is_foliage_pixel = is_foliage_marker || is_foliage_id;
   const bool is_environment_pixel = !is_character_pixel && !is_foliage_pixel;
   float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
   const bool xegtao_bound = sss_injection_data.xegtao_dedicated_bound >= 0.5;
+  const bool xegtao_force_neutral_x = sss_injection_data.xegtao_force_neutral_x >= 0.5;
   const bool xegtao_bent_normals_enabled = sss_injection_data.xegtao_bent_normals >= 0.5;
+  const bool xegtao_debug_blackout = sss_injection_data.xegtao_debug_blackout >= 0.5;
+  const bool xegtao_ao_active_for_draw = sss_injection_data.xegtao_ao_active_for_draw >= 0.5;
+  const float xegtao_foliage_blend = saturate(sss_injection_data.xegtao_foliage_ao_blend);
   float3 xegtao_sample = ssao_sample;
   if (xegtao_bound) {
     xegtao_sample = xegtaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
@@ -374,6 +385,11 @@ void main(
     if (xegtao_bent_normals_enabled && is_environment_pixel) {
       ao_sample.x = ApplyXeGTAOBentVisibility(ao_sample.x, xegtao_sample.yz);
     }
+  } else if (xegtao_force_neutral_x) {
+    ao_sample.x = 1.0;
+  }
+  if (xegtao_ao_active_for_draw && is_foliage_pixel) {
+    ao_sample.x = lerp(1.0, ao_sample.x, xegtao_foliage_blend);
   }
   r4.xyz = ao_sample;
   float sss_shadow_sample = saturate(ssao_sample.z);
@@ -381,9 +397,15 @@ void main(
     sss_shadow_sample = saturate(sssShadowTexture.SampleLevel(samLinear_s, v1.xy, 0).z);
   }
   uint xegtao_debug_mode_ui = (uint)round(max(sss_injection_data.xegtao_debug_mode, 0.0));
-  const bool run_xegtao_debug = xegtao_debug_mode_ui > 0u
-      && (xegtao_bound || xegtao_debug_mode_ui >= 10u);
+  const bool run_xegtao_debug = !xegtao_force_neutral_x
+      && xegtao_debug_mode_ui > 0u
+      && (xegtao_bound || xegtao_debug_mode_ui >= 10u || xegtao_debug_blackout);
   if (run_xegtao_debug) {
+    if (xegtao_debug_blackout && xegtao_debug_mode_ui <= 9u) {
+      o0 = float4(0.0, 0.0, 0.0, 1.0);
+      o1 = r1;
+      return;
+    }
     if (is_character_pixel) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
@@ -405,6 +427,9 @@ void main(
 
     const bool xegtao_effective_character_masked = xegtao_bound && !is_character_pixel;
     float3 xegtao_debug_sample = xegtao_effective_character_masked ? xegtao_debug_source : ssao_debug_sample;
+    if (xegtao_ao_active_for_draw && is_foliage_pixel) {
+      xegtao_debug_sample.x = lerp(1.0, xegtao_debug_sample.x, xegtao_foliage_blend);
+    }
     float3 ao_debug_sample = is_character_pixel ? ssao_debug_sample : ao_sample;
     float xegtao_ao = saturate(xegtao_debug_sample.x);
     float vanilla_ao = saturate(ssao_debug_sample.x);

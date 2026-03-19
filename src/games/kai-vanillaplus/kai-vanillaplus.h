@@ -159,6 +159,14 @@ struct SssInjectData {
   float xegtao_bent_specular_proxy_roughness;
   // Maximum extra darkening from bent-normal modulation.
   float xegtao_bent_max_darkening;
+  // Force neutral AO.X on draws that are gated away from XeGTAO consumption.
+  float xegtao_force_neutral_x;
+  // Force black debug output for XeGTAO debug modes 01..09 on this draw.
+  float xegtao_debug_blackout;
+  // True when this draw is consuming XeGTAO AO.X (custom-bind or copyback path).
+  float xegtao_ao_active_for_draw;
+  // Foliage-only XeGTAO AO blend factor: 0=no AO on foliage, 1=full XeGTAO AO.
+  float xegtao_foliage_ao_blend;
 };
 
 #ifndef __cplusplus

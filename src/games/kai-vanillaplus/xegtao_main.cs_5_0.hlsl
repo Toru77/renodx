@@ -40,9 +40,15 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_normal_detail_response;
   float xegtao_normal_max_darkening;
   float xegtao_normal_darkening_mode;
-  float xegtao_bent_normals;
-  float xegtao_reserved0;
-  float xegtao_reserved1;
+  float xegtao_denoiser_mode;
+  float xegtao_copyback_preserve_yzw;
+  float xegtao_isfast_passes;
+  float xegtao_isfast_samples;
+  float xegtao_isfast_radius;
+  float xegtao_isfast_edge_sensitivity;
+  float xegtao_isfast_spatial_sigma;
+  float xegtao_isfast_hybrid_blend;
+  float xegtao_isfast_noise_available;
 };
 
 #ifndef XE_GTAO_COMPUTE_BENT_NORMALS
@@ -127,9 +133,29 @@ void GetQualityParameters(out lpfloat slice_count, out lpfloat steps_per_slice)
   }
 }
 
-float3 DecodeMrtNormalAsIs(uint2 pix_coord)
+bool TryMapWorkingPixelToMrtTexel(uint2 working_pix_coord, uint2 working_size, out uint2 mapped_mrt_texel)
 {
-  const uint4 mrt_sample = g_srcMrtNormal.Load(int3(pix_coord, 0));
+  mapped_mrt_texel = uint2(0u, 0u);
+
+  uint mrt_width;
+  uint mrt_height;
+  g_srcMrtNormal.GetDimensions(mrt_width, mrt_height);
+  if (mrt_width == 0u || mrt_height == 0u)
+  {
+    return false;
+  }
+
+  uint2 mrt_size = uint2(mrt_width, mrt_height);
+  float2 safe_working_size = max(float2(working_size), 1.0.xx);
+  float2 scale = float2(mrt_size) / safe_working_size;
+  float2 mapped = floor((float2(working_pix_coord) + 0.5.xx) * scale);
+  mapped_mrt_texel = min((uint2)mapped, mrt_size - 1u);
+  return true;
+}
+
+float3 DecodeMrtNormalAsIs(uint2 mrt_texel)
+{
+  const uint4 mrt_sample = g_srcMrtNormal.Load(int3(mrt_texel, 0));
   float2 encoded = float2((float)mrt_sample.x, (float)mrt_sample.y) * (1.0 / 32767.5) + float2(-1.0, -1.0);
   float azimuth = 3.14159274 * encoded.x;
   float sin_azimuth;
@@ -218,7 +244,7 @@ float3 BuildDepthFallbackNormal(uint2 pix_coord, GTAOConstants consts)
   return depth_normal * rsqrt(len2);
 }
 
-float3 BuildSelectedInputNormal(uint2 pix_coord, GTAOConstants consts)
+float3 BuildSelectedInputNormal(uint2 pix_coord, uint2 working_size, GTAOConstants consts)
 {
   float3 depth_fallback_normal = BuildDepthFallbackNormal(pix_coord, consts);
   float3 selected = depth_fallback_normal;
@@ -229,7 +255,13 @@ float3 BuildSelectedInputNormal(uint2 pix_coord, GTAOConstants consts)
 
   if (xegtao_mrt_normal_available >= 0.5)
   {
-    float3 decoded_normal = DecodeMrtNormalAsIs(pix_coord);
+    uint2 mapped_mrt_texel = uint2(0u, 0u);
+    if (!TryMapWorkingPixelToMrtTexel(pix_coord, working_size, mapped_mrt_texel))
+    {
+      return selected;
+    }
+
+    float3 decoded_normal = DecodeMrtNormalAsIs(mapped_mrt_texel);
     float decoded_len2 = dot(decoded_normal, decoded_normal);
     if (decoded_len2 >= 1e-5)
     {
@@ -276,7 +308,7 @@ void main(uint2 pix_coord : SV_DispatchThreadID)
   GetQualityParameters(slice_count, steps_per_slice);
 
   uint noise_index = consts.NoiseIndex < 0 ? 0u : (uint)consts.NoiseIndex;
-  lpfloat3 selected_normal = (lpfloat3)BuildSelectedInputNormal(pix_coord, consts);
+  lpfloat3 selected_normal = (lpfloat3)BuildSelectedInputNormal(pix_coord, uint2(width, height), consts);
 
   XeGTAO_MainPass(
       pix_coord,
