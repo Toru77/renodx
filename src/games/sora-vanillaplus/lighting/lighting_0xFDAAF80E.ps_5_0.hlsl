@@ -213,6 +213,7 @@ void main(
   float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21;
   uint4 bitmask, uiDest;
   float4 fDest;
+  uint width, height, num_levels;
 
   r0.xyzw = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyzw;
   mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -582,7 +583,7 @@ void main(
   r3.z = r8.w * r3.w;
   r6.z = dot(r6.xyw, r15.xyz);
   r16.xyzw = (int4)r1.wwww & int4(1,2,4,16);
-  r0.w = r16.x ? r0.w : 1;
+  r0.w = r16.x ? 1.0f : r0.w;
   r17.xyz = r12.xyz * r1.yyy + -lightDirection_g.xyz;
   r8.w = dot(r17.xyz, r17.xyz);
   r8.w = rsqrt(r8.w);
@@ -608,16 +609,9 @@ void main(
     } else {
       r8.w = r6.z + r6.z;
       r18.xyz = r6.xyw * -r8.www + r15.xyz;
-      r8.w = uiDest.w;
-    // Unknown use of GetDimensions for resinfo_ from missing reflection info, need manual fix.
-    //     resinfo_indexable(texturecube)(float,float,float,float)_uint r8.w, l(0), t17.xyzw
-    // Example for texture2d type, uint return:
-    tx.GetDimensions(0, uiDest.x, uiDest.y, uiDest.z);
-    rx = uiDest;
-     state=1, constZero.eType=4, returnType=2, texture.eType=7, afImmediates[0]=0.000000
+      texEnvMap_g.GetDimensions(0, width, height, num_levels);
       r18.xyz = float3(1,-1,-1) * r18.xyz;
-      r8.w = (int)r8.w + -1;
-      r8.w = (uint)r8.w;
+      r8.w = (float)(num_levels - 1);
       r8.w = r16.z * r8.w;
       r17.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r18.xyz, r8.w).xyz;
     }
@@ -667,16 +661,9 @@ void main(
       r15.xyz = r1.www * -r15.xyz + -r19.xyz;
       r15.xyz = r7.yyy ? r15.xyz : 0;
       r1.w = r13.z * r7.z;
-      r2.x = uiDest.w;
-    // Unknown use of GetDimensions for resinfo_ from missing reflection info, need manual fix.
-    //     resinfo_indexable(texturecube)(float,float,float,float)_uint r2.x, l(0), t17.wxyz
-    // Example for texture2d type, uint return:
-    tx.GetDimensions(0, uiDest.x, uiDest.y, uiDest.z);
-    rx = uiDest;
-     state=1, constZero.eType=4, returnType=2, texture.eType=7, afImmediates[0]=0.000000
+      texEnvMap_g.GetDimensions(0, width, height, num_levels);
       r17.xyz = float3(1,-1,-1) * r17.xyz;
-      r2.x = (int)r2.x + -1;
-      r2.x = (uint)r2.x;
+      r2.x = (float)(num_levels - 1);
       r1.w = r2.x * r1.w;
       r17.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r17.xyz, r1.w).xyz;
       r2.x = (int)r1.z & 2;
@@ -744,9 +731,7 @@ void main(
     while (true) {
       r2.w = cmp((uint)r2.x >= (uint)r1.w);
       if (r2.w != 0) break;
-      r2.w = (uint)r2.x << 2;
-    // Structured buffer using dynamic offset (needs manual fix):
-        ld_structured_indexable(structured_buffer, stride=576)(mixed,mixed,mixed,mixed) r2.w, r3.y, r2.w, t12.xxxx
+      r2.w = lightIndices_g[r3.y].pointLightIndices[r2.x];
       r11.x = dynamicLights_g[r2.w].pos.x;
       r11.y = dynamicLights_g[r2.w].pos.y;
       r11.z = dynamicLights_g[r2.w].pos.z;
@@ -802,10 +787,7 @@ void main(
     while (true) {
       r2.w = cmp((uint)r2.x >= (uint)r1.w);
       if (r2.w != 0) break;
-      r2.w = (uint)r2.x << 2;
-      r2.w = (int)r2.w + 256;
-    // Structured buffer using dynamic offset (needs manual fix):
-        ld_structured_indexable(structured_buffer, stride=576)(mixed,mixed,mixed,mixed) r2.w, r3.y, r2.w, t12.xxxx
+      r2.w = lightIndices_g[r3.y].spotLightIndices[r2.x];
       r15.x = dynamicLights_g[r2.w].pos.x;
       r15.y = dynamicLights_g[r2.w].pos.y;
       r15.z = dynamicLights_g[r2.w].pos.z;
@@ -907,9 +889,7 @@ void main(
     while (true) {
       r1.w = cmp((uint)r9.w >= (uint)r1.y);
       if (r1.w != 0) break;
-      r1.w = (uint)r9.w << 2;
-    // Structured buffer using dynamic offset (needs manual fix):
-        ld_structured_indexable(structured_buffer, stride=576)(mixed,mixed,mixed,mixed) r1.w, r3.y, r1.w, t12.xxxx
+      r1.w = lightIndices_g[r3.y].pointLightIndices[r9.w];
       r10.x = dynamicLights_g[r1.w].pos.x;
       r10.y = dynamicLights_g[r1.w].pos.y;
       r10.z = dynamicLights_g[r1.w].pos.z;
@@ -948,10 +928,7 @@ void main(
     while (true) {
       r1.w = cmp((uint)r10.w >= (uint)r1.y);
       if (r1.w != 0) break;
-      r1.w = (uint)r10.w << 2;
-      r1.w = (int)r1.w + 256;
-    // Structured buffer using dynamic offset (needs manual fix):
-        ld_structured_indexable(structured_buffer, stride=576)(mixed,mixed,mixed,mixed) r1.w, r3.y, r1.w, t12.xxxx
+      r1.w = lightIndices_g[r3.y].spotLightIndices[r10.w];
       r11.x = dynamicLights_g[r1.w].pos.x;
       r11.y = dynamicLights_g[r1.w].pos.y;
       r11.z = dynamicLights_g[r1.w].pos.z;
