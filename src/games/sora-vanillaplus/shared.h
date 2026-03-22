@@ -7,6 +7,8 @@ struct ShaderInjectData {
   float slider_1;
   float slider_2;
   float slider_3;
+  // Volumetric haze AA mode: 0 = Vanilla, 1 = Improved (tricubic haze AA)
+  float volfog_haze_aa_mode;
 };
 
 #ifndef __cplusplus
@@ -22,6 +24,8 @@ cbuffer shader_injection : register(b13) {
 #define VANILLAPLUS_SLIDER_1    shader_injection_data.slider_1
 #define VANILLAPLUS_SLIDER_2    shader_injection_data.slider_2
 #define VANILLAPLUS_SLIDER_3    shader_injection_data.slider_3
+#define VANILLAPLUS_VOLFOG_HAZE_AA shader_injection_data.volfog_haze_aa_mode
+#define VANILLAPLUS_VOLFOG_HAZE_AA_STRENGTH 1.0
 #endif
 
 #endif  // SRC_GAMES_GENERIC_VANILLAPLUS_SHARED_H_

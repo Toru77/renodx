@@ -77,6 +77,10 @@ Texture2D<float4> depthTexture : register(t1);
 Texture3D<float4> volumeScatter : register(t2);
 
 
+// Includes for improved volumetric haze AA
+#include "../reference/rendering.hlsl"
+#include "../shared.h"
+
 // 3Dmigoto declarations
 #define cmp -
 
@@ -100,7 +104,20 @@ void main(
   r0.y = -volumeNearOverFarClip_g + 1;
   r0.z = r0.x / r0.y;
   r0.xy = v1.xy;
-  r0.xyzw = volumeScatter.SampleLevel(samLinear_s, r0.xyz, 0).xyzw;
+  // Sample the volume: vanilla trilinear or improved tricubic haze AA
+  {
+    float3 uvw = r0.xyz;
+    uint volW, volH, volD;
+    volumeScatter.GetDimensions(volW, volH, volD);
+    float3 volSize = float3((float)volW, (float)volH, (float)volD);
+    float4 volSample;
+    if (shader_injection_data.volfog_haze_aa_mode > 0.5) {
+      volSample = renodx::rendering::SampleTricubicBSpline(volumeScatter, samLinear_s, uvw, volSize);
+    } else {
+      volSample = volumeScatter.SampleLevel(samLinear_s, uvw, 0);
+    }
+    r0.xyzw = volSample.xyzw;
+  }
   r1.xyzw = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyzw;
   r0.xyz = r1.xyz * r0.www + r0.xyz;
   r0.xyz = r0.xyz + -r1.xyz;
