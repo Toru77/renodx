@@ -31,6 +31,7 @@
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/resource.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/platform.hpp"
 #include "../../utils/shader.hpp"
 #include "../../utils/state.hpp"
 #include "../../utils/swapchain.hpp"
@@ -5740,13 +5741,27 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-        .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Addon made by Toru.",
-        .section = "Info",
+      .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+      .label = "Patreon",
+      .section = "Info",
+      .on_click = []() {
+        renodx::utils::platform::LaunchURL("https://www.patreon.com/c/Toru77");
+        return false;
+      },
+    },
+    new renodx::utils::settings::Setting{
+      .value_type = renodx::utils::settings::SettingValueType::TEXT,
+      .label = "Addon made by Toru.",
+      .section = "Info",
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "Thanks to Shortfuse for RenoDX.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Thanks to Forge for rendering techniques and inspiring me.",
         .section = "Info",
     },
     new renodx::utils::settings::Setting{
@@ -5761,7 +5776,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Enable High or Ultra Local Shadowing.",
+        .label = "Enable High or Ultra Local Shadowing for XeGTAO.",
         .section = "Info",
     },
 };
