@@ -23,6 +23,7 @@ ShaderInjectData shader_injection = {
     .slider_1 = 50.f,
     .slider_2 = 50.f,
     .slider_3 = 0.f,
+    .volfog_haze_aa_mode = 0.f,
 };
 
 renodx::mods::shader::CustomShaders custom_shaders = {
@@ -32,45 +33,18 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 };
 
 renodx::utils::settings::Settings settings = {
+    // NOTE: removed generic ModEnabled and Slider{1,2,3} settings per request
     new renodx::utils::settings::Setting{
-        .key = "ModEnabled",
-        .binding = &shader_injection.mod_enabled,
+        .key = "VolFogHazeAAMode",
+        .binding = &shader_injection.volfog_haze_aa_mode,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f,
-        .label = "Enabled",
-        .section = "Vanilla+",
-        .labels = {"Off", "On"},
+        .label = "Volumetric Haze AA",
+        .section = "Volumetric Fog",
+        .tooltip = "Mode for volumetric haze anti-aliasing: Vanilla or Improved (tricubic B-spline).",
+        .labels = {"Vanilla", "Improved"},
     },
-    new renodx::utils::settings::Setting{
-        .key = "Slider1",
-        .binding = &shader_injection.slider_1,
-        .default_value = 50.f,
-        .label = "Slider 1",
-        .section = "Vanilla+",
-        .tooltip = "Generic slider value passed to injected shaders.",
-        .min = 0.f,
-        .max = 100.f,
-    },
-    new renodx::utils::settings::Setting{
-        .key = "Slider2",
-        .binding = &shader_injection.slider_2,
-        .default_value = 50.f,
-        .label = "Slider 2",
-        .section = "Vanilla+",
-        .tooltip = "Generic slider value passed to injected shaders.",
-        .min = 0.f,
-        .max = 100.f,
-    },
-    new renodx::utils::settings::Setting{
-        .key = "Slider3",
-        .binding = &shader_injection.slider_3,
-        .default_value = 0.f,
-        .label = "Slider 3",
-        .section = "Vanilla+",
-        .tooltip = "Generic slider value passed to injected shaders.",
-        .min = -100.f,
-        .max = 100.f,
-    },
+    
 };
 
 }  // namespace
