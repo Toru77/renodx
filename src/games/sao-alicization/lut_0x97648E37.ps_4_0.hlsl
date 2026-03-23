@@ -170,7 +170,7 @@ void main(
     if (strength > 0.f) {
       // Use the original HDR color as the hue/purity reference
       finalHDRColor = CorrectHueAndPurityMBGated(
-          finalHDRColor, referenceSDR, 1.f, 0.f, 0.f, 1.0f, 1.0f, float2(-1.f, -1.f), 1e-6f);
+          finalHDRColor, referenceSDR, 1.f, 0.f, 0.f, 0.95f, 1.0f, float2(-1.f, -1.f), 1e-6f);
     }
   }
 

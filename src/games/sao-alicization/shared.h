@@ -6,7 +6,7 @@
 // #define RENODX_GRAPHICS_WHITE_NITS             renodx::color::bt2408::GRAPHICS_WHITE
 // #define RENODX_COLOR_GRADE_STRENGTH            1.f
 // #define RENODX_TONE_MAP_TYPE                   TONE_MAP_TYPE_RENO_DRT
-// #define RENODX_TONE_MAP_EXPOSURE               1.f
+#define RENODX_TONE_MAP_EXPOSURE               0.5f
 // #define RENODX_TONE_MAP_HIGHLIGHTS             1.f
 // #define RENODX_TONE_MAP_SHADOWS                1.f
 // #define RENODX_TONE_MAP_CONTRAST               1.f
