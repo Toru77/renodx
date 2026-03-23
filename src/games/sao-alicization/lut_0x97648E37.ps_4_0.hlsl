@@ -43,6 +43,7 @@ void main(
 
   // Raw hdr color
   float3 colorHDR = r0.xyz;
+  //float3 referenceHDR = renodx::tonemap::uncharted2::BT709(r0.xyz);
 
   r1.x = dot(float3(0.412109375,0.523925781,0.0639648438), r0.xyz);
   r1.y = dot(float3(0.166748047,0.720458984,0.112792969), r0.xyz);
@@ -128,6 +129,7 @@ void main(
   
   //  SDR color before graded
   float3 colorSDRNeutral = r0.xyz;
+  float3 referenceSDR = renodx::tonemap::Reinhard(r0.xyz);
 
   r2.xyz = float3(12.9200001,12.9200001,12.9200001) * r0.xyz;
   r0.xyz = cmp(float3(0.00313080009,0.00313080009,0.00313080009) >= r0.xyz);
@@ -159,17 +161,16 @@ void main(
   float3 colorSDRGraded = renodx::color::srgb::Decode(r0.xyz); 
   
 
-  float3 upgradedColor = renodx::tonemap::UpgradeToneMap(colorHDR, colorSDRNeutral, colorSDRGraded, 0.0);
+  float3 upgradedColor = renodx::tonemap::UpgradeToneMap(colorHDR, colorSDRNeutral, colorSDRGraded, 0);
 
   float3 finalHDRColor = renodx::draw::ToneMapPass(upgradedColor);
-
 
   if (shader_injection.tone_map_hue_processor == 3.f) {
     float strength = shader_injection.tone_map_hue_correction; 
     if (strength > 0.f) {
       // Use the original HDR color as the hue/purity reference
       finalHDRColor = CorrectHueAndPurityMBGated(
-          finalHDRColor, colorHDR, strength, 0.5f, 1.0f, 1.0f, 1.0f, float2(-1.f, -1.f), 1e-6f);
+          finalHDRColor, referenceSDR, 1.f, 0.f, 0.f, 1.0f, 1.0f, float2(-1.f, -1.f), 1e-6f);
     }
   }
 
