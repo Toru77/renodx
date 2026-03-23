@@ -1,4 +1,5 @@
 // ---- Created with 3Dmigoto v1.4.1 on Mon Mar 23 01:12:20 2026
+#include "./shared.h"
 
 cbuffer _Globals : register(b0)
 {
@@ -23,6 +24,7 @@ Texture2D<float4> ColorGradingLUT : register(t2);
 #define cmp -
 
 
+
 void main(
   float4 v0 : SV_POSITION0,
   float2 v1 : TEXCOORD0,
@@ -35,6 +37,11 @@ void main(
   r0.xy = (int2)v0.xy;
   r0.zw = float2(0,0);
   r0.xyzw = ColorBuffer.Load(r0.xyz).xyzw;
+  
+
+  // Grab the raw pixel data before the game's tonemap math mangles it.
+  float3 colorHDR = r0.xyz;
+
   r1.x = dot(float3(0.412109375,0.523925781,0.0639648438), r0.xyz);
   r1.y = dot(float3(0.166748047,0.720458984,0.112792969), r0.xyz);
   r1.z = dot(float3(0.0241699219,0.0754394531,0.900390625), r0.xyz);
@@ -116,10 +123,18 @@ void main(
   r1.xyz = float3(0.416666657,0.416666657,0.416666657) * r1.xyz;
   r1.xyz = exp2(r1.xyz);
   r1.xyz = r1.xyz * float3(1.05499995,1.05499995,1.05499995) + float3(-0.0549999997,-0.0549999997,-0.0549999997);
+  
+  // Grab r0.xyz right before the 12.92 multiplier begins the linear-to-sRGB encode.
+  float3 colorSDRNeutral = r0.xyz;
+
   r2.xyz = float3(12.9200001,12.9200001,12.9200001) * r0.xyz;
   r0.xyz = cmp(float3(0.00313080009,0.00313080009,0.00313080009) >= r0.xyz);
   r0.xyz = r0.xyz ? r2.xyz : r1.xyz;
-  r1.xyz = saturate(r0.xyz);
+  
+  // The original shader clamps highlights here. We let it, because we need
+  // the exact LUT output to blend with our HDR later.
+  r1.xyz = saturate(r0.xyz); 
+  
   r1.xyz = r1.xyz * float3(0.96875,0.96875,0.96875) + float3(0.015625,0.015625,0.015625);
   r2.y = 1 + -r1.y;
   r0.w = r1.z * 32 + -0.5;
@@ -140,12 +155,31 @@ void main(
   r0.xyz = log2(abs(r0.xyz));
   r0.xyz = ToneMapParam.www * r0.xyz;
   r0.xyz = exp2(r0.xyz);
+
+
+  // Convert graded SDR from gamma space back to linear space.
+  float3 colorSDRGraded = renodx::color::srgb::Decode(r0.xyz); 
+  
+  // Use renodx namespace for the tonemapping logic
+  float3 upgradedColor = renodx::tonemap::UpgradeToneMap(colorHDR, colorSDRNeutral, colorSDRGraded);
+  
+  // Apply final HDR roll-offs (Ensure ToneMapPass is also in the namespace)
+  float3 finalHDRColor = renodx::draw::ToneMapPass(upgradedColor);
+
+  // Overwrite r0.xyz with our new HDR color so the vignette applies to it natively
+  r0.xyz = finalHDRColor;
+
+  // [Game Native] Vignette calculation
   r1.xy = v1.xy * float2(2,2) + float2(-1,-1);
   r0.w = dot(r1.xy, r1.xy);
   r0.w = sqrt(r0.w);
   r0.w = -GradingParam.y + r0.w;
   r0.w = max(0, r0.w);
   r0.w = saturate(-r0.w * GradingParam.x + 1);
+  
   o0.xyz = r0.xyz * r0.www;
+  //o0.xyz *= RENODX_DIFFUSE_WHITE_NITS / 203.0;
+  o0.xyz = renodx::draw::RenderIntermediatePass(o0.xyz);
+  o0.xyz = renodx::color::srgb::Decode(o0.xyz);
   return;
 }

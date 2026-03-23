@@ -20,7 +20,7 @@
 namespace {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-    // CustomShaderEntry(0x00000000),
+    BypassShaderEntry(0x97648E37),  // tonemapper
     // CustomSwapchainShader(0x00000000),
     // BypassShaderEntry(0x00000000),
     // __ALL_CUSTOM_SHADERS
