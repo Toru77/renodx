@@ -19,12 +19,8 @@
 
 namespace {
 
-renodx::mods::shader::CustomShaders custom_shaders = {
-    BypassShaderEntry(0x97648E37),  // tonemapper
-    // CustomSwapchainShader(0x00000000),
-    // BypassShaderEntry(0x00000000),
-    // __ALL_CUSTOM_SHADERS
-};
+renodx::mods::shader::CustomShaders custom_shaders = {__ALL_CUSTOM_SHADERS};
+
 
 ShaderInjectData shader_injection;
 
@@ -116,19 +112,19 @@ renodx::utils::settings::Settings settings = {
         .section = "Tone Mapping",
         .labels = {"BT709", "BT2020", "AP1"},
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapHueProcessor",
         .binding = &shader_injection.tone_map_hue_processor,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 3.f,
         .label = "Hue Processor",
         .section = "Tone Mapping",
         .tooltip = "Selects hue processor",
-        .labels = {"OKLab", "ICtCp", "darkTable UCS"},
+        .labels = {"OKLab", "ICtCp", "darkTable UCS", "MacLeod-Boynton"},
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapHueCorrection",
@@ -141,7 +137,7 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapHueShift",
@@ -154,7 +150,7 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return current_settings_mode >= 1; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapClampColorSpace",
@@ -167,7 +163,7 @@ renodx::utils::settings::Settings settings = {
         .labels = {"None", "BT709", "BT2020", "AP1"},
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value - 1.f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapClampPeak",
@@ -180,7 +176,7 @@ renodx::utils::settings::Settings settings = {
         .labels = {"None", "BT709", "BT2020", "AP1"},
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value - 1.f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeExposure",
@@ -267,12 +263,12 @@ renodx::utils::settings::Settings settings = {
         .key = "ColorGradeScene",
         .binding = &shader_injection.color_grade_strength,
         .default_value = 100.f,
-        .label = "Scene Grading",
+        .label = "Game LUT Strength",
         .section = "Color Grading",
-        .tooltip = "Scene grading as applied by the game",
+        .tooltip = "Controls the strength of the game's color grading LUT.",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
-        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainCustomColorSpace",
@@ -299,7 +295,7 @@ renodx::utils::settings::Settings settings = {
         .key = "IntermediateDecoding",
         .binding = &shader_injection.intermediate_encoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 4.f,
         .label = "Intermediate Encoding",
         .section = "Display Output",
         .labels = {"Auto", "None", "SRGB", "2.2", "2.4"},
@@ -307,13 +303,13 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) {
             if (value == 0) return shader_injection.gamma_correction + 1.f;
             return value - 1.f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainDecoding",
         .binding = &shader_injection.swap_chain_decoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 2.f,
         .label = "Swapchain Decoding",
         .section = "Display Output",
         .labels = {"Auto", "None", "SRGB", "2.2", "2.4"},
@@ -321,18 +317,18 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) {
             if (value == 0) return shader_injection.intermediate_encoding;
             return value - 1.f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainGammaCorrection",
         .binding = &shader_injection.swap_chain_gamma_correction,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 1.f,
         .label = "Gamma Correction",
         .section = "Display Output",
         .labels = {"None", "2.2", "2.4"},
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainClampColorSpace",
@@ -344,7 +340,7 @@ renodx::utils::settings::Settings settings = {
         .labels = {"None", "BT709", "BT2020", "AP1"},
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value - 1.f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
+        .is_visible = []() { return false; },
     },
 };
 
@@ -491,7 +487,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                 // return void
               },
               .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool is_hdr10 = setting->GetValue() == 4;
@@ -510,7 +506,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .section = "Display Proxy",
               .labels = {"Off", "On"},
               .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool use_device_proxy = setting->GetValue() == 1.f;
@@ -533,7 +529,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .section = "Display Proxy",
               .labels = {"Off", "On"},
               .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool use_device_proxy =
@@ -550,7 +546,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .section = "Display Proxy",
               .labels = {"Off", "On"},
               .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool use_device_proxy =
@@ -572,7 +568,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                   "Any size",
               },
               .is_global = true,
-              .is_visible = []() { return settings[0]->GetValue() >= 2; },
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           settings.push_back(setting);
