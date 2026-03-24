@@ -27,9 +27,8 @@ ShaderInjectData shader_injection = {
 };
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-#ifdef __ALL_CUSTOM_SHADERS
-    __ALL_CUSTOM_SHADERS
-#endif
+    CustomShaderEntry(0x954D3D6D),  //volumetric fog
+    CustomShaderEntry(0xFDAAF80E),  //lighting
 };
 
 renodx::utils::settings::Settings settings = {
