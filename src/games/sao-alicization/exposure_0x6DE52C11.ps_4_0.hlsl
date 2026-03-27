@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Mon Mar 23 17:19:10 2026
+// ---- Created with 3Dmigoto v1.4.1 on Fri Mar 27 18:30:53 2026
 
 cbuffer _Globals : register(b0)
 {
@@ -16,6 +16,8 @@ SamplerState PointClampSampler_s : register(s0);
 Texture2D<float> Exposure0Buffer : register(t0);
 Texture2D<float> Exposure1Buffer : register(t1);
 
+#include "./shared.h"
+
 
 // 3Dmigoto declarations
 #define cmp -
@@ -30,14 +32,10 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
 
-  r0.x = Exposure1Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
-  r0.x = LuminasParam.w + -r0.x;
-  r1.x = Exposure0Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
-  r0.x = -r1.x + r0.x;
-  r0.x = LuminasParam.z * r0.x + r1.x;
-  // Original exposure calculation
-  float outExp = LuminasParam.x * r0.x + LuminasParam.y;
-
-  o0.x = 0.0; 
+  // Override game's exposure with RenoDX-injected exposure value.
+  // The shader_injection constant buffer provides `tone_map_exposure`.
+  float userExposure = 0.0f;
+  r0.x = userExposure;
+  o0.x = LuminasParam.x * r0.x + LuminasParam.y;
   return;
 }
