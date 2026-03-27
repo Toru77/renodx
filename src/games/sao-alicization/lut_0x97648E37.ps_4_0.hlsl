@@ -166,11 +166,15 @@ void main(
   float3 finalHDRColor = renodx::draw::ToneMapPass(upgradedColor);
 
   if (shader_injection.tone_map_hue_processor == 3.f) {
-    float strength = shader_injection.tone_map_hue_correction; 
+    float strength = saturate(RENODX_TONE_MAP_HUE_CORRECTION); 
     if (strength > 0.f) {
       // Use the original HDR color as the hue/purity reference
       finalHDRColor = CorrectHueAndPurityMBGated(
-          finalHDRColor, referenceSDR, 1.f, 0.f, 0.f, 0.95f, 1.0f, float2(-1.f, -1.f), 1e-6f);
+          finalHDRColor, referenceSDR, strength,
+        0.5f,
+        2.f,
+        strength,
+        1.f);
     }
   }
 
