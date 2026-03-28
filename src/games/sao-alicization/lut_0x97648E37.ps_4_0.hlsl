@@ -159,7 +159,7 @@ void main(
   // SDR color after graded
   float3 colorSDRGraded = r0.xyz;
 
-  r0.xyz = Tonemap(colorHDR, colorSDRNeutral, colorSDRGraded);
+  r0.xyz = BuildTonemapPayload(colorHDR, colorSDRNeutral, colorSDRGraded);
 
   o0.xyz = r0.xyz * r0.www;
   return;

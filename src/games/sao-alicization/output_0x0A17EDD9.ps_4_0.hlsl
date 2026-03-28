@@ -21,7 +21,7 @@ void main(
 
   r0.xyzw = ColorBuffer.Sample(LinearClampSampler_s, v1.xy).xyzw;
   o0.w = dot(r0.xyz, float3(0.298999995,0.587000012,0.114));
-  o0.xyz = r0.xyz;
+  o0.xyz = ApplyToneMapPass(r0.xyz);
   o0.xyz = RenderIntermediatePass(o0.xyz);
   return;
 }
