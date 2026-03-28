@@ -1,11 +1,10 @@
 #include "./shared.h"
 
-float3 Tonemap(float3 colorHDR, float3 colorSDRNeutral, float3 colorSDRGraded) {
-  //tonemap
-  // If the RenoDX tone mapper is disabled (type == 0), skip RenoDX calls.
+float3 BuildTonemapPayload(float3 colorHDR, float3 colorSDRNeutral, float3 colorSDRGraded) {
+  // Build the pre-ToneMapPass payload from LUT-sampled inputs.
   if (RENODX_TONE_MAP_TYPE >= 1.0f) {
     //color Untonemapped (source of HDR luminance)
-    float3 colorU = colorHDR; 
+    float3 colorU = colorHDR;
      //Return: redunant black color, prevents div 0
     if (max(max(colorU.r, colorU.g), colorU.b) <= 0.f) return 0.f;
     {
@@ -13,6 +12,7 @@ float3 Tonemap(float3 colorHDR, float3 colorSDRNeutral, float3 colorSDRGraded) {
     const float sdrMax = 1.65f; //(arbitrary, just if it look nice!)
     const float sdrStart = 1.0f;
     float3 colorUBlow = renodx::tonemap::ReinhardPiecewise(colorU, sdrMax, sdrStart); //or whatever tonemap
+
     //strength
     const float hueStrength = shader_injection.custom_pblow_chue;
     const float chrominanceStrength = shader_injection.custom_pblow_csat;
@@ -74,22 +74,29 @@ float3 Tonemap(float3 colorHDR, float3 colorSDRNeutral, float3 colorSDRGraded) {
     // colorN = renodx::color::correct::Luminance(colorN, m, m1); //(same as above)
   }
 
-  //colorHDR = renodx::color::correct::Gamma(colorHDR, true);
-  //ToneMapPass() (user color grading, gamma correction, HDR tonemap)
+  colorHDR = renodx::tonemap::UpgradeToneMap(colorU, colorN, colorSDRGraded, RENODX_COLOR_GRADE_STRENGTH);
+  return colorHDR;
+  }
+  return colorSDRGraded;
+}
+
+float3 ApplyToneMapPass(float3 colorHDR) {
+  // Apply RenoDX ToneMapPass to a prebuilt payload.
+  if (RENODX_TONE_MAP_TYPE >= 1.0f) {
   renodx::draw::Config config = renodx::draw::BuildConfig(); {
     config.reno_drt_white_clip = 3000 / 203.;
-    config.reno_drt_tone_map_method = renodx::tonemap::renodrt::config::tone_map_method::HERMITE_SPLINE;
+    config.reno_drt_tone_map_method = renodx::tonemap::renodrt::config::tone_map_method::REINHARD;
     config.tone_map_per_channel = 0;
     config.tone_map_hue_correction = 0;
     config.tone_map_hue_shift = 0;
-
     }
-    
-    colorHDR = renodx::tonemap::UpgradeToneMap(colorU, colorN, colorSDRGraded, RENODX_COLOR_GRADE_STRENGTH);
     colorHDR = renodx::draw::ToneMapPass(colorHDR, config);
-    return colorHDR;
   }
-  return colorSDRGraded;
+  return colorHDR;
+}
+
+float3 Tonemap(float3 colorHDR, float3 colorSDRNeutral, float3 colorSDRGraded) {
+  return ApplyToneMapPass(BuildTonemapPayload(colorHDR, colorSDRNeutral, colorSDRGraded));
 }
 
 float3 RenderIntermediatePass(float3 colorHDR) {
