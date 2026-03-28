@@ -122,6 +122,7 @@ void main(
   r1.xyz = float3(0.416666657,0.416666657,0.416666657) * r1.xyz;
   r1.xyz = exp2(r1.xyz);
   r1.xyz = r1.xyz * float3(1.05499995,1.05499995,1.05499995) + float3(-0.0549999997,-0.0549999997,-0.0549999997);
+
   r2.xyz = float3(12.9200001,12.9200001,12.9200001) * r0.xyz;
   r0.xyz = cmp(float3(0.00313080009,0.00313080009,0.00313080009) >= r0.xyz);
   r0.xyz = r0.xyz ? r2.xyz : r1.xyz;
@@ -134,7 +135,7 @@ void main(
   r1.x = r1.x + r1.y;
   r2.z = r1.x * 0.03125 + 0.03125;
   r2.x = 0.03125 * r1.x;
-  float3 colorSDRNeutral = r0.xyz;
+  float3 colorSDRNeutral = r0.xyz; //decode to linear for tonemapping
   r1.xyzw = ColorGradingLUT.Sample(LinearClampSampler_s, r2.xy).xyzw;
   r2.xyzw = ColorGradingLUT.Sample(LinearClampSampler_s, r2.zy).xyzw;
   r2.xyz = r2.xyz + -r1.xyz;
@@ -159,5 +160,7 @@ void main(
   float3 colorSDRGraded = r0.xyz;
 
   r0.xyz = Tonemap(colorHDR, colorSDRNeutral, colorSDRGraded);
+
+  o0.xyz = r0.xyz * r0.www;
   return;
 }
