@@ -7,6 +7,8 @@
 
 #define DEBUG_LEVEL_0
 
+#include <shared_mutex>
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -14,7 +16,10 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/data.hpp"
+#include "../../utils/resource.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/swapchain.hpp"
 #include "./shared.h"
 
 namespace {
@@ -25,6 +30,33 @@ renodx::mods::shader::CustomShaders custom_shaders = {__ALL_CUSTOM_SHADERS};
 ShaderInjectData shader_injection;
 
 float current_settings_mode = 0;
+float current_render_reshade_before_ui = 0.f;
+
+bool ExecuteReshadeEffects(reshade::api::command_list* cmd_list) {
+  if (current_render_reshade_before_ui == 0.f) return true;
+
+  auto* cmd_list_data = renodx::utils::data::Get<renodx::utils::swapchain::CommandListData>(cmd_list);
+  if (cmd_list_data == nullptr) return true;
+  if (cmd_list_data->current_render_targets.empty()) return true;
+
+  auto rtv0 = cmd_list_data->current_render_targets[0];
+  if (rtv0.handle == 0) return true;
+
+  auto* info = renodx::utils::resource::GetResourceViewInfo(rtv0);
+  if (info->clone.handle != 0u) {
+    rtv0 = info->clone;
+  }
+
+  auto* data = renodx::utils::data::Get<renodx::utils::swapchain::DeviceData>(cmd_list->get_device());
+  if (data == nullptr) return true;
+
+  const std::shared_lock lock(data->mutex);
+  for (auto* runtime : data->effect_runtimes) {
+    runtime->render_effects(cmd_list, rtv0, rtv0);
+  }
+
+  return true;
+}
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
@@ -225,6 +257,15 @@ renodx::utils::settings::Settings settings = {
             "JPN CRT",
         },
         .is_visible = []() { return settings[0]->GetValue() >= 1; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RenderReshadeBeforeUI",
+        .binding = &current_render_reshade_before_ui,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Draw Reshade before UI",
+        .section = "Effects",
+        .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -542,6 +583,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
             s << format << ": " << value;
             reshade::log::message(reshade::log::level::info, s.str().c_str());
           }
+        }
+
+        if (auto it = custom_shaders.find(0x0A17EDD9u); it != custom_shaders.end()) {
+          it->second.on_drawn = ExecuteReshadeEffects;
+        } else {
+          reshade::log::message(
+              reshade::log::level::warning,
+              "sao-alicization: Could not enable pre-UI ReShade hook, shader 0x0A17EDD9 was not found.");
         }
 
         initialized = true;

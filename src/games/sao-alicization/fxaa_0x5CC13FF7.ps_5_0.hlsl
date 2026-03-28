@@ -16,7 +16,6 @@ void main(
   float4 r0,r1,r2,r3,r4,r5;
   uint4 bitmask, uiDest;
   float4 fDest;
-
   r0.xyz = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).xyz;
   r1.xyz = ColorBuffer.Gather(LinearClampSampler_s, v1.xy).xyz;
   r2.xyz = ColorBuffer.Gather(LinearClampSampler_s, v1.xy, int2(-1, -1)).xzw;

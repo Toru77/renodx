@@ -89,6 +89,7 @@ float3 ApplyToneMapPass(float3 colorHDR) {
     config.tone_map_per_channel = 0;
     config.tone_map_hue_correction = 0;
     config.tone_map_hue_shift = 0;
+    config.tone_map_highlights = 0.925;
     }
     colorHDR = renodx::draw::ToneMapPass(colorHDR, config);
   }

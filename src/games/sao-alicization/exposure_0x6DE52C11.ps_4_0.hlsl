@@ -37,6 +37,7 @@ void main(
   r0.x = -r1.x + r0.x;
   r0.x = LuminasParam.z * r0.x + r1.x;
   o0.x = LuminasParam.x * r0.x + LuminasParam.y;
-  o0.x = min(o0.x, kExposureHardMax);
+  //o0.x = min(o0.x, kExposureHardMax);
+  o0.x = -500;
   return;
 }
