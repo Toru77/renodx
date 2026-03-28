@@ -37,8 +37,10 @@ void main(
   r0.xy = (int2)v0.xy;
   r0.zw = float2(0,0);
   r0.xyzw = ColorBuffer.Load(r0.xyz).xyzw;
+
   // Raw hdr color
   float3 colorHDR = r0.xyz;
+  
   r1.x = dot(float3(0.412109375,0.523925781,0.0639648438), r0.xyz);
   r1.y = dot(float3(0.166748047,0.720458984,0.112792969), r0.xyz);
   r1.z = dot(float3(0.0241699219,0.0754394531,0.900390625), r0.xyz);
@@ -132,7 +134,7 @@ void main(
   r1.x = r1.x + r1.y;
   r2.z = r1.x * 0.03125 + 0.03125;
   r2.x = 0.03125 * r1.x;
-  float2 lutUV = r2.xy;
+  float3 colorSDRNeutral = r0.xyz;
   r1.xyzw = ColorGradingLUT.Sample(LinearClampSampler_s, r2.xy).xyzw;
   r2.xyzw = ColorGradingLUT.Sample(LinearClampSampler_s, r2.zy).xyzw;
   r2.xyz = r2.xyz + -r1.xyz;
@@ -145,12 +147,17 @@ void main(
   r0.xyz = log2(abs(r0.xyz));
   r0.xyz = ToneMapParam.www * r0.xyz;
   r0.xyz = exp2(r0.xyz);
+
   r1.xy = v1.xy * float2(2,2) + float2(-1,-1);
   r0.w = dot(r1.xy, r1.xy);
   r0.w = sqrt(r0.w);
   r0.w = -GradingParam.y + r0.w;
   r0.w = max(0, r0.w);
   r0.w = saturate(-r0.w * GradingParam.x + 1);
-  o0.xyz = r0.xyz * r0.www;
+
+  // SDR color after graded
+  float3 colorSDRGraded = r0.xyz;
+
+  r0.xyz = Tonemap(colorHDR, colorSDRNeutral, colorSDRGraded);
   return;
 }
