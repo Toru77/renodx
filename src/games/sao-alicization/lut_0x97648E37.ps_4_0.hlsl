@@ -1,7 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Mon Mar 23 01:12:20 2026
-#include "./macleod_boynton.hlsli"
-#include "./shared.h"
-
+// ---- Created with 3Dmigoto v1.4.1 on Fri Mar 27 20:30:35 2026
 
 cbuffer _Globals : register(b0)
 {
@@ -24,7 +21,8 @@ Texture2D<float4> ColorGradingLUT : register(t2);
 
 // 3Dmigoto declarations
 #define cmp -
-
+#include "./common.hlsl"
+#include "./shared.h"
 
 
 void main(
@@ -39,12 +37,8 @@ void main(
   r0.xy = (int2)v0.xy;
   r0.zw = float2(0,0);
   r0.xyzw = ColorBuffer.Load(r0.xyz).xyzw;
-  
-
   // Raw hdr color
   float3 colorHDR = r0.xyz;
-  //float3 referenceHDR = renodx::tonemap::uncharted2::BT709(r0.xyz);
-
   r1.x = dot(float3(0.412109375,0.523925781,0.0639648438), r0.xyz);
   r1.y = dot(float3(0.166748047,0.720458984,0.112792969), r0.xyz);
   r1.z = dot(float3(0.0241699219,0.0754394531,0.900390625), r0.xyz);
@@ -126,15 +120,10 @@ void main(
   r1.xyz = float3(0.416666657,0.416666657,0.416666657) * r1.xyz;
   r1.xyz = exp2(r1.xyz);
   r1.xyz = r1.xyz * float3(1.05499995,1.05499995,1.05499995) + float3(-0.0549999997,-0.0549999997,-0.0549999997);
-  
-  //  SDR color before graded
-  float3 colorSDRNeutral = r0.xyz;
-  float3 referenceSDR = renodx::tonemap::Reinhard(r0.xyz);
-
   r2.xyz = float3(12.9200001,12.9200001,12.9200001) * r0.xyz;
   r0.xyz = cmp(float3(0.00313080009,0.00313080009,0.00313080009) >= r0.xyz);
   r0.xyz = r0.xyz ? r2.xyz : r1.xyz;
-  r1.xyz = saturate(r0.xyz); 
+  r1.xyz = saturate(r0.xyz);
   r1.xyz = r1.xyz * float3(0.96875,0.96875,0.96875) + float3(0.015625,0.015625,0.015625);
   r2.y = 1 + -r1.y;
   r0.w = r1.z * 32 + -0.5;
@@ -143,6 +132,7 @@ void main(
   r1.x = r1.x + r1.y;
   r2.z = r1.x * 0.03125 + 0.03125;
   r2.x = 0.03125 * r1.x;
+  float2 lutUV = r2.xy;
   r1.xyzw = ColorGradingLUT.Sample(LinearClampSampler_s, r2.xy).xyzw;
   r2.xyzw = ColorGradingLUT.Sample(LinearClampSampler_s, r2.zy).xyzw;
   r2.xyz = r2.xyz + -r1.xyz;
@@ -155,42 +145,12 @@ void main(
   r0.xyz = log2(abs(r0.xyz));
   r0.xyz = ToneMapParam.www * r0.xyz;
   r0.xyz = exp2(r0.xyz);
-
-
-  // gamma space back to linear space
-  float3 colorSDRGraded = renodx::color::srgb::Decode(r0.xyz); 
-  
-
-  float3 upgradedColor = renodx::tonemap::UpgradeToneMap(colorHDR, colorSDRNeutral, colorSDRGraded, 0);
-
-  float3 finalHDRColor = renodx::draw::ToneMapPass(upgradedColor);
-
-  if (shader_injection.tone_map_hue_processor == 3.f) {
-    float strength = saturate(RENODX_TONE_MAP_HUE_CORRECTION); 
-    if (strength > 0.f) {
-      // Use the original HDR color as the hue/purity reference
-      finalHDRColor = CorrectHueAndPurityMBGated(
-          finalHDRColor, referenceSDR, strength,
-        0.5f,
-        2.f,
-        strength,
-        1.f);
-    }
-  }
-
-
-  r0.xyz = finalHDRColor;
-
-
   r1.xy = v1.xy * float2(2,2) + float2(-1,-1);
   r0.w = dot(r1.xy, r1.xy);
   r0.w = sqrt(r0.w);
   r0.w = -GradingParam.y + r0.w;
   r0.w = max(0, r0.w);
   r0.w = saturate(-r0.w * GradingParam.x + 1);
-  
   o0.xyz = r0.xyz * r0.www;
-  o0.xyz = renodx::color::srgb::Decode(o0.xyz);
-  o0.xyz = renodx::draw::RenderIntermediatePass(o0.xyz);
   return;
 }
