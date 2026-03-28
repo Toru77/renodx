@@ -181,6 +181,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Controls the strength of the game's color grading LUT.",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type == 1.f; },
+        .parse = [](float value) { return value * 0.01f; },
         .is_visible = []() { return current_settings_mode >= 1; },
     },
 
