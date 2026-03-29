@@ -74,6 +74,8 @@ struct ShaderInjectData {
   float custom_lens;
   float custom_pblow_chue;
   float custom_pblow_csat;
+  float custom_fxaa;
+  float custom_exposure_adjustment;
 };
 
 #ifndef __cplusplus

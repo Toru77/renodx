@@ -134,16 +134,6 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ColorGradeHighlights",
-        .binding = &shader_injection.tone_map_highlights,
-        .default_value = 50.f,
-        .label = "Highlights",
-        .section = "Color Grading",
-        .max = 100.f,
-        .parse = [](float value) { return value * 0.02f; },
-        .is_visible = []() { return current_settings_mode >= 1; },
-    },
-    new renodx::utils::settings::Setting{
         .key = "ColorGradeShadows",
         .binding = &shader_injection.tone_map_shadows,
         .default_value = 50.f,
@@ -172,39 +162,6 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ColorGradeHighlightSaturation",
-        .binding = &shader_injection.tone_map_highlight_saturation,
-        .default_value = 50.f,
-        .label = "Highlight Saturation",
-        .section = "Color Grading",
-        .tooltip = "Adds or removes highlight color.",
-        .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) { return value * 0.02f; },
-        .is_visible = []() { return current_settings_mode >= 1; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeBlowout",
-        .binding = &shader_injection.tone_map_blowout,
-        .default_value = 0.f,
-        .label = "Blowout",
-        .section = "Color Grading",
-        .tooltip = "Controls highlight desaturation due to overexposure.",
-        .max = 100.f,
-        .parse = [](float value) { return value * 0.01f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeFlare",
-        .binding = &shader_injection.tone_map_flare,
-        .default_value = 0.f,
-        .label = "Flare",
-        .section = "Color Grading",
-        .tooltip = "Flare/Glare Compensation",
-        .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type == 1.f; },
-        .parse = [](float value) { return value * 0.02f; },
-    },
-    new renodx::utils::settings::Setting{
         .key = "ColorGradeScene",
         .binding = &shader_injection.color_grade_strength,
         .default_value = 100.f,
@@ -223,9 +180,9 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.5f,
         .label = "Tone Mapper Start",
         .section = "Hue Shifted Blowout",
-        .max = 100.f,
+        .max = 1.f,
         .format = "%.2f",
-        .is_visible = []() { return current_settings_mode >= 1; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "PerceptualBlowoutSaturation",
@@ -233,9 +190,9 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.45f,
         .label = "Saturation",
         .section = "Hue Shifted Blowout",
-        .max = 100.f,
+        .max = 1.f,
         .format = "%.2f",
-        .is_visible = []() { return current_settings_mode >= 1; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainCustomColorSpace",
@@ -268,6 +225,24 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
+        .key = "FXAA",
+        .binding = &shader_injection.custom_fxaa,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "FXAA",
+        .section = "Effects",
+        .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "ExposureAdjustment",
+        .binding = &shader_injection.custom_exposure_adjustment,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Exposure Adjustment",
+        .section = "Effects",
+        .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::BUTTON,
       .label = "Patreon",
       .section = "Info",
@@ -276,7 +251,6 @@ renodx::utils::settings::Settings settings = {
         return false;
       },
     },
-
     new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::TEXT,
       .label = "Addon made by Toru.",
@@ -287,11 +261,21 @@ renodx::utils::settings::Settings settings = {
         .label = "Thanks to Shortfuse for RenoDX.",
         .section = "Info",   
     },
+     new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Make sure FXAA is on at game settings. You can close it on this menu later on.",
+        .section = "Instructions",   
+    },
+     new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "If you want to use this in SDR, change HDR10 to scRGB, select Vanilla tonemapper then restart the game.",
+        .section = "Instructions",   
+    },
     new renodx::utils::settings::Setting{
         .key = "IntermediateDecoding",
         .binding = &shader_injection.intermediate_encoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 4.f,
+        .default_value = 0.f,
         .label = "Intermediate Encoding",
         .section = "Display Output",
         .labels = {"Auto", "None", "SRGB", "2.2", "2.4"},
@@ -299,13 +283,13 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) {
             if (value == 0) return shader_injection.gamma_correction + 1.f;
             return value - 1.f; },
-        .is_visible = []() { return settings[0]->GetValue() >= 1; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainDecoding",
         .binding = &shader_injection.swap_chain_decoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f,
+        .default_value = 0.f,
         .label = "Swapchain Decoding",
         .section = "Display Output",
         .labels = {"Auto", "None", "SRGB", "2.2", "2.4"},
@@ -313,7 +297,7 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) {
             if (value == 0) return shader_injection.intermediate_encoding;
             return value - 1.f; },
-        .is_visible = []() { return settings[0]->GetValue() >= 1; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainGammaCorrection",
@@ -483,7 +467,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                 // return void
               },
               .is_global = true,
-              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool is_hdr10 = setting->GetValue() == 4;
@@ -564,7 +547,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                   "Any size",
               },
               .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 1; },
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           settings.push_back(setting);
@@ -585,12 +568,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           }
         }
 
-        if (auto it = custom_shaders.find(0x0A17EDD9u); it != custom_shaders.end()) {
+        if (auto it = custom_shaders.find(0x5CC13FF7u); it != custom_shaders.end()) {
           it->second.on_drawn = ExecuteReshadeEffects;
         } else {
           reshade::log::message(
               reshade::log::level::warning,
-              "sao-alicization: Could not enable pre-UI ReShade hook, shader 0x0A17EDD9 was not found.");
+              "sao-alicization: Could not enable pre-UI ReShade hook, shader was not found.");
         }
 
         initialized = true;
