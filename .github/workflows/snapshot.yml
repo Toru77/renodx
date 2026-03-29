@@ -49,6 +49,9 @@ jobs:
       
       - name: Build YS X Proud Nordics
         run: cmake --build --preset clang-x64-release --target ys10pn --verbose
+
+      - name: Build Sword Art Online Alicization Lycoris
+        run: cmake --build --preset clang-x64-release --target sao-alicization --verbose
       
       - name: Set up Clang (x86)
         uses: egor-tensin/setup-clang@v1
