@@ -266,11 +266,6 @@ renodx::utils::settings::Settings settings = {
         .label = "Make sure FXAA is on at game settings. You can close it on this menu later on.",
         .section = "Instructions",   
     },
-     new renodx::utils::settings::Setting{
-        .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "If you want to use this in SDR, change HDR10 to scRGB, select Vanilla tonemapper then restart the game.",
-        .section = "Instructions",   
-    },
     new renodx::utils::settings::Setting{
         .key = "IntermediateDecoding",
         .binding = &shader_injection.intermediate_encoding,
@@ -376,7 +371,8 @@ bool initialized = false;
 }  // namespace
 
 extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX";
-extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX (Generic)";
+extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "SAO ALicization Addon for RenoDX";
+extern "C" __declspec(dllexport) constexpr const char* AUTHOR = "Toru";
 
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
@@ -467,6 +463,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                 // return void
               },
               .is_global = true,
+              .is_visible = []() { return false; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           bool is_hdr10 = setting->GetValue() == 4;
@@ -552,8 +549,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
           settings.push_back(setting);
 
-          auto value = setting->GetValue();
-          if (value > 0) {
+         
             renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
           .old_format = reshade::api::format::r8g8b8a8_unorm,
           .new_format = reshade::api::format::r16g16b16a16_float,
@@ -561,11 +557,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           .aspect_ratio = renodx::mods::swapchain::SwapChainUpgradeTarget::BACK_BUFFER,
           .usage_include = reshade::api::resource_usage::render_target,
             });
-            std::stringstream s;
-            s << "Applying user resource upgrade for ";
-            s << format << ": " << value;
-            reshade::log::message(reshade::log::level::info, s.str().c_str());
-          }
         }
 
         if (auto it = custom_shaders.find(0x5CC13FF7u); it != custom_shaders.end()) {
