@@ -6,6 +6,7 @@ Texture2D<float4> ColorBuffer : register(t0);
 
 // 3Dmigoto declarations
 #define cmp -
+#include "./shared.h"
 
 
 void main(
@@ -16,6 +17,13 @@ void main(
   float4 r0,r1,r2,r3,r4,r5;
   uint4 bitmask, uiDest;
   float4 fDest;
+  if (shader_injection.custom_fxaa == 0) {
+  r0.xyz = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).xyz;
+  o0.xyz = r0.xyz;
+  o0.w = 1;
+  return;
+  }
+  if (shader_injection.custom_fxaa == 1) {
   r0.xyz = ColorBuffer.SampleLevel(LinearClampSampler_s, v1.xy, 0).xyz;
   r1.xyz = ColorBuffer.Gather(LinearClampSampler_s, v1.xy).xyz;
   r2.xyz = ColorBuffer.Gather(LinearClampSampler_s, v1.xy, int2(-1, -1)).xzw;
@@ -353,4 +361,5 @@ void main(
   o0.xyz = r0.xyz;
   o0.w = 1;
   return;
+  }
 }

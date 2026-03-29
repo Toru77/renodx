@@ -19,6 +19,7 @@ Texture2D<float> Exposure1Buffer : register(t1);
 
 // 3Dmigoto declarations
 #define cmp -
+#include "./shared.h"
 
 
 void main(
@@ -26,18 +27,25 @@ void main(
   float2 v1 : TEXCOORD0,
   out float o0 : SV_TARGET0)
 {
-  const float kExposureHardMax = 0.0f;
   float4 r0,r1;
   uint4 bitmask, uiDest;
   float4 fDest;
-
-  r0.x = Exposure1Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
-  r0.x = LuminasParam.w + -r0.x;
-  r1.x = Exposure0Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
-  r0.x = -r1.x + r0.x;
-  r0.x = LuminasParam.z * r0.x + r1.x;
-  o0.x = LuminasParam.x * r0.x + LuminasParam.y;
-  //o0.x = min(o0.x, kExposureHardMax);
-  o0.x = -500;
+  if (shader_injection.custom_exposure_adjustment == 0) {
+    r0.x = Exposure1Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
+    r0.x = LuminasParam.w + -r0.x;
+    r1.x = Exposure0Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
+    r0.x = -r1.x + r0.x;
+    r0.x = LuminasParam.z * r0.x + r1.x;
+    o0.x = LuminasParam.x * r0.x + LuminasParam.y;
+  }
+  if (shader_injection.custom_exposure_adjustment == 1) {
+    r0.x = Exposure1Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
+    r0.x = LuminasParam.w + -r0.x;
+    r1.x = Exposure0Buffer.SampleLevel(PointClampSampler_s, float2(0.5,0.5), 0).x;
+    r0.x = -r1.x + r0.x;
+    r0.x = LuminasParam.z * r0.x + r1.x;
+    o0.x = LuminasParam.x * r0.x + LuminasParam.y;
+    o0.x = -50;   
+  }
   return;
 }
