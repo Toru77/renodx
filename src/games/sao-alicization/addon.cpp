@@ -222,6 +222,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Draw Reshade before UI",
         .section = "Effects",
+        .tooltip = "Draws ReShade effects before UI rendering. Effect needs to be HDR compatible.",
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -231,6 +232,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "FXAA",
         .section = "Effects",
+        .tooltip = "Enables or disables FXAA. Make sure it's enabled in game settings.",
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -240,6 +242,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Exposure Adjustment",
         .section = "Effects",
+        .tooltip = "Adjusts the exposure of the game.",
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
