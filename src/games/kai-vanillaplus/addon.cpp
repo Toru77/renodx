@@ -188,15 +188,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = &OnBeforeVanillaAoDraw,
             .on_drawn = &OnAoFinalPassDrawn,
         },
-    },                                             // vanilla ao final pass hook
-    {
-        kWireFenceShader,
-        {
-            .crc32 = kWireFenceShader,
-            .code = __0x26F1598B,
-            .on_draw = &OnBeforeWireFenceShaderDraw,
-        },
-    },  // wire fence
+    },                                             // vanilla ao final pass hook // wire fence
 };
 
 
