@@ -6,6 +6,10 @@
 #define XE_GTAO_USE_DEFAULT_CONSTANTS 0
 #endif
 
+#ifndef XE_GTAO_USE_HALF_FLOAT_PRECISION
+#define XE_GTAO_USE_HALF_FLOAT_PRECISION 0
+#endif
+
 #include "./GTAO/XeGTAO.h"
 
 cbuffer cb_scene : register(b0)

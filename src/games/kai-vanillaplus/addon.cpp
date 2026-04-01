@@ -434,16 +434,11 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::pipeline_layout xegtao_normal_cap_layout = {};
 
   reshade::api::pipeline xegtao_prefilter_pipeline = {};
-  reshade::api::pipeline xegtao_prefilter_fp32_pipeline = {};
   reshade::api::pipeline xegtao_main_pipeline = {};
-  reshade::api::pipeline xegtao_main_fp32_pipeline = {};
   reshade::api::pipeline xegtao_denoise_pipeline = {};
-  reshade::api::pipeline xegtao_denoise_fp32_pipeline = {};
   reshade::api::pipeline xegtao_denoise_isfast_pipeline = {};
-  reshade::api::pipeline xegtao_denoise_isfast_fp32_pipeline = {};
   reshade::api::pipeline xegtao_composite_pipeline = {};
   reshade::api::pipeline xegtao_normal_cap_pipeline = {};
-  reshade::api::pipeline xegtao_normal_cap_fp32_pipeline = {};
 
   uint64_t present_frame_index = 0u;
   uint64_t last_gtao_frame = kInvalidFrameIndex;
@@ -1884,16 +1879,11 @@ void DestroyXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   if (device == nullptr || data == nullptr) return;
 
   DestroyPipelineIfValid(device, &data->xegtao_prefilter_pipeline);
-  DestroyPipelineIfValid(device, &data->xegtao_prefilter_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_main_pipeline);
-  DestroyPipelineIfValid(device, &data->xegtao_main_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_denoise_pipeline);
-  DestroyPipelineIfValid(device, &data->xegtao_denoise_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_denoise_isfast_pipeline);
-  DestroyPipelineIfValid(device, &data->xegtao_denoise_isfast_fp32_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_composite_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_normal_cap_pipeline);
-  DestroyPipelineIfValid(device, &data->xegtao_normal_cap_fp32_pipeline);
 
   DestroyPipelineLayoutIfValid(device, &data->xegtao_prefilter_layout);
   DestroyPipelineLayoutIfValid(device, &data->xegtao_main_layout);
@@ -2261,13 +2251,6 @@ bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   }
   if (!EnsureXeGTAOComputePipeline(
           device,
-          data->xegtao_prefilter_layout,
-          __xegtao_prefilter_fp32,
-          &data->xegtao_prefilter_fp32_pipeline)) {
-    return false;
-  }
-  if (!EnsureXeGTAOComputePipeline(
-          device,
           data->xegtao_main_layout,
           __xegtao_main,
           &data->xegtao_main_pipeline)) {
@@ -2275,23 +2258,9 @@ bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   }
   if (!EnsureXeGTAOComputePipeline(
           device,
-          data->xegtao_main_layout,
-          __xegtao_main_fp32,
-          &data->xegtao_main_fp32_pipeline)) {
-    return false;
-  }
-  if (!EnsureXeGTAOComputePipeline(
-          device,
           data->xegtao_denoise_layout,
           __xegtao_denoise,
           &data->xegtao_denoise_pipeline)) {
-    return false;
-  }
-  if (!EnsureXeGTAOComputePipeline(
-          device,
-          data->xegtao_denoise_layout,
-          __xegtao_denoise_fp32,
-          &data->xegtao_denoise_fp32_pipeline)) {
     return false;
   }
   if (!EnsureXeGTAOComputePipeline(
@@ -2306,13 +2275,6 @@ bool EnsureXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
           data->xegtao_normal_cap_layout,
           __xegtao_normal_cap,
           &data->xegtao_normal_cap_pipeline)) {
-    return false;
-  }
-  if (!EnsureXeGTAOComputePipeline(
-          device,
-          data->xegtao_normal_cap_layout,
-          __xegtao_normal_cap_fp32,
-          &data->xegtao_normal_cap_fp32_pipeline)) {
     return false;
   }
   return true;
@@ -2783,16 +2745,10 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   if (width == 0u || height == 0u) return fail("working texture dimensions are zero");
   const bool force_downscaled_quality = IsXeGTAOCurrentInputDownscaled(device, data);
 
-  const bool use_full_fp32 =
-      ClampXeGTAOPrecision() == static_cast<uint32_t>(XeGTAOPrecision::kFullFP32);
-  const reshade::api::pipeline prefilter_pipeline =
-      use_full_fp32 ? data->xegtao_prefilter_fp32_pipeline : data->xegtao_prefilter_pipeline;
-  const reshade::api::pipeline main_pipeline =
-      use_full_fp32 ? data->xegtao_main_fp32_pipeline : data->xegtao_main_pipeline;
-  const reshade::api::pipeline denoise_pipeline =
-      use_full_fp32 ? data->xegtao_denoise_fp32_pipeline : data->xegtao_denoise_pipeline;
-  const reshade::api::pipeline normal_cap_pipeline =
-      use_full_fp32 ? data->xegtao_normal_cap_fp32_pipeline : data->xegtao_normal_cap_pipeline;
+    const reshade::api::pipeline prefilter_pipeline = data->xegtao_prefilter_pipeline;
+    const reshade::api::pipeline main_pipeline = data->xegtao_main_pipeline;
+    const reshade::api::pipeline denoise_pipeline = data->xegtao_denoise_pipeline;
+    const reshade::api::pipeline normal_cap_pipeline = data->xegtao_normal_cap_pipeline;
 
   std::array<reshade::api::resource_view, 1> prefilter_srvs = {
       data->captured_depth_srv,
