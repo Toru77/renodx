@@ -145,7 +145,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kAoPass0Shader,
             .code = __0x0E83E74E,
-            .on_draw = &OnBeforeVanillaAoDraw,
+            //.on_draw = &OnBeforeVanillaAoDraw,
         },
     },                                             // vanilla ao pass 0
     {
@@ -153,7 +153,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kAoPass1Shader,
             .code = __0x3CA978C6,
-            .on_draw = &OnBeforeVanillaAoDraw,
+            //.on_draw = &OnBeforeVanillaAoDraw,
         },
     },                                             // vanilla ao pass 1
     {
@@ -161,7 +161,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kAoPass2Shader,
             .code = __0x928A59DA,
-            .on_draw = &OnBeforeVanillaAoDraw,
+            //.on_draw = &OnBeforeVanillaAoDraw,
         },
     },                                             // vanilla ao pass 2
     {
@@ -169,7 +169,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kAoPass3Shader,
             .code = __0xA385AB53,
-            .on_draw = &OnBeforeVanillaAoDraw,
+            //.on_draw = &OnBeforeVanillaAoDraw,
         },
     },                                             // vanilla ao pass 3
     {
@@ -177,7 +177,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kAoPass4Shader,
             .code = __0xBEA381A1,
-            .on_draw = &OnBeforeVanillaAoDraw,
+            //.on_draw = &OnBeforeVanillaAoDraw,
         },
     },                                             // vanilla ao pass 4
     {
@@ -185,10 +185,10 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         {
             .crc32 = kAoFinalShader,
             .code = __0x036B0D74,
-            .on_draw = &OnBeforeVanillaAoDraw,
-            .on_drawn = &OnAoFinalPassDrawn,
+            //.on_draw = &OnBeforeVanillaAoDraw,
+            //.on_drawn = &OnAoFinalPassDrawn,
         },
-    },                                             // vanilla ao final pass hook // wire fence
+    },                                             // vanilla ao final pass hook
 };
 
 
