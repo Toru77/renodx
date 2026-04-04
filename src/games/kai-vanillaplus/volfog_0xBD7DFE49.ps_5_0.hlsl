@@ -97,6 +97,13 @@ void main(
   float4 v1 : TEXCOORD0,
   out float4 o0 : SV_Target0)
 {
+  // ---- Scene color ----
+  float4 sceneColor = colorTexture.SampleLevel(samPoint_s, v1.xy, 0);
+  if (sss_injection_data.volfog_enabled < 0.5) {
+    o0 = sceneColor;
+    return;
+  }
+
   // ---- Depth → linearZ → volume W coordinate (vanilla logic) ----
   float depth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   float2 depthVec = float2(depth, 1.0);
@@ -112,11 +119,10 @@ void main(
 
   // ---- Optional IS-FAST temporal jitter (bound texture or fallback) ----
   float3 uvw = float3(v1.xy, volZ);
-  // volfog_is_fast_enabled is driven by the single master IS-FAST setting.
+  // volfog_is_fast_enabled is derived from Volumetric Fog settings + IS-FAST master.
   if (sss_injection_data.volfog_is_fast_enabled > 0.5) {
     float2 pixelCoord = floor(v0.xy);
-    // Use shared IS-FAST temporal speed to avoid weak progression at high FPS.
-    float jitterSpeed = max(sss_injection_data.shadow_isfast_jitter_speed, 1.0);
+    float jitterSpeed = max(sss_injection_data.volfog_jitter_speed, 1.0);
     uint frameIndex = (uint)max(sceneTime_g * jitterSpeed, 0.0);
     float2 jitter2 = renodx::rendering::InterleavedGradientNoiseTemporal2D(pixelCoord, frameIndex);
     if (sss_injection_data.isfast_noise_bound > 0.5) {
@@ -138,7 +144,7 @@ void main(
     float2 halfTexelXY = 0.5 * texelSize.xy;
     float halfSlice = 0.5 * texelSize.z;
     float jitterZ = frac(jitter2.x + jitter2.y * 0.5);
-    float jitterStrength = 1.5;
+    float jitterStrength = max(sss_injection_data.volfog_jitter_amount, 0.0);
 
     uvw.xy = clamp(uvw.xy + (jitter2 - 0.5) * texelSize.xy * jitterStrength, halfTexelXY, 1.0 - halfTexelXY);
     uvw.z = clamp(uvw.z + (jitterZ - 0.5) * texelSize.z * jitterStrength, halfSlice, 1.0 - halfSlice);
@@ -151,9 +157,6 @@ void main(
   } else {
     fogSample = volumeScatter.SampleLevel(samLinear_s, uvw, 0);
   }
-
-  // ---- Scene color ----
-  float4 sceneColor = colorTexture.SampleLevel(samPoint_s, v1.xy, 0);
 
   // ---- Composite: scene * transmittance + inscatter (vanilla formula) ----
   float3 foggedColor = sceneColor.xyz * fogSample.w + fogSample.xyz;

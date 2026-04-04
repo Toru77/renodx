@@ -59,17 +59,31 @@ float4 DecodeAOTerm(uint packed_term)
 [numthreads(8, 8, 1)]
 void main(uint2 dispatch_thread_id : SV_DispatchThreadID)
 {
-  uint width;
-  uint height;
-  g_outComposite.GetDimensions(width, height);
-  if (dispatch_thread_id.x >= width || dispatch_thread_id.y >= height)
+  uint out_width;
+  uint out_height;
+  g_outComposite.GetDimensions(out_width, out_height);
+  if (dispatch_thread_id.x >= out_width || dispatch_thread_id.y >= out_height)
   {
     return;
   }
 
-  const int3 load_coord = int3(dispatch_thread_id, 0);
-  float4 original_ao = g_srcOriginalAO.Load(load_coord);
-  float4 gtao_term = DecodeAOTerm(g_srcGTAOTerm.Load(load_coord).x);
+  uint src_width;
+  uint src_height;
+  g_srcOriginalAO.GetDimensions(src_width, src_height);
+  uint gtao_width;
+  uint gtao_height;
+  g_srcGTAOTerm.GetDimensions(gtao_width, gtao_height);
+  if (src_width == 0u || src_height == 0u || gtao_width == 0u || gtao_height == 0u)
+  {
+    return;
+  }
+
+  const float2 uv = (float2(dispatch_thread_id) + float2(0.5, 0.5)) / float2(out_width, out_height);
+  const uint2 src_coord = min((uint2)(uv * float2(src_width, src_height)), uint2(src_width - 1u, src_height - 1u));
+  const uint2 gtao_coord = min(dispatch_thread_id, uint2(gtao_width - 1u, gtao_height - 1u));
+
+  float4 original_ao = g_srcOriginalAO.Load(int3(src_coord, 0));
+  float4 gtao_term = DecodeAOTerm(g_srcGTAOTerm.Load(int3(gtao_coord, 0)).x);
   // Contract:
   //   x = visibility (decoded .w)
   //   yzw = preserved AO yzw in copyback path to avoid AO semantic corruption.
