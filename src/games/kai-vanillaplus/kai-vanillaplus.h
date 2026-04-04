@@ -167,6 +167,12 @@ struct SssInjectData {
   float xegtao_ao_active_for_draw;
   // Foliage-only XeGTAO AO blend factor: 0=no AO on foliage, 1=full XeGTAO AO.
   float xegtao_foliage_ao_blend;
+
+  // Volumetric fog controls (volfog_0xBD7DFE49)
+  float volfog_enabled;         // 0=Off, 1=On
+  float volfog_jitter_enabled;  // 0=Off, 1=On (gated by IS-FAST master)
+  float volfog_jitter_amount;   // jitter strength multiplier
+  float volfog_jitter_speed;    // temporal progression speed
 };
 
 #ifndef __cplusplus

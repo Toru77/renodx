@@ -67,10 +67,10 @@ struct DeviceData;
 bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 void OnAfterLightingShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeVanillaAoDraw(reshade::api::command_list* cmd_list);
-bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list);
 bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list);
 void OnCharacterShaderDrawn(reshade::api::command_list* cmd_list);
 void OnAoFinalPassDrawn(reshade::api::command_list* cmd_list);
+void OnVolFogShaderDrawn(reshade::api::command_list* cmd_list);
 bool BindISFastNoisePixel(reshade::api::command_list* cmd_list);
 bool BindISFastNoiseTexturePixel(reshade::api::command_list* cmd_list, uint32_t texture_binding);
 void OnInitDevice(reshade::api::device* device);
@@ -79,6 +79,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize);
 void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize);
 void ReloadIsFastResources(reshade::api::device* device, const char* reason);
 void DestroyXeGTAOResources(reshade::api::device* device, DeviceData* data);
+void DestroyXeGTAODescriptorTables(reshade::api::device* device, DeviceData* data);
 void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data);
 void DestroyDedicatedSssViews(reshade::api::device* device, DeviceData* data);
 void TransitionResource(
@@ -139,7 +140,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x534E54EA),                 // sss source pass
     CustomShaderEntry(0xAB6DBF4D),                 // dof coc
     CustomShaderEntry(0x2734F870),                 // dof blur composite
-    CustomShaderEntry(0xBD7DFE49),                 // vol fog
+    {
+      kVolFogShader,
+      {
+        .crc32 = kVolFogShader,
+        .code = __0xBD7DFE49,
+        .on_drawn = &OnVolFogShaderDrawn,
+      },
+    },                                             // vol fog
     {
         kAoPass0Shader,
         {
@@ -300,6 +308,10 @@ SssInjectData shader_injection = {
     .xegtao_debug_blackout = 0.f,
     .xegtao_ao_active_for_draw = 0.f,
     .xegtao_foliage_ao_blend = 1.0f,
+    .volfog_enabled = 1.f,
+    .volfog_jitter_enabled = 1.f,
+    .volfog_jitter_amount = 1.5f,
+    .volfog_jitter_speed = 237.f,
 };
 
 float settings_mode = 0.f;
@@ -307,6 +319,13 @@ float isfast_jitter_master = 1.f;
 float char_ssgi_composite_method = 1.f;  // 0=Off, 1=On
 float xegtao_mode = 1.f;                  // 0=Off, 1=On
 float xegtao_quality = 0.f;               // 0=High, 1=Very High, 2=Ultra
+float xegtao_fix_mode = 0.f;              // 0=Off/current path, 1..5=cumulative fixes
+float xegtao_fix_l5_prefilter = 1.f;      // Level-5 pass isolation toggle
+float xegtao_fix_l5_main = 1.f;           // Level-5 pass isolation toggle
+float xegtao_fix_l5_denoise = 1.f;        // Level-5 pass isolation toggle
+float xegtao_fix_l5_composite = 1.f;      // Level-5 pass isolation toggle
+float xegtao_probe_a_dispatch_no_t22 = 0.f;  // Probe A: run dispatch path, suppress t22 bind
+float xegtao_probe_b_t22_no_dispatch = 0.f;  // Probe B: exercise t22 bind, suppress dispatch
 float xegtao_precision = 2.f;             // Runtime-forced to Full FP32 (legacy key kept for compatibility)
 float xegtao_normal_input_mode = 1.f;     // 0=Off(depth fallback), 1=View-Transformed
 float xegtao_normal_influence = 0.05f;
@@ -353,8 +372,33 @@ bool g_isfast_mode_use_fast_texture = true;
 float isfast_texture_source_enabled = 1.f;  // 0=Off(debug), 1=On(real DDS)
 thread_local bool g_skip_descriptor_capture = false;
 
+struct ScopedDescriptorCaptureSkip {
+  explicit ScopedDescriptorCaptureSkip(bool enable = true)
+      : active_(enable), previous_(g_skip_descriptor_capture) {
+    if (active_) {
+      g_skip_descriptor_capture = true;
+    }
+  }
+
+  ~ScopedDescriptorCaptureSkip() {
+    if (active_) {
+      g_skip_descriptor_capture = previous_;
+    }
+  }
+
+  ScopedDescriptorCaptureSkip(const ScopedDescriptorCaptureSkip&) = delete;
+  ScopedDescriptorCaptureSkip& operator=(const ScopedDescriptorCaptureSkip&) = delete;
+
+ private:
+  bool active_;
+  bool previous_;
+};
+
 constexpr uint64_t kInvalidFrameIndex = std::numeric_limits<uint64_t>::max();
 constexpr uint32_t kXeGtaoDepthMipLevels = 5u;
+constexpr uint32_t kXeGtaoDescriptorTableParamCount = 4u;
+using XeGTAODescriptorTableSet =
+  std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount>;
 
 enum class XeGTAOMode : uint32_t {
   kOff = 0u,
@@ -362,9 +406,12 @@ enum class XeGTAOMode : uint32_t {
 };
 
 enum class XeGTAOFixMode : uint32_t {
-  kStrictCustomBind = 0u,
-  kDownscaledCopyback = 1u,
-  kAlwaysCopyback = 2u,
+  kOff = 0u,
+  kProducerConsumerSplit = 1u,
+  kDispatchIsolationRestore = 2u,
+  kSingleOwnerDeterministic = 3u,
+  kStrictSideEffectGuard = 4u,
+  kPassIsolationDiagnostics = 5u,
 };
 
 enum class XeGTAOPrecision : uint32_t {
@@ -433,6 +480,12 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::pipeline_layout xegtao_composite_layout = {};
   reshade::api::pipeline_layout xegtao_normal_cap_layout = {};
 
+  XeGTAODescriptorTableSet xegtao_prefilter_descriptor_tables = {};
+  XeGTAODescriptorTableSet xegtao_main_descriptor_tables = {};
+  XeGTAODescriptorTableSet xegtao_denoise_descriptor_tables = {};
+  XeGTAODescriptorTableSet xegtao_composite_descriptor_tables = {};
+  XeGTAODescriptorTableSet xegtao_normal_cap_descriptor_tables = {};
+
   reshade::api::pipeline xegtao_prefilter_pipeline = {};
   reshade::api::pipeline xegtao_main_pipeline = {};
   reshade::api::pipeline xegtao_denoise_pipeline = {};
@@ -463,6 +516,24 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint32_t xegtao_result_t3_height = 0u;
   uint32_t xegtao_result_t4_width = 0u;
   uint32_t xegtao_result_t4_height = 0u;
+  uint32_t xegtao_result_working_width = 0u;
+  uint32_t xegtao_result_working_height = 0u;
+  bool xegtao_consume_signature_valid = false;
+  uint64_t xegtao_consume_signature_frame = kInvalidFrameIndex;
+  uint64_t xegtao_consume_t3_resource_handle = 0u;
+  uint64_t xegtao_consume_t4_resource_handle = 0u;
+  uint32_t xegtao_consume_t3_width = 0u;
+  uint32_t xegtao_consume_t3_height = 0u;
+  uint32_t xegtao_consume_t4_width = 0u;
+  uint32_t xegtao_consume_t4_height = 0u;
+  uint32_t xegtao_consume_working_width = 0u;
+  uint32_t xegtao_consume_working_height = 0u;
+  bool xegtao_consume_owner_valid = false;
+  uint64_t xegtao_consume_owner_frame = kInvalidFrameIndex;
+  uint32_t xegtao_consume_owner_shader_hash = 0u;
+  uint32_t xegtao_consume_owner_draw_ordinal = 0u;
+  uint64_t xegtao_consume_owner_gate_signature = 0u;
+  bool xegtao_consume_owner_downscaled = false;
   uint64_t xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
   uint32_t xegtao_lighting_draw_counter = 0u;
   bool xegtao_owner_valid = false;
@@ -471,6 +542,22 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint32_t xegtao_owner_draw_ordinal = 0u;
   uint64_t xegtao_owner_gate_signature = 0u;
   bool xegtao_owner_downscaled = false;
+  bool xegtao_deferred_dispatch_pending = false;
+  uint64_t xegtao_deferred_dispatch_frame = kInvalidFrameIndex;
+  bool xegtao_deferred_dispatch_executed = false;
+  uint64_t xegtao_deferred_gate_signature = 0u;
+  uint32_t xegtao_deferred_owner_shader_hash = 0u;
+  uint32_t xegtao_deferred_owner_draw_ordinal = 0u;
+  reshade::api::resource_view xegtao_deferred_depth_srv = {};
+  reshade::api::resource_view xegtao_deferred_ssao_srv = {};
+  reshade::api::resource_view xegtao_deferred_mrt_normal_srv = {};
+  reshade::api::buffer_range xegtao_deferred_scene_cbv = {};
+  bool xegtao_deferred_scene_cbv_valid = false;
+  uint64_t xegtao_deferred_scene_cbv_frame = kInvalidFrameIndex;
+  XeGTAOSceneCbvSource xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  bool xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
+  uint64_t xegtao_deferred_drop_log_frame = kInvalidFrameIndex;
+  uint64_t xegtao_volfog_seen_frame = kInvalidFrameIndex;
   bool last_owner_state_valid = false;
   uint64_t last_owner_diag_hash = 0u;
   bool last_gate_state_valid = false;
@@ -491,6 +578,22 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint32_t xegtao_warmup_stable_count = 0u;
   uint64_t last_warmup_enter_signature = 0u;
   uint64_t last_warmup_complete_signature = 0u;
+  bool xegtao_dispatch_isolation_active = false;
+  bool xegtao_dispatch_restore_mismatch = false;
+  uint64_t xegtao_trace_frame = kInvalidFrameIndex;
+  bool xegtao_trace_dispatch_attempted = false;
+  bool xegtao_trace_dispatch_succeeded = false;
+  bool xegtao_trace_main_pass_executed = false;
+  bool xegtao_trace_composite_pass_executed = false;
+  bool xegtao_trace_t22_bind_executed = false;
+  bool xegtao_trace_copyback_requested = false;
+  bool xegtao_trace_copyback_succeeded = false;
+  bool xegtao_trace_apply_gate_passed = false;
+  bool xegtao_trace_probe_a_active = false;
+  bool xegtao_trace_probe_b_active = false;
+  uint32_t xegtao_trace_owner_draw_ordinal = 0u;
+  bool xegtao_trace_state_valid = false;
+  uint64_t xegtao_trace_diag_hash = 0u;
 
   uint64_t last_capture_diag_log_frame = kInvalidFrameIndex;
   uint64_t last_logged_depth_view_handle = 0u;
@@ -826,6 +929,24 @@ void OnInitDevice(reshade::api::device* device) {
     data->xegtao_result_t3_height = 0u;
     data->xegtao_result_t4_width = 0u;
     data->xegtao_result_t4_height = 0u;
+    data->xegtao_result_working_width = 0u;
+    data->xegtao_result_working_height = 0u;
+    data->xegtao_consume_signature_valid = false;
+    data->xegtao_consume_signature_frame = kInvalidFrameIndex;
+    data->xegtao_consume_t3_resource_handle = 0u;
+    data->xegtao_consume_t4_resource_handle = 0u;
+    data->xegtao_consume_t3_width = 0u;
+    data->xegtao_consume_t3_height = 0u;
+    data->xegtao_consume_t4_width = 0u;
+    data->xegtao_consume_t4_height = 0u;
+    data->xegtao_consume_working_width = 0u;
+    data->xegtao_consume_working_height = 0u;
+    data->xegtao_consume_owner_valid = false;
+    data->xegtao_consume_owner_frame = kInvalidFrameIndex;
+    data->xegtao_consume_owner_shader_hash = 0u;
+    data->xegtao_consume_owner_draw_ordinal = 0u;
+    data->xegtao_consume_owner_gate_signature = 0u;
+    data->xegtao_consume_owner_downscaled = false;
     data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
     data->xegtao_lighting_draw_counter = 0u;
     data->xegtao_owner_valid = false;
@@ -834,6 +955,22 @@ void OnInitDevice(reshade::api::device* device) {
     data->xegtao_owner_draw_ordinal = 0u;
     data->xegtao_owner_gate_signature = 0u;
     data->xegtao_owner_downscaled = false;
+    data->xegtao_deferred_dispatch_pending = false;
+    data->xegtao_deferred_dispatch_frame = kInvalidFrameIndex;
+    data->xegtao_deferred_dispatch_executed = false;
+    data->xegtao_deferred_gate_signature = 0u;
+    data->xegtao_deferred_owner_shader_hash = 0u;
+    data->xegtao_deferred_owner_draw_ordinal = 0u;
+    data->xegtao_deferred_depth_srv = {};
+    data->xegtao_deferred_ssao_srv = {};
+    data->xegtao_deferred_mrt_normal_srv = {};
+    data->xegtao_deferred_scene_cbv = {};
+    data->xegtao_deferred_scene_cbv_valid = false;
+    data->xegtao_deferred_scene_cbv_frame = kInvalidFrameIndex;
+    data->xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+    data->xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
+    data->xegtao_deferred_drop_log_frame = kInvalidFrameIndex;
+    data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
     data->last_owner_state_valid = false;
     data->last_owner_diag_hash = 0u;
     data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
@@ -857,6 +994,22 @@ void OnInitDevice(reshade::api::device* device) {
     data->xegtao_warmup_stable_count = 0u;
     data->last_warmup_enter_signature = 0u;
     data->last_warmup_complete_signature = 0u;
+    data->xegtao_dispatch_isolation_active = false;
+    data->xegtao_dispatch_restore_mismatch = false;
+    data->xegtao_trace_frame = kInvalidFrameIndex;
+    data->xegtao_trace_dispatch_attempted = false;
+    data->xegtao_trace_dispatch_succeeded = false;
+    data->xegtao_trace_main_pass_executed = false;
+    data->xegtao_trace_composite_pass_executed = false;
+    data->xegtao_trace_t22_bind_executed = false;
+    data->xegtao_trace_copyback_requested = false;
+    data->xegtao_trace_copyback_succeeded = false;
+    data->xegtao_trace_apply_gate_passed = false;
+    data->xegtao_trace_probe_a_active = false;
+    data->xegtao_trace_probe_b_active = false;
+    data->xegtao_trace_owner_draw_ordinal = 0u;
+    data->xegtao_trace_state_valid = false;
+    data->xegtao_trace_diag_hash = 0u;
   }
   ReloadIsFastResources(device, "init_device");
 }
@@ -881,6 +1034,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   if (data == nullptr) return;
 
   DestroyXeGTAOResources(device, data);
+  DestroyXeGTAODescriptorTables(device, data);
   DestroyDedicatedSssViews(device, data);
   data->captured_mrt_normal_srv = {};
   data->last_gtao_frame = kInvalidFrameIndex;
@@ -904,6 +1058,24 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_result_t3_height = 0u;
   data->xegtao_result_t4_width = 0u;
   data->xegtao_result_t4_height = 0u;
+  data->xegtao_result_working_width = 0u;
+  data->xegtao_result_working_height = 0u;
+  data->xegtao_consume_signature_valid = false;
+  data->xegtao_consume_signature_frame = kInvalidFrameIndex;
+  data->xegtao_consume_t3_resource_handle = 0u;
+  data->xegtao_consume_t4_resource_handle = 0u;
+  data->xegtao_consume_t3_width = 0u;
+  data->xegtao_consume_t3_height = 0u;
+  data->xegtao_consume_t4_width = 0u;
+  data->xegtao_consume_t4_height = 0u;
+  data->xegtao_consume_working_width = 0u;
+  data->xegtao_consume_working_height = 0u;
+  data->xegtao_consume_owner_valid = false;
+  data->xegtao_consume_owner_frame = kInvalidFrameIndex;
+  data->xegtao_consume_owner_shader_hash = 0u;
+  data->xegtao_consume_owner_draw_ordinal = 0u;
+  data->xegtao_consume_owner_gate_signature = 0u;
+  data->xegtao_consume_owner_downscaled = false;
   data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
   data->xegtao_lighting_draw_counter = 0u;
   data->xegtao_owner_valid = false;
@@ -912,6 +1084,22 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_owner_draw_ordinal = 0u;
   data->xegtao_owner_gate_signature = 0u;
   data->xegtao_owner_downscaled = false;
+  data->xegtao_deferred_dispatch_pending = false;
+  data->xegtao_deferred_dispatch_frame = kInvalidFrameIndex;
+  data->xegtao_deferred_dispatch_executed = false;
+  data->xegtao_deferred_gate_signature = 0u;
+  data->xegtao_deferred_owner_shader_hash = 0u;
+  data->xegtao_deferred_owner_draw_ordinal = 0u;
+  data->xegtao_deferred_depth_srv = {};
+  data->xegtao_deferred_ssao_srv = {};
+  data->xegtao_deferred_mrt_normal_srv = {};
+  data->xegtao_deferred_scene_cbv = {};
+  data->xegtao_deferred_scene_cbv_valid = false;
+  data->xegtao_deferred_scene_cbv_frame = kInvalidFrameIndex;
+  data->xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
+  data->xegtao_deferred_drop_log_frame = kInvalidFrameIndex;
+  data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
   data->last_owner_state_valid = false;
   data->last_owner_diag_hash = 0u;
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
@@ -934,6 +1122,22 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_warmup_stable_count = 0u;
   data->last_warmup_enter_signature = 0u;
   data->last_warmup_complete_signature = 0u;
+  data->xegtao_dispatch_isolation_active = false;
+  data->xegtao_dispatch_restore_mismatch = false;
+  data->xegtao_trace_frame = kInvalidFrameIndex;
+  data->xegtao_trace_dispatch_attempted = false;
+  data->xegtao_trace_dispatch_succeeded = false;
+  data->xegtao_trace_main_pass_executed = false;
+  data->xegtao_trace_composite_pass_executed = false;
+  data->xegtao_trace_t22_bind_executed = false;
+  data->xegtao_trace_copyback_requested = false;
+  data->xegtao_trace_copyback_succeeded = false;
+  data->xegtao_trace_apply_gate_passed = false;
+  data->xegtao_trace_probe_a_active = false;
+  data->xegtao_trace_probe_b_active = false;
+  data->xegtao_trace_owner_draw_ordinal = 0u;
+  data->xegtao_trace_state_valid = false;
+  data->xegtao_trace_diag_hash = 0u;
   data->last_logged_depth_view_handle = 0u;
   data->last_logged_ssao_view_handle = 0u;
   data->last_logged_mrt_normal_view_handle = 0u;
@@ -965,6 +1169,7 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   auto* data = device->get_private_data<DeviceData>();
   if (data == nullptr) return;
   DestroyXeGTAOResources(device, data);
+  DestroyXeGTAODescriptorTables(device, data);
   DestroyDedicatedSssViews(device, data);
   data->captured_mrt_normal_srv = {};
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
@@ -985,6 +1190,24 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_result_t3_height = 0u;
   data->xegtao_result_t4_width = 0u;
   data->xegtao_result_t4_height = 0u;
+  data->xegtao_result_working_width = 0u;
+  data->xegtao_result_working_height = 0u;
+  data->xegtao_consume_signature_valid = false;
+  data->xegtao_consume_signature_frame = kInvalidFrameIndex;
+  data->xegtao_consume_t3_resource_handle = 0u;
+  data->xegtao_consume_t4_resource_handle = 0u;
+  data->xegtao_consume_t3_width = 0u;
+  data->xegtao_consume_t3_height = 0u;
+  data->xegtao_consume_t4_width = 0u;
+  data->xegtao_consume_t4_height = 0u;
+  data->xegtao_consume_working_width = 0u;
+  data->xegtao_consume_working_height = 0u;
+  data->xegtao_consume_owner_valid = false;
+  data->xegtao_consume_owner_frame = kInvalidFrameIndex;
+  data->xegtao_consume_owner_shader_hash = 0u;
+  data->xegtao_consume_owner_draw_ordinal = 0u;
+  data->xegtao_consume_owner_gate_signature = 0u;
+  data->xegtao_consume_owner_downscaled = false;
   data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
   data->xegtao_lighting_draw_counter = 0u;
   data->xegtao_owner_valid = false;
@@ -993,6 +1216,22 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_owner_draw_ordinal = 0u;
   data->xegtao_owner_gate_signature = 0u;
   data->xegtao_owner_downscaled = false;
+  data->xegtao_deferred_dispatch_pending = false;
+  data->xegtao_deferred_dispatch_frame = kInvalidFrameIndex;
+  data->xegtao_deferred_dispatch_executed = false;
+  data->xegtao_deferred_gate_signature = 0u;
+  data->xegtao_deferred_owner_shader_hash = 0u;
+  data->xegtao_deferred_owner_draw_ordinal = 0u;
+  data->xegtao_deferred_depth_srv = {};
+  data->xegtao_deferred_ssao_srv = {};
+  data->xegtao_deferred_mrt_normal_srv = {};
+  data->xegtao_deferred_scene_cbv = {};
+  data->xegtao_deferred_scene_cbv_valid = false;
+  data->xegtao_deferred_scene_cbv_frame = kInvalidFrameIndex;
+  data->xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
+  data->xegtao_deferred_drop_log_frame = kInvalidFrameIndex;
+  data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
   data->last_owner_state_valid = false;
   data->last_owner_diag_hash = 0u;
   data->last_capture_diag_log_frame = kInvalidFrameIndex;
@@ -1013,6 +1252,22 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_warmup_stable_count = 0u;
   data->last_warmup_enter_signature = 0u;
   data->last_warmup_complete_signature = 0u;
+  data->xegtao_dispatch_isolation_active = false;
+  data->xegtao_dispatch_restore_mismatch = false;
+  data->xegtao_trace_frame = kInvalidFrameIndex;
+  data->xegtao_trace_dispatch_attempted = false;
+  data->xegtao_trace_dispatch_succeeded = false;
+  data->xegtao_trace_main_pass_executed = false;
+  data->xegtao_trace_composite_pass_executed = false;
+  data->xegtao_trace_t22_bind_executed = false;
+  data->xegtao_trace_copyback_requested = false;
+  data->xegtao_trace_copyback_succeeded = false;
+  data->xegtao_trace_apply_gate_passed = false;
+  data->xegtao_trace_probe_a_active = false;
+  data->xegtao_trace_probe_b_active = false;
+  data->xegtao_trace_owner_draw_ordinal = 0u;
+  data->xegtao_trace_state_valid = false;
+  data->xegtao_trace_diag_hash = 0u;
   data->last_logged_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->last_logged_scene_cbv_buffer_handle = 0u;
   data->last_logged_scene_cbv_valid = false;
@@ -1322,29 +1577,18 @@ uint64_t BuildXeGTAODrawSignature(
 bool IsXeGTAOResultDownscaled(const DeviceData* data) {
   if (data == nullptr || !data->xegtao_result_signature_valid) return false;
   if (data->xegtao_result_t3_width == 0u || data->xegtao_result_t3_height == 0u) return false;
-  const char* scale_class = ClassifyXeGTAOT4ScaleClass(
-      data->xegtao_result_t3_width,
-      data->xegtao_result_t3_height,
-      data->xegtao_result_t4_width,
-      data->xegtao_result_t4_height);
-  return std::strcmp(scale_class, "1/2") == 0 || std::strcmp(scale_class, "1/4") == 0;
+  if (data->xegtao_result_working_width == 0u || data->xegtao_result_working_height == 0u) return false;
+  return data->xegtao_result_working_width < data->xegtao_result_t3_width
+      || data->xegtao_result_working_height < data->xegtao_result_t3_height;
 }
 
 bool IsXeGTAOCurrentInputDownscaled(reshade::api::device* device, const DeviceData* data) {
   if (device == nullptr || data == nullptr) return false;
+  if (data->working_width == 0u || data->working_height == 0u) return false;
   const auto depth_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
-  const auto ssao_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
-  if (!depth_info.alive || !ssao_info.alive) return false;
-  if (depth_info.resource_desc.type != reshade::api::resource_type::texture_2d
-      || ssao_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
-    return false;
-  }
-  const char* scale_class = ClassifyXeGTAOT4ScaleClass(
-      depth_info.width,
-      depth_info.height,
-      ssao_info.width,
-      ssao_info.height);
-  return std::strcmp(scale_class, "1/2") == 0 || std::strcmp(scale_class, "1/4") == 0;
+  if (!depth_info.alive) return false;
+  if (depth_info.resource_desc.type != reshade::api::resource_type::texture_2d) return false;
+  return data->working_width < depth_info.width || data->working_height < depth_info.height;
 }
 
 std::string FormatXeGTAOOwnerInfo(const DeviceData* data) {
@@ -1699,16 +1943,37 @@ XeGTAOMode GetXeGTAOModeSetting() {
 }
 
 uint32_t ClampXeGTAOFixMode() {
-  return static_cast<uint32_t>(XeGTAOFixMode::kStrictCustomBind);
+  return static_cast<uint32_t>(std::clamp(std::round(xegtao_fix_mode), 0.f, 5.f));
 }
 
 const char* GetXeGTAOFixModeName(uint32_t fix_mode) {
-  (void)fix_mode;
-  return "strict_t22";
+  switch (static_cast<XeGTAOFixMode>(fix_mode)) {
+    case XeGTAOFixMode::kProducerConsumerSplit:
+      return "l1_producer_consumer";
+    case XeGTAOFixMode::kDispatchIsolationRestore:
+      return "l2_isolation_restore";
+    case XeGTAOFixMode::kSingleOwnerDeterministic:
+      return "l3_single_owner";
+    case XeGTAOFixMode::kStrictSideEffectGuard:
+      return "l4_strict_guard";
+    case XeGTAOFixMode::kPassIsolationDiagnostics:
+      return "l5_pass_isolation";
+    case XeGTAOFixMode::kOff:
+    default:
+      return "off";
+  }
 }
 
 uint32_t ClampXeGTAOQuality() {
   return static_cast<uint32_t>(std::clamp(xegtao_quality, 0.f, 2.f));
+}
+
+uint32_t ClampBooleanToggle(float value) {
+  return static_cast<uint32_t>(std::clamp(std::round(value), 0.f, 1.f));
+}
+
+bool IsXeGTAOFixLevelAtLeast(XeGTAOFixMode level) {
+  return ClampXeGTAOFixMode() >= static_cast<uint32_t>(level);
 }
 
 uint32_t ClampXeGTAOPrecision() {
@@ -1819,6 +2084,33 @@ void DestroyResourceIfValid(reshade::api::device* device, reshade::api::resource
   *resource = {0u};
 }
 
+void DestroyDescriptorTableIfValid(
+    reshade::api::device* device,
+    reshade::api::descriptor_table* table) {
+  if (device == nullptr || table == nullptr) return;
+  if (table->handle == 0u) return;
+  device->free_descriptor_table(*table);
+  *table = {0u};
+}
+
+void DestroyXeGTAODescriptorTableSet(
+    reshade::api::device* device,
+    XeGTAODescriptorTableSet* tables) {
+  if (device == nullptr || tables == nullptr) return;
+  for (auto& table : *tables) {
+    DestroyDescriptorTableIfValid(device, &table);
+  }
+}
+
+void DestroyXeGTAODescriptorTables(reshade::api::device* device, DeviceData* data) {
+  if (device == nullptr || data == nullptr) return;
+  DestroyXeGTAODescriptorTableSet(device, &data->xegtao_prefilter_descriptor_tables);
+  DestroyXeGTAODescriptorTableSet(device, &data->xegtao_main_descriptor_tables);
+  DestroyXeGTAODescriptorTableSet(device, &data->xegtao_denoise_descriptor_tables);
+  DestroyXeGTAODescriptorTableSet(device, &data->xegtao_composite_descriptor_tables);
+  DestroyXeGTAODescriptorTableSet(device, &data->xegtao_normal_cap_descriptor_tables);
+}
+
 void DestroyPipelineLayoutIfValid(reshade::api::device* device, reshade::api::pipeline_layout* layout) {
   if (device == nullptr || layout == nullptr) return;
   if (layout->handle == 0u) return;
@@ -1877,6 +2169,8 @@ void DestroyDedicatedSssViews(reshade::api::device* device, DeviceData* data) {
 
 void DestroyXeGTAOPipelines(reshade::api::device* device, DeviceData* data) {
   if (device == nullptr || data == nullptr) return;
+
+  DestroyXeGTAODescriptorTables(device, data);
 
   DestroyPipelineIfValid(device, &data->xegtao_prefilter_pipeline);
   DestroyPipelineIfValid(device, &data->xegtao_main_pipeline);
@@ -1937,6 +2231,24 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->xegtao_result_t3_height = 0u;
   data->xegtao_result_t4_width = 0u;
   data->xegtao_result_t4_height = 0u;
+  data->xegtao_result_working_width = 0u;
+  data->xegtao_result_working_height = 0u;
+  data->xegtao_consume_signature_valid = false;
+  data->xegtao_consume_signature_frame = kInvalidFrameIndex;
+  data->xegtao_consume_t3_resource_handle = 0u;
+  data->xegtao_consume_t4_resource_handle = 0u;
+  data->xegtao_consume_t3_width = 0u;
+  data->xegtao_consume_t3_height = 0u;
+  data->xegtao_consume_t4_width = 0u;
+  data->xegtao_consume_t4_height = 0u;
+  data->xegtao_consume_working_width = 0u;
+  data->xegtao_consume_working_height = 0u;
+  data->xegtao_consume_owner_valid = false;
+  data->xegtao_consume_owner_frame = kInvalidFrameIndex;
+  data->xegtao_consume_owner_shader_hash = 0u;
+  data->xegtao_consume_owner_draw_ordinal = 0u;
+  data->xegtao_consume_owner_gate_signature = 0u;
+  data->xegtao_consume_owner_downscaled = false;
   data->xegtao_lighting_draw_counter_frame = kInvalidFrameIndex;
   data->xegtao_lighting_draw_counter = 0u;
   data->xegtao_owner_valid = false;
@@ -1945,6 +2257,22 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->xegtao_owner_draw_ordinal = 0u;
   data->xegtao_owner_gate_signature = 0u;
   data->xegtao_owner_downscaled = false;
+  data->xegtao_deferred_dispatch_pending = false;
+  data->xegtao_deferred_dispatch_frame = kInvalidFrameIndex;
+  data->xegtao_deferred_dispatch_executed = false;
+  data->xegtao_deferred_gate_signature = 0u;
+  data->xegtao_deferred_owner_shader_hash = 0u;
+  data->xegtao_deferred_owner_draw_ordinal = 0u;
+  data->xegtao_deferred_depth_srv = {};
+  data->xegtao_deferred_ssao_srv = {};
+  data->xegtao_deferred_mrt_normal_srv = {};
+  data->xegtao_deferred_scene_cbv = {};
+  data->xegtao_deferred_scene_cbv_valid = false;
+  data->xegtao_deferred_scene_cbv_frame = kInvalidFrameIndex;
+  data->xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+  data->xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
+  data->xegtao_deferred_drop_log_frame = kInvalidFrameIndex;
+  data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
   data->last_owner_state_valid = false;
   data->last_owner_diag_hash = 0u;
   data->last_gate_state_valid = false;
@@ -1964,6 +2292,22 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->xegtao_warmup_stable_count = 0u;
   data->last_warmup_enter_signature = 0u;
   data->last_warmup_complete_signature = 0u;
+  data->xegtao_dispatch_isolation_active = false;
+  data->xegtao_dispatch_restore_mismatch = false;
+  data->xegtao_trace_frame = kInvalidFrameIndex;
+  data->xegtao_trace_dispatch_attempted = false;
+  data->xegtao_trace_dispatch_succeeded = false;
+  data->xegtao_trace_main_pass_executed = false;
+  data->xegtao_trace_composite_pass_executed = false;
+  data->xegtao_trace_t22_bind_executed = false;
+  data->xegtao_trace_copyback_requested = false;
+  data->xegtao_trace_copyback_succeeded = false;
+  data->xegtao_trace_apply_gate_passed = false;
+  data->xegtao_trace_probe_a_active = false;
+  data->xegtao_trace_probe_b_active = false;
+  data->xegtao_trace_owner_draw_ordinal = 0u;
+  data->xegtao_trace_state_valid = false;
+  data->xegtao_trace_diag_hash = 0u;
   data->last_capture_diag_log_frame = kInvalidFrameIndex;
   data->last_logged_depth_view_handle = 0u;
   data->last_logged_ssao_view_handle = 0u;
@@ -2156,14 +2500,56 @@ bool EnsureXeGTAOLayout(
   push_constants_range.count = 32;
   push_constants_range.visibility = reshade::api::shader_stage::all_compute;
 
+  reshade::api::pipeline_layout_param param_sampler = {};
+  param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  param_sampler.descriptor_table.count = 1;
+  param_sampler.descriptor_table.ranges = &sampler_range;
+
+  reshade::api::pipeline_layout_param param_cbv = {};
+  param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  param_cbv.descriptor_table.count = 1;
+  param_cbv.descriptor_table.ranges = &cbv_range;
+
+  reshade::api::pipeline_layout_param param_srv = {};
+  param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  param_srv.descriptor_table.count = 1;
+  param_srv.descriptor_table.ranges = &srv_range;
+
+  reshade::api::pipeline_layout_param param_uav = {};
+  param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  param_uav.descriptor_table.count = 1;
+  param_uav.descriptor_table.ranges = &uav_range;
+
+  reshade::api::pipeline_layout_param param_constants = {};
+  param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
+  param_constants.push_constants = push_constants_range;
+
   std::array<reshade::api::pipeline_layout_param, 5> params = {
-      reshade::api::pipeline_layout_param{sampler_range},
-      reshade::api::pipeline_layout_param{cbv_range},
-      reshade::api::pipeline_layout_param{srv_range},
-      reshade::api::pipeline_layout_param{uav_range},
-      reshade::api::pipeline_layout_param{push_constants_range},
+      param_sampler,
+      param_cbv,
+      param_srv,
+      param_uav,
+      param_constants,
   };
   return device->create_pipeline_layout(static_cast<uint32_t>(params.size()), params.data(), out_layout);
+}
+
+bool EnsureXeGTAODescriptorTables(
+    reshade::api::device* device,
+    reshade::api::pipeline_layout layout,
+    XeGTAODescriptorTableSet* out_tables) {
+  if (device == nullptr || out_tables == nullptr) return false;
+  if (layout.handle == 0u) return false;
+
+  for (uint32_t i = 0u; i < kXeGtaoDescriptorTableParamCount; ++i) {
+    auto& table = (*out_tables)[i];
+    if (table.handle != 0u) continue;
+    if (!device->allocate_descriptor_table(layout, i, &table)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool EnsureXeGTAOComputePipeline(
@@ -2191,6 +2577,7 @@ bool DispatchXeGTAOCompute(
     reshade::api::command_list* cmd_list,
     reshade::api::pipeline_layout layout,
     reshade::api::pipeline pipeline,
+    XeGTAODescriptorTableSet* descriptor_tables,
     std::span<const reshade::api::descriptor_table_update> descriptor_updates,
     std::span<const float> push_constants,
     uint32_t group_count_x,
@@ -2198,17 +2585,40 @@ bool DispatchXeGTAOCompute(
     uint32_t group_count_z) {
   if (cmd_list == nullptr) return false;
   if (layout.handle == 0u || pipeline.handle == 0u) return false;
+  if (descriptor_tables == nullptr) return false;
+  if (descriptor_updates.empty() || descriptor_updates.size() > kXeGtaoDescriptorTableParamCount) return false;
   if (group_count_x == 0u || group_count_y == 0u || group_count_z == 0u) return false;
 
-  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, pipeline);
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return false;
+  if (!EnsureXeGTAODescriptorTables(device, layout, descriptor_tables)) return false;
 
-  for (uint32_t i = 0u; i < descriptor_updates.size(); ++i) {
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::all_compute,
-        layout,
-        i,
-        descriptor_updates[i]);
+  renodx::utils::state::CommandListState previous_state = {};
+  bool has_previous_state = false;
+  if (auto* current_state = renodx::utils::state::GetCurrentState(cmd_list);
+      current_state != nullptr) {
+    previous_state = *current_state;
+    has_previous_state = true;
   }
+
+  std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> table_updates = {};
+  std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount> bound_tables = {};
+  const uint32_t update_count = static_cast<uint32_t>(descriptor_updates.size());
+  for (uint32_t i = 0u; i < update_count; ++i) {
+    bound_tables[i] = (*descriptor_tables)[i];
+    table_updates[i] = descriptor_updates[i];
+    table_updates[i].table = bound_tables[i];
+  }
+
+  device->update_descriptor_tables(update_count, table_updates.data());
+
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, pipeline);
+  cmd_list->bind_descriptor_tables(
+      reshade::api::shader_stage::all_compute,
+      layout,
+      0u,
+      update_count,
+      bound_tables.data());
 
   cmd_list->push_constants(
       reshade::api::shader_stage::all_compute,
@@ -2219,6 +2629,45 @@ bool DispatchXeGTAOCompute(
       push_constants.data());
 
   cmd_list->dispatch(group_count_x, group_count_y, group_count_z);
+
+  std::array<reshade::api::sampler, 16> null_samplers = {};
+  std::array<reshade::api::sampler_with_resource_view, 16> null_sampler_srvs = {};
+  std::array<reshade::api::buffer_range, 16> null_buffer_ranges = {};
+  std::array<reshade::api::resource_view, 16> null_views = {};
+
+  std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> clear_updates = {};
+  for (uint32_t i = 0u; i < update_count; ++i) {
+    clear_updates[i] = table_updates[i];
+    switch (clear_updates[i].type) {
+      case reshade::api::descriptor_type::sampler:
+        clear_updates[i].descriptors = null_samplers.data();
+        break;
+      case reshade::api::descriptor_type::sampler_with_resource_view:
+        clear_updates[i].descriptors = null_sampler_srvs.data();
+        break;
+      case reshade::api::descriptor_type::constant_buffer:
+      case reshade::api::descriptor_type::shader_storage_buffer:
+        clear_updates[i].descriptors = null_buffer_ranges.data();
+        break;
+      default:
+        clear_updates[i].descriptors = null_views.data();
+        break;
+    }
+  }
+
+  device->update_descriptor_tables(update_count, clear_updates.data());
+  cmd_list->bind_descriptor_tables(
+      reshade::api::shader_stage::all_compute,
+      layout,
+      0u,
+      update_count,
+      bound_tables.data());
+  reshade::api::pipeline null_compute_pipeline = {};
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, null_compute_pipeline);
+
+  if (has_previous_state) {
+    previous_state.Apply(cmd_list);
+  }
   return true;
 }
 
@@ -2291,6 +2740,12 @@ bool EnsureXeGTAOResources(reshade::api::device* device, DeviceData* data) {
   if (ssao_desc.type != reshade::api::resource_type::texture_2d) return false;
   if (ssao_desc.texture.samples != 1u) return false;
 
+  const auto depth_resource = device->get_resource_from_view(data->captured_depth_srv);
+  if (depth_resource.handle == 0u) return false;
+  const auto depth_desc = device->get_resource_desc(depth_resource);
+  if (depth_desc.type != reshade::api::resource_type::texture_2d) return false;
+  if (depth_desc.texture.samples != 1u) return false;
+
   auto ssao_view_format = device->get_resource_view_desc(data->captured_ssao_srv).format;
   if (ssao_view_format == reshade::api::format::unknown) {
     ssao_view_format = reshade::api::format_to_default_typed(ssao_desc.texture.format);
@@ -2308,22 +2763,25 @@ bool EnsureXeGTAOResources(reshade::api::device* device, DeviceData* data) {
       ? reshade::api::format::r16_float
       : reshade::api::format::r32_float;
 
+  const uint32_t target_working_width = std::max(1u, depth_desc.texture.width);
+  const uint32_t target_working_height = std::max(1u, depth_desc.texture.height);
+
   const bool should_recreate =
       data->depth_mips_texture.handle == 0u
       || data->ao_term_a_texture.handle == 0u
       || data->ao_term_b_texture.handle == 0u
       || data->edges_texture.handle == 0u
       || data->composite_texture.handle == 0u
-      || data->working_width != ssao_desc.texture.width
-      || data->working_height != ssao_desc.texture.height
+      || data->working_width != target_working_width
+      || data->working_height != target_working_height
       || data->working_precision != precision_mode
       || data->working_ao_format != ssao_view_format;
   if (!should_recreate) return true;
 
   DestroyXeGTAOResources(device, data);
 
-  data->working_width = ssao_desc.texture.width;
-  data->working_height = ssao_desc.texture.height;
+  data->working_width = target_working_width;
+  data->working_height = target_working_height;
   data->working_precision = precision_mode;
   data->working_ao_format = ssao_view_format;
 
@@ -2637,7 +3095,11 @@ bool TryCopyBackXeGTAOResult(reshade::api::command_list* cmd_list, DeviceData* d
   return true;
 }
 
-bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, bool request_copy_back) {
+bool RunXeGTAOForFrame(
+  reshade::api::command_list* cmd_list,
+  DeviceData* data,
+  bool request_copy_back,
+  bool resolve_inputs_from_current_bindings) {
   if (cmd_list == nullptr || data == nullptr) return false;
   auto* device = cmd_list->get_device();
   auto fail = [data, device](const std::string& reason) -> bool {
@@ -2666,6 +3128,10 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   data->xegtao_copyback_requested_for_frame = request_copy_back;
   data->xegtao_copyback_succeeded_for_frame = false;
   data->xegtao_copyback_active_for_apply = false;
+  data->xegtao_trace_main_pass_executed = false;
+  data->xegtao_trace_composite_pass_executed = false;
+  data->xegtao_trace_copyback_requested = request_copy_back;
+  data->xegtao_trace_copyback_succeeded = false;
 
   if (data->xegtao_result_signature_frame != data->present_frame_index) {
     data->xegtao_result_signature_valid = false;
@@ -2697,25 +3163,36 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     data->captured_mrt_normal_srv = {};
   }
 
-  // Always refresh from currently bound lighting descriptors so quality-path transitions
-  // (e.g. high <-> ultra resolution) cannot keep stale-but-alive captures.
-  ResolveXeGTAOInputsFromCurrentBindings(cmd_list, data);
+  if (resolve_inputs_from_current_bindings) {
+    // Always refresh from currently bound lighting descriptors so quality-path transitions
+    // (e.g. high <-> ultra resolution) cannot keep stale-but-alive captures.
+    ResolveXeGTAOInputsFromCurrentBindings(cmd_list, data);
 
-  const bool has_current_scene_cbv = data->resolved_scene_cbv_from_current_bindings
-      && data->captured_scene_cbv_valid
-      && data->captured_scene_cbv_frame == data->present_frame_index
-      && data->captured_scene_cbv.buffer.handle != 0u
-      && IsSceneCbvCandidateValid(device, data->captured_scene_cbv);
+    const bool has_current_scene_cbv = data->resolved_scene_cbv_from_current_bindings
+        && data->captured_scene_cbv_valid
+        && data->captured_scene_cbv_frame == data->present_frame_index
+        && data->captured_scene_cbv.buffer.handle != 0u
+        && IsSceneCbvCandidateValid(device, data->captured_scene_cbv);
 
-  if (!has_current_scene_cbv) {
-    data->captured_scene_cbv = {};
-    data->captured_scene_cbv_valid = false;
-    data->captured_scene_cbv_frame = kInvalidFrameIndex;
-    data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
-  }
+    if (!has_current_scene_cbv) {
+      data->captured_scene_cbv = {};
+      data->captured_scene_cbv_valid = false;
+      data->captured_scene_cbv_frame = kInvalidFrameIndex;
+      data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+    }
 
-  if (!has_current_scene_cbv) {
-    (void)TryAdoptFallbackSceneCbv(device, data);
+    if (!has_current_scene_cbv) {
+      (void)TryAdoptFallbackSceneCbv(device, data);
+    }
+  } else {
+    const bool has_frozen_scene_cbv = data->captured_scene_cbv_valid
+        && data->captured_scene_cbv_frame == data->present_frame_index
+        && data->captured_scene_cbv.buffer.handle != 0u
+        && IsSceneCbvCandidateValid(device, data->captured_scene_cbv);
+    if (!has_frozen_scene_cbv) {
+      (void)TryAdoptFallbackSceneCbv(device, data);
+    }
+    data->resolved_scene_cbv_from_current_bindings = false;
   }
 
   LogXeGTAOCaptureDiagnostics(device, data);
@@ -2743,6 +3220,16 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   const uint32_t width = data->working_width;
   const uint32_t height = data->working_height;
   if (width == 0u || height == 0u) return fail("working texture dimensions are zero");
+  const uint32_t fix_mode = ClampXeGTAOFixMode();
+  const bool l5_pass_isolation =
+      fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kPassIsolationDiagnostics);
+  const bool run_prefilter_pass = !l5_pass_isolation || ClampBooleanToggle(xegtao_fix_l5_prefilter) != 0u;
+  const bool run_main_pass = !l5_pass_isolation || ClampBooleanToggle(xegtao_fix_l5_main) != 0u;
+  const bool run_denoise_pass = !l5_pass_isolation || ClampBooleanToggle(xegtao_fix_l5_denoise) != 0u;
+  const bool run_composite_pass = !l5_pass_isolation || ClampBooleanToggle(xegtao_fix_l5_composite) != 0u;
+  if (!run_prefilter_pass || !run_main_pass || !run_composite_pass) {
+    return fail("level-5 pass isolation disabled a required producer pass");
+  }
   const bool force_downscaled_quality = IsXeGTAOCurrentInputDownscaled(device, data);
 
     const reshade::api::pipeline prefilter_pipeline = data->xegtao_prefilter_pipeline;
@@ -2767,23 +3254,24 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
       reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, prefilter_srvs.data()},
       reshade::api::descriptor_table_update{{}, 0, 0, 5, reshade::api::descriptor_type::texture_unordered_access_view, prefilter_uavs.data()},
   };
-  TransitionResource(
+    TransitionResource(
       cmd_list,
       data->depth_mips_texture,
       reshade::api::resource_usage::shader_resource,
       reshade::api::resource_usage::unordered_access);
-  if (!DispatchXeGTAOCompute(
-          cmd_list,
-          data->xegtao_prefilter_layout,
-          prefilter_pipeline,
-          std::span<const reshade::api::descriptor_table_update>(prefilter_updates.data(), prefilter_updates.size()),
-          std::span<const float>(prefilter_constants.data(), prefilter_constants.size()),
-          (width + 15u) / 16u,
-          (height + 15u) / 16u,
-          1u)) {
+    if (!DispatchXeGTAOCompute(
+        cmd_list,
+        data->xegtao_prefilter_layout,
+        prefilter_pipeline,
+      &data->xegtao_prefilter_descriptor_tables,
+        std::span<const reshade::api::descriptor_table_update>(prefilter_updates.data(), prefilter_updates.size()),
+        std::span<const float>(prefilter_constants.data(), prefilter_constants.size()),
+        (width + 15u) / 16u,
+        (height + 15u) / 16u,
+        1u)) {
     return fail("prefilter dispatch failed");
-  }
-  TransitionResource(
+    }
+    TransitionResource(
       cmd_list,
       data->depth_mips_texture,
       reshade::api::resource_usage::unordered_access,
@@ -2824,6 +3312,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
             cmd_list,
             data->xegtao_main_layout,
             main_pipeline,
+          &data->xegtao_main_descriptor_tables,
             std::span<const reshade::api::descriptor_table_update>(main_updates.data(), main_updates.size()),
             std::span<const float>(main_constants.data(), main_constants.size()),
             (width + 7u) / 8u,
@@ -2851,6 +3340,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
       && xegtao_normal_max_darkening < 0.999f;
 
   if (exact_normal_cap_enabled) {
+    data->xegtao_trace_main_pass_executed = true;
     if (!dispatch_main_pass(true, data->ao_term_b_uav, data->ao_term_b_texture, "main baseline")) return false;
     if (!dispatch_main_pass(false, data->ao_term_a_uav, data->ao_term_a_texture, "main")) return false;
 
@@ -2877,6 +3367,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
             cmd_list,
             data->xegtao_normal_cap_layout,
             normal_cap_pipeline,
+          &data->xegtao_normal_cap_descriptor_tables,
             std::span<const reshade::api::descriptor_table_update>(normal_cap_updates.data(), normal_cap_updates.size()),
             std::span<const float>(normal_cap_constants.data(), normal_cap_constants.size()),
             (width + 7u) / 8u,
@@ -2890,13 +3381,16 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
         reshade::api::resource_usage::unordered_access,
         reshade::api::resource_usage::shader_resource);
   } else {
+    data->xegtao_trace_main_pass_executed = true;
     if (!dispatch_main_pass(false, data->ao_term_a_uav, data->ao_term_a_texture, "main")) return false;
   }
 
   data->xegtao_mrt_normal_frame = data->present_frame_index;
   data->xegtao_mrt_normal_valid = mrt_normal_valid;
 
-  const uint32_t denoise_passes = force_downscaled_quality ? 3u : ClampXeGTAODenoisePasses();
+  const uint32_t denoise_passes = run_denoise_pass
+      ? (force_downscaled_quality ? 3u : ClampXeGTAODenoisePasses())
+      : 0u;
   bool denoise_source_is_a = true;
 
   auto dispatch_vanilla_denoise_pass =
@@ -2933,6 +3427,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
             cmd_list,
             data->xegtao_denoise_layout,
             denoise_pipeline,
+          &data->xegtao_denoise_descriptor_tables,
             std::span<const reshade::api::descriptor_table_update>(denoise_updates.data(), denoise_updates.size()),
             std::span<const float>(denoise_constants.data(), denoise_constants.size()),
             (width + 15u) / 16u,
@@ -2980,10 +3475,12 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
       data->composite_texture,
       reshade::api::resource_usage::shader_resource,
       reshade::api::resource_usage::unordered_access);
+  data->xegtao_trace_composite_pass_executed = true;
   if (!DispatchXeGTAOCompute(
           cmd_list,
           data->xegtao_composite_layout,
           data->xegtao_composite_pipeline,
+      &data->xegtao_composite_descriptor_tables,
           std::span<const reshade::api::descriptor_table_update>(composite_updates.data(), composite_updates.size()),
           std::span<const float>(composite_constants.data(), composite_constants.size()),
           (width + 7u) / 8u,
@@ -3004,6 +3501,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     data->copyback_succeeded = TryCopyBackXeGTAOResult(cmd_list, data);
     data->xegtao_copyback_succeeded_for_frame = data->copyback_succeeded;
     data->xegtao_copyback_active_for_apply = data->copyback_succeeded;
+    data->xegtao_trace_copyback_succeeded = data->copyback_succeeded;
     if (!data->copyback_succeeded) {
       TransitionResource(
           cmd_list,
@@ -3016,6 +3514,7 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
     data->copyback_succeeded = false;
     data->xegtao_copyback_succeeded_for_frame = false;
     data->xegtao_copyback_active_for_apply = false;
+    data->xegtao_trace_copyback_succeeded = false;
   }
 
   const auto signature_t3 = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
@@ -3036,6 +3535,8 @@ bool RunXeGTAOForFrame(reshade::api::command_list* cmd_list, DeviceData* data, b
   data->xegtao_result_t3_height = signature_t3.height;
   data->xegtao_result_t4_width = signature_t4.width;
   data->xegtao_result_t4_height = signature_t4.height;
+  data->xegtao_result_working_width = data->working_width;
+  data->xegtao_result_working_height = data->working_height;
   data->last_gtao_frame = data->present_frame_index;
   return true;
 }
@@ -3609,6 +4110,18 @@ void OnAoFinalPassDrawn(reshade::api::command_list* cmd_list) {
   if (data == nullptr) return;
 }
 
+void OnVolFogShaderDrawn(reshade::api::command_list* cmd_list) {
+  if (cmd_list == nullptr) return;
+
+  auto* device = cmd_list->get_device();
+  if (device == nullptr || !IsIsFastSupportedDevice(device)) return;
+
+  auto* data = device->get_private_data<DeviceData>();
+  if (data == nullptr) return;
+
+  data->xegtao_volfog_seen_frame = data->present_frame_index;
+}
+
 void OnAfterLightingShaderDraw(reshade::api::command_list* cmd_list) {
   (void)cmd_list;
   // Safety reset to prevent per-draw XeGTAO state leaking into later draws that
@@ -3675,14 +4188,100 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     auto* data = device->get_private_data<DeviceData>();
     const auto mode = GetXeGTAOModeSetting();
     if (data != nullptr && mode != XeGTAOMode::kOff) {
+        const uint32_t fix_mode = ClampXeGTAOFixMode();
+        const bool fix_l1_split =
+          fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kProducerConsumerSplit);
+        const bool fix_l2_isolation =
+          fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kDispatchIsolationRestore);
+        const bool fix_l3_owner =
+          fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kSingleOwnerDeterministic);
+        const bool fix_l4_guard =
+          fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kStrictSideEffectGuard);
+        const bool probe_a_dispatch_no_t22 = ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22) != 0u;
+        const bool probe_b_t22_no_dispatch =
+            !probe_a_dispatch_no_t22 && ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch) != 0u;
+
       const uint64_t frame = data->present_frame_index;
       if (data->xegtao_lighting_draw_counter_frame != frame) {
         data->xegtao_lighting_draw_counter_frame = frame;
         data->xegtao_lighting_draw_counter = 0u;
+        data->xegtao_dispatch_isolation_active = false;
+        data->xegtao_dispatch_restore_mismatch = false;
+        data->xegtao_trace_frame = frame;
+        data->xegtao_trace_dispatch_attempted = false;
+        data->xegtao_trace_dispatch_succeeded = false;
+        data->xegtao_trace_main_pass_executed = false;
+        data->xegtao_trace_composite_pass_executed = false;
+        data->xegtao_trace_t22_bind_executed = false;
+        data->xegtao_trace_copyback_requested = false;
+        data->xegtao_trace_copyback_succeeded = false;
+        data->xegtao_trace_apply_gate_passed = false;
+        data->xegtao_trace_probe_a_active = probe_a_dispatch_no_t22;
+        data->xegtao_trace_probe_b_active = probe_b_t22_no_dispatch;
+        data->xegtao_trace_owner_draw_ordinal = 0u;
+        data->xegtao_trace_state_valid = false;
+        data->xegtao_trace_diag_hash = 0u;
+        data->xegtao_deferred_dispatch_pending = false;
+        data->xegtao_deferred_dispatch_frame = kInvalidFrameIndex;
+        data->xegtao_deferred_dispatch_executed = false;
+        data->xegtao_deferred_gate_signature = 0u;
+        data->xegtao_deferred_owner_shader_hash = 0u;
+        data->xegtao_deferred_owner_draw_ordinal = 0u;
+        data->xegtao_deferred_depth_srv = {};
+        data->xegtao_deferred_ssao_srv = {};
+        data->xegtao_deferred_mrt_normal_srv = {};
+        data->xegtao_deferred_scene_cbv = {};
+        data->xegtao_deferred_scene_cbv_valid = false;
+        data->xegtao_deferred_scene_cbv_frame = kInvalidFrameIndex;
+        data->xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
+        data->xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
+        data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
+        if (fix_l1_split) {
+          data->xegtao_consume_signature_valid =
+              data->xegtao_result_signature_valid
+              && data->xegtao_result_t3_resource_handle != 0u
+              && data->xegtao_result_t4_resource_handle != 0u
+              && IsViewAlive(device, data->composite_srv);
+          data->xegtao_consume_signature_frame = data->xegtao_result_signature_frame;
+          data->xegtao_consume_t3_resource_handle = data->xegtao_result_t3_resource_handle;
+          data->xegtao_consume_t4_resource_handle = data->xegtao_result_t4_resource_handle;
+          data->xegtao_consume_t3_width = data->xegtao_result_t3_width;
+          data->xegtao_consume_t3_height = data->xegtao_result_t3_height;
+          data->xegtao_consume_t4_width = data->xegtao_result_t4_width;
+          data->xegtao_consume_t4_height = data->xegtao_result_t4_height;
+          data->xegtao_consume_working_width = data->xegtao_result_working_width;
+          data->xegtao_consume_working_height = data->xegtao_result_working_height;
+          data->xegtao_consume_owner_valid = data->xegtao_owner_valid;
+          data->xegtao_consume_owner_frame = data->xegtao_owner_frame;
+          data->xegtao_consume_owner_shader_hash = data->xegtao_owner_shader_hash;
+          data->xegtao_consume_owner_draw_ordinal = data->xegtao_owner_draw_ordinal;
+          data->xegtao_consume_owner_gate_signature = data->xegtao_owner_gate_signature;
+          data->xegtao_consume_owner_downscaled = data->xegtao_owner_downscaled;
+        } else {
+          data->xegtao_consume_signature_valid = false;
+          data->xegtao_consume_signature_frame = kInvalidFrameIndex;
+          data->xegtao_consume_t3_resource_handle = 0u;
+          data->xegtao_consume_t4_resource_handle = 0u;
+          data->xegtao_consume_t3_width = 0u;
+          data->xegtao_consume_t3_height = 0u;
+          data->xegtao_consume_t4_width = 0u;
+          data->xegtao_consume_t4_height = 0u;
+          data->xegtao_consume_working_width = 0u;
+          data->xegtao_consume_working_height = 0u;
+          data->xegtao_consume_owner_valid = false;
+          data->xegtao_consume_owner_frame = kInvalidFrameIndex;
+          data->xegtao_consume_owner_shader_hash = 0u;
+          data->xegtao_consume_owner_draw_ordinal = 0u;
+          data->xegtao_consume_owner_gate_signature = 0u;
+          data->xegtao_consume_owner_downscaled = false;
+        }
       }
       data->xegtao_lighting_draw_counter += 1u;
       const uint32_t lighting_draw_ordinal = data->xegtao_lighting_draw_counter;
       bool has_result_this_frame = data->last_gtao_frame == frame;
+        bool has_result_for_apply = fix_l1_split
+          ? data->xegtao_consume_signature_valid
+          : has_result_this_frame;
       bool dispatched_xegtao_this_draw = false;
       uint64_t dispatched_gate_signature = 0u;
 
@@ -3741,11 +4340,64 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             }
 
             if (warmup_ready) {
-              const bool request_copy_back = false;
-              has_result_this_frame = RunXeGTAOForFrame(cmd_list, data, request_copy_back);
-              if (has_result_this_frame) {
-                dispatched_xegtao_this_draw = true;
-                dispatched_gate_signature = gate_signature;
+              if (fix_l3_owner && !is_main_lighting_draw) {
+                // Level 3+: only main-lighting draw is allowed to produce the frame token.
+              } else if (probe_b_t22_no_dispatch) {
+                data->xegtao_trace_dispatch_attempted = false;
+              } else if (fix_l2_isolation) {
+                if (!data->xegtao_deferred_dispatch_pending
+                    || data->xegtao_deferred_dispatch_frame != frame) {
+                  if ((!data->captured_scene_cbv_valid
+                       || data->captured_scene_cbv_frame != frame
+                       || data->captured_scene_cbv.buffer.handle == 0u
+                       || !IsSceneCbvCandidateValid(device, data->captured_scene_cbv))
+                      && data->fallback_scene_cbv_seen) {
+                    // Deferred dispatch snapshots should self-bootstrap from fallback scene CBV,
+                    // so fix2+ does not require an off/fix1 toggle to start producing AO.
+                    (void)TryAdoptFallbackSceneCbv(device, data);
+                  }
+                  data->xegtao_deferred_dispatch_pending = true;
+                  data->xegtao_deferred_dispatch_frame = frame;
+                  data->xegtao_deferred_dispatch_executed = false;
+                  data->xegtao_deferred_gate_signature = gate_signature;
+                  data->xegtao_deferred_owner_shader_hash = shader_hash;
+                  data->xegtao_deferred_owner_draw_ordinal = lighting_draw_ordinal;
+                  data->xegtao_deferred_depth_srv = data->captured_depth_srv;
+                  data->xegtao_deferred_ssao_srv = data->captured_ssao_srv;
+                  data->xegtao_deferred_mrt_normal_srv = data->captured_mrt_normal_srv;
+                  data->xegtao_deferred_scene_cbv = data->captured_scene_cbv;
+                  data->xegtao_deferred_scene_cbv_valid =
+                      data->captured_scene_cbv_valid
+                      && data->captured_scene_cbv_frame == frame
+                      && data->captured_scene_cbv.buffer.handle != 0u
+                      && IsSceneCbvCandidateValid(device, data->captured_scene_cbv);
+                  data->xegtao_deferred_scene_cbv_frame = data->captured_scene_cbv_frame;
+                  data->xegtao_deferred_scene_cbv_source = data->captured_scene_cbv_source;
+                  data->xegtao_deferred_resolved_scene_cbv_from_current_bindings =
+                      data->resolved_scene_cbv_from_current_bindings;
+                }
+                data->xegtao_trace_dispatch_attempted = false;
+                data->xegtao_trace_dispatch_succeeded = false;
+              } else {
+                const bool request_copy_back = false;
+                data->xegtao_trace_dispatch_attempted = true;
+                data->xegtao_dispatch_isolation_active = fix_l2_isolation;
+
+                ScopedDescriptorCaptureSkip dispatch_capture_guard(fix_l4_guard);
+                has_result_this_frame = RunXeGTAOForFrame(
+                  cmd_list,
+                  data,
+                  request_copy_back,
+                  true);
+                data->xegtao_trace_dispatch_succeeded = has_result_this_frame;
+
+                data->xegtao_dispatch_isolation_active = false;
+                data->xegtao_dispatch_restore_mismatch = false;
+
+                if (has_result_this_frame) {
+                  dispatched_xegtao_this_draw = true;
+                  dispatched_gate_signature = gate_signature;
+                }
               }
             }
           }
@@ -3759,6 +4411,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         data->xegtao_owner_frame = frame;
         data->xegtao_owner_shader_hash = shader_hash;
         data->xegtao_owner_draw_ordinal = lighting_draw_ordinal;
+        data->xegtao_trace_owner_draw_ordinal = lighting_draw_ordinal;
         data->xegtao_owner_gate_signature = dispatched_gate_signature;
         data->xegtao_owner_downscaled = data->xegtao_owner_valid && IsXeGTAOResultDownscaled(data);
 
@@ -3778,6 +4431,10 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         data->last_owner_diag_hash = owner_diag_hash;
       }
 
+      if (!fix_l1_split) {
+        has_result_for_apply = has_result_this_frame;
+      }
+
       bool should_force_neutral_x = false;
       bool apply_gate_passed = false;
       std::string apply_gate_reason;
@@ -3788,36 +4445,94 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       uint64_t apply_draw_signature = 0u;
       bool apply_draw_signature_valid = false;
       std::string apply_draw_signature_diag;
-      const bool copyback_requested = has_result_this_frame
+        const bool apply_signature_valid = fix_l1_split
+          ? data->xegtao_consume_signature_valid
+          : data->xegtao_result_signature_valid;
+        const uint64_t apply_signature_frame = fix_l1_split
+          ? data->xegtao_consume_signature_frame
+          : data->xegtao_result_signature_frame;
+        const uint64_t apply_t3_resource_handle = fix_l1_split
+          ? data->xegtao_consume_t3_resource_handle
+          : data->xegtao_result_t3_resource_handle;
+        const uint64_t apply_t4_resource_handle = fix_l1_split
+          ? data->xegtao_consume_t4_resource_handle
+          : data->xegtao_result_t4_resource_handle;
+        const uint32_t apply_t3_width = fix_l1_split
+          ? data->xegtao_consume_t3_width
+          : data->xegtao_result_t3_width;
+        const uint32_t apply_t3_height = fix_l1_split
+          ? data->xegtao_consume_t3_height
+          : data->xegtao_result_t3_height;
+        const uint32_t apply_t4_width = fix_l1_split
+          ? data->xegtao_consume_t4_width
+          : data->xegtao_result_t4_width;
+        const uint32_t apply_t4_height = fix_l1_split
+          ? data->xegtao_consume_t4_height
+          : data->xegtao_result_t4_height;
+        const uint32_t apply_working_width = fix_l1_split
+          ? data->xegtao_consume_working_width
+          : data->xegtao_result_working_width;
+        const uint32_t apply_working_height = fix_l1_split
+          ? data->xegtao_consume_working_height
+          : data->xegtao_result_working_height;
+        const bool copyback_requested = has_result_for_apply
           && data->xegtao_copyback_frame == frame
           && data->xegtao_copyback_requested_for_frame;
       const bool copyback_active_for_apply = copyback_requested
           && data->xegtao_copyback_succeeded_for_frame
           && data->xegtao_copyback_active_for_apply;
       const bool copyback_failed_for_apply = copyback_requested && !copyback_active_for_apply;
+      data->xegtao_trace_copyback_requested = copyback_requested;
+      data->xegtao_trace_copyback_succeeded = copyback_active_for_apply;
       const bool downscaled_result_for_apply =
-          has_result_this_frame
-          && data->xegtao_result_signature_valid
-          && data->xegtao_result_signature_frame == frame
-          && IsXeGTAOResultDownscaled(data);
+          has_result_for_apply
+          && apply_signature_valid
+          && apply_working_width > 0u
+          && apply_working_height > 0u
+          && apply_t3_width > 0u
+          && apply_t3_height > 0u
+          && (apply_working_width < apply_t3_width || apply_working_height < apply_t3_height);
+        const bool owner_token_valid = fix_l1_split
+          ? data->xegtao_consume_owner_valid
+          : data->xegtao_owner_valid;
+        const uint64_t owner_token_frame = fix_l1_split
+          ? data->xegtao_consume_owner_frame
+          : data->xegtao_owner_frame;
+        const uint32_t owner_token_shader_hash = fix_l1_split
+          ? data->xegtao_consume_owner_shader_hash
+          : data->xegtao_owner_shader_hash;
+        const uint32_t owner_token_draw_ordinal = fix_l1_split
+          ? data->xegtao_consume_owner_draw_ordinal
+          : data->xegtao_owner_draw_ordinal;
+        const uint64_t owner_token_gate_signature = fix_l1_split
+          ? data->xegtao_consume_owner_gate_signature
+          : data->xegtao_owner_gate_signature;
+        const bool owner_token_downscaled = fix_l1_split
+          ? data->xegtao_consume_owner_downscaled
+          : data->xegtao_owner_downscaled;
+        const bool owner_token_frame_ready = fix_l1_split
+          ? (owner_token_frame != kInvalidFrameIndex && owner_token_frame == apply_signature_frame)
+          : owner_token_frame == frame;
       const bool owner_ready_for_draw =
-          data->xegtao_owner_valid
-          && data->xegtao_owner_frame == frame
-          && shader_hash == data->xegtao_owner_shader_hash
-          && lighting_draw_ordinal == data->xegtao_owner_draw_ordinal;
+          owner_token_valid
+          && owner_token_frame_ready
+          && shader_hash == owner_token_shader_hash
+          && lighting_draw_ordinal == owner_token_draw_ordinal;
       // Owner-only debug policy: only the owning lighting draw emits XeGTAO debug.
       shader_injection.xegtao_debug_mode = owner_ready_for_draw ? resolved_xegtao_debug_mode : 0.f;
       const bool downscaled_owner_token_available =
-          data->xegtao_owner_valid
-          && data->xegtao_owner_frame == frame
-          && data->xegtao_owner_downscaled;
+          owner_token_valid
+          && owner_token_frame_ready
+          && owner_token_downscaled;
 
-      auto bind_xegtao_srv = [&]() {
+      auto bind_xegtao_srv = [&](reshade::api::resource_view srv_to_bind) -> bool {
+        if (probe_a_dispatch_no_t22) return false;
+        if (!IsViewAlive(device, srv_to_bind)) return false;
         shader_injection.xegtao_dedicated_bound = 1.f;
         if (data->xegtao_mrt_normal_frame == frame && data->xegtao_mrt_normal_valid) {
           shader_injection.xegtao_mrt_normal_valid = 1.f;
         }
-        g_skip_descriptor_capture = true;
+        ScopedDescriptorCaptureSkip capture_skip_guard(true);
         cmd_list->push_descriptors(
             reshade::api::shader_stage::pixel,
             reshade::api::pipeline_layout{0},
@@ -3828,19 +4543,34 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                 0,
                 1,
                 reshade::api::descriptor_type::texture_shader_resource_view,
-                &data->composite_srv,
+                &srv_to_bind,
             });
-        g_skip_descriptor_capture = false;
+        data->xegtao_trace_t22_bind_executed = true;
+        return true;
       };
 
-      if (copyback_active_for_apply) {
+      if (probe_b_t22_no_dispatch) {
+        apply_gate_source = "probe_b_t22_no_dispatch";
+        apply_gate_reason = "probe B forced t22 bind without new XeGTAO dispatch";
+        reshade::api::resource_view probe_srv = {};
+        if (IsViewAlive(device, data->captured_ssao_srv)) {
+          probe_srv = data->captured_ssao_srv;
+        } else if (IsViewAlive(device, data->composite_srv)) {
+          probe_srv = data->composite_srv;
+        }
+        if (probe_srv.handle != 0u) {
+          (void)bind_xegtao_srv(probe_srv);
+        }
+        should_force_neutral_x = true;
+        shader_injection.xegtao_debug_mode = 0.f;
+      } else if (copyback_active_for_apply) {
         if (downscaled_result_for_apply) {
           if (owner_ready_for_draw) {
             apply_gate_passed = true;
             apply_gate_source = "copyback_active_owner";
             apply_gate_reason = "copyback-active owner draw";
             if (shader_injection.xegtao_debug_mode > 0.f && IsViewAlive(device, data->composite_srv)) {
-              bind_xegtao_srv();
+              (void)bind_xegtao_srv(data->composite_srv);
             }
           } else {
             apply_gate_passed = false;
@@ -3859,14 +4589,14 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
           if (shader_injection.xegtao_debug_mode > 0.f && shader_injection.xegtao_debug_mode <= 9.f) {
             if (owner_ready_for_draw && IsViewAlive(device, data->composite_srv)) {
-              bind_xegtao_srv();
+              (void)bind_xegtao_srv(data->composite_srv);
             } else {
               shader_injection.xegtao_debug_blackout = 1.f;
             }
           }
         }
       } else {
-        const bool should_try_apply = has_result_this_frame && IsViewAlive(device, data->composite_srv);
+        const bool should_try_apply = has_result_for_apply && IsViewAlive(device, data->composite_srv);
         if (should_try_apply) {
           reshade::api::resource_view current_t3 = {};
           reshade::api::resource_view current_t4 = {};
@@ -3877,10 +4607,12 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           const auto tracked_t3_info = GetXeGTAOCapturedViewInfo(device, data->captured_depth_srv);
           const auto tracked_t4_info = GetXeGTAOCapturedViewInfo(device, data->captured_ssao_srv);
           const bool signature_ready =
-              data->xegtao_result_signature_valid
-              && data->xegtao_result_signature_frame == frame
-              && data->xegtao_result_t3_resource_handle != 0u
-              && data->xegtao_result_t4_resource_handle != 0u;
+              apply_signature_valid
+              && apply_t3_resource_handle != 0u
+              && apply_t4_resource_handle != 0u
+              && (fix_l1_split
+                ? (apply_signature_frame != kInvalidFrameIndex && apply_signature_frame < frame)
+                : apply_signature_frame == frame);
 
           if (!signature_ready) {
             apply_gate_reason = "XeGTAO result signature unavailable for this frame";
@@ -3893,12 +4625,12 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               } else if (!current_t4_info.alive || current_t4_info.resource.handle == 0u
                          || current_t4_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
                 apply_gate_reason = "current draw t4 is invalid";
-              } else if (current_t3_info.resource.handle != data->xegtao_result_t3_resource_handle
-                         || current_t4_info.resource.handle != data->xegtao_result_t4_resource_handle
-                         || current_t3_info.width != data->xegtao_result_t3_width
-                         || current_t3_info.height != data->xegtao_result_t3_height
-                         || current_t4_info.width != data->xegtao_result_t4_width
-                         || current_t4_info.height != data->xegtao_result_t4_height) {
+              } else if (current_t3_info.resource.handle != apply_t3_resource_handle
+                         || current_t4_info.resource.handle != apply_t4_resource_handle
+                         || current_t3_info.width != apply_t3_width
+                         || current_t3_info.height != apply_t3_height
+                         || current_t4_info.width != apply_t4_width
+                         || current_t4_info.height != apply_t4_height) {
                 apply_gate_reason = "current draw t3/t4 does not match XeGTAO source signature";
               } else {
                 apply_gate_passed = true;
@@ -3913,12 +4645,12 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               } else if (!tracked_t4_info.alive || tracked_t4_info.resource.handle == 0u
                          || tracked_t4_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
                 apply_gate_reason = "tracked fallback t4 is invalid";
-              } else if (tracked_t3_info.resource.handle != data->xegtao_result_t3_resource_handle
-                         || tracked_t4_info.resource.handle != data->xegtao_result_t4_resource_handle
-                         || tracked_t3_info.width != data->xegtao_result_t3_width
-                         || tracked_t3_info.height != data->xegtao_result_t3_height
-                         || tracked_t4_info.width != data->xegtao_result_t4_width
-                         || tracked_t4_info.height != data->xegtao_result_t4_height) {
+              } else if (tracked_t3_info.resource.handle != apply_t3_resource_handle
+                         || tracked_t4_info.resource.handle != apply_t4_resource_handle
+                         || tracked_t3_info.width != apply_t3_width
+                         || tracked_t3_info.height != apply_t3_height
+                         || tracked_t4_info.width != apply_t4_width
+                         || tracked_t4_info.height != apply_t4_height) {
                 apply_gate_reason = "tracked fallback t3/t4 does not match XeGTAO source signature";
               } else {
                 apply_gate_passed = true;
@@ -3936,28 +4668,37 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                 apply_t4_info,
                 &apply_draw_signature,
                 &apply_draw_signature_diag);
-            const bool result_is_downscaled =
-                signature_ready
-                && data->xegtao_result_signature_frame == frame
-                && IsXeGTAOResultDownscaled(data);
+            const bool result_is_downscaled = signature_ready && downscaled_result_for_apply;
             if (result_is_downscaled) {
               const bool owner_ready =
-                  data->xegtao_owner_valid
-                  && data->xegtao_owner_frame == frame
-                  && data->xegtao_owner_downscaled;
+                  owner_token_valid
+                  && owner_token_frame_ready
+                  && owner_token_downscaled;
               if (!owner_ready) {
                 apply_gate_passed = false;
                 apply_gate_reason = "downscaled owner token is unavailable";
               } else {
                 const bool owner_match =
-                    shader_hash == data->xegtao_owner_shader_hash
-                    && lighting_draw_ordinal == data->xegtao_owner_draw_ordinal
+                    shader_hash == owner_token_shader_hash
+                    && lighting_draw_ordinal == owner_token_draw_ordinal
                     && apply_draw_signature_valid
-                    && apply_draw_signature == data->xegtao_owner_gate_signature;
+                    && apply_draw_signature == owner_token_gate_signature;
                 if (!owner_match) {
                   apply_gate_passed = false;
                   apply_gate_reason = "downscaled non-owner draw rejected";
                 }
+              }
+            }
+
+            if (apply_gate_passed && fix_l3_owner) {
+              const bool owner_match =
+                  owner_token_valid
+                  && owner_token_frame_ready
+                  && shader_hash == owner_token_shader_hash
+                  && lighting_draw_ordinal == owner_token_draw_ordinal;
+              if (!owner_match) {
+                apply_gate_passed = false;
+                apply_gate_reason = "non-owner draw rejected by deterministic owner policy";
               }
             }
           }
@@ -3982,7 +4723,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               << ", " << FormatXeGTAOResultSignatureInfo(data);
           apply_gate_diag = diag_stream.str();
         } else {
-          apply_gate_reason = has_result_this_frame
+          apply_gate_reason = has_result_for_apply
               ? "XeGTAO composite SRV is not alive"
               : "XeGTAO result unavailable this frame";
           std::ostringstream diag_stream;
@@ -4012,7 +4753,8 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             : &data->last_apply_gate_soft_diag_hash;
         if (apply_gate_state_valid != nullptr && apply_gate_last_passed != nullptr && apply_gate_last_hash != nullptr) {
           const bool expected_non_owner_reject = !apply_gate_passed
-              && apply_gate_reason == "downscaled non-owner draw rejected";
+              && (apply_gate_reason == "downscaled non-owner draw rejected"
+                  || apply_gate_reason == "non-owner draw rejected by deterministic owner policy");
           if (!expected_non_owner_reject) {
             if (!*apply_gate_state_valid
                 || *apply_gate_last_passed != apply_gate_passed
@@ -4034,15 +4776,27 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         }
 
         if (apply_gate_passed && IsViewAlive(device, data->composite_srv)) {
-          bind_xegtao_srv();
+          (void)bind_xegtao_srv(data->composite_srv);
         } else {
           should_force_neutral_x = true;
           shader_injection.xegtao_debug_mode = 0.f;
         }
       }
 
+      if (probe_a_dispatch_no_t22) {
+        apply_gate_passed = false;
+        apply_gate_source = "probe_a_dispatch_no_t22";
+        apply_gate_reason = "probe A suppresses t22 binding";
+        should_force_neutral_x = true;
+        shader_injection.xegtao_debug_mode = 0.f;
+      }
+
       std::string apply_path = "strict_t22";
-      if (copyback_active_for_apply) {
+      if (probe_a_dispatch_no_t22) {
+        apply_path = "probe_a_dispatch_no_t22";
+      } else if (probe_b_t22_no_dispatch) {
+        apply_path = "probe_b_t22_no_dispatch";
+      } else if (copyback_active_for_apply) {
         if (downscaled_result_for_apply) {
           apply_path = owner_ready_for_draw ? "copyback_active_owner" : "non_owner_neutral";
         } else {
@@ -4076,6 +4830,42 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         *last_apply_path_hash = apply_path_hash;
       }
 
+      data->xegtao_trace_apply_gate_passed = apply_gate_passed;
+      data->xegtao_trace_probe_a_active = probe_a_dispatch_no_t22;
+      data->xegtao_trace_probe_b_active = probe_b_t22_no_dispatch;
+      uint64_t trace_hash = 1469598103934665603ull;
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_dispatch_attempted ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_dispatch_succeeded ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_main_pass_executed ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_composite_pass_executed ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_t22_bind_executed ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_copyback_requested ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_copyback_succeeded ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_apply_gate_passed ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_probe_a_active ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_probe_b_active ? 1u : 0u);
+      trace_hash = HashCombineU64(trace_hash, data->xegtao_trace_owner_draw_ordinal);
+      trace_hash = HashCombineU64(trace_hash, HashString(apply_path));
+      if (!data->xegtao_trace_state_valid || data->xegtao_trace_diag_hash != trace_hash) {
+        std::ostringstream trace_message;
+        trace_message << "XeGTAO trace frame " << frame
+                      << " (dispatch_attempted=" << (data->xegtao_trace_dispatch_attempted ? 1 : 0)
+                      << ", dispatch_succeeded=" << (data->xegtao_trace_dispatch_succeeded ? 1 : 0)
+                      << ", main_pass=" << (data->xegtao_trace_main_pass_executed ? 1 : 0)
+                      << ", composite_pass=" << (data->xegtao_trace_composite_pass_executed ? 1 : 0)
+                      << ", t22_bind=" << (data->xegtao_trace_t22_bind_executed ? 1 : 0)
+                      << ", copyback_req=" << (data->xegtao_trace_copyback_requested ? 1 : 0)
+                      << ", copyback_ok=" << (data->xegtao_trace_copyback_succeeded ? 1 : 0)
+                      << ", apply_gate=" << (data->xegtao_trace_apply_gate_passed ? 1 : 0)
+                      << ", probe_a=" << (data->xegtao_trace_probe_a_active ? 1 : 0)
+                      << ", probe_b=" << (data->xegtao_trace_probe_b_active ? 1 : 0)
+                      << ", owner_draw=" << data->xegtao_trace_owner_draw_ordinal
+                      << ", apply_path=" << apply_path << ")";
+        AddonLog(reshade::log::level::info, trace_message.str().c_str());
+      }
+      data->xegtao_trace_state_valid = true;
+      data->xegtao_trace_diag_hash = trace_hash;
+
       shader_injection.xegtao_force_neutral_x = should_force_neutral_x ? 1.f : 0.f;
       const bool xegtao_ao_active_for_draw =
           !should_force_neutral_x
@@ -4094,20 +4884,21 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   }
   if (!IsViewAlive(device, char_mrt0)) return true;
 
-  g_skip_descriptor_capture = true;
-  cmd_list->push_descriptors(
+    {
+    ScopedDescriptorCaptureSkip capture_skip_guard(true);
+    cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
       reshade::api::pipeline_layout{0},
       0,
       reshade::api::descriptor_table_update{
-          {},
-          10,
-          0,
-          1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &char_mrt0,
+        {},
+        10,
+        0,
+        1,
+        reshade::api::descriptor_type::texture_shader_resource_view,
+        &char_mrt0,
       });
-  g_skip_descriptor_capture = false;
+    }
   return true;
 }
 
@@ -4198,12 +4989,6 @@ bool BindISFastNoisePixel(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-bool OnBeforeVolFogShaderDraw(reshade::api::command_list* cmd_list) {
-  // Volumetric fog has no dedicated toggle: mirror master state at draw time.
-  shader_injection.volfog_is_fast_enabled = isfast_jitter_master >= 0.5f ? 1.f : 0.f;
-  return BindISFastNoisePixel(cmd_list);
-}
-
 bool OnBeforeWireFenceShaderDraw(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return true;
   if (shader_injection.wire_alpha_mode < 1.5f) return true;
@@ -4236,6 +5021,110 @@ void OnPresentAdvanceFrame(
     }
     auto* data = device->get_private_data<DeviceData>();
     if (data != nullptr) {
+      const uint64_t frame = data->present_frame_index;
+      if (data->xegtao_deferred_dispatch_pending
+          && data->xegtao_deferred_dispatch_frame == frame
+          && !data->xegtao_deferred_dispatch_executed) {
+        const uint32_t fix_mode = ClampXeGTAOFixMode();
+        const bool use_deferred_dispatch =
+            fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kDispatchIsolationRestore);
+        const bool probe_a_dispatch_no_t22 = ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22) != 0u;
+        const bool probe_b_t22_no_dispatch =
+            !probe_a_dispatch_no_t22 && ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch) != 0u;
+
+        if (!use_deferred_dispatch || probe_b_t22_no_dispatch) {
+          data->xegtao_deferred_dispatch_pending = false;
+          data->xegtao_deferred_dispatch_executed = true;
+        } else {
+          auto* cmd_list = queue != nullptr
+              ? queue->get_immediate_command_list()
+              : nullptr;
+
+          if (cmd_list == nullptr) {
+            if (data->xegtao_deferred_drop_log_frame != frame) {
+              data->xegtao_deferred_drop_log_frame = frame;
+              AddonLog(
+                  reshade::log::level::warning,
+                  "XeGTAO deferred dispatch dropped: present queue/immediate command list unavailable at end-of-frame");
+            }
+            data->xegtao_deferred_dispatch_pending = false;
+            data->xegtao_deferred_dispatch_executed = true;
+          } else {
+            const bool deferred_views_valid =
+                IsViewAlive(device, data->xegtao_deferred_depth_srv)
+                && IsViewAlive(device, data->xegtao_deferred_ssao_srv);
+            bool deferred_scene_cbv_valid =
+                data->xegtao_deferred_scene_cbv_valid
+                && data->xegtao_deferred_scene_cbv.buffer.handle != 0u
+                && IsSceneCbvCandidateValid(device, data->xegtao_deferred_scene_cbv);
+
+            if (!deferred_scene_cbv_valid && data->fallback_scene_cbv_seen) {
+              data->captured_scene_cbv = data->xegtao_deferred_scene_cbv;
+              data->captured_scene_cbv_valid = data->xegtao_deferred_scene_cbv_valid;
+              data->captured_scene_cbv_frame = data->xegtao_deferred_scene_cbv_frame;
+              data->captured_scene_cbv_source = data->xegtao_deferred_scene_cbv_source;
+              if (TryAdoptFallbackSceneCbv(device, data)) {
+                data->xegtao_deferred_scene_cbv = data->captured_scene_cbv;
+                data->xegtao_deferred_scene_cbv_valid = data->captured_scene_cbv_valid;
+                data->xegtao_deferred_scene_cbv_frame = data->captured_scene_cbv_frame;
+                data->xegtao_deferred_scene_cbv_source = data->captured_scene_cbv_source;
+                deferred_scene_cbv_valid = true;
+              }
+            }
+
+            if (!deferred_views_valid || !deferred_scene_cbv_valid) {
+              if (data->xegtao_deferred_drop_log_frame != frame) {
+                data->xegtao_deferred_drop_log_frame = frame;
+                AddonLog(
+                    reshade::log::level::warning,
+                    "XeGTAO deferred dispatch dropped: frozen lighting snapshot is invalid");
+              }
+              data->xegtao_deferred_dispatch_pending = false;
+              data->xegtao_deferred_dispatch_executed = true;
+            } else {
+              data->captured_depth_srv = data->xegtao_deferred_depth_srv;
+              data->captured_ssao_srv = data->xegtao_deferred_ssao_srv;
+              data->captured_mrt_normal_srv = data->xegtao_deferred_mrt_normal_srv;
+              data->captured_scene_cbv = data->xegtao_deferred_scene_cbv;
+              data->captured_scene_cbv_valid = data->xegtao_deferred_scene_cbv_valid;
+              data->captured_scene_cbv_frame = data->xegtao_deferred_scene_cbv_frame;
+              data->captured_scene_cbv_source = data->xegtao_deferred_scene_cbv_source;
+              data->resolved_scene_cbv_from_current_bindings =
+                  data->xegtao_deferred_resolved_scene_cbv_from_current_bindings;
+
+              const bool fix_l4_guard =
+                  fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kStrictSideEffectGuard);
+              data->xegtao_dispatch_isolation_active = true;
+              ScopedDescriptorCaptureSkip dispatch_capture_guard(fix_l4_guard);
+              data->xegtao_trace_dispatch_attempted = true;
+              const bool has_result_this_frame = RunXeGTAOForFrame(
+                  cmd_list,
+                  data,
+                  false,
+                  false);
+              data->xegtao_trace_dispatch_succeeded = has_result_this_frame;
+              data->xegtao_dispatch_isolation_active = false;
+              data->xegtao_dispatch_restore_mismatch = false;
+
+              data->xegtao_deferred_dispatch_pending = false;
+              data->xegtao_deferred_dispatch_executed = true;
+
+              if (has_result_this_frame) {
+                data->xegtao_owner_valid =
+                    data->xegtao_result_signature_valid
+                    && data->xegtao_result_signature_frame == frame;
+                data->xegtao_owner_frame = frame;
+                data->xegtao_owner_shader_hash = data->xegtao_deferred_owner_shader_hash;
+                data->xegtao_owner_draw_ordinal = data->xegtao_deferred_owner_draw_ordinal;
+                data->xegtao_owner_gate_signature = data->xegtao_deferred_gate_signature;
+                data->xegtao_owner_downscaled = data->xegtao_owner_valid && IsXeGTAOResultDownscaled(data);
+                data->xegtao_trace_owner_draw_ordinal = data->xegtao_owner_draw_ordinal;
+              }
+            }
+          }
+        }
+      }
+      data->xegtao_deferred_dispatch_executed = false;
       data->present_frame_index += 1u;
     }
   }
@@ -4251,7 +5140,18 @@ void OnPresentAdvanceFrame(
   shader_injection.shadow_isfast_jitter_speed = 237.f;
   shader_injection.char_shadow_jitter_enabled = isfast_enabled;
   shader_injection.foliage_sss_jitter_enabled = isfast_enabled;
-  shader_injection.volfog_is_fast_enabled = isfast_enabled;
+  shader_injection.volfog_enabled = std::clamp(std::round(shader_injection.volfog_enabled), 0.f, 1.f);
+  shader_injection.volfog_jitter_enabled =
+      std::clamp(std::round(shader_injection.volfog_jitter_enabled), 0.f, 1.f);
+  shader_injection.volfog_jitter_amount = std::clamp(shader_injection.volfog_jitter_amount, 0.f, 2.f);
+  shader_injection.volfog_jitter_speed = std::clamp(shader_injection.volfog_jitter_speed, 0.f, 1024.f);
+  shader_injection.volfog_is_fast_enabled =
+      isfast_enabled >= 0.5f
+      && shader_injection.volfog_enabled >= 0.5f
+      && shader_injection.volfog_jitter_enabled >= 0.5f
+      && shader_injection.volfog_jitter_amount > 0.0001f
+      ? 1.f
+      : 0.f;
   shader_injection.wire_alpha_mode = isfast_enabled > 0.5f ? 2.f : 0.f;
   shader_injection.wire_alpha_threshold_offset = 0.f;
   shader_injection.wire_alpha_sharpen = 1.f;
@@ -4289,6 +5189,13 @@ void OnPresentAdvanceFrame(
   shader_injection.xegtao_debug_blackout = 0.f;
   shader_injection.xegtao_ao_active_for_draw = 0.f;
   xegtao_mode = std::clamp(std::round(xegtao_mode), 0.f, 1.f);
+  xegtao_fix_mode = std::clamp(std::round(xegtao_fix_mode), 0.f, 5.f);
+  xegtao_fix_l5_prefilter = static_cast<float>(ClampBooleanToggle(xegtao_fix_l5_prefilter));
+  xegtao_fix_l5_main = static_cast<float>(ClampBooleanToggle(xegtao_fix_l5_main));
+  xegtao_fix_l5_denoise = static_cast<float>(ClampBooleanToggle(xegtao_fix_l5_denoise));
+  xegtao_fix_l5_composite = static_cast<float>(ClampBooleanToggle(xegtao_fix_l5_composite));
+  xegtao_probe_a_dispatch_no_t22 = static_cast<float>(ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22));
+  xegtao_probe_b_t22_no_dispatch = static_cast<float>(ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch));
   xegtao_denoiser_mode = 0.f;
   xegtao_isfast_jitter_amount = std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
   xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
@@ -4353,6 +5260,115 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "High, Very High, and Ultra only. Low/Medium were removed to avoid noisy output.",
         .labels = {"High", "Very High", "Ultra"},
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOFix",
+      .binding = &xegtao_fix_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+      .label = "XeGTAO Fix",
+        .section = "XeGTAO",
+      .tooltip = "Off keeps the current path. Levels 1-5 add cumulative dispatch/apply protections against volumetric side effects.",
+      .labels = {
+        "Off",
+        "1 - Producer/Consumer",
+        "2 - + Isolation/Restore",
+        "3 - + Single Owner",
+        "4 - + Strict Guard",
+        "5 - + Pass Isolation",
+      },
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOFixL5Prefilter",
+      .binding = &xegtao_fix_l5_prefilter,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Fix L5 Prefilter",
+      .section = "XeGTAO",
+      .tooltip = "Level 5 diagnostic toggle for prefilter pass.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() {
+        return xegtao_mode >= 0.5f
+           && IsXeGTAOFixLevelAtLeast(XeGTAOFixMode::kPassIsolationDiagnostics);
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOFixL5Main",
+      .binding = &xegtao_fix_l5_main,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Fix L5 Main",
+      .section = "XeGTAO",
+      .tooltip = "Level 5 diagnostic toggle for main AO pass.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() {
+        return xegtao_mode >= 0.5f
+           && IsXeGTAOFixLevelAtLeast(XeGTAOFixMode::kPassIsolationDiagnostics);
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOFixL5Denoise",
+      .binding = &xegtao_fix_l5_denoise,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Fix L5 Denoise",
+      .section = "XeGTAO",
+      .tooltip = "Level 5 diagnostic toggle for denoise passes.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() {
+        return xegtao_mode >= 0.5f
+           && IsXeGTAOFixLevelAtLeast(XeGTAOFixMode::kPassIsolationDiagnostics);
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOFixL5Composite",
+      .binding = &xegtao_fix_l5_composite,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Fix L5 Composite",
+      .section = "XeGTAO",
+      .tooltip = "Level 5 diagnostic toggle for final composite pass.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() {
+        return xegtao_mode >= 0.5f
+           && IsXeGTAOFixLevelAtLeast(XeGTAOFixMode::kPassIsolationDiagnostics);
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOProbeADispatchNoT22",
+      .binding = &xegtao_probe_a_dispatch_no_t22,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Probe A: Dispatch No t22",
+      .section = "XeGTAO",
+      .tooltip = "Runs XeGTAO dispatch/composite but suppresses t22 bind to isolate dispatch-only side effects.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() {
+        return xegtao_mode >= 0.5f
+           && IsXeGTAOFixLevelAtLeast(XeGTAOFixMode::kDispatchIsolationRestore);
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOProbeBT22NoDispatch",
+      .binding = &xegtao_probe_b_t22_no_dispatch,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Probe B: t22 No Dispatch",
+      .section = "XeGTAO",
+      .tooltip = "Exercises t22 bind path without new XeGTAO dispatch to isolate bind-side effects.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() {
+        return xegtao_mode >= 0.5f
+           && IsXeGTAOFixLevelAtLeast(XeGTAOFixMode::kDispatchIsolationRestore)
+           && xegtao_probe_a_dispatch_no_t22 < 0.5f;
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "XeGTAOPrecision",
@@ -5540,6 +6556,57 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "VolFogMode",
+        .binding = &shader_injection.volfog_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Mode",
+        .section = "Volumetric Fog",
+        .tooltip = "Turn volumetric fog on or off.",
+        .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "VolFogTemporalJitter",
+        .binding = &shader_injection.volfog_jitter_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Temporal Jitter",
+        .section = "Volumetric Fog",
+        .tooltip = "Enable or disable temporal jitter for volumetric fog sampling.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.volfog_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "VolFogTemporalJitterAmount",
+        .binding = &shader_injection.volfog_jitter_amount,
+        .default_value = 0.7f,
+        .label = "Temporal Jitter Amount",
+        .section = "Volumetric Fog",
+        .tooltip = "Strength of temporal jitter applied to volumetric fog sampling.",
+        .min = 0.f,
+        .max = 2.f,
+        .format = "%.2f",
+        .is_enabled = []() {
+          return shader_injection.volfog_enabled >= 0.5f
+                 && shader_injection.volfog_jitter_enabled >= 0.5f;
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "VolFogTemporalJitterSpeed",
+        .binding = &shader_injection.volfog_jitter_speed,
+        .default_value = 237.f,
+        .label = "Temporal Jitter Speed",
+        .section = "Volumetric Fog",
+        .tooltip = "Temporal progression speed for volumetric fog jitter.",
+        .min = 0.f,
+        .max = 1024.f,
+        .format = "%.0f",
+        .is_enabled = []() {
+          return shader_injection.volfog_enabled >= 0.5f
+                 && shader_injection.volfog_jitter_enabled >= 0.5f;
+        },
+    },
+    new renodx::utils::settings::Setting{
         .key = "VolFogTricubic",
         .binding = &shader_injection.volfog_tricubic_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -5548,6 +6615,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Volumetric Fog",
         .tooltip = "Replaces trilinear with tricubic B-spline filtering on the fog volume, eliminating blocky voxel boundaries.",
         .labels = {"Off", "On"},
+        .is_enabled = []() { return shader_injection.volfog_enabled >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "VolFogColorCorrectionStrength",
@@ -5560,7 +6628,8 @@ renodx::utils::settings::Settings settings = {
         .max = 1.f,
         .format = "%.2f",
         .is_enabled = []() {
-          return shader_injection.fog_color_correction_enabled >= 0.5f;
+          return shader_injection.volfog_enabled >= 0.5f
+                 && shader_injection.fog_color_correction_enabled >= 0.5f;
         },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
