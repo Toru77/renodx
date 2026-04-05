@@ -353,14 +353,16 @@ void main(
   r3.zw = float2(0,0);
   uint4 mrt0_raw = mrtTexture0.Load(r3.xyz);
   const uint kFoliageMarkerBit = 0x80000000u;
+  const uint kFoliageVariationBit = 0x0200u;
   uint mrt0z_marked = mrt0_raw.z;
   uint mrt0z_raw = mrt0z_marked & ~kFoliageMarkerBit;
+  uint mrt0z_class = mrt0z_raw & ~kFoliageVariationBit;
   r3.xy = mrt0_raw.xy;
   r3.z = mrt0z_raw;
   const bool is_character_pixel = ((mrt0z_raw >> 8u) & 1u) != 0u;
   const bool is_foliage_marker = (mrt0z_marked & kFoliageMarkerBit) != 0u;
-  const bool is_foliage_id = (mrt0z_raw == 2303u) || (mrt0z_raw == 3327u);
-  // Keep marker authoritative, but tolerate legacy/raw-ID cases for stable SSS targeting.
+  const bool is_foliage_id = (mrt0z_class == 2303u) || (mrt0z_class == 3327u);
+  // Match SSS targeting semantics so foliage AO slider uses the same mask footprint.
   const bool is_foliage_pixel = is_foliage_marker || is_foliage_id;
   const bool is_environment_pixel = !is_character_pixel && !is_foliage_pixel;
   float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
@@ -384,14 +386,15 @@ void main(
   } else if (xegtao_force_neutral_x) {
     ao_sample.x = 1.0;
   }
-  if (xegtao_ao_active_for_draw && is_foliage_pixel) {
-    ao_sample.x = lerp(1.0, ao_sample.x, xegtao_foliage_blend);
-  }
-  r4.xyz = ao_sample;
   float sss_shadow_sample = saturate(ssao_sample.z);
   if (sss_injection_data.sss_dedicated_bound >= 0.5) {
     sss_shadow_sample = saturate(sssShadowTexture.SampleLevel(samLinear_s, v1.xy, 0).z);
   }
+  const bool is_foliage_ao_mask_pixel = is_foliage_pixel && sss_shadow_sample < 0.999;
+  if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+    ao_sample.x = lerp(1.0, ao_sample.x, xegtao_foliage_blend);
+  }
+  r4.xyz = ao_sample;
   uint xegtao_debug_mode_ui = (uint)round(max(sss_injection_data.xegtao_debug_mode, 0.0));
   const bool run_xegtao_debug = !xegtao_force_neutral_x
       && xegtao_debug_mode_ui > 0u
@@ -423,7 +426,7 @@ void main(
 
     const bool xegtao_effective_character_masked = xegtao_bound && !is_character_pixel;
     float3 xegtao_debug_sample = xegtao_effective_character_masked ? xegtao_debug_source : ssao_debug_sample;
-    if (xegtao_ao_active_for_draw && is_foliage_pixel) {
+    if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
       xegtao_debug_sample.x = lerp(1.0, xegtao_debug_sample.x, xegtao_foliage_blend);
     }
     float3 ao_debug_sample = is_character_pixel ? ssao_debug_sample : ao_sample;
