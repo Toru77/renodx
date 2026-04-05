@@ -84,7 +84,7 @@ float3 ApplyToneMapPass(float3 colorHDR) {
   // Apply RenoDX ToneMapPass to a prebuilt payload.
   if (RENODX_TONE_MAP_TYPE >= 1.0f) {
   renodx::draw::Config config = renodx::draw::BuildConfig(); {
-    config.reno_drt_white_clip = 3000 / 203.;
+    //config.reno_drt_white_clip = 3000 / 203.;
     config.reno_drt_tone_map_method = renodx::tonemap::renodrt::config::tone_map_method::REINHARD;
     config.tone_map_per_channel = 0;
     config.tone_map_hue_correction = 0;
