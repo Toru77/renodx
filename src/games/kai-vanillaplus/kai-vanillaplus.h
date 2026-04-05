@@ -173,6 +173,9 @@ struct SssInjectData {
   float volfog_jitter_enabled;  // 0=Off, 1=On (gated by IS-FAST master)
   float volfog_jitter_amount;   // jitter strength multiplier
   float volfog_jitter_speed;    // temporal progression speed
+
+  // Foliage mask method: 0=SSS parity(t1 strict), 1=legacy broad(t1), 2=t10 strict.
+  float xegtao_foliage_mask_method;
 };
 
 #ifndef __cplusplus

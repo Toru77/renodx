@@ -357,13 +357,37 @@ void main(
   uint mrt0z_marked = mrt0_raw.z;
   uint mrt0z_raw = mrt0z_marked & ~kFoliageMarkerBit;
   uint mrt0z_class = mrt0z_raw & ~kFoliageVariationBit;
+  const uint xegtao_foliage_mask_method_ui =
+      (uint)round(clamp(sss_injection_data.xegtao_foliage_mask_method, 0.0, 2.0));
+  uint4 foliage_mask_t10_raw = mrt0_raw;
+  bool foliage_mask_t10_available = false;
+  charMaskTexture.GetDimensions(0, fDest.x, fDest.y, fDest.z);
+  if (fDest.x > 0.0 && fDest.y > 0.0) {
+    const uint2 foliage_mask_size = (uint2)fDest.xy;
+    const uint2 foliage_mask_coord = min((uint2)(v1.xy * fDest.xy), foliage_mask_size - uint2(1u, 1u));
+    foliage_mask_t10_raw = charMaskTexture.Load(int3(foliage_mask_coord, 0));
+    foliage_mask_t10_available = true;
+  }
+  const bool is_foliage_pixel_t1_sss = (mrt0z_raw == 2303u) || (mrt0z_raw == 3327u);
+  const bool is_foliage_pixel_t1_broad =
+      ((mrt0z_marked & kFoliageMarkerBit) != 0u)
+      || (mrt0z_class == 2303u)
+      || (mrt0z_class == 3327u);
+
+  const uint foliage_t10_z_marked = foliage_mask_t10_raw.z;
+  const uint foliage_t10_z_raw = foliage_t10_z_marked & ~kFoliageMarkerBit;
+  const bool is_foliage_pixel_t10_strict =
+      (foliage_t10_z_raw == 2303u) || (foliage_t10_z_raw == 3327u);
   r3.xy = mrt0_raw.xy;
   r3.z = mrt0z_raw;
   const bool is_character_pixel = ((mrt0z_raw >> 8u) & 1u) != 0u;
-  const bool is_foliage_marker = (mrt0z_marked & kFoliageMarkerBit) != 0u;
-  const bool is_foliage_id = (mrt0z_class == 2303u) || (mrt0z_class == 3327u);
-  // Match SSS targeting semantics so foliage AO slider uses the same mask footprint.
-  const bool is_foliage_pixel = is_foliage_marker || is_foliage_id;
+  // Method 0: SSS parity strict (t1), 1: legacy broad (t1), 2: strict t10.
+  bool is_foliage_pixel = is_foliage_pixel_t1_sss;
+  if (xegtao_foliage_mask_method_ui == 1u) {
+    is_foliage_pixel = is_foliage_pixel_t1_broad;
+  } else if (xegtao_foliage_mask_method_ui == 2u) {
+    is_foliage_pixel = foliage_mask_t10_available && is_foliage_pixel_t10_strict;
+  }
   const bool is_environment_pixel = !is_character_pixel && !is_foliage_pixel;
   float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
   const bool xegtao_bound = sss_injection_data.xegtao_dedicated_bound >= 0.5;
@@ -371,6 +395,7 @@ void main(
   const bool xegtao_bent_normals_enabled = sss_injection_data.xegtao_bent_normals >= 0.5;
   const bool xegtao_debug_blackout = sss_injection_data.xegtao_debug_blackout >= 0.5;
   const bool xegtao_ao_active_for_draw = sss_injection_data.xegtao_ao_active_for_draw >= 0.5;
+  const bool sss_dedicated_bound = sss_injection_data.sss_dedicated_bound >= 0.5;
   const float xegtao_foliage_blend = saturate(sss_injection_data.xegtao_foliage_ao_blend);
   float3 xegtao_sample = ssao_sample;
   if (xegtao_bound) {
@@ -387,10 +412,11 @@ void main(
     ao_sample.x = 1.0;
   }
   float sss_shadow_sample = saturate(ssao_sample.z);
-  if (sss_injection_data.sss_dedicated_bound >= 0.5) {
+  if (sss_dedicated_bound) {
     sss_shadow_sample = saturate(sssShadowTexture.SampleLevel(samLinear_s, v1.xy, 0).z);
   }
-  const bool is_foliage_ao_mask_pixel = is_foliage_pixel && sss_shadow_sample < 0.999;
+  const bool is_foliage_ao_mask_pixel =
+      is_foliage_pixel && (!sss_dedicated_bound || sss_shadow_sample < 0.999);
   if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
     ao_sample.x = lerp(1.0, ao_sample.x, xegtao_foliage_blend);
   }
@@ -513,6 +539,26 @@ void main(
     } else if (xegtao_debug_mode_ui == 19u) {
       float ao_effective = saturate(max(ao_debug_sample.x, ao_debug_sample.y * sss_shadow_sample));
       debug_color = ao_effective.xxx;
+    } else if (xegtao_debug_mode_ui == 20u) {
+      const bool foliage_shadow_gate = !sss_dedicated_bound || sss_shadow_debug < 0.999;
+      const bool foliage_gate_active = xegtao_ao_active_for_draw && is_foliage_pixel && foliage_shadow_gate;
+      if (!xegtao_ao_active_for_draw) {
+        debug_color = float3(0.0, 0.0, 1.0);
+      } else if (foliage_gate_active) {
+        debug_color = float3(0.0, 1.0, 0.0);
+      } else if (is_foliage_pixel) {
+        debug_color = float3(1.0, 1.0, 0.0);
+      } else {
+        debug_color = float3(0.2, 0.0, 0.0);
+      }
+    } else if (xegtao_debug_mode_ui == 21u) {
+      // RGB method compare:
+      //   R = legacy broad (t1), G = SSS parity strict (t1), B = strict t10 (0.5 if unavailable)
+      float t10_debug = foliage_mask_t10_available ? (is_foliage_pixel_t10_strict ? 1.0 : 0.0) : 0.5;
+      debug_color = float3(
+          is_foliage_pixel_t1_broad ? 1.0 : 0.0,
+          is_foliage_pixel_t1_sss ? 1.0 : 0.0,
+          t10_debug);
     }
 
     o0 = float4(debug_color, 1.0);

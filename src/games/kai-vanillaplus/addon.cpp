@@ -61,7 +61,11 @@ constexpr uint32_t kLightingXeGtaoRegister = 22u;
 constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 constexpr uint64_t kXeGTAODeferredStartupGuardFrames = 3u;
+constexpr uint64_t kXeGTAOStartupDispatchGuardFrames = 16u;
+constexpr uint64_t kXeGTAOStartupRequireCurrentSceneCbvFrames = 64u;
 constexpr uint64_t kXeGTAOClearStartupGuardFrames = 8u;
+constexpr uint64_t kXeGTAOResizeDispatchGuardFrames = 4u;
+constexpr uint64_t kXeGTAOFallbackSceneCbvMaxAgeFrames = 2u;
 constexpr bool kEnableAddonLogs = false;
 std::atomic_bool g_enable_runtime_addon_logs{false};
 std::atomic_bool g_xegtao_startup_mode_logged{false};
@@ -317,6 +321,7 @@ SssInjectData shader_injection = {
     .volfog_jitter_enabled = 1.f,
     .volfog_jitter_amount = 1.5f,
     .volfog_jitter_speed = 237.f,
+    .xegtao_foliage_mask_method = 0.f,
 };
 
 float settings_mode = 0.f;
@@ -363,6 +368,7 @@ float xegtao_denoise_blur_beta = 8.f;
 float xegtao_debug_mode = 0.f;
 float xegtao_runtime_debug_logging = 0.f;
 float xegtao_foliage_ao_blend = 1.0f;
+float xegtao_foliage_mask_method = 0.f;  // 0=SSS parity(t1 strict), 1=legacy broad(t1), 2=t10 strict
 
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
 std::atomic_uint64_t g_character_mrt0_view{0u};
@@ -500,6 +506,8 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::pipeline xegtao_normal_cap_pipeline = {};
 
   uint64_t present_frame_index = 0u;
+  uint64_t xegtao_resize_guard_until_frame = 0u;
+  uint64_t xegtao_resize_guard_log_frame = kInvalidFrameIndex;
   uint64_t last_gtao_frame = kInvalidFrameIndex;
   uint64_t last_ao_hook_frame = kInvalidFrameIndex;
   uint64_t last_copyback_frame = kInvalidFrameIndex;
@@ -1031,25 +1039,96 @@ void OnInitDevice(reshade::api::device* device) {
 void OnDestroyDevice(reshade::api::device* device) {
   if (!IsIsFastSupportedDevice(device)) return;
   LogIsFast(reshade::log::level::debug, "OnDestroyDevice begin.");
-  if (auto* data = device->get_private_data<DeviceData>(); data != nullptr) {
-    DestroyXeGTAOState(device, data);
-  }
-  DestroyIsFastResources(device);
+
+  // Teardown can run while runtime internals are already being dismantled,
+  // so avoid API-side destroy/free calls here and just drop private data.
+  g_character_mrt0_view.store(0u, std::memory_order_relaxed);
+  g_lighting_mrt0_view.store(0u, std::memory_order_relaxed);
+
+  g_isfast_texture = {0u};
+  g_isfast_reshade_srv = {0u};
+  g_isfast_reshade_sampler = {0u};
+  g_isfast_bind_logged = false;
+  g_isfast_using_debug_texture = false;
+  g_isfast_bind_failed_logged = false;
+  g_isfast_compute_bind_logged = false;
+
   device->destroy_private_data<DeviceData>();
   LogIsFast(reshade::log::level::debug, "OnDestroyDevice complete. isfast_noise_bound=0.");
 }
 
+void InvalidateXeGTAOSwapchainHandles(DeviceData* data) {
+  if (data == nullptr) return;
+
+  data->depth_mips_texture = {};
+  data->depth_mips_srv = {};
+  data->depth_mips_uavs = {};
+
+  data->ao_term_a_texture = {};
+  data->ao_term_a_srv = {};
+  data->ao_term_a_uav = {};
+
+  data->ao_term_b_texture = {};
+  data->ao_term_b_srv = {};
+  data->ao_term_b_uav = {};
+
+  data->edges_texture = {};
+  data->edges_srv = {};
+  data->edges_uav = {};
+
+  data->composite_texture = {};
+  data->composite_srv = {};
+  data->composite_uav = {};
+  data->composite_desc = {};
+
+  data->working_width = 0u;
+  data->working_height = 0u;
+  data->working_precision = std::numeric_limits<uint32_t>::max();
+  data->working_ao_format = reshade::api::format::unknown;
+
+  data->xegtao_prefilter_descriptor_tables = {};
+  data->xegtao_main_descriptor_tables = {};
+  data->xegtao_denoise_descriptor_tables = {};
+  data->xegtao_composite_descriptor_tables = {};
+  data->xegtao_normal_cap_descriptor_tables = {};
+
+  data->character_sss_current_resource = {};
+  data->character_sss_current_srv = {};
+  data->character_sss_last_valid_resource = {};
+  data->character_sss_last_valid_srv = {};
+  data->character_sss_current_frame = kInvalidFrameIndex;
+
+  data->point_clamp_sampler = {};
+}
+
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
-  (void)resize;
   if (swapchain == nullptr) return;
   auto* device = swapchain->get_device();
   if (!IsIsFastSupportedDevice(device)) return;
   auto* data = device->get_private_data<DeviceData>();
   if (data == nullptr) return;
 
-  DestroyXeGTAOResources(device, data);
-  DestroyXeGTAODescriptorTables(device, data);
-  DestroyDedicatedSssViews(device, data);
+  AddonLog(
+      reshade::log::level::info,
+      std::format(
+          "XeGTAO swapchain init (resize={}, frame={})",
+          resize ? 1 : 0,
+          data->present_frame_index));
+
+  data->xegtao_resize_guard_until_frame = resize
+      ? data->present_frame_index + kXeGTAOResizeDispatchGuardFrames
+      : 0u;
+  data->xegtao_resize_guard_log_frame = kInvalidFrameIndex;
+  g_character_mrt0_view.store(0u, std::memory_order_relaxed);
+  g_lighting_mrt0_view.store(0u, std::memory_order_relaxed);
+
+  if (!resize) {
+    DestroyXeGTAOResources(device, data);
+    DestroyXeGTAODescriptorTables(device, data);
+    DestroyDedicatedSssViews(device, data);
+  } else {
+    InvalidateXeGTAOSwapchainHandles(data);
+  }
   data->captured_mrt_normal_srv = {};
   data->last_gtao_frame = kInvalidFrameIndex;
   data->last_ao_hook_frame = kInvalidFrameIndex;
@@ -1184,12 +1263,34 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
 }
 
 void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
-  (void)resize;
   if (swapchain == nullptr) return;
   auto* device = swapchain->get_device();
   if (!IsIsFastSupportedDevice(device)) return;
+
+  // Resize teardown may happen while runtime state is unstable.
+  // Keep this path non-destructive and only invalidate global handles.
+  if (resize) {
+    g_character_mrt0_view.store(0u, std::memory_order_relaxed);
+    g_lighting_mrt0_view.store(0u, std::memory_order_relaxed);
+    AddonLog(reshade::log::level::info, "XeGTAO swapchain destroy (resize=1)");
+    return;
+  }
+
   auto* data = device->get_private_data<DeviceData>();
   if (data == nullptr) return;
+
+  AddonLog(
+      reshade::log::level::info,
+      std::format(
+          "XeGTAO swapchain destroy (resize={}, frame={})",
+          resize ? 1 : 0,
+          data->present_frame_index));
+
+  data->xegtao_resize_guard_until_frame = 0u;
+  data->xegtao_resize_guard_log_frame = kInvalidFrameIndex;
+  g_character_mrt0_view.store(0u, std::memory_order_relaxed);
+  g_lighting_mrt0_view.store(0u, std::memory_order_relaxed);
+
   DestroyXeGTAOResources(device, data);
   DestroyXeGTAODescriptorTables(device, data);
   DestroyDedicatedSssViews(device, data);
@@ -2063,6 +2164,7 @@ void CacheFallbackSceneCbv(reshade::api::command_list* cmd_list, const reshade::
   if (data == nullptr) return;
 
   if (range.buffer.handle == 0u) return;
+  if (!IsSceneCbvCandidateValid(device, range)) return;
   data->fallback_scene_cbv = range;
   data->fallback_scene_cbv_seen = true;
   data->fallback_scene_cbv_frame = data->present_frame_index;
@@ -2083,6 +2185,14 @@ bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
 
   if (!data->fallback_scene_cbv_seen) return false;
+  if (data->fallback_scene_cbv_frame == kInvalidFrameIndex) return false;
+  const bool enforce_fresh_fallback =
+      data->present_frame_index < kXeGTAOStartupRequireCurrentSceneCbvFrames;
+  if (enforce_fresh_fallback
+      && data->present_frame_index >= data->fallback_scene_cbv_frame
+      && data->present_frame_index - data->fallback_scene_cbv_frame > kXeGTAOFallbackSceneCbvMaxAgeFrames) {
+    return false;
+  }
   if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) return false;
 
   data->captured_scene_cbv = data->fallback_scene_cbv;
@@ -2214,6 +2324,8 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   DestroyXeGTAOResources(device, data);
   DestroyXeGTAOPipelines(device, data);
   DestroyDedicatedSssViews(device, data);
+  g_character_mrt0_view.store(0u, std::memory_order_relaxed);
+  g_lighting_mrt0_view.store(0u, std::memory_order_relaxed);
 
   if (data->point_clamp_sampler.handle != 0u) {
     device->destroy_sampler(data->point_clamp_sampler);
@@ -2228,6 +2340,8 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->captured_scene_cbv_frame = kInvalidFrameIndex;
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->resolved_scene_cbv_from_current_bindings = false;
+  data->xegtao_resize_guard_until_frame = 0u;
+  data->xegtao_resize_guard_log_frame = kInvalidFrameIndex;
   data->fallback_scene_cbv = {};
   data->fallback_scene_cbv_seen = false;
   data->fallback_scene_cbv_frame = kInvalidFrameIndex;
@@ -2617,12 +2731,22 @@ bool DispatchXeGTAOCompute(
   auto* data = device->get_private_data<DeviceData>();
 
   renodx::utils::state::CommandListState previous_state = {};
-  bool has_previous_state = false;
-  if (auto* current_state = renodx::utils::state::GetCurrentState(cmd_list);
-      current_state != nullptr) {
-    previous_state = *current_state;
-    has_previous_state = true;
+  auto* current_state = renodx::utils::state::GetCurrentState(cmd_list);
+  if (current_state == nullptr) {
+    if (data != nullptr) {
+      data->xegtao_debug_predispatch_reject_count += 1u;
+      if (data->xegtao_debug_last_predispatch_reject_frame != data->present_frame_index) {
+        data->xegtao_debug_last_predispatch_reject_frame = data->present_frame_index;
+        AddonLog(
+            reshade::log::level::warning,
+            std::format(
+                "XeGTAO pre-dispatch reject: command-list state unavailable (frame={})",
+                data->present_frame_index));
+      }
+    }
+    return false;
   }
+  previous_state = *current_state;
 
   std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> table_updates = {};
   std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount> bound_tables = {};
@@ -2719,9 +2843,7 @@ bool DispatchXeGTAOCompute(
         bound_tables.data());
   }
 
-  if (has_previous_state) {
-    previous_state.Apply(cmd_list);
-  }
+  previous_state.Apply(cmd_list);
   return true;
 }
 
@@ -3074,7 +3196,7 @@ std::array<float, 32> BuildXeGTAOPushConstants(
   constants[10] = denoise_passes == 0u
       ? 0.f
       : static_cast<float>((data != nullptr ? data->present_frame_index : 0u) % 64u);
-  constants[11] = std::clamp(xegtao_debug_mode, 0.f, 19.f);
+  constants[11] = std::clamp(xegtao_debug_mode, 0.f, 21.f);
   constants[12] = denoise_last_pass ? 1.f : 0.f;
   const uint32_t normal_input_mode = ClampXeGTAONormalInputMode();
   const bool transformed_normal_mode = normal_input_mode == 1u;
@@ -3186,6 +3308,13 @@ bool RunXeGTAOForFrame(
   };
   if (device == nullptr) return fail("device is null");
 
+  if (data->present_frame_index < kXeGTAOStartupDispatchGuardFrames) {
+    return fail(std::format(
+        "startup dispatch guard active (frame {} < {})",
+        data->present_frame_index,
+        kXeGTAOStartupDispatchGuardFrames));
+  }
+
   data->xegtao_copyback_frame = data->present_frame_index;
   data->xegtao_copyback_requested_for_frame = request_copy_back;
   data->xegtao_copyback_succeeded_for_frame = false;
@@ -3270,10 +3399,26 @@ bool RunXeGTAOForFrame(
       reason += " (tracked + fallback cache missing)";
     } else if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) {
       reason += " (fallback cache rejected by validation)";
+    } else if (data->fallback_scene_cbv_frame == kInvalidFrameIndex) {
+      reason += " (fallback cache frame is invalid)";
+    } else if (data->present_frame_index < kXeGTAOStartupRequireCurrentSceneCbvFrames
+        && data->present_frame_index >= data->fallback_scene_cbv_frame
+        && data->present_frame_index - data->fallback_scene_cbv_frame > kXeGTAOFallbackSceneCbvMaxAgeFrames) {
+      reason += std::format(
+          " (fallback cache is stale during startup: age={} frames)",
+          data->present_frame_index - data->fallback_scene_cbv_frame);
     } else {
       reason += " (descriptor-table resolve did not expose a valid b0)";
     }
     return fail(reason);
+  }
+  if (data->present_frame_index < kXeGTAOStartupRequireCurrentSceneCbvFrames
+      && data->captured_scene_cbv_source != XeGTAOSceneCbvSource::kCurrentLighting) {
+    return fail(std::format(
+        "startup scene CBV guard active (source={}, frame {} < {})",
+        GetXeGTAOSceneCbvSourceName(data->captured_scene_cbv_source),
+        data->present_frame_index,
+        kXeGTAOStartupRequireCurrentSceneCbvFrames));
   }
   if (!EnsurePointClampSampler(device, data)) return fail("point clamp sampler creation failed");
   if (!EnsureXeGTAOPipelines(device, data)) return fail("pipeline/layout setup failed");
@@ -4281,6 +4426,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.xegtao_bent_specular_proxy_roughness = 0.f;
   shader_injection.xegtao_bent_max_darkening = 0.f;
   shader_injection.xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
+  shader_injection.xegtao_foliage_mask_method = std::clamp(std::round(xegtao_foliage_mask_method), 0.f, 2.f);
 
   auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
   const auto shader_hash = shader_state != nullptr
@@ -4288,7 +4434,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       : 0u;
   if (shader_hash != kLightingShader && shader_hash != kLightingSoftShader) return true;
   const bool is_main_lighting_draw = shader_hash == kLightingShader;
-  const float resolved_xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 19.f);
+  const float resolved_xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 21.f);
   shader_injection.xegtao_debug_mode = 0.f;
 
   auto* device = cmd_list->get_device();
@@ -4310,6 +4456,18 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             !probe_a_dispatch_no_t22 && ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch) != 0u;
 
       const uint64_t frame = data->present_frame_index;
+      if (frame < data->xegtao_resize_guard_until_frame) {
+        if (data->xegtao_resize_guard_log_frame != frame) {
+          data->xegtao_resize_guard_log_frame = frame;
+          AddonLog(
+              reshade::log::level::info,
+              std::format(
+                  "XeGTAO resize guard active on frame {} (guard_until={})",
+                  frame,
+                  data->xegtao_resize_guard_until_frame));
+        }
+        return true;
+      }
       if (data->xegtao_lighting_draw_counter_frame != frame) {
         data->xegtao_lighting_draw_counter_frame = frame;
         data->xegtao_lighting_draw_counter = 0u;
@@ -5382,7 +5540,8 @@ void OnPresentAdvanceFrame(
   xegtao_denoiser_mode = 0.f;
   xegtao_isfast_jitter_amount = std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
   xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
-  shader_injection.xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 19.f);
+  xegtao_foliage_mask_method = std::clamp(std::round(xegtao_foliage_mask_method), 0.f, 2.f);
+  shader_injection.xegtao_debug_mode = std::clamp(std::round(xegtao_debug_mode), 0.f, 21.f);
   shader_injection.xegtao_normal_input_mode = static_cast<float>(ClampXeGTAONormalInputMode());
   shader_injection.xegtao_mrt_normal_valid = 0.f;
   shader_injection.xegtao_bent_normals = 0.f;
@@ -5392,6 +5551,7 @@ void OnPresentAdvanceFrame(
   shader_injection.xegtao_bent_specular_proxy_roughness = 0.f;
   shader_injection.xegtao_bent_max_darkening = 0.f;
   shader_injection.xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
+  shader_injection.xegtao_foliage_mask_method = xegtao_foliage_mask_method;
 }
 
 bool IsAdvancedSettingsMode() {
@@ -5461,6 +5621,7 @@ renodx::utils::settings::Settings settings = {
         "5 - + Pass Isolation",
       },
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFixL5Prefilter",
@@ -5932,8 +6093,20 @@ renodx::utils::settings::Settings settings = {
         .format = "%.0f",
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
         .parse = [](float value) { return std::clamp(value, 0.f, 100.f) * 0.01f; },
-        .is_visible = []() { return true; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
+      new renodx::utils::settings::Setting{
+        .key = "XeGTAOFoliageMaskMethod",
+        .binding = &xegtao_foliage_mask_method,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Foliage Mask Method",
+        .section = "XeGTAO",
+          .tooltip = "Selects XeGTAO foliage mask method: SSS parity strict t1, legacy broad t1, or strict t10 char mask.",
+          .labels = {"SSS Parity (t1 Strict)", "Legacy Broad (t1)", "CharMask Strict (t10)"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+      },
     new renodx::utils::settings::Setting{
         .key = "XeGTAORuntimeDebugLogging",
         .binding = &xegtao_runtime_debug_logging,
@@ -5975,6 +6148,8 @@ renodx::utils::settings::Settings settings = {
             "17 AO X Source Compare",
             "18 AO Live XYZ",
             "19 AO Effective Proxy",
+            "20 Foliage AO Gate",
+            "21 Foliage Mask Methods RGB",
         },
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -6785,6 +6960,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Enable or disable temporal jitter for volumetric fog sampling.",
         .labels = {"Off", "On"},
         .is_enabled = []() { return shader_injection.volfog_enabled >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "VolFogTemporalJitterAmount",
@@ -6800,6 +6976,7 @@ renodx::utils::settings::Settings settings = {
           return shader_injection.volfog_enabled >= 0.5f
                  && shader_injection.volfog_jitter_enabled >= 0.5f;
         },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "VolFogTemporalJitterSpeed",
@@ -6815,6 +6992,7 @@ renodx::utils::settings::Settings settings = {
           return shader_injection.volfog_enabled >= 0.5f
                  && shader_injection.volfog_jitter_enabled >= 0.5f;
         },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "VolFogTricubic",
@@ -7003,7 +7181,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Enable High or Ultra Local Shadowing for XeGTAO.",
+        .label = "Enable Character Only Local Shadowing for XeGTAO. Default doesn't work.",
         .section = "Info",
     },
 };

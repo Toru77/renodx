@@ -754,6 +754,15 @@ void XeGTAO_DecodeGatherPartial( const uint4 packedValue, out AOTermType outDeco
 
 void XeGTAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Texture2D<uint> sourceAOTerm, Texture2D<lpfloat> sourceEdges, SamplerState texSampler, RWTexture2D<uint> outputTexture, const uniform bool finalApply )
 {
+    uint sourceWidth, sourceHeight;
+    uint outputWidth, outputHeight;
+    sourceAOTerm.GetDimensions( sourceWidth, sourceHeight );
+    outputTexture.GetDimensions( outputWidth, outputHeight );
+    if( sourceWidth == 0 || sourceHeight == 0 || outputWidth == 0 || outputHeight == 0 )
+        return;
+    if( pixCoordBase.x >= sourceWidth || pixCoordBase.y >= sourceHeight )
+        return;
+
     const lpfloat blurAmount = (finalApply)?((lpfloat)consts.DenoiseBlurBeta):((lpfloat)consts.DenoiseBlurBeta/(lpfloat)5.0);
     const lpfloat diagWeight = 0.85 * 0.5;
 
@@ -778,6 +787,8 @@ void XeGTAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Textu
     for( int side = 0; side < 2; side++ )
     {
         const int2 pixCoord = int2( pixCoordBase.x + side, pixCoordBase.y );
+        if( pixCoord.x < 0 || pixCoord.y < 0 || uint( pixCoord.x ) >= sourceWidth || uint( pixCoord.y ) >= sourceHeight || uint( pixCoord.x ) >= outputWidth || uint( pixCoord.y ) >= outputHeight )
+            continue;
 
         lpfloat4 edgesL_LRTB  = XeGTAO_UnpackEdges( (side==0)?(edgesQ0.x):(edgesQ0.y) );
         lpfloat4 edgesT_LRTB  = XeGTAO_UnpackEdges( (side==0)?(edgesQ0.z):(edgesQ1.w) );
