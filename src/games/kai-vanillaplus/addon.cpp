@@ -60,7 +60,10 @@ constexpr uint32_t kLightingSceneCbRegister = 0u;
 constexpr uint32_t kLightingXeGtaoRegister = 22u;
 constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
+constexpr uint64_t kXeGTAODeferredStartupGuardFrames = 3u;
 constexpr bool kEnableAddonLogs = false;
+std::atomic_bool g_enable_runtime_addon_logs{false};
+std::atomic_bool g_xegtao_startup_mode_logged{false};
 
 struct DeviceData;
 
@@ -90,12 +93,13 @@ void TransitionResource(
 void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list, DeviceData* data);
 
 inline void AddonLog(reshade::log::level level, const char* message) {
-  if (!kEnableAddonLogs || message == nullptr) return;
+  if (message == nullptr) return;
+  if (!kEnableAddonLogs && !g_enable_runtime_addon_logs.load(std::memory_order_relaxed)) return;
   reshade::log::message(level, message);
 }
 
 inline void AddonLog(reshade::log::level level, const std::string& message) {
-  if (!kEnableAddonLogs) return;
+  if (!kEnableAddonLogs && !g_enable_runtime_addon_logs.load(std::memory_order_relaxed)) return;
   reshade::log::message(level, message.c_str());
 }
 
@@ -328,8 +332,8 @@ float xegtao_probe_a_dispatch_no_t22 = 0.f;  // Probe A: run dispatch path, supp
 float xegtao_probe_b_t22_no_dispatch = 0.f;  // Probe B: exercise t22 bind, suppress dispatch
 float xegtao_precision = 2.f;             // Runtime-forced to Full FP32 (legacy key kept for compatibility)
 float xegtao_normal_input_mode = 1.f;     // 0=Off(depth fallback), 1=View-Transformed
-float xegtao_normal_influence = 0.05f;
-float xegtao_normal_depth_blend = 0.45f;
+float xegtao_normal_influence = 0.20f;
+float xegtao_normal_depth_blend = 0.70f;
 float xegtao_normal_sharpness = 1.f;
 float xegtao_normal_edge_rejection = 1.f;
 float xegtao_normal_z_preservation = 1.f;
@@ -356,6 +360,7 @@ float xegtao_thin_occluder_compensation = 0.50f;
 float xegtao_depth_mip_sampling_offset = 3.3f;
 float xegtao_denoise_blur_beta = 8.f;
 float xegtao_debug_mode = 0.f;
+float xegtao_runtime_debug_logging = 0.f;
 float xegtao_foliage_ao_blend = 1.0f;
 
 std::atomic_uint64_t g_lighting_mrt0_view{0u};
@@ -594,6 +599,14 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   uint32_t xegtao_trace_owner_draw_ordinal = 0u;
   bool xegtao_trace_state_valid = false;
   uint64_t xegtao_trace_diag_hash = 0u;
+  uint32_t xegtao_debug_descriptor_reject_count = 0u;
+  uint64_t xegtao_debug_last_descriptor_reject_frame = kInvalidFrameIndex;
+  uint32_t xegtao_debug_predispatch_reject_count = 0u;
+  uint64_t xegtao_debug_last_predispatch_reject_frame = kInvalidFrameIndex;
+  uint32_t xegtao_debug_deferred_drop_count = 0u;
+  uint64_t xegtao_debug_last_deferred_drop_frame = kInvalidFrameIndex;
+  uint32_t xegtao_debug_normal_fallback_count = 0u;
+  uint64_t xegtao_debug_last_normal_fallback_frame = kInvalidFrameIndex;
 
   uint64_t last_capture_diag_log_frame = kInvalidFrameIndex;
   uint64_t last_logged_depth_view_handle = 0u;
@@ -1099,6 +1112,14 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->xegtao_deferred_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->xegtao_deferred_resolved_scene_cbv_from_current_bindings = false;
   data->xegtao_deferred_drop_log_frame = kInvalidFrameIndex;
+  data->xegtao_debug_descriptor_reject_count = 0u;
+  data->xegtao_debug_last_descriptor_reject_frame = kInvalidFrameIndex;
+  data->xegtao_debug_predispatch_reject_count = 0u;
+  data->xegtao_debug_last_predispatch_reject_frame = kInvalidFrameIndex;
+  data->xegtao_debug_deferred_drop_count = 0u;
+  data->xegtao_debug_last_deferred_drop_frame = kInvalidFrameIndex;
+  data->xegtao_debug_normal_fallback_count = 0u;
+  data->xegtao_debug_last_normal_fallback_frame = kInvalidFrameIndex;
   data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
   data->last_owner_state_valid = false;
   data->last_owner_diag_hash = 0u;
@@ -2592,6 +2613,7 @@ bool DispatchXeGTAOCompute(
   auto* device = cmd_list->get_device();
   if (device == nullptr) return false;
   if (!EnsureXeGTAODescriptorTables(device, layout, descriptor_tables)) return false;
+  auto* data = device->get_private_data<DeviceData>();
 
   renodx::utils::state::CommandListState previous_state = {};
   bool has_previous_state = false;
@@ -2608,6 +2630,36 @@ bool DispatchXeGTAOCompute(
     bound_tables[i] = (*descriptor_tables)[i];
     table_updates[i] = descriptor_updates[i];
     table_updates[i].table = bound_tables[i];
+    if (table_updates[i].table.handle == 0u) {
+      if (data != nullptr) {
+        data->xegtao_debug_descriptor_reject_count += 1u;
+        if (data->xegtao_debug_last_descriptor_reject_frame != data->present_frame_index) {
+          data->xegtao_debug_last_descriptor_reject_frame = data->present_frame_index;
+          AddonLog(
+              reshade::log::level::warning,
+              std::format(
+                  "XeGTAO descriptor reject: null table handle (update_index={}, frame={})",
+                  i,
+                  data->present_frame_index));
+        }
+      }
+      return false;
+    }
+    if (table_updates[i].count != 0u && table_updates[i].descriptors == nullptr) {
+      if (data != nullptr) {
+        data->xegtao_debug_descriptor_reject_count += 1u;
+        if (data->xegtao_debug_last_descriptor_reject_frame != data->present_frame_index) {
+          data->xegtao_debug_last_descriptor_reject_frame = data->present_frame_index;
+          AddonLog(
+              reshade::log::level::warning,
+              std::format(
+                  "XeGTAO descriptor reject: null descriptor payload (update_index={}, frame={})",
+                  i,
+                  data->present_frame_index));
+        }
+      }
+      return false;
+    }
   }
 
   device->update_descriptor_tables(update_count, table_updates.data());
@@ -3022,10 +3074,18 @@ std::array<float, 32> BuildXeGTAOPushConstants(
       : static_cast<float>((data != nullptr ? data->present_frame_index : 0u) % 64u);
   constants[11] = std::clamp(xegtao_debug_mode, 0.f, 19.f);
   constants[12] = denoise_last_pass ? 1.f : 0.f;
-  constants[13] = static_cast<float>(ClampXeGTAONormalInputMode());
+  const uint32_t normal_input_mode = ClampXeGTAONormalInputMode();
+  const bool transformed_normal_mode = normal_input_mode == 1u;
+  const float effective_normal_influence = transformed_normal_mode
+      ? std::max(xegtao_normal_influence, 0.20f)
+      : xegtao_normal_influence;
+  const float effective_normal_depth_blend = transformed_normal_mode
+      ? std::max(xegtao_normal_depth_blend, 0.70f)
+      : xegtao_normal_depth_blend;
+  constants[13] = static_cast<float>(normal_input_mode);
   constants[14] = 0.f;
-  constants[15] = std::clamp(xegtao_normal_influence, 0.f, 2.f);
-  constants[16] = std::clamp(xegtao_normal_depth_blend, 0.f, 1.f);
+  constants[15] = std::clamp(effective_normal_influence, 0.f, 2.f);
+  constants[16] = std::clamp(effective_normal_depth_blend, 0.f, 1.f);
   constants[17] = std::clamp(xegtao_normal_sharpness, 0.5f, 2.5f);
   constants[18] = std::clamp(xegtao_normal_edge_rejection, 0.f, 4.f);
   constants[19] = std::clamp(xegtao_normal_z_preservation, 0.f, 2.f);
@@ -3159,7 +3219,7 @@ bool RunXeGTAOForFrame(
     data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   }
 
-  if (!IsViewAlive(device, data->captured_mrt_normal_srv)) {
+  if (resolve_inputs_from_current_bindings && !IsViewAlive(device, data->captured_mrt_normal_srv)) {
     data->captured_mrt_normal_srv = {};
   }
 
@@ -3219,7 +3279,34 @@ bool RunXeGTAOForFrame(
 
   const uint32_t width = data->working_width;
   const uint32_t height = data->working_height;
-  if (width == 0u || height == 0u) return fail("working texture dimensions are zero");
+  auto note_predispatch_reject = [data](const char* reason) {
+    if (data == nullptr) return;
+    data->xegtao_debug_predispatch_reject_count += 1u;
+    if (data->xegtao_debug_last_predispatch_reject_frame != data->present_frame_index) {
+      data->xegtao_debug_last_predispatch_reject_frame = data->present_frame_index;
+      AddonLog(
+          reshade::log::level::warning,
+          std::format("XeGTAO pre-dispatch reject: {} (frame={})", reason, data->present_frame_index));
+    }
+  };
+  if (width == 0u || height == 0u) {
+    note_predispatch_reject("working texture dimensions are zero");
+    return fail("working texture dimensions are zero");
+  }
+  if (!IsViewAlive(device, data->captured_depth_srv)) {
+    note_predispatch_reject("lighting depth t3 became invalid before dispatch");
+    return fail("lighting depth t3 became invalid before dispatch");
+  }
+  if (!IsViewAlive(device, data->captured_ssao_srv)) {
+    note_predispatch_reject("lighting AO t4 became invalid before dispatch");
+    return fail("lighting AO t4 became invalid before dispatch");
+  }
+  if (!data->captured_scene_cbv_valid
+      || data->captured_scene_cbv.buffer.handle == 0u
+      || !IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
+    note_predispatch_reject("lighting scene CB b0 became invalid before dispatch");
+    return fail("lighting scene CB b0 became invalid before dispatch");
+  }
   const uint32_t fix_mode = ClampXeGTAOFixMode();
   const bool l5_pass_isolation =
       fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kPassIsolationDiagnostics);
@@ -3277,20 +3364,39 @@ bool RunXeGTAOForFrame(
       reshade::api::resource_usage::unordered_access,
       reshade::api::resource_usage::shader_resource);
 
-  const bool mrt_normal_valid = IsViewAlive(device, data->captured_mrt_normal_srv);
+  const auto is_mrt_normal_available_for_dispatch = [&]() -> bool {
+    if (resolve_inputs_from_current_bindings) {
+      return IsViewAlive(device, data->captured_mrt_normal_srv);
+    }
+    return data->captured_mrt_normal_srv.handle != 0u;
+  };
+  const bool mrt_normal_valid = is_mrt_normal_available_for_dispatch();
+  if (ClampXeGTAONormalInputMode() == 1u && !mrt_normal_valid) {
+    data->xegtao_debug_normal_fallback_count += 1u;
+    if (data->xegtao_debug_last_normal_fallback_frame != data->present_frame_index) {
+      data->xegtao_debug_last_normal_fallback_frame = data->present_frame_index;
+      AddonLog(
+          reshade::log::level::info,
+          std::format(
+              "XeGTAO transformed normal unavailable at dispatch: MRT normal SRV invalid, using depth fallback (frame={})",
+              data->present_frame_index));
+    }
+  }
   auto dispatch_main_pass = [&](bool force_depth_only, reshade::api::resource_view ao_uav, reshade::api::resource ao_texture, const char* pass_name) {
+    const bool mrt_normal_valid_now =
+      !force_depth_only && is_mrt_normal_available_for_dispatch();
     std::array<reshade::api::resource_view, 2> main_srvs = {
         data->depth_mips_srv,
         data->captured_mrt_normal_srv,
     };
-    const uint32_t main_srv_count = (!force_depth_only && mrt_normal_valid) ? 2u : 1u;
+    const uint32_t main_srv_count = mrt_normal_valid_now ? 2u : 1u;
     std::array<reshade::api::resource_view, 2> main_uavs = {
         ao_uav,
         data->edges_uav,
     };
     auto main_constants = BuildXeGTAOPushConstants(data, false, force_downscaled_quality);
     main_constants[13] = force_depth_only ? 0.f : main_constants[13];
-    main_constants[14] = (!force_depth_only && mrt_normal_valid) ? 1.f : 0.f;
+    main_constants[14] = mrt_normal_valid_now ? 1.f : 0.f;
 
     std::array<reshade::api::descriptor_table_update, 4> main_updates = {
         reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &data->point_clamp_sampler},
@@ -4524,12 +4630,17 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           owner_token_valid
           && owner_token_frame_ready
           && owner_token_downscaled;
+      const bool mrt_normal_valid_for_apply =
+          data->xegtao_mrt_normal_valid
+          && apply_signature_valid
+          && data->xegtao_mrt_normal_frame != kInvalidFrameIndex
+          && data->xegtao_mrt_normal_frame == apply_signature_frame;
 
       auto bind_xegtao_srv = [&](reshade::api::resource_view srv_to_bind) -> bool {
         if (probe_a_dispatch_no_t22) return false;
         if (!IsViewAlive(device, srv_to_bind)) return false;
         shader_injection.xegtao_dedicated_bound = 1.f;
-        if (data->xegtao_mrt_normal_frame == frame && data->xegtao_mrt_normal_valid) {
+        if (mrt_normal_valid_for_apply) {
           shader_injection.xegtao_mrt_normal_valid = 1.f;
         }
         ScopedDescriptorCaptureSkip capture_skip_guard(true);
@@ -4859,6 +4970,7 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
                       << ", apply_gate=" << (data->xegtao_trace_apply_gate_passed ? 1 : 0)
                       << ", probe_a=" << (data->xegtao_trace_probe_a_active ? 1 : 0)
                       << ", probe_b=" << (data->xegtao_trace_probe_b_active ? 1 : 0)
+                      << ", deferred_mode=" << (fix_l2_isolation ? 1 : 0)
                       << ", owner_draw=" << data->xegtao_trace_owner_draw_ordinal
                       << ", apply_path=" << apply_path << ")";
         AddonLog(reshade::log::level::info, trace_message.str().c_str());
@@ -5021,6 +5133,19 @@ void OnPresentAdvanceFrame(
     }
     auto* data = device->get_private_data<DeviceData>();
     if (data != nullptr) {
+      if (!g_xegtao_startup_mode_logged.exchange(true, std::memory_order_relaxed)) {
+        AddonLog(
+            reshade::log::level::info,
+            std::format(
+                "XeGTAO startup mode: fix={}, l5(prefilter={}, main={}, denoise={}, composite={}), probeA={}, probeB={}",
+                GetXeGTAOFixModeName(ClampXeGTAOFixMode()),
+                ClampBooleanToggle(xegtao_fix_l5_prefilter),
+                ClampBooleanToggle(xegtao_fix_l5_main),
+                ClampBooleanToggle(xegtao_fix_l5_denoise),
+                ClampBooleanToggle(xegtao_fix_l5_composite),
+                ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22),
+                ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch)));
+      }
       const uint64_t frame = data->present_frame_index;
       if (data->xegtao_deferred_dispatch_pending
           && data->xegtao_deferred_dispatch_frame == frame
@@ -5035,6 +5160,19 @@ void OnPresentAdvanceFrame(
         if (!use_deferred_dispatch || probe_b_t22_no_dispatch) {
           data->xegtao_deferred_dispatch_pending = false;
           data->xegtao_deferred_dispatch_executed = true;
+        } else if (frame < kXeGTAODeferredStartupGuardFrames) {
+          if (data->xegtao_deferred_drop_log_frame != frame) {
+            data->xegtao_deferred_drop_log_frame = frame;
+            AddonLog(
+                reshade::log::level::info,
+                std::format(
+                    "XeGTAO deferred startup guard: skipping dispatch on frame {}",
+                    frame));
+          }
+          data->xegtao_debug_deferred_drop_count += 1u;
+          data->xegtao_debug_last_deferred_drop_frame = frame;
+          data->xegtao_deferred_dispatch_pending = false;
+          data->xegtao_deferred_dispatch_executed = true;
         } else {
           auto* cmd_list = queue != nullptr
               ? queue->get_immediate_command_list()
@@ -5047,10 +5185,21 @@ void OnPresentAdvanceFrame(
                   reshade::log::level::warning,
                   "XeGTAO deferred dispatch dropped: present queue/immediate command list unavailable at end-of-frame");
             }
+            data->xegtao_debug_deferred_drop_count += 1u;
+            data->xegtao_debug_last_deferred_drop_frame = frame;
             data->xegtao_deferred_dispatch_pending = false;
             data->xegtao_deferred_dispatch_executed = true;
           } else {
-            const bool deferred_views_valid =
+            const reshade::api::resource_view fallback_lighting_mrt0 = {
+                g_lighting_mrt0_view.load(std::memory_order_relaxed)};
+            reshade::api::resource_view deferred_mrt_normal_srv =
+                data->xegtao_deferred_mrt_normal_srv;
+            bool deferred_mrt_normal_valid = deferred_mrt_normal_srv.handle != 0u;
+            if (!deferred_mrt_normal_valid && fallback_lighting_mrt0.handle != 0u) {
+              deferred_mrt_normal_srv = fallback_lighting_mrt0;
+              deferred_mrt_normal_valid = true;
+            }
+            const bool deferred_depth_ssao_valid =
                 IsViewAlive(device, data->xegtao_deferred_depth_srv)
                 && IsViewAlive(device, data->xegtao_deferred_ssao_srv);
             bool deferred_scene_cbv_valid =
@@ -5072,19 +5221,39 @@ void OnPresentAdvanceFrame(
               }
             }
 
-            if (!deferred_views_valid || !deferred_scene_cbv_valid) {
+            if (!deferred_depth_ssao_valid || !deferred_scene_cbv_valid) {
               if (data->xegtao_deferred_drop_log_frame != frame) {
                 data->xegtao_deferred_drop_log_frame = frame;
+                const std::string drop_reason = !deferred_depth_ssao_valid
+                    ? "frozen t3/t4 views invalid"
+                    : "frozen scene CB b0 invalid";
                 AddonLog(
                     reshade::log::level::warning,
-                    "XeGTAO deferred dispatch dropped: frozen lighting snapshot is invalid");
+                    std::format(
+                        "XeGTAO deferred dispatch dropped: {} (frame={})",
+                        drop_reason,
+                        frame));
               }
+              data->xegtao_debug_deferred_drop_count += 1u;
+              data->xegtao_debug_last_deferred_drop_frame = frame;
               data->xegtao_deferred_dispatch_pending = false;
               data->xegtao_deferred_dispatch_executed = true;
             } else {
               data->captured_depth_srv = data->xegtao_deferred_depth_srv;
               data->captured_ssao_srv = data->xegtao_deferred_ssao_srv;
-              data->captured_mrt_normal_srv = data->xegtao_deferred_mrt_normal_srv;
+              data->captured_mrt_normal_srv =
+                  deferred_mrt_normal_valid ? deferred_mrt_normal_srv : reshade::api::resource_view{};
+              if (!deferred_mrt_normal_valid) {
+                data->xegtao_debug_normal_fallback_count += 1u;
+                if (data->xegtao_debug_last_normal_fallback_frame != frame) {
+                  data->xegtao_debug_last_normal_fallback_frame = frame;
+                  AddonLog(
+                      reshade::log::level::info,
+                      std::format(
+                          "XeGTAO deferred normal fallback: MRT normal SRV missing, using depth-derived path (frame={})",
+                          frame));
+                }
+              }
               data->captured_scene_cbv = data->xegtao_deferred_scene_cbv;
               data->captured_scene_cbv_valid = data->xegtao_deferred_scene_cbv_valid;
               data->captured_scene_cbv_frame = data->xegtao_deferred_scene_cbv_frame;
@@ -5102,6 +5271,16 @@ void OnPresentAdvanceFrame(
                   data,
                   false,
                   false);
+                AddonLog(
+                  reshade::log::level::info,
+                  std::format(
+                    "XeGTAO deferred-present dispatch frame {} (succeeded={}, normal_mode={}, mrt_normal_valid={}, main_pass={}, composite_pass={})",
+                    frame,
+                    has_result_this_frame ? 1 : 0,
+                    ClampXeGTAONormalInputMode(),
+                    data->xegtao_mrt_normal_valid ? 1 : 0,
+                    data->xegtao_trace_main_pass_executed ? 1 : 0,
+                    data->xegtao_trace_composite_pass_executed ? 1 : 0));
               data->xegtao_trace_dispatch_succeeded = has_result_this_frame;
               data->xegtao_dispatch_isolation_active = false;
               data->xegtao_dispatch_restore_mismatch = false;
@@ -5196,6 +5375,8 @@ void OnPresentAdvanceFrame(
   xegtao_fix_l5_composite = static_cast<float>(ClampBooleanToggle(xegtao_fix_l5_composite));
   xegtao_probe_a_dispatch_no_t22 = static_cast<float>(ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22));
   xegtao_probe_b_t22_no_dispatch = static_cast<float>(ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch));
+  xegtao_runtime_debug_logging = static_cast<float>(ClampBooleanToggle(xegtao_runtime_debug_logging));
+  g_enable_runtime_addon_logs.store(xegtao_runtime_debug_logging >= 0.5f, std::memory_order_relaxed);
   xegtao_denoiser_mode = 0.f;
   xegtao_isfast_jitter_amount = std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
   xegtao_foliage_ao_blend = std::clamp(xegtao_foliage_ao_blend, 0.f, 1.f);
@@ -5397,7 +5578,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "XeGTAONormalInfluence",
         .binding = &xegtao_normal_influence,
-        .default_value = 0.05f,
+        .default_value = 0.20f,
         .label = "Normal Influence",
         .section = "XeGTAO",
         .tooltip = "Scales MRT normal XY contribution before blending.",
@@ -5410,7 +5591,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "XeGTAONormalDepthBlend",
         .binding = &xegtao_normal_depth_blend,
-        .default_value = 0.45f,
+        .default_value = 0.70f,
         .label = "Normal-Depth Blend",
         .section = "XeGTAO",
         .tooltip = "0 uses depth fallback normals, 1 fully uses tuned MRT normals.",
@@ -5734,6 +5915,33 @@ renodx::utils::settings::Settings settings = {
         .min = 0.01f,
         .max = 8.f,
         .format = "%.2f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAOFoliageShading",
+        .binding = &xegtao_foliage_ao_blend,
+        .default_value = 100.f,
+        .label = "Foliage Shading",
+        .section = "XeGTAO",
+        .tooltip = "Blends foliage AO between mask-off neutral shading and full masked XeGTAO shading.",
+        .min = 0.f,
+        .max = 100.f,
+        .format = "%.0f",
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .parse = [](float value) { return std::clamp(value, 0.f, 100.f) * 0.01f; },
+        .is_visible = []() { return true; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "XeGTAORuntimeDebugLogging",
+        .binding = &xegtao_runtime_debug_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Runtime Debug Logs",
+        .section = "XeGTAO",
+        .tooltip =
+          "Enables low-volume XeGTAO runtime logs for descriptor rejects, deferred drops, and normal fallbacks.",
+        .labels = {"Off", "On"},
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
         .is_visible = []() { return IsAdvancedSettingsMode(); },
     },

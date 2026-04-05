@@ -619,19 +619,37 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
     // MIP 0
     const uint2 baseCoord = dispatchThreadID;
     const uint2 pixCoord = baseCoord * 2;
-    float4 depths4 = sourceNDCDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2(1,1) );
+    uint outDepth0Width, outDepth0Height;
+    uint outDepth1Width, outDepth1Height;
+    uint outDepth2Width, outDepth2Height;
+    uint outDepth3Width, outDepth3Height;
+    uint outDepth4Width, outDepth4Height;
+    outDepth0.GetDimensions( outDepth0Width, outDepth0Height );
+    outDepth1.GetDimensions( outDepth1Width, outDepth1Height );
+    outDepth2.GetDimensions( outDepth2Width, outDepth2Height );
+    outDepth3.GetDimensions( outDepth3Width, outDepth3Height );
+    outDepth4.GetDimensions( outDepth4Width, outDepth4Height );
+
+    const uint2 outDepth0SafeSize = uint2( max( outDepth0Width, 1u ), max( outDepth0Height, 1u ) );
+    const uint2 clampedPixCoord = min( pixCoord, outDepth0SafeSize - 1u );
+    float4 depths4 = sourceNDCDepth.GatherRed( depthSampler, float2( clampedPixCoord * consts.ViewportPixelSize ), int2(1,1) );
     lpfloat depth0 = XeGTAO_ClampDepth( XeGTAO_ScreenSpaceToViewSpaceDepth( depths4.w, consts ) );
     lpfloat depth1 = XeGTAO_ClampDepth( XeGTAO_ScreenSpaceToViewSpaceDepth( depths4.z, consts ) );
     lpfloat depth2 = XeGTAO_ClampDepth( XeGTAO_ScreenSpaceToViewSpaceDepth( depths4.x, consts ) );
     lpfloat depth3 = XeGTAO_ClampDepth( XeGTAO_ScreenSpaceToViewSpaceDepth( depths4.y, consts ) );
-    outDepth0[ pixCoord + uint2(0, 0) ] = (lpfloat)depth0;
-    outDepth0[ pixCoord + uint2(1, 0) ] = (lpfloat)depth1;
-    outDepth0[ pixCoord + uint2(0, 1) ] = (lpfloat)depth2;
-    outDepth0[ pixCoord + uint2(1, 1) ] = (lpfloat)depth3;
+    if( pixCoord.x < outDepth0Width && pixCoord.y < outDepth0Height )
+        outDepth0[ pixCoord + uint2(0, 0) ] = (lpfloat)depth0;
+    if( (pixCoord.x + 1) < outDepth0Width && pixCoord.y < outDepth0Height )
+        outDepth0[ pixCoord + uint2(1, 0) ] = (lpfloat)depth1;
+    if( pixCoord.x < outDepth0Width && (pixCoord.y + 1) < outDepth0Height )
+        outDepth0[ pixCoord + uint2(0, 1) ] = (lpfloat)depth2;
+    if( (pixCoord.x + 1) < outDepth0Width && (pixCoord.y + 1) < outDepth0Height )
+        outDepth0[ pixCoord + uint2(1, 1) ] = (lpfloat)depth3;
 
     // MIP 1
     lpfloat dm1 = XeGTAO_DepthMIPFilter( depth0, depth1, depth2, depth3, consts );
-    outDepth1[ baseCoord ] = (lpfloat)dm1;
+    if( baseCoord.x < outDepth1Width && baseCoord.y < outDepth1Height )
+        outDepth1[ baseCoord ] = (lpfloat)dm1;
     g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm1;
 
     GroupMemoryBarrierWithGroupSync( );
@@ -646,7 +664,8 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
         lpfloat inBR = g_scratchDepths[groupThreadID.x+1][groupThreadID.y+1];
 
         lpfloat dm2 = XeGTAO_DepthMIPFilter( inTL, inTR, inBL, inBR, consts );
-        outDepth2[ baseCoord / 2 ] = (lpfloat)dm2;
+        if( (baseCoord.x / 2) < outDepth2Width && (baseCoord.y / 2) < outDepth2Height )
+            outDepth2[ baseCoord / 2 ] = (lpfloat)dm2;
         g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm2;
     }
 
@@ -662,7 +681,8 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
         lpfloat inBR = g_scratchDepths[groupThreadID.x+2][groupThreadID.y+2];
 
         lpfloat dm3 = XeGTAO_DepthMIPFilter( inTL, inTR, inBL, inBR, consts );
-        outDepth3[ baseCoord / 4 ] = (lpfloat)dm3;
+        if( (baseCoord.x / 4) < outDepth3Width && (baseCoord.y / 4) < outDepth3Height )
+            outDepth3[ baseCoord / 4 ] = (lpfloat)dm3;
         g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm3;
     }
 
@@ -678,7 +698,8 @@ void XeGTAO_PrefilterDepths16x16( uint2 dispatchThreadID /*: SV_DispatchThreadID
         lpfloat inBR = g_scratchDepths[groupThreadID.x+4][groupThreadID.y+4];
 
         lpfloat dm4 = XeGTAO_DepthMIPFilter( inTL, inTR, inBL, inBR, consts );
-        outDepth4[ baseCoord / 8 ] = (lpfloat)dm4;
+        if( (baseCoord.x / 8) < outDepth4Width && (baseCoord.y / 8) < outDepth4Height )
+            outDepth4[ baseCoord / 8 ] = (lpfloat)dm4;
         //g_scratchDepths[ groupThreadID.x ][ groupThreadID.y ] = dm4;
     }
 }
