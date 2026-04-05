@@ -61,6 +61,7 @@ constexpr uint32_t kLightingXeGtaoRegister = 22u;
 constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 constexpr uint64_t kXeGTAODeferredStartupGuardFrames = 3u;
+constexpr uint64_t kXeGTAOClearStartupGuardFrames = 8u;
 constexpr bool kEnableAddonLogs = false;
 std::atomic_bool g_enable_runtime_addon_logs{false};
 std::atomic_bool g_xegtao_startup_mode_logged{false};
@@ -2682,40 +2683,41 @@ bool DispatchXeGTAOCompute(
 
   cmd_list->dispatch(group_count_x, group_count_y, group_count_z);
 
+  constexpr bool clear_sampler = true;
+  constexpr bool clear_rebind_tables = true;
+  const bool startup_clear_guard_active =
+      data == nullptr || data->present_frame_index < kXeGTAOClearStartupGuardFrames;
+
   std::array<reshade::api::sampler, 16> null_samplers = {};
-  std::array<reshade::api::sampler_with_resource_view, 16> null_sampler_srvs = {};
-  std::array<reshade::api::buffer_range, 16> null_buffer_ranges = {};
-  std::array<reshade::api::resource_view, 16> null_views = {};
 
   std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> clear_updates = {};
+  bool has_clear_descriptor_updates = false;
   for (uint32_t i = 0u; i < update_count; ++i) {
     clear_updates[i] = table_updates[i];
     switch (clear_updates[i].type) {
       case reshade::api::descriptor_type::sampler:
-        clear_updates[i].descriptors = null_samplers.data();
-        break;
-      case reshade::api::descriptor_type::sampler_with_resource_view:
-        clear_updates[i].descriptors = null_sampler_srvs.data();
-        break;
-      case reshade::api::descriptor_type::constant_buffer:
-      case reshade::api::descriptor_type::shader_storage_buffer:
-        clear_updates[i].descriptors = null_buffer_ranges.data();
+        if (clear_sampler) {
+          clear_updates[i].descriptors = null_samplers.data();
+          has_clear_descriptor_updates = true;
+        }
         break;
       default:
-        clear_updates[i].descriptors = null_views.data();
         break;
     }
   }
 
-  device->update_descriptor_tables(update_count, clear_updates.data());
-  cmd_list->bind_descriptor_tables(
-      reshade::api::shader_stage::all_compute,
-      layout,
-      0u,
-      update_count,
-      bound_tables.data());
-  reshade::api::pipeline null_compute_pipeline = {};
-  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, null_compute_pipeline);
+  if (!startup_clear_guard_active && has_clear_descriptor_updates) {
+    device->update_descriptor_tables(update_count, clear_updates.data());
+  }
+
+  if (!startup_clear_guard_active && clear_rebind_tables) {
+    cmd_list->bind_descriptor_tables(
+        reshade::api::shader_stage::all_compute,
+        layout,
+        0u,
+        update_count,
+        bound_tables.data());
+  }
 
   if (has_previous_state) {
     previous_state.Apply(cmd_list);
