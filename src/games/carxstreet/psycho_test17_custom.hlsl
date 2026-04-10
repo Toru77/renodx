@@ -1,7 +1,197 @@
 #include "./shared.h"
+#include "./macleod_boynton.hlsli"
 
 #ifndef RENODX_SHADERS_TONEMAP_PSYCHO_TEST17_HLSL_
 #define RENODX_SHADERS_TONEMAP_PSYCHO_TEST17_HLSL_
+
+namespace renodx {
+namespace color {
+
+namespace macleod_boynton {
+
+#define XYZ_TO_LMS_2006 renodx_custom::color::macleod_boynton::XYZ_TO_LMS_2006
+#define LMS_TO_XYZ_2006 renodx_custom::color::macleod_boynton::LMS_TO_XYZ_2006
+
+static const float3x3 LMS_TO_LMS_WEIGHTED_MAT = float3x3(
+  1.f, 0.f, 0.f,
+  0.f, 1.f, 0.f,
+  0.f, 0.f, 1.f);
+
+// These need to be computed from other (non-const) matrices at compile-time;
+// avoid static initializers that reference other variables (FXC rejects them).
+#define BT709_TO_LMS_WEIGHTED_MAT (mul(XYZ_TO_LMS_2006, renodx::color::BT709_TO_XYZ_MAT))
+#define BT2020_TO_LMS_WEIGHTED_MAT (mul(XYZ_TO_LMS_2006, renodx::color::BT2020_TO_XYZ_MAT))
+
+float3 WeighLMS(float3 lms_input) {
+  return lms_input;
+}
+
+float3 UnweighLMS(float3 lms_weighted) {
+  return lms_weighted;
+}
+
+float3 WeightedLMSFromMacleodBoynton(float3 mb) {
+  return renodx_custom::color::macleod_boynton::LMS_From_MB_T(mb.xy, mb.z);
+}
+
+namespace from {
+
+float3 WeightedLMS(float3 lms_weighted) {
+  float2 mb = renodx_custom::color::macleod_boynton::MB_From_LMS(lms_weighted);
+  float t = lms_weighted.x + lms_weighted.y;
+  return float3(mb, t);
+}
+
+float3 LMS(float3 lms_input) {
+  return WeightedLMS(WeighLMS(lms_input));
+}
+
+float2 D65XY() {
+  return renodx_custom::color::macleod_boynton::MB_White_D65();
+}
+
+}  // namespace from
+}  // namespace macleod_boynton
+
+namespace lms {
+namespace from {
+
+float3 BT709(float3 bt709_linear) {
+    return mul(
+      XYZ_TO_LMS_2006,
+      renodx::color::xyz::from::BT709(bt709_linear));
+}
+
+float3 MacLeodBoynton(float3 mb) {
+  return renodx_custom::color::macleod_boynton::LMS_From_MB_T(mb.xy, mb.z);
+}
+
+}  // namespace from
+}  // namespace lms
+
+namespace yf {
+namespace from {
+
+float LMS(float3 lms_input) {
+  return 1.55f * lms_input.x + lms_input.y;
+}
+
+float BT709(float3 bt709_linear) {
+  return LMS(renodx::color::lms::from::BT709(bt709_linear));
+}
+
+float BT709(float bt709_linear) {
+  return BT709(bt709_linear.xxx);
+}
+
+}  // namespace from
+}  // namespace yf
+
+namespace gamut {
+
+static const float EPSILON = 1e-20f;
+static const float MB_NEAR_WHITE_EPSILON = 1e-14f;
+
+float RayExitTCIE1702(float2 origin, float2 direction) {
+  if (dot(direction, direction) <= MB_NEAR_WHITE_EPSILON) {
+    return 0.f;
+  }
+
+  float3 lms_origin = renodx_custom::color::macleod_boynton::LMS_From_MB_T(origin, 1.f);
+  float3 lms_step = renodx_custom::color::macleod_boynton::LMS_From_MB_T(origin + direction, 1.f);
+
+    float3 rgb_origin = mul(
+      renodx::color::XYZ_TO_BT709_MAT,
+      mul(LMS_TO_XYZ_2006, lms_origin));
+    float3 rgb_step = mul(
+      renodx::color::XYZ_TO_BT709_MAT,
+      mul(LMS_TO_XYZ_2006, lms_step));
+  float3 a = rgb_step - rgb_origin;
+
+  float t_lo = 0.f;
+  float t_hi = renodx_custom::color::macleod_boynton::INTERVAL_MAX;
+  float lo;
+  float hi;
+
+  renodx_custom::color::macleod_boynton::IntervalLower0(a.x, rgb_origin.x, lo, hi);
+  t_lo = max(t_lo, lo);
+  t_hi = min(t_hi, hi);
+
+  renodx_custom::color::macleod_boynton::IntervalLower0(a.y, rgb_origin.y, lo, hi);
+  t_lo = max(t_lo, lo);
+  t_hi = min(t_hi, hi);
+
+  renodx_custom::color::macleod_boynton::IntervalLower0(a.z, rgb_origin.z, lo, hi);
+  t_lo = max(t_lo, lo);
+  t_hi = min(t_hi, hi);
+
+  if (t_hi < t_lo) {
+    return 0.f;
+  }
+
+  return max(0.f, t_hi);
+}
+
+float3 GamutCompressWeightedLMSCoreRGBBoundFromAdaptiveWeightedInput(
+    float3 lms_weighted_relative_input,
+    float3 current_adaptive_state_lms,
+    float3x3 bound_rgb_to_lms_weighted_mat,
+    float strength) {
+  if (strength <= 0.f) {
+    return lms_weighted_relative_input;
+  }
+
+  float3 adaptive_state = max(current_adaptive_state_lms, 1e-6f.xxx);
+  float3 lms_absolute = lms_weighted_relative_input * adaptive_state;
+  float3 bound_rgb = mul(renodx::math::Invert3x3(bound_rgb_to_lms_weighted_mat), lms_absolute);
+  float3 compressed_rgb = max(bound_rgb, 0.f.xxx);
+  float3 compressed_lms = mul(bound_rgb_to_lms_weighted_mat, compressed_rgb);
+  float3 blended_lms = lerp(lms_absolute, compressed_lms, saturate(strength));
+  return renodx::math::DivideSafe(blended_lms, adaptive_state, 0.f.xxx);
+}
+
+}  // namespace gamut
+
+namespace bt709 {
+namespace from {
+
+float3 LMS(float3 lms_input) {
+    return renodx::color::bt709::from::XYZ(
+      mul(LMS_TO_XYZ_2006, lms_input));
+}
+
+}  // namespace from
+}  // namespace bt709
+
+}  // namespace color
+
+namespace tonemap {
+
+float3 NakaRushton(
+    float3 lms_input,
+    float3 lms_peak,
+    float3 current_adaptive_state_lms,
+    float3 desired_background_state_lms,
+    float cone_response_exponent) {
+  float3 safe_peak = max(lms_peak, 1e-6f.xxx);
+  float3 safe_adaptive_state = max(current_adaptive_state_lms, 1e-6f.xxx);
+  float3 safe_background_state = max(desired_background_state_lms, 1e-6f.xxx);
+  float response_exponent = max(cone_response_exponent, 1e-4f);
+
+  float3 normalized = renodx::math::DivideSafe(max(lms_input, 0.f.xxx), safe_peak, 0.f.xxx);
+  float3 response = pow(normalized, response_exponent);
+  float3 compressed = renodx::math::DivideSafe(response, 1.f.xxx + response, 0.f.xxx);
+
+  float3 adaptation_ratio = renodx::math::DivideSafe(
+      safe_background_state,
+      safe_adaptive_state,
+      1.f.xxx);
+
+  return compressed * safe_peak * adaptation_ratio;
+}
+
+}  // namespace tonemap
+}  // namespace renodx
 
 namespace renodx {
 namespace tonemap {
@@ -550,22 +740,22 @@ float3 psychotm_test17(
     // noop
   } else if (gamut_compression == 0) {
     lms_working = psycho17_GamutCompressLMSBoundAdaptive(
-        lms_in,
-        current_adaptive_state_lms,
-        renodx::color::macleod_boynton::LMS_TO_LMS_WEIGHTED_MAT,
-        1.f);
+      lms_in,
+      current_adaptive_state_lms,
+      renodx::color::macleod_boynton::LMS_TO_LMS_WEIGHTED_MAT,
+      1.f);
   } else if (gamut_compression_mode == 0) {
     lms_working = psycho17_GamutCompressLMSBoundAdaptive(
-        lms_in,
-        current_adaptive_state_lms,
-        renodx::color::macleod_boynton::BT709_TO_LMS_WEIGHTED_MAT,
-        1.f);
+      lms_in,
+      current_adaptive_state_lms,
+      BT709_TO_LMS_WEIGHTED_MAT,
+      1.f);
   } else {
     lms_working = psycho17_GamutCompressLMSBoundAdaptive(
-        lms_in,
-        current_adaptive_state_lms,
-        renodx::color::macleod_boynton::BT2020_TO_LMS_WEIGHTED_MAT,
-        1.f);
+      lms_in,
+      current_adaptive_state_lms,
+      BT2020_TO_LMS_WEIGHTED_MAT,
+      1.f);
   }
 
   float yf_input = renodx::color::yf::from::LMS(lms_working);
@@ -672,16 +862,16 @@ float3 psychotm_test17(
 
   if (gamut_compression != 0.f) {
     if (gamut_compression_mode == 0) {
-      display_scaled_relative_weighted = psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
+        display_scaled_relative_weighted = psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
           display_scaled_relative_weighted,
           current_adaptive_state_lms,
-          renodx::color::macleod_boynton::BT709_TO_LMS_WEIGHTED_MAT,
+          BT709_TO_LMS_WEIGHTED_MAT,
           gamut_compression);
     } else if (gamut_compression_mode == 1) {
-      display_scaled_relative_weighted = psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
+        display_scaled_relative_weighted = psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
           display_scaled_relative_weighted,
           current_adaptive_state_lms,
-          renodx::color::macleod_boynton::BT2020_TO_LMS_WEIGHTED_MAT,
+          BT2020_TO_LMS_WEIGHTED_MAT,
           gamut_compression);
     }
   }
