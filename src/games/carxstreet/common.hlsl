@@ -1,4 +1,5 @@
 #include "./shared.h"
+#include "./psycho_test17_custom.hlsl"
 
 float3 BuildTonemapPayload(float3 colorHDR, float3 colorSDRNeutral, float3 colorSDRGraded) {
   // Build the pre-ToneMapPass payload from LUT-sampled inputs.
@@ -82,6 +83,24 @@ float3 BuildTonemapPayload(float3 colorHDR, float3 colorSDRNeutral, float3 color
 
 float3 ApplyToneMapPass(float3 colorHDR) {
   // Apply RenoDX ToneMapPass to a prebuilt payload.
+  // Psycho tonemap (custom implementation) selected explicitly as option 4
+  if (RENODX_TONE_MAP_TYPE == 4.0f) {
+    float peak_value = max(1.f, RENODX_PEAK_WHITE_NITS / max(RENODX_DIFFUSE_WHITE_NITS, 1.f));
+    colorHDR = renodx::tonemap::psycho::psychotm_test17(
+        colorHDR,
+        peak_value,
+        RENODX_TONE_MAP_EXPOSURE,
+        RENODX_TONE_MAP_HIGHLIGHTS,
+        RENODX_TONE_MAP_SHADOWS,
+        RENODX_TONE_MAP_CONTRAST,
+        RENODX_TONE_MAP_SATURATION,
+        RENODX_TONE_MAP_BLOWOUT,
+        peak_value,
+        RENODX_TONE_MAP_HUE_CORRECTION,
+        RENODX_TONE_MAP_HUE_SHIFT);
+    return colorHDR;
+  }
+
   if (RENODX_TONE_MAP_TYPE >= 1.0f) {
   renodx::draw::Config config = renodx::draw::BuildConfig(); {
     //config.reno_drt_white_clip = 3000 / 203.;
