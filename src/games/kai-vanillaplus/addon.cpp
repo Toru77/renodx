@@ -6178,7 +6178,7 @@ renodx::utils::settings::Settings settings = {
           "Off disables XeGTAO fallback sources (fallback scene CBV and deferred MRT-normal fallback). On enables those fallback paths.",
         .labels = {"Off", "On"},
         .is_enabled = []() { return xegtao_mode >= 0.5f; },
-        .is_visible = []() { return true; },
+        .is_visible = []() { return IsAdvancedSettingsMode(); },
       },
       new renodx::utils::settings::Setting{
         .key = "XeGTAORuntimeDebugLogging",
