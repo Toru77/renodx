@@ -60,9 +60,11 @@ constexpr uint32_t kLightingSceneCbRegister = 0u;
 constexpr uint32_t kLightingXeGtaoRegister = 22u;
 constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
+constexpr uint64_t kSceneCbMaximumBytes = 64u * 1024u;
 constexpr uint64_t kXeGTAODeferredStartupGuardFrames = 3u;
 constexpr uint64_t kXeGTAOStartupDispatchGuardFrames = 16u;
 constexpr uint64_t kXeGTAOStartupRequireCurrentSceneCbvFrames = 64u;
+constexpr uint64_t kXeGTAOFallbackStartupQuarantineFrames = 240u;
 constexpr uint64_t kXeGTAOClearStartupGuardFrames = 8u;
 constexpr uint64_t kXeGTAOResizeDispatchGuardFrames = 4u;
 constexpr uint64_t kXeGTAOFallbackSceneCbvMaxAgeFrames = 2u;
@@ -367,6 +369,7 @@ float xegtao_depth_mip_sampling_offset = 3.3f;
 float xegtao_denoise_blur_beta = 8.f;
 float xegtao_debug_mode = 0.f;
 float xegtao_runtime_debug_logging = 0.f;
+float xegtao_enable_fallbacks = 1.f;
 float xegtao_foliage_ao_blend = 1.0f;
 float xegtao_foliage_mask_method = 0.f;  // 0=SSS parity(t1 strict), 1=legacy broad(t1), 2=t10 strict
 
@@ -2095,6 +2098,10 @@ uint32_t ClampBooleanToggle(float value) {
   return static_cast<uint32_t>(std::clamp(std::round(value), 0.f, 1.f));
 }
 
+bool AreXeGTAOFallbacksEnabled() {
+  return ClampBooleanToggle(xegtao_enable_fallbacks) != 0u;
+}
+
 bool IsXeGTAOFixLevelAtLeast(XeGTAOFixMode level) {
   return ClampXeGTAOFixMode() >= static_cast<uint32_t>(level);
 }
@@ -2135,27 +2142,43 @@ float ClampXeGTAOIsFastJitterAmount() {
   return std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
 }
 
-bool IsSceneCbvCandidateValid(reshade::api::device* device, const reshade::api::buffer_range& range) {
-  if (device == nullptr) return false;
-  if (range.buffer.handle == 0u) return false;
+bool TryNormalizeSceneCbvRange(
+    reshade::api::device* device,
+    const reshade::api::buffer_range& input,
+    reshade::api::buffer_range* output) {
+  if (device == nullptr || output == nullptr) return false;
+  if (input.buffer.handle == 0u) return false;
 
-  const auto desc = device->get_resource_desc(range.buffer);
+  const auto desc = device->get_resource_desc(input.buffer);
   if (desc.type != reshade::api::resource_type::buffer) return false;
   if (desc.buffer.size < kSceneCbMinimumBytes) return false;
-  if (range.offset >= desc.buffer.size) return false;
+  if (input.offset >= desc.buffer.size) return false;
 
-  // In D3D11-style paths size may be UINT64_MAX (whole buffer) or 0 (unknown),
-  // so only validate explicit ranges.
-  if (range.size != 0u && range.size != UINT64_MAX) {
-    if (range.size < kSceneCbMinimumBytes) return false;
-    if (range.size > desc.buffer.size) return false;
-    if (range.offset > desc.buffer.size - range.size) return false;
-  }
+  const uint64_t available_bytes = desc.buffer.size - input.offset;
+  const bool has_unknown_size = input.size == 0u || input.size == UINT64_MAX;
+  if (!has_unknown_size && input.size < kSceneCbMinimumBytes) return false;
 
+  uint64_t normalized_size = has_unknown_size ? available_bytes : input.size;
+  if (normalized_size > available_bytes) normalized_size = available_bytes;
+  if (normalized_size > kSceneCbMaximumBytes) normalized_size = kSceneCbMaximumBytes;
+
+  // Constant buffer payload is 16-byte aligned; align down to keep updates valid.
+  normalized_size &= ~0xFu;
+  if (normalized_size < kSceneCbMinimumBytes) return false;
+
+  reshade::api::buffer_range normalized = input;
+  normalized.size = normalized_size;
+  *output = normalized;
   return true;
 }
 
+bool IsSceneCbvCandidateValid(reshade::api::device* device, const reshade::api::buffer_range& range) {
+  reshade::api::buffer_range normalized = {};
+  return TryNormalizeSceneCbvRange(device, range, &normalized);
+}
+
 void CacheFallbackSceneCbv(reshade::api::command_list* cmd_list, const reshade::api::buffer_range& range) {
+  if (!AreXeGTAOFallbacksEnabled()) return;
   if (cmd_list == nullptr) return;
   auto* device = cmd_list->get_device();
   if (device == nullptr) return;
@@ -2163,19 +2186,28 @@ void CacheFallbackSceneCbv(reshade::api::command_list* cmd_list, const reshade::
   auto* data = device->get_private_data<DeviceData>();
   if (data == nullptr) return;
 
-  if (range.buffer.handle == 0u) return;
-  if (!IsSceneCbvCandidateValid(device, range)) return;
-  data->fallback_scene_cbv = range;
+  // Startup quarantine: keep fallback paths dormant during unstable bootstrap.
+  if (data->present_frame_index < kXeGTAOFallbackStartupQuarantineFrames) return;
+
+  reshade::api::buffer_range normalized = {};
+  if (!TryNormalizeSceneCbvRange(device, range, &normalized)) return;
+  data->fallback_scene_cbv = normalized;
   data->fallback_scene_cbv_seen = true;
   data->fallback_scene_cbv_frame = data->present_frame_index;
 }
 
 bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
   if (device == nullptr || data == nullptr) return false;
+  if (!AreXeGTAOFallbacksEnabled()) return false;
 
+  // Startup quarantine: avoid binding fallback CBV until runtime settles.
+  if (data->present_frame_index < kXeGTAOFallbackStartupQuarantineFrames) return false;
+
+  reshade::api::buffer_range normalized_current = {};
   if (data->captured_scene_cbv_valid
       && data->captured_scene_cbv_source == XeGTAOSceneCbvSource::kCurrentLighting
-      && IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
+      && TryNormalizeSceneCbvRange(device, data->captured_scene_cbv, &normalized_current)) {
+    data->captured_scene_cbv = normalized_current;
     return true;
   }
 
@@ -2193,9 +2225,12 @@ bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
       && data->present_frame_index - data->fallback_scene_cbv_frame > kXeGTAOFallbackSceneCbvMaxAgeFrames) {
     return false;
   }
-  if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) return false;
+  reshade::api::buffer_range normalized_fallback = {};
+  if (!TryNormalizeSceneCbvRange(device, data->fallback_scene_cbv, &normalized_fallback)) return false;
 
-  data->captured_scene_cbv = data->fallback_scene_cbv;
+  data->fallback_scene_cbv = normalized_fallback;
+
+  data->captured_scene_cbv = normalized_fallback;
   data->captured_scene_cbv_valid = true;
   data->captured_scene_cbv_frame = data->present_frame_index;
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kFallback;
@@ -3395,7 +3430,12 @@ bool RunXeGTAOForFrame(
       || data->captured_scene_cbv.buffer.handle == 0u
       || !IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
     std::string reason = "lighting scene CB b0 is not captured";
-    if (!data->fallback_scene_cbv_seen) {
+    if (data->present_frame_index < kXeGTAOFallbackStartupQuarantineFrames) {
+      reason += std::format(
+          " (fallback startup quarantine active: frame {} < {})",
+          data->present_frame_index,
+          kXeGTAOFallbackStartupQuarantineFrames);
+    } else if (!data->fallback_scene_cbv_seen) {
       reason += " (tracked + fallback cache missing)";
     } else if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) {
       reason += " (fallback cache rejected by validation)";
@@ -3454,6 +3494,12 @@ bool RunXeGTAOForFrame(
     note_predispatch_reject("lighting scene CB b0 became invalid before dispatch");
     return fail("lighting scene CB b0 became invalid before dispatch");
   }
+  reshade::api::buffer_range normalized_scene_cbv = {};
+  if (!TryNormalizeSceneCbvRange(device, data->captured_scene_cbv, &normalized_scene_cbv)) {
+    note_predispatch_reject("lighting scene CB b0 range is unsafe for dispatch");
+    return fail("lighting scene CB b0 range is unsafe for dispatch");
+  }
+  data->captured_scene_cbv = normalized_scene_cbv;
   const uint32_t fix_mode = ClampXeGTAOFixMode();
   const bool l5_pass_isolation =
       fix_mode >= static_cast<uint32_t>(XeGTAOFixMode::kPassIsolationDiagnostics);
@@ -3899,8 +3945,9 @@ void CaptureTrackedConstantBuffer(
   if (device == nullptr) return;
   auto* data = device->get_private_data<DeviceData>();
   if (data == nullptr) return;
-  if (!IsSceneCbvCandidateValid(device, range)) return;
-  data->captured_scene_cbv = range;
+  reshade::api::buffer_range normalized = {};
+  if (!TryNormalizeSceneCbvRange(device, range, &normalized)) return;
+  data->captured_scene_cbv = normalized;
   data->captured_scene_cbv_valid = true;
   data->captured_scene_cbv_frame = data->present_frame_index;
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kCurrentLighting;
@@ -4291,10 +4338,11 @@ void ResolveXeGTAOInputsFromCurrentBindings(reshade::api::command_list* cmd_list
           if (kLightingSceneCbRegister >= range.dx_register_index
               && kLightingSceneCbRegister < (range.dx_register_index + range.count)) {
             reshade::api::buffer_range cbv = {};
+            reshade::api::buffer_range normalized_cbv = {};
             const uint32_t descriptor_index = kLightingSceneCbRegister - range.dx_register_index;
             if (TryGetBufferRangeFromBoundDescriptorTable(device, table, range, descriptor_index, &cbv)
-                && IsSceneCbvCandidateValid(device, cbv)) {
-              data->captured_scene_cbv = cbv;
+                && TryNormalizeSceneCbvRange(device, cbv, &normalized_cbv)) {
+              data->captured_scene_cbv = normalized_cbv;
               data->captured_scene_cbv_valid = true;
               data->captured_scene_cbv_frame = data->present_frame_index;
               data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kCurrentLighting;
@@ -5297,14 +5345,15 @@ void OnPresentAdvanceFrame(
         AddonLog(
             reshade::log::level::info,
             std::format(
-                "XeGTAO startup mode: fix={}, l5(prefilter={}, main={}, denoise={}, composite={}), probeA={}, probeB={}",
+            "XeGTAO startup mode: fix={}, l5(prefilter={}, main={}, denoise={}, composite={}), probeA={}, probeB={}, fallbacks={}",
                 GetXeGTAOFixModeName(ClampXeGTAOFixMode()),
                 ClampBooleanToggle(xegtao_fix_l5_prefilter),
                 ClampBooleanToggle(xegtao_fix_l5_main),
                 ClampBooleanToggle(xegtao_fix_l5_denoise),
                 ClampBooleanToggle(xegtao_fix_l5_composite),
                 ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22),
-                ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch)));
+                ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch),
+                ClampBooleanToggle(xegtao_enable_fallbacks)));
       }
       const uint64_t frame = data->present_frame_index;
       if (data->xegtao_deferred_dispatch_pending
@@ -5355,7 +5404,9 @@ void OnPresentAdvanceFrame(
             reshade::api::resource_view deferred_mrt_normal_srv =
                 data->xegtao_deferred_mrt_normal_srv;
             bool deferred_mrt_normal_valid = deferred_mrt_normal_srv.handle != 0u;
-            if (!deferred_mrt_normal_valid && fallback_lighting_mrt0.handle != 0u) {
+            if (!deferred_mrt_normal_valid
+                && AreXeGTAOFallbacksEnabled()
+                && fallback_lighting_mrt0.handle != 0u) {
               deferred_mrt_normal_srv = fallback_lighting_mrt0;
               deferred_mrt_normal_valid = true;
             }
@@ -5366,6 +5417,14 @@ void OnPresentAdvanceFrame(
                 data->xegtao_deferred_scene_cbv_valid
                 && data->xegtao_deferred_scene_cbv.buffer.handle != 0u
                 && IsSceneCbvCandidateValid(device, data->xegtao_deferred_scene_cbv);
+            if (deferred_scene_cbv_valid) {
+              reshade::api::buffer_range normalized_deferred_scene_cbv = {};
+              if (TryNormalizeSceneCbvRange(device, data->xegtao_deferred_scene_cbv, &normalized_deferred_scene_cbv)) {
+                data->xegtao_deferred_scene_cbv = normalized_deferred_scene_cbv;
+              } else {
+                deferred_scene_cbv_valid = false;
+              }
+            }
 
             if (!deferred_scene_cbv_valid && data->fallback_scene_cbv_seen) {
               data->captured_scene_cbv = data->xegtao_deferred_scene_cbv;
@@ -5536,6 +5595,7 @@ void OnPresentAdvanceFrame(
   xegtao_probe_a_dispatch_no_t22 = static_cast<float>(ClampBooleanToggle(xegtao_probe_a_dispatch_no_t22));
   xegtao_probe_b_t22_no_dispatch = static_cast<float>(ClampBooleanToggle(xegtao_probe_b_t22_no_dispatch));
   xegtao_runtime_debug_logging = static_cast<float>(ClampBooleanToggle(xegtao_runtime_debug_logging));
+  xegtao_enable_fallbacks = static_cast<float>(ClampBooleanToggle(xegtao_enable_fallbacks));
   g_enable_runtime_addon_logs.store(xegtao_runtime_debug_logging >= 0.5f, std::memory_order_relaxed);
   xegtao_denoiser_mode = 0.f;
   xegtao_isfast_jitter_amount = std::clamp(xegtao_isfast_jitter_amount, 0.f, 1.f);
@@ -6108,6 +6168,19 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
+        .key = "XeGTAOFallbacks",
+        .binding = &xegtao_enable_fallbacks,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Fallbacks",
+        .section = "XeGTAO",
+        .tooltip =
+          "Off disables XeGTAO fallback sources (fallback scene CBV and deferred MRT-normal fallback). On enables those fallback paths.",
+        .labels = {"Off", "On"},
+        .is_enabled = []() { return xegtao_mode >= 0.5f; },
+        .is_visible = []() { return true; },
+      },
+      new renodx::utils::settings::Setting{
         .key = "XeGTAORuntimeDebugLogging",
         .binding = &xegtao_runtime_debug_logging,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
