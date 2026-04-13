@@ -68,6 +68,8 @@ constexpr uint64_t kXeGTAOFallbackStartupQuarantineFrames = 240u;
 constexpr uint64_t kXeGTAOClearStartupGuardFrames = 8u;
 constexpr uint64_t kXeGTAOResizeDispatchGuardFrames = 4u;
 constexpr uint64_t kXeGTAOFallbackSceneCbvMaxAgeFrames = 2u;
+constexpr uint64_t kXeGTAOFallbackPostResizeCooldownFrames = 240u;
+constexpr uint32_t kXeGTAOFallbackSceneCbvRequiredStableFrames = 240u;
 constexpr bool kEnableAddonLogs = false;
 std::atomic_bool g_enable_runtime_addon_logs{false};
 std::atomic_bool g_xegtao_startup_mode_logged{false};
@@ -453,6 +455,8 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   reshade::api::buffer_range fallback_scene_cbv = {};
   bool fallback_scene_cbv_seen = false;
   uint64_t fallback_scene_cbv_frame = kInvalidFrameIndex;
+  uint64_t fallback_scene_cbv_signature = 0u;
+  uint32_t fallback_scene_cbv_stable_count = 0u;
 
   reshade::api::sampler point_clamp_sampler = {};
 
@@ -642,6 +646,7 @@ struct __declspec(uuid("d0ce55f2-f373-4f3a-99ed-f08888d7f11b")) DeviceData {
   bool last_logged_fallback_scene_cbv_seen = false;
   uint64_t last_logged_fallback_scene_cbv_buffer_handle = 0u;
   uint64_t last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
+  uint32_t last_logged_fallback_scene_cbv_stable_count = 0u;
 };
 
 #pragma pack(push, 1)
@@ -998,6 +1003,11 @@ void OnInitDevice(reshade::api::device* device) {
     data->xegtao_volfog_seen_frame = kInvalidFrameIndex;
     data->last_owner_state_valid = false;
     data->last_owner_diag_hash = 0u;
+    data->fallback_scene_cbv = {};
+    data->fallback_scene_cbv_seen = false;
+    data->fallback_scene_cbv_frame = kInvalidFrameIndex;
+    data->fallback_scene_cbv_signature = 0u;
+    data->fallback_scene_cbv_stable_count = 0u;
     data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
     data->resolved_scene_cbv_from_current_bindings = false;
     data->character_sss_current_frame = kInvalidFrameIndex;
@@ -1208,6 +1218,11 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->last_owner_diag_hash = 0u;
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->resolved_scene_cbv_from_current_bindings = false;
+  data->fallback_scene_cbv = {};
+  data->fallback_scene_cbv_seen = false;
+  data->fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->fallback_scene_cbv_signature = 0u;
+  data->fallback_scene_cbv_stable_count = 0u;
   data->last_capture_diag_log_frame = kInvalidFrameIndex;
   data->last_gate_state_valid = false;
   data->last_gate_passed = false;
@@ -1263,6 +1278,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->last_logged_fallback_scene_cbv_seen = false;
   data->last_logged_fallback_scene_cbv_buffer_handle = 0u;
   data->last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->last_logged_fallback_scene_cbv_stable_count = 0u;
 }
 
 void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
@@ -1300,6 +1316,11 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->captured_mrt_normal_srv = {};
   data->captured_scene_cbv_source = XeGTAOSceneCbvSource::kNone;
   data->resolved_scene_cbv_from_current_bindings = false;
+  data->fallback_scene_cbv = {};
+  data->fallback_scene_cbv_seen = false;
+  data->fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->fallback_scene_cbv_signature = 0u;
+  data->fallback_scene_cbv_stable_count = 0u;
   data->last_copyback_frame = kInvalidFrameIndex;
   data->copyback_succeeded = false;
   data->xegtao_copyback_frame = kInvalidFrameIndex;
@@ -1400,6 +1421,7 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   data->last_logged_fallback_scene_cbv_seen = false;
   data->last_logged_fallback_scene_cbv_buffer_handle = 0u;
   data->last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->last_logged_fallback_scene_cbv_stable_count = 0u;
 }
 
 void ReloadIsFastResources(reshade::api::device* device, const char* reason) {
@@ -2023,16 +2045,19 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
   const bool fallback_scene_cbv_seen = data->fallback_scene_cbv_seen && data->fallback_scene_cbv.buffer.handle != 0u;
   const uint64_t fallback_scene_cbv_handle = fallback_scene_cbv_seen ? data->fallback_scene_cbv.buffer.handle : 0u;
   const uint64_t fallback_scene_cbv_frame = fallback_scene_cbv_seen ? data->fallback_scene_cbv_frame : kInvalidFrameIndex;
+  const uint32_t fallback_scene_cbv_stable_count = fallback_scene_cbv_seen ? data->fallback_scene_cbv_stable_count : 0u;
   const bool fallback_scene_cbv_transition =
       data->last_logged_fallback_scene_cbv_seen != fallback_scene_cbv_seen
-      || data->last_logged_fallback_scene_cbv_buffer_handle != fallback_scene_cbv_handle;
+      || data->last_logged_fallback_scene_cbv_buffer_handle != fallback_scene_cbv_handle
+      || data->last_logged_fallback_scene_cbv_stable_count != fallback_scene_cbv_stable_count;
   if (fallback_scene_cbv_transition) {
     std::ostringstream message;
     message << "XeGTAO fallback b0 transition: seen "
             << static_cast<uint32_t>(data->last_logged_fallback_scene_cbv_seen ? 1u : 0u)
             << " -> " << static_cast<uint32_t>(fallback_scene_cbv_seen ? 1u : 0u)
             << ", buffer 0x" << std::hex << data->last_logged_fallback_scene_cbv_buffer_handle
-            << " -> 0x" << fallback_scene_cbv_handle << std::dec;
+            << " -> 0x" << fallback_scene_cbv_handle << std::dec
+            << ", stable_count=" << fallback_scene_cbv_stable_count;
     if (fallback_scene_cbv_seen) {
       message << ", last_seen_frame=" << fallback_scene_cbv_frame;
     }
@@ -2061,6 +2086,7 @@ void LogXeGTAOCaptureDiagnostics(reshade::api::device* device, DeviceData* data)
   data->last_logged_fallback_scene_cbv_seen = fallback_scene_cbv_seen;
   data->last_logged_fallback_scene_cbv_buffer_handle = fallback_scene_cbv_handle;
   data->last_logged_fallback_scene_cbv_frame = fallback_scene_cbv_frame;
+  data->last_logged_fallback_scene_cbv_stable_count = fallback_scene_cbv_stable_count;
 }
 
 XeGTAOMode GetXeGTAOModeSetting() {
@@ -2100,6 +2126,31 @@ uint32_t ClampBooleanToggle(float value) {
 
 bool AreXeGTAOFallbacksEnabled() {
   return ClampBooleanToggle(xegtao_enable_fallbacks) != 0u;
+}
+
+uint64_t BuildSceneCbvSignature(const reshade::api::buffer_range& range) {
+  uint64_t signature = 1469598103934665603ull;
+  signature = HashCombineU64(signature, range.buffer.handle);
+  signature = HashCombineU64(signature, range.offset);
+  signature = HashCombineU64(signature, range.size);
+  return signature;
+}
+
+uint64_t GetXeGTAOFallbackActivationFrame(const DeviceData* data) {
+  uint64_t activation_frame = kXeGTAOFallbackStartupQuarantineFrames;
+  if (data == nullptr) return activation_frame;
+
+  if (data->xegtao_resize_guard_until_frame != 0u) {
+    const uint64_t post_resize_activation_frame =
+        data->xegtao_resize_guard_until_frame + kXeGTAOFallbackPostResizeCooldownFrames;
+    activation_frame = std::max(activation_frame, post_resize_activation_frame);
+  }
+  return activation_frame;
+}
+
+bool IsXeGTAOFallbackActivationBlocked(const DeviceData* data) {
+  if (data == nullptr) return true;
+  return data->present_frame_index < GetXeGTAOFallbackActivationFrame(data);
 }
 
 bool IsXeGTAOFixLevelAtLeast(XeGTAOFixMode level) {
@@ -2186,11 +2237,20 @@ void CacheFallbackSceneCbv(reshade::api::command_list* cmd_list, const reshade::
   auto* data = device->get_private_data<DeviceData>();
   if (data == nullptr) return;
 
-  // Startup quarantine: keep fallback paths dormant during unstable bootstrap.
-  if (data->present_frame_index < kXeGTAOFallbackStartupQuarantineFrames) return;
+  if (IsXeGTAOFallbackActivationBlocked(data)) return;
 
   reshade::api::buffer_range normalized = {};
   if (!TryNormalizeSceneCbvRange(device, range, &normalized)) return;
+
+  const uint64_t signature = BuildSceneCbvSignature(normalized);
+  if (data->fallback_scene_cbv_signature != signature) {
+    data->fallback_scene_cbv_signature = signature;
+    data->fallback_scene_cbv_stable_count = 1u;
+  } else if (data->fallback_scene_cbv_frame != data->present_frame_index
+      && data->fallback_scene_cbv_stable_count < kXeGTAOFallbackSceneCbvRequiredStableFrames) {
+    data->fallback_scene_cbv_stable_count += 1u;
+  }
+
   data->fallback_scene_cbv = normalized;
   data->fallback_scene_cbv_seen = true;
   data->fallback_scene_cbv_frame = data->present_frame_index;
@@ -2200,8 +2260,7 @@ bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
   if (device == nullptr || data == nullptr) return false;
   if (!AreXeGTAOFallbacksEnabled()) return false;
 
-  // Startup quarantine: avoid binding fallback CBV until runtime settles.
-  if (data->present_frame_index < kXeGTAOFallbackStartupQuarantineFrames) return false;
+  if (IsXeGTAOFallbackActivationBlocked(data)) return false;
 
   reshade::api::buffer_range normalized_current = {};
   if (data->captured_scene_cbv_valid
@@ -2225,8 +2284,17 @@ bool TryAdoptFallbackSceneCbv(reshade::api::device* device, DeviceData* data) {
       && data->present_frame_index - data->fallback_scene_cbv_frame > kXeGTAOFallbackSceneCbvMaxAgeFrames) {
     return false;
   }
+
   reshade::api::buffer_range normalized_fallback = {};
   if (!TryNormalizeSceneCbvRange(device, data->fallback_scene_cbv, &normalized_fallback)) return false;
+  const uint64_t fallback_signature = BuildSceneCbvSignature(normalized_fallback);
+  if (data->fallback_scene_cbv_signature != fallback_signature) {
+    data->fallback_scene_cbv_signature = fallback_signature;
+    data->fallback_scene_cbv_stable_count = 1u;
+  }
+  if (data->fallback_scene_cbv_stable_count < kXeGTAOFallbackSceneCbvRequiredStableFrames) {
+    return false;
+  }
 
   data->fallback_scene_cbv = normalized_fallback;
 
@@ -2380,6 +2448,8 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->fallback_scene_cbv = {};
   data->fallback_scene_cbv_seen = false;
   data->fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->fallback_scene_cbv_signature = 0u;
+  data->fallback_scene_cbv_stable_count = 0u;
   data->last_gtao_frame = kInvalidFrameIndex;
   data->last_ao_hook_frame = kInvalidFrameIndex;
   data->last_copyback_frame = kInvalidFrameIndex;
@@ -2501,6 +2571,7 @@ void DestroyXeGTAOState(reshade::api::device* device, DeviceData* data) {
   data->last_logged_fallback_scene_cbv_seen = false;
   data->last_logged_fallback_scene_cbv_buffer_handle = 0u;
   data->last_logged_fallback_scene_cbv_frame = kInvalidFrameIndex;
+  data->last_logged_fallback_scene_cbv_stable_count = 0u;
 }
 
 bool CreateCharacterSssSrv(
@@ -3430,17 +3501,23 @@ bool RunXeGTAOForFrame(
       || data->captured_scene_cbv.buffer.handle == 0u
       || !IsSceneCbvCandidateValid(device, data->captured_scene_cbv)) {
     std::string reason = "lighting scene CB b0 is not captured";
-    if (data->present_frame_index < kXeGTAOFallbackStartupQuarantineFrames) {
+    const uint64_t fallback_activation_frame = GetXeGTAOFallbackActivationFrame(data);
+    if (data->present_frame_index < fallback_activation_frame) {
       reason += std::format(
-          " (fallback startup quarantine active: frame {} < {})",
+          " (fallback activation blocked: frame {} < unlock {})",
           data->present_frame_index,
-          kXeGTAOFallbackStartupQuarantineFrames);
+          fallback_activation_frame);
     } else if (!data->fallback_scene_cbv_seen) {
       reason += " (tracked + fallback cache missing)";
     } else if (!IsSceneCbvCandidateValid(device, data->fallback_scene_cbv)) {
       reason += " (fallback cache rejected by validation)";
     } else if (data->fallback_scene_cbv_frame == kInvalidFrameIndex) {
       reason += " (fallback cache frame is invalid)";
+    } else if (data->fallback_scene_cbv_stable_count < kXeGTAOFallbackSceneCbvRequiredStableFrames) {
+      reason += std::format(
+          " (fallback cache warmup: stable_count={} < {})",
+          data->fallback_scene_cbv_stable_count,
+          kXeGTAOFallbackSceneCbvRequiredStableFrames);
     } else if (data->present_frame_index < kXeGTAOStartupRequireCurrentSceneCbvFrames
         && data->present_frame_index >= data->fallback_scene_cbv_frame
         && data->present_frame_index - data->fallback_scene_cbv_frame > kXeGTAOFallbackSceneCbvMaxAgeFrames) {
@@ -3972,12 +4049,21 @@ void OnPushDescriptorsCaptureLightingTextures(
   const auto shader_hash = shader_state != nullptr
       ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state)
       : 0u;
+  auto* device = cmd_list->get_device();
+  auto* data = device != nullptr ? device->get_private_data<DeviceData>() : nullptr;
   const bool is_tracked_shader =
       shader_hash == kLightingShader || shader_hash == kLightingSoftShader || shader_hash == kCharacterShader;
-  // On D3D11, b0 updates may happen before the tracked lighting hash is visible.
-  // Accept unknown hash as fallback capture source for b0.
+  const bool has_current_frame_tracked_cbv =
+      data != nullptr
+      && data->captured_scene_cbv_valid
+      && data->captured_scene_cbv_source == XeGTAOSceneCbvSource::kCurrentLighting
+      && data->captured_scene_cbv_frame == data->present_frame_index
+      && data->captured_scene_cbv.buffer.handle != 0u;
+  // Unknown hash capture is only allowed while current-frame tracked b0 is still missing.
   const bool allow_fallback_scene_cb_capture =
-      shader_hash == 0u || shader_hash == kLightingShader || shader_hash == kLightingSoftShader;
+      shader_hash == kLightingShader
+      || shader_hash == kLightingSoftShader
+      || (shader_hash == 0u && !has_current_frame_tracked_cbv);
 
   for (uint32_t i = 0; i < update.count; ++i) {
     uint32_t reg = 0u;
@@ -4958,7 +5044,13 @@ bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               }
             } else {
               apply_gate_source = "tracked_fallback";
-              if (!tracked_t3_info.alive || tracked_t3_info.resource.handle == 0u
+              const uint64_t fallback_activation_frame = GetXeGTAOFallbackActivationFrame(data);
+              if (frame < fallback_activation_frame) {
+                apply_gate_reason = std::format(
+                    "tracked fallback apply blocked (frame {} < unlock {})",
+                    frame,
+                    fallback_activation_frame);
+              } else if (!tracked_t3_info.alive || tracked_t3_info.resource.handle == 0u
                   || tracked_t3_info.resource_desc.type != reshade::api::resource_type::texture_2d) {
                 apply_gate_reason = "tracked fallback t3 is invalid";
               } else if (!tracked_t4_info.alive || tracked_t4_info.resource.handle == 0u
