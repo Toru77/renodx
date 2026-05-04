@@ -204,6 +204,27 @@ Texture2D<float4> texSSRMap_g : register(t24);
 // 3Dmigoto declarations
 #define cmp -
 
+// Helper function: Apply environment screen-space shadows with brightness rejection
+void ApplyEnvSSS(inout float3 color, float sss_shadow_sample)
+{
+  if (shader_injection_data.env_sss_enabled >= 0.5) {
+    float brightness_reject = shader_injection_data.env_sss_bright_reject_threshold;
+    float brightness_fade = max(shader_injection_data.env_sss_bright_reject_fade, 1e-5);
+    float pixel_luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+    float bright_mask = smoothstep(brightness_reject, brightness_reject + brightness_fade, pixel_luma);
+    float env_shadow = lerp(sss_shadow_sample, 1.0, bright_mask);
+    
+    if (shader_injection_data.debug_show_env_sss >= 0.5) {
+      color = float3(0.5, 0.5, 0.5) * env_shadow;
+    } else {
+      color *= env_shadow;
+    }
+  }
+}
+
+// 3Dmigoto declarations
+#define cmp -
+
 
 void main(
   float4 v0 : SV_Position0,
@@ -476,16 +497,8 @@ void main(
       r4.yzw = r0.xyz * mapAOColor_g.xyz + -r0.xyz;
       r6.xyz = r1.www * r4.yzw + r0.xyz;
     }
-      float brightness_reject = shader_injection_data.foliage_sss_bright_reject_threshold;
-      float brightness_fade = max(shader_injection_data.foliage_sss_bright_reject_fade, 1e-5);
-      float pixel_luma = dot(r6.xyz, float3(0.2126, 0.7152, 0.0722));
-      float bright_mask = smoothstep(brightness_reject, brightness_reject + brightness_fade, pixel_luma);
-      float env_shadow = lerp(sss_shadow_sample, 1.0, bright_mask);
-      if (shader_injection_data.debug_show_env_sss >= 0.5) {
-        r6.xyz = float3(0.5, 0.5, 0.5) * env_shadow;
-      } else if (shader_injection_data.foliage_sss_enabled >= 0.5) {
-        r6.xyz *= env_shadow;
-      }
+    // Apply environment SSS early in pipeline (before other effects)
+    ApplyEnvSSS(r6.xyz, sss_shadow_sample);
     r6.w = r0.w;
     o0.xyzw = r6.xyzw;
     o1.xyzw = r2.xyzw;
@@ -1041,18 +1054,8 @@ void main(
   r0.y = mapAOIntensity_g * r0.y;
   r3.yzw = r2.xyw * mapAOColor_g.xyz + -r2.xyw;
   r0.yzw = r0.yyy * r3.yzw + r2.xyw;
-  if (!is_character_pixel) {
-    float brightness_reject = shader_injection_data.foliage_sss_bright_reject_threshold;
-    float brightness_fade = max(shader_injection_data.foliage_sss_bright_reject_fade, 1e-5);
-    float pixel_luma = dot(r0.yzw, float3(0.2126, 0.7152, 0.0722));
-    float bright_mask = smoothstep(brightness_reject, brightness_reject + brightness_fade, pixel_luma);
-    float env_shadow = lerp(sss_shadow_sample, 1.0, bright_mask);
-    if (shader_injection_data.debug_show_env_sss >= 0.5) {
-      r0.yzw = float3(0.5, 0.5, 0.5) * env_shadow;
-    } else if (shader_injection_data.foliage_sss_enabled >= 0.5) {
-      r0.yzw *= env_shadow;
-    }
-  }
+  // Apply environment SSS to all pixels (not just non-character)
+  ApplyEnvSSS(r0.yzw, sss_shadow_sample);
   r1.y = -fogNearDistance_g + -r3.x;
   r1.y = saturate(fogFadeRangeInv_g * r1.y);
   r1.w = -fogHeight_g + r5.y;
