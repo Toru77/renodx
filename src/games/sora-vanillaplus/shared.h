@@ -9,14 +9,45 @@ struct ShaderInjectData {
   float slider_3;
   // Volumetric haze AA mode: 0 = Vanilla, 1 = Improved (tricubic haze AA)
   float volfog_haze_aa_mode;
+
+  // Character Shadowing
+  float char_shadow_mode;
+  float char_shadow_sample_count;
+  float char_shadow_hard_shadow_samples;
+  float char_shadow_fade_out_samples;
+  float char_shadow_surface_thickness;
+  float char_shadow_contrast;
+  float char_shadow_light_screen_fade_start;
+  float char_shadow_light_screen_fade_end;
+  float char_shadow_min_occluder_depth_scale;
+  float char_shadow_jitter_enabled;
+  // Shadow type: 0 = Camera, 1 = World, 2 = Combined
+  float char_shadow_type;
+  // Per-pass strengths (0..1).
+  float char_shadow_camera_strength;
+  float char_shadow_world_strength;
+
+  // Screen Space Shadows
+  float foliage_sss_enabled;
+  float foliage_sss_strength;
+  float foliage_sss_sample_count;
+  float foliage_sss_surface_thickness;
+  float foliage_sss_contrast;
+  float foliage_sss_jitter_enabled;
+  float foliage_sss_height_enabled;
+  float foliage_sss_height_min;
+  float foliage_sss_height_max;
+  float foliage_sss_height_fade;
+  float foliage_sss_vertical_reject;
+  float foliage_sss_max_darkening;
+  float foliage_sss_bright_reject_threshold;
+  float foliage_sss_bright_reject_fade;
+  // Debug views (0 = off, 1 = on)
+  float debug_show_env_sss;
 };
 
 #ifndef __cplusplus
-#if ((__SHADER_TARGET_MAJOR == 5 && __SHADER_TARGET_MINOR >= 1) || __SHADER_TARGET_MAJOR >= 6)
-cbuffer shader_injection : register(b13, space0) {
-#else
 cbuffer shader_injection : register(b13) {
-#endif
   ShaderInjectData shader_injection_data : packoffset(c0);
 }
 
