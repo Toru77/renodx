@@ -198,6 +198,8 @@ Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
 
+#include "../shared.h"
+
 
 // 3Dmigoto declarations
 #define cmp -
@@ -235,6 +237,8 @@ void main(
   r3.zw = float2(0,0);
   r3.xy = mrtTexture2.Load(r3.xyz).xy;
   r4.xyz = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
+  float sss_shadow_sample = saturate(ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).w);
+  bool is_character_pixel = (((uint)r1.z & 8u) != 0u);
   r1.w = (int)r1.z & 8;
   if (r1.w == 0) {
     r5.yz = (uint2)r3.xx >> int2(5,10);
@@ -472,6 +476,16 @@ void main(
       r4.yzw = r0.xyz * mapAOColor_g.xyz + -r0.xyz;
       r6.xyz = r1.www * r4.yzw + r0.xyz;
     }
+      float brightness_reject = shader_injection_data.foliage_sss_bright_reject_threshold;
+      float brightness_fade = max(shader_injection_data.foliage_sss_bright_reject_fade, 1e-5);
+      float pixel_luma = dot(r6.xyz, float3(0.2126, 0.7152, 0.0722));
+      float bright_mask = smoothstep(brightness_reject, brightness_reject + brightness_fade, pixel_luma);
+      float env_shadow = lerp(sss_shadow_sample, 1.0, bright_mask);
+      if (shader_injection_data.debug_show_env_sss >= 0.5) {
+        r6.xyz = float3(0.5, 0.5, 0.5) * env_shadow;
+      } else if (shader_injection_data.foliage_sss_enabled >= 0.5) {
+        r6.xyz *= env_shadow;
+      }
     r6.w = r0.w;
     o0.xyzw = r6.xyzw;
     o1.xyzw = r2.xyzw;
@@ -535,8 +549,8 @@ void main(
   r4.y = deferredParams_g[r1.x].glowLumThreshold;
   r4.z = deferredParams_g[r1.x].glowShadowFadeRatio;
   r4.w = deferredParams_g[r1.x].ssaoIntensity;
-  r1.x = deferredParams_g[r1.x].ssrDistance;
   r1.w = deferredParams_g[r1.x].flag;
+  r1.x = deferredParams_g[r1.x].ssrDistance;
   r11.w = r12.x;
   r15.xz = r11.yz;
   r15.yw = r12.yz;
@@ -583,7 +597,7 @@ void main(
   r3.z = r8.w * r3.w;
   r6.z = dot(r6.xyw, r15.xyz);
   r16.xyzw = (int4)r1.wwww & int4(1,2,4,16);
-  r0.w = r16.x ? 1.0f : r0.w;
+  r0.w = r16.x ? r0.w : 1.0f;
   r17.xyz = r12.xyz * r1.yyy + -lightDirection_g.xyz;
   r8.w = dot(r17.xyz, r17.xyz);
   r8.w = rsqrt(r8.w);
@@ -1027,6 +1041,18 @@ void main(
   r0.y = mapAOIntensity_g * r0.y;
   r3.yzw = r2.xyw * mapAOColor_g.xyz + -r2.xyw;
   r0.yzw = r0.yyy * r3.yzw + r2.xyw;
+  if (!is_character_pixel) {
+    float brightness_reject = shader_injection_data.foliage_sss_bright_reject_threshold;
+    float brightness_fade = max(shader_injection_data.foliage_sss_bright_reject_fade, 1e-5);
+    float pixel_luma = dot(r0.yzw, float3(0.2126, 0.7152, 0.0722));
+    float bright_mask = smoothstep(brightness_reject, brightness_reject + brightness_fade, pixel_luma);
+    float env_shadow = lerp(sss_shadow_sample, 1.0, bright_mask);
+    if (shader_injection_data.debug_show_env_sss >= 0.5) {
+      r0.yzw = float3(0.5, 0.5, 0.5) * env_shadow;
+    } else if (shader_injection_data.foliage_sss_enabled >= 0.5) {
+      r0.yzw *= env_shadow;
+    }
+  }
   r1.y = -fogNearDistance_g + -r3.x;
   r1.y = saturate(fogFadeRangeInv_g * r1.y);
   r1.w = -fogHeight_g + r5.y;
