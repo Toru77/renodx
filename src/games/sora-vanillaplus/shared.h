@@ -27,21 +27,21 @@ struct ShaderInjectData {
   float char_shadow_camera_strength;
   float char_shadow_world_strength;
 
-  // Screen Space Shadows
-  float foliage_sss_enabled;
-  float foliage_sss_strength;
-  float foliage_sss_sample_count;
-  float foliage_sss_surface_thickness;
-  float foliage_sss_contrast;
-  float foliage_sss_jitter_enabled;
-  float foliage_sss_height_enabled;
-  float foliage_sss_height_min;
-  float foliage_sss_height_max;
-  float foliage_sss_height_fade;
-  float foliage_sss_vertical_reject;
-  float foliage_sss_max_darkening;
-  float foliage_sss_bright_reject_threshold;
-  float foliage_sss_bright_reject_fade;
+  // Environment Screen Space Shadows
+  float env_sss_enabled;
+  float env_sss_strength;
+  float env_sss_sample_count;
+  float env_sss_surface_thickness;
+  float env_sss_contrast;
+  float env_sss_jitter_enabled;
+  float env_sss_height_enabled;
+  float env_sss_height_min;
+  float env_sss_height_max;
+  float env_sss_height_fade;
+  float env_sss_vertical_reject;
+  float env_sss_max_darkening;
+  float env_sss_bright_reject_threshold;
+  float env_sss_bright_reject_fade;
   // Debug views (0 = off, 1 = on)
   float debug_show_env_sss;
 };

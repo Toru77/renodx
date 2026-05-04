@@ -100,18 +100,18 @@ static float3 DecodeNormalFromMrt(uint2 packed)
   return float3(cs * xy_len, sn * xy_len, enc.y);
 }
 
-static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
+static float ComputeEnvSunShadow(float2 uv, float3 normalWS)
 {
-  int sampleCount = max((int)round(shader_injection_data.foliage_sss_sample_count), 1);
+  int sampleCount = max((int)round(shader_injection_data.env_sss_sample_count), 1);
   int hardShadowSamples = max(sampleCount / 8, 1);
   int fadeOutSamples = max(sampleCount / 3, 1);
   if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
     fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
   }
 
-  float surfaceThickness = max(shader_injection_data.foliage_sss_surface_thickness, 1e-5);
-  float shadowContrast = max(shader_injection_data.foliage_sss_contrast, 0.0);
-  bool useJitter = shader_injection_data.foliage_sss_jitter_enabled >= 0.5;
+  float surfaceThickness = max(shader_injection_data.env_sss_surface_thickness, 1e-5);
+  float shadowContrast = max(shader_injection_data.env_sss_contrast, 0.0);
+  bool useJitter = shader_injection_data.env_sss_jitter_enabled >= 0.5;
 
   float startDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * uv, 0).x;
   if (startDepth <= CHAR_SHADOW_FAR_DEPTH_VALUE) {
@@ -142,8 +142,8 @@ static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
   worldPos.z = dot(viewPos4, viewInv_g._m02_m12_m22_m32);
 
   float foliageHeightMask = 1.0;
-  if (shader_injection_data.foliage_sss_height_enabled >= 0.5) {
-    float searchPixels = max(shader_injection_data.foliage_sss_height_max, 1.0);
+  if (shader_injection_data.env_sss_height_enabled >= 0.5) {
+    float searchPixels = max(shader_injection_data.env_sss_height_max, 1.0);
     float2 groundUV = uv + float2(0.0, searchPixels * invVPSize_g.y);
     groundUV = saturate(groundUV);
 
@@ -165,8 +165,8 @@ static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
 
     float heightAboveGround = abs(worldPos.y - groundWorldPos.y);
 
-    float heightThreshold = max(shader_injection_data.foliage_sss_height_min, 0.0);
-    float heightFade = max(shader_injection_data.foliage_sss_height_fade, 1e-5);
+    float heightThreshold = max(shader_injection_data.env_sss_height_min, 0.0);
+    float heightFade = max(shader_injection_data.env_sss_height_fade, 1e-5);
     foliageHeightMask = 1.0 - smoothstep(heightThreshold, heightThreshold + heightFade, heightAboveGround);
 
     if (foliageHeightMask <= 1e-4) {
@@ -180,7 +180,7 @@ static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
   }
   float3 pixelToLightWS = -lightDirection_g.xyz * rsqrt(lightDirLenSq);
 
-  float verticalReject = shader_injection_data.foliage_sss_vertical_reject;
+  float verticalReject = shader_injection_data.env_sss_vertical_reject;
   if (verticalReject > 0.0) {
     float uprightness = abs(normalDirWS.y);
     float verticalMask = smoothstep(verticalReject - 0.1, verticalReject + 0.1, uprightness);
@@ -265,7 +265,7 @@ static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
   float result = dot(shadowValue, 0.25);
   result = min(result, hardShadow);
 
-  float maxDarkening = saturate(shader_injection_data.foliage_sss_max_darkening);
+  float maxDarkening = saturate(shader_injection_data.env_sss_max_darkening);
   result = max(result, 1.0 - maxDarkening);
 
   float validSampleFade = saturate((float)validSamples / (float)sampleCount);
@@ -839,10 +839,12 @@ void main(
     r5.y = 0;
     r4.z = 1;
     r4.w = 1;
-    if (shader_injection_data.foliage_sss_enabled >= 0.5) {
+    // Extract and apply environment SSS computation (Bend Studio algorithm)
+    if (shader_injection_data.env_sss_enabled >= 0.5) {
       float3 envNormal = DecodeNormalFromMrt(mrt0_xy_raw);
-      float envShadow = ComputeFoliageSunShadow(v1.zw, envNormal);
-      float envStrength = saturate(shader_injection_data.foliage_sss_strength);
+      // ComputeEnvSunShadow: dedicated function for environment screen-space shadows
+      float envShadow = ComputeEnvSunShadow(v1.zw, envNormal);
+      float envStrength = saturate(shader_injection_data.env_sss_strength);
       envShadow = lerp(1.0, envShadow, envStrength);
       r4.w = envShadow;
     }
