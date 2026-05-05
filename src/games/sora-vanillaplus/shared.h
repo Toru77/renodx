@@ -42,7 +42,7 @@ struct ShaderInjectData {
   float env_sss_max_darkening;
   float env_sss_bright_reject_threshold;
   float env_sss_bright_reject_fade;
-  // Debug views (0 = off, 1 = on)
+  // Debug view mode (0 = off, 1..4 = inspection views)
   float debug_show_env_sss;
 };
 
