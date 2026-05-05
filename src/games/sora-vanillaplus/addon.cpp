@@ -390,12 +390,12 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DebugShowEnvSSS",
       .binding = &shader_injection.debug_show_env_sss,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f,
-      .label = "Show Env SSS",
+      .label = "Env SSS Debug View",
       .section = "Environment Screen Space Shadows",
-      .tooltip = "Show final environment SSS on a gray background for debugging.",
-      .labels = {"Off", "On"},
+      .tooltip = "0=Off, 1=Final shadow, 2=Character mask, 3=Surface normal, 4=Raw shadow.",
+      .labels = {"Off", "Final Shadow", "Character Mask", "Surface Normal", "Raw Shadow"},
     },
     
 };

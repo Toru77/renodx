@@ -839,15 +839,7 @@ void main(
     r5.y = 0;
     r4.z = 1;
     r4.w = 1;
-    // Extract and apply environment SSS computation (Bend Studio algorithm)
-    if (shader_injection_data.env_sss_enabled >= 0.5) {
-      float3 envNormal = DecodeNormalFromMrt(mrt0_xy_raw);
-      // ComputeEnvSunShadow: dedicated function for environment screen-space shadows
-      float envShadow = ComputeEnvSunShadow(v1.zw, envNormal);
-      float envStrength = saturate(shader_injection_data.env_sss_strength);
-      envShadow = lerp(1.0, envShadow, envStrength);
-      r4.w = envShadow;
-    }
+    // Env SSS is extracted to the lighting pass.
   }
   r4.xy = float2(1,1) + -r5.xy;
   r1.x = dot(r0.xyzw, viewProjInv_g._m00_m10_m20_m30);
