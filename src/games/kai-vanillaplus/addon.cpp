@@ -4117,25 +4117,19 @@ bool TryGetResourceViewFromBoundDescriptorTable(
   auto heap_pair = descriptor_data->heaps.find(heap.handle);
   if (heap_pair == descriptor_data->heaps.end()) return false;
 
-  auto known_pair = descriptor_data->resource_view_heap_locations.find(heap.handle);
-  if (known_pair == descriptor_data->resource_view_heap_locations.end()) return false;
-
   const uint32_t offset = base_offset + descriptor_index;
   const auto& heap_entries = heap_pair->second;
   if (offset >= heap_entries.size()) return false;
-  if (!known_pair->second.contains(offset)) return false;
 
-  const auto& [descriptor_type, descriptor_value] = heap_entries[offset];
+  const auto& descriptor = heap_entries[offset];
   reshade::api::resource_view view = {};
-  switch (descriptor_type) {
+  switch (descriptor.type) {
     case reshade::api::descriptor_type::sampler_with_resource_view:
-      view = std::get<reshade::api::sampler_with_resource_view>(descriptor_value).view;
-      break;
     case reshade::api::descriptor_type::buffer_shader_resource_view:
     case reshade::api::descriptor_type::texture_shader_resource_view:
     case reshade::api::descriptor_type::buffer_unordered_access_view:
     case reshade::api::descriptor_type::texture_unordered_access_view:
-      view = std::get<reshade::api::resource_view>(descriptor_value);
+      view = descriptor.resource_view;
       break;
     default:
       return false;
@@ -4174,13 +4168,13 @@ bool TryGetBufferRangeFromBoundDescriptorTable(
   const auto& heap_entries = heap_pair->second;
   if (offset >= heap_entries.size()) return false;
 
-  const auto& [descriptor_type, descriptor_value] = heap_entries[offset];
-  if (descriptor_type != reshade::api::descriptor_type::constant_buffer
-      && descriptor_type != reshade::api::descriptor_type::shader_storage_buffer) {
+  const auto& descriptor = heap_entries[offset];
+  if (descriptor.type != reshade::api::descriptor_type::constant_buffer
+      && descriptor.type != reshade::api::descriptor_type::shader_storage_buffer) {
     return false;
   }
 
-  const auto buffer_range = std::get<reshade::api::buffer_range>(descriptor_value);
+  const auto buffer_range = descriptor.buffer_range;
   if (buffer_range.buffer.handle == 0u) return false;
   *out_range = buffer_range;
   return true;
