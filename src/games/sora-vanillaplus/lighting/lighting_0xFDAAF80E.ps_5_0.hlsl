@@ -183,6 +183,7 @@ Texture2D<uint4> mrtTexture1 : register(t2);
 Texture2D<uint2> mrtTexture2 : register(t3);
 Texture2D<float4> depthTexture : register(t4);
 Texture2D<float4> ssaoTexture : register(t5);
+Texture2D<uint4> xegtaoTexture : register(t22);  // XeGTAO AO (r32_uint, packed 0-255)
 StructuredBuffer<DeferredParam> deferredParams_g : register(t6);
 StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t7);
 Texture2D<float4> outlineShapeMask : register(t8);
@@ -237,7 +238,69 @@ void main(
   r3.xy = (int2)r3.xy;
   r3.zw = float2(0,0);
   r3.xy = mrtTexture2.Load(r3.xyz).xy;
-  r4.xyz = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
+  // Sample AO: always read vanilla SSAO first, then conditionally
+  // replace only the .x channel with XeGTAO (kai-vanillaplus pattern).
+  float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
+  bool xegtao_bound = shader_injection_data.xegtao_dedicated_bound > 0.5f;
+
+  float3 ao_sample = ssao_sample;
+  if (xegtao_bound) {
+    // r32_uint texture — must Load (no Sample on integer formats).
+    uint width, height;
+    xegtaoTexture.GetDimensions(width, height);
+    uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
+    uint4 xegtao_raw = xegtaoTexture.Load(int3(texel, 0));
+    ao_sample.x = float(xegtao_raw.x & 0xFFu) / 255.0;
+  }
+  r4.xyz = ao_sample;
+
+  // —— XeGTAO Debug View ——
+  // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
+  if (shader_injection_data.xegtao_debug_view > 0.5f) {
+    int mode = (int)shader_injection_data.xegtao_debug_view;
+    float hdr_scale = 0.05;
+    if (mode == 1) {
+      // AO Only: greyscale AO
+      o0.rgb = float3(ao_sample.x, ao_sample.x, ao_sample.x) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (mode == 2) {
+      // XeGTAO Raw: uint4.x decoded directly
+      uint width, height;
+      xegtaoTexture.GetDimensions(width, height);
+      uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
+      uint4 raw = xegtaoTexture.Load(int3(texel, 0));
+      float raw_ao = float(raw.x & 0xFFu) / 255.0;
+      o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (mode == 3) {
+      // XeGTAO Raw RGBA: uint4 channels decoded directly
+      uint width, height;
+      xegtaoTexture.GetDimensions(width, height);
+      uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
+      uint4 raw = xegtaoTexture.Load(int3(texel, 0));
+      o0.rgba = float4(
+        float(raw.x & 0xFFu) / 255.0,
+        float(raw.y & 0xFFu) / 255.0,
+        float(raw.z & 0xFFu) / 255.0,
+        float(raw.w & 0xFFu) / 255.0
+      ) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (mode == 4) {
+      // Vanilla SSAO: t5.x greyscale
+      float s = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).x;
+      o0.rgb = float3(s, s, s) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (mode == 5) {
+      // Depth: t4.x greyscale
+      float d = depthTexture.SampleLevel(samLinear_s, v1.xy, 0).x;
+      o0.rgb = float3(d, d, d) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+  }
   bool is_character_pixel = (((uint)r1.z & 8u) == 0u);
   uint2 mrt0_xy_raw = (uint2)r1.xy;
   r1.w = (int)r1.z & 8;

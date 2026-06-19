@@ -714,7 +714,11 @@ void main(
     r2.w = 1 + -r1.x;
     r4.z = r1.y * r2.w + r1.x;
   } else {
-    if (mapAOSampleCount_g != 0) {
+    // When XeGTAO is active, skip the vanilla map AO loop for performance.
+    // Character screen-space shadows are preserved (they run in the char pixel path above).
+    if (shader_injection_data.xegtao_mode > 0.5f) {
+      r5.x = 0.0;  // Neutral AO (no darkening from vanilla path)
+    } else if (mapAOSampleCount_g != 0) {
       r1.w = (uint)r1.z >> 8;
       r1.xy = (int2)r1.zw & int2(255,255);
       r1.xy = (uint2)r1.xy;
