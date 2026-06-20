@@ -1562,11 +1562,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!make_layout(3u, 1u, &d->ssgi_layout)) return false;
   if (!d->denoise_pipeline.handle) { /* placeholder — denoise_pipeline already created above */ }
   if (!make_layout(2u, 1u, &d->ssgi_denoise_layout)) return false;
-  if (!d->ssgi_pipeline.handle)
-    mkcs(__xegtao_ssgi, "main", d->ssgi_layout, &d->ssgi_pipeline);
-  if (!d->ssgi_denoise_pipeline.handle)
-    mkcs(__xegtao_ssgi_denoise, "main", d->ssgi_denoise_layout, &d->ssgi_denoise_pipeline);
-
   return d->prefilter_pipeline.handle && d->main_high_pipeline.handle
       && d->denoise_pipeline.handle && d->denoise_last_pipeline.handle;
 }

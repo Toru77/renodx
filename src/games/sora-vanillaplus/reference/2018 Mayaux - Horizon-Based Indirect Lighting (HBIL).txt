@@ -1,0 +1,1193 @@
+Horizon-Based Indirect Lighting (HBIL)
+The ideal companion for your far-field indirect lighting solution.
+March 2018 – Benoît “Patapom” Mayaux.
+benoit.mayaux@gmail.com
+
+1
+
+In the following document, vectors will be written in boldface characters (e.g. 𝒙, 𝛚𝐢 ), world-space vectors will be
+̂ 𝐨, 𝒙
+̂ ) and scalar values will use regular characters (e.g. 𝑎, 𝜋, 𝜃).
+noted as a hat vector (e.g. 𝛚
+The spherical coordinates used throughout the paper have an elevation angle 𝜃 aligned with the vertical Z axis, and an
+azimuthal angle 𝜑 lying in the tangent plane measured from axis X:
+
+FIGURE 1. THE FRAME FOR SPHERICAL COORDINATES USED IN THIS PAPER.
+
+1. Introduction
+In this paper we are presenting a new real-time, screen-space technique that can be easily integrated into existing
+rendering pipelines and that drastically improves the quality of the lighting by adding an important near-field
+illumination term. It exploits a reprojection of the radiance from one frame to another to provide a theoretically
+infinite amount of light bounces and at the same time keeps a tight frame budget since it basically relies on the same
+foundation as the Horizon-Based Ambient Occlusion (HBAO) technique introduced by Bavoil et al. [1] except it uses
+the information gathered while computing the horizon to its maximum potential.
+HBAO already improves upon the traditional Ambient Occlusion integral by skipping the computation of rays that
+wouldn’t contribute to the visibility term because they are below the geometric horizon and would therefore intersect
+the nearby geometry:
+
+2
+
+FIGURE 2. THE HBAO ALGORITHM IS EXPLOITING THE FULL VISIBILITY OF THE HORIZON CONE OF ANGLE
+𝛼: WE KNOW ALL THE GREEN RAYS INSIDE THE CONE ESCAPE THE SURFACE OF THE HEIGHTFIELD AND ARE
+THE ONLY ONES ACTUALLY CONTRIBUTING TO THE VISIBILITY TERM. THE RED RAYS, BELOW THE
+GEOMETRIC HORIZON HIT THE HEIGHT FIELD AND BRING NO ACTUAL CONTRIBUTION TO VISIBILITY .
+
+The ambient occlusion term is normally written:
+𝐴𝑂(𝒙) =
+
+1
+∫ V(𝒙, 𝛚𝐢 ) ⅆωi
+2𝜋 Ω+
+
+(𝟏)
+
+With:
+•
+•
+•
+•
+•
+
+𝒙 the location of the pixel for which we are calculating the AO
+𝛚𝐢 the incoming ray direction
+Ω+ the upper hemisphere of directions whose solid angle is 2𝜋
+ⅆωi the portion of solid angle covered by the 𝛚𝐢 vector
+V(𝒙, 𝛚𝐢 ) the visibility term returning 1 if the ray escapes to infinity, 0 if the ray intersects the heightfield
+
+3
+
+Thanks to HBAO, it gets simplified into:
+2𝜋
+
+𝜃ℎ (𝜑)
+1
+∫ ∫
+𝐴𝑂(𝒙) =
+sin(𝜃) ⅆ𝜃 ⅆ𝜑
+2𝜋
+0
+0
+
+Where 𝜃ℎ (𝜑) is the horizon angle for each azimuthal direction 𝜑.
+This technique allows us to avoid tracing rays for the entire hemisphere, instead we simply need to determine the
+horizon angle 𝜃ℎ (𝜑) for a particular azimuthal angle 𝜑 by sampling the height field in screen space:
+
+FIGURE 3. THE HEIGHTFIELD IS SAMPLED ALONG THE X DIRECTION AND THE HORIZON IS UPDATED
+ALONG THE WAY BY REDUCING THE HORIZON ANGLE 𝜃ℎ EACH TIME.
+
+The portion of AO computed by the inner integral is then:
+𝜃ℎ (𝜑)
+
+∫
+
+sin(𝜃) ⅆ𝜃 = 1 − cos(𝜃ℎ (𝜑))
+
+0
+
+And so, the final expression for the AO becomes:
+𝐴𝑂(𝒙) = 1 −
+
+1 2𝜋
+∫ cos(𝜃ℎ (𝜑)) ⅆ𝜑
+2𝜋 0
+4
+
+At runtime, the integral is discretized into a series of 𝑆 azimuthal “slices” for which we must find the horizon angle:
+𝑆
+
+1
+𝐴𝑂(𝒙) ≈ 1 − ∑ cos(𝜃ℎ (𝜑))
+𝑆
+
+1.1. Camera Spaces
+When computing HBAO, we are actually dealing with two different camera spaces:
+•
+
+̂, 𝒀
+̂, 𝒁
+̂ are the world-space camera
+The global camera space given by our standard view transform where 𝑿
+“right”, “up” and “at” vectors respectively.
+
+•
+
+The local camera space that is reconstructed from the view vector and the camera’s up vector.
+
+FIGURE 4. THE LOCAL AND GLOBAL CAMERA SPACES. IN ORDER TO AVOID CAMERA-SPACE NORMAL
+VECTORS WITH NEGATIVE Z COMPONENTS, A LOCAL CAMERA SPACE CENTERED ON THE SAMPLING
+̂ IS RECONSTRUCTED FROM THE LOCAL VIEW VECTOR 𝝎
+̂𝒐 .
+LOCATION 𝒙
+
+In order to avoid getting a camera-space normal with a negative z component, we must construct a “local” camera
+̂:
+space specifically for our sampling location 𝒙
+5
+
+̂𝒙 =
+𝝎
+
+̂×𝝎
+̂𝒐
+𝒀
+̂×𝝎
+̂ 𝒐‖
+‖𝒀
+
+̂𝒚 = 𝝎
+̂𝒐 × 𝝎
+̂𝒙
+𝝎
+Where:
+̂ −𝒙
+̂
+𝒙
+𝒄 −𝒙
+
+•
+
+̂ 𝒐 = ‖𝒙̂𝒄 ̂‖ is the normalized local view vector pointing from our world-space location 𝒙
+̂ toward the world𝝎
+
+•
+
+̂𝒄
+space camera position 𝒙
+̂ 𝒙, 𝝎
+̂ 𝒚 are the reconstructed local “right” and “up” vectors respectively
+𝝎
+
+1.2. Slice Space
+The local camera space being setup, this will serve as our working reference frame where we can start subdividing the
+hemisphere of the HBAO algorithm into multiple slices, as shown in the figure below:
+
+FIGURE 5. THE HEMISPHERE OF DIRECTIONS FROM EQUATION (1) IS SUBDIVIDED INTO MULTIPLE SLICES.
+̂ (𝜑).
+EACH SLICE’S TANGENT DIRECTION IS GIVEN BY THE WORLD VECTOR 𝑫
+
+6
+
+We will subdivide the hemisphere Ω+ into multiple azimuthal slices whose tangent directions are given by:
+̂ (𝜑) = cos(𝜑) 𝝎
+̂ 𝒙 + sin(𝜑) 𝝎
+̂𝒚
+𝑫
+Where 𝜑 is the azimuthal angle for the slice.
+In local camera space, the slice’s direction and outgoing view vector are simply given by:
+cos(𝜑)
+𝑫(𝜑) = { sin(𝜑)
+0
+0
+𝝎𝒐 = {0
+1
+We will further need an additional space called the “slice space” which is the 2D plane of a specific slice that is defined
+by the canonical directions:
+1
+𝑫′ = {
+0
+0
+𝝎′𝒐 = {
+1
+In slice space, the central location of our sampling point is simply:
+0
+𝒙′ = {
+0
+̂ into the slice, shown in figure 6, is given by:
+And the projection of the world-space normal vector 𝒏
+𝒏′ = {
+
+𝑛𝑥
+̂ (𝜑)
+̂∙𝑫
+𝒏
+= {𝑛
+𝑦
+̂∙𝝎
+̂𝒐
+𝒏
+
+(𝟐)
+
+7
+
+̂ (𝜑) IS THE TANGENT
+̂ 𝟎 AXIS. 𝑫
+FIGURE 6. A SAMPLING SLICE ROTATING BY AN ANGLE 𝜑 ABOUT THE 𝝎
+̂ IS
+DIRECTION OF THE SLICE. WE POINT OUT THE IMPORTANT FACT THAT THE WORLD-SPACE NORMAL 𝒏
+NOT NECESSARILY LYING IN THE PLANE OF THE SLICE AND NEEDS TO BE PROJECTED ONTO THE SLICE,
+̂ (𝜑) ONTO THE NORMAL PLANE GIVES US
+YIELDING THE 𝒏′ VECTOR. WE NOTICE THAT PROJECTING 𝑫
+INITIAL VALUES FOR THE HORIZON ANGLES 𝜃𝑓𝑟𝑜𝑛𝑡 AND 𝜃𝑏𝑎𝑐𝑘 (THIS IS DISCUSSED IN SECTION 2.1).
+
+8
+
+1.3. Computing Horizon Angles
+Special care must be observed when taking screen-space horizon angles –computed by sampling the depth buffer,
+̂ axis– into local camera-space horizon angles 𝜃 expressed
+whose Z values are expressed along the global camera 𝒁
+̂ 𝒐:
+from the local view axis 𝝎
+
+FIGURE 7. CORRECTION SETUP TO TRANSFORM CAMERA-SPACE HORIZON ANGLES INTO ACTUAL SLICESPACE HORIZON ANGLES.
+
+9
+
+̂𝟏 away from our central location 𝒙
+̂ while walking along a slice.
+Let’s imagine we are sampling a new location 𝒙
+̂ and 𝒀
+̂ tangent axes), we moved 𝑟 units away from our
+In screen space (i.e. in the camera plane defined by the 𝑿
+central location where we sample our new depth value (relative to our central location’s depth) 𝑧 and we obtain the
+angle 𝛽.
+̂, 𝒙
+̂𝟏 ) forms with our view direction
+Unfortunately, we are rather interested by the horizon angle 𝜃 that the red axis (𝒙
+̂.
+̂ 𝒐 , than the horizon angle 𝛽 it forms with the camera axis 𝒁
+𝝎
+̂ axis is making an angle 𝛼 with our local view direction 𝝎
+̂ 𝒐.
+We know that the global camera 𝒁
+We easily notice that 𝜃 = 𝛽 − 𝛼 and thus we can write:
+cos(𝜃) = cos(𝛽 − 𝛼)
+Trigonometric identities give us:
+cos(𝜃) = cos(𝛼) cos(𝛽) + sin(𝛼) sin(𝛽)
+We know:
+cos(𝛽) =
+sin(𝛽) =
+
+𝑧
+√𝑟 2 + 𝑧 2
+𝑟
+√𝑟 2 + 𝑧 2
+
+And finally, our horizon angle is simply given by the expression:
+cos(𝜃) =
+
+cos(𝛼) 𝑧 + sin(𝛼) 𝑟
+√𝑟 2 + 𝑧 2
+
+We notice that cos(𝜃) = cos(𝛽) when the camera axis and view directions are aligned (i.e. at the center of the
+screen), while cos(𝜃) → sin(𝛽) when we reach the borders of the screen and the deviation from the camera axis is
+maximal.
+
+2. Improvements over HBAO
+In this paper, we will discuss several improvements to make the most out of the information gathered while
+performing the HBAO algorithm, these improvements will give us what I called the Horizon-Based Indirect Lighting
+(HBIL) algorithm:
+
+10
+
+•
+
+Section 2.1. will discuss how to use the camera-space normal to make the result more robust and reveal more
+details.
+
+•
+
+Section 2.2 will discuss how to obtain the bent-cone from our samples that will yield a better estimate of the
+far-field irradiance.
+
+•
+
+Finally, section 2.3 will explain how to eventually re-use the indirect diffuse lighting from the previously
+rendered frame to compute a very important near-field indirect lighting term.
+
+2.1. Using the Normal
+We can first improve a little upon the quality of the HBAO algorithm by using the normal to initialize the horizon
+angles.
+The normal vector is often readily available from the G-Buffer produced by deferred renderers. For each slice, we can
+̂ (𝜑) onto the normal plane by
+initialize the front and back horizon angles by projecting the slice’s direction vector 𝑫
+̂ 𝒐 , as shown in figure 6:
+following the camera view vector 𝝎
+𝑡=−
+
+̂ (𝜑) ∙ 𝒏
+̂
+𝑫
+̂𝒐 ∙ 𝒏
+̂
+𝝎
+
+cos(𝜃𝑓𝑟𝑜𝑛𝑡 ) =
+
+𝑡
+
+√1 + 𝑡 2
+𝑡
+cos(𝜃𝑏𝑎𝑐𝑘 ) = −
+√1 + 𝑡 2
+
+We thus obtain 𝜃𝑓𝑟𝑜𝑛𝑡 and 𝜃𝑏𝑎𝑐𝑘 , the initial front and back horizon angles represented in figure 6.
+
+11
+
+FIGURE 8. LEFT: HORIZON ANGLES ARE INITIALIZED BY DEPTH ALONE. RIGHT: HORIZON ANGLES ARE
+INITIALIZED WITH THE G-BUFFER’S NORMAL. WE CAN SEE THE RESULTING IMAGES ARE MUCH MORE
+DETAILED AND CONVINCING.
+
+12
+
+2.2. Bent Cones
+We follow the methodology of the GTAO computation described by Jimenez et al. [3] to compute the Ambient
+Occlusion but we are also interested in computing what I call a “bent cone”, which is a combination of a bent normal
+used as the central axis of a cone whose aperture depends on the ambient occlusion:
+
+FIGURE 9. THE “BENT-CONE”, A BENT NORMAL WITH AN ANGLE.
+
+2.2.1. Bent Normal
+Vidiger et al. [9] showed the importance of the bent normal in the production of realistic images in their SSRTGI
+technique, we will show here how to obtain the bent normal without the need for ray-tracing, once again by
+extending the HBAO algorithm.
+
+13
+
+̃ , we need to compute the average direction of a vector unoccluded by the
+In order to get the bent normal 𝒏
+environment:
+̃ = ∫ 𝑉(𝒙, 𝝎𝒊 ) 𝝎𝒊 ⅆ𝜔𝑖
+𝒏
+
+(𝟑)
+
+𝛺+
+
+FIGURE 10. INTEGRATION OF THE VECTOR 𝝎𝒊 BETWEEN ANGLES 𝜃0 AND 𝜃1 , RESTRICTED TO A SINGLE
+SLICE. NOTICE THAT THE NORMAL VECTOR 𝒏 IS NOT NECESSARILY LYING IN THE SLICE’S PLANE.
+
+We can get an approximation of the integral for equation 3 by computing a series of integrals restricted to 2D slices
+rotating about our view axis 𝝎𝒐 as shown in the figure 10 above:
+𝝎𝒊 (𝜃) = sin(𝜃) . 𝑫(𝜑) + cos(𝜃) . 𝝎𝒐
+
+14
+
+𝑆
+
+𝜃1
+𝜋
+̃ ≈ ∑ ∫ 𝝎𝒊 (𝜃) |sin(𝜃)| 𝑑𝜃
+𝒏
+𝑆
+𝜃0
+
+(𝟒)
+
+Where:
+•
+•
+•
+
+S is the amount of slices
+𝜃0 is the “back” horizon angle for the slice. 𝜃0 ∈ [−𝜋, 0]
+𝜃1 is the “front” horizon angle for the slice. 𝜃1 ∈ [0, 𝜋]
+
+Focusing on the inner integral, we rewrite its expression in slice-space as:
+sin(𝜃)
+𝝎′𝒊 (𝜃) = {
+cos(𝜃)
+𝜃1
+
+̃ ′ = ∫ 𝝎′𝒊 (𝜃) |sin(𝜃)| 𝑑𝜃
+𝒏
+𝜃0
+
+Where:
+•
+•
+
+𝝎′𝒊 (𝜃) is the slice-space version of 𝝎𝒊 (𝜃)
+̃ ′ is the resulting normal vector for the slice
+𝒏
+
+And we get:
+𝑛̃
+̃ ′ = {𝑛̃𝑥
+𝒏
+
+𝑦
+
+1
+𝑛̃𝑥 = (𝜃1 − 𝜃0 + sin(𝜃0 ) cos(𝜃0 ) − sin(𝜃1 ) cos(𝜃1 ))
+2
+1
+𝑛̃𝑦 = (2 − cos 2(𝜃0 ) − cos 2(𝜃1 ))
+2
+
+(𝟓)
+(𝟔)
+
+From which can finally rebuild a unit camera-space normal:
+̃=
+𝒏
+
+∑𝑆𝑖 𝑫(𝜑𝑖 ). 𝑛̃𝑥 (𝑖) + 𝝎𝒐 . 𝑛̃𝑦 (𝑖)
+‖∑𝑆𝑖 𝑫(𝜑𝑖 ). 𝑛̃𝑥 (𝑖) + 𝝎𝒐 . 𝑛̃𝑦 (𝑖)‖
+
+Where:
+•
+
+𝑛̃𝑥 (𝑖) and 𝑛̃𝑦 (𝑖) are the 𝑛̃𝑥 and 𝑛̃𝑦 values computed by equations 5 and 6 for slice 𝑖
+
+•
+
+𝑫(𝜑𝑖 ) is the slice direction for slice 𝑖
+
+15
+
+FIGURE 11. TOP: WORLD-SPACE NORMAL. BOTTOM: WORLD-SPACE BENT NORMAL. THE DIRECTION
+OF THE NORMAL IS INFLUENCED TO BEND TOWARD THE DIRECTION OF LEAST -OCCLUSION. THIS IS THE
+DIRECTION THAT IS THE MOST SUITED TO SAMPLE THE FAR-FIELD IRRADIANCE.
+
+16
+
+FIGURE 12. TOP: FAR-FIELD IRRADIANCE SAMPLING FROM TERRAIN NORMAL. BOTTOM: SAMPLING IN
+THE DIRECTION OF THE COMPUTED BENT NORMAL. THE RESULTS ARE MUCH SMOOTHER.
+(Library scene COURTESY OF LÉON DENISE)
+
+2.2.2. Cone Aperture and Ambient Occlusion
+Now, for the angle part of the bent cone, we need the solid angle covered by the cone to be significant when we use it
+to sample the far-field environment:
+17
+
+𝐸𝑓𝑎𝑟 (𝒙, 𝒏) = ∫ 𝑉(𝒙, 𝝎𝒊 )𝐿𝑖 (𝒙, 𝝎𝒊 )(𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖
+
+(𝟕)
+
+𝛺+
+
+Where:
+•
+•
+•
+•
+•
+
+𝐸𝑓𝑎𝑟 (𝒙, 𝒏) is the irradiance at 𝒙 for surface normal 𝒏 from the far-field environment
+𝐿𝑖 (𝒙, 𝝎𝒊 ) is the incoming radiance at 𝒙 from direction 𝝎𝒊
+𝛺+ is the set of all directions covering the upper hemisphere
+𝑑𝜔𝑖 is the solid angle covered by the surface perceived along direction 𝝎𝒊
+𝑉(𝒙, 𝝎𝒊 ) is the visibility term from equation 1
+
+I wrote in [4] that equation 7 is often simplified into:
+1
+𝐸̃𝑓𝑎𝑟 (𝒙, 𝒏) = [∫ 𝐿𝑖 (𝒙, 𝛚𝐢 )(𝒏. 𝛚𝐢 ) ⅆωi ] . [ ∫ V(𝒙, 𝛚𝐢 ) ⅆωi ] = 𝐸0 (𝒙, 𝒏). 𝐴𝑂(𝒙)
+2𝜋 Ω+
+Ω+
+
+(𝟖)
+
+Where 𝐸0 (𝒙, 𝒏) is the unoccluded irradiance from a diffuse cube map, or some SH representation.
+Jimenez et al. in their “Ground-Truth AO” (GTAO) [3] use instead an AO term they call “radiometrically correct”,
+meaning they account for the dot product with the normal in the visibility integral as well, and so the AO integral
+becomes:
+𝐴𝑂(𝒙) =
+
+1
+∫ V(𝒙, 𝛚𝐢 )(𝒏. 𝛚𝐢 ) ⅆωi
+𝜋 Ω+
+
+(𝟗)
+
+And indeed, this is actually the term we need because we will be using the complement of that term in section 2.3
+when we will compute the near-field irradiance term.
+1
+
+1
+
+Also notice the normalization factor is now 𝜋 instead of 2𝜋.
+
+18
+
+FIGURE 13. INFLUENCE OF THE DOT PRODUCT WITH THE NORMAL ON THE COMPUTATION OF THE
+AMBIENT OCCLUSION TERM. TOP: WITHOUT INFLUENCE OF THE NORMAL (EQUATION 7). BOTTOM:
+WITH INFLUENCE OF THE NORMAL (EQUATION 8). THE BOTTOM VERSION IS PREFERRED AS IT IS
+PHYSICALLY CORRECT. WE ALSO NOTICE IT HELPS REVEALING MORE SUBTLE DETAILS.
+
+19
+
+Identically to equation 4 used to compute the bent normal, we can write:
+𝝎𝒊 (𝜃) = sin(𝜃) . 𝑫(𝜑) + cos(𝜃) . 𝝎𝒐
+𝑆
+
+𝜃1
+1
+𝐴𝑂(𝒙) ≈ ∑ ∫ (𝒏. 𝝎𝒊 (𝜃)) |sin(𝜃)| 𝑑𝜃
+𝑆
+𝜃0
+
+Where 𝑖 is the slice index and 𝑆 the amount of slices.
+We rewrite once again the inner integral in slice-space between our 2 horizon angles 𝜃0 and 𝜃1 :
+sin(𝜃)
+𝝎′𝒊 (𝜃) = {
+cos(𝜃)
+𝜃1
+
+𝐴𝑂𝑖 = ∫ (𝒏′ ∙ 𝝎′𝒊 (𝜃))|sin(𝜃)| 𝑑𝜃
+
+(𝟏𝟎)
+
+𝜃0
+
+̂ projected into slice-space (cf. equation 2 and figure 6).
+With 𝐴𝑂𝑖 the AO value for slice 𝑖 and 𝒏′ the normal vector 𝒏
+We finally get:
+𝐴𝑂𝑖 =
+
+𝑛𝑦
+𝑛𝑥
+[θ1 − θ0 + sin(θ0 ) cos(θ0 ) − sin(θ1 ) cos(θ1 )] + [2 − cos2 (θ0 ) − cos 2(θ1 )]
+2
+2
+
+(𝟏𝟏)
+
+And finally, AO is given by:
+𝑆
+
+1
+𝐴𝑂(𝒙) ≈ ∑ 𝐴𝑂𝑖
+𝑆
+𝑖
+
+To finalize our bent-cone, we are interested in another formulation for the AO, which would be the solid angle
+covered by the cone with aperture angle 𝛼 :
+Ω = 2𝜋(1 − cos(𝛼))
+The true integral of the visibility term in equation 8 actually yields exactly this solid angle:
+Ω = ∫ V(𝒙, 𝛚𝐢 ) ⅆωi = 2𝜋 𝐴𝑂(𝒙)
+Ω+
+
+From this we can deduce that:
+𝐴𝑂(𝒙) = 1 − cos(𝛼)
+And finally, the aperture angle of our bent-cone is given by:
+20
+
+𝛼 = cos −1(1 − 𝐴𝑂(𝒙))
+
+(𝟏𝟐)
+
+We can also conclude that the cosine of the aperture angle of our bent-cone is the geometric equivalent of the
+classical AO formulation, but we will prefer it to the AO term since the cosine of an angle lends itself better to a
+comparison to the 𝑁 ∙ 𝐿 dot product generally found in lighting equations.
+
+The effect of accounting for the cone aperture angle is most important, as can be seen in the images below:
+
+FIGURE 14. INFLUENCE OF THE AMBIENT OCCLUSION / CONE ANGLE TERM. LEFT: NO AMBIENT
+OCCLUSION IS USED. RIGHT: WITH AMBIENT OCCLUSION TERM. NOTE THAT THE BENT-NORMAL IS
+ENABLED IN ALL IMAGES. (Torus Rooms scene COURTESY OF LÉON DENISE)
+21
+
+2.2.3. Using the bent-cone for far-field indirect illumination (Cube Map)
+In [4] we noted that the simplification induced by equation 8 suffers from a loss in energy that should be compensated
+by applying a factor given by ℱ0 (𝛼) so that:
+𝐸̃𝑓𝑎𝑟 (𝒙, 𝒏) = 𝐸0 (𝒙, 𝒏). ℱ0 (𝐴𝑂(𝒙))
+With:
+ℱ0 (𝛼) = 𝛼 . (1 +
+
+(1 − 𝛼)0.75
+1−𝛼
+)
+) = 𝛼 . (1 + 4
+2
+2 √1 − 𝛼
+
+Here, 𝐸0 (𝒙, 𝒏) is sampled from a pre-convolved diffuse cube map, or obtained from any other way where the angular
+aperture is predefined to be 90° and cannot be changed.
+
+2.2.4. Using the bent-cone for far-field indirect illumination (Spherical
+Harmonics)
+If the distant environment is available as spherical harmonics (SH) instead, then we should use the modified irradiance
+estimate from [5] that allows to reduce the aperture angle used in Ramamoorthi’s calculations [7] using the simple
+𝜋
+
+free parameter 𝜃𝑚𝑎𝑥 as replacement for the upper bound to his integral (16) instead of the default 2 value:
+𝜃𝑚𝑎𝑥
+
+𝐴𝑛 = 2𝜋 ∫ 𝑌𝑛,0 (𝜃𝑖′ ) cos(𝜃𝑖′ ) sin(𝜃𝑖′ ) 𝑑𝜃𝑖′
+0
+
+I will only give the procedure for an order-2 SH representation (i.e. 9 coefficients), details can be found on my wiki
+page for a possible extension to higher orders:
+𝑡 = cos(𝜃𝑚𝑎𝑥 ) = 1 − 𝐴𝑂(𝒙)
+1
+𝑐0 = √ 𝜋 (1 − 𝑡 2 )
+2
+1
+𝑐1 = √ 3 𝜋 (1 − 𝑡 3 )
+3
+1
+3(1 − 𝑡 4 ) − 2(1 − 𝑡 2 )
+𝑐2 = √ 5 𝜋 [
+]
+4
+4
+Then the resulting irradiance estimate for a cone of aperture 𝜃𝑚𝑎𝑥 is given by:
+22
+
+𝑥
+𝑦
+𝒏={
+𝑧
+𝐸̃𝑓𝑎𝑟 (𝒏) = 𝑐0 . 𝐿00
+0
+1
++𝑐1 . (𝑦. 𝐿−1
+1 + 𝑧. 𝐿1 + 𝑥. 𝐿1 )
++𝑐2 . 𝐿02 . (3𝑧 2 − 1)
++𝑐2 √3. 𝐿22 (𝑥 2 − 𝑦 2 )
+−1
+1
++𝑐2 2√3. (𝑥. 𝑦. 𝐿−2
+2 + 𝑦. 𝑧. 𝐿2 + 𝑧. 𝑥. 𝐿2 )
+
+The 𝐿𝑚
+𝑙 represent the encoded SH terms for the distant environment’s radiance.
+Note: It is also totally possible to estimate the irradiance by simply using the classical hemisphere SH estimate from [7]
+and multiply the result by ℱ0 (𝐴𝑂(𝒙)) as seen in section 2.2.3. but I find the results more accurate using the reducedcone formulation.
+
+2.3. Indirect Lighting
+The classical lighting equation to compute the outgoing radiance from a pixel at 𝒙 in viewing direction 𝝎𝒐 is essentially
+given by:
+
+𝐿𝑜 (𝒙, 𝝎𝒐 ) = ∫ 𝐿𝑖 (𝒙, 𝝎𝒊 )𝜌(𝒙, 𝝎𝒊 , 𝝎𝒐 )(𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖
+
+(𝟏𝟑)
+
+𝛺+
+
+Where:
+•
+•
+•
+•
+•
+
+𝐿𝑖 (𝒙, 𝝎𝒊 ) is the incoming radiance at 𝒙 from direction 𝝎𝒊
+𝜌(𝒙, 𝝎𝒊 , 𝝎𝒐 ) is the surface’s BRDF
+𝒏 is the surface normal
+𝛺+ is the set of all directions covering the upper hemisphere
+𝑑𝜔𝑖 is the solid angle covered by the surface perceived along direction 𝝎𝒊
+
+Focusing only on diffuse Lambertian reflection, we can rewrite equation 13 as:
+
+𝐿𝑜 (𝒙, 𝝎𝒐 ) =
+
+𝜌(𝒙)
+𝜌(𝒙)
+∫ 𝐿𝑖 (𝒙, 𝝎𝒊 )(𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖 =
+𝐸(𝒙, 𝒏)
+𝜋 𝛺+
+𝜋
+
+(𝟏𝟒)
+
+Where:
+•
+
+𝐸(𝒙, 𝒏) is the irradiance collected at surface location 𝒙 and normal 𝒏.
+
+23
+
+•
+
+𝜌(𝒙)
+represents the diffuse BRDF for a surface with albedo 𝜌(𝒙) ∈ [𝟎, 𝟏].
+𝜋
+
+The division by 𝜋 is here to guarantee energy conservation since ∫𝛺+(𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖 = 𝜋.
+
+FIGURE 15. REPRESENTATION OF THE 3 POSSIBLE SOURCES OF IRRADIANCE: DIRECT LIGHTING, FARFIELD LIGHTING FROM THE UNOCCLUDED ENVIRONMENT AND NEAR-FIELD LIGHTING WHICH
+REPRESENTS THE IRRADIANCE THAT BOUNCED OFF THE NEIGHBOR ENVIRONMENT . WE NOTICE THAT THE
+NEAR-FIELD ONLY ACCOUNTS FOR THE OCCLUDED ENVIRONMENT ABOVE THE NORMAL PLANE AND IS
+THE EXACT COMPLEMENT OF THE FAR-FIELD.
+
+24
+
+We saw in equation 8 how to sample the far-field environment but as shown in figure 15, the complete formulation
+for the irradiance is really given by:
+𝐸(𝒙, 𝒏) = 𝐸𝑑𝑖𝑟𝑒𝑐𝑡 (𝒙, 𝒏) + 𝐸𝑓𝑎𝑟 (𝒙, 𝒏) + 𝐸𝑛𝑒𝑎𝑟 (𝒙, 𝒏)
+Where:
+•
+•
+•
+
+𝐸𝑑𝑖𝑟𝑒𝑐𝑡 (𝒙, 𝒏) is the direct diffuse lighting irradiance computed using all the light sources of the scene and has
+already been extensively covered throughout the CG literature
+𝐸𝑓𝑎𝑟 (𝒙, 𝒏) is the far-field distant environment term that can be computed using the bent-cone, as shown in
+sections 2.2.3. and 2.2.4.
+𝐸𝑛𝑒𝑎𝑟 (𝒙, 𝒏) represents the missing near-field environment term, the part of the energy that bounced off the
+close environment and perceived indirectly by our sampling point.
+This part is often ignored, simplified or statically pre-computed as it is quite tricky and expensive to evaluate.
+
+𝐸𝑛𝑒𝑎𝑟 (𝒙, 𝒏) can be written as:
+𝐸𝑛𝑒𝑎𝑟 (𝒙, 𝒏) = ∫ +(1 − 𝑉(𝒙, 𝝎𝒊 ))𝐿𝑖 (𝒙, 𝝎𝒊 )(𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖
+𝛺
+
+(𝟏𝟓)
+
+We immediately notice this term is using the opposite of the visibility function and is thus the exact complement of
+the far-field environment term from equation 7 since we only gather radiance that bounced off of the occluded
+environment
+Contrary to [4] where the near-field bounces were approximated via manually-fitted and ad-hoc terms, in this paper
+we will see how to actually compute these bounces.
+
+2.3.1. Recursive Irradiance Bounces
+We begin by noticing that, since we are only considering the diffuse Lambertian case, the incoming radiance term
+𝐿𝑖 (𝒙, 𝝎𝒊 ) from equation 15 has to be a diffuse reflection of the light off the neighbor environment:
+𝐿𝑖 (𝒙, 𝝎𝒊 ) =
+
+𝜌(𝒙′)
+𝐸(𝒙′, 𝒏′)
+𝜋
+
+Where 𝒙′ and 𝒏′ are the location and normal of the neighbor environment perceived in direction 𝝎𝒊 .
+
+25
+
+FIGURE 16. WE ARE ONLY INTERESTED IN THE DIFFUSE REFLECTION OF LIGHT AT 𝒙′ WHEN SAMPLING
+THE ENVIRONMENT FROM 𝒙 IN DIRECTION 𝝎𝒊 . WE CALL THIS NORMAL-AGNOSTIC, DIFFUSELY
+REFLECTED RADIANCE, 𝐿𝑑 (𝒙′).
+
+Assuming the neighbor is taking care of its own lighting (i.e. we are making an independence hypothesis) then we
+write:
+𝐿𝑖 (𝒙, 𝝎𝒊 ) = 𝐿𝑑 (𝒙′)
+Which is the diffusely-reflected radiance sampled at location 𝒙′.
+Note: Because we are going to sample a buffer where we stored the diffuse radiance 𝐿𝑑 (𝒙′), the
+
+𝜌(𝒙′)
+and 𝐸(𝒙′, 𝒏′)
+𝜋
+
+are already combined together and we cannot make the same assumption as in [3] that the neighbor reflectance is
+the same as our current reflectance 𝜌(𝒙′) = 𝜌(𝒙), nor is it desired to make such an assumption any more since we are
+not computing an approximate term here.
+
+We can then rewrite equation 15 as:
+𝐸𝑛𝑒𝑎𝑟 (𝒙, 𝒏) = ∫ 𝐿𝑑 (𝒙′)(𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖 ,
+𝛺+
+
+𝑉(𝒙, 𝝎𝒊 ) = 0
+
+(𝟏𝟔)
+
+26
+
+And interestingly, we notice that estimating the near-field irradiance simply involves sampling the diffusely-reflected
+radiance from neighbor surfaces.
+So, when rendering frame N, assuming the diffuse radiance values computed for the last frame N-1 are available then
+we could solve the entire lighting diffuse equation 14 by computing:
+𝐿𝑜 𝑁 (𝒙, 𝝎𝒐 ) =
+
+𝜌(𝒙)
+[𝐸𝑑𝑖𝑟𝑒𝑐𝑡 𝑁 (𝒙, 𝒏) + 𝐸𝑓𝑎𝑟 𝑁 (𝒙, 𝒏) + ∫ 𝐿𝑑 𝑁−1 (𝒙′) (𝒏. 𝝎𝒊 ) ⅆ𝜔𝑖 ]
+𝜋
+𝛺+
+
+(𝟏𝟕)
+
+With:
+•
+•
+•
+
+𝐿𝑜 𝑁 (𝒙, 𝝎𝒐 ) the radiance computed at frame N that will be stored in the diffuse radiance buffer which will, in
+turn, be re-used as input at frame N+1
+𝐸𝑑𝑖𝑟𝑒𝑐𝑡 𝑁 (𝒙, 𝒏) the direct lighting irradiance computed at frame N
+𝐸𝑓𝑎𝑟 𝑁 (𝒙, 𝒏) the far-field radiance computed at frame N
+
+•
+
+𝐿𝑑 𝑁−1 (𝒙′) the diffusely-reflected radiance computed at frame N-1 and stored at neighbor location 𝒙′
+
+Computing radiance in this fashion would theoretically give us an “infinite amount of light bounces” since we keep the
+light bouncing from one frame to the next.
+The details on how to reproject radiance from frame N-1 are given later in section 3.1.
+
+2.3.2. Solving the indirect lighting integral
+All we are left to solve is equation 16. Coming back to the context of our integration slice, where we are slowly
+computing the horizon angles for our front and back directions:
+
+27
+
+FIGURE 17. SAMPLING THE GATHERED IRRADIANCE WHEN THE HORIZON IS RISING FROM 𝜃0 TO 𝜃1 : WE
+SIMPLY NEED TO SAMPLE THE NEIGHBOR RADIANCE 𝐿𝑑 (𝒙′ ) (SHOWN IN GREEN) AND COMPUTE ITS
+PERCEIVED INFLUENCE ON OUR CENTRAL LOCATION 𝒙.
+
+In this figure, we can easily see that the only irradiance we perceive from 𝒙 is the one from when the horizon jumps
+up a little: only the area represented in green contributes to the perceived irradiance when we rise from θ0 to θ1 . This
+integrates very well into our existing ray-marching scheme and we see that we can get much more bang for our buck
+by gathering the indirect radiance as well!
+So, for a small jump of the horizon angle from θ0 to θ1 , we rewrite once again almost exactly the integral from
+equation 10 except we no longer samples a “unit far-field radiance” but the radiance reflected by our neighbor
+instead:
+sin(𝜃)
+𝝎′𝒊 = {
+cos(𝜃)
+θ1
+
+∆𝐸 = ∫ 𝐿𝑑 (𝒙′ ) (𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ
+θ0
+
+̂ projected into slice-space (cf. equation 2 and figure 6).
+With 𝒏′ the normal vector 𝒏
+28
+
+Assuming 𝐿𝑑 (𝒙′ ) is constant for the entire interval [θ0 , θ1 ] then ∆𝐸 becomes:
+θ1
+
+∆𝐸 ≈ 𝐿𝑑 (𝒙′ ) ∫ (𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ
+
+(𝟏𝟖)
+
+θ0
+
+Solving the integral yields:
+θ1
+
+∫ (𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ =
+θ0
+
+𝑛𝑦
+𝑛𝑥
+[θ1 − θ0 + sin(θ0 ) cos(θ0 ) − sin(θ1 ) cos(θ1 )] + [cos 2(θ0 ) − cos2 (θ1 )]
+2
+2
+
+This new formulation is easy to integrate into the existing framework of HBAO computation and only requires to
+sample an additional radiance buffer, on top of our sampling of the depth buffer used for classical HBAO.
+
+FIGURE 18. LEFT: DIRECT LIGHTING ONLY. MIDDLE: IRRADIANCE GATHERED BY THE HBIL ALGORITHM.
+RIGHT: THE COMBINED RESULT. THE SCENE IS LIT BY A SINGLE LIGHT PLACED ON THE CEILING.
+
+2.3.3. Accounting for the Fresnel Term
+When considering the full micro-facet BRDF model, we often find ourselves with an expression similar to:
+𝜌(𝝎𝒊 , 𝝎𝒐 ) =
+
+𝜌𝑑
+[1 − 𝐹(𝝎𝒊 , 𝝎𝒉 )] + 𝐹(𝝎𝒊 , 𝝎𝒉 ). 𝜌𝑠 (𝝎𝒊 , 𝝎𝒐 )
+𝜋
+
+Where 𝐹(𝝎𝒊 , 𝝎𝒉 ) is the Fresnel term that balances the distribution of the reflection between the specular part of the
+𝜌
+
+BRDF, namely 𝜌𝑠 (𝝎𝒊 , 𝝎𝒐 ), and its diffuse part 𝜋𝑑 which is the only part we have considered so far.
+𝝎 +𝝎
+
+𝝎𝒉 = ‖𝝎𝒊 +𝝎𝒐 ‖ is the well-known half-direction vector between 𝝎𝒊 and 𝝎𝒐 .
+𝒊
+
+𝒐
+
+Assuming we are using the simplified Schlick’s approximation to the actual Fresnel term:
+29
+
+𝐹(𝝎𝒊 , 𝝎𝒉 ) = 𝐹0 + (1 − 𝐹0 )(1 − 𝝎𝒊 · 𝝎𝒉 )5
+𝐹0 being the classical “reflectance at normal incidence” and is related to the medium’s index of refraction by:
+𝐹0 = (
+
+𝑛1 − 𝑛2 2
+)
+𝑛1 + 𝑛2
+
+The diffuse integral 18 then becomes:
+θ1
+
+∆𝐸 = 𝐿𝑑 (𝒙′ ) ∫ (1 − 𝐹(𝝎′𝒊 , 𝝎′𝒉 ))(𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ
+θ0
+
+Where:
+𝝎′𝒉 =
+
+𝝎′ 𝒊 + 𝝎′ 𝒐
+‖𝝎′ 𝒊 + 𝝎′ 𝒐 ‖
+
+sin(𝜃)
+𝝎′𝒊 = {
+cos(𝜃)
+
+0
+𝝎′ 𝒐 = {
+1
+
+So ∆𝐸 becomes:
+θ1
+
+∆𝐸 = 𝐿𝑑 (𝒙′ ) ∫ (1 − 𝐹0 − (1 − 𝐹0 )(1 − 𝝎′𝒊 . 𝝎′𝒉 )5 )(𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ
+θ0
+
+θ1
+
+θ1
+
+θ0
+
+θ0
+
+= 𝐿𝑑 (𝒙′ )(1 − 𝐹0 ) [∫ (𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ − ∫ (1 − 𝝎′𝒊 . 𝝎′𝒉 )5 (𝒏′ . 𝝎′𝒊 ) sin(𝜃)𝑑θ]
+The first integral is equation 18 that we already solved, focusing on the new green expression we obtain:
+θ1
+
+5
+
+θ1
+
+1 + cos(𝜃)
+∫ (1 − 𝝎′𝒊 . 𝝎′𝒉 )5 (𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ = ∫ (1 − √
+) (𝑛𝑥 sin(𝜃) + 𝑛𝑦 cos(𝜃)) sin(𝜃) 𝑑θ
+2
+θ0
+θ0
+
+Noticing that this complex integral will influence at most 0.03% of the final irradiance value, we decide the benefits
+aren’t worth the cost of estimating such an expensive expression and we drop the term entirely.
+Overall, the main takeaway here is that equation 18 really needs to be rewritten as:
+θ1
+
+∆𝐸 = 𝐿𝑑 (𝒙′ ) (1 − 𝐹0 ) ∫ (𝒏′ . 𝝎′𝒊 ) sin(𝜃) 𝑑θ
+
+(𝟏𝟗)
+
+θ0
+
+The 𝐹0 value is usually available from the G-Buffer as it is required for specular lighting computations. This result
+makes a lot of sense if you take the case of a metal for which the 𝐹0 value is close to 1, it is known that metals have no
+diffuse component and, as such, weighing the final diffuse irradiance by 1-𝐹0 will indeed reduce the indirect diffuse
+lighting coming from metals to 0.
+
+30
+
+FIGURE 19. THE EFFECT OF THE HBIL TECHNIQUE. LEFT: DIRECT ONLY. RIGHT: DIRECT + HBIL.
+31
+
+FIGURE 20. AN ADDITIONAL BENEFIT OF THE TECHNIQUE: IT IS POSSIBLE TO INJECT EMISSIVE SURFACES
+INTO THE SOURCE RADIANCE BUFFER TO OBTAIN SIMPLE AREA LIGHTS.
+
+3. Integration with the lighting pipeline
+Integrating HBIL into a deferred pipeline is not a lot of work but strongly relies on having an efficient Temporal AntiAliasing (TAA) technique to smooth out the noise introduced by the fact that only 2 screen-space directions are traced
+per-pixel, as we will see in section 3.3 about interleaved rendering.
+The rendering pipeline for HBIL is shown below:
+
+32
+
+Reproject
+
+Push
+
+Pull
+
+HBIL
+
+Buffers
+Splitting
+
+Regular Pipeline
+
+G-Buffer
+Generation
+
+Lighting
+
+PostProcessing
+
+FIGURE 21. INTEGRATION OF HBIL INTO A REGULAR DEFERRED-LIGHTING PIPELINE.
+
+3.1. Memory Requirements
+Here is the list of G-Buffer fields required by the technique:
+•
+•
+
+Albedo (RGB)
+Normal (RG), usually stored in the camera-space described in section 1.1.
+
+•
+
+The 3rd component of the normal is then reconstructed via 𝑧 = √1 − 𝑥² − 𝑦²
+F0, or the equivalent “Metal” parameter (either luminance only or full RGB).
+
+Here is the list of additional buffers required by the technique:
+•
+
+•
+•
+•
+•
+
+Diffuse lighting (Fullscreen, RGB, HDR, All Mips), used to store the diffuse part of the lighting that is reprojected and re-injected next frame (orange arrow in figure 21). Successfully tested with either RGB10A2 and
+R11G11B10 high-dynamic range formats.
+Push/Pull-Buffer (Fullscreen, RGB, HDR, All Mips), serves as the 2nd ping-pong buffer (diffuse lighting buffer
+being the first one) to compute the push/pull chain after reprojection (cf. Section 3.2).
+4x4 Split Radiance (1/4 Resolution, RGB, HDR, No Mip), temporary quarter-res buffers where the
+reprojected/reconstructed radiance from last frame is stored (allocated as Texture2DArray)
+4x4 Split Normal (1/4 Resolution, R8G8_SNORM, No Mip), temporary quarter-res buffer where the G-Buffer
+normal is stored as HBIL input (allocated as Texture2DArray)
+4x4 Split Depth (1/4 Resolution, R16F, No Mip), temporary quarter-res buffer where the G-Buffer depth is
+stored as HBIL input (allocated as Texture2DArray)
+
+33
+
+•
+•
+
+4x4 Split Irradiance (1/4 Resolution, RGB, HDR, No Mip), temporary quarter-res buffer where we store the
+irradiance output by the HBIL (allocated as Texture2DArray)
+4x4 Split Bent Cone (1/4 Resolution, R8G8B8A8_SNORM, No Mip), temporary quarter-res buffer where we
+store the bent-cone output by the HBIL (allocated as Texture2DArray)
+
+3.2. Reconstructing Last Frame Radiance
+I’m using a compute shader to scatter last frame’s radiance into current frame’s point of view. Due to the nature of
+the scatter process, the resulting image has holes (disocclusion events) and pixels that fight to scatter to the same
+position (occlusion events), as seen in figure 22.
+The occlusion events are taken care of by simply using a temporary Z-buffer to prioritize last frame’s reprojected Z
+values and accept only the reprojected radiance closest to this frame’s camera.
+The disocclusion events, on the other hand, appear as holes that need to be filled. We use the push/pull algorithm
+described in [8] to compute mips from valid radiance values, then pulling these newly computed smooth values to the
+higher mips again and using them whenever a radiance value is unavailable.
+
+34
+
+FIGURE 22. TOP-LEFT: RAW REPROJECTED RADIANCE WITH HOLES. TOP-RIGHT: FINAL RESULT AFTER
+PUSH/PULL RECONSTRUCTION. THE RAW REPROJECTION GOES THROUGH THE ENTIRE PROCESS OF
+PUSHING VALID VALUES DOWN TO THE MIPS, THEN PULLING THE NEWLY COMPUTED VALUES BACK
+AGAIN UP TO THE FINAL RESULT WHERE HOLES ARE FILLED.
+
+Of course, it’s also entirely possible to entirely bypass the forward (i.e. scattered) reprojection + push/pull
+reconstruction and simply use a gathering technique with screen-space motion vectors that are often readily available
+with Temporal Anti-Aliasing algorithms. The source radiance from last frame would then be “gathered” instead of
+“scattered”.
+
+35
+
+3.3. Interleaved Rendering
+Ideally, we would like to split the integral over the hemisphere from equation 1 into as many slices as possible for
+each pixel, and use as many samples as possible. In reality, taking many texture taps from fullscreen render targets is
+largely too expensive and quickly ruins cache coherence, making overall performance very poor.
+The core optimization for the HBIL algorithm to be tractable is of course to use interleaved rendering as described by
+Bavoil et al. in [2] and [6].
+The idea is to separate the many slices used for integration into only a few slices per pixel that are slightly offset in
+rotation from one pixel to the next, all the while computing the samples into smaller render targets, thus drastically
+improving cache coherence.
+In my current implementation of HBIL, I split the buffers into quarter-resolution buffers and interleaved rendering is
+computed in small 4x4 squares so, even though only 2 hemisphere slices 90° from each other are used per pixel, when
+merged together, the Monte-Carlo integration is actually using 4x4x2 = 32 slices.
+
+FIGURE 23. TOP: MOSAIC OF 4X4 INTERLEAVED RENDERINGS OF THE IRRADIANCE BUFFER.
+MIDDLE: RAW RECOMPOSED RESULT. BOTTOM: RECOMPOSED RESULT AFTER TEMPORAL FILTERING.
+36
+
+It is certainly possible to obtain a smoother result by recomposing the final buffer with a bilateral spatial filter that
+uses neighbor samples as well, at the cost of using more bandwidth and reducing cache efficiency once again. This is
+left as future research.
+
+3.4. Depth Filtering
+Care must be taken when sampling the radiance buffer in order to reject samples that clearly don’t contribute to the
+lighting. The only true valid criterion I could find is somewhat expensive as it requires sampling the normal buffer on
+top of existing depth and radiance buffers, but it has strong geometric grounds that make it robust as it doesn’t
+involve too many “free parameters” (rather a once for all setup that “looks good™” for all scenes).
+You can see in the figure below the need for such a filter:
+
+FIGURE 24. TOP: UNFILTERED RESULT WHERE INCORRECT SAMPLES ARE USED, LEADING TO A PLEASING
+ALTHOUGH WRONG LIGHTING UNDER THE ARCHES. BOTTOM: CORRECTLY FILTERED OUT RESULT.
+
+37
+
+The samples we want to reject are the ones facing away from our central location, as seen in the figure below:
+
+FIGURE 25. REJECTION FILTER IS BASED ON WHETHER A POINT IS FACING THE CENTRAL LOCATION 𝒙
+WHERE THE INTEGRAL IS TAKING PLACE. POINT 𝒙′ WITH NORMAL 𝒏′ IS A VALID CANDIDATE WHILE
+POINT 𝒙′′ WITH NORMAL 𝒏′′ IS CLEARLY NOT CONTRIBUTING THE RADIANCE PERCEIVED BY 𝒙.
+
+In figure 24 (top) we notice the pixels in the area circled in red will attempt, during screen-space sampling, to use the
+colors from the bright red drape below whereas the drape is clearly facing away from these pixels and doesn’t
+contribute at all to their lighting.
+So, although the depth samples from the drape should participate to the increase in ambient occlusion, the radiance
+samples, on the other hand, are filtered with the criterion:
+𝑡 = 𝑠𝑚𝑜𝑜𝑡ℎ𝑠𝑡𝑒𝑝( 𝑎, 𝑏, −𝒏′ ∙ 𝝎𝒊 )
+𝒙′ −𝒙
+
+With 𝒏′ the normal at the neighbor’s location and 𝝎𝒊 = ‖𝒙′ −𝒙‖ the vector pointing from the central location 𝒙 to the
+neighbor’s location 𝒙’. 𝑎 and 𝑏 are tolerance values set so that the fade value 𝑡 goes to 0 when the dot product is too
+negative.
+Then the radiance value can be updated as:
+𝐿𝑛𝑒𝑤 = 𝑙𝑒𝑟𝑝( 𝐿𝑜𝑙𝑑 , 𝐿(𝒙′ ), 𝑡 )
+
+38
+
+Where 𝐿𝑜𝑙𝑑 is the radiance value from the previous sample that we keep in an “inout” register that keeps getting
+updated, 𝐿(𝒙′ ) is the radiance that we sampled from the source radiance buffer. We can see the parameter t serves
+as a fallback to a “safe” radiance value we used for an earlier sample.
+
+3.5. Performance
+Performance measurements were done on a NVIDIA 680 GTX, 2GB of DDR5 Video Memory, Driver version is 388.13.
+Current version of the algorithm uses 2 sampling slices per pixel with 16 samples per direction at 1280x720.
+Time measurements are averaged over many scenes.
+
+Pass Name
+
+Time (ms)
+
+Reprojection (opt.)
+Push/Pull (opt.)
+Buffers Split
+HBIL
+TOTAL (with optional push/pull phase)
+TOTAL (core HBIL only)
+
+0.16
+0.32
+0.78
+1.97
+3.23
+2.75
+
+4. Conclusion & Future Work
+This paper presented new improvements over the existing horizon-based algorithms and showed how to make the
+most out of the information gathered during the horizon sampling phase. This additional information allows us to
+produce the very important bent-normal direction as well as gathering the indirect radiance from our samples, which
+drastically enhances the overall indirect lighting of the scene.
+There are of course limitations due to the screen-space nature of the method, like large sources of lighting
+disappearing when off-screen, but I found out the fading effect due to the progressive reduction in surface due to
+camera movement usually masks this effect well. In a future work, it would be interesting to keep these off-screen
+values in some sort of special “off-screen buffer”, during the re-projection phase for example. This off-screen buffer
+could possibly be a paraboloid-projection of the half-space behind the camera, that would accumulate values as the
+camera stands still and rotates, but would fade away as soon as it starts a translation movement (invalidating the
+cached off-screen environment).
+Due to the small amount of sampling directions per pixel, additional work is needed to further reduce the noise that is
+produced.
+39
+
+An interesting and very promising line for future research would be to further exploit the dependence on the 𝐹0
+Fresnel term to “focus” the sampling directions into the “rough” specular direction, the idea would be to merge the
+HBIL and specular screen-space reflection into a single algorithm, thus avoiding the cost of tracing the screen twice,
+once for the diffuse reflection, another time for the specular reflection.
+Overall, although it is not the definitive answer to the difficult problem of global illumination, HBIL provides a
+significant enhancement to the indirect lighting part of an image and constitutes a nice extension to far-field indirect
+lighting techniques like the wildly-used probe-based solutions.
+
+5. Acknowledgments
+Special thanks to Eko Software for financing this research. HBIL will appear in the next Eko Software ARPG game based
+on Warhammer Fantasy Battles IP.
+My thanks go to Stéphane Le Boeuf for proof reading this paper, Benjamin Lalisse for his clever remarks and general
+support, Martin Gérard for his precious help with my math, Léon Denise for his beautiful 3D scenes, Geoffrey Rosin for
+his amazing textures, David Toyou, Laurent Tartinville for his help, and Sandra for moral support
+
+.
+
+6. References & Bibliography
+[1] Bavoil, L. and Sainz M. 2008. “Image-Space Horizon-Based Ambient Occlusion”
+[2] Bavoil, L. and Jansen, J. 2013. “Particle Shadows & Cache-Efficient Post-Processing”
+[3] Jimenez, J. Wu, X-C. Pesce, A. and Jarabo, A. 2016. “Practical Realtime Strategies for Accurate Indirect Occlusion”
+[4] Mayaux, B. 2018, “Improved Ambient Occlusion”
+[5] Mayaux, B. 2016, “Spherical Harmonics Irradiance Estimate for a Cone” (personal blog)
+[6] Bavoil, L. 2014, “Deinterleaved Texturing for Cache-Efficient Interleaved Sampling”
+[7] Ramamoorthi, R. 2001, “On the Relationship between Radiance and Irradiance: Determining the illumination from images of a convex
+Lambertian object”
+[8] Kraus, M. 2009, "The Pull-Push Algorithm Revisited"
+[9] Vidiger, D. 2017 “SSRTGI: Toughest Challenge in Real-Time 3D”
+McGuire, M. 2011, “The Alchemy Screen-Space Ambient Obscurance Algorithm”
+McGuire, M. 2012, “Scalable Ambient Obscurance”
+
+40
+
+
