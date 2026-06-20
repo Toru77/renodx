@@ -556,7 +556,12 @@ void main(
     // Apply environment SSS early in pipeline (before other effects)
     ApplyEnvSSS(r6.xyz, v1.xy, mrt0_xy_raw, is_character_pixel);
     if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-      r6.xyz += ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+      float3 ssgiColor = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+      if (shader_injection_data.xegtao_ssgi_debug > 0.5f) {
+        r6.xyz = ssgiColor;  // Debug: replace scene with SSGI texture
+      } else {
+        r6.xyz += ssgiColor;  // Normal: add GI to scene
+      }
     }
     r6.w = r0.w;
     o0.xyzw = r6.xyzw;
@@ -1285,7 +1290,12 @@ void main(
   o2.y = min(0x0000ffff, (uint)r0.x);
   o0.xyz = r0.yzw;
   if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-    o0.xyz += ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+    float3 ssgiColor2 = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+    if (shader_injection_data.xegtao_ssgi_debug > 0.5f) {
+      o0.xyz = ssgiColor2;  // Debug: replace scene with SSGI texture
+    } else {
+      o0.xyz += ssgiColor2;  // Normal: add GI to scene
+    }
   }
   o0.w = 1;
   o2.x = 0;

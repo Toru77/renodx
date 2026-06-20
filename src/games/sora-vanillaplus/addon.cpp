@@ -83,6 +83,7 @@ ShaderInjectData shader_injection = {
   .xegtao_dedicated_bound = 0.f,
   .xegtao_fix_experimental = 0.f,
   .xegtao_ssgi_bound = 0.f,
+  .xegtao_ssgi_debug = 0.f,
 };
 
 // ═══════════ XeGTAO Backend — constants, types, fwd decls ═══════════
@@ -122,6 +123,8 @@ static float g_ssgi_intensity            = 1.0f;
 static float g_ssgi_step_distribution    = 1.f;  // 0=constant, 1=exponential
 static float g_ssgi_resolution           = 0.f;   // 0=full, 1=half
 static float g_ssgi_multibounce          = 1.f;
+static float g_ssgi_light_exposure       = 1.f;  // exposure scale for HDR light buffer (lower = dimmer GI)
+static float g_ssgi_experimental_fix     = 0.f;  // 0=Off, 1-5=experimental algorithm fixes
 
 // ── SSGI's own XeGTAO settings (override standalone when SSGI is on) ──
 static float g_ssgi_xegtao_quality_level     = 2.f;
@@ -135,14 +138,15 @@ static float g_ssgi_xegtao_thin_occluder_comp = 0.5f;
 static float g_ssgi_xegtao_depth_mip_offset  = 3.30f;
 static float g_ssgi_xegtao_denoise_blur_beta = 20.0f;
 
+// ── SSGI debug views ──
+static float g_ssgi_debug_view = 0.f;  // 0=Off, 1=Raw GI, 2=Denoised GI, 3=Light Buffer
+
 // ── CPU optimization toggles (each independently testable) ──
 // ── CPU optimization toggles ──
 static float g_cpuopt_xegtao_frame_skip   = 0.f;
 static float g_cpuopt_ssgi_frame_skip     = 0.f;
 static float g_cpuopt_deferred_dispatch   = 0.f;  // dispatch XeGTAO/SSGI in OnPresent, not inline
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
-static float g_cpuopt_suppress_capture    = 0.f;  // skip descriptor capture events during our dispatches
-static float g_cpuopt_batched_state       = 0.f;  // save/restore cmd list state once for all XeGTAO passes
 
 using XeGTAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount>;
@@ -200,6 +204,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view captured_depth_srv = {};
   reshade::api::resource_view captured_ssao_srv = {};
   reshade::api::resource_view captured_mrt_normal_srv = {};
+  reshade::api::resource_view captured_color_srv = {};   // t0 — lighting input color texture
   reshade::api::resource_view captured_scene_cbv_view = {};  // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
   bool captured_scene_cbv_valid = false;
@@ -764,19 +769,26 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Don't destroy/recreate pipelines every frame (kai-style).",
       .labels = {"Off", "On"},
     },
+    // ── SSGI Debug ──
     new renodx::utils::settings::Setting{
-      .key = "CPUOptSuppressCapture", .binding = &g_cpuopt_suppress_capture,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Suppress Capture", .section = "CPU Opt",
-      .tooltip = "Skip descriptor capture events during our own compute dispatches.",
-      .labels = {"Off", "On"},
+      .key = "SSGIDebugView", .binding = &g_ssgi_debug_view,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
+      .tooltip = "Shows SSGI debug textures instead of blended GI (neutralizes AO).",
+      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Color Tex t0"},
     },
     new renodx::utils::settings::Setting{
-      .key = "CPUOptBatchedState", .binding = &g_cpuopt_batched_state,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Batched State", .section = "CPU Opt",
-      .tooltip = "Save/restore command list state once for all XeGTAO passes.",
-      .labels = {"Off", "On"},
+      .key = "SSGILightExposure", .binding = &g_ssgi_light_exposure,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Light Exposure", .section = "SSGI",
+      .tooltip = "Exposure scale for the HDR light buffer. Lower values if GI is too bright/white.",
+      .min = 0.01f, .max = 10.f,
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIExperimentalFix", .binding = &g_ssgi_experimental_fix,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Experimental Fix", .section = "SSGI",
+      .labels = {"Off","1: Self-sample","2: No normals","3: No occlusion","4: Paper mask","5: No centering"},
     },
 };
 
@@ -879,9 +891,6 @@ static bool IsSceneCbvCandidateValid(reshade::api::device* device,
 
 // ── Push-descriptors event → capture lighting inputs (kai pattern) ──
 
-// ── Global guard: suppress descriptor capture events during our own dispatches. ──
-static bool g_xegtao_dispatch_in_progress = false;
-
 static void OnPushDescriptorsCapture(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -889,8 +898,6 @@ static void OnPushDescriptorsCapture(
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
   if (!cmd_list) return;
-  // CPU opt: suppress capture events during our own compute dispatches (kai-style).
-  if (g_cpuopt_suppress_capture > 0.5f && g_xegtao_dispatch_in_progress) return;
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
@@ -910,6 +917,18 @@ static void OnPushDescriptorsCapture(
     if (update.binding == kLightingMrtNormalRegister && update.count >= 1
         && views[0].handle != 0u) {
       d->captured_mrt_normal_srv = views[0];
+    }
+    // Capture t0 color texture — ONLY from the lighting shader (hash 0xFDAAF80E).
+    // Unconditional capture would grab binding 0 from any shader, causing wrong colors.
+    if (update.binding == 0u && update.count >= 1
+        && views[0].handle != 0u) {
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (hash == 0xFDAAF80Eu) {
+          d->captured_color_srv = views[0];
+        }
+      }
     }
   }
   if (update.type == reshade::api::descriptor_type::constant_buffer) {
@@ -958,8 +977,6 @@ static void OnBindDescriptorTables(
   }
 
   if (shader_injection.xegtao_mode < 0.5f && g_ssgi_enabled < 0.5f) return;
-  // CPU opt: suppress capture events during our own compute dispatches (kai-style).
-  if (g_cpuopt_suppress_capture > 0.5f && g_xegtao_dispatch_in_progress) return;
 
   // Only capture on pixel-stage draws.
   const uint32_t sm = static_cast<uint32_t>(stages);
@@ -1102,7 +1119,50 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
          std::to_string(gw) + "x" + std::to_string(gh) + ")").c_str());
     }
   }
-  // Use deferred snapshots from lighting draw (kai-style).
+  // ── Light buffer capture for SSGI (next frame's input) ──
+  // Must run for BOTH inline and deferred modes — outside the deferred dispatch gate.
+  if (g_ssgi_enabled > 0.5f && d->captured_light_buffer_texture.handle) {
+    auto bb = sc->get_back_buffer(0);
+    if (bb.handle) {
+      // Recreate capture texture if back buffer format changed (e.g. HDR vs SDR mismatch).
+      auto bb_desc = dev->get_resource_desc(bb);
+      auto cap_desc = dev->get_resource_desc(d->captured_light_buffer_texture);
+      if (bb_desc.texture.format != cap_desc.texture.format
+          || bb_desc.texture.width != cap_desc.texture.width
+          || bb_desc.texture.height != cap_desc.texture.height) {
+        if (d->captured_light_buffer_srv.handle) dev->destroy_resource_view(d->captured_light_buffer_srv);
+        if (d->captured_light_buffer_texture.handle) dev->destroy_resource(d->captured_light_buffer_texture);
+        d->captured_light_buffer_srv = {};
+        d->captured_light_buffer_texture = {};
+        reshade::api::resource_desc rd = {};
+        rd.type = reshade::api::resource_type::texture_2d;
+        rd.texture = {bb_desc.texture.width, bb_desc.texture.height, 1, 1, bb_desc.texture.format, 1};
+        rd.heap = reshade::api::memory_heap::gpu_only;
+        rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+        dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
+                             &d->captured_light_buffer_texture);
+        dev->create_resource_view(d->captured_light_buffer_texture,
+                                   reshade::api::resource_usage::shader_resource,
+                                   reshade::api::resource_view_desc(
+                                       reshade::api::resource_view_type::texture_2d,
+                                       bb_desc.texture.format, 0, 1, 0, 1),
+                                   &d->captured_light_buffer_srv);
+      }
+      cl->barrier(bb, reshade::api::resource_usage::present,
+                  reshade::api::resource_usage::copy_source);
+      cl->barrier(d->captured_light_buffer_texture,
+                  reshade::api::resource_usage::shader_resource,
+                  reshade::api::resource_usage::copy_dest);
+      cl->copy_texture_region(bb, 0, nullptr,
+                              d->captured_light_buffer_texture, 0, nullptr);
+      cl->barrier(d->captured_light_buffer_texture,
+                  reshade::api::resource_usage::copy_dest,
+                  reshade::api::resource_usage::shader_resource);
+      cl->barrier(bb, reshade::api::resource_usage::copy_source,
+                  reshade::api::resource_usage::present);
+    }
+  }
+  // Use deferred snapshots from lighting draw (kai-style) — deferred dispatch only.
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     if (shader_injection.xegtao_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::warning,
@@ -1138,21 +1198,16 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
        std::to_string(d->working_width) + "x" +
        std::to_string(d->working_height) + ")").c_str());
 
-  // Save command-list state (unless RunXeGTAO handles it via batched state).
+  // Save command-list state.
+  auto* cs = renodx::utils::state::GetCurrentState(cl);
   renodx::utils::state::CommandListState prev = {};
-  if (g_cpuopt_batched_state < 0.5f) {
-    auto* cs = renodx::utils::state::GetCurrentState(cl);
-    if (cs) prev = *cs;
-  }
+  if (cs) prev = *cs;
 
   bool ok = RunXeGTAO(cl, d);
 
-  // Restore only if RunXeGTAO didn't already (batched state).
-  if (g_cpuopt_batched_state < 0.5f) {
-    cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-    auto* cs = renodx::utils::state::GetCurrentState(cl);
-    if (cs) *cs = prev;
-  }
+  // Restore: unbind compute pipeline, restore descriptor tables.
+  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+  if (cs) *cs = prev;
 
   if (shader_injection.xegtao_debug_logging > 0.5f && ok) {
     std::ostringstream msg;
@@ -1165,29 +1220,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   // ── SSGI deferred dispatch (runs after XeGTAO, using its depth MIPs) ──
   if (g_ssgi_enabled > 0.5f && d->ssgi_output_srv.handle
-      && d->captured_light_buffer_srv.handle) {
+      && (d->captured_color_srv.handle || d->captured_light_buffer_srv.handle)) {
     RunSSGI(cl, d);
     cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
   }
 
-  // ── Light buffer capture for SSGI (next frame's input) ──
-  if (g_ssgi_enabled > 0.5f && d->captured_light_buffer_texture.handle) {
-    auto bb = sc->get_back_buffer(0);
-    if (bb.handle) {
-      cl->barrier(bb, reshade::api::resource_usage::present,
-                  reshade::api::resource_usage::copy_source);
-      cl->barrier(d->captured_light_buffer_texture,
-                  reshade::api::resource_usage::shader_resource,
-                  reshade::api::resource_usage::copy_dest);
-      cl->copy_texture_region(bb, 0, nullptr,
-                              d->captured_light_buffer_texture, 0, nullptr);
-      cl->barrier(d->captured_light_buffer_texture,
-                  reshade::api::resource_usage::copy_dest,
-                  reshade::api::resource_usage::shader_resource);
-      cl->barrier(bb, reshade::api::resource_usage::copy_source,
-                  reshade::api::resource_usage::present);
-    }
-  }
   shader_injection.xegtao_ssgi_bound = 0.f;  // Reset for next frame's SSAO pass
 }
 
@@ -1217,17 +1254,14 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (g_cpuopt_deferred_dispatch < 0.5f) {
     if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid
         && dd->ao_term_a_srv.handle) {
-      renodx::utils::state::CommandListState prev = {};
       auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+      renodx::utils::state::CommandListState prev = {};
       if (cs) prev = *cs;
 
       bool ok = RunXeGTAO(cmd_list, dd);
 
-      // Restore only if RunXeGTAO didn't already (batched state).
-      if (g_cpuopt_batched_state < 0.5f) {
-        cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-        if (cs) *cs = prev;
-      }
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+      if (cs) *cs = prev;
       (void)ok;
     }
   }
@@ -1252,18 +1286,34 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     shader_injection.xegtao_dedicated_bound = 1.f;
   }
 
-  // ── SSGI dispatch + push t23 ──
+  // ── SSGI inline dispatch (only when NOT deferred) ──
   shader_injection.xegtao_ssgi_bound = 0.f;
-  if (g_ssgi_enabled > 0.5f
-      && dd->ssgi_output_srv.handle) {
-    // Inline dispatch (only when NOT deferred): run SSGI, push fresh result.
-    // Deferred mode: push previous frame's denoised result from OnPresent.
-    if (g_cpuopt_deferred_dispatch < 0.5f) {
-      if (dd->captured_light_buffer_srv.handle) {
-        RunSSGI(cmd_list, dd);
-      }
+  shader_injection.xegtao_ssgi_debug = 0.f;
+  if (g_ssgi_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f) {
+    if (dd->ssgi_output_srv.handle
+        && (dd->captured_color_srv.handle || dd->captured_light_buffer_srv.handle)) {
+      RunSSGI(cmd_list, dd);
     }
-    if (dd->ssgi_denoised_srv.handle) {
+  }
+
+  // ── SSGI push t23 (runs for BOTH inline and deferred modes) ──
+  if (g_ssgi_enabled > 0.5f) {
+    reshade::api::resource_view ssgi_push_srv =
+        dd->ssgi_denoised_srv.handle ? dd->ssgi_denoised_srv : dd->fallback_srv;
+    if (g_ssgi_debug_view > 0.5f) {
+      int dv = (int)g_ssgi_debug_view;
+      if (dv == 1)      ssgi_push_srv = dd->ssgi_output_srv;           // Raw GI
+      else if (dv == 2) ssgi_push_srv = dd->ssgi_denoised_srv.handle
+          ? dd->ssgi_denoised_srv : dd->ssgi_output_srv;                // Denoised (fallback to raw)
+      else if (dv == 3) {                                               // Light Buffer (same source as SSGI)
+        ssgi_push_srv = dd->captured_color_srv.handle ? dd->captured_color_srv :
+                        (dd->captured_light_buffer_srv.handle ? dd->captured_light_buffer_srv : dd->fallback_srv);
+      }
+      else if (dv == 4) ssgi_push_srv = dd->captured_color_srv;         // Color t0 (raw)
+      shader_injection.xegtao_ssgi_debug = 1.f;  // Tell shader to REPLACE scene with SSGI
+    }
+    if (!ssgi_push_srv.handle) ssgi_push_srv = dd->fallback_srv;
+    if (ssgi_push_srv.handle) {
       // Push SSGI result to t23
       cmd_list->push_descriptors(
           reshade::api::shader_stage::pixel,
@@ -1272,7 +1322,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           reshade::api::descriptor_table_update{
               {}, kLightingSsgiRegister, 0, 1,
               reshade::api::descriptor_type::texture_shader_resource_view,
-              &dd->ssgi_denoised_srv,
+              &ssgi_push_srv,
           });
       shader_injection.xegtao_ssgi_bound = 1.f;
     }
@@ -1525,12 +1575,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 
 static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return;
-  // CPU opt: suppress descriptor capture events during our own dispatch (kai-style).
-  struct ScopedDispatchGuard {
-    bool prev;
-    ScopedDispatchGuard() : prev(g_xegtao_dispatch_in_progress) { g_xegtao_dispatch_in_progress = true; }
-    ~ScopedDispatchGuard() { g_xegtao_dispatch_in_progress = prev; }
-  } _guard;
+  // Frame skip
   if (g_cpuopt_ssgi_frame_skip > 0.5f) {
     uint64_t n = (uint64_t)g_cpuopt_ssgi_frame_skip + 1u;
     if ((d->frame_index % n) != 0u) return;
@@ -1562,12 +1607,17 @@ static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
   };
 
   // SSGI pass: 3 SRVs (depth MIPs, MRT normal, light buffer), 1 UAV (GI output)
+  // Light buffer prefers t0 color texture (scene before lighting) —
+  // matches the paper's "direct lighting only" better than back-buffer copy.
+  reshade::api::resource_view light_buf_srv =
+      d->captured_color_srv.handle ? d->captured_color_srv :
+      (d->captured_light_buffer_srv.handle ? d->captured_light_buffer_srv : d->fallback_srv);
   cl->bind_pipeline(AC, d->ssgi_pipeline);
   {
     reshade::api::resource_view ssgi_srvs[3] = {
         d->depth_mips_srv,
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
-        d->captured_light_buffer_srv.handle ? d->captured_light_buffer_srv : d->fallback_srv,
+        light_buf_srv,
     };
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
@@ -1582,7 +1632,9 @@ static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
     pc[26] = g_ssgi_directions;
     pc[27] = g_ssgi_thickness;
     pc[28] = g_ssgi_intensity;
+    pc[29] = g_ssgi_light_exposure;  // HDR light buffer exposure
     pc[30] = g_ssgi_step_distribution;
+    pc[31] = g_ssgi_experimental_fix; // experimental fix selector
     cl->push_constants(CS, d->ssgi_layout, kXeGtaoPushConstantsLayoutParam, 0, 32, pc.data());
   }
   cl->dispatch((ssgi_w + 7) / 8, (ssgi_h + 7) / 8, 1);
@@ -1611,12 +1663,6 @@ static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
 
 static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return false;
-  // CPU opt: suppress descriptor capture events during our own dispatch (kai-style).
-  struct ScopedDispatchGuard {
-    bool prev;
-    ScopedDispatchGuard() : prev(g_xegtao_dispatch_in_progress) { g_xegtao_dispatch_in_progress = true; }
-    ~ScopedDispatchGuard() { g_xegtao_dispatch_in_progress = prev; }
-  } _guard;
   // Frame skip
   if (g_cpuopt_xegtao_frame_skip > 0.5f) {
     uint64_t n = (uint64_t)g_cpuopt_xegtao_frame_skip + 1u;
@@ -1639,13 +1685,6 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     reshade::log::message(reshade::log::level::info,
       (std::string("[XeGTAO] RunXeGTAO: dispatching pass 1 (") +
        std::to_string(w) + "x" + std::to_string(h) + ")").c_str());
-
-  // CPU opt: save/restore command list state once for all passes.
-  renodx::utils::state::CommandListState batched_prev = {};
-  if (g_cpuopt_batched_state > 0.5f) {
-    auto* cs = renodx::utils::state::GetCurrentState(cl);
-    if (cs) batched_prev = *cs;
-  }
 
   auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
     if (r.handle) cl->barrier(r, o, n);
@@ -1758,13 +1797,6 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] All passes complete.");
-
-  // CPU opt: restore state after all passes.
-  if (g_cpuopt_batched_state > 0.5f) {
-    cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-    auto* cs = renodx::utils::state::GetCurrentState(cl);
-    if (cs) *cs = batched_prev;
-  }
   return true;
 }
 
