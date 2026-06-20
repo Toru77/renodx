@@ -135,6 +135,15 @@ static float g_ssgi_xegtao_thin_occluder_comp = 0.5f;
 static float g_ssgi_xegtao_depth_mip_offset  = 3.30f;
 static float g_ssgi_xegtao_denoise_blur_beta = 20.0f;
 
+// ── CPU optimization toggles (each independently testable) ──
+// ── CPU optimization toggles ──
+static float g_cpuopt_xegtao_frame_skip   = 0.f;
+static float g_cpuopt_ssgi_frame_skip     = 0.f;
+static float g_cpuopt_deferred_dispatch   = 0.f;  // dispatch XeGTAO/SSGI in OnPresent, not inline
+static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
+static float g_cpuopt_suppress_capture    = 0.f;  // skip descriptor capture events during our dispatches
+static float g_cpuopt_batched_state       = 0.f;  // save/restore cmd list state once for all XeGTAO passes
+
 using XeGTAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount>;
 
@@ -202,6 +211,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Deferred dispatch snapshots (kai-style): captured at lighting draw, used at present.
   reshade::api::resource_view deferred_depth_srv = {};
   reshade::api::resource_view deferred_ssao_srv = {};
+  reshade::api::resource_view deferred_mrt_normal_srv = {};
   reshade::api::resource_view deferred_scene_cbv_view = {};
   reshade::api::buffer_range deferred_scene_cbv = {};
   bool deferred_scene_cbv_valid = false;
@@ -224,6 +234,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   XeGTAODescriptorTableSet ssgi_tables = {};
   XeGTAODescriptorTableSet ssgi_denoise_tables = {};
   bool ssgi_bound = false;
+
+  // CPU optimization tracking
+  uint64_t last_bound_pipeline_handle = 0u;
+  uint64_t last_srv0_handle = 0u;
+  uint64_t last_srv1_handle = 0u;
+  uint64_t last_uav0_handle = 0u;
+  uint64_t last_cbv_handle = 0u;
+  uint64_t last_sampler_handle = 0u;
 };
 
 static void CreateXeGTAOResources(reshade::api::device* device, DeviceData* data,
@@ -719,6 +737,47 @@ renodx::utils::settings::Settings settings = {
       .min = 0.5f, .max = 20.0f, .format = "%.2f",
       .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
     },
+    // —— CPU Optimizations ——
+    new renodx::utils::settings::Setting{
+      .key = "CPUOptXeGTAOFrameSkip", .binding = &g_cpuopt_xegtao_frame_skip,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "XeGTAO Frame Skip", .section = "CPU Opt",
+      .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CPUOptSSGIFrameSkip", .binding = &g_cpuopt_ssgi_frame_skip,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "SSGI Frame Skip", .section = "CPU Opt",
+      .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
+      .tooltip = "Move XeGTAO/SSGI dispatch to OnPresent (kai-style, 1-frame latency).",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CPUOptEnsurePipelines", .binding = &g_cpuopt_ensure_pipelines,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Ensure Pipelines", .section = "CPU Opt",
+      .tooltip = "Don't destroy/recreate pipelines every frame (kai-style).",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CPUOptSuppressCapture", .binding = &g_cpuopt_suppress_capture,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Suppress Capture", .section = "CPU Opt",
+      .tooltip = "Skip descriptor capture events during our own compute dispatches.",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CPUOptBatchedState", .binding = &g_cpuopt_batched_state,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Batched State", .section = "CPU Opt",
+      .tooltip = "Save/restore command list state once for all XeGTAO passes.",
+      .labels = {"Off", "On"},
+    },
 };
 
 // ═══════════ XeGTAO Backend — implementation ═══════════
@@ -820,6 +879,9 @@ static bool IsSceneCbvCandidateValid(reshade::api::device* device,
 
 // ── Push-descriptors event → capture lighting inputs (kai pattern) ──
 
+// ── Global guard: suppress descriptor capture events during our own dispatches. ──
+static bool g_xegtao_dispatch_in_progress = false;
+
 static void OnPushDescriptorsCapture(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -827,6 +889,8 @@ static void OnPushDescriptorsCapture(
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
   if (!cmd_list) return;
+  // CPU opt: suppress capture events during our own compute dispatches (kai-style).
+  if (g_cpuopt_suppress_capture > 0.5f && g_xegtao_dispatch_in_progress) return;
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
@@ -894,6 +958,8 @@ static void OnBindDescriptorTables(
   }
 
   if (shader_injection.xegtao_mode < 0.5f && g_ssgi_enabled < 0.5f) return;
+  // CPU opt: suppress capture events during our own compute dispatches (kai-style).
+  if (g_cpuopt_suppress_capture > 0.5f && g_xegtao_dispatch_in_progress) return;
 
   // Only capture on pixel-stage draws.
   const uint32_t sm = static_cast<uint32_t>(stages);
@@ -1052,9 +1118,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
     return;
   }
-  // Restore deferred snapshots as active captures for RunXeGTAO.
+  // Restore deferred snapshots as active captures for RunXeGTAO / RunSSGI.
   d->captured_depth_srv = d->deferred_depth_srv;
   d->captured_ssao_srv = d->deferred_ssao_srv;
+  d->captured_mrt_normal_srv = d->deferred_mrt_normal_srv;
   d->captured_scene_cbv_view = d->deferred_scene_cbv_view;
   d->captured_scene_cbv = d->deferred_scene_cbv;
   d->captured_scene_cbv_valid = d->deferred_scene_cbv_valid;
@@ -1071,16 +1138,21 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
        std::to_string(d->working_width) + "x" +
        std::to_string(d->working_height) + ")").c_str());
 
-  // Save command-list state.
-  auto* cs = renodx::utils::state::GetCurrentState(cl);
+  // Save command-list state (unless RunXeGTAO handles it via batched state).
   renodx::utils::state::CommandListState prev = {};
-  if (cs) prev = *cs;
+  if (g_cpuopt_batched_state < 0.5f) {
+    auto* cs = renodx::utils::state::GetCurrentState(cl);
+    if (cs) prev = *cs;
+  }
 
   bool ok = RunXeGTAO(cl, d);
 
-  // Restore: unbind compute pipeline, restore descriptor tables.
-  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-  if (cs) *cs = prev;
+  // Restore only if RunXeGTAO didn't already (batched state).
+  if (g_cpuopt_batched_state < 0.5f) {
+    cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+    auto* cs = renodx::utils::state::GetCurrentState(cl);
+    if (cs) *cs = prev;
+  }
 
   if (shader_injection.xegtao_debug_logging > 0.5f && ok) {
     std::ostringstream msg;
@@ -1089,6 +1161,13 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     reshade::log::message(reshade::log::level::info, msg.str().c_str());
   } else if (shader_injection.xegtao_debug_logging > 0.5f && !ok) {
     reshade::log::message(reshade::log::level::warning, "[XeGTAO] Dispatch failed.");
+  }
+
+  // ── SSGI deferred dispatch (runs after XeGTAO, using its depth MIPs) ──
+  if (g_ssgi_enabled > 0.5f && d->ssgi_output_srv.handle
+      && d->captured_light_buffer_srv.handle) {
+    RunSSGI(cl, d);
+    cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
   }
 
   // ── Light buffer capture for SSGI (next frame's input) ──
@@ -1123,21 +1202,39 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (!dd) return true;
 
-  // Dispatch XeGTAO on this frame's command list (kai-style: zero latency).
-  if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid
-      && dd->ao_term_a_srv.handle) {
-    auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-    renodx::utils::state::CommandListState prev = {};
-    if (cs) prev = *cs;
-
-    bool ok = RunXeGTAO(cmd_list, dd);
-
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-    if (cs) *cs = prev;
-    (void)ok;
+  // ── Deferred dispatch path: capture snapshots for OnPresent (kai-style). ──
+  if (g_cpuopt_deferred_dispatch > 0.5f) {
+    dd->deferred_depth_srv = dd->captured_depth_srv;
+    dd->deferred_mrt_normal_srv = dd->captured_mrt_normal_srv;
+    dd->deferred_scene_cbv_view = dd->captured_scene_cbv_view;
+    dd->deferred_scene_cbv = dd->captured_scene_cbv;
+    dd->deferred_scene_cbv_valid = dd->captured_scene_cbv_valid;
+    dd->deferred_scene_cbv_frame = dd->captured_scene_cbv_frame;
+    dd->deferred_pending = true;
   }
 
-  // Push the XeGTAO AO result at t22 (fresh from dispatch above).
+  // ── Inline dispatch: Run XeGTAO on this frame's command list (only when NOT deferred). ──
+  if (g_cpuopt_deferred_dispatch < 0.5f) {
+    if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid
+        && dd->ao_term_a_srv.handle) {
+      renodx::utils::state::CommandListState prev = {};
+      auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+      if (cs) prev = *cs;
+
+      bool ok = RunXeGTAO(cmd_list, dd);
+
+      // Restore only if RunXeGTAO didn't already (batched state).
+      if (g_cpuopt_batched_state < 0.5f) {
+        cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+        if (cs) *cs = prev;
+      }
+      (void)ok;
+    }
+  }
+
+  // Push the XeGTAO AO result at t22.
+  // In inline mode: fresh from dispatch above.
+  // In deferred mode: result from previous frame's OnPresent dispatch.
   // Effective dpc = max(1, setting) — matches forced denoise in RunXeGTAO.
   int edpc = (int)shader_injection.xegtao_denoise_passes;
   if (edpc < 1) edpc = 1;
@@ -1155,23 +1252,30 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     shader_injection.xegtao_dedicated_bound = 1.f;
   }
 
-  // ── SSGI dispatch (after XeGTAO, before lighting draw) ──
+  // ── SSGI dispatch + push t23 ──
   shader_injection.xegtao_ssgi_bound = 0.f;
   if (g_ssgi_enabled > 0.5f
-      && dd->ssgi_output_srv.handle
-      && dd->captured_light_buffer_srv.handle) {
-    RunSSGI(cmd_list, dd);
-    // Push SSGI result to t23
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0},
-        0,
-        reshade::api::descriptor_table_update{
-            {}, kLightingSsgiRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &dd->ssgi_denoised_srv,
-        });
-    shader_injection.xegtao_ssgi_bound = 1.f;
+      && dd->ssgi_output_srv.handle) {
+    // Inline dispatch (only when NOT deferred): run SSGI, push fresh result.
+    // Deferred mode: push previous frame's denoised result from OnPresent.
+    if (g_cpuopt_deferred_dispatch < 0.5f) {
+      if (dd->captured_light_buffer_srv.handle) {
+        RunSSGI(cmd_list, dd);
+      }
+    }
+    if (dd->ssgi_denoised_srv.handle) {
+      // Push SSGI result to t23
+      cmd_list->push_descriptors(
+          reshade::api::shader_stage::pixel,
+          reshade::api::pipeline_layout{0},
+          0,
+          reshade::api::descriptor_table_update{
+              {}, kLightingSsgiRegister, 0, 1,
+              reshade::api::descriptor_type::texture_shader_resource_view,
+              &dd->ssgi_denoised_srv,
+          });
+      shader_injection.xegtao_ssgi_bound = 1.f;
+    }
   }
 
   return true;
@@ -1328,16 +1432,25 @@ static std::array<float, 32> BuildXeGTAOPushConstants(DeviceData* data, bool den
 // ── Pipeline creation ──
 
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData* d) {
-  // Force recreation: old 4-param layouts incompatible with new 5-param shaders.
-  auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
-  auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
+  // CPU opt: when ensure mode is on, skip destruction (kai-style).
+  // When off, force-recreate every call (legacy behavior).
+  auto dp = [&](reshade::api::pipeline& p) {
+    if (g_cpuopt_ensure_pipelines > 0.5f) return;  // keep existing
+    if (p.handle) { dev->destroy_pipeline(p); p = {}; }
+  };
+  auto dl = [&](reshade::api::pipeline_layout& l) {
+    if (g_cpuopt_ensure_pipelines > 0.5f) return;  // keep existing
+    if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; }
+  };
   dl(d->prefilter_layout); dl(d->main_layout); dl(d->denoise_layout);
   dp(d->prefilter_pipeline); dp(d->main_low_pipeline); dp(d->main_medium_pipeline);
   dp(d->main_high_pipeline); dp(d->main_ultra_pipeline); dp(d->denoise_pipeline);
   dp(d->denoise_last_pipeline);
-  DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
-  DestroyXeGTAODescriptorTables(dev, &d->main_tables);
-  DestroyXeGTAODescriptorTables(dev, &d->denoise_tables);
+  if (g_cpuopt_ensure_pipelines < 0.5f) {
+    DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
+    DestroyXeGTAODescriptorTables(dev, &d->main_tables);
+    DestroyXeGTAODescriptorTables(dev, &d->denoise_tables);
+  }
 
   auto mkcs = [&](std::span<const uint8_t> bc, const char* ep,
                   reshade::api::pipeline_layout lo, reshade::api::pipeline* out) -> bool {
@@ -1412,6 +1525,16 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 
 static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return;
+  // CPU opt: suppress descriptor capture events during our own dispatch (kai-style).
+  struct ScopedDispatchGuard {
+    bool prev;
+    ScopedDispatchGuard() : prev(g_xegtao_dispatch_in_progress) { g_xegtao_dispatch_in_progress = true; }
+    ~ScopedDispatchGuard() { g_xegtao_dispatch_in_progress = prev; }
+  } _guard;
+  if (g_cpuopt_ssgi_frame_skip > 0.5f) {
+    uint64_t n = (uint64_t)g_cpuopt_ssgi_frame_skip + 1u;
+    if ((d->frame_index % n) != 0u) return;
+  }
   auto* dev = cl->get_device();
   if (!CreateComputePipelinesIfNeeded(dev, d)) return;
   if (!EnsureXeGTAODescriptorTables(dev, d->ssgi_layout, &d->ssgi_tables)) return;
@@ -1454,7 +1577,6 @@ static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_ssgi(d->ssgi_layout, &d->ssgi_tables, 4, u);
     auto pc = BuildXeGTAOPushConstants(d, false);
-    // Map SSGI params to unused push constant slots (c[24]..c[30])
     pc[24] = g_ssgi_radius;
     pc[25] = g_ssgi_steps;
     pc[26] = g_ssgi_directions;
@@ -1489,6 +1611,17 @@ static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
 
 static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return false;
+  // CPU opt: suppress descriptor capture events during our own dispatch (kai-style).
+  struct ScopedDispatchGuard {
+    bool prev;
+    ScopedDispatchGuard() : prev(g_xegtao_dispatch_in_progress) { g_xegtao_dispatch_in_progress = true; }
+    ~ScopedDispatchGuard() { g_xegtao_dispatch_in_progress = prev; }
+  } _guard;
+  // Frame skip
+  if (g_cpuopt_xegtao_frame_skip > 0.5f) {
+    uint64_t n = (uint64_t)g_cpuopt_xegtao_frame_skip + 1u;
+    if ((d->frame_index % n) != 0u) return true;
+  }
   auto* dev = cl->get_device();
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] RunXeGTAO: creating pipelines...");
@@ -1507,6 +1640,13 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       (std::string("[XeGTAO] RunXeGTAO: dispatching pass 1 (") +
        std::to_string(w) + "x" + std::to_string(h) + ")").c_str());
 
+  // CPU opt: save/restore command list state once for all passes.
+  renodx::utils::state::CommandListState batched_prev = {};
+  if (g_cpuopt_batched_state > 0.5f) {
+    auto* cs = renodx::utils::state::GetCurrentState(cl);
+    if (cs) batched_prev = *cs;
+  }
+
   auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
     if (r.handle) cl->barrier(r, o, n);
   };
@@ -1521,22 +1661,21 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
                                 uint32_t count,
                                 const reshade::api::descriptor_table_update* updates) {
     std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> u = {};
-    for (uint32_t i = 0; i < count; ++i) {
-      u[i] = updates[i];
-      u[i].table = (*tbl)[i];
-    }
+    for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
     dev->update_descriptor_tables(count, u.data());
-    if (shader_injection.xegtao_debug_logging > 0.5f)
-      reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1: tables updated, binding...");
     std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount> b = {};
     for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
     cl->bind_descriptor_tables(CS, lo, 0, count, b.data());
   };
 
+  auto bind_pipe = [&](reshade::api::pipeline p) {
+    cl->bind_pipeline(AC, p);
+  };
+
   // Pass 1: Prefilter
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1: binding pipeline...");
-  cl->bind_pipeline(AC, d->prefilter_pipeline);
+  bind_pipe(d->prefilter_pipeline);
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1: updating descriptors...");
   {
@@ -1565,7 +1704,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     if (!mp.handle) mp = d->main_medium_pipeline;
     if (!mp.handle) mp = d->main_low_pipeline; }
   if (!mp.handle) return false;
-  cl->bind_pipeline(AC, mp);
+  bind_pipe(mp);
   {
     reshade::api::resource_view mu[2] = {d->ao_term_a_uav, d->edges_uav};
     reshade::api::resource_view main_srvs[2] = {
@@ -1601,7 +1740,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       reshade::api::resource dst_tex;
       if (use_a) { src = d->ao_term_a_srv; dst_uav = d->ao_term_b_uav; dst_tex = d->ao_term_b_texture; }
       else       { src = d->ao_term_b_srv; dst_uav = d->ao_term_a_uav; dst_tex = d->ao_term_a_texture; }
-      cl->bind_pipeline(AC, last ? d->denoise_last_pipeline : d->denoise_pipeline);
+      bind_pipe(last ? d->denoise_last_pipeline : d->denoise_pipeline);
       reshade::api::resource_view sv[2] = {src, d->edges_srv};
       reshade::api::descriptor_table_update u[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
@@ -1619,6 +1758,13 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] All passes complete.");
+
+  // CPU opt: restore state after all passes.
+  if (g_cpuopt_batched_state > 0.5f) {
+    cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+    auto* cs = renodx::utils::state::GetCurrentState(cl);
+    if (cs) *cs = batched_prev;
+  }
   return true;
 }
 
