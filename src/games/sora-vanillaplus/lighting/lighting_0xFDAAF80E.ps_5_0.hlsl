@@ -184,6 +184,7 @@ Texture2D<uint2> mrtTexture2 : register(t3);
 Texture2D<float4> depthTexture : register(t4);
 Texture2D<float4> ssaoTexture : register(t5);
 Texture2D<uint4> xegtaoTexture : register(t22);  // XeGTAO AO (r32_uint, packed 0-255)
+Texture2D<float4> ssgiTexture : register(t23);   // SSGI indirect diffuse (R16G16B16A16)
 StructuredBuffer<DeferredParam> deferredParams_g : register(t6);
 StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t7);
 Texture2D<float4> outlineShapeMask : register(t8);
@@ -245,12 +246,24 @@ void main(
 
   float3 ao_sample = ssao_sample;
   if (xegtao_bound) {
-    // r32_uint texture — must Load (no Sample on integer formats).
     uint width, height;
     xegtaoTexture.GetDimensions(width, height);
     uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
     uint4 xegtao_raw = xegtaoTexture.Load(int3(texel, 0));
-    ao_sample.x = float(xegtao_raw.x & 0xFFu) / 255.0;
+    float xegtao_ao = float(xegtao_raw.x) / 255.0;
+
+    int fix = (int)shader_injection_data.xegtao_fix_experimental;
+    if (fix == 1) {
+      ao_sample.x = 1.0;  // Neutral: test if veil is from AO value
+    } else if (fix == 2) {
+      ao_sample.x = float(xegtao_raw.x) / 255.0;  // Full uint, no 0xFF mask
+    } else if (fix == 3) {
+      ao_sample.x = 1.0 - xegtao_ao;  // Inverted encoding
+    } else if (fix == 4) {
+      ao_sample = float3(xegtao_ao, xegtao_ao, xegtao_ao);  // All channels XeGTAO
+    } else {
+      ao_sample.x = xegtao_ao;  // Default current
+    }
   }
   r4.xyz = ao_sample;
 
@@ -260,8 +273,8 @@ void main(
     int mode = (int)shader_injection_data.xegtao_debug_view;
     float hdr_scale = 0.05;
     if (mode == 1) {
-      // AO Only: greyscale AO
-      o0.rgb = float3(ao_sample.x, ao_sample.x, ao_sample.x) * hdr_scale;
+      // AO Only: red tint for visibility
+      o0.rgb = float3(ao_sample.x * hdr_scale, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode == 2) {
@@ -270,7 +283,7 @@ void main(
       xegtaoTexture.GetDimensions(width, height);
       uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
       uint4 raw = xegtaoTexture.Load(int3(texel, 0));
-      float raw_ao = float(raw.x & 0xFFu) / 255.0;
+      float raw_ao = float(raw.x) / 255.0;
       o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
@@ -281,10 +294,10 @@ void main(
       uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
       uint4 raw = xegtaoTexture.Load(int3(texel, 0));
       o0.rgba = float4(
-        float(raw.x & 0xFFu) / 255.0,
-        float(raw.y & 0xFFu) / 255.0,
-        float(raw.z & 0xFFu) / 255.0,
-        float(raw.w & 0xFFu) / 255.0
+        float(raw.x) / 255.0,
+        float(raw.y) / 255.0,
+        float(raw.z) / 255.0,
+        float(raw.w) / 255.0
       ) * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
@@ -542,6 +555,9 @@ void main(
     }
     // Apply environment SSS early in pipeline (before other effects)
     ApplyEnvSSS(r6.xyz, v1.xy, mrt0_xy_raw, is_character_pixel);
+    if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
+      r6.xyz += ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+    }
     r6.w = r0.w;
     o0.xyzw = r6.xyzw;
     o1.xyzw = r2.xyzw;
@@ -1268,6 +1284,9 @@ void main(
   r0.x = (uint)r0.x;
   o2.y = min(0x0000ffff, (uint)r0.x);
   o0.xyz = r0.yzw;
+  if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
+    o0.xyz += ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+  }
   o0.w = 1;
   o2.x = 0;
   return;

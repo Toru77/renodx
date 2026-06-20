@@ -716,8 +716,11 @@ void XeGTAO_Output( uint2 pixCoord, RWTexture2D<uint> outputTexture, AOTermType 
     lpfloat3    bentNormal = normalize(outputValue.xyz);
     outputTexture[pixCoord.xy] = XeGTAO_EncodeVisibilityBentNormal( visibility, bentNormal );
 #else
-    // r32_uint storage: no scale needed (full 32-bit range, unlike 8-bit UNORM).
-    outputTexture[pixCoord.xy] = uint(outputValue * 255.0 + 0.5);
+    // Multiply back OCCLUSION_TERM_SCALE on final output to undo the
+    // pre-denoise division in XeGTAO_OutputWorkingTerm (same as bent-normal path).
+    lpfloat vis = outputValue;
+    if (finalApply) vis = saturate(vis * (lpfloat)XE_GTAO_OCCLUSION_TERM_SCALE);
+    outputTexture[pixCoord.xy] = uint(vis * 255.0 + 0.5);
 #endif
 }
 

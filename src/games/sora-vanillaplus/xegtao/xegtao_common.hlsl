@@ -67,7 +67,7 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_normal_detail_response;
   float xegtao_normal_max_darkening;
   float xegtao_normal_darkening_mode;
-  float xegtao_denoiser_mode;
+  float xegtao_normal_transform_mode;   // 0=view_g, 1=viewInv_g, 2=passthrough
   float xegtao_copyback_preserve_yzw;
   float xegtao_isfast_passes;
   float xegtao_isfast_samples;

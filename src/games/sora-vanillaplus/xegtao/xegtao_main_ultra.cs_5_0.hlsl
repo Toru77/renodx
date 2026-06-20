@@ -1,13 +1,15 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// sora-vanillaplus XeGTAO — Pass 2: Main GTAO (Ultra quality — 32 spp)
+// sora-vanillaplus XeGTAO — Pass 2: Main GTAO (Ultra quality)
 //
-// Kai-style: builds GTAOConstants in-shader.
+// Kai-style: builds GTAOConstants in-shader, MRT normal from game g-buffer.
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "xegtao_common.hlsl"
 
 Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);
+Texture2D<uint4>       g_srcMrtNormal      : register(t1);
 SamplerState           g_samplerPointClamp : register(s0);
+
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
 RWTexture2D<float>         g_outWorkingEdges  : register(u1);
 
@@ -18,39 +20,131 @@ static lpfloat2 SpatioTemporalNoise(uint2 p, uint t)
                   frac(0.5 + (float)i * 0.5698402909980532659114));
 }
 
-static lpfloat3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r, lpfloat t, lpfloat b, lpfloat4 e, GTAOConstants consts)
+// ── Depth-derived normal (fallback) ──
+float3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r,
+                   lpfloat t, lpfloat b, lpfloat4 e, GTAOConstants consts)
 {
   float3 C = XeGTAO_ComputeViewspacePosition(u, z, consts);
   float3 L = XeGTAO_ComputeViewspacePosition(u + float2(-1, 0) * consts.ViewportPixelSize, l, consts);
-  float3 R = XeGTAO_ComputeViewspacePosition(u + float2(1, 0) * consts.ViewportPixelSize, r, consts);
-  float3 T = XeGTAO_ComputeViewspacePosition(u + float2(0, -1) * consts.ViewportPixelSize, t, consts);
-  float3 B = XeGTAO_ComputeViewspacePosition(u + float2(0, 1) * consts.ViewportPixelSize, b, consts);
-  return (lpfloat3)XeGTAO_CalculateNormal(e, C, L, R, T, B);
+  float3 R = XeGTAO_ComputeViewspacePosition(u + float2( 1, 0) * consts.ViewportPixelSize, r, consts);
+  float3 T = XeGTAO_ComputeViewspacePosition(u + float2( 0,-1) * consts.ViewportPixelSize, t, consts);
+  float3 B = XeGTAO_ComputeViewspacePosition(u + float2( 0, 1) * consts.ViewportPixelSize, b, consts);
+  return (float3)XeGTAO_CalculateNormal(e, C, L, R, T, B);
+}
+
+// ── MRT normal helpers (from kai-vanillaplus) ──
+float3 SafeNormalize3(float3 v, float3 fallback)
+{
+  float len2 = dot(v, v);
+  return (len2 < 1e-5) ? fallback : v * rsqrt(len2);
+}
+
+float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
+{
+  int2 size = max(consts.ViewportSize, int2(1, 1));
+  int2 tc = int2(pix);
+  float c = g_srcWorkingDepth.Load(int3(clamp(tc, int2(0,0), size-1), 0));
+  float l = g_srcWorkingDepth.Load(int3(clamp(tc+int2(-1,0), int2(0,0), size-1), 0));
+  float r = g_srcWorkingDepth.Load(int3(clamp(tc+int2(1,0), int2(0,0), size-1), 0));
+  float t = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,-1), int2(0,0), size-1), 0));
+  float b = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,1), int2(0,0), size-1), 0));
+  float delta = max(max(abs(l-c), abs(r-c)), max(abs(t-c), abs(b-c)));
+  return saturate(delta * 4.0);
+}
+
+float3 DecodeMrtNormalAsIs(uint2 texel)
+{
+  uint4 sample = g_srcMrtNormal.Load(int3(texel, 0));
+  float2 enc = float2((float)sample.x, (float)sample.y) * (1.0 / 32767.5) + float2(-1.0, -1.0);
+  float azimuth = 3.14159274 * enc.x;
+  float sin_a, cos_a;
+  sincos(azimuth, sin_a, cos_a);
+  float ring = sqrt(saturate(1.0 - enc.y * enc.y));
+  float3 n = float3(cos_a * ring, sin_a * ring, enc.y);
+  return SafeNormalize3(n, float3(0, 0, 1));
+}
+
+float3 TransformNormalToView(float3 decoded)
+{
+  // 0=view_g (default), 1=viewInv_g, 2=passthrough
+  float3x3 m = (float3x3)view_g;
+  if (xegtao_normal_transform_mode > 1.5) return SafeNormalize3(decoded, float3(0, 0, 1));
+  if (xegtao_normal_transform_mode > 0.5) m = (float3x3)viewInv_g;
+  float3 vn = mul(m, decoded);
+  return SafeNormalize3(vn, float3(0, 0, 1));
+}
+
+float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
+{
+  float2 u = (float2(pix) + 0.5) * consts.ViewportPixelSize;
+  float4 ul = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize);
+  float4 br = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize, int2(1,1));
+  return DepthNormal(pix, u, ul.y, ul.x, br.z, ul.z, br.x,
+      XeGTAO_CalculateEdges(ul.y, ul.x, br.z, ul.z, br.x), consts);
+}
+
+float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants consts)
+{
+  float3 depth_fallback = BuildDepthFallbackNormal(pix, consts);
+  float3 selected = depth_fallback;
+
+  if (xegtao_normal_input_mode < 0.5) return selected;
+  if (xegtao_mrt_normal_available < 0.5) return selected;
+
+  uint mw, mh;
+  g_srcMrtNormal.GetDimensions(mw, mh);
+  if (mw == 0 || mh == 0) return selected;
+
+  float2 scale = float2(mw, mh) / max(float2(working_size), 1.0.xx);
+  int2 mrt_tc = min(int2(floor((float2(pix) + 0.5) * scale)), int2(mw-1, mh-1));
+
+  float3 decoded = DecodeMrtNormalAsIs((uint2)mrt_tc);
+  if (dot(decoded, decoded) < 1e-5) return selected;
+
+  float3 mrt_normal = TransformNormalToView(decoded);
+  float3 tuned = mrt_normal;
+  tuned.xy *= max(0.0, xegtao_normal_influence);
+  tuned.z  *= max(0.0, xegtao_normal_z_preservation);
+  tuned = SafeNormalize3(tuned, mrt_normal);
+
+  float sharpness = max(0.01, xegtao_normal_sharpness);
+  float base_blend = pow(saturate(xegtao_normal_depth_blend), 1.0 / sharpness);
+  float edge_metric = ComputeDepthEdgeMetric(pix, consts);
+  float edge_att = 1.0 - saturate(edge_metric * max(0.0, xegtao_normal_edge_rejection));
+  float normal_delta = 1.0 - saturate(dot(depth_fallback, tuned));
+  float detail_response = max(0.01, xegtao_normal_detail_response);
+  float detail_gain = lerp(0.35, 1.25, pow(normal_delta, 1.0 / detail_response));
+  float final_blend = saturate(base_blend * edge_att * detail_gain);
+  if (xegtao_normal_darkening_mode < 0.5)
+    final_blend *= saturate(xegtao_normal_max_darkening);
+
+  return SafeNormalize3(lerp(depth_fallback, tuned, final_blend), depth_fallback);
 }
 
 [numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)]
 void main(uint2 p : SV_DispatchThreadID)
 {
-  uint width;
-  uint height;
+  uint width, height;
   g_srcWorkingDepth.GetDimensions(width, height);
-
   if (p.x >= width || p.y >= height) return;
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
   uint noise_idx = consts.NoiseIndex < 0 ? 0u : (uint)consts.NoiseIndex;
   lpfloat2 n = SpatioTemporalNoise(p, noise_idx);
-  float2 u = (float2(p) + 0.5f) * consts.ViewportPixelSize;
 
-  lpfloat4 ul = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(p) * consts.ViewportPixelSize);
-  lpfloat4 br = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(p) * consts.ViewportPixelSize, int2(1, 1));
-  lpfloat z = ul.y, l = ul.x, t = ul.z, r = br.z, b = br.x;
-  lpfloat4 e = XeGTAO_CalculateEdges(z, l, r, t, b);
+  lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(p, uint2(width, height), consts);
 
-  XeGTAO_MainPass(p, (lpfloat)4, (lpfloat)4, n,
-      DepthNormal(p, u, z, l, r, t, b, e, consts),
-      consts,
-      g_srcWorkingDepth, g_samplerPointClamp,
+  // Quality from push constant
+  lpfloat slice_count = 3.0;
+  lpfloat steps_per_slice = 3.0;
+  uint q = (uint)round(clamp(xegtao_quality, 0.0, 3.0));
+  if (q == 0u)      { slice_count = 2.0; steps_per_slice = 2.0; }  // Low
+  else if (q == 1u) { slice_count = 2.0; steps_per_slice = 3.0; }  // Medium
+  else if (q == 2u) { slice_count = 3.0; steps_per_slice = 3.0; }  // High
+  else              { slice_count = 4.0; steps_per_slice = 4.0; }  // Ultra
+
+  XeGTAO_MainPass(p, slice_count, steps_per_slice, n, normal,
+      consts, g_srcWorkingDepth, g_samplerPointClamp,
       g_outWorkingAOTerm, g_outWorkingEdges);
 }

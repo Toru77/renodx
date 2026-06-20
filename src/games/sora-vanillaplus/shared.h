@@ -62,6 +62,7 @@ struct ShaderInjectData {
   float xegtao_debug_logging;       // 0=Off, 1=On
   float xegtao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid XeGTAO
   float xegtao_fix_experimental;    // 0=Off, 1-5=experimental fixes for A/B testing
+  float xegtao_ssgi_bound;          // 0/1 — set at runtime: t23 holds valid SSGI GI
 };
 
 #ifndef __cplusplus
