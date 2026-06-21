@@ -1138,10 +1138,18 @@ static void OnPushDescriptorsCapture(
   // ── Capture depth/SSAO/CBV — unconditional (register-based, kai-style). ──
   if (update.type == reshade::api::descriptor_type::texture_shader_resource_view) {
     auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
+    // Capture depth t4 — ONLY from the lighting shader (hash 0xFDAAF80E).
+    // Post-processing passes may bind full-res textures at t4, overwriting the real depth.
     if (update.binding == kLightingDepthRegister && update.count >= 1
         && views[0].handle != 0u) {
-      d->captured_depth_srv = views[0];
-      d->captured_scene_cbv_frame = d->frame_index;
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (hash == 0xFDAAF80Eu) {
+          d->captured_depth_srv = views[0];
+          d->captured_scene_cbv_frame = d->frame_index;
+        }
+      }
     }
     if (update.binding == kLightingSsaoRegister && update.count >= 1
         && views[0].handle != 0u) {
@@ -1599,8 +1607,14 @@ static bool OnBeforeSsaoShaderDraw(reshade::api::command_list*) {
 static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
                                    uint32_t gw, uint32_t gh) {
   DestroyXeGTAOResources(dev, d);
-  // Use full captured depth resolution to avoid pixel-mapping artifacts (veil).
-  uint32_t w = gw, h = gh;
+  // Scale by internal resolution setting (50/75/100%) from depth buffer size.
+  // Exact match — no snapping. Shader GetDimensions() handles bounds correctly.
+  int ir = (int)shader_injection.xegtao_internal_resolution;  // 0=50%, 1=75%, 2=100%
+  float scale = (ir == 0) ? 0.5f : (ir == 1) ? 0.75f : 1.0f;
+  uint32_t w = (uint32_t)(gw * scale);
+  uint32_t h = (uint32_t)(gh * scale);
+  if (w < 64u) w = 64u;
+  if (h < 64u) h = 64u;
   d->working_width = w; d->working_height = h;
 
   {
@@ -2211,7 +2225,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
       auto pc = BuildXeGTAOPushConstants(d, last);
       cl->push_constants(CS, d->denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 48, pc.data());
-      cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
+      cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;
     }
