@@ -26,14 +26,17 @@
 // Use fp32 math for fxc / cs_5_0 compatibility.
 #define XE_GTAO_USE_HALF_FLOAT_PRECISION 0
 
+// Enable visibility bitmask AO (replaces GTAO horizon angles).
+#define XE_GTAO_USE_BITMASK 1
+
 // We do NOT compute bent normals (AO visibility only).
 // #define XE_GTAO_COMPUTE_BENT_NORMALS
 
-#include "XeGTAO.h"
-#include "XeGTAO.hlsli"
+// GI is enabled per-shader-variant via XE_GTAO_COMPUTE_GI.
+// This common header provides the bindings used when it is defined.
 
 // ── Game's scene constant buffer (b0) ──
-// Bound directly from captured scene CBV — contains view/proj matrices.
+// Must be declared BEFORE XeGTAO.hlsli so XeGTAO_MainPass can reference its members.
 cbuffer cb_scene : register(b0)
 {
   float4x4 view_g;
@@ -42,6 +45,7 @@ cbuffer cb_scene : register(b0)
 };
 
 // ── User settings via push_constants (b13) ──
+// Must be declared BEFORE XeGTAO.hlsli so XeGTAO_MainPass GI path can reference it.
 cbuffer cb_xegtao : register(b13)
 {
   float xegtao_quality;
@@ -76,7 +80,30 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_isfast_spatial_sigma;
   float xegtao_isfast_hybrid_blend;
   float xegtao_isfast_noise_available;
+  float xegtao_multibounce_saturation;  // c[32] — multi-bounce feedback color saturation
 };
+
+// ── GI-related push constant aliases (repurpose IS-FAST fields) ──
+// These must be defined BEFORE XeGTAO.hlsli so the GI path can use them.
+#define g_gi_enabled            xegtao_isfast_passes           // 0=off, 1=on
+#define g_gi_intensity          xegtao_isfast_edge_sensitivity  // [0..5]
+#define g_gi_saturation         xegtao_isfast_spatial_sigma     // [0..2]
+#define g_gi_multibounce        xegtao_isfast_hybrid_blend      // 0/1
+#define g_gi_multibounce_strength xegtao_isfast_noise_available  // [0..10] feedback intensity
+#define g_gi_multibounce_saturation xegtao_multibounce_saturation // [0..2] feedback saturation
+#define g_gi_power              xegtao_isfast_radius            // power curve
+#define g_gi_light_exposure     xegtao_isfast_samples           // HDR light buffer exposure scale
+
+// ── GI resources are passed as function parameters to XeGTAO_MainPass ──
+// (avoids fxc X3003 redefinition errors from forward declarations).
+// The wrapper .cs_5_0.hlsl files declare and pass them.
+
+// ── Helper function prototypes (defined in wrapper .cs_5_0.hlsl files) ──
+float3 DecodeMrtNormalAsIs(uint2 texel);
+float3 TransformNormalToView(float3 decoded);
+
+#include "XeGTAO.h"
+#include "XeGTAO.hlsli"
 
 // ── Build GTAOConstants from scene CB + push constants ──
 GTAOConstants BuildGTAOConstants(uint2 viewport_size)

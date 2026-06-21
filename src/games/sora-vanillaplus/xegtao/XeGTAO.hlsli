@@ -183,6 +183,38 @@ lpfloat XeGTAO_FastACos( lpfloat inX )
     return (inX >= 0) ? res : PI - res; 
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Visibility Bitmask helpers (Therrien/Levesque/Gilet 2023)
+// Replaces GTAO's two horizon angles with a uint bitmask of N_b sectors.
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define XE_GTAO_BITMASK_SECTOR_COUNT 32u
+
+// Population count (count set bits in uint).
+uint XeGTAO_CountBits(uint v)
+{
+    v = v - ((v >> 1u) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2u) & 0x33333333u);
+    v = (v + (v >> 4u)) & 0x0F0F0F0Fu;
+    v = v + (v >> 8u);
+    v = v + (v >> 16u);
+    return v & 0x3Fu;
+}
+
+// Mark sectors between minHorizon and maxHorizon as occluded.
+// minHorizon, maxHorizon: normalized [0, 1] across the hemisphere slice.
+// Uses ceil rounding: sample needs to at least touch a sector to activate it.
+uint XeGTAO_UpdateSectors(float minHorizon, float maxHorizon, uint globalOccludedBitfield)
+{
+    uint startHorizonInt = (uint)(minHorizon * XE_GTAO_BITMASK_SECTOR_COUNT);
+    uint angleHorizonInt = (uint)ceil((maxHorizon - minHorizon) * XE_GTAO_BITMASK_SECTOR_COUNT);
+    uint angleHorizonBitfield = angleHorizonInt > 0u
+        ? (0xFFFFFFFFu >> (XE_GTAO_BITMASK_SECTOR_COUNT - angleHorizonInt))
+        : 0u;
+    uint currentOccludedBitfield = angleHorizonBitfield << startHorizonInt;
+    return globalOccludedBitfield | currentOccludedBitfield;
+}
+
 uint XeGTAO_EncodeVisibilityBentNormal( lpfloat visibility, lpfloat3 bentNormal )
 {
     return XeGTAO_FLOAT4_to_R8G8B8A8_UNORM( lpfloat4( bentNormal * 0.5 + 0.5, visibility ) );
@@ -243,7 +275,15 @@ lpfloat3x3 XeGTAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
 }
 
 void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
-    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges )
+    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges
+#ifdef XE_GTAO_COMPUTE_GI
+    , bool enableGI, float giIntensity,
+    Texture2D<float4> lightBuffer, SamplerState lightSampler,
+    Texture2D<uint4> mrtNormalTexture,
+    RWTexture2D<float4> outGI
+    , RWTexture2D<float4> outDebug
+#endif
+    )
 {                                                                       
     float2 normalizedScreenPos = (pixCoord + float2( 0.5, 0.5 )) * consts.ViewportPixelSize;
 
@@ -321,6 +361,14 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #else
     lpfloat3 bentNormal = viewspaceNormal;
 #endif
+#ifdef XE_GTAO_COMPUTE_GI
+    float3 giAccum = float3(0, 0, 0);
+#endif
+    // ── Debug accumulators for bitmask viz (modes 6-8) ──
+    uint debugTotalSectorCoverage = 0u;
+    uint debugTotalSamples = 0u;
+    uint debugFirstSliceBitmask = 0u;
+    bool debugFirstSliceSaved = false;
 
 #ifdef XE_GTAO_SHOW_DEBUG_VIZ
     float3 dbgWorldPos          = mul(g_globals.ViewInv, float4(pixCenterPos, 1)).xyz;
@@ -405,6 +453,155 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // line 15 from the paper
             lpfloat n = signNorm * XeGTAO_FastACos(cosNorm);
 
+#ifdef XE_GTAO_USE_BITMASK
+            // ═══════════════════════════════════════════════════════════════
+            // Visibility Bitmask AO + optional GI
+            // Replaces GTAO horizon angles with a uint bitmask.
+            // Therrien/Levesque/Gilet 2023, Algorithm 1.
+            // ═══════════════════════════════════════════════════════════════
+
+            // Bitmask for this slice (0 = unoccluded, 1 = occluded).
+            uint sliceBitmask = 0u;
+#ifdef XE_GTAO_COMPUTE_GI
+            float3 sliceGI = float3(0, 0, 0);
+#endif
+
+            [unroll]
+            for( lpfloat step = 0; step < stepsPerSlice; step++ )
+            {
+                // R1 sequence (http://extremelearning.com.au/unreasonable-effectiveness-of-quasirandom-sequences/)
+                const lpfloat stepBaseNoise = lpfloat(slice + step * stepsPerSlice) * 0.6180339887498948482;
+                lpfloat stepNoise = frac(noiseSample + stepBaseNoise);
+
+                lpfloat s = (step+stepNoise) / (stepsPerSlice);
+                s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
+                s += minS;
+
+                lpfloat2 sampleOffset = s * omega;
+                lpfloat sampleOffsetLength = length( sampleOffset );
+                const lpfloat mipLevel = (lpfloat)clamp( log2( sampleOffsetLength ) - consts.DepthMIPSamplingOffset, 0, XE_GTAO_DEPTH_MIP_LEVELS );
+                sampleOffset = round(sampleOffset) * (lpfloat2)consts.ViewportPixelSize;
+
+                // ── Sample both sides along the slice ──
+                // Unroll the two sides: side 0 = +offset, side 1 = -offset.
+                [unroll]
+                for( int side = 0; side < 2; side++ )
+                {
+                    float sideSign = (side == 0) ? 1.0 : -1.0;
+                    float2 sampleScreenPos = normalizedScreenPos + sampleOffset * sideSign;
+                    float  SZ = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos, mipLevel ).x;
+                    float3 samplePos = XeGTAO_ComputeViewspacePosition( sampleScreenPos, SZ, consts );
+
+                    float3 sampleDelta = samplePos - float3(pixCenterPos);
+                    lpfloat sampleDist = (lpfloat)length( sampleDelta );
+
+                    // ── Experimental fix mode from push constant c[24] ──
+                    int fixMode = (int)xegtao_copyback_preserve_yzw;
+
+                    // Skip samples beyond the effect radius.
+                    if (sampleDist > effectRadius) continue;
+
+                    // Compute effective thickness.
+                    // BUG: constant thickness can exceed sampleDist for near samples,
+                    // pushing back-face behind the pixel and saturating all sectors.
+                    float thickness = (float)thinOccluderCompensation;
+                    // Fix 1: clamp thickness to 50% of sample distance.
+                    if (fixMode == 1) thickness = min(thickness, (float)sampleDist * 0.5f);
+                    // Fix 2: clamp thickness to 100% of sample distance.
+                    if (fixMode == 2) thickness = min(thickness, (float)sampleDist);
+                    // Fix 3: scale thickness by (1 - distance/radius) → near=thicker, far=thinner.
+                    if (fixMode == 3) thickness = thickness * (1.0f - (float)sampleDist / max(effectRadius, 0.001f));
+                    // Fix 4: skip sample if back-face would go behind pixel.
+                    if (fixMode == 4 && (float)sampleDist < thickness) continue;
+                    // Fix 5: skip sample if thickness > 2x sample distance.
+                    if (fixMode == 5 && (float)sampleDist < thickness * 2.0f) continue;
+
+                    // ── Front-face and back-face (offset by thickness along viewVec) ──
+                    float3 sampleHorizonVec = (float3)(sampleDelta / sampleDist);
+                    float3 sampleDeltaBack = sampleDelta - (float3)viewVec * thickness;
+                    float3 sampleHorizonVecBack = normalize( sampleDeltaBack );
+
+                    // Horizon cosines relative to viewVec (same as GTAO's shc).
+                    float shc_front = dot(sampleHorizonVec, (float3)viewVec);
+                    float shc_back  = dot(sampleHorizonVecBack, (float3)viewVec);
+
+                    // Convert to angles, shift from viewVec to projected normal, map to [0,1].
+                    // From authors' supplemental code (bitmask_tips.txt).
+                    float2 frontBackHorizon = float2(shc_front, shc_back);
+                    frontBackHorizon.x = (float)XeGTAO_FastACos((lpfloat)frontBackHorizon.x);  // [0, π]
+                    frontBackHorizon.y = (float)XeGTAO_FastACos((lpfloat)frontBackHorizon.y);
+
+                    // Shift: authors' N = -sign(...)*acos = -n (GTAO convention).
+                    // Substituting N = -n: mapped = (sd*-angle + n + π/2)/π
+                    float sd = sideSign;  // samplingDirection: +1 right, -1 left
+                    frontBackHorizon = saturate(((sd * -frontBackHorizon) + (float)n + XE_GTAO_PI_HALF) / XE_GTAO_PI);
+
+                    // samplingDirection inverts min/max ordering.
+                    frontBackHorizon = (sd >= 0.0) ? frontBackHorizon.yx : frontBackHorizon.xy;
+
+                    // Compute sample bitmask and update global bitmask.
+                    uint sampleMask = XeGTAO_UpdateSectors(frontBackHorizon.x, frontBackHorizon.y, 0u);
+
+                    // ── Debug: track per-sample sector coverage ──
+                    debugTotalSectorCoverage += XeGTAO_CountBits(sampleMask);
+                    debugTotalSamples += 1u;
+
+#ifdef XE_GTAO_COMPUTE_GI
+                    // ── GI contribution (paper Algorithm 1, line 23) ──
+                    // b_j & ~b_i: sectors this sample covers that are NOT yet occluded.
+                    uint newSectors = sampleMask & ~sliceBitmask;
+                    uint newCount = XeGTAO_CountBits(newSectors);
+                    if (newCount > 0u && enableGI)
+                    {
+                        // Read HDR light color at sample position (with exposure scale).
+                        float3 lightColor = lightBuffer.SampleLevel(lightSampler, sampleScreenPos, 0).rgb * g_gi_light_exposure;
+
+                        // Light direction from pixel to sample.
+                        float3 lightDir = (float3)(sampleDelta / sampleDist);
+                        float NdotL = saturate(dot((float3)viewspaceNormal, lightDir));
+
+                        // Sample normal for (n_j · −l_j) weighting.
+                        // Use MRT g-buffer normal if available, else fall back to pixel normal.
+                        float3 sampleNormal = (float3)viewspaceNormal;
+                        if (xegtao_normal_input_mode > 0.5 && xegtao_mrt_normal_available > 0.5)
+                        {
+                            // Map sample screen pos to MRT texel.
+                            uint mw2, mh2;
+                            mrtNormalTexture.GetDimensions(mw2, mh2);
+                            if (mw2 > 0 && mh2 > 0)
+                            {
+                                int2 mrtTc = int2(sampleScreenPos * float2(mw2, mh2));
+                                mrtTc = clamp(mrtTc, int2(0,0), int2(mw2-1, mh2-1));
+                                float3 decoded = DecodeMrtNormalAsIs((uint2)mrtTc);
+                                sampleNormal = TransformNormalToView(decoded);
+                            }
+                        }
+                        float NsDotL = saturate(dot(sampleNormal, -lightDir));
+
+                        float weight = (float)newCount / (float)XE_GTAO_BITMASK_SECTOR_COUNT;
+                        sliceGI += weight * lightColor * NdotL * NsDotL * giIntensity;
+                    }
+#endif // XE_GTAO_COMPUTE_GI
+
+                    sliceBitmask |= sampleMask;
+                }
+            }
+
+            // ── Debug: save first slice's final bitmask ──
+            if (!debugFirstSliceSaved) {
+                debugFirstSliceBitmask = sliceBitmask;
+                debugFirstSliceSaved = true;
+            }
+
+            // ── AO for this slice: fraction of unoccluded sectors ──
+            lpfloat sliceAO = (lpfloat)1.0 - (lpfloat)XeGTAO_CountBits(sliceBitmask) / (lpfloat)XE_GTAO_BITMASK_SECTOR_COUNT;
+            visibility += sliceAO;
+
+#ifdef XE_GTAO_COMPUTE_GI
+            giAccum += sliceGI;
+#endif
+
+#else // !XE_GTAO_USE_BITMASK — original GTAO horizon-angle path (preserved)
             // this is a lower weight target; not using -1 as in the original paper because it is under horizon, so a 'weight' has different meaning based on the normal
             const lpfloat lowHorizonCos0  = cos(n+XE_GTAO_PI_HALF);
             const lpfloat lowHorizonCos1  = cos(n-XE_GTAO_PI_HALF);
@@ -543,6 +740,7 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             lpfloat iarc1 = ((lpfloat)cosNorm + (lpfloat)2 * (lpfloat)h1 * (lpfloat)sin(n)-(lpfloat)cos((lpfloat)2 * (lpfloat)h1-n))/(lpfloat)4;
             lpfloat localVisibility = (lpfloat)projectedNormalVecLength * (lpfloat)(iarc0+iarc1);
             visibility += localVisibility;
+#endif // XE_GTAO_USE_BITMASK
 
 #ifdef XE_GTAO_COMPUTE_BENT_NORMALS
             // see "Algorithm 2 Extension that computes bent normals b."
@@ -556,6 +754,10 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         visibility /= (lpfloat)sliceCount;
         visibility = pow( visibility, (lpfloat)consts.FinalValuePower );
         visibility = max( (lpfloat)0.03, visibility ); // disallow total occlusion (which wouldn't make any sense anyhow since pixel is visible but also helps with packing bent normals)
+
+#ifdef XE_GTAO_COMPUTE_GI
+        giAccum /= max((float)sliceCount, 1.0);
+#endif
 
 #ifdef XE_GTAO_COMPUTE_BENT_NORMALS
         bentNormal = normalize(bentNormal) ;
@@ -573,6 +775,36 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #endif
 
     XeGTAO_OutputWorkingTerm( pixCoord, visibility, bentNormal, outWorkingAOTerm );
+
+#ifdef XE_GTAO_COMPUTE_GI
+    // ── Debug views 6-8: bitmask visualizations (dedicated UAV, independent of GI) ──
+    int dbgMode = (int)xegtao_debug_mode;
+    if (dbgMode == 6) {
+        float avgCoverage = (debugTotalSamples > 0u)
+            ? (float)debugTotalSectorCoverage / (float)(debugTotalSamples * XE_GTAO_BITMASK_SECTOR_COUNT)
+            : 0.0f;
+        outDebug[pixCoord] = float4(avgCoverage, 0.5f * (1.0f - avgCoverage), 1.0f - avgCoverage, 1.0f);
+    } else if (dbgMode == 7) {
+        float avgOccluded = (debugTotalSamples > 0u)
+            ? (float)debugTotalSectorCoverage / (float)max(debugTotalSamples, 1u)
+            : 0.0f;
+        float gray = 1.0f - saturate(avgOccluded / (float)XE_GTAO_BITMASK_SECTOR_COUNT);
+        outDebug[pixCoord] = float4(gray, gray, gray, 1.0f);
+    } else if (dbgMode == 8) {
+        uint bm = debugFirstSliceBitmask;
+        float r = (float)(bm & 0xFFu) / 255.0f;
+        float g = (float)((bm >> 8u) & 0xFFu) / 255.0f;
+        float b = (float)((bm >> 16u) & 0xFFu) / 255.0f;
+        outDebug[pixCoord] = float4(r, g, b, 1.0f);
+    } else {
+        outDebug[pixCoord] = float4(0, 0, 0, 0);
+    }
+
+    if (enableGI)
+        outGI[pixCoord] = float4(giAccum, (float)visibility);
+    else
+        outGI[pixCoord] = float4(0, 0, 0, 0);
+#endif
 }
 
 // weighted average depth filter

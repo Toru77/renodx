@@ -74,7 +74,7 @@ ShaderInjectData shader_injection = {
   .xegtao_radius_multiplier = 1.5f,
   .xegtao_final_power = 2.0f,
   .xegtao_sample_distribution = 1.5f,
-  .xegtao_thin_occluder_comp = 0.5f,
+  .xegtao_bitmask_thickness = 0.2f,
   .xegtao_depth_mip_offset = 3.30f,
   .xegtao_denoise_blur_beta = 20.0f,
   .xegtao_internal_resolution = 100.f,
@@ -84,6 +84,15 @@ ShaderInjectData shader_injection = {
   .xegtao_fix_experimental = 0.f,
   .xegtao_ssgi_bound = 0.f,
   .xegtao_ssgi_debug = 0.f,
+  .ssgi_enabled = 0.f,
+  .ssgi_intensity = 1.0f,
+  .ssgi_saturation = 1.0f,
+  .ssgi_multibounce = 0.f,
+  .ssgi_multibounce_strength = 1.f,
+  .ssgi_multibounce_saturation = 1.f,
+  .ssgi_gi_power = 1.5f,
+  .ssgi_debug_logging = 0.f,
+  .ssgi_debug_view = 0.f,
 };
 
 // ═══════════ XeGTAO Backend — constants, types, fwd decls ═══════════
@@ -113,38 +122,13 @@ static float g_xegtao_normal_max_darkening  = 0.50f;
 static float g_xegtao_normal_darkening_mode = 0.f;
 static float g_xegtao_normal_transform_mode = 0.f; // 0=view_g, 1=viewInv_g, 2=passthrough
 
-// ── SSGI (Visibility Bitmask Indirect Diffuse) globals ──
-static float g_ssgi_enabled              = 0.f;
-static float g_ssgi_radius               = 2.0f;
-static float g_ssgi_steps                = 12.f;
-static float g_ssgi_directions           = 4.f;
-static float g_ssgi_thickness            = 0.2f;
-static float g_ssgi_intensity            = 1.0f;
-static float g_ssgi_step_distribution    = 1.f;  // 0=constant, 1=exponential
-static float g_ssgi_resolution           = 0.f;   // 0=full, 1=half
-static float g_ssgi_multibounce          = 1.f;
-static float g_ssgi_light_exposure       = 1.f;  // exposure scale for HDR light buffer (lower = dimmer GI)
-static float g_ssgi_experimental_fix     = 0.f;  // 0=Off, 1-5=experimental algorithm fixes
+// ── SSGI globals removed — now controlled via ShaderInjectData fields (shared.h). ──
+// ssgi_enabled, ssgi_intensity, ssgi_saturation, ssgi_multibounce, ssgi_gi_power
+// are all part of shader_injection and pushed via BuildXeGTAOPushConstants.
+static float g_ssgi_light_exposure = 0.05f;  // HDR light buffer exposure scale (lower = dimmer GI)
 
-// ── SSGI's own XeGTAO settings (override standalone when SSGI is on) ──
-static float g_ssgi_xegtao_quality_level     = 2.f;
-static float g_ssgi_xegtao_denoise_passes    = 1.f;
-static float g_ssgi_xegtao_radius            = 0.5f;
-static float g_ssgi_xegtao_falloff_range     = 0.615f;
-static float g_ssgi_xegtao_radius_multiplier = 1.5f;
-static float g_ssgi_xegtao_final_power       = 2.0f;
-static float g_ssgi_xegtao_sample_distribution = 1.5f;
-static float g_ssgi_xegtao_thin_occluder_comp = 0.5f;
-static float g_ssgi_xegtao_depth_mip_offset  = 3.30f;
-static float g_ssgi_xegtao_denoise_blur_beta = 20.0f;
-
-// ── SSGI debug views ──
-static float g_ssgi_debug_view = 0.f;  // 0=Off, 1=Raw GI, 2=Denoised GI, 3=Light Buffer
-
-// ── CPU optimization toggles (each independently testable) ──
 // ── CPU optimization toggles ──
 static float g_cpuopt_xegtao_frame_skip   = 0.f;
-static float g_cpuopt_ssgi_frame_skip     = 0.f;
 static float g_cpuopt_deferred_dispatch   = 0.f;  // dispatch XeGTAO/SSGI in OnPresent, not inline
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 
@@ -223,7 +207,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t deferred_scene_cbv_frame = UINT64_MAX;
   bool deferred_pending = false;
 
-  // ── SSGI resources ──
+  // ── GI resources (now integrated — no separate SSGI pipeline) ──
   reshade::api::resource ssgi_output_texture = {};
   reshade::api::resource_view ssgi_output_srv = {};
   reshade::api::resource_view ssgi_output_uav = {};
@@ -232,12 +216,20 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view ssgi_denoised_uav = {};
   reshade::api::resource captured_light_buffer_texture = {};
   reshade::api::resource_view captured_light_buffer_srv = {};
-  reshade::api::pipeline_layout ssgi_layout = {};
-  reshade::api::pipeline_layout ssgi_denoise_layout = {};
-  reshade::api::pipeline ssgi_pipeline = {};
-  reshade::api::pipeline ssgi_denoise_pipeline = {};
-  XeGTAODescriptorTableSet ssgi_tables = {};
-  XeGTAODescriptorTableSet ssgi_denoise_tables = {};
+  bool captured_light_buffer_valid = false;   // true after first frame's capture
+  // ── Multi-bounce accumulation (HDR light buffer + previous GI) ──
+  reshade::api::resource multibounce_texture = {};
+  reshade::api::resource_view multibounce_srv = {};
+  reshade::api::resource_view multibounce_uav = {};
+  reshade::api::pipeline multibounce_pipeline = {};
+  reshade::api::pipeline_layout multibounce_layout = {};
+  XeGTAODescriptorTableSet multibounce_tables = {};
+  bool ssgi_denoised_valid = false;            // true after first denoise completes
+  reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
+  // ── Debug UAV (bitmask debug views 6-8) ──
+  reshade::api::resource debug_texture = {};
+  reshade::api::resource_view debug_srv = {};
+  reshade::api::resource_view debug_uav = {};
   bool ssgi_bound = false;
 
   // CPU optimization tracking
@@ -254,7 +246,7 @@ static void CreateXeGTAOResources(reshade::api::device* device, DeviceData* data
 static void DestroyXeGTAOResources(reshade::api::device* device, DeviceData* data);
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunXeGTAO(reshade::api::command_list* cmd_list, DeviceData* data);
-static void RunSSGI(reshade::api::command_list* cmd_list, DeviceData* data);
+// SSGI is now integrated into XeGTAO main pass — no separate RunSSGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
 static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
@@ -469,69 +461,70 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 2.f, .label = "Quality Level", .section = "XeGTAO",
       .labels = {"Low", "Medium", "High", "Ultra"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoisePasses", .binding = &shader_injection.xegtao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Denoise Passes", .section = "XeGTAO",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAORadius", .binding = &shader_injection.xegtao_radius,
       .default_value = 0.5f, .label = "Radius", .section = "XeGTAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFalloffRange", .binding = &shader_injection.xegtao_falloff_range,
       .default_value = 0.615f, .label = "Falloff Range", .section = "XeGTAO",
       .min = 0.0f, .max = 1.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAORadiusMultiplier", .binding = &shader_injection.xegtao_radius_multiplier,
       .default_value = 1.457f, .label = "Radius Multiplier", .section = "XeGTAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFinalPower", .binding = &shader_injection.xegtao_final_power,
       .default_value = 2.2f, .label = "Final Power", .section = "XeGTAO",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOSampleDistribution", .binding = &shader_injection.xegtao_sample_distribution,
       .default_value = 2.0f, .label = "Sample Distribution", .section = "XeGTAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOThinOccluderComp", .binding = &shader_injection.xegtao_thin_occluder_comp,
-      .default_value = 0.0f, .label = "Thin Occluder Comp", .section = "XeGTAO",
-      .min = 0.0f, .max = 0.7f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .key = "XeGTAOBitmaskThickness", .binding = &shader_injection.xegtao_bitmask_thickness,
+      .default_value = 0.2f, .label = "Bitmask Thickness", .section = "XeGTAO",
+      .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
+      .min = 0.01f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODepthMIPOffset", .binding = &shader_injection.xegtao_depth_mip_offset,
       .default_value = 3.30f, .label = "Depth MIP Offset", .section = "XeGTAO",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoiseBlurBeta", .binding = &shader_injection.xegtao_denoise_blur_beta,
       .default_value = 1.2f, .label = "Denoise Blur Beta", .section = "XeGTAO",
       .min = 0.5f, .max = 20.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOInternalResolution", .binding = &shader_injection.xegtao_internal_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 75.f, .label = "Internal Resolution", .section = "XeGTAO",
       .labels = {"50%", "75%", "100%"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalInputMode", .binding = &g_xegtao_normal_input_mode,
@@ -539,56 +532,56 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "MRT Normal Input", .section = "XeGTAO",
       .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
       .labels = {"Off (Depth)", "On (MRT)"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalInfluence", .binding = &g_xegtao_normal_influence,
       .default_value = 1.f, .label = "Normal Influence", .section = "XeGTAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalDepthBlend", .binding = &g_xegtao_normal_depth_blend,
       .default_value = 0.5f, .label = "Normal Depth Blend", .section = "XeGTAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalSharpness", .binding = &g_xegtao_normal_sharpness,
       .default_value = 1.f, .label = "Normal Sharpness", .section = "XeGTAO",
       .min = 0.01f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalEdgeRejection", .binding = &g_xegtao_normal_edge_rejection,
       .default_value = 0.5f, .label = "Normal Edge Rejection", .section = "XeGTAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalZPreservation", .binding = &g_xegtao_normal_z_preservation,
       .default_value = 1.f, .label = "Normal Z Preservation", .section = "XeGTAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalDetailResponse", .binding = &g_xegtao_normal_detail_response,
       .default_value = 0.35f, .label = "Normal Detail Response", .section = "XeGTAO",
       .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalMaxDarkening", .binding = &g_xegtao_normal_max_darkening,
       .default_value = 0.8f, .label = "Normal Max Darkening", .section = "XeGTAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalDarkeningMode", .binding = &g_xegtao_normal_darkening_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Normal Darkening Mode", .section = "XeGTAO",
       .labels = {"Multiply", "Replace"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalTransformMode", .binding = &g_xegtao_normal_transform_mode,
@@ -596,13 +589,14 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Normal Transform Mode", .section = "XeGTAO",
       .tooltip = "How to transform MRT normals to view space. Try alternatives if normals look wrong at some camera angles.",
       .labels = {"view_g (default)", "viewInv_g", "Passthrough"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f && g_ssgi_enabled < 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODebugView", .binding = &shader_injection.xegtao_debug_view,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "XeGTAO",
-      .labels = {"Off", "AO Only", "XeGTAO raw .a", "XeGTAO RGBA", "Vanilla SSAO", "Depth"},
+      .labels = {"Off", "AO Only", "XeGTAO raw .a", "XeGTAO RGBA", "Vanilla SSAO", "Depth",
+                 "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits"},
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODebugLogging", .binding = &shader_injection.xegtao_debug_logging,
@@ -614,133 +608,83 @@ renodx::utils::settings::Settings settings = {
       .key = "XeGTAOFixExperimental", .binding = &shader_injection.xegtao_fix_experimental,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Fix Experimental", .section = "XeGTAO",
-      .tooltip = "Reserved for future A/B testing. Leave at Off.",
-      .labels = {"Off", "Reserved 1", "Reserved 2", "Reserved 3", "Reserved 4", "Reserved 5"},
+      .tooltip = "Bitmask AO experimental fixes. 0=Off (baseline). Test each mode to diagnose darkening.",
+      .labels = {"Off", "1:Clamp50%", "2:Clamp100%", "3:ScaleDist", "4:SkipBehind", "5:Skip2x"},
     },
-    // —— SSGI (Screen Space Global Illumination) ——
+    // —— SSGI (Screen Space Global Illumination — integrated into XeGTAO) ——
     new renodx::utils::settings::Setting{
-      .key = "SSGIEnable", .binding = &g_ssgi_enabled,
+      .key = "SSGIEnable", .binding = &shader_injection.ssgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "SSGI Enable", .section = "SSGI",
-      .tooltip = "Visibility bitmask indirect diffuse from screen-space GI.",
+      .tooltip = "Visibility bitmask indirect diffuse GI. Requires XeGTAO Mode = On.",
       .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIRadius", .binding = &g_ssgi_radius,
-      .default_value = 2.0f, .label = "Radius", .section = "SSGI",
-      .min = 0.1f, .max = 10.0f, .format = "%.1f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGISteps", .binding = &g_ssgi_steps,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 12.f, .label = "Steps", .section = "SSGI",
-      .labels = {"4", "8", "12", "16", "20", "24", "28", "32"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIDirections", .binding = &g_ssgi_directions,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Directions", .section = "SSGI",
-      .labels = {"1", "2", "3", "4", "5", "6"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIThickness", .binding = &g_ssgi_thickness,
-      .default_value = 0.2f, .label = "Thickness", .section = "SSGI",
-      .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIIntensity", .binding = &g_ssgi_intensity,
+      .key = "SSGIIntensity", .binding = &shader_injection.ssgi_intensity,
       .default_value = 1.0f, .label = "Intensity", .section = "SSGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIStepDistribution", .binding = &g_ssgi_step_distribution,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Step Distribution", .section = "SSGI",
-      .labels = {"Constant", "Exponential"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .key = "SSGISaturation", .binding = &shader_injection.ssgi_saturation,
+      .default_value = 1.0f, .label = "Saturation", .section = "SSGI",
+      .tooltip = "0 = grayscale GI, 1 = full color GI.",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIResolution", .binding = &g_ssgi_resolution,
+      .key = "SSGIMultiBounce", .binding = &shader_injection.ssgi_multibounce,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Resolution", .section = "SSGI",
-      .labels = {"Full", "Half"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounce", .binding = &g_ssgi_multibounce,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Multi-Bounce", .section = "SSGI",
-      .tooltip = "Feed SSGI output back for multiple light bounces.",
+      .default_value = 0.f, .label = "Multi-Bounce", .section = "SSGI",
+      .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    // —— XeGTAO settings under SSGI (override standalone when SSGI is on) ——
-    new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAOQuality", .binding = &g_ssgi_xegtao_quality_level,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "XeGTAO Quality", .section = "SSGI",
-      .labels = {"Low", "Medium", "High", "Ultra"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAODenoisePasses", .binding = &g_ssgi_xegtao_denoise_passes,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "XeGTAO Denoise", .section = "SSGI",
-      .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .key = "SSGIMultiBounceStrength", .binding = &shader_injection.ssgi_multibounce_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Multi-Bounce Strength", .section = "SSGI",
+      .tooltip = "Intensity of the multi-bounce feedback. 1.0 = natural, higher = stronger accumulation.",
+      .min = 0.0f, .max = 10.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAORadius", .binding = &g_ssgi_xegtao_radius,
-      .default_value = 0.5f, .label = "XeGTAO Radius", .section = "SSGI",
-      .min = 0.01f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .key = "SSGIMultiBounceSaturation", .binding = &shader_injection.ssgi_multibounce_saturation,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Multi-Bounce Saturation", .section = "SSGI",
+      .tooltip = "Color saturation of the multi-bounce feedback. 0 = grayscale, 1 = full color.",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAOFalloff", .binding = &g_ssgi_xegtao_falloff_range,
-      .default_value = 0.615f, .label = "XeGTAO Falloff", .section = "SSGI",
-      .min = 0.0f, .max = 1.0f, .format = "%.3f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAORadiusMult", .binding = &g_ssgi_xegtao_radius_multiplier,
-      .default_value = 1.5f, .label = "XeGTAO Radius Mult", .section = "SSGI",
-      .min = 0.3f, .max = 3.0f, .format = "%.3f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAOFinalPower", .binding = &g_ssgi_xegtao_final_power,
-      .default_value = 2.0f, .label = "XeGTAO Final Power", .section = "SSGI",
+      .key = "SSGIGIPower", .binding = &shader_injection.ssgi_gi_power,
+      .default_value = 1.5f, .label = "GI Power", .section = "SSGI",
+      .tooltip = "Power curve applied to GI output. Higher = more contrast.",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAOSampleDist", .binding = &g_ssgi_xegtao_sample_distribution,
-      .default_value = 1.5f, .label = "XeGTAO Sample Dist", .section = "SSGI",
-      .min = 1.0f, .max = 3.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .key = "SSGILightExposure", .binding = &g_ssgi_light_exposure,
+      .default_value = 0.05f, .label = "Light Exposure", .section = "SSGI",
+      .tooltip = "Exposure scale for HDR light buffer. Start at 0.05. Lower = dimmer GI.",
+      .min = 0.001f, .max = 5.0f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    },
+    // —— SSGI Debug ——
+    new renodx::utils::settings::Setting{
+      .key = "SSGIDebugView", .binding = &shader_injection.ssgi_debug_view,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
+      .tooltip = "Replace scene with SSGI debug textures. 0=Off, 1=Raw GI, 2=Denoised GI, 3=Light Buffer.",
+      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer"},
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAOThinOccluder", .binding = &g_ssgi_xegtao_thin_occluder_comp,
-      .default_value = 0.5f, .label = "XeGTAO Thin Occluder", .section = "SSGI",
-      .min = 0.0f, .max = 0.7f, .format = "%.3f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAODepthMIP", .binding = &g_ssgi_xegtao_depth_mip_offset,
-      .default_value = 3.30f, .label = "XeGTAO Depth MIP", .section = "SSGI",
-      .min = 2.0f, .max = 6.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIXeGTAODenoiseBlur", .binding = &g_ssgi_xegtao_denoise_blur_beta,
-      .default_value = 20.0f, .label = "XeGTAO Denoise Blur", .section = "SSGI",
-      .min = 0.5f, .max = 20.0f, .format = "%.2f",
-      .is_enabled = []() { return g_ssgi_enabled > 0.5f; },
+      .key = "SSGIDebugLogging", .binding = &shader_injection.ssgi_debug_logging,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "SSGI Debug Logging", .section = "SSGI",
+      .tooltip = "Log SSGI dispatch, push, and texture binding to console.",
+      .labels = {"Off", "On"},
     },
     // —— CPU Optimizations ——
     new renodx::utils::settings::Setting{
@@ -750,7 +694,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
     },
     new renodx::utils::settings::Setting{
-      .key = "CPUOptSSGIFrameSkip", .binding = &g_cpuopt_ssgi_frame_skip,
+      .key = "CPUOptSSGIFrameSkip", .binding = &g_cpuopt_xegtao_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "SSGI Frame Skip", .section = "CPU Opt",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
@@ -769,27 +713,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Don't destroy/recreate pipelines every frame (kai-style).",
       .labels = {"Off", "On"},
     },
-    // ── SSGI Debug ──
-    new renodx::utils::settings::Setting{
-      .key = "SSGIDebugView", .binding = &g_ssgi_debug_view,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
-      .tooltip = "Shows SSGI debug textures instead of blended GI (neutralizes AO).",
-      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Color Tex t0"},
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGILightExposure", .binding = &g_ssgi_light_exposure,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Light Exposure", .section = "SSGI",
-      .tooltip = "Exposure scale for the HDR light buffer. Lower values if GI is too bright/white.",
-      .min = 0.01f, .max = 10.f,
-    },
-    new renodx::utils::settings::Setting{
-      .key = "SSGIExperimentalFix", .binding = &g_ssgi_experimental_fix,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Experimental Fix", .section = "SSGI",
-      .labels = {"Off","1: Self-sample","2: No normals","3: No occlusion","4: Paper mask","5: No centering"},
-    },
+    // ── SSGI debug views removed — use XeGTAO Debug View for GI inspection. ──
 };
 
 // ═══════════ XeGTAO Backend — implementation ═══════════
@@ -950,7 +874,7 @@ static void OnPushDescriptorsCapture(
   }
 
   // ── Per-draw gating (only when XeGTAO or SSGI is on). ──
-  if (shader_injection.xegtao_mode < 0.5f && g_ssgi_enabled < 0.5f) return;
+  if (shader_injection.xegtao_mode < 0.5f) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
 }
 
@@ -976,7 +900,7 @@ static void OnBindDescriptorTables(
       std::to_string(first) + ", count=" + std::to_string(count)).c_str());
   }
 
-  if (shader_injection.xegtao_mode < 0.5f && g_ssgi_enabled < 0.5f) return;
+  if (shader_injection.xegtao_mode < 0.5f) return;
 
   // Only capture on pixel-stage draws.
   const uint32_t sm = static_cast<uint32_t>(stages);
@@ -1068,7 +992,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->frame_index++;
-  if (shader_injection.xegtao_mode < 0.5f && g_ssgi_enabled < 0.5f) return;
+  if (shader_injection.xegtao_mode < 0.5f) return;
   if (d->frame_index <= kXeGTAOStartupGuardFrames) {
     if (d->frame_index == kXeGTAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
@@ -1119,51 +1043,55 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
          std::to_string(gw) + "x" + std::to_string(gh) + ")").c_str());
     }
   }
-  // ── Light buffer capture for SSGI (next frame's input) ──
-  // Must run for BOTH inline and deferred modes — outside the deferred dispatch gate.
-  if (g_ssgi_enabled > 0.5f && d->captured_light_buffer_texture.handle) {
+  // Use deferred snapshots from lighting draw (kai-style) — deferred dispatch only.
+  // ── Light-buffer capture helper (runs after XeGTAO for multi-bounce feedback) ──
+  auto capture_light_buffer_for_next_frame = [&]() {
+    if (shader_injection.ssgi_enabled < 0.5f || !d->captured_light_buffer_texture.handle) return;
     auto bb = sc->get_back_buffer(0);
-    if (bb.handle) {
-      // Recreate capture texture if back buffer format changed (e.g. HDR vs SDR mismatch).
-      auto bb_desc = dev->get_resource_desc(bb);
-      auto cap_desc = dev->get_resource_desc(d->captured_light_buffer_texture);
-      if (bb_desc.texture.format != cap_desc.texture.format
-          || bb_desc.texture.width != cap_desc.texture.width
-          || bb_desc.texture.height != cap_desc.texture.height) {
-        if (d->captured_light_buffer_srv.handle) dev->destroy_resource_view(d->captured_light_buffer_srv);
-        if (d->captured_light_buffer_texture.handle) dev->destroy_resource(d->captured_light_buffer_texture);
-        d->captured_light_buffer_srv = {};
-        d->captured_light_buffer_texture = {};
-        reshade::api::resource_desc rd = {};
-        rd.type = reshade::api::resource_type::texture_2d;
-        rd.texture = {bb_desc.texture.width, bb_desc.texture.height, 1, 1, bb_desc.texture.format, 1};
-        rd.heap = reshade::api::memory_heap::gpu_only;
-        rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
-        dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                             &d->captured_light_buffer_texture);
-        dev->create_resource_view(d->captured_light_buffer_texture,
-                                   reshade::api::resource_usage::shader_resource,
-                                   reshade::api::resource_view_desc(
-                                       reshade::api::resource_view_type::texture_2d,
-                                       bb_desc.texture.format, 0, 1, 0, 1),
-                                   &d->captured_light_buffer_srv);
-      }
-      cl->barrier(bb, reshade::api::resource_usage::present,
-                  reshade::api::resource_usage::copy_source);
-      cl->barrier(d->captured_light_buffer_texture,
-                  reshade::api::resource_usage::shader_resource,
-                  reshade::api::resource_usage::copy_dest);
-      cl->copy_texture_region(bb, 0, nullptr,
-                              d->captured_light_buffer_texture, 0, nullptr);
-      cl->barrier(d->captured_light_buffer_texture,
-                  reshade::api::resource_usage::copy_dest,
-                  reshade::api::resource_usage::shader_resource);
-      cl->barrier(bb, reshade::api::resource_usage::copy_source,
-                  reshade::api::resource_usage::present);
+    if (!bb.handle) return;
+    // Recreate capture texture if back buffer format changed (e.g. HDR vs SDR mismatch).
+    auto bb_desc = dev->get_resource_desc(bb);
+    auto cap_desc = dev->get_resource_desc(d->captured_light_buffer_texture);
+    if (bb_desc.texture.format != cap_desc.texture.format
+        || bb_desc.texture.width != cap_desc.texture.width
+        || bb_desc.texture.height != cap_desc.texture.height) {
+      if (d->captured_light_buffer_srv.handle) dev->destroy_resource_view(d->captured_light_buffer_srv);
+      if (d->captured_light_buffer_texture.handle) dev->destroy_resource(d->captured_light_buffer_texture);
+      d->captured_light_buffer_srv = {};
+      d->captured_light_buffer_texture = {};
+      d->captured_light_buffer_valid = false;
+      reshade::api::resource_desc rd = {};
+      rd.type = reshade::api::resource_type::texture_2d;
+      rd.texture = {bb_desc.texture.width, bb_desc.texture.height, 1, 1, bb_desc.texture.format, 1};
+      rd.heap = reshade::api::memory_heap::gpu_only;
+      rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+      dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
+                           &d->captured_light_buffer_texture);
+      dev->create_resource_view(d->captured_light_buffer_texture,
+                                 reshade::api::resource_usage::shader_resource,
+                                 reshade::api::resource_view_desc(
+                                     reshade::api::resource_view_type::texture_2d,
+                                     bb_desc.texture.format, 0, 1, 0, 1),
+                                 &d->captured_light_buffer_srv);
     }
-  }
+    cl->barrier(bb, reshade::api::resource_usage::present,
+                reshade::api::resource_usage::copy_source);
+    cl->barrier(d->captured_light_buffer_texture,
+                reshade::api::resource_usage::shader_resource,
+                reshade::api::resource_usage::copy_dest);
+    cl->copy_texture_region(bb, 0, nullptr,
+                            d->captured_light_buffer_texture, 0, nullptr);
+    cl->barrier(d->captured_light_buffer_texture,
+                reshade::api::resource_usage::copy_dest,
+                reshade::api::resource_usage::shader_resource);
+    cl->barrier(bb, reshade::api::resource_usage::copy_source,
+                reshade::api::resource_usage::present);
+    d->captured_light_buffer_valid = true;
+  };
+
   // Use deferred snapshots from lighting draw (kai-style) — deferred dispatch only.
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
+    capture_light_buffer_for_next_frame();
     if (shader_injection.xegtao_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::warning,
                             "[XeGTAO] Dispatch skipped: no deferred depth SRV.");
@@ -1172,6 +1100,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   }
   if (!d->deferred_scene_cbv_valid
       || (d->frame_index - d->deferred_scene_cbv_frame) > 1u) {
+    capture_light_buffer_for_next_frame();
     if (shader_injection.xegtao_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::warning,
                             "[XeGTAO] Dispatch skipped: no deferred scene CBV.");
@@ -1218,12 +1147,12 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     reshade::log::message(reshade::log::level::warning, "[XeGTAO] Dispatch failed.");
   }
 
-  // ── SSGI deferred dispatch (runs after XeGTAO, using its depth MIPs) ──
-  if (g_ssgi_enabled > 0.5f && d->ssgi_output_srv.handle
-      && (d->captured_color_srv.handle || d->captured_light_buffer_srv.handle)) {
-    RunSSGI(cl, d);
-    cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-  }
+  // ── GI is now integrated into XeGTAO main pass (visibility bitmask AO+GI). ──
+  // The GI output (ssgi_denoised_srv) is produced during RunXeGTAO denoise pass.
+  // No separate SSGI dispatch needed.
+
+  // ── Capture light buffer for next frame's multi-bounce (after GI applied) ──
+  capture_light_buffer_for_next_frame();
 
   shader_injection.xegtao_ssgi_bound = 0.f;  // Reset for next frame's SSAO pass
 }
@@ -1232,7 +1161,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   shader_injection.xegtao_dedicated_bound = 0.f;
 
-  if (shader_injection.xegtao_mode < 0.5f && g_ssgi_enabled < 0.5f) return true;
+  if (shader_injection.xegtao_mode < 0.5f) return true;
   if (!cmd_list) return true;
 
   auto* dev = cmd_list->get_device();
@@ -1286,35 +1215,42 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     shader_injection.xegtao_dedicated_bound = 1.f;
   }
 
-  // ── SSGI inline dispatch (only when NOT deferred) ──
+  // ── SSGI push t23 (GI is produced by RunXeGTAO) ──
   shader_injection.xegtao_ssgi_bound = 0.f;
   shader_injection.xegtao_ssgi_debug = 0.f;
-  if (g_ssgi_enabled > 0.5f && g_cpuopt_deferred_dispatch < 0.5f) {
-    if (dd->ssgi_output_srv.handle
-        && (dd->captured_color_srv.handle || dd->captured_light_buffer_srv.handle)) {
-      RunSSGI(cmd_list, dd);
-    }
+
+  // Determine what to push to t23.
+  reshade::api::resource_view push_srv = {};
+  bool do_push = false;
+  bool debug_replace = false;
+
+  // SSGI debug views (1=Raw GI, 2=Denoised GI, 3=Light Buffer, 4=Accumulated).
+  if (shader_injection.ssgi_debug_view > 0.5f) {
+    int dv = (int)shader_injection.ssgi_debug_view;
+    if (dv == 1)      push_srv = dd->ssgi_output_srv;
+    else if (dv == 2) push_srv = dd->ssgi_denoised_srv;
+    else if (dv == 3) push_srv = dd->captured_color_srv.handle
+        ? dd->captured_color_srv : dd->captured_light_buffer_srv;
+    else if (dv == 4) push_srv = dd->multibounce_srv.handle
+        ? dd->multibounce_srv : dd->fallback_srv;
+    do_push = true;
+    debug_replace = true;
+  }
+  // Bitmask debug views 6-8: push dedicated debug UAV output.
+  else if (shader_injection.xegtao_debug_view > 5.5f && shader_injection.xegtao_debug_view < 8.5f) {
+    push_srv = dd->debug_srv;
+    do_push = true;
+    debug_replace = true;
+  }
+  // Normal SSGI: push denoised GI.
+  else if (shader_injection.ssgi_enabled > 0.5f) {
+    push_srv = dd->ssgi_denoised_srv;
+    do_push = true;
   }
 
-  // ── SSGI push t23 (runs for BOTH inline and deferred modes) ──
-  if (g_ssgi_enabled > 0.5f) {
-    reshade::api::resource_view ssgi_push_srv =
-        dd->ssgi_denoised_srv.handle ? dd->ssgi_denoised_srv : dd->fallback_srv;
-    if (g_ssgi_debug_view > 0.5f) {
-      int dv = (int)g_ssgi_debug_view;
-      if (dv == 1)      ssgi_push_srv = dd->ssgi_output_srv;           // Raw GI
-      else if (dv == 2) ssgi_push_srv = dd->ssgi_denoised_srv.handle
-          ? dd->ssgi_denoised_srv : dd->ssgi_output_srv;                // Denoised (fallback to raw)
-      else if (dv == 3) {                                               // Light Buffer (same source as SSGI)
-        ssgi_push_srv = dd->captured_color_srv.handle ? dd->captured_color_srv :
-                        (dd->captured_light_buffer_srv.handle ? dd->captured_light_buffer_srv : dd->fallback_srv);
-      }
-      else if (dv == 4) ssgi_push_srv = dd->captured_color_srv;         // Color t0 (raw)
-      shader_injection.xegtao_ssgi_debug = 1.f;  // Tell shader to REPLACE scene with SSGI
-    }
-    if (!ssgi_push_srv.handle) ssgi_push_srv = dd->fallback_srv;
-    if (ssgi_push_srv.handle) {
-      // Push SSGI result to t23
+  if (do_push) {
+    if (!push_srv.handle) push_srv = dd->fallback_srv;
+    if (push_srv.handle) {
       cmd_list->push_descriptors(
           reshade::api::shader_stage::pixel,
           reshade::api::pipeline_layout{0},
@@ -1322,9 +1258,18 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           reshade::api::descriptor_table_update{
               {}, kLightingSsgiRegister, 0, 1,
               reshade::api::descriptor_type::texture_shader_resource_view,
-              &ssgi_push_srv,
+              &push_srv,
           });
       shader_injection.xegtao_ssgi_bound = 1.f;
+      if (debug_replace) shader_injection.xegtao_ssgi_debug = 1.f;
+    }
+    // SSGI debug logging.
+    if (shader_injection.ssgi_debug_logging > 0.5f) {
+      std::string msg = "[SSGI] t23 push: srv=";
+      msg += push_srv.handle ? "valid" : "FALLBACK";
+      msg += " debug=" + std::to_string(debug_replace ? 1 : 0);
+      msg += " ssgi_enabled=" + std::to_string((int)shader_injection.ssgi_enabled);
+      reshade::log::message(reshade::log::level::info, msg.c_str());
     }
   }
 
@@ -1389,16 +1334,20 @@ static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
   mk(w, h, reshade::api::format::r32_float, &d->edges_texture, &d->edges_srv, &d->edges_uav);
   mk(gw, gh, reshade::api::format::r8g8b8a8_unorm, &d->composite_texture, &d->composite_srv, &d->composite_uav);
 
-  // ── SSGI resources (at working resolution, or half) ──
-  uint32_t ssgi_w = w, ssgi_h = h;
-  if (g_ssgi_resolution > 0.5f) { ssgi_w = std::max(64u, w / 2u); ssgi_h = std::max(64u, h / 2u); }
-  mk(ssgi_w, ssgi_h, reshade::api::format::r16g16b16a16_float,
+  // ── GI resources (same resolution as AO per user preference) ──
+  mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->ssgi_output_texture, &d->ssgi_output_srv, &d->ssgi_output_uav);
-  mk(ssgi_w, ssgi_h, reshade::api::format::r16g16b16a16_float,
+  mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->ssgi_denoised_texture, &d->ssgi_denoised_srv, &d->ssgi_denoised_uav);
+  mk(w, h, reshade::api::format::r8g8b8a8_unorm,
+     &d->debug_texture, &d->debug_srv, &d->debug_uav);
   // Light buffer capture at full back-buffer resolution
   mk(gw, gh, reshade::api::format::r16g16b16a16_float,
      &d->captured_light_buffer_texture, &d->captured_light_buffer_srv, nullptr);
+  // Multi-bounce accumulation buffer (HDR, same resolution as working set)
+  mk(w, h, reshade::api::format::r16g16b16a16_float,
+     &d->multibounce_texture, &d->multibounce_srv, &d->multibounce_uav);
+  d->ssgi_denoised_valid = false;
 }
 
 static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
@@ -1421,14 +1370,14 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
   DestroyXeGTAODescriptorTables(dev, &d->main_tables);
   DestroyXeGTAODescriptorTables(dev, &d->denoise_tables);
-  // SSGI resources
+  // GI resources (now integrated — no separate SSGI pipeline)
   dv(d->ssgi_output_srv); dv(d->ssgi_output_uav); dr(d->ssgi_output_texture);
   dv(d->ssgi_denoised_srv); dv(d->ssgi_denoised_uav); dr(d->ssgi_denoised_texture);
   dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
-  dp(d->ssgi_pipeline); dp(d->ssgi_denoise_pipeline);
-  dl(d->ssgi_layout); dl(d->ssgi_denoise_layout);
-  DestroyXeGTAODescriptorTables(dev, &d->ssgi_tables);
-  DestroyXeGTAODescriptorTables(dev, &d->ssgi_denoise_tables);
+  dv(d->multibounce_srv); dv(d->multibounce_uav); dr(d->multibounce_texture);
+  dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
+  dp(d->multibounce_pipeline); dl(d->multibounce_layout);
+  DestroyXeGTAODescriptorTables(dev, &d->multibounce_tables);
   // Do NOT clear captured_depth_srv / captured_scene_cbv —
   // those reference game-owned resources that survive recreation.
   d->resources_created = false;
@@ -1436,23 +1385,19 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 32> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass) {
-  std::array<float, 32> c = {};
-  const bool ssgi_on = g_ssgi_enabled > 0.5f;
-  const uint32_t denoise_passes = ssgi_on
-      ? (uint32_t)g_ssgi_xegtao_denoise_passes
-      : (uint32_t)shader_injection.xegtao_denoise_passes;
-  c[0]  = ssgi_on ? g_ssgi_xegtao_quality_level : shader_injection.xegtao_quality_level;
+static std::array<float, 40> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass) {
+  std::array<float, 40> c = {};
+  const uint32_t denoise_passes = (uint32_t)shader_injection.xegtao_denoise_passes;
+  c[0]  = shader_injection.xegtao_quality_level;
   c[1]  = (float)denoise_passes;
-  c[2]  = std::max(0.001f, ssgi_on ? g_ssgi_xegtao_radius : shader_injection.xegtao_radius);
-  c[3]  = std::clamp(ssgi_on ? g_ssgi_xegtao_falloff_range : shader_injection.xegtao_falloff_range, 0.f, 1.f);
-  c[4]  = std::clamp(ssgi_on ? g_ssgi_xegtao_radius_multiplier : shader_injection.xegtao_radius_multiplier, 0.3f, 3.f);
-  c[5]  = std::clamp(ssgi_on ? g_ssgi_xegtao_final_power : shader_injection.xegtao_final_power, 0.5f, 5.f);
-  c[6]  = std::clamp(ssgi_on ? g_ssgi_xegtao_sample_distribution : shader_injection.xegtao_sample_distribution, 1.f, 3.f);
-  c[7]  = std::clamp(ssgi_on ? g_ssgi_xegtao_thin_occluder_comp : shader_injection.xegtao_thin_occluder_comp, 0.f, 0.7f);
-  c[8]  = std::clamp(ssgi_on ? g_ssgi_xegtao_depth_mip_offset : shader_injection.xegtao_depth_mip_offset, 0.f, 30.f);
-  c[9]  = denoise_passes == 0u ? 10000.f : std::max(0.01f,
-      ssgi_on ? g_ssgi_xegtao_denoise_blur_beta : shader_injection.xegtao_denoise_blur_beta);
+  c[2]  = std::max(0.001f, shader_injection.xegtao_radius);
+  c[3]  = std::clamp(shader_injection.xegtao_falloff_range, 0.f, 1.f);
+  c[4]  = std::clamp(shader_injection.xegtao_radius_multiplier, 0.3f, 3.f);
+  c[5]  = std::clamp(shader_injection.xegtao_final_power, 0.5f, 5.f);
+  c[6]  = std::clamp(shader_injection.xegtao_sample_distribution, 1.f, 3.f);
+  c[7]  = std::clamp(shader_injection.xegtao_bitmask_thickness, 0.01f, 2.f);
+  c[8]  = std::clamp(shader_injection.xegtao_depth_mip_offset, 0.f, 30.f);
+  c[9]  = denoise_passes == 0u ? 10000.f : std::max(0.01f, shader_injection.xegtao_denoise_blur_beta);
   c[10] = denoise_passes == 0u ? 0.f : (float)((data ? data->frame_index : 0u) % 64u);
   c[11] = shader_injection.xegtao_debug_view;
   c[12] = denoise_last_pass ? 1.f : 0.f;
@@ -1467,15 +1412,24 @@ static std::array<float, 32> BuildXeGTAOPushConstants(DeviceData* data, bool den
   c[20] = g_xegtao_normal_detail_response;
   c[21] = g_xegtao_normal_max_darkening;
   c[22] = g_xegtao_normal_darkening_mode;
-  c[23] = g_xegtao_normal_transform_mode;  // 0=view_g (default), 1=viewInv_g, 2=passthrough
-  c[24] = 0.f;  // copyback_preserve_yzw
-  c[25] = 0.f;  // isfast_passes
-  c[26] = 0.f;  // isfast_samples
-  c[27] = 0.f;  // isfast_radius
-  c[28] = 0.f;  // isfast_edge_sensitivity
-  c[29] = 0.f;  // isfast_spatial_sigma
-  c[30] = 0.f;  // isfast_hybrid_blend
-  c[31] = 0.f;  // isfast_noise_available
+  c[23] = g_xegtao_normal_transform_mode;
+  c[24] = shader_injection.xegtao_fix_experimental;  // bitmask experimental fix selector (0-5)
+  // ── GI parameters (IS-FAST repurpose) ──
+  // isfast_passes (c[25]) = g_gi_enabled
+  c[25] = shader_injection.ssgi_enabled;                           // GI enable (0/1)
+  // isfast_samples (c[26]) = g_gi_light_exposure
+  c[26] = std::clamp(g_ssgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
+  // isfast_radius (c[27]) = g_gi_power
+  c[27] = std::clamp(shader_injection.ssgi_gi_power, 0.5f, 5.f);  // GI power
+  // isfast_edge_sensitivity (c[28]) = g_gi_intensity
+  c[28] = std::clamp(shader_injection.ssgi_intensity, 0.f, 5.f);  // GI intensity
+  // isfast_spatial_sigma (c[29]) = g_gi_saturation
+  c[29] = std::clamp(shader_injection.ssgi_saturation, 0.f, 2.f); // GI saturation
+  // isfast_hybrid_blend (c[30]) = g_gi_multibounce
+  c[30] = shader_injection.ssgi_multibounce;                       // multi-bounce (0/1)
+  c[31] = std::clamp(shader_injection.ssgi_multibounce_strength, 0.f, 10.f);  // feedback strength
+  c[32] = std::clamp(shader_injection.ssgi_multibounce_saturation, 0.f, 2.f); // feedback saturation
+  // c[33..39] reserved
   return c;
 }
 
@@ -1529,7 +1483,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 32;
+    push_constants_range.count = 40;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -1547,8 +1501,12 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   };
 
   if (!make_layout(1u, kXeGTAODepthMipLevels, &d->prefilter_layout)) return false;
-  if (!make_layout(2u, 2u, &d->main_layout)) return false;
-  if (!make_layout(2u, 1u, &d->denoise_layout)) return false;
+  // Main: 3 SRVs (depth MIPs, MRT normal, light buffer) + 4 UAVs (AO, edges, GI, debug)
+  if (!make_layout(3u, 4u, &d->main_layout)) return false;
+  // Denoise: 3 SRVs (AO, edges, raw GI) + 2 UAVs (denoised AO, denoised GI)
+  if (!make_layout(3u, 2u, &d->denoise_layout)) return false;
+  // Multi-bounce accumulate: 2 SRVs (color, previous GI) + 1 UAV (accumulated)
+  if (!make_layout(2u, 1u, &d->multibounce_layout)) return false;
 
   if (!d->prefilter_pipeline.handle) mkcs(__xegtao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
   if (!d->main_low_pipeline.handle)      mkcs(__xegtao_main_low, "main", d->main_layout, &d->main_low_pipeline);
@@ -1557,101 +1515,13 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->main_ultra_pipeline.handle)    mkcs(__xegtao_main_ultra, "main", d->main_layout, &d->main_ultra_pipeline);
   if (!d->denoise_pipeline.handle)       mkcs(__xegtao_denoise_pass, "main", d->denoise_layout, &d->denoise_pipeline);
   if (!d->denoise_last_pipeline.handle)  mkcs(__xegtao_denoise_last, "main", d->denoise_layout, &d->denoise_last_pipeline);
+  if (!d->multibounce_pipeline.handle)   mkcs(__xegtao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
 
-  // ── SSGI pipeline layout (sampler, cbv, 3 SRVs, 1 UAV, push_constants) ──
-  if (!make_layout(3u, 1u, &d->ssgi_layout)) return false;
-  if (!d->denoise_pipeline.handle) { /* placeholder — denoise_pipeline already created above */ }
-  if (!make_layout(2u, 1u, &d->ssgi_denoise_layout)) return false;
+  // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
+  // No separate SSGI pipeline needed — main_layout handles both AO and GI outputs.
   return d->prefilter_pipeline.handle && d->main_high_pipeline.handle
-      && d->denoise_pipeline.handle && d->denoise_last_pipeline.handle;
-}
-
-// ── SSGI Dispatch ──
-
-static void RunSSGI(reshade::api::command_list* cl, DeviceData* d) {
-  if (!d->captured_depth_srv.handle) return;
-  // Frame skip
-  if (g_cpuopt_ssgi_frame_skip > 0.5f) {
-    uint64_t n = (uint64_t)g_cpuopt_ssgi_frame_skip + 1u;
-    if ((d->frame_index % n) != 0u) return;
-  }
-  auto* dev = cl->get_device();
-  if (!CreateComputePipelinesIfNeeded(dev, d)) return;
-  if (!EnsureXeGTAODescriptorTables(dev, d->ssgi_layout, &d->ssgi_tables)) return;
-  if (!EnsureXeGTAODescriptorTables(dev, d->ssgi_denoise_layout, &d->ssgi_denoise_tables)) return;
-
-  const uint32_t w = d->working_width, h = d->working_height;
-  uint32_t ssgi_w = (g_ssgi_resolution > 0.5f) ? std::max(64u, w / 2u) : w;
-  uint32_t ssgi_h = (g_ssgi_resolution > 0.5f) ? std::max(64u, h / 2u) : h;
-
-  const auto UA = reshade::api::resource_usage::unordered_access;
-  const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto CS = reshade::api::shader_stage::all_compute;
-  const auto AC = reshade::api::pipeline_stage::all_compute;
-
-  auto apply_ssgi = [&](reshade::api::pipeline_layout lo,
-                         XeGTAODescriptorTableSet* tbl,
-                         uint32_t count,
-                         const reshade::api::descriptor_table_update* updates) {
-    std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> u = {};
-    for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
-    dev->update_descriptor_tables(count, u.data());
-    std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount> b = {};
-    for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
-    cl->bind_descriptor_tables(CS, lo, 0, count, b.data());
-  };
-
-  // SSGI pass: 3 SRVs (depth MIPs, MRT normal, light buffer), 1 UAV (GI output)
-  // Light buffer prefers t0 color texture (scene before lighting) —
-  // matches the paper's "direct lighting only" better than back-buffer copy.
-  reshade::api::resource_view light_buf_srv =
-      d->captured_color_srv.handle ? d->captured_color_srv :
-      (d->captured_light_buffer_srv.handle ? d->captured_light_buffer_srv : d->fallback_srv);
-  cl->bind_pipeline(AC, d->ssgi_pipeline);
-  {
-    reshade::api::resource_view ssgi_srvs[3] = {
-        d->depth_mips_srv,
-        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
-        light_buf_srv,
-    };
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,ssgi_srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssgi_output_uav},
-    };
-    apply_ssgi(d->ssgi_layout, &d->ssgi_tables, 4, u);
-    auto pc = BuildXeGTAOPushConstants(d, false);
-    pc[24] = g_ssgi_radius;
-    pc[25] = g_ssgi_steps;
-    pc[26] = g_ssgi_directions;
-    pc[27] = g_ssgi_thickness;
-    pc[28] = g_ssgi_intensity;
-    pc[29] = g_ssgi_light_exposure;  // HDR light buffer exposure
-    pc[30] = g_ssgi_step_distribution;
-    pc[31] = g_ssgi_experimental_fix; // experimental fix selector
-    cl->push_constants(CS, d->ssgi_layout, kXeGtaoPushConstantsLayoutParam, 0, 32, pc.data());
-  }
-  cl->dispatch((ssgi_w + 7) / 8, (ssgi_h + 7) / 8, 1);
-  cl->barrier(d->ssgi_output_texture, UA, SR);
-
-  // SSGI denoise pass
-  cl->bind_pipeline(AC, d->ssgi_denoise_pipeline);
-  {
-    reshade::api::resource_view dn_srvs[2] = {d->ssgi_output_srv, d->depth_mips_srv};
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,dn_srvs},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssgi_denoised_uav},
-    };
-    apply_ssgi(d->ssgi_denoise_layout, &d->ssgi_denoise_tables, 4, u);
-    auto pc = BuildXeGTAOPushConstants(d, false);
-    pc[24] = 1.0f;  // blur strength
-    pc[25] = 1.0f;  // depth sensitivity
-    cl->push_constants(CS, d->ssgi_denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 32, pc.data());
-  }
-  cl->dispatch((ssgi_w + 7) / 8, (ssgi_h + 7) / 8, 1);
+      && d->denoise_pipeline.handle && d->denoise_last_pipeline.handle
+      && d->multibounce_pipeline.handle;
 }
 
 // ── Dispatch ──
@@ -1672,6 +1542,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!EnsureXeGTAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
   if (!EnsureXeGTAODescriptorTables(dev, d->main_layout, &d->main_tables)) return false;
   if (!EnsureXeGTAODescriptorTables(dev, d->denoise_layout, &d->denoise_tables)) return false;
+  if (!EnsureXeGTAODescriptorTables(dev, d->multibounce_layout, &d->multibounce_tables)) return false;
 
   uint32_t w = d->working_width, h = d->working_height;
   if (w < 64 || h < 64) return false;
@@ -1721,12 +1592,66 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildXeGTAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kXeGtaoPushConstantsLayoutParam, 0, 32, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kXeGtaoPushConstantsLayoutParam, 0, 40, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1 (prefilter) done.");
+
+  // ── Multi-bounce accumulate (HDR light buffer + previous GI) ──
+  // Runs BEFORE main pass to create an HDR accumulated light buffer.
+  {
+    bool mb_enabled  = shader_injection.ssgi_multibounce > 0.5f;
+    bool mb_gi_ready = d->ssgi_denoised_valid;
+    bool mb_pipe_ok  = d->multibounce_pipeline.handle != 0u;
+    bool mb_color_ok = d->captured_color_srv.handle != 0u;
+    bool mb_prev_ok  = d->ssgi_denoised_srv.handle != 0u;
+    bool mb_uav_ok   = d->multibounce_uav.handle != 0u;
+
+    if (shader_injection.ssgi_debug_logging > 0.5f) {
+      std::string msg = "[SSGI] MultiBounce: enabled=";
+      msg += mb_enabled ? "1" : "0";
+      msg += " denoisedValid="; msg += mb_gi_ready ? "1" : "0";
+      msg += " pipeline=";      msg += mb_pipe_ok ? "OK" : "MISSING";
+      msg += " colorSRV=";      msg += mb_color_ok ? "OK" : "MISSING";
+      msg += " prevGI_SRV=";    msg += mb_prev_ok ? "OK" : "MISSING";
+      msg += " accUAV=";        msg += mb_uav_ok ? "OK" : "MISSING";
+      reshade::log::message(reshade::log::level::info, msg.c_str());
+    }
+
+    if (mb_enabled && mb_gi_ready && mb_pipe_ok) {
+      bind_pipe(d->multibounce_pipeline);
+      reshade::api::resource_view acc_color = mb_color_ok
+          ? d->captured_color_srv : d->fallback_srv;
+      reshade::api::resource_view acc_prev_gi = mb_prev_ok
+          ? d->ssgi_denoised_srv : d->fallback_srv;
+      reshade::api::resource_view acc_srvs[2] = {acc_color, acc_prev_gi};
+      reshade::api::resource_view acc_uav_arr = mb_uav_ok
+          ? d->multibounce_uav : d->fallback_uav;
+      reshade::api::descriptor_table_update au[4] = {
+        {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+        {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+        {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,acc_srvs},
+        {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
+      };
+      apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
+      cl->push_constants(CS, d->multibounce_layout, kXeGtaoPushConstantsLayoutParam, 0, 40,
+                         BuildXeGTAOPushConstants(d, false).data());
+      cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+      bar(d->multibounce_texture, UA, SR);
+      if (shader_injection.ssgi_debug_logging > 0.5f)
+        reshade::log::message(reshade::log::level::info, "[SSGI] MultiBounce: accumulate dispatched.");
+    } else if (mb_enabled && !mb_gi_ready) {
+      if (shader_injection.ssgi_debug_logging > 0.5f)
+        reshade::log::message(reshade::log::level::info,
+            "[SSGI] MultiBounce: SKIPPED (denoised GI not valid yet — first frame or XeGTAO never ran).");
+    } else if (mb_enabled && !mb_pipe_ok) {
+      if (shader_injection.ssgi_debug_logging > 0.5f)
+        reshade::log::message(reshade::log::level::warning,
+            "[SSGI] MultiBounce: SKIPPED (accumulate pipeline missing).");
+    }
+  }
 
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_high_pipeline;
@@ -1740,26 +1665,77 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!mp.handle) return false;
   bind_pipe(mp);
   {
-    reshade::api::resource_view mu[2] = {d->ao_term_a_uav, d->edges_uav};
-    reshade::api::resource_view main_srvs[2] = {
+    // Light buffer: HDR accumulated (multi-bounce ON) or direct-only (OFF).
+    reshade::api::resource_view light_buf;
+    const char* lb_source = "unknown";
+    if (shader_injection.ssgi_multibounce > 0.5f && d->ssgi_denoised_valid
+        && d->multibounce_srv.handle) {
+      // Multi-bounce ON: use HDR accumulated buffer (color + previous GI).
+      light_buf = d->multibounce_srv;
+      lb_source = "accumulated";
+    } else {
+      // Single-bounce: use direct-only HDR color texture.
+      if (d->captured_color_srv.handle) {
+        light_buf = d->captured_color_srv;
+        lb_source = "colorSRV";
+      } else if (d->captured_light_buffer_srv.handle) {
+        light_buf = d->captured_light_buffer_srv;
+        lb_source = "backbuf";
+      } else {
+        light_buf = d->fallback_srv;
+        lb_source = "FALLBACK";
+      }
+    }
+    if (shader_injection.ssgi_debug_logging > 0.5f) {
+      std::string msg = "[SSGI] Main lightBuf=";
+      msg += lb_source;
+      msg += " mbEnable="; msg += (shader_injection.ssgi_multibounce > 0.5f) ? "1" : "0";
+      msg += " mbReady=";  msg += d->ssgi_denoised_valid ? "1" : "0";
+      msg += " mbSRV=";    msg += d->multibounce_srv.handle ? "OK" : "no";
+      msg += " colorSRV="; msg += d->captured_color_srv.handle ? "OK" : "no";
+      reshade::log::message(reshade::log::level::info, msg.c_str());
+    }
+    reshade::api::resource_view main_srvs[3] = {
         d->depth_mips_srv,
-        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv
+        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
+        light_buf
+    };
+    // Shader register order: u0=AO, u1=edges, u2=GI, u3=debug
+    reshade::api::resource_view main_uavs[4] = {
+        d->ao_term_a_uav,
+        d->edges_uav,
+        d->ssgi_output_uav.handle ? d->ssgi_output_uav : d->fallback_uav,
+        d->debug_uav.handle ? d->debug_uav : d->fallback_uav
     };
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
-      {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,mu},
+      {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
+      {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildXeGTAOPushConstants(d, false);
-    cl->push_constants(CS, d->main_layout, kXeGtaoPushConstantsLayoutParam, 0, 32, pc.data());
+    cl->push_constants(CS, d->main_layout, kXeGtaoPushConstantsLayoutParam, 0, 40, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
   bar(d->edges_texture, UA, SR);
+  bar(d->ssgi_output_texture, UA, SR);  // GI output ready for denoise
+  bar(d->debug_texture, UA, SR);         // Debug output ready for read
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 2 (main) done.");
+  if (shader_injection.ssgi_debug_logging > 0.5f) {
+    std::string msg = "[SSGI] Main pass: enableGI=";
+    msg += (shader_injection.ssgi_enabled > 0.5f) ? "1" : "0";
+    msg += " intensity=" + std::to_string(shader_injection.ssgi_intensity);
+    msg += " multibounce=" + std::to_string((int)shader_injection.ssgi_multibounce);
+    msg += " lightBuf=";
+    if (shader_injection.ssgi_multibounce > 0.5f && d->ssgi_denoised_valid)
+      msg += "accumulated";
+    else
+      msg += (d->captured_color_srv.handle) ? "colorSRV" : (d->captured_light_buffer_srv.handle ? "backbuf" : "MISSING");
+    reshade::log::message(reshade::log::level::info, msg.c_str());
+  }
 
   // Pass 3: Denoise (ping-pong) — always run at least one pass to apply
   // the XE_GTAO_OCCLUSION_TERM_SCALE multiply-back (1.5x) in XeGTAO_Output.
@@ -1775,20 +1751,30 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       if (use_a) { src = d->ao_term_a_srv; dst_uav = d->ao_term_b_uav; dst_tex = d->ao_term_b_texture; }
       else       { src = d->ao_term_b_srv; dst_uav = d->ao_term_a_uav; dst_tex = d->ao_term_a_texture; }
       bind_pipe(last ? d->denoise_last_pipeline : d->denoise_pipeline);
-      reshade::api::resource_view sv[2] = {src, d->edges_srv};
+      reshade::api::resource_view sv[3] = {src, d->edges_srv,
+          d->ssgi_output_srv.handle ? d->ssgi_output_srv : d->fallback_srv};  // raw GI
+      reshade::api::resource_view dn_uavs[2] = {dst_uav,
+          d->ssgi_denoised_uav.handle ? d->ssgi_denoised_uav : d->fallback_uav};  // denoised GI
       reshade::api::descriptor_table_update u[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
         {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,sv},
-        {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&dst_uav},
+        {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,sv},
+        {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,dn_uavs},
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
       auto pc = BuildXeGTAOPushConstants(d, last);
-      cl->push_constants(CS, d->denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 32, pc.data());
+      cl->push_constants(CS, d->denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 40, pc.data());
       cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;
     }
+  }
+  bar(d->ssgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read
+  if (!d->ssgi_denoised_valid) {
+    d->ssgi_denoised_valid = true;            // Multi-bounce feedback active next frame
+    if (shader_injection.ssgi_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::info,
+          "[SSGI] MultiBounce: denoised GI now valid — accumulate will run next frame.");
   }
   if (shader_injection.xegtao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[XeGTAO] All passes complete.");

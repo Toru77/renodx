@@ -45,25 +45,36 @@ struct ShaderInjectData {
   // Debug view mode (0 = off, 1..4 = inspection views)
   float debug_show_env_sss;
 
-  // —— XeGTAO (Ground Truth Ambient Occlusion) ——
-  float xegtao_mode;                // 0=Off (vanilla AO), 1=On (XeGTAO)
+  // —— XeGTAO (Visibility Bitmask AO + optional GI) ——
+  float xegtao_mode;                // 0=Off (vanilla AO), 1=On (Bitmask AO)
   float xegtao_quality_level;       // 0=Low, 1=Medium, 2=High, 3=Ultra
   float xegtao_denoise_passes;      // 0=Off, 1..3
   float xegtao_radius;              // World-space effect radius
   float xegtao_falloff_range;       // [0..1], default 0.615
   float xegtao_radius_multiplier;   // [0.3..3], default 1.457
-  float xegtao_final_power;         // [0.5..5], default 2.2
+  float xegtao_final_power;         // [0.5..5], default 2.2 (AO power)
   float xegtao_sample_distribution; // [1..3], default 2.0
-  float xegtao_thin_occluder_comp;  // [0..0.7], default 0.0
+  float xegtao_bitmask_thickness;   // [0.01..2.0], default 0.2 — world-space thickness for bitmask
   float xegtao_depth_mip_offset;    // [2..6], default 3.30
   float xegtao_denoise_blur_beta;   // Denoise sharpness, default 1.2
   float xegtao_internal_resolution; // 50/75/100 %, default 75
-  float xegtao_debug_view;          // 0=Off, 1=AO-only gray
+  float xegtao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
   float xegtao_debug_logging;       // 0=Off, 1=On
-  float xegtao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid XeGTAO
-  float xegtao_fix_experimental;    // 0=Off, 1-5=experimental fixes for A/B testing
-  float xegtao_ssgi_bound;          // 0/1 — set at runtime: t23 holds valid SSGI GI
-  float xegtao_ssgi_debug;          // 0=Off (add GI to scene), 1=On (replace scene with GI for debug)
+  float xegtao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid XeGTAO AO
+  float xegtao_fix_experimental;    // 0=Off, 1-5=experimental (unused in bitmask path)
+  float xegtao_ssgi_bound;          // 0/1 — set at runtime: t23 holds valid GI
+  float xegtao_ssgi_debug;          // 0=Off (add GI), 1=On (replace scene with GI)
+
+  // —— SSGI (Screen Space Global Illumination via Visibility Bitmask) ——
+  float ssgi_enabled;               // 0=Off, 1=On (requires xegtao_mode >= 1)
+  float ssgi_intensity;             // [0..5], default 1.0
+  float ssgi_saturation;            // [0..2], default 1.0
+  float ssgi_multibounce;           // 0=Off, 1=On
+  float ssgi_multibounce_strength;  // [0..10], default 1.0 — feedback intensity
+  float ssgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
+  float ssgi_gi_power;              // [0.5..5], default 1.5 — power curve for GI
+  float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
+  float ssgi_debug_view;            // 0=Off, 1=Raw GI, 2=Denoised GI, 3=Light Buffer
 };
 
 #ifndef __cplusplus

@@ -3,16 +3,24 @@
 //
 // Kai-style: builds GTAOConstants in-shader, gets quality from push_constants.
 // Quality is determined by xegtao_quality push constant, not hardcoded slices.
+// Visibility Bitmask AO + optional GI (Therrien/Levesque/Gilet 2023).
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define XE_GTAO_COMPUTE_GI
 #include "xegtao_common.hlsl"
 
 Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);
 Texture2D<uint4>       g_srcMrtNormal      : register(t1);
 SamplerState           g_samplerPointClamp : register(s0);
 
+// ── GI bindings (main pass: t2 = HDR light buffer) ──
+Texture2D<float4>      g_srcLightBuffer    : register(t2);
+SamplerState           g_samplerLightBuffer : register(s1);
+
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
 RWTexture2D<float>         g_outWorkingEdges  : register(u1);
+RWTexture2D<float4>        g_outGI            : register(u2);
+RWTexture2D<float4>        g_outDebug         : register(u3);
 
 static lpfloat2 SpatioTemporalNoise(uint2 p, uint t)
 {
@@ -147,5 +155,10 @@ void main(uint2 p : SV_DispatchThreadID)
 
   XeGTAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
-      g_outWorkingAOTerm, g_outWorkingEdges);
+      g_outWorkingAOTerm, g_outWorkingEdges,
+      (g_gi_enabled > 0.5f), g_gi_intensity,
+      g_srcLightBuffer, g_samplerLightBuffer,
+      g_srcMrtNormal,
+      g_outGI,
+      g_outDebug);
 }
