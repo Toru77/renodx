@@ -369,6 +369,9 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     uint debugTotalSamples = 0u;
     uint debugFirstSliceBitmask = 0u;
     bool debugFirstSliceSaved = false;
+    // ── SSGI debug view 5: sample activity counters ──
+    uint activityContributed = 0u;  // samples that added GI
+    uint activityRejected = 0u;     // samples valid but newCount==0
 
 #ifdef XE_GTAO_SHOW_DEBUG_VIZ
     float3 dbgWorldPos          = mul(g_globals.ViewInv, float4(pixCenterPos, 1)).xyz;
@@ -580,6 +583,9 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
                         float weight = (float)newCount / (float)XE_GTAO_BITMASK_SECTOR_COUNT;
                         sliceGI += weight * lightColor * NdotL * NsDotL * giIntensity;
+                        activityContributed += 1u;
+                    } else if (enableGI) {
+                        activityRejected += 1u;
                     }
 #endif // XE_GTAO_COMPUTE_GI
 
@@ -757,6 +763,34 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
 #ifdef XE_GTAO_COMPUTE_GI
         giAccum /= max((float)sliceCount, 1.0);
+
+        // ── RGB Adaptive Boost: amplify channels proportional to dominance ──
+        // Mode 0 (GI Color): boost based on GI's own per-channel strength.
+        // Mode 1 (Albedo): boost based on surface color at pixel center.
+        float3 adaptiveWeights;
+        if (g_gi_adaptive_mode < 0.5f) {
+            // Mode 0: GI's own color determines dominance.
+            float giMaxChan = max(max(giAccum.r, giAccum.g), giAccum.b) + 0.001;
+            adaptiveWeights = saturate(giAccum / giMaxChan);
+        } else {
+            // Mode 1: sample surface albedo at pixel center for dominance.
+            float3 albedo = lightBuffer.SampleLevel(lightSampler, normalizedScreenPos, 0).rgb;
+            float albedoMax = max(max(albedo.r, albedo.g), albedo.b) + 0.001;
+            adaptiveWeights = saturate(albedo / albedoMax);
+        }
+        giAccum.r *= 1.0 + adaptiveWeights.r * g_gi_adaptive_r;
+        giAccum.g *= 1.0 + adaptiveWeights.g * g_gi_adaptive_g;
+        giAccum.b *= 1.0 + adaptiveWeights.b * g_gi_adaptive_b;
+
+        // ── Adaptive Luma Normalization: boost dim GI toward target brightness ──
+        // Evens out indoor/outdoor GI so both respond to the same settings.
+        if (g_gi_adaptive_luma_strength > 0.001f) {
+            float giLuma = dot(giAccum, float3(0.299, 0.587, 0.114));
+            float target = g_gi_adaptive_luma_strength;
+            // Only boost dim GI up; don't crush bright GI down.
+            float scale = (giLuma > 0.001f && giLuma < target) ? (target / giLuma) : 1.0;
+            giAccum *= lerp(1.0, scale, g_gi_adaptive_luma_blend);
+        }
 #endif
 
 #ifdef XE_GTAO_COMPUTE_BENT_NORMALS
@@ -777,6 +811,15 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     XeGTAO_OutputWorkingTerm( pixCoord, visibility, bentNormal, outWorkingAOTerm );
 
 #ifdef XE_GTAO_COMPUTE_GI
+    // ── SSGI debug view 5: sample activity heatmap ──
+    // Red = rejected samples (valid but newCount==0), Green = contributed, Yellow = mix
+    int ssgiDbgMode = (int)g_ssgi_debug_view;
+    if (ssgiDbgMode == 5) {
+        float totalActivity = (float)max(activityContributed + activityRejected, 1u);
+        float r = (float)activityRejected / totalActivity;
+        float g = (float)activityContributed / totalActivity;
+        outDebug[pixCoord] = float4(r, g, 0.0, 1.0);
+    } else {
     // ── Debug views 6-8: bitmask visualizations (dedicated UAV, independent of GI) ──
     int dbgMode = (int)xegtao_debug_mode;
     if (dbgMode == 6) {
@@ -799,6 +842,7 @@ void XeGTAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     } else {
         outDebug[pixCoord] = float4(0, 0, 0, 0);
     }
+    } // end ssgiDbgMode==5 vs bitmask debug
 
     if (enableGI)
         outGI[pixCoord] = float4(giAccum, (float)visibility);

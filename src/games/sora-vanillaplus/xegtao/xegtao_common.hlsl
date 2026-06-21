@@ -81,6 +81,16 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_isfast_hybrid_blend;
   float xegtao_isfast_noise_available;
   float xegtao_multibounce_saturation;  // c[32] — multi-bounce feedback color saturation
+  float xegtao_ssgi_debug_view;         // c[33] — SSGI debug view mode (for shader-side viz)
+  float xegtao_isfast_enabled;           // c[34] — IS-FAST enable (0/1)
+  float xegtao_isfast_strength;          // c[35] — IS-FAST noise strength [0..1]
+  float xegtao_isfast_debug;             // c[36] — IS-FAST texture loaded flag (set by shader check)
+  float xegtao_adaptive_mode;           // c[37] — 0=GI color, 1=albedo
+  float xegtao_adaptive_luma_strength;  // c[38] — target luma (0=off)
+  float xegtao_adaptive_luma_blend;     // c[39] — blend original↔normalized
+  float xegtao_isfast_spatial_scale;    // c[40] — IS-FAST spatial scale [0.25..4]
+  float xegtao_isfast_temporal_speed;   // c[41] — IS-FAST temporal speed [0..5]
+  float xegtao_isfast_seed;             // c[42] — IS-FAST seed offset [0..64]
 };
 
 // ── GI-related push constant aliases (repurpose IS-FAST fields) ──
@@ -91,6 +101,20 @@ cbuffer cb_xegtao : register(b13)
 #define g_gi_multibounce        xegtao_isfast_hybrid_blend      // 0/1
 #define g_gi_multibounce_strength xegtao_isfast_noise_available  // [0..10] feedback intensity
 #define g_gi_multibounce_saturation xegtao_multibounce_saturation // [0..2] feedback saturation
+#define g_ssgi_debug_view       xegtao_ssgi_debug_view           // SSGI debug view mode
+#define g_isfast_enabled        xegtao_isfast_enabled            // IS-FAST enable (0/1)
+#define g_isfast_strength       xegtao_isfast_strength           // IS-FAST noise strength
+#define g_isfast_texture_loaded xegtao_isfast_debug              // IS-FAST: 1=texture loaded
+#define g_isfast_spatial_scale xegtao_isfast_spatial_scale        // IS-FAST spatial scale [0.25..4]
+#define g_isfast_temporal_speed xegtao_isfast_temporal_speed      // IS-FAST temporal speed [0..5]
+#define g_isfast_seed_offset   xegtao_isfast_seed                 // IS-FAST seed offset [0..64]
+// Legacy adaptive macros — hardcoded to 0 (no effect), slots repurposed for IS-FAST
+#define g_gi_adaptive_r         0.f
+#define g_gi_adaptive_g         0.f
+#define g_gi_adaptive_b         0.f
+#define g_gi_adaptive_mode      xegtao_adaptive_mode             // 0=GI color, 1=albedo
+#define g_gi_adaptive_luma_strength xegtao_adaptive_luma_strength // [0..5] target luma
+#define g_gi_adaptive_luma_blend xegtao_adaptive_luma_blend       // [0..1] blend
 #define g_gi_power              xegtao_isfast_radius            // power curve
 #define g_gi_light_exposure     xegtao_isfast_samples           // HDR light buffer exposure scale
 

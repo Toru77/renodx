@@ -54,9 +54,106 @@ SamplerComparisonState SmplShadow_s : register(s13);
 Texture2D<float4> depthTexture : register(t0);
 Texture2DArray<float4> shadowMaps : register(t16);
 
+#include "../shared.h"
+
+// ── IS-FAST noise texture (bound globally by addon) ──
+Texture3D<float2> g_isfastNoiseTexture : register(t3);
 
 // 3Dmigoto declarations
 #define cmp -
+
+// ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──
+static float IGN(float2 p) {
+  return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+// ── Spatio-Temporal Blue Noise (IS-FAST) with IGN fallback ──
+static float2 SpatioTemporalNoise_ISFAST(uint2 p, uint t) {
+  if (shader_injection_data.shadow_isfast_texture_loaded > 0.5f) {
+    float3 uvw = float3(
+      (float)(p.x % 128u) / 128.0,
+      (float)(p.y % 128u) / 128.0,
+      (float)((t + (uint)shader_injection_data.shadow_isfast_seed_offset) % 32u) / 32.0);
+    uvw.xy *= shader_injection_data.shadow_isfast_spatial_scale;
+    uvw.z *= shader_injection_data.shadow_isfast_temporal_speed;
+    float2 s = g_isfastNoiseTexture.SampleLevel(samPoint_s, uvw, 0);
+    return s;
+  } else {
+    static const float R2_A1 = 0.7548776662466927;
+    static const float R2_A2 = 0.5698402909980532;
+    float b1 = IGN(float2(p) * shader_injection_data.shadow_isfast_spatial_scale + shader_injection_data.shadow_isfast_seed_offset);
+    float b2 = IGN(float2(p) * shader_injection_data.shadow_isfast_spatial_scale + float2(47, 17) + shader_injection_data.shadow_isfast_seed_offset);
+    return float2(frac(b1 + R2_A1 * (float)t * shader_injection_data.shadow_isfast_temporal_speed),
+                  frac(b2 + R2_A2 * (float)t * shader_injection_data.shadow_isfast_temporal_speed));
+  }
+}
+
+// ── PCSS Poisson disk sample offset (√-distributed, golden-angle) ──
+static float2 ISFAST_PoissonDisk(float sample_index, float sample_count, float jitter_angle, float radius_scale) {
+  float r = sqrt((sample_index + 0.5) / sample_count) * radius_scale;
+  float a = sample_index * 2.399963f + jitter_angle;
+  float sin_a, cos_a;
+  sincos(a, sin_a, cos_a);
+  return float2(cos_a, sin_a) * r;
+}
+
+#define PCSS_SAMPLE_COUNT 32u
+#define PCSS_BLOCKER_COUNT 31u
+
+// ── PCSS: three-step (blocker search → penumbra → variable-radius PCF) ──
+float PCSS_Shadow(
+    float2 shadow_uv,
+    float receiver_z,
+    float slice,
+    float split_distance,
+    float jitter_angle)
+{
+  // Derive cascade world size from shadow projection matrix
+  // UV radius = world_softness / cascadeWorldSize → constant world-space softness
+  float2 cascadeWorldSize;
+  cascadeWorldSize.x = 2.0 / max(abs(shadowMtx_g[int(slice)]._m00), 0.0001);
+  cascadeWorldSize.y = 2.0 / max(abs(shadowMtx_g[int(slice)]._m11), 0.0001);
+  float2 base_radius = shader_injection_data.shadow_pcss_search_radius / cascadeWorldSize;
+  float2 search_radius = base_radius;
+
+  float blocker_radius_scale = rsqrt((float)PCSS_BLOCKER_COUNT);
+  float filter_radius_scale = rsqrt((float)PCSS_SAMPLE_COUNT);
+
+  // Step 1: Blocker search
+  float blocker_count = 0;
+  float blocker_depth_sum = 0;
+  for (uint i = 0u; i < PCSS_BLOCKER_COUNT; i++) {
+    float2 offset = ISFAST_PoissonDisk((float)i, (float)PCSS_BLOCKER_COUNT, jitter_angle, blocker_radius_scale);
+    float2 sample_uv = saturate(shadow_uv + offset * search_radius);
+    float blocker_z = shadowMaps.SampleLevel(samPoint_s, float3(sample_uv, slice), 0).x;
+    if (blocker_z < receiver_z) {
+      blocker_depth_sum += blocker_z;
+      blocker_count += 1;
+    }
+  }
+
+  // If no blockers, fully lit
+  if (blocker_count < 1) return 1.0;
+
+  // Step 2: Penumbra estimate
+  float avg_blocker = blocker_depth_sum / blocker_count;
+  float depth_diff = receiver_z - avg_blocker;
+  float penumbra = min(shader_injection_data.shadow_pcss_depth_cap, depth_diff)
+                   * shader_injection_data.shadow_penumbra_scale
+                   + shader_injection_data.shadow_base_softness;
+  // filter_radius = penumbra × base_radius × user width multiplier
+  float2 filter_radius = penumbra * base_radius * shader_injection_data.shadow_pcss_filter_width;
+  filter_radius = max(invShadowSize_g, filter_radius);  // at least 1 texel
+
+  // Step 3: Variable-radius PCF
+  float shadow = 0;
+  for (uint j = 0u; j < PCSS_SAMPLE_COUNT; j++) {
+    float2 offset = ISFAST_PoissonDisk((float)j, (float)PCSS_SAMPLE_COUNT, jitter_angle, filter_radius_scale);
+    float2 sample_uv = saturate(shadow_uv + offset * filter_radius);
+    shadow += shadowMaps.SampleCmpLevelZero(SmplShadow_s, float3(sample_uv, slice), receiver_z).x;
+  }
+  return shadow / (float)PCSS_SAMPLE_COUNT;
+}
 
 
 void main(
@@ -81,6 +178,25 @@ void main(
   float4 r0,r1,r2,r3,r4;
   uint4 bitmask, uiDest;
   float4 fDest;
+
+  // ── PCSS jitter setup ──
+  float pcss_jitter_angle = 0;
+  bool pcss_active = shader_injection_data.shadow_filter_method > 1.5f;
+  if (pcss_active && shader_injection_data.shadow_pcss_jitter_enabled > 0.5f) {
+    uint2 jitter_pixel = uint2(floor(v0.xy));
+    float jitter_phase_static = IGN(float2(jitter_pixel));
+    uint jitter_frame = (uint)(sceneTime_g * shader_injection_data.shadow_pcss_jitter_speed);
+    float2 jitter_noise;
+    if (shader_injection_data.shadow_isfast_enabled > 0.5f) {
+      jitter_noise = SpatioTemporalNoise_ISFAST(jitter_pixel, jitter_frame);
+    } else {
+      static const float R2_A1 = 0.7548776662466927;
+      float b = IGN(float2(jitter_pixel) + float2(47, 17));
+      jitter_noise = float2(frac(b + R2_A1 * (float)jitter_frame), jitter_phase_static);
+    }
+    float jitter_phase = lerp(jitter_phase_static, jitter_noise.x, shader_injection_data.shadow_pcss_jitter_amount);
+    pcss_jitter_angle = 6.28318548 * jitter_phase;
+  }
 
   r0.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   r0.xy = v1.zw * float2(2,-2) + float2(-1,1);
@@ -115,6 +231,9 @@ void main(
       r2.x = 1;
     } else {
       r3.z = 3;
+      if (shader_injection_data.shadow_filter_method > 1.5f) {
+        r2.x = PCSS_Shadow(r1.yz, r1.w, 3, shadowSplitDistance_g.z, pcss_jitter_angle);
+      } else if (shader_injection_data.shadow_filter_method > 0.5f) {
       r2.yz = float2(0,0);
       while (true) {
         r2.w = cmp((int)r2.z >= 10);
@@ -125,6 +244,10 @@ void main(
         r2.z = (int)r2.z + 1;
       }
       r2.x = 0.100000001 * r2.y;
+      } else {
+        r3.xy = saturate(r1.yz);
+        r2.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
+      }
     }
     r1.y = cmp(r1.x < shadowSplitDistance_g.z);
     if (r1.y != 0) {
@@ -134,6 +257,13 @@ void main(
       r1.y = dot(r0.xyzw, shadowMtx_g[2]._m03_m13_m23_m33);
       r1.yzw = r3.xyz / r1.yyy;
       r3.z = 2;
+      if (shader_injection_data.shadow_filter_method > 1.5f) {
+        r2.w = PCSS_Shadow(r1.yz, r1.w, 2, shadowSplitDistance_g.z, pcss_jitter_angle);
+        r1.y = shadowSplitDistance_g.z + -r1.x;
+        r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+        r1.z = r2.w + -r2.x;
+        r2.x = r1.y * r1.z + r2.x;
+      } else if (shader_injection_data.shadow_filter_method > 0.5f) {
       r2.yz = float2(0,0);
       while (true) {
         r2.w = cmp((int)r2.z >= 10);
@@ -144,9 +274,17 @@ void main(
         r2.z = (int)r2.z + 1;
       }
       r1.y = shadowSplitDistance_g.z + -r1.x;
-      r1.y = 0.200000003 * r1.y;
+      r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
       r1.z = r2.y * 0.100000001 + -r2.x;
       r2.x = r1.y * r1.z + r2.x;
+      } else {
+        r3.xy = saturate(r1.yz);
+        r2.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
+        r1.y = shadowSplitDistance_g.z + -r1.x;
+        r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+        r1.z = r2.w + -r2.x;
+        r2.x = r1.y * r1.z + r2.x;
+      }
     }
   } else {
     r1.y = shadowSplitDistance_g.y + -5;
@@ -166,6 +304,9 @@ void main(
         r2.x = 1;
       } else {
         r3.z = 2;
+        if (shader_injection_data.shadow_filter_method > 1.5f) {
+          r2.x = PCSS_Shadow(r1.yz, r1.w, 2, shadowSplitDistance_g.y, pcss_jitter_angle);
+        } else if (shader_injection_data.shadow_filter_method > 0.5f) {
         r2.yz = float2(0,0);
         while (true) {
           r2.w = cmp((int)r2.z >= 10);
@@ -176,6 +317,10 @@ void main(
           r2.z = (int)r2.z + 1;
         }
         r2.x = 0.100000001 * r2.y;
+        } else {
+          r3.xy = saturate(r1.yz);
+          r2.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
+        }
       }
       r1.y = cmp(r1.x < shadowSplitDistance_g.y);
       if (r1.y != 0) {
@@ -186,6 +331,13 @@ void main(
         r1.yzw = r3.xyz / r1.yyy;
         r2.yz = invShadowSize_g.xy * float2(1.125,1.125);
         r3.z = 1;
+        if (shader_injection_data.shadow_filter_method > 1.5f) {
+          r2.w = PCSS_Shadow(r1.yz, r1.w, 1, shadowSplitDistance_g.y, pcss_jitter_angle);
+          r1.y = shadowSplitDistance_g.y + -r1.x;
+          r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+          r1.z = r2.w + -r2.x;
+          r2.x = r1.y * r1.z + r2.x;
+        } else if (shader_injection_data.shadow_filter_method > 0.5f) {
         r2.w = 0;
         r3.w = 0;
         while (true) {
@@ -197,18 +349,29 @@ void main(
           r3.w = (int)r3.w + 1;
         }
         r1.y = shadowSplitDistance_g.y + -r1.x;
-        r1.y = 0.200000003 * r1.y;
+        r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
         r1.z = r2.w * 0.100000001 + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
+        } else {
+          r3.xy = saturate(r1.yz);
+          r2.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
+          r1.y = shadowSplitDistance_g.y + -r1.x;
+          r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+          r1.z = r2.w + -r2.x;
+          r2.x = r1.y * r1.z + r2.x;
+        }
       }
     } else {
       r1.y = cmp(r1.x < shadowSplitDistance_g.x);
-      r2.yzw = r1.yyy ? float3(0,0,0) : float3(1.40129846e-45,5.60519386e-45,1);
+      r2.yzw = r1.yyy ? float3(0,0,0) : float3(1,4,1);
       r3.x = dot(r0.xyzw, shadowMtx_g[r2.z/4]._m00_m10_m20_m30);
       r3.y = dot(r0.xyzw, shadowMtx_g[r2.z/4]._m01_m11_m21_m31);
       r3.z = dot(r0.xyzw, shadowMtx_g[r2.z/4]._m02_m12_m22_m32);
       r1.z = dot(r0.xyzw, shadowMtx_g[r2.z/4]._m03_m13_m23_m33);
       r3.xyz = r3.xyz / r1.zzz;
+      if (shader_injection_data.shadow_filter_method > 1.5f) {
+        r2.x = PCSS_Shadow(r3.xy, r3.z, r2.w, shadowSplitDistance_g.x, pcss_jitter_angle);
+      } else if (shader_injection_data.shadow_filter_method > 0.5f) {
       r1.z = dot(float2(1.25,1.125), icb[r2.y+0].xy);
       r1.zw = invShadowSize_g.xy * r1.zz;
       r3.w = 0;
@@ -222,6 +385,10 @@ void main(
         r4.x = (int)r4.x + 1;
       }
       r2.x = 0.100000001 * r3.w;
+      } else {
+        r2.yz = saturate(r3.xy);
+        r2.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r2.yzw, r3.z).x;
+      }
       r1.z = shadowSplitDistance_g.x + -5;
       r1.z = cmp(r1.z < r1.x);
       r1.y = r1.z ? r1.y : 0;
@@ -233,6 +400,13 @@ void main(
         r0.xyz = r3.xyz / r0.xxx;
         r1.yz = invShadowSize_g.xy * float2(1.125,1.125);
         r3.z = 1;
+        if (shader_injection_data.shadow_filter_method > 1.5f) {
+          r0.w = PCSS_Shadow(r0.xy, r0.z, 1, shadowSplitDistance_g.x, pcss_jitter_angle);
+          r0.y = shadowSplitDistance_g.x + -r1.x;
+          r0.y = shader_injection_data.shadow_pcss_cascade_blend * r0.y;
+          r0.z = r0.w + -r2.x;
+          r2.x = r0.y * r0.z + r2.x;
+        } else if (shader_injection_data.shadow_filter_method > 0.5f) {
         r0.w = 0;
         r1.w = 0;
         while (true) {
@@ -244,9 +418,17 @@ void main(
           r1.w = (int)r1.w + 1;
         }
         r0.y = shadowSplitDistance_g.x + -r1.x;
-        r0.xy = float2(0.100000001,0.200000003) * r0.wy;
+        r0.xy = float2(0.100000001,shader_injection_data.shadow_pcss_cascade_blend) * r0.wy;
         r0.z = r3.w * 0.100000001 + -r0.x;
         r2.x = r0.y * r0.z + r0.x;
+        } else {
+          r3.xy = saturate(r0.xy);
+          r0.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r0.z).x;
+          r0.y = shadowSplitDistance_g.x + -r1.x;
+          r0.y = shader_injection_data.shadow_pcss_cascade_blend * r0.y;
+          r0.z = r0.w + -r2.x;
+          r2.x = r0.y * r0.z + r2.x;
+        }
       }
     }
   }

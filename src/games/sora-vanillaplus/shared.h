@@ -69,12 +69,37 @@ struct ShaderInjectData {
   float ssgi_enabled;               // 0=Off, 1=On (requires xegtao_mode >= 1)
   float ssgi_intensity;             // [0..5], default 1.0
   float ssgi_saturation;            // [0..2], default 1.0
+  float ssgi_char_mask_strength;    // [0..1], default 0 — reduce SSGI on characters (0=off, 1=fully masked)
   float ssgi_multibounce;           // 0=Off, 1=On
   float ssgi_multibounce_strength;  // [0..10], default 1.0 — feedback intensity
   float ssgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
+  float ssgi_adaptive_r;            // [0..1], default 0 — per-channel red adaptive boost
+  float ssgi_adaptive_g;            // [0..1], default 0 — per-channel green adaptive boost
+  float ssgi_adaptive_b;            // [0..1], default 0 — per-channel blue adaptive boost
+  float ssgi_adaptive_mode;         // 0=GI color, 1=surface albedo
+  float ssgi_adaptive_luma_strength;// [0..5], default 0 — target luma for normalization (0=off)
+  float ssgi_adaptive_luma_blend;   // [0..1], default 0.5 — blend between original and normalized
   float ssgi_gi_power;              // [0.5..5], default 1.5 — power curve for GI
   float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
-  float ssgi_debug_view;            // 0=Off, 1=Raw GI, 2=Denoised GI, 3=Light Buffer
+  float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples
+  float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
+  float shadow_edge_tint;           // 0=Off, 1=On — shadowEdgeColor tint at shadow edges
+  // —— PCSS (Percentage Closer Soft Shadows) ——
+  float shadow_pcss_jitter_enabled;    // 0=Off, 1=On
+  float shadow_pcss_jitter_amount;     // [0..1], default 1.0 — blend static→temporal
+  float shadow_pcss_jitter_speed;      // [0..500], default 237.0 — temporal animation speed
+  float shadow_base_softness;          // [0..0.5], default 0.2 — constant penumbra offset
+  float shadow_penumbra_scale;         // [1..200], default 60.0 — penumbra width multiplier
+  float shadow_pcss_search_radius;     // [1..100], default 30.0 — blocker search radius multiplier
+  float shadow_pcss_filter_width;      // [0.1..5], default 1.0 — PCF filter width multiplier
+  float shadow_pcss_depth_cap;         // [0.01..0.5], default 0.05 — max depth diff for penumbra
+  float shadow_pcss_cascade_blend;     // [0.02..1], default 0.2 — cross-fade width (smaller=wider blend)
+  // —— IS-FAST mirrors for shadow pass (set from g_isfast_* globals) ——
+  float shadow_isfast_enabled;         // 0/1 — mirror of g_isfast_enabled
+  float shadow_isfast_texture_loaded;  // 0/1 — set at runtime by addon
+  float shadow_isfast_spatial_scale;   // [0.25..4], default 1.0
+  float shadow_isfast_temporal_speed;  // [0..5], default 1.0
+  float shadow_isfast_seed_offset;     // [0..64], default 0
 };
 
 #ifndef __cplusplus

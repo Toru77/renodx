@@ -16,18 +16,46 @@ SamplerState           g_samplerPointClamp : register(s0);
 Texture2D<float4>      g_srcLightBuffer    : register(t2);
 SamplerState           g_samplerLightBuffer : register(s1);
 
+// ── IS-FAST noise (t3 = 3D noise texture / unused when off) ──
+Texture3D<float2>      g_isfastNoiseTexture : register(t3);
+
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
 RWTexture2D<float>         g_outWorkingEdges  : register(u1);
 RWTexture2D<float4>        g_outGI            : register(u2);
 RWTexture2D<float4>        g_outDebug         : register(u3);
 
-static lpfloat2 SpatioTemporalNoise(uint2 pixCoord, uint temporalIndex)
+// ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──
+static float IGN(float2 p) {
+  return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+static lpfloat2 SpatioTemporalNoise_Hilbert(uint2 p, uint t)
 {
-  uint index = HilbertIndex(pixCoord.x % XE_HILBERT_WIDTH, pixCoord.y % XE_HILBERT_WIDTH);
-  index += 288u * (temporalIndex % 64u);
-  return lpfloat2(
-      frac(0.5 + (float)index * 0.75487766624669276005),
-      frac(0.5 + (float)index * 0.5698402909980532659114));
+  uint i = HilbertIndex(p.x % XE_HILBERT_WIDTH, p.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
+  return lpfloat2(frac(0.5 + (float)i * 0.75487766624669276005),
+                  frac(0.5 + (float)i * 0.5698402909980532659114));
+}
+
+static lpfloat2 SpatioTemporalNoise_ISFAST(uint2 p, uint t)
+{
+  if (g_isfast_texture_loaded > 0.5f) {
+    float3 uvw = float3(
+      (float)(p.x % 128u) / 128.0,
+      (float)(p.y % 128u) / 128.0,
+      (float)((t + (uint)g_isfast_seed_offset) % 32u) / 32.0);
+    uvw.xy *= g_isfast_spatial_scale;
+    uvw.z *= g_isfast_temporal_speed;
+    float2 s = g_isfastNoiseTexture.SampleLevel(g_samplerPointClamp, uvw, 0);
+    return (lpfloat2)(s * g_isfast_strength);
+  } else {
+    static const float R2_A1 = 0.7548776662466927;
+    static const float R2_A2 = 0.5698402909980532;
+    float b1 = IGN(float2(p) * g_isfast_spatial_scale + g_isfast_seed_offset);
+    float b2 = IGN(float2(p) * g_isfast_spatial_scale + float2(47, 17) + g_isfast_seed_offset);
+    return lpfloat2(frac(b1 + R2_A1 * (float)t * g_isfast_temporal_speed),
+                    frac(b2 + R2_A2 * (float)t * g_isfast_temporal_speed))
+         * g_isfast_strength;
+  }
 }
 
 float3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r,
@@ -139,7 +167,9 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
   uint noise_idx = consts.NoiseIndex < 0 ? 0u : (uint)consts.NoiseIndex;
-  lpfloat2 noise = SpatioTemporalNoise(pixCoord, noise_idx);
+  lpfloat2 n = (g_isfast_enabled > 0.5f)
+    ? SpatioTemporalNoise_ISFAST(pixCoord, noise_idx)
+    : SpatioTemporalNoise_Hilbert(pixCoord, noise_idx);
 
   lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(pixCoord, uint2(width, height), consts);
 
@@ -152,7 +182,7 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
   else if (q == 2u) { slice_count = 3.0; steps_per_slice = 3.0; }  // High
   else              { slice_count = 4.0; steps_per_slice = 4.0; }  // Ultra
 
-  XeGTAO_MainPass(pixCoord, slice_count, steps_per_slice, noise, normal,
+  XeGTAO_MainPass(pixCoord, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
       g_outWorkingAOTerm, g_outWorkingEdges,
       (g_gi_enabled > 0.5f), g_gi_intensity,

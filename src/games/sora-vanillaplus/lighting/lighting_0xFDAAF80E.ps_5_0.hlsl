@@ -565,6 +565,9 @@ void main(
       // Intensity.
       giColor *= shader_injection_data.ssgi_intensity;
       
+      // Character mask: reduce GI on characters by configured amount.
+      giColor *= (1.0 - shader_injection_data.ssgi_char_mask_strength);
+      
       if (shader_injection_data.xegtao_ssgi_debug > 0.5f) {
         r6.xyz = giColor;  // Debug: replace scene with GI texture
       } else {
@@ -804,8 +807,12 @@ void main(
   r1.w = log2(r0.w);
   r1.w = shadowEdgeSharpness_g * r1.w;
   r1.w = exp2(r1.w);
-  r13.yzw = -shadowEdgeColor_g.xyz + r8.xyz;
-  r13.yzw = r0.www * r13.yzw + shadowEdgeColor_g.xyz;
+  if (shader_injection_data.shadow_edge_tint > 0.5f) {
+    r13.yzw = -shadowEdgeColor_g.xyz + r8.xyz;
+    r13.yzw = r0.www * r13.yzw + shadowEdgeColor_g.xyz;
+  } else {
+    r13.yzw = r8.xyz;
+  }
   r1.w = r1.w * r7.x;
   r7.xyz = r13.yzw + -r8.xyz;
   r7.xyz = r1.www * r7.xyz + r8.xyz;

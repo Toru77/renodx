@@ -1,0 +1,122 @@
+Percentage-Closer Soft Shadows
+Randima Fernando
+NVIDIA Corporation
+1. Introduction
+One of the fundamental problems in computer graphics is
+generating accurate soft shadows from area light sources.
+Soft shadows provide valuable cues about the relationships
+between objects, becoming sharper as objects contact each
+other and more blurry (softer) the further they are apart.
+
+generate soft shadows exist, none produce results as
+realistic as ours with the same features: ease of integration,
+robustness, and interactivity. Common failings include
+producing umbras that do not shrink as penumbras grow.
+
+3. Percentage-Closer Soft Shadows
+The PCSS technique builds on regular shadow mapping:
+when shading each pixel in the eye view, PCSS returns a
+floating‐point value that indicates the amount of shadowing
+at each shaded point (replacing the traditional depth
+comparison of ordinary shadow mapping).
+PCSS is based on the observation that as the size of the PCF
+kernel increases, the resulting shadows become softer. The
+challenge is to vary the filter size intelligently to achieve the
+correct degree of softness. To do this, the algorithm uses a
+three‐step approach when shading each eye‐view pixel:
+
+This sketch presents a new method, called Percentage‐
+Closer Soft Shadows (PCSS), for generating perceptually
+accurate soft shadows. Based on shadow mapping
+[Williams 1978] and percentage‐closer filtering (PCF)
+[Reeves et al. 1987], PCSS has these key characteristics:
+• Generates perceptually accurate soft shadows
+post‐processing,
+
+Step 2: Penumbra estimation. Using a parallel planes
+approximation, we estimate the penumbra width based on
+the light size and blocker/receiver distances from the light:
+wPenumbra = (dReceiver – dBlocker) ⋅ wLight / dBlocker
+
+• Uses a single light source sample (one shadow map)
+• Requires no pre‐processing,
+additional geometry
+
+Step 1: Blocker search. We search the shadow map and
+average the depths that are closer to the light source than to
+the point being shaded (the “receiver”). The size of the
+search region depends on the light size and the receiver’s
+distance from the light source.
+
+or
+
+• Seamlessly replaces a traditional shadow map query
+(embodies the same advantages as traditional shadow
+mapping—independent of scene complexity, works
+with alpha testing, displacement mapping, and so on)
+• Runs in real‐time on current consumer graphics
+hardware
+This combination makes it uniquely suitable for a wide
+range of applications, from next‐generation games to
+DCC/CAD applications. Because it uses just a single sample
+and requires no special processing steps, the technique
+easily replaces existing shadow mapping shader code in an
+application while producing much more compelling images.
+The only required change is to replace the typical shadow
+mapping pixel shader with a PCSS shader.
+
+Step 3: Filtering. Now we perform a typical PCF step on the
+shadow map using a kernel size proportional to the
+penumbra estimate from Step 2.
+
+4. Results
+A relatively unoptimized version of the technique runs in
+FX Composer at 21 fps on an NVIDIA GeForce Ultra at 640
+x 480 with 64 samples used for the blocker search and for
+the PCF step. This gives excellent results, particularly for
+more realistic textured scenes, while maintaining a high
+degree of interactivity. The number of samples can be
+modified depending on the light size and desired quality.
+
+5. References
+HASENFRATZ, J., LAPIERRE, M., HOLZSCHUCH, N., AND SILLION, F. A
+Survey of Real‐Time Soft Shadow Algorithms. Computer Graphics
+Forum, Vol. 22, No. 4 (December 2003)
+
+2. Previous Work
+
+REEVES, W.T., SALESIN, D. H., AND COOK, R. I. Rendering Antialiased
+Shadows with Depth Maps. In Computer Graphics (SIGGRAPH 1987
+Proceedings), pages 283‐291, July 1987.
+
+The history of shadow generation in computer graphics is
+vast and rich. A good survey of shadowing techniques can
+be found in [Hasenfratz 2003]. While many attempts to
+
+WILLIAMS, L. Casting Curved Shadows on Curved Surfaces. In
+Computer Graphics (SIGGRAPH 1978 Proceedings), pages 270‐274,
+August 1978.
+
+Percentage-Closer Soft Shadows
+(Supplementary Material)
+Randima Fernando
+NVIDIA Corporation
+Blocker Search Step
+The following diagram illustrates the “blocker” and “receiver” terminology.
+
+During the blocker search step, the PCSS algorithm searches a region of the shadow map (shown in red). During the search, it
+averages depth values that are closer to the light than the receiving point. This average depth value is used in the subsequent
+penumbra size estimation step.
+
+Penumbra Size Estimation Step
+The following diagram illustrates the geometry for estimating the penumbra size, assuming that the blocker, receiver, and
+light source are parallel. This assumption works very well in practice and could be relaxed as an improvement.
+
+Screenshots
+A complex interaction between many objects (with a medium‐sized light source):
+
+Same scene with a smaller light source:
+
+Same scene with a larger light source:
+
+
