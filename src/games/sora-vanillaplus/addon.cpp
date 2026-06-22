@@ -39,6 +39,13 @@ ShaderInjectData shader_injection = {
     .slider_2 = 50.f,
     .slider_3 = 0.f,
     .volfog_haze_aa_mode = 0.f,
+    .volfog_isfast_enabled = 0.f,
+    .volfog_isfast_texture_loaded = 0.f,
+    .volfog_jitter_enabled = 0.f,
+    .volfog_jitter_amount = 0.5f,
+    .volfog_jitter_speed = 237.f,
+    .volfog_isfast_spatial_scale = 1.f,
+    .volfog_isfast_dedicated_sampler = 0.f,
   .char_shadow_mode = 2.f,
   .char_shadow_sample_count = 32.f,
   .char_shadow_hard_shadow_samples = 4.f,
@@ -115,6 +122,10 @@ ShaderInjectData shader_injection = {
   .shadow_pcss_filter_width = 1.f,
   .shadow_pcss_depth_cap = 0.05f,
   .shadow_pcss_cascade_blend = 0.2f,
+  .shadow_pcss_fix_texel_radius = 0.f,
+  .shadow_pcss_fix_clamp_cascade = 0.f,
+  .shadow_pcss_fix_min_radius = 0.f,
+  .shadow_pcss_fix_auto_blend = 0.f,
   .shadow_penumbra_color_strength = 1.f,
   .shadow_penumbra_vibrance = 1.f,
   .shadow_penumbra_detection = 0.5f,
@@ -347,10 +358,54 @@ static bool OnBeforeShadowBlurDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+// ── Volfog IS-FAST sync + push IS-FAST SRV at t3 ──
+static void SyncVolFogISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
+  shader_injection.volfog_isfast_spatial_scale = g_isfast_spatial_scale;
+  if (auto* dev = cmd_list->get_device()) {
+    if (auto* d = dev->get_private_data<DeviceData>()) {
+      shader_injection.volfog_isfast_texture_loaded = d->isfast_texture_loaded ? 1.f : 0.f;
+    }
+  }
+  // Derive effective IS-FAST flag from master + volfog toggle
+  shader_injection.volfog_isfast_enabled =
+      g_isfast_enabled >= 0.5f
+      && shader_injection.volfog_jitter_enabled >= 0.5f
+      && shader_injection.volfog_jitter_amount > 0.0001f
+      ? 1.f : 0.f;
+}
+
+static bool OnBeforeVolFogDraw(reshade::api::command_list* cmd_list) {
+  SyncVolFogISFASTToShaderInjection(cmd_list);
+  // Push IS-FAST noise texture at t3 (same pattern as shadow shader at t3)
+  if (auto* dev = cmd_list->get_device()) {
+    if (auto* d = dev->get_private_data<DeviceData>()) {
+      reshade::api::resource_view srv = d->isfast_noise_srv.handle
+          ? d->isfast_noise_srv : d->fallback_srv;
+      if (srv.handle) {
+        cmd_list->push_descriptors(
+            reshade::api::shader_stage::pixel,
+            reshade::api::pipeline_layout{0}, 0,
+            reshade::api::descriptor_table_update{
+                {}, 3u, 0, 1,
+                reshade::api::descriptor_type::texture_shader_resource_view,
+                &srv,
+            });
+      }
+    }
+  }
+  return true;
+}
+
 // ═══════════ Custom shaders ═══════════
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-    CustomShaderEntry(0x954D3D6D),
+    {
+        0x954D3D6Du,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x954D3D6Du,
+            .on_draw = OnBeforeVolFogDraw,
+        },
+    },
     {
         0x79359F5Cu,
         renodx::mods::shader::CustomShader{
@@ -392,6 +447,46 @@ renodx::utils::settings::Settings settings = {
         .section = "Volumetric Fog",
         .tooltip = "Mode for volumetric haze anti-aliasing: Vanilla or Improved.",
         .labels = {"Vanilla", "Improved"},
+    },
+    // —— Volumetric Fog IS-FAST Jitter ——
+    new renodx::utils::settings::Setting{
+      .key = "VolFogJitter", .binding = &shader_injection.volfog_jitter_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Vol Fog Jitter", .section = "Volumetric Fog",
+      .tooltip = "Apply IS-FAST spatio-temporal noise to break up froxel grid artifacts. Requires IS-FAST enabled.",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VolFogJitterAmount", .binding = &shader_injection.volfog_jitter_amount,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Jitter Amount", .section = "Volumetric Fog",
+      .tooltip = "Strength of the noise jitter applied to volume sample coordinates.",
+      .min = 0.f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VolFogJitterSpeed", .binding = &shader_injection.volfog_jitter_speed,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 237.f, .label = "Jitter Speed", .section = "Volumetric Fog",
+      .tooltip = "Temporal animation speed for the noise jitter. Higher = faster rotation.",
+      .min = 0.f, .max = 1024.0f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VolFogISFASTSpatialScale", .binding = &shader_injection.volfog_isfast_spatial_scale,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "IS-FAST Spatial Scale", .section = "Volumetric Fog",
+      .tooltip = "Scales the IS-FAST noise pattern spatially. Lower = larger noise features.",
+      .min = 0.25f, .max = 4.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "VolFogISFASTSampler", .binding = &shader_injection.volfog_isfast_dedicated_sampler,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "IS-FAST Dedicated Sampler", .section = "Volumetric Fog",
+      .tooltip = "Off = reuse s1 point sampler. On = use dedicated s2 point-wrap sampler for noise.",
+      .labels = {"s1 Point", "s2 Dedicated"},
+      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowMode", .binding = &shader_injection.char_shadow_mode,
@@ -1056,6 +1151,39 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.02f, .label = "Cascade Blend", .section = "Shadow Maps",
       .tooltip = "Cross-fade width between cascades. Lower = wider/smoother blend. 0.02 = 50 units, 1.0 = 1 unit.",
       .min = 0.02f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    },
+    // —— PCSS Experimental Fixes (A/B test, all off = default behavior) ——
+    new renodx::utils::settings::Setting{
+      .key = "ShadowPCSSFixTexelRadius", .binding = &shader_injection.shadow_pcss_fix_texel_radius,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "PCSS Fix A: Texel-Based Softness", .section = "Shadow Maps",
+      .tooltip = "Override world-space filter with texel-based radius. Consistent softness across all quality levels.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ShadowPCSSFixClampCascade", .binding = &shader_injection.shadow_pcss_fix_clamp_cascade,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "PCSS Fix B: Clamp Cascade Size", .section = "Shadow Maps",
+      .tooltip = "Cap the cascade world size. Prevents Ultra's extended cascades from collapsing the filter. 0=off.",
+      .min = 0.f, .max = 500.0f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ShadowPCSSFixMinRadius", .binding = &shader_injection.shadow_pcss_fix_min_radius,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "PCSS Fix C: Minimum Filter Radius", .section = "Shadow Maps",
+      .tooltip = "Guaranteed minimum PCF filter radius in shadow map texels. Prevents filter from collapsing. 0=off.",
+      .min = 0.f, .max = 100.0f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ShadowPCSSFixAutoBlend", .binding = &shader_injection.shadow_pcss_fix_auto_blend,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "PCSS Fix D: Auto-Scale Blend", .section = "Shadow Maps",
+      .tooltip = "Scale cascade blend by split distance. Larger cascades get tighter blends. Off = static blend value.",
+      .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
     },
     // —— Colored Shadow Penumbra (Improved mode, PCSS-only) ——

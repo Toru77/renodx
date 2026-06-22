@@ -9,6 +9,14 @@ struct ShaderInjectData {
   float slider_3;
   // Volumetric haze AA mode: 0 = Vanilla, 1 = Improved (tricubic haze AA)
   float volfog_haze_aa_mode;
+  // Volumetric Fog IS-FAST jitter
+  float volfog_isfast_enabled;         // runtime: derived from global IS-FAST + volfog toggle
+  float volfog_isfast_texture_loaded;  // runtime: IS-FAST noise texture is available
+  float volfog_jitter_enabled;         // 0=Off, 1=On — user toggle
+  float volfog_jitter_amount;          // [0..2], default 0.5 — jitter strength
+  float volfog_jitter_speed;           // [0..1024], default 237 — temporal speed
+  float volfog_isfast_spatial_scale;   // [0.25..4], default 1.0 — volfog spatial scale
+  float volfog_isfast_dedicated_sampler;// 0=s1 point, 1=s2 dedicated point-wrap sampler
 
   // Character Shadowing
   float char_shadow_mode;
@@ -97,6 +105,11 @@ struct ShaderInjectData {
   float shadow_pcss_filter_width;      // [0.1..5], default 1.0 — PCF filter width multiplier
   float shadow_pcss_depth_cap;         // [0.01..0.5], default 0.05 — max depth diff for penumbra
   float shadow_pcss_cascade_blend;     // [0.02..1], default 0.2 — cross-fade width (smaller=wider blend)
+  // —— PCSS Experimental Fixes (0=off/default behavior) ——
+  float shadow_pcss_fix_texel_radius;   // 0=Off, 1=On — texel-based filter radius (consistent across quality)
+  float shadow_pcss_fix_clamp_cascade;  // [0..500], default 0 — max cascade world size (0=off), clamp to this
+  float shadow_pcss_fix_min_radius;     // [0..100], default 0 — minimum filter radius in texels (0=off)
+  float shadow_pcss_fix_auto_blend;     // 0=Off, 1=On — auto-scale cascade blend with split distance
   // —— Colored Shadow Penumbra (PCSS Improved mode) ——
   float shadow_penumbra_color_strength;// [0..2], default 1.0 — how strongly to apply vibrancy effect
   float shadow_penumbra_vibrance;      // [0..100], default 1.0 — 0=grayscale, 1=neutral, >1=vivid

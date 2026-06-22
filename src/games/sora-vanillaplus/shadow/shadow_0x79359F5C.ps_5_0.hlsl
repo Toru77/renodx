@@ -116,6 +116,18 @@ float PCSS_Shadow(
   float2 base_radius = shader_injection_data.shadow_pcss_search_radius / cascadeWorldSize;
   float2 search_radius = base_radius;
 
+  // —— PCSS Experimental Fixes ——
+  // Fix B: Clamp cascade world size (prevents Ultra's large cascades from collapsing filter)
+  if (shader_injection_data.shadow_pcss_fix_clamp_cascade > 0.01f) {
+    cascadeWorldSize = min(cascadeWorldSize, shader_injection_data.shadow_pcss_fix_clamp_cascade);
+    base_radius = shader_injection_data.shadow_pcss_search_radius / cascadeWorldSize;
+  }
+  // Fix A: Texel-based radius (consistent across all quality levels)
+  if (shader_injection_data.shadow_pcss_fix_texel_radius > 0.5f) {
+    base_radius = shader_injection_data.shadow_pcss_search_radius * invShadowSize_g * 50.0;
+  }
+  search_radius = base_radius;
+
   float blocker_radius_scale = rsqrt((float)PCSS_BLOCKER_COUNT);
   float filter_radius_scale = rsqrt((float)PCSS_SAMPLE_COUNT);
 
@@ -144,6 +156,11 @@ float PCSS_Shadow(
   // filter_radius = penumbra × base_radius × user width multiplier
   float2 filter_radius = penumbra * base_radius * shader_injection_data.shadow_pcss_filter_width;
   filter_radius = max(invShadowSize_g, filter_radius);  // at least 1 texel
+  // Fix C: Enforce minimum filter radius in texels
+  if (shader_injection_data.shadow_pcss_fix_min_radius > 0.01f) {
+    float2 min_radius_uv = shader_injection_data.shadow_pcss_fix_min_radius * invShadowSize_g;
+    filter_radius = max(filter_radius, min_radius_uv);
+  }
 
   // Step 3: Variable-radius PCF
   float shadow = 0;
@@ -196,6 +213,12 @@ void main(
     }
     float jitter_phase = lerp(jitter_phase_static, jitter_noise.x, shader_injection_data.shadow_pcss_jitter_amount);
     pcss_jitter_angle = 6.28318548 * jitter_phase;
+  }
+
+  // Fix D: Auto-scale cascade blend with split distance
+  float pcss_blend = shader_injection_data.shadow_pcss_cascade_blend;
+  if (shader_injection_data.shadow_pcss_fix_auto_blend > 0.5f) {
+    pcss_blend *= shadowSplitDistance_g.y / 200.0;
   }
 
   r0.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
@@ -260,7 +283,7 @@ void main(
       if (shader_injection_data.shadow_filter_method > 1.5f) {
         r2.w = PCSS_Shadow(r1.yz, r1.w, 2, shadowSplitDistance_g.z, pcss_jitter_angle);
         r1.y = shadowSplitDistance_g.z + -r1.x;
-        r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+        r1.y = pcss_blend * r1.y;
         r1.z = r2.w + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
       } else if (shader_injection_data.shadow_filter_method > 0.5f) {
@@ -274,14 +297,14 @@ void main(
         r2.z = (int)r2.z + 1;
       }
       r1.y = shadowSplitDistance_g.z + -r1.x;
-      r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+      r1.y = pcss_blend * r1.y;
       r1.z = r2.y * 0.100000001 + -r2.x;
       r2.x = r1.y * r1.z + r2.x;
       } else {
         r3.xy = saturate(r1.yz);
         r2.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
         r1.y = shadowSplitDistance_g.z + -r1.x;
-        r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+        r1.y = pcss_blend * r1.y;
         r1.z = r2.w + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
       }
@@ -334,7 +357,7 @@ void main(
         if (shader_injection_data.shadow_filter_method > 1.5f) {
           r2.w = PCSS_Shadow(r1.yz, r1.w, 1, shadowSplitDistance_g.y, pcss_jitter_angle);
           r1.y = shadowSplitDistance_g.y + -r1.x;
-          r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+          r1.y = pcss_blend * r1.y;
           r1.z = r2.w + -r2.x;
           r2.x = r1.y * r1.z + r2.x;
         } else if (shader_injection_data.shadow_filter_method > 0.5f) {
@@ -349,14 +372,14 @@ void main(
           r3.w = (int)r3.w + 1;
         }
         r1.y = shadowSplitDistance_g.y + -r1.x;
-        r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+        r1.y = pcss_blend * r1.y;
         r1.z = r2.w * 0.100000001 + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
         } else {
           r3.xy = saturate(r1.yz);
           r2.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
           r1.y = shadowSplitDistance_g.y + -r1.x;
-          r1.y = shader_injection_data.shadow_pcss_cascade_blend * r1.y;
+          r1.y = pcss_blend * r1.y;
           r1.z = r2.w + -r2.x;
           r2.x = r1.y * r1.z + r2.x;
         }
@@ -403,7 +426,7 @@ void main(
         if (shader_injection_data.shadow_filter_method > 1.5f) {
           r0.w = PCSS_Shadow(r0.xy, r0.z, 1, shadowSplitDistance_g.x, pcss_jitter_angle);
           r0.y = shadowSplitDistance_g.x + -r1.x;
-          r0.y = shader_injection_data.shadow_pcss_cascade_blend * r0.y;
+          r0.y = pcss_blend * r0.y;
           r0.z = r0.w + -r2.x;
           r2.x = r0.y * r0.z + r2.x;
         } else if (shader_injection_data.shadow_filter_method > 0.5f) {
@@ -418,14 +441,14 @@ void main(
           r1.w = (int)r1.w + 1;
         }
         r0.y = shadowSplitDistance_g.x + -r1.x;
-        r0.xy = float2(0.100000001,shader_injection_data.shadow_pcss_cascade_blend) * r0.wy;
+        r0.xy = float2(0.100000001,pcss_blend) * r0.wy;
         r0.z = r3.w * 0.100000001 + -r0.x;
         r2.x = r0.y * r0.z + r0.x;
         } else {
           r3.xy = saturate(r0.xy);
           r0.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r0.z).x;
           r0.y = shadowSplitDistance_g.x + -r1.x;
-          r0.y = shader_injection_data.shadow_pcss_cascade_blend * r0.y;
+          r0.y = pcss_blend * r0.y;
           r0.z = r0.w + -r2.x;
           r2.x = r0.y * r0.z + r2.x;
         }
