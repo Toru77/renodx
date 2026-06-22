@@ -1148,6 +1148,16 @@ static void OnPushDescriptorsCapture(
         if (hash == 0xFDAAF80Eu) {
           d->captured_depth_srv = views[0];
           d->captured_scene_cbv_frame = d->frame_index;
+          if (shader_injection.xegtao_debug_logging > 0.5f) {
+            auto depth_res = device->get_resource_from_view(views[0]);
+            if (depth_res.handle != 0u) {
+              auto dd = device->get_resource_desc(depth_res);
+              reshade::log::message(reshade::log::level::info,
+                (std::string("[XeGTAO] Depth captured from lighting: ") +
+                 std::to_string(dd.texture.width) + "x" +
+                 std::to_string(dd.texture.height)).c_str());
+            }
+          }
         }
       }
     }
@@ -1406,13 +1416,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->captured_light_buffer_valid = true;
   };
 
-  // Use deferred snapshots from lighting draw (kai-style) — deferred dispatch only.
+  // Inline dispatch active (deferred off) — XeGTAO runs during lighting pass, not here.
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     capture_light_buffer_for_next_frame();
-    if (shader_injection.xegtao_debug_logging > 0.5f) {
-      reshade::log::message(reshade::log::level::warning,
-                            "[XeGTAO] Dispatch skipped: no deferred depth SRV.");
-    }
     return;
   }
   if (!d->deferred_scene_cbv_valid
