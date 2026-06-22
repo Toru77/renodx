@@ -762,7 +762,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGICharMaskStrength", .binding = &shader_injection.ssgi_char_mask_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Character Mask Strength", .section = "SSGI",
+      .default_value = 0.5f, .label = "Character Mask Strength", .section = "SSGI",
       .tooltip = "Reduce SSGI on character models. 0 = full GI on characters, 1 = fully masked.",
       .min = 0.5f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
@@ -770,7 +770,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.ssgi_multibounce,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 10.f, .label = "Multi-Bounce", .section = "SSGI",
+      .default_value = 1.f, .label = "Multi-Bounce", .section = "SSGI",
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
@@ -981,7 +981,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowEdgeTint", .binding = &shader_injection.shadow_edge_tint,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Colored Shadow Penumbra", .section = "Shadow Maps",
+      .default_value = 2.f, .label = "Colored Shadow Penumbra", .section = "Shadow Maps",
       .tooltip = "Off = neutral edges. Falcom = vanilla red tint. Improved = PCSS vibrancy boost in penumbra.",
       .labels = {"Off", "Falcom", "Improved"},
     },
@@ -1037,7 +1037,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFilterWidth", .binding = &shader_injection.shadow_pcss_filter_width,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.f, .label = "Filter Width", .section = "Shadow Maps",
+      .default_value = 3.f, .label = "Filter Width", .section = "Shadow Maps",
       .tooltip = "PCF filter width multiplier. Lower = sharper, higher = blurrier.",
       .min = 0.1f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -1045,7 +1045,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSDepthCap", .binding = &shader_injection.shadow_pcss_depth_cap,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.015f, .label = "Depth Sensitivity", .section = "Shadow Maps",
+      .default_value = 0.012f, .label = "Depth Sensitivity", .section = "Shadow Maps",
       .tooltip = "Max depth difference for penumbra. Higher = more distance-based softening.",
       .min = 0.01f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -1053,7 +1053,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSScascadeBlend", .binding = &shader_injection.shadow_pcss_cascade_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.3f, .label = "Cascade Blend", .section = "Shadow Maps",
+      .default_value = 0.02f, .label = "Cascade Blend", .section = "Shadow Maps",
       .tooltip = "Cross-fade width between cascades. Lower = wider/smoother blend. 0.02 = 50 units, 1.0 = 1 unit.",
       .min = 0.02f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -1062,7 +1062,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraColorStrength", .binding = &shader_injection.shadow_penumbra_color_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Penumbra Color Strength", .section = "Shadow Maps",
+      .default_value = 0.65f, .label = "Penumbra Color Strength", .section = "Shadow Maps",
       .tooltip = "How strongly the vibrancy effect is applied in penumbra regions. 0=off, 1=full.",
       .min = 0.f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
@@ -1070,7 +1070,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraVibrance", .binding = &shader_injection.shadow_penumbra_vibrance,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Penumbra Vibrance", .section = "Shadow Maps",
+      .default_value = 30.f, .label = "Penumbra Vibrance", .section = "Shadow Maps",
       .tooltip = "Vibrance adjustment in penumbra. 0=grayscale, 1=neutral, >1=more vivid. Protects already-saturated colors.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
@@ -1078,7 +1078,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Penumbra Detection", .section = "Shadow Maps",
+      .default_value = 1.0f, .label = "Penumbra Detection", .section = "Shadow Maps",
       .tooltip = "What counts as penumbra. Higher = wider detection area, more of the image gets the effect.",
       .min = 0.01f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
@@ -1094,7 +1094,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraFalcomBlend", .binding = &shader_injection.shadow_penumbra_falcom_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Falcom Penumbra Blend", .section = "Shadow Maps",
+      .default_value = 0.5f, .label = "Falcom Penumbra Blend", .section = "Shadow Maps",
       .tooltip = "Blend the vibrancy effect toward Falcom's red shadowEdgeColor tint. 0=pure vibrancy, 1=pure Falcom.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
@@ -1102,7 +1102,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraEdgeVibrance", .binding = &shader_injection.shadow_penumbra_edge_vibrance,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Edge Color Vibrance", .section = "Shadow Maps",
+      .default_value = 0.3f, .label = "Edge Color Vibrance", .section = "Shadow Maps",
       .tooltip = "Vibrance applied to shadowEdgeColor when Falcom blend > 0. 0=grayscale, 1=neutral, >1=vivid.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
@@ -1118,7 +1118,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraLightColorSaturation", .binding = &shader_injection.shadow_penumbra_lightcolor_saturation,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Light Color Saturation", .section = "Shadow Maps",
+      .default_value = 0.f, .label = "Light Color Saturation", .section = "Shadow Maps",
       .tooltip = "Vibrance applied to lightColor before blending. 0=grayscale, 1=neutral, >1=vivid sun color.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
