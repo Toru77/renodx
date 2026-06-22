@@ -555,6 +555,18 @@ void main(
     }
     // Apply environment SSS early in pipeline (before other effects)
     ApplyEnvSSS(r6.xyz, v1.xy, mrt0_xy_raw, is_character_pixel);
+
+    // Probe ambient debug — show lightProbe_g[0] DC term (indoor/outdoor signal)
+    if (shader_injection_data.ssgi_cascade_debug > 0.5f) {
+      float3 probeAmbient = lightProbe_g[0].xyz;
+      r6.xyz = probeAmbient * 0.5;
+      r6.w = r0.w;
+      o0.xyzw = r6.xyzw;
+      o1.xyzw = r2.xyzw;
+      o2.xy = r3.xy;
+      return;
+    }
+
     if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
       float3 giRaw = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
       
@@ -1405,6 +1417,18 @@ void main(
   r0.x = (uint)r0.x;
   o2.y = min(0x0000ffff, (uint)r0.x);
   o0.xyz = r0.yzw;
+
+  // Probe ambient debug — character pixel path
+  if (shader_injection_data.ssgi_cascade_debug > 0.5f) {
+    float3 probeAmbient = lightProbe_g[0].xyz;
+    o0.xyz = probeAmbient * 0.5;
+    o0.w = 1;
+    o1.xyzw = r2.xyzw;
+    o2.xy = r3.xy;
+    o2.x = 0;
+    return;
+  }
+
   if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
     float3 giRaw = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
     

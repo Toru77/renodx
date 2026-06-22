@@ -93,6 +93,7 @@ struct ShaderInjectData {
   float ssgi_affect_lights;         // 0=Off, 1=On — additively blend lightColor into GI
   float ssgi_lights_strength;       // [0..5], default 1.0 — multiplier for lightColor contribution
   float ssgi_lights_saturation;     // [0..100], default 1.0 — vibrance for lightColor: 0=gray, 1=neutral
+  float ssgi_cascade_debug;         // 0=Off, 1=On — show shadowmapCascadeCount_g as color overlay
   float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
   float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS vibrancy)
   // —— PCSS (Percentage Closer Soft Shadows) ——

@@ -111,6 +111,7 @@ ShaderInjectData shader_injection = {
   .ssgi_affect_lights = 0.f,
   .ssgi_lights_strength = 1.f,
   .ssgi_lights_saturation = 1.f,
+  .ssgi_cascade_debug = 0.f,
   .shadow_filter_method = 1.f,
   .shadow_edge_tint = 1.f,
   .shadow_pcss_jitter_enabled = 1.f,
@@ -181,6 +182,10 @@ static float g_isfast_debug_logging = 0.f;
 static float g_isfast_spatial_scale = 1.f;
 static float g_isfast_temporal_speed = 1.f;
 static float g_isfast_seed_offset   = 0.f;
+
+// ── Settings visibility ──
+static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
+static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
 
 // ── CPU optimization toggles ──
 static float g_xegtao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, …)
@@ -403,6 +408,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         0x954D3D6Du,
         renodx::mods::shader::CustomShader{
             .crc32 = 0x954D3D6Du,
+            .code = __0x954D3D6D,
             .on_draw = OnBeforeVolFogDraw,
         },
     },
@@ -439,6 +445,17 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
+        .key = "SettingsMode",
+        .binding = &g_settings_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .can_reset = false,
+        .label = "Settings Mode",
+        .section = "Settings",
+        .labels = {"Basic", "Advanced"},
+        .is_global = true,
+    },
+    new renodx::utils::settings::Setting{
         .key = "VolFogHazeAAMode",
         .binding = &shader_injection.volfog_haze_aa_mode,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -452,9 +469,10 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "VolFogJitter", .binding = &shader_injection.volfog_jitter_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Vol Fog Jitter", .section = "Volumetric Fog",
+      .default_value = 1.f, .label = "Vol Fog Jitter", .section = "Volumetric Fog",
       .tooltip = "Apply IS-FAST spatio-temporal noise to break up froxel grid artifacts. Requires IS-FAST enabled.",
       .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VolFogJitterAmount", .binding = &shader_injection.volfog_jitter_amount,
@@ -463,6 +481,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Strength of the noise jitter applied to volume sample coordinates.",
       .min = 0.f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VolFogJitterSpeed", .binding = &shader_injection.volfog_jitter_speed,
@@ -471,6 +490,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Temporal animation speed for the noise jitter. Higher = faster rotation.",
       .min = 0.f, .max = 1024.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VolFogISFASTSpatialScale", .binding = &shader_injection.volfog_isfast_spatial_scale,
@@ -479,6 +499,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scales the IS-FAST noise pattern spatially. Lower = larger noise features.",
       .min = 0.25f, .max = 4.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "VolFogISFASTSampler", .binding = &shader_injection.volfog_isfast_dedicated_sampler,
@@ -487,6 +508,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Off = reuse s1 point sampler. On = use dedicated s2 point-wrap sampler for noise.",
       .labels = {"s1 Point", "s2 Dedicated"},
       .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowMode", .binding = &shader_injection.char_shadow_mode,
@@ -500,6 +522,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.f, .label = "Shadow Type", .section = "Character Shadowing",
       .labels = {"Camera View", "World View", "Combined"},
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowCameraStrength", .binding = &shader_injection.char_shadow_camera_strength,
@@ -507,6 +530,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f && shader_injection.char_shadow_type != 1.f; },
       .parse = [](float v) { return v * 0.01f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowWorldStrength", .binding = &shader_injection.char_shadow_world_strength,
@@ -514,13 +538,15 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f && shader_injection.char_shadow_type != 0.f; },
       .parse = [](float v) { return v * 0.01f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowSampleCount", .binding = &shader_injection.char_shadow_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 32.f, .label = "Sample Count", .section = "Character Shadowing",
+      .default_value = 16.f, .label = "Sample Count", .section = "Character Shadowing",
       .min = 1.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowHardSamples", .binding = &shader_injection.char_shadow_hard_shadow_samples,
@@ -528,49 +554,57 @@ renodx::utils::settings::Settings settings = {
       .default_value = 4.f, .label = "Hard Samples", .section = "Character Shadowing",
       .min = 0.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowFadeSamples", .binding = &shader_injection.char_shadow_fade_out_samples,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 16.f, .label = "Fade Samples", .section = "Character Shadowing",
+      .default_value = 8.f, .label = "Fade Samples", .section = "Character Shadowing",
       .min = 0.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowSurfaceThickness", .binding = &shader_injection.char_shadow_surface_thickness,
-      .default_value = 0.09f, .label = "Surface Thickness", .section = "Character Shadowing",
+      .default_value = 0.075f, .label = "Surface Thickness", .section = "Character Shadowing",
       .min = 0.001f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowContrast", .binding = &shader_injection.char_shadow_contrast,
       .default_value = 9.f, .label = "Shadow Contrast", .section = "Character Shadowing",
       .min = 0.f, .max = 12.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowLightFadeStart", .binding = &shader_injection.char_shadow_light_screen_fade_start,
       .default_value = 0.f, .label = "Light Fade Start", .section = "Character Shadowing",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowLightFadeEnd", .binding = &shader_injection.char_shadow_light_screen_fade_end,
       .default_value = 0.f, .label = "Light Fade End", .section = "Character Shadowing",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowMinOccluderDepthScale", .binding = &shader_injection.char_shadow_min_occluder_depth_scale,
       .default_value = 0.f, .label = "Occluder Depth Scale", .section = "Character Shadowing",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSEnabled", .binding = &shader_injection.env_sss_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Bend SSS", .section = "Environment Screen Space Shadows",
       .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSStrength", .binding = &shader_injection.env_sss_strength,
@@ -578,6 +612,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
       .parse = [](float v) { return v * 0.01f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSSampleCount", .binding = &shader_injection.env_sss_sample_count,
@@ -585,18 +620,21 @@ renodx::utils::settings::Settings settings = {
       .default_value = 24.f, .label = "Sample Count", .section = "Environment Screen Space Shadows",
       .min = 1.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSSurfaceThickness", .binding = &shader_injection.env_sss_surface_thickness,
       .default_value = 0.005f, .label = "Surface Thickness", .section = "Environment Screen Space Shadows",
       .min = 0.001f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSContrast", .binding = &shader_injection.env_sss_contrast,
       .default_value = 2.f, .label = "Shadow Contrast", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 12.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightEnable", .binding = &shader_injection.env_sss_height_enabled,
@@ -604,54 +642,63 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Height Above Ground", .section = "Environment Screen Space Shadows",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightMin", .binding = &shader_injection.env_sss_height_min,
       .default_value = 0.f, .label = "Min Height", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 10.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f && shader_injection.env_sss_height_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightMax", .binding = &shader_injection.env_sss_height_max,
       .default_value = 1.f, .label = "Ground Search", .section = "Environment Screen Space Shadows",
       .min = 1.f, .max = 200.f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f && shader_injection.env_sss_height_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightFade", .binding = &shader_injection.env_sss_height_fade,
       .default_value = 0.10f, .label = "Height Fade", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 5.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f && shader_injection.env_sss_height_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSVerticalReject", .binding = &shader_injection.env_sss_vertical_reject,
       .default_value = 0.30f, .label = "Vertical Reject", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSMaxDarkening", .binding = &shader_injection.env_sss_max_darkening,
       .default_value = 0.40f, .label = "Max Darkening", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSBrightRejectThreshold", .binding = &shader_injection.env_sss_bright_reject_threshold,
       .default_value = 0.19f, .label = "Brightness Reject", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 5.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSBrightRejectFade", .binding = &shader_injection.env_sss_bright_reject_fade,
       .default_value = 0.5f, .label = "Brightness Fade", .section = "Environment Screen Space Shadows",
       .min = 0.01f, .max = 3.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DebugShowEnvSSS", .binding = &shader_injection.debug_show_env_sss,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Env SSS Debug View", .section = "Environment Screen Space Shadows",
       .labels = {"Off", "Final Shadow", "Character Mask", "Surface Normal", "Raw Shadow"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— XeGTAO ——
     new renodx::utils::settings::Setting{
@@ -667,6 +714,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Quality Level", .section = "XeGTAO",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoisePasses", .binding = &shader_injection.xegtao_denoise_passes,
@@ -674,6 +722,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Denoise Passes", .section = "XeGTAO",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOJitter", .binding = &g_xegtao_jitter_toggle,
@@ -682,36 +731,42 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Enable temporal jitter even when denoising is off.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes < 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAORadius", .binding = &shader_injection.xegtao_radius,
       .default_value = 0.5f, .label = "Radius", .section = "XeGTAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFalloffRange", .binding = &shader_injection.xegtao_falloff_range,
       .default_value = 0.615f, .label = "Falloff Range", .section = "XeGTAO",
       .min = 0.0f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAORadiusMultiplier", .binding = &shader_injection.xegtao_radius_multiplier,
       .default_value = 1.457f, .label = "Radius Multiplier", .section = "XeGTAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFinalPower", .binding = &shader_injection.xegtao_final_power,
       .default_value = 1.5f, .label = "Final Power", .section = "XeGTAO",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOSampleDistribution", .binding = &shader_injection.xegtao_sample_distribution,
       .default_value = 1.33f, .label = "Sample Distribution", .section = "XeGTAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOBitmaskThickness", .binding = &shader_injection.xegtao_bitmask_thickness,
@@ -719,18 +774,21 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODepthMIPOffset", .binding = &shader_injection.xegtao_depth_mip_offset,
       .default_value = 3.30f, .label = "Depth MIP Offset", .section = "XeGTAO",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoiseBlurBeta", .binding = &shader_injection.xegtao_denoise_blur_beta,
       .default_value = 20.0f, .label = "Denoise Blur Beta", .section = "XeGTAO",
       .min = 0.5f, .max = 20.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOInternalResolution", .binding = &shader_injection.xegtao_internal_resolution,
@@ -738,6 +796,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.f, .label = "Internal Resolution", .section = "XeGTAO",
       .labels = {"50%", "75%", "100%"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalInputMode", .binding = &g_xegtao_normal_input_mode,
@@ -746,48 +805,56 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
       .labels = {"Off (Depth)", "On (MRT)"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalInfluence", .binding = &g_xegtao_normal_influence,
       .default_value = 1.f, .label = "Normal Influence", .section = "XeGTAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalDepthBlend", .binding = &g_xegtao_normal_depth_blend,
       .default_value = 0.65f, .label = "Normal Depth Blend", .section = "XeGTAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalSharpness", .binding = &g_xegtao_normal_sharpness,
       .default_value = 1.f, .label = "Normal Sharpness", .section = "XeGTAO",
       .min = 0.01f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalEdgeRejection", .binding = &g_xegtao_normal_edge_rejection,
       .default_value = 0.5f, .label = "Normal Edge Rejection", .section = "XeGTAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalZPreservation", .binding = &g_xegtao_normal_z_preservation,
       .default_value = 0.f, .label = "Normal Z Preservation", .section = "XeGTAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalDetailResponse", .binding = &g_xegtao_normal_detail_response,
       .default_value = 1.0f, .label = "Normal Detail Response", .section = "XeGTAO",
       .min = 0.01f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalMaxDarkening", .binding = &g_xegtao_normal_max_darkening,
       .default_value = 0.4f, .label = "Normal Max Darkening", .section = "XeGTAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalDarkeningMode", .binding = &g_xegtao_normal_darkening_mode,
@@ -795,6 +862,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Normal Darkening Mode", .section = "XeGTAO",
       .labels = {"Multiply", "Replace"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAONormalTransformMode", .binding = &g_xegtao_normal_transform_mode,
@@ -803,6 +871,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How to transform MRT normals to view space. Try alternatives if normals look wrong at some camera angles.",
       .labels = {"view_g (default)", "viewInv_g", "Passthrough"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODebugView", .binding = &shader_injection.xegtao_debug_view,
@@ -810,12 +879,14 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Debug View", .section = "XeGTAO",
       .labels = {"Off", "AO Only", "XeGTAO raw .a", "XeGTAO RGBA", "Vanilla SSAO", "Depth",
                  "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODebugLogging", .binding = &shader_injection.xegtao_debug_logging,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Debug Logging", .section = "XeGTAO",
       .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFixExperimental", .binding = &shader_injection.xegtao_fix_experimental,
@@ -823,6 +894,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Fix Experimental", .section = "XeGTAO",
       .tooltip = "Bitmask AO experimental fixes. 0=Off (baseline). Test each mode to diagnose darkening.",
       .labels = {"Off", "1:Clamp50%", "2:Clamp100%", "3:ScaleDist", "4:SkipBehind", "5:Skip2x"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOFrameSkip", .binding = &g_xegtao_frame_skip,
@@ -831,6 +903,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Skip XeGTAO AO+GI computation every N frames to improve performance.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— SSGI (Screen Space Global Illumination — integrated into XeGTAO) ——
     new renodx::utils::settings::Setting{
@@ -846,6 +919,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.0f, .label = "Intensity", .section = "SSGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGISaturation", .binding = &shader_injection.ssgi_saturation,
@@ -853,6 +927,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "0 = grayscale GI, 1 = full color GI.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGICharMaskStrength", .binding = &shader_injection.ssgi_char_mask_strength,
@@ -861,6 +936,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Reduce SSGI on character models. 0 = full GI on characters, 1 = fully masked.",
       .min = 0.5f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.ssgi_multibounce,
@@ -869,6 +945,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounceStrength", .binding = &shader_injection.ssgi_multibounce_strength,
@@ -877,6 +954,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Intensity of the multi-bounce feedback. 1.0 = natural, higher = stronger accumulation.",
       .min = 0.0f, .max = 10.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounceSaturation", .binding = &shader_injection.ssgi_multibounce_saturation,
@@ -885,6 +963,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Color saturation of the multi-bounce feedback. 0 = grayscale, 1 = full color.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveR", .binding = &shader_injection.ssgi_adaptive_r,
@@ -893,6 +972,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveG", .binding = &shader_injection.ssgi_adaptive_g,
@@ -901,6 +981,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveB", .binding = &shader_injection.ssgi_adaptive_b,
@@ -909,6 +990,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveMode", .binding = &shader_injection.ssgi_adaptive_mode,
@@ -917,6 +999,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "GI Color = boost channels based on GI's own color. Albedo = boost based on surface color at pixel.",
       .labels = {"GI Color", "Surface Albedo"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveLumaStrength", .binding = &shader_injection.ssgi_adaptive_luma_strength,
@@ -925,6 +1008,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Target brightness for GI normalization. 0=off. Higher = brighter target. Evens out indoor/outdoor GI.",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveLumaBlend", .binding = &shader_injection.ssgi_adaptive_luma_blend,
@@ -933,6 +1017,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blend between original GI (0) and luma-normalized GI (1).",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIGIPower", .binding = &shader_injection.ssgi_gi_power,
@@ -940,6 +1025,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Power curve applied to GI output. Higher = more contrast.",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGILightExposure", .binding = &g_ssgi_light_exposure,
@@ -947,6 +1033,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Exposure scale for HDR light buffer. Start at 0.05. Lower = dimmer GI.",
       .min = 0.001f, .max = 5.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIFrameSkip", .binding = &g_ssgi_frame_skip,
@@ -955,6 +1042,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Skip GI computation every N frames. AO still runs every frame.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MultiBounceFrameSkip", .binding = &g_multibounce_frame_skip,
@@ -963,6 +1051,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Skip multi-bounce accumulation every N frames.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— SSGI Debug ——
     new renodx::utils::settings::Setting{
@@ -971,6 +1060,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
       .tooltip = "Replace scene with SSGI debug textures.",
       .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity", "Light Color"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIDebugLogging", .binding = &shader_injection.ssgi_debug_logging,
@@ -978,6 +1068,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "SSGI Debug Logging", .section = "SSGI",
       .tooltip = "Log SSGI dispatch, push, and texture binding to console.",
       .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— SSGI Affect Lights ——
     new renodx::utils::settings::Setting{
@@ -986,6 +1077,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Affect Lights", .section = "SSGI",
       .tooltip = "Additively blend the sun's lightColor into the GI contribution, tinting indirect light.",
       .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGILightsStrength", .binding = &shader_injection.ssgi_lights_strength,
@@ -994,6 +1086,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How much lightColor to add. 0=no effect, 1=full sun color, >1=boosted.",
       .min = 0.f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.ssgi_affect_lights > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGILightsSaturation", .binding = &shader_injection.ssgi_lights_saturation,
@@ -1002,6 +1095,15 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance applied to lightColor before adding. 0=grayscale, 1=neutral, >1=vivid.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.ssgi_affect_lights > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGICascadeDebug", .binding = &shader_injection.ssgi_cascade_debug,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "CascadeCount Debug", .section = "SSGI",
+      .tooltip = "Color overlay by shadowmapCascadeCount_g: 0=red, 1=yellow, 2=green, 3=cyan, 4=blue.",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— IS-FAST ——
     new renodx::utils::settings::Setting{
@@ -1018,6 +1120,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "0 = deterministic (banding), 1 = full noise.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ISFASTDebugLogging", .binding = &g_isfast_debug_logging,
@@ -1025,6 +1128,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Debug Logging", .section = "IS-FAST",
       .tooltip = "Log IS-FAST texture load status and noise source.",
       .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ISFASTSpatialScale", .binding = &g_isfast_spatial_scale,
@@ -1033,6 +1137,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scale noise spatial frequency. <1 zooms in (smoother), >1 adds more detail.",
       .min = 0.25f, .max = 4.0f, .format = "%.2f",
       .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ISFASTTemporalSpeed", .binding = &g_isfast_temporal_speed,
@@ -1041,6 +1146,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scale noise animation speed. 0 = frozen, 1 = default, 5 = fast flicker.",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ISFASTSeedOffset", .binding = &g_isfast_seed_offset,
@@ -1049,6 +1155,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Offset the noise seed pattern (0-64). Shift to find optimal noise distribution.",
       .labels = {"0","4","8","12","16","20","24","28","32","36","40","44","48","52","56","60"},
       .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— CPU Optimizations ——
     new renodx::utils::settings::Setting{
@@ -1057,6 +1164,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
       .tooltip = "Move XeGTAO/SSGI dispatch to OnPresent (kai-style, 1-frame latency).",
       .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CPUOptEnsurePipelines", .binding = &g_cpuopt_ensure_pipelines,
@@ -1064,6 +1172,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Ensure Pipelines", .section = "CPU Opt",
       .tooltip = "Don't destroy/recreate pipelines every frame (kai-style).",
       .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— Shadow Maps ——
     new renodx::utils::settings::Setting{
@@ -1088,6 +1197,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Use IS-FAST spatio-temporal noise to rotate PCSS sample pattern each frame.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSJitterAmount", .binding = &shader_injection.shadow_pcss_jitter_amount,
@@ -1096,6 +1206,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "0 = static Poisson, 1 = full temporal rotation.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSJitterSpeed", .binding = &shader_injection.shadow_pcss_jitter_speed,
@@ -1104,6 +1215,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Temporal animation speed. Higher = faster rotation.",
       .min = 0.0f, .max = 500.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
@@ -1112,6 +1224,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Constant minimum penumbra width. Contact-hard at 0, always soft at 0.5.",
       .min = 0.0f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraScale", .binding = &shader_injection.shadow_penumbra_scale,
@@ -1120,6 +1233,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How fast penumbra widens with occluder distance. Higher = softer distant shadows.",
       .min = 1.0f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSSearchRadius", .binding = &shader_injection.shadow_pcss_search_radius,
@@ -1128,6 +1242,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Desired softness in world units. Same value = same penumbra width across all cascades. 0.1=sharp, 5=very soft.",
       .min = 0.1f, .max = 2.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFilterWidth", .binding = &shader_injection.shadow_pcss_filter_width,
@@ -1136,6 +1251,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "PCF filter width multiplier. Lower = sharper, higher = blurrier.",
       .min = 0.1f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSDepthCap", .binding = &shader_injection.shadow_pcss_depth_cap,
@@ -1144,14 +1260,16 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Max depth difference for penumbra. Higher = more distance-based softening.",
       .min = 0.01f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSScascadeBlend", .binding = &shader_injection.shadow_pcss_cascade_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.02f, .label = "Cascade Blend", .section = "Shadow Maps",
+      .default_value = 0.30f, .label = "Cascade Blend", .section = "Shadow Maps",
       .tooltip = "Cross-fade width between cascades. Lower = wider/smoother blend. 0.02 = 50 units, 1.0 = 1 unit.",
       .min = 0.02f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— PCSS Experimental Fixes (A/B test, all off = default behavior) ——
     new renodx::utils::settings::Setting{
@@ -1161,6 +1279,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Override world-space filter with texel-based radius. Consistent softness across all quality levels.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFixClampCascade", .binding = &shader_injection.shadow_pcss_fix_clamp_cascade,
@@ -1169,14 +1288,16 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Cap the cascade world size. Prevents Ultra's extended cascades from collapsing the filter. 0=off.",
       .min = 0.f, .max = 500.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFixMinRadius", .binding = &shader_injection.shadow_pcss_fix_min_radius,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "PCSS Fix C: Minimum Filter Radius", .section = "Shadow Maps",
+      .default_value = 5.0f, .label = "PCSS Fix C: Minimum Filter Radius", .section = "Shadow Maps",
       .tooltip = "Guaranteed minimum PCF filter radius in shadow map texels. Prevents filter from collapsing. 0=off.",
       .min = 0.f, .max = 100.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFixAutoBlend", .binding = &shader_injection.shadow_pcss_fix_auto_blend,
@@ -1185,6 +1306,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scale cascade blend by split distance. Larger cascades get tighter blends. Off = static blend value.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— Colored Shadow Penumbra (Improved mode, PCSS-only) ——
     new renodx::utils::settings::Setting{
@@ -1194,6 +1316,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How strongly the vibrancy effect is applied in penumbra regions. 0=off, 1=full.",
       .min = 0.f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraVibrance", .binding = &shader_injection.shadow_penumbra_vibrance,
@@ -1202,6 +1325,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance adjustment in penumbra. 0=grayscale, 1=neutral, >1=more vivid. Protects already-saturated colors.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
@@ -1210,6 +1334,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "What counts as penumbra. Higher = wider detection area, more of the image gets the effect.",
       .min = 0.01f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraColorBrightness", .binding = &shader_injection.shadow_penumbra_color_brightness,
@@ -1218,6 +1343,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Brightness multiplier for the vibrancy tint color. 1=neutral, 0=black, >1=brighter.",
       .min = 0.f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraFalcomBlend", .binding = &shader_injection.shadow_penumbra_falcom_blend,
@@ -1226,6 +1352,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blend the vibrancy effect toward Falcom's red shadowEdgeColor tint. 0=pure vibrancy, 1=pure Falcom.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraEdgeVibrance", .binding = &shader_injection.shadow_penumbra_edge_vibrance,
@@ -1234,6 +1361,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance applied to shadowEdgeColor when Falcom blend > 0. 0=grayscale, 1=neutral, >1=vivid.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraLightColorBlend", .binding = &shader_injection.shadow_penumbra_lightcolor_blend,
@@ -1242,6 +1370,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blend the penumbra tint toward the sun's lightColor. 0=no effect, 1=fully sun-colored penumbra.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraLightColorSaturation", .binding = &shader_injection.shadow_penumbra_lightcolor_saturation,
@@ -1250,6 +1379,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance applied to lightColor before blending. 0=grayscale, 1=neutral, >1=vivid sun color.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraDebugView", .binding = &shader_injection.shadow_penumbra_debug_view,
@@ -1258,6 +1388,46 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Visualize penumbra processing. PenumbraMask=detection area, TintColor=adjusted color, Result=final blend.",
       .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+      .label = "Patreon",
+      .section = "Info",
+      .on_click = []() {
+        renodx::utils::platform::LaunchURL("https://www.patreon.com/c/Toru77");
+        return false;
+      },
+    },
+    new renodx::utils::settings::Setting{
+      .value_type = renodx::utils::settings::SettingValueType::TEXT,
+      .label = "Addon made by Toru.",
+      .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Thanks to Shortfuse for RenoDX.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Thanks to Forge for rendering techniques and inspiring me.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "IS-FAST Jitter: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Ultra Shadows are recommended for PCSS. High is minimum.",
+        .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Disable SSAO from in game settings for small performance boost if you are using XeGTAO.",
+        .section = "Info",
     },
     // ── SSGI debug views removed — use XeGTAO Debug View for GI inspection. ──
 };
@@ -2487,9 +2657,9 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
 
 }  // namespace
 
-extern "C" __declspec(dllexport) constexpr const char* NAME = "Generic Vanilla+";
+extern "C" __declspec(dllexport) constexpr const char* NAME = "Sora Vanilla+";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION =
-    "Generic vanilla-plus shader injector";
+    "Sora Vanilla+ made by Toru";
 
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
