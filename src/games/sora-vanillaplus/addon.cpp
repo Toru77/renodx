@@ -101,6 +101,9 @@ ShaderInjectData shader_injection = {
   .ssgi_gi_power = 1.5f,
   .ssgi_debug_logging = 0.f,
   .ssgi_debug_view = 0.f,
+  .ssgi_affect_lights = 0.f,
+  .ssgi_lights_strength = 1.f,
+  .ssgi_lights_saturation = 1.f,
   .shadow_filter_method = 1.f,
   .shadow_edge_tint = 1.f,
   .shadow_pcss_jitter_enabled = 1.f,
@@ -872,7 +875,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
       .tooltip = "Replace scene with SSGI debug textures.",
-      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity"},
+      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity", "Light Color"},
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIDebugLogging", .binding = &shader_injection.ssgi_debug_logging,
@@ -880,6 +883,30 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "SSGI Debug Logging", .section = "SSGI",
       .tooltip = "Log SSGI dispatch, push, and texture binding to console.",
       .labels = {"Off", "On"},
+    },
+    // —— SSGI Affect Lights ——
+    new renodx::utils::settings::Setting{
+      .key = "SSGIAffectLights", .binding = &shader_injection.ssgi_affect_lights,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Affect Lights", .section = "SSGI",
+      .tooltip = "Additively blend the sun's lightColor into the GI contribution, tinting indirect light.",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGILightsStrength", .binding = &shader_injection.ssgi_lights_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Lights Strength", .section = "SSGI",
+      .tooltip = "How much lightColor to add. 0=no effect, 1=full sun color, >1=boosted.",
+      .min = 0.f, .max = 5.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.ssgi_affect_lights > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGILightsSaturation", .binding = &shader_injection.ssgi_lights_saturation,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Lights Saturation", .section = "SSGI",
+      .tooltip = "Vibrance applied to lightColor before adding. 0=grayscale, 1=neutral, >1=vivid.",
+      .min = 0.f, .max = 100.0f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.ssgi_affect_lights > 0.5f; },
     },
     // —— IS-FAST ——
     new renodx::utils::settings::Setting{

@@ -81,7 +81,10 @@ struct ShaderInjectData {
   float ssgi_adaptive_luma_blend;   // [0..1], default 0.5 — blend between original and normalized
   float ssgi_gi_power;              // [0.5..5], default 1.5 — power curve for GI
   float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
-  float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples
+  float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples, 6=LightColor
+  float ssgi_affect_lights;         // 0=Off, 1=On — additively blend lightColor into GI
+  float ssgi_lights_strength;       // [0..5], default 1.0 — multiplier for lightColor contribution
+  float ssgi_lights_saturation;     // [0..100], default 1.0 — vibrance for lightColor: 0=gray, 1=neutral
   float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
   float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS vibrancy)
   // —— PCSS (Percentage Closer Soft Shadows) ——

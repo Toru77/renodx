@@ -564,7 +564,25 @@ void main(
       
       // Intensity.
       giColor *= shader_injection_data.ssgi_intensity;
-      
+
+      // Affect Lights: additively blend sun color into GI (SSGI-style lerp saturation)
+      if (shader_injection_data.ssgi_affect_lights > 0.5f) {
+        float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
+        float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.ssgi_lights_saturation);
+        lightContrib = saturate(lightContrib);
+        giColor += lightContrib * shader_injection_data.ssgi_lights_strength * 0.2f;
+      }
+
+      // Light Color debug view — shows sun color uniformly
+      if ((int)shader_injection_data.ssgi_debug_view == 6) {
+        r6.xyz = lightColor_g.xyz * 0.05;
+        r6.w = r0.w;
+        o0.xyzw = r6.xyzw;
+        o1.xyzw = r2.xyzw;
+        o2.xy = r3.xy;
+        return;
+      }
+
       // Character mask: reduce GI on characters by configured amount.
       giColor *= (1.0 - shader_injection_data.ssgi_char_mask_strength);
       
@@ -1396,7 +1414,25 @@ void main(
     
     // Intensity.
     giColor *= shader_injection_data.ssgi_intensity;
-    
+
+    // Affect Lights: additively blend sun color into GI (SSGI-style lerp saturation)
+    if (shader_injection_data.ssgi_affect_lights > 0.5f) {
+      float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
+      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.ssgi_lights_saturation);
+      lightContrib = saturate(lightContrib);
+      giColor += lightContrib * shader_injection_data.ssgi_lights_strength * 0.2f;
+    }
+
+    // Light Color debug view — shows sun color uniformly
+    if ((int)shader_injection_data.ssgi_debug_view == 6) {
+      o0.xyz = lightColor_g.xyz * 0.05;
+      o0.w = 1;
+      o1.xyzw = r2.xyzw;
+      o2.xy = r3.xy;
+      o2.x = 0;
+      return;
+    }
+
     if (shader_injection_data.xegtao_ssgi_debug > 0.5f) {
       o0.xyz = giColor;  // Debug: replace scene with GI texture
     } else {
