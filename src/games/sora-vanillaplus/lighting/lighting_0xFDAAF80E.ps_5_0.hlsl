@@ -808,14 +808,88 @@ void main(
   r1.w = shadowEdgeSharpness_g * r1.w;
   r1.w = exp2(r1.w);
   if (shader_injection_data.shadow_edge_tint > 1.5f) {
-    // Improved (PCSS-only): diffuse saturation boost in penumbra region
+    // Improved (PCSS-only): vibrancy boost in penumbra region
     float penumbra = 1.0f - 2.0f * abs(r0.w - 0.5f);
     penumbra = saturate(penumbra / shader_injection_data.shadow_penumbra_detection);
-    float luma = dot(r8.xyz, float3(0.333f, 0.333f, 0.333f));
-    // saturation: 0=grayscale, 1=neutral, >1=boosted
-    float3 saturated = luma + shader_injection_data.shadow_penumbra_saturation * (r8.xyz - luma);
-    saturated = saturate(saturated);
-    r13.yzw = lerp(r8.xyz, saturated, penumbra);
+
+    // Vibrancy source: colorTexture (r0.xyz) — has full scene color.
+    // r8.xyz is NOT usable here because line 806 blends it toward white:
+    //   r8 = lerp(r8, 1, r1.w)  which washes out all color in lit areas.
+    float3 surfaceColor = r0.xyz;
+    float luma = dot(surfaceColor, float3(0.333f, 0.333f, 0.333f));
+    float maxC = max(surfaceColor.x, max(surfaceColor.y, surfaceColor.z));
+    float vibrance = shader_injection_data.shadow_penumbra_vibrance;
+    float3 surfaceVibrancy;
+    if (vibrance <= 1.0f) {
+      surfaceVibrancy = luma + vibrance * (surfaceColor - luma);
+    } else {
+      float vibranceFactor = 1.0f + (vibrance - 1.0f) * (1.0f - maxC);
+      surfaceVibrancy = luma + vibranceFactor * (surfaceColor - luma);
+    }
+    surfaceVibrancy = saturate(surfaceVibrancy);
+
+    // Vibrancy-adjusted Falcom shadowEdgeColor
+    float edgeLuma = dot(shadowEdgeColor_g.xyz, float3(0.333f, 0.333f, 0.333f));
+    float edgeMaxC = max(shadowEdgeColor_g.x, max(shadowEdgeColor_g.y, shadowEdgeColor_g.z));
+    float edgeVibrance = shader_injection_data.shadow_penumbra_edge_vibrance;
+    float3 edgeVibrancy;
+    if (edgeVibrance <= 1.0f) {
+      edgeVibrancy = edgeLuma + edgeVibrance * (shadowEdgeColor_g.xyz - edgeLuma);
+    } else {
+      float edgeFactor = 1.0f + (edgeVibrance - 1.0f) * (1.0f - edgeMaxC);
+      edgeVibrancy = edgeLuma + edgeFactor * (shadowEdgeColor_g.xyz - edgeLuma);
+    }
+    edgeVibrancy = saturate(edgeVibrancy);
+
+    // Vibrancy-adjusted lightColor (sun color)
+    float lightLuma = dot(lightColor_g.xyz, float3(0.333f, 0.333f, 0.333f));
+    float lightMaxC = max(lightColor_g.x, max(lightColor_g.y, lightColor_g.z));
+    float lightSaturation = shader_injection_data.shadow_penumbra_lightcolor_saturation;
+    float3 lightVibrancy;
+    if (lightSaturation <= 1.0f) {
+      lightVibrancy = lightLuma + lightSaturation * (lightColor_g.xyz - lightLuma);
+    } else {
+      float lightFactor = 1.0f + (lightSaturation - 1.0f) * (1.0f - lightMaxC);
+      lightVibrancy = lightLuma + lightFactor * (lightColor_g.xyz - lightLuma);
+    }
+    lightVibrancy = saturate(lightVibrancy);
+
+    // Blend between surface vibrancy and Falcom edge vibrancy
+    float3 tintColor = lerp(surfaceVibrancy, edgeVibrancy, shader_injection_data.shadow_penumbra_falcom_blend);
+
+    // Blend toward lightColor vibrancy
+    tintColor = lerp(tintColor, lightVibrancy, shader_injection_data.shadow_penumbra_lightcolor_blend);
+
+    // Apply brightness
+    tintColor *= shader_injection_data.shadow_penumbra_color_brightness;
+    tintColor = saturate(tintColor);
+
+    // Blend vibrancy color onto the shadow-edge-processed r8.xyz
+    float strength = shader_injection_data.shadow_penumbra_color_strength * penumbra;
+    float3 finalColor = lerp(r8.xyz, tintColor, strength);
+
+    // Debug views — replace output and return early
+    static const float kDebugHdrScale = 0.05;
+    int debugMode = (int)shader_injection_data.shadow_penumbra_debug_view;
+    if (debugMode == 1) {
+      o0.rgb = float3(penumbra, penumbra, penumbra) * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (debugMode == 2) {
+      o0.rgb = tintColor * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (debugMode == 3) {
+      o0.rgb = finalColor * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (debugMode == 4) {
+      // Sun color (lightColor_g from cb_scene c25) applied uniformly
+      o0.rgb = lightColor_g.xyz * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+
+    r13.yzw = finalColor;
   } else if (shader_injection_data.shadow_edge_tint > 0.5f) {
     r13.yzw = -shadowEdgeColor_g.xyz + r8.xyz;
     r13.yzw = r0.www * r13.yzw + shadowEdgeColor_g.xyz;

@@ -83,7 +83,7 @@ struct ShaderInjectData {
   float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
   float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples
   float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
-  float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS saturation boost)
+  float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS vibrancy)
   // —— PCSS (Percentage Closer Soft Shadows) ——
   float shadow_pcss_jitter_enabled;    // 0=Off, 1=On
   float shadow_pcss_jitter_amount;     // [0..1], default 1.0 — blend static→temporal
@@ -95,8 +95,15 @@ struct ShaderInjectData {
   float shadow_pcss_depth_cap;         // [0.01..0.5], default 0.05 — max depth diff for penumbra
   float shadow_pcss_cascade_blend;     // [0.02..1], default 0.2 — cross-fade width (smaller=wider blend)
   // —— Colored Shadow Penumbra (PCSS Improved mode) ——
-  float shadow_penumbra_saturation;    // [0..100], default 1.0 — 0=grayscale, 1=neutral, 100=max saturated
+  float shadow_penumbra_color_strength;// [0..2], default 1.0 — how strongly to apply vibrancy effect
+  float shadow_penumbra_vibrance;      // [0..100], default 1.0 — 0=grayscale, 1=neutral, >1=vivid
   float shadow_penumbra_detection;     // [0.01..1], default 0.5 — what counts as penumbra (higher=wider)
+  float shadow_penumbra_debug_view;    // 0=Off, 1=PenumbraMask, 2=TintColor, 3=Result, 4=SunColor
+  float shadow_penumbra_color_brightness;// [0..5], default 1.0 — brightness multiplier for tint color
+  float shadow_penumbra_falcom_blend;   // [0..1], default 0 — blend toward Falcom shadowEdgeColor tint
+  float shadow_penumbra_edge_vibrance;  // [0..100], default 1.0 — vibrance applied to shadowEdgeColor in Improved
+  float shadow_penumbra_lightcolor_blend;// [0..1], default 0 — blend tint toward sun color (lightColor_g)
+  float shadow_penumbra_lightcolor_saturation;// [0..100], default 1.0 — vibrance for lightColor before blending
   // —— IS-FAST mirrors for shadow pass (set from g_isfast_* globals) ——
   float shadow_isfast_enabled;         // 0/1 — mirror of g_isfast_enabled
   float shadow_isfast_texture_loaded;  // 0/1 — set at runtime by addon
