@@ -83,7 +83,7 @@ struct ShaderInjectData {
   float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
   float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples
   float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
-  float shadow_edge_tint;           // 0=Off, 1=On — shadowEdgeColor tint at shadow edges
+  float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS saturation boost)
   // —— PCSS (Percentage Closer Soft Shadows) ——
   float shadow_pcss_jitter_enabled;    // 0=Off, 1=On
   float shadow_pcss_jitter_amount;     // [0..1], default 1.0 — blend static→temporal
@@ -94,6 +94,9 @@ struct ShaderInjectData {
   float shadow_pcss_filter_width;      // [0.1..5], default 1.0 — PCF filter width multiplier
   float shadow_pcss_depth_cap;         // [0.01..0.5], default 0.05 — max depth diff for penumbra
   float shadow_pcss_cascade_blend;     // [0.02..1], default 0.2 — cross-fade width (smaller=wider blend)
+  // —— Colored Shadow Penumbra (PCSS Improved mode) ——
+  float shadow_penumbra_saturation;    // [0..100], default 1.0 — 0=grayscale, 1=neutral, 100=max saturated
+  float shadow_penumbra_detection;     // [0.01..1], default 0.5 — what counts as penumbra (higher=wider)
   // —— IS-FAST mirrors for shadow pass (set from g_isfast_* globals) ——
   float shadow_isfast_enabled;         // 0/1 — mirror of g_isfast_enabled
   float shadow_isfast_texture_loaded;  // 0/1 — set at runtime by addon

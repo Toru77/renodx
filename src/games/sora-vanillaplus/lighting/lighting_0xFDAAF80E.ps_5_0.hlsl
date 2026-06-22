@@ -807,7 +807,16 @@ void main(
   r1.w = log2(r0.w);
   r1.w = shadowEdgeSharpness_g * r1.w;
   r1.w = exp2(r1.w);
-  if (shader_injection_data.shadow_edge_tint > 0.5f) {
+  if (shader_injection_data.shadow_edge_tint > 1.5f) {
+    // Improved (PCSS-only): diffuse saturation boost in penumbra region
+    float penumbra = 1.0f - 2.0f * abs(r0.w - 0.5f);
+    penumbra = saturate(penumbra / shader_injection_data.shadow_penumbra_detection);
+    float luma = dot(r8.xyz, float3(0.333f, 0.333f, 0.333f));
+    // saturation: 0=grayscale, 1=neutral, >1=boosted
+    float3 saturated = luma + shader_injection_data.shadow_penumbra_saturation * (r8.xyz - luma);
+    saturated = saturate(saturated);
+    r13.yzw = lerp(r8.xyz, saturated, penumbra);
+  } else if (shader_injection_data.shadow_edge_tint > 0.5f) {
     r13.yzw = -shadowEdgeColor_g.xyz + r8.xyz;
     r13.yzw = r0.www * r13.yzw + shadowEdgeColor_g.xyz;
   } else {

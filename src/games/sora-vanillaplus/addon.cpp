@@ -112,6 +112,8 @@ ShaderInjectData shader_injection = {
   .shadow_pcss_filter_width = 1.f,
   .shadow_pcss_depth_cap = 0.05f,
   .shadow_pcss_cascade_blend = 0.2f,
+  .shadow_penumbra_saturation = 1.f,
+  .shadow_penumbra_detection = 0.5f,
   .shadow_isfast_enabled = 0.f,
   .shadow_isfast_texture_loaded = 0.f,
   .shadow_isfast_spatial_scale = 1.f,
@@ -944,10 +946,10 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowEdgeTint", .binding = &shader_injection.shadow_edge_tint,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Red Shadow Edge Tint", .section = "Shadow Maps",
-      .tooltip = "Vanilla shadow edge coloring via shadowEdgeColor_g. Off = neutral edges.",
-      .labels = {"Off", "On"},
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Colored Shadow Penumbra", .section = "Shadow Maps",
+      .tooltip = "Off = neutral edges. Falcom = vanilla red shadow edge tint. Improved = PCSS-only saturation boost in penumbra.",
+      .labels = {"Off", "Falcom", "Improved"},
     },
     // —— PCSS Settings (enabled when ShadowFilterMethod = PCSS) ——
     new renodx::utils::settings::Setting{
@@ -1021,6 +1023,23 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Cross-fade width between cascades. Lower = wider/smoother blend. 0.02 = 50 units, 1.0 = 1 unit.",
       .min = 0.02f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
+    },
+    // —— Colored Shadow Penumbra (Improved mode) ——
+    new renodx::utils::settings::Setting{
+      .key = "ShadowPenumbraSaturation", .binding = &shader_injection.shadow_penumbra_saturation,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Penumbra Saturation", .section = "Shadow Maps",
+      .tooltip = "Diffuse color saturation in penumbra region. 0=grayscale, 1=neutral, 100=max saturation.",
+      .min = 0.f, .max = 100.0f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ShadowPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Penumbra Detection", .section = "Shadow Maps",
+      .tooltip = "What counts as penumbra. Higher = wider detection area, more of the image gets saturated.",
+      .min = 0.01f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
     },
     // ── SSGI debug views removed — use XeGTAO Debug View for GI inspection. ──
 };
