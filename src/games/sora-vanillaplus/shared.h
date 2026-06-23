@@ -68,7 +68,8 @@ struct ShaderInjectData {
   float xegtao_denoise_leak_threshold; // [1..4], default 2.5 — edge leak threshold (lower=more leak)
   float xegtao_denoise_leak_strength; // [0..1], default 0.5 — edge leak strength (higher=less flicker)
   float xegtao_denoiser_type;        // 0=Spatial, 1=Spatio-Temporal
-  float xegtao_temporal_blend;       // [0.5..0.95], default 0.85 — blend weight toward history
+  float xegtao_temporal_blend;       // derived internally from temporal_frame_count
+  float xegtao_temporal_frame_count; // 0-16 frames accounted for temporal blending (0=off)
   float xegtao_disocclusion_threshold; // [0.001..0.1], default 0.01 — depth diff to reject history
   float xegtao_noise_type;         // 0=IS-FAST, 1=IGN, 2=Hilbert — noise selection when IS-FAST on
   float xegtao_internal_resolution; // 50/75/100 %, default 75

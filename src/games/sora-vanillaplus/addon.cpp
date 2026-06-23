@@ -751,7 +751,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "XeGTAONoiseType", .binding = &shader_injection.xegtao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Noise Type", .section = "XeGTAO",
+      .default_value = 2.f, .label = "Noise Type", .section = "XeGTAO",
       .tooltip = "IS-FAST = pre-computed blue noise (needs fast_noise_ea.dds). "
                  "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
                  "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
@@ -834,19 +834,26 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoiserType", .binding = &shader_injection.xegtao_denoiser_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Denoiser Type", .section = "XeGTAO",
+      .default_value = 1.f, .label = "Denoiser Type", .section = "XeGTAO",
       .tooltip = "Spatial: 5x5 edge-aware blur only. Spatio-Temporal: blends with previous frame for much higher stability on thin geometry.",
       .labels = {"Spatial", "Spatio-Temporal"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOTemporalBlend", .binding = &shader_injection.xegtao_temporal_blend,
-      .default_value = 0.85f, .label = "Temporal Blend", .section = "XeGTAO",
-      .tooltip = "Weight toward history frame. Higher = more stable but more ghosting on moving objects. 0.85 = default.",
-      .min = 0.0f, .max = 0.8f, .format = "%.2f",
+      .key = "XeGTAOTemporalFrames", .binding = &shader_injection.xegtao_temporal_frame_count,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "Temporal Frames", .section = "XeGTAO",
+      .tooltip = "How many previous frames influence the result. 0-1 = off (spatial only). 2 = fast response. 8 = balanced (default). 16 = most stable, some ghosting.",
+      .labels = {"0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOTemporalBlend", .binding = &shader_injection.xegtao_temporal_blend,
+      .default_value = 0.35f, .label = "Temporal Blend", .section = "XeGTAO",
+      .tooltip = "Overall temporal strength (multiplied with Frames). 1.0 = full effect. 0.5 = half. 0.0 = off.",
+      .min = 0.0f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODisocclusionThr", .binding = &shader_injection.xegtao_disocclusion_threshold,
@@ -2291,7 +2298,13 @@ static std::array<float, 49> BuildXeGTAOPushConstants(DeviceData* data, bool den
   c[44] = std::clamp(shader_injection.xegtao_denoise_leak_strength, 0.f, 1.f);
   // ── Spatio-Temporal denoiser ──
   c[45] = shader_injection.xegtao_denoiser_type;                     // 0=Spatial, 1=Spatio-Temporal
-  c[46] = std::clamp(shader_injection.xegtao_temporal_blend, 0.0f, 0.95f);
+  // Temporal blend: base weight from frame count, scaled by blend strength
+  {
+    float fc = shader_injection.xegtao_temporal_frame_count;
+    float baseWeight = (fc > 1.f) ? ((fc - 1.f) / fc) : 0.f;
+    float blendScale = std::clamp(shader_injection.xegtao_temporal_blend, 0.f, 1.f);
+    c[46] = std::clamp(baseWeight * blendScale, 0.0f, 0.98f);
+  }
   c[47] = std::clamp(shader_injection.xegtao_disocclusion_threshold, 0.001f, 0.1f);
   c[48] = shader_injection.xegtao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
   return c;
