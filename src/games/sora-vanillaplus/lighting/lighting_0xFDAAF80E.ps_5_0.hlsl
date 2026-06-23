@@ -267,6 +267,13 @@ void main(
   }
   r4.xyz = ao_sample;
 
+  // Reduce AO where indirect light exists
+  if (shader_injection_data.ssgi_reduce_ao > 0.5f && shader_injection_data.xegtao_ssgi_bound > 0.5f) {
+    float3 giEarly = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+    float giBrightness = dot(giEarly, float3(0.333, 0.333, 0.333));
+    r4.x = lerp(r4.x, 1.0, saturate(giBrightness * shader_injection_data.ssgi_reduce_ao_strength));
+  }
+
   // —— XeGTAO Debug View ——
   // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
   if (shader_injection_data.xegtao_debug_view > 0.5f) {
@@ -576,6 +583,11 @@ void main(
       
       // Intensity.
       giColor *= shader_injection_data.ssgi_intensity;
+
+      // Max clamp
+      if (shader_injection_data.ssgi_max_clamp > 0.0) {
+        giColor = min(giColor, shader_injection_data.ssgi_max_clamp);
+      }
 
       // Affect Lights: additively blend sun color into GI (SSGI-style lerp saturation)
       if (shader_injection_data.ssgi_affect_lights > 0.5f) {
@@ -1438,6 +1450,11 @@ void main(
     
     // Intensity.
     giColor *= shader_injection_data.ssgi_intensity;
+
+    // Max clamp
+    if (shader_injection_data.ssgi_max_clamp > 0.0) {
+      giColor = min(giColor, shader_injection_data.ssgi_max_clamp);
+    }
 
     // Affect Lights: additively blend sun color into GI (SSGI-style lerp saturation)
     if (shader_injection_data.ssgi_affect_lights > 0.5f) {

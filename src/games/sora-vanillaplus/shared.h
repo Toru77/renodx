@@ -87,7 +87,9 @@ struct ShaderInjectData {
   float ssgi_adaptive_mode;         // 0=GI color, 1=surface albedo
   float ssgi_adaptive_luma_strength;// [0..5], default 0 — target luma for normalization (0=off)
   float ssgi_adaptive_luma_blend;   // [0..1], default 0.5 — blend between original and normalized
-  float ssgi_gi_power;              // [0.5..5], default 1.5 — power curve for GI
+  float ssgi_max_clamp;             // [0..20], default 0 — max GI per-channel (0=off)
+  float ssgi_reduce_ao;             // 0=Off, 1=On — reduce AO where indirect light exists
+  float ssgi_reduce_ao_strength;    // [0..5], default 1.0 — strength of AO reduction by indirect light
   float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
   float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples, 6=LightColor
   float ssgi_affect_lights;         // 0=Off, 1=On — additively blend lightColor into GI

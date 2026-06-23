@@ -105,7 +105,9 @@ ShaderInjectData shader_injection = {
   .ssgi_adaptive_mode = 0.f,
   .ssgi_adaptive_luma_strength = 0.f,
   .ssgi_adaptive_luma_blend = 0.5f,
-  .ssgi_gi_power = 1.5f,
+  .ssgi_max_clamp = 0.f,
+  .ssgi_reduce_ao = 0.f,
+  .ssgi_reduce_ao_strength = 1.f,
   .ssgi_debug_logging = 0.f,
   .ssgi_debug_view = 0.f,
   .ssgi_affect_lights = 0.f,
@@ -719,7 +721,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoisePasses", .binding = &shader_injection.xegtao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Denoise Passes", .section = "XeGTAO",
+      .default_value = 2.f, .label = "Denoise Passes", .section = "XeGTAO",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -763,7 +765,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOSampleDistribution", .binding = &shader_injection.xegtao_sample_distribution,
-      .default_value = 1.33f, .label = "Sample Distribution", .section = "XeGTAO",
+      .default_value = 1.0f, .label = "Sample Distribution", .section = "XeGTAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1020,11 +1022,28 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIGIPower", .binding = &shader_injection.ssgi_gi_power,
-      .default_value = 1.5f, .label = "GI Power", .section = "SSGI",
-      .tooltip = "Power curve applied to GI output. Higher = more contrast.",
-      .min = 0.5f, .max = 5.0f, .format = "%.2f",
+      .key = "SSGIMaxClamp", .binding = &shader_injection.ssgi_max_clamp,
+      .default_value = 0.2f, .label = "GI Max Clamp", .section = "SSGI",
+      .tooltip = "Clamp GI per-channel to this maximum. 0 = off.",
+      .min = 0.0f, .max = 20.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIReduceAO", .binding = &shader_injection.ssgi_reduce_ao,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Reduce AO with GI", .section = "SSGI",
+      .tooltip = "Reduce XeGTAO occlusion where indirect light is strong. Keeps dark crevices dark while brightening lit surfaces.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIReduceAOStrength", .binding = &shader_injection.ssgi_reduce_ao_strength,
+      .default_value = 2.f, .label = "Reduce AO Strength", .section = "SSGI",
+      .tooltip = "How strongly indirect light reduces AO. 0=no change, 1=full reduction.",
+      .min = 0.0f, .max = 5.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_reduce_ao > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -1389,6 +1408,21 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+      .label = "Reset All Settings to Defaults",
+      .section = "Settings",
+      .on_click = []() {
+        for (auto* s : settings) {
+          if (s->binding != nullptr && s->can_reset) {
+            s->value = s->default_value;
+            s->value_as_int = static_cast<int>(s->default_value);
+            s->Write();
+          }
+        }
+        return true;
+      },
     },
     new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -2165,7 +2199,7 @@ static std::array<float, 48> BuildXeGTAOPushConstants(DeviceData* data, bool den
   // isfast_samples (c[26]) = g_gi_light_exposure
   c[26] = std::clamp(g_ssgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
   // isfast_radius (c[27]) = g_gi_power
-  c[27] = std::clamp(shader_injection.ssgi_gi_power, 0.5f, 5.f);  // GI power
+  c[27] = 1.5f;  // GI power (fixed, removed from UI)
   // isfast_edge_sensitivity (c[28]) = g_gi_intensity
   c[28] = std::clamp(shader_injection.ssgi_intensity, 0.f, 5.f);  // GI intensity
   // isfast_spatial_sigma (c[29]) = g_gi_saturation
