@@ -65,6 +65,12 @@ struct ShaderInjectData {
   float xegtao_bitmask_thickness;   // [0.01..2.0], default 0.2 — world-space thickness for bitmask
   float xegtao_depth_mip_offset;    // [2..6], default 3.30
   float xegtao_denoise_blur_beta;   // Denoise sharpness, default 1.2
+  float xegtao_denoise_leak_threshold; // [1..4], default 2.5 — edge leak threshold (lower=more leak)
+  float xegtao_denoise_leak_strength; // [0..1], default 0.5 — edge leak strength (higher=less flicker)
+  float xegtao_denoiser_type;        // 0=Spatial, 1=Spatio-Temporal
+  float xegtao_temporal_blend;       // [0.5..0.95], default 0.85 — blend weight toward history
+  float xegtao_disocclusion_threshold; // [0.001..0.1], default 0.01 — depth diff to reject history
+  float xegtao_noise_type;         // 0=IS-FAST, 1=IGN, 2=Hilbert — noise selection when IS-FAST on
   float xegtao_internal_resolution; // 50/75/100 %, default 75
   float xegtao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
   float xegtao_debug_logging;       // 0=Off, 1=On

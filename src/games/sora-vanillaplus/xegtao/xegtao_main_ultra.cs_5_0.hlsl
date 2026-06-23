@@ -51,6 +51,18 @@ static lpfloat2 SpatioTemporalNoise_ISFAST(uint2 p, uint t)
   }
 }
 
+// ── Interleaved Gradient Noise + R2 temporal (standalone, no texture needed) ──
+static lpfloat2 SpatioTemporalNoise_IGN(uint2 p, uint t)
+{
+  static const float R2_A1 = 0.7548776662466927;
+  static const float R2_A2 = 0.5698402909980532;
+  float b1 = IGN(float2(p) * g_isfast_spatial_scale + g_isfast_seed_offset);
+  float b2 = IGN(float2(p) * g_isfast_spatial_scale + float2(47, 17) + g_isfast_seed_offset);
+  return lpfloat2(frac(b1 + R2_A1 * (float)t * g_isfast_temporal_speed),
+                  frac(b2 + R2_A2 * (float)t * g_isfast_temporal_speed))
+       * g_isfast_strength;
+}
+
 static lpfloat2 SpatioTemporalNoise_Hilbert(uint2 p, uint t)
 {
   uint i = HilbertIndex(p.x % XE_HILBERT_WIDTH, p.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
@@ -169,9 +181,14 @@ void main(uint2 p : SV_DispatchThreadID)
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
   uint noise_idx = consts.NoiseIndex < 0 ? 0u : (uint)consts.NoiseIndex;
-  lpfloat2 n = (g_isfast_enabled > 0.5f)
-    ? SpatioTemporalNoise_ISFAST(p, noise_idx)
-    : SpatioTemporalNoise_Hilbert(p, noise_idx);
+  lpfloat2 n;
+  if (g_isfast_enabled > 0.5f) {
+    if (xegtao_noise_type < 0.5f)      n = SpatioTemporalNoise_ISFAST(p, noise_idx);
+    else if (xegtao_noise_type < 1.5f) n = SpatioTemporalNoise_IGN(p, noise_idx);
+    else                               n = SpatioTemporalNoise_Hilbert(p, noise_idx);
+  } else {
+    n = SpatioTemporalNoise_Hilbert(p, noise_idx);
+  }
 
   lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(p, uint2(width, height), consts);
 
@@ -179,10 +196,10 @@ void main(uint2 p : SV_DispatchThreadID)
   lpfloat slice_count = 3.0;
   lpfloat steps_per_slice = 3.0;
   uint q = (uint)round(clamp(xegtao_quality, 0.0, 3.0));
-  if (q == 0u)      { slice_count = 2.0; steps_per_slice = 2.0; }  // Low
+  if (q == 0u)      { slice_count = 1.0; steps_per_slice = 3.0; }  // Low
   else if (q == 1u) { slice_count = 2.0; steps_per_slice = 3.0; }  // Medium
   else if (q == 2u) { slice_count = 3.0; steps_per_slice = 3.0; }  // High
-  else              { slice_count = 4.0; steps_per_slice = 4.0; }  // Ultra
+  else              { slice_count = 4.0; steps_per_slice = 3.0; }  // Ultra
 
   XeGTAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,

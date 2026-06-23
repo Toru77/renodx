@@ -39,9 +39,11 @@
 // Must be declared BEFORE XeGTAO.hlsli so XeGTAO_MainPass can reference its members.
 cbuffer cb_scene : register(b0)
 {
-  float4x4 view_g;
-  float4x4 viewInv_g;
-  float4x4 proj_g;
+  float4x4 view_g          : packoffset(c0);
+  float4x4 viewInv_g       : packoffset(c4);
+  float4x4 proj_g          : packoffset(c8);
+  float4x4 projInv_g       : packoffset(c12);
+  float4x4 prevViewProj_g  : packoffset(c74);
 };
 
 // ── User settings via push_constants (b13) ──
@@ -91,6 +93,12 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_isfast_spatial_scale;    // c[40] — IS-FAST spatial scale [0.25..4]
   float xegtao_isfast_temporal_speed;   // c[41] — IS-FAST temporal speed [0..5]
   float xegtao_isfast_seed;             // c[42] — IS-FAST seed offset [0..64]
+  float xegtao_denoise_leak_threshold;  // c[43] — edge leak threshold [1..4], default 2.5
+  float xegtao_denoise_leak_strength;   // c[44] — edge leak strength [0..1], default 0.5
+  float xegtao_denoiser_type;           // c[45] — 0=Spatial, 1=Spatio-Temporal
+  float xegtao_temporal_blend;          // c[46] — history blend weight [0.5..0.95], default 0.85
+  float xegtao_disocclusion_threshold;  // c[47] — depth diff to reject history [0.001..0.1], default 0.01
+  float xegtao_noise_type;             // c[48] — 0=IS-FAST, 1=IGN, 2=Hilbert
 };
 
 // ── GI-related push constant aliases (repurpose IS-FAST fields) ──

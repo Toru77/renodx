@@ -85,6 +85,11 @@ ShaderInjectData shader_injection = {
   .xegtao_bitmask_thickness = 0.2f,
   .xegtao_depth_mip_offset = 3.30f,
   .xegtao_denoise_blur_beta = 20.0f,
+  .xegtao_denoise_leak_threshold = 2.5f,
+  .xegtao_denoise_leak_strength = 0.5f,
+  .xegtao_denoiser_type = 0.f,
+  .xegtao_temporal_blend = 0.85f,
+  .xegtao_disocclusion_threshold = 0.01f,
   .xegtao_internal_resolution = 100.f,
   .xegtao_debug_view = 0.f,
   .xegtao_debug_logging = 0.f,
@@ -214,6 +219,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource ao_term_b_texture = {};
   reshade::api::resource_view ao_term_b_srv = {};
   reshade::api::resource_view ao_term_b_uav = {};
+
+  reshade::api::resource history_ao_texture_a = {};   // spatio-temporal history (ping-pong)
+  reshade::api::resource_view history_ao_srv_a = {};
+  reshade::api::resource_view history_ao_uav_a = {};
+  reshade::api::resource history_ao_texture_b = {};
+  reshade::api::resource_view history_ao_srv_b = {};
+  reshade::api::resource_view history_ao_uav_b = {};
+  bool history_ao_read_from_a = true;  // ping-pong toggle
 
   reshade::api::resource edges_texture = {};
   reshade::api::resource_view edges_srv = {};
@@ -736,6 +749,16 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "XeGTAONoiseType", .binding = &shader_injection.xegtao_noise_type,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Noise Type", .section = "XeGTAO",
+      .tooltip = "IS-FAST = pre-computed blue noise (needs fast_noise_ea.dds). "
+                 "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
+                 "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
+      .labels = {"IS-FAST", "IGN", "Hilbert"},
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_isfast_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
       .key = "XeGTAORadius", .binding = &shader_injection.xegtao_radius,
       .default_value = 0.5f, .label = "Radius", .section = "XeGTAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
@@ -790,6 +813,47 @@ renodx::utils::settings::Settings settings = {
       .default_value = 20.0f, .label = "Denoise Blur Beta", .section = "XeGTAO",
       .min = 0.5f, .max = 20.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAODenoiseLeakThreshold", .binding = &shader_injection.xegtao_denoise_leak_threshold,
+      .default_value = 2.5f, .label = "Denoise Leak Threshold", .section = "XeGTAO",
+      .tooltip = "Min edges before AO leaks between pixels. Lower = more temporal stability, slightly softer shadows. 2.5 = default.",
+      .min = 1.0f, .max = 4.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAODenoiseLeakStrength", .binding = &shader_injection.xegtao_denoise_leak_strength,
+      .default_value = 0.5f, .label = "Denoise Leak Strength", .section = "XeGTAO",
+      .tooltip = "How strongly AO leaks across edges. Higher = less flicker on grass/thin geometry, slightly softer contact shadows. 0.5 = default.",
+      .min = 0.0f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAODenoiserType", .binding = &shader_injection.xegtao_denoiser_type,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Denoiser Type", .section = "XeGTAO",
+      .tooltip = "Spatial: 5x5 edge-aware blur only. Spatio-Temporal: blends with previous frame for much higher stability on thin geometry.",
+      .labels = {"Spatial", "Spatio-Temporal"},
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOTemporalBlend", .binding = &shader_injection.xegtao_temporal_blend,
+      .default_value = 0.85f, .label = "Temporal Blend", .section = "XeGTAO",
+      .tooltip = "Weight toward history frame. Higher = more stable but more ghosting on moving objects. 0.85 = default.",
+      .min = 0.0f, .max = 0.8f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAODisocclusionThr", .binding = &shader_injection.xegtao_disocclusion_threshold,
+      .default_value = 0.01f, .label = "Disocclusion Threshold", .section = "XeGTAO",
+      .tooltip = "Max depth difference to accept history sample. Higher = more ghosting, less flicker on disocclusion.",
+      .min = 0.001f, .max = 1.0f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2104,6 +2168,8 @@ static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
 
   mk(w, h, reshade::api::format::r32_uint, &d->ao_term_a_texture, &d->ao_term_a_srv, &d->ao_term_a_uav);
   mk(w, h, reshade::api::format::r32_uint, &d->ao_term_b_texture, &d->ao_term_b_srv, &d->ao_term_b_uav);
+  mk(w, h, reshade::api::format::r32_uint, &d->history_ao_texture_a, &d->history_ao_srv_a, &d->history_ao_uav_a);
+  mk(w, h, reshade::api::format::r32_uint, &d->history_ao_texture_b, &d->history_ao_srv_b, &d->history_ao_uav_b);
   mk(w, h, reshade::api::format::r32_float, &d->edges_texture, &d->edges_srv, &d->edges_uav);
   mk(gw, gh, reshade::api::format::r8g8b8a8_unorm, &d->composite_texture, &d->composite_srv, &d->composite_uav);
 
@@ -2133,6 +2199,8 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
   dv(d->depth_mips_srv); for (auto& u : d->depth_mips_uavs) dv(u); dr(d->depth_mips_texture);
   dv(d->ao_term_a_srv); dv(d->ao_term_a_uav); dr(d->ao_term_a_texture);
   dv(d->ao_term_b_srv); dv(d->ao_term_b_uav); dr(d->ao_term_b_texture);
+  dv(d->history_ao_srv_a); dv(d->history_ao_uav_a); dr(d->history_ao_texture_a);
+  dv(d->history_ao_srv_b); dv(d->history_ao_uav_b); dr(d->history_ao_texture_b);
   dv(d->edges_srv); dv(d->edges_uav); dr(d->edges_texture);
   dv(d->composite_srv); dv(d->composite_uav); dr(d->composite_texture);
   if (d->point_clamp_sampler.handle) { dev->destroy_sampler(d->point_clamp_sampler); d->point_clamp_sampler = {}; }
@@ -2162,9 +2230,9 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 48> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 49> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f) {
-  std::array<float, 48> c = {};
+  std::array<float, 49> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.xegtao_denoise_passes;
   c[0]  = shader_injection.xegtao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -2218,7 +2286,14 @@ static std::array<float, 48> BuildXeGTAOPushConstants(DeviceData* data, bool den
   c[40] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
   c[41] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
   c[42] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
-  // c[43-47] reserved for future use
+  // ── Denoiser leak parameters ──
+  c[43] = std::clamp(shader_injection.xegtao_denoise_leak_threshold, 1.f, 4.f);
+  c[44] = std::clamp(shader_injection.xegtao_denoise_leak_strength, 0.f, 1.f);
+  // ── Spatio-Temporal denoiser ──
+  c[45] = shader_injection.xegtao_denoiser_type;                     // 0=Spatial, 1=Spatio-Temporal
+  c[46] = std::clamp(shader_injection.xegtao_temporal_blend, 0.0f, 0.95f);
+  c[47] = std::clamp(shader_injection.xegtao_disocclusion_threshold, 0.001f, 0.1f);
+  c[48] = shader_injection.xegtao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
   return c;
 }
 
@@ -2272,7 +2347,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 48;
+    push_constants_range.count = 49;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -2292,8 +2367,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!make_layout(1u, kXeGTAODepthMipLevels, &d->prefilter_layout)) return false;
   // Main: 4 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise) + 4 UAVs (AO, edges, GI, debug)
   if (!make_layout(4u, 4u, &d->main_layout)) return false;
-  // Denoise: 3 SRVs (AO, edges, raw GI) + 2 UAVs (denoised AO, denoised GI)
-  if (!make_layout(3u, 2u, &d->denoise_layout)) return false;
+  // Denoise: 5 SRVs (AO, edges, raw GI, history AO, depth mip) + 3 UAVs (denoised AO, denoised GI, history AO)
+  if (!make_layout(5u, 3u, &d->denoise_layout)) return false;
   // Multi-bounce accumulate: 2 SRVs (color, previous GI) + 1 UAV (accumulated)
   if (!make_layout(2u, 1u, &d->multibounce_layout)) return false;
 
@@ -2499,7 +2574,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildXeGTAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kXeGtaoPushConstantsLayoutParam, 0, 48, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kXeGtaoPushConstantsLayoutParam, 0, 49, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
@@ -2543,7 +2618,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
       };
       apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
-      cl->push_constants(CS, d->multibounce_layout, kXeGtaoPushConstantsLayoutParam, 0, 48,
+      cl->push_constants(CS, d->multibounce_layout, kXeGtaoPushConstantsLayoutParam, 0, 49,
                          BuildXeGTAOPushConstants(d, false).data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->multibounce_texture, UA, SR);
@@ -2623,7 +2698,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildXeGTAOPushConstants(d, false, ssgi_enabled_this_frame);
-    cl->push_constants(CS, d->main_layout, kXeGtaoPushConstantsLayoutParam, 0, 48, pc.data());
+    cl->push_constants(CS, d->main_layout, kXeGtaoPushConstantsLayoutParam, 0, 49, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -2659,22 +2734,33 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       if (use_a) { src = d->ao_term_a_srv; dst_uav = d->ao_term_b_uav; dst_tex = d->ao_term_b_texture; }
       else       { src = d->ao_term_b_srv; dst_uav = d->ao_term_a_uav; dst_tex = d->ao_term_a_texture; }
       bind_pipe(last ? d->denoise_last_pipeline : d->denoise_pipeline);
-      reshade::api::resource_view sv[3] = {src, d->edges_srv,
-          d->ssgi_output_srv.handle ? d->ssgi_output_srv : d->fallback_srv};  // raw GI
-      reshade::api::resource_view dn_uavs[2] = {dst_uav,
-          d->ssgi_denoised_uav.handle ? d->ssgi_denoised_uav : d->fallback_uav};  // denoised GI
+      // Ping-pong history: read from last frame's write target, write to other buffer
+      reshade::api::resource_view hist_srv = d->history_ao_read_from_a
+          ? (d->history_ao_srv_a.handle ? d->history_ao_srv_a : d->fallback_srv)
+          : (d->history_ao_srv_b.handle ? d->history_ao_srv_b : d->fallback_srv);
+      reshade::api::resource_view hist_uav = d->history_ao_read_from_a
+          ? (d->history_ao_uav_b.handle ? d->history_ao_uav_b : d->fallback_uav)
+          : (d->history_ao_uav_a.handle ? d->history_ao_uav_a : d->fallback_uav);
+      reshade::api::resource_view sv[5] = {src, d->edges_srv,
+          d->ssgi_output_srv.handle ? d->ssgi_output_srv : d->fallback_srv,  // raw GI
+          hist_srv,                                                           // history AO (read)
+          d->depth_mips_srv};                                                 // depth MIP0 for reprojection
+      reshade::api::resource_view dn_uavs[3] = {dst_uav,
+          d->ssgi_denoised_uav.handle ? d->ssgi_denoised_uav : d->fallback_uav,  // denoised GI
+          hist_uav};                                                              // history AO (write)
       reshade::api::descriptor_table_update u[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
         {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,3,reshade::api::descriptor_type::texture_shader_resource_view,sv},
-        {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,dn_uavs},
+        {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,sv},
+        {{},0,0,3,reshade::api::descriptor_type::texture_unordered_access_view,dn_uavs},
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
       auto pc = BuildXeGTAOPushConstants(d, last);
-      cl->push_constants(CS, d->denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 48, pc.data());
+      cl->push_constants(CS, d->denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 49, pc.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;
+      d->history_ao_read_from_a = !d->history_ao_read_from_a;  // swap history ping-pong
     }
   }
   bar(d->ssgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read

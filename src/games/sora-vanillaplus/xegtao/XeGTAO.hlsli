@@ -1049,7 +1049,7 @@ void XeGTAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Textu
         edgesC_LRTB[side] *= lpfloat4( edgesL_LRTB.y, edgesR_LRTB.x, edgesT_LRTB.w, edgesB_LRTB.z );
 
 #if 1   // this allows some small amount of AO leaking from neighbours if there are 3 or 4 edges; this reduces both spatial and temporal aliasing
-        const lpfloat leak_threshold = 2.5; const lpfloat leak_strength = 0.5;
+        const lpfloat leak_threshold = (lpfloat)xegtao_denoise_leak_threshold; const lpfloat leak_strength = (lpfloat)xegtao_denoise_leak_strength;
         lpfloat edginess = (saturate(4.0 - leak_threshold - dot( edgesC_LRTB[side], lpfloat4( 1.0, 1.0, 1.0, 1.0 ) )) / (4-leak_threshold)) * leak_strength;
         edgesC_LRTB[side] = saturate( edgesC_LRTB[side] + edginess );
 #endif
