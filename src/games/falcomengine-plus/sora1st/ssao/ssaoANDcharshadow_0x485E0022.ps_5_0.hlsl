@@ -81,8 +81,8 @@ Texture2D<uint4> mrtTexture0 : register(t1);
 Texture2D<float4> intensityMap : register(t2);
 Texture2D<float4> prevTexture : register(t3);
 
-#include "../shared.h"
-#include "../reference/rendering.hlsl"
+#include "../../shared.h"
+#include "../../reference/rendering.hlsl"
 
 
 // 3Dmigoto declarations

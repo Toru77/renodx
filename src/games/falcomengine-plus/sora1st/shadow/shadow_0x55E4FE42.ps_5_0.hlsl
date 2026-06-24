@@ -60,7 +60,7 @@ SamplerState samLinear_s : register(s1);
 Texture2D<float4> colorTexture : register(t0);
 Texture2D<float4> depthTexture : register(t1);
 
-#include "../shared.h"
+#include "../../shared.h"
 
 // 3Dmigoto declarations
 #define cmp -

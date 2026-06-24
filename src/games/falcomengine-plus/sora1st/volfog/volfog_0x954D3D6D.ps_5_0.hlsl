@@ -80,8 +80,8 @@ Texture3D<float2> g_isfastNoiseTexture : register(t3);
 
 
 // Includes for improved volumetric haze AA
-#include "../reference/rendering.hlsl"
-#include "../shared.h"
+#include "../../reference/rendering.hlsl"
+#include "../../shared.h"
 
 // 3Dmigoto declarations
 #define cmp -

@@ -2790,9 +2790,9 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
 
 }  // namespace
 
-extern "C" __declspec(dllexport) constexpr const char* NAME = "Sora Vanilla+";
+extern "C" __declspec(dllexport) constexpr const char* NAME = "Falcom Engine+";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION =
-    "Sora Vanilla+ made by Toru";
+    "Falcom Engine+ made by Toru. It supports Beyond the Horizon and Sora 1st at the moment.";
 
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {

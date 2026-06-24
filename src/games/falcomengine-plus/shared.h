@@ -1,5 +1,5 @@
-#ifndef SRC_GAMES_GENERIC_VANILLAPLUS_SHARED_H_
-#define SRC_GAMES_GENERIC_VANILLAPLUS_SHARED_H_
+#ifndef SRC_GAMES_FALCOMENGINE_PLUS_SHARED_H_
+#define SRC_GAMES_FALCOMENGINE_PLUS_SHARED_H_
 
 // Keep this 32-bit aligned for push constant injection.
 struct ShaderInjectData {
@@ -151,4 +151,4 @@ cbuffer shader_injection : register(b13) {
 #define VANILLAPLUS_VOLFOG_HAZE_AA_STRENGTH 1.0
 #endif
 
-#endif  // SRC_GAMES_GENERIC_VANILLAPLUS_SHARED_H_
+#endif  // SRC_GAMES_FALCOMENGINE_PLUS_SHARED_H_

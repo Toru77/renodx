@@ -200,8 +200,8 @@ Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
 
-#include "../shared.h"
-#include "../reference/env_sss.hlsl"
+#include "../../shared.h"
+#include "../../reference/env_sss.hlsl"
 
 
 // 3Dmigoto declarations

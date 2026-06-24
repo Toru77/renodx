@@ -75,15 +75,15 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_normal_darkening_mode;
   float xegtao_normal_transform_mode;   // 0=view_g, 1=viewInv_g, 2=passthrough
   float xegtao_copyback_preserve_yzw;
-  float xegtao_isfast_passes;
-  float xegtao_isfast_samples;
-  float xegtao_isfast_radius;
-  float xegtao_isfast_edge_sensitivity;
-  float xegtao_isfast_spatial_sigma;
-  float xegtao_isfast_hybrid_blend;
-  float xegtao_isfast_noise_available;
-  float xegtao_multibounce_saturation;  // c[32] — multi-bounce feedback color saturation
-  float xegtao_ssgi_debug_view;         // c[33] — SSGI debug view mode (for shader-side viz)
+  float g_gi_enabled;                    // c[25] — 0=off, 1=on
+  float g_gi_light_exposure;             // c[26] — HDR light buffer exposure scale [0.001..10]
+  float g_gi_power;                      // c[27] — GI power curve (fixed 1.5)
+  float g_gi_intensity;                  // c[28] — GI intensity [0..5]
+  float g_gi_saturation;                 // c[29] — GI saturation [0..2]
+  float g_gi_multibounce;                // c[30] — multi-bounce enable (0/1)
+  float g_gi_multibounce_strength;       // c[31] — feedback intensity [0..10]
+  float g_gi_multibounce_saturation;     // c[32] — feedback color saturation [0..2]
+  float g_ssgi_debug_view;               // c[33] — SSGI debug view mode
   float xegtao_isfast_enabled;           // c[34] — IS-FAST enable (0/1)
   float xegtao_isfast_strength;          // c[35] — IS-FAST noise strength [0..1]
   float xegtao_isfast_debug;             // c[36] — IS-FAST texture loaded flag (set by shader check)
@@ -101,15 +101,7 @@ cbuffer cb_xegtao : register(b13)
   float xegtao_noise_type;             // c[48] — 0=IS-FAST, 1=IGN, 2=Hilbert
 };
 
-// ── GI-related push constant aliases (repurpose IS-FAST fields) ──
-// These must be defined BEFORE XeGTAO.hlsli so the GI path can use them.
-#define g_gi_enabled            xegtao_isfast_passes           // 0=off, 1=on
-#define g_gi_intensity          xegtao_isfast_edge_sensitivity  // [0..5]
-#define g_gi_saturation         xegtao_isfast_spatial_sigma     // [0..2]
-#define g_gi_multibounce        xegtao_isfast_hybrid_blend      // 0/1
-#define g_gi_multibounce_strength xegtao_isfast_noise_available  // [0..10] feedback intensity
-#define g_gi_multibounce_saturation xegtao_multibounce_saturation // [0..2] feedback saturation
-#define g_ssgi_debug_view       xegtao_ssgi_debug_view           // SSGI debug view mode
+// ── GI parameters are native cb_xegtao fields (c[25]-c[33]) — no aliases needed.
 #define g_isfast_enabled        xegtao_isfast_enabled            // IS-FAST enable (0/1)
 #define g_isfast_strength       xegtao_isfast_strength           // IS-FAST noise strength
 #define g_isfast_texture_loaded xegtao_isfast_debug              // IS-FAST: 1=texture loaded
@@ -123,8 +115,7 @@ cbuffer cb_xegtao : register(b13)
 #define g_gi_adaptive_mode      xegtao_adaptive_mode             // 0=GI color, 1=albedo
 #define g_gi_adaptive_luma_strength xegtao_adaptive_luma_strength // [0..5] target luma
 #define g_gi_adaptive_luma_blend xegtao_adaptive_luma_blend       // [0..1] blend
-#define g_gi_power              xegtao_isfast_radius            // power curve
-#define g_gi_light_exposure     xegtao_isfast_samples           // HDR light buffer exposure scale
+// g_gi_power (c[27]) and g_gi_light_exposure (c[26]) are native fields.
 
 // ── GI resources are passed as function parameters to XeGTAO_MainPass ──
 // (avoids fxc X3003 redefinition errors from forward declarations).

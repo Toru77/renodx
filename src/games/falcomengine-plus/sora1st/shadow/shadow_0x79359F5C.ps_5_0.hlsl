@@ -54,7 +54,7 @@ SamplerComparisonState SmplShadow_s : register(s13);
 Texture2D<float4> depthTexture : register(t0);
 Texture2DArray<float4> shadowMaps : register(t16);
 
-#include "../shared.h"
+#include "../../shared.h"
 
 // ── IS-FAST noise texture (bound globally by addon) ──
 Texture3D<float2> g_isfastNoiseTexture : register(t3);
