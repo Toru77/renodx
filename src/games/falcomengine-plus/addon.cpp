@@ -18,6 +18,7 @@
 #include <cstring>
 #include <shared_mutex>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 #include <Windows.h>
 
@@ -90,7 +91,6 @@ ShaderInjectData shader_injection = {
   .xegtao_denoiser_type = 0.f,
   .xegtao_temporal_blend = 0.85f,
   .xegtao_disocclusion_threshold = 0.01f,
-  .xegtao_internal_resolution = 100.f,
   .xegtao_debug_view = 0.f,
   .xegtao_debug_logging = 0.f,
   .xegtao_dedicated_bound = 0.f,
@@ -192,7 +192,46 @@ static float g_isfast_seed_offset   = 0.f;
 
 // ── Settings visibility ──
 static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
-static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
+static float g_developer_mode           = 0.f;   // 0=Off (forced basic), 1=On (allow advanced)
+static bool IsAdvancedSettingsMode() { return g_developer_mode >= 0.5f && g_settings_mode >= 0.5f; }
+
+// ── Advanced setting keys (reset to defaults when Developer Mode is OFF) ──
+static const std::unordered_set<std::string>& GetAdvancedSettingKeys() {
+  static const std::unordered_set<std::string> keys = {
+    "VolFogJitter", "VolFogJitterAmount", "VolFogJitterSpeed", "VolFogISFASTSpatialScale", "VolFogISFASTSampler",
+    "CharShadowType", "CharShadowCameraStrength", "CharShadowWorldStrength", "CharShadowSampleCount",
+    "CharShadowHardSamples", "CharShadowFadeSamples", "CharShadowSurfaceThickness", "CharShadowContrast",
+    "CharShadowLightFadeStart", "CharShadowLightFadeEnd", "CharShadowMinOccluderDepthScale",
+    "EnvSSSEnabled", "EnvSSSStrength", "EnvSSSSampleCount", "EnvSSSSurfaceThickness", "EnvSSSContrast",
+    "EnvSSSHeightEnable", "EnvSSSHeightMin", "EnvSSSHeightMax", "EnvSSSHeightFade", "EnvSSSVerticalReject",
+    "EnvSSSMaxDarkening", "EnvSSBrightRejectThreshold", "EnvSSBrightRejectFade", "DebugShowEnvSSS",
+    "XeGTAOQuality", "XeGTAODenoisePasses", "XeGTAOJitter", "XeGTAORadius", "XeGTAOFalloffRange",
+    "XeGTAORadiusMultiplier", "XeGTAOFinalPower", "XeGTAOSampleDistribution", "XeGTAOBitmaskThickness",
+    "XeGTAODepthMIPOffset", "XeGTAODenoiseBlurBeta", "XeGTAODenoiseLeakThreshold", "XeGTAODenoiseLeakStrength",
+    "XeGTAODenoiserType", "XeGTAOTemporalFrames", "XeGTAOTemporalBlend", "XeGTAODisocclusionThr",
+    "XeGTAONormalInputMode", "XeGTAONormalInfluence", "XeGTAONormalDepthBlend", "XeGTAONormalSharpness",
+    "XeGTAONormalEdgeRejection", "XeGTAONormalZPreservation", "XeGTAONormalDetailResponse",
+    "XeGTAONormalMaxDarkening", "XeGTAONormalDarkeningMode", "XeGTAONormalTransformMode",
+    "XeGTAODebugView", "XeGTAODebugLogging", "XeGTAOFixExperimental", "XeGTAOFrameSkip",
+    "SSGIIntensity", "SSGISaturation", "SSGICharMaskStrength", "SSGIMultiBounce", "SSGIMultiBounceStrength",
+    "SSGIMultiBounceSaturation", "SSGIAdaptiveR", "SSGIAdaptiveG", "SSGIAdaptiveB", "SSGIAdaptiveMode",
+    "SSGIAdaptiveLumaStrength", "SSGIAdaptiveLumaBlend", "SSGIMaxClamp", "SSGIReduceAO", "SSGIReduceAOStrength",
+    "SSGILightExposure", "SSGIFrameSkip", "MultiBounceFrameSkip", "SSGIDebugView", "SSGIDebugLogging",
+    "SSGIAffectLights", "SSGILightsStrength", "SSGILightsSaturation", "SSGICascadeDebug",
+    "ISFASTStrength", "ISFASTDebugLogging", "ISFASTSpatialScale", "ISFASTTemporalSpeed", "ISFASTSeedOffset",
+    "CPUOptDeferredDispatch", "CPUOptEnsurePipelines",
+    "ShadowPCSSJitter", "ShadowPCSSJitterAmount", "ShadowPCSSJitterSpeed", "ShadowBaseSoftness",
+    "ShadowPenumbraScale", "ShadowPCSSSearchRadius", "ShadowPCSSFilterWidth", "ShadowPCSSDepthCap",
+    "ShadowPCSScascadeBlend", "ShadowPCSSFixTexelRadius", "ShadowPCSSFixClampCascade", "ShadowPCSSFixMinRadius",
+    "ShadowPCSSFixAutoBlend", "ShadowPenumbraColorStrength", "ShadowPenumbraVibrance", "ShadowPenumbraDetection",
+    "ShadowPenumbraColorBrightness", "ShadowPenumbraFalcomBlend", "ShadowPenumbraEdgeVibrance",
+    "ShadowPenumbraLightColorBlend", "ShadowPenumbraLightColorSaturation", "ShadowPenumbraDebugView"
+  };
+  return keys;
+}
+
+// ── Forward declaration — defined after settings vector ──
+static void ResetAdvancedSettingsToDefaults();
 
 // ── CPU optimization toggles ──
 static float g_xegtao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, …)
@@ -245,7 +284,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Resolution-change guard.
   uint32_t last_created_game_width = 0u;
   uint32_t last_created_game_height = 0u;
-  float last_created_resolution_scale = 0.f;
 
   reshade::api::pipeline_layout prefilter_layout = {};
   reshade::api::pipeline_layout main_layout = {};
@@ -459,6 +497,20 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 // ═══════════ Settings ═══════════
 
 renodx::utils::settings::Settings settings = {
+    new renodx::utils::settings::Setting{
+      .key = "DeveloperMode", .binding = &g_developer_mode,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .can_reset = false,
+      .label = "Developer Mode", .section = "Settings",
+      .tooltip = "Off = Basic mode only, advanced settings forced to defaults. On = full control.",
+      .labels = {"Off (Basic Only)", "On (Full Control)"},
+      .on_change = []() {
+        if (g_developer_mode < 0.5f) {
+          ResetAdvancedSettingsToDefaults();
+        }
+      },
+      .is_global = true,
+    },
     new renodx::utils::settings::Setting{
         .key = "SettingsMode",
         .binding = &g_settings_mode,
@@ -803,7 +855,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODepthMIPOffset", .binding = &shader_injection.xegtao_depth_mip_offset,
-      .default_value = 3.30f, .label = "Depth MIP Offset", .section = "XeGTAO",
+      .default_value = 2.0f, .label = "Depth MIP Offset", .section = "XeGTAO",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -817,7 +869,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoiseLeakThreshold", .binding = &shader_injection.xegtao_denoise_leak_threshold,
-      .default_value = 2.5f, .label = "Denoise Leak Threshold", .section = "XeGTAO",
+      .default_value = 1.0f, .label = "Denoise Leak Threshold", .section = "XeGTAO",
       .tooltip = "Min edges before AO leaks between pixels. Lower = more temporal stability, slightly softer shadows. 2.5 = default.",
       .min = 1.0f, .max = 4.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
@@ -825,7 +877,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoiseLeakStrength", .binding = &shader_injection.xegtao_denoise_leak_strength,
-      .default_value = 0.5f, .label = "Denoise Leak Strength", .section = "XeGTAO",
+      .default_value = 1.0f, .label = "Denoise Leak Strength", .section = "XeGTAO",
       .tooltip = "How strongly AO leaks across edges. Higher = less flicker on grass/thin geometry, slightly softer contact shadows. 0.5 = default.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
@@ -847,6 +899,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How many previous frames influence the result. 0-1 = off (spatial only). 2 = fast response. 8 = balanced (default). 16 = most stable, some ghosting.",
       .labels = {"0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAOTemporalBlend", .binding = &shader_injection.xegtao_temporal_blend,
@@ -854,6 +907,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Overall temporal strength (multiplied with Frames). 1.0 = full effect. 0.5 = half. 0.0 = off.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODisocclusionThr", .binding = &shader_injection.xegtao_disocclusion_threshold,
@@ -861,14 +915,6 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Max depth difference to accept history sample. Higher = more ghosting, less flicker on disocclusion.",
       .min = 0.001f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "XeGTAOInternalResolution", .binding = &shader_injection.xegtao_internal_resolution,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Internal Resolution", .section = "XeGTAO",
-      .labels = {"50%", "75%", "100%"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -1086,7 +1132,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveLumaBlend", .binding = &shader_injection.ssgi_adaptive_luma_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.3f, .label = "Adaptive Luma Blend", .section = "SSGI",
+      .default_value = 0.15f, .label = "Adaptive Luma Blend", .section = "SSGI",
       .tooltip = "Blend between original GI (0) and luma-normalized GI (1).",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
@@ -1268,7 +1314,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowFilterMethod", .binding = &shader_injection.shadow_filter_method,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Shadow Filter Method", .section = "Shadow Maps",
+      .default_value = 1.f, .label = "Shadow Filter Method", .section = "Shadow Maps",
       .tooltip = "CSM filtering: Off = single sample. Falcom = vanilla 10-tap PCF. PCSS = physically-accurate soft shadows.",
       .labels = {"Off", "Falcom", "PCSS"},
     },
@@ -1536,6 +1582,20 @@ renodx::utils::settings::Settings settings = {
     },
     // ── SSGI debug views removed — use XeGTAO Debug View for GI inspection. ──
 };
+
+// ═══════════ Developer Mode reset (defined here because it needs `settings` in scope) ═══════════
+
+static void ResetAdvancedSettingsToDefaults() {
+  const auto& advanced_keys = GetAdvancedSettingKeys();
+  for (auto* setting : settings) {
+    if (setting->key.empty()) continue;
+    if (setting->is_global) continue;
+    if (!setting->can_reset) continue;
+    if (advanced_keys.count(setting->key) == 0) continue;
+    setting->Set(setting->default_value);
+    setting->Write();
+  }
+}
 
 // ═══════════ XeGTAO Backend — implementation ═══════════
 
@@ -1831,6 +1891,16 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->frame_index++;
+
+  // ── Developer Mode startup guard: force advanced settings to defaults if dev mode is OFF ──
+  static bool s_devmode_startup_checked = false;
+  if (!s_devmode_startup_checked) {
+    s_devmode_startup_checked = true;
+    if (g_developer_mode < 0.5f) {
+      ResetAdvancedSettingsToDefaults();
+    }
+  }
+
   if (shader_injection.xegtao_mode < 0.5f) return;
   if (d->frame_index <= kXeGTAOStartupGuardFrames) {
     if (d->frame_index == kXeGTAOStartupGuardFrames) {
@@ -2125,12 +2195,9 @@ static bool OnBeforeSsaoShaderDraw(reshade::api::command_list*) {
 static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
                                    uint32_t gw, uint32_t gh) {
   DestroyXeGTAOResources(dev, d);
-  // Scale by internal resolution setting (50/75/100%) from depth buffer size.
-  // Exact match — no snapping. Shader GetDimensions() handles bounds correctly.
-  int ir = (int)shader_injection.xegtao_internal_resolution;  // 0=50%, 1=75%, 2=100%
-  float scale = (ir == 0) ? 0.5f : (ir == 1) ? 0.75f : 1.0f;
-  uint32_t w = (uint32_t)(gw * scale);
-  uint32_t h = (uint32_t)(gh * scale);
+  // Always at full resolution.
+  uint32_t w = gw;
+  uint32_t h = gh;
   if (w < 64u) w = 64u;
   if (h < 64u) h = 64u;
   d->working_width = w; d->working_height = h;
@@ -2773,7 +2840,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;
-      d->history_ao_read_from_a = !d->history_ao_read_from_a;  // swap history ping-pong
+      if (last) { d->history_ao_read_from_a = !d->history_ao_read_from_a; }  // only final pass writes history
     }
   }
   bar(d->ssgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read

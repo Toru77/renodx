@@ -72,7 +72,6 @@ struct ShaderInjectData {
   float xegtao_temporal_frame_count; // 0-16 frames accounted for temporal blending (0=off)
   float xegtao_disocclusion_threshold; // [0.001..0.1], default 0.01 — depth diff to reject history
   float xegtao_noise_type;         // 0=IS-FAST, 1=IGN, 2=Hilbert — noise selection when IS-FAST on
-  float xegtao_internal_resolution; // 50/75/100 %, default 75
   float xegtao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
   float xegtao_debug_logging;       // 0=Off, 1=On
   float xegtao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid XeGTAO AO

@@ -99,7 +99,7 @@ float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
   float t = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,-1), int2(0,0), size-1), 0));
   float b = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,1), int2(0,0), size-1), 0));
   float delta = max(max(abs(l-c), abs(r-c)), max(abs(t-c), abs(b-c)));
-  return saturate(delta * 4.0);
+  return saturate(delta * 1.0);
 }
 
 float3 DecodeMrtNormalAsIs(uint2 texel)
