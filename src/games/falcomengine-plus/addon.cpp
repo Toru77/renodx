@@ -2122,7 +2122,6 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "IS-FAST Jitter/Noise: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
         .section = "Info",
-        .is_visible = []() { return !IsKai(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
