@@ -228,6 +228,8 @@ struct ShaderInjectData {
   float ssgi_kai_consume_falcom;       // 0=Off, 1=On — use Falcom SSGI to modulate XeGTAO GI
   float ssgi_kai_falcom_blend;         // [0..1], default 0.5 — how much Falcom SSGI modulates XeGTAO GI
   float ssgi_kai_xegtao_only;          // 0=Off, 1=On — suppress Falcom SSGI output, XeGTAO GI only
+  float shadow_edge_tint_kai;          // Kai-specific: 0=Off, 1=Improved (colored penumbra)
+  float character_light_strength;      // [0..2], default 0 — scales chrLightIntensity_g hero light on characters
 };
 
 #ifndef __cplusplus

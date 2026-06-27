@@ -1584,7 +1584,7 @@ void main(
   r11.xyz = float3(1,1,1) + -r8.xyz;
   r8.xyz = r4.yyy * r11.xyz + r8.xyz;
   // ── Colored Shadow Penumbra (Kai — Improved mode only, no Falcom fallback) ──
-  if (shader_injection_data.shadow_edge_tint >= 1.0f) {
+  if (shader_injection_data.shadow_edge_tint_kai >= 1.0f) {
     float penumbra = 1.0f - 2.0f * abs(r8.w - 0.5f);
     penumbra = saturate(penumbra / shader_injection_data.shadow_penumbra_detection);
 
@@ -1940,6 +1940,10 @@ void main(
     r8.xyz = r9.xyz * r12.www + r6.xyz;
   }
   r5.xyz = r7.xzw * r7.yyy;
+  // ── Character dynamic light suppression ──
+  if (is_character_pixel && shader_injection_data.character_light_strength > 0.001f) {
+    r8.xyz *= (1.0 - shader_injection_data.character_light_strength);
+  }
   r5.xyz = r21.xyz * r8.xyz + r5.xyz;
   r3.y = cmp(0 < r1.y);
   r0.x = dot(r0.xyz, float3(0.298999995,0.587000012,0.114));

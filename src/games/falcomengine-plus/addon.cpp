@@ -123,7 +123,7 @@ ShaderInjectData shader_injection = {
   .ssgi_lights_saturation = 1.f,
   .ssgi_cascade_debug = 0.f,
   .shadow_filter_method = 1.f,
-  .shadow_edge_tint = 1.f,
+  .shadow_edge_tint = 2.f,
   .shadow_pcss_jitter_enabled = 1.f,
   .shadow_pcss_jitter_amount = 1.f,
   .shadow_pcss_jitter_speed = 237.f,
@@ -202,6 +202,8 @@ ShaderInjectData shader_injection = {
   .ssgi_kai_consume_falcom = 0.f,
   .ssgi_kai_falcom_blend = 0.5f,
   .ssgi_kai_xegtao_only = 0.f,
+  .shadow_edge_tint_kai = 1.f,
+  .character_light_strength = 0.f,
 };
 
 // ═══════════ XeGTAO Backend — constants, types, fwd decls ═══════════
@@ -1489,7 +1491,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.f, .label = "CS Dispatch Fix", .section = "XeGTAO",
       .tooltip = "Fixes double volumetrics caused by stale compute descriptor bindings. Fix 1: restore state via Apply(). Fix 2: null compute descriptors. Fix 3: null + restore.",
       .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsAdvancedSettingsMode() && IsKai(); },
     },
     // —— SSGI (Screen Space Global Illumination — integrated into XeGTAO) ——
     new renodx::utils::settings::Setting{
@@ -2016,12 +2018,21 @@ renodx::utils::settings::Settings settings = {
     },
     // ── Colored Shadow Penumbra (Kai) ──
     new renodx::utils::settings::Setting{
-      .key = "KaiPenumbraMode", .binding = &shader_injection.shadow_edge_tint,
+      .key = "KaiPenumbraMode", .binding = &shader_injection.shadow_edge_tint_kai,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Colored Penumbra", .section = "Shadows",
       .tooltip = "Improved mode applies vibrance boost in shadow penumbra regions. No Falcom fallback on Kai.",
       .labels = {"Off", "Improved"},
       .is_visible = []() { return IsKai(); },
+    },
+    // —— Character hero light (Kai) ——
+    new renodx::utils::settings::Setting{
+      .key = "KaiCharacterLight", .binding = &shader_injection.character_light_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "Hero Light Suppression", .section = "Shadows",
+      .tooltip = "Suppresses dynamic point/spot lights on character pixels. 0=off (vanilla), 1=fully remove.",
+      .min = 0.f, .max = 1.0f, .format = "%.2f",
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "KaiPenumbraStrength", .binding = &shader_injection.shadow_penumbra_color_strength,
@@ -2029,7 +2040,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.15f, .label = "Penumbra Strength", .section = "Shadows",
       .tooltip = "Overall strength of the colored penumbra effect.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2038,7 +2049,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 30.f, .label = "Penumbra Vibrance", .section = "Shadows",
       .tooltip = "Vibrance applied to surface color in penumbra. 0=grayscale, 1=neutral, >1=vivid.",
       .min = 0.0f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2047,7 +2058,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.0f, .label = "Penumbra Detection", .section = "Shadows",
       .tooltip = "Penumbra detection width. Higher = wider area gets the effect.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2056,7 +2067,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Penumbra Brightness", .section = "Shadows",
       .tooltip = "Brightness multiplier for the penumbra tint color.",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_enabled = []() { return shader_injection.shadow_edge_tint_kai >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
