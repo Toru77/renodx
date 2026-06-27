@@ -18,8 +18,12 @@ static float3 DecodeNormalFromMrt(uint2 packed)
 static float ComputeEnvSunShadow(float2 uv, float3 normalWS)
 {
   int sampleCount = max((int)round(shader_injection_data.env_sss_sample_count), 1);
-  int hardShadowSamples = max(sampleCount / 8, 1);
-  int fadeOutSamples = max(sampleCount / 3, 1);
+  int hardShadowSamples = shader_injection_data.env_sss_hard_shadow_samples > 0.5f
+      ? (int)shader_injection_data.env_sss_hard_shadow_samples
+      : max(sampleCount / 8, 1);
+  int fadeOutSamples = shader_injection_data.env_sss_fade_out_samples > 0.5f
+      ? (int)shader_injection_data.env_sss_fade_out_samples
+      : max(sampleCount / 3, 1);
   if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
     fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
   }
@@ -226,7 +230,7 @@ static void ApplyEnvSSS(inout float3 color, float2 uv, uint2 mrt0_xy_raw, bool i
 
   if (shader_injection_data.env_sss_enabled >= 0.5 && !is_character_pixel) {
     float strength = saturate(shader_injection_data.env_sss_strength);
-    color = lerp(color, color * rawShadow, strength);
+    color = lerp(color, color * env_shadow, strength);
   }
 }
 

@@ -1,0 +1,2102 @@
+// ---- Created with 3Dmigoto v1.4.1 on Thu Feb 26 13:41:21 2026
+
+struct DeferredParam
+{
+    float3 shadowColor;            // Offset:    0
+    float emissive;                // Offset:   12
+    float3 specularColor;          // Offset:   16
+    float rimLightPower;           // Offset:   28
+    float3 rimLightColor;          // Offset:   32
+    float rimIntensity;            // Offset:   44
+    float3 fresnels;               // Offset:   48
+    float specularShadowFadeRatio; // Offset:   60
+    float3 specularGlossinesses;   // Offset:   64
+    float dynamicLightIntensity;   // Offset:   76
+    float materialFogIntensity;    // Offset:   80
+    float metalness;               // Offset:   84
+    float roughness;               // Offset:   88
+    float cryRefractionIndex;      // Offset:   92
+    float cryFresnel;              // Offset:   96
+    float cryBrightness;           // Offset:  100
+    float cryBrightnessPower;      // Offset:  104
+    float glowIntensity;           // Offset:  108
+    float glowLumThreshold;        // Offset:  112
+    float glowShadowFadeRatio;     // Offset:  116
+    float ssaoIntensity;           // Offset:  120
+    float translucency;            // Offset:  124
+    float ssrDistance;             // Offset:  128
+    float2 reserve;                // Offset:  132
+    uint flag;                     // Offset:  140
+};
+
+struct OutlineShapeParam
+{
+    float4x4 mtx;                  // Offset:    0
+    float4 color;                  // Offset:   64
+    float2 gradation_size;         // Offset:   80
+    float gradation_sharpness;     // Offset:   88
+    uint type;                     // Offset:   92
+    float radius;                  // Offset:   96
+    float height_base;             // Offset:  100
+    float height_width;            // Offset:  104
+    float height_gradation_width;  // Offset:  108
+    float fan_angle;               // Offset:  112
+    float pad[3];                  // Offset:  116
+};
+
+struct LightParam
+{
+    float3 pos;                    // Offset:    0
+    float radius;                  // Offset:   12
+    float3 color;                  // Offset:   16
+    float radiusInv;               // Offset:   28
+    float3 charaColor;             // Offset:   32
+    float attenuation;             // Offset:   44
+    float3 vec;                    // Offset:   48
+    float spotAngleInv;            // Offset:   60
+    float attenuationAngle;        // Offset:   64
+    float specularIntensity;       // Offset:   68
+    float specularGlossiness;      // Offset:   72
+    float scatterAnisotropy;       // Offset:   76
+    float3 scatterColor;           // Offset:   80
+    float scatterDensity;          // Offset:   92
+    float translucency;            // Offset:   96
+    int shadowmapIndex;            // Offset:  100
+    float userParams[2];           // Offset:  104
+};
+
+struct LightIndexData
+{
+    int pointLightIndices[63];     // Offset:    0
+    uint pointLightCount;          // Offset:  252
+    int spotLightIndices[63];      // Offset:  256
+    uint spotLightCount;           // Offset:  508
+    int lightProbeIndices[14];     // Offset:  512
+    uint lightProbeCount;          // Offset:  568
+    float tileDepthInv;            // Offset:  572
+};
+
+struct LightProbeParam
+{
+    float4 pos;                    // Offset:    0
+    float radius;                  // Offset:   16
+    float radiusInv;               // Offset:   20
+    float attenuation;             // Offset:   24
+    float intensity;               // Offset:   28
+    float4 sh[9];                  // Offset:   32
+};
+
+cbuffer cb_scene : register(b0)
+{
+  float4x4 view_g : packoffset(c0);
+  float4x4 viewInv_g : packoffset(c4);
+  float4x4 proj_g : packoffset(c8);
+  float4x4 projInv_g : packoffset(c12);
+  float4x4 viewProj_g : packoffset(c16);
+  float4x4 viewProjInv_g : packoffset(c20);
+  float2 vpSize_g : packoffset(c24);
+  float2 invVPSize_g : packoffset(c24.z);
+  float3 lightColor_g : packoffset(c25);
+  float ldotvXZ_g : packoffset(c25.w);
+  float3 lightDirection_g : packoffset(c26);
+  float gameTime_g : packoffset(c26.w);
+  float3 sceneShadowColor_g : packoffset(c27);
+  float chrLightIntensity_g : packoffset(c27.w);
+  float3 windDirection_g : packoffset(c28);
+  float sceneTime_g : packoffset(c28.w);
+  float2 lightTileSizeInv_g : packoffset(c29);
+  float fogNearDistance_g : packoffset(c29.z);
+  float fogFadeRangeInv_g : packoffset(c29.w);
+  float3 fogColor_g : packoffset(c30);
+  float fogIntensity_g : packoffset(c30.w);
+  float fogHeight_g : packoffset(c31);
+  float fogHeightRangeInv_g : packoffset(c31.y);
+  float windWaveTime_g : packoffset(c31.z);
+  float windWaveFrequency_g : packoffset(c31.w);
+  uint localLightProbeCount_g : packoffset(c32);
+  float lightSpecularGlossiness_g : packoffset(c32.y);
+  float lightSpecularIntensity_g : packoffset(c32.z);
+  float disableMapObjNearFade_g : packoffset(c32.w);
+  float4x4 ditherMtx_g : packoffset(c33);
+  float4 lightProbe_g[9] : packoffset(c37);
+  float3 chrLightDir_g : packoffset(c46);
+  float windForce_g : packoffset(c46.w);
+  float4 mapColor_g : packoffset(c47);
+  float4 clipPlane_g : packoffset(c48);
+  float2 resolutionScaling_g : packoffset(c49);
+  float2 shadowSplitDistance_g : packoffset(c49.z);
+  float4x4 shadowMtx_g[3] : packoffset(c50);
+  float shadowFadeNear_g : packoffset(c62);
+  float shadowFadeRangeInv_g : packoffset(c62.y);
+  float2 invShadowSize_g : packoffset(c62.z);
+  float4 frustumPlanes_g[6] : packoffset(c63);
+  float4x4 prevView_g : packoffset(c69);
+  float4x4 prevViewInv_g : packoffset(c73);
+  float4x4 prevProj_g : packoffset(c77);
+  float4x4 prevProjInv_g : packoffset(c81);
+  float4x4 prevViewProj_g : packoffset(c85);
+  float4x4 prevViewProjInv_g : packoffset(c89);
+  float2 motionJitterOffset_g : packoffset(c93);
+  float2 curJitterOffset_g : packoffset(c93.z);
+  float prevSceneTime_g : packoffset(c94);
+  uint enableMotionVectors_g : packoffset(c94.y);
+  float prevWindWaveTime_g : packoffset(c94.z);
+  float padding : packoffset(c94.w);
+}
+
+cbuffer cb_local : register(b2)
+{
+  float fadeRangeInv_g : packoffset(c0);
+  float density_g : packoffset(c0.y);
+  float4 offsetsAndWeights[8] : packoffset(c1);
+}
+
+cbuffer cb_post_sky : register(b6)
+{
+  float3 incomingLight_g : packoffset(c0);
+  uint isEnableSky_g : packoffset(c0.w);
+  float3 scatteringR_g : packoffset(c1);
+  float3 scatteringM_g : packoffset(c2);
+  float3 extinctionR_g : packoffset(c3);
+  float3 extinctionM_g : packoffset(c4);
+  float3 densityScaleHeight_g : packoffset(c5);
+  float skyHorizonBottomLimit_g : packoffset(c5.w);
+  float3 sunDirection_g : packoffset(c6);
+  float skyHorizonTopLimit_g : packoffset(c6.w);
+  float mieG_g : packoffset(c7);
+  float distanceScale_g : packoffset(c7.y);
+  float planetRadius_g : packoffset(c7.z);
+  float atmosphereHeight_g : packoffset(c7.w);
+  float sunIntensity_g : packoffset(c8);
+  float skyLutNearOverFarClip_g : packoffset(c8.y);
+  float skyLutCameraFarClip_g : packoffset(c8.z);
+  float skyBrightness_g : packoffset(c8.w);
+  float cloudCoverage_g : packoffset(c9);
+  float cloudThickness_g : packoffset(c9.y);
+  uint cloudRaySteps_g : packoffset(c9.z);
+  float cloudLightIntensity_g : packoffset(c9.w);
+  float cloudDistance_g : packoffset(c10);
+  float cloudFadeRangeInv_g : packoffset(c10.y);
+  float cloudHeight_g : packoffset(c10.z);
+  float cloudScale_g : packoffset(c10.w);
+  float3 cloudColor_g : packoffset(c11);
+}
+
+cbuffer cb_deferred : register(b4)
+{
+  float3 mapAOColor_g : packoffset(c0);
+  uint outlineShapeCount_g : packoffset(c0.w);
+  float4 outlineShapeMaskUVParam_g : packoffset(c1);
+  float ssgiShadowRatio_g : packoffset(c2);
+}
+
+SamplerState samPoint_s : register(s0);
+SamplerState samLinear_s : register(s1);
+SamplerState SmplCube_s : register(s14);
+SamplerState SmplLinearClamp_s : register(s15);
+SamplerComparisonState SmplShadow_s : register(s13);
+Texture2D<float4> colorTexture : register(t0);
+Texture2D<uint4> mrtTexture0 : register(t1);
+Texture2D<uint4> mrtTexture1 : register(t2);
+Texture2D<float> depthTexture : register(t3);
+Texture2D<float4> ssaoTexture : register(t4);
+StructuredBuffer<DeferredParam> deferredParams_g : register(t5);
+StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t6);
+Texture2D<float4> outlineShapeMask : register(t7);
+Texture2D<float4> cloudsTexture : register(t8);
+Texture2D<float4> ssgiTexture : register(t9);
+Texture2D<uint4> charMaskTexture : register(t10);
+StructuredBuffer<LightParam> dynamicLights_g : register(t11);
+StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
+StructuredBuffer<LightProbeParam> localLightProbes_g : register(t13);
+StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
+Texture2D<float4> sssShadowTexture : register(t15);
+Texture2DArray<float4> shadowMaps : register(t16);
+TextureCube<float4> texEnvMap_g : register(t17);
+Texture2DArray<float4> spotShadowMaps : register(t18);
+Texture3D<float4> atmosphereInscatterLUT : register(t19);
+Texture3D<float4> atmosphereExtinctionLUT : register(t20);
+Texture2D<float4> texMirror_g : register(t21);
+Texture2D<uint> xegtaoTexture : register(t22);
+Texture2D<float4> xegtaoSSGITexture : register(t23);
+Texture3D<float2> isfast_noise : register(t24);
+
+#include "../../shared.h"
+#include "../../reference/rendering.hlsl"
+
+// 3Dmigoto declarations
+#define cmp -
+
+float3 DecodeXeGTAOBentNormal(float2 packed_xy) {
+  float2 bent_xy = packed_xy * 2.0 + float2(-1.0, -1.0);
+  float bent_z = sqrt(saturate(1.0 - dot(bent_xy, bent_xy)));
+  float3 bent = float3(bent_xy, bent_z);
+  float len2 = dot(bent, bent);
+  return len2 > 1e-5 ? bent * rsqrt(len2) : float3(0.0, 0.0, 1.0);
+}
+
+float3 GetMainLightDirectionViewToLight() {
+  float3 light_dir_view;
+  light_dir_view.x = dot(lightDirection_g.xyz, view_g._m00_m10_m20);
+  light_dir_view.y = dot(lightDirection_g.xyz, view_g._m01_m11_m21);
+  light_dir_view.z = dot(lightDirection_g.xyz, view_g._m02_m12_m22);
+  float len2 = dot(light_dir_view, light_dir_view);
+  if (len2 <= 1e-5) return float3(0.0, 0.0, -1.0);
+  // lightDirection_g points from the light to the scene; invert to get direction TO light.
+  return -light_dir_view * rsqrt(len2);
+}
+
+float ApplyXeGTAOBentVisibility(float ao_visibility, float2 bent_payload_xy) {
+  float3 bent_normal = DecodeXeGTAOBentNormal(bent_payload_xy);
+  float3 light_dir_to_light = GetMainLightDirectionViewToLight();
+
+  float diffuse_strength = saturate(shader_injection_data.xegtao_bent_diffuse_strength);
+  float diffuse_softness = clamp(shader_injection_data.xegtao_bent_diffuse_softness, 0.02, 0.35);
+  float spec_strength = saturate(shader_injection_data.xegtao_bent_specular_strength);
+  float spec_proxy_roughness = saturate(shader_injection_data.xegtao_bent_specular_proxy_roughness);
+  float max_darkening = saturate(shader_injection_data.xegtao_bent_max_darkening);
+
+  float ao_clamped = saturate(ao_visibility);
+  float cos_cone = 1.0 - ao_clamped;
+  float cos_light = clamp(dot(bent_normal, light_dir_to_light), -1.0, 1.0);
+
+  // Directional diffuse visibility (cosine-space cone test).
+  float diffuse_vis = smoothstep(cos_cone - diffuse_softness, cos_cone + diffuse_softness, cos_light);
+  // Conservative specular proxy visibility (reflection-aware path intentionally not used).
+  float spec_threshold = lerp(cos_cone, -1.0, saturate(spec_proxy_roughness * spec_proxy_roughness));
+  float spec_vis = smoothstep(spec_threshold - 0.1, spec_threshold + 0.1, cos_light);
+
+  float bent_vis = lerp(1.0, diffuse_vis, diffuse_strength) * lerp(1.0, spec_vis, spec_strength);
+  float bent_cap = lerp(1.0 - max_darkening, 1.0, saturate(bent_vis));
+  return saturate(ao_visibility * bent_cap);
+}
+
+uint2 XeGTAODebugPixelCoord(float2 uv, uint width, uint height) {
+  width = max(width, 1u);
+  height = max(height, 1u);
+  float2 pixel_f = saturate(uv) * float2((float)width, (float)height);
+  return min((uint2)pixel_f, uint2(width - 1u, height - 1u));
+}
+
+float4 XeGTAODebugLoad4(Texture2D<float4> texture_obj, float2 uv) {
+  uint width, height;
+  texture_obj.GetDimensions(width, height);
+  uint2 pixel = XeGTAODebugPixelCoord(uv, width, height);
+  return texture_obj.Load(int3(pixel, 0));
+}
+
+float XeGTAODebugLoad1(Texture2D<float> texture_obj, float2 uv) {
+  uint width, height;
+  texture_obj.GetDimensions(width, height);
+  uint2 pixel = XeGTAODebugPixelCoord(uv, width, height);
+  return texture_obj.Load(int3(pixel, 0));
+}
+
+float2 ISFASTShadowSampleOffset(
+    float sample_index,
+    float sample_count,
+    float jitter_angle,
+    float radius_scale,
+    bool use_cosine_warp) {
+  float sample_radius = sqrt(sample_index + 0.5) * radius_scale;
+  float sample_angle = sample_index * 2.4000001 + jitter_angle;
+  float sample_sin;
+  float sample_cos;
+  sincos(sample_angle, sample_sin, sample_cos);
+  return float2(sample_cos, sample_sin) * sample_radius;
+}
+
+
+void main(
+  float4 v0 : SV_Position0,
+  float4 v1 : TEXCOORD0,
+  out float4 o0 : SV_Target0,
+  out uint4 o1 : SV_Target1)
+{
+  float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24;
+  uint4 bitmask, uiDest;
+  float4 fDest;
+  float cubemap_mode = shader_injection_data.cubemap_improvements_enabled;
+  float cubemap_improved_factor = saturate(cubemap_mode);
+  float cubemap_lighting_mip_boost = clamp(shader_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0);
+  bool exp_fog_color_correction_enabled = shader_injection_data.fog_color_correction_enabled >= 0.5;
+  float exp_fog_hue = clamp(shader_injection_data.fog_hue, 0.0, 2.0);
+  float exp_fog_chrominance = clamp(shader_injection_data.fog_chrominance, 0.0, 2.0);
+  float exp_fog_avg_brightness = clamp(shader_injection_data.fog_avg_brightness, 0.0, 2.0);
+  float exp_fog_min_brightness = clamp(shader_injection_data.fog_min_brightness, -0.5, 1.0);
+  float exp_fog_min_chroma_change = clamp(shader_injection_data.fog_min_chroma_change, 0.0, 4.0);
+  float exp_fog_max_chroma_change = clamp(shader_injection_data.fog_max_chroma_change, 0.0, 8.0);
+  exp_fog_max_chroma_change = max(exp_fog_max_chroma_change, exp_fog_min_chroma_change);
+  float exp_fog_lightness_strength = clamp(shader_injection_data.fog_lightness_strength, 0.0, 2.0);
+  float exp_fog_color_correction_strength = saturate(shader_injection_data.fog_color_correction_strength);
+
+  r0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
+  mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
+  r1.xy = fDest.xy;
+  r1.xy = v1.xy * r1.xy;
+  r1.xy = (int2)r1.xy;
+  r1.zw = float2(0,0);
+  r1.xyzw = mrtTexture1.Load(r1.xyz).xyzw;
+  r2.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+  r0.w = cmp(0 >= r2.z);
+  if (r0.w != 0) {
+    r3.xyzw = cloudsTexture.SampleLevel(samLinear_s, v1.xy, 0).xyzw;
+    r3.xyz = r3.xyz + -r0.xyz;
+    r3.xyz = r3.www * r3.xyz + r0.xyz;
+    o0.xyz = skyBrightness_g * r3.xyz;
+    o0.w = 1;
+    o1.xyzw = r1.xyzw;
+    return;
+  }
+  mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
+  r3.xy = fDest.xy;
+  r3.xy = v1.xy * r3.xy;
+  r3.xy = (int2)r3.xy;
+  r3.zw = float2(0,0);
+  uint4 mrt0_raw = mrtTexture0.Load(r3.xyz);
+  const uint kFoliageMarkerBit = 0x80000000u;
+  const uint kFoliageVariationBit = 0x0200u;
+  uint mrt0z_marked = mrt0_raw.z;
+  uint mrt0z_raw = mrt0z_marked & ~kFoliageMarkerBit;
+  uint mrt0z_class = mrt0z_raw & ~kFoliageVariationBit;
+  const uint xegtao_foliage_mask_method_ui =
+      (uint)round(clamp(shader_injection_data.xegtao_foliage_mask_method, 0.0, 2.0));
+  uint4 foliage_mask_t10_raw = mrt0_raw;
+  bool foliage_mask_t10_available = false;
+  charMaskTexture.GetDimensions(0, fDest.x, fDest.y, fDest.z);
+  if (fDest.x > 0.0 && fDest.y > 0.0) {
+    const uint2 foliage_mask_size = (uint2)fDest.xy;
+    const uint2 foliage_mask_coord = min((uint2)(v1.xy * fDest.xy), foliage_mask_size - uint2(1u, 1u));
+    foliage_mask_t10_raw = charMaskTexture.Load(int3(foliage_mask_coord, 0));
+    foliage_mask_t10_available = true;
+  }
+  const bool is_foliage_pixel_t1_sss = (mrt0z_raw == 2303u) || (mrt0z_raw == 3327u);
+  const bool is_foliage_pixel_t1_broad =
+      ((mrt0z_marked & kFoliageMarkerBit) != 0u)
+      || (mrt0z_class == 2303u)
+      || (mrt0z_class == 3327u);
+
+  const uint foliage_t10_z_marked = foliage_mask_t10_raw.z;
+  const uint foliage_t10_z_raw = foliage_t10_z_marked & ~kFoliageMarkerBit;
+  const bool is_foliage_pixel_t10_strict =
+      (foliage_t10_z_raw == 2303u) || (foliage_t10_z_raw == 3327u);
+  r3.xy = mrt0_raw.xy;
+  r3.z = mrt0z_raw;
+  const bool is_character_pixel = ((mrt0z_raw >> 8u) & 1u) != 0u;
+  // Method 0: SSS parity strict (t1), 1: legacy broad (t1), 2: strict t10.
+  bool is_foliage_pixel = is_foliage_pixel_t1_sss;
+  if (xegtao_foliage_mask_method_ui == 1u) {
+    is_foliage_pixel = is_foliage_pixel_t1_broad;
+  } else if (xegtao_foliage_mask_method_ui == 2u) {
+    is_foliage_pixel = foliage_mask_t10_available && is_foliage_pixel_t10_strict;
+  }
+  const bool is_environment_pixel = !is_character_pixel && !is_foliage_pixel;
+  float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
+  const bool xegtao_bound = shader_injection_data.xegtao_dedicated_bound >= 0.5;
+  const bool xegtao_force_neutral_x = shader_injection_data.xegtao_force_neutral_x >= 0.5;
+  const bool xegtao_bent_normals_enabled = shader_injection_data.xegtao_bent_normals >= 0.5;
+  const bool xegtao_debug_blackout = shader_injection_data.xegtao_debug_blackout >= 0.5;
+  const bool xegtao_ao_active_for_draw = shader_injection_data.xegtao_ao_active_for_draw >= 0.5;
+  const bool sss_dedicated_bound = shader_injection_data.sss_dedicated_bound >= 0.5;
+  const float xegtao_foliage_blend = saturate(shader_injection_data.xegtao_foliage_ao_blend);
+  float3 xegtao_sample = ssao_sample;
+  if (xegtao_bound) {
+    uint xw, xh;
+    xegtaoTexture.GetDimensions(xw, xh);
+    uint xpacked = xegtaoTexture.Load(int3(uint2(v1.xy * float2(xw, xh)), 0));
+    xegtao_sample = float3(float(xpacked) / 255.0, 0.0, 0.0);
+  }
+  float3 ao_sample = ssao_sample;
+  if (xegtao_bound) {
+    // XeGTAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
+    ao_sample.x = xegtao_sample.x;
+    if (xegtao_bent_normals_enabled && is_environment_pixel) {
+      ao_sample.x = ApplyXeGTAOBentVisibility(ao_sample.x, xegtao_sample.yz);
+    }
+  } else if (xegtao_force_neutral_x) {
+    ao_sample.x = 1.0;
+  }
+  float sss_shadow_sample = saturate(ssao_sample.z);
+  if (sss_dedicated_bound) {
+    sss_shadow_sample = saturate(sssShadowTexture.SampleLevel(samLinear_s, v1.xy, 0).z);
+  }
+  const bool is_foliage_ao_mask_pixel =
+      is_foliage_pixel && (!sss_dedicated_bound || sss_shadow_sample < 0.999);
+  if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+    ao_sample.x = lerp(1.0, ao_sample.x, xegtao_foliage_blend);
+  }
+  r4.xyz = ao_sample;
+  uint xegtao_debug_mode_ui = (uint)round(max(shader_injection_data.xegtao_debug_mode, 0.0));
+  const bool run_xegtao_debug = !xegtao_force_neutral_x
+      && xegtao_debug_mode_ui > 0u
+      && (xegtao_bound || xegtao_debug_mode_ui >= 10u || xegtao_debug_blackout);
+  if (run_xegtao_debug) {
+    if (xegtao_debug_blackout && xegtao_debug_mode_ui <= 9u) {
+      o0 = float4(0.0, 0.0, 0.0, 1.0);
+      o1 = r1;
+      return;
+    }
+    if (is_character_pixel) {
+      o0 = float4(0.0, 0.0, 0.0, 1.0);
+      o1 = r1;
+      return;
+    }
+    float3 ssao_debug_sample = ssao_sample;
+    float3 xegtao_debug_source = xegtao_sample;
+    float sss_shadow_debug = sss_shadow_sample;
+    float depth_raw = saturate(r2.z);
+    if (xegtao_debug_mode_ui <= 9u) {
+      ssao_debug_sample = XeGTAODebugLoad4(ssaoTexture, v1.xy).xyz;
+      xegtao_debug_source = xegtao_bound ? xegtao_sample : ssao_debug_sample;
+      sss_shadow_debug = saturate(ssao_debug_sample.z);
+      if (shader_injection_data.sss_dedicated_bound >= 0.5) {
+        sss_shadow_debug = saturate(XeGTAODebugLoad4(sssShadowTexture, v1.xy).z);
+      }
+      depth_raw = saturate(XeGTAODebugLoad1(depthTexture, v1.xy));
+    }
+
+    const bool xegtao_effective_character_masked = xegtao_bound && !is_character_pixel;
+    float3 xegtao_debug_sample = xegtao_effective_character_masked ? xegtao_debug_source : ssao_debug_sample;
+    if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+      xegtao_debug_sample.x = lerp(1.0, xegtao_debug_sample.x, xegtao_foliage_blend);
+    }
+    float3 ao_debug_sample = is_character_pixel ? ssao_debug_sample : ao_sample;
+    float xegtao_ao = saturate(xegtao_debug_sample.x);
+    float vanilla_ao = saturate(ssao_debug_sample.x);
+    float ao_delta = xegtao_ao - vanilla_ao;
+    float ao_delta_mag = saturate(abs(ao_delta) * 8.0);
+    float3 ao_delta_color = (ao_delta >= 0.0)
+        ? float3(ao_delta_mag, ao_delta_mag * 0.2, 0.0)
+        : float3(0.0, ao_delta_mag * 0.3, ao_delta_mag);
+    float depth_edge = saturate(length(float2(ddx(depth_raw), ddy(depth_raw))) * 800.0);
+    uint2 mrt_packed_xy = (uint2)r3.xy;
+    float2 mrt_encoded = mrt_packed_xy * float2(3.05180438e-05, 3.05180438e-05) + float2(-1.0, -1.0);
+    float mrt_angle = 3.14159274 * mrt_encoded.x;
+    float mrt_sin;
+    float mrt_cos;
+    sincos(mrt_angle, mrt_sin, mrt_cos);
+    float mrt_ring = sqrt(saturate(1.0 - mrt_encoded.y * mrt_encoded.y));
+    float3 mrt_normal_as_is = float3(mrt_cos * mrt_ring, mrt_sin * mrt_ring, mrt_encoded.y);
+    float mrt_as_is_len2 = max(dot(mrt_normal_as_is, mrt_normal_as_is), 1e-5);
+    mrt_normal_as_is *= rsqrt(mrt_as_is_len2);
+    float3 mrt_normal_view = mul((float3x3)view_g, mrt_normal_as_is);
+    float mrt_view_len2 = max(dot(mrt_normal_view, mrt_normal_view), 1e-5);
+    mrt_normal_view *= rsqrt(mrt_view_len2);
+    const bool mrt_use_transform = shader_injection_data.xegtao_normal_input_mode >= 0.5;
+    float3 selected_mrt_normal = mrt_use_transform ? mrt_normal_view : mrt_normal_as_is;
+    float selected_normal_length = sqrt(max(dot(selected_mrt_normal, selected_mrt_normal), 0.0));
+    float reconstructed_z = sqrt(saturate(1.0 - dot(mrt_normal_as_is.xy, mrt_normal_as_is.xy)));
+    const bool mrt_source_valid = shader_injection_data.xegtao_mrt_normal_valid >= 0.5;
+    bool env_pixel = is_environment_pixel;
+
+    float3 debug_color = xegtao_ao.xxx;
+    if (xegtao_debug_mode_ui == 1u) {
+      debug_color = xegtao_ao.xxx;
+    } else if (xegtao_debug_mode_ui == 2u) {
+      debug_color = vanilla_ao.xxx;
+    } else if (xegtao_debug_mode_ui == 3u) {
+      debug_color = ao_delta_color;
+    } else if (xegtao_debug_mode_ui == 4u) {
+      debug_color = saturate(xegtao_debug_sample);
+    } else if (xegtao_debug_mode_ui == 5u) {
+      debug_color = float3(0.0, saturate(ssao_debug_sample.y), saturate(ssao_debug_sample.z));
+    } else if (xegtao_debug_mode_ui == 6u) {
+      debug_color = depth_raw.xxx;
+    } else if (xegtao_debug_mode_ui == 7u) {
+      debug_color = depth_edge.xxx;
+    } else if (xegtao_debug_mode_ui == 8u) {
+      debug_color = sss_shadow_debug.xxx;
+    } else if (xegtao_debug_mode_ui == 9u) {
+      debug_color = float3(0.0, saturate(ao_sample.y), saturate(ao_sample.z));
+    } else if (xegtao_debug_mode_ui == 10u) {
+      debug_color = float3(mrt_normal_as_is.x * 0.5 + 0.5, mrt_normal_as_is.y * 0.5 + 0.5, 0.5);
+    } else if (xegtao_debug_mode_ui == 11u) {
+      debug_color = float3(mrt_normal_as_is.z * 0.5 + 0.5, reconstructed_z, 0.0);
+    } else if (xegtao_debug_mode_ui == 12u) {
+      debug_color = saturate(selected_mrt_normal * 0.5 + 0.5);
+    } else if (xegtao_debug_mode_ui == 13u) {
+      debug_color = saturate(selected_normal_length).xxx;
+    } else if (xegtao_debug_mode_ui == 14u) {
+      if (!xegtao_bound || !mrt_source_valid) {
+        debug_color = float3(0.0, 0.0, 1.0);
+      } else if (mrt_use_transform) {
+        debug_color = float3(0.0, 1.0, 0.0);
+      } else {
+        debug_color = float3(1.0, 0.0, 0.0);
+      }
+    } else if (xegtao_debug_mode_ui == 15u) {
+      debug_color = float3(
+          is_character_pixel ? 1.0 : 0.0,
+          is_foliage_pixel ? 1.0 : 0.0,
+          env_pixel ? 1.0 : 0.0);
+    } else if (xegtao_debug_mode_ui == 16u) {
+      if (!xegtao_bound) {
+        debug_color = float3(0.0, 0.0, 1.0);
+      } else if (mrt_source_valid) {
+        debug_color = float3(1.0, 1.0, 1.0);
+      } else {
+        debug_color = float3(0.0, 1.0, 1.0);
+      }
+    } else if (xegtao_debug_mode_ui == 17u) {
+      debug_color = float3(xegtao_ao, vanilla_ao, ao_delta_mag);
+    } else if (xegtao_debug_mode_ui == 18u) {
+      debug_color = saturate(ao_debug_sample);
+    } else if (xegtao_debug_mode_ui == 19u) {
+      float ao_effective = saturate(max(ao_debug_sample.x, ao_debug_sample.y * sss_shadow_sample));
+      debug_color = ao_effective.xxx;
+    } else if (xegtao_debug_mode_ui == 20u) {
+      const bool foliage_shadow_gate = !sss_dedicated_bound || sss_shadow_debug < 0.999;
+      const bool foliage_gate_active = xegtao_ao_active_for_draw && is_foliage_pixel && foliage_shadow_gate;
+      if (!xegtao_ao_active_for_draw) {
+        debug_color = float3(0.0, 0.0, 1.0);
+      } else if (foliage_gate_active) {
+        debug_color = float3(0.0, 1.0, 0.0);
+      } else if (is_foliage_pixel) {
+        debug_color = float3(1.0, 1.0, 0.0);
+      } else {
+        debug_color = float3(0.2, 0.0, 0.0);
+      }
+    } else if (xegtao_debug_mode_ui == 21u) {
+      // RGB method compare:
+      //   R = legacy broad (t1), G = SSS parity strict (t1), B = strict t10 (0.5 if unavailable)
+      float t10_debug = foliage_mask_t10_available ? (is_foliage_pixel_t10_strict ? 1.0 : 0.0) : 0.5;
+      debug_color = float3(
+          is_foliage_pixel_t1_broad ? 1.0 : 0.0,
+          is_foliage_pixel_t1_sss ? 1.0 : 0.0,
+          t10_debug);
+    }
+
+    o0 = float4(debug_color, 1.0);
+    o1 = r1;
+    return;
+  }
+  r0.w = (uint)r3.z >> 8;
+  // mrt0z_raw/is_foliage_pixel are decoded above and reused below.
+  float foliage_saved_shadow = sss_shadow_sample;     // active SSS source (vanilla AO.z policy)
+  float3 foliage_debug_ssao = ssao_sample;            // debug: full ssaoTexture sample
+  float foliage_debug_mrt0z = r3.z;                   // debug: raw mrtTexture0.z value
+  r3.xy = (uint2)r3.xy;
+  r5.zw = r3.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
+  r3.x = 3.14159274 * r5.z;
+  sincos(r3.x, r3.x, r6.x);
+  r3.y = r5.w * r5.w;
+  r3.w = -r5.w * r5.w + 1;
+  r3.w = sqrt(r3.w);
+  r5.x = r6.x * r3.w;
+  r5.y = r3.x * r3.w;
+  // ── XeGTAO GI: sample & process once for both early-return and main paths ──
+  r24.xyzw = float4(0, 0, 0, 0);
+  if (shader_injection_data.xegtao_ssgi_bound >= 0.5) {
+    r24.xyzw = xegtaoSSGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
+    r24.xyz *= shader_injection_data.ssgi_intensity;
+    float giLuma = dot(r24.xyz, float3(0.333, 0.333, 0.333));
+    r24.xyz = lerp(giLuma.xxx, r24.xyz, shader_injection_data.ssgi_saturation);
+    if (shader_injection_data.ssgi_max_clamp > 0.0) {
+      r24.xyz = min(r24.xyz, shader_injection_data.ssgi_max_clamp);
+    }
+    r24.w = saturate(giLuma);
+  }
+  r3.x = (int)r0.w & 8;
+  if (r3.x == 0) {
+    r6.y = (uint)r1.y >> 8;
+    r6.x = r1.y;
+    r3.xw = (int2)r6.xy & int2(255,255);
+    r3.xw = (uint2)r3.xw;
+    r6.x = 0.00392156886;
+    r6.y = r0.y;
+    r6.xy = r6.xy * r3.xw;
+    if (1 == 0) r3.x = 0; else if (1+8 < 32) {     r3.x = (uint)r3.z << (32-(1 + 8)); r3.x = (uint)r3.x >> (32-1);    } else r3.x = (uint)r3.z >> 8;
+    if (r3.x != 0) {
+      r3.x = (int)r1.z & 255;
+      r3.x = (uint)r3.x;
+      r6.z = r3.x * r0.z;
+      r7.x = r0.x;
+      r7.yz = float2(0.00392156886,0.00392156886);
+      r8.xyz = r7.xyz * r6.xyz;
+      r3.x = r4.y * sss_shadow_sample;
+      r4.yzw = -r7.xyz * r6.xyz + r0.xyz;
+      r4.yzw = r3.xxx * r4.yzw + r8.xyz;
+      r3.x = (int)r0.w & 4;
+      if (r3.x == 0) {
+        r2.xy = v1.xy * float2(2,-2) + float2(-1,1);
+        r2.w = 1;
+        r3.x = dot(r2.xyzw, projInv_g._m02_m12_m22_m32);
+        r3.w = dot(r2.xyzw, projInv_g._m03_m13_m23_m33);
+        r3.x = r3.x / r3.w;
+        r3.w = saturate(-0.5 * r3.x);
+        r3.w = r3.w * 0.00899999961 + 0.00100000005;
+        r6.yz = offsetsAndWeights[0].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r5.z = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.y = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r5.z = r5.z / r6.y;
+        r5.z = -r5.z + r3.x;
+        r5.z = cmp(r5.z >= r3.w);
+        r5.z = r5.z ? 1.000000 : 0;
+        r6.yz = offsetsAndWeights[1].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r6.y = cmp(r6.y >= r3.w);
+        r6.y = r6.y ? 1.000000 : 0;
+        r6.y = offsetsAndWeights[1].z * r6.y;
+        r5.z = r5.z * offsetsAndWeights[0].z + r6.y;
+        r6.yz = offsetsAndWeights[2].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r6.y = cmp(r6.y >= r3.w);
+        r6.y = r6.y ? 1.000000 : 0;
+        r5.z = r6.y * offsetsAndWeights[2].z + r5.z;
+        r6.yz = offsetsAndWeights[3].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r6.y = cmp(r6.y >= r3.w);
+        r6.y = r6.y ? 1.000000 : 0;
+        r5.z = r6.y * offsetsAndWeights[3].z + r5.z;
+        r6.yz = offsetsAndWeights[4].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r6.y = cmp(r6.y >= r3.w);
+        r6.y = r6.y ? 1.000000 : 0;
+        r5.z = r6.y * offsetsAndWeights[4].z + r5.z;
+        r6.yz = offsetsAndWeights[5].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r6.y = cmp(r6.y >= r3.w);
+        r6.y = r6.y ? 1.000000 : 0;
+        r5.z = r6.y * offsetsAndWeights[5].z + r5.z;
+        r6.yz = offsetsAndWeights[6].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r6.y = cmp(r6.y >= r3.w);
+        r6.y = r6.y ? 1.000000 : 0;
+        r5.z = r6.y * offsetsAndWeights[6].z + r5.z;
+        r6.yz = offsetsAndWeights[7].xy + v1.xy;
+        r7.z = depthTexture.SampleLevel(samLinear_s, r6.yz, 0).x;
+        r7.xy = r6.yz * float2(2,-2) + float2(-1,1);
+        r7.w = 1;
+        r6.y = dot(r7.xyzw, projInv_g._m02_m12_m22_m32);
+        r6.z = dot(r7.xyzw, projInv_g._m03_m13_m23_m33);
+        r6.y = r6.y / r6.z;
+        r6.y = -r6.y + r3.x;
+        r3.w = cmp(r6.y >= r3.w);
+        r3.w = r3.w ? 1.000000 : 0;
+        r3.w = r3.w * offsetsAndWeights[7].z + r5.z;
+        r7.yzw = (uint3)r1.xxx >> int3(4,8,12);
+        r7.x = r1.x;
+        r7.xyzw = (int4)r7.xyzw & int4(15,15,15,15);
+        r7.xyzw = (uint4)r7.xyzw;
+        r5.z = 0.0666666701 * r7.w;
+        r6.y = cmp(0 < r7.w);
+        r3.w = r3.w * r3.w;
+        r3.w = r3.w * r5.z;
+        r3.w = density_g * r3.w;
+        r3.x = fadeRangeInv_g * -r3.x;
+        r3.xw = min(float2(1,1), r3.xw);
+        r3.x = 1 + -r3.x;
+        r3.x = r3.w * r3.x;
+        r8.x = dot(lightDirection_g.xyz, view_g._m00_m10_m20);
+        r8.y = dot(lightDirection_g.xyz, view_g._m01_m11_m21);
+        r3.w = dot(r8.xy, r8.xy);
+        r3.w = rsqrt(r3.w);
+        r6.zw = r8.xy * r3.ww;
+        r8.x = dot(r5.xyw, view_g._m00_m10_m20);
+        r8.y = dot(r5.xyw, view_g._m01_m11_m21);
+        r8.z = dot(r5.xyw, view_g._m02_m12_m22);
+        r3.w = dot(r8.xyz, r8.xyz);
+        r3.w = rsqrt(r3.w);
+        r8.xy = r8.xy * r3.ww;
+        r3.w = dot(r8.xy, r6.zw);
+        r3.w = r3.w * 0.5 + 0.5;
+        r3.w = log2(abs(r3.w));
+        r3.w = 0.400000006 * r3.w;
+        r3.w = exp2(r3.w);
+        r3.x = r3.x * r3.w;
+        r7.xyz = r7.xyz * float3(0.0666666701,0.0666666701,0.0666666701) + -r4.yzw;
+        r7.xyz = r3.xxx * r7.xyz + r4.yzw;
+        r4.yzw = r6.y ? r7.xyz : r4.yzw;
+      }
+    } else {
+      r3.x = 1 + -r4.x;
+      r3.x = r6.x * r3.x;
+      r6.xyz = r0.xyz * mapAOColor_g.xyz + -r0.xyz;
+      r4.yzw = r3.xxx * r6.xyz + r0.xyz;
+    }
+
+    // --- In-Shader Character SSGI Composite (early-return path) ---
+    {
+      bool er_is_char = ((mrt0z_raw >> 8u) & 1u) != 0u;
+      bool er_gi_on = shader_injection_data.char_gi_enabled >= 0.5;
+      uint er_dbg = (uint)(max(shader_injection_data.char_gi_debug_mode, 0.0) + 0.5);
+
+      if (er_gi_on && er_is_char) {
+        float4 er_ssgi = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0);
+        if (shader_injection_data.ssgi_mod_enabled >= 0.5) {
+          er_ssgi.xyz = pow(abs(er_ssgi.xyz * max(shader_injection_data.ssgi_color_boost, 0.0)),
+                           max(shader_injection_data.ssgi_pow, 0.01));
+          er_ssgi.w = saturate(er_ssgi.w * max(shader_injection_data.ssgi_alpha_boost, 0.0));
+        } else {
+          er_ssgi = float4(0, 0, 0, 0);
+        }
+
+        static const float3 ER_LUMA = float3(0.299, 0.587, 0.114);
+        float er_ao = saturate(r4.x);
+        float er_ao_f = lerp(1.0, er_ao, saturate(shader_injection_data.char_gi_ao_influence));
+        float er_rej = pow(saturate(er_ao_f), max(shader_injection_data.char_gi_reject_strength, 0.0));
+        float er_sl = dot(r4.yzw, ER_LUMA);
+        float er_sp = max(shader_injection_data.char_gi_shadow_power, 0.1);
+        float er_sr = pow(saturate(1.0 - er_sl), er_sp);
+        float er_bb = max(shader_injection_data.char_gi_bright_boost, 0.0);
+        float er_bbs = max(er_bb - 1.0, 0.0);
+        float er_bm = saturate(1.0 - er_sr);
+        float er_sm = saturate(er_sr + er_bm * er_bbs);
+        float er_df = lerp(1.0, max(shader_injection_data.char_gi_dark_boost, 0.0), er_sr);
+        float3 er_gc = max(er_ssgi.rgb, 0.0);
+        float er_gl = dot(er_gc, ER_LUMA);
+        float3 er_gf = (er_gc - er_gl.xxx) * max(shader_injection_data.char_gi_chroma_strength, 0.0)
+                      + (er_gl * max(shader_injection_data.char_gi_luma_strength, 0.0)).xxx;
+        float er_gw = saturate(er_ssgi.a * max(shader_injection_data.char_gi_alpha_scale, 0.0))
+                    * er_sm * er_df * er_rej;
+        float er_hp = max(shader_injection_data.char_gi_headroom_power, 0.1);
+        float3 er_hr = max(pow(saturate(1.0 - r4.yzw), er_hp), saturate(er_bbs * 0.35).xxx);
+        float er_str = max(shader_injection_data.char_gi_strength, 0.0);
+        float er_ma = max(shader_injection_data.char_gi_max_add, 0.0);
+        float3 er_contrib = er_gf * (er_gw * er_str * er_hr);
+        er_contrib = min(er_contrib, (er_ma * (1.0 + er_bbs * er_bm) * sqrt(max(er_rej, 0.0))).xxx);
+        float er_plc = max(shader_injection_data.char_gi_peak_luma_cap, 0.0);
+        if (er_plc > 0.0) {
+          float er_cl = dot(max(er_contrib, 0.0), ER_LUMA);
+          er_contrib *= min(1.0, er_plc / max(er_cl, 1e-6));
+        }
+        r4.yzw = r4.yzw + er_contrib;
+
+        if (er_dbg != 0u) {
+          float er_ds = max(shader_injection_data.char_gi_debug_scale, 0.001);
+          float3 er_dc = r4.yzw;
+          if (er_dbg == 1u) er_dc = float3(1.0, 0.2, 0.2);
+          else if (er_dbg == 2u) er_dc = er_gc * er_ds;
+          else if (er_dbg == 3u) er_dc = er_ssgi.aaa * er_ds;
+          else if (er_dbg == 4u) er_dc = er_gf * er_ds;
+          else if (er_dbg == 5u) er_dc = er_gw.xxx * er_ds;
+          else if (er_dbg == 6u) er_dc = abs(er_contrib) * er_ds;
+          else if (er_dbg == 7u) er_dc = r4.yzw;
+          r4.yzw = saturate(er_dc);
+        }
+      } else if (er_gi_on && er_dbg != 0u) {
+        bool er_co = shader_injection_data.char_gi_debug_chars_only >= 0.5;
+        if (er_co) r4.yzw = float3(0, 0, 0);
+        else if (er_dbg == 1u) r4.yzw = float3(0.1, 0.1, 0.1);
+      }
+    }
+    // --- End early-return Character SSGI Composite ---
+
+    // Add XeGTAO GI to early-return output (bypassing game's SSGI formula)
+    r4.yzw = r4.yzw + r24.xyz;
+    o0.xyz = r4.yzw;
+    o0.w = 1;
+    o1.xyzw = r1.xyzw;
+    return;
+  }
+  r3.x = (int)r3.z & 255;
+  r3.x = (uint)r3.x;
+  r3.z = 0.00392156886 * r3.x;
+  r6.xyw = (uint3)r1.yzw >> int3(8,8,8);
+  r6.z = r1.y;
+  r4.yz = (int2)r6.zx & int2(255,255);
+  r4.yz = (uint2)r4.yz;
+  r4.yz = float2(0.00392156886,0.00392156886) * r4.yz;
+  r6.xz = r1.zw;
+  r6.xyzw = (int4)r6.xyzw & int4(255,255,255,255);
+  r6.xyzw = (uint4)r6.xyzw;
+  r7.xyzw = float4(0.00392156886,0.00392156886,0.00392156886,0.00392156886) * r6.yxzw;
+  r1.x = min(0x00004e1f, (uint)r1.x);
+  r8.x = deferredParams_g[r1.x].shadowColor.x;
+  r8.y = deferredParams_g[r1.x].shadowColor.y;
+  r8.z = deferredParams_g[r1.x].shadowColor.z;
+  r8.w = deferredParams_g[r1.x].emissive;
+  r9.x = deferredParams_g[r1.x].specularColor.x;
+  r9.y = deferredParams_g[r1.x].specularColor.y;
+  r9.z = deferredParams_g[r1.x].specularColor.z;
+  r9.w = deferredParams_g[r1.x].rimLightPower;
+  r10.x = deferredParams_g[r1.x].rimLightColor.x;
+  r10.y = deferredParams_g[r1.x].rimLightColor.y;
+  r10.z = deferredParams_g[r1.x].rimLightColor.z;
+  r10.w = deferredParams_g[r1.x].rimIntensity;
+  r11.x = deferredParams_g[r1.x].fresnels.x;
+  r11.y = deferredParams_g[r1.x].fresnels.y;
+  r11.z = deferredParams_g[r1.x].fresnels.z;
+  r12.x = deferredParams_g[r1.x].specularGlossinesses.x;
+  r12.y = deferredParams_g[r1.x].specularGlossinesses.y;
+  r12.z = deferredParams_g[r1.x].specularGlossinesses.z;
+  r12.w = deferredParams_g[r1.x].dynamicLightIntensity;
+  r13.x = deferredParams_g[r1.x].materialFogIntensity;
+  r13.y = deferredParams_g[r1.x].metalness;
+  r13.z = deferredParams_g[r1.x].roughness;
+  r13.w = deferredParams_g[r1.x].cryRefractionIndex;
+  r14.x = deferredParams_g[r1.x].cryFresnel;
+  r14.y = deferredParams_g[r1.x].cryBrightness;
+  r14.z = deferredParams_g[r1.x].cryBrightnessPower;
+  r14.w = deferredParams_g[r1.x].glowIntensity;
+  r1.y = deferredParams_g[r1.x].glowLumThreshold;
+  r1.z = deferredParams_g[r1.x].glowShadowFadeRatio;
+  r1.w = deferredParams_g[r1.x].ssaoIntensity;
+  r3.w = deferredParams_g[r1.x].ssrDistance;
+  r1.x = deferredParams_g[r1.x].flag;
+  r11.w = r12.x;
+  r15.xz = r11.yz;
+  r15.yw = r12.yz;
+  r6.xz = r15.xy + -r11.xw;
+  r6.xz = r7.zz * r6.xz + r11.xw;
+  r11.xy = r15.zw + -r6.xz;
+  r6.xz = r7.ww * r11.xy + r6.xz;
+  r2.xy = v1.zw * float2(2,-2) + float2(-1,1);
+  r2.w = 1;
+  r11.x = dot(r2.xyzw, viewProjInv_g._m00_m10_m20_m30);
+  r11.y = dot(r2.xyzw, viewProjInv_g._m01_m11_m21_m31);
+  r11.z = dot(r2.xyzw, viewProjInv_g._m02_m12_m22_m32);
+  r11.w = dot(r2.xyzw, viewProjInv_g._m03_m13_m23_m33);
+  r2.xyzw = r11.xyzw / r11.wwww;
+  r4.w = dot(view_g._m02_m12_m22_m32, r2.xyzw);
+  r7.zw = lightTileSizeInv_g.xy * v0.xy;
+  r7.zw = (uint2)r7.zw;
+  r5.z = (uint)r7.w << 5;
+  r6.w = (int)r7.z + (int)r5.z;
+  r6.w = lightIndices_g[r6.w].tileDepthInv;
+  r6.w = r6.w * -r4.w;
+  r6.w = min(7, r6.w);
+  r6.w = max(0, r6.w);
+  r6.w = (uint)r6.w;
+  r5.z = mad((int)r6.w, 576, (int)r5.z);
+  r5.z = (int)r7.z + (int)r5.z;
+  r5.z = min(4607, (uint)r5.z);
+  r6.w = lightIndices_g[r5.z].lightProbeCount;
+  r6.w = min(14, (uint)r6.w);
+  r3.y = r3.y * 3 + -1;
+  r7.z = r5.y * r5.y;
+  r7.z = r5.x * r5.x + -r7.z;
+  r11.xyz = float3(0,0,0);
+  r15.w = 0;
+  r7.w = 0;
+  while (true) {
+    r11.w = cmp((uint)r7.w >= (uint)r6.w);
+    if (r11.w != 0) break;
+    int probeIdx = lightIndices_g[r5.z].lightProbeIndices[(int)r7.w];
+    r12.x = localLightProbes_g[probeIdx].pos.x;
+    r12.y = localLightProbes_g[probeIdx].pos.y;
+    r12.z = localLightProbes_g[probeIdx].pos.z;
+    r12.xyz = r12.xyz + -r2.xyz;
+    r12.x = dot(r12.xyz, r12.xyz);
+    r12.x = sqrt(r12.x);
+    r16.x = localLightProbes_g[probeIdx].radiusInv;
+    r16.y = localLightProbes_g[probeIdx].attenuation;
+    r16.z = localLightProbes_g[probeIdx].intensity;
+    r12.x = r16.x * r12.x;
+    r12.x = log2(abs(r12.x));
+    r12.x = r16.y * r12.x;
+    r12.x = exp2(r12.x);
+    r12.x = 1 + -r12.x;
+    r12.x = max(0, r12.x);
+    r12.y = r12.x * r16.z;
+    r12.z = cmp(0 >= r12.y);
+    if (r12.z != 0) {
+      r12.z = (int)r7.w + 1;
+      r7.w = r12.z;
+      continue;
+    }
+    r16.x = localLightProbes_g[probeIdx].sh[0].x;
+    r16.y = localLightProbes_g[probeIdx].sh[0].y;
+    r16.w = localLightProbes_g[probeIdx].sh[0].z;
+    r17.x = localLightProbes_g[probeIdx].sh[1].x;
+    r17.y = localLightProbes_g[probeIdx].sh[1].y;
+    r17.z = localLightProbes_g[probeIdx].sh[1].z;
+    r16.xyw = r17.xyz * r5.xxx + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[2].x;
+    r17.y = localLightProbes_g[probeIdx].sh[2].y;
+    r17.z = localLightProbes_g[probeIdx].sh[2].z;
+    r16.xyw = r17.xyz * r5.yyy + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[3].x;
+    r17.y = localLightProbes_g[probeIdx].sh[3].y;
+    r17.z = localLightProbes_g[probeIdx].sh[3].z;
+    r16.xyw = r17.xyz * r5.www + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[4].x;
+    r17.y = localLightProbes_g[probeIdx].sh[4].y;
+    r17.z = localLightProbes_g[probeIdx].sh[4].z;
+    r17.xyz = r17.xyz * r5.www;
+    r16.xyw = r17.xyz * r5.xxx + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[5].x;
+    r17.y = localLightProbes_g[probeIdx].sh[5].y;
+    r17.z = localLightProbes_g[probeIdx].sh[5].z;
+    r17.xyz = r17.xyz * r5.yyy;
+    r16.xyw = r17.xyz * r5.www + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[6].x;
+    r17.y = localLightProbes_g[probeIdx].sh[6].y;
+    r17.z = localLightProbes_g[probeIdx].sh[6].z;
+    r17.xyz = r17.xyz * r5.yyy;
+    r16.xyw = r17.xyz * r5.xxx + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[7].x;
+    r17.y = localLightProbes_g[probeIdx].sh[7].y;
+    r17.z = localLightProbes_g[probeIdx].sh[7].z;
+    r16.xyw = r17.xyz * r3.yyy + r16.xyw;
+    r17.x = localLightProbes_g[probeIdx].sh[8].x;
+    r17.y = localLightProbes_g[probeIdx].sh[8].y;
+    r17.z = localLightProbes_g[probeIdx].sh[8].z;
+    r16.xyw = r17.xyz * r7.zzz + r16.xyw;
+    r11.xyz = r16.xyw * r12.yyy + r11.xyz;
+    r15.w = r12.x * r16.z + r15.w;
+    r7.w = (int)r7.w + 1;
+  }
+  r6.w = cmp(r15.w == 0.000000);
+  r6.w = r6.w ? 1.000000 : 0;
+  r6.w = r15.w + r6.w;
+  r11.xyz = r11.xyz / r6.www;
+  r15.w = saturate(r15.w);
+  r6.w = 1 + -r15.w;
+  r15.xyz = r15.www * r11.xyz;
+  r11.xyzw = max(float4(0,0,0,0), r15.xyzw);
+  r7.w = cmp(0 < r6.w);
+  r12.xyz = lightProbe_g[1].xyz * r5.xxx + lightProbe_g[0].xyz;
+  r12.xyz = lightProbe_g[2].xyz * r5.yyy + r12.xyz;
+  r12.xyz = lightProbe_g[3].xyz * r5.www + r12.xyz;
+  r15.xyz = lightProbe_g[4].xyz * r5.www;
+  r12.xyz = r15.xyz * r5.xxx + r12.xyz;
+  r15.xyz = lightProbe_g[5].xyz * r5.yyy;
+  r12.xyz = r15.xyz * r5.www + r12.xyz;
+  r15.xyz = lightProbe_g[6].xyz * r5.yyy;
+  r12.xyz = r15.xyz * r5.xxx + r12.xyz;
+  r12.xyz = lightProbe_g[7].xyz * r3.yyy + r12.xyz;
+  r12.xyz = lightProbe_g[8].xyz * r7.zzz + r12.xyz;
+  r12.xyz = r12.xyz * r6.www;
+  r12.xyz = r7.w ? r12.xyz : 0;
+  r12.xyz = max(float3(0,0,0), r12.xyz);
+  r12.xyz = r12.xyz + r11.xyz;
+  // Always sample Falcom SSGI as base; XeGTAO GI is sampled earlier (r24) and applied directly at end.
+  r15.xyzw = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
+  // Save Falcom SSGI for consume feature (before it may be zeroed for xegtao_only)
+  float4 falcomSSGI = r15;
+  // Kai: optionally consume Falcom SSGI to modulate XeGTAO GI (sampled earlier into r24)
+  if (shader_injection_data.xegtao_ssgi_bound >= 0.5
+      && shader_injection_data.ssgi_kai_consume_falcom >= 0.5) {
+    r24.xyz *= lerp(1.0, falcomSSGI.xyz, shader_injection_data.ssgi_kai_falcom_blend);
+    r24.w = saturate(dot(r24.xyz, float3(0.333, 0.333, 0.333)));
+  }
+  // Kai: optionally suppress Falcom SSGI output (XeGTAO GI only)
+  if (shader_injection_data.ssgi_kai_xegtao_only >= 0.5) {
+    r15.xyzw = float4(0, 0, 0, 0);
+  }
+  if (shader_injection_data.ssgi_mod_enabled < 0.5 && shader_injection_data.xegtao_ssgi_bound < 0.5) {
+    // Zero out only when neither Falcom SSGI nor XeGTAO SSGI is active.
+    r15.xyzw = float4(0, 0, 0, 0);
+  }
+
+  // Save SSGI and character mask for in-shader character GI composite
+  float4 chargi_ssgi_saved = r15;
+  // Use mrt0z_raw from mrtTexture0 (t1) which already has the character bit
+  bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
+  float chargi_ao_raw = saturate(max(r4.x, r4.y * sss_shadow_sample));
+  float chargi_depth_center = max(r2.z, 1e-6);
+  // Soft-lighting variant uses a stable shadow kernel (no temporal jitter).
+  bool shadow_use_jitter = shader_injection_data.shadow_pcss_jitter_enabled >= 0.5;
+  float shadow_jitter_amount = saturate(shader_injection_data.shadow_isfast_jitter_amount);
+  float shadow_jitter_speed = max(shader_injection_data.shadow_isfast_jitter_speed, 0.0);
+  float2 shadow_jitter_pixel = floor(v0.xy);
+  uint shadow_jitter_frame = (uint)max(sceneTime_g * shadow_jitter_speed, 0.0);
+  float shadow_jitter_phase_temporal =
+      renodx::rendering::InterleavedGradientNoiseTemporal(
+          shadow_jitter_pixel, shadow_jitter_frame);
+  float shadow_jitter_phase_static =
+      renodx::rendering::InterleavedGradientNoise(shadow_jitter_pixel);
+  float shadow_jitter_phase = lerp(
+      shadow_jitter_phase_static,
+      shadow_jitter_phase_temporal,
+      shadow_jitter_amount);
+  float shadow_jitter_angle_temporal = 6.28318548 * shadow_jitter_phase;
+  float shadow_jitter_angle_static = 6.28318548 * shadow_jitter_phase_static;
+  // ── IS-FAST jitter override: sample blue-noise via game's samPoint_s + manual wrap ──
+  float shadow_jitter_angle_isfast = shadow_jitter_angle_temporal;
+  if (shader_injection_data.shadow_isfast_enabled > 0.5
+      && shader_injection_data.shadow_isfast_texture_loaded > 0.5) {
+    uint isfastW, isfastH, isfastD;
+    isfast_noise.GetDimensions(isfastW, isfastH, isfastD);
+    if (isfastW > 0 && isfastD > 0) {
+      uint isfastFrame = (uint)max(sceneTime_g * 60.0, 0.0) % 64u;
+      float3 uvw = float3(
+          frac((shadow_jitter_pixel + 0.5) / (float)isfastW),
+          ((float)(isfastFrame % isfastD) + 0.5) / (float)isfastD);
+      float2 isfastSample = isfast_noise.SampleLevel(samPoint_s, uvw, 0);
+      shadow_jitter_angle_isfast = isfastSample.x * 6.28318548;
+    }
+  }
+
+  r16.x = viewInv_g._m30;
+  r16.y = viewInv_g._m31;
+  r16.z = viewInv_g._m32;
+  r17.xyz = r16.xyz + -r2.xyz;
+  r3.y = dot(r17.xyz, r17.xyz);
+  r3.y = rsqrt(r3.y);
+  r18.xyz = r17.xyz * r3.yyy;
+  r6.w = r8.w * r3.z;
+  r7.z = dot(r5.xyw, r18.xyz);
+  r19.xyzw = (int4)r1.xxxx & int4(1,2,4,16);
+  if (r19.x != 0) {
+    r16.xyz = -r16.xyz + r2.xyz;
+    r7.w = dot(r16.xyz, r16.xyz);
+    r7.w = sqrt(r7.w);
+    r8.w = shadowSplitDistance_g.y + -5;
+    r8.w = cmp(r8.w < r7.w);
+    if (r8.w != 0) {
+      r16.x = dot(r2.xyzw, shadowMtx_g[2]._m00_m10_m20_m30);
+      r16.y = dot(r2.xyzw, shadowMtx_g[2]._m01_m11_m21_m31);
+      r16.z = dot(r2.xyzw, shadowMtx_g[2]._m02_m12_m22_m32);
+      r8.w = dot(r2.xyzw, shadowMtx_g[2]._m03_m13_m23_m33);
+      r16.xyz = r16.xyz / r8.www;
+      r20.xy = cmp(r16.xy < float2(0,0));
+      r20.zw = cmp(float2(1,1) < r16.xy);
+      r8.w = (int)r20.z | (int)r20.x;
+      r8.w = (int)r20.y | (int)r8.w;
+      r8.w = (int)r20.w | (int)r8.w;
+      if (r8.w != 0) {
+        r8.w = 1;
+      } else {
+        r16.w = 30 / shadowSplitDistance_g.y;
+        r20.xy = float2(0.000500000024,0.000250000012) * r16.ww;
+        shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+        r20.zw = fDest.xy;
+        r20.zw = float2(1,1) / r20.zw;
+        r20.xy = max(r20.zw, r20.xy);
+        r16.w = shadow_use_jitter
+                    ? shadow_jitter_angle_isfast
+                    : shadow_jitter_angle_static;
+        r21.z = 2;
+        r17.w = 0;
+        r18.w = 0;
+        while (true) {
+          r19.x = cmp((int)r18.w >= 16);
+          if (r19.x != 0) break;
+          r19.x = (int)r18.w;
+          float2 filter_offset = ISFASTShadowSampleOffset(
+              r19.x,
+              16.0,
+              r16.w,
+              0.25,
+              false);
+          r21.xy = filter_offset * r20.xy + r16.xy;
+          r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
+          r17.w = r19.x + r17.w;
+          r18.w = (int)r18.w + 1;
+        }
+        r8.w = 0.0625 * r17.w;
+      }
+      r16.x = cmp(r7.w < shadowSplitDistance_g.y);
+      if (r16.x != 0) {
+        r16.x = dot(r2.xyzw, shadowMtx_g[1]._m00_m10_m20_m30);
+        r16.y = dot(r2.xyzw, shadowMtx_g[1]._m01_m11_m21_m31);
+        r16.z = dot(r2.xyzw, shadowMtx_g[1]._m02_m12_m22_m32);
+        r16.w = dot(r2.xyzw, shadowMtx_g[1]._m03_m13_m23_m33);
+        r16.xyz = r16.xyz / r16.www;
+        r16.w = 30 / shadowSplitDistance_g.y;
+        r20.xy = float2(0.000500000024,0.000250000012) * r16.ww;
+        shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+        r20.zw = fDest.xy;
+        r20.zw = float2(1,1) / r20.zw;
+        r20.xy = max(r20.zw, r20.xy);
+        r16.w = shadow_use_jitter
+                    ? shadow_jitter_angle_isfast
+                    : shadow_jitter_angle_static;
+        r21.z = 1;
+        r17.w = 0;
+        r18.w = 0;
+        while (true) {
+          r19.x = cmp((int)r18.w >= 16);
+          if (r19.x != 0) break;
+          r19.x = (int)r18.w;
+          float2 filter_offset = ISFASTShadowSampleOffset(
+              r19.x,
+              16.0,
+              r16.w,
+              0.25,
+              false);
+          r21.xy = filter_offset * r20.xy + r16.xy;
+          r19.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
+          r17.w = r19.x + r17.w;
+          r18.w = (int)r18.w + 1;
+        }
+        r16.x = shadowSplitDistance_g.y + -r7.w;
+        r16.x = 0.200000003 * r16.x;
+        r16.y = r17.w * 0.0625 + -r8.w;
+        r8.w = r16.x * r16.y + r8.w;
+      }
+      r16.x = -shadowFadeNear_g + r7.w;
+      r16.x = saturate(shadowFadeRangeInv_g * r16.x);
+      r16.y = 1 + -r8.w;
+      r8.w = r16.x * r16.y + r8.w;
+    } else {
+      r16.x = cmp(r7.w < shadowSplitDistance_g.x);
+      uint shadow_split_idx = (r16.x != 0) ? 0u : 1u;
+      r20.z = shadow_split_idx * 4;
+      r20.w = shadow_split_idx;
+      r21.x = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m00_m10_m20_m30);
+      r21.y = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m01_m11_m21_m31);
+      r21.z = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m02_m12_m22_m32);
+      r16.y = dot(r2.xyzw, shadowMtx_g[shadow_split_idx]._m03_m13_m23_m33);
+      r16.yzw = r21.xyz / r16.yyy;
+      r17.w = 30 / shadowSplitDistance_g.x;
+      r21.xy = float2(0.000500000024,0.000250000012) * r17.ww;
+      shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+      r21.zw = fDest.xy;
+      r21.zw = float2(1,1) / r21.zw;
+      r21.zw = max(r21.zw, r21.xy);
+      r17.w = shadow_use_jitter
+                  ? shadow_jitter_angle_isfast
+                  : shadow_jitter_angle_static;
+      r18.w = 0;
+      r19.x = 0;
+      while (true) {
+        r20.z = cmp((int)r19.x >= 16);
+        if (r20.z != 0) break;
+        r20.z = (int)r19.x;
+        float2 filter_offset = ISFASTShadowSampleOffset(
+            r20.z,
+            16.0,
+            r17.w,
+            0.25,
+            false);
+        r20.xy = filter_offset * r21.zw + r16.yz;
+        r20.x = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r20.xyw, r16.w).x;
+        r18.w = r20.x + r18.w;
+        r19.x = (int)r19.x + 1;
+      }
+      r8.w = 0.0625 * r18.w;
+      r16.y = shadowSplitDistance_g.x + -5;
+      r16.y = cmp(r16.y < r7.w);
+      r16.x = r16.y ? r16.x : 0;
+      if (r16.x != 0) {
+        r16.x = dot(r2.xyzw, shadowMtx_g[1]._m00_m10_m20_m30);
+        r16.y = dot(r2.xyzw, shadowMtx_g[1]._m01_m11_m21_m31);
+        r16.z = dot(r2.xyzw, shadowMtx_g[1]._m02_m12_m22_m32);
+        r16.w = dot(r2.xyzw, shadowMtx_g[1]._m03_m13_m23_m33);
+        r16.xyz = r16.xyz / r16.www;
+        shadowMaps.GetDimensions(0, fDest.x, fDest.y, fDest.z, fDest.w);
+        r20.xy = fDest.xy;
+        r20.xy = float2(1,1) / r20.xy;
+        r20.xy = max(r20.xy, r21.xy);
+        r16.w = shadow_use_jitter
+                    ? shadow_jitter_angle_isfast
+                    : shadow_jitter_angle_static;
+        r21.z = 1;
+        r17.w = 0;
+        r19.x = 0;
+        while (true) {
+          r20.z = cmp((int)r19.x >= 16);
+          if (r20.z != 0) break;
+          r20.z = (int)r19.x;
+          float2 filter_offset = ISFASTShadowSampleOffset(
+              r20.z,
+              16.0,
+              r16.w,
+              0.25,
+              false);
+          r21.xy = filter_offset * r20.xy + r16.xy;
+          r20.z = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r21.xyz, r16.z).x;
+          r17.w = r20.z + r17.w;
+          r19.x = (int)r19.x + 1;
+        }
+        r16.x = 0.0625 * r17.w;
+        r7.w = shadowSplitDistance_g.x + -r7.w;
+        r7.w = 0.200000003 * r7.w;
+        r16.y = r18.w * 0.0625 + -r16.x;
+        r8.w = r7.w * r16.y + r16.x;
+      }
+    }
+  } else {
+    r8.w = 1;
+  }
+  r16.xyz = r17.xyz * r3.yyy + -lightDirection_g.xyz;
+  r7.w = dot(r16.xyz, r16.xyz);
+  r7.w = rsqrt(r7.w);
+  r16.xyz = r16.xyz * r7.www;
+  r7.w = lightSpecularGlossiness_g * r6.z;
+  r16.x = saturate(dot(r16.xyz, r5.xyw));
+  r7.w = max(0.00100000005, r7.w);
+  r16.x = log2(r16.x);
+  r7.w = r16.x * r7.w;
+  r7.w = exp2(r7.w);
+  r7.w = r7.w * r8.w;
+  r7.w = lightSpecularIntensity_g * r7.w;
+  r7.w = r19.y ? r7.w : 0;
+  r9.xyz = r7.www * r9.xyz;
+  r9.xyz = lightColor_g.xyz * r9.xyz;
+  if (r19.z != 0) {
+    r16.xy = r13.yz * r4.yz;
+    r4.y = (int)r1.x & 32;
+    if (r4.y != 0) {
+      r20.y = resolutionScaling_g.y + -v1.y;
+      r20.x = v1.x;
+      r20.xyz = texMirror_g.SampleLevel(SmplLinearClamp_s, r20.xy, 0).xyz;
+    } else {
+      r7.w = r7.z + r7.z;
+      r21.xyz = r5.xyw * -r7.www + r18.xyz;
+      float3 exp_probe_dir_ws = normalize(r21.xyz);
+      uint env_w, env_h, env_levels;
+      texEnvMap_g.GetDimensions(0, env_w, env_h, env_levels);
+      r7.w = env_levels;
+      float exp_env_mip = r16.y * max(r7.w - 1.0, 0.0);
+      r21.xyz = float3(1,-1,-1) * exp_probe_dir_ws;
+      r7.w = exp_env_mip;
+      r20.xyz = texEnvMap_g.SampleLevel(
+          SmplCube_s,
+          r21.xyz,
+          r7.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
+    }
+    r7.w = cmp(0 < r6.x);
+    r13.y = 1 + -abs(r7.z);
+    r13.y = max(0, r13.y);
+    r13.y = log2(r13.y);
+    r6.x = r13.y * r6.x;
+    r6.x = exp2(r6.x);
+    r6.x = r7.w ? r6.x : 1;
+    r7.w = r16.x * r6.x;
+    r21.xyz = r0.xyz * r20.xyz + -r0.xyz;
+    r21.xyz = r7.www * r21.xyz + r0.xyz;
+    r7.w = dot(r20.xyz, float3(0.298999995,0.587000012,0.114));
+    r13.y = r16.y * -9 + 10;
+    r7.w = log2(r7.w);
+    r7.w = r13.y * r7.w;
+    r7.w = exp2(r7.w);
+    r13.y = 1 + -r7.w;
+    r7.w = r16.x * r13.y + r7.w;
+    r16.xyz = r20.xyz * r7.www;
+    r16.xyz = r16.xyz * r6.xxx;
+    r6.x = -r4.z * r13.z + 1;
+    if (cubemap_improved_factor >= 0.5 && r4.y == 0) {
+      // Improved: skylight luminance modulation with roughness/AO shaping.
+      r13.y = max(0, dot(r20.xyz, float3(0.2126,0.7152,0.0722)));
+      r13.w = smoothstep(0.0, 0.25, r13.y);
+      r13.w = r13.w * lerp(0.5, 1.0, saturate(r13.z));
+      r13.w = r13.w * lerp(0.4, 1.0, saturate(r6.x));
+      r13.w = lerp(0.3, 1.0, r13.w);
+      r16.xyz = max(float3(0,0,0), r16.xyz * r13.www);
+    }
+    r16.xyz = r16.xyz * r6.xxx + r9.xyz;
+    r9.xyz = r4.y ? r9.xyz : r16.xyz;
+  } else {
+    r4.y = (int)r1.x & 8;
+    if (r4.y != 0) {
+      r4.y = r7.z + r7.z;
+      r16.xyz = r5.xyw * -r4.yyy + r18.xyz;
+      r4.y = 1 / r13.w;
+      r6.x = dot(-r18.xyz, r5.xyw);
+      r7.w = r4.y * r4.y;
+      r13.y = -r6.x * r6.x + 1;
+      r7.w = -r7.w * r13.y + 1;
+      r13.y = sqrt(r7.w);
+      r6.x = r4.y * r6.x + r13.y;
+      r7.w = cmp(r7.w >= 0);
+      r20.xyz = r6.xxx * r5.xyw;
+      r18.xyz = r4.yyy * -r18.xyz + -r20.xyz;
+      r18.xyz = r7.w ? r18.xyz : 0;
+      r4.y = r13.z * r4.z;
+      uint env_w2, env_h2, env_levels2;
+      texEnvMap_g.GetDimensions(0, env_w2, env_h2, env_levels2);
+      r6.x = env_levels2;
+      r16.xyz = float3(1,-1,-1) * r16.xyz;
+      r6.x = (int)r6.x + -1;
+      r6.x = (uint)r6.x;
+      r4.y = r6.x * r4.y;
+      r16.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r16.xyz, r4.y).xyz;
+      r18.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r18.xyz, r4.y).xyz;
+      r4.y = cmp(0 < r14.x);
+      r6.x = 1 + -abs(r7.z);
+      r6.x = max(0, r6.x);
+      r6.x = log2(r6.x);
+      r6.x = r14.x * r6.x;
+      r6.x = exp2(r6.x);
+      r4.y = r4.y ? r6.x : 1;
+      r20.xyz = r0.xyz * r16.xyz + -r0.xyz;
+      r20.xyz = r4.yyy * r20.xyz + r0.xyz;
+      r6.x = -r6.y * 0.00392156886 + 1;
+      r7.x = r4.y * r6.x + r7.x;
+      r6.x = abs(r7.z) * r14.y;
+      r6.x = log2(r6.x);
+      r6.x = r14.z * r6.x;
+      r6.x = exp2(r6.x);
+      r14.xyz = r7.xxx * r16.xyz;
+      r14.xyz = r14.xyz * r4.yyy;
+      r4.y = -r4.z * r13.z + 1;
+      r9.xyz = r14.xyz * r4.yyy + r9.xyz;
+      r13.yzw = r6.xxx * r18.xyz;
+      r21.xyz = r20.xyz * r13.yzw;
+    } else {
+      r21.xyz = r0.xyz;
+    }
+  }
+  r4.y = ssgiShadowRatio_g * r15.w;
+  r13.yzw = sceneShadowColor_g.xyz * r15.xyz + -sceneShadowColor_g.xyz;
+  r13.yzw = r4.yyy * r13.yzw + sceneShadowColor_g.xyz;
+  r8.xyz = r13.yzw + r8.xyz;
+  r8.xyz = min(float3(1,1,1), r8.xyz);
+  r13.yzw = r15.xyz + -r12.xyz;
+  r12.xyz = r15.www * r13.yzw + r12.xyz;
+  r13.yzw = float3(1,1,1) + -r8.xyz;
+  r11.xyz = r13.yzw * r11.xyz;
+  r8.xyz = r11.www * r11.xyz + r8.xyz;
+  r4.y = r7.x * r8.w;
+  r11.xyz = float3(1,1,1) + -r8.xyz;
+  r8.xyz = r4.yyy * r11.xyz + r8.xyz;
+  // ── Colored Shadow Penumbra (Kai — Improved mode only, no Falcom fallback) ──
+  if (shader_injection_data.shadow_edge_tint >= 1.0f) {
+    float penumbra = 1.0f - 2.0f * abs(r8.w - 0.5f);
+    penumbra = saturate(penumbra / shader_injection_data.shadow_penumbra_detection);
+
+    // Vibrancy from surface color (r0.xyz = colorTexture)
+    float3 surfaceColor = r0.xyz;
+    float luma = dot(surfaceColor, float3(0.333f, 0.333f, 0.333f));
+    float maxC = max(surfaceColor.x, max(surfaceColor.y, surfaceColor.z));
+    float vibrance = shader_injection_data.shadow_penumbra_vibrance;
+    float3 surfaceVibrancy;
+    if (vibrance <= 1.0f) {
+      surfaceVibrancy = luma + vibrance * (surfaceColor - luma);
+    } else {
+      float vibranceFactor = 1.0f + (vibrance - 1.0f) * (1.0f - maxC);
+      surfaceVibrancy = luma + vibranceFactor * (surfaceColor - luma);
+    }
+    surfaceVibrancy = saturate(surfaceVibrancy);
+
+    // Kai's lightColor_g is a subtle multiplier (near-zero values), not a bright sun color.
+    // Blending toward lightVibrancy would mix near-black, and the subsequent
+    // *lightColor_g below zeroes out any tint. Use surface vibrance only.
+    float3 tintColor = surfaceVibrancy;
+
+    // Apply brightness
+    tintColor *= shader_injection_data.shadow_penumbra_color_brightness;
+    tintColor = saturate(tintColor);
+
+    // Blend vibrancy color onto the shadow-applied r8.xyz
+    float strength = shader_injection_data.shadow_penumbra_color_strength * penumbra;
+    r8.xyz = lerp(r8.xyz, tintColor, strength);
+
+    // Debug views
+    static const float kDebugHdrScale = 0.05;
+    int debugMode = (int)shader_injection_data.shadow_penumbra_debug_view;
+    if (debugMode == 1) {
+      o0.rgb = float3(penumbra, penumbra, penumbra) * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r1.xyzw; return;
+    }
+    if (debugMode == 2) {
+      o0.rgb = tintColor * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r1.xyzw; return;
+    }
+    if (debugMode == 3) {
+      o0.rgb = r8.xyz * kDebugHdrScale;
+      o0.a = 1.0; o1.xyzw = r1.xyzw; return;
+    }
+    if (debugMode == 4) {
+      o0.rgb = lightColor_g.xyz * 10.0;  // boost for visibility (Kai's sun color is dim)
+      o0.a = 1.0; o1.xyzw = r1.xyzw; return;
+    }
+  }
+  r8.xyz = r8.xyz * lightColor_g.xyz + r12.xyz;
+  r4.y = min(1, r6.w);
+  r6.xyw = float3(1,1,1) + -r8.xyz;
+  r6.xyw = r4.yyy * r6.xyw + r8.xyz;
+  r4.y = 1 + -abs(r7.z);
+  r4.y = max(0, r4.y);
+  r4.y = r4.y * r10.w;
+  r4.y = log2(r4.y);
+  r4.y = r9.w * r4.y;
+  r4.y = exp2(r4.y);
+  r4.y = min(1, r4.y);
+  r7.xzw = r10.xyz * r4.yyy + r9.xyz;
+  if (r19.y != 0) {
+    r4.y = lightIndices_g[r5.z].pointLightCount;
+    r4.y = min(63, (uint)r4.y);
+    r8.xyz = float3(0,0,0);
+    r9.xyz = float3(0,0,0);
+    r4.z = 0;
+    while (true) {
+      r9.w = cmp((uint)r4.z >= (uint)r4.y);
+      if (r9.w != 0) break;
+      int lightIdx = lightIndices_g[r5.z].pointLightIndices[(int)r4.z];
+      r10.x = dynamicLights_g[lightIdx].pos.x;
+      r10.y = dynamicLights_g[lightIdx].pos.y;
+      r10.z = dynamicLights_g[lightIdx].pos.z;
+      r10.xyz = r10.xyz + -r2.xyz;
+      r10.w = dot(r10.xyz, r10.xyz);
+      r11.x = sqrt(r10.w);
+      r11.y = dynamicLights_g[lightIdx].radiusInv;
+      r11.x = r11.x * r11.y;
+      r11.y = dynamicLights_g[lightIdx].attenuation;
+      r11.x = log2(abs(r11.x));
+      r11.x = r11.y * r11.x;
+      r11.x = exp2(r11.x);
+      r11.x = 1 + -r11.x;
+      r11.x = max(0, r11.x);
+      r11.y = cmp(0 < r11.x);
+      if (r11.y != 0) {
+        r10.w = rsqrt(r10.w);
+        r10.xyz = r10.xyz * r10.www;
+        r10.w = dynamicLights_g[lightIdx].translucency;
+        r11.y = dot(r10.xyz, r5.xyw);
+        r10.w = max(r11.y, r10.w);
+        r10.w = r11.x * r10.w;
+        r11.x = dynamicLights_g[lightIdx].color.x;
+        r11.y = dynamicLights_g[lightIdx].color.y;
+        r11.z = dynamicLights_g[lightIdx].color.z;
+        r9.xyz = r11.xyz * r10.www + r9.xyz;
+        r10.xyz = r17.xyz * r3.yyy + r10.xyz;
+        r11.w = dot(r10.xyz, r10.xyz);
+        r11.w = rsqrt(r11.w);
+        r10.xyz = r11.www * r10.xyz;
+        r12.x = dynamicLights_g[lightIdx].specularIntensity;
+        r12.y = dynamicLights_g[lightIdx].specularGlossiness;
+        r9.w = r12.y * r6.z;
+        r10.x = saturate(dot(r10.xyz, r5.xyw));
+        r9.w = max(0.00100000005, r9.w);
+        r10.x = log2(r10.x);
+        r9.w = r10.x * r9.w;
+        r9.w = exp2(r9.w);
+        r10.xyz = r11.xyz * r9.www;
+        r10.xyz = r10.xyz * r10.www;
+        r8.xyz = r10.xyz * r12.xxx + r8.xyz;
+      }
+      r4.z = (int)r4.z + 1;
+    }
+    r9.xyz = r9.xyz * r12.www + r6.xyw;
+    r4.y = lightIndices_g[r5.z].spotLightCount;
+    r4.y = min(63, (uint)r4.y);
+    r10.xyz = r8.xyz;
+    r11.xyz = float3(0,0,0);
+    r4.z = 0;
+    while (true) {
+      r9.w = cmp((uint)r4.z >= (uint)r4.y);
+      if (r9.w != 0) break;
+      int lightIdx = lightIndices_g[r5.z].spotLightIndices[(int)r4.z];
+      r12.x = dynamicLights_g[lightIdx].pos.x;
+      r12.y = dynamicLights_g[lightIdx].pos.y;
+      r12.z = dynamicLights_g[lightIdx].pos.z;
+      r12.xyz = r12.xyz + -r2.xyz;
+      r10.w = dot(r12.xyz, r12.xyz);
+      r11.w = rsqrt(r10.w);
+      r12.xyz = r12.xyz * r11.www;
+      r16.x = dynamicLights_g[lightIdx].vec.x;
+      r16.y = dynamicLights_g[lightIdx].vec.y;
+      r16.z = dynamicLights_g[lightIdx].vec.z;
+      r16.w = dynamicLights_g[lightIdx].spotAngleInv;
+      r11.w = dot(r12.xyz, r16.xyz);
+      r11.w = max(0, r11.w);
+      r11.w = 1 + -r11.w;
+      r11.w = r11.w * r16.w;
+      r13.y = dynamicLights_g[lightIdx].attenuationAngle;
+      r11.w = log2(r11.w);
+      r11.w = r13.y * r11.w;
+      r11.w = exp2(r11.w);
+      r11.w = 1 + -r11.w;
+      r11.w = max(0, r11.w);
+      r13.y = cmp(0 < r11.w);
+      if (r13.y != 0) {
+        r10.w = sqrt(r10.w);
+        r13.y = dynamicLights_g[lightIdx].radiusInv;
+        r10.w = r13.y * r10.w;
+        r13.y = dynamicLights_g[lightIdx].attenuation;
+        r10.w = log2(abs(r10.w));
+        r10.w = r13.y * r10.w;
+        r10.w = exp2(r10.w);
+        r10.w = 1 + -r10.w;
+        r10.w = max(0, r10.w);
+        r10.w = r11.w * r10.w;
+        r11.w = cmp(0 < r10.w);
+        if (r11.w != 0) {
+          r13.y = dynamicLights_g[lightIdx].translucency;
+          r13.z = dynamicLights_g[lightIdx].shadowmapIndex;
+          r11.w = cmp((int)r13.z != -1);
+          if (r11.w != 0) {
+            r16.xyzw = spotShadowMatrices_g[r13.z]._m00_m10_m20_m30;
+            r18.xyzw = spotShadowMatrices_g[r13.z]._m01_m11_m21_m31;
+            r20.xyzw = spotShadowMatrices_g[r13.z]._m02_m12_m22_m32;
+            r22.xyzw = spotShadowMatrices_g[r13.z]._m03_m13_m23_m33;
+            r14.x = dot(r2.xyzw, r16.xyzw);
+            r14.y = dot(r2.xyzw, r18.xyzw);
+            r14.z = dot(r2.xyzw, r20.xyzw);
+            r11.w = dot(r2.xyzw, r22.xyzw);
+            r16.xyz = r14.xyz / r11.www;
+            r16.w = (uint)r13.z;
+            r11.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r16.xyw, r16.z).x;
+            r14.xyz = float3(0.00244140625,0,0) + r16.xyw;
+            r13.z = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r14.xyz, r16.z).x;
+            r13.z = 0.200000003 * r13.z;
+            r11.w = r11.w * 0.200000003 + r13.z;
+            r14.xyz = float3(-0.00244140625,0,0) + r16.xyw;
+            r13.z = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r14.xyz, r16.z).x;
+            r11.w = r13.z * 0.200000003 + r11.w;
+            r14.xyz = float3(0,0.00244140625,0) + r16.xyw;
+            r13.z = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r14.xyz, r16.z).x;
+            r11.w = r13.z * 0.200000003 + r11.w;
+            r14.xyz = float3(0,-0.00244140625,0) + r16.xyw;
+            r13.z = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r14.xyz, r16.z).x;
+            r11.w = r13.z * 0.200000003 + r11.w;
+            r10.w = r11.w * r10.w;
+          }
+          r11.w = dot(r12.xyz, r5.xyw);
+          r11.w = max(r13.y, r11.w);
+          r10.w = r11.w * r10.w;
+          r13.y = dynamicLights_g[lightIdx].color.x;
+          r13.z = dynamicLights_g[lightIdx].color.y;
+          r13.w = dynamicLights_g[lightIdx].color.z;
+          r11.xyz = r13.yzw * r10.www + r11.xyz;
+          r12.xyz = r17.xyz * r3.yyy + r12.xyz;
+          r11.w = dot(r12.xyz, r12.xyz);
+          r11.w = rsqrt(r11.w);
+          r12.xyz = r12.xyz * r11.www;
+          r14.x = dynamicLights_g[lightIdx].specularIntensity;
+          r14.y = dynamicLights_g[lightIdx].specularGlossiness;
+          r9.w = r14.y * r6.z;
+          r11.w = saturate(dot(r12.xyz, r5.xyw));
+          r9.w = max(0.00100000005, r9.w);
+          r11.w = log2(r11.w);
+          r9.w = r11.w * r9.w;
+          r9.w = exp2(r9.w);
+          r12.xyz = r13.yzw * r9.www;
+          r12.xyz = r12.xyz * r10.www;
+          r10.xyz = r12.xyz * r14.xxx + r10.xyz;
+        }
+      }
+      r4.z = (int)r4.z + 1;
+    }
+    r8.xyz = r11.xyz * r12.www + r9.xyz;
+    r7.xzw = r10.xyz * r12.www + r7.xzw;
+  } else {
+    r3.y = lightIndices_g[r5.z].pointLightCount;
+    r3.y = min(63, (uint)r3.y);
+    r9.xyzw = float4(0,0,0,0);
+    while (true) {
+      r4.y = cmp((uint)r9.w >= (uint)r3.y);
+      if (r4.y != 0) break;
+      int lightIdx = lightIndices_g[r5.z].pointLightIndices[(int)r9.w];
+      r10.x = dynamicLights_g[lightIdx].pos.x;
+      r10.y = dynamicLights_g[lightIdx].pos.y;
+      r10.z = dynamicLights_g[lightIdx].pos.z;
+      r10.xyz = r10.xyz + -r2.xyz;
+      r4.z = dot(r10.xyz, r10.xyz);
+      r6.z = sqrt(r4.z);
+      r10.w = dynamicLights_g[lightIdx].radiusInv;
+      r6.z = r10.w * r6.z;
+      r10.w = dynamicLights_g[lightIdx].attenuation;
+      r6.z = log2(abs(r6.z));
+      r6.z = r10.w * r6.z;
+      r6.z = exp2(r6.z);
+      r6.z = 1 + -r6.z;
+      r6.z = max(0, r6.z);
+      r10.w = cmp(0 < r6.z);
+      if (r10.w != 0) {
+        r10.w = dynamicLights_g[lightIdx].translucency;
+        r4.z = rsqrt(r4.z);
+        r10.xyz = r10.xyz * r4.zzz;
+        r4.z = dot(r10.xyz, r5.xyw);
+        r4.z = max(r10.w, r4.z);
+        r10.x = dynamicLights_g[lightIdx].color.x;
+        r10.y = dynamicLights_g[lightIdx].color.y;
+        r10.z = dynamicLights_g[lightIdx].color.z;
+        r10.xyz = r10.xyz * r6.zzz;
+        r9.xyz = r10.xyz * r4.zzz + r9.xyz;
+      }
+      r9.w = (int)r9.w + 1;
+    }
+    r6.xyz = r9.xyz * r12.www + r6.xyw;
+    r3.y = lightIndices_g[r5.z].spotLightCount;
+    r3.y = min(63, (uint)r3.y);
+    r9.xyzw = float4(0,0,0,0);
+    while (true) {
+      r4.y = cmp((uint)r9.w >= (uint)r3.y);
+      if (r4.y != 0) break;
+      int lightIdx = lightIndices_g[r5.z].spotLightIndices[(int)r9.w];
+      r10.x = dynamicLights_g[lightIdx].pos.x;
+      r10.y = dynamicLights_g[lightIdx].pos.y;
+      r10.z = dynamicLights_g[lightIdx].pos.z;
+      r10.xyz = r10.xyz + -r2.xyz;
+      r4.z = dot(r10.xyz, r10.xyz);
+      r6.w = rsqrt(r4.z);
+      r10.xyz = r10.xyz * r6.www;
+      r11.x = dynamicLights_g[lightIdx].vec.x;
+      r11.y = dynamicLights_g[lightIdx].vec.y;
+      r11.z = dynamicLights_g[lightIdx].vec.z;
+      r11.w = dynamicLights_g[lightIdx].spotAngleInv;
+      r6.w = dot(r10.xyz, r11.xyz);
+      r6.w = max(0, r6.w);
+      r6.w = 1 + -r6.w;
+      r6.w = r6.w * r11.w;
+      r10.w = dynamicLights_g[lightIdx].attenuationAngle;
+      r6.w = log2(r6.w);
+      r6.w = r10.w * r6.w;
+      r6.w = exp2(r6.w);
+      r6.w = 1 + -r6.w;
+      r6.w = max(0, r6.w);
+      r10.w = cmp(0 < r6.w);
+      if (r10.w != 0) {
+        r4.z = sqrt(r4.z);
+        r10.w = dynamicLights_g[lightIdx].radiusInv;
+        r4.z = r10.w * r4.z;
+        r10.w = dynamicLights_g[lightIdx].attenuation;
+        r4.z = log2(abs(r4.z));
+        r4.z = r10.w * r4.z;
+        r4.z = exp2(r4.z);
+        r4.z = 1 + -r4.z;
+        r4.z = max(0, r4.z);
+        r4.z = r6.w * r4.z;
+        r6.w = cmp(0 < r4.z);
+        if (r6.w != 0) {
+          r11.x = dynamicLights_g[lightIdx].translucency;
+          r11.y = dynamicLights_g[lightIdx].shadowmapIndex;
+          r6.w = cmp((int)r11.y != -1);
+          if (r6.w != 0) {
+            r16.xyzw = spotShadowMatrices_g[r11.y]._m00_m10_m20_m30;
+            r17.xyzw = spotShadowMatrices_g[r11.y]._m01_m11_m21_m31;
+            r18.xyzw = spotShadowMatrices_g[r11.y]._m02_m12_m22_m32;
+            r20.xyzw = spotShadowMatrices_g[r11.y]._m03_m13_m23_m33;
+            r12.x = dot(r2.xyzw, r16.xyzw);
+            r12.y = dot(r2.xyzw, r17.xyzw);
+            r12.z = dot(r2.xyzw, r18.xyzw);
+            r6.w = dot(r2.xyzw, r20.xyzw);
+            r16.xyz = r12.xyz / r6.www;
+            r16.w = (uint)r11.y;
+            r6.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r16.xyw, r16.z).x;
+            r11.yzw = float3(0.00244140625,0,0) + r16.xyw;
+            r10.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r11.yzw, r16.z).x;
+            r10.w = 0.200000003 * r10.w;
+            r6.w = r6.w * 0.200000003 + r10.w;
+            r11.yzw = float3(-0.00244140625,0,0) + r16.xyw;
+            r10.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r11.yzw, r16.z).x;
+            r6.w = r10.w * 0.200000003 + r6.w;
+            r11.yzw = float3(0,0.00244140625,0) + r16.xyw;
+            r10.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r11.yzw, r16.z).x;
+            r6.w = r10.w * 0.200000003 + r6.w;
+            r11.yzw = float3(0,-0.00244140625,0) + r16.xyw;
+            r10.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r11.yzw, r16.z).x;
+            r6.w = r10.w * 0.200000003 + r6.w;
+            r4.z = r6.w * r4.z;
+          }
+          r6.w = dot(r10.xyz, r5.xyw);
+          r6.w = max(r11.x, r6.w);
+          r10.x = dynamicLights_g[lightIdx].color.x;
+          r10.y = dynamicLights_g[lightIdx].color.y;
+          r10.z = dynamicLights_g[lightIdx].color.z;
+          r10.xyz = r10.xyz * r4.zzz;
+          r9.xyz = r10.xyz * r6.www + r9.xyz;
+        }
+      }
+      r9.w = (int)r9.w + 1;
+    }
+    r8.xyz = r9.xyz * r12.www + r6.xyz;
+  }
+  r5.xyz = r7.xzw * r7.yyy;
+  r5.xyz = r21.xyz * r8.xyz + r5.xyz;
+  r3.y = cmp(0 < r1.y);
+  r0.x = dot(r0.xyz, float3(0.298999995,0.587000012,0.114));
+  r0.x = r0.x + -r1.y;
+  r0.x = max(0, r0.x);
+  r0.x = r0.x / r1.y;
+  r0.x = min(1, r0.x);
+  r0.x = r3.y ? r0.x : 1;
+  r0.y = r14.w * r3.z;
+  r0.x = r0.y * r0.x;
+  r0.y = -1 + r8.w;
+  r0.y = r1.z * r0.y + 1;
+  r0.x = r0.x * r0.y;
+  r6.xyz = min(float3(1,1,1), r15.xyz);
+  r6.xyz = -mapAOColor_g.xyz + r6.xyz;
+  r6.xyz = r15.www * r6.xyz + mapAOColor_g.xyz;
+  r0.y = 1 + -r4.x;
+  r4.xyz = r5.xyz * r6.xyz + -r5.xyz;
+  r4.xyz = r0.yyy * r4.xyz + r5.xyz;
+  // --- RenoDx SSS Shadow ---
+  if (is_foliage_pixel && foliage_saved_shadow < 0.999) {
+    float sss_shadow = foliage_saved_shadow;
+    // Brightness rejection: reduce shadow on bright pixels (lamps, emissives)
+    float bright_reject_thresh = shader_injection_data.env_sss_bright_reject_threshold;
+    float bright_reject_fade = max(shader_injection_data.env_sss_bright_reject_fade, 1e-5);
+    float pixel_luma = dot(r4.xyz, float3(0.2126, 0.7152, 0.0722));
+    float bright_mask = smoothstep(bright_reject_thresh, bright_reject_thresh + bright_reject_fade, pixel_luma);
+    sss_shadow = lerp(sss_shadow, 1.0, bright_mask);
+    r4.xyz *= sss_shadow;
+  }
+  // --- End RenoDx SSS Shadow ---
+  r0.y = -fogNearDistance_g + -r4.w;
+  r0.y = saturate(fogFadeRangeInv_g * r0.y);
+  r0.z = -fogHeight_g + r2.y;
+  r0.z = saturate(fogHeightRangeInv_g * r0.z);
+  r0.y = r0.y * r0.z;
+  r0.z = fogIntensity_g * r0.y;
+  r0.w = (int)r0.w & 16;
+  r1.y = -r3.x * 0.00392156886 + 1;
+  r0.w = r0.w ? r1.y : 1;
+  r0.z = r0.z * r13.x;
+  r0.z = r0.z * r0.w;
+  r3.xyz = fogColor_g.xyz + -r4.xyz;
+  r3.xyz = r0.zzz * r3.xyz + r4.xyz;
+  if (exp_fog_color_correction_enabled) {
+    float3 exp_fog_fade = r0.zzz * (fogColor_g.xyz - r4.xyz);
+    float exp_fog_hdr_norm = max(max(r4.x, max(r4.y, r4.z)), 1.0);
+    r3.xyz = renodx::rendering::FogColorCorrection(
+        r4.xyz / exp_fog_hdr_norm,
+        exp_fog_fade / exp_fog_hdr_norm,
+        exp_fog_hue,
+        exp_fog_chrominance,
+        exp_fog_avg_brightness,
+        exp_fog_min_brightness,
+          exp_fog_min_chroma_change,
+          exp_fog_max_chroma_change,
+          exp_fog_lightness_strength,
+        exp_fog_color_correction_strength) * exp_fog_hdr_norm;
+  }
+  r0.z = (int)r1.x & 64;
+  r0.z = cmp((int)r0.z == 0);
+  r0.w = cmp(0 != isEnableSky_g);
+  r0.z = r0.w ? r0.z : 0;
+  if (r0.z != 0) {
+    r0.z = -r4.w / skyLutCameraFarClip_g;
+    r1.xy = invVPSize_g.xy * v0.xy;
+    r0.z = -skyLutNearOverFarClip_g + r0.z;
+    r0.w = -skyLutNearOverFarClip_g + 1;
+    r1.z = r0.z / r0.w;
+    r4.xyz = atmosphereInscatterLUT.SampleLevel(samLinear_s, r1.xyz, 0).xyz;
+    r1.xyz = atmosphereExtinctionLUT.SampleLevel(samLinear_s, r1.xyz, 0).xyz;
+    r3.xyz = r3.xyz * r1.xyz + r4.xyz;
+  }
+  if (outlineShapeCount_g != 0) {
+    r0.zw = -outlineShapeMaskUVParam_g.xy + r2.xz;
+    r0.zw = outlineShapeMaskUVParam_g.zw * r0.zw;
+    r1.xy = cmp(r0.zw >= float2(0,0));
+    r1.x = r1.y ? r1.x : 0;
+    r1.yz = cmp(float2(1,1) >= r0.zw);
+    r1.y = r1.z ? r1.y : 0;
+    r1.x = r1.y ? r1.x : 0;
+    if (r1.x != 0) {
+      r0.z = outlineShapeMask.SampleLevel(samLinear_s, r0.zw, 0).x;
+    } else {
+      r0.z = 1;
+    }
+    r2.w = 1;
+    r1.xyz = r3.xyz;
+    r0.w = 0;
+    while (true) {
+      r4.x = cmp((uint)r0.w >= outlineShapeCount_g);
+      if (r4.x != 0) break;
+      r4.x = outlineShapes_g[r0.w].radius;
+      r4.y = outlineShapes_g[r0.w].height_base;
+      r4.z = outlineShapes_g[r0.w].height_width;
+      r4.w = outlineShapes_g[r0.w].height_gradation_width;
+      r4.y = -r4.y + r2.y;
+      r5.x = cmp(r4.z >= abs(r4.y));
+      if (r5.x != 0) {
+        r5.x = outlineShapes_g[r0.w].mtx._m00;
+        r5.y = outlineShapes_g[r0.w].mtx._m10;
+        r5.z = outlineShapes_g[r0.w].mtx._m20;
+        r5.w = outlineShapes_g[r0.w].mtx._m30;
+        r6.x = outlineShapes_g[r0.w].mtx._m02;
+        r6.y = outlineShapes_g[r0.w].mtx._m32;
+        r6.z = outlineShapes_g[r0.w].mtx._m12;
+        r6.w = outlineShapes_g[r0.w].mtx._m22;
+        r7.x = outlineShapes_g[r0.w].color.x;
+        r7.y = outlineShapes_g[r0.w].color.y;
+        r7.z = outlineShapes_g[r0.w].color.z;
+        r7.w = outlineShapes_g[r0.w].color.w;
+        r8.x = outlineShapes_g[r0.w].gradation_size.x;
+        r8.y = outlineShapes_g[r0.w].gradation_size.y;
+        r8.z = outlineShapes_g[r0.w].gradation_sharpness;
+        r8.w = outlineShapes_g[r0.w].type;
+        r9.x = abs(r4.y) + r4.w;
+        r9.x = cmp(r4.z < r9.x);
+        r4.y = r4.z + -abs(r4.y);
+        r4.y = r4.y / r4.w;
+        r4.y = r9.x ? r4.y : 1;
+        if (r8.w == 0) {
+          r6.x = r5.w;
+          r4.zw = -r6.xy + r2.xz;
+          r4.z = dot(r4.zw, r4.zw);
+          r4.z = sqrt(r4.z);
+          r4.w = cmp(r4.x < r4.z);
+          r9.x = -r8.x + r4.x;
+          r9.y = cmp(r4.z >= r9.x);
+          r9.z = ~(int)r9.y;
+          r4.z = -r9.x + r4.z;
+          r4.z = r4.z / r8.x;
+          r4.z = r9.y ? r4.z : 0;
+          r4.z = r4.w ? 0 : r4.z;
+          r4.w = (int)r4.w | (int)r9.z;
+        } else {
+          r9.x = cmp((int)r8.w == 1);
+          if (r9.x != 0) {
+            r9.x = outlineShapes_g[r0.w].fan_angle;
+            r6.xz = r5.wz;
+            r9.yz = -r6.xy + r2.xz;
+            r9.w = dot(r9.yz, r9.yz);
+            r10.x = sqrt(r9.w);
+            r10.y = cmp(r4.x < r10.x);
+            r4.x = -r8.x + r4.x;
+            r9.w = rsqrt(r9.w);
+            r9.yz = r9.yz * r9.ww;
+            r9.y = dot(r6.zw, r9.yz);
+            r9.z = 1 + -abs(r9.y);
+            r9.z = sqrt(r9.z);
+            r9.w = abs(r9.y) * -0.0187292993 + 0.0742610022;
+            r9.w = r9.w * abs(r9.y) + -0.212114394;
+            r9.w = r9.w * abs(r9.y) + 1.57072878;
+            r10.z = r9.w * r9.z;
+            r10.z = r10.z * -2 + 3.14159274;
+            r9.y = cmp(r9.y < -r9.y);
+            r9.y = r9.y ? r10.z : 0;
+            r9.y = r9.w * r9.z + r9.y;
+            r9.z = cmp(r9.x >= r9.y);
+            r9.w = ~(int)r9.z;
+            r10.z = 6.28318548 * r10.x;
+            r9.xy = r10.zz * r9.xy;
+            r9.y = 0.159154937 * r9.y;
+            r9.x = r9.x * 0.159154937 + -r9.y;
+            r9.x = r9.x / r8.x;
+            r9.x = min(1, r9.x);
+            r9.x = 1 + -r9.x;
+            r4.x = r10.x + -r4.x;
+            r4.x = r4.x / r8.x;
+            r4.x = min(1, r4.x);
+            r4.x = max(r9.x, r4.x);
+            r4.x = r9.z ? r4.x : 0;
+            r4.z = r10.y ? 0 : r4.x;
+            r4.w = (int)r10.y | (int)r9.w;
+          } else {
+            r4.x = cmp((int)r8.w == 2);
+            r5.x = dot(r2.xyzw, r5.xyzw);
+            r5.y = dot(r2.xwyz, r6.xyzw);
+            r5.zw = cmp(r5.xy < float2(0.5,0.5));
+            r5.z = r5.w ? r5.z : 0;
+            r6.xy = cmp(float2(-0.5,-0.5) < r5.xy);
+            r5.w = r6.y ? r6.x : 0;
+            r5.z = r5.w ? r5.z : 0;
+            r6.xy = float2(0.5,0.5) + -r8.xy;
+            r6.zw = cmp(abs(r5.xy) < r6.xy);
+            r5.w = r6.w ? r6.z : 0;
+            r5.xy = -r6.xy + abs(r5.xy);
+            r5.xy = r5.xy / r8.xy;
+            r5.x = max(r5.x, r5.y);
+            r5.x = r5.w ? 0 : r5.x;
+            r5.x = r5.z ? r5.x : 0;
+            r5.y = r5.z ? r5.w : -1;
+            r4.zw = r4.x ? r5.xy : 0;
+          }
+        }
+        r4.x = log2(r4.z);
+        r4.x = r8.z * r4.x;
+        r4.x = exp2(r4.x);
+        r4.x = r4.x * r7.w;
+        r4.x = r4.x * r0.z;
+        r7.w = r4.x * r4.y;
+        r4.xyzw = r4.w ? float4(0,0,0,0) : r7.xyzw;
+      } else {
+        r4.xyzw = float4(0,0,0,0);
+      }
+      r4.xyz = r4.xyz + -r1.xyz;
+      r1.xyz = r4.www * r4.xyz + r1.xyz;
+      r0.w = (int)r0.w + 1;
+    }
+    r3.xyz = r1.xyz;
+  }
+  r0.y = -r0.y * fogIntensity_g + 1;
+  r0.y = r1.w * r0.y;
+  r0.z = 65.5350037 * r3.w;
+  r0.z = (uint)r0.z;
+  o1.x = min(0x0000ffff, (uint)r0.z);
+  r0.y = 255 * r0.y;
+  r0.y = (uint)r0.y;
+  r0.y = min(255, (uint)r0.y);
+  o1.y = mad((int)r0.y, 256, (int)r0.y);
+  r0.x = saturate(0.100000001 * r0.x);
+  r0.x = 255 * r0.x;
+  r0.x = (uint)r0.x;
+  o1.w = r19.w ? r0.x : 0;
+
+  // --- In-Shader Character SSGI Composite ---
+  if (shader_injection_data.char_gi_enabled >= 0.5) {
+    static const float3 CHARGI_LUMA = float3(0.299, 0.587, 0.114);
+    float chargi_char_mask = chargi_is_character ? 1.0 : 0.0;
+
+    // Sanitize saved SSGI
+    uint4 cg_bits = asuint(chargi_ssgi_saved);
+    bool4 cg_nan = ((cg_bits & 0x7F800000u) == 0x7F800000u) & ((cg_bits & 0x007FFFFFu) != 0u);
+    bool4 cg_inf = ((cg_bits & 0x7FFFFFFFu) == 0x7F800000u);
+    if (any(cg_nan) || any(cg_inf)) chargi_ssgi_saved = float4(0, 0, 0, 0);
+
+    float cg_ao_influence = saturate(shader_injection_data.char_gi_ao_influence);
+    float cg_ao_factor = lerp(1.0, chargi_ao_raw, cg_ao_influence);
+    float cg_reject_strength = max(shader_injection_data.char_gi_reject_strength, 0.0);
+    float cg_reject_factor = pow(saturate(cg_ao_factor), cg_reject_strength);
+
+    float cg_source_luma = dot(r3.xyz, CHARGI_LUMA);
+    float cg_shadow_power = max(shader_injection_data.char_gi_shadow_power, 0.1);
+    float cg_shadow_raw = pow(saturate(1.0 - cg_source_luma), cg_shadow_power);
+    float cg_bright_boost = max(shader_injection_data.char_gi_bright_boost, 0.0);
+    float cg_bright_boost_scale = max(cg_bright_boost - 1.0, 0.0);
+    float cg_bright_mask = saturate(1.0 - cg_shadow_raw);
+    float cg_shadow_mask = saturate(cg_shadow_raw + cg_bright_mask * cg_bright_boost_scale);
+    float cg_dark_boost = max(shader_injection_data.char_gi_dark_boost, 0.0);
+    float cg_dark_factor = lerp(1.0, cg_dark_boost, cg_shadow_raw);
+
+    float3 cg_gi_color = max(chargi_ssgi_saved.rgb, 0.0);
+    float cg_gi_luma = dot(cg_gi_color, CHARGI_LUMA);
+    float3 cg_gi_chroma = cg_gi_color - cg_gi_luma.xxx;
+    float cg_chroma_strength = max(shader_injection_data.char_gi_chroma_strength, 0.0);
+    float cg_luma_strength = max(shader_injection_data.char_gi_luma_strength, 0.0);
+    float3 cg_gi_filtered = cg_gi_chroma * cg_chroma_strength + (cg_gi_luma * cg_luma_strength).xxx;
+
+    float cg_alpha_scale = max(shader_injection_data.char_gi_alpha_scale, 0.0);
+    float cg_gi_weight = saturate(chargi_ssgi_saved.a * cg_alpha_scale) * cg_shadow_mask * cg_dark_factor;
+    cg_gi_weight *= cg_reject_factor;
+
+    float cg_headroom_power = max(shader_injection_data.char_gi_headroom_power, 0.1);
+    float3 cg_headroom = pow(saturate(1.0 - r3.xyz), cg_headroom_power);
+    float cg_bright_headroom_floor = saturate(cg_bright_boost_scale * 0.35);
+    float3 cg_headroom_adjusted = max(cg_headroom, cg_bright_headroom_floor.xxx);
+
+    float cg_strength = max(shader_injection_data.char_gi_strength, 0.0);
+    float cg_max_add = max(shader_injection_data.char_gi_max_add, 0.0);
+    float cg_max_add_boost = 1.0 + cg_bright_boost_scale * cg_bright_mask;
+    float3 cg_final_gain = cg_gi_weight * cg_strength * cg_headroom_adjusted;
+    float3 cg_gi_contrib = cg_gi_filtered * cg_final_gain;
+    float cg_cap_scale = sqrt(max(cg_reject_factor, 0.0));
+    float cg_gi_cap = cg_max_add * cg_max_add_boost * cg_cap_scale;
+    cg_gi_contrib = min(cg_gi_contrib, cg_gi_cap.xxx);
+    float cg_peak_luma_cap = max(shader_injection_data.char_gi_peak_luma_cap, 0.0);
+    if (cg_peak_luma_cap > 0.0) {
+      float cg_contrib_luma = dot(max(cg_gi_contrib, 0.0), CHARGI_LUMA);
+      float cg_luma_scale = min(1.0, cg_peak_luma_cap / max(cg_contrib_luma, 1e-6));
+      cg_gi_contrib *= cg_luma_scale;
+    }
+    cg_gi_contrib *= chargi_char_mask;
+    r3.xyz = r3.xyz + cg_gi_contrib;
+
+    uint cg_debug_mode = (uint)(max(shader_injection_data.char_gi_debug_mode, 0.0) + 0.5);
+    if (cg_debug_mode != 0u) {
+      float cg_debug_scale = max(shader_injection_data.char_gi_debug_scale, 0.001);
+      bool cg_debug_chars_only = shader_injection_data.char_gi_debug_chars_only >= 0.5;
+      float3 cg_debug_color = r3.xyz;
+
+      if (cg_debug_mode == 1u) {
+        cg_debug_color = (chargi_char_mask > 0.5) ? float3(1.0, 0.2, 0.2) : float3(0.1, 0.1, 0.1);
+      } else if (cg_debug_mode == 2u) {
+        cg_debug_color = cg_gi_color * cg_debug_scale;
+      } else if (cg_debug_mode == 3u) {
+        cg_debug_color = chargi_ssgi_saved.aaa * cg_debug_scale;
+      } else if (cg_debug_mode == 4u) {
+        cg_debug_color = cg_gi_filtered * cg_debug_scale;
+      } else if (cg_debug_mode == 5u) {
+        cg_debug_color = cg_gi_weight.xxx * cg_debug_scale;
+      } else if (cg_debug_mode == 6u) {
+        cg_debug_color = abs(cg_gi_contrib) * cg_debug_scale;
+      } else if (cg_debug_mode == 7u) {
+        cg_debug_color = r3.xyz;
+      } else if (cg_debug_mode == 8u) {
+        float cg_cl = dot(abs(cg_gi_contrib), CHARGI_LUMA) * cg_debug_scale;
+        cg_debug_color = cg_cl.xxx;
+      } else if (cg_debug_mode == 9u) {
+        cg_debug_color = cg_headroom_adjusted * cg_debug_scale;
+      } else if (cg_debug_mode == 10u) {
+        float cg_gl = dot(cg_final_gain, CHARGI_LUMA) * cg_debug_scale;
+        cg_debug_color = cg_gl.xxx;
+      } else if (cg_debug_mode == 11u) {
+        cg_debug_color = cg_shadow_mask.xxx * cg_debug_scale;
+      } else if (cg_debug_mode == 12u) {
+        cg_debug_color = float3(0, 0, 0);
+      } else if (cg_debug_mode == 13u) {
+        cg_debug_color = float3(0, 0, 0);
+      } else if (cg_debug_mode == 14u) {
+        cg_debug_color = cg_ao_factor.xxx * cg_debug_scale;
+      } else if (cg_debug_mode == 15u) {
+        cg_debug_color = cg_reject_factor.xxx * cg_debug_scale;
+      }
+
+      if (cg_debug_chars_only && chargi_char_mask < 0.5) {
+        cg_debug_color = float3(0, 0, 0);
+      }
+
+      r3.xyz = saturate(cg_debug_color);
+    }
+  }
+  // --- End In-Shader Character SSGI Composite ---
+
+  // --- Foliage Debug Visualization ---
+  int foliage_dbg = (int)shader_injection_data.foliage_debug_mode;
+  if (foliage_dbg == 1) {
+    r3.xyz = is_foliage_pixel ? float3(0, 1, 0) : r3.xyz * 0.3;
+  } else if (foliage_dbg == 2) {
+    r3.xyz = is_foliage_pixel ? foliage_saved_shadow.xxx : r3.xyz * 0.3;
+  } else if (foliage_dbg == 3) {
+    r3.xyz = is_foliage_pixel ? foliage_debug_ssao : r3.xyz * 0.3;
+  } else if (foliage_dbg == 4) {
+    float mrt_val = foliage_debug_mrt0z / 4096.0;
+    bool raw_bit9 = (((uint)foliage_debug_mrt0z >> 9u) & 1u) != 0u;
+    r3.xyz = raw_bit9 ? float3(0, mrt_val, 0) : float3(mrt_val, 0, 0);
+  } else if (foliage_dbg == 5) {
+    bool raw_bit9 = (((uint)foliage_debug_mrt0z >> 9u) & 1u) != 0u;
+    r3.xyz = raw_bit9 ? float3(1, 1, 1) : float3(0, 0, 0);
+  } else if (foliage_dbg == 6) {
+    uint raw_z = (uint)foliage_debug_mrt0z;
+    if (raw_z == 2815u || raw_z == 3839u) {
+      r3.xyz = float3(0, 0, 1);
+    } else if (raw_z == 2303u) {
+      r3.xyz = float3(0, 1, 0);
+    } else if (raw_z == 3327u) {
+      r3.xyz = float3(0, 1, 1);
+    } else {
+      r3.xyz = float3(raw_z / 4096.0, 0, 0);
+    }
+  } else if (foliage_dbg == 7) {
+    uint raw_z = (uint)foliage_debug_mrt0z;
+    r3.xyz = float3((raw_z & 0xFFu) / 255.0, ((raw_z >> 8u) & 0xFFu) / 255.0, ((raw_z >> 16u) & 0xFFu) / 255.0);
+  }
+  // --- End Foliage Debug ---
+  // Add XeGTAO GI directly to final scene (bypasses game's SSGI formula)
+  r3.xyz = r3.xyz + r24.xyz;
+  // ── SSGI Debug Views: replace scene with debug texture ──
+  if (shader_injection_data.ssgi_debug_view > 0.5) {
+    int dbgMode = (int)shader_injection_data.ssgi_debug_view;
+    if (dbgMode == 7) {
+      o0.xyz = r15.xyz;  // Final GI (combined Falcom + XeGTAO with all processing)
+    } else {
+      o0.xyz = xegtaoSSGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
+    }
+    o0.w = 1;
+    o1.z = r0.y;
+    return;
+  }
+  o0.xyz = r3.xyz;
+  o0.w = 1;
+  o1.z = r0.y;
+  return;
+}

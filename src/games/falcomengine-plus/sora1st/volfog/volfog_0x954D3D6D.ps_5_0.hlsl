@@ -86,31 +86,6 @@ Texture3D<float2> g_isfastNoiseTexture : register(t3);
 // 3Dmigoto declarations
 #define cmp -
 
-// ── Interleaved Gradient Noise (IGN) — IS-FAST fallback ──
-static float IGN(float2 p) {
-  return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
-}
-
-// ── Spatio-Temporal Blue Noise (IS-FAST) with IGN fallback ──
-static float2 SpatioTemporalNoise_ISFAST(uint2 p, uint t) {
-  if (shader_injection_data.volfog_isfast_texture_loaded > 0.5f) {
-    float3 uvw = float3(
-      (float)(p.x % 128u) / 128.0,
-      (float)(p.y % 128u) / 128.0,
-      (float)((t + 0u) % 32u) / 32.0);
-    uvw.xy *= shader_injection_data.volfog_isfast_spatial_scale;
-    float2 s = g_isfastNoiseTexture.SampleLevel(samPoint_s, uvw, 0);
-    return s;
-  } else {
-    static const float R2_A1 = 0.7548776662466927;
-    static const float R2_A2 = 0.5698402909980532;
-    float b1 = IGN(float2(p) * shader_injection_data.volfog_isfast_spatial_scale);
-    float b2 = IGN(float2(p) * shader_injection_data.volfog_isfast_spatial_scale + float2(47, 17));
-    return float2(frac(b1 + R2_A1 * (float)t),
-                  frac(b2 + R2_A2 * (float)t));
-  }
-}
-
 
 void main(
   float4 v0 : SV_Position0,
@@ -137,23 +112,6 @@ void main(
     uint volW, volH, volD;
     volumeScatter.GetDimensions(volW, volH, volD);
     float3 volSize = float3((float)volW, (float)volH, (float)volD);
-
-    // ── IS-FAST temporal jitter ──
-    if (shader_injection_data.volfog_isfast_enabled > 0.5f) {
-      float2 pixelCoord = floor(v0.xy);
-      float jitterSpeed = max(shader_injection_data.volfog_jitter_speed, 1.0f);
-      uint frameIndex = (uint)max(sceneTime_g * jitterSpeed, 0.0f);
-      float2 jitter2 = SpatioTemporalNoise_ISFAST((uint2)pixelCoord, frameIndex);
-
-      float3 texelSize = 1.0f / max(volSize, float3(1.0f, 1.0f, 1.0f));
-      float2 halfTexelXY = 0.5f * texelSize.xy;
-      float halfSlice = 0.5f * texelSize.z;
-      float jitterZ = frac(jitter2.x + jitter2.y * 0.5f);
-      float jitterStrength = max(shader_injection_data.volfog_jitter_amount, 0.0f);
-
-      uvw.xy = clamp(uvw.xy + (jitter2 - 0.5f) * texelSize.xy * jitterStrength, halfTexelXY, 1.0f - halfTexelXY);
-      uvw.z = clamp(uvw.z + (jitterZ - 0.5f) * texelSize.z * jitterStrength, halfSlice, 1.0f - halfSlice);
-    }
 
     float4 volSample;
     if (shader_injection_data.volfog_haze_aa_mode > 0.5) {

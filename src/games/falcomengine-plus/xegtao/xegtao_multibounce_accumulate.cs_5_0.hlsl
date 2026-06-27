@@ -27,6 +27,11 @@ void main(uint2 dt : SV_DispatchThreadID)
     float prevLuma = dot(prevGI.rgb, float3(0.299, 0.587, 0.114));
     prevGI.rgb = lerp(prevLuma.xxx, prevGI.rgb, g_gi_multibounce_saturation);
 
+    // Apply max clamp to prevent over-brightening from feedback accumulation
+    if (g_gi_multibounce_max_clamp > 0.0) {
+      prevGI.rgb = min(prevGI.rgb, g_gi_multibounce_max_clamp);
+    }
+
     // Boost previous GI by multi-bounce strength to bridge the scale gap
     // between GI (0-2) and HDR direct light (0-50+).
     // Default 1.0 = natural feedback; increase for stronger multi-bounce.

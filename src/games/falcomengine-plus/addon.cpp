@@ -18,7 +18,6 @@
 #include <cstring>
 #include <shared_mutex>
 #include <sstream>
-#include <unordered_set>
 #include <vector>
 #include <Windows.h>
 
@@ -46,6 +45,7 @@ ShaderInjectData shader_injection = {
     .volfog_jitter_amount = 0.5f,
     .volfog_jitter_speed = 237.f,
     .volfog_isfast_spatial_scale = 1.f,
+    .volfog_noise_strength = 1.f,
     .volfog_isfast_dedicated_sampler = 0.f,
   .char_shadow_mode = 2.f,
   .char_shadow_sample_count = 32.f,
@@ -63,6 +63,8 @@ ShaderInjectData shader_injection = {
   .env_sss_enabled = 1.f,
   .env_sss_strength = 1.0f,
   .env_sss_sample_count = 24.f,
+  .env_sss_hard_shadow_samples = 0.f,
+  .env_sss_fade_out_samples = 0.f,
   .env_sss_surface_thickness = 0.005f,
   .env_sss_contrast = 2.f,
   .env_sss_jitter_enabled = 1.f,
@@ -104,6 +106,7 @@ ShaderInjectData shader_injection = {
   .ssgi_multibounce = 0.f,
   .ssgi_multibounce_strength = 1.f,
   .ssgi_multibounce_saturation = 1.f,
+  .ssgi_multibounce_max_clamp = 0.f,
   .ssgi_adaptive_r = 0.f,
   .ssgi_adaptive_g = 0.f,
   .ssgi_adaptive_b = 0.f,
@@ -148,14 +151,67 @@ ShaderInjectData shader_injection = {
   .shadow_isfast_spatial_scale = 1.f,
   .shadow_isfast_temporal_speed = 1.f,
   .shadow_isfast_seed_offset = 0.f,
+  // ── Kai-specific defaults ──
+  .cubemap_improvements_enabled = 1.f,
+  .cubemap_lighting_mip_boost = 1.5f,
+  .floor_cubemap_mip_scale = 4.f,
+  .ssgi_mod_enabled = 1.f,
+  .ssgi_color_boost = 1.f,
+  .ssgi_alpha_boost = 1.f,
+  .ssgi_pow = 1.f,
+  .dof_mode = 1.f,
+  .dof_strength = 1.f,
+  .dof_radius_scale = 1.33f,
+  .dof_sample_count = 24.f,
+  .dof_near_scale = 1.f,
+  .dof_far_scale = 1.f,
+  .dof_coc_curve = 1.f,
+  .dof_edge_threshold = 0.25f,
+  .char_gi_strength = 3.0f,
+  .char_gi_alpha_scale = 1.0f,
+  .char_gi_chroma_strength = 0.50f,
+  .char_gi_luma_strength = 0.0f,
+  .char_gi_shadow_power = 1.25f,
+  .char_gi_dark_boost = 0.0f,
+  .char_gi_bright_boost = 3.0f,
+  .char_gi_headroom_power = 1.25f,
+  .char_gi_max_add = 0.020f,
+  .char_gi_peak_luma_cap = 0.0f,
+  .char_gi_depth_reject = 2.0f,
+  .fog_color_correction_enabled = 1.f,
+  .fog_hue = 0.f,
+  .fog_chrominance = 0.f,
+  .fog_avg_brightness = 0.85f,
+  .fog_min_brightness = 0.f,
+  .fog_min_chroma_change = 0.f,
+  .fog_max_chroma_change = 0.f,
+  .fog_lightness_strength = 1.f,
+  .fog_color_correction_strength = 0.5f,
+  .ssr_mode = 1.f,
+  .ssr_ray_count_scale = 1.f,
+  .foliage_translucency_scale = 1.f,
+  .foliage_opacity_scale = 1.f,
+  .foliage_ssao_scale = 1.f,
+  .char_shadow_strength = 1.f,
+  .foliage_debug_mode = 0.f,
+  .sss_dedicated_bound = 0.f,
+  .char_gi_enabled = 1.f,
+  .volfog_enabled = 1.f,
+  .volfog_tricubic_enabled = 1.f,
+  .volfog_color_correction_strength = 0.5f,
+  .ssgi_kai_consume_falcom = 0.f,
+  .ssgi_kai_falcom_blend = 0.5f,
+  .ssgi_kai_xegtao_only = 0.f,
 };
 
 // ═══════════ XeGTAO Backend — constants, types, fwd decls ═══════════
 
 constexpr uint32_t kLightingXeGtaoRegister = 22u;
 constexpr uint32_t kLightingSsgiRegister   = 23u;  // t23 = ssgiTexture
-constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture
-constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture
+constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture (Sora)
+constexpr uint32_t kLightingDepthRegisterKai = 3u; // t3 = depthTexture (Kai)
+constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture (Sora)
+constexpr uint32_t kLightingSsaoRegisterKai = 4u; // t4 = ssaoTexture (Kai)
 constexpr uint32_t kLightingSceneCbRegister = 0u; // b0 = cb_scene
 constexpr uint32_t kXeGTAODepthMipLevels = 5u;
 constexpr uint32_t kXeGtaoDescriptorTableParamCount = 4u;  // sampler, cbv, srv, uav
@@ -192,52 +248,40 @@ static float g_isfast_seed_offset   = 0.f;
 
 // ── Settings visibility ──
 static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
-static float g_developer_mode           = 0.f;   // 0=Off (forced basic), 1=On (allow advanced)
-static bool IsAdvancedSettingsMode() { return g_developer_mode >= 0.5f && g_settings_mode >= 0.5f; }
+static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
 
-// ── Advanced setting keys (reset to defaults when Developer Mode is OFF) ──
-static const std::unordered_set<std::string>& GetAdvancedSettingKeys() {
-  static const std::unordered_set<std::string> keys = {
-    "VolFogJitter", "VolFogJitterAmount", "VolFogJitterSpeed", "VolFogISFASTSpatialScale", "VolFogISFASTSampler",
-    "CharShadowType", "CharShadowCameraStrength", "CharShadowWorldStrength", "CharShadowSampleCount",
-    "CharShadowHardSamples", "CharShadowFadeSamples", "CharShadowSurfaceThickness", "CharShadowContrast",
-    "CharShadowLightFadeStart", "CharShadowLightFadeEnd", "CharShadowMinOccluderDepthScale",
-    "EnvSSSEnabled", "EnvSSSStrength", "EnvSSSSampleCount", "EnvSSSSurfaceThickness", "EnvSSSContrast",
-    "EnvSSSHeightEnable", "EnvSSSHeightMin", "EnvSSSHeightMax", "EnvSSSHeightFade", "EnvSSSVerticalReject",
-    "EnvSSSMaxDarkening", "EnvSSBrightRejectThreshold", "EnvSSBrightRejectFade", "DebugShowEnvSSS",
-    "XeGTAOQuality", "XeGTAODenoisePasses", "XeGTAOJitter", "XeGTAORadius", "XeGTAOFalloffRange",
-    "XeGTAORadiusMultiplier", "XeGTAOFinalPower", "XeGTAOSampleDistribution", "XeGTAOBitmaskThickness",
-    "XeGTAODepthMIPOffset", "XeGTAODenoiseBlurBeta", "XeGTAODenoiseLeakThreshold", "XeGTAODenoiseLeakStrength",
-    "XeGTAODenoiserType", "XeGTAOTemporalFrames", "XeGTAOTemporalBlend", "XeGTAODisocclusionThr",
-    "XeGTAONormalInputMode", "XeGTAONormalInfluence", "XeGTAONormalDepthBlend", "XeGTAONormalSharpness",
-    "XeGTAONormalEdgeRejection", "XeGTAONormalZPreservation", "XeGTAONormalDetailResponse",
-    "XeGTAONormalMaxDarkening", "XeGTAONormalDarkeningMode", "XeGTAONormalTransformMode",
-    "XeGTAODebugView", "XeGTAODebugLogging", "XeGTAOFixExperimental", "XeGTAOFrameSkip",
-    "SSGIIntensity", "SSGISaturation", "SSGICharMaskStrength", "SSGIMultiBounce", "SSGIMultiBounceStrength",
-    "SSGIMultiBounceSaturation", "SSGIAdaptiveR", "SSGIAdaptiveG", "SSGIAdaptiveB", "SSGIAdaptiveMode",
-    "SSGIAdaptiveLumaStrength", "SSGIAdaptiveLumaBlend", "SSGIMaxClamp", "SSGIReduceAO", "SSGIReduceAOStrength",
-    "SSGILightExposure", "SSGIFrameSkip", "MultiBounceFrameSkip", "SSGIDebugView", "SSGIDebugLogging",
-    "SSGIAffectLights", "SSGILightsStrength", "SSGILightsSaturation", "SSGICascadeDebug",
-    "ISFASTStrength", "ISFASTDebugLogging", "ISFASTSpatialScale", "ISFASTTemporalSpeed", "ISFASTSeedOffset",
-    "CPUOptDeferredDispatch", "CPUOptEnsurePipelines",
-    "ShadowPCSSJitter", "ShadowPCSSJitterAmount", "ShadowPCSSJitterSpeed", "ShadowBaseSoftness",
-    "ShadowPenumbraScale", "ShadowPCSSSearchRadius", "ShadowPCSSFilterWidth", "ShadowPCSSDepthCap",
-    "ShadowPCSScascadeBlend", "ShadowPCSSFixTexelRadius", "ShadowPCSSFixClampCascade", "ShadowPCSSFixMinRadius",
-    "ShadowPCSSFixAutoBlend", "ShadowPenumbraColorStrength", "ShadowPenumbraVibrance", "ShadowPenumbraDetection",
-    "ShadowPenumbraColorBrightness", "ShadowPenumbraFalcomBlend", "ShadowPenumbraEdgeVibrance",
-    "ShadowPenumbraLightColorBlend", "ShadowPenumbraLightColorSaturation", "ShadowPenumbraDebugView"
-  };
-  return keys;
+// ── Kai detection ──
+static float g_char_ssgi_composite_method = 1.f;  // Kai Character SSGI master toggle
+
+static bool IsKai() {
+  static bool checked = false;
+  static bool is_kai = false;
+  if (!checked) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string name(exePath);
+    auto lastSlash = name.find_last_of("\\/");
+    if (lastSlash != std::string::npos) name = name.substr(lastSlash + 1);
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    is_kai = (name == "kai.exe");
+    checked = true;
+  }
+  return is_kai;
 }
 
-// ── Forward declaration — defined after settings vector ──
-static void ResetAdvancedSettingsToDefaults();
+// ── Lighting shader identification (Sora + Kai) ──
+static bool IsLightingShader(uint32_t hash) {
+  return hash == 0xFDAAF80Eu    // Sora lighting
+      || hash == 0x430ED091u    // Kai lighting
+      || hash == 0xF6C55E5Fu;   // Kai lighting soft
+}
 
 // ── CPU optimization toggles ──
 static float g_xegtao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, …)
+static float g_xegtao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
 static float g_ssgi_frame_skip           = 0.f;
 static float g_multibounce_frame_skip    = 0.f;
-static float g_cpuopt_deferred_dispatch   = 0.f;  // dispatch XeGTAO/SSGI in OnPresent, not inline
+static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch XeGTAO/SSGI in OnPresent, not inline (default ON for Kai)
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 static float g_xegtao_jitter_toggle       = 0.f;  // enable jitter even when denoise is off
 
@@ -295,6 +339,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline main_ultra_pipeline = {};
   reshade::api::pipeline denoise_pipeline = {};
   reshade::api::pipeline denoise_last_pipeline = {};
+  reshade::api::pipeline denoise_last_kai_pipeline = {};  // Kai: correct prevViewProj_g offset (c85)
 
   // Descriptor tables — pre-allocated per pass.
   XeGTAODescriptorTableSet prefilter_tables = {};
@@ -349,6 +394,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // ── IS-FAST noise ──
   reshade::api::resource isfast_noise_texture = {};
   reshade::api::resource_view isfast_noise_srv = {};
+  reshade::api::sampler isfast_sampler = {};
   bool isfast_texture_loaded = false;
   bool isfast_texture_attempted = false;  // only try DDS load once
   bool ssgi_bound = false;
@@ -370,6 +416,8 @@ static bool RunXeGTAO(reshade::api::command_list* cmd_list, DeviceData* data);
 // SSGI is now integrated into XeGTAO main pass — no separate RunSSGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
+static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list);
+static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
 static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages, reshade::api::pipeline_layout layout,
     uint32_t param_index, const reshade::api::descriptor_table_update& update);
@@ -454,6 +502,61 @@ static bool OnBeforeVolFogDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
+  SyncVolFogISFASTToShaderInjection(cmd_list);
+  // Sync Sora volfog settings → Kai volfog fields
+  shader_injection.volfog_tricubic_enabled = shader_injection.volfog_haze_aa_mode;
+  shader_injection.volfog_is_fast_enabled = shader_injection.volfog_isfast_enabled;
+  // Note: volfog_color_correction_strength is bound to Fog3DCorrectionStrength setting;
+  // do NOT overwrite it with the 2D fog_color_correction_strength.
+  if (auto* dev = cmd_list->get_device()) {
+    if (auto* d = dev->get_private_data<DeviceData>()) {
+      shader_injection.isfast_noise_bound = d->isfast_texture_loaded ? 1.f : 0.f;
+    }
+  }
+  // Push IS-FAST noise texture at t15 (Kai's volfog register)
+  if (auto* dev = cmd_list->get_device()) {
+    if (auto* d = dev->get_private_data<DeviceData>()) {
+      reshade::api::resource_view srv = d->isfast_noise_srv.handle
+          ? d->isfast_noise_srv : d->fallback_srv;
+      if (srv.handle) {
+        cmd_list->push_descriptors(
+            reshade::api::shader_stage::pixel,
+            reshade::api::pipeline_layout{0}, 0,
+            reshade::api::descriptor_table_update{
+                {}, 15u, 0, 1,
+                reshade::api::descriptor_type::texture_shader_resource_view,
+                &srv,
+            });
+      }
+    }
+  }
+  return true;
+}
+
+// ── Kai character lighting callback (Env SSS + Character Shadowing) ──
+static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list) {
+  // Character shader reads shader_injection_data automatically via b13 injection.
+  // Push IS-FAST noise if the shader uses it.
+  if (auto* dev = cmd_list->get_device()) {
+    if (auto* d = dev->get_private_data<DeviceData>()) {
+      reshade::api::resource_view srv = d->isfast_noise_srv.handle
+          ? d->isfast_noise_srv : d->fallback_srv;
+      if (srv.handle) {
+        cmd_list->push_descriptors(
+            reshade::api::shader_stage::pixel,
+            reshade::api::pipeline_layout{0}, 0,
+            reshade::api::descriptor_table_update{
+                {}, 15u, 0, 1,
+                reshade::api::descriptor_type::texture_shader_resource_view,
+                &srv,
+            });
+      }
+    }
+  }
+  return true;
+}
+
 // ═══════════ Custom shaders ═══════════
 
 renodx::mods::shader::CustomShaders custom_shaders = {
@@ -488,29 +591,41 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .crc32 = 0xFDAAF80Eu,
             .code = __0xFDAAF80E,
             .on_draw = OnBeforeLightingShaderDraw,
-            // No .views — t22 is pushed at draw time via push_descriptors.
-            // This avoids pipeline layout injection issues (kai-vanillaplus approach).
         },
     },
+    // ── Kai lighting (XeGTAO + SSGI) ──
+    CustomShaderEntryCallback(0x430ED091, OnBeforeLightingShaderDraw),
+    CustomShaderEntryCallback(0xF6C55E5F, OnBeforeLightingShaderDraw),
+    // ── Kai volumetric fog (IS-FAST + Haze AA) ──
+    CustomShaderEntryCallback(0xBD7DFE49, OnBeforeKaiVolFogDraw),
+    // ── Kai character lighting (Env SSS + Character Shadowing) ──
+    {
+        0x445A1838u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x445A1838u,
+            .code = __0x445A1838,
+            .on_draw = OnBeforeCharLightingDraw,
+        },
+    },
+    // ── Kai cubemap (10 glass + floor shaders) ──
+    CustomShaderEntryCallback(0xB1CCBCAE, nullptr),
+    CustomShaderEntryCallback(0x1A17A133, nullptr),
+    CustomShaderEntryCallback(0xCA715B78, nullptr),
+    CustomShaderEntryCallback(0xE1E0ACBB, nullptr),
+    CustomShaderEntryCallback(0xF237E72F, nullptr),
+    CustomShaderEntryCallback(0x07E984A7, nullptr),
+    CustomShaderEntryCallback(0xFDC5CDBF, nullptr),
+    CustomShaderEntryCallback(0x8337B262, nullptr),
+    CustomShaderEntryCallback(0xD97BD91B, nullptr),
+    CustomShaderEntryCallback(0xEFB6AC0F, nullptr),
+    // ── Kai DOF shaders ──
+    CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
+    CustomShaderEntryCallback(0x2734F870, nullptr),
 };
 
 // ═══════════ Settings ═══════════
 
 renodx::utils::settings::Settings settings = {
-    new renodx::utils::settings::Setting{
-      .key = "DeveloperMode", .binding = &g_developer_mode,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .can_reset = false,
-      .label = "Developer Mode", .section = "Settings",
-      .tooltip = "Off = Basic mode only, advanced settings forced to defaults. On = full control.",
-      .labels = {"Off (Basic Only)", "On (Full Control)"},
-      .on_change = []() {
-        if (g_developer_mode < 0.5f) {
-          ResetAdvancedSettingsToDefaults();
-        }
-      },
-      .is_global = true,
-    },
     new renodx::utils::settings::Setting{
         .key = "SettingsMode",
         .binding = &g_settings_mode,
@@ -520,7 +635,376 @@ renodx::utils::settings::Settings settings = {
         .label = "Settings Mode",
         .section = "Settings",
         .labels = {"Basic", "Advanced"},
+        .on_change = []() {
+          if (g_settings_mode < 0.5f) {  // Switched to Basic — reset advanced-only settings
+            float saved = g_settings_mode;
+            g_settings_mode = 1.0f;
+            std::vector<renodx::utils::settings::Setting*> advanced;
+            for (auto* s : settings) {
+              if (s->key.empty() || !s->can_reset || s->is_global) continue;
+              if (s->is_visible()) advanced.push_back(s);
+            }
+            g_settings_mode = saved;
+            for (auto* s : advanced) {
+              if (!s->is_visible()) {
+                s->Set(s->default_value);
+                s->Write();
+              }
+            }
+          }
+        },
         .is_global = true,
+    },
+    // —— IS-FAST Master Toggle (top-level) ——
+    new renodx::utils::settings::Setting{
+      .key = "ISFASTMasterEnable", .binding = &g_isfast_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "IS-FAST Noise", .section = "IS-FAST",
+      .tooltip = "Master toggle for IS-FAST spatio-temporal blue noise. Requires fast_noise_ea.dds next to game .exe.",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ISFASTStrength", .binding = &g_isfast_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Noise Strength", .section = "IS-FAST",
+      .tooltip = "0 = deterministic (banding), 1 = full noise.",
+      .min = 0.0f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ISFASTDebugLogging", .binding = &g_isfast_debug_logging,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Debug Logging", .section = "IS-FAST",
+      .tooltip = "Log IS-FAST texture load status and noise source.",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ISFASTSpatialScale", .binding = &g_isfast_spatial_scale,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Spatial Scale", .section = "IS-FAST",
+      .tooltip = "Scale noise spatial frequency. <1 zooms in (smoother), >1 adds more detail.",
+      .min = 0.25f, .max = 4.0f, .format = "%.2f",
+      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ISFASTTemporalSpeed", .binding = &g_isfast_temporal_speed,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Temporal Speed", .section = "IS-FAST",
+      .tooltip = "Scale noise animation speed. 0 = frozen, 1 = default, 5 = fast flicker.",
+      .min = 0.0f, .max = 5.0f, .format = "%.2f",
+      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ISFASTSeedOffset", .binding = &g_isfast_seed_offset,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Seed Offset", .section = "IS-FAST",
+      .tooltip = "Offset the noise seed pattern (0-64). Shift to find optimal noise distribution.",
+      .labels = {"0","4","8","12","16","20","24","28","32","36","40","44","48","52","56","60"},
+      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+
+    // ═══════════ Kai-Specific Sections (only visible on kai.exe) ═══════════
+
+    // ── Cubemap ──
+    new renodx::utils::settings::Setting{
+      .key = "CubemapImprovements", .binding = &shader_injection.cubemap_improvements_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Mode", .section = "Cubemap",
+      .labels = {"Vanilla", "Improved"},
+      .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "LightingCubemapMipBoost", .binding = &shader_injection.cubemap_lighting_mip_boost,
+      .default_value = 1.5f, .label = "Lighting Mip Boost", .section = "Cubemap",
+      .tooltip = "Lighting shader cubemap mip scale. Default is 1.5x.",
+      .min = 0.5f, .max = 4.f, .format = "%.1fx",
+      .is_enabled = []() { return shader_injection.cubemap_improvements_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FloorCubemapMipScale", .binding = &shader_injection.floor_cubemap_mip_scale,
+      .default_value = 4.f, .label = "Floor Mip Scale", .section = "Cubemap",
+      .tooltip = "Scales floor reflection roughness/mip response. 1.0 = Vanilla.",
+      .min = 0.f, .max = 4.f, .format = "%.2f",
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+
+    // ── SSGI (Falcom) ──
+    new renodx::utils::settings::Setting{
+      .key = "KaiSSGIEnable", .binding = &shader_injection.ssgi_mod_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Enable", .section = "SSGI (Falcom)",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiSSGIColorBoost", .binding = &shader_injection.ssgi_color_boost,
+      .default_value = 1.f, .label = "Color Boost", .section = "SSGI (Falcom)",
+      .tooltip = "Scales SSGI RGB contribution before power shaping.",
+      .min = 0.f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiSSGIAlphaBoost", .binding = &shader_injection.ssgi_alpha_boost,
+      .default_value = 1.f, .label = "Alpha Boost", .section = "SSGI (Falcom)",
+      .tooltip = "Scales SSGI alpha before saturate.",
+      .min = 0.f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiSSGIPower", .binding = &shader_injection.ssgi_pow,
+      .default_value = 1.f, .label = "Power", .section = "SSGI (Falcom)",
+      .tooltip = "Applies pow(abs(color), Power) to shape bounce response.",
+      .min = 0.1f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.ssgi_mod_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+
+    // ── Depth of Field ──
+    new renodx::utils::settings::Setting{
+      .key = "DOFMode", .binding = &shader_injection.dof_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Mode", .section = "Depth of Field",
+      .tooltip = "Vanilla keeps the original blur shader. Improved uses DOF method 3 (gather).",
+      .labels = {"Vanilla", "Improved"},
+      .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFStrength", .binding = &shader_injection.dof_strength,
+      .default_value = 1.f, .label = "Strength", .section = "Depth of Field",
+      .tooltip = "Overall blend strength for improved DOF output.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFRadiusScale", .binding = &shader_injection.dof_radius_scale,
+      .default_value = 1.33f, .label = "Radius Scale", .section = "Depth of Field",
+      .tooltip = "Scales blur radius derived from game CoC.",
+      .min = 0.25f, .max = 2.5f, .format = "%.2fx",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFSampleCount", .binding = &shader_injection.dof_sample_count,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 24.f, .label = "Sample Count", .section = "Depth of Field",
+      .tooltip = "Higher values produce smoother bokeh at higher cost.",
+      .min = 4.f, .max = 64.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFNearScale", .binding = &shader_injection.dof_near_scale,
+      .default_value = 1.f, .label = "Near Scale", .section = "Depth of Field",
+      .tooltip = "Scales near-field CoC response.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFFarScale", .binding = &shader_injection.dof_far_scale,
+      .default_value = 1.f, .label = "Far Scale", .section = "Depth of Field",
+      .tooltip = "Scales far-field CoC response.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFCoCCurve", .binding = &shader_injection.dof_coc_curve,
+      .default_value = 1.f, .label = "CoC Curve", .section = "Depth of Field",
+      .tooltip = "Applies pow(CoC, Curve) before blur; >1 tightens focus transition.",
+      .min = 0.25f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFEdgeThreshold", .binding = &shader_injection.dof_edge_threshold,
+      .default_value = 0.25f, .label = "Edge Threshold", .section = "Depth of Field",
+      .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
+      .min = 0.02f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+
+    // ── Character SSGI ──
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeMethod", .binding = &g_char_ssgi_composite_method,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Apply Game SSGI", .section = "Character SSGI",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeStrength", .binding = &shader_injection.char_gi_strength,
+      .default_value = 3.0f, .label = "Strength", .section = "Character SSGI",
+      .tooltip = "Overall contribution scale for character GI.",
+      .min = 0.f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeAlphaScale", .binding = &shader_injection.char_gi_alpha_scale,
+      .default_value = 1.0f, .label = "Alpha Scale", .section = "Character SSGI",
+      .tooltip = "Scales sampled SSGI alpha before blending.",
+      .min = 0.f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeChroma", .binding = &shader_injection.char_gi_chroma_strength,
+      .default_value = 0.50f, .label = "Chroma", .section = "Character SSGI",
+      .tooltip = "Scales colorful GI component; lower values reduce tinting.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeLuma", .binding = &shader_injection.char_gi_luma_strength,
+      .default_value = 0.0f, .label = "Luma", .section = "Character SSGI",
+      .tooltip = "Scales neutral GI brightness; keep low to avoid white haze.",
+      .min = 0.f, .max = 1.f, .format = "%.3f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeShadowPower", .binding = &shader_injection.char_gi_shadow_power,
+      .default_value = 1.25f, .label = "Shadow Power", .section = "Character SSGI",
+      .tooltip = "Higher values concentrate GI toward darker areas.",
+      .min = 0.1f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeDarkBoost", .binding = &shader_injection.char_gi_dark_boost,
+      .default_value = 0.0f, .label = "Dark Boost", .section = "Character SSGI",
+      .tooltip = "Extra GI multiplier in darker regions (after shadow mask).",
+      .min = 0.f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeBrightBoost", .binding = &shader_injection.char_gi_bright_boost,
+      .default_value = 3.0f, .label = "Bright Boost", .section = "Character SSGI",
+      .tooltip = "Boosts GI on brighter regions (values above 1.0 increase bright-side contribution).",
+      .min = 0.f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeHeadroomPower", .binding = &shader_injection.char_gi_headroom_power,
+      .default_value = 1.25f, .label = "Headroom Power", .section = "Character SSGI",
+      .tooltip = "Controls how strongly bright pixels reject additional GI.",
+      .min = 0.1f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeMaxAdd", .binding = &shader_injection.char_gi_max_add,
+      .default_value = 0.020f, .label = "Max Add", .section = "Character SSGI",
+      .tooltip = "Per-channel cap for added GI to prevent haze/bloomy washout.",
+      .min = 0.f, .max = 1.f, .format = "%.3f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositePeakLumaCap", .binding = &shader_injection.char_gi_peak_luma_cap,
+      .default_value = 0.0f, .label = "Peak Luma Cap", .section = "Character SSGI",
+      .tooltip = "Caps peak GI brightness on characters after blending weights. Set 0 to disable.",
+      .min = 0.f, .max = 1.f, .format = "%.3f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharacterSSGICompositeDepthReject", .binding = &shader_injection.char_gi_depth_reject,
+      .default_value = 2.0f, .label = "Depth Reject", .section = "Character SSGI",
+      .tooltip = "Higher values suppress GI across depth discontinuities and silhouette edges.",
+      .min = 0.f, .max = 16.f, .format = "%.2f",
+      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+
+    // ── Fog Color Correction ──
+    new renodx::utils::settings::Setting{
+      .key = "FogColorCorrectionMode", .binding = &shader_injection.fog_color_correction_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Mode", .section = "Fog Color Correction",
+      .labels = {"Vanilla", "Improved"},
+      .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogHue", .binding = &shader_injection.fog_hue,
+      .default_value = 0.f, .label = "Fog Hue", .section = "Fog Color Correction",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogChrominance", .binding = &shader_injection.fog_chrominance,
+      .default_value = 0.f, .label = "Fog Chroma", .section = "Fog Color Correction",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogAvgBrightness", .binding = &shader_injection.fog_avg_brightness,
+      .default_value = 0.85f, .label = "Fog Avg Bright", .section = "Fog Color Correction",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogMinBrightness", .binding = &shader_injection.fog_min_brightness,
+      .default_value = 0.f, .label = "Fog Min Bright", .section = "Fog Color Correction",
+      .min = -0.5f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogMinChroma", .binding = &shader_injection.fog_min_chroma_change,
+      .default_value = 0.f, .label = "Fog Min Chroma", .section = "Fog Color Correction",
+      .tooltip = "Minimum chroma ratio applied during fog hue/chroma restoration.",
+      .min = 0.f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogMaxChroma", .binding = &shader_injection.fog_max_chroma_change,
+      .default_value = 0.f, .label = "Fog Max Chroma", .section = "Fog Color Correction",
+      .tooltip = "Maximum chroma ratio applied during fog hue/chroma restoration.",
+      .min = 0.f, .max = 8.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogLightnessStrength", .binding = &shader_injection.fog_lightness_strength,
+      .default_value = 1.f, .label = "Fog Lightness", .section = "Fog Color Correction",
+      .tooltip = "Scales fog lightness restoration amount.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FogColorCorrectionStrength", .binding = &shader_injection.fog_color_correction_strength,
+      .default_value = 0.5f, .label = "2D Fog Correction Strength", .section = "Fog Color Correction",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "Fog3DCorrectionStrength", .binding = &shader_injection.volfog_color_correction_strength,
+      .default_value = 0.5f, .label = "3D Fog Correction Strength", .section = "Fog Color Correction",
+      .tooltip = "Controls how strongly fog color correction is applied to volumetric fog. 0 = off, 1 = full.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.fog_color_correction_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
         .key = "VolFogHazeAAMode",
@@ -531,51 +1015,6 @@ renodx::utils::settings::Settings settings = {
         .section = "Volumetric Fog",
         .tooltip = "Mode for volumetric haze anti-aliasing: Vanilla or Improved.",
         .labels = {"Vanilla", "Improved"},
-    },
-    // —— Volumetric Fog IS-FAST Jitter ——
-    new renodx::utils::settings::Setting{
-      .key = "VolFogJitter", .binding = &shader_injection.volfog_jitter_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Vol Fog Jitter", .section = "Volumetric Fog",
-      .tooltip = "Apply IS-FAST spatio-temporal noise to break up froxel grid artifacts. Requires IS-FAST enabled.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "VolFogJitterAmount", .binding = &shader_injection.volfog_jitter_amount,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Jitter Amount", .section = "Volumetric Fog",
-      .tooltip = "Strength of the noise jitter applied to volume sample coordinates.",
-      .min = 0.f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "VolFogJitterSpeed", .binding = &shader_injection.volfog_jitter_speed,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 237.f, .label = "Jitter Speed", .section = "Volumetric Fog",
-      .tooltip = "Temporal animation speed for the noise jitter. Higher = faster rotation.",
-      .min = 0.f, .max = 1024.0f, .format = "%.0f",
-      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "VolFogISFASTSpatialScale", .binding = &shader_injection.volfog_isfast_spatial_scale,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "IS-FAST Spatial Scale", .section = "Volumetric Fog",
-      .tooltip = "Scales the IS-FAST noise pattern spatially. Lower = larger noise features.",
-      .min = 0.25f, .max = 4.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "VolFogISFASTSampler", .binding = &shader_injection.volfog_isfast_dedicated_sampler,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "IS-FAST Dedicated Sampler", .section = "Volumetric Fog",
-      .tooltip = "Off = reuse s1 point sampler. On = use dedicated s2 point-wrap sampler for noise.",
-      .labels = {"s1 Point", "s2 Dedicated"},
-      .is_enabled = []() { return shader_injection.volfog_jitter_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowMode", .binding = &shader_injection.char_shadow_mode,
@@ -669,9 +1108,9 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "EnvSSSEnabled", .binding = &shader_injection.env_sss_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Bend SSS", .section = "Environment Screen Space Shadows",
+      .default_value = 1.f, .label = "Bend SSS", .section = "Environment Screen Space Shadows",
       .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSStrength", .binding = &shader_injection.env_sss_strength,
@@ -679,29 +1118,47 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
       .parse = [](float v) { return v * 0.01f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSSampleCount", .binding = &shader_injection.env_sss_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 24.f, .label = "Sample Count", .section = "Environment Screen Space Shadows",
+      .default_value = 32.f, .label = "Sample Count", .section = "Environment Screen Space Shadows",
       .min = 1.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "EnvSSSHardSamples", .binding = &shader_injection.env_sss_hard_shadow_samples,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Hard Shadow Samples", .section = "Environment Screen Space Shadows",
+      .tooltip = "Number of hard-contact samples at the start of the ray march. 0 = auto (Sample Count / 8). Higher = sharper contact shadows, but may miss thin occluders.",
+      .min = 0.f, .max = 32.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "EnvSSSFadeSamples", .binding = &shader_injection.env_sss_fade_out_samples,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Fade Out Samples", .section = "Environment Screen Space Shadows",
+      .tooltip = "Number of fade-out samples at the end of the ray march. 0 = auto (Sample Count / 3). Higher = smoother transition from shadow to no shadow, reducing banding in soft shadows.",
+      .min = 0.f, .max = 32.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSSurfaceThickness", .binding = &shader_injection.env_sss_surface_thickness,
       .default_value = 0.005f, .label = "Surface Thickness", .section = "Environment Screen Space Shadows",
       .min = 0.001f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSContrast", .binding = &shader_injection.env_sss_contrast,
       .default_value = 2.f, .label = "Shadow Contrast", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 12.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightEnable", .binding = &shader_injection.env_sss_height_enabled,
@@ -709,63 +1166,63 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Height Above Ground", .section = "Environment Screen Space Shadows",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightMin", .binding = &shader_injection.env_sss_height_min,
       .default_value = 0.f, .label = "Min Height", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 10.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f && shader_injection.env_sss_height_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightMax", .binding = &shader_injection.env_sss_height_max,
       .default_value = 1.f, .label = "Ground Search", .section = "Environment Screen Space Shadows",
       .min = 1.f, .max = 200.f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f && shader_injection.env_sss_height_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSHeightFade", .binding = &shader_injection.env_sss_height_fade,
       .default_value = 0.10f, .label = "Height Fade", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 5.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f && shader_injection.env_sss_height_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSVerticalReject", .binding = &shader_injection.env_sss_vertical_reject,
       .default_value = 0.30f, .label = "Vertical Reject", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSSMaxDarkening", .binding = &shader_injection.env_sss_max_darkening,
       .default_value = 0.40f, .label = "Max Darkening", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSBrightRejectThreshold", .binding = &shader_injection.env_sss_bright_reject_threshold,
       .default_value = 0.19f, .label = "Brightness Reject", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 5.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSBrightRejectFade", .binding = &shader_injection.env_sss_bright_reject_fade,
       .default_value = 0.5f, .label = "Brightness Fade", .section = "Environment Screen Space Shadows",
       .min = 0.01f, .max = 3.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DebugShowEnvSSS", .binding = &shader_injection.debug_show_env_sss,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Env SSS Debug View", .section = "Environment Screen Space Shadows",
-      .labels = {"Off", "Final Shadow", "Character Mask", "Surface Normal", "Raw Shadow"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .labels = {"Off", "SSS Mask", "Shadow Value"},
+    .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     // —— XeGTAO ——
     new renodx::utils::settings::Setting{
@@ -809,6 +1266,7 @@ renodx::utils::settings::Settings settings = {
                  "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
       .labels = {"IS-FAST", "IGN", "Hilbert"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAORadius", .binding = &shader_injection.xegtao_radius,
@@ -1024,6 +1482,15 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
+    // ── XeGTAO Dispatch Fix (for double volumetrics) ──
+    new renodx::utils::settings::Setting{
+      .key = "XeGTAOCSDispatchFix", .binding = &g_xegtao_cs_dispatch_fix,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "CS Dispatch Fix", .section = "XeGTAO",
+      .tooltip = "Fixes double volumetrics caused by stale compute descriptor bindings. Fix 1: restore state via Apply(). Fix 2: null compute descriptors. Fix 3: null + restore.",
+      .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
     // —— SSGI (Screen Space Global Illumination — integrated into XeGTAO) ——
     new renodx::utils::settings::Setting{
       .key = "SSGIEnable", .binding = &shader_injection.ssgi_enabled,
@@ -1078,9 +1545,18 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounceSaturation", .binding = &shader_injection.ssgi_multibounce_saturation,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.5f, .label = "Multi-Bounce Saturation", .section = "SSGI",
+      .default_value = 1.0f, .label = "Multi-Bounce Saturation", .section = "SSGI",
       .tooltip = "Color saturation of the multi-bounce feedback. 0 = grayscale, 1 = full color.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIMultiBounceMaxClamp", .binding = &shader_injection.ssgi_multibounce_max_clamp,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "Multi-Bounce Max Clamp", .section = "SSGI",
+      .tooltip = "Clamp multi-bounce feedback per-channel to prevent over-brightening. 0 = off.",
+      .min = 0.0f, .max = 20.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -1195,7 +1671,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
       .tooltip = "Replace scene with SSGI debug textures.",
-      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity", "Light Color"},
+      .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity", "Light Color", "Final GI"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -1205,6 +1681,33 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Log SSGI dispatch, push, and texture binding to console.",
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    // ── Kai: XeGTAO SSGI Falcom SSGI consumption ──
+    new renodx::utils::settings::Setting{
+      .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.ssgi_kai_consume_falcom,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "SSGI",
+      .tooltip = "When ON, Falcom's SSGI color modulates XeGTAO GI before blending. Creates a multiplicative interaction between the two GI sources.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.ssgi_enabled > 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIKaiFalcomBlend", .binding = &shader_injection.ssgi_kai_falcom_blend,
+      .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "SSGI",
+      .tooltip = "How much Falcom SSGI color modulates XeGTAO GI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
+      .min = 0.f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_kai_consume_falcom > 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIKaiXeGTAOOnly", .binding = &shader_injection.ssgi_kai_xegtao_only,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "XeGTAO GI Only (Kai)", .section = "SSGI",
+      .tooltip = "When ON, Falcom SSGI is suppressed from output and only XeGTAO GI is visible. XeGTAO can still consume Falcom SSGI internally for modulation.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.ssgi_enabled > 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     // —— SSGI Affect Lights ——
     new renodx::utils::settings::Setting{
@@ -1241,66 +1744,14 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // —— IS-FAST ——
-    new renodx::utils::settings::Setting{
-      .key = "ISFASTEnable", .binding = &g_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "IS-FAST Noise", .section = "IS-FAST",
-      .tooltip = "IS-FAST spatio-temporal blue noise. Requires fast_noise_ea.dds next to game .exe. Falls back to IGN if missing.",
-      .labels = {"Off", "On"},
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ISFASTStrength", .binding = &g_isfast_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Noise Strength", .section = "IS-FAST",
-      .tooltip = "0 = deterministic (banding), 1 = full noise.",
-      .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ISFASTDebugLogging", .binding = &g_isfast_debug_logging,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Debug Logging", .section = "IS-FAST",
-      .tooltip = "Log IS-FAST texture load status and noise source.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ISFASTSpatialScale", .binding = &g_isfast_spatial_scale,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Spatial Scale", .section = "IS-FAST",
-      .tooltip = "Scale noise spatial frequency. <1 zooms in (smoother), >1 adds more detail.",
-      .min = 0.25f, .max = 4.0f, .format = "%.2f",
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ISFASTTemporalSpeed", .binding = &g_isfast_temporal_speed,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Temporal Speed", .section = "IS-FAST",
-      .tooltip = "Scale noise animation speed. 0 = frozen, 1 = default, 5 = fast flicker.",
-      .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "ISFASTSeedOffset", .binding = &g_isfast_seed_offset,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Seed Offset", .section = "IS-FAST",
-      .tooltip = "Offset the noise seed pattern (0-64). Shift to find optimal noise distribution.",
-      .labels = {"0","4","8","12","16","20","24","28","32","36","40","44","48","52","56","60"},
-      .is_enabled = []() { return g_isfast_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
     // —— CPU Optimizations ——
     new renodx::utils::settings::Setting{
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
-      .tooltip = "Move XeGTAO/SSGI dispatch to OnPresent (kai-style, 1-frame latency).",
+      .default_value = 1.f, .label = "Deferred Dispatch", .section = "CPU Opt",
+      .tooltip = "Move XeGTAO/SSGI dispatch to OnPresent (1-frame latency). Kai-only, default ON — avoids CS binding contamination.",
       .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CPUOptEnsurePipelines", .binding = &g_cpuopt_ensure_pipelines,
@@ -1317,6 +1768,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Shadow Filter Method", .section = "Shadow Maps",
       .tooltip = "CSM filtering: Off = single sample. Falcom = vanilla 10-tap PCF. PCSS = physically-accurate soft shadows.",
       .labels = {"Off", "Falcom", "PCSS"},
+      .is_visible = []() { return !IsKai(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowEdgeTint", .binding = &shader_injection.shadow_edge_tint,
@@ -1324,6 +1776,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.f, .label = "Colored Shadow Penumbra", .section = "Shadow Maps",
       .tooltip = "Off = neutral edges. Falcom = vanilla red tint. Improved = PCSS vibrancy boost in penumbra.",
       .labels = {"Off", "Falcom", "Improved"},
+      .is_visible = []() { return !IsKai(); },
     },
     // —— PCSS Settings (enabled when ShadowFilterMethod = PCSS) ——
     new renodx::utils::settings::Setting{
@@ -1333,7 +1786,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Use IS-FAST spatio-temporal noise to rotate PCSS sample pattern each frame.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSJitterAmount", .binding = &shader_injection.shadow_pcss_jitter_amount,
@@ -1342,7 +1795,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "0 = static Poisson, 1 = full temporal rotation.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSJitterSpeed", .binding = &shader_injection.shadow_pcss_jitter_speed,
@@ -1351,7 +1804,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Temporal animation speed. Higher = faster rotation.",
       .min = 0.0f, .max = 500.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
@@ -1360,7 +1813,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Constant minimum penumbra width. Contact-hard at 0, always soft at 0.5.",
       .min = 0.0f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraScale", .binding = &shader_injection.shadow_penumbra_scale,
@@ -1369,7 +1822,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How fast penumbra widens with occluder distance. Higher = softer distant shadows.",
       .min = 1.0f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSSearchRadius", .binding = &shader_injection.shadow_pcss_search_radius,
@@ -1378,7 +1831,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Desired softness in world units. Same value = same penumbra width across all cascades. 0.1=sharp, 5=very soft.",
       .min = 0.1f, .max = 2.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFilterWidth", .binding = &shader_injection.shadow_pcss_filter_width,
@@ -1387,7 +1840,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "PCF filter width multiplier. Lower = sharper, higher = blurrier.",
       .min = 0.1f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSDepthCap", .binding = &shader_injection.shadow_pcss_depth_cap,
@@ -1396,7 +1849,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Max depth difference for penumbra. Higher = more distance-based softening.",
       .min = 0.01f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSScascadeBlend", .binding = &shader_injection.shadow_pcss_cascade_blend,
@@ -1405,7 +1858,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Cross-fade width between cascades. Lower = wider/smoother blend. 0.02 = 50 units, 1.0 = 1 unit.",
       .min = 0.02f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     // —— PCSS Experimental Fixes (A/B test, all off = default behavior) ——
     new renodx::utils::settings::Setting{
@@ -1415,7 +1868,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Override world-space filter with texel-based radius. Consistent softness across all quality levels.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFixClampCascade", .binding = &shader_injection.shadow_pcss_fix_clamp_cascade,
@@ -1424,7 +1877,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Cap the cascade world size. Prevents Ultra's extended cascades from collapsing the filter. 0=off.",
       .min = 0.f, .max = 500.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFixMinRadius", .binding = &shader_injection.shadow_pcss_fix_min_radius,
@@ -1433,7 +1886,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Guaranteed minimum PCF filter radius in shadow map texels. Prevents filter from collapsing. 0=off.",
       .min = 0.f, .max = 100.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPCSSFixAutoBlend", .binding = &shader_injection.shadow_pcss_fix_auto_blend,
@@ -1442,7 +1895,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scale cascade blend by split distance. Larger cascades get tighter blends. Off = static blend value.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     // —— Colored Shadow Penumbra (Improved mode, PCSS-only) ——
     new renodx::utils::settings::Setting{
@@ -1452,7 +1905,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How strongly the vibrancy effect is applied in penumbra regions. 0=off, 1=full.",
       .min = 0.f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraVibrance", .binding = &shader_injection.shadow_penumbra_vibrance,
@@ -1461,7 +1914,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance adjustment in penumbra. 0=grayscale, 1=neutral, >1=more vivid. Protects already-saturated colors.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
@@ -1470,7 +1923,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "What counts as penumbra. Higher = wider detection area, more of the image gets the effect.",
       .min = 0.01f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraColorBrightness", .binding = &shader_injection.shadow_penumbra_color_brightness,
@@ -1479,7 +1932,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Brightness multiplier for the vibrancy tint color. 1=neutral, 0=black, >1=brighter.",
       .min = 0.f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraFalcomBlend", .binding = &shader_injection.shadow_penumbra_falcom_blend,
@@ -1488,7 +1941,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blend the vibrancy effect toward Falcom's red shadowEdgeColor tint. 0=pure vibrancy, 1=pure Falcom.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraEdgeVibrance", .binding = &shader_injection.shadow_penumbra_edge_vibrance,
@@ -1497,7 +1950,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance applied to shadowEdgeColor when Falcom blend > 0. 0=grayscale, 1=neutral, >1=vivid.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraLightColorBlend", .binding = &shader_injection.shadow_penumbra_lightcolor_blend,
@@ -1506,7 +1959,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blend the penumbra tint toward the sun's lightColor. 0=no effect, 1=fully sun-colored penumbra.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraLightColorSaturation", .binding = &shader_injection.shadow_penumbra_lightcolor_saturation,
@@ -1515,7 +1968,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Vibrance applied to lightColor before blending. 0=grayscale, 1=neutral, >1=vivid sun color.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraDebugView", .binding = &shader_injection.shadow_penumbra_debug_view,
@@ -1524,7 +1977,96 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Visualize penumbra processing. PenumbraMask=detection area, TintColor=adjusted color, Result=final blend.",
       .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
+    },
+    // —— Shadows (Kai) ——
+    new renodx::utils::settings::Setting{
+      .key = "KaiShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.05f, .label = "Base Softness", .section = "Shadows",
+      .tooltip = "Constant minimum penumbra width for PCSS shadows. 0 = contact-hard, higher = always soft.",
+      .min = 0.0f, .max = 1.0f, .format = "%.3f",
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiShadowJitter", .binding = &shader_injection.shadow_pcss_jitter_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "PCSS Jitter", .section = "Shadows",
+      .tooltip = "Use IS-FAST blue noise to rotate PCSS sample pattern each frame.",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiShadowJitterAmount", .binding = &shader_injection.shadow_pcss_jitter_amount,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Jitter Amount", .section = "Shadows",
+      .tooltip = "0 = static Poisson, 1 = full temporal rotation.",
+      .min = 0.0f, .max = 1.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiShadowJitterSpeed", .binding = &shader_injection.shadow_pcss_jitter_speed,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 237.f, .label = "Jitter Speed", .section = "Shadows",
+      .tooltip = "Temporal animation speed. Higher = faster rotation.",
+      .min = 0.0f, .max = 500.0f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    // ── Colored Shadow Penumbra (Kai) ──
+    new renodx::utils::settings::Setting{
+      .key = "KaiPenumbraMode", .binding = &shader_injection.shadow_edge_tint,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Colored Penumbra", .section = "Shadows",
+      .tooltip = "Improved mode applies vibrance boost in shadow penumbra regions. No Falcom fallback on Kai.",
+      .labels = {"Off", "Improved"},
+      .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiPenumbraStrength", .binding = &shader_injection.shadow_penumbra_color_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.15f, .label = "Penumbra Strength", .section = "Shadows",
+      .tooltip = "Overall strength of the colored penumbra effect.",
+      .min = 0.0f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiPenumbraVibrance", .binding = &shader_injection.shadow_penumbra_vibrance,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 30.f, .label = "Penumbra Vibrance", .section = "Shadows",
+      .tooltip = "Vibrance applied to surface color in penumbra. 0=grayscale, 1=neutral, >1=vivid.",
+      .min = 0.0f, .max = 100.0f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiPenumbraDetection", .binding = &shader_injection.shadow_penumbra_detection,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 2.0f, .label = "Penumbra Detection", .section = "Shadows",
+      .tooltip = "Penumbra detection width. Higher = wider area gets the effect.",
+      .min = 0.01f, .max = 2.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiPenumbraBrightness", .binding = &shader_injection.shadow_penumbra_color_brightness,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Penumbra Brightness", .section = "Shadows",
+      .tooltip = "Brightness multiplier for the penumbra tint color.",
+      .min = 0.0f, .max = 5.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "KaiPenumbraDebug", .binding = &shader_injection.shadow_penumbra_debug_view,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Penumbra Debug", .section = "Shadows",
+      .tooltip = "Visualize penumbra: 0=Off, 1=Detection Mask, 2=Tint Color, 3=Result, 4=Sun Color.",
+      .labels = {"Off", "Penumbra Mask", "Tint Color", "Result", "Sun Color"},
+      .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -1567,35 +2109,37 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "IS-FAST Jitter: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
+        .label = "IS-FAST Jitter/Noise: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
         .section = "Info",
+        .is_visible = []() { return !IsKai(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "Ultra Shadows are recommended for PCSS. High is minimum.",
         .section = "Info",
+        .is_visible = []() { return !IsKai(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "Disable SSAO from in game settings for small performance boost if you are using XeGTAO.",
         .section = "Info",
+        .is_visible = []() { return !IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Enable Soft or PCSS Shadow Filtering in-game.",
+        .section = "Info",
+        .is_visible = []() { return IsKai(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "If you are going to be using XeGTAO, make sure in-game setting for local shadowing is set to character only.",
+        .section = "Info",
+        .is_visible = []() { return IsKai(); },
     },
     // ── SSGI debug views removed — use XeGTAO Debug View for GI inspection. ──
+
 };
-
-// ═══════════ Developer Mode reset (defined here because it needs `settings` in scope) ═══════════
-
-static void ResetAdvancedSettingsToDefaults() {
-  const auto& advanced_keys = GetAdvancedSettingKeys();
-  for (auto* setting : settings) {
-    if (setting->key.empty()) continue;
-    if (setting->is_global) continue;
-    if (!setting->can_reset) continue;
-    if (advanced_keys.count(setting->key) == 0) continue;
-    setting->Set(setting->default_value);
-    setting->Write();
-  }
-}
 
 // ═══════════ XeGTAO Backend — implementation ═══════════
 
@@ -1710,14 +2254,14 @@ static void OnPushDescriptorsCapture(
   // ── Capture depth/SSAO/CBV — unconditional (register-based, kai-style). ──
   if (update.type == reshade::api::descriptor_type::texture_shader_resource_view) {
     auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
-    // Capture depth t4 — ONLY from the lighting shader (hash 0xFDAAF80E).
-    // Post-processing passes may bind full-res textures at t4, overwriting the real depth.
-    if (update.binding == kLightingDepthRegister && update.count >= 1
+  // Capture depth: t4 (Sora) or t3 (Kai) — ONLY from lighting shader, game-specific binding.
+    uint32_t depthBinding = IsKai() ? kLightingDepthRegisterKai : kLightingDepthRegister;
+    if (update.binding == depthBinding && update.count >= 1
         && views[0].handle != 0u) {
       auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xFDAAF80Eu) {
+        if (IsLightingShader(hash)) {
           d->captured_depth_srv = views[0];
           d->captured_scene_cbv_frame = d->frame_index;
           if (shader_injection.xegtao_debug_logging > 0.5f) {
@@ -1733,13 +2277,21 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    if (update.binding == kLightingSsaoRegister && update.count >= 1
+  // Capture SSAO: t5 (Sora) or t4 (Kai) — game-specific binding.
+    uint32_t ssaoBinding = IsKai() ? kLightingSsaoRegisterKai : kLightingSsaoRegister;
+    if (update.binding == ssaoBinding && update.count >= 1
         && views[0].handle != 0u) {
       d->captured_ssao_srv = views[0];
     }
-    if (update.binding == kLightingMrtNormalRegister && update.count >= 1
+    if ((update.binding == kLightingMrtNormalRegister) && update.count >= 1
         && views[0].handle != 0u) {
-      d->captured_mrt_normal_srv = views[0];
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (IsLightingShader(hash)) {
+          d->captured_mrt_normal_srv = views[0];
+        }
+      }
     }
     // Capture t0 color texture — ONLY from the lighting shader (hash 0xFDAAF80E).
     // Unconditional capture would grab binding 0 from any shader, causing wrong colors.
@@ -1748,7 +2300,7 @@ static void OnPushDescriptorsCapture(
       auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xFDAAF80Eu) {
+        if (IsLightingShader(hash)) {
           d->captured_color_srv = views[0];
         }
       }
@@ -1809,7 +2361,7 @@ static void OnBindDescriptorTables(
   auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
   if (!ss) return;
   uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-  if (hash != 0xFDAAF80Eu) return;  // Only lighting shader
+  if (!IsLightingShader(hash)) return;  // Only lighting shader (Sora + Kai)
 
   auto* ld = renodx::utils::pipeline_layout::GetPipelineLayoutData(layout);
   if (!ld) return;
@@ -1856,6 +2408,8 @@ static void OnBindDescriptorTables(
       if (r.type == reshade::api::descriptor_type::texture_shader_resource_view) {
         resolve_tex(kLightingDepthRegister, &d->captured_depth_srv);
         resolve_tex(kLightingSsaoRegister, &d->captured_ssao_srv);
+        resolve_tex(kLightingDepthRegisterKai, &d->captured_depth_srv);
+        resolve_tex(kLightingSsaoRegisterKai, &d->captured_ssao_srv);
       }
       if (r.type == reshade::api::descriptor_type::constant_buffer) {
         if (!(vm & (sm | static_cast<uint32_t>(reshade::api::shader_stage::vertex)))) continue;
@@ -1881,6 +2435,57 @@ static void OnBindDescriptorTables(
   }
 }
 
+// ── XeGTAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics ──
+static void ApplyXeGTAOCSDispatchFix(
+    reshade::api::command_list* cmd_list,
+    renodx::utils::state::CommandListState* cs,
+    renodx::utils::state::CommandListState& prev) {
+  int fix = (int)g_xegtao_cs_dispatch_fix;
+  if (fix < 1 || fix > 3) {
+    // Fix 0 (Off): legacy behavior — just null pipeline + struct copy
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+    if (cs) *cs = prev;
+    return;
+  }
+
+  if (fix == 2 || fix == 3) {
+    // Push null descriptors to all compute-stage slots used by XeGTAO
+    reshade::api::resource_view null_srv = {};
+    reshade::api::resource_view null_uav = {};
+    reshade::api::resource_view null_cbv = {};
+    reshade::api::sampler null_sampler = {};
+    // s0: sampler
+    cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &null_sampler});
+    // b0: CBV
+    cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &null_cbv});
+    // t0-t4: SRVs
+    for (int i = 0; i < 5; ++i)
+      cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
+          reshade::api::pipeline_layout{0}, 0,
+          reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &null_srv});
+    // u0-u3: UAVs
+    for (int i = 0; i < 4; ++i)
+      cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
+          reshade::api::pipeline_layout{0}, 0,
+          reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
+
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+  }
+
+  if (fix == 1 || fix == 3) {
+    // Restore previous state via Apply() — issues actual GPU commands
+    if (cs) {
+      prev.Apply(cmd_list);
+    } else {
+      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
+    }
+  }
+}
+
 // ── Present hook ──
 
 static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* sc,
@@ -1892,12 +2497,25 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (!d) return;
   d->frame_index++;
 
-  // ── Developer Mode startup guard: force advanced settings to defaults if dev mode is OFF ──
-  static bool s_devmode_startup_checked = false;
-  if (!s_devmode_startup_checked) {
-    s_devmode_startup_checked = true;
-    if (g_developer_mode < 0.5f) {
-      ResetAdvancedSettingsToDefaults();
+  // ── Basic mode startup guard: reset advanced-only settings to defaults if Basic is selected ──
+  static bool s_basic_startup_checked = false;
+  if (!s_basic_startup_checked) {
+    s_basic_startup_checked = true;
+    if (g_settings_mode < 0.5f) {
+      float saved = g_settings_mode;
+      g_settings_mode = 1.0f;
+      std::vector<renodx::utils::settings::Setting*> advanced;
+      for (auto* s : settings) {
+        if (s->key.empty() || !s->can_reset || s->is_global) continue;
+        if (s->is_visible()) advanced.push_back(s);
+      }
+      g_settings_mode = saved;
+      for (auto* s : advanced) {
+        if (!s->is_visible()) {
+          s->Set(s->default_value);
+          s->Write();
+        }
+      }
     }
   }
 
@@ -2039,9 +2657,8 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   bool ok = RunXeGTAO(cl, d);
 
-  // Restore: unbind compute pipeline, restore descriptor tables.
-  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-  if (cs) *cs = prev;
+  // Restore: apply dispatch fix, then restore previous state.
+  ApplyXeGTAOCSDispatchFix(cl, cs, prev);
 
   if (shader_injection.xegtao_debug_logging > 0.5f && ok) {
     std::ostringstream msg;
@@ -2066,6 +2683,36 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   shader_injection.xegtao_dedicated_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
+  // Push IS-FAST noise texture for PCSS shadow jitter (t24 only — NO sampler push,
+  // uses game's samPoint_s at s0 with manual wrap in shader to avoid heap corruption)
+  if (g_isfast_enabled > 0.5f) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (auto* dd = dev->get_private_data<DeviceData>()) {
+        if (dd->isfast_noise_srv.handle) {
+          cmd_list->push_descriptors(
+              reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0}, 0,
+              reshade::api::descriptor_table_update{
+                  {}, 24u, 0, 1,
+                  reshade::api::descriptor_type::texture_shader_resource_view,
+                  &dd->isfast_noise_srv});
+        }
+      }
+    }
+  }
+
+  // ── Kai sync: character SSGI master toggle + PCSS jitter ──
+  shader_injection.char_gi_enabled = (g_char_ssgi_composite_method >= 0.5f) ? 1.f : 0.f;
+  shader_injection.shadow_isfast_jitter_amount = shader_injection.shadow_pcss_jitter_amount;
+  shader_injection.shadow_isfast_jitter_speed = shader_injection.shadow_pcss_jitter_speed;
+  // Zero out jitter when IS-FAST master is off
+  if (g_isfast_enabled < 0.5f) {
+    shader_injection.shadow_isfast_jitter_amount = 0.f;
+    shader_injection.shadow_isfast_jitter_speed = 0.f;
+  }
+  // Sync Kai debug views from shared settings
+  shader_injection.xegtao_debug_mode = shader_injection.xegtao_debug_view;
+  shader_injection.foliage_debug_mode = shader_injection.debug_show_env_sss;
 
   if (shader_injection.xegtao_mode < 0.5f) return true;
   if (!cmd_list) return true;
@@ -2095,8 +2742,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
       bool ok = RunXeGTAO(cmd_list, dd);
 
-      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-      if (cs) *cs = prev;
+      ApplyXeGTAOCSDispatchFix(cmd_list, cs, prev);
       (void)ok;
     }
   }
@@ -2159,12 +2805,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (do_push) {
     if (!push_srv.handle) push_srv = dd->fallback_srv;
     if (push_srv.handle) {
+      uint32_t giRegister = IsKai() ? 23u : kLightingSsgiRegister;  // Kai uses t23 for XeGTAO GI
       cmd_list->push_descriptors(
           reshade::api::shader_stage::pixel,
           reshade::api::pipeline_layout{0},
           0,
           reshade::api::descriptor_table_update{
-              {}, kLightingSsgiRegister, 0, 1,
+              {}, giRegister, 0, 1,
               reshade::api::descriptor_type::texture_shader_resource_view,
               &push_srv,
           });
@@ -2281,6 +2928,7 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
   dp(d->prefilter_pipeline); dp(d->main_low_pipeline); dp(d->main_medium_pipeline);
   dp(d->main_high_pipeline); dp(d->main_ultra_pipeline); dp(d->denoise_pipeline);
   dp(d->denoise_last_pipeline);
+  dp(d->denoise_last_kai_pipeline);
   dl(d->prefilter_layout); dl(d->main_layout); dl(d->denoise_layout);
   DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
   DestroyXeGTAODescriptorTables(dev, &d->main_tables);
@@ -2295,6 +2943,7 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyXeGTAODescriptorTables(dev, &d->multibounce_tables);
   // IS-FAST noise
   dv(d->isfast_noise_srv); dr(d->isfast_noise_texture);
+  if (d->isfast_sampler.handle) { dev->destroy_sampler(d->isfast_sampler); d->isfast_sampler = {}; }
   d->isfast_texture_loaded = false;
   d->isfast_texture_attempted = false;
   // Do NOT clear captured_depth_srv / captured_scene_cbv —
@@ -2304,9 +2953,9 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 49> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 50> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f) {
-  std::array<float, 49> c = {};
+  std::array<float, 50> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.xegtao_denoise_passes;
   c[0]  = shader_injection.xegtao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -2350,30 +2999,31 @@ static std::array<float, 49> BuildXeGTAOPushConstants(DeviceData* data, bool den
   c[30] = shader_injection.ssgi_multibounce;                       // multi-bounce (0/1)
   c[31] = std::clamp(shader_injection.ssgi_multibounce_strength, 0.f, 10.f);  // feedback strength
   c[32] = std::clamp(shader_injection.ssgi_multibounce_saturation, 0.f, 2.f); // feedback saturation
-  c[33] = shader_injection.ssgi_debug_view;                         // SSGI debug view (for shader-side activity viz)
-  c[34] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
-  c[35] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
-  c[36] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
-  c[37] = shader_injection.ssgi_adaptive_mode;                       // 0=GI color, 1=albedo
-  c[38] = std::clamp(shader_injection.ssgi_adaptive_luma_strength, 0.f, 5.f); // 0=off
-  c[39] = std::clamp(shader_injection.ssgi_adaptive_luma_blend, 0.f, 1.f);
-  c[40] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
-  c[41] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
-  c[42] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
+  c[33] = std::clamp(shader_injection.ssgi_multibounce_max_clamp, 0.f, 20.f);  // multi-bounce max clamp
+  c[34] = shader_injection.ssgi_debug_view;                         // SSGI debug view
+  c[35] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
+  c[36] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
+  c[37] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
+  c[38] = shader_injection.ssgi_adaptive_mode;                       // 0=GI color, 1=albedo
+  c[39] = std::clamp(shader_injection.ssgi_adaptive_luma_strength, 0.f, 5.f); // 0=off
+  c[40] = std::clamp(shader_injection.ssgi_adaptive_luma_blend, 0.f, 1.f);
+  c[41] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
+  c[42] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
+  c[43] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
   // ── Denoiser leak parameters ──
-  c[43] = std::clamp(shader_injection.xegtao_denoise_leak_threshold, 1.f, 4.f);
-  c[44] = std::clamp(shader_injection.xegtao_denoise_leak_strength, 0.f, 1.f);
+  c[44] = std::clamp(shader_injection.xegtao_denoise_leak_threshold, 1.f, 4.f);
+  c[45] = std::clamp(shader_injection.xegtao_denoise_leak_strength, 0.f, 1.f);
   // ── Spatio-Temporal denoiser ──
-  c[45] = shader_injection.xegtao_denoiser_type;                     // 0=Spatial, 1=Spatio-Temporal
+  c[46] = shader_injection.xegtao_denoiser_type;                     // 0=Spatial, 1=Spatio-Temporal
   // Temporal blend: base weight from frame count, scaled by blend strength
   {
     float fc = shader_injection.xegtao_temporal_frame_count;
     float baseWeight = (fc > 1.f) ? ((fc - 1.f) / fc) : 0.f;
     float blendScale = std::clamp(shader_injection.xegtao_temporal_blend, 0.f, 1.f);
-    c[46] = std::clamp(baseWeight * blendScale, 0.0f, 0.98f);
+    c[47] = std::clamp(baseWeight * blendScale, 0.0f, 0.98f);
   }
-  c[47] = std::clamp(shader_injection.xegtao_disocclusion_threshold, 0.001f, 0.1f);
-  c[48] = shader_injection.xegtao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
+  c[48] = std::clamp(shader_injection.xegtao_disocclusion_threshold, 0.001f, 0.1f);
+  c[49] = shader_injection.xegtao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
   return c;
 }
 
@@ -2394,6 +3044,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->prefilter_pipeline); dp(d->main_low_pipeline); dp(d->main_medium_pipeline);
   dp(d->main_high_pipeline); dp(d->main_ultra_pipeline); dp(d->denoise_pipeline);
   dp(d->denoise_last_pipeline);
+  dp(d->denoise_last_kai_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
     DestroyXeGTAODescriptorTables(dev, &d->main_tables);
@@ -2427,7 +3078,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 49;
+    push_constants_range.count = 50;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -2459,6 +3110,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->main_ultra_pipeline.handle)    mkcs(__xegtao_main_ultra, "main", d->main_layout, &d->main_ultra_pipeline);
   if (!d->denoise_pipeline.handle)       mkcs(__xegtao_denoise_pass, "main", d->denoise_layout, &d->denoise_pipeline);
   if (!d->denoise_last_pipeline.handle)  mkcs(__xegtao_denoise_last, "main", d->denoise_layout, &d->denoise_last_pipeline);
+  // Kai variant: same layout, different CSO with correct prevViewProj_g at c85
+  if (!d->denoise_last_kai_pipeline.handle) mkcs(__xegtao_denoise_last_kai, "main", d->denoise_layout, &d->denoise_last_kai_pipeline);
   if (!d->multibounce_pipeline.handle)   mkcs(__xegtao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
 
   // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
@@ -2482,6 +3135,13 @@ struct DDS_HEADER_DXT10 { uint32_t dxgiFormat, resourceDimension, miscFlag, arra
 #pragma pack(pop)
 
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
+  // Diagnostic log every frame when debug logging is on
+  if (g_isfast_debug_logging > 0.5f) {
+    reshade::log::message(reshade::log::level::info,
+      (std::string("[IS-FAST] Status: attempted=") + (d->isfast_texture_attempted ? "yes" : "no")
+       + ", loaded=" + (d->isfast_texture_loaded ? "yes" : "no")
+       + ", srv=" + (d->isfast_noise_srv.handle ? "valid" : "null")).c_str());
+  }
   if (d->isfast_texture_attempted) return d->isfast_texture_loaded;
   d->isfast_texture_attempted = true;
 
@@ -2564,6 +3224,16 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
     reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_3d,
                                      reshade::api::format::r8g8_unorm, 0, 1, 0, 1),
     &d->isfast_noise_srv);
+
+  // Create point-wrap sampler for IS-FAST noise sampling
+  {
+    reshade::api::sampler_desc sd = {};
+    sd.filter = reshade::api::filter_mode::min_mag_mip_point;
+    sd.address_u = reshade::api::texture_address_mode::wrap;
+    sd.address_v = reshade::api::texture_address_mode::wrap;
+    sd.address_w = reshade::api::texture_address_mode::wrap;
+    dev->create_sampler(sd, &d->isfast_sampler);
+  }
 
   d->isfast_texture_loaded = true;
   if (g_isfast_debug_logging > 0.5f)
@@ -2813,7 +3483,8 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       reshade::api::resource dst_tex;
       if (use_a) { src = d->ao_term_a_srv; dst_uav = d->ao_term_b_uav; dst_tex = d->ao_term_b_texture; }
       else       { src = d->ao_term_b_srv; dst_uav = d->ao_term_a_uav; dst_tex = d->ao_term_a_texture; }
-      bind_pipe(last ? d->denoise_last_pipeline : d->denoise_pipeline);
+      auto& last_pipe = IsKai() ? d->denoise_last_kai_pipeline : d->denoise_last_pipeline;
+      bind_pipe(last ? last_pipe : d->denoise_pipeline);
       // Ping-pong history: read from last frame's write target, write to other buffer
       reshade::api::resource_view hist_srv = d->history_ao_read_from_a
           ? (d->history_ao_srv_a.handle ? d->history_ao_srv_a : d->fallback_srv)

@@ -267,11 +267,30 @@ void main(
   }
   r4.xyz = ao_sample;
 
+  // ── Cached SSGI: sample & process once, reused at all sites (Kai-style optimization) ──
+  float3 cachedSSGI = float3(0, 0, 0);
+  float cachedSSGILuma = 0;
+  if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
+    float3 giRaw = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+    float giLuma = dot(giRaw, float3(0.299, 0.587, 0.114));
+    float3 giColor = lerp(giLuma.xxx, giRaw, shader_injection_data.ssgi_saturation);
+    giColor *= shader_injection_data.ssgi_intensity;
+    if (shader_injection_data.ssgi_max_clamp > 0.0) {
+      giColor = min(giColor, shader_injection_data.ssgi_max_clamp);
+    }
+    if (shader_injection_data.ssgi_affect_lights > 0.5f) {
+      float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
+      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.ssgi_lights_saturation);
+      lightContrib = saturate(lightContrib);
+      giColor += lightContrib * shader_injection_data.ssgi_lights_strength * 0.2f;
+    }
+    cachedSSGI = giColor;
+    cachedSSGILuma = dot(cachedSSGI, float3(0.333, 0.333, 0.333));
+  }
+
   // Reduce AO where indirect light exists
   if (shader_injection_data.ssgi_reduce_ao > 0.5f && shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-    float3 giEarly = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
-    float giBrightness = dot(giEarly, float3(0.333, 0.333, 0.333));
-    r4.x = lerp(r4.x, 1.0, saturate(giBrightness * shader_injection_data.ssgi_reduce_ao_strength));
+    r4.x = lerp(r4.x, 1.0, saturate(cachedSSGILuma * shader_injection_data.ssgi_reduce_ao_strength));
   }
 
   // —— XeGTAO Debug View ——
@@ -575,27 +594,7 @@ void main(
     }
 
     if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-      float3 giRaw = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
-      
-      // Saturation control: lerp between grayscale and full color.
-      float giLuma = dot(giRaw, float3(0.299, 0.587, 0.114));
-      float3 giColor = lerp(giLuma.xxx, giRaw, shader_injection_data.ssgi_saturation);
-      
-      // Intensity.
-      giColor *= shader_injection_data.ssgi_intensity;
-
-      // Max clamp
-      if (shader_injection_data.ssgi_max_clamp > 0.0) {
-        giColor = min(giColor, shader_injection_data.ssgi_max_clamp);
-      }
-
-      // Affect Lights: additively blend sun color into GI (SSGI-style lerp saturation)
-      if (shader_injection_data.ssgi_affect_lights > 0.5f) {
-        float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
-        float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.ssgi_lights_saturation);
-        lightContrib = saturate(lightContrib);
-        giColor += lightContrib * shader_injection_data.ssgi_lights_strength * 0.2f;
-      }
+      float3 giColor = cachedSSGI;
 
       // Light Color debug view — shows sun color uniformly
       if ((int)shader_injection_data.ssgi_debug_view == 6) {
@@ -1442,27 +1441,7 @@ void main(
   }
 
   if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-    float3 giRaw = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
-    
-    // Saturation control.
-    float giLuma = dot(giRaw, float3(0.299, 0.587, 0.114));
-    float3 giColor = lerp(giLuma.xxx, giRaw, shader_injection_data.ssgi_saturation);
-    
-    // Intensity.
-    giColor *= shader_injection_data.ssgi_intensity;
-
-    // Max clamp
-    if (shader_injection_data.ssgi_max_clamp > 0.0) {
-      giColor = min(giColor, shader_injection_data.ssgi_max_clamp);
-    }
-
-    // Affect Lights: additively blend sun color into GI (SSGI-style lerp saturation)
-    if (shader_injection_data.ssgi_affect_lights > 0.5f) {
-      float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
-      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.ssgi_lights_saturation);
-      lightContrib = saturate(lightContrib);
-      giColor += lightContrib * shader_injection_data.ssgi_lights_strength * 0.2f;
-    }
+    float3 giColor = cachedSSGI;
 
     // Light Color debug view — shows sun color uniformly
     if ((int)shader_injection_data.ssgi_debug_view == 6) {

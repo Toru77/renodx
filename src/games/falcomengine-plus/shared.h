@@ -16,6 +16,7 @@ struct ShaderInjectData {
   float volfog_jitter_amount;          // [0..2], default 0.5 — jitter strength
   float volfog_jitter_speed;           // [0..1024], default 237 — temporal speed
   float volfog_isfast_spatial_scale;   // [0.25..4], default 1.0 — volfog spatial scale
+  float volfog_noise_strength;         // [0..2], default 1.0 — noise strength (0=off, 1=natural, 2=boosted)
   float volfog_isfast_dedicated_sampler;// 0=s1 point, 1=s2 dedicated point-wrap sampler
 
   // Character Shadowing
@@ -39,6 +40,8 @@ struct ShaderInjectData {
   float env_sss_enabled;
   float env_sss_strength;
   float env_sss_sample_count;
+  float env_sss_hard_shadow_samples; // 0=auto (sampleCount/8), >0=override
+  float env_sss_fade_out_samples;    // 0=auto (sampleCount/3), >0=override
   float env_sss_surface_thickness;
   float env_sss_contrast;
   float env_sss_jitter_enabled;
@@ -87,6 +90,7 @@ struct ShaderInjectData {
   float ssgi_multibounce;           // 0=Off, 1=On
   float ssgi_multibounce_strength;  // [0..10], default 1.0 — feedback intensity
   float ssgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
+  float ssgi_multibounce_max_clamp; // [0..20], default 0 — max multi-bounce per-channel (0=off)
   float ssgi_adaptive_r;            // [0..1], default 0 — per-channel red adaptive boost
   float ssgi_adaptive_g;            // [0..1], default 0 — per-channel green adaptive boost
   float ssgi_adaptive_b;            // [0..1], default 0 — per-channel blue adaptive boost
@@ -135,6 +139,95 @@ struct ShaderInjectData {
   float shadow_isfast_spatial_scale;   // [0.25..4], default 1.0
   float shadow_isfast_temporal_speed;  // [0..5], default 1.0
   float shadow_isfast_seed_offset;     // [0..64], default 0
+
+  // ── Kai-specific fields (only active when running kai.exe) ──
+  // Cubemap
+  float cubemap_improvements_enabled;  // 0=Vanilla, 1=Improved
+  float cubemap_lighting_mip_boost;    // [0.5..4], default 1.5 — lighting shader cubemap mip scale
+  float floor_cubemap_mip_scale;       // [0..4], default 4 — floor reflection roughness/mip response
+  // SSGI (Falcom native, not XeGTAO)
+  float ssgi_mod_enabled;              // 0=Off, 1=On
+  float ssgi_color_boost;              // [0..3], default 1 — scales SSGI RGB before power shaping
+  float ssgi_alpha_boost;              // [0..3], default 1 — scales SSGI alpha before saturate
+  float ssgi_pow;                      // [0.1..3], default 1 — pow(abs(color), Power) bounce response
+  // Depth of Field
+  float dof_mode;                      // 0=Vanilla, 1=Improved
+  float dof_strength;                  // [0..2], default 1 — overall blend for improved DOF
+  float dof_radius_scale;              // [0.25..2.5], default 1.33 — blur radius from CoC
+  float dof_sample_count;              // [4..64], default 24
+  float dof_near_scale;                // [0..2], default 1 — near-field CoC response
+  float dof_far_scale;                 // [0..2], default 1 — far-field CoC response
+  float dof_coc_curve;                 // [0.25..4], default 1 — pow(CoC, Curve)
+  float dof_edge_threshold;            // [0.02..1], default 0.25 — CoC-mismatch rejection
+  // Character SSGI Composite
+  float char_gi_strength;              // [0..3], default 3 — overall GI contribution
+  float char_gi_alpha_scale;           // [0..3], default 1 — sampled SSGI alpha scale
+  float char_gi_chroma_strength;       // [0..2], default 0.5 — colorful GI component
+  float char_gi_luma_strength;         // [0..1], default 0 — neutral GI brightness
+  float char_gi_shadow_power;          // [0.1..4], default 1.25 — concentrates GI toward dark areas
+  float char_gi_dark_boost;            // [0..4], default 0 — extra GI in darker regions
+  float char_gi_bright_boost;          // [0..3], default 3 — boosts GI on brighter regions
+  float char_gi_headroom_power;        // [0.1..4], default 1.25 — bright pixel GI rejection
+  float char_gi_max_add;               // [0..1], default 0.02 — per-channel GI cap
+  float char_gi_peak_luma_cap;         // [0..1], default 0 — caps peak GI brightness
+  float char_gi_depth_reject;          // [0..16], default 2 — suppress GI across depth edges
+  // Fog Color Correction
+  float fog_color_correction_enabled;  // 0=Vanilla, 1=Improved
+  float fog_hue;                       // [0..2], default 0
+  float fog_chrominance;               // [0..2], default 0
+  float fog_avg_brightness;            // [0..2], default 0.85
+  float fog_min_brightness;            // [-0.5..1], default 0
+  float fog_min_chroma_change;         // [0..4], default 0 — min chroma ratio
+  float fog_max_chroma_change;         // [0..8], default 0 — max chroma ratio
+  float fog_lightness_strength;        // [0..2], default 1 — fog lightness restoration
+  float fog_color_correction_strength; // [0..1], default 0.5 — 2D fog correction blend
+  // SSR (Kai — not wired in UI yet, fields needed for shader compilation)
+  float ssr_mode;                      // 0=Off, 1=On
+  float ssr_ray_count_scale;           // [0..5], default 1
+  // Foliage translucency/opacity (Kai-specific)
+  float foliage_translucency_scale;    // default 1
+  float foliage_opacity_scale;         // default 1
+  float foliage_ssao_scale;            // default 1
+  // Kai XeGTAO bent normal / foliage mask fields
+  float xegtao_bent_diffuse_strength;
+  float xegtao_bent_diffuse_softness;
+  float xegtao_bent_specular_strength;
+  float xegtao_bent_specular_proxy_roughness;
+  float xegtao_bent_max_darkening;
+  float xegtao_bent_normals;
+  float xegtao_force_neutral_x;
+  float xegtao_debug_blackout;
+  float xegtao_ao_active_for_draw;
+  float xegtao_foliage_ao_blend;
+  float xegtao_foliage_mask_method;
+  float xegtao_mrt_normal_valid;
+  float xegtao_debug_mode;             // Kai XeGTAO debug mode (distinct from xegtao_debug_view)
+  float xegtao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_xegtao_normal_input_mode)
+  // Kai char shadow / misc
+  float char_shadow_strength;
+  float foliage_debug_mode;
+  float sss_dedicated_bound;
+  float shadow_isfast_jitter_amount;
+  float shadow_isfast_jitter_speed;
+  float shadow_pcss_sample_mode;
+  // Kai character SSGI debug/internal fields
+  float char_gi_enabled;
+  float char_gi_ao_influence;
+  float char_gi_reject_strength;
+  float char_gi_normal_reject;
+  float char_gi_debug_mode;
+  float char_gi_debug_scale;
+  float char_gi_debug_chars_only;
+  // Kai volfog fields
+  float volfog_enabled;
+  float volfog_tricubic_enabled;
+  float volfog_is_fast_enabled;
+  float isfast_noise_bound;
+  float volfog_color_correction_strength;
+  // Kai: XeGTAO SSGI consume Falcom SSGI
+  float ssgi_kai_consume_falcom;       // 0=Off, 1=On — use Falcom SSGI to modulate XeGTAO GI
+  float ssgi_kai_falcom_blend;         // [0..1], default 0.5 — how much Falcom SSGI modulates XeGTAO GI
+  float ssgi_kai_xegtao_only;          // 0=Off, 1=On — suppress Falcom SSGI output, XeGTAO GI only
 };
 
 #ifndef __cplusplus

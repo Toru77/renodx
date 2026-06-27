@@ -43,7 +43,11 @@ cbuffer cb_scene : register(b0)
   float4x4 viewInv_g       : packoffset(c4);
   float4x4 proj_g          : packoffset(c8);
   float4x4 projInv_g       : packoffset(c12);
-  float4x4 prevViewProj_g  : packoffset(c74);
+#ifdef RENODX_KAI
+  float4x4 prevViewProj_g  : packoffset(c85);   // Kai: prevViewProj_g at c85
+#else
+  float4x4 prevViewProj_g  : packoffset(c74);   // Sora 1st: prevViewProj_g at c74
+#endif
 };
 
 // ── User settings via push_constants (b13) ──
@@ -83,7 +87,8 @@ cbuffer cb_xegtao : register(b13)
   float g_gi_multibounce;                // c[30] — multi-bounce enable (0/1)
   float g_gi_multibounce_strength;       // c[31] — feedback intensity [0..10]
   float g_gi_multibounce_saturation;     // c[32] — feedback color saturation [0..2]
-  float g_ssgi_debug_view;               // c[33] — SSGI debug view mode
+  float g_gi_multibounce_max_clamp;      // c[33] — max multi-bounce per-channel (0=off)
+  float g_ssgi_debug_view;               // c[34] — SSGI debug view mode
   float xegtao_isfast_enabled;           // c[34] — IS-FAST enable (0/1)
   float xegtao_isfast_strength;          // c[35] — IS-FAST noise strength [0..1]
   float xegtao_isfast_debug;             // c[36] — IS-FAST texture loaded flag (set by shader check)
