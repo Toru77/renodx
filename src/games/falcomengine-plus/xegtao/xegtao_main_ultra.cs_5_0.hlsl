@@ -196,10 +196,10 @@ void main(uint2 p : SV_DispatchThreadID)
   lpfloat slice_count = 3.0;
   lpfloat steps_per_slice = 3.0;
   uint q = (uint)round(clamp(xegtao_quality, 0.0, 3.0));
-  if (q == 0u)      { slice_count = 1.0; steps_per_slice = 3.0; }  // Low
-  else if (q == 1u) { slice_count = 2.0; steps_per_slice = 3.0; }  // Medium
-  else if (q == 2u) { slice_count = 3.0; steps_per_slice = 3.0; }  // High
-  else              { slice_count = 4.0; steps_per_slice = 3.0; }  // Ultra
+  if (q == 0u)      { slice_count = 2.0; steps_per_slice = 3.0; }  // Low
+  else if (q == 1u) { slice_count = 3.0; steps_per_slice = 3.0; }  // Medium
+  else if (q == 2u) { slice_count = 4.0; steps_per_slice = 3.0; }  // High
+  else              { slice_count = 5.0; steps_per_slice = 3.0; }  // Ultra
 
   XeGTAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
