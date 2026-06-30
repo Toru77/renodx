@@ -1240,7 +1240,6 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Quality Level", .section = "XeGTAO",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "XeGTAODenoisePasses", .binding = &shader_injection.xegtao_denoise_passes,
