@@ -1399,7 +1399,7 @@ void main(
             r4.xy = r4.xy / r8.zw;
             r4.x = max(r4.x, r4.y);
             r4.x = r6.x ? 0 : r4.x;
-            r4.x = (int)r3.w & (int)r4.x;
+            r4.x = r3.w ? r4.x : 0;
             r3.w = r3.w ? r6.x : -1;
             r2.w = r3.z ? r4.x : 0;
             r3.y = r3.z ? r3.w : 0;
