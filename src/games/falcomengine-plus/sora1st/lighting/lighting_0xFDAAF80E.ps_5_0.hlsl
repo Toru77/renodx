@@ -183,8 +183,8 @@ Texture2D<uint4> mrtTexture1 : register(t2);
 Texture2D<uint2> mrtTexture2 : register(t3);
 Texture2D<float4> depthTexture : register(t4);
 Texture2D<float4> ssaoTexture : register(t5);
-Texture2D<uint4> xegtaoTexture : register(t22);  // XeGTAO AO (r32_uint, packed 0-255)
-Texture2D<float4> ssgiTexture : register(t23);   // SSGI indirect diffuse (R16G16B16A16)
+Texture2D<uint4> gtvbaoTexture : register(t22);  // GTVBAO AO (r32_uint, packed 0-255)
+Texture2D<float4> vbgiTexture : register(t23);   // VBGI indirect diffuse (R16G16B16A16)
 StructuredBuffer<DeferredParam> deferredParams_g : register(t6);
 StructuredBuffer<OutlineShapeParam> outlineShapes_g : register(t7);
 Texture2D<float4> outlineShapeMask : register(t8);
@@ -240,85 +240,85 @@ void main(
   r3.zw = float2(0,0);
   r3.xy = mrtTexture2.Load(r3.xyz).xy;
   // Sample AO: always read vanilla SSAO first, then conditionally
-  // replace only the .x channel with XeGTAO (kai-vanillaplus pattern).
+  // replace only the .x channel with GTVBAO (kai-vanillaplus pattern).
   float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
-  bool xegtao_bound = shader_injection_data.xegtao_dedicated_bound > 0.5f;
+  bool GTVBAO_bound = shader_injection_data.gtvbao_dedicated_bound > 0.5f;
 
   float3 ao_sample = ssao_sample;
-  if (xegtao_bound) {
+  if (GTVBAO_bound) {
     uint width, height;
-    xegtaoTexture.GetDimensions(width, height);
+    gtvbaoTexture.GetDimensions(width, height);
     uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
-    uint4 xegtao_raw = xegtaoTexture.Load(int3(texel, 0));
-    float xegtao_ao = float(xegtao_raw.x) / 255.0;
+    uint4 GTVBAO_raw = gtvbaoTexture.Load(int3(texel, 0));
+    float GTVBAO_ao = float(GTVBAO_raw.x) / 255.0;
 
-    int fix = (int)shader_injection_data.xegtao_fix_experimental;
+    int fix = (int)shader_injection_data.gtvbao_fix_experimental;
     if (fix == 1) {
       ao_sample.x = 1.0;  // Neutral: test if veil is from AO value
     } else if (fix == 2) {
-      ao_sample.x = float(xegtao_raw.x) / 255.0;  // Full uint, no 0xFF mask
+      ao_sample.x = float(GTVBAO_raw.x) / 255.0;  // Full uint, no 0xFF mask
     } else if (fix == 3) {
-      ao_sample.x = 1.0 - xegtao_ao;  // Inverted encoding
+      ao_sample.x = 1.0 - GTVBAO_ao;  // Inverted encoding
     } else if (fix == 4) {
-      ao_sample = float3(xegtao_ao, xegtao_ao, xegtao_ao);  // All channels XeGTAO
+      ao_sample = float3(GTVBAO_ao, GTVBAO_ao, GTVBAO_ao);  // All channels GTVBAO
     } else {
-      ao_sample.x = xegtao_ao;  // Default current
+      ao_sample.x = GTVBAO_ao;  // Default current
     }
   }
   r4.xyz = ao_sample;
 
-  // ── Cached SSGI: sample & process once, reused at all sites (Kai-style optimization) ──
-  float3 cachedSSGI = float3(0, 0, 0);
-  float cachedSSGILuma = 0;
-  if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-    float3 giRaw = ssgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
+  // ── Cached VBGI: sample & process once, reused at all sites (Kai-style optimization) ──
+  float3 cachedVBGI = float3(0, 0, 0);
+  float cachedVBGILuma = 0;
+  if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+    float3 giRaw = vbgiTexture.SampleLevel(samLinear_s, v1.xy, 0).rgb;
     float giLuma = dot(giRaw, float3(0.299, 0.587, 0.114));
-    float3 giColor = lerp(giLuma.xxx, giRaw, shader_injection_data.ssgi_saturation);
-    giColor *= shader_injection_data.ssgi_intensity;
-    if (shader_injection_data.ssgi_max_clamp > 0.0) {
-      giColor = min(giColor, shader_injection_data.ssgi_max_clamp);
+    float3 giColor = lerp(giLuma.xxx, giRaw, shader_injection_data.vbgi_saturation);
+    giColor *= shader_injection_data.vbgi_intensity;
+    if (shader_injection_data.vbgi_max_clamp > 0.0) {
+      giColor = min(giColor, shader_injection_data.vbgi_max_clamp);
     }
-    if (shader_injection_data.ssgi_affect_lights > 0.5f) {
+    if (shader_injection_data.vbgi_affect_lights > 0.5f) {
       float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
-      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.ssgi_lights_saturation);
+      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.vbgi_lights_saturation);
       lightContrib = saturate(lightContrib);
-      giColor += lightContrib * shader_injection_data.ssgi_lights_strength * 0.2f;
+      giColor += lightContrib * shader_injection_data.vbgi_lights_strength * 0.2f;
     }
-    cachedSSGI = giColor;
-    cachedSSGILuma = dot(cachedSSGI, float3(0.333, 0.333, 0.333));
+    cachedVBGI = giColor;
+    cachedVBGILuma = dot(cachedVBGI, float3(0.333, 0.333, 0.333));
   }
 
   // Reduce AO where indirect light exists
-  if (shader_injection_data.ssgi_reduce_ao > 0.5f && shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-    r4.x = lerp(r4.x, 1.0, saturate(cachedSSGILuma * shader_injection_data.ssgi_reduce_ao_strength));
+  if (shader_injection_data.vbgi_reduce_ao > 0.5f && shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+    r4.x = lerp(r4.x, 1.0, saturate(cachedVBGILuma * shader_injection_data.vbgi_reduce_ao_strength));
   }
 
-  // —— XeGTAO Debug View ——
+  // —— GTVBAO Debug View ——
   // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
-  if (shader_injection_data.xegtao_debug_view > 0.5f) {
-    int mode = (int)shader_injection_data.xegtao_debug_view;
-    float hdr_scale = 0.05;
+  if (shader_injection_data.gtvbao_debug_view > 0.5f) {
+    int mode = (int)shader_injection_data.gtvbao_debug_view;
+    float hdr_scale = 0.3;
     if (mode == 1) {
       // AO Only: red tint for visibility
       o0.rgb = float3(ao_sample.x * hdr_scale, 0.0, 0.0);
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode == 2) {
-      // XeGTAO Raw: uint4.x decoded directly
+      // GTVBAO Raw: uint4.x decoded directly
       uint width, height;
-      xegtaoTexture.GetDimensions(width, height);
+      gtvbaoTexture.GetDimensions(width, height);
       uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
-      uint4 raw = xegtaoTexture.Load(int3(texel, 0));
+      uint4 raw = gtvbaoTexture.Load(int3(texel, 0));
       float raw_ao = float(raw.x) / 255.0;
       o0.rgb = float3(raw_ao, raw_ao, raw_ao) * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
     if (mode == 3) {
-      // XeGTAO Raw RGBA: uint4 channels decoded directly
+      // GTVBAO Raw RGBA: uint4 channels decoded directly
       uint width, height;
-      xegtaoTexture.GetDimensions(width, height);
+      gtvbaoTexture.GetDimensions(width, height);
       uint2 texel = uint2(saturate(v1.xy) * float2(width, height));
-      uint4 raw = xegtaoTexture.Load(int3(texel, 0));
+      uint4 raw = gtvbaoTexture.Load(int3(texel, 0));
       o0.rgba = float4(
         float(raw.x) / 255.0,
         float(raw.y) / 255.0,
@@ -583,7 +583,7 @@ void main(
     ApplyEnvSSS(r6.xyz, v1.xy, mrt0_xy_raw, is_character_pixel);
 
     // Probe ambient debug — show lightProbe_g[0] DC term (indoor/outdoor signal)
-    if (shader_injection_data.ssgi_cascade_debug > 0.5f) {
+    if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
       float3 probeAmbient = lightProbe_g[0].xyz;
       r6.xyz = probeAmbient * 0.5;
       r6.w = r0.w;
@@ -593,11 +593,11 @@ void main(
       return;
     }
 
-    if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-      float3 giColor = cachedSSGI;
+    if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+      float3 giColor = cachedVBGI;
 
       // Light Color debug view — shows sun color uniformly
-      if ((int)shader_injection_data.ssgi_debug_view == 6) {
+      if ((int)shader_injection_data.vbgi_debug_view == 6) {
         r6.xyz = lightColor_g.xyz * 0.05;
         r6.w = r0.w;
         o0.xyzw = r6.xyzw;
@@ -607,9 +607,9 @@ void main(
       }
 
       // Character mask: reduce GI on characters by configured amount.
-      giColor *= (1.0 - shader_injection_data.ssgi_char_mask_strength);
+      giColor *= (1.0 - shader_injection_data.vbgi_char_mask_strength);
       
-      if (shader_injection_data.xegtao_ssgi_debug > 0.5f) {
+      if (shader_injection_data.gtvbao_vbgi_debug > 0.5f) {
         r6.xyz = giColor;  // Debug: replace scene with GI texture
       } else {
         r6.xyz += giColor;  // Normal: add GI to scene
@@ -1430,7 +1430,7 @@ void main(
   o0.xyz = r0.yzw;
 
   // Probe ambient debug — character pixel path
-  if (shader_injection_data.ssgi_cascade_debug > 0.5f) {
+  if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
     float3 probeAmbient = lightProbe_g[0].xyz;
     o0.xyz = probeAmbient * 0.5;
     o0.w = 1;
@@ -1440,11 +1440,11 @@ void main(
     return;
   }
 
-  if (shader_injection_data.xegtao_ssgi_bound > 0.5f) {
-    float3 giColor = cachedSSGI;
+  if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+    float3 giColor = cachedVBGI;
 
     // Light Color debug view — shows sun color uniformly
-    if ((int)shader_injection_data.ssgi_debug_view == 6) {
+    if ((int)shader_injection_data.vbgi_debug_view == 6) {
       o0.xyz = lightColor_g.xyz * 0.05;
       o0.w = 1;
       o1.xyzw = r2.xyzw;
@@ -1453,7 +1453,7 @@ void main(
       return;
     }
 
-    if (shader_injection_data.xegtao_ssgi_debug > 0.5f) {
+    if (shader_injection_data.gtvbao_vbgi_debug > 0.5f) {
       o0.xyz = giColor;  // Debug: replace scene with GI texture
     } else {
       o0.xyz += giColor;  // Normal: add GI to scene

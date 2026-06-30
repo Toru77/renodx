@@ -1,31 +1,32 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// sora-vanillaplus XeGTAO — Pass 3: Denoise (final pass)
+// falcomengine-plus GTVBAO — Pass 3: Denoise (final pass)
 //
 // Kai-style: builds GTAOConstants in-shader.
-// Extended to denoise GI alongside AO when XE_GTAO_COMPUTE_GI is defined.
+// Extended to denoise GI alongside AO when GT_VBAO_COMPUTE_GI is defined.
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define XE_GTAO_COMPUTE_GI
-#include "xegtao_common.hlsl"
+#define GT_VBAO_COMPUTE_GI
+#include "gtvbao_common.hlsl"
 
 Texture2D<uint>    g_srcWorkingAOTerm : register(t0);
 Texture2D<lpfloat> g_srcWorkingEdges  : register(t1);
 Texture2D<float4>  g_srcRawGI          : register(t2);  // raw GI from main pass
 Texture2D<uint>    g_srcHistoryAO      : register(t3);  // previous frame denoised AO
 Texture2D<float>   g_srcDepth          : register(t4);  // viewspace depth MIP0 for reprojection
+Texture2D<uint4>   g_mrtNormalTexture  : register(t5);  // MRT g-buffer normals (for Poisson denoiser)
 SamplerState       g_samplerPointClamp : register(s0);
 RWTexture2D<uint>  g_outFinalAOTerm   : register(u0);
 RWTexture2D<float4> g_outGI            : register(u1);
 RWTexture2D<uint>  g_outHistoryAO     : register(u2);  // write history for next frame
 
 // ── GI denoise helpers ──
-float XeGTAO_DenoiseGI_EdgeWeight(float centerDepth, float neighborDepth)
+float GTVBAO_DenoiseGI_EdgeWeight(float centerDepth, float neighborDepth)
 {
     float diff = abs(centerDepth - neighborDepth);
     return exp(-diff * 10.0);
 }
 
-void XeGTAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
+void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
     Texture2D<float4> srcGI, Texture2D<lpfloat> srcDepth,
     SamplerState samp, RWTexture2D<float4> outGI)
 {
@@ -58,7 +59,7 @@ void XeGTAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
         float2 nuv = (float2(nc) + 0.5) * consts.ViewportPixelSize;
         float neighborDepth = srcDepth.SampleLevel(samp, nuv, 0);
 
-        float depthW = XeGTAO_DenoiseGI_EdgeWeight(centerDepth, neighborDepth);
+        float depthW = GTVBAO_DenoiseGI_EdgeWeight(centerDepth, neighborDepth);
         float colorDiff = length(neighborGI.rgb - centerGI.rgb) / max(length(centerGI.rgb), 0.001);
         float colorW = exp(-colorDiff * 2.0);
         float w = depthW * colorW;
@@ -71,7 +72,7 @@ void XeGTAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
     }
 }
 
-[numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)]
+[numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]
 void main(uint2 dt : SV_DispatchThreadID)
 {
   uint width;
@@ -80,12 +81,27 @@ void main(uint2 dt : SV_DispatchThreadID)
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
-  XeGTAO_Denoise(dt * uint2(2, 1), consts,
-      g_srcWorkingAOTerm, g_srcWorkingEdges, g_samplerPointClamp,
-      g_outFinalAOTerm, true);
+  if (GTVBAO_denoiser_type >= 1.5f)
+  {
+    // ── Poisson denoiser (AO only, spatial-only) ──
+    GTVBAO_DenoiseAO_Poisson(dt * uint2(2, 1), consts,
+        g_srcWorkingAOTerm, g_srcDepth, g_mrtNormalTexture, g_samplerPointClamp,
+        g_outFinalAOTerm, true);
 
-  // ── Spatio-Temporal blend ──
-  if (xegtao_denoiser_type > 0.5f) {
+    for (int side = 0; side < 2; side++) {
+      int2 pixCoord = int2(dt.x * 2 + side, dt.y);
+      if (pixCoord.x < (int)width && pixCoord.y < (int)height) {
+        g_outHistoryAO[pixCoord] = g_outFinalAOTerm[pixCoord];
+      }
+    }
+  }
+  else
+  {
+    GTVBAO_Denoise(dt * uint2(2, 1), consts,
+        g_srcWorkingAOTerm, g_srcWorkingEdges, g_samplerPointClamp,
+        g_outFinalAOTerm, true);
+
+    if (GTVBAO_denoiser_type > 0.5f) {
     float2 vpSize = float2(width, height);
     float2 invVPSize = 1.0.xx / vpSize;
 
@@ -104,12 +120,12 @@ void main(uint2 dt : SV_DispatchThreadID)
       // Camera reprojection — reconstruct viewspace position from depth,
       // transform to previous frame's clip space via world space.
       float viewZ = -g_srcDepth.SampleLevel(g_samplerPointClamp, uv, 0);
-      float3 viewPos = XeGTAO_ComputeViewspacePosition(uv, viewZ, consts);
+      float3 viewPos = GTVBAO_ComputeViewspacePosition(uv, viewZ, consts);
       float4 worldPos = mul(float4(viewPos, 1.0), viewInv_g);
       float4 prevClipPos = mul(worldPos, prevViewProj_g);
       float2 prevNDC = prevClipPos.xy / prevClipPos.w;
       float2 prevUV = prevNDC * float2(-0.5, 0.5) + 0.5;
-      float historyWeight = xegtao_temporal_blend;
+      float historyWeight = GTVBAO_temporal_blend;
 
       // Reject history when reprojected UV falls off-screen
       if (any(prevUV < 0.0 || prevUV > 1.0)) historyWeight = 0.0;
@@ -133,11 +149,12 @@ void main(uint2 dt : SV_DispatchThreadID)
       g_outHistoryAO[pixCoord] = blendedPacked;
     }
   }
+  } // end else (non-Poisson)
 
-  // Denoise GI using depth + color edge weights.
+  // GI always uses original 3×3 bilateral (runs for all denoiser types)
   if (g_gi_enabled > 0.5f)
   {
-      XeGTAO_DenoiseGI(dt * uint2(2, 1), consts,
+      GTVBAO_DenoiseGI(dt * uint2(2, 1), consts,
           g_srcRawGI, g_srcWorkingEdges, g_samplerPointClamp,
           g_outGI);
   }

@@ -714,9 +714,9 @@ void main(
     r2.w = 1 + -r1.x;
     r4.z = r1.y * r2.w + r1.x;
   } else {
-    // When XeGTAO is active, skip the vanilla map AO loop for performance.
+    // When GTVBAO is active, skip the vanilla map AO loop for performance.
     // Character screen-space shadows are preserved (they run in the char pixel path above).
-    if (shader_injection_data.xegtao_mode > 0.5f || shader_injection_data.xegtao_ssgi_bound > 0.5f) {
+    if (shader_injection_data.gtvbao_mode > 0.5f || shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       r5.x = 0.0;  // Neutral AO (no darkening from vanilla path)
     } else if (mapAOSampleCount_g != 0) {
       r1.w = (uint)r1.z >> 8;
@@ -846,8 +846,8 @@ void main(
     // Env SSS is extracted to the lighting pass.
   }
   r4.xy = float2(1,1) + -r5.xy;
-  // When XeGTAO is active, skip temporal blend — preserve character shadow in z.
-  if (shader_injection_data.xegtao_mode > 0.5f) {
+  // When GTVBAO is active, skip temporal blend — preserve character shadow in z.
+  if (shader_injection_data.gtvbao_mode > 0.5f) {
     o0 = float4(1, 1, r4.z, 1);
     return;
   }

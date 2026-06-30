@@ -1,0 +1,91 @@
+ Ground truth version of Visibility Bitmask Ambient Occlusion (VBAO | https://arxiv.org/abs/2301.11376).
+    This version matches the result of a brute force ray marcher that shares the same limitations and assumptions
+    (limited number of screen space depth samples, depth sample distribution along marching direction, thickness assumption).
+    GT-VBAO supports both, uniform hemisphere weighting, and cosine weighted hemisphere weighting.
+    
+    This work was partially fundend by 1000Orks: https://1000orks.com/ | https://x.com/1000orks.
+    
+    An overview of the original VBAO including source code can be found on Olivier Therrien's blog: https://cdrinmatane.github.io/posts/ssaovb-code/.
+    
+--- EDIT: A version of GT-VBAO that doesn't require bidirectional ray marching can be found here: https://www.shadertoy.com/view/Xc3yzs
+    
+    GT-VBAO accounts for the shortcoming of the original VBAO implementation in the following ways:
+    
+    1. correct slice-local sample distribution: 
+        VBAO assumes a uniform distribution of samples in each slice. 
+        However, this does not account for the pole at the view vector, which leads to a lower sample density close to angN.
+        In addition, for properly cosine weighted AO, the cosine falloff towards the horizons also needs to be considered here.
+        
+        To account for the non-uniform slice-local sample pdf the min/max-horizon angles are remapped by the corresponding CDF.
+        
+        Because of the bit mask approach we can't remap the sample locations themselves as it is usually done via the inverse CDF.
+        However, we can apply the inverse mapping (i.e. the CDF itself) to the constant interval we intent to sample.
+        This also has the advantage that we do not need to invert the CDF (at least as long as we are only interested in AO).
+    
+    2. treat the slice-local samples as point samples instead of as sectors (+ jitter the sample group as a whole)
+        This is done by calculating the quantized arc length from the quantized min/max-horizon angles instead of 
+        computing the arc length from the unquantized angles and then quantizing it.
+        
+        The code here uses an equivalent approach that first computes two bit masks from the min/max-angles, respectively, 
+        and then 'ands' those together. The resulting code is a bit more readable and should produce the same number of instructions.
+        
+    3. account for perspective distorion when not using an orthographic projection
+        VBAO treats a perspective camera the same way as an orthographic one. 
+        A perspective projection can be accounted for by sampling the slice direction in a local frame around the view vector (view vec space).
+        The resulting slice direction can then subsequently be projected to the image plane.
+        
+        Also, when accounting for the assumed thickness by computing an offseted position from the current depth sample we can not do so using the
+        view vector. Instead we need to compute an offset direction for each depth sample associated position individually.
+    
+    These changes apply to both, the uniformly weighted hemisphere variant, as well as the cosine weighted hemisphere variant of GT-VBAO.
+    However, the cosine weighted hemisphere variant also requires us to make changes to the slice direction sampling routine:
+    
+    4. support for slice direction sampling from a cosine weighted hemisphere via one of 3 options:
+        1 - Sample uniformly, but account for the cosine distribution by weighting each slice accordingly.
+            This is the most straightforward option, but it produces significant amounts of variance.
+        2 - Sample a ray direction from the world space cosine lobe around N. Project this ray direction to the image plane and
+            use it as the slice direction. I don't have a prove that this is actually correct, but comparing it to option 1 and to the
+            reference ray marcher output it most likely is. While this approach (appears) to perfectly sample proportionally
+            to the desired slice pdf, it has the drawback that it requires 2 random numbers to generate a single slice direction.
+            This usually reduces the effectiveness of low-discrepancy sequences and sampling patterns that are designed to distribute 
+            the sampling error in image space.
+        3 - Directly importance sample the one dimensional pdf of slice angles using a single random number. 
+            The difficulty with this approach is that the corresponding CDF is not invertible.
+            It is, however, possible to construct a pretty good invertible approximation that does not produce any noticeable bias.
+            
+            The CDF we are trying to approximate is a simple sinusoid s-curve if the view vector is orthogonal to the surface normal.
+            The more the view vector alignes with the surface normal the more the s-curve blends towards a simple linear ramp.
+            However, at the same time as the linear blend happens the C1-continuous sinusoid s-curve morphes into a C2-continuous sinusoid s-curve.
+            The C2-continuous sinusoid s-curve is one of those curves that appear simple at first glance but then turn out to be non-invertible.
+            
+            The approximation of the inverse CDF I came up with looks like this:
+            
+            float SampleSlice(float x, float sinNV)
+            {
+                float s = QBias(sinNV, 0.15);
+
+                      x =    SinStep(x);
+                float y = InvSinStep(x, s);
+                      y = InvSinStep(y);
+
+                return y;
+            } 
+            
+            SinStep(x) is the C1-continuous sinusoid s-curve and InvSinStep(x) its inverse.
+            InvSinStep(x, s) is a generalization that allows to morph the curve into a linear ramp by stretching it
+            (simply lerping towards a linear ramp wouldn't give the desired behavior and also wouldn't be invertible).
+            QBias(x, b) is a simple quatratic bias used to compute the streching value from the sine of the angle between
+            the view vector and the surface normal. The bias of 0.15 is chosen so as to match the ground truth pdf.
+            In practice, the first SinStep(x) and the last InvSinStep(y) can be optimized away by not working with angles directly
+            (compare the two versions of SampleSliceDir(vvsN, rnd01) in Buffer C).
+            
+            The sampling option used here can be set via GTVBAO_SLICE_SAMPLING_MODE at the top of Buffer C (default: option 3)
+    
+    I also tried using a dedicated bit mask for both ray marching directions, separately, but found that, at least for this test scene here, 
+    it made very little difference. 32 bits for the whole slice seems like a solid choice.
+    
+    
+    buffera.txt: input logic
+    bufferb.txt: g-buffer rendering
+    bufferc.txt: GT-VBAO + reference ray marcher/caster
+    doc.txt   : documentation + presentation

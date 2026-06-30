@@ -217,8 +217,8 @@ Texture2DArray<float4> spotShadowMaps : register(t18);
 Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
-Texture2D<uint> xegtaoTexture : register(t22);
-Texture2D<float4> xegtaoSSGITexture : register(t23);
+Texture2D<uint> gtvbaoTexture : register(t22);
+Texture2D<float4> gtvbaoVBGITexture : register(t23);
 Texture3D<float2> isfast_noise : register(t24);
 
 #include "../../shared.h"
@@ -227,7 +227,7 @@ Texture3D<float2> isfast_noise : register(t24);
 // 3Dmigoto declarations
 #define cmp -
 
-float3 DecodeXeGTAOBentNormal(float2 packed_xy) {
+float3 DecodeGTVBAOBentNormal(float2 packed_xy) {
   float2 bent_xy = packed_xy * 2.0 + float2(-1.0, -1.0);
   float bent_z = sqrt(saturate(1.0 - dot(bent_xy, bent_xy)));
   float3 bent = float3(bent_xy, bent_z);
@@ -246,15 +246,15 @@ float3 GetMainLightDirectionViewToLight() {
   return -light_dir_view * rsqrt(len2);
 }
 
-float ApplyXeGTAOBentVisibility(float ao_visibility, float2 bent_payload_xy) {
-  float3 bent_normal = DecodeXeGTAOBentNormal(bent_payload_xy);
+float ApplyGTVBAOBentVisibility(float ao_visibility, float2 bent_payload_xy) {
+  float3 bent_normal = DecodeGTVBAOBentNormal(bent_payload_xy);
   float3 light_dir_to_light = GetMainLightDirectionViewToLight();
 
-  float diffuse_strength = saturate(shader_injection_data.xegtao_bent_diffuse_strength);
-  float diffuse_softness = clamp(shader_injection_data.xegtao_bent_diffuse_softness, 0.02, 0.35);
-  float spec_strength = saturate(shader_injection_data.xegtao_bent_specular_strength);
-  float spec_proxy_roughness = saturate(shader_injection_data.xegtao_bent_specular_proxy_roughness);
-  float max_darkening = saturate(shader_injection_data.xegtao_bent_max_darkening);
+  float diffuse_strength = saturate(shader_injection_data.gtvbao_bent_diffuse_strength);
+  float diffuse_softness = clamp(shader_injection_data.gtvbao_bent_diffuse_softness, 0.02, 0.35);
+  float spec_strength = saturate(shader_injection_data.gtvbao_bent_specular_strength);
+  float spec_proxy_roughness = saturate(shader_injection_data.gtvbao_bent_specular_proxy_roughness);
+  float max_darkening = saturate(shader_injection_data.gtvbao_bent_max_darkening);
 
   float ao_clamped = saturate(ao_visibility);
   float cos_cone = 1.0 - ao_clamped;
@@ -271,24 +271,24 @@ float ApplyXeGTAOBentVisibility(float ao_visibility, float2 bent_payload_xy) {
   return saturate(ao_visibility * bent_cap);
 }
 
-uint2 XeGTAODebugPixelCoord(float2 uv, uint width, uint height) {
+uint2 GTVBAODebugPixelCoord(float2 uv, uint width, uint height) {
   width = max(width, 1u);
   height = max(height, 1u);
   float2 pixel_f = saturate(uv) * float2((float)width, (float)height);
   return min((uint2)pixel_f, uint2(width - 1u, height - 1u));
 }
 
-float4 XeGTAODebugLoad4(Texture2D<float4> texture_obj, float2 uv) {
+float4 GTVBAODebugLoad4(Texture2D<float4> texture_obj, float2 uv) {
   uint width, height;
   texture_obj.GetDimensions(width, height);
-  uint2 pixel = XeGTAODebugPixelCoord(uv, width, height);
+  uint2 pixel = GTVBAODebugPixelCoord(uv, width, height);
   return texture_obj.Load(int3(pixel, 0));
 }
 
-float XeGTAODebugLoad1(Texture2D<float> texture_obj, float2 uv) {
+float GTVBAODebugLoad1(Texture2D<float> texture_obj, float2 uv) {
   uint width, height;
   texture_obj.GetDimensions(width, height);
-  uint2 pixel = XeGTAODebugPixelCoord(uv, width, height);
+  uint2 pixel = GTVBAODebugPixelCoord(uv, width, height);
   return texture_obj.Load(int3(pixel, 0));
 }
 
@@ -359,8 +359,8 @@ void main(
   uint mrt0z_marked = mrt0_raw.z;
   uint mrt0z_raw = mrt0z_marked & ~kFoliageMarkerBit;
   uint mrt0z_class = mrt0z_raw & ~kFoliageVariationBit;
-  const uint xegtao_foliage_mask_method_ui =
-      (uint)round(clamp(shader_injection_data.xegtao_foliage_mask_method, 0.0, 2.0));
+  const uint GTVBAO_foliage_mask_method_ui =
+      (uint)round(clamp(shader_injection_data.gtvbao_foliage_mask_method, 0.0, 2.0));
   uint4 foliage_mask_t10_raw = mrt0_raw;
   bool foliage_mask_t10_available = false;
   charMaskTexture.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -385,35 +385,35 @@ void main(
   const bool is_character_pixel = ((mrt0z_raw >> 8u) & 1u) != 0u;
   // Method 0: SSS parity strict (t1), 1: legacy broad (t1), 2: strict t10.
   bool is_foliage_pixel = is_foliage_pixel_t1_sss;
-  if (xegtao_foliage_mask_method_ui == 1u) {
+  if (GTVBAO_foliage_mask_method_ui == 1u) {
     is_foliage_pixel = is_foliage_pixel_t1_broad;
-  } else if (xegtao_foliage_mask_method_ui == 2u) {
+  } else if (GTVBAO_foliage_mask_method_ui == 2u) {
     is_foliage_pixel = foliage_mask_t10_available && is_foliage_pixel_t10_strict;
   }
   const bool is_environment_pixel = !is_character_pixel && !is_foliage_pixel;
   float3 ssao_sample = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
-  const bool xegtao_bound = shader_injection_data.xegtao_dedicated_bound >= 0.5;
-  const bool xegtao_force_neutral_x = shader_injection_data.xegtao_force_neutral_x >= 0.5;
-  const bool xegtao_bent_normals_enabled = shader_injection_data.xegtao_bent_normals >= 0.5;
-  const bool xegtao_debug_blackout = shader_injection_data.xegtao_debug_blackout >= 0.5;
-  const bool xegtao_ao_active_for_draw = shader_injection_data.xegtao_ao_active_for_draw >= 0.5;
+  const bool GTVBAO_bound = shader_injection_data.gtvbao_dedicated_bound >= 0.5;
+  const bool GTVBAO_force_neutral_x = shader_injection_data.gtvbao_force_neutral_x >= 0.5;
+  const bool GTVBAO_bent_normals_enabled = shader_injection_data.gtvbao_bent_normals >= 0.5;
+  const bool GTVBAO_debug_blackout = shader_injection_data.gtvbao_debug_blackout >= 0.5;
+  const bool GTVBAO_ao_active_for_draw = shader_injection_data.gtvbao_ao_active_for_draw >= 0.5;
   const bool sss_dedicated_bound = shader_injection_data.sss_dedicated_bound >= 0.5;
-  const float xegtao_foliage_blend = saturate(shader_injection_data.xegtao_foliage_ao_blend);
-  float3 xegtao_sample = ssao_sample;
-  if (xegtao_bound) {
+  const float GTVBAO_foliage_blend = saturate(shader_injection_data.gtvbao_foliage_ao_blend);
+  float3 GTVBAO_sample = ssao_sample;
+  if (GTVBAO_bound) {
     uint xw, xh;
-    xegtaoTexture.GetDimensions(xw, xh);
-    uint xpacked = xegtaoTexture.Load(int3(uint2(v1.xy * float2(xw, xh)), 0));
-    xegtao_sample = float3(float(xpacked) / 255.0, 0.0, 0.0);
+    gtvbaoTexture.GetDimensions(xw, xh);
+    uint xpacked = gtvbaoTexture.Load(int3(uint2(v1.xy * float2(xw, xh)), 0));
+    GTVBAO_sample = float3(float(xpacked) / 255.0, 0.0, 0.0);
   }
   float3 ao_sample = ssao_sample;
-  if (xegtao_bound) {
-    // XeGTAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
-    ao_sample.x = xegtao_sample.x;
-    if (xegtao_bent_normals_enabled && is_environment_pixel) {
-      ao_sample.x = ApplyXeGTAOBentVisibility(ao_sample.x, xegtao_sample.yz);
+  if (GTVBAO_bound) {
+    // GTVBAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
+    ao_sample.x = GTVBAO_sample.x;
+    if (GTVBAO_bent_normals_enabled && is_environment_pixel) {
+      ao_sample.x = ApplyGTVBAOBentVisibility(ao_sample.x, GTVBAO_sample.yz);
     }
-  } else if (xegtao_force_neutral_x) {
+  } else if (GTVBAO_force_neutral_x) {
     ao_sample.x = 1.0;
   }
   float sss_shadow_sample = saturate(ssao_sample.z);
@@ -422,16 +422,16 @@ void main(
   }
   const bool is_foliage_ao_mask_pixel =
       is_foliage_pixel && (!sss_dedicated_bound || sss_shadow_sample < 0.999);
-  if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
-    ao_sample.x = lerp(1.0, ao_sample.x, xegtao_foliage_blend);
+  if (GTVBAO_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+    ao_sample.x = lerp(1.0, ao_sample.x, GTVBAO_foliage_blend);
   }
   r4.xyz = ao_sample;
-  uint xegtao_debug_mode_ui = (uint)round(max(shader_injection_data.xegtao_debug_mode, 0.0));
-  const bool run_xegtao_debug = !xegtao_force_neutral_x
-      && xegtao_debug_mode_ui > 0u
-      && (xegtao_bound || xegtao_debug_mode_ui >= 10u || xegtao_debug_blackout);
-  if (run_xegtao_debug) {
-    if (xegtao_debug_blackout && xegtao_debug_mode_ui <= 9u) {
+  uint GTVBAO_debug_mode_ui = (uint)round(max(shader_injection_data.gtvbao_debug_mode, 0.0));
+  const bool run_GTVBAO_debug = !GTVBAO_force_neutral_x
+      && GTVBAO_debug_mode_ui > 0u
+      && (GTVBAO_bound || GTVBAO_debug_mode_ui >= 10u || GTVBAO_debug_blackout);
+  if (run_GTVBAO_debug) {
+    if (GTVBAO_debug_blackout && GTVBAO_debug_mode_ui <= 9u) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
       return;
@@ -442,28 +442,28 @@ void main(
       return;
     }
     float3 ssao_debug_sample = ssao_sample;
-    float3 xegtao_debug_source = xegtao_sample;
+    float3 GTVBAO_debug_source = GTVBAO_sample;
     float sss_shadow_debug = sss_shadow_sample;
     float depth_raw = saturate(r2.z);
-    if (xegtao_debug_mode_ui <= 9u) {
-      ssao_debug_sample = XeGTAODebugLoad4(ssaoTexture, v1.xy).xyz;
-      xegtao_debug_source = xegtao_bound ? xegtao_sample : ssao_debug_sample;
+    if (GTVBAO_debug_mode_ui <= 9u) {
+      ssao_debug_sample = GTVBAODebugLoad4(ssaoTexture, v1.xy).xyz;
+      GTVBAO_debug_source = GTVBAO_bound ? GTVBAO_sample : ssao_debug_sample;
       sss_shadow_debug = saturate(ssao_debug_sample.z);
       if (shader_injection_data.sss_dedicated_bound >= 0.5) {
-        sss_shadow_debug = saturate(XeGTAODebugLoad4(sssShadowTexture, v1.xy).z);
+        sss_shadow_debug = saturate(GTVBAODebugLoad4(sssShadowTexture, v1.xy).z);
       }
-      depth_raw = saturate(XeGTAODebugLoad1(depthTexture, v1.xy));
+      depth_raw = saturate(GTVBAODebugLoad1(depthTexture, v1.xy));
     }
 
-    const bool xegtao_effective_character_masked = xegtao_bound && !is_character_pixel;
-    float3 xegtao_debug_sample = xegtao_effective_character_masked ? xegtao_debug_source : ssao_debug_sample;
-    if (xegtao_ao_active_for_draw && is_foliage_ao_mask_pixel) {
-      xegtao_debug_sample.x = lerp(1.0, xegtao_debug_sample.x, xegtao_foliage_blend);
+    const bool GTVBAO_effective_character_masked = GTVBAO_bound && !is_character_pixel;
+    float3 GTVBAO_debug_sample = GTVBAO_effective_character_masked ? GTVBAO_debug_source : ssao_debug_sample;
+    if (GTVBAO_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+      GTVBAO_debug_sample.x = lerp(1.0, GTVBAO_debug_sample.x, GTVBAO_foliage_blend);
     }
     float3 ao_debug_sample = is_character_pixel ? ssao_debug_sample : ao_sample;
-    float xegtao_ao = saturate(xegtao_debug_sample.x);
+    float GTVBAO_ao = saturate(GTVBAO_debug_sample.x);
     float vanilla_ao = saturate(ssao_debug_sample.x);
-    float ao_delta = xegtao_ao - vanilla_ao;
+    float ao_delta = GTVBAO_ao - vanilla_ao;
     float ao_delta_mag = saturate(abs(ao_delta) * 8.0);
     float3 ao_delta_color = (ao_delta >= 0.0)
         ? float3(ao_delta_mag, ao_delta_mag * 0.2, 0.0)
@@ -482,72 +482,72 @@ void main(
     float3 mrt_normal_view = mul((float3x3)view_g, mrt_normal_as_is);
     float mrt_view_len2 = max(dot(mrt_normal_view, mrt_normal_view), 1e-5);
     mrt_normal_view *= rsqrt(mrt_view_len2);
-    const bool mrt_use_transform = shader_injection_data.xegtao_normal_input_mode >= 0.5;
+    const bool mrt_use_transform = shader_injection_data.gtvbao_normal_input_mode >= 0.5;
     float3 selected_mrt_normal = mrt_use_transform ? mrt_normal_view : mrt_normal_as_is;
     float selected_normal_length = sqrt(max(dot(selected_mrt_normal, selected_mrt_normal), 0.0));
     float reconstructed_z = sqrt(saturate(1.0 - dot(mrt_normal_as_is.xy, mrt_normal_as_is.xy)));
-    const bool mrt_source_valid = shader_injection_data.xegtao_mrt_normal_valid >= 0.5;
+    const bool mrt_source_valid = shader_injection_data.gtvbao_mrt_normal_valid >= 0.5;
     bool env_pixel = is_environment_pixel;
 
-    float3 debug_color = xegtao_ao.xxx;
-    if (xegtao_debug_mode_ui == 1u) {
-      debug_color = xegtao_ao.xxx;
-    } else if (xegtao_debug_mode_ui == 2u) {
+    float3 debug_color = GTVBAO_ao.xxx;
+    if (GTVBAO_debug_mode_ui == 1u) {
+      debug_color = GTVBAO_ao.xxx;
+    } else if (GTVBAO_debug_mode_ui == 2u) {
       debug_color = vanilla_ao.xxx;
-    } else if (xegtao_debug_mode_ui == 3u) {
+    } else if (GTVBAO_debug_mode_ui == 3u) {
       debug_color = ao_delta_color;
-    } else if (xegtao_debug_mode_ui == 4u) {
-      debug_color = saturate(xegtao_debug_sample);
-    } else if (xegtao_debug_mode_ui == 5u) {
+    } else if (GTVBAO_debug_mode_ui == 4u) {
+      debug_color = saturate(GTVBAO_debug_sample);
+    } else if (GTVBAO_debug_mode_ui == 5u) {
       debug_color = float3(0.0, saturate(ssao_debug_sample.y), saturate(ssao_debug_sample.z));
-    } else if (xegtao_debug_mode_ui == 6u) {
+    } else if (GTVBAO_debug_mode_ui == 6u) {
       debug_color = depth_raw.xxx;
-    } else if (xegtao_debug_mode_ui == 7u) {
+    } else if (GTVBAO_debug_mode_ui == 7u) {
       debug_color = depth_edge.xxx;
-    } else if (xegtao_debug_mode_ui == 8u) {
+    } else if (GTVBAO_debug_mode_ui == 8u) {
       debug_color = sss_shadow_debug.xxx;
-    } else if (xegtao_debug_mode_ui == 9u) {
+    } else if (GTVBAO_debug_mode_ui == 9u) {
       debug_color = float3(0.0, saturate(ao_sample.y), saturate(ao_sample.z));
-    } else if (xegtao_debug_mode_ui == 10u) {
+    } else if (GTVBAO_debug_mode_ui == 10u) {
       debug_color = float3(mrt_normal_as_is.x * 0.5 + 0.5, mrt_normal_as_is.y * 0.5 + 0.5, 0.5);
-    } else if (xegtao_debug_mode_ui == 11u) {
+    } else if (GTVBAO_debug_mode_ui == 11u) {
       debug_color = float3(mrt_normal_as_is.z * 0.5 + 0.5, reconstructed_z, 0.0);
-    } else if (xegtao_debug_mode_ui == 12u) {
+    } else if (GTVBAO_debug_mode_ui == 12u) {
       debug_color = saturate(selected_mrt_normal * 0.5 + 0.5);
-    } else if (xegtao_debug_mode_ui == 13u) {
+    } else if (GTVBAO_debug_mode_ui == 13u) {
       debug_color = saturate(selected_normal_length).xxx;
-    } else if (xegtao_debug_mode_ui == 14u) {
-      if (!xegtao_bound || !mrt_source_valid) {
+    } else if (GTVBAO_debug_mode_ui == 14u) {
+      if (!GTVBAO_bound || !mrt_source_valid) {
         debug_color = float3(0.0, 0.0, 1.0);
       } else if (mrt_use_transform) {
         debug_color = float3(0.0, 1.0, 0.0);
       } else {
         debug_color = float3(1.0, 0.0, 0.0);
       }
-    } else if (xegtao_debug_mode_ui == 15u) {
+    } else if (GTVBAO_debug_mode_ui == 15u) {
       debug_color = float3(
           is_character_pixel ? 1.0 : 0.0,
           is_foliage_pixel ? 1.0 : 0.0,
           env_pixel ? 1.0 : 0.0);
-    } else if (xegtao_debug_mode_ui == 16u) {
-      if (!xegtao_bound) {
+    } else if (GTVBAO_debug_mode_ui == 16u) {
+      if (!GTVBAO_bound) {
         debug_color = float3(0.0, 0.0, 1.0);
       } else if (mrt_source_valid) {
         debug_color = float3(1.0, 1.0, 1.0);
       } else {
         debug_color = float3(0.0, 1.0, 1.0);
       }
-    } else if (xegtao_debug_mode_ui == 17u) {
-      debug_color = float3(xegtao_ao, vanilla_ao, ao_delta_mag);
-    } else if (xegtao_debug_mode_ui == 18u) {
+    } else if (GTVBAO_debug_mode_ui == 17u) {
+      debug_color = float3(GTVBAO_ao, vanilla_ao, ao_delta_mag);
+    } else if (GTVBAO_debug_mode_ui == 18u) {
       debug_color = saturate(ao_debug_sample);
-    } else if (xegtao_debug_mode_ui == 19u) {
+    } else if (GTVBAO_debug_mode_ui == 19u) {
       float ao_effective = saturate(max(ao_debug_sample.x, ao_debug_sample.y * sss_shadow_sample));
       debug_color = ao_effective.xxx;
-    } else if (xegtao_debug_mode_ui == 20u) {
+    } else if (GTVBAO_debug_mode_ui == 20u) {
       const bool foliage_shadow_gate = !sss_dedicated_bound || sss_shadow_debug < 0.999;
-      const bool foliage_gate_active = xegtao_ao_active_for_draw && is_foliage_pixel && foliage_shadow_gate;
-      if (!xegtao_ao_active_for_draw) {
+      const bool foliage_gate_active = GTVBAO_ao_active_for_draw && is_foliage_pixel && foliage_shadow_gate;
+      if (!GTVBAO_ao_active_for_draw) {
         debug_color = float3(0.0, 0.0, 1.0);
       } else if (foliage_gate_active) {
         debug_color = float3(0.0, 1.0, 0.0);
@@ -556,7 +556,7 @@ void main(
       } else {
         debug_color = float3(0.2, 0.0, 0.0);
       }
-    } else if (xegtao_debug_mode_ui == 21u) {
+    } else if (GTVBAO_debug_mode_ui == 21u) {
       // RGB method compare:
       //   R = legacy broad (t1), G = SSS parity strict (t1), B = strict t10 (0.5 if unavailable)
       float t10_debug = foliage_mask_t10_available ? (is_foliage_pixel_t10_strict ? 1.0 : 0.0) : 0.5;
@@ -584,15 +584,15 @@ void main(
   r3.w = sqrt(r3.w);
   r5.x = r6.x * r3.w;
   r5.y = r3.x * r3.w;
-  // ── XeGTAO GI: sample & process once for both early-return and main paths ──
+  // ── GTVBAO VBGI: sample & process once for both early-return and main paths ──
   r24.xyzw = float4(0, 0, 0, 0);
-  if (shader_injection_data.xegtao_ssgi_bound >= 0.5) {
-    r24.xyzw = xegtaoSSGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
-    r24.xyz *= shader_injection_data.ssgi_intensity;
+  if (shader_injection_data.gtvbao_vbgi_bound >= 0.5) {
+    r24.xyzw = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
+    r24.xyz *= shader_injection_data.vbgi_intensity;
     float giLuma = dot(r24.xyz, float3(0.333, 0.333, 0.333));
-    r24.xyz = lerp(giLuma.xxx, r24.xyz, shader_injection_data.ssgi_saturation);
-    if (shader_injection_data.ssgi_max_clamp > 0.0) {
-      r24.xyz = min(r24.xyz, shader_injection_data.ssgi_max_clamp);
+    r24.xyz = lerp(giLuma.xxx, r24.xyz, shader_injection_data.vbgi_saturation);
+    if (shader_injection_data.vbgi_max_clamp > 0.0) {
+      r24.xyz = min(r24.xyz, shader_injection_data.vbgi_max_clamp);
     }
     r24.w = saturate(giLuma);
   }
@@ -821,7 +821,7 @@ void main(
     }
     // --- End early-return Character SSGI Composite ---
 
-    // Add XeGTAO GI to early-return output (bypassing game's SSGI formula)
+    // Add GTVBAO VBGI to early-return output (bypassing game's SSGI formula)
     r4.yzw = r4.yzw + r24.xyz;
     o0.xyz = r4.yzw;
     o0.w = 1;
@@ -1000,22 +1000,22 @@ void main(
   r12.xyz = r7.w ? r12.xyz : 0;
   r12.xyz = max(float3(0,0,0), r12.xyz);
   r12.xyz = r12.xyz + r11.xyz;
-  // Always sample Falcom SSGI as base; XeGTAO GI is sampled earlier (r24) and applied directly at end.
+  // Always sample Falcom SSGI as base; GTVBAO VBGI is sampled earlier (r24) and applied directly at end.
   r15.xyzw = ssgiTexture.SampleLevel(samLinear_s, v1.zw, 0).xyzw;
-  // Save Falcom SSGI for consume feature (before it may be zeroed for xegtao_only)
+  // Save Falcom SSGI for consume feature (before it may be zeroed for GTVBAO_only)
   float4 falcomSSGI = r15;
-  // Kai: optionally consume Falcom SSGI to modulate XeGTAO GI (sampled earlier into r24)
-  if (shader_injection_data.xegtao_ssgi_bound >= 0.5
-      && shader_injection_data.ssgi_kai_consume_falcom >= 0.5) {
-    r24.xyz *= lerp(1.0, falcomSSGI.xyz, shader_injection_data.ssgi_kai_falcom_blend);
+  // Kai: optionally consume Falcom SSGI to modulate GTVBAO VBGI (sampled earlier into r24)
+  if (shader_injection_data.gtvbao_vbgi_bound >= 0.5
+      && shader_injection_data.vbgi_kai_consume_falcom >= 0.5) {
+    r24.xyz *= lerp(1.0, falcomSSGI.xyz, shader_injection_data.vbgi_kai_falcom_blend);
     r24.w = saturate(dot(r24.xyz, float3(0.333, 0.333, 0.333)));
   }
-  // Kai: optionally suppress Falcom SSGI output (XeGTAO GI only)
-  if (shader_injection_data.ssgi_kai_xegtao_only >= 0.5) {
+  // Kai: optionally suppress Falcom SSGI output (GTVBAO VBGI only)
+  if (shader_injection_data.vbgi_kai_gtvbao_only >= 0.5) {
     r15.xyzw = float4(0, 0, 0, 0);
   }
-  if (shader_injection_data.ssgi_mod_enabled < 0.5 && shader_injection_data.xegtao_ssgi_bound < 0.5) {
-    // Zero out only when neither Falcom SSGI nor XeGTAO SSGI is active.
+  if (shader_injection_data.ssgi_mod_enabled < 0.5 && shader_injection_data.gtvbao_vbgi_bound < 0.5) {
+    // Zero out only when neither Falcom SSGI nor GTVBAO VBGI is active.
     r15.xyzw = float4(0, 0, 0, 0);
   }
 
@@ -2085,15 +2085,15 @@ void main(
     r3.xyz = float3((raw_z & 0xFFu) / 255.0, ((raw_z >> 8u) & 0xFFu) / 255.0, ((raw_z >> 16u) & 0xFFu) / 255.0);
   }
   // --- End Foliage Debug ---
-  // Add XeGTAO GI directly to final scene (bypasses game's SSGI formula)
+  // Add GTVBAO VBGI directly to final scene (bypasses game's SSGI formula)
   r3.xyz = r3.xyz + r24.xyz;
   // ── SSGI Debug Views: replace scene with debug texture ──
-  if (shader_injection_data.ssgi_debug_view > 0.5) {
-    int dbgMode = (int)shader_injection_data.ssgi_debug_view;
+  if (shader_injection_data.vbgi_debug_view > 0.5) {
+    int dbgMode = (int)shader_injection_data.vbgi_debug_view;
     if (dbgMode == 7) {
-      o0.xyz = r15.xyz;  // Final GI (combined Falcom + XeGTAO with all processing)
+      o0.xyz = r15.xyz;  // Final GI (combined Falcom + GTVBAO with all processing)
     } else {
-      o0.xyz = xegtaoSSGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
+      o0.xyz = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
     }
     o0.w = 1;
     o1.z = r0.y;

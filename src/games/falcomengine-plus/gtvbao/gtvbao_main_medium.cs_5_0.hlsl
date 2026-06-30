@@ -1,13 +1,12 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// sora-vanillaplus XeGTAO — Pass 2: Main GTAO (High quality)
+// falcomengine-plus GTVBAO — Pass 2: Main GTAO (Medium quality — 12 spp)
 //
-// Kai-style: builds GTAOConstants in-shader, gets quality from push_constants.
-// Quality is determined by xegtao_quality push constant, not hardcoded slices.
+// Kai-style: builds GTAOConstants in-shader, MRT normal from game g-buffer.
 // Visibility Bitmask AO + optional GI (Therrien/Levesque/Gilet 2023).
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define XE_GTAO_COMPUTE_GI
-#include "xegtao_common.hlsl"
+#define GT_VBAO_COMPUTE_GI
+#include "gtvbao_common.hlsl"
 
 Texture2D<lpfloat>     g_srcWorkingDepth   : register(t0);
 Texture2D<uint4>       g_srcMrtNormal      : register(t1);
@@ -30,10 +29,16 @@ static float IGN(float2 p) {
   return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
+static lpfloat2 SpatioTemporalNoise_Hilbert(uint2 p, uint t)
+{
+  uint i = HilbertIndex(p.x % XE_HILBERT_WIDTH, p.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
+  return lpfloat2(frac(0.5 + (float)i * 0.75487766624669276005),
+                  frac(0.5 + (float)i * 0.5698402909980532659114));
+}
+
 static lpfloat2 SpatioTemporalNoise_ISFAST(uint2 p, uint t)
 {
   if (g_isfast_texture_loaded > 0.5f) {
-    // Sample pre-computed 128×128×32 RG8 noise volume
     float3 uvw = float3(
       (float)(p.x % 128u) / 128.0,
       (float)(p.y % 128u) / 128.0,
@@ -43,7 +48,6 @@ static lpfloat2 SpatioTemporalNoise_ISFAST(uint2 p, uint t)
     float2 s = g_isfastNoiseTexture.SampleLevel(g_samplerPointClamp, uvw, 0);
     return (lpfloat2)(s * g_isfast_strength);
   } else {
-    // IGN fallback — Interleaved Gradient Noise + R2 temporal
     static const float R2_A1 = 0.7548776662466927;
     static const float R2_A2 = 0.5698402909980532;
     float b1 = IGN(float2(p) * g_isfast_spatial_scale + g_isfast_seed_offset);
@@ -66,26 +70,17 @@ static lpfloat2 SpatioTemporalNoise_IGN(uint2 p, uint t)
        * g_isfast_strength;
 }
 
-static lpfloat2 SpatioTemporalNoise_Hilbert(uint2 p, uint t)
-{
-  uint i = HilbertIndex(p.x % XE_HILBERT_WIDTH, p.y % XE_HILBERT_WIDTH) + 288u * (t % 64u);
-  return lpfloat2(frac(0.5 + (float)i * 0.75487766624669276005),
-                  frac(0.5 + (float)i * 0.5698402909980532659114));
-}
-
-// ── Depth-derived normal (fallback) ──
 float3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r,
                    lpfloat t, lpfloat b, lpfloat4 e, GTAOConstants consts)
 {
-  float3 C = XeGTAO_ComputeViewspacePosition(u, z, consts);
-  float3 L = XeGTAO_ComputeViewspacePosition(u + float2(-1, 0) * consts.ViewportPixelSize, l, consts);
-  float3 R = XeGTAO_ComputeViewspacePosition(u + float2( 1, 0) * consts.ViewportPixelSize, r, consts);
-  float3 T = XeGTAO_ComputeViewspacePosition(u + float2( 0,-1) * consts.ViewportPixelSize, t, consts);
-  float3 B = XeGTAO_ComputeViewspacePosition(u + float2( 0, 1) * consts.ViewportPixelSize, b, consts);
-  return (float3)XeGTAO_CalculateNormal(e, C, L, R, T, B);
+  float3 C = GTVBAO_ComputeViewspacePosition(u, z, consts);
+  float3 L = GTVBAO_ComputeViewspacePosition(u + float2(-1, 0) * consts.ViewportPixelSize, l, consts);
+  float3 R = GTVBAO_ComputeViewspacePosition(u + float2( 1, 0) * consts.ViewportPixelSize, r, consts);
+  float3 T = GTVBAO_ComputeViewspacePosition(u + float2( 0,-1) * consts.ViewportPixelSize, t, consts);
+  float3 B = GTVBAO_ComputeViewspacePosition(u + float2( 0, 1) * consts.ViewportPixelSize, b, consts);
+  return (float3)GTVBAO_CalculateNormal(e, C, L, R, T, B);
 }
 
-// ── MRT normal helpers (from kai-vanillaplus) ──
 float3 SafeNormalize3(float3 v, float3 fallback)
 {
   float len2 = dot(v, v);
@@ -121,8 +116,8 @@ float3 TransformNormalToView(float3 decoded)
 {
   // 0=view_g (default), 1=viewInv_g, 2=passthrough
   float3x3 m = (float3x3)view_g;
-  if (xegtao_normal_transform_mode > 1.5) return SafeNormalize3(decoded, float3(0, 0, 1));
-  if (xegtao_normal_transform_mode > 0.5) m = (float3x3)viewInv_g;
+  if (GTVBAO_normal_transform_mode > 1.5) return SafeNormalize3(decoded, float3(0, 0, 1));
+  if (GTVBAO_normal_transform_mode > 0.5) m = (float3x3)viewInv_g;
   float3 vn = mul(m, decoded);
   return SafeNormalize3(vn, float3(0, 0, 1));
 }
@@ -133,7 +128,7 @@ float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
   float4 ul = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize);
   float4 br = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize, int2(1,1));
   return DepthNormal(pix, u, ul.y, ul.x, br.z, ul.z, br.x,
-      XeGTAO_CalculateEdges(ul.y, ul.x, br.z, ul.z, br.x), consts);
+      GTVBAO_CalculateEdges(ul.y, ul.x, br.z, ul.z, br.x), consts);
 }
 
 float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants consts)
@@ -141,8 +136,8 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   float3 depth_fallback = BuildDepthFallbackNormal(pix, consts);
   float3 selected = depth_fallback;
 
-  if (xegtao_normal_input_mode < 0.5) return selected;
-  if (xegtao_mrt_normal_available < 0.5) return selected;
+  if (GTVBAO_normal_input_mode < 0.5) return selected;
+  if (GTVBAO_mrt_normal_available < 0.5) return selected;
 
   uint mw, mh;
   g_srcMrtNormal.GetDimensions(mw, mh);
@@ -156,55 +151,55 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
 
   float3 mrt_normal = TransformNormalToView(decoded);
   float3 tuned = mrt_normal;
-  tuned.xy *= max(0.0, xegtao_normal_influence);
-  tuned.z  *= max(0.0, xegtao_normal_z_preservation);
+  tuned.xy *= max(0.0, GTVBAO_normal_influence);
+  tuned.z  *= max(0.0, GTVBAO_normal_z_preservation);
   tuned = SafeNormalize3(tuned, mrt_normal);
 
-  float sharpness = max(0.01, xegtao_normal_sharpness);
-  float base_blend = pow(saturate(xegtao_normal_depth_blend), 1.0 / sharpness);
+  float sharpness = max(0.01, GTVBAO_normal_sharpness);
+  float base_blend = pow(saturate(GTVBAO_normal_depth_blend), 1.0 / sharpness);
   float edge_metric = ComputeDepthEdgeMetric(pix, consts);
-  float edge_att = 1.0 - saturate(edge_metric * max(0.0, xegtao_normal_edge_rejection));
+  float edge_att = 1.0 - saturate(edge_metric * max(0.0, GTVBAO_normal_edge_rejection));
   float normal_delta = 1.0 - saturate(dot(depth_fallback, tuned));
-  float detail_response = max(0.01, xegtao_normal_detail_response);
+  float detail_response = max(0.01, GTVBAO_normal_detail_response);
   float detail_gain = lerp(0.35, 1.25, pow(normal_delta, 1.0 / detail_response));
   float final_blend = saturate(base_blend * edge_att * detail_gain);
-  if (xegtao_normal_darkening_mode < 0.5)
-    final_blend *= saturate(xegtao_normal_max_darkening);
+  if (GTVBAO_normal_darkening_mode < 0.5)
+    final_blend *= saturate(GTVBAO_normal_max_darkening);
 
   return SafeNormalize3(lerp(depth_fallback, tuned, final_blend), depth_fallback);
 }
 
-[numthreads(XE_GTAO_NUMTHREADS_X, XE_GTAO_NUMTHREADS_Y, 1)]
-void main(uint2 p : SV_DispatchThreadID)
+[numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]
+void main(uint2 pixCoord : SV_DispatchThreadID)
 {
   uint width, height;
   g_srcWorkingDepth.GetDimensions(width, height);
-  if (p.x >= width || p.y >= height) return;
+  if (pixCoord.x >= width || pixCoord.y >= height) return;
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
   uint noise_idx = consts.NoiseIndex < 0 ? 0u : (uint)consts.NoiseIndex;
   lpfloat2 n;
   if (g_isfast_enabled > 0.5f) {
-    if (xegtao_noise_type < 0.5f)      n = SpatioTemporalNoise_ISFAST(p, noise_idx);
-    else if (xegtao_noise_type < 1.5f) n = SpatioTemporalNoise_IGN(p, noise_idx);
-    else                               n = SpatioTemporalNoise_Hilbert(p, noise_idx);
+    if (GTVBAO_noise_type < 0.5f)      n = SpatioTemporalNoise_ISFAST(pixCoord, noise_idx);
+    else if (GTVBAO_noise_type < 1.5f) n = SpatioTemporalNoise_IGN(pixCoord, noise_idx);
+    else                               n = SpatioTemporalNoise_Hilbert(pixCoord, noise_idx);
   } else {
-    n = SpatioTemporalNoise_Hilbert(p, noise_idx);
+    n = SpatioTemporalNoise_Hilbert(pixCoord, noise_idx);
   }
 
-  lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(p, uint2(width, height), consts);
+  lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(pixCoord, uint2(width, height), consts);
 
   // Quality from push constant
   lpfloat slice_count = 3.0;
   lpfloat steps_per_slice = 3.0;
-  uint q = (uint)round(clamp(xegtao_quality, 0.0, 3.0));
+  uint q = (uint)round(clamp(GTVBAO_quality, 0.0, 3.0));
   if (q == 0u)      { slice_count = 2.0; steps_per_slice = 3.0; }  // Low
   else if (q == 1u) { slice_count = 3.0; steps_per_slice = 3.0; }  // Medium
   else if (q == 2u) { slice_count = 4.0; steps_per_slice = 3.0; }  // High
   else              { slice_count = 5.0; steps_per_slice = 3.0; }  // Ultra
 
-  XeGTAO_MainPass(p, slice_count, steps_per_slice, n, normal,
+  GTVBAO_MainPass(pixCoord, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
       g_outWorkingAOTerm, g_outWorkingEdges,
       (g_gi_enabled > 0.5f), g_gi_intensity,

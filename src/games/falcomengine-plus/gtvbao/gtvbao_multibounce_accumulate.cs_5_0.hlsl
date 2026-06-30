@@ -1,12 +1,12 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// sora-vanillaplus XeGTAO — Multi-bounce light buffer accumulation
+// falcomengine-plus GTVBAO — Multi-bounce light buffer accumulation
 //
 // Adds previous frame's denoised GI to the HDR color buffer, creating
 // an accumulated light buffer that enables multi-bounce GI feedback.
 // Runs before the main pass when multi-bounce is enabled.
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "xegtao_common.hlsl"
+#include "gtvbao_common.hlsl"
 
 Texture2D<float4>  g_srcColor      : register(t0);  // HDR pre-lighting color texture
 Texture2D<float4>  g_srcPreviousGI : register(t1);  // Previous frame's denoised GI

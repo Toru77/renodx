@@ -77,51 +77,51 @@ ShaderInjectData shader_injection = {
   .env_sss_bright_reject_threshold = 0.19f,
   .env_sss_bright_reject_fade = 0.5f,
   .debug_show_env_sss = 0.f,
-  .xegtao_mode = 1.f,
-  .xegtao_quality_level = 2.f,
-  .xegtao_denoise_passes = 1.f,
-  .xegtao_radius = 0.5f,
-  .xegtao_falloff_range = 0.615f,
-  .xegtao_radius_multiplier = 1.5f,
-  .xegtao_final_power = 2.0f,
-  .xegtao_sample_distribution = 1.5f,
-  .xegtao_bitmask_thickness = 0.2f,
-  .xegtao_depth_mip_offset = 3.30f,
-  .xegtao_denoise_blur_beta = 20.0f,
-  .xegtao_denoise_leak_threshold = 2.5f,
-  .xegtao_denoise_leak_strength = 0.5f,
-  .xegtao_denoiser_type = 0.f,
-  .xegtao_temporal_blend = 0.85f,
-  .xegtao_disocclusion_threshold = 0.01f,
-  .xegtao_debug_view = 0.f,
-  .xegtao_debug_logging = 0.f,
-  .xegtao_dedicated_bound = 0.f,
-  .xegtao_fix_experimental = 0.f,
-  .xegtao_ssgi_bound = 0.f,
-  .xegtao_ssgi_debug = 0.f,
-  .ssgi_enabled = 0.f,
-  .ssgi_intensity = 1.0f,
-  .ssgi_saturation = 1.0f,
-  .ssgi_char_mask_strength = 0.f,
-  .ssgi_multibounce = 0.f,
-  .ssgi_multibounce_strength = 1.f,
-  .ssgi_multibounce_saturation = 1.f,
-  .ssgi_multibounce_max_clamp = 0.f,
-  .ssgi_adaptive_r = 0.f,
-  .ssgi_adaptive_g = 0.f,
-  .ssgi_adaptive_b = 0.f,
-  .ssgi_adaptive_mode = 0.f,
-  .ssgi_adaptive_luma_strength = 0.f,
-  .ssgi_adaptive_luma_blend = 0.5f,
-  .ssgi_max_clamp = 0.f,
-  .ssgi_reduce_ao = 0.f,
-  .ssgi_reduce_ao_strength = 1.f,
-  .ssgi_debug_logging = 0.f,
-  .ssgi_debug_view = 0.f,
-  .ssgi_affect_lights = 0.f,
-  .ssgi_lights_strength = 1.f,
-  .ssgi_lights_saturation = 1.f,
-  .ssgi_cascade_debug = 0.f,
+  .gtvbao_mode = 1.f,
+  .gtvbao_quality_level = 2.f,
+  .gtvbao_denoise_passes = 1.f,
+  .gtvbao_radius = 0.5f,
+  .gtvbao_falloff_range = 0.615f,
+  .gtvbao_radius_multiplier = 1.5f,
+  .gtvbao_final_power = 2.0f,
+  .gtvbao_sample_distribution = 1.5f,
+  .gtvbao_bitmask_thickness = 0.2f,
+  .gtvbao_depth_mip_offset = 3.30f,
+  .gtvbao_denoise_blur_beta = 20.0f,
+  .gtvbao_denoise_leak_threshold = 2.5f,
+  .gtvbao_denoise_leak_strength = 0.5f,
+  .gtvbao_denoiser_type = 0.f,
+  .gtvbao_temporal_blend = 0.85f,
+  .gtvbao_disocclusion_threshold = 0.01f,
+  .gtvbao_debug_view = 0.f,
+  .gtvbao_debug_logging = 0.f,
+  .gtvbao_dedicated_bound = 0.f,
+  .gtvbao_fix_experimental = 0.f,
+  .gtvbao_vbgi_bound = 0.f,
+  .gtvbao_vbgi_debug = 0.f,
+  .vbgi_enabled = 0.f,
+  .vbgi_intensity = 1.0f,
+  .vbgi_saturation = 1.0f,
+  .vbgi_char_mask_strength = 0.f,
+  .vbgi_multibounce = 0.f,
+  .vbgi_multibounce_strength = 1.f,
+  .vbgi_multibounce_saturation = 1.f,
+  .vbgi_multibounce_max_clamp = 0.f,
+  .vbgi_adaptive_r = 0.f,
+  .vbgi_adaptive_g = 0.f,
+  .vbgi_adaptive_b = 0.f,
+  .vbgi_adaptive_mode = 0.f,
+  .vbgi_adaptive_luma_strength = 0.f,
+  .vbgi_adaptive_luma_blend = 0.5f,
+  .vbgi_max_clamp = 0.f,
+  .vbgi_reduce_ao = 0.f,
+  .vbgi_reduce_ao_strength = 1.f,
+  .vbgi_debug_logging = 0.f,
+  .vbgi_debug_view = 0.f,
+  .vbgi_affect_lights = 0.f,
+  .vbgi_lights_strength = 1.f,
+  .vbgi_lights_saturation = 1.f,
+  .vbgi_cascade_debug = 0.f,
   .shadow_filter_method = 1.f,
   .shadow_edge_tint = 2.f,
   .shadow_pcss_jitter_enabled = 1.f,
@@ -199,46 +199,54 @@ ShaderInjectData shader_injection = {
   .volfog_enabled = 1.f,
   .volfog_tricubic_enabled = 1.f,
   .volfog_color_correction_strength = 0.5f,
-  .ssgi_kai_consume_falcom = 0.f,
-  .ssgi_kai_falcom_blend = 0.5f,
-  .ssgi_kai_xegtao_only = 0.f,
+  .vbgi_kai_consume_falcom = 0.f,
+  .vbgi_kai_falcom_blend = 0.5f,
+  .vbgi_kai_gtvbao_only = 0.f,
   .shadow_edge_tint_kai = 1.f,
   .character_light_strength = 0.f,
+  .gtvbao_cdf_enabled = 0.f,
+  .gtvbao_cosine_enabled = 0.f,
+  .gtvbao_cosine_mode = 2.f,
+  .gtvbao_thickness_enabled = 0.f,
+  .gtvbao_poisson_samples = 8.f,
+  .gtvbao_poisson_luma_phi = 5.f,
+  .gtvbao_poisson_depth_phi = 5.f,
+  .gtvbao_poisson_normal_phi = 5.f,
 };
 
-// ═══════════ XeGTAO Backend — constants, types, fwd decls ═══════════
+// ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
 
-constexpr uint32_t kLightingXeGtaoRegister = 22u;
-constexpr uint32_t kLightingSsgiRegister   = 23u;  // t23 = ssgiTexture
+constexpr uint32_t kLightingGtvbaoRegister = 22u;
+constexpr uint32_t kLightingVbgiRegister   = 23u;  // t23 = vbgiTexture
 constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingDepthRegisterKai = 3u; // t3 = depthTexture (Kai)
 constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture (Sora)
 constexpr uint32_t kLightingSsaoRegisterKai = 4u; // t4 = ssaoTexture (Kai)
 constexpr uint32_t kLightingSceneCbRegister = 0u; // b0 = cb_scene
-constexpr uint32_t kXeGTAODepthMipLevels = 5u;
-constexpr uint32_t kXeGtaoDescriptorTableParamCount = 4u;  // sampler, cbv, srv, uav
-constexpr uint32_t kXeGtaoPushConstantsLayoutParam = 4u;   // push_constants at b13
+constexpr uint32_t kGTVBAODepthMipLevels = 5u;
+constexpr uint32_t kGtvbaoDescriptorTableParamCount = 4u;  // sampler, cbv, srv, uav
+constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at b13
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
-constexpr uint64_t kXeGTAOStartupGuardFrames = 8u;
-constexpr uint64_t kXeGTAOResizeGuardFrames = 4u;
+constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
+constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
-// ── XeGTAO normal tuning globals (separate from ShaderInjectData) ──
-static float g_xegtao_normal_input_mode     = 1.f;
-static float g_xegtao_normal_influence      = 1.f;
-static float g_xegtao_normal_z_preservation = 1.f;
-static float g_xegtao_normal_depth_blend    = 0.70f;
-static float g_xegtao_normal_sharpness      = 0.75f;
-static float g_xegtao_normal_edge_rejection = 0.5f;
-static float g_xegtao_normal_detail_response = 0.75f;
-static float g_xegtao_normal_max_darkening  = 0.50f;
-static float g_xegtao_normal_darkening_mode = 0.f;
-static float g_xegtao_normal_transform_mode = 0.f; // 0=view_g, 1=viewInv_g, 2=passthrough
+// ── GTVBAO normal tuning globals (separate from ShaderInjectData) ──
+static float g_gtvbao_normal_input_mode     = 1.f;
+static float g_gtvbao_normal_influence      = 1.f;
+static float g_gtvbao_normal_z_preservation = 1.f;
+static float g_gtvbao_normal_depth_blend    = 0.70f;
+static float g_gtvbao_normal_sharpness      = 0.75f;
+static float g_gtvbao_normal_edge_rejection = 0.5f;
+static float g_gtvbao_normal_detail_response = 0.75f;
+static float g_gtvbao_normal_max_darkening  = 0.50f;
+static float g_gtvbao_normal_darkening_mode = 0.f;
+static float g_gtvbao_normal_transform_mode = 0.f; // 0=view_g, 1=viewInv_g, 2=passthrough
 
-// ── SSGI globals removed — now controlled via ShaderInjectData fields (shared.h). ──
-// ssgi_enabled, ssgi_intensity, ssgi_saturation, ssgi_multibounce, ssgi_gi_power
-// are all part of shader_injection and pushed via BuildXeGTAOPushConstants.
-static float g_ssgi_light_exposure = 0.05f;  // HDR light buffer exposure scale (lower = dimmer GI)
+// ── VBGI globals removed — now controlled via ShaderInjectData fields (shared.h). ──
+// vbgi_enabled, vbgi_intensity, vbgi_saturation, vbgi_multibounce, vbgi_gi_power
+// are all part of shader_injection and pushed via BuildGTVBAOPushConstants.
+static float g_vbgi_light_exposure = 0.05f;  // HDR light buffer exposure scale (lower = dimmer GI)
 
 // ── IS-FAST noise ──
 static float g_isfast_enabled       = 0.f;
@@ -253,7 +261,7 @@ static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
 static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
 
 // ── Kai detection ──
-static float g_char_ssgi_composite_method = 1.f;  // Kai Character SSGI master toggle
+static float g_char_vbgi_composite_method = 1.f;  // Kai Character VBGI master toggle
 
 static bool IsKai() {
   static bool checked = false;
@@ -279,16 +287,16 @@ static bool IsLightingShader(uint32_t hash) {
 }
 
 // ── CPU optimization toggles ──
-static float g_xegtao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, …)
-static float g_xegtao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
-static float g_ssgi_frame_skip           = 0.f;
+static float g_gtvbao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, …)
+static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
+static float g_vbgi_frame_skip           = 0.f;
 static float g_multibounce_frame_skip    = 0.f;
-static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch XeGTAO/SSGI in OnPresent, not inline (default ON for Kai)
+static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnPresent, not inline (default ON for Kai)
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
-static float g_xegtao_jitter_toggle       = 0.f;  // enable jitter even when denoise is off
+static float g_gtvbao_jitter_toggle       = 0.f;  // enable jitter even when denoise is off
 
-using XeGTAODescriptorTableSet =
-    std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount>;
+using GTVBAODescriptorTableSet =
+    std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
 
 struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t working_width = 0u;
@@ -296,7 +304,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
 
   reshade::api::resource depth_mips_texture = {};
   reshade::api::resource_view depth_mips_srv = {};
-  std::array<reshade::api::resource_view, kXeGTAODepthMipLevels> depth_mips_uavs = {};
+  std::array<reshade::api::resource_view, kGTVBAODepthMipLevels> depth_mips_uavs = {};
 
   reshade::api::resource ao_term_a_texture = {};
   reshade::api::resource_view ao_term_a_srv = {};
@@ -321,7 +329,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view composite_srv = {};
   reshade::api::resource_view composite_uav = {};
 
-  // 1×1 white fallback — always valid, returned when XeGTAO is off / not ready.
+  // 1×1 white fallback — always valid, returned when GTVBAO is off / not ready.
   reshade::api::resource fallback_texture = {};
   reshade::api::resource_view fallback_srv = {};
 
@@ -344,9 +352,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline denoise_last_kai_pipeline = {};  // Kai: correct prevViewProj_g offset (c85)
 
   // Descriptor tables — pre-allocated per pass.
-  XeGTAODescriptorTableSet prefilter_tables = {};
-  XeGTAODescriptorTableSet main_tables = {};
-  XeGTAODescriptorTableSet denoise_tables = {};
+  GTVBAODescriptorTableSet prefilter_tables = {};
+  GTVBAODescriptorTableSet main_tables = {};
+  GTVBAODescriptorTableSet denoise_tables = {};
 
   reshade::api::resource_view captured_depth_srv = {};
   reshade::api::resource_view captured_ssao_srv = {};
@@ -370,13 +378,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t deferred_scene_cbv_frame = UINT64_MAX;
   bool deferred_pending = false;
 
-  // ── GI resources (now integrated — no separate SSGI pipeline) ──
-  reshade::api::resource ssgi_output_texture = {};
-  reshade::api::resource_view ssgi_output_srv = {};
-  reshade::api::resource_view ssgi_output_uav = {};
-  reshade::api::resource ssgi_denoised_texture = {};
-  reshade::api::resource_view ssgi_denoised_srv = {};
-  reshade::api::resource_view ssgi_denoised_uav = {};
+  // ── GI resources (now integrated — no separate VBGI pipeline) ──
+  reshade::api::resource vbgi_output_texture = {};
+  reshade::api::resource_view vbgi_output_srv = {};
+  reshade::api::resource_view vbgi_output_uav = {};
+  reshade::api::resource vbgi_denoised_texture = {};
+  reshade::api::resource_view vbgi_denoised_srv = {};
+  reshade::api::resource_view vbgi_denoised_uav = {};
   reshade::api::resource captured_light_buffer_texture = {};
   reshade::api::resource_view captured_light_buffer_srv = {};
   bool captured_light_buffer_valid = false;   // true after first frame's capture
@@ -386,8 +394,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view multibounce_uav = {};
   reshade::api::pipeline multibounce_pipeline = {};
   reshade::api::pipeline_layout multibounce_layout = {};
-  XeGTAODescriptorTableSet multibounce_tables = {};
-  bool ssgi_denoised_valid = false;            // true after first denoise completes
+  GTVBAODescriptorTableSet multibounce_tables = {};
+  bool vbgi_denoised_valid = false;            // true after first denoise completes
   reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
   // ── Debug UAV (bitmask debug views 6-8) ──
   reshade::api::resource debug_texture = {};
@@ -399,7 +407,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::sampler isfast_sampler = {};
   bool isfast_texture_loaded = false;
   bool isfast_texture_attempted = false;  // only try DDS load once
-  bool ssgi_bound = false;
+  bool vbgi_bound = false;
 
   // CPU optimization tracking
   uint64_t last_bound_pipeline_handle = 0u;
@@ -410,12 +418,12 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t last_sampler_handle = 0u;
 };
 
-static void CreateXeGTAOResources(reshade::api::device* device, DeviceData* data,
+static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
                                    uint32_t gw, uint32_t gh);
-static void DestroyXeGTAOResources(reshade::api::device* device, DeviceData* data);
+static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* data);
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
-static bool RunXeGTAO(reshade::api::command_list* cmd_list, DeviceData* data);
-// SSGI is now integrated into XeGTAO main pass — no separate RunSSGI needed.
+static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
+// VBGI is now integrated into GTVBAO main pass — no separate RunVBGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list);
@@ -595,7 +603,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeLightingShaderDraw,
         },
     },
-    // ── Kai lighting (XeGTAO + SSGI) ──
+    // ── Kai lighting (GTVBAO + VBGI) ──
     CustomShaderEntryCallback(0x430ED091, OnBeforeLightingShaderDraw),
     CustomShaderEntryCallback(0xF6C55E5F, OnBeforeLightingShaderDraw),
     // ── Kai volumetric fog (IS-FAST + Haze AA) ──
@@ -838,98 +846,98 @@ renodx::utils::settings::Settings settings = {
 
     // ── Character SSGI ──
     new renodx::utils::settings::Setting{
-      .key = "CharacterSSGICompositeMethod", .binding = &g_char_ssgi_composite_method,
+      .key = "CharacterSSGICompositeMethod", .binding = &g_char_vbgi_composite_method,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Apply Game SSGI", .section = "Character SSGI",
+      .default_value = 1.f, .label = "Apply Game VBGI", .section = "Character VBGI",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeStrength", .binding = &shader_injection.char_gi_strength,
-      .default_value = 3.0f, .label = "Strength", .section = "Character SSGI",
+      .default_value = 3.0f, .label = "Strength", .section = "Character VBGI",
       .tooltip = "Overall contribution scale for character GI.",
       .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeAlphaScale", .binding = &shader_injection.char_gi_alpha_scale,
-      .default_value = 1.0f, .label = "Alpha Scale", .section = "Character SSGI",
+      .default_value = 1.0f, .label = "Alpha Scale", .section = "Character VBGI",
       .tooltip = "Scales sampled SSGI alpha before blending.",
       .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeChroma", .binding = &shader_injection.char_gi_chroma_strength,
-      .default_value = 0.50f, .label = "Chroma", .section = "Character SSGI",
+      .default_value = 0.50f, .label = "Chroma", .section = "Character VBGI",
       .tooltip = "Scales colorful GI component; lower values reduce tinting.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeLuma", .binding = &shader_injection.char_gi_luma_strength,
-      .default_value = 0.0f, .label = "Luma", .section = "Character SSGI",
+      .default_value = 0.0f, .label = "Luma", .section = "Character VBGI",
       .tooltip = "Scales neutral GI brightness; keep low to avoid white haze.",
       .min = 0.f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeShadowPower", .binding = &shader_injection.char_gi_shadow_power,
-      .default_value = 1.25f, .label = "Shadow Power", .section = "Character SSGI",
+      .default_value = 1.25f, .label = "Shadow Power", .section = "Character VBGI",
       .tooltip = "Higher values concentrate GI toward darker areas.",
       .min = 0.1f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeDarkBoost", .binding = &shader_injection.char_gi_dark_boost,
-      .default_value = 0.0f, .label = "Dark Boost", .section = "Character SSGI",
+      .default_value = 0.0f, .label = "Dark Boost", .section = "Character VBGI",
       .tooltip = "Extra GI multiplier in darker regions (after shadow mask).",
       .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeBrightBoost", .binding = &shader_injection.char_gi_bright_boost,
-      .default_value = 3.0f, .label = "Bright Boost", .section = "Character SSGI",
+      .default_value = 3.0f, .label = "Bright Boost", .section = "Character VBGI",
       .tooltip = "Boosts GI on brighter regions (values above 1.0 increase bright-side contribution).",
       .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeHeadroomPower", .binding = &shader_injection.char_gi_headroom_power,
-      .default_value = 1.25f, .label = "Headroom Power", .section = "Character SSGI",
+      .default_value = 1.25f, .label = "Headroom Power", .section = "Character VBGI",
       .tooltip = "Controls how strongly bright pixels reject additional GI.",
       .min = 0.1f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeMaxAdd", .binding = &shader_injection.char_gi_max_add,
-      .default_value = 0.020f, .label = "Max Add", .section = "Character SSGI",
+      .default_value = 0.020f, .label = "Max Add", .section = "Character VBGI",
       .tooltip = "Per-channel cap for added GI to prevent haze/bloomy washout.",
       .min = 0.f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositePeakLumaCap", .binding = &shader_injection.char_gi_peak_luma_cap,
-      .default_value = 0.0f, .label = "Peak Luma Cap", .section = "Character SSGI",
+      .default_value = 0.0f, .label = "Peak Luma Cap", .section = "Character VBGI",
       .tooltip = "Caps peak GI brightness on characters after blending weights. Set 0 to disable.",
       .min = 0.f, .max = 1.f, .format = "%.3f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeDepthReject", .binding = &shader_injection.char_gi_depth_reject,
-      .default_value = 2.0f, .label = "Depth Reject", .section = "Character SSGI",
+      .default_value = 2.0f, .label = "Depth Reject", .section = "Character VBGI",
       .tooltip = "Higher values suppress GI across depth discontinuities and silhouette edges.",
       .min = 0.f, .max = 16.f, .format = "%.2f",
-      .is_enabled = []() { return g_char_ssgi_composite_method >= 0.5f; },
+      .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
 
@@ -1207,7 +1215,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "EnvSSBrightRejectThreshold", .binding = &shader_injection.env_sss_bright_reject_threshold,
-      .default_value = 0.19f, .label = "Brightness Reject", .section = "Environment Screen Space Shadows",
+      .default_value = 0.5f, .label = "Brightness Reject", .section = "Environment Screen Space Shadows",
       .min = 0.f, .max = 5.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
     .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
@@ -1226,521 +1234,591 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "SSS Mask", "Shadow Value"},
     .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
-    // —— XeGTAO ——
+    // —— GTVBAO ——
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOMode", .binding = &shader_injection.xegtao_mode,
+      .key = "GTVBAOMode", .binding = &shader_injection.gtvbao_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "XeGTAO Mode", .section = "XeGTAO",
-      .tooltip = "Off = vanilla game AO. On = XeGTAO compute-shader AO.",
-      .labels = {"Off (Vanilla AO)", "On (XeGTAO)"},
+      .default_value = 1.f, .label = "GTVBAO mode", .section = "GTVBAO",
+      .tooltip = "Off = vanilla game AO. On = GTVBAO compute-shader AO.",
+      .labels = {"Off (Vanilla AO)", "On (GTVBAO)"},
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOQuality", .binding = &shader_injection.xegtao_quality_level,
+      .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality Level", .section = "XeGTAO",
+      .default_value = 1.f, .label = "Quality Level", .section = "GTVBAO",
       .labels = {"Low", "Medium", "High", "Ultra"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODenoisePasses", .binding = &shader_injection.xegtao_denoise_passes,
+      .key = "GTVBAODenoisePasses", .binding = &shader_injection.gtvbao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Denoise Passes", .section = "XeGTAO",
+      .default_value = 2.f, .label = "Denoise Passes", .section = "GTVBAO",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOJitter", .binding = &g_xegtao_jitter_toggle,
+      .key = "GTVBAOJitter", .binding = &g_gtvbao_jitter_toggle,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Jitter", .section = "XeGTAO",
+      .default_value = 0.f, .label = "Jitter", .section = "GTVBAO",
       .tooltip = "Enable temporal jitter even when denoising is off.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes < 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes < 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONoiseType", .binding = &shader_injection.xegtao_noise_type,
+      .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Noise Type", .section = "XeGTAO",
+      .default_value = 2.f, .label = "Noise Type", .section = "GTVBAO",
       .tooltip = "IS-FAST = pre-computed blue noise (needs fast_noise_ea.dds). "
                  "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
                  "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
       .labels = {"IS-FAST", "IGN", "Hilbert"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_isfast_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_isfast_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAORadius", .binding = &shader_injection.xegtao_radius,
-      .default_value = 0.5f, .label = "Radius", .section = "XeGTAO",
+      .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
+      .default_value = 0.5f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOFalloffRange", .binding = &shader_injection.xegtao_falloff_range,
-      .default_value = 0.615f, .label = "Falloff Range", .section = "XeGTAO",
+      .key = "GTVBAOFalloffRange", .binding = &shader_injection.gtvbao_falloff_range,
+      .default_value = 0.615f, .label = "Falloff Range", .section = "GTVBAO",
       .min = 0.0f, .max = 1.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAORadiusMultiplier", .binding = &shader_injection.xegtao_radius_multiplier,
-      .default_value = 1.457f, .label = "Radius Multiplier", .section = "XeGTAO",
+      .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
+      .default_value = 1.457f, .label = "Radius Multiplier", .section = "GTVBAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOFinalPower", .binding = &shader_injection.xegtao_final_power,
-      .default_value = 1.5f, .label = "Final Power", .section = "XeGTAO",
+      .key = "GTVBAOFinalPower", .binding = &shader_injection.gtvbao_final_power,
+      .default_value = 2.2f, .label = "Final Power", .section = "GTVBAO",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOSampleDistribution", .binding = &shader_injection.xegtao_sample_distribution,
-      .default_value = 1.0f, .label = "Sample Distribution", .section = "XeGTAO",
+      .key = "GTVBAOSampleDistribution", .binding = &shader_injection.gtvbao_sample_distribution,
+      .default_value = 1.0f, .label = "Sample Distribution", .section = "GTVBAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOBitmaskThickness", .binding = &shader_injection.xegtao_bitmask_thickness,
-      .default_value = 0.2f, .label = "Bitmask Thickness", .section = "XeGTAO",
+      .key = "GTVBAOBitmaskThickness", .binding = &shader_injection.gtvbao_bitmask_thickness,
+      .default_value = 0.2f, .label = "Bitmask Thickness", .section = "GTVBAO",
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    // —— GTVBAO Upgrade (visibility bitmask accuracy improvements) ——
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGTVBAOCDF", .binding = &shader_injection.gtvbao_cdf_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "GTVBAO CDF Remap", .section = "GTVBAO",
+      .tooltip = "CDF-remap horizon angles to correct sample density near the view pole. Reduces AO bias.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODepthMIPOffset", .binding = &shader_injection.xegtao_depth_mip_offset,
-      .default_value = 2.0f, .label = "Depth MIP Offset", .section = "XeGTAO",
+      .key = "GTVBAOGTVBAOCosine", .binding = &shader_injection.gtvbao_cosine_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "GTVBAO Cosine Sampling", .section = "GTVBAO",
+      .tooltip = "Sample slice directions from a cosine-weighted hemisphere instead of uniformly. Physically correct AO falloff.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
+      .tooltip = "Mode 1: Uniform slices with per-slice weight. Mode 2: Ray projection from world-space lobe. Mode 3: CDF importance sampling (best quality/speed).",
+      .labels = {"Weight", "Project", "CDF"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_cosine_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGTVBAOThickness", .binding = &shader_injection.gtvbao_thickness_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "GTVBAO Per-Sample Thickness", .section = "GTVBAO",
+      .tooltip = "Compute thickness offset per sample direction instead of using fixed view-vector offset. Correct for wide FOV.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAODepthMIPOffset", .binding = &shader_injection.gtvbao_depth_mip_offset,
+      .default_value = 2.0f, .label = "Depth MIP Offset", .section = "GTVBAO",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODenoiseBlurBeta", .binding = &shader_injection.xegtao_denoise_blur_beta,
-      .default_value = 20.0f, .label = "Denoise Blur Beta", .section = "XeGTAO",
+      .key = "GTVBAODenoiseBlurBeta", .binding = &shader_injection.gtvbao_denoise_blur_beta,
+      .default_value = 20.0f, .label = "Denoise Blur Beta", .section = "GTVBAO",
       .min = 0.5f, .max = 20.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODenoiseLeakThreshold", .binding = &shader_injection.xegtao_denoise_leak_threshold,
-      .default_value = 1.0f, .label = "Denoise Leak Threshold", .section = "XeGTAO",
+      .key = "GTVBAODenoiseLeakThreshold", .binding = &shader_injection.gtvbao_denoise_leak_threshold,
+      .default_value = 1.0f, .label = "Denoise Leak Threshold", .section = "GTVBAO",
       .tooltip = "Min edges before AO leaks between pixels. Lower = more temporal stability, slightly softer shadows. 2.5 = default.",
       .min = 1.0f, .max = 4.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODenoiseLeakStrength", .binding = &shader_injection.xegtao_denoise_leak_strength,
-      .default_value = 1.0f, .label = "Denoise Leak Strength", .section = "XeGTAO",
+      .key = "GTVBAODenoiseLeakStrength", .binding = &shader_injection.gtvbao_denoise_leak_strength,
+      .default_value = 1.0f, .label = "Denoise Leak Strength", .section = "GTVBAO",
       .tooltip = "How strongly AO leaks across edges. Higher = less flicker on grass/thin geometry, slightly softer contact shadows. 0.5 = default.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODenoiserType", .binding = &shader_injection.xegtao_denoiser_type,
+      .key = "GTVBAODenoiserType", .binding = &shader_injection.gtvbao_denoiser_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Denoiser Type", .section = "XeGTAO",
-      .tooltip = "Spatial: 5x5 edge-aware blur only. Spatio-Temporal: blends with previous frame for much higher stability on thin geometry.",
-      .labels = {"Spatial", "Spatio-Temporal"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f; },
+      .default_value = 2.f, .label = "Denoiser Type", .section = "GTVBAO",
+      .tooltip = "Spatial: 5x5 edge-aware blur only. Spatio-Temporal: blends with previous frame for much higher stability on thin geometry. Poisson: disk sampling with luma/depth/normal similarity weights.",
+      .labels = {"Spatial", "Spatio-Temporal", "Poisson"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOTemporalFrames", .binding = &shader_injection.xegtao_temporal_frame_count,
+      .key = "GTVBAOPoissonSamples", .binding = &shader_injection.gtvbao_poisson_samples,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Temporal Frames", .section = "XeGTAO",
+      .default_value = 6.f, .label = "Poisson Samples", .section = "GTVBAO",
+      .tooltip = "Number of Poisson disk samples for denoising. More samples = better quality, higher cost.",
+      .labels = {"4","6","8","10","12","14","16","20","24","28","32"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type >= 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOPoissonLumaPhi", .binding = &shader_injection.gtvbao_poisson_luma_phi,
+      .default_value = 0.f, .label = "Poisson Luma Phi", .section = "GTVBAO",
+      .tooltip = "Luma/AO similarity falloff. Lower = stricter (only very similar pixels contribute). Higher = more blur.",
+      .min = 0.0f, .max = 20.0f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type >= 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOPoissonDepthPhi", .binding = &shader_injection.gtvbao_poisson_depth_phi,
+      .default_value = 0.f, .label = "Poisson Depth Phi", .section = "GTVBAO",
+      .tooltip = "Depth similarity falloff. Lower = stricter (only coplanar surfaces contribute). Higher = more blur across depth edges.",
+      .min = 0.0f, .max = 20.0f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type >= 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOPoissonNormalPhi", .binding = &shader_injection.gtvbao_poisson_normal_phi,
+      .default_value = 0.f, .label = "Poisson Normal Phi", .section = "GTVBAO",
+      .tooltip = "Normal similarity falloff (exponent). Lower = stricter (only same-facing surfaces). Higher = more blur across normals.",
+      .min = 0.0f, .max = 20.0f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type >= 1.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOTemporalFrames", .binding = &shader_injection.gtvbao_temporal_frame_count,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "Temporal Frames", .section = "GTVBAO",
       .tooltip = "How many previous frames influence the result. 0-1 = off (spatial only). 2 = fast response. 8 = balanced (default). 16 = most stable, some ghosting.",
       .labels = {"0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOTemporalBlend", .binding = &shader_injection.xegtao_temporal_blend,
-      .default_value = 0.35f, .label = "Temporal Blend", .section = "XeGTAO",
+      .key = "GTVBAOTemporalBlend", .binding = &shader_injection.gtvbao_temporal_blend,
+      .default_value = 0.35f, .label = "Temporal Blend", .section = "GTVBAO",
       .tooltip = "Overall temporal strength (multiplied with Frames). 1.0 = full effect. 0.5 = half. 0.0 = off.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODisocclusionThr", .binding = &shader_injection.xegtao_disocclusion_threshold,
-      .default_value = 0.01f, .label = "Disocclusion Threshold", .section = "XeGTAO",
+      .key = "GTVBAODisocclusionThr", .binding = &shader_injection.gtvbao_disocclusion_threshold,
+      .default_value = 0.01f, .label = "Disocclusion Threshold", .section = "GTVBAO",
       .tooltip = "Max depth difference to accept history sample. Higher = more ghosting, less flicker on disocclusion.",
       .min = 0.001f, .max = 1.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.xegtao_denoise_passes > 0.f && shader_injection.xegtao_denoiser_type > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalInputMode", .binding = &g_xegtao_normal_input_mode,
+      .key = "GTVBAONormalInputMode", .binding = &g_gtvbao_normal_input_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "MRT Normal Input", .section = "XeGTAO",
+      .default_value = 1.f, .label = "MRT Normal Input", .section = "GTVBAO",
       .tooltip = "Off = depth normals only. On = use game g-buffer normals.",
       .labels = {"Off (Depth)", "On (MRT)"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalInfluence", .binding = &g_xegtao_normal_influence,
-      .default_value = 1.f, .label = "Normal Influence", .section = "XeGTAO",
+      .key = "GTVBAONormalInfluence", .binding = &g_gtvbao_normal_influence,
+      .default_value = 1.f, .label = "Normal Influence", .section = "GTVBAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalDepthBlend", .binding = &g_xegtao_normal_depth_blend,
-      .default_value = 0.65f, .label = "Normal Depth Blend", .section = "XeGTAO",
+      .key = "GTVBAONormalDepthBlend", .binding = &g_gtvbao_normal_depth_blend,
+      .default_value = 0.65f, .label = "Normal Depth Blend", .section = "GTVBAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalSharpness", .binding = &g_xegtao_normal_sharpness,
-      .default_value = 1.f, .label = "Normal Sharpness", .section = "XeGTAO",
+      .key = "GTVBAONormalSharpness", .binding = &g_gtvbao_normal_sharpness,
+      .default_value = 1.f, .label = "Normal Sharpness", .section = "GTVBAO",
       .min = 0.01f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalEdgeRejection", .binding = &g_xegtao_normal_edge_rejection,
-      .default_value = 0.5f, .label = "Normal Edge Rejection", .section = "XeGTAO",
+      .key = "GTVBAONormalEdgeRejection", .binding = &g_gtvbao_normal_edge_rejection,
+      .default_value = 0.5f, .label = "Normal Edge Rejection", .section = "GTVBAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalZPreservation", .binding = &g_xegtao_normal_z_preservation,
-      .default_value = 0.f, .label = "Normal Z Preservation", .section = "XeGTAO",
+      .key = "GTVBAONormalZPreservation", .binding = &g_gtvbao_normal_z_preservation,
+      .default_value = 0.f, .label = "Normal Z Preservation", .section = "GTVBAO",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalDetailResponse", .binding = &g_xegtao_normal_detail_response,
-      .default_value = 1.0f, .label = "Normal Detail Response", .section = "XeGTAO",
+      .key = "GTVBAONormalDetailResponse", .binding = &g_gtvbao_normal_detail_response,
+      .default_value = 1.0f, .label = "Normal Detail Response", .section = "GTVBAO",
       .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalMaxDarkening", .binding = &g_xegtao_normal_max_darkening,
-      .default_value = 0.4f, .label = "Normal Max Darkening", .section = "XeGTAO",
+      .key = "GTVBAONormalMaxDarkening", .binding = &g_gtvbao_normal_max_darkening,
+      .default_value = 0.4f, .label = "Normal Max Darkening", .section = "GTVBAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalDarkeningMode", .binding = &g_xegtao_normal_darkening_mode,
+      .key = "GTVBAONormalDarkeningMode", .binding = &g_gtvbao_normal_darkening_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Normal Darkening Mode", .section = "XeGTAO",
+      .default_value = 0.f, .label = "Normal Darkening Mode", .section = "GTVBAO",
       .labels = {"Multiply", "Replace"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAONormalTransformMode", .binding = &g_xegtao_normal_transform_mode,
+      .key = "GTVBAONormalTransformMode", .binding = &g_gtvbao_normal_transform_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Normal Transform Mode", .section = "XeGTAO",
+      .default_value = 0.f, .label = "Normal Transform Mode", .section = "GTVBAO",
       .tooltip = "How to transform MRT normals to view space. Try alternatives if normals look wrong at some camera angles.",
       .labels = {"view_g (default)", "viewInv_g", "Passthrough"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && g_xegtao_normal_input_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODebugView", .binding = &shader_injection.xegtao_debug_view,
+      .key = "GTVBAODebugView", .binding = &shader_injection.gtvbao_debug_view,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Debug View", .section = "XeGTAO",
-      .labels = {"Off", "AO Only", "XeGTAO raw .a", "XeGTAO RGBA", "Vanilla SSAO", "Depth",
+      .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
+      .labels = {"Off", "AO Only", "GTVBAO raw .a", "GTVBAO RGBA", "Vanilla SSAO", "Depth",
                  "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAODebugLogging", .binding = &shader_injection.xegtao_debug_logging,
+      .key = "GTVBAODebugLogging", .binding = &shader_injection.gtvbao_debug_logging,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Debug Logging", .section = "XeGTAO",
+      .default_value = 0.f, .label = "Debug Logging", .section = "GTVBAO",
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOFixExperimental", .binding = &shader_injection.xegtao_fix_experimental,
+      .key = "GTVBAOFixExperimental", .binding = &shader_injection.gtvbao_fix_experimental,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Fix Experimental", .section = "XeGTAO",
+      .default_value = 0.f, .label = "Fix Experimental", .section = "GTVBAO",
       .tooltip = "Bitmask AO experimental fixes. 0=Off (baseline). Test each mode to diagnose darkening.",
       .labels = {"Off", "1:Clamp50%", "2:Clamp100%", "3:ScaleDist", "4:SkipBehind", "5:Skip2x"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOFrameSkip", .binding = &g_xegtao_frame_skip,
+      .key = "GTVBAOFrameSkip", .binding = &g_gtvbao_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Frame Skip", .section = "XeGTAO",
-      .tooltip = "Skip XeGTAO AO+GI computation every N frames to improve performance.",
+      .default_value = 0.f, .label = "Frame Skip", .section = "GTVBAO",
+      .tooltip = "Skip GTVBAO AO+GI computation every N frames to improve performance.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── XeGTAO Dispatch Fix (for double volumetrics) ──
+    // ── GTVBAO dispatch Fix (for double volumetrics) ──
     new renodx::utils::settings::Setting{
-      .key = "XeGTAOCSDispatchFix", .binding = &g_xegtao_cs_dispatch_fix,
+      .key = "GTVBAOCSDispatchFix", .binding = &g_gtvbao_cs_dispatch_fix,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "CS Dispatch Fix", .section = "XeGTAO",
+      .default_value = 2.f, .label = "CS Dispatch Fix", .section = "GTVBAO",
       .tooltip = "Fixes double volumetrics caused by stale compute descriptor bindings. Fix 1: restore state via Apply(). Fix 2: null compute descriptors. Fix 3: null + restore.",
       .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
     .is_visible = []() { return IsAdvancedSettingsMode() && IsKai(); },
     },
-    // —— SSGI (Screen Space Global Illumination — integrated into XeGTAO) ——
+    // —— SSGI (Screen Space Global Illumination — integrated into GTVBAO) ——
     new renodx::utils::settings::Setting{
-      .key = "SSGIEnable", .binding = &shader_injection.ssgi_enabled,
+      .key = "SSGIEnable", .binding = &shader_injection.vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "SSGI Enable", .section = "SSGI",
-      .tooltip = "Visibility bitmask indirect diffuse GI. Requires XeGTAO Mode = On.",
+      .default_value = 1.f, .label = "SSGI Enable", .section = "VBGI",
+      .tooltip = "Visibility bitmask indirect diffuse GI. Requires GTVBAO mode = On.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIIntensity", .binding = &shader_injection.ssgi_intensity,
-      .default_value = 1.0f, .label = "Intensity", .section = "SSGI",
+      .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
+      .default_value = 1.0f, .label = "Intensity", .section = "VBGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGISaturation", .binding = &shader_injection.ssgi_saturation,
-      .default_value = 1.5f, .label = "Saturation", .section = "SSGI",
+      .key = "SSGISaturation", .binding = &shader_injection.vbgi_saturation,
+      .default_value = 1.5f, .label = "Saturation", .section = "VBGI",
       .tooltip = "0 = grayscale GI, 1 = full color GI.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGICharMaskStrength", .binding = &shader_injection.ssgi_char_mask_strength,
+      .key = "SSGICharMaskStrength", .binding = &shader_injection.vbgi_char_mask_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Character Mask Strength", .section = "SSGI",
+      .default_value = 0.5f, .label = "Character Mask Strength", .section = "VBGI",
       .tooltip = "Reduce SSGI on character models. 0 = full GI on characters, 1 = fully masked.",
       .min = 0.5f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounce", .binding = &shader_injection.ssgi_multibounce,
+      .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Multi-Bounce", .section = "SSGI",
+      .default_value = 1.f, .label = "Multi-Bounce", .section = "VBGI",
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceStrength", .binding = &shader_injection.ssgi_multibounce_strength,
+      .key = "SSGIMultiBounceStrength", .binding = &shader_injection.vbgi_multibounce_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 5.0f, .label = "Multi-Bounce Strength", .section = "SSGI",
+      .default_value = 5.0f, .label = "Multi-Bounce Strength", .section = "VBGI",
       .tooltip = "Intensity of the multi-bounce feedback. 1.0 = natural, higher = stronger accumulation.",
       .min = 0.0f, .max = 10.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceSaturation", .binding = &shader_injection.ssgi_multibounce_saturation,
+      .key = "SSGIMultiBounceSaturation", .binding = &shader_injection.vbgi_multibounce_saturation,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Multi-Bounce Saturation", .section = "SSGI",
+      .default_value = 1.0f, .label = "Multi-Bounce Saturation", .section = "VBGI",
       .tooltip = "Color saturation of the multi-bounce feedback. 0 = grayscale, 1 = full color.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMultiBounceMaxClamp", .binding = &shader_injection.ssgi_multibounce_max_clamp,
+      .key = "SSGIMultiBounceMaxClamp", .binding = &shader_injection.vbgi_multibounce_max_clamp,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Multi-Bounce Max Clamp", .section = "SSGI",
+      .default_value = 0.f, .label = "Multi-Bounce Max Clamp", .section = "VBGI",
       .tooltip = "Clamp multi-bounce feedback per-channel to prevent over-brightening. 0 = off.",
       .min = 0.0f, .max = 20.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveR", .binding = &shader_injection.ssgi_adaptive_r,
+      .key = "SSGIAdaptiveR", .binding = &shader_injection.vbgi_adaptive_r,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Red Adaptive Strength", .section = "SSGI",
+      .default_value = 0.f, .label = "Red Adaptive Strength", .section = "VBGI",
       .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveG", .binding = &shader_injection.ssgi_adaptive_g,
+      .key = "SSGIAdaptiveG", .binding = &shader_injection.vbgi_adaptive_g,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Green Adaptive Strength", .section = "SSGI",
+      .default_value = 0.f, .label = "Green Adaptive Strength", .section = "VBGI",
       .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveB", .binding = &shader_injection.ssgi_adaptive_b,
+      .key = "SSGIAdaptiveB", .binding = &shader_injection.vbgi_adaptive_b,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Blue Adaptive Strength", .section = "SSGI",
+      .default_value = 0.f, .label = "Blue Adaptive Strength", .section = "VBGI",
       .tooltip = "Per-channel adaptive boost: amplifies a color channel more when it's dominant. 0=off, 1=max.",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveMode", .binding = &shader_injection.ssgi_adaptive_mode,
+      .key = "SSGIAdaptiveMode", .binding = &shader_injection.vbgi_adaptive_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Adaptive Mode", .section = "SSGI",
+      .default_value = 0.f, .label = "Adaptive Mode", .section = "VBGI",
       .tooltip = "GI Color = boost channels based on GI's own color. Albedo = boost based on surface color at pixel.",
       .labels = {"GI Color", "Surface Albedo"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveLumaStrength", .binding = &shader_injection.ssgi_adaptive_luma_strength,
+      .key = "SSGIAdaptiveLumaStrength", .binding = &shader_injection.vbgi_adaptive_luma_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.1f, .label = "Adaptive Luma Strength", .section = "SSGI",
+      .default_value = 0.1f, .label = "Adaptive Luma Strength", .section = "VBGI",
       .tooltip = "Target brightness for GI normalization. 0=off. Higher = brighter target. Evens out indoor/outdoor GI.",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIAdaptiveLumaBlend", .binding = &shader_injection.ssgi_adaptive_luma_blend,
+      .key = "SSGIAdaptiveLumaBlend", .binding = &shader_injection.vbgi_adaptive_luma_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.15f, .label = "Adaptive Luma Blend", .section = "SSGI",
+      .default_value = 0.15f, .label = "Adaptive Luma Blend", .section = "VBGI",
       .tooltip = "Blend between original GI (0) and luma-normalized GI (1).",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIMaxClamp", .binding = &shader_injection.ssgi_max_clamp,
-      .default_value = 0.2f, .label = "GI Max Clamp", .section = "SSGI",
+      .key = "SSGIMaxClamp", .binding = &shader_injection.vbgi_max_clamp,
+      .default_value = 0.2f, .label = "GI Max Clamp", .section = "VBGI",
       .tooltip = "Clamp GI per-channel to this maximum. 0 = off.",
       .min = 0.0f, .max = 20.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIReduceAO", .binding = &shader_injection.ssgi_reduce_ao,
+      .key = "SSGIReduceAO", .binding = &shader_injection.vbgi_reduce_ao,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Reduce AO with GI", .section = "SSGI",
-      .tooltip = "Reduce XeGTAO occlusion where indirect light is strong. Keeps dark crevices dark while brightening lit surfaces.",
+      .default_value = 1.f, .label = "Reduce AO with GI", .section = "VBGI",
+      .tooltip = "Reduce GTVBAO occlusion where indirect light is strong. Keeps dark crevices dark while brightening lit surfaces.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIReduceAOStrength", .binding = &shader_injection.ssgi_reduce_ao_strength,
-      .default_value = 2.f, .label = "Reduce AO Strength", .section = "SSGI",
+      .key = "SSGIReduceAOStrength", .binding = &shader_injection.vbgi_reduce_ao_strength,
+      .default_value = 2.f, .label = "Reduce AO Strength", .section = "VBGI",
       .tooltip = "How strongly indirect light reduces AO. 0=no change, 1=full reduction.",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_reduce_ao > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_reduce_ao > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGILightExposure", .binding = &g_ssgi_light_exposure,
-      .default_value = 1.0f, .label = "Light Exposure", .section = "SSGI",
+      .key = "SSGILightExposure", .binding = &g_vbgi_light_exposure,
+      .default_value = 1.0f, .label = "Light Exposure", .section = "VBGI",
       .tooltip = "Exposure scale for HDR light buffer. Start at 0.05. Lower = dimmer GI.",
       .min = 0.001f, .max = 5.0f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIFrameSkip", .binding = &g_ssgi_frame_skip,
+      .key = "SSGIFrameSkip", .binding = &g_vbgi_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "SSGI Frame Skip", .section = "SSGI",
+      .default_value = 0.f, .label = "SSGI Frame Skip", .section = "VBGI",
       .tooltip = "Skip GI computation every N frames. AO still runs every frame.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MultiBounceFrameSkip", .binding = &g_multibounce_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Multi-Bounce Frame Skip", .section = "SSGI",
+      .default_value = 1.f, .label = "Multi-Bounce Frame Skip", .section = "VBGI",
       .tooltip = "Skip multi-bounce accumulation every N frames.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
-      .is_enabled = []() { return shader_injection.xegtao_mode > 0.5f && shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_multibounce > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // —— SSGI Debug ——
+    // —— VBGI debug ——
     new renodx::utils::settings::Setting{
-      .key = "SSGIDebugView", .binding = &shader_injection.ssgi_debug_view,
+      .key = "SSGIDebugView", .binding = &shader_injection.vbgi_debug_view,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "SSGI Debug View", .section = "SSGI",
-      .tooltip = "Replace scene with SSGI debug textures.",
+      .default_value = 0.f, .label = "VBGI debug View", .section = "VBGI",
+      .tooltip = "Replace scene with VBGI debug textures.",
       .labels = {"Off", "Raw GI", "Denoised GI", "Light Buffer", "Accumulated", "5:Sample Activity", "Light Color", "Final GI"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIDebugLogging", .binding = &shader_injection.ssgi_debug_logging,
+      .key = "SSGIDebugLogging", .binding = &shader_injection.vbgi_debug_logging,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "SSGI Debug Logging", .section = "SSGI",
-      .tooltip = "Log SSGI dispatch, push, and texture binding to console.",
+      .default_value = 0.f, .label = "VBGI debug Logging", .section = "VBGI",
+      .tooltip = "Log VBGI dispatch, push, and texture binding to console.",
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── Kai: XeGTAO SSGI Falcom SSGI consumption ──
+    // ── Kai: GTVBAO VBGI Falcom SSGI consumption ──
     new renodx::utils::settings::Setting{
-      .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.ssgi_kai_consume_falcom,
+      .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.vbgi_kai_consume_falcom,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "SSGI",
-      .tooltip = "When ON, Falcom's SSGI color modulates XeGTAO GI before blending. Creates a multiplicative interaction between the two GI sources.",
+      .default_value = 0.f, .label = "Consume Falcom SSGI (Kai)", .section = "VBGI",
+      .tooltip = "When ON, Falcom's SSGI color modulates GTVBAO VBGI before blending. Creates a multiplicative interaction between the two GI sources.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIKaiFalcomBlend", .binding = &shader_injection.ssgi_kai_falcom_blend,
-      .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "SSGI",
-      .tooltip = "How much Falcom SSGI color modulates XeGTAO GI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
+      .key = "SSGIKaiFalcomBlend", .binding = &shader_injection.vbgi_kai_falcom_blend,
+      .default_value = 0.5f, .label = "Falcom SSGI Blend (Kai)", .section = "VBGI",
+      .tooltip = "How much Falcom SSGI color modulates GTVBAO VBGI. 0 = no modulation (additive only), 1 = full multiplicative blend.",
       .min = 0.f, .max = 1.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.ssgi_enabled > 0.5f && shader_injection.ssgi_kai_consume_falcom > 0.5f; },
+      .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_kai_consume_falcom > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGIKaiXeGTAOOnly", .binding = &shader_injection.ssgi_kai_xegtao_only,
+      .key = "SSGIKaiGTVBAOOnly", .binding = &shader_injection.vbgi_kai_gtvbao_only,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "XeGTAO GI Only (Kai)", .section = "SSGI",
-      .tooltip = "When ON, Falcom SSGI is suppressed from output and only XeGTAO GI is visible. XeGTAO can still consume Falcom SSGI internally for modulation.",
+      .default_value = 0.f, .label = "GTVBAO VBGI Only (Kai)", .section = "VBGI",
+      .tooltip = "When ON, Falcom SSGI is suppressed from output and only GTVBAO VBGI is visible. GTVBAO can still consume Falcom SSGI internally for modulation.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.ssgi_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     // —— SSGI Affect Lights ——
     new renodx::utils::settings::Setting{
-      .key = "SSGIAffectLights", .binding = &shader_injection.ssgi_affect_lights,
+      .key = "SSGIAffectLights", .binding = &shader_injection.vbgi_affect_lights,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Affect Lights", .section = "SSGI",
+      .default_value = 0.f, .label = "Affect Lights", .section = "VBGI",
       .tooltip = "Additively blend the sun's lightColor into the GI contribution, tinting indirect light.",
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGILightsStrength", .binding = &shader_injection.ssgi_lights_strength,
+      .key = "SSGILightsStrength", .binding = &shader_injection.vbgi_lights_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Lights Strength", .section = "SSGI",
+      .default_value = 1.f, .label = "Lights Strength", .section = "VBGI",
       .tooltip = "How much lightColor to add. 0=no effect, 1=full sun color, >1=boosted.",
       .min = 0.f, .max = 5.0f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.ssgi_affect_lights > 0.5f; },
+      .is_enabled = []() { return shader_injection.vbgi_affect_lights > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGILightsSaturation", .binding = &shader_injection.ssgi_lights_saturation,
+      .key = "SSGILightsSaturation", .binding = &shader_injection.vbgi_lights_saturation,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Lights Saturation", .section = "SSGI",
+      .default_value = 1.f, .label = "Lights Saturation", .section = "VBGI",
       .tooltip = "Vibrance applied to lightColor before adding. 0=grayscale, 1=neutral, >1=vivid.",
       .min = 0.f, .max = 100.0f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.ssgi_affect_lights > 0.5f; },
+      .is_enabled = []() { return shader_injection.vbgi_affect_lights > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "SSGICascadeDebug", .binding = &shader_injection.ssgi_cascade_debug,
+      .key = "SSGICascadeDebug", .binding = &shader_injection.vbgi_cascade_debug,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "CascadeCount Debug", .section = "SSGI",
+      .default_value = 0.f, .label = "CascadeCount Debug", .section = "VBGI",
       .tooltip = "Color overlay by shadowmapCascadeCount_g: 0=red, 1=yellow, 2=green, 3=cyan, 4=blue.",
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1750,7 +1828,7 @@ renodx::utils::settings::Settings settings = {
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Deferred Dispatch", .section = "CPU Opt",
-      .tooltip = "Move XeGTAO/SSGI dispatch to OnPresent (1-frame latency). Kai-only, default ON — avoids CS binding contamination.",
+      .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default ON — avoids CS binding contamination.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
@@ -2130,7 +2208,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Disable SSAO from in game settings for small performance boost if you are using XeGTAO.",
+        .label = "Disable SSAO from in game settings for small performance boost if you are using GTVBAO.",
         .section = "Info",
         .is_visible = []() { return !IsKai(); },
     },
@@ -2142,15 +2220,15 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "If you are going to be using XeGTAO, make sure in-game setting for local shadowing is set to character only.",
+        .label = "If you are going to be using GTVBAO, make sure in-game setting for local shadowing is set to character only.",
         .section = "Info",
         .is_visible = []() { return IsKai(); },
     },
-    // ── SSGI debug views removed — use XeGTAO Debug View for GI inspection. ──
+    // ── VBGI debug views removed — use GTVBAO debug View for GI inspection. ──
 
 };
 
-// ═══════════ XeGTAO Backend — implementation ═══════════
+// ═══════════ GTVBAO Backend — implementation ═══════════
 
 static void OnInitDevice(reshade::api::device* device) {
   reshade::log::message(reshade::log::level::info, "[sora-vanillaplus] Device init — addon loaded.");
@@ -2172,13 +2250,13 @@ static void OnInitDevice(reshade::api::device* device) {
                                     reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1),
                                 &d->fallback_srv);
 
-  reshade::log::message(reshade::log::level::info, "[XeGTAO] Device init — fallback SRV created.");
+  reshade::log::message(reshade::log::level::info, "[GTVBAO] Device init — fallback SRV created.");
 }
 
 static void OnDestroyDevice(reshade::api::device* device) {
   auto* d = device->get_private_data<DeviceData>();
   if (d) {
-    DestroyXeGTAOResources(device, d);
+    DestroyGTVBAOResources(device, d);
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
     device->destroy_private_data<DeviceData>();
@@ -2189,12 +2267,12 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
   auto* d = sc->get_device()->get_private_data<DeviceData>();
   if (!d) return;
   if (resize) {
-    d->resize_guard_until_frame = d->frame_index + kXeGTAOResizeGuardFrames;
+    d->resize_guard_until_frame = d->frame_index + kGTVBAOResizeGuardFrames;
     d->captured_depth_srv = {}; d->captured_ssao_srv = {};
     d->captured_scene_cbv_view = {};
     d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
-    DestroyXeGTAOResources(sc->get_device(), d);
+    DestroyGTVBAOResources(sc->get_device(), d);
   }
 }
 
@@ -2209,17 +2287,17 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
     d->resources_created = false;
     return;
   }
-  DestroyXeGTAOResources(sc->get_device(), d);
+  DestroyGTVBAOResources(sc->get_device(), d);
 }
 
 // ── Descriptor table helpers ──
 
-static bool EnsureXeGTAODescriptorTables(
+static bool EnsureGTVBAODescriptorTables(
     reshade::api::device* device,
     reshade::api::pipeline_layout layout,
-    XeGTAODescriptorTableSet* tables) {
+    GTVBAODescriptorTableSet* tables) {
   if (!device || !tables || !layout.handle) return false;
-  for (uint32_t i = 0; i < kXeGtaoDescriptorTableParamCount; ++i) {
+  for (uint32_t i = 0; i < kGtvbaoDescriptorTableParamCount; ++i) {
     if ((*tables)[i].handle != 0u) continue;
     if (!device->allocate_descriptor_table(layout, i, &(*tables)[i]))
       return false;
@@ -2227,8 +2305,8 @@ static bool EnsureXeGTAODescriptorTables(
   return true;
 }
 
-static void DestroyXeGTAODescriptorTables(
-    reshade::api::device* device, XeGTAODescriptorTableSet* tables) {
+static void DestroyGTVBAODescriptorTables(
+    reshade::api::device* device, GTVBAODescriptorTableSet* tables) {
   if (!device || !tables) return;
   for (auto& t : *tables) {
     if (t.handle) { device->free_descriptor_table(t); t = {}; }
@@ -2273,12 +2351,12 @@ static void OnPushDescriptorsCapture(
         if (IsLightingShader(hash)) {
           d->captured_depth_srv = views[0];
           d->captured_scene_cbv_frame = d->frame_index;
-          if (shader_injection.xegtao_debug_logging > 0.5f) {
+          if (shader_injection.gtvbao_debug_logging > 0.5f) {
             auto depth_res = device->get_resource_from_view(views[0]);
             if (depth_res.handle != 0u) {
               auto dd = device->get_resource_desc(depth_res);
               reshade::log::message(reshade::log::level::info,
-                (std::string("[XeGTAO] Depth captured from lighting: ") +
+                (std::string("[GTVBAO] Depth captured from lighting: ") +
                  std::to_string(dd.texture.width) + "x" +
                  std::to_string(dd.texture.height)).c_str());
             }
@@ -2333,8 +2411,8 @@ static void OnPushDescriptorsCapture(
     }
   }
 
-  // ── Per-draw gating (only when XeGTAO or SSGI is on). ──
-  if (shader_injection.xegtao_mode < 0.5f) return;
+  // ── Per-draw gating (only when GTVBAO or SSGI is on). ──
+  if (shader_injection.gtvbao_mode < 0.5f) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
 }
 
@@ -2356,11 +2434,11 @@ static void OnBindDescriptorTables(
   if (s_bind_log_count < 5u) {
     s_bind_log_count++;
     reshade::log::message(reshade::log::level::info,
-      (std::string("[XeGTAO] bind_descriptor_tables: first=") +
+      (std::string("[GTVBAO] bind_descriptor_tables: first=") +
       std::to_string(first) + ", count=" + std::to_string(count)).c_str());
   }
 
-  if (shader_injection.xegtao_mode < 0.5f) return;
+  if (shader_injection.gtvbao_mode < 0.5f) return;
 
   // Only capture on pixel-stage draws.
   const uint32_t sm = static_cast<uint32_t>(stages);
@@ -2444,12 +2522,12 @@ static void OnBindDescriptorTables(
   }
 }
 
-// ── XeGTAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics ──
-static void ApplyXeGTAOCSDispatchFix(
+// ── GTVBAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics ──
+static void ApplyGTVBAOCSDispatchFix(
     reshade::api::command_list* cmd_list,
     renodx::utils::state::CommandListState* cs,
     renodx::utils::state::CommandListState& prev) {
-  int fix = (int)g_xegtao_cs_dispatch_fix;
+  int fix = (int)g_gtvbao_cs_dispatch_fix;
   if (fix < 1 || fix > 3) {
     // Fix 0 (Off): legacy behavior — just null pipeline + struct copy
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
@@ -2458,7 +2536,7 @@ static void ApplyXeGTAOCSDispatchFix(
   }
 
   if (fix == 2 || fix == 3) {
-    // Push null descriptors to all compute-stage slots used by XeGTAO
+    // Push null descriptors to all compute-stage slots used by GTVBAO
     reshade::api::resource_view null_srv = {};
     reshade::api::resource_view null_uav = {};
     reshade::api::resource_view null_cbv = {};
@@ -2528,11 +2606,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
   }
 
-  if (shader_injection.xegtao_mode < 0.5f) return;
-  if (d->frame_index <= kXeGTAOStartupGuardFrames) {
-    if (d->frame_index == kXeGTAOStartupGuardFrames) {
+  if (shader_injection.gtvbao_mode < 0.5f) return;
+  if (d->frame_index <= kGTVBAOStartupGuardFrames) {
+    if (d->frame_index == kGTVBAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
-        "[XeGTAO] Startup guard complete — dispatch begins next frame.");
+        "[GTVBAO] Startup guard complete — dispatch begins next frame.");
     }
     return;
   }
@@ -2568,21 +2646,21 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
         && (!d->resources_created || too_small
             || gw != d->last_created_game_width
             || gh != d->last_created_game_height)) {
-      CreateXeGTAOResources(dev, d, gw, gh);
+      CreateGTVBAOResources(dev, d, gw, gh);
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
       d->resources_created = true;
       reshade::log::message(reshade::log::level::info,
-        (std::string("[XeGTAO] Resources created: ") +
+        (std::string("[GTVBAO] Resources created: ") +
          std::to_string(d->working_width) + "x" +
          std::to_string(d->working_height) + " (depth=" +
          std::to_string(gw) + "x" + std::to_string(gh) + ")").c_str());
     }
   }
   // Use deferred snapshots from lighting draw (kai-style) — deferred dispatch only.
-  // ── Light-buffer capture helper (runs after XeGTAO for multi-bounce feedback) ──
+  // ── Light-buffer capture helper (runs after GTVBAO for multi-bounce feedback) ──
   auto capture_light_buffer_for_next_frame = [&]() {
-    if (shader_injection.ssgi_enabled < 0.5f || !d->captured_light_buffer_texture.handle) return;
+    if (shader_injection.vbgi_enabled < 0.5f || !d->captured_light_buffer_texture.handle) return;
     auto bb = sc->get_back_buffer(0);
     if (!bb.handle) return;
     // Recreate capture texture if back buffer format changed (e.g. HDR vs SDR mismatch).
@@ -2625,7 +2703,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->captured_light_buffer_valid = true;
   };
 
-  // Inline dispatch active (deferred off) — XeGTAO runs during lighting pass, not here.
+  // Inline dispatch active (deferred off) — GTVBAO runs during lighting pass, not here.
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     capture_light_buffer_for_next_frame();
     return;
@@ -2633,13 +2711,13 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (!d->deferred_scene_cbv_valid
       || (d->frame_index - d->deferred_scene_cbv_frame) > 1u) {
     capture_light_buffer_for_next_frame();
-    if (shader_injection.xegtao_debug_logging > 0.5f) {
+    if (shader_injection.gtvbao_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::warning,
-                            "[XeGTAO] Dispatch skipped: no deferred scene CBV.");
+                            "[GTVBAO] Dispatch skipped: no deferred scene CBV.");
     }
     return;
   }
-  // Restore deferred snapshots as active captures for RunXeGTAO / RunSSGI.
+  // Restore deferred snapshots as active captures for RunGTVBAO / RunVBGI.
   d->captured_depth_srv = d->deferred_depth_srv;
   d->captured_ssao_srv = d->deferred_ssao_srv;
   d->captured_mrt_normal_srv = d->deferred_mrt_normal_srv;
@@ -2649,12 +2727,12 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   d->captured_scene_cbv_frame = d->deferred_scene_cbv_frame;
   d->deferred_pending = false;
 
-  // XeGTAO reads proj_g directly from the game's scene CBV (b0) in-shader —
+  // GTVBAO reads proj_g directly from the game's scene CBV (b0) in-shader —
   // no CPU-side mapping needed (kai-vanillaplus approach).
 
-  if (shader_injection.xegtao_debug_logging > 0.5f)
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      (std::string("[XeGTAO] Dispatching (frame=") +
+      (std::string("[GTVBAO] Dispatching (frame=") +
        std::to_string(d->frame_index) + ", res=" +
        std::to_string(d->working_width) + "x" +
        std::to_string(d->working_height) + ")").c_str());
@@ -2664,33 +2742,33 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   renodx::utils::state::CommandListState prev = {};
   if (cs) prev = *cs;
 
-  bool ok = RunXeGTAO(cl, d);
+  bool ok = RunGTVBAO(cl, d);
 
   // Restore: apply dispatch fix, then restore previous state.
-  ApplyXeGTAOCSDispatchFix(cl, cs, prev);
+  ApplyGTVBAOCSDispatchFix(cl, cs, prev);
 
-  if (shader_injection.xegtao_debug_logging > 0.5f && ok) {
+  if (shader_injection.gtvbao_debug_logging > 0.5f && ok) {
     std::ostringstream msg;
-    msg << "[XeGTAO] Dispatch OK (frame=" << d->frame_index
+    msg << "[GTVBAO] Dispatch OK (frame=" << d->frame_index
         << ", res=" << d->working_width << "x" << d->working_height << ")";
     reshade::log::message(reshade::log::level::info, msg.str().c_str());
-  } else if (shader_injection.xegtao_debug_logging > 0.5f && !ok) {
-    reshade::log::message(reshade::log::level::warning, "[XeGTAO] Dispatch failed.");
+  } else if (shader_injection.gtvbao_debug_logging > 0.5f && !ok) {
+    reshade::log::message(reshade::log::level::warning, "[GTVBAO] Dispatch failed.");
   }
 
-  // ── GI is now integrated into XeGTAO main pass (visibility bitmask AO+GI). ──
-  // The GI output (ssgi_denoised_srv) is produced during RunXeGTAO denoise pass.
-  // No separate SSGI dispatch needed.
+  // ── GI is now integrated into GTVBAO main pass (visibility bitmask AO+GI). ──
+  // The GI output (vbgi_denoised_srv) is produced during RunGTVBAO denoise pass.
+  // No separate VBGI dispatch needed.
 
   // ── Capture light buffer for next frame's multi-bounce (after GI applied) ──
   capture_light_buffer_for_next_frame();
 
-  shader_injection.xegtao_ssgi_bound = 0.f;  // Reset for next frame's SSAO pass
+  shader_injection.gtvbao_vbgi_bound = 0.f;  // Reset for next frame's SSAO pass
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
-  shader_injection.xegtao_dedicated_bound = 0.f;
+  shader_injection.gtvbao_dedicated_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
   // Push IS-FAST noise texture for PCSS shadow jitter (t24 only — NO sampler push,
   // uses game's samPoint_s at s0 with manual wrap in shader to avoid heap corruption)
@@ -2710,8 +2788,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
   }
 
-  // ── Kai sync: character SSGI master toggle + PCSS jitter ──
-  shader_injection.char_gi_enabled = (g_char_ssgi_composite_method >= 0.5f) ? 1.f : 0.f;
+  // ── Kai sync: Character VBGI master toggle + PCSS jitter ──
+  shader_injection.char_gi_enabled = (g_char_vbgi_composite_method >= 0.5f) ? 1.f : 0.f;
   shader_injection.shadow_isfast_jitter_amount = shader_injection.shadow_pcss_jitter_amount;
   shader_injection.shadow_isfast_jitter_speed = shader_injection.shadow_pcss_jitter_speed;
   // Zero out jitter when IS-FAST master is off
@@ -2720,10 +2798,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     shader_injection.shadow_isfast_jitter_speed = 0.f;
   }
   // Sync Kai debug views from shared settings
-  shader_injection.xegtao_debug_mode = shader_injection.xegtao_debug_view;
+  shader_injection.gtvbao_debug_mode = shader_injection.gtvbao_debug_view;
   shader_injection.foliage_debug_mode = shader_injection.debug_show_env_sss;
 
-  if (shader_injection.xegtao_mode < 0.5f) return true;
+  if (shader_injection.gtvbao_mode < 0.5f) return true;
   if (!cmd_list) return true;
 
   auto* dev = cmd_list->get_device();
@@ -2741,7 +2819,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     dd->deferred_pending = true;
   }
 
-  // ── Inline dispatch: Run XeGTAO on this frame's command list (only when NOT deferred). ──
+  // ── Inline dispatch: Run GTVBAO on this frame's command list (only when NOT deferred). ──
   if (g_cpuopt_deferred_dispatch < 0.5f) {
     if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid
         && dd->ao_term_a_srv.handle) {
@@ -2749,18 +2827,18 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       renodx::utils::state::CommandListState prev = {};
       if (cs) prev = *cs;
 
-      bool ok = RunXeGTAO(cmd_list, dd);
+      bool ok = RunGTVBAO(cmd_list, dd);
 
-      ApplyXeGTAOCSDispatchFix(cmd_list, cs, prev);
+      ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
       (void)ok;
     }
   }
 
-  // Push the XeGTAO AO result at t22.
+  // Push the GTVBAO AO result at t22.
   // In inline mode: fresh from dispatch above.
   // In deferred mode: result from previous frame's OnPresent dispatch.
-  // Effective dpc = max(1, setting) — matches forced denoise in RunXeGTAO.
-  int edpc = (int)shader_injection.xegtao_denoise_passes;
+  // Effective dpc = max(1, setting) — matches forced denoise in RunGTVBAO.
+  int edpc = (int)shader_injection.gtvbao_denoise_passes;
   if (edpc < 1) edpc = 1;
   reshade::api::resource_view srv = (edpc & 1)
       ? dd->ao_term_b_srv : dd->ao_term_a_srv;
@@ -2770,26 +2848,26 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         reshade::api::pipeline_layout{0},
         0,
         reshade::api::descriptor_table_update{
-            {}, kLightingXeGtaoRegister, 0, 1,
+            {}, kLightingGtvbaoRegister, 0, 1,
             reshade::api::descriptor_type::texture_shader_resource_view, &srv,
         });
-    shader_injection.xegtao_dedicated_bound = 1.f;
+    shader_injection.gtvbao_dedicated_bound = 1.f;
   }
 
-  // ── SSGI push t23 (GI is produced by RunXeGTAO) ──
-  shader_injection.xegtao_ssgi_bound = 0.f;
-  shader_injection.xegtao_ssgi_debug = 0.f;
+  // ── SSGI push t23 (GI is produced by RunGTVBAO) ──
+  shader_injection.gtvbao_vbgi_bound = 0.f;
+  shader_injection.gtvbao_vbgi_debug = 0.f;
 
   // Determine what to push to t23.
   reshade::api::resource_view push_srv = {};
   bool do_push = false;
   bool debug_replace = false;
 
-  // SSGI debug views (1=Raw GI, 2=Denoised GI, 3=Light Buffer, 4=Accumulated, 5=Samples).
-  if (shader_injection.ssgi_debug_view > 0.5f) {
-    int dv = (int)shader_injection.ssgi_debug_view;
-    if (dv == 1)      push_srv = dd->ssgi_output_srv;
-    else if (dv == 2) push_srv = dd->ssgi_denoised_srv;
+  // VBGI debug views (1=Raw GI, 2=Denoised GI, 3=Light Buffer, 4=Accumulated, 5=Samples).
+  if (shader_injection.vbgi_debug_view > 0.5f) {
+    int dv = (int)shader_injection.vbgi_debug_view;
+    if (dv == 1)      push_srv = dd->vbgi_output_srv;
+    else if (dv == 2) push_srv = dd->vbgi_denoised_srv;
     else if (dv == 3) push_srv = dd->captured_color_srv.handle
         ? dd->captured_color_srv : dd->captured_light_buffer_srv;
     else if (dv == 4) push_srv = dd->multibounce_srv.handle
@@ -2800,21 +2878,21 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     debug_replace = true;
   }
   // Bitmask debug views 6-8: push dedicated debug UAV output.
-  else if (shader_injection.xegtao_debug_view > 5.5f && shader_injection.xegtao_debug_view < 8.5f) {
+  else if (shader_injection.gtvbao_debug_view > 5.5f && shader_injection.gtvbao_debug_view < 8.5f) {
     push_srv = dd->debug_srv;
     do_push = true;
     debug_replace = true;
   }
   // Normal SSGI: push denoised GI.
-  else if (shader_injection.ssgi_enabled > 0.5f) {
-    push_srv = dd->ssgi_denoised_srv;
+  else if (shader_injection.vbgi_enabled > 0.5f) {
+    push_srv = dd->vbgi_denoised_srv;
     do_push = true;
   }
 
   if (do_push) {
     if (!push_srv.handle) push_srv = dd->fallback_srv;
     if (push_srv.handle) {
-      uint32_t giRegister = IsKai() ? 23u : kLightingSsgiRegister;  // Kai uses t23 for XeGTAO GI
+      uint32_t giRegister = IsKai() ? 23u : kLightingVbgiRegister;  // Kai uses t23 for GTVBAO VBGI
       cmd_list->push_descriptors(
           reshade::api::shader_stage::pixel,
           reshade::api::pipeline_layout{0},
@@ -2824,15 +2902,15 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               reshade::api::descriptor_type::texture_shader_resource_view,
               &push_srv,
           });
-      shader_injection.xegtao_ssgi_bound = 1.f;
-      if (debug_replace) shader_injection.xegtao_ssgi_debug = 1.f;
+      shader_injection.gtvbao_vbgi_bound = 1.f;
+      if (debug_replace) shader_injection.gtvbao_vbgi_debug = 1.f;
     }
-    // SSGI debug logging.
-    if (shader_injection.ssgi_debug_logging > 0.5f) {
+    // VBGI debug logging.
+    if (shader_injection.vbgi_debug_logging > 0.5f) {
       std::string msg = "[SSGI] t23 push: srv=";
       msg += push_srv.handle ? "valid" : "FALLBACK";
       msg += " debug=" + std::to_string(debug_replace ? 1 : 0);
-      msg += " ssgi_enabled=" + std::to_string((int)shader_injection.ssgi_enabled);
+      msg += " vbgi_enabled=" + std::to_string((int)shader_injection.vbgi_enabled);
       reshade::log::message(reshade::log::level::info, msg.c_str());
     }
   }
@@ -2842,15 +2920,15 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list*) {
   // Used as on_replace callback via CustomShaderEntryCallback.
-  // Return true = use our replacement SSAO shader (with XeGTAO gate).
+  // Return true = use our replacement SSAO shader (with GTVBAO gate).
   return true;
 }
 
 // ── Resource create / destroy ──
 
-static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
+static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
                                    uint32_t gw, uint32_t gh) {
-  DestroyXeGTAOResources(dev, d);
+  DestroyGTVBAOResources(dev, d);
   // Always at full resolution.
   uint32_t w = gw;
   uint32_t h = gh;
@@ -2867,15 +2945,15 @@ static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
   {
     reshade::api::resource_desc rd = {};
     rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {w, h, 1, (uint16_t)kXeGTAODepthMipLevels, reshade::api::format::r32_float, 1};
+    rd.texture = {w, h, 1, (uint16_t)kGTVBAODepthMipLevels, reshade::api::format::r32_float, 1};
     rd.heap = reshade::api::memory_heap::gpu_only;
     rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
     dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->depth_mips_texture);
     dev->create_resource_view(d->depth_mips_texture, reshade::api::resource_usage::shader_resource,
                                reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                 reshade::api::format::r32_float, 0, kXeGTAODepthMipLevels, 0, 1),
+                                                                 reshade::api::format::r32_float, 0, kGTVBAODepthMipLevels, 0, 1),
                                &d->depth_mips_srv);
-    for (uint32_t m = 0; m < kXeGTAODepthMipLevels; ++m)
+    for (uint32_t m = 0; m < kGTVBAODepthMipLevels; ++m)
       dev->create_resource_view(d->depth_mips_texture, reshade::api::resource_usage::unordered_access,
                                  reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
                                                                    reshade::api::format::r32_float, m, 1, 0, 1),
@@ -2905,9 +2983,9 @@ static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
 
   // ── GI resources (same resolution as AO per user preference) ──
   mk(w, h, reshade::api::format::r16g16b16a16_float,
-     &d->ssgi_output_texture, &d->ssgi_output_srv, &d->ssgi_output_uav);
+     &d->vbgi_output_texture, &d->vbgi_output_srv, &d->vbgi_output_uav);
   mk(w, h, reshade::api::format::r16g16b16a16_float,
-     &d->ssgi_denoised_texture, &d->ssgi_denoised_srv, &d->ssgi_denoised_uav);
+     &d->vbgi_denoised_texture, &d->vbgi_denoised_srv, &d->vbgi_denoised_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
      &d->debug_texture, &d->debug_srv, &d->debug_uav);
   // Light buffer capture at full back-buffer resolution
@@ -2916,10 +2994,10 @@ static void CreateXeGTAOResources(reshade::api::device* dev, DeviceData* d,
   // Multi-bounce accumulation buffer (HDR, same resolution as working set)
   mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->multibounce_texture, &d->multibounce_srv, &d->multibounce_uav);
-  d->ssgi_denoised_valid = false;
+  d->vbgi_denoised_valid = false;
 }
 
-static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
+static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
@@ -2939,17 +3017,17 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
   dp(d->denoise_last_pipeline);
   dp(d->denoise_last_kai_pipeline);
   dl(d->prefilter_layout); dl(d->main_layout); dl(d->denoise_layout);
-  DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
-  DestroyXeGTAODescriptorTables(dev, &d->main_tables);
-  DestroyXeGTAODescriptorTables(dev, &d->denoise_tables);
-  // GI resources (now integrated — no separate SSGI pipeline)
-  dv(d->ssgi_output_srv); dv(d->ssgi_output_uav); dr(d->ssgi_output_texture);
-  dv(d->ssgi_denoised_srv); dv(d->ssgi_denoised_uav); dr(d->ssgi_denoised_texture);
+  DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->main_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->denoise_tables);
+  // GI resources (now integrated — no separate VBGI pipeline)
+  dv(d->vbgi_output_srv); dv(d->vbgi_output_uav); dr(d->vbgi_output_texture);
+  dv(d->vbgi_denoised_srv); dv(d->vbgi_denoised_uav); dr(d->vbgi_denoised_texture);
   dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
   dv(d->multibounce_srv); dv(d->multibounce_uav); dr(d->multibounce_texture);
   dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
   dp(d->multibounce_pipeline); dl(d->multibounce_layout);
-  DestroyXeGTAODescriptorTables(dev, &d->multibounce_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->multibounce_tables);
   // IS-FAST noise
   dv(d->isfast_noise_srv); dr(d->isfast_noise_texture);
   if (d->isfast_sampler.handle) { dev->destroy_sampler(d->isfast_sampler); d->isfast_sampler = {}; }
@@ -2962,77 +3040,87 @@ static void DestroyXeGTAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 50> BuildXeGTAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 58> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f) {
-  std::array<float, 50> c = {};
-  const uint32_t denoise_passes = (uint32_t)shader_injection.xegtao_denoise_passes;
-  c[0]  = shader_injection.xegtao_quality_level;
+  std::array<float, 58> c = {};
+  const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
+  c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
-  c[2]  = std::max(0.001f, shader_injection.xegtao_radius);
-  c[3]  = std::clamp(shader_injection.xegtao_falloff_range, 0.f, 1.f);
-  c[4]  = std::clamp(shader_injection.xegtao_radius_multiplier, 0.3f, 3.f);
-  c[5]  = std::clamp(shader_injection.xegtao_final_power, 0.5f, 5.f);
-  c[6]  = std::clamp(shader_injection.xegtao_sample_distribution, 1.f, 3.f);
-  c[7]  = std::clamp(shader_injection.xegtao_bitmask_thickness, 0.01f, 2.f);
-  c[8]  = std::clamp(shader_injection.xegtao_depth_mip_offset, 0.f, 30.f);
-  c[9]  = denoise_passes == 0u ? 10000.f : std::max(0.01f, shader_injection.xegtao_denoise_blur_beta);
-  c[10] = (denoise_passes == 0u && g_xegtao_jitter_toggle < 0.5f)
+  c[2]  = std::max(0.001f, shader_injection.gtvbao_radius);
+  c[3]  = std::clamp(shader_injection.gtvbao_falloff_range, 0.f, 1.f);
+  c[4]  = std::clamp(shader_injection.gtvbao_radius_multiplier, 0.3f, 3.f);
+  c[5]  = std::clamp(shader_injection.gtvbao_final_power, 0.5f, 5.f);
+  c[6]  = std::clamp(shader_injection.gtvbao_sample_distribution, 1.f, 3.f);
+  c[7]  = std::clamp(shader_injection.gtvbao_bitmask_thickness, 0.01f, 2.f);
+  c[8]  = std::clamp(shader_injection.gtvbao_depth_mip_offset, 0.f, 30.f);
+  c[9]  = denoise_passes == 0u ? 10000.f : std::max(0.01f, shader_injection.gtvbao_denoise_blur_beta);
+  c[10] = (denoise_passes == 0u && g_gtvbao_jitter_toggle < 0.5f)
       ? 0.f : (float)((data ? data->frame_index : 0u) % 64u);
-  c[11] = shader_injection.xegtao_debug_view;
+  c[11] = shader_injection.gtvbao_debug_view;
   c[12] = denoise_last_pass ? 1.f : 0.f;
   // Normal input: use game MRT normals when available, depth fallback otherwise.
-  c[13] = g_xegtao_normal_input_mode;
+  c[13] = g_gtvbao_normal_input_mode;
   c[14] = (data && data->captured_mrt_normal_srv.handle != 0u) ? 1.f : 0.f;
-  c[15] = g_xegtao_normal_influence;
-  c[16] = g_xegtao_normal_depth_blend;
-  c[17] = g_xegtao_normal_sharpness;
-  c[18] = g_xegtao_normal_edge_rejection;
-  c[19] = g_xegtao_normal_z_preservation;
-  c[20] = g_xegtao_normal_detail_response;
-  c[21] = g_xegtao_normal_max_darkening;
-  c[22] = g_xegtao_normal_darkening_mode;
-  c[23] = g_xegtao_normal_transform_mode;
-  c[24] = shader_injection.xegtao_fix_experimental;  // bitmask experimental fix selector (0-5)
+  c[15] = g_gtvbao_normal_influence;
+  c[16] = g_gtvbao_normal_depth_blend;
+  c[17] = g_gtvbao_normal_sharpness;
+  c[18] = g_gtvbao_normal_edge_rejection;
+  c[19] = g_gtvbao_normal_z_preservation;
+  c[20] = g_gtvbao_normal_detail_response;
+  c[21] = g_gtvbao_normal_max_darkening;
+  c[22] = g_gtvbao_normal_darkening_mode;
+  c[23] = g_gtvbao_normal_transform_mode;
+  c[24] = shader_injection.gtvbao_fix_experimental;  // bitmask experimental fix selector (0-5)
   // ── GI parameters (IS-FAST repurpose) ──
   // isfast_passes (c[25]) = g_gi_enabled
-  c[25] = (ssgi_enabled_override >= 0.f) ? ssgi_enabled_override : shader_injection.ssgi_enabled; // GI enable
+  c[25] = (ssgi_enabled_override >= 0.f) ? ssgi_enabled_override : shader_injection.vbgi_enabled; // GI enable
   // isfast_samples (c[26]) = g_gi_light_exposure
-  c[26] = std::clamp(g_ssgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
+  c[26] = std::clamp(g_vbgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
   // isfast_radius (c[27]) = g_gi_power
   c[27] = 1.5f;  // GI power (fixed, removed from UI)
   // isfast_edge_sensitivity (c[28]) = g_gi_intensity
-  c[28] = std::clamp(shader_injection.ssgi_intensity, 0.f, 5.f);  // GI intensity
+  c[28] = std::clamp(shader_injection.vbgi_intensity, 0.f, 5.f);  // GI intensity
   // isfast_spatial_sigma (c[29]) = g_gi_saturation
-  c[29] = std::clamp(shader_injection.ssgi_saturation, 0.f, 2.f); // GI saturation
+  c[29] = std::clamp(shader_injection.vbgi_saturation, 0.f, 2.f); // GI saturation
   // isfast_hybrid_blend (c[30]) = g_gi_multibounce
-  c[30] = shader_injection.ssgi_multibounce;                       // multi-bounce (0/1)
-  c[31] = std::clamp(shader_injection.ssgi_multibounce_strength, 0.f, 10.f);  // feedback strength
-  c[32] = std::clamp(shader_injection.ssgi_multibounce_saturation, 0.f, 2.f); // feedback saturation
-  c[33] = std::clamp(shader_injection.ssgi_multibounce_max_clamp, 0.f, 20.f);  // multi-bounce max clamp
-  c[34] = shader_injection.ssgi_debug_view;                         // SSGI debug view
+  c[30] = shader_injection.vbgi_multibounce;                       // multi-bounce (0/1)
+  c[31] = std::clamp(shader_injection.vbgi_multibounce_strength, 0.f, 10.f);  // feedback strength
+  c[32] = std::clamp(shader_injection.vbgi_multibounce_saturation, 0.f, 2.f); // feedback saturation
+  c[33] = std::clamp(shader_injection.vbgi_multibounce_max_clamp, 0.f, 20.f);  // multi-bounce max clamp
+  c[34] = shader_injection.vbgi_debug_view;                         // VBGI debug view
   c[35] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
   c[36] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
   c[37] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
-  c[38] = shader_injection.ssgi_adaptive_mode;                       // 0=GI color, 1=albedo
-  c[39] = std::clamp(shader_injection.ssgi_adaptive_luma_strength, 0.f, 5.f); // 0=off
-  c[40] = std::clamp(shader_injection.ssgi_adaptive_luma_blend, 0.f, 1.f);
+  c[38] = shader_injection.vbgi_adaptive_mode;                       // 0=GI color, 1=albedo
+  c[39] = std::clamp(shader_injection.vbgi_adaptive_luma_strength, 0.f, 5.f); // 0=off
+  c[40] = std::clamp(shader_injection.vbgi_adaptive_luma_blend, 0.f, 1.f);
   c[41] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
   c[42] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
   c[43] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
   // ── Denoiser leak parameters ──
-  c[44] = std::clamp(shader_injection.xegtao_denoise_leak_threshold, 1.f, 4.f);
-  c[45] = std::clamp(shader_injection.xegtao_denoise_leak_strength, 0.f, 1.f);
+  c[44] = std::clamp(shader_injection.gtvbao_denoise_leak_threshold, 1.f, 4.f);
+  c[45] = std::clamp(shader_injection.gtvbao_denoise_leak_strength, 0.f, 1.f);
   // ── Spatio-Temporal denoiser ──
-  c[46] = shader_injection.xegtao_denoiser_type;                     // 0=Spatial, 1=Spatio-Temporal
+  c[46] = shader_injection.gtvbao_denoiser_type;                     // 0=Spatial, 1=Spatio-Temporal
   // Temporal blend: base weight from frame count, scaled by blend strength
   {
-    float fc = shader_injection.xegtao_temporal_frame_count;
+    float fc = shader_injection.gtvbao_temporal_frame_count;
     float baseWeight = (fc > 1.f) ? ((fc - 1.f) / fc) : 0.f;
-    float blendScale = std::clamp(shader_injection.xegtao_temporal_blend, 0.f, 1.f);
+    float blendScale = std::clamp(shader_injection.gtvbao_temporal_blend, 0.f, 1.f);
     c[47] = std::clamp(baseWeight * blendScale, 0.0f, 0.98f);
   }
-  c[48] = std::clamp(shader_injection.xegtao_disocclusion_threshold, 0.001f, 0.1f);
-  c[49] = shader_injection.xegtao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
+  c[48] = std::clamp(shader_injection.gtvbao_disocclusion_threshold, 0.001f, 0.1f);
+  c[49] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
+  // ── GTVBAO upgrade toggles ──
+  c[50] = shader_injection.gtvbao_cdf_enabled;
+  c[51] = shader_injection.gtvbao_cosine_enabled;
+  c[52] = shader_injection.gtvbao_cosine_mode;
+  c[53] = shader_injection.gtvbao_thickness_enabled;
+  // ── Poisson denoiser ──
+  c[54] = std::clamp(shader_injection.gtvbao_poisson_samples, 4.f, 32.f);
+  c[55] = std::clamp(shader_injection.gtvbao_poisson_luma_phi, 0.5f, 20.f);
+  c[56] = std::clamp(shader_injection.gtvbao_poisson_depth_phi, 0.5f, 20.f);
+  c[57] = std::clamp(shader_injection.gtvbao_poisson_normal_phi, 0.5f, 20.f);
   return c;
 }
 
@@ -3055,9 +3143,9 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->denoise_last_pipeline);
   dp(d->denoise_last_kai_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
-    DestroyXeGTAODescriptorTables(dev, &d->prefilter_tables);
-    DestroyXeGTAODescriptorTables(dev, &d->main_tables);
-    DestroyXeGTAODescriptorTables(dev, &d->denoise_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->main_tables);
+    DestroyGTVBAODescriptorTables(dev, &d->denoise_tables);
   }
 
   auto mkcs = [&](std::span<const uint8_t> bc, const char* ep,
@@ -3074,7 +3162,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using DT = reshade::api::descriptor_type;
   using P = reshade::api::pipeline_layout_param;
 
-  // Match kai's EnsureXeGTAOLayout: separate descriptor tables, each with binding=0,
+  // Match kai's EnsureGTVBAOLayout: separate descriptor tables, each with binding=0,
   // plus push_constants at b13.
   auto make_layout = [&](uint32_t srv_count, uint32_t uav_count,
                          reshade::api::pipeline_layout* out) -> bool {
@@ -3087,7 +3175,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 50;
+    push_constants_range.count = 54;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -3104,27 +3192,27 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     return dev->create_pipeline_layout(5, params, out);
   };
 
-  if (!make_layout(1u, kXeGTAODepthMipLevels, &d->prefilter_layout)) return false;
+  if (!make_layout(1u, kGTVBAODepthMipLevels, &d->prefilter_layout)) return false;
   // Main: 4 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise) + 4 UAVs (AO, edges, GI, debug)
   if (!make_layout(4u, 4u, &d->main_layout)) return false;
-  // Denoise: 5 SRVs (AO, edges, raw GI, history AO, depth mip) + 3 UAVs (denoised AO, denoised GI, history AO)
-  if (!make_layout(5u, 3u, &d->denoise_layout)) return false;
+  // Denoise: 6 SRVs (AO, edges, raw GI, history AO, depth mip, MRT normal) + 3 UAVs (denoised AO, denoised GI, history AO)
+  if (!make_layout(6u, 3u, &d->denoise_layout)) return false;
   // Multi-bounce accumulate: 2 SRVs (color, previous GI) + 1 UAV (accumulated)
   if (!make_layout(2u, 1u, &d->multibounce_layout)) return false;
 
-  if (!d->prefilter_pipeline.handle) mkcs(__xegtao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
-  if (!d->main_low_pipeline.handle)      mkcs(__xegtao_main_low, "main", d->main_layout, &d->main_low_pipeline);
-  if (!d->main_medium_pipeline.handle)   mkcs(__xegtao_main_medium, "main", d->main_layout, &d->main_medium_pipeline);
-  if (!d->main_high_pipeline.handle)     mkcs(__xegtao_main_high, "main", d->main_layout, &d->main_high_pipeline);
-  if (!d->main_ultra_pipeline.handle)    mkcs(__xegtao_main_ultra, "main", d->main_layout, &d->main_ultra_pipeline);
-  if (!d->denoise_pipeline.handle)       mkcs(__xegtao_denoise_pass, "main", d->denoise_layout, &d->denoise_pipeline);
-  if (!d->denoise_last_pipeline.handle)  mkcs(__xegtao_denoise_last, "main", d->denoise_layout, &d->denoise_last_pipeline);
+  if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
+  if (!d->main_low_pipeline.handle)      mkcs(__gtvbao_main_low, "main", d->main_layout, &d->main_low_pipeline);
+  if (!d->main_medium_pipeline.handle)   mkcs(__gtvbao_main_medium, "main", d->main_layout, &d->main_medium_pipeline);
+  if (!d->main_high_pipeline.handle)     mkcs(__gtvbao_main_high, "main", d->main_layout, &d->main_high_pipeline);
+  if (!d->main_ultra_pipeline.handle)    mkcs(__gtvbao_main_ultra, "main", d->main_layout, &d->main_ultra_pipeline);
+  if (!d->denoise_pipeline.handle)       mkcs(__gtvbao_denoise_pass, "main", d->denoise_layout, &d->denoise_pipeline);
+  if (!d->denoise_last_pipeline.handle)  mkcs(__gtvbao_denoise_last, "main", d->denoise_layout, &d->denoise_last_pipeline);
   // Kai variant: same layout, different CSO with correct prevViewProj_g at c85
-  if (!d->denoise_last_kai_pipeline.handle) mkcs(__xegtao_denoise_last_kai, "main", d->denoise_layout, &d->denoise_last_kai_pipeline);
-  if (!d->multibounce_pipeline.handle)   mkcs(__xegtao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
+  if (!d->denoise_last_kai_pipeline.handle) mkcs(__gtvbao_denoise_last_kai, "main", d->denoise_layout, &d->denoise_last_kai_pipeline);
+  if (!d->multibounce_pipeline.handle)   mkcs(__gtvbao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
 
   // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
-  // No separate SSGI pipeline needed — main_layout handles both AO and GI outputs.
+  // no separate VBGI pipeline needed — main_layout handles both AO and GI outputs.
   return d->prefilter_pipeline.handle && d->main_high_pipeline.handle
       && d->denoise_pipeline.handle && d->denoise_last_pipeline.handle
       && d->multibounce_pipeline.handle;
@@ -3253,7 +3341,7 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
 
 // ── Dispatch ──
 
-static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
+static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return false;
 
   // ── Frame skips (independent per component) ──
@@ -3262,35 +3350,35 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     uint64_t n = (uint64_t)setting + 1u;
     return (d->frame_index % n) != 0u;
   };
-  bool skip_xegtao      = skip_this_frame(g_xegtao_frame_skip);       // skips entire dispatch
-  bool skip_ssgi         = skip_this_frame(g_ssgi_frame_skip);         // AO runs, GI off
+  bool skip_GTVBAO      = skip_this_frame(g_gtvbao_frame_skip);       // skips entire dispatch
+  bool skip_ssgi         = skip_this_frame(g_vbgi_frame_skip);         // AO runs, GI off
   bool skip_multibounce  = skip_this_frame(g_multibounce_frame_skip);  // accumulate skipped
 
-  if (skip_xegtao) return true;  // skip everything, no work done
+  if (skip_GTVBAO) return true;  // skip everything, no work done
 
-  float ssgi_enabled_this_frame = shader_injection.ssgi_enabled;
+  float ssgi_enabled_this_frame = shader_injection.vbgi_enabled;
   if (skip_ssgi) ssgi_enabled_this_frame = 0.f;
   auto* dev = cl->get_device();
 
   // ── IS-FAST noise texture (load once) ──
   if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
 
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] RunXeGTAO: creating pipelines...");
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] RunGTVBAO: creating pipelines...");
   if (!CreateComputePipelinesIfNeeded(dev, d)) return false;
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] RunXeGTAO: allocating descriptor tables...");
-  if (!EnsureXeGTAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
-  if (!EnsureXeGTAODescriptorTables(dev, d->main_layout, &d->main_tables)) return false;
-  if (!EnsureXeGTAODescriptorTables(dev, d->denoise_layout, &d->denoise_tables)) return false;
-  if (!EnsureXeGTAODescriptorTables(dev, d->multibounce_layout, &d->multibounce_tables)) return false;
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] RunGTVBAO: allocating descriptor tables...");
+  if (!EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->main_layout, &d->main_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->denoise_layout, &d->denoise_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->multibounce_layout, &d->multibounce_tables)) return false;
 
   uint32_t w = d->working_width, h = d->working_height;
   if (w < 64 || h < 64) return false;
 
-  if (shader_injection.xegtao_debug_logging > 0.5f)
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      (std::string("[XeGTAO] RunXeGTAO: dispatching pass 1 (") +
+      (std::string("[GTVBAO] RunGTVBAO: dispatching pass 1 (") +
        std::to_string(w) + "x" + std::to_string(h) + ")").c_str());
 
   auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
@@ -3303,13 +3391,13 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
 
   // Helper: build & apply descriptor updates.
   auto apply_descriptors = [&](reshade::api::pipeline_layout lo,
-                                XeGTAODescriptorTableSet* tbl,
+                                GTVBAODescriptorTableSet* tbl,
                                 uint32_t count,
                                 const reshade::api::descriptor_table_update* updates) {
-    std::array<reshade::api::descriptor_table_update, kXeGtaoDescriptorTableParamCount> u = {};
+    std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
     for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
     dev->update_descriptor_tables(count, u.data());
-    std::array<reshade::api::descriptor_table, kXeGtaoDescriptorTableParamCount> b = {};
+    std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> b = {};
     for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
     cl->bind_descriptor_tables(CS, lo, 0, count, b.data());
   };
@@ -3319,38 +3407,38 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   };
 
   // Pass 1: Prefilter
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1: binding pipeline...");
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: binding pipeline...");
   bind_pipe(d->prefilter_pipeline);
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1: updating descriptors...");
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: updating descriptors...");
   {
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
       {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_depth_srv},
-      {{},0,0,kXeGTAODepthMipLevels,reshade::api::descriptor_type::texture_unordered_access_view,d->depth_mips_uavs.data()},
+      {{},0,0,kGTVBAODepthMipLevels,reshade::api::descriptor_type::texture_unordered_access_view,d->depth_mips_uavs.data()},
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
-    auto pc = BuildXeGTAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kXeGtaoPushConstantsLayoutParam, 0, 49, pc.data());
+    auto pc = BuildGTVBAOPushConstants(d, false);
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 57, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 1 (prefilter) done.");
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1 (prefilter) done.");
 
   // ── Multi-bounce accumulate (HDR light buffer + previous GI) ──
   // Runs BEFORE main pass to create an HDR accumulated light buffer.
   {
-    bool mb_enabled  = shader_injection.ssgi_multibounce > 0.5f;
-    bool mb_gi_ready = d->ssgi_denoised_valid;
+    bool mb_enabled  = shader_injection.vbgi_multibounce > 0.5f;
+    bool mb_gi_ready = d->vbgi_denoised_valid;
     bool mb_pipe_ok  = d->multibounce_pipeline.handle != 0u;
     bool mb_color_ok = d->captured_color_srv.handle != 0u;
-    bool mb_prev_ok  = d->ssgi_denoised_srv.handle != 0u;
+    bool mb_prev_ok  = d->vbgi_denoised_srv.handle != 0u;
     bool mb_uav_ok   = d->multibounce_uav.handle != 0u;
 
-    if (shader_injection.ssgi_debug_logging > 0.5f) {
+    if (shader_injection.vbgi_debug_logging > 0.5f) {
       std::string msg = "[SSGI] MultiBounce: enabled=";
       msg += mb_enabled ? "1" : "0";
       msg += " denoisedValid="; msg += mb_gi_ready ? "1" : "0";
@@ -3366,7 +3454,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       reshade::api::resource_view acc_color = mb_color_ok
           ? d->captured_color_srv : d->fallback_srv;
       reshade::api::resource_view acc_prev_gi = mb_prev_ok
-          ? d->ssgi_denoised_srv : d->fallback_srv;
+          ? d->vbgi_denoised_srv : d->fallback_srv;
       reshade::api::resource_view acc_srvs[2] = {acc_color, acc_prev_gi};
       reshade::api::resource_view acc_uav_arr = mb_uav_ok
           ? d->multibounce_uav : d->fallback_uav;
@@ -3377,18 +3465,18 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
       };
       apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
-      cl->push_constants(CS, d->multibounce_layout, kXeGtaoPushConstantsLayoutParam, 0, 49,
-                         BuildXeGTAOPushConstants(d, false).data());
+      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 57,
+                         BuildGTVBAOPushConstants(d, false).data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->multibounce_texture, UA, SR);
-      if (shader_injection.ssgi_debug_logging > 0.5f)
+      if (shader_injection.vbgi_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::info, "[SSGI] MultiBounce: accumulate dispatched.");
     } else if (mb_enabled && !mb_gi_ready) {
-      if (shader_injection.ssgi_debug_logging > 0.5f)
+      if (shader_injection.vbgi_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::info,
-            "[SSGI] MultiBounce: SKIPPED (denoised GI not valid yet — first frame or XeGTAO never ran).");
+            "[SSGI] MultiBounce: SKIPPED (denoised GI not valid yet — first frame or GTVBAO never ran).");
     } else if (mb_enabled && !mb_pipe_ok) {
-      if (shader_injection.ssgi_debug_logging > 0.5f)
+      if (shader_injection.vbgi_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::warning,
             "[SSGI] MultiBounce: SKIPPED (accumulate pipeline missing).");
     }
@@ -3396,7 +3484,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
 
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_high_pipeline;
-  { int q = (int)shader_injection.xegtao_quality_level;
+  { int q = (int)shader_injection.gtvbao_quality_level;
     if (q == 0 && d->main_low_pipeline.handle) mp = d->main_low_pipeline;
     else if (q == 1 && d->main_medium_pipeline.handle) mp = d->main_medium_pipeline;
     else if (q == 3 && d->main_ultra_pipeline.handle) mp = d->main_ultra_pipeline;
@@ -3409,7 +3497,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     // Light buffer: HDR accumulated (multi-bounce ON) or direct-only (OFF).
     reshade::api::resource_view light_buf;
     const char* lb_source = "unknown";
-    if (shader_injection.ssgi_multibounce > 0.5f && d->ssgi_denoised_valid
+    if (shader_injection.vbgi_multibounce > 0.5f && d->vbgi_denoised_valid
         && d->multibounce_srv.handle) {
       // Multi-bounce ON: use HDR accumulated buffer (color + previous GI).
       light_buf = d->multibounce_srv;
@@ -3427,11 +3515,11 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
         lb_source = "FALLBACK";
       }
     }
-    if (shader_injection.ssgi_debug_logging > 0.5f) {
+    if (shader_injection.vbgi_debug_logging > 0.5f) {
       std::string msg = "[SSGI] Main lightBuf=";
       msg += lb_source;
-      msg += " mbEnable="; msg += (shader_injection.ssgi_multibounce > 0.5f) ? "1" : "0";
-      msg += " mbReady=";  msg += d->ssgi_denoised_valid ? "1" : "0";
+      msg += " mbEnable="; msg += (shader_injection.vbgi_multibounce > 0.5f) ? "1" : "0";
+      msg += " mbReady=";  msg += d->vbgi_denoised_valid ? "1" : "0";
       msg += " mbSRV=";    msg += d->multibounce_srv.handle ? "OK" : "no";
       msg += " colorSRV="; msg += d->captured_color_srv.handle ? "OK" : "no";
       reshade::log::message(reshade::log::level::info, msg.c_str());
@@ -3446,7 +3534,7 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
     reshade::api::resource_view main_uavs[4] = {
         d->ao_term_a_uav,
         d->edges_uav,
-        d->ssgi_output_uav.handle ? d->ssgi_output_uav : d->fallback_uav,
+        d->vbgi_output_uav.handle ? d->vbgi_output_uav : d->fallback_uav,
         d->debug_uav.handle ? d->debug_uav : d->fallback_uav
     };
     reshade::api::descriptor_table_update u[4] = {
@@ -3456,23 +3544,23 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
-    auto pc = BuildXeGTAOPushConstants(d, false, ssgi_enabled_this_frame);
-    cl->push_constants(CS, d->main_layout, kXeGtaoPushConstantsLayoutParam, 0, 49, pc.data());
+    auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame);
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 57, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
   bar(d->edges_texture, UA, SR);
-  bar(d->ssgi_output_texture, UA, SR);  // GI output ready for denoise
+  bar(d->vbgi_output_texture, UA, SR);  // GI output ready for denoise
   bar(d->debug_texture, UA, SR);         // Debug output ready for read
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] Pass 2 (main) done.");
-  if (shader_injection.ssgi_debug_logging > 0.5f) {
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 2 (main) done.");
+  if (shader_injection.vbgi_debug_logging > 0.5f) {
     std::string msg = "[SSGI] Main pass: enableGI=";
-    msg += (shader_injection.ssgi_enabled > 0.5f) ? "1" : "0";
-    msg += " intensity=" + std::to_string(shader_injection.ssgi_intensity);
-    msg += " multibounce=" + std::to_string((int)shader_injection.ssgi_multibounce);
+    msg += (shader_injection.vbgi_enabled > 0.5f) ? "1" : "0";
+    msg += " intensity=" + std::to_string(shader_injection.vbgi_intensity);
+    msg += " multibounce=" + std::to_string((int)shader_injection.vbgi_multibounce);
     msg += " lightBuf=";
-    if (shader_injection.ssgi_multibounce > 0.5f && d->ssgi_denoised_valid)
+    if (shader_injection.vbgi_multibounce > 0.5f && d->vbgi_denoised_valid)
       msg += "accumulated";
     else
       msg += (d->captured_color_srv.handle) ? "colorSRV" : (d->captured_light_buffer_srv.handle ? "backbuf" : "MISSING");
@@ -3480,9 +3568,9 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
   }
 
   // Pass 3: Denoise (ping-pong) — always run at least one pass to apply
-  // the XE_GTAO_OCCLUSION_TERM_SCALE multiply-back (1.5x) in XeGTAO_Output.
+  // the XE_GTAO_OCCLUSION_TERM_SCALE multiply-back (1.5x) in GTVBAO_Output.
   // When dpc==0 the DenoiseBlurBeta=10000 effectively disables blur.
-  int dpc = (int)shader_injection.xegtao_denoise_passes;
+  int dpc = (int)shader_injection.gtvbao_denoise_passes;
   if (dpc < 1) dpc = 1;
   {
     bool use_a = true;
@@ -3501,37 +3589,38 @@ static bool RunXeGTAO(reshade::api::command_list* cl, DeviceData* d) {
       reshade::api::resource_view hist_uav = d->history_ao_read_from_a
           ? (d->history_ao_uav_b.handle ? d->history_ao_uav_b : d->fallback_uav)
           : (d->history_ao_uav_a.handle ? d->history_ao_uav_a : d->fallback_uav);
-      reshade::api::resource_view sv[5] = {src, d->edges_srv,
-          d->ssgi_output_srv.handle ? d->ssgi_output_srv : d->fallback_srv,  // raw GI
+      reshade::api::resource_view sv[6] = {src, d->edges_srv,
+          d->vbgi_output_srv.handle ? d->vbgi_output_srv : d->fallback_srv,  // raw GI
           hist_srv,                                                           // history AO (read)
-          d->depth_mips_srv};                                                 // depth MIP0 for reprojection
+          d->depth_mips_srv,                                                  // depth MIP0 for reprojection
+          d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv}; // MRT normal
       reshade::api::resource_view dn_uavs[3] = {dst_uav,
-          d->ssgi_denoised_uav.handle ? d->ssgi_denoised_uav : d->fallback_uav,  // denoised GI
+          d->vbgi_denoised_uav.handle ? d->vbgi_denoised_uav : d->fallback_uav,  // denoised GI
           hist_uav};                                                              // history AO (write)
       reshade::api::descriptor_table_update u[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
         {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,sv},
+        {{},0,0,6,reshade::api::descriptor_type::texture_shader_resource_view,sv},
         {{},0,0,3,reshade::api::descriptor_type::texture_unordered_access_view,dn_uavs},
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
-      auto pc = BuildXeGTAOPushConstants(d, last);
-      cl->push_constants(CS, d->denoise_layout, kXeGtaoPushConstantsLayoutParam, 0, 49, pc.data());
+      auto pc = BuildGTVBAOPushConstants(d, last);
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 57, pc.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;
       if (last) { d->history_ao_read_from_a = !d->history_ao_read_from_a; }  // only final pass writes history
     }
   }
-  bar(d->ssgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read
-  if (!d->ssgi_denoised_valid) {
-    d->ssgi_denoised_valid = true;            // Multi-bounce feedback active next frame
-    if (shader_injection.ssgi_debug_logging > 0.5f)
+  bar(d->vbgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read
+  if (!d->vbgi_denoised_valid) {
+    d->vbgi_denoised_valid = true;            // Multi-bounce feedback active next frame
+    if (shader_injection.vbgi_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::info,
           "[SSGI] MultiBounce: denoised GI now valid — accumulate will run next frame.");
   }
-  if (shader_injection.xegtao_debug_logging > 0.5f)
-    reshade::log::message(reshade::log::level::info, "[XeGTAO] All passes complete.");
+  if (shader_injection.gtvbao_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[GTVBAO] All passes complete.");
   return true;
 }
 

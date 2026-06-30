@@ -1,6 +1,6 @@
 SamplerState samLinear_s : register(s0);
 Texture2D<float4> sourceTexture : register(t0);
-Texture2D<float4> ssgiTexture : register(t1);
+Texture2D<float4> vbgiTexture : register(t1);
 Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<uint4> mrtTexture1 : register(t3);
 Texture2D<float4> depthTexture : register(t4);
@@ -13,9 +13,9 @@ static const float PI = 3.14159274;
 static const uint CHARACTER_MASK_SHIFT = 8u;
 
 #if ((__SHADER_TARGET_MAJOR == 5 && __SHADER_TARGET_MINOR >= 1) || __SHADER_TARGET_MAJOR >= 6)
-cbuffer character_ssgi_composite_settings : register(b13, space0) {
+cbuffer character_vbgi_composite_settings : register(b13, space0) {
 #else
-cbuffer character_ssgi_composite_settings : register(b13) {
+cbuffer character_vbgi_composite_settings : register(b13) {
 #endif
   // x=strength, y=alpha_scale, z=chroma_strength, w=luma_strength
   float4 characterGiParams0;
@@ -48,17 +48,17 @@ float3 DecodeMrt0Normal(uint4 mrt) {
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   float4 source = sourceTexture.SampleLevel(samLinear_s, uv, 0);
   float3 source_base = source.rgb;
-  float4 ssgi = ssgiTexture.SampleLevel(samLinear_s, uv, 0);
+  float4 vbgi = vbgiTexture.SampleLevel(samLinear_s, uv, 0);
 
-  // Sanitize SSGI: NaN/Inf in the GI buffer will propagate through all math
+  // Sanitize vbgi: NaN/Inf in the GI buffer will propagate through all math
   // (NaN * 0.0 = NaN), corrupting even non-character pixels.
   // Use bitwise NaN check — FXC fast-math can optimize away isnan().
-  uint4 ssgi_bits = asuint(ssgi);
-  bool4 ssgi_nan = ((ssgi_bits & 0x7F800000u) == 0x7F800000u) & ((ssgi_bits & 0x007FFFFFu) != 0u);
-  bool4 ssgi_inf = ((ssgi_bits & 0x7FFFFFFFu) == 0x7F800000u);
-  bool had_nan = any(ssgi_nan);
-  bool had_inf = any(ssgi_inf);
-  if (had_nan || had_inf) ssgi = float4(0, 0, 0, 0);
+  uint4 vbgi_bits = asuint(vbgi);
+  bool4 vbgi_nan = ((vbgi_bits & 0x7F800000u) == 0x7F800000u) & ((vbgi_bits & 0x007FFFFFu) != 0u);
+  bool4 vbgi_inf = ((vbgi_bits & 0x7FFFFFFFu) == 0x7F800000u);
+  bool had_nan = any(vbgi_nan);
+  bool had_inf = any(vbgi_inf);
+  if (had_nan || had_inf) vbgi = float4(0, 0, 0, 0);
 
   // Integer-addressed Load() for debug comparison (bypasses sampler)
   uint src_width, src_height;
@@ -66,10 +66,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   uint2 src_pixel = ComputePixelCoord(uv, src_width, src_height);
   float4 source_loaded = sourceTexture.Load(int3(src_pixel, 0));
 
-  uint ssgi_width, ssgi_height;
-  ssgiTexture.GetDimensions(ssgi_width, ssgi_height);
-  uint2 ssgi_pixel = ComputePixelCoord(uv, ssgi_width, ssgi_height);
-  float4 ssgi_loaded = ssgiTexture.Load(int3(ssgi_pixel, 0));
+  uint vbgi_width, vbgi_height;
+  vbgiTexture.GetDimensions(vbgi_width, vbgi_height);
+  uint2 vbgi_pixel = ComputePixelCoord(uv, vbgi_width, vbgi_height);
+  float4 vbgi_loaded = vbgiTexture.Load(int3(vbgi_pixel, 0));
 
   uint mrt0_width, mrt0_height;
   mrtTexture0.GetDimensions(mrt0_width, mrt0_height);
@@ -138,7 +138,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   float dark_boost = max(characterGiParams1.w, 0.0);
   float dark_factor = lerp(1.0, dark_boost, shadow_raw);
 
-  float3 gi_color = max(ssgi.rgb, 0.0);
+  float3 gi_color = max(vbgi.rgb, 0.0);
   float gi_luma = dot(gi_color, LUMA_WEIGHTS);
   float3 gi_chroma = gi_color - gi_luma.xxx;
   float chroma_strength = max(characterGiParams0.z, 0.0);
@@ -146,7 +146,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
   float3 gi_filtered = gi_chroma * chroma_strength + (gi_luma * luma_strength).xxx;
 
   float alpha_scale = max(characterGiParams0.y, 0.0);
-  float gi_weight = saturate(ssgi.a * alpha_scale) * shadow_mask * dark_factor;
+  float gi_weight = saturate(vbgi.a * alpha_scale) * shadow_mask * dark_factor;
   gi_weight *= reject_factor;
 
   float headroom_power = max(characterGiParams1.y, 0.1);
@@ -184,7 +184,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     } else if (debug_mode == 2u) {
       debug_color = gi_color * debug_scale;
     } else if (debug_mode == 3u) {
-      debug_color = (ssgi.aaa * debug_scale);
+      debug_color = (vbgi.aaa * debug_scale);
     } else if (debug_mode == 4u) {
       debug_color = gi_filtered * debug_scale;
     } else if (debug_mode == 5u) {
@@ -214,13 +214,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     } else if (debug_mode == 16u) {
       debug_color = source_loaded.rgb * debug_scale;
     } else if (debug_mode == 17u) {
-      debug_color = ssgi_loaded.rgb * debug_scale;
+      debug_color = vbgi_loaded.rgb * debug_scale;
     } else if (debug_mode == 18u) {
-      debug_color = ssgi.rrr * debug_scale;
+      debug_color = vbgi.rrr * debug_scale;
     } else if (debug_mode == 19u) {
-      debug_color = ssgi.ggg * debug_scale;
+      debug_color = vbgi.ggg * debug_scale;
     } else if (debug_mode == 20u) {
-      debug_color = ssgi.bbb * debug_scale;
+      debug_color = vbgi.bbb * debug_scale;
     } else if (debug_mode == 21u) {
       debug_color = float3(had_nan ? 1.0 : 0.0, had_inf ? 1.0 : 0.0, (!had_nan && !had_inf) ? 0.15 : 0.0);
     } else if (debug_mode == 22u) {
@@ -243,7 +243,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
       float3 diff = abs(source_base - source_loaded.rgb);
       debug_color = diff * debug_scale * 100.0;
     } else if (debug_mode == 27u) {
-      float3 diff = abs(ssgi.rgb - ssgi_loaded.rgb);
+      float3 diff = abs(vbgi.rgb - vbgi_loaded.rgb);
       debug_color = diff * debug_scale * 100.0;
     } else if (debug_mode == 28u) {
       // NUKE TEST: writes solid magenta everywhere.

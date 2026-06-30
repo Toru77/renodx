@@ -56,56 +56,56 @@ struct ShaderInjectData {
   // Debug view mode (0 = off, 1..4 = inspection views)
   float debug_show_env_sss;
 
-  // —— XeGTAO (Visibility Bitmask AO + optional GI) ——
-  float xegtao_mode;                // 0=Off (vanilla AO), 1=On (Bitmask AO)
-  float xegtao_quality_level;       // 0=Low, 1=Medium, 2=High, 3=Ultra
-  float xegtao_denoise_passes;      // 0=Off, 1..3
-  float xegtao_radius;              // World-space effect radius
-  float xegtao_falloff_range;       // [0..1], default 0.615
-  float xegtao_radius_multiplier;   // [0.3..3], default 1.457
-  float xegtao_final_power;         // [0.5..5], default 2.2 (AO power)
-  float xegtao_sample_distribution; // [1..3], default 2.0
-  float xegtao_bitmask_thickness;   // [0.01..2.0], default 0.2 — world-space thickness for bitmask
-  float xegtao_depth_mip_offset;    // [2..6], default 3.30
-  float xegtao_denoise_blur_beta;   // Denoise sharpness, default 1.2
-  float xegtao_denoise_leak_threshold; // [1..4], default 2.5 — edge leak threshold (lower=more leak)
-  float xegtao_denoise_leak_strength; // [0..1], default 0.5 — edge leak strength (higher=less flicker)
-  float xegtao_denoiser_type;        // 0=Spatial, 1=Spatio-Temporal
-  float xegtao_temporal_blend;       // derived internally from temporal_frame_count
-  float xegtao_temporal_frame_count; // 0-16 frames accounted for temporal blending (0=off)
-  float xegtao_disocclusion_threshold; // [0.001..0.1], default 0.01 — depth diff to reject history
-  float xegtao_noise_type;         // 0=IS-FAST, 1=IGN, 2=Hilbert — noise selection when IS-FAST on
-  float xegtao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
-  float xegtao_debug_logging;       // 0=Off, 1=On
-  float xegtao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid XeGTAO AO
-  float xegtao_fix_experimental;    // 0=Off, 1-5=experimental (unused in bitmask path)
-  float xegtao_ssgi_bound;          // 0/1 — set at runtime: t23 holds valid GI
-  float xegtao_ssgi_debug;          // 0=Off (add GI), 1=On (replace scene with GI)
+  // —— GTVBAO (Visibility Bitmask AO + optional VBGI) ——
+  float gtvbao_mode;                // 0=Off (vanilla AO), 1=On (Bitmask AO)
+  float gtvbao_quality_level;       // 0=Low, 1=Medium, 2=High, 3=Ultra
+  float gtvbao_denoise_passes;      // 0=Off, 1..3
+  float gtvbao_radius;              // World-space effect radius
+  float gtvbao_falloff_range;       // [0..1], default 0.615
+  float gtvbao_radius_multiplier;   // [0.3..3], default 1.457
+  float gtvbao_final_power;         // [0.5..5], default 2.2 (AO power)
+  float gtvbao_sample_distribution; // [1..3], default 2.0
+  float gtvbao_bitmask_thickness;   // [0.01..2.0], default 0.2 — world-space thickness for bitmask
+  float gtvbao_depth_mip_offset;    // [2..6], default 3.30
+  float gtvbao_denoise_blur_beta;   // Denoise sharpness, default 1.2
+  float gtvbao_denoise_leak_threshold; // [1..4], default 2.5 — edge leak threshold (lower=more leak)
+  float gtvbao_denoise_leak_strength; // [0..1], default 0.5 — edge leak strength (higher=less flicker)
+  float gtvbao_denoiser_type;        // 0=Spatial, 1=Spatio-Temporal, 2=Poisson
+  float gtvbao_temporal_blend;       // derived internally from temporal_frame_count
+  float gtvbao_temporal_frame_count; // 0-16 frames accounted for temporal blending (0=off)
+  float gtvbao_disocclusion_threshold; // [0.001..0.1], default 0.01 — depth diff to reject history
+  float gtvbao_noise_type;         // 0=IS-FAST, 1=IGN, 2=Hilbert — noise selection when IS-FAST on
+  float gtvbao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
+  float gtvbao_debug_logging;       // 0=Off, 1=On
+  float gtvbao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid GTVBAO AO
+  float gtvbao_fix_experimental;    // 0=Off, 1-5=experimental (unused in bitmask path)
+  float gtvbao_vbgi_bound;          // 0/1 — set at runtime: t23 holds valid VBGI
+  float gtvbao_vbgi_debug;          // 0=Off (add GI), 1=On (replace scene with GI)
 
-  // —— SSGI (Screen Space Global Illumination via Visibility Bitmask) ——
-  float ssgi_enabled;               // 0=Off, 1=On (requires xegtao_mode >= 1)
-  float ssgi_intensity;             // [0..5], default 1.0
-  float ssgi_saturation;            // [0..2], default 1.0
-  float ssgi_char_mask_strength;    // [0..1], default 0 — reduce SSGI on characters (0=off, 1=fully masked)
-  float ssgi_multibounce;           // 0=Off, 1=On
-  float ssgi_multibounce_strength;  // [0..10], default 1.0 — feedback intensity
-  float ssgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
-  float ssgi_multibounce_max_clamp; // [0..20], default 0 — max multi-bounce per-channel (0=off)
-  float ssgi_adaptive_r;            // [0..1], default 0 — per-channel red adaptive boost
-  float ssgi_adaptive_g;            // [0..1], default 0 — per-channel green adaptive boost
-  float ssgi_adaptive_b;            // [0..1], default 0 — per-channel blue adaptive boost
-  float ssgi_adaptive_mode;         // 0=GI color, 1=surface albedo
-  float ssgi_adaptive_luma_strength;// [0..5], default 0 — target luma for normalization (0=off)
-  float ssgi_adaptive_luma_blend;   // [0..1], default 0.5 — blend between original and normalized
-  float ssgi_max_clamp;             // [0..20], default 0 — max GI per-channel (0=off)
-  float ssgi_reduce_ao;             // 0=Off, 1=On — reduce AO where indirect light exists
-  float ssgi_reduce_ao_strength;    // [0..5], default 1.0 — strength of AO reduction by indirect light
-  float ssgi_debug_logging;         // 0=Off, 1=On — SSGI debug logging
-  float ssgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples, 6=LightColor
-  float ssgi_affect_lights;         // 0=Off, 1=On — additively blend lightColor into GI
-  float ssgi_lights_strength;       // [0..5], default 1.0 — multiplier for lightColor contribution
-  float ssgi_lights_saturation;     // [0..100], default 1.0 — vibrance for lightColor: 0=gray, 1=neutral
-  float ssgi_cascade_debug;         // 0=Off, 1=On — show shadowmapCascadeCount_g as color overlay
+  // —— VBGI (Visibility-Based Global Illumination) ——
+  float vbgi_enabled;               // 0=Off, 1=On (requires gtvbao_mode >= 1)
+  float vbgi_intensity;             // [0..5], default 1.0
+  float vbgi_saturation;            // [0..2], default 1.0
+  float vbgi_char_mask_strength;    // [0..1], default 0 — reduce VBGI on characters (0=off, 1=fully masked)
+  float vbgi_multibounce;           // 0=Off, 1=On
+  float vbgi_multibounce_strength;  // [0..10], default 1.0 — feedback intensity
+  float vbgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
+  float vbgi_multibounce_max_clamp; // [0..20], default 0 — max multi-bounce per-channel (0=off)
+  float vbgi_adaptive_r;            // [0..1], default 0 — per-channel red adaptive boost
+  float vbgi_adaptive_g;            // [0..1], default 0 — per-channel green adaptive boost
+  float vbgi_adaptive_b;            // [0..1], default 0 — per-channel blue adaptive boost
+  float vbgi_adaptive_mode;         // 0=GI color, 1=surface albedo
+  float vbgi_adaptive_luma_strength;// [0..5], default 0 — target luma for normalization (0=off)
+  float vbgi_adaptive_luma_blend;   // [0..1], default 0.5 — blend between original and normalized
+  float vbgi_max_clamp;             // [0..20], default 0 — max GI per-channel (0=off)
+  float vbgi_reduce_ao;             // 0=Off, 1=On — reduce AO where indirect light exists
+  float vbgi_reduce_ao_strength;    // [0..5], default 1.0 — strength of AO reduction by indirect light
+  float vbgi_debug_logging;         // 0=Off, 1=On — VBGI debug logging
+  float vbgi_debug_view;            // 0=Off, 1=RawGI, 2=Denoised, 3=LightBuf, 4=Accum, 5=Samples, 6=LightColor
+  float vbgi_affect_lights;         // 0=Off, 1=On — additively blend lightColor into GI
+  float vbgi_lights_strength;       // [0..5], default 1.0 — multiplier for lightColor contribution
+  float vbgi_lights_saturation;     // [0..100], default 1.0 — vibrance for lightColor: 0=gray, 1=neutral
+  float vbgi_cascade_debug;         // 0=Off, 1=On — show shadowmapCascadeCount_g as color overlay
   float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
   float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS vibrancy)
   // —— PCSS (Percentage Closer Soft Shadows) ——
@@ -145,7 +145,7 @@ struct ShaderInjectData {
   float cubemap_improvements_enabled;  // 0=Vanilla, 1=Improved
   float cubemap_lighting_mip_boost;    // [0.5..4], default 1.5 — lighting shader cubemap mip scale
   float floor_cubemap_mip_scale;       // [0..4], default 4 — floor reflection roughness/mip response
-  // SSGI (Falcom native, not XeGTAO)
+  // SSGI (Falcom native, not GTVBAO)
   float ssgi_mod_enabled;              // 0=Off, 1=On
   float ssgi_color_boost;              // [0..3], default 1 — scales SSGI RGB before power shaping
   float ssgi_alpha_boost;              // [0..3], default 1 — scales SSGI alpha before saturate
@@ -188,21 +188,21 @@ struct ShaderInjectData {
   float foliage_translucency_scale;    // default 1
   float foliage_opacity_scale;         // default 1
   float foliage_ssao_scale;            // default 1
-  // Kai XeGTAO bent normal / foliage mask fields
-  float xegtao_bent_diffuse_strength;
-  float xegtao_bent_diffuse_softness;
-  float xegtao_bent_specular_strength;
-  float xegtao_bent_specular_proxy_roughness;
-  float xegtao_bent_max_darkening;
-  float xegtao_bent_normals;
-  float xegtao_force_neutral_x;
-  float xegtao_debug_blackout;
-  float xegtao_ao_active_for_draw;
-  float xegtao_foliage_ao_blend;
-  float xegtao_foliage_mask_method;
-  float xegtao_mrt_normal_valid;
-  float xegtao_debug_mode;             // Kai XeGTAO debug mode (distinct from xegtao_debug_view)
-  float xegtao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_xegtao_normal_input_mode)
+  // Kai GTVBAO bent normal / foliage mask fields
+  float gtvbao_bent_diffuse_strength;
+  float gtvbao_bent_diffuse_softness;
+  float gtvbao_bent_specular_strength;
+  float gtvbao_bent_specular_proxy_roughness;
+  float gtvbao_bent_max_darkening;
+  float gtvbao_bent_normals;
+  float gtvbao_force_neutral_x;
+  float gtvbao_debug_blackout;
+  float gtvbao_ao_active_for_draw;
+  float gtvbao_foliage_ao_blend;
+  float gtvbao_foliage_mask_method;
+  float gtvbao_mrt_normal_valid;
+  float gtvbao_debug_mode;             // Kai GTVBAO debug mode (distinct from gtvbao_debug_view)
+  float gtvbao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_gtvbao_normal_input_mode)
   // Kai char shadow / misc
   float char_shadow_strength;
   float foliage_debug_mode;
@@ -210,7 +210,7 @@ struct ShaderInjectData {
   float shadow_isfast_jitter_amount;
   float shadow_isfast_jitter_speed;
   float shadow_pcss_sample_mode;
-  // Kai character SSGI debug/internal fields
+  // Kai character VBGI debug/internal fields
   float char_gi_enabled;
   float char_gi_ao_influence;
   float char_gi_reject_strength;
@@ -224,12 +224,22 @@ struct ShaderInjectData {
   float volfog_is_fast_enabled;
   float isfast_noise_bound;
   float volfog_color_correction_strength;
-  // Kai: XeGTAO SSGI consume Falcom SSGI
-  float ssgi_kai_consume_falcom;       // 0=Off, 1=On — use Falcom SSGI to modulate XeGTAO GI
-  float ssgi_kai_falcom_blend;         // [0..1], default 0.5 — how much Falcom SSGI modulates XeGTAO GI
-  float ssgi_kai_xegtao_only;          // 0=Off, 1=On — suppress Falcom SSGI output, XeGTAO GI only
+  // Kai: GTVBAO VBGI consume Falcom SSGI
+  float vbgi_kai_consume_falcom;       // 0=Off, 1=On — use Falcom SSGI to modulate GTVBAO VBGI
+  float vbgi_kai_falcom_blend;         // [0..1], default 0.5 — how much Falcom SSGI modulates GTVBAO VBGI
+  float vbgi_kai_gtvbao_only;          // 0=Off, 1=On — suppress Falcom SSGI output, GTVBAO VBGI only
   float shadow_edge_tint_kai;          // Kai-specific: 0=Off, 1=Improved (colored penumbra)
   float character_light_strength;      // [0..2], default 0 — scales chrLightIntensity_g hero light on characters
+  // —— GTVBAO upgrade toggles ——
+  float gtvbao_cdf_enabled;     // 0=Off, 1=On — CDF remap horizon angles
+  float gtvbao_cosine_enabled;  // 0=Off, 1=On — cosine-weighted slice sampling
+  float gtvbao_cosine_mode;     // 0=Weight, 1=Project, 2=CDF — cosine sampling method
+  float gtvbao_thickness_enabled; // 0=Off, 1=On — per-sample thickness offset
+  // —— Poisson denoiser ——
+  float gtvbao_poisson_samples;     // [4..32], default 8 — Poisson disk sample count
+  float gtvbao_poisson_luma_phi;    // [0.5..20], default 5 — luma/AO similarity falloff
+  float gtvbao_poisson_depth_phi;   // [0.5..20], default 5 — depth similarity falloff
+  float gtvbao_poisson_normal_phi;  // [0.5..20], default 5 — normal similarity falloff
 };
 
 #ifndef __cplusplus
