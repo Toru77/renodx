@@ -1568,7 +1568,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.f, .label = "CS Dispatch Fix", .section = "GTVBAO",
       .tooltip = "Fixes double volumetrics caused by stale compute descriptor bindings. Fix 1: restore state via Apply(). Fix 2: null compute descriptors. Fix 3: null + restore.",
       .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
-    .is_visible = []() { return IsAdvancedSettingsMode() && IsKai(); },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // —— SSGI (Screen Space Global Illumination — integrated into GTVBAO) ——
     new renodx::utils::settings::Setting{
@@ -1830,7 +1830,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Deferred Dispatch", .section = "CPU Opt",
       .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default ON — avoids CS binding contamination.",
       .labels = {"Off", "On"},
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CPUOptEnsurePipelines", .binding = &g_cpuopt_ensure_pipelines,
