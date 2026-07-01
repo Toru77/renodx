@@ -1096,14 +1096,14 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowLightFadeStart", .binding = &shader_injection.char_shadow_light_screen_fade_start,
-      .default_value = 0.f, .label = "Light Fade Start", .section = "Character Shadowing",
+      .default_value = 0.35f, .label = "Light Fade Start", .section = "Character Shadowing",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowLightFadeEnd", .binding = &shader_injection.char_shadow_light_screen_fade_end,
-      .default_value = 0.f, .label = "Light Fade End", .section = "Character Shadowing",
+      .default_value = 1.f, .label = "Light Fade End", .section = "Character Shadowing",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
