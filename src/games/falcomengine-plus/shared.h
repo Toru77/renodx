@@ -140,7 +140,7 @@ struct ShaderInjectData {
   float shadow_isfast_temporal_speed;  // [0..5], default 1.0
   float shadow_isfast_seed_offset;     // [0..64], default 0
 
-  // ── Kai-specific fields (only active when running kai.exe) ──
+  // ── Kai / Daybreak 2 cubemap fields ──
   // Cubemap
   float cubemap_improvements_enabled;  // 0=Vanilla, 1=Improved
   float cubemap_lighting_mip_boost;    // [0.5..4], default 1.5 — lighting shader cubemap mip scale

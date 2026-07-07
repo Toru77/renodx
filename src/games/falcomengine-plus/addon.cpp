@@ -279,6 +279,23 @@ static bool IsKai() {
   return is_kai;
 }
 
+// ── Daybreak 2 detection ──
+static bool IsDaybreak2() {
+  static bool checked = false;
+  static bool is_db2 = false;
+  if (!checked) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string name(exePath);
+    auto lastSlash = name.find_last_of("\\/");
+    if (lastSlash != std::string::npos) name = name.substr(lastSlash + 1);
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    is_db2 = (name == "kuro2.exe");
+    checked = true;
+  }
+  return is_db2;
+}
+
 // ── Lighting shader identification (Sora + Kai) ──
 static bool IsLightingShader(uint32_t hash) {
   return hash == 0xFDAAF80Eu    // Sora lighting
@@ -628,6 +645,10 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x8337B262, nullptr),
     CustomShaderEntryCallback(0xD97BD91B, nullptr),
     CustomShaderEntryCallback(0xEFB6AC0F, nullptr),
+    // ── Daybreak 2 cubemap (3 glass shaders) ──
+    CustomShaderEntryCallback(0xE01674A5, nullptr),
+    CustomShaderEntryCallback(0xF19E927D, nullptr),
+    CustomShaderEntryCallback(0x27748076, nullptr),
     // ── Kai DOF shaders ──
     CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
     CustomShaderEntryCallback(0x2734F870, nullptr),
@@ -718,7 +739,7 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
-    // ═══════════ Kai-Specific Sections (only visible on kai.exe) ═══════════
+    // ═══════════ Kai / Daybreak 2 - Specific Sections ═══════════
 
     // ── Cubemap ──
     new renodx::utils::settings::Setting{
@@ -726,7 +747,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Mode", .section = "Cubemap",
       .labels = {"Vanilla", "Improved"},
-      .is_visible = []() { return IsKai(); },
+      .is_visible = []() { return IsKai() || IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "LightingCubemapMipBoost", .binding = &shader_injection.cubemap_lighting_mip_boost,
@@ -734,14 +755,14 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Lighting shader cubemap mip scale. Default is 1.5x.",
       .min = 0.5f, .max = 4.f, .format = "%.1fx",
       .is_enabled = []() { return shader_injection.cubemap_improvements_enabled >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return (IsKai() || IsDaybreak2()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "FloorCubemapMipScale", .binding = &shader_injection.floor_cubemap_mip_scale,
       .default_value = 4.f, .label = "Floor Mip Scale", .section = "Cubemap",
       .tooltip = "Scales floor reflection roughness/mip response. 1.0 = Vanilla.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return (IsKai() || IsDaybreak2()) && IsAdvancedSettingsMode(); },
     },
 
     // ── SSGI (Falcom) ──
