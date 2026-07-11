@@ -215,6 +215,7 @@ ShaderInjectData shader_injection = {
   .char_gtvbao_mode = 0.f,
   .char_gtvbao_mask_strength = 0.f,
   .char_gtvbgi_mask_strength = 0.f,
+  .gtvbao_prefilter_enabled = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -1096,21 +1097,24 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMode", .binding = &shader_injection.char_gtvbao_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Allow GTVBAO", .section = "Character Shadowing",
+      .default_value = 2.f, .label = "Allow GTVBAO", .section = "Character Shadowing",
       .labels = {"Off", "On", "Combined"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMaskStr", .binding = &shader_injection.char_gtvbao_mask_strength,
-      .default_value = 0.f, .label = "GTVBAO Char Mask", .section = "Character Shadowing",
+      .default_value = 75.f, .label = "GTVBAO Char Mask", .section = "Character Shadowing",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f; },
       .parse = [](float v) { return v * 0.01f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
       .default_value = 0.f, .label = "GTVBGI Char Mask", .section = "Character Shadowing",
       .min = 0.f, .max = 100.f,
       .parse = [](float v) { return v * 0.01f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowSampleCount", .binding = &shader_injection.char_shadow_sample_count,
@@ -1616,6 +1620,14 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOPrefilter", .binding = &shader_injection.gtvbao_prefilter_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Pre-filter AO", .section = "GTVBAO",
+      .tooltip = "Depth-aware 3×3 bilateral pre-filter on raw AO before power curve (reduces bitmask noise).",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     // ── GTVBAO dispatch Fix (for double volumetrics) ──
     new renodx::utils::settings::Setting{
@@ -3177,6 +3189,7 @@ static std::array<float, 58> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[55] = std::clamp(shader_injection.gtvbao_poisson_luma_phi, 0.5f, 20.f);
   c[56] = std::clamp(shader_injection.gtvbao_poisson_depth_phi, 0.5f, 20.f);
   c[57] = std::clamp(shader_injection.gtvbao_poisson_normal_phi, 0.5f, 20.f);
+  c[58] = shader_injection.gtvbao_prefilter_enabled;
   return c;
 }
 

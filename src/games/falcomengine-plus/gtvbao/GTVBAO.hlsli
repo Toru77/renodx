@@ -1335,6 +1335,28 @@ void GTVBAO_DenoiseAO_Poisson(
         if (pc.x >= (int)w || pc.y >= (int)h) continue;
 
         float centerAO = (float)srcAO.Load(int3(pc, 0)) * 0.0039215686f; // /255
+
+        // ── Optional depth-aware bilateral pre-filter ──
+        if (GTVBAO_prefilter_enabled > 0.5f) {
+            float centerDepth = depthTex.Load(int3(pc, 0));
+            float filteredSum = centerAO, filteredW = 1.0f;
+            [unroll]
+            for (int dy2 = -1; dy2 <= 1; dy2++) {
+                [unroll]
+                for (int dx2 = -1; dx2 <= 1; dx2++) {
+                    if (dx2 == 0 && dy2 == 0) continue;
+                    int2 npc = int2(pc.x + dx2, pc.y + dy2);
+                    if (npc.x < 0 || npc.y < 0 || npc.x >= (int)w || npc.y >= (int)h) continue;
+                    float nAO = (float)srcAO.Load(int3(npc, 0)) * 0.0039215686f;
+                    float nDepth = depthTex.Load(int3(npc, 0));
+                    float depthW = exp(-abs(centerDepth - nDepth) * 10.0f);
+                    filteredSum += nAO * depthW;
+                    filteredW += depthW;
+                }
+            }
+            centerAO = filteredSum / filteredW;
+        }
+
         float sum = centerAO * centerWeight, totalW = centerWeight;
 
         [loop]

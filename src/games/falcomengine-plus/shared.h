@@ -244,6 +244,8 @@ struct ShaderInjectData {
   float char_gtvbao_mode;            // 0=Off, 1=On, 2=Combined
   float char_gtvbao_mask_strength;   // [0..1], 0=full AO on chars, 1=no AO on chars
   float char_gtvbgi_mask_strength;   // [0..1], 0=full GI on chars, 1=no GI on chars
+  // —— GTVBAO pre-filter ——
+  float gtvbao_prefilter_enabled;    // 0=Off, 1=On — depth-aware bilateral pre-filter on raw AO
 };
 
 #ifndef __cplusplus

@@ -114,6 +114,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_poisson_luma_phi;      // c[55] — [0.5..20], default 5
   float GTVBAO_poisson_depth_phi;     // c[56] — [0.5..20], default 5
   float GTVBAO_poisson_normal_phi;    // c[57] — [0.5..20], default 5
+  float GTVBAO_prefilter_enabled;      // c[58] — 0=Off, 1=On
 };
 
 // ── GI parameters are native cb_gtvbao fields (c[25]-c[33]) — no aliases needed.

@@ -83,16 +83,51 @@ void main(uint2 dt : SV_DispatchThreadID)
 
   if (GTVBAO_denoiser_type >= 1.5f)
   {
-    // ── Poisson denoiser (AO only, spatial-only) ──
+    // ── Poisson denoiser (AO spatial) + temporal blend ──
     GTVBAO_DenoiseAO_Poisson(dt * uint2(2, 1), consts,
         g_srcWorkingAOTerm, g_srcDepth, g_mrtNormalTexture, g_samplerPointClamp,
         g_outFinalAOTerm, true);
 
+    // ── Temporal reprojection + blend (matching ST path) ──
+    float2 vpSize = float2(width, height);
+    float2 invVPSize = 1.0.xx / vpSize;
+
+    [unroll]
     for (int side = 0; side < 2; side++) {
       int2 pixCoord = int2(dt.x * 2 + side, dt.y);
-      if (pixCoord.x < (int)width && pixCoord.y < (int)height) {
-        g_outHistoryAO[pixCoord] = g_outFinalAOTerm[pixCoord];
-      }
+      if (pixCoord.x >= (int)width || pixCoord.y >= (int)height) continue;
+
+      uint spatialPacked = g_outFinalAOTerm[pixCoord];
+      float spatialAO = float(spatialPacked) / 255.0;
+
+      float2 uv = (float2(pixCoord) + 0.5) * invVPSize;
+      float viewZ = g_srcDepth.SampleLevel(g_samplerPointClamp, uv, 0);
+      float3 viewPos = GTVBAO_ComputeViewspacePosition(uv, viewZ, consts);
+      float4 worldPos = mul(float4(viewPos, 1.0), viewInv_g);
+      float4 prevClipPos = mul(worldPos, prevViewProj_g);
+      float2 prevNDC = prevClipPos.xy / prevClipPos.w;
+      float2 prevUV = prevNDC * float2(-0.5, 0.5) + 0.5;
+      float historyWeight = GTVBAO_temporal_blend;
+
+      if (any(prevUV < 0.0 || prevUV > 1.0)) historyWeight = 0.0;
+
+      // Disocclusion check: reject if depth at history UV differs from current
+      float prevDepth = g_srcDepth.SampleLevel(g_samplerPointClamp, prevUV, 0);
+      if (abs(viewZ - prevDepth) > GTVBAO_disocclusion_threshold) historyWeight = 0.0;
+
+      uint hw, hh;
+      g_srcHistoryAO.GetDimensions(hw, hh);
+      int2 historyCoord = int2(saturate(prevUV) * float2(hw, hh));
+      uint historyPacked = g_srcHistoryAO.Load(int3(historyCoord, 0));
+      float historyAO = float(historyPacked) / 255.0;
+
+      if (historyAO < 0.001) historyWeight = 0.0;
+
+      float blendedAO = lerp(spatialAO, historyAO, historyWeight);
+
+      uint blendedPacked = uint(saturate(blendedAO) * 255.0 + 0.5);
+      g_outFinalAOTerm[pixCoord] = blendedPacked;
+      g_outHistoryAO[pixCoord] = blendedPacked;
     }
   }
   else
@@ -119,7 +154,7 @@ void main(uint2 dt : SV_DispatchThreadID)
 
       // Camera reprojection — reconstruct viewspace position from depth,
       // transform to previous frame's clip space via world space.
-      float viewZ = -g_srcDepth.SampleLevel(g_samplerPointClamp, uv, 0);
+      float viewZ = g_srcDepth.SampleLevel(g_samplerPointClamp, uv, 0);
       float3 viewPos = GTVBAO_ComputeViewspacePosition(uv, viewZ, consts);
       float4 worldPos = mul(float4(viewPos, 1.0), viewInv_g);
       float4 prevClipPos = mul(worldPos, prevViewProj_g);
@@ -129,6 +164,10 @@ void main(uint2 dt : SV_DispatchThreadID)
 
       // Reject history when reprojected UV falls off-screen
       if (any(prevUV < 0.0 || prevUV > 1.0)) historyWeight = 0.0;
+
+      // Disocclusion check: reject if depth at history UV differs from current
+      float prevDepth = g_srcDepth.SampleLevel(g_samplerPointClamp, prevUV, 0);
+      if (abs(viewZ - prevDepth) > GTVBAO_disocclusion_threshold) historyWeight = 0.0;
 
       // Sample history AO
       uint hw, hh;

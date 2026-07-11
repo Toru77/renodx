@@ -1,5 +1,5 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// falcomengine-plus GTVBAO — Pass 2: Main GTAO (Low quality — 8 spp)
+// falcomengine-plus GTVBAO — Pass 2: Main GTAO (Low quality — 9 spp)
 //
 // Kai-style: builds GTAOConstants in-shader, MRT normal from game g-buffer.
 // Visibility Bitmask AO + optional GI (Therrien/Levesque/Gilet 2023).
@@ -194,10 +194,10 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
   lpfloat slice_count = 3.0;
   lpfloat steps_per_slice = 3.0;
   uint q = (uint)round(clamp(GTVBAO_quality, 0.0, 3.0));
-  if (q == 0u)      { slice_count = 2.0; steps_per_slice = 3.0; }  // Low
-  else if (q == 1u) { slice_count = 3.0; steps_per_slice = 3.0; }  // Medium
-  else if (q == 2u) { slice_count = 4.0; steps_per_slice = 3.0; }  // High
-  else              { slice_count = 5.0; steps_per_slice = 3.0; }  // Ultra
+  if (q == 0u)      { slice_count = 3.0; steps_per_slice = 3.0; }  // Low
+  else if (q == 1u) { slice_count = 6.0; steps_per_slice = 3.0; }  // Medium
+  else if (q == 2u) { slice_count = 9.0; steps_per_slice = 3.0; }  // High
+  else              { slice_count = 12.0; steps_per_slice = 3.0; }  // Ultra
 
   GTVBAO_MainPass(pixCoord, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,

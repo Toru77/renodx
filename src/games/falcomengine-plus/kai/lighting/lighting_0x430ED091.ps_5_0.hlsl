@@ -414,6 +414,15 @@ void main(
   if (GTVBAO_bound) {
     // GTVBAO policy: replace AO.X only. Preserve legacy AO.YZ for SSS/material compatibility.
     ao_sample.x = GTVBAO_sample.x;
+    // Character GTVBAO control (Sora parity)
+    if (is_character_pixel) {
+      if (shader_injection_data.char_gtvbao_mode < 0.5f) {
+        ao_sample.x = ssao_sample.x;  // Off: use vanilla SSAO for characters
+      } else {
+        float charMask = saturate(shader_injection_data.char_gtvbao_mask_strength);
+        ao_sample.x = lerp(GTVBAO_sample.x, ssao_sample.x, charMask);
+      }
+    }
     if (GTVBAO_bent_normals_enabled && is_environment_pixel) {
       ao_sample.x = ApplyGTVBAOBentVisibility(ao_sample.x, GTVBAO_sample.yz);
     }
@@ -832,7 +841,11 @@ void main(
     // --- End early-return Character SSGI Composite ---
 
     // Add GTVBAO VBGI to early-return output (bypassing game's SSGI formula)
-    r4.yzw = r4.yzw + r24.xyz;
+    {
+      float giCharScale = is_character_pixel
+          ? (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength)) : 1.0;
+      r4.yzw = r4.yzw + r24.xyz * giCharScale;
+    }
     o0.xyz = r4.yzw;
     o0.w = 1;
     o1.xyzw = r1.xyzw;
@@ -2323,7 +2336,11 @@ void main(
   }
   // --- End Foliage Debug ---
   // Add GTVBAO VBGI directly to final scene (bypasses game's SSGI formula)
-  r3.xyz = r3.xyz + r24.xyz;
+  {
+    float giCharScale = is_character_pixel
+        ? (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength)) : 1.0;
+    r3.xyz = r3.xyz + r24.xyz * giCharScale;
+  }
   // ── SSGI Debug Views: replace scene with debug texture ──
   if (shader_injection_data.vbgi_debug_view > 0.5) {
     int dbgMode = (int)shader_injection_data.vbgi_debug_view;
