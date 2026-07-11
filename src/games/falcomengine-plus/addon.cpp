@@ -216,6 +216,13 @@ ShaderInjectData shader_injection = {
   .char_gtvbao_mask_strength = 0.f,
   .char_gtvbgi_mask_strength = 0.f,
   .gtvbao_prefilter_enabled = 0.f,
+  .brdf_hammon_diffuse_enabled = 0.f,
+  .brdf_multiscatter_specular_enabled = 0.f,
+  .brdf_diffuse_strength = 1.f,
+  .brdf_specular_strength = 1.f,
+  .brdf_roughness_min = 0.04f,
+  .brdf_roughness_max = 1.f,
+  .brdf_f0_source = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -1628,6 +1635,57 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Depth-aware 3×3 bilateral pre-filter on raw AO before power curve (reduces bitmask noise).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    // ── BRDF Improvement ──
+    new renodx::utils::settings::Setting{
+      .key = "BRDFHammonDiffuse", .binding = &shader_injection.brdf_hammon_diffuse_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Hammon 2017 Diffuse", .section = "BRDF Improvement",
+      .tooltip = "Replaces Lambert diffuse with Hammon 2017 GGX+Smith multi-scatter energy-conserving diffuse (GDC 2017).",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "BRDFDiffuseStrength", .binding = &shader_injection.brdf_diffuse_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Diffuse Blend", .section = "BRDF Improvement",
+      .tooltip = "Blend between vanilla Lambert and Hammon diffuse. 0=vanilla, 1=full Hammon, 2=2x boost.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.brdf_hammon_diffuse_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "BRDFMultiScatterSpecular", .binding = &shader_injection.brdf_multiscatter_specular_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
+      .tooltip = "Replaces Blinn-Phong specular with GGX D·V·F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.65f, .label = "Specular Blend", .section = "BRDF Improvement",
+      .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "BRDFRoughnessMin", .binding = &shader_injection.brdf_roughness_min,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Roughness Min", .section = "BRDF Improvement",
+      .tooltip = "Clamp minimum perceptual roughness to prevent GGX singularity. 0.04 is a safe minimum for most materials.",
+      .min = 0.f, .max = 0.5f, .format = "%.2f",
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "BRDFRoughnessMax", .binding = &shader_injection.brdf_roughness_max,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Roughness Max", .section = "BRDF Improvement",
+      .tooltip = "Clamp maximum perceptual roughness. 1.0 = no clamping.",
+      .min = 0.5f, .max = 1.f, .format = "%.2f",
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // ── GTVBAO dispatch Fix (for double volumetrics) ──
     new renodx::utils::settings::Setting{
