@@ -171,12 +171,14 @@ TextureCube<float4> texEnvMap_g : register(t17);
 StructuredBuffer<LightParam> dynamicLights_g : register(t18);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t19);
 Texture2D<float4> farShadowMap : register(t21);
+Texture2D<uint> gtvbaoTexture : register(t22);
+Texture2D<float4> gtvbaoVBGITexture : register(t23);
 Texture2DArray<float4> spotShadowMaps : register(t24);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t25);
 
 
 // 3Dmigoto declarations
-#define cmp -
+#define cmp 
 
 
 void main(
@@ -1344,6 +1346,40 @@ void main(
     u0_x = u0_x << 16;
     o1.w = r18.w ? u0_x : 0u;
   }
+  // ── GTVBAO Ambient Occlusion ──
+  {
+    float ao_visibility = 1.0;
+    if (shader_injection_data.gtvbao_dedicated_bound >= 0.5) {
+      uint xw, xh;
+      gtvbaoTexture.GetDimensions(xw, xh);
+      uint xpacked = gtvbaoTexture.Load(int3(uint2(v1.xy * float2(xw, xh)), 0));
+      ao_visibility = float(xpacked) / 255.0;
+    }
+    r2.xyw *= ao_visibility;
+  }
+  
+  // ── GTVBAO VBGI ──
+  {
+    float3 vbgi_color = float3(0, 0, 0);
+    if (shader_injection_data.gtvbao_vbgi_bound >= 0.5) {
+      float4 vbgi_sample = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0);
+      vbgi_color = vbgi_sample.xyz * shader_injection_data.vbgi_intensity;
+      float giLuma = dot(vbgi_color, float3(0.333, 0.333, 0.333));
+      vbgi_color = lerp(giLuma.xxx, vbgi_color, shader_injection_data.vbgi_saturation);
+      if (shader_injection_data.vbgi_max_clamp > 0.0) {
+        vbgi_color = min(vbgi_color, shader_injection_data.vbgi_max_clamp);
+      }
+    }
+    r2.xyw += vbgi_color;
+  }
+  
+  // ── GTVBAO Debug Views ──
+  if (shader_injection_data.vbgi_debug_view > 0.5) {
+    o0.xyz = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
+    o0.w = 1;
+    return;
+  }
+  
   o0.xyz = r2.xyw;
   o0.w = 1;
   return;

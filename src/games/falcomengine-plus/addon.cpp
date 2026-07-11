@@ -561,23 +561,25 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── Kai character lighting callback (Env SSS + Character Shadowing) ──
+// ── Kai + Daybreak 2 character lighting callback (Env SSS + Character Shadowing) ──
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list) {
   // Character shader reads shader_injection_data automatically via b13 injection.
-  // Push IS-FAST noise if the shader uses it.
-  if (auto* dev = cmd_list->get_device()) {
-    if (auto* d = dev->get_private_data<DeviceData>()) {
-      reshade::api::resource_view srv = d->isfast_noise_srv.handle
-          ? d->isfast_noise_srv : d->fallback_srv;
-      if (srv.handle) {
-        cmd_list->push_descriptors(
-            reshade::api::shader_stage::pixel,
-            reshade::api::pipeline_layout{0}, 0,
+  // Push IS-FAST noise at t15 (Kai char shader uses it; Daybreak 2 char does not).
+  if (!IsDaybreak2()) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (auto* d = dev->get_private_data<DeviceData>()) {
+        reshade::api::resource_view srv = d->isfast_noise_srv.handle
+            ? d->isfast_noise_srv : d->fallback_srv;
+        if (srv.handle) {
+          cmd_list->push_descriptors(
+              reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0}, 0,
             reshade::api::descriptor_table_update{
                 {}, 15u, 0, 1,
                 reshade::api::descriptor_type::texture_shader_resource_view,
                 &srv,
             });
+        }
       }
     }
   }
@@ -649,6 +651,17 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0xE01674A5, nullptr),
     CustomShaderEntryCallback(0xF19E927D, nullptr),
     CustomShaderEntryCallback(0x27748076, nullptr),
+    // ── Daybreak 2 volumetric fog (Haze AA) ──
+    CustomShaderEntryCallback(0x9A49E6E9, nullptr),
+    // ── Daybreak 2 character lighting (Env SSS + Character Shadowing) ──
+    {
+        0xAC3BA23Cu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xAC3BA23Cu,
+            .code = __0xAC3BA23C,
+            .on_draw = OnBeforeCharLightingDraw,
+        },
+    },
     // ── Kai DOF shaders ──
     CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
     CustomShaderEntryCallback(0x2734F870, nullptr),
@@ -1363,7 +1376,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
       .tooltip = "Mode 1: Uniform slices with per-slice weight. Mode 2: Ray projection from world-space lobe. Mode 3: CDF importance sampling (best quality/speed).",
       .labels = {"Weight", "Project", "CDF"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_cosine_enabled > 0.5f; },
@@ -1387,8 +1400,8 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAODenoiseBlurBeta", .binding = &shader_injection.gtvbao_denoise_blur_beta,
-      .default_value = 20.0f, .label = "Denoise Blur Beta", .section = "GTVBAO",
-      .min = 0.5f, .max = 20.0f, .format = "%.2f",
+      .default_value = 200.0f, .label = "Denoise Blur Beta", .section = "GTVBAO",
+      .min = 0.5f, .max = 200.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },

@@ -95,6 +95,8 @@ Texture2D<float4> cloudsTexture : register(t2);
 Texture3D<float4> inscatterLUT : register(t3);
 Texture3D<float4> extinctionLUT : register(t4);
 
+#include "../../shared.h"
+#include "../../reference/rendering.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -123,8 +125,17 @@ void main(
     r1.y = -volumeNearOverFarClip_g + 1;
     r1.z = r1.x / r1.y;
     r1.xy = v1.zw;
-    r2.xyz = inscatterLUT.SampleLevel(samLinear_s, r1.xyz, 0).xyz;
-    r1.xyz = extinctionLUT.SampleLevel(samLinear_s, r1.xyz, 0).xyz;
+    float3 volUVW = r1.xyz;
+    uint3 volTmp;
+    inscatterLUT.GetDimensions(volTmp.x, volTmp.y, volTmp.z);
+    float3 volSize = float3(volTmp);
+    if (shader_injection_data.volfog_haze_aa_mode > 0.5) {
+      r2.xyz = renodx::rendering::SampleTricubicBSpline(inscatterLUT, samLinear_s, volUVW, volSize).xyz;
+      r1.xyz = renodx::rendering::SampleTricubicBSpline(extinctionLUT, samLinear_s, volUVW, volSize).xyz;
+    } else {
+      r2.xyz = inscatterLUT.SampleLevel(samLinear_s, volUVW, 0).xyz;
+      r1.xyz = extinctionLUT.SampleLevel(samLinear_s, volUVW, 0).xyz;
+    }
     r1.xyz = r1.xyz + r2.xyz;
     r0.xyz = r1.xyz * r0.xyz;
     o1.x = 0;

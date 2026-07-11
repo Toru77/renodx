@@ -416,6 +416,122 @@ static float ComputeCharacterSunShadow(float2 uv, float3 normalWS)
   return lerp(1.0, result, directionalStrength);
 }
 
+// ── Camera-space Bend_SSS ray-march (matches Sora's ComputeCharacterCameraShadow) ──
+static float ComputeKaiCameraShadow(float2 uv, float3 normalWS)
+{
+  int sampleCount = max((int)round(shader_injection_data.char_shadow_sample_count), 1);
+  int hardShadowSamples = clamp((int)round(shader_injection_data.char_shadow_hard_shadow_samples), 0, sampleCount);
+  int fadeOutSamples = clamp((int)round(shader_injection_data.char_shadow_fade_out_samples), 0, sampleCount);
+  if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
+    fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
+  }
+
+  float surfaceThickness = max(shader_injection_data.char_shadow_surface_thickness, 1e-5);
+  float shadowContrast = max(shader_injection_data.char_shadow_contrast, 0.0);
+  float minOccluderDepthScale = max(shader_injection_data.char_shadow_min_occluder_depth_scale, 0.0);
+  bool useJitter = shader_injection_data.char_shadow_jitter_enabled >= 0.5;
+
+  float startDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * uv, 0).x;
+  if (startDepth <= CHAR_SHADOW_FAR_DEPTH_VALUE) return 1.0;
+
+  float normalLenSq = dot(normalWS, normalWS);
+  if (normalLenSq <= 1e-8) return 1.0;
+  float3 normalDirWS = normalWS * rsqrt(normalLenSq);
+
+  float4 clipPos = float4(uv * float2(2, -2) + float2(-1, 1), startDepth, 1.0);
+  float4 viewPosH;
+  viewPosH.x = dot(clipPos, projInv_g._m00_m10_m20_m30);
+  viewPosH.y = dot(clipPos, projInv_g._m01_m11_m21_m31);
+  viewPosH.z = dot(clipPos, projInv_g._m02_m12_m22_m32);
+  viewPosH.w = dot(clipPos, projInv_g._m03_m13_m23_m33);
+  if (abs(viewPosH.w) <= 1e-6) return 1.0;
+  float3 viewPos = viewPosH.xyz / viewPosH.www;
+
+  float4 viewPos4 = float4(viewPos, 1.0);
+  float3 worldPos;
+  worldPos.x = dot(viewPos4, viewInv_g._m00_m10_m20_m30);
+  worldPos.y = dot(viewPos4, viewInv_g._m01_m11_m21_m31);
+  worldPos.z = dot(viewPos4, viewInv_g._m02_m12_m22_m32);
+
+  float rayDirLenSq = dot(rayMarchShadowDir_g.xyz, rayMarchShadowDir_g.xyz);
+  if (rayDirLenSq <= 1e-8) return 1.0;
+  // rayMarchShadowDir_g is already the ray-march direction — use directly, no negation
+  float3 pixelToLightWS = rayMarchShadowDir_g.xyz * rsqrt(rayDirLenSq);
+  float ndotl = saturate(abs(dot(normalDirWS, pixelToLightWS)));
+  if (ndotl <= 0.001) return 1.0;
+
+  float jitter = 0.0;
+  if (useJitter) {
+    float2 pixelCoord = floor(uv * vpSize_g.xy);
+    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
+    jitter = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
+  }
+
+  float3 viewForwardWS = float3(viewInv_g._m20, viewInv_g._m21, viewInv_g._m22);
+  viewForwardWS = viewForwardWS * rsqrt(max(dot(viewForwardWS, viewForwardWS), 1e-8));
+  float normalViewFactor = saturate(abs(dot(normalDirWS, viewForwardWS)));
+  float surfaceStartBias = normalViewFactor * -0.00249999994 + 0.00749999983;
+  float rayStepLength = normalViewFactor * 0.00150000001 + 0.000500000024;
+  float3 rayStepWS = pixelToLightWS * rayStepLength;
+  float3 rayStartWS = worldPos + normalDirWS * surfaceStartBias;
+
+  float depthThickness = max(abs(CHAR_SHADOW_FAR_DEPTH_VALUE - startDepth) * surfaceThickness, 1e-5);
+  float hardShadow = 1.0;
+  float4 shadowValue = 1.0;
+  int validSamples = 0;
+
+  [loop]
+  for (int i = 0; i < sampleCount; ++i) {
+    float sampleIndex = (float)(i + 1) + jitter;
+    float3 samplePosWS = rayStartWS + rayStepWS * sampleIndex;
+    float4 samplePosWS4 = float4(samplePosWS, 1.0);
+
+    float4 sampleClip;
+    sampleClip.x = dot(samplePosWS4, viewProj_g._m00_m10_m20_m30);
+    sampleClip.y = dot(samplePosWS4, viewProj_g._m01_m11_m21_m31);
+    sampleClip.z = dot(samplePosWS4, viewProj_g._m02_m12_m22_m32);
+    sampleClip.w = dot(samplePosWS4, viewProj_g._m03_m13_m23_m33);
+    if (abs(sampleClip.w) <= 1e-6) break;
+
+    float3 sampleNdc = sampleClip.xyz / sampleClip.www;
+    float2 sampleUV = sampleNdc.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
+    if (sampleUV.x <= invVPSize_g.x || sampleUV.y <= invVPSize_g.y ||
+        sampleUV.x >= (1.0 - invVPSize_g.x) || sampleUV.y >= (1.0 - invVPSize_g.y)) break;
+
+    validSamples++;
+
+    float sampleDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * sampleUV, 0).x;
+    float shadowSample = 1.0;
+    float depthDelta = sampleDepth - sampleNdc.z;
+    if (depthDelta > (depthThickness * minOccluderDepthScale)) {
+      float depthMatch = abs(depthDelta / depthThickness - 1.0);
+      shadowSample = saturate(depthMatch * shadowContrast + (1.0 - shadowContrast));
+    }
+
+    if (i < hardShadowSamples) {
+      hardShadow = min(hardShadow, shadowSample);
+    } else {
+      if (i >= (sampleCount - fadeOutSamples)) {
+        float fadeOut = (float)(i + 1 - (sampleCount - fadeOutSamples)) / (float)(fadeOutSamples + 1) * 0.75;
+        shadowSample = saturate(shadowSample + fadeOut);
+      }
+      int bucket = i & 3;
+      if (bucket == 0) shadowValue.x = min(shadowValue.x, shadowSample);
+      if (bucket == 1) shadowValue.y = min(shadowValue.y, shadowSample);
+      if (bucket == 2) shadowValue.z = min(shadowValue.z, shadowSample);
+      if (bucket == 3) shadowValue.w = min(shadowValue.w, shadowSample);
+    }
+  }
+
+  float result = dot(shadowValue, 0.25);
+  result = min(result, hardShadow);
+
+  float validSampleFade = saturate((float)validSamples / (float)sampleCount);
+  validSampleFade = validSampleFade * validSampleFade;
+  float directionalStrength = ndotl * validSampleFade;
+  return lerp(1.0, result, directionalStrength);
+}
+
 
 void main(
   float4 v0 : SV_Position0,
@@ -508,18 +624,13 @@ void main(
     r1.z = 0.100000001 * r3.w;
     int charShadowMode = clamp((int)round(shader_injection_data.char_shadow_mode), 0, 2);
     int charShadowType = clamp((int)round(shader_injection_data.char_shadow_type), 0, 2);
-    float charCameraStrength = saturate(shader_injection_data.char_shadow_camera_strength);
-    float charWorldStrength = saturate(shader_injection_data.char_shadow_world_strength);
-    float shadowWorld = 1.0;
-    float shadowCamera = 1.0;
+    float cameraStrength = saturate(shader_injection_data.char_shadow_camera_strength);
+    float worldStrength = saturate(shader_injection_data.char_shadow_world_strength);
+    float camShadowVal = 1.0;
+    float worldShadowVal = 1.0;
 
-    // Compute world-space shadow when mode 2 and type needs it
-    if (charShadowMode == 2) {
-      shadowWorld = ComputeCharacterSunShadow(v1.zw, r1.xyw);
-    }
-
-    // Compute camera/view-space shadow (vanilla raymarch) when mode 1, or mode 2 with type != 1
-    if ((charShadowMode == 1) || (charShadowMode == 2 && charShadowType != 1)) {
+    if (charShadowMode == 1) {
+      // Vanilla: game's native 10-step ray-march camera shadow
       r2.w = 1;
       r3.x = dot(r2.xyzw, viewInv_g._m00_m10_m20_m30);
       r3.y = dot(r2.xyzw, viewInv_g._m01_m11_m21_m31);
@@ -553,30 +664,29 @@ void main(
         r2.w = r3.x * 0.25 + r2.w;
         r4.x = (int)r4.x + 1;
       }
-      shadowCamera = 1 + -r2.w;
-      shadowCamera = max(0, shadowCamera);
-    }
-
-    // Blend shadow based on mode and type
-    if (charShadowMode == 0) {
-      r1.x = 1;
-    } else if (charShadowMode == 1) {
-      float charShadowStrength = saturate(shader_injection_data.char_shadow_strength);
-      r1.x = lerp(1.0, shadowCamera, charShadowStrength);
-    } else { // charShadowMode == 2
-      if (charShadowType == 0) {        // Camera View
-        float effStrength = charCameraStrength * saturate(shader_injection_data.char_shadow_strength);
-        r1.x = lerp(1.0, shadowCamera, effStrength);
-      } else if (charShadowType == 1) { // World View
-        float effStrength = charWorldStrength * saturate(shader_injection_data.char_shadow_strength);
-        r1.x = lerp(1.0, shadowWorld, effStrength);
-      } else {                          // Combined
-        float camResult = lerp(1.0, shadowCamera, charCameraStrength);
-        float worldResult = lerp(1.0, shadowWorld, charWorldStrength);
-        r1.x = min(camResult, worldResult);
-        float charShadowStrength = saturate(shader_injection_data.char_shadow_strength);
-        r1.x = lerp(1.0, r1.x, charShadowStrength);
+      r1.x = 1 + -r2.w;
+      r1.x = max(0, r1.x);
+    } else if (charShadowMode == 2) {
+      // Bend_SSS: use Sora-style algorithms, respecting char_shadow_type
+      if (charShadowType == 0 || charShadowType == 2) {
+        camShadowVal = ComputeKaiCameraShadow(v1.zw, r1.xyw);
       }
+      if (charShadowType == 1 || charShadowType == 2) {
+        worldShadowVal = ComputeCharacterSunShadow(v1.zw, r1.xyw);
+      }
+
+      camShadowVal = lerp(1.0, camShadowVal, cameraStrength);
+      worldShadowVal = lerp(1.0, worldShadowVal, worldStrength);
+
+      if (charShadowType == 0) {
+        r1.x = camShadowVal;
+      } else if (charShadowType == 1) {
+        r1.x = worldShadowVal;
+      } else {
+        r1.x = camShadowVal * worldShadowVal;
+      }
+    } else {
+      r1.x = 1;
     }
 
     r1.yw = float2(0.5,0.5) + -v1.zw;
