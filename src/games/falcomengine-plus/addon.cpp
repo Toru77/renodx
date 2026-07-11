@@ -212,6 +212,9 @@ ShaderInjectData shader_injection = {
   .gtvbao_poisson_luma_phi = 5.f,
   .gtvbao_poisson_depth_phi = 5.f,
   .gtvbao_poisson_normal_phi = 5.f,
+  .char_gtvbao_mode = 0.f,
+  .char_gtvbao_mask_strength = 0.f,
+  .char_gtvbgi_mask_strength = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -1089,6 +1092,25 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f && shader_injection.char_shadow_type != 0.f; },
       .parse = [](float v) { return v * 0.01f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharGTVBAOMode", .binding = &shader_injection.char_gtvbao_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Allow GTVBAO", .section = "Character Shadowing",
+      .labels = {"Off", "On", "Combined"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharGTVBAOMaskStr", .binding = &shader_injection.char_gtvbao_mask_strength,
+      .default_value = 0.f, .label = "GTVBAO Char Mask", .section = "Character Shadowing",
+      .min = 0.f, .max = 100.f,
+      .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f; },
+      .parse = [](float v) { return v * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CharGTVBGIMaskStr", .binding = &shader_injection.char_gtvbgi_mask_strength,
+      .default_value = 0.f, .label = "GTVBGI Char Mask", .section = "Character Shadowing",
+      .min = 0.f, .max = 100.f,
+      .parse = [](float v) { return v * 0.01f; },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowSampleCount", .binding = &shader_injection.char_shadow_sample_count,

@@ -579,6 +579,13 @@ void main(
       r4.yzw = r0.xyz * mapAOColor_g.xyz + -r0.xyz;
       r6.xyz = r1.www * r4.yzw + r0.xyz;
     }
+    // GTVBAO on characters — apply bitmask AO to character pixels
+    if (is_character_pixel && shader_injection_data.char_gtvbao_mode > 0.5f
+        && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
+      float gtvbaoCharMask = saturate(shader_injection_data.char_gtvbao_mask_strength);
+      float gtvbaoAO = lerp(r4.x, 1.0, gtvbaoCharMask);
+      r6.xyz *= gtvbaoAO;
+    }
     // Apply environment SSS early in pipeline (before other effects)
     ApplyEnvSSS(r6.xyz, v1.xy, mrt0_xy_raw, is_character_pixel);
 
@@ -607,7 +614,9 @@ void main(
       }
 
       // Character mask: reduce GI on characters by configured amount.
-      giColor *= (1.0 - shader_injection_data.vbgi_char_mask_strength);
+      if (is_character_pixel) {
+        giColor *= (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength));
+      }
       
       if (shader_injection_data.gtvbao_vbgi_debug > 0.5f) {
         r6.xyz = giColor;  // Debug: replace scene with GI texture

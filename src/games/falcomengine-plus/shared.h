@@ -240,6 +240,10 @@ struct ShaderInjectData {
   float gtvbao_poisson_luma_phi;    // [0.5..20], default 5 — luma/AO similarity falloff
   float gtvbao_poisson_depth_phi;   // [0.5..20], default 5 — depth similarity falloff
   float gtvbao_poisson_normal_phi;  // [0.5..20], default 5 — normal similarity falloff
+  // —— Character GTVBAO / GTVBGI ——
+  float char_gtvbao_mode;            // 0=Off, 1=On, 2=Combined
+  float char_gtvbao_mask_strength;   // [0..1], 0=full AO on chars, 1=no AO on chars
+  float char_gtvbgi_mask_strength;   // [0..1], 0=full GI on chars, 1=no GI on chars
 };
 
 #ifndef __cplusplus
