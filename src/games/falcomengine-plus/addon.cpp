@@ -893,13 +893,13 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeMethod", .binding = &g_char_vbgi_composite_method,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Apply Game VBGI", .section = "Character VBGI",
+      .default_value = 1.f, .label = "Apply Game SSGI", .section = "Character SSGI",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeStrength", .binding = &shader_injection.char_gi_strength,
-      .default_value = 3.0f, .label = "Strength", .section = "Character VBGI",
+      .default_value = 3.0f, .label = "Strength", .section = "Character SSGI",
       .tooltip = "Overall contribution scale for character GI.",
       .min = 0.f, .max = 3.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -907,7 +907,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeAlphaScale", .binding = &shader_injection.char_gi_alpha_scale,
-      .default_value = 1.0f, .label = "Alpha Scale", .section = "Character VBGI",
+      .default_value = 1.0f, .label = "Alpha Scale", .section = "Character SSGI",
       .tooltip = "Scales sampled SSGI alpha before blending.",
       .min = 0.f, .max = 3.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -915,7 +915,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeChroma", .binding = &shader_injection.char_gi_chroma_strength,
-      .default_value = 0.50f, .label = "Chroma", .section = "Character VBGI",
+      .default_value = 0.50f, .label = "Chroma", .section = "Character SSGI",
       .tooltip = "Scales colorful GI component; lower values reduce tinting.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -923,7 +923,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeLuma", .binding = &shader_injection.char_gi_luma_strength,
-      .default_value = 0.0f, .label = "Luma", .section = "Character VBGI",
+      .default_value = 0.0f, .label = "Luma", .section = "Character SSGI",
       .tooltip = "Scales neutral GI brightness; keep low to avoid white haze.",
       .min = 0.f, .max = 1.f, .format = "%.3f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -931,7 +931,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeShadowPower", .binding = &shader_injection.char_gi_shadow_power,
-      .default_value = 1.25f, .label = "Shadow Power", .section = "Character VBGI",
+      .default_value = 1.25f, .label = "Shadow Power", .section = "Character SSGI",
       .tooltip = "Higher values concentrate GI toward darker areas.",
       .min = 0.1f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -939,7 +939,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeDarkBoost", .binding = &shader_injection.char_gi_dark_boost,
-      .default_value = 0.0f, .label = "Dark Boost", .section = "Character VBGI",
+      .default_value = 0.0f, .label = "Dark Boost", .section = "Character SSGI",
       .tooltip = "Extra GI multiplier in darker regions (after shadow mask).",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -947,7 +947,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeBrightBoost", .binding = &shader_injection.char_gi_bright_boost,
-      .default_value = 3.0f, .label = "Bright Boost", .section = "Character VBGI",
+      .default_value = 3.0f, .label = "Bright Boost", .section = "Character SSGI",
       .tooltip = "Boosts GI on brighter regions (values above 1.0 increase bright-side contribution).",
       .min = 0.f, .max = 3.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -955,7 +955,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeHeadroomPower", .binding = &shader_injection.char_gi_headroom_power,
-      .default_value = 1.25f, .label = "Headroom Power", .section = "Character VBGI",
+      .default_value = 1.25f, .label = "Headroom Power", .section = "Character SSGI",
       .tooltip = "Controls how strongly bright pixels reject additional GI.",
       .min = 0.1f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -963,7 +963,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeMaxAdd", .binding = &shader_injection.char_gi_max_add,
-      .default_value = 0.020f, .label = "Max Add", .section = "Character VBGI",
+      .default_value = 0.020f, .label = "Max Add", .section = "Character SSGI",
       .tooltip = "Per-channel cap for added GI to prevent haze/bloomy washout.",
       .min = 0.f, .max = 1.f, .format = "%.3f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -971,7 +971,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositePeakLumaCap", .binding = &shader_injection.char_gi_peak_luma_cap,
-      .default_value = 0.0f, .label = "Peak Luma Cap", .section = "Character VBGI",
+      .default_value = 0.0f, .label = "Peak Luma Cap", .section = "Character SSGI",
       .tooltip = "Caps peak GI brightness on characters after blending weights. Set 0 to disable.",
       .min = 0.f, .max = 1.f, .format = "%.3f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -979,7 +979,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeDepthReject", .binding = &shader_injection.char_gi_depth_reject,
-      .default_value = 2.0f, .label = "Depth Reject", .section = "Character VBGI",
+      .default_value = 2.0f, .label = "Depth Reject", .section = "Character SSGI",
       .tooltip = "Higher values suppress GI across depth discontinuities and silhouette edges.",
       .min = 0.f, .max = 16.f, .format = "%.2f",
       .is_enabled = []() { return g_char_vbgi_composite_method >= 0.5f; },
@@ -1312,14 +1312,14 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality Level", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Quality Level", .section = "GTVBAO",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAODenoisePasses", .binding = &shader_injection.gtvbao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Denoise Passes", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Denoise Passes", .section = "GTVBAO",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1336,7 +1336,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Noise Type", .section = "GTVBAO",
+      .default_value = 0.f, .label = "Noise Type", .section = "GTVBAO",
       .tooltip = "IS-FAST = pre-computed blue noise (needs fast_noise_ea.dds). "
                  "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
                  "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
@@ -1457,7 +1457,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAODenoiserType", .binding = &shader_injection.gtvbao_denoiser_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Denoiser Type", .section = "GTVBAO",
+      .default_value = 0.f, .label = "Denoiser Type", .section = "GTVBAO",
       .tooltip = "Spatial: 5x5 edge-aware blur only. Spatio-Temporal: blends with previous frame for much higher stability on thin geometry. Poisson: disk sampling with luma/depth/normal similarity weights.",
       .labels = {"Spatial", "Spatio-Temporal", "Poisson"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
@@ -1499,7 +1499,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOTemporalFrames", .binding = &shader_injection.gtvbao_temporal_frame_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Temporal Frames", .section = "GTVBAO",
+      .default_value = 0.f, .label = "Temporal Frames", .section = "GTVBAO",
       .tooltip = "How many previous frames influence the result. 0-1 = off (spatial only). 2 = fast response. 8 = balanced (default). 16 = most stable, some ghosting.",
       .labels = {"0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_denoiser_type > 0.5f; },
@@ -1700,7 +1700,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIEnable", .binding = &shader_injection.vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "SSGI Enable", .section = "VBGI",
+      .default_value = 1.f, .label = "VBGI Enable", .section = "VBGI",
       .tooltip = "Visibility bitmask indirect diffuse GI. Requires GTVBAO mode = On.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
