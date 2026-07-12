@@ -115,6 +115,8 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_poisson_depth_phi;     // c[56] — [0.5..20], default 5
   float GTVBAO_poisson_normal_phi;    // c[57] — [0.5..20], default 5
   float GTVBAO_prefilter_enabled;      // c[58] — 0=Off, 1=On
+  float GTVBAO_exclude_foliage;        // c[59] — 0=Off, 1=On — skip AO on foliage
+  float GTVBAO_foliage_ao_value;       // c[60] — [0..1] — AO value for excluded foliage
 };
 
 // ── GI parameters are native cb_gtvbao fields (c[25]-c[33]) — no aliases needed.

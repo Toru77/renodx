@@ -223,6 +223,8 @@ ShaderInjectData shader_injection = {
   .brdf_roughness_min = 0.04f,
   .brdf_roughness_max = 1.f,
   .brdf_f0_source = 0.f,
+  .gtvbao_exclude_foliage = 0.f,
+  .gtvbao_foliage_ao_value = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -1637,6 +1639,23 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
+    // ── GTVBAO Foliage ──
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOExcludeFoliage", .binding = &shader_injection.gtvbao_exclude_foliage,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Exclude Foliage", .section = "GTVBAO",
+      .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOFoliageAOValue", .binding = &shader_injection.gtvbao_foliage_ao_value,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Foliage AO Value", .section = "GTVBAO",
+      .tooltip = "AO value assigned to excluded foliage pixels. 1.0 = no occlusion, 0.0 = fully occluded.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
+    },
     // ── BRDF Improvement ──
     new renodx::utils::settings::Setting{
       .key = "BRDFHammonDiffuse", .binding = &shader_injection.brdf_hammon_diffuse_enabled,
@@ -1658,7 +1677,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFMultiScatterSpecular", .binding = &shader_injection.brdf_multiscatter_specular_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
+      .default_value = 1.f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
       .tooltip = "Replaces Blinn-Phong specular with GGX D·V·F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
       .labels = {"Off", "On"},
     },
@@ -3248,6 +3267,9 @@ static std::array<float, 58> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[56] = std::clamp(shader_injection.gtvbao_poisson_depth_phi, 0.5f, 20.f);
   c[57] = std::clamp(shader_injection.gtvbao_poisson_normal_phi, 0.5f, 20.f);
   c[58] = shader_injection.gtvbao_prefilter_enabled;
+  // ── Foliage exclusion ──
+  c[59] = shader_injection.gtvbao_exclude_foliage;
+  c[60] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
   return c;
 }
 

@@ -132,9 +132,41 @@ void main(uint2 dt : SV_DispatchThreadID)
   }
   else
   {
-    GTVBAO_Denoise(dt * uint2(2, 1), consts,
-        g_srcWorkingAOTerm, g_srcWorkingEdges, g_samplerPointClamp,
-        g_outFinalAOTerm, true);
+    // ── Pre-filter: 3×3 depth-aware bilateral on raw AO ──
+    if (GTVBAO_prefilter_enabled > 0.5f) {
+      uint pf_w, pf_h;
+      g_srcWorkingAOTerm.GetDimensions(pf_w, pf_h);
+      [unroll]
+      for (int pf_side = 0; pf_side < 2; pf_side++) {
+        int2 pc = int2(dt.x * 2 + pf_side, dt.y);
+        if (pc.x >= (int)pf_w || pc.y >= (int)pf_h) continue;
+        float centerAO = (float)g_srcWorkingAOTerm.Load(int3(pc, 0)) * (1.0f / 255.0f);
+        float centerDepth = g_srcDepth.Load(int3(pc, 0));
+        float filteredSum = centerAO, filteredW = 1.0f;
+        [unroll]
+        for (int dy = -1; dy <= 1; dy++) {
+          [unroll]
+          for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            int2 npc = int2(pc.x + dx, pc.y + dy);
+            if (npc.x < 0 || npc.y < 0 || npc.x >= (int)pf_w || npc.y >= (int)pf_h) continue;
+            float nAO = (float)g_srcWorkingAOTerm.Load(int3(npc, 0)) * (1.0f / 255.0f);
+            float nDepth = g_srcDepth.Load(int3(npc, 0));
+            float depthW = exp(-abs(centerDepth - nDepth) * 10.0f);
+            filteredSum += nAO * depthW;
+            filteredW += depthW;
+          }
+        }
+        float filteredAO = filteredSum / max(filteredW, 1e-5f);
+        g_outFinalAOTerm[pc] = (uint)(saturate(filteredAO) * 255.0f + 0.5f);
+      }
+    }
+    else
+    {
+      GTVBAO_Denoise(dt * uint2(2, 1), consts,
+          g_srcWorkingAOTerm, g_srcWorkingEdges, g_samplerPointClamp,
+          g_outFinalAOTerm, true);
+    }
 
     if (GTVBAO_denoiser_type > 0.5f) {
     float2 vpSize = float2(width, height);

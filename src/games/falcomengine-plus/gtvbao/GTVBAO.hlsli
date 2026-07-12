@@ -393,6 +393,30 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
     outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
 
+    // ── Foliage early-out ──
+    // Foliage is forward-rendered so its material type isn't in the deferred mrt1.
+    // Instead, detect foliage by depth edge density: foliage has many depth discontinuities
+    // in a small neighborhood (alpha-tested leaves/branches) vs. solid geometry.
+    if (GTVBAO_exclude_foliage > 0.5f) {
+      float dzL = abs(viewspaceZ - pixLZ);
+      float dzR = abs(viewspaceZ - pixRZ);
+      float dzT = abs(viewspaceZ - pixTZ);
+      float dzB = abs(viewspaceZ - pixBZ);
+      float dzThreshold = 0.02f;  // viewspace depth delta threshold
+      uint edgeCount = 0u;
+      if (dzL > dzThreshold) edgeCount++;
+      if (dzR > dzThreshold) edgeCount++;
+      if (dzT > dzThreshold) edgeCount++;
+      if (dzB > dzThreshold) edgeCount++;
+      if (edgeCount >= 3u) {  // 3+ edges = likely foliage (alpha-tested surface)
+        outWorkingAOTerm[pixCoord] = (uint)(GTVBAO_foliage_ao_value * 255.0f);
+#ifdef GT_VBAO_COMPUTE_GI
+        outGI[pixCoord] = float4(0, 0, 0, 0);
+#endif
+        return;
+      }
+    }
+
 	// Generating screen space normals in-place is faster than generating normals in a separate pass but requires
 	// use of 32bit depth buffer (16bit works but visibly degrades quality) which in turn slows everything down. So to
 	// reduce complexity and allow for screen space normal reuse by other effects, we've pulled it out into a separate

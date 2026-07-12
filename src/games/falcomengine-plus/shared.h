@@ -254,6 +254,9 @@ struct ShaderInjectData {
   float brdf_roughness_min;                // [0..0.5] default 0.04
   float brdf_roughness_max;                // [0.5..1] default 1.0
   float brdf_f0_source;                    // reserved (0=specularColor)
+  // —— GTVBAO foliage ——
+  float gtvbao_exclude_foliage;            // 0=Off, 1=On — skip AO computation on foliage pixels
+  float gtvbao_foliage_ao_value;           // [0..1] default 1.0 — AO value for excluded foliage (1=no occlusion)
 };
 
 #ifndef __cplusplus
