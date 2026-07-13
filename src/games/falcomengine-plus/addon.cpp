@@ -215,7 +215,7 @@ ShaderInjectData shader_injection = {
   .char_gtvbao_mode = 0.f,
   .char_gtvbao_mask_strength = 0.f,
   .char_gtvbgi_mask_strength = 0.f,
-  .gtvbao_prefilter_enabled = 0.f,
+  .gtvbao_prefilter_enabled = 1.f,
   .brdf_hammon_diffuse_enabled = 0.f,
   .brdf_multiscatter_specular_enabled = 0.f,
   .brdf_diffuse_strength = 1.f,
@@ -3196,9 +3196,9 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 58> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 61> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f) {
-  std::array<float, 58> c = {};
+  std::array<float, 61> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -3581,7 +3581,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 57, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 61, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
@@ -3705,7 +3705,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame);
-    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 57, pc.data());
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 61, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -3765,7 +3765,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
       auto pc = BuildGTVBAOPushConstants(d, last);
-      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 57, pc.data());
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 61, pc.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;

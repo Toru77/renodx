@@ -158,7 +158,10 @@ void main(uint2 dt : SV_DispatchThreadID)
           }
         }
         float filteredAO = filteredSum / max(filteredW, 1e-5f);
-        g_outFinalAOTerm[pc] = (uint)(saturate(filteredAO) * 255.0f + 0.5f);
+        // Multiply back OCCLUSION_TERM_SCALE to undo pre-denoise division
+        // (matching GTVBAO_Output with finalApply=true)
+        filteredAO = saturate(filteredAO * GT_VBAO_OCCLUSION_TERM_SCALE);
+        g_outFinalAOTerm[pc] = (uint)(filteredAO * 255.0f + 0.5f);
       }
     }
     else
