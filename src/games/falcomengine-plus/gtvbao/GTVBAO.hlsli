@@ -366,11 +366,11 @@ lpfloat3x3 GTVBAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
 }
 
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
-    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges
+    Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges,
+    Texture2D<uint4> mrtNormalTexture
 #ifdef GT_VBAO_COMPUTE_GI
     , bool enableGI, float giIntensity,
     Texture2D<float4> lightBuffer, SamplerState lightSampler,
-    Texture2D<uint4> mrtNormalTexture,
     RWTexture2D<float4> outGI
     , RWTexture2D<float4> outDebug
 #endif
@@ -393,22 +393,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
     outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
 
-    // ── Foliage early-out ──
-    // Foliage is forward-rendered so its material type isn't in the deferred mrt1.
-    // Instead, detect foliage by depth edge density: foliage has many depth discontinuities
-    // in a small neighborhood (alpha-tested leaves/branches) vs. solid geometry.
+    // ── Foliage early-out (precise MRT1 material type check) ──
+    // The foliage pixel shaders (moving + static) write o1.w = 44 or 40
+    // to SV_Target1 (mrtNormalTexture). Check the material type directly
+    // instead of guessing from depth edges.
     if (GTVBAO_exclude_foliage > 0.5f) {
-      float dzL = abs(viewspaceZ - pixLZ);
-      float dzR = abs(viewspaceZ - pixRZ);
-      float dzT = abs(viewspaceZ - pixTZ);
-      float dzB = abs(viewspaceZ - pixBZ);
-      float dzThreshold = 0.02f;  // viewspace depth delta threshold
-      uint edgeCount = 0u;
-      if (dzL > dzThreshold) edgeCount++;
-      if (dzR > dzThreshold) edgeCount++;
-      if (dzT > dzThreshold) edgeCount++;
-      if (dzB > dzThreshold) edgeCount++;
-      if (edgeCount >= 3u) {  // 3+ edges = likely foliage (alpha-tested surface)
+      uint matType = mrtNormalTexture.Load(int3(pixCoord, 0)).w;
+      if (matType == 40 || matType == 44) {
         outWorkingAOTerm[pixCoord] = (uint)(GTVBAO_foliage_ao_value * 255.0f);
 #ifdef GT_VBAO_COMPUTE_GI
         outGI[pixCoord] = float4(0, 0, 0, 0);

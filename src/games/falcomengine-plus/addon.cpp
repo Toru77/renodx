@@ -1647,6 +1647,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFoliageAOValue", .binding = &shader_injection.gtvbao_foliage_ao_value,
@@ -1655,6 +1656,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "AO value assigned to excluded foliage pixels. 1.0 = no occlusion, 0.0 = fully occluded.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // ── BRDF Improvement ──
     new renodx::utils::settings::Setting{
@@ -1684,7 +1686,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.65f, .label = "Specular Blend", .section = "BRDF Improvement",
+      .default_value = 0.33f, .label = "Specular Blend", .section = "BRDF Improvement",
       .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
@@ -1701,7 +1703,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFRoughnessMax", .binding = &shader_injection.brdf_roughness_max,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Roughness Max", .section = "BRDF Improvement",
+      .default_value = 0.75f, .label = "Roughness Max", .section = "BRDF Improvement",
       .tooltip = "Clamp maximum perceptual roughness. 1.0 = no clamping.",
       .min = 0.5f, .max = 1.f, .format = "%.2f",
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1972,7 +1974,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Deferred Dispatch", .section = "CPU Opt",
+      .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
       .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default ON — avoids CS binding contamination.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -2674,48 +2676,57 @@ static void ApplyGTVBAOCSDispatchFix(
     renodx::utils::state::CommandListState& prev) {
   int fix = (int)g_gtvbao_cs_dispatch_fix;
   if (fix < 1 || fix > 3) {
-    // Fix 0 (Off): legacy behavior — just null pipeline + struct copy
+    // Fix 0 (Off): just null pipeline + struct copy
     cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
     if (cs) *cs = prev;
     return;
   }
 
+  // Fix 1/2/3: properly save and restore compute state
+  // GTVBAO binds descriptors via bind_descriptor_tables with a proper pipeline layout.
+  // We save the previous compute pipeline + descriptor tables, then restore them.
+  // This handles both "there were previous compute bindings" and "clean slate" cases.
+  reshade::api::pipeline prev_compute_pipeline = {0u};
+  reshade::api::pipeline_layout prev_layout = {0u};
+  std::vector<reshade::api::descriptor_table> prev_tables;
+  if (cs) {
+    auto it = cs->pipelines.find(reshade::api::pipeline_stage::all_compute);
+    if (it != cs->pipelines.end()) prev_compute_pipeline = it->second;
+    prev_layout = cs->compute_pipeline_layout;
+    prev_tables = cs->compute_descriptor_tables;
+  }
+
   if (fix == 2 || fix == 3) {
-    // Push null descriptors to all compute-stage slots used by GTVBAO
+    // Additionally null the individual compute slots (belt and suspenders)
     reshade::api::resource_view null_srv = {};
     reshade::api::resource_view null_uav = {};
-    reshade::api::resource_view null_cbv = {};
     reshade::api::sampler null_sampler = {};
-    // s0: sampler
     cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
         reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &null_sampler});
-    // b0: CBV
-    cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
-        reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &null_cbv});
-    // t0-t4: SRVs
     for (int i = 0; i < 5; ++i)
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
           reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &null_srv});
-    // u0-u3: UAVs
     for (int i = 0; i < 4; ++i)
       cmd_list->push_descriptors(reshade::api::shader_stage::all_compute,
           reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
-
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
   }
 
-  if (fix == 1 || fix == 3) {
-    // Restore previous state via Apply() — issues actual GPU commands
-    if (cs) {
-      prev.Apply(cmd_list);
-    } else {
-      cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, reshade::api::pipeline{0u});
-    }
+  // Restore previous compute descriptor tables (if any were bound)
+  if (prev_layout.handle != 0u && !prev_tables.empty()) {
+    cmd_list->bind_descriptor_tables(
+        reshade::api::shader_stage::all_compute,
+        prev_layout, 0,
+        static_cast<uint32_t>(prev_tables.size()),
+        prev_tables.data());
   }
+
+  // Restore previous compute pipeline (or null it)
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, prev_compute_pipeline);
+
+  if (cs) *cs = prev;
 }
 
 // ── Present hook ──

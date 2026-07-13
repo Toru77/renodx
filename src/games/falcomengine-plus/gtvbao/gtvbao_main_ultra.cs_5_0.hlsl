@@ -204,9 +204,9 @@ void main(uint2 p : SV_DispatchThreadID)
   GTVBAO_MainPass(p, slice_count, steps_per_slice, n, normal,
       consts, g_srcWorkingDepth, g_samplerPointClamp,
       g_outWorkingAOTerm, g_outWorkingEdges,
+      g_srcMrtNormal,
       (g_gi_enabled > 0.5f), g_gi_intensity,
       g_srcLightBuffer, g_samplerLightBuffer,
-      g_srcMrtNormal,
       g_outGI,
       g_outDebug);
 }
