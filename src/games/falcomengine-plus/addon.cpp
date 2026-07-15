@@ -76,6 +76,7 @@ ShaderInjectData shader_injection = {
   .env_sss_max_darkening = 0.40f,
   .env_sss_bright_reject_threshold = 0.19f,
   .env_sss_bright_reject_fade = 0.5f,
+  .env_sss_csm_gate = 0.f,
   .debug_show_env_sss = 0.f,
   .gtvbao_mode = 1.f,
   .gtvbao_quality_level = 2.f,
@@ -1295,6 +1296,15 @@ renodx::utils::settings::Settings settings = {
       .min = 0.01f, .max = 3.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
     .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "EnvSSSCSMGate", .binding = &shader_injection.env_sss_csm_gate,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "CSM Indoor Gate", .section = "Environment Screen Space Shadows",
+      .tooltip = "Skip screen-space shadows on pixels already in deep CSM shadow (prevents false shadows inside buildings).",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.env_sss_enabled >= 0.5f; },
+      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DebugShowEnvSSS", .binding = &shader_injection.debug_show_env_sss,
