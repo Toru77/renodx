@@ -1527,7 +1527,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
       .tooltip = "Mode 1: Uniform slices with per-slice weight. Mode 2: Ray projection from world-space lobe. Mode 3: CDF importance sampling (best quality/speed).",
       .labels = {"Weight", "Project", "CDF"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_cosine_enabled > 0.5f; },
@@ -1544,7 +1544,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAODepthMIPOffset", .binding = &shader_injection.gtvbao_depth_mip_offset,
-      .default_value = 2.5f, .label = "Depth MIP Offset", .section = "GTVBAO",
+      .default_value = 3.5f, .label = "Depth MIP Offset", .section = "GTVBAO",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
