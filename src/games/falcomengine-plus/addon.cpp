@@ -1328,10 +1328,10 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "LocalSSSEnable", .binding = &shader_injection.local_sss_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Local SSS", .section = "Local Screen Space Shadows",
+      .default_value = 1.f, .label = "Local SSS", .section = "Local Screen Space Shadows",
       .tooltip = "Enable Bend_SSS screen-space ray-march shadows for point/spot lights.",
       .labels = {"Off", "On"},
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
       .key = "LocalSSSStrength", .binding = &shader_injection.local_sss_strength,
