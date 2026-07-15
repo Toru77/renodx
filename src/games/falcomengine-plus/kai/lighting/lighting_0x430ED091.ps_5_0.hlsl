@@ -226,6 +226,7 @@ Texture3D<float2> isfast_noise : register(t24);
 
 #include "../../shared.h"
 #include "../../reference/rendering.hlsl"
+#include "../../reference/brdf.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -896,6 +897,13 @@ void main(
   r1.w = deferredParams_g[r1.x].ssaoIntensity;
   r3.w = deferredParams_g[r1.x].ssrDistance;
   r1.x = deferredParams_g[r1.x].flag;
+  // ── BRDF shared inputs (static) ──
+  float3 brdf_F0 = r9.xyz;
+  float3 brdf_N = r5.xyw;
+  float brdf_roughness = clamp(r13.z, shader_injection_data.brdf_roughness_min, shader_injection_data.brdf_roughness_max);
+  bool brdf_use_ggx = shader_injection_data.brdf_multiscatter_specular_enabled > 0.5f;
+  float brdf_specular_str = shader_injection_data.brdf_specular_strength;
+  // brdf_V and brdf_NdotV computed after r2 (world pos) is initialized below
   r11.w = r12.x;
   r15.xz = r11.yz;
   r15.yw = r12.yz;
@@ -910,6 +918,9 @@ void main(
   r11.z = dot(r2.xyzw, viewProjInv_g._m02_m12_m22_m32);
   r11.w = dot(r2.xyzw, viewProjInv_g._m03_m13_m23_m33);
   r2.xyzw = r11.xyzw / r11.wwww;
+  // ── BRDF view-dependent inputs (r2 = world position now valid) ──
+  float3 brdf_V = normalize(float3(viewInv_g._m30 - r2.x, viewInv_g._m31 - r2.y, viewInv_g._m32 - r2.z));
+  float brdf_NdotV = saturate(dot(brdf_N, brdf_V));
   r4.w = dot(view_g._m02_m12_m22_m32, r2.xyzw);
   r7.zw = lightTileSizeInv_g.xy * v0.xy;
   r7.zw = (uint2)r7.zw;
@@ -1461,12 +1472,20 @@ void main(
   r7.w = dot(r16.xyz, r16.xyz);
   r7.w = rsqrt(r7.w);
   r16.xyz = r16.xyz * r7.www;
+  float brdf_NdotL_sun = saturate(dot(brdf_N, -lightDirection_g.xyz));
   r7.w = lightSpecularGlossiness_g * r6.z;
-  r16.x = saturate(dot(r16.xyz, r5.xyw));
+  float brdf_NdotH_sun = saturate(dot(r16.xyz, r5.xyw));
   r7.w = max(0.00100000005, r7.w);
-  r16.x = log2(r16.x);
-  r7.w = r16.x * r7.w;
-  r7.w = exp2(r7.w);
+  r16.x = log2(brdf_NdotH_sun);
+  float brdf_blinn_sun = exp2(r16.x * r7.w);
+  if (brdf_use_ggx) {
+    float brdf_VdotH_sun = saturate(dot(brdf_V, r16.xyz));
+    float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun, brdf_VdotH_sun, brdf_roughness, brdf_F0);
+    brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun, brdf_roughness, brdf_F0);
+    r7.w = lerp(brdf_blinn_sun, brdf_ggx_sun.x * brdf_NdotL_sun, brdf_specular_str);
+  } else {
+    r7.w = brdf_blinn_sun;
+  }
   r7.w = r7.w * r8.w;
   r7.w = lightSpecularIntensity_g * r7.w;
   r7.w = r19.y ? r7.w : 0;
@@ -1699,6 +1718,9 @@ void main(
         r11.y = dynamicLights_g[lightIdx].color.y;
         r11.z = dynamicLights_g[lightIdx].color.z;
         r9.xyz = r11.xyz * r10.www + r9.xyz;
+        // Save light direction before H computation for NdotL
+        float3 brdf_pt_L = r10.xyz;
+        float brdf_NdotL_pt = saturate(dot(brdf_N, brdf_pt_L));
         r10.xyz = r17.xyz * r3.yyy + r10.xyz;
         r11.w = dot(r10.xyz, r10.xyz);
         r11.w = rsqrt(r11.w);
@@ -1706,11 +1728,20 @@ void main(
         r12.x = dynamicLights_g[lightIdx].specularIntensity;
         r12.y = dynamicLights_g[lightIdx].specularGlossiness;
         r9.w = r12.y * r6.z;
-        r10.x = saturate(dot(r10.xyz, r5.xyw));
+        float brdf_NdotH_pt = saturate(dot(r10.xyz, r5.xyw));
         r9.w = max(0.00100000005, r9.w);
-        r10.x = log2(r10.x);
-        r9.w = r10.x * r9.w;
-        r9.w = exp2(r9.w);
+        r10.x = log2(brdf_NdotH_pt);
+        float brdf_blinn_pt = exp2(r10.x * r9.w);
+        float spec_result_pt;
+        if (brdf_use_ggx) {
+          float brdf_VdotH_pt = saturate(dot(brdf_V, r10.xyz));
+          float3 brdf_ggx_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
+          brdf_ggx_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_roughness, brdf_F0);
+          spec_result_pt = lerp(brdf_blinn_pt, brdf_ggx_pt.x * brdf_NdotL_pt, brdf_specular_str);
+        } else {
+          spec_result_pt = brdf_blinn_pt;
+        }
+        r9.w = spec_result_pt;
         r10.xyz = r11.xyz * r9.www;
         r10.xyz = r10.xyz * r10.www;
         r8.xyz = r10.xyz * r12.xxx + r8.xyz;
@@ -1802,6 +1833,9 @@ void main(
           r13.z = dynamicLights_g[lightIdx].color.y;
           r13.w = dynamicLights_g[lightIdx].color.z;
           r11.xyz = r13.yzw * r10.www + r11.xyz;
+          // Save light direction before H computation for NdotL
+          float3 brdf_sp_L = r12.xyz;
+          float brdf_NdotL_sp = saturate(dot(brdf_N, brdf_sp_L));
           r12.xyz = r17.xyz * r3.yyy + r12.xyz;
           r11.w = dot(r12.xyz, r12.xyz);
           r11.w = rsqrt(r11.w);
@@ -1809,11 +1843,20 @@ void main(
           r14.x = dynamicLights_g[lightIdx].specularIntensity;
           r14.y = dynamicLights_g[lightIdx].specularGlossiness;
           r9.w = r14.y * r6.z;
-          r11.w = saturate(dot(r12.xyz, r5.xyw));
+          float brdf_NdotH_sp = saturate(dot(r12.xyz, r5.xyw));
           r9.w = max(0.00100000005, r9.w);
-          r11.w = log2(r11.w);
-          r9.w = r11.w * r9.w;
-          r9.w = exp2(r9.w);
+          r11.w = log2(brdf_NdotH_sp);
+          float brdf_blinn_sp = exp2(r11.w * r9.w);
+          float spec_result_sp;
+          if (brdf_use_ggx) {
+            float brdf_VdotH_sp = saturate(dot(brdf_V, r12.xyz));
+            float3 brdf_ggx_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
+            brdf_ggx_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_roughness, brdf_F0);
+            spec_result_sp = lerp(brdf_blinn_sp, brdf_ggx_sp.x * brdf_NdotL_sp, brdf_specular_str);
+          } else {
+            spec_result_sp = brdf_blinn_sp;
+          }
+          r9.w = spec_result_sp;
           r12.xyz = r13.yzw * r9.www;
           r12.xyz = r12.xyz * r10.www;
           r10.xyz = r12.xyz * r14.xxx + r10.xyz;
