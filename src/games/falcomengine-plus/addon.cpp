@@ -1544,7 +1544,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAODepthMIPOffset", .binding = &shader_injection.gtvbao_depth_mip_offset,
-      .default_value = 2.0f, .label = "Depth MIP Offset", .section = "GTVBAO",
+      .default_value = 2.5f, .label = "Depth MIP Offset", .section = "GTVBAO",
       .min = 2.0f, .max = 6.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },

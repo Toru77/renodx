@@ -109,6 +109,12 @@ float3 GTVBAO_ComputeViewspacePosition( const float2 screenPos, const float view
     return ret;
 }
 
+// ── Inverse of GTVBAO_ComputeViewspacePosition: view-space → screen-space UV ──
+float2 GTVBAO_ProjectViewToScreen(float3 viewPos, GTAOConstants consts) {
+    float2 ndc = viewPos.xy / max(viewPos.z, 1e-5f);
+    return (ndc - consts.NDCToViewAdd) / consts.NDCToViewMul;
+}
+
 float GTVBAO_ScreenSpaceToViewSpaceDepth( const float screenDepth, const GTAOConstants consts )
 {
     float depthLinearizeMul = consts.DepthUnpackConsts.x;
@@ -219,35 +225,26 @@ uint GTVBAO_UpdateSectors(float minHorizon, float maxHorizon, uint globalOcclude
 // GTVBAO helpers — Ground Truth Visibility Bitmask AO upgrades
 // ═══════════════════════════════════════════════════════════════
 
-// ── SinStep: C1-continuous sinusoid s-curve ──
+// ── SinStep: C1-continuous sinusoid s-curve (reference implementation) ──
 float GTVBAO_SinStep(float x) {
-    return x - sin(6.283185307f * x) * 0.159154943f;
+    return 0.5f - 0.5f * cos(x * GT_VBAO_PI);
 }
 
-// ── InvSinStep: inverse via Newton iteration ──
+// ── InvSinStep: analytic inverse (reference implementation) ──
 float GTVBAO_InvSinStep(float y) {
-    float x = y;
-    [unroll]
-    for (int i = 0; i < 3; i++) {
-        float fx = x - sin(6.283185307f * x) * 0.159154943f;
-        float dfx = 1.0f - cos(6.283185307f * x);
-        x = x - (fx - y) / max(dfx, 1e-5f);
-    }
-    return saturate(x);
+    return acos(1.0f - 2.0f * saturate(y)) * (1.0f / GT_VBAO_PI);
 }
 
-// ── QBias: quadratic bias for CDF morphing ──
+// ── QBias: quadratic bias for CDF morphing (reference implementation) ──
 float GTVBAO_QBias(float x, float b) {
-    float xx = x * x;
-    return xx / (2.0f * b * (1.0f - x) + xx);
+    return x + (x - x * x) * b;
 }
 
-// ── InvSinStep with stretch parameter ──
+// ── InvSinStep with stretch parameter (reference analytic formula) ──
 float GTVBAO_InvSinStepStretch(float y, float s) {
-    if (s < 0.001f) return y;
-    float stretched = y * s + (1.0f - s) * 0.5f;
-    float inv = GTVBAO_InvSinStep(stretched);
-    return saturate((inv - (1.0f - s) * 0.5f) / s);
+    if (s < 0.00001f) return y;
+    float u = asin(sin(s * GT_VBAO_PI * 0.5f) * (1.0f - 2.0f * y));
+    return 0.5f - u * (1.0f / (GT_VBAO_PI * s));
 }
 
 // ── Cosine-weighted slice sampling (Mode 3: CDF importance sampling, optimized) ──
@@ -261,8 +258,10 @@ float GTVBAO_SampleSliceCosine_Mode3(float rnd, float NdotV) {
 }
 
 // ── Cosine-weighted slice sampling (Mode 2: Ray projection) ──
-// Samples direction from cosine lobe around N, projects to screen-space slice angle.
-float GTVBAO_SampleSliceCosine_Mode2(float rnd0, float rnd1, float3 N_view, float3 viewVec) {
+// Samples direction from cosine lobe around N, projects to screen-space slice angle
+// with perspective correction (matching research paper reference implementation).
+float GTVBAO_SampleSliceCosine_Mode2(float rnd0, float rnd1, float3 N_view,
+    float3 pixCenterPos, float2 normalizedScreenPos, GTAOConstants consts) {
     // Sample from cosine lobe around N in view space
     float phi_lobe = 6.283185307f * rnd0;
     float cosTheta = sqrt(rnd1);
@@ -276,11 +275,17 @@ float GTVBAO_SampleSliceCosine_Mode2(float rnd0, float rnd1, float3 N_view, floa
     }
     B = cross(N_view, T);
     // Cosine-lobe direction in view space
-    float3 lobeDir = T * (sinTheta * cos(phi_lobe))
-                   + B * (sinTheta * sin(phi_lobe))
-                   + N_view * cosTheta;
-    // Slice direction is the XY screen-space component of the lobe direction
-    float phi = atan2(lobeDir.y, lobeDir.x);
+    float3 lobeDirVS = T * (sinTheta * cos(phi_lobe))
+                     + B * (sinTheta * sin(phi_lobe))
+                     + N_view * cosTheta;
+    // Project lobe direction to screen space with perspective correction
+    // (matches reference: SPos_from_VPos(positionVS + smplDirVS * nearZ*0.5) - SPos_from_VPos(positionVS))
+    float viewOffset = abs(pixCenterPos.z) * 0.01f;
+    float3 offsetPosVS = pixCenterPos + lobeDirVS * viewOffset;
+    float2 screenOffset = GTVBAO_ProjectViewToScreen(offsetPosVS, consts);
+    float2 screenDir = screenOffset - normalizedScreenPos;
+    // Convert screen-space direction to phi (matching omega = (cosPhi, -sinPhi) convention)
+    float phi = atan2(-screenDir.y, screenDir.x);
     if (phi < 0.0f) phi += GT_VBAO_PI;
     return phi;
 }
@@ -538,9 +543,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     // Mode 1: uniform, weight applied later
                     phi = sliceK * GT_VBAO_PI;
                 } else if (mode == 1) {
-                    // Mode 2: ray projection from cosine lobe
+                    // Mode 2: ray projection from cosine lobe with perspective correction
                     float rnd1 = frac(noiseSample + sliceK * 0.381966f);
-                    phi = GTVBAO_SampleSliceCosine_Mode2(rnd0, rnd1, (float3)viewspaceNormal, (float3)viewVec);
+                    phi = GTVBAO_SampleSliceCosine_Mode2(rnd0, rnd1, (float3)viewspaceNormal,
+                        pixCenterPos, normalizedScreenPos, consts);
                 } else {
                     // Mode 3 (default): CDF importance sampling
                     phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, NdotV);
