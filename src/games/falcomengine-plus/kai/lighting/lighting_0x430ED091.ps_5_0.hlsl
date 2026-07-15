@@ -1718,10 +1718,15 @@ void main(
         // ── Local SSS (Bend_SSS for point lights) ──
         if (shader_injection_data.local_sss_enabled > 0.5f
             && shader_injection_data.local_sss_light_type > 0.5f) {
-          float local_shadow = ComputeLocalShadow(v1.zw, r2.xyz, brdf_N,
-              dynamicLights_g[lightIdx].pos, dynamicLights_g[lightIdx].radius);
-          local_shadow = lerp(1.0, local_shadow, shader_injection_data.local_sss_strength);
-          r10.w *= local_shadow;
+          float3 lp_ls = dynamicLights_g[lightIdx].pos;
+          float lr_ls = dynamicLights_g[lightIdx].radius;
+          float ld_ls = length(lp_ls - r2.xyz);
+          float le_ls = shader_injection_data.local_sss_light_fade_end;
+          if (ld_ls < lr_ls * max(le_ls, 0.001f) * 1.1f) {
+            float local_shadow = ComputeLocalShadow(v1.zw, r2.xyz, brdf_N, lp_ls, lr_ls);
+            local_shadow = lerp(1.0, local_shadow, shader_injection_data.local_sss_strength);
+            r10.w *= local_shadow;
+          }
         }
         r11.x = dynamicLights_g[lightIdx].color.x;
         r11.y = dynamicLights_g[lightIdx].color.y;
@@ -1841,10 +1846,15 @@ void main(
           // ── Local SSS (Bend_SSS for spot lights) ──
           if (shader_injection_data.local_sss_enabled > 0.5f
               && shader_injection_data.local_sss_light_type != 1.0f) {
-            float local_shadow = ComputeLocalShadow(v1.zw, r2.xyz, brdf_N,
-                dynamicLights_g[lightIdx].pos, dynamicLights_g[lightIdx].radius);
-            local_shadow = lerp(1.0, local_shadow, shader_injection_data.local_sss_strength);
-            r10.w *= local_shadow;
+            float3 lp_ls = dynamicLights_g[lightIdx].pos;
+            float lr_ls = dynamicLights_g[lightIdx].radius;
+            float ld_ls = length(lp_ls - r2.xyz);
+            float le_ls = shader_injection_data.local_sss_light_fade_end;
+            if (ld_ls < lr_ls * max(le_ls, 0.001f) * 1.1f) {
+              float local_shadow = ComputeLocalShadow(v1.zw, r2.xyz, brdf_N, lp_ls, lr_ls);
+              local_shadow = lerp(1.0, local_shadow, shader_injection_data.local_sss_strength);
+              r10.w *= local_shadow;
+            }
           }
           r13.y = dynamicLights_g[lightIdx].color.x;
           r13.z = dynamicLights_g[lightIdx].color.y;

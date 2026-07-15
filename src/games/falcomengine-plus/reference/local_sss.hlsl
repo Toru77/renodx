@@ -26,30 +26,31 @@ static float ComputeLocalShadow(
   float surfaceThickness = max(shader_injection_data.local_sss_surface_thickness, 1e-5);
   float shadowContrast = max(shader_injection_data.local_sss_contrast, 0.0);
 
-  // ── Depth validity ──
-  float startDepth = depthTexture.SampleLevel(samPoint_s, uv, 0).x;
-  if (startDepth <= LOCAL_SSS_FAR_DEPTH_VALUE) return 1.0;
-
-  float normalLenSq = dot(normalWS, normalWS);
-  if (normalLenSq <= 1e-8) return 1.0;
-  float3 normalDirWS = normalWS * rsqrt(normalLenSq);
-
-  // ── Light direction and distance ──
+  // ── Light direction and distance (cheap, no texture read) ──
   float3 toLightWS = lightPos - worldPos;
   float lightDist = length(toLightWS);
   float lightDistInv = 1.0 / max(lightDist, 1e-5);
   float3 pixelToLightWS = toLightWS * lightDistInv;
+  float distNorm = lightDist / max(lightRadius, 1e-5);
+
+  // ── Light distance fade (skip SSS for far lights) ──
+  float lightFadeStart = shader_injection_data.local_sss_light_fade_start;
+  float lightFadeEnd = max(shader_injection_data.local_sss_light_fade_end, lightFadeStart + 1e-5);
+  float lightFade = 1.0 - smoothstep(lightFadeStart, lightFadeEnd, distNorm);
+  if (lightFade <= 1e-4) return 1.0;
+
+  // ── Normal validity ──
+  float normalLenSq = dot(normalWS, normalWS);
+  if (normalLenSq <= 1e-8) return 1.0;
+  float3 normalDirWS = normalWS * rsqrt(normalLenSq);
 
   // ── NdotL facing check ──
   float ndotl = saturate(abs(dot(normalDirWS, pixelToLightWS)));
   if (ndotl <= 0.001) return 1.0;
 
-  // ── Light distance fade (screen-space shadows degrade with distance) ──
-  float lightFadeStart = shader_injection_data.local_sss_light_fade_start;
-  float lightFadeEnd = max(shader_injection_data.local_sss_light_fade_end, lightFadeStart + 1e-5);
-  float distNorm = lightDist / max(lightRadius, 1e-5);
-  float lightFade = 1.0 - smoothstep(lightFadeStart, lightFadeEnd, distNorm);
-  if (lightFade <= 1e-4) return 1.0;
+  // ── Depth validity (texture read — deferred until after cheap early-outs) ──
+  float startDepth = depthTexture.SampleLevel(samPoint_s, uv, 0).x;
+  if (startDepth <= LOCAL_SSS_FAR_DEPTH_VALUE) return 1.0;
 
   // ── Occluder depth scale ──
   float occluderDepthScale = max(shader_injection_data.local_sss_occluder_depth_scale, 0.0);
@@ -76,17 +77,17 @@ static float ComputeLocalShadow(
   float4 shadowValue = 1.0;
   int validSamples = 0;
 
-  // ── Max ray distance: capped at light distance ──
-  float maxRayDist = lightDist * 0.99; // stop just before the light itself
+  // ── Max ray distance: capped at light distance (squared to avoid sqrt per sample) ──
+  float maxRayDistSq = lightDist * lightDist * 0.98;
 
   [loop]
   for (int i = 0; i < sampleCount; ++i) {
     float sampleIndex = (float)(i + 1);
     float3 samplePosWS = rayStartWS + rayStepWS * sampleIndex;
 
-    // Early out if we've passed the light
-    float sampleDist = length(samplePosWS - worldPos);
-    if (sampleDist > maxRayDist) {
+    // Early out if we've passed the light (squared distance, no sqrt)
+    float3 sampleDelta = samplePosWS - worldPos;
+    if (dot(sampleDelta, sampleDelta) > maxRayDistSq) {
       validSamples = max(validSamples, 1);
       break;
     }
