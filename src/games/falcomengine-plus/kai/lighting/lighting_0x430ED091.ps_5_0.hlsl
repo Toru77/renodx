@@ -227,6 +227,7 @@ Texture3D<float2> isfast_noise : register(t24);
 #include "../../shared.h"
 #include "../../reference/rendering.hlsl"
 #include "../../reference/brdf.hlsli"
+#include "../../reference/local_sss.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -1714,6 +1715,14 @@ void main(
         r11.y = dot(r10.xyz, r5.xyw);
         r10.w = max(r11.y, r10.w);
         r10.w = r11.x * r10.w;
+        // ── Local SSS (Bend_SSS for point lights) ──
+        if (shader_injection_data.local_sss_enabled > 0.5f
+            && shader_injection_data.local_sss_light_type > 0.5f) {
+          float local_shadow = ComputeLocalShadow(v1.zw, r2.xyz, brdf_N,
+              dynamicLights_g[lightIdx].pos, dynamicLights_g[lightIdx].radius);
+          local_shadow = lerp(1.0, local_shadow, shader_injection_data.local_sss_strength);
+          r10.w *= local_shadow;
+        }
         r11.x = dynamicLights_g[lightIdx].color.x;
         r11.y = dynamicLights_g[lightIdx].color.y;
         r11.z = dynamicLights_g[lightIdx].color.z;
@@ -1829,6 +1838,14 @@ void main(
           r11.w = dot(r12.xyz, r5.xyw);
           r11.w = max(r13.y, r11.w);
           r10.w = r11.w * r10.w;
+          // ── Local SSS (Bend_SSS for spot lights) ──
+          if (shader_injection_data.local_sss_enabled > 0.5f
+              && shader_injection_data.local_sss_light_type != 1.0f) {
+            float local_shadow = ComputeLocalShadow(v1.zw, r2.xyz, brdf_N,
+                dynamicLights_g[lightIdx].pos, dynamicLights_g[lightIdx].radius);
+            local_shadow = lerp(1.0, local_shadow, shader_injection_data.local_sss_strength);
+            r10.w *= local_shadow;
+          }
           r13.y = dynamicLights_g[lightIdx].color.x;
           r13.z = dynamicLights_g[lightIdx].color.y;
           r13.w = dynamicLights_g[lightIdx].color.z;

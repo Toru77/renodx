@@ -57,6 +57,19 @@ struct ShaderInjectData {
   // Debug view mode (0 = off, 1..4 = inspection views)
   float debug_show_env_sss;
 
+  // —— Local Screen Space Shadows (Bend_SSS for point/spot lights) ——
+  float local_sss_enabled;             // 0=Off, 1=On
+  float local_sss_strength;            // [0..1]
+  float local_sss_light_type;          // 0=Spot, 1=Point, 2=Both
+  float local_sss_sample_count;        // [1..64]
+  float local_sss_hard_shadow_samples; // 0=auto (sampleCount/8)
+  float local_sss_fade_out_samples;    // 0=auto (sampleCount/3)
+  float local_sss_surface_thickness;   // [0.001..0.2]
+  float local_sss_contrast;            // [0..12]
+  float local_sss_light_fade_start;    // [0..1]
+  float local_sss_light_fade_end;      // [0..1]
+  float local_sss_occluder_depth_scale;// [0..4]
+
   // —— GTVBAO (Visibility Bitmask AO + optional VBGI) ——
   float gtvbao_mode;                // 0=Off (vanilla AO), 1=On (Bitmask AO)
   float gtvbao_quality_level;       // 0=Low, 1=Medium, 2=High, 3=Ultra
