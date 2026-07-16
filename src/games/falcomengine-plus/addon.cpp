@@ -402,9 +402,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet main_tables = {};
   GTVBAODescriptorTableSet denoise_tables = {};
 
-  // Foliage mask descriptor tables (separate set — uses foliage_mask_layout)
-  GTVBAODescriptorTableSet foliage_mask_tables = {};
-
   reshade::api::resource_view captured_depth_srv = {};
   reshade::api::resource_view captured_ssao_srv = {};
   reshade::api::resource_view captured_mrt_normal_srv = {};
@@ -446,12 +443,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet multibounce_tables = {};
   bool vbgi_denoised_valid = false;            // true after first denoise completes
   reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
-  // ── Foliage mask (R8_UINT, working resolution, pre-pass) ──
+  // ── Foliage mask (quarter-res R8_UINT, pre-pass) ──
   reshade::api::resource foliage_mask_texture = {};
   reshade::api::resource_view foliage_mask_srv = {};
   reshade::api::resource_view foliage_mask_uav = {};
   reshade::api::pipeline_layout foliage_mask_layout = {};
   reshade::api::pipeline foliage_mask_pipeline = {};
+  GTVBAODescriptorTableSet foliage_mask_tables = {};
   // ── Debug UAV (bitmask debug views 6-8) ──
   reshade::api::resource debug_texture = {};
   reshade::api::resource_view debug_srv = {};
@@ -463,6 +461,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool isfast_texture_loaded = false;
   bool isfast_texture_attempted = false;  // only try DDS load once
   bool vbgi_bound = false;
+  bool foliage_drawn_this_frame = false;  // set by foliage shader on_draw, reset per frame
 
   // CPU optimization tracking
   uint64_t last_bound_pipeline_handle = 0u;
@@ -624,6 +623,14 @@ static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+// ── Foliage draw tracking (for GTVBAO foliage exclusion performance) ──
+static bool OnBeforeFoliageDraw(reshade::api::command_list* cmd_list) {
+  auto* device = cmd_list->get_device();
+  auto* data = device->get_private_data<DeviceData>();
+  if (data) data->foliage_drawn_this_frame = true;
+  return true;
+}
+
 // ═══════════ Custom shaders ═══════════
 
 renodx::mods::shader::CustomShaders custom_shaders = {
@@ -658,7 +665,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0x4942F14Cu,
             .code = __0x4942F14C,
-            .on_draw = [](reshade::api::command_list*) { return true; },
+            .on_draw = OnBeforeFoliageDraw,
         },
     },
     {
@@ -666,7 +673,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0x9645D00Fu,
             .code = __0x9645D00F,
-            .on_draw = [](reshade::api::command_list*) { return true; },
+            .on_draw = OnBeforeFoliageDraw,
         },
     },
     // ── Sora clutter/flower foliage ──
@@ -675,7 +682,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0x68C07DEAu,
             .code = __0x68C07DEA,
-            .on_draw = [](reshade::api::command_list*) { return true; },
+            .on_draw = OnBeforeFoliageDraw,
         },
     },
     {
@@ -683,7 +690,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0xBA6CE3DAu,
             .code = __0xBA6CE3DA,
-            .on_draw = [](reshade::api::command_list*) { return true; },
+            .on_draw = OnBeforeFoliageDraw,
         },
     },
     // ── Sora potflower foliage ──
@@ -692,7 +699,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0xAAAD1F02u,
             .code = __0xAAAD1F02,
-            .on_draw = [](reshade::api::command_list*) { return true; },
+            .on_draw = OnBeforeFoliageDraw,
         },
     },
     // ── Kai foliage (GTVBAO foliage marker) ──
@@ -3360,7 +3367,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
      &d->vbgi_output_texture, &d->vbgi_output_srv, &d->vbgi_output_uav);
   mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->vbgi_denoised_texture, &d->vbgi_denoised_srv, &d->vbgi_denoised_uav);
-  // Foliage mask (R8_UINT, working resolution) — consumed by main pass at t4
+  // Foliage mask (full-res R8_UINT)
   mk(w, h, reshade::api::format::r8_uint,
      &d->foliage_mask_texture, &d->foliage_mask_srv, &d->foliage_mask_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
@@ -3577,12 +3584,11 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   };
 
   if (!make_layout(1u, kGTVBAODepthMipLevels, &d->prefilter_layout)) return false;
-  // Foliage mask pipeline (t0=depth, t1=MRT normal → u0=foliage mask)
+  // Foliage mask (t0=depth, t1=MRT normal → u0=foliage mask)
   if (!make_layout(2u, 1u, &d->foliage_mask_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables);
   if (!d->foliage_mask_pipeline.handle)
     mkcs(__gtvbao_foliage_mask, "main", d->foliage_mask_layout, &d->foliage_mask_pipeline);
-
   // Main: 5 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise, foliage mask) + 4 UAVs (AO, edges, GI, debug)
   if (!make_layout(5u, 4u, &d->main_layout)) return false;
   // Denoise: 6 SRVs (AO, edges, raw GI, history AO, depth mip, MRT normal) + 3 UAVs (denoised AO, denoised GI, history AO)
@@ -3768,6 +3774,10 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   uint32_t w = d->working_width, h = d->working_height;
   if (w < 64 || h < 64) return false;
 
+  // Save + reset per-frame foliage tracking (set true in foliage shader on_draw callbacks)
+  bool had_foliage_draws = d->foliage_drawn_this_frame;
+  d->foliage_drawn_this_frame = false;
+
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
       (std::string("[GTVBAO] RunGTVBAO: dispatching pass 1 (") +
@@ -3874,16 +3884,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     }
   }
 
-  // ── Foliage mask pre-pass (per-pixel, reads MRT normal, writes R8_UINT mask) ──
-  if (shader_injection.gtvbao_exclude_foliage > 0.5f
-      && d->foliage_mask_pipeline.handle
-      && d->foliage_mask_uav.handle
+  // ── Foliage mask pre-pass (full-res, reads MRT normal, writes R8_UINT) ──
+  if (had_foliage_draws && shader_injection.gtvbao_exclude_foliage > 0.5f
+      && d->foliage_mask_pipeline.handle && d->foliage_mask_uav.handle
       && d->captured_mrt_normal_srv.handle) {
+    uint32_t mkW = w, mkH = h;
     bind_pipe(d->foliage_mask_pipeline);
-    // Bind depth (t0), MRT normal (t1), mask UAV (u0).
-    // The shader writes every pixel — dispatching over full working resolution guarantees coverage.
     reshade::api::resource_view fm_srvs[2] = {
-        d->depth_mips_srv,                          // t0 — working depth (for GetDimensions / dispatch bounds)
+        d->depth_mips_srv,                          // t0 — working depth (GetDimensions)
         d->captured_mrt_normal_srv                  // t1 — G-buffer normal (bit 15 test)
     };
     reshade::api::descriptor_table_update fu[4] = {
@@ -3895,7 +3903,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d, false);
     cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 61, pc.data());
-    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
     bar(d->foliage_mask_texture, UA, SR);
   }
 

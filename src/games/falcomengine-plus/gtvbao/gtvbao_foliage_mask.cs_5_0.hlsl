@@ -19,14 +19,14 @@ SamplerState g_samplerPointClamp : register(s0);
 [numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]
 void main(uint2 p : SV_DispatchThreadID)
 {
-    uint width, height;
-    g_srcWorkingDepth.GetDimensions(width, height);
-    if (p.x >= width || p.y >= height) return;
+    uint maskW, maskH;
+g_outFoliageMask.GetDimensions(maskW, maskH);
+if (p.x >= maskW || p.y >= maskH) return;
 #ifndef RENODX_KAI
     if (GTVBAO_exclude_foliage > 0.5f) {
         uint mrtW, mrtH;
         g_srcMrtNormal.GetDimensions(mrtW, mrtH);
-        float2 mrtScale = float2(mrtW, mrtH) / max(float2(width, height), 1.0.xx);
+        float2 mrtScale = float2(mrtW, mrtH) / max(float2(maskW, maskH), 1.0.xx);
         int2 mrtTC = min(int2(floor((float2(p) + 0.5) * mrtScale)), int2(mrtW - 1, mrtH - 1));
         if (g_srcMrtNormal.Load(int3(mrtTC, 0)).w & 0x8000u) {
             g_outFoliageMask[p] = 1u;
