@@ -237,6 +237,10 @@ ShaderInjectData shader_injection = {
   .brdf_f0_source = 0.f,
   .gtvbao_exclude_foliage = 1.f,
   .gtvbao_foliage_ao_value = 1.f,
+  .foliage_grass_ao_enabled = 0.f,
+  .foliage_grass_ao_base = 0.25f,
+  .foliage_grass_ao_tip = 1.f,
+  .foliage_grass_ao_curve = 0.5f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -662,6 +666,32 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0x9645D00Fu,
             .code = __0x9645D00F,
+            .on_draw = [](reshade::api::command_list*) { return true; },
+        },
+    },
+    // ── Sora clutter/flower foliage ──
+    {
+        0x68C07DEAu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x68C07DEAu,
+            .code = __0x68C07DEA,
+            .on_draw = [](reshade::api::command_list*) { return true; },
+        },
+    },
+    {
+        0xBA6CE3DAu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xBA6CE3DAu,
+            .code = __0xBA6CE3DA,
+            .on_draw = [](reshade::api::command_list*) { return true; },
+        },
+    },
+    // ── Sora potflower foliage ──
+    {
+        0xAAAD1F02u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xAAAD1F02u,
+            .code = __0xAAAD1F02,
             .on_draw = [](reshade::api::command_list*) { return true; },
         },
     },
@@ -1808,6 +1838,42 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blends foliage AO toward fully bright. 1.0 = keep normal GTVBAO AO (like foliage exclusion OFF). 0.0 = no AO on foliage (fully bright).",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    // ── Foliage Grass AO ──
+    new renodx::utils::settings::Setting{
+      .key = "FoliageGrassAOEnabled", .binding = &shader_injection.foliage_grass_ao_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Grass AO", .section = "Foliage Grass AO",
+      .tooltip = "Per-blade vertical AO gradient: dark at root, bright at tip. Replaces noisy SSAO/GTAO on foliage with a stable bake. (Ghost of Tsushima §1.5e-ii)",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FoliageGrassAOBase", .binding = &shader_injection.foliage_grass_ao_base,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.15f, .label = "Grass AO Base", .section = "Foliage Grass AO",
+      .tooltip = "AO multiplier at the blade root. Lower = darker base (more self-occlusion).",
+      .min = 0.f, .max = 0.8f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FoliageGrassAOTip", .binding = &shader_injection.foliage_grass_ao_tip,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.33f, .label = "Grass AO Tip", .section = "Foliage Grass AO",
+      .tooltip = "AO multiplier at the blade tip. Values > 1.0 slightly brighten the tip (rim-light effect).",
+      .min = 0.5f, .max = 1.5f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FoliageGrassAOCurve", .binding = &shader_injection.foliage_grass_ao_curve,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.33f, .label = "Grass AO Curve", .section = "Foliage Grass AO",
+      .tooltip = "Power curve exponent. <1.0 = darkening concentrated at base (recommended). 1.0 = linear. >1.0 = darkening extends further up the blade.",
+      .min = 0.1f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // ── BRDF Improvement ──

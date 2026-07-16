@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Sun Mar 22 00:32:12 2026
+// ---- Created with 3Dmigoto v1.4.1 on Thu Jul 16 16:54:55 2026
 
 struct InstanceParam
 {
@@ -86,17 +86,22 @@ cbuffer cb_local : register(b5)
   float dynamicLightIntensity_g : packoffset(c6.y);
   float fresnel0_g : packoffset(c6.z);
   float specularGlossiness0_g : packoffset(c6.w);
-  float shakeScale_g : packoffset(c7);
-  float shakeSpeed_g : packoffset(c7.y);
-  float shakeFlexibility_g : packoffset(c7.z);
-  float shakeFreq_g : packoffset(c7.w);
-  float shakeWindScale_g : packoffset(c8);
-  float shadowCastOffset_g : packoffset(c8.y);
-  float volumeFogInvalidity_g : packoffset(c8.z);
+  float alphaTestThreshold_g : packoffset(c7);
+  float shakeScale_g : packoffset(c7.y);
+  float shakeSpeed_g : packoffset(c7.z);
+  float shakeFlexibility_g : packoffset(c7.w);
+  float shakeFreq_g : packoffset(c8);
+  float shakeWindScale_g : packoffset(c8.y);
+  float shadowCastOffset_g : packoffset(c8.z);
+  float volumeFogInvalidity_g : packoffset(c8.w);
 }
 
 SamplerState Smpl0_s : register(s0);
+SamplerState Smpl3_s : register(s3);
+SamplerState Smpl6_s : register(s6);
 Texture2D<float4> Tex0 : register(t0);
+Texture2D<float4> Tex3 : register(t3);
+Texture2D<float4> Tex6 : register(t6);
 StructuredBuffer<InstanceParam> instances_g : register(t15);
 
 #include "../../shared.h"
@@ -109,9 +114,9 @@ StructuredBuffer<InstanceParam> instances_g : register(t15);
 void main(
   float4 v0 : SV_Position0,
   float4 v1 : NORMAL0,
-  float4 v2 : TEXCOORD0,
-  float4 v3 : TEXCOORD1,
-  float4 v4 : TEXCOORD4,
+  float4 v2 : TANGENT0,
+  float4 v3 : TEXCOORD0,
+  float4 v4 : TEXCOORD1,
   nointerpolation uint4 v5 : TEXCOORD6,
   float4 v6 : TEXCOORD7,
   float4 v7 : TEXCOORD8,
@@ -126,11 +131,11 @@ void main(
                               { 0, 1.000000, 0, 0},
                               { 0, 0, 1.000000, 0},
                               { 0, 0, 0, 1.000000} };
-  float4 r0,r1,r2,r3;
+  float4 r0,r1,r2,r3,r4;
   uint4 bitmask, uiDest;
   float4 fDest;
 
-  r0.x = dot(v2.xyz, clipPlane_g.xyz);
+  r0.x = dot(v3.xyz, clipPlane_g.xyz);
   r0.x = -clipPlane_g.w + r0.x;
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
@@ -151,9 +156,9 @@ void main(
   r1.z = instances_g[v5.x].param.z;
   r0.z = cmp(0 < r1.z);
   r0.x = r0.z ? r0.y : r0.x;
-  r2.x = viewInv_g._m30 + -v2.x;
-  r2.y = viewInv_g._m31 + -v2.y;
-  r2.z = viewInv_g._m32 + -v2.z;
+  r2.x = viewInv_g._m30 + -v3.x;
+  r2.y = viewInv_g._m31 + -v3.y;
+  r2.z = viewInv_g._m32 + -v3.z;
   r0.y = dot(r2.xyz, r2.xyz);
   r0.y = sqrt(r0.y);
   r0.y = r0.y + -r1.x;
@@ -161,29 +166,37 @@ void main(
   r0.y = min(1, r0.y);
   r0.y = max(disableMapObjNearFade_g, r0.y);
   r0.y = mapColor_g.w * r0.y;
-  r0.x = r0.y * v4.w + -r0.x;
-  r0.y = v4.w * r0.y;
+  r1.x = instances_g[v5.x].color.x;
+  r1.y = instances_g[v5.x].color.y;
+  r1.z = instances_g[v5.x].color.z;
+  r1.w = instances_g[v5.x].color.w;
+  r1.w = opacity_g * r1.w;
+  r0.x = r0.y * r1.w + -r0.x;
+  r0.y = r1.w * r0.y;
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
-  r0.x = 1 & swizzle_flags_g;
-  r0.zw = v3.xy * float2(1,-1) + float2(0,1);
-  r1.xyzw = Tex0.Sample(Smpl0_s, r0.zw).xyzw;
-  r2.x = r1.x;
-  r2.w = 1;
-  r1.xyzw = r0.xxxx ? r2.xxxw : r1.xyzw;
-  o0.xyzw = v4.xyzw * r1.xyzw;
-  o0.rgb = ApplyFoliageAO(o0.rgb, v3.y);
-  r1.xyz = v2.xyz;
+  r0.w = 1;
+  r2.xy = int2(1,64) & swizzle_flags_g;
+  r2.zw = v4.xy * float2(1,-1) + float2(0,1);
+  r3.xyzw = Tex0.Sample(Smpl0_s, r2.zw).xyzw;
+  r0.x = r3.x;
+  r3.xyzw = r2.xxxx ? r0.xxxw : r3.xyzw;
+  r0.x = -alphaTestThreshold_g + r3.w;
+  o0.xyzw = r3.xyzw * r1.xyzw;
+  r0.x = cmp(r0.x < 0);
+  if (r0.x != 0) discard;
+  o0.rgb = ApplyFoliageAO(o0.rgb, v4.y);
+  r1.xyz = v3.xyz;
   r1.w = 1;
   r0.x = dot(r1.xyzw, view_g._m00_m10_m20_m30);
-  r2.z = ddy_coarse(r0.x);
-  r3.w = ddx_coarse(r0.x);
+  r3.z = ddy_coarse(r0.x);
+  r4.w = ddx_coarse(r0.x);
   r0.x = dot(r1.xyzw, view_g._m01_m11_m21_m31);
   r0.z = dot(r1.xyzw, view_g._m02_m12_m22_m32);
-  r2.yw = ddy_coarse(r0.zx);
-  r3.yz = ddx_coarse(r0.xz);
-  r0.xzw = r3.yzw * r2.yzw;
-  r0.xzw = r2.wyz * r3.zwy + -r0.xzw;
+  r3.yw = ddy_coarse(r0.zx);
+  r4.yz = ddx_coarse(r0.xz);
+  r0.xzw = r4.yzw * r3.yzw;
+  r0.xzw = r3.wyz * r4.zwy + -r0.xzw;
   r1.x = dot(r0.xzw, r0.xzw);
   r1.x = rsqrt(r1.x);
   r1.yzw = r1.xxx * r0.xzw;
@@ -216,9 +229,28 @@ void main(
   r0.xz = (uint2)r0.xz;
   r0.xz = min(uint2(255,255), (uint2)r0.xz);
   o1.z = mad((int)r0.z, 256, (int)r0.x);
-  r0.x = dot(v1.xyz, v1.xyz);
+  r0.x = dot(v2.xyz, v2.xyz);
   r0.x = rsqrt(r0.x);
-  r1.yzw = v1.xyz * r0.xxx;
+  r0.xzw = v2.xyz * r0.xxx;
+  r1.y = v1.w;
+  r1.z = v2.w;
+  r1.w = v3.w;
+  r1.x = dot(r1.yzw, r1.yzw);
+  r1.x = rsqrt(r1.x);
+  r1.xyz = r1.yzw * r1.xxx;
+  r3.xyz = Tex3.Sample(Smpl3_s, r2.zw).xyz;
+  r2.xzw = Tex6.Sample(Smpl6_s, r2.zw).xyz;
+  r2.xyz = saturate(r2.yyy ? r2.xxx : r2.xzw);
+  r3.xyz = r3.xyz * float3(2,2,2) + float3(-1,-1,-1);
+  r1.xyz = r3.yyy * r1.xyz;
+  r0.xzw = r3.xxx * r0.xzw + r1.xyz;
+  r1.x = dot(v1.xyz, v1.xyz);
+  r1.x = rsqrt(r1.x);
+  r1.xyz = v1.xyz * r1.xxx;
+  r0.xzw = r3.zzz * r1.xyz + r0.xzw;
+  r1.x = dot(r0.xzw, r0.xzw);
+  r1.x = rsqrt(r1.x);
+  r1.yzw = r1.xxx * r0.xzw;
   r0.x = max(abs(r1.z), abs(r1.y));
   r0.x = 1 / r0.x;
   r0.z = min(abs(r1.z), abs(r1.y));
@@ -230,8 +262,8 @@ void main(
   r0.z = r0.z * r0.w + 0.999866009;
   r0.w = r0.x * r0.z;
   r0.w = r0.w * -2 + 1.57079637;
-  r2.x = cmp(abs(r1.y) < abs(r1.z));
-  r0.w = r2.x ? r0.w : 0;
+  r3.x = cmp(abs(r1.y) < abs(r1.z));
+  r0.w = r3.x ? r0.w : 0;
   r0.x = r0.x * r0.z + r0.w;
   r0.z = cmp(r1.y < -r1.y);
   r0.z = r0.z ? -3.141593 : 0;
@@ -259,9 +291,8 @@ void main(
   r0.xy = r0.xx * float2(0.5,-0.5) + float2(0.5,0.5);
   r0.y = max(r0.x, r0.y);
   r0.y = r0.y + -r0.x;
-  r0.w = saturate(translucency_g * r0.y + r0.x);
-  r0.xyz = float3(255,255,255);
-  r0.xyzw = float4(1,1,1,255) * r0.xyzw;
+  r2.w = saturate(translucency_g * r0.y + r0.x);
+  r0.xyzw = float4(255,255,255,255) * r2.xyzw;
   o2.xyzw = (uint4)r0.xyzw;
   o3.x = materialID_g;
   r0.xy = v6.xy / v6.ww;

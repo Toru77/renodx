@@ -271,6 +271,11 @@ struct ShaderInjectData {
   // —— GTVBAO foliage ——
   float gtvbao_exclude_foliage;            // 0=Off, 1=On — skip AO computation on foliage pixels
   float gtvbao_foliage_ao_value;           // [0..1] default 1.0 — 1=keep normal AO, 0=no AO (fully bright)
+  // —— Foliage Grass AO ——
+  float foliage_grass_ao_enabled;          // 0=Off, 1=On
+  float foliage_grass_ao_base;             // AO at root [0..1] default 0.25
+  float foliage_grass_ao_tip;              // AO at tip [0..1] default 1.0
+  float foliage_grass_ao_curve;            // power exponent [0.1..2] default 0.5
 };
 
 #ifndef __cplusplus
