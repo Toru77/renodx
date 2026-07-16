@@ -237,7 +237,7 @@ void main(
   r0.xy = float2(127.5,127.5) * r0.xy;
   r0.xy = (uint2)r0.xy;
   r0.xy = min(uint2(255,255), (uint2)r0.xy);
-  o1.w = mad((int)r0.y, 256, (int)r0.x);
+  o1.w = mad((int)r0.y, 256, (int)r0.x) | 0x8000u;  // bit 15 = foliage marker for GTVBAO (Sora only; Kai disabled via RENODX_KAI guard)
   r0.x = dot(v1.xyz, v1.xyz);
   r0.x = rsqrt(r0.x);
   r0.xyz = v1.xyz * r0.xxx;

@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Sun Mar 22 00:32:12 2026
+// ---- Created with 3Dmigoto v1.4.1 on Thu Jul 16 16:07:42 2026
 
 struct InstanceParam
 {
@@ -86,13 +86,14 @@ cbuffer cb_local : register(b5)
   float dynamicLightIntensity_g : packoffset(c6.y);
   float fresnel0_g : packoffset(c6.z);
   float specularGlossiness0_g : packoffset(c6.w);
-  float shakeScale_g : packoffset(c7);
-  float shakeSpeed_g : packoffset(c7.y);
-  float shakeFlexibility_g : packoffset(c7.z);
-  float shakeFreq_g : packoffset(c7.w);
-  float shakeWindScale_g : packoffset(c8);
-  float shadowCastOffset_g : packoffset(c8.y);
-  float volumeFogInvalidity_g : packoffset(c8.z);
+  float alphaTestThreshold_g : packoffset(c7);
+  float shakeScale_g : packoffset(c7.y);
+  float shakeSpeed_g : packoffset(c7.z);
+  float shakeFlexibility_g : packoffset(c7.w);
+  float shakeFreq_g : packoffset(c8);
+  float shakeWindScale_g : packoffset(c8.y);
+  float shadowCastOffset_g : packoffset(c8.z);
+  float volumeFogInvalidity_g : packoffset(c8.w);
 }
 
 SamplerState Smpl0_s : register(s0);
@@ -109,7 +110,7 @@ void main(
   float4 v1 : NORMAL0,
   float4 v2 : TEXCOORD0,
   float4 v3 : TEXCOORD1,
-  float4 v4 : TEXCOORD4,
+  float4 v4 : TEXCOORD3,
   nointerpolation uint4 v5 : TEXCOORD6,
   float4 v6 : TEXCOORD7,
   float4 v7 : TEXCOORD8,
@@ -159,17 +160,25 @@ void main(
   r0.y = min(1, r0.y);
   r0.y = max(disableMapObjNearFade_g, r0.y);
   r0.y = mapColor_g.w * r0.y;
-  r0.x = r0.y * v4.w + -r0.x;
-  r0.y = v4.w * r0.y;
+  r1.x = instances_g[v5.x].color.x;
+  r1.y = instances_g[v5.x].color.y;
+  r1.z = instances_g[v5.x].color.z;
+  r1.w = instances_g[v5.x].color.w;
+  r1.w = opacity_g * r1.w;
+  r0.x = r0.y * r1.w + -r0.x;
+  r0.y = r1.w * r0.y;
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
   r0.x = 1 & swizzle_flags_g;
   r0.zw = v3.xy * float2(1,-1) + float2(0,1);
-  r1.xyzw = Tex0.Sample(Smpl0_s, r0.zw).xyzw;
-  r2.x = r1.x;
-  r2.w = 1;
-  r1.xyzw = r0.xxxx ? r2.xxxw : r1.xyzw;
-  o0.xyzw = v4.xyzw * r1.xyzw;
+  r2.xyzw = Tex0.Sample(Smpl0_s, r0.zw).xyzw;
+  r3.x = r2.x;
+  r3.w = 1;
+  r2.xyzw = r0.xxxx ? r3.xxxw : r2.xyzw;
+  r0.x = -alphaTestThreshold_g + r2.w;
+  o0.xyzw = r2.xyzw * r1.xyzw;
+  r0.x = cmp(r0.x < 0);
+  if (r0.x != 0) discard;
   r1.xyz = v2.xyz;
   r1.w = 1;
   r0.x = dot(r1.xyzw, view_g._m00_m10_m20_m30);
@@ -213,46 +222,46 @@ void main(
   r0.xz = (uint2)r0.xz;
   r0.xz = min(uint2(255,255), (uint2)r0.xz);
   o1.z = mad((int)r0.z, 256, (int)r0.x);
-  r0.x = dot(v1.xyz, v1.xyz);
-  r0.x = rsqrt(r0.x);
-  r1.yzw = v1.xyz * r0.xxx;
-  r0.x = max(abs(r1.z), abs(r1.y));
-  r0.x = 1 / r0.x;
-  r0.z = min(abs(r1.z), abs(r1.y));
-  r0.x = r0.z * r0.x;
-  r0.z = r0.x * r0.x;
-  r0.w = r0.z * 0.0208350997 + -0.0851330012;
-  r0.w = r0.z * r0.w + 0.180141002;
-  r0.w = r0.z * r0.w + -0.330299497;
-  r0.z = r0.z * r0.w + 0.999866009;
-  r0.w = r0.x * r0.z;
-  r0.w = r0.w * -2 + 1.57079637;
-  r2.x = cmp(abs(r1.y) < abs(r1.z));
-  r0.w = r2.x ? r0.w : 0;
-  r0.x = r0.x * r0.z + r0.w;
-  r0.z = cmp(r1.y < -r1.y);
-  r0.z = r0.z ? -3.141593 : 0;
-  r0.x = r0.x + r0.z;
-  r0.z = min(r1.z, r1.y);
-  r0.z = cmp(r0.z < -r0.z);
-  r0.w = max(r1.z, r1.y);
-  r0.w = cmp(r0.w >= -r0.w);
-  r0.z = r0.w ? r0.z : 0;
-  r0.x = r0.z ? -r0.x : r0.x;
-  r1.x = 0.318309873 * r0.x;
-  r0.xz = float2(1,1) + r1.xw;
-  r0.w = dot(r1.yzw, -lightDirection_g.xyz);
-  r0.xz = float2(32767.5,32767.5) * r0.xz;
-  r0.xz = (uint2)r0.xz;
-  o1.xy = min(uint2(65535,65535), (uint2)r0.xz);
   r0.x = cmp(r0.y < 0.999989986);
   r0.y = saturate(ssaoIntensity_g * r0.y);
   r0.y = 30.9990005 * r0.y;
   r0.y = (uint)r0.y;
   o3.y = (uint)r0.y << 10;
-  o1.w = (r0.x ? 44 : 40) | 0x8000u;  // bit 15 = foliage marker for GTVBAO
-  r0.x = v8.x ? -1 : 1;
-  r0.x = r0.w * r0.x;
+  o1.w = r0.x ? 44 : 40;
+  r0.x = dot(v1.xyz, v1.xyz);
+  r0.x = rsqrt(r0.x);
+  r0.yzw = v1.xyz * r0.xxx;
+  r1.x = max(abs(r0.z), abs(r0.y));
+  r1.x = 1 / r1.x;
+  r1.y = min(abs(r0.z), abs(r0.y));
+  r1.x = r1.y * r1.x;
+  r1.y = r1.x * r1.x;
+  r1.z = r1.y * 0.0208350997 + -0.0851330012;
+  r1.z = r1.y * r1.z + 0.180141002;
+  r1.z = r1.y * r1.z + -0.330299497;
+  r1.y = r1.y * r1.z + 0.999866009;
+  r1.z = r1.x * r1.y;
+  r1.z = r1.z * -2 + 1.57079637;
+  r1.w = cmp(abs(r0.y) < abs(r0.z));
+  r1.z = r1.w ? r1.z : 0;
+  r1.x = r1.x * r1.y + r1.z;
+  r1.y = cmp(r0.y < -r0.y);
+  r1.y = r1.y ? -3.141593 : 0;
+  r1.x = r1.x + r1.y;
+  r1.y = min(r0.z, r0.y);
+  r1.y = cmp(r1.y < -r1.y);
+  r1.z = max(r0.z, r0.y);
+  r1.z = cmp(r1.z >= -r1.z);
+  r1.y = r1.z ? r1.y : 0;
+  r1.x = r1.y ? -r1.x : r1.x;
+  r0.x = 0.318309873 * r1.x;
+  r1.xy = float2(1,1) + r0.xw;
+  r0.x = dot(r0.yzw, -lightDirection_g.xyz);
+  r0.yz = float2(32767.5,32767.5) * r1.xy;
+  r0.yz = (uint2)r0.yz;
+  o1.xy = min(uint2(65535,65535), (uint2)r0.yz);
+  r0.y = v8.x ? -1 : 1;
+  r0.x = r0.x * r0.y;
   r0.xy = r0.xx * float2(0.5,-0.5) + float2(0.5,0.5);
   r0.y = max(r0.x, r0.y);
   r0.y = r0.y + -r0.x;

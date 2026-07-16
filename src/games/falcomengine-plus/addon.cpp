@@ -235,7 +235,7 @@ ShaderInjectData shader_injection = {
   .brdf_roughness_min = 0.04f,
   .brdf_roughness_max = 1.f,
   .brdf_f0_source = 0.f,
-  .gtvbao_exclude_foliage = 0.f,
+  .gtvbao_exclude_foliage = 1.f,
   .gtvbao_foliage_ao_value = 1.f,
 };
 
@@ -398,6 +398,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet main_tables = {};
   GTVBAODescriptorTableSet denoise_tables = {};
 
+  // Foliage mask descriptor tables (separate set — uses foliage_mask_layout)
+  GTVBAODescriptorTableSet foliage_mask_tables = {};
+
   reshade::api::resource_view captured_depth_srv = {};
   reshade::api::resource_view captured_ssao_srv = {};
   reshade::api::resource_view captured_mrt_normal_srv = {};
@@ -439,6 +442,12 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet multibounce_tables = {};
   bool vbgi_denoised_valid = false;            // true after first denoise completes
   reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
+  // ── Foliage mask (R8_UINT, working resolution, pre-pass) ──
+  reshade::api::resource foliage_mask_texture = {};
+  reshade::api::resource_view foliage_mask_srv = {};
+  reshade::api::resource_view foliage_mask_uav = {};
+  reshade::api::pipeline_layout foliage_mask_layout = {};
+  reshade::api::pipeline foliage_mask_pipeline = {};
   // ── Debug UAV (bitmask debug views 6-8) ──
   reshade::api::resource debug_texture = {};
   reshade::api::resource_view debug_srv = {};
@@ -639,6 +648,32 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         },
     },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
+    // ── Sora foliage (GTVBAO foliage marker bit 31 in o1.w) ──
+    {
+        0x4942F14Cu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x4942F14Cu,
+            .code = __0x4942F14C,
+            .on_draw = [](reshade::api::command_list*) { return true; },
+        },
+    },
+    {
+        0x9645D00Fu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x9645D00Fu,
+            .code = __0x9645D00F,
+            .on_draw = [](reshade::api::command_list*) { return true; },
+        },
+    },
+    // ── Kai foliage (GTVBAO foliage marker) ──
+    {
+        0x534E54EAu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x534E54EAu,
+            .code = __0x534E54EA,
+            .on_draw = [](reshade::api::command_list*) { return true; },
+        },
+    },
     {
         0xFDAAF80Eu,
         renodx::mods::shader::CustomShader{
@@ -690,6 +725,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // ── Kai DOF shaders ──
     CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
     CustomShaderEntryCallback(0x2734F870, nullptr),
+    //__ALL_CUSTOM_SHADERS,
 };
 
 // ═══════════ Settings ═══════════
@@ -1485,14 +1521,14 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFinalPower", .binding = &shader_injection.gtvbao_final_power,
-      .default_value = 2.2f, .label = "Final Power", .section = "GTVBAO",
+      .default_value = 1.8f, .label = "Final Power", .section = "GTVBAO",
       .min = 0.5f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOSampleDistribution", .binding = &shader_injection.gtvbao_sample_distribution,
-      .default_value = 1.0f, .label = "Sample Distribution", .section = "GTVBAO",
+      .default_value = 3.0f, .label = "Sample Distribution", .section = "GTVBAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1719,7 +1755,7 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
       .labels = {"Off", "AO Only", "GTVBAO raw .a", "GTVBAO RGBA", "Vanilla SSAO", "Depth",
-                 "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits"},
+                 "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits", "9:FoliageMask"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -1759,7 +1795,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOExcludeFoliage", .binding = &shader_injection.gtvbao_exclude_foliage,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Exclude Foliage", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Exclude Foliage", .section = "GTVBAO",
       .tooltip = "Skip AO computation on foliage pixels (prevent wind disocclusion noise).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -1768,8 +1804,8 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFoliageAOValue", .binding = &shader_injection.gtvbao_foliage_ao_value,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Foliage AO Value", .section = "GTVBAO",
-      .tooltip = "AO value assigned to excluded foliage pixels. 1.0 = no occlusion, 0.0 = fully occluded.",
+      .default_value = 0.f, .label = "Foliage AO Value", .section = "GTVBAO",
+      .tooltip = "Blends foliage AO toward fully bright. 1.0 = keep normal GTVBAO AO (like foliage exclusion OFF). 0.0 = no AO on foliage (fully bright).",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1844,7 +1880,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
-      .default_value = 1.0f, .label = "Intensity", .section = "VBGI",
+      .default_value = 0.75f, .label = "Intensity", .section = "VBGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1878,7 +1914,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounceStrength", .binding = &shader_injection.vbgi_multibounce_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 5.0f, .label = "Multi-Bounce Strength", .section = "VBGI",
+      .default_value = 1.0f, .label = "Multi-Bounce Strength", .section = "VBGI",
       .tooltip = "Intensity of the multi-bounce feedback. 1.0 = natural, higher = stronger accumulation.",
       .min = 0.0f, .max = 10.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
@@ -1967,7 +2003,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIReduceAO", .binding = &shader_injection.vbgi_reduce_ao,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Reduce AO with GI", .section = "VBGI",
+      .default_value = 0.f, .label = "Reduce AO with GI", .section = "VBGI",
       .tooltip = "Reduce GTVBAO occlusion where indirect light is strong. Keeps dark crevices dark while brightening lit surfaces.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
@@ -2001,7 +2037,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "MultiBounceFrameSkip", .binding = &g_multibounce_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Multi-Bounce Frame Skip", .section = "VBGI",
+      .default_value = 0.f, .label = "Multi-Bounce Frame Skip", .section = "VBGI",
       .tooltip = "Skip multi-bounce accumulation every N frames.",
       .labels = {"Off", "2 Frames", "3 Frames", "4 Frames"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
@@ -3258,6 +3294,9 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
      &d->vbgi_output_texture, &d->vbgi_output_srv, &d->vbgi_output_uav);
   mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->vbgi_denoised_texture, &d->vbgi_denoised_srv, &d->vbgi_denoised_uav);
+  // Foliage mask (R8_UINT, working resolution) — consumed by main pass at t4
+  mk(w, h, reshade::api::format::r8_uint,
+     &d->foliage_mask_texture, &d->foliage_mask_srv, &d->foliage_mask_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
      &d->debug_texture, &d->debug_srv, &d->debug_uav);
   // Light buffer capture at full back-buffer resolution
@@ -3292,11 +3331,14 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->denoise_tables);
+  DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
   // GI resources (now integrated — no separate VBGI pipeline)
   dv(d->vbgi_output_srv); dv(d->vbgi_output_uav); dr(d->vbgi_output_texture);
   dv(d->vbgi_denoised_srv); dv(d->vbgi_denoised_uav); dr(d->vbgi_denoised_texture);
   dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
   dv(d->multibounce_srv); dv(d->multibounce_uav); dr(d->multibounce_texture);
+  dv(d->foliage_mask_srv); dv(d->foliage_mask_uav); dr(d->foliage_mask_texture);
+  dp(d->foliage_mask_pipeline); dl(d->foliage_mask_layout);
   dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
   dp(d->multibounce_pipeline); dl(d->multibounce_layout);
   DestroyGTVBAODescriptorTables(dev, &d->multibounce_tables);
@@ -3469,13 +3511,20 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   };
 
   if (!make_layout(1u, kGTVBAODepthMipLevels, &d->prefilter_layout)) return false;
-  // Main: 4 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise) + 4 UAVs (AO, edges, GI, debug)
-  if (!make_layout(4u, 4u, &d->main_layout)) return false;
+  // Foliage mask pipeline (t0=depth, t1=MRT normal → u0=foliage mask)
+  if (!make_layout(2u, 1u, &d->foliage_mask_layout)) return false;
+  EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables);
+  if (!d->foliage_mask_pipeline.handle)
+    mkcs(__gtvbao_foliage_mask, "main", d->foliage_mask_layout, &d->foliage_mask_pipeline);
+
+  // Main: 5 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise, foliage mask) + 4 UAVs (AO, edges, GI, debug)
+  if (!make_layout(5u, 4u, &d->main_layout)) return false;
   // Denoise: 6 SRVs (AO, edges, raw GI, history AO, depth mip, MRT normal) + 3 UAVs (denoised AO, denoised GI, history AO)
   if (!make_layout(6u, 3u, &d->denoise_layout)) return false;
   // Multi-bounce accumulate: 2 SRVs (color, previous GI) + 1 UAV (accumulated)
   if (!make_layout(2u, 1u, &d->multibounce_layout)) return false;
 
+  EnsureGTVBAODescriptorTables(dev, d->prefilter_layout, &d->prefilter_tables);
   if (!d->prefilter_pipeline.handle) mkcs(__gtvbao_prefilter, "main", d->prefilter_layout, &d->prefilter_pipeline);
   if (!d->main_low_pipeline.handle)      mkcs(__gtvbao_main_low, "main", d->main_layout, &d->main_low_pipeline);
   if (!d->main_medium_pipeline.handle)   mkcs(__gtvbao_main_medium, "main", d->main_layout, &d->main_medium_pipeline);
@@ -3648,6 +3697,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!EnsureGTVBAODescriptorTables(dev, d->main_layout, &d->main_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->denoise_layout, &d->denoise_tables)) return false;
   if (!EnsureGTVBAODescriptorTables(dev, d->multibounce_layout, &d->multibounce_tables)) return false;
+  if (!EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables)) return false;
 
   uint32_t w = d->working_width, h = d->working_height;
   if (w < 64 || h < 64) return false;
@@ -3758,6 +3808,31 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     }
   }
 
+  // ── Foliage mask pre-pass (per-pixel, reads MRT normal, writes R8_UINT mask) ──
+  if (shader_injection.gtvbao_exclude_foliage > 0.5f
+      && d->foliage_mask_pipeline.handle
+      && d->foliage_mask_uav.handle
+      && d->captured_mrt_normal_srv.handle) {
+    bind_pipe(d->foliage_mask_pipeline);
+    // Bind depth (t0), MRT normal (t1), mask UAV (u0).
+    // The shader writes every pixel — dispatching over full working resolution guarantees coverage.
+    reshade::api::resource_view fm_srvs[2] = {
+        d->depth_mips_srv,                          // t0 — working depth (for GetDimensions / dispatch bounds)
+        d->captured_mrt_normal_srv                  // t1 — G-buffer normal (bit 15 test)
+    };
+    reshade::api::descriptor_table_update fu[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,fm_srvs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->foliage_mask_uav},
+    };
+    apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
+    auto pc = BuildGTVBAOPushConstants(d, false);
+    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 61, pc.data());
+    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    bar(d->foliage_mask_texture, UA, SR);
+  }
+
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_high_pipeline;
   { int q = (int)shader_injection.gtvbao_quality_level;
@@ -3800,11 +3875,12 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       msg += " colorSRV="; msg += d->captured_color_srv.handle ? "OK" : "no";
       reshade::log::message(reshade::log::level::info, msg.c_str());
     }
-    reshade::api::resource_view main_srvs[4] = {
+    reshade::api::resource_view main_srvs[5] = {
         d->depth_mips_srv,
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
         light_buf,
-        d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv  // t3 IS-FAST noise
+        d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,  // t3 IS-FAST noise
+        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv   // t4 foliage mask
     };
     // Shader register order: u0=AO, u1=edges, u2=GI, u3=debug
     reshade::api::resource_view main_uavs[4] = {
@@ -3816,7 +3892,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,4,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
+      {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
       {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);

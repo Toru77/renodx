@@ -19,6 +19,7 @@ SamplerState           g_samplerLightBuffer : register(s1);
 
 // ── IS-FAST noise (t3 = 3D noise texture / unused when off) ──
 Texture3D<float2>      g_isfastNoiseTexture : register(t3);
+Texture2D<uint>        g_srcFoliageMask    : register(t4);
 
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
 RWTexture2D<float>         g_outWorkingEdges  : register(u1);
@@ -208,6 +209,7 @@ void main(uint2 p : SV_DispatchThreadID)
       consts, g_srcWorkingDepth, g_samplerPointClamp,
       g_outWorkingAOTerm, g_outWorkingEdges,
       g_srcMrtNormal,
+      g_srcFoliageMask,
       (g_gi_enabled > 0.5f), g_gi_intensity,
       g_srcLightBuffer, g_samplerLightBuffer,
       g_outGI,

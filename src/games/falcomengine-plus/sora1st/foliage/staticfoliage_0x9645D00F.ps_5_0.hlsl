@@ -229,7 +229,7 @@ void main(
   r0.y = 30.9990005 * r0.y;
   r0.y = (uint)r0.y;
   o3.y = (uint)r0.y << 10;
-  o1.w = r0.x ? 44 : 40;
+  o1.w = (r0.x ? 44 : 40) | 0x8000u;  // bit 15 = foliage marker for GTVBAO
   r0.x = v7.x ? -1 : 1;
   r0.x = r0.w * r0.x;
   r0.xy = r0.xx * float2(0.5,-0.5) + float2(0.5,0.5);

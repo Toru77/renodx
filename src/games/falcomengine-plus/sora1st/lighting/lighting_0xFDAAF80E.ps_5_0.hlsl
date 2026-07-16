@@ -340,6 +340,16 @@ void main(
       o0.rgb = float3(d, d, d) * hdr_scale;
       o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
     }
+    if (mode == 9) {
+      // FoliageMask: GTVBAO raw AO (mid-gray = foliage detected)
+      uint fw, fh;
+      gtvbaoTexture.GetDimensions(fw, fh);
+      uint2 ftexel = uint2(saturate(v1.xy) * float2(fw, fh));
+      uint4 fraw = gtvbaoTexture.Load(int3(ftexel, 0));
+      float fraw_ao = float(fraw.x) / 255.0;
+      o0.rgb = float3(fraw_ao, fraw_ao, fraw_ao) * hdr_scale;
+      o0.a = 1.0; o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
   }
   bool is_character_pixel = (((uint)r1.z & 8u) == 0u);
   uint2 mrt0_xy_raw = (uint2)r1.xy;

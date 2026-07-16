@@ -270,7 +270,7 @@ struct ShaderInjectData {
   float brdf_f0_source;                    // reserved (0=specularColor)
   // —— GTVBAO foliage ——
   float gtvbao_exclude_foliage;            // 0=Off, 1=On — skip AO computation on foliage pixels
-  float gtvbao_foliage_ao_value;           // [0..1] default 1.0 — AO value for excluded foliage (1=no occlusion)
+  float gtvbao_foliage_ao_value;           // [0..1] default 1.0 — 1=keep normal AO, 0=no AO (fully bright)
 };
 
 #ifndef __cplusplus

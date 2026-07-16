@@ -372,7 +372,8 @@ lpfloat3x3 GTVBAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
 
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
     Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges,
-    Texture2D<uint4> mrtNormalTexture
+    Texture2D<uint4> mrtNormalTexture,
+    Texture2D<uint> foliageMaskTexture
 #ifdef GT_VBAO_COMPUTE_GI
     , bool enableGI, float giIntensity,
     Texture2D<float4> lightBuffer, SamplerState lightSampler,
@@ -398,20 +399,25 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
     outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
 
-    // ── Foliage early-out (precise MRT1 material type check) ──
-    // The foliage pixel shaders (moving + static) write o1.w = 44 or 40
-    // to SV_Target1 (mrtNormalTexture). Check the material type directly
-    // instead of guessing from depth edges.
-    if (GTVBAO_exclude_foliage > 0.5f) {
-      uint matType = mrtNormalTexture.Load(int3(pixCoord, 0)).w;
-      if (matType == 40 || matType == 44) {
-        outWorkingAOTerm[pixCoord] = (uint)(GTVBAO_foliage_ao_value * 255.0f);
-#ifdef GT_VBAO_COMPUTE_GI
-        outGI[pixCoord] = float4(0, 0, 0, 0);
-#endif
-        return;
-      }
+    // ── Foliage detection (toggle on, or debug mode 9 always checks) ──
+    // Sora foliage PS sets o1.w bit 15 (0x8000) to mark the pixel.
+    // Kai uses o1.w for 16-bit normal data — skip there.
+    // When detected: normal AO is fully computed, then blended toward
+    // fully bright (255) by (1 - foliage_ao_value) after GTVBAO_OutputWorkingTerm.
+    //   foliage_ao_value = 1.0 → keep normal AO (blend factor 0)
+    //   foliage_ao_value = 0.0 → fully bright (blend factor 1)
+#ifndef RENODX_KAI
+    bool gtvbao_foliage_pixel = false;
+    bool checkFoliage = (GTVBAO_debug_mode > 8.5f) || (GTVBAO_exclude_foliage > 0.5f);
+    if (checkFoliage) {
+      uint mrtW, mrtH, workW, workH;
+      mrtNormalTexture.GetDimensions(mrtW, mrtH);
+      sourceViewspaceDepth.GetDimensions(workW, workH);
+      float2 mrtScale = float2(mrtW, mrtH) / max(float2(workW, workH), 1.0.xx);
+      int2 mrtTC = min(int2(floor((float2(pixCoord) + 0.5) * mrtScale)), int2(mrtW - 1, mrtH - 1));
+      gtvbao_foliage_pixel = (mrtNormalTexture.Load(int3(mrtTC, 0)).w & 0x8000u) != 0u;
     }
+#endif // RENODX_KAI
 
 	// Generating screen space normals in-place is faster than generating normals in a separate pass but requires
 	// use of 32bit depth buffer (16bit works but visibly degrades quality) which in turn slows everything down. So to
@@ -624,6 +630,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     float sideSign = (side == 0) ? 1.0 : -1.0;
                     float2 sampleScreenPos = normalizedScreenPos + sampleOffset * sideSign;
                     float  SZ = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos, mipLevel ).x;
+                    // ── Foliage cast-AO prevention: skip samples that land on foliage ──
+                    if (GTVBAO_exclude_foliage > 0.5f) {
+                        int2 mc = int2(saturate(sampleScreenPos) * float2(consts.ViewportSize));
+                        if (foliageMaskTexture.Load(int3(mc, 0)) != 0u) continue;
+                    }
                     float3 samplePos = GTVBAO_ComputeViewspacePosition( sampleScreenPos, SZ, consts );
 
                     float3 sampleDelta = samplePos - float3(pixCenterPos);
@@ -815,10 +826,17 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
                 float2 sampleScreenPos0 = normalizedScreenPos + sampleOffset;
                 float  SZ0 = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos0, mipLevel ).x;
-                float3 samplePos0 = GTVBAO_ComputeViewspacePosition( sampleScreenPos0, SZ0, consts );
 
                 float2 sampleScreenPos1 = normalizedScreenPos - sampleOffset;
                 float  SZ1 = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos1, mipLevel ).x;
+                // ── Foliage cast-AO prevention: set depth to center (non-occluding) ──
+                if (GTVBAO_exclude_foliage > 0.5f) {
+                    int2 mc0 = int2(saturate(sampleScreenPos0) * float2(consts.ViewportSize));
+                    int2 mc1 = int2(saturate(sampleScreenPos1) * float2(consts.ViewportSize));
+                    if (foliageMaskTexture.Load(int3(mc0, 0)) != 0u) SZ0 = (float)viewspaceZ;
+                    if (foliageMaskTexture.Load(int3(mc1, 0)) != 0u) SZ1 = (float)viewspaceZ;
+                }
+                float3 samplePos0 = GTVBAO_ComputeViewspacePosition( sampleScreenPos0, SZ0, consts );
                 float3 samplePos1 = GTVBAO_ComputeViewspacePosition( sampleScreenPos1, SZ1, consts );
 
                 float3 sampleDelta0     = (samplePos0 - float3(pixCenterPos)); // using lpfloat for sampleDelta causes precision issues
@@ -968,6 +986,22 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #endif
 
     GTVBAO_OutputWorkingTerm( pixCoord, visibility, bentNormal, outWorkingAOTerm );
+
+#ifndef RENODX_KAI
+    // ── Foliage post-blend (no early-out, normal AO computed first) ──
+    // Blend written AO toward 255 (fully visible) based on foliage_ao_value.
+    //   value=1 → blend=0 → keep AO unchanged
+    //   value=0 → blend=1 → fully bright (AO=1.0)
+    if (gtvbao_foliage_pixel && GTVBAO_exclude_foliage > 0.5f) {
+      float aoBlend = 1.0f - saturate(GTVBAO_foliage_ao_value);
+      uint cur = outWorkingAOTerm[pixCoord];
+      uint blended = (uint)(lerp((float)cur, 255.0f, aoBlend) + 0.5f);
+      outWorkingAOTerm[pixCoord] = blended;
+#ifdef GT_VBAO_COMPUTE_GI
+      outGI[pixCoord] = float4(0, 0, 0, 0);
+#endif
+    }
+#endif
 
 #ifdef GT_VBAO_COMPUTE_GI
     // ── SSGI debug view 5: sample activity heatmap ──
