@@ -85,6 +85,8 @@ cbuffer cb_local : register(b5)
 
 StructuredBuffer<InstanceParam> instances_g : register(t15);
 
+#include "../../shared.h"
+#include "../../foliage/grass_ao.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -149,6 +151,7 @@ void main(
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
   o0.xyzw = v3.xyzw;
+  o0.rgb = ApplyFoliageAO(o0.rgb, 0.5f);  // no UV — use constant mid-blade AO
   r1.xyz = v2.xyz;
   r1.w = 1;
   r0.x = dot(r1.xyzw, view_g._m00_m10_m20_m30);
