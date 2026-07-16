@@ -201,7 +201,6 @@ Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
 
 #include "../../shared.h"
-#include "../../reference/env_sss.hlsl"
 #include "../../reference/brdf.hlsli"
 
 
@@ -597,8 +596,6 @@ void main(
       float gtvbaoAO = lerp(r4.x, 1.0, gtvbaoCharMask);
       r6.xyz *= gtvbaoAO;
     }
-    // Apply environment SSS early in pipeline (before other effects)
-    ApplyEnvSSS(r6.xyz, v1.xy, mrt0_xy_raw, is_character_pixel);
 
     // Probe ambient debug — show lightProbe_g[0] DC term (indoor/outdoor signal)
     if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
@@ -1352,8 +1349,6 @@ void main(
   r0.y = mapAOIntensity_g * r0.y;
   r3.yzw = r2.xyw * mapAOColor_g.xyz + -r2.xyw;
   r0.yzw = r0.yyy * r3.yzw + r2.xyw;
-  // Apply environment SSS to all pixels (not just non-character)
-  ApplyEnvSSS(r0.yzw, v1.xy, mrt0_xy_raw, is_character_pixel);
   r1.y = -fogNearDistance_g + -r3.x;
   r1.y = saturate(fogFadeRangeInv_g * r1.y);
   r1.w = -fogHeight_g + r5.y;
