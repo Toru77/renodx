@@ -1435,7 +1435,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "LocalSSSSampleCount", .binding = &shader_injection.local_sss_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 18.f, .label = "Sample Count", .section = "Local Screen Space Shadows",
+      .default_value = 10.f, .label = "Sample Count", .section = "Local Screen Space Shadows",
       .min = 1.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.local_sss_enabled >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
@@ -1461,7 +1461,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "LocalSSSSurfaceThickness", .binding = &shader_injection.local_sss_surface_thickness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.0250f, .label = "Surface Thickness", .section = "Local Screen Space Shadows",
+      .default_value = 0.0200f, .label = "Surface Thickness", .section = "Local Screen Space Shadows",
       .min = 0.001f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.local_sss_enabled >= 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
@@ -1477,7 +1477,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "LocalSSSLightFadeStart", .binding = &shader_injection.local_sss_light_fade_start,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.65f, .label = "Light Fade Start", .section = "Local Screen Space Shadows",
+      .default_value = 0.15f, .label = "Light Fade Start", .section = "Local Screen Space Shadows",
       .tooltip = "Screen-distance where shadow starts fading (0 = at the light, 1 = at light radius edge).",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.local_sss_enabled >= 0.5f; },
@@ -1863,7 +1863,6 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Grass AO", .section = "Foliage Grass AO",
       .tooltip = "Per-blade vertical AO gradient: dark at root, bright at tip. Replaces noisy SSAO/GTAO on foliage with a stable bake. (Ghost of Tsushima §1.5e-ii)",
       .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "FoliageGrassAOBase", .binding = &shader_injection.foliage_grass_ao_base,
