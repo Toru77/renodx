@@ -110,6 +110,7 @@ Texture2D<float4> Tex0 : register(t0);
 StructuredBuffer<InstanceParam> instances_g : register(t15);
 
 #include "../../shared.h"
+#include "../../foliage/grass_ao.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -192,6 +193,7 @@ void main(
   o1.z = foliage_class;
   r0.y = (ssaoIntensity_g * shader_injection_data.foliage_ssao_scale) * r1.w;
   o0.xyz = r1.xyz;
+  o0.rgb = ApplyFoliageAO(o0.rgb, v4.y);
   o0.w = r0.y * r0.x;
   r0.xyz = v3.xyz;
   r0.w = 1;
