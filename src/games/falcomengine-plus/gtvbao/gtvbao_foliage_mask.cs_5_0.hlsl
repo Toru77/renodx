@@ -22,17 +22,17 @@ void main(uint2 p : SV_DispatchThreadID)
     uint maskW, maskH;
 g_outFoliageMask.GetDimensions(maskW, maskH);
 if (p.x >= maskW || p.y >= maskH) return;
-#ifndef RENODX_KAI
     if (GTVBAO_exclude_foliage > 0.5f) {
         uint mrtW, mrtH;
         g_srcMrtNormal.GetDimensions(mrtW, mrtH);
         float2 mrtScale = float2(mrtW, mrtH) / max(float2(maskW, maskH), 1.0.xx);
         int2 mrtTC = min(int2(floor((float2(p) + 0.5) * mrtScale)), int2(mrtW - 1, mrtH - 1));
-        if (g_srcMrtNormal.Load(int3(mrtTC, 0)).w & 0x8000u) {
+        uint4 _mrtV = g_srcMrtNormal.Load(int3(mrtTC, 0));
+        uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;
+        if (_mrtC & 0x8000u) {
             g_outFoliageMask[p] = 1u;
             return;
         }
     }
-#endif
     g_outFoliageMask[p] = 0u;
 }

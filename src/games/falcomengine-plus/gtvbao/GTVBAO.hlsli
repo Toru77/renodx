@@ -407,13 +407,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
 
     // ── Foliage detection (toggle on, or debug mode 9 always checks) ──
-    // Sora foliage PS sets o1.w bit 15 (0x8000) to mark the pixel.
-    // Kai uses o1.w for 16-bit normal data — skip there.
+    // Foliage PS sets o1.w bit 15 (0x8000) to mark the pixel.
     // When detected: normal AO is fully computed, then blended toward
     // fully bright (255) by (1 - foliage_ao_value) after GTVBAO_OutputWorkingTerm.
     //   foliage_ao_value = 1.0 → keep normal AO (blend factor 0)
     //   foliage_ao_value = 0.0 → fully bright (blend factor 1)
-#ifndef RENODX_KAI
     bool gtvbao_foliage_pixel = false;
     bool checkFoliage = (GTVBAO_debug_mode > 8.5f) || (GTVBAO_exclude_foliage > 0.5f);
     if (checkFoliage) {
@@ -421,9 +419,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
       sourceViewspaceDepth.GetDimensions(workW, workH);
       float2 mrtScale = float2(g_mrtW, g_mrtH) / max(float2(workW, workH), 1.0.xx);
       int2 mrtTC = min(int2(floor((float2(pixCoord) + 0.5) * mrtScale)), int2(g_mrtW - 1, g_mrtH - 1));
-      gtvbao_foliage_pixel = (mrtNormalTexture.Load(int3(mrtTC, 0)).w & 0x8000u) != 0u;
+      uint4 _mrtV = mrtNormalTexture.Load(int3(mrtTC, 0));
+      uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;
+      gtvbao_foliage_pixel = (_mrtC & 0x8000u) != 0u;
     }
-#endif // RENODX_KAI
 
 	// Generating screen space normals in-place is faster than generating normals in a separate pass but requires
 	// use of 32bit depth buffer (16bit works but visibly degrades quality) which in turn slows everything down. So to
@@ -993,7 +992,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
     GTVBAO_OutputWorkingTerm( pixCoord, visibility, bentNormal, outWorkingAOTerm );
 
-#ifndef RENODX_KAI
     // ── Foliage post-blend (no early-out, normal AO computed first) ──
     // Blend written AO toward 255 (fully visible) based on foliage_ao_value.
     //   value=1 → blend=0 → keep AO unchanged
@@ -1007,7 +1005,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
       outGI[pixCoord] = float4(0, 0, 0, 0);
 #endif
     }
-#endif
 
 #ifdef GT_VBAO_COMPUTE_GI
     // ── SSGI debug view 5: sample activity heatmap ──

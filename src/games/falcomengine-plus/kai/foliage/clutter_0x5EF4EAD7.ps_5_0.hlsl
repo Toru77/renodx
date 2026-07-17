@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Wed Mar  4 19:23:33 2026
+// ---- Created with 3Dmigoto v1.4.1 on Fri Jul 17 12:07:24 2026
 
 struct InstanceParam
 {
@@ -121,8 +121,9 @@ void main(
   nointerpolation uint4 v2 : TEXCOORD0,
   float4 v3 : TEXCOORD1,
   float4 v4 : TEXCOORD2,
-  float4 v5 : TEXCOORD7,
-  uint v6 : SV_IsFrontFace0,
+  float4 v5 : TEXCOORD4,
+  float4 v6 : TEXCOORD7,
+  uint v7 : SV_IsFrontFace0,
   out float4 o0 : SV_Target0,
   out uint4 o1 : SV_Target1,
   out uint4 o2 : SV_Target2,
@@ -170,7 +171,7 @@ void main(
   r1.y = instances_g[v2.x].color.y;
   r1.z = instances_g[v2.x].color.z;
   r1.w = instances_g[v2.x].color.w;
-  r1.w = (opacity_g * shader_injection_data.foliage_opacity_scale) * r1.w;
+  r1.w = opacity_g * r1.w;
   r0.y = r1.w * r0.y;
   r0.x = r0.y * mapColor_g.w + -r0.x;
   r0.y = mapColor_g.w * r0.y;
@@ -187,10 +188,8 @@ void main(
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
   r0.x = r0.y ? 0 : 1;
-  uint foliage_class = r0.y ? 3327u : 2303u;
-  foliage_class |= 0x8000u;
-  o1.z = foliage_class;
-  r0.y = (ssaoIntensity_g * shader_injection_data.foliage_ssao_scale) * r1.w;
+  o1.z = (r0.y ? 3327 : 2303) | 0x8000u;
+  r0.y = ssaoIntensity_g * r1.w;
   o0.xyz = r1.xyz;
   o0.w = r0.y * r0.x;
   r0.xyz = v3.xyz;
@@ -237,11 +236,11 @@ void main(
   r0.xy = float2(127.5,127.5) * r0.xy;
   r0.xy = (uint2)r0.xy;
   r0.xy = min(uint2(255,255), (uint2)r0.xy);
-  o1.w = mad((int)r0.y, 256, (int)r0.x);  // o1.z bit 15 = Kai foliage marker
+  o1.w = mad((int)r0.y, 256, (int)r0.x);
   r0.x = dot(v1.xyz, v1.xyz);
   r0.x = rsqrt(r0.x);
   r0.xyz = v1.xyz * r0.xxx;
-  r0.w = v6.x ? -1 : 1;
+  r0.w = v7.x ? -1 : 1;
   r1.yzw = r0.xyz * r0.www;
   r0.x = dot(r0.xyz, -lightDirection_g.xyz);
   r0.x = r0.x * r0.w;
@@ -276,14 +275,14 @@ void main(
   o1.xy = min(uint2(65535,65535), (uint2)r0.zw);
   r0.y = max(r0.x, r0.y);
   r0.y = r0.y + -r0.x;
-  r0.x = (translucency_g * shader_injection_data.foliage_translucency_scale) * r0.y + r0.x;
+  r0.x = translucency_g * r0.y + r0.x;
   r0.x = 255 * r0.x;
   r0.x = (uint)r0.x;
   r0.x = min(255, (uint)r0.x);
   o2.z = mad((int)r0.x, 256, 255);
   o2.x = materialID_g;
   o2.yw = float2(9.18340949e-41,0);
-  r0.xy = v5.xy / v5.ww;
+  r0.xy = v6.xy / v6.ww;
   r0.xy = r0.xy * float2(0.5,-0.5) + float2(0.5,0.5);
   r0.xy = r0.xy * vpSize_g.xy + -v0.xy;
   o3.xy = -motionJitterOffset_g.xy + r0.xy;
