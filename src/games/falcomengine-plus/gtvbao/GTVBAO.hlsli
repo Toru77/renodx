@@ -636,7 +636,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     float2 sampleScreenPos = normalizedScreenPos + sampleOffset * sideSign;
                     float  SZ = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos, mipLevel ).x;
                     // ── Foliage cast-AO prevention: skip samples that land on foliage ──
-                    if (GTVBAO_exclude_foliage > 0.5f) {
+                    if (GTVBAO_exclude_foliage > 0.5f && !gtvbao_foliage_pixel) {
                         int2 mc = int2(saturate(sampleScreenPos) * float2(g_maskW, g_maskH));
                         if (foliageMaskTexture.Load(int3(mc, 0)) != 0u) continue;
                     }
@@ -835,7 +835,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 float2 sampleScreenPos1 = normalizedScreenPos - sampleOffset;
                 float  SZ1 = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos1, mipLevel ).x;
                 // ── Foliage cast-AO prevention: set depth to center (non-occluding) ──
-                if (GTVBAO_exclude_foliage > 0.5f) {
+                if (GTVBAO_exclude_foliage > 0.5f && !gtvbao_foliage_pixel) {
                     int2 mc0 = int2(saturate(sampleScreenPos0) * float2(g_maskW, g_maskH));
                     int2 mc1 = int2(saturate(sampleScreenPos1) * float2(g_maskW, g_maskH));
                     if (foliageMaskTexture.Load(int3(mc0, 0)) != 0u) SZ0 = (float)viewspaceZ;
@@ -1001,9 +1001,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
       uint cur = outWorkingAOTerm[pixCoord];
       uint blended = (uint)(lerp((float)cur, 255.0f, aoBlend) + 0.5f);
       outWorkingAOTerm[pixCoord] = blended;
-#ifdef GT_VBAO_COMPUTE_GI
-      outGI[pixCoord] = float4(0, 0, 0, 0);
-#endif
     }
 
 #ifdef GT_VBAO_COMPUTE_GI
