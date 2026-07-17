@@ -1744,6 +1744,12 @@ void main(
   // --- RenoDx SSS Shadow ---
   if (is_foliage_pixel && foliage_saved_shadow < 0.999) {
     float sss_shadow = foliage_saved_shadow;
+    // ── CSM gate: skip SSS on pixels already in deep directional shadow ──
+    // r8.w = CSM shadow visibility (0 = fully shadowed, 1 = fully lit)
+    if (shader_injection_data.env_sss_csm_gate > 0.5f) {
+      float csm_gate = saturate(r8.w * 5.0);
+      sss_shadow = lerp(1.0, sss_shadow, csm_gate);
+    }
     // Brightness rejection: reduce shadow on bright pixels (lamps, emissives)
     float bright_reject_thresh = shader_injection_data.env_sss_bright_reject_threshold;
     float bright_reject_fade = max(shader_injection_data.env_sss_bright_reject_fade, 1e-5);
