@@ -1512,7 +1512,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Quality Level", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Quality Level", .section = "GTVBAO",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     },
