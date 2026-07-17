@@ -1886,7 +1886,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "FoliageGrassAOCurve", .binding = &shader_injection.foliage_grass_ao_curve,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.33f, .label = "Grass AO Curve", .section = "Foliage Grass AO",
+      .default_value = 0.25f, .label = "Grass AO Curve", .section = "Foliage Grass AO",
       .tooltip = "Power curve exponent. <1.0 = darkening concentrated at base (recommended). 1.0 = linear. >1.0 = darkening extends further up the blade.",
       .min = 0.1f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
