@@ -329,6 +329,7 @@ static bool IsDaybreak2() {
 // ── Lighting shader identification (Sora + Kai) ──
 static bool IsLightingShader(uint32_t hash) {
   return hash == 0xFDAAF80Eu    // Sora lighting
+      || hash == 0x0CDCB258u    // Kyoto lighting
       || hash == 0x430ED091u    // Kai lighting
       || hash == 0xF6C55E5Fu;   // Kai lighting soft
 }
@@ -725,6 +726,15 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0xFDAAF80Eu,
             .code = __0xFDAAF80E,
+            .on_draw = OnBeforeLightingShaderDraw,
+        },
+    },
+    //Kyoto lighting (GTVBAO + VBGI)
+    {
+        0x0CDCB258u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x0CDCB258u,
+            .code = __0x0CDCB258,
             .on_draw = OnBeforeLightingShaderDraw,
         },
     },

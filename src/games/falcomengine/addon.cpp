@@ -185,6 +185,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
      CustomShaderEntry(0x197BCB74), // bloom blend
      CustomShaderEntry(0x5AFABB1C), // bloom godray
      CustomShaderEntry(0xDF53C75B), // hud
+     CustomShaderEntry(0x9C84A630), // hud
 
     // UpgradeRTVShader(0x1336F6F8),
     // UpgradeRTVShader(0xEF0CAEEA),

@@ -1,0 +1,1294 @@
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets
+Local
+Image-based Lighting
+are blue
+ They have 110% line spacing, 2 points before & after
+Withbullets
+Parallax-corrected
+Cubemap
+ Longer
+in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+Sébastien
+Lagarde,
+Antoine
+Zanuttini
+maximum
+recommended
+number
+of lines
+per slide
+(seven).
+DONTNOD Entertainment
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+Image-based
+Lighting
+ Longer bullets
+in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Image-based lighting (IBL)
+
+ This
+subtitle
+20 pointsambient lighting
+IBL good
+for is
+simulating
+ Bullets
+are blue
+Talk focuses
+on
+ Static
+IBL 110% line spacing, 2 points before & after
+ They
+have
+ Glossy/specular indirect lighting
+ Longer
+bullets in the form of a paragraph are harder to
+ read
+IBL often
+implemented
+withline
+cubemaps
+game
+if there
+is insufficient
+spacing. in
+This
+is the
+ maximum
+Good results
+but with some
+artifacts
+recommended
+number
+of lines per slide
+ (seven).
+Can we improve the results ?
+ Sub bullets look like this
+
+Distant IBL
+Offline
+
+ Infinite
+This subtitle
+is 20 points
+cubemap
+ Bullets
+ Distant
+are
+blue
+lighting
+ No position
+ They
+have 110% line spacing, 2 points before & after
+ Hand authored
+ Longer
+bullets in the form of a paragraph are harder to
+ Zone-based
+read if there is insufficient line spacing. This is the
+
+ Contributes
+maximum
+recommended
+to all objects number of lines per slide
+ Smooth lighting transition
+(seven).
+ Sub bullets look like this
+Runtime
+
+Local IBL
+
+ Local
+cubemap
+This subtitle
+is 20 points
+
+Offline
+
+ Local are
+lighting
+ Bullets
+blue
+ Position
+ They
+have 110% line spacing, 2 points before & after
+ In-engine generated
+ Longer bullets in the form of a paragraph are harder to
+
+ Object-based
+
+read
+if there is insufficient line spacing. This is the
+ Contribute
+to nearest
+maximum
+objects recommended number of lines per slide
+ Lighting seams
+(seven).
+ Parallax
+issue
+Sub bullets
+look like this
+Runtime
+
+Local IBL
+
+ This subtitle
+is 20 points
+ Lighting
+seams
+
+ Parallax issue
+
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+Ourbullets
+Local
+Image-based Lighting
+ Longer
+in the form of a paragraph are harder to
+
+Approach
+read if there is insufficient
+line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Our Local IBL Approach
+Offline
+
+ Mix
+localiscubemaps
+This of
+subtitle
+20 points
+ Position
+ Bullets
+are blue
+ Local lighting
+ They
+have 110% line spacing, 2 points before & after
+ In-engine generated
+ Longer bullets in the form of a paragraph are harder to
+ Point of interest
+
+read if there is insufficient line spacing. This is the
+-based
+maximum recommended number of lines per slide
+ Contribute to all objects
+(seven).
+
+No lighting seams
+Subparallax
+bullets look
+like this
+ Still
+issue
+
+Runtime
+
+Our Local IBL Approach
+
+ This
+is 20 points
+Pointsubtitle
+of interest
+(POI)?
+ Bullets are blue
+Context dependent
+ They
+have 110% line spacing, 2 points before & after
+ Camera
+ Longer
+ Playerbullets in the form of a paragraph are harder to
+read
+if there
+is insufficient line spacing. This is the
+ Any
+character
+maximum
+recommended number of lines per slide
+ Dummy location
+(seven).
+ Animated by a track
+ Sub bullets look like this
+
+Our Local IBL approach
+
+ Influence
+link to
+This subtitlevolume
+is 20 points
+ local
+Bulletscubemap
+are blue
+Top view
+ Box or sphere
+ They
+have 110% line spacing, 2 points before & after
+ Must overlap
+ Longer bullets in the form of a paragraph are harder to
+
+ Gather
+local
+cubemapsline spacing. This is the
+read if there
+is insufficient
+ Based on POI location
+
+maximum recommended number of lines per slide
+ Based on cubemap influence
+(seven).
+volume
+ Take
+Sub bullets
+lookvolumes
+like this
+N nearest
+
+Blending algorithm
+
+ Blending
+weights
+This subtitle
+is 20rules
+points
+ 100%are
+influence
+ Bullets
+blue at
+boundary of inner range
+ They
+have 110% line spacing, 2 points before & after
+ 0% influence at boundary
+ Longer
+bullets
+of outer
+range in the form of a paragraph are harder to
+read
+if there
+is insufficient
+line spacing. This is the
+ Smaller
+influence
+more
+maximum
+importantrecommended number of lines per slide
+ No overlap of inner range
+(seven).
+ Sub bullets look like this
+
+Blending algorithm – Pseudo code
+for (int i = 0; i < NumPrimitive; ++i) {
+if (In inner range) EarlyOut;
+if (In outer range)
+
+ This subtitle is 20 points
+ Bullets are blue
+SelectedPrimitive.Add(CurrentPrimitive.GetInfluenceWeights(LocationPOI));
+}
+ They have 110% line spacing, 2 points before & after
+SelectedPrimitive.Sort();
+for (int i = 0; i < NumSelectedPrimitive; ++i) {
+ Longer
+SumIW
++= SelectedPrimitive[i];
+bullets
+in the form of a paragraph are harder to
+InvSumIW += (1.0f - SelectedPrimitive[i]);
+
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+
+}
+for (int i = 0; i < NumSelectedPrimitive; ++i) {
+BlendFactor[i] = (1.0f - (SelectedPrimitive[i] / SumIW)) /
+(NumSelectedPrimitive - 1);
+BlendFactor[i] *= ((1.0f - SelectedPrimitive[i]) / InvSumIW);
+SumBlendFactor += BlendFactor[i];
+}
+// Normalize BlendFactor (...)
+
+ Sub bullets look like this
+
+Blending algorithm
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Blending algorithm
+
+ Video
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Blending algorithm
+xy = VPosScaleBias.xy * ScreenPos.xy +
+ Combined
+onisGPU
+This subtitle
+20 points float2
+VPosScaleBias.zw;
+ Multiple
+half3 CubeDir = GetCubeDir(xy.x, xy.y);
+shaders
+Bullets are
+blue
+half3 CubeColor;
+ By face
+ They
+have 110% line spacing,
+2 points before & after
+CubeColor
+= weight1 * texCUBElod(CubeTex1,
+ By cubemap number
+MipmapIndex)).rgb;
+ Longer bullets in the form of ahalf4(CubeDir,
+paragraph
+are harder to
+ Blend
+mipmaps
+CubeColor += weight2 * texCUBElod(CubeTex2,
+read ifall
+there
+is insufficient line
+spacing. This is the
+
+ For preconcolved cubemap
+
+half4(CubeDir, MipmapIndex)).rgb;
+
+maximum recommended number of lines per slide
+CubeColor += weight3 * texCUBElod(CubeTex3,
+(seven).
+half4(CubeDir, MipmapIndex)).rgb;
+ Sub bullets look like this
+
+CubeColor += weight2 * texCUBElod(CubeTex4,
+half4(CubeDir, MipmapIndex)).rgb;
+
+Blending algorithm
+
+ Use
+of points
+Thisknowledge
+subtitle is 20
+ hardware
+Bullets aretexture
+blue layout
+ On console only
+ They
+have 110% line spacing, 2 points before & after
+ 128^2
+PS3
+PS3
+X360harder to
+Longer bullets
+inX360
+the form 256^2
+of a paragraph
+are
+DXT1
+
+(ms)
+
+(ms)
+
+DXT1
+
+(ms)
+
+(ms)
+
+4
+
+0.68
+
+0.99
+
+read if there is insufficient line spacing. This is the
+1
+0.08
+0.20
+1
+0.29
+0.48
+maximum
+recommended
+number
+of
+lines
+per
+slide
+2
+0.09
+0.26
+2
+0.40
+0.61
+(seven).0.10
+3
+0.34
+3
+0.54
+0.78
+like this
+4  Sub bullets
+0.11 look
+0.41
+
+Our Local IBL Approach
+ No lighting seams anymore
+
+ This subtitle
+is have
+20 points
+ But still
+parallax issue
+ Bullets are
+Andblue
+introduce error with distant objects
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+Parallax-corrected
+Cubemap
+ Longer
+bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+in Object’s shader
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ Simple
+algorithm
+minimize
+This subtitle
+is 20topoints
+issue on GPU
+ parallax
+Bullets are blue
+ Artists define box volume
+ They have 110% line spacing, 2 points before & after
+ Intersect
+a volume and
+ correct
+Longer the
+bullets
+in the vector
+form of a paragraph are harder to
+reflection
+readjust
+if there
+is insufficient
+line spacing. This is the
+ We
+reinvented
+the wheel!
+
+maximum
+recommended
+ Kevin Bjorke,
+GPU Gems number of lines per slide
+ Bartosz Czuba, Gamedev.net
+(seven).
+ forums
+Sub bullets look like this
+
+Parallax-corrected cubemap
+float3 DirectionWS = PositionWS - CameraWS;
+
+ This
+float3 subtitle
+ReflDirectionWS
+reflect(DirectionWS, NormalWS);
+is 20= points
+// Find the ray intersection with box plane
+ Bullets
+are blue
+float3 FirstPlaneIntersect = (BoxMax - PositionWS) / ReflDirectionWS;
+float3 SecondPlaneIntersect = (BoxMin - PositionWS) / ReflDirectionWS;
+ They
+have
+110%
+line spacing,
+2 along
+points
+& after
+// Get the
+furthest
+of these
+intersections
+the before
+ray (Ok because
+x/0
+give +inf and -x/0 give –inf )
+ Longer
+bullets in= max(FirstPlaneIntersect,
+the form of a paragraph
+are harder to
+float3 FurthestPlane
+SecondPlaneIntersect);
+// Find the closest far intersection
+read
+if there is insufficient line spacing. This is the
+float Distance = min(min(FurthestPlane.x, FurthestPlane.y),
+FurthestPlane.z);
+maximum
+recommended number of lines per slide
+// Get the intersection position
+float3 IntersectPositionWS = PositionWS + ReflDirectionWS * Distance;
+(seven).
+// Get corrected reflection
+ReflDirectionWS
+IntersectPositionWS
+- CubemapPositionWS;
+Sub bullets= look
+like this
+
+
+
+return texCUBE(envMap, ReflDirectionWS);
+
+Parallax-corrected Cubemap
+
+ Works
+This subtitle
+20kind
+points
+well onisall
+of surfaces but…costly
+ OBB geometry
+ Bullets
+are blueproxy : ~21 instructions
+ For one parallax-corrected cubemap
+ They
+have 110% line spacing, 2 points before & after
+  Longer bullets in the form of a paragraph are harder to
+Cheaper approximation exists
+if there is insufficient line spacing. This is the
+ read
+NVIDIA / ATI demo
+recommended number of lines per slide
+ maximum
+Pseudo code
+(seven).
+D = normalize(K * (Pp - C) + R)
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ This subtitle is 20 points
+Object’s Shader with
+Object’shader
+
+Bullets
+are
+blue
+cubemaps
+parallax
+correction
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line
+spacing.
+This is the
+Mixing
+step with
+Scene
+Scene
+cubemaps
+parallax
+maximum
+recommended
+number
+of
+lines
+per
+slide
+rendering
+rendering
+correction
+(seven).
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+Parallax-corrected
+Cubemap
+ Longer
+bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+Mixing Step
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ No
+positions
+Thispixel
+subtitle
+is 20 points
+ Add
+a reflection
+Bullets
+are blue plane
+ Parallax
+correction
+is spacing, 2 points before & after
+They have
+110% line
+camera,
+ based
+Longeron
+bullets
+in the form of a paragraph are harder to
+geometry
+proxy
+and
+read if there
+is insufficient
+line spacing. This is the
+reflection
+maximumplane
+recommended number of lines per slide
+ For current point of view
+(seven).
+
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+// Intersection with OBB convert to unit box space
+
+ This
+float3 subtitle
+RayWS = normalize(GetCubeDir(...));
+// Current direction
+is 20 points
+float3 RayLS = mul((float3x3)WorldToLocal, RayWS);
+float3 ReflCameraLS
+ Bullets
+are blue= mul(WorldToLocal, ReflCameraWS); // Can be precalc
+// Same code as before but for ReflCameraLS and with unit box
+float3 Unitary
+= float3(1.0f,
+1.0f, 1.0f);
+ They
+have 110%
+line spacing,
+2 points before & after
+float3 FirstPlaneIntersect
+= (Unitary - ReflCameraLS) / RayLS;
+float3 SecondPlaneIntersect = (-Unitary - ReflCameraLS) / RayLS;
+ Longer
+bullets in the form of a paragraph are harder to
+float3 FurthestPlane = max(FirstPlaneIntersect, SecondPlaneIntersect);
+float Distance = min(FurthestPlane.x, min(FurthestPlane.y,
+FurthestPlane.z));
+// Use Distance in WS directly to recover intersection
+float3 IntersectPositionWS = ReflCameraWS + RayWS * Distance;
+float3 ReflDirectionWS = IntersectPositionWS - CubemapPositionWS;
+
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+
+
+Sub
+bullets look like
+this
+return
+texCUBE(envMap,
+ReflDirectionWS);
+
+Parallax-corrected cubemap
+
+ This subtitle is 20 points
+POI-based
+ Bullets are blue Object-based
+Parallax-corrected
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+Wrong Way!
+
+Parallax-corrected Cubemap
+
+ This
+Top-Dow
+viewisof20
+a points
+corridor with 3 local cubemaps
+subtitle
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ Video
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ With
+: Enlarge geometry proxy
+This glossy
+subtitlematerial
+is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ Distortion
+ This subtitle
+with glossy
+material
+is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Reference
+
+Our approximation
+
+Parallax-corrected cubemap
+
+ Error
+This subtitle
+analysisis 20 points
+ Parallax-corrected
+ Bullets
+are blue cubemap only works for one normal
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+
+ Improvement
+This subtitle is 20 points
+ Rasterizing
+parallax
+Bullets are blue
+ corrected
+They havecubemap
+110% line spacing, 2 points before & after
+ Draw the textured box volume
+ Longer
+bullets in the form of a paragraph are harder to
+from reflected camera position
+
+read if there is insufficient line spacing. This is the
+ No longer restricted to
+maximum recommended number of lines per slide
+box/sphere volume!
+(seven).
+ Tools for artists to define any
+ convex
+Sub bullets
+look like this
+volume
+
+Parallax-corrected Cubemap
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Parallax-corrected Cubemap
+// C++
+
+ This
+Matrix subtitle
+Mirror = CreateMirrorMatrix(ReflectionPlaneWS);
+is 20 points
+Vector ReflectedViewPositionWS = Mirror.TransformVector(ViewPositionWS);
+Matrix View
+= CalcCubeFaceViewMatrix(FaceIndex,
+ReflectedViewPositionWS);
+ Bullets
+are
+blue
+Matrix ViewProjection = View * Projection;
+ They
+have 110% line spacing, 2 points before & after
+// Shader
+VertexMain() {
+ Longer
+bullets= in
+the form of InPositionOS);
+a paragraph are harder to
+float4 PositionWS
+mul(LocalToWorld,
+float4 PositionSS = mul(ViewProjectionMatrix, PositionWS);
+read
+if there is insufficient line spacing. This is the
+OutPosition = PositionSS;
+OutDirection =recommended
+PositionWS.xyz - CubemapPositionWS.xyz;
+Current
+maximum
+number of lines //per
+slidedirection
+}
+(seven).
+PixelMain() {
+OutColor
+texCUBE(CubeTexture,
+Sub =bullets
+look like this OutDirection);
+}
+
+
+
+Sum up : Parallax-corrected Cubemap
+
+ Planar
+This subtitle
+is 20 points
+objects
+only
+# Cube
+PS3 (ms)
+X360 (ms)
+ Bullets
+ Convex
+are blue
+volumes
+1
+0.14
+0.29
+ Scalable
+ They
+withline
+number
+of
+2
+0.23 & after
+0.41
+have 110%
+spacing,
+2 points
+before
+cubemap
+3
+0.31
+0.52
+ Longer
+bullets in the form of a paragraph
+are harder
+to
+
+Measures for 128x128x6 DXT1 cubemap
+
+ General
+read if there is insufficient line spacing. This is the
+
+Measures for 25% / 75% screen coverage
+
+ Cheap recommended
+approximationnumber of# Cube
+maximum
+linesPS3per
+slideX360 (ms)
+(ms)
+ Per pixel correction
+(seven).
+1
+0.24 / 0.75 0.19 / 0.45
+ Simple
+ Sub
+2
+0.48 / 1.27 0.44 / 1.21
+bulletsvolume
+look like(Box/Sphere)
+this
+3
+
+0.72/ 2.26
+
+0.61 / 2.27
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in theCaveats
+form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Caveats - Distant lighting issues
+
+ This
+subtitle
+is 20 pointswith distance from POI
+Accuracy
+decreases
+ Bullets
+blue solutions to artists
+Provideare
+different
+ They
+110%lighting
+line spacing,
+2 points
+before position
+& after
+ Usehave
+ambient
+information
+at objects
+ Longer
+bullets
+in the form
+of a
+are harder to
+ Mix
+with cubemap
+based
+onparagraph
+POI distance
+read
+if there
+is insufficient
+line spacing.
+This is the
+ Fade
+cubemap
+contribution
+with distance
+maximum
+number
+of lines per slide
+ Helpsrecommended
+with performance
+too
+(seven).
+ Override cubemap by objects
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+Conclusion
+ Longer bullets in the
+form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+Takeaways
+
+ This
+is 20approach
+points
+Newsubtitle
+local IBL
+ Bullets
+are blue
+ Cheap
+ They
+have 110%
+spacing,
+ Replace
+costlyline
+real-time
+IBL2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+
+Several tools in the hands of the artists
+
+read if there is insufficient line spacing. This is the
+ To ease smooth lighting transition
+maximum recommended number of lines per slide
+ To get accurate lighting
+(seven).
+ Sub bullets look like this
+
+Future
+
+ These
+This subtitle
+20 points
+toolsis are
+not enough
+
+ Bullets
+are blue others
+ We developed
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+
+Described in upcoming
+read if there is insufficient line spacing. This is the
+GPU pro 4 book
+maximum recommended number of lines per slide
+to
+be released at GDC 2013
+(seven).
+ Sub bullets look like this
+
+Acknowledgments
+
+ This
+subtitle
+20 pointsartist) for his invaluable help on
+Frédéric
+Crosis(Lighting
+testing, are
+using
+and mastering our tools
+ Bullets
+blue
+ They
+DONTNOD
+team line spacing, 2 points before & after
+have 110%
+ Longer
+Thanks bullets
+to all my
+in reviewers
+the form of a paragraph are harder to
+ Naty
+Hoffman,
+Ware, line
+Stephen
+Hill, Laury
+Michel,
+Sam
+read
+if there
+is Gabriel
+insufficient
+spacing.
+This
+is the
+Hocevar, Jérôme Banal, Nicolas Serouart, Michel Koch, Brian
+maximum
+recommended number of lines per slide
+Karis, Colin Barré-Brisebois
+(seven).
+
+ Sub bullets look like this
+
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+
+Questions?
+
+read if there is insufficient line spacing. This is the
+Slides
+available
+at http://seblagarde.wordpress.com/
+maximum
+recommended
+number of lines per slide
+(seven).
+Twitter: @SebLagarde
+ Sub bullets look like this
+
+Email: Lagardese@hotmail.fr
+
+References
+Lagarde,
+“Tips, ticks
+guidelines for specular cubemaps”,
+ This
+subtitle
+is 20and
+points
+http://seblagarde.wordpress.com/2011/12/03/tips-tricks-and Bullets
+are blue
+guidelines-for-specular-cubemap/
+ They
+have
+110% 2line
+spacing,
+2 points before & after
+McTaggart,
+“Half-Life
+Valve
+Source Shading”
+http://www2.ati.com/developer/gdc/D3DTutorial10_Half Longer
+bullets in the form of a paragraph are harder to
+Life2_Shading.pdf
+
+read if there is insufficient line spacing. This is the
+ Bjorke, “Image based lighting”,
+maximum
+recommended number of lines per slide
+http://http.developer.nvidia.com/GPUGems/gpugems_ch19.html
+ (seven).
+Behc, “Box projected cubemap environment mapping”
+http://www.gamedev.net/topic/568829-box-projected-cubemap Sub bullets look like this
+environment-mapping/
+
+References
+Mad Mod
+Mike demo,
+Naked Truth Behind NVIDIA’s Demos”,
+ This
+subtitle
+is 20 “The
+points
+ftp.up.ac.za/mirrors/www.nvidia.com/developer/presentations/2005/SI
+ Bullets
+are blue
+GGRAPH/Truth_About_NVIDIA_Demos.pdf
+ They
+have
+110%Environment
+line spacing,
+2 points
+before
+after
+Brennan,
+“Accurate
+Mapped
+Reflections
+and &
+Refractions
+by Adjusting
+for Object
+Distance”,
+ Longer
+bullets
+in the
+form of a paragraph are harder to
+
+http://developer.amd.com/media/gpu_assets/ShaderX_CubeEnvironm
+
+read
+if there is insufficient line spacing. This is the
+entMapCorrection.pdf
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+This slide has a 16:9 media window
+ This subtitle is 20 points
+ Bullets are blue
+ They have 110% line spacing, 2 points before & after
+ Longer bullets in the form of a paragraph are harder to
+read if there is insufficient line spacing. This is the
+maximum recommended number of lines per slide
+(seven).
+ Sub bullets look like this
+
+
