@@ -277,6 +277,20 @@ struct ShaderInjectData {
   float foliage_grass_ao_base;             // AO at root [0..1] default 0.25
   float foliage_grass_ao_tip;              // AO at tip [0..1] default 1.0
   float foliage_grass_ao_curve;            // power exponent [0.1..2] default 0.5
+  // —— Motion Blur (camera-motion blur, Guertin et al. 2013) ——
+  float motion_blur_enabled;           // 0=Off, 1=On
+  float motion_blur_sample_count;      // [4..48] default 16
+  float motion_blur_tile_size_px;      // [4..150] default 40 — tile size in pixels (paper's r)
+  float motion_blur_strength;          // [0..1] default 1.0 blend factor
+  float motion_blur_noise_type;        // 0=Halton, 1=IS-FAST — jitter noise source
+  float motion_blur_velocity_scale;    // [0.1..5] default 1.0 — multiply motion vectors
+  float motion_blur_sample_spread;     // [0.1..5] default 1.0 — multiply sample distance
+  float motion_blur_half_res;          // 0=Off, 1=On — run at half res for performance
+  float motion_blur_velocity_max;      // [0..200] default 0 — max velocity clamp (0=off)
+  float motion_blur_debug_logging;     // 0=Off, 1=On — debug logging for motion blur
+  float motion_blur_adaptive_samples;  // 0=Off, 1=On — vary sample count by velocity magnitude
+  float motion_blur_velocity_source;   // 0=Game MV (auto), 1=Force depth reprojection
+  float motion_blur_debug_view;        // 0=Off, 1=Velocity visualization
 };
 
 #ifndef __cplusplus

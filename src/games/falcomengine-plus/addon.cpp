@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -242,6 +242,19 @@ ShaderInjectData shader_injection = {
   .foliage_grass_ao_base = 0.25f,
   .foliage_grass_ao_tip = 1.f,
   .foliage_grass_ao_curve = 0.5f,
+  .motion_blur_enabled = 0.f,
+  .motion_blur_sample_count = 16.f,
+  .motion_blur_tile_size_px = 40.f,
+  .motion_blur_strength = 1.f,
+  .motion_blur_noise_type = 0.f,
+  .motion_blur_velocity_scale = 1.f,
+  .motion_blur_sample_spread = 1.f,
+  .motion_blur_half_res = 0.f,
+  .motion_blur_velocity_max = 0.f,
+  .motion_blur_debug_logging = 0.f,
+  .motion_blur_adaptive_samples = 1.f,
+  .motion_blur_velocity_source = 0.f,
+  .motion_blur_debug_view = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -472,6 +485,52 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t last_uav0_handle = 0u;
   uint64_t last_cbv_handle = 0u;
   uint64_t last_sampler_handle = 0u;
+
+  // ── Motion blur (Guertin 2013) ──
+  reshade::api::resource mv_fullres_texture = {};
+  reshade::api::resource_view mv_fullres_srv = {};
+  reshade::api::resource_view mv_fullres_uav = {};
+  reshade::api::resource tilemax_texture = {};
+  reshade::api::resource_view tilemax_srv = {};
+  reshade::api::resource_view tilemax_uav = {};
+  reshade::api::resource neighbormax_texture = {};
+  reshade::api::resource_view neighbormax_srv = {};
+  reshade::api::resource_view neighbormax_uav = {};
+  reshade::api::resource blur_output_texture = {};
+  reshade::api::resource_view blur_output_srv = {};
+  reshade::api::resource_view blur_output_uav = {};
+  reshade::api::resource_view captured_ui_less_color_srv = {};
+  uint32_t mb_output_width = 0u;
+  uint32_t mb_output_height = 0u;
+  reshade::api::pipeline_layout mb_velocity_layout = {};
+  reshade::api::pipeline_layout mb_tilemax_layout = {};
+  reshade::api::pipeline_layout mb_neighbormax_layout = {};
+  reshade::api::pipeline_layout mb_reconstruct_layout = {};
+  GTVBAODescriptorTableSet mb_velocity_tables = {};
+  GTVBAODescriptorTableSet mb_tilemax_tables = {};
+  GTVBAODescriptorTableSet mb_neighbormax_tables = {};
+  GTVBAODescriptorTableSet mb_reconstruct_tables = {};
+  reshade::api::pipeline mb_velocity_pipeline = {};
+  reshade::api::pipeline mb_tilemax_pipeline = {};
+  reshade::api::pipeline mb_neighbormax_pipeline = {};
+  reshade::api::pipeline mb_reconstruct_pipeline = {};
+  reshade::api::resource mb_output_fullres_texture = {};
+  reshade::api::resource_view mb_output_fullres_srv = {};
+  reshade::api::resource_view mb_output_fullres_uav = {};
+  reshade::api::pipeline_layout mb_upscale_layout = {};
+  GTVBAODescriptorTableSet mb_upscale_tables = {};
+  reshade::api::pipeline mb_upscale_pipeline = {};
+  // Game motion vectors (captured from RTV4 of sky shader)
+  reshade::api::resource_view captured_mv_rtv = {};
+  reshade::api::resource_view captured_mv_srv = {};
+  bool captured_mv_valid = false;
+  uint32_t captured_mv_width = 0;
+  uint32_t captured_mv_height = 0;
+  reshade::api::pipeline_layout mb_velocity_game_mv_layout = {};
+  reshade::api::pipeline mb_velocity_game_mv_pipeline = {};
+  GTVBAODescriptorTableSet mb_velocity_game_mv_tables = {};
+  bool mb_resources_created = false;
+  bool mb_half_res = false;
 };
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
@@ -487,6 +546,11 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
 static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages, reshade::api::pipeline_layout layout,
     uint32_t param_index, const reshade::api::descriptor_table_update& update);
+static void CreateMotionBlurResources(reshade::api::device* dev, DeviceData* d, uint32_t gw, uint32_t gh, uint32_t output_w, uint32_t output_h);
+static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d);
+static bool RunMotionBlur(reshade::api::command_list* cmd_list, DeviceData* d, reshade::api::resource_view scene_color_srv);
+static bool OnBeforeUICompositeDraw(reshade::api::command_list* cmd_list);
+static void OnCaptureGameMVRTV(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv);
 
 // ── IS-FAST sync helpers (sync g_isfast_* globals → shader_injection) ──
 static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
@@ -636,6 +700,14 @@ static bool OnBeforeFoliageDraw(reshade::api::command_list* cmd_list) {
 // ═══════════ Custom shaders ═══════════
 
 renodx::mods::shader::CustomShaders custom_shaders = {
+    {
+        0xC9FA40B7u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xC9FA40B7u,
+            .code = __0xC9FA40B7,
+            .on_draw = OnBeforeUICompositeDraw,
+        },
+    },
     {
         0x954D3D6Du,
         renodx::mods::shader::CustomShader{
@@ -2546,6 +2618,109 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
+    // —— Motion Blur (Guertin et al. 2013 camera-motion blur post-process) ——
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurEnabled", .binding = &shader_injection.motion_blur_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Enable", .section = "Motion Blur",
+      .tooltip = "Camera-motion blur post-process (Guertin et al. 2013).",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurSampleCount", .binding = &shader_injection.motion_blur_sample_count,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 16.f, .label = "Sample Count", .section = "Motion Blur",
+      .tooltip = "Gather samples per pixel. Higher = smoother, more GPU cost. 25 matches the paper.",
+      .min = 4.f, .max = 48.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurTileSize", .binding = &shader_injection.motion_blur_tile_size_px,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 40.f, .label = "Tile Size (px)", .section = "Motion Blur",
+      .tooltip = "Tile size in pixels. Paper default=40. Smaller = finer velocity detail, larger = broader blur.",
+      .min = 4.f, .max = 150.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurVelocityScale", .binding = &shader_injection.motion_blur_velocity_scale,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Velocity Scale", .section = "Motion Blur",
+      .tooltip = "Multiply motion vectors. >1 = more blur, <1 = less blur.",
+      .min = 0.1f, .max = 5.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurSampleSpread", .binding = &shader_injection.motion_blur_sample_spread,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Sample Spread", .section = "Motion Blur",
+      .tooltip = "Multiply sample distance along blur direction. >1 = longer motion streaks.",
+      .min = 0.1f, .max = 5.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurStrength", .binding = &shader_injection.motion_blur_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Strength", .section = "Motion Blur",
+      .tooltip = "Blend original vs blurred. 0=off, 1=full.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurNoiseType", .binding = &shader_injection.motion_blur_noise_type,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Noise Type", .section = "Motion Blur",
+      .tooltip = "Jitter noise source. Halton = deterministic, IS-FAST = blue noise (better at low samples).",
+      .labels = {"Halton", "IS-FAST"},
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurHalfRes", .binding = &shader_injection.motion_blur_half_res,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Half Resolution", .section = "Motion Blur",
+      .tooltip = "Run at half resolution for ~2x performance.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurVelocityMax", .binding = &shader_injection.motion_blur_velocity_max,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "Max Velocity (px)", .section = "Motion Blur",
+      .tooltip = "Soft-clamp velocity at this pixel value. 0=off. Prevents excessive character blur.",
+      .min = 0.f, .max = 200.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurDebugLogging", .binding = &shader_injection.motion_blur_debug_logging,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Debug Logging", .section = "Motion Blur",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurAdaptiveSamples", .binding = &shader_injection.motion_blur_adaptive_samples,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Adaptive Sampling", .section = "Motion Blur",
+      .tooltip = "Use fewer samples for slow motion. Near-zero quality loss, ~40%% faster.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurVelocitySource", .binding = &shader_injection.motion_blur_velocity_source,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Velocity Source", .section = "Motion Blur",
+      .tooltip = "Motion vector source. Game MV = per-object + camera vectors. Depth reprojection = camera-only vectors.",
+      .labels = {"Game MV (auto)", "Depth Reprojection"},
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurDebugView", .binding = &shader_injection.motion_blur_debug_view,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Debug View", .section = "Motion Blur",
+      .tooltip = "Visualize processed motion vectors. R=horizontal+, G=vertical+. Gray=static.",
+      .labels = {"Off", "Velocity"},
+      .is_enabled = []() { return shader_injection.motion_blur_enabled > 0.5f; },
+    },
     new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::BUTTON,
       .label = "Reset All Settings to Defaults",
@@ -2653,6 +2828,235 @@ static void OnDestroyDevice(reshade::api::device* device) {
   }
 }
 
+// ── Motion blur: destroy resources ──
+static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  if (shader_injection.motion_blur_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info, "[MotionBlur] Destroying resources...");
+  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+  auto dp = [&](reshade::api::pipeline& p) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } };
+  auto dl = [&](reshade::api::pipeline_layout& l) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } };
+  auto dt = [&](GTVBAODescriptorTableSet& t) {
+    for (auto& tbl : t) { if (tbl.handle) { dev->free_descriptor_table(tbl); tbl = {}; } }
+  };
+  dv(d->mv_fullres_srv); dv(d->mv_fullres_uav); dr(d->mv_fullres_texture);
+  dv(d->tilemax_srv); dv(d->tilemax_uav); dr(d->tilemax_texture);
+  dv(d->neighbormax_srv); dv(d->neighbormax_uav); dr(d->neighbormax_texture);
+  dv(d->blur_output_srv); dv(d->blur_output_uav); dr(d->blur_output_texture);
+  dv(d->mb_output_fullres_srv); dv(d->mb_output_fullres_uav); dr(d->mb_output_fullres_texture);
+  dp(d->mb_velocity_pipeline); dl(d->mb_velocity_layout); dt(d->mb_velocity_tables);
+  dp(d->mb_tilemax_pipeline); dl(d->mb_tilemax_layout); dt(d->mb_tilemax_tables);
+  dp(d->mb_neighbormax_pipeline); dl(d->mb_neighbormax_layout); dt(d->mb_neighbormax_tables);
+  dp(d->mb_reconstruct_pipeline); dl(d->mb_reconstruct_layout); dt(d->mb_reconstruct_tables);
+  dp(d->mb_velocity_game_mv_pipeline); dl(d->mb_velocity_game_mv_layout); dt(d->mb_velocity_game_mv_tables);
+  dv(d->captured_mv_srv); d->captured_mv_rtv = {}; d->captured_mv_valid = false;
+  d->captured_mv_width = 0; d->captured_mv_height = 0;
+  dp(d->mb_upscale_pipeline); dl(d->mb_upscale_layout); dt(d->mb_upscale_tables);
+  d->mb_resources_created = false;
+  d->mb_half_res = false;
+}
+
+// ── Motion blur: create resources ──
+static void CreateMotionBlurResources(reshade::api::device* dev, DeviceData* d, uint32_t gw, uint32_t gh, uint32_t output_w, uint32_t output_h) {
+  if (!dev || !d) return;
+  DestroyMotionBlurResources(dev, d);
+  auto mk = [&](uint32_t tw, uint32_t th, reshade::api::format fmt,
+                reshade::api::resource* res, reshade::api::resource_view* srv,
+                reshade::api::resource_view* uav) {
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_2d;
+    rd.texture = {tw, th, 1, 1, fmt, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, res);
+    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, fmt, 0, 1, 0, 1);
+    if (srv) dev->create_resource_view(*res, reshade::api::resource_usage::shader_resource, vd, srv);
+    if (uav) dev->create_resource_view(*res, reshade::api::resource_usage::unordered_access, vd, uav);
+  };
+  uint32_t ow = output_w > 0 ? output_w : gw;
+  uint32_t oh = output_h > 0 ? output_h : gh;
+  bool half = shader_injection.motion_blur_half_res > 0.5f;
+  uint32_t mw = half ? (ow / 2u) : ow;
+  uint32_t mh = half ? (oh / 2u) : oh;
+  if (mw < 64u) mw = 64u; if (mh < 64u) mh = 64u;
+  // Working textures at half or full resolution
+  mk(mw, mh, reshade::api::format::r16g16_float,
+     &d->mv_fullres_texture, &d->mv_fullres_srv, &d->mv_fullres_uav);
+  mk(mw, mh, reshade::api::format::r16g16b16a16_float,
+     &d->blur_output_texture, &d->blur_output_srv, &d->blur_output_uav);
+  // Full-res output (always at display resolution for T0 passthrough)
+  mk(ow, oh, reshade::api::format::r16g16b16a16_float,
+     &d->mb_output_fullres_texture, &d->mb_output_fullres_srv, &d->mb_output_fullres_uav);
+  // Tile grid from working resolution
+  uint32_t r = (uint32_t)std::clamp(shader_injection.motion_blur_tile_size_px, 4.f, 150.f);
+  uint32_t tw = (mw + r - 1) / r; uint32_t th = (mh + r - 1) / r;
+  if (tw < 1) tw = 1; if (th < 1) th = 1;
+  mk(tw, th, reshade::api::format::r16g16_float, &d->tilemax_texture, &d->tilemax_srv, &d->tilemax_uav);
+  mk(tw, th, reshade::api::format::r16g16_float, &d->neighbormax_texture, &d->neighbormax_srv, &d->neighbormax_uav);
+  d->mb_output_width = ow; d->mb_output_height = oh;
+  d->mb_half_res = half;
+  d->mb_resources_created = true;
+  if (shader_injection.motion_blur_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info,
+      (std::string("[MotionBlur] Resources created: internal=") + std::to_string(gw) + "x" + std::to_string(gh) +
+       ", output=" + std::to_string(ow) + "x" + std::to_string(oh) + ", tileGrid=" + std::to_string(tw) + "x" + std::to_string(th) + ")").c_str());
+}
+
+// ── Motion blur: build push constants ──
+static std::array<float, 23> BuildMotionBlurPushConstants(DeviceData* d, uint32_t gw, uint32_t gh, uint32_t output_w, uint32_t output_h) {
+  std::array<float, 23> c = {};
+  uint32_t r = (uint32_t)std::clamp(shader_injection.motion_blur_tile_size_px, 4.f, 150.f);
+  bool half = shader_injection.motion_blur_half_res > 0.5f;
+  uint32_t mw = half ? (output_w / 2u) : output_w;
+  uint32_t mh = half ? (output_h / 2u) : output_h;
+  if (mw < 64u) mw = 64u; if (mh < 64u) mh = 64u;
+  uint32_t tw = (mw + r - 1) / r; uint32_t th = (mh + r - 1) / r;
+  if (tw < 1) tw = 1; if (th < 1) th = 1;
+  c[0]=shader_injection.motion_blur_enabled; c[1]=std::clamp(shader_injection.motion_blur_sample_count,4.f,48.f);
+  c[2]=(float)r; c[3]=1.f/(float)r; c[4]=std::clamp(shader_injection.motion_blur_strength,0.f,1.f);
+  c[5]=0.95f; c[6]=40.f; c[7]=1.5f;
+  c[8]=(float)mw; c[9]=(float)mh;
+  c[10]=(float)tw; c[11]=(float)th;
+  c[12] = d && d->captured_mv_valid ? (float)d->captured_mv_width : (float)gw;
+  c[13] = d && d->captured_mv_valid ? (float)d->captured_mv_height : (float)gh;
+  c[14]=shader_injection.motion_blur_noise_type;
+  c[15]=(float)(d ? d->frame_index : 0u);
+  c[16]=std::clamp(shader_injection.motion_blur_velocity_scale, 0.1f, 5.f);
+  c[17]=std::clamp(shader_injection.motion_blur_sample_spread, 0.1f, 5.f);
+  c[18]=(shader_injection.motion_blur_velocity_max > 0.5f) ? shader_injection.motion_blur_velocity_max : 0.f;
+  c[19]=(float)output_w; c[20]=(float)output_h;
+  c[21]=shader_injection.motion_blur_adaptive_samples;
+  c[22]=shader_injection.motion_blur_debug_view;
+  return c;
+}
+
+// ── Motion blur: dispatch ──
+static bool RunMotionBlur(reshade::api::command_list* cl, DeviceData* d, reshade::api::resource_view scene_color_srv) {
+  if (!cl || !d) return false;
+  if (!d->mb_resources_created) return false;
+  if (!d->captured_depth_srv.handle) return false;
+  if (shader_injection.motion_blur_enabled < 0.5f) return false;
+  auto* dev = cl->get_device();
+  if (!dev) return false;
+  if (!d->mb_velocity_pipeline.handle || !d->mb_tilemax_pipeline.handle || !d->mb_neighbormax_pipeline.handle
+      || !d->mb_reconstruct_pipeline.handle) {
+    if (shader_injection.motion_blur_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::warning, "[MotionBlur] Skipped: pipelines not created");
+    return false;
+  }
+  const auto UA = reshade::api::resource_usage::unordered_access;
+  const auto SR = reshade::api::resource_usage::shader_resource;
+  const auto CS = reshade::api::shader_stage::all_compute;
+  const auto AC = reshade::api::pipeline_stage::all_compute;
+  auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
+    if (r.handle) cl->barrier(r, o, n);
+  };
+  auto apply_descriptors = [&](reshade::api::pipeline_layout lo, GTVBAODescriptorTableSet* tbl, uint32_t count,
+                                const reshade::api::descriptor_table_update* updates) {
+    std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
+    for (uint32_t i=0;i<count;++i){u[i]=updates[i];u[i].table=(*tbl)[i];}
+    dev->update_descriptor_tables(count,u.data());
+    std::array<reshade::api::descriptor_table,kGtvbaoDescriptorTableParamCount>b={};
+    for (uint32_t i=0;i<count;++i)b[i]=(*tbl)[i];
+    cl->bind_descriptor_tables(CS,lo,0,count,b.data());
+  };
+  uint32_t gw=d->last_created_game_width, gh=d->last_created_game_height;
+  if (d->mb_output_width == 0u || d->mb_output_height == 0u) {
+    if (shader_injection.motion_blur_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::warning,
+        "[MotionBlur] Skipped: mb_output_width/height is 0 (resources created without valid backbuffer?)");
+    return false;
+  }
+  uint32_t ow=d->mb_output_width, oh=d->mb_output_height;
+  bool half = shader_injection.motion_blur_half_res > 0.5f;
+  uint32_t mw = half ? (ow / 2u) : ow, mh = half ? (oh / 2u) : oh;
+  if (mw < 64u) mw = 64u; if (mh < 64u) mh = 64u;
+  auto pc=BuildMotionBlurPushConstants(d,gw,gh,ow,oh);
+  uint32_t tw=(uint32_t)pc[10],th=(uint32_t)pc[11];
+  if(shader_injection.motion_blur_debug_logging>0.5f)
+    reshade::log::message(reshade::log::level::info,(std::string("[MotionBlur] Dispatch: frame=")+std::to_string(d->frame_index)+", output="+std::to_string(ow)+"x"+std::to_string(oh)+", depth="+std::to_string(gw)+"x"+std::to_string(gh)+", samples="+std::to_string((int)pc[1])+", strength="+std::to_string(pc[4])).c_str());
+  // Pass 0: Velocity — use game motion vectors if available, otherwise depth reprojection
+  // User can force depth reprojection via Velocity Source setting
+  { bool useGameMV = (shader_injection.motion_blur_velocity_source < 0.5f)
+      && d->captured_mv_valid && d->mb_velocity_game_mv_pipeline.handle;
+  if (shader_injection.motion_blur_debug_logging > 0.5f)
+    reshade::log::message(reshade::log::level::info,
+      (std::string("[MotionBlur] Velocity: ") + (useGameMV ? "game MV" : "depth reprojection")).c_str());
+  if (useGameMV) {
+    cl->bind_pipeline(AC, d->mb_velocity_game_mv_pipeline);
+    reshade::api::descriptor_table_update u[4]={{ {},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler },{ {},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view },{ {},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_mv_srv },{ {},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->mv_fullres_uav }};
+    apply_descriptors(d->mb_velocity_game_mv_layout, &d->mb_velocity_game_mv_tables, 4, u);
+    cl->push_constants(CS, d->mb_velocity_game_mv_layout, 4, 0, 23, pc.data());
+  } else {
+    cl->bind_pipeline(AC, d->mb_velocity_pipeline);
+    reshade::api::descriptor_table_update u[4]={{ {},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler },{ {},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view },{ {},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_depth_srv },{ {},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->mv_fullres_uav }};
+    apply_descriptors(d->mb_velocity_layout, &d->mb_velocity_tables, 4, u);
+    cl->push_constants(CS, d->mb_velocity_layout, 4, 0, 23, pc.data());
+  }
+  cl->dispatch((mw+7)/8,(mh+7)/8,1); bar(d->mv_fullres_texture,UA,SR); }
+  // Pass 1: TileMax
+  { cl->bind_pipeline(AC,d->mb_tilemax_pipeline);
+    reshade::api::descriptor_table_update u[4]={{ {},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler },{ {},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view },{ {},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->mv_fullres_srv },{ {},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->tilemax_uav }};
+    apply_descriptors(d->mb_tilemax_layout,&d->mb_tilemax_tables,4,u);
+    cl->push_constants(CS,d->mb_tilemax_layout,4,0,23,pc.data());
+    cl->dispatch(tw,th,1); bar(d->tilemax_texture,UA,SR); }
+  // Pass 2: NeighborMax
+  { cl->bind_pipeline(AC,d->mb_neighbormax_pipeline);
+    reshade::api::descriptor_table_update u[4]={{ {},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler },{ {},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view },{ {},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->tilemax_srv },{ {},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->neighbormax_uav }};
+    apply_descriptors(d->mb_neighbormax_layout,&d->mb_neighbormax_tables,4,u);
+    cl->push_constants(CS,d->mb_neighbormax_layout,4,0,23,pc.data());
+    cl->dispatch((tw+7)/8,(th+7)/8,1); bar(d->neighbormax_texture,UA,SR); }
+  // Pass 3: Reconstruct (output res, t0=captured T0, t4=IS-FAST noise)
+  { cl->bind_pipeline(AC,d->mb_reconstruct_pipeline);
+    reshade::api::resource_view recon_srvs[5]={scene_color_srv,d->neighbormax_srv,d->mv_fullres_srv,d->captured_depth_srv,d->isfast_noise_srv};
+    reshade::api::descriptor_table_update u[4]={{ {},0,0,1,reshade::api::descriptor_type::sampler,&d->isfast_sampler },{ {},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view },{ {},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,recon_srvs },{ {},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->blur_output_uav }};
+    apply_descriptors(d->mb_reconstruct_layout,&d->mb_reconstruct_tables,4,u);
+    cl->push_constants(CS,d->mb_reconstruct_layout,4,0,23,pc.data());
+    cl->dispatch((mw+7)/8,(mh+7)/8,1); bar(d->blur_output_texture,UA,SR); }
+  // Pass 4: Upsample to full-res output (only when half-res is on)
+  if (half && d->mb_upscale_pipeline.handle) {
+    if (shader_injection.motion_blur_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::info,
+        (std::string("[MotionBlur] Upsample: src=") + std::to_string(mw) + "x" + std::to_string(mh) +
+         " dst=" + std::to_string(ow) + "x" + std::to_string(oh) +
+         " groups=" + std::to_string((ow+7)/8) + "x" + std::to_string((oh+7)/8)).c_str());
+    cl->bind_pipeline(AC,d->mb_upscale_pipeline);
+    reshade::api::resource_view upsample_srvs[2] = { d->blur_output_srv, scene_color_srv };
+    reshade::api::descriptor_table_update u[4]={{ {},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler },{ {},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view },{ {},0,0,2,reshade::api::descriptor_type::texture_shader_resource_view,upsample_srvs },{ {},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->mb_output_fullres_uav }};
+    apply_descriptors(d->mb_upscale_layout,&d->mb_upscale_tables,4,u);
+    cl->push_constants(CS,d->mb_upscale_layout,4,0,23,pc.data());
+    cl->dispatch((ow+7)/8,(oh+7)/8,1); bar(d->mb_output_fullres_texture,UA,SR); }
+  return true;
+}
+
+// ── Motion blur: 0xC9FA40B7 hook ──
+static bool OnBeforeUICompositeDraw(reshade::api::command_list* cmd_list) {
+  if (shader_injection.motion_blur_enabled < 0.5f) return true;
+  auto* dev = cmd_list->get_device(); if (!dev) return true;
+  auto* d = dev->get_private_data<DeviceData>(); if (!d || !d->mb_resources_created) return true;
+  if (!d->captured_depth_srv.handle) return true;
+  bool ok = RunMotionBlur(cmd_list, d, d->captured_ui_less_color_srv);
+  bool half = shader_injection.motion_blur_half_res > 0.5f;
+  reshade::api::resource_view result_srv = half
+      ? d->mb_output_fullres_srv : d->blur_output_srv;
+  if (ok && result_srv.handle) {
+    cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+      reshade::api::descriptor_table_update{{},0u,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&result_srv});
+  }
+  if (shader_injection.motion_blur_debug_logging > 0.5f) {
+    auto bres = dev->get_resource_from_view(result_srv);
+    auto bd = (bres.handle) ? dev->get_resource_desc(bres) : reshade::api::resource_desc{};
+    reshade::log::message(reshade::log::level::info,
+      (std::string("[MotionBlur] hook: ") + (ok ? "OK" : "FAIL") +
+       " pushed=" + std::to_string(bd.texture.width) + "x" + std::to_string(bd.texture.height) +
+       " (half=" + (half ? "1" : "0") + ")" +
+       " mbOut=" + std::to_string(d->mb_output_width) + "x" + std::to_string(d->mb_output_height) +
+       " lastGame=" + std::to_string(d->last_created_game_width) + "x" + std::to_string(d->last_created_game_height)).c_str());
+  }
+  return true;
+}
+
 static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
   auto* d = sc->get_device()->get_private_data<DeviceData>();
   if (!d) return;
@@ -2713,6 +3117,42 @@ static bool IsSceneCbvCandidateValid(reshade::api::device* device,
   return desc.buffer.size >= kSceneCbMinimumBytes
       && desc.buffer.size <= (64u * 1024u)
       && range.offset + range.size <= desc.buffer.size;
+}
+
+// ── Bind-render-targets event → capture game motion vectors from RTV4 ──
+
+static void OnCaptureGameMVRTV(reshade::api::command_list* cmd_list,
+    uint32_t count, const reshade::api::resource_view* rtvs,
+    reshade::api::resource_view dsv) {
+  if (!cmd_list || count <= 4 || !rtvs || !rtvs[4].handle) return;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d || d->captured_mv_srv.handle) return;  // already captured
+  d->captured_mv_rtv = rtvs[4];
+  auto res = dev->get_resource_from_view(rtvs[4]);
+  if (!res.handle) {
+    if (shader_injection.motion_blur_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::warning,
+        "[MotionBlur] Game MV capture: get_resource_from_view failed");
+    return;
+  }
+  reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d,
+      reshade::api::format::r16g16_float, 0, 1, 0, 1);
+  if (!dev->create_resource_view(res, reshade::api::resource_usage::shader_resource, vd, &d->captured_mv_srv)) {
+    if (shader_injection.motion_blur_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::warning,
+        "[MotionBlur] Game MV capture: create_resource_view failed — falling back to depth reprojection");
+    d->captured_mv_rtv = {};
+    return;
+  }
+  auto mvDesc = dev->get_resource_desc(res);
+  d->captured_mv_valid = true;
+  d->captured_mv_width = mvDesc.texture.width;
+  d->captured_mv_height = mvDesc.texture.height;
+  reshade::log::message(reshade::log::level::info,
+    (std::string("[MotionBlur] Game MV captured from RTV4 — using game motion vectors (")
+      + std::to_string(d->captured_mv_width) + "x" + std::to_string(d->captured_mv_height) + ")").c_str());
 }
 
 // ── Push-descriptors event → capture lighting inputs (kai pattern) ──
@@ -2796,6 +3236,23 @@ static void OnPushDescriptorsCapture(
           d->captured_scene_cbv_valid = true;
           d->captured_scene_cbv_frame = d->frame_index;
           d->captured_scene_cbv_view = cbv_views[0];
+        }
+      }
+    }
+  }
+
+  // ── Motion blur: capture T0 from 0xC9FA40B7 (UI-less composite) ──
+  // Must run BEFORE the GTVBAO gate below, since motion blur works independently of GTVBAO.
+  if (shader_injection.motion_blur_enabled > 0.5f && update.type == reshade::api::descriptor_type::texture_shader_resource_view) {
+    auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
+    if (update.binding == 0u && update.count >= 1 && views[0].handle != 0u) {
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (hash == 0xC9FA40B7u) {
+          d->captured_ui_less_color_srv = views[0];
+          if (shader_injection.motion_blur_debug_logging > 0.5f)
+            reshade::log::message(reshade::log::level::info, "[MotionBlur] T0 captured from 0xC9FA40B7");
         }
       }
     }
@@ -3043,9 +3500,15 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     const bool too_small = d->working_width < 320u || d->working_height < 320u;
     if (gw > 0u && gh > 0u
         && (!d->resources_created || too_small
+            || d->mb_half_res != (shader_injection.motion_blur_half_res > 0.5f)
             || gw != d->last_created_game_width
             || gh != d->last_created_game_height)) {
       CreateGTVBAOResources(dev, d, gw, gh);
+      {
+        auto bb = sc->get_back_buffer(0);
+        auto bd = dev->get_resource_desc(bb);
+        CreateMotionBlurResources(dev, d, gw, gh, bd.texture.width, bd.texture.height);
+      }
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
       d->resources_created = true;
@@ -3441,6 +3904,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   // Do NOT clear captured_depth_srv / captured_scene_cbv —
   // those reference game-owned resources that survive recreation.
   d->resources_created = false;
+  DestroyMotionBlurResources(dev, d);
 }
 
 // ── Push constants builder (kai-vanillaplus style) ──
@@ -3548,10 +4012,18 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; }
   };
   dl(d->prefilter_layout); dl(d->main_layout); dl(d->denoise_layout);
+  dl(d->mb_velocity_layout); dl(d->mb_tilemax_layout); dl(d->mb_neighbormax_layout);
+  dl(d->mb_reconstruct_layout);
+  dl(d->mb_upscale_layout);
+  dl(d->mb_velocity_game_mv_layout);
   dp(d->prefilter_pipeline); dp(d->main_low_pipeline); dp(d->main_medium_pipeline);
   dp(d->main_high_pipeline); dp(d->main_ultra_pipeline); dp(d->denoise_pipeline);
   dp(d->denoise_last_pipeline);
   dp(d->denoise_last_kai_pipeline);
+  dp(d->mb_velocity_pipeline); dp(d->mb_tilemax_pipeline); dp(d->mb_neighbormax_pipeline);
+  dp(d->mb_reconstruct_pipeline);
+  dp(d->mb_upscale_pipeline);
+  dp(d->mb_velocity_game_mv_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -3626,6 +4098,28 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   // Kai variant: same layout, different CSO with correct prevViewProj_g at c85
   if (!d->denoise_last_kai_pipeline.handle) mkcs(__gtvbao_denoise_last_kai, "main", d->denoise_layout, &d->denoise_last_kai_pipeline);
   if (!d->multibounce_pipeline.handle)   mkcs(__gtvbao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
+
+  // ── Motion blur pipelines ──
+  if (!d->mb_velocity_layout.handle && !make_layout(1u, 1u, &d->mb_velocity_layout)) return false;
+  if (!d->mb_tilemax_layout.handle && !make_layout(1u, 1u, &d->mb_tilemax_layout)) return false;
+  if (!d->mb_neighbormax_layout.handle && !make_layout(1u, 1u, &d->mb_neighbormax_layout)) return false;
+  if (!d->mb_reconstruct_layout.handle && !make_layout(5u, 1u, &d->mb_reconstruct_layout)) return false;
+  EnsureGTVBAODescriptorTables(dev, d->mb_velocity_layout, &d->mb_velocity_tables);
+  if (!d->mb_velocity_pipeline.handle) mkcs(__motion_blur_velocity, "main", d->mb_velocity_layout, &d->mb_velocity_pipeline);
+  EnsureGTVBAODescriptorTables(dev, d->mb_tilemax_layout, &d->mb_tilemax_tables);
+  if (!d->mb_tilemax_pipeline.handle) mkcs(__motion_blur_tilemax, "main", d->mb_tilemax_layout, &d->mb_tilemax_pipeline);
+  EnsureGTVBAODescriptorTables(dev, d->mb_neighbormax_layout, &d->mb_neighbormax_tables);
+  if (!d->mb_neighbormax_pipeline.handle) mkcs(__motion_blur_neighbormax, "main", d->mb_neighbormax_layout, &d->mb_neighbormax_pipeline);
+  EnsureGTVBAODescriptorTables(dev, d->mb_reconstruct_layout, &d->mb_reconstruct_tables);
+  if (!d->mb_reconstruct_pipeline.handle) mkcs(__motion_blur_reconstruct, "main", d->mb_reconstruct_layout, &d->mb_reconstruct_pipeline);
+  // Upscale (half-res → full-res, only used when Half Resolution is on)
+  if (!d->mb_upscale_layout.handle && !make_layout(2u, 1u, &d->mb_upscale_layout)) return false;
+  EnsureGTVBAODescriptorTables(dev, d->mb_upscale_layout, &d->mb_upscale_tables);
+  // Game MV variant: reads game motion vectors instead of depth reprojection
+  if (!d->mb_velocity_game_mv_layout.handle && !make_layout(1u, 1u, &d->mb_velocity_game_mv_layout)) return false;
+  EnsureGTVBAODescriptorTables(dev, d->mb_velocity_game_mv_layout, &d->mb_velocity_game_mv_tables);
+  if (!d->mb_velocity_game_mv_pipeline.handle) mkcs(__motion_blur_velocity_game_mv, "main", d->mb_velocity_game_mv_layout, &d->mb_velocity_game_mv_pipeline);
+  if (!d->mb_upscale_pipeline.handle) mkcs(__motion_blur_halfres_upscale, "main", d->mb_upscale_layout, &d->mb_upscale_pipeline);
 
   // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
   // no separate VBGI pipeline needed — main_layout handles both AO and GI outputs.
@@ -4091,6 +4585,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnCaptureGameMVRTV);
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
@@ -4099,6 +4594,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnCaptureGameMVRTV);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
       reshade::unregister_addon(h_module);
       break;
