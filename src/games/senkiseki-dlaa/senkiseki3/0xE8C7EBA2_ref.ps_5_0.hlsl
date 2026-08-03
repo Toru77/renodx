@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Tue Jul 28 01:02:54 2026
+// ---- Created with 3Dmigoto v1.4.1 on Wed Jul 29 03:27:07 2026
 
 SamplerState PointClampSampler_s : register(s0);
 Texture2D<float4> ColorBuffer : register(t0);

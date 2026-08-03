@@ -676,7 +676,7 @@ foreach(FILE ${ADDON_FILES})
   add_dependencies(${ADDON} ${ADDON}-shaders)
   add_dependencies(${ADDON} detours)
   target_link_libraries(${ADDON} PRIVATE detours)
-  if(ADDON STREQUAL "senkiseki-dlaa" OR ADDON STREQUAL "haloinfinite")
+  if(ADDON STREQUAL "haloinfinite")
     target_link_libraries(${ADDON} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib)
   endif()
   target_include_directories(${ADDON} SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/Detours/include)
@@ -688,21 +688,11 @@ foreach(FILE ${ADDON_FILES})
   target_include_directories(${ADDON} SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/reshade)
   target_include_directories(${ADDON} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/${ADDON}.include)
   #target_compile_definitions(${ADDON} PRIVATE _UNICODE)
-  if(ADDON STREQUAL "kai" OR ADDON STREQUAL "kai-vanillaplus")
-    target_compile_options(${ADDON} PRIVATE /utf-8)
-    set_target_properties(${ADDON}
-      PROPERTIES
-      PREFIX ""
-      OUTPUT_NAME "kai-vanilla-plus"
-      SUFFIX ${TARGET_SUFFIX}
-    )
-  else()
-    set_target_properties(${ADDON}
-      PROPERTIES
-      PREFIX "renodx-"
-      SUFFIX ${TARGET_SUFFIX}
-    )
-  endif()
+  set_target_properties(${ADDON}
+    PROPERTIES
+    PREFIX "renodx-"
+    SUFFIX ${TARGET_SUFFIX}
+  )
 endforeach()
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})

@@ -67,9 +67,6 @@ cbuffer _Globals : register(b0)
   float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
   float4 PointLightParams : packoffset(c59) = {0,0,0,0};
   float4 PointLightColor : packoffset(c60) = {0,0,0,0};
-
-  // DLAA: Previous frame view-projection matrix
-  float4x4 prevViewProjection : packoffset(c74);
 }
 
 StructuredBuffer<float4x4> BoneTransformConstantBuffer : register(t0);
@@ -139,16 +136,19 @@ void main(
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
 
-  // ── DLAA: Apply camera jitter to SV_Position ──
-  float4 jitteredPos = r1;
-  if (DLAA_JITTER_ENABLED > 0.5f) {
-    jitteredPos.x += DLAA_JITTER_X * jitteredPos.w;
-    jitteredPos.y += DLAA_JITTER_Y * jitteredPos.w;
-  }
-  o0.xyzw = jitteredPos;
+  // ── DLAA: no geometry jitter here — the camera jitter is applied at the
+  // pre-FXAA composite (0xE8C7EBA2) as an image-level UV shift instead.
+  o0.xyzw = r1;
 
   // ── DLAA: Per-object motion vectors (prev clip-space position) ──
+  // Senkiseki3 does not populate cb0 c74 (Sora engine only), so the previous
+  // frame's ViewProjection is injected by the addon via the b13 cbuffer.
   if (DLAA_PER_OBJECT_MOTION > 0.5f) {
+    float4x4 prevViewProjection = float4x4(
+        shader_injection_data.prev_view_proj[0],  shader_injection_data.prev_view_proj[1],  shader_injection_data.prev_view_proj[2],  shader_injection_data.prev_view_proj[3],
+        shader_injection_data.prev_view_proj[4],  shader_injection_data.prev_view_proj[5],  shader_injection_data.prev_view_proj[6],  shader_injection_data.prev_view_proj[7],
+        shader_injection_data.prev_view_proj[8],  shader_injection_data.prev_view_proj[9],  shader_injection_data.prev_view_proj[10], shader_injection_data.prev_view_proj[11],
+        shader_injection_data.prev_view_proj[12], shader_injection_data.prev_view_proj[13], shader_injection_data.prev_view_proj[14], shader_injection_data.prev_view_proj[15]);
     float4 prevClip;
     prevClip.x = dot(r0.xyzw, prevViewProjection._m00_m10_m20_m30);
     prevClip.y = dot(r0.xyzw, prevViewProjection._m01_m11_m21_m31);
@@ -160,7 +160,7 @@ void main(
   }
 
   // ── Original outputs ──
-  o6.xyzw = r1.xyzw;  // TEXCOORD10 = original (un-jittered) clip-space position
+  o6.xyzw = r1;  // TEXCOORD10 = clip position
   o1.xyzw = float4(1,1,1,1);
   r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
 
