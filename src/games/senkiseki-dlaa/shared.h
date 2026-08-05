@@ -42,6 +42,9 @@ struct ShaderInjectData {
 
   // ── Effect/particle exclusion (read by the velocity compute via push constants) ──
   float dlaa_exclude_effects;  // 0=Off, 1=On — mask particles/effects out of DLAA (invalid-MV opt-out)
+
+  // ── Jitter method (addon-side; read by the addon + VS injection) ──
+  float dlaa_jitter_method;    // 0=Per VS (jitter inside replaced VSs), 1=Global (patch shared ViewProjection)
 };
 
 #ifndef __cplusplus
@@ -63,6 +66,7 @@ cbuffer shader_injection : register(b13) {
 #define DLAA_JITTER_X             shader_injection_data.jitter_offset_x
 #define DLAA_JITTER_Y             shader_injection_data.jitter_offset_y
 #define DLAA_EXCLUDE_EFFECTS      shader_injection_data.dlaa_exclude_effects
+#define DLAA_JITTER_METHOD        shader_injection_data.dlaa_jitter_method
 
 #endif
 

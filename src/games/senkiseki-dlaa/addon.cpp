@@ -99,6 +99,24 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   float viewport_w = 2560.f, viewport_h = 1440.f;
   float swapchain_w = 2560.f, swapchain_h = 1440.f;
   float jitter_x = 0.f, jitter_y = 0.f;
+  // Global jitter (Jitter Method = Global): unjittered ViewProjection captured
+  // from the game's b0 _Globals upload, plus the last VP write state so the
+  // per-draw bind-time write only happens when the jitter state actually flips.
+  std::array<float, 16> globals_unjittered_vp = {};
+  bool globals_vp_captured = false;
+  bool globals_last_vp_jittered = false;
+  // Per-buffer record of the UNJITTERED VP captured from each _Globals upload.
+  // Used by the draw-time effect un-jitter so an effect draw reverts to its OWN
+  // buffer's unjittered VP (never a stale one from another buffer).
+  struct GlobalsBufferRec {
+    reshade::api::resource res = {};
+    std::array<float, 16> unjittered_vp = {};
+  };
+  std::vector<GlobalsBufferRec> globals_recs;
+  uint32_t globals_patch_count = 0;  // _Globals uploads captured this frame (diag)
+  uint32_t globals_map_count = 0;    // large buffers mapped this frame (diag)
+  reshade::api::resource last_b0_buffer = {};  // last b0 CB bound (global jitter writes VP here at draw time)
+  bool in_own_upload = false;  // recursion guard: we're re-issuing a jittered _Globals upload
   uint32_t frame_index = 0u;
   bool resources_created = false;
 
@@ -412,6 +430,12 @@ static void MaybeLogEffectDraw(reshade::api::command_list* cmd_list, DeviceData*
 // This is PS-driven (not VS-driven) so shared VSs like 0xDFE5A75D keep jitter
 // in their geometry pass and lose it only in their effect/transparent pass.
 static void ApplyPerDrawJitter(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (shader_injection.dlaa_jitter_method > 0.5f) {
+    // Global method: per-VS injection offsets stay 0 (the VP patch handles jitter).
+    shader_injection.jitter_offset_x = 0.f;
+    shader_injection.jitter_offset_y = 0.f;
+    return;
+  }
   auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
   if (IsEffectPs(phash)) {
@@ -423,6 +447,79 @@ static void ApplyPerDrawJitter(reshade::api::command_list* cmd_list, DeviceData*
   }
 }
 
+// Global jitter: draw-time VP correction.
+// Scene geometry is jittered reliably at the SOURCE (OnUpdateBufferRegion
+// patches every _Globals upload), so scene draws need no draw-time write — and
+// writing here could clobber the correctly-patched VP with a stale captured one
+// from a different buffer. Draw-time only handles:
+//   * effect draws (excluded from DLAA): revert to THIS buffer's own unjittered
+//     VP so effects don't shimmer/move;
+//   * untracked buffers (upload missed jitter, e.g. Map-updated): fallback write.
+static DeviceData::GlobalsBufferRec* FindGlobalsRec(DeviceData* d, reshade::api::resource res);  // defined below
+static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (!cmd_list || !d) return;
+  if (shader_injection.dlaa_jitter_method < 0.5f) return;
+  if (shader_injection.dlaa_jitter_enabled < 0.5f && shader_injection.dlaa_jitter_test < 0.5f) return;
+  // Gate-failure diagnostics: periodic (first few, then every 250th) so we can
+  // see WHY the draw-time write doesn't fire in-game even after the start-menu
+  // consumed the first-slot probes.
+  if (!d->globals_vp_captured || !d->last_b0_buffer.handle) {
+    if (shader_injection.dlaa_debug_logging > 0.5f) {
+      static int skip_probe = 0;
+      if (skip_probe++ < 5 || skip_probe % 250 == 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[DLAA] global: draw SKIP (captured=%d last_b0=0x%llX)",
+                 (int)d->globals_vp_captured, (unsigned long long)d->last_b0_buffer.handle);
+        reshade::log::message(reshade::log::level::info, buf);
+      }
+    }
+    return;
+  }
+  auto* dev = cmd_list->get_device();
+  if (!dev) return;
+  auto rd = dev->get_resource_desc(d->last_b0_buffer);
+  if (rd.type != reshade::api::resource_type::buffer || rd.buffer.size < 768ull) {
+    if (shader_injection.dlaa_debug_logging > 0.5f) {
+      static int size_probe = 0;
+      if (size_probe++ < 5 || size_probe % 250 == 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "[DLAA] global: draw SKIP small buffer=0x%llX size=%llu",
+                 (unsigned long long)d->last_b0_buffer.handle,
+                 (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull));
+        reshade::log::message(reshade::log::level::info, buf);
+      }
+    }
+    return;
+  }
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  bool want_jittered = !IsEffectPs(phash);
+  // Scene draw on a tracked (source-patched) buffer: already jittered, leave it.
+  auto* rec = FindGlobalsRec(d, d->last_b0_buffer);
+  if (want_jittered && rec) return;
+  // Choose the VP to write: this buffer's own unjittered VP when known (effect
+  // un-jitter), else the global captured VP (jittered for untracked scene
+  // fallback, unjittered for untracked effect fallback).
+  std::array<float, 16> vp = rec ? rec->unjittered_vp : d->globals_unjittered_vp;
+  if (want_jittered && !rec) {
+    for (int i = 0; i < 4; ++i) {
+      vp[i] += d->jitter_x * vp[12 + i];
+      vp[4 + i] += d->jitter_y * vp[12 + i];
+    }
+  }
+  dev->update_buffer_region(vp.data(), d->last_b0_buffer, 160ull, 64ull);
+  if (shader_injection.dlaa_debug_logging > 0.5f) {
+    static int wprobe = 0;
+    if (wprobe++ < 5 || wprobe % 250 == 0) {
+      char wbuf[160];
+      snprintf(wbuf, sizeof(wbuf), "[DLAA] global: draw VP write buffer=0x%llX size=%llu jittered=%d ps=0x%08X",
+               (unsigned long long)d->last_b0_buffer.handle,
+               (unsigned long long)rd.buffer.size, (int)want_jittered, phash);
+      reshade::log::message(reshade::log::level::info, wbuf);
+    }
+  }
+}
+
 // Draw hooks: append the mask RT right before effect draws (the PS is
 // guaranteed to be bound here, unlike at the RT-bind event).
 static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
@@ -431,6 +528,7 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
     ApplyPerDrawJitter(cmd_list, d);
+    MaybeWriteGlobalsVp(cmd_list, d);
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
   }
@@ -442,6 +540,7 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
     ApplyPerDrawJitter(cmd_list, d);
+    MaybeWriteGlobalsVp(cmd_list, d);
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
   }
@@ -624,6 +723,20 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
   memcpy(view_inv.data(),  data + 224 / 4, 64);  // c14 ViewInverse
   memcpy(proj_inv.data(),  data + 288 / 4, 64);  // c18 ProjectionInverse
   ctx->Unmap(d->scene_cbv_staging, 0);
+
+  // Global jitter method: the staged copy captured the JITTERED VP (we patch
+  // b0 at bind time). Prefer the exact unjittered VP captured from the game's
+  // upload so the velocity reprojection stays jitter-free.
+  if (shader_injection.dlaa_jitter_method > 0.5f) {
+    if (d->globals_vp_captured) {
+      view_proj = d->globals_unjittered_vp;
+    } else {
+      for (int i = 0; i < 4; ++i) {
+        view_proj[i] -= d->jitter_x * view_proj[12 + i];
+        view_proj[4 + i] -= d->jitter_y * view_proj[12 + i];
+      }
+    }
+  }
 
   float sum = 0.f;
   for (float v : view_proj) sum += v;
@@ -833,6 +946,7 @@ static void OnPushDescriptorsCapture(
       if (cbv->buffer.handle) {
         auto* cbv_ss = renodx::utils::shader::GetCurrentState(cmd_list);
         uint32_t vhash = cbv_ss ? renodx::utils::shader::GetCurrentVertexShaderHash(cbv_ss) : 0u;
+        uint32_t phash = cbv_ss ? renodx::utils::shader::GetCurrentPixelShaderHash(cbv_ss) : 0u;
         if (IsSceneGeometryVs(vhash)) {
           d->captured_scene_cbv = *cbv;
           d->captured_scene_cbv_valid = true;
@@ -842,8 +956,153 @@ static void OnPushDescriptorsCapture(
             d->scene_cbv_copy_issued = IssueSceneCbvCopy(cmd_list, d);
           }
         }
+        // Track the last b0 buffer bound for the VERTEX stage (the VS reads the
+        // ViewProjection from it). PS-stage b0 binds (material cbuffers) must
+        // NOT overwrite this, or the draw-time write would target the wrong
+        // (often small) buffer.
+        if ((stage & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex) {
+          d->last_b0_buffer = cbv->buffer;
+          if (shader_injection.dlaa_debug_logging > 0.5f) {
+            static int bprobe = 0;
+            if (bprobe++ < 5 || bprobe % 250 == 0) {
+              auto brd = dev->get_resource_desc(cbv->buffer);
+              char bbuf[128];
+              snprintf(bbuf, sizeof(bbuf), "[DLAA] global: b0 VS bind buffer=0x%llX size=%llu",
+                       (unsigned long long)cbv->buffer.handle,
+                       (unsigned long long)(brd.type == reshade::api::resource_type::buffer ? brd.buffer.size : 0ull));
+              reshade::log::message(reshade::log::level::info, bbuf);
+            }
+          }
+        }
       }
     }
+  }
+}
+
+// ── Global jitter: capture the game's unjittered ViewProjection ──
+// When Jitter Method = Global, the addon jitters the SHARED scene.ViewProjection
+// (b0 _Globals, c10 = bytes 160..208) instead of each replaced VS. The game
+// re-uploads the full unjittered _Globals per object, so we read-only capture
+// the unjittered VP here (before the upload lands) and re-issue the upload with
+// the jittered VP. This works for EVERY scene VS permutation.
+static DeviceData::GlobalsBufferRec* FindGlobalsRec(DeviceData* d, reshade::api::resource res) {
+  for (auto& rec : d->globals_recs)
+    if (rec.res.handle == res.handle) return &rec;
+  return nullptr;
+}
+
+static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
+                                 reshade::api::resource dest, uint64_t dest_offset, uint64_t size) {
+  auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  // Recursion guard: our own re-issued upload below must land unchanged.
+  if (d && d->in_own_upload) return false;
+  // ── PROBE: log the first few large-buffer uploads (before any gates) so we
+  // can see whether the game uploads b0 via UpdateSubresource and with what
+  // offsets/sizes. ──
+  if (dev && dest.handle && shader_injection.dlaa_debug_logging > 0.5f) {
+    auto prd = dev->get_resource_desc(dest);
+    if (prd.type == reshade::api::resource_type::buffer && prd.buffer.size >= 768ull) {
+      static int probe = 0;
+      if (probe++ < 10) {
+        char pbuf[180];
+        snprintf(pbuf, sizeof(pbuf),
+                 "[DLAA] probe: upd buffer=0x%llX bufsize=%llu off=%llu len=%llu method=%d",
+                 (unsigned long long)dest.handle, (unsigned long long)prd.buffer.size,
+                 (unsigned long long)dest_offset, (unsigned long long)size,
+                 (int)(shader_injection.dlaa_jitter_method > 0.5f));
+        reshade::log::message(reshade::log::level::info, pbuf);
+      }
+    }
+  }
+  if (!dev || !data || !dest.handle) return false;
+  if (shader_injection.dlaa_jitter_method < 0.5f) return false;
+  if (shader_injection.dlaa_jitter_enabled < 0.5f && shader_injection.dlaa_jitter_test < 0.5f) return false;
+  if (!d) return false;
+  // Must reach the VP region (c10, bytes 160..208) — excludes small
+  // post/shadow cbuffers and our own 64-byte VP writes (size < 208).
+  if (dest_offset > 160ull || size < 208ull) return false;
+  auto rd = dev->get_resource_desc(dest);
+  if (rd.type != reshade::api::resource_type::buffer || rd.buffer.size < 768ull) return false;
+  // Full-buffer (null-box) updates report UINT64_MAX: clamp to the buffer size.
+  if (size == UINT64_MAX) size = rd.buffer.size;
+  if (size < 208ull) return false;
+  // (captured_scene_cbv gate removed: it was tied to the 41-VS hash list and
+  // could miss the other per-material _Globals variants; the size + sanity
+  // checks and the globals_buffers set cover all of them.)
+  // Sanity: reject an empty/zero matrix. NOTE: D3D perspective projections have
+  // m33 == 0, so we must NOT require m33 != 0 — that rejected every VP.
+  const float* vp0 = reinterpret_cast<const float*>(
+      static_cast<const uint8_t*>(data) + (size_t)(160ull - dest_offset));
+  float vp_acc = 0.f;
+  for (int i = 0; i < 16; ++i) vp_acc += std::fabs(vp0[i]);
+  if (vp_acc < 1e-3f) return false;
+  // Save the game's UNJITTERED ViewProjection for the velocity compute.
+  memcpy(d->globals_unjittered_vp.data(), vp0, 64);
+  d->globals_vp_captured = true;
+  // Per-buffer record: this buffer's own unjittered VP (used by the draw-time
+  // effect un-jitter so we never write a stale VP from another buffer).
+  auto* rec = FindGlobalsRec(d, dest);
+  if (!rec) {
+    if (d->globals_recs.size() < 64) {
+      d->globals_recs.push_back({});
+      d->globals_recs.back().res = dest;
+      d->globals_recs.back().unjittered_vp = d->globals_unjittered_vp;
+    }
+  } else {
+    rec->unjittered_vp = d->globals_unjittered_vp;
+  }
+  ++d->globals_patch_count;
+  // ── SOURCE-LEVEL PATCH (reliable jitter) ──
+  // We are on the immediate context right before the game's UpdateSubresource
+  // lands. Copy the game's data, jitter the VP region, then BLOCK the original
+  // upload and re-issue ours. The buffer now permanently contains the jittered
+  // VP from the moment of upload — no dependency on draw-time writes, buffer
+  // bind order, or UpdateSubresource-on-bound-buffer behavior. World (c44+) and
+  // every other per-object field are copied verbatim.
+  if (size > 2048ull) return false;  // _Globals are 848-1376B; skip anything larger
+  uint8_t patched[2048];
+  memcpy(patched, data, (size_t)size);
+  float* vpd = reinterpret_cast<float*>(patched + (size_t)(160ull - dest_offset));
+  const float jx = d->jitter_x, jy = d->jitter_y;
+  for (int i = 0; i < 4; ++i) {
+    vpd[i] += jx * vpd[12 + i];
+    vpd[4 + i] += jy * vpd[12 + i];
+  }
+  if (shader_injection.dlaa_debug_logging > 0.5f) {
+    static int gpatch = 0;
+    if (gpatch++ < 5 || gpatch % 250 == 0) {
+      char buf[160];
+      snprintf(buf, sizeof(buf), "[DLAA] global: SOURCE PATCH buffer=0x%llX size=%llu jx=%.4f jy=%.4f",
+               (unsigned long long)dest.handle, (unsigned long long)size, jx, jy);
+      reshade::log::message(reshade::log::level::info, buf);
+    }
+  }
+  d->in_own_upload = true;
+  dev->update_buffer_region(patched, dest, dest_offset, size);
+  d->in_own_upload = false;
+  return true;  // block the game's original (unjittered) upload
+}
+
+// ── PROBE: log the first few large-buffer Map calls. If the game uploads b0 via
+// Map/Unmap instead of UpdateSubresource, update_buffer_region never fires and
+// we need Map-based interception instead. ──
+static void OnMapBufferRegionProbe(reshade::api::device* dev, reshade::api::resource res,
+                                   uint64_t offset, uint64_t size, reshade::api::map_access access,
+                                   void** data) {
+  if (!dev || !res.handle || !data) return;
+  if (shader_injection.dlaa_debug_logging < 0.5f) return;
+  auto rd = dev->get_resource_desc(res);
+  if (rd.type != reshade::api::resource_type::buffer || rd.buffer.size < 768ull) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (d) ++d->globals_map_count;
+  static int mprobe = 0;
+  if (++mprobe <= 10 || mprobe % 250 == 0) {
+    char pbuf[180];
+    snprintf(pbuf, sizeof(pbuf),
+             "[DLAA] probe: map buffer=0x%llX bufsize=%llu off=%llu len=%llu",
+             (unsigned long long)res.handle, (unsigned long long)rd.buffer.size,
+             (unsigned long long)offset, (unsigned long long)size);
+    reshade::log::message(reshade::log::level::info, pbuf);
   }
 }
 
@@ -852,37 +1111,43 @@ static void UpdateJitter(DeviceData* d) {
   if (!d) return;
   if (shader_injection.dlaa_jitter_test > 0.5f) {
     // Jitter Test: apply a large FIXED 8px horizontal projection shift so the
-    // rasterization-level jitter is plainly visible. With DLAA OFF + Jitter ON,
-    // the whole image should visibly jump 8px (a REAL rasterization shift, not a
-    // post-process translation) — verifies the proxy projection jitter reaches
-    // the geometry with no fullscreen filtering.
-    float jx = 8.f * 2.f / d->viewport_w;
-    d->jitter_x = jx; d->jitter_y = 0.f;
-    shader_injection.jitter_offset_x = jx;
-    shader_injection.jitter_offset_y = 0.f;
-    return;
+    // rasterization-level jitter is plainly visible.
+    d->jitter_x = 8.f * 2.f / d->viewport_w;
+    d->jitter_y = 0.f;
+  } else if (shader_injection.dlaa_jitter_enabled < 0.5f) {
+    d->jitter_x = 0.f;
+    d->jitter_y = 0.f;
+  } else {
+    uint32_t f = d->frame_index;
+    d->jitter_x = (Halton(f + 1u, 2u) - 0.5f) * 2.f / d->viewport_w;
+    d->jitter_y = (Halton(f + 1u, 3u) - 0.5f) * 2.f / d->viewport_h;
   }
-  if (shader_injection.dlaa_jitter_enabled < 0.5f) {
-    d->jitter_x = 0.f; d->jitter_y = 0.f;
+  if (shader_injection.dlaa_jitter_method > 0.5f) {
+    // Global method: the shared ViewProjection patch is the jitter source; keep
+    // the per-VS injection offsets at 0 so replaced VSs don't double-jitter.
     shader_injection.jitter_offset_x = 0.f;
     shader_injection.jitter_offset_y = 0.f;
-    return;
+  } else {
+    shader_injection.jitter_offset_x = d->jitter_x;
+    shader_injection.jitter_offset_y = d->jitter_y;
   }
-  uint32_t f = d->frame_index;
-  float jx = (Halton(f + 1u, 2u) - 0.5f) * 2.f / d->viewport_w;
-  float jy = (Halton(f + 1u, 3u) - 0.5f) * 2.f / d->viewport_h;
-  d->jitter_x = jx; d->jitter_y = jy;
-  shader_injection.jitter_offset_x = jx;
-  shader_injection.jitter_offset_y = jy;
 }
 
-// ── Projection jitter: REMOVED ──
-// The old proxy-cbuffer approach (copy _Globals -> patch c10 -> re-bind at b0)
-// was unworkable: b0 is a PER-OBJECT cbuffer (World at c44), so a shared proxy
-// would give every object the first object's World matrix, and per-draw
-// readbacks killed performance. Jitter is now applied directly in the replaced
-// scene-geometry VSs (boot/0xHASH.vs_4_1.hlsl): o0.x += jitter_x * o0.w after
-// the ViewProjection multiply. See SCENE_GEOMETRY_VS_HASHES.
+// ── Projection jitter: two methods ──
+// 1) PER VS (default): jitter is added directly in the replaced scene-geometry
+//    VSs (boot/0xHASH.vs_4_1.hlsl): o0.x += DLAA_JITTER_X * o0.w after the
+//    ViewProjection multiply. Requires each new scene's VS permutations to be
+//    patched (see SCENE_GEOMETRY_VS_HASHES).
+// 2) GLOBAL (Jitter Method = Global): the addon patches the SHARED
+//    scene.ViewProjection (b0 _Globals, c10 = bytes 160..208) in place at bind
+//    time (row0 += jx*row3, row1 += jy*row3). Every scene object jitters
+//    regardless of VS hash — no per-scene shader gathering. The unjittered VP
+//    is captured from the game's upload (OnUpdateBufferRegion) so velocity stays
+//    jitter-free, and effect draws (excluded from DLAA) get the UNJITTERED VP.
+// The old shared-PROXY approach is unworkable: replacing b0 with one proxy gives
+// every object the first object's World matrix (b0 is per-object, World at c44);
+// per-draw readbacks also killed performance. The global method only writes the
+// VP region (bytes 160..208) into the game's own buffer — World is untouched.
 
 // ── Velocity push constants ──
 // Push constants (b13, 48 floats = 12 float4s) matching motion_velocity.cs_5_0.hlsl:
@@ -1237,6 +1502,14 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []{ return true; },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLAAJitterMethod", .binding = &shader_injection.dlaa_jitter_method,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f, .label = "Jitter Method", .section = "Antialiasing",
+        .tooltip = "Per VS: jitter is added inside each replaced scene-geometry vertex shader (each new scene's VS permutations must be patched). Global: the shared camera ViewProjection in _Globals is patched once, jittering every scene object regardless of VS hash (no per-scene shader gathering).",
+        .labels = {"Per VS", "Global"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLAAZeroMV", .binding = &shader_injection.dlaa_zero_mv,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Zero Motion Vectors", .section = "Antialiasing",
@@ -1451,6 +1724,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
 
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+      reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionProbe);
       reshade::register_event<reshade::addon_event::draw>(OnDrawMaskHook);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawMaskHookIndexed);
 
@@ -1495,6 +1770,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
         if (shader_injection.dlaa_debug_logging > 0.5f && (++fc <= 3 || (fc % 300 == 0)))
           reshade::log::message(reshade::log::level::info,
             (std::string("[DLAA] Present frame ") + std::to_string(fc)).c_str());
+        // Per-frame global-jitter summary: _Globals uploads patched vs large
+        // buffers mapped this frame — tells us mid-game whether the scene
+        // _Globals is uploaded via UpdateSubresource or Map/Unmap.
+        if (d && shader_injection.dlaa_debug_logging > 0.5f && fc % 90 == 0) {
+          char gbuf[128];
+          snprintf(gbuf, sizeof(gbuf), "[DLAA] global: frame %d patched=%u mapped=%u",
+                   fc, d->globals_patch_count, d->globals_map_count);
+          reshade::log::message(reshade::log::level::info, gbuf);
+        }
+        if (d) { d->globals_patch_count = 0; d->globals_map_count = 0; }
       });
 
       reshade::log::message(reshade::log::level::info, "[Senkiseki3 DLAA] Addon loaded");
@@ -1511,6 +1796,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       senkiseki3::dlss::ShutdownDLSS();
       reshade::unregister_event<reshade::addon_event::draw>(OnDrawMaskHook);
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawMaskHookIndexed);
+      reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionProbe);
+      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_addon(h_module);
       break;
   }
