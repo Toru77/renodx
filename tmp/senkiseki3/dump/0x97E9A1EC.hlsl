@@ -1,7 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Fri Jul 31 21:27:58 2026
-
-#include "../../shared.h"
-
+// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 18:08:12 2026
 
 cbuffer _Globals : register(b0)
 {
@@ -61,15 +58,9 @@ cbuffer _Globals : register(b0)
   float4 UVaDuDvTexcoord : packoffset(c62) = {0,0,1,1};
   float AlphaThreshold : packoffset(c63) = {0.5};
   float3 ShadowColorShift : packoffset(c63.y) = {0.100000001,0.0199999996,0.0199999996};
-  float Shininess : packoffset(c64) = {0.5};
-  float SpecularPower : packoffset(c64.y) = {50};
-  float2 WindyGrassDirection : packoffset(c64.z) = {0,0};
-  float WindyGrassSpeed : packoffset(c65) = {0.100000001};
-  float WindyGrassHomogenity : packoffset(c65.y) = {2};
-  float WindyGrassScale : packoffset(c65.z) = {1};
-  float BloomIntensity : packoffset(c65.w) = {1};
-  float4 PointLightParams : packoffset(c66) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c67) = {0,0,0,0};
+  float BloomIntensity : packoffset(c64) = {1};
+  float4 PointLightParams : packoffset(c65) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c66) = {0,0,0,0};
 }
 
 
@@ -95,69 +86,52 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
 
-  r0.x = WindyGrassHomogenity * WindyGrassHomogenity;
-  r0.x = 1 / r0.x;
+  r0.w = 1;
   r1.xyz = v0.xyz;
   r1.w = 1;
-  r2.x = dot(r1.xyzw, World._m00_m10_m20_m30);
-  r2.z = dot(r1.xyzw, World._m02_m12_m22_m32);
-  r2.y = dot(r1.xyzw, World._m01_m11_m21_m31);
-  r0.y = r2.x + r2.z;
-  r0.x = r0.y * r0.x;
-  r0.y = frac(r0.x);
-  r0.x = r0.x * 0.25 + r0.y;
-  r0.y = WindyGrassSpeed * GlobalTexcoordFactor;
-  r0.x = r0.y * 30 + r0.x;
-  r0.x = sin(r0.x);
-  r0.xy = WindyGrassDirection.xy * r0.xx;
-  r0.xy = WindyGrassScale * r0.xy;
-  r0.xz = v2.yy * r0.xy;
-  r0.yw = float2(0,1);
-  r0.xyz = r2.xyz + r0.xyz;
+  r0.x = dot(r1.xyzw, World._m00_m10_m20_m30);
+  r0.z = dot(r1.xyzw, World._m02_m12_m22_m32);
+  r0.y = dot(r1.xyzw, World._m01_m11_m21_m31);
   r1.x = dot(r0.xyzw, scene.ViewProjection._m00_m10_m20_m30);
   r1.y = dot(r0.xyzw, scene.ViewProjection._m01_m11_m21_m31);
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
   r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
-  // Jitter offsets come from the addon b13 injection (0 when disabled).
-  o0.x = r1.x + DLAA_JITTER_X * r1.w;
-  o0.y = r1.y + DLAA_JITTER_Y * r1.w;
-  o0.zw = r1.zw;
+  o0.xyzw = r1.xyzw;
   o6.xyzw = r1.xyzw;
   o1.xyzw = min(float4(1,1,1,1), v3.xyzw);
-  r1.x = -scene.MiscParameters3.x + r0.y;
-  r1.x = saturate(scene.MiscParameters3.y * r1.x);
-  r1.y = -scene.FogRangeParameters.x + -r0.w;
-  o4.w = -r0.w;
-  r0.w = saturate(scene.FogRangeParameters.z * r1.y);
-  r1.y = scene.MiscParameters3.z + r0.w;
-  r1.y = min(1, r1.y);
-  r0.w = r1.x * r1.y + r0.w;
-  r0.w = min(1, r0.w);
-  o2.w = scene.FogRangeParameters.w * r0.w;
   r1.xyz = scene.EyePosition.xyz + -r0.xyz;
   o4.xyz = r0.xyz;
-  r0.x = dot(r1.xyz, r1.xyz);
-  r0.x = rsqrt(r0.x);
-  r0.xyz = r1.xyz * r0.xxx;
-  r1.x = dot(v1.xyz, World._m00_m10_m20);
-  r1.y = dot(v1.xyz, World._m01_m11_m21);
-  r1.z = dot(v1.xyz, World._m02_m12_m22);
-  r0.w = dot(r1.xyz, r1.xyz);
-  r0.w = rsqrt(r0.w);
-  r1.xyz = r1.xyz * r0.www;
-  r0.x = dot(r1.xyz, r0.xyz);
-  o5.xyz = r1.xyz;
-  r0.y = cmp(r0.x < 0);
-  r0.x = r0.y ? -r0.x : r0.x;
-  r0.x = 1 + -r0.x;
-  r0.x = max(0, r0.x);
-  r0.x = log2(r0.x);
-  r0.y = max(1, PointLightColor.w);
-  r0.x = r0.y * r0.x;
-  r0.x = exp2(r0.x);
-  o2.xyz = PointLightColor.xyz * r0.xxx;
+  r0.x = -scene.MiscParameters3.x + r0.y;
+  r0.x = saturate(scene.MiscParameters3.y * r0.x);
+  r0.y = dot(r1.xyz, r1.xyz);
+  r0.y = rsqrt(r0.y);
+  r1.xyz = r1.xyz * r0.yyy;
+  r2.x = dot(v1.xyz, World._m00_m10_m20);
+  r2.y = dot(v1.xyz, World._m01_m11_m21);
+  r2.z = dot(v1.xyz, World._m02_m12_m22);
+  r0.y = dot(r2.xyz, r2.xyz);
+  r0.y = rsqrt(r0.y);
+  r2.xyz = r2.xyz * r0.yyy;
+  r0.y = dot(r2.xyz, r1.xyz);
+  o5.xyz = r2.xyz;
+  r0.z = cmp(r0.y < 0);
+  r0.y = r0.z ? -r0.y : r0.y;
+  r0.y = 1 + -r0.y;
+  r0.y = max(0, r0.y);
+  r0.y = log2(r0.y);
+  r0.z = max(1, PointLightColor.w);
+  r0.y = r0.z * r0.y;
+  r0.y = exp2(r0.y);
+  o2.xyz = PointLightColor.xyz * r0.yyy;
+  r0.y = -scene.FogRangeParameters.x + -r0.w;
+  o4.w = -r0.w;
+  r0.y = saturate(scene.FogRangeParameters.z * r0.y);
+  r0.z = scene.MiscParameters3.z + r0.y;
+  r0.z = min(1, r0.z);
+  r0.x = r0.x * r0.z + r0.y;
+  r0.x = min(1, r0.x);
+  o2.w = scene.FogRangeParameters.w * r0.x;
   o3.xy = v2.xy * GameMaterialTexcoord.zw + GameMaterialTexcoord.xy;
   return;
 }

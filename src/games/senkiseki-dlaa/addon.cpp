@@ -43,6 +43,7 @@ ShaderInjectData shader_injection = {
     .dlaa_flag_is_hdr = 0.f, .dlaa_flag_depth_inverted = 1.f,
     .dlaa_flag_auto_exposure = 0.f,
     .jitter_offset_x = 0.f, .jitter_offset_y = 0.f,
+    .dlaa_velocity_format = 0.f,
 };
 
 // ── Descriptor table helpers ──
@@ -58,6 +59,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource velocity_texture = {};
   reshade::api::resource_view velocity_srv = {};
   reshade::api::resource_view velocity_uav = {};
+  reshade::api::format velocity_format = {};  // r16g16_float / r32g32_float (A/B toggle)
   reshade::api::pipeline_layout velocity_layout = {};
   reshade::api::pipeline velocity_pipeline = {};
   DTSet velocity_tables = {};
@@ -83,6 +85,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool matrices_valid = false;
   ID3D11Buffer* scene_cbv_staging = nullptr;
   uint32_t scene_cbv_staging_size = 0u;
+  bool scene_cbv_copy_issued = false;  // a camera-matrix staging copy is queued this frame
   float viewport_w = 2560.f, viewport_h = 1440.f;
   float swapchain_w = 2560.f, swapchain_h = 1440.f;
   float jitter_x = 0.f, jitter_y = 0.f;
@@ -130,6 +133,7 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   d->last_rtv2_candidate = {};
   if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
   d->scene_cbv_staging_size = 0u;
+  d->scene_cbv_copy_issued = false;
   d->matrices_valid = false;
   if (d->point_sampler.handle) dev->destroy_sampler(d->point_sampler);
   d->point_sampler = {};
@@ -212,7 +216,9 @@ static bool EnsureDebugNative(reshade::api::device* dev, DeviceData* d) {
   }
   if (!d->dbg_vel_srv) {
     D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
-    srvd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    D3D11_TEXTURE2D_DESC vtd = {};
+    reinterpret_cast<ID3D11Texture2D*>(d->velocity_texture.handle)->GetDesc(&vtd);
+    srvd.Format = vtd.Format;  // r16g16_float or r32g32_float (follows the toggle)
     srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvd.Texture2D.MipLevels = 1;
     if (FAILED(nd->CreateShaderResourceView(reinterpret_cast<ID3D11Resource*>(d->velocity_texture.handle), &srvd, &d->dbg_vel_srv)))
@@ -339,6 +345,54 @@ static bool InvertMat4(const float* m, float* out) {
   return true;
 }
 
+// Queue the GPU copy of the camera matrices (c10..c21) into the staging buffer
+// EARLY — at the hash-gated scene b0 capture — so the Map in ReadSceneMatrices
+// (at FXAA, end of frame) finds the copy already complete and does NOT drain the
+// GPU pipeline. D3D11_MAP_READ on a just-copied staging buffer forces a full
+// pipeline flush mid-frame (GPU utilization dropped to ~76% with copy-at-FXAA);
+// issuing the copy at the first scene draw hides it behind the frame's GPU work.
+static bool IssueSceneCbvCopy(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (!cmd_list || !d || !d->captured_scene_cbv_valid) return false;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return false;
+  auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
+  if (!cb) return false;
+
+  // Read window must cover c10..c21 = 352 bytes.
+  uint64_t range_size = d->captured_scene_cbv.size;
+  if (range_size < 352ull) range_size = 352ull;
+  if (range_size > 65536ull) range_size = 65536ull;
+  auto bdesc = dev->get_resource_desc(d->captured_scene_cbv.buffer);
+  if (bdesc.buffer.size > 0) {
+    const uint64_t offset = d->captured_scene_cbv.offset;
+    const uint64_t max_read = (offset < bdesc.buffer.size) ? (bdesc.buffer.size - offset) : 0u;
+    if (range_size > max_read) range_size = max_read;
+  }
+  if (range_size < 352ull) return false;  // can't reach the matrices
+  const uint32_t need = static_cast<uint32_t>(range_size);
+
+  if (!d->scene_cbv_staging || d->scene_cbv_staging_size < need) {
+    if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = need;
+    bd.Usage = D3D11_USAGE_STAGING;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
+    if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) return false;
+    d->scene_cbv_staging_size = need;
+  }
+
+  auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!ctx) return false;
+  D3D11_BOX box = {};
+  box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
+  box.right = box.left + need;
+  box.bottom = 1;
+  box.back = 1;
+  ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
+  return true;
+}
+
 // Read the game's _Globals camera matrices (ViewProjection c10, ViewInverse c14,
 // ProjectionInverse c18) via a staging copy of the captured scene CBV, then:
 //   prev_view_proj     = last frame's ViewProjection
@@ -373,12 +427,18 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
     d->scene_cbv_staging_size = need;
   }
 
-  D3D11_BOX box = {};
-  box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
-  box.right = box.left + need;
-  box.bottom = 1;
-  box.back = 1;
-  ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
+  if (!d->scene_cbv_copy_issued) {
+    // Fallback: no early copy was queued this frame (e.g. DLAA toggled on
+    // mid-frame). This path stalls the pipeline; the early copy in
+    // OnPushDescriptorsCapture is the normal path.
+    D3D11_BOX box = {};
+    box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
+    box.right = box.left + need;
+    box.bottom = 1;
+    box.back = 1;
+    ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
+  }
+  d->scene_cbv_copy_issued = false;  // consumed this frame
 
   D3D11_MAPPED_SUBRESOURCE mapped = {};
   if (FAILED(ctx->Map(d->scene_cbv_staging, 0, D3D11_MAP_READ, 0, &mapped))) return false;
@@ -432,7 +492,7 @@ static void UpdateMotionSrv(reshade::api::device* dev, DeviceData* d, reshade::a
 // NOTE: b0 is a PER-OBJECT cbuffer (contains World at c44) — that is why the
 // proxy-cbuffer jitter approach is unworkable (a shared proxy would give every
 // object the first object's World matrix). Jitter must live in the VS.
-static const std::array<uint32_t, 12> SCENE_GEOMETRY_VS_HASHES = {
+static const std::array<uint32_t, 41> SCENE_GEOMETRY_VS_HASHES = {
     0x37F1DE22u,  // world/terrain (primary)
     0xCBF171E5u,  // world
     0xDF1D933Fu,  // world
@@ -445,6 +505,36 @@ static const std::array<uint32_t, 12> SCENE_GEOMETRY_VS_HASHES = {
     0x0D5DABC6u,  // skinned characters/NPCs
     0xB2F338C8u,  // skinned
     0xB1C24E2Au,  // skinned
+    0x5C1A50E5u,  // character hair
+    0x4A030C25u,  // character clothing
+    0x3641D444u,  // eyeball
+    0xC8F5D77Bu,  // character skin
+    0xF8C9B92Du,  // character clothing
+    0xB662509Au,  // character clothing
+    // Foliage/world VSs discovered in the foliage scene:
+    0x29513853u,  // foliage (main)
+    0xED3D1A43u,  // foliage
+    0x7D5282A3u,  // scene/world
+    0x066E7DFBu,  // scene/world
+    0x714E4C33u,  // scene/world
+    0x7A711F41u,  // scene/world
+    0x09BD12FAu,  // scene/world
+    0x030AD345u,  // scene/world
+    0x8913640Au,  // scene/world
+    0x2DC04A66u,  // scene/world (G-buffer, 7 SRVs)
+    0x34AA271Fu,  // scene/world (G-buffer)
+    0xDFE5A75Du,  // scene/world (G-buffer)
+    0x8ED5035Bu,  // scene/world (G-buffer)
+    0x97E9A1ECu,  // scene/world (G-buffer)
+    0x4D37FA49u,  // scene/world (G-buffer)
+    0x9596CBC1u,  // scene/world (G-buffer)
+    0xE4C6D6F4u,  // scene/world (G-buffer)
+    0x8AFF0B4Fu,  // world-space effect (water/particle, RT=1)
+    0x795F3AD3u,  // world-space effect (RT=1)
+    0x5E5AE3FBu,  // character outline
+    0x77355EEDu,  // forest impostor billboard (sky)
+    0xC8FE8FC4u,  // transparent texture (world-space)
+    0x7D3553A7u,  // particle (world-space)
 };
 
 static bool IsSceneGeometryVs(uint32_t hash) {
@@ -570,6 +660,11 @@ static void OnPushDescriptorsCapture(
         if (IsSceneGeometryVs(vhash)) {
           d->captured_scene_cbv = *cbv;
           d->captured_scene_cbv_valid = true;
+          // Queue the camera-matrix staging copy EARLY so the Map at FXAA
+          // (ReadSceneMatrices) doesn't stall the GPU pipeline mid-frame.
+          if (shader_injection.dlaa_enabled > 0.5f && !d->scene_cbv_copy_issued) {
+            d->scene_cbv_copy_issued = IssueSceneCbvCopy(cmd_list, d);
+          }
         }
       }
     }
@@ -658,19 +753,35 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   uint32_t w = (uint32_t)d->viewport_w, h = (uint32_t)d->viewport_h;
   if (w < 64u) w = 64u; if (h < 64u) h = 64u;
 
+  // Motion-vector texture format (A/B): r16g16_float (default) or r32g32_float.
+  // Recreated on toggle change so the switch is instant mid-session.
+  const auto vel_fmt = (shader_injection.dlaa_velocity_format > 0.5f)
+                           ? reshade::api::format::r32g32_float
+                           : reshade::api::format::r16g16_float;
+  if (d->velocity_texture.handle && d->velocity_format != vel_fmt) {
+    if (shader_injection.dlaa_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::info, "[DLAA] Velocity format change: recreating MV texture");
+    if (d->velocity_srv.handle) dev->destroy_resource_view(d->velocity_srv);
+    if (d->velocity_uav.handle) dev->destroy_resource_view(d->velocity_uav);
+    dev->destroy_resource(d->velocity_texture);
+    d->velocity_texture = {}; d->velocity_srv = {}; d->velocity_uav = {};
+    d->velocity_format = {}; d->resources_created = false;
+    if (d->dbg_vel_srv) { d->dbg_vel_srv->Release(); d->dbg_vel_srv = nullptr; }
+  }
   if (!d->velocity_texture.handle) {
     reshade::api::resource_desc rd = {};
     rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {w, h, 1, 1, reshade::api::format::r16g16_float, 1};
+    rd.texture = {w, h, 1, 1, vel_fmt, 1};
     rd.heap = reshade::api::memory_heap::gpu_only;
     rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
     dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->velocity_texture);
-    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16_float, 0,1,0,1);
+    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, vel_fmt, 0,1,0,1);
     dev->create_resource_view(d->velocity_texture, reshade::api::resource_usage::shader_resource, vd, &d->velocity_srv);
     dev->create_resource_view(d->velocity_texture, reshade::api::resource_usage::unordered_access, vd, &d->velocity_uav);
+    d->velocity_format = vel_fmt;
     d->resources_created = true;
     if (shader_injection.dlaa_debug_logging > 0.5f)
-      reshade::log::message(reshade::log::level::info, (std::string("[DLAA] Velocity texture created: ") + std::to_string(w) + "x" + std::to_string(h)).c_str());
+      reshade::log::message(reshade::log::level::info, (std::string("[DLAA] Velocity texture created: ") + std::to_string(w) + "x" + std::to_string(h) + " fmt=" + std::to_string((int)vel_fmt)).c_str());
   }
 
   if (!d->velocity_pipeline.handle && !CreateVelocityPipeline(dev, d)) return false;
@@ -969,6 +1080,14 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLAAVelocityFormat", .binding = &shader_injection.dlaa_velocity_format,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "32-bit Motion Vectors", .section = "Antialiasing",
+        .tooltip = "MV texture precision A/B: r16g16_float (16-bit, default) vs r32g32_float (32-bit). 32-bit costs a little bandwidth; 16-bit is already exact for pixel-space MVs up to 2048px.",
+        .labels = {"16-bit (r16g16)","32-bit (r32g32)"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLAADepthSource", .binding = &shader_injection.dlaa_depth_source,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "Depth Source", .section = "Antialiasing",
@@ -1074,6 +1193,39 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // position (o7) for per-object motion vectors. Prev clip is computed with
     // the unjittered prevViewProj (b13), so the MV stays jitter-free.
     CustomShaderEntry(0x0D5DABC6),
+    // Additional character-mesh VSs (hair, eyes, skin, clothing) — same
+    // geometry jitter; discovered in the character-heavy scene.
+    CustomShaderEntry(0x5C1A50E5),  // hair
+    CustomShaderEntry(0x4A030C25),  // clothing
+    CustomShaderEntry(0x3641D444),  // eyeball
+    CustomShaderEntry(0xC8F5D77B),  // skin
+    CustomShaderEntry(0xF8C9B92D),  // clothing
+    CustomShaderEntry(0xB662509A),  // clothing
+    // Foliage & world VSs discovered in the foliage scene (same geometry jitter).
+    CustomShaderEntry(0x29513853),  // foliage (main)
+    CustomShaderEntry(0xED3D1A43),  // foliage
+    CustomShaderEntry(0x7D5282A3),  // scene/world
+    CustomShaderEntry(0x066E7DFB),  // scene/world
+    CustomShaderEntry(0x714E4C33),  // scene/world
+    CustomShaderEntry(0x7A711F41),  // scene/world
+    CustomShaderEntry(0x09BD12FA),  // scene/world
+    CustomShaderEntry(0x030AD345),  // scene/world
+    CustomShaderEntry(0x8913640A),  // scene/world
+    // Second batch of scene/world & world-space effect VSs from the same scene.
+    CustomShaderEntry(0x2DC04A66),
+    CustomShaderEntry(0x34AA271F),
+    CustomShaderEntry(0xDFE5A75D),
+    CustomShaderEntry(0x8ED5035B),
+    CustomShaderEntry(0x97E9A1EC),
+    CustomShaderEntry(0x4D37FA49),
+    CustomShaderEntry(0x9596CBC1),
+    CustomShaderEntry(0xE4C6D6F4),
+    CustomShaderEntry(0x8AFF0B4F),  // water/particle
+    CustomShaderEntry(0x795F3AD3),  // world-space effect
+    CustomShaderEntry(0x5E5AE3FB),  // character outline
+    CustomShaderEntry(0x77355EED),  // forest impostor billboard (sky)
+    CustomShaderEntry(0xC8FE8FC4),  // transparent texture
+    CustomShaderEntry(0x7D3553A7),  // particle
     // Character G-buffer PS: encodes per-object prevNDC into MRT2 (o2.zw) so
     // the velocity compute can build MVs for skinned characters.
     CustomShaderEntry(0x0E8BC215),
@@ -1116,6 +1268,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           // Reset the per-frame depth-source preference (captures happen during the
           // next frame, before RunDLAA at FXAA).
           d->depth_primary_captured = false;
+          // The early scene-CBV staging copy is issued once per frame (at the
+          // first scene-geometry b0 push) and consumed at FXAA.
+          d->scene_cbv_copy_issued = false;
           // Jitter is computed once per frame at PRESENT time, before the next frame's
           // composite (0xE8C7EBA2) draws. Both the composite UV shift and the NGX jitter
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.

@@ -36,6 +36,9 @@ struct ShaderInjectData {
   // frame for per-object motion vectors. Senkiseki3 does NOT populate cb0 c74
   // (that was the Sora engine), so the VS reads it from b13 instead.
   float prev_view_proj[16];
+
+  // ── MV texture precision A/B (addon-side only, not read by shaders) ──
+  float dlaa_velocity_format;  // 0 = r16g16_float (16-bit), 1 = r32g32_float (32-bit)
 };
 
 #ifndef __cplusplus
