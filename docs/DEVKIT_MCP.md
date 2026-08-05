@@ -10,6 +10,7 @@ See also:
 
 The live inspection stack has three parts:
 
+
 1. the game-side `devkit` addon
 2. the `renodx-mcp-bridge` process
 3. an MCP client such as Codex or another JSON-RPC MCP host

@@ -1,7 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:57 2026
-
-#include "../../shared.h"
-
+// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:56 2026
 
 cbuffer _Globals : register(b0)
 {
@@ -65,11 +62,9 @@ cbuffer _Globals : register(b0)
   float RimLitIntensity : packoffset(c61.w) = {4};
   float RimLitPower : packoffset(c62) = {2};
   float RimLightClampFactor : packoffset(c62.y) = {2};
-  float CubeMapIntensity : packoffset(c62.z) = {1};
-  float CubeMapFresnel : packoffset(c62.w) = {0};
-  float BloomIntensity : packoffset(c63) = {1};
-  float4 PointLightParams : packoffset(c64) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c65) = {0,0,0,0};
+  float BloomIntensity : packoffset(c62.z) = {1};
+  float4 PointLightParams : packoffset(c63) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c64) = {0,0,0,0};
 }
 
 
@@ -105,11 +100,7 @@ void main(
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
   r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
-  // Jitter offsets come from the addon b13 injection (0 when disabled).
-  o0.x = r1.x + DLAA_JITTER_X * r1.w;
-  o0.y = r1.y + DLAA_JITTER_Y * r1.w;
-  o0.zw = r1.zw;
+  o0.xyzw = r1.xyzw;
   o6.xyzw = r1.xyzw;
   o1.xyzw = float4(1,1,1,1);
   r1.xyz = scene.EyePosition.xyz + -r0.xyz;

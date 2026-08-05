@@ -1,8 +1,5 @@
 // ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:57 2026
 
-#include "../../shared.h"
-
-
 cbuffer _Globals : register(b0)
 {
   uint4 DuranteSettings : packoffset(c0);
@@ -105,11 +102,7 @@ void main(
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
   r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
-  // Jitter offsets come from the addon b13 injection (0 when disabled).
-  o0.x = r1.x + DLAA_JITTER_X * r1.w;
-  o0.y = r1.y + DLAA_JITTER_Y * r1.w;
-  o0.zw = r1.zw;
+  o0.xyzw = r1.xyzw;
   o6.xyzw = r1.xyzw;
   o1.xyzw = float4(1,1,1,1);
   r1.xyz = scene.EyePosition.xyz + -r0.xyz;

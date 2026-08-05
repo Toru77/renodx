@@ -60,16 +60,16 @@ cbuffer _Globals : register(b0)
   float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
   float Shininess : packoffset(c59) = {0.5};
   float SpecularPower : packoffset(c59.y) = {50};
-  float3 SpecularColor : packoffset(c60) = {1,1,1};
-  float3 RimLitColor : packoffset(c61) = {1,1,1};
-  float RimLitIntensity : packoffset(c61.w) = {4};
-  float RimLitPower : packoffset(c62) = {2};
-  float RimLightClampFactor : packoffset(c62.y) = {2};
-  float CubeMapIntensity : packoffset(c62.z) = {1};
-  float CubeMapFresnel : packoffset(c62.w) = {0};
-  float BloomIntensity : packoffset(c63) = {1};
-  float4 PointLightParams : packoffset(c64) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c65) = {0,0,0,0};
+  float3 RimLitColor : packoffset(c60) = {1,1,1};
+  float RimLitIntensity : packoffset(c60.w) = {4};
+  float RimLitPower : packoffset(c61) = {2};
+  float RimLightClampFactor : packoffset(c61.y) = {2};
+  float BlendMulScale2 : packoffset(c61.z) = {1};
+  float CubeMapIntensity : packoffset(c61.w) = {1};
+  float CubeMapFresnel : packoffset(c62) = {0};
+  float BloomIntensity : packoffset(c62.y) = {1};
+  float4 PointLightParams : packoffset(c63) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c64) = {0,0,0,0};
 }
 
 
@@ -82,13 +82,17 @@ void main(
   float3 v0 : POSITION0,
   float3 v1 : NORMAL0,
   float2 v2 : TEXCOORD0,
+  float3 v3 : TANGENT0,
+  float2 v4 : TEXCOORD3,
   out float4 o0 : SV_POSITION0,
   out float4 o1 : COLOR0,
   out float4 o2 : COLOR1,
-  out float4 o3 : TEXCOORD0,
+  out float2 o3 : TEXCOORD0,
+  out float2 p3 : TEXCOORD2,
   out float4 o4 : TEXCOORD1,
   out float4 o5 : TEXCOORD4,
-  out float4 o6 : TEXCOORD10)
+  out float4 o6 : TEXCOORD6,
+  out float4 o7 : TEXCOORD10)
 {
   float4 r0,r1,r2;
   uint4 bitmask, uiDest;
@@ -110,7 +114,7 @@ void main(
   o0.x = r1.x + DLAA_JITTER_X * r1.w;
   o0.y = r1.y + DLAA_JITTER_Y * r1.w;
   o0.zw = r1.zw;
-  o6.xyzw = r1.xyzw;
+  o7.xyzw = r1.xyzw;
   o1.xyzw = float4(1,1,1,1);
   r1.xyz = scene.EyePosition.xyz + -r0.xyz;
   o4.xyz = r0.xyz;
@@ -144,5 +148,12 @@ void main(
   r0.x = min(1, r0.x);
   o2.w = scene.FogRangeParameters.w * r0.x;
   o3.xy = v2.xy * GameMaterialTexcoord.zw + GameMaterialTexcoord.xy;
+  p3.xy = v4.xy * UVaMUvTexcoord.zw + UVaMUvTexcoord.xy;
+  r0.x = dot(v3.xyz, World._m00_m10_m20);
+  r0.y = dot(v3.xyz, World._m01_m11_m21);
+  r0.z = dot(v3.xyz, World._m02_m12_m22);
+  r0.w = dot(r0.xyz, r0.xyz);
+  r0.w = rsqrt(r0.w);
+  o6.xyz = r0.xyz * r0.www;
   return;
 }

@@ -11,6 +11,7 @@
 #define DEBUG_LEVEL_0
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -67,7 +68,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource captured_depth_res = {};
   uint32_t depth_source_hash = 0u;  // PS hash that last pushed the captured depth (source identity)
   bool depth_primary_captured = false;  // a perspective (non-linear) depth was captured this frame
-  bool scene_done = false;  // pre-FXAA composite drew -> stop jittering viewports (FXAA/HUD crisp)
   reshade::api::resource_view captured_color_srv = {};
   reshade::api::resource captured_color_res = {};
   reshade::api::resource captured_rtv0_res = {};
@@ -423,9 +423,40 @@ static void UpdateMotionSrv(reshade::api::device* dev, DeviceData* d, reshade::a
   dev->create_resource_view(res, reshade::api::resource_usage::shader_resource, vd, &d->captured_motion_srv);
 }
 
+// ── Scene-geometry vertex shader set (hash-gated) ──
+// These are the VSs that rasterize the 3D scene into the 3-MRT G-buffer
+// (captured live via the devkit; see tmp/senkiseki3/dump). Each one transforms
+// with scene.ViewProjection (cb0 c10) from the per-object _Globals, so the
+// jitter is applied directly in each replaced VS (boot/0xHASH.vs_4_1.hlsl).
+//
+// NOTE: b0 is a PER-OBJECT cbuffer (contains World at c44) — that is why the
+// proxy-cbuffer jitter approach is unworkable (a shared proxy would give every
+// object the first object's World matrix). Jitter must live in the VS.
+static const std::array<uint32_t, 12> SCENE_GEOMETRY_VS_HASHES = {
+    0x37F1DE22u,  // world/terrain (primary)
+    0xCBF171E5u,  // world
+    0xDF1D933Fu,  // world
+    0x9BB882F5u,  // terrain tiles
+    0x43ED1D83u,  // world
+    0xC1F80CF6u,  // world
+    0x8BB470CEu,  // world
+    0x4E107313u,  // world (COLOR input)
+    0x09394015u,  // unskinned characters/NPCs
+    0x0D5DABC6u,  // skinned characters/NPCs
+    0xB2F338C8u,  // skinned
+    0xB1C24E2Au,  // skinned
+};
+
+static bool IsSceneGeometryVs(uint32_t hash) {
+  for (uint32_t h : SCENE_GEOMETRY_VS_HASHES) {
+    if (h == hash) return true;
+  }
+  return false;
+}
+
 // ── Event: capture all needed descriptors (falcomengine-plus pattern: type → binding → hash) ──
 static void OnPushDescriptorsCapture(
-    reshade::api::command_list* cmd_list, reshade::api::shader_stage, reshade::api::pipeline_layout,
+    reshade::api::command_list* cmd_list, reshade::api::shader_stage stage, reshade::api::pipeline_layout,
     uint32_t param_index, const reshade::api::descriptor_table_update& update) {
   auto* dev = cmd_list->get_device();
   if (!dev) return;
@@ -466,12 +497,6 @@ static void OnPushDescriptorsCapture(
         if (hash == 0x96BB8CFFu || hash == 0xE8C7EBA2u) {
           d->captured_color_srv = views[0];
           d->captured_color_res = dev->get_resource_from_view(views[0]);
-        }
-        if (hash == 0xE8C7EBA2u) {
-          // Pre-FXAA composite: the scene (and its jittered DLAA input) is done.
-          // Stop jittering viewports so FXAA and the HUD (drawn after) stay crisp
-          // and don't re-jitter the already-aligned DLAA output (which caused shake).
-          d->scene_done = true;
         }
       }
     }
@@ -533,12 +558,19 @@ static void OnPushDescriptorsCapture(
   }
 
   // ── CBV capture (b0 _Globals) ──
+  // Hash-gated: only capture when a scene-geometry VS is bound, so
+  // captured_scene_cbv reliably points at the camera _Globals (not the post
+  // cbuffer, shadow matrices, or per-effect buffers).
   if (update.type == reshade::api::descriptor_type::constant_buffer) {
     if (update.binding == 0u && update.count >= 1) {
       auto* cbv = static_cast<const reshade::api::buffer_range*>(update.descriptors);
       if (cbv->buffer.handle) {
-        d->captured_scene_cbv = *cbv;
-        d->captured_scene_cbv_valid = true;
+        auto* cbv_ss = renodx::utils::shader::GetCurrentState(cmd_list);
+        uint32_t vhash = cbv_ss ? renodx::utils::shader::GetCurrentVertexShaderHash(cbv_ss) : 0u;
+        if (IsSceneGeometryVs(vhash)) {
+          d->captured_scene_cbv = *cbv;
+          d->captured_scene_cbv_valid = true;
+        }
       }
     }
   }
@@ -548,10 +580,11 @@ static void OnPushDescriptorsCapture(
 static void UpdateJitter(DeviceData* d) {
   if (!d) return;
   if (shader_injection.dlaa_jitter_test > 0.5f) {
-    // Jitter Test: apply a large FIXED 8px horizontal viewport shift so the
+    // Jitter Test: apply a large FIXED 8px horizontal projection shift so the
     // rasterization-level jitter is plainly visible. With DLAA OFF + Jitter ON,
     // the whole image should visibly jump 8px (a REAL rasterization shift, not a
-    // post-process translation) — verifies viewport jitter reaches the geometry.
+    // post-process translation) — verifies the proxy projection jitter reaches
+    // the geometry with no fullscreen filtering.
     float jx = 8.f * 2.f / d->viewport_w;
     d->jitter_x = jx; d->jitter_y = 0.f;
     shader_injection.jitter_offset_x = jx;
@@ -572,58 +605,13 @@ static void UpdateJitter(DeviceData* d) {
   shader_injection.jitter_offset_y = jy;
 }
 
-// ── Viewport jitter (TRUE sub-pixel rasterization jitter) ──
-// Offsets the full-res viewport origin by the per-frame sub-pixel jitter. This
-// shifts the actual rasterization pixel grid (unlike the old composite UV shift,
-// which only resampled an already-rendered image), giving DLSS the per-frame
-// sample diversity it needs to reconstruct detail. The velocity shader subtracts
-// the same content shift so MVs stay jitter-free and MVJittered stays off.
-static bool viewport_rebind_guard = false;
-static void OnBindViewports(
-    reshade::api::command_list* cmd_list, uint32_t first, uint32_t count,
-    const reshade::api::viewport* viewports) {
-  if (viewport_rebind_guard || count == 0u || viewports == nullptr) return;
-  auto* dev = cmd_list->get_device();
-  if (!dev) return;
-  auto* d = dev->get_private_data<DeviceData>();
-  if (!d) return;
-  if (d->scene_done) return;  // FXAA/HUD/post passes: no jitter (crisp UI, no re-jitter)
-  if (shader_injection.dlaa_jitter_enabled < 0.5f) return;
-  // Per-frame content shift in pixels (screen y-down), matching the NGX jitter.
-  const float jpx = d->jitter_x * d->viewport_w * 0.5f;
-  const float jpy = -d->jitter_y * d->viewport_h * 0.5f;
-  if (jpx == 0.f && jpy == 0.f) return;
-
-  std::vector<reshade::api::viewport> vps(count);
-  bool changed = false;
-  for (uint32_t i = 0u; i < count; ++i) {
-    vps[i] = viewports[i];
-    // Only jitter viewports matching the main full-res size (skip shadows, UI, etc.).
-    if (std::fabs(vps[i].width - d->swapchain_w) < 1.f &&
-        std::fabs(vps[i].height - d->swapchain_h) < 1.f) {
-      vps[i].x += jpx;
-      vps[i].y += jpy;
-      changed = true;
-      // Diagnostic: log which full-res viewports get jittered (throttled).
-      if (shader_injection.dlaa_debug_logging > 0.5f) {
-        static int vp_log_count = 0;
-        if (vp_log_count < 40) {
-          vp_log_count++;
-          char buf[128];
-          snprintf(buf, sizeof(buf), "[DLAA] Viewport jittered: %ux%u orig(%.2f,%.2f) off(%+.3f,%+.3f)",
-                   (int)vps[i].width, (int)vps[i].height,
-                   viewports[i].x, viewports[i].y, jpx, jpy);
-          reshade::log::message(reshade::log::level::info, buf);
-        }
-      }
-    }
-  }
-  if (changed) {
-    viewport_rebind_guard = true;
-    cmd_list->bind_viewports(first, count, vps.data());
-    viewport_rebind_guard = false;
-  }
-}
+// ── Projection jitter: REMOVED ──
+// The old proxy-cbuffer approach (copy _Globals -> patch c10 -> re-bind at b0)
+// was unworkable: b0 is a PER-OBJECT cbuffer (World at c44), so a shared proxy
+// would give every object the first object's World matrix, and per-draw
+// readbacks killed performance. Jitter is now applied directly in the replaced
+// scene-geometry VSs (boot/0xHASH.vs_4_1.hlsl): o0.x += jitter_x * o0.w after
+// the ViewProjection multiply. See SCENE_GEOMETRY_VS_HASHES.
 
 // ── Velocity push constants ──
 // Push constants (b13, 48 floats = 12 float4s) matching motion_velocity.cs_5_0.hlsl:
@@ -1065,15 +1053,33 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFxaaDraw,
         },
     },
-    // Skinned character/NPC VS: outputs prev clip-space position (o7) for
-    // per-object motion vectors (no geometry jitter — jitter is applied at the
-    // pre-FXAA composite as an image-level UV shift instead).
+    // ── Scene-geometry VS replacements (hash-gated camera jitter) ──
+    // Each replaced VS adds the per-frame sub-pixel jitter to SV_Position after
+    // the ViewProjection multiply (o0.x += DLAA_JITTER_X * o0.w). This is the
+    // ONLY jitter source — no proxy cbuffer, no composite UV shift. The jitter
+    // offsets come from the addon's b13 injection (0 when disabled), so the
+    // 8px jitter-test toggle works without DLAA being enabled.
+    CustomShaderEntry(0x37F1DE22),  // world/terrain (primary)
+    CustomShaderEntry(0xCBF171E5),  // world
+    CustomShaderEntry(0xDF1D933F),  // world
+    CustomShaderEntry(0x9BB882F5),  // terrain tiles
+    CustomShaderEntry(0x43ED1D83),  // world
+    CustomShaderEntry(0xC1F80CF6),  // world
+    CustomShaderEntry(0x8BB470CE),  // world
+    CustomShaderEntry(0x4E107313),  // world (COLOR input)
+    CustomShaderEntry(0x09394015),  // unskinned characters/NPCs
+    CustomShaderEntry(0xB2F338C8),  // skinned
+    CustomShaderEntry(0xB1C24E2A),  // skinned
+    // Skinned character/NPC VS: geometry jitter + outputs prev clip-space
+    // position (o7) for per-object motion vectors. Prev clip is computed with
+    // the unjittered prevViewProj (b13), so the MV stays jitter-free.
     CustomShaderEntry(0x0D5DABC6),
     // Character G-buffer PS: encodes per-object prevNDC into MRT2 (o2.zw) so
     // the velocity compute can build MVs for skinned characters.
     CustomShaderEntry(0x0E8BC215),
-    // Pre-FXAA composite: applies the camera jitter (image-level UV shift) to
-    // the buffer that FXAA consumes and that RunDLAA feeds to DLSS.
+    // Pre-FXAA composite: pure pixel-center passthrough (no UV-shift jitter).
+    // The geometry jitter passes through unchanged to the buffer RunDLAA feeds
+    // to DLSS.
     CustomShaderEntry(0xE8C7EBA2),
 };
 
@@ -1095,7 +1101,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
 
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
-      reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
 
       reshade::register_event<reshade::addon_event::present>(
           [](reshade::api::command_queue*, reshade::api::swapchain* swapchain,
@@ -1111,8 +1116,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           // Reset the per-frame depth-source preference (captures happen during the
           // next frame, before RunDLAA at FXAA).
           d->depth_primary_captured = false;
-          // Reset the scene-phase flag: jittering resumes at the start of each frame.
-          d->scene_done = false;
           // Jitter is computed once per frame at PRESENT time, before the next frame's
           // composite (0xE8C7EBA2) draws. Both the composite UV shift and the NGX jitter
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.

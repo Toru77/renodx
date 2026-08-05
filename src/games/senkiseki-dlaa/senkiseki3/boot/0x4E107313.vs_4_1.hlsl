@@ -46,30 +46,28 @@ cbuffer _Globals : register(b0)
   bool PhyreContextSwitches : packoffset(c43);
   bool PhyreMaterialSwitches : packoffset(c43.y);
   float4x4 World : packoffset(c44);
-  float GlobalTexcoordFactor : packoffset(c48);
-  float GameMaterialID : packoffset(c48.y) = {0};
-  float4 GameMaterialDiffuse : packoffset(c49) = {1,1,1,1};
-  float4 GameMaterialEmission : packoffset(c50) = {0,0,0,0};
-  float GameMaterialMonotone : packoffset(c51) = {0};
-  float4 GameMaterialTexcoord : packoffset(c52) = {0,0,1,1};
-  float4 GameDitherParams : packoffset(c53) = {0,0,0,0};
-  float4 UVaMUvColor : packoffset(c54) = {1,1,1,1};
-  float4 UVaProjTexcoord : packoffset(c55) = {0,0,1,1};
-  float4 UVaMUvTexcoord : packoffset(c56) = {0,0,1,1};
-  float4 UVaMUv2Texcoord : packoffset(c57) = {0,0,1,1};
-  float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
-  float Shininess : packoffset(c59) = {0.5};
-  float SpecularPower : packoffset(c59.y) = {50};
-  float3 SpecularColor : packoffset(c60) = {1,1,1};
-  float3 RimLitColor : packoffset(c61) = {1,1,1};
-  float RimLitIntensity : packoffset(c61.w) = {4};
-  float RimLitPower : packoffset(c62) = {2};
-  float RimLightClampFactor : packoffset(c62.y) = {2};
-  float CubeMapIntensity : packoffset(c62.z) = {1};
-  float CubeMapFresnel : packoffset(c62.w) = {0};
-  float BloomIntensity : packoffset(c63) = {1};
-  float4 PointLightParams : packoffset(c64) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c65) = {0,0,0,0};
+  float4x4 WorldViewProjection : packoffset(c48);
+  float GlobalTexcoordFactor : packoffset(c52);
+  float GameMaterialID : packoffset(c52.y) = {0};
+  float4 GameMaterialDiffuse : packoffset(c53) = {1,1,1,1};
+  float4 GameMaterialEmission : packoffset(c54) = {0,0,0,0};
+  float GameMaterialMonotone : packoffset(c55) = {0};
+  float4 GameMaterialTexcoord : packoffset(c56) = {0,0,1,1};
+  float4 GameDitherParams : packoffset(c57) = {0,0,0,0};
+  float4 UVaMUvColor : packoffset(c58) = {1,1,1,1};
+  float4 UVaProjTexcoord : packoffset(c59) = {0,0,1,1};
+  float4 UVaMUvTexcoord : packoffset(c60) = {0,0,1,1};
+  float4 UVaMUv2Texcoord : packoffset(c61) = {0,0,1,1};
+  float4 UVaDuDvTexcoord : packoffset(c62) = {0,0,1,1};
+  float Shininess : packoffset(c63) = {0.5};
+  float SpecularPower : packoffset(c63.y) = {50};
+  float3 RimLitColor : packoffset(c64) = {1,1,1};
+  float RimLitIntensity : packoffset(c64.w) = {4};
+  float RimLitPower : packoffset(c65) = {2};
+  float RimLightClampFactor : packoffset(c65.y) = {2};
+  float BloomIntensity : packoffset(c65.z) = {1};
+  float4 PointLightParams : packoffset(c66) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c67) = {0,0,0,0};
 }
 
 
@@ -82,6 +80,7 @@ void main(
   float3 v0 : POSITION0,
   float3 v1 : NORMAL0,
   float2 v2 : TEXCOORD0,
+  float4 v3 : COLOR0,
   out float4 o0 : SV_POSITION0,
   out float4 o1 : COLOR0,
   out float4 o2 : COLOR1,
@@ -111,7 +110,7 @@ void main(
   o0.y = r1.y + DLAA_JITTER_Y * r1.w;
   o0.zw = r1.zw;
   o6.xyzw = r1.xyzw;
-  o1.xyzw = float4(1,1,1,1);
+  o1.xyzw = min(float4(1,1,1,1), v3.xyzw);
   r1.xyz = scene.EyePosition.xyz + -r0.xyz;
   o4.xyz = r0.xyz;
   r0.x = -scene.MiscParameters3.x + r0.y;

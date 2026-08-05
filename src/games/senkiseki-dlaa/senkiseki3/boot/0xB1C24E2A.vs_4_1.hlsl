@@ -1,13 +1,7 @@
-// ── Modified skinned character vertex shader for DLAA ──
-// Based on: character_skinned_0x0D5DABC6.vs_4_1.hlsl
-// Additions:
-//   • Camera jitter applied to SV_Position (DLAA_JITTER_X/Y)
-//   • Per-object motion: prev clip-space position output to TEXCOORD5
-//   • prevViewProjection matrix expected at cb0 c74 (same as Sora sky shader)
-//
-// SPDX-License-Identifier: MIT
+// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:57 2026
 
 #include "../../shared.h"
+
 
 cbuffer _Globals : register(b0)
 {
@@ -65,8 +59,13 @@ cbuffer _Globals : register(b0)
   float4 UVaMUvTexcoord : packoffset(c56) = {0,0,1,1};
   float4 UVaMUv2Texcoord : packoffset(c57) = {0,0,1,1};
   float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
-  float4 PointLightParams : packoffset(c59) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c60) = {0,0,0,0};
+  float AlphaThreshold : packoffset(c59) = {0.5};
+  float3 ShadowColorShift : packoffset(c59.y) = {0.100000001,0.0199999996,0.0199999996};
+  float ShadowReceiveOffset : packoffset(c60) = {0.600000024};
+  float BloomIntensity : packoffset(c60.y) = {0.699999988};
+  float4 GameEdgeParameters : packoffset(c61) = {1,1,1,0.00300000003};
+  float4 PointLightParams : packoffset(c62) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c63) = {0,0,0,0};
 }
 
 StructuredBuffer<float4x4> BoneTransformConstantBuffer : register(t0);
@@ -82,22 +81,18 @@ void main(
   float2 v2 : TEXCOORD0,
   uint4 v3 : BLENDINDICES0,
   float4 v4 : BLENDWEIGHTS0,
-  float2 v5 : TEXCOORD3,
   out float4 o0 : SV_POSITION0,
   out float4 o1 : COLOR0,
   out float4 o2 : COLOR1,
-  out float2 o3 : TEXCOORD0,
-  out float2 p3 : TEXCOORD2,
+  out float4 o3 : TEXCOORD0,
   out float4 o4 : TEXCOORD1,
   out float4 o5 : TEXCOORD4,
-  out float4 o6 : TEXCOORD10,
-  out float4 o7 : TEXCOORD5)  // DLAA: prev clip-space position for per-object MV
+  out float4 o6 : TEXCOORD10)
 {
   float4 r0,r1,r2,r3,r4;
   uint4 bitmask, uiDest;
   float4 fDest;
 
-  // ── 4-bone skinning (original code) ──
   r0.xyzw = BoneTransformConstantBuffer[v3.y]._m00_m10_m20_m30;
   r1.xyz = v0.xyz;
   r1.w = 1;
@@ -128,45 +123,19 @@ void main(
   r3.xyzw = BoneTransformConstantBuffer[v3.w]._m02_m12_m22_m32;
   r2.z = dot(r1.xyzw, r3.xyzw);
   r0.xyz = r2.xyz * v4.www + r0.xyz;
-  r0.w = 1;  // r0 = world-space position (skinned)
-
-  // ── Current clip-space position ──
+  r0.w = 1;
   r1.x = dot(r0.xyzw, scene.ViewProjection._m00_m10_m20_m30);
   r1.y = dot(r0.xyzw, scene.ViewProjection._m01_m11_m21_m31);
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
-
-  // ── DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
+  r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
+  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
   // Jitter offsets come from the addon b13 injection (0 when disabled).
   o0.x = r1.x + DLAA_JITTER_X * r1.w;
   o0.y = r1.y + DLAA_JITTER_Y * r1.w;
   o0.zw = r1.zw;
-
-  // ── DLAA: Per-object motion vectors (prev clip-space position) ──
-  // Senkiseki3 does not populate cb0 c74 (Sora engine only), so the previous
-  // frame's ViewProjection is injected by the addon via the b13 cbuffer.
-  if (DLAA_PER_OBJECT_MOTION > 0.5f) {
-    float4x4 prevViewProjection = float4x4(
-        shader_injection_data.prev_view_proj[0],  shader_injection_data.prev_view_proj[1],  shader_injection_data.prev_view_proj[2],  shader_injection_data.prev_view_proj[3],
-        shader_injection_data.prev_view_proj[4],  shader_injection_data.prev_view_proj[5],  shader_injection_data.prev_view_proj[6],  shader_injection_data.prev_view_proj[7],
-        shader_injection_data.prev_view_proj[8],  shader_injection_data.prev_view_proj[9],  shader_injection_data.prev_view_proj[10], shader_injection_data.prev_view_proj[11],
-        shader_injection_data.prev_view_proj[12], shader_injection_data.prev_view_proj[13], shader_injection_data.prev_view_proj[14], shader_injection_data.prev_view_proj[15]);
-    float4 prevClip;
-    prevClip.x = dot(r0.xyzw, prevViewProjection._m00_m10_m20_m30);
-    prevClip.y = dot(r0.xyzw, prevViewProjection._m01_m11_m21_m31);
-    prevClip.z = dot(r0.xyzw, prevViewProjection._m02_m12_m22_m32);
-    prevClip.w = dot(r0.xyzw, prevViewProjection._m03_m13_m23_m33);
-    o7 = prevClip;
-  } else {
-    o7 = float4(0, 0, 0, 0);
-  }
-
-  // ── Original outputs ──
-  o6.xyzw = r1;  // TEXCOORD10 = clip position
+  o6.xyzw = r1.xyzw;
   o1.xyzw = float4(1,1,1,1);
-  r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-
-  // World-space normal (skinned)
   r1.xyz = scene.EyePosition.xyz + -r0.xyz;
   r1.w = dot(r1.xyz, r1.xyz);
   r1.w = rsqrt(r1.w);
@@ -224,6 +193,5 @@ void main(
   r0.x = min(1, r0.x);
   o2.w = scene.FogRangeParameters.w * r0.x;
   o3.xy = v2.xy * GameMaterialTexcoord.zw + GameMaterialTexcoord.xy;
-  p3.xy = v5.xy * UVaMUvTexcoord.zw + UVaMUvTexcoord.xy;
   return;
 }

@@ -82,17 +82,19 @@ void main(uint2 pix : SV_DispatchThreadID)
     }
   }
 
-  // Velocity in output-res pixel units (y-down). Jitter-free: neither the depth
-  // reprojection nor the per-object path contains jitter now (the camera jitter
-  // is applied as an image-level UV shift at the pre-FXAA composite, and DLSS
-  // aligns it via the jitter offsets it receives).
+  // Velocity in output-res pixel units (y-down).
+  //
+  // Jitter compensation:
+  //  - Depth-reprojection path: ALREADY jitter-free. Unproject/reproject uses
+  //    the UNJITTERED matrices, which is an identity round trip for any depth,
+  //    so the geometry jitter (SV_Position shift in the replaced scene VSs)
+  //    cancels even though the depth is rasterized at the jittered grid. Do NOT
+  //    compensate here (it would inject the jitter into static-environment MVs).
+  //  - Per-object path: curPx is the jittered pixel, but the VS prevClip is
+  //    unjittered NDC, so the MV picks up the content shift
+  //    (+jitter_x*w/2, -jitter_y*h/2 px). Subtract it there only.
+  // DLSS receives the same jitter via InJitterOffset (MVJittered=0).
   float2 vel = (curPx - prevPx) * params0.z;
-  // The depth-reprojection path is ALREADY jitter-free: unproject/reproject with
-  // the unjittered matrices is an identity round trip for any depth value, so the
-  // viewport jitter cancels even though the depth is rasterized at the jittered
-  // grid. Only the PER-OBJECT path picks up the jitter (curPx is the jittered
-  // pixel but the VS prevClip is unjittered NDC), so subtract the content shift
-  // (jitter_x*w*0.5, -jitter_y*h*0.5) there only.
   if (hasObjectMotion) {
     vel.x -= params1.x * params0.x * 0.5f;
     vel.y += params1.y * params0.y * 0.5f;

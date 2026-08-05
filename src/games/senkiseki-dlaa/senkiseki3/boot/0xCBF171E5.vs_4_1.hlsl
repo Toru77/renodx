@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:57 2026
+// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:56 2026
 
 #include "../../shared.h"
 
@@ -65,11 +65,9 @@ cbuffer _Globals : register(b0)
   float RimLitIntensity : packoffset(c61.w) = {4};
   float RimLitPower : packoffset(c62) = {2};
   float RimLightClampFactor : packoffset(c62.y) = {2};
-  float CubeMapIntensity : packoffset(c62.z) = {1};
-  float CubeMapFresnel : packoffset(c62.w) = {0};
-  float BloomIntensity : packoffset(c63) = {1};
-  float4 PointLightParams : packoffset(c64) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c65) = {0,0,0,0};
+  float BloomIntensity : packoffset(c62.z) = {1};
+  float4 PointLightParams : packoffset(c63) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c64) = {0,0,0,0};
 }
 
 

@@ -60,16 +60,9 @@ cbuffer _Globals : register(b0)
   float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
   float Shininess : packoffset(c59) = {0.5};
   float SpecularPower : packoffset(c59.y) = {50};
-  float3 SpecularColor : packoffset(c60) = {1,1,1};
-  float3 RimLitColor : packoffset(c61) = {1,1,1};
-  float RimLitIntensity : packoffset(c61.w) = {4};
-  float RimLitPower : packoffset(c62) = {2};
-  float RimLightClampFactor : packoffset(c62.y) = {2};
-  float CubeMapIntensity : packoffset(c62.z) = {1};
-  float CubeMapFresnel : packoffset(c62.w) = {0};
-  float BloomIntensity : packoffset(c63) = {1};
-  float4 PointLightParams : packoffset(c64) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c65) = {0,0,0,0};
+  float BloomIntensity : packoffset(c59.z) = {1};
+  float4 PointLightParams : packoffset(c60) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c61) = {0,0,0,0};
 }
 
 
