@@ -97,6 +97,7 @@ void main(
   o0.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   o0.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
   // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
+  // Effect draws have their jitter zeroed per-draw by the addon (ApplyPerDrawJitter).
   o0.x += DLAA_JITTER_X * o0.w;
   o0.y += DLAA_JITTER_Y * o0.w;
   r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);

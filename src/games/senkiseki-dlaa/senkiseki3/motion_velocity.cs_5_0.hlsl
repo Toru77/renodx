@@ -11,18 +11,21 @@
 //
 // Input:  t0 = depth texture (R32_FLOAT or R32_TYPELESS)
 //         t1 = G-buffer MRT2 (per-object prevNDC in o2.zw, y-up UV)
+//         t2 = effect/particle mask (r16g16_float, 1.0 = excluded from DLAA)
 // Output: u0 = velocity buffer (R16G16_FLOAT, screen px, y-down)
 //
 // Push constants (b13, 32 floats = 8 float4s):
 //   c[0..3]  = prevViewProjection (4x4 row-major)
 //   c[4..7]  = curViewProjInverse (4x4 row-major)
 //   c[8]     = VP_WIDTH, VP_HEIGHT, VELOCITY_SCALE, DEBUG_VIEW
-//   c[9]     = JITTER_X(NDC), JITTER_Y(NDC), PER_OBJECT_MOTION, 0
+//   c[9]     = JITTER_X(NDC), JITTER_Y(NDC), PER_OBJECT_MOTION, ZERO_MV
+//   c[10]    = MV_THRESHOLD(px), MV_DIRECTION(flip), 0, EXCLUDE_EFFECTS
 //
 // SPDX-License-Identifier: MIT
 
 Texture2D<float> g_srcDepth : register(t0);
 Texture2D<float4> g_srcMotion : register(t1);
+Texture2D<float4> g_srcEffectMask : register(t2);
 RWTexture2D<float2> g_outVelocity : register(u0);
 
 cbuffer cb_push : register(b13) {
@@ -105,6 +108,12 @@ void main(uint2 pix : SV_DispatchThreadID)
   if (params2.y > 0.5f) vel = -vel;
   // MV Threshold: zero out sub-pixel noise (static dots) that poison history.
   if (length(vel) < params2.x) vel = float2(0.0, 0.0);
+
+  // Exclude effects/particles from DLAA: an off-screen motion vector makes DLSS
+  // fall back to the current input frame (no temporal history), which prevents
+  // shimmer/ghosting on content DLSS can't resolve. The effect PSs write 1.0
+  // into the mask (t2) during their passes.
+  if (params2.w > 0.5f && g_srcEffectMask.Load(int3(pix, 0)).x > 0.5f) vel = float2(100000.0, 100000.0);
 
   // Guard against garbage from invalid matrices/depth (e.g. startup frames)
   if (!isfinite(vel.x) || !isfinite(vel.y)) vel = 0;

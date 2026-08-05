@@ -39,6 +39,9 @@ struct ShaderInjectData {
 
   // ── MV texture precision A/B (addon-side only, not read by shaders) ──
   float dlaa_velocity_format;  // 0 = r16g16_float (16-bit), 1 = r32g32_float (32-bit)
+
+  // ── Effect/particle exclusion (read by the velocity compute via push constants) ──
+  float dlaa_exclude_effects;  // 0=Off, 1=On — mask particles/effects out of DLAA (invalid-MV opt-out)
 };
 
 #ifndef __cplusplus
@@ -59,6 +62,7 @@ cbuffer shader_injection : register(b13) {
 #define DLAA_DEBUG_LOGGING        shader_injection_data.dlaa_debug_logging
 #define DLAA_JITTER_X             shader_injection_data.jitter_offset_x
 #define DLAA_JITTER_Y             shader_injection_data.jitter_offset_y
+#define DLAA_EXCLUDE_EFFECTS      shader_injection_data.dlaa_exclude_effects
 
 #endif
 

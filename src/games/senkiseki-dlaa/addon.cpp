@@ -44,10 +44,11 @@ ShaderInjectData shader_injection = {
     .dlaa_flag_auto_exposure = 0.f,
     .jitter_offset_x = 0.f, .jitter_offset_y = 0.f,
     .dlaa_velocity_format = 0.f,
+    .dlaa_exclude_effects = 0.f,
 };
 
 // ── Descriptor table helpers ──
-constexpr uint32_t kTableParamCount = 5u;
+constexpr uint32_t kTableParamCount = 6u;
 using DTSet = std::array<reshade::api::descriptor_table, kTableParamCount>;
 
 static void FreeTables(reshade::api::device* dev, DTSet& t) {
@@ -63,6 +64,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline_layout velocity_layout = {};
   reshade::api::pipeline velocity_pipeline = {};
   DTSet velocity_tables = {};
+
+  // Effect/particle exclusion mask (invalid-MV opt-out for DLAA)
+  reshade::api::resource effect_mask_texture = {};
+  reshade::api::resource_view effect_mask_srv = {};
+  reshade::api::resource_view effect_mask_rtv = {};
+  reshade::api::resource_view last_rtvs[8] = {};  // last bound RT set (for mask re-bind)
+  uint32_t last_rtv_count = 0;
+  reshade::api::resource_view last_dsv = {};
+  bool effect_mask_cleared_this_frame = false;
 
   reshade::api::buffer_range captured_scene_cbv = {};  // _Globals cbuffer at b0
   bool captured_scene_cbv_valid = false;
@@ -125,6 +135,8 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
 
   dv(d->velocity_srv); dv(d->velocity_uav); dr(d->velocity_texture);
   dp(d->velocity_pipeline); dl(d->velocity_layout); FreeTables(dev, d->velocity_tables);
+  dv(d->effect_mask_srv); dv(d->effect_mask_rtv); dr(d->effect_mask_texture);
+  d->last_rtv_count = 0; d->last_dsv = {};
   d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
   dv(d->captured_depth_srv); dv(d->captured_color_srv);
   d->captured_depth_res = {}; d->captured_color_res = {};
@@ -167,6 +179,7 @@ static bool CreateVelocityPipeline(reshade::api::device* dev, DeviceData* d) {
   DR cbv_r     = {0,0,0,1, DS::all_compute, 1, DT::constant_buffer};
   DR srv_r     = {0,0,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                    // t0 (depth)
   DR motion_r  = {0,1,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                    // t1 (per-object MV)
+  DR mask_r    = {0,2,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                    // t2 (effect mask)
   DR uav_r     = {0,0,0,1, DS::all_compute, 1, DT::texture_unordered_access_view};
   reshade::api::constant_range pc_range = {};
   pc_range.binding = 0;
@@ -174,16 +187,17 @@ static bool CreateVelocityPipeline(reshade::api::device* dev, DeviceData* d) {
   pc_range.count = 48;  // matches motion_velocity.cs_5_0.hlsl cbuffer (12 float4s)
   pc_range.visibility = DS::all_compute;
 
-  P params[6];
+  P params[7];
   params[0].type = PT::descriptor_table; params[0].descriptor_table = {1, &sampler_r};
   params[1].type = PT::descriptor_table; params[1].descriptor_table = {1, &cbv_r};
   params[2].type = PT::descriptor_table; params[2].descriptor_table = {1, &srv_r};
   params[3].type = PT::descriptor_table; params[3].descriptor_table = {1, &motion_r};
   params[4].type = PT::descriptor_table; params[4].descriptor_table = {1, &uav_r};
-  params[5].type = PT::push_constants;   params[5].push_constants = pc_range;
+  params[5].type = PT::descriptor_table; params[5].descriptor_table = {1, &mask_r};
+  params[6].type = PT::push_constants;   params[6].push_constants = pc_range;
 
-  if (!dev->create_pipeline_layout(6, params, &d->velocity_layout)) return false;
-  for (uint32_t i = 0; i < 5u; ++i)
+  if (!dev->create_pipeline_layout(7, params, &d->velocity_layout)) return false;
+  for (uint32_t i = 0; i < 6u; ++i)
     if (!dev->allocate_descriptor_table(d->velocity_layout, i, &d->velocity_tables[i])) return false;
 
   reshade::api::shader_desc cs_desc = {};
@@ -281,10 +295,163 @@ static bool EnsurePrevColorTexture(reshade::api::device* dev, DeviceData* d, uin
   return d->prev_color_texture.handle != 0u && d->prev_color_srv.handle != 0u;
 }
 
+// ── Effect/particle exclusion mask ──
+// Effect passes (particle, transparent, water, etc.) write 1.0 into a full-res
+// mask via an appended render target. The velocity compute reads it and writes
+// an OFF-SCREEN motion vector there, so DLSS falls back to the current input
+// frame (no temporal history) — kills shimmer/ghosting on content DLSS can't
+// resolve (particles, transparency).
+static const std::array<uint32_t, 3> EFFECT_PS_HASHES = {
+    0xD589DF82u,  // particle (0x7D3553A7)
+    0x720FE34Cu,  // water/particle (0x8AFF0B4F)
+    0xC1BF7F2Eu,  // effect (0x795F3AD3)
+    // NOTE: transparent textures (0x728F5ED1 / VS 0xC8FE8FC4) are deliberately
+    // NOT excluded. They are static world content that shares the camera's
+    // motion with the background, so the velocity compute gives them correct
+    // camera MVs and DLAA resolves them cleanly. Excluding them made the masked
+    // region show the RAW JITTERED background (single sample, no temporal
+    // accumulation) -> everything behind the texture shook/jittered.
+};
+
+static bool IsEffectPs(uint32_t hash) {
+  for (uint32_t h : EFFECT_PS_HASHES) if (h == hash) return true;
+  return false;
+}
+
+// VSs paired with the excluded effect PSs — these must NOT apply the DLAA
+// rasterization jitter (they render as a native current-frame fallback).
+static const std::array<uint32_t, 4> EFFECT_VS_HASHES = {
+    0x7D3553A7u,  // particle
+    0x8AFF0B4Fu,  // water/particle
+    0x795F3AD3u,  // world-space effect
+    0xC8FE8FC4u,  // transparent texture
+};
+
+static bool IsEffectVs(uint32_t hash) {
+  for (uint32_t h : EFFECT_VS_HASHES) if (h == hash) return true;
+  return false;
+}
+
+// Create the full-res effect mask (r16g16_float, RT + SRV).
+static bool EnsureEffectMask(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
+  if (d->effect_mask_texture.handle) return true;
+  if (!dev || !d) return false;
+  reshade::api::resource_desc rd = {};
+  rd.type = reshade::api::resource_type::texture_2d;
+  rd.texture = {w, h, 1, 1, reshade::api::format::r16g16_float, 1};
+  rd.heap = reshade::api::memory_heap::gpu_only;
+  rd.usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+  if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::render_target, &d->effect_mask_texture)) return false;
+  reshade::api::resource_view_desc rv(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16_float, 0, 1, 0, 1);
+  dev->create_resource_view(d->effect_mask_texture, reshade::api::resource_usage::render_target, rv, &d->effect_mask_rtv);
+  dev->create_resource_view(d->effect_mask_texture, reshade::api::resource_usage::shader_resource, rv, &d->effect_mask_srv);
+  return d->effect_mask_rtv.handle && d->effect_mask_srv.handle;
+}
+
+// Append the effect-mask RT to effect passes (called right before their draw).
+static void MaybeAppendEffectMask(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (shader_injection.dlaa_exclude_effects < 0.5f) return;
+  if (!cmd_list || !d || !d->effect_mask_rtv.handle || d->last_rtv_count == 0u) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  if (!IsEffectPs(phash)) return;
+  auto* dev = cmd_list->get_device();
+  if (!dev || !d->last_rtvs[0].handle) return;
+  // D3D11 requires all bound RTs to share identical dimensions — only append
+  // the mask to full-res passes. Low-res passes (e.g. particles rendered into
+  // a 341x341 buffer) are skipped rather than breaking the draw.
+  reshade::api::resource_desc mr = dev->get_resource_desc(d->effect_mask_texture);
+  reshade::api::resource_desc rd = dev->get_resource_desc(dev->get_resource_from_view(d->last_rtvs[0]));
+  if (rd.type != reshade::api::resource_type::texture_2d) return;
+  if (rd.texture.width != mr.texture.width || rd.texture.height != mr.texture.height) return;
+  // Clear once per frame before the first effect pass.
+  if (!d->effect_mask_cleared_this_frame) {
+    const float black[4] = {0.f, 0.f, 0.f, 0.f};
+    cmd_list->clear_render_target_view(d->effect_mask_rtv, black);
+    d->effect_mask_cleared_this_frame = true;
+  }
+  reshade::api::resource_view rts[9];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < d->last_rtv_count && n < 8u; ++i)
+    if (d->last_rtvs[i].handle) rts[n++] = d->last_rtvs[i];
+  if (n == 0u || n >= 8u) return;
+  // The effect PS writes the mask to SV_TARGET1, so the mask RT must sit at
+  // RTV index 1 — NOT appended at the end (that only aligned for single-RT
+  // passes; multi-RT effect passes never wrote the mask and stayed in DLAA).
+  // Shift the pass's own RT1..N down one slot to make room for it.
+  for (uint32_t i = n; i > 1; --i) rts[i] = rts[i - 1];
+  rts[1] = d->effect_mask_rtv;
+  ++n;
+  cmd_list->bind_render_targets_and_depth_stencil(n, rts, d->last_dsv);
+}
+
+// ── Diagnostics: log the first ~20 effect draws (VS/PS hashes + exclusion flag).
+// Tells us whether 0xC8FE8FC4-type draws are being masked (PS in EFFECT_PS_HASHES)
+// and whether the exclude toggle is 1 at draw time (VS gate should fire).
+static void MaybeLogEffectDraw(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (!cmd_list || !d) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (!state) return;
+  uint32_t vhash = renodx::utils::shader::GetCurrentVertexShaderHash(state);
+  uint32_t phash = renodx::utils::shader::GetCurrentPixelShaderHash(state);
+  if (!IsEffectVs(vhash) && !IsEffectPs(phash) && vhash != 0xDFE5A75Du) return;
+  static uint32_t logged = 0;
+  if (logged++ >= 20u) return;
+  char buf[160];
+  snprintf(buf, sizeof(buf), "[DLAA] effect draw: vs=0x%08X ps=0x%08X exclude=%d rtvs=%u",
+           vhash, phash, (int)(shader_injection.dlaa_exclude_effects > 0.5f), d->last_rtv_count);
+  reshade::log::message(reshade::log::level::info, buf);
+}
+
+// Per-draw jitter control: effect draws (PS in EFFECT_PS_HASHES) are excluded
+// from DLAA via the mask and render as a native current-frame fallback, so they
+// must NOT receive the rasterization jitter (it would just shimmer). This runs
+// BEFORE renodx's injection push (our draw hook is registered first), so the
+// jitter offsets the VS reads THIS draw are exactly what we set here. Regular
+// geometry is restored to the frame's canonical jitter (d->jitter_x/y).
+// This is PS-driven (not VS-driven) so shared VSs like 0xDFE5A75D keep jitter
+// in their geometry pass and lose it only in their effect/transparent pass.
+static void ApplyPerDrawJitter(reshade::api::command_list* cmd_list, DeviceData* d) {
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  if (IsEffectPs(phash)) {
+    shader_injection.jitter_offset_x = 0.f;
+    shader_injection.jitter_offset_y = 0.f;
+  } else {
+    shader_injection.jitter_offset_x = d->jitter_x;
+    shader_injection.jitter_offset_y = d->jitter_y;
+  }
+}
+
+// Draw hooks: append the mask RT right before effect draws (the PS is
+// guaranteed to be bound here, unlike at the RT-bind event).
+static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
+  auto* dev = cmd_list->get_device();
+  if (!dev) return false;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (d) {
+    ApplyPerDrawJitter(cmd_list, d);
+    MaybeLogEffectDraw(cmd_list, d);
+    MaybeAppendEffectMask(cmd_list, d);
+  }
+  return false;
+}
+static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  auto* dev = cmd_list->get_device();
+  if (!dev) return false;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (d) {
+    ApplyPerDrawJitter(cmd_list, d);
+    MaybeLogEffectDraw(cmd_list, d);
+    MaybeAppendEffectMask(cmd_list, d);
+  }
+  return false;
+}
+
 // ── Event: capture RTV0 (FXAA output target) ──
 static void OnBindRenderTargets(
     reshade::api::command_list* cmd_list, uint32_t count,
-    const reshade::api::resource_view* rtvs, reshade::api::resource_view) {
+    const reshade::api::resource_view* rtvs, reshade::api::resource_view dsv) {
   if (count < 1 || !rtvs || !rtvs[0].handle) return;
   auto* dev = cmd_list->get_device();
   if (!dev) return;
@@ -294,6 +461,15 @@ static void OnBindRenderTargets(
   // Candidate per-object motion MRT (RTV2) — adopted when char G-buffer draws
   if (count >= 3u && rtvs[2].handle) {
     d->last_rtv2_candidate = dev->get_resource_from_view(rtvs[2]);
+  }
+  // Track the bound RT set for the effect-mask re-bind (skip our own echo).
+  bool has_mask = false;
+  for (uint32_t i = 0; i < count && i < 8u; ++i)
+    if (d->effect_mask_rtv.handle && rtvs[i] == d->effect_mask_rtv) has_mask = true;
+  if (!has_mask) {
+    d->last_rtv_count = std::min<uint32_t>(count, 8u);
+    for (uint32_t i = 0; i < d->last_rtv_count; ++i) d->last_rtvs[i] = rtvs[i];
+    d->last_dsv = dsv;
   }
 }
 
@@ -727,6 +903,7 @@ static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
   c[39] = shader_injection.dlaa_zero_mv;
   c[40] = shader_injection.dlaa_mv_threshold;
   c[41] = shader_injection.dlaa_mv_direction;
+  c[43] = shader_injection.dlaa_exclude_effects;  // params2.w — mask effects out of DLAA
   return c;
 }
 
@@ -786,6 +963,9 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
 
   if (!d->velocity_pipeline.handle && !CreateVelocityPipeline(dev, d)) return false;
 
+  // Effect mask (r16g16_float) for the DLAA opt-out of particles/effects.
+  EnsureEffectMask(dev, d, w, h);
+
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
   const auto CS = reshade::api::shader_stage::all_compute;
@@ -818,22 +998,23 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       // Pass: Velocity compute
       cmd_list->bind_pipeline(AC, d->velocity_pipeline);
 
-      reshade::api::descriptor_table_update u[5] = {
+      reshade::api::descriptor_table_update u[6] = {
         { d->velocity_tables[0], 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_sampler },
         { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv },
         { d->velocity_tables[2], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_depth_srv },
         { d->velocity_tables[3], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_motion_srv },
         { d->velocity_tables[4], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->velocity_uav },
+        { d->velocity_tables[5], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->effect_mask_srv },
       };
-      dev->update_descriptor_tables(5, u);
+      dev->update_descriptor_tables(6, u);
 
-      reshade::api::descriptor_table tables[5] = {
+      reshade::api::descriptor_table tables[6] = {
           d->velocity_tables[0], d->velocity_tables[1], d->velocity_tables[2],
-          d->velocity_tables[3], d->velocity_tables[4]};
-      cmd_list->bind_descriptor_tables(CS, d->velocity_layout, 0, 5, tables);
+          d->velocity_tables[3], d->velocity_tables[4], d->velocity_tables[5]};
+      cmd_list->bind_descriptor_tables(CS, d->velocity_layout, 0, 6, tables);
 
       auto pc = BuildVelocityPC(d);
-      cmd_list->push_constants(CS, d->velocity_layout, 5, 0, 48, pc.data());
+      cmd_list->push_constants(CS, d->velocity_layout, 6, 0, 48, pc.data());
       cmd_list->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       cmd_list->barrier(d->velocity_texture, UA, SR);
 
@@ -1088,6 +1269,14 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLAAExcludeEffects", .binding = &shader_injection.dlaa_exclude_effects,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Exclude Effects from DLAA", .section = "Antialiasing",
+        .tooltip = "Masks particles/effects out of DLAA: they get an off-screen motion vector so DLSS falls back to the current frame (no temporal shimmer/ghosting).",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLAADepthSource", .binding = &shader_injection.dlaa_depth_source,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "Depth Source", .section = "Antialiasing",
@@ -1229,6 +1418,15 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // Character G-buffer PS: encodes per-object prevNDC into MRT2 (o2.zw) so
     // the velocity compute can build MVs for skinned characters.
     CustomShaderEntry(0x0E8BC215),
+    // Effect PS replacements: write SV_TARGET1 = 1.0 into the appended
+    // effect-mask RT (Exclude Effects toggle) so the velocity compute can
+    // opt these pixels out of DLAA (invalid-MV -> current-frame fallback).
+    CustomShaderEntry(0xD589DF82),  // particle PS (mask writer)
+    CustomShaderEntry(0x720FE34C),  // water/particle PS (mask writer)
+    CustomShaderEntry(0xC1BF7F2E),  // effect PS (mask writer)
+    // (0x728F5ED1 transparent PS is NOT registered: it must stay jittered +
+    //  DLAA'd — static world content with correct camera MVs. Excluding it made
+    //  the background behind it shake.)
     // Pre-FXAA composite: pure pixel-center passthrough (no UV-shift jitter).
     // The geometry jitter passes through unchanged to the buffer RunDLAA feeds
     // to DLSS.
@@ -1237,7 +1435,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 
 }  // namespace
 
-extern "C" __declspec(dllexport) constexpr const char* NAME = "Senkiseki3 DLAA";
+extern "C" __declspec(dllexport) constexpr const char* NAME = "Senkiseki DLAA";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION =
     "NVIDIA DLAA for Senkiseki3. Requires nvngx_dlss.dll.";
 
@@ -1253,6 +1451,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
 
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::register_event<reshade::addon_event::draw>(OnDrawMaskHook);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawMaskHookIndexed);
 
       reshade::register_event<reshade::addon_event::present>(
           [](reshade::api::command_queue*, reshade::api::swapchain* swapchain,
@@ -1271,6 +1471,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           // The early scene-CBV staging copy is issued once per frame (at the
           // first scene-geometry b0 push) and consumed at FXAA.
           d->scene_cbv_copy_issued = false;
+          // Effect mask is cleared at the first effect pass each frame.
+          d->effect_mask_cleared_this_frame = false;
           // Jitter is computed once per frame at PRESENT time, before the next frame's
           // composite (0xE8C7EBA2) draws. Both the composite UV shift and the NGX jitter
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.
@@ -1307,6 +1509,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       break;
     case DLL_PROCESS_DETACH:
       senkiseki3::dlss::ShutdownDLSS();
+      reshade::unregister_event<reshade::addon_event::draw>(OnDrawMaskHook);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawMaskHookIndexed);
       reshade::unregister_addon(h_module);
       break;
   }
