@@ -457,7 +457,7 @@ static void MaybeAppendEffectMask(reshade::api::command_list* cmd_list, DeviceDa
 // patched to write o3/SV_TARGET3 (otherwise that part falls back to camera
 // motion). Full list = the character's mesh parts (hair, skin, clothing, eyes,
 // outline, face).
-static const std::array<uint32_t, 14> PER_OBJECT_MOTION_VS_HASHES = {
+static const std::array<uint32_t, 24> PER_OBJECT_MOTION_VS_HASHES = {
     0x0D5DABC6u,  // main skinned character (face)
     0xB2F338C8u,  // skinned
     0xB1C24E2Au,  // skinned
@@ -472,6 +472,16 @@ static const std::array<uint32_t, 14> PER_OBJECT_MOTION_VS_HASHES = {
     0xF8C9B92Du,  // clothing
     0x5E5AE3FBu,  // character outline
     0xB662509Au,  // clothing
+    0x0045297Du,  // skinned (draw 39)
+    0x59001D8Eu,  // skinned (draw 40)
+    0x63C867BAu,  // skinned (draw 41)
+    0xB0A80DEFu,  // skinned outline (draw 42)
+    0x1DF2E2BBu,  // skinned (draw 45)
+    0x38BCCCA0u,  // skinned (draw 52)
+    0x6285DCF3u,  // skinned (draw 73)
+    0xFC588329u,  // skinned (draw 80)
+    0x5AA04209u,  // skinned (draw 84)
+    0x835760A3u,  // skinned outline (draw 85)
 };
 
 static bool IsPerObjectMotionVs(uint32_t hash) {
@@ -929,7 +939,7 @@ static void UpdateMotionSrv(reshade::api::device* dev, DeviceData* d, reshade::a
 // NOTE: b0 is a PER-OBJECT cbuffer (contains World at c44) — that is why the
 // proxy-cbuffer jitter approach is unworkable (a shared proxy would give every
 // object the first object's World matrix). Jitter must live in the VS.
-static const std::array<uint32_t, 41> SCENE_GEOMETRY_VS_HASHES = {
+static const std::array<uint32_t, 51> SCENE_GEOMETRY_VS_HASHES = {
     0x37F1DE22u,  // world/terrain (primary)
     0xCBF171E5u,  // world
     0xDF1D933Fu,  // world
@@ -972,6 +982,18 @@ static const std::array<uint32_t, 41> SCENE_GEOMETRY_VS_HASHES = {
     0x77355EEDu,  // forest impostor billboard (sky)
     0xC8FE8FC4u,  // transparent texture (world-space)
     0x7D3553A7u,  // particle (world-space)
+    // Remaining char-part VSs from the 39-86 sweep (also scene geometry for the
+    // b0 camera-matrix capture gate).
+    0x0045297Du,  // draw 39
+    0x59001D8Eu,  // draw 40
+    0x63C867BAu,  // draw 41
+    0xB0A80DEFu,  // draw 42 (outline)
+    0x1DF2E2BBu,  // draw 45
+    0x38BCCCA0u,  // draw 52
+    0x6285DCF3u,  // draw 73
+    0xFC588329u,  // draw 80
+    0x5AA04209u,  // draw 84
+    0x835760A3u,  // draw 85 (outline)
 };
 
 static bool IsSceneGeometryVs(uint32_t hash) {
@@ -1842,6 +1864,17 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xB5759643),
     CustomShaderEntry(0xF426BC1C),
     CustomShaderEntry(0x38656EB3),
+    // Remaining char-part VSs from the full 39-86 pairing sweep (draws 39..85).
+    CustomShaderEntry(0x0045297D),  // draw 39
+    CustomShaderEntry(0x59001D8E),  // draw 40
+    CustomShaderEntry(0x63C867BA),  // draw 41
+    CustomShaderEntry(0xB0A80DEF),  // draw 42 (outline)
+    CustomShaderEntry(0x1DF2E2BB),  // draw 45
+    CustomShaderEntry(0x38BCCCA0),  // draw 52
+    CustomShaderEntry(0x6285DCF3),  // draw 73
+    CustomShaderEntry(0xFC588329),  // draw 80
+    CustomShaderEntry(0x5AA04209),  // draw 84
+    CustomShaderEntry(0x835760A3),  // draw 85 (outline)
     // Foliage & world VSs discovered in the foliage scene (same geometry jitter).
     CustomShaderEntry(0x29513853),  // foliage (main)
     CustomShaderEntry(0xED3D1A43),  // foliage
@@ -1881,6 +1914,19 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xA4DC2F84),  // pairs with 0x5C1A50E5
     CustomShaderEntry(0x7542CBC4),  // pairs with 0xB1C24E2A
     CustomShaderEntry(0x0E03514A),  // pairs with 0xB2F338C8
+    CustomShaderEntry(0x1DE48D94),  // pairs with 0x5E5AE3FB (outline)
+    CustomShaderEntry(0x2029B1A4),  // pairs with 0xF426BC1C
+    CustomShaderEntry(0x87986FAA),  // pairs with 0xBCB30859
+    CustomShaderEntry(0x2B3C9980),  // pairs with 0x0045297D
+    CustomShaderEntry(0x08F6C8F5),  // pairs with 0x59001D8E
+    CustomShaderEntry(0x38BA428E),  // pairs with 0x63C867BA
+    CustomShaderEntry(0xE14A638B),  // pairs with 0xB0A80DEF (outline)
+    CustomShaderEntry(0x43C1531A),  // pairs with 0x1DF2E2BB
+    CustomShaderEntry(0xF280500B),  // pairs with 0x38BCCCA0
+    CustomShaderEntry(0xC04F07D9),  // pairs with 0x6285DCF3
+    CustomShaderEntry(0xEA7B3E27),  // pairs with 0xFC588329
+    CustomShaderEntry(0xDD5A9D03),  // pairs with 0x5AA04209
+    CustomShaderEntry(0x055CFB63),  // pairs with 0x835760A3 (outline)
     // Effect PS replacements: write SV_TARGET1 = 1.0 into the appended
     // effect-mask RT (Exclude Effects toggle) so the velocity compute can
     // opt these pixels out of DLAA (invalid-MV -> current-frame fallback).
