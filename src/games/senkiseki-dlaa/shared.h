@@ -45,6 +45,13 @@ struct ShaderInjectData {
 
   // ── Jitter method (addon-side; read by the addon + VS injection) ──
   float dlaa_jitter_method;    // 0=Per VS (jitter inside replaced VSs), 1=Global (patch shared ViewProjection)
+
+  // ── Phase 0 probe logging (addon-side only; NOT read by shaders) ──
+  // Separate toggle from dlaa_debug_logging so the prev-pose feasibility probe
+  // (bone-buffer SRV pushes, per-object draw bone bindings, vertex-buffer
+  // BindFlags) isn't lost in the general debug spam. Kept at the end of the
+  // struct so the cbuffer layout of the fields above is unchanged.
+  float dlaa_phase0_logging;   // 0=Off, 1=On — prev-pose bone-buffer/vertex probe logs
 };
 
 #ifndef __cplusplus

@@ -577,7 +577,7 @@ void main(
   o0.xyz = r0.xyz;
   o2.w = 1;
   // ── DLAA: per-object motion (prevClip from replaced char VS TEXCOORD5) ──
-  // Encodes prevNDC (0..1, y-up) into the appended 16-bit RTV's xy with w=1 as
+  // Encodes prevNDC (0..1, y-up) into the appended 32-bit RTV's xy with w=1 as
   // the valid flag; o0/o1/o2 (the game's MRTs) are left exactly as the original.
   if (DLAA_PER_OBJECT_MOTION > 0.5f) {
     float2 prevNDC = v7.xy / max(v7.w, 0.001);

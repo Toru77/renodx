@@ -46,6 +46,8 @@ add_executable(embed_file src/embed_file.cpp)
 # Helper executable that analyzes HLSL #include dependencies and outputs .d files
 add_executable(analyze_hlsl_deps src/analyze_hlsl_deps.cpp)
 add_executable(decomp ./src/decompiler/cli.cpp)
+# Standalone DXBC parse/patch toolkit test harness (Phase A of generic shader patcher)
+add_executable(dxbc_test src/games/senkiseki-dlaa/dxbc_test.cpp)
 add_executable(mcp_bridge src/apps/mcp_bridge/main.cpp)
 
 target_include_directories(mcp_bridge SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/external/json/include)
