@@ -111,6 +111,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   struct GlobalsBufferRec {
     reshade::api::resource res = {};
     std::array<float, 16> unjittered_vp = {};
+    bool depth_only = false;  // character depth/shadow pass buffer: keep VP UNJITTERED
   };
   std::vector<GlobalsBufferRec> globals_recs;
   uint32_t globals_patch_count = 0;  // _Globals uploads captured this frame (diag)
@@ -350,6 +351,42 @@ static bool IsEffectVs(uint32_t hash) {
   return false;
 }
 
+// Character depth/shadow-casting VSs (skinned, output only SV_POSITION; write
+// the character's depth into the MAIN depth buffer). These read
+// scene.ViewProjection (c10) which the global source patch jitters — but their
+// shadow consumer compares against an UNJITTERED projection, so a jittered
+// depth pass makes the character shadow move/shake (8px under the jitter test).
+// Per-VS mode leaves them unjittered and shadows are stable, so in global mode
+// we mark their buffers and keep them UNJITTERED (skip the source patch).
+static DeviceData::GlobalsBufferRec* FindGlobalsRec(DeviceData* d, reshade::api::resource res);  // defined below
+static const std::array<uint32_t, 4> DEPTH_VS_HASHES = {
+    0xAA8821ECu,  // character shadow (user-reported)
+    0x78F969DDu,  // character depth
+    0xA1D82AA3u,  // character depth
+    0x600D64CCu,  // character depth
+};
+
+static bool IsDepthVs(uint32_t hash) {
+  for (uint32_t h : DEPTH_VS_HASHES) if (h == hash) return true;
+  return false;
+}
+
+// Mark the current b0 _Globals buffer as a character-depth-pass buffer (VP must
+// stay UNJITTERED). Called at draw time when the bound VS is a depth VS.
+static void MarkDepthBuffer(DeviceData* d, reshade::api::resource res) {
+  if (!d || !res.handle) return;
+  auto* rec = FindGlobalsRec(d, res);
+  if (!rec) {
+    if (d->globals_recs.size() < 128) {
+      d->globals_recs.push_back({});
+      d->globals_recs.back().res = res;
+      d->globals_recs.back().depth_only = true;
+    }
+    return;
+  }
+  rec->depth_only = true;
+}
+
 // Create the full-res effect mask (r16g16_float, RT + SRV).
 static bool EnsureEffectMask(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
   if (d->effect_mask_texture.handle) return true;
@@ -478,20 +515,40 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   auto* dev = cmd_list->get_device();
   if (!dev) return;
   auto rd = dev->get_resource_desc(d->last_b0_buffer);
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  // ── Character depth/shadow pass: mark its buffer (VP stays UNJITTERED) and
+  // never write jitter into it. Per-VS mode leaves these unjittered and the
+  // shadow is stable; the global source patch jitters c10 on ALL buffers, which
+  // made the character shadow move — so we un-jitter this buffer. ──
+  if (IsDepthVs(vh)) {
+    MarkDepthBuffer(d, d->last_b0_buffer);
+    if (shader_injection.dlaa_debug_logging > 0.5f) {
+      static int depth_mark = 0;
+      if (depth_mark++ < 5 || depth_mark % 250 == 0) {
+        char dbuf[160];
+        snprintf(dbuf, sizeof(dbuf), "[DLAA] global: DEPTH VS 0x%08X buffer=0x%llX size=%llu (unjittered)",
+                 vh, (unsigned long long)d->last_b0_buffer.handle,
+                 (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull));
+        reshade::log::message(reshade::log::level::info, dbuf);
+      }
+    }
+    return;  // depth pass reads the buffer's UNJITTERED VP (source patch skips it)
+  }
   if (rd.type != reshade::api::resource_type::buffer || rd.buffer.size < 768ull) {
     if (shader_injection.dlaa_debug_logging > 0.5f) {
       static int size_probe = 0;
-      if (size_probe++ < 5 || size_probe % 250 == 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "[DLAA] global: draw SKIP small buffer=0x%llX size=%llu",
+      if (size_probe++ < 20 || size_probe % 250 == 0) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "[DLAA] global: draw SKIP small buffer=0x%llX size=%llu vs=0x%08X",
                  (unsigned long long)d->last_b0_buffer.handle,
-                 (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull));
+                 (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull),
+                 vh);
         reshade::log::message(reshade::log::level::info, buf);
       }
     }
     return;
   }
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
   bool want_jittered = !IsEffectPs(phash);
   // Scene draw on a tracked (source-patched) buffer: already jittered, leave it.
@@ -1043,13 +1100,32 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
   // effect un-jitter so we never write a stale VP from another buffer).
   auto* rec = FindGlobalsRec(d, dest);
   if (!rec) {
-    if (d->globals_recs.size() < 64) {
+    if (d->globals_recs.size() < 128) {
       d->globals_recs.push_back({});
       d->globals_recs.back().res = dest;
       d->globals_recs.back().unjittered_vp = d->globals_unjittered_vp;
     }
   } else {
     rec->unjittered_vp = d->globals_unjittered_vp;
+  }
+  // ── Character depth/shadow pass buffers: keep VP UNJITTERED ──
+  // The depth VSs (DEPTH_VS_HASHES) write the character's depth into the main
+  // depth buffer via scene.ViewProjection. Its shadow consumer compares against
+  // the UNJITTERED projection, so jittering c10 here made the character shadow
+  // move/shake (per-VS mode leaves it unjittered and shadows are stable). The
+  // buffer is marked at draw time (MarkDepthBuffer); capture the unjittered VP
+  // but let the game's original upload stand unchanged.
+  if (rec && rec->depth_only) {
+    if (shader_injection.dlaa_debug_logging > 0.5f) {
+      static int depth_skip = 0;
+      if (depth_skip++ < 5 || depth_skip % 250 == 0) {
+        char dbuf[128];
+        snprintf(dbuf, sizeof(dbuf), "[DLAA] global: depth buffer unjittered buffer=0x%llX size=%llu",
+                 (unsigned long long)dest.handle, (unsigned long long)rd.buffer.size);
+        reshade::log::message(reshade::log::level::info, dbuf);
+      }
+    }
+    return false;  // let the game's original (unjittered) upload proceed
   }
   ++d->globals_patch_count;
   // ── SOURCE-LEVEL PATCH (reliable jitter) ──
