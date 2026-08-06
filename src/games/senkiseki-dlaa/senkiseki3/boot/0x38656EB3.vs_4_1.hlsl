@@ -1,7 +1,6 @@
-// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 15:12:57 2026
+// ---- Created with 3Dmigoto v1.4.1 on Thu Aug  6 04:13:13 2026
 
 #include "../../shared.h"
-
 
 cbuffer _Globals : register(b0)
 {
@@ -59,17 +58,21 @@ cbuffer _Globals : register(b0)
   float4 UVaMUvTexcoord : packoffset(c56) = {0,0,1,1};
   float4 UVaMUv2Texcoord : packoffset(c57) = {0,0,1,1};
   float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
-  float AlphaThreshold : packoffset(c59) = {0.5};
-  float3 ShadowColorShift : packoffset(c59.y) = {0.100000001,0.0199999996,0.0199999996};
-  float3 RimLitColor : packoffset(c60) = {1,1,1};
-  float RimLitIntensity : packoffset(c60.w) = {4};
-  float RimLitPower : packoffset(c61) = {2};
-  float RimLightClampFactor : packoffset(c61.y) = {2};
-  float ShadowReceiveOffset : packoffset(c61.z) = {0.600000024};
-  float BloomIntensity : packoffset(c61.w) = {0.699999988};
-  float4 GameEdgeParameters : packoffset(c62) = {1,1,1,0.00300000003};
-  float4 PointLightParams : packoffset(c63) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c64) = {0,0,0,0};
+  float3 ShadowColorShift : packoffset(c59) = {0.100000001,0.0199999996,0.0199999996};
+  float Shininess : packoffset(c59.w) = {0.5};
+  float SpecularPower : packoffset(c60) = {50};
+  float3 SpecularColor : packoffset(c60.y) = {1,1,1};
+  float3 RimLitColor : packoffset(c61) = {1,1,1};
+  float RimLitIntensity : packoffset(c61.w) = {4};
+  float RimLitPower : packoffset(c62) = {2};
+  float RimLightClampFactor : packoffset(c62.y) = {2};
+  float ShadowReceiveOffset : packoffset(c62.z) = {0.600000024};
+  float BloomIntensity : packoffset(c62.w) = {0.699999988};
+  float4 GameEdgeParameters : packoffset(c63) = {1,1,1,0.00300000003};
+  float4 OutlineColorFactor : packoffset(c64) = {1,1,1,1};
+  float3 OutlineColor : packoffset(c65) = {0.699999988,0.5,0.300000012};
+  float4 PointLightParams : packoffset(c66) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c67) = {0,0,0,0};
 }
 
 StructuredBuffer<float4x4> BoneTransformConstantBuffer : register(t0);
@@ -90,11 +93,11 @@ void main(
   out float4 o2 : COLOR1,
   out float4 o3 : TEXCOORD0,
   out float4 o4 : TEXCOORD1,
-  out float4 o5 : TEXCOORD4,
+  out float4 o5 : TEXCOORD9,
   out float4 o6 : TEXCOORD10,
-  out float4 o8 : TEXCOORD5)  // DLAA: prevClip
+  out float4 o7 : TEXCOORD5)  // DLAA: prevClip
 {
-  float4 r0,r1,r2,r3,r4;
+  float4 r0,r1,r2,r3;
   uint4 bitmask, uiDest;
   float4 fDest;
 
@@ -129,17 +132,56 @@ void main(
   r2.z = dot(r1.xyzw, r3.xyzw);
   r0.xyz = r2.xyz * v4.www + r0.xyz;
   r0.w = 1;
+  r0.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
+  r0.w = max(0.300000012, r0.w);
+  r0.w = min(1, r0.w);
+  r1.xyz = BoneTransformConstantBuffer[v3.y]._m00_m10_m20;
+  r1.x = dot(v1.xyz, r1.xyz);
+  r2.xyz = BoneTransformConstantBuffer[v3.y]._m01_m11_m21;
+  r1.y = dot(v1.xyz, r2.xyz);
+  r2.xyz = BoneTransformConstantBuffer[v3.y]._m02_m12_m22;
+  r1.z = dot(v1.xyz, r2.xyz);
+  r1.xyz = v4.yyy * r1.xyz;
+  r2.xyz = BoneTransformConstantBuffer[v3.x]._m00_m10_m20;
+  r2.x = dot(v1.xyz, r2.xyz);
+  r3.xyz = BoneTransformConstantBuffer[v3.x]._m01_m11_m21;
+  r2.y = dot(v1.xyz, r3.xyz);
+  r3.xyz = BoneTransformConstantBuffer[v3.x]._m02_m12_m22;
+  r2.z = dot(v1.xyz, r3.xyz);
+  r1.xyz = r2.xyz * v4.xxx + r1.xyz;
+  r2.xyz = BoneTransformConstantBuffer[v3.z]._m00_m10_m20;
+  r2.x = dot(v1.xyz, r2.xyz);
+  r3.xyz = BoneTransformConstantBuffer[v3.z]._m01_m11_m21;
+  r2.y = dot(v1.xyz, r3.xyz);
+  r3.xyz = BoneTransformConstantBuffer[v3.z]._m02_m12_m22;
+  r2.z = dot(v1.xyz, r3.xyz);
+  r1.xyz = r2.xyz * v4.zzz + r1.xyz;
+  r2.xyz = BoneTransformConstantBuffer[v3.w]._m00_m10_m20;
+  r2.x = dot(v1.xyz, r2.xyz);
+  r3.xyz = BoneTransformConstantBuffer[v3.w]._m01_m11_m21;
+  r2.y = dot(v1.xyz, r3.xyz);
+  r3.xyz = BoneTransformConstantBuffer[v3.w]._m02_m12_m22;
+  r2.z = dot(v1.xyz, r3.xyz);
+  r1.xyz = r2.xyz * v4.www + r1.xyz;
+  r1.w = dot(r1.xyz, r1.xyz);
+  r1.w = rsqrt(r1.w);
+  r1.xyz = r1.xyz * r1.www;
+  r2.xyz = GameEdgeParameters.www * r1.xyz;
+  o5.xyz = r1.xyz;
+  r0.xyz = r2.xyz * r0.www + r0.xyz;
+  r1.xyz = -scene.EyePosition.xyz + r0.xyz;
+  r0.w = dot(r1.xyz, r1.xyz);
+  r0.w = rsqrt(r0.w);
+  r1.xyz = r1.xyz * r0.www;
+  r0.w = 0.00100000005 + GameEdgeParameters.w;
+  r0.xyz = r1.xyz * r0.www + r0.xyz;
+  r0.w = 1;
   r1.x = dot(r0.xyzw, scene.ViewProjection._m00_m10_m20_m30);
   r1.y = dot(r0.xyzw, scene.ViewProjection._m01_m11_m21_m31);
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
-  r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
-  // Jitter offsets come from the addon b13 injection (0 when disabled).
-  o0.x = r1.x + DLAA_JITTER_X * r1.w;
-  o0.y = r1.y + DLAA_JITTER_Y * r1.w;
-  o0.zw = r1.zw;
   // DLAA: per-object motion (prev clip-space position from prevViewProj x current pose).
+  // Injected prev VP comes from the addon b13 cbuffer (Senkiseki3 has no c74).
   if (DLAA_PER_OBJECT_MOTION > 0.5f) {
     float4x4 prevViewProjection = float4x4(
         shader_injection_data.prev_view_proj[0],  shader_injection_data.prev_view_proj[1],  shader_injection_data.prev_view_proj[2],  shader_injection_data.prev_view_proj[3],
@@ -152,68 +194,27 @@ void main(
     prevClip.y = dot(wp.xyzw, prevViewProjection._m01_m11_m21_m31);
     prevClip.z = dot(wp.xyzw, prevViewProjection._m02_m12_m22_m32);
     prevClip.w = dot(wp.xyzw, prevViewProjection._m03_m13_m23_m33);
-    o8 = prevClip;
+    o7 = prevClip;
   } else {
-    o8 = float4(0, 0, 0, 0);
+    o7 = float4(0, 0, 0, 0);
   }
+  r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
+  r0.w = -scene.FogRangeParameters.x + -r0.w;
+  r0.w = saturate(scene.FogRangeParameters.z * r0.w);
+  o0.xyzw = r1.xyzw;
   o6.xyzw = r1.xyzw;
-  o1.xyzw = float4(1,1,1,1);
-  r1.xyz = scene.EyePosition.xyz + -r0.xyz;
-  r1.w = dot(r1.xyz, r1.xyz);
-  r1.w = rsqrt(r1.w);
-  r1.xyz = r1.xyz * r1.www;
-  r2.xyz = BoneTransformConstantBuffer[v3.y]._m00_m10_m20;
-  r2.x = dot(v1.xyz, r2.xyz);
-  r3.xyz = BoneTransformConstantBuffer[v3.y]._m01_m11_m21;
-  r2.y = dot(v1.xyz, r3.xyz);
-  r3.xyz = BoneTransformConstantBuffer[v3.y]._m02_m12_m22;
-  r2.z = dot(v1.xyz, r3.xyz);
-  r2.xyz = v4.yyy * r2.xyz;
-  r3.xyz = BoneTransformConstantBuffer[v3.x]._m00_m10_m20;
-  r3.x = dot(v1.xyz, r3.xyz);
-  r4.xyz = BoneTransformConstantBuffer[v3.x]._m01_m11_m21;
-  r3.y = dot(v1.xyz, r4.xyz);
-  r4.xyz = BoneTransformConstantBuffer[v3.x]._m02_m12_m22;
-  r3.z = dot(v1.xyz, r4.xyz);
-  r2.xyz = r3.xyz * v4.xxx + r2.xyz;
-  r3.xyz = BoneTransformConstantBuffer[v3.z]._m00_m10_m20;
-  r3.x = dot(v1.xyz, r3.xyz);
-  r4.xyz = BoneTransformConstantBuffer[v3.z]._m01_m11_m21;
-  r3.y = dot(v1.xyz, r4.xyz);
-  r4.xyz = BoneTransformConstantBuffer[v3.z]._m02_m12_m22;
-  r3.z = dot(v1.xyz, r4.xyz);
-  r2.xyz = r3.xyz * v4.zzz + r2.xyz;
-  r3.xyz = BoneTransformConstantBuffer[v3.w]._m00_m10_m20;
-  r3.x = dot(v1.xyz, r3.xyz);
-  r4.xyz = BoneTransformConstantBuffer[v3.w]._m01_m11_m21;
-  r3.y = dot(v1.xyz, r4.xyz);
-  r4.xyz = BoneTransformConstantBuffer[v3.w]._m02_m12_m22;
-  r3.z = dot(v1.xyz, r4.xyz);
-  r2.xyz = r3.xyz * v4.www + r2.xyz;
-  r1.w = dot(r2.xyz, r2.xyz);
-  r1.w = rsqrt(r1.w);
-  r2.xyz = r2.xyz * r1.www;
-  r1.x = dot(r2.xyz, r1.xyz);
-  o5.xyz = r2.xyz;
-  r1.x = max(0, r1.x);
-  r1.x = 1 + -r1.x;
-  r1.x = max(0, r1.x);
-  r1.x = log2(r1.x);
-  r1.y = max(1, PointLightColor.w);
-  r1.x = r1.y * r1.x;
-  r1.x = exp2(r1.x);
-  o2.xyz = PointLightColor.xyz * r1.xxx;
+  o1.xyz = OutlineColor.xyz * OutlineColorFactor.xyz;
+  o1.w = 1;
   r1.x = -scene.MiscParameters3.x + r0.y;
   o4.xyz = r0.xyz;
   r0.x = saturate(scene.MiscParameters3.y * r1.x);
-  r0.y = -scene.FogRangeParameters.x + -r0.w;
-  o4.w = -r0.w;
-  r0.y = saturate(scene.FogRangeParameters.z * r0.y);
-  r0.z = scene.MiscParameters3.z + r0.y;
-  r0.z = min(1, r0.z);
-  r0.x = r0.x * r0.z + r0.y;
+  r0.y = scene.MiscParameters3.z + r0.w;
+  r0.y = min(1, r0.y);
+  r0.x = r0.x * r0.y + r0.w;
   r0.x = min(1, r0.x);
   o2.w = scene.FogRangeParameters.w * r0.x;
-  o3.xy = v2.xy * GameMaterialTexcoord.zw + GameMaterialTexcoord.xy;
+  o2.xyz = float3(0,0,0);
+  o3.xy = v2.xy;
+  o4.w = 0;
   return;
 }

@@ -50,13 +50,14 @@ void main(uint2 pix : SV_DispatchThreadID)
   float2 prevPx = curPx;
   bool hasObjectMotion = false;
 
-  // ── Per-object motion (dynamic objects, from modified VS + G-buffer) ──
+  // ── Per-object motion (dynamic objects, from modified VS + 16-bit target) ──
+  // Stage 1: the patched char PS writes prevNDC (0..1, y-up) into a dedicated
+  // r16g16b16a16_float target's xy, with w=1 as the valid flag (cleared to 0).
   if (params1.z > 0.5f) {
     float4 mrt = g_srcMotion.Load(int3(pix, 0));
-    // o2.w != 0 marks a pixel with per-object prevNDC (y-up UV in zw)
-    if (abs(mrt.w) > 0.001f) {
-      prevPx.x = mrt.z * w;
-      prevPx.y = (1.0 - mrt.w) * h;  // flip y-up UV -> y-down screen px
+    if (mrt.w > 0.5f) {
+      prevPx.x = mrt.x * w;
+      prevPx.y = (1.0 - mrt.y) * h;  // flip y-up UV -> y-down screen px
       hasObjectMotion = true;
     }
   }

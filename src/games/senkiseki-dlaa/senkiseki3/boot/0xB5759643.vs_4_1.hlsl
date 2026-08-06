@@ -1,7 +1,6 @@
-// ---- Created with 3Dmigoto v1.4.1 on Wed Aug  5 17:51:14 2026
+// ---- Created with 3Dmigoto v1.4.1 on Thu Aug  6 04:13:13 2026
 
 #include "../../shared.h"
-
 
 cbuffer _Globals : register(b0)
 {
@@ -46,34 +45,32 @@ cbuffer _Globals : register(b0)
   bool PhyreContextSwitches : packoffset(c43);
   bool PhyreMaterialSwitches : packoffset(c43.y);
   float4x4 World : packoffset(c44);
-  float GlobalTexcoordFactor : packoffset(c48);
-  float PerMaterialMainLightClampFactor : packoffset(c48.y) = {1.5};
-  float3 LightDirForChar : packoffset(c49);
-  float GameMaterialID : packoffset(c49.w) = {0};
-  float4 GameMaterialDiffuse : packoffset(c50) = {1,1,1,1};
-  float4 GameMaterialEmission : packoffset(c51) = {0,0,0,0};
-  float GameMaterialMonotone : packoffset(c52) = {0};
-  float4 GameMaterialTexcoord : packoffset(c53) = {0,0,1,1};
-  float4 UVaMUvColor : packoffset(c54) = {1,1,1,1};
-  float4 UVaProjTexcoord : packoffset(c55) = {0,0,1,1};
-  float4 UVaMUvTexcoord : packoffset(c56) = {0,0,1,1};
-  float4 UVaMUv2Texcoord : packoffset(c57) = {0,0,1,1};
-  float4 UVaDuDvTexcoord : packoffset(c58) = {0,0,1,1};
-  float3 ShadowColorShift : packoffset(c59) = {0.100000001,0.0199999996,0.0199999996};
-  float Shininess : packoffset(c59.w) = {0.5};
-  float SpecularPower : packoffset(c60) = {50};
-  float3 SpecularColor : packoffset(c60.y) = {1,1,1};
-  float3 RimLitColor : packoffset(c61) = {1,1,1};
-  float RimLitIntensity : packoffset(c61.w) = {4};
-  float RimLitPower : packoffset(c62) = {2};
-  float RimLightClampFactor : packoffset(c62.y) = {2};
-  float ShadowReceiveOffset : packoffset(c62.z) = {0.600000024};
-  float BloomIntensity : packoffset(c62.w) = {0.699999988};
-  float4 GameEdgeParameters : packoffset(c63) = {1,1,1,0.00300000003};
-  float4 OutlineColorFactor : packoffset(c64) = {1,1,1,1};
-  float3 OutlineColor : packoffset(c65) = {0.699999988,0.5,0.300000012};
-  float4 PointLightParams : packoffset(c66) = {0,0,0,0};
-  float4 PointLightColor : packoffset(c67) = {0,0,0,0};
+  float4x4 WorldViewProjection : packoffset(c48);
+  float GlobalTexcoordFactor : packoffset(c52);
+  float3 LightDirForChar : packoffset(c52.y);
+  float GameMaterialID : packoffset(c53) = {0};
+  float4 GameMaterialDiffuse : packoffset(c54) = {1,1,1,1};
+  float4 GameMaterialEmission : packoffset(c55) = {0,0,0,0};
+  float GameMaterialMonotone : packoffset(c56) = {0};
+  float4 GameMaterialTexcoord : packoffset(c57) = {0,0,1,1};
+  float4 UVaMUvColor : packoffset(c58) = {1,1,1,1};
+  float4 UVaProjTexcoord : packoffset(c59) = {0,0,1,1};
+  float4 UVaMUvTexcoord : packoffset(c60) = {0,0,1,1};
+  float4 UVaMUv2Texcoord : packoffset(c61) = {0,0,1,1};
+  float4 UVaDuDvTexcoord : packoffset(c62) = {0,0,1,1};
+  float3 ShadowColorShift : packoffset(c63) = {0.100000001,0.0199999996,0.0199999996};
+  float Shininess : packoffset(c63.w) = {0.5};
+  float SpecularPower : packoffset(c64) = {50};
+  float3 RimLitColor : packoffset(c64.y) = {1,1,1};
+  float RimLitIntensity : packoffset(c65) = {4};
+  float RimLitPower : packoffset(c65.y) = {2};
+  float RimLightClampFactor : packoffset(c65.z) = {2};
+  float ShadowReceiveOffset : packoffset(c65.w) = {0.600000024};
+  float SphereMapIntensity : packoffset(c66) = {1};
+  float BloomIntensity : packoffset(c66.y) = {0.699999988};
+  float4 GameEdgeParameters : packoffset(c67) = {1,1,1,0.00300000003};
+  float4 PointLightParams : packoffset(c68) = {0,0,0,0};
+  float4 PointLightColor : packoffset(c69) = {0,0,0,0};
 }
 
 StructuredBuffer<float4x4> BoneTransformConstantBuffer : register(t0);
@@ -97,8 +94,7 @@ void main(
   out float4 o4 : TEXCOORD1,
   out float4 o5 : TEXCOORD4,
   out float4 o6 : TEXCOORD6,
-  out float4 o7 : TEXCOORD10,
-  out float4 o8 : TEXCOORD5)  // DLAA: prevClip
+  out float4 o7 : TEXCOORD10)
 {
   float4 r0,r1,r2,r3,r4,r5;
   uint4 bitmask, uiDest;
@@ -139,13 +135,8 @@ void main(
   r1.y = dot(r0.xyzw, scene.ViewProjection._m01_m11_m21_m31);
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
-  r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
-  // Jitter offsets come from the addon b13 injection (0 when disabled).
-  o0.x = r1.x + DLAA_JITTER_X * r1.w;
-  o0.y = r1.y + DLAA_JITTER_Y * r1.w;
-  o0.zw = r1.zw;
   // DLAA: per-object motion (prev clip-space position from prevViewProj x current pose).
+  // Injected prev VP comes from the addon b13 cbuffer (Senkiseki3 has no c74).
   if (DLAA_PER_OBJECT_MOTION > 0.5f) {
     float4x4 prevViewProjection = float4x4(
         shader_injection_data.prev_view_proj[0],  shader_injection_data.prev_view_proj[1],  shader_injection_data.prev_view_proj[2],  shader_injection_data.prev_view_proj[3],
@@ -158,10 +149,12 @@ void main(
     prevClip.y = dot(wp.xyzw, prevViewProjection._m01_m11_m21_m31);
     prevClip.z = dot(wp.xyzw, prevViewProjection._m02_m12_m22_m32);
     prevClip.w = dot(wp.xyzw, prevViewProjection._m03_m13_m23_m33);
-    o8 = prevClip;
+    o7 = prevClip;
   } else {
-    o8 = float4(0, 0, 0, 0);
+    o7 = float4(0, 0, 0, 0);
   }
+  r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
+  o0.xyzw = r1.xyzw;
   o7.xyzw = r1.xyzw;
   o1.xyzw = float4(1,1,1,1);
   r1.x = -scene.MiscParameters3.x + r0.y;

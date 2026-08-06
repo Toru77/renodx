@@ -99,7 +99,8 @@ void main(
   out float4 o4 : TEXCOORD1,
   out float4 o5 : TEXCOORD4,
   out float4 o6 : TEXCOORD6,
-  out float4 o7 : TEXCOORD10)
+  out float4 o7 : TEXCOORD10,
+  out float4 o8 : TEXCOORD5)  // DLAA: prevClip
 {
   float4 r0,r1,r2,r3,r4,r5;
   uint4 bitmask, uiDest;
@@ -146,6 +147,23 @@ void main(
   o0.x = r1.x + DLAA_JITTER_X * r1.w;
   o0.y = r1.y + DLAA_JITTER_Y * r1.w;
   o0.zw = r1.zw;
+  // DLAA: per-object motion (prev clip-space position from prevViewProj x current pose).
+  if (DLAA_PER_OBJECT_MOTION > 0.5f) {
+    float4x4 prevViewProjection = float4x4(
+        shader_injection_data.prev_view_proj[0],  shader_injection_data.prev_view_proj[1],  shader_injection_data.prev_view_proj[2],  shader_injection_data.prev_view_proj[3],
+        shader_injection_data.prev_view_proj[4],  shader_injection_data.prev_view_proj[5],  shader_injection_data.prev_view_proj[6],  shader_injection_data.prev_view_proj[7],
+        shader_injection_data.prev_view_proj[8],  shader_injection_data.prev_view_proj[9],  shader_injection_data.prev_view_proj[10], shader_injection_data.prev_view_proj[11],
+        shader_injection_data.prev_view_proj[12], shader_injection_data.prev_view_proj[13], shader_injection_data.prev_view_proj[14], shader_injection_data.prev_view_proj[15]);
+    float4 prevClip;
+    float4 wp = float4(r0.xyz, 1);
+    prevClip.x = dot(wp.xyzw, prevViewProjection._m00_m10_m20_m30);
+    prevClip.y = dot(wp.xyzw, prevViewProjection._m01_m11_m21_m31);
+    prevClip.z = dot(wp.xyzw, prevViewProjection._m02_m12_m22_m32);
+    prevClip.w = dot(wp.xyzw, prevViewProjection._m03_m13_m23_m33);
+    o8 = prevClip;
+  } else {
+    o8 = float4(0, 0, 0, 0);
+  }
   o7.xyzw = r1.xyzw;
   o1.xyzw = float4(1,1,1,1);
   r1.x = -scene.MiscParameters3.x + r0.y;

@@ -74,6 +74,16 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view last_dsv = {};
   bool effect_mask_cleared_this_frame = false;
 
+  // Per-object motion target (r16g16b16a16_float, 16-bit per channel): the
+  // patched char PS writes prevNDC + valid-flag to an APPENDED RTV (o3), so we
+  // never touch the game's 8-bit MRT2 (which is an encoded-depth target — the
+  // old 0x0E8BC215 overwrote it and corrupted whatever reads it). Appended only
+  // during character draws whose VS outputs prevClip (TEXCOORD5).
+  reshade::api::resource motion_texture = {};
+  reshade::api::resource_view motion_srv = {};
+  reshade::api::resource_view motion_rtv = {};
+  bool motion_cleared_this_frame = false;
+
   reshade::api::buffer_range captured_scene_cbv = {};  // _Globals cbuffer at b0
   bool captured_scene_cbv_valid = false;
   reshade::api::resource_view captured_depth_srv = {};
@@ -155,6 +165,7 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   dv(d->velocity_srv); dv(d->velocity_uav); dr(d->velocity_texture);
   dp(d->velocity_pipeline); dl(d->velocity_layout); FreeTables(dev, d->velocity_tables);
   dv(d->effect_mask_srv); dv(d->effect_mask_rtv); dr(d->effect_mask_texture);
+  dv(d->motion_srv); dv(d->motion_rtv); dr(d->motion_texture);
   d->last_rtv_count = 0; d->last_dsv = {};
   d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
   dv(d->captured_depth_srv); dv(d->captured_color_srv);
@@ -440,6 +451,84 @@ static void MaybeAppendEffectMask(reshade::api::command_list* cmd_list, DeviceDa
   cmd_list->bind_render_targets_and_depth_stencil(n, rts, d->last_dsv);
 }
 
+// ── Per-object motion (Stage 1): dedicated 16-bit target ──
+// VSs whose replacement outputs prevClip in TEXCOORD5 (o7/o8). All the skinned
+// character-part VSs are patched to emit prevClip; the paired PS must be
+// patched to write o3/SV_TARGET3 (otherwise that part falls back to camera
+// motion). Full list = the character's mesh parts (hair, skin, clothing, eyes,
+// outline, face).
+static const std::array<uint32_t, 14> PER_OBJECT_MOTION_VS_HASHES = {
+    0x0D5DABC6u,  // main skinned character (face)
+    0xB2F338C8u,  // skinned
+    0xB1C24E2Au,  // skinned
+    0xBCB30859u,  // skinned
+    0x5C1A50E5u,  // hair
+    0xB5759643u,  // skinned
+    0x4A030C25u,  // clothing
+    0x3641D444u,  // eyeball
+    0xF426BC1Cu,  // skinned
+    0xC8F5D77Bu,  // skin
+    0x38656EB3u,  // skinned
+    0xF8C9B92Du,  // clothing
+    0x5E5AE3FBu,  // character outline
+    0xB662509Au,  // clothing
+};
+
+static bool IsPerObjectMotionVs(uint32_t hash) {
+  for (uint32_t h : PER_OBJECT_MOTION_VS_HASHES) if (h == hash) return true;
+  return false;
+}
+
+// Create the full-res per-object motion target (r16g16b16a16_float, RT + SRV).
+static bool EnsureMotionTarget(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
+  if (d->motion_texture.handle) return true;
+  if (!dev || !d) return false;
+  reshade::api::resource_desc rd = {};
+  rd.type = reshade::api::resource_type::texture_2d;
+  rd.texture = {w, h, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
+  rd.heap = reshade::api::memory_heap::gpu_only;
+  rd.usage = reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource;
+  if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::render_target, &d->motion_texture)) return false;
+  reshade::api::resource_view_desc rv(reshade::api::resource_view_type::texture_2d, reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
+  dev->create_resource_view(d->motion_texture, reshade::api::resource_usage::render_target, rv, &d->motion_rtv);
+  dev->create_resource_view(d->motion_texture, reshade::api::resource_usage::shader_resource, rv, &d->motion_srv);
+  return d->motion_rtv.handle && d->motion_srv.handle;
+}
+
+// Append the per-object motion RTV to character G-buffer draws (the patched PS
+// writes o3/SV_TARGET3 = prevNDC + valid flag). The RTV goes at the END (index
+// n), so the game's RT0..2 (color, normal, encoded-depth) are untouched — no
+// corruption. Cleared once per frame to a zero-flag sentinel.
+static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (shader_injection.dlaa_per_object_motion < 0.5f) return;
+  if (!cmd_list || !d || !d->motion_rtv.handle || d->last_rtv_count == 0u) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  if (!IsPerObjectMotionVs(vh)) return;
+  auto* dev = cmd_list->get_device();
+  if (!dev || !d->last_rtvs[0].handle) return;
+  // D3D11 requires all bound RTs to share identical dimensions — only append
+  // the target to full-res passes.
+  reshade::api::resource_desc mr = dev->get_resource_desc(d->motion_texture);
+  reshade::api::resource_desc rd = dev->get_resource_desc(dev->get_resource_from_view(d->last_rtvs[0]));
+  if (rd.type != reshade::api::resource_type::texture_2d) return;
+  if (rd.texture.width != mr.texture.width || rd.texture.height != mr.texture.height) return;
+  // Clear once per frame (flag=0 invalid; the patched PS writes flag=1).
+  if (!d->motion_cleared_this_frame) {
+    const float clear[4] = {0.f, 0.f, 0.f, 0.f};
+    cmd_list->clear_render_target_view(d->motion_rtv, clear);
+    d->motion_cleared_this_frame = true;
+  }
+  reshade::api::resource_view rts[9];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < d->last_rtv_count && n < 8u; ++i)
+    if (d->last_rtvs[i].handle) rts[n++] = d->last_rtvs[i];
+  if (n == 0u || n >= 8u) return;
+  rts[n] = d->motion_rtv;
+  ++n;
+  cmd_list->bind_render_targets_and_depth_stencil(n, rts, d->last_dsv);
+}
+
 // ── Diagnostics: log the first ~20 effect draws (VS/PS hashes + exclusion flag).
 // Tells us whether 0xC8FE8FC4-type draws are being masked (PS in EFFECT_PS_HASHES)
 // and whether the exclude toggle is 1 at draw time (VS gate should fire).
@@ -588,6 +677,7 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
     MaybeWriteGlobalsVp(cmd_list, d);
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
+    MaybeAppendMotionRtv(cmd_list, d);
   }
   return false;
 }
@@ -600,6 +690,7 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
     MaybeWriteGlobalsVp(cmd_list, d);
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
+    MaybeAppendMotionRtv(cmd_list, d);
   }
   return false;
 }
@@ -1306,6 +1397,8 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
 
   // Effect mask (r16g16_float) for the DLAA opt-out of particles/effects.
   EnsureEffectMask(dev, d, w, h);
+  // Per-object motion target (16-bit per channel) for character MVs.
+  EnsureMotionTarget(dev, d, w, h);
 
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
@@ -1339,11 +1432,16 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       // Pass: Velocity compute
       cmd_list->bind_pipeline(AC, d->velocity_pipeline);
 
+      // Per-object motion source: our dedicated 16-bit target (Stage 1) when
+      // available, else the legacy game MRT2 capture (8-bit, noisy).
+      reshade::api::resource_view motion_src = d->motion_srv;
+      if (shader_injection.dlaa_per_object_motion < 0.5f || !motion_src.handle)
+        motion_src = d->captured_motion_srv;
       reshade::api::descriptor_table_update u[6] = {
         { d->velocity_tables[0], 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_sampler },
         { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv },
         { d->velocity_tables[2], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_depth_srv },
-        { d->velocity_tables[3], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_motion_srv },
+        { d->velocity_tables[3], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &motion_src },
         { d->velocity_tables[4], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->velocity_uav },
         { d->velocity_tables[5], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->effect_mask_srv },
       };
@@ -1739,6 +1837,11 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xC8F5D77B),  // skin
     CustomShaderEntry(0xF8C9B92D),  // clothing
     CustomShaderEntry(0xB662509A),  // clothing
+    // Additional skinned char-part VSs (per-object motion prevClip).
+    CustomShaderEntry(0xBCB30859),
+    CustomShaderEntry(0xB5759643),
+    CustomShaderEntry(0xF426BC1C),
+    CustomShaderEntry(0x38656EB3),
     // Foliage & world VSs discovered in the foliage scene (same geometry jitter).
     CustomShaderEntry(0x29513853),  // foliage (main)
     CustomShaderEntry(0xED3D1A43),  // foliage
@@ -1764,9 +1867,20 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x77355EED),  // forest impostor billboard (sky)
     CustomShaderEntry(0xC8FE8FC4),  // transparent texture
     CustomShaderEntry(0x7D3553A7),  // particle
-    // Character G-buffer PS: encodes per-object prevNDC into MRT2 (o2.zw) so
-    // the velocity compute can build MVs for skinned characters.
-    CustomShaderEntry(0x0E8BC215),
+    // Character G-buffer PS (paired with the main skinned char VS 0x0D5DABC6):
+    // writes per-object prevNDC into o3 (SV_TARGET3) of the appended 16-bit
+    // motion RTV — o0/o1/o2 (game MRTs) are untouched. The old 0x0E8BC215
+    // overwrote MRT2 (o2 = encoded depth) which corrupted other objects.
+    CustomShaderEntry(0xFEA2B509),
+    // Other character-part G-buffer PSs — same o3 per-object-motion patch.
+    CustomShaderEntry(0x159A34A3),  // pairs with 0xB662509A
+    CustomShaderEntry(0x1682CB9B),  // pairs with 0xF8C9B92D
+    CustomShaderEntry(0x41C27C38),  // pairs with 0xC8F5D77B
+    CustomShaderEntry(0xBE1FC4AC),  // pairs with 0x3641D444
+    CustomShaderEntry(0x59F0F50E),  // pairs with 0x4A030C25
+    CustomShaderEntry(0xA4DC2F84),  // pairs with 0x5C1A50E5
+    CustomShaderEntry(0x7542CBC4),  // pairs with 0xB1C24E2A
+    CustomShaderEntry(0x0E03514A),  // pairs with 0xB2F338C8
     // Effect PS replacements: write SV_TARGET1 = 1.0 into the appended
     // effect-mask RT (Exclude Effects toggle) so the velocity compute can
     // opt these pixels out of DLAA (invalid-MV -> current-frame fallback).
@@ -1824,6 +1938,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           d->scene_cbv_copy_issued = false;
           // Effect mask is cleared at the first effect pass each frame.
           d->effect_mask_cleared_this_frame = false;
+          // Per-object motion target cleared at the first char draw each frame.
+          d->motion_cleared_this_frame = false;
           // Jitter is computed once per frame at PRESENT time, before the next frame's
           // composite (0xE8C7EBA2) draws. Both the composite UV shift and the NGX jitter
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.
