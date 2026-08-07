@@ -157,6 +157,27 @@ inline int NextFreeTexcoord(const std::vector<SignatureEntry>& sig) {
   return MaxTexcoordIndex(sig) + 1;
 }
 
+// True for system values the RASTERIZER generates in the PS (not written by
+// the VS), so they occupy an input register with NO matching VS output. The
+// D3D11 stage-to-stage mapping is direct (oN -> vN), so an appended input must
+// land on the register the paired VS writes, and rasterizer-generated inputs
+// must not count toward that register. (D3D10_SB_NAME_*: PRIMITIVE_ID=7,
+// IS_FRONT_FACE=9, SAMPLE_INDEX=10, COVERAGE=18, INNER_COVERAGE=19,
+// STENCIL_REF=20.)
+inline bool IsRasterizerGeneratedSysval(uint32_t svt) {
+  switch (svt) {
+    case 7u:
+    case 9u:
+    case 10u:
+    case 18u:
+    case 19u:
+    case 20u:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // ── RDEF resource bindings ──
 struct ResourceBinding {
   std::string name;
@@ -228,6 +249,11 @@ struct Instruction {
   uint32_t opcode = 0u;  // D3D10_SB_OPCODE_TYPE
 };
 
+// D3D10_SB_OPCODE_CUSTOMDATA = 53 (dcl_immediateConstantBuffer / comments /
+// debug info). Declared here (before the OpcodeType enum) because
+// IterateInstructions runs before the enum is in scope.
+constexpr uint32_t kOpCustomData = 53u;
+
 inline bool IterateInstructions(const uint8_t* chunk_data, uint32_t chunk_size,
                                 std::vector<Instruction>& out) {
   ShexHeader h;
@@ -239,7 +265,18 @@ inline bool IterateInstructions(const uint8_t* chunk_data, uint32_t chunk_size,
     uint32_t token;
     std::memcpy(&token, chunk_data + pos, 4);
     const uint32_t opcode = token & 0x7FFu;
-    const uint32_t len = token >> 24u;
+    uint32_t len = token >> 24u;
+    if (opcode == kOpCustomData) {
+      // Custom-data blocks (dcl_immediateConstantBuffer, comments, debug info):
+      // the opcode token's length field is ZERO (bits [31:11] hold the custom-
+      // data CLASS instead), and DWORD 1 holds the total block length in
+      // DWORDs INCLUDING DWORD 0 and DWORD 1 (min 2). Without this, the old
+      // `len = token >> 24` read 0 and bailed, so ScanShex never found the ret
+      // and any G-buffer PS containing a dcl_immediateConstantBuffer was
+      // rejected by the patch gate.
+      if (pos + 8u > end) break;  // need at least DWORD 0 + DWORD 1
+      std::memcpy(&len, chunk_data + pos + 4u, 4);
+    }
     if (len == 0u) break;  // malformed
     Instruction ins;
     ins.offset = pos;
@@ -770,10 +807,14 @@ inline void EmitDclTemps(std::vector<uint32_t>& out, uint32_t count) {
 // Append a new signature entry + its semantic name to a signature chunk in the
 // blob, fixing up the chunk size, ALL existing entries' name offsets, the
 // following chunk offsets, and the file size, so the patched blob round-trips.
+// Append a new signature entry. `insert_at` optionally places the new entry at
+// a specific index (default = append at the end), keeping the entry array
+// sorted by register index when relocating an existing entry (SV_SampleIndex).
 inline bool AppendSignatureEntry(std::vector<std::byte>& data, const ChunkInfo& chunk,
                                  std::string_view semantic, uint32_t semantic_index,
                                  uint32_t reg, uint32_t mask, uint32_t rw_mask,
-                                 uint32_t component_type /* D3D10_SB_REGISTER_COMPONENT_* */) {
+                                 uint32_t component_type /* D3D10_SB_REGISTER_COMPONENT_* */,
+                                 uint32_t insert_at = UINT32_MAX) {
   constexpr uint32_t kEntriesOffset = 8u;  // skip count + unknown
   // Locate chunk data start.
   const uint32_t data_off = chunk.offset + kChunkHeaderSize;
@@ -783,6 +824,9 @@ inline bool AppendSignatureEntry(std::vector<std::byte>& data, const ChunkInfo& 
   const uint32_t count = *reinterpret_cast<uint32_t*>(chunk_data);
   const uint32_t entries_end = kEntriesOffset + count * kSignatureEntrySize;  // rel. to data start
   if (entries_end > chunk.size) return false;
+  const uint32_t at = (insert_at == UINT32_MAX) ? count : insert_at;
+  if (at > count) return false;
+  const uint32_t insert_off = kEntriesOffset + at * kSignatureEntrySize;
 
   // CRITICAL: DXBC chunks must start on a 4-byte boundary. The appended entry
   // (24 bytes) + semantic name string (e.g. "TEXCOORD\0" = 9 bytes) = 33 bytes
@@ -796,11 +840,11 @@ inline bool AppendSignatureEntry(std::vector<std::byte>& data, const ChunkInfo& 
   const uint32_t delta = (raw_delta + 3u) & ~3u;
   const uint32_t pad = delta - raw_delta;
 
-  // Insert the new 24-byte entry right after the last existing entry. This
-  // shifts the string table by kSignatureEntrySize, so existing entries' name
-  // offsets must be bumped as well.
-  data.insert(data.begin() + data_off + entries_end, kSignatureEntrySize, std::byte{0});
-  uint8_t* dst = reinterpret_cast<uint8_t*>(data.data()) + data_off + entries_end;
+  // Insert the new 24-byte entry at `at` (after the existing entry at index
+  // at-1). This shifts the string table by kSignatureEntrySize, so existing
+  // entries' name offsets must be bumped as well.
+  data.insert(data.begin() + data_off + insert_off, kSignatureEntrySize, std::byte{0});
+  uint8_t* dst = reinterpret_cast<uint8_t*>(data.data()) + data_off + insert_off;
   const uint32_t str_off = chunk.size + kSignatureEntrySize;  // new name offset (rel. to data start)
   std::memcpy(dst + 0, &str_off, 4);
   std::memcpy(dst + 4, &semantic_index, 4);
@@ -814,9 +858,12 @@ inline bool AppendSignatureEntry(std::vector<std::byte>& data, const ChunkInfo& 
   dst[23] = 0;
 
   // Fix existing entries' name offsets (string table moved by +kSignatureEntrySize).
+  // Original entry at index i now sits at position i (if i < at) or i+1 (if
+  // i >= at, pushed down by the newly inserted entry).
   chunk_data = reinterpret_cast<uint8_t*>(data.data()) + data_off;
   for (uint32_t i = 0; i < count; ++i) {
-    uint8_t* e = chunk_data + kEntriesOffset + i * kSignatureEntrySize;
+    const uint32_t pos = (i >= at) ? (i + 1u) : i;
+    uint8_t* e = chunk_data + kEntriesOffset + pos * kSignatureEntrySize;
     uint32_t off;
     std::memcpy(&off, e, 4);
     off += kSignatureEntrySize;
@@ -854,6 +901,34 @@ inline bool AppendSignatureEntry(std::vector<std::byte>& data, const ChunkInfo& 
   for (uint32_t i = 0; i < chunk_count; ++i)
     if (offsets[i] > chunk.offset) offsets[i] += delta;
   return true;
+}
+
+// Rewrite the register_index field of an existing signature entry in place.
+// Used to relocate SV_SampleIndex to a higher input register. Finds the entry
+// by semantic name + index; returns false if not found.
+inline bool RewriteSignatureEntryRegister(std::vector<std::byte>& data, const ChunkInfo& chunk,
+                                          std::string_view semantic, uint32_t semantic_index,
+                                          uint32_t new_reg) {
+  const uint32_t data_off = chunk.offset + kChunkHeaderSize;
+  if (data_off + chunk.size > data.size()) return false;
+  if (chunk.size < 8u) return false;
+  uint8_t* chunk_data = reinterpret_cast<uint8_t*>(data.data()) + data_off;
+  const uint32_t count = *reinterpret_cast<uint32_t*>(chunk_data);
+  if (8u + count * kSignatureEntrySize > chunk.size) return false;
+  for (uint32_t i = 0u; i < count; ++i) {
+    uint8_t* e = chunk_data + 8u + i * kSignatureEntrySize;
+    uint32_t name_off, sem_idx;
+    std::memcpy(&name_off, e, 4);
+    std::memcpy(&sem_idx, e + 4, 4);
+    if (sem_idx == semantic_index) {
+      const char* n = reinterpret_cast<const char*>(chunk_data + name_off);
+      if (semantic == n) {
+        std::memcpy(e + 16, &new_reg, 4);  // register_index
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ── DXBC MD5 hash (dxbc-spirv algorithm, from the Luma Framework, MIT) ──
@@ -1088,6 +1163,65 @@ inline bool FindCbufferVariable(const std::vector<RdefCbuffer>& cbs, std::string
   return false;
 }
 
+// Forward decl (defined below with the SHEX scanner helpers).
+inline uint32_t InstructionLength(const uint32_t* dwords, uint32_t dword_count, uint32_t i);
+
+// Rewrite every INPUT operand whose first immediate32 index equals old_reg to
+// new_reg, in-place over a SHEX/SHDR dword stream. Used to relocate
+// SV_SampleIndex to a higher input register so the appended TEXCOORD5 lands on
+// the register the paired VS writes prevClip to. Skips CUSTOMDATA blocks
+// (dcl_immediateConstantBuffer = raw constant data, not operands).
+inline void RewriteInputRegister(std::vector<uint32_t>& tokens, uint32_t old_reg,
+                                 uint32_t new_reg) {
+  const uint32_t n = (uint32_t)tokens.size();
+  uint32_t i = 0u;
+  while (i < n) {
+    const uint32_t op = tokens[i] & 0x7FFu;
+    const uint32_t len = InstructionLength(tokens.data(), n, i);
+    if (len == 0u) break;
+    if (op != kOpCustomData) {
+      uint32_t idx = i + 1u;
+      if ((tokens[i] & 0xFFu) == 0xFFu) ++idx;  // extended opcode header
+      const uint32_t end = i + len;
+      while (idx < end) {
+        const uint32_t t = tokens[idx];
+        const uint32_t type = (t >> kOperandTypeShift) & 0xFFu;
+        const uint32_t index_dim = (t >> kOperandIndexDimShift) & 0x3u;
+        const uint32_t rep0 = (t >> kOperandIndexRepShift) & 0x7u;
+        // Position of the first immediate32 index value (register number).
+        uint32_t first_val_pos = 0u;
+        ++idx;  // consume operand token
+        if ((t & 0x80000000u) != 0u) ++idx;  // extended modifier dword
+        for (uint32_t d = 0u; d < index_dim; ++d) {
+          const uint32_t rep = (t >> (kOperandIndexRepShift + 3u * d)) & 0x7u;
+          if (rep == 0u) {  // immediate32
+            if (d == 0u) first_val_pos = idx;
+            ++idx;
+          } else if (rep == 1u) {  // immediate64
+            idx += 2u;
+          } else if (rep == 2u) {  // relative: nested operand token + its index
+            const uint32_t rt = tokens[idx];
+            ++idx;
+            if ((rt & 0x80000000u) != 0u) ++idx;
+            const uint32_t rdim = (rt >> kOperandIndexDimShift) & 0x3u;
+            const uint32_t rrep0 = (rt >> kOperandIndexRepShift) & 0x7u;
+            if (rdim >= 1u && rrep0 == 0u) ++idx;
+            else if (rdim >= 1u && rrep0 == 2u) idx += 2u;
+          } else {  // rep 3/4: immediate value + relative operand token + index
+            ++idx;
+            if ((tokens[idx] & 0x80000000u) != 0u) ++idx;
+            ++idx;
+            ++idx;
+          }
+        }
+        if (type == OPERAND_INPUT && first_val_pos != 0u && tokens[first_val_pos] == old_reg)
+          tokens[first_val_pos] = new_reg;
+      }
+    }
+    i += len;
+  }
+}
+
 // ── SHEX scanner ──
 struct ShexScan {
   bool has_temps = false;
@@ -1100,11 +1234,36 @@ struct ShexScan {
   std::vector<std::pair<uint32_t, uint32_t>> cb_slot_sizes;  // (slot, register count) pairs
   std::vector<uint32_t> resource_slots;  // t-slots from ANY dcl_resource* decl (textures + structured + raw + typed)
   std::vector<uint32_t> structured_slots;  // t-slots declared with dcl_resource_structured (0xA2) only
+  // (cbuffer slot, element) pairs actually READ by instructions in the body
+  // (constant-buffer operands). Used to gate the outline block on REAL
+  // GameEdgeParameters usage — most char VSs DECLARE it in RDEF but never read
+  // it, and injecting the offset there adds a spurious world-space MV bias.
+  std::vector<std::pair<uint32_t, uint32_t>> cb_reads;
 };
 
 inline bool IsDeclOpcode(uint32_t op) {
   // D3D10/10.1/11 declaration opcodes (vs_4_1 subset: DCL_RESOURCE..DCL_GLOBAL_FLAGS + DCL_RESOURCE_STRUCTURED).
-  return (op >= 88u && op <= 106u) || op == 162u;
+  // CUSTOMDATA (53) = dcl_immediateConstantBuffer / comments: a declaration-
+  // style block that must be treated as part of the header so first_non_decl
+  // lands after it (its length lives in DWORD 1, see IterateInstructions).
+  return op == kOpCustomData || (op >= 88u && op <= 106u) || op == 162u;
+}
+
+// Instruction length in DWORDs given the opcode token + following stream.
+// For CUSTOMDATA blocks the length field in the opcode token is 0 and the real
+// length (INCLUDING the opcode token) lives in the NEXT dword; everything else
+// uses the standard bits [30:24] length field. Returns 0 on malformed input.
+inline uint32_t InstructionLength(const uint32_t* dwords, uint32_t dword_count,
+                                  uint32_t i) {
+  if (i >= dword_count) return 0u;
+  const uint32_t op = dwords[i] & 0x7FFu;
+  uint32_t len = dwords[i] >> 24u;
+  if (op == kOpCustomData) {
+    if (i + 1u >= dword_count) return 0u;
+    len = dwords[i + 1u];
+  }
+  if (len == 0u) return 0u;
+  return len;
 }
 
 // Walk one operand: consume its token + index value dwords. Returns operand
@@ -1114,7 +1273,8 @@ inline bool IsDeclOpcode(uint32_t op) {
 // index values — otherwise that modifier (e.g. 0x00000041 = NEG) is misread as
 // an index value -> phantom temp 65 -> the injected block gets placed at
 // r66-r77 and dcl_temps balloons to 78 on shaders that only use r0-r5.
-inline uint32_t WalkOperand(const uint32_t* dwords, uint32_t& idx, uint32_t* out_first) {
+inline uint32_t WalkOperand(const uint32_t* dwords, uint32_t& idx, uint32_t* out_first,
+                            uint32_t* out_second = nullptr) {
   const uint32_t t = dwords[idx];
   ++idx;  // the operand token itself
   if ((t & 0x80000000u) != 0u) ++idx;  // extended operand modifier dword
@@ -1124,6 +1284,7 @@ inline uint32_t WalkOperand(const uint32_t* dwords, uint32_t& idx, uint32_t* out
     const uint32_t rep = (t >> (kOperandIndexRepShift + 3u * d)) & 0x7u;
     if (rep == 0u) {  // immediate32: the CURRENT dword is the value
       if (d == 0u && out_first != nullptr) *out_first = dwords[idx];
+      if (d == 1u && out_second != nullptr) *out_second = dwords[idx];
       ++idx;
     } else if (rep == 1u) {  // immediate64: 2 value dwords
       idx += 2u;
@@ -1196,12 +1357,24 @@ inline bool ScanShex(const uint8_t* chunk_data, uint32_t chunk_size, ShexScan& o
     // on a shader that only uses r0-r5) and dcl_temps (5->78) on every patched
     // VS. Extended opcodes (first dword opcode field = 0xFF) use a 2-dword
     // header, so operands start at start+2 for those.
-    uint32_t idx = start + 1u;
-    if ((dwords[start] & 0xFFu) == 0xFFu) ++idx;  // extended opcode: 2-dword header
-    while (idx < start + ins.length) {
-      uint32_t first = 0u;
-      const uint32_t otype = WalkOperand(dwords, idx, &first);
-      if (otype == OPERAND_TEMP && first > out.max_temp) out.max_temp = first;
+    //
+    // CUSTOMDATA blocks (dcl_immediateConstantBuffer / comments) contain raw
+    // 4-float constant tuples, NOT operands — walking them as operands would
+    // hallucinate phantom temps from the constant bit patterns. Skip them.
+    if (op != kOpCustomData) {
+      uint32_t idx = start + 1u;
+      if ((dwords[start] & 0xFFu) == 0xFFu) ++idx;  // extended opcode: 2-dword header
+      while (idx < start + ins.length) {
+        uint32_t first = 0u, second = 0u;
+        const uint32_t otype = WalkOperand(dwords, idx, &first, &second);
+        if (otype == OPERAND_TEMP && first > out.max_temp) out.max_temp = first;
+        // For a constant-buffer operand (type 8), index0 = buffer slot,
+        // index1 = element (confirmed against 0x0D5DABC6: every CB operand is
+        // (0, element)). Store (slot, element) so the outline gate can look up
+        // (globals_slot, edge_elem).
+        if (otype == OPERAND_CONSTANT_BUFFER)
+          out.cb_reads.emplace_back(first, second);
+      }
     }
     pos = start + ins.length;
     (void)pos;
@@ -1397,6 +1570,19 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   } else if (outline) {
     outline = false;  // couldn't find the _Globals size — can't confirm safety
   }
+  // Only replicate the outline offset when the shader body ACTUALLY reads
+  // cb0[GameEdgeParameters]. Most char VSs DECLARE GameEdgeParameters in RDEF
+  // but never read it (the outline is a separate pass), and injecting the
+  // offset into prevClip there adds a fixed world-space MV bias: sub-pixel far
+  // away but MANY pixels up close -> near-character detail loss + jitter (user
+  // confirmed DLAAPhaseBOutline=0 removes it). Gating on real usage is generic
+  // and keeps the offset for genuinely-outlined shaders only.
+  if (outline) {
+    const bool edge_read =
+        std::find(scan.cb_reads.begin(), scan.cb_reads.end(),
+                  std::make_pair(globals_slot, edge_elem)) != scan.cb_reads.end();
+    if (!edge_read) outline = false;
+  }
   // Minimal / no-output / constant modes: never emit the outline block.
   if (minimal || no_output) outline = false;
 
@@ -1531,14 +1717,17 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   bool patched_temps = false;
   if (scan.has_temps) {
     // Find the dcl_temps instruction inside the copied stream (it's a decl).
+    // Walk with InstructionLength so CUSTOMDATA blocks (dcl_immediateConstant
+    // Buffer) can't make the loop stall on len=0.
     for (uint32_t i = 0; i < first_non_decl_dw;) {
       const uint32_t op = new_tokens[i] & 0x7FFu;
-      const uint32_t len = new_tokens[i] >> 24u;
+      const uint32_t len = InstructionLength(new_tokens.data(), old_token_dwords, i);
       if (op == OP_DCL_TEMPS && len >= 2u) {
         new_tokens[i + 1u] = new_dcl_temps;
         patched_temps = true;
         break;
       }
+      if (len == 0u) break;  // malformed; bail to the insert fallback
       i += len;
     }
   }
@@ -1682,7 +1871,8 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
 // RTV is only bound on char draws (MaybeAppendMotionRtv), so o3 is discarded
 // whenever per-object motion is off. Mirrors the VS patch's chunk/STAT/hash
 // fixups. No per-hash lists — this replaces the 22 hand-patched boot PSs.
-inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* out_new_hash) {
+inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* out_new_hash,
+                                      uint32_t vs_texcoord_index = 0u) {
   DXBCHeader header;
   std::vector<ChunkInfo> chunks;
   if (!ParseDXBC(data, header, chunks)) return false;
@@ -1695,31 +1885,84 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   std::vector<SignatureEntry> is, os;
   if (!ParseSignature(data, *isgn, is) || !ParseSignature(data, *osgn, os)) return false;
 
-  // Scope gate: G-buffer PS with EXACTLY outputs at registers 0/1/2 (3
-  // SV_TARGETs). Skip if SV_TARGET3 already exists (the appended motion RTV
-  // lives at index 3) or if the PS already reads TEXCOORD5 (would collide with
-  // our prevClip input). Requiring max_out == 2 keeps the appended output at
-  // register 3 with semantic index 3 (the RTV index MaybeAppendMotionRtv uses).
+  // Scope gate: G-buffer PS with 3 OR 4 SV_TARGETs (3-RT: registers 0..2, or
+  // 4-RT: registers 0..3 — e.g. the iris PS writes a 4th game target). Skip if
+  // the append slot (max_out+1) already has an SV_TARGET (would collide with
+  // the appended motion output) or if the PS already reads TEXCOORD5 (would
+  // collide with the prevClip input). Requiring max_out in {2,3} keeps the
+  // appended output at register max_out+1 with semantic index max_out+1 — the
+  // RTV index MaybeAppendMotionRtv binds (it appends the motion RTV AFTER the
+  // game's bound RTs, so a 4-RT pass gets motion at index 4).
   uint32_t max_out = 0;
   uint32_t sv_target_count = 0;
   for (const auto& e : os) {
-    if (e.name == "SV_TARGET") {
-      ++sv_target_count;
-      if (e.semantic_index == 3u) return false;  // SV_TARGET3 already taken
-    }
+    if (e.name == "SV_TARGET") ++sv_target_count;
     if (e.register_index > max_out) max_out = e.register_index;
   }
-  if (max_out != 2u || sv_target_count < 3u) return false;  // not a 3-RT G-buffer PS
-  bool has_tex5 = false;
-  uint32_t max_in = 0;
-  for (const auto& e : is) {
-    if (e.name == "TEXCOORD" && e.semantic_index == 5u) has_tex5 = true;
-    if (e.register_index > max_in) max_in = e.register_index;
+  if ((max_out != 2u && max_out != 3u) || sv_target_count < 3u) return false;
+  for (const auto& e : os) {
+    if (e.name == "SV_TARGET" && e.semantic_index == max_out + 1u) return false;
   }
-  if (has_tex5) return false;
+  // Choose the prevClip TEXCOORD index the same way Phase B does for the VS
+  // (prefer 5, else the first free index >= 5): the paired VS writes prevClip
+  // to that semantic, so the PS input must use the SAME index. A hardcoded 5
+  // would collide with PSs that already read TEXCOORD5 (e.g. the iris PS
+  // 0x6008D62C reads TEXCOORD5@v7) and silently break the VS->PS linkage.
+  std::array<bool, 32> used_tex = {};
+  uint32_t max_in = 0;        // highest input register INCLUDING rasterizer SVs
+  uint32_t max_regular_in = 0;  // highest input register linked to a VS output
+  for (const auto& e : is) {
+    if (e.name == "TEXCOORD" && e.semantic_index < 32u)
+      used_tex[e.semantic_index] = true;
+    if (e.register_index > max_in) max_in = e.register_index;
+    // Rasterizer-generated SVs (SV_SampleIndex, SV_PrimitiveID, ...) are NOT
+    // written by the VS, so they occupy registers with no matching VS output.
+    // D3D11 maps VS outputs to PS inputs DIRECTLY (oN -> vN), so the appended
+    // TEXCOORD input must land on max_regular_in + 1 = the register the paired
+    // VS writes prevClip to — NOT max_in + 1, which would be one higher
+    // whenever a rasterizer SV sits at the top (SV_SampleIndex on the char
+    // G-buffer PSs).
+    if (!IsRasterizerGeneratedSysval(e.system_value_type) &&
+        e.register_index > max_regular_in)
+      max_regular_in = e.register_index;
+  }
+  uint32_t tex_idx = 5u;
+  // The PS prevClip input MUST use the SAME TEXCOORD index the paired patched
+  // VS writes it to (D3D11 links VS outputs to PS inputs by semantic name +
+  // index). Phase B picks the first free index >= 5 in the VS OSGN, which can
+  // DIFFER from the PS's first free index whenever the game's VS outputs a
+  // TEXCOORD the PS doesn't consume (e.g. the eye VS 0x215C68A3 outputs
+  // TEXCOORD5, so Phase B uses TEXCOORD6, but the PS 0x0E03514A has no
+  // TEXCOORD5 and would independently pick TEXCOORD5 -> it reads the game's
+  // own TEXCOORD5 as prevClip -> garbage MVs -> ghosting). OnCreatePipeline
+  // passes the paired VS's chosen index here.
+  if (vs_texcoord_index != 0u && vs_texcoord_index < 32u && !used_tex[vs_texcoord_index]) {
+    tex_idx = vs_texcoord_index;
+  } else if (used_tex[5u]) {
+    tex_idx = 32u;
+    for (uint32_t i = 5u; i < 32u; ++i)
+      if (!used_tex[i]) { tex_idx = i; break; }
+    if (tex_idx == 32u) return false;  // no free TEXCOORD slot
+  }
 
-  const uint32_t new_in_reg = max_in + 1u;   // free input register (vN)
-  const uint32_t new_out_reg = max_out + 1u; // = 3 for G-buffer PSs
+  const uint32_t new_in_reg = max_regular_in + 1u;  // matches VS prevClip output (oN)
+  const uint32_t new_out_reg = max_out + 1u;        // = 3 for 3-RT, 4 for 4-RT G-buffer PSs
+
+  // If a rasterizer-generated SV (SV_SampleIndex) currently sits on new_in_reg,
+  // relocate it to a free higher register (max_in + 1 is always free) and
+  // rewrite every reference: the ISGN register_index, the dcl_input_ps_sgv
+  // token operand, and all INPUT instruction operands (e.g. the iadd reading
+  // v8.x). TEXCOORD{tex_idx} then takes the vacated register, matching the VS
+  // output.
+  uint32_t sv_old_reg = UINT32_MAX;
+  uint32_t sv_new_reg = UINT32_MAX;
+  for (const auto& e : is) {
+    if (IsRasterizerGeneratedSysval(e.system_value_type) && e.register_index == new_in_reg) {
+      sv_old_reg = e.register_index;
+      sv_new_reg = max_in + 1u;
+      break;
+    }
+  }
 
   // Scan SHEX.
   const uint8_t* shex_data =
@@ -1761,16 +2004,22 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   uint32_t ret_dw = scan.ret_offset / 4u - 2u;
 
   std::vector<uint32_t> new_tokens(tokens, tokens + old_token_dwords);
+  // Relocate SV_SampleIndex references (dcl_input_ps_sgv + iadd operands) to a
+  // higher register so TEXCOORD5 can take the register the VS writes prevClip
+  // to. Must happen on the ORIGINAL stream before the new decls/body are
+  // spliced in (the injected code uses new_in_reg, not the old SV register).
+  if (sv_old_reg != UINT32_MAX) RewriteInputRegister(new_tokens, sv_old_reg, sv_new_reg);
   bool patched_temps = false;
   if (scan.has_temps) {
     for (uint32_t i = 0; i < first_non_decl_dw;) {
       const uint32_t op = new_tokens[i] & 0x7FFu;
-      const uint32_t len = new_tokens[i] >> 24u;
+      const uint32_t len = InstructionLength(new_tokens.data(), old_token_dwords, i);
       if (op == OP_DCL_TEMPS && len >= 2u) {
         new_tokens[i + 1u] = new_dcl_temps;
         patched_temps = true;
         break;
       }
+      if (len == 0u) break;  // malformed; bail to the insert fallback
       i += len;
     }
   }
@@ -1831,19 +2080,41 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
     if (!ParseDXBC(out, h2, chunks2)) return false;
     const ChunkInfo* isgn2 = FindChunk(chunks2, "ISGN");
     if (!isgn2) return false;
+    uint32_t insert_at = UINT32_MAX;  // default: append at the end
+    if (sv_old_reg != UINT32_MAX) {
+      // Relocate the SV_SampleIndex ISGN entry (register_index) to sv_new_reg
+      // and insert TEXCOORD5 at its old slot so the signature stays sorted by
+      // register (TEXCOORD5@new_in_reg < SV_SampleIndex@sv_new_reg).
+      std::vector<SignatureEntry> is2;
+      if (!ParseSignature(out, *isgn2, is2)) return false;
+      int32_t sv_idx = -1;
+      for (uint32_t i = 0u; i < (uint32_t)is2.size(); ++i) {
+        if (IsRasterizerGeneratedSysval(is2[i].system_value_type) &&
+            is2[i].register_index == sv_old_reg) {
+          sv_idx = (int32_t)i;
+          break;
+        }
+      }
+      if (sv_idx < 0) return false;
+      if (!RewriteSignatureEntryRegister(out, *isgn2, is2[(uint32_t)sv_idx].name,
+                                         is2[(uint32_t)sv_idx].semantic_index, sv_new_reg))
+        return false;
+      insert_at = (uint32_t)sv_idx;
+    }
     // rw_mask 0x0B mirrors the hand-patched PS ISGN entry (reads .xyw).
-    if (!AppendSignatureEntry(out, *isgn2, "TEXCOORD", 5u, new_in_reg, 0xFu, 0x0Bu,
-                              3u /* FLOAT32 */))
+    if (!AppendSignatureEntry(out, *isgn2, "TEXCOORD", tex_idx, new_in_reg, 0xFu, 0x0Bu,
+                              3u /* FLOAT32 */, insert_at))
       return false;
   }
-  // ── Append the OSGN output entry (SV_TARGET3) ──
+  // ── Append the OSGN output entry (SV_TARGET at max_out+1: 3 for 3-RT, 4 for
+  // 4-RT G-buffer PSs) ──
   {
     DXBCHeader h2;
     std::vector<ChunkInfo> chunks2;
     if (!ParseDXBC(out, h2, chunks2)) return false;
     const ChunkInfo* osgn2 = FindChunk(chunks2, "OSGN");
     if (!osgn2) return false;
-    if (!AppendSignatureEntry(out, *osgn2, "SV_TARGET", 3u, new_out_reg, 0xFu, 0x0u,
+    if (!AppendSignatureEntry(out, *osgn2, "SV_TARGET", new_out_reg, new_out_reg, 0xFu, 0x0u,
                               3u /* FLOAT32 */))
       return false;
   }

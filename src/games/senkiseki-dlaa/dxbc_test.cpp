@@ -394,14 +394,16 @@ int PatchOne(const std::string& path, const std::string& out_path) {
 
 // Patch a G-buffer pixel shader in place (Phase E), write the patched blob to
 // `out_path`, and re-validate (parse + signatures + hash self-consistency).
-int PatchOnePs(const std::string& path, const std::string& out_path) {
+// `texidx` (0 = auto) is the paired patched VS's prevClip TEXCOORD index that
+// the PS input MUST reuse so the VS->PS semantic linkage matches.
+int PatchOnePs(const std::string& path, const std::string& out_path, uint32_t texidx = 0u) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
     std::cerr << "  ERROR: cannot read file\n";
     return 1;
   }
   uint32_t new_hash = 0;
-  const bool patched = dxbc::PatchPerObjectPixelShader(data, &new_hash);
+  const bool patched = dxbc::PatchPerObjectPixelShader(data, &new_hash, texidx);
   if (!patched) {
     std::cout << "  NOT PATCHED (not a G-buffer PS or gate rejected)\n";
     dxbc::DXBCHeader h;
@@ -625,6 +627,7 @@ int main(int argc, char** argv) {
   bool emittest = false;
   bool patch = false;
   bool patchps = false;
+  uint32_t texidx = 0u;
   std::string patch_out;
   std::vector<std::string> paths;
   for (int i = 1; i < argc; ++i) {
@@ -639,6 +642,8 @@ int main(int argc, char** argv) {
       patch = true;
     } else if (arg == "--patchps") {
       patchps = true;
+    } else if (arg == "--texidx") {
+      if (i + 1 < argc) texidx = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
     } else if (arg == "--out") {
       if (i + 1 < argc) patch_out = argv[++i];
     } else {
@@ -655,7 +660,8 @@ int main(int argc, char** argv) {
     std::cerr << "  --dump prints every SHEX instruction's raw dwords + decode.\n";
     std::cerr << "  --emittest prints the emitter-built injected block (no files needed).\n";
     std::cerr << "  --patch patches a skinned VS (generic Phase B) and writes out.cso.\n";
-    std::cerr << "  --patchps patches a G-buffer PS (Phase E) and writes out.cso.\n";
+    std::cerr << "  --patchps [--texidx <n>] patches a G-buffer PS (Phase E) and writes out.cso.\n";
+    std::cerr << "    --texidx overrides the prevClip TEXCOORD index with the paired VS's (0=auto).\n";
     return 1;
   }
 
@@ -679,7 +685,7 @@ int main(int argc, char** argv) {
     std::string in = paths[0];
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
-    int rc = PatchOnePs(in, out);
+    int rc = PatchOnePs(in, out, texidx);
     std::cout << "\n";
     return rc;
   }

@@ -130,11 +130,11 @@ void main(
   r1.z = dot(r0.xyzw, scene.ViewProjection._m02_m12_m22_m32);
   r1.w = dot(r0.xyzw, scene.ViewProjection._m03_m13_m23_m33);
   r0.w = dot(r0.xyzw, scene.View._m02_m12_m22_m32);
-  // DLAA: rasterization-level camera jitter (SV_Position sub-pixel shift).
-  // Jitter offsets come from the addon b13 injection (0 when disabled).
-  o0.x = r1.x + DLAA_JITTER_X * r1.w;
-  o0.y = r1.y + DLAA_JITTER_Y * r1.w;
-  o0.zw = r1.zw;
+  // NOTE: no DLAA jitter here — the other eye VSs (0x3641D444, 0xB2F338C8)
+  // are generic-patched (Phase B) WITHOUT jitter, so jittering only this VS
+  // made the white sclera shift sub-pixel against the unjittered iris -> the
+  // gray/too-white flicker. Keep SV_Position faithful to the original.
+  o0.xyzw = r1.xyzw;
   // DLAA: per-object motion (prev clip-space position from prevViewProj x current pose).
   if (DLAA_PER_OBJECT_MOTION > 0.5f) {
     float4x4 prevViewProjection = float4x4(

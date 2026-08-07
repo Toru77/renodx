@@ -85,6 +85,11 @@ static float g_phase_mv_jittered = 0.f;   // DIAGNOSTIC (Test C): feed JITTERED 
 static float g_phase_jitter_depth = 0.f;  // DIAGNOSTIC (friend's red flag #1): jitter the character's MAIN depth pass too,
                                           // so DLSS sees color AND depth in the same jitter state. Only the character SHADOW
                                           // VS stays unjittered (its consumer compares against the unjittered projection).
+static float g_phase_mv_threshold_object = 0.f;  // per-object / Prev-Bone MV threshold (px). DLAAMVThreshold now gates
+                                                 // ONLY camera (depth-reprojection) MVs; this gates the per-object path.
+                                                 // Addon-side (NOT in ShaderInjectData: growing that struct resizes the
+                                                 // injected b13 cbuffer and breaks the boot PSs). Consumed only by
+                                                 // BuildVelocityPC -> velocity compute params3.x.
 
 // ── Descriptor table helpers ──
 constexpr uint32_t kTableParamCount = 6u;
@@ -208,25 +213,30 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11Buffer* prev_bones_buffer = nullptr;
   ID3D11ShaderResourceView* prev_bones_srv = nullptr;
 
-  // ── Phase D: per-character prev-bone twins (real per-object MVs) ──
+  // ── Phase D: per-instance prev-bone snapshots (real per-object MVs) ──
   // The game uploads a per-character bone StructuredBuffer (stride 64) at VS t0
-  // every frame. For each distinct bone-buffer handle we keep an addon-owned
-  // same-size structured buffer + SRV (the "twin"). At present we
-  // CopyResource(game buffer -> twin), so the NEXT frame's patched VS reads the
-  // PREVIOUS frame's bone matrices at its prev-bone t# slot -> prevClip
-  // reflects real animation/limb motion, not just camera motion. Keyed ONLY by
-  // the bone-buffer handle (no VS hash). Gated by DLAAPerObjectMotion = Prev-Bone.
-  struct PrevBoneTwin {
-    ID3D11Buffer* twin_buffer = nullptr;   // addon-owned structured buffer (copy dest)
-    ID3D11ShaderResourceView* twin_srv = nullptr;
-    ID3D11Buffer* game_buffer = nullptr;   // game's bone buffer (copy source, AddRef'd)
-    uint64_t handle = 0u;                  // game bone-buffer handle (key)
-    uint32_t size = 0u;
-    uint32_t stride = 0u;
-    uint64_t last_seen_frame = 0u;
+  // every frame. For each CHARACTER INSTANCE we keep an addon-owned cur/prev
+  // pair. At DRAW TIME (when the game has JUST bound this frame's bone buffer
+  // at its t0 slot) we CopyResource(game buffer -> cur), and the patched VS
+  // binds PREV (cur promoted to prev at present), so it re-skins with the
+  // PREVIOUS frame's bones -> prevClip reflects real animation/limb motion.
+  //
+  // Keyed by CHARACTER INSTANCE (per-object b0 cbuffer handle + VB slot0
+  // handle), NOT by VS hash — a single VS is SHARED across many characters
+  // (eyeballs, skin, clothing), so a shader key would mix their bones. And NOT
+  // by the bone-buffer handle: the game rotates a RING of bone buffers (frame N
+  // writes buffer[N%4]), so a handle-keyed twin is 3-4 frames stale. Capturing
+  // at draw time keyed by the stable instance is ring-agnostic.
+  struct PrevBoneSnap {
+    ID3D11Buffer* cur_buffer = nullptr;    // addon-owned structured buffer (this frame's bones)
+    ID3D11ShaderResourceView* cur_srv = nullptr;
+    ID3D11Buffer* prev_buffer = nullptr;   // addon-owned structured buffer (prev frame's bones)
+    ID3D11ShaderResourceView* prev_srv = nullptr;
+    uint32_t size = 0u;                    // byte size (== game bone buffer)
+    uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
   };
-  std::vector<PrevBoneTwin> prev_bone_twins;
-  ID3D11ShaderResourceView* last_bound_twin_srv = nullptr;  // twin bound this draw (for restore)
+  std::unordered_map<uint64_t, PrevBoneSnap> prev_bone_snaps;  // key = instance composite
+  ID3D11ShaderResourceView* last_bound_twin_srv = nullptr;  // prev snap bound this draw (for restore)
 
   // ── Phase 0 prev-pose probe state (separate DLAAPhase0Logging toggle) ──
   // Last vertex-stage t0 SRV push = the game's bone StructuredBuffer. The draw
@@ -371,12 +381,13 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   if (d->prev_vp_cb) { d->prev_vp_cb->Release(); d->prev_vp_cb = nullptr; }
   if (d->prev_bones_srv) { d->prev_bones_srv->Release(); d->prev_bones_srv = nullptr; }
   if (d->prev_bones_buffer) { d->prev_bones_buffer->Release(); d->prev_bones_buffer = nullptr; }
-  for (auto& t : d->prev_bone_twins) {
-    if (t.twin_srv) t.twin_srv->Release();
-    if (t.twin_buffer) t.twin_buffer->Release();
-    if (t.game_buffer) t.game_buffer->Release();
+  for (auto& [key, snap] : d->prev_bone_snaps) {
+    if (snap.cur_srv) snap.cur_srv->Release();
+    if (snap.cur_buffer) snap.cur_buffer->Release();
+    if (snap.prev_srv) snap.prev_srv->Release();
+    if (snap.prev_buffer) snap.prev_buffer->Release();
   }
-  d->prev_bone_twins.clear();
+  d->prev_bone_snaps.clear();
   d->last_bound_twin_srv = nullptr;
   if (d->prev_bone_saved_srv) { d->prev_bone_saved_srv->Release(); d->prev_bone_saved_srv = nullptr; }
   if (d->prev_vp_saved_cb) { d->prev_vp_saved_cb->Release(); d->prev_vp_saved_cb = nullptr; }
@@ -747,13 +758,25 @@ static bool EnsureMotionTarget(reshade::api::device* dev, DeviceData* d, uint32_
 // zero-flag sentinel.
 static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (shader_injection.dlaa_per_object_motion < 0.5f) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  const uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  const uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  // Diagnostic: the white part of the eye shows background in HSV (no per-object
+  // motion). Capture EVERY draw whose VS is per-object OR whose PS is one of our
+  // patched outputs, with the bound RTV count, so we can see why the white part
+  // is excluded (most likely: drawn in a pass with <3 RTs, or with an unpatched
+  // PS). DLAADebugLogging must be on.
+  const bool is_po_vs = d->patched_vs_by_new_hash.contains(vh) || IsPerObjectMotionVs(vh);
+  const bool is_patched_ps = d->patched_ps_hashes.contains(ph);
+  if (shader_injection.dlaa_debug_logging > 0.5f && (is_po_vs || is_patched_ps))
+    LogThrottled("motion-draw", reshade::log::level::info, 200u, 100u,
+                 "[DLAA] motion: draw vs=0x%08X ps=0x%08X rtvs=%u poVS=%d patchedPS=%d",
+                 vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_patched_ps);
   // G-buffer only: require the game's color/normal/depth MRT set (>=3 RTs).
   // Depth/shadow/effect passes bind fewer RTs and must never get the appended
   // motion RTV (the generic patcher now touches many more VSs than the old
   // 24-hash list, so this guard matters).
   if (!cmd_list || !d || !d->motion_rtv.handle || d->last_rtv_count < 3u) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
   // Gate on BOTH:
   //  (a) VSs the generic in-place patcher modified (patched NEW hashes), and
   //  (b) the ORIGINAL per-object char VS hashes as a fallback gate (covers the
@@ -761,7 +784,16 @@ static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceDat
   //      All skinned char VSs are generic-patched (they are NOT in
   //      custom_shaders — the boot-HLSL VS replacements don't emit prevClip,
   //      so listing them there made their paired PSs read garbage v7).
-  if (!d->patched_vs_by_new_hash.contains(vh) && !IsPerObjectMotionVs(vh)) return;
+  if (!is_po_vs) {
+    // Diagnostic: log near-miss draws (per-object PS but unrecognized VS) so we
+    // can see why a part (e.g. the white of the eye) may not get per-object
+    // motion. Only log when the PS is one of our patched outputs, to avoid noise.
+    if (shader_injection.dlaa_debug_logging > 0.5f && d->patched_ps_hashes.contains(ph))
+      LogThrottled("motion-gate", reshade::log::level::info, 40u, 250u,
+                   "[DLAA] motion: SKIP (VS not per-object) vs=0x%08X ps=0x%08X rtvs=%u",
+                   vh, ph, d->last_rtv_count);
+    return;
+  }
   auto* dev = cmd_list->get_device();
   if (!dev || !d->last_rtvs[0].handle) return;
   // D3D11 requires all bound RTs to share identical dimensions — only append
@@ -770,6 +802,10 @@ static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceDat
   reshade::api::resource_desc rd = dev->get_resource_desc(dev->get_resource_from_view(d->last_rtvs[0]));
   if (rd.type != reshade::api::resource_type::texture_2d) return;
   if (rd.texture.width != mr.texture.width || rd.texture.height != mr.texture.height) return;
+  if (shader_injection.dlaa_debug_logging > 0.5f)
+    LogThrottled("motion-append", reshade::log::level::info, 60u, 200u,
+                 "[DLAA] motion: APPEND vs=0x%08X ps=0x%08X rtvs=%u",
+                 vh, ph, d->last_rtv_count);
   // Clear once per frame (flag=0 invalid; the patched PS writes flag=1).
   if (!d->motion_cleared_this_frame) {
     const float clear[4] = {0.f, 0.f, 0.f, 0.f};
@@ -848,103 +884,102 @@ static bool EnsurePrevBonesSrv(reshade::api::device* dev, DeviceData* d) {
   return d->prev_bones_srv != nullptr;
 }
 
-// ── Phase D: prev-bone twin registry ──
-// Find (or create) the addon-owned twin for the game bone-buffer behind the
-// given SRV. Keyed ONLY by the game's bone-buffer handle (no VS hash). The twin
-// is a same-size/same-stride structured buffer + SRV that we CopyResource into
-// at present, so the next frame's patched VS reads the PREVIOUS frame's bones.
-// Returns the twin's SRV (or nullptr if the buffer isn't a stride-64 structured
-// buffer / on allocation failure). Bounded (LRU evicts the least-recently-used).
-static ID3D11ShaderResourceView* EnsurePrevBoneTwin(reshade::api::device* dev, DeviceData* d,
-                                                    ID3D11ShaderResourceView* game_srv) {
-  if (!dev || !d || !game_srv) return nullptr;
-  ID3D11Resource* res = nullptr;
-  game_srv->GetResource(&res);
-  if (!res) return nullptr;
-  D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-  res->GetType(&dim);
-  if (dim != D3D11_RESOURCE_DIMENSION_BUFFER) {
-    res->Release();
-    return nullptr;
-  }
-  auto* gb = static_cast<ID3D11Buffer*>(res);
-  D3D11_BUFFER_DESC gd = {};
-  gb->GetDesc(&gd);
-  if (!(gd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) || gd.StructureByteStride != 64u) {
-    res->Release();
-    return nullptr;
-  }
-  // Key by the native buffer pointer (stable per game bone buffer).
-  const uint64_t key = (uint64_t)(uintptr_t)gb;
-  // Existing twin?
-  for (auto& t : d->prev_bone_twins) {
-    if (t.handle == key) {
-      t.last_seen_frame = d->frame_index;
-      res->Release();
-      return t.twin_srv;
-    }
+// ── Phase D: per-instance prev-bone snapshot registry ──
+// Find (or create) the addon-owned cur/prev snapshot pair for a character
+// INSTANCE (key = composite of the per-object b0 cbuffer handle + VB slot0
+// handle). Each snap holds a cur buffer (draw-time capture of THIS frame's
+// bones) and a prev buffer (promoted from cur at present; bound to the patched
+// VS so it re-skins with the PREVIOUS frame's bones). Returns the snap, or
+// nullptr on allocation failure. Bounded (LRU evicts the least-recently-used).
+static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, DeviceData* d,
+                                                    uint64_t key, uint32_t bytes) {
+  if (!dev || !d || key == 0u || bytes == 0u) return nullptr;
+  // Existing snap for this instance, same size?
+  auto it = d->prev_bone_snaps.find(key);
+  if (it != d->prev_bone_snaps.end()) {
+    if (it->second.size == bytes) return &it->second;
+    // Size changed (rare): release and recreate below.
+    if (it->second.cur_srv) it->second.cur_srv->Release();
+    if (it->second.cur_buffer) it->second.cur_buffer->Release();
+    if (it->second.prev_srv) it->second.prev_srv->Release();
+    if (it->second.prev_buffer) it->second.prev_buffer->Release();
+    d->prev_bone_snaps.erase(it);
   }
   // LRU evict when at capacity.
-  if (d->prev_bone_twins.size() >= 64u) {
+  if (d->prev_bone_snaps.size() >= 128u) {
     uint64_t oldest = UINT64_MAX;
-    size_t oldest_idx = 0u;
-    for (size_t i = 0u; i < d->prev_bone_twins.size(); ++i) {
-      if (d->prev_bone_twins[i].last_seen_frame < oldest) {
-        oldest = d->prev_bone_twins[i].last_seen_frame;
-        oldest_idx = i;
+    uint64_t oldest_key = 0u;
+    for (auto& [k, s] : d->prev_bone_snaps) {
+      if (s.last_draw_frame < oldest) {
+        oldest = s.last_draw_frame;
+        oldest_key = k;
       }
     }
-    auto& o = d->prev_bone_twins[oldest_idx];
-    if (o.twin_srv) o.twin_srv->Release();
-    if (o.twin_buffer) o.twin_buffer->Release();
-    if (o.game_buffer) o.game_buffer->Release();
-    d->prev_bone_twins.erase(d->prev_bone_twins.begin() + oldest_idx);
+    auto& o = d->prev_bone_snaps[oldest_key];
+    if (o.cur_srv) o.cur_srv->Release();
+    if (o.cur_buffer) o.cur_buffer->Release();
+    if (o.prev_srv) o.prev_srv->Release();
+    if (o.prev_buffer) o.prev_buffer->Release();
+    d->prev_bone_snaps.erase(oldest_key);
   }
-  // Create the twin (DEFAULT structured buffer, same size/stride + SRV).
+  // Create the cur/prev pair (DEFAULT structured buffers, same size + SRVs).
+  // Both start as identity bone matrices so frame 0's prev is the safe bind-pose
+  // placeholder (never uninitialized garbage bones in the first draw).
   auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
-  if (!nd) { res->Release(); return nullptr; }
-  DeviceData::PrevBoneTwin t;
-  D3D11_BUFFER_DESC bd = {};
-  bd.ByteWidth = gd.ByteWidth;
-  bd.Usage = D3D11_USAGE_DEFAULT;
-  bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-  bd.StructureByteStride = 64u;
-  if (FAILED(nd->CreateBuffer(&bd, nullptr, &t.twin_buffer))) { res->Release(); return nullptr; }
-  D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-  sd.Format = DXGI_FORMAT_UNKNOWN;
-  sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
-  sd.BufferEx.FirstElement = 0u;
-  sd.BufferEx.NumElements = gd.ByteWidth / 64u;
-  if (FAILED(nd->CreateShaderResourceView(t.twin_buffer, &sd, &t.twin_srv))) {
-    t.twin_buffer->Release();
-    res->Release();
-    return nullptr;
-  }
-  gb->AddRef();  // keep the copy source alive across frames
-  t.game_buffer = gb;
-  t.handle = key;
-  t.size = gd.ByteWidth;
-  t.stride = 64u;
-  t.last_seen_frame = d->frame_index;
-  d->prev_bone_twins.push_back(t);
-  res->Release();
-  return t.twin_srv;
+  if (!nd) return nullptr;
+  DeviceData::PrevBoneSnap snap;
+  auto create_pair = [&](ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) -> bool {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = bytes;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = 64u;
+    // Identity bone matrices (bytes/64 elements, each = 4x4 identity).
+    std::vector<uint8_t> identity(bytes, 0);
+    for (uint32_t i = 0; i < bytes / 64u; ++i) {
+      float* m = reinterpret_cast<float*>(identity.data() + (size_t)i * 64u);
+      m[0] = m[5] = m[10] = m[15] = 1.f;
+    }
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem = identity.data();
+    init.SysMemPitch = bytes;
+    init.SysMemSlicePitch = 0u;
+    if (FAILED(nd->CreateBuffer(&bd, &init, buf))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_UNKNOWN;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+    sd.BufferEx.FirstElement = 0u;
+    sd.BufferEx.NumElements = bytes / 64u;
+    if (FAILED(nd->CreateShaderResourceView(*buf, &sd, srv))) {
+      (*buf)->Release();
+      *buf = nullptr;
+      return false;
+    }
+    return true;
+  };
+  if (!create_pair(&snap.cur_buffer, &snap.cur_srv)) return nullptr;
+  if (!create_pair(&snap.prev_buffer, &snap.prev_srv)) return nullptr;
+  snap.size = bytes;
+  snap.last_draw_frame = 0u;
+  d->prev_bone_snaps.emplace(key, snap);
+  return &d->prev_bone_snaps[key];
 }
 
-// ── Phase D: frame-end prev-bone capture ──
-// CopyResource(game bone buffer -> twin) for every registered bone handle, so
-// the next frame's patched VS re-skins with the PREVIOUS frame's bones. Called
-// at present (after all draws of frame N). Gated by DLAAPerObjectMotion =
-// Prev-Bone (>= 1.5). Uses the native immediate context.
+// ── Phase D: frame-end prev-bone promotion ──
+// CopyResource(cur -> prev) for every per-instance snapshot, so the next
+// frame's patched VS re-skins with the PREVIOUS frame's bones (the cur captured
+// at draw time this frame). Called at present (after all draws of frame N).
+// Gated by DLAAPerObjectMotion = Prev-Bone (>= 1.5). Uses the native immediate
+// context.
 static void CapturePrevBones(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
   if (shader_injection.dlaa_per_object_motion < 1.5f) return;  // Prev-Bone option only
-  if (d->prev_bone_twins.empty()) return;
+  if (d->prev_bone_snaps.empty()) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return;
-  for (auto& t : d->prev_bone_twins) {
-    if (t.twin_buffer && t.game_buffer) ctx->CopyResource(t.twin_buffer, t.game_buffer);
+  for (auto& [key, snap] : d->prev_bone_snaps) {
+    if (snap.prev_buffer && snap.cur_buffer) ctx->CopyResource(snap.prev_buffer, snap.cur_buffer);
   }
 }
 
@@ -1093,21 +1128,66 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   ID3D11ShaderResourceView* bone_srv = d->prev_bones_srv;
   d->last_bound_twin_srv = nullptr;
   if (shader_injection.dlaa_per_object_motion >= 1.5f) {
-    // Read the game's CURRENT bone SRV at its own slot (the patcher records
-    // bone_game_slot, usually t0) and bind its prev-frame twin. Only ever bind
-    // our own twin SRV (never the game's SRV itself) so the ld_structured
-    // descriptor kind is always valid.
-    ID3D11ShaderResourceView* game_srv = nullptr;
-    ctx->VSGetShaderResources(it->second.bone_game_slot, 1u, &game_srv);
-    if (game_srv) {
-      ID3D11ShaderResourceView* twin_srv =
-          EnsurePrevBoneTwin(cmd_list->get_device(), d, game_srv);
-      game_srv->Release();
-      if (twin_srv) {
-        bone_srv = twin_srv;
-        d->last_bound_twin_srv = twin_srv;
+    // Draw-time per-INSTANCE prev-bone capture. At this point the game has JUST
+    // bound THIS frame's bone buffer at bone_game_slot (usually t0) — that
+    // buffer holds frame N's bones RIGHT NOW. We CopyResource it into this
+    // instance's "cur" snapshot and bind the instance's "prev" (promoted from
+    // cur at present) so the patched VS re-skins with frame N-1's bones.
+    //
+    // Key = CHARACTER INSTANCE (per-object b0 cbuffer + VB slot0 handle), NOT
+    // the VS hash (a VS is SHARED across many characters — eyeballs/skin/
+    // clothing — so a shader key would mix their bones) and NOT the bone handle
+    // (the game rotates a RING of bone buffers, frame N writes buffer[N%4], so
+    // a handle-keyed twin is 3-4 frames stale). Capturing at draw time keyed by
+    // the stable instance is ring-agnostic. Only ever bind our own snapshot SRV
+    // (never the game's SRV itself) so the ld_structured descriptor kind is
+    // always valid.
+    ID3D11Buffer* b0 = nullptr;
+    ctx->VSGetConstantBuffers(0u, 1u, &b0);
+    ID3D11Buffer* vb0 = nullptr;
+    UINT vb_stride = 0u, vb_offset = 0u;
+    ctx->IAGetVertexBuffers(0u, 1u, &vb0, &vb_stride, &vb_offset);
+    if (b0 && vb0) {
+      // Boost-style hash_combine: heap pointers' entropy is mostly in the low
+      // bits, so a naive (b0<<32)^vb0 would collide; this mixes both fully.
+      const uint64_t b0k = (uint64_t)(uintptr_t)b0;
+      const uint64_t vbk = (uint64_t)(uintptr_t)vb0;
+      const uint64_t key = b0k ^ (vbk + 0x9e3779b97f4a7c15ull + (b0k << 6) + (b0k >> 2));
+      ID3D11ShaderResourceView* game_srv = nullptr;
+      ctx->VSGetShaderResources(it->second.bone_game_slot, 1u, &game_srv);
+      if (game_srv) {
+        ID3D11Resource* res = nullptr;
+        game_srv->GetResource(&res);
+        if (res) {
+          D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+          res->GetType(&dim);
+          if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            auto* gb = static_cast<ID3D11Buffer*>(res);
+            D3D11_BUFFER_DESC gd = {};
+            gb->GetDesc(&gd);
+            if ((gd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && gd.StructureByteStride == 64u) {
+              DeviceData::PrevBoneSnap* snap =
+                  EnsurePrevBoneSnap(cmd_list->get_device(), d, key, gd.ByteWidth);
+              if (snap) {
+                // Capture this frame's bones into cur ONCE per frame per
+                // instance (multiple draws of the same instance/VS in one frame
+                // share one snapshot — the game binds the same pose for all).
+                if (snap->last_draw_frame != d->frame_index) {
+                  ctx->CopyResource(snap->cur_buffer, gb);
+                  snap->last_draw_frame = d->frame_index;
+                }
+                bone_srv = snap->prev_srv;
+                d->last_bound_twin_srv = snap->prev_srv;
+              }
+            }
+          }
+          res->Release();
+        }
+        game_srv->Release();
       }
     }
+    if (b0) b0->Release();
+    if (vb0) vb0->Release();
   }
   // Save the game's current bindings at these slots BEFORE overwriting them:
   // MaybeRestorePatchedBinds (next draw) puts them back so our extra structured
@@ -1703,6 +1783,7 @@ static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d)
   // NEW: read the bound vertex buffer (slot 0) and its BindFlags. Only valid on
   // the native immediate context.
   uint32_t vb_bind_flags = 0u;
+  uint64_t vb_handle = 0ull, b0_handle = 0ull;
   {
     auto* native_ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
     if (native_ctx) {
@@ -1713,17 +1794,32 @@ static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d)
         D3D11_BUFFER_DESC bd = {};
         vb->GetDesc(&bd);
         vb_bind_flags = bd.BindFlags;
+        vb_handle = (uint64_t)(uintptr_t)vb;
         vb->Release();
         d->p0_vs_vb_bind_flags[vhash] = bd.BindFlags;
+      }
+      // Per-object b0 cbuffer (World at c44) = the per-instance key's upper
+      // half. Verify it is STABLE per character across frames (while the bone
+      // handle rotates through the ring) and DISTINCT across characters that
+      // share a VS — the premise of the draw-time snapshot key.
+      ID3D11Buffer* b0 = nullptr;
+      native_ctx->VSGetConstantBuffers(0, 1, &b0);
+      if (b0) {
+        b0_handle = (uint64_t)(uintptr_t)b0;
+        b0->Release();
       }
     }
   }
   bool gpu_skinned = (vb_bind_flags & D3D11_BIND_UNORDERED_ACCESS) != 0;
+  // Same hash_combine as the draw-time snapshot key in MaybeBindPatchedVs.
+  uint64_t inst_key = b0_handle ^ (vb_handle + 0x9e3779b97f4a7c15ull + (b0_handle << 6) + (b0_handle >> 2));
 
   LogThrottled("p0-draw", reshade::log::level::info, 30u, 300u,
-               "[P0] per-object draw vs=0x%08X ps=0x%08X bone=0x%llX size=%u stride=%u vbBindFlags=0x%X %s%s",
+               "[P0] per-object draw vs=0x%08X ps=0x%08X bone=0x%llX size=%u stride=%u vbBindFlags=0x%X b0=0x%llX vb0=0x%llX instKey=0x%llX %s%s",
                vhash, phash, (unsigned long long)bone,
                d->last_bone_size, d->last_bone_stride, vb_bind_flags,
+               (unsigned long long)b0_handle, (unsigned long long)vb_handle,
+               (unsigned long long)inst_key,
                bone ? "skinned" : "WORLD-only (no bone SRV seen)",
                gpu_skinned ? " GPU-SKINNED(UAV)" : "");
 }
@@ -2077,7 +2173,8 @@ static void UpdateJitter(DeviceData* d) {
 //   c[0..15] = prevViewProj, c[16..31] = curViewProjInv,
 //   c[32..35] = params0 (vp_w, vp_h, velocity_scale, debug_view),
 //   c[36..39] = params1 (jitter_x, jitter_y, per_object_motion, zero_mv),
-//   c[40..43] = params2 (mv_threshold, mv_direction, mv_mode, 0)
+//   c[40..43] = params2 (mv_threshold, mv_direction, mv_mode, exclude_effects),
+//   c[44..47] = params3 (mv_threshold_object — per-object/Prev-Bone MVs only)
 static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
   std::array<float, 48> c = {};
   if (!d) return c;
@@ -2097,6 +2194,7 @@ static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
   //   2 = MVJittered=1 + no subtract; camera path adds jitter (Test C)
   c[42] = (g_phase_mv_jittered > 0.5f) ? 2.f : g_phase_mv_comp;
   c[43] = shader_injection.dlaa_exclude_effects;  // params2.w — mask effects out of DLAA
+  c[44] = g_phase_mv_threshold_object;            // params3.x — per-object/Prev-Bone MVs only
   return c;
 }
 
@@ -2214,11 +2312,20 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       // Pass: Velocity compute
       cmd_list->bind_pipeline(AC, d->velocity_pipeline);
 
-      // Per-object motion source: our dedicated 16-bit target (Stage 1) when
-      // available, else the legacy game MRT2 capture (8-bit, noisy).
+      // Motion-vector source for the velocity compute. The shader only samples
+      // t1 (g_srcMotion) when per_object_motion is on (params1.z > 0.5); in
+      // camera-only mode the texture is NEVER read, but the dispatch still
+      // requires a NON-NULL descriptor. ALWAYS bind the dedicated 32-bit target
+      // (created by EnsureMotionTarget above) and only fall back to the legacy
+      // game-MRT2 capture if that ever fails.
+      //
+      // NOTE: do NOT select the legacy capture in camera mode. It was populated
+      // from the original char G-buffer PS hash 0x0E8BC215, which Phase E's
+      // generic PS patcher now modifies (changing its hash) — so the capture
+      // gate never fires, captured_motion_srv stays null, and the dispatch was
+      // skipped -> DLAA never ran in camera-only mode (no overlay).
       reshade::api::resource_view motion_src = d->motion_srv;
-      if (shader_injection.dlaa_per_object_motion < 0.5f || !motion_src.handle)
-        motion_src = d->captured_motion_srv;
+      if (!motion_src.handle) motion_src = d->captured_motion_srv;
       // ── Velocity dispatch: null-descriptor guard + bound-state diagnostics ──
       // The first dispatch here was TDRing the GPU despite all bindings looking
       // valid. Guards: skip on a null descriptor (never dispatch on a partial
@@ -2533,7 +2640,15 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAMVThreshold", .binding = &shader_injection.dlaa_mv_threshold,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
         .default_value = 0.f, .label = "MV Threshold (px)", .section = "Antialiasing",
-        .tooltip = "Zeros motion vectors below this magnitude. Kills static sub-pixel MV noise that poisons history.",
+        .tooltip = "Zeros CAMERA motion vectors below this magnitude. Kills static sub-pixel MV noise that poisons history. Per-object / Prev-Bone MVs have their own threshold: DLAAPerObjectMVThreshold.",
+        .min = 0.f, .max = 5.f, .format = "%.2f",
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPerObjectMVThreshold", .binding = &g_phase_mv_threshold_object,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.f, .label = "Per-Object MV Threshold (px)", .section = "Antialiasing",
+        .tooltip = "Zeros PER-OBJECT / Prev-Bone motion vectors below this magnitude (dynamic objects: character limbs, hair, etc.). The camera path keeps its own DLAAMVThreshold. Leave 0 to keep all per-object MVs (including small noise).",
         .min = 0.f, .max = 5.f, .format = "%.2f",
         .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
     },
@@ -2641,7 +2756,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAPhaseBOutline", .binding = &g_phaseb_outline,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Phase B Outline Offset", .section = "Antialiasing",
-        .tooltip = "Replicate the GameEdgeParameters outline offset in the patched prevClip. Disable to isolate crashes to the outline block.",
+        .tooltip = "Replicate the GameEdgeParameters outline offset in the patched prevClip. Now gated on ACTUAL shader usage (most char VSs declare it but never read it, so this is normally a no-op) — only genuinely-outlined shaders get the offset.",
         .labels = {"Off","On"},
     },
     // ── Shake-isolation diagnostics ──
@@ -2753,6 +2868,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // BLENDINDICES/BLENDWEIGHTS).
     // Foliage & world VSs discovered in the foliage scene (same geometry jitter).
     CustomShaderEntry(0x29513853),  // foliage (main)
+
+    // ── White part of the eye: boot prevClip pair (07-Aug) ──
+    // The boot HLSL (senkiseki3/boot/0xB1C24E2A.vs_4_1.hlsl + 0x7542CBC4.ps_4_1.hlsl)
+    // already emit prevClip (VS o8/TEXCOORD5) and write the motion RTV (PS
+    // SV_TARGET3). Registering them here (old way) makes the game use the
+    // hand-patched pair directly, so the white part gets per-object motion.
+    // NOTE: OnCreatePipeline skips custom_shaders entries, so these are NOT
+    // double-patched by the generic Phase B/E patcher.
     CustomShaderEntry(0xED3D1A43),  // foliage
     CustomShaderEntry(0x7D5282A3),  // scene/world
     CustomShaderEntry(0x066E7DFB),  // scene/world
@@ -2915,13 +3038,38 @@ static bool OnCreatePipeline(
 
   // ── Phase E: generic per-object-motion PS patcher ──
   // Runs on the pixel_shader subobject (create_pipeline fires once per stage;
-  // the PS is a separate subobject from the VS). Appends TEXCOORD5 input +
-  // SV_TARGET3 output to any G-buffer PS (>=3 SV_TARGET outputs) and injects
-  // the prevNDC->o3 write before ret. The PS needs NO draw-time binding: it
-  // reads prevClip (TEXCOORD5) via normal VS->PS semantic linkage and writes
-  // the appended o3; MaybeAppendMotionRtv only binds the motion RTV on char
-  // draws, so o3 is discarded elsewhere. Skip-guard: hand-replaced shaders
-  // (effect masks, FXAA, composite) and already-patched hashes.
+  // the PS is a separate subobject from the VS). Appends a TEXCOORD input
+  // (prevClip, at the SAME index the paired VS writes it) + an SV_TARGET
+  // output (the appended motion RTV, at max_out+1) to any G-buffer PS (>=3
+  // SV_TARGET outputs) and injects the prevNDC->o3 write before ret. The PS
+  // needs NO draw-time binding: it reads prevClip via normal VS->PS semantic
+  // linkage and writes the appended o3; MaybeAppendMotionRtv only binds the
+  // motion RTV on char draws, so o3 is discarded elsewhere. Skip-guard:
+  // hand-replaced shaders (effect masks, FXAA, composite) and already-patched
+  // hashes.
+  //
+  // The PS prevClip input semantic must EXACTLY match the index Phase B chose
+  // for the paired VS (D3D11 links by semantic name+index). If we picked the
+  // PS's own first-free index, it could differ from the VS's (the game's VS
+  // may output TEXCOORDs the PS doesn't consume, e.g. eye VS 0x215C68A3
+  // outputs TEXCOORD5 while PS 0x0E03514A does not read it) -> the PS would
+  // read the game's own TEXCOORD as prevClip -> garbage MVs -> ghosting. Look
+  // up the VS subobject in this same create_pipeline call and reuse its index.
+  uint32_t vs_texcoord_index = 0u;
+  for (uint32_t i = 0; i < subobject_count; ++i) {
+    const auto& sub = subobjects[i];
+    if (sub.type != reshade::api::pipeline_subobject_type::vertex_shader) continue;
+    if (sub.count != 1u) continue;
+    auto* vsd = static_cast<reshade::api::shader_desc*>(sub.data);
+    if (!vsd || vsd->code_size == 0u) continue;
+    const uint32_t vhash = renodx::utils::hash::ComputeCRC32(
+        static_cast<const uint8_t*>(vsd->code), vsd->code_size);
+    auto vit = d->patched_vs_by_new_hash.find(vhash);
+    if (vit != d->patched_vs_by_new_hash.end()) {
+      vs_texcoord_index = vit->second.texcoord_index;
+    }
+    break;
+  }
   for (uint32_t i = 0; i < subobject_count; ++i) {
     const auto& sub = subobjects[i];
     if (sub.type != reshade::api::pipeline_subobject_type::pixel_shader) continue;
@@ -2937,7 +3085,7 @@ static bool OnCreatePipeline(
     blob.resize(desc->code_size);
     std::memcpy(blob.data(), desc->code, desc->code_size);
     uint32_t new_hash = 0u;
-    if (!senkiseki3::dxbc::PatchPerObjectPixelShader(blob, &new_hash)) continue;
+    if (!senkiseki3::dxbc::PatchPerObjectPixelShader(blob, &new_hash, vs_texcoord_index)) continue;
     if (new_hash == 0u || new_hash == hash) continue;
 
     desc->code = malloc(blob.size());

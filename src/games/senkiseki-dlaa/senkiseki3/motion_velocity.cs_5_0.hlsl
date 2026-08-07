@@ -14,7 +14,7 @@
 //         t2 = effect/particle mask (r16g16_float, 1.0 = excluded from DLAA)
 // Output: u0 = velocity buffer (R16G16_FLOAT, screen px, y-down)
 //
-// Push constants (b13, 32 floats = 8 float4s):
+// Push constants (b13, 48 floats = 12 float4s):
 //   c[0..3]  = prevViewProjection (4x4 row-major)
 //   c[4..7]  = curViewProjInverse (4x4 row-major)
 //   c[8]     = VP_WIDTH, VP_HEIGHT, VELOCITY_SCALE, DEBUG_VIEW
@@ -22,6 +22,7 @@
 //   c[10]    = MV_THRESHOLD(px), MV_DIRECTION(flip), MV_MODE, EXCLUDE_EFFECTS
 //              MV_MODE: 0=MVJittered=0 no per-object subtract (B), 1=MVJittered=0
 //              subtract (A, current), 2=MVJittered=1 whole buffer jittered (C)
+//   c[11]    = OBJECT_MV_THRESHOLD(px) — per-object/Prev-Bone MVs only
 //
 // SPDX-License-Identifier: MIT
 
@@ -35,7 +36,8 @@ cbuffer cb_push : register(b13) {
   float4x4 curViewProjInv;
   float4 params0;   // x=vp_w, y=vp_h, z=velocity_scale, w=debug_view
   float4 params1;   // x=jitter_x(NDC), y=jitter_y(NDC), z=per_object_motion, w=zero_mv
-  float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=mv_mode, w=0
+  float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=mv_mode, w=exclude_effects
+  float4 params3;   // x=mv_threshold_object(px) — per-object/Prev-Bone MVs only
 };
 
 [numthreads(8, 8, 1)]
@@ -125,7 +127,10 @@ void main(uint2 pix : SV_DispatchThreadID)
   // MV Direction A/B: flip sign (previous-current instead of current-previous).
   if (params2.y > 0.5f) vel = -vel;
   // MV Threshold: zero out sub-pixel noise (static dots) that poison history.
-  if (length(vel) < params2.x) vel = float2(0.0, 0.0);
+  // Camera (depth-reprojection) MVs use params2.x (DLAAMVThreshold);
+  // per-object / Prev-Bone MVs use params3.x (DLAAPerObjectMVThreshold).
+  float mvThresh = hasObjectMotion ? params3.x : params2.x;
+  if (length(vel) < mvThresh) vel = float2(0.0, 0.0);
 
   // Exclude effects/particles from DLAA: an off-screen motion vector makes DLSS
   // fall back to the current input frame (no temporal history), which prevents
