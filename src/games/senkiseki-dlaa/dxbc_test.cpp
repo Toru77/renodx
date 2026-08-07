@@ -392,6 +392,82 @@ int PatchOne(const std::string& path, const std::string& out_path) {
   return 0;
 }
 
+// Patch a G-buffer pixel shader in place (Phase E), write the patched blob to
+// `out_path`, and re-validate (parse + signatures + hash self-consistency).
+int PatchOnePs(const std::string& path, const std::string& out_path) {
+  auto data = ReadBinaryFile(path);
+  if (data.empty()) {
+    std::cerr << "  ERROR: cannot read file\n";
+    return 1;
+  }
+  uint32_t new_hash = 0;
+  const bool patched = dxbc::PatchPerObjectPixelShader(data, &new_hash);
+  if (!patched) {
+    std::cout << "  NOT PATCHED (not a G-buffer PS or gate rejected)\n";
+    dxbc::DXBCHeader h;
+    std::vector<dxbc::ChunkInfo> chunks;
+    if (dxbc::ParseDXBC(data, h, chunks)) {
+      uint8_t d[16];
+      dxbc::ComputeDXBCHash(reinterpret_cast<const uint8_t*>(data.data()), data.size(), d);
+      std::cout << "  (valid DXBC, hash " << (std::memcmp(d, h.checksum, 16) == 0 ? "MATCH" : "MISMATCH") << ")\n";
+    }
+    return 0;  // not an error for non-G-buffer files
+  }
+
+  if (!WriteBinaryFile(out_path, data)) {
+    std::cerr << "  ERROR: cannot write " << out_path << "\n";
+    return 1;
+  }
+  std::cout << "  PATCHED: new CRC32=0x" << std::hex << new_hash << std::dec
+            << " size=" << data.size() << " -> " << out_path << "\n";
+
+  // Re-validate the patched blob.
+  dxbc::DXBCHeader h;
+  std::vector<dxbc::ChunkInfo> chunks;
+  if (!dxbc::ParseDXBC(data, h, chunks)) {
+    std::cout << "  ERROR: patched blob fails ParseDXBC\n";
+    return 1;
+  }
+  uint8_t d[16];
+  dxbc::ComputeDXBCHash(reinterpret_cast<const uint8_t*>(data.data()), data.size(), d);
+  const bool hash_ok = std::memcmp(d, h.checksum, 16) == 0;
+  std::cout << "  reparse: OK hash=" << (hash_ok ? "SELF-CONSISTENT" : "MISMATCH (BUG)") << "\n";
+
+  // Show the ISGN TEXCOORD5 + OSGN SV_TARGET3 entries.
+  for (const char* name : {"ISGN", "OSGN"}) {
+    if (const dxbc::ChunkInfo* sigc = dxbc::FindChunk(chunks, name)) {
+      std::vector<dxbc::SignatureEntry> sig;
+      if (dxbc::ParseSignature(
+              reinterpret_cast<const uint8_t*>(data.data()) + sigc->offset + dxbc::kChunkHeaderSize,
+              sigc->size, sig)) {
+        std::cout << "  " << name << " now " << sig.size() << " entries:";
+        for (const auto& e : sig) {
+          std::cout << " \"" << e.name << (e.semantic_index ? std::to_string(e.semantic_index) : "")
+                    << "\"@v" << e.register_index;
+        }
+        std::cout << "\n";
+      }
+    }
+  }
+
+  // Show the injected block (last instructions before ret).
+  const dxbc::ChunkInfo* shex = dxbc::FindChunk(chunks, "SHEX");
+  if (!shex) shex = dxbc::FindChunk(chunks, "SHDR");
+  if (shex) {
+    std::vector<dxbc::Instruction> insns;
+    if (dxbc::IterateInstructions(
+            reinterpret_cast<const uint8_t*>(data.data()) + shex->offset + dxbc::kChunkHeaderSize,
+            shex->size, insns)) {
+      std::cout << "  SHEX instr count=" << insns.size() << " (last 10):\n";
+      size_t start = insns.size() > 10u ? insns.size() - 10u : 0u;
+      for (size_t i = start; i < insns.size(); ++i) {
+        std::cout << "    " << NameOfOpcode(insns[i].opcode) << "\n";
+      }
+    }
+  }
+  return 0;
+}
+
 int RunOne(const std::string& path, bool roundtrip, bool dump) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
@@ -548,6 +624,7 @@ int main(int argc, char** argv) {
   bool dump = false;
   bool emittest = false;
   bool patch = false;
+  bool patchps = false;
   std::string patch_out;
   std::vector<std::string> paths;
   for (int i = 1; i < argc; ++i) {
@@ -560,6 +637,8 @@ int main(int argc, char** argv) {
       emittest = true;
     } else if (arg == "--patch") {
       patch = true;
+    } else if (arg == "--patchps") {
+      patchps = true;
     } else if (arg == "--out") {
       if (i + 1 < argc) patch_out = argv[++i];
     } else {
@@ -570,11 +649,13 @@ int main(int argc, char** argv) {
   if (paths.empty() && !emittest) {
     std::cerr << "USAGE: dxbc_test.exe <path-to.cso> [more.cso ...] [--roundtrip] [--dump]\n";
     std::cerr << "       dxbc_test.exe --patch [<out.cso>] <in.cso>\n";
+    std::cerr << "       dxbc_test.exe --patchps [<out.cso>] <in.cso>\n";
     std::cerr << "  Parses DXBC blobs, prints signatures/RDEF/SHEX, verifies the MD5\n";
     std::cerr << "  checksum, and (with --roundtrip) tests signature insertion.\n";
     std::cerr << "  --dump prints every SHEX instruction's raw dwords + decode.\n";
     std::cerr << "  --emittest prints the emitter-built injected block (no files needed).\n";
     std::cerr << "  --patch patches a skinned VS (generic Phase B) and writes out.cso.\n";
+    std::cerr << "  --patchps patches a G-buffer PS (Phase E) and writes out.cso.\n";
     return 1;
   }
 
@@ -590,6 +671,15 @@ int main(int argc, char** argv) {
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
     int rc = PatchOne(in, out);
+    std::cout << "\n";
+    return rc;
+  }
+
+  if (patchps && !paths.empty()) {
+    std::string in = paths[0];
+    std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
+    std::cout << "=== " << in << " ===\n";
+    int rc = PatchOnePs(in, out);
     std::cout << "\n";
     return rc;
   }

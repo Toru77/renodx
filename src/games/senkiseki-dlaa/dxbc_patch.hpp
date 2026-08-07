@@ -643,6 +643,16 @@ inline void EmitMaxImm1(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t d
   EmitImm1(out, imm_bits);
 }
 
+// div dst, src0, src1  (opcode 14, len 7)
+inline void EmitDiv(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_mask,
+                    uint32_t s0_reg, uint32_t s0_swizzle, uint32_t s1_reg,
+                    uint32_t s1_swizzle) {
+  EmitOpcode(out, OP_DIV, 7u);
+  EmitTempDst(out, dst_reg, dst_mask);
+  EmitTempSrc(out, s0_reg, s0_swizzle);
+  EmitTempSrc(out, s1_reg, s1_swizzle);
+}
+
 // min dst, src, l(imm) (opcode 51, len 7)
 inline void EmitMinImm1(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_mask,
                         uint32_t s0_reg, uint32_t s0_swizzle, uint32_t imm_bits) {
@@ -739,6 +749,14 @@ inline void EmitDclResourceStructured(std::vector<uint32_t>& out, uint32_t slot,
 inline void EmitDclOutput(std::vector<uint32_t>& out, uint32_t reg) {
   out.push_back(EncodeOpcode(OP_DCL_OUTPUT) | EncodeInstructionLength(3u));
   out.push_back(0x001020F2u);
+  out.push_back(reg);
+}
+
+// dcl_input_ps vN.xyzw  (opcode 98, len 3; interpolation LINEAR = 2 in bits
+// [13:11] — verified bytes 0x03001062 0x001010F2 <N> from a compiled ps_4_1)
+inline void EmitDclInputPs(std::vector<uint32_t>& out, uint32_t reg) {
+  out.push_back(EncodeOpcode(OP_DCL_INPUT_PS) | EncodeInstructionLength(3u) | (2u << 11u));
+  out.push_back(0x001010F2u);
   out.push_back(reg);
 }
 
@@ -1652,6 +1670,217 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     out_info->outline_applied = outline;  // true only if emitted + bounds-confirmed
     out_info->needs_no_binding = no_bind;
   }
+  return true;
+}
+
+// ── Generic per-object-motion PS patcher (Phase E core) ──
+// Detects a G-buffer pixel shader (>=3 SV_TARGET outputs), appends a TEXCOORD5
+// input (prevClip from the paired patched char VS) + an SV_TARGET3 output (the
+// appended 32-bit motion RTV), and injects
+//   o3 = (prevNDC.x*0.5+0.5, prevNDC.y*0.5+0.5, 0, 1),  prevNDC = vN.xy / max(vN.w, 0.001)
+// before the trailing ret. Written UNCONDITIONALLY (no b13 read): the motion
+// RTV is only bound on char draws (MaybeAppendMotionRtv), so o3 is discarded
+// whenever per-object motion is off. Mirrors the VS patch's chunk/STAT/hash
+// fixups. No per-hash lists — this replaces the 22 hand-patched boot PSs.
+inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* out_new_hash) {
+  DXBCHeader header;
+  std::vector<ChunkInfo> chunks;
+  if (!ParseDXBC(data, header, chunks)) return false;
+  const ChunkInfo* isgn = FindChunk(chunks, "ISGN");
+  const ChunkInfo* osgn = FindChunk(chunks, "OSGN");
+  const ChunkInfo* shex = FindChunk(chunks, "SHEX");
+  if (!shex) shex = FindChunk(chunks, "SHDR");
+  if (!isgn || !osgn || !shex) return false;
+
+  std::vector<SignatureEntry> is, os;
+  if (!ParseSignature(data, *isgn, is) || !ParseSignature(data, *osgn, os)) return false;
+
+  // Scope gate: G-buffer PS with EXACTLY outputs at registers 0/1/2 (3
+  // SV_TARGETs). Skip if SV_TARGET3 already exists (the appended motion RTV
+  // lives at index 3) or if the PS already reads TEXCOORD5 (would collide with
+  // our prevClip input). Requiring max_out == 2 keeps the appended output at
+  // register 3 with semantic index 3 (the RTV index MaybeAppendMotionRtv uses).
+  uint32_t max_out = 0;
+  uint32_t sv_target_count = 0;
+  for (const auto& e : os) {
+    if (e.name == "SV_TARGET") {
+      ++sv_target_count;
+      if (e.semantic_index == 3u) return false;  // SV_TARGET3 already taken
+    }
+    if (e.register_index > max_out) max_out = e.register_index;
+  }
+  if (max_out != 2u || sv_target_count < 3u) return false;  // not a 3-RT G-buffer PS
+  bool has_tex5 = false;
+  uint32_t max_in = 0;
+  for (const auto& e : is) {
+    if (e.name == "TEXCOORD" && e.semantic_index == 5u) has_tex5 = true;
+    if (e.register_index > max_in) max_in = e.register_index;
+  }
+  if (has_tex5) return false;
+
+  const uint32_t new_in_reg = max_in + 1u;   // free input register (vN)
+  const uint32_t new_out_reg = max_out + 1u; // = 3 for G-buffer PSs
+
+  // Scan SHEX.
+  const uint8_t* shex_data =
+      reinterpret_cast<const uint8_t*>(data.data()) + shex->offset + kChunkHeaderSize;
+  ShexScan scan;
+  if (!ScanShex(shex_data, shex->size, scan)) return false;
+  if (!scan.has_ret) return false;
+
+  // Allocate temps: base = declared count or max used + 1.
+  const uint32_t temp_base = std::max(scan.has_temps ? scan.dcl_temps : 0u, scan.max_temp + 1u);
+  const uint32_t rT = temp_base;        // prevClip scratch
+  const uint32_t rHalf = temp_base + 1u; // 0.5 constant
+  const uint32_t new_dcl_temps = temp_base + 2u;
+
+  // Build injected declaration tokens: dcl_input_ps vN.xyzw + dcl_output oM.
+  std::vector<uint32_t> decls;
+  EmitDclInputPs(decls, new_in_reg);
+  EmitDclOutput(decls, new_out_reg);
+
+  // Build injected body tokens (mirrors the hand-patched boot PS):
+  //   rT = vN; rT.w = max(rT.w, 0.001); rT.xy = rT.xy / rT.w
+  //   rHalf = (0.5,0.5); rT.xy = rT.xy*0.5 + 0.5
+  //   rT.z = 0; rT.w = 1; o3 = rT
+  std::vector<uint32_t> body;
+  EmitMovInput(body, rT, 0xFu, new_in_reg, 0xFu);                  // mov rT.xyzw, vN.xyzw
+  EmitMaxImm1(body, rT, 0x8u, rT, kSwizzleWWWW, 0x3A83126Fu);      // max rT.w, rT.w, l(0.001)
+  EmitDiv(body, rT, 0x3u, rT, kSwizzleXYZW, rT, kSwizzleWWWW);     // div rT.xy, rT.xy, rT.ww
+  EmitMovImm4(body, rHalf, 0x3u, 0x3F000000u, 0x3F000000u, 0u, 0u); // rHalf.xy = (0.5,0.5)
+  EmitMad(body, rT, 0x3u, rT, kSwizzleXYZW, rHalf, kSwizzleXYZW, rHalf,
+          kSwizzleXYZW);                                          // rT.xy = rT.xy*0.5+0.5
+  EmitMovImm1(body, rT, 0x4u, 0u);                                 // rT.z = 0
+  EmitMovImm1(body, rT, 0x8u, 0x3F800000u);                        // rT.w = 1.0 (valid flag)
+  EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);              // mov oM.xyzw, rT.xyzw
+
+  // ── Rebuild the SHEX chunk token stream (same as the VS patch) ──
+  const uint32_t* tokens = reinterpret_cast<const uint32_t*>(shex_data + 8u);
+  const uint32_t old_token_dwords = (shex->size - 8u) / 4u;
+  uint32_t first_non_decl_dw = scan.first_non_decl / 4u - 2u;  // rel. to token stream
+  uint32_t ret_dw = scan.ret_offset / 4u - 2u;
+
+  std::vector<uint32_t> new_tokens(tokens, tokens + old_token_dwords);
+  bool patched_temps = false;
+  if (scan.has_temps) {
+    for (uint32_t i = 0; i < first_non_decl_dw;) {
+      const uint32_t op = new_tokens[i] & 0x7FFu;
+      const uint32_t len = new_tokens[i] >> 24u;
+      if (op == OP_DCL_TEMPS && len >= 2u) {
+        new_tokens[i + 1u] = new_dcl_temps;
+        patched_temps = true;
+        break;
+      }
+      i += len;
+    }
+  }
+  if (!patched_temps) {
+    std::vector<uint32_t> tmp;
+    EmitDclTemps(tmp, new_dcl_temps);
+    new_tokens.insert(new_tokens.begin(), tmp.begin(), tmp.end());
+    first_non_decl_dw += (uint32_t)tmp.size();
+    ret_dw += (uint32_t)tmp.size();
+  }
+
+  // Splice: decls (old) + new decls + body (old) + new body + ret..
+  std::vector<uint32_t> assembled;
+  assembled.reserve(new_tokens.size() + decls.size() + body.size());
+  assembled.insert(assembled.end(), new_tokens.begin(), new_tokens.begin() + first_non_decl_dw);
+  assembled.insert(assembled.end(), decls.begin(), decls.end());
+  assembled.insert(assembled.end(), new_tokens.begin() + first_non_decl_dw,
+                   new_tokens.begin() + ret_dw);
+  assembled.insert(assembled.end(), body.begin(), body.end());
+  assembled.insert(assembled.end(), new_tokens.begin() + ret_dw, new_tokens.end());
+
+  // ── Assemble a fresh blob with the grown SHEX chunk ──
+  const uint32_t new_shex_size = 8u + (uint32_t)assembled.size() * 4u;
+  const uint32_t delta = new_shex_size - shex->size;
+  const uint32_t new_file_size = (uint32_t)data.size() + delta;
+
+  std::vector<std::byte> out;
+  out.reserve(new_file_size);
+  out.insert(out.end(), data.begin(), data.begin() + 32);
+  std::memcpy(out.data() + 24u, &new_file_size, 4);
+  for (const auto& c : chunks) {
+    uint32_t off = c.offset;
+    if (c.offset > shex->offset) off += delta;
+    std::byte* p = reinterpret_cast<std::byte*>(&off);
+    out.insert(out.end(), p, p + 4);
+  }
+  for (const auto& c : chunks) {
+    if (c.offset == shex->offset) {
+      out.insert(out.end(), data.begin() + c.offset, data.begin() + c.offset + 4);  // name
+      std::byte* szp = reinterpret_cast<std::byte*>(const_cast<uint32_t*>(&new_shex_size));
+      out.insert(out.end(), szp, szp + 4);
+      out.insert(out.end(), data.begin() + c.offset + 8, data.begin() + c.offset + 12);
+      const uint32_t new_count = (uint32_t)assembled.size() + 2u;
+      std::byte* cp = reinterpret_cast<std::byte*>(const_cast<uint32_t*>(&new_count));
+      out.insert(out.end(), cp, cp + 4);
+      const std::byte* tb = reinterpret_cast<const std::byte*>(assembled.data());
+      out.insert(out.end(), tb, tb + assembled.size() * 4u);
+    } else {
+      const uint32_t clen = 8u + c.size;
+      out.insert(out.end(), data.begin() + c.offset, data.begin() + c.offset + clen);
+    }
+  }
+
+  // ── Append the ISGN input entry (TEXCOORD5, free input register) ──
+  {
+    DXBCHeader h2;
+    std::vector<ChunkInfo> chunks2;
+    if (!ParseDXBC(out, h2, chunks2)) return false;
+    const ChunkInfo* isgn2 = FindChunk(chunks2, "ISGN");
+    if (!isgn2) return false;
+    // rw_mask 0x0B mirrors the hand-patched PS ISGN entry (reads .xyw).
+    if (!AppendSignatureEntry(out, *isgn2, "TEXCOORD", 5u, new_in_reg, 0xFu, 0x0Bu,
+                              3u /* FLOAT32 */))
+      return false;
+  }
+  // ── Append the OSGN output entry (SV_TARGET3) ──
+  {
+    DXBCHeader h2;
+    std::vector<ChunkInfo> chunks2;
+    if (!ParseDXBC(out, h2, chunks2)) return false;
+    const ChunkInfo* osgn2 = FindChunk(chunks2, "OSGN");
+    if (!osgn2) return false;
+    if (!AppendSignatureEntry(out, *osgn2, "SV_TARGET", 3u, new_out_reg, 0xFu, 0x0u,
+                              3u /* FLOAT32 */))
+      return false;
+  }
+
+  // ── Fix the STAT chunk (instruction + temp counts) ──
+  {
+    DXBCHeader h2;
+    std::vector<ChunkInfo> chunks2;
+    if (ParseDXBC(out, h2, chunks2)) {
+      if (const ChunkInfo* stat = FindChunk(chunks2, "STAT")) {
+        if (stat->size >= 8u) {
+          uint8_t* stat_data =
+              reinterpret_cast<uint8_t*>(out.data()) + stat->offset + kChunkHeaderSize;
+          uint32_t new_instr = 0u;
+          size_t i = 0u;
+          while (i < assembled.size()) {
+            const uint32_t t = assembled[i];
+            const uint32_t len = t >> 24u;
+            if (len == 0u) break;
+            if (!IsDeclOpcode(t & 0x7FFu)) ++new_instr;
+            i += len;
+          }
+          std::memcpy(stat_data + 0u, &new_instr, 4);
+          std::memcpy(stat_data + 4u, &new_dcl_temps, 4);
+        }
+      }
+    }
+  }
+
+  WriteDXBCHash(out);
+  data = std::move(out);
+  uint32_t new_hash = 0u;
+  {
+    const uint8_t* c = reinterpret_cast<const uint8_t*>(data.data());
+    new_hash = ComputeCRC32(c, data.size());
+  }
+  if (out_new_hash != nullptr) *out_new_hash = new_hash;
   return true;
 }
 

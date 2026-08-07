@@ -70,6 +70,21 @@ static float g_phaseb_no_output = 0.f;  // crash-bisection: injected block runs 
 static float g_phaseb_constant = 0.f;   // crash-bisection: minimal but o7 = (0,0,0,1) constant,
                                         // zero reads at all
 static float g_phaseb_dump = 0.f;     // evidence capture: write patched/original blobs + drawtrace to renodx-dev/dump/phaseb/
+// ── Shake-isolation diagnostics (addon-side floats, NOT in ShaderInjectData) ──
+static float g_phase_freeze_jitter = 0.f;  // DIAGNOSTIC: fix jitter at a CONSTANT value every frame (Halton disabled).
+                                          // If the Prev-Bone shake disappears with a fixed jitter, the error is the
+                                          // frame-to-frame jitter variation (compensation/timing mismatch), not the MVs.
+static float g_phase_mv_comp = 1.f;        // DIAGNOSTIC: per-object jitter subtraction in the velocity shader A/B.
+                                          // 1 = subtract the frame's jitter from per-object MVs (current behavior).
+                                          // 0 = don't compensate. If the character STOPS shaking with comp OFF, the
+                                          // character was never jittered (we were over-subtracting); if it still shakes,
+                                          // the character IS jittered and compensation isn't the cause.
+static float g_phase_mv_jittered = 0.f;   // DIAGNOSTIC (Test C): feed JITTERED MVs + MVJittered=1 so DLSS removes the
+                                          // jitter internally. The velocity shader then ADDS the jitter to the camera path
+                                          // (it is jitter-free by construction) to keep the whole buffer consistently jittered.
+static float g_phase_jitter_depth = 0.f;  // DIAGNOSTIC (friend's red flag #1): jitter the character's MAIN depth pass too,
+                                          // so DLSS sees color AND depth in the same jitter state. Only the character SHADOW
+                                          // VS stays unjittered (its consumer compares against the unjittered projection).
 
 // ── Descriptor table helpers ──
 constexpr uint32_t kTableParamCount = 6u;
@@ -178,6 +193,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // the game's original bytecode) and the NEW hash (CreateInputLayout re-fires
   // with the already-patched blob) are recorded so we never double-patch.
   std::unordered_set<uint32_t> patched_vs_hashes;
+  // Phase E: same skip-guard for the generic per-object-motion PS patcher
+  // (PatchPerObjectPixelShader). The patched PS needs NO draw-time binding — it
+  // reads prevClip (TEXCOORD5) via normal VS->PS semantic linkage and writes
+  // the appended o3/SV_TARGET3.
+  std::unordered_set<uint32_t> patched_ps_hashes;
   // Dynamic 64-byte native cbuffer holding prev_view_proj (the unjittered
   // previous-frame ViewProjection), bound to patched VSs' prevVP slot at draw.
   ID3D11Buffer* prev_vp_cb = nullptr;
@@ -365,6 +385,7 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   d->patched_bind_restore_pending = false;
   d->patched_vs_by_new_hash.clear();
   d->patched_vs_hashes.clear();
+  d->patched_ps_hashes.clear();
   d->resources_created = false;
 }
 
@@ -579,6 +600,14 @@ static const std::array<uint32_t, 4> DEPTH_VS_HASHES = {
 };
 
 static bool IsDepthVs(uint32_t hash) {
+  // DLAAPhaseJitterDepth (diagnostic): jitter the character's MAIN depth pass
+  // too so DLSS sees color AND depth in the same jitter state (friend's red
+  // flag #1). Only the character SHADOW VS (0xAA8821EC) stays unjittered — its
+  // consumer compares against the unjittered projection. Default (off): all
+  // depth VSs stay unjittered.
+  if (g_phase_jitter_depth > 0.5f) {
+    return hash == 0xAA8821ECu;
+  }
   for (uint32_t h : DEPTH_VS_HASHES) if (h == hash) return true;
   return false;
 }
@@ -1222,13 +1251,18 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
   bool want_jittered = !IsEffectPs(phash);
   // Scene draw on a tracked (source-patched) buffer: already jittered, leave it.
+  // EXCEPT depth_only buffers: those are the character's shared b0 (marked by
+  // the depth/shadow pass), whose upload the source patch left UNJITTERED — so
+  // the G-buffer draw must jitter it here, or the character rasterizes unjittered
+  // while the per-object velocity path subtracts jitter -> MV error -> shake.
   auto* rec = FindGlobalsRec(d, d->last_b0_buffer);
-  if (want_jittered && rec) return;
+  if (want_jittered && rec && !rec->depth_only) return;
   // Choose the VP to write: this buffer's own unjittered VP when known (effect
-  // un-jitter), else the global captured VP (jittered for untracked scene
-  // fallback, unjittered for untracked effect fallback).
+  // un-jitter / depth_only G-buffer jitter), else the global captured VP
+  // (jittered for untracked scene fallback, unjittered for untracked effect
+  // fallback).
   std::array<float, 16> vp = rec ? rec->unjittered_vp : d->globals_unjittered_vp;
-  if (want_jittered && !rec) {
+  if (want_jittered) {
     for (int i = 0; i < 4; ++i) {
       vp[i] += d->jitter_x * vp[12 + i];
       vp[4 + i] += d->jitter_y * vp[12 + i];
@@ -1237,9 +1271,10 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   dev->update_buffer_region(vp.data(), d->last_b0_buffer, 160ull, 64ull);
   if (shader_injection.dlaa_debug_logging > 0.5f) {
     LogThrottled("vp-write", reshade::log::level::info, 5u, 250u,
-                 "[DLAA] global: draw VP write buffer=0x%llX size=%llu jittered=%d ps=0x%08X",
+                 "[DLAA] global: draw VP write buffer=0x%llX size=%llu jittered=%d depth_only=%d ps=0x%08X",
                  (unsigned long long)d->last_b0_buffer.handle,
-                 (unsigned long long)rd.buffer.size, (int)want_jittered, phash);
+                 (unsigned long long)rd.buffer.size, (int)want_jittered,
+                 (int)(rec && rec->depth_only), phash);
   }
 }
 
@@ -1995,6 +2030,13 @@ static void UpdateJitter(DeviceData* d) {
     // rasterization-level jitter is plainly visible.
     d->jitter_x = 8.f * 2.f / d->viewport_w;
     d->jitter_y = 0.f;
+  } else if (g_phase_freeze_jitter > 0.5f) {
+    // Freeze: CONSTANT sub-pixel jitter every frame (Halton disabled). DLSS
+    // handles a fixed offset fine; if the character's shake disappears with a
+    // fixed jitter, the error is the per-frame jitter VARIATION being mishandled
+    // (compensation/timing mismatch), not the motion vectors themselves.
+    d->jitter_x = 0.25f * 2.f / d->viewport_w;
+    d->jitter_y = -0.25f * 2.f / d->viewport_h;
   } else if (shader_injection.dlaa_jitter_enabled < 0.5f) {
     d->jitter_x = 0.f;
     d->jitter_y = 0.f;
@@ -2035,7 +2077,7 @@ static void UpdateJitter(DeviceData* d) {
 //   c[0..15] = prevViewProj, c[16..31] = curViewProjInv,
 //   c[32..35] = params0 (vp_w, vp_h, velocity_scale, debug_view),
 //   c[36..39] = params1 (jitter_x, jitter_y, per_object_motion, zero_mv),
-//   c[40..43] = params2 (mv_threshold, mv_direction, 0, 0)
+//   c[40..43] = params2 (mv_threshold, mv_direction, mv_mode, 0)
 static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
   std::array<float, 48> c = {};
   if (!d) return c;
@@ -2049,6 +2091,11 @@ static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
   c[39] = shader_injection.dlaa_zero_mv;
   c[40] = shader_injection.dlaa_mv_threshold;
   c[41] = shader_injection.dlaa_mv_direction;
+  // params2.z = MV jitter mode:
+  //   0 = MVJittered=0 + no per-object subtraction (Test B)
+  //   1 = MVJittered=0 + subtract per-object jitter (Test A, current)
+  //   2 = MVJittered=1 + no subtract; camera path adds jitter (Test C)
+  c[42] = (g_phase_mv_jittered > 0.5f) ? 2.f : g_phase_mv_comp;
   c[43] = shader_injection.dlaa_exclude_effects;  // params2.w — mask effects out of DLAA
   return c;
 }
@@ -2133,8 +2180,10 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   // Sync dlss.hpp globals from settings (preset & enable gates)
   senkiseki3::dlss::dlss_enabled = shader_injection.dlaa_enabled;
   senkiseki3::dlss::dlss_render_preset = shader_injection.dlaa_preset;
-  // MVs are jitter-subtracted in the velocity shader, so MVJittered stays off.
-  senkiseki3::dlss::dlss_motion_vectors_jittered = 0.f;
+  // MVJittered A/B/C (DLAAPhaseMVJittered): off = MVs are jitter-subtracted in
+  // the velocity shader (MVJittered=0, Tests A/B); on = MVs are fed JITTERED and
+  // DLSS removes the jitter internally (MVJittered=1, Test C).
+  senkiseki3::dlss::dlss_motion_vectors_jittered = (g_phase_mv_jittered > 0.5f) ? 1.f : 0.f;
   senkiseki3::dlss::dlss_debug_logging = shader_injection.dlaa_debug_logging;
   senkiseki3::dlss::dlss_flag_is_hdr = shader_injection.dlaa_flag_is_hdr;
   senkiseki3::dlss::dlss_flag_depth_inverted = shader_injection.dlaa_flag_depth_inverted;
@@ -2595,6 +2644,35 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Replicate the GameEdgeParameters outline offset in the patched prevClip. Disable to isolate crashes to the outline block.",
         .labels = {"Off","On"},
     },
+    // ── Shake-isolation diagnostics ──
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseFreezeJitter", .binding = &g_phase_freeze_jitter,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Freeze Jitter", .section = "Antialiasing",
+        .tooltip = "DIAGNOSTIC: replace the Halton sequence with a CONSTANT sub-pixel jitter (+0.25/-0.25px) every frame. If the Prev-Bone shake disappears with a fixed jitter, the error is the frame-to-frame jitter VARIATION (compensation/timing mismatch), not the MVs themselves.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseMVComp", .binding = &g_phase_mv_comp,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase: MV Jitter Comp", .section = "Antialiasing",
+        .tooltip = "DIAGNOSTIC: per-object jitter subtraction in the velocity shader A/B (Test A/B with MVJittered off). Off: if the character STOPS shaking, the character was never jittered (we were over-subtracting); if it still shakes, the character IS jittered and compensation isn't the cause.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseMVJittered", .binding = &g_phase_mv_jittered,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: MVJittered=1 (Test C)", .section = "Antialiasing",
+        .tooltip = "DIAGNOSTIC (Test C): feed JITTERED MVs and set MVJittered=1 so DLSS removes the jitter internally (instead of subtracting in the shader). The camera path then ADDS the jitter to stay consistent. Use with Phase: MV Jitter Comp = Off.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseJitterDepth", .binding = &g_phase_jitter_depth,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Jitter Character Depth", .section = "Antialiasing",
+        .tooltip = "DIAGNOSTIC: jitter the character's MAIN depth pass too, so DLSS's color and depth are in the SAME jitter state (currently color is jittered but depth is unjittered). Only the shadow VS stays unjittered. Watch for the character shadow moving.",
+        .labels = {"Off","On"},
+    },
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseBNoBind", .binding = &g_phaseb_no_bind,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -2697,33 +2775,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x77355EED),  // forest impostor billboard (sky)
     CustomShaderEntry(0xC8FE8FC4),  // transparent texture
     CustomShaderEntry(0x7D3553A7),  // particle
-    // Character G-buffer PS (paired with the main skinned char VS 0x0D5DABC6):
-    // writes per-object prevNDC into o3 (SV_TARGET3) of the appended 16-bit
-    // motion RTV — o0/o1/o2 (game MRTs) are untouched. The old 0x0E8BC215
-    // overwrote MRT2 (o2 = encoded depth) which corrupted other objects.
-    CustomShaderEntry(0xFEA2B509),
-    // Other character-part G-buffer PSs — same o3 per-object-motion patch.
-    CustomShaderEntry(0x159A34A3),  // pairs with 0xB662509A
-    CustomShaderEntry(0x1682CB9B),  // pairs with 0xF8C9B92D
-    CustomShaderEntry(0x41C27C38),  // pairs with 0xC8F5D77B
-    CustomShaderEntry(0xBE1FC4AC),  // pairs with 0x3641D444
-    CustomShaderEntry(0x59F0F50E),  // pairs with 0x4A030C25
-    CustomShaderEntry(0xA4DC2F84),  // pairs with 0x5C1A50E5
-    CustomShaderEntry(0x7542CBC4),  // pairs with 0xB1C24E2A
-    CustomShaderEntry(0x0E03514A),  // pairs with 0xB2F338C8
-    CustomShaderEntry(0x1DE48D94),  // pairs with 0x5E5AE3FB (outline)
-    CustomShaderEntry(0x2029B1A4),  // pairs with 0xF426BC1C
-    CustomShaderEntry(0x87986FAA),  // pairs with 0xBCB30859
-    CustomShaderEntry(0x2B3C9980),  // pairs with 0x0045297D
-    CustomShaderEntry(0x08F6C8F5),  // pairs with 0x59001D8E
-    CustomShaderEntry(0x38BA428E),  // pairs with 0x63C867BA
-    CustomShaderEntry(0xE14A638B),  // pairs with 0xB0A80DEF (outline)
-    CustomShaderEntry(0x43C1531A),  // pairs with 0x1DF2E2BB
-    CustomShaderEntry(0xF280500B),  // pairs with 0x38BCCCA0
-    CustomShaderEntry(0xC04F07D9),  // pairs with 0x6285DCF3
-    CustomShaderEntry(0xEA7B3E27),  // pairs with 0xFC588329
-    CustomShaderEntry(0xDD5A9D03),  // pairs with 0x5AA04209
-    CustomShaderEntry(0x055CFB63),  // pairs with 0x835760A3 (outline)
+    // ── Phase E: per-object-motion PSs are NO LONGER hand-replaced ──
+    // The 22 char G-buffer PSs (0xFEA2B509, 0x159A34A3, 0x1682CB9B, ...,
+    // 0x055CFB63) were removed from custom_shaders: the generic DXBC patcher
+    // (OnCreatePipeline -> PatchPerObjectPixelShader) now appends the
+    // TEXCOORD5 input + SV_TARGET3 output to ANY G-buffer PS, writing
+    // prevNDC+valid-flag to the appended 32-bit motion RTV. No hashes, no
+    // per-shader HLSL — same as the VS patcher. (The old boot PS .hlsl files
+    // remain on disk as reference but are no longer injected.)
     // Effect PS replacements: write SV_TARGET1 = 1.0 into the appended
     // effect-mask RT (Exclude Effects toggle) so the velocity compute can
     // opt these pixels out of DLAA (invalid-MV -> current-frame fallback).
@@ -2851,6 +2910,48 @@ static bool OnCreatePipeline(
              (int)info.outline_applied, (int)info.needs_no_binding,
              (int)options.minimal_patch, (int)options.test_no_output,
              (int)options.test_constant_output);
+    reshade::log::message(reshade::log::level::info, buf);
+  }
+
+  // ── Phase E: generic per-object-motion PS patcher ──
+  // Runs on the pixel_shader subobject (create_pipeline fires once per stage;
+  // the PS is a separate subobject from the VS). Appends TEXCOORD5 input +
+  // SV_TARGET3 output to any G-buffer PS (>=3 SV_TARGET outputs) and injects
+  // the prevNDC->o3 write before ret. The PS needs NO draw-time binding: it
+  // reads prevClip (TEXCOORD5) via normal VS->PS semantic linkage and writes
+  // the appended o3; MaybeAppendMotionRtv only binds the motion RTV on char
+  // draws, so o3 is discarded elsewhere. Skip-guard: hand-replaced shaders
+  // (effect masks, FXAA, composite) and already-patched hashes.
+  for (uint32_t i = 0; i < subobject_count; ++i) {
+    const auto& sub = subobjects[i];
+    if (sub.type != reshade::api::pipeline_subobject_type::pixel_shader) continue;
+    if (sub.count != 1u) continue;
+    auto* desc = static_cast<reshade::api::shader_desc*>(sub.data);
+    if (!desc || desc->code_size == 0u) continue;
+    const uint32_t hash = renodx::utils::hash::ComputeCRC32(
+        static_cast<const uint8_t*>(desc->code), desc->code_size);
+    if (d->patched_ps_hashes.contains(hash)) continue;
+    if (custom_shaders.contains(hash)) continue;
+
+    std::vector<std::byte> blob;
+    blob.resize(desc->code_size);
+    std::memcpy(blob.data(), desc->code, desc->code_size);
+    uint32_t new_hash = 0u;
+    if (!senkiseki3::dxbc::PatchPerObjectPixelShader(blob, &new_hash)) continue;
+    if (new_hash == 0u || new_hash == hash) continue;
+
+    desc->code = malloc(blob.size());
+    if (!desc->code) continue;
+    std::memcpy(const_cast<void*>(desc->code), blob.data(), blob.size());
+    desc->code_size = blob.size();
+
+    d->patched_ps_hashes.insert(hash);     // original
+    d->patched_ps_hashes.insert(new_hash); // patched
+    changed = true;
+
+    char buf[160];
+    snprintf(buf, sizeof(buf), "[DLAA] phaseE: patched PS 0x%08X -> 0x%08X (%u B)",
+             hash, new_hash, (uint32_t)blob.size());
     reshade::log::message(reshade::log::level::info, buf);
   }
   return changed;

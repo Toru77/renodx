@@ -19,7 +19,9 @@
 //   c[4..7]  = curViewProjInverse (4x4 row-major)
 //   c[8]     = VP_WIDTH, VP_HEIGHT, VELOCITY_SCALE, DEBUG_VIEW
 //   c[9]     = JITTER_X(NDC), JITTER_Y(NDC), PER_OBJECT_MOTION, ZERO_MV
-//   c[10]    = MV_THRESHOLD(px), MV_DIRECTION(flip), 0, EXCLUDE_EFFECTS
+//   c[10]    = MV_THRESHOLD(px), MV_DIRECTION(flip), MV_MODE, EXCLUDE_EFFECTS
+//              MV_MODE: 0=MVJittered=0 no per-object subtract (B), 1=MVJittered=0
+//              subtract (A, current), 2=MVJittered=1 whole buffer jittered (C)
 //
 // SPDX-License-Identifier: MIT
 
@@ -33,7 +35,7 @@ cbuffer cb_push : register(b13) {
   float4x4 curViewProjInv;
   float4 params0;   // x=vp_w, y=vp_h, z=velocity_scale, w=debug_view
   float4 params1;   // x=jitter_x(NDC), y=jitter_y(NDC), z=per_object_motion, w=zero_mv
-  float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=0, w=0
+  float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=mv_mode, w=0
 };
 
 [numthreads(8, 8, 1)]
@@ -99,7 +101,22 @@ void main(uint2 pix : SV_DispatchThreadID)
   //    (+jitter_x*w/2, -jitter_y*h/2 px). Subtract it there only.
   // DLSS receives the same jitter via InJitterOffset (MVJittered=0).
   float2 vel = (curPx - prevPx) * params0.z;
-  if (hasObjectMotion) {
+  // params2.z = MV jitter mode (DLAAPhaseMVJittered / DLAAPhaseMVComp):
+  //   0 = MVJittered=0 + no per-object subtraction (Test B)
+  //   1 = MVJittered=0 + subtract per-object jitter (Test A, current)
+  //   2 = MVJittered=1 + whole buffer JITTERED: per-object keeps its jitter
+  //       (no subtract) and the camera path ADDS the jitter, so DLSS removes
+  //       it internally via MVJittered=1.
+  if (params2.z > 1.5f) {
+    // MVJittered=1 (Test C): the camera path is jitter-free by construction
+    // (unjittered matrices round trip) — add the current jitter so it matches
+    // the per-object jittered MVs and the whole buffer is consistently jittered.
+    if (!hasObjectMotion) {
+      vel.x += params1.x * params0.x * 0.5f;
+      vel.y -= params1.y * params0.y * 0.5f;
+    }
+  } else if (hasObjectMotion && params2.z > 0.5f) {
+    // MVJittered=0 (Test A): subtract the frame's jitter from per-object MVs.
     vel.x -= params1.x * params0.x * 0.5f;
     vel.y += params1.y * params0.y * 0.5f;
   }
