@@ -27,6 +27,11 @@ inline float dlss_debug_logging = 0.f;
 inline float dlss_flag_is_hdr = 0.f;
 inline float dlss_flag_depth_inverted = 1.f;
 inline float dlss_flag_auto_exposure = 0.f;
+// DLSS output texture format. Default R8G8B8A8 (composite-identical). The
+// DLAAHdrFloatOut toggle switches it to R16G16B16A16_FLOAT so the HDR mod's
+// tone map receives UNCLAMPED highlight values (8-bit UNORM clamps before the
+// tone map -> clipping/banding).
+inline DXGI_FORMAT dlss_output_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 // ── Instance ──
 struct InstanceData {
@@ -394,7 +399,7 @@ inline bool EnsureFeature(ID3D11DeviceContext* command_list, uint32_t width, uin
 
 inline bool InitDLSS(ID3D11Device* device, uint32_t width, uint32_t height) {
   if (!EnsureNgxInitialized(device)) return false;
-  DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  DXGI_FORMAT format = dlss_output_format;
   return EnsureOutputTexture(width, height, format);
 }
 
@@ -422,9 +427,9 @@ inline bool EvaluateDLSS(ID3D11DeviceContext* command_list,
   const int render_preset = GetRenderPresetValue();
   const int feature_flags = GetFeatureFlags();
 
-  D3D11_TEXTURE2D_DESC output_desc;
-  static_cast<ID3D11Texture2D*>(output_color)->GetDesc(&output_desc);
-  const DXGI_FORMAT output_format = output_desc.Format;
+  // DLSS output format: the float-output toggle (DLAAHdrFloatOut) overrides the
+  // default R8G8B8A8 so highlights survive the HDR mod's tone map unclamped.
+  const DXGI_FORMAT output_format = dlss_output_format;
 
   if (!EnsureOutputTexture(width, height, output_format)) return false;
   if (!EnsureFeature(command_list, width, height, output_format, render_preset, feature_flags)) return false;

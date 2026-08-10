@@ -59,6 +59,7 @@ ShaderInjectData shader_injection = {
     .dlaa_phase0_logging = 0.f,
     .dlaa_hdr_decode = 0.f,
     .dlaa_hdr_inject = 0.f,
+    .dlaa_hdr_float_out = 0.f,
 };
 
 // ── Phase B isolation toggles (addon-side floats, NOT in ShaderInjectData —
@@ -428,6 +429,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Native MV-debug resources (bypass ReShade pipeline creation; display via NGX output)
   ID3D11ComputeShader* dbg_cs = nullptr;
   ID3D11UnorderedAccessView* dbg_out_uav = nullptr;
+  DXGI_FORMAT dbg_out_uav_fmt = DXGI_FORMAT_UNKNOWN;  // ngx format the UAV was created for
   ID3D11ShaderResourceView* dbg_vel_srv = nullptr;
   ID3D11ShaderResourceView* dbg_color_srv = nullptr;
   ID3D11ShaderResourceView* dbg_prev_srv = nullptr;
@@ -630,13 +632,16 @@ static bool EnsureDebugNative(reshade::api::device* dev, DeviceData* d) {
     if (FAILED(nd->CreateComputeShader(__mv_debug.data(), static_cast<SIZE_T>(__mv_debug.size()), nullptr, &d->dbg_cs)))
       return false;
   }
-  if (!d->dbg_out_uav) {
+  if (!d->dbg_out_uav || d->dbg_out_uav_fmt != senkiseki3::dlss::ngx.output_format) {
+    // Recreate when the NGX output format changes (float-output toggle).
+    if (d->dbg_out_uav) { d->dbg_out_uav->Release(); d->dbg_out_uav = nullptr; }
     D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {};
-    uavd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    uavd.Format = senkiseki3::dlss::ngx.output_format;
     uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     uavd.Texture2D.MipSlice = 0;
     if (FAILED(nd->CreateUnorderedAccessView(senkiseki3::dlss::ngx.output_texture.Get(), &uavd, &d->dbg_out_uav)))
       return false;
+    d->dbg_out_uav_fmt = senkiseki3::dlss::ngx.output_format;
   }
   if (!d->dbg_vel_srv) {
     D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
@@ -769,15 +774,27 @@ static bool EnsureHdrConversion(reshade::api::device* dev, DeviceData* d, uint32
     if (FAILED(nd->CreateShaderResourceView(d->encoded_scratch, &srvd, &d->encoded_scratch_srv))) return false;
     if (FAILED(nd->CreateUnorderedAccessView(d->encoded_scratch, &uavd, &d->encoded_scratch_uav))) return false;
   }
-  // CPU staging for the NGX-output luma diagnostic (matches ngx output format).
-  if (!d->ngx_dump_staging) {
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_STAGING;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->ngx_dump_staging))) return false;
+  // CPU staging for the NGX-output luma diagnostic — match the ngx output
+  // format (r8g8b8a8, or r16g16b16a16_float when DLAAHdrFloatOut is on).
+  {
+    DXGI_FORMAT ngx_fmt = senkiseki3::dlss::ngx.output_format;
+    if (ngx_fmt == DXGI_FORMAT_UNKNOWN) ngx_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (d->ngx_dump_staging) {
+      D3D11_TEXTURE2D_DESC td = {};
+      d->ngx_dump_staging->GetDesc(&td);
+      if (td.Format != ngx_fmt || td.Width != w || td.Height != h) {
+        d->ngx_dump_staging->Release(); d->ngx_dump_staging = nullptr;
+      }
+    }
+    if (!d->ngx_dump_staging) {
+      D3D11_TEXTURE2D_DESC td = {};
+      td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+      td.Format = ngx_fmt;
+      td.SampleDesc.Count = 1;
+      td.Usage = D3D11_USAGE_STAGING;
+      td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->ngx_dump_staging))) return false;
+    }
   }
   d->hdr_scratch_w = w; d->hdr_scratch_h = h;
   return true;
@@ -810,10 +827,35 @@ static bool RunHdrConvertPass(ID3D11DeviceContext* cl, DeviceData* d, int mode,
   return true;
 }
 
+// IEEE 754 half -> float (for the r16g16b16a16_float NGX output luma dump).
+static float HalfToFloat(uint16_t h) {
+  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t man = h & 0x3FFu;
+  uint32_t f;
+  if (exp == 0u) {
+    if (man == 0u) {
+      f = sign;
+    } else {
+      exp = 127u - 15u + 1u;
+      while ((man & 0x400u) == 0u) { man <<= 1u; --exp; }
+      man &= 0x3FFu;
+      f = sign | (exp << 23) | (man << 13);
+    }
+  } else if (exp == 31u) {
+    f = sign | 0x7F800000u | (man << 13);
+  } else {
+    f = sign | ((exp - 15u + 127u) << 23) | (man << 13);
+  }
+  float out = 0.f;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+
 // DIAGNOSTIC: copy the NGX output to a CPU staging texture and log min/avg/max
 // RGB luma (throttled ~1 Hz by the caller). Distinguishes "DLSS wrote PURE 0
-// (eval/config failure)" from "DLSS wrote DARK-but-nonzero content (encoding
-// mismatch -> the DLAAHdrDecode fix)". GPU stall acceptable at 1 Hz.
+// (eval/config failure)" from "DLSS wrote DARK-but-nonzero content". Handles
+// both r8g8b8a8 and r16g16b16a16_float NGX output. GPU stall acceptable at 1 Hz.
 static void LogNgxOutputLuma(ID3D11DeviceContext* cl, DeviceData* d) {
   if (!cl || !d || !d->ngx_dump_staging) return;
   auto* ngx_out = senkiseki3::dlss::ngx.output_texture.Get();
@@ -821,6 +863,9 @@ static void LogNgxOutputLuma(ID3D11DeviceContext* cl, DeviceData* d) {
   cl->CopyResource(d->ngx_dump_staging, ngx_out);
   D3D11_MAPPED_SUBRESOURCE map = {};
   if (FAILED(cl->Map(d->ngx_dump_staging, 0, D3D11_MAP_READ, 0, &map))) return;
+  D3D11_TEXTURE2D_DESC td = {};
+  d->ngx_dump_staging->GetDesc(&td);
+  const bool is_float = (td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
   auto* px = static_cast<const uint8_t*>(map.pData);
   double sum = 0.0;
   float mn = 1e9f, mx = -1e9f;
@@ -829,7 +874,16 @@ static void LogNgxOutputLuma(ID3D11DeviceContext* cl, DeviceData* d) {
   for (uint32_t y = 0; y < d->hdr_scratch_h; y += 8) {
     const uint8_t* row = px + (size_t)y * stride;
     for (uint32_t x = 0; x < d->hdr_scratch_w; x += 8) {
-      float l = (row[x * 4 + 0] + row[x * 4 + 1] + row[x * 4 + 2]) * (1.f / (3.f * 255.f));
+      float r, g, b;
+      if (is_float) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(row + (size_t)x * 8u);
+        r = HalfToFloat(p[0]); g = HalfToFloat(p[1]); b = HalfToFloat(p[2]);
+      } else {
+        r = row[x * 4 + 0] * (1.f / 255.f);
+        g = row[x * 4 + 1] * (1.f / 255.f);
+        b = row[x * 4 + 2] * (1.f / 255.f);
+      }
+      float l = (r + g + b) * (1.f / 3.f);
       sum += l; mn = std::min(mn, l); mx = std::max(mx, l);
       samples++;
     }
@@ -2832,6 +2886,11 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   senkiseki3::dlss::dlss_flag_is_hdr = shader_injection.dlaa_flag_is_hdr;
   senkiseki3::dlss::dlss_flag_depth_inverted = shader_injection.dlaa_flag_depth_inverted;
   senkiseki3::dlss::dlss_flag_auto_exposure = shader_injection.dlaa_flag_auto_exposure;
+  // DLSS output format: r16g16b16a16_float when the toggle is on, so the HDR
+  // mod's final_blending tone maps UNCLAMPED values (8-bit UNORM clamps
+  // highlights before the tone map -> clipping/banding).
+  senkiseki3::dlss::dlss_output_format = (shader_injection.dlaa_hdr_float_out > 0.5f)
+      ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
 
   // DLAA evaluate (only when all resources ready + NGX supported). The gate and
   // matrices status are logged UNCONDITIONALLY so a crash log always shows why
@@ -3044,8 +3103,10 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
 
           // Display: native SRV of the NGX output texture -> PS t0 (proven path).
           ID3D11ShaderResourceView* dbg_srv = nullptr;
+          D3D11_TEXTURE2D_DESC ngx_dvd_td = {};
+          senkiseki3::dlss::ngx.output_texture->GetDesc(&ngx_dvd_td);
           D3D11_SHADER_RESOURCE_VIEW_DESC dvd = {};
-          dvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+          dvd.Format = ngx_dvd_td.Format;
           dvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
           dvd.Texture2D.MipLevels = 1;
           if (SUCCEEDED(senkiseki3::dlss::ngx.device->CreateShaderResourceView(
@@ -3176,6 +3237,9 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
           }
           dlaa_ok = senkiseki3::dlss::EvaluateDLSS(cl, src, ngx_out, mv, dep,
                        jitter_px_x, jitter_px_y, mv_scale_x, mv_scale_y);
+          // The DLSS output texture may have been recreated by the eval (e.g.
+          // the float-output toggle changed its format) — refresh the pointer.
+          ngx_out = reinterpret_cast<ID3D11Resource*>(senkiseki3::dlss::ngx.output_texture.Get());
           if (dlaa_ok) {
             ++d->evals_this_frame;  // diag: count evals/present (must be 1)
             // Re-encode the DLSS linear output into the HDR chain's encoding
@@ -3474,6 +3538,14 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
         .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (_renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
         .labels = {"Auto","Pre-ToneMap","Composite"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAHdrFloatOut", .binding = &shader_injection.dlaa_hdr_float_out,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "HDR: Float DLSS Output", .section = "Antialiasing",
+        .tooltip = "Makes the DLSS output texture r16g16b16a16_float instead of r8g8b8a8. The 8-bit UNORM output clamps highlight values before the HDR mod's tone map can recover them (clipping/banding on the Pre-ToneMap path). Float preserves the range through the tone map. Recreates the DLSS feature once on toggle.",
+        .labels = {"Off (8-bit)","On (r16 float)"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{

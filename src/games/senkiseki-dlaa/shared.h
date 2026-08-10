@@ -56,6 +56,7 @@ struct ShaderInjectData {
   // ── HDR-mod compatibility (addon-side only; NOT read by shaders) ──
   float dlaa_hdr_decode;       // 0=Off, 1=sRGB, 2=PQ — DLSS input/output color conversion (composite path)
   float dlaa_hdr_inject;       // 0=Auto, 1=Pre-ToneMap (final_blending, raw scene), 2=Composite (FXAA)
+  float dlaa_hdr_float_out;    // 0=Off, 1=On — DLSS output r16g16b16a16_float (unclamped highlights)
 };
 
 #ifndef __cplusplus
