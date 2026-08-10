@@ -37,7 +37,8 @@ cbuffer cb_push : register(b13) {
   float4 params0;   // x=vp_w, y=vp_h, z=velocity_scale, w=debug_view
   float4 params1;   // x=jitter_x(NDC), y=jitter_y(NDC), z=per_object_motion, w=zero_mv
   float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=mv_mode, w=exclude_effects
-  float4 params3;   // x=mv_threshold_object(px) — per-object/Prev-Bone MVs only
+  float4 params3;   // x=mv_threshold_object(px), y=prev_jitter_x(NDC), z=prev_jitter_y(NDC), w=jitter_in_mv
+  float4 params4;   // x=depth_sample_unjit, yzw=unused
 };
 
 [numthreads(8, 8, 1)]
@@ -47,11 +48,42 @@ void main(uint2 pix : SV_DispatchThreadID)
   uint h = (uint)params0.y;
   if (pix.x >= w || pix.y >= h) return;
 
+  // DLAAPhaseSynthMV (params4.y): synthetic MV test — bypass depth reprojection
+  // entirely and write an ANALYTIC global MV, so we can establish the correct
+  // jitter-delta MV + sign in the reproj debug view without DLSS/depth/matrices.
+  //   1 = zero everywhere (Test A)
+  //   2 = Jcur - Jprev  (pixel-space, y-down)
+  //   3 = Jprev - Jcur  (flipped sign)
+  if (params4.y > 0.5f) {
+    float2 synth = 0.0;
+    if (params4.y > 1.5f) {
+      // Jcur - Jprev in y-down px: x = (jx - prevJx)*w/2, y = -(jy - prevJy)*h/2
+      synth.x = (params1.x - params3.y) * params0.x * 0.5f;
+      synth.y = -(params1.y - params3.z) * params0.y * 0.5f;
+      if (params4.y > 2.5f) synth = -synth;
+    }
+    g_outVelocity[pix] = synth;
+    return;
+  }
+
   // Current pixel center in screen space (y-down)
   float2 curPx = float2(pix) + 0.5;
 
+  // Content shift of the current frame's sub-pixel jitter (px, y-down): the
+  // jittered render shows content from the unjittered position (p - jitterPx).
+  float2 jitterPx = float2(params1.x * params0.x * 0.5f, -params1.y * params0.y * 0.5f);
+  // The UNJITTERED current pixel. The depth is rasterized at the JITTERED grid,
+  // so depth[p] belongs to the content at unjittered p - jitterPx. Unprojecting
+  // at the jittered pixel with the unjittered matrices would inject the frame's
+  // jitter into the MVs (vel = vel_true + jitterPx) whenever the camera moves —
+  // DLSS then applies the jitter offset again -> misaligned history -> shimmer,
+  // worst at low FPS (few temporal samples to average it out). Use the
+  // unjittered pixel so the round trip is exact for BOTH static (vel = 0) and
+  // moving (vel = vel_true), for jittered AND unjittered depth alike.
+  float2 curPxU = curPx - jitterPx;
+
   // Previous-frame screen position (y-down)
-  float2 prevPx = curPx;
+  float2 prevPx = curPxU;  // no-motion default (invalid depth -> vel = 0)
   bool hasObjectMotion = false;
 
   // ── Per-object motion (dynamic objects, from modified VS + 32-bit target) ──
@@ -68,10 +100,21 @@ void main(uint2 pix : SV_DispatchThreadID)
 
   // ── Camera motion (depth reprojection) ──
   if (!hasObjectMotion) {
-    float depth = g_srcDepth.Load(int3(pix, 0));
+    // DLAAPhaseDepthSampleUnjit (params4.x): the depth buffer is UNJITTERED
+    // (our depth_only fix), so depth[pix] belongs to the content at UNJITTERED
+    // position pix, NOT at curPxU = pix - jitterPx. Sampling at pix therefore
+    // misreads the depth by up to half a pixel whenever jitter is on, injecting
+    // a per-frame MV error DLSS can't compensate. Sample at the UNJITTERED pixel
+    // (curPxU, rounded to the nearest texel) so depth and position agree.
+    int2 depthPix = int2(pix);
+    if (params4.x > 0.5f) {
+      depthPix = int2(round(curPxU));
+      depthPix = clamp(depthPix, int2(0, 0), int2((int)w - 1, (int)h - 1));
+    }
+    float depth = g_srcDepth.Load(int3(depthPix, 0));
 
-    // NDC (y-up) from pixel position
-    float2 ndc = (curPx / float2(w, h)) * 2.0 - 1.0;
+    // NDC (y-up) from the UNJITTERED pixel position
+    float2 ndc = (curPxU / float2(w, h)) * 2.0 - 1.0;
     ndc.y = -ndc.y;
 
     // Unproject to world space
@@ -93,16 +136,17 @@ void main(uint2 pix : SV_DispatchThreadID)
   // Velocity in output-res pixel units (y-down).
   //
   // Jitter compensation:
-  //  - Depth-reprojection path: ALREADY jitter-free. Unproject/reproject uses
-  //    the UNJITTERED matrices, which is an identity round trip for any depth,
-  //    so the geometry jitter (SV_Position shift in the replaced scene VSs)
-  //    cancels even though the depth is rasterized at the jittered grid. Do NOT
-  //    compensate here (it would inject the jitter into static-environment MVs).
+  //  - Depth-reprojection path: the unproject/reproject runs with the UNJITTERED
+  //    matrices at the UNJITTERED pixel (curPxU), so it is an exact identity for
+  //    static content (vel = 0) AND yields the correct jitter-free MV for moving
+  //    content (vel = vel_true). This matters because the world depth is
+  //    rasterized at the JITTERED grid (Global/Per-VS jitter) — depth[p] belongs
+  //    to the content at p - jitterPx.
   //  - Per-object path: curPx is the jittered pixel, but the VS prevClip is
   //    unjittered NDC, so the MV picks up the content shift
   //    (+jitter_x*w/2, -jitter_y*h/2 px). Subtract it there only.
   // DLSS receives the same jitter via InJitterOffset (MVJittered=0).
-  float2 vel = (curPx - prevPx) * params0.z;
+  float2 vel = ((hasObjectMotion ? curPx : curPxU) - prevPx) * params0.z;
   // params2.z = MV jitter mode (DLAAPhaseMVJittered / DLAAPhaseMVComp):
   //   0 = MVJittered=0 + no per-object subtraction (Test B)
   //   1 = MVJittered=0 + subtract per-object jitter (Test A, current)
@@ -121,6 +165,18 @@ void main(uint2 pix : SV_DispatchThreadID)
     // MVJittered=0 (Test A): subtract the frame's jitter from per-object MVs.
     vel.x -= params1.x * params0.x * 0.5f;
     vel.y += params1.y * params0.y * 0.5f;
+  }
+  // DIAGNOSTIC (DLAAPhaseJitterInMV, params3.w): this DLSS runtime IGNORES the
+  // NGX jitter offset (report 0 vs real = identical), so the per-frame jitter
+  // reads as unresolvable sub-pixel motion -> shimmer, worst at low FPS. Bake the
+  // jitter DELTA (current - previous frame, px) into the MVs so DLSS's MV-based
+  // reprojection aligns the jittered history. Base MVs must be jitter-free for
+  // this to be exact: camera via curPxU, per-object via the Test A subtraction
+  // above (params2.z ~ 1). At static: vel = jitterCur - jitterPrev, which maps the
+  // content at the current jittered pixel back to its previous jittered position.
+  if (params3.w > 0.5f) {
+    vel.x += (params1.x - params3.y) * params0.x * 0.5f;   // (jx - prevJx) * w/2
+    vel.y -= (params1.y - params3.z) * params0.y * 0.5f;   // -(jy - prevJy) * h/2
   }
   // Zero-MV A/B: force all motion vectors to 0 (isolates whether MVs help or hurt).
   if (params1.w > 0.5f) vel = float2(0.0, 0.0);

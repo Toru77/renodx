@@ -74,6 +74,13 @@ static float g_phaseb_dump = 0.f;     // evidence capture: write patched/origina
 static float g_phase_freeze_jitter = 0.f;  // DIAGNOSTIC: fix jitter at a CONSTANT value every frame (Halton disabled).
                                           // If the Prev-Bone shake disappears with a fixed jitter, the error is the
                                           // frame-to-frame jitter variation (compensation/timing mismatch), not the MVs.
+static float g_phase_freeze_report = 0.f;  // DIAGNOSTIC (DLAAPhaseFreezeReport): render the normal (Halton) jitter
+                                          // but report a CONSTANT jitter to DLSS. If the shake disappears, DLSS was
+                                          // reacting to the VARYING report (fix the offset); if it still shakes, DLSS
+                                          // ignores the report and the RENDERED variation is the culprit.
+static float g_phase_freeze_render = 0.f;  // DIAGNOSTIC (DLAAPhaseFreezeRender): mirror — render a CONSTANT jitter
+                                          // but report the normal (Halton) jitter. If it shakes, DLSS consumes the
+                                          // report; if it stays stable, DLSS ignores it.
 static float g_phase_mv_comp = 1.f;        // DIAGNOSTIC: per-object jitter subtraction in the velocity shader A/B.
                                           // 1 = subtract the frame's jitter from per-object MVs (current behavior).
                                           // 0 = don't compensate. If the character STOPS shaking with comp OFF, the
@@ -82,14 +89,50 @@ static float g_phase_mv_comp = 1.f;        // DIAGNOSTIC: per-object jitter subt
 static float g_phase_mv_jittered = 0.f;   // DIAGNOSTIC (Test C): feed JITTERED MVs + MVJittered=1 so DLSS removes the
                                           // jitter internally. The velocity shader then ADDS the jitter to the camera path
                                           // (it is jitter-free by construction) to keep the whole buffer consistently jittered.
-static float g_phase_jitter_depth = 0.f;  // DIAGNOSTIC (friend's red flag #1): jitter the character's MAIN depth pass too,
-                                          // so DLSS sees color AND depth in the same jitter state. Only the character SHADOW
-                                          // VS stays unjittered (its consumer compares against the unjittered projection).
+static float g_phase_jitter_depth = 0.f;  // DIAGNOSTIC (DLAAPhaseJitterDepth): jitter the depth pass too,
+                                          // so DLSS sees color AND depth in the same jitter state (Test B).
+                                          // Default OFF = depth stays the game's native UNJITTERED depth
+                                          // (Test A). Only the character SHADOW VS stays unjittered (its
+                                          // consumer compares against the unjittered projection).
+static float g_phase_jitter_color = 1.f;  // DIAGNOSTIC (DLAAPhaseJitterColor): master color-jitter toggle.
+                                          // Default ON = color rendered with the jittered VP (normal DLAA).
+                                          // OFF = color renders UNJITTERED and 0 jitter is reported to DLSS
+                                          // (baseline: unjittered color + unjittered depth + report 0).
 static float g_phase_mv_threshold_object = 0.f;  // per-object / Prev-Bone MV threshold (px). DLAAMVThreshold now gates
                                                  // ONLY camera (depth-reprojection) MVs; this gates the per-object path.
                                                  // Addon-side (NOT in ShaderInjectData: growing that struct resizes the
                                                  // injected b13 cbuffer and breaks the boot PSs). Consumed only by
                                                  // BuildVelocityPC -> velocity compute params3.x.
+static float g_jitter_scale = 1.f;  // DIAGNOSTIC (DLAAJitterScale): 0=0.5x, 1=1x exact, 2=2x — scales the NGX jitter
+                                    // offset magnitude reported to DLSS WITHOUT changing the rendered jitter. If the
+                                    // 30 FPS static jitter converges at 0.5x or 2x, the reported magnitude doesn't
+                                    // match the applied one. Addon-side only (not in ShaderInjectData).
+static float g_jitter_in_mv = 0.f;  // DIAGNOSTIC (DLAAPhaseJitterInMV): bake the jitter DELTA (current - previous
+                                    // frame) into the MVs. This DLSS runtime IGNORES the NGX jitter offset (report 0
+                                    // vs real = identical), so the per-frame jitter reads as unresolvable sub-pixel
+                                    // motion -> shimmer, worst at low FPS. DLSS uses the MVs directly, so adding the
+                                    // delta makes its reprojection align the jittered history. Pairs with Test A.
+static float g_jitter_decouple = 0.f;  // DIAGNOSTIC (DLAAPhaseReportOnly): render UNJITTERED but report the Halton
+                                       // jitter to DLSS. The DEFINITIVE test of whether DLSS uses the offset: if the
+                                       // output changes when this is on (DLSS told jitter that isn't rendered), DLSS
+                                       // consumes the report; if it looks identical to jitter-off, DLSS ignores it.
+static float g_mv_scale_mode = 0.f;  // DIAGNOSTIC (DLAAMVScale): A/B the DLSS InMVScale parameter (converts the
+                                     // velocity texture to pixel space) WITHOUT touching the MV shader. 0 = 1.0
+                                     // (MVs already pixel-space, SDK default), 1 = 1/W,1/H (1.0 = full screen),
+                                     // 2 = 2/W,2/H (NDC, 1.0 = half screen).
+static float g_phase_depth_sample_unjit = 0.f;  // DIAGNOSTIC (DLAAPhaseDepthSampleUnjit): sample the depth at the
+                                                // UNJITTERED pixel (curPxU) instead of the jittered pixel (pix) in the
+                                                // velocity camera path. With an UNJITTERED depth buffer (depth_only),
+                                                // depth[pix] belongs to content at unjittered position pix, NOT at
+                                                // curPxU = pix - jitterPx — so sampling at pix misreads the depth by
+                                                // up to half a pixel whenever jitter is on, injecting a per-frame MV
+                                                // error that DLSS can't compensate (shimmer, worst at 30 FPS).
+static float g_phase_synth_jitter_mv = 0.f;  // DIAGNOSTIC (DLAAPhaseSynthMV): synthetic MV test. Bypasses depth
+                                             // reprojection and writes an ANALYTIC global MV so we can establish the
+                                             // correct jitter-delta MV + sign in the reprojection debug view (no DLSS,
+                                             // no depth, no matrices). 0=normal, 1=zero everywhere, 2=Jcur-Jprev,
+                                             // 3=Jprev-Jcur. At static+jitter, whichever sign makes the reproj view
+                                             // black is the sign DLSS needs (fed via JitterInMV + report 0).
 
 // ── Descriptor table helpers ──
 constexpr uint32_t kTableParamCount = 6u;
@@ -263,6 +306,18 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource captured_depth_res = {};
   uint32_t depth_source_hash = 0u;  // PS hash that last pushed the captured depth (source identity)
   bool depth_primary_captured = false;  // a perspective (non-linear) depth was captured this frame
+  // ── Frame-pairing diagnostic ──
+  // The velocity reprojection must pair depth_N with VP_N (and reproject through
+  // prevVP = VP_{N-1}). If the captured depth or VP belongs to a different frame
+  // (N-1/N-2), the error scales with the per-frame displacement -> invisible at
+  // 170 FPS (tiny motion) but glaring at 30 FPS (large motion). Stamps record
+  // which frame_index each input was captured on + the resource identity, so we
+  // can prove/disprove the N / N-1 pairing directly.
+  uint32_t depth_capture_frame = 0u;      // frame_index when captured_depth_res was last set
+  uint64_t depth_capture_res_handle = 0u;  // resource handle at depth capture (ping-pong detection)
+  uint32_t vp_read_frame = 0u;            // frame_index when ReadSceneMatrices captured curr VP
+  uint64_t vp_cbv_handle = 0u;            // _Globals buffer handle the VP was read from
+  uint32_t prev_vp_frame = 0u;            // frame_index the current prev_view_proj was captured on
   reshade::api::resource_view captured_color_srv = {};
   reshade::api::resource captured_color_res = {};
   reshade::api::resource captured_rtv0_res = {};
@@ -281,7 +336,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool scene_cbv_copy_issued = false;  // a camera-matrix staging copy is queued this frame
   float viewport_w = 2560.f, viewport_h = 1440.f;
   float swapchain_w = 2560.f, swapchain_h = 1440.f;
-  float jitter_x = 0.f, jitter_y = 0.f;
+  float jitter_x = 0.f, jitter_y = 0.f;             // RENDER jitter (what the source patch applies)
+  float report_jitter_x = 0.f, report_jitter_y = 0.f;  // REPORT jitter (what NGX is told; = render unless decoupled)
+  float prev_jitter_x = 0.f, prev_jitter_y = 0.f;  // previous frame's jitter (for MV jitter-delta baking)
   // Global jitter (Jitter Method = Global): unjittered ViewProjection captured
   // from the game's b0 _Globals upload, plus the last VP write state so the
   // per-draw bind-time write only happens when the jitter state actually flips.
@@ -302,6 +359,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource last_b0_buffer = {};  // last b0 CB bound (global jitter writes VP here at draw time)
   bool in_own_upload = false;  // recursion guard: we're re-issuing a jittered _Globals upload
   uint32_t frame_index = 0u;
+  uint32_t evals_this_frame = 0u;  // EvaluateDLSS calls this frame (diag: must be 1 per presented frame)
+  std::chrono::steady_clock::time_point last_present_time{};  // for DLSS InFrameTimeDeltaInMsec
   bool resources_created = false;
   // Crash capture ring buffer: every draw is recorded in memory (bounded); when
   // the GPU dies (velocity pipeline creation fails with DEVICE_REMOVED, or a
@@ -429,7 +488,7 @@ static bool CreateVelocityPipeline(reshade::api::device* dev, DeviceData* d) {
   reshade::api::constant_range pc_range = {};
   pc_range.binding = 0;
   pc_range.dx_register_index = 13;
-  pc_range.count = 48;  // matches motion_velocity.cs_5_0.hlsl cbuffer (12 float4s)
+  pc_range.count = 52;  // matches motion_velocity.cs_5_0.hlsl cbuffer (13 float4s)
   pc_range.visibility = DS::all_compute;
 
   P params[7];
@@ -603,8 +662,9 @@ static bool IsEffectVs(uint32_t hash) {
 // Per-VS mode leaves them unjittered and shadows are stable, so in global mode
 // we mark their buffers and keep them UNJITTERED (skip the source patch).
 static DeviceData::GlobalsBufferRec* FindGlobalsRec(DeviceData* d, reshade::api::resource res);  // defined below
-static const std::array<uint32_t, 4> DEPTH_VS_HASHES = {
+static const std::array<uint32_t, 5> DEPTH_VS_HASHES = {
     0xAA8821ECu,  // character shadow (user-reported)
+    0xAB857156u,  // hat shadow (draw 1) — was missing, shadow shook in global jitter
     0x78F969DDu,  // character depth
     0xA1D82AA3u,  // character depth
     0x600D64CCu,  // character depth
@@ -1284,6 +1344,47 @@ static void ApplyPerDrawJitter(reshade::api::command_list* cmd_list, DeviceData*
 //     VP so effects don't shimmer/move;
 //   * untracked buffers (upload missed jitter, e.g. Map-updated): fallback write.
 static DeviceData::GlobalsBufferRec* FindGlobalsRec(DeviceData* d, reshade::api::resource res);  // defined below
+
+// The game's native depth is the R24G8 output res we auto-check (captured_depth_res).
+// A draw WRITES that depth when its bound depth-stencil IS that same resource
+// AND no color RT is bound (a true depth-only pass — the game fills the R24G8
+// in its own depth pass, then color draws later). The game's own depth is NOT
+// jittered, so the source patch must leave this buffer's VP unjittered
+// (depth_only) — DLSS then gets the native unjittered depth while the color
+// passes keep the jittered VP. Color passes that merely depth-test against the
+// R24G8 have color RTs bound, so they never match here and stay jittered.
+static bool IsDepthWriteDraw(reshade::api::command_list* cmd_list, DeviceData* d) {
+  // DLAAPhaseJitterDepth ON: we WANT the world depth pass jittered (Test B:
+  // color AND depth in the same jitter state) — so do NOT mark it depth_only.
+  // Default OFF: mark it depth_only so the source patch leaves the VP unjittered
+  // and DLSS gets the game's native unjittered depth (Test A).
+  if (g_phase_jitter_depth > 0.5f) return false;
+  if (!cmd_list || !d) return false;
+  if (!d->captured_depth_res.handle) return false;
+  auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!ctx) return false;
+  ID3D11RenderTargetView* rtvs[8] = {};
+  ID3D11DepthStencilView* dsv = nullptr;
+  UINT num_rtvs = 8;
+  ctx->OMGetRenderTargets(num_rtvs, rtvs, &dsv);
+  if (!dsv) {
+    for (UINT i = 0; i < num_rtvs; ++i) if (rtvs[i]) rtvs[i]->Release();
+    return false;
+  }
+  // Depth-only pass: no color target bound.
+  bool no_color = (num_rtvs == 0u);
+  ID3D11Resource* res = nullptr;
+  dsv->GetResource(&res);
+  bool match = false;
+  if (res) {
+    match = no_color && (reinterpret_cast<uintptr_t>(res) == d->captured_depth_res.handle);
+    res->Release();
+  }
+  dsv->Release();
+  for (UINT i = 0; i < num_rtvs; ++i) if (rtvs[i]) rtvs[i]->Release();
+  return match;
+}
+
 static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
   if (shader_injection.dlaa_jitter_method < 0.5f) return;
@@ -1291,6 +1392,9 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   // Gate-failure diagnostics: periodic (first few, then every 250th) so we can
   // see WHY the draw-time write doesn't fire in-game even after the start-menu
   // consumed the first-slot probes.
+  // DLAAPhaseJitterColor OFF: nothing is jittered at the source, so there is
+  // nothing to correct at draw time (no effect un-jitter, no fallback write).
+  if (g_phase_jitter_color < 0.5f) return;
   if (!d->globals_vp_captured || !d->last_b0_buffer.handle) {
     if (shader_injection.dlaa_debug_logging > 0.5f) {
       LogThrottled("draw-skip-cap", reshade::log::level::info, 5u, 250u,
@@ -1304,15 +1408,21 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   auto rd = dev->get_resource_desc(d->last_b0_buffer);
   auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
-  // ── Character depth/shadow pass: mark its buffer (VP stays UNJITTERED) and
-  // never write jitter into it. Per-VS mode leaves these unjittered and the
-  // shadow is stable; the global source patch jitters c10 on ALL buffers, which
-  // made the character shadow move — so we un-jitter this buffer. ──
-  if (IsDepthVs(vh)) {
+  // ── Depth passes: keep the VP UNJITTERED so DLSS gets the game's native
+  // depth. Two signals identify a depth-writing draw:
+  //   * IsDepthVs(vh): known depth/shadow VSs (character draws + shadow maps
+  //     whose consumers compare against the unjittered projection);
+  //   * the bound DSV IS the captured R24G8 (captured_depth_res): the WORLD
+  //     depth pass. The game's own depth is NOT jittered, so the source patch
+  //     must NOT jitter this buffer's VP — mark it depth_only here, then the
+  //     source patch (OnUpdateBufferRegion) lets the original upload stand.
+  //     Color passes don't bind the depth buffer as DSV, so they keep the
+  //     jittered VP.
+  if (IsDepthVs(vh) || IsDepthWriteDraw(cmd_list, d)) {
     MarkDepthBuffer(d, d->last_b0_buffer);
     if (shader_injection.dlaa_debug_logging > 0.5f) {
       LogThrottled("depth-vs", reshade::log::level::info, 5u, 250u,
-                   "[DLAA] global: DEPTH VS 0x%08X buffer=0x%llX size=%llu (unjittered)",
+                   "[DLAA] global: DEPTH draw vs=0x%08X buffer=0x%llX size=%llu (unjittered)",
                    vh, (unsigned long long)d->last_b0_buffer.handle,
                    (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull));
     }
@@ -1595,6 +1705,12 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
 
   d->prev_view_proj = d->curr_view_proj;
   d->curr_view_proj = view_proj;
+  // Frame-pairing stamp: this frame's VP belongs to frame_index (now); the
+  // velocity reprojection uses it as the CURRENT VP and the previous stamp's
+  // VP as prevViewProj — so prev_view_proj must be exactly one frame older.
+  d->prev_vp_frame = d->vp_read_frame;
+  d->vp_read_frame = d->frame_index;
+  d->vp_cbv_handle = d->captured_scene_cbv.buffer.handle;
   // Invert the ACTUAL ViewProjection (c10) directly instead of composing the
   // game's separate ViewInverse/ProjectionInverse (c14/c18). If those stored
   // inverses don't exactly match the forward VP, every pixel gets a
@@ -1944,6 +2060,13 @@ static void OnPushDescriptorsCapture(
             d->viewport_w = (float)rd.texture.width;
             d->viewport_h = (float)rd.texture.height;
             d->depth_source_hash = hash;
+            // Frame-pairing stamp: which frame this depth was captured on + the
+            // resource identity. The velocity reprojection unprojects this depth
+            // with curr VP and reprojects with prev VP — if the depth is from a
+            // different frame than those matrices, the MV error scales with the
+            // per-frame displacement (bad at 30 FPS, invisible at 170 FPS).
+            d->depth_capture_frame = d->frame_index;
+            d->depth_capture_res_handle = res.handle;
             if (is_primary) d->depth_primary_captured = true;
           }
         }
@@ -1967,7 +2090,7 @@ static void OnPushDescriptorsCapture(
           d->captured_scene_cbv_valid = true;
           // Queue the camera-matrix staging copy EARLY so the Map at FXAA
           // (ReadSceneMatrices) doesn't stall the GPU pipeline mid-frame.
-          if (shader_injection.dlaa_enabled > 0.5f && !d->scene_cbv_copy_issued) {
+          if (shader_injection.dlaa_enabled > 1.5f && !d->scene_cbv_copy_issued) {
             d->scene_cbv_copy_issued = IssueSceneCbvCopy(cmd_list, d);
           }
         }
@@ -2072,6 +2195,10 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
     }
     return false;  // let the game's original (unjittered) upload proceed
   }
+  // DLAAPhaseJitterColor OFF: skip the source patch for ALL buffers (color
+  // renders unjittered — baseline). The VP capture above still ran, so the
+  // velocity compute keeps the game's native matrices.
+  if (g_phase_jitter_color < 0.5f) return false;
   ++d->globals_patch_count;
   // ── SOURCE-LEVEL PATCH (reliable jitter) ──
   // We are on the immediate context right before the game's UpdateSubresource
@@ -2121,25 +2248,55 @@ static void OnMapBufferRegionProbe(reshade::api::device* dev, reshade::api::reso
 // ── Jitter update ──
 static void UpdateJitter(DeviceData* d) {
   if (!d) return;
+  // Compute the jitter VALUE (NDC) this frame should use.
+  float rjx = 0.f, rjy = 0.f;
   if (shader_injection.dlaa_jitter_test > 0.5f) {
     // Jitter Test: apply a large FIXED 8px horizontal projection shift so the
     // rasterization-level jitter is plainly visible.
-    d->jitter_x = 8.f * 2.f / d->viewport_w;
-    d->jitter_y = 0.f;
+    rjx = 8.f * 2.f / d->viewport_w; rjy = 0.f;
   } else if (g_phase_freeze_jitter > 0.5f) {
-    // Freeze: CONSTANT sub-pixel jitter every frame (Halton disabled). DLSS
-    // handles a fixed offset fine; if the character's shake disappears with a
-    // fixed jitter, the error is the per-frame jitter VARIATION being mishandled
-    // (compensation/timing mismatch), not the motion vectors themselves.
-    d->jitter_x = 0.25f * 2.f / d->viewport_w;
-    d->jitter_y = -0.25f * 2.f / d->viewport_h;
+    // Freeze: CONSTANT sub-pixel jitter every frame (Halton disabled).
+    rjx = 0.25f * 2.f / d->viewport_w;
+    rjy = -0.25f * 2.f / d->viewport_h;
   } else if (shader_injection.dlaa_jitter_enabled < 0.5f) {
-    d->jitter_x = 0.f;
-    d->jitter_y = 0.f;
+    rjx = 0.f; rjy = 0.f;
   } else {
     uint32_t f = d->frame_index;
-    d->jitter_x = (Halton(f + 1u, 2u) - 0.5f) * 2.f / d->viewport_w;
-    d->jitter_y = (Halton(f + 1u, 3u) - 0.5f) * 2.f / d->viewport_h;
+    rjx = (Halton(f + 1u, 2u) - 0.5f) * 2.f / d->viewport_w;
+    rjy = (Halton(f + 1u, 3u) - 0.5f) * 2.f / d->viewport_h;
+  }
+  // The frozen sub-pixel value used by the freeze diagnostics (matches
+  // DLAAPhaseFreezeJitter's constant).
+  const float frjx = 0.25f * 2.f / d->viewport_w;
+  const float frjy = -0.25f * 2.f / d->viewport_h;
+  // Render vs report jitter, decoupled by the A/B toggles. Default: both = the
+  // computed value. DLAAPhaseFreezeReport freezes only the report; DLAAPhase-
+  // FreezeRender freezes only the render.
+  float render_jx = rjx, render_jy = rjy;
+  float report_jx = rjx, report_jy = rjy;
+  if (g_phase_freeze_report > 0.5f) { report_jx = frjx; report_jy = frjy; }
+  if (g_phase_freeze_render > 0.5f) { render_jx = frjx; render_jy = frjy; }
+  // DLAAPhaseJitterColor OFF: baseline — render UNJITTERED and report 0 jitter
+  // (takes precedence over Report-Only, which is a color-jittered diagnostic).
+  if (g_phase_jitter_color < 0.5f) {
+    d->jitter_x = 0.f; d->jitter_y = 0.f;
+    d->report_jitter_x = 0.f; d->report_jitter_y = 0.f;
+  } else if (g_jitter_decouple > 0.5f) {
+    // DIAGNOSTIC (DLAAPhaseReportOnly): render UNJITTERED but report the Halton
+    // jitter to DLSS. If the output changes vs plain jitter-off, DLSS consumes
+    // the report; if identical, DLSS ignores the reported offset entirely.
+    d->jitter_x = 0.f; d->jitter_y = 0.f;
+    d->report_jitter_x = report_jx; d->report_jitter_y = report_jy;
+  } else {
+    d->jitter_x = render_jx; d->jitter_y = render_jy;
+    d->report_jitter_x = report_jx; d->report_jitter_y = report_jy;
+  }
+  // DLAAPhaseJitterInMV: the jitter DELTA is baked into the MVs (velocity shader
+  // params3.w), so DLSS must NOT also apply the reported offset — that would
+  // double-count the jitter (the original JitterInMV fullscreen-shake failure).
+  // Force the report to 0: the correct combo is delta-in-MV + report 0.
+  if (g_jitter_in_mv > 0.5f) {
+    d->report_jitter_x = 0.f; d->report_jitter_y = 0.f;
   }
   if (shader_injection.dlaa_jitter_method > 0.5f) {
     // Global method: the shared ViewProjection patch is the jitter source; keep
@@ -2169,14 +2326,15 @@ static void UpdateJitter(DeviceData* d) {
 // VP region (bytes 160..208) into the game's own buffer — World is untouched.
 
 // ── Velocity push constants ──
-// Push constants (b13, 48 floats = 12 float4s) matching motion_velocity.cs_5_0.hlsl:
+// Push constants (b13, 52 floats = 13 float4s) matching motion_velocity.cs_5_0.hlsl:
 //   c[0..15] = prevViewProj, c[16..31] = curViewProjInv,
 //   c[32..35] = params0 (vp_w, vp_h, velocity_scale, debug_view),
 //   c[36..39] = params1 (jitter_x, jitter_y, per_object_motion, zero_mv),
 //   c[40..43] = params2 (mv_threshold, mv_direction, mv_mode, exclude_effects),
-//   c[44..47] = params3 (mv_threshold_object — per-object/Prev-Bone MVs only)
-static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
-  std::array<float, 48> c = {};
+//   c[44..47] = params3 (mv_threshold_object, prev_jitter_x, prev_jitter_y, jitter_in_mv),
+//   c[48..51] = params4 (depth_sample_unjit, 0, 0, 0)
+static std::array<float, 52> BuildVelocityPC(DeviceData* d) {
+  std::array<float, 52> c = {};
   if (!d) return c;
   memcpy(&c[0],  d->prev_view_proj.data(), 64);
   memcpy(&c[16], d->curr_view_proj_inv.data(), 64);
@@ -2195,6 +2353,11 @@ static std::array<float, 48> BuildVelocityPC(DeviceData* d) {
   c[42] = (g_phase_mv_jittered > 0.5f) ? 2.f : g_phase_mv_comp;
   c[43] = shader_injection.dlaa_exclude_effects;  // params2.w — mask effects out of DLAA
   c[44] = g_phase_mv_threshold_object;            // params3.x — per-object/Prev-Bone MVs only
+  c[45] = d->prev_jitter_x;                       // params3.y — previous frame's jitter X (NDC)
+  c[46] = d->prev_jitter_y;                       // params3.z — previous frame's jitter Y (NDC)
+  c[47] = g_jitter_in_mv;                         // params3.w — bake jitter delta into MVs (diag)
+  c[48] = g_phase_depth_sample_unjit;              // params4.x — sample depth at unjittered pixel (diag)
+  c[49] = g_phase_synth_jitter_mv;                 // params4.y — synthetic jitter MV test (diag)
   return c;
 }
 
@@ -2276,7 +2439,8 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   // (rendered jitter == reported jitter).
 
   // Sync dlss.hpp globals from settings (preset & enable gates)
-  senkiseki3::dlss::dlss_enabled = shader_injection.dlaa_enabled;
+  // 3-way toggle: 0=Off, 1=FXAA (game luma FXAA, no DLSS), 2=DLAA.
+  senkiseki3::dlss::dlss_enabled = (shader_injection.dlaa_enabled > 1.5f) ? 1.f : 0.f;
   senkiseki3::dlss::dlss_render_preset = shader_injection.dlaa_preset;
   // MVJittered A/B/C (DLAAPhaseMVJittered): off = MVs are jitter-subtracted in
   // the velocity shader (MVJittered=0, Tests A/B); on = MVs are fed JITTERED and
@@ -2390,7 +2554,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       cmd_list->bind_descriptor_tables(CS, d->velocity_layout, 0, 6, tables);
 
       auto pc = BuildVelocityPC(d);
-      cmd_list->push_constants(CS, d->velocity_layout, 6, 0, 48, pc.data());
+      cmd_list->push_constants(CS, d->velocity_layout, 6, 0, 52, pc.data());
       cmd_list->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       cmd_list->barrier(d->velocity_texture, UA, SR);
 
@@ -2472,15 +2636,30 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
         } else {
           // NGX jitter must match the rendered screen-space jitter (pixels, y-down).
           // The VS adds +JITTER_Y to clip Y (y-up), which shifts content by -JY on
-          // screen Y, so the Y offset is negated here.
-          float jitter_px_x = d->jitter_x * d->viewport_w * 0.5f;
-          float jitter_px_y = -d->jitter_y * d->viewport_h * 0.5f;
+          // screen Y, so the Y offset is negated here. Uses report_jitter (== render
+          // jitter unless DLAAPhaseReportOnly decouples them).
+          float jitter_px_x = d->report_jitter_x * d->viewport_w * 0.5f;
+          float jitter_px_y = -d->report_jitter_y * d->viewport_h * 0.5f;
           // A/B the NGX jitter sign convention (NVIDIA ships a debug hotkey for this):
           // 0 = FlipBoth, 1 = FlipX, 2 = FlipY, 3 = Current.
           const int jsign = (int)shader_injection.dlaa_jitter_sign;
           if (jsign != 3) {
             if (jsign == 0 || jsign == 1) jitter_px_x = -jitter_px_x;
             if (jsign == 0 || jsign == 2) jitter_px_y = -jitter_px_y;
+          }
+          // DIAGNOSTIC (DLAAJitterScale): scale the reported NGX jitter magnitude
+          // without touching the rendered jitter. If the 30 FPS static jitter
+          // converges at 0.5x or 2x, the reported magnitude doesn't match the applied.
+          // 0 = report 0 jitter (frames ARE jittered, DLSS told none): if visually
+          // IDENTICAL to 1x, DLSS is ignoring the reported jitter entirely.
+          {
+            float jscale = 1.0f;
+            if (g_jitter_scale < 0.5f) jscale = 0.0f;        // report 0
+            else if (g_jitter_scale < 1.5f) jscale = 0.5f;   // 0.5x
+            else if (g_jitter_scale < 2.5f) jscale = 1.0f;   // 1x (exact)
+            else jscale = 2.0f;                              // 2x
+            jitter_px_x *= jscale;
+            jitter_px_y *= jscale;
           }
           // Force Reset A/B: makes InReset=1 every frame (no history). Does NOT
           // recreate the feature, so it isolates temporal accumulation.
@@ -2494,7 +2673,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
           // into its matrices, so MVs are legitimately non-zero).
           static int jitter_log_count = 0;
           if (shader_injection.dlaa_debug_logging > 0.5f && (++jitter_log_count % 60 == 0)) {
-            char buf[192];
+            char buf[256];
             int cw = 0, ch = 0, cfmt = 0;
             if (d->captured_color_res.handle) {
               auto cdesc = dev->get_resource_desc(d->captured_color_res);
@@ -2517,18 +2696,35 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
               dfmt = (int)ddesc.texture.format;
             }
             snprintf(buf, sizeof(buf),
-              "[DLAA] f=%u px=(%.3f,%.3f) reset=%d feature=%s color=%ux%u fmt=%d vpd=%.4f po=%d motion=%ux%u fmt=%d depth=%ux%u fmt=%d src=0x%08X",
+              "[DLAA] f=%u px=(%.3f,%.3f) jpx=(%.3f,%.3f) s=%.0f reset=%d feature=%s color=%ux%u fmt=%d vpd=%.4f po=%d motion=%ux%u fmt=%d depth=%ux%u fmt=%d src=0x%08X dcf=%u vpf=%u pvf=%u dh=0x%llX cbv=0x%llX",
               d->frame_index,
               d->jitter_x * d->viewport_w * 0.5f, -d->jitter_y * d->viewport_h * 0.5f,
+              jitter_px_x, jitter_px_y, g_jitter_scale,
               senkiseki3::dlss::ngx.reset ? 1 : 0,
               senkiseki3::dlss::ngx.feature ? "yes" : "no",
               cw, ch, cfmt, vp_delta,
               (int)shader_injection.dlaa_per_object_motion, mw, mh, mfmt,
-              dw, dh, dfmt, d->depth_source_hash);
+              dw, dh, dfmt, d->depth_source_hash,
+              d->depth_capture_frame, d->vp_read_frame, d->prev_vp_frame,
+              (unsigned long long)d->depth_capture_res_handle,
+              (unsigned long long)d->vp_cbv_handle);
             reshade::log::message(reshade::log::level::info, buf);
           }
+          // DIAGNOSTIC (DLAAMVScale): A/B ONLY the DLSS MV_Scale parameter.
+          // The SDK header says InMVScale converts the velocity texture TO pixel
+          // space, so 1.0 assumes the texture is already pixel-space; 1/W,1/H
+          // assumes 1.0 = full screen; 2/W,2/H assumes NDC (1.0 = half screen).
+          // The MV shader's values are NOT modified, so this is a clean A/B of
+          // the DLSS scale convention alone.
+          float mv_scale_x = 1.f, mv_scale_y = 1.f;
+          switch ((int)g_mv_scale_mode) {
+            case 1: mv_scale_x = 1.f / (float)w; mv_scale_y = 1.f / (float)h; break;
+            case 2: mv_scale_x = 2.f / (float)w; mv_scale_y = 2.f / (float)h; break;
+            default: break;  // 1.0 (pixel-space, current)
+          }
           dlaa_ok = senkiseki3::dlss::EvaluateDLSS(cl, src, ngx_out, mv, dep,
-                       jitter_px_x, jitter_px_y, 1.f, 1.f);
+                       jitter_px_x, jitter_px_y, mv_scale_x, mv_scale_y);
+          if (dlaa_ok) ++d->evals_this_frame;  // diag: count evals/present (must be 1)
         }
       }
       // Replace t0 with DLAA output SRV (falcomengine-plus pattern).
@@ -2580,29 +2776,53 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAEnabled", .binding = &shader_injection.dlaa_enabled,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "DLAA", .section = "Antialiasing",
-        .tooltip = "Replace FXAA with NVIDIA DLAA. Requires nvngx_dlss.dll.", .labels = {"FXAA", "DLAA"},
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f, .label = "Anti-Aliasing", .section = "Antialiasing",
+        .tooltip = "Off: no anti-aliasing (FXAA replaced by a passthrough). FXAA: the game's original luma FXAA. DLAA: NVIDIA DLAA (requires nvngx_dlss.dll).", .labels = {"Off", "FXAA", "DLAA"},
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAPreset", .binding = &shader_injection.dlaa_preset,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "DLSS Preset", .section = "Antialiasing",
         .labels = {"Default","F-CNN","J-T1","K-T1","L-T2","M-T2"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAJitter", .binding = &shader_injection.dlaa_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Camera Jitter", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAJitterSign", .binding = &shader_injection.dlaa_jitter_sign,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "Jitter Sign", .section = "Antialiasing",
         .labels = {"FlipBoth","FlipX","FlipY","Current"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAJitterScale", .binding = &g_jitter_scale,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f, .label = "Jitter Report (diag)", .section = "Antialiasing",
+        .tooltip = "DIAGNOSTIC: scales the NGX jitter offset reported to DLSS WITHOUT changing the rendered jitter. 'None' reports 0 (frames ARE still jittered) — if that looks identical to 1x, DLSS ignores the reported jitter entirely. 0.5x/2x test the magnitude.",
+        .labels = {"None (report 0)","0.5x","1x (exact)","2x"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseJitterInMV", .binding = &g_jitter_in_mv,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Jitter In MV (diag)", .section = "Antialiasing",
+        .tooltip = "ROOT-CAUSE FIX (diagnostic): the per-frame rendered jitter is NOT being compensated via the reported offset (Freeze Report = no change), so it reads as sub-pixel motion -> shimmer, worst at low FPS. The velocity shader bakes the jitter DELTA (current - previous frame) into the MVs, and the reported jitter is forced to 0 so DLSS does NOT double-count. This routes the jitter through the MVs, which DLSS demonstrably consumes. Use with Jitter Color = On, Jitter Depth = Off, Report = 1x.",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseReportOnly", .binding = &g_jitter_decouple,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Report-Only Jitter (diag)", .section = "Antialiasing",
+        .tooltip = "DEFINITIVE A/B of whether DLSS consumes the reported jitter offset: renders the frame UNJITTERED but still reports the Halton jitter to DLSS. If the image changes vs plain jitter-off, DLSS uses the offset; if it looks identical, DLSS ignores the reported offset entirely. Log shows px=0 (rendered) vs jpx!=0 (reported).",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAJitterTest", .binding = &shader_injection.dlaa_jitter_test,
@@ -2618,7 +2838,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Jitter Method", .section = "Antialiasing",
         .tooltip = "Per VS: jitter is added inside each replaced scene-geometry vertex shader (each new scene's VS permutations must be patched). Global: the shared camera ViewProjection in _Globals is patched once, jittering every scene object regardless of VS hash (no per-scene shader gathering).",
         .labels = {"Per VS", "Global"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAZeroMV", .binding = &shader_injection.dlaa_zero_mv,
@@ -2626,7 +2846,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Zero Motion Vectors", .section = "Antialiasing",
         .tooltip = "Forces all motion vectors to 0. A/B: if image looks similar, MVs aren't helping; if worse, MVs contribute useful info.",
         .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAMVDirection", .binding = &shader_injection.dlaa_mv_direction,
@@ -2634,7 +2854,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "MV Direction Flip", .section = "Antialiasing",
         .tooltip = "Flips motion vector sign (previous-current instead of current-previous). A/B: if flipping fixes ghosting, the convention was wrong.",
         .labels = {"Off","Flip"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAMVThreshold", .binding = &shader_injection.dlaa_mv_threshold,
@@ -2642,7 +2862,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "MV Threshold (px)", .section = "Antialiasing",
         .tooltip = "Zeros CAMERA motion vectors below this magnitude. Kills static sub-pixel MV noise that poisons history. Per-object / Prev-Bone MVs have their own threshold: DLAAPerObjectMVThreshold.",
         .min = 0.f, .max = 5.f, .format = "%.2f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAPerObjectMVThreshold", .binding = &g_phase_mv_threshold_object,
@@ -2650,7 +2870,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Per-Object MV Threshold (px)", .section = "Antialiasing",
         .tooltip = "Zeros PER-OBJECT / Prev-Bone motion vectors below this magnitude (dynamic objects: character limbs, hair, etc.). The camera path keeps its own DLAAMVThreshold. Leave 0 to keep all per-object MVs (including small noise).",
         .min = 0.f, .max = 5.f, .format = "%.2f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAVelocityFormat", .binding = &shader_injection.dlaa_velocity_format,
@@ -2658,7 +2878,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "32-bit Motion Vectors", .section = "Antialiasing",
         .tooltip = "MV texture precision A/B: r16g16_float (16-bit, default) vs r32g32_float (32-bit). 32-bit costs a little bandwidth; 16-bit is already exact for pixel-space MVs up to 2048px.",
         .labels = {"16-bit (r16g16)","32-bit (r32g32)"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAExcludeEffects", .binding = &shader_injection.dlaa_exclude_effects,
@@ -2666,7 +2886,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Exclude Effects from DLAA", .section = "Antialiasing",
         .tooltip = "Masks particles/effects out of DLAA: they get an off-screen motion vector so DLSS falls back to the current frame (no temporal shimmer/ghosting).",
         .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAADepthSource", .binding = &shader_injection.dlaa_depth_source,
@@ -2674,7 +2894,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Depth Source", .section = "Antialiasing",
         .tooltip = "Which pass's depth DLAA uses. Auto = last full-res depth push (may be wrong). Pick the one that shows a real depth map in MV Debug=Depth. See scan log.",
         .labels = {"Auto","0x0E83E74E","0x55D61207","0x322E20D4"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAForceReset", .binding = &shader_injection.dlaa_force_reset,
@@ -2682,7 +2902,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Force Reset (No History)", .section = "Antialiasing",
         .tooltip = "Forces NGX InReset=1 every frame (no temporal accumulation). A/B test: if identical to Off, history is already disabled.",
         .labels = {"Off","On"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAPerObjectMotion", .binding = &shader_injection.dlaa_per_object_motion,
@@ -2690,46 +2910,70 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Per-Object Motion", .section = "Antialiasing",
         .tooltip = "Camera Only: camera reprojection MVs only. Per-Object: patched char VSs emit prevClip (current-pose re-skin -> camera-relative MVs). Prev-Bone: patched char VSs re-skin with the PREVIOUS frame's per-character bone matrices -> true limb/animation MVs. Requires Phase B bind mode (NoBind/Minimal off) and a restart.",
         .labels = {"Camera Only","Per-Object","Prev-Bone"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAVelocityScale", .binding = &shader_injection.dlaa_velocity_scale,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
         .default_value = 1.f, .label = "Velocity Scale", .section = "Antialiasing",
         .min = 0.1f, .max = 5.f, .format = "%.2f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAMVScale", .binding = &g_mv_scale_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f, .label = "MV Scale (diag)", .section = "Antialiasing",
+        .tooltip = "A/B: the DLSS InMVScale parameter (converts the velocity texture to pixel space) WITHOUT changing the MV shader. 1.0 = MVs already pixel-space (SDK default). 1/W,1/H = normalized (1.0 = full screen). 2/W,2/H = NDC (1.0 = half screen). If the 30 FPS jitter converges at one of these, the MV scale convention was the bug.",
+        .labels = {"1.0 (px)","1/W, 1/H","2/W, 2/H"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseDepthSampleUnjit", .binding = &g_phase_depth_sample_unjit,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Sample Depth Unjittered (diag)", .section = "Antialiasing",
+        .tooltip = "A/B: sample the velocity camera path's depth at the UNJITTERED pixel (curPxU) instead of the jittered pixel (pix). With an unjittered depth buffer, depth[pix] belongs to content at unjittered position pix, not at curPxU = pix - jitterPx — sampling at pix misreads the depth by up to half a pixel whenever jitter is on, injecting a per-frame MV error DLSS can't compensate (shimmer, worst at 30 FPS). On = sample at curPxU.",
+        .labels = {"Off (depth[pix])","On (depth[curPxU])"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseSynthMV", .binding = &g_phase_synth_jitter_mv,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f, .label = "Phase: Synthetic Jitter MV (diag)", .section = "Antialiasing",
+        .tooltip = "ESTABLISH THE SIGN: bypasses depth reprojection and writes an ANALYTIC global MV (no DLSS, no depth, no matrices) so the reproj debug view proves the correct jitter-delta MV + sign. At 30 FPS static + jitter ON, whichever of Jcur-Jprev / Jprev-Jcur makes the reproj view BLACK is the sign DLSS needs (then feed it via JitterInMV + report 0).",
+        .labels = {"Off","Zero (Test A)","Jcur-Jprev","Jprev-Jcur"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAADebugView", .binding = &shader_injection.dlaa_debug_view,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "MV Debug", .section = "Antialiasing",
         .labels = {"Off","HSV","Arrows","Magnitude","Reproj","Depth"},
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAADebugScale", .binding = &shader_injection.dlaa_debug_scale,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
         .default_value = 50.f, .label = "MV Debug Scale", .section = "Antialiasing",
         .min = 1.f, .max = 200.f, .format = "%.0f",
-        .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f && shader_injection.dlaa_debug_view >= 1.f; },
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f && shader_injection.dlaa_debug_view >= 1.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAFlagIsHDR", .binding = &shader_injection.dlaa_flag_is_hdr,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Flag: HDR Input", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAFlagDepthInverted", .binding = &shader_injection.dlaa_flag_depth_inverted,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Flag: Depth Inverted", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAFlagAutoExposure", .binding = &shader_injection.dlaa_flag_auto_exposure,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Flag: Auto Exposure", .section = "Antialiasing",
-        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 0.5f; },
+        .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAADebugLogging", .binding = &shader_injection.dlaa_debug_logging,
@@ -2768,6 +3012,20 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off","On"},
     },
     new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseFreezeReport", .binding = &g_phase_freeze_report,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Freeze Report (diag)", .section = "Antialiasing",
+        .tooltip = "A/B: render the NORMAL (Halton) jitter but report a CONSTANT jitter to DLSS. If the shake DISAPPEARS, DLSS was reacting to the VARYING report (so the offset we feed is wrong); if it STILL shakes, DLSS ignores the report and the RENDERED variation is the culprit.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseFreezeRender", .binding = &g_phase_freeze_render,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase: Freeze Render (diag)", .section = "Antialiasing",
+        .tooltip = "A/B (mirror of Freeze Report): render a CONSTANT jitter but report the normal (Halton) jitter. If it SHAKES, DLSS consumes the report; if it STAYS STABLE, DLSS ignores it.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLAAPhaseMVComp", .binding = &g_phase_mv_comp,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Phase: MV Jitter Comp", .section = "Antialiasing",
@@ -2784,9 +3042,16 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseJitterDepth", .binding = &g_phase_jitter_depth,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Phase: Jitter Character Depth", .section = "Antialiasing",
-        .tooltip = "DIAGNOSTIC: jitter the character's MAIN depth pass too, so DLSS's color and depth are in the SAME jitter state (currently color is jittered but depth is unjittered). Only the shadow VS stays unjittered. Watch for the character shadow moving.",
-        .labels = {"Off","On"},
+        .default_value = 0.f, .label = "Phase: Jitter Depth (diag)", .section = "Antialiasing",
+        .tooltip = "A/B: jitter the DEPTH pass too, so DLSS's color and depth are in the SAME jitter state (Test B). Off (default) = depth stays the game's native UNJITTERED depth (Test A). On = the world + character depth passes are jittered with the color. Only the shadow VS stays unjittered. Watch for the character shadow moving.",
+        .labels = {"Off (Test A)","On (Test B)"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseJitterColor", .binding = &g_phase_jitter_color,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase: Jitter Color (diag)", .section = "Antialiasing",
+        .tooltip = "A/B: master color-jitter toggle. On (default) = color rendered with the jittered VP (normal DLAA). Off = color renders UNJITTERED and 0 jitter is reported to DLSS — the clean baseline (unjittered color + unjittered depth + report 0).",
+        .labels = {"Off (Baseline)","On"},
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseBNoBind", .binding = &g_phaseb_no_bind,
@@ -2828,16 +3093,23 @@ renodx::utils::settings::Settings settings = {
 // ── Draw hook: FXAA replacement ──
 // DLAA output replaces t0 content; FXAA reads it and composites to RTV0
 static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
-  if (shader_injection.dlaa_enabled < 0.5f) return true;
+  if (shader_injection.dlaa_enabled < 1.5f) return true;  // DLAA only (mode 2)
   RunDLAA(cmd_list);
   return true;  // Always let FXAA run — it composites our DLAA'd t0 to RTV0
 }
 
+// ── FXAA replacement (3-way AA toggle) ──
+// The replacement shader (0x96BB8CFF) SELF-GATES on shader_injection.dlaa_enabled
+// (b13): Off (0) → passthrough, FXAA (1) → RGB-luma FXAA 3.11, DLAA (2) →
+// passthrough. No on_replace gate is needed — the shader always runs and picks
+// its behavior from the toggle. OnBeforeFxaaDraw still runs DLAA first in DLAA
+// mode so t0 holds the DLAA output for the passthrough to copy.
 renodx::mods::shader::CustomShaders custom_shaders = {
     {
         0x96BB8CFFu,
         renodx::mods::shader::CustomShader{
             .crc32 = 0x96BB8CFFu,
+            .code = __0x96BB8CFF,
             .on_draw = OnBeforeFxaaDraw,
         },
     },
@@ -3141,6 +3413,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
         // Always track output resolution for depth validation
         auto* d = dev->get_private_data<DeviceData>();
         if (d) {
+          // Measure frame time for DLSS InFrameTimeDeltaInMsec (motion-speed scaling).
+          const auto now = std::chrono::steady_clock::now();
+          if (d->last_present_time.time_since_epoch().count() != 0) {
+            const double dt_ms = std::chrono::duration<double, std::milli>(
+                now - d->last_present_time).count();
+            senkiseki3::dlss::dlss_frame_time_delta_ms = (float)dt_ms;
+          }
+          d->last_present_time = now;
           reshade::api::resource_desc bbd = dev->get_resource_desc(swapchain->get_current_back_buffer());
           d->swapchain_w = (float)bbd.texture.width;
           d->swapchain_h = (float)bbd.texture.height;
@@ -3159,6 +3439,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.
           // (Calling it in RunDLAA caused a 1-frame mismatch: the composite used J_{N-1}
           // while NGX got J_N, so DLSS could never align its temporal history.)
+          // Save the PREVIOUS frame's jitter (the value about to be overwritten) for the
+          // velocity shader's jitter-delta baking (DLAAPhaseJitterInMV).
+          d->prev_jitter_x = d->jitter_x;
+          d->prev_jitter_y = d->jitter_y;
           UpdateJitter(d);
           // Phase 0 prev-pose probe: once-per-frame summary (separate toggle).
           Phase0ProbeFrameSummary(d);
@@ -3187,7 +3471,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
             if (pcmd) CapturePrevBones(pcmd, d);
           }
         }
-        if (shader_injection.dlaa_enabled < 0.5f) return;
+        if (shader_injection.dlaa_enabled < 1.5f) return;  // NGX only in DLAA mode (2)
         if (!senkiseki3::dlss::ngx.initialized && !senkiseki3::dlss::ngx.init_failed) {
           if (shader_injection.dlaa_debug_logging > 0.5f)
             reshade::log::message(reshade::log::level::info, "[DLAA] Attempting NGX init...");
@@ -3212,6 +3496,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           reshade::log::message(reshade::log::level::info, gbuf);
         }
         if (d) { d->globals_patch_count = 0; d->globals_map_count = 0; }
+        // DIAGNOSTIC: how many EvaluateDLSS calls happened in the frame that just
+        // presented. Must be 1 — if >1, FXAA/RunDLAA fires multiple times per frame
+        // and DLSS's internal frame counter advances faster than the presented frames.
+        if (d && shader_injection.dlaa_debug_logging > 0.5f && fc % 30 == 0) {
+          char fbuf[128];
+          snprintf(fbuf, sizeof(fbuf), "[DLAA] freq f=%u evals=%u",
+                   d->frame_index, d->evals_this_frame);
+          reshade::log::message(reshade::log::level::info, fbuf);
+        }
+        if (d) d->evals_this_frame = 0;
       });
 
       reshade::log::message(reshade::log::level::info, "[Senkiseki3 DLAA] Addon loaded");

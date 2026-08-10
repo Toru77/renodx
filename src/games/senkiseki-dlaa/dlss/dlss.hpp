@@ -5,10 +5,12 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi1_6.h>
+#include <tlhelp32.h>
 #include <include/reshade.hpp>
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
@@ -18,6 +20,7 @@ namespace senkiseki3::dlss {
 
 // ── Settings globals (written by addon.cpp settings system) ──
 inline float dlss_enabled = 1.f;
+inline float dlss_frame_time_delta_ms = 16.7f;  // measured frame time (ms) for InFrameTimeDeltaInMsec
 inline float dlss_render_preset = 0.f;
 inline float dlss_motion_vectors_jittered = 0.f;
 inline float dlss_debug_logging = 0.f;
@@ -179,6 +182,60 @@ inline void ReleaseNgx() {
   ngx.init_failed = false;
 }
 
+// Log the loaded NGX/DLSS runtime module version + the NGX API version we
+// compiled against. The game never shipped DLSS — the user injects this runtime —
+// so this identifies exactly which DLSS binary is being driven. Robust: tries the
+// exact module name, then enumerates loaded modules for anything "nvngx"-named,
+// and logs the path even when no version resource is present.
+static void LogNgxRuntimeVersion() {
+  HMODULE mod = GetModuleHandleW(L"nvngx_dlss.dll");
+  wchar_t path[MAX_PATH] = {};
+  if (mod) {
+    const DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+    if (len == 0u || len >= MAX_PATH) return;
+  } else {
+    // Enumerate loaded modules for a candidate (case-insensitive "nvngx").
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me = {};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me)) {
+      do {
+        if (_wcsnicmp(me.szModule, L"nvngx", 5) == 0 ||
+            _wcsnicmp(me.szModule, L"dlss", 4) == 0) {
+          wcscpy_s(path, me.szExePath);
+          mod = me.hModule;
+          break;
+        }
+      } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    if (path[0] == 0u) return;
+  }
+  char buf[320];
+  DWORD dummy = 0;
+  const DWORD vsize = GetFileVersionInfoSizeW(path, &dummy);
+  if (vsize != 0u) {
+    std::vector<uint8_t> blob(vsize);
+    if (GetFileVersionInfoW(path, dummy, vsize, blob.data())) {
+      VS_FIXEDFILEINFO* ffi = nullptr;
+      UINT ffi_len = 0;
+      if (VerQueryValueW(blob.data(), L"\\", reinterpret_cast<void**>(&ffi), &ffi_len) && ffi) {
+        snprintf(buf, sizeof(buf),
+                 "[DLAA] NGX runtime %u.%u.%u.%u, API 0x%X (%ls)",
+                 HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                 HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS),
+                 NVSDK_NGX_VERSION_API_MACRO, path);
+        reshade::log::message(reshade::log::level::info, buf);
+        return;
+      }
+    }
+  }
+  // No version resource — still report the module path.
+  snprintf(buf, sizeof(buf), "[DLAA] NGX runtime module: %ls (no version info)", path);
+  reshade::log::message(reshade::log::level::info, buf);
+}
+
 inline bool EnsureNgxInitialized(ID3D11Device* native_device) {
   if (ngx.initialized) return ngx.supported;
   if (ngx.init_failed || native_device == nullptr) return false;
@@ -203,6 +260,8 @@ inline bool EnsureNgxInitialized(ID3D11Device* native_device) {
     reshade::log::message(reshade::log::level::error, s.str().c_str());
     return false;
   }
+
+  LogNgxRuntimeVersion();
 
   const NVSDK_NGX_Result params_result = NVSDK_NGX_D3D11_GetCapabilityParameters(&ngx.capability_parameters);
   if (NVSDK_NGX_FAILED(params_result) || ngx.capability_parameters == nullptr) {
@@ -384,6 +443,24 @@ inline bool EvaluateDLSS(ID3D11DeviceContext* command_list,
   eval.InMVScaleY = mv_scale_y;
   eval.InPreExposure = 1.f;
   eval.InExposureScale = 1.f;
+  eval.InFrameTimeDeltaInMsec = dlss_frame_time_delta_ms;
+
+  // DIAGNOSTIC: dump EVERY parameter handed to DLSS right before evaluation so we
+  // can verify the integration populates the eval struct exactly as the runtime
+  // expects. The user controls all DLSS inputs (the game never shipped DLSS).
+  if (dlss_debug_logging != 0.f) {
+    static int eval_log_count = 0;
+    if (++eval_log_count % 60 == 0) {
+      char buf[320];
+      snprintf(buf, sizeof(buf),
+        "[DLAA] eval W=%ux%u jit=(%.3f,%.3f) mvscale=(%.3f,%.3f) mvjit=%d reset=%d ftd=%.1fms sharp=%.2f preexp=%.2f flags=0x%X preset=%s",
+        width, height, jitter_x, jitter_y, mv_scale_x, mv_scale_y,
+        (feature_flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) ? 1 : 0,
+        eval.InReset, dlss_frame_time_delta_ms, eval.Feature.InSharpness,
+        eval.InPreExposure, feature_flags, GetRenderPresetName(ngx.render_preset));
+      reshade::log::message(reshade::log::level::info, buf);
+    }
+  }
 
   const NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(command_list, ngx.feature, ngx.runtime_parameters, &eval);
   if (NVSDK_NGX_FAILED(result)) {

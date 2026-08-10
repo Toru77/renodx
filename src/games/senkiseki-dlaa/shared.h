@@ -7,7 +7,7 @@
 
 struct ShaderInjectData {
   // ── DLAA ──
-  float dlaa_enabled;              // 0=Off (FXAA passthrough), 1=DLAA
+  float dlaa_enabled;              // 0=Off, 1=FXAA (game luma FXAA), 2=DLAA
   float dlaa_preset;               // DLSS preset: 0=Default, 1=F, 2=J, 3=K, 4=L, 5=M
   float dlaa_jitter_enabled;       // 0=Off, 1=On — camera projection jitter
   float dlaa_jitter_sign;          // NGX jitter sign: 0=FlipBoth, 1=FlipX, 2=FlipY, 3=Current
