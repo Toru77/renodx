@@ -25,7 +25,7 @@
 SamplerState LinearClampSampler_s : register(s0);
 Texture2D<float4> ColorBuffer : register(t0);
 
-static const float kEdgeThresholdMin = 0.01;   // game: max(0.0833, 0.1*maxLuma)
+static const float kEdgeThresholdMin = 0.0000001;   // game: max(0.0833, 0.1*maxLuma)
 static const float kEdgeThresholdMax = 0.1;
 static const float kSubpixLumaScale = 1;            // game (Senkiseki3): 0.25*((3-2s)s²)²
 

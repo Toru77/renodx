@@ -52,6 +52,10 @@ struct ShaderInjectData {
   // BindFlags) isn't lost in the general debug spam. Kept at the end of the
   // struct so the cbuffer layout of the fields above is unchanged.
   float dlaa_phase0_logging;   // 0=Off, 1=On — prev-pose bone-buffer/vertex probe logs
+
+  // ── HDR-mod compatibility (addon-side only; NOT read by shaders) ──
+  float dlaa_hdr_decode;       // 0=Off, 1=sRGB, 2=PQ — DLSS input/output color conversion (composite path)
+  float dlaa_hdr_inject;       // 0=Auto, 1=Pre-ToneMap (final_blending, raw scene), 2=Composite (FXAA)
 };
 
 #ifndef __cplusplus

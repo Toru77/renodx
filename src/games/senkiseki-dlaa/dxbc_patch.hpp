@@ -743,6 +743,15 @@ inline void EmitMovOutput(std::vector<uint32_t>& out, uint32_t out_reg, uint32_t
   EmitTempSrc(out, src_reg, src_swizzle);
 }
 
+// mov dst.mask, src (output write, custom mask) — writes prevNDC into an
+// EXISTING output's .zw (Phase E no-new-output crash-bisection).
+inline void EmitMovOutputMasked(std::vector<uint32_t>& out, uint32_t out_reg, uint32_t mask,
+                                uint32_t src_reg, uint32_t src_swizzle) {
+  EmitOpcode(out, OP_MOV, 5u);
+  EmitOutputDst(out, out_reg, mask);
+  EmitTempSrc(out, src_reg, src_swizzle);
+}
+
 // mov dst.xyzw, cbN[e].xyzw  (opcode 54, len 6)
 inline void EmitMovCb(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_mask,
                       uint32_t cb_slot, uint32_t cb_element) {
@@ -1230,6 +1239,12 @@ struct ShexScan {
   uint32_t first_non_decl = 0;    // byte offset (rel. to token stream start) of first non-dcl instr
   uint32_t ret_offset = 0;        // byte offset of the last ret instruction
   bool has_ret = false;
+  // First instruction that writes SV_Position (output register 0), used by the
+  // jitter-only patch to inject the camera jitter into the source temp BEFORE
+  // o0 is written (outputs cannot be read back).
+  uint32_t o0_write_offset = 0;   // byte offset (rel. token stream) of the o0 write
+  bool o0_from_temp = false;      // the write is `mov o0.xyzw, rN`
+  uint32_t o0_src_temp = 0;       // rN (the clip-space temp to jitter)
   std::vector<uint32_t> cb_slots;        // cbuffer slots from dcl_constantbuffer
   std::vector<std::pair<uint32_t, uint32_t>> cb_slot_sizes;  // (slot, register count) pairs
   std::vector<uint32_t> resource_slots;  // t-slots from ANY dcl_resource* decl (textures + structured + raw + typed)
@@ -1364,9 +1379,17 @@ inline bool ScanShex(const uint8_t* chunk_data, uint32_t chunk_size, ShexScan& o
     if (op != kOpCustomData) {
       uint32_t idx = start + 1u;
       if ((dwords[start] & 0xFFu) == 0xFFu) ++idx;  // extended opcode: 2-dword header
+      uint32_t op_index = 0u;
+      uint32_t dst_type = 0u, dst_reg = 0u;
+      uint32_t mov_src_type = 0u, mov_src_reg = 0u;
       while (idx < start + ins.length) {
         uint32_t first = 0u, second = 0u;
         const uint32_t otype = WalkOperand(dwords, idx, &first, &second);
+        // The FIRST operand is the destination; for `mov o0, rN` the SECOND is
+        // the source temp (needed by the jitter-only patch).
+        if (op_index == 0u) { dst_type = otype; dst_reg = first; }
+        else if (op == OP_MOV && op_index == 1u) { mov_src_type = otype; mov_src_reg = first; }
+        ++op_index;
         if (otype == OPERAND_TEMP && first > out.max_temp) out.max_temp = first;
         // For a constant-buffer operand (type 8), index0 = buffer slot,
         // index1 = element (confirmed against 0x0D5DABC6: every CB operand is
@@ -1374,6 +1397,15 @@ inline bool ScanShex(const uint8_t* chunk_data, uint32_t chunk_size, ShexScan& o
         // (globals_slot, edge_elem).
         if (otype == OPERAND_CONSTANT_BUFFER)
           out.cb_reads.emplace_back(first, second);
+      }
+      // First write to SV_Position (output reg 0). Outputs can't be read, so
+      // the jitter-only patch jitters the MOV's source temp before the write.
+      if (out.o0_write_offset == 0u && dst_type == OPERAND_OUTPUT && dst_reg == 0u) {
+        out.o0_write_offset = ins.offset;
+        if (op == OP_MOV && mov_src_type == OPERAND_TEMP) {
+          out.o0_from_temp = true;
+          out.o0_src_temp = mov_src_reg;
+        }
       }
     }
     pos = start + ins.length;
@@ -1420,6 +1452,11 @@ struct PatchOptions {
   bool test_constant_output = false; // crash-bisection: minimal, but o7 = (0,0,0,1) constant
                                      // — ZERO reads at all. Isolates the cb0 read / v7 data
                                      // from the mere existence of the output register.
+  bool jitter_only = false;          // camera path: inject ONLY the SV_Position camera
+                                     // jitter (b13) before the o0 write. No prevClip
+                                     // output, no re-skin, no prevVP, no outline, no OSGN
+                                     // append. Under GLOBAL jitter the b13 offset is 0 ->
+                                     // inert by design (the _Globals VP patch does it).
 };
 
 // prev-bone re-skin block (t#) × addon prevVP cbuffer (b#) → new TEXCOORD
@@ -1517,6 +1554,140 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   ShexScan scan;
   if (!ScanShex(shex_data, shex->size, scan)) return false;
   if (!scan.has_ret) return false;  // can't find the tail
+
+  // ── Jitter-only mode (Phase B for the camera path) ──
+  // The generic VS patch's ONLY job here: add the camera jitter to SV_Position
+  // (o0.x/y += jitter * o0.w) right before the game's o0 write, reading the
+  // addon's b13 cbuffer (jitter_offset at c4.zw — matches shared.h). No
+  // prevClip output, no prev-bone re-skin, no prevVP, no outline, no OSGN
+  // append: NONE of the per-object motion machinery. Under the GLOBAL jitter
+  // method ApplyPerDrawJitter zeroes b13.jitter_offset, so this adds 0 — inert
+  // by design (Global jitter is applied via the _Globals VP patch). Under
+  // Per-VS jitter it shifts SV_Position exactly like the custom replacements.
+  if (options.jitter_only) {
+    if (!scan.o0_from_temp || scan.o0_write_offset == 0u) return false;  // can't find o0 write
+    const uint32_t rS = scan.o0_src_temp;
+    const uint32_t rJ = std::max(scan.has_temps ? scan.dcl_temps : 0u, scan.max_temp + 1u);
+    const uint32_t new_dcl_temps = rJ + 1u;
+
+    std::vector<uint32_t> decls;
+    EmitDclConstantBuffer(decls, 13u, 5u);  // addon shader_injection b13 (jitter at c4.zw)
+
+    std::vector<uint32_t> body;
+    EmitMovCb(body, rJ, 0xFu, 13u, 4u);     // rJ = cb13[4]
+    EmitMad(body, rS, 0x1u, rJ, kSwizzleZZZZ, rS, kSwizzleWWWW, rS, kSwizzleXXXX);  // rS.x += rJ.z * rS.w
+    EmitMad(body, rS, 0x2u, rJ, kSwizzleWWWW, rS, kSwizzleWWWW, rS, kSwizzleYYYY);  // rS.y += rJ.w * rS.w
+
+    // Rebuild the SHEX token stream with the bumped dcl_temps.
+    const uint32_t* tokens = reinterpret_cast<const uint32_t*>(shex_data + 8u);
+    const uint32_t old_token_dwords = (shex->size - 8u) / 4u;
+    uint32_t first_non_decl_dw = scan.first_non_decl / 4u - 2u;  // rel. to token stream
+    uint32_t o0_dw = scan.o0_write_offset / 4u - 2u;             // insert jitter before o0 write
+
+    std::vector<uint32_t> new_tokens(tokens, tokens + old_token_dwords);
+    bool patched_temps = false;
+    if (scan.has_temps) {
+      for (uint32_t i = 0; i < first_non_decl_dw;) {
+        const uint32_t op = new_tokens[i] & 0x7FFu;
+        const uint32_t len = InstructionLength(new_tokens.data(), old_token_dwords, i);
+        if (op == OP_DCL_TEMPS && len >= 2u) {
+          new_tokens[i + 1u] = new_dcl_temps;
+          patched_temps = true;
+          break;
+        }
+        if (len == 0u) break;
+        i += len;
+      }
+    }
+    if (!patched_temps) {
+      std::vector<uint32_t> tmp;
+      EmitDclTemps(tmp, new_dcl_temps);
+      new_tokens.insert(new_tokens.begin(), tmp.begin(), tmp.end());
+      first_non_decl_dw += (uint32_t)tmp.size();
+      o0_dw += (uint32_t)tmp.size();
+    }
+
+    // Splice: decls + tokens[..o0) + jitter body + tokens[o0..)
+    std::vector<uint32_t> assembled;
+    assembled.reserve(new_tokens.size() + decls.size() + body.size());
+    assembled.insert(assembled.end(), new_tokens.begin(), new_tokens.begin() + first_non_decl_dw);
+    assembled.insert(assembled.end(), decls.begin(), decls.end());
+    assembled.insert(assembled.end(), new_tokens.begin() + first_non_decl_dw,
+                     new_tokens.begin() + o0_dw);
+    assembled.insert(assembled.end(), body.begin(), body.end());
+    assembled.insert(assembled.end(), new_tokens.begin() + o0_dw, new_tokens.end());
+
+    // ── Assemble the fresh blob with the grown SHEX chunk (same as the motion path) ──
+    const uint32_t new_shex_size = 8u + (uint32_t)assembled.size() * 4u;
+    const uint32_t delta = new_shex_size - shex->size;
+    const uint32_t new_file_size = (uint32_t)data.size() + delta;
+
+    std::vector<std::byte> out;
+    out.reserve(new_file_size);
+    out.insert(out.end(), data.begin(), data.begin() + 32);
+    std::memcpy(out.data() + 24u, &new_file_size, 4);
+    for (const auto& c : chunks) {
+      uint32_t off = c.offset;
+      if (c.offset > shex->offset) off += delta;
+      std::byte* p = reinterpret_cast<std::byte*>(&off);
+      out.insert(out.end(), p, p + 4);
+    }
+    for (const auto& c : chunks) {
+      if (c.offset == shex->offset) {
+        out.insert(out.end(), data.begin() + c.offset, data.begin() + c.offset + 4);  // name
+        std::byte* szp = reinterpret_cast<std::byte*>(const_cast<uint32_t*>(&new_shex_size));
+        out.insert(out.end(), szp, szp + 4);
+        out.insert(out.end(), data.begin() + c.offset + 8, data.begin() + c.offset + 12);
+        const uint32_t new_count = (uint32_t)assembled.size() + 2u;
+        std::byte* cp = reinterpret_cast<std::byte*>(const_cast<uint32_t*>(&new_count));
+        out.insert(out.end(), cp, cp + 4);
+        const std::byte* tb = reinterpret_cast<const std::byte*>(assembled.data());
+        out.insert(out.end(), tb, tb + assembled.size() * 4u);
+      } else {
+        const uint32_t clen = 8u + c.size;
+        out.insert(out.end(), data.begin() + c.offset, data.begin() + c.offset + clen);
+      }
+    }
+
+    // ── Fix the STAT chunk (instruction + temp counts) — no OSGN append here ──
+    {
+      DXBCHeader h3;
+      std::vector<ChunkInfo> chunks3;
+      if (ParseDXBC(out, h3, chunks3)) {
+        if (const ChunkInfo* stat = FindChunk(chunks3, "STAT")) {
+          if (stat->size >= 8u) {
+            uint8_t* stat_data =
+                reinterpret_cast<uint8_t*>(out.data()) + stat->offset + kChunkHeaderSize;
+            uint32_t new_instr = 0u;
+            size_t i = 0u;
+            while (i < assembled.size()) {
+              const uint32_t t = assembled[i];
+              const uint32_t len = t >> 24u;
+              if (len == 0u) break;
+              if (!IsDeclOpcode(t & 0x7FFu)) ++new_instr;
+              i += len;
+            }
+            std::memcpy(stat_data + 0u, &new_instr, 4);
+            std::memcpy(stat_data + 4u, &new_dcl_temps, 4);
+          }
+        }
+      }
+    }
+
+    WriteDXBCHash(out);
+    data = std::move(out);
+    uint32_t new_hash = 0u;
+    {
+      const uint8_t* c = reinterpret_cast<const uint8_t*>(data.data());
+      new_hash = ComputeCRC32(c, data.size());
+    }
+    if (out_new_hash != nullptr) *out_new_hash = new_hash;
+    if (out_info != nullptr) {
+      out_info->new_hash = new_hash;
+      out_info->needs_no_binding = true;  // reads only b13 (0 under Global); no prev-bone/prevVP binds
+    }
+    return true;
+  }
 
   // Pick free prevVP cb slot (skip used + 13=shader_injection) and prev-bone t slot.
   uint32_t cb_slot = 1u;
@@ -1862,6 +2033,26 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   return true;
 }
 
+// Phase E crash-bisection options (mirrors Phase B's PatchOptions). Each
+// variant strips one construct from the injected PS so we can isolate which
+// piece makes the NVIDIA driver hang the GPU on the linked patched VS+PS pair.
+struct PixelShaderPatchOptions {
+  bool constant_output = false;  // add ONLY the oM output (constant write) —
+                                 // no new input decl, no SV_SampleIndex
+                                 // relocation, no vN read.
+  bool no_read = false;          // normal input decl + SV relocation, but the
+                                 // body writes a CONSTANT (never reads vN).
+  bool no_math = false;          // normal input decl + SV relocation, body =
+                                 // mov oM, vN straight through (no max/div/mad).
+  bool no_new_output = false;    // normal input + SV relocation + full div/mad
+                                 // math, but prevNDC goes into the EXISTING max
+                                 // output's .zw instead of a NEW appended
+                                 // output — no OSGN append, no dcl_output.
+                                 // Every crashing test so far appended a new
+                                 // output; if this is safe, the appended
+                                 // output register was the trigger.
+};
+
 // ── Generic per-object-motion PS patcher (Phase E core) ──
 // Detects a G-buffer pixel shader (>=3 SV_TARGET outputs), appends a TEXCOORD5
 // input (prevClip from the paired patched char VS) + an SV_TARGET3 output (the
@@ -1872,7 +2063,8 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
 // whenever per-object motion is off. Mirrors the VS patch's chunk/STAT/hash
 // fixups. No per-hash lists — this replaces the 22 hand-patched boot PSs.
 inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* out_new_hash,
-                                      uint32_t vs_texcoord_index = 0u) {
+                                      uint32_t vs_texcoord_index = 0u,
+                                      const PixelShaderPatchOptions& options = {}) {
   DXBCHeader header;
   std::vector<ChunkInfo> chunks;
   if (!ParseDXBC(data, header, chunks)) return false;
@@ -1978,24 +2170,51 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   const uint32_t new_dcl_temps = temp_base + 2u;
 
   // Build injected declaration tokens: dcl_input_ps vN.xyzw + dcl_output oM.
+  // constant_output skips the input decl entirely — the PS only gains the oM
+  // output written with a constant, isolating the output register / OSGN
+  // append from the new input + SV relocation.
   std::vector<uint32_t> decls;
-  EmitDclInputPs(decls, new_in_reg);
-  EmitDclOutput(decls, new_out_reg);
+  if (!options.constant_output) EmitDclInputPs(decls, new_in_reg);
+  if (!options.no_new_output) EmitDclOutput(decls, new_out_reg);
 
   // Build injected body tokens (mirrors the hand-patched boot PS):
   //   rT = vN; rT.w = max(rT.w, 0.001); rT.xy = rT.xy / rT.w
   //   rHalf = (0.5,0.5); rT.xy = rT.xy*0.5 + 0.5
   //   rT.z = 0; rT.w = 1; o3 = rT
+  // Crash-bisection variants:
+  //   constant_output / no_read: oM = (0.5,0.5,0,1) — NEVER touches vN
+  //     (isolates the vN data path from the decls).
+  //   no_math: oM = vN straight through (no max/div/mad) — isolates the math.
   std::vector<uint32_t> body;
-  EmitMovInput(body, rT, 0xFu, new_in_reg, 0xFu);                  // mov rT.xyzw, vN.xyzw
-  EmitMaxImm1(body, rT, 0x8u, rT, kSwizzleWWWW, 0x3A83126Fu);      // max rT.w, rT.w, l(0.001)
-  EmitDiv(body, rT, 0x3u, rT, kSwizzleXYZW, rT, kSwizzleWWWW);     // div rT.xy, rT.xy, rT.ww
-  EmitMovImm4(body, rHalf, 0x3u, 0x3F000000u, 0x3F000000u, 0u, 0u); // rHalf.xy = (0.5,0.5)
-  EmitMad(body, rT, 0x3u, rT, kSwizzleXYZW, rHalf, kSwizzleXYZW, rHalf,
-          kSwizzleXYZW);                                          // rT.xy = rT.xy*0.5+0.5
-  EmitMovImm1(body, rT, 0x4u, 0u);                                 // rT.z = 0
-  EmitMovImm1(body, rT, 0x8u, 0x3F800000u);                        // rT.w = 1.0 (valid flag)
-  EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);              // mov oM.xyzw, rT.xyzw
+  if (options.constant_output || options.no_read) {
+    EmitMovImm4(body, rT, 0xFu, 0x3F000000u, 0x3F000000u, 0u, 0x3F800000u);  // rT = (0.5,0.5,0,1)
+    EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);                     // mov oM.xyzw, rT.xyzw
+  } else if (options.no_math) {
+    EmitMovInput(body, rT, 0xFu, new_in_reg, 0xFu);                         // mov rT.xyzw, vN.xyzw
+    EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);                     // mov oM.xyzw, rT.xyzw
+  } else if (options.no_new_output) {
+    // Full prevClip->NDC math, but write into the EXISTING max output's .zw
+    // (o2.zw for 3-RT, o3.zw for 4-RT) instead of an appended oM. No new
+    // output register, no OSGN append — tests whether the appended output was
+    // the crash trigger. Swizzle (_,_,X,Y): dest.z=rT.x, dest.w=rT.y.
+    EmitMovInput(body, rT, 0xFu, new_in_reg, 0xFu);                  // mov rT.xyzw, vN.xyzw
+    EmitMaxImm1(body, rT, 0x8u, rT, kSwizzleWWWW, 0x3A83126Fu);      // max rT.w, rT.w, l(0.001)
+    EmitDiv(body, rT, 0x3u, rT, kSwizzleXYZW, rT, kSwizzleWWWW);     // div rT.xy, rT.xy, rT.ww
+    EmitMovImm4(body, rHalf, 0x3u, 0x3F000000u, 0x3F000000u, 0u, 0u); // rHalf.xy = (0.5,0.5)
+    EmitMad(body, rT, 0x3u, rT, kSwizzleXYZW, rHalf, kSwizzleXYZW, rHalf,
+            kSwizzleXYZW);                                          // rT.xy = rT.xy*0.5+0.5
+    EmitMovOutputMasked(body, max_out, 0xCu, rT, 0x40u);             // mov o{max}.zw, rT.xy
+  } else {
+    EmitMovInput(body, rT, 0xFu, new_in_reg, 0xFu);                  // mov rT.xyzw, vN.xyzw
+    EmitMaxImm1(body, rT, 0x8u, rT, kSwizzleWWWW, 0x3A83126Fu);      // max rT.w, rT.w, l(0.001)
+    EmitDiv(body, rT, 0x3u, rT, kSwizzleXYZW, rT, kSwizzleWWWW);     // div rT.xy, rT.xy, rT.ww
+    EmitMovImm4(body, rHalf, 0x3u, 0x3F000000u, 0x3F000000u, 0u, 0u); // rHalf.xy = (0.5,0.5)
+    EmitMad(body, rT, 0x3u, rT, kSwizzleXYZW, rHalf, kSwizzleXYZW, rHalf,
+            kSwizzleXYZW);                                          // rT.xy = rT.xy*0.5+0.5
+    EmitMovImm1(body, rT, 0x4u, 0u);                                 // rT.z = 0
+    EmitMovImm1(body, rT, 0x8u, 0x3F800000u);                        // rT.w = 1.0 (valid flag)
+    EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);              // mov oM.xyzw, rT.xyzw
+  }
 
   // ── Rebuild the SHEX chunk token stream (same as the VS patch) ──
   const uint32_t* tokens = reinterpret_cast<const uint32_t*>(shex_data + 8u);
@@ -2008,7 +2227,10 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   // higher register so TEXCOORD5 can take the register the VS writes prevClip
   // to. Must happen on the ORIGINAL stream before the new decls/body are
   // spliced in (the injected code uses new_in_reg, not the old SV register).
-  if (sv_old_reg != UINT32_MAX) RewriteInputRegister(new_tokens, sv_old_reg, sv_new_reg);
+  // constant_output skips the input decl entirely, so an SV_SampleIndex sitting
+  // on new_in_reg stays where it is (no relocation needed).
+  if (!options.constant_output && sv_old_reg != UINT32_MAX)
+    RewriteInputRegister(new_tokens, sv_old_reg, sv_new_reg);
   bool patched_temps = false;
   if (scan.has_temps) {
     for (uint32_t i = 0; i < first_non_decl_dw;) {
@@ -2107,8 +2329,9 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
       return false;
   }
   // ── Append the OSGN output entry (SV_TARGET at max_out+1: 3 for 3-RT, 4 for
-  // 4-RT G-buffer PSs) ──
-  {
+  // 4-RT G-buffer PSs). SKIPPED in no_new_output mode: prevNDC goes into the
+  // EXISTING max output's .zw, so the PS gains no new SV_TARGET. ──
+  if (!options.no_new_output) {
     DXBCHeader h2;
     std::vector<ChunkInfo> chunks2;
     if (!ParseDXBC(out, h2, chunks2)) return false;

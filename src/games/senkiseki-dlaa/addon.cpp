@@ -11,6 +11,7 @@
 #define DEBUG_LEVEL_0
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -20,6 +21,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,6 +57,8 @@ ShaderInjectData shader_injection = {
     .dlaa_velocity_format = 0.f,
     .dlaa_exclude_effects = 0.f,
     .dlaa_phase0_logging = 0.f,
+    .dlaa_hdr_decode = 0.f,
+    .dlaa_hdr_inject = 0.f,
 };
 
 // ── Phase B isolation toggles (addon-side floats, NOT in ShaderInjectData —
@@ -70,6 +74,18 @@ static float g_phaseb_no_output = 0.f;  // crash-bisection: injected block runs 
 static float g_phaseb_constant = 0.f;   // crash-bisection: minimal but o7 = (0,0,0,1) constant,
                                         // zero reads at all
 static float g_phaseb_dump = 0.f;     // evidence capture: write patched/original blobs + drawtrace to renodx-dev/dump/phaseb/
+static float g_phaseb_jitter_only = 1.f;  // camera path (default ON): generic VS patch ONLY
+                                          // adds the SV_Position jitter — no prevClip output,
+                                          // no prev-bone re-skin, no prevVP, no outline, no
+                                          // OSGN append. Under GLOBAL jitter it's inert (b13=0).
+// ── Phase E crash-bisection toggles (mirror Phase B's; isolate what the
+// NVIDIA driver chokes on in the patched PS) ──
+static float g_phasee_constant = 0.f;  // add ONLY the o3 output, constant write — no input
+                                       // decl, no SV_SampleIndex relocation, no vN read
+static float g_phasee_no_read = 0.f;   // input decl + SV relocation, but body never reads vN
+static float g_phasee_no_math = 0.f;   // input decl + SV relocation, mov o3,vN (no div/mad)
+static float g_phasee_no_new_output = 0.f;  // full input+math, but prevNDC -> EXISTING
+                                            // o{max}.zw, NO new output / OSGN append
 // ── Shake-isolation diagnostics (addon-side floats, NOT in ShaderInjectData) ──
 static float g_phase_freeze_jitter = 0.f;  // DIAGNOSTIC: fix jitter at a CONSTANT value every frame (Halton disabled).
                                           // If the Prev-Bone shake disappears with a fixed jitter, the error is the
@@ -381,6 +397,28 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t prev_vp_slot = 0u;
   bool patched_bind_restore_pending = false;
 
+  // ── Hang watchdog (scene-3 loading-screen freeze) ──
+  // A background thread writes a heartbeat to watchdog.log every 250 ms while
+  // the render thread keeps `watchdog_progress` stamped at every interesting
+  // spot (pipeline patch start/end, draw hook enter/done, present). When the
+  // game freezes, the render thread stops advancing the string, so the LAST
+  // repeated heartbeat names the exact spot — splitting the two failure modes
+  // we keep going back and forth on:
+  //   * stuck after "create_pipeline phaseE patched PS 0x..->0x.."
+  //       => blocked inside the driver's CreatePixelShader => driver COMPILE
+  //          hang on that patched shader pair (no CPU assertion can catch it)
+  //   * stuck after "draw done vs=0x.. ps=0x.."
+  //       => blocked inside the driver's Draw/DrawIndexed => GPU EXECUTION
+  //          hang on that patched draw
+  std::mutex watchdog_mutex;
+  char watchdog_progress[512] = "init";  // FIXED buffer: zero heap allocation inside the
+                                         // lock scope, so a hung/corrupt heap can never
+                                         // deadlock the watchdog against the render thread
+  std::atomic<bool> watchdog_running{false};
+  std::atomic<uint64_t> watchdog_ping{0};  // bumped every heartbeat; proves the watchdog
+                                           // thread is alive even when the progress stalls
+  std::thread watchdog_thread;
+
   reshade::api::sampler point_sampler = {};
 
   // Previous-frame color scratch (reprojection debug mode)
@@ -395,7 +433,42 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11ShaderResourceView* dbg_prev_srv = nullptr;
   ID3D11SamplerState* dbg_linear_sampler = nullptr;
   ID3D11Buffer* dbg_cb = nullptr;
+
+  // ── HDR-mod compatibility (Phase 2): DLSS input/output color conversion ──
+  // Decode the sRGB/PQ composite to linear before DLSS (DLSS always expects
+  // linear input), then re-encode the DLSS output to the encoding the HDR chain
+  // expects (0x9DB02646 SignPow + swapchain proxy sRGB-decode -> PQ).
+  ID3D11ComputeShader* hdr_conv_cs = nullptr;
+  ID3D11Buffer* hdr_conv_cb = nullptr;
+  ID3D11Texture2D* linear_scratch = nullptr;     // r16g16b16a16_float (DLSS input)
+  ID3D11ShaderResourceView* linear_scratch_srv = nullptr;
+  ID3D11UnorderedAccessView* linear_scratch_uav = nullptr;
+  ID3D11Texture2D* encoded_scratch = nullptr;    // r8g8b8a8_unorm (re-encoded DLSS output)
+  ID3D11ShaderResourceView* encoded_scratch_srv = nullptr;
+  ID3D11UnorderedAccessView* encoded_scratch_uav = nullptr;
+  ID3D11Texture2D* ngx_dump_staging = nullptr;   // CPU-readable copy of NGX output (luma diag)
+  uint32_t hdr_scratch_w = 0u, hdr_scratch_h = 0u;
+  bool hdr_detected = false;                     // _renodx-senkiseki.addon64 loaded (Phase 3 auto-default)
+  bool dlaa_ran_this_frame = false;              // DLSS bound t0 at a final_blending draw this frame
+
+  // ── Robust DLSS color source (Phase 3 fix) ──
+  // The game's PS t0 at the FXAA draw IS the composite. Read it live so the
+  // DLSS input is immune to the event capture's failure modes under the HDR mod
+  // (hash-0 "Pipeline not found" skip, or our own NGX-output t0 bind re-firing
+  // the capture hook). Native AddRef'd pointers.
+  ID3D11ShaderResourceView* live_color_srv = nullptr;
+  ID3D11Resource* live_color_res = nullptr;
+  uint32_t color_capture_frame = 0u;             // last successful event color capture
+  ID3D11Texture2D* color_dump_staging = nullptr; // CPU readback for the color-source diag
 };
+
+// ── Hang watchdog (full definitions live below WritePhasebDump; forward
+// declarations so the draw hooks + pipeline patcher + present can stamp the
+// current spot).
+static void WatchdogSet(DeviceData* d, const char* fmt, ...);
+static void WatchdogStampDraw(reshade::api::command_list* cmd_list, DeviceData* d, const char* tag);
+static void WatchdogStart(DeviceData* d);
+static void WatchdogStop(DeviceData* d);
 
 // ── Halton jitter ──
 static float Halton(uint32_t n, uint32_t base) {
@@ -407,6 +480,7 @@ static float Halton(uint32_t n, uint32_t base) {
 // ── Destroy ──
 static void Destroy(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
+  WatchdogStop(d);  // join the heartbeat thread before tearing down DeviceData
   auto dr = [&](reshade::api::resource& r) { if(r.handle) dev->destroy_resource(r); r={}; };
   auto dv = [&](reshade::api::resource_view& v) { if(v.handle) dev->destroy_resource_view(v); v={}; };
   auto dp = [&](reshade::api::pipeline& p) { if(p.handle) dev->destroy_pipeline(p); p={}; };
@@ -437,6 +511,20 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   if (d->dbg_prev_srv) { d->dbg_prev_srv->Release(); d->dbg_prev_srv = nullptr; }
   if (d->dbg_linear_sampler) { d->dbg_linear_sampler->Release(); d->dbg_linear_sampler = nullptr; }
   if (d->dbg_cb) { d->dbg_cb->Release(); d->dbg_cb = nullptr; }
+  if (d->hdr_conv_cs) { d->hdr_conv_cs->Release(); d->hdr_conv_cs = nullptr; }
+  if (d->hdr_conv_cb) { d->hdr_conv_cb->Release(); d->hdr_conv_cb = nullptr; }
+  if (d->linear_scratch_uav) { d->linear_scratch_uav->Release(); d->linear_scratch_uav = nullptr; }
+  if (d->linear_scratch_srv) { d->linear_scratch_srv->Release(); d->linear_scratch_srv = nullptr; }
+  if (d->linear_scratch) { d->linear_scratch->Release(); d->linear_scratch = nullptr; }
+  if (d->encoded_scratch_uav) { d->encoded_scratch_uav->Release(); d->encoded_scratch_uav = nullptr; }
+  if (d->encoded_scratch_srv) { d->encoded_scratch_srv->Release(); d->encoded_scratch_srv = nullptr; }
+  if (d->encoded_scratch) { d->encoded_scratch->Release(); d->encoded_scratch = nullptr; }
+  if (d->ngx_dump_staging) { d->ngx_dump_staging->Release(); d->ngx_dump_staging = nullptr; }
+  if (d->color_dump_staging) { d->color_dump_staging->Release(); d->color_dump_staging = nullptr; }
+  if (d->live_color_srv) { d->live_color_srv->Release(); d->live_color_srv = nullptr; }
+  if (d->live_color_res) { d->live_color_res->Release(); d->live_color_res = nullptr; }
+  d->color_capture_frame = 0u;
+  d->hdr_scratch_w = 0u; d->hdr_scratch_h = 0u;
   if (d->prev_vp_cb) { d->prev_vp_cb->Release(); d->prev_vp_cb = nullptr; }
   if (d->prev_bones_srv) { d->prev_bones_srv->Release(); d->prev_bones_srv = nullptr; }
   if (d->prev_bones_buffer) { d->prev_bones_buffer->Release(); d->prev_bones_buffer = nullptr; }
@@ -615,6 +703,213 @@ static bool EnsurePrevColorTexture(reshade::api::device* dev, DeviceData* d, uin
   reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1);
   dev->create_resource_view(d->prev_color_texture, reshade::api::resource_usage::shader_resource, vd, &d->prev_color_srv);
   return d->prev_color_texture.handle != 0u && d->prev_color_srv.handle != 0u;
+}
+
+// ── HDR-mod compatibility (Phase 2): DLSS input/output color conversion ──
+// The senkiseki HDR mod encodes the composite as sRGB (processAndToneMap ->
+// srgb::EncodeSafe) while DLSS always expects LINEAR input regardless of the
+// IsHDR flag, so DLSS outputs dark/black content which the HDR swapchain proxy
+// (sRGB decode -> PQ) amplifies to a pure black screen. These passes decode the
+// captured composite to a linear scratch (DLSS input) and re-encode the DLSS
+// output back to the encoding the HDR chain expects (0x9DB02646 SignPow + proxy).
+static bool EnsureHdrConversion(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
+  auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
+  if (!nd || !d || w == 0u || h == 0u) return false;
+
+  if (!d->hdr_conv_cs) {
+    if (FAILED(nd->CreateComputeShader(__hdr_convert.data(), static_cast<SIZE_T>(__hdr_convert.size()), nullptr, &d->hdr_conv_cs)))
+      return false;
+  }
+  if (!d->hdr_conv_cb) {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(nd->CreateBuffer(&bd, nullptr, &d->hdr_conv_cb))) return false;
+  }
+  const bool size_changed = (d->hdr_scratch_w != w || d->hdr_scratch_h != h);
+  if (d->linear_scratch && size_changed) {
+    if (d->linear_scratch_uav) { d->linear_scratch_uav->Release(); d->linear_scratch_uav = nullptr; }
+    if (d->linear_scratch_srv) { d->linear_scratch_srv->Release(); d->linear_scratch_srv = nullptr; }
+    if (d->linear_scratch) { d->linear_scratch->Release(); d->linear_scratch = nullptr; }
+  }
+  if (!d->linear_scratch) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->linear_scratch))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.Format = td.Format; srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; srvd.Texture2D.MipLevels = 1;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {};
+    uavd.Format = td.Format; uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D; uavd.Texture2D.MipSlice = 0;
+    if (FAILED(nd->CreateShaderResourceView(d->linear_scratch, &srvd, &d->linear_scratch_srv))) return false;
+    if (FAILED(nd->CreateUnorderedAccessView(d->linear_scratch, &uavd, &d->linear_scratch_uav))) return false;
+  }
+  if (d->encoded_scratch && size_changed) {
+    if (d->encoded_scratch_uav) { d->encoded_scratch_uav->Release(); d->encoded_scratch_uav = nullptr; }
+    if (d->encoded_scratch_srv) { d->encoded_scratch_srv->Release(); d->encoded_scratch_srv = nullptr; }
+    if (d->encoded_scratch) { d->encoded_scratch->Release(); d->encoded_scratch = nullptr; }
+  }
+  if (!d->encoded_scratch) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->encoded_scratch))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+    srvd.Format = td.Format; srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; srvd.Texture2D.MipLevels = 1;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavd = {};
+    uavd.Format = td.Format; uavd.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D; uavd.Texture2D.MipSlice = 0;
+    if (FAILED(nd->CreateShaderResourceView(d->encoded_scratch, &srvd, &d->encoded_scratch_srv))) return false;
+    if (FAILED(nd->CreateUnorderedAccessView(d->encoded_scratch, &uavd, &d->encoded_scratch_uav))) return false;
+  }
+  // CPU staging for the NGX-output luma diagnostic (matches ngx output format).
+  if (!d->ngx_dump_staging) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->ngx_dump_staging))) return false;
+  }
+  d->hdr_scratch_w = w; d->hdr_scratch_h = h;
+  return true;
+}
+
+// Run one color-conversion compute pass on the native context (mode: 0=sRGB
+// decode, 1=sRGB encode, 2=PQ decode, 3=PQ encode).
+static bool RunHdrConvertPass(ID3D11DeviceContext* cl, DeviceData* d, int mode,
+                              ID3D11ShaderResourceView* src_srv,
+                              ID3D11UnorderedAccessView* dst_uav,
+                              uint32_t w, uint32_t h) {
+  if (!cl || !d || !d->hdr_conv_cs || !d->hdr_conv_cb || !src_srv || !dst_uav) return false;
+  D3D11_MAPPED_SUBRESOURCE map = {};
+  if (FAILED(cl->Map(d->hdr_conv_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
+  float* p = static_cast<float*>(map.pData);
+  p[0] = (float)mode; p[1] = 0.f; p[2] = 0.f; p[3] = 0.f;
+  cl->Unmap(d->hdr_conv_cb, 0);
+  ID3D11ShaderResourceView* srvs[1] = { src_srv };
+  ID3D11UnorderedAccessView* uavs[1] = { dst_uav };
+  cl->CSSetShaderResources(0, 1, srvs);
+  cl->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+  cl->CSSetConstantBuffers(13, 1, &d->hdr_conv_cb);
+  cl->CSSetShader(d->hdr_conv_cs, nullptr, 0);
+  cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+  ID3D11UnorderedAccessView* null_uav = nullptr;
+  cl->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+  ID3D11ShaderResourceView* null_srv[1] = {};
+  cl->CSSetShaderResources(0, 1, null_srv);
+  cl->CSSetShader(nullptr, nullptr, 0);
+  return true;
+}
+
+// DIAGNOSTIC: copy the NGX output to a CPU staging texture and log min/avg/max
+// RGB luma (throttled ~1 Hz by the caller). Distinguishes "DLSS wrote PURE 0
+// (eval/config failure)" from "DLSS wrote DARK-but-nonzero content (encoding
+// mismatch -> the DLAAHdrDecode fix)". GPU stall acceptable at 1 Hz.
+static void LogNgxOutputLuma(ID3D11DeviceContext* cl, DeviceData* d) {
+  if (!cl || !d || !d->ngx_dump_staging) return;
+  auto* ngx_out = senkiseki3::dlss::ngx.output_texture.Get();
+  if (!ngx_out) return;
+  cl->CopyResource(d->ngx_dump_staging, ngx_out);
+  D3D11_MAPPED_SUBRESOURCE map = {};
+  if (FAILED(cl->Map(d->ngx_dump_staging, 0, D3D11_MAP_READ, 0, &map))) return;
+  auto* px = static_cast<const uint8_t*>(map.pData);
+  double sum = 0.0;
+  float mn = 1e9f, mx = -1e9f;
+  uint64_t samples = 0;
+  const uint32_t stride = map.RowPitch;
+  for (uint32_t y = 0; y < d->hdr_scratch_h; y += 8) {
+    const uint8_t* row = px + (size_t)y * stride;
+    for (uint32_t x = 0; x < d->hdr_scratch_w; x += 8) {
+      float l = (row[x * 4 + 0] + row[x * 4 + 1] + row[x * 4 + 2]) * (1.f / (3.f * 255.f));
+      sum += l; mn = std::min(mn, l); mx = std::max(mx, l);
+      samples++;
+    }
+  }
+  cl->Unmap(d->ngx_dump_staging, 0);
+  if (samples == 0) return;
+  float avg = (float)(sum / (double)samples);
+  char buf[128];
+  snprintf(buf, sizeof(buf), "[DLAA] NGX output luma: min=%.3f avg=%.3f max=%.3f (min=0 => DLSS wrote pure black)",
+           mn, avg, mx);
+  reshade::log::message(reshade::log::level::info, buf);
+}
+
+// Ensure the CPU readback staging for the DLSS color-source diagnostic.
+static bool EnsureColorDumpStaging(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
+  auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
+  if (!nd || !d || w == 0u || h == 0u) return false;
+  if (d->color_dump_staging) {
+    D3D11_TEXTURE2D_DESC td = {};
+    d->color_dump_staging->GetDesc(&td);
+    if (td.Width == w && td.Height == h) return true;
+    d->color_dump_staging->Release(); d->color_dump_staging = nullptr;
+  }
+  D3D11_TEXTURE2D_DESC td = {};
+  td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_STAGING;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  return SUCCEEDED(nd->CreateTexture2D(&td, nullptr, &d->color_dump_staging));
+}
+
+// DIAGNOSTIC: report the ACTUAL color source handed to DLSS — live t0 vs event
+// capture, content min/avg/max luma (CPU readback), capture staleness, and the
+// FXAA draw's resolved PS hash (0 => "Pipeline not found" capture skip).
+static void LogColorSource(reshade::api::command_list* cmd_list, DeviceData* d,
+                           ID3D11Resource* color_res, bool using_live) {
+  auto* dev = cmd_list->get_device();
+  auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!dev || !d || !cl || !color_res) return;
+
+  D3D11_TEXTURE2D_DESC td = {};
+  static_cast<ID3D11Texture2D*>(color_res)->GetDesc(&td);
+
+  float mn = 0.f, avg = 0.f, mx = 0.f;
+  bool have_luma = false;
+  if (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM && EnsureColorDumpStaging(dev, d, td.Width, td.Height)) {
+    cl->CopyResource(d->color_dump_staging, color_res);
+    D3D11_MAPPED_SUBRESOURCE map = {};
+    if (SUCCEEDED(cl->Map(d->color_dump_staging, 0, D3D11_MAP_READ, 0, &map))) {
+      auto* px = static_cast<const uint8_t*>(map.pData);
+      double sum = 0.0; float mnv = 1e9f, mxv = -1e9f; uint64_t n = 0;
+      for (uint32_t y = 0; y < td.Height; y += 8) {
+        const uint8_t* row = px + (size_t)y * map.RowPitch;
+        for (uint32_t x = 0; x < td.Width; x += 8) {
+          float l = (row[x * 4 + 0] + row[x * 4 + 1] + row[x * 4 + 2]) * (1.f / (3.f * 255.f));
+          sum += l; mnv = std::min(mnv, l); mxv = std::max(mxv, l); n++;
+        }
+      }
+      cl->Unmap(d->color_dump_staging, 0);
+      if (n) { mn = mnv; mx = mxv; avg = (float)(sum / (double)n); have_luma = true; }
+    }
+  }
+
+  auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t hash = ss ? renodx::utils::shader::GetCurrentPixelShaderHash(ss) : 0u;
+  uint32_t stale = d->frame_index >= d->color_capture_frame ? d->frame_index - d->color_capture_frame : 0u;
+  char buf[200];
+  if (have_luma) {
+    snprintf(buf, sizeof(buf),
+      "[DLAA] color src: %s res=0x%llX fmt=%d %ux%u luma=(%.3f,%.3f,%.3f) capStale=%u fxaaHash=0x%X",
+      using_live ? "LIVE" : "CAPTURE", (unsigned long long)color_res,
+      (int)td.Format, (unsigned)td.Width, (unsigned)td.Height, mn, avg, mx, stale, hash);
+  } else {
+    snprintf(buf, sizeof(buf),
+      "[DLAA] color src: %s res=0x%llX fmt=%d %ux%u (luma readback skipped) capStale=%u fxaaHash=0x%X",
+      using_live ? "LIVE" : "CAPTURE", (unsigned long long)color_res,
+      (int)td.Format, (unsigned)td.Width, (unsigned)td.Height, stale, hash);
+  }
+  reshade::log::message(reshade::log::level::info, buf);
 }
 
 // ── Effect/particle exclusion mask ──
@@ -1473,20 +1768,92 @@ static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d)
 
 // Draw hooks: append the mask RT right before effect draws (the PS is
 // guaranteed to be bound here, unlike at the RT-bind event).
+// SCENE-3 TDR diagnostic: log the REAL output-merger state (render-target
+// formats + sample counts + DSV format/samples) on every draw whose VS or PS is
+// one of our patched outputs. The drawtrace only logs the tracked BIND count;
+// if scene 3's char draws bind a 4th RTV at slot 3 (a game target our o3 write
+// would collide with) or multisampled targets, this reveals it directly.
+// Queries the NATIVE D3D11 context (the real state, not our tracking).
+// Gated on DLAADebugLogging.
+static void MaybeLogOmState(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (shader_injection.dlaa_debug_logging <= 0.5f || !cmd_list || !d) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  const uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  const uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  const bool is_po_vs = d->patched_vs_by_new_hash.contains(vh) || IsPerObjectMotionVs(vh);
+  const bool is_patched_ps = d->patched_ps_hashes.contains(ph);
+  if (!is_po_vs && !is_patched_ps) return;
+  auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!ctx) return;
+  ID3D11RenderTargetView* rtvs[8] = {};
+  ID3D11DepthStencilView* dsv = nullptr;
+  ctx->OMGetRenderTargets(8, rtvs, &dsv);  // fills up to 8; count non-null below
+  UINT count = 0;
+  for (UINT i = 0u; i < 8u; ++i) if (rtvs[i]) ++count;
+  char line[512];
+  int pos = snprintf(line, sizeof(line), "[DLAA] OM vs=0x%08X ps=0x%08X realRtvs=%u",
+                     vh, ph, count);
+  for (UINT i = 0; i < 8u && i < count && pos > 0 && pos < (int)sizeof(line); ++i) {
+    if (!rtvs[i]) continue;
+    D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+    rtvs[i]->GetDesc(&rd);
+    UINT samples = 1;
+    ID3D11Resource* res = nullptr;
+    rtvs[i]->GetResource(&res);
+    if (res) {
+      D3D11_RESOURCE_DIMENSION dim;
+      res->GetType(&dim);
+      if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D11_TEXTURE2D_DESC td = {};
+        static_cast<ID3D11Texture2D*>(res)->GetDesc(&td);
+        samples = td.SampleDesc.Count;
+      }
+      res->Release();
+    }
+    pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " r%d=fmt%d ms%d",
+                    (int)i, (int)rd.Format, (int)samples);
+  }
+  if (dsv) {
+    D3D11_DEPTH_STENCIL_VIEW_DESC dd = {};
+    dsv->GetDesc(&dd);
+    UINT dsv_samples = 1;
+    ID3D11Resource* res = nullptr;
+    dsv->GetResource(&res);
+    if (res) {
+      D3D11_RESOURCE_DIMENSION dim;
+      res->GetType(&dim);
+      if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D11_TEXTURE2D_DESC td = {};
+        static_cast<ID3D11Texture2D*>(res)->GetDesc(&td);
+        dsv_samples = td.SampleDesc.Count;
+      }
+      res->Release();
+    }
+    pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " dsv=fmt%d ms%d",
+                    (int)dd.Format, (int)dsv_samples);
+  }
+  for (UINT i = 0; i < 8u && i < count; ++i) if (rtvs[i]) rtvs[i]->Release();
+  if (dsv) dsv->Release();
+  LogThrottled("om-state", reshade::log::level::info, 60u, 250u, "%s", line);
+}
+
 static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
   auto* dev = cmd_list->get_device();
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
+    WatchdogStampDraw(cmd_list, d, "enter");
     MaybeRestorePatchedBinds(cmd_list, d);
     Phase0ProbeDraw(cmd_list, d);
     MaybeTraceCrashWindow(cmd_list, d);
+    MaybeLogOmState(cmd_list, d);
     ApplyPerDrawJitter(cmd_list, d);
     MaybeWriteGlobalsVp(cmd_list, d);
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
     MaybeBindPatchedVs(cmd_list, d);
     MaybeAppendMotionRtv(cmd_list, d);
+    WatchdogStampDraw(cmd_list, d, "done");
   }
   return false;
 }
@@ -1495,15 +1862,18 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
+    WatchdogStampDraw(cmd_list, d, "enter");
     MaybeRestorePatchedBinds(cmd_list, d);
     Phase0ProbeDraw(cmd_list, d);
     MaybeTraceCrashWindow(cmd_list, d);
+    MaybeLogOmState(cmd_list, d);
     ApplyPerDrawJitter(cmd_list, d);
     MaybeWriteGlobalsVp(cmd_list, d);
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
     MaybeBindPatchedVs(cmd_list, d);
     MaybeAppendMotionRtv(cmd_list, d);
+    WatchdogStampDraw(cmd_list, d, "done");
   }
   return false;
 }
@@ -2004,14 +2374,26 @@ static void OnPushDescriptorsCapture(
       }
     }
 
-    // Color: FXAA (0x96BB8CFF) or pre-FXAA composite (0xE8C7EBA2) at t0
+    // Color: FXAA (0x96BB8CFF) or pre-FXAA composite (0xE8C7EBA2) at t0.
+    // POISON GUARD (Phase 3): never accept our own NGX-output bind — RunDLAA's
+    // native PSSetShaderResources(0, ngx_out) is intercepted by ReShade and
+    // re-fires this hook with the FXAA draw's hash, which would overwrite the
+    // captured composite with the (black) DLSS output. RunDLAA prefers the LIVE
+    // t0 (PSGetShaderResources); this event capture is the fallback + feeds the
+    // reprojection debug view.
     if (update.binding == 0u && update.count >= 1 && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0x96BB8CFFu || hash == 0xE8C7EBA2u) {
-          d->captured_color_srv = views[0];
-          d->captured_color_res = dev->get_resource_from_view(views[0]);
+      auto res = dev->get_resource_from_view(views[0]);
+      bool is_ngx_out = senkiseki3::dlss::ngx.output_texture &&
+          res.handle == reinterpret_cast<uintptr_t>(senkiseki3::dlss::ngx.output_texture.Get());
+      if (res.handle && !is_ngx_out) {
+        auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+        if (ss) {
+          uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+          if (hash == 0x96BB8CFFu || hash == 0xE8C7EBA2u) {
+            d->captured_color_srv = views[0];
+            d->captured_color_res = res;
+            d->color_capture_frame = d->frame_index;
+          }
         }
       }
     }
@@ -2473,6 +2855,48 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
                  "[DLAA] veloc: matrices_valid=%d", (int)d->matrices_valid);
 
     if (d->matrices_valid) {
+      // HDR decode path (Phase 2): when DLAAHdrDecode is on, this holds the
+      // re-encoded DLSS output SRV to bind at PS t0 (instead of raw NGX output).
+      ID3D11ShaderResourceView* hdr_t0_srv = nullptr;
+
+      // ── Phase 3 fix: robust DLSS color source ──
+      // The game's PS t0 at this FXAA draw IS the composite. Read it live so we
+      // are immune to the event capture's failure modes under the HDR mod
+      // (hash-0 "Pipeline not found" skip, or our own NGX-output t0 bind
+      // re-firing the capture hook and poisoning captured_color).
+      if (d->live_color_srv) { d->live_color_srv->Release(); d->live_color_srv = nullptr; }
+      if (d->live_color_res) { d->live_color_res->Release(); d->live_color_res = nullptr; }
+      ID3D11ShaderResourceView* live_t0 = nullptr;
+      cl->PSGetShaderResources(0, 1, &live_t0);
+      if (live_t0) {
+        ID3D11Resource* live_res = nullptr;
+        live_t0->GetResource(&live_res);
+        if (live_res) {
+          D3D11_TEXTURE2D_DESC td = {};
+          static_cast<ID3D11Texture2D*>(live_res)->GetDesc(&td);
+          bool is_ngx_out = senkiseki3::dlss::ngx.output_texture &&
+              live_res == senkiseki3::dlss::ngx.output_texture.Get();
+          if (td.Width == w && td.Height == h && !is_ngx_out) {
+            d->live_color_srv = live_t0; d->live_color_srv->AddRef();
+            d->live_color_res = live_res; d->live_color_res->AddRef();
+          }
+          live_res->Release();
+        }
+        live_t0->Release();
+      }
+      // DIAG (Phase 3): confirm the actual color source handed to DLSS — live vs
+      // event capture, content luma, capture staleness, and the FXAA draw's
+      // resolved PS hash (0 => "Pipeline not found" capture skip).
+      if (shader_injection.dlaa_debug_logging > 0.5f) {
+        static int color_src_log = 0;
+        if (++color_src_log % 60 == 0) {
+          ID3D11Resource* diag_res = d->live_color_res
+              ? d->live_color_res
+              : reinterpret_cast<ID3D11Resource*>(d->captured_color_res.handle);
+          LogColorSource(cmd_list, d, diag_res, d->live_color_res != nullptr);
+        }
+      }
+
       // Pass: Velocity compute
       cmd_list->bind_pipeline(AC, d->velocity_pipeline);
 
@@ -2722,34 +3146,93 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
             case 2: mv_scale_x = 2.f / (float)w; mv_scale_y = 2.f / (float)h; break;
             default: break;  // 1.0 (pixel-space, current)
           }
+          // HDR-mod compatibility (Phase 2): DLSS always expects LINEAR input
+          // regardless of the IsHDR flag (IsHDR only tweaks exposure/tonemap).
+          // With the senkiseki HDR mod the composite is sRGB-encoded, so DLSS
+          // sees gamma-compressed values as linear -> dark output that the HDR
+          // swapchain proxy (sRGB decode -> PQ) amplifies to pure black.
+          // DLAAHdrDecode: 0=Off (unchanged), 1=sRGB, 2=PQ — decodes the input
+          // to a linear scratch for DLSS and re-encodes the output for t0.
+          // ── Phase 3 fix: use the LIVE game t0 (composite) as the DLSS color
+          // source. The event capture can fail/poison under the HDR mod (hash-0
+          // "Pipeline not found" skip, or our own NGX-output t0 bind re-firing
+          // the capture hook), so prefer what the game ACTUALLY bound here.
+          ID3D11Resource* color_src_res = d->live_color_res
+              ? d->live_color_res
+              : reinterpret_cast<ID3D11Resource*>(d->captured_color_res.handle);
+          ID3D11ShaderResourceView* color_src_srv = d->live_color_srv
+              ? d->live_color_srv
+              : reinterpret_cast<ID3D11ShaderResourceView*>(d->captured_color_srv.handle);
+          const int hdr_decode_mode = (int)shader_injection.dlaa_hdr_decode;
+          if (hdr_decode_mode >= 1 && hdr_decode_mode <= 2) {
+            if (EnsureHdrConversion(dev, d, w, h) && color_src_srv) {
+              int dec = (hdr_decode_mode == 1) ? 0 : 2;  // sRGB decode / PQ decode
+              if (RunHdrConvertPass(cl, d, dec, color_src_srv, d->linear_scratch_uav, w, h)) {
+                src = reinterpret_cast<ID3D11Resource*>(d->linear_scratch);
+              }
+            }
+          } else {
+            src = color_src_res;
+          }
           dlaa_ok = senkiseki3::dlss::EvaluateDLSS(cl, src, ngx_out, mv, dep,
                        jitter_px_x, jitter_px_y, mv_scale_x, mv_scale_y);
-          if (dlaa_ok) ++d->evals_this_frame;  // diag: count evals/present (must be 1)
+          if (dlaa_ok) {
+            ++d->evals_this_frame;  // diag: count evals/present (must be 1)
+            // Re-encode the DLSS linear output into the HDR chain's encoding
+            // (mode 1 = sRGB, 3 = PQ) and bind THAT at PS t0.
+            if (hdr_decode_mode >= 1 && hdr_decode_mode <= 2 && d->encoded_scratch_uav) {
+              int enc = (hdr_decode_mode == 1) ? 1 : 3;
+              ID3D11ShaderResourceView* ngx_srv = nullptr;
+              D3D11_SHADER_RESOURCE_VIEW_DESC nsv = {};
+              D3D11_TEXTURE2D_DESC ntd = {};
+              senkiseki3::dlss::ngx.output_texture->GetDesc(&ntd);
+              nsv.Format = ntd.Format;
+              nsv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+              nsv.Texture2D.MipLevels = 1;
+              if (SUCCEEDED(senkiseki3::dlss::ngx.device->CreateShaderResourceView(ngx_out, &nsv, &ngx_srv))) {
+                if (RunHdrConvertPass(cl, d, enc, ngx_srv, d->encoded_scratch_uav, w, h)) {
+                  hdr_t0_srv = d->encoded_scratch_srv;
+                }
+                ngx_srv->Release();
+              }
+            }
+            // DIAGNOSTIC: NGX output luma (pure 0 vs dark content) ~1 Hz.
+            static int luma_log_count = 0;
+            if (shader_injection.dlaa_debug_logging > 0.5f && (++luma_log_count % 60 == 0)) {
+              LogNgxOutputLuma(cl, d);
+            }
+          }
         }
       }
       // Replace t0 with DLAA output SRV (falcomengine-plus pattern).
       // In MV debug mode the velocity SRV is already bound to t0 above.
       if (dlaa_ok && shader_injection.dlaa_debug_view <= 0.5f) {
-        D3D11_TEXTURE2D_DESC ngx_desc;
-        senkiseki3::dlss::ngx.output_texture->GetDesc(&ngx_desc);
-        static int fmt_log = 0;
-        if (shader_injection.dlaa_debug_logging > 0.5f && ++fmt_log <= 2) {
-          char buf[96];
-          snprintf(buf, sizeof(buf), "[DLAA] NGX output: %ux%u fmt=%d",
-                   ngx_desc.Width, ngx_desc.Height, (int)ngx_desc.Format);
-          reshade::log::message(reshade::log::level::info, buf);
+        // HDR decode path: bind the re-encoded scratch (already holds the DLSS
+        // output in the HDR chain's sRGB/PQ encoding). Otherwise bind the raw
+        // NGX output texture (non-HDR / DLAAHdrDecode=Off, unchanged behavior).
+        ID3D11ShaderResourceView* dlaa_srv = hdr_t0_srv;
+        bool release_srv = false;
+        if (dlaa_srv == nullptr) {
+          D3D11_TEXTURE2D_DESC ngx_desc;
+          senkiseki3::dlss::ngx.output_texture->GetDesc(&ngx_desc);
+          static int fmt_log = 0;
+          if (shader_injection.dlaa_debug_logging > 0.5f && ++fmt_log <= 2) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "[DLAA] NGX output: %ux%u fmt=%d",
+                     ngx_desc.Width, ngx_desc.Height, (int)ngx_desc.Format);
+            reshade::log::message(reshade::log::level::info, buf);
+          }
+          D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+          srvd.Format = ngx_desc.Format;
+          srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+          srvd.Texture2D.MipLevels = 1;
+          senkiseki3::dlss::ngx.device->CreateShaderResourceView(
+              senkiseki3::dlss::ngx.output_texture.Get(), &srvd, &dlaa_srv);
+          release_srv = (dlaa_srv != nullptr);
         }
-
-        ID3D11ShaderResourceView* dlaa_srv = nullptr;
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
-        srvd.Format = ngx_desc.Format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvd.Texture2D.MipLevels = 1;
-        senkiseki3::dlss::ngx.device->CreateShaderResourceView(
-            senkiseki3::dlss::ngx.output_texture.Get(), &srvd, &dlaa_srv);
         if (dlaa_srv) {
           cl->PSSetShaderResources(0, 1, &dlaa_srv);
-          dlaa_srv->Release();
+          if (release_srv) dlaa_srv->Release();
         } else {
           LogThrottled("ngx-srv-fail", reshade::log::level::warning, 1u, 120u,
                        "[DLAA] Failed to create SRV for NGX output");
@@ -2759,17 +3242,19 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   }
 
   // Keep a previous-frame color copy for the reprojection debug mode.
-  if (shader_injection.dlaa_debug_view >= 1.f && d->captured_color_res.handle) {
+  if (shader_injection.dlaa_debug_view >= 1.f && (d->live_color_res || d->captured_color_res.handle)) {
     auto* cl2 = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
     if (cl2 && d->prev_color_texture.handle) {
       auto* prev_native = reinterpret_cast<ID3D11Resource*>(d->prev_color_texture.handle);
-      auto* cur_native = reinterpret_cast<ID3D11Resource*>(d->captured_color_res.handle);
+      auto* cur_native = d->live_color_res
+          ? d->live_color_res
+          : reinterpret_cast<ID3D11Resource*>(d->captured_color_res.handle);
       cl2->CopyResource(prev_native, cur_native);
     }
   }
 
   d->frame_index++;
-  return false;  // Never skip FXAA — DLAA replaces t0, FXAA composites to RTV0
+  return dlaa_ok;  // true = DLSS/debug output was bound at t0 on this draw
 }
 
 // ── Settings ──
@@ -2976,6 +3461,22 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "DLAAHdrDecode", .binding = &shader_injection.dlaa_hdr_decode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f, .label = "HDR Decode (diag)", .section = "Antialiasing",
+        .tooltip = "HDR-mod compatibility A/B (COMPOSITE path only): converts the DLSS input/output color encoding. Off = feed DLSS the composite as-is. sRGB = decode composite sRGB->linear before DLSS and re-encode the DLSS output linear->sRGB. PQ = same with ST.2084 PQ. The Pre-ToneMap inject path (DLAAHdrInject) does NOT use this.",
+        .labels = {"Off","sRGB","PQ"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAHdrInject", .binding = &shader_injection.dlaa_hdr_inject,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
+        .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (_renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
+        .labels = {"Auto","Pre-ToneMap","Composite"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLAADebugLogging", .binding = &shader_injection.dlaa_debug_logging,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Debug Logging", .section = "Antialiasing",
@@ -2994,6 +3495,13 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Phase B Generic VS Patch", .section = "Antialiasing",
         .tooltip = "Generic DXBC patcher: adds prev-bone re-skin + prevVP to every skinned VS at pipeline creation (per-object motion MVs without per-shader HLSL).",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseBJitterOnly", .binding = &g_phaseb_jitter_only,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase B Jitter-Only", .section = "Antialiasing",
+        .tooltip = "CAMERA PATH (default ON): the generic VS patch injects ONLY the SV_Position camera jitter (b13) — no prevClip output, no prev-bone re-skin, no prevVP, no outline, no OSGN append. Under the GLOBAL jitter method the b13 offset is 0, so this is an inert safety patch. Turn OFF to restore the per-object motion machinery. Requires restart.",
         .labels = {"Off","On"},
     },
     new renodx::utils::settings::Setting{
@@ -3082,6 +3590,34 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off","On"},
     },
     new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseEConstant", .binding = &g_phasee_constant,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase E Constant Output", .section = "Antialiasing",
+        .tooltip = "CRASH BISECTION: Phase E adds ONLY the o3 output register, written with a CONSTANT (0.5,0.5,0,1) — no new input decl, no SV_SampleIndex relocation, no vN read. If it still hangs, the mere appended output register faults; if not, the input/relocation/read matters. Requires restart.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseENoRead", .binding = &g_phasee_no_read,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase E No Input Read", .section = "Antialiasing",
+        .tooltip = "CRASH BISECTION: normal input decl + SV relocation, but the injected body writes a CONSTANT — never reads vN. Isolates the vN data path from the declaration/relocation machinery. Requires restart.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseENoMath", .binding = &g_phasee_no_math,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase E No Math", .section = "Antialiasing",
+        .tooltip = "CRASH BISECTION: normal input decl + SV relocation, body = mov o3, vN straight through (no max/div/mad). Isolates the divide/mad math from the read. Requires restart.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseENoNewOutput", .binding = &g_phasee_no_new_output,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase E No New Output (o2.zw)", .section = "Antialiasing",
+        .tooltip = "CRASH BISECTION: full input decl + SV relocation + full div/mad math, but prevNDC is written into the EXISTING max output's .zw (o2.zw for 3-RT) instead of appending a NEW SV_TARGET output — NO OSGN append, NO dcl_output. Every crashing test so far appended a new output; if this is safe, the appended output register was the trigger. Requires restart.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
         .key = "DLAAPhaseBDump", .binding = &g_phaseb_dump,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Phase B Evidence Dump", .section = "Antialiasing",
@@ -3092,11 +3628,81 @@ renodx::utils::settings::Settings settings = {
 
 // ── Draw hook: FXAA replacement ──
 // DLAA output replaces t0 content; FXAA reads it and composites to RTV0
+static bool HdrFinalPathActive(reshade::api::command_list* cmd_list);  // defined below
+
 static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
   if (shader_injection.dlaa_enabled < 1.5f) return true;  // DLAA only (mode 2)
+  // HDR pre-tone-map path (DLAAHdrInject): DLSS already ran at the final_blending
+  // draw, so the FXAA replacement just passthroughs the tone-mapped composite to
+  // RTV0. Fallback: if no final_blending draw ran DLSS this frame (e.g. a final
+  // variant we don't hook), run DLSS here on the composite as before.
+  if (HdrFinalPathActive(cmd_list)) {
+    auto* dev = cmd_list->get_device();
+    auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
+    if (d && d->dlaa_ran_this_frame) return true;
+  }
   RunDLAA(cmd_list);
   return true;  // Always let FXAA run — it composites our DLAA'd t0 to RTV0
 }
+
+// ── HDR pre-tone-map path (DLAAHdrInject) ──
+// Runs DLAA at the FINAL_BLENDING draw instead of FXAA. The live PS t0 at that
+// draw is the game's UNTONEMAPPED raw scene (final_blending's ColorBuffer) —
+// DLSS processes it and RunDLAA rebinds t0 to the DLSS output, so the HDR mod's
+// OWN final_blending (which runs right after this on_draw) tone maps the DLAA'd
+// image. No renodx/HDR settings are read or replicated: if the HDR mod author
+// changes the tone map or nits, we never know or care.
+static bool HdrFinalPathActive(reshade::api::command_list* cmd_list) {
+  const int mode = (int)shader_injection.dlaa_hdr_inject;
+  if (mode == 1) return true;   // Force Pre-ToneMap
+  if (mode == 2) return false;  // Force Composite
+  // Auto: active when the HDR mod is loaded.
+  auto* dev = cmd_list ? cmd_list->get_device() : nullptr;
+  auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  return d && d->hdr_detected;
+}
+
+static bool OnBeforeFinalBlendingDraw(reshade::api::command_list* cmd_list) {
+  if (shader_injection.dlaa_enabled < 1.5f) return true;  // DLAA only (mode 2)
+  if (!HdrFinalPathActive(cmd_list)) return true;          // pre-tone-map path off
+  auto* dev = cmd_list->get_device();
+  auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  if (!d) return true;
+  d->dlaa_ran_this_frame = RunDLAA(cmd_list);
+  return true;  // never skip — the HDR mod's final_blending must tone-map t0
+}
+
+// All final_blending hashes the HDR mod replaces (CS4 + CS3 variants). DLSS runs
+// at these draws so it sees the raw pre-tone-map scene, and the HDR mod's own
+// final_blending (running after our on_draw) tone maps the DLSS output.
+static constexpr std::array<uint32_t, 138> FINAL_BLENDING_HASHES = {
+    // CS4 finals
+    0x46A727D9u, 0x2BF0C94Bu, 0x3E08A3A6u, 0x2A8422DEu, 0x49107B8Fu, 0x1C7DCC30u,
+    0x3541804Au, 0xFD245ECCu, 0x93DEF816u, 0x0469E6D6u, 0x16DA1605u, 0xC2D07E63u,
+    0x1ABB15C9u, 0x228096A4u, 0x2005E90Cu, 0x2F2D2517u, 0x30064E3Du, 0x38B0F676u,
+    0x46589838u, 0x4C17DC8Cu, 0x4D291F04u, 0x4E97BECAu, 0x4F6D55D7u, 0x5F75A7B5u,
+    0x6417B671u, 0x575568A5u, 0x68F73C03u, 0x71DC9089u, 0x762A5B0Eu, 0x7DD4CB97u,
+    0x7E245ADCu, 0x83446FEFu, 0x84648647u, 0x8589D7AFu, 0x8A4275AAu, 0x8F06D84Cu,
+    0xA07D8921u, 0x94889944u, 0x9BF2734Cu, 0xA01BCC76u, 0xA20ECB4Bu, 0xA210474Cu,
+    0xA4560071u, 0xA6A642ECu, 0xA716393Fu, 0xA7C2CED9u, 0xAC7DDDACu, 0xB1E0A90Du,
+    0xB41DEC9Bu, 0xB573287Eu, 0xB59D548Au, 0xB5A7008Bu, 0xB936A99Bu, 0xBB0DEC2Au,
+    0xBEE3AF35u, 0xCC00713Eu, 0xCF4D44BCu, 0xD01F775Cu, 0xD0D6FE14u, 0xDA5C467Fu,
+    0xDBC91624u, 0xDECB5EF1u, 0xE1D7A2B6u, 0xE65E731Du, 0xEC63410Fu, 0xED6722DCu,
+    0xED849BD1u, 0xF0566A0Fu, 0xFCBCF123u,
+    // CS3 finals
+    0x6B574B6Eu, 0xABF4E009u, 0xB4406452u, 0x95F02C1Du, 0x26217A30u, 0x46DC6C58u,
+    0x5A5A4C5Au, 0x322E20D4u, 0x00C4E2A6u, 0x0161438Cu, 0x01E1FF0Fu, 0x02E4863Eu,
+    0x0EBE33ECu, 0x11CAE0E6u, 0x1486065Du, 0x160A4895u, 0x167A12F5u, 0x1D403F97u,
+    0x1EDECECCu, 0x215168ABu, 0x2594FB2Cu, 0x269DDBDFu, 0x281F2814u, 0x31E727B4u,
+    0x3415A1BEu, 0x34EAE8B6u, 0x38BB9A49u, 0x3FB18938u, 0x513CF99Fu, 0x517BF7B2u,
+    0x51DB8AC5u, 0x52DBC392u, 0x53B8577Cu, 0x5A1C72D5u, 0x5BBE9F57u, 0x67F0BD68u,
+    0x6C550D4Fu, 0x78F1AC05u, 0x884D23A7u, 0x8923A287u, 0x8BDD1E5Du, 0x90180FAFu,
+    0x9655B4B2u, 0x97EB039Cu, 0x9B0A1C60u, 0xA4945FF3u, 0xA4D9C6FDu, 0xA671C250u,
+    0xA9F09088u, 0xABE9BEE1u, 0xAC84E828u, 0xACFCDFC2u, 0xB32BC083u, 0xB3BF88B3u,
+    0xB78778F5u, 0xBA62ACD7u, 0xC2DFA434u, 0xCED8E8A8u, 0xCFF51135u, 0xD7BC302Fu,
+    0xD8F91B51u, 0xE0E54773u, 0xE13AAD9Bu, 0xE2FC9C22u, 0xE52B3C27u, 0xE742F2C3u,
+    0xEC64A31Au, 0xEFAC375Cu, 0xEFC9A329u,
+};
 
 // ── FXAA replacement (3-way AA toggle) ──
 // The replacement shader (0x96BB8CFF) SELF-GATES on shader_injection.dlaa_enabled
@@ -3104,94 +3710,54 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
 // passthrough. No on_replace gate is needed — the shader always runs and picks
 // its behavior from the toggle. OnBeforeFxaaDraw still runs DLAA first in DLAA
 // mode so t0 holds the DLAA output for the passthrough to copy.
-renodx::mods::shader::CustomShaders custom_shaders = {
-    {
-        0x96BB8CFFu,
-        renodx::mods::shader::CustomShader{
-            .crc32 = 0x96BB8CFFu,
-            .code = __0x96BB8CFF,
-            .on_draw = OnBeforeFxaaDraw,
-        },
-    },
-    // ── Scene-geometry VS replacements (hash-gated camera jitter) ──
-    // Each replaced VS adds the per-frame sub-pixel jitter to SV_Position after
-    // the ViewProjection multiply (o0.x += DLAA_JITTER_X * o0.w). This is the
-    // ONLY jitter source — no proxy cbuffer, no composite UV shift. The jitter
-    // offsets come from the addon's b13 injection (0 when disabled), so the
-    // 8px jitter-test toggle works without DLAA being enabled.
-    CustomShaderEntry(0x37F1DE22),  // world/terrain (primary)
-    CustomShaderEntry(0xCBF171E5),  // world
-    CustomShaderEntry(0xDF1D933F),  // world
-    CustomShaderEntry(0x9BB882F5),  // terrain tiles
-    CustomShaderEntry(0x43ED1D83),  // world
-    CustomShaderEntry(0xC1F80CF6),  // world
-    CustomShaderEntry(0x8BB470CE),  // world
-    CustomShaderEntry(0x4E107313),  // world (COLOR input)
-    CustomShaderEntry(0x09394015),  // unskinned characters/NPCs
-    // NOTE: ALL SKINNED char VSs (face 0x0D5DABC6, hair, eyes, skin, clothing,
-    // outline, etc.) are handled by the GENERIC DXBC patcher (OnCreatePipeline)
-    // and must NOT be listed here: the patcher's skip-guard
-    // (`if (custom_shaders.contains(hash)) continue;`) would bypass them and
-    // leave their paired hand-patched PSs reading an undefined v7/prevClip
-    // (TEXCOORD5) -> garbage motion lines on those meshes. The boot-HLSL
-    // replacements in this list only add geometry jitter and do NOT emit
-    // prevClip. Unskinned scene-geometry VSs below stay custom-replaced (the
-    // generic patcher only touches skinned VSs — those have no
-    // BLENDINDICES/BLENDWEIGHTS).
-    // Foliage & world VSs discovered in the foliage scene (same geometry jitter).
-    CustomShaderEntry(0x29513853),  // foliage (main)
+// Build the custom-shader table: the FXAA 3-way replacement + effect-mask +
+// composite entries, PLUS every final_blending hash with an on_draw hook that
+// runs DLSS on the raw pre-tone-map scene (HDR pre-tone-map path). The final
+// entries carry NO replacement code, so the HDR mod's own final_blending
+// replacement is used and tone maps the DLSS output.
+static renodx::mods::shader::CustomShaders BuildCustomShaders() {
+  renodx::mods::shader::CustomShaders cs = {
+      {
+          0x96BB8CFFu,
+          renodx::mods::shader::CustomShader{
+              .crc32 = 0x96BB8CFFu,
+              .code = __0x96BB8CFF,
+              .on_draw = OnBeforeFxaaDraw,
+          },
+      },
+      // ── Phase E: per-object-motion PSs are NO LONGER hand-replaced ──
+      // The 22 char G-buffer PSs (0xFEA2B509, 0x159A34A3, 0x1682CB9B, ...,
+      // 0x055CFB63) were removed from custom_shaders: the generic DXBC patcher
+      // (OnCreatePipeline -> PatchPerObjectPixelShader) now appends the
+      // TEXCOORD5 input + SV_TARGET3 output to ANY G-buffer PS, writing
+      // prevNDC+valid-flag to the appended 32-bit motion RTV. No hashes, no
+      // per-shader HLSL — same as the VS patcher. (The old boot PS .hlsl files
+      // remain on disk as reference but are no longer injected.)
+      // Effect PS replacements: write SV_TARGET1 = 1.0 into the appended
+      // effect-mask RT (Exclude Effects toggle) so the velocity compute can
+      // opt these pixels out of DLAA (invalid-MV -> current-frame fallback).
+      CustomShaderEntry(0xD589DF82),  // particle PS (mask writer)
+      CustomShaderEntry(0x720FE34C),  // water/particle PS (mask writer)
+      CustomShaderEntry(0xC1BF7F2E),  // effect PS (mask writer)
+      // (0x728F5ED1 transparent PS is NOT registered: it must stay jittered +
+      //  DLAA'd — static world content with correct camera MVs. Excluding it made
+      //  the background behind it shake.)
+      // Pre-FXAA composite: pure pixel-center passthrough (no UV-shift jitter).
+      // The geometry jitter passes through unchanged to the buffer RunDLAA feeds
+      // to DLSS.
+      CustomShaderEntry(0xE8C7EBA2),
+  };
+  for (uint32_t h : FINAL_BLENDING_HASHES) {
+    if (cs.contains(h)) continue;
+    renodx::mods::shader::CustomShader s = {};
+    s.crc32 = h;
+    s.on_draw = OnBeforeFinalBlendingDraw;
+    cs.emplace(h, s);
+  }
+  return cs;
+}
 
-    // ── White part of the eye: boot prevClip pair (07-Aug) ──
-    // The boot HLSL (senkiseki3/boot/0xB1C24E2A.vs_4_1.hlsl + 0x7542CBC4.ps_4_1.hlsl)
-    // already emit prevClip (VS o8/TEXCOORD5) and write the motion RTV (PS
-    // SV_TARGET3). Registering them here (old way) makes the game use the
-    // hand-patched pair directly, so the white part gets per-object motion.
-    // NOTE: OnCreatePipeline skips custom_shaders entries, so these are NOT
-    // double-patched by the generic Phase B/E patcher.
-    CustomShaderEntry(0xED3D1A43),  // foliage
-    CustomShaderEntry(0x7D5282A3),  // scene/world
-    CustomShaderEntry(0x066E7DFB),  // scene/world
-    CustomShaderEntry(0x714E4C33),  // scene/world
-    CustomShaderEntry(0x7A711F41),  // scene/world
-    CustomShaderEntry(0x09BD12FA),  // scene/world
-    CustomShaderEntry(0x030AD345),  // scene/world
-    CustomShaderEntry(0x8913640A),  // scene/world
-    // Second batch of scene/world & world-space effect VSs from the same scene.
-    CustomShaderEntry(0x2DC04A66),
-    CustomShaderEntry(0x34AA271F),
-    CustomShaderEntry(0xDFE5A75D),
-    CustomShaderEntry(0x8ED5035B),
-    CustomShaderEntry(0x97E9A1EC),
-    CustomShaderEntry(0x4D37FA49),
-    CustomShaderEntry(0x9596CBC1),
-    CustomShaderEntry(0xE4C6D6F4),
-    CustomShaderEntry(0x8AFF0B4F),  // water/particle
-    CustomShaderEntry(0x795F3AD3),  // world-space effect
-    CustomShaderEntry(0x77355EED),  // forest impostor billboard (sky)
-    CustomShaderEntry(0xC8FE8FC4),  // transparent texture
-    CustomShaderEntry(0x7D3553A7),  // particle
-    // ── Phase E: per-object-motion PSs are NO LONGER hand-replaced ──
-    // The 22 char G-buffer PSs (0xFEA2B509, 0x159A34A3, 0x1682CB9B, ...,
-    // 0x055CFB63) were removed from custom_shaders: the generic DXBC patcher
-    // (OnCreatePipeline -> PatchPerObjectPixelShader) now appends the
-    // TEXCOORD5 input + SV_TARGET3 output to ANY G-buffer PS, writing
-    // prevNDC+valid-flag to the appended 32-bit motion RTV. No hashes, no
-    // per-shader HLSL — same as the VS patcher. (The old boot PS .hlsl files
-    // remain on disk as reference but are no longer injected.)
-    // Effect PS replacements: write SV_TARGET1 = 1.0 into the appended
-    // effect-mask RT (Exclude Effects toggle) so the velocity compute can
-    // opt these pixels out of DLAA (invalid-MV -> current-frame fallback).
-    CustomShaderEntry(0xD589DF82),  // particle PS (mask writer)
-    CustomShaderEntry(0x720FE34C),  // water/particle PS (mask writer)
-    CustomShaderEntry(0xC1BF7F2E),  // effect PS (mask writer)
-    // (0x728F5ED1 transparent PS is NOT registered: it must stay jittered +
-    //  DLAA'd — static world content with correct camera MVs. Excluding it made
-    //  the background behind it shake.)
-    // Pre-FXAA composite: pure pixel-center passthrough (no UV-shift jitter).
-    // The geometry jitter passes through unchanged to the buffer RunDLAA feeds
-    // to DLSS.
-    CustomShaderEntry(0xE8C7EBA2),
-};
+renodx::mods::shader::CustomShaders custom_shaders = BuildCustomShaders();
 
 // Resolve the evidence folder once: <ReShadeBase>/renodx-dev/dump/phaseb/ — the
 // SAME absolute base the DevKit uses (renodx::utils::path::GetOutputPath). A
@@ -3221,6 +3787,74 @@ static void WritePhasebDump(uint32_t hash, const void* code, size_t size, const 
   if (f) { fwrite(code, 1, size, f); fclose(f); }
 }
 
+// ── Hang watchdog: heartbeat thread ──
+// Writes one line to watchdog.log every 250 ms while DLAAPhaseBDump is ON. The
+// render thread keeps `watchdog_progress` stamped at every interesting spot
+// (pipeline patch start/end, draw hook enter/done, present). When the game
+// freezes the render thread stops advancing it, so the repeated tail of the
+// heartbeat file shows exactly where it stopped.
+static std::string WatchdogPath() {
+  std::error_code ec;
+  auto p = renodx::utils::path::GetOutputSubdirectory("dump") / "phaseb";
+  std::filesystem::create_directories(p, ec);
+  return (p / "watchdog.log").string();
+}
+
+static void WatchdogSet(DeviceData* d, const char* fmt, ...) {
+  if (!d || !d->watchdog_running.load()) return;
+  char buf[512];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  buf[sizeof(buf) - 1u] = '\0';
+  std::lock_guard<std::mutex> lock(d->watchdog_mutex);
+  strncpy_s(d->watchdog_progress, buf, _TRUNCATE);  // fixed copy — no allocation in lock scope
+  d->watchdog_progress[sizeof(d->watchdog_progress) - 1u] = '\0';
+}
+
+static void WatchdogStampDraw(reshade::api::command_list* cmd_list, DeviceData* d, const char* tag) {
+  if (!d || !d->watchdog_running.load()) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  WatchdogSet(d, "draw %s vs=0x%08X ps=0x%08X", tag, vh, ph);
+}
+
+static void WatchdogStart(DeviceData* d) {
+  if (!d || d->watchdog_running.exchange(true)) return;
+  const std::string path = WatchdogPath();
+  d->watchdog_thread = std::thread([d, path]() {
+    while (d->watchdog_running.load()) {
+      char prog[512];
+      {
+        std::lock_guard<std::mutex> lock(d->watchdog_mutex);
+        strncpy_s(prog, d->watchdog_progress, _TRUNCATE);  // fixed copy — no allocation
+        prog[sizeof(prog) - 1u] = '\0';
+      }
+      const uint64_t ping = d->watchdog_ping.fetch_add(1u) + 1u;
+      if (g_phaseb_dump >= 0.5f) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        FILE* f = nullptr;
+        fopen_s(&f, path.c_str(), "a");
+        if (f) {
+          fprintf(f, "t=%lld ping=%llu %s\n", (long long)ms,
+                  (unsigned long long)ping, prog);
+          fclose(f);
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+  });
+}
+
+static void WatchdogStop(DeviceData* d) {
+  if (!d) return;
+  d->watchdog_running.store(false);
+  if (d->watchdog_thread.joinable()) d->watchdog_thread.join();
+}
+
 // (All-draw crash-window tracing is implemented in MaybeTraceCrashWindow near
 // the draw hooks; per-draw lines are appended there.)
 
@@ -3247,6 +3881,7 @@ static bool OnCreatePipeline(
   // pipelines, so a toggle-on later would never re-create an unpatched VS. An
   // unbound prevVP/prev-bone slot only affects the unused extra output.
   bool changed = false;
+  WatchdogSet(d, "create_pipeline n=%u", subobject_count);
   for (uint32_t i = 0; i < subobject_count; ++i) {
     const auto& sub = subobjects[i];
     if (sub.type != reshade::api::pipeline_subobject_type::vertex_shader) continue;
@@ -3271,6 +3906,7 @@ static bool OnCreatePipeline(
     options.minimal_patch = g_phaseb_minimal >= 0.5f;
     options.test_no_output = g_phaseb_no_output >= 0.5f;
     options.test_constant_output = g_phaseb_constant >= 0.5f;
+    options.jitter_only = g_phaseb_jitter_only >= 0.5f;
     if (!senkiseki3::dxbc::PatchSkinnedVertexShader(blob, &new_hash, &info, options)) continue;
     if (new_hash == 0u || new_hash == hash) continue;
 
@@ -3299,13 +3935,14 @@ static bool OnCreatePipeline(
 
     char buf[224];
     snprintf(buf, sizeof(buf),
-             "[DLAA] phaseB: patched VS 0x%08X -> 0x%08X (%u B) cb%u t%u TEXCOORD%u o%u outline=%d noBind=%d minimal=%d noOutput=%d const=%d",
+             "[DLAA] phaseB: patched VS 0x%08X -> 0x%08X (%u B) cb%u t%u TEXCOORD%u o%u outline=%d noBind=%d minimal=%d noOutput=%d const=%d jitterOnly=%d",
              hash, new_hash, (uint32_t)blob.size(), info.prev_vp_cb_slot,
              info.prev_bone_t_slot, info.texcoord_index, info.output_reg,
              (int)info.outline_applied, (int)info.needs_no_binding,
              (int)options.minimal_patch, (int)options.test_no_output,
-             (int)options.test_constant_output);
+             (int)options.test_constant_output, (int)options.jitter_only);
     reshade::log::message(reshade::log::level::info, buf);
+    WatchdogSet(d, "create_pipeline phaseB patched VS 0x%08X -> 0x%08X", hash, new_hash);
   }
 
   // ── Phase E: generic per-object-motion PS patcher ──
@@ -3357,7 +3994,12 @@ static bool OnCreatePipeline(
     blob.resize(desc->code_size);
     std::memcpy(blob.data(), desc->code, desc->code_size);
     uint32_t new_hash = 0u;
-    if (!senkiseki3::dxbc::PatchPerObjectPixelShader(blob, &new_hash, vs_texcoord_index)) continue;
+    senkiseki3::dxbc::PixelShaderPatchOptions ps_options;
+    ps_options.constant_output = g_phasee_constant >= 0.5f;
+    ps_options.no_read = g_phasee_no_read >= 0.5f;
+    ps_options.no_math = g_phasee_no_math >= 0.5f;
+    ps_options.no_new_output = g_phasee_no_new_output >= 0.5f;
+    if (!senkiseki3::dxbc::PatchPerObjectPixelShader(blob, &new_hash, vs_texcoord_index, ps_options)) continue;
     if (new_hash == 0u || new_hash == hash) continue;
 
     // Evidence capture (DLAAPhaseBDump on): original + patched PS blobs, written
@@ -3374,11 +4016,15 @@ static bool OnCreatePipeline(
     d->patched_ps_hashes.insert(new_hash); // patched
     changed = true;
 
-    char buf[160];
-    snprintf(buf, sizeof(buf), "[DLAA] phaseE: patched PS 0x%08X -> 0x%08X (%u B)",
-             hash, new_hash, (uint32_t)blob.size());
+    char buf[192];
+    snprintf(buf, sizeof(buf), "[DLAA] phaseE: patched PS 0x%08X -> 0x%08X (%u B) const=%d noRead=%d noMath=%d noNewOut=%d",
+             hash, new_hash, (uint32_t)blob.size(),
+             (int)ps_options.constant_output, (int)ps_options.no_read, (int)ps_options.no_math,
+             (int)ps_options.no_new_output);
     reshade::log::message(reshade::log::level::info, buf);
+    WatchdogSet(d, "create_pipeline phaseE patched PS 0x%08X -> 0x%08X", hash, new_hash);
   }
+  WatchdogSet(d, "create_pipeline done");
   return changed;
 }
 
@@ -3418,6 +4064,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
         // Always track output resolution for depth validation
         auto* d = dev->get_private_data<DeviceData>();
         if (d) {
+          WatchdogSet(d, "present f=%u", d->frame_index);
           // Measure frame time for DLSS InFrameTimeDeltaInMsec (motion-speed scaling).
           const auto now = std::chrono::steady_clock::now();
           if (d->last_present_time.time_since_epoch().count() != 0) {
@@ -3439,6 +4086,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           d->effect_mask_cleared_this_frame = false;
           // Per-object motion target cleared at the first char draw each frame.
           d->motion_cleared_this_frame = false;
+          // HDR pre-tone-map path: DLSS ran at a final_blending draw this frame?
+          d->dlaa_ran_this_frame = false;
           // Jitter is computed once per frame at PRESENT time, before the next frame's
           // composite (0xE8C7EBA2) draws. Both the composite UV shift and the NGX jitter
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.
@@ -3516,7 +4165,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::log::message(reshade::log::level::info, "[Senkiseki3 DLAA] Addon loaded");
 
       reshade::register_event<reshade::addon_event::init_device>([](reshade::api::device* dev) {
-        dev->create_private_data<DeviceData>();
+        auto* d = dev->create_private_data<DeviceData>();
+        // HDR-mod detection (Phase 3): the senkiseki HDR addon ships as
+        // _renodx-senkiseki.addon64. When present, DLSS input/output needs the
+        // sRGB linearize path. Logged for confirmation; auto-defaulting comes
+        // after the Phase 2 A/B verifies DLAAHdrDecode=1 fixes the black screen.
+        d->hdr_detected = GetModuleHandleA("_renodx-senkiseki.addon64") != nullptr;
+        reshade::log::message(reshade::log::level::info,
+          d->hdr_detected ? "[DLAA] HDR mod detected: _renodx-senkiseki.addon64"
+                          : "[DLAA] HDR mod not detected");
+        WatchdogStart(d);
       });
       reshade::register_event<reshade::addon_event::destroy_device>([](reshade::api::device* dev) {
         auto* d = dev->get_private_data<DeviceData>();
