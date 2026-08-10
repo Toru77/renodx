@@ -1065,40 +1065,113 @@ static bool EnsureEffectMask(reshade::api::device* dev, DeviceData* d, uint32_t 
 }
 
 // Append the effect-mask RT to effect passes (called right before their draw).
+// The effect PS writes the mask to SV_TARGET1, so the mask RT is inserted at
+// RTV index 1 and the pass's own RT1..N shift down one slot.
 static void MaybeAppendEffectMask(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (shader_injection.dlaa_exclude_effects < 0.5f) return;
-  if (!cmd_list || !d || !d->effect_mask_rtv.handle || d->last_rtv_count == 0u) return;
+  if (!cmd_list || !d || !d->effect_mask_rtv.handle) return;
   auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
   if (!IsEffectPs(phash)) return;
   auto* dev = cmd_list->get_device();
-  if (!dev || !d->last_rtvs[0].handle) return;
+  auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!dev || !ctx) return;
+
+  // ── Read the REAL output-merger state from the native context ──
+  // The effect pass's actual render targets are queried LIVE via
+  // OMGetRenderTargets, NOT from d->last_rtvs (the event-tracked set can be
+  // stale/mismatched under the HDR mod, which made the append bind a wrong RT0:
+  // the effect color o0 rendered off-scene and the effects vanished while the
+  // mask o1 still landed in the mask RT).
+  ID3D11RenderTargetView* om_rtvs[8] = {};
+  ID3D11DepthStencilView* om_dsv = nullptr;
+  ctx->OMGetRenderTargets(8, om_rtvs, &om_dsv);
+  UINT om_num = 0;
+  for (UINT i = 0; i < 8u; ++i) if (om_rtvs[i]) om_num = i + 1u;
+  auto release_om = [&]() {
+    for (UINT i = 0; i < 8u; ++i) if (om_rtvs[i]) om_rtvs[i]->Release();
+    if (om_dsv) om_dsv->Release();
+  };
+  if (om_num == 0u || om_rtvs[0] == nullptr) { release_om(); return; }
+
   // D3D11 requires all bound RTs to share identical dimensions — only append
   // the mask to full-res passes. Low-res passes (e.g. particles rendered into
   // a 341x341 buffer) are skipped rather than breaking the draw.
-  reshade::api::resource_desc mr = dev->get_resource_desc(d->effect_mask_texture);
-  reshade::api::resource_desc rd = dev->get_resource_desc(dev->get_resource_from_view(d->last_rtvs[0]));
-  if (rd.type != reshade::api::resource_type::texture_2d) return;
-  if (rd.texture.width != mr.texture.width || rd.texture.height != mr.texture.height) return;
+  D3D11_TEXTURE2D_DESC r0_td = {};
+  {
+    ID3D11Resource* res = nullptr;
+    om_rtvs[0]->GetResource(&res);
+    if (res) {
+      D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      res->GetType(&dim);
+      if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        static_cast<ID3D11Texture2D*>(res)->GetDesc(&r0_td);
+      res->Release();
+    }
+  }
+  D3D11_TEXTURE2D_DESC mtd = {};
+  reinterpret_cast<ID3D11Texture2D*>(d->effect_mask_texture.handle)->GetDesc(&mtd);
+  if (r0_td.Width == 0u || r0_td.Width != mtd.Width || r0_td.Height != mtd.Height) {
+    release_om(); return;
+  }
+
   // Clear once per frame before the first effect pass.
   if (!d->effect_mask_cleared_this_frame) {
     const float black[4] = {0.f, 0.f, 0.f, 0.f};
     cmd_list->clear_render_target_view(d->effect_mask_rtv, black);
     d->effect_mask_cleared_this_frame = true;
   }
-  reshade::api::resource_view rts[9];
+
+  // DIAG: real OM state at the effect draw — if exclusion is still broken the
+  // log names the exact RT set the effect renders into.
+  if (shader_injection.dlaa_debug_logging > 0.5f) {
+    char line[256];
+    int pos = snprintf(line, sizeof(line), "[DLAA] mask OM: ps=0x%08X rtvs=%u", phash, om_num);
+    for (UINT i = 0; i < 8u && i < om_num && pos > 0 && pos < (int)sizeof(line); ++i) {
+      if (!om_rtvs[i]) continue;
+      D3D11_RENDER_TARGET_VIEW_DESC rtd = {};
+      om_rtvs[i]->GetDesc(&rtd);
+      ID3D11Resource* r = nullptr;
+      om_rtvs[i]->GetResource(&r);
+      UINT w = 0, h = 0;
+      if (r) {
+        D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        r->GetType(&dim);
+        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+          D3D11_TEXTURE2D_DESC t = {};
+          static_cast<ID3D11Texture2D*>(r)->GetDesc(&t);
+          w = t.Width; h = t.Height;
+        }
+        r->Release();
+      }
+      pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " r%d=fmt%d %ux%u",
+                      (int)i, (int)rtd.Format, w, h);
+    }
+    if (om_dsv) {
+      D3D11_DEPTH_STENCIL_VIEW_DESC dd = {};
+      om_dsv->GetDesc(&dd);
+      pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " dsv=fmt%d", (int)dd.Format);
+    }
+    LogThrottled("mask-om", reshade::log::level::info, 20u, 60u, "%s", line);
+  }
+
+  // Build the appended set: [RT0, maskRT, RT1..RTn-1] (native OM views -> handles).
+  reshade::api::resource_view rts[9] = {};
   uint32_t n = 0;
-  for (uint32_t i = 0; i < d->last_rtv_count && n < 8u; ++i)
-    if (d->last_rtvs[i].handle) rts[n++] = d->last_rtvs[i];
-  if (n == 0u || n >= 8u) return;
-  // The effect PS writes the mask to SV_TARGET1, so the mask RT must sit at
-  // RTV index 1 — NOT appended at the end (that only aligned for single-RT
-  // passes; multi-RT effect passes never wrote the mask and stayed in DLAA).
-  // Shift the pass's own RT1..N down one slot to make room for it.
-  for (uint32_t i = n; i > 1; --i) rts[i] = rts[i - 1];
-  rts[1] = d->effect_mask_rtv;
-  ++n;
-  cmd_list->bind_render_targets_and_depth_stencil(n, rts, d->last_dsv);
+  auto to_rv = [](ID3D11RenderTargetView* v) {
+    reshade::api::resource_view rv = {};
+    rv.handle = reinterpret_cast<uintptr_t>(v);
+    return rv;
+  };
+  rts[n++] = to_rv(om_rtvs[0]);
+  rts[n++] = d->effect_mask_rtv;
+  for (UINT i = 1; i < om_num && n < 8u; ++i)
+    if (om_rtvs[i]) rts[n++] = to_rv(om_rtvs[i]);
+  reshade::api::resource_view dsv = {};
+  if (om_dsv) dsv.handle = reinterpret_cast<uintptr_t>(om_dsv);
+  cmd_list->bind_render_targets_and_depth_stencil(n, rts, dsv);
+
+  release_om();
 }
 
 // ── Per-object motion (Stage 1): dedicated 16-bit target ──
@@ -3326,26 +3399,26 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAEnabled", .binding = &shader_injection.dlaa_enabled,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f, .label = "Anti-Aliasing", .section = "Antialiasing",
+        .default_value = 2.f, .label = "Anti-Aliasing", .section = "Antialiasing",
         .tooltip = "Off: no anti-aliasing (FXAA replaced by a passthrough). FXAA: the game's original luma FXAA. DLAA: NVIDIA DLAA (requires nvngx_dlss.dll).", .labels = {"Off", "FXAA", "DLAA"},
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAPreset", .binding = &shader_injection.dlaa_preset,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "DLSS Preset", .section = "Antialiasing",
+        .default_value = 3.f, .label = "DLSS Preset", .section = "Antialiasing",
         .labels = {"Default","F-CNN","J-T1","K-T1","L-T2","M-T2"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAJitter", .binding = &shader_injection.dlaa_jitter_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Camera Jitter", .section = "Antialiasing",
+        .default_value = 1.f, .label = "Camera Jitter", .section = "Antialiasing",
         .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAJitterSign", .binding = &shader_injection.dlaa_jitter_sign,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "Jitter Sign", .section = "Antialiasing",
+        .default_value = 3.f, .label = "Jitter Sign", .section = "Antialiasing",
         .labels = {"FlipBoth","FlipX","FlipY","Current"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
@@ -3384,7 +3457,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAJitterMethod", .binding = &shader_injection.dlaa_jitter_method,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "Jitter Method", .section = "Antialiasing",
+        .default_value = 1.f, .label = "Jitter Method", .section = "Antialiasing",
         .tooltip = "Per VS: jitter is added inside each replaced scene-geometry vertex shader (each new scene's VS permutations must be patched). Global: the shared camera ViewProjection in _Globals is patched once, jittering every scene object regardless of VS hash (no per-scene shader gathering).",
         .labels = {"Per VS", "Global"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
@@ -3408,7 +3481,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAMVThreshold", .binding = &shader_injection.dlaa_mv_threshold,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 0.f, .label = "MV Threshold (px)", .section = "Antialiasing",
+        .default_value = 0.2f, .label = "MV Threshold (px)", .section = "Antialiasing",
         .tooltip = "Zeros CAMERA motion vectors below this magnitude. Kills static sub-pixel MV noise that poisons history. Per-object / Prev-Bone MVs have their own threshold: DLAAPerObjectMVThreshold.",
         .min = 0.f, .max = 5.f, .format = "%.2f",
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
@@ -3432,7 +3505,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAExcludeEffects", .binding = &shader_injection.dlaa_exclude_effects,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Exclude Effects from DLAA", .section = "Antialiasing",
+        .default_value = 1.f, .label = "Exclude Effects from DLAA", .section = "Antialiasing",
         .tooltip = "Masks particles/effects out of DLAA: they get an off-screen motion vector so DLSS falls back to the current frame (no temporal shimmer/ghosting).",
         .labels = {"Off","On"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
@@ -3509,19 +3582,19 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAFlagIsHDR", .binding = &shader_injection.dlaa_flag_is_hdr,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Flag: HDR Input", .section = "Antialiasing",
+        .default_value = 1.f, .label = "Flag: HDR Input", .section = "Antialiasing",
         .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAFlagDepthInverted", .binding = &shader_injection.dlaa_flag_depth_inverted,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Flag: Depth Inverted", .section = "Antialiasing",
+        .default_value = 0.f, .label = "Flag: Depth Inverted", .section = "Antialiasing",
         .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAFlagAutoExposure", .binding = &shader_injection.dlaa_flag_auto_exposure,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "Flag: Auto Exposure", .section = "Antialiasing",
+        .default_value = 1.f, .label = "Flag: Auto Exposure", .section = "Antialiasing",
         .labels = {"Off","On"}, .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     new renodx::utils::settings::Setting{
@@ -3535,7 +3608,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAHdrInject", .binding = &shader_injection.dlaa_hdr_inject,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
+        .default_value = 1.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
         .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (_renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
         .labels = {"Auto","Pre-ToneMap","Composite"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
@@ -3543,7 +3616,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAHdrFloatOut", .binding = &shader_injection.dlaa_hdr_float_out,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f, .label = "HDR: Float DLSS Output", .section = "Antialiasing",
+        .default_value = 1.f, .label = "HDR: Float DLSS Output", .section = "Antialiasing",
         .tooltip = "Makes the DLSS output texture r16g16b16a16_float instead of r8g8b8a8. The 8-bit UNORM output clamps highlight values before the HDR mod's tone map can recover them (clipping/banding on the Pre-ToneMap path). Float preserves the range through the tone map. Recreates the DLSS feature once on toggle.",
         .labels = {"Off (8-bit)","On (r16 float)"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
@@ -3565,7 +3638,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseB", .binding = &g_phaseb_enabled,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Phase B Generic VS Patch", .section = "Antialiasing",
+        .default_value = 0.f, .label = "Phase B Generic VS Patch", .section = "Antialiasing",
         .tooltip = "Generic DXBC patcher: adds prev-bone re-skin + prevVP to every skinned VS at pipeline creation (per-object motion MVs without per-shader HLSL).",
         .labels = {"Off","On"},
     },
