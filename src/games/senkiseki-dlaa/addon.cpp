@@ -3360,6 +3360,11 @@ static bool OnCreatePipeline(
     if (!senkiseki3::dxbc::PatchPerObjectPixelShader(blob, &new_hash, vs_texcoord_index)) continue;
     if (new_hash == 0u || new_hash == hash) continue;
 
+    // Evidence capture (DLAAPhaseBDump on): original + patched PS blobs, written
+    // BEFORE the driver sees them so a TDR can't lose the evidence.
+    WritePhasebDump(hash, desc->code, desc->code_size, ".ps");
+    WritePhasebDump(new_hash, blob.data(), blob.size(), ".ps.patched");
+
     desc->code = malloc(blob.size());
     if (!desc->code) continue;
     std::memcpy(const_cast<void*>(desc->code), blob.data(), blob.size());
