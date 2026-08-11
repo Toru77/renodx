@@ -419,6 +419,7 @@ inline uint32_t EncodeInstruction(uint32_t opcode, uint32_t length, uint32_t sat
 //   .xyzw=0xE4 .xxxx=0x00 .yyyy=0x55 .zzzz=0xAA .wwww=0xFF
 
 constexpr uint32_t kSwizzleXYZW = 0xE4u;
+constexpr uint32_t kSwizzleXYXY = 0x44u;  // [x,y,x,y]: div into .zw reads src .x/.y (curNDC.x/.y)
 constexpr uint32_t kSwizzleXXXX = 0x00u;
 constexpr uint32_t kSwizzleYYYY = 0x55u;
 constexpr uint32_t kSwizzleZZZZ = 0xAAu;
@@ -1929,12 +1930,16 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   }
 
   // ── Per-object velocity (RT2 channel): Part A — CURRENT-pose re-skin ──
-  // prevClip (rB) = prev-bone skin x prevVP captures the PREVIOUS frame. For
-  // the velocity delta we also need THIS frame's clip: re-skin with the game's
-  // CURRENT bones (bone_game_slot = t0, already bound by the game) x the game's
-  // CURRENT ViewProjection (b0 c10..c13, already bound). Both skins get the
-  // same outline offset, so it cancels in the delta. rB is still free here
-  // (prevClip is computed after this block), so it is reused as dp4 scratch.
+  // For the velocity delta we need THIS frame's clip AND the previous pose
+  // projected with the SAME camera. Re-skin with the game's CURRENT bones
+  // (bone_game_slot = t0, already bound by the game) x the game's CURRENT
+  // ViewProjection (b0 c10..c13) into rCurClip. prevClip (rB, computed after
+  // this block) = the SAME c10..c13 x the PREV-frame bones (t1), so the delta
+  // prevNDC-curNDC is OBJECT-ONLY motion (the camera cancels) — the camera
+  // component is added back by the velocity compute's depth-reprojection path.
+  // Both skins get the same outline offset, so it cancels in the delta. rB is
+  // still free here (prevClip is computed after this block), so it is reused as
+  // dp4 scratch.
   if (emit_vel) {
     for (uint32_t b = 0; b < 4u; ++b) {
       const uint32_t comp = kBoneComps[b];
@@ -1998,41 +2003,65 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitDp4Cb(body, rCurClip, 0x8u, globals_slot, 13u, rCurAcc, kSwizzleXYZW);
   }
 
-  // prevClip into rB. constant mode: o7 = (0,0,0,1) with ZERO reads. minimal/
-  // no-bind modes: game's own ViewProjection (b0 c10..c13); otherwise the
-  // addon's prevVP cbuffer. no-output test: block runs but no output write.
+  // prevClip into rB. For the per-object velocity path the prevClip must use
+  // the CURRENT ViewProjection (b0 c10..c13) so the delta prevNDC-curNDC is
+  // OBJECT-ONLY motion — both skins share the SAME camera, so the camera
+  // component cancels and the delta is immune to prevVP (cb1) staleness/
+  // pairing (the old full-MV delta showed a huge ~-0.9 NDC rigid-body offset).
+  // The camera component is added back in the velocity compute's
+  // depth-reprojection path. constant mode: o7 = (0,0,0,1) with ZERO reads.
+  // minimal/no-bind modes: game's own ViewProjection (b0 c10..c13); the legacy
+  // (non-velocity) prevClip output uses the addon prevVP cbuffer.
   if (constant) {
     EmitMovImm4(body, rB, 0xFu, 0u, 0u, 0u, 0x3F800000u);  // rB = (0,0,0,1)
   } else {
-    EmitDp4Cb(body, rB, 0x1u, prev_vp_cb, prev_vp_elem + 0u, minimal ? rP : rAcc, kSwizzleXYZW);
-    EmitDp4Cb(body, rB, 0x2u, prev_vp_cb, prev_vp_elem + 1u, minimal ? rP : rAcc, kSwizzleXYZW);
-    EmitDp4Cb(body, rB, 0x4u, prev_vp_cb, prev_vp_elem + 2u, minimal ? rP : rAcc, kSwizzleXYZW);
-    EmitDp4Cb(body, rB, 0x8u, prev_vp_cb, prev_vp_elem + 3u, minimal ? rP : rAcc, kSwizzleXYZW);
+    const uint32_t vel_cb = emit_vel ? globals_slot : prev_vp_cb;
+    const uint32_t vel_elem = emit_vel ? 10u : prev_vp_elem;
+    EmitDp4Cb(body, rB, 0x1u, vel_cb, vel_elem + 0u, minimal ? rP : rAcc, kSwizzleXYZW);
+    EmitDp4Cb(body, rB, 0x2u, vel_cb, vel_elem + 1u, minimal ? rP : rAcc, kSwizzleXYZW);
+    EmitDp4Cb(body, rB, 0x4u, vel_cb, vel_elem + 2u, minimal ? rP : rAcc, kSwizzleXYZW);
+    EmitDp4Cb(body, rB, 0x8u, vel_cb, vel_elem + 3u, minimal ? rP : rAcc, kSwizzleXYZW);
   }
 
   // ── Per-object velocity (RT2 channel): Part B — encode prevNDC-curNDC ──
-  // Now rB = prevClip (prev-bone skin x prevVP) and rCurClip = curClip (cur-bone
-  // skin x current VP). The 24-bit code E = (Ix*4096 + Iy)/16777216 where
-  // Ix,Iy = clamp(round_z((delta*8+0.5)*4096), 0, 4095) quantize the NDC delta.
-  // The x8 scale (was x2) maps delta in [-0.0625, +0.0625] NDC (~+/-160px at
-  // 1440p) onto the full 12-bit range — 4x finer quantization than the old
-  // +/-0.25 NDC range, so the packed channel's ~0.3px steps (which flickered
-  // under jitter -> DLSS shake) drop to ~0.08px. Velocities beyond +/-160px in
-  // one frame clamp (rare for 60fps characters).
+  // Now rB = prevClip (prev-bone skin x CURRENT VP) and rCurClip = curClip
+  // (cur-bone skin x CURRENT VP) — BOTH projected with the game's current
+  // c10..c13, so the delta is OBJECT-ONLY motion (camera cancels, immune to
+  // prevVP pairing/staleness). The camera component of the object's full MV is
+  // added by the velocity compute's depth-reprojection path.
+  // The 24-bit code E = (Ix*4096 + Iy)/16777216 where
+  // Ix,Iy = clamp(round_z((delta*0.5+0.5)*4096), 0, 4095) quantize the NDC delta.
+  // The x0.5 scale maps delta in [-1.0, +1.0] NDC (~+/-1280px at 2560 wide)
+  // onto the full 12-bit range (quantization ~0.625px, DLAA-safe); beyond that
+  // the delta clamps and the 1000px robustness cap in the compute drops the
+  // pixel back to the camera path (graceful). The decode in
+  // motion_velocity.cs_5_0.hlsl and the MaybeLogMotionBuffer readback must use
+  // (Ix/4096)*2 - 1 to match.
   // The game's UNPATCHED PS computes depth = v.z/v.w = E/1 = E and packs E into
   // o2 (RT2) as 3 bytes — no PS patch needed. Writing (E,1) into TEXCOORD10.zw
   // keeps .xy untouched (the PS never reads them).
   if (emit_vel) {
     EmitDiv(body, rV, 0x3u, rB, kSwizzleXYZW, rB, kSwizzleWWWW);             // rV.xy = prevNDC
-    EmitDiv(body, rV, 0xCu, rCurClip, kSwizzleXYZW, rCurClip, kSwizzleWWWW); // rV.zw = curNDC
+    // rV.zw = curNDC.xy. CRITICAL: with dst mask .zw, src0 MUST be swizzled
+    // [x,y,x,y] so rV.z = curClip.x/curClip.w (curNDC.x) and
+    // rV.w = curClip.y/curClip.w (curNDC.y). The old kSwizzleXYZW read
+    // rV.z = curClip.z/curClip.w = the DEPTH and rV.w = w/w = 1, which made
+    // the encoded delta = prevNDC.x - curDEPTH (~ -0.94 = the character's
+    // depth, rejecting the far range at the 1000px cap -> "only near camera")
+    // and dy = prevNDC.y - 1. This was the root cause of the whole -0.93
+    // "same as camera" bug.
+    EmitDiv(body, rV, 0xCu, rCurClip, kSwizzleXYXY, rCurClip, kSwizzleWWWW); // rV.zw = curNDC.xy
     if (options.velocity_debug_mode == 0u) {
     EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX); // dx = prev.x - cur.x
     EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY); // dy = prev.y - cur.y (imm -1 at .y)
-    // nx = round_z(clamp(dx*8+0.5,0,1) * 4096) clamped to [0,4095].
+    // nx = round_z(clamp(dx*0.5+0.5,0,1) * 4096) clamped to [0,4095] — the
+    // x0.5 scale gives a +-1.0 NDC (+-1280px) range so the FULL screen-space
+    // motion (camera + object, since prevClip uses the previous frame's VP)
+    // fits even for a close-to-camera moving character (~0.62 NDC measured).
     // NOTE: clamp to 4095.999756 (0x457FFFFF = the float just below 4096)
     // BEFORE round_z so the result is always an integer in [0,4095] — clamping
     // after round_z would leave a fractional nx in the round_z(4096) edge case.
-    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x41000000u, 0u, 0u, 0u);  // rV.x *= 8 (finer quant)
+    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u, 0u, 0u, 0u);  // rV.x *= 0.5 (range +-1.0 NDC)
     EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
     EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
     EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);              // min 1
@@ -2040,8 +2069,8 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FFFFFu);              // min 4095.999756
     EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);                            // round_z
     EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
-    // ny = round_z(clamp(dy*8+0.5,0,1) * 4096) clamped to [0,4095].
-    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x41000000u, 0u, 0u);  // rV.y *= 8 (finer quant, imm at .y)
+    // ny = round_z(clamp(dy*0.5+0.5,0,1) * 4096) clamped to [0,4095].
+    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x3F000000u, 0u, 0u);  // rV.y *= 0.5 (range +-1.0 NDC, imm at .y)
     EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
     EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
     EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
@@ -2056,7 +2085,7 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
     // mov o{tex10}.zw, rV.zzzw  -> the game's PS packs (E, 1) into o2/RT2.
     EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else {
+    } else if (options.velocity_debug_mode <= 4u) {
       // ── Diagnostic encode (velocity_debug_mode 1..4): write a RAW NDC
       // component instead of the delta so the motionBuf readback reveals whether
       // the injected cur/prev skin NDC is sane. mode: 1=curNDC.x, 2=prevNDC.x,
@@ -2077,6 +2106,66 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
       // code = Ix*4096; E = code / 16777216
       EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = Ix*4096
       EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24
+      EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
+      EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
+    } else if (options.velocity_debug_mode == 6u) {
+      // ── Diagnostic encode (mode 6): BOTH skins in ONE code — Ix = curNDC.x
+      // (rV.z), Iy = prevNDC.x (rV.x). A single motionBuf center readback then
+      // reveals which injected skin is broken: at the character's screen-center
+      // pixel curNDC.x should be ~0 (Ix ~ 2048 -> E.r ~ 0.5 = "zeroVel"); a
+      // wildly off Ix means the Part A cur re-skin (t0) is broken, a wildly off
+      // Iy means the Part B prev re-skin (t1) is broken. Same 2-axis layout as
+      // mode 0, 4095-scale like modes 1..4. ──
+      EmitMov(body, rV, 0x2u, rV, kSwizzleXXXX);  // rV.y = prevNDC.x (before clobber)
+      EmitMov(body, rV, 0x1u, rV, kSwizzleZZZZ);  // rV.x = curNDC.x
+      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u, 0u, 0u, 0u);  // rV.x *= 0.5
+      EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
+      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
+      EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);
+      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FF000u, 0u, 0u, 0u);  // *= 4095.0
+      EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);
+      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
+      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x3F000000u, 0u, 0u);  // rV.y *= 0.5
+      EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
+      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
+      EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
+      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x457FF000u, 0u, 0u);  // *= 4095.0
+      EmitRoundZ(body, rV, 0x2u, rV, kSwizzleYYYY);
+      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
+      // code = Ix*4096 + Iy;  E = code / 16777216
+      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = Ix*4096
+      EmitAdd(body, rV, 0x4u, rV, kSwizzleZZZZ, rV, kSwizzleYYYY);             // rV.z += Iy
+      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24
+      EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
+      EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
+    } else {
+      // ── Diagnostic encode (velocity_debug_mode >= 5): encode the RAW DELTA
+      // prevNDC-curNDC with a WIDE +-4 NDC range (scale 0.125) so nothing
+      // saturates. The motionBuf readback classification (E-based) then splits:
+      //   zeroVel (E~0.5) = delta ~ 0   -> identical bones+VP, encode SHOULD be 0.5
+      //   pos / neg       = delta finite & non-zero (magnitude decodable)
+      //   noData (E~0)    = delta NaN or <= -4 NDC -> injected skin broken
+      // Same 2-axis code layout as mode 0 (nx*4096+ny). ──
+      EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX); // dx = prev.x - cur.x
+      EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY); // dy = prev.y - cur.y (imm -1 at .y)
+      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3E000000u, 0u, 0u, 0u);  // rV.x *= 0.125
+      EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
+      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
+      EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);
+      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FF000u, 0u, 0u, 0u);  // rV.x *= 4095.0
+      EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);
+      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
+      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x3E000000u, 0u, 0u);  // rV.y *= 0.125 (imm at .y)
+      EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
+      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
+      EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
+      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x457FF000u, 0u, 0u);  // rV.y *= 4095.0 (imm at .y)
+      EmitRoundZ(body, rV, 0x2u, rV, kSwizzleYYYY);
+      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
+      // code = nx*4096 + ny;  E = code / 16777216
+      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = nx*4096 (imm at .z)
+      EmitAdd(body, rV, 0x4u, rV, kSwizzleZZZZ, rV, kSwizzleYYYY);             // rV.z += ny
+      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24 (imm at .z)
       EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
       EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
     }

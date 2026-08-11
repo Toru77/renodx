@@ -1,13 +1,16 @@
 // ── Motion Vector Generation: Depth Reprojection + Per-Object MV ──
 // Compute shader (cs_5_0) that generates R16G16_FLOAT velocity.
 //
-// Two sources (per-pixel, object motion wins):
+// Two sources, COMBINED per-pixel (full MV = camera + object):
 //   1. Per-object motion (dynamic objects): G-buffer MRT2 at t1 holds the
-//      previous-frame NDC encoded in o2.zw ([0,1] UV, y-up) by the modified
-//      char G-buffer shader (0x0E8BC215). o2.w != 0 marks a valid entry.
+//      OBJECT-ONLY motion delta prevNDC-curNDC (both skins projected with the
+//      CURRENT ViewProjection, so camera motion is NOT included) encoded in
+//      o2.zw ([0,1], y-up) by the modified char G-buffer VS. o2.w != 0 marks a
+//      valid entry. The object delta (px) is ADDED to the camera-path prevPx.
 //   2. Camera motion (depth reprojection): unproject depth (t0) with the
 //      current inverse view-projection, reproject with the previous
-//      view-projection, and take the screen-space delta.
+//      view-projection, and take the screen-space delta. Always runs; the
+//      per-object delta is added on top for dynamic-object pixels.
 //
 // Input:  t0 = depth texture (R32_FLOAT or R32_TYPELESS)
 //         t1 = G-buffer MRT2 (per-object prevNDC in o2.zw, y-up UV)
@@ -82,23 +85,24 @@ void main(uint2 pix : SV_DispatchThreadID)
   // moving (vel = vel_true), for jittered AND unjittered depth alike.
   float2 curPxU = curPx - jitterPx;
 
-  // Previous-frame screen position (y-down)
-  float2 prevPx = curPxU;  // no-motion default (invalid depth -> vel = 0)
+  // Previous-frame screen position (y-down). Default = current pixel (no motion).
+  float2 prevPx = curPxU;
+  float2 objectDeltaPx = float2(0.0, 0.0);
   bool hasObjectMotion = false;
 
   // ── Per-object motion (dynamic objects, from modified VS + 32-bit target) ──
-  // RT2 channel (NO pixel-shader patch): the patched VS encodes the velocity
-  // delta prevNDC-curNDC as a 24-bit code E = (Ix*4096 + Iy)/16777216 into
-  // TEXCOORD10.zw, and the GAME's UNPATCHED G-buffer PS packs E into o2 (RT2)
-  // as 3 bytes: o2 = (byte0/256, byte1/256, byte2, 1). We swap RT2 for our
-  // r32g32b32a32_float target, so mrt.rgb = the packed bytes and mrt.w = 1.
+  // The patched VS encodes the OBJECT-ONLY motion delta prevNDC-curNDC (both
+  // skins projected with the CURRENT ViewProjection, so the camera component is
+  // NOT included — immune to prevVP pairing/staleness that made the old full-MV
+  // delta a huge ~-0.9 NDC rigid-body offset) as a 24-bit code
+  // E = (Ix*4096 + Iy)/16777216 into TEXCOORD10.zw, and the GAME's UNPATCHED
+  // G-buffer PS packs E into o2 (RT2) as 3 bytes: o2 = (byte0/256, byte1/256,
+  // byte2, 1). We swap RT2 for our r32g32b32a32_float target.
   // Decode: code = byte0*65536 + byte1*256 + byte2; Ix = code/4096, Iy = code
-  // mod 4096; vx = Ix/4096*0.125-0.0625, vy = Iy/4096*0.125-0.0625 (the exact
-  // inverse of the VS encode, which scales delta*8+0.5 so delta in
-  // [-0.0625,+0.0625] NDC spans the full 12-bit range -> ~0.08px steps at 1440p,
-  // 4x finer than the old 0.5-0.25 mapping -> less quantization flicker/shake).
-  // The cleared (0,0,0,0) sentinel decodes to code 0 -> no per-object data ->
-  // the camera path below handles the pixel.
+  // mod 4096; vx = Ix/4096*2-1, vy = Iy/4096*2-1 (±1.0 NDC = ±1280px at 2560w).
+  // The camera component of the object's motion is added by the depth
+  // reprojection below (per-object pixels ADD the object delta to the camera
+  // prevPx, so the full MV = camera + object).
   if (params1.z > 0.5f) {
     float4 mrt = g_srcMotion.Load(int3(pix, 0));
     float code = round(mrt.r * 256.0f) * 65536.0f +
@@ -107,16 +111,24 @@ void main(uint2 pix : SV_DispatchThreadID)
     if (code > 0.5f) {
       float ix = floor(code / 4096.0f);
       float iy = code - ix * 4096.0f;
-      float vx = (ix / 4096.0f) * 0.125f - 0.0625f;
-      float vy = (iy / 4096.0f) * 0.125f - 0.0625f;
-      prevPx.x = curPx.x + vx * w * 0.5f;
-      prevPx.y = curPx.y - vy * h * 0.5f;  // NDC y-up -> y-down screen px
-      hasObjectMotion = true;
+      float vx = (ix / 4096.0f) * 2.0f - 1.0f;    // ×0.5 encode: ±1.0 NDC
+      float vy = (iy / 4096.0f) * 2.0f - 1.0f;
+      // Robustness: only trust object-only MVs within a sane magnitude. Values
+      // beyond 1000px mean the prev-bone snapshot was stale/mixed or the motion
+      // is absurd — falling back to the camera path keeps the character
+      // consistent (no jitter).
+      if (max(abs(vx) * w * 0.5f, abs(vy) * h * 0.5f) < 1000.0f) {
+        objectDeltaPx.x = vx * w * 0.5f;
+        objectDeltaPx.y = -vy * h * 0.5f;
+        hasObjectMotion = true;
+      }
     }
   }
 
-  // ── Camera motion (depth reprojection) ──
-  if (!hasObjectMotion) {
+  // ── Camera motion (depth reprojection) — ALWAYS. Per-object pixels ADD the
+  // object delta on top, so their full MV = camera + object (consistent with
+  // the background). ──
+  {
     // DLAAPhaseDepthSampleUnjit (params4.x): the depth buffer is UNJITTERED
     // (our depth_only fix), so depth[pix] belongs to the content at UNJITTERED
     // position pix, NOT at curPxU = pix - jitterPx. Sampling at pix therefore
@@ -148,40 +160,32 @@ void main(uint2 pix : SV_DispatchThreadID)
         prevPx.y = (0.5 - prevNDC.y * 0.5) * h;  // y-up NDC -> y-down px
       }
     }
+    if (hasObjectMotion) {
+      prevPx += objectDeltaPx;
+    }
   }
 
-  // Velocity in output-res pixel units (y-down).
+  // Velocity in output-res pixel units (y-down), jitter-free (curPxU, the
+  // camera path, and the object delta are all unjittered).
   //
   // Jitter compensation:
   //  - Depth-reprojection path: the unproject/reproject runs with the UNJITTERED
   //    matrices at the UNJITTERED pixel (curPxU), so it is an exact identity for
   //    static content (vel = 0) AND yields the correct jitter-free MV for moving
-  //    content (vel = vel_true). This matters because the world depth is
-  //    rasterized at the JITTERED grid (Global/Per-VS jitter) — depth[p] belongs
-  //    to the content at p - jitterPx.
-  //  - Per-object path: curPx is the jittered pixel, but the VS prevClip is
-  //    unjittered NDC, so the MV picks up the content shift
-  //    (+jitter_x*w/2, -jitter_y*h/2 px). Subtract it there only.
+  //    content (vel = vel_true).
+  //  - Per-object path: now built on the jitter-free camera path + jitter-free
+  //    object delta, so it needs NO jitter subtraction (the old per-object
+  //    curPx-based full-MV path picked up the content shift and subtracted it).
   // DLSS receives the same jitter via InJitterOffset (MVJittered=0).
-  float2 vel = ((hasObjectMotion ? curPx : curPxU) - prevPx) * params0.z;
+  float2 vel = (curPxU - prevPx) * params0.z;
   // params2.z = MV jitter mode (DLAAPhaseMVJittered / DLAAPhaseMVComp):
-  //   0 = MVJittered=0 + no per-object subtraction (Test B)
-  //   1 = MVJittered=0 + subtract per-object jitter (Test A, current)
-  //   2 = MVJittered=1 + whole buffer JITTERED: per-object keeps its jitter
-  //       (no subtract) and the camera path ADDS the jitter, so DLSS removes
-  //       it internally via MVJittered=1.
+  //   0/1 = MVJittered=0 (Tests A/B): the buffer is jitter-free — no per-object
+  //       subtraction is needed anymore (they are camera-path based).
+  //   2   = MVJittered=1 (Test C): add the current jitter so the whole buffer
+  //       is consistently jittered and DLSS removes it internally.
   if (params2.z > 1.5f) {
-    // MVJittered=1 (Test C): the camera path is jitter-free by construction
-    // (unjittered matrices round trip) — add the current jitter so it matches
-    // the per-object jittered MVs and the whole buffer is consistently jittered.
-    if (!hasObjectMotion) {
-      vel.x += params1.x * params0.x * 0.5f;
-      vel.y -= params1.y * params0.y * 0.5f;
-    }
-  } else if (hasObjectMotion && params2.z > 0.5f) {
-    // MVJittered=0 (Test A): subtract the frame's jitter from per-object MVs.
-    vel.x -= params1.x * params0.x * 0.5f;
-    vel.y += params1.y * params0.y * 0.5f;
+    vel.x += params1.x * params0.x * 0.5f;
+    vel.y -= params1.y * params0.y * 0.5f;
   }
   // DIAGNOSTIC (DLAAPhaseJitterInMV, params3.w): this DLSS runtime IGNORES the
   // NGX jitter offset (report 0 vs real = identical), so the per-frame jitter

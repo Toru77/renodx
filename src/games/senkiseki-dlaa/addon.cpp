@@ -370,6 +370,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   //    ring-period stale; the key must NOT include the handle).
   std::unordered_map<uint64_t, std::unordered_set<uint64_t>> diag_bone_keys;  // bone -> keys (sharing)
   std::unordered_map<uint64_t, std::unordered_set<uint64_t>> diag_key_bones;  // key -> bones (ring)
+  // Per-VS bind summary: vs-hash -> {real prev-bone snapshot binds, identity
+  // placeholder binds}. Tells us which patched VSs actually re-skin with the
+  // PREVIOUS frame's bones and which fall back to the identity placeholder
+  // (garbage prevNDC -> E=0). Logged+cleared by LogBoneTopology.
+  std::unordered_map<uint32_t, std::array<uint64_t, 2>> diag_bind_counts;
   uint64_t diag_topology_log_frame = 0u;  // frame of the last topology summary log
 
   // ── Phase 0 prev-pose probe state (separate DLAAPhase0Logging toggle) ──
@@ -1800,6 +1805,11 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
       uint64_t n_a1 = 0, n_a0 = 0, n_a_other = 0;
       double best_speed = 0.0; UINT best_x = 0, best_y = 0;
       float max_r = 0.f, max_g = 0.f, max_b = 0.f, max_a = 0.f;
+      // Bounding box + centroid of the alpha=1 pixels (packer writes) so we can
+      // tell WHERE on screen the swap actually landed — the center crop can miss
+      // the character if it isn't at screen center.
+      UINT a_min_x = sd.Width, a_min_y = sd.Height, a_max_x = 0u, a_max_y = 0u;
+      uint64_t a_cx = 0, a_cy = 0;
       constexpr UINT sx = 4u, sy = 4u;
       for (UINT y = 0; y < sd.Height; y += sy) {
         const float* row = p + (size_t)y * (m.RowPitch / sizeof(float));
@@ -1809,7 +1819,14 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
           if (q[1] > max_g) max_g = q[1];
           if (q[2] > max_b) max_b = q[2];
           if (q[3] > max_a) max_a = q[3];
-          if (q[3] >= 0.99f) n_a1++; else if (q[3] <= 0.01f) n_a0++; else n_a_other++;
+          if (q[3] >= 0.99f) {
+            n_a1++;
+            if (x < a_min_x) a_min_x = x;
+            if (x > a_max_x) a_max_x = x;
+            if (y < a_min_y) a_min_y = y;
+            if (y > a_max_y) a_max_y = y;
+            a_cx += x; a_cy += y;
+          } else if (q[3] <= 0.01f) n_a0++; else n_a_other++;
           const double code = std::round((double)q[0] * 256.0) * 65536.0 +
                               std::round((double)q[1] * 256.0) * 256.0 +
                               std::round((double)q[2] * 256.0);
@@ -1819,26 +1836,29 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
           if (e >= 0.49 && e <= 0.51) { n_zero++; continue; }
           const double ix = std::floor(code / 4096.0);
           const double iy = code - ix * 4096.0;
-          const double vx = (ix / 4096.0) * 0.125 - 0.0625;
-          const double vy = (iy / 4096.0) * 0.125 - 0.0625;
+          const double vx = (ix / 4096.0) * 2.0 - 1.0;    // ×0.5 encode
+          const double vy = (iy / 4096.0) * 2.0 - 1.0;
           if (e > 0.51) n_pos++; else n_neg++;
           const double sp = std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
           if (sp > best_speed) { best_speed = sp; best_x = x; best_y = y; }
         }
       }
       const uint64_t ftotal = ((uint64_t)(sd.Height / sy)) * (uint64_t)(sd.Width / sx);
-      char fbuf[340];
+      char fbuf[400];
       snprintf(fbuf, sizeof(fbuf),
                "[DLAA] motionBufFull: %ux%u noData=%u%% zeroVel=%u%% pos=%u%% "
                "neg=%u%% clampMax=%u%% bestSpeed=%.2fpx@(%u,%u) maxRaw=(%.3f,%.3f,%.3f) "
-               "alpha1=%u%% alpha0=%u%% aOth=%u%% maxA=%.3f",
+               "alpha1=%u%% alpha0=%u%% aOth=%u%% maxA=%.3f alphaBox=(%u,%u)-(%u,%u) aCenter=(%u,%u)",
                (unsigned)sd.Width, (unsigned)sd.Height,
                (unsigned)(n_no * 100u / ftotal), (unsigned)(n_zero * 100u / ftotal),
                (unsigned)(n_pos * 100u / ftotal), (unsigned)(n_neg * 100u / ftotal),
                (unsigned)(n_max * 100u / ftotal), (float)best_speed, best_x, best_y,
                max_r, max_g, max_b,
                (unsigned)(n_a1 * 100u / ftotal), (unsigned)(n_a0 * 100u / ftotal),
-               (unsigned)(n_a_other * 100u / ftotal), max_a);
+               (unsigned)(n_a_other * 100u / ftotal), max_a,
+               n_a1 ? a_min_x : 0u, n_a1 ? a_min_y : 0u,
+               n_a1 ? a_max_x : 0u, n_a1 ? a_max_y : 0u,
+               n_a1 ? (unsigned)(a_cx / n_a1) : 0u, n_a1 ? (unsigned)(a_cy / n_a1) : 0u);
       reshade::log::message(reshade::log::level::info, fbuf);
 
       // ── Center crop detail (the per-character summary) ──
@@ -1868,8 +1888,8 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
           if (e >= 0.49 && e <= 0.51) { c_zero++; continue; }
           const double ix = std::floor(code / 4096.0);
           const double iy = code - ix * 4096.0;
-          const double vx = (ix / 4096.0) * 0.125 - 0.0625;
-          const double vy = (iy / 4096.0) * 0.125 - 0.0625;
+          const double vx = (ix / 4096.0) * 2.0 - 1.0;    // ×0.5 encode
+          const double vy = (iy / 4096.0) * 2.0 - 1.0;
           if (e > 0.51) c_pos++; else c_neg++;
           c_speed_sum += std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
           c_speed_n++;
@@ -1890,6 +1910,26 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
                center_rgba[0], center_rgba[1], center_rgba[2], center_rgba[3],
                (unsigned)(c_a1 * 100u / ctotal), (unsigned)(c_a0 * 100u / ctotal));
       reshade::log::message(reshade::log::level::info, cbuf);
+      // ── Mode 6 self-decode: the center pixel's 24-bit code holds
+      // Ix = curNDC.x, Iy = prevNDC.x (4095-scale). Log the decoded NDC values
+      // directly so the cur-vs-prev diagnosis is unambiguous:
+      //   Ix ~ 2048 (curNDC.x ~ 0)  -> the CUR skin is the on-screen position (healthy)
+      //   Iy displaced from 2048    -> the PREV skin is displaced (stale/mixed)
+      // and vice versa. ──
+      if (g_phaseb_vel_debug > 5.5f && center_rgba[3] >= 0.99f) {
+        const double c_code = std::round((double)center_rgba[0] * 256.0) * 65536.0 +
+                              std::round((double)center_rgba[1] * 256.0) * 256.0 +
+                              std::round((double)center_rgba[2] * 256.0);
+        const double c_ix = std::floor(c_code / 4096.0);
+        const double c_iy = c_code - c_ix * 4096.0;
+        const double c_cur = (c_ix / 4095.0) * 2.0 - 1.0;
+        const double c_prev = (c_iy / 4095.0) * 2.0 - 1.0;
+        char cb6[160];
+        snprintf(cb6, sizeof(cb6),
+                 "[DLAA] mode6 center: curNDC.x=%+.4f prevNDC.x=%+.4f (Ix=%.0f Iy=%.0f)",
+                 (float)c_cur, (float)c_prev, c_ix, c_iy);
+        reshade::log::message(reshade::log::level::info, cb6);
+      }
     }
     d->motion_dump_pending = false;
   }
@@ -1955,12 +1995,23 @@ static void LogBoneTopology(DeviceData* d) {
     if (age < min_age) min_age = age;
     if (age > max_age) max_age = age;
   }
+  // Per-VS prevBones/identity bind counts (real/identity per vs hash).
+  std::string bindsum;
+  for (auto& [vh, cnt] : d->diag_bind_counts) {
+    char tmp[96];
+    sprintf_s(tmp, "0x%08X:%llu/%llu", vh, (unsigned long long)cnt[0],
+              (unsigned long long)cnt[1]);
+    if (!bindsum.empty()) bindsum += ",";
+    bindsum += tmp;
+  }
+  d->diag_bind_counts.clear();
   std::string msg = "[DLAA] boneTopology: bones=" + std::to_string(d->diag_bone_keys.size()) +
                     " keys=" + std::to_string(d->prev_bone_snaps.size()) +
                     " sharedBones=" + std::to_string(shared_bones) + "{" + shared + "}" +
                     " ringKeys=" + std::to_string(ring_keys) + "{" + ring + "}" +
                     " prevAge=" + (min_age == UINT64_MAX ? std::string("n/a") : std::to_string(min_age)) +
-                    ".." + (max_age == 0u ? std::string("n/a") : std::to_string(max_age));
+                    ".." + (max_age == 0u ? std::string("n/a") : std::to_string(max_age)) +
+                    " bindReal/identity={" + bindsum + "}";
   reshade::log::message(reshade::log::level::info, msg.c_str());
 }
 
@@ -1969,6 +2020,7 @@ static void LogBoneTopology(DeviceData* d) {
 // snapshot hold real affine matrices — if the prev snapshot is identity/zero,
 // the injected prev-bone skin yields a degenerate clip -> prevNDC NaN -> E=0. ──
 static uint64_t g_bone_dump_last = 0;
+static uint64_t g_cb_diag_last = 0;
 static void DumpBoneFirstMat(ID3D11Device* nd, ID3D11DeviceContext* ctx,
                              ID3D11Buffer* buf, const char* tag) {
   if (!nd || !ctx || !buf) return;
@@ -2207,7 +2259,72 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
               // snapshot (prev becomes ring-period stale, but never MIXED across
               // characters).
               const uint64_t gbk = (uint64_t)(uintptr_t)gb;
-              const uint64_t key = base ^ (gbk + 0x9e3779b97f4a7c15ull + (base << 6) + (base >> 2));
+              // ── RING COLLAPSE (round 17) ──
+              // The game rotates a RING of per-frame buffers (bone SRVs and/or
+              // per-slot cb0s) for each character: the same instance draws with
+              // a DIFFERENT key every frame, with the low 16 bits cycling
+              // through exactly 16 values (0xCD94AA55D2F0EEF5 -> ...F275 ->
+              // ...8FF5 -> ...C3B5 -> ... repeats after 16). Keying the
+              // snapshot by the full key gave every ring slot its own
+              // snapshot, so a slot's prev = that slot's pose from 16 frames
+              // ago (snap age=16, bone offset ~15 frames -> ~1.07 units ->
+              // ~1200px at normal distance -> rejected by the 1000px compute
+              // cap -> camera fallback = "same as camera"; close-up it passed
+              // the cap -> "only shows near camera"). Masking the cycling low
+              // 16 bits collapses the whole ring into ONE snapshot per
+              // character: cur is overwritten every frame with the CURRENT
+              // pose (the game always binds a freshly-written slot), prev is
+              // promoted from cur at present, so prev = the PREVIOUS frame's
+              // pose = truly 1 frame old.
+              const uint64_t key =
+                  (base ^ (gbk + 0x9e3779b97f4a7c15ull + (base << 6) + (base >> 2))) & ~0xFFFFull;
+              // ── Diag (throttled): which key component cycles (b0 / vb0 /
+              // bone handle). Confirms the ring composition for the next log. ──
+              if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+                LogThrottled("ring-components", reshade::log::level::info, 1u, 30u,
+                             "[DLAA] ring b0=0x%llX vb=0x%llX bone=0x%llX key=0x%llX size=%u",
+                             (unsigned long long)b0k, (unsigned long long)vbk,
+                             (unsigned long long)gbk, (unsigned long long)key, gd.ByteWidth);
+              // ── Mode 6 draw-identity diag: log WHICH patched draw is bound
+              // (vh / ph / key / bone handle) and the VP row0 (cb0[10]) it would
+              // project with. The mode-6 motionBuf center shows curNDC.x pinned
+              // at ~+0.937 (off-screen right) while prevNDC.x ~ 0 — the cur skin
+              // reads a WRONG t0 at the draw that writes the center pixel. This
+              // line names that draw so we can see whether it's the main VP
+              // (m00~-1.38, m03~+80.9) or a different pass/VP, and which bone
+              // handle is bound. Throttled lightly so the whole pass is visible. ──
+              if (g_phaseb_vel_debug > 5.5f && shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+                auto* pstate = renodx::utils::shader::GetCurrentState(cmd_list);
+                uint32_t pvh = pstate ? renodx::utils::shader::GetCurrentVertexShaderHash(pstate) : 0u;
+                uint32_t pph = pstate ? renodx::utils::shader::GetCurrentPixelShaderHash(pstate) : 0u;
+                float vp_m00 = 0.f, vp_m03 = 0.f;
+                if (b0) {
+                  D3D11_BUFFER_DESC bd2 = {};
+                  b0->GetDesc(&bd2);
+                  UINT off = 160u;  // c10 = byte offset 160 (4 floats * 10)
+                  if (off + 64u > bd2.ByteWidth) off = 0u;
+                  D3D11_BUFFER_DESC sd2 = {};
+                  sd2.ByteWidth = 64u; sd2.Usage = D3D11_USAGE_STAGING; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                  ID3D11Buffer* st2 = nullptr;
+                  if (SUCCEEDED(reinterpret_cast<ID3D11Device*>(cmd_list->get_device()->get_native())
+                                    ->CreateBuffer(&sd2, nullptr, &st2))) {
+                    D3D11_BOX box = {off, 0, 0, off + 64u, 1, 1};
+                    ctx->CopySubresourceRegion(st2, 0, 0, 0, 0, b0, 0, &box);
+                    D3D11_MAPPED_SUBRESOURCE mm2 = {};
+                    if (SUCCEEDED(ctx->Map(st2, 0, D3D11_MAP_READ, 0, &mm2))) {
+                      const float* f2 = static_cast<const float*>(mm2.pData);
+                      vp_m00 = f2[0]; vp_m03 = f2[3];
+                      ctx->Unmap(st2, 0);
+                    }
+                    st2->Release();
+                  }
+                }
+                LogThrottled(ThrottleKey("mode6-draw", pvh, pph).c_str(),
+                             reshade::log::level::info, 1u, 15u,
+                             "[DLAA] mode6 draw vs=0x%08X ps=0x%08X bone=0x%llX key=0x%llX vp=(%+.4f,%+.4f)",
+                             pvh, pph, (unsigned long long)gbk, (unsigned long long)key,
+                             vp_m00, vp_m03);
+              }
               DeviceData::PrevBoneSnap* snap =
                   EnsurePrevBoneSnap(cmd_list->get_device(), d, key, gd.ByteWidth);
               // Phase B diagnostic: which bones are shared across keys (sharing)
@@ -2217,30 +2334,46 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 d->diag_key_bones[key].insert(gbk);
               }
               if (snap) {
-                // Capture this frame's bones into cur ONCE per frame per
-                // instance (multiple draws of the same instance/VS in one frame
-                // share one snapshot — the game binds the same pose for all).
-                if (snap->last_draw_frame != d->frame_index) {
-                  ctx->CopyResource(snap->cur_buffer, gb);
-                  snap->last_draw_frame = d->frame_index;
-                  // Bound prev staleness. Without this, snapshots accumulate
-                  // forever (no eviction at the high cap) and a character that
-                  // was culled/offscreen for a while comes back with prev bones
-                  // HUNDREDS of frames old -> the VS encode feeds huge garbage
-                  // deltas -> DLSS jitter + "per-object disappears at some
-                  // angles" (stale characters popping into view). If prev was
-                  // never captured (identity, first frame) OR is older than
-                  // 2 frames, refresh prev = THIS frame's pose so the bind is
-                  // current-pose parallax (smooth, consistent with the depth
-                  // path) and true prev-bone motion resumes from next frame.
-                  if (snap->prev_capture_frame == 0u ||
-                      snap->prev_capture_frame + 2u < d->frame_index) {
-                    ctx->CopyResource(snap->prev_buffer, snap->cur_buffer);
-                    snap->prev_capture_frame = d->frame_index;
-                  }
-                }
+                // Refresh cur with the game's CURRENT bones at EVERY draw.
+                // The game can update the bone buffer in place DURING the frame
+                // (an early pass may draw the character before the final pose
+                // is written), so capturing once per frame at the FIRST draw
+                // left cur (and therefore prev) holding a STALE early pose
+                // (measured ~8 frames behind the current pose). The stale
+                // delta came out ~0.9 NDC instead of ~0.04 NDC, blew past the
+                // 1000px robustness cap, and every character pixel fell back
+                // to the camera path ("same as camera" at normal distance).
+                // Overwriting cur at every draw keeps cur = the LATEST bones;
+                // the prev <- cur promotion happens at PRESENT
+                // (CapturePrevBones), so t1 = prev = the PREVIOUS frame's
+                // FINAL pose = truly 1 frame old for the main-pass draws.
+                if (snap->cur_buffer) ctx->CopyResource(snap->cur_buffer, gb);
+                snap->last_draw_frame = d->frame_index;
                 bone_srv = snap->prev_srv;
                 d->last_bound_twin_srv = snap->prev_srv;
+                // ── Diag (throttled per key): the snapshot's prev-bone
+                // freshness/state at THIS draw. age = frames since the prev
+                // content was captured; captured = cur was refreshed from the
+                // game's t0 this draw; refreshed = prev was just forced to cur
+                // (staleness fallback). If age is huge the prev bones are stale
+                // (garbage deltas); if refreshed fires constantly prev==cur
+                // (delta ~0). Neither matches a -0.87 NDC delta, so this
+                // distinguishes stale content from wrong-instance content. ──
+                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+                  const uint64_t snap_age = snap->prev_capture_frame
+                      ? (d->frame_index - snap->prev_capture_frame) : UINT64_MAX;
+                  const bool captured_this = (snap->last_draw_frame != d->frame_index);
+                  const bool refreshed_this =
+                      captured_this && (snap->prev_capture_frame == 0u ||
+                                        snap->prev_capture_frame + 2u < d->frame_index);
+                  LogThrottled(ThrottleKey("snap-state", vh, (uint32_t)key,
+                                           (uint32_t)(key >> 32)).c_str(),
+                               reshade::log::level::info, 1u, 120u,
+                               "[DLAA] snap vs=0x%08X key=0x%llX age=%llu cap=%d refr=%d "
+                               "prevCapF=%llu lastDraw=%llu size=%u",
+                               vh, key, snap_age, (int)captured_this, (int)refreshed_this,
+                               snap->prev_capture_frame, snap->last_draw_frame, snap->size);
+                }
                 // ── Diag (1/sec): confirm the game bone buffer + our prev
                 // snapshot hold REAL affine matrices. Identity/zero prev =>
                 // degenerate prevClip => E=0. ──
@@ -2251,6 +2384,77 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                       cmd_list->get_device()->get_native());
                   DumpBoneFirstMat(ndev, ctx, gb, "game");
                   DumpBoneFirstMat(ndev, ctx, snap->prev_buffer, "prev");
+                }
+                // ── Diag (1/sec): what prevVP (cb1) and the game's b0 c10..13
+                // ACTUALLY hold at THIS draw, and the delta the VS would
+                // compute for a root-bone vertex. The per-object delta =
+                // prevNDC(prevVP x prev-bones) - curNDC(c10..13 x cur-bones);
+                // a stale/wrong prevVP (or a non-VP c10..13) produces a large
+                // rigid-body offset instead of per-limb motion (the ~-0.9 NDC
+                // uniform delta we observe). These reads are the EXACT
+                // matrices the two passes multiply by. ──
+                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+                    d->frame_index - g_cb_diag_last > 60u) {
+                  g_cb_diag_last = d->frame_index;
+                  auto* ndev2 = reinterpret_cast<ID3D11Device*>(
+                      cmd_list->get_device()->get_native());
+                  auto read_cb = [&](ID3D11Buffer* src, UINT byte_off, float* out16) {
+                    if (!ndev2 || !src || !out16) return;
+                    D3D11_BUFFER_DESC sbd = {};
+                    sbd.ByteWidth = 64u;
+                    sbd.Usage = D3D11_USAGE_STAGING;
+                    sbd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    ID3D11Buffer* st = nullptr;
+                    if (FAILED(ndev2->CreateBuffer(&sbd, nullptr, &st))) return;
+                    D3D11_BOX box = {byte_off, 0, 0, byte_off + 64u, 1, 1};
+                    ctx->CopySubresourceRegion(st, 0, 0, 0, 0, src, 0, &box);
+                    D3D11_MAPPED_SUBRESOURCE mm = {};
+                    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &mm))) {
+                      memcpy(out16, mm.pData, 64u);
+                      ctx->Unmap(st, 0);
+                    }
+                    st->Release();
+                  };
+                  float cb1m[16] = {}, b0m[16] = {}, gb_m[16] = {}, pb_m[16] = {};
+                  if (d->prev_vp_cb) read_cb(d->prev_vp_cb, 0u, cb1m);
+                  if (b0) {
+                    D3D11_BUFFER_DESC gd2 = {};
+                    b0->GetDesc(&gd2);
+                    UINT off = 160u;  // c10 (byte offset)
+                    if (off + 64u > gd2.ByteWidth) off = 0u;
+                    read_cb(b0, off, b0m);
+                  }
+                  read_cb(gb, 0u, gb_m);
+                  read_cb(snap->prev_buffer, 0u, pb_m);
+                  const float* f = cb1m;
+                  LogThrottled(ThrottleKey("draw-cb1", vh, 0u, 0u).c_str(),
+                               reshade::log::level::info, 1u, 60u,
+                               "[DLAA] draw cb1(prevVP)=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
+                               f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+                               f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                  const float* g = b0m;
+                  LogThrottled(ThrottleKey("draw-c1013", vh, 0u, 0u).c_str(),
+                               reshade::log::level::info, 1u, 60u,
+                               "[DLAA] draw b0 c10..13=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
+                               g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+                               g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+                  // Simulate the VS for a vertex at the root-bone translation:
+                  // curClip = c10..13 x gameRoot, prevClip = cb1 x prevRoot.
+                  auto project = [](const float* m, const float* p, float* ndc) {
+                    float cx = m[0]*p[0] + m[1]*p[1] + m[2]*p[2] + m[3];
+                    float cy = m[4]*p[0] + m[5]*p[1] + m[6]*p[2] + m[7];
+                    float cw = m[12]*p[0] + m[13]*p[1] + m[14]*p[2] + m[15];
+                    if (cw != 0.f) { ndc[0] = cx/cw; ndc[1] = cy/cw; }
+                    else { ndc[0] = ndc[1] = 0.f; }
+                  };
+                  float curN[2], prevN[2];
+                  project(b0m, gb_m, curN);
+                  project(cb1m, pb_m, prevN);
+                  LogThrottled(ThrottleKey("draw-delta", vh, 0u, 0u).c_str(),
+                               reshade::log::level::info, 1u, 60u,
+                               "[DLAA] draw sim: curNDC=(%+.4f,%+.4f) prevNDC=(%+.4f,%+.4f) delta=(%+.4f,%+.4f)  (root-bone vertex; observed motionBuf delta ~(-0.92,-0.35))",
+                               curN[0], curN[1], prevN[0], prevN[1],
+                               prevN[0]-curN[0], prevN[1]-curN[1]);
                 }
               }
             }
@@ -2264,6 +2468,12 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     if (vb0) vb0->Release();
     if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) LogBoneTopology(d);
   }
+  // Per-VS bind accounting: last_bound_twin_srv is non-null iff a REAL prev-bone
+  // snapshot was bound (vs the identity placeholder). Surfaces which VSs drive
+  // real prev-bone re-skinning vs identity fallback (garbage prevNDC).
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+      shader_injection.dlaa_per_object_motion >= 0.5f)
+    d->diag_bind_counts[vh][d->last_bound_twin_srv ? 0u : 1u]++;
   // Save the game's current bindings at these slots BEFORE overwriting them:
   // MaybeRestorePatchedBinds (next draw) puts them back so our extra structured
   // SRV / prevVP CB never leak into later draws that read the slot as a
@@ -2288,7 +2498,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
     LogThrottled(ThrottleKey("phaseB-bind", vh, it->second.prev_vp_cb_slot,
                              it->second.prev_bone_t_slot).c_str(),
-                 reshade::log::level::info, 1u, 500u,
+                 reshade::log::level::info, 1u, 120u,
                  "[DLAA] phaseB: bind patched vs=0x%08X cb%u=%s t%u=%s tex%u o%u",
                  vh, it->second.prev_vp_cb_slot, d->prev_vp_cb ? "prevVP" : "NONE",
                  it->second.prev_bone_t_slot,
@@ -4246,8 +4456,8 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAPhaseBVelDebug", .binding = &g_phaseb_vel_debug,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "Phase B Velocity Encode Debug", .section = "Antialiasing",
-        .tooltip = "Diagnostic: make the patched VS encode a RAW NDC component instead of the prevNDC-curNDC delta, so the motionBuf readback reveals whether the injected cur/prev skin NDC is sane (character at screen center -> zeroVel) or NaN (all-zeros -> the injected skin is broken). 0=normal delta, 1=curNDC.x, 2=prevNDC.x, 3=curNDC.y, 4=prevNDC.y. Restart-gated (read at shader patch time).",
-        .labels = {"Off","Cur NDC X","Prev NDC X","Cur NDC Y","Prev NDC Y"},
+        .tooltip = "Diagnostic: make the patched VS encode a RAW NDC component instead of the prevNDC-curNDC delta, so the motionBuf readback reveals whether the injected cur/prev skin NDC is sane (character at screen center -> zeroVel) or NaN (all-zeros -> the injected skin is broken). 0=normal delta, 1=curNDC.x, 2=prevNDC.x, 3=curNDC.y, 4=prevNDC.y, 5=RAW DELTA with a wide +-4 NDC range (zeroVel => delta~0, pos/neg => real finite delta, noData => delta NaN), 6=BOTH skins in one code (Ix=curNDC.x, Iy=prevNDC.x) so a single motionBuf center readback shows which skin is displaced. Restart-gated (read at shader patch time).",
+        .labels = {"Off","Cur NDC X","Prev NDC X","Cur NDC Y","Prev NDC Y","Raw Delta (wide)","CurX + PrevX"},
     },
     // Phase B generic-patch isolation (crash bisection).
     new renodx::utils::settings::Setting{
@@ -4961,6 +5171,21 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
                                shader_injection.prev_view_proj[10], shader_injection.prev_view_proj[11],
                                shader_injection.prev_view_proj[12], shader_injection.prev_view_proj[13],
                                shader_injection.prev_view_proj[14], shader_injection.prev_view_proj[15]);
+                // Diag: current frame's ViewProjection, so we can compare prevVP
+                // vs curVP (a large difference = stale prevVP -> the per-object
+                // delta would carry a camera offset the camera path doesn't).
+                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+                  LogThrottled("curvp-content", reshade::log::level::info, 1u, 60u,
+                               "[DLAA] curVP =[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|"
+                               "%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
+                               d->curr_view_proj[0], d->curr_view_proj[1],
+                               d->curr_view_proj[2], d->curr_view_proj[3],
+                               d->curr_view_proj[4], d->curr_view_proj[5],
+                               d->curr_view_proj[6], d->curr_view_proj[7],
+                               d->curr_view_proj[8], d->curr_view_proj[9],
+                               d->curr_view_proj[10], d->curr_view_proj[11],
+                               d->curr_view_proj[12], d->curr_view_proj[13],
+                               d->curr_view_proj[14], d->curr_view_proj[15]);
               }
             }
           }
