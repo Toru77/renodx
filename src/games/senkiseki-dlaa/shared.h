@@ -53,10 +53,28 @@ struct ShaderInjectData {
   // struct so the cbuffer layout of the fields above is unchanged.
   float dlaa_phase0_logging;   // 0=Off, 1=On — prev-pose bone-buffer/vertex probe logs
 
+  // ── Phase B / per-object motion debug logging (addon-side only; NOT read by shaders) ──
+  // Separate toggle from dlaa_debug_logging so the Phase B generic VS patch +
+  // per-object motion machinery (patched-VS bind, prevVP/prev-bone slots, RT2
+  // velocity swap, motion RTV append/skip, patched-draw OM state) can be
+  // isolated from the general DLAA log spam. Kept at the end of the struct so
+  // the cbuffer layout of the fields above is unchanged.
+  float dlaa_phaseb_debug_logging;  // 0=Off, 1=On — Phase B / per-object-motion logs
+
   // ── HDR-mod compatibility (addon-side only; NOT read by shaders) ──
   float dlaa_hdr_decode;       // 0=Off, 1=sRGB, 2=PQ — DLSS input/output color conversion (composite path)
   float dlaa_hdr_inject;       // 0=Auto, 1=Pre-ToneMap (final_blending, raw scene), 2=Composite (FXAA)
   float dlaa_hdr_float_out;    // 0=Off, 1=On — DLSS output r16g16b16a16_float (unclamped highlights)
+
+  // ── Phase B velocity-encode debug (addon-side only; read at pipeline patch
+  // time, so it is restart-gated). When nonzero, the patched VS encodes a RAW
+  // NDC component instead of the prevNDC-curNDC delta, so the motionBuf readback
+  // reveals whether the injected cur/prev skin NDC is sane:
+  //   0 = normal delta;  1 = curNDC.x;  2 = prevNDC.x;  3 = curNDC.y;  4 = prevNDC.y
+  // E = clamp(ndc*0.5+0.5,0,1). A character at screen center yields ~E=0.5
+  // (zeroVel); all-zeros (noData) means that NDC is NaN -> the injected skin is
+  // broken for that pose. ──
+  float dlaa_phaseb_vel_debug;  // 0=Off, 1..4=encode cur/prev NDC component instead of delta
 };
 
 #ifndef __cplusplus

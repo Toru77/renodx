@@ -87,13 +87,30 @@ void main(uint2 pix : SV_DispatchThreadID)
   bool hasObjectMotion = false;
 
   // ── Per-object motion (dynamic objects, from modified VS + 32-bit target) ──
-  // Stage 1: the patched char PS writes prevNDC (0..1, y-up) into a dedicated
-  // r32g32b32a32_float target's xy, with w=1 as the valid flag (cleared to 0).
+  // RT2 channel (NO pixel-shader patch): the patched VS encodes the velocity
+  // delta prevNDC-curNDC as a 24-bit code E = (Ix*4096 + Iy)/16777216 into
+  // TEXCOORD10.zw, and the GAME's UNPATCHED G-buffer PS packs E into o2 (RT2)
+  // as 3 bytes: o2 = (byte0/256, byte1/256, byte2, 1). We swap RT2 for our
+  // r32g32b32a32_float target, so mrt.rgb = the packed bytes and mrt.w = 1.
+  // Decode: code = byte0*65536 + byte1*256 + byte2; Ix = code/4096, Iy = code
+  // mod 4096; vx = Ix/4096*0.125-0.0625, vy = Iy/4096*0.125-0.0625 (the exact
+  // inverse of the VS encode, which scales delta*8+0.5 so delta in
+  // [-0.0625,+0.0625] NDC spans the full 12-bit range -> ~0.08px steps at 1440p,
+  // 4x finer than the old 0.5-0.25 mapping -> less quantization flicker/shake).
+  // The cleared (0,0,0,0) sentinel decodes to code 0 -> no per-object data ->
+  // the camera path below handles the pixel.
   if (params1.z > 0.5f) {
     float4 mrt = g_srcMotion.Load(int3(pix, 0));
-    if (mrt.w > 0.5f) {
-      prevPx.x = mrt.x * w;
-      prevPx.y = (1.0 - mrt.y) * h;  // flip y-up UV -> y-down screen px
+    float code = round(mrt.r * 256.0f) * 65536.0f +
+                 round(mrt.g * 256.0f) * 256.0f +
+                 round(mrt.b * 256.0f);
+    if (code > 0.5f) {
+      float ix = floor(code / 4096.0f);
+      float iy = code - ix * 4096.0f;
+      float vx = (ix / 4096.0f) * 0.125f - 0.0625f;
+      float vy = (iy / 4096.0f) * 0.125f - 0.0625f;
+      prevPx.x = curPx.x + vx * w * 0.5f;
+      prevPx.y = curPx.y - vy * h * 0.5f;  // NDC y-up -> y-down screen px
       hasObjectMotion = true;
     }
   }

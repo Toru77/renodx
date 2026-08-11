@@ -334,15 +334,19 @@ void EmitSelfTest() {
 }
 
 // Patch a skinned VS in place, write the patched blob to `out_path`, and
-// re-validate (parse + signatures + hash self-consistency).
-int PatchOne(const std::string& path, const std::string& out_path) {
+// re-validate (parse + signatures + hash self-consistency). With `velocity`
+// the RT2-channel per-object velocity encode is emitted too.
+int PatchOne(const std::string& path, const std::string& out_path, bool velocity = false) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
     std::cerr << "  ERROR: cannot read file\n";
     return 1;
   }
   uint32_t new_hash = 0;
-  const bool patched = dxbc::PatchSkinnedVertexShader(data, &new_hash);
+  dxbc::PatchInfo info;
+  dxbc::PatchOptions options;
+  options.emit_velocity_to_rt2 = velocity;
+  const bool patched = dxbc::PatchSkinnedVertexShader(data, &new_hash, &info, options);
   if (!patched) {
     std::cout << "  NOT PATCHED (not a skinned VS or parse failed)\n";
     // Re-parse to confirm it's a valid DXBC anyway.
@@ -362,6 +366,11 @@ int PatchOne(const std::string& path, const std::string& out_path) {
   }
   std::cout << "  PATCHED: new CRC32=0x" << std::hex << new_hash << std::dec
             << " size=" << data.size() << " -> " << out_path << "\n";
+  std::cout << "  velocity=" << (info.velocity_emitted ? "EMITTED" : "no")
+            << " tex10=o" << info.tex10_out_reg
+            << " outline=" << (info.outline_applied ? "yes" : "no")
+            << " prevVP=b" << info.prev_vp_cb_slot << " prevBone=t" << info.prev_bone_t_slot
+            << " gameBone=t" << info.bone_game_slot << "\n";
 
   // Re-validate the patched blob.
   dxbc::DXBCHeader h;
@@ -375,7 +384,7 @@ int PatchOne(const std::string& path, const std::string& out_path) {
   const bool hash_ok = std::memcmp(d, h.checksum, 16) == 0;
   std::cout << "  reparse: OK hash=" << (hash_ok ? "SELF-CONSISTENT" : "MISMATCH (BUG)") << "\n";
 
-  // Show the OSGN prevClip entry.
+  // Show the OSGN entries (velocity mode appends nothing; full mode appends prevClip).
   if (const dxbc::ChunkInfo* osgn = dxbc::FindChunk(chunks, "OSGN")) {
     std::vector<dxbc::SignatureEntry> sig;
     if (dxbc::ParseSignature(
@@ -389,6 +398,18 @@ int PatchOne(const std::string& path, const std::string& out_path) {
       std::cout << "\n";
     }
   }
+  return 0;
+}
+
+// Report whether a PS consumes TEXCOORD10 ONLY as .zw (RT2-swap safe).
+int PsZwCheck(const std::string& path) {
+  auto data = ReadBinaryFile(path);
+  if (data.empty()) {
+    std::cerr << "  ERROR: cannot read file\n";
+    return 1;
+  }
+  const bool ok = dxbc::PsReadsTexcoord10Zw(data);
+  std::cout << "  TEXCOORD10.zw-reader (RT2 velocity-safe): " << (ok ? "YES" : "no") << "\n";
   return 0;
 }
 
@@ -626,6 +647,8 @@ int main(int argc, char** argv) {
   bool dump = false;
   bool emittest = false;
   bool patch = false;
+  bool patchvel = false;
+  bool pszw = false;
   bool patchps = false;
   uint32_t texidx = 0u;
   std::string patch_out;
@@ -640,6 +663,10 @@ int main(int argc, char** argv) {
       emittest = true;
     } else if (arg == "--patch") {
       patch = true;
+    } else if (arg == "--patchvel") {
+      patchvel = true;
+    } else if (arg == "--pszw") {
+      pszw = true;
     } else if (arg == "--patchps") {
       patchps = true;
     } else if (arg == "--texidx") {
@@ -660,6 +687,8 @@ int main(int argc, char** argv) {
     std::cerr << "  --dump prints every SHEX instruction's raw dwords + decode.\n";
     std::cerr << "  --emittest prints the emitter-built injected block (no files needed).\n";
     std::cerr << "  --patch patches a skinned VS (generic Phase B) and writes out.cso.\n";
+    std::cerr << "  --patchvel patches a skinned VS WITH the RT2-channel velocity encode.\n";
+    std::cerr << "  --pszw <ps.cso> reports whether the PS reads TEXCOORD10.zw (RT2-swap safe).\n";
     std::cerr << "  --patchps [--texidx <n>] patches a G-buffer PS (Phase E) and writes out.cso.\n";
     std::cerr << "    --texidx overrides the prevClip TEXCOORD index with the paired VS's (0=auto).\n";
     return 1;
@@ -672,13 +701,22 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (patch && !paths.empty()) {
+  if ((patch || patchvel) && !paths.empty()) {
     std::string in = paths[0];
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
-    int rc = PatchOne(in, out);
+    int rc = PatchOne(in, out, patchvel);
     std::cout << "\n";
     return rc;
+  }
+
+  if (pszw && !paths.empty()) {
+    for (const auto& in : paths) {
+      std::cout << "=== " << in << " ===\n";
+      PsZwCheck(in);
+      std::cout << "\n";
+    }
+    return 0;
   }
 
   if (patchps && !paths.empty()) {

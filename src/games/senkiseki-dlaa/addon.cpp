@@ -57,6 +57,7 @@ ShaderInjectData shader_injection = {
     .dlaa_velocity_format = 0.f,
     .dlaa_exclude_effects = 0.f,
     .dlaa_phase0_logging = 0.f,
+    .dlaa_phaseb_debug_logging = 0.f,
     .dlaa_hdr_decode = 0.f,
     .dlaa_hdr_inject = 0.f,
     .dlaa_hdr_float_out = 0.f,
@@ -74,13 +75,30 @@ static float g_phaseb_no_output = 0.f;  // crash-bisection: injected block runs 
                                         // prevClip output register (PS v7 undefined again)
 static float g_phaseb_constant = 0.f;   // crash-bisection: minimal but o7 = (0,0,0,1) constant,
                                         // zero reads at all
+static float g_phaseb_vel_debug = 0.f;  // velocity-encode debug: 0=normal delta,
+                                        // 1..4=encode a RAW NDC component (1=curNDC.x,
+                                        // 2=prevNDC.x, 3=curNDC.y, 4=prevNDC.y) so the
+                                        // motionBuf readback shows if the injected skin's
+                                        // NDC is sane or NaN (restart-gated: read at patch).
 static float g_phaseb_dump = 0.f;     // evidence capture: write patched/original blobs + drawtrace to renodx-dev/dump/phaseb/
 static float g_phaseb_jitter_only = 1.f;  // camera path (default ON): generic VS patch ONLY
                                           // adds the SV_Position jitter — no prevClip output,
                                           // no prev-bone re-skin, no prevVP, no outline, no
                                           // OSGN append. Under GLOBAL jitter it's inert (b13=0).
+static float g_phaseb_rt2_velocity = 1.f;  // per-object velocity via the GAME's TEXCOORD10 ->
+                                           // RT2 channel (NO pixel-shader patch): the patched VS
+                                           // encodes prevNDC-curNDC into TEXCOORD10.zw and the
+                                           // game's UNPATCHED G-buffer PS packs it into o2 (RT2).
+                                           // The slot-2 RTV swap is gated per-PS (TEXCOORD10 read
+                                           // only as .zw), so this is scene-3 safe. Requires
+                                           // DLAAPhaseBJitterOnly=Off + DLAAPerObjectMotion and a
+                                           // restart.
 // ── Phase E crash-bisection toggles (mirror Phase B's; isolate what the
 // NVIDIA driver chokes on in the patched PS) ──
+static float g_phasee_enabled = 0.f;  // MASTER GATE: the Phase E PS patcher (patched char PS
+                                      // writes o3/SV_TARGET3). The patched VS + patched PS pair
+                                      // faults the GPU in scene 3 — keep OFF (default). The
+                                      // per-object MVs use the VS-only RT2 channel instead.
 static float g_phasee_constant = 0.f;  // add ONLY the o3 output, constant write — no input
                                        // decl, no SV_SampleIndex relocation, no vN read
 static float g_phasee_no_read = 0.f;   // input decl + SV relocation, but body never reads vN
@@ -207,6 +225,25 @@ static void LogThrottled(const char* key, reshade::log::level level,
   reshade::log::message(level, buf);
 }
 
+// Content-aware throttle key: `site` + the DISTINCT draw/state content, so the
+// FIRST occurrence of every distinct draw (its vs/ps/rtv-count, bind slots, or
+// OM state) is ALWAYS logged verbatim — that's the important info — and only
+// IDENTICAL repeats are rate-limited. A state change (different VS/PS/RT count,
+// or a bind that flips OK->OTHER/NULL) is a new key and logs immediately, so
+// throttling can never hide a transition. Used by the Phase B / motion sites.
+static std::string ThrottleKey(const char* site, uint32_t a = 0u, uint32_t b = 0u,
+                               uint32_t c = 0u, uint32_t d = 0u) {
+  char buf[96];
+  snprintf(buf, sizeof(buf), "%s|%08X|%08X|%u|%u", site, a, b, c, d);
+  return std::string(buf);
+}
+static std::string ThrottleKeyStr(const char* site, const char* content) {
+  std::string key = site;
+  key += "|";
+  key += content;
+  return key;
+}
+
 // ── Per-device state ──
 struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource velocity_texture = {};
@@ -235,6 +272,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view motion_srv = {};
   reshade::api::resource_view motion_rtv = {};
   bool motion_cleared_this_frame = false;
+  // RT2-swap bookkeeping: when a patched velocity draw swaps slot 2 for the
+  // motion target we remember the GAME's original slot-2 RTV (AddRef'd) and
+  // rebind it before any following non-velocity draw, so the game's native
+  // packed depth never overwrites our motion buffer (the "0x3275FC76 depth
+  // ghost") and the game's own RT2 stays current.
+  ID3D11RenderTargetView* saved_slot2_rtv = nullptr;
+  bool slot2_swapped = false;
 
   // ── Generic DXBC patcher (Phase B): per-object MVs WITHOUT per-shader HLSL ──
   // On create_pipeline we run PatchSkinnedVertexShader on any skinned VS that
@@ -250,14 +294,30 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     uint32_t texcoord_index = 5u;    // prevClip TEXCOORD semantic index
     uint32_t output_reg = 0u;        // prevClip output register
     bool needs_no_binding = false;   // true: patched VS reads only game's t0/b0 (DLAAPhaseBNoBind)
+    bool emits_velocity = false;     // true: this patched VS encoded per-object velocity
+                                     // into TEXCOORD10.zw (the RT2 channel, no PS patch).
   };
-  // Current (patched) hash -> info, used at draw time (GetCurrentVertexShaderHash
-  // returns the patched hash because renodx didn't make this replacement).
-  std::unordered_map<uint32_t, PatchedVsInfo> patched_vs_by_new_hash;
-  // Skip-guard at create_pipeline: both the ORIGINAL hash (VS re-created from
-  // the game's original bytecode) and the NEW hash (CreateInputLayout re-fires
-  // with the already-patched blob) are recorded so we never double-patch.
-  std::unordered_set<uint32_t> patched_vs_hashes;
+  // Original OR patched hash -> info, used at draw time. renodx's shader
+  // tracking reports the GAME'S ORIGINAL hash for a replaced pipeline (its
+  // PipelineShaderDetails reverts replaced shaders to their original identity),
+  // so a map keyed only by the patched hash always misses at draw time. Key by
+  // BOTH so the draw-time lookup (MaybeBindPatchedVs / MaybeReplaceSlot2MotionRtv
+  // / MaybeAppendMotionRtv) matches whatever GetCurrentVertexShaderHash returns.
+  std::unordered_map<uint32_t, PatchedVsInfo> patched_vs_by_hash;
+  // Pixel shaders whose TEXCOORD10 is consumed ONLY as .zw (the G-buffer packed-
+  // depth pattern: div v6.z/v6.w -> o2). Only their draws may swap RT2 for the
+  // velocity target — a PS that reads TEXCOORD10 for its own math (as .xyz)
+  // would write a non-velocity value into o2 and ghost. Classified GENERICALLY
+  // at create_pipeline from the ORIGINAL PS bytecode (PsReadsTexcoord10Zw) — no
+  // hardcoded hash list.
+  std::unordered_set<uint32_t> velocity_compatible_ps_hashes;
+  // Skip-guard at create_pipeline: only the NEW (patched-blob) hashes are
+  // recorded. A re-fire carrying our patched blob (CreateInputLayout) is
+  // skipped; a re-creation of an ORIGINAL blob is ALWAYS re-patched — D3D11
+  // games create the same VS bytecode many times, and the old guard (which
+  // also recorded originals) left unpatched pipelines that most character
+  // draws actually bound (the "only 3 VSs contribute" bug).
+  std::unordered_set<uint32_t> patched_vs_new_hashes;
   // Phase E: same skip-guard for the generic per-object-motion PS patcher
   // (PatchPerObjectPixelShader). The patched PS needs NO draw-time binding — it
   // reads prevClip (TEXCOORD5) via normal VS->PS semantic linkage and writes
@@ -294,9 +354,23 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     ID3D11ShaderResourceView* prev_srv = nullptr;
     uint32_t size = 0u;                    // byte size (== game bone buffer)
     uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
+    uint64_t prev_capture_frame = 0u;      // frame the CURRENT prev_buffer content was captured (freshness)
   };
   std::unordered_map<uint64_t, PrevBoneSnap> prev_bone_snaps;  // key = instance composite
   ID3D11ShaderResourceView* last_bound_twin_srv = nullptr;  // prev snap bound this draw (for restore)
+
+  // ── Phase B bone-topology diagnostics (dlaa_phaseb_debug_logging) ──
+  // Reveals how the game owns bone buffers so the snapshot KEY can be tuned:
+  //  - diag_bone_keys[bone] = set of snapshot keys using that bone handle. A bone
+  //    used by >1 key means buffers are SHARED across instances (a bone-handle key
+  //    then collides; only (b0,vb0)-style keys can separate them, and same-mesh
+  //    instances still mix).
+  //  - diag_key_bones[key] = set of bone handles a key has seen across frames. >1
+  //    means the game rotates a RING of buffers (a bone-handle key then goes
+  //    ring-period stale; the key must NOT include the handle).
+  std::unordered_map<uint64_t, std::unordered_set<uint64_t>> diag_bone_keys;  // bone -> keys (sharing)
+  std::unordered_map<uint64_t, std::unordered_set<uint64_t>> diag_key_bones;  // key -> bones (ring)
+  uint64_t diag_topology_log_frame = 0u;  // frame of the last topology summary log
 
   // ── Phase 0 prev-pose probe state (separate DLAAPhase0Logging toggle) ──
   // Last vertex-stage t0 SRV push = the game's bone StructuredBuffer. The draw
@@ -462,6 +536,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11Resource* live_color_res = nullptr;
   uint32_t color_capture_frame = 0u;             // last successful event color capture
   ID3D11Texture2D* color_dump_staging = nullptr; // CPU readback for the color-source diag
+  // Motion-buffer content readback (per-object velocity diagnostic): a center
+  // crop of the RT2-swapped motion target is copied to staging at present and
+  // mapped one throttle tick later, so the log shows what the velocity compute
+  // actually decodes at character pixels.
+  ID3D11Texture2D* motion_dump_staging = nullptr;
+  uint32_t motion_dump_last_issue = 0u;
+  bool motion_dump_pending = false;
 };
 
 // ── Hang watchdog (full definitions live below WritePhasebDump; forward
@@ -492,6 +573,8 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   dp(d->velocity_pipeline); dl(d->velocity_layout); FreeTables(dev, d->velocity_tables);
   dv(d->effect_mask_srv); dv(d->effect_mask_rtv); dr(d->effect_mask_texture);
   dv(d->motion_srv); dv(d->motion_rtv); dr(d->motion_texture);
+  if (d->saved_slot2_rtv) { d->saved_slot2_rtv->Release(); d->saved_slot2_rtv = nullptr; }
+  d->slot2_swapped = false;
   d->last_rtv_count = 0; d->last_dsv = {};
   d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
   dv(d->captured_depth_srv); dv(d->captured_color_srv);
@@ -523,6 +606,7 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   if (d->encoded_scratch) { d->encoded_scratch->Release(); d->encoded_scratch = nullptr; }
   if (d->ngx_dump_staging) { d->ngx_dump_staging->Release(); d->ngx_dump_staging = nullptr; }
   if (d->color_dump_staging) { d->color_dump_staging->Release(); d->color_dump_staging = nullptr; }
+  if (d->motion_dump_staging) { d->motion_dump_staging->Release(); d->motion_dump_staging = nullptr; }
   if (d->live_color_srv) { d->live_color_srv->Release(); d->live_color_srv = nullptr; }
   if (d->live_color_res) { d->live_color_res->Release(); d->live_color_res = nullptr; }
   d->color_capture_frame = 0u;
@@ -537,14 +621,17 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
     if (snap.prev_buffer) snap.prev_buffer->Release();
   }
   d->prev_bone_snaps.clear();
+  d->diag_bone_keys.clear();
+  d->diag_key_bones.clear();
+  d->diag_topology_log_frame = 0u;
   d->last_bound_twin_srv = nullptr;
   if (d->prev_bone_saved_srv) { d->prev_bone_saved_srv->Release(); d->prev_bone_saved_srv = nullptr; }
   if (d->prev_vp_saved_cb) { d->prev_vp_saved_cb->Release(); d->prev_vp_saved_cb = nullptr; }
   d->prev_bone_slot = 0u;
   d->prev_vp_slot = 0u;
   d->patched_bind_restore_pending = false;
-  d->patched_vs_by_new_hash.clear();
-  d->patched_vs_hashes.clear();
+  d->patched_vs_by_hash.clear();
+  d->patched_vs_new_hashes.clear();
   d->patched_ps_hashes.clear();
   d->resources_created = false;
 }
@@ -1247,11 +1334,12 @@ static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceDat
   // motion). Capture EVERY draw whose VS is per-object OR whose PS is one of our
   // patched outputs, with the bound RTV count, so we can see why the white part
   // is excluded (most likely: drawn in a pass with <3 RTs, or with an unpatched
-  // PS). DLAADebugLogging must be on.
-  const bool is_po_vs = d->patched_vs_by_new_hash.contains(vh) || IsPerObjectMotionVs(vh);
+  // PS). DLAAPhaseBDebugLogging must be on.
+  const bool is_po_vs = d->patched_vs_by_hash.contains(vh) || IsPerObjectMotionVs(vh);
   const bool is_patched_ps = d->patched_ps_hashes.contains(ph);
-  if (shader_injection.dlaa_debug_logging > 0.5f && (is_po_vs || is_patched_ps))
-    LogThrottled("motion-draw", reshade::log::level::info, 200u, 100u,
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f && (is_po_vs || is_patched_ps))
+    LogThrottled(ThrottleKey("motion-draw", vh, ph, d->last_rtv_count).c_str(),
+                 reshade::log::level::info, 1u, 200u,
                  "[DLAA] motion: draw vs=0x%08X ps=0x%08X rtvs=%u poVS=%d patchedPS=%d",
                  vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_patched_ps);
   // G-buffer only: require the game's color/normal/depth MRT set (>=3 RTs).
@@ -1270,8 +1358,9 @@ static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceDat
     // Diagnostic: log near-miss draws (per-object PS but unrecognized VS) so we
     // can see why a part (e.g. the white of the eye) may not get per-object
     // motion. Only log when the PS is one of our patched outputs, to avoid noise.
-    if (shader_injection.dlaa_debug_logging > 0.5f && d->patched_ps_hashes.contains(ph))
-      LogThrottled("motion-gate", reshade::log::level::info, 40u, 250u,
+    if (shader_injection.dlaa_phaseb_debug_logging > 0.5f && d->patched_ps_hashes.contains(ph))
+      LogThrottled(ThrottleKey("motion-gate", vh, ph, d->last_rtv_count).c_str(),
+                   reshade::log::level::info, 1u, 250u,
                    "[DLAA] motion: SKIP (VS not per-object) vs=0x%08X ps=0x%08X rtvs=%u",
                    vh, ph, d->last_rtv_count);
     return;
@@ -1284,8 +1373,9 @@ static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceDat
   reshade::api::resource_desc rd = dev->get_resource_desc(dev->get_resource_from_view(d->last_rtvs[0]));
   if (rd.type != reshade::api::resource_type::texture_2d) return;
   if (rd.texture.width != mr.texture.width || rd.texture.height != mr.texture.height) return;
-  if (shader_injection.dlaa_debug_logging > 0.5f)
-    LogThrottled("motion-append", reshade::log::level::info, 60u, 200u,
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+    LogThrottled(ThrottleKey("motion-append", vh, ph, d->last_rtv_count).c_str(),
+                 reshade::log::level::info, 1u, 200u,
                  "[DLAA] motion: APPEND vs=0x%08X ps=0x%08X rtvs=%u",
                  vh, ph, d->last_rtv_count);
   // Clear once per frame (flag=0 invalid; the patched PS writes flag=1).
@@ -1302,6 +1392,208 @@ static void MaybeAppendMotionRtv(reshade::api::command_list* cmd_list, DeviceDat
   rts[n] = d->motion_rtv;
   ++n;
   cmd_list->bind_render_targets_and_depth_stencil(n, rts, d->last_dsv);
+}
+
+// ── Per-object velocity (RT2 channel, NO PS patch) ──
+// Replace the character G-buffer's slot-2 RTV (RT2) with our 32-bit velocity
+// target during character draws. The patched VS writes the per-object velocity
+// into TEXCOORD10.zw, and the GAME's UNPATCHED PS packs it into o2 (RT2) — no
+// pixel-shader patch (the patched-VS + patched-PS pair faults the GPU in
+// scene 3). All gates are STRUCTURAL (generic — no hash lists):
+//   - DLAAPerObjectMotion >= Per-Object (the motion path is enabled).
+//   - The draw's VS is one of our patched VSs that actually emitted velocity
+//     (dynamically populated at create_pipeline).
+//   - The draw's PS consumes TEXCOORD10 ONLY as .zw (the G-buffer packed-depth
+//     pattern, classified at create_pipeline). PSs that read TEXCOORD10 for
+//     their own lighting math (e.g. as .xyz) write a NON-velocity value into
+//     o2 — swapping RT2 there would capture garbage velocity (ghosting).
+//   - G-buffer only (>= 3 RTs, slot 2 present) + full-res (D3D11 requires all
+//     bound RTs to share dimensions; formats may differ).
+// The game's real RT2 keeps stale packed depth (nothing downstream reads it),
+// so the swap is invisible to the game. Uses the LIVE OM state (the event-
+// tracked last_rtvs can be stale/mismatched under the HDR mod).
+static void MaybeReplaceSlot2MotionRtv(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (shader_injection.dlaa_per_object_motion < 0.5f) return;
+  if (!cmd_list || !d || !d->motion_rtv.handle) return;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (!state) return;
+  const uint32_t vh = renodx::utils::shader::GetCurrentVertexShaderHash(state);
+  const uint32_t ph = renodx::utils::shader::GetCurrentPixelShaderHash(state);
+  // Swap candidate: patched VS that emitted velocity + velocity-compatible PS.
+  // Determined up-front so a NON-candidate draw that follows a swapped draw can
+  // restore the game's real RT2 first — otherwise unpatched draws overwrite the
+  // motion buffer with native packed depth (the "0x3275FC76 depth ghost").
+  auto vit = d->patched_vs_by_hash.find(vh);
+  const bool is_swap_candidate =
+      (vit != d->patched_vs_by_hash.end() && vit->second.emits_velocity) &&
+      d->velocity_compatible_ps_hashes.contains(ph);
+  // Fast path: nothing to swap here and no earlier swap left to undo.
+  if (!is_swap_candidate && !d->slot2_swapped) return;
+  auto* dev = cmd_list->get_device();
+  auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!dev || !ctx) return;
+
+  // Live OM state (the event-tracked last_rtvs can be stale under the HDR mod).
+  ID3D11RenderTargetView* om_rtvs[8] = {};
+  ID3D11DepthStencilView* om_dsv = nullptr;
+  ctx->OMGetRenderTargets(8, om_rtvs, &om_dsv);
+  UINT om_num = 0;
+  for (UINT i = 0; i < 8u; ++i) if (om_rtvs[i]) om_num = i + 1u;
+  auto release_om = [&]() {
+    for (UINT i = 0; i < 8u; ++i) if (om_rtvs[i]) om_rtvs[i]->Release();
+    if (om_dsv) om_dsv->Release();
+  };
+  auto to_rv = [](ID3D11RenderTargetView* v) {
+    reshade::api::resource_view rv = {};
+    rv.handle = reinterpret_cast<uintptr_t>(v);
+    return rv;
+  };
+
+  // ── RT2 restore: undo a previous draw's swap before a non-velocity draw. ──
+  // Once a patched draw binds our 32-bit motion target at slot 2 it stays there
+  // until the game rebinds its OM, so every unpatched 3-RT draw later in the
+  // character pass writes its NATIVE packed depth into OUR target. The velocity
+  // compute then decodes that depth as a fake per-object field (camera-angle
+  // dependent and quantized -> the jitter) and overwrites the REAL velocities
+  // written by earlier patched draws. Rebinding the game's RT2 here keeps the
+  // motion buffer clean so ONLY patched draws contribute to it.
+  const ID3D11RenderTargetView* our_rtv =
+      reinterpret_cast<ID3D11RenderTargetView*>(d->motion_rtv.handle);
+  if (d->slot2_swapped) {
+    if (om_num < 3u || om_rtvs[2] == nullptr || om_rtvs[2] != our_rtv) {
+      // The game rebound its own OM (or slot 2 is gone) — our motion buffer is
+      // no longer bound, the swap is already undone; drop the saved ref.
+      if (d->saved_slot2_rtv) { d->saved_slot2_rtv->Release(); d->saved_slot2_rtv = nullptr; }
+      d->slot2_swapped = false;
+    } else if (!is_swap_candidate) {
+      // Slot 2 is still OUR motion target but this draw won't (re)swap it —
+      // put the game's original RT2 back before this draw executes.
+      reshade::api::resource_view rts[9] = {};
+      uint32_t n = 0;
+      for (UINT i = 0; i < om_num && n < 8u; ++i) {
+        if (i == 2u) { rts[n++] = to_rv(d->saved_slot2_rtv); continue; }
+        if (om_rtvs[i]) rts[n++] = to_rv(om_rtvs[i]);
+      }
+      reshade::api::resource_view dsv = {};
+      if (om_dsv) dsv.handle = reinterpret_cast<uintptr_t>(om_dsv);
+      cmd_list->bind_render_targets_and_depth_stencil(n, rts, dsv);
+      if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+        LogThrottled(ThrottleKey("rt2-restore", vh, ph).c_str(),
+                     reshade::log::level::info, 1u, 200u,
+                     "[DLAA] motion: RT2 RESTORE vs=0x%08X ps=0x%08X rtvs=%u",
+                     vh, ph, om_num);
+      if (d->saved_slot2_rtv) { d->saved_slot2_rtv->Release(); d->saved_slot2_rtv = nullptr; }
+      d->slot2_swapped = false;
+    }
+    // else: slot 2 is our target AND this draw will swap again -> leave it.
+  }
+
+  // G-buffer only: the game's color/normal/depth set (>= 3 RTs, slot 2 present).
+  if (om_num < 3u || om_rtvs[0] == nullptr || om_rtvs[2] == nullptr) {
+    release_om();
+    return;
+  }
+  if (!is_swap_candidate) {
+    release_om();
+    return;
+  }
+
+  // Full-res only (D3D11 requires all bound RTs to share dimensions).
+  D3D11_TEXTURE2D_DESC r0_td = {};
+  {
+    ID3D11Resource* res = nullptr;
+    om_rtvs[0]->GetResource(&res);
+    if (res) {
+      D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      res->GetType(&dim);
+      if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        static_cast<ID3D11Texture2D*>(res)->GetDesc(&r0_td);
+      res->Release();
+    }
+  }
+  D3D11_TEXTURE2D_DESC mtd = {};
+  reinterpret_cast<ID3D11Texture2D*>(d->motion_texture.handle)->GetDesc(&mtd);
+  if (r0_td.Width == 0u || r0_td.Width != mtd.Width || r0_td.Height != mtd.Height) {
+    release_om();
+    return;
+  }
+
+  // Clear once per frame (0 => "no per-object data" sentinel for non-char
+  // pixels; the velocity compute falls back to the camera path there).
+  if (!d->motion_cleared_this_frame) {
+    const float black[4] = {0.f, 0.f, 0.f, 0.f};
+    cmd_list->clear_render_target_view(d->motion_rtv, black);
+    d->motion_cleared_this_frame = true;
+  }
+
+  // ── Diag: does the game's blend state even WRITE slot 2? If
+  // RenderTargetWriteMask[2] == 0 (or the RT is disabled), the packer PS's o2
+  // output is discarded and our motion buffer stays cleared even though the
+  // swap bound it. This is a prime suspect for the all-zero motionBuf. ──
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+    ID3D11BlendState* bs = nullptr;
+    FLOAT bf[4] = {0, 0, 0, 0};
+    UINT sm = 0;
+    ctx->OMGetBlendState(&bs, bf, &sm);
+    if (bs) {
+      D3D11_BLEND_DESC bd = {};
+      bs->GetDesc(&bd);
+      char bm[128] = {};
+      for (UINT i = 0; i < 8u && i < om_num; ++i)
+        snprintf(bm + strlen(bm), sizeof(bm) - strlen(bm), " %u=%s%02X",
+                 i, bd.RenderTarget[i].BlendEnable ? "on:" : "off:",
+                 (unsigned)bd.RenderTarget[i].RenderTargetWriteMask);
+      LogThrottled(ThrottleKeyStr("rt2-blend", bm).c_str(),
+                   reshade::log::level::info, 1u, 250u,
+                   "[DLAA] motion: BLEND vs=0x%08X ps=0x%08X sm=0x%X%s",
+                   vh, ph, sm, bm);
+      bs->Release();
+    }
+  }
+
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+    LogThrottled(ThrottleKey("rt2-motion", vh, ph, om_num).c_str(),
+                 reshade::log::level::info, 1u, 200u,
+                 "[DLAA] motion: RT2 SWAP vs=0x%08X ps=0x%08X rtvs=%u",
+                 vh, ph, om_num);
+
+  // Replace slot 2 with our velocity target: [RT0, RT1, motionRTV, RT3..].
+  // First swap: remember the game's original slot-2 RTV so we can restore it
+  // before the next non-velocity draw (see the restore block above).
+  if (!d->slot2_swapped) {
+    d->saved_slot2_rtv = om_rtvs[2];
+    if (d->saved_slot2_rtv) d->saved_slot2_rtv->AddRef();
+    d->slot2_swapped = true;
+  }
+  reshade::api::resource_view rts[9] = {};
+  uint32_t n = 0;
+  for (UINT i = 0; i < om_num && n < 8u; ++i) {
+    if (i == 2u) {
+      rts[n++] = d->motion_rtv;
+      continue;
+    }
+    if (om_rtvs[i]) rts[n++] = to_rv(om_rtvs[i]);
+  }
+  reshade::api::resource_view dsv = {};
+  if (om_dsv) dsv.handle = reinterpret_cast<uintptr_t>(om_dsv);
+  cmd_list->bind_render_targets_and_depth_stencil(n, rts, dsv);
+
+  // ── Diag: confirm the swap actually took effect on THIS context (ReShade's
+  // bind could in principle be deferred/ignored). If slot 2 reads back OTHER
+  // here, the packer draw wrote o2 into the game's native RT2, not our buffer. ──
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+    ID3D11RenderTargetView* chk[8] = {};
+    ctx->OMGetRenderTargets(8, chk, nullptr);
+    const bool slot2_ok =
+        chk[2] == reinterpret_cast<ID3D11RenderTargetView*>(d->motion_rtv.handle);
+    for (UINT i = 0; i < 8u; ++i) if (chk[i]) chk[i]->Release();
+    LogThrottled(ThrottleKey("rt2-verify", vh, ph, slot2_ok ? 1u : 2u).c_str(),
+                 reshade::log::level::info, 1u, 250u,
+                 "[DLAA] motion: SWAP VERIFY vs=0x%08X ps=0x%08X slot2=%s",
+                 vh, ph, slot2_ok ? "OK" : "OTHER");
+  }
+
+  release_om();
 }
 
 // ── Phase B runtime ──
@@ -1387,8 +1679,13 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
     if (it->second.prev_buffer) it->second.prev_buffer->Release();
     d->prev_bone_snaps.erase(it);
   }
-  // LRU evict when at capacity.
-  if (d->prev_bone_snaps.size() >= 128u) {
+  // LRU evict when at capacity. Raised 512 -> 4096: the boneTopology diagnostic
+  // showed ~768 distinct bone buffers with the key space pinned at the old 512
+  // cap — every new key evicted+recreated an older snapshot, and each recreation
+  // served identity-content prev for a frame or two (bind-pose garbage MVs ->
+  // intermittent shaking). At 4096 the active set never churns (each snap is
+  // ~2 * bytes; ~16KB typical -> ~64MB worst case, acceptable).
+  if (d->prev_bone_snaps.size() >= 4096u) {
     uint64_t oldest = UINT64_MAX;
     uint64_t oldest_key = 0u;
     for (auto& [k, s] : d->prev_bone_snaps) {
@@ -1448,21 +1745,257 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
   return &d->prev_bone_snaps[key];
 }
 
+// ── Phase B diagnostic: motion-buffer content readback ──
+// Decisive check for "per-object shows nothing": sample the ACTUAL 32-bit
+// motion target (the RT2-swapped buffer) and report what the velocity compute
+// would decode. A center crop is copied to staging at present; it is mapped one
+// throttle tick later (the GPU has finished by then) and each pixel is
+// categorized:
+//   noData    = code == 0                  (cleared sentinel / never written)
+//   zeroVel   = E ~ 0.5                    (per-object wrote, delta ~ 0)
+//   pos / neg = real per-object MV         (E in (0,0.5) or (0.5,1))
+//   clampMax  = E ~ 1                      (encode clamped at the + range)
+// avgSpeed is the mean decoded velocity magnitude in pixels. Gated by
+// DLAAPhaseBDebugLogging + DLAAPerObjectMotion >= Per-Object.
+static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (!cmd_list || !d || !d->motion_texture.handle) return;
+  if (shader_injection.dlaa_per_object_motion < 0.5f) return;
+  if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f) return;
+  auto* dev = cmd_list->get_device();
+  auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
+  if (!dev || !cl || !nd) return;
+  if (d->frame_index - d->motion_dump_last_issue < 60u) return;  // ~1x/sec
+  d->motion_dump_last_issue = d->frame_index;
+
+  auto* src = reinterpret_cast<ID3D11Texture2D*>(d->motion_texture.handle);
+  D3D11_TEXTURE2D_DESC sd = {};
+  src->GetDesc(&sd);
+  constexpr UINT kDw = 384u, kDh = 216u;  // center crop (~27% x 30% at 1440p)
+  if (sd.Width < kDw || sd.Height < kDh) return;
+
+  // Full-res staging so we can also scan for data OUTSIDE the center crop
+  // (the character may simply not be centered in the 384x216 box).
+  if (!d->motion_dump_staging) {
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = sd.Width; td.Height = sd.Height; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->motion_dump_staging))) return;
+  }
+
+  // Read back the frame issued a throttle tick ago (the GPU finished it long ago).
+  if (d->motion_dump_pending) {
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (SUCCEEDED(cl->Map(d->motion_dump_staging, 0, D3D11_MAP_READ, 0, &m))) {
+      const float* p = static_cast<const float*>(m.pData);
+      const double wp = (double)sd.Width * 0.5, hp = (double)sd.Height * 0.5;
+      // ── Full-texture sampled scan (every 4th pixel): does ANY pixel hold
+      // per-object data, and where is the strongest signal? If this is 100%
+      // noData everywhere, the writes never land (blend mask / swap issue);
+      // if it shows data outside the crop, the center-box assumption is wrong. ──
+      uint64_t n_no = 0, n_zero = 0, n_pos = 0, n_neg = 0, n_max = 0;
+      uint64_t n_a1 = 0, n_a0 = 0, n_a_other = 0;
+      double best_speed = 0.0; UINT best_x = 0, best_y = 0;
+      float max_r = 0.f, max_g = 0.f, max_b = 0.f, max_a = 0.f;
+      constexpr UINT sx = 4u, sy = 4u;
+      for (UINT y = 0; y < sd.Height; y += sy) {
+        const float* row = p + (size_t)y * (m.RowPitch / sizeof(float));
+        for (UINT x = 0; x < sd.Width; x += sx) {
+          const float* q = row + (size_t)x * 4u;
+          if (q[0] > max_r) max_r = q[0];
+          if (q[1] > max_g) max_g = q[1];
+          if (q[2] > max_b) max_b = q[2];
+          if (q[3] > max_a) max_a = q[3];
+          if (q[3] >= 0.99f) n_a1++; else if (q[3] <= 0.01f) n_a0++; else n_a_other++;
+          const double code = std::round((double)q[0] * 256.0) * 65536.0 +
+                              std::round((double)q[1] * 256.0) * 256.0 +
+                              std::round((double)q[2] * 256.0);
+          const double e = code / 16777216.0;
+          if (code <= 0.5) { n_no++; continue; }
+          if (e >= 0.99) { n_max++; continue; }
+          if (e >= 0.49 && e <= 0.51) { n_zero++; continue; }
+          const double ix = std::floor(code / 4096.0);
+          const double iy = code - ix * 4096.0;
+          const double vx = (ix / 4096.0) * 0.125 - 0.0625;
+          const double vy = (iy / 4096.0) * 0.125 - 0.0625;
+          if (e > 0.51) n_pos++; else n_neg++;
+          const double sp = std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
+          if (sp > best_speed) { best_speed = sp; best_x = x; best_y = y; }
+        }
+      }
+      const uint64_t ftotal = ((uint64_t)(sd.Height / sy)) * (uint64_t)(sd.Width / sx);
+      char fbuf[340];
+      snprintf(fbuf, sizeof(fbuf),
+               "[DLAA] motionBufFull: %ux%u noData=%u%% zeroVel=%u%% pos=%u%% "
+               "neg=%u%% clampMax=%u%% bestSpeed=%.2fpx@(%u,%u) maxRaw=(%.3f,%.3f,%.3f) "
+               "alpha1=%u%% alpha0=%u%% aOth=%u%% maxA=%.3f",
+               (unsigned)sd.Width, (unsigned)sd.Height,
+               (unsigned)(n_no * 100u / ftotal), (unsigned)(n_zero * 100u / ftotal),
+               (unsigned)(n_pos * 100u / ftotal), (unsigned)(n_neg * 100u / ftotal),
+               (unsigned)(n_max * 100u / ftotal), (float)best_speed, best_x, best_y,
+               max_r, max_g, max_b,
+               (unsigned)(n_a1 * 100u / ftotal), (unsigned)(n_a0 * 100u / ftotal),
+               (unsigned)(n_a_other * 100u / ftotal), max_a);
+      reshade::log::message(reshade::log::level::info, fbuf);
+
+      // ── Center crop detail (the per-character summary) ──
+      uint64_t c_no = 0, c_zero = 0, c_pos = 0, c_neg = 0, c_max = 0;
+      uint64_t c_a1 = 0, c_a0 = 0;
+      double c_speed_sum = 0.0; uint64_t c_speed_n = 0;
+      float c_min_e = 2.f, c_max_e = -1.f;
+      float center_rgba[4] = {0.f, 0.f, 0.f, 0.f};
+      const UINT c_left = (sd.Width - kDw) / 2u, c_top = (sd.Height - kDh) / 2u;
+      for (UINT y = 0; y < kDh; ++y) {
+        const float* row = p + (size_t)(c_top + y) * (m.RowPitch / sizeof(float));
+        for (UINT x = 0; x < kDw; ++x) {
+          const float* q = row + (size_t)(c_left + x) * 4u;
+          if (x == kDw / 2u && y == kDh / 2u) {
+            center_rgba[0] = q[0]; center_rgba[1] = q[1];
+            center_rgba[2] = q[2]; center_rgba[3] = q[3];
+          }
+          if (q[3] >= 0.99f) c_a1++; else if (q[3] <= 0.01f) c_a0++;
+          const double code = std::round((double)q[0] * 256.0) * 65536.0 +
+                              std::round((double)q[1] * 256.0) * 256.0 +
+                              std::round((double)q[2] * 256.0);
+          const double e = code / 16777216.0;
+          if (e < c_min_e) c_min_e = (float)e;
+          if (e > c_max_e) c_max_e = (float)e;
+          if (code <= 0.5) { c_no++; continue; }
+          if (e >= 0.99) { c_max++; continue; }
+          if (e >= 0.49 && e <= 0.51) { c_zero++; continue; }
+          const double ix = std::floor(code / 4096.0);
+          const double iy = code - ix * 4096.0;
+          const double vx = (ix / 4096.0) * 0.125 - 0.0625;
+          const double vy = (iy / 4096.0) * 0.125 - 0.0625;
+          if (e > 0.51) c_pos++; else c_neg++;
+          c_speed_sum += std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
+          c_speed_n++;
+        }
+      }
+      cl->Unmap(d->motion_dump_staging, 0);
+      const uint64_t ctotal = (uint64_t)kDw * kDh;
+      char cbuf[300];
+      snprintf(cbuf, sizeof(cbuf),
+               "[DLAA] motionBuf: crop=%ux%u@(%u,%u) noData=%u%% zeroVel=%u%% pos=%u%% "
+               "neg=%u%% clampMax=%u%% avgSpeed=%.2fpx minE=%.3f maxE=%.3f "
+               "center=(%.3f,%.3f,%.3f,%.3f) alpha1=%u%% alpha0=%u%%",
+               kDw, kDh, c_left, c_top,
+               (unsigned)(c_no * 100u / ctotal), (unsigned)(c_zero * 100u / ctotal),
+               (unsigned)(c_pos * 100u / ctotal), (unsigned)(c_neg * 100u / ctotal),
+               (unsigned)(c_max * 100u / ctotal),
+               c_speed_n ? (float)(c_speed_sum / (double)c_speed_n) : 0.f, c_min_e, c_max_e,
+               center_rgba[0], center_rgba[1], center_rgba[2], center_rgba[3],
+               (unsigned)(c_a1 * 100u / ctotal), (unsigned)(c_a0 * 100u / ctotal));
+      reshade::log::message(reshade::log::level::info, cbuf);
+    }
+    d->motion_dump_pending = false;
+  }
+
+  // Issue a fresh full-texture copy for the next tick.
+  cl->CopySubresourceRegion(d->motion_dump_staging, 0, 0, 0, 0, src, 0, nullptr);
+  d->motion_dump_pending = true;
+}
+
 // ── Phase D: frame-end prev-bone promotion ──
 // CopyResource(cur -> prev) for every per-instance snapshot, so the next
 // frame's patched VS re-skins with the PREVIOUS frame's bones (the cur captured
 // at draw time this frame). Called at present (after all draws of frame N).
-// Gated by DLAAPerObjectMotion = Prev-Bone (>= 1.5). Uses the native immediate
-// context.
+// Gated by DLAAPerObjectMotion >= Per-Object (>= 0.5): BOTH per-object and
+// prev-bone modes feed the patched VS from these snapshots — per-object mode
+// previously bound the identity placeholder, which produced bind-pose garbage
+// (prevNDC from a model-space vertex, no world transform) instead of true
+// motion. Uses the native immediate context.
 static void CapturePrevBones(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
-  if (shader_injection.dlaa_per_object_motion < 1.5f) return;  // Prev-Bone option only
+  if (shader_injection.dlaa_per_object_motion < 0.5f) return;  // per-object motion off
   if (d->prev_bone_snaps.empty()) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return;
   for (auto& [key, snap] : d->prev_bone_snaps) {
     if (snap.prev_buffer && snap.cur_buffer) ctx->CopyResource(snap.prev_buffer, snap.cur_buffer);
+    snap.prev_capture_frame = snap.last_draw_frame;  // prev now holds the cur captured at this frame
   }
+}
+
+// ── Phase B bone-topology summary (diagnostic) ──
+// Logs (throttled to ~every 2s) how the game owns its bone buffers: how many
+// distinct bones/keys, which bones are shared by >1 key (same-mesh/instance
+// collisions), which keys rotate through >1 bone handle (ring buffers), and the
+// freshest/oldest prev-capture age seen. This decides the snapshot key policy.
+static void LogBoneTopology(DeviceData* d) {
+  if (!d || d->prev_bone_snaps.empty()) return;
+  if (d->frame_index - d->diag_topology_log_frame < 120u) return;
+  d->diag_topology_log_frame = d->frame_index;
+  uint32_t shared_bones = 0u, ring_keys = 0u;
+  std::string shared, ring;
+  char tmp[96];
+  for (auto& [bh, keys] : d->diag_bone_keys) {
+    if (keys.size() <= 1u) continue;
+    if (shared_bones) shared += ",";
+    sprintf_s(tmp, "0x%llX:%u", (unsigned long long)bh, (unsigned)keys.size());
+    shared += tmp;
+    shared_bones++;
+  }
+  for (auto& [k, bones] : d->diag_key_bones) {
+    if (bones.size() <= 1u) continue;
+    if (ring_keys) ring += ",";
+    sprintf_s(tmp, "0x%llX:%u", (unsigned long long)k, (unsigned)bones.size());
+    ring += tmp;
+    ring_keys++;
+  }
+  // Prev-capture freshness: how old (in frames) is the bones content the last
+  // bound prev held. Age 1 = perfect; >>1 = ring/stale.
+  uint64_t min_age = UINT64_MAX, max_age = 0u;
+  for (auto& [key, snap] : d->prev_bone_snaps) {
+    if (!snap.prev_capture_frame) continue;
+    uint64_t age = d->frame_index - snap.prev_capture_frame;
+    if (age < min_age) min_age = age;
+    if (age > max_age) max_age = age;
+  }
+  std::string msg = "[DLAA] boneTopology: bones=" + std::to_string(d->diag_bone_keys.size()) +
+                    " keys=" + std::to_string(d->prev_bone_snaps.size()) +
+                    " sharedBones=" + std::to_string(shared_bones) + "{" + shared + "}" +
+                    " ringKeys=" + std::to_string(ring_keys) + "{" + ring + "}" +
+                    " prevAge=" + (min_age == UINT64_MAX ? std::string("n/a") : std::to_string(min_age)) +
+                    ".." + (max_age == 0u ? std::string("n/a") : std::to_string(max_age));
+  reshade::log::message(reshade::log::level::info, msg.c_str());
+}
+
+// ── Diag: dump the first 4x4 matrix of a structured bone buffer via a staging
+// copy (throttled by the caller). Confirms the game's bone buffer and our prev
+// snapshot hold real affine matrices — if the prev snapshot is identity/zero,
+// the injected prev-bone skin yields a degenerate clip -> prevNDC NaN -> E=0. ──
+static uint64_t g_bone_dump_last = 0;
+static void DumpBoneFirstMat(ID3D11Device* nd, ID3D11DeviceContext* ctx,
+                             ID3D11Buffer* buf, const char* tag) {
+  if (!nd || !ctx || !buf) return;
+  D3D11_BUFFER_DESC bd = {};
+  buf->GetDesc(&bd);
+  if (bd.ByteWidth < 64u) return;
+  D3D11_BUFFER_DESC sd = {};
+  sd.ByteWidth = 64u;  // one 4x4 matrix
+  sd.Usage = D3D11_USAGE_STAGING;
+  sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  ID3D11Buffer* staging = nullptr;
+  if (FAILED(nd->CreateBuffer(&sd, nullptr, &staging))) return;
+  D3D11_BOX box = {0, 0, 0, 64u, 1, 1};
+  ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, buf, 0, &box);
+  D3D11_MAPPED_SUBRESOURCE m = {};
+  if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+    const float* f = static_cast<const float*>(m.pData);
+    char line[340];
+    snprintf(line, sizeof(line),
+             "[DLAA] bone[%s]: %+.4f %+.4f %+.4f %+.4f | %+.4f %+.4f %+.4f %+.4f | "
+             "%+.4f %+.4f %+.4f %+.4f | %+.4f %+.4f %+.4f %+.4f",
+             tag, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+             f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+    reshade::log::message(reshade::log::level::info, line);
+    ctx->Unmap(staging, 0);
+  }
+  staging->Release();
 }
 
 // (Crash-window trace now lives in MaybeTraceCrashWindow below the draw hooks.)
@@ -1488,7 +2021,7 @@ static void MaybeTraceCrashWindow(reshade::api::command_list* cmd_list, DeviceDa
   auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
   uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
-  bool patched = d->patched_vs_by_new_hash.contains(vh);
+  bool patched = d->patched_vs_by_hash.contains(vh);
   char line[160];
   snprintf(line, sizeof(line), "f=%u vs=0x%08X ps=0x%08X rtvs=%u%s%s",
            d->frame_index, vh, ph, d->last_rtv_count,
@@ -1581,15 +2114,17 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   if (!cmd_list || !d) return;
   auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
-  auto it = d->patched_vs_by_new_hash.find(vh);
-  if (it == d->patched_vs_by_new_hash.end()) return;
+  auto it = d->patched_vs_by_hash.find(vh);
+  if (it == d->patched_vs_by_hash.end()) return;
   // DLAAPhaseBNoBind (crash-bisection) mode: the patched VS reads ONLY the
   // game's own t0 bones + b0 ViewProjection — it declares no addon cb#/t# and
   // reads none, so binding anything here would only risk clobbering the game's
   // slots. Skip entirely (nothing to bind, nothing to leak, nothing to restore).
   if (it->second.needs_no_binding) {
-    if (shader_injection.dlaa_debug_logging > 0.5f)
-      LogThrottled("phaseB-nobind", reshade::log::level::info, 40u, 500u,
+    if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+      LogThrottled(ThrottleKey("phaseB-nobind", vh, it->second.texcoord_index,
+                               it->second.output_reg).c_str(),
+                   reshade::log::level::info, 1u, 500u,
                    "[DLAA] phaseB: patched vs=0x%08X NO-BIND (game t0/b0 only) tex%u o%u",
                    vh, it->second.texcoord_index, it->second.output_reg);
     return;
@@ -1609,21 +2144,31 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   if (!EnsurePrevBonesSrv(cmd_list->get_device(), d)) return;
   ID3D11ShaderResourceView* bone_srv = d->prev_bones_srv;
   d->last_bound_twin_srv = nullptr;
-  if (shader_injection.dlaa_per_object_motion >= 1.5f) {
+  if (shader_injection.dlaa_per_object_motion >= 0.5f) {
     // Draw-time per-INSTANCE prev-bone capture. At this point the game has JUST
     // bound THIS frame's bone buffer at bone_game_slot (usually t0) — that
     // buffer holds frame N's bones RIGHT NOW. We CopyResource it into this
     // instance's "cur" snapshot and bind the instance's "prev" (promoted from
     // cur at present) so the patched VS re-skins with frame N-1's bones.
     //
-    // Key = CHARACTER INSTANCE (per-object b0 cbuffer + VB slot0 handle), NOT
-    // the VS hash (a VS is SHARED across many characters — eyeballs/skin/
-    // clothing — so a shader key would mix their bones) and NOT the bone handle
-    // (the game rotates a RING of bone buffers, frame N writes buffer[N%4], so
-    // a handle-keyed twin is 3-4 frames stale). Capturing at draw time keyed by
-    // the stable instance is ring-agnostic. Only ever bind our own snapshot SRV
-    // (never the game's SRV itself) so the ld_structured descriptor kind is
-    // always valid.
+    // Gated at >= Per-Object (0.5), NOT just Prev-Bone (1.5): the per-object
+    // velocity encode also needs the PREVIOUS frame's position. Binding the
+    // identity placeholder there (the old <1.5 behavior) made prevNDC =
+    // prevVP x bind-pose MODEL-space vertex (this engine's bones bake the
+    // world transform, so an identity re-skin is not even in world space) —
+    // garbage deltas that only look plausible as bind-pose parallax on some
+    // camera angles. Both modes now re-skin with the true previous pose.
+    // Key = (b0 cbuffer + VB slot0 + BONE-buffer handle). The VS hash is NOT
+    // usable (a VS is SHARED across many characters — eyeballs/skin/clothing —
+    // so a shader key would mix their bones). b0 is the SHARED scene cbuffer in
+    // this engine and VB0 is shared by same-mesh characters, so the bone handle
+    // (folded into the key below once confirmed stride-64 structured) is the
+    // real per-character discriminator — without it every same-mesh character
+    // collided on ONE snapshot and mixed bones. If the game rotates a ring of
+    // bone buffers for a character, each ring slot gets its own snapshot (prev
+    // is ring-period stale but never mixed across characters). Only ever bind
+    // our own snapshot SRV (never the game's SRV itself) so the ld_structured
+    // descriptor kind is always valid.
     ID3D11Buffer* b0 = nullptr;
     ctx->VSGetConstantBuffers(0u, 1u, &b0);
     ID3D11Buffer* vb0 = nullptr;
@@ -1634,7 +2179,13 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
       // bits, so a naive (b0<<32)^vb0 would collide; this mixes both fully.
       const uint64_t b0k = (uint64_t)(uintptr_t)b0;
       const uint64_t vbk = (uint64_t)(uintptr_t)vb0;
-      const uint64_t key = b0k ^ (vbk + 0x9e3779b97f4a7c15ull + (b0k << 6) + (b0k >> 2));
+      // Base instance key (cb0 + VB0). NOTE: cb0 is the SHARED scene/globals
+      // cbuffer in this engine (the patched VS reads ViewProjection at
+      // cb0[10..13] from it), and VB0 is shared by every character using the
+      // same mesh — so neither alone discriminates a character. The bone-buffer
+      // handle (folded in below once confirmed stride-64 structured) is the
+      // per-character discriminator.
+      const uint64_t base = b0k ^ (vbk + 0x9e3779b97f4a7c15ull + (b0k << 6) + (b0k >> 2));
       ID3D11ShaderResourceView* game_srv = nullptr;
       ctx->VSGetShaderResources(it->second.bone_game_slot, 1u, &game_srv);
       if (game_srv) {
@@ -1648,8 +2199,23 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
             D3D11_BUFFER_DESC gd = {};
             gb->GetDesc(&gd);
             if ((gd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && gd.StructureByteStride == 64u) {
+              // Fold the bone-buffer handle into the key. Without it, every
+              // character sharing (cb0,VB0) — i.e. every same-mesh character —
+              // collides on ONE snapshot and mixes their bones, which is the
+              // "Prev-Bone rarely works" failure. If the game rotates a ring of
+              // bone buffers for a single character, each ring slot gets its own
+              // snapshot (prev becomes ring-period stale, but never MIXED across
+              // characters).
+              const uint64_t gbk = (uint64_t)(uintptr_t)gb;
+              const uint64_t key = base ^ (gbk + 0x9e3779b97f4a7c15ull + (base << 6) + (base >> 2));
               DeviceData::PrevBoneSnap* snap =
                   EnsurePrevBoneSnap(cmd_list->get_device(), d, key, gd.ByteWidth);
+              // Phase B diagnostic: which bones are shared across keys (sharing)
+              // and which keys rotate through multiple bone handles (ring).
+              if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+                d->diag_bone_keys[gbk].insert(key);
+                d->diag_key_bones[key].insert(gbk);
+              }
               if (snap) {
                 // Capture this frame's bones into cur ONCE per frame per
                 // instance (multiple draws of the same instance/VS in one frame
@@ -1657,9 +2223,35 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 if (snap->last_draw_frame != d->frame_index) {
                   ctx->CopyResource(snap->cur_buffer, gb);
                   snap->last_draw_frame = d->frame_index;
+                  // Bound prev staleness. Without this, snapshots accumulate
+                  // forever (no eviction at the high cap) and a character that
+                  // was culled/offscreen for a while comes back with prev bones
+                  // HUNDREDS of frames old -> the VS encode feeds huge garbage
+                  // deltas -> DLSS jitter + "per-object disappears at some
+                  // angles" (stale characters popping into view). If prev was
+                  // never captured (identity, first frame) OR is older than
+                  // 2 frames, refresh prev = THIS frame's pose so the bind is
+                  // current-pose parallax (smooth, consistent with the depth
+                  // path) and true prev-bone motion resumes from next frame.
+                  if (snap->prev_capture_frame == 0u ||
+                      snap->prev_capture_frame + 2u < d->frame_index) {
+                    ctx->CopyResource(snap->prev_buffer, snap->cur_buffer);
+                    snap->prev_capture_frame = d->frame_index;
+                  }
                 }
                 bone_srv = snap->prev_srv;
                 d->last_bound_twin_srv = snap->prev_srv;
+                // ── Diag (1/sec): confirm the game bone buffer + our prev
+                // snapshot hold REAL affine matrices. Identity/zero prev =>
+                // degenerate prevClip => E=0. ──
+                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+                    d->frame_index - g_bone_dump_last > 60u) {
+                  g_bone_dump_last = d->frame_index;
+                  auto* ndev = reinterpret_cast<ID3D11Device*>(
+                      cmd_list->get_device()->get_native());
+                  DumpBoneFirstMat(ndev, ctx, gb, "game");
+                  DumpBoneFirstMat(ndev, ctx, snap->prev_buffer, "prev");
+                }
               }
             }
           }
@@ -1670,6 +2262,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     }
     if (b0) b0->Release();
     if (vb0) vb0->Release();
+    if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) LogBoneTopology(d);
   }
   // Save the game's current bindings at these slots BEFORE overwriting them:
   // MaybeRestorePatchedBinds (next draw) puts them back so our extra structured
@@ -1692,11 +2285,14 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     ID3D11Buffer* cbs[1] = {d->prev_vp_cb};
     ctx->VSSetConstantBuffers(it->second.prev_vp_cb_slot, 1u, cbs);
   }
-  if (shader_injection.dlaa_debug_logging > 0.5f) {
-    LogThrottled("phaseB-bind", reshade::log::level::info, 40u, 500u,
+  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+    LogThrottled(ThrottleKey("phaseB-bind", vh, it->second.prev_vp_cb_slot,
+                             it->second.prev_bone_t_slot).c_str(),
+                 reshade::log::level::info, 1u, 500u,
                  "[DLAA] phaseB: bind patched vs=0x%08X cb%u=%s t%u=%s tex%u o%u",
                  vh, it->second.prev_vp_cb_slot, d->prev_vp_cb ? "prevVP" : "NONE",
-                 it->second.prev_bone_t_slot, d->prev_bones_srv ? "prevBones" : "NONE",
+                 it->second.prev_bone_t_slot,
+                 d->last_bound_twin_srv ? "prevBones" : "prevBones(identity)",
                  it->second.texcoord_index, it->second.output_reg);
     // Read the binds back to confirm they recorded on THIS context. If the game
     // draws on a different (deferred) context, they read back NULL/OTHER and the
@@ -1705,7 +2301,10 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     ID3D11Buffer* rb_cb = nullptr;
     ctx->VSGetShaderResources(it->second.prev_bone_t_slot, 1u, &rb_srv);
     ctx->VSGetConstantBuffers(it->second.prev_vp_cb_slot, 1u, &rb_cb);
-    LogThrottled("bind-verify", reshade::log::level::info, 40u, 500u,
+    LogThrottled(ThrottleKey("bind-verify", vh,
+                             (uint32_t)(rb_srv == bone_srv ? 1u : (rb_srv ? 2u : 0u)),
+                             (uint32_t)(rb_cb == d->prev_vp_cb ? 1u : (rb_cb ? 2u : 0u))).c_str(),
+                 reshade::log::level::info, 1u, 500u,
                  "[DLAA] bind verify vs=0x%08X t%u=%s b%u=%s",
                  vh, it->second.prev_bone_t_slot,
                  (rb_srv == bone_srv) ? "OK" : (rb_srv ? "OTHER" : "NULL"),
@@ -1901,13 +2500,14 @@ static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d)
 // if scene 3's char draws bind a 4th RTV at slot 3 (a game target our o3 write
 // would collide with) or multisampled targets, this reveals it directly.
 // Queries the NATIVE D3D11 context (the real state, not our tracking).
-// Gated on DLAADebugLogging.
+// Gated on DLAAPhaseBDebugLogging (isolates the Phase B / motion diagnostics
+// from the general DLAA debug spam).
 static void MaybeLogOmState(reshade::api::command_list* cmd_list, DeviceData* d) {
-  if (shader_injection.dlaa_debug_logging <= 0.5f || !cmd_list || !d) return;
+  if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f || !cmd_list || !d) return;
   auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
   const uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
   const uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
-  const bool is_po_vs = d->patched_vs_by_new_hash.contains(vh) || IsPerObjectMotionVs(vh);
+  const bool is_po_vs = d->patched_vs_by_hash.contains(vh) || IsPerObjectMotionVs(vh);
   const bool is_patched_ps = d->patched_ps_hashes.contains(ph);
   if (!is_po_vs && !is_patched_ps) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -1961,7 +2561,8 @@ static void MaybeLogOmState(reshade::api::command_list* cmd_list, DeviceData* d)
   }
   for (UINT i = 0; i < 8u && i < count; ++i) if (rtvs[i]) rtvs[i]->Release();
   if (dsv) dsv->Release();
-  LogThrottled("om-state", reshade::log::level::info, 60u, 250u, "%s", line);
+  LogThrottled(ThrottleKeyStr("om-state", line).c_str(),
+               reshade::log::level::info, 1u, 250u, "%s", line);
 }
 
 static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
@@ -1979,7 +2580,7 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
     MaybeBindPatchedVs(cmd_list, d);
-    MaybeAppendMotionRtv(cmd_list, d);
+    MaybeReplaceSlot2MotionRtv(cmd_list, d);
     WatchdogStampDraw(cmd_list, d, "done");
   }
   return false;
@@ -1999,7 +2600,7 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
     MaybeLogEffectDraw(cmd_list, d);
     MaybeAppendEffectMask(cmd_list, d);
     MaybeBindPatchedVs(cmd_list, d);
-    MaybeAppendMotionRtv(cmd_list, d);
+    MaybeReplaceSlot2MotionRtv(cmd_list, d);
     WatchdogStampDraw(cmd_list, d, "done");
   }
   return false;
@@ -3530,7 +4131,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAPerObjectMotion", .binding = &shader_injection.dlaa_per_object_motion,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f, .label = "Per-Object Motion", .section = "Antialiasing",
-        .tooltip = "Camera Only: camera reprojection MVs only. Per-Object: patched char VSs emit prevClip (current-pose re-skin -> camera-relative MVs). Prev-Bone: patched char VSs re-skin with the PREVIOUS frame's per-character bone matrices -> true limb/animation MVs. Requires Phase B bind mode (NoBind/Minimal off) and a restart.",
+        .tooltip = "Camera Only: camera reprojection MVs only. Per-Object: patched char VSs re-skin with the PREVIOUS frame's per-character bone matrices and encode prevNDC-curNDC into RT2 -> true per-object/limb MVs (falls back to the camera path where no per-object data is written). Prev-Bone: same mechanism (identical MVs) reserved for the deeper prev-bone debug view. Requires Phase B bind mode (NoBind/Minimal off) and a restart.",
         .labels = {"Camera Only","Per-Object","Prev-Bone"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
@@ -3634,6 +4235,20 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Prev-pose feasibility probe (bone-buffer SRV pushes at vertex t0, per-object VS skinned/world detection, buffer handle reuse, and vertex-buffer BindFlags to detect GPU-skinned UAV buffers for the Luma-style prev-vertex capture). Kept SEPARATE from Debug Logging so bone logs aren't buried in general spam.",
         .labels = {"Off","On"},
     },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseBDebugLogging", .binding = &shader_injection.dlaa_phaseb_debug_logging,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase B / Motion Debug Logging", .section = "Antialiasing",
+        .tooltip = "Isolates the Phase B generic VS patch + per-object motion logs (patched-VS bind, prevVP/prev-bone slots, RT2 velocity swap, motion RTV append/skip, and the patched-draw output-merger state) from the general Debug Logging spam. Turn this ON with Debug Logging OFF to see ONLY the Phase B / motion machinery.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseBVelDebug", .binding = &g_phaseb_vel_debug,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f, .label = "Phase B Velocity Encode Debug", .section = "Antialiasing",
+        .tooltip = "Diagnostic: make the patched VS encode a RAW NDC component instead of the prevNDC-curNDC delta, so the motionBuf readback reveals whether the injected cur/prev skin NDC is sane (character at screen center -> zeroVel) or NaN (all-zeros -> the injected skin is broken). 0=normal delta, 1=curNDC.x, 2=prevNDC.x, 3=curNDC.y, 4=prevNDC.y. Restart-gated (read at shader patch time).",
+        .labels = {"Off","Cur NDC X","Prev NDC X","Cur NDC Y","Prev NDC Y"},
+    },
     // Phase B generic-patch isolation (crash bisection).
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseB", .binding = &g_phaseb_enabled,
@@ -3647,6 +4262,20 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Phase B Jitter-Only", .section = "Antialiasing",
         .tooltip = "CAMERA PATH (default ON): the generic VS patch injects ONLY the SV_Position camera jitter (b13) — no prevClip output, no prev-bone re-skin, no prevVP, no outline, no OSGN append. Under the GLOBAL jitter method the b13 offset is 0, so this is an inert safety patch. Turn OFF to restore the per-object motion machinery. Requires restart.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseBRt2Velocity", .binding = &g_phaseb_rt2_velocity,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase B RT2 Velocity", .section = "Antialiasing",
+        .tooltip = "Per-object motion via the GAME's TEXCOORD10 -> RT2 channel (NO pixel-shader patch): the patched VS encodes prevNDC-curNDC into TEXCOORD10.zw and the game's UNPATCHED G-buffer PS packs it into o2. The slot-2 swap is gated per-PS (TEXCOORD10 consumed only as .zw), so incompatible PSs keep the game's RT2. Generic — no hash lists. Requires DLAAPhaseBJitterOnly=Off, DLAAPerObjectMotion, and a restart. This replaces the crashing Phase E PS patch.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseE", .binding = &g_phasee_enabled,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase E PS Patch (CRASHES)", .section = "Antialiasing",
+        .tooltip = "CRASH-BISECTION ONLY — KEEP OFF. The generic per-object-motion PS patcher (appends o3/SV_TARGET3). Any patched VS + patched PS pair faults the GPU in scene 3. Per-object MVs now use the VS-only RT2 channel instead.",
         .labels = {"Off","On"},
     },
     new renodx::utils::settings::Setting{
@@ -4035,9 +4664,14 @@ static bool OnCreatePipeline(
     if (!desc || desc->code_size == 0u) continue;
     const uint32_t hash = renodx::utils::hash::ComputeCRC32(
         static_cast<const uint8_t*>(desc->code), desc->code_size);
-    // Skip already-patched (re-fire at CreateInputLayout with our blob) and
-    // hand-replaced shaders (renodx handles those with its own blobs).
-    if (d->patched_vs_hashes.contains(hash)) continue;
+    // Skip only when the incoming blob is ALREADY our patched blob (the
+    // CreateInputLayout re-fire carries our patched bytecode, whose hash is in
+    // patched_vs_new_hashes). A re-creation of the GAME'S ORIGINAL bytecode is
+    // ALWAYS patched — D3D11 games create the same VS many times, and the old
+    // guard skipped those, leaving unpatched pipelines that most character
+    // draws actually bound (no velocity). Hand-replaced shaders (renodx) are
+    // skipped too.
+    if (d->patched_vs_new_hashes.contains(hash)) continue;
     if (custom_shaders.contains(hash)) continue;
 
     std::vector<std::byte> blob;
@@ -4052,6 +4686,21 @@ static bool OnCreatePipeline(
     options.test_no_output = g_phaseb_no_output >= 0.5f;
     options.test_constant_output = g_phaseb_constant >= 0.5f;
     options.jitter_only = g_phaseb_jitter_only >= 0.5f;
+    // Per-object velocity via the GAME's TEXCOORD10 -> RT2 channel (no PS patch).
+    // Gated ONLY on the phase feature (DLAAPhaseBRt2Velocity) at patch time, NOT
+    // on DLAAPerObjectMotion. The per-object toggle is a RUNTIME (draw-time)
+    // gate — the swap + capture + compute all read it live — so toggling it on
+    // mid-session must work even though the pipeline was created earlier.
+    // Baking it here meant pipelines created while the toggle was off never
+    // emitted the velocity (emits_velocity=false) and the draw-time swap gate
+    // then never fired: the motion buffer stayed empty ("per-object shows
+    // nothing") until a restart with the toggle pre-set. Camera-only mode now
+    // leaves the game's RT2 holding E instead of native depth on skinned draws,
+    // which is harmless (RT2 is never read downstream).
+    options.emit_velocity_to_rt2 = g_phaseb_rt2_velocity >= 0.5f;
+    // Diagnostic: encode a RAW NDC component (cur/prev x/y) instead of the delta
+    // so the motionBuf readback shows whether the injected skin's NDC is sane.
+    options.velocity_debug_mode = (uint32_t)g_phaseb_vel_debug;
     if (!senkiseki3::dxbc::PatchSkinnedVertexShader(blob, &new_hash, &info, options)) continue;
     if (new_hash == 0u || new_hash == hash) continue;
 
@@ -4073,9 +4722,13 @@ static bool OnCreatePipeline(
     pvi.output_reg = info.output_reg;
     pvi.needs_no_binding = info.needs_no_binding;
     pvi.bone_game_slot = info.bone_game_slot;
-    d->patched_vs_by_new_hash[new_hash] = pvi;
-    d->patched_vs_hashes.insert(hash);     // original
-    d->patched_vs_hashes.insert(new_hash); // patched
+    pvi.emits_velocity = info.velocity_emitted;
+    // Key by BOTH hashes so the draw-time lookup matches whichever identity
+    // GetCurrentVertexShaderHash reports (renodx tracks the original for a
+    // replaced pipeline). Skip-guard records only the patched blob hash.
+    d->patched_vs_by_hash[hash] = pvi;      // original
+    d->patched_vs_by_hash[new_hash] = pvi;  // patched
+    d->patched_vs_new_hashes.insert(new_hash);
     changed = true;
 
     char buf[224];
@@ -4090,7 +4743,28 @@ static bool OnCreatePipeline(
     WatchdogSet(d, "create_pipeline phaseB patched VS 0x%08X -> 0x%08X", hash, new_hash);
   }
 
-  // ── Phase E: generic per-object-motion PS patcher ──
+  // ── Per-object velocity: classify G-buffer PSs whose TEXCOORD10 is consumed
+  // ONLY as .zw (the packed-depth pattern: div v6.z/v6.w -> o2). The slot-2
+  // velocity swap is gated on this per draw, so ONLY these draws capture the
+  // VS-encoded velocity; PSs that read TEXCOORD10 for their own math (as .xyz)
+  // keep the game's RT2 untouched (no swap, no ghosting). Generic — every PS
+  // that comes through create_pipeline is classified from its ORIGINAL bytecode.
+  for (uint32_t i = 0; i < subobject_count; ++i) {
+    const auto& sub = subobjects[i];
+    if (sub.type != reshade::api::pipeline_subobject_type::pixel_shader) continue;
+    if (sub.count != 1u) continue;
+    auto* desc = static_cast<reshade::api::shader_desc*>(sub.data);
+    if (!desc || desc->code_size == 0u) continue;
+    const uint32_t hash = renodx::utils::hash::ComputeCRC32(
+        static_cast<const uint8_t*>(desc->code), desc->code_size);
+    if (d->velocity_compatible_ps_hashes.contains(hash)) continue;
+    std::vector<std::byte> blob(desc->code_size);
+    std::memcpy(blob.data(), desc->code, desc->code_size);
+    if (senkiseki3::dxbc::PsReadsTexcoord10Zw(blob))
+      d->velocity_compatible_ps_hashes.insert(hash);
+  }
+
+  // ── Phase E: generic per-object-motion PS patcher (MASTER-GATED OFF) ──
   // Runs on the pixel_shader subobject (create_pipeline fires once per stage;
   // the PS is a separate subobject from the VS). Appends a TEXCOORD input
   // (prevClip, at the SAME index the paired VS writes it) + an SV_TARGET
@@ -4109,6 +4783,10 @@ static bool OnCreatePipeline(
   // outputs TEXCOORD5 while PS 0x0E03514A does not read it) -> the PS would
   // read the game's own TEXCOORD as prevClip -> garbage MVs -> ghosting. Look
   // up the VS subobject in this same create_pipeline call and reuse its index.
+  // Phase E was PROVEN to fault the GPU in scene 3 (patched VS + patched PS
+  // pair). Kept behind an explicit opt-in for crash-bisection only; the
+  // per-object MVs use the VS-only RT2 channel instead.
+  if (g_phasee_enabled >= 0.5f) {
   uint32_t vs_texcoord_index = 0u;
   for (uint32_t i = 0; i < subobject_count; ++i) {
     const auto& sub = subobjects[i];
@@ -4118,8 +4796,8 @@ static bool OnCreatePipeline(
     if (!vsd || vsd->code_size == 0u) continue;
     const uint32_t vhash = renodx::utils::hash::ComputeCRC32(
         static_cast<const uint8_t*>(vsd->code), vsd->code_size);
-    auto vit = d->patched_vs_by_new_hash.find(vhash);
-    if (vit != d->patched_vs_by_new_hash.end()) {
+    auto vit = d->patched_vs_by_hash.find(vhash);
+    if (vit != d->patched_vs_by_hash.end()) {
       vs_texcoord_index = vit->second.texcoord_index;
     }
     break;
@@ -4168,6 +4846,14 @@ static bool OnCreatePipeline(
              (int)ps_options.no_new_output);
     reshade::log::message(reshade::log::level::info, buf);
     WatchdogSet(d, "create_pipeline phaseE patched PS 0x%08X -> 0x%08X", hash, new_hash);
+  }
+  } else if (shader_injection.dlaa_debug_logging > 0.5f) {
+    static bool phasee_off_logged = false;
+    if (!phasee_off_logged) {
+      phasee_off_logged = true;
+      reshade::log::message(reshade::log::level::info,
+          "[DLAA] Phase E PS patcher DISABLED (default) — per-object MVs use the VS-only RT2 channel.");
+    }
   }
   WatchdogSet(d, "create_pipeline done");
   return changed;
@@ -4259,6 +4945,22 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
               if (pctx && SUCCEEDED(pctx->Map(d->prev_vp_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
                 std::memcpy(m.pData, shader_injection.prev_view_proj, 64);
                 pctx->Unmap(d->prev_vp_cb, 0);
+                // Diag: the patched VS re-skins with prevVP from THIS buffer. If
+                // the matrix is zero/garbage here, prevNDC is NaN -> the encode
+                // clamps to E=0 -> the motion buffer fills with (0,0,0,1) (writes
+                // land but decode to noData). Log it once per second.
+                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+                  LogThrottled("prevvp-content", reshade::log::level::info, 1u, 60u,
+                               "[DLAA] prevVP=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|"
+                               "%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
+                               shader_injection.prev_view_proj[0], shader_injection.prev_view_proj[1],
+                               shader_injection.prev_view_proj[2], shader_injection.prev_view_proj[3],
+                               shader_injection.prev_view_proj[4], shader_injection.prev_view_proj[5],
+                               shader_injection.prev_view_proj[6], shader_injection.prev_view_proj[7],
+                               shader_injection.prev_view_proj[8], shader_injection.prev_view_proj[9],
+                               shader_injection.prev_view_proj[10], shader_injection.prev_view_proj[11],
+                               shader_injection.prev_view_proj[12], shader_injection.prev_view_proj[13],
+                               shader_injection.prev_view_proj[14], shader_injection.prev_view_proj[15]);
               }
             }
           }
@@ -4268,6 +4970,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           {
             auto* pcmd = queue->get_immediate_command_list();
             if (pcmd) CapturePrevBones(pcmd, d);
+          }
+          // Phase B diagnostic: read back the swapped motion target so the log
+          // shows what the velocity compute actually decodes at char pixels.
+          {
+            auto* pcmd = queue->get_immediate_command_list();
+            if (pcmd) MaybeLogMotionBuffer(pcmd, d);
           }
         }
         if (shader_injection.dlaa_enabled < 1.5f) return;  // NGX only in DLAA mode (2)

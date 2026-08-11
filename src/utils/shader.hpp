@@ -385,9 +385,20 @@ inline PipelineShaderDetails* GetPipelineShaderDetails(const reshade::api::pipel
       });
 
   if (details == nullptr) {
-    log::e("utils::shader::GetPipelineShaderDetails(Pipeline not found for handle: ",
-           log::AsPtr(pipeline.handle), ")");
-    assert(details != nullptr);
+    // Hot-path noise: an untracked pipeline (e.g. created before the addon
+    // attached) is queried on every draw, flooding ReShade.log at ~100+ lines/
+    // sec. Log each distinct handle ONCE instead.
+    static std::mutex report_mutex;
+    static std::unordered_set<uint64_t> reported;
+    bool first_time = false;
+    {
+      std::lock_guard<std::mutex> lock(report_mutex);
+      first_time = reported.insert(pipeline.handle).second;
+    }
+    if (first_time) {
+      log::e("utils::shader::GetPipelineShaderDetails(Pipeline not found for handle: ",
+             log::AsPtr(pipeline.handle), ")");
+    }
   }
 
   return details;
