@@ -2030,13 +2030,16 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   // prevVP pairing/staleness). The camera component of the object's full MV is
   // added by the velocity compute's depth-reprojection path.
   // The 24-bit code E = (Ix*4096 + Iy)/16777216 where
-  // Ix,Iy = clamp(round_z((delta*0.5+0.5)*4096), 0, 4095) quantize the NDC delta.
-  // The x0.5 scale maps delta in [-1.0, +1.0] NDC (~+/-1280px at 2560 wide)
-  // onto the full 12-bit range (quantization ~0.625px, DLAA-safe); beyond that
-  // the delta clamps and the 1000px robustness cap in the compute drops the
-  // pixel back to the camera path (graceful). The decode in
-  // motion_velocity.cs_5_0.hlsl and the MaybeLogMotionBuffer readback must use
-  // (Ix/4096)*2 - 1 to match.
+  // Ix,Iy = clamp(round_z((delta*S+0.5)*4096), 0, 4095) quantize the NDC delta.
+  // S = 4.0 maps delta in [-0.125, +0.125] NDC (~+/-160px at 2560 wide) onto
+  // the full 12-bit range (quantization ~0.078px/step — 8x finer than the old
+  // +-1.0 NDC / 0.625px range, which was the main source of the per-pixel
+  // noise + DLAA detail smear on the character). Object-only deltas are small
+  // by construction (per-frame limb motion, typically < 0.05 NDC), so the
+  // tighter range has huge headroom; beyond it the delta clamps and the 1000px
+  // robustness cap in the compute drops the pixel back to the camera path
+  // (graceful). The decode in motion_velocity.cs_5_0.hlsl and the
+  // MaybeLogMotionBuffer readback must use ((Ix/4096)-0.5)/S to match.
   // The game's UNPATCHED PS computes depth = v.z/v.w = E/1 = E and packs E into
   // o2 (RT2) as 3 bytes — no PS patch needed. Writing (E,1) into TEXCOORD10.zw
   // keeps .xy untouched (the PS never reads them).
@@ -2054,14 +2057,15 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     if (options.velocity_debug_mode == 0u) {
     EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX); // dx = prev.x - cur.x
     EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY); // dy = prev.y - cur.y (imm -1 at .y)
-    // nx = round_z(clamp(dx*0.5+0.5,0,1) * 4096) clamped to [0,4095] — the
-    // x0.5 scale gives a +-1.0 NDC (+-1280px) range so the FULL screen-space
-    // motion (camera + object, since prevClip uses the previous frame's VP)
-    // fits even for a close-to-camera moving character (~0.62 NDC measured).
+    // nx = round_z(clamp(dx*S+0.5,0,1) * 4096) clamped to [0,4095], S = 4.0
+    // (object delta range +-0.125 NDC = +-160px). Object-only deltas are small
+    // (per-frame limb motion, typically < 0.05 NDC), so this tight range gives
+    // 0.078px quantization steps — 8x finer than the old +-1.0 NDC / 0.625px
+    // range that produced the visible per-pixel noise + DLAA detail smear.
     // NOTE: clamp to 4095.999756 (0x457FFFFF = the float just below 4096)
     // BEFORE round_z so the result is always an integer in [0,4095] — clamping
     // after round_z would leave a fractional nx in the round_z(4096) edge case.
-    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u, 0u, 0u, 0u);  // rV.x *= 0.5 (range +-1.0 NDC)
+    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x40800000u, 0u, 0u, 0u);  // rV.x *= 4.0 (range +-0.125 NDC)
     EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
     EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
     EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);              // min 1
@@ -2069,8 +2073,8 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FFFFFu);              // min 4095.999756
     EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);                            // round_z
     EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
-    // ny = round_z(clamp(dy*0.5+0.5,0,1) * 4096) clamped to [0,4095].
-    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x3F000000u, 0u, 0u);  // rV.y *= 0.5 (range +-1.0 NDC, imm at .y)
+    // ny = round_z(clamp(dy*S+0.5,0,1) * 4096) clamped to [0,4095], S = 4.0.
+    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x40800000u, 0u, 0u);  // rV.y *= 4.0 (range +-0.125 NDC, imm at .y)
     EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
     EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
     EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);

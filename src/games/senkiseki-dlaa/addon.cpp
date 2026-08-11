@@ -1836,8 +1836,8 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
           if (e >= 0.49 && e <= 0.51) { n_zero++; continue; }
           const double ix = std::floor(code / 4096.0);
           const double iy = code - ix * 4096.0;
-          const double vx = (ix / 4096.0) * 2.0 - 1.0;    // ×0.5 encode
-          const double vy = (iy / 4096.0) * 2.0 - 1.0;
+          const double vx = ((ix / 4096.0) - 0.5) / 4.0;   // object-delta decode (S=4)
+          const double vy = ((iy / 4096.0) - 0.5) / 4.0;
           if (e > 0.51) n_pos++; else n_neg++;
           const double sp = std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
           if (sp > best_speed) { best_speed = sp; best_x = x; best_y = y; }
@@ -1888,8 +1888,8 @@ static void MaybeLogMotionBuffer(reshade::api::command_list* cmd_list, DeviceDat
           if (e >= 0.49 && e <= 0.51) { c_zero++; continue; }
           const double ix = std::floor(code / 4096.0);
           const double iy = code - ix * 4096.0;
-          const double vx = (ix / 4096.0) * 2.0 - 1.0;    // ×0.5 encode
-          const double vy = (iy / 4096.0) * 2.0 - 1.0;
+          const double vx = ((ix / 4096.0) - 0.5) / 4.0;   // object-delta decode (S=4)
+          const double vy = ((iy / 4096.0) - 0.5) / 4.0;
           if (e > 0.51) c_pos++; else c_neg++;
           c_speed_sum += std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
           c_speed_n++;
@@ -2347,25 +2347,36 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // the prev <- cur promotion happens at PRESENT
                 // (CapturePrevBones), so t1 = prev = the PREVIOUS frame's
                 // FINAL pose = truly 1 frame old for the main-pass draws.
+                const uint64_t prev_last_draw = snap->last_draw_frame;
                 if (snap->cur_buffer) ctx->CopyResource(snap->cur_buffer, gb);
                 snap->last_draw_frame = d->frame_index;
+                // ── Staleness guard (round 21): ──
+                // If the prev content is older than ~2 frames (the character was
+                // culled / LOD-switched, or the snapshot key changed -> a brand-
+                // new snapshot with empty prev), binding that stale prev makes
+                // the patched VS compute a huge object delta on the first
+                // draw(s) after the gap -> a visible pop/jitter that also smears
+                // DLAA history. Force prev = cur (just captured above) so THIS
+                // draw computes delta = 0 (camera-only, invisible) and the next
+                // present promotes normally. Age 1 (normal 1-frame prev) never
+                // fires.
+                const uint64_t snap_age = snap->prev_capture_frame
+                    ? (d->frame_index - snap->prev_capture_frame) : UINT64_MAX;
+                const bool guard_fired =
+                    snap_age > 2u && snap->prev_buffer && snap->cur_buffer;
+                if (guard_fired) ctx->CopyResource(snap->prev_buffer, snap->cur_buffer);
                 bone_srv = snap->prev_srv;
                 d->last_bound_twin_srv = snap->prev_srv;
                 // ── Diag (throttled per key): the snapshot's prev-bone
                 // freshness/state at THIS draw. age = frames since the prev
-                // content was captured; captured = cur was refreshed from the
-                // game's t0 this draw; refreshed = prev was just forced to cur
-                // (staleness fallback). If age is huge the prev bones are stale
-                // (garbage deltas); if refreshed fires constantly prev==cur
-                // (delta ~0). Neither matches a -0.87 NDC delta, so this
-                // distinguishes stale content from wrong-instance content. ──
+                // content was captured; captured = this draw is the first draw
+                // of the frame for this key (cur refreshed from the game's t0);
+                // refreshed = the staleness guard just forced prev=cur. If age
+                // is huge the prev bones were stale (garbage deltas); if
+                // refreshed fires constantly prev==cur (delta ~0). ──
                 if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
-                  const uint64_t snap_age = snap->prev_capture_frame
-                      ? (d->frame_index - snap->prev_capture_frame) : UINT64_MAX;
-                  const bool captured_this = (snap->last_draw_frame != d->frame_index);
-                  const bool refreshed_this =
-                      captured_this && (snap->prev_capture_frame == 0u ||
-                                        snap->prev_capture_frame + 2u < d->frame_index);
+                  const bool captured_this = (prev_last_draw != d->frame_index);
+                  const bool refreshed_this = guard_fired;
                   LogThrottled(ThrottleKey("snap-state", vh, (uint32_t)key,
                                            (uint32_t)(key >> 32)).c_str(),
                                reshade::log::level::info, 1u, 120u,

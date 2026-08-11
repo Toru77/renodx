@@ -99,7 +99,9 @@ void main(uint2 pix : SV_DispatchThreadID)
   // G-buffer PS packs E into o2 (RT2) as 3 bytes: o2 = (byte0/256, byte1/256,
   // byte2, 1). We swap RT2 for our r32g32b32a32_float target.
   // Decode: code = byte0*65536 + byte1*256 + byte2; Ix = code/4096, Iy = code
-  // mod 4096; vx = Ix/4096*2-1, vy = Iy/4096*2-1 (±1.0 NDC = ±1280px at 2560w).
+  // mod 4096; delta = ((Ix/4096)-0.5)/S with S = 4.0 (±0.125 NDC = ±160px at
+  // 2560w; 0.078px/step quantization — 8x finer than the old ±1.0 NDC range,
+  // which was the main per-pixel noise / DLAA detail-smear source).
   // The camera component of the object's motion is added by the depth
   // reprojection below (per-object pixels ADD the object delta to the camera
   // prevPx, so the full MV = camera + object).
@@ -111,12 +113,17 @@ void main(uint2 pix : SV_DispatchThreadID)
     if (code > 0.5f) {
       float ix = floor(code / 4096.0f);
       float iy = code - ix * 4096.0f;
-      float vx = (ix / 4096.0f) * 2.0f - 1.0f;    // ×0.5 encode: ±1.0 NDC
-      float vy = (iy / 4096.0f) * 2.0f - 1.0f;
-      // Robustness: only trust object-only MVs within a sane magnitude. Values
-      // beyond 1000px mean the prev-bone snapshot was stale/mixed or the motion
-      // is absurd — falling back to the camera path keeps the character
-      // consistent (no jitter).
+      // Decode the object delta. VS encode is e = clamp(delta*S+0.5), S = 4.0,
+      // Ix = round_z(e*4096) -> delta = (Ix/4096 - 0.5)/S. Range +-0.125 NDC.
+      const float kObjScale = 4.0f;
+      float vx = ((ix / 4096.0f) - 0.5f) / kObjScale;
+      float vy = ((iy / 4096.0f) - 0.5f) / kObjScale;
+      // Robustness: with the tight range the decoded delta can't exceed 160px,
+      // so stale/garbage prev-bone content can no longer be caught by this cap
+      // (it could only see clamped values). Stale prevs are instead prevented
+      // CPU-side at bind time (MaybeBindPatchedVs forces prev=cur when a
+      // snapshot's prev is >2 frames old). This check remains as a final
+      // safety net; values beyond 1000px fall back to the camera path.
       if (max(abs(vx) * w * 0.5f, abs(vy) * h * 0.5f) < 1000.0f) {
         objectDeltaPx.x = vx * w * 0.5f;
         objectDeltaPx.y = -vy * h * 0.5f;
