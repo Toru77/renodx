@@ -336,7 +336,8 @@ void EmitSelfTest() {
 // Patch a skinned VS in place, write the patched blob to `out_path`, and
 // re-validate (parse + signatures + hash self-consistency). With `velocity`
 // the RT2-channel per-object velocity encode is emitted too.
-int PatchOne(const std::string& path, const std::string& out_path, bool velocity = false) {
+int PatchOne(const std::string& path, const std::string& out_path, bool velocity = false,
+             bool carrier = false) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
     std::cerr << "  ERROR: cannot read file\n";
@@ -346,6 +347,7 @@ int PatchOne(const std::string& path, const std::string& out_path, bool velocity
   dxbc::PatchInfo info;
   dxbc::PatchOptions options;
   options.emit_velocity_to_rt2 = velocity;
+  options.emit_velocity_carrier = carrier;
   const bool patched = dxbc::PatchSkinnedVertexShader(data, &new_hash, &info, options);
   if (!patched) {
     std::cout << "  NOT PATCHED (not a skinned VS or parse failed)\n";
@@ -417,14 +419,17 @@ int PsZwCheck(const std::string& path) {
 // `out_path`, and re-validate (parse + signatures + hash self-consistency).
 // `texidx` (0 = auto) is the paired patched VS's prevClip TEXCOORD index that
 // the PS input MUST reuse so the VS->PS semantic linkage matches.
-int PatchOnePs(const std::string& path, const std::string& out_path, uint32_t texidx = 0u) {
+int PatchOnePs(const std::string& path, const std::string& out_path, uint32_t texidx = 0u,
+               bool existing_carrier = false) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
     std::cerr << "  ERROR: cannot read file\n";
     return 1;
   }
   uint32_t new_hash = 0;
-  const bool patched = dxbc::PatchPerObjectPixelShader(data, &new_hash, texidx);
+  dxbc::PixelShaderPatchOptions options;
+  options.existing_velocity_carrier = existing_carrier;
+  const bool patched = dxbc::PatchPerObjectPixelShader(data, &new_hash, texidx, options);
   if (!patched) {
     std::cout << "  NOT PATCHED (not a G-buffer PS or gate rejected)\n";
     dxbc::DXBCHeader h;
@@ -648,8 +653,10 @@ int main(int argc, char** argv) {
   bool emittest = false;
   bool patch = false;
   bool patchvel = false;
+  bool patchcarrier = false;
   bool pszw = false;
   bool patchps = false;
+  bool patchpscarrier = false;
   uint32_t texidx = 0u;
   std::string patch_out;
   std::vector<std::string> paths;
@@ -665,10 +672,14 @@ int main(int argc, char** argv) {
       patch = true;
     } else if (arg == "--patchvel") {
       patchvel = true;
+    } else if (arg == "--patchcarrier") {
+      patchcarrier = true;
     } else if (arg == "--pszw") {
       pszw = true;
     } else if (arg == "--patchps") {
       patchps = true;
+    } else if (arg == "--patchpscarrier") {
+      patchpscarrier = true;
     } else if (arg == "--texidx") {
       if (i + 1 < argc) texidx = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 0));
     } else if (arg == "--out") {
@@ -681,7 +692,9 @@ int main(int argc, char** argv) {
   if (paths.empty() && !emittest) {
     std::cerr << "USAGE: dxbc_test.exe <path-to.cso> [more.cso ...] [--roundtrip] [--dump]\n";
     std::cerr << "       dxbc_test.exe --patch [<out.cso>] <in.cso>\n";
+    std::cerr << "       dxbc_test.exe --patchcarrier [<out.cso>] <in.cso>\n";
     std::cerr << "       dxbc_test.exe --patchps [<out.cso>] <in.cso>\n";
+    std::cerr << "       dxbc_test.exe --patchpscarrier [<out.cso>] <in.cso>\n";
     std::cerr << "  Parses DXBC blobs, prints signatures/RDEF/SHEX, verifies the MD5\n";
     std::cerr << "  checksum, and (with --roundtrip) tests signature insertion.\n";
     std::cerr << "  --dump prints every SHEX instruction's raw dwords + decode.\n";
@@ -690,6 +703,7 @@ int main(int argc, char** argv) {
     std::cerr << "  --patchvel patches a skinned VS WITH the RT2-channel velocity encode.\n";
     std::cerr << "  --pszw <ps.cso> reports whether the PS reads TEXCOORD10.zw (RT2-swap safe).\n";
     std::cerr << "  --patchps [--texidx <n>] patches a G-buffer PS (Phase E) and writes out.cso.\n";
+    std::cerr << "  --patchpscarrier patches a PS using the existing TEXCOORD10.xy carrier.\n";
     std::cerr << "    --texidx overrides the prevClip TEXCOORD index with the paired VS's (0=auto).\n";
     return 1;
   }
@@ -701,11 +715,11 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if ((patch || patchvel) && !paths.empty()) {
+  if ((patch || patchvel || patchcarrier) && !paths.empty()) {
     std::string in = paths[0];
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
-    int rc = PatchOne(in, out, patchvel);
+    int rc = PatchOne(in, out, patchvel, patchcarrier);
     std::cout << "\n";
     return rc;
   }
@@ -719,11 +733,11 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (patchps && !paths.empty()) {
+  if ((patchps || patchpscarrier) && !paths.empty()) {
     std::string in = paths[0];
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
-    int rc = PatchOnePs(in, out, texidx);
+    int rc = PatchOnePs(in, out, texidx, patchpscarrier);
     std::cout << "\n";
     return rc;
   }

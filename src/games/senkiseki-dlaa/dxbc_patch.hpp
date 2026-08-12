@@ -1250,6 +1250,7 @@ struct ShexScan {
   uint32_t first_non_decl = 0;    // byte offset (rel. to token stream start) of first non-dcl instr
   uint32_t ret_offset = 0;        // byte offset of the last ret instruction
   bool has_ret = false;
+  uint32_t ret_count = 0;         // Phase E appends its write before the sole return
   // First instruction that writes SV_Position (output register 0), used by the
   // jitter-only patch to inject the camera jitter into the source temp BEFORE
   // o0 is written (outputs cannot be read back).
@@ -1374,6 +1375,7 @@ inline bool ScanShex(const uint8_t* chunk_data, uint32_t chunk_size, ShexScan& o
     if (op == OP_RET) {
       out.has_ret = true;
       out.ret_offset = ins.offset;
+      ++out.ret_count;
     }
     // Walk operands to find max temp register. The walk is BOUNDED by the
     // instruction boundary: WalkOperand consumes a variable number of dwords
@@ -1478,11 +1480,25 @@ struct PatchOptions {
                                      // Requires the full patch mode (no no_bind/minimal/
                                      // no_output/constant) + a skinned VS that OUTPUTS
                                      // TEXCOORD10 + a structured bone buffer slot.
+  bool emit_velocity_carrier = false; // write raw prevNDC-curNDC into existing
+                                      // TEXCOORD10.xy for the dedicated Phase E target;
+                                      // does not write the game's RT2 .zw payload.
   uint32_t velocity_debug_mode = 0u; // 0 = normal delta. 1..4 = diagnostic: encode a RAW
                                      // NDC component (1=curNDC.x, 2=prevNDC.x, 3=curNDC.y,
                                      // 4=prevNDC.y) as E = clamp(ndc*0.5+0.5,0,1) instead of
                                      // the delta, so the motionBuf readback shows whether
                                      // the injected skin's NDC is sane or NaN.
+  bool velocity_full_mv = false;     // FULL-MV (A/B vs object-only): prevClip = prevBone x
+                                     // the addon's PREVIOUS-frame VP (prev_vp_cb) instead of
+                                     // the game's current c10..13, so the encoded delta is the
+                                     // COMPLETE screen-space motion (camera + object) — the
+                                     // exact MV DLAA expects. Removes the second-order
+                                     // camera x object cross-term of the camera+object
+                                     // decomposition in the compute, which made the character
+                                     // shake when both camera and character moved (chase cam).
+                                     // The compute then uses the delta directly (jitter-
+                                     // compensated under Global jitter) instead of adding it
+                                     // to the depth-reprojected camera path.
 };
 
 // Classify a G-buffer PS: does it consume TEXCOORD10 ONLY as .zw? The ISGN
@@ -1502,6 +1518,53 @@ inline bool PsReadsTexcoord10Zw(const std::vector<std::byte>& data) {
   for (const auto& e : is)
     if (e.name == "TEXCOORD" && e.semantic_index == 10u) return e.read_write_mask == 0xCu;
   return false;
+}
+
+// Strong Phase E eligibility contract. This is deliberately stricter than the
+// RT2 transport classifier above: a matching TEXCOORD10 read alone also occurs
+// in non-G-buffer and alternate-output material shaders. Phase E only supports
+// the game's canonical three-target G-buffer footprint, then adds SV_TARGET3.
+// No shader hashes are involved.
+inline bool IsStrictPhaseECarrierPixelShader(const std::vector<std::byte>& data) {
+  DXBCHeader header;
+  std::vector<ChunkInfo> chunks;
+  if (!ParseDXBC(data, header, chunks)) return false;
+  const ChunkInfo* isgn = FindChunk(chunks, "ISGN");
+  const ChunkInfo* osgn = FindChunk(chunks, "OSGN");
+  const ChunkInfo* shex = FindChunk(chunks, "SHEX");
+  if (!shex) shex = FindChunk(chunks, "SHDR");
+  if (!isgn || !osgn || !shex) return false;
+
+  std::vector<SignatureEntry> is, os;
+  if (!ParseSignature(data, *isgn, is) || !ParseSignature(data, *osgn, os)) return false;
+
+  uint32_t carrier_count = 0u;
+  for (const auto& e : is) {
+    if (e.name != "TEXCOORD" || e.semantic_index != 10u) continue;
+    ++carrier_count;
+    // The VS owns xy for the raw velocity carrier; this PS consumes only zw.
+    if (e.system_value_type != 0u || e.component_type != 3u ||
+        e.mask != 0xFu || e.read_write_mask != 0xCu)
+      return false;
+  }
+  if (carrier_count != 1u) return false;
+
+  // Exactly SV_TARGET0..2, all float4, leaves a single unambiguous append slot
+  // at o3. Reject depth/stencil/coverage or sparse/partial output signatures.
+  if (os.size() != 3u) return false;
+  for (uint32_t i = 0u; i < 3u; ++i) {
+    const auto& e = os[i];
+    if (e.name != "SV_TARGET" || e.semantic_index != i || e.register_index != i ||
+        e.system_value_type != 0u || e.component_type != 3u ||
+        e.mask != 0xFu || e.read_write_mask != 0u)
+      return false;
+  }
+
+  const uint8_t* shex_data =
+      reinterpret_cast<const uint8_t*>(data.data()) + shex->offset + kChunkHeaderSize;
+  ShexScan scan;
+  if (!ScanShex(shex_data, shex->size, scan)) return false;
+  return scan.has_ret && scan.ret_count == 1u;
 }
 
 // prev-bone re-skin block (t#) × addon prevVP cbuffer (b#) → new TEXCOORD
@@ -1772,7 +1835,8 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   // VS (blend_reg >= 0 checked above), a TEXCOORD10 output (the RT2 channel),
   // and a confirmed structured bone buffer slot (the game's CURRENT bones the
   // cur-skin re-reads). Everything is structural — no hash lists here.
-  const bool emit_vel = options.emit_velocity_to_rt2 && !no_bind && !minimal && !no_output &&
+  const bool emit_vel = (options.emit_velocity_to_rt2 || options.emit_velocity_carrier) &&
+                        !no_bind && !minimal && !no_output &&
                         !constant && tex10_out_reg != UINT32_MAX &&
                         !scan.structured_slots.empty();
   const uint32_t bone_game_slot = scan.structured_slots.empty() ? 0u : scan.structured_slots[0];
@@ -2003,20 +2067,28 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitDp4Cb(body, rCurClip, 0x8u, globals_slot, 13u, rCurAcc, kSwizzleXYZW);
   }
 
-  // prevClip into rB. For the per-object velocity path the prevClip must use
-  // the CURRENT ViewProjection (b0 c10..c13) so the delta prevNDC-curNDC is
-  // OBJECT-ONLY motion — both skins share the SAME camera, so the camera
-  // component cancels and the delta is immune to prevVP (cb1) staleness/
-  // pairing (the old full-MV delta showed a huge ~-0.9 NDC rigid-body offset).
-  // The camera component is added back in the velocity compute's
-  // depth-reprojection path. constant mode: o7 = (0,0,0,1) with ZERO reads.
-  // minimal/no-bind modes: game's own ViewProjection (b0 c10..c13); the legacy
-  // (non-velocity) prevClip output uses the addon prevVP cbuffer.
+  // prevClip into rB. For the per-object velocity path:
+  //   * object-only (default, velocity_full_mv=false): prevClip uses the
+  //     CURRENT ViewProjection (b0 c10..c13) so the delta prevNDC-curNDC is
+  //     OBJECT-ONLY motion (both skins share the same camera -> the camera
+  //     component cancels). The camera component is added back in the velocity
+  //     compute's depth-reprojection path (camera + object). The old -0.9 NDC
+  //     "rigid-body offset" was the div-swizzle bug (curNDC read depth), NOT
+  //     a prevVP problem — prevVP is frame-aligned (captured at present).
+  //   * full-MV (velocity_full_mv=true): prevClip uses the addon prevVP
+  //     cbuffer (prev_vp_cb, the UNJITTERED previous-frame VP, frame-aligned
+  //     with the prev-bone snapshot) so the delta = prevNDC-curNDC is the
+  //     COMPLETE screen-space motion (camera + object) — the exact MV DLAA
+  //     expects, no decomposition. The compute uses it directly (jitter-
+  //     compensated under Global jitter).
+  // constant mode: o7 = (0,0,0,1) with ZERO reads. minimal/no-bind modes:
+  // game's own ViewProjection (b0 c10..c13); the legacy (non-velocity)
+  // prevClip output uses the addon prevVP cbuffer.
   if (constant) {
     EmitMovImm4(body, rB, 0xFu, 0u, 0u, 0u, 0x3F800000u);  // rB = (0,0,0,1)
   } else {
-    const uint32_t vel_cb = emit_vel ? globals_slot : prev_vp_cb;
-    const uint32_t vel_elem = emit_vel ? 10u : prev_vp_elem;
+    const uint32_t vel_cb = (emit_vel && !options.velocity_full_mv) ? globals_slot : prev_vp_cb;
+    const uint32_t vel_elem = (emit_vel && !options.velocity_full_mv) ? 10u : prev_vp_elem;
     EmitDp4Cb(body, rB, 0x1u, vel_cb, vel_elem + 0u, minimal ? rP : rAcc, kSwizzleXYZW);
     EmitDp4Cb(body, rB, 0x2u, vel_cb, vel_elem + 1u, minimal ? rP : rAcc, kSwizzleXYZW);
     EmitDp4Cb(body, rB, 0x4u, vel_cb, vel_elem + 2u, minimal ? rP : rAcc, kSwizzleXYZW);
@@ -2024,11 +2096,15 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   }
 
   // ── Per-object velocity (RT2 channel): Part B — encode prevNDC-curNDC ──
-  // Now rB = prevClip (prev-bone skin x CURRENT VP) and rCurClip = curClip
-  // (cur-bone skin x CURRENT VP) — BOTH projected with the game's current
-  // c10..c13, so the delta is OBJECT-ONLY motion (camera cancels, immune to
-  // prevVP pairing/staleness). The camera component of the object's full MV is
-  // added by the velocity compute's depth-reprojection path.
+  // object-only (default): rB = prevClip (prev-bone skin x CURRENT VP) and
+  // rCurClip = curClip (cur-bone skin x CURRENT VP) — BOTH projected with the
+  // game's current c10..c13, so the delta is OBJECT-ONLY motion (camera
+  // cancels); the camera component is added by the compute's depth-
+  // reprojection path.
+  // full-MV (velocity_full_mv): rB = prevClip (prev-bone skin x PREVIOUS VP,
+  // addon prev_vp_cb) and rCurClip = cur-bone skin x game c10..13 — the delta
+  // is the COMPLETE screen-space motion (camera + object); the compute uses it
+  // directly (jitter-compensated).
   // The 24-bit code E = (Ix*4096 + Iy)/16777216 where
   // Ix,Iy = clamp(round_z((delta*S+0.5)*4096), 0, 4095) quantize the NDC delta.
   // S = 4.0 maps delta in [-0.125, +0.125] NDC (~+/-160px at 2560 wide) onto
@@ -2054,28 +2130,38 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     // and dy = prevNDC.y - 1. This was the root cause of the whole -0.93
     // "same as camera" bug.
     EmitDiv(body, rV, 0xCu, rCurClip, kSwizzleXYXY, rCurClip, kSwizzleWWWW); // rV.zw = curNDC.xy
-    if (options.velocity_debug_mode == 0u) {
-    EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX); // dx = prev.x - cur.x
-    EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY); // dy = prev.y - cur.y (imm -1 at .y)
-    // nx = round_z(clamp(dx*S+0.5,0,1) * 4096) clamped to [0,4095], S = 4.0
-    // (object delta range +-0.125 NDC = +-160px). Object-only deltas are small
-    // (per-frame limb motion, typically < 0.05 NDC), so this tight range gives
-    // 0.078px quantization steps — 8x finer than the old +-1.0 NDC / 0.625px
-    // range that produced the visible per-pixel noise + DLAA detail smear.
+    // Preserve the raw object delta for the dedicated Phase E carrier before
+    // the legacy quantized encoder overwrites rV.xy.
+    EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX);
+    EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY);
+    if (options.emit_velocity_carrier)
+      EmitMovOutputMasked(body, tex10_out_reg, 0x3u, rV, kSwizzleXYXY); // raw delta -> TEXCOORD10.xy
+    if (options.emit_velocity_to_rt2 && options.velocity_debug_mode == 0u) {
+    // Encode re-center (FIX 1c): E = delta + 0.75 with S = 1.0 for BOTH modes.
+    // The old center 0.5 put a still character at E=0.5 -> byte0=128, the ONE
+    // band where the game's 8-bit RT2 (r8g8b8a8_unorm) round-trips with a +-1
+    // LSB error = a +-1.25..2.2px decoded MV floor at still. Center 0.75 puts
+    // small deltas at byte0=192 (and the whole +-0.125 NDC object-only range at
+    // byte0 160..224) — bit-exact through 8-bit unorm, so the floor disappears.
+    // Range before clamp: delta in [-0.75, +0.25] NDC (+0.25 NDC = +320px, the
+    // same positive headroom as the old full-MV +-320px).
+    const uint32_t kScaleImm = 0x3F800000u;  // 1.0 (S=1 both modes; re-center)
+    // nx = round_z(clamp(dx + 0.75, 0, 1) * 4096) clamped to [0,4095] (FIX 1c:
+    // center 0.75 so small deltas land on the bit-exact 8-bit byte0 region).
     // NOTE: clamp to 4095.999756 (0x457FFFFF = the float just below 4096)
     // BEFORE round_z so the result is always an integer in [0,4095] — clamping
     // after round_z would leave a fractional nx in the round_z(4096) edge case.
-    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x40800000u, 0u, 0u, 0u);  // rV.x *= 4.0 (range +-0.125 NDC)
-    EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
+    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, kScaleImm, 0u, 0u, 0u);  // rV.x *= 1.0 (FIX 1c; kept for imm parity)
+    EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F400000u);              // rV.x += 0.75 (FIX 1c re-center)
     EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
     EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);              // min 1
     EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x45800000u, 0u, 0u, 0u);  // rV.x *= 4096
     EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FFFFFu);              // min 4095.999756
     EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);                            // round_z
     EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
-    // ny = round_z(clamp(dy*S+0.5,0,1) * 4096) clamped to [0,4095], S = 4.0.
-    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x40800000u, 0u, 0u);  // rV.y *= 4.0 (range +-0.125 NDC, imm at .y)
-    EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
+    // ny = round_z(clamp(dy + 0.75, 0, 1) * 4096) clamped to [0,4095] (re-center).
+    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, kScaleImm, 0u, 0u);  // rV.y *= 1.0 (FIX 1c; kept for imm parity)
+    EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F400000u);              // rV.y += 0.75 (FIX 1c re-center)
     EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
     EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
     EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x45800000u, 0u, 0u);  // rV.y *= 4096 (imm at .y)
@@ -2089,7 +2175,7 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
     // mov o{tex10}.zw, rV.zzzw  -> the game's PS packs (E, 1) into o2/RT2.
     EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else if (options.velocity_debug_mode <= 4u) {
+    } else if (options.emit_velocity_to_rt2 && options.velocity_debug_mode <= 4u) {
       // ── Diagnostic encode (velocity_debug_mode 1..4): write a RAW NDC
       // component instead of the delta so the motionBuf readback reveals whether
       // the injected cur/prev skin NDC is sane. mode: 1=curNDC.x, 2=prevNDC.x,
@@ -2112,7 +2198,7 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
       EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24
       EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
       EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else if (options.velocity_debug_mode == 6u) {
+    } else if (options.emit_velocity_to_rt2 && options.velocity_debug_mode == 6u) {
       // ── Diagnostic encode (mode 6): BOTH skins in ONE code — Ix = curNDC.x
       // (rV.z), Iy = prevNDC.x (rV.x). A single motionBuf center readback then
       // reveals which injected skin is broken: at the character's screen-center
@@ -2142,7 +2228,7 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
       EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24
       EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
       EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else {
+    } else if (options.emit_velocity_to_rt2) {
       // ── Diagnostic encode (velocity_debug_mode >= 5): encode the RAW DELTA
       // prevNDC-curNDC with a WIDE +-4 NDC range (scale 0.125) so nothing
       // saturates. The motionBuf readback classification (E-based) then splits:
@@ -2357,6 +2443,9 @@ struct PixelShaderPatchOptions {
                                  // Every crashing test so far appended a new
                                  // output; if this is safe, the appended
                                  // output register was the trigger.
+  bool existing_velocity_carrier = false; // use the already-declared
+                                          // TEXCOORD10.xy carrier; do not add a
+                                          // new PS input or relocate SV inputs.
 };
 
 // ── Generic per-object-motion PS patcher (Phase E core) ──
@@ -2371,6 +2460,9 @@ struct PixelShaderPatchOptions {
 inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* out_new_hash,
                                       uint32_t vs_texcoord_index = 0u,
                                       const PixelShaderPatchOptions& options = {}) {
+  // Carrier mode is the live Phase E path. Enforce the full structural
+  // contract here too, so every caller gets the same generic safety gate.
+  if (options.existing_velocity_carrier && !IsStrictPhaseECarrierPixelShader(data)) return false;
   DXBCHeader header;
   std::vector<ChunkInfo> chunks;
   if (!ParseDXBC(data, header, chunks)) return false;
@@ -2382,6 +2474,17 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
 
   std::vector<SignatureEntry> is, os;
   if (!ParseSignature(data, *isgn, is) || !ParseSignature(data, *osgn, os)) return false;
+
+  uint32_t carrier_reg = UINT32_MAX;
+  if (options.existing_velocity_carrier) {
+    for (const auto& e : is) {
+      if (e.name == "TEXCOORD" && e.semantic_index == 10u && e.read_write_mask == 0xCu) {
+        carrier_reg = e.register_index;
+        break;
+      }
+    }
+    if (carrier_reg == UINT32_MAX) return false;
+  }
 
   // Scope gate: G-buffer PS with 3 OR 4 SV_TARGETs (3-RT: registers 0..2, or
   // 4-RT: registers 0..3 — e.g. the iris PS writes a 4th game target). Skip if
@@ -2480,7 +2583,8 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   // output written with a constant, isolating the output register / OSGN
   // append from the new input + SV relocation.
   std::vector<uint32_t> decls;
-  if (!options.constant_output) EmitDclInputPs(decls, new_in_reg);
+  if (!options.constant_output && !options.existing_velocity_carrier)
+    EmitDclInputPs(decls, new_in_reg);
   if (!options.no_new_output) EmitDclOutput(decls, new_out_reg);
 
   // Build injected body tokens (mirrors the hand-patched boot PS):
@@ -2495,6 +2599,16 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   if (options.constant_output || options.no_read) {
     EmitMovImm4(body, rT, 0xFu, 0x3F000000u, 0x3F000000u, 0u, 0x3F800000u);  // rT = (0.5,0.5,0,1)
     EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);                     // mov oM.xyzw, rT.xyzw
+  } else if (options.existing_velocity_carrier) {
+    // Phase E carrier mode: the patched VS writes the raw object delta into
+    // TEXCOORD10.xy, while the game PS reads only TEXCOORD10.zw. Keep the
+    // existing linkage and emit the carrier directly to the dedicated target.
+    EmitMovImm4(body, rT, 0xFu, 0u, 0u, 0u, 0x3F800000u);
+    EmitMovInput(body, rT, 0x3u, carrier_reg, kSwizzleXYXY);
+    if (options.no_new_output)
+      EmitMovOutputMasked(body, max_out, 0x3u, rT, kSwizzleXYXY);
+    else
+      EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);
   } else if (options.no_math) {
     EmitMovInput(body, rT, 0xFu, new_in_reg, 0xFu);                         // mov rT.xyzw, vN.xyzw
     EmitMovOutput(body, new_out_reg, rT, kSwizzleXYZW);                     // mov oM.xyzw, rT.xyzw
@@ -2535,7 +2649,7 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   // spliced in (the injected code uses new_in_reg, not the old SV register).
   // constant_output skips the input decl entirely, so an SV_SampleIndex sitting
   // on new_in_reg stays where it is (no relocation needed).
-  if (!options.constant_output && sv_old_reg != UINT32_MAX)
+  if (!options.constant_output && !options.existing_velocity_carrier && sv_old_reg != UINT32_MAX)
     RewriteInputRegister(new_tokens, sv_old_reg, sv_new_reg);
   bool patched_temps = false;
   if (scan.has_temps) {
@@ -2601,7 +2715,9 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
     }
   }
 
-  // ── Append the ISGN input entry (TEXCOORD5, free input register) ──
+  // ── Append the ISGN input entry (legacy Phase E path) ──
+  // Carrier mode already has TEXCOORD10 in the original PS signature.
+  if (!options.existing_velocity_carrier) {
   {
     DXBCHeader h2;
     std::vector<ChunkInfo> chunks2;
@@ -2633,6 +2749,7 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
     if (!AppendSignatureEntry(out, *isgn2, "TEXCOORD", tex_idx, new_in_reg, 0xFu, 0x0Bu,
                               3u /* FLOAT32 */, insert_at))
       return false;
+  }
   }
   // ── Append the OSGN output entry (SV_TARGET at max_out+1: 3 for 3-RT, 4 for
   // 4-RT G-buffer PSs). SKIPPED in no_new_output mode: prevNDC goes into the

@@ -2,7 +2,10 @@
 // Compute shader (cs_5_0) that generates R16G16_FLOAT velocity.
 //
 // Two sources, COMBINED per-pixel (full MV = camera + object):
-//   1. Per-object motion (dynamic objects): G-buffer MRT2 at t1 holds the
+//   1. Per-object motion (dynamic objects): normally the dedicated Phase E
+//      motion target at t1 holds the raw OBJECT-ONLY delta. Legacy RT2 mode
+//      uses the packed fallback described below.
+//      G-buffer MRT2 at t1 holds the
 //      OBJECT-ONLY motion delta prevNDC-curNDC (both skins projected with the
 //      CURRENT ViewProjection, so camera motion is NOT included) encoded in
 //      o2.zw ([0,1], y-up) by the modified char G-buffer VS. o2.w != 0 marks a
@@ -13,11 +16,17 @@
 //      per-object delta is added on top for dynamic-object pixels.
 //
 // Input:  t0 = depth texture (R32_FLOAT or R32_TYPELESS)
-//         t1 = G-buffer MRT2 (per-object prevNDC in o2.zw, y-up UV)
+//         t1 = motion source (dedicated r32g32b32a32_float in Phase E, or the
+//              legacy game's r8g8b8a8_unorm RT2): the packer
+//              PS fills o2.rgb with the 24-bit per-object encode E and o2.w=1
+//              (alpha) as its validity flag where it wrote (the character);
+//              background pixels carry the game's real packed depth with
+//              alpha=0 and are ignored via the alpha gate (no addon swap:
+//              Fix 1 keeps the game's G-buffer intact).
 //         t2 = effect/particle mask (r16g16_float, 1.0 = excluded from DLAA)
 // Output: u0 = velocity buffer (R16G16_FLOAT, screen px, y-down)
 //
-// Push constants (b13, 48 floats = 12 float4s):
+// Push constants (b13, 56 floats = 14 float4s):
 //   c[0..3]  = prevViewProjection (4x4 row-major)
 //   c[4..7]  = curViewProjInverse (4x4 row-major)
 //   c[8]     = VP_WIDTH, VP_HEIGHT, VELOCITY_SCALE, DEBUG_VIEW
@@ -25,7 +34,9 @@
 //   c[10]    = MV_THRESHOLD(px), MV_DIRECTION(flip), MV_MODE, EXCLUDE_EFFECTS
 //              MV_MODE: 0=MVJittered=0 no per-object subtract (B), 1=MVJittered=0
 //              subtract (A, current), 2=MVJittered=1 whole buffer jittered (C)
-//   c[11]    = OBJECT_MV_THRESHOLD(px) — per-object/Prev-Bone MVs only
+//   c[11]    = OBJECT_MV_THRESHOLD(px), PREV_JITTER_X, PREV_JITTER_Y, JITTER_IN_MV
+//   c[12]    = DEPTH_SAMPLE_UNJIT, SYNTH_JITTER_MV, FULL_MV_MODE, GLOBAL_JITTER
+//   c[13]    = STATIC_CAMERA_SC, OBJECT_DELTA_DIRECT, MAX_VP_DELTA, (unused)
 //
 // SPDX-License-Identifier: MIT
 
@@ -41,7 +52,10 @@ cbuffer cb_push : register(b13) {
   float4 params1;   // x=jitter_x(NDC), y=jitter_y(NDC), z=per_object_motion, w=zero_mv
   float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=mv_mode, w=exclude_effects
   float4 params3;   // x=mv_threshold_object(px), y=prev_jitter_x(NDC), z=prev_jitter_y(NDC), w=jitter_in_mv
-  float4 params4;   // x=depth_sample_unjit, yzw=unused
+  float4 params4;   // x=depth_sample_unjit, y=synth_jitter_mv, z=full_mv_mode, w=global_jitter
+  float4 params5;   // x=static_camera_shortcircuit, y=object_delta_direct,
+                    // z=max_vp_delta (|prevVP-curVP| max; < 1e-4 => camera still),
+                    // w=dedicated Phase E source
 };
 
 [numthreads(8, 8, 1)]
@@ -90,14 +104,18 @@ void main(uint2 pix : SV_DispatchThreadID)
   float2 objectDeltaPx = float2(0.0, 0.0);
   bool hasObjectMotion = false;
 
-  // ── Per-object motion (dynamic objects, from modified VS + 32-bit target) ──
+  // ── Per-object motion (dynamic objects, from the modified VS) ──
   // The patched VS encodes the OBJECT-ONLY motion delta prevNDC-curNDC (both
   // skins projected with the CURRENT ViewProjection, so the camera component is
   // NOT included — immune to prevVP pairing/staleness that made the old full-MV
   // delta a huge ~-0.9 NDC rigid-body offset) as a 24-bit code
   // E = (Ix*4096 + Iy)/16777216 into TEXCOORD10.zw, and the GAME's UNPATCHED
   // G-buffer PS packs E into o2 (RT2) as 3 bytes: o2 = (byte0/256, byte1/256,
-  // byte2, 1). We swap RT2 for our r32g32b32a32_float target.
+  // byte2, 1). t1 is the GAME's real RT2 (r8g8b8a8_unorm) — no swap (Fix 1):
+  // the game's G-buffer stays intact. FIX 1c re-centers the encode to E =
+  // delta + 0.75 (S=1) so a still character sits at byte0=192 — bit-exact
+  // through the 8-bit RT2 (the old 0.5 center hit the +-1-LSB byte0=128 band
+  // and floored every still per-object delta at ~+-1.25..2.2px).
   // Decode: code = byte0*65536 + byte1*256 + byte2; Ix = code/4096, Iy = code
   // mod 4096; delta = ((Ix/4096)-0.5)/S with S = 4.0 (±0.125 NDC = ±160px at
   // 2560w; 0.078px/step quantization — 8x finer than the old ±1.0 NDC range,
@@ -105,70 +123,154 @@ void main(uint2 pix : SV_DispatchThreadID)
   // The camera component of the object's motion is added by the depth
   // reprojection below (per-object pixels ADD the object delta to the camera
   // prevPx, so the full MV = camera + object).
+  //
+  // FIX 1b (legacy RT2 alpha validity gate): the GAME's RT2 is a FULL-SCREEN target — it
+  // holds the per-object encode E only where the packer PS wrote it (o2.w=1 ->
+  // alpha=1, the character) and REAL packed depth everywhere else (alpha=0,
+  // background). Reading the whole RT2 as per-object decoded the background
+  // depth into fake 200-360px MVs (the environment-wide ghost). The packer
+  // writes o2.w=1 unconditionally, so alpha IS the encode's own validity flag:
+  // gate per-object on it — only character pixels are per-object, the
+  // background falls through to the camera path.
   if (params1.z > 0.5f) {
     float4 mrt = g_srcMotion.Load(int3(pix, 0));
-    float code = round(mrt.r * 256.0f) * 65536.0f +
-                 round(mrt.g * 256.0f) * 256.0f +
-                 round(mrt.b * 256.0f);
-    if (code > 0.5f) {
-      float ix = floor(code / 4096.0f);
-      float iy = code - ix * 4096.0f;
-      // Decode the object delta. VS encode is e = clamp(delta*S+0.5), S = 4.0,
-      // Ix = round_z(e*4096) -> delta = (Ix/4096 - 0.5)/S. Range +-0.125 NDC.
-      const float kObjScale = 4.0f;
-      float vx = ((ix / 4096.0f) - 0.5f) / kObjScale;
-      float vy = ((iy / 4096.0f) - 0.5f) / kObjScale;
-      // Robustness: with the tight range the decoded delta can't exceed 160px,
-      // so stale/garbage prev-bone content can no longer be caught by this cap
-      // (it could only see clamped values). Stale prevs are instead prevented
-      // CPU-side at bind time (MaybeBindPatchedVs forces prev=cur when a
-      // snapshot's prev is >2 frames old). This check remains as a final
+    if (params5.w > 0.5f) {
+      // Phase E: the dedicated R32G32B32A32 target receives the raw
+      // object-only delta from the existing TEXCOORD10.xy carrier. Alpha is
+      // cleared to zero and written as one by the patched PS, so it is a
+      // genuine validity bit here (unlike the game's shared RT2 alpha).
+      if (mrt.a > 0.5f && max(abs(mrt.x), abs(mrt.y)) < 4.0f) {
+        objectDeltaPx = float2(mrt.x * w * 0.5f, -mrt.y * h * 0.5f);
+        if (max(abs(objectDeltaPx.x), abs(objectDeltaPx.y)) < 1000.0f)
+          hasObjectMotion = true;
+      }
+    } else {
+      float code = round(mrt.r * 256.0f) * 65536.0f +
+                   round(mrt.g * 256.0f) * 256.0f +
+                   round(mrt.b * 256.0f);
+      if (code > 0.5f && mrt.a > 0.5f) {
+        float ix = floor(code / 4096.0f);
+        float iy = code - ix * 4096.0f;
+      // Decode the object delta (FIX 1c re-center). VS encode is now
+      // E = clamp(delta + 0.75, 0, 1) with S = 1.0 for BOTH modes; Ix =
+      // round_z(E*4096) -> delta = Ix/4096 - 0.75. (The old center 0.5 sat a
+      // still character on byte0=128, the 8-bit RT2's +-1-LSB rounding band,
+      // which floored every small per-object delta at ~+-1.25..2.2px.)
+      float vx = (ix / 4096.0f) - 0.75f;
+      float vy = (iy / 4096.0f) - 0.75f;
+      // Robustness: with the re-centered S=1 encode the decoded delta ranges
+      // up to +-0.75 NDC (+-960px) before the clamp-to-0/1 falls back, so
+      // stale/garbage prev-bone content that survives the CPU-side staleness
+      // guard could reach a few hundred px. This check remains as a final
       // safety net; values beyond 1000px fall back to the camera path.
-      if (max(abs(vx) * w * 0.5f, abs(vy) * h * 0.5f) < 1000.0f) {
-        objectDeltaPx.x = vx * w * 0.5f;
-        objectDeltaPx.y = -vy * h * 0.5f;
-        hasObjectMotion = true;
+        if (max(abs(vx) * w * 0.5f, abs(vy) * h * 0.5f) < 1000.0f) {
+          objectDeltaPx.x = vx * w * 0.5f;
+          objectDeltaPx.y = -vy * h * 0.5f;
+          hasObjectMotion = true;
+        }
       }
     }
+
+    // Full-MV carrier coordinates must be in the same unjittered space as
+    // curPxU below. With the default Global jitter method, the game's current
+    // b0 ViewProjection has J_current applied when the patched VS reconstructs
+    // curClip, whereas our prevVP cbuffer deliberately remains unjittered.
+    // Thus the raw carrier is (prev - current - J_current). Restore
+    // J_current here so a still character has exactly zero object motion and a
+    // moving character keeps its real small per-frame delta. Per-VS jitter is
+    // applied after this injected reconstruction, so it does not need this
+    // correction.
+    if (hasObjectMotion && params4.z > 0.5f && params4.w > 0.5f)
+      objectDeltaPx += jitterPx;
   }
 
   // ── Camera motion (depth reprojection) — ALWAYS. Per-object pixels ADD the
   // object delta on top, so their full MV = camera + object (consistent with
   // the background). ──
   {
-    // DLAAPhaseDepthSampleUnjit (params4.x): the depth buffer is UNJITTERED
-    // (our depth_only fix), so depth[pix] belongs to the content at UNJITTERED
-    // position pix, NOT at curPxU = pix - jitterPx. Sampling at pix therefore
-    // misreads the depth by up to half a pixel whenever jitter is on, injecting
-    // a per-frame MV error DLSS can't compensate. Sample at the UNJITTERED pixel
-    // (curPxU, rounded to the nearest texel) so depth and position agree.
-    int2 depthPix = int2(pix);
-    if (params4.x > 0.5f) {
-      depthPix = int2(round(curPxU));
-      depthPix = clamp(depthPix, int2(0, 0), int2((int)w - 1, (int)h - 1));
-    }
-    float depth = g_srcDepth.Load(int3(depthPix, 0));
+    // ROOT-CAUSE FIX 1 (DLAAPhaseStaticCameraSC, params5.x): when the
+    // ViewProjection is unchanged (params5.z = max |prevVP-curVP| < 1e-4), the
+    // unproject/reproject round trip is a mathematical identity that only
+    // injects float precision noise (~0.01-0.02px on the near character — the
+    // yellow/purple HSV spots). Skip it: prevPx stays curPxU -> static content
+    // gets EXACTLY zero velocity at the source, no threshold needed.
+    if (!(params5.x > 0.5f && params5.z < 0.0001f)) {
+      // DLAAPhaseDepthSampleUnjit (params4.x): the depth buffer is UNJITTERED
+      // (our depth_only fix), so depth[pix] belongs to the content at UNJITTERED
+      // position pix, NOT at curPxU = pix - jitterPx. Sampling at pix therefore
+      // misreads the depth by up to half a pixel whenever jitter is on, injecting
+      // a per-frame MV error DLSS can't compensate. Sample at the UNJITTERED pixel
+      // (curPxU, rounded to the nearest texel) so depth and position agree.
+      int2 depthPix = int2(pix);
+      if (params4.x > 0.5f) {
+        depthPix = int2(round(curPxU));
+        depthPix = clamp(depthPix, int2(0, 0), int2((int)w - 1, (int)h - 1));
+      }
+      float depth = g_srcDepth.Load(int3(depthPix, 0));
 
-    // NDC (y-up) from the UNJITTERED pixel position
-    float2 ndc = (curPxU / float2(w, h)) * 2.0 - 1.0;
-    ndc.y = -ndc.y;
+      // NDC (y-up) from the UNJITTERED pixel position
+      float2 ndc = (curPxU / float2(w, h)) * 2.0 - 1.0;
+      ndc.y = -ndc.y;
 
-    // Unproject to world space
-    float4 clipPos = float4(ndc, depth, 1.0);
-    float4 worldPos = mul(clipPos, curViewProjInv);
-    if (abs(worldPos.w) > 1e-6) {
-      worldPos /= worldPos.w;
+      // Unproject to world space
+      float4 clipPos = float4(ndc, depth, 1.0);
+      float4 worldPos = mul(clipPos, curViewProjInv);
+      if (abs(worldPos.w) > 1e-6) {
+        worldPos /= worldPos.w;
 
-      // Reproject to previous screen
-      float4 prevClip = mul(worldPos, prevViewProj);
-      if (abs(prevClip.w) > 1e-5) {
-        float2 prevNDC = prevClip.xy / prevClip.w;
-        prevPx.x = (prevNDC.x * 0.5 + 0.5) * w;
-        prevPx.y = (0.5 - prevNDC.y * 0.5) * h;  // y-up NDC -> y-down px
+        // Reproject to previous screen
+        float4 prevClip = mul(worldPos, prevViewProj);
+        if (abs(prevClip.w) > 1e-5) {
+          float2 prevNDC = prevClip.xy / prevClip.w;
+          prevPx.x = (prevNDC.x * 0.5 + 0.5) * w;
+          prevPx.y = (0.5 - prevNDC.y * 0.5) * h;  // y-up NDC -> y-down px
+        }
       }
     }
     if (hasObjectMotion) {
-      prevPx += objectDeltaPx;
+      // ROOT-CAUSE FIX 2 (DLAAPhaseObjectDeltaDirect, params5.y): trust the
+      // EXACT per-object delta instead of the round-22 confidence blend that
+      // routes small deltas onto the noisy camera path. Full-MV: the delta IS
+      // the complete screen-space motion (camera included) -> prevPx = curPxU
+      // + objDelta. Object-only: relative delta added to the camera path.
+      // The user-controlled per-object deadband rejects only as much subtle
+      // motion as desired. It also gates the final per-object MV below, so a
+      // single slider governs this direct-path cutoff end-to-end.
+      if (params5.y > 0.5f) {
+        float objLen = length(objectDeltaPx);
+        if (objLen < params3.x) objectDeltaPx = float2(0.0, 0.0);
+        if (params4.z > 0.5f) {
+          prevPx = curPxU + objectDeltaPx;
+        } else {
+          prevPx += objectDeltaPx;
+        }
+      } else {
+        // ── Object-motion confidence blend (round 22): ──
+        // The character's per-object delta includes its idle/root-bob motion (a
+        // few px to ~12px, oscillating frame-to-frame even when standing "still"
+        // — the "arrows fire wildly at still" symptom). Those small per-object
+        // MVs are NOT depth-consistent with the camera path, so DLSS rejects the
+        // character's history -> no accumulation -> the whole character shakes,
+        // jitter-independent, in every per-object variant. Fix: blend toward the
+        // depth-consistent camera-path prevPx (which DLSS accepts) when the
+        // per-object delta is SMALL, and use the per-object delta only when the
+        // motion is substantial (real walking/limbs). objLen <= 12px -> camera
+        // path (stable at still — covers the whole idle range); >= 20px -> full
+        // per-object (real motion; walking deltas are 90-180px).
+        const float kObjConfLowPx = 12.0f, kObjConfHighPx = 20.0f;
+        float objLen = length(objectDeltaPx);
+        float w = saturate((objLen - kObjConfLowPx) / (kObjConfHighPx - kObjConfLowPx));
+        if (params4.z > 0.5f) {
+        // Full-MV mode: the carrier has already had the Global-jitter term
+        // removed above, so this is the complete jitter-free screen-space
+        // motion (prevBone x prevVP - curBone x curVP).
+        prevPx = lerp(prevPx, curPxU + objectDeltaPx, w);
+        } else {
+          // Object-only: add the (confidence-scaled) object delta onto the
+          // depth-reprojected camera path (full MV = camera + object).
+          prevPx += objectDeltaPx * w;
+        }
+      }
     }
   }
 
@@ -190,7 +292,16 @@ void main(uint2 pix : SV_DispatchThreadID)
   //       subtraction is needed anymore (they are camera-path based).
   //   2   = MVJittered=1 (Test C): add the current jitter so the whole buffer
   //       is consistently jittered and DLSS removes it internally.
-  if (params2.z > 1.5f) {
+  //   3   = MVJittered=1 CHARACTER-ONLY (DLAAPhaseMVJitteredCharOnly): add the
+  //       current jitter to per-object pixels only; the camera path stays
+  //       jitter-free (Test C fixed the character but made the camera fallback
+  //       worse — this applies the jittered-MV treatment where it helped).
+  if (params2.z > 2.5f) {
+    if (hasObjectMotion) {
+      vel.x += params1.x * params0.x * 0.5f;
+      vel.y -= params1.y * params0.y * 0.5f;
+    }
+  } else if (params2.z > 1.5f) {
     vel.x += params1.x * params0.x * 0.5f;
     vel.y -= params1.y * params0.y * 0.5f;
   }
@@ -212,7 +323,7 @@ void main(uint2 pix : SV_DispatchThreadID)
   if (params2.y > 0.5f) vel = -vel;
   // MV Threshold: zero out sub-pixel noise (static dots) that poison history.
   // Camera (depth-reprojection) MVs use params2.x (DLAAMVThreshold);
-  // per-object / Prev-Bone MVs use params3.x (DLAAPerObjectMVThreshold).
+  // per-object / Prev-Bone MVs use params3.x (Per-Object Motion Deadband).
   float mvThresh = hasObjectMotion ? params3.x : params2.x;
   if (length(vel) < mvThresh) vel = float2(0.0, 0.0);
 
