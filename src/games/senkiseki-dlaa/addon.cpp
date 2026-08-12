@@ -122,6 +122,30 @@ static float g_phase_mv_threshold_object = 0.2f;  // per-object / Prev-Bone moti
                                                  // injected b13 cbuffer and breaks the boot PSs). Consumed only by
                                                  // BuildVelocityPC -> velocity compute params3.x.
 
+// ── CPU optimizations (A/B, all live — default OFF = current behavior).
+// Each can be enabled independently to measure its CPU saving with DLAA +
+// Per-Object motion. All are designed to be behavior-preserving; test each on
+// its own against the baseline (all Off). ──
+static float g_opt_promote_drawn_only = 0.f;  // OPT 1: CapturePrevBones promotes only snaps drawn this frame
+                                              // (an undrawn snap's cur is byte-identical to its last capture, so
+                                              // copying it to prev is a no-op).
+static float g_opt_bind_capture_only = 0.f;   // OPT 2: MaybeBindPatchedVs runs the per-instance prev-bone capture
+                                              // only on draws whose PS actually consumes the velocity encode
+                                              // (velocity-compatible G-buffer packer); other patched draws bind the
+                                              // identity placeholder (the encode is dropped there anyway).
+static float g_opt_watchdog_gate = 0.f;       // OPT 3: skip the per-draw watchdog stamp (mutex + format) unless
+                                              // DLAAPhaseBDump is on (the heartbeat is only written when dump is on).
+static float g_opt_depth_cache = 0.f;         // OPT 4: cache the _Globals buffer size at upload time (skips
+                                              // get_resource_desc per draw) and skip the depth-writer OM query when
+                                              // no depth-stencil is bound on the last OM bind.
+static float g_opt_shared_state = 0.f;        // OPT 5: query GetCurrentState ONCE per draw (draw hook) and reuse the
+                                              // VS/PS hashes across all per-draw helpers instead of ~6 state queries.
+static float g_opt_desc_cache = 0.f;          // OPT 6: OnPushDescriptorsCapture caches view handles already classified
+                                              // as "not a depth resource" so repeated t0/t1 pushes skip the
+                                              // get_resource_from_view + get_resource_desc lookups.
+static float g_opt_rec_map = 0.f;             // OPT 7: FindGlobalsRec uses an index map (handle -> rec) instead of a
+                                              // linear scan over up to 128 _Globals buffer records per lookup.
+
 // ── Descriptor table helpers ──
 // Sized for the velocity compute layout: 8 descriptor tables (s0, b13, t0,
 // t1, u0, t2, t3-history SRV, u1-history UAV) + push constants. The velocity
@@ -323,6 +347,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     uint32_t size = 0u;                    // byte size (== game bone buffer)
     uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
     uint64_t prev_capture_frame = 0u;      // frame the CURRENT prev_buffer content was captured (freshness)
+    // OPT 1: set at the draw-time cur capture, cleared at present after the
+    // promote. Lets CapturePrevBones promote exactly the snaps drawn this
+    // present cycle WITHOUT comparing frame counters (d->frame_index advances
+    // inside RunDLAA before present, so a counter comparison always fails).
+    bool drawn_since_last_present = false;
   };
   std::unordered_map<uint64_t, PrevBoneSnap> prev_bone_snaps;  // key = instance composite
   ID3D11ShaderResourceView* last_bound_twin_srv = nullptr;  // prev snap bound this draw (for restore)
@@ -368,6 +397,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool captured_scene_cbv_valid = false;
   reshade::api::resource_view captured_depth_srv = {};
   reshade::api::resource captured_depth_res = {};
+  // OPT 6: view handles already classified as NOT depth-format (skips repeated
+  // get_resource_from_view/get_resource_desc on the same texture at t0/t1).
+  std::unordered_set<uint64_t> non_depth_views;
   uint32_t depth_source_hash = 0u;  // PS hash that last pushed the captured depth (source identity)
   bool depth_primary_captured = false;  // a perspective (non-linear) depth was captured this frame
   // ── Frame-pairing diagnostic ──
@@ -416,8 +448,16 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     reshade::api::resource res = {};
     std::array<float, 16> unjittered_vp = {};
     bool depth_only = false;  // character depth/shadow pass buffer: keep VP UNJITTERED
+    uint64_t buffer_size = 0u;  // OPT 4/7: buffer byte size cached at upload time (skips get_resource_desc per draw)
   };
   std::vector<GlobalsBufferRec> globals_recs;
+  // OPT 7: handle -> index into globals_recs (always maintained on push_back;
+  // gives O(1) lookups in FindGlobalsRec instead of a linear scan over up to
+  // 128 records). Records are never erased, so indices stay valid.
+  std::unordered_map<uint64_t, uint32_t> globals_rec_index;
+  // OPT 5: per-draw VS/PS hashes, cached ONCE per draw by the draw hook and
+  // shared across all per-draw helpers when DLAAPhaseBSharedState is on.
+  uint32_t draw_vh = 0u, draw_ph = 0u;
   uint32_t globals_patch_count = 0;  // _Globals uploads captured this frame (diag)
   uint32_t globals_map_count = 0;    // large buffers mapped this frame (diag)
   reshade::api::resource last_b0_buffer = {};  // last b0 CB bound (global jitter writes VP here at draw time)
@@ -509,6 +549,24 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11Texture2D* motion_burst_staging = nullptr;
   uint32_t motion_burst_remaining = 0u;
 };
+
+// OPT 5: per-draw shader hashes. When DLAAPhaseBSharedState is on, the draw
+// hook queries GetCurrentState ONCE per draw and caches the VS/PS hashes in
+// DeviceData; every per-draw helper reads them through these accessors instead
+// of issuing its own GetCurrentState (a data-store lookup). When the toggle is
+// off they behave exactly as before (each caller queries state itself). NOTE:
+// only DRAW-hook helpers use these — push/event hooks query state directly
+// because their state can differ from the last draw.
+static uint32_t CurrentVsHash(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (g_opt_shared_state >= 0.5f && d) return d->draw_vh;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  return state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+}
+static uint32_t CurrentPsHash(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (g_opt_shared_state >= 0.5f && d) return d->draw_ph;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  return state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+}
 
 // ── Hang watchdog (full definitions live below WritePhasebDump; forward
 // declarations so the draw hooks + pipeline patcher + present can stamp the
@@ -1003,6 +1061,7 @@ static void MarkDepthBuffer(DeviceData* d, reshade::api::resource res) {
       d->globals_recs.push_back({});
       d->globals_recs.back().res = res;
       d->globals_recs.back().depth_only = true;
+      d->globals_rec_index[res.handle] = (uint32_t)(d->globals_recs.size() - 1u);
     }
     return;
   }
@@ -1031,8 +1090,7 @@ static bool EnsureEffectMask(reshade::api::device* dev, DeviceData* d, uint32_t 
 static void MaybeAppendEffectMask(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (shader_injection.dlaa_exclude_effects < 0.5f) return;
   if (!cmd_list || !d || !d->effect_mask_rtv.handle) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  uint32_t phash = CurrentPsHash(cmd_list, d);
   if (!IsEffectPs(phash)) return;
   auto* dev = cmd_list->get_device();
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -1326,9 +1384,8 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
 // all four targets are compatible before binding our dedicated RT3.
 static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  const uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
-  const uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  const uint32_t vh = CurrentVsHash(cmd_list, d);
+  const uint32_t ph = CurrentPsHash(cmd_list, d);
   const auto vit = d->patched_vs_by_hash.find(vh);
   const bool is_po_vs = vit != d->patched_vs_by_hash.end() && vit->second.emits_velocity;
   const bool is_phasee_candidate = d->phasee_ps_candidates.contains(ph);
@@ -1538,10 +1595,8 @@ static void UpdateMotionSrv(reshade::api::device* dev, DeviceData* d, reshade::a
 static void MaybeCaptureMotionRtv(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (g_phasee_enabled >= 0.5f || shader_injection.dlaa_per_object_motion < 0.5f) return;
   if (!cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  if (!state) return;
-  const uint32_t vh = renodx::utils::shader::GetCurrentVertexShaderHash(state);
-  const uint32_t ph = renodx::utils::shader::GetCurrentPixelShaderHash(state);
+  const uint32_t vh = CurrentVsHash(cmd_list, d);
+  const uint32_t ph = CurrentPsHash(cmd_list, d);
   // Capture candidate: patched VS that emitted velocity + velocity-compatible
   // PS — the draws whose o2/RT2 actually holds the per-object encode E.
   auto vit = d->patched_vs_by_hash.find(vh);
@@ -2160,8 +2215,16 @@ static void CapturePrevBones(reshade::api::command_list* cmd_list, DeviceData* d
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return;
   for (auto& [key, snap] : d->prev_bone_snaps) {
+    // OPT 1: an undrawn snap's cur is byte-identical to its last capture, so
+    // copying it to prev is a no-op — skip the copy and keep prev_capture_frame
+    // unchanged (the staleness guard sees the exact same age as today).
+    // The "drawn this present cycle" signal is the flag set at the actual
+    // draw-time capture (NOT a frame counter: d->frame_index advances inside
+    // RunDLAA before present, so a counter comparison always fails here).
+    if (g_opt_promote_drawn_only >= 0.5f && !snap.drawn_since_last_present) continue;
     if (snap.prev_buffer && snap.cur_buffer) ctx->CopyResource(snap.prev_buffer, snap.cur_buffer);
     snap.prev_capture_frame = snap.last_draw_frame;  // prev now holds the cur captured at this frame
+    snap.drawn_since_last_present = false;
   }
 }
 
@@ -2428,9 +2491,8 @@ static const std::string& GetPhasebDir();
 // crash reproduces with it off too, so the trace must not be gated by it).
 static void MaybeTraceCrashWindow(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (g_phaseb_dump < 0.5f || !cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
-  uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  uint32_t vh = CurrentVsHash(cmd_list, d);
+  uint32_t ph = CurrentPsHash(cmd_list, d);
   bool patched = d->patched_vs_by_hash.contains(vh);
   char line[160];
   snprintf(line, sizeof(line), "f=%u vs=0x%08X ps=0x%08X rtvs=%u%s%s",
@@ -2522,8 +2584,7 @@ static void MaybeRestorePatchedBinds(reshade::api::command_list* cmd_list, Devic
 // (bind_shader_resource_views is not in the public command_list API).
 static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  uint32_t vh = CurrentVsHash(cmd_list, d);
   auto it = d->patched_vs_by_hash.find(vh);
   if (it == d->patched_vs_by_hash.end()) return;
   // Ensure the prevVP cbuffer exists BEFORE binding (frame 0's first draw
@@ -2541,7 +2602,15 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   if (!EnsurePrevBonesSrv(cmd_list->get_device(), d)) return;
   ID3D11ShaderResourceView* bone_srv = d->prev_bones_srv;
   d->last_bound_twin_srv = nullptr;
-  if (shader_injection.dlaa_per_object_motion >= 0.5f) {
+  if (shader_injection.dlaa_per_object_motion >= 0.5f &&
+      (g_opt_bind_capture_only < 0.5f ||
+       d->velocity_compatible_ps_hashes.contains(CurrentPsHash(cmd_list, d)))) {
+    // OPT 2: when DLAAOptBindCaptureOnly is on, the per-instance prev-bone
+    // capture runs only on draws whose PS actually consumes the velocity encode
+    // (the velocity-compatible G-buffer packer set — the same gate
+    // MaybeCaptureMotionRtv uses). Depth/outline/low-res patched draws bind the
+    // identity placeholder instead (their encode is dropped), saving the key
+    // COM queries + a full-bone-buffer CopyResource on every patched draw.
     // Draw-time per-INSTANCE prev-bone capture. At this point the game has JUST
     // bound THIS frame's bone buffer at bone_game_slot (usually t0) — that
     // buffer holds frame N's bones RIGHT NOW. We CopyResource it into this
@@ -2694,6 +2763,11 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // FINAL pose = truly 1 frame old for the main-pass draws.
                 const uint64_t prev_last_draw = snap->last_draw_frame;
                 if (snap->cur_buffer) ctx->CopyResource(snap->cur_buffer, gb);
+                // OPT 1: mark this snap's cur as refreshed during THIS present
+                // cycle, so CapturePrevBones promotes exactly the snaps that
+                // were actually drawn (frame counters are unreliable at present
+                // time — see CapturePrevBones).
+                snap->drawn_since_last_present = true;
                 snap->last_draw_frame = d->frame_index;
                 // ── Staleness guard (round 21 + strict A/B): ──
                 // If the prev content is older than the allowed gap (the
@@ -2895,10 +2969,8 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
 // and whether the exclude toggle is 1 at draw time (VS gate should fire).
 static void MaybeLogEffectDraw(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  if (!state) return;
-  uint32_t vhash = renodx::utils::shader::GetCurrentVertexShaderHash(state);
-  uint32_t phash = renodx::utils::shader::GetCurrentPixelShaderHash(state);
+  uint32_t vhash = CurrentVsHash(cmd_list, d);
+  uint32_t phash = CurrentPsHash(cmd_list, d);
   if (!IsEffectVs(vhash) && !IsEffectPs(phash) && vhash != 0xDFE5A75Du) return;
   LogThrottled("effect-draw", reshade::log::level::info, 20u, 0u,
                "[DLAA] effect draw: vs=0x%08X ps=0x%08X exclude=%d rtvs=%u",
@@ -2943,6 +3015,11 @@ static bool IsDepthWriteDraw(reshade::api::command_list* cmd_list, DeviceData* d
   if (!d->captured_depth_res.handle) return false;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return false;
+  // OPT 4: the event-tracked last OM bind had no depth-stencil (and is current
+  // at draw time), so this draw cannot be a depth write — skip the
+  // OMGetRenderTargets query entirely. (When a DSV IS bound we still query, so
+  // the world-depth prepass vs color-pass distinction is never skipped.)
+  if (g_opt_depth_cache >= 0.5f && !d->last_dsv.handle) return false;
   ID3D11RenderTargetView* rtvs[8] = {};
   ID3D11DepthStencilView* dsv = nullptr;
   UINT num_rtvs = 8;
@@ -2978,9 +3055,18 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   }
   auto* dev = cmd_list->get_device();
   if (!dev) return;
-  auto rd = dev->get_resource_desc(d->last_b0_buffer);
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
+  uint32_t vh = CurrentVsHash(cmd_list, d);
+  // OPT 4/7: look the _Globals record up early and reuse the size cached at
+  // upload time, so tracked buffers skip the per-draw get_resource_desc.
+  auto* rec = (g_opt_depth_cache >= 0.5f || g_opt_rec_map >= 0.5f)
+                  ? FindGlobalsRec(d, d->last_b0_buffer)
+                  : nullptr;
+  uint64_t buf_size = (rec && rec->buffer_size) ? rec->buffer_size : 0ull;
+  if (buf_size == 0ull) {
+    auto rd = dev->get_resource_desc(d->last_b0_buffer);
+    if (rd.type != reshade::api::resource_type::buffer) return;
+    buf_size = rd.buffer.size;
+  }
   // ── Depth passes: keep the VP UNJITTERED so DLSS gets the game's native
   // depth. Two signals identify a depth-writing draw:
   //   * IsDepthVs(vh): known depth/shadow VSs (character draws + shadow maps
@@ -2997,28 +3083,28 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
       LogThrottled("depth-vs", reshade::log::level::info, 5u, 250u,
                    "[DLAA] global: DEPTH draw vs=0x%08X buffer=0x%llX size=%llu (unjittered)",
                    vh, (unsigned long long)d->last_b0_buffer.handle,
-                   (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull));
+                   (unsigned long long)buf_size);
     }
     return;  // depth pass reads the buffer's UNJITTERED VP (source patch skips it)
   }
-  if (rd.type != reshade::api::resource_type::buffer || rd.buffer.size < 768ull) {
+  if (buf_size < 768ull) {
     if (shader_injection.dlaa_debug_logging > 0.5f) {
       LogThrottled("draw-skip-small", reshade::log::level::info, 20u, 250u,
                    "[DLAA] global: draw SKIP small buffer=0x%llX size=%llu vs=0x%08X",
                    (unsigned long long)d->last_b0_buffer.handle,
-                   (unsigned long long)(rd.type == reshade::api::resource_type::buffer ? rd.buffer.size : 0ull),
-                   vh);
+                   (unsigned long long)buf_size, vh);
     }
     return;
   }
-  uint32_t phash = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  uint32_t phash = CurrentPsHash(cmd_list, d);
   bool want_jittered = !IsEffectPs(phash);
   // Scene draw on a tracked (source-patched) buffer: already jittered, leave it.
   // EXCEPT depth_only buffers: those are the character's shared b0 (marked by
   // the depth/shadow pass), whose upload the source patch left UNJITTERED — so
   // the G-buffer draw must jitter it here, or the character rasterizes unjittered
   // while the per-object velocity path subtracts jitter -> MV error -> shake.
-  auto* rec = FindGlobalsRec(d, d->last_b0_buffer);
+  if (g_opt_depth_cache < 0.5f && g_opt_rec_map < 0.5f)
+    rec = FindGlobalsRec(d, d->last_b0_buffer);
   if (want_jittered && rec && !rec->depth_only) return;
   // Choose the VP to write: this buffer's own unjittered VP when known (effect
   // un-jitter / depth_only G-buffer jitter), else the global captured VP
@@ -3036,7 +3122,7 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
     LogThrottled("vp-write", reshade::log::level::info, 5u, 250u,
                  "[DLAA] global: draw VP write buffer=0x%llX size=%llu jittered=%d depth_only=%d ps=0x%08X",
                  (unsigned long long)d->last_b0_buffer.handle,
-                 (unsigned long long)rd.buffer.size, (int)want_jittered,
+                 (unsigned long long)buf_size, (int)want_jittered,
                  (int)(rec && rec->depth_only), phash);
   }
 }
@@ -3056,9 +3142,8 @@ static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d)
 // from the general DLAA debug spam).
 static void MaybeLogOmState(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f || !cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  const uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
-  const uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  const uint32_t vh = CurrentVsHash(cmd_list, d);
+  const uint32_t ph = CurrentPsHash(cmd_list, d);
   const bool is_po_vs = d->patched_vs_by_hash.contains(vh) || IsPerObjectMotionVs(vh);
   const bool is_phasee_candidate = d->phasee_ps_candidates.contains(ph);
   if (!is_po_vs && !is_phasee_candidate) return;
@@ -3122,6 +3207,14 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
+    // OPT 5: query the current pipeline state ONCE per draw and share the VS/PS
+    // hashes with all per-draw helpers (the hook never changes pipeline state,
+    // so every helper sees the same hashes).
+    if (g_opt_shared_state >= 0.5f) {
+      auto* st = renodx::utils::shader::GetCurrentState(cmd_list);
+      d->draw_vh = st ? renodx::utils::shader::GetCurrentVertexShaderHash(st) : 0u;
+      d->draw_ph = st ? renodx::utils::shader::GetCurrentPixelShaderHash(st) : 0u;
+    }
     WatchdogStampDraw(cmd_list, d, "enter");
     MaybeRestorePatchedBinds(cmd_list, d);
     Phase0ProbeDraw(cmd_list, d);
@@ -3143,6 +3236,14 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
+    // OPT 5: query the current pipeline state ONCE per draw and share the VS/PS
+    // hashes with all per-draw helpers (the hook never changes pipeline state,
+    // so every helper sees the same hashes).
+    if (g_opt_shared_state >= 0.5f) {
+      auto* st = renodx::utils::shader::GetCurrentState(cmd_list);
+      d->draw_vh = st ? renodx::utils::shader::GetCurrentVertexShaderHash(st) : 0u;
+      d->draw_ph = st ? renodx::utils::shader::GetCurrentPixelShaderHash(st) : 0u;
+    }
     WatchdogStampDraw(cmd_list, d, "enter");
     MaybeRestorePatchedBinds(cmd_list, d);
     Phase0ProbeDraw(cmd_list, d);
@@ -3542,11 +3643,9 @@ static void Phase0ProbeVertexSrv(reshade::api::device* dev, reshade::api::comman
 static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (shader_injection.dlaa_phase0_logging < 0.5f) return;
   if (!cmd_list || !d) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  if (!state) return;
-  uint32_t vhash = renodx::utils::shader::GetCurrentVertexShaderHash(state);
+  uint32_t vhash = CurrentVsHash(cmd_list, d);
   if (!IsPerObjectMotionVs(vhash)) return;
-  uint32_t phash = renodx::utils::shader::GetCurrentPixelShaderHash(state);
+  uint32_t phash = CurrentPsHash(cmd_list, d);
 
   // Skinned = a bone SRV was seen for this VS; World-only = none (no entry).
   auto it = d->p0_vs_bone_handle.find(vhash);
@@ -3689,13 +3788,20 @@ static void OnPushDescriptorsCapture(
     // over R32/R16 variants (41/53/54/56), which are usually LINEAR/processed depth
     // that cannot be used as clip-space Z/W (shows all-white in the Depth view).
     if ((update.binding == 0u || update.binding == 1u)
-        && update.count >= 1 && views[0].handle != 0u) {
+        && update.count >= 1 && views[0].handle != 0u &&
+        !(g_opt_desc_cache >= 0.5f && d->non_depth_views.count(views[0].handle) != 0u)) {
+      // OPT 6: a view already classified as NOT depth-format (the common case —
+      // material/color textures at t0/t1) skips the two map lookups
+      // (get_resource_from_view + get_resource_desc) on every repeat push of
+      // the same texture. Formats never change, so this cache is persistent.
       auto res = dev->get_resource_from_view(views[0]);
       if (res.handle) {
         auto rd = dev->get_resource_desc(res);
         int fmt = (int)rd.texture.format;
         bool is_primary = (fmt == 40 || fmt == 44 || fmt == 45 || fmt == 46);
         bool is_fallback = (fmt == 41 || fmt == 53 || fmt == 54 || fmt == 56);
+        if (g_opt_desc_cache >= 0.5f && !is_primary && !is_fallback)
+          d->non_depth_views.insert(views[0].handle);
         if ((is_primary || is_fallback)
             && (float)rd.texture.width == d->swapchain_w
             && (float)rd.texture.height == d->swapchain_h) {
@@ -3788,6 +3894,14 @@ static void OnPushDescriptorsCapture(
 // the unjittered VP here (before the upload lands) and re-issue the upload with
 // the jittered VP. This works for EVERY scene VS permutation.
 static DeviceData::GlobalsBufferRec* FindGlobalsRec(DeviceData* d, reshade::api::resource res) {
+  // OPT 4/7: index-map lookup (handle -> vector index) instead of a linear scan
+  // over up to 128 records. The index is always maintained on push_back, so the
+  // map path is exact (records are never erased, indices stay valid).
+  if (g_opt_rec_map >= 0.5f || g_opt_depth_cache >= 0.5f) {
+    auto it = d->globals_rec_index.find(res.handle);
+    if (it == d->globals_rec_index.end()) return nullptr;
+    return &d->globals_recs[it->second];
+  }
   for (auto& rec : d->globals_recs)
     if (rec.res.handle == res.handle) return &rec;
   return nullptr;
@@ -3843,9 +3957,12 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
       d->globals_recs.push_back({});
       d->globals_recs.back().res = dest;
       d->globals_recs.back().unjittered_vp = d->globals_unjittered_vp;
+      d->globals_recs.back().buffer_size = rd.buffer.size;
+      d->globals_rec_index[dest.handle] = (uint32_t)(d->globals_recs.size() - 1u);
     }
   } else {
     rec->unjittered_vp = d->globals_unjittered_vp;
+    rec->buffer_size = rd.buffer.size;
   }
   // ── Character depth/shadow pass buffers: keep VP UNJITTERED ──
   // The depth VSs (DEPTH_VS_HASHES) write the character's depth into the main
@@ -4571,7 +4688,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "DLAAHdrInject", .binding = &shader_injection.dlaa_hdr_inject,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
+        .default_value = 2.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
         .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (_renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
         .labels = {"Auto","Pre-ToneMap","Composite"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
@@ -4677,6 +4794,56 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Phase B Evidence Dump", .section = "Antialiasing",
         .tooltip = "Write every patched VS's original + patched bytecode (0x<hash>.cso / 0x<new>.patched.cso) and a per-draw crash trace (drawtrace.log) to renodx-dev/dump/phaseb/. The LAST drawtrace line before a GPU TDR identifies the crashing draw.",
+        .labels = {"Off","On"},
+    },
+    // ── CPU optimizations (A/B, live — enable ONE at a time against baseline) ──
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptPromoteDrawnOnly", .binding = &g_opt_promote_drawn_only,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 1: Promote Only Drawn Snaps", .section = "Antialiasing",
+        .tooltip = "CPU opt 1: at present, only CopyResource(cur->prev) for prev-bone snapshots whose instance was drawn this frame. An undrawn snap's cur is byte-identical to its last capture, so the copy is a no-op — this removes hundreds of D3D11 copy commands per present with no content change. Live.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptBindCaptureOnly", .binding = &g_opt_bind_capture_only,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 2: Capture Bones Only on G-Buffer", .section = "Antialiasing",
+        .tooltip = "CPU opt 2: only run the per-instance prev-bone capture in MaybeBindPatchedVs on draws whose PS actually consumes the velocity encode (velocity-compatible packer PS). Depth/outline/low-res patched draws bind the identity placeholder instead (the encode is dropped there), saving the key COM queries + a full-bone-buffer CopyResource on every patched draw. Live.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptWatchdogGate", .binding = &g_opt_watchdog_gate,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 3: Gate Watchdog Stamps", .section = "Antialiasing",
+        .tooltip = "CPU opt 3: skip the per-draw watchdog stamp (mutex + vsnprintf, x2 per draw) unless DLAAPhaseBDump is on. The heartbeat file is only written when dump is on, so the stamp is dead weight otherwise. Live.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptDepthCache", .binding = &g_opt_depth_cache,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 4: Cache Depth-Writer Check", .section = "Antialiasing",
+        .tooltip = "CPU opt 4: cache the _Globals buffer size at upload time (skips get_resource_desc per draw for tracked buffers) and skip the OMGetRenderTargets depth-writer query when no depth-stencil is bound (event-tracked last OM bind, current at draw time). Draws WITH a DSV still query, so the world-depth prepass vs color-pass distinction is never skipped. Live.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptSharedState", .binding = &g_opt_shared_state,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 5: Shared Per-Draw State", .section = "Antialiasing",
+        .tooltip = "CPU opt 5: query GetCurrentState ONCE per draw in the draw hook and share the VS/PS hashes across all per-draw helpers, instead of ~6 redundant state lookups per draw. Live.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptDescCache", .binding = &g_opt_desc_cache,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 6: Cache Non-Depth Views", .section = "Antialiasing",
+        .tooltip = "CPU opt 6: OnPushDescriptorsCapture caches view handles already classified as NOT depth-format, so repeated t0/t1 pushes of the same material/color texture skip get_resource_from_view + get_resource_desc. Persistent (resource formats don't change). Live.",
+        .labels = {"Off","On"},
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptRecMap", .binding = &g_opt_rec_map,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 7: _Globals Rec Index Map", .section = "Antialiasing",
+        .tooltip = "CPU opt 7: FindGlobalsRec uses a handle->index map instead of a linear scan over up to 128 _Globals buffer records on every upload/draw lookup. Live.",
         .labels = {"Off","On"},
     },
 };
@@ -4857,6 +5024,9 @@ static std::string WatchdogPath() {
 
 static void WatchdogSet(DeviceData* d, const char* fmt, ...) {
   if (!d || !d->watchdog_running.load()) return;
+  // OPT 3: the heartbeat is only ever written when DLAAPhaseBDump is on, so
+  // skip the mutex lock + formatting on every draw in normal use.
+  if (g_opt_watchdog_gate >= 0.5f && g_phaseb_dump < 0.5f) return;
   char buf[512];
   va_list args;
   va_start(args, fmt);
@@ -4870,9 +5040,11 @@ static void WatchdogSet(DeviceData* d, const char* fmt, ...) {
 
 static void WatchdogStampDraw(reshade::api::command_list* cmd_list, DeviceData* d, const char* tag) {
   if (!d || !d->watchdog_running.load()) return;
-  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
-  uint32_t vh = state ? renodx::utils::shader::GetCurrentVertexShaderHash(state) : 0u;
-  uint32_t ph = state ? renodx::utils::shader::GetCurrentPixelShaderHash(state) : 0u;
+  // OPT 3: also skip the per-draw state query when the stamp itself is gated
+  // off (the heartbeat file is only written with DLAAPhaseBDump on).
+  if (g_opt_watchdog_gate >= 0.5f && g_phaseb_dump < 0.5f) return;
+  uint32_t vh = CurrentVsHash(cmd_list, d);
+  uint32_t ph = CurrentPsHash(cmd_list, d);
   WatchdogSet(d, "draw %s vs=0x%08X ps=0x%08X", tag, vh, ph);
 }
 
