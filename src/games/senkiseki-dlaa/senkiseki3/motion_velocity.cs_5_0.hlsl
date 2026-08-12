@@ -31,11 +31,9 @@
 //   c[4..7]  = curViewProjInverse (4x4 row-major)
 //   c[8]     = VP_WIDTH, VP_HEIGHT, VELOCITY_SCALE, DEBUG_VIEW
 //   c[9]     = JITTER_X(NDC), JITTER_Y(NDC), PER_OBJECT_MOTION, ZERO_MV
-//   c[10]    = MV_THRESHOLD(px), MV_DIRECTION(flip), MV_MODE, EXCLUDE_EFFECTS
-//              MV_MODE: 0=MVJittered=0 no per-object subtract (B), 1=MVJittered=0
-//              subtract (A, current), 2=MVJittered=1 whole buffer jittered (C)
-//   c[11]    = OBJECT_MV_THRESHOLD(px), PREV_JITTER_X, PREV_JITTER_Y, JITTER_IN_MV
-//   c[12]    = DEPTH_SAMPLE_UNJIT, SYNTH_JITTER_MV, FULL_MV_MODE, GLOBAL_JITTER
+//   c[10]    = MV_THRESHOLD(px), reserved, reserved, EXCLUDE_EFFECTS
+//   c[11]    = OBJECT_MV_THRESHOLD(px), reserved, reserved, reserved
+//   c[12]    = reserved, reserved, FULL_MV_MODE, reserved
 //   c[13]    = STATIC_CAMERA_SC, OBJECT_DELTA_DIRECT, MAX_VP_DELTA, (unused)
 //
 // SPDX-License-Identifier: MIT
@@ -50,9 +48,9 @@ cbuffer cb_push : register(b13) {
   float4x4 curViewProjInv;
   float4 params0;   // x=vp_w, y=vp_h, z=velocity_scale, w=debug_view
   float4 params1;   // x=jitter_x(NDC), y=jitter_y(NDC), z=per_object_motion, w=zero_mv
-  float4 params2;   // x=mv_threshold(px), y=mv_direction(flip), z=mv_mode, w=exclude_effects
-  float4 params3;   // x=mv_threshold_object(px), y=prev_jitter_x(NDC), z=prev_jitter_y(NDC), w=jitter_in_mv
-  float4 params4;   // x=depth_sample_unjit, y=synth_jitter_mv, z=full_mv_mode, w=global_jitter
+  float4 params2;   // x=mv_threshold(px), w=exclude_effects
+  float4 params3;   // x=mv_threshold_object(px)
+  float4 params4;   // z=full_mv_mode
   float4 params5;   // x=static_camera_shortcircuit, y=object_delta_direct,
                     // z=max_vp_delta (|prevVP-curVP| max; < 1e-4 => camera still),
                     // w=dedicated Phase E source
@@ -64,24 +62,6 @@ void main(uint2 pix : SV_DispatchThreadID)
   uint w = (uint)params0.x;
   uint h = (uint)params0.y;
   if (pix.x >= w || pix.y >= h) return;
-
-  // DLAAPhaseSynthMV (params4.y): synthetic MV test — bypass depth reprojection
-  // entirely and write an ANALYTIC global MV, so we can establish the correct
-  // jitter-delta MV + sign in the reproj debug view without DLSS/depth/matrices.
-  //   1 = zero everywhere (Test A)
-  //   2 = Jcur - Jprev  (pixel-space, y-down)
-  //   3 = Jprev - Jcur  (flipped sign)
-  if (params4.y > 0.5f) {
-    float2 synth = 0.0;
-    if (params4.y > 1.5f) {
-      // Jcur - Jprev in y-down px: x = (jx - prevJx)*w/2, y = -(jy - prevJy)*h/2
-      synth.x = (params1.x - params3.y) * params0.x * 0.5f;
-      synth.y = -(params1.y - params3.z) * params0.y * 0.5f;
-      if (params4.y > 2.5f) synth = -synth;
-    }
-    g_outVelocity[pix] = synth;
-    return;
-  }
 
   // Current pixel center in screen space (y-down)
   float2 curPx = float2(pix) + 0.5;
@@ -180,7 +160,7 @@ void main(uint2 pix : SV_DispatchThreadID)
     // moving character keeps its real small per-frame delta. Per-VS jitter is
     // applied after this injected reconstruction, so it does not need this
     // correction.
-    if (hasObjectMotion && params4.z > 0.5f && params4.w > 0.5f)
+    if (hasObjectMotion && params4.z > 0.5f)
       objectDeltaPx += jitterPx;
   }
 
@@ -195,18 +175,7 @@ void main(uint2 pix : SV_DispatchThreadID)
     // yellow/purple HSV spots). Skip it: prevPx stays curPxU -> static content
     // gets EXACTLY zero velocity at the source, no threshold needed.
     if (!(params5.x > 0.5f && params5.z < 0.0001f)) {
-      // DLAAPhaseDepthSampleUnjit (params4.x): the depth buffer is UNJITTERED
-      // (our depth_only fix), so depth[pix] belongs to the content at UNJITTERED
-      // position pix, NOT at curPxU = pix - jitterPx. Sampling at pix therefore
-      // misreads the depth by up to half a pixel whenever jitter is on, injecting
-      // a per-frame MV error DLSS can't compensate. Sample at the UNJITTERED pixel
-      // (curPxU, rounded to the nearest texel) so depth and position agree.
-      int2 depthPix = int2(pix);
-      if (params4.x > 0.5f) {
-        depthPix = int2(round(curPxU));
-        depthPix = clamp(depthPix, int2(0, 0), int2((int)w - 1, (int)h - 1));
-      }
-      float depth = g_srcDepth.Load(int3(depthPix, 0));
+      float depth = g_srcDepth.Load(int3(pix, 0));
 
       // NDC (y-up) from the UNJITTERED pixel position
       float2 ndc = (curPxU / float2(w, h)) * 2.0 - 1.0;
@@ -287,40 +256,9 @@ void main(uint2 pix : SV_DispatchThreadID)
   //    curPx-based full-MV path picked up the content shift and subtracted it).
   // DLSS receives the same jitter via InJitterOffset (MVJittered=0).
   float2 vel = (curPxU - prevPx) * params0.z;
-  // params2.z = MV jitter mode (DLAAPhaseMVJittered / DLAAPhaseMVComp):
-  //   0/1 = MVJittered=0 (Tests A/B): the buffer is jitter-free — no per-object
-  //       subtraction is needed anymore (they are camera-path based).
-  //   2   = MVJittered=1 (Test C): add the current jitter so the whole buffer
-  //       is consistently jittered and DLSS removes it internally.
-  //   3   = MVJittered=1 CHARACTER-ONLY (DLAAPhaseMVJitteredCharOnly): add the
-  //       current jitter to per-object pixels only; the camera path stays
-  //       jitter-free (Test C fixed the character but made the camera fallback
-  //       worse — this applies the jittered-MV treatment where it helped).
-  if (params2.z > 2.5f) {
-    if (hasObjectMotion) {
-      vel.x += params1.x * params0.x * 0.5f;
-      vel.y -= params1.y * params0.y * 0.5f;
-    }
-  } else if (params2.z > 1.5f) {
-    vel.x += params1.x * params0.x * 0.5f;
-    vel.y -= params1.y * params0.y * 0.5f;
-  }
-  // DIAGNOSTIC (DLAAPhaseJitterInMV, params3.w): this DLSS runtime IGNORES the
-  // NGX jitter offset (report 0 vs real = identical), so the per-frame jitter
-  // reads as unresolvable sub-pixel motion -> shimmer, worst at low FPS. Bake the
-  // jitter DELTA (current - previous frame, px) into the MVs so DLSS's MV-based
-  // reprojection aligns the jittered history. Base MVs must be jitter-free for
-  // this to be exact: camera via curPxU, per-object via the Test A subtraction
-  // above (params2.z ~ 1). At static: vel = jitterCur - jitterPrev, which maps the
-  // content at the current jittered pixel back to its previous jittered position.
-  if (params3.w > 0.5f) {
-    vel.x += (params1.x - params3.y) * params0.x * 0.5f;   // (jx - prevJx) * w/2
-    vel.y -= (params1.y - params3.z) * params0.y * 0.5f;   // -(jy - prevJy) * h/2
-  }
   // Zero-MV A/B: force all motion vectors to 0 (isolates whether MVs help or hurt).
   if (params1.w > 0.5f) vel = float2(0.0, 0.0);
-  // MV Direction A/B: flip sign (previous-current instead of current-previous).
-  if (params2.y > 0.5f) vel = -vel;
+  vel = -vel;
   // MV Threshold: zero out sub-pixel noise (static dots) that poison history.
   // Camera (depth-reprojection) MVs use params2.x (DLAAMVThreshold);
   // per-object / Prev-Bone MVs use params3.x (Per-Object Motion Deadband).

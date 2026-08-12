@@ -10,11 +10,11 @@ struct ShaderInjectData {
   float dlaa_enabled;              // 0=Off, 1=FXAA (game luma FXAA), 2=DLAA
   float dlaa_preset;               // DLSS preset: 0=Default, 1=F, 2=J, 3=K, 4=L, 5=M
   float dlaa_jitter_enabled;       // 0=Off, 1=On — camera projection jitter
-  float dlaa_jitter_sign;          // NGX jitter sign: 0=FlipBoth, 1=FlipX, 2=FlipY, 3=Current
-  float dlaa_jitter_test;          // 0=Off, 1=On — 8px fixed viewport shift to verify rasterization jitter
+  float reserved0;                 // ABI padding (former jitter diagnostics)
+  float reserved1;                 // ABI padding (former jitter diagnostics)
   float dlaa_force_reset;          // 0=Off, 1=On — force NGX InReset=1 every frame (no history)
   float dlaa_zero_mv;              // 0=Off, 1=On — force all motion vectors to 0 (A/B: MVs help?)
-  float dlaa_mv_direction;         // 0=Off, 1=On — flip MV sign (previous-current vs current-previous)
+  float reserved2;                 // ABI padding (former MV direction setting)
   float dlaa_mv_threshold;         // px — zero out MVs below this magnitude (kills static noise)
   float dlaa_depth_source;         // 0=Auto (last full-res depth push), 1..3 = hash-gate to a pass
   float dlaa_per_object_motion;    // 0=Off, 1=On — per-object MV from VS injection
@@ -43,8 +43,7 @@ struct ShaderInjectData {
   // ── Effect/particle exclusion (read by the velocity compute via push constants) ──
   float dlaa_exclude_effects;  // 0=Off, 1=On — mask particles/effects out of DLAA (invalid-MV opt-out)
 
-  // ── Jitter method (addon-side; read by the addon + VS injection) ──
-  float dlaa_jitter_method;    // 0=Per VS (jitter inside replaced VSs), 1=Global (patch shared ViewProjection)
+  float reserved3;             // ABI padding (global jitter is now unconditional)
 
   // ── Phase 0 probe logging (addon-side only; NOT read by shaders) ──
   // Separate toggle from dlaa_debug_logging so the prev-pose feasibility probe
@@ -62,7 +61,7 @@ struct ShaderInjectData {
   float dlaa_phaseb_debug_logging;  // 0=Off, 1=On — Phase B / per-object-motion logs
 
   // ── HDR-mod compatibility (addon-side only; NOT read by shaders) ──
-  float dlaa_hdr_decode;       // 0=Off, 1=sRGB, 2=PQ — DLSS input/output color conversion (composite path)
+  float reserved4;             // ABI padding (former HDR decode setting)
   float dlaa_hdr_inject;       // 0=Auto, 1=Pre-ToneMap (final_blending, raw scene), 2=Composite (FXAA)
   float dlaa_hdr_float_out;    // 0=Off, 1=On — DLSS output r16g16b16a16_float (unclamped highlights)
 
@@ -96,7 +95,6 @@ cbuffer shader_injection : register(b13) {
 #define DLAA_JITTER_X             shader_injection_data.jitter_offset_x
 #define DLAA_JITTER_Y             shader_injection_data.jitter_offset_y
 #define DLAA_EXCLUDE_EFFECTS      shader_injection_data.dlaa_exclude_effects
-#define DLAA_JITTER_METHOD        shader_injection_data.dlaa_jitter_method
 
 #endif
 

@@ -1870,9 +1870,9 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   // cb0[GameEdgeParameters]. Most char VSs DECLARE GameEdgeParameters in RDEF
   // but never read it (the outline is a separate pass), and injecting the
   // offset into prevClip there adds a fixed world-space MV bias: sub-pixel far
-  // away but MANY pixels up close -> near-character detail loss + jitter (user
-  // confirmed DLAAPhaseBOutline=0 removes it). Gating on real usage is generic
-  // and keeps the offset for genuinely-outlined shaders only.
+  // away but MANY pixels up close -> near-character detail loss + jitter.
+  // Gating on real usage is generic and keeps the offset for genuinely-outlined
+  // shaders only.
   if (outline) {
     const bool edge_read =
         std::find(scan.cb_reads.begin(), scan.cb_reads.end(),
