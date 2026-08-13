@@ -4103,6 +4103,8 @@ static std::array<float, 56> BuildVelocityPC(DeviceData* d) {
 }
 
 // ── DLAA dispatch ──
+static bool HdrFinalPathActive(reshade::api::command_list* cmd_list);  // defined below
+
 static bool RunDLAA(reshade::api::command_list* cmd_list) {
   auto* dev = cmd_list->get_device();
   if (!dev) return false;
@@ -4188,11 +4190,15 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   senkiseki3::dlss::dlss_flag_is_hdr = shader_injection.dlaa_flag_is_hdr;
   senkiseki3::dlss::dlss_flag_depth_inverted = shader_injection.dlaa_flag_depth_inverted;
   senkiseki3::dlss::dlss_flag_auto_exposure = shader_injection.dlaa_flag_auto_exposure;
-  // DLSS output format: r16g16b16a16_float when the toggle is on, so the HDR
-  // mod's final_blending tone maps UNCLAMPED values (8-bit UNORM clamps
-  // highlights before the tone map -> clipping/banding).
-  senkiseki3::dlss::dlss_output_format = (shader_injection.dlaa_hdr_float_out > 0.5f)
-      ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+  // DLSS output format. On the COMPOSITE path (no pre-tone-map) the DLAA image
+  // is copied straight into the FXAA output target (RTV0, 8-bit SDR), so DLSS
+  // must write 8-bit UNORM for the native copy to match formats. The float
+  // output toggle only matters on the pre-tone-map path, where the HDR mod's
+  // final_blending tone maps UNCLAMPED values (8-bit UNORM clamps highlights
+  // before the tone map -> clipping/banding).
+  senkiseki3::dlss::dlss_output_format =
+      (HdrFinalPathActive(cmd_list) && shader_injection.dlaa_hdr_float_out > 0.5f)
+          ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
 
   // DLAA evaluate (only when all resources ready + NGX supported). The gate and
   // matrices status are logged UNCONDITIONALLY so a crash log always shows why
@@ -4567,7 +4573,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAEnabled", .binding = &shader_injection.dlaa_enabled,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 2.f, .label = "Anti-Aliasing", .section = "Antialiasing",
-        .tooltip = "Off: no anti-aliasing (FXAA replaced by a passthrough). FXAA: the game's original luma FXAA. DLAA: NVIDIA DLAA (requires nvngx_dlss.dll).", .labels = {"Off", "FXAA", "DLAA"},
+        .tooltip = "Off: no anti-aliasing (FXAA pass skipped, native copy). FXAA: the game's original FXAA (no replacement). DLAA: NVIDIA DLAA (requires nvngx_dlss.dll).", .labels = {"Off", "FXAA", "DLAA"},
     },
     new renodx::utils::settings::Setting{
         .key = "DLAAPreset", .binding = &shader_injection.dlaa_preset,
@@ -4848,23 +4854,114 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
-// ── Draw hook: FXAA replacement ──
-// DLAA output replaces t0 content; FXAA reads it and composites to RTV0
+// ── Draw hook: FXAA pass (0x96BB8CFF) ──
+// No shader is replaced anymore: OnBeforeFxaaDraw either lets the game's own
+// FXAA run (FXAA mode), or native-copies the current t0 into RTV0 and skips the
+// draw (Off/DLAA mode). The FXAA entry is code-less, so nothing is injected.
 static bool HdrFinalPathActive(reshade::api::command_list* cmd_list);  // defined below
 
+// ── Final composite -> RTV0 native copy (NO injected shader) ──
+// Copies the current PS t0 (the composite, or the DLAA/tonemapped output
+// depending on the injection point) into the FXAA output target (RTV0) with a
+// native CopyResource, so the FXAA draw can be skipped entirely. Returns true
+// when the copy succeeded (caller should skip the draw); false when validation
+// failed (caller should let the game's FXAA run instead).
+static bool CopyFinalToRtv0(reshade::api::command_list* cmd_list, DeviceData* d) {
+  auto* dev = cmd_list->get_device();
+  if (!dev) return false;
+  auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!cl) return false;
+
+  // Source: the live PS t0 the game bound for this draw.
+  ID3D11ShaderResourceView* t0_srv = nullptr;
+  cl->PSGetShaderResources(0, 1, &t0_srv);
+  if (!t0_srv) return false;
+  ID3D11Resource* src = nullptr;
+  t0_srv->GetResource(&src);
+  if (!src) { t0_srv->Release(); return false; }
+
+  // Destination: the live OM RTV0 (fallback: the tracked FXAA output target).
+  ID3D11RenderTargetView* om_rtvs[8] = {};
+  ID3D11DepthStencilView* om_dsv = nullptr;
+  UINT om_num = 0;
+  cl->OMGetRenderTargets(8, om_rtvs, &om_dsv);
+  ID3D11Resource* dst = nullptr;
+  if (om_num >= 1 && om_rtvs[0]) om_rtvs[0]->GetResource(&dst);
+  if (!dst && d && d->captured_rtv0_res.handle)
+    dst = reinterpret_cast<ID3D11Resource*>(d->captured_rtv0_res.handle);
+  if (!dst) {
+    if (src) src->Release();
+    if (t0_srv) t0_srv->Release();
+    for (UINT i = 0; i < om_num; ++i) if (om_rtvs[i]) om_rtvs[i]->Release();
+    if (om_dsv) om_dsv->Release();
+    return false;
+  }
+
+  bool ok = false;
+  if (src == dst) {
+    ok = true;  // already the target — nothing to copy
+  } else {
+    D3D11_TEXTURE2D_DESC sd = {}, dd = {};
+    ID3D11Texture2D* st = nullptr;
+    ID3D11Texture2D* dt = nullptr;
+    if (SUCCEEDED(src->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&st)) &&
+        SUCCEEDED(dst->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&dt))) {
+      st->GetDesc(&sd);
+      dt->GetDesc(&dd);
+      if (sd.SampleDesc.Count == 1 && dd.SampleDesc.Count == 1 &&
+          sd.Width == dd.Width && sd.Height == dd.Height &&
+          sd.Format == dd.Format &&
+          sd.MipLevels == dd.MipLevels && sd.ArraySize == dd.ArraySize) {
+        // Unbind the source SRV and the OM render targets so CopyResource has
+        // no in-flight hazards, then restore the state the game set for this
+        // draw (the next pass rebinds whatever it needs either way).
+        ID3D11ShaderResourceView* null_srv = nullptr;
+        cl->PSSetShaderResources(0, 1, &null_srv);
+        cl->OMSetRenderTargets(0, nullptr, nullptr);
+        cl->CopyResource(dst, src);
+        cl->OMSetRenderTargets(om_num, om_rtvs, om_dsv);
+        cl->PSSetShaderResources(0, 1, &t0_srv);
+        ok = true;
+      }
+    }
+    if (st) st->Release();
+    if (dt) dt->Release();
+  }
+
+  if (src) src->Release();
+  if (t0_srv) t0_srv->Release();
+  for (UINT i = 0; i < om_num; ++i) if (om_rtvs[i]) om_rtvs[i]->Release();
+  if (om_dsv) om_dsv->Release();
+  return ok;
+}
+
 static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
-  if (shader_injection.dlaa_enabled < 1.5f) return true;  // DLAA only (mode 2)
-  // HDR pre-tone-map path (DLAAHdrInject): DLSS already ran at the final_blending
-  // draw, so the FXAA replacement just passthroughs the tone-mapped composite to
-  // RTV0. Fallback: if no final_blending draw ran DLSS this frame (e.g. a final
-  // variant we don't hook), run DLSS here on the composite as before.
+  auto* dev = cmd_list->get_device();
+  auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
+
+  // AA=Off: passthrough — native-copy the composite (t0) into RTV0 and skip the
+  // game's FXAA draw (no injected shader).
+  if (shader_injection.dlaa_enabled < 0.5f)
+    return !CopyFinalToRtv0(cmd_list, d);
+
+  // AA=FXAA: run the game's ORIGINAL FXAA — no replacement, no injection.
+  if (shader_injection.dlaa_enabled < 1.5f)
+    return true;
+
+  // AA=DLAA: run DLSS (unless the pre-tone-map final_blending draw already ran
+  // it this frame), then native-copy the DLAA'd image into RTV0 and skip the
+  // FXAA draw so the game's FXAA does not re-AA the DLSS output.
   if (HdrFinalPathActive(cmd_list)) {
-    auto* dev = cmd_list->get_device();
-    auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
-    if (d && d->dlaa_ran_this_frame) return true;
+    if (d && d->dlaa_ran_this_frame) {
+      // DLSS ran at final_blending; the HDR mod's final_blending then tone-mapped
+      // the DLAA output into the composite (t0). Copy that out.
+      return !CopyFinalToRtv0(cmd_list, d);
+    }
+    // Fallback: no final_blending draw ran DLSS this frame (e.g. a final variant
+    // we don't hook) — run DLSS here on the composite as before.
   }
   RunDLAA(cmd_list);
-  return true;  // Always let FXAA run — it composites our DLAA'd t0 to RTV0
+  return !CopyFinalToRtv0(cmd_list, d);
 }
 
 // ── HDR pre-tone-map path (DLAAHdrInject) ──
@@ -4926,24 +5023,27 @@ static constexpr std::array<uint32_t, 138> FINAL_BLENDING_HASHES = {
     0xEC64A31Au, 0xEFAC375Cu, 0xEFC9A329u,
 };
 
-// ── FXAA replacement (3-way AA toggle) ──
-// The replacement shader (0x96BB8CFF) SELF-GATES on shader_injection.dlaa_enabled
-// (b13): Off (0) → passthrough, FXAA (1) → RGB-luma FXAA 3.11, DLAA (2) →
-// passthrough. No on_replace gate is needed — the shader always runs and picks
-// its behavior from the toggle. OnBeforeFxaaDraw still runs DLAA first in DLAA
-// mode so t0 holds the DLAA output for the passthrough to copy.
-// Build the custom-shader table: the FXAA 3-way replacement + effect-mask +
-// composite entries, PLUS every final_blending hash with an on_draw hook that
-// runs DLSS on the raw pre-tone-map scene (HDR pre-tone-map path). The final
-// entries carry NO replacement code, so the HDR mod's own final_blending
-// replacement is used and tone maps the DLSS output.
+// ── FXAA pass hook (3-way AA toggle) ──
+// The FXAA shader (0x96BB8CFF) is NO LONGER replaced — the entry carries no
+// code, so the game's ORIGINAL shader runs untouched unless we skip the draw.
+// OnBeforeFxaaDraw is the final-composite decision point:
+//   Off (0)   -> native-copy t0 (composite) into RTV0 and skip FXAA (passthrough)
+//   FXAA (1)  -> return true: the game's original FXAA runs (no injection)
+//   DLAA (2)  -> run DLSS (unless the pre-tone-map path already did), then
+//                native-copy the DLAA'd image into RTV0 and skip FXAA
+// Build the custom-shader table: the FXAA hook + effect-mask + composite
+// entries, PLUS every final_blending hash with an on_draw hook that runs DLSS
+// on the raw pre-tone-map scene (HDR pre-tone-map path). The final entries
+// carry NO replacement code, so the HDR mod's own final_blending replacement is
+// used and tone maps the DLSS output.
 static renodx::mods::shader::CustomShaders BuildCustomShaders() {
   renodx::mods::shader::CustomShaders cs = {
       {
+          // FXAA pass (0x96BB8CFF): HOOK ONLY — no replacement code, so the
+          // game's original shader runs unless OnBeforeFxaaDraw skips the draw.
           0x96BB8CFFu,
           renodx::mods::shader::CustomShader{
               .crc32 = 0x96BB8CFFu,
-              .code = __0x96BB8CFF,
               .on_draw = OnBeforeFxaaDraw,
           },
       },
