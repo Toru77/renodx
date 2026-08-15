@@ -336,8 +336,7 @@ void EmitSelfTest() {
 // Patch a skinned VS in place, write the patched blob to `out_path`, and
 // re-validate (parse + signatures + hash self-consistency). With `velocity`
 // the RT2-channel per-object velocity encode is emitted too.
-int PatchOne(const std::string& path, const std::string& out_path, bool velocity = false,
-             bool carrier = false) {
+int PatchOne(const std::string& path, const std::string& out_path, bool carrier = false) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
     std::cerr << "  ERROR: cannot read file\n";
@@ -346,7 +345,6 @@ int PatchOne(const std::string& path, const std::string& out_path, bool velocity
   uint32_t new_hash = 0;
   dxbc::PatchInfo info;
   dxbc::PatchOptions options;
-  options.emit_velocity_to_rt2 = velocity;
   options.emit_velocity_carrier = carrier;
   const bool patched = dxbc::PatchSkinnedVertexShader(data, &new_hash, &info, options);
   if (!patched) {
@@ -400,18 +398,6 @@ int PatchOne(const std::string& path, const std::string& out_path, bool velocity
       std::cout << "\n";
     }
   }
-  return 0;
-}
-
-// Report whether a PS consumes TEXCOORD10 ONLY as .zw (RT2-swap safe).
-int PsZwCheck(const std::string& path) {
-  auto data = ReadBinaryFile(path);
-  if (data.empty()) {
-    std::cerr << "  ERROR: cannot read file\n";
-    return 1;
-  }
-  const bool ok = dxbc::PsReadsTexcoord10Zw(data);
-  std::cout << "  TEXCOORD10.zw-reader (RT2 velocity-safe): " << (ok ? "YES" : "no") << "\n";
   return 0;
 }
 
@@ -652,9 +638,7 @@ int main(int argc, char** argv) {
   bool dump = false;
   bool emittest = false;
   bool patch = false;
-  bool patchvel = false;
   bool patchcarrier = false;
-  bool pszw = false;
   bool patchps = false;
   bool patchpscarrier = false;
   uint32_t texidx = 0u;
@@ -670,12 +654,8 @@ int main(int argc, char** argv) {
       emittest = true;
     } else if (arg == "--patch") {
       patch = true;
-    } else if (arg == "--patchvel") {
-      patchvel = true;
     } else if (arg == "--patchcarrier") {
       patchcarrier = true;
-    } else if (arg == "--pszw") {
-      pszw = true;
     } else if (arg == "--patchps") {
       patchps = true;
     } else if (arg == "--patchpscarrier") {
@@ -700,8 +680,6 @@ int main(int argc, char** argv) {
     std::cerr << "  --dump prints every SHEX instruction's raw dwords + decode.\n";
     std::cerr << "  --emittest prints the emitter-built injected block (no files needed).\n";
     std::cerr << "  --patch patches a skinned VS (generic Phase B) and writes out.cso.\n";
-    std::cerr << "  --patchvel patches a skinned VS WITH the RT2-channel velocity encode.\n";
-    std::cerr << "  --pszw <ps.cso> reports whether the PS reads TEXCOORD10.zw (RT2-swap safe).\n";
     std::cerr << "  --patchps [--texidx <n>] patches a G-buffer PS (Phase E) and writes out.cso.\n";
     std::cerr << "  --patchpscarrier patches a PS using the existing TEXCOORD10.xy carrier.\n";
     std::cerr << "    --texidx overrides the prevClip TEXCOORD index with the paired VS's (0=auto).\n";
@@ -715,22 +693,13 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if ((patch || patchvel || patchcarrier) && !paths.empty()) {
+  if ((patch || patchcarrier) && !paths.empty()) {
     std::string in = paths[0];
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
-    int rc = PatchOne(in, out, patchvel, patchcarrier);
+    int rc = PatchOne(in, out, patchcarrier);
     std::cout << "\n";
     return rc;
-  }
-
-  if (pszw && !paths.empty()) {
-    for (const auto& in : paths) {
-      std::cout << "=== " << in << " ===\n";
-      PsZwCheck(in);
-      std::cout << "\n";
-    }
-    return 0;
   }
 
   if ((patchps || patchpscarrier) && !paths.empty()) {

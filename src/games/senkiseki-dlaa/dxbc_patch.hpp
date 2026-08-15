@@ -426,6 +426,10 @@ constexpr uint32_t kSwizzleZZZZ = 0xAAu;
 constexpr uint32_t kSwizzleWWWW = 0xFFu;
 constexpr uint32_t kSwizzleZZZW = 0xEAu;  // .x=z .y=z .z=z .w=w (velocity rV.zzzw -> oN.zw)
 
+// Number of prev-World slots the rigid VS probes for nearest-translation selection.
+// MUST equal kRigidPrevWorldSlots in addon.cpp.
+constexpr uint32_t kRigidWorldSlots = 4u;
+
 inline void EmitOpcode(std::vector<uint32_t>& out, uint32_t opcode, uint32_t length) {
   out.push_back(EncodeInstruction(opcode, length));
 }
@@ -671,6 +675,27 @@ inline void EmitMin(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_m
   EmitTempDst(out, dst_reg, dst_mask);
   EmitTempSrc(out, s0_reg, s0_swizzle);
   EmitTempSrc(out, s1_reg, s1_swizzle);
+}
+
+// lt dst, src0, src1  (opcode 49, len 7)
+inline void EmitLt(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_mask,
+                   uint32_t s0_reg, uint32_t s0_swizzle, uint32_t s1_reg, uint32_t s1_swizzle) {
+  EmitOpcode(out, OP_LT, 7u);
+  EmitTempDst(out, dst_reg, dst_mask);
+  EmitTempSrc(out, s0_reg, s0_swizzle);
+  EmitTempSrc(out, s1_reg, s1_swizzle);
+}
+
+// movc dst, cond, src1(true), src2(false)  (opcode 55, len 9)
+inline void EmitMovc(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_mask,
+                     uint32_t cond_reg, uint32_t cond_swizzle,
+                     uint32_t s1_reg, uint32_t s1_swizzle,
+                     uint32_t s2_reg, uint32_t s2_swizzle) {
+  EmitOpcode(out, OP_MOVC, 9u);
+  EmitTempDst(out, dst_reg, dst_mask);
+  EmitTempSrc(out, cond_reg, cond_swizzle);
+  EmitTempSrc(out, s1_reg, s1_swizzle);
+  EmitTempSrc(out, s2_reg, s2_swizzle);
 }
 
 // max dst, src, l(imm) (opcode 52, len 7)
@@ -1443,12 +1468,17 @@ struct PatchInfo {
                                    // time to find/register its prev-frame twin (Phase D).
   uint32_t texcoord_index = 5u;    // TEXCOORD semantic index of the prevClip output
   uint32_t output_reg = 0u;        // new output register (oN)
-  uint32_t tex10_out_reg = UINT32_MAX;  // the GAME's TEXCOORD10 output register (RT2 channel)
+  uint32_t tex10_out_reg = UINT32_MAX;  // the GAME's TEXCOORD10 output register (Phase E carrier)
   bool outline_applied = false;    // whether the GameEdgeParameters offset was replicated
   bool needs_no_binding = false;   // true: the patched VS reads only the game's own t0/b0
                                    // (no addon t#/b# binds needed — crash-bisection mode)
-  bool velocity_emitted = false;   // true: the patched VS encoded prevNDC-curNDC into the
-                                   // GAME's TEXCOORD10.zw (RT2 channel, no PS patch).
+  bool velocity_emitted = false;   // true: the patched VS emitted the raw prevNDC-curNDC
+                                   // delta into TEXCOORD10.xy (the Phase E carrier).
+  // Rigid (weapon / character-attached object) patch fields:
+  uint32_t prev_world_cb_slot = 1u;  // free b-slot chosen for the prev-World cbuffer
+  uint32_t world_cb_element = 44u;   // _Globals element index of World (c44 => byte 704)
+  bool rigid_patch = false;          // true: this PatchInfo describes the RIGID patch path
+                                     // (no bones - per-object motion from the World matrix).
 };
 
 // Tunables for the generic patch (used for crash bisection).
@@ -1473,21 +1503,15 @@ struct PatchOptions {
                                      // output, no re-skin, no prevVP, no outline, no OSGN
                                      // append. Under GLOBAL jitter the b13 offset is 0 ->
                                      // inert by design (the _Globals VP patch does it).
-  bool emit_velocity_to_rt2 = false; // per-object velocity via the GAME's TEXCOORD10 ->
-                                     // RT2 channel (NO pixel-shader patch): the patched VS
-                                     // encodes prevNDC-curNDC into TEXCOORD10.zw and the
-                                     // game's UNPATCHED G-buffer PS packs it into o2 (RT2).
-                                     // Requires the full patch mode (no no_bind/minimal/
-                                     // no_output/constant) + a skinned VS that OUTPUTS
-                                     // TEXCOORD10 + a structured bone buffer slot.
-  bool emit_velocity_carrier = false; // write raw prevNDC-curNDC into existing
-                                      // TEXCOORD10.xy for the dedicated Phase E target;
-                                      // does not write the game's RT2 .zw payload.
-  uint32_t velocity_debug_mode = 0u; // 0 = normal delta. 1..4 = diagnostic: encode a RAW
-                                     // NDC component (1=curNDC.x, 2=prevNDC.x, 3=curNDC.y,
-                                     // 4=prevNDC.y) as E = clamp(ndc*0.5+0.5,0,1) instead of
-                                     // the delta, so the motionBuf readback shows whether
-                                     // the injected skin's NDC is sane or NaN.
+  // NOTE: the "RT2 channel" per-object transport (emit_velocity_to_rt2) was an
+  // EXPERIMENT and has been REMOVED on purpose - do not re-add it. The only
+  // supported per-object velocity transport is the Phase E carrier below.
+  bool emit_velocity_carrier = false; // write the raw prevNDC-curNDC delta into the
+                                      // EXISTING TEXCOORD10.xy (the Phase E carrier). The
+                                      // paired patched PS (PatchPerObjectPixelShader with
+                                      // existing_velocity_carrier) writes it to the appended
+                                      // SV_TARGET3 motion RTV. Leaves TEXCOORD10.zw (the
+                                      // game's packed depth) untouched.
   bool velocity_full_mv = false;     // FULL-MV (A/B vs object-only): prevClip = prevBone x
                                      // the addon's PREVIOUS-frame VP (prev_vp_cb) instead of
                                      // the game's current c10..13, so the encoded delta is the
@@ -1501,28 +1525,8 @@ struct PatchOptions {
                                      // to the depth-reprojected camera path.
 };
 
-// Classify a G-buffer PS: does it consume TEXCOORD10 ONLY as .zw? The ISGN
-// `mask` field is the FULL component set the VS provides (0xF for TEXCOORD10);
-// the PS's ACTUAL reads live in `read_write_mask` (0xC = the `dcl_input_ps
-// vN.zw` packed-depth pattern: div v6.z/v6.w -> o2). Only these PSs are safe to
-// swap RT2 for the velocity target — a PS that reads TEXCOORD10 for its own
-// math (e.g. as .xyz) would write a non-velocity value into o2 and ghost.
-inline bool PsReadsTexcoord10Zw(const std::vector<std::byte>& data) {
-  DXBCHeader header;
-  std::vector<ChunkInfo> chunks;
-  if (!ParseDXBC(data, header, chunks)) return false;
-  const ChunkInfo* isgn = FindChunk(chunks, "ISGN");
-  if (!isgn) return false;
-  std::vector<SignatureEntry> is;
-  if (!ParseSignature(data, *isgn, is)) return false;
-  for (const auto& e : is)
-    if (e.name == "TEXCOORD" && e.semantic_index == 10u) return e.read_write_mask == 0xCu;
-  return false;
-}
-
-// Strong Phase E eligibility contract. This is deliberately stricter than the
-// RT2 transport classifier above: a matching TEXCOORD10 read alone also occurs
-// in non-G-buffer and alternate-output material shaders. Phase E only supports
+// Strong Phase E eligibility contract. A matching TEXCOORD10.zw read alone also
+// occurs in non-G-buffer and alternate-output material shaders. Phase E only supports
 // the game's canonical three-target G-buffer footprint, then adds SV_TARGET3.
 // No shader hashes are involved.
 inline bool IsStrictPhaseECarrierPixelShader(const std::vector<std::byte>& data) {
@@ -1606,9 +1610,10 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     if (e.name == "TEXCOORD" || e.name == "COLOR") { has_geometry_output = true; break; }
   if (!has_geometry_output) return false;
 
-  // TEXCOORD10 output register = the GAME's RT2 packed-depth channel (the PS
-  // divides v.z/v.w and packs 24 bits into o2). The velocity encode overwrites
-  // ONLY its .zw. Absent => no RT2 channel => velocity can't be emitted.
+  // TEXCOORD10 output register = the Phase E carrier channel. The game's PS
+  // reads ONLY its .zw (the packed-depth divide: v.z/v.w -> o2); the carrier
+  // writes the raw delta into .xy and leaves .zw (packed depth) untouched.
+  // Absent => no carrier channel => velocity can't be emitted.
   uint32_t tex10_out_reg = UINT32_MAX;
   for (const auto& e : os)
     if (e.name == "TEXCOORD" && e.semantic_index == 10u) { tex10_out_reg = e.register_index; break; }
@@ -1830,12 +1835,12 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   const bool minimal = options.minimal_patch || options.test_constant_output;
   const bool no_output = options.test_no_output;
   const bool constant = options.test_constant_output;
-  // ── Per-object velocity (RT2 channel) gate ──
+  // ── Per-object velocity (Phase E carrier) gate ──
   // Requires the FULL patch mode (never the crash-bisection modes), a skinned
-  // VS (blend_reg >= 0 checked above), a TEXCOORD10 output (the RT2 channel),
-  // and a confirmed structured bone buffer slot (the game's CURRENT bones the
+  // VS (blend_reg >= 0 checked above), a TEXCOORD10 output (the carrier), and
+  // a confirmed structured bone buffer slot (the game's CURRENT bones the
   // cur-skin re-reads). Everything is structural — no hash lists here.
-  const bool emit_vel = (options.emit_velocity_to_rt2 || options.emit_velocity_carrier) &&
+  const bool emit_vel = options.emit_velocity_carrier &&
                         !no_bind && !minimal && !no_output &&
                         !constant && tex10_out_reg != UINT32_MAX &&
                         !scan.structured_slots.empty();
@@ -1993,7 +1998,7 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitAdd(body, rAcc, 0x7u, rAcc, kSwizzleXYZW, rEye, kSwizzleXYZW);
   }
 
-  // ── Per-object velocity (RT2 channel): Part A — CURRENT-pose re-skin ──
+  // -- Per-object velocity (Phase E carrier): Part A - CURRENT-pose re-skin --
   // For the velocity delta we need THIS frame's clip AND the previous pose
   // projected with the SAME camera. Re-skin with the game's CURRENT bones
   // (bone_game_slot = t0, already bound by the game) x the game's CURRENT
@@ -2095,30 +2100,19 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     EmitDp4Cb(body, rB, 0x8u, vel_cb, vel_elem + 3u, minimal ? rP : rAcc, kSwizzleXYZW);
   }
 
-  // ── Per-object velocity (RT2 channel): Part B — encode prevNDC-curNDC ──
-  // object-only (default): rB = prevClip (prev-bone skin x CURRENT VP) and
-  // rCurClip = curClip (cur-bone skin x CURRENT VP) — BOTH projected with the
-  // game's current c10..c13, so the delta is OBJECT-ONLY motion (camera
-  // cancels); the camera component is added by the compute's depth-
-  // reprojection path.
-  // full-MV (velocity_full_mv): rB = prevClip (prev-bone skin x PREVIOUS VP,
-  // addon prev_vp_cb) and rCurClip = cur-bone skin x game c10..13 — the delta
-  // is the COMPLETE screen-space motion (camera + object); the compute uses it
-  // directly (jitter-compensated).
-  // The 24-bit code E = (Ix*4096 + Iy)/16777216 where
-  // Ix,Iy = clamp(round_z((delta*S+0.5)*4096), 0, 4095) quantize the NDC delta.
-  // S = 4.0 maps delta in [-0.125, +0.125] NDC (~+/-160px at 2560 wide) onto
-  // the full 12-bit range (quantization ~0.078px/step — 8x finer than the old
-  // +-1.0 NDC / 0.625px range, which was the main source of the per-pixel
-  // noise + DLAA detail smear on the character). Object-only deltas are small
-  // by construction (per-frame limb motion, typically < 0.05 NDC), so the
-  // tighter range has huge headroom; beyond it the delta clamps and the 1000px
-  // robustness cap in the compute drops the pixel back to the camera path
-  // (graceful). The decode in motion_velocity.cs_5_0.hlsl and the
-  // MaybeLogMotionBuffer readback must use ((Ix/4096)-0.5)/S to match.
-  // The game's UNPATCHED PS computes depth = v.z/v.w = E/1 = E and packs E into
-  // o2 (RT2) as 3 bytes — no PS patch needed. Writing (E,1) into TEXCOORD10.zw
-  // keeps .xy untouched (the PS never reads them).
+  // -- Per-object velocity (Phase E carrier): encode prevNDC-curNDC --
+  // object-only (velocity_full_mv=false): rB = prevClip (prev-bone skin x
+  // CURRENT VP) and rCurClip = curClip (cur-bone skin x CURRENT VP) - BOTH
+  // projected with the game's current c10..c13, so the delta is OBJECT-ONLY
+  // motion (camera cancels); the camera component is added by the compute's
+  // depth-reprojection path.
+  // full-MV (velocity_full_mv=true): rB = prevClip (prev-bone skin x PREVIOUS
+  // VP, addon prev_vp_cb) and rCurClip = cur-bone skin x game c10..13 - the
+  // delta is the COMPLETE screen-space motion (camera + object); the compute
+  // uses it directly (jitter-compensated).
+  // The RAW prevNDC-curNDC delta is written into TEXCOORD10.xy (the Phase E
+  // carrier); the paired patched PS reads it and writes o3 (the appended motion
+  // RTV). TEXCOORD10.zw (the game's packed depth) is untouched.
   if (emit_vel) {
     EmitDiv(body, rV, 0x3u, rB, kSwizzleXYZW, rB, kSwizzleWWWW);             // rV.xy = prevNDC
     // rV.zw = curNDC.xy. CRITICAL: with dst mask .zw, src0 MUST be swizzled
@@ -2130,136 +2124,14 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
     // and dy = prevNDC.y - 1. This was the root cause of the whole -0.93
     // "same as camera" bug.
     EmitDiv(body, rV, 0xCu, rCurClip, kSwizzleXYXY, rCurClip, kSwizzleWWWW); // rV.zw = curNDC.xy
-    // Preserve the raw object delta for the dedicated Phase E carrier before
-    // the legacy quantized encoder overwrites rV.xy.
+    // rV.xy = prevNDC.xy - curNDC.xy (raw object/camera delta), written to the
+    // Phase E carrier (TEXCOORD10.xy). The paired patched PS reads it and writes
+    // o3 (the appended motion RTV). TEXCOORD10.zw stays the game's packed depth.
     EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX);
     EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY);
-    if (options.emit_velocity_carrier)
-      EmitMovOutputMasked(body, tex10_out_reg, 0x3u, rV, kSwizzleXYXY); // raw delta -> TEXCOORD10.xy
-    if (options.emit_velocity_to_rt2 && options.velocity_debug_mode == 0u) {
-    // Encode re-center (FIX 1c): E = delta + 0.75 with S = 1.0 for BOTH modes.
-    // The old center 0.5 put a still character at E=0.5 -> byte0=128, the ONE
-    // band where the game's 8-bit RT2 (r8g8b8a8_unorm) round-trips with a +-1
-    // LSB error = a +-1.25..2.2px decoded MV floor at still. Center 0.75 puts
-    // small deltas at byte0=192 (and the whole +-0.125 NDC object-only range at
-    // byte0 160..224) — bit-exact through 8-bit unorm, so the floor disappears.
-    // Range before clamp: delta in [-0.75, +0.25] NDC (+0.25 NDC = +320px, the
-    // same positive headroom as the old full-MV +-320px).
-    const uint32_t kScaleImm = 0x3F800000u;  // 1.0 (S=1 both modes; re-center)
-    // nx = round_z(clamp(dx + 0.75, 0, 1) * 4096) clamped to [0,4095] (FIX 1c:
-    // center 0.75 so small deltas land on the bit-exact 8-bit byte0 region).
-    // NOTE: clamp to 4095.999756 (0x457FFFFF = the float just below 4096)
-    // BEFORE round_z so the result is always an integer in [0,4095] — clamping
-    // after round_z would leave a fractional nx in the round_z(4096) edge case.
-    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, kScaleImm, 0u, 0u, 0u);  // rV.x *= 1.0 (FIX 1c; kept for imm parity)
-    EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F400000u);              // rV.x += 0.75 (FIX 1c re-center)
-    EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
-    EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);              // min 1
-    EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x45800000u, 0u, 0u, 0u);  // rV.x *= 4096
-    EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FFFFFu);              // min 4095.999756
-    EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);                            // round_z
-    EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                       // max 0
-    // ny = round_z(clamp(dy + 0.75, 0, 1) * 4096) clamped to [0,4095] (re-center).
-    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, kScaleImm, 0u, 0u);  // rV.y *= 1.0 (FIX 1c; kept for imm parity)
-    EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F400000u);              // rV.y += 0.75 (FIX 1c re-center)
-    EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
-    EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
-    EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x45800000u, 0u, 0u);  // rV.y *= 4096 (imm at .y)
-    EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x457FFFFFu);              // min 4095.999756
-    EmitRoundZ(body, rV, 0x2u, rV, kSwizzleYYYY);
-    EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
-    // code = Ix*4096 + Iy;  E = code / 16777216
-    EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = Ix*4096 (imm at .z)
-    EmitAdd(body, rV, 0x4u, rV, kSwizzleZZZZ, rV, kSwizzleYYYY);             // rV.z += Iy
-    EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24 (imm at .z)
-    EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
-    // mov o{tex10}.zw, rV.zzzw  -> the game's PS packs (E, 1) into o2/RT2.
-    EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else if (options.emit_velocity_to_rt2 && options.velocity_debug_mode <= 4u) {
-      // ── Diagnostic encode (velocity_debug_mode 1..4): write a RAW NDC
-      // component instead of the delta so the motionBuf readback reveals whether
-      // the injected cur/prev skin NDC is sane. mode: 1=curNDC.x, 2=prevNDC.x,
-      // 3=curNDC.y, 4=prevNDC.y. E = clamp(ndc*0.5+0.5,0,1); Ix = round_z(E*4095);
-      // E = Ix*4096/2^24 ~ the value. Readback: character at screen center ->
-      // zeroVel; all-zeros (noData) -> that NDC is NaN (broken injected skin). ──
-      const uint32_t dbg_swz = (options.velocity_debug_mode == 1u) ? kSwizzleZZZZ :
-                              (options.velocity_debug_mode == 2u) ? kSwizzleXXXX :
-                              (options.velocity_debug_mode == 3u) ? kSwizzleWWWW :
-                                                                    kSwizzleYYYY;
-      EmitMulImm4(body, rV, 0x1u, rV, dbg_swz, 0x3F000000u, 0u, 0u, 0u);  // rV.x = ndc*0.5
-      EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);         // rV.x += 0.5
-      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                  // max 0
-      EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);         // min 1
-      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FF000u, 0u, 0u, 0u);  // *= 4095.0
-      EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);                       // round_z
-      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);                  // max 0
-      // code = Ix*4096; E = code / 16777216
-      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = Ix*4096
-      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24
-      EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
-      EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else if (options.emit_velocity_to_rt2 && options.velocity_debug_mode == 6u) {
-      // ── Diagnostic encode (mode 6): BOTH skins in ONE code — Ix = curNDC.x
-      // (rV.z), Iy = prevNDC.x (rV.x). A single motionBuf center readback then
-      // reveals which injected skin is broken: at the character's screen-center
-      // pixel curNDC.x should be ~0 (Ix ~ 2048 -> E.r ~ 0.5 = "zeroVel"); a
-      // wildly off Ix means the Part A cur re-skin (t0) is broken, a wildly off
-      // Iy means the Part B prev re-skin (t1) is broken. Same 2-axis layout as
-      // mode 0, 4095-scale like modes 1..4. ──
-      EmitMov(body, rV, 0x2u, rV, kSwizzleXXXX);  // rV.y = prevNDC.x (before clobber)
-      EmitMov(body, rV, 0x1u, rV, kSwizzleZZZZ);  // rV.x = curNDC.x
-      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u, 0u, 0u, 0u);  // rV.x *= 0.5
-      EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
-      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
-      EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);
-      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FF000u, 0u, 0u, 0u);  // *= 4095.0
-      EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);
-      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
-      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x3F000000u, 0u, 0u);  // rV.y *= 0.5
-      EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
-      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
-      EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
-      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x457FF000u, 0u, 0u);  // *= 4095.0
-      EmitRoundZ(body, rV, 0x2u, rV, kSwizzleYYYY);
-      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
-      // code = Ix*4096 + Iy;  E = code / 16777216
-      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = Ix*4096
-      EmitAdd(body, rV, 0x4u, rV, kSwizzleZZZZ, rV, kSwizzleYYYY);             // rV.z += Iy
-      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24
-      EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
-      EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    } else if (options.emit_velocity_to_rt2) {
-      // ── Diagnostic encode (velocity_debug_mode >= 5): encode the RAW DELTA
-      // prevNDC-curNDC with a WIDE +-4 NDC range (scale 0.125) so nothing
-      // saturates. The motionBuf readback classification (E-based) then splits:
-      //   zeroVel (E~0.5) = delta ~ 0   -> identical bones+VP, encode SHOULD be 0.5
-      //   pos / neg       = delta finite & non-zero (magnitude decodable)
-      //   noData (E~0)    = delta NaN or <= -4 NDC -> injected skin broken
-      // Same 2-axis code layout as mode 0 (nx*4096+ny). ──
-      EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX); // dx = prev.x - cur.x
-      EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY); // dy = prev.y - cur.y (imm -1 at .y)
-      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3E000000u, 0u, 0u, 0u);  // rV.x *= 0.125
-      EmitAddImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F000000u);              // rV.x += 0.5
-      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
-      EmitMinImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0x3F800000u);
-      EmitMulImm4(body, rV, 0x1u, rV, kSwizzleXXXX, 0x457FF000u, 0u, 0u, 0u);  // rV.x *= 4095.0
-      EmitRoundZ(body, rV, 0x1u, rV, kSwizzleXXXX);
-      EmitMaxImm1(body, rV, 0x1u, rV, kSwizzleXXXX, 0u);
-      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x3E000000u, 0u, 0u);  // rV.y *= 0.125 (imm at .y)
-      EmitAddImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F000000u);              // rV.y += 0.5
-      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
-      EmitMinImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0x3F800000u);
-      EmitMulImm4(body, rV, 0x2u, rV, kSwizzleYYYY, 0u, 0x457FF000u, 0u, 0u);  // rV.y *= 4095.0 (imm at .y)
-      EmitRoundZ(body, rV, 0x2u, rV, kSwizzleYYYY);
-      EmitMaxImm1(body, rV, 0x2u, rV, kSwizzleYYYY, 0u);
-      // code = nx*4096 + ny;  E = code / 16777216
-      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleXXXX, 0u, 0u, 0x45800000u, 0u);  // rV.z = nx*4096 (imm at .z)
-      EmitAdd(body, rV, 0x4u, rV, kSwizzleZZZZ, rV, kSwizzleYYYY);             // rV.z += ny
-      EmitMulImm4(body, rV, 0x4u, rV, kSwizzleZZZZ, 0u, 0u, 0x33800000u, 0u);  // rV.z *= 2^-24 (imm at .z)
-      EmitMovImm1(body, rV, 0x8u, 0x3F800000u);                                // rV.w = 1.0
-      EmitMovOutputMasked(body, tex10_out_reg, 0xCu, rV, kSwizzleZZZW);
-    }
+    EmitMovOutputMasked(body, tex10_out_reg, 0x3u, rV, kSwizzleXYXY); // raw delta -> TEXCOORD10.xy
   }
+
   if (!no_output && !emit_vel) EmitMovOutput(body, new_out_reg, rB, kSwizzleXYZW);
 
   // ── Rebuild the SHEX chunk token stream ──
@@ -2425,6 +2297,326 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   return true;
 }
 
+// ── Rigid (weapon / character-attached object) VS patcher (Phase W) ──
+// Detects a RIGID character-path vertex shader (the same PhyreEngine material VS
+// the walls use, but lit by the character light) and injects per-object motion:
+//   prevClip = prevWorld x prevVP x float4(v0,1)
+//   curClip  = curWorld  x curVP  x float4(v0,1)
+// and emits the raw prevNDC-curNDC delta into TEXCOORD10.xy (the Phase E
+// carrier), exactly like the skinned path's emit_velocity_carrier path.
+//
+// DISCRIMINATOR (structural, NOT hash-based): the RDEF cbuffer must contain the
+// PhyreEngine "LightDirForChar" variable (the character directional light).
+// Every character-path VS (skinned character + rigid weapon/accessory) declares
+// it; every environment VS (walls/floor/ceiling/terrain) does NOT (they use
+// CubeMapIntensity/Fresnel or plain World instead). So this patcher can never
+// touch walls. Skinned VSs are rejected up front (BLENDINDICES/BLENDWEIGHTS) so
+// they stay on the existing Phase B bone path.
+//
+// Fails closed: rigid + LightDirForChar + World@c44 + TEXCOORD10 output + single
+// return are ALL required; the paired PS is classified as a Phase E carrier
+// (IsStrictPhaseECarrierPixelShader) at create_pipeline, and the draw is gated by
+// the existing MaybeAppendMotionRtvStrict (patched VS + Phase E PS + 3 RTs).
+inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_new_hash,
+                                   PatchInfo* out_info = nullptr,
+                                   const PatchOptions& options = {}) {
+  // The rigid path only exists to emit the Phase E carrier. When Phase E is off
+  // there is nothing to emit, so do NOT patch (keeps TEXCOORD10.xy intact for any
+  // game PS that reads it).
+  if (!options.emit_velocity_carrier) return false;
+  DXBCHeader header;
+  std::vector<ChunkInfo> chunks;
+  if (!ParseDXBC(data, header, chunks)) return false;
+  const ChunkInfo* isgn = FindChunk(chunks, "ISGN");
+  const ChunkInfo* osgn = FindChunk(chunks, "OSGN");
+  const ChunkInfo* shex = FindChunk(chunks, "SHEX");
+  if (!shex) shex = FindChunk(chunks, "SHDR");
+  const ChunkInfo* rdef = FindChunk(chunks, "RDEF");
+  if (!isgn || !osgn || !shex || !rdef) return false;
+
+  std::vector<SignatureEntry> is, os;
+  if (!ParseSignature(data, *isgn, is) || !ParseSignature(data, *osgn, os)) return false;
+
+  // Rigid only: a skinned VS (blend indices/weights) stays on the Phase B path.
+  int pos_reg = -1;
+  for (const auto& e : is) {
+    if (e.name == "BLENDINDICES" || e.name == "BLENDWEIGHTS") return false;
+    if (e.name == "POSITION") pos_reg = (int)e.register_index;
+  }
+  if (pos_reg < 0) return false;
+
+  // The GAME's TEXCOORD10 output register = the Phase E carrier channel.
+  uint32_t tex10_out_reg = UINT32_MAX;
+  bool has_geometry_output = false;
+  for (const auto& e : os) {
+    if (e.name == "TEXCOORD" && e.semantic_index == 10u) tex10_out_reg = e.register_index;
+    if (e.name == "TEXCOORD" || e.name == "COLOR") has_geometry_output = true;
+  }
+  if (tex10_out_reg == UINT32_MAX) return false;   // no carrier channel (e.g. shadow/depth pass)
+  if (!has_geometry_output) return false;          // not a G-buffer VS
+
+  // RDEF gate: LightDirForChar (character light) + World matrix + _Globals.
+  const uint8_t* rdef_data =
+      reinterpret_cast<const uint8_t*>(data.data()) + rdef->offset + kChunkHeaderSize;
+  std::vector<RdefCbuffer> cbs;
+  if (!ParseRDEFCbuffers(rdef_data, rdef->size, cbs)) return false;
+  // Find the per-object _Globals cbuffer BY ITS VARIABLES (the real RDEF name is
+  // "$Globals", not "_Globals" — 3Dmigoto renames it in decompiled HLSL only).
+  bool has_light_char = false;
+  uint32_t world_off = 0u;
+  bool has_world = false;
+  uint32_t globals_slot = 0u;
+  uint32_t globals_declared = 0u;
+  std::string globals_cb_name;
+  for (const auto& cb : cbs) {
+    for (const auto& v : cb.variables) {
+      if (v.name == "LightDirForChar") has_light_char = true;
+      if (v.name == "World") {
+        has_world = true;
+        world_off = v.start_offset;
+        globals_declared = cb.size / 16u;
+        globals_cb_name = cb.name;
+      }
+    }
+  }
+  if (!has_light_char || !has_world) return false;
+  // Resolve the cbuffer's bind slot from the RDEF resource binding table.
+  std::vector<ResourceBinding> bindings;
+  if (ParseRDEFBindings(rdef_data, rdef->size, bindings))
+    for (const auto& b : bindings)
+      if (b.name == globals_cb_name && b.input_type == 0u) globals_slot = b.bind_point;
+  const uint32_t world_elem = world_off / 16u;  // c44 for all these VSs
+  if (world_elem + 3u >= globals_declared) return false;  // World must fit the cbuffer
+
+  // SHEX scan.
+  const uint8_t* shex_data =
+      reinterpret_cast<const uint8_t*>(data.data()) + shex->offset + kChunkHeaderSize;
+  ShexScan scan;
+  if (!ScanShex(shex_data, shex->size, scan)) return false;
+  if (!scan.has_ret || scan.ret_count != 1u) return false;  // single-return tail required
+
+  // Pick kRigidWorldSlots CONSECUTIVE free cbuffer slots (prevWorld slots) plus one
+  // for prevVP. vs_4_1 has only b0..b13; 13 is the shader_injection cbuffer.
+  auto slot_used = [&](uint32_t s) {
+    return std::find(scan.cb_slots.begin(), scan.cb_slots.end(), s) != scan.cb_slots.end() || s == 13u;
+  };
+  uint32_t cb_slot_w = 1u;
+  for (;;) {
+    bool ok = true;
+    for (uint32_t k = 0u; k < kRigidWorldSlots; ++k)
+      if (slot_used(cb_slot_w + k)) { ok = false; break; }
+    if (ok) break;
+    ++cb_slot_w;
+  }
+  uint32_t cb_slot_vp = cb_slot_w + kRigidWorldSlots;
+  while (slot_used(cb_slot_vp)) ++cb_slot_vp;
+  if (cb_slot_vp > 13u) return false;
+
+  // Temps.
+  const uint32_t temp_base = std::max(scan.has_temps ? scan.dcl_temps : 0u, scan.max_temp + 1u);
+  const uint32_t rP = temp_base + 0u;         // float4(v0, 1)
+  const uint32_t rW = temp_base + 1u;         // CUR world-position scratch (unchanged)
+  const uint32_t rB = temp_base + 2u;         // prevClip
+  const uint32_t rCurClip = temp_base + 3u;   // curClip
+  const uint32_t rV = temp_base + 4u;         // velocity encode scratch
+  const uint32_t rUnitW = temp_base + 5u;     // (0,0,0,1) — extracts matrix translation via dp4
+  const uint32_t rT = temp_base + 6u;         // cur World translation
+  const uint32_t rD = temp_base + 7u;         // per-candidate delta (xyz) + dist^2 (w)
+  const uint32_t rCmp = temp_base + 8u;       // compare scratch
+  const uint32_t rBestD = temp_base + 9u;     // best (min) distance^2
+  const uint32_t rBestW = temp_base + 10u;    // best prev world position
+  const uint32_t rPW = temp_base + 11u;       // candidate prev world position
+  const uint32_t new_dcl_temps = temp_base + 12u;
+
+  // Decls: prevWorld[0..K-1] cbuffers (globals_declared registers each) + prevVP cbuffer (4 registers).
+  std::vector<uint32_t> decls;
+  for (uint32_t k = 0u; k < kRigidWorldSlots; ++k)
+    EmitDclConstantBuffer(decls, cb_slot_w + k, globals_declared);  // prevWorld[k] = full b0 snapshot (World at c44)
+  EmitDclConstantBuffer(decls, cb_slot_vp, 4u);
+
+  std::vector<uint32_t> body;
+  // rP = float4(v0, 1)
+  EmitMovInput(body, rP, 0x7u, (uint32_t)pos_reg, 0x7u);
+  EmitMovImm1(body, rP, 0x8u, 0x3F800000u);
+  // curWorldPos = curWorld (cb0[world_elem..+2]) x rP; w = 1 (matches the game's r0.w=1)
+  EmitDp4Cb(body, rW, 0x1u, globals_slot, world_elem + 0u, rP, kSwizzleXYZW);
+  EmitDp4Cb(body, rW, 0x2u, globals_slot, world_elem + 1u, rP, kSwizzleXYZW);
+  EmitDp4Cb(body, rW, 0x4u, globals_slot, world_elem + 2u, rP, kSwizzleXYZW);
+  EmitMovImm1(body, rW, 0x8u, 0x3F800000u);
+  // curClip = curVP (cb0[10..13]) x rW
+  EmitDp4Cb(body, rCurClip, 0x1u, globals_slot, 10u, rW, kSwizzleXYZW);
+  EmitDp4Cb(body, rCurClip, 0x2u, globals_slot, 11u, rW, kSwizzleXYZW);
+  EmitDp4Cb(body, rCurClip, 0x4u, globals_slot, 12u, rW, kSwizzleXYZW);
+  EmitDp4Cb(body, rCurClip, 0x8u, globals_slot, 13u, rW, kSwizzleXYZW);
+  // ── Nearest prev-World selection (same-mesh instance disambiguation) ──
+  // rUnitW = (0,0,0,1): dp4 against a matrix row extracts its .w (translation).
+  EmitMovImm4(body, rUnitW, 0xFu, 0u, 0u, 0u, 0x3F800000u);
+  // rT = cur World translation = (cb0[we].w, cb0[we+1].w, cb0[we+2].w)
+  EmitDp4Cb(body, rT, 0x1u, globals_slot, world_elem + 0u, rUnitW, kSwizzleXYZW);
+  EmitDp4Cb(body, rT, 0x2u, globals_slot, world_elem + 1u, rUnitW, kSwizzleXYZW);
+  EmitDp4Cb(body, rT, 0x4u, globals_slot, world_elem + 2u, rUnitW, kSwizzleXYZW);
+  EmitMovImm1(body, rBestD, 0x1u, 0x7F7FFFFFu);  // FLT_MAX
+  EmitMovImm4(body, rBestW, 0xFu, 0u, 0u, 0u, 0u);
+  for (uint32_t k = 0u; k < kRigidWorldSlots; ++k) {
+    const uint32_t slot = cb_slot_w + k;
+    // rD.xyz = prevWorld[k] translation - rT;  rD.w = |delta|^2
+    EmitDp4Cb(body, rD, 0x1u, slot, world_elem + 0u, rUnitW, kSwizzleXYZW);
+    EmitDp4Cb(body, rD, 0x2u, slot, world_elem + 1u, rUnitW, kSwizzleXYZW);
+    EmitDp4Cb(body, rD, 0x4u, slot, world_elem + 2u, rUnitW, kSwizzleXYZW);
+    EmitMadImm4(body, rD, 0x7u, rT, kSwizzleXYZW,
+                0xBF800000u, 0xBF800000u, 0xBF800000u, 0xBF800000u, rD, kSwizzleXYZW);
+    EmitDp3(body, rD, 0x8u, rD, kSwizzleXYZW, rD, kSwizzleXYZW);
+    // update best: if (rD.w < rBestD.x) { rBestD = rD.w; rBestW = rPW; }
+    EmitLt(body, rCmp, 0x1u, rD, kSwizzleWWWW, rBestD, kSwizzleXXXX);
+    EmitMovc(body, rBestD, 0x1u, rCmp, kSwizzleXXXX, rD, kSwizzleWWWW, rBestD, kSwizzleXXXX);
+    // rPW = prevWorld[k] x rP  (candidate prev world position)
+    EmitDp4Cb(body, rPW, 0x1u, slot, world_elem + 0u, rP, kSwizzleXYZW);
+    EmitDp4Cb(body, rPW, 0x2u, slot, world_elem + 1u, rP, kSwizzleXYZW);
+    EmitDp4Cb(body, rPW, 0x4u, slot, world_elem + 2u, rP, kSwizzleXYZW);
+    EmitMovImm1(body, rPW, 0x8u, 0x3F800000u);
+    EmitMovc(body, rBestW, 0xFu, rCmp, kSwizzleXXXX, rPW, kSwizzleXYZW, rBestW, kSwizzleXYZW);
+  }
+  // prevClip = prevVP x rBestW. Full-MV (default): the addon prevVP cbuffer (unjittered
+  // prev ViewProjection). Object-only: the game's CURRENT VP (cb0[10..13]).
+  const uint32_t vel_cb = options.velocity_full_mv ? cb_slot_vp : globals_slot;
+  const uint32_t vel_elem = options.velocity_full_mv ? 0u : 10u;
+  EmitDp4Cb(body, rB, 0x1u, vel_cb, vel_elem + 0u, rBestW, kSwizzleXYZW);
+  EmitDp4Cb(body, rB, 0x2u, vel_cb, vel_elem + 1u, rBestW, kSwizzleXYZW);
+  EmitDp4Cb(body, rB, 0x4u, vel_cb, vel_elem + 2u, rBestW, kSwizzleXYZW);
+  EmitDp4Cb(body, rB, 0x8u, vel_cb, vel_elem + 3u, rBestW, kSwizzleXYZW);
+
+  // ── Phase E carrier encode ──
+  // rV.xy = prevNDC, rV.zw = curNDC.xy; the raw delta (prev - cur) is written
+  // into TEXCOORD10.xy (the Phase E carrier). The paired patched PS reads it and
+  // writes o3 (the appended motion RTV). TEXCOORD10.zw stays the game's packed
+  // depth — the game's packed-depth G-buffer channel is never touched.
+  EmitDiv(body, rV, 0x3u, rB, kSwizzleXYZW, rB, kSwizzleWWWW);
+  EmitDiv(body, rV, 0xCu, rCurClip, kSwizzleXYXY, rCurClip, kSwizzleWWWW);
+  EmitMadImm4(body, rV, 0x1u, rV, kSwizzleZZZZ, 0xBF800000u, 0u, 0u, 0u, rV, kSwizzleXXXX);
+  EmitMadImm4(body, rV, 0x2u, rV, kSwizzleWWWW, 0u, 0xBF800000u, 0u, 0u, rV, kSwizzleYYYY);
+  EmitMovOutputMasked(body, tex10_out_reg, 0x3u, rV, kSwizzleXYXY);
+
+  // ── Rebuild the SHEX chunk token stream (mirrors PatchSkinnedVertexShader) ──
+  const uint32_t* tokens = reinterpret_cast<const uint32_t*>(shex_data + 8u);
+  const uint32_t old_token_dwords = (shex->size - 8u) / 4u;
+  uint32_t first_non_decl_dw = scan.first_non_decl / 4u - 2u;
+  uint32_t ret_dw = scan.ret_offset / 4u - 2u;
+
+  std::vector<uint32_t> new_tokens(tokens, tokens + old_token_dwords);
+  bool patched_temps = false;
+  if (scan.has_temps) {
+    for (uint32_t i = 0; i < first_non_decl_dw;) {
+      const uint32_t op = new_tokens[i] & 0x7FFu;
+      const uint32_t len = InstructionLength(new_tokens.data(), old_token_dwords, i);
+      if (op == OP_DCL_TEMPS && len >= 2u) {
+        new_tokens[i + 1u] = new_dcl_temps;
+        patched_temps = true;
+        break;
+      }
+      if (len == 0u) break;
+      i += len;
+    }
+  }
+  if (!patched_temps) {
+    std::vector<uint32_t> tmp;
+    EmitDclTemps(tmp, new_dcl_temps);
+    new_tokens.insert(new_tokens.begin(), tmp.begin(), tmp.end());
+    first_non_decl_dw += (uint32_t)tmp.size();
+    ret_dw += (uint32_t)tmp.size();
+  }
+
+  std::vector<uint32_t> assembled;
+  assembled.reserve(new_tokens.size() + decls.size() + body.size());
+  assembled.insert(assembled.end(), new_tokens.begin(), new_tokens.begin() + first_non_decl_dw);
+  assembled.insert(assembled.end(), decls.begin(), decls.end());
+  assembled.insert(assembled.end(), new_tokens.begin() + first_non_decl_dw, new_tokens.begin() + ret_dw);
+  assembled.insert(assembled.end(), body.begin(), body.end());
+  assembled.insert(assembled.end(), new_tokens.begin() + ret_dw, new_tokens.end());
+
+  const uint32_t new_shex_size = 8u + (uint32_t)assembled.size() * 4u;
+  const uint32_t delta = new_shex_size - shex->size;
+  const uint32_t new_file_size = (uint32_t)data.size() + delta;
+
+  std::vector<std::byte> out;
+  out.reserve(new_file_size);
+  out.insert(out.end(), data.begin(), data.begin() + 32);
+  std::memcpy(out.data() + 24u, &new_file_size, 4);
+  for (const auto& c : chunks) {
+    uint32_t off = c.offset;
+    if (c.offset > shex->offset) off += delta;
+    std::byte* p = reinterpret_cast<std::byte*>(&off);
+    out.insert(out.end(), p, p + 4);
+  }
+  for (const auto& c : chunks) {
+    if (c.offset == shex->offset) {
+      out.insert(out.end(), data.begin() + c.offset, data.begin() + c.offset + 4);  // name
+      std::byte* szp = reinterpret_cast<std::byte*>(const_cast<uint32_t*>(&new_shex_size));
+      out.insert(out.end(), szp, szp + 4);
+      out.insert(out.end(), data.begin() + c.offset + 8, data.begin() + c.offset + 12);
+      const uint32_t new_count = (uint32_t)assembled.size() + 2u;
+      std::byte* cp = reinterpret_cast<std::byte*>(const_cast<uint32_t*>(&new_count));
+      out.insert(out.end(), cp, cp + 4);
+      const std::byte* tb = reinterpret_cast<const std::byte*>(assembled.data());
+      out.insert(out.end(), tb, tb + assembled.size() * 4u);
+    } else {
+      const uint32_t clen = 8u + c.size;
+      out.insert(out.end(), data.begin() + c.offset, data.begin() + c.offset + clen);
+    }
+  }
+
+  // No OSGN append: the carrier rides the game's EXISTING TEXCOORD10.
+
+  // Fix the STAT chunk (instruction + temp counts).
+  {
+    DXBCHeader h3;
+    std::vector<ChunkInfo> chunks3;
+    if (ParseDXBC(out, h3, chunks3)) {
+      if (const ChunkInfo* stat = FindChunk(chunks3, "STAT")) {
+        if (stat->size >= 8u) {
+          uint8_t* stat_data =
+              reinterpret_cast<uint8_t*>(out.data()) + stat->offset + kChunkHeaderSize;
+          uint32_t new_instr = 0u;
+          size_t i = 0u;
+          while (i < assembled.size()) {
+            const uint32_t t = assembled[i];
+            const uint32_t len = t >> 24u;
+            if (len == 0u) break;
+            if (!IsDeclOpcode(t & 0x7FFu)) ++new_instr;
+            i += len;
+          }
+          std::memcpy(stat_data + 0u, &new_instr, 4);
+          std::memcpy(stat_data + 4u, &new_dcl_temps, 4);
+        }
+      }
+    }
+  }
+
+  WriteDXBCHash(out);
+  data = std::move(out);
+  uint32_t new_hash = 0u;
+  {
+    const uint8_t* c = reinterpret_cast<const uint8_t*>(data.data());
+    new_hash = ComputeCRC32(c, data.size());
+  }
+  if (out_new_hash != nullptr) *out_new_hash = new_hash;
+  if (out_info != nullptr) {
+    out_info->new_hash = new_hash;
+    out_info->prev_vp_cb_slot = cb_slot_vp;
+    out_info->prev_bone_t_slot = 0u;
+    out_info->bone_game_slot = 0u;
+    out_info->texcoord_index = 0u;
+    out_info->output_reg = 0u;
+    out_info->tex10_out_reg = tex10_out_reg;
+    out_info->outline_applied = false;
+    out_info->needs_no_binding = false;
+    out_info->velocity_emitted = true;
+    out_info->prev_world_cb_slot = cb_slot_w;
+    out_info->world_cb_element = world_elem;
+    out_info->rigid_patch = true;
+  }
+  return true;
+}
+
 // Phase E crash-bisection options (mirrors Phase B's PatchOptions). Each
 // variant strips one construct from the injected PS so we can isolate which
 // piece makes the NVIDIA driver hang the GPU on the linked patched VS+PS pair.
@@ -2454,7 +2646,7 @@ struct PixelShaderPatchOptions {
 // appended 32-bit motion RTV), and injects
 //   o3 = (prevNDC.x*0.5+0.5, prevNDC.y*0.5+0.5, 0, 1),  prevNDC = vN.xy / max(vN.w, 0.001)
 // before the trailing ret. Written UNCONDITIONALLY (no b13 read): the motion
-// RTV is only bound on char draws (MaybeAppendMotionRtv), so o3 is discarded
+// RTV is only bound on char draws (MaybeAppendMotionRtvStrict), so o3 is discarded
 // whenever per-object motion is off. Mirrors the VS patch's chunk/STAT/hash
 // fixups. No per-hash lists — this replaces the 22 hand-patched boot PSs.
 inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* out_new_hash,
@@ -2492,7 +2684,7 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
   // the appended motion output) or if the PS already reads TEXCOORD5 (would
   // collide with the prevClip input). Requiring max_out in {2,3} keeps the
   // appended output at register max_out+1 with semantic index max_out+1 — the
-  // RTV index MaybeAppendMotionRtv binds (it appends the motion RTV AFTER the
+  // RTV index MaybeAppendMotionRtvStrict binds (it appends the motion RTV AFTER the
   // game's bound RTs, so a 4-RT pass gets motion at index 4).
   uint32_t max_out = 0;
   uint32_t sv_target_count = 0;
