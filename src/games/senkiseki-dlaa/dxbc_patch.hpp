@@ -1538,6 +1538,11 @@ struct PatchOptions {
                                      // The compute then uses the delta directly (jitter-
                                      // compensated under Global jitter) instead of adding it
                                      // to the depth-reprojected camera path.
+  bool rigid_weapons = true;         // Phase W: patch weapon/accessory rigid VSs
+                                      // (LightDirForChar - weapons). Default on.
+  bool rigid_items = true;           // Phase W: patch rim-lit held-item rigid VSs
+                                      // (RimLitColor + WorldViewProjection - books/torches).
+                                      // Default on.
 };
 
 // Strong Phase E eligibility contract. A matching TEXCOORD10.zw read alone also
@@ -2476,7 +2481,14 @@ inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_n
       }
     }
   }
-  const bool is_character_attached = has_light_char || (has_rim_lit && has_wvp);
+  // Category toggles (DLAAPhaseWRigidWeapon / DLAAPhaseWRigidItem, both default
+  // on, restart-gated). Weapons/accessories = LightDirForChar; rim-lit held
+  // items (books/torches) = RimLitColor + WorldViewProjection. When a toggle is
+  // off, that category is NOT patched (falls back to camera MV only).
+  const bool is_weapon = has_light_char;
+  const bool is_item = has_rim_lit && has_wvp;
+  const bool is_character_attached =
+      (is_weapon && options.rigid_weapons) || (is_item && options.rigid_items);
   if (!is_character_attached || !has_world) return false;
   // Resolve the cbuffer's bind slot from the RDEF resource binding table.
   std::vector<ResourceBinding> bindings;

@@ -117,6 +117,11 @@ static float g_phasee_enabled = 0.f;  // MASTER GATE: the Phase E PS patcher (pa
                                       // transport was an EXPERIMENT and has been REMOVED on
                                       // purpose — the Phase E carrier is the ONLY supported
                                       // per-object velocity transport now.
+// Phase W: rigid object category toggles (weapons vs held items). Both default
+// ON and restart-gated (read at create_pipeline / shader patch time). When off,
+// that category's rigid VS is NOT patched, so those objects get camera MV only.
+static float g_phase_rigid_weapons = 1.f;  // DLAAPhaseWRigidWeapon: weapons/accessories (LightDirForChar)
+static float g_phase_rigid_items = 1.f;    // DLAAPhaseWRigidItem: rim-lit held items (books/torches)
 static float g_phase_mv_comp = 1.f;
 static float g_phase_mv_threshold_object = 0.2f;  // per-object / Prev-Bone motion deadband (px). DLAAMVThreshold now gates
                                                    // ONLY camera (depth-reprojection) MVs; this gates the per-object path.
@@ -5153,6 +5158,22 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Generic dedicated motion target: Phase B writes the raw object delta into existing TEXCOORD10.xy. Phase E classifies PSs structurally, but keeps their original bytecode at creation; it lazily creates/binds a patched twin only for a live patched-VS + exact three-RT G-buffer draw, then restores the original PS before every other draw. Requires restart.",
         .labels = {"Off","On"},
     },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseWRigidWeapon", .binding = &g_phase_rigid_weapons,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase W: Weapons/Accessories", .section = "Antialiasing",
+        .tooltip = "Patch weapon/accessory rigid objects (LightDirForChar) with per-object motion. Off = these objects are NOT patched and fall back to camera (depth-reprojected) MVs only. Requires restart (read at shader patch time).",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseWRigidItem", .binding = &g_phase_rigid_items,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase W: Held Items (books)", .section = "Antialiasing",
+        .tooltip = "Patch rim-lit held-item rigid objects like books/torches (RimLitColor + WorldViewProjection) with per-object motion. Off = these objects are NOT patched and fall back to camera (depth-reprojected) MVs only. Requires restart (read at shader patch time).",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
     // ── Shake-isolation diagnostics ──
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseMVComp", .binding = &g_phase_mv_comp,
@@ -5616,6 +5637,9 @@ static bool OnCreatePipeline(
     // expects, no camera/object decomposition in the compute (which shook the
     // character under the chase-cam cross-term). Restart-gated (read at patch).
     options.velocity_full_mv = g_phaseb_vel_full_mv >= 0.5f;
+    // Phase W category toggles (restart-gated, read at shader patch time).
+    options.rigid_weapons = g_phase_rigid_weapons >= 0.5f;
+    options.rigid_items = g_phase_rigid_items >= 0.5f;
     // Skinned VS first (Phase B). A RIGID character-path VS (weapon/accessory,
     // no blend indices) falls through to the rigid patcher (Phase W).
     if (!senkiseki3::dxbc::PatchSkinnedVertexShader(blob, &new_hash, &info, options)) {
