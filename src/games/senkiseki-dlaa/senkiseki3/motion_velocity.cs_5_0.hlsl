@@ -33,7 +33,7 @@
 //   c[9]     = JITTER_X(NDC), JITTER_Y(NDC), PER_OBJECT_MOTION, ZERO_MV
 //   c[10]    = MV_THRESHOLD(px), reserved, reserved, EXCLUDE_EFFECTS
 //   c[11]    = OBJECT_MV_THRESHOLD(px), reserved, reserved, reserved
-//   c[12]    = reserved, reserved, FULL_MV_MODE, reserved
+//   c[12]    = OBJECT_DEPTH_EPS, OBJECT_DEPTH_TEST, FULL_MV_MODE, reserved
 //   c[13]    = STATIC_CAMERA_SC, OBJECT_DELTA_DIRECT, MAX_VP_DELTA, (unused)
 //
 // SPDX-License-Identifier: MIT
@@ -50,7 +50,7 @@ cbuffer cb_push : register(b13) {
   float4 params1;   // x=jitter_x(NDC), y=jitter_y(NDC), z=per_object_motion, w=zero_mv
   float4 params2;   // x=mv_threshold(px), w=exclude_effects
   float4 params3;   // x=mv_threshold_object(px)
-  float4 params4;   // z=full_mv_mode
+  float4 params4;   // x=object_depth_epsilon, y=object_depth_test, z=full_mv_mode
   float4 params5;   // x=static_camera_shortcircuit, y=object_delta_direct,
                     // z=max_vp_delta (|prevVP-curVP| max; < 1e-4 => camera still),
                     // w=dedicated Phase E source
@@ -123,6 +123,18 @@ void main(uint2 pix : SV_DispatchThreadID)
         objectDeltaPx = float2(mrt.x * w * 0.5f, -mrt.y * h * 0.5f);
         if (max(abs(objectDeltaPx.x), abs(objectDeltaPx.y)) < 1000.0f)
           hasObjectMotion = true;
+        // ── Object-depth visibility test (DLAAPhaseObjectDepthTest) ──
+        // The patched Phase E PS stores the object's clip z/w (the SAME surface
+        // depth the rasterizer wrote to the depth buffer) in mrt.z. If it
+        // matches the captured scene depth (within epsilon), this object IS the
+        // visible surface and its MV wins. If it differs, the object is occluded
+        // by a later-drawn surface — fall back to the camera (depth-reprojected)
+        // MV, which is correct for whatever is actually visible.
+        if (params4.y > 0.5f && hasObjectMotion) {
+          float sceneDepth = g_srcDepth.Load(int3(pix, 0));
+          if (abs(mrt.z - sceneDepth) > params4.x)
+            hasObjectMotion = false;
+        }
       }
     } else {
       float code = round(mrt.r * 256.0f) * 65536.0f +

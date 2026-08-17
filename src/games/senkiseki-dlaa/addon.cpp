@@ -109,6 +109,7 @@ static float g_phase_object_delta_direct = 1.f;
 // anything stale is forced to prev=cur (delta 0, camera path). Every-frame
 // parts keep their constant real MV; intermittent parts go stable.
 static float g_phaseb_strict_prev = 0.f;
+static float g_char_motion_debug = 0.f;  // non-throttled per-draw logs for specific character VS/PS pairs
 static float g_phaseb_dump = 0.f;     // evidence capture: write patched/original blobs + drawtrace to renodx-dev/dump/phaseb/
 // ── Phase E velocity carrier ──
 static float g_phasee_enabled = 0.f;  // MASTER GATE: the Phase E PS patcher (patched char PS
@@ -122,6 +123,17 @@ static float g_phase_mv_threshold_object = 0.2f;  // per-object / Prev-Bone moti
                                                  // Addon-side (NOT in ShaderInjectData: growing that struct resizes the
                                                  // injected b13 cbuffer and breaks the boot PSs). Consumed only by
                                                  // BuildVelocityPC -> velocity compute params3.x.
+
+// ── Object-depth visibility test (DLAAPhaseObjectDepthTest) ──
+// The patched Phase E PS stores the object's clip z/w (the SAME surface depth
+// the rasterizer writes to the depth buffer — the game's own packed depth
+// o2 = v.z/v.w already derives from TEXCOORD10.zw) into the motion target's
+// .z. The velocity compute compares it against the captured scene depth: a
+// match means this object IS the visible surface (its MV wins); a mismatch
+// means the object is occluded by a later-drawn surface, so the compute falls
+// back to the camera (depth-reprojected) MV of whatever is actually visible.
+static float g_phase_object_depth_test = 1.f;    // DLAAPhaseObjectDepthTest: master toggle (live)
+static float g_phase_object_depth_eps = 0.001f;  // DLAAPhaseObjectDepthEps: epsilon in clip-z space (live)
 
 // ── CPU optimizations (A/B, all live — default OFF = current behavior).
 // Each can be enabled independently to measure its CPU saving with DLAA +
@@ -2981,6 +2993,73 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                     }
                   }
                 }
+                // ── Character Motion Debug Logs (DLAAPhaseBCharMotionDebug) ──
+                // NON-throttled per-draw diagnostic for SPECIFIC character
+                // VS/PS pairs. The flickering-MV ghosting is intermittent (one
+                // frame wrong, next frame right), so the 1/sec throttled logs
+                // hide the offending frame. Logs the game's CURRENT root bone,
+                // every prev slot's root bone, and the slot the patched VS's
+                // nearest-root-bone match would select (mirrors the GPU logic).
+                // On a STATIONARY (breathing-only) character a large dBone means
+                // the nearest-match picked a stale/identity slot - the smoking
+                // gun. EXPENSIVE: 5 GPU readbacks per matching draw.
+                {
+                  const uint32_t ph_char = CurrentPsHash(cmd_list, d);
+                  const bool cm_vs = (vh == 0x0B8C262Du || vh == 0x1D90829Au ||
+                                      it->second.new_hash == 0x0B8C262Du ||
+                                      it->second.new_hash == 0x1D90829Au);
+                  const bool cm_ps = (ph_char == 0x159A34A3u || ph_char == 0x1DE48D94u);
+                  if (g_char_motion_debug > 0.5f && (cm_vs || cm_ps)) {
+                    auto* ndev3 = reinterpret_cast<ID3D11Device*>(
+                        cmd_list->get_device()->get_native());
+                    auto read_bone_t = [&](ID3D11Buffer* src, float out[3]) {
+                      out[0] = out[1] = out[2] = 0.f;
+                      if (!ndev3 || !src) return;
+                      D3D11_BUFFER_DESC sd3 = {};
+                      sd3.ByteWidth = 64u;
+                      sd3.Usage = D3D11_USAGE_STAGING;
+                      sd3.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                      ID3D11Buffer* st3 = nullptr;
+                      if (FAILED(ndev3->CreateBuffer(&sd3, nullptr, &st3))) return;
+                      D3D11_BOX box3 = {0, 0, 0, 64u, 1, 1};
+                      ctx->CopySubresourceRegion(st3, 0, 0, 0, 0, src, 0, &box3);
+                      D3D11_MAPPED_SUBRESOURCE mm3 = {};
+                      if (SUCCEEDED(ctx->Map(st3, 0, D3D11_MAP_READ, 0, &mm3))) {
+                        const float* f3 = static_cast<const float*>(mm3.pData);
+                        out[0] = f3[3]; out[1] = f3[7]; out[2] = f3[11];
+                        ctx->Unmap(st3, 0);
+                      }
+                      st3->Release();
+                    };
+                    float gt[3] = {};
+                    float pt[DeviceData::kBoneSlots][3] = {};
+                    read_bone_t(gb, gt);
+                    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+                      read_bone_t(snap->prev_buffer[s], pt[s]);
+                    // Mirror the GPU nearest-root-bone selection (min |delta|^2).
+                    uint32_t best_slot = 0u; float best_d = 1e30f;
+                    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                      float dx = pt[s][0]-gt[0], dy = pt[s][1]-gt[1], dz = pt[s][2]-gt[2];
+                      float d = dx*dx+dy*dy+dz*dz;
+                      if (d < best_d) { best_d = d; best_slot = s; }
+                    }
+                    const float dbx = pt[best_slot][0]-gt[0];
+                    const float dby = pt[best_slot][1]-gt[1];
+                    const float dbz = pt[best_slot][2]-gt[2];
+                    char cline[1100];
+                    snprintf(cline, sizeof(cline),
+                      "[DLAA] charmv vs=0x%08X ps=0x%08X f=%llu key=0x%llX rr=%u cap=%u age=%llu refr=%d real=%d game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) best=%u d=%.4f dBone=(%+.4f,%+.4f,%+.4f)",
+                      vh, ph_char, (unsigned long long)d->frame_index,
+                      (unsigned long long)key, snap->rr, cap_slot,
+                      (unsigned long long)snap_age, (int)guard_fired,
+                      (int)(bound_snap != nullptr),
+                      gt[0], gt[1], gt[2],
+                      pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
+                      pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
+                      best_slot, best_d, dbx, dby, dbz);
+                    reshade::log::message(reshade::log::level::info, cline);
+                  }
+                }
                 // ── Diag (1/sec): confirm the game bone buffer + our prev
                 // snapshot hold REAL affine matrices. Identity/zero prev =>
                 // degenerate prevClip => E=0. ──
@@ -3075,12 +3154,15 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     if (vb0) vb0->Release();
     if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) LogBoneTopology(d);
   }
-  // Per-VS bind accounting: bound_real_prev_bones is true iff a REAL prev-bone
-  // snapshot was bound (vs the identity placeholder). Surfaces which VSs drive
-  // real prev-bone re-skinning vs identity fallback (garbage prevNDC).
+  // Per-VS bind accounting: bound_snap is non-null iff a REAL prev-bone
+  // snapshot was captured/bound this draw (vs the identity placeholder).
+  // Surfaces which VSs drive real prev-bone re-skinning vs identity fallback
+  // (garbage prevNDC). Use the LOCAL bound_snap here: the member
+  // bound_real_prev_bones is only set after this point (and reset by the
+  // restore), so reading it here always reported "identity".
   if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
       shader_injection.dlaa_per_object_motion >= 0.5f)
-    d->diag_bind_counts[vh][d->bound_real_prev_bones ? 0u : 1u]++;
+    d->diag_bind_counts[vh][bound_snap ? 0u : 1u]++;
   // Save the game's current bindings at these slots BEFORE overwriting them:
   // MaybeRestorePatchedBinds (next draw) puts them back so our extra structured
   // SRV / prevVP CB never leak into later draws that read the slot as a
@@ -4357,8 +4439,8 @@ static std::array<float, 56> BuildVelocityPC(DeviceData* d) {
   c[45] = d->prev_jitter_x;                       // params3.y — previous frame's jitter X (NDC)
   c[46] = d->prev_jitter_y;                       // params3.z — previous frame's jitter Y (NDC)
   c[47] = 0.f;
-  c[48] = 0.f;
-  c[49] = 0.f;
+  c[48] = g_phase_object_depth_eps;              // params4.x — object-depth visibility epsilon (clip-z)
+  c[49] = g_phase_object_depth_test;             // params4.y — object-depth visibility test toggle
   c[50] = g_phaseb_vel_full_mv;                    // params4.z — full-MV encode (VS delta = complete motion)
   c[51] = 1.f;  // params4.w — Global jitter: remove J_current from the full-MV carrier
   // params5 — root-cause fixes (live toggles, tested separately):
@@ -5031,6 +5113,30 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Root-cause fix 3: only use a prev-bone snapshot when it is EXACTLY 1 frame old. Default (Off) allows a 2-frame-old prev, whose 2-frame accumulated delta intermittently crosses the 12px confidence gate -> the flashing yellow/purple HSV regions on intermittently-drawn parts (and wrong-magnitude MVs that poison DLSS when they move). On = anything stale is forced to prev=cur (delta 0, camera path): every-frame parts keep their constant real MV, intermittent parts go stable. Live (no restart).",
         .labels = {"Off","On"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseObjectDepthTest", .binding = &g_phase_object_depth_test,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Phase Object Depth Test", .section = "Antialiasing",
+        .tooltip = "Reject stale per-object MVs where the character is occluded. The patched Phase E PS stores the character's clip z/w in the motion target; the velocity compute only uses the object MV when that matches the captured scene depth (within DLAAPhaseObjectDepthEps). A mismatch means a later-drawn surface (e.g. a wall) covers the character, so the compute falls back to the correct camera MV of the visible surface. Fixes occluded characters smearing their motion onto foreground geometry. Live.",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseObjectDepthEps", .binding = &g_phase_object_depth_eps,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.001f, .label = "Phase Object Depth Epsilon", .section = "Antialiasing",
+        .tooltip = "Clip-z tolerance for the object-depth visibility test. The scene depth is R24G8 (24-bit unorm, ~6e-8 quantization in clip-z), so 0.001 comfortably absorbs quantization while still rejecting any meaningful occlusion gap. Smaller = stricter; larger = more forgiving. Live.",
+        .min = 0.00001f, .max = 0.1f, .format = "%.5f",
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    // Non-throttled per-draw motion logs for the two flickering-MV characters.
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseBCharMotionDebug", .binding = &g_char_motion_debug,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Character Motion Debug Logs", .section = "Antialiasing",
+        .tooltip = "Non-throttled per-draw log for the two ghosting characters (VS 0x0B8C262D / 0x1D90829A, PS 0x159A34A3 / 0x1DE48D94). Logs the game's current root bone, all 4 prev-bone slots' root bones, and the nearest-root-bone slot the patched VS selects - so the intermittent wrong frame can be caught (the 1/sec throttled logs hide it). EXPENSIVE (GPU readback every matching draw); debug only. Live.",
+        .labels = {"Off","On"},
     },
     // Phase B generic-patch isolation (crash bisection).
     new renodx::utils::settings::Setting{

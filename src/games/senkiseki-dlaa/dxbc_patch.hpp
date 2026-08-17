@@ -2893,8 +2893,17 @@ inline bool PatchPerObjectPixelShader(std::vector<std::byte>& data, uint32_t* ou
     // Phase E carrier mode: the patched VS writes the raw object delta into
     // TEXCOORD10.xy, while the game PS reads only TEXCOORD10.zw. Keep the
     // existing linkage and emit the carrier directly to the dedicated target.
+    // Object-depth visibility test (DLAAPhaseObjectDepthTest): o3.z now holds
+    // the object's clip z/w (the SAME surface depth the rasterizer writes to
+    // the depth buffer — the game's own packed depth o2 = v.z/v.w already
+    // derives from TEXCOORD10.zw). The velocity compute compares it against the
+    // captured scene depth to reject stale object MVs where the character is
+    // occluded by a later-drawn surface.
     EmitMovImm4(body, rT, 0xFu, 0u, 0u, 0u, 0x3F800000u);
-    EmitMovInput(body, rT, 0x3u, carrier_reg, kSwizzleXYXY);
+    EmitMovInput(body, rT, 0x3u, carrier_reg, kSwizzleXYXY);        // rT.xy = object delta
+    EmitMovInput(body, rHalf, 0xCu, carrier_reg, kSwizzleZZZW);     // rHalf.zw = clip z/w
+    EmitMaxImm1(body, rHalf, 0x8u, rHalf, kSwizzleWWWW, 0x3A83126Fu);  // rHalf.w = max(w, 0.001)
+    EmitDiv(body, rT, 0x4u, rHalf, kSwizzleZZZZ, rHalf, kSwizzleWWWW); // rT.z = clip.z / clip.w
     if (options.no_new_output)
       EmitMovOutputMasked(body, max_out, 0x3u, rT, kSwizzleXYXY);
     else
