@@ -335,12 +335,16 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // by the bone-buffer handle: the game rotates a RING of bone buffers (frame N
   // writes buffer[N%4]), so a handle-keyed twin is 3-4 frames stale. Capturing
   // at draw time keyed by the stable instance is ring-agnostic.
+  // Number of prev-bone SRV slots per skinned snapshot (nearest-root-bone
+  // selection). MUST equal kBoneSlots in dxbc_patch.hpp.
+  static constexpr uint32_t kBoneSlots = 4u;
   struct PrevBoneSnap {
-    ID3D11Buffer* cur_buffer = nullptr;    // addon-owned structured buffer (this frame's bones)
-    ID3D11ShaderResourceView* cur_srv = nullptr;
-    ID3D11Buffer* prev_buffer = nullptr;   // addon-owned structured buffer (prev frame's bones)
-    ID3D11ShaderResourceView* prev_srv = nullptr;
+    ID3D11Buffer* cur_buffer[kBoneSlots] = {};    // addon-owned structured buffers (this frame's bones)
+    ID3D11ShaderResourceView* cur_srv[kBoneSlots] = {};
+    ID3D11Buffer* prev_buffer[kBoneSlots] = {};   // addon-owned structured buffers (prev frame's bones)
+    ID3D11ShaderResourceView* prev_srv[kBoneSlots] = {};
     uint32_t size = 0u;                    // byte size (== game bone buffer)
+    uint32_t rr = 0u;                      // round-robin capture cursor (reset at present)
     uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
     uint64_t prev_capture_frame = 0u;      // frame the CURRENT prev_buffer content was captured (freshness)
     // OPT 1: set at the draw-time cur capture, cleared at present after the
@@ -350,7 +354,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     bool drawn_since_last_present = false;
   };
   std::unordered_map<uint64_t, PrevBoneSnap> prev_bone_snaps;  // key = instance composite
-  ID3D11ShaderResourceView* last_bound_twin_srv = nullptr;  // prev snap bound this draw (for restore)
+  ID3D11ShaderResourceView* last_bound_bone_srv[kBoneSlots] = {};  // our bound SRVs (is-ours check)
+  bool bound_real_prev_bones = false;  // this draw bound a real per-instance snapshot (vs identity)
 
   // ── Phase W: per-instance prev-World snapshots (rigid weapon/object path) ──
   // The weapon's per-object motion is its World matrix (b0 c44..c47). At draw time
@@ -394,6 +399,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   //    ring-period stale; the key must NOT include the handle).
   std::unordered_map<uint64_t, std::unordered_set<uint64_t>> diag_bone_keys;  // bone -> keys (sharing)
   std::unordered_map<uint64_t, std::unordered_set<uint64_t>> diag_key_bones;  // key -> bones (ring)
+  std::unordered_map<uint64_t, uint64_t> diag_robot_last_frame;  // (vh<<32|ph) -> last robot-diag log frame
   // Per-VS bind summary: vs-hash -> {real prev-bone snapshot binds, identity
   // placeholder binds}. Tells us which patched VSs actually re-skin with the
   // PREVIOUS frame's bones and which fall back to the identity placeholder
@@ -502,7 +508,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // into LATER draws whose VS may read that slot as a Texture2D -> GPU fault
   // (TDR). We save the game's prior bindings here and restore them at the next
   // draw (only if our placeholder is still bound, i.e. the game didn't rebind).
-  ID3D11ShaderResourceView* prev_bone_saved_srv = nullptr;
+  ID3D11ShaderResourceView* prev_bone_saved_srv[kBoneSlots] = {};
   ID3D11Buffer* prev_vp_saved_cb = nullptr;
   uint32_t prev_bone_slot = 0u;
   uint32_t prev_vp_slot = 0u;
@@ -661,17 +667,23 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   if (d->prev_bones_srv) { d->prev_bones_srv->Release(); d->prev_bones_srv = nullptr; }
   if (d->prev_bones_buffer) { d->prev_bones_buffer->Release(); d->prev_bones_buffer = nullptr; }
   for (auto& [key, snap] : d->prev_bone_snaps) {
-    if (snap.cur_srv) snap.cur_srv->Release();
-    if (snap.cur_buffer) snap.cur_buffer->Release();
-    if (snap.prev_srv) snap.prev_srv->Release();
-    if (snap.prev_buffer) snap.prev_buffer->Release();
+    (void)key;
+    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+      if (snap.cur_srv[s]) snap.cur_srv[s]->Release();
+      if (snap.cur_buffer[s]) snap.cur_buffer[s]->Release();
+      if (snap.prev_srv[s]) snap.prev_srv[s]->Release();
+      if (snap.prev_buffer[s]) snap.prev_buffer[s]->Release();
+    }
   }
   d->prev_bone_snaps.clear();
   d->diag_bone_keys.clear();
   d->diag_key_bones.clear();
   d->diag_topology_log_frame = 0u;
-  d->last_bound_twin_srv = nullptr;
-  if (d->prev_bone_saved_srv) { d->prev_bone_saved_srv->Release(); d->prev_bone_saved_srv = nullptr; }
+  d->bound_real_prev_bones = false;
+  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+    if (d->prev_bone_saved_srv[s]) { d->prev_bone_saved_srv[s]->Release(); d->prev_bone_saved_srv[s] = nullptr; }
+    d->last_bound_bone_srv[s] = nullptr;
+  }
   if (d->prev_vp_saved_cb) { d->prev_vp_saved_cb->Release(); d->prev_vp_saved_cb = nullptr; }
   d->prev_bone_slot = 0u;
   d->prev_vp_slot = 0u;
@@ -1604,10 +1616,12 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
   if (it != d->prev_bone_snaps.end()) {
     if (it->second.size == bytes) return &it->second;
     // Size changed (rare): release and recreate below.
-    if (it->second.cur_srv) it->second.cur_srv->Release();
-    if (it->second.cur_buffer) it->second.cur_buffer->Release();
-    if (it->second.prev_srv) it->second.prev_srv->Release();
-    if (it->second.prev_buffer) it->second.prev_buffer->Release();
+    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+      if (it->second.cur_srv[s]) it->second.cur_srv[s]->Release();
+      if (it->second.cur_buffer[s]) it->second.cur_buffer[s]->Release();
+      if (it->second.prev_srv[s]) it->second.prev_srv[s]->Release();
+      if (it->second.prev_buffer[s]) it->second.prev_buffer[s]->Release();
+    }
     d->prev_bone_snaps.erase(it);
   }
   // LRU evict when at capacity. Raised 512 -> 4096: the boneTopology diagnostic
@@ -1615,7 +1629,9 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
   // cap — every new key evicted+recreated an older snapshot, and each recreation
   // served identity-content prev for a frame or two (bind-pose garbage MVs ->
   // intermittent shaking). At 4096 the active set never churns (each snap is
-  // ~2 * bytes; ~16KB typical -> ~64MB worst case, acceptable).
+  // ~2*K * bytes = 8 * bytes with K=4; ~16KB typical -> ~128KB/snap. The
+  // ~768-buffer active set is ~96MB, and the 4096 LRU cap bounds the worst case
+  // (~512MB) — matches the rigid path's K-slot footprint).
   if (d->prev_bone_snaps.size() >= 4096u) {
     uint64_t oldest = UINT64_MAX;
     uint64_t oldest_key = 0u;
@@ -1626,10 +1642,12 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
       }
     }
     auto& o = d->prev_bone_snaps[oldest_key];
-    if (o.cur_srv) o.cur_srv->Release();
-    if (o.cur_buffer) o.cur_buffer->Release();
-    if (o.prev_srv) o.prev_srv->Release();
-    if (o.prev_buffer) o.prev_buffer->Release();
+    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+      if (o.cur_srv[s]) o.cur_srv[s]->Release();
+      if (o.cur_buffer[s]) o.cur_buffer[s]->Release();
+      if (o.prev_srv[s]) o.prev_srv[s]->Release();
+      if (o.prev_buffer[s]) o.prev_buffer[s]->Release();
+    }
     d->prev_bone_snaps.erase(oldest_key);
   }
   // Create the cur/prev pair (DEFAULT structured buffers, same size + SRVs).
@@ -1668,8 +1686,26 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
     }
     return true;
   };
-  if (!create_pair(&snap.cur_buffer, &snap.cur_srv)) return nullptr;
-  if (!create_pair(&snap.prev_buffer, &snap.prev_srv)) return nullptr;
+  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+    if (!create_pair(&snap.cur_buffer[s], &snap.cur_srv[s])) {
+      for (uint32_t j = 0u; j < s; ++j) {
+        if (snap.cur_srv[j]) snap.cur_srv[j]->Release();
+        if (snap.cur_buffer[j]) snap.cur_buffer[j]->Release();
+      }
+      return nullptr;
+    }
+  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+    if (!create_pair(&snap.prev_buffer[s], &snap.prev_srv[s])) {
+      for (uint32_t j = 0u; j < s; ++j) {
+        if (snap.prev_srv[j]) snap.prev_srv[j]->Release();
+        if (snap.prev_buffer[j]) snap.prev_buffer[j]->Release();
+      }
+      for (uint32_t j = 0u; j < DeviceData::kBoneSlots; ++j) {
+        if (snap.cur_srv[j]) snap.cur_srv[j]->Release();
+        if (snap.cur_buffer[j]) snap.cur_buffer[j]->Release();
+      }
+      return nullptr;
+    }
   snap.size = bytes;
   snap.last_draw_frame = 0u;
   d->prev_bone_snaps.emplace(key, snap);
@@ -2229,9 +2265,12 @@ static void CapturePrevBones(reshade::api::command_list* cmd_list, DeviceData* d
     // draw-time capture (NOT a frame counter: d->frame_index advances inside
     // RunDLAA before present, so a counter comparison always fails here).
     if (g_opt_promote_drawn_only >= 0.5f && !snap.drawn_since_last_present) continue;
-    if (snap.prev_buffer && snap.cur_buffer) ctx->CopyResource(snap.prev_buffer, snap.cur_buffer);
+    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+      if (snap.prev_buffer[s] && snap.cur_buffer[s])
+        ctx->CopyResource(snap.prev_buffer[s], snap.cur_buffer[s]);
     snap.prev_capture_frame = snap.last_draw_frame;  // prev now holds the cur captured at this frame
     snap.drawn_since_last_present = false;
+    snap.rr = 0u;
   }
 }
 
@@ -2575,24 +2614,30 @@ static void MaybeRestorePatchedBinds(reshade::api::command_list* cmd_list, Devic
   if (!d || !d->patched_bind_restore_pending) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return;
-  ID3D11ShaderResourceView* rb_t = nullptr;
   ID3D11Buffer* rb_b = nullptr;
-  ctx->VSGetShaderResources(d->prev_bone_slot, 1u, &rb_t);
   ctx->VSGetConstantBuffers(d->prev_vp_slot, 1u, &rb_b);
-  const bool t_is_ours = (rb_t == d->prev_bones_srv) || (rb_t == d->last_bound_twin_srv);
   const bool b_is_ours = (rb_b == d->prev_vp_cb);
-  if (t_is_ours) ctx->VSSetShaderResources(d->prev_bone_slot, 1u, &d->prev_bone_saved_srv);
   if (b_is_ours) {
     ID3D11Buffer* cb = d->prev_vp_saved_cb;
     ctx->VSSetConstantBuffers(d->prev_vp_slot, 1u, &cb);
   }
-  if (rb_t) rb_t->Release();
   if (rb_b) rb_b->Release();
-  if (d->prev_bone_saved_srv) { d->prev_bone_saved_srv->Release(); d->prev_bone_saved_srv = nullptr; }
+  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+    ID3D11ShaderResourceView* rb_t = nullptr;
+    ctx->VSGetShaderResources(d->prev_bone_slot + s, 1u, &rb_t);
+    const bool t_is_ours = (rb_t == d->prev_bones_srv) || (rb_t == d->last_bound_bone_srv[s]);
+    if (t_is_ours) {
+      ID3D11ShaderResourceView* sv = d->prev_bone_saved_srv[s];
+      ctx->VSSetShaderResources(d->prev_bone_slot + s, 1u, &sv);
+    }
+    if (rb_t) rb_t->Release();
+    if (d->prev_bone_saved_srv[s]) { d->prev_bone_saved_srv[s]->Release(); d->prev_bone_saved_srv[s] = nullptr; }
+    d->last_bound_bone_srv[s] = nullptr;
+  }
   if (d->prev_vp_saved_cb) { d->prev_vp_saved_cb->Release(); d->prev_vp_saved_cb = nullptr; }
   d->prev_bone_slot = 0u;
   d->prev_vp_slot = 0u;
-  d->last_bound_twin_srv = nullptr;
+  d->bound_real_prev_bones = false;
   // Restore the RIGID path's prev-World cbuffer slots (bound by MaybeBindPatchedRigidVs).
   if (d->prev_world_slot != 0u) {
     for (uint32_t s = 0u; s < DeviceData::kRigidPrevWorldSlots; ++s) {
@@ -2645,8 +2690,10 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   // not a bone buffer (e.g. a texture), and feeding a texture to the patched
   // VS's ld_structured t#,64 is a descriptor-kind mismatch that TDRs the GPU.
   if (!EnsurePrevBonesSrv(cmd_list->get_device(), d)) return;
-  ID3D11ShaderResourceView* bone_srv = d->prev_bones_srv;
-  d->last_bound_twin_srv = nullptr;
+  // Set when a real per-instance snapshot was captured this draw. Determines
+  // whether the K prev-bone slots get the real prev SRVs (snapshot present) or
+  // the identity placeholder (never leave a patched skinned VS slot unbound).
+  DeviceData::PrevBoneSnap* bound_snap = nullptr;
   if (shader_injection.dlaa_per_object_motion >= 0.5f &&
       (g_opt_bind_capture_only < 0.5f ||
        d->phasee_ps_candidates.contains(CurrentPsHash(cmd_list, d)))) {
@@ -2690,13 +2737,12 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
       // bits, so a naive (b0<<32)^vb0 would collide; this mixes both fully.
       const uint64_t b0k = (uint64_t)(uintptr_t)b0;
       const uint64_t vbk = (uint64_t)(uintptr_t)vb0;
-      // Base instance key (cb0 + VB0). NOTE: cb0 is the SHARED scene/globals
-      // cbuffer in this engine (the patched VS reads ViewProjection at
-      // cb0[10..13] from it), and VB0 is shared by every character using the
-      // same mesh — so neither alone discriminates a character. The bone-buffer
-      // handle (folded in below once confirmed stride-64 structured) is the
-      // per-character discriminator.
-      const uint64_t base = b0k ^ (vbk + 0x9e3779b97f4a7c15ull + (b0k << 6) + (b0k >> 2));
+      // Per-mesh identity = (cb0 + VB0). cb0 is the SHARED scene/globals
+      // cbuffer (the patched VS reads ViewProjection at cb0[10..13] from it)
+      // and VB0 is shared by every same-mesh instance, so neither alone
+      // discriminates a mesh; the bone-buffer handle (folded into the key below
+      // once confirmed stride-64 structured) is the per-instance discriminator.
+      // The key itself is built further down with a proper 64-bit mix.
       ID3D11ShaderResourceView* game_srv = nullptr;
       ctx->VSGetShaderResources(it->second.bone_game_slot, 1u, &game_srv);
       if (game_srv) {
@@ -2718,25 +2764,27 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
               // snapshot (prev becomes ring-period stale, but never MIXED across
               // characters).
               const uint64_t gbk = (uint64_t)(uintptr_t)gb;
-              // ── RING COLLAPSE (round 17) ──
-              // The game rotates a RING of per-frame buffers (bone SRVs and/or
-              // per-slot cb0s) for each character: the same instance draws with
-              // a DIFFERENT key every frame, with the low 16 bits cycling
-              // through exactly 16 values (0xCD94AA55D2F0EEF5 -> ...F275 ->
-              // ...8FF5 -> ...C3B5 -> ... repeats after 16). Keying the
-              // snapshot by the full key gave every ring slot its own
-              // snapshot, so a slot's prev = that slot's pose from 16 frames
-              // ago (snap age=16, bone offset ~15 frames -> ~1.07 units ->
-              // ~1200px at normal distance -> rejected by the 1000px compute
-              // cap -> camera fallback = "same as camera"; close-up it passed
-              // the cap -> "only shows near camera"). Masking the cycling low
-              // 16 bits collapses the whole ring into ONE snapshot per
-              // character: cur is overwritten every frame with the CURRENT
-              // pose (the game always binds a freshly-written slot), prev is
-              // promoted from cur at present, so prev = the PREVIOUS frame's
-              // pose = truly 1 frame old.
+              // ── RING COLLAPSE + full-entropy key ──
+              // The game rotates a RING of per-frame bone buffers: the same mesh
+              // binds a DIFFERENT bone handle every frame (pool addresses cycle
+              // through the low bits). Mask the ROTATING low bits of the bone
+              // handle BEFORE mixing so the whole ring collapses to ONE snapshot
+              // per mesh (cur = latest pose each frame, prev = last frame's pose).
+              // The stable per-mesh identity (b0 + vb0) is mixed at FULL entropy
+              // with a proper 64-bit mix (murmur3 finalizer). The old boost
+              // hash_combine left the key's high bits constant-dominated (every
+              // object shared the same 0xCD94... prefix), so after masking only
+              // ~5 bits distinguished objects -> DIFFERENT meshes collided and
+              // the promoted prev-bone picked up a neighbour's skeleton (the
+              // robot's static arms re-skinned ~15-20 units away).
+              const auto mix_key = [](uint64_t x) {
+                x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+                x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+                x ^= x >> 33;
+                return x;
+              };
               const uint64_t key =
-                  (base ^ (gbk + 0x9e3779b97f4a7c15ull + (base << 6) + (base >> 2))) & ~0xFFFFull;
+                  mix_key(b0k ^ mix_key(vbk) ^ mix_key(gbk & ~0xFFFFFull));
               // ── Diag (throttled): which key component cycles (b0 / vb0 /
               // bone handle). Confirms the ring composition for the next log. ──
               if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
@@ -2807,7 +2855,15 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // (CapturePrevBones), so t1 = prev = the PREVIOUS frame's
                 // FINAL pose = truly 1 frame old for the main-pass draws.
                 const uint64_t prev_last_draw = snap->last_draw_frame;
-                if (snap->cur_buffer) ctx->CopyResource(snap->cur_buffer, gb);
+                // Round-robin capture: write THIS frame's bones into slot rr and
+                // advance the cursor. Same-mesh instances (e.g. two identical
+                // robots) share ONE snapshot, so consecutive draws rotate through
+                // the K cur slots; at present all K are promoted and the patched
+                // VS picks the slot whose ROOT bone is nearest its own (mirrors
+                // the rigid path's World nearest-match).
+                const uint32_t cap_slot = snap->rr % DeviceData::kBoneSlots;
+                snap->rr = (snap->rr + 1u) % DeviceData::kBoneSlots;
+                if (snap->cur_buffer[cap_slot]) ctx->CopyResource(snap->cur_buffer[cap_slot], gb);
                 // OPT 1: mark this snap's cur as refreshed during THIS present
                 // cycle, so CapturePrevBones promotes exactly the snaps that
                 // were actually drawn (frame counters are unreliable at present
@@ -2835,11 +2891,12 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 const uint64_t snap_age = snap->prev_capture_frame
                     ? (d->frame_index - snap->prev_capture_frame) : UINT64_MAX;
                 const uint64_t max_stale_age = (g_phaseb_strict_prev > 0.5f) ? 1u : 2u;
-                const bool guard_fired =
-                    snap_age > max_stale_age && snap->prev_buffer && snap->cur_buffer;
-                if (guard_fired) ctx->CopyResource(snap->prev_buffer, snap->cur_buffer);
-                bone_srv = snap->prev_srv;
-                d->last_bound_twin_srv = snap->prev_srv;
+                const bool guard_fired = snap_age > max_stale_age;
+                if (guard_fired)
+                  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+                    if (snap->prev_buffer[s] && snap->cur_buffer[s])
+                      ctx->CopyResource(snap->prev_buffer[s], snap->cur_buffer[s]);
+                bound_snap = snap;
                 // ── Diag (throttled per key): the snapshot's prev-bone
                 // freshness/state at THIS draw. age = frames since the prev
                 // content was captured; captured = this draw is the first draw
@@ -2858,6 +2915,72 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                                vh, key, snap_age, (int)captured_this, (int)refreshed_this,
                                snap->prev_capture_frame, snap->last_draw_frame, snap->size);
                 }
+                // ── Robot hash-gated diagnostic ──
+                // The robot (VS 0x2485824C -> 0x67182A05) draws its BODY
+                // (PS 0x657DB305) and ARMS (PS 0x1D60B0C2) with the SAME
+                // skinned VS but DIFFERENT meshes (different vb0 => different
+                // bone-snapshot keys). The arms emit a WRONG MV while the robot
+                // is static. Log, per robot draw (1/sec each), the snapshot key
+                // components + the FIRST bone's translation (game=cur vs
+                // promoted prev) so we can see whether the arms' prev-bone
+                // snapshot is stale or contaminated (age > 2, or prev != cur).
+                {
+                  const uint32_t ph_robot = CurrentPsHash(cmd_list, d);
+                  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+                      (vh == 0x2485824Cu || vh == 0x67182A05u ||
+                       ph_robot == 0x657DB305u || ph_robot == 0x1D60B0C2u)) {
+                    const uint64_t rkey = ((uint64_t)vh << 32u) | ph_robot;
+                    auto& rlast = d->diag_robot_last_frame[rkey];
+                    if (d->frame_index - rlast >= 60u) {
+                      rlast = d->frame_index;
+                      auto* ndev3 = reinterpret_cast<ID3D11Device*>(
+                          cmd_list->get_device()->get_native());
+                      auto read_bone_t = [&](ID3D11Buffer* src, float out[3]) {
+                        out[0] = out[1] = out[2] = 0.f;
+                        if (!ndev3 || !src) return;
+                        D3D11_BUFFER_DESC sd3 = {};
+                        sd3.ByteWidth = 64u;
+                        sd3.Usage = D3D11_USAGE_STAGING;
+                        sd3.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        ID3D11Buffer* st3 = nullptr;
+                        if (FAILED(ndev3->CreateBuffer(&sd3, nullptr, &st3))) return;
+                        D3D11_BOX box3 = {0, 0, 0, 64u, 1, 1};
+                        ctx->CopySubresourceRegion(st3, 0, 0, 0, 0, src, 0, &box3);
+                        D3D11_MAPPED_SUBRESOURCE mm3 = {};
+                        if (SUCCEEDED(ctx->Map(st3, 0, D3D11_MAP_READ, 0, &mm3))) {
+                          const float* f3 = static_cast<const float*>(mm3.pData);
+                          out[0] = f3[3]; out[1] = f3[7]; out[2] = f3[11];
+                          ctx->Unmap(st3, 0);
+                        }
+                        st3->Release();
+                      };
+                      float gt[3] = {};
+                      float pt[DeviceData::kBoneSlots][3] = {};
+                      read_bone_t(gb, gt);
+                      for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+                        read_bone_t(snap->prev_buffer[s], pt[s]);
+                      // Nearest prev slot to the game root (the VS picks this on-GPU).
+                      float best_t[3] = {}; float best_d = 1e30f;
+                      for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                        float dx = pt[s][0]-gt[0], dy = pt[s][1]-gt[1], dz = pt[s][2]-gt[2];
+                        float d = dx*dx+dy*dy+dz*dz;
+                        if (d < best_d) { best_d = d; best_t[0]=pt[s][0]; best_t[1]=pt[s][1]; best_t[2]=pt[s][2]; }
+                      }
+                      char rline[720];
+                      snprintf(rline, sizeof(rline),
+                        "[DLAA] robot vs=0x%08X ps=0x%08X key=0x%llX b0=0x%llX vb=0x%llX bone=0x%llX age=%llu cap=%d refr=%d game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) dBone=(%+.4f,%+.4f,%+.4f)",
+                        vh, ph_robot, (unsigned long long)key,
+                        (unsigned long long)b0k, (unsigned long long)vbk,
+                        (unsigned long long)gbk, (unsigned long long)snap_age,
+                        (int)(prev_last_draw != d->frame_index), (int)guard_fired,
+                        gt[0], gt[1], gt[2],
+                        pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
+                        pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
+                        best_t[0]-gt[0], best_t[1]-gt[1], best_t[2]-gt[2]);
+                      reshade::log::message(reshade::log::level::info, rline);
+                    }
+                  }
+                }
                 // ── Diag (1/sec): confirm the game bone buffer + our prev
                 // snapshot hold REAL affine matrices. Identity/zero prev =>
                 // degenerate prevClip => E=0. ──
@@ -2867,7 +2990,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   auto* ndev = reinterpret_cast<ID3D11Device*>(
                       cmd_list->get_device()->get_native());
                   DumpBoneFirstMat(ndev, ctx, gb, "game");
-                  DumpBoneFirstMat(ndev, ctx, snap->prev_buffer, "prev");
+                  DumpBoneFirstMat(ndev, ctx, snap->prev_buffer[0], "prev0");
                 }
                 // ── Diag (1/sec): what prevVP (cb1) and the game's b0 c10..13
                 // ACTUALLY hold at THIS draw, and the delta the VS would
@@ -2909,7 +3032,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                     read_cb(b0, off, b0m);
                   }
                   read_cb(gb, 0u, gb_m);
-                  read_cb(snap->prev_buffer, 0u, pb_m);
+                  read_cb(snap->prev_buffer[0], 0u, pb_m);
                   const float* f = cb1m;
                   LogThrottled(ThrottleKey("draw-cb1", vh, 0u, 0u).c_str(),
                                reshade::log::level::info, 1u, 60u,
@@ -2952,28 +3075,41 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     if (vb0) vb0->Release();
     if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) LogBoneTopology(d);
   }
-  // Per-VS bind accounting: last_bound_twin_srv is non-null iff a REAL prev-bone
+  // Per-VS bind accounting: bound_real_prev_bones is true iff a REAL prev-bone
   // snapshot was bound (vs the identity placeholder). Surfaces which VSs drive
   // real prev-bone re-skinning vs identity fallback (garbage prevNDC).
   if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
       shader_injection.dlaa_per_object_motion >= 0.5f)
-    d->diag_bind_counts[vh][d->last_bound_twin_srv ? 0u : 1u]++;
+    d->diag_bind_counts[vh][d->bound_real_prev_bones ? 0u : 1u]++;
   // Save the game's current bindings at these slots BEFORE overwriting them:
   // MaybeRestorePatchedBinds (next draw) puts them back so our extra structured
   // SRV / prevVP CB never leak into later draws that read the slot as a
   // Texture2D/other type (that descriptor-kind mismatch TDRs the GPU).
-  ID3D11ShaderResourceView* cur_t = nullptr;
+  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+    ID3D11ShaderResourceView* cur_t = nullptr;
+    ctx->VSGetShaderResources(it->second.prev_bone_t_slot + s, 1u, &cur_t);
+    if (d->prev_bone_saved_srv[s]) d->prev_bone_saved_srv[s]->Release();
+    d->prev_bone_saved_srv[s] = cur_t;  // takes the ref
+  }
   ID3D11Buffer* cur_b = nullptr;
-  ctx->VSGetShaderResources(it->second.prev_bone_t_slot, 1u, &cur_t);
   ctx->VSGetConstantBuffers(it->second.prev_vp_cb_slot, 1u, &cur_b);
-  if (d->prev_bone_saved_srv) d->prev_bone_saved_srv->Release();
   if (d->prev_vp_saved_cb) d->prev_vp_saved_cb->Release();
-  d->prev_bone_saved_srv = cur_t;  // takes the ref
   d->prev_vp_saved_cb = cur_b;     // takes the ref
   d->prev_bone_slot = it->second.prev_bone_t_slot;
   d->prev_vp_slot = it->second.prev_vp_cb_slot;
   d->patched_bind_restore_pending = true;
-  ctx->VSSetShaderResources(it->second.prev_bone_t_slot, 1u, &bone_srv);
+  // Bind all K prev-bone slots: the instance's real prev SRVs when a snapshot
+  // was captured this draw, else the identity placeholder at EVERY slot (an
+  // unbound structured-buffer slot a patched VS reads is a GPU fault/TDR).
+  ID3D11ShaderResourceView* bone_srvs[DeviceData::kBoneSlots];
+  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+    ID3D11ShaderResourceView* sv = d->prev_bones_srv;
+    if (bound_snap && bound_snap->prev_srv[s]) sv = bound_snap->prev_srv[s];
+    bone_srvs[s] = sv;
+    d->last_bound_bone_srv[s] = sv;
+  }
+  d->bound_real_prev_bones = (bound_snap != nullptr);
+  ctx->VSSetShaderResources(it->second.prev_bone_t_slot, DeviceData::kBoneSlots, bone_srvs);
   // PrevVP cbuffer at b#.
   if (d->prev_vp_cb) {
     ID3D11Buffer* cbs[1] = {d->prev_vp_cb};
@@ -2986,7 +3122,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                  "[DLAA] phaseB: bind patched vs=0x%08X cb%u=%s t%u=%s tex%u o%u",
                  vh, it->second.prev_vp_cb_slot, d->prev_vp_cb ? "prevVP" : "NONE",
                  it->second.prev_bone_t_slot,
-                 d->last_bound_twin_srv ? "prevBones" : "prevBones(identity)",
+                 d->bound_real_prev_bones ? "prevBones" : "prevBones(identity)",
                  it->second.texcoord_index, it->second.output_reg);
     // Read the binds back to confirm they recorded on THIS context. If the game
     // draws on a different (deferred) context, they read back NULL/OTHER and the
@@ -2996,12 +3132,12 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     ctx->VSGetShaderResources(it->second.prev_bone_t_slot, 1u, &rb_srv);
     ctx->VSGetConstantBuffers(it->second.prev_vp_cb_slot, 1u, &rb_cb);
     LogThrottled(ThrottleKey("bind-verify", vh,
-                             (uint32_t)(rb_srv == bone_srv ? 1u : (rb_srv ? 2u : 0u)),
+                             (uint32_t)(rb_srv == bone_srvs[0] ? 1u : (rb_srv ? 2u : 0u)),
                              (uint32_t)(rb_cb == d->prev_vp_cb ? 1u : (rb_cb ? 2u : 0u))).c_str(),
                  reshade::log::level::info, 1u, 500u,
                  "[DLAA] bind verify vs=0x%08X t%u=%s b%u=%s",
                  vh, it->second.prev_bone_t_slot,
-                 (rb_srv == bone_srv) ? "OK" : (rb_srv ? "OTHER" : "NULL"),
+                 (rb_srv == bone_srvs[0]) ? "OK" : (rb_srv ? "OTHER" : "NULL"),
                  it->second.prev_vp_cb_slot,
                  (rb_cb == d->prev_vp_cb) ? "OK" : (rb_cb ? "OTHER" : "NULL"));
     if (rb_srv) rb_srv->Release();

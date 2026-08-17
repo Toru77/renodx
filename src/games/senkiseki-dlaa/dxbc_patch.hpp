@@ -429,6 +429,9 @@ constexpr uint32_t kSwizzleZZZW = 0xEAu;  // .x=z .y=z .z=z .w=w (velocity rV.zz
 // Number of prev-World slots the rigid VS probes for nearest-translation selection.
 // MUST equal kRigidPrevWorldSlots in addon.cpp.
 constexpr uint32_t kRigidWorldSlots = 4u;
+// Number of prev-bone SRV slots the skinned VS probes for nearest-root-bone
+// selection. MUST equal kBoneSlots in addon.cpp.
+constexpr uint32_t kBoneSlots = 4u;
 
 inline void EmitOpcode(std::vector<uint32_t>& out, uint32_t opcode, uint32_t length) {
   out.push_back(EncodeInstruction(opcode, length));
@@ -769,6 +772,18 @@ inline void EmitLdStructured3(std::vector<uint32_t>& out, uint32_t dst_reg,
                               uint32_t resource_reg, uint32_t resource_swizzle) {
   EmitLdStructured(out, dst_reg, 0x7u, index_input_reg, index_comp, byte_off, resource_reg,
                    resource_swizzle);
+}
+
+// ld_structured dst, l(imm_idx), l(byte_off), tN -- immediate element index
+// (used to read bone 0 = the root bone for nearest-instance matching).
+inline void EmitLdStructuredImmIdx(std::vector<uint32_t>& out, uint32_t dst_reg, uint32_t dst_mask,
+                                   uint32_t imm_idx, uint32_t byte_off,
+                                   uint32_t resource_reg, uint32_t resource_swizzle) {
+  EmitOpcode(out, OP_LD_STRUCTURED, 9u);
+  EmitTempDst(out, dst_reg, dst_mask);
+  EmitImm1(out, imm_idx);
+  EmitImm1(out, byte_off);
+  EmitResourceSrc(out, resource_reg, resource_swizzle);
 }
 
 // mov dst.xyzw, src (output write)
@@ -1815,9 +1830,19 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
          cb_slot == 13u)
     ++cb_slot;
   uint32_t t_slot = 1u;
-  while (std::find(scan.resource_slots.begin(), scan.resource_slots.end(), t_slot) !=
-         scan.resource_slots.end())
-    ++t_slot;
+  {
+    auto t_used = [&](uint32_t s) {
+      return std::find(scan.resource_slots.begin(), scan.resource_slots.end(), s) !=
+             scan.resource_slots.end();
+    };
+    for (;;) {
+      bool ok = true;
+      for (uint32_t k = 0u; k < kBoneSlots; ++k)
+        if (t_used(t_slot + k)) { ok = false; break; }
+      if (ok) break;
+      ++t_slot;
+    }
+  }
   // vs_4_1 has only 14 cbuffer slots (b0..b13) — a slot at 14 would be invalid
   // bytecode and crash the driver. If every slot is taken, skip this shader.
   if (cb_slot > 13u) return false;
@@ -1906,7 +1931,14 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   const uint32_t rCurAcc = temp_base + 9u;  // cur-bone skin (velocity; game's CURRENT bones)
   const uint32_t rCurClip = temp_base + 10u; // cur clip = current VP x rCurAcc (velocity)
   const uint32_t rV = temp_base + 11u;   // velocity encode scratch (prevNDC/curNDC/delta/code)
-  const uint32_t kTempSlots = emit_vel ? 14u : 12u;
+  const uint32_t rRootCur = temp_base + 12u;  // current root-bone translation (nearest-match)
+  const uint32_t rRootK = temp_base + 13u;    // candidate slot root-bone translation
+  const uint32_t rScratch = temp_base + 14u;  // root-bone row scratch (nearest-match)
+  const uint32_t rDelta = temp_base + 15u;    // delta (xyz) + dist^2 (w)
+  const uint32_t rCmp = temp_base + 16u;      // compare scratch
+  const uint32_t rBestD = temp_base + 17u;    // best (min) distance^2
+  const uint32_t rBestW = temp_base + 18u;    // best skinned position
+  const uint32_t kTempSlots = minimal ? (emit_vel ? 14u : 12u) : 19u;
   const uint32_t new_dcl_temps = temp_base + kTempSlots;
 
   // Build injected declaration tokens. In no_bind mode the game already declares
@@ -1915,7 +1947,8 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   std::vector<uint32_t> decls;
   if (!no_bind) {
     EmitDclConstantBuffer(decls, cb_slot, 4u);        // prevVP (16 floats)
-    EmitDclResourceStructured(decls, t_slot, 64u);    // prev bones
+    for (uint32_t k = 0u; k < kBoneSlots; ++k)
+      EmitDclResourceStructured(decls, t_slot + k, 64u);  // prev bones (K slots, nearest-match)
   }
   // The velocity path rides the game's EXISTING TEXCOORD10.zw — it needs NO new
   // prevClip output register (and no OSGN append), so skip the dcl_output.
@@ -1934,22 +1967,75 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
   static constexpr uint32_t kWeightSwizzles[4] = {kSwizzleYYYY, kSwizzleXXXX, kSwizzleZZZZ,
                                                   kSwizzleWWWW};
   if (!minimal) {
-    for (uint32_t b = 0; b < 4u; ++b) {
-      const uint32_t comp = kBoneComps[b];
-      const uint32_t wswiz = kWeightSwizzles[b];
-      EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 0u, bone_t_slot, kSwizzleXYZW);
-      EmitDp4(body, rB, 0x1u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
-      EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 16u, bone_t_slot, kSwizzleXYZW);
-      EmitDp4(body, rB, 0x2u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
-      EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 32u, bone_t_slot, kSwizzleXYZW);
-      EmitDp4(body, rB, 0x4u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
-      if (b == 0u)
-        EmitMulInput(body, rAcc, 0x7u, (uint32_t)weight_reg, wswiz, rB, kSwizzleXYZW);
-      else
-        EmitMadInput(body, rAcc, 0x7u, (uint32_t)weight_reg, wswiz, rB, kSwizzleXYZW, rAcc,
-                     kSwizzleXYZW);
+    if (no_bind) {
+      // No-bind (crash-bisection) mode: single-slot re-skin unchanged.
+      for (uint32_t b = 0; b < 4u; ++b) {
+        const uint32_t comp = kBoneComps[b];
+        const uint32_t wswiz = kWeightSwizzles[b];
+        EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 0u, bone_t_slot, kSwizzleXYZW);
+        EmitDp4(body, rB, 0x1u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
+        EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 16u, bone_t_slot, kSwizzleXYZW);
+        EmitDp4(body, rB, 0x2u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
+        EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 32u, bone_t_slot, kSwizzleXYZW);
+        EmitDp4(body, rB, 0x4u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
+        if (b == 0u)
+          EmitMulInput(body, rAcc, 0x7u, (uint32_t)weight_reg, wswiz, rB, kSwizzleXYZW);
+        else
+          EmitMadInput(body, rAcc, 0x7u, (uint32_t)weight_reg, wswiz, rB, kSwizzleXYZW, rAcc,
+                       kSwizzleXYZW);
+      }
+      EmitMovImm1(body, rAcc, 0x8u, 0x3F800000u);  // rAcc.w = 1
+    } else {
+      // Same-mesh instance nearest-match: pick the prev-bone slot whose ROOT
+      // bone (index 0) translation is nearest the current root bone, then
+      // re-skin with that slot. Mirrors the rigid path's World nearest-match.
+      // rRootCur = current root bone translation (rows 0..2 .w) from t0.
+      EmitLdStructuredImmIdx(body, rScratch, 0xFu, 0u, 0u, bone_game_slot, kSwizzleXYZW);
+      EmitMovSel1(body, rRootCur, 0x1u, rScratch, 3u);
+      EmitLdStructuredImmIdx(body, rScratch, 0xFu, 0u, 16u, bone_game_slot, kSwizzleXYZW);
+      EmitMovSel1(body, rRootCur, 0x2u, rScratch, 3u);
+      EmitLdStructuredImmIdx(body, rScratch, 0xFu, 0u, 32u, bone_game_slot, kSwizzleXYZW);
+      EmitMovSel1(body, rRootCur, 0x4u, rScratch, 3u);
+      EmitMovImm1(body, rBestD, 0x1u, 0x7F7FFFFFu);  // FLT_MAX
+      EmitMovImm4(body, rBestW, 0xFu, 0u, 0u, 0u, 0u);
+      for (uint32_t k = 0u; k < kBoneSlots; ++k) {
+        const uint32_t slot = bone_t_slot + k;
+        // rRootK = this slot's root bone translation.
+        EmitLdStructuredImmIdx(body, rScratch, 0xFu, 0u, 0u, slot, kSwizzleXYZW);
+        EmitMovSel1(body, rRootK, 0x1u, rScratch, 3u);
+        EmitLdStructuredImmIdx(body, rScratch, 0xFu, 0u, 16u, slot, kSwizzleXYZW);
+        EmitMovSel1(body, rRootK, 0x2u, rScratch, 3u);
+        EmitLdStructuredImmIdx(body, rScratch, 0xFu, 0u, 32u, slot, kSwizzleXYZW);
+        EmitMovSel1(body, rRootK, 0x4u, rScratch, 3u);
+        // rDelta = rRootK - rRootCur; rDelta.w = |delta|^2.
+        EmitMadImm4(body, rDelta, 0x7u, rRootCur, kSwizzleXYZW,
+                    0xBF800000u, 0xBF800000u, 0xBF800000u, 0xBF800000u, rRootK, kSwizzleXYZW);
+        EmitDp3(body, rDelta, 0x8u, rDelta, kSwizzleXYZW, rDelta, kSwizzleXYZW);
+        EmitLt(body, rCmp, 0x1u, rDelta, kSwizzleWWWW, rBestD, kSwizzleXXXX);
+        EmitMovc(body, rBestD, 0x1u, rCmp, kSwizzleXXXX, rDelta, kSwizzleWWWW, rBestD, kSwizzleXXXX);
+        // Re-skin this slot (4-bone loop reading `slot`'s prev bones).
+        for (uint32_t b = 0; b < 4u; ++b) {
+          const uint32_t comp = kBoneComps[b];
+          const uint32_t wswiz = kWeightSwizzles[b];
+          EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 0u, slot, kSwizzleXYZW);
+          EmitDp4(body, rB, 0x1u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
+          EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 16u, slot, kSwizzleXYZW);
+          EmitDp4(body, rB, 0x2u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
+          EmitLdStructured(body, rC, 0xFu, (uint32_t)blend_reg, comp, 32u, slot, kSwizzleXYZW);
+          EmitDp4(body, rB, 0x4u, rC, kSwizzleXYZW, rP, kSwizzleXYZW);
+          if (b == 0u)
+            EmitMulInput(body, rAcc, 0x7u, (uint32_t)weight_reg, wswiz, rB, kSwizzleXYZW);
+          else
+            EmitMadInput(body, rAcc, 0x7u, (uint32_t)weight_reg, wswiz, rB, kSwizzleXYZW, rAcc,
+                         kSwizzleXYZW);
+        }
+        EmitMovImm1(body, rAcc, 0x8u, 0x3F800000u);  // rAcc.w = 1
+        // Keep this slot's skin if it is the nearest so far.
+        EmitMovc(body, rBestW, 0xFu, rCmp, kSwizzleXXXX, rAcc, kSwizzleXYZW, rBestW, kSwizzleXYZW);
+      }
+      // rAcc = the nearest slot's skinned position.
+      EmitMov(body, rAcc, 0xFu, rBestW, kSwizzleXYZW);
     }
-    EmitMovImm1(body, rAcc, 0x8u, 0x3F800000u);  // rAcc.w = 1
   }
 
   // Outline offset replication (prev-bone normal + GameEdgeParameters).
