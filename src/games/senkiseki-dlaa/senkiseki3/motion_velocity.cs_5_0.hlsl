@@ -41,6 +41,7 @@
 Texture2D<float> g_srcDepth : register(t0);
 Texture2D<float4> g_srcMotion : register(t1);
 Texture2D<float4> g_srcEffectMask : register(t2);
+Texture2D<float> g_srcPrevDepth : register(t3);
 RWTexture2D<float2> g_outVelocity : register(u0);
 
 cbuffer cb_push : register(b13) {
@@ -54,6 +55,8 @@ cbuffer cb_push : register(b13) {
   float4 params5;   // x=static_camera_shortcircuit, y=object_delta_direct,
                     // z=max_vp_delta (|prevVP-curVP| max; < 1e-4 => camera still),
                     // w=dedicated Phase E source
+  float4 params6;   // x=depth_consistency_enabled, y=depth_consistency_eps,
+                    // z=depth_consistency_soft, w=prev_depth_valid
 };
 
 [numthreads(8, 8, 1)]
@@ -83,6 +86,7 @@ void main(uint2 pix : SV_DispatchThreadID)
   float2 prevPx = curPxU;
   float2 objectDeltaPx = float2(0.0, 0.0);
   bool hasObjectMotion = false;
+  bool depthConsistent = true;  // A+C: depth reprojection passed prev-depth validation
 
   // ── Per-object motion (dynamic objects, from the modified VS) ──
   // The patched VS encodes the OBJECT-ONLY motion delta prevNDC-curNDC (both
@@ -205,6 +209,21 @@ void main(uint2 pix : SV_DispatchThreadID)
           float2 prevNDC = prevClip.xy / prevClip.w;
           prevPx.x = (prevNDC.x * 0.5 + 0.5) * w;
           prevPx.y = (0.5 - prevNDC.y * 0.5) * h;  // y-up NDC -> y-down px
+          // A + C: previous-depth validation + confidence. The camera-path MV is
+          // only trustworthy if the surface it reprojects actually EXISTS at the
+          // predicted previous pixel. Compare the predicted prev depth (clip z/w)
+          // against the previous frame's captured depth: a mismatch means a
+          // disocclusion or a moving surface (held items, etc.) where the camera
+          // MV is wrong. Mark it invalid so DLSS falls back to the current frame
+          // (no smear), via a soft confidence ramp.
+          if (params6.x > 0.5f && params6.w > 0.5f) {
+            float predictedPrevDepth = saturate(prevClip.z / prevClip.w);
+            int2 prevPxI = int2(clamp(prevPx, float2(0.0, 0.0), float2(float(w) - 1.0, float(h) - 1.0)) + 0.5);
+            float actualPrevDepth = g_srcPrevDepth.Load(int3(prevPxI, 0));
+            float depthErr = abs(predictedPrevDepth - actualPrevDepth);
+            float depthConf = 1.0 - saturate((depthErr - params6.y) / max(params6.z, 1e-6));
+            if (depthConf <= 0.0) depthConsistent = false;
+          }
         }
       }
     }
@@ -282,6 +301,7 @@ void main(uint2 pix : SV_DispatchThreadID)
   // shimmer/ghosting on content DLSS can't resolve. The effect PSs write 1.0
   // into the mask (t2) during their passes.
   if (params2.w > 0.5f && g_srcEffectMask.Load(int3(pix, 0)).x > 0.5f) vel = float2(100000.0, 100000.0);
+  if (!depthConsistent && !hasObjectMotion) vel = float2(100000.0, 100000.0);  // A+C: no-history fallback
 
   // Guard against garbage from invalid matrices/depth (e.g. startup frames)
   if (!isfinite(vel.x) || !isfinite(vel.y)) vel = 0;

@@ -122,6 +122,10 @@ static float g_phasee_enabled = 0.f;  // MASTER GATE: the Phase E PS patcher (pa
 // that category's rigid VS is NOT patched, so those objects get camera MV only.
 static float g_phase_rigid_weapons = 1.f;  // DLAAPhaseWRigidWeapon: weapons/accessories (LightDirForChar)
 static float g_phase_rigid_items = 1.f;    // DLAAPhaseWRigidItem: rim-lit held items (books/torches)
+static float g_phase_item_dump = 0.f;     // DLAAPhaseWItemDump: dump/log ONLY rigid items (books/torches) for hang isolation.
+static float g_phase_depth_consistency = 1.f;      // DLAAPhaseDepthConsistency: prev-depth validation (A+C)
+static float g_phase_depth_consistency_eps = 0.01f;    // consistency tolerance in clip-z (0..1)
+static float g_phase_depth_consistency_soft = 0.005f;  // soft falloff band (confidence ramp)
 static float g_phase_mv_comp = 1.f;
 static float g_phase_mv_threshold_object = 0.2f;  // per-object / Prev-Bone motion deadband (px). DLAAMVThreshold now gates
                                                    // ONLY camera (depth-reprojection) MVs; this gates the per-object path.
@@ -168,7 +172,7 @@ static float g_opt_rec_map = 0.f;             // OPT 7: FindGlobalsRec uses an i
 // Sized for the velocity compute layout: 8 descriptor tables (s0, b13, t0,
 // t1, u0, t2, t3-history SRV, u1-history UAV) + push constants. The velocity
 // compute is the ONLY user of DTSet, so this is its table count.
-constexpr uint32_t kTableParamCount = 6u;
+constexpr uint32_t kTableParamCount = 7u;
 using DTSet = std::array<reshade::api::descriptor_table, kTableParamCount>;
 
 static void FreeTables(reshade::api::device* dev, DTSet& t) {
@@ -292,6 +296,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     uint32_t prev_world_cb_slot = 1u; // rigid: prev-World cbuffer slot (dcl_constantbuffer cb#)
     uint32_t world_cb_element = 44u;  // rigid: _Globals element of World (c44)
     bool is_rigid = false;            // true: rigid (weapon) patch vs skinned patch
+  bool is_rigid_item = false;        // true: rigid "item" category (books/torches), not weapon
   };
   // Original OR patched hash -> info, used at draw time. renodx's shader
   // tracking reports the GAME'S ORIGINAL hash for a replaced pipeline (its
@@ -519,6 +524,12 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // the async GPU fault surfaced, missing the faulting draw entirely.
   std::deque<std::string> crash_ring;
   bool crash_ring_dumped = false;
+  // item.log consecutive-duplicate throttle: only append a line when the
+  // (vs,ps,rtvs,motionRTV) signature CHANGES. Identical consecutive item draws
+  // are counted and summarized once ("skipped N identical item draws") so
+  // item.log stays short enough to parse (was >10k mostly-duplicate lines).
+  char item_log_last_sig[160] = {};
+  uint32_t item_log_dup_count = 0u;
   // Save/restore of the patched VS's extra t#/b# slots: the patched VS reads an
   // addon structured SRV (prev-bones) + cbuffer (prevVP) at slots that were
   // "free" for the char VSs, but leaving them bound leaks our structured SRV
@@ -558,6 +569,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Previous-frame color scratch (reprojection debug mode)
   reshade::api::resource prev_color_texture = {};
   reshade::api::resource_view prev_color_srv = {};
+  // A+C: previous-frame depth (R24G8_TYPELESS + R24_UNORM_X8 SRV) for the depth
+  // reprojection consistency check. Created natively; released in Destroy().
+  ID3D11Texture2D* prev_depth_tex = nullptr;
+  reshade::api::resource_view prev_depth_srv = {};   // .handle = native R24_UNORM_X8 SRV
+  bool prev_depth_valid = false;                     // true once a frame has been captured
 
   // Native MV-debug resources (bypass ReShade pipeline creation; display via NGX output)
   ID3D11ComputeShader* dbg_cs = nullptr;
@@ -665,6 +681,9 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   if (d->point_sampler.handle) dev->destroy_sampler(d->point_sampler);
   d->point_sampler = {};
   dv(d->prev_color_srv); dr(d->prev_color_texture);
+  if (d->prev_depth_srv.handle) { reinterpret_cast<ID3D11ShaderResourceView*>(d->prev_depth_srv.handle)->Release(); d->prev_depth_srv = {}; }
+  if (d->prev_depth_tex) { d->prev_depth_tex->Release(); d->prev_depth_tex = nullptr; }
+  d->prev_depth_valid = false;
   if (d->dbg_cs) { d->dbg_cs->Release(); d->dbg_cs = nullptr; }
   if (d->dbg_out_uav) { d->dbg_out_uav->Release(); d->dbg_out_uav = nullptr; }
   if (d->dbg_vel_srv) { d->dbg_vel_srv->Release(); d->dbg_vel_srv = nullptr; }
@@ -749,30 +768,32 @@ static bool CreateVelocityPipeline(reshade::api::device* dev, DeviceData* d) {
   DR srv_r     = {0,0,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                    // t0 (depth)
   DR motion_r  = {0,1,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                    // t1 (per-object MV)
   DR mask_r    = {0,2,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                    // t2 (effect mask)
+  DR prev_depth_r = {0,3,0,1, DS::all_compute, 1, DT::texture_shader_resource_view};                 // t3 (prev-frame depth)
   DR uav_r     = {0,0,0,1, DS::all_compute, 1, DT::texture_unordered_access_view};
   reshade::api::constant_range pc_range = {};
   pc_range.binding = 0;
   pc_range.dx_register_index = 13;
-  pc_range.count = 56;  // matches motion_velocity.cs_5_0.hlsl cbuffer (14 float4s)
+  pc_range.count = 60;  // matches motion_velocity.cs_5_0.hlsl cbuffer (15 float4s)
   pc_range.visibility = DS::all_compute;
 
-  P params[7];
+  P params[8];
   params[0].type = PT::descriptor_table; params[0].descriptor_table = {1, &sampler_r};
   params[1].type = PT::descriptor_table; params[1].descriptor_table = {1, &cbv_r};
   params[2].type = PT::descriptor_table; params[2].descriptor_table = {1, &srv_r};
   params[3].type = PT::descriptor_table; params[3].descriptor_table = {1, &motion_r};
   params[4].type = PT::descriptor_table; params[4].descriptor_table = {1, &uav_r};
   params[5].type = PT::descriptor_table; params[5].descriptor_table = {1, &mask_r};
-  params[6].type = PT::push_constants;   params[6].push_constants = pc_range;
+  params[6].type = PT::descriptor_table; params[6].descriptor_table = {1, &prev_depth_r};
+  params[7].type = PT::push_constants;   params[7].push_constants = pc_range;
 
-  if (!dev->create_pipeline_layout(7, params, &d->velocity_layout)) {
+  if (!dev->create_pipeline_layout(8, params, &d->velocity_layout)) {
     // Unconditional step diagnostics: the dispatch never ran because this (or a
     // later step) fails — the log must say which one.
     LogThrottled("vel-step-layout", reshade::log::level::warning, 3u, 60u,
                  "[DLAA] veloc: create_pipeline_layout FAILED (pc=13,count=48)");
     return false;
   }
-  for (uint32_t i = 0; i < 6u; ++i)
+  for (uint32_t i = 0; i < 7u; ++i)
     if (!dev->allocate_descriptor_table(d->velocity_layout, i, &d->velocity_tables[i])) {
       LogThrottled("vel-step-table", reshade::log::level::warning, 3u, 60u,
                    "[DLAA] veloc: allocate_descriptor_table %u FAILED", i);
@@ -883,6 +904,43 @@ static bool EnsurePrevColorTexture(reshade::api::device* dev, DeviceData* d, uin
   reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1);
   dev->create_resource_view(d->prev_color_texture, reshade::api::resource_usage::shader_resource, vd, &d->prev_color_srv);
   return d->prev_color_texture.handle != 0u && d->prev_color_srv.handle != 0u;
+}
+
+// A+C: previous-frame depth for the depth-reprojection consistency check.
+// The game's native depth is R24G8 (captured_depth_res), so the copy target
+// must use the same typeless format for a legal CopyResource. The SRV reads
+// it as R24_UNORM_X8 (0..1), matching g_srcDepth in the velocity compute.
+static bool EnsurePrevDepthTexture(reshade::api::device* dev, DeviceData* d, uint32_t w, uint32_t h) {
+  if (!dev || !d || w == 0u || h == 0u) return false;
+  if (d->prev_depth_tex) {
+    D3D11_TEXTURE2D_DESC existing = {};
+    d->prev_depth_tex->GetDesc(&existing);
+    if (existing.Width == w && existing.Height == h) return true;
+    if (d->prev_depth_srv.handle) { reinterpret_cast<ID3D11ShaderResourceView*>(d->prev_depth_srv.handle)->Release(); d->prev_depth_srv = {}; }
+    d->prev_depth_tex->Release(); d->prev_depth_tex = nullptr;
+    d->prev_depth_valid = false;
+  }
+  auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
+  if (!nd) return false;
+  D3D11_TEXTURE2D_DESC td = {};
+  td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+  td.Format = DXGI_FORMAT_R24G8_TYPELESS;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (FAILED(nd->CreateTexture2D(&td, nullptr, &d->prev_depth_tex)) || !d->prev_depth_tex) return false;
+  D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+  sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+  sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  sv.Texture2D.MostDetailedMip = 0;
+  sv.Texture2D.MipLevels = 1;
+  ID3D11ShaderResourceView* srv = nullptr;
+  if (FAILED(nd->CreateShaderResourceView(d->prev_depth_tex, &sv, &srv)) || !srv) {
+    d->prev_depth_tex->Release(); d->prev_depth_tex = nullptr;
+    return false;
+  }
+  d->prev_depth_srv.handle = reinterpret_cast<uintptr_t>(srv);
+  return true;
 }
 
 // Keep a CPU-readable copy of the NGX output for the optional luma diagnostic.
@@ -2558,6 +2616,7 @@ static void DumpBoneFirstMat(ID3D11Device* nd, ID3D11DeviceContext* ctx,
 // (Crash-window trace now lives in MaybeTraceCrashWindow below the draw hooks.)
 // Forward decl: evidence dump folder resolver (defined with the dump helpers).
 static const std::string& GetPhasebDir();
+static const std::string& GetPhasewDir();
 
 // Draw-time binding for patched skinned VSs: bind the CURRENT bone buffer to
 // the patched VS's prev-bone t# slot and the addon's prevVP cbuffer to its b#
@@ -2600,6 +2659,41 @@ static void MaybeTraceCrashWindow(reshade::api::command_list* cmd_list, DeviceDa
       fclose(pf);
     }
   }
+}
+
+// Item dump log: append each rigid-item (books/torches) draw to phasew/item.log
+// (the item-scoped analog of phaseb/patched.log). Gated on DLAAPhaseWItemDump;
+// independent of the Phase W toggles (it logs only what IS patched as an item).
+// Duplicate throttle: identical CONSECUTIVE (vs,ps,rtvs,motionRTV) signatures are
+// NOT re-appended; they are counted and summarized once the signature changes, so
+// item.log stays short enough to parse (it was >10k mostly-duplicate lines).
+static void MaybeLogItemDraw(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (g_phase_item_dump < 0.5f || !cmd_list || !d) return;
+  uint32_t vh = CurrentVsHash(cmd_list, d);
+  const auto it = d->patched_vs_by_hash.find(vh);
+  if (it == d->patched_vs_by_hash.end() || !it->second.is_rigid_item) return;
+  uint32_t ph = CurrentPsHash(cmd_list, d);
+  char sig[160];
+  snprintf(sig, sizeof(sig), "vs=0x%08X ps=0x%08X rtvs=%u%s",
+           vh, ph, d->last_rtv_count, d->motion_rtv.handle ? " motionRTV=1" : "");
+  if (d->item_log_last_sig[0] != '\0' && strcmp(sig, d->item_log_last_sig) == 0) {
+    ++d->item_log_dup_count;
+    return;
+  }
+  char ipath[1024];
+  snprintf(ipath, sizeof(ipath), "%s/item.log", GetPhasewDir().c_str());
+  FILE* ipf = nullptr;
+  fopen_s(&ipf, ipath, "a");
+  if (ipf) {
+    if (d->item_log_dup_count > 0u) {
+      fprintf(ipf, "  ... (skipped %u identical item draws)\n", d->item_log_dup_count);
+    }
+    fprintf(ipf, "f=%u %s\n", d->frame_index, sig);
+    fclose(ipf);
+  }
+  strncpy_s(d->item_log_last_sig, sig, _TRUNCATE);
+  d->item_log_last_sig[sizeof(d->item_log_last_sig) - 1u] = '\0';
+  d->item_log_dup_count = 0u;
 }
 
 // Dump the crash ring to drawtrace.log (once per device lifetime). Called when
@@ -3607,6 +3701,7 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
     MaybeRestorePatchedBinds(cmd_list, d);
     Phase0ProbeDraw(cmd_list, d);
     MaybeTraceCrashWindow(cmd_list, d);
+    MaybeLogItemDraw(cmd_list, d);
     MaybeLogOmState(cmd_list, d);
     ApplyPerDrawJitter(cmd_list, d);
     MaybeWriteGlobalsVp(cmd_list, d);
@@ -3636,6 +3731,7 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
     MaybeRestorePatchedBinds(cmd_list, d);
     Phase0ProbeDraw(cmd_list, d);
     MaybeTraceCrashWindow(cmd_list, d);
+    MaybeLogItemDraw(cmd_list, d);
     MaybeLogOmState(cmd_list, d);
     ApplyPerDrawJitter(cmd_list, d);
     MaybeWriteGlobalsVp(cmd_list, d);
@@ -4425,8 +4521,8 @@ static void UpdateJitter(DeviceData* d) {
 //   c[44..47] = params3 (mv_threshold_object, reserved, reserved, reserved),
 //   c[48..51] = params4 (reserved, reserved, full_mv_mode, global_jitter),
 //   c[52..55] = params5 (static_camera_shortcircuit, object_delta_direct, max_vp_delta, unused)
-static std::array<float, 56> BuildVelocityPC(DeviceData* d) {
-  std::array<float, 56> c = {};
+static std::array<float, 60> BuildVelocityPC(DeviceData* d) {
+  std::array<float, 60> c = {};
   if (!d) return c;
   memcpy(&c[0],  d->prev_view_proj.data(), 64);
   memcpy(&c[16], d->curr_view_proj_inv.data(), 64);
@@ -4462,6 +4558,11 @@ static std::array<float, 56> BuildVelocityPC(DeviceData* d) {
     c[54] = vp_delta;
   }
   c[55] = g_phasee_enabled >= 0.5f ? 1.f : 0.f; // params5.w — dedicated carrier source
+  // params6 — depth-reprojection consistency (A+C):
+  c[56] = g_phase_depth_consistency;
+  c[57] = g_phase_depth_consistency_eps;
+  c[58] = g_phase_depth_consistency_soft;
+  c[59] = d->prev_depth_valid ? 1.f : 0.f;
   return c;
 }
 
@@ -4534,6 +4635,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   EnsureEffectMask(dev, d, w, h);
   // Per-object motion target (32-bit float) for character MVs.
   EnsureMotionTarget(dev, d, w, h);
+  EnsurePrevDepthTexture(dev, d, w, h);
 
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
@@ -4636,17 +4738,19 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       // valid. Guards: skip on a null descriptor (never dispatch on a partial
       // set), and log the exact bound state + OM (RTV/DSV) state so a repeat
       // names the bad descriptor instead of guessing.
-      reshade::api::descriptor_table_update u[6] = {
+      reshade::api::descriptor_table_update u[7] = {
         { d->velocity_tables[0], 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_sampler },
         { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv },
         { d->velocity_tables[2], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_depth_srv },
         { d->velocity_tables[3], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &motion_src },
         { d->velocity_tables[4], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->velocity_uav },
         { d->velocity_tables[5], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->effect_mask_srv },
+        { d->velocity_tables[6], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->prev_depth_srv },
       };
       if (!d->point_sampler.handle || !d->captured_scene_cbv.buffer.handle ||
           !d->captured_depth_srv.handle || !motion_src.handle ||
-          !d->velocity_uav.handle || !d->effect_mask_srv.handle) {
+          !d->velocity_uav.handle || !d->effect_mask_srv.handle ||
+          !d->prev_depth_srv.handle) {
         if (shader_injection.dlaa_debug_logging > 0.5f)
           LogThrottled("veloc-skip", reshade::log::level::warning, 3u, 60u,
                        "[DLAA] veloc: SKIP dispatch (null descriptor)");
@@ -4687,15 +4791,16 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
         if (cs_cb) cs_cb->Release();
       }
 
-      dev->update_descriptor_tables(6, u);
+      dev->update_descriptor_tables(7, u);
 
-      reshade::api::descriptor_table tables[6] = {
+      reshade::api::descriptor_table tables[7] = {
           d->velocity_tables[0], d->velocity_tables[1], d->velocity_tables[2],
-          d->velocity_tables[3], d->velocity_tables[4], d->velocity_tables[5]};
-      cmd_list->bind_descriptor_tables(CS, d->velocity_layout, 0, 6, tables);
+          d->velocity_tables[3], d->velocity_tables[4], d->velocity_tables[5],
+          d->velocity_tables[6]};
+      cmd_list->bind_descriptor_tables(CS, d->velocity_layout, 0, 7, tables);
 
       auto pc = BuildVelocityPC(d);
-      cmd_list->push_constants(CS, d->velocity_layout, 6, 0, 56, pc.data());
+      cmd_list->push_constants(CS, d->velocity_layout, 7, 0, 60, pc.data());
       cmd_list->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       cmd_list->barrier(d->velocity_texture, UA, SR);
 
@@ -4907,6 +5012,22 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
           ? d->live_color_res
           : reinterpret_cast<ID3D11Resource*>(d->captured_color_res.handle);
       cl2->CopyResource(prev_native, cur_native);
+    }
+  }
+
+  // A+C: promote this frame's depth to prev_depth for the NEXT frame's
+  // depth-reprojection consistency check. CopyResource needs identical
+  // formats, so only copy when the source is R24G8_TYPELESS (our target).
+  if (g_phase_depth_consistency >= 0.5f && d->captured_depth_res.handle) {
+    auto rd = dev->get_resource_desc(d->captured_depth_res);
+    if (rd.type == reshade::api::resource_type::texture_2d && (int)rd.texture.format == 44) {
+      auto* cl3 = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      if (cl3 && d->prev_depth_tex) {
+        auto* dst = reinterpret_cast<ID3D11Resource*>(d->prev_depth_tex);
+        auto* src = reinterpret_cast<ID3D11Resource*>(d->captured_depth_res.handle);
+        cl3->CopyResource(dst, src);
+        d->prev_depth_valid = true;
+      }
     }
   }
 
@@ -5172,6 +5293,38 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f, .label = "Phase W: Held Items (books)", .section = "Antialiasing",
         .tooltip = "Patch rim-lit held-item rigid objects like books/torches (RimLitColor + WorldViewProjection) with per-object motion. Off = these objects are NOT patched and fall back to camera (depth-reprojected) MVs only. Requires restart (read at shader patch time).",
         .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseWItemDump", .binding = &g_phase_item_dump,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Phase W: Item Dump Logs", .section = "Antialiasing",
+        .tooltip = "Diagnostic: dump ORIGINAL + PATCHED VS bytecode for rigid ITEMS only (books/torches, RimLitColor + WorldViewProjection) to renodx-dev/dump/phasew/ and append each rigid-item draw to phasew/item.log. Use to isolate a hang caused by patching held items. Requires restart.",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseDepthConsistency", .binding = &g_phase_depth_consistency,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Depth Reprojection Consistency", .section = "Antialiasing",
+        .tooltip = "Previous-depth validation: compare the reprojected previous pixel's predicted depth against the previous frame's captured depth. A mismatch (disocclusion, or a moving surface like a held item) marks the pixel invalid so DLSS falls back to the current frame instead of smearing. Live.",
+        .labels = {"Off","On"},
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseDepthConsistencyEps", .binding = &g_phase_depth_consistency_eps,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.01f, .label = "Depth Consistency Epsilon", .section = "Antialiasing",
+        .tooltip = "Tolerance (clip-z, 0..1) for the depth-consistency check. Depth is R24G8 (~6e-8 quantization); a few px of parallax is ~1e-3..1e-2. Smaller = stricter, larger = more forgiving. Live.",
+        .min = 0.0001f, .max = 0.2f, .format = "%.4f",
+        .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseDepthConsistencySoft", .binding = &g_phase_depth_consistency_soft,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 0.005f, .label = "Depth Consistency Soft Band", .section = "Antialiasing",
+        .tooltip = "Soft falloff width (clip-z) past the epsilon, over which the confidence ramps down to invalid. Larger = smoother valid/invalid transition (less flicker at the boundary). Live.",
+        .min = 0.0001f, .max = 0.2f, .format = "%.4f",
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
     // ── Shake-isolation diagnostics ──
@@ -5496,6 +5649,26 @@ static void WritePhasebDump(uint32_t hash, const void* code, size_t size, const 
   if (f) { fwrite(code, 1, size, f); fclose(f); }
 }
 
+static const std::string& GetPhasewDir() {
+  static const std::string dir = [] {
+    std::error_code ec;
+    auto p = renodx::utils::path::GetOutputSubdirectory("dump") / "phasew";
+    std::filesystem::create_directories(p, ec);
+    return p.string();
+  }();
+  return dir;
+}
+
+static void WriteItemDump(uint32_t hash, const void* code, size_t size, const char* suffix) {
+  if (g_phase_item_dump < 0.5f) return;
+  if (!code || size == 0u) return;
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/0x%08X%s.cso", GetPhasewDir().c_str(), hash, suffix);
+  FILE* f = nullptr;
+  fopen_s(&f, path, "wb");
+  if (f) { fwrite(code, 1, size, f); fclose(f); }
+}
+
 // ── Hang watchdog: heartbeat thread ──
 // Writes one line to watchdog.log every 250 ms while DLAAPhaseBDump is ON. The
 // render thread keeps `watchdog_progress` stamped at every interesting spot
@@ -5513,7 +5686,7 @@ static void WatchdogSet(DeviceData* d, const char* fmt, ...) {
   if (!d || !d->watchdog_running.load()) return;
   // OPT 3: the heartbeat is only ever written when DLAAPhaseBDump is on, so
   // skip the mutex lock + formatting on every draw in normal use.
-  if (g_opt_watchdog_gate >= 0.5f && g_phaseb_dump < 0.5f) return;
+  if (g_opt_watchdog_gate >= 0.5f && g_phaseb_dump < 0.5f && g_phase_item_dump < 0.5f) return;
   char buf[512];
   va_list args;
   va_start(args, fmt);
@@ -5529,7 +5702,7 @@ static void WatchdogStampDraw(reshade::api::command_list* cmd_list, DeviceData* 
   if (!d || !d->watchdog_running.load()) return;
   // OPT 3: also skip the per-draw state query when the stamp itself is gated
   // off (the heartbeat file is only written with DLAAPhaseBDump on).
-  if (g_opt_watchdog_gate >= 0.5f && g_phaseb_dump < 0.5f) return;
+  if (g_opt_watchdog_gate >= 0.5f && g_phaseb_dump < 0.5f && g_phase_item_dump < 0.5f) return;
   uint32_t vh = CurrentVsHash(cmd_list, d);
   uint32_t ph = CurrentPsHash(cmd_list, d);
   WatchdogSet(d, "draw %s vs=0x%08X ps=0x%08X", tag, vh, ph);
@@ -5547,7 +5720,7 @@ static void WatchdogStart(DeviceData* d) {
         prog[sizeof(prog) - 1u] = '\0';
       }
       const uint64_t ping = d->watchdog_ping.fetch_add(1u) + 1u;
-      if (g_phaseb_dump >= 0.5f) {
+      if (g_phaseb_dump >= 0.5f || g_phase_item_dump >= 0.5f) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         FILE* f = nullptr;
@@ -5651,6 +5824,10 @@ static bool OnCreatePipeline(
     // BEFORE the driver sees them so a TDR can't lose the evidence.
     WritePhasebDump(hash, desc->code, desc->code_size, "");
     WritePhasebDump(new_hash, blob.data(), blob.size(), ".patched");
+    if (info.rigid_is_item) {
+      WriteItemDump(hash, desc->code, desc->code_size, "");
+      WriteItemDump(new_hash, blob.data(), blob.size(), ".patched");
+    }
 
     desc->code = malloc(blob.size());
     if (!desc->code) continue;
@@ -5668,6 +5845,7 @@ static bool OnCreatePipeline(
     pvi.prev_world_cb_slot = info.prev_world_cb_slot;
     pvi.world_cb_element = info.world_cb_element;
     pvi.is_rigid = info.rigid_patch;
+    pvi.is_rigid_item = info.rigid_is_item;
     // Key by BOTH hashes so the draw-time lookup matches whichever identity
     // GetCurrentVertexShaderHash reports (renodx tracks the original for a
     // replaced pipeline). Skip-guard records only the patched blob hash.

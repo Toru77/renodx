@@ -1494,6 +1494,8 @@ struct PatchInfo {
   uint32_t world_cb_element = 44u;   // _Globals element index of World (c44 => byte 704)
   bool rigid_patch = false;          // true: this PatchInfo describes the RIGID patch path
                                      // (no bones - per-object motion from the World matrix).
+  bool rigid_is_item = false;        // true: rigid "item" category (RimLitColor +
+                                      // WorldViewProjection - books/torches), not weapon.
 };
 
 // Tunables for the generic patch (used for crash bisection).
@@ -2723,6 +2725,7 @@ inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_n
     out_info->prev_world_cb_slot = cb_slot_w;
     out_info->world_cb_element = world_elem;
     out_info->rigid_patch = true;
+    out_info->rigid_is_item = is_item;
   }
   return true;
 }
