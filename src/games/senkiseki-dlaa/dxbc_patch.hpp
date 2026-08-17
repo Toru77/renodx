@@ -2391,18 +2391,21 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
 // and emits the raw prevNDC-curNDC delta into TEXCOORD10.xy (the Phase E
 // carrier), exactly like the skinned path's emit_velocity_carrier path.
 //
-// DISCRIMINATOR (structural, NOT hash-based): the RDEF cbuffer must contain the
-// PhyreEngine "LightDirForChar" variable (the character directional light).
-// Every character-path VS (skinned character + rigid weapon/accessory) declares
-// it; every environment VS (walls/floor/ceiling/terrain) does NOT (they use
-// CubeMapIntensity/Fresnel or plain World instead). So this patcher can never
-// touch walls. Skinned VSs are rejected up front (BLENDINDICES/BLENDWEIGHTS) so
-// they stay on the existing Phase B bone path.
+// DISCRIMINATOR (structural, NOT hash-based): a character-attached rigid object
+// is one whose RDEF _Globals cbuffer declares EITHER
+//   * LightDirForChar (the character directional light - weapons/accessories), or
+//   * BOTH RimLitColor AND WorldViewProjection (rim-lit held items like books and
+//     torches that also cast a dynamic shadow via the pre-multiplied WVP).
+// Every environment VS (walls/floor/ceiling/terrain) declares NONE of these (they
+// use CubeMapIntensity/Fresnel/BlendMulScale2 or plain World instead), so this
+// patcher can never touch walls. Skinned VSs are rejected up front
+// (BLENDINDICES/BLENDWEIGHTS) so they stay on the existing Phase B bone path.
 //
-// Fails closed: rigid + LightDirForChar + World@c44 + TEXCOORD10 output + single
-// return are ALL required; the paired PS is classified as a Phase E carrier
-// (IsStrictPhaseECarrierPixelShader) at create_pipeline, and the draw is gated by
-// the existing MaybeAppendMotionRtvStrict (patched VS + Phase E PS + 3 RTs).
+// Fails closed: rigid + (LightDirForChar | (RimLitColor & WorldViewProjection)) +
+// World@c44 + TEXCOORD10 output + single return are ALL required; the paired PS is
+// classified as a Phase E carrier (IsStrictPhaseECarrierPixelShader) at
+// create_pipeline, and the draw is gated by the existing MaybeAppendMotionRtvStrict
+// (patched VS + Phase E PS + 3 RTs).
 inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_new_hash,
                                    PatchInfo* out_info = nullptr,
                                    const PatchOptions& options = {}) {
@@ -2441,7 +2444,11 @@ inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_n
   if (tex10_out_reg == UINT32_MAX) return false;   // no carrier channel (e.g. shadow/depth pass)
   if (!has_geometry_output) return false;          // not a G-buffer VS
 
-  // RDEF gate: LightDirForChar (character light) + World matrix + _Globals.
+  // RDEF gate: character-attachment signal + World matrix + _Globals.
+  // A rigid object is character-attached when it declares LightDirForChar
+  // (weapon/accessory) OR both RimLitColor AND WorldViewProjection (rim-lit held
+  // item like a book/torch that casts a dynamic shadow). Walls/environment
+  // declare none of these.
   const uint8_t* rdef_data =
       reinterpret_cast<const uint8_t*>(data.data()) + rdef->offset + kChunkHeaderSize;
   std::vector<RdefCbuffer> cbs;
@@ -2449,6 +2456,8 @@ inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_n
   // Find the per-object _Globals cbuffer BY ITS VARIABLES (the real RDEF name is
   // "$Globals", not "_Globals" — 3Dmigoto renames it in decompiled HLSL only).
   bool has_light_char = false;
+  bool has_rim_lit = false;
+  bool has_wvp = false;
   uint32_t world_off = 0u;
   bool has_world = false;
   uint32_t globals_slot = 0u;
@@ -2457,6 +2466,8 @@ inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_n
   for (const auto& cb : cbs) {
     for (const auto& v : cb.variables) {
       if (v.name == "LightDirForChar") has_light_char = true;
+      if (v.name == "RimLitColor") has_rim_lit = true;
+      if (v.name == "WorldViewProjection") has_wvp = true;
       if (v.name == "World") {
         has_world = true;
         world_off = v.start_offset;
@@ -2465,7 +2476,8 @@ inline bool PatchRigidVertexShader(std::vector<std::byte>& data, uint32_t* out_n
       }
     }
   }
-  if (!has_light_char || !has_world) return false;
+  const bool is_character_attached = has_light_char || (has_rim_lit && has_wvp);
+  if (!is_character_attached || !has_world) return false;
   // Resolve the cbuffer's bind slot from the RDEF resource binding table.
   std::vector<ResourceBinding> bindings;
   if (ParseRDEFBindings(rdef_data, rdef->size, bindings))

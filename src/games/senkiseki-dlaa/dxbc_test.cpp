@@ -482,6 +482,52 @@ int PatchOnePs(const std::string& path, const std::string& out_path, uint32_t te
   return 0;
 }
 
+// Patch a rigid VS in place (Phase W discriminator test), write the patched blob
+// to `out_path`, and re-validate. Reports the discriminator signals (LightDirForChar
+// / RimLitColor / WorldViewProjection / World) so the book-vs-wall classification
+// is visible without decompiling.
+int PatchOneRigid(const std::string& path, const std::string& out_path) {
+  auto data = ReadBinaryFile(path);
+  if (data.empty()) {
+    std::cerr << "  ERROR: cannot read file\n";
+    return 1;
+  }
+  uint32_t new_hash = 0;
+  dxbc::PatchInfo info;
+  dxbc::PatchOptions options;
+  options.emit_velocity_carrier = true;  // the rigid path only runs when the carrier is on
+  const bool patched = dxbc::PatchRigidVertexShader(data, &new_hash, &info, options);
+  if (!patched) {
+    std::cout << "  NOT PATCHED (not a rigid character-attached VS, or parse failed)\n";
+    return 0;  // not an error: wall-style shaders are correctly rejected
+  }
+
+  if (!WriteBinaryFile(out_path, data)) {
+    std::cerr << "  ERROR: cannot write " << out_path << "\n";
+    return 1;
+  }
+  std::cout << "  PATCHED: new CRC32=0x" << std::hex << new_hash << std::dec
+            << " size=" << data.size() << " -> " << out_path << "\n";
+  std::cout << "  cbWorld=" << info.prev_world_cb_slot
+            << " cbVP=" << info.prev_vp_cb_slot
+            << " world@c" << info.world_cb_element
+            << " tex10=o" << info.tex10_out_reg
+            << " rigid=" << (info.rigid_patch ? "yes" : "no") << "\n";
+
+  // Re-validate the patched blob.
+  dxbc::DXBCHeader h;
+  std::vector<dxbc::ChunkInfo> chunks;
+  if (!dxbc::ParseDXBC(data, h, chunks)) {
+    std::cout << "  ERROR: patched blob fails ParseDXBC\n";
+    return 1;
+  }
+  uint8_t d[16];
+  dxbc::ComputeDXBCHash(reinterpret_cast<const uint8_t*>(data.data()), data.size(), d);
+  const bool hash_ok = std::memcmp(d, h.checksum, 16) == 0;
+  std::cout << "  reparse: OK hash=" << (hash_ok ? "SELF-CONSISTENT" : "MISMATCH (BUG)") << "\n";
+  return 0;
+}
+
 int RunOne(const std::string& path, bool roundtrip, bool dump) {
   auto data = ReadBinaryFile(path);
   if (data.empty()) {
@@ -639,6 +685,7 @@ int main(int argc, char** argv) {
   bool emittest = false;
   bool patch = false;
   bool patchcarrier = false;
+  bool patchrigid = false;
   bool patchps = false;
   bool patchpscarrier = false;
   uint32_t texidx = 0u;
@@ -656,6 +703,8 @@ int main(int argc, char** argv) {
       patch = true;
     } else if (arg == "--patchcarrier") {
       patchcarrier = true;
+    } else if (arg == "--patchrigid") {
+      patchrigid = true;
     } else if (arg == "--patchps") {
       patchps = true;
     } else if (arg == "--patchpscarrier") {
@@ -673,6 +722,7 @@ int main(int argc, char** argv) {
     std::cerr << "USAGE: dxbc_test.exe <path-to.cso> [more.cso ...] [--roundtrip] [--dump]\n";
     std::cerr << "       dxbc_test.exe --patch [<out.cso>] <in.cso>\n";
     std::cerr << "       dxbc_test.exe --patchcarrier [<out.cso>] <in.cso>\n";
+    std::cerr << "       dxbc_test.exe --patchrigid [<out.cso>] <in.cso>\n";
     std::cerr << "       dxbc_test.exe --patchps [<out.cso>] <in.cso>\n";
     std::cerr << "       dxbc_test.exe --patchpscarrier [<out.cso>] <in.cso>\n";
     std::cerr << "  Parses DXBC blobs, prints signatures/RDEF/SHEX, verifies the MD5\n";
@@ -698,6 +748,15 @@ int main(int argc, char** argv) {
     std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
     std::cout << "=== " << in << " ===\n";
     int rc = PatchOne(in, out, patchcarrier);
+    std::cout << "\n";
+    return rc;
+  }
+
+  if (patchrigid && !paths.empty()) {
+    std::string in = paths[0];
+    std::string out = patch_out.empty() ? (in + ".patched.cso") : patch_out;
+    std::cout << "=== " << in << " ===\n";
+    int rc = PatchOneRigid(in, out);
     std::cout << "\n";
     return rc;
   }
