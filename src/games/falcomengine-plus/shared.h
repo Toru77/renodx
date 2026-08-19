@@ -120,24 +120,22 @@ struct ShaderInjectData {
   float vbgi_lights_strength;       // [0..5], default 1.0 — multiplier for lightColor contribution
   float vbgi_lights_saturation;     // [0..100], default 1.0 — vibrance for lightColor: 0=gray, 1=neutral
   float vbgi_cascade_debug;         // 0=Off, 1=On — show shadowmapCascadeCount_g as color overlay
-  float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=PCSS
-  float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (PCSS vibrancy)
-  // —— PCSS (Percentage Closer Soft Shadows) ——
-  float shadow_pcss_jitter_enabled;    // 0=Off, 1=On
+  float shadow_filter_method;       // 0=Off (single sample), 1=Falcom (10-tap PCF), 2=CHSS
+  float shadow_edge_tint;           // 0=Off, 1=Falcom (vanilla red tint), 2=Improved (vibrancy)
+  // —— CHSS (Contact-Hardening Soft Shadows) + shared jitter ——
+  float shadow_pcss_jitter_enabled;    // 0=Off, 1=On (also used by Kai PCSS)
   float shadow_pcss_jitter_amount;     // [0..1], default 1.0 — blend static→temporal
   float shadow_pcss_jitter_speed;      // [0..500], default 237.0 — temporal animation speed
+  float shadow_chss_noise_mode;        // 0=IGN, 1=IS-FAST (spatio-temporal blue noise, requires ISFASTMasterEnable)
   float shadow_base_softness;          // [0..0.5], default 0.2 — constant penumbra offset
-  float shadow_penumbra_scale;         // [1..200], default 60.0 — penumbra width multiplier
-  float shadow_pcss_search_radius;     // [1..100], default 30.0 — blocker search radius multiplier
-  float shadow_pcss_filter_width;      // [0.1..5], default 1.0 — PCF filter width multiplier
-  float shadow_pcss_depth_cap;         // [0.01..0.5], default 0.05 — max depth diff for penumbra
-  float shadow_pcss_cascade_blend;     // [0.02..1], default 0.2 — cross-fade width (smaller=wider blend)
-  // —— PCSS Experimental Fixes (0=off/default behavior) ——
-  float shadow_pcss_fix_texel_radius;   // 0=Off, 1=On — texel-based filter radius (consistent across quality)
-  float shadow_pcss_fix_clamp_cascade;  // [0..500], default 0 — max cascade world size (0=off), clamp to this
-  float shadow_pcss_fix_min_radius;     // [0..100], default 0 — minimum filter radius in texels (0=off)
-  float shadow_pcss_fix_auto_blend;     // 0=Off, 1=On — auto-scale cascade blend with split distance
-  // —— Colored Shadow Penumbra (PCSS Improved mode) ——
+  float shadow_chss_search_radius;     // [0.1..2], default 1.0 — world-space softness (blocker search/PCF max)
+  float shadow_chss_penumbra_scale;    // [1..200], default 80.0 — penumbra width multiplier
+  float shadow_chss_depth_cap;         // [0.01..1], default 0.05 — max depth diff for penumbra
+  float shadow_chss_min_radius;        // [0..100], default 0 — minimum filter radius in texels (0=off)
+  float shadow_chss_post_blur;         // [0..100], default 0 — blur strength (0=off/passthrough, 100=full)
+  float shadow_chss_blocker_count;     // [4..64], default 16 — blocker search sample count
+  float shadow_chss_sample_count;      // [4..64], default 16 — PCF filter sample count
+  // —— Colored Shadow Penumbra (Improved mode) ——
   float shadow_penumbra_color_strength;// [0..2], default 1.0 — how strongly to apply vibrancy effect
   float shadow_penumbra_vibrance;      // [0..100], default 1.0 — 0=grayscale, 1=neutral, >1=vivid
   float shadow_penumbra_detection;     // [0.01..1], default 0.5 — what counts as penumbra (higher=wider)
@@ -223,7 +221,6 @@ struct ShaderInjectData {
   float sss_dedicated_bound;
   float shadow_isfast_jitter_amount;
   float shadow_isfast_jitter_speed;
-  float shadow_pcss_sample_mode;
   // Kai character VBGI debug/internal fields
   float char_gi_enabled;
   float char_gi_ao_influence;

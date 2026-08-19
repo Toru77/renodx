@@ -88,7 +88,7 @@ static float2 SpatioTemporalNoise_ISFAST(uint2 p, uint t) {
   }
 }
 
-// ── PCSS Poisson disk sample offset (√-distributed, golden-angle) ──
+// ── Vogel disk sample offset (√-distributed, golden-angle) — CHSS ──
 static float2 ISFAST_PoissonDisk(float sample_index, float sample_count, float jitter_angle, float radius_scale) {
   float r = sqrt((sample_index + 0.5) / sample_count) * radius_scale;
   float a = sample_index * 2.399963f + jitter_angle;
@@ -97,15 +97,12 @@ static float2 ISFAST_PoissonDisk(float sample_index, float sample_count, float j
   return float2(cos_a, sin_a) * r;
 }
 
-#define PCSS_SAMPLE_COUNT 32u
-#define PCSS_BLOCKER_COUNT 31u
-
-// ── PCSS: three-step (blocker search → penumbra → variable-radius PCF) ──
-float PCSS_Shadow(
+// ── CHSS (Contact-Hardening Soft Shadows, Sterna 2018 §2.1):
+//    average blocker search → penumbra estimate → variable-radius PCF ──
+float CHSS_Shadow(
     float2 shadow_uv,
     float receiver_z,
     float slice,
-    float split_distance,
     float jitter_angle)
 {
   // Derive cascade world size from shadow projection matrix
@@ -113,29 +110,19 @@ float PCSS_Shadow(
   float2 cascadeWorldSize;
   cascadeWorldSize.x = 2.0 / max(abs(shadowMtx_g[int(slice)]._m00), 0.0001);
   cascadeWorldSize.y = 2.0 / max(abs(shadowMtx_g[int(slice)]._m11), 0.0001);
-  float2 base_radius = shader_injection_data.shadow_pcss_search_radius / cascadeWorldSize;
-  float2 search_radius = base_radius;
+  float2 search_radius = shader_injection_data.shadow_chss_search_radius / cascadeWorldSize;
 
-  // —— PCSS Experimental Fixes ——
-  // Fix B: Clamp cascade world size (prevents Ultra's large cascades from collapsing filter)
-  if (shader_injection_data.shadow_pcss_fix_clamp_cascade > 0.01f) {
-    cascadeWorldSize = min(cascadeWorldSize, shader_injection_data.shadow_pcss_fix_clamp_cascade);
-    base_radius = shader_injection_data.shadow_pcss_search_radius / cascadeWorldSize;
-  }
-  // Fix A: Texel-based radius (consistent across all quality levels)
-  if (shader_injection_data.shadow_pcss_fix_texel_radius > 0.5f) {
-    base_radius = shader_injection_data.shadow_pcss_search_radius * invShadowSize_g * 50.0;
-  }
-  search_radius = base_radius;
+  // User-configurable sample counts (guarded against 0)
+  float blocker_count_total = max(1.f, shader_injection_data.shadow_chss_blocker_count);
+  float filter_count_total = max(1.f, shader_injection_data.shadow_chss_sample_count);
+  float blocker_radius_scale = rsqrt(blocker_count_total);
+  float filter_radius_scale = rsqrt(filter_count_total);
 
-  float blocker_radius_scale = rsqrt((float)PCSS_BLOCKER_COUNT);
-  float filter_radius_scale = rsqrt((float)PCSS_SAMPLE_COUNT);
-
-  // Step 1: Blocker search
+  // Step 1: Average blocker search (paper Listing 3)
   float blocker_count = 0;
   float blocker_depth_sum = 0;
-  for (uint i = 0u; i < PCSS_BLOCKER_COUNT; i++) {
-    float2 offset = ISFAST_PoissonDisk((float)i, (float)PCSS_BLOCKER_COUNT, jitter_angle, blocker_radius_scale);
+  for (uint i = 0u; i < (uint)blocker_count_total; i++) {
+    float2 offset = ISFAST_PoissonDisk((float)i, blocker_count_total, jitter_angle, blocker_radius_scale);
     float2 sample_uv = saturate(shadow_uv + offset * search_radius);
     float blocker_z = shadowMaps.SampleLevel(samPoint_s, float3(sample_uv, slice), 0).x;
     if (blocker_z < receiver_z) {
@@ -147,29 +134,31 @@ float PCSS_Shadow(
   // If no blockers, fully lit
   if (blocker_count < 1) return 1.0;
 
-  // Step 2: Penumbra estimate
+  // Step 2: Penumbra estimate (paper Listing 4: saturate(scale * ((z - avg)/avg)^2))
   float avg_blocker = blocker_depth_sum / blocker_count;
   float depth_diff = receiver_z - avg_blocker;
-  float penumbra = min(shader_injection_data.shadow_pcss_depth_cap, depth_diff)
-                   * shader_injection_data.shadow_penumbra_scale
-                   + shader_injection_data.shadow_base_softness;
-  // filter_radius = penumbra × base_radius × user width multiplier
-  float2 filter_radius = penumbra * base_radius * shader_injection_data.shadow_pcss_filter_width;
+  // Depth cap bounds the depth difference before normalization
+  float penumbra_ratio = saturate(min(shader_injection_data.shadow_chss_depth_cap, depth_diff) / avg_blocker);
+  penumbra_ratio *= penumbra_ratio;
+  float penumbra = saturate(shader_injection_data.shadow_chss_penumbra_scale * penumbra_ratio);
+  penumbra += shader_injection_data.shadow_base_softness;
+  // filter_radius = penumbra × search radius (contact-hard at 0)
+  float2 filter_radius = penumbra * search_radius;
   filter_radius = max(invShadowSize_g, filter_radius);  // at least 1 texel
-  // Fix C: Enforce minimum filter radius in texels
-  if (shader_injection_data.shadow_pcss_fix_min_radius > 0.01f) {
-    float2 min_radius_uv = shader_injection_data.shadow_pcss_fix_min_radius * invShadowSize_g;
+  // Enforce minimum filter radius in texels (0=off)
+  if (shader_injection_data.shadow_chss_min_radius > 0.01f) {
+    float2 min_radius_uv = shader_injection_data.shadow_chss_min_radius * invShadowSize_g;
     filter_radius = max(filter_radius, min_radius_uv);
   }
 
-  // Step 3: Variable-radius PCF
+  // Step 3: Variable-radius PCF (paper Listing 6)
   float shadow = 0;
-  for (uint j = 0u; j < PCSS_SAMPLE_COUNT; j++) {
-    float2 offset = ISFAST_PoissonDisk((float)j, (float)PCSS_SAMPLE_COUNT, jitter_angle, filter_radius_scale);
+  for (uint j = 0u; j < (uint)filter_count_total; j++) {
+    float2 offset = ISFAST_PoissonDisk((float)j, filter_count_total, jitter_angle, filter_radius_scale);
     float2 sample_uv = saturate(shadow_uv + offset * filter_radius);
     shadow += shadowMaps.SampleCmpLevelZero(SmplShadow_s, float3(sample_uv, slice), receiver_z).x;
   }
-  return shadow / (float)PCSS_SAMPLE_COUNT;
+  return shadow / filter_count_total;
 }
 
 
@@ -196,15 +185,16 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
 
-  // ── PCSS jitter setup ──
-  float pcss_jitter_angle = 0;
-  bool pcss_active = shader_injection_data.shadow_filter_method > 1.5f;
-  if (pcss_active && shader_injection_data.shadow_pcss_jitter_enabled > 0.5f) {
+  // ── CHSS jitter setup ──
+  float chss_jitter_angle = 0;
+  bool chss_active = shader_injection_data.shadow_filter_method > 1.5f;
+  if (chss_active && shader_injection_data.shadow_pcss_jitter_enabled > 0.5f) {
     uint2 jitter_pixel = uint2(floor(v0.xy));
     float jitter_phase_static = IGN(float2(jitter_pixel));
     uint jitter_frame = (uint)(sceneTime_g * shader_injection_data.shadow_pcss_jitter_speed);
     float2 jitter_noise;
-    if (shader_injection_data.shadow_isfast_enabled > 0.5f) {
+    if (shader_injection_data.shadow_isfast_enabled > 0.5f
+        && shader_injection_data.shadow_chss_noise_mode > 0.5f) {
       jitter_noise = SpatioTemporalNoise_ISFAST(jitter_pixel, jitter_frame);
     } else {
       static const float R2_A1 = 0.7548776662466927;
@@ -212,14 +202,11 @@ void main(
       jitter_noise = float2(frac(b + R2_A1 * (float)jitter_frame), jitter_phase_static);
     }
     float jitter_phase = lerp(jitter_phase_static, jitter_noise.x, shader_injection_data.shadow_pcss_jitter_amount);
-    pcss_jitter_angle = 6.28318548 * jitter_phase;
+    chss_jitter_angle = 6.28318548 * jitter_phase;
   }
 
-  // Fix D: Auto-scale cascade blend with split distance
-  float pcss_blend = shader_injection_data.shadow_pcss_cascade_blend;
-  if (shader_injection_data.shadow_pcss_fix_auto_blend > 0.5f) {
-    pcss_blend *= shadowSplitDistance_g.y / 200.0;
-  }
+  // Cascade cross-fade width (constant; wider cascades get relatively tighter blends)
+  float chss_blend = 0.2f;
 
   r0.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   r0.xy = v1.zw * float2(2,-2) + float2(-1,1);
@@ -255,7 +242,7 @@ void main(
     } else {
       r3.z = 3;
       if (shader_injection_data.shadow_filter_method > 1.5f) {
-        r2.x = PCSS_Shadow(r1.yz, r1.w, 3, shadowSplitDistance_g.z, pcss_jitter_angle);
+        r2.x = CHSS_Shadow(r1.yz, r1.w, 3, chss_jitter_angle);
       } else if (shader_injection_data.shadow_filter_method > 0.5f) {
       r2.yz = float2(0,0);
       while (true) {
@@ -281,9 +268,9 @@ void main(
       r1.yzw = r3.xyz / r1.yyy;
       r3.z = 2;
       if (shader_injection_data.shadow_filter_method > 1.5f) {
-        r2.w = PCSS_Shadow(r1.yz, r1.w, 2, shadowSplitDistance_g.z, pcss_jitter_angle);
+        r2.w = CHSS_Shadow(r1.yz, r1.w, 2, chss_jitter_angle);
         r1.y = shadowSplitDistance_g.z + -r1.x;
-        r1.y = pcss_blend * r1.y;
+        r1.y = chss_blend * r1.y;
         r1.z = r2.w + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
       } else if (shader_injection_data.shadow_filter_method > 0.5f) {
@@ -297,14 +284,14 @@ void main(
         r2.z = (int)r2.z + 1;
       }
       r1.y = shadowSplitDistance_g.z + -r1.x;
-      r1.y = pcss_blend * r1.y;
+      r1.y = chss_blend * r1.y;
       r1.z = r2.y * 0.100000001 + -r2.x;
       r2.x = r1.y * r1.z + r2.x;
       } else {
         r3.xy = saturate(r1.yz);
         r2.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
         r1.y = shadowSplitDistance_g.z + -r1.x;
-        r1.y = pcss_blend * r1.y;
+        r1.y = chss_blend * r1.y;
         r1.z = r2.w + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
       }
@@ -328,7 +315,7 @@ void main(
       } else {
         r3.z = 2;
         if (shader_injection_data.shadow_filter_method > 1.5f) {
-          r2.x = PCSS_Shadow(r1.yz, r1.w, 2, shadowSplitDistance_g.y, pcss_jitter_angle);
+          r2.x = CHSS_Shadow(r1.yz, r1.w, 2, chss_jitter_angle);
         } else if (shader_injection_data.shadow_filter_method > 0.5f) {
         r2.yz = float2(0,0);
         while (true) {
@@ -355,9 +342,9 @@ void main(
         r2.yz = invShadowSize_g.xy * float2(1.125,1.125);
         r3.z = 1;
         if (shader_injection_data.shadow_filter_method > 1.5f) {
-          r2.w = PCSS_Shadow(r1.yz, r1.w, 1, shadowSplitDistance_g.y, pcss_jitter_angle);
+          r2.w = CHSS_Shadow(r1.yz, r1.w, 1, chss_jitter_angle);
           r1.y = shadowSplitDistance_g.y + -r1.x;
-          r1.y = pcss_blend * r1.y;
+          r1.y = chss_blend * r1.y;
           r1.z = r2.w + -r2.x;
           r2.x = r1.y * r1.z + r2.x;
         } else if (shader_injection_data.shadow_filter_method > 0.5f) {
@@ -372,14 +359,14 @@ void main(
           r3.w = (int)r3.w + 1;
         }
         r1.y = shadowSplitDistance_g.y + -r1.x;
-        r1.y = pcss_blend * r1.y;
+        r1.y = chss_blend * r1.y;
         r1.z = r2.w * 0.100000001 + -r2.x;
         r2.x = r1.y * r1.z + r2.x;
         } else {
           r3.xy = saturate(r1.yz);
           r2.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r1.w).x;
           r1.y = shadowSplitDistance_g.y + -r1.x;
-          r1.y = pcss_blend * r1.y;
+          r1.y = chss_blend * r1.y;
           r1.z = r2.w + -r2.x;
           r2.x = r1.y * r1.z + r2.x;
         }
@@ -393,7 +380,7 @@ void main(
       r1.z = dot(r0.xyzw, shadowMtx_g[r2.z/4]._m03_m13_m23_m33);
       r3.xyz = r3.xyz / r1.zzz;
       if (shader_injection_data.shadow_filter_method > 1.5f) {
-        r2.x = PCSS_Shadow(r3.xy, r3.z, r2.w, shadowSplitDistance_g.x, pcss_jitter_angle);
+        r2.x = CHSS_Shadow(r3.xy, r3.z, r2.w, chss_jitter_angle);
       } else if (shader_injection_data.shadow_filter_method > 0.5f) {
       r1.z = dot(float2(1.25,1.125), icb[r2.y+0].xy);
       r1.zw = invShadowSize_g.xy * r1.zz;
@@ -424,9 +411,9 @@ void main(
         r1.yz = invShadowSize_g.xy * float2(1.125,1.125);
         r3.z = 1;
         if (shader_injection_data.shadow_filter_method > 1.5f) {
-          r0.w = PCSS_Shadow(r0.xy, r0.z, 1, shadowSplitDistance_g.x, pcss_jitter_angle);
+          r0.w = CHSS_Shadow(r0.xy, r0.z, 1, chss_jitter_angle);
           r0.y = shadowSplitDistance_g.x + -r1.x;
-          r0.y = pcss_blend * r0.y;
+          r0.y = chss_blend * r0.y;
           r0.z = r0.w + -r2.x;
           r2.x = r0.y * r0.z + r2.x;
         } else if (shader_injection_data.shadow_filter_method > 0.5f) {
@@ -441,14 +428,14 @@ void main(
           r1.w = (int)r1.w + 1;
         }
         r0.y = shadowSplitDistance_g.x + -r1.x;
-        r0.xy = float2(0.100000001,pcss_blend) * r0.wy;
+        r0.xy = float2(0.100000001,chss_blend) * r0.wy;
         r0.z = r3.w * 0.100000001 + -r0.x;
         r2.x = r0.y * r0.z + r0.x;
         } else {
           r3.xy = saturate(r0.xy);
           r0.w = shadowMaps.SampleCmpLevelZero(SmplShadow_s, r3.xyz, r0.z).x;
           r0.y = shadowSplitDistance_g.x + -r1.x;
-          r0.y = pcss_blend * r0.y;
+          r0.y = chss_blend * r0.y;
           r0.z = r0.w + -r2.x;
           r2.x = r0.y * r0.z + r2.x;
         }

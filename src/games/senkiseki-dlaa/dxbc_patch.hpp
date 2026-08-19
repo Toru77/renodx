@@ -2158,6 +2158,11 @@ inline bool PatchSkinnedVertexShader(std::vector<std::byte>& data, uint32_t* out
       EmitMul(body, rEye, 0x7u, rEye, kSwizzleXYZW, rE, kSwizzleWWWW);
       EmitAdd(body, rCurAcc, 0x7u, rCurAcc, kSwizzleXYZW, rEye, kSwizzleXYZW);
     }
+    if (!no_bind && !minimal) {
+      EmitMovImm1(body, rCmp, 0x1u, 0x3E800000u);
+      EmitLt(body, rCmp, 0x1u, rCmp, kSwizzleXXXX, rBestD, kSwizzleXXXX);
+      EmitMovc(body, rAcc, 0xFu, rCmp, kSwizzleXXXX, rCurAcc, kSwizzleXYZW, rAcc, kSwizzleXYZW);
+    }
     // curClip = the GAME's current ViewProjection (b0 c10..c13) x rCurAcc.
     EmitDp4Cb(body, rCurClip, 0x1u, globals_slot, 10u, rCurAcc, kSwizzleXYZW);
     EmitDp4Cb(body, rCurClip, 0x2u, globals_slot, 11u, rCurAcc, kSwizzleXYZW);

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  *
@@ -88,6 +88,12 @@ static float g_phaseb_vel_frame_dump = 0.f;  // FRAME-BURST diagnostic: when set
                                              // per-object delta reads as "clean". The burst
                                              // reveals the exact temporal pattern (real idle
                                              // motion vs stale-prev alternation vs garbage).
+static float g_phaseb_burst_frames = 90.f;  // Auto-burst length when the master
+                                            // diagnostic toggle (DLAAPhaseBCharMotionDebug)
+                                            // arms the burst; default 90 frames (1.5s at 60fps,
+                                            // ~0.85s at 107fps). A longer burst (up to 600)
+                                            // lets the burst span a reported flicker window
+                                            // without restarting the game.
 // ROOT-CAUSE FIX 1 (A/B, live): the yellow/purple HSV spots at still are the
 // depth-reprojection float round-trip noise on the near character (velScan
 // proves max=0.02px, all inside the character alphaBox; fullScan proves the
@@ -110,6 +116,13 @@ static float g_phase_object_delta_direct = 1.f;
 // parts keep their constant real MV; intermittent parts go stable.
 static float g_phaseb_strict_prev = 0.f;
 static float g_char_motion_debug = 0.f;  // non-throttled per-draw logs for specific character VS/PS pairs
+// DLAAPhaseBCharMotionDebug is the MASTER diagnostic toggle: it also enables
+// the Phase B prevVP/snapshot diagnostics (which normally need
+// DLAAPhaseBDebugLogging) and one automatic velocity burst. This helper is
+// that master gate — every per-draw Phase B diag uses it.
+static bool PhasebDbgActive() {
+  return shader_injection.dlaa_phaseb_debug_logging > 0.5f || g_char_motion_debug > 0.5f;
+}
 static float g_phaseb_dump = 0.f;     // evidence capture: write patched/original blobs + drawtrace to renodx-dev/dump/phaseb/
 // ── Phase E velocity carrier ──
 static float g_phasee_enabled = 0.f;  // MASTER GATE: the Phase E PS patcher (patched char PS
@@ -369,6 +382,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     uint32_t rr = 0u;                      // round-robin capture cursor (reset at present)
     uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
     uint64_t prev_capture_frame = 0u;      // frame the CURRENT prev_buffer content was captured (freshness)
+    uint64_t charmv_last_log_frame = 0u;   // frame of the last charmv log line (charmv steady-state throttle)
     // OPT 1: set at the draw-time cur capture, cleared at present after the
     // promote. Lets CapturePrevBones promote exactly the snaps drawn this
     // present cycle WITHOUT comparing frame counters (d->frame_index advances
@@ -610,6 +624,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // staging for the per-frame decode + how many frames are left in the burst.
   ID3D11Texture2D* motion_burst_staging = nullptr;
   uint32_t motion_burst_remaining = 0u;
+  bool char_debug_prev_on = false;          // last-frame DLAAPhaseBCharMotionDebug state (rising-edge detect)
+  bool motion_burst_auto_armed = false;     // char-debug master toggle armed one automatic velocity burst
+  uint64_t diag_ctx_until = 0u;             // frame-burst context capture: log per-draw Phase B diag
+                                            // unthrottled through this frame (armed by a maxD spike)
 };
 
 // OPT 5: per-draw shader hashes. When DLAAPhaseBSharedState is on, the draw
@@ -1502,6 +1520,14 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
 // Phase E's generic, live OM gate. The DXBC gate guarantees the PS writes
 // exactly o3; this verifies that the current draw has exactly RT0..2 and that
 // all four targets are compatible before binding our dedicated RT3.
+// ── Frame-burst context capture ──
+// While a maxD spike from MaybeLogMotionFrameBurst has armed the context, the
+// per-draw Phase B diagnostic lines switch from throttled to one-per-draw so
+// the log names WHICH draw/key wrote the wrong MV region (the steady-state
+// throttles hide the offending frame).
+static bool DiagCtxActive(DeviceData* d) {
+  return d && d->diag_ctx_until != 0u && d->frame_index <= d->diag_ctx_until;
+}
 static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
   const uint32_t vh = CurrentVsHash(cmd_list, d);
@@ -1510,11 +1536,20 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
   const bool is_po_vs = vit != d->patched_vs_by_hash.end() && vit->second.emits_velocity;
   const bool is_phasee_candidate = d->phasee_ps_candidates.contains(ph);
 
-  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f && (is_po_vs || is_phasee_candidate))
-    LogThrottled(ThrottleKey("motion-draw", vh, ph, d->last_rtv_count).c_str(),
-                 reshade::log::level::info, 1u, 200u,
-                 "[DLAA] motion: draw vs=0x%08X ps=0x%08X rtvs=%u poVS=%d phaseECandidate=%d",
-                 vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_phasee_candidate);
+  if (PhasebDbgActive() && (is_po_vs || is_phasee_candidate)) {
+    if (DiagCtxActive(d)) {
+      char mline[256];
+      snprintf(mline, sizeof(mline),
+               "[DLAA] motion: draw vs=0x%08X ps=0x%08X rtvs=%u poVS=%d phaseECandidate=%d",
+               vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_phasee_candidate);
+      reshade::log::message(reshade::log::level::info, mline);
+    } else {
+      LogThrottled(ThrottleKey("motion-draw", vh, ph, d->last_rtv_count).c_str(),
+                   reshade::log::level::info, 1u, 200u,
+                   "[DLAA] motion: draw vs=0x%08X ps=0x%08X rtvs=%u poVS=%d phaseECandidate=%d",
+                   vh, ph, d->last_rtv_count, (int)is_po_vs, (int)is_phasee_candidate);
+    }
+  }
 
   const bool eligible = g_phasee_enabled >= 0.5f &&
                         shader_injection.dlaa_per_object_motion >= 0.5f &&
@@ -1600,7 +1635,7 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
     return;
   }
 
-  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+  if (PhasebDbgActive())
     LogThrottled(ThrottleKey("motion-append", vh, ph, 3u).c_str(),
                  reshade::log::level::info, 1u, 200u,
                  "[DLAA] motion: APPEND vs=0x%08X ps=0x%08X rtvs=3", vh, ph);
@@ -2389,10 +2424,29 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
   auto* src = ResolveMotionSourceTexture(d);
   if (!src) return;
   if (shader_injection.dlaa_per_object_motion < 0.5f) return;
+  // Expire the context-capture window once the armed frames have passed.
+  if (d->diag_ctx_until != 0u && d->frame_index > d->diag_ctx_until)
+    d->diag_ctx_until = 0u;
   auto* dev = cmd_list->get_device();
   auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
   if (!dev || !cl || !nd) return;
+  // DLAAPhaseBCharMotionDebug (the master diagnostic toggle) also runs ONE
+  // velocity burst when switched on, so the final-MV classification is always
+  // captured without setting DLAAPhaseBVelFrameDump separately. An explicit
+  // DLAAPhaseBVelFrameDump still wins when both are set (it re-arms here).
+  const bool cd_on = g_char_motion_debug > 0.5f;
+  if (cd_on && !d->char_debug_prev_on) d->motion_burst_auto_armed = true;
+  d->char_debug_prev_on = cd_on;
+  if (g_phaseb_vel_frame_dump <= 0.5f && cd_on && d->motion_burst_auto_armed &&
+      d->motion_burst_remaining == 0u) {
+    d->motion_burst_remaining = (uint32_t)std::clamp(g_phaseb_burst_frames, 1.0f, 600.0f);
+    d->motion_burst_auto_armed = false;
+    char armbuf[96];
+    snprintf(armbuf, sizeof(armbuf), "[DLAA] burst auto-armed: %u frames",
+             (unsigned)d->motion_burst_remaining);
+    reshade::log::message(reshade::log::level::info, armbuf);
+  }
   if (g_phaseb_vel_frame_dump > 0.5f && d->motion_burst_remaining == 0u) {
     d->motion_burst_remaining = (uint32_t)std::clamp(g_phaseb_vel_frame_dump, 1.0f, 300.0f);
   }
@@ -2435,6 +2489,11 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
   uint64_t n_a1 = 0, a_cx = 0, a_cy = 0;
   UINT a_min_x = sd.Width, a_min_y = sd.Height, a_max_x = 0u, a_max_y = 0u;
   double max_speed = 0.0;
+  UINT max_x = 0u, max_y = 0u;
+  double max_vx = 0.0, max_vy = 0.0;
+  uint32_t n_over20 = 0u, n_over50 = 0u, n_over100 = 0u;
+  struct BurstTopPx { double sp, vx, vy; UINT x, y; };
+  BurstTopPx top[3] = {};
   constexpr UINT sx = 2u, sy = 2u;
   auto read_texel = [&](UINT x, UINT y, float out[4]) {
     if (sd.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
@@ -2455,15 +2514,14 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
       if (y < a_min_y) a_min_y = y;
       if (y > a_max_y) a_max_y = y;
       a_cx += x; a_cy += y;
-      double sp = 0.0;
+      double dx = 0.0, dy = 0.0;
       if (g_phasee_enabled >= 0.5f) {
-        double dx = (double)q[0] * wp;
-        double dy = -(double)q[1] * hp;
+        dx = (double)q[0] * wp;
+        dy = -(double)q[1] * hp;
         if (correct_global_carrier) {
           dx += carrier_jitter_x;
           dy += carrier_jitter_y;
         }
-        sp = std::sqrt(dx * dx + dy * dy);
       } else {
         const double code = std::round((double)q[0] * 256.0) * 65536.0 +
                             std::round((double)q[1] * 256.0) * 256.0 +
@@ -2471,14 +2529,26 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
         if (code <= 0.5) continue;
         const double ix = std::floor(code / 4096.0);
         const double iy = code - ix * 4096.0;
-        const double vx = (ix / 4096.0) - 0.75;
-        const double vy = (iy / 4096.0) - 0.75;
-        sp = std::sqrt(vx * vx * wp * wp + vy * vy * hp * hp);
+        dx = ((ix / 4096.0) - 0.75) * wp;
+        dy = -((iy / 4096.0) - 0.75) * hp;
       }
-      if (sp > max_speed) max_speed = sp;
+      const double sp = std::sqrt(dx * dx + dy * dy);
+      if (sp > max_speed) {
+        max_speed = sp;
+        max_x = x; max_y = y; max_vx = dx; max_vy = dy;
+      }
+      if (sp > 20.0) n_over20++;
+      if (sp > 50.0) n_over50++;
+      if (sp > 100.0) n_over100++;
+      if (sp > top[2].sp) {
+        top[2] = {sp, dx, dy, x, y};
+        for (int i = 2; i > 0 && top[i].sp > top[i - 1].sp; --i) {
+          const BurstTopPx t = top[i]; top[i] = top[i - 1]; top[i - 1] = t;
+        }
+      }
     }
   }
-  char buf[320];
+  char buf[400];
   if (n_a1) {
     const UINT cx = (UINT)(a_cx / n_a1), cy = (UINT)(a_cy / n_a1);
     float cq[4]; read_texel(cx, cy, cq);
@@ -2507,10 +2577,12 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
     }
     snprintf(buf, sizeof(buf),
              "[DLAA] burst f=%llu c=(%u,%u) raw=(%+.2f,%+.2f) d=(%+.2f,%+.2f)px |d|=%.2f maxD=%.2fpx "
-             "box=%ux%u a1=%llu",
+             "@(%u,%u) v=(%+.2f,%+.2f) n20=%u n50=%u n100=%u box=%ux%u a1=%llu",
              (unsigned long long)d->frame_index, cx, cy, (float)raw_dx, (float)raw_dy,
              (float)dx, (float)dy,
              (float)std::sqrt(dx * dx + dy * dy), (float)max_speed,
+             max_x, max_y, (float)max_vx, (float)max_vy,
+             (unsigned)n_over20, (unsigned)n_over50, (unsigned)n_over100,
              (unsigned)(a_max_x - a_min_x), (unsigned)(a_max_y - a_min_y),
              (unsigned long long)n_a1);
   } else {
@@ -2519,6 +2591,30 @@ static void MaybeLogMotionFrameBurst(reshade::api::command_list* cmd_list, Devic
   }
   cl->Unmap(d->motion_burst_staging, 0);
   reshade::log::message(reshade::log::level::info, buf);
+  // ── Frame-burst context capture: a maxD spike (wrong MV region) arms
+  // unthrottled per-draw Phase B diag for the next frames so the log names
+  // WHICH draw/key wrote the wrong pixels. The event repeats on consecutive
+  // frames, so the armed window catches the producing draw. ──
+  if (max_speed > 20.0) {
+    if (d->diag_ctx_until == 0u || d->frame_index > d->diag_ctx_until) {
+      d->diag_ctx_until = d->frame_index + 1u;
+      char ctxbuf[128];
+      snprintf(ctxbuf, sizeof(ctxbuf),
+               "[DLAA] burst-ctx: armed full draw context through f=%llu (maxD=%.2fpx)",
+               (unsigned long long)d->diag_ctx_until, (float)max_speed);
+      reshade::log::message(reshade::log::level::info, ctxbuf);
+    }
+    if (n_a1 && top[0].sp > 0.0) {
+      char topbuf[400];
+      snprintf(topbuf, sizeof(topbuf),
+               "[DLAA] burst top3 f=%llu: (%u,%u|%+.2f,%+.2f|%.1f) (%u,%u|%+.2f,%+.2f|%.1f) (%u,%u|%+.2f,%+.2f|%.1f)",
+               (unsigned long long)d->frame_index,
+               top[0].x, top[0].y, (float)top[0].vx, (float)top[0].vy, (float)top[0].sp,
+               top[1].x, top[1].y, (float)top[1].vx, (float)top[1].vy, (float)top[1].sp,
+               top[2].x, top[2].y, (float)top[2].vx, (float)top[2].vy, (float)top[2].sp);
+      reshade::log::message(reshade::log::level::info, topbuf);
+    }
+  }
   d->motion_burst_remaining--;
   if (d->motion_burst_remaining == 0u) g_phaseb_vel_frame_dump = 0.f;
 }
@@ -2805,6 +2901,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   // whether the K prev-bone slots get the real prev SRVs (snapshot present) or
   // the identity placeholder (never leave a patched skinned VS slot unbound).
   DeviceData::PrevBoneSnap* bound_snap = nullptr;
+  int snap_miss_reason = 0;
   if (shader_injection.dlaa_per_object_motion >= 0.5f &&
       (g_opt_bind_capture_only < 0.5f ||
        d->phasee_ps_candidates.contains(CurrentPsHash(cmd_list, d)))) {
@@ -2895,14 +2992,24 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 return x;
               };
               const uint64_t key =
-                  mix_key(b0k ^ mix_key(vbk) ^ mix_key(gbk & ~0xFFFFFull));
+                  mix_key(b0k ^ mix_key(vbk) ^ mix_key(gbk & ~0x3FFFFFull));
               // ── Diag (throttled): which key component cycles (b0 / vb0 /
               // bone handle). Confirms the ring composition for the next log. ──
-              if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
-                LogThrottled("ring-components", reshade::log::level::info, 1u, 30u,
-                             "[DLAA] ring b0=0x%llX vb=0x%llX bone=0x%llX key=0x%llX size=%u",
-                             (unsigned long long)b0k, (unsigned long long)vbk,
-                             (unsigned long long)gbk, (unsigned long long)key, gd.ByteWidth);
+              if (PhasebDbgActive()) {
+                if (DiagCtxActive(d)) {
+                  char rline2[256];
+                  snprintf(rline2, sizeof(rline2),
+                           "[DLAA] ring b0=0x%llX vb=0x%llX bone=0x%llX key=0x%llX size=%u",
+                           (unsigned long long)b0k, (unsigned long long)vbk,
+                           (unsigned long long)gbk, (unsigned long long)key, gd.ByteWidth);
+                  reshade::log::message(reshade::log::level::info, rline2);
+                } else {
+                  LogThrottled("ring-components", reshade::log::level::info, 1u, 30u,
+                               "[DLAA] ring b0=0x%llX vb=0x%llX bone=0x%llX key=0x%llX size=%u",
+                               (unsigned long long)b0k, (unsigned long long)vbk,
+                               (unsigned long long)gbk, (unsigned long long)key, gd.ByteWidth);
+                }
+              }
               // ── Mode 6 draw-identity diag: log WHICH patched draw is bound
               // (vh / ph / key / bone handle) and the VP row0 (cb0[10]) it would
               // project with. The mode-6 motionBuf center shows curNDC.x pinned
@@ -2947,7 +3054,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   EnsurePrevBoneSnap(cmd_list->get_device(), d, key, gd.ByteWidth);
               // Phase B diagnostic: which bones are shared across keys (sharing)
               // and which keys rotate through multiple bone handles (ring).
-              if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+              if (PhasebDbgActive()) {
                 d->diag_bone_keys[gbk].insert(key);
                 d->diag_key_bones[key].insert(gbk);
               }
@@ -3015,16 +3122,29 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // refreshed = the staleness guard just forced prev=cur. If age
                 // is huge the prev bones were stale (garbage deltas); if
                 // refreshed fires constantly prev==cur (delta ~0). ──
-                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+                if (DiagCtxActive(d) ||
+                    shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
                   const bool captured_this = (prev_last_draw != d->frame_index);
                   const bool refreshed_this = guard_fired;
-                  LogThrottled(ThrottleKey("snap-state", vh, (uint32_t)key,
-                                           (uint32_t)(key >> 32)).c_str(),
-                               reshade::log::level::info, 1u, 120u,
-                               "[DLAA] snap vs=0x%08X key=0x%llX age=%llu cap=%d refr=%d "
-                               "prevCapF=%llu lastDraw=%llu size=%u",
-                               vh, key, snap_age, (int)captured_this, (int)refreshed_this,
-                               snap->prev_capture_frame, snap->last_draw_frame, snap->size);
+                  if (DiagCtxActive(d)) {
+                    char sline[256];
+                    snprintf(sline, sizeof(sline),
+                             "[DLAA] snap vs=0x%08X key=0x%llX age=%llu cap=%d refr=%d "
+                             "prevCapF=%llu lastDraw=%llu size=%u",
+                             vh, (unsigned long long)key, (unsigned long long)snap_age,
+                             (int)captured_this, (int)refreshed_this,
+                             (unsigned long long)snap->prev_capture_frame,
+                             (unsigned long long)snap->last_draw_frame, snap->size);
+                    reshade::log::message(reshade::log::level::info, sline);
+                  } else {
+                    LogThrottled(ThrottleKey("snap-state", vh, (uint32_t)key,
+                                             (uint32_t)(key >> 32)).c_str(),
+                                 reshade::log::level::info, 1u, 120u,
+                                 "[DLAA] snap vs=0x%08X key=0x%llX age=%llu cap=%d refr=%d "
+                                 "prevCapF=%llu lastDraw=%llu size=%u",
+                                 vh, key, snap_age, (int)captured_this, (int)refreshed_this,
+                                 snap->prev_capture_frame, snap->last_draw_frame, snap->size);
+                  }
                 }
                 // ── Robot hash-gated diagnostic ──
                 // The robot (VS 0x2485824C -> 0x67182A05) draws its BODY
@@ -3037,7 +3157,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // snapshot is stale or contaminated (age > 2, or prev != cur).
                 {
                   const uint32_t ph_robot = CurrentPsHash(cmd_list, d);
-                  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+                  if (PhasebDbgActive() &&
                       (vh == 0x2485824Cu || vh == 0x67182A05u ||
                        ph_robot == 0x657DB305u || ph_robot == 0x1D60B0C2u)) {
                     const uint64_t rkey = ((uint64_t)vh << 32u) | ph_robot;
@@ -3093,15 +3213,21 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   }
                 }
                 // ── Character Motion Debug Logs (DLAAPhaseBCharMotionDebug) ──
-                // NON-throttled per-draw diagnostic for SPECIFIC character
-                // VS/PS pairs. The flickering-MV ghosting is intermittent (one
-                // frame wrong, next frame right), so the 1/sec throttled logs
-                // hide the offending frame. Logs the game's CURRENT root bone,
-                // every prev slot's root bone, and the slot the patched VS's
-                // nearest-root-bone match would select (mirrors the GPU logic).
-                // On a STATIONARY (breathing-only) character a large dBone means
-                // the nearest-match picked a stale/identity slot - the smoking
-                // gun. EXPENSIVE: 5 GPU readbacks per matching draw.
+                // Per-draw diagnostic for SPECIFIC character VS/PS pairs. The
+                // flickering-MV ghosting is intermittent (one frame wrong, next
+                // frame right), so the 1/sec throttled logs hide the offending
+                // frame. Logs the game's CURRENT root bone, every prev slot's
+                // root bone, and the slot the patched VS's nearest-root-bone
+                // match would select (mirrors the GPU logic). On a STATIONARY
+                // (breathing-only) character a large dBone means the
+                // nearest-match picked a stale/identity slot - the smoking gun.
+                // DLAAPhaseBCharMotionDebug is the MASTER diagnostic toggle
+                // (it also enables the Phase B prevVP/snapshot logs and one
+                // velocity burst), so this block is THROTTLED to stay
+                // processable: anomalies (age != 1, refr=1, best != 0, root
+                // delta > 5mm) ALWAYS log, steady state logs at most one line
+                // per key per 60 frames, and the 5 GPU readbacks are skipped
+                // entirely on throttled steady-state draws (the expensive part).
                 {
                   const uint32_t ph_char = CurrentPsHash(cmd_list, d);
                   const bool cm_vs = (vh == 0x0B8C262Du || vh == 0x1D90829Au ||
@@ -3109,60 +3235,73 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                                       it->second.new_hash == 0x1D90829Au);
                   const bool cm_ps = (ph_char == 0x159A34A3u || ph_char == 0x1DE48D94u);
                   if (g_char_motion_debug > 0.5f && (cm_vs || cm_ps)) {
-                    auto* ndev3 = reinterpret_cast<ID3D11Device*>(
-                        cmd_list->get_device()->get_native());
-                    auto read_bone_t = [&](ID3D11Buffer* src, float out[3]) {
-                      out[0] = out[1] = out[2] = 0.f;
-                      if (!ndev3 || !src) return;
-                      D3D11_BUFFER_DESC sd3 = {};
-                      sd3.ByteWidth = 64u;
-                      sd3.Usage = D3D11_USAGE_STAGING;
-                      sd3.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                      ID3D11Buffer* st3 = nullptr;
-                      if (FAILED(ndev3->CreateBuffer(&sd3, nullptr, &st3))) return;
-                      D3D11_BOX box3 = {0, 0, 0, 64u, 1, 1};
-                      ctx->CopySubresourceRegion(st3, 0, 0, 0, 0, src, 0, &box3);
-                      D3D11_MAPPED_SUBRESOURCE mm3 = {};
-                      if (SUCCEEDED(ctx->Map(st3, 0, D3D11_MAP_READ, 0, &mm3))) {
-                        const float* f3 = static_cast<const float*>(mm3.pData);
-                        out[0] = f3[3]; out[1] = f3[7]; out[2] = f3[11];
-                        ctx->Unmap(st3, 0);
+                    const bool cd_anomaly = guard_fired || snap_age != 1u;
+                    const uint64_t cd_last = snap->charmv_last_log_frame;
+                    const bool cd_recent = cd_last != 0u &&
+                                           (d->frame_index - cd_last) < 60u;
+                    if (cd_anomaly || !cd_recent || DiagCtxActive(d)) {
+                      auto* ndev3 = reinterpret_cast<ID3D11Device*>(
+                          cmd_list->get_device()->get_native());
+                      auto read_bone_t = [&](ID3D11Buffer* src, float out[3]) {
+                        out[0] = out[1] = out[2] = 0.f;
+                        if (!ndev3 || !src) return;
+                        D3D11_BUFFER_DESC sd3 = {};
+                        sd3.ByteWidth = 64u;
+                        sd3.Usage = D3D11_USAGE_STAGING;
+                        sd3.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        ID3D11Buffer* st3 = nullptr;
+                        if (FAILED(ndev3->CreateBuffer(&sd3, nullptr, &st3))) return;
+                        D3D11_BOX box3 = {0, 0, 0, 64u, 1, 1};
+                        ctx->CopySubresourceRegion(st3, 0, 0, 0, 0, src, 0, &box3);
+                        D3D11_MAPPED_SUBRESOURCE mm3 = {};
+                        if (SUCCEEDED(ctx->Map(st3, 0, D3D11_MAP_READ, 0, &mm3))) {
+                          const float* f3 = static_cast<const float*>(mm3.pData);
+                          out[0] = f3[3]; out[1] = f3[7]; out[2] = f3[11];
+                          ctx->Unmap(st3, 0);
+                        }
+                        st3->Release();
+                      };
+                      float gt[3] = {};
+                      float pt[DeviceData::kBoneSlots][3] = {};
+                      read_bone_t(gb, gt);
+                      for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+                        read_bone_t(snap->prev_buffer[s], pt[s]);
+                      // Mirror the GPU nearest-root-bone selection (min |delta|^2).
+                      uint32_t best_slot = 0u; float best_d = 1e30f;
+                      for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                        float dx = pt[s][0]-gt[0], dy = pt[s][1]-gt[1], dz = pt[s][2]-gt[2];
+                        float d = dx*dx+dy*dy+dz*dz;
+                        if (d < best_d) { best_d = d; best_slot = s; }
                       }
-                      st3->Release();
-                    };
-                    float gt[3] = {};
-                    float pt[DeviceData::kBoneSlots][3] = {};
-                    read_bone_t(gb, gt);
-                    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
-                      read_bone_t(snap->prev_buffer[s], pt[s]);
-                    // Mirror the GPU nearest-root-bone selection (min |delta|^2).
-                    uint32_t best_slot = 0u; float best_d = 1e30f;
-                    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
-                      float dx = pt[s][0]-gt[0], dy = pt[s][1]-gt[1], dz = pt[s][2]-gt[2];
-                      float d = dx*dx+dy*dy+dz*dz;
-                      if (d < best_d) { best_d = d; best_slot = s; }
+                      const float dbx = pt[best_slot][0]-gt[0];
+                      const float dby = pt[best_slot][1]-gt[1];
+                      const float dbz = pt[best_slot][2]-gt[2];
+                      const bool cd_big = dbx > 0.005f || dbx < -0.005f ||
+                                          dby > 0.005f || dby < -0.005f ||
+                                          dbz > 0.005f || dbz < -0.005f;
+                      if (DiagCtxActive(d) || cd_anomaly || cd_big ||
+                          best_slot != 0u || cd_last == 0u || !cd_recent) {
+                        char cline[1100];
+                        snprintf(cline, sizeof(cline),
+                          "[DLAA] charmv vs=0x%08X ps=0x%08X f=%llu key=0x%llX rr=%u cap=%u age=%llu refr=%d real=%d game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) best=%u d=%.4f dBone=(%+.4f,%+.4f,%+.4f)",
+                          vh, ph_char, (unsigned long long)d->frame_index,
+                          (unsigned long long)key, snap->rr, cap_slot,
+                          (unsigned long long)snap_age, (int)guard_fired,
+                          (int)(bound_snap != nullptr),
+                          gt[0], gt[1], gt[2],
+                          pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
+                          pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
+                          best_slot, best_d, dbx, dby, dbz);
+                        reshade::log::message(reshade::log::level::info, cline);
+                        snap->charmv_last_log_frame = d->frame_index;
+                      }
                     }
-                    const float dbx = pt[best_slot][0]-gt[0];
-                    const float dby = pt[best_slot][1]-gt[1];
-                    const float dbz = pt[best_slot][2]-gt[2];
-                    char cline[1100];
-                    snprintf(cline, sizeof(cline),
-                      "[DLAA] charmv vs=0x%08X ps=0x%08X f=%llu key=0x%llX rr=%u cap=%u age=%llu refr=%d real=%d game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) best=%u d=%.4f dBone=(%+.4f,%+.4f,%+.4f)",
-                      vh, ph_char, (unsigned long long)d->frame_index,
-                      (unsigned long long)key, snap->rr, cap_slot,
-                      (unsigned long long)snap_age, (int)guard_fired,
-                      (int)(bound_snap != nullptr),
-                      gt[0], gt[1], gt[2],
-                      pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
-                      pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
-                      best_slot, best_d, dbx, dby, dbz);
-                    reshade::log::message(reshade::log::level::info, cline);
                   }
                 }
                 // ── Diag (1/sec): confirm the game bone buffer + our prev
                 // snapshot hold REAL affine matrices. Identity/zero prev =>
                 // degenerate prevClip => E=0. ──
-                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+                if (PhasebDbgActive() &&
                     d->frame_index - g_bone_dump_last > 60u) {
                   g_bone_dump_last = d->frame_index;
                   auto* ndev = reinterpret_cast<ID3D11Device*>(
@@ -3178,7 +3317,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 // rigid-body offset instead of per-limb motion (the ~-0.9 NDC
                 // uniform delta we observe). These reads are the EXACT
                 // matrices the two passes multiply by. ──
-                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+                if (PhasebDbgActive() &&
                     d->frame_index - g_cb_diag_last > 60u) {
                   g_cb_diag_last = d->frame_index;
                   auto* ndev2 = reinterpret_cast<ID3D11Device*>(
@@ -3212,17 +3351,19 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   read_cb(gb, 0u, gb_m);
                   read_cb(snap->prev_buffer[0], 0u, pb_m);
                   const float* f = cb1m;
-                  LogThrottled(ThrottleKey("draw-cb1", vh, 0u, 0u).c_str(),
-                               reshade::log::level::info, 1u, 60u,
-                               "[DLAA] draw cb1(prevVP)=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
-                               f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
-                               f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                  char cb1line[340];
+                  snprintf(cb1line, sizeof(cb1line),
+                           "[DLAA] draw cb1(prevVP)=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
+                           f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+                           f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                  reshade::log::message(reshade::log::level::info, cb1line);
                   const float* g = b0m;
-                  LogThrottled(ThrottleKey("draw-c1013", vh, 0u, 0u).c_str(),
-                               reshade::log::level::info, 1u, 60u,
-                               "[DLAA] draw b0 c10..13=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
-                               g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
-                               g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+                  char b0line[340];
+                  snprintf(b0line, sizeof(b0line),
+                           "[DLAA] draw b0 c10..13=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
+                           g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+                           g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+                  reshade::log::message(reshade::log::level::info, b0line);
                   // Simulate the VS for a vertex at the root-bone translation:
                   // curClip = c10..13 x gameRoot, prevClip = cb1 x prevRoot.
                   auto project = [](const float* m, const float* p, float* ndc) {
@@ -3235,23 +3376,36 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                   float curN[2], prevN[2];
                   project(b0m, gb_m, curN);
                   project(cb1m, pb_m, prevN);
-                  LogThrottled(ThrottleKey("draw-delta", vh, 0u, 0u).c_str(),
-                               reshade::log::level::info, 1u, 60u,
-                               "[DLAA] draw sim: curNDC=(%+.4f,%+.4f) prevNDC=(%+.4f,%+.4f) delta=(%+.4f,%+.4f)  (root-bone vertex; observed motionBuf delta ~(-0.92,-0.35))",
-                               curN[0], curN[1], prevN[0], prevN[1],
-                               prevN[0]-curN[0], prevN[1]-curN[1]);
+                  char simline[340];
+                  snprintf(simline, sizeof(simline),
+                           "[DLAA] draw sim: curNDC=(%+.4f,%+.4f) prevNDC=(%+.4f,%+.4f) delta=(%+.4f,%+.4f)  (root-bone vertex; observed motionBuf delta ~(-0.92,-0.35))",
+                           curN[0], curN[1], prevN[0], prevN[1],
+                           prevN[0]-curN[0], prevN[1]-curN[1]);
+                  reshade::log::message(reshade::log::level::info, simline);
                 }
+              } else {
+                snap_miss_reason = 6;
               }
+            } else {
+              snap_miss_reason = 5;
             }
+          } else {
+            snap_miss_reason = 4;
           }
           res->Release();
         }
         game_srv->Release();
+      } else {
+        snap_miss_reason = 3;
       }
+    } else {
+      snap_miss_reason = 2;
     }
     if (b0) b0->Release();
     if (vb0) vb0->Release();
-    if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) LogBoneTopology(d);
+    if (PhasebDbgActive()) LogBoneTopology(d);
+  } else {
+    snap_miss_reason = 1;
   }
   // Per-VS bind accounting: bound_snap is non-null iff a REAL prev-bone
   // snapshot was captured/bound this draw (vs the identity placeholder).
@@ -3259,7 +3413,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   // (garbage prevNDC). Use the LOCAL bound_snap here: the member
   // bound_real_prev_bones is only set after this point (and reset by the
   // restore), so reading it here always reported "identity".
-  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f &&
+  if (PhasebDbgActive() &&
       shader_injection.dlaa_per_object_motion >= 0.5f)
     d->diag_bind_counts[vh][bound_snap ? 0u : 1u]++;
   // Save the game's current bindings at these slots BEFORE overwriting them:
@@ -3296,15 +3450,33 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
     ID3D11Buffer* cbs[1] = {d->prev_vp_cb};
     ctx->VSSetConstantBuffers(it->second.prev_vp_cb_slot, 1u, cbs);
   }
-  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
-    LogThrottled(ThrottleKey("phaseB-bind", vh, it->second.prev_vp_cb_slot,
-                             it->second.prev_bone_t_slot).c_str(),
-                 reshade::log::level::info, 1u, 120u,
-                 "[DLAA] phaseB: bind patched vs=0x%08X cb%u=%s t%u=%s tex%u o%u",
-                 vh, it->second.prev_vp_cb_slot, d->prev_vp_cb ? "prevVP" : "NONE",
-                 it->second.prev_bone_t_slot,
-                 d->bound_real_prev_bones ? "prevBones" : "prevBones(identity)",
-                 it->second.texcoord_index, it->second.output_reg);
+  if (PhasebDbgActive()) {
+    if (DiagCtxActive(d)) {
+      char bline[256];
+      snprintf(bline, sizeof(bline),
+               "[DLAA] phaseB: bind patched vs=0x%08X cb%u=%s t%u=%s tex%u o%u",
+               vh, it->second.prev_vp_cb_slot, d->prev_vp_cb ? "prevVP" : "NONE",
+               it->second.prev_bone_t_slot,
+               d->bound_real_prev_bones ? "prevBones" : "prevBones(identity)",
+               it->second.texcoord_index, it->second.output_reg);
+      reshade::log::message(reshade::log::level::info, bline);
+      if (!bound_snap) {
+        char mline[192];
+        snprintf(mline, sizeof(mline),
+                 "[DLAA] snap MISSING vs=0x%08X ps=0x%08X reason=%d",
+                 vh, CurrentPsHash(cmd_list, d), snap_miss_reason);
+        reshade::log::message(reshade::log::level::info, mline);
+      }
+    } else {
+      LogThrottled(ThrottleKey("phaseB-bind", vh, it->second.prev_vp_cb_slot,
+                               it->second.prev_bone_t_slot).c_str(),
+                   reshade::log::level::info, 1u, 120u,
+                   "[DLAA] phaseB: bind patched vs=0x%08X cb%u=%s t%u=%s tex%u o%u",
+                   vh, it->second.prev_vp_cb_slot, d->prev_vp_cb ? "prevVP" : "NONE",
+                   it->second.prev_bone_t_slot,
+                   d->bound_real_prev_bones ? "prevBones" : "prevBones(identity)",
+                   it->second.texcoord_index, it->second.output_reg);
+    }
     // Read the binds back to confirm they recorded on THIS context. If the game
     // draws on a different (deferred) context, they read back NULL/OTHER and the
     // patched VS executes with an unbound t#/b# -> GPU fault (TDR).
@@ -3437,7 +3609,7 @@ static void MaybeBindPatchedRigidVs(reshade::api::command_list* cmd_list, Device
     ctx->VSSetConstantBuffers(vp_slot, 1u, cbs);
   }
 
-  if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+  if (PhasebDbgActive())
     LogThrottled(ThrottleKey("phaseW-bind", vh, world_slot, vp_slot).c_str(),
                  reshade::log::level::info, 1u, 120u,
                  "[DLAA] phaseW: bind rigid vs=0x%08X cbWorld%u..%u=%s cbVP%u=prevVP",
@@ -5215,6 +5387,13 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f, .label = "Phase B Velocity Frame Burst (diagnostic)", .section = "Antialiasing",
         .tooltip = "Diagnostic: set to N (e.g. 90) to decode the per-object delta (px) at the alpha-box center EVERY frame for N frames and log it. The 1/sec motionBuf readback classifies the delta into bands and its zeroVel band hides deltas up to several px, so an oscillating per-object delta reads as 'clean' while the HSV debug view shows the character covered in changing colors. The burst reveals the exact temporal pattern: smooth small sine at still = real idle motion; alternating 0/large or random garbage = stale/wrong prev snapshot. Stand still ~2s then walk ~2s, then paste the [DLAA] burst lines. Auto-resets to 0 when done.",
     },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAPhaseBBurstFrames", .binding = &g_phaseb_burst_frames,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = 90.f, .label = "Phase B Auto-Burst Length (frames)", .section = "Antialiasing",
+        .tooltip = "Diagnostic: length in frames of the automatic velocity burst that DLAAPhaseBCharMotionDebug arms once when switched on (also re-arms on each Off->On edge). Default 90; raise up to 600 so the burst spans a reported flicker window. Only used when DLAAPhaseBVelFrameDump is 0.",
+        .min = 1.f, .max = 600.f, .format = "%.0f",
+    },
     // ROOT-CAUSE fixes (A/B, live — test each separately):
     new renodx::utils::settings::Setting{
         .key = "DLAAPhaseStaticCameraSC", .binding = &g_phase_static_camera_shortcircuit,
@@ -5261,7 +5440,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAPhaseBCharMotionDebug", .binding = &g_char_motion_debug,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f, .label = "Character Motion Debug Logs", .section = "Antialiasing",
-        .tooltip = "Non-throttled per-draw log for the two ghosting characters (VS 0x0B8C262D / 0x1D90829A, PS 0x159A34A3 / 0x1DE48D94). Logs the game's current root bone, all 4 prev-bone slots' root bones, and the nearest-root-bone slot the patched VS selects - so the intermittent wrong frame can be caught (the 1/sec throttled logs hide it). EXPENSIVE (GPU readback every matching draw); debug only. Live.",
+        .tooltip = "MASTER DIAGNOSTIC TOGGLE for the two ghosting characters (VS 0x0B8C262D / 0x1D90829A, PS 0x159A34A3 / 0x1DE48D94): logs the game's current root bone, all 4 prev-bone slots' root bones, and the nearest-root-bone slot the patched VS selects, PLUS the Phase B prevVP/snapshot diagnostics and ONE automatic velocity burst (DLAAPhaseBBurstFrames frames, re-armed on each Off->On edge). Charmv lines are throttled (anomalies - stale snapshot, wrong slot, root delta >5mm - always log; steady state 1/key/60 frames; readbacks skipped when throttled). Set ONLY this toggle; toggle Off then On to re-arm the burst (or restart). Live.",
         .labels = {"Off","On"},
     },
     // Phase B generic-patch isolation (crash bisection).
@@ -6010,7 +6189,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
                 // the matrix is zero/garbage here, prevNDC is NaN -> the encode
                 // clamps to E=0 -> the motion buffer fills with (0,0,0,1) (writes
                 // land but decode to noData). Log it once per second.
-                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+                if (PhasebDbgActive())
                   LogThrottled("prevvp-content", reshade::log::level::info, 1u, 60u,
                                "[DLAA] prevVP=[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|"
                                "%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",
@@ -6025,7 +6204,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
                 // Diag: current frame's ViewProjection, so we can compare prevVP
                 // vs curVP (a large difference = stale prevVP -> the per-object
                 // delta would carry a camera offset the camera path doesn't).
-                if (shader_injection.dlaa_phaseb_debug_logging > 0.5f)
+                if (PhasebDbgActive())
                   LogThrottled("curvp-content", reshade::log::level::info, 1u, 60u,
                                "[DLAA] curVP =[%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f|"
                                "%+.4f,%+.4f,%+.4f,%+.4f|%+.4f,%+.4f,%+.4f,%+.4f]",

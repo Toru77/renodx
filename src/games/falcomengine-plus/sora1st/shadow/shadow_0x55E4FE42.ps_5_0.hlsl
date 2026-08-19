@@ -123,10 +123,12 @@ void main(
   r4.y = r3.x;
   r4.z = r2.x;
   r2.y = 1;
-  if (shader_injection_data.shadow_filter_method > 1.5f) {
-    // PCSS: passthrough — PCSS handles softness internally
+  if (shader_injection_data.shadow_filter_method > 0.5f) {
+    if (shader_injection_data.shadow_filter_method > 1.5f
+        && shader_injection_data.shadow_chss_post_blur < 0.5f) {
+    // CHSS: passthrough — CHSS handles softness internally (unless post-blur is enabled)
     o0.x = r1.x;
-  } else if (shader_injection_data.shadow_filter_method > 0.5f) {
+  } else {
   r1.yz = float2(0,0);
   r0.w = 0;
   while (true) {
@@ -158,7 +160,12 @@ void main(
   r0.y = r0.x ? 1.000000 : 0;
   r0.y = r1.z + r0.y;
   r0.y = r1.y / r0.y;
-  o0.x = r0.x ? r1.x : r0.y;
+  float blur_strength = 1.0;
+  if (shader_injection_data.shadow_filter_method > 1.5f) {
+    blur_strength = saturate(shader_injection_data.shadow_chss_post_blur / 100.0);
+  }
+  o0.x = r0.x ? r1.x : lerp(r1.x, r0.y, blur_strength);
+  }
   } else {
     o0.x = r1.x;
   }
