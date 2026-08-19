@@ -734,44 +734,44 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
     // ── Sora foliage (GTVBAO foliage marker bit 31 in o1.w) ──
     {
-        0x4942F14Cu,
+        0x76E6E95Eu,
         renodx::mods::shader::CustomShader{
-            .crc32 = 0x4942F14Cu,
-            .code = __0x4942F14C,
+            .crc32 = 0x76E6E95Eu,
+            .code = __0x76E6E95E,
             .on_draw = OnBeforeFoliageDraw,
         },
     },
     {
-        0x9645D00Fu,
+        0x39F91AE8u,
         renodx::mods::shader::CustomShader{
-            .crc32 = 0x9645D00Fu,
-            .code = __0x9645D00F,
+            .crc32 = 0x39F91AE8u,
+            .code = __0x39F91AE8,
             .on_draw = OnBeforeFoliageDraw,
         },
     },
     // ── Sora clutter/flower foliage ──
     {
-        0x68C07DEAu,
+        0xb03759DAu,
         renodx::mods::shader::CustomShader{
-            .crc32 = 0x68C07DEAu,
-            .code = __0x68C07DEA,
+            .crc32 = 0xB03759DAu,
+            .code = __0xB03759DA,
             .on_draw = OnBeforeFoliageDraw,
         },
     },
     {
-        0xBA6CE3DAu,
+        0xf96f9811u,
         renodx::mods::shader::CustomShader{
-            .crc32 = 0xBA6CE3DAu,
-            .code = __0xBA6CE3DA,
+            .crc32 = 0xF96F9811u,
+            .code = __0xF96F9811,
             .on_draw = OnBeforeFoliageDraw,
         },
     },
     // ── Sora potflower foliage ──
     {
-        0xAAAD1F02u,
+        0xd9becfb1u,
         renodx::mods::shader::CustomShader{
-            .crc32 = 0xAAAD1F02u,
-            .code = __0xAAAD1F02,
+            .crc32 = 0xD9BECFB1u,
+            .code = __0xD9BECFB1,
             .on_draw = OnBeforeFoliageDraw,
         },
     },
