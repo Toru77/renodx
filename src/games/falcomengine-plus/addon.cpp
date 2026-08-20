@@ -1312,7 +1312,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowWorldStrength", .binding = &shader_injection.char_shadow_world_strength,
-      .default_value = 75.f, .label = "World Strenght", .section = "Character Shadowing",
+      .default_value = 33.f, .label = "World Strenght", .section = "Character Shadowing",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f && shader_injection.char_shadow_type != 0.f; },
       .parse = [](float v) { return v * 0.01f; },
@@ -1343,7 +1343,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharShadowSampleCount", .binding = &shader_injection.char_shadow_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 16.f, .label = "Sample Count", .section = "Character Shadowing",
+      .default_value = 32.f, .label = "Sample Count", .section = "Character Shadowing",
       .min = 1.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1351,7 +1351,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharShadowHardSamples", .binding = &shader_injection.char_shadow_hard_shadow_samples,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Hard Samples", .section = "Character Shadowing",
+      .default_value = 0.f, .label = "Hard Samples", .section = "Character Shadowing",
       .min = 0.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1359,7 +1359,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharShadowFadeSamples", .binding = &shader_injection.char_shadow_fade_out_samples,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 8.f, .label = "Fade Samples", .section = "Character Shadowing",
+      .default_value = 0.f, .label = "Fade Samples", .section = "Character Shadowing",
       .min = 0.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
