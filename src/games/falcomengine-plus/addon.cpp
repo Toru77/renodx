@@ -308,6 +308,23 @@ static bool IsKai() {
   return is_kai;
 }
 
+// ── Sora 2nd detection ──
+static bool IsSora2nd() {
+  static bool checked = false;
+  static bool is_sora2nd = false;
+  if (!checked) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string name(exePath);
+    auto lastSlash = name.find_last_of("\\/");
+    if (lastSlash != std::string::npos) name = name.substr(lastSlash + 1);
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    is_sora2nd = (name == "sora_2nd.exe");
+    checked = true;
+  }
+  return is_sora2nd;
+}
+
 // ── Daybreak 2 detection ──
 static bool IsDaybreak2() {
   static bool checked = false;
@@ -328,6 +345,7 @@ static bool IsDaybreak2() {
 // ── Lighting shader identification (Sora + Kai) ──
 static bool IsLightingShader(uint32_t hash) {
   return hash == 0xFDAAF80Eu    // Sora lighting
+      || hash == 0xCA3D8596u    // Sora 2nd lighting
       || hash == 0x0CDCB258u    // Kyoto lighting
       || hash == 0x430ED091u    // Kai lighting
       || hash == 0xF6C55E5Fu;   // Kai lighting soft
@@ -397,6 +415,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline denoise_pipeline = {};
   reshade::api::pipeline denoise_last_pipeline = {};
   reshade::api::pipeline denoise_last_kai_pipeline = {};  // Kai: correct prevViewProj_g offset (c85)
+  reshade::api::pipeline denoise_last_sora2nd_pipeline = {};  // Sora 2nd: correct prevViewProj_g offset (c75)
 
   // Descriptor tables — pre-allocated per pass.
   GTVBAODescriptorTableSet prefilter_tables = {};
@@ -681,10 +700,13 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0xCA3D8596u,
             .code = __0xCA3D8596,
+            .on_draw = OnBeforeLightingShaderDraw,
         },
     },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
-    // ── Sora foliage (GTVBAO foliage marker bit 31 in o1.w) ──
+    // ── Sora 2nd ssao (GTVBAO gate) ──
+    CustomShaderEntryCallback(0x752B2580, OnBeforeSsaoShaderDraw),
+    // ── Sora foliage (GTVBAO foliage marker bit 15 in o1.w) ──
     {
         0x76E6E95Eu,
         renodx::mods::shader::CustomShader{
@@ -724,6 +746,47 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0xD9BECFB1u,
             .code = __0xD9BECFB1,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    // ── Sora 2nd foliage (GTVBAO foliage marker bit 15 in o1.w) ──
+    {
+        0x46FCDC51u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x46FCDC51u,
+            .code = __0x46FCDC51,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x5C33E765u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x5C33E765u,
+            .code = __0x5C33E765,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xF6733CDDu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xF6733CDDu,
+            .code = __0xF6733CDD,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x533C1853u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x533C1853u,
+            .code = __0x533C1853,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xF1EC53A8u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xF1EC53A8u,
+            .code = __0xF1EC53A8,
             .on_draw = OnBeforeFoliageDraw,
         },
     },
@@ -3431,6 +3494,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dp(d->main_high_pipeline); dp(d->main_ultra_pipeline); dp(d->denoise_pipeline);
   dp(d->denoise_last_pipeline);
   dp(d->denoise_last_kai_pipeline);
+  dp(d->denoise_last_sora2nd_pipeline);
   dl(d->prefilter_layout); dl(d->main_layout); dl(d->denoise_layout);
   DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -3565,6 +3629,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->main_high_pipeline); dp(d->main_ultra_pipeline); dp(d->denoise_pipeline);
   dp(d->denoise_last_pipeline);
   dp(d->denoise_last_kai_pipeline);
+  dp(d->denoise_last_sora2nd_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -3638,6 +3703,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->denoise_last_pipeline.handle)  mkcs(__gtvbao_denoise_last, "main", d->denoise_layout, &d->denoise_last_pipeline);
   // Kai variant: same layout, different CSO with correct prevViewProj_g at c85
   if (!d->denoise_last_kai_pipeline.handle) mkcs(__gtvbao_denoise_last_kai, "main", d->denoise_layout, &d->denoise_last_kai_pipeline);
+  // Sora 2nd variant: same layout, different CSO with correct prevViewProj_g at c75
+  if (!d->denoise_last_sora2nd_pipeline.handle) mkcs(__gtvbao_denoise_last_sora2nd, "main", d->denoise_layout, &d->denoise_last_sora2nd_pipeline);
   if (!d->multibounce_pipeline.handle)   mkcs(__gtvbao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
 
   // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
@@ -4038,7 +4105,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       reshade::api::resource dst_tex;
       if (use_a) { src = d->ao_term_a_srv; dst_uav = d->ao_term_b_uav; dst_tex = d->ao_term_b_texture; }
       else       { src = d->ao_term_b_srv; dst_uav = d->ao_term_a_uav; dst_tex = d->ao_term_a_texture; }
-      auto& last_pipe = IsKai() ? d->denoise_last_kai_pipeline : d->denoise_last_pipeline;
+      auto& last_pipe = IsKai() ? d->denoise_last_kai_pipeline
+          : (IsSora2nd() ? d->denoise_last_sora2nd_pipeline : d->denoise_last_pipeline);
       bind_pipe(last ? last_pipe : d->denoise_pipeline);
       // Ping-pong history: read from last frame's write target, write to other buffer
       reshade::api::resource_view hist_srv = d->history_ao_read_from_a

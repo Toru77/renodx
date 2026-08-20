@@ -91,6 +91,9 @@ SamplerState Smpl0_s : register(s0);
 Texture2D<float4> Tex0 : register(t0);
 
 
+#include "../../shared.h"
+#include "../../foliage/grass_ao.hlsli"
+
 // 3Dmigoto declarations
 #define cmp -
 
@@ -122,6 +125,7 @@ void main(
   r2.w = 1;
   r0.xyzw = r0.xxxx ? r2.xxxw : r1.xyzw;
   o0.xyzw = v4.xyzw * r0.xyzw;
+  o0.rgb = ApplyFoliageAO(o0.rgb, v3.y);
   r0.xyz = v2.xyz;
   r0.w = 1;
   r1.x = dot(r0.xyzw, view_g._m00_m10_m20_m30);
@@ -200,7 +204,7 @@ void main(
   r0.yz = float2(32767.5,32767.5) * r1.xy;
   r0.yz = (uint2)r0.yz;
   o1.xy = min(uint2(65535,65535), (uint2)r0.yz);
-  o1.w = 40;
+  o1.w = 40 | 0x8000u;  // bit 15 = foliage marker for GTVBAO
   r0.y = v8.x ? -1 : 1;
   r0.x = r0.x * r0.y;
   r0.xy = r0.xx * float2(0.5,-0.5) + float2(0.5,0.5);

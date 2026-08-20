@@ -99,6 +99,9 @@ Texture2D<float4> Tex0 : register(t0);
 StructuredBuffer<InstanceParam> instances_g : register(t15);
 
 
+#include "../../shared.h"
+#include "../../foliage/grass_ao.hlsli"
+
 // 3Dmigoto declarations
 #define cmp -
 
@@ -170,6 +173,7 @@ void main(
   r2.xyzw = r0.xxxx ? r3.xxxw : r2.xyzw;
   r0.x = -alphaTestThreshold_g + r2.w;
   o0.xyzw = r2.xyzw * r1.xyzw;
+  o0.rgb = ApplyFoliageAO(o0.rgb, v3.y);
   r0.x = cmp(r0.x < 0);
   if (r0.x != 0) discard;
   r1.xyz = v2.xyz;
@@ -220,7 +224,7 @@ void main(
   r0.y = 30.9990005 * r0.y;
   r0.y = (uint)r0.y;
   o3.y = (uint)r0.y << 10;
-  o1.w = r0.x ? 44 : 40;
+  o1.w = (r0.x ? 44 : 40) | 0x8000u;  // bit 15 = foliage marker for GTVBAO
   r0.x = dot(v1.xyz, v1.xyz);
   r0.x = max(0.00100000005, r0.x);
   r0.x = rsqrt(r0.x);

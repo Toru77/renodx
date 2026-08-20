@@ -85,6 +85,7 @@ Texture2D<uint4> mrtTexture0 : register(t1);
 Texture2D<float4> intensityMap : register(t2);
 Texture2D<float4> prevTexture : register(t3);
 
+#include "../../shared.h"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -449,7 +450,12 @@ void main(
     r1.x = 0;
     r2.w = 0;
   } else {
-    if (mapAOSampleCount_g != 0) {
+    // When GTVBAO is active, skip the vanilla map AO loop for performance.
+    // Character screen-space shadows are preserved (they run in the char pixel path above).
+    if (shader_injection_data.gtvbao_mode > 0.5f || shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+      r1.x = 0.0;  // Neutral AO (no darkening from vanilla path)
+      r2.w = 0.0;  // Neutral intensity (temporal blend stays neutral)
+    } else if (mapAOSampleCount_g != 0) {
       r1.w = (uint)r1.z >> 8;
       r1.zw = (int2)r1.zw & int2(255,255);
       r1.zw = (uint2)r1.zw;
@@ -567,6 +573,11 @@ void main(
     r4.z = 1;
   }
   r4.xy = float2(1,1) + -r1.xy;
+  // When GTVBAO is active, skip the temporal blend — preserve character shadow in z.
+  if (shader_injection_data.gtvbao_mode > 0.5f) {
+    o0 = float4(1, 1, r4.z, r3.x ? 1 : 0);
+    return;
+  }
   r1.x = dot(r0.xyzw, ssaoPrevViewProj_g._m00_m10_m20_m30);
   r1.y = dot(r0.xyzw, ssaoPrevViewProj_g._m01_m11_m21_m31);
   r0.x = dot(r0.xyzw, ssaoPrevViewProj_g._m03_m13_m23_m33);

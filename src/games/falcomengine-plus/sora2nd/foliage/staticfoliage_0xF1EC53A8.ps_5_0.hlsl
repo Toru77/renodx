@@ -77,6 +77,9 @@ cbuffer cb_local : register(b5)
 
 
 
+#include "../../shared.h"
+#include "../../foliage/grass_ao.hlsli"
+
 // 3Dmigoto declarations
 #define cmp -
 
@@ -101,6 +104,7 @@ void main(
   float4 fDest;
 
   o0.xyzw = v3.xyzw;
+  o0.rgb = ApplyFoliageAO(o0.rgb, 0.5f);
   r0.xyz = v2.xyz;
   r0.w = 1;
   r1.x = dot(r0.xyzw, view_g._m00_m10_m20_m30);
@@ -179,7 +183,7 @@ void main(
   r0.yz = float2(32767.5,32767.5) * r1.xy;
   r0.yz = (uint2)r0.yz;
   o1.xy = min(uint2(65535,65535), (uint2)r0.yz);
-  o1.w = 40;
+  o1.w = 40 | 0x8000u;  // bit 15 = foliage marker for GTVBAO
   r0.y = v7.x ? -1 : 1;
   r0.x = r0.x * r0.y;
   r0.xy = r0.xx * float2(0.5,-0.5) + float2(0.5,0.5);

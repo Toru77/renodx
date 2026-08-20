@@ -45,6 +45,8 @@ cbuffer cb_scene : register(b0)
   float4x4 projInv_g       : packoffset(c12);
 #ifdef RENODX_KAI
   float4x4 prevViewProj_g  : packoffset(c85);   // Kai: prevViewProj_g at c85
+#elif defined(RENODX_SORA2ND)
+  float4x4 prevViewProj_g  : packoffset(c75);   // Sora 2nd: prevViewProj_g at c75
 #else
   float4x4 prevViewProj_g  : packoffset(c74);   // Sora 1st: prevViewProj_g at c74
 #endif
