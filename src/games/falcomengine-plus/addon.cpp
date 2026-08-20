@@ -30,6 +30,7 @@
 #include "../../utils/state.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
+#include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
 
 namespace {
 
@@ -931,7 +932,7 @@ renodx::utils::settings::Settings settings = {
       .key = "ISFASTMasterEnable", .binding = &g_isfast_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "IS-FAST Noise", .section = "IS-FAST",
-      .tooltip = "Master toggle for IS-FAST spatio-temporal blue noise. Requires fast_noise_ea.dds next to game .exe.",
+      .tooltip = "Master toggle for IS-FAST spatio-temporal blue noise. Uses the baked-in fast_noise_ea.dds (no file needed next to the game .exe).",
       .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -947,7 +948,7 @@ renodx::utils::settings::Settings settings = {
       .key = "ISFASTDebugLogging", .binding = &g_isfast_debug_logging,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Debug Logging", .section = "IS-FAST",
-      .tooltip = "Log IS-FAST texture load status and noise source.",
+      .tooltip = "Log IS-FAST status: whether the baked-in noise texture loaded and which noise source is active.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -1657,7 +1658,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAONoiseType", .binding = &shader_injection.gtvbao_noise_type,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Noise Type", .section = "GTVBAO",
-      .tooltip = "IS-FAST = pre-computed blue noise (needs fast_noise_ea.dds). "
+      .tooltip = "IS-FAST = pre-computed blue noise (baked into the addon). "
                  "IGN = Interleaved Gradient Noise. Hilbert = Hilbert curve noise. "
                  "Only applies when IS-FAST master toggle is On; forced to Hilbert when Off.",
       .labels = {"IS-FAST", "IGN", "Hilbert"},
@@ -1666,7 +1667,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.5f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 0.35f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1694,7 +1695,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOSampleDistribution", .binding = &shader_injection.gtvbao_sample_distribution,
-      .default_value = 2.0f, .label = "Sample Distribution", .section = "GTVBAO",
+      .default_value = 1.0f, .label = "Sample Distribution", .section = "GTVBAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1729,7 +1730,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
+      .default_value = 2.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
       .tooltip = "Mode 1: Uniform slices with per-slice weight. Mode 2: Ray projection from world-space lobe. Mode 3: CDF importance sampling (best quality/speed).",
       .labels = {"Weight", "Project", "CDF"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_cosine_enabled > 0.5f; },
@@ -1859,7 +1860,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalDepthBlend", .binding = &g_gtvbao_normal_depth_blend,
-      .default_value = 0.65f, .label = "Normal Depth Blend", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Normal Depth Blend", .section = "GTVBAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1894,7 +1895,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalMaxDarkening", .binding = &g_gtvbao_normal_max_darkening,
-      .default_value = 0.4f, .label = "Normal Max Darkening", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Normal Max Darkening", .section = "GTVBAO",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1910,7 +1911,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalTransformMode", .binding = &g_gtvbao_normal_transform_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Normal Transform Mode", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Normal Transform Mode", .section = "GTVBAO",
       .tooltip = "How to transform MRT normals to view space. Try alternatives if normals look wrong at some camera angles.",
       .labels = {"view_g (default)", "viewInv_g", "Passthrough"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
@@ -2371,7 +2372,7 @@ renodx::utils::settings::Settings settings = {
       .key = "ShadowCHSSNoiseMode", .binding = &shader_injection.shadow_chss_noise_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Noise Mode", .section = "Shadow Maps",
-      .tooltip = "Jitter noise source. IGN = interleaved gradient noise (no texture needed). IS-FAST = pre-computed spatio-temporal blue noise from fast_noise_ea.dds (requires ISFASTMasterEnable; falls back to IGN if the file is missing).",
+      .tooltip = "Jitter noise source. IGN = interleaved gradient noise (no texture needed). IS-FAST = pre-computed spatio-temporal blue noise (baked into the addon; requires ISFASTMasterEnable; falls back to IGN if unavailable).",
       .labels = {"IGN", "IS-FAST"},
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f && shader_injection.shadow_pcss_jitter_enabled > 0.5f && g_isfast_enabled > 0.5f; },
     .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
@@ -3765,41 +3766,47 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   if (d->isfast_texture_attempted) return d->isfast_texture_loaded;
   d->isfast_texture_attempted = true;
 
-  // Build path: <exe_dir>/fast_noise_ea.dds
-  char exePath[MAX_PATH];
-  GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-  std::string ddsPath(exePath);
-  ddsPath = ddsPath.substr(0, ddsPath.find_last_of("\\/") + 1) + "fast_noise_ea.dds";
+  // Source: baked-in fast_noise_ea.dds bytes (embed_file.exe header).
+  // No external file next to the game .exe is required anymore.
+  const auto* bytes = __fast_noise_ea.data();
+  const size_t byte_count = __fast_noise_ea.size();
 
   if (g_isfast_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      (std::string("[IS-FAST] Searching: ") + ddsPath).c_str());
+      (std::string("[IS-FAST] Embedded fast_noise_ea.dds bytes: ") + std::to_string(byte_count)).c_str());
 
-  FILE* f = nullptr;
-  if (fopen_s(&f, ddsPath.c_str(), "rb") != 0 || !f) {
+  if (byte_count < sizeof(DDS_HEADER) + 4) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] fast_noise_ea.dds not found — using IGN fallback.");
+        "[IS-FAST] Embedded fast_noise_ea.dds too small — using IGN fallback.");
     return false;
   }
 
   // Read magic
   uint32_t magic = 0;
-  fread(&magic, 4, 1, f);
-  if (magic != 0x20534444) { fclose(f); return false; } // "DDS "
+  memcpy(&magic, bytes, 4);
+  if (magic != 0x20534444) return false; // "DDS "
 
   DDS_HEADER hdr = {};
-  fread(&hdr, sizeof(hdr), 1, f);
+  memcpy(&hdr, bytes + 4, sizeof(hdr));
 
   uint32_t w = hdr.dwWidth, h = hdr.dwHeight, ddsDepth = hdr.dwDepth;
   uint32_t fmt = 0;
   bool isDX10 = (hdr.ddspf.dwFourCC == 0x30315844); // "DX10"
 
+  size_t header_size = 4 + sizeof(hdr);
   if (isDX10) {
+    header_size += sizeof(DDS_HEADER_DXT10);
+    if (byte_count < header_size) {
+      if (g_isfast_debug_logging > 0.5f)
+        reshade::log::message(reshade::log::level::warning,
+          "[IS-FAST] Embedded fast_noise_ea.dds truncated DX10 header — using IGN fallback.");
+      return false;
+    }
     DDS_HEADER_DXT10 dx10 = {};
-    fread(&dx10, sizeof(dx10), 1, f);
+    memcpy(&dx10, bytes + 4 + sizeof(hdr), sizeof(dx10));
     fmt = dx10.dxgiFormat;
-    if (dx10.resourceDimension != 4) { fclose(f); return false; } // must be Texture3D
+    if (dx10.resourceDimension != 4) return false; // must be Texture3D
   }
 
   // DXGI_FORMAT_R8G8_UNORM = 49, expected dims: 128×128×32
@@ -3810,15 +3817,19 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
       msg += " fmt=" + std::to_string(fmt) + " (expected 128x128x32 RG8_UNORM) — using IGN fallback.";
       reshade::log::message(reshade::log::level::warning, msg.c_str());
     }
-    fclose(f);
     return false;
   }
 
-  // Allocate buffer: 128×128×32 × 2 bytes = 1,048,576 bytes
+  // Payload: 128×128×32 × 2 bytes = 1,048,576 bytes
   size_t dataSize = (size_t)w * h * ddsDepth * 2;
+  if (byte_count < header_size + dataSize) {
+    if (g_isfast_debug_logging > 0.5f)
+      reshade::log::message(reshade::log::level::warning,
+        "[IS-FAST] Embedded fast_noise_ea.dds truncated payload — using IGN fallback.");
+    return false;
+  }
   std::vector<uint8_t> data(dataSize);
-  fread(data.data(), 1, dataSize, f);
-  fclose(f);
+  memcpy(data.data(), bytes + header_size, dataSize);
 
   // Create 3D texture
   reshade::api::resource_desc rd = {};
@@ -3858,7 +3869,7 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   d->isfast_texture_loaded = true;
   if (g_isfast_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      "[IS-FAST] Texture loaded: 128x128x32 RG8_UNORM — noise source: TEXTURE");
+      "[IS-FAST] Texture loaded (embedded): 128x128x32 RG8_UNORM — noise source: TEXTURE");
   return true;
 }
 
