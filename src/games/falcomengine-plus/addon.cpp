@@ -1303,7 +1303,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowCameraStrength", .binding = &shader_injection.char_shadow_camera_strength,
-      .default_value = 75.f, .label = "Camera Strenght", .section = "Character Shadowing",
+      .default_value = 100.f, .label = "Camera Strenght", .section = "Character Shadowing",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f && shader_injection.char_shadow_type != 1.f; },
       .parse = [](float v) { return v * 0.01f; },
@@ -1311,7 +1311,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowWorldStrength", .binding = &shader_injection.char_shadow_world_strength,
-      .default_value = 100.f, .label = "World Strenght", .section = "Character Shadowing",
+      .default_value = 75.f, .label = "World Strenght", .section = "Character Shadowing",
       .min = 0.f, .max = 100.f,
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f && shader_injection.char_shadow_type != 0.f; },
       .parse = [](float v) { return v * 0.01f; },
