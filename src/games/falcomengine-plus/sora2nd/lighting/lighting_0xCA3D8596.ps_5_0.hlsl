@@ -211,6 +211,7 @@ Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
 
 #include "../../shared.h"
+#include "../../reference/brdf.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -790,6 +791,30 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r5.z = log2(r5.z);
   r5.y = r5.y * r5.z;
   r5.y = exp2(r5.y);
+  // ── BRDF shared inputs ──
+  float brdf_NdotV = saturate(dot(r8.xyw, r19.xyz));
+  float brdf_roughness_src = r15.z;
+  float brdf_roughness = clamp(brdf_roughness_src,
+      shader_injection_data.brdf_roughness_min,
+      shader_injection_data.brdf_roughness_max);
+  float3 brdf_F0 = r9.xyz;
+  float3 brdf_V = r19.xyz;
+  bool brdf_use_ggx = shader_injection_data.brdf_multiscatter_specular_enabled > 0.5f;
+  float brdf_specular_str = shader_injection_data.brdf_specular_strength;
+  // ── BRDF Sun GGX ──
+  float brdf_blinn_sun = r5.y;
+  if (brdf_use_ggx) {
+    float brdf_NdotH_sun = saturate(dot(r21.xyz, r8.xyw));
+    float brdf_NdotL_sun = saturate(dot(r8.xyw, -lightDirection_g.xyz));
+    float brdf_VdotH_sun = saturate(dot(r19.xyz, r21.xyz));
+    float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun,
+                                       brdf_VdotH_sun, brdf_roughness, brdf_F0);
+    brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun,
+                                             brdf_roughness, brdf_F0);
+    r5.y = lerp(brdf_blinn_sun, brdf_ggx_sun.x * brdf_NdotL_sun, brdf_specular_str);
+  } else {
+    r5.y = brdf_blinn_sun;
+  }
   r5.y = r5.y * r3.w;
   r5.y = lightSpecularIntensity_g * r5.y;
   r5.y = r20.y ? r5.y : 0;
@@ -1041,6 +1066,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r13.y = dynamicLights_g[r2.w].color.y;
         r13.z = dynamicLights_g[r2.w].color.z;
         r11.xyz = r13.xyz * r5.yyy + r11.xyz;
+        // ── BRDF Point Light ──
+        float brdf_rawNdotL_pt = r6.w;
+        float3 brdf_H_pt = normalize(brdf_V + r12.xyz);
+        float brdf_NdotH_pt = saturate(dot(brdf_H_pt, r8.xyw));
+        float brdf_VdotH_pt = saturate(dot(brdf_V, brdf_H_pt));
         r12.xyz = r14.xyz * r1.yyy + r12.xyz;
         r5.z = dot(r12.xyz, r12.xyz);
         r5.z = rsqrt(r5.z);
@@ -1053,6 +1083,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r5.z = log2(r5.z);
         r2.w = r5.z * r2.w;
         r2.w = exp2(r2.w);
+        if (brdf_use_ggx) {
+          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_rawNdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
+          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_rawNdotL_pt, brdf_roughness, brdf_F0);
+          float brdf_ggx_scalar_pt = brdf_ggx_spec_pt.x * brdf_rawNdotL_pt;
+          r2.w = lerp(r2.w, brdf_ggx_scalar_pt, brdf_specular_str);
+          r2.w = max(r2.w, 0.0f);
+        }
         r12.xyz = r13.xyz * r2.www;
         r12.xyz = r12.xyz * r5.yyy;
         r10.xyz = r12.xyz * r15.yyy + r10.xyz;
@@ -1144,6 +1181,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.y = dynamicLights_g[r2.w].color.y;
           r19.z = dynamicLights_g[r2.w].color.z;
           r15.yzw = r19.xyz * r5.yyy + r15.yzw;
+          // ── BRDF Spot Light ──
+          float brdf_rawNdotL_sp = dot(r16.xyz, r8.xyw);
+          float3 brdf_H_sp = normalize(brdf_V + r16.xyz);
+          float brdf_NdotH_sp = saturate(dot(brdf_H_sp, r8.xyw));
+          float brdf_VdotH_sp = saturate(dot(brdf_V, brdf_H_sp));
           r16.xyz = r14.xyz * r1.yyy + r16.xyz;
           r5.z = dot(r16.xyz, r16.xyz);
           r5.z = rsqrt(r5.z);
@@ -1156,6 +1198,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r5.z = log2(r5.z);
           r2.w = r5.z * r2.w;
           r2.w = exp2(r2.w);
+          if (brdf_use_ggx) {
+            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_rawNdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
+            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_rawNdotL_sp, brdf_roughness, brdf_F0);
+            float brdf_ggx_scalar_sp = brdf_ggx_spec_sp.x * brdf_rawNdotL_sp;
+            r2.w = lerp(r2.w, brdf_ggx_scalar_sp, brdf_specular_str);
+            r2.w = max(r2.w, 0.0f);
+          }
           r16.xyz = r19.xyz * r2.www;
           r16.xyz = r16.xyz * r5.yyy;
           r13.xyz = r16.xyz * r20.xxx + r13.xyz;
