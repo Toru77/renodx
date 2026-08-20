@@ -790,6 +790,30 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
+    {
+        0x2F107485u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x2F107485u,
+            .code = __0x2F107485,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x37C0064Bu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x37C0064Bu,
+            .code = __0x37C0064B,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xA8291F30u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xA8291F30u,
+            .code = __0xA8291F30,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
     // ── Kai foliage (GTVBAO foliage marker) ──
     {
         0x534E54EAu,
@@ -1355,14 +1379,14 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowLightFadeStart", .binding = &shader_injection.char_shadow_light_screen_fade_start,
-      .default_value = 0.5f, .label = "Light Fade Start", .section = "Character Shadowing",
+      .default_value = 1.0f, .label = "Light Fade Start", .section = "Character Shadowing",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharShadowLightFadeEnd", .binding = &shader_injection.char_shadow_light_screen_fade_end,
-      .default_value = 1.f, .label = "Light Fade End", .section = "Character Shadowing",
+      .default_value = 0.5f, .label = "Light Fade End", .section = "Character Shadowing",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1972,7 +1996,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "FoliageGrassAOTip", .binding = &shader_injection.foliage_grass_ao_tip,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.33f, .label = "Grass AO Tip", .section = "Foliage Grass AO",
+      .default_value = 1.2f, .label = "Grass AO Tip", .section = "Foliage Grass AO",
       .tooltip = "AO multiplier at the blade tip. Values > 1.0 slightly brighten the tip (rim-light effect).",
       .min = 0.5f, .max = 1.5f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
@@ -2015,7 +2039,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.2f, .label = "Specular Blend", .section = "BRDF Improvement",
+      .default_value = 0.1f, .label = "Specular Blend", .section = "BRDF Improvement",
       .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
