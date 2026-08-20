@@ -3546,9 +3546,10 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 62> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
-                                                       float ssgi_enabled_override = -1.f) {
-  std::array<float, 62> c = {};
+static std::array<float, 63> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
+                                                       float ssgi_enabled_override = -1.f,
+                                                       bool foliage_mask_valid = false) {
+  std::array<float, 63> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -3632,6 +3633,8 @@ static std::array<float, 62> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[59] = shader_injection.gtvbao_exclude_foliage;
   c[60] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
   c[61] = IsKai() ? 1.f : 0.f;
+  // c[62] — foliage mask is only fresh when the pre-pass dispatched this frame.
+  c[62] = foliage_mask_valid ? 1.f : 0.f;
   return c;
 }
 
@@ -3900,6 +3903,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   // Save + reset per-frame foliage tracking (set true in foliage shader on_draw callbacks)
   bool had_foliage_draws = d->foliage_drawn_this_frame;
   d->foliage_drawn_this_frame = false;
+  // The foliage mask is only fresh when the pre-pass actually dispatched this frame.
+  // Otherwise it holds stale data from an earlier frame (e.g. a previous scene with foliage)
+  // and must NOT be consumed by the main pass.
+  const bool foliage_mask_valid = had_foliage_draws
+      && shader_injection.gtvbao_exclude_foliage > 0.5f
+      && d->foliage_mask_pipeline.handle
+      && d->foliage_mask_uav.handle
+      && d->captured_mrt_normal_srv.handle;
 
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
@@ -3946,7 +3957,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 62, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 63, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
@@ -4008,9 +4019,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   }
 
   // ── Foliage mask pre-pass (full-res, reads MRT normal, writes R8_UINT) ──
-  if (had_foliage_draws && shader_injection.gtvbao_exclude_foliage > 0.5f
-      && d->foliage_mask_pipeline.handle && d->foliage_mask_uav.handle
-      && d->captured_mrt_normal_srv.handle) {
+  if (foliage_mask_valid) {
     uint32_t mkW = w, mkH = h;
     bind_pipe(d->foliage_mask_pipeline);
     reshade::api::resource_view fm_srvs[2] = {
@@ -4025,7 +4034,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 62, pc.data());
+    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 63, pc.data());
     cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
     bar(d->foliage_mask_texture, UA, SR);
   }
@@ -4093,8 +4102,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
-    auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame);
-    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 62, pc.data());
+    auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid);
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 63, pc.data());
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -4155,7 +4164,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
       auto pc = BuildGTVBAOPushConstants(d, last);
-      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 62, pc.data());
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 63, pc.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(dst_tex, UA, SR);
       use_a = !use_a;

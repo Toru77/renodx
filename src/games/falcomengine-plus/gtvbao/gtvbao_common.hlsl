@@ -120,6 +120,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_exclude_foliage;        // c[59] — 0=Off, 1=On — skip AO on foliage
   float GTVBAO_foliage_ao_value;       // c[60] — [0..1] — AO value for excluded foliage
   float GTVBAO_foliage_channel_mode;   // c[61] — 0=o1.w (Sora), 1=o1.z (Kai)
+  float GTVBAO_foliage_mask_valid;     // c[62] — 1 = mask pre-pass ran this frame (mask is fresh)
 };
 
 // ── GI parameters are native cb_gtvbao fields (c[25]-c[33]) — no aliases needed.

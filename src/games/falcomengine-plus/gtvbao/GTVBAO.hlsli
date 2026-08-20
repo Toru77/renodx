@@ -387,11 +387,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     lpfloat4 valuesUL   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize )               );
     lpfloat4 valuesBR   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2( 1, 1 ) );
 
-    // Cache texture dimensions for foliage mask checks.
+    // Cache texture dimensions for foliage mask checks (only when mask is fresh this frame).
     uint g_mrtW, g_mrtH;
     mrtNormalTexture.GetDimensions(g_mrtW, g_mrtH);
     uint g_maskW = 1, g_maskH = 1;
-    if (GTVBAO_exclude_foliage > 0.5f)
+    if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f)
         foliageMaskTexture.GetDimensions(g_maskW, g_maskH);
 
     // viewspace Z at the center
@@ -636,7 +636,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     float2 sampleScreenPos = normalizedScreenPos + sampleOffset * sideSign;
                     float  SZ = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos, mipLevel ).x;
                     // ── Foliage cast-AO prevention: skip samples that land on foliage ──
-                    if (GTVBAO_exclude_foliage > 0.5f && !gtvbao_foliage_pixel) {
+                    // Only when the mask is fresh (pre-pass dispatched this frame).
+                    if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f && !gtvbao_foliage_pixel) {
                         int2 mc = int2(saturate(sampleScreenPos) * float2(g_maskW, g_maskH));
                         if (foliageMaskTexture.Load(int3(mc, 0)) != 0u) continue;
                     }
@@ -835,7 +836,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 float2 sampleScreenPos1 = normalizedScreenPos - sampleOffset;
                 float  SZ1 = sourceViewspaceDepth.SampleLevel( depthSampler, sampleScreenPos1, mipLevel ).x;
                 // ── Foliage cast-AO prevention: set depth to center (non-occluding) ──
-                if (GTVBAO_exclude_foliage > 0.5f && !gtvbao_foliage_pixel) {
+                // Only when the mask is fresh (pre-pass dispatched this frame).
+                if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f && !gtvbao_foliage_pixel) {
                     int2 mc0 = int2(saturate(sampleScreenPos0) * float2(g_maskW, g_maskH));
                     int2 mc1 = int2(saturate(sampleScreenPos1) * float2(g_maskW, g_maskH));
                     if (foliageMaskTexture.Load(int3(mc0, 0)) != 0u) SZ0 = (float)viewspaceZ;
