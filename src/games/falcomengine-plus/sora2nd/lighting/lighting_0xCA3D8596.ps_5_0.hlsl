@@ -212,6 +212,7 @@ Texture2D<float4> texCloudShadow : register(t27);
 
 #include "../../shared.h"
 #include "../../reference/brdf.hlsli"
+#include "../../reference/rendering.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -375,7 +376,21 @@ void main(
   r3.z = r3.z * volumeCameraFarOverMaxFar_g + -volumeNearOverFarClip_g;
   r3.w = -volumeNearOverFarClip_g + 1;
   r7.z = r3.z / r3.w;
-  r7.xyzw = volumeFogTexture_g.SampleLevel(SmplLinearClamp_s, r7.xyz, 0).xyzw;
+  // Sample the volume: vanilla trilinear or improved tricubic haze AA
+  {
+    float3 uvw = r7.xyz;
+    uint volW, volH, volD;
+    volumeFogTexture_g.GetDimensions(volW, volH, volD);
+    float3 volSize = float3((float)volW, (float)volH, (float)volD);
+
+    float4 volSample;
+    if (shader_injection_data.volfog_haze_aa_mode > 0.5) {
+      volSample = renodx::rendering::SampleTricubicBSpline(volumeFogTexture_g, SmplLinearClamp_s, uvw, volSize);
+    } else {
+      volSample = volumeFogTexture_g.SampleLevel(SmplLinearClamp_s, uvw, 0);
+    }
+    r7.xyzw = volSample.xyzw;
+  }
   r3.z = (int)r1.z & 8;
   if (r3.z == 0) {
     r8.yz = (uint2)r3.xx >> int2(5,10);
