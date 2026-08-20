@@ -659,6 +659,30 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeShadowBlurDraw,
         },
     },
+    // ── Sora 2nd shadow pipeline ──
+    {
+        0xF320152Cu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xF320152Cu,
+            .code = __0xF320152C,
+            .on_draw = OnBeforeShadowCSMDraw,
+        },
+    },
+    {
+        0xF1575FE3u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xF1575FE3u,
+            .code = __0xF1575FE3,
+            .on_draw = OnBeforeShadowBlurDraw,
+        },
+    },
+    {
+        0xCA3D8596u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xCA3D8596u,
+            .code = __0xCA3D8596,
+        },
+    },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
     // ── Sora foliage (GTVBAO foliage marker bit 31 in o1.w) ──
     {
