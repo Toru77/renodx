@@ -2015,7 +2015,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.33f, .label = "Specular Blend", .section = "BRDF Improvement",
+      .default_value = 0.2f, .label = "Specular Blend", .section = "BRDF Improvement",
       .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
