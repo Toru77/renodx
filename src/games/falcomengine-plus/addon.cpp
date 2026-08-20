@@ -1670,7 +1670,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOSampleDistribution", .binding = &shader_injection.gtvbao_sample_distribution,
-      .default_value = 3.0f, .label = "Sample Distribution", .section = "GTVBAO",
+      .default_value = 2.0f, .label = "Sample Distribution", .section = "GTVBAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
