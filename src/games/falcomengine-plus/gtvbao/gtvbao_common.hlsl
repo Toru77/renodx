@@ -121,6 +121,14 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_foliage_ao_value;       // c[60] — [0..1] — AO value for excluded foliage
   float GTVBAO_foliage_channel_mode;   // c[61] — 0=o1.w (Sora), 1=o1.z (Kai)
   float GTVBAO_foliage_mask_valid;     // c[62] — 1 = mask pre-pass ran this frame (mask is fresh)
+  // ── Denoiser upgrades (R1-R4) ──
+  float GTVBAO_denoise_stage;          // c[63] — denoise_last dispatch mode: 0=legacy combined, 1=temporal-only, 2=spatial-final-no-temporal, 3=passthrough scale-back
+  float GTVBAO_temporal_normal_reject; // c[64] — [0..1] history normal similarity threshold (dot), 0=off
+  float GTVBAO_ghost_clamp;            // c[65] — [0..4] variance clamp extent (σ of current 3×3 neighborhood), 0=off
+  float GTVBAO_atrous_enabled;         // c[66] — 0=Off, 1=On — à-trous wavelet spatial filter
+  float GTVBAO_atrous_depth_sigma;     // c[67] — [0.05..4] relative depth edge-stop strength
+  float GTVBAO_atrous_normal_sigma;    // c[68] — [2..128] normal edge-stop power
+  float GTVBAO_atrous_step;            // c[69] — à-trous stride for this dispatch (1, 2, 4)
 };
 
 // ── GI parameters are native cb_gtvbao fields (c[25]-c[33]) — no aliases needed.

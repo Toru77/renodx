@@ -277,6 +277,12 @@ struct ShaderInjectData {
   // —— DOF anti-starvation (thin-feature sharp-line fix) ——
   float dof_sign_softness;                 // [0..1], default 0.4 — opposite-layer tap acceptance (0=hard reject)
   float dof_coverage_enabled;              // 0 Off, 1 On — coverage-aware composite (blend by same-layer fraction)
+  // —— GTVBAO denoiser upgrades (appended at end to keep initializer order stable) ——
+  float gtvbao_temporal_normal_reject;     // [0..1] default 0.5 — history normal similarity threshold (dot)
+  float gtvbao_ghost_clamp;                // [0..4] default 1.5 — variance clamp extent (σ of current 3×3), 0=off
+  float gtvbao_atrous_enabled;             // 0 Off, 1 On — à-trous wavelet spatial filter (replaces bilateral chain)
+  float gtvbao_atrous_depth_sigma;         // [0.05..4] default 1.0 — relative depth edge-stop strength
+  float gtvbao_atrous_normal_sigma;        // [2..128] default 32 — normal edge-stop power
 };
 
 #ifndef __cplusplus
