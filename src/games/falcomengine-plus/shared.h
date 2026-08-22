@@ -274,6 +274,9 @@ struct ShaderInjectData {
   float foliage_grass_ao_base;             // AO at root [0..1] default 0.25
   float foliage_grass_ao_tip;              // AO at tip [0..1] default 1.0
   float foliage_grass_ao_curve;            // power exponent [0.1..2] default 0.5
+  // —— DOF anti-starvation (thin-feature sharp-line fix) ——
+  float dof_sign_softness;                 // [0..1], default 0.4 — opposite-layer tap acceptance (0=hard reject)
+  float dof_coverage_enabled;              // 0 Off, 1 On — coverage-aware composite (blend by same-layer fraction)
 };
 
 #ifndef __cplusplus

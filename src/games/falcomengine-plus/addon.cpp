@@ -242,6 +242,8 @@ ShaderInjectData shader_injection = {
   .foliage_grass_ao_base = 0.25f,
   .foliage_grass_ao_tip = 1.f,
   .foliage_grass_ao_curve = 0.5f,
+  .dof_sign_softness = 0.4f,
+  .dof_coverage_enabled = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -892,6 +894,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // ── Kai DOF shaders ──
     CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
     CustomShaderEntryCallback(0x2734F870, nullptr),
+    // ── Sora 2nd DOF shaders (port Kai improved) ──
+    CustomShaderEntryCallback(0x5BBEC5A3, nullptr),
+    CustomShaderEntryCallback(0xCD6FC25D, nullptr),
     //__ALL_CUSTOM_SHADERS,
 };
 
@@ -1046,7 +1051,6 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Mode", .section = "Depth of Field",
       .tooltip = "Vanilla keeps the original blur shader. Improved uses DOF method 3 (gather).",
       .labels = {"Vanilla", "Improved"},
-      .is_visible = []() { return IsKai(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFStrength", .binding = &shader_injection.dof_strength,
@@ -1054,7 +1058,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Overall blend strength for improved DOF output.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFRadiusScale", .binding = &shader_injection.dof_radius_scale,
@@ -1062,7 +1066,6 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scales blur radius derived from game CoC.",
       .min = 0.25f, .max = 2.5f, .format = "%.2fx",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFSampleCount", .binding = &shader_injection.dof_sample_count,
@@ -1071,7 +1074,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Higher values produce smoother bokeh at higher cost.",
       .min = 4.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFNearScale", .binding = &shader_injection.dof_near_scale,
@@ -1079,7 +1082,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scales near-field CoC response.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFFarScale", .binding = &shader_injection.dof_far_scale,
@@ -1087,7 +1090,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scales far-field CoC response.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFCoCCurve", .binding = &shader_injection.dof_coc_curve,
@@ -1095,15 +1098,32 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Applies pow(CoC, Curve) before blur; >1 tightens focus transition.",
       .min = 0.25f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFEdgeThreshold", .binding = &shader_injection.dof_edge_threshold,
-      .default_value = 0.25f, .label = "Edge Threshold", .section = "Depth of Field",
+      .default_value = 0.02f, .label = "Edge Threshold", .section = "Depth of Field",
       .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
       .min = 0.02f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFSignSoftness", .binding = &shader_injection.dof_sign_softness,
+      .default_value = 1.f, .label = "Layer Softness", .section = "Depth of Field",
+      .tooltip = "Fixes sharp character lines in near blur. Acceptance of taps from the opposite depth layer: 0 = hard reject (vanilla behavior, can leave thin features unblurred), higher = softer separation (more bleed).",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFCoverageFix", .binding = &shader_injection.dof_coverage_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Coverage Composite", .section = "Depth of Field",
+      .tooltip = "Fixes sharp character lines in near blur. Blends same-layer bokeh toward the full-disc average weighted by how much of the blur disc the feature actually covers.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
     // ── Character SSGI ──
@@ -1321,7 +1341,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMode", .binding = &shader_injection.char_gtvbao_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Allow GTVBAO", .section = "Character Shadowing",
+      .default_value = 0.f, .label = "Allow GTVBAO", .section = "Character Shadowing",
       .labels = {"Off", "On", "Combined"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -1343,7 +1363,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharShadowSampleCount", .binding = &shader_injection.char_shadow_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 32.f, .label = "Sample Count", .section = "Character Shadowing",
+      .default_value = 12.f, .label = "Sample Count", .section = "Character Shadowing",
       .min = 1.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode == 2.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
