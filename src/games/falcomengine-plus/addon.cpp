@@ -897,6 +897,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // ── Sora 2nd DOF shaders (port Kai improved) ──
     CustomShaderEntryCallback(0x5BBEC5A3, nullptr),
     CustomShaderEntryCallback(0xCD6FC25D, nullptr),
+    // ── Sora 1st DOF shaders ──
+    CustomShaderEntryCallback(0x1CA8DE95, nullptr),
     //__ALL_CUSTOM_SHADERS,
 };
 
@@ -1065,7 +1067,6 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.33f, .label = "Radius Scale", .section = "Depth of Field",
       .tooltip = "Scales blur radius derived from game CoC.",
       .min = 0.25f, .max = 2.5f, .format = "%.2fx",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFSampleCount", .binding = &shader_injection.dof_sample_count,
