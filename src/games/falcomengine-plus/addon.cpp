@@ -1074,8 +1074,6 @@ renodx::utils::settings::Settings settings = {
       .default_value = 24.f, .label = "Sample Count", .section = "Depth of Field",
       .tooltip = "Higher values produce smoother bokeh at higher cost.",
       .min = 4.f, .max = 64.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFNearScale", .binding = &shader_injection.dof_near_scale,
