@@ -1,0 +1,742 @@
+Journal of Computer Graphics Techniques Vol. 7, No. 4, 2018
+
+http://jcgt.org
+
+Sampling the GGX Distribution of Visible Normals
+Eric Heitz
+Unity Technologies
+
+⇔
+ellipsoid (αx , αy )
+
+hemisphere (αx = αy = 1)
+
+Figure 1. Sampling the GGX distribution of visible normals (VNDF) is equivalent to sam-
+
+pling the projected area of an ellipsoid, which can be mapped to sampling the projected area
+of a hemisphere.
+
+Abstract
+Importance sampling microfacet bidirectional scattering distribution functions (BSDFs) using
+their distribution of visible normals (VNDF) yields significant variance reduction in Monte
+Carlo rendering. In this article, we describe an efficient and exact sampling routine for the
+VNDF of the GGX microfacet distribution. This routine leverages the property that GGX is
+the distribution of normals of a truncated ellipsoid, and sampling the GGX VNDF is equivalent to sampling the 2D projection of this truncated ellipsoid. To do that, we simplify the
+problem by using the linear transformation that maps the truncated ellipsoid to a hemisphere.
+Since linear transformations preserve the uniformity of projected areas, sampling in the hemisphere configuration and transforming the samples back to the ellipsoid configuration yields
+valid samples from the GGX VNDF.
+
+1.
+1.1.
+
+Introduction and Previous Work
+The GGX Distribution
+
+The GGX distribution is the normal distribution function (NDF) of an ellipsoid, i.e., it
+measures the density of a given normal orientation on the surface of the ellipsoid. ForR
+mally, it is a distribution D such that if Ω is a solid-angle domain, then Ω D(ω) ∂ω is
+the area of the surface of the ellipsoid whose normals are oriented within Ω. The idea
+
+1
+
+ISSN 2331-7418
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+Z
+N
+
+Y
+αy
+
+X
+αx
+
+Figure 2. The GGX distribution is the distribution of normals of an ellipsoid.
+
+of representing a distribution of normals using an ellipsoid shape was invented independently multiple times. To our knowledge, it was first introduced by Trowbridge
+and Reitz [1975] in the physics literature. In computer graphics, Neyret derived an
+equivalent distribution to represent volumetric materials [Neyret 1995; Neyret 1998].
+Later, the same distribution was derived again by Walter et al. [2007] to model the
+scattering of glass and named GGX, which stands for “ground glass unknown.” Currently, this microfacet distribution is one of the most widely used in the rendering
+industry.
+The GGX distribution uses only the upper part of the ellipsoid according to a
+local frame. As shown in Figure 2, the ellipsoid is truncated to the upper hemisphere
+in direction Z = (0, 0, 1), and it is described by two scaling (or roughness) parameters
+αx and αy that represent the inverse lengths of the principal axes of the ellipsoid on
+the X = (1, 0, 0) and Y = (0, 1, 0) directions. For a given normal defined in this
+frame by N = (xn , yn , zn ), the GGX distribution is given by
+1
+
+D(N ) =
+π αx αy
+
+ 2
+
+2
+xn
++ αyn2 + zn2
+α2x
+y
+
+2 .
+
+(1)
+
+In microfacet BSDFs, the GGX distribution is usually used with the Smith shadowing
+model. The Smith shadowing function associated with the GGX distribution was first
+introduced by Walter et al. [2007] for isotropic distributions (αx = αy ) and generalized to anisotropic GGX distributions by Heitz [2014]. For a given view direction
+V = (xv , yv , zv ), the Smith anisotropic GGX shadowing function is
+r
+1
+, with Λ(V ) =
+G1 (V ) =
+1 + Λ(V )
+1.2.
+
+−1 +
+
+1+
+2
+
+α2x x2v +α2y yv2
+zv2
+
+.
+
+(2)
+
+Importance Sampling Using the VNDF
+
+Using microfacet BSDFs in Monte Carlo renderers requires importance-sampling
+techniques. Historically, the classic approach consists of sampling microfacets using the NDF, but Heitz and d’Eon [2014] showed that using the distribution of visible
+2
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+normals (VNDF)
+DV (N ) =
+
+G1 (V ) max (0, V · N ) D(N )
+V ·Z
+
+(3)
+
+instead of the NDF provides significant variance reduction. This is because the VNDF
+contains visibility terms that appear in the BSDF expression that cancel out in the
+importance-sampling weights, thus reducing the variance (see Appendix B).
+2.
+
+Previous Work
+
+Heitz and d’Eon [2014] provide analytic solutions for sampling
+the VNDFs of the Beckmann and GGX distributions in their supplemental material.
+To facilitate the VNDF sampling, their algorithms map the configuration to a simpler
+configuration of unit roughness (αx = αy = 1). Unfortunately, even with unit roughness, their solution for GGX is only approximate because it requires a fitted curve:
+the derivations are made in slope space and the conditional inverse CDF of GGX does
+not have a closed form in this space.
+VNDF sampling.
+
+The key observation used in this article
+is that sampling the GGX distribution can be done exactly by sampling the projected
+area of the associated ellipsoid. The idea of sampling the projected area of the ellipsoid was introduced by Neyret [1998] and Heitz et al. [2015] showed that it was
+equivalent to sampling the VNDF of the ellipsoid’s NDF. However, they performed
+this operation for a complete ellipsoid (also called SGGX distribution), while in the
+case of the GGX distribution the ellipsoid is truncated to the upper hemisphere.
+Sampling the projected area of an ellipsoid.
+
+In this article, we use the sampling algorithm introduced in the supplemental material [Walter et al. 2015] of Dong
+et al. [2015]. They introduce a truncated-ellipsoid NDF that is a generalized GGX distribution whose associated ellipsoid is transformed not only by linear scaling but also
+by skewness factors (the matrix A is non-diagonal). The idea behind their sampling
+algorithm is to keep Heitz and d’Eon’s unit-roughness transformation that transforms
+the truncated ellipsoid into a hemisphere, as we explain in Section 3. With this transformation, the problem boils down to sampling the projected area of a hemisphere,
+and they provide an area-preserving parameterization to do this, which we explain in
+Section 4. In summary, the purpose of this article is not to introduce new ideas, as they
+can already be found in substance in Walter and Dong’s supplemental material. Our
+main contribution is to bring these ideas together into a simple and well-documented
+routine for sampling the GGX VNDF.
+Sampling the projected area of a truncated ellipsoid.
+
+An early version of this work was made available as a
+non-peer-reviewed technical report [Heitz 2017]. However, this previous version uses
+
+Previous version of this article.
+
+3
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+another parameterization that cannot be used with view directions located in the lower
+hemisphere (V · Z < 0). This is never the case with classic microfacet BSDF models,
+but there are special cases where this occurs, for instance Smith multiple-scattering
+BSDFs model incident rays that can be located in the lower hemisphere after their
+first bounce on the microsurface [Heitz et al. 2016]. In this article, we replaced the
+previous parameterization by the one of Walter et al. [2015] that is not subject to this
+limitation and can thus be used with multiple-scattering BSDFs.
+3.
+
+Ellipsoid-hemisphere Transformation
+
+In this section, we explain the transformation that maps an ellipsoid configuration to
+a hemisphere configuration, as shown in Figure 3.
+ellipsoid configuration
+
+hemisphere configuration
+
+Ve
+Vh
+
+(a)
+
+(b)
+
+Nh
+Ne
+
+(d)
+
+(c)
+
+Figure 3. Ellipsoid-hemisphere transformation. We start by transforming the view vector Ve
+
+of the ellipsoid configuration (a) to a view vector Vh in the hemisphere configuration (b). In
+the hemisphere configuration, we sample a normal Nh by sampling the projected area of the
+hemisphere (c). By transforming this normal back to the ellipsoid configuration, we obtain a
+normal Ne sampled from the distribution of visible normals of the ellipsoid (d).
+
+4
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+3.1.
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Initial Ellipsoid Configuration
+
+The initial ellipsoid configuration is shown in Figure 3(a). Ve denotes the view direction, and the ellipsoid is given by the roughness parameters αx and αy . We also
+consider two uniform random numbers U1 and U2 that we are going to use in the
+sampling procedure.
+vec3 sampleGGXVNDF(vec3 Ve, float alpha_x, float alpha_y, float U1, float U2)
+{
+...
+}
+
+3.2.
+
+Transforming the View Direction to the Hemisphere Configuration
+
+The linear transformation that maps the ellipsoid of roughness αx and αy to the hemisphere is represented by a 3 × 3 matrix
+
+
+αx 0 0
+
+
+A =  0 αy 0 .
+(4)
+0
+0 1
+To move from Figure 3(a) to Figure 3(b), we compute a view vector in the hemisphere
+configuration Vh by transforming the view vector Ve in the ellipsoid configuration:
+Vh =
+
+A Ve
+.
+kA Ve k
+
+(5)
+
+// Section 3.2: transforming the view direction to the hemisphere configuration
+vec3 Vh = normalize(vec3(alpha_x * Ve.x, alpha_y * Ve.y, Ve.z));
+
+3.3.
+
+Sampling the Projected Area of the Hemisphere
+
+In Figure 3(c), we sample a normal Nh by sampling the projected area of the hemisphere. This part of the algorithm is explained in Section 4.
+3.4.
+
+Transforming the Normal Back to the Ellipsoid Configuration
+
+To move from Figure 3(c) to Figure 3(d), we transform the normal Nh in the hemisphere configuration to obtain a normal in the ellipsoid configuration Ve . The geometric transformation is the inverse transformation as before, i.e., A−1 . However,
+since normals are not vectors but covectors, they are not transformed by A−1 but by
+−T
+its inverse transpose matrix, which is A−1
+= A. The normal in the ellipsoid
+configuration is thus
+Ne =
+
+A Nh
+.
+kA Nh k
+
+5
+
+(6)
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Note that in the code we clamp the z-component to 0 to prevent numerical errors.
+// Section 3.4: transforming the normal back to the ellipsoid configuration
+vec3 Ne = normalize(vec3(alpha_x * Nh.x, alpha_y * Nh.y, max(0.0, Nh.z));
+
+4.
+
+Sampling the Projected Area of a Hemisphere
+
+In this section, we derive an area-preserving parameterization that we use to sample
+the projected area of the hemisphere.
+4.1.
+
+Orthonormal Basis
+
+We start by constructing an orthonormal basis (Vh , T1 , T2 ) (see Figure 4), where T1
+is in the tangent plane orthogonal to Z = (0, 0, 1):
+T1 =
+
+Z × Vh
+(−yv , xv , 0)
+= p
+,
+kZ × Vh k
+x2v + yv2
+
+T2 = Vh × T1 .
+
+(7)
+(8)
+
+// Section 4.1: orthonormal basis (with special case if cross product is zero)
+float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+vec3 T1 = lensq > 0 ? vec3(-Vh.y, Vh.x, 0) * inversesqrt(lensq) : vec3(1,0,0);
+vec3 T2 = cross(Vh, T1);
+
+Nh
+T2
+T1
+Vh
+
+Figure 4. Orthonormal basis for sampling the projected area of the hemisphere.
+
+4.2.
+
+Parameterization of the Projected Area
+
+Figure 5 shows the shape of the projected area of the
+hemisphere. It is the signed sum of the projected areas of the two half disks. The
+projected area of the half disk located in the tangent plane (in green) is proportional
+to Z · Vh = zv , and the projected area of the other half disk (in blue) is proportional
+to Vh · Vh = 1. If the view direction is below the horizon (Vh · Z < 0), the green disk
+Shape of the projected area.
+
+6
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+normal incidence
+
+grazing incidence
+
+below-horizon incidence
+
+Figure 5. Shape of the projected area of the hemisphere. The projected area of the hemisphere
+
+is the signed sum of the projected areas of the two half disks. If the view direction is below
+the horizon the green disk partially masks the blue disk.
+
+partially masks the blue disk. In all configurations, the shape of the projected area is
+thus a disk whose lower boundary ispmoving and
+pproducing a uniform vertical scaling
+2
+such that the vertical segment [− p
+1 − t1 , + p
+1 − t21 ] of abscissa t1 is uniformly
+2
+remapped to the interval [−(Vh · Z) 1 − t1 , + 1 − t21 ]. The scaling factor of this
+remapping is s = 1+(V2h ·Z) .
+Figure 6 shows that a
+point (t1 , t2 ) uniformly sampled in the unit disk using a polar parameterization,
+p
+
+U1 , 2 π U 2 ,
+(9)
+(r, φ) =
+Parameterization of the projected area of the hemisphere.
+
+(t1 , t2 ) = (r cos φ, r sin φ),
+
+(10)
+
+is mapped to a point (t1 , t02 ) uniformly sampled in the shape of the projected area by
+applying the vertical remapping:
+q
+0
+t2 = (1 − s) 1 − t21 + s t2 .
+(11)
+
+// Section 4.2: parameterization of the projected area
+float r = sqrt(U1);
+float phi = 2.0 * M_PI * U2;
+float t1 = r * cos(phi);
+float t2 = r * sin(phi);
+float s = 0.5 * (1.0 + Vh.z);
+t2 = (1.0 - s)*sqrt(1.0 - t1*t1) + s*t2;
+
+7
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+T2
+
+T2
+
+T2
+(t1 , t02 )
+
+(t1 , t02 )
+
+(t1 , t2 )
+T1
+
+T1
+
+T1
+
+T1
+
+T1
+
+T1
+
+Figure 6. Parameterization of the projected area of the hemisphere. The shape of the projected
+
+area in all configurations is a disk whose lower boundary is moving and producing a uniform
+vertical scaling. Hence, a polar parameterization of the unit disk compressed by a uniform
+vertical scaling yields an area-preserving parameterization of the projected area.
+
+4.3.
+
+Reprojection on the Hemisphere
+
+Finally, we reproject the point t1 T1 + t2 T2 onto the hemisphere to obtain its normal.
+To do this, we compute the component vh in direction Vh such that the point
+Ph = t1 T1 + t2 T2 + vh Vh
+
+(12)
+
+is normalized, i.e., we compute
+q
+vh = 1 − t21 − t22 .
+
+(13)
+
+Since the point Ph is on a hemisphere, the associated normal is Nh = Ph . Note that
+in our implementation we clamp 1 − t21 − t22 to 0 in order to avoid numerical-precision
+errors.
+// Section 4.3: reprojection onto hemisphere
+vec3 Nh = t1*T1 + t2*T2 + sqrt(max(0.0, 1.0 - t1*t1 - t2*t2))*Vh;
+
+5.
+
+Evaluation
+
+We compared the performance of our final implementation from Listing 1 to the implementation provided by Heitz and d’Eon [2014] by generating 10 milPerformance.
+
+8
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+lion random samples on a Intel(R) Core(TM) i7-5960X. The generation takes 1.46s
+with our implementation and 2.31s with Heitz and d’Eon’s implementation. Our implementation is 58% faster.
+To visualize the parameterizations used by the
+sampling algorithms, we use them to warp a unit-square checker and a point set in Figure 7. To ease the visualization, we display the results in the 2D Cartesian
+ slope space
+
+n −yn
+by converting the 3D normal directions to 2D slope values: (x̃, ỹ) = −x
+,
+zn
+zn .
+Since our algorithm and the one of Heitz and d’Eon [2014] use the same linear transformation to map the configuration to the unit-roughness or hemisphere configuration
+(where αx = αy = 1) and their difference is how they operate in this configuration,
+we display them in this configuration for varying view angles.
+Visualizing the parameterization.
+
+unit square checker and point set
+
+[Heitz and d’Eon 2014]
+
+ours
+
+θv = π/2
+
+θv = π/4
+
+θv = 0
+
+DV
+
+Figure 7. Visualizing the parameterization. We warp the unit-square checker and point set us-
+
+ing the sampling algorithms. We compute the warping in the unit-roughness (or hemisphere)
+configuration and visualize it in slope space.
+
+9
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+6.
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Conclusion
+
+We have described an efficient implementation of a GGX VNDF sampling routine.
+In contrast to the routine of Heitz and d’Eon [2014] that used a fitted curve, this new
+routine is exact. Furthermore, it is about 58% faster according to our experiments and
+simpler to implement. Finally, it can be used with view directions located in the lower
+hemisphere, which makes it usable for sampling multiple-scattering BSDFs based on
+the GGX distribution [Heitz et al. 2016].
+Acknowledgements
+I thank Stephen Hill for motivating me to write this paper and for his helpful feedback.
+
+A.
+
+Complete Implementation of the GGX VNDF Sampling Routine
+
+// Input Ve: view direction
+// Input alpha_x, alpha_y: roughness parameters
+// Input U1, U2: uniform random numbers
+// Output Ne: normal sampled with PDF D_Ve(Ne) = G1(Ve) * max(0, dot(Ve, Ne)) * D(Ne) / Ve.z
+vec3 sampleGGXVNDF(vec3 Ve, float alpha_x, float alpha_y, float U1, float U2)
+{
+// Section 3.2: transforming the view direction to the hemisphere configuration
+vec3 Vh = normalize(vec3(alpha_x * Ve.x, alpha_y * Ve.y, Ve.z));
+// Section 4.1: orthonormal basis (with special case if cross product is zero)
+float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+vec3 T1 = lensq > 0 ? vec3(-Vh.y, Vh.x, 0) * inversesqrt(lensq) : vec3(1,0,0);
+vec3 T2 = cross(Vh, T1);
+// Section 4.2: parameterization of the projected area
+float r = sqrt(U1);
+float phi = 2.0 * M_PI * U2;
+float t1 = r * cos(phi);
+float t2 = r * sin(phi);
+float s = 0.5 * (1.0 + Vh.z);
+t2 = (1.0 - s)*sqrt(1.0 - t1*t1) + s*t2;
+// Section 4.3: reprojection onto hemisphere
+vec3 Nh = t1*T1 + t2*T2 + sqrt(max(0.0, 1.0 - t1*t1 - t2*t2))*Vh;
+// Section 3.4: transforming the normal back to the ellipsoid configuration
+vec3 Ne = normalize(vec3(alpha_x * Nh.x, alpha_y * Nh.y, std::max<float>(0.0, Nh.z)));
+return Ne;
+}
+
+Listing 1. Sampling the GGX VNDF: complete implementation.
+
+B.
+
+Usage in a Monte Carlo Renderer
+
+In this section, we briefly recall how to use the routine of Listing 1 to compute a
+Monte Carlo estimator of the direct illumination,
+Z
+¯
+I=
+I(L) ρ(V, L) (L · Z) dωL ,
+(14)
+Ω
+
+where V is the view direction, I(L) is the radiance arriving at the shading point from
+direction L, and ρ(V, L) is a GGX microfacet BRDF.
+10
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+GGX microfacet BRDF.
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+Typically, a microfacet BRDF has the following expression:
+ρ(V, L) =
+
+F (V, H) D(H) G2 (V, L)
+,
+4 cos θV cos θL
+
+(15)
+
+where H is the half-vector between V and L, F (V, H) is a Fresnel term, D(H) is
+the GGX distribution, and G2 (V, L) is the shadowing-and-masking function [Heitz
+2014].
+The sampling routine of Listing 1 generates
+microfacet samples Ni whose PDF is the VNDF DV (Ni ) of Equation (3). By reflecting the view direction, we obtain light samples Li :
+Importance sampling using the VNDF.
+
+Li = reflect (V, Ni ) ,
+
+(16)
+
+whose PDF is the VNDF weighted by the Jacobian of the reflection operator:
+PDF (Li ) =
+
+DV (Ni )
+.
+4 (V · Ni )
+
+(17)
+
+With this importance sampling procedure, we obtain a stochastic estimator of Equation (14):
+Monte Carlo estimator of the direct illumination.
+
+1
+I¯ ≈
+n
+=
+
+1
+n
+
+n
+X
+i=1
+n
+X
+i=1
+
+I(Li )
+
+ρ(V, Li ) (Li · Z)
+PDF (Li )
+
+(18)
+
+I(Li )
+
+F (V, Li ) G2 (V, Li )
+.
+G1 (V )
+
+(19)
+
+This estimator usually has low variance because most of the microfacet BRDF terms
+2 (V,Li )
+cancel with the PDF terms and the remaining fraction, F (V,LGi )1 G
+, takes values
+(V )
+in [0, 1]. For more details on these derivations, we refer the reader to the original
+VNDF-sampling article [Heitz and d’Eon 2014].
+References
+D ONG , Z., WALTER , B., M ARSCHNER , S., AND G REENBERG , D. P. 2015. Predicting
+appearance from measured microgeometry of metal surfaces. ACM Trans. Graph. 35, 1
+(Dec.), 9:1–9:13. URL: http://doi.acm.org/10.1145/2815618. 3
+H EITZ , E., AND D ’E ON , E. 2014. Importance sampling microfacet-based BSDFs using
+the distribution of visible normals. In Proceedings of the 25th Eurographics Symposium
+on Rendering, Eurographics Association, Aire-la-Ville, Switzerland, EGSR ’14, 103–112.
+URL: https://hal.inria.fr/hal-00996995v2. 2, 3, 8, 9, 10, 11
+H EITZ , E., D UPUY, J., C RASSIN , C., AND DACHSBACHER , C. 2015. The SGGX microflake
+distribution. ACM Trans. Graph. 34, 4 (July), 48:1–48:11. URL: http://doi.acm.
+org/10.1145/2766988. 3
+
+11
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+H EITZ , E., H ANIKA , J., D ’E ON , E., AND DACHSBACHER , C. 2016. Multiple-scattering
+microfacet BSDFs with the Smith model. ACM Trans. Graph. 35, 4 (July), 58:1–58:14.
+URL: http://doi.acm.org/10.1145/2897824.2925943. 4, 10
+H EITZ , E. 2014. Understanding the masking-shadowing function in microfacet-based
+BRDFs. Journal of Computer Graphics Techniques (JCGT) 3, 2 (June), 48–107. URL:
+http://jcgt.org/published/0003/02/03/. 2, 11
+H EITZ , E. 2017. A Simpler and Exact Sampling Routine for the GGX Distribution of
+Visible Normals. Research report. URL: http://hal.archives-ouvertes.fr/
+hal-01509746. 3
+N EYRET, F. 1995. A General and Multiscale Model for Volumetric Textures. In Graphics Interface, Canadian Human-Computer Communications Society, Toronto, Ontario, Canada,
+83–91. URL: https://hal.inria.fr/inria-00588886. 2
+N EYRET, F. 1998. Modeling Animating and Rendering Complex Scenes using Volumetric
+Textures. IEEE Transactions on Visualization and Computer Graphics 4, 1, 55 – 70. URL:
+https://hal.inria.fr/inria-00537523. 2, 3
+T ROWBRIDGE , T. S., AND R EITZ , K. P. 1975. Average irregularity representation of a
+rough surface for ray reflection. J. Opt. Soc. Am. 65, 5 (May), 531–536. URL: http:
+//www.osapublishing.org/abstract.cfm?URI=josa-65-5-531. 2
+WALTER , B., M ARSCHNER , S. R., L I , H., AND T ORRANCE , K. E. 2007. Microfacet models for refraction through rough surfaces. In Proceedings of the 18th Eurographics Conference on Rendering Techniques, Eurographics Association, Aire-la-Ville,
+Switzerland, EGSR’07, 195–206. URL: https://www.cs.cornell.edu/˜srm/
+publications/EGSR07-btdf.html. 2
+WALTER , B., D ONG , Z., M ARSCHNER , S., AND G REENBERG , D. 2015. The Ellipsoid Normal Distribution Function. Supplemental material of Predicting Appearance
+from Measured Microgeometry of Metal Surfaces, ACM Trans. Graph. 35, 4, 9:1–9:13.
+May 2016 updated version. URL: http://pdfs.semanticscholar.org/fc79/
+f6c7340937c2589cf22165f2c4fc9acb2ba2.pdf. 3, 4
+
+Author Contact Information
+Eric Heitz
+Unity Technologies
+eric@unity3d.com
+
+Eric Heitz, Sampling the GGX Distribution of Visible Normals, Journal of Computer Graphics Techniques (JCGT), vol. 7, no. 4, 1–13, 2018
+http://jcgt.org/published/0007/04/01/
+Received:
+Recommended:
+Published:
+
+2018-07-16
+2018-09-07
+2018-11-30
+
+Corresponding Editor: Wojciech Jarosz
+Editor-in-Chief:
+Marc Olano
+
+12
+
+Journal of Computer Graphics Techniques
+Sampling the GGX Distribution of Visible Normals
+
+Vol. 7, No. 4, 2018
+http://jcgt.org
+
+c 2018 Eric Heitz (the Authors).
+The Authors provide this document (the Work) under the Creative Commons CC BY-ND
+3.0 license available online at http://creativecommons.org/licenses/by-nd/3.0/. The Authors
+further grant permission for reuse of images and text from the first page of the Work, provided
+that the reuse is for the purpose of promoting and/or summarizing the Work in scholarly
+venues and that any reuse is accompanied by a scientific citation to the Work.
+
+13
+
+

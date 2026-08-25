@@ -1,0 +1,1076 @@
+empowers game creators to shape the future of gaming
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Stochastic ScreenSpace Reflections
+TOMASZ STACHOWIAK
+
+ELECTRONIC ARTS / FROSTBITE
+
+YASIN ULUDAG
+
+ELECTRONIC ARTS / DICE
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Agenda
+
+
+Motivation and requirements
+
+
+
+Previous work
+
+
+
+Core algorithm
+
+
+
+Secret sauce
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Motivation and requirements
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Motivation
+
+Mirror’s Edge Catalyst concept art (DICE)
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Motivation
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Motivation
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our requirements
+
+
+Sharp and blurry reflections
+
+
+
+Contact hardening
+
+
+
+Specular elongation
+
+
+
+Per-pixel roughness and normal
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our requirements
+
+
+Sharp and blurry reflections
+
+
+
+Contact hardening
+
+
+
+Specular elongation
+
+
+
+Per-pixel roughness and normal
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our requirements
+
+
+Sharp and blurry reflections
+
+
+
+Contact hardening
+
+
+
+Specular elongation
+
+
+
+Per-pixel roughness and normal
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our requirements
+
+
+Sharp and blurry reflections
+
+
+
+Contact hardening
+
+
+
+Specular elongation
+
+
+
+Per-pixel roughness and normal
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Basic mirror-only SSR
+ Shoot rays from G-Buffer
+ Normals just work
+
+ Raymarch depth
+ Return color at hit point
+ Final lighting of last frame
+ Reprojected
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Killzone Shadow Fall [Valient14]
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Killzone Shadow Fall [Valient14]
+
+???
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Killzone Shadow Fall [Valient14]
+
+
+No hardening
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Filtered Importance Sampling
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our approach
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our approach
+
+
+BRDF importance sampling
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our approach
+
+
+Hit point reuse across neighbors
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our approach
+
+
+Prefiltered samples
+
+
+
+Weighed by each BRDF
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Our approach - screenshots
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+High smoothness
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Medium smoothness
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Medium smoothness + normals
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Variable smoothness
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Smooth + rough; complex surfaces
+SSR Off
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Smooth + rough; complex surfaces
+SSR On
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Mirror’s Edge Catalyst
+SSR Off
+Fallback Off
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Mirror’s Edge Catalyst
+SSR On Fallback Off
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Mirror’s Edge Catalyst
+SSR On Fallback On
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Mirror’s Edge Catalyst
+SSR only; no AA
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Algorithm breakdown
+Tile classification
+
+Ray allocation
+
+HQ raytracing
+
+Cheap raytracing
+
+Color resolve
+
+Temporal filter
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Tile-based classification
+
+
+Split screen in tiles
+
+
+
+Shoot tracer rays at 1/8th resolution
+
+
+
+Estimate tile importance
+ Hit anything at all?
+ Perceptual variance of hit values
+
+
+
+Allocate ray count per tile
+ Between user-specified min and max
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Ray classification
+
+
+Classify each pixel based on roughness
+
+
+
+Expensive rays
+ Hierarchical raytracing
+ Exact intersection
+
+
+
+Cheap rays
+ Simple linear march
+ May skip thin objects
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Hierarchical tracing
+
+
+Stackless ray walk of min-Z pyramid
+
+mip = 0;
+while (level > -1)
+step through current cell;
+if (above Z plane) ++level;
+if (below Z plane) --level;
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Importance sampling refresher
+probability
+
+
+Variance reduction for Monte Carlo
+
+
+
+Given a target function to integrate…
+
+
+
+Find a probability distribution function
+we can sample
+ As close as possible to target
+
+
+
+Generate samples according to PDF
+
+
+
+Calculate mean function / PDF
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+BRDF importance sampling
+
+
+Any BRDF
+ We use GGX
+
+
+
+Every ray is sacred, every ray is great…
+ Make them count!
+ Low discrepancy Halton sequence
+ Some rays go under the surface
+ We re-generate them
+ Could try Distribution of Visible Normals
+
+[Heitz14]
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Ray reuse
+
+
+Neighboring pixels shoot useful rays
+ Visibility might be different
+ We assume it’s the same
+
+
+
+Reuse intersection results
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Ray reuse
+
+
+Weigh by local BRDF
+
+
+
+Divide by original PDF
+ Returned by ray-trace along with hit-point
+
+
+
+Neighbors can have vastly different properties
+
+
+
+Spikes in BRDF/PDF ratio
+ Worse results than without reuse :(
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Ray reuse test scene
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 1 resolve sample
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Variance reduction
+
+
+This is what we’re solving
+
+
+
+Where
+ fs is the BRDF
+ Li is the incident radiance
+ We integrate over hemisphere
+ We skip emitted light (Le) in the formulation
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Variance!
+
+Mul and div by the same factor
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+… pre-integrate one of them
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+… and do the rest with Monte Carlo.
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Same thing in Simple English
+
+ BRDF-weighted image contributions
+ Normalization of BRDF weights
+ Pre-integrated BRDF
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+… and pseudocode
+result
+
+= 0.0
+
+weightSum = 0.0
+for pixel in neighborhood:
+weight = localBrdf(pixel.hit) /
+pixel.hitPdf
+result += color(pixel.hit) * weight
+weightSum += weight
+result /= weightSum
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 1 resolve sample
+no normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+no normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+with normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+4 rays, 1 resolve sample
+with normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 1 resolve sample
+with normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+with normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+4 rays, 4 resolve samples
+with normalization
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+with normalization and temporal filter
+half-resolution
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Sparse raytracing
+
+
+Raytrace at a reduced resolution
+
+
+
+Reuse multiple rays at full-res
+ Unique blend of rays for every pixel
+ Automatic from BRDF
+
+ Per-pixel normals and roughness preserved
+
+
+
+Weight normalization fixes gaps
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+with normalization and temporal filter
+half-res trace; half-res resolve
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+1 ray, 4 resolve samples
+with normalization and temporal filter
+half-res trace; full-res resolve
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Temporal reprojection
+
+
+Reprojection along G-Buffer depth ‘smears’
+
+
+
+Add reflection depth
+ Average from local rays
+ Proper reflection parallax
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Importance sampling bias
+probability
+
+
+Lots of noise from BRDF tail
+
+
+
+Shift samples toward mirror direction
+ Still need accurate PDF values
+
+
+
+Truncated distribution sampling
+float2 u = halton(sampleIdx);
+u.x = lerp(u.x, 1.0, bias);
+
+ 
+
+importanceSample(u);
+
+
+Different normalization constant
+ Our variance reduction re-normalizes!
+
+angle
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Filtered importance sampling
+
+
+Pre-filter image pyramid
+
+
+
+Estimate footprint of a cone at intersection
+
+
+
+No actual cone tracing
+
+
+
+Mip determined by log function fit
+ Roughness
+ Distance to hit
+ Elongation
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Filter bias
+
+
+Counter sampling bias with filter bias
+ Same parameter
+ Tuned for similar look across the range
+
+
+
+Improves performance
+ Better spatial coherency
+ Smaller mips
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Bias 0.0
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Bias 0.7
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Multi-pixel resolve
+
+
+Resolve four pixels at a time
+ Using the same rays
+
+
+
+Four running color and weight sums
+ Four times the VGPRs
+ Two-three waves enough in practice
+
+
+
+Same four color buffer UVs
+ Different mips :(
+ Find min and max mips, interpolate samples
+ Two color samples instead of four :)
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Mip anchor interpolation
+4 mip fetches
+
+2 mip fetches
++ interpolation
+
+1 mip fetch
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Performance
+
+
+PS4 timings (Frostbite testbed)
+ 1600 x 900; all pixels reflective
+ HQ rays for “Disney” roughness < 20%
+ Bias 0.7
+ All passes use compute, can run async.
+
+Resolve
+sample
+s
+
+Rays /
+halfres
+pixel
+
+Effective
+samples/
+pixel
+
+Tile
+classif
+y
+
+Rayalloc
+
+Linear
+trace
+
+Hi-Z
+trace
+
+Resolve
+
+Temporal
+
+Total
+
+4
+
+1
+
+4
+
+0.16ms
+
+0.24ms
+
+0.20ms
+
+0.37ms
+
+0.81ms
+
+0.30ms
+
+2.19m
+s
+
+4
+
+2
+
+8
+
+0.16ms
+
+0.34ms
+
+0.34ms
+
+0.65ms
+
+1.46ms
+
+0.30ms
+
+3.34m
+s
+
+1
+
+4
+
+4
+
+0.16ms
+
+1.06ms
+
+0.61ms
+
+0.91ms
+
+0.91ms
+
+0.33ms
+
+4.41m
+s
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Video
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Conclusion
+
+
+All requirements fulfilled
+ Accuracy, per-pixel normal, roughness, etc.
+
+
+
+Tiny bright highlights still result in noise
+ Can we detect and sample them more?
+ Adaptive Multiple Importance Sampling?
+ Track variance and blur where it’s high?
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Thanks!
+
+
+Questions?
+ tomasz.stachowiak@frostbite.com
+
+
+
+
+@h3r2tic
+
+By the way, we’re hiring!
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+References
+
+
+[Heitz14] Eric Heitz, Eugene D'Eon "Importance Sampling Microfacet-Based BSDFs
+using the Distribution of Visible Normals" https://hal.inria.fr/hal-00996995
+
+
+
+[Hermanns15] Lukas Hermanns "Screen space cone tracing for glossy reflections" http
+://publica.fraunhofer.de/documents/N-336466.html
+
+
+
+[Karis13] Brian Karis "Real Shading in Unreal Engine 4" http://blog.selfshadow.com/pu
+blications/s2013-shading-course/
+
+
+
+[Karis14] Brian Karis "High-quality Temporal Supersampling" http://advances.realtimer
+endering.com/s2014/
+
+
+
+[McGuire14] Morgan McGuire, Michael Mara "Efficient GPU Screen-Space Ray Tracing"
+http://jcgt.org/published/0003/04/04/
+
+
+
+[Pearce15] William Pearce "Screen Space Glossy Reflections" http://roar11.com/2015/0
+7/screen-space-glossy-reflections/
+
+
+
+[Tokuyoshi15] Yusuke Tokuyoshi "Specular Lobe-Aware Filtering and Upsampling for
+Interactive Indirect Illumination" http://www.jp.square-enix.com/info/library/
+
+
+
+[Uludag14] Yasin Uludag "Hi-Z Screen-Space Cone-Traced Reflections" GPU Pro 5
+
+
+
+[Valient14] Michal Valient "Reflections And Volumetrics Of Killzone Shadow Fall" http://
+advances.realtimerendering.com/s2014/
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Bonus slides
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Lobe-aware filtering
+[Tokuyoshi15]
+
+No hardening :(
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Hi-Z Cone Tracing [Uludag14]
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Previous work
+
+
+Hi-Z Cone Tracing [Uludag14]
+
+Can’t trace
+this
+???
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Overblurring at grazing angles
+
+
+Cones poorly fit specular lobes at grazing angles
+
+
+
+Lobes become anisotropic in shape
+
+
+
+Cone fit to wider (azimuthal) angle over-blurs
+
+
+
+Fit it to polar angle
+ Effectively: shrink the cone at grazing angles
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Filter shrinking due to elongation
+
+
+Found a close fit in Mathematica
+
+
+
+Also came up with an ad-hoc one
+
+
+
+Ad-hoc close enough in testing
+
+specularConeTangent *=
+lerp(saturate(NdotV * 2.0), 1.0,
+sqrt(roughness));
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Filter shrinking due to elongation
+No filter
+
+Naive filter
+
+Adjusted filter
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Pre-integrated FG note
+
+
+Remember this?
+
+
+
+Multiply by FG after temporal
+ We do it when applying SSR to the screen
+
+
+
+Reduces smearing and noise
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Multi-pixel resolve jittering
+
+
+Ray reuse across 2x2 quads == 2x2 noise
+ Makes Temporal AA unhappy!
+ 2x2 blocks look like features, not aliasing
+
+
+
+Spread out the target pixels
+ Jitter temporally to hide artifacts
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Variance reduction for ray reuse
+
+
+Initial idea: Multiple Importance Sampling
+ Treat neighboring pixels as generation strategies
+ Accurate, unbiased results
+ Expensive
+ ALU and VGPR heavy
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Neighborhood clamping
+
+
+Similar to Temporal AA
+
+
+
+Tuned for some smearing over noise
+ Can’t kill all the lag anyway
+ Reflection color is from previous frame!
+
+ Expand the color bounding box
+
+
+
+Tiled, loaded from LDS
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Common materials
+SSR Off
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+Common materials
+SSR On
+
+SIGGRAPH 2015: Advances in Real-Time Rendering course
+
+

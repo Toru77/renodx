@@ -18,6 +18,11 @@
 
 namespace renodx::utils::dlss::nvngx {
 
+// ── Phase R3-MV: optional capture callback ──
+// Games set this to inspect NGX evaluation parameters (motion vectors etc.)
+// without modifying the shared hook logic. Called before passthrough.
+static void (*on_evaluate_feature_d3d11)(ID3D11DeviceContext*, const NVSDK_NGX_Parameter*) = nullptr;
+
 static decltype(&NVSDK_NGX_D3D11_Init) real_NVSDK_NGX_D3D11_Init = nullptr;
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D11_Init(unsigned long long InApplicationId, const wchar_t* InApplicationDataPath, ID3D11Device* InDevice, const NVSDK_NGX_FeatureCommonInfo* InFeatureInfo = nullptr, NVSDK_NGX_Version InSDKVersion = NVSDK_NGX_Version_API) {
 #ifdef DEBUG_LEVEL_0
@@ -106,6 +111,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_CONV hooked_NVSDK_NGX_D3D11_EvaluateFeature
 #ifdef DEBUG_LEVEL_0
   utils::log::d("utils::dlss::nvngx::hooked_NVSDK_NGX_D3D11_EvaluateFeature()");
 #endif
+  if (on_evaluate_feature_d3d11 != nullptr && InParameters != nullptr)
+    on_evaluate_feature_d3d11(InDevCtx, InParameters);
   utils::directx::NativeFromReShadeProxy(&InDevCtx);
   return real_NVSDK_NGX_D3D11_EvaluateFeature(InDevCtx, InFeatureHandle, InParameters, InCallback);
 }

@@ -207,6 +207,7 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
+Texture2D<float4> ssrCustomTexture : register(t25);  // Custom SSR (addon-pushed)
 Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
 
@@ -249,6 +250,44 @@ void main(
   r3.xy = (int2)r3.xy;
   r3.zw = float2(0,0);
   r3.xy = mrtTexture2.Load(r3.xyz).xy;
+  // ── Custom SSR debug views (Phase 1/3 instrumentation) ──
+  // Phase 2.10/3 integration proofs (raw slider indices 28/29/30):
+  if (shader_injection_data.ssr_custom_bound > 0.5f) {
+    const int dvRaw = (int)(shader_injection_data.ssr_debug_view + 0.5f);
+    if (dvRaw == 28) {          // t25 RGB — traced radiance reaching the PS
+      float4 t = ssrCustomTexture.SampleLevel(SmplLinearClamp_s,
+          resolutionScaling_g.xy * v1.xy, 0);
+      o0.rgb = t.rgb; o0.a = 1.0;
+      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (dvRaw == 29) {          // t25 Alpha — confidence/Fresnel magnitude
+      float4 t = ssrCustomTexture.SampleLevel(SmplLinearClamp_s,
+          resolutionScaling_g.xy * v1.xy, 0);
+      o0.rgb = t.aaa; o0.a = 1.0;
+      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (dvRaw == 30) {          // Vanilla t24 — eligibility reference
+      float4 t = texSSRMap_g.SampleLevel(SmplLinearClamp_s,
+          resolutionScaling_g.xy * v1.xy, 0);
+      o0.rgb = t.rgb; o0.a = 1.0;
+      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+    if (dvRaw == 31) {          // SSR Coverage — resolved α as grayscale
+      float4 t = ssrCustomTexture.SampleLevel(SmplLinearClamp_s,
+          resolutionScaling_g.xy * v1.xy, 0);
+      o0.rgb = t.aaa; o0.a = 1.0;
+      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
+    }
+  }
+  if (shader_injection_data.ssr_custom_bound > 0.5f
+      && shader_injection_data.ssr_debug_view > 0.5f) {
+    float3 ssrDbg = ssrCustomTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
+    o0.rgb = ssrDbg * 0.3;
+    o0.a = 1.0;
+    o1.xyzw = r2.xyzw;
+    o2.xy = r3.xy;
+    return;
+  }
   r4.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   r5.xyz = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
   // Sample AO: always read vanilla SSAO first, then conditionally
@@ -852,12 +891,31 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r22.xyz, r8.z).xyz;
     }
     r8.z = (int)r1.z & 2;
-    if (r8.z != 0) {
+    // ── Custom SSR eligibility (independent of the game's vanilla mask) ──
+    //   0 = Vanilla Flag (pixel flag & 2; water-only in practice)
+    //   1 = Custom Material: roughness <= cutoff  (default)
+    //   2 = All eligible surfaces
+    bool ssrVanillaElig = (r8.z != 0);
+    bool ssrCustomElig = (r15.z <= shader_injection_data.ssr_roughness_threshold);
+    bool ssrUseCustom = shader_injection_data.ssr_apply > 0.5f
+                     && shader_injection_data.ssr_custom_bound > 0.5f
+                     && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig
+                       : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
+                       : ssrCustomElig);
+    if (ssrUseCustom) {
+      r20.xz = resolutionScaling_g.xy * v1.zw;
+      r22.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
+      r22.w = r22.w * shader_injection_data.ssr_apply_gain;
+    } else if (ssrVanillaElig) {
       r20.xz = resolutionScaling_g.xy * v1.zw;
       r22.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
-      r22.xyz = r22.xyz + -r21.xyz;
-      r21.xyz = r22.www * r22.xyz + r21.xyz;
+    } else {
+      r22.xyzw = float4(0, 0, 0, 0);   // no SSR contribution on this pixel
     }
+    // Environment-vs-SSR replacement blend (AMD SSSR fallback model):
+    // α=0 → cubemap unchanged · α=1 → SSR replaces · intermediate blends.
+    r22.xyz = r22.xyz + -r21.xyz;
+    r21.xyz = r22.www * r22.xyz + r21.xyz;
     r8.z = cmp(0 < r2.x);
     r9.y = 1 + -abs(r3.y);
     r9.y = max(0, r9.y);
@@ -903,12 +961,26 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r2.x = r5.y * r2.x;
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r21.xyz, r2.x).xyz;
       r5.y = (int)r1.z & 2;
-      if (r5.y != 0) {
+      bool ssrVanillaElig2 = (r5.y != 0);
+      bool ssrCustomElig2 = (r15.z <= shader_injection_data.ssr_roughness_threshold);
+      bool ssrUseCustom2 = shader_injection_data.ssr_apply > 0.5f
+                        && shader_injection_data.ssr_custom_bound > 0.5f
+                        && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig2
+                          : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
+                          : ssrCustomElig2);
+      if (ssrUseCustom2) {
+        r5.yz = resolutionScaling_g.xy * v1.zw;
+        r23.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
+        r23.w = r23.w * shader_injection_data.ssr_apply_gain;
+      } else if (ssrVanillaElig2) {
         r5.yz = resolutionScaling_g.xy * v1.zw;
         r23.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
-        r23.xyz = r23.xyz + -r21.xyz;
-        r21.xyz = r23.www * r23.xyz + r21.xyz;
+      } else {
+        r23.xyzw = float4(0, 0, 0, 0);
       }
+      // Environment-vs-SSR replacement blend (site 2).
+      r23.xyz = r23.xyz + -r21.xyz;
+      r21.xyz = r23.www * r23.xyz + r21.xyz;
       r19.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r19.xyz, r2.x).xyz;
       r2.x = cmp(0 < r16.x);
       r5.y = 1 + -abs(r3.y);
