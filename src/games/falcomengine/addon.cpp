@@ -137,7 +137,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 
     CustomShaderEntry(0xE20E1A41), // final
     CustomShaderEntry(0x14DAB5E7), // final
-    CustomShaderEntry(0xC9FA40B7), // tonemap
+    UpgradeRTVReplaceShader(0xC9FA40B7), // tonemap
     CustomShaderEntry(0xCDE6FA28), // bloomTAA
     CustomShaderEntry(0xD6CF040B), // bloom blend
     CustomShaderEntry(0x0F66FA5C), // bloom
@@ -151,9 +151,19 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x31FE6C05), // hud
     CustomShaderEntry(0xDCC360B5), // hud
 
+    // Sora2
+    UpgradeRTVReplaceShader(0x9D91FAC3), // depth
+    UpgradeRTVReplaceShader(0xA22BF9AA), // copy
+    UpgradeRTVReplaceShader(0x44C12B1C), // flow
+    UpgradeRTVReplaceShader(0xCE0B3FF0), // flow
+    UpgradeRTVReplaceShader(0x637A62EB), // flow
+    UpgradeRTVReplaceShader(0xF7D07254), // flow
+    UpgradeRTVReplaceShader(0x81120B3E), // flow
+
     // YS X
     CustomShaderEntry(0xC8EBAB1E), // hud
     CustomShaderEntry(0xAA5313D9), // hud
+
     {0x2EB53B7A,
      {
          .crc32 = 0x2EB53B7A,
@@ -180,12 +190,13 @@ renodx::mods::shader::CustomShaders custom_shaders = {
      CustomShaderEntry(0x36B738AD), // ui
      CustomShaderEntry(0x44DFE546), // ui
 
-     //Kyoto Xanadu
-     CustomShaderEntry(0xB879528D), // bloom final
-     CustomShaderEntry(0x197BCB74), // bloom blend
-     CustomShaderEntry(0x5AFABB1C), // bloom godray
-     CustomShaderEntry(0xDF53C75B), // hud
+    // Kyoto Xanadu
+     UpgradeRTVReplaceShader(0x197BCB74), // bloomblend
+     UpgradeRTVReplaceShader(0xB879528D), // bloomfinal
+     UpgradeRTVReplaceShader(0x5AFABB1C), // bloomgodray
      CustomShaderEntry(0x9C84A630), // hud
+     CustomShaderEntry(0xDF53C75B), // hud
+
 
     // UpgradeRTVShader(0x1336F6F8),
     // UpgradeRTVShader(0xEF0CAEEA),

@@ -21,7 +21,7 @@ void main(
   o0.xyz = r0.xyz;
 
   // if (RENODX_TONE_MAP_TYPE > 0) {
-    
+
   //   bool decoding = true;
   //   o0.rgb = processAndToneMap(o0.rgb, decoding);
   // }
