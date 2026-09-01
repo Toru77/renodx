@@ -1,0 +1,25 @@
+Dynamic Cubemaps — Reference Files
+===================================
+
+These files are original shader source files from
+Skyrim Community Shaders and are included here for
+reference purposes only.
+
+Original Project:
+Skyrim Community Shaders
+https://github.com/community-shaders/skyrim-community-shaders
+
+The original files are licensed under:
+
+GNU General Public License v3.0 or later
+with the Community Shaders Modding Exception and
+GPL-3.0 Linking Exception (with Corresponding Source).
+
+These files have not been modified for Falcom Engine Plus.
+
+All original copyright and license notices contained
+within these files are retained.
+
+For the complete license terms, see the GPL-3.0 license
+and EXCEPTIONS.md from the original Community Shaders
+project.

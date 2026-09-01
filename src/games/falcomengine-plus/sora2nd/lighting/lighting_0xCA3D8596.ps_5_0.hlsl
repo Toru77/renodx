@@ -207,7 +207,7 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
-Texture2D<float4> ssrCustomTexture : register(t25);  // Custom SSR (addon-pushed)
+Texture2D<float4> ssrCustomTexture : register(t25);  // removed feature. Non existent
 Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
 

@@ -1,0 +1,26 @@
+Dynamic Cubemaps — Falcom Engine Plus Port
+
+This implementation is a port and modification of the
+Dynamic Cubemaps implementation from Skyrim Community Shaders.
+
+It has been adapted for use with Falcom Engine Plus.
+
+Original project:
+https://github.com/community-shaders/skyrim-community-shaders
+
+The original Dynamic Cubemaps code is licensed under
+GPL-3.0-or-later with the Community Shaders Modding Exception
+and GPL-3.0 Linking Exception (with Corresponding Source).
+
+This port is a modified version of that code and is distributed
+under the same license and applicable exceptions.
+
+Modifications:
+- Ported to Falcom Engine Plus.
+- Adapted to the target game's rendering architecture.
+- Adapted to the target engine's resources and shader interfaces.
+
+Modified: 2026
+
+Original copyright and attribution notices are retained where
+applicable.

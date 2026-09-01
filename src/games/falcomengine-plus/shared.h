@@ -340,6 +340,24 @@ struct ShaderInjectData {
   float ssr_log_ngx;                       // NGX motion vector capture verification toggle
   float ssr_log_config;                    // Phase3Config/Integrate config echo toggle
   float ssr_log_init;                      // R3 init staged logs / pyramid lifecycle toggle
+  // —— Dynamic Cubemaps (Sora 2nd) — Phase 0A/B standalone ———
+  float dynCube_enabled;                   // 0=Off (vanilla t17), 1=On (dynamic)
+  float dynCube_debug;                     // 0=Off(normal) 1=ShowDynamicCube 2=FaceViz 3=SolidColors 4=NoOverride
+  float dynCube_resolution;                // 0=64 1=96 2=128 (default 128)
+  float dynCube_history;                   // 0=Off (Phase0B no history) 1=On (Phase1 lerp 0.5)
+  float dynCube_inference;                 // 0=Off 1=On (Phase2)
+  float dynCube_ggx;                       // 0=HW mips (cheap approx) 1=GGX (Phase3)
+  float dynCube_capture_interval;          // 0=Every frame 1=Every 2nd ...
+  float dynCube_roughness_boost;           // placeholder for future mip boost
+  float dynCube_debug_logging;             // 0=Off 1=On — 1 log/sec diag for which part is broken
+  float dynCube_debug_face;                // 0..5 face for preview when debug=1/2/5/6
+  float dynCube_capture_boost;             // capture color boost multiplier, default 1.0
+  float dynCube_history_blend;             // temporal lerp weight, default 0.5
+  float dynCube_history_pos_threshold;     // world-unit position compatibility threshold, default 0.5
+  float dynCube_inference_coverage_threshold;   // mip0 validity >= this -> copy history unchanged, default 0.5
+  float dynCube_inference_min_mip_coverage;     // coarser mip validity >= this -> use to fill, default 0.05
+  float dynCube_character_capture;              // 0=exclude characters (default), 1=capture characters
+  float dynCube_force_vanilla;                  // 0=bind dynamic cube to t17, 1=keep vanilla t17 (A/B)
 };
 
 #ifndef __cplusplus
