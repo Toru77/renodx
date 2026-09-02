@@ -276,6 +276,8 @@ ShaderInjectData shader_injection = {
   .dynCube_ssr_edge_fade = 0.3f,
   .dynCube_ssr_grazing_fade = 0.5f,
   .dynCube_ssr_thickness = 0.1f,
+  .dynCube_ssr_char_occ_strength = 0.8f,
+  .dynCube_ssr_char_occ_upness = 0.5f,
   .dynCube_vanilla_blur = 0.f,
   .dynCube_capture_boost = 1.f,
   .dynCube_history_blend = 0.5f,
@@ -3150,6 +3152,24 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRCharOccStrength", .binding = &shader_injection.dynCube_ssr_char_occ_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.8f, .label = "SSR Character Occlusion Reduction", .section = "Dynamic Cubemaps",
+      .tooltip = "How much SSR confidence is reduced when the ray hits a character from a horizontal (floor/water) surface. Attacks third-person disocclusion rings; 0 = off. Vertical mirrors (low upness) are unaffected.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRCharOccUpness", .binding = &shader_injection.dynCube_ssr_char_occ_upness,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "SSR Character Occlusion Upness", .section = "Dynamic Cubemaps",
+      .tooltip = "Surface upness threshold where the character-hit confidence reduction begins (smooth ±0.25 band). 0 = any up-facing surface, 0.5 = mostly horizontal, 1 = only fully horizontal (floor/water).",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaBlur", .binding = &shader_injection.dynCube_vanilla_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.f, .label = "Vanilla Cubemap Blur", .section = "Dynamic Cubemaps",
@@ -4751,7 +4771,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 4; // steps, binarySteps, maxDist, thickness
+    push_range.count = 8; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5053,15 +5073,17 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (quality < 0.5f) { sampleCount = 10u; maxDist = 12.f; }
   else if (quality < 1.5f) { sampleCount = 16u; maxDist = 20.f; }
   else { sampleCount = 24u; maxDist = 32.f; }
-  float pc[6] = {
+  float pc[8] = {
       (float)sampleCount,
       maxDist,
       std::clamp(shader_injection.dynCube_ssr_thickness, 0.f, 10.f),
       std::clamp(shader_injection.dynCube_ssr_distance_fade, 0.f, 1.f),
       std::clamp(shader_injection.dynCube_ssr_edge_fade, 0.f, 1.f),
       std::clamp(shader_injection.dynCube_ssr_grazing_fade, 0.f, 1.f),
+      std::clamp(shader_injection.dynCube_ssr_char_occ_strength, 0.f, 1.f),
+      std::clamp(shader_injection.dynCube_ssr_char_occ_upness, 0.f, 1.f),
   };
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 6, pc);
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 8, pc);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_raw, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 

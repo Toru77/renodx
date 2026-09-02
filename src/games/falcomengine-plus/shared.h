@@ -308,6 +308,8 @@ struct ShaderInjectData {
   float dynCube_ssr_edge_fade;                   // screen-edge confidence falloff, 0..1
   float dynCube_ssr_grazing_fade;                // grazing-angle confidence falloff, 0..1
   float dynCube_ssr_thickness;                   // depth tolerance, default 0.1
+  float dynCube_ssr_char_occ_strength;              // SSR confidence reduction for character-induced horizontal-surface disocclusion (0..1)
+  float dynCube_ssr_char_occ_upness;                // surface upness threshold where the character-hit confidence reduction begins (0..1)
   float dynCube_vanilla_blur;                    // vanilla cubemap mip-offset blur, 0=sharp
   float dynCube_capture_boost;             // capture color boost multiplier, default 1.0
   float dynCube_history_blend;             // temporal lerp weight, default 0.5

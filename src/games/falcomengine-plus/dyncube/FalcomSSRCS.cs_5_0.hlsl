@@ -25,6 +25,8 @@ cbuffer cb_ssr : register(b13)
     float g_distanceFade;
     float g_edgeFade;
     float g_grazingFade;
+    float g_charOccStrength;
+    float g_charOccUpness;
 };
 
 Texture2D<float4> g_colorTex : register(t0);
@@ -170,6 +172,26 @@ void main(uint3 dtid : SV_DispatchThreadID)
         float grazingConf = smoothstep(0.0, grazingBand, nv);
 
         float conf = saturate(hitConf * distanceConf * edgeConf * grazingConf);
+
+        // Character-induced disocclusion: if the ray from a NON-character (e.g. floor)
+        // surface hits a CHARACTER pixel on a HORIZONTAL surface, that character is a
+        // foreground occluder between the camera and the true reflected scene, not a
+        // genuine reflection target (SSR cannot render mirrored images). Reduce
+        // confidence so the Dynamic/Vanilla fallback takes over smoothly. Vertical
+        // surfaces (mirrors/walls, low upness) keep the legitimate character reflection.
+        if (g_charOccStrength > 0.0f) {
+            int2 hitPx = clamp(int2(fuv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
+            bool charHit  = ((g_mrt0Tex.Load(int3(hitPx, 0)).w & 1u) != 0u);
+            bool charOrig = ((g_mrt0Tex.Load(int3(px, 0)).w & 1u) != 0u);
+            if (charHit && !charOrig) {
+                float upness = abs(n_world.y);
+                float upLo = max(g_charOccUpness - 0.25, 0.0);
+                float upHi = min(g_charOccUpness + 0.25, 1.0);
+                float occFactor = smoothstep(upLo, upHi, upness);
+                conf *= 1.0 - g_charOccStrength * occFactor;
+            }
+        }
+
         g_out[px] = float4(max(0.0, g_colorTex.SampleLevel(g_pointClamp, fuv, 0).rgb), conf);
     }
 }
