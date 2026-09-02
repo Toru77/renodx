@@ -211,8 +211,7 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
-Texture2D<float4> ssrCustomTexture : register(t25);  // removed feature. Non existent
-Texture3D<float4> volumeFogTexture_g : register(t26);
+  Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
 
 #include "../../shared.h"
@@ -255,44 +254,6 @@ void main(
   r3.xy = (int2)r3.xy;
   r3.zw = float2(0,0);
   r3.xy = mrtTexture2.Load(r3.xyz).xy;
-  // ── Custom SSR debug views (Phase 1/3 instrumentation) ──
-  // Phase 2.10/3 integration proofs (raw slider indices 28/29/30):
-  if (shader_injection_data.ssr_custom_bound > 0.5f) {
-    const int dvRaw = (int)(shader_injection_data.ssr_debug_view + 0.5f);
-    if (dvRaw == 28) {          // t25 RGB — traced radiance reaching the PS
-      float4 t = ssrCustomTexture.SampleLevel(SmplLinearClamp_s,
-          resolutionScaling_g.xy * v1.xy, 0);
-      o0.rgb = t.rgb; o0.a = 1.0;
-      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (dvRaw == 29) {          // t25 Alpha — confidence/Fresnel magnitude
-      float4 t = ssrCustomTexture.SampleLevel(SmplLinearClamp_s,
-          resolutionScaling_g.xy * v1.xy, 0);
-      o0.rgb = t.aaa; o0.a = 1.0;
-      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (dvRaw == 30) {          // Vanilla t24 — eligibility reference
-      float4 t = texSSRMap_g.SampleLevel(SmplLinearClamp_s,
-          resolutionScaling_g.xy * v1.xy, 0);
-      o0.rgb = t.rgb; o0.a = 1.0;
-      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-    if (dvRaw == 31) {          // SSR Coverage — resolved α as grayscale
-      float4 t = ssrCustomTexture.SampleLevel(SmplLinearClamp_s,
-          resolutionScaling_g.xy * v1.xy, 0);
-      o0.rgb = t.aaa; o0.a = 1.0;
-      o1.xyzw = r2.xyzw; o2.xy = r3.xy; return;
-    }
-  }
-  if (shader_injection_data.ssr_custom_bound > 0.5f
-      && shader_injection_data.ssr_debug_view > 0.5f) {
-    float3 ssrDbg = ssrCustomTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb;
-    o0.rgb = ssrDbg * 0.3;
-    o0.a = 1.0;
-    o1.xyzw = r2.xyzw;
-    o2.xy = r3.xy;
-    return;
-  }
   r4.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   r5.xyz = ssaoTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
   // Sample AO: always read vanilla SSAO first, then conditionally
@@ -895,11 +856,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   // OFF = mathematical reflect(pixel->camera, N). ON = physical ray (the game's (1,-1,-1) flips to it).
   float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
   float3 dynCubeReflDir = float3(0, 0, 0);
-  float dynCubeReflMip = 0.0;
+  float dynCubeVanillaMipFactor = 0.0;   // game roughness->mip factor, for the vanilla fallback's own mip chain
   bool dynCubeReflActive = false;
   int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
   if (r20.z != 0) {
     r5.yz = r15.yz * r9.yz;
+    dynCubeVanillaMipFactor = r5.z;
     r6.w = (int)r18.z & 32;
     if (r6.w != 0) {
       r21.y = resolutionScaling_g.y + -v1.y;
@@ -931,14 +893,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (shader_injection_data.dynCube_force_mip > -0.5f) {
         r8.z = clamp(shader_injection_data.dynCube_force_mip, 0.0, (float)(num_levels - 1));
       }
-      // Vanilla cubemap blur (filtered mip lookup) applies when t17 is the vanilla cube (Force Vanilla).
-      // Applied to the reflection sample mip only; r8.z is left untouched for dynCubeReflMip.
+      // Vanilla cubemap blur applies when t17 is the vanilla cube (Force Vanilla); the dynamic
+      // cube uses the artistic Dynamic Cubemap Blur (mip offset into the GGX/HW chain).
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r22.xyz,
           r8.z + (shader_injection_data.dynCube_force_vanilla > 0.5f
-              ? shader_injection_data.dynCube_vanilla_blur : 0.0)).xyz;
-      // Record the reflection direction + mip for the SSR -> Dynamic -> Vanilla resolution.
+              ? shader_injection_data.dynCube_vanilla_blur
+              : shader_injection_data.dynCube_blur)).xyz;
+      // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
       dynCubeReflDir = r22.xyz;
-      dynCubeReflMip = r8.z;
       dynCubeReflActive = true;
       // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
       if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace >= 0) {
@@ -949,17 +911,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       // ── Existing vanilla/custom SSR eligibility + blend (kept when no new SSR/force path) ──
       r8.z = (int)r1.z & 2;
       bool ssrVanillaElig = (r8.z != 0);
-      bool ssrCustomElig = (r15.z <= shader_injection_data.ssr_roughness_threshold);
-      bool ssrUseCustom = shader_injection_data.ssr_apply > 0.5f
-                       && shader_injection_data.ssr_custom_bound > 0.5f
-                       && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig
-                         : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
-                         : ssrCustomElig);
-      if (ssrUseCustom) {
-        r20.xz = resolutionScaling_g.xy * v1.zw;
-        r22.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
-        r22.w = r22.w * shader_injection_data.ssr_apply_gain;
-      } else if (ssrVanillaElig) {
+      if (ssrVanillaElig) {
         r20.xz = resolutionScaling_g.xy * v1.zw;
         r22.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
       } else {
@@ -999,8 +951,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               ssrWeight = saturate(ssrTap.a * finalEdgeConf);
             }
           }
-          float3 vanillaCol = dynCubeVanillaTex.SampleLevel(SmplCube_s, dynCubeReflDir,
-              dynCubeReflMip + shader_injection_data.dynCube_vanilla_blur).xyz;
+          // Vanilla fallback: use the vanilla cube's OWN mip chain (its level count), not the
+          // dynamic cube's, so the fallback LOD matches the game's native roughness mapping.
+          float3 vanillaCol;
+          {
+            uint vw, vh, vl;
+            dynCubeVanillaTex.GetDimensions(0, vw, vh, vl);
+            float vanillaMip = (vl > 1u) ? (float)(vl - 1) * dynCubeVanillaMipFactor : 0.0;
+            vanillaCol = dynCubeVanillaTex.SampleLevel(SmplCube_s, dynCubeReflDir,
+                vanillaMip + shader_injection_data.dynCube_vanilla_blur).xyz;
+          }
           // Final dynamic validity: raw histPos capture validity (>0.5 => captured).
           float dynamicConf;
           {
@@ -1091,6 +1051,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r19.xyz = r2.xxx * -r19.xyz + -r23.xyz;
       r19.xyz = r5.zzz ? r19.xyz : 0;
       r2.x = r15.z * r9.z;
+      dynCubeVanillaMipFactor = r2.x;
       texEnvMap_g.GetDimensions(0, width, height, num_levels);
       r21.xyz = float3(1,-1,-1) * r21.xyz;
       r5.y = (float)(num_levels - 1);
@@ -1099,15 +1060,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (shader_injection_data.dynCube_force_mip > -0.5f) {
         r2.x = clamp(shader_injection_data.dynCube_force_mip, 0.0, (float)(num_levels - 1));
       }
-      // Vanilla cubemap blur (filtered mip lookup) applies when t17 is the vanilla cube (Force Vanilla).
-      // Applied to the reflection sample mip only; r2.x is left untouched for the refraction sample.
+      // Vanilla cubemap blur applies when t17 is the vanilla cube (Force Vanilla); the dynamic
+      // cube uses the artistic Dynamic Cubemap Blur (mip offset into the GGX/HW chain).
       float3 dynCubeSampleDir = r21.xyz;  // flipped sample direction
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDir,
           r2.x + (shader_injection_data.dynCube_force_vanilla > 0.5f
-              ? shader_injection_data.dynCube_vanilla_blur : 0.0)).xyz;
-      // Record the reflection direction + mip for the SSR -> Dynamic -> Vanilla resolution.
+              ? shader_injection_data.dynCube_vanilla_blur
+              : shader_injection_data.dynCube_blur)).xyz;
+      // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
       dynCubeReflDir = dynCubeSampleDir;
-      dynCubeReflMip = r2.x;
       dynCubeReflActive = true;
       // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
       if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace2 >= 0) {
@@ -1117,17 +1078,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         // ── Existing vanilla/custom SSR eligibility + blend (site 2, kept when no new SSR/force path) ──
         r5.y = (int)r1.z & 2;
         bool ssrVanillaElig2 = (r5.y != 0);
-        bool ssrCustomElig2 = (r15.z <= shader_injection_data.ssr_roughness_threshold);
-        bool ssrUseCustom2 = shader_injection_data.ssr_apply > 0.5f
-                          && shader_injection_data.ssr_custom_bound > 0.5f
-                          && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig2
-                            : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
-                            : ssrCustomElig2);
-        if (ssrUseCustom2) {
-          r5.yz = resolutionScaling_g.xy * v1.zw;
-          r23.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
-          r23.w = r23.w * shader_injection_data.ssr_apply_gain;
-        } else if (ssrVanillaElig2) {
+        if (ssrVanillaElig2) {
           r5.yz = resolutionScaling_g.xy * v1.zw;
           r23.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
         } else {
@@ -1165,8 +1116,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 ssrWeight = saturate(ssrTap2.a * finalEdgeConf);
               }
             }
-            float3 vanillaCol2 = dynCubeVanillaTex.SampleLevel(SmplCube_s, dynCubeReflDir,
-                dynCubeReflMip + shader_injection_data.dynCube_vanilla_blur).xyz;
+            // Vanilla fallback: use the vanilla cube's OWN mip chain (its level count), not the
+            // dynamic cube's, so the fallback LOD matches the game's native roughness mapping.
+            float3 vanillaCol2;
+            {
+              uint vw2, vh2, vl2;
+              dynCubeVanillaTex.GetDimensions(0, vw2, vh2, vl2);
+              float vanillaMip2 = (vl2 > 1u) ? (float)(vl2 - 1) * dynCubeVanillaMipFactor : 0.0;
+              vanillaCol2 = dynCubeVanillaTex.SampleLevel(SmplCube_s, dynCubeReflDir,
+                  vanillaMip2 + shader_injection_data.dynCube_vanilla_blur).xyz;
+            }
             // Final dynamic validity: raw histPos capture validity (>0.5 => captured).
             float dynamicConf;
             {

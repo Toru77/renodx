@@ -283,62 +283,6 @@ struct ShaderInjectData {
   float gtvbao_atrous_enabled;             // 0 Off, 1 On — à-trous wavelet spatial filter (replaces bilateral chain)
   float gtvbao_atrous_depth_sigma;         // [0.05..4] default 1.0 — relative depth edge-stop strength
   float gtvbao_atrous_normal_sigma;        // [2..128] default 32 — normal edge-stop power
-  // —— Sora 2nd Custom SSR (appended at end to keep initializer order stable) ——
-  // ssr_mode above is the master toggle (shared with Kai's improved SSR field).
-  float ssr_max_ray_distance;              // [10..2000] world units — global ray-length cap, min'd with material ssrDistance
-  float ssr_thickness;                     // [0..0.2] world-space thickness for hit confidence
-  float ssr_roughness_threshold;           // [0..1] skip SSR on pixels above this roughness
-  float ssr_mirror_bias;                   // [0..0.9] VNDF sampling bias toward mirror direction
-  float ssr_intensity;                     // [0..2] reflection strength
-  float ssr_denoise_radius;                // [0..8] max spatial kernel radius in px
-  float ssr_denoise_taps;                  // [1..16] resolve tap count
-  float ssr_debug_view;                    // 0=Off, 1=HiZ mip0, 2=HiZ mip N, 3=mip conservatism
-  float ssr_debug_mip;                     // [0..7] mip index for debug views 2/3
-  float ssr_deferred_dispatch;             // 0=Inline at lighting draw, 1=OnPresent (1-frame latency)
-  float ssr_frame_skip;                    // 0=Off, N=run every N+1 frames
-  float ssr_half_res_trace;                // reserved (phase 5): 0=Full res, 1=Half res tracing
-  float ssr_radiance_source;               // reserved: 0=colorTexture t0, 1=backbuffer capture
-  float ssr_custom_bound;                  // runtime: t25 holds valid custom SSR data
-  // —— Phase 2.1 traversal diagnostics ——
-  float ssr_bypass_validation;             // 0=Full ValidateHit, 1=in-bounds+finite-depth only
-  float ssr_forced_ray_mode;               // 0=Mirror, 1=Fixed normal, 2=Fixed screen diagonal
-  float ssr_normal_convention;             // canonical: 1=mul(n,view_g) — locked by Phase 2.1 data
-  // —— Phase 2.2 self-hit sweep ——
-  float ssr_self_hit_threshold;            // [0..8] px manhattan threshold for self-intersection reject
-  // —— Phase 2.3 backface A/B ——
-  float ssr_backface_gate;                 // 1=reject backface hits (canonical), 0=accept them (diagnostic)
-  // —— Phase 2.4 initial-advance displacement ——
-  float ssr_initial_advance_bias;          // [0..8] screen-space px minimum for the FIRST depth test
-  // —— Phase 2.7 thickness-gate isolation ——
-  float ssr_thickness_gate;                // 1=reject by thickness confidence (canonical), 0=diagnostic off
-  // —— Phase 2.9 perpendicular-distance metric ——
-  float ssr_thickness_mode;                // canonical: 1=Perpendicular (production baseline)
-  // —— Phase 3 stochastic SSR ——
-  float ssr_stochastic;                    // 1=VNDF production rays, 0=deterministic Mirror (regression mode)
-  float ssr_apply;                         // 1=lighting PS consumes t25 reflection (default OFF until imagery OK)
-  float ssr_apply_gain;                    // diagnostic visibility gain on t25 alpha (return to 1.0 after proof)
-  float ssr_diagnostics;                   // 1=probe atomics + heavy debug payloads ON (TraceStats requires this)
-  float ssr_eligibility_mode;              // 0=Vanilla Flag, 1=Custom Material (default), 2=All opaque world
-  // —— Phase 4 spatial reconstruction ——
-  float ssr_resolve_radius;                // [1..16] max spatial resolve radius in px
-  float ssr_depth_sigma;                   // [0.01..1.0] depth similarity sigma
-  float ssr_normal_sigma;                  // [1..128] normal similarity exponent
-  float ssr_rough_sigma;                   // [0.01..1.0] roughness similarity sigma
-  float ssr_same_surface_reject;           // [0..1] reject same-surface candidates (diagnostic toggle, default OFF)
-  float ssr_plane_delta_threshold;         // world-unit perpendicular-distance threshold for same-plane detection
-  float ssr_roughness_alpha_blend;         // [0..1] rough-surface alpha attenuation toward cubemap
-  float ssr_ray_count;                     // [1..4] stochastic rays per pixel
-  float ssr_rough_interp;                  // 0=perceptual (alpha=r^2, verified vs our lighting BRDF), 1=already alpha
-  float ssr_probe_pixel_x;                 // Phase 3.Fix15 CompareProbe pixel X (read-only probe)
-  float ssr_probe_pixel_y;                 // Phase 3.Fix15 CompareProbe pixel Y
-  float ssr_probe_auto;                    // Phase 3.Fix16 auto-select brightest valid mirror pixel (Stochastic OFF only)
-  float ssr_resolve_enable;                // Phase R1: spatial reconstruction toggle (production t25 source switch)
-  float ssr_max_traversal_steps;           // R-budget A/B: hierarchical march step cap (16-512)
-  float ssr_log_tracestats;                // Trace Stats aggregate dump toggle
-  float ssr_log_probes;                    // GeoProbe/dirProbe/vndfProbe/FootProbe/CompareProbe print toggle
-  float ssr_log_resolve;                   // ResolveProbe/EstimatorProbe/RvS(post) print toggle
-  float ssr_log_config;                    // Phase3Config/Integrate config echo toggle
-  float ssr_log_init;                      // R3 init staged logs / pyramid lifecycle toggle
   // —— Dynamic Cubemaps (Sora 2nd) — Phase 0A/B standalone ———
   float dynCube_enabled;                   // 0=Off (vanilla t17), 1=On (dynamic)
   float dynCube_debug;                     // 0=Off(normal) 1=ShowDynamicCube 2=FaceViz 3=SolidColors 4=NoOverride
@@ -373,6 +317,7 @@ struct ShaderInjectData {
   float dynCube_force_dynamic;                  // 0=off 1=on (debug: dynamic cubemap only)
   float dynCube_force_ssr;                      // 0=off 1=on (debug: SSR only)
   float dynCube_layer_mix;                      // -1=automatic confidence blend, 0..2=manual (0=SSR,1=Dynamic,2=Vanilla)
+  float dynCube_blur;                           // artistic mip-offset blur on the dynamic cube sample (fractional), 0=sharp
 };
 
 #ifndef __cplusplus

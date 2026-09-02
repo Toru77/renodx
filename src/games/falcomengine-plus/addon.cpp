@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -251,59 +251,6 @@ ShaderInjectData shader_injection = {
   .gtvbao_atrous_enabled = 0.f,
   .gtvbao_atrous_depth_sigma = 1.f,
   .gtvbao_atrous_normal_sigma = 32.f,
-  // ── Sora 2nd Custom SSR ──
-  .ssr_max_ray_distance = 300.f,
-  .ssr_thickness = 0.15f,
-  .ssr_roughness_threshold = 0.6f,
-  .ssr_mirror_bias = 0.25f,
-  .ssr_intensity = 1.f,
-  .ssr_denoise_radius = 4.f,
-  .ssr_denoise_taps = 8.f,
-  .ssr_debug_view = 0.f,
-  .ssr_debug_mip = 2.f,
-  .ssr_deferred_dispatch = 0.f,
-  .ssr_frame_skip = 0.f,
-  .ssr_custom_bound = 0.f,
-  // ── Phase 2.1 traversal diagnostics ──
-  .ssr_bypass_validation = 0.f,
-  .ssr_forced_ray_mode = 0.f,
-  .ssr_normal_convention = 1.f,   // canonical (Phase 2.1 data locked mul(n,view_g))
-  // ── Phase 2.2 self-hit sweep ──
-  .ssr_self_hit_threshold = 2.f,
-  // ── Phase 2.3 backface A/B ──
-  .ssr_backface_gate = 1.f,
-  // ── Phase 2.4 initial-advance displacement ──
-  .ssr_initial_advance_bias = 0.f,
-  // ── Phase 2.8 sweep ──
-  .ssr_thickness_gate = 1.f,
-  // ── Phase 2.9/3.0 production baseline (Perpendicular @ 0.15) ──
-  .ssr_thickness_mode = 1.f,
-  // ── Phase 3 stochastic SSR ──
-  .ssr_stochastic = 1.f,
-  .ssr_apply = 0.f,
-  .ssr_apply_gain = 1.f,
-  .ssr_diagnostics = 1.f,
-  .ssr_eligibility_mode = 1.f,
-  // ── Phase 4 spatial reconstruction ──
-  .ssr_resolve_radius = 8.f,
-  .ssr_depth_sigma = 0.1f,
-  .ssr_normal_sigma = 32.f,
-  .ssr_rough_sigma = 0.15f,
-  .ssr_same_surface_reject = 0.f,
-  .ssr_plane_delta_threshold = 0.1f,
-  .ssr_roughness_alpha_blend = 0.f,
-  .ssr_ray_count = 1.f,
-  .ssr_rough_interp = 0.f,
-  .ssr_probe_pixel_x = 960.f,
-  .ssr_probe_pixel_y = 540.f,
-  .ssr_probe_auto = 1.f,
-  .ssr_resolve_enable = 0.f,
-  .ssr_max_traversal_steps = 64.f,
-  .ssr_log_tracestats = 0.f,
-  .ssr_log_probes = 0.f,
-  .ssr_log_resolve = 0.f,
-  .ssr_log_config = 0.f,
-  .ssr_log_init = 0.f,
   // —— Dynamic Cubemaps (Sora 2nd) ——
   .dynCube_enabled = 0.f,
   .dynCube_debug = 0.f,
@@ -338,6 +285,7 @@ ShaderInjectData shader_injection = {
   .dynCube_force_dynamic = 0.f,
   .dynCube_force_ssr = 0.f,
   .dynCube_layer_mix = -1.f,
+  .dynCube_blur = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -356,14 +304,6 @@ constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buff
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
-
-// ── Custom SSR (Sora 2nd) ──
-constexpr uint32_t kLightingSSRCustomRegister = 25u;  // t25 = ssrCustomTexture
-constexpr uint32_t kSSRHizMipLevels = 8u;             // Hi-Z chain mips 0..7
-constexpr uint32_t SSR_RAD_MIP_LEVELS = 8u;           // R3: radiance pyramid mips 0..7
-constexpr uint32_t kSSRPushConstantCount = 42u;       // push constants at b13
-constexpr uint32_t kSSRStatsWidth = 8u;               // atomic counter texture
-constexpr uint32_t kSSRStatsHeight = 29u;
 
 // ── GTVBAO normal tuning globals (separate from ShaderInjectData) ──
 static float g_gtvbao_normal_input_mode     = 1.f;
@@ -606,24 +546,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::sampler isfast_sampler = {};
   bool isfast_texture_loaded = false;
   bool isfast_texture_attempted = false;  // only try DDS load once
-  // ── Phase 3 stochastic SSR captures/resources ──
-  // Phase 3 stochastic SSR captures/resources
-  reshade::api::resource_view captured_mrt_material_srv = {};    // Sora t3 (material idx)
-  reshade::api::resource_view captured_mrt_spec_srv = {};        // Sora t2 (F0/specular)
-  reshade::api::resource_view captured_deferred_params_srv = {}; // t6 StructuredBuffer
-  reshade::api::resource ssr_radiance_copy_texture = {};         // lazy BackBuffer capture
-  reshade::api::resource_view ssr_radiance_copy_srv = {};
-  bool ssr_radiance_copy_created = false;
-  bool ssr_radiance_verify_done = false;                         // one-shot content readback
-  reshade::api::resource ssr_radiance_verify_stage = {};         // 4x4 readback
-  reshade::api::sampler ssr_linear_sampler = {};
-  // Phase 4 spatial reconstruction output
-  reshade::api::resource ssr_output_texture = {};                // RGBA16F WxH
-  reshade::api::resource_view ssr_output_srv = {};
-  reshade::api::resource_view ssr_output_uav = {};
-  reshade::api::pipeline_layout ssr_resolve_layout = {};
-  reshade::api::pipeline ssr_resolve_pipeline = {};
-  GTVBAODescriptorTableSet ssr_resolve_tables = {};
   bool vbgi_bound = false;
   bool foliage_drawn_this_frame = false;  // set by foliage shader on_draw, reset per frame
   // ── GTVBAO: which ao_term buffer holds the latest final AO result ──
@@ -636,69 +558,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t last_uav0_handle = 0u;
   uint64_t last_cbv_handle = 0u;
   uint64_t last_sampler_handle = 0u;
-
-  // ── Custom SSR (Sora 2nd) ──
-  reshade::api::resource ssr_hiz_texture = {};   // R32F chain, mips 0..kSSRHizMipLevels-1
-  reshade::api::resource_view ssr_hiz_srv = {};  // full-chain SRV
-  std::array<reshade::api::resource_view, kSSRHizMipLevels> ssr_hiz_uavs = {};
-  reshade::api::resource ssr_hiz_scratch_texture = {};      // full-res R32F, reduce input (SRV only)
-  reshade::api::resource_view ssr_hiz_scratch_srv = {};
-  reshade::api::resource ssr_debug_texture = {};            // RGBA8 debug output
-  reshade::api::resource_view ssr_debug_srv = {};
-  reshade::api::resource_view ssr_debug_uav = {};
-  // Phase 2: per-pixel trace result — rgb = debug payload, a = confidence.
-  reshade::api::resource ssr_ray_result_texture = {};       // RGBA16F WxH
-  reshade::api::resource ssr_ray_meta_texture = {};         // R2C: RGBA16F pdf/dist/dir
-  reshade::api::resource_view ssr_ray_meta_srv = {};
-  reshade::api::resource_view ssr_ray_meta_uav = {};
-  // Phase R3: filtered radiance pyramid (RGBA16F, 8 mips) + scratch.
-  reshade::api::resource ssr_rad_pyr_texture = {};
-  reshade::api::resource_view ssr_rad_pyr_srv = {};
-  reshade::api::resource_view ssr_rad_pyr_uavs[8] = {};   // mips 0..7
-  reshade::api::resource_view ssr_rad_scratch_srv = {};
-  reshade::api::resource ssr_rad_scratch_texture = {};
-  reshade::api::pipeline ssr_rad_base_pipeline = {};
-  reshade::api::pipeline ssr_rad_reduce_pipeline = {};
-  bool ssr_rad_created = false;
-  bool ssr_rad_pyr_valid = false;
-  bool ssr_rad_pipelines_ok = false;
-  bool ssr_rad_pipelines_diag = false;
-  // Phase R3-MV: DLSS motion vector capture.
-  reshade::api::resource_view captured_motion_srv = {};
-  float captured_mv_scale_x = 0.f;
-  float captured_mv_scale_y = 0.f;
-  bool motion_captured = false;
-  reshade::api::resource_view ssr_ray_result_srv = {};
-  reshade::api::resource_view ssr_ray_result_uav = {};
-  // Phase 2.1: atomic funnel counters (8x4 R32_UINT) + readback staging.
-  reshade::api::resource ssr_stats_texture = {};
-  reshade::api::resource_view ssr_stats_uav = {};
-  reshade::api::resource ssr_stats_stage = {};
-  // Phase 3.Fix19: resolve dispatch state + t25 source selection.
-  bool ssr_resolved_this_frame = false;
-  // Phase 3.Fix16: CompareProbe auto-selection staging + frozen pixel state.
-  reshade::api::resource ssr_probe_stage = {};
-  bool ssr_probe_has_selection = false;
-  float ssr_probe_frozen_x = 960.f;
-  float ssr_probe_frozen_y = 540.f;
-  // Readback staging for one-shot numeric Hi-Z verification (debug mode 4):
-  // chained check of mip1..mip3 against their immediately preceding mip.
-  std::array<reshade::api::resource, 4> ssr_verify_stages = {};
-  bool ssr_resources_created = false;
-  uint32_t last_created_ssr_width = 0u;
-  uint32_t last_created_ssr_height = 0u;
-  // All SSR passes share an identical signature: 1 SRV in, 1 UAV out.
-  reshade::api::pipeline_layout ssr_common_layout = {};
-  reshade::api::pipeline ssr_hiz_base_pipeline = {};
-  reshade::api::pipeline ssr_hiz_reduce_pipeline = {};
-  reshade::api::pipeline ssr_debug_pipeline = {};
-  GTVBAODescriptorTableSet ssr_common_tables = {};
-  // Phase 2 trace: 3 SRVs (Hi-Z chain, hardware depth, MRT normals) + 2 UAVs.
-  reshade::api::pipeline_layout ssr_trace_layout = {};
-  reshade::api::pipeline ssr_trace_pipeline = {};
-  GTVBAODescriptorTableSet ssr_trace_tables = {};
-  bool ssr_stats_done = false;   // one-shot latch for Trace Stats report
-  bool ssr_verify_done = false;   // one-shot latch for numeric verification
 
   // ── Dynamic Cubemaps (Sora 2nd) — Phase 0A/B + Phase 1 history ──
   // Aliases to the current (just-written) history set — dyncube_srv is the cube SRV for t17.
@@ -756,6 +615,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   DynCubePhase dyncube_phase = DynCubePhase::Done;
   uint64_t dyncube_next_update_frame = 0;                // next frame a capture may begin
   uint64_t dyncube_sched_frame = UINT64_MAX;             // last present frame the scheduler ran
+  // Actual GPU-work counters (prove capture/filter frequency; reported in the throttled log).
+  uint64_t dyncube_capture_dispatches = 0;               // RunDynCubeCapture dispatched
+  uint64_t dyncube_filter_updates = 0;                   // RunDynCubeFilter completed
+  uint64_t dyncube_ggx_mip_dispatches = 0;               // GGX per-mip dispatches issued
+  uint64_t dyncube_face_copies = 0;                      // 6-face mip0 copies issued
   reshade::api::pipeline_layout dyncube_ggx_layout = {};
   reshade::api::pipeline dyncube_ggx_pipeline = {};
   GTVBAODescriptorTableSet dyncube_ggx_tables = {};
@@ -786,21 +650,7 @@ static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data
 static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* data);
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
-// ── Custom SSR (Sora 2nd) — Phase 1: Hi-Z pyramid ──
-static void CreateSSRResources(reshade::api::device* device, DeviceData* data,
-                               uint32_t gw, uint32_t gh);
-static void DestroySSRResources(reshade::api::device* device, DeviceData* data);
-static bool CreateSSRPipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
-static bool RunSSRHiZ(reshade::api::command_list* cmd_list, DeviceData* data);
-static bool RunSSRTrace(reshade::api::command_list* cmd_list, DeviceData* data);
-static bool RunSSRResolve(reshade::api::command_list* cmd_list, DeviceData* data);
-static bool RunSSRRadiancePyramid(reshade::api::command_list* cmd_list, DeviceData* data);
-static float SSR_TranslateDebugView(float slider_value);
-static bool SSR_IsRawVsResolvedView(float translated_debug);
-static bool SSR_IsMotionVectorView(float translated_debug);
-static void SSR_LogTraceStats(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
-static void SSR_LogTraceStats(reshade::api::command_list* cmd_list, DeviceData* data);
 // ── Dynamic Cubemaps — forward decls ──
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size);
 static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d);
@@ -837,20 +687,22 @@ static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
 static bool OnBeforeShadowCSMDraw(reshade::api::command_list* cmd_list) {
   SyncISFASTToShaderInjection(cmd_list);
   // Push IS-FAST noise texture at t3 (same pattern as t22 in lighting shader)
-  if (auto* dev = cmd_list->get_device()) {
-    if (auto* d = dev->get_private_data<DeviceData>()) {
-      reshade::api::resource_view srv = d->isfast_noise_srv.handle
-          ? d->isfast_noise_srv : d->fallback_srv;
-      if (srv.handle) {
-        cmd_list->push_descriptors(
-            reshade::api::shader_stage::pixel,
-            reshade::api::pipeline_layout{0},
-            0,
-            reshade::api::descriptor_table_update{
-                {}, 3u, 0, 1,
-                reshade::api::descriptor_type::texture_shader_resource_view,
-                &srv,
-            });
+  if (g_isfast_enabled > 0.5f) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (auto* d = dev->get_private_data<DeviceData>()) {
+        reshade::api::resource_view srv = d->isfast_noise_srv.handle
+            ? d->isfast_noise_srv : d->fallback_srv;
+        if (srv.handle) {
+          cmd_list->push_descriptors(
+              reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0},
+              0,
+              reshade::api::descriptor_table_update{
+                  {}, 3u, 0, 1,
+                  reshade::api::descriptor_type::texture_shader_resource_view,
+                  &srv,
+              });
+        }
       }
     }
   }
@@ -881,19 +733,21 @@ static void SyncVolFogISFASTToShaderInjection(reshade::api::command_list* cmd_li
 static bool OnBeforeVolFogDraw(reshade::api::command_list* cmd_list) {
   SyncVolFogISFASTToShaderInjection(cmd_list);
   // Push IS-FAST noise texture at t3 (same pattern as shadow shader at t3)
-  if (auto* dev = cmd_list->get_device()) {
-    if (auto* d = dev->get_private_data<DeviceData>()) {
-      reshade::api::resource_view srv = d->isfast_noise_srv.handle
-          ? d->isfast_noise_srv : d->fallback_srv;
-      if (srv.handle) {
-        cmd_list->push_descriptors(
-            reshade::api::shader_stage::pixel,
-            reshade::api::pipeline_layout{0}, 0,
-            reshade::api::descriptor_table_update{
-                {}, 3u, 0, 1,
-                reshade::api::descriptor_type::texture_shader_resource_view,
-                &srv,
-            });
+  if (g_isfast_enabled > 0.5f) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (auto* d = dev->get_private_data<DeviceData>()) {
+        reshade::api::resource_view srv = d->isfast_noise_srv.handle
+            ? d->isfast_noise_srv : d->fallback_srv;
+        if (srv.handle) {
+          cmd_list->push_descriptors(
+              reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0}, 0,
+              reshade::api::descriptor_table_update{
+                  {}, 3u, 0, 1,
+                  reshade::api::descriptor_type::texture_shader_resource_view,
+                  &srv,
+              });
+        }
       }
     }
   }
@@ -913,19 +767,21 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
     }
   }
   // Push IS-FAST noise texture at t15 (Kai's volfog register)
-  if (auto* dev = cmd_list->get_device()) {
-    if (auto* d = dev->get_private_data<DeviceData>()) {
-      reshade::api::resource_view srv = d->isfast_noise_srv.handle
-          ? d->isfast_noise_srv : d->fallback_srv;
-      if (srv.handle) {
-        cmd_list->push_descriptors(
-            reshade::api::shader_stage::pixel,
-            reshade::api::pipeline_layout{0}, 0,
-            reshade::api::descriptor_table_update{
-                {}, 15u, 0, 1,
-                reshade::api::descriptor_type::texture_shader_resource_view,
-                &srv,
-            });
+  if (g_isfast_enabled > 0.5f) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (auto* d = dev->get_private_data<DeviceData>()) {
+        reshade::api::resource_view srv = d->isfast_noise_srv.handle
+            ? d->isfast_noise_srv : d->fallback_srv;
+        if (srv.handle) {
+          cmd_list->push_descriptors(
+              reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0}, 0,
+              reshade::api::descriptor_table_update{
+                  {}, 15u, 0, 1,
+                  reshade::api::descriptor_type::texture_shader_resource_view,
+                  &srv,
+              });
+        }
       }
     }
   }
@@ -936,7 +792,7 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list) {
   // Character shader reads shader_injection_data automatically via b13 injection.
   // Push IS-FAST noise at t15 (Kai char shader uses it; Daybreak 2 char does not).
-  if (!IsDaybreak2()) {
+  if (!IsDaybreak2() && g_isfast_enabled > 0.5f) {
     if (auto* dev = cmd_list->get_device()) {
       if (auto* d = dev->get_private_data<DeviceData>()) {
         reshade::api::resource_view srv = d->isfast_noise_srv.handle
@@ -3097,6 +2953,14 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeBlur", .binding = &shader_injection.dynCube_blur,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
+      .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
+      .min = 0.f, .max = 8.f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeUpdateInterval", .binding = &shader_injection.dynCube_capture_interval,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
@@ -3395,7 +3259,6 @@ static void OnDestroyDevice(reshade::api::device* device) {
   auto* d = device->get_private_data<DeviceData>();
   if (d) {
     DestroyGTVBAOResources(device, d);
-    DestroySSRResources(device, d);
     DestroyDynCubeResources(device, d);
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
@@ -3413,7 +3276,6 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
     d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
     DestroyGTVBAOResources(sc->get_device(), d);
-    DestroySSRResources(sc->get_device(), d);
     DestroyDynCubeResources(sc->get_device(), d);
   }
 }
@@ -3427,12 +3289,10 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
     d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
     d->resources_created = false;
-    DestroySSRResources(sc->get_device(), d);
     DestroyDynCubeResources(sc->get_device(), d);
     return;
   }
   DestroyGTVBAOResources(sc->get_device(), d);
-  DestroySSRResources(sc->get_device(), d);
   DestroyDynCubeResources(sc->get_device(), d);
 }
 
@@ -3480,6 +3340,13 @@ static void OnPushDescriptorsCapture(
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
   if (!cmd_list) return;
+  // Fast path: no feature consumes the captured snapshots -> skip ALL capture work.
+  // (Fired on every push_descriptors in the frame; without this gate the body below
+  //  runs thousands of times per frame even when every addon feature is disabled.)
+  if (shader_injection.gtvbao_mode < 0.5f
+      && shader_injection.dynCube_enabled < 0.5f) {
+    return;
+  }
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
@@ -3526,29 +3393,6 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    // Phase 3: Sora 2nd F0/specular texture (mrtTexture1 @ t2).
-    if (update.binding == 2u && IsSora2nd() && update.count >= 1
-        && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xCA3D8596u) {
-          d->captured_mrt_spec_srv = views[0];
-        }
-      }
-    }
-    // Phase 3: Sora 2nd material-index texture (mrtTexture2 @ t3).
-    // Gated to Sora2nd: Kai binds its depth buffer at the same register.
-    if (update.binding == 3u && IsSora2nd() && update.count >= 1
-        && views[0].handle != 0u) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0xCA3D8596u) {
-          d->captured_mrt_material_srv = views[0];
-        }
-      }
-    }
     // Capture t0 color texture — ONLY from the lighting shader (hash 0xFDAAF80E).
     // Unconditional capture would grab binding 0 from any shader, causing wrong colors.
     if (update.binding == 0u && update.count >= 1
@@ -3592,20 +3436,6 @@ static void OnPushDescriptorsCapture(
       }
     }
   }
-  // Phase 3: capture the deferred-parameter StructuredBuffer (Sora t6).
-  if (update.type == reshade::api::descriptor_type::buffer_shader_resource_view
-      || update.type == reshade::api::descriptor_type::shader_resource_view) {
-    auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-    uint32_t hash = ss ? renodx::utils::shader::GetCurrentPixelShaderHash(ss) : 0u;
-    if ((hash == 0xCA3D8596u || IsLightingShader(hash))
-        && update.binding == 6u && update.count >= 1) {
-      auto* views6 = static_cast<const reshade::api::resource_view*>(update.descriptors);
-      if (views6[0].handle != 0u) {
-        d->captured_deferred_params_srv = views6[0];
-      }
-    }
-  }
-
   // ── Per-draw gating (only when GTVBAO or SSGI is on). ──
   if (shader_injection.gtvbao_mode < 0.5f) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
@@ -3619,6 +3449,8 @@ static void OnBindDescriptorTables(
     reshade::api::pipeline_layout layout,
     uint32_t first, uint32_t count,
     const reshade::api::descriptor_table* tables) {
+  // Fast path: GTVBAO is the only consumer of these captures.
+  if (shader_injection.gtvbao_mode < 0.5f) return;
   if (!cmd_list || !tables || count == 0u) return;
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
@@ -3632,8 +3464,6 @@ static void OnBindDescriptorTables(
       (std::string("[GTVBAO] bind_descriptor_tables: first=") +
       std::to_string(first) + ", count=" + std::to_string(count)).c_str());
   }
-
-  if (shader_injection.gtvbao_mode < 0.5f) return;
 
   // Only capture on pixel-stage draws.
   const uint32_t sm = static_cast<uint32_t>(stages);
@@ -3810,10 +3640,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
   }
 
-  // DynCube can dispatch independently of GTVBAO/SSR — must not early-out
+  // DynCube can dispatch independently of GTVBAO — must not early-out
   const bool dynCube_present_active = shader_injection.dynCube_enabled > 0.5f;
-  const bool sora_ssr_present_active = IsSora2nd() && shader_injection.ssr_mode > 0.5f;
-  if (shader_injection.gtvbao_mode < 0.5f && !sora_ssr_present_active && !dynCube_present_active) return;
+  if (shader_injection.gtvbao_mode < 0.5f && !dynCube_present_active) return;
   if (d->frame_index <= kGTVBAOStartupGuardFrames) {
     if (d->frame_index == kGTVBAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
@@ -3857,14 +3686,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
       d->resources_created = true;
-      // Custom SSR resources follow the same lifecycle (Sora 2nd only).
-      if (IsSora2nd() && shader_injection.ssr_mode > 0.5f) {
-        CreateSSRResources(dev, d, gw, gh);
-        reshade::log::message(reshade::log::level::info,
-          (std::string("[SSR] Resources created: ") +
-           std::to_string(gw) + "x" + std::to_string(gh) +
-           ", hiz mips=" + std::to_string(kSSRHizMipLevels)).c_str());
-      }
       reshade::log::message(reshade::log::level::info,
         (std::string("[GTVBAO] Resources created: ") +
          std::to_string(d->working_width) + "x" +
@@ -3918,110 +3739,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->captured_light_buffer_valid = true;
   };
 
-  // ── Phase 3: BackBuffer radiance capture for SSR Radiance Source = BackBuffer ──
-  // Copies the fully-lit final image for NEXT frame's inline trace (the
-  // standard one-frame-stale semantics; identical lifecycle to VBGI's
-  // light-buffer capture). Created lazily on first use.
-  auto ssr_capture_radiance = [&]() {
-    if (!(IsSora2nd() && shader_injection.ssr_mode > 0.5f
-          && shader_injection.ssr_radiance_source > 0.5f))
-      return;
-    auto bb = sc->get_back_buffer(0);
-    if (!bb.handle) return;
-    if (!d->ssr_radiance_copy_created) {
-      auto bd = dev->get_resource_desc(bb);
-      reshade::api::resource_desc rd = {};
-      rd.type = reshade::api::resource_type::texture_2d;
-      rd.texture = {bd.texture.width, bd.texture.height, 1, 1, bd.texture.format, 1};
-      rd.heap = reshade::api::memory_heap::gpu_only;
-      // Initial state = copy_dest: first barrier below then transitions to SRV.
-      rd.usage = reshade::api::resource_usage::copy_dest
-               | reshade::api::resource_usage::shader_resource;
-      if (!dev->create_resource(rd, nullptr,
-                                reshade::api::resource_usage::copy_dest,
-                                &d->ssr_radiance_copy_texture))
-        return;
-      dev->create_resource_view(d->ssr_radiance_copy_texture,
-                                reshade::api::resource_usage::shader_resource,
-                                reshade::api::resource_view_desc(
-                                    reshade::api::resource_view_type::texture_2d,
-                                    bd.texture.format, 0, 1, 0, 1),
-                                &d->ssr_radiance_copy_srv);
-      d->ssr_radiance_copy_created = true;
-      // One-shot readback verification staging (4x4).
-      reshade::api::resource_desc rv = {};
-      rv.type = reshade::api::resource_type::texture_2d;
-      rv.texture = {4u, 4u, 1, 1, bd.texture.format, 1};
-      rv.heap = reshade::api::memory_heap::gpu_to_cpu;
-      rv.usage = reshade::api::resource_usage::copy_dest;
-      dev->create_resource(rv, nullptr, reshade::api::resource_usage::copy_dest,
-                           &d->ssr_radiance_verify_stage);
-      std::ostringstream cl;
-      cl << "[SSR] BackBuffer radiance capture created. fmt="
-         << (uint32_t)bd.texture.format << " dims=" << bd.texture.width
-         << "x" << bd.texture.height;
-      reshade::log::message(reshade::log::level::info, cl.str().c_str());
-    }
-    const auto CSRC = reshade::api::resource_usage::copy_source;
-    const auto CD = reshade::api::resource_usage::copy_dest;
-    const auto SRVU = reshade::api::resource_usage::shader_resource;
-    cl->barrier(bb, reshade::api::resource_usage::present, CSRC);
-    cl->barrier(d->ssr_radiance_copy_texture, SRVU, CD);
-    cl->copy_texture_region(bb, 0u, nullptr, d->ssr_radiance_copy_texture, 0u, nullptr);
-
-    // One-shot content verification: read back a 4x4 sample and log averages.
-    if (!d->ssr_radiance_verify_done && d->ssr_radiance_verify_stage.handle) {
-      d->ssr_radiance_verify_done = true;
-      cl->barrier(d->ssr_radiance_copy_texture, CD, CD);   // still copy-dest here
-      cl->copy_texture_region(d->ssr_radiance_copy_texture, 0u, nullptr,
-                              d->ssr_radiance_verify_stage, 0u, nullptr);
-      reshade::api::subresource_data sd = {};
-      if (dev->map_texture_region(d->ssr_radiance_verify_stage, 0u, nullptr,
-                                  reshade::api::map_access::read_only, &sd) && sd.data) {
-        double r = 0, g = 0, b = 0; uint32_t n = 0;
-        for (uint32_t y = 0; y < 4u; ++y) {
-          const auto* row = reinterpret_cast<const uint16_t*>(
-              static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(y) * sd.row_pitch);
-          for (uint32_t x = 0; x < 4u; ++x) {
-            // Half-float decode (RGBA16F).
-            auto h2f = [](uint16_t h) -> float {
-              uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-              uint32_t e = (h >> 10) & 0x1Fu;
-              uint32_t m = h & 0x03FFu;
-              uint32_t bits;
-              if (e == 0)      bits = sign;                              // zero
-              else if (e == 31) bits = sign | 0x7F800000u | (m << 13);   // inf/nan
-              else {
-                uint32_t ee = e - 15u + 127u;
-                bits = sign | (ee << 23) | (m << 13);
-              }
-              float f; memcpy(&f, &bits, 4); return f;
-            };
-            r += h2f(row[x * 4 + 0]); g += h2f(row[x * 4 + 1]); b += h2f(row[x * 4 + 2]);
-            ++n;
-          }
-        }
-        dev->unmap_texture_region(d->ssr_radiance_verify_stage, 0u);
-        std::ostringstream v;
-        v << "[SSR] radCopy verify: avgRGB=" << (r / n) << "," << (g / n)
-          << "," << (b / n) << " over " << n << " samples"
-          << (n ? "" : " (READBACK FAILED)");
-        reshade::log::message(reshade::log::level::info, v.str().c_str());
-      } else {
-        dev->unmap_texture_region(d->ssr_radiance_verify_stage, 0u);
-        reshade::log::message(reshade::log::level::warning,
-            "[SSR] radCopy verify: map unavailable.");
-      }
-    }
-
-    cl->barrier(d->ssr_radiance_copy_texture, CD, SRVU);
-    cl->barrier(bb, CSRC, reshade::api::resource_usage::present);
-  };
-
   // Inline dispatch active (deferred off) — GTVBAO runs during lighting pass, not here.
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     capture_light_buffer_for_next_frame();
-    ssr_capture_radiance();
     // DynCube debug face preview — must run even when GTVBAO deferred off
     if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
         && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
@@ -4064,7 +3784,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (!d->deferred_scene_cbv_valid
       || (d->frame_index - d->deferred_scene_cbv_frame) > 1u) {
     capture_light_buffer_for_next_frame();
-    ssr_capture_radiance();
     if (shader_injection.gtvbao_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::warning,
                             "[GTVBAO] Dispatch skipped: no deferred scene CBV.");
@@ -4099,19 +3818,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   bool ok = true;
   if (shader_injection.gtvbao_mode > 0.5f) ok = RunGTVBAO(cl, d);
 
-  // ── Custom SSR (Sora 2nd): deferred Hi-Z build + trace (mirrors GTVBAO deferral). ──
-  // Requires the CPU-Opt "Deferred Dispatch" machinery to be active, since it
-  // reuses its captured snapshots; otherwise the inline lighting-draw path
-  // already ran this frame.
-  if (sora_ssr_present_active && shader_injection.ssr_deferred_dispatch > 0.5f
-      && d->ssr_resources_created && d->captured_depth_srv.handle) {
-  RunSSRHiZ(cl, d);
-  RunSSRTrace(cl, d);
-  RunSSRRadiancePyramid(cl, d);
-  // Phase R1: spatial reconstruction (gated by Spatial Resolve toggle).
-  RunSSRResolve(cl, d);
-  }
-
   // Restore: apply dispatch fix, then restore previous state.
   ApplyGTVBAOCSDispatchFix(cl, cs, prev);
 
@@ -4130,7 +3836,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   // ── Capture light buffer for next frame's multi-bounce (after GI applied) ──
   capture_light_buffer_for_next_frame();
-  ssr_capture_radiance();
 
   // ── DynCube debug face preview — samples capture resources directly (not t17) ──
   if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
@@ -4210,10 +3915,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // Dynamic Cubemaps — standalone, must run even when GTVBAO/SSR off (any Falcom title)
   const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f;
-  // Custom SSR (Sora 2nd) runs independently of GTVBAO.
-  const bool sora_custom_ssr_active = IsSora2nd() && shader_injection.ssr_mode > 0.5f;
   const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f;
-  if (!gtvbao_active && !sora_custom_ssr_active && !dyncube_active) return true;
+  if (!gtvbao_active && !dyncube_active) return true;
   if (!cmd_list) return true;
 
   auto* dev = cmd_list->get_device();
@@ -4246,23 +3949,6 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
       ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
       (void)ok;
-    }
-  }
-
-  // ── Custom SSR (Sora 2nd): inline Hi-Z build + trace (default — no added latency). ──
-  if (sora_custom_ssr_active && shader_injection.ssr_deferred_dispatch < 0.5f) {
-    if (dd->captured_depth_srv.handle && dd->ssr_resources_created) {
-      auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-      renodx::utils::state::CommandListState prev = {};
-      if (cs) prev = *cs;
-
-  RunSSRHiZ(cmd_list, dd);
-  RunSSRTrace(cmd_list, dd);
-  RunSSRRadiancePyramid(cmd_list, dd);
-  // Phase R1: spatial reconstruction (gated by Spatial Resolve toggle).
-  RunSSRResolve(cmd_list, dd);
-
-      ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
     }
   }
 
@@ -4428,6 +4114,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           msg += " res=" + std::to_string(wantSize);
           msg += " ssr=" + std::to_string((int)shader_injection.dynCube_ssr_enabled);
           msg += " ggxValid=" + std::string(dd->dyncube_ggx_valid ? "1" : "0");
+          msg += " capTot=" + std::to_string(dd->dyncube_capture_dispatches);
+          msg += " fltTot=" + std::to_string(dd->dyncube_filter_updates);
+          msg += " ggxMips=" + std::to_string(dd->dyncube_ggx_mip_dispatches);
+          msg += " faceCpy=" + std::to_string(dd->dyncube_face_copies);
           reshade::log::message(reshade::log::level::info, msg.c_str());
         }
       }
@@ -4482,52 +4172,6 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
   }
 
-  // ── Custom SSR (Sora 2nd): t25 transport. ──────────────────────────────
-  // Debug View != Off -> debug/ray textures via the PS early-out.
-  // Apply To Scene ON  -> ray_result consumed by the specular blend.
-  // BOTH require ssr_custom_bound=1 or the PS ignores t25 entirely.
-  shader_injection.ssr_custom_bound = 0.f;
-  if (sora_custom_ssr_active) {
-    const bool debug_active = shader_injection.ssr_debug_view > 0.5f;
-    const bool trace_view = shader_injection.ssr_debug_view > 4.5f;
-    // Phase 3.Fix20 partial-revert: production t25 = raw ssr_ray_result_srv.
-    // The resolve output is no longer consumed in production.
-    reshade::api::resource_view ssr_push_srv = dd->ssr_ray_result_srv;   // production raw
-    // Phase R1: resolved output takes precedence when resolve ran this frame.
-    if (dd->ssr_resolved_this_frame && dd->ssr_output_srv.handle)
-      ssr_push_srv = dd->ssr_output_srv;
-    if (debug_active && !trace_view) ssr_push_srv = dd->ssr_debug_srv;   // HiZ views 1..4
-    if (!ssr_push_srv.handle) ssr_push_srv = dd->fallback_srv;
-    if (ssr_push_srv.handle) {
-      cmd_list->push_descriptors(
-          reshade::api::shader_stage::pixel,
-          reshade::api::pipeline_layout{0},
-          0,
-          reshade::api::descriptor_table_update{
-              {}, kLightingSSRCustomRegister, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view, &ssr_push_srv,
-          });
-      shader_injection.ssr_custom_bound = 1.f;
-      // One-shot integration diagnostic on Apply state transitions.
-      static int s_last_apply = -1;
-      const int apply_now = (int)shader_injection.ssr_apply;
-      if (apply_now != s_last_apply && shader_injection.ssr_log_config > 0.5f) {
-        s_last_apply = apply_now;
-        auto rt = dd->ssr_ray_result_texture.handle
-            ? dev->get_resource_desc(dd->ssr_ray_result_texture)
-            : reshade::api::resource_desc{};
-        reshade::log::message(reshade::log::level::info,
-            (std::string("[SSR] Integrate: apply=") + std::to_string(apply_now)
-             + " bound=1 radSrc="
-             + std::to_string((int)shader_injection.ssr_radiance_source)
-             + " rayTex=" + std::to_string(rt.texture.width) + "x"
-             + std::to_string(rt.texture.height)
-             + " (reflections require vanilla SSR-eligible pixels: MRT flag bit 1)"
-            ).c_str());
-      }
-    }
-  }
-
   return true;
 }
 
@@ -4554,10 +4198,6 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     sd.filter = reshade::api::filter_mode::min_mag_mip_point;
     sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
     dev->create_sampler(sd, &d->point_clamp_sampler);
-    reshade::api::sampler_desc ld = {};
-    ld.filter = reshade::api::filter_mode::min_mag_mip_linear;
-    ld.address_u = ld.address_v = ld.address_w = reshade::api::texture_address_mode::clamp;
-    dev->create_sampler(ld, &d->ssr_linear_sampler);
   }
   {
     reshade::api::resource_desc rd = {};
@@ -4673,287 +4313,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
 
 // ═══════════ Custom SSR (Sora 2nd) — Phase 1: Hi-Z pyramid ═══════════
 
-static void DestroySSRResources(reshade::api::device* dev, DeviceData* d) {
-  if (!dev || !d) return;
-  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
-  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  for (auto& u : d->ssr_hiz_uavs) dv(u);
-  dv(d->ssr_hiz_srv);
-  dr(d->ssr_hiz_texture);
-  dv(d->ssr_hiz_scratch_srv);
-  dr(d->ssr_hiz_scratch_texture);
-  dv(d->ssr_debug_srv); dv(d->ssr_debug_uav);
-  dr(d->ssr_debug_texture);
-  dv(d->ssr_ray_result_srv); dv(d->ssr_ray_result_uav);
-  dr(d->ssr_ray_result_texture);
-  dv(d->ssr_ray_meta_srv); dv(d->ssr_ray_meta_uav); dr(d->ssr_ray_meta_texture);
-  dv(d->ssr_rad_pyr_srv); dr(d->ssr_rad_pyr_texture);
-  for (auto& u : d->ssr_rad_pyr_uavs) dv(u);
-  dv(d->ssr_rad_scratch_srv); dr(d->ssr_rad_scratch_texture);
-  d->ssr_rad_created = false; d->ssr_rad_pyr_valid = false;
-  dv(d->ssr_stats_uav);
-  dr(d->ssr_stats_texture);
-  dr(d->ssr_stats_stage);
-  dr(d->ssr_probe_stage);
-  dv(d->ssr_radiance_copy_srv); dr(d->ssr_radiance_copy_texture);
-  d->ssr_radiance_copy_created = false;
-  dr(d->ssr_radiance_verify_stage);
-  if (d->ssr_linear_sampler.handle) { dev->destroy_sampler(d->ssr_linear_sampler); d->ssr_linear_sampler = {}; }
-  dv(d->ssr_output_srv); dv(d->ssr_output_uav); dr(d->ssr_output_texture);
-  // Resolve pipeline/layout/tables are resolution-independent — kept alive.
-  for (auto& s : d->ssr_verify_stages) dr(s);
-  // Pipelines/layouts/tables are resolution-independent — kept alive across resizes.
-  d->ssr_resources_created = false;
-}
 
-static void CreateSSRResources(reshade::api::device* dev, DeviceData* d,
-                               uint32_t gw, uint32_t gh) {
-  DestroySSRResources(dev, d);
-  uint32_t w = gw < 64u ? 64u : gw;
-  uint32_t h = gh < 64u ? 64u : gh;
-
-  {
-    reshade::api::resource_desc rd = {};
-    rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {w, h, 1, (uint16_t)kSSRHizMipLevels, reshade::api::format::r32_float, 1};
-    rd.heap = reshade::api::memory_heap::gpu_only;
-    rd.usage = reshade::api::resource_usage::shader_resource
-             | reshade::api::resource_usage::unordered_access
-             | reshade::api::resource_usage::copy_source;
-    dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                         &d->ssr_hiz_texture);
-    dev->create_resource_view(d->ssr_hiz_texture, reshade::api::resource_usage::shader_resource,
-                              reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                               reshade::api::format::r32_float,
-                                                               0, kSSRHizMipLevels, 0, 1),
-                              &d->ssr_hiz_srv);
-    for (uint32_t m = 0; m < kSSRHizMipLevels; ++m)
-      dev->create_resource_view(d->ssr_hiz_texture, reshade::api::resource_usage::unordered_access,
-                                reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
-                                                                 reshade::api::format::r32_float, m, 1, 0, 1),
-                                &d->ssr_hiz_uavs[m]);
-  }
-  {
-    reshade::api::resource_desc rd = {};
-    rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {w, h, 1, 1, reshade::api::format::r32_float, 1};
-    rd.heap = reshade::api::memory_heap::gpu_only;
-    // Scratch is read-only from shader perspective: SRV only. It is refreshed
-    // exclusively via copy_texture_region, which has no SRV/UAV exclusivity rule.
-    rd.usage = reshade::api::resource_usage::shader_resource
-             | reshade::api::resource_usage::copy_dest;
-    dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                         &d->ssr_hiz_scratch_texture);
-    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d,
-                                        reshade::api::format::r32_float, 0, 1, 0, 1);
-    dev->create_resource_view(d->ssr_hiz_scratch_texture,
-                              reshade::api::resource_usage::shader_resource, vd,
-                              &d->ssr_hiz_scratch_srv);
-  }
-  {
-    // Readback staging for the one-shot numeric verification (debug mode 4):
-    // one texture per chain mip 0..3 so each level can be checked against its
-    // immediate predecessor with reducer-identical semantics.
-    for (uint32_t i = 0; i < 4; ++i) {
-      const uint32_t sw = (w >> i) > 0 ? (w >> i) : 1u;
-      const uint32_t sh = (h >> i) > 0 ? (h >> i) : 1u;
-      reshade::api::resource_desc rd = {};
-      rd.type = reshade::api::resource_type::texture_2d;
-      rd.texture = {sw, sh, 1, 1, reshade::api::format::r32_float, 1};
-      rd.heap = reshade::api::memory_heap::gpu_to_cpu;
-      rd.usage = reshade::api::resource_usage::copy_dest;
-      dev->create_resource(rd, nullptr, reshade::api::resource_usage::copy_dest,
-                           &d->ssr_verify_stages[i]);
-    }
-  }
-  {
-    reshade::api::resource_desc rd = {};
-    rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {w, h, 1, 1, reshade::api::format::r8g8b8a8_unorm, 1};
-    rd.heap = reshade::api::memory_heap::gpu_only;
-    rd.usage = reshade::api::resource_usage::shader_resource
-             | reshade::api::resource_usage::unordered_access;
-    dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                         &d->ssr_debug_texture);
-    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d,
-                                        reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1);
-    dev->create_resource_view(d->ssr_debug_texture,
-                              reshade::api::resource_usage::shader_resource, vd,
-                              &d->ssr_debug_srv);
-    dev->create_resource_view(d->ssr_debug_texture,
-                              reshade::api::resource_usage::unordered_access, vd,
-                              &d->ssr_debug_uav);
-  }
-  {
-    // Phase 2 trace output (RGBA16F: rgb = debug payload, a = confidence).
-    reshade::api::resource_desc rd = {};
-    rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {w, h, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
-    rd.heap = reshade::api::memory_heap::gpu_only;
-    rd.usage = reshade::api::resource_usage::shader_resource
-             | reshade::api::resource_usage::unordered_access;
-    dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                         &d->ssr_ray_result_texture);
-    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d,
-                                        reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
-      dev->create_resource_view(d->ssr_ray_result_texture,
-                                reshade::api::resource_usage::shader_resource, vd,
-                                &d->ssr_ray_result_srv);
-      dev->create_resource_view(d->ssr_ray_result_texture,
-                                reshade::api::resource_usage::unordered_access, vd,
-                                &d->ssr_ray_result_uav);
-      // Phase R2C: per-ray estimator metadata (RGBA16F:
-      // r=pdf_L, g=hit view-distance, ba=octahedral view-space direction).
-      reshade::api::resource_desc rm = {};
-      rm.type = reshade::api::resource_type::texture_2d;
-      rm.texture = {w, h, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
-      rm.heap = reshade::api::memory_heap::gpu_only;
-      rm.usage = reshade::api::resource_usage::shader_resource
-               | reshade::api::resource_usage::unordered_access;
-      dev->create_resource(rm, nullptr, reshade::api::resource_usage::shader_resource,
-                           &d->ssr_ray_meta_texture);
-      dev->create_resource_view(d->ssr_ray_meta_texture,
-                                reshade::api::resource_usage::shader_resource, vd,
-                                &d->ssr_ray_meta_srv);
-      dev->create_resource_view(d->ssr_ray_meta_texture,
-                                reshade::api::resource_usage::unordered_access, vd,
-                                &d->ssr_ray_meta_uav);
-    }
-    {
-      // Phase R3: filtered radiance pyramid (RGBA16F, 8 mips) + scratch.
-      reshade::api::resource_desc rp = {};
-      rp.type = reshade::api::resource_type::texture_2d;
-      rp.texture = {w, h, 1, SSR_RAD_MIP_LEVELS, reshade::api::format::r16g16b16a16_float, 1};
-      rp.heap = reshade::api::memory_heap::gpu_only;
-      rp.usage = reshade::api::resource_usage::shader_resource
-               | reshade::api::resource_usage::unordered_access;
-      if (dev->create_resource(rp, nullptr, reshade::api::resource_usage::shader_resource,
-                               &d->ssr_rad_pyr_texture)) {
-        if (shader_injection.ssr_log_init > 0.5f)
-          reshade::log::message(reshade::log::level::info,
-          "[SSR] R3 init: pyr tex created");
-        bool views_ok = true;
-        dev->create_resource_view(d->ssr_rad_pyr_texture,
-                                  reshade::api::resource_usage::shader_resource,
-                                  reshade::api::resource_view_desc(
-                                      reshade::api::resource_view_type::texture_2d,
-                                      reshade::api::format::r16g16b16a16_float, 0, SSR_RAD_MIP_LEVELS, 0, 1),
-                                  &d->ssr_rad_pyr_srv);
-        if (!d->ssr_rad_pyr_srv.handle) views_ok = false;
-        for (uint32_t m = 0; m < SSR_RAD_MIP_LEVELS; ++m) {
-          // NOTE: uav array covers mips 0..7 (index == mip). The [-1] here was
-          // the startup-crash OOB write found by the Stage-0b-style triage.
-          dev->create_resource_view(d->ssr_rad_pyr_texture,
-                                    reshade::api::resource_usage::unordered_access,
-                                    reshade::api::resource_view_desc(
-                                        reshade::api::resource_view_type::texture_2d,
-                                        reshade::api::format::r16g16b16a16_float, m, 1, 0, 1),
-                                    &d->ssr_rad_pyr_uavs[m]);
-          if (!d->ssr_rad_pyr_uavs[m].handle) views_ok = false;
-        }
-        if (views_ok && shader_injection.ssr_log_init > 0.5f)
-          reshade::log::message(reshade::log::level::info,
-            "[SSR] R3 init: srv+8 uavs created");
-
-        // Scratch buffer — guarded creation (was unguarded).
-        bool scr_ok = false;
-        reshade::api::resource_desc rs = {};
-        rs.type = reshade::api::resource_type::texture_2d;
-        rs.texture = {w, h, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
-        rs.heap = reshade::api::memory_heap::gpu_only;
-        rs.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-        reshade::api::resource scr_tmp = {};
-        if (dev->create_resource(rs, nullptr, reshade::api::resource_usage::shader_resource,
-                                 &scr_tmp)) {
-          d->ssr_rad_scratch_texture = scr_tmp;
-          dev->create_resource_view(d->ssr_rad_scratch_texture,
-                                    reshade::api::resource_usage::shader_resource,
-                                    reshade::api::resource_view_desc(
-                                        reshade::api::resource_view_type::texture_2d,
-                                        reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1),
-                                    &d->ssr_rad_scratch_srv);
-          scr_ok = d->ssr_rad_scratch_srv.handle != 0u;
-        }
-        if (scr_ok && shader_injection.ssr_log_init > 0.5f)
-          reshade::log::message(reshade::log::level::info,
-            "[SSR] R3 init: scratch created");
-
-        d->ssr_rad_created = views_ok && scr_ok &&
-                             d->ssr_rad_pyr_srv.handle != 0u;
-        if (d->ssr_rad_created && shader_injection.ssr_log_init > 0.5f)
-          reshade::log::message(reshade::log::level::info,
-            "[SSR] R3 init: complete");
-        else {
-          reshade::log::message(reshade::log::level::error,
-            "[SSR] R3 init: FAILED - filtered radiance disabled (SSR continues without it)");
-          // Degrade cleanly: release partials so nothing half-valid lingers.
-          if (d->ssr_rad_pyr_srv.handle) { dev->destroy_resource_view(d->ssr_rad_pyr_srv); d->ssr_rad_pyr_srv = {}; }
-          for (auto& u : d->ssr_rad_pyr_uavs)
-            if (u.handle) { dev->destroy_resource_view(u); u = {}; }
-          if (d->ssr_rad_pyr_texture.handle) { dev->destroy_resource(d->ssr_rad_pyr_texture); d->ssr_rad_pyr_texture = {}; }
-          if (d->ssr_rad_scratch_srv.handle) { dev->destroy_resource_view(d->ssr_rad_scratch_srv); d->ssr_rad_scratch_srv = {}; }
-          if (d->ssr_rad_scratch_texture.handle) { dev->destroy_resource(d->ssr_rad_scratch_texture); d->ssr_rad_scratch_texture = {}; }
-        }
-      } else {
-        reshade::log::message(reshade::log::level::error,
-          "[SSR] R3 init: pyr tex create FAILED - filtered radiance disabled");
-      }
-    }
-    {
-      // Phase 4: resolved output (RGBA16F).
-      reshade::api::resource_desc rd = {};
-      rd.type = reshade::api::resource_type::texture_2d;
-      rd.texture = {w, h, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
-      rd.heap = reshade::api::memory_heap::gpu_only;
-      rd.usage = reshade::api::resource_usage::shader_resource
-               | reshade::api::resource_usage::unordered_access;
-      dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource,
-                           &d->ssr_output_texture);
-      reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d,
-                                          reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
-      dev->create_resource_view(d->ssr_output_texture,
-                                reshade::api::resource_usage::shader_resource, vd,
-                                &d->ssr_output_srv);
-      dev->create_resource_view(d->ssr_output_texture,
-                                reshade::api::resource_usage::unordered_access, vd,
-                                &d->ssr_output_uav);
-    }
-  {
-    // Phase 2.1 atomic funnel counters (8x13 R32_UINT) + readback staging.
-    reshade::api::resource_desc rd = {};
-    rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {kSSRStatsWidth, kSSRStatsHeight, 1, 1, reshade::api::format::r32_uint, 1};
-    rd.heap = reshade::api::memory_heap::gpu_only;
-    rd.usage = reshade::api::resource_usage::unordered_access
-             | reshade::api::resource_usage::copy_source;
-    dev->create_resource(rd, nullptr, reshade::api::resource_usage::unordered_access,
-                         &d->ssr_stats_texture);
-    dev->create_resource_view(d->ssr_stats_texture,
-                              reshade::api::resource_usage::unordered_access,
-                              reshade::api::resource_view_desc(
-                                  reshade::api::resource_view_type::texture_2d,
-                                  reshade::api::format::r32_uint, 0, 1, 0, 1),
-                              &d->ssr_stats_uav);
-    reshade::api::resource_desc rs = {};
-    rs.type = reshade::api::resource_type::texture_2d;
-    rs.texture = {kSSRStatsWidth, kSSRStatsHeight, 1, 1, reshade::api::format::r32_uint, 1};
-    rs.heap = reshade::api::memory_heap::gpu_to_cpu;
-    rs.usage = reshade::api::resource_usage::copy_dest;
-    dev->create_resource(rs, nullptr, reshade::api::resource_usage::copy_dest,
-                         &d->ssr_stats_stage);
-    // Phase 3.Fix16: full-res RGBA16F readback staging for probe auto-select.
-    reshade::api::resource_desc rp = {};
-    rp.type = reshade::api::resource_type::texture_2d;
-    rp.texture = {w, h, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
-    rp.heap = reshade::api::memory_heap::gpu_to_cpu;
-    rp.usage = reshade::api::resource_usage::copy_dest;
-    dev->create_resource(rp, nullptr, reshade::api::resource_usage::copy_dest,
-                         &d->ssr_probe_stage);
-  }
-  d->last_created_ssr_width = gw;
-  d->last_created_ssr_height = gh;
-  d->ssr_resources_created = true;
-}
 
 // ═══════════ Dynamic Cubemaps (Sora 2nd) — standalone t17 replacement ═══════════
 
@@ -5541,6 +4901,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
 
   uint32_t sz = d->dyncube_size;
   cl->dispatch((sz + 7)/8, (sz + 7)/8, 6);
+  ++d->dyncube_capture_dispatches;
 
   // Barrier current history + camera UAVs -> SRV (t17 reads current set, preview + next-frame reads too)
   cl->barrier(d->dyncube_hist[cur].color, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
@@ -5575,6 +4936,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
   const uint32_t sz = d->dyncube_size;
   const uint32_t building = 1u - d->dyncube_ggx_active;
   if (mips < 2) return false;
+  ++d->dyncube_filter_updates;
 
   reshade::api::resource src = d->dyncube_texture;
   reshade::api::resource dst = d->dyncube_ggx_out[building];
@@ -5587,6 +4949,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
     reshade::api::subresource_box box = {0,0,0, sz, sz, 1};
     for (uint32_t f = 0; f < 6; ++f) {
       cl->copy_texture_region(src, f, &box, dstRes, f * mips, &box, reshade::api::filter_mode::min_mag_mip_point);
+      ++d->dyncube_face_copies;
     }
     cl->barrier(src, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
     cl->barrier(dstRes, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
@@ -5628,6 +4991,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
     cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ggx_layout, 3, 0, 1, &rough);
     uint32_t mw = std::max(1u, sz >> m);
     cl->dispatch((mw + 7u) / 8u, (mw + 7u) / 8u, 6);
+    ++d->dyncube_ggx_mip_dispatches;
   }
   cl->barrier(dst, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   return true;
@@ -5731,1288 +5095,6 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 3, 0, 2, pcV);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  return true;
-}
-
-static bool CreateSSRPipelinesIfNeeded(reshade::api::device* dev, DeviceData* d) {
-  using DR = reshade::api::descriptor_range;
-  using DS = reshade::api::shader_stage;
-  using DT = reshade::api::descriptor_type;
-  using P = reshade::api::pipeline_layout_param;
-
-  auto mkcs = [&](std::span<const uint8_t> bc,
-                  reshade::api::pipeline_layout lo, reshade::api::pipeline* out) -> bool {
-    if (bc.empty() || !lo.handle) return false;
-    if (out->handle != 0u) return true;  // ensure-style: create once
-    reshade::api::shader_desc sd = {};
-    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = "main";
-    reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
-    return dev->create_pipeline(lo, 1, &so, out);
-  };
-
-  auto make_layout = [&](uint32_t srv_count, uint32_t uav_count,
-                         reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
-    DR srv_r     = {0,0,0,srv_count,DS::all_compute,1,DT::texture_shader_resource_view};
-    DR uav_r     = {0,0,0,uav_count,DS::all_compute,1,DT::texture_unordered_access_view};
-    reshade::api::constant_range push_constants_range = {};
-    push_constants_range.binding = 0;
-    push_constants_range.dx_register_index = 13;
-    push_constants_range.dx_register_space = 0;
-    push_constants_range.count = kSSRPushConstantCount;
-    push_constants_range.visibility = DS::all_compute;
-    P param_sampler, param_cbv, param_srv, param_uav, param_constants;
-    param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
-    param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
-    param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
-    param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
-    param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
-    param_constants.push_constants = push_constants_range;
-    P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
-    return dev->create_pipeline_layout(5, params, out);
-  };
-
-  // Trace variant: generic SRV range (textures t0..t6 + StructuredBuffer t7)
-  // and a two-sampler table (point-clamp + linear-clamp).
-  auto make_trace_layout = [&](reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,2,DS::all_compute,1,DT::sampler};
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
-    DR srv_r     = {0,0,0,9,DS::all_compute,1,DT::shader_resource_view};
-    DR uav_r     = {0,0,0,3,DS::all_compute,1,DT::texture_unordered_access_view};   // R2C: rays+meta+stats
-    reshade::api::constant_range push_constants_range = {};
-    push_constants_range.binding = 0;
-    push_constants_range.dx_register_index = 13;
-    push_constants_range.dx_register_space = 0;
-    push_constants_range.count = kSSRPushConstantCount;
-    push_constants_range.visibility = DS::all_compute;
-    P param_sampler, param_cbv, param_srv, param_uav, param_constants;
-    param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
-    param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
-    param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
-    param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
-    param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
-    param_constants.push_constants = push_constants_range;
-    P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
-    return dev->create_pipeline_layout(5, params, out);
-  };
-
-  if (!make_layout(1u, 1u, &d->ssr_common_layout)) return false;
-  if (!make_trace_layout(&d->ssr_trace_layout)) return false;
-  // Resolve layout: Phase R1 Stage 0b probe — EXACT structural clone of the
-  // proven trace layout (generic SRV type/count 8, two samplers, 2 UAVs).
-  // The previous variant used texture-specific descriptor types; after two
-  // failed red tests we eliminate every delta from the working path.
-  {
-    DR sampler_r = {0,0,0,2,DS::all_compute,1,DT::sampler};
-    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
-    DR srv_r     = {0,0,0,9,DS::all_compute,1,DT::shader_resource_view};
-    DR uav_r     = {0,0,0,3,DS::all_compute,1,DT::texture_unordered_access_view};
-    reshade::api::constant_range push_constants_range = {};
-    push_constants_range.binding = 0;
-    push_constants_range.dx_register_index = 13;
-    push_constants_range.dx_register_space = 0;
-    push_constants_range.count = kSSRPushConstantCount;
-    push_constants_range.visibility = DS::all_compute;
-    P param_sampler, param_cbv, param_srv, param_uav, param_constants;
-    param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
-    param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
-    param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
-    param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-    param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
-    param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
-    param_constants.push_constants = push_constants_range;
-    P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
-    if (!dev->create_pipeline_layout(5, params, &d->ssr_resolve_layout))
-      return false;
-  }
-
-  if (!mkcs(__ssr_hiz_base, d->ssr_common_layout, &d->ssr_hiz_base_pipeline)) return false;
-  if (!mkcs(__ssr_hiz_reduce, d->ssr_common_layout, &d->ssr_hiz_reduce_pipeline)) return false;
-  if (!mkcs(__ssr_debug, d->ssr_common_layout, &d->ssr_debug_pipeline)) return false;
-  if (!mkcs(__ssr_trace, d->ssr_trace_layout, &d->ssr_trace_pipeline)) return false;
-  if (!mkcs(__ssr_resolve, d->ssr_resolve_layout, &d->ssr_resolve_pipeline)) return false;
-  // Phase R3 pipelines: NON-FATAL. A failure here previously aborted the
-  // entire SSR subsystem (white views / dead TraceStats) via this function's
-  // return-false contract. Degrade to no-pyramid instead.
-  {
-    static bool s_rad_fail_logged = false;
-    bool ok = mkcs(__ssr_rad_base, d->ssr_common_layout, &d->ssr_rad_base_pipeline);
-    ok = ok && mkcs(__ssr_rad_reduce, d->ssr_common_layout, &d->ssr_rad_reduce_pipeline);
-    d->ssr_rad_pipelines_ok = ok;
-    if (!ok && !s_rad_fail_logged) {
-      s_rad_fail_logged = true;
-      reshade::log::message(reshade::log::level::error,
-        "[SSR] R3 init: rad pipeline creation FAILED - filtered radiance disabled (SSR continues)");
-    }
-    if (!s_rad_fail_logged && d->ssr_rad_pipelines_ok && !d->ssr_rad_pipelines_diag) {
-      d->ssr_rad_pipelines_diag = true;
-      reshade::log::message(reshade::log::level::info,
-        "[SSR] R3 init: pipelines created");
-    }
-  }
-
-  if (!EnsureGTVBAODescriptorTables(dev, d->ssr_common_layout, &d->ssr_common_tables)) return false;
-  if (!EnsureGTVBAODescriptorTables(dev, d->ssr_trace_layout, &d->ssr_trace_tables)) return false;
-  if (!EnsureGTVBAODescriptorTables(dev, d->ssr_resolve_layout, &d->ssr_resolve_tables)) return false;
-  return true;
-}
-
-// Push-constant layout mirrors cb_ssr in ssr_common.hlsl exactly.
-// Debug View slider stores a contiguous label index; trace modes live at
-// codes 10..15, so indices 5..10 translate as index+5. Codes 0..4 frozen.
-static float SSR_TranslateDebugView(float slider_value) {
-  return (slider_value > 4.5f) ? (slider_value + 5.0f) : slider_value;
-}
-
-// Phase 3.Fix19: Raw-vs-Resolved split view code (label idx 37 -> 42).
-static bool SSR_IsRawVsResolvedView(float translated_debug) {
-  return fabsf(translated_debug - 42.0f) < 0.25f;
-}
-static bool SSR_IsMotionVectorView(float translated_debug) {
-  return fabsf(translated_debug - 43.0f) < 0.25f;
-}
-
-static std::array<float, kSSRPushConstantCount> BuildSSRPushConstants(
-    DeviceData* data, float scratch_width, float scratch_height) {
-  std::array<float, kSSRPushConstantCount> c = {};
-  const float dbg_translated = SSR_TranslateDebugView(shader_injection.ssr_debug_view);
-  c[0]  = shader_injection.ssr_mode;
-  c[1]  = dbg_translated;
-  c[2]  = shader_injection.ssr_debug_mip;
-  c[3]  = std::max(1.0f, shader_injection.ssr_max_ray_distance);
-  c[4]  = shader_injection.ssr_thickness;
-  c[5]  = shader_injection.ssr_roughness_threshold;
-  c[6]  = (float)((data ? data->frame_index : 0u) % 64u);
-  c[7]  = std::clamp(shader_injection.ssr_max_traversal_steps, 16.0f, 512.0f);   // traversal budget (slider, R-budget A/B)
-  c[8]  = shader_injection.ssr_mirror_bias;
-  c[9]  = shader_injection.ssr_intensity;
-  c[10] = shader_injection.ssr_denoise_radius;
-  // Phase 3.Fix19: c11 (SSR_denoise_taps, unused by all shaders) carries the
-  // Raw-vs-Resolved split flag for the resolve pass when view 42 is selected.
-  c[11] = SSR_IsRawVsResolvedView(dbg_translated) ? 1.0f : 0.0f;
-  // Phase R3: c12 (SSR_half_res_trace, reserved/unused) carries the filtered
-  // radiance pyramid validity flag for the resolve pass.
-  c[12] = (data != nullptr && data->ssr_rad_pyr_valid
-           && shader_injection.ssr_radiance_source < 0.5f) ? 1.0f : 0.0f;
-  c[13] = shader_injection.ssr_radiance_source;
-  c[14] = std::max(1.0f, scratch_width);
-  c[15] = std::max(1.0f, scratch_height);
-  c[16] = shader_injection.ssr_bypass_validation;
-  c[17] = shader_injection.ssr_forced_ray_mode;
-  c[18] = shader_injection.ssr_normal_convention;
-  c[19] = std::max(0.0f, shader_injection.ssr_self_hit_threshold);
-  c[20] = shader_injection.ssr_backface_gate;
-  c[21] = std::clamp(shader_injection.ssr_initial_advance_bias, 0.0f, 8.0f);
-  c[22] = shader_injection.ssr_thickness_gate;
-  c[23] = shader_injection.ssr_thickness_mode;
-  c[24] = shader_injection.ssr_diagnostics;
-  c[25] = std::max(0.0f, shader_injection.brdf_roughness_min);
-  c[26] = std::clamp(shader_injection.brdf_roughness_max, 0.0f, 1.0f);
-  // c13 already carries ssr_radiance_source (bound-time SRV selection mirror)
-  c[27] = std::clamp(shader_injection.ssr_ray_count, 1.0f, 4.0f);
-  c[28] = shader_injection.ssr_rough_interp;
-  c[29] = shader_injection.ssr_stochastic;
-  c[30] = shader_injection.ssr_eligibility_mode;
-  c[31] = std::clamp(shader_injection.ssr_roughness_threshold, 0.0f, 1.0f);
-  c[32] = std::clamp(shader_injection.ssr_resolve_radius, 1.0f, 16.0f);
-  c[33] = std::max(0.01f, shader_injection.ssr_depth_sigma);
-  c[34] = std::max(1.0f, shader_injection.ssr_normal_sigma);
-  c[35] = std::max(0.01f, shader_injection.ssr_rough_sigma);
-  c[36] = shader_injection.ssr_same_surface_reject;
-  c[37] = std::max(0.001f, shader_injection.ssr_plane_delta_threshold);
-  // NOTE (audit finding, unfixed): shader expects same_surface_reject at
-  // c37 and plane_delta_threshold at c38 — these two writes are off by one.
-  // Left untouched per Phase 3.Fix15 scope; flagged for separate approval.
-  // Phase 3.Fix16: auto-selected frozen coords take precedence in auto mode.
-  const bool probe_auto_sel = shader_injection.ssr_probe_auto > 0.5f &&
-                              data != nullptr && data->ssr_probe_has_selection;
-  c[39] = std::clamp(probe_auto_sel ? data->ssr_probe_frozen_x
-                                    : shader_injection.ssr_probe_pixel_x,
-                     0.0f, 7680.0f);
-  c[40] = std::clamp(probe_auto_sel ? data->ssr_probe_frozen_y
-                                    : shader_injection.ssr_probe_pixel_y,
-                     0.0f, 4320.0f);
-  // Phase R2E.2: RNG source flag — IS-FAST volume bound vs IGN fallback.
-  c[41] = (data != nullptr && data->isfast_noise_srv.handle != 0u) ? 1.0f : 0.0f;
-  return c;
-}
-
-// One-shot numeric Hi-Z verification (debug mode 4): reads back chain mips
-// 0..3 and validates, for each level M in 1..3, every texel of mip M against
-// the explicit 2x2 MIN of its mip-(M-1) children — replicating the GPU
-// reducer exactly: floor-halving dimensions, child coords = dst*2 + {0,1},
-// FLT_MAX padding outside the source region (odd/orphan edges).
-static void SSR_VerifyHiZMips(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return;
-  auto* dev = cl->get_device();
-  bool have_all = true;
-  for (const auto& s : d->ssr_verify_stages)
-    if (!s.handle) have_all = false;
-  if (!have_all) {
-    reshade::log::message(reshade::log::level::warning,
-        "[SSR] HiZ verify skipped: staging textures missing.");
-    return;
-  }
-  const uint32_t w = d->working_width, h = d->working_height;
-  const float kEmpty = 3.402823466e+38f;   // matches SSR_FLT_MAX in shaders
-
-  // Floor-halving dims per mip (identical to reducer dispatch math).
-  uint32_t mw[4], mh[4];
-  mw[0] = w; mh[0] = h;
-  for (uint32_t i = 1; i < 4; ++i) {
-    mw[i] = std::max(1u, w >> i);
-    mh[i] = std::max(1u, h >> i);
-  }
-
-  // Whole-subresource copies: dimensions match by construction.
-  const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto CSRC = reshade::api::resource_usage::copy_source;
-  cl->barrier(d->ssr_hiz_texture, SR, CSRC);
-  for (uint32_t i = 0; i < 4; ++i)
-    cl->copy_texture_region(d->ssr_hiz_texture, i, nullptr,
-                            d->ssr_verify_stages[i], 0u, nullptr);
-
-  struct MappedMip { reshade::api::subresource_data data; bool ok; };
-  MappedMip mm[4] = {};
-  for (uint32_t i = 0; i < 4; ++i)
-    mm[i].ok = dev->map_texture_region(d->ssr_verify_stages[i], 0u, nullptr,
-                                       reshade::api::map_access::read_only,
-                                       &mm[i].data);
-  cl->barrier(d->ssr_hiz_texture, CSRC, SR);
-  if (!mm[0].ok || !mm[1].ok || !mm[2].ok || !mm[3].ok
-      || !mm[0].data.data || !mm[1].data.data
-      || !mm[2].data.data || !mm[3].data.data) {
-    reshade::log::message(reshade::log::level::error,
-        "[SSR] HiZ verify failed: map_texture_region unavailable.");
-    for (uint32_t i = 0; i < 4; ++i)
-      if (mm[i].ok) dev->unmap_texture_region(d->ssr_verify_stages[i], 0u);
-    return;
-  }
-
-  auto row_of = [](const reshade::api::subresource_data& sd,
-                   uint32_t y) -> const float* {
-    return reinterpret_cast<const float*>(
-        static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(y) * sd.row_pitch);
-  };
-
-  // Chained check: each level against its immediate predecessor.
-  for (uint32_t m = 1; m < 4; ++m) {
-    const uint32_t sw = mw[m - 1], sh = mh[m - 1];   // source (parent) dims
-    const uint32_t dw = mw[m], dh = mh[m];           // destination dims
-
-    uint64_t mismatches = 0;
-    float got = 0.f, want = 0.f, quad[4] = {0.f, 0.f, 0.f, 0.f};
-    uint32_t qx = 0, qy = 0;
-    bool first_saved = false;
-
-    for (uint32_t y = 0; y < dh; ++y) {
-      const bool has_row1 = (2u * y + 1u) < sh;
-      const float* rowA = row_of(mm[m - 1].data, 2u * y);
-      const float* rowB = has_row1 ? row_of(mm[m - 1].data, 2u * y + 1u) : nullptr;
-      const float* rowD = row_of(mm[m].data, y);
-      for (uint32_t x = 0; x < dw; ++x) {
-        const bool has_col1 = (2u * x + 1u) < sw;
-        const float a = rowA[2u * x];
-        const float b = has_col1 ? rowA[2u * x + 1u] : kEmpty;
-        const float c = has_row1 ? rowB[2u * x] : kEmpty;
-        const float e = (has_row1 && has_col1) ? rowB[2u * x + 1u] : kEmpty;
-        const float expected = (std::min)((std::min)(a, b), (std::min)(c, e));
-        const float actual = rowD[x];
-        if (actual != expected) {
-          if (!first_saved) {
-            got = actual; want = expected;
-            qx = x; qy = y;
-            quad[0] = a; quad[1] = b; quad[2] = c; quad[3] = e;
-            first_saved = true;
-          }
-          ++mismatches;
-        }
-      }
-    }
-
-    std::ostringstream msg;
-    if (mismatches == 0u) {
-      msg << "[SSR] HiZ verify: mip" << m << " PASS (" << (uint64_t)dw * dh
-          << " texels vs mip" << (m - 1) << " " << sw << "x" << sh << ")";
-      reshade::log::message(reshade::log::level::info, msg.str().c_str());
-    } else {
-      msg << "[SSR] HiZ verify: mip" << m << " FAIL — " << mismatches << "/"
-          << ((uint64_t)dw * dh) << " mismatches vs mip" << (m - 1)
-          << ". first @ (" << qx << "," << qy << ") got=" << got
-          << " want=" << want << " | mip" << (m - 1) << " quad [TL=" << quad[0]
-          << " TR=" << quad[1] << " BL=" << quad[2] << " BR=" << quad[3] << "]";
-      reshade::log::message(reshade::log::level::error, msg.str().c_str());
-    }
-  }
-
-  for (uint32_t i = 0; i < 4; ++i)
-    dev->unmap_texture_region(d->ssr_verify_stages[i], 0u);
-}
-
-// Builds the SSR Hi-Z min-pyramid from this frame's captured depth buffer.
-// Sequential per-level passes (correctness first). Every pass binds exactly
-// one UAV at slot 0 and never holds an SRV+UAV on the same resource:
-//   base   : depth SRV -> hiz mip0 UAV
-//   level L: hiz is COPY_SOURCE while scratch absorbs it, then scratch SRV ->
-//            hiz mip L UAV. Scratch itself is never bound as a UAV anywhere.
-static bool RunSSRHiZ(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return false;
-  if (!d->captured_depth_srv.handle || !d->captured_scene_cbv_valid) return false;
-  auto* dev = cl->get_device();
-  if (!dev) return false;
-
-  const int debug_mode = (int)(shader_injection.ssr_debug_view + 0.5f);
-  if (debug_mode != 4) d->ssr_verify_done = false;   // re-arm when leaving mode 4
-
-  if (!CreateSSRPipelinesIfNeeded(dev, d)) return false;
-  if (!d->ssr_resources_created || !d->ssr_hiz_srv.handle) return false;
-
-  const uint32_t w = d->working_width, h = d->working_height;
-  if (w < 64u || h < 64u) return false;
-
-  const auto CS = reshade::api::shader_stage::all_compute;
-  const auto AC = reshade::api::pipeline_stage::all_compute;
-  const auto UA = reshade::api::resource_usage::unordered_access;
-  const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto CD = reshade::api::resource_usage::copy_dest;
-  const auto CSRC = reshade::api::resource_usage::copy_source;
-
-  auto apply_descriptors = [&](reshade::api::pipeline_layout lo,
-                               GTVBAODescriptorTableSet* tbl,
-                               uint32_t count,
-                               const reshade::api::descriptor_table_update* updates) {
-    std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
-    for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = (*tbl)[i]; }
-    dev->update_descriptor_tables(count, u.data());
-    std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> b = {};
-    for (uint32_t i = 0; i < count; ++i) b[i] = (*tbl)[i];
-    cl->bind_descriptor_tables(CS, lo, 0, count, b.data());
-  };
-
-  // ── Pass 1a: base level (depth -> hiz mip0 only; single UAV binding) ──
-  {
-    cl->bind_pipeline(AC, d->ssr_hiz_base_pipeline);
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_depth_srv},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssr_hiz_uavs[0]},
-    };
-    apply_descriptors(d->ssr_common_layout, &d->ssr_common_tables, 4, u);
-    auto pc = BuildSSRPushConstants(d, (float)w, (float)h);
-    cl->push_constants(CS, d->ssr_common_layout, kGtvbaoPushConstantsLayoutParam,
-                       0, kSSRPushConstantCount, pc.data());
-    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-  }
-
-  // ── Pass 1b: sequential per-level MIN reduction ──
-  // Each iteration: copy prev level into scratch (no shader-visible conflict),
-  // then reduce scratch SRV -> hiz mip L UAV.
-  cl->bind_pipeline(AC, d->ssr_hiz_reduce_pipeline);
-  for (uint32_t level = 1; level < kSSRHizMipLevels; ++level) {
-    const uint32_t pw = (w >> (level - 1)) > 0 ? (w >> (level - 1)) : 1u;
-    const uint32_t ph = (h >> (level - 1)) > 0 ? (h >> (level - 1)) : 1u;
-    const uint32_t dw = (w >> level) > 0 ? (w >> level) : 1u;
-    const uint32_t dh = (h >> level) > 0 ? (h >> level) : 1u;
-
-    const reshade::api::subresource_box src_box = {0u, 0u, 0u, pw, ph, 1u};
-    const reshade::api::subresource_box dst_box = {0u, 0u, 0u, pw, ph, 1u};
-    cl->barrier(d->ssr_hiz_texture, UA, CSRC);
-    cl->barrier(d->ssr_hiz_scratch_texture, SR, CD);
-    cl->copy_texture_region(d->ssr_hiz_texture, level - 1u, &src_box,
-                            d->ssr_hiz_scratch_texture, 0u, &dst_box);
-    cl->barrier(d->ssr_hiz_scratch_texture, CD, SR);
-
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->ssr_hiz_scratch_srv},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssr_hiz_uavs[level]},
-    };
-    apply_descriptors(d->ssr_common_layout, &d->ssr_common_tables, 4, u);
-    auto pc = BuildSSRPushConstants(d, (float)pw, (float)ph);
-    cl->push_constants(CS, d->ssr_common_layout, kGtvbaoPushConstantsLayoutParam,
-                       0, kSSRPushConstantCount, pc.data());
-    cl->dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
-  }
-  cl->barrier(d->ssr_hiz_texture, UA, SR);
-
-  // ── Debug visualization (Phase 1 validation; HiZ views = slider codes 1..4) ──
-  if (shader_injection.ssr_debug_view > 0.5f && shader_injection.ssr_debug_view < 4.5f
-      && d->ssr_debug_pipeline.handle) {
-    cl->bind_pipeline(AC, d->ssr_debug_pipeline);
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->ssr_hiz_srv},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssr_debug_uav},
-    };
-    apply_descriptors(d->ssr_common_layout, &d->ssr_common_tables, 4, u);
-    auto pc = BuildSSRPushConstants(d, (float)w, (float)h);
-    cl->push_constants(CS, d->ssr_common_layout, kGtvbaoPushConstantsLayoutParam,
-                       0, kSSRPushConstantCount, pc.data());
-    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-    cl->barrier(d->ssr_debug_texture, UA, SR);
-  }
-
-  // ── One-shot numeric verification (debug mode 4): mip1..3 vs predecessors ──
-  if (debug_mode == 4 && !d->ssr_verify_done && d->ssr_verify_stages[0].handle) {
-    d->ssr_verify_done = true;
-    SSR_VerifyHiZMips(cl, d);
-  }
-
-  return true;
-}
-
-// One-shot trace funnel statistics (Debug View 'Trace Stats'): snapshots the
-// 8x4 atomic counter block and logs the aggregate percentages/averages.
-static void SSR_LogTraceStats(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return;
-  auto* dev = cl->get_device();
-  if (!dev || !d->ssr_stats_texture.handle || !d->ssr_stats_stage.handle) {
-    reshade::log::message(reshade::log::level::warning,
-        "[SSR] TraceStats skipped: staging missing.");
-    return;
-  }
-  const auto UA = reshade::api::resource_usage::unordered_access;
-  const auto CSRC = reshade::api::resource_usage::copy_source;
-  const auto CD = reshade::api::resource_usage::copy_dest;
-  cl->barrier(d->ssr_stats_texture, UA, CSRC);
-  cl->barrier(d->ssr_stats_stage, CD, CD);
-  cl->copy_texture_region(d->ssr_stats_texture, 0u, nullptr,
-                          d->ssr_stats_stage, 0u, nullptr);
-
-  reshade::api::subresource_data sd = {};
-  if (!dev->map_texture_region(d->ssr_stats_stage, 0u, nullptr,
-                               reshade::api::map_access::read_only, &sd) || !sd.data) {
-    reshade::log::message(reshade::log::level::error,
-        "[SSR] TraceStats failed: map unavailable.");
-    return;
-  }
-  uint32_t c[kSSRStatsHeight][kSSRStatsWidth] = {};
-  for (uint32_t y = 0; y < kSSRStatsHeight; ++y) {
-    const auto* row = reinterpret_cast<const uint32_t*>(
-        static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(y) * sd.row_pitch);
-    memcpy(c[y], row, kSSRStatsWidth * sizeof(uint32_t));
-  }
-  dev->unmap_texture_region(d->ssr_stats_stage, 0u);
-  cl->barrier(d->ssr_stats_texture, CSRC, UA);
-
-  const double pixels      = static_cast<double>(c[0][0]);
-  const double traversed   = static_cast<double>(c[0][3]);
-  const double candidates  = static_cast<double>(c[0][4]);
-  const double raw_hits    = static_cast<double>(c[1][6]);
-  const double accepted    = static_cast<double>(c[1][4]);
-  auto pct_of_pixels = [&](double v) { return pixels > 0 ? 100.0 * v / pixels : 0.0; };
-  auto pct_of_cand   = [&](double v) { return candidates > 0 ? 100.0 * v / candidates : 0.0; };
-
-  std::ostringstream msg;
-  msg << "[SSR] TraceStats: pixels=" << (uint64_t)pixels
-      << " traversed=" << pct_of_pixels(traversed) << "%pix"
-      << " candidates=" << pct_of_pixels(candidates) << "%pix"
-      << " raw_hits=" << pct_of_pixels(raw_hits) << "%pix"
-      << " validated=" << pct_of_pixels(accepted) << "%pix"
-      << " self_thr=" << shader_injection.ssr_self_hit_threshold << "px"
-      << " bypass=" << (shader_injection.ssr_bypass_validation > 0.5f ? "ON" : "off")
-      << " thickGate=" << (shader_injection.ssr_thickness_gate > 0.5f ? "ON" : "OFF")
-      << " thickT=" << shader_injection.ssr_thickness
-      << " thickMode=" << (shader_injection.ssr_thickness_mode > 0.5f ? "PERP" : "EUCLID");
-  reshade::log::message(reshade::log::level::info, msg.str().c_str());
-  {
-    std::ostringstream px;
-    px << "[SSR]   accounting: logicalPixels=" << (uint64_t)pixels
-       << " rayExecutions=" << c[12][1]
-       << " candidateExecutions=" << c[12][2]
-       << " acceptedExecutions=" << c[12][3]
-       << " perpFallback=" << c[12][0]
-       // Phase 3.Fix17: below-horizon regeneration funnel (row y8).
-       << " | belowHorizonInitial=" << c[8][0]
-       << " regenerated=" << c[8][1]
-       << " regenRejected=" << c[8][2];
-    reshade::log::message(reshade::log::level::info, px.str().c_str());
-  }
-  {
-    std::ostringstream r;
-    r << "[SSR]   reject (%cand):"
-      << " self=" << pct_of_cand(c[0][7]) << "%"
-      << " sky=" << pct_of_cand(c[1][0]) << "%"
-      << " bf=" << pct_of_cand(c[1][1]) << "%"
-      << " off(inbounds)=" << pct_of_cand(c[0][5]) << "%"
-      << " finite_depth=" << pct_of_cand(c[0][6]) << "%"
-      << " thickness=" << pct_of_cand(c[1][2]) << "%"
-      << " vignette=" << pct_of_cand(c[1][3]) << "%";
-    reshade::log::message(reshade::log::level::info, r.str().c_str());
-  }
-  {
-    std::ostringstream t;
-    t << "[SSR]   term (% of pixels):"
-      << " candidate=" << pct_of_pixels(c[3][0]) << "%"
-      << " budget=" << pct_of_pixels(c[3][1]) << "%"
-      << " degenerate=" << pct_of_pixels(c[3][2]) << "%"
-      << " sky_origin=" << pct_of_pixels(c[3][3]) << "%"
-      << " | bypass_accepted=" << c[1][5];
-    reshade::log::message(reshade::log::level::info, t.str().c_str());
-  }
-  {
-    std::ostringstream i;
-    double iters_avg = traversed > 0 ? static_cast<double>(c[2][0]) / traversed : 0.0;
-    double fmip_avg  = traversed > 0 ? static_cast<double>(c[2][2]) / traversed : 0.0;
-    double cmip_avg  = traversed > 0 ? static_cast<double>(c[2][3]) / traversed : 0.0;
-    i << "[SSR]   iterations avg=" << iters_avg << " max=" << c[2][1]
-      << " | mip final_avg=" << fmip_avg << " coarse_avg=" << cmip_avg
-      << " (hits only)";
-    reshade::log::message(reshade::log::level::info, i.str().c_str());
-  }
-  { // Phase 2.3 candidate-distance bins (% of candidates)
-    std::ostringstream d;
-    d << "[SSR]   candDist (%cand):"
-      << " 0-1=" << pct_of_cand(c[4][0]) << "%"
-      << " 1-2=" << pct_of_cand(c[4][1]) << "%"
-      << " 2-8=" << pct_of_cand(c[4][2]) << "%"
-      << " 8-32=" << pct_of_cand(c[4][3]) << "%"
-      << " 32+=" << pct_of_cand(c[4][4]) << "%";
-    reshade::log::message(reshade::log::level::info, d.str().c_str());
-  }
-  { // Phase 2.3 candidate z-delta signs (% of candidates)
-    std::ostringstream z;
-    z << "[SSR]   candZDelta (%cand):"
-      << " behind(ray past surf)=" << pct_of_cand(c[4][5]) << "%"
-      << " front=" << pct_of_cand(c[4][6]) << "%"
-      << " eps(grazing)=" << pct_of_cand(c[4][7]) << "%";
-    reshade::log::message(reshade::log::level::info, z.str().c_str());
-  }
-  { // Phase 2.3 backface dot-product distribution (% of candidates)
-    std::ostringstream b;
-    b << "[SSR]   bfDot (%cand):"
-      << " <-0.75=" << pct_of_cand(c[5][0]) << "%"
-      << " -0.75..-0.25=" << pct_of_cand(c[5][1]) << "%"
-      << " -0.25..0=" << pct_of_cand(c[5][2]) << "%"
-      << " 0..0.25=" << pct_of_cand(c[5][3]) << "%"
-      << " 0.25..0.75=" << pct_of_cand(c[5][4]) << "%"
-      << " >0.75=" << pct_of_cand(c[5][5]) << "%"
-      << " | gate=" << (shader_injection.ssr_backface_gate > 0.5f ? "ON" : "OFF");
-    reshade::log::message(reshade::log::level::info, b.str().c_str());
-  }
-  { // Phase 2.4 first depth-test displacement (% of traversed)
-    auto pct_of_trav = [&](double v) { return traversed > 0 ? 100.0 * v / traversed : 0.0; };
-    std::ostringstream f;
-    f << "[SSR]   firstStep (%trav):"
-      << " <0.5=" << pct_of_trav(c[6][0]) << "%"
-      << " <1=" << pct_of_trav(c[6][1]) << "%"
-      << " <1.5=" << pct_of_trav(c[6][2]) << "%"
-      << " <2=" << pct_of_trav(c[6][3]) << "%"
-      << " <4=" << pct_of_trav(c[6][4]) << "%"
-      << " >=4=" << pct_of_trav(c[6][5]) << "%"
-      << " | bias=" << shader_injection.ssr_initial_advance_bias << "px";
-    reshade::log::message(reshade::log::level::info, f.str().c_str());
-  }
-  { // Phase 2.8 thickness-metric distribution + CDF at sweep stops (% of candidates)
-    auto pc = [&](uint32_t v) {
-      return candidates > 0 ? 100.0 * static_cast<double>(v) / candidates : 0.0;
-    };
-    const double b0 = pc(c[10][0]), b1 = pc(c[10][1]), b2 = pc(c[10][2]);
-    const double b3 = pc(c[10][3]), b4 = pc(c[10][4]), b5 = pc(c[10][5]);
-    const double b6 = pc(c[10][6]), b7 = pc(c[10][7]);
-    std::ostringstream t;
-    t << "[SSR]   thickDist (%cand):"
-      << " <0.01=" << b0 << "%"
-      << " .01-.025=" << b1 << "%"
-      << " .025-.05=" << b2 << "%"
-      << " .05-.1=" << b3 << "%"
-      << " .1-.15=" << b4 << "%"
-      << " .15-.25=" << b5 << "%"
-      << " .25-.5=" << b6 << "%"
-      << " >=.5=" << b7 << "%";
-    reshade::log::message(reshade::log::level::info, t.str().c_str());
-    {
-      std::ostringstream cdf;
-      cdf << "[SSR]   thickCDF accepted-% at T:"
-          << " .01->" << b0
-          << " | .025->" << (b0 + b1)
-          << " | .05->" << (b0 + b1 + b2)
-          << " | .1->" << (b0 + b1 + b2 + b3)
-          << " | .15->" << (b0 + b1 + b2 + b3 + b4)
-          << " | .25->" << (b0 + b1 + b2 + b3 + b4 + b5)
-          << " | .5->" << (b0 + b1 + b2 + b3 + b4 + b5 + b6);
-      reshade::log::message(reshade::log::level::info, cdf.str().c_str());
-    }
-    { // Phase 2.9 perpendicular-metric distribution (% of candidates, same grid)
-      auto pp = [&](uint32_t v) {
-        return candidates > 0 ? 100.0 * static_cast<double>(v) / candidates : 0.0;
-      };
-      std::ostringstream p;
-      p << "[SSR]   thickDistP (%cand):"
-        << " <0.01=" << pp(c[11][0]) << "%"
-        << " .01-.025=" << pp(c[11][1]) << "%"
-        << " .025-.05=" << pp(c[11][2]) << "%"
-        << " .05-.1=" << pp(c[11][3]) << "%"
-        << " .1-.15=" << pp(c[11][4]) << "%"
-        << " .15-.25=" << pp(c[11][5]) << "%"
-        << " .25-.5=" << pp(c[11][6]) << "%"
-        << " >=.5=" << pp(c[11][7]) << "%";
-      reshade::log::message(reshade::log::level::info, p.str().c_str());
-      std::ostringstream fb;
-      fb << "[SSR]   perpFallback=" << c[12][0]
-         << " (" << pct_of_pixels(static_cast<double>(c[12][0])) << "%pix"
-         << ", " << pc(c[12][0]) << "%cand)"
-         << " — candidates using Euclidean because hit-texel depth normal was unavailable";
-      reshade::log::message(reshade::log::level::info, fb.str().c_str());
-    }
-  }
-  { // Phase 2.5 normal-family diagnostics (% of traversed) — cells y7..y9
-    auto pt = [&](uint32_t v) {
-      return traversed > 0 ? 100.0 * static_cast<double>(v) / traversed : 0.0;
-    };
-    std::ostringstream n;
-    n << "[SSR]   normals (%trav):"
-      << " diff>30deg=" << pt(c[6][6]) << "%"
-      << " depthNA=" << pt(c[6][7]) << "%"
-      << " | mrtLen: exact=" << pt(c[7][0]) << "%"
-      << " near=" << pt(c[7][1]) << "%"
-      << " off=" << pt(c[7][2]) << "%";
-    reshade::log::message(reshade::log::level::info, n.str().c_str());
-    {
-      std::ostringstream d;
-      d << "[SSR]   mrtVsDepthDot (%trav, mutually exclusive):"
-        << " >=0.99=" << pt(c[7][3]) << "%"
-        << " 0.95-0.99=" << pt(c[7][4]) << "%"
-        << " 0.90-0.95=" << pt(c[7][5]) << "%"
-        << " 0.80-0.90=" << pt(c[7][6]) << "%"
-        << " <0.80=" << pt(c[7][7]) << "%";
-      reshade::log::message(reshade::log::level::info, d.str().c_str());
-    }
-    {
-      std::ostringstream r;
-      r << "[SSR]   reflDelta (%trav): <10deg=" << pt(c[8][0]) << "%"
-        << " 10-30=" << pt(c[8][1]) << "%"
-        << " >=30=" << pt(c[8][2]) << "%"
-        << " | agreeSubset(dot>=.95): <10=" << pt(c[9][0]) << "%"
-        << " 10-30=" << pt(c[9][1]) << "%"
-        << " >=30=" << pt(c[9][2]) << "%";
-      reshade::log::message(reshade::log::level::info, r.str().c_str());
-    }
-    {
-      std::ostringstream g;
-      g << "[SSR]   vGrazing dot(V,N_depth) (%trav): <=-0.2=" << pt(c[8][3]) << "%"
-        << " -0.2..0=" << pt(c[8][4]) << "%"
-        << " 0..+0.2=" << pt(c[8][5]) << "%"
-        << " >+0.2=" << pt(c[8][6]) << "%"
-        << " (expect ~0% non-positive)";
-      reshade::log::message(reshade::log::level::info, g.str().c_str());
-    }
-    { // Raw counts audit line — makes any accumulation anomaly instantly visible.
-      std::ostringstream a;
-      a << "[SSR]   audit counts: y7=[" << c[7][0] << "," << c[7][1] << ","
-        << c[7][2] << "," << c[7][3] << "," << c[7][4] << "," << c[7][5] << ","
-        << c[7][6] << "," << c[7][7] << "]"
-        << " y8=[" << c[8][0] << "," << c[8][1] << "," << c[8][2] << ","
-        << c[8][3] << "," << c[8][4] << "," << c[8][5] << "," << c[8][6] << "]"
-        << " y9=[" << c[9][0] << "," << c[9][1] << "," << c[9][2] << ","
-        << c[9][3] << "," << c[9][4] << "," << c[9][5] << "]";
-      reshade::log::message(reshade::log::level::info, a.str().c_str());
-    }
-    { // Phase 3.Fix9: GeoProbe — decode bit-cast floats from y13/y14.
-      auto dec = [&](uint32_t cell) -> float {
-        float f; memcpy(&f, &cell, 4); return f;
-      };
-      std::ostringstream g;
-      g << "[SSR] GeoProbe:"
-        << " P_view=(" << dec(c[13][0]) << "," << dec(c[13][1]) << "," << dec(c[13][2]) << ")"
-        << " V_view=(" << dec(c[13][3]) << "," << dec(c[13][4]) << "," << dec(c[13][5]) << ")"
-        << " hw_depth=" << dec(c[13][6])
-        << " dot(V,N)=" << dec(c[13][7]);
-      reshade::log::message(reshade::log::level::info, g.str().c_str());
-      std::ostringstream g2;
-      g2 << "[SSR]   R_minus=(" << dec(c[14][0]) << "," << dec(c[14][1]) << "," << dec(c[14][2]) << ")"
-         << " UV_end=(" << dec(c[14][3]) << "," << dec(c[14][4]) << ")"
-         << " dot(R_m,N)=" << dec(c[14][5])
-         << " dot(R_p,N)=" << dec(c[14][6])
-         << " dot(R_plus,N)=" << dec(c[14][7]);
-      reshade::log::message(reshade::log::level::info, g2.str().c_str());
-      // Phase 3.Fix12: dirProbe (y15) — old endpoint-projection |duv| sweep
-      // vs new AMD unit-step constant. unitStep must not vary with the
-      // Max Ray Distance slider.
-      std::ostringstream g3;
-      g3 << "[SSR]   nearPlaneDist=" << dec(c[15][0])
-         << " dirProbe: oldL1=" << dec(c[15][1])
-         << " oldL10=" << dec(c[15][2])
-         << " oldL100=" << dec(c[15][3])
-         << " oldL300=" << dec(c[15][4])
-         << " unitStep=" << dec(c[15][5]);
-      reshade::log::message(reshade::log::level::info, g3.str().c_str());
-      // Phase 3.Fix13: vndfProbe (y16) — numeric VNDF direction probe.
-      // dotLM=1/angDeg=0 baseline in Mirror mode; sentinels -2/-1 = no ray.
-      // Phase 3.Fix17: flip column renamed "rejected" — 1 = both samples
-      // below horizon, ray never marched. Per-attempt rows in y20/y21.
-      std::ostringstream g4;
-      g4 << "[SSR]   vndfProbe: rough=" << dec(c[16][0])
-         << " alpha=" << dec(c[16][1])
-         << " dotLM=" << dec(c[16][2])
-         << " angDeg=" << dec(c[16][3])
-         << " ndotl=" << dec(c[16][4])
-         << " rejected=" << dec(c[16][5])
-         << " bias=" << dec(c[16][6])
-         << " rays=" << dec(c[16][7]);
-      reshade::log::message(reshade::log::level::info, g4.str().c_str());
-      {
-        std::ostringstream g5;
-        g5 << "[SSR]   vndfProbe att0: dotLM=" << dec(c[20][0])
-           << " angDeg=" << dec(c[20][1])
-           << " ndotl=" << dec(c[20][2])
-           << " belowHorizon=" << dec(c[20][3]);
-        reshade::log::message(reshade::log::level::info, g5.str().c_str());
-        if (dec(c[20][4]) > 0.5f) {
-          std::ostringstream g6;
-          g6 << "[SSR]   vndfProbe att1: dotLM=" << dec(c[21][0])
-             << " angDeg=" << dec(c[21][1])
-             << " ndotl=" << dec(c[21][2])
-             << " belowHorizon=" << dec(c[21][3]);
-          reshade::log::message(reshade::log::level::info, g6.str().c_str());
-        }
-      }
-      // Phase 3.Fix15: Mirror-vs-VNDF CompareProbe (y17-y19). resolveA is
-      // logged as -1: the Phase 4 resolve pass has no dispatch call site.
-      std::ostringstream p1;
-      p1 << "[SSR] CompareProbe M: uv=(" << dec(c[17][0]) << "," << dec(c[17][1]) << ")"
-         << " rad=(" << dec(c[17][2]) << "," << dec(c[17][3]) << "," << dec(c[17][4]) << ")"
-         << " a=" << dec(c[17][5]) << " hit=" << dec(c[17][6]);
-      reshade::log::message(reshade::log::level::info, p1.str().c_str());
-      std::ostringstream p2;
-      p2 << "[SSR] CompareProbe V: uv=(" << dec(c[18][0]) << "," << dec(c[18][1]) << ")"
-         << " rad=(" << dec(c[18][2]) << "," << dec(c[18][3]) << "," << dec(c[18][4]) << ")"
-         << " a=" << dec(c[18][5])
-         << " angDeg=" << dec(c[18][6]) << " hit=" << dec(c[18][7]);
-      reshade::log::message(reshade::log::level::info, p2.str().c_str());
-      std::ostringstream p3;
-      p3 << "[SSR] CompareProbe blend: rawConf=" << dec(c[19][0])
-         << " t25a=" << dec(c[19][1])
-         << " resolveA=" << dec(c[19][2]);
-      reshade::log::message(reshade::log::level::info, p3.str().c_str());
-      // Phase 3.Fix18: radiance footprint probe at the V hit UV.
-      std::ostringstream p4;
-      p4 << "[SSR] footProbe: c=(" << dec(c[22][0]) << "," << dec(c[22][1]) << "," << dec(c[22][2]) << ")"
-         << " avg3=(" << dec(c[22][3]) << "," << dec(c[22][4]) << "," << dec(c[22][5]) << ")"
-         << " valid=" << dec(c[22][6]);
-      reshade::log::message(reshade::log::level::info, p4.str().c_str());
-      std::ostringstream p5;
-      p5 << "[SSR] footProbe: avg5=(" << dec(c[23][0]) << "," << dec(c[23][1]) << "," << dec(c[23][2]) << ")"
-         << " max5=(" << dec(c[23][3]) << "," << dec(c[23][4]) << "," << dec(c[23][5]) << ")"
-         << " maxLuma=" << dec(c[23][6]);
-      reshade::log::message(reshade::log::level::info, p5.str().c_str());
-      // Phase R1 Probe B: hit classification at the probe pixel (row y27).
-      std::ostringstream pc;
-      pc << "[SSR] CompareProbe Class: VsameSurf=" << dec(c[27][0])
-         << " VrejReason=" << dec(c[27][1])
-         << " MsameSurf=" << dec(c[27][2])
-         << " VndotlFinal=" << dec(c[27][3])
-         << " MrejReason=" << dec(c[27][4]);
-      reshade::log::message(reshade::log::level::info, pc.str().c_str());
-      // Phase R1: RvS comparison now logs directly from RunSSRResolve
-      // (Option B) — the stats readback here would predate the resolve.
-    }
-  }
-}
-
-// Phase 2: deterministic mirror trace — reflect(-V, N), SSSR hierarchical
-// march, ValidateHit confidence. Writes rgb = debug payload (codes 10..17)
-// and a = hit confidence into ssr_ray_result. No radiance sampling yet.
-// Phase 3.Fix16: CompareProbe auto-selection. Reads back the raw stochastic
-// output (RGBA16F, alpha = confidence) and freezes the brightest pixel whose
-// mirror-mode ray hit with conf >= 0.8 and max(RGB) >= 0.25. Runs ONLY while
-// Stochastic is OFF and Debug View is off (production frames), throttled to
-// every 10th frame; the selection then stays frozen while the user switches
-// Stochastic ON — giving a perfectly controlled same-pixel comparison.
-// Relaxed fallback: if no pixel passes the brightness floor, picks the
-// brightest conf>=0.8 pixel so the probe always has a target.
-static float SSR_ProbeHalfToFloat(uint16_t h) {
-  const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-  const uint32_t exp16 = (uint32_t)(h >> 10) & 0x1Fu;
-  const uint32_t man16 = (uint32_t)h & 0x03FFu;
-  uint32_t bits;
-  if (exp16 == 0u) {
-    if (man16 == 0u) {
-      bits = sign;
-    } else {
-      uint32_t e = 127 - 15 + 1;
-      uint32_t m = man16;
-      while ((m & 0x400u) == 0u) { m <<= 1; --e; }
-      bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
-    }
-  } else if (exp16 == 31u) {
-    bits = sign | 0x7F800000u | (man16 << 13);
-  } else {
-    bits = sign | ((exp16 - 15u + 127u) << 23) | (man16 << 13);
-  }
-  float f;
-  memcpy(&f, &bits, 4);
-  return f;
-}
-
-static void SSR_AutoSelectProbePixel(reshade::api::command_list* cl,
-                                     reshade::api::device* dev, DeviceData* d) {
-  if (!cl || !dev || !d) return;
-  if (shader_injection.ssr_probe_auto < 0.5f) return;      // manual X/Y mode
-  if (shader_injection.ssr_stochastic > 0.5f) return;       // freeze while stochastic
-  if (shader_injection.ssr_debug_view > 0.5f) return;       // production frames only
-  if ((d->frame_index % 10u) != 0u) return;                 // throttle
-  if (!d->ssr_ray_result_texture.handle || !d->ssr_probe_stage.handle) return;
-
-  const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto CSRC = reshade::api::resource_usage::copy_source;
-  const auto CD = reshade::api::resource_usage::copy_dest;
-  cl->barrier(d->ssr_ray_result_texture, SR, CSRC);
-  cl->barrier(d->ssr_probe_stage, CD, CD);
-  cl->copy_texture_region(d->ssr_ray_result_texture, 0u, nullptr,
-                          d->ssr_probe_stage, 0u, nullptr);
-  reshade::api::subresource_data sd = {};
-  bool mapped = dev->map_texture_region(d->ssr_probe_stage, 0u, nullptr,
-                                        reshade::api::map_access::read_only, &sd)
-                && sd.data != nullptr;
-  float best_bright = -1.0f, best_conf_bright = -1.0f;
-  float sel_a = 0.f, sel_r = 0.f, sel_g = 0.f, sel_b = 0.f;
-  float fb_a = 0.f;
-  uint32_t sel_x = 0, sel_y = 0, fb_x = 0, fb_y = 0;
-  if (mapped) {
-    const uint32_t w = d->last_created_ssr_width;
-    const uint32_t hgt = d->last_created_ssr_height;
-    constexpr float kMinConf = 0.8f;
-    constexpr float kMinBright = 0.25f;
-    for (uint32_t y = 0; y < hgt; ++y) {
-      const uint16_t* row = reinterpret_cast<const uint16_t*>(
-          static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(y) * sd.row_pitch);
-      for (uint32_t x = 0; x < w; ++x) {
-        const uint16_t* p = row + x * 4u;
-        const float a = SSR_ProbeHalfToFloat(p[3]);
-        if (a < kMinConf) continue;
-        const float r = SSR_ProbeHalfToFloat(p[0]);
-        const float g = SSR_ProbeHalfToFloat(p[1]);
-        const float b = SSR_ProbeHalfToFloat(p[2]);
-        const float bright = std::max(r, std::max(g, b));
-        if (bright >= kMinBright && bright > best_bright) {
-          best_bright = bright;
-          sel_x = x; sel_y = y; sel_a = a; sel_r = r; sel_g = g; sel_b = b;
-        }
-        if (bright > best_conf_bright) {
-          best_conf_bright = bright;
-          fb_x = x; fb_y = y; fb_a = a;
-        }
-      }
-    }
-    dev->unmap_texture_region(d->ssr_probe_stage, 0u);
-  }
-  cl->barrier(d->ssr_ray_result_texture, CSRC, SR);
-
-  bool have = false;
-  bool relaxed = false;
-  float lx = 0.f, ly = 0.f;
-  if (best_bright >= 0.0f) {
-    have = true; lx = (float)sel_x; ly = (float)sel_y;
-  } else if (best_conf_bright >= 0.0f) {
-    have = true; relaxed = true;
-    lx = (float)fb_x; ly = (float)fb_y; sel_a = fb_a;
-    sel_r = sel_g = sel_b = best_conf_bright;
-  }
-  if (!have) return;
-  const bool changed = !d->ssr_probe_has_selection ||
-      fabsf(d->ssr_probe_frozen_x - lx) > 0.5f ||
-      fabsf(d->ssr_probe_frozen_y - ly) > 0.5f;
-  d->ssr_probe_frozen_x = lx;
-  d->ssr_probe_frozen_y = ly;
-  d->ssr_probe_has_selection = true;
-  if (changed) {
-    std::ostringstream s;
-    s << "[SSR] CompareProbe selected pixel=(" << (int)lx << "," << (int)ly << ")"
-      << " mirrorRad=(" << sel_r << "," << sel_g << "," << sel_b << ")"
-      << " conf=" << sel_a
-      << (relaxed ? " (relaxed: no pixel passed brightness floor)" : "");
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
-  }
-}
-
-
-static bool RunSSRTrace(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return false;
-  if (!d->captured_depth_srv.handle || !d->captured_scene_cbv_valid) return false;
-  auto* dev = cl->get_device();
-  if (!dev) return false;
-  if (!CreateSSRPipelinesIfNeeded(dev, d)) return false;
-  if (!d->ssr_resources_created || !d->ssr_ray_result_uav.handle
-      || !d->ssr_hiz_srv.handle || !d->ssr_trace_pipeline.handle) return false;
-
-  const int debug_slider = (int)(shader_injection.ssr_debug_view + 0.5f);
-  // Trace Stats decoupled from Debug View — gated on ssr_log_tracestats toggle.
-  {
-    static bool s_prev_tracestats = false;
-    const bool tracestats_on = shader_injection.ssr_log_tracestats > 0.5f;
-    if (!tracestats_on && s_prev_tracestats) d->ssr_stats_done = false;
-    s_prev_tracestats = tracestats_on;
-  }
-
-  // Explicit configuration echo — on Trace Stats trigger or setting change.
-  {
-    static uint32_t s_cfg_hash = 0u;
-    const uint32_t h = (uint32_t)shader_injection.ssr_stochastic
-        + (uint32_t)shader_injection.ssr_ray_count * 7u
-        + (uint32_t)shader_injection.ssr_forced_ray_mode * 11u
-        + (uint32_t)shader_injection.ssr_thickness_mode * 13u
-        + (uint32_t)shader_injection.ssr_diagnostics * 17u
-        + (uint32_t)shader_injection.ssr_radiance_source * 19u
-        + (uint32_t)(shader_injection.ssr_thickness * 1000.0f);
-    if (h != s_cfg_hash && shader_injection.ssr_log_config > 0.5f) {
-      s_cfg_hash = h;
-      std::ostringstream cfg;
-      cfg << "[SSR] Phase3Config: stochastic="
-          << (int)shader_injection.ssr_stochastic
-          << " rayCount=" << (int)shader_injection.ssr_ray_count
-          << " forcedRayMode=" << (int)shader_injection.ssr_forced_ray_mode
-          << " diag=" << (int)shader_injection.ssr_diagnostics
-          << " radSrc=" << (int)shader_injection.ssr_radiance_source
-          << " thickMode=" << (shader_injection.ssr_thickness_mode > 0.5f ? "PERP" : "EUCLID")
-          << " thickT=" << shader_injection.ssr_thickness;
-      reshade::log::message(reshade::log::level::info, cfg.str().c_str());
-    }
-  }
-
-  const uint32_t w = d->working_width, h = d->working_height;
-  if (w < 64u || h < 64u) return false;
-
-  const auto CS = reshade::api::shader_stage::all_compute;
-  const auto AC = reshade::api::pipeline_stage::all_compute;
-  const auto UA = reshade::api::resource_usage::unordered_access;
-  const auto SR = reshade::api::resource_usage::shader_resource;
-
-  cl->bind_pipeline(AC, d->ssr_trace_pipeline);
-
-  // Reset funnel counters for this frame's accumulation.
-  const uint32_t zero[4] = {0u, 0u, 0u, 0u};
-  if (d->ssr_stats_uav.handle)
-    cl->clear_unordered_access_view_uint(d->ssr_stats_uav, zero);
-
-  // IS-FAST volume is required by the stochastic path regardless of the
-  // global IS-FAST master toggle.
-  if (!d->isfast_noise_srv.handle && shader_injection.ssr_stochastic > 0.5f)
-    LoadISFASTNoiseTexture(dev, d);
-
-  // Radiance source selection at bind time:
-  //   0 = colorTexture t0 (current frame), 1 = BackBuffer copy (lazy-created
-  //   in OnPresent when selected).
-  reshade::api::resource_view rad_srv = d->captured_color_srv.handle
-      ? d->captured_color_srv : d->fallback_srv;
-  if (shader_injection.ssr_radiance_source > 0.5f && d->ssr_radiance_copy_srv.handle)
-    rad_srv = d->ssr_radiance_copy_srv;
-
-  const reshade::api::resource_view fallback = d->fallback_srv;
-  reshade::api::resource_view srvs[7] = {
-      d->ssr_hiz_srv,
-      d->captured_depth_srv,
-      d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : fallback,
-      d->captured_mrt_spec_srv.handle ? d->captured_mrt_spec_srv : fallback,
-      d->captured_mrt_material_srv.handle ? d->captured_mrt_material_srv : fallback,
-      rad_srv,
-      d->isfast_noise_srv.handle ? d->isfast_noise_srv : fallback};
-  reshade::api::resource_view uavs[3] = {d->ssr_ray_result_uav, d->ssr_ray_meta_uav, d->ssr_stats_uav};
-  reshade::api::sampler smp[2] = {d->point_clamp_sampler, d->ssr_linear_sampler};
-
-  // Six updates: sampler span, CBV, texture SRV span t0..t6, buffer SRV t7,
-  // UAV span. The trace layout's generic shader_resource_view range accepts
-  // both texture and buffer SRVs.
-  std::array<reshade::api::descriptor_table_update, 5> uu = {};
-  uu[0] = {{},0,0,2,reshade::api::descriptor_type::sampler,smp};
-  uu[1] = {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view};
-  uu[2] = {{},0,0,7,reshade::api::descriptor_type::texture_shader_resource_view,srvs};
-  uu[3] = {{},7,0,1,reshade::api::descriptor_type::buffer_shader_resource_view,
-           &d->captured_deferred_params_srv};
-  uu[4] = {{},0,0,3,reshade::api::descriptor_type::texture_unordered_access_view,uavs};
-  // Param mapping: 0=sampler, 1=cbv, 2=SRV table (texture span AND the t7
-  // buffer entry both target param 2), 3=UAV (R2C: rays+meta+stats).
-  const uint32_t param_of[5] = {0u, 1u, 2u, 2u, 3u};
-  uint32_t update_count = 5u;
-  for (uint32_t i = 0; i < 5; ++i) {
-    if ((i == 3) && !d->captured_deferred_params_srv.handle) {
-      update_count = 4u;                       // drop buffer entry if uncaptured
-      continue;
-    }
-    uu[i].table = d->ssr_trace_tables[param_of[i]];
-  }
-  dev->update_descriptor_tables(update_count, uu.data());
-  std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> bb = {};
-  for (uint32_t i = 0; i < 4; ++i) bb[i] = d->ssr_trace_tables[i];
-  cl->bind_descriptor_tables(CS, d->ssr_trace_layout, 0, 4, bb.data());
-
-  auto pc = BuildSSRPushConstants(d, (float)w, (float)h);
-  cl->push_constants(CS, d->ssr_trace_layout, kGtvbaoPushConstantsLayoutParam,
-                     0, kSSRPushConstantCount, pc.data());
-  cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-  cl->barrier(d->ssr_ray_result_texture, UA, SR);
-
-  // Phase 3.Fix16: auto-select the CompareProbe pixel from this mirror frame.
-  SSR_AutoSelectProbePixel(cl, dev, d);
-
-  // One-shot aggregate report when the user selects 'Trace Stats'.
-  if (shader_injection.ssr_log_tracestats > 0.5f && !d->ssr_stats_done && d->ssr_stats_stage.handle) {
-    d->ssr_stats_done = true;
-    SSR_LogTraceStats(cl, d);
-  }
-  return true;
-}
-
-// ── Phase 3.Fix19: spatial resolve dispatch (was created but never called) ──
-// Chain: ssr_trace → ssr_ray_result → ssr_resolve → ssr_output → t25 → PS.
-// Runs on production frames (Debug View off) and on the Raw-vs-Resolved
-// split view (code 42); skipped for all other debug views because those
-// overwrite ray_result with visualization payloads.
-static bool RunSSRResolve(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return false;
-  d->ssr_resolved_this_frame = false;
-  // Phase R1: production dispatch only when the Spatial Resolve toggle is ON.
-  // Resetting the logger latch here means off→on toggles re-log.
-  static bool s_prev_pass = false;
-  if (shader_injection.ssr_resolve_enable < 0.5f) { s_prev_pass = false; return false; }
-  auto* dev = cl->get_device();
-  if (!dev) return false;
-
-  const float dbg_translated = SSR_TranslateDebugView(shader_injection.ssr_debug_view);
-  const bool rvr_view = SSR_IsRawVsResolvedView(dbg_translated);
-  const bool mv_view = SSR_IsMotionVectorView(dbg_translated);
-  if (shader_injection.ssr_debug_view > 0.5f && !rvr_view && !mv_view) return false;
-  if (!d->ssr_output_uav.handle || !d->ssr_output_srv.handle
-      || !d->ssr_resolve_pipeline.handle
-      || !d->ssr_ray_result_srv.handle || !d->ssr_hiz_srv.handle) return false;
-
-  const uint32_t w = d->last_created_ssr_width;
-  const uint32_t h = d->last_created_ssr_height;
-
-  const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto UA = reshade::api::resource_usage::unordered_access;
-  const auto AC = reshade::api::pipeline_stage::all_compute; // bind_pipeline
-  const auto CS = reshade::api::shader_stage::all_compute;   // descriptors/push
-  // ── Phase R1 Stage 0b FIX: bind the resolve pipeline. Without this the
-  // dispatch executed whatever compute pipeline was still bound (trace's),
-  // so the stub never ran and ssr_output stayed creation-zeros.
-  cl->bind_pipeline(AC, d->ssr_resolve_pipeline);
-  cl->barrier(d->ssr_output_texture, SR, UA);
-
-  // -- Phase R2C resolve bindings ------------------------------------------
-  // Table param 2 slot map (binding == HLSL t-register):
-  //   0=ray_result 1=hiz 2=mrt_normal 3=mrt_matidx
-  //   4=deferredParams(StructuredBuffer) 5=ray_meta 6=mrt_spec(F0)
-  // The StructuredBuffer keeps its own buffer_shader_resource_view entry
-  // (mixing types into one span invalidates the whole table update).
-  // -- Phase R3 resolve bindings ------------------------------------------
-  // Layout uses generic shader_resource_view type (same as trace layout),
-  // so all 9 SRVs (textures + StructuredBuffer) go into ONE span update.
-  // Table param 2 slot map (binding == HLSL t-register):
-  //   0=ray_result 1=hiz 2=mrt_normal 3=mrt_matidx 4=deferredParams(buf)
-  //   5=ray_meta 6=mrt_spec(F0) 7=radPyr(pyramid) 8=motionVectors(DLSS)
-  reshade::api::resource_view srvs_all[9] = {
-      d->ssr_ray_result_srv,
-      d->ssr_hiz_srv,
-      d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
-      d->captured_mrt_material_srv.handle ? d->captured_mrt_material_srv : d->fallback_srv,
-      d->captured_deferred_params_srv,
-      d->ssr_ray_meta_srv.handle ? d->ssr_ray_meta_srv : d->fallback_srv,
-      d->captured_mrt_spec_srv.handle ? d->captured_mrt_spec_srv : d->fallback_srv,
-      d->ssr_rad_pyr_srv.handle ? d->ssr_rad_pyr_srv : d->fallback_srv,
-      d->captured_motion_srv.handle ? d->captured_motion_srv : d->fallback_srv};
-  reshade::api::resource_view uavs[2] = {d->ssr_output_uav, d->ssr_stats_uav};
-
-  reshade::api::sampler smps[2] = {d->point_clamp_sampler, d->ssr_linear_sampler};
-  // Single generic SRV span covering all 9 slots (t0-t8) — same approach as
-  // trace layout which mixes Texture2D + StructuredBuffer in one range.
-  std::array<reshade::api::descriptor_table_update, 4> uu = {};
-  uu[0] = {{},0,0,2,reshade::api::descriptor_type::sampler,smps};
-  uu[1] = {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view};
-  uu[2] = {{},0,0,9,reshade::api::descriptor_type::shader_resource_view,srvs_all};
-  uu[3] = {{},0,0,2,reshade::api::descriptor_type::texture_unordered_access_view,uavs};
-  const uint32_t param_of[4] = {0u, 1u, 2u, 3u};
-  for (uint32_t i = 0; i < 4; ++i) uu[i].table = d->ssr_resolve_tables[param_of[i]];
-  dev->update_descriptor_tables(4, uu.data());
-  std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> bb = {};
-  for (uint32_t i = 0; i < 4; ++i) bb[i] = d->ssr_resolve_tables[i];
-  cl->bind_descriptor_tables(CS, d->ssr_resolve_layout, 0, 4, bb.data());
-
-  auto pc = BuildSSRPushConstants(d, (float)w, (float)h);
-  cl->push_constants(CS, d->ssr_resolve_layout, kGtvbaoPushConstantsLayoutParam,
-                     0, kSSRPushConstantCount, pc.data());
-  cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-  cl->barrier(d->ssr_output_texture, UA, SR);
-  d->ssr_resolved_this_frame = true;
-
-  // ── Probe readback. Gated on ssr_log_resolve + 30-frame throttle. ──
-  if (shader_injection.ssr_log_resolve > 0.5f &&
-      d->ssr_stats_texture.handle && d->ssr_stats_stage.handle &&
-      d->frame_index % 30u == 0u) {
-    const auto CSRC = reshade::api::resource_usage::copy_source;
-    const auto CD = reshade::api::resource_usage::copy_dest;
-    cl->barrier(d->ssr_stats_texture, UA, CSRC);
-    cl->barrier(d->ssr_stats_stage, CD, CD);
-    cl->copy_texture_region(d->ssr_stats_texture, 0u, nullptr,
-                            d->ssr_stats_stage, 0u, nullptr);
-    reshade::api::subresource_data sd = {};
-    if (dev->map_texture_region(d->ssr_stats_stage, 0u, nullptr,
-                                reshade::api::map_access::read_only, &sd) && sd.data) {
-      const uint32_t* row = reinterpret_cast<const uint32_t*>(
-          static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(25) * sd.row_pitch);
-      auto dec = [&](uint32_t cell) -> float { float f; memcpy(&f, &cell, 4); return f; };
-      if (dec(row[6]) > 0.0f) {   // rawA > 0 — probe pixel had a valid center ray
-        std::ostringstream r;
-        r << "[SSR] CompareProbe RvS(post): raw=(" << dec(row[0]) << "," << dec(row[1]) << "," << dec(row[2]) << ")"
-          << " res=(" << dec(row[3]) << "," << dec(row[4]) << "," << dec(row[5]) << ")"
-          << " rawA=" << dec(row[6]) << " resA=" << dec(row[7]);
-        reshade::log::message(reshade::log::level::info, r.str().c_str());
-      }
-      // Probe A: tap classification at the probe pixel (row y26).
-      const uint32_t* row26 = reinterpret_cast<const uint32_t*>(
-          static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(26) * sd.row_pitch);
-      std::ostringstream rp;
-      rp << "[SSR] ResolveProbe: validNbr=" << row26[0]
-         << " alphaRej=" << row26[1]
-         << " depthRej=" << row26[2]
-         << " normalRej=" << row26[3]
-         << " roughRej=" << row26[4]
-         << " centerW=" << dec(row26[5])
-         << " nbrW=" << dec(row26[6])
-         << " totalW=" << dec(row26[7]);
-      reshade::log::message(reshade::log::level::info, rp.str().c_str());
-      // Phase R2C estimator diagnosis (row y29).
-      const uint32_t* row29 = reinterpret_cast<const uint32_t*>(
-          static_cast<const uint8_t*>(sd.data) + static_cast<size_t>(29) * sd.row_pitch);
-      std::ostringstream e;
-      e << "[SSR] EstimatorProbe: nbrW_est=" << dec(row29[0])
-        << " totalW_est=" << dec(row29[1])
-        << " pdfAvg=" << dec(row29[2])
-        << " clampHits=" << row29[3]
-        << " coverage=" << dec(row29[4])
-        << " resA=" << dec(row29[5]);
-      reshade::log::message(reshade::log::level::info, e.str().c_str());
-      dev->unmap_texture_region(d->ssr_stats_stage, 0u);
-    }
-    cl->barrier(d->ssr_stats_texture, CSRC, UA);
-  }
-
-  // Status log: re-emits whenever resolve resumes after a gap (toggle
-  // off/on, view switches) or on resolution change.
-  const bool first_after_gap = !s_prev_pass;
-  s_prev_pass = true;
-  static uint32_t s_log_w = 0, s_log_h = 0;
-  if (first_after_gap || s_log_w != w || s_log_h != h) {
-    s_log_w = w; s_log_h = h;
-    std::ostringstream s;
-    s << "[SSR] Resolve: dispatched=1 input=" << w << "x" << h
-      << " output=" << w << "x" << h
-      << (rvr_view ? " (raw-vs-resolved split view)" : "");
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
-  }
-  return true;
-}
-// -- Phase R3: filtered radiance pyramid build ------------------------------
-// mip0 = captured HDR scene color (requires radSrc == ColorTexture);
-// mips 1..7 = sequential 2x2 box-average reduction, Hi-Z machinery cloned.
-// Gated OFF entirely when radSrc != 0: the pyramid would then hold stale
-// content while the user tests the BackBuffer source. Logged on transition.
-static bool RunSSRRadiancePyramid(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return false;
-  const bool want = shader_injection.ssr_radiance_source < 0.5f;
-  static bool s_prev_want = false;
-  if (!want) {
-    if (s_prev_want && shader_injection.ssr_log_init > 0.5f) {
-      reshade::log::message(reshade::log::level::info,
-        "[SSR] RadiancePyramid: disabled (filtered radiance requires radSrc=ColorTexture t0).");
-    }
-    s_prev_want = false;
-    d->ssr_rad_pyr_valid = false;
-    return false;
-  }
-  if (!d->ssr_rad_pipelines_ok || !d->ssr_rad_created
-      || !d->ssr_rad_pyr_srv.handle || !d->ssr_rad_base_pipeline.handle)
-    return false;
-  auto* dev = cl->get_device();
-  if (!dev || !d->captured_color_srv.handle) return false;
-
-  const uint32_t w = d->last_created_ssr_width, h = d->last_created_ssr_height;
-  const auto CS = reshade::api::shader_stage::all_compute;
-  const auto AC = reshade::api::pipeline_stage::all_compute;
-  const auto UA = reshade::api::resource_usage::unordered_access;
-  const auto SR = reshade::api::resource_usage::shader_resource;
-  const auto CD = reshade::api::resource_usage::copy_dest;
-  const auto CSRC = reshade::api::resource_usage::copy_source;
-
-  auto apply_descriptors = [&](uint32_t count,
-                               const reshade::api::descriptor_table_update* updates) {
-    std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {};
-    for (uint32_t i = 0; i < count; ++i) { u[i] = updates[i]; u[i].table = d->ssr_common_tables[i]; }
-    dev->update_descriptor_tables(count, u.data());
-    std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> b = {};
-    for (uint32_t i = 0; i < count; ++i) b[i] = d->ssr_common_tables[i];
-    cl->bind_descriptor_tables(CS, d->ssr_common_layout, 0, count, b.data());
-  };
-
-  // Pass R3a: base level (colorTexture -> pyramid mip 0 + scratch pre-seed).
-  cl->barrier(d->ssr_rad_pyr_texture, SR, UA);
-  cl->bind_pipeline(AC, d->ssr_rad_base_pipeline);
-  {
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->captured_color_srv},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssr_rad_pyr_uavs[0]},
-    };
-
-
-
-
-    apply_descriptors(4, u);
-  }
-  auto pc = BuildSSRPushConstants(d, (float)w, (float)h);
-  cl->push_constants(CS, d->ssr_common_layout, kGtvbaoPushConstantsLayoutParam,
-                     0, kSSRPushConstantCount, pc.data());
-  cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-
-  // Pass R3b: per-level box reduction (scratch ping-pong, Hi-Z pattern).
-  cl->bind_pipeline(AC, d->ssr_rad_reduce_pipeline);
-  for (uint32_t level = 1; level < SSR_RAD_MIP_LEVELS; ++level) {
-    const uint32_t pw = (w >> (level - 1)) > 0 ? (w >> (level - 1)) : 1u;
-    const uint32_t ph = (h >> (level - 1)) > 0 ? (h >> (level - 1)) : 1u;
-    const uint32_t dw = (w >> level) > 0 ? (w >> level) : 1u;
-    const uint32_t dh = (h >> level) > 0 ? (h >> level) : 1u;
-
-    cl->barrier(d->ssr_rad_pyr_texture, UA, CSRC);
-    cl->barrier(d->ssr_rad_scratch_texture, SR, CD);
-    const reshade::api::subresource_box src_box = {0u, 0u, 0u, pw, ph, 1u};
-    const reshade::api::subresource_box dst_box = {0u, 0u, 0u, pw, ph, 1u};
-    cl->copy_texture_region(d->ssr_rad_pyr_texture, level - 1u, &src_box,
-                            d->ssr_rad_scratch_texture, 0u, &dst_box);
-    cl->barrier(d->ssr_rad_scratch_texture, CD, SR);
-
-    reshade::api::descriptor_table_update u[4] = {
-      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,&d->ssr_rad_scratch_srv},
-      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->ssr_rad_pyr_uavs[level - 1]},
-    };
-    apply_descriptors(4, u);
-    auto pcr = BuildSSRPushConstants(d, (float)pw, (float)ph);
-    cl->push_constants(CS, d->ssr_common_layout, kGtvbaoPushConstantsLayoutParam,
-                       0, kSSRPushConstantCount, pcr.data());
-    cl->dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
-  }
-  cl->barrier(d->ssr_rad_pyr_texture, UA, SR);
-  d->ssr_rad_pyr_valid = true;
-  s_prev_want = true;
   return true;
 }
 
