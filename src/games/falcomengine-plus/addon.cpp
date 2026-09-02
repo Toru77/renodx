@@ -309,9 +309,8 @@ ShaderInjectData shader_injection = {
   .dynCube_debug = 0.f,
   .dynCube_resolution = 0.f,
   .dynCube_history = 0.f,
-  .dynCube_inference = 0.f,
   .dynCube_ggx = 0.f,
-  .dynCube_capture_interval = 0.f,
+  .dynCube_capture_interval = 1.f,
   .dynCube_roughness_boost = 1.f,
   .dynCube_debug_logging = 0.f,
   .dynCube_debug_face = 0.f,
@@ -322,10 +321,7 @@ ShaderInjectData shader_injection = {
   .dynCube_parallax_box_size_y = 10.f,
   .dynCube_parallax_box_size_z = 20.f,
   .dynCube_parallax_debug = 0.f,
-  .dynCube_pos_aware_enabled = 0.f,
-  .dynCube_pos_aware_strength = 1.f,
-  .dynCube_pos_aware_samples = 1.f,
-  .dynCube_pos_aware_spread = 0.35f,
+  .dynCube_reflect_sign_flip = 0.f,
   .dynCube_ssr_enabled = 0.f,
   .dynCube_ssr_quality = 1.f,
   .dynCube_ssr_blur = 2.f,
@@ -337,12 +333,11 @@ ShaderInjectData shader_injection = {
   .dynCube_capture_boost = 1.f,
   .dynCube_history_blend = 0.5f,
   .dynCube_history_pos_threshold = 0.5f,
-  .dynCube_inference_coverage_threshold = 0.5f,
-  .dynCube_inference_min_mip_coverage = 0.05f,
   .dynCube_character_capture = 0.f,
   .dynCube_force_vanilla = 0.f,
   .dynCube_force_dynamic = 0.f,
   .dynCube_force_ssr = 0.f,
+  .dynCube_layer_mix = -1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -741,34 +736,26 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_hist_cur = 0;           // current write set (0=A,1=B)
   bool dyncube_needs_reset = true;         // clear history + first-frame reset
   bool dyncube_was_enabled = false;        // rising-edge latch for enabled->reset
-  // Phase 2 inference
-  reshade::api::resource dyncube_infer_mips = {};        // RGBA16F cube, 8 mips (coverage chain)
-  reshade::api::resource_view dyncube_infer_mips_cube_srv = {};  // cube SRV mips 0..7
-  reshade::api::resource_view dyncube_infer_mips_uav = {};       // mip0 array UAV (prep write)
-  reshade::api::resource dyncube_inferred = {};         // RGBA16F cube, 1 mip (t17 when inference ON)
-  reshade::api::resource_view dyncube_inferred_cube_srv = {};
-  reshade::api::resource_view dyncube_inferred_uav = {};
-  reshade::api::resource dyncube_infer_srcview = {};    // RGBA16F array, source marker (debug 8)
-  reshade::api::resource_view dyncube_infer_srcview_srv = {};
-  reshade::api::resource_view dyncube_infer_srcview_uav = {};
-  reshade::api::sampler dyncube_infer_sampler = {};     // trilinear clamp for mip sampling
-  reshade::api::pipeline_layout dyncube_infer_prep_layout = {};
-  reshade::api::pipeline dyncube_infer_prep_pipeline = {};
-  GTVBAODescriptorTableSet dyncube_infer_prep_tables = {};
-  reshade::api::pipeline_layout dyncube_infer_layout = {};
-  reshade::api::pipeline dyncube_infer_pipeline = {};
-  GTVBAODescriptorTableSet dyncube_infer_tables = {};
+  reshade::api::sampler dyncube_linear_sampler = {};     // trilinear clamp (GGX input mips)
   // Character mask (Phase 2)
   reshade::api::resource dyncube_charmask = {};          // RGBA16F cube, 1 mip (character mask)
   reshade::api::resource_view dyncube_charmask_srv = {};   // TextureCube SRV (for debug 9)
   reshade::api::resource_view dyncube_charmask_uav = {};   // Texture2DArray UAV (compute write)
-  // Phase 3 GGX prefilter
+  // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
+  // partially-written cube is never exposed to lighting.
   uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..1024)
   reshade::api::resource dyncube_ggx_in = {};            // RGBA16F cube, N mips (GGX input chain)
   reshade::api::resource_view dyncube_ggx_in_cube_srv = {};
-  reshade::api::resource dyncube_ggx_out = {};           // RGBA16F cube, N mips (filtered output / t17)
-  reshade::api::resource_view dyncube_ggx_out_cube_srv = {};
-  reshade::api::resource_view dyncube_ggx_out_mip_uav[8] = {};  // per-mip array UAVs (mips 1..N-1)
+  reshade::api::resource dyncube_ggx_out[2] = {};        // RGBA16F cubes, N mips (filtered output)
+  reshade::api::resource_view dyncube_ggx_out_cube_srv[2] = {};
+  reshade::api::resource_view dyncube_ggx_out_mip_uav[2][8] = {};  // per-mip array UAVs (mips 1..N-1)
+  uint32_t dyncube_ggx_active = 0;                       // index of the completed cube bound to t17
+  bool dyncube_ggx_valid = false;                        // a completed filter has been produced
+  // Multi-frame update scheduler (Capture -> Filter -> Done -> wait -> Capture).
+  enum class DynCubePhase : uint32_t { Done = 0, Capture = 1, Filter = 2 };
+  DynCubePhase dyncube_phase = DynCubePhase::Done;
+  uint64_t dyncube_next_update_frame = 0;                // next frame a capture may begin
+  uint64_t dyncube_sched_frame = UINT64_MAX;             // last present frame the scheduler ran
   reshade::api::pipeline_layout dyncube_ggx_layout = {};
   reshade::api::pipeline dyncube_ggx_pipeline = {};
   GTVBAODescriptorTableSet dyncube_ggx_tables = {};
@@ -3051,8 +3038,8 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeDebug", .binding = &shader_injection.dynCube_debug,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "Dynamic Cubemaps",
-      .tooltip = "0=Normal (dynamic cube in lighting), 1=Show Dynamic Cube, 2=Face Visualization, 3=Solid Face Colors, 4=No Override (vanilla t17), 5=History Validity, 6=History Contribution, 7=Inference Result, 8=Inference Source, 9=Character Mask, 10=GGX Filtered Cube (mip-selectable), 11=Selected Sample World Pos, 12=Position Error, 13=Position-Aware Sample Pos, 14=SSR Result (blurred), 15=SSR Confidence, 16=Reflection Source, 17=SSR Raw, 18=SSR Edge Fade.",
-      .labels = {"Normal", "Show Cube", "Face Viz", "Solid Colors", "No Override", "History Validity", "History Contribution", "Inference Result", "Inference Source", "Character Mask", "GGX Filtered", "Sample Pos", "Pos Error", "Pos-Aware Pos", "SSR Result", "SSR Confidence", "Reflection Source", "SSR Raw", "SSR Edge Fade"},
+      .tooltip = "0=Normal (dynamic cube in lighting), 1=Show Dynamic Cube, 2=Face Visualization, 3=Solid Face Colors, 4=No Override (vanilla t17), 5=History Validity, 6=History Contribution, 7=Character Mask, 8=GGX Filtered Cube (mip-selectable), 9=SSR Result (blurred), 10=SSR Confidence, 11=Reflection Source, 12=SSR Raw, 13=SSR Edge Fade.",
+      .labels = {"Normal", "Show Cube", "Face Viz", "Solid Colors", "No Override", "History Validity", "History Contribution", "Character Mask", "GGX Filtered", "SSR Result", "SSR Confidence", "Reflection Source", "SSR Raw", "SSR Edge Fade"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
@@ -3101,13 +3088,21 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeInference", .binding = &shader_injection.dynCube_inference,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Inference", .section = "Dynamic Cubemaps",
-      .tooltip = "Phase2: fill gaps via mips + default fallback. Requires History.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f; },
+      .key = "DynCubeLayerMix", .binding = &shader_injection.dynCube_layer_mix,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = -1.f, .label = "Reflection Layer Mix", .section = "Dynamic Cubemaps",
+      .tooltip = "Manual reflection source override. -1 = automatic confidence blend. 0 = SSR only. 1 = Dynamic only. 2 = Vanilla only. Values in between blend adjacent sources.",
+      .min = -1.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeUpdateInterval", .binding = &shader_injection.dynCube_capture_interval,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
+      .tooltip = "Frames between new cubemap captures (1=fastest 2-stage cadence, 2=every 2 frames, 4=every 4 frames, 8=every 8 frames). Capture and filter run on separate frames; the previous completed cube stays visible between updates.",
+      .labels = {"1", "2", "3", "4", "5", "6", "7", "8"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeGGX", .binding = &shader_injection.dynCube_ggx,
@@ -3153,38 +3148,20 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeInferCoverageThreshold", .binding = &shader_injection.dynCube_inference_coverage_threshold,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Infer Coverage Threshold", .section = "Dynamic Cubemaps",
-      .tooltip = "Full-resolution validity coverage at or above this -> copy history unchanged. Below -> search coarser mips. Default 0.5.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f && shader_injection.dynCube_inference > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "DynCubeInferMinMipCoverage", .binding = &shader_injection.dynCube_inference_min_mip_coverage,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.05f, .label = "Infer Min Mip Coverage", .section = "Dynamic Cubemaps",
-      .tooltip = "Coarser mip validity coverage needed to contribute to filling a missing direction. Default 0.05.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f && shader_injection.dynCube_inference > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "DynCubeDebugFace", .binding = &shader_injection.dynCube_debug_face,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug Face", .section = "Dynamic Cubemaps",
-      .tooltip = "Face for debug preview when Debug View=1/2/5/6/7/8/9/10: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Preview samples the capture resource directly.",
+      .tooltip = "Face for debug preview when Debug View=1/2/5/6/7/8: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Preview samples the capture resource directly.",
       .labels = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f || shader_injection.dynCube_debug == 9.f || shader_injection.dynCube_debug == 10.f); },
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeDebugMip", .binding = &shader_injection.dynCube_debug_mip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug Mip", .section = "Dynamic Cubemaps",
-      .tooltip = "Mip level for the GGX filtered cube preview when Debug View=10. 0=sharp inferred, 7=strongly blurred.",
+      .tooltip = "Mip level for the GGX filtered cube preview when Debug View=8. 0=sharp history, 7=strongly blurred.",
       .labels = {"0", "1", "2", "3", "4", "5", "6", "7"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_debug == 10.f; },
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_debug == 8.f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeForceMip", .binding = &shader_injection.dynCube_force_mip,
@@ -3238,38 +3215,12 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubePosAware", .binding = &shader_injection.dynCube_pos_aware_enabled,
+      .key = "DynCubeReflectSignFlip", .binding = &shader_injection.dynCube_reflect_sign_flip,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Position-Aware Correction", .section = "Dynamic Cubemaps",
-      .tooltip = "OFF = direction-only cubemap lookup (current). ON = refine the reflection direction using stored histPos world positions near the reflection ray.",
+      .default_value = 0.f, .label = "Reflection Sign Flip", .section = "Dynamic Cubemaps",
+      .tooltip = "Debug A/B: OFF = use the mathematical reflect ray (current). ON = use the physical reflection ray (negated) for box-parallax correction. Test which direction the correction moves.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "DynCubePosAwareStrength", .binding = &shader_injection.dynCube_pos_aware_strength,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Position-Aware Strength", .section = "Dynamic Cubemaps",
-      .tooltip = "0.0 = existing direction-only lookup. 1.0 = full position-aware candidate direction. For A/B testing.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_pos_aware_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "DynCubePosAwareSamples", .binding = &shader_injection.dynCube_pos_aware_samples,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Position-Aware Samples", .section = "Dynamic Cubemaps",
-      .tooltip = "Total candidate directions evaluated around the reflection direction (including the original).",
-      .labels = {"4", "8", "16"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_pos_aware_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "DynCubePosAwareSpread", .binding = &shader_injection.dynCube_pos_aware_spread,
-      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.35f, .label = "Position-Aware Spread", .section = "Dynamic Cubemaps",
-      .tooltip = "Max tangent offset (in direction space) of the candidate search around the reflection direction. Larger reaches more offset nearby geometry.",
-      .min = 0.05f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_pos_aware_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4075,8 +4026,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
         && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
             || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
-            || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f
-            || shader_injection.dynCube_debug == 9.f || shader_injection.dynCube_debug == 10.f)) {
+            || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f)) {
       int face = (int)std::clamp(shader_injection.dynCube_debug_face, 0.f, 5.f);
       const uint32_t outSet = 1u - d->dyncube_hist_cur; // freshly written set (alias target)
       reshade::api::resource srcTex = d->dyncube_texture;
@@ -4084,12 +4034,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       uint32_t srcW = 0, srcH = 0;
       if (shader_injection.dynCube_debug == 5.f) srcTex = d->dyncube_hist[outSet].pos;
       else if (shader_injection.dynCube_debug == 6.f) srcTex = d->dyncube_hist[outSet].contrib;
-      else if (shader_injection.dynCube_debug == 7.f) srcTex = d->dyncube_inferred;
-      else if (shader_injection.dynCube_debug == 8.f) srcTex = d->dyncube_infer_srcview;
-      else if (shader_injection.dynCube_debug == 9.f) srcTex = d->dyncube_charmask;
-      else if (shader_injection.dynCube_debug == 10.f) {
-        // GGX filtered cube: preview a specific mip of dyncube_ggx_out.
-        srcTex = d->dyncube_ggx_out;
+      else if (shader_injection.dynCube_debug == 7.f) srcTex = d->dyncube_charmask;
+      else if (shader_injection.dynCube_debug == 8.f) {
+        // GGX filtered cube: preview a specific mip of the ACTIVE completed cube.
+        srcTex = d->dyncube_ggx_out[d->dyncube_ggx_active];
         int mip = (int)std::clamp(shader_injection.dynCube_debug_mip, 0.f, (float)(d->dyncube_mip_count - 1));
         srcSub = (uint32_t)mip + (uint32_t)face * d->dyncube_mip_count;
         srcW = std::max(1u, d->dyncube_size >> mip);
@@ -4188,8 +4136,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
       && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
           || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
-          || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f
-          || shader_injection.dynCube_debug == 9.f || shader_injection.dynCube_debug == 10.f)) {
+          || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f)) {
     int face = (int)std::clamp(shader_injection.dynCube_debug_face, 0.f, 5.f);
     const uint32_t outSet = 1u - d->dyncube_hist_cur; // freshly written set (alias target)
     reshade::api::resource srcTex = d->dyncube_texture;
@@ -4197,12 +4144,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     uint32_t srcW = 0, srcH = 0;
     if (shader_injection.dynCube_debug == 5.f) srcTex = d->dyncube_hist[outSet].pos;
     else if (shader_injection.dynCube_debug == 6.f) srcTex = d->dyncube_hist[outSet].contrib;
-    else if (shader_injection.dynCube_debug == 7.f) srcTex = d->dyncube_inferred;
-    else if (shader_injection.dynCube_debug == 8.f) srcTex = d->dyncube_infer_srcview;
-    else if (shader_injection.dynCube_debug == 9.f) srcTex = d->dyncube_charmask;
-    else if (shader_injection.dynCube_debug == 10.f) {
-      // GGX filtered cube: preview a specific mip of dyncube_ggx_out.
-      srcTex = d->dyncube_ggx_out;
+    else if (shader_injection.dynCube_debug == 7.f) srcTex = d->dyncube_charmask;
+    else if (shader_injection.dynCube_debug == 8.f) {
+      // GGX filtered cube: preview a specific mip of the ACTIVE completed cube.
+      srcTex = d->dyncube_ggx_out[d->dyncube_ggx_active];
       int mip = (int)std::clamp(shader_injection.dynCube_debug_mip, 0.f, (float)(d->dyncube_mip_count - 1));
       srcSub = (uint32_t)mip + (uint32_t)face * d->dyncube_mip_count;
       srcW = std::max(1u, d->dyncube_size >> mip);
@@ -4423,13 +4368,72 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     } else if (!dd->dyncube_solid_pipeline.handle || !dd->dyncube_capture_pipeline.handle) {
       CreateDynCubePipelinesIfNeeded(dev, dd);
     }
-    bool pushed = false;
-    auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-    renodx::utils::state::CommandListState prev = {};
-    if (cs) prev = *cs;
 
-    // Bind the history position cube (t29) for the debug 11/12/13 + position-aware lookup.
-    // Structurally valid for every debug mode (all sets share the cube layout).
+    // ── Multi-frame Dynamic Cubemap scheduler — runs ONCE per present frame ──
+    if (dd->dyncube_sched_frame != dd->frame_index) {
+      dd->dyncube_sched_frame = dd->frame_index;
+      const uint32_t interval = std::max(1u, (uint32_t)std::clamp(shader_injection.dynCube_capture_interval, 1.f, 16.f));
+
+      // SSR runs every frame, independent of the Dynamic Cubemap update interval.
+      if (shader_injection.dynCube_ssr_enabled > 0.5f) {
+        (void)RunDynCubeSSR(cmd_list, dd);
+      }
+
+      // Seed: on first activation (no completed cube yet) capture + filter immediately so
+      // the active cube is valid from the first frame (never a black/partial cube).
+      if (!dd->dyncube_ggx_valid && RunDynCubeCapture(cmd_list, dd)) {
+        if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
+          dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
+          dd->dyncube_ggx_valid = true;
+        }
+        dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+        dd->dyncube_next_update_frame = dd->frame_index + interval;
+      }
+
+      // State machine: Capture -> Filter -> Done -> wait for interval -> Capture.
+      // A new capture never begins while a previous update is still in Capture/Filter.
+      switch (dd->dyncube_phase) {
+        case DeviceData::DynCubePhase::Done:
+          if (dd->frame_index >= dd->dyncube_next_update_frame) dd->dyncube_phase = DeviceData::DynCubePhase::Capture;
+          break;
+        case DeviceData::DynCubePhase::Capture:
+          if (RunDynCubeCapture(cmd_list, dd)) {
+            dd->dyncube_next_update_frame = dd->frame_index + interval;
+            dd->dyncube_phase = DeviceData::DynCubePhase::Filter;
+          }
+          break;
+        case DeviceData::DynCubePhase::Filter:
+          if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
+            dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
+            dd->dyncube_ggx_valid = true;
+            dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+          }
+          break;
+      }
+
+      // ── Throttled scheduler log (1/sec) — verify the state machine behavior ──
+      if (shader_injection.dynCube_debug_logging > 0.5f) {
+        static auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_log >= std::chrono::seconds(1)) {
+          last_log = now;
+          const char* phaseName = (dd->dyncube_phase == DeviceData::DynCubePhase::Capture) ? "Capture"
+                                : (dd->dyncube_phase == DeviceData::DynCubePhase::Filter) ? "Filter"
+                                : "Done";
+          std::string msg = "[DynCube] ";
+          msg += "interval=" + std::to_string(interval);
+          msg += " state=" + std::string(phaseName);
+          msg += " active=" + std::string(dd->dyncube_ggx_active ? "B" : "A");
+          msg += " frame=" + std::to_string(dd->frame_index);
+          msg += " res=" + std::to_string(wantSize);
+          msg += " ssr=" + std::to_string((int)shader_injection.dynCube_ssr_enabled);
+          msg += " ggxValid=" + std::string(dd->dyncube_ggx_valid ? "1" : "0");
+          reshade::log::message(reshade::log::level::info, msg.c_str());
+        }
+      }
+    }
+
+    // Bind the history position cube (t29) — Dynamic validity source for the blend.
     {
       reshade::api::resource_view histPosSrv = dd->dyncube_hist[1u - dd->dyncube_hist_cur].pos_cube_srv;
       if (histPosSrv.handle) {
@@ -4444,6 +4448,17 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         reshade::api::descriptor_table_update{{}, kDynCubeVanillaRegister, 0, 1,
           reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
     }
+    // Bind the SSR result (t31 blurred) + raw (t32) — produced once per frame by the scheduler.
+    if (shader_injection.dynCube_ssr_enabled > 0.5f && dd->dyncube_ssr_blur_srv.handle) {
+      cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{{}, kDynCubeSSRRegister, 0, 1,
+          reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_blur_srv});
+      if (dd->dyncube_ssr_raw_srv.handle) {
+        cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+          reshade::api::descriptor_table_update{{}, kDynCubeSSRRawRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_raw_srv});
+      }
+    }
 
     if (dbg == 3) {
       // Solid face colors — validates t17 binding + handedness without capture.
@@ -4452,114 +4467,17 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
             reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_solid_cube_srv});
-        pushed = true;
       }
     } else if (overrideT17) {
-      // Normal / Show Cube / Face Viz / History / Inference — capture then optionally infer
-      if (RunDynCubeCapture(cmd_list, dd)) {
-        reshade::api::resource_view t17srv = dd->dyncube_srv;
-        if (shader_injection.dynCube_inference > 0.5f
-            && RunDynCubeInference(cmd_list, dd)) {
-          // Phase 3: filter the inferred environment into a roughness mip chain.
-          const bool ggxOn = (shader_injection.dynCube_ggx > 0.5f);
-          if (RunDynCubeFilter(cmd_list, dd, ggxOn)) {
-            t17srv = dd->dyncube_ggx_out_cube_srv; // filtered cube feeds t17
-          } else {
-            t17srv = dd->dyncube_inferred_cube_srv; // fallback to 1-mip inferred
-          }
-        }
-        // Simple SSR (screen-space ray march + blur) — independent of history/ggx.
-        if (shader_injection.dynCube_ssr_enabled > 0.5f) {
-          if (RunDynCubeSSR(cmd_list, dd) && dd->dyncube_ssr_blur_srv.handle) {
-            cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-              reshade::api::descriptor_table_update{{}, kDynCubeSSRRegister, 0, 1,
-                reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_blur_srv});
-            if (dd->dyncube_ssr_raw_srv.handle) {
-              cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-                reshade::api::descriptor_table_update{{}, kDynCubeSSRRawRegister, 0, 1,
-                  reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_ssr_raw_srv});
-            }
-          }
-        }
+      // Push the ACTIVE completed filtered cube (never a partially-written building cube).
+      // Before the first filter completes, fall back to the raw history cube.
+      reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
+          ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+          : dd->dyncube_srv;
+      if (t17srv.handle) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
             reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
-        pushed = true;
-      } else {
-        // Capture failed (missing depth/color/cbv) — ensure solid fallback if already written
-        if (dd->dyncube_srv.handle) {
-          cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
-            reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
-              reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_srv});
-          pushed = true;
-        }
-        // No extra spam log here; main throttled log below reports capDepth/capColor/cbvValid
-      }
-      // Force Vanilla ON: run capture/inference/filter/SSR in background but don't override t17
-      if (forceVanilla) {
-        // Still run capture/inference/filter/SSR in background so history accumulates for A/B switching
-        if (RunDynCubeCapture(cmd_list, dd)) {
-          if (shader_injection.dynCube_inference > 0.5f) {
-            (void)RunDynCubeInference(cmd_list, dd);
-            (void)RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f));
-          }
-          if (shader_injection.dynCube_ssr_enabled > 0.5f) {
-            (void)RunDynCubeSSR(cmd_list, dd);
-          }
-        }
-      }
-      // ── Throttled debug log (1/sec) — diagnose which part is broken ──
-      if (shader_injection.dynCube_debug_logging > 0.5f) {
-        static auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
-        auto now = std::chrono::steady_clock::now();
-        if (now - last_log >= std::chrono::seconds(1)) {
-          last_log = now;
-          std::string msg = "[DynCube] ";
-          msg += "enabled=1";
-          msg += " debug=" + std::to_string(dbg);
-          msg += " res=" + std::to_string(wantSize);
-          msg += " resCreated=" + std::string(dd->dyncube_resources_created ? "1" : "0");
-          msg += " srv=" + std::string(dd->dyncube_srv.handle ? "ok" : "null");
-          msg += " uav=" + std::string(dd->dyncube_uav.handle ? "ok" : "null");
-          msg += " capDepth=" + std::string(dd->captured_depth_srv.handle ? "ok" : "null");
-          msg += " capColor=" + std::string(dd->captured_color_srv.handle ? "ok" : "null");
-          msg += " cbvValid=" + std::string(dd->captured_scene_cbv_valid ? "1" : "0");
-          msg += " capPipe=" + std::string(dd->dyncube_capture_pipeline.handle ? "ok" : "null");
-          msg += " solidPipe=" + std::string(dd->dyncube_solid_pipeline.handle ? "ok" : "null");
-          msg += " pushed=" + std::string(pushed ? "1" : "0");
-          msg += " history=" + std::to_string((int)shader_injection.dynCube_history);
-          msg += " pingPong=" + std::string(dd->dyncube_hist_cur ? "B" : "A");
-          msg += " histRead=" + std::string(dd->dyncube_hist[1u - dd->dyncube_hist_cur].color_arr_srv.handle ? "ok" : "null");
-          msg += " histWrite=" + std::string(dd->dyncube_hist[dd->dyncube_hist_cur].color_uav.handle ? "ok" : "null");
-          msg += " posRead=" + std::string(dd->dyncube_hist[1u - dd->dyncube_hist_cur].pos_arr_srv.handle ? "ok" : "null");
-          msg += " posWrite=" + std::string(dd->dyncube_hist[dd->dyncube_hist_cur].pos_uav.handle ? "ok" : "null");
-          msg += " inference=" + std::to_string((int)shader_injection.dynCube_inference);
-          msg += " inferPipe=" + std::string(dd->dyncube_infer_pipeline.handle ? "ok" : "null");
-          msg += " inferMips=" + std::string(dd->dyncube_infer_mips_cube_srv.handle ? "ok" : "null");
-          msg += " inferSrv=" + std::string(dd->dyncube_inferred_cube_srv.handle ? "ok" : "null");
-          msg += " forceVanilla=" + std::to_string((int)shader_injection.dynCube_force_vanilla);
-          msg += " charCapture=" + std::to_string((int)shader_injection.dynCube_character_capture);
-          msg += " charMaskAvail=" + std::string(dd->captured_mrt_normal_srv.handle ? "1" : "0");
-          msg += " ggx=" + std::to_string((int)shader_injection.dynCube_ggx);
-          msg += " ggxIn=" + std::string(dd->dyncube_ggx_in_cube_srv.handle ? "ok" : "null");
-          msg += " ggxOut=" + std::string(dd->dyncube_ggx_out_cube_srv.handle ? "ok" : "null");
-          msg += " ggxPipe=" + std::string(dd->dyncube_ggx_pipeline.handle ? "ok" : "null");
-          msg += " mips=" + std::to_string(dd->dyncube_mip_count);
-          msg += " posAware=" + std::to_string((int)shader_injection.dynCube_pos_aware_enabled);
-          msg += " paStrength=" + std::to_string((int)(shader_injection.dynCube_pos_aware_strength * 100.f));
-          msg += " paSamples=" + std::to_string(shader_injection.dynCube_pos_aware_samples < 0.5f ? 4 : (shader_injection.dynCube_pos_aware_samples < 1.5f ? 8 : 16));
-          msg += " paSpread=" + std::to_string((int)(shader_injection.dynCube_pos_aware_spread * 100.f));
-          msg += " ssr=" + std::to_string((int)shader_injection.dynCube_ssr_enabled);
-          msg += " ssrBlur=" + std::string(dd->dyncube_ssr_blur_srv.handle ? "ok" : "null");
-          msg += " ssrPipe=" + std::string(dd->dyncube_ssr_pipeline.handle ? "ok" : "null");
-          msg += " ssrBlurPipe=" + std::string(dd->dyncube_ssr_blur_pipeline.handle ? "ok" : "null");
-          msg += " vanillaSrv=" + std::string(dd->captured_vanilla_env_srv.handle ? "ok" : "null");
-          msg += " t17src=" + std::string(pushed ? (forceVanilla ? "vanilla" : "dynamic") : "none");
-          if (dbg == 4) msg += " (NoOverride)";
-          else if (dbg == 3) msg += " (Solid)";
-          else if (!pushed) msg += " (FAILED)";
-          reshade::log::message(reshade::log::level::info, msg.c_str());
-        }
       }
     }
   }
@@ -5065,18 +4983,17 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   for (uint32_t i = 0; i < 2; ++i) {
     dv(d->dyncube_cam_srv[i]); dv(d->dyncube_cam_uav[i]); dr(d->dyncube_cam[i]);
   }
-  // Phase 2 inference
-  dv(d->dyncube_infer_mips_cube_srv); dv(d->dyncube_infer_mips_uav); dr(d->dyncube_infer_mips);
-  dv(d->dyncube_inferred_cube_srv); dv(d->dyncube_inferred_uav); dr(d->dyncube_inferred);
-  dv(d->dyncube_infer_srcview_srv); dv(d->dyncube_infer_srcview_uav); dr(d->dyncube_infer_srcview);
-  if (d->dyncube_infer_sampler.handle) { dev->destroy_sampler(d->dyncube_infer_sampler); d->dyncube_infer_sampler = {}; }
   // Character mask
   dv(d->dyncube_charmask_srv); dr(d->dyncube_charmask);
   if (d->dyncube_charmask_uav.handle) { dev->destroy_resource_view(d->dyncube_charmask_uav); d->dyncube_charmask_uav = {}; }
   // Phase 3 GGX
+  if (d->dyncube_linear_sampler.handle) { dev->destroy_sampler(d->dyncube_linear_sampler); d->dyncube_linear_sampler = {}; }
   dv(d->dyncube_ggx_in_cube_srv); dr(d->dyncube_ggx_in);
-  dv(d->dyncube_ggx_out_cube_srv); dr(d->dyncube_ggx_out);
-  for (auto& u : d->dyncube_ggx_out_mip_uav) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
+  for (uint32_t i = 0; i < 2; ++i) {
+    dv(d->dyncube_ggx_out_cube_srv[i]); dr(d->dyncube_ggx_out[i]);
+    for (auto& u : d->dyncube_ggx_out_mip_uav[i]) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
+  }
+  d->dyncube_ggx_valid = false;
   // Dedicated solid-color debug cube
   dv(d->dyncube_solid_cube_srv); dr(d->dyncube_solid_cube);
   if (d->dyncube_solid_cube_uav.handle) { dev->destroy_resource_view(d->dyncube_solid_cube_uav); d->dyncube_solid_cube_uav = {}; }
@@ -5093,10 +5010,6 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& t : d->dyncube_ssr_blur_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   dp(d->dyncube_ggx_pipeline); dl(d->dyncube_ggx_layout);
   for (auto& t : d->dyncube_ggx_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-  dp(d->dyncube_infer_prep_pipeline); dl(d->dyncube_infer_prep_layout);
-  for (auto& t : d->dyncube_infer_prep_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
-  dp(d->dyncube_infer_pipeline); dl(d->dyncube_infer_layout);
-  for (auto& t : d->dyncube_infer_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_hist_cur = 0;
   d->dyncube_needs_reset = true;
   dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
@@ -5222,67 +5135,12 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   d->dyncube_srv = d->dyncube_hist[0].color_cube_srv;
   d->dyncube_uav = d->dyncube_hist[0].color_uav;
 
-  // ── Phase 2 inference resources ──
+  // Trilinear clamp sampler for GGX input-chain mip sampling (distinct from point clamp).
   {
-    // Coverage mip chain: RGBA16F cube, 8 mips, generate_mipmaps flag (hardware GenMips)
-    reshade::api::resource_desc rd = {};
-    rd.type = reshade::api::resource_type::texture_2d;
-    rd.texture = {size, size, 6, 8, reshade::api::format::r16g16b16a16_float, 1};
-    rd.heap = reshade::api::memory_heap::gpu_only;
-    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-    rd.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;
-    if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_infer_mips)) {
-      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create infer mips");
-      DestroyDynCubeResources(dev, d);
-      return false;
-    }
-    dev->create_resource_view(d->dyncube_infer_mips, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, 8, 0, 6),
-      &d->dyncube_infer_mips_cube_srv);
-    dev->create_resource_view(d->dyncube_infer_mips, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_infer_mips_uav);
-    // Inferred output (t17 when inference ON): RGBA16F cube, 1 mip
-    reshade::api::resource_desc io = {};
-    io.type = reshade::api::resource_type::texture_2d;
-    io.texture = {size, size, 6, 1, reshade::api::format::r16g16b16a16_float, 1};
-    io.heap = reshade::api::memory_heap::gpu_only;
-    io.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-    io.flags = reshade::api::resource_flags::cube_compatible;
-    if (!dev->create_resource(io, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_inferred)) {
-      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create inferred");
-      DestroyDynCubeResources(dev, d);
-      return false;
-    }
-    dev->create_resource_view(d->dyncube_inferred, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_inferred_cube_srv);
-    dev->create_resource_view(d->dyncube_inferred, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_inferred_uav);
-    // Source-marker debug view (debug 8): RGBA16F array, 1 mip
-    if (!dev->create_resource(io, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_infer_srcview)) {
-      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create infer srcview");
-      DestroyDynCubeResources(dev, d);
-      return false;
-    }
-    dev->create_resource_view(d->dyncube_infer_srcview, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_infer_srcview_srv);
-    dev->create_resource_view(d->dyncube_infer_srcview, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_infer_srcview_uav);
-    // Trilinear clamp sampler for mip sampling (distinct from point clamp)
     reshade::api::sampler_desc ls = {};
     ls.filter = reshade::api::filter_mode::min_mag_mip_linear;
     ls.address_u = ls.address_v = ls.address_w = reshade::api::texture_address_mode::clamp;
-    dev->create_sampler(ls, &d->dyncube_infer_sampler);
+    dev->create_sampler(ls, &d->dyncube_linear_sampler);
   }
 
   // Character mask (Phase 2): RGBA16F cube, 1 mip
@@ -5332,29 +5190,34 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
                                        reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
       &d->dyncube_ggx_in_cube_srv);
 
-    // Output: RGBA16F cube, N mips (mip0 = sharp inferred copy, mips 1..N-1 = filtered).
+    // Output: two RGBA16F cubes, N mips each (mip0 = sharp history copy, mips 1..N-1 = filtered).
+    // Double-buffered (Active/Building) so a partially-written cube is never exposed to t17.
     reshade::api::resource_desc rdo = {};
     rdo.type = reshade::api::resource_type::texture_2d;
     rdo.texture = {size, size, 6, (uint16_t)mips, reshade::api::format::r16g16b16a16_float, 1};
     rdo.heap = reshade::api::memory_heap::gpu_only;
     rdo.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
     rdo.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps; // HW A/B path GenerateMips
-    if (!dev->create_resource(rdo, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_ggx_out)) {
-      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create GGX output");
-      DestroyDynCubeResources(dev, d);
-      return false;
+    for (uint32_t i = 0; i < 2; ++i) {
+      if (!dev->create_resource(rdo, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_ggx_out[i])) {
+        if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create GGX output");
+        DestroyDynCubeResources(dev, d);
+        return false;
+      }
+      dev->create_resource_view(d->dyncube_ggx_out[i], reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                         reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
+        &d->dyncube_ggx_out_cube_srv[i]);
+      // Per-mip array UAVs (mips 1..N-1) for the GGX filter dispatches.
+      for (uint32_t m = 1; m < mips; ++m) {
+        dev->create_resource_view(d->dyncube_ggx_out[i], reshade::api::resource_usage::unordered_access,
+          reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                           reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
+          &d->dyncube_ggx_out_mip_uav[i][m]);
+      }
     }
-    dev->create_resource_view(d->dyncube_ggx_out, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
-      &d->dyncube_ggx_out_cube_srv);
-    // Per-mip array UAVs (mips 1..N-1) for the GGX filter dispatches.
-    for (uint32_t m = 1; m < mips; ++m) {
-      dev->create_resource_view(d->dyncube_ggx_out, reshade::api::resource_usage::unordered_access,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                         reshade::api::format::r16g16b16a16_float, m, 1, 0, 6),
-        &d->dyncube_ggx_out_mip_uav[m]);
-    }
+    d->dyncube_ggx_active = 0;
+    d->dyncube_ggx_valid = false;
   }
 
   // Dedicated solid-color debug cube (debug 3) — independent of history/ggx resources.
@@ -5486,57 +5349,6 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (!mkcs(__dyncube_solid, d->dyncube_solid_layout, &d->dyncube_solid_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] solid pipeline create failed");
     }
-
-  // ── Phase 2 inference pipelines ──
-  auto make_infer_prep_layout = [&](reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR srv_r     = {0,0,0,2,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 histColor, t1 histPos
-    DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 infer_mips mip0
-    P p0, p1, p2;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
-    P params[3] = {p0,p1,p2};
-    return dev->create_pipeline_layout(3, params, out);
-  };
-  auto make_infer_layout = [&](reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
-    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR srv_r     = {0,0,0,1,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 infer_mips cube
-    DR uav_r     = {0,0,0,2,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 inferred, u1 srcview
-    reshade::api::constant_range push_range = {};
-    push_range.binding = 0;
-    push_range.dx_register_index = 13;
-    push_range.dx_register_space = 0;
-    push_range.count = 2; // coverageThreshold, minMipCoverage
-    push_range.visibility = DS::all_compute;
-    P p0, p1, p2, pPush;
-    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
-    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
-    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
-    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[4] = {p0,p1,p2,pPush};
-    return dev->create_pipeline_layout(4, params, out);
-  };
-  if (!make_infer_prep_layout(&d->dyncube_infer_prep_layout)) return false;
-  if (!make_infer_layout(&d->dyncube_infer_layout)) return false;
-  if (!ensure(d->dyncube_infer_prep_layout, &d->dyncube_infer_prep_tables, 3)) return false;
-  if (!ensure(d->dyncube_infer_layout, &d->dyncube_infer_tables, 3)) return false;
-  #ifdef __InferDynamicCubemapPrepCS_EMBED_FILE
-  if (!__InferDynamicCubemapPrepCS.empty()) {
-    if (!mkcs(__InferDynamicCubemapPrepCS, d->dyncube_infer_prep_layout, &d->dyncube_infer_prep_pipeline)) {
-      if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] infer prep pipeline create failed");
-    }
-  }
-  #endif
-  #ifdef __InferDynamicCubemapCS_EMBED_FILE
-  if (!__InferDynamicCubemapCS.empty()) {
-    if (!mkcs(__InferDynamicCubemapCS, d->dyncube_infer_layout, &d->dyncube_infer_pipeline)) {
-      if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] infer pipeline create failed");
-    }
-  }
-  #endif
 
   // ── Phase 3 GGX prefilter pipeline ──
   auto make_ggx_layout = [&](reshade::api::pipeline_layout* out) -> bool {
@@ -5746,101 +5558,45 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   return true;
 }
 
-static bool RunDynCubeInference(reshade::api::command_list* cl, DeviceData* d) {
-  if (!cl || !d) return false;
-  if (!d->dyncube_resources_created) return false;
-  auto* dev = cl->get_device();
-  if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
-  if (!d->dyncube_infer_prep_pipeline.handle || !d->dyncube_infer_pipeline.handle) return false;
-  if (!d->dyncube_infer_mips_cube_srv.handle || !d->dyncube_infer_mips_uav.handle) return false;
-
-  const uint32_t outSet = 1u - d->dyncube_hist_cur; // freshly written history set (alias target)
-  if (!d->dyncube_hist[outSet].color_arr_srv.handle || !d->dyncube_hist[outSet].pos_arr_srv.handle) return false;
-
-  const uint32_t sz = d->dyncube_size;
-
-  // 1) Prep: copy history color.rgb + pos.a (validity) into infer_mips mip0
-  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_infer_prep_pipeline);
-  auto* pt = &d->dyncube_infer_prep_tables;
-  reshade::api::resource_view prep_srvs[2] = {d->dyncube_hist[outSet].color_arr_srv, d->dyncube_hist[outSet].pos_arr_srv};
-  reshade::api::descriptor_table_update pu[3] = {
-    {pt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
-    {pt->at(1), 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, prep_srvs},
-    {pt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_infer_mips_uav},
-  };
-  dev->update_descriptor_tables(3, pu);
-  std::array<reshade::api::descriptor_table, 3> ptables = {pt->at(0), pt->at(1), pt->at(2)};
-  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_infer_prep_layout, 0, 3, ptables.data());
-  cl->dispatch((sz + 7)/8, (sz + 7)/8, 6);
-  cl->barrier(d->dyncube_infer_mips, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-
-  // Unbind the mip UAV so hardware GenerateMips has a clean shader_resource state.
-  {
-    reshade::api::resource_view nullUav = {};
-    reshade::api::descriptor_table_update nu = {pt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &nullUav};
-    dev->update_descriptor_tables(1, &nu);
-    cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_infer_prep_layout, 2, 1, &pt->at(2));
-  }
-
-  // 2) Hardware GenerateMips over the coverage chain (blurs rgb + averages validity alpha)
-  cl->generate_mipmaps(d->dyncube_infer_mips_cube_srv);
-
-  // 3) Inference: mip-walk to fill uncovered directions
-  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_infer_pipeline);
-  auto* it = &d->dyncube_infer_tables;
-  reshade::api::resource_view infer_uavs[2] = {d->dyncube_inferred_uav, d->dyncube_infer_srcview_uav};
-  reshade::api::descriptor_table_update iu[3] = {
-    {it->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_infer_sampler},
-    {it->at(1), 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->dyncube_infer_mips_cube_srv},
-    {it->at(2), 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, infer_uavs},
-  };
-  dev->update_descriptor_tables(3, iu);
-  std::array<reshade::api::descriptor_table, 3> itables = {it->at(0), it->at(1), it->at(2)};
-  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_infer_layout, 0, 3, itables.data());
-  float pc[2] = {
-      std::clamp(shader_injection.dynCube_inference_coverage_threshold, 0.f, 1.f),
-      std::clamp(shader_injection.dynCube_inference_min_mip_coverage, 0.f, 1.f),
-  };
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_infer_layout, 3, 0, 2, pc);
-  cl->dispatch((sz + 7)/8, (sz + 7)/8, 6);
-  cl->barrier(d->dyncube_inferred, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  cl->barrier(d->dyncube_infer_srcview, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-  return true;
-}
-
-// Phase 3: filter the inferred environment into a multi-mip roughness chain.
-// ggxOn = false -> hardware GenerateMips (box-filter) A/B path.
+// Phase 3: filter the freshly captured history cube into a multi-mip roughness chain.
+// ggxOn = false -> hardware GenerateMips (box-filter) path.
 // ggxOn = true  -> GGX NDF importance-sampled mips 1..N-1 (mip0 stays a sharp copy).
-// Reads dyncube_inferred; never overwrites it. Output is dyncube_ggx_out (t17 source).
+// Source = the just-written history color cube (dyncube_texture). Output = the BUILDING
+// ggx_out cube (index 1 - ggx_active); the caller swaps ggx_active on success so a
+// partially-written cube is never bound to t17.
 static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool ggxOn) {
   if (!cl || !d) return false;
   if (!d->dyncube_resources_created) return false;
-  if (!d->dyncube_inferred.handle || !d->dyncube_ggx_out.handle) return false;
+  if (!d->dyncube_texture.handle) return false;
   auto* dev = cl->get_device();
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
 
   const uint32_t mips = d->dyncube_mip_count;
   const uint32_t sz = d->dyncube_size;
+  const uint32_t building = 1u - d->dyncube_ggx_active;
   if (mips < 2) return false;
 
-  // Copy the 6 inferred faces into mip0 of a target cube (dst sub = face * mips).
-  auto copy_mip0 = [&](reshade::api::resource dst) -> bool {
-    if (!dst.handle) return false;
-    cl->barrier(d->dyncube_inferred, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
-    cl->barrier(dst, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
+  reshade::api::resource src = d->dyncube_texture;
+  reshade::api::resource dst = d->dyncube_ggx_out[building];
+
+  // Copy the 6 history faces into mip0 of a target cube (dst sub = face * mips).
+  auto copy_mip0 = [&](reshade::api::resource dstRes) -> bool {
+    if (!dstRes.handle) return false;
+    cl->barrier(src, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
+    cl->barrier(dstRes, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
     reshade::api::subresource_box box = {0,0,0, sz, sz, 1};
     for (uint32_t f = 0; f < 6; ++f) {
-      cl->copy_texture_region(d->dyncube_inferred, f, &box, dst, f * mips, &box, reshade::api::filter_mode::min_mag_mip_point);
+      cl->copy_texture_region(src, f, &box, dstRes, f * mips, &box, reshade::api::filter_mode::min_mag_mip_point);
     }
-    cl->barrier(d->dyncube_inferred, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
-    cl->barrier(dst, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
+    cl->barrier(src, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
+    cl->barrier(dstRes, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
     return true;
   };
 
   if (!ggxOn) {
-    // Hardware box-filtered mips: mip0 = sharp inferred, rest = GenerateMips.
-    if (!copy_mip0(d->dyncube_ggx_out)) return false;
-    cl->generate_mipmaps(d->dyncube_ggx_out_cube_srv);
+    // Hardware box-filtered mips: mip0 = sharp history copy, rest = GenerateMips.
+    if (!copy_mip0(dst)) return false;
+    cl->generate_mipmaps(d->dyncube_ggx_out_cube_srv[building]);
     return true;
   }
 
@@ -5849,21 +5605,21 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
   if (!d->dyncube_ggx_in.handle || !d->dyncube_ggx_in_cube_srv.handle) return false;
   if (!copy_mip0(d->dyncube_ggx_in)) return false;
   cl->generate_mipmaps(d->dyncube_ggx_in_cube_srv);
-  if (!copy_mip0(d->dyncube_ggx_out)) return false;
+  if (!copy_mip0(dst)) return false;
 
   if (!d->dyncube_ggx_pipeline.handle) return false;
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ggx_pipeline);
   auto* gt = &d->dyncube_ggx_tables;
 
   // Filter mips 1..N-1, roughness = mip / (N-1) (matches Skyrim reference).
-  cl->barrier(d->dyncube_ggx_out, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+  cl->barrier(dst, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
   const float delta = 1.0f / float(mips - 1);
   for (uint32_t m = 1; m < mips; ++m) {
-    if (!d->dyncube_ggx_out_mip_uav[m].handle) continue;
+    if (!d->dyncube_ggx_out_mip_uav[building][m].handle) continue;
     reshade::api::descriptor_table_update gu[3] = {
-        {gt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_infer_sampler},
+        {gt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_linear_sampler},
         {gt->at(1), 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->dyncube_ggx_in_cube_srv},
-        {gt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ggx_out_mip_uav[m]},
+        {gt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ggx_out_mip_uav[building][m]},
     };
     dev->update_descriptor_tables(3, gu);
     std::array<reshade::api::descriptor_table, 3> gtables = {gt->at(0), gt->at(1), gt->at(2)};
@@ -5873,7 +5629,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
     uint32_t mw = std::max(1u, sz >> m);
     cl->dispatch((mw + 7u) / 8u, (mw + 7u) / 8u, 6);
   }
-  cl->barrier(d->dyncube_ggx_out, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  cl->barrier(dst, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   return true;
 }
 

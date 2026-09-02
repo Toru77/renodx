@@ -344,23 +344,19 @@ struct ShaderInjectData {
   float dynCube_debug;                     // 0=Off(normal) 1=ShowDynamicCube 2=FaceViz 3=SolidColors 4=NoOverride
   float dynCube_resolution;                // 0=64 1=96 2=128 (default 128)
   float dynCube_history;                   // 0=Off (Phase0B no history) 1=On (Phase1 lerp 0.5)
-  float dynCube_inference;                 // 0=Off 1=On (Phase2)
   float dynCube_ggx;                       // 0=HW mips (cheap approx) 1=GGX (Phase3)
-  float dynCube_capture_interval;          // 0=Every frame 1=Every 2nd ...
+  float dynCube_capture_interval;          // frames between capture starts (1=fastest 2-stage cadence)
   float dynCube_roughness_boost;           // placeholder for future mip boost
   float dynCube_debug_logging;             // 0=Off 1=On — 1 log/sec diag for which part is broken
   float dynCube_debug_face;                // 0..5 face for preview when debug=1/2/5/6
-  float dynCube_debug_mip;                 // 0..7 mip for GGX filtered preview when debug=10
+  float dynCube_debug_mip;                 // 0..7 mip for GGX filtered preview when debug=8
   float dynCube_force_mip;                 // debug: -1=normal roughness LOD, 0..7=force t17 mip
   float dynCube_parallax_enabled;              // 0=off 1=on (probe-box parallax correction)
   float dynCube_parallax_box_size_x;           // probe box size X (world units), default 20
   float dynCube_parallax_box_size_y;           // default 10
   float dynCube_parallax_box_size_z;           // default 20
   float dynCube_parallax_debug;                // 0=off 1=on (tint reflection by probe-box exit face)
-  float dynCube_pos_aware_enabled;               // 0=off 1=on (position-aware histPos lookup)
-  float dynCube_pos_aware_strength;              // 0..1 blend to position-aware direction, default 1
-  float dynCube_pos_aware_samples;               // 0/1/2 -> 4/8/16, default 1 (8)
-  float dynCube_pos_aware_spread;                // tangent spread, default 0.35
+  float dynCube_reflect_sign_flip;               // 0=mathematical reflect ray (current), 1=physical ray (negated) — debug A/B
   float dynCube_ssr_enabled;                     // 0=off 1=on (simple screen-space SSR)
   float dynCube_ssr_quality;                     // 0/1/2 -> Low/Medium/High (sample+dist mapping)
   float dynCube_ssr_blur;                        // SSR Gaussian blur sigma, 0=sharp
@@ -372,12 +368,11 @@ struct ShaderInjectData {
   float dynCube_capture_boost;             // capture color boost multiplier, default 1.0
   float dynCube_history_blend;             // temporal lerp weight, default 0.5
   float dynCube_history_pos_threshold;     // world-unit position compatibility threshold, default 0.5
-  float dynCube_inference_coverage_threshold;   // mip0 validity >= this -> copy history unchanged, default 0.5
-  float dynCube_inference_min_mip_coverage;     // coarser mip validity >= this -> use to fill, default 0.05
   float dynCube_character_capture;              // 0=exclude characters (default), 1=capture characters
   float dynCube_force_vanilla;                  // 0=bind dynamic cube to t17, 1=keep vanilla t17 (A/B)
   float dynCube_force_dynamic;                  // 0=off 1=on (debug: dynamic cubemap only)
   float dynCube_force_ssr;                      // 0=off 1=on (debug: SSR only)
+  float dynCube_layer_mix;                      // -1=automatic confidence blend, 0..2=manual (0=SSR,1=Dynamic,2=Vanilla)
 };
 
 #ifndef __cplusplus
