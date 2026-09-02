@@ -34,16 +34,24 @@ void main(uint3 dtid : SV_DispatchThreadID)
     const float sigma = max(g_sigma, 1e-3);
     const float invSigma2 = 0.5 / (sigma * sigma);
 
-    float4 sum = 0.0;
-    float total = 0.0;
+    // Confidence-weighted accumulation: color contributes only where SSR has
+    // valid confidence (a), so SSR color never bleeds into low/miss regions.
+    float3 accumColor = 0.0;
+    float accumConfidence = 0.0;
+    float totalWeight = 0.0;
     for (int d = -radius; d <= radius; ++d) {
         float wgt = exp(-float(d) * float(d) * invSigma2);
         int2 tap = (g_horizontal > 0.5)
             ? int2(px.x + d, px.y)
             : int2(px.x, px.y + d);
         tap = clamp(tap, int2(0, 0), int2(w, h) - int2(1, 1));
-        sum += g_inTex.Load(int3(tap, 0)) * wgt;
-        total += wgt;
+        float4 sample = g_inTex.Load(int3(tap, 0));
+        float conf = sample.a;
+        accumColor += sample.rgb * conf * wgt;
+        accumConfidence += conf * wgt;
+        totalWeight += wgt;
     }
-    g_outTex[px] = sum / max(total, 1e-6);
+    float finalConfidence = accumConfidence / max(totalWeight, 1e-4);
+    float3 finalColor = accumColor / max(accumConfidence, 1e-4);
+    g_outTex[px] = float4(max(0.0, finalColor), finalConfidence);
 }
