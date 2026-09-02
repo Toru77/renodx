@@ -890,15 +890,17 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r8.z = (float)(num_levels - 1);
       r8.z = r8.z * r5.z;
       // Debug: Force Cubemap Mip (dynCube_force_mip >= 0) — bypass roughness LOD to verify the GGX chain.
-      if (shader_injection_data.dynCube_force_mip > -0.5f) {
+      // DynCube-only mip overrides apply only to the dynamic path; DynCube OFF = pure game vanilla.
+      if (shader_injection_data.dynCube_enabled > 0.5f && shader_injection_data.dynCube_force_mip > -0.5f) {
         r8.z = clamp(shader_injection_data.dynCube_force_mip, 0.0, (float)(num_levels - 1));
       }
-      // Vanilla cubemap blur applies when t17 is the vanilla cube (Force Vanilla); the dynamic
-      // cube uses the artistic Dynamic Cubemap Blur (mip offset into the GGX/HW chain).
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r22.xyz,
-          r8.z + (shader_injection_data.dynCube_force_vanilla > 0.5f
-              ? shader_injection_data.dynCube_vanilla_blur
-              : shader_injection_data.dynCube_blur)).xyz;
+      float dynCubeSampleMip = r8.z;
+      if (shader_injection_data.dynCube_enabled > 0.5f) {
+        dynCubeSampleMip += (shader_injection_data.dynCube_force_vanilla > 0.5f
+            ? shader_injection_data.dynCube_vanilla_blur
+            : shader_injection_data.dynCube_blur);
+      }
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r22.xyz, dynCubeSampleMip).xyz;
       // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
       dynCubeReflDir = r22.xyz;
       dynCubeReflActive = true;
@@ -1057,16 +1059,18 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r5.y = (float)(num_levels - 1);
       r2.x = r5.y * r2.x;
       // Debug: Force Cubemap Mip (dynCube_force_mip >= 0) — bypass roughness LOD to verify the GGX chain.
-      if (shader_injection_data.dynCube_force_mip > -0.5f) {
+      // DynCube-only mip overrides apply only to the dynamic path; DynCube OFF = pure game vanilla.
+      if (shader_injection_data.dynCube_enabled > 0.5f && shader_injection_data.dynCube_force_mip > -0.5f) {
         r2.x = clamp(shader_injection_data.dynCube_force_mip, 0.0, (float)(num_levels - 1));
       }
-      // Vanilla cubemap blur applies when t17 is the vanilla cube (Force Vanilla); the dynamic
-      // cube uses the artistic Dynamic Cubemap Blur (mip offset into the GGX/HW chain).
       float3 dynCubeSampleDir = r21.xyz;  // flipped sample direction
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDir,
-          r2.x + (shader_injection_data.dynCube_force_vanilla > 0.5f
-              ? shader_injection_data.dynCube_vanilla_blur
-              : shader_injection_data.dynCube_blur)).xyz;
+      float dynCubeSampleMip2 = r2.x;
+      if (shader_injection_data.dynCube_enabled > 0.5f) {
+        dynCubeSampleMip2 += (shader_injection_data.dynCube_force_vanilla > 0.5f
+            ? shader_injection_data.dynCube_vanilla_blur
+            : shader_injection_data.dynCube_blur);
+      }
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDir, dynCubeSampleMip2).xyz;
       // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
       dynCubeReflDir = dynCubeSampleDir;
       dynCubeReflActive = true;
