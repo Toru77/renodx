@@ -202,6 +202,10 @@ StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
 TextureCube<float4> texEnvMap_g : register(t17);
+TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (debug 11/12)
+TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
+Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
+Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 17)
 Texture2DArray<float4> spotShadowMaps : register(t18);
 Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
@@ -212,6 +216,7 @@ Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
 
 #include "../../shared.h"
+#include "../../dyncube/parallax_cubemap.hlsli"
 #include "../../reference/brdf.hlsli"
 #include "../../reference/rendering.hlsl"
 
@@ -874,6 +879,25 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r5.y = r20.y ? r5.y : 0;
   r11.xyz = r5.yyy * r11.xyz;
   r11.xyz = lightColor_g.xyz * r11.xyz;
+  // DynCube position-aware diagnostic (debug 11/12): carries the selected sample's
+  // world position from histPos to the final output override.
+  float3 dynCubeDiag = float3(0, 0, 0);
+  bool dynCubeDiagActive = false;
+  // SSR -> Dynamic -> Vanilla reflection source resolution.
+  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_ssr_enabled > 0.5f;
+  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_force_dynamic > 0.5f;
+  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_force_ssr > 0.5f;
+  bool dynCubeReflResolveActive = dynCubeNewSSRActive || dynCubeForceDynamicActive || dynCubeForceSSRActive;
+  float3 dynCubeReflDir = float3(0, 0, 0);
+  float dynCubeReflMip = 0.0;
+  bool dynCubeReflActive = false;
+  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 16)
   if (r20.z != 0) {
     r5.yz = r15.yz * r9.yz;
     r6.w = (int)r18.z & 32;
@@ -884,38 +908,132 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     } else {
       r8.z = r3.y + r3.y;
       r22.xyz = r8.xyw * -r8.zzz + r19.xyz;
+      float3 dynCubeR = r22.xyz;  // world reflection dir (pre flip) for debug 12 ray point
+      // Parallax-corrected cubemap lookup (generic Falcom Engine+). Active only for the
+      // dynamic cube (enabled + not force-vanilla) so the vanilla path is untouched.
+      int parallaxFace = -1;
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_parallax_enabled > 0.5f) {
+        float3 parallaxDir;
+        if (DynCubeParallaxCorrect(r4.xyz, r22.xyz, viewInv_g._m30_m31_m32,
+            float3(shader_injection_data.dynCube_parallax_box_size_x,
+                   shader_injection_data.dynCube_parallax_box_size_y,
+                   shader_injection_data.dynCube_parallax_box_size_z),
+            parallaxDir, parallaxFace)) {
+          r22.xyz = parallaxDir;
+        }
+      }
       texEnvMap_g.GetDimensions(0, width, height, num_levels);
       r22.xyz = float3(1,-1,-1) * r22.xyz;
       r8.z = (float)(num_levels - 1);
       r8.z = r8.z * r5.z;
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r22.xyz, r8.z).xyz;
+      // Debug: Force Cubemap Mip (dynCube_force_mip >= 0) — bypass roughness LOD to verify the GGX chain.
+      if (shader_injection_data.dynCube_force_mip > -0.5f) {
+        r8.z = clamp(shader_injection_data.dynCube_force_mip, 0.0, (float)(num_levels - 1));
+      }
+      // Position-aware lookup: refine the sample direction using stored histPos world
+      // positions scored against the reflection ray. Only for the dynamic cube path.
+      float3 dynCubeFinalDir = r22.xyz;
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_debug != 4.f
+          && shader_injection_data.dynCube_pos_aware_enabled > 0.5f
+          && shader_injection_data.dynCube_pos_aware_strength > 0.001f) {
+        float3 paDir;
+        float paStrength = clamp(shader_injection_data.dynCube_pos_aware_strength, 0.0, 1.0);
+        uint paCount = (shader_injection_data.dynCube_pos_aware_samples < 0.5) ? 4u
+                     : (shader_injection_data.dynCube_pos_aware_samples < 1.5) ? 8u : 16u;
+        if (DynCubePosAwareLookup(dynCubeHistPosTex, samPoint_s, r4.xyz, dynCubeR, r22.xyz,
+                                  paCount, shader_injection_data.dynCube_pos_aware_spread, paDir)) {
+          dynCubeFinalDir = normalize(lerp(r22.xyz, paDir, paStrength));
+        }
+      }
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeFinalDir, r8.z).xyz;
+      // Record the reflection direction + mip for the SSR -> Dynamic -> Vanilla resolution.
+      dynCubeReflDir = dynCubeFinalDir;
+      dynCubeReflMip = r8.z;
+      dynCubeReflActive = true;
+      // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
+      if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace >= 0) {
+        r21.xyz = DynCubeParallaxFaceColor(parallaxFace);
+      }
+      // DynCube position-aware diagnostic (debug 11/12/13): histPos of the selected sample.
+      // 11 = original direction's histPos, 12 = original position error, 13 = corrected direction's histPos.
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && (shader_injection_data.dynCube_debug == 11.f || shader_injection_data.dynCube_debug == 12.f
+              || shader_injection_data.dynCube_debug == 13.f)) {
+        float4 hp = (shader_injection_data.dynCube_debug == 13.f)
+            ? dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeFinalDir, 0)
+            : dynCubeHistPosTex.SampleLevel(SmplCube_s, r22.xyz, 0);
+        float3 sampleWorld = hp.xyz * 1000.0;  // un-scale stored pos (g_posScale = 0.001)
+        if (hp.a < 0.5) {
+          dynCubeDiag = float3(1.0, 0.0, 1.0);  // magenta = no captured sample
+        } else if (shader_injection_data.dynCube_debug == 11.f || shader_injection_data.dynCube_debug == 13.f) {
+          float3 relPos = sampleWorld - viewInv_g._m30_m31_m32;
+          dynCubeDiag = saturate(relPos * (0.5 / 50.0) + 0.5);  // ±50 world units -> [0,1]
+        } else {
+          float3 rayPoint = r4.xyz + dynCubeR * 10.0;  // probe distance 10 world units
+          float err = length(rayPoint - sampleWorld);
+          dynCubeDiag = lerp(float3(0,1,0), float3(1,0,0), saturate(err / 30.0));  // green=close, red=far
+        }
+        dynCubeDiagActive = true;
+      }
     }
-    r8.z = (int)r1.z & 2;
-    // ── Custom SSR eligibility (independent of the game's vanilla mask) ──
-    //   0 = Vanilla Flag (pixel flag & 2; water-only in practice)
-    //   1 = Custom Material: roughness <= cutoff  (default)
-    //   2 = All eligible surfaces
-    bool ssrVanillaElig = (r8.z != 0);
-    bool ssrCustomElig = (r15.z <= shader_injection_data.ssr_roughness_threshold);
-    bool ssrUseCustom = shader_injection_data.ssr_apply > 0.5f
-                     && shader_injection_data.ssr_custom_bound > 0.5f
-                     && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig
-                       : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
-                       : ssrCustomElig);
-    if (ssrUseCustom) {
-      r20.xz = resolutionScaling_g.xy * v1.zw;
-      r22.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
-      r22.w = r22.w * shader_injection_data.ssr_apply_gain;
-    } else if (ssrVanillaElig) {
-      r20.xz = resolutionScaling_g.xy * v1.zw;
-      r22.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
+    if (!dynCubeReflResolveActive) {
+      // ── Existing vanilla/custom SSR eligibility + blend (kept when no new SSR/force path) ──
+      r8.z = (int)r1.z & 2;
+      bool ssrVanillaElig = (r8.z != 0);
+      bool ssrCustomElig = (r15.z <= shader_injection_data.ssr_roughness_threshold);
+      bool ssrUseCustom = shader_injection_data.ssr_apply > 0.5f
+                       && shader_injection_data.ssr_custom_bound > 0.5f
+                       && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig
+                         : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
+                         : ssrCustomElig);
+      if (ssrUseCustom) {
+        r20.xz = resolutionScaling_g.xy * v1.zw;
+        r22.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
+        r22.w = r22.w * shader_injection_data.ssr_apply_gain;
+      } else if (ssrVanillaElig) {
+        r20.xz = resolutionScaling_g.xy * v1.zw;
+        r22.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r20.xz, 0).xyzw;
+      } else {
+        r22.xyzw = float4(0, 0, 0, 0);   // no SSR contribution on this pixel
+      }
+      // Environment-vs-SSR replacement blend (AMD SSSR fallback model):
+      // α=0 → cubemap unchanged · α=1 → SSR replaces · intermediate blends.
+      r22.xyz = r22.xyz + -r21.xyz;
+      r21.xyz = r22.www * r22.xyz + r21.xyz;
     } else {
-      r22.xyzw = float4(0, 0, 0, 0);   // no SSR contribution on this pixel
+      // ── SSR > Dynamic > Vanilla resolution (new simple SSR path, with force toggles) ──
+      if (dynCubeReflActive) {
+        if (dynCubeForceDynamicActive) {
+          // Force Dynamic: keep the dynamic cube sample (r21).
+          dynCubeReflSrc = 1;
+        } else if (dynCubeForceSSRActive && dynCubeNewSSRActive) {
+          // Force SSR: use the SSR color directly.
+          float2 ssrUV = resolutionScaling_g.xy * v1.zw;
+          float4 ssrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0);
+          r21.xyz = ssrTap.rgb;
+          dynCubeReflSrc = 0;
+        } else if (dynCubeNewSSRActive) {
+          // Confidence-based blend.
+          float2 ssrUV = resolutionScaling_g.xy * v1.zw;
+          float4 ssrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0);
+          float ssrWeight = saturate(ssrTap.a);
+          float4 hpV = dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeReflDir, 0);
+          float dynamicConf = (hpV.a > 0.5f) ? 1.0 : 0.0;  // existing binary dynamic validity
+          float dynamicWeight = (1.0 - ssrWeight) * dynamicConf;
+          float vanillaWeight = 1.0 - ssrWeight - dynamicWeight;
+          float3 vanillaCol = dynCubeVanillaTex.SampleLevel(SmplCube_s, dynCubeReflDir,
+              dynCubeReflMip + shader_injection_data.dynCube_vanilla_blur).xyz;
+          r21.xyz = ssrTap.rgb * ssrWeight + r21.xyz * dynamicWeight + vanillaCol * vanillaWeight;
+          dynCubeReflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
+                         : (dynamicWeight >= vanillaWeight) ? 1 : 2;
+        }
+      }
     }
-    // Environment-vs-SSR replacement blend (AMD SSSR fallback model):
-    // α=0 → cubemap unchanged · α=1 → SSR replaces · intermediate blends.
-    r22.xyz = r22.xyz + -r21.xyz;
-    r21.xyz = r22.www * r22.xyz + r21.xyz;
     r8.z = cmp(0 < r2.x);
     r9.y = 1 + -abs(r3.y);
     r9.y = max(0, r9.y);
@@ -943,6 +1061,22 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     if (r2.x != 0) {
       r2.x = r3.y + r3.y;
       r21.xyz = r8.xyw * -r2.xxx + r19.xyz;
+      float3 dynCubeR2 = r21.xyz;  // world reflection dir (pre flip) for debug 12 ray point
+      // Parallax-corrected cubemap lookup (generic Falcom Engine+). Active only for the
+      // dynamic cube (enabled + not force-vanilla) so the vanilla path is untouched.
+      int parallaxFace2 = -1;
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_parallax_enabled > 0.5f) {
+        float3 parallaxDir2;
+        if (DynCubeParallaxCorrect(r4.xyz, r21.xyz, viewInv_g._m30_m31_m32,
+            float3(shader_injection_data.dynCube_parallax_box_size_x,
+                   shader_injection_data.dynCube_parallax_box_size_y,
+                   shader_injection_data.dynCube_parallax_box_size_z),
+            parallaxDir2, parallaxFace2)) {
+          r21.xyz = parallaxDir2;
+        }
+      }
       r2.x = 1 / r15.w;
       r5.y = dot(-r19.xyz, r8.xyw);
       r5.z = r2.x * r2.x;
@@ -959,28 +1093,110 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r21.xyz = float3(1,-1,-1) * r21.xyz;
       r5.y = (float)(num_levels - 1);
       r2.x = r5.y * r2.x;
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r21.xyz, r2.x).xyz;
-      r5.y = (int)r1.z & 2;
-      bool ssrVanillaElig2 = (r5.y != 0);
-      bool ssrCustomElig2 = (r15.z <= shader_injection_data.ssr_roughness_threshold);
-      bool ssrUseCustom2 = shader_injection_data.ssr_apply > 0.5f
-                        && shader_injection_data.ssr_custom_bound > 0.5f
-                        && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig2
-                          : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
-                          : ssrCustomElig2);
-      if (ssrUseCustom2) {
-        r5.yz = resolutionScaling_g.xy * v1.zw;
-        r23.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
-        r23.w = r23.w * shader_injection_data.ssr_apply_gain;
-      } else if (ssrVanillaElig2) {
-        r5.yz = resolutionScaling_g.xy * v1.zw;
-        r23.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
-      } else {
-        r23.xyzw = float4(0, 0, 0, 0);
+      // Debug: Force Cubemap Mip (dynCube_force_mip >= 0) — bypass roughness LOD to verify the GGX chain.
+      if (shader_injection_data.dynCube_force_mip > -0.5f) {
+        r2.x = clamp(shader_injection_data.dynCube_force_mip, 0.0, (float)(num_levels - 1));
       }
-      // Environment-vs-SSR replacement blend (site 2).
-      r23.xyz = r23.xyz + -r21.xyz;
-      r21.xyz = r23.www * r23.xyz + r21.xyz;
+      // Position-aware lookup: refine the sample direction using stored histPos world
+      // positions scored against the reflection ray. Only for the dynamic cube path.
+      float3 dynCubeFinalDir2 = r21.xyz;
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_debug != 4.f
+          && shader_injection_data.dynCube_pos_aware_enabled > 0.5f
+          && shader_injection_data.dynCube_pos_aware_strength > 0.001f) {
+        float3 paDir2;
+        float paStrength = clamp(shader_injection_data.dynCube_pos_aware_strength, 0.0, 1.0);
+        uint paCount = (shader_injection_data.dynCube_pos_aware_samples < 0.5) ? 4u
+                     : (shader_injection_data.dynCube_pos_aware_samples < 1.5) ? 8u : 16u;
+        if (DynCubePosAwareLookup(dynCubeHistPosTex, samPoint_s, r4.xyz, dynCubeR2, r21.xyz,
+                                  paCount, shader_injection_data.dynCube_pos_aware_spread, paDir2)) {
+          dynCubeFinalDir2 = normalize(lerp(r21.xyz, paDir2, paStrength));
+        }
+      }
+      float3 dynCubeSampleDir2 = r21.xyz;  // original flipped sample dir for debug 11/12 histPos lookup
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeFinalDir2, r2.x).xyz;
+      // Record the reflection direction + mip for the SSR -> Dynamic -> Vanilla resolution.
+      dynCubeReflDir = dynCubeFinalDir2;
+      dynCubeReflMip = r2.x;
+      dynCubeReflActive = true;
+      // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
+      if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace2 >= 0) {
+        r21.xyz = DynCubeParallaxFaceColor(parallaxFace2);
+      }
+      // DynCube position-aware diagnostic (debug 11/12/13): histPos of the selected sample.
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && (shader_injection_data.dynCube_debug == 11.f || shader_injection_data.dynCube_debug == 12.f
+              || shader_injection_data.dynCube_debug == 13.f)) {
+        float4 hp = (shader_injection_data.dynCube_debug == 13.f)
+            ? dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeFinalDir2, 0)
+            : dynCubeHistPosTex.SampleLevel(SmplCube_s, dynCubeSampleDir2, 0);
+        float3 sampleWorld = hp.xyz * 1000.0;  // un-scale stored pos (g_posScale = 0.001)
+        if (hp.a < 0.5) {
+          dynCubeDiag = float3(1.0, 0.0, 1.0);  // magenta = no captured sample
+        } else if (shader_injection_data.dynCube_debug == 11.f || shader_injection_data.dynCube_debug == 13.f) {
+          float3 relPos = sampleWorld - viewInv_g._m30_m31_m32;
+          dynCubeDiag = saturate(relPos * (0.5 / 50.0) + 0.5);  // ±50 world units -> [0,1]
+        } else {
+          float3 rayPoint = r4.xyz + dynCubeR2 * 10.0;  // probe distance 10 world units
+          float err = length(rayPoint - sampleWorld);
+          dynCubeDiag = lerp(float3(0,1,0), float3(1,0,0), saturate(err / 30.0));  // green=close, red=far
+        }
+        dynCubeDiagActive = true;
+      }
+      if (!dynCubeReflResolveActive) {
+        // ── Existing vanilla/custom SSR eligibility + blend (site 2, kept when no new SSR/force path) ──
+        r5.y = (int)r1.z & 2;
+        bool ssrVanillaElig2 = (r5.y != 0);
+        bool ssrCustomElig2 = (r15.z <= shader_injection_data.ssr_roughness_threshold);
+        bool ssrUseCustom2 = shader_injection_data.ssr_apply > 0.5f
+                          && shader_injection_data.ssr_custom_bound > 0.5f
+                          && ((shader_injection_data.ssr_eligibility_mode < 0.5f) ? ssrVanillaElig2
+                            : (shader_injection_data.ssr_eligibility_mode > 1.5f) ? true
+                            : ssrCustomElig2);
+        if (ssrUseCustom2) {
+          r5.yz = resolutionScaling_g.xy * v1.zw;
+          r23.xyzw = ssrCustomTexture.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
+          r23.w = r23.w * shader_injection_data.ssr_apply_gain;
+        } else if (ssrVanillaElig2) {
+          r5.yz = resolutionScaling_g.xy * v1.zw;
+          r23.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r5.yz, 0).xyzw;
+        } else {
+          r23.xyzw = float4(0, 0, 0, 0);
+        }
+        // Environment-vs-SSR replacement blend (site 2).
+        r23.xyz = r23.xyz + -r21.xyz;
+        r21.xyz = r23.www * r23.xyz + r21.xyz;
+      } else {
+        // ── SSR > Dynamic > Vanilla resolution (site 2, with force toggles) ──
+        if (dynCubeReflActive) {
+          if (dynCubeForceDynamicActive) {
+            // Force Dynamic: keep the dynamic cube sample (r21).
+            dynCubeReflSrc = 1;
+          } else if (dynCubeForceSSRActive && dynCubeNewSSRActive) {
+            // Force SSR: use the SSR color directly.
+            float2 ssrUV2 = resolutionScaling_g.xy * v1.zw;
+            float4 ssrTap2 = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV2, 0);
+            r21.xyz = ssrTap2.rgb;
+            dynCubeReflSrc = 0;
+          } else if (dynCubeNewSSRActive) {
+            // Confidence-based blend.
+            float2 ssrUV2 = resolutionScaling_g.xy * v1.zw;
+            float4 ssrTap2 = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV2, 0);
+            float ssrWeight = saturate(ssrTap2.a);
+            float4 hpV2 = dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeReflDir, 0);
+            float dynamicConf = (hpV2.a > 0.5f) ? 1.0 : 0.0;
+            float dynamicWeight = (1.0 - ssrWeight) * dynamicConf;
+            float vanillaWeight = 1.0 - ssrWeight - dynamicWeight;
+            float3 vanillaCol2 = dynCubeVanillaTex.SampleLevel(SmplCube_s, dynCubeReflDir,
+                dynCubeReflMip + shader_injection_data.dynCube_vanilla_blur).xyz;
+            r21.xyz = ssrTap2.rgb * ssrWeight + r21.xyz * dynamicWeight + vanillaCol2 * vanillaWeight;
+            dynCubeReflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
+                           : (dynamicWeight >= vanillaWeight) ? 1 : 2;
+          }
+        }
+      }
       r19.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r19.xyz, r2.x).xyz;
       r2.x = cmp(0 < r16.x);
       r5.y = 1 + -abs(r3.y);
@@ -1507,6 +1723,33 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     } else {
       o0.xyz += giColor;  // Normal: add GI to scene
     }
+  }
+  // DynCube position-aware diagnostic (debug 11/12/13): override final output with the
+  // selected sample's world position / reflection-ray position error (not the reflection color).
+  if (dynCubeDiagActive) {
+    o0.xyz = dynCubeDiag;
+  } else if (dynCubeNewSSRActive && (shader_injection_data.dynCube_debug == 14.f
+      || shader_injection_data.dynCube_debug == 15.f
+      || shader_injection_data.dynCube_debug == 17.f || shader_injection_data.dynCube_debug == 18.f)) {
+    float2 ssrUV = resolutionScaling_g.xy * v1.zw;
+    float4 ssrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0);  // blurred
+    if (shader_injection_data.dynCube_debug == 14.f) {
+      o0.xyz = ssrTap.rgb;   // SSR Result (blurred)
+    } else if (shader_injection_data.dynCube_debug == 15.f) {
+      o0.xyz = float3(ssrTap.a, ssrTap.a, ssrTap.a);  // SSR Confidence
+    } else if (shader_injection_data.dynCube_debug == 17.f) {
+      o0.xyz = dynCubeSSRRawTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0).rgb;  // SSR Raw
+    } else {
+      float minEdge = min(min(ssrUV.x, 1.0 - ssrUV.x), min(ssrUV.y, 1.0 - ssrUV.y));
+      float edgeConf = smoothstep(0.0, max(shader_injection_data.dynCube_ssr_edge_fade * 0.25, 1e-4), minEdge);
+      o0.xyz = float3(edgeConf, edgeConf, edgeConf);  // SSR Edge Fade
+    }
+  } else if (dynCubeReflResolveActive && shader_injection_data.dynCube_debug == 16.f) {
+    // Reflection Source: RED=SSR, GREEN=Dynamic, BLUE=Vanilla.
+    o0.xyz = !dynCubeReflActive ? float3(0, 0, 0)
+           : (dynCubeReflSrc == 0) ? float3(1, 0, 0)
+           : (dynCubeReflSrc == 1) ? float3(0, 1, 0)
+                                   : float3(0, 0, 1);
   }
   r0.y = saturate(0.100000001 * r0.w);
   r0.xzw = float3(255,255,255);
