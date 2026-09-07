@@ -206,6 +206,7 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history 
 TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
 Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
+StructuredBuffer<float4> dynCubeWorldBox : register(t33);  // persistent world-space AABB ([0]=min+valid, [1]=max+spare)
   Texture2DArray<float4> spotShadowMaps : register(t18);
 Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
@@ -877,7 +878,19 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           && shader_injection_data.dynCube_force_vanilla < 0.5f
           && shader_injection_data.dynCube_parallax_enabled > 0.5f) {
         float3 parallaxDir;
-        if (DynCubeParallaxCorrect(r4.xyz, r22.xyz * dynCubeReflectSign, viewInv_g._m30_m31_m32,
+        // World-fixed box path: persistent world-space proxy, margin applied at
+        // lookup time. Falls back to the camera-centered path when the toggle is
+        // off or no valid bounds were accumulated yet.
+        if (shader_injection_data.dynCube_worldbox_enabled > 0.5f
+            && dynCubeWorldBox[0].w > 0.5f) {
+          float wbMargin = max(0.0f, shader_injection_data.dynCube_worldbox_margin);
+          if (DynCubeParallaxCorrectBox(r4.xyz, r22.xyz * dynCubeReflectSign, viewInv_g._m30_m31_m32,
+              dynCubeWorldBox[0].xyz - wbMargin,
+              dynCubeWorldBox[1].xyz + wbMargin,
+              parallaxDir, parallaxFace)) {
+            r22.xyz = parallaxDir * dynCubeReflectSign;
+          }
+        } else if (DynCubeParallaxCorrect(r4.xyz, r22.xyz * dynCubeReflectSign, viewInv_g._m30_m31_m32,
             float3(shader_injection_data.dynCube_parallax_box_size_x,
                    shader_injection_data.dynCube_parallax_box_size_y,
                    shader_injection_data.dynCube_parallax_box_size_z),
@@ -1036,7 +1049,19 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           && shader_injection_data.dynCube_force_vanilla < 0.5f
           && shader_injection_data.dynCube_parallax_enabled > 0.5f) {
         float3 parallaxDir2;
-        if (DynCubeParallaxCorrect(r4.xyz, r21.xyz * dynCubeReflectSign, viewInv_g._m30_m31_m32,
+        // World-fixed box path: persistent world-space proxy, margin applied at
+        // lookup time. Falls back to the camera-centered path when the toggle is
+        // off or no valid bounds were accumulated yet.
+        if (shader_injection_data.dynCube_worldbox_enabled > 0.5f
+            && dynCubeWorldBox[0].w > 0.5f) {
+          float wbMargin2 = max(0.0f, shader_injection_data.dynCube_worldbox_margin);
+          if (DynCubeParallaxCorrectBox(r4.xyz, r21.xyz * dynCubeReflectSign, viewInv_g._m30_m31_m32,
+              dynCubeWorldBox[0].xyz - wbMargin2,
+              dynCubeWorldBox[1].xyz + wbMargin2,
+              parallaxDir2, parallaxFace2)) {
+            r21.xyz = parallaxDir2 * dynCubeReflectSign;
+          }
+        } else if (DynCubeParallaxCorrect(r4.xyz, r21.xyz * dynCubeReflectSign, viewInv_g._m30_m31_m32,
             float3(shader_injection_data.dynCube_parallax_box_size_x,
                    shader_injection_data.dynCube_parallax_box_size_y,
                    shader_injection_data.dynCube_parallax_box_size_z),

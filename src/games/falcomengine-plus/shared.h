@@ -320,6 +320,8 @@ struct ShaderInjectData {
   float dynCube_force_ssr;                      // 0=off 1=on (debug: SSR only)
   float dynCube_layer_mix;                      // -1=automatic confidence blend, 0..2=manual (0=SSR,1=Dynamic,2=Vanilla)
   float dynCube_blur;                           // artistic mip-offset blur on the dynamic cube sample (fractional), 0=sharp
+  float dynCube_worldbox_enabled;                // 0=off (camera-centered proxy), 1=on (persistent world-space proxy)
+  float dynCube_worldbox_margin;                 // world-unit margin expanded around the stored bounds at lookup, default 1.0
   float dynCube_lookup_direction_flip;        // 0=off (current dynamic lookup), 1=negate final dynamic lookup dir — independent of parallax reflect sign
 };
 

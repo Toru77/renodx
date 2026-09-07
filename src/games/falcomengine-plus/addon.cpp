@@ -289,6 +289,8 @@ ShaderInjectData shader_injection = {
   .dynCube_force_ssr = 0.f,
   .dynCube_layer_mix = -1.f,
   .dynCube_blur = 0.f,
+  .dynCube_worldbox_enabled = 0.f,
+  .dynCube_worldbox_margin = 1.f,
   .dynCube_lookup_direction_flip = 0.f,
 };
 
@@ -327,6 +329,11 @@ constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debu
 constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
+constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
+// Max pass-0 reduction groups over all supported cube sizes (1024 -> 128x128x6).
+constexpr uint32_t kDynCubeWorldBoxMaxGroups = ((1024u + 7u) / 8u) * ((1024u + 7u) / 8u) * 6u;
+// Manual Reset World Box request (set by the UI button, consumed by the reduction).
+static bool g_dyncube_worldbox_reset_request = false;
 constexpr uint32_t kDynCubeDefaultSize = 128u;
 static uint32_t DynCubeResolveSize(float v);
 
@@ -442,6 +449,7 @@ struct DynCubeSet {
   reshade::api::resource_view cam_uav[2];
   reshade::api::resource charmask;
   reshade::api::resource_view charmask_srv;
+  reshade::api::resource_view charmask_arr_srv;
   reshade::api::resource_view charmask_uav;
   reshade::api::resource ggx_in;
   reshade::api::resource_view ggx_in_cube_srv;
@@ -636,7 +644,21 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Character mask (Phase 2)
   reshade::api::resource dyncube_charmask = {};          // RGBA16F cube, 1 mip (character mask)
   reshade::api::resource_view dyncube_charmask_srv = {};   // TextureCube SRV (for debug 9)
+  reshade::api::resource_view dyncube_charmask_arr_srv = {}; // Texture2DArray SRV (world-box reduction read)
   reshade::api::resource_view dyncube_charmask_uav = {};   // Texture2DArray UAV (compute write)
+  // World-fixed parallax proxy (Sora2nd v1): persistent GPU bounds, no CPU readback.
+  // Survives cache round-trips (size-independent); destroyed + re-initialized on recreate.
+  reshade::api::resource dyncube_worldbox_bounds = {};       // structured buffer, 2x float4: [0]=(min,valid) [1]=(max,spare)
+  reshade::api::resource_view dyncube_worldbox_bounds_srv = {}; // buffer SRV (t33 lighting read)
+  reshade::api::resource_view dyncube_worldbox_bounds_uav = {}; // buffer UAV (reduction merge write)
+  reshade::api::resource dyncube_worldbox_scratch = {};      // structured buffer, maxGroups*2 float4 partials
+  reshade::api::resource_view dyncube_worldbox_scratch_srv = {}; // buffer SRV (pass-1 read)
+  reshade::api::resource_view dyncube_worldbox_scratch_uav = {}; // buffer UAV (pass-0 write)
+  reshade::api::pipeline_layout dyncube_worldbox_layout = {};
+  reshade::api::pipeline dyncube_worldbox_pipeline = {};
+  GTVBAODescriptorTableSet dyncube_worldbox_tables = {};
+  bool dyncube_worldbox_reset_pending = true;   // set on recreate / toggle rising edge / manual button
+  bool dyncube_worldbox_was_enabled = false;    // toggle rising-edge latch
   // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
   // partially-written cube is never exposed to lighting.
   uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..1024)
@@ -702,6 +724,7 @@ static void UnbindDynCubeComputeState(reshade::api::command_list* cl);
 static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d);
+static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, uint32_t set);
 static bool RunDynCubeInference(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool ggxOn);
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
@@ -3124,6 +3147,36 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeWorldBox", .binding = &shader_injection.dynCube_worldbox_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "World-Fixed Parallax Box", .section = "Dynamic Cubemaps",
+      .tooltip = "OFF = camera-centered parallax proxy (current). ON = persistent world-space proxy accumulated from captured geometry (stable across movement). Only relevant when dynamic cubemaps are active.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeWorldBoxMargin", .binding = &shader_injection.dynCube_worldbox_margin,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "World Box Margin", .section = "Dynamic Cubemaps",
+      .tooltip = "World-unit margin expanded around the stored bounds at lookup time (never baked into the persistent bounds).",
+      .min = 0.f, .max = 50.f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f && shader_injection.dynCube_worldbox_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeWorldBoxReset",
+      .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+      .label = "Reset World Box", .section = "Dynamic Cubemaps",
+      .tooltip = "Clears the persistent world-space bounds and validity (e.g. after changing rooms).",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_worldbox_enabled > 0.5f; },
+      .on_click = []() {
+        g_dyncube_worldbox_reset_request = true;
+        return false;
+      },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeReflectSignFlip", .binding = &shader_injection.dynCube_reflect_sign_flip,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Reflection Sign Flip", .section = "Dynamic Cubemaps",
@@ -4039,6 +4092,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     if (dyncube_active && !dd0->dyncube_was_enabled) dd0->dyncube_needs_reset = true;
     if (!dyncube_active && dd0->dyncube_was_enabled) dd0->dyncube_pending_destroy = true;
     dd0->dyncube_was_enabled = dyncube_active;
+    // World-fixed parallax: first use after enabling must ignore stale stored bounds.
+    const bool worldbox_enabled = shader_injection.dynCube_worldbox_enabled > 0.5f;
+    if (worldbox_enabled && !dd0->dyncube_worldbox_was_enabled) dd0->dyncube_worldbox_reset_pending = true;
+    dd0->dyncube_worldbox_was_enabled = worldbox_enabled;
   }
   if (!gtvbao_active && !dyncube_active) return true;
   if (!cmd_list) return true;
@@ -4264,6 +4321,14 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
             reshade::api::descriptor_type::texture_shader_resource_view, &histPosSrv});
       }
     }
+    // Bind the persistent world-space bounds (t33) for the Sora2nd world-fixed
+    // parallax path. Bound unconditionally (future-port friendly); the lighting
+    // shader gates the read on the enable toggle + the stored valid flag.
+    if (dd->dyncube_worldbox_bounds_srv.handle) {
+      cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{{}, kDynCubeWorldBoxRegister, 0, 1,
+          reshade::api::descriptor_type::buffer_shader_resource_view, &dd->dyncube_worldbox_bounds_srv});
+    }
     // Bind the game's vanilla cubemap (t30) for the SSR -> Dynamic -> Vanilla fallback.
     if (dd->captured_vanilla_env_srv.handle) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
@@ -4479,8 +4544,14 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
     dv(d->dyncube_cam_srv[i]); dv(d->dyncube_cam_uav[i]); dr(d->dyncube_cam[i]);
   }
   // Character mask
-  dv(d->dyncube_charmask_srv); dr(d->dyncube_charmask);
+  dv(d->dyncube_charmask_srv); dv(d->dyncube_charmask_arr_srv); dr(d->dyncube_charmask);
   if (d->dyncube_charmask_uav.handle) { dev->destroy_resource_view(d->dyncube_charmask_uav); d->dyncube_charmask_uav = {}; }
+  // World-fixed parallax bounds (persistent; re-initialized on next create)
+  dv(d->dyncube_worldbox_bounds_srv); dv(d->dyncube_worldbox_bounds_uav); dr(d->dyncube_worldbox_bounds);
+  dv(d->dyncube_worldbox_scratch_srv); dv(d->dyncube_worldbox_scratch_uav); dr(d->dyncube_worldbox_scratch);
+  dp(d->dyncube_worldbox_pipeline); dl(d->dyncube_worldbox_layout);
+  for (auto& t : d->dyncube_worldbox_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  d->dyncube_worldbox_reset_pending = true;
   // Phase 3 GGX
   if (d->dyncube_linear_sampler.handle) { dev->destroy_sampler(d->dyncube_linear_sampler); d->dyncube_linear_sampler = {}; }
   dv(d->dyncube_ggx_in_cube_srv); dr(d->dyncube_ggx_in);
@@ -4655,10 +4726,84 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
                                        reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
       &d->dyncube_charmask_srv);
+    dev->create_resource_view(d->dyncube_charmask, reshade::api::resource_usage::shader_resource,
+      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+      &d->dyncube_charmask_arr_srv);
     dev->create_resource_view(d->dyncube_charmask, reshade::api::resource_usage::unordered_access,
       reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
                                        reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
       &d->dyncube_charmask_uav);
+  }
+
+  // ── World-fixed parallax bounds (Sora2nd v1): persistent, size-independent ──
+  {
+    // bounds: 2x float4 [0]=(min,valid) [1]=(max,spare); initialized empty/invalid.
+    // Initial upload + in-shader stored-validity check make the first merge safe.
+    float initBounds[8] = {
+      3.402823466e+38f, 3.402823466e+38f, 3.402823466e+38f, 0.f,
+      -3.402823466e+38f, -3.402823466e+38f, -3.402823466e+38f, 0.f,
+    };
+    reshade::api::subresource_data initData = {initBounds, sizeof(initBounds), sizeof(initBounds)};
+    reshade::api::resource_desc rb = {};
+    rb.type = reshade::api::resource_type::buffer;
+    rb.buffer.size = sizeof(initBounds);
+    rb.buffer.stride = 16;
+    rb.heap = reshade::api::memory_heap::gpu_only;
+    rb.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(rb, &initData, reshade::api::resource_usage::shader_resource, &d->dyncube_worldbox_bounds)) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box bounds");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+    // NOTE: buffer view offset/size are STRUCTURED ELEMENT counts for the D3D11
+    // backend (FirstElement/NumElements), not bytes — UINT64_MAX is invalid here.
+    if (!dev->create_resource_view(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
+        &d->dyncube_worldbox_bounds_srv)
+        || !d->dyncube_worldbox_bounds_srv.handle) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box bounds SRV");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+    if (!dev->create_resource_view(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
+        &d->dyncube_worldbox_bounds_uav)
+        || !d->dyncube_worldbox_bounds_uav.handle) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box bounds UAV");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+    // scratch: per-group min/max pairs, sized for the largest supported cube (1024).
+    reshade::api::resource_desc rs = {};
+    rs.type = reshade::api::resource_type::buffer;
+    rs.buffer.size = (uint64_t)kDynCubeWorldBoxMaxGroups * 2u * 16u;
+    rs.buffer.stride = 16;
+    rs.heap = reshade::api::memory_heap::gpu_only;
+    rs.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(rs, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_worldbox_scratch)) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box scratch");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+    const uint64_t scratchElements = (uint64_t)kDynCubeWorldBoxMaxGroups * 2u;
+    if (!dev->create_resource_view(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
+        &d->dyncube_worldbox_scratch_srv)
+        || !d->dyncube_worldbox_scratch_srv.handle) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box scratch SRV");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+    if (!dev->create_resource_view(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
+        &d->dyncube_worldbox_scratch_uav)
+        || !d->dyncube_worldbox_scratch_uav.handle) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create world-box scratch UAV");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+    d->dyncube_worldbox_reset_pending = true;
   }
 
   // ── Phase 3 GGX filtered cubes ──
@@ -4943,6 +5088,35 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     }
   }
   #endif
+
+  // ── World-fixed parallax bounds reduction pipeline ──
+  // 4 SRVs (pos, contrib, charmask, camCur), 2 UAVs (scratch, bounds), 4 push floats
+  auto make_worldbox_layout = [&](reshade::api::pipeline_layout* out) -> bool {
+    if (out->handle != 0u) return true;
+    DR srv_r     = {0,0,0,4,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t3 (pos, contrib, charmask, camCur)
+    DR srv_buf_r = {0,0,0,2,DS::all_compute,1,DT::buffer_unordered_access_view}; // u0..u1 (scratch, bounds)
+    reshade::api::constant_range push_range = {};
+    push_range.binding = 0;
+    push_range.dx_register_index = 13;
+    push_range.dx_register_space = 0;
+    push_range.count = 4; // pass, posScale, reset, scratchCount
+    push_range.visibility = DS::all_compute;
+    P p0, p1, pPush;
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_buf_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
+    P params[3] = {p0,p1,pPush};
+    return dev->create_pipeline_layout(3, params, out);
+  };
+  if (!make_worldbox_layout(&d->dyncube_worldbox_layout)) return false;
+  if (!ensure(d->dyncube_worldbox_layout, &d->dyncube_worldbox_tables, 2)) return false;
+  #ifdef __DynCubeBoundsReduceCS_EMBED_FILE
+  if (!__DynCubeBoundsReduceCS.empty()) {
+    if (!mkcs(__DynCubeBoundsReduceCS, d->dyncube_worldbox_layout, &d->dyncube_worldbox_pipeline)) {
+      if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] World-box pipeline create failed");
+    }
+  }
+  #endif
   return true;
 }
 
@@ -4985,6 +5159,7 @@ static void MoveActiveSetTo(DeviceData* d, DynCubeSet& s) {
   }
   s.charmask = d->dyncube_charmask; d->dyncube_charmask = {};
   s.charmask_srv = d->dyncube_charmask_srv; d->dyncube_charmask_srv = {};
+  s.charmask_arr_srv = d->dyncube_charmask_arr_srv; d->dyncube_charmask_arr_srv = {};
   s.charmask_uav = d->dyncube_charmask_uav; d->dyncube_charmask_uav = {};
   s.ggx_in = d->dyncube_ggx_in; d->dyncube_ggx_in = {};
   s.ggx_in_cube_srv = d->dyncube_ggx_in_cube_srv; d->dyncube_ggx_in_cube_srv = {};
@@ -5021,6 +5196,7 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   }
   d->dyncube_charmask = s.charmask; s.charmask = {};
   d->dyncube_charmask_srv = s.charmask_srv; s.charmask_srv = {};
+  d->dyncube_charmask_arr_srv = s.charmask_arr_srv; s.charmask_arr_srv = {};
   d->dyncube_charmask_uav = s.charmask_uav; s.charmask_uav = {};
   d->dyncube_ggx_in = s.ggx_in; s.ggx_in = {};
   d->dyncube_ggx_in_cube_srv = s.ggx_in_cube_srv; s.ggx_in_cube_srv = {};
@@ -5082,7 +5258,7 @@ static void DestroyDynCubeSet(reshade::api::device* dev, DynCubeSet& s) {
   for (uint32_t i = 0; i < 2; ++i) {
     dv(s.cam_srv[i]); dv(s.cam_uav[i]); dr(s.cam[i]);
   }
-  dv(s.charmask_srv); dr(s.charmask);
+  dv(s.charmask_srv); dv(s.charmask_arr_srv); dr(s.charmask);
   if (s.charmask_uav.handle) { dev->destroy_resource_view(s.charmask_uav); s.charmask_uav = {}; }
   dv(s.ggx_in_cube_srv); dr(s.ggx_in);
   for (uint32_t i = 0; i < 2; ++i) {
@@ -5205,6 +5381,17 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   cl->barrier(d->dyncube_hist[cur].contrib, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   cl->barrier(d->dyncube_cam[cur], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
+  // World-fixed parallax bounds: only when enabled AND a capture actually ran
+  // (we are inside the post-capture barrier region, pre-swap). Nothing at all
+  // is dispatched for this feature when the toggle is OFF.
+  if (shader_injection.dynCube_worldbox_enabled > 0.5f) {
+    // The existing barrier set does not cover charmask — transition it for the
+    // reduction read, then restore UAV state for the next capture write.
+    cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    (void)RunDynCubeWorldBox(cl, d, cur);
+    cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+  }
+
   // Swap: next frame reads the just-written set as "previous" and writes the other set.
   d->dyncube_hist_cur = prev;
   // Aliases (t17 + preview + solid) point at the freshly written set.
@@ -5212,6 +5399,71 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   d->dyncube_srv = d->dyncube_hist[cur].color_cube_srv;
   d->dyncube_uav = d->dyncube_hist[cur].color_uav;
   d->dyncube_solid_written = false; // now contains captured data
+  UnbindDynCubeComputeState(cl);
+  return true;
+}
+
+// World-fixed parallax bounds reduction (Sora2nd v1). Reads the just-written
+// history set (pre-swap index `set`): pos/contrib/charmask array SRVs + camCur.
+// Two passes: per-group partials into scratch, then a single-group expand-only
+// merge into the persistent bounds (camera included unfiltered for containment).
+// No CPU readback. Runs only when the toggle is ON (caller-gated).
+static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, uint32_t set) {
+  if (!cl || !d || set > 1u) return false;
+  if (!d->dyncube_resources_created) return false;
+  if (!d->dyncube_worldbox_pipeline.handle) return false;
+  if (!d->dyncube_hist[set].pos_arr_srv.handle
+      || !d->dyncube_hist[set].contrib_arr_srv.handle
+      || !d->dyncube_charmask_arr_srv.handle
+      || !d->dyncube_cam_srv[set].handle
+      || !d->dyncube_worldbox_scratch_uav.handle
+      || !d->dyncube_worldbox_scratch_srv.handle
+      || !d->dyncube_worldbox_bounds_uav.handle) return false;
+  auto* dev = cl->get_device();
+
+  const uint32_t sz = d->dyncube_size;
+  const uint32_t g = (sz + 7u) / 8u;   // groups per face axis (matches capture dispatch)
+  const uint32_t groups = g * g * 6u;  // total pass-0 groups
+
+  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_worldbox_pipeline);
+  auto* tbl = &d->dyncube_worldbox_tables;
+  reshade::api::resource_view srvs[4] = {
+      d->dyncube_hist[set].pos_arr_srv,
+      d->dyncube_hist[set].contrib_arr_srv,
+      d->dyncube_charmask_arr_srv,
+      d->dyncube_cam_srv[set],
+  };
+  reshade::api::resource_view uavs[2] = {
+      d->dyncube_worldbox_scratch_uav,
+      d->dyncube_worldbox_bounds_uav,
+  };
+  reshade::api::descriptor_table_update ups[2];
+  ups[0] = {tbl->at(0), 0, 0, 4, reshade::api::descriptor_type::texture_shader_resource_view, srvs};
+  ups[1] = {tbl->at(1), 0, 0, 2, reshade::api::descriptor_type::buffer_unordered_access_view, uavs};
+  dev->update_descriptor_tables(2, ups);
+  std::array<reshade::api::descriptor_table, 2> tables = {tbl->at(0), tbl->at(1)};
+  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 0, 2, tables.data());
+
+  const float reset = (d->dyncube_worldbox_reset_pending || g_dyncube_worldbox_reset_request) ? 1.0f : 0.0f;
+  // Pass 0: per-group partials. Scratch must be UAV-writable.
+  {
+    float pc[4] = {0.0f, 0.001f, reset, (float)groups};
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 4, pc);
+    cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+    cl->dispatch(g, g, 6);
+  }
+  // Pass 1: single-group merge. Scratch UAV->SRV, bounds SRV->UAV, then merge,
+  // then bounds UAV->SRV so lighting (t33) reads the finished result.
+  {
+    float pc[4] = {1.0f, 0.001f, reset, (float)groups};
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 4, pc);
+    cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+    cl->dispatch(1, 1, 1);
+    cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  }
+  d->dyncube_worldbox_reset_pending = false;
+  g_dyncube_worldbox_reset_request = false;
   UnbindDynCubeComputeState(cl);
   return true;
 }

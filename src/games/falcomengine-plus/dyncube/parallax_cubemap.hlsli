@@ -56,17 +56,14 @@ bool DynCubeRayBoxIntersect(float3 ro, float3 rd, float3 bmin, float3 bmax,
     return true;
 }
 
-// Parallax-correct the reflection ray at surface point P against a probe box of
-// size boxSize centered at probeOrigin. On success outDir = normalize(Q - O) and
-// outFace = probe-box exit face index (0..5); on failure outDir = R, outFace = -1.
-bool DynCubeParallaxCorrect(float3 P, float3 R, float3 probeOrigin, float3 boxSize,
-                            out float3 outDir, out int outFace)
+// Shared slab body for both proxy variants. On success outDir = normalize(Q - O)
+// and outFace = probe-box exit face index (0..5); on failure outDir = R, outFace = -1.
+bool DynCubeParallaxCorrectCore(float3 P, float3 R, float3 probeOrigin,
+                                float3 boxMin, float3 boxMax,
+                                out float3 outDir, out int outFace)
 {
     outDir = R;
     outFace = -1;
-
-    float3 boxMin = probeOrigin - boxSize * 0.5;
-    float3 boxMax = probeOrigin + boxSize * 0.5;
 
     float tmin, tmax;
     if (!DynCubeRayBoxIntersect(P, R, boxMin, boxMax, tmin, tmax)) return false;
@@ -87,6 +84,28 @@ bool DynCubeParallaxCorrect(float3 P, float3 R, float3 probeOrigin, float3 boxSi
                            : (d.z > 0.0 ? 1 : 0);
     outFace = axis * 2 + sign;
     return true;
+}
+
+// Parallax-correct the reflection ray at surface point P against a probe box of
+// size boxSize centered at probeOrigin. Behaviorally identical to the original;
+// forwards into the shared core.
+bool DynCubeParallaxCorrect(float3 P, float3 R, float3 probeOrigin, float3 boxSize,
+                            out float3 outDir, out int outFace)
+{
+    return DynCubeParallaxCorrectCore(P, R, probeOrigin,
+                                      probeOrigin - boxSize * 0.5,
+                                      probeOrigin + boxSize * 0.5,
+                                      outDir, outFace);
+}
+
+// World-fixed variant: explicit world-space proxy bounds (e.g. the persistent
+// bounds buffer) with the same probe origin and identical intersection semantics.
+bool DynCubeParallaxCorrectBox(float3 P, float3 R, float3 probeOrigin,
+                               float3 boxMin, float3 boxMax,
+                               out float3 outDir, out int outFace)
+{
+    return DynCubeParallaxCorrectCore(P, R, probeOrigin, boxMin, boxMax,
+                                      outDir, outFace);
 }
 
 // Distinct color per probe-box exit face for the Parallax Debug view.
