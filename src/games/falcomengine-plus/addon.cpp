@@ -289,6 +289,7 @@ ShaderInjectData shader_injection = {
   .dynCube_force_ssr = 0.f,
   .dynCube_layer_mix = -1.f,
   .dynCube_blur = 0.f,
+  .dynCube_lookup_direction_flip = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3127,6 +3128,15 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Reflection Sign Flip", .section = "Dynamic Cubemaps",
       .tooltip = "Debug A/B: OFF = use the mathematical reflect ray (current). ON = use the physical reflection ray (negated) for box-parallax correction. Test which direction the correction moves.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeLookupDirectionFlip", .binding = &shader_injection.dynCube_lookup_direction_flip,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Dynamic Cubemap Reflection Direction Flip", .section = "Dynamic Cubemaps",
+      .tooltip = "A/B test for the dynamic cubemap sampling direction only. OFF = current lookup direction. ON = negate the final dynamic lookup direction. Independent from Reflection Sign Flip (parallax-only).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },

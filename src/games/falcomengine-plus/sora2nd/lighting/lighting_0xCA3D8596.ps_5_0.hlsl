@@ -900,7 +900,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             ? shader_injection_data.dynCube_vanilla_blur
             : shader_injection_data.dynCube_blur);
       }
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r22.xyz, dynCubeSampleMip).xyz;
+      float3 dynCubeSampleDirA =
+          r22.xyz *
+          ((shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0);
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirA, dynCubeSampleMip).xyz;
       // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
       dynCubeReflDir = r22.xyz;
       dynCubeReflActive = true;
@@ -1070,7 +1073,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             ? shader_injection_data.dynCube_vanilla_blur
             : shader_injection_data.dynCube_blur);
       }
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDir, dynCubeSampleMip2).xyz;
+      float3 dynCubeSampleDirB =
+          dynCubeSampleDir *
+          ((shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0);
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirB, dynCubeSampleMip2).xyz;
       // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
       dynCubeReflDir = dynCubeSampleDir;
       dynCubeReflActive = true;

@@ -52,6 +52,7 @@ float2 ViewToUV(float3 viewDir)
 {
     float4 clip = mul(proj_g, float4(viewDir, 0.0));
     if (abs(clip.w) < 1e-6) return float2(-2, -2);
+    if (clip.w <= 0.0) return float2(-2, -2);
     float2 ndc = clip.xy / clip.w;
     return ndc * float2(0.5, -0.5) + 0.5;
 }
@@ -85,9 +86,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
     g_outColor.GetDimensions(w, h, el);
     if (dtid.x >= w || dtid.y >= h || dtid.z >= 6) return;
 
-    // Falcom game samples t17 with (1,-1,-1)*reflect(...); conjugate the reference
-    // capture negation (-GetSamplingVector) through that flip -> negate X only.
-    float3 worldDir = float3(-1.0, 1.0, 1.0) * GetSamplingVector(dtid, w, h);
+    // Falcom game samples t17 with (1,-1,-1)*reflect(...); store physical
+    // radiance R at the same TextureCube address the lookup samples, so the
+    // capture transform must equal the lookup transform: (1,-1,-1).
+    float3 worldDir = float3(1.0, -1.0, -1.0) * GetSamplingVector(dtid, w, h);
     float3 viewDir = WorldToViewDir(worldDir);
     // Projection cull disabled for diagnostic (see Phase 0B). Keep IsOutside only.
     float2 uv = ViewToUV(viewDir);
