@@ -917,8 +917,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r22.xyz *
           ((shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0);
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirA, dynCubeSampleMip).xyz;
-      // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
-      dynCubeReflDir = r22.xyz;
+      // Record the final sampled direction (including lookup flip) so validity and
+      // vanilla fallback test the texel actually displayed, not its antipode.
+      dynCubeReflDir = dynCubeSampleDirA;
       dynCubeReflActive = true;
       // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
       if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace >= 0) {
@@ -1102,8 +1103,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           dynCubeSampleDir *
           ((shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0);
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirB, dynCubeSampleMip2).xyz;
-      // Record the reflection direction for the SSR -> Dynamic -> Vanilla resolution.
-      dynCubeReflDir = dynCubeSampleDir;
+      // Record the final sampled direction (including lookup flip) so validity and
+      // vanilla fallback test the texel actually displayed, not its antipode.
+      dynCubeReflDir = dynCubeSampleDirB;
       dynCubeReflActive = true;
       // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
       if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace2 >= 0) {
