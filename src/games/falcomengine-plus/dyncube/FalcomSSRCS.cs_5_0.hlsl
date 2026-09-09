@@ -1,7 +1,8 @@
 // FalcomSSRCS.cs_5_0.hlsl — Falcom Engine+ generic simple screen-space SSR (compute).
 // No Hi-Z, no temporal/motion-vector/denoise. One thread per screen pixel.
-// Non-linear (biased) sample distribution along the reflection ray, linearized-depth
-// crossing (validated Sora positive-distance convention), binary refinement, then the
+// McGuire-style perspective-correct screen-space march (uniform pixel steps,
+// near-plane clipped), linearized-depth interval crossing (validated Sora
+// positive-distance convention), binary refinement, then the
 // captured frame color. Output RGBA16F: rgb = reflection color, a = combined confidence.
 // Confidence = hitConf * distanceConf * edgeConf * grazingConf.
 // Input : t0 captured color, t1 captured depth, t2 captured mrtTexture0 (normal),
@@ -37,7 +38,6 @@ SamplerState      g_pointClamp : register(s0);
 RWTexture2D<float4> g_out : register(u0);
 
 static const float SSR_FLT_MAX = 3.402823466e+38;
-static const float kDistanceBias = 1.5;  // concentrate samples near the origin
 static const uint  kBinarySteps = 5u;    // internal binary refinement iterations
 
 // ── Depth linearization (identical math to the validated SSR/GTVBAO path; handles
@@ -110,43 +110,120 @@ void main(uint3 dtid : SV_DispatchThreadID)
     if (nv <= 0.0) return;
     float3 R = 2.0 * nv * N - V;  // reflect(-V, N)
 
-    // Non-linear march: samples concentrated near the origin, spreading toward maxDist.
+    // McGuire-style march: g_sampleCount caps traversal iterations, g_maxDist caps
+    // the endpoint only (uniform pixel spacing, no world-distance distribution).
     const float maxDist = max(g_maxDist, 0.001);
     const uint  count = max((uint)g_sampleCount, 2u);
     const float thickness = max(g_thickness, 1e-4);
-    const float invCount = 1.0 / float(count);
+
+    // Clip the endpoint so the projected segment never goes behind the camera
+    // (negative w would mirror UVs into a false in-bounds result). w(t) is linear.
+    float4 clipP = mul(float4(P, 1.0), proj_g);
+    float4 clipD = mul(float4(R, 0.0), proj_g);
+    if (clipP.w <= 0.0) return;  // origin behind camera (should not happen for rasterized pixels)
+    float tEnd = maxDist;
+    if (clipD.w < -1e-9) {
+        float wMin = max(clipP.w * 0.01, 1e-4);
+        tEnd = min(tEnd, (wMin - clipP.w) / clipD.w);
+    }
+    if (tEnd <= 1e-4) return;  // no forward ray extent
+    float3 endP = P + R * tEnd;
+
+    // Project origin/clipped endpoint to pixel space (ProjectToUV convention).
+    // Homogeneous (Q, k) interpolation keeps the 3D position perspective-correct.
+    float4 c0 = clipP;
+    float4 c1 = clipP + clipD * tEnd;
+    float k0 = 1.0 / c0.w;
+    float k1 = 1.0 / c1.w;
+    float3 Q0 = P * k0;
+    float3 Q1 = endP * k1;
+    float2 pixScale = float2(w, h);
+    float2 P0 = float2(c0.x * k0 * 0.5 + 0.5, 1.0 - (c0.y * k0 * 0.5 + 0.5)) * pixScale;
+    float2 P1 = float2(c1.x * k1 * 0.5 + 0.5, 1.0 - (c1.y * k1 * 0.5 + 0.5)) * pixScale;
+
+    // Degenerate projection (ray at a pixel): cover at least one pixel.
+    float2 pixDelta = P1 - P0;
+    if (dot(pixDelta, pixDelta) < 0.0001) {
+        P1 += float2(0.01, 0.0);
+        pixDelta = P1 - P0;
+    }
+
+    // Permute so x is the major axis (deterministic, no jitter).
+    bool permute = abs(pixDelta.x) < abs(pixDelta.y);
+    if (permute) {
+        pixDelta = pixDelta.yx;
+        P0 = P0.yx;
+        P1 = P1.yx;
+    }
+    float stepDir = (pixDelta.x >= 0.0) ? 1.0 : -1.0;
+    float invdx = stepDir / pixDelta.x;
+    float2 dP = float2(stepDir, pixDelta.y * invdx);
+    float3 dQ = (Q1 - Q0) * invdx;
+    float dk = (k1 - k0) * invdx;
+
+    // DDA iteration budget remains fixed.
+    // Adaptive stride distributes that budget across the projected
+    // major-axis segment so long rays can reach the endpoint without
+    // increasing the number of depth samples.
+    // This restores ray reach but increases screen-space spacing,
+    // so thin features may be skipped at large stride.
+    float majorLen = abs(pixDelta.x);
+    float stride = max(1.0, ceil(majorLen / max((float)count, 1.0)));
+    dP *= stride;
+    dQ *= stride;
+    dk *= stride;
+
+    float2 originPix = float2(px) + 0.5;
+    float2 walk = P0;
+    float3 Q = Q0;
+    float k = k0;
+    float end = P1.x * stepDir;
 
     float3 cur = P;
     float3 prev = P;  // previous march sample (step length + refinement fallback)
+    float prevRayDist = -P.z;
     float3 bracketLo = P;      // most recent strictly-in-front sample (depthDiff < 0)
     bool hasBracketLo = false; // true once such a sample has been observed
     bool crossed = false;
     float penetration = 0.0;     // rayDist - sceneDist at the crossing step (depth behind)
     float localStepLen = 1.0;    // view-space length of the crossing step
-    for (uint i = 1u; i <= count; ++i) {
-        float u = float(i) * invCount;
-        float t = maxDist * pow(u, kDistanceBias);
-        prev = cur;
-        cur = P + R * t;
-        localStepLen = length(cur - prev);
-        float2 suv = ProjectToUV(cur);
-        if (any(suv < 0.0) || any(suv > 1.0)) break;  // ray left the screen
-        int2 spx = clamp(int2(suv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
-        float sceneDist = LinearizeDepth(g_depthTex.Load(int3(spx, 0)));
-        if (sceneDist >= SSR_FLT_MAX * 0.5) continue;  // sky at this texel
-        float rayDist = -cur.z;
-        float diff = rayDist - sceneDist;
-        // Hit only when the ray is strictly BEHIND the surface by at least thickness.
-        if (diff >= thickness) {
-            penetration = rayDist - sceneDist;
-            crossed = true;
-            break;
+    for (uint step = 0u; step < count && (walk.x * stepDir) <= end; ++step) {
+        float2 hitPixF = permute ? walk.yx : walk;
+        float3 stepPos = Q * (1.0 / k);
+        float stepRayDist = -stepPos.z;
+        if (all(abs(hitPixF - originPix) < 2.0)) {
+            // Self-hit guard (~2 texels, AMD rule): advance state, skip testing.
+            prev = stepPos;
+            prevRayDist = stepRayDist;
+        } else if (any(hitPixF < 0.0) || any(hitPixF >= float2(w, h))) {
+            break;  // ray left the screen: miss (march UVs are never clamped)
+        } else {
+            int2 spx = int2(hitPixF);
+            float sceneDist = LinearizeDepth(g_depthTex.Load(int3(spx, 0)));
+            if (sceneDist < SSR_FLT_MAX * 0.5) {
+                float rayLo = min(prevRayDist, stepRayDist);
+                float rayHi = max(prevRayDist, stepRayDist);
+                // Depth-interval overlap: ray slab vs [sceneDist, sceneDist + thickness].
+                // Hit only when the ray is strictly BEHIND the surface by at least thickness.
+                if (rayHi >= sceneDist && rayLo <= sceneDist + thickness) {
+                    cur = stepPos;
+                    penetration = stepRayDist - sceneDist;
+                    localStepLen = length(cur - prev);
+                    crossed = true;
+                    break;
+                }
+                // Track the most recent strictly-in-front sample for zero-crossing refinement.
+                if (stepRayDist - sceneDist < 0.0) {
+                    bracketLo = stepPos;
+                    hasBracketLo = true;
+                }
+            }
+            prev = stepPos;
+            prevRayDist = stepRayDist;
         }
-        // Track the most recent strictly-in-front sample for zero-crossing refinement.
-        if (diff < 0.0) {
-            bracketLo = cur;
-            hasBracketLo = true;
-        }
+        walk += dP;
+        Q += dQ;
+        k += dk;
     }
 
     if (crossed) {
@@ -168,7 +245,13 @@ void main(uint3 dtid : SV_DispatchThreadID)
             float sDist = LinearizeDepth(g_depthTex.Load(int3(mpx, 0)));
             if (mDist >= sDist) cur = mid; else prev = mid;
         }
-        float2 fuv = saturate(ProjectToUV(cur));
+        float2 fuvRaw = ProjectToUV(cur);
+        if (any(fuvRaw < 0.0) || any(fuvRaw > 1.0)) return;  // refined hit left the screen: miss
+        float2 fuv = fuvRaw;
+        // Backface rejection (AMD rule): a hit whose outward normal faces along the
+        // reflection ray was struck from behind and carries wrong-side content.
+        float3 hitN_view = normalize(mul(DecodeWorldNormal(int2(fuv * float2(w, h)), int2(w, h)), (float3x3)view_g));
+        if (dot(hitN_view, R) > 0.0) return;
 
         // Confidence factors.
         // hitConf: decisive vs grazing/borderline depth crossing (overshoot beyond

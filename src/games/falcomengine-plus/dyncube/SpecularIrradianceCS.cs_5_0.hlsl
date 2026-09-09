@@ -151,11 +151,18 @@ void main(uint3 dtid : SV_DispatchThreadID)
             // Mip level to sample from.
             float mipLevel = max(0.5 * log2(ws / wt) + 1.0, 0.0);
 
-            color += g_inputTex.SampleLevel(g_linearClamp, Li, mipLevel).rgb * cosLi;
-            weight += cosLi;
+            float4 tap = g_inputTex.SampleLevel(g_linearClamp, Li, mipLevel);
+            // Validity-aware normalization: tap.rgb is already coverage-diluted, so only
+            // the denominator is weighted by tap alpha (valid mass). Invalid taps (a=0)
+            // contribute to neither side; fully valid footprints behave exactly as before.
+            color += tap.rgb * cosLi;
+            weight += cosLi * tap.a;
         }
     }
-    color /= weight;
+    if (weight > 1e-4)
+        color /= weight;
+    else
+        color = 0.0;
 
     g_outTex[dtid] = float4(max(0.0, color), 1.0);
 }

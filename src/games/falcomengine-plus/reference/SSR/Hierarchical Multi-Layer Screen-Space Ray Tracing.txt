@@ -1,0 +1,2552 @@
+Hierarchical Multi-Layer Screen-Space Ray Tracing
+Supplemental Material
+Nikolai Hofmann
+
+Phillip Bogendörfer
+
+Marc Stamminger
+
+Kai Selgrad
+
+Computer Graphics Group, University of Erlangen-Nuremberg
+
+Contents
+1 Larger Screenshots
+
+2
+
+2 Construction Times
+2.1 Sponza . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+2.2 San Miguel . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+3
+3
+4
+
+3 Full Resolution Trace Times
+3.1 Sponza . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+3.2 San Miguel . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+3.3 Overall Perf, 1 Bounce Full Res Construction and Full Res Trace . . . . . . . . . .
+3.4 San Miguel . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+5
+5
+6
+7
+7
+
+4 Half Resolution Trace Times
+4.1 Sponza . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.2 San Miguel . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4.3 Overall Perf, 1 Bounce Full Res Construction and Half Res Trace . . . . . . . . . .
+4.4 San Miguel . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+
+8
+8
+9
+9
+10
+
+5 SSR Code
+
+11
+
+6 HSSR Code
+6.1 Fragment Collection Pass . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.2 Per-Pixel Linked-Lists Sorting Pass . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.3 Hierarchy Construction . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6.4 Hierarchical Screen-Space Ray Tracer . . . . . . . . . . . . . . . . . . . . . . . . .
+
+14
+14
+15
+16
+19
+
+1
+
+1
+
+Larger Screenshots
+
+Times for Sponza refer to this view.
+
+Times for San Miguel refer to this view.
+
+2
+
+2
+
+Construction Times
+
+2.1
+
+Sponza
+
+720p:
+9 ms
+8 ms
+
+Collect [Mara et al. 14]
+
+7 ms
+
+Collect [Mara et al. 16]
+
+6 ms
+
+Build Hierarchy
+
+5 ms
+
+Sort
+
+4 ms
+
+Collect
+
+3 ms
+2 ms
+1 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+14 ms
+Collect [Mara et al. 14]
+
+12 ms
+
+Collect [Mara et al. 16]
+
+10 ms
+
+Build Hierarchy
+
+8 ms
+
+Collect
+
+Sort
+
+6 ms
+4 ms
+2 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+3
+
+7 layer
+
+8 layer
+
+2.2
+
+San Miguel
+
+720p:
+45 ms
+40 ms
+
+Collect [Mara et al. 14]
+
+35 ms
+
+Collect [Mara et al. 16]
+
+30 ms
+
+Build Hierarchy
+
+25 ms
+
+Sort
+
+20 ms
+
+Collect
+
+15 ms
+10 ms
+5 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+55 ms
+50 ms
+
+Collect [Mara et al. 14]
+
+45 ms
+
+Collect [Mara et al. 16]
+
+40 ms
+
+Build Hierarchy
+
+35 ms
+
+Sort
+
+30 ms
+
+Collect
+
+25 ms
+20 ms
+15 ms
+10 ms
+5 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+4
+
+7 layer
+
+8 layer
+
+3
+
+Full Resolution Trace Times
+
+3.1
+
+Sponza
+
+720p:
+8 ms
+
+[McGuire and Mara 14]
+stride 1
+
+7 ms
+
+[McGuire and Mara 14]
+stride 2
+
+6 ms
+5 ms
+
+[McGuire and Mara 14]
+stride 3
+
+4 ms
+3 ms
+2 ms
+
+[McGuire and Mara 14]
+stride 4
+
+1 ms
+
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+[McGuire and Mara 14]
+stride 1
+
+25 ms
+24 ms
+
+[McGuire and Mara 14]
+stride 2
+
+23 ms
+
+[McGuire and Mara 14]
+stride 3
+
+22 ms
+21 ms
+
+[McGuire and Mara 14]
+stride 4
+
+20 ms
+19 ms
+
+Our hierarchical trace
+
+18 ms
+17 ms
+16 ms
+15 ms
+14 ms
+13 ms
+12 ms
+11 ms
+10 ms
+9 ms
+8 ms
+7 ms
+6 ms
+5 ms
+4 ms
+3 ms
+2 ms
+1 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+5
+
+7 layer
+
+8 layer
+
+3.2
+
+San Miguel
+
+720p:
+[McGuire and Mara 14]
+stride 1
+
+9 ms
+8 ms
+
+[McGuire and Mara 14]
+stride 2
+
+7 ms
+6 ms
+
+[McGuire and Mara 14]
+stride 3
+
+5 ms
+
+[McGuire and Mara 14]
+stride 4
+
+4 ms
+3 ms
+
+Our hierarchical trace
+
+2 ms
+1 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+29 ms
+
+[McGuire and Mara 14]
+stride 1
+
+28 ms
+27 ms
+
+[McGuire and Mara 14]
+stride 2
+
+26 ms
+
+[McGuire and Mara 14]
+stride 3
+
+25 ms
+24 ms
+
+[McGuire and Mara 14]
+stride 4
+
+23 ms
+22 ms
+
+Our hierarchical trace
+
+21 ms
+20 ms
+19 ms
+18 ms
+17 ms
+16 ms
+15 ms
+14 ms
+13 ms
+12 ms
+11 ms
+10 ms
+9 ms
+8 ms
+7 ms
+6 ms
+5 ms
+4 ms
+3 ms
+2 ms
+1 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+6
+
+7 layer
+
+8 layer
+
+3.3
+
+Overall Perf, 1 Bounce Full Res Construction and Full Res Trace
+
+720p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+3.4
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+San Miguel
+
+720p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7
+
+7 layer
+
+8 layer
+
+4
+
+Half Resolution Trace Times
+
+Traced times for 720p: 640×560, for 1080p: 960x540. Threads are assinged without ‘holes’.
+
+4.1
+
+Sponza
+
+720p:
+[McGuire and Mara 14]
+stride 1
+
+3 ms
+
+[McGuire and Mara 14]
+stride 2
+
+2 ms
+
+[McGuire and Mara 14]
+stride 3
+
+1 ms
+
+[McGuire and Mara 14]
+stride 4
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+Our hierarchical trace
+
+1080p:
+[McGuire and Mara 14]
+stride 1
+
+8 ms
+7 ms
+
+[McGuire and Mara 14]
+stride 2
+
+6 ms
+5 ms
+
+[McGuire and Mara 14]
+stride 3
+
+4 ms
+
+[McGuire and Mara 14]
+stride 4
+
+3 ms
+2 ms
+
+Our hierarchical trace
+
+1 ms
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+8
+
+7 layer
+
+8 layer
+
+4.2
+
+San Miguel
+
+720p:
+[McGuire and Mara 14]
+stride 1
+[McGuire and Mara 14]
+stride 2
+
+3 ms
+2 ms
+
+[McGuire and Mara 14]
+stride 3
+
+1 ms
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+10 ms
+
+[McGuire and Mara 14]
+stride 1
+
+9 ms
+8 ms
+
+[McGuire and Mara 14]
+stride 2
+
+7 ms
+
+[McGuire and Mara 14]
+stride 3
+
+6 ms
+5 ms
+
+[McGuire and Mara 14]
+stride 4
+
+4 ms
+3 ms
+
+Our hierarchical trace
+
+2 ms
+1 ms
+1 layer
+
+4.3
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+Overall Perf, 1 Bounce Full Res Construction and Half Res Trace
+
+720p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+9
+
+7 layer
+
+8 layer
+
+4.4
+
+San Miguel
+
+720p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+7 layer
+
+8 layer
+
+1080p:
+100 %
+
+[McGuire and Mara 14]
+stride 1
+
+75 %
+
+[McGuire and Mara 14]
+stride 2
+
+50 %
+
+[McGuire and Mara 14]
+stride 3
+
+25 %
+
+[McGuire and Mara 14]
+stride 4
+Our hierarchical trace
+1 layer
+
+2 layer
+
+3 layer
+
+4 layer
+
+5 layer
+
+6 layer
+
+10
+
+7 layer
+
+8 layer
+
+5
+
+SSR Code
+
+Originally published by McGuire and Mara (2014), adapted to our framework.
+1
+2
+3
+4
+
+# version 430 core
+# define LAYERS 8
+# define THREADS 32
+layout ( local_size_x = THREADS , local_size_y = THREADS ) in ;
+
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+
+uniform mat4 view ;
+uniform mat4 proj ;
+uniform ivec2 screendim ;
+uniform vec2 cam_near_far ;
+uniform float aspect ;
+uniform float tan_fovy ;
+uniform int stride ;
+uniform int half_res ;
+const ivec2 dim = ivec2 ( screendim * ( half_res == 1 ? 0.5 f : 1. f ) ) ;
+
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+
+// Journal of Computer Graphics Techniques Vol . 3 , No . 2 , 2014:
+vec2 signNotZero ( vec2 v ) {
+return vec2 (( v . x >= 0.0) ? +1.0 : -1.0 , ( v . y >= 0.0) ? +1.0 : -1.0) ;
+}
+vec3 oct_to_float32x3 ( vec2 e ) {
+vec3 v = vec3 ( e . xy , 1.0 - abs ( e . x ) - abs ( e . y ) ) ;
+if ( v . z < 0) v . xy = (1.0 - abs ( v . yx ) ) * signNotZero ( v . xy ) ;
+return normalize ( v ) ;
+}
+vec3 reproject ( vec2 at , float depth ) {
+const float fy = 1. f / tan_fovy , fx = fy / aspect , inv_fx = 1. f / fx ;
+const vec2 inv_screendim = 1. f / vec2 ( screendim ) ;
+vec2 clip = at * inv_screendim * 2. f - 1. f ;
+float eye_z = - depth * cam_near_far . y ;
+float eye_x = ( clip . x * - eye_z ) * inv_fx ;
+float eye_y = ( clip . y * - eye_z ) * tan_fovy ;
+return vec3 ( eye_x , eye_y , eye_z ) ;
+}
+
+34
+35
+36
+37
+38
+39
+40
+41
+42
+
+// parameters
+# define OPTIONAL_CLIPPING
+# define EPSILON 0.0001 f
+# define THICKNESS EPSILON * 5 * cam_near_far . y
+# define THRESHOLD 0.3 f
+# define MAX_STEPS 1000
+# define MAX_LEN 3000. f
+# define BOUNCES 1
+
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+
+struct Ray {
+vec3 orig ;
+vec3 dir ;
+};
+struct RayTracingResult {
+bool hit [ BOUNCES ];
+vec3 hitPos [ BOUNCES ];
+float dist [ BOUNCES ];
+vec3 hitNorm [ BOUNCES ];
+};
+struct RayTracingState {
+vec2 P0 , dP ;
+
+11
+
+56
+57
+58
+59
+60
+61
+
+vec3 Q0 , dQ ;
+float k0 , dk ;
+float stepDir ;
+float end ;
+bool permute ;
+} state ;
+
+62
+63
+
+64
+65
+66
+
+67
+68
+
+69
+70
+71
+72
+
+73
+74
+75
+
+76
+77
+78
+
+79
+80
+
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+
+float distanceSquared ( in vec2 A , in vec2 B ) { A -= B ; return dot (A , A ) ;
+}
+void setupFor ( in Ray ray ) {
+// clip near plane
+float rayLength = ( - ray . orig . z - ray . dir . z * MAX_LEN ) <
+cam_near_far . x ? ( cam_near_far . x + ray . orig . z ) / - ray . dir . z :
+MAX_LEN ;
+vec3 csEndPoint = ray . orig + ray . dir * rayLength ;
+vec4 H0 = proj * vec4 ( ray . orig , 1.0) , H1 = proj * vec4 ( csEndPoint ,
+1.0) ;
+state . k0 = 1.0 / H0 . w ; float k1 = 1.0 / H1 . w ;
+state . Q0 = ray . orig * state . k0 ; vec3 Q1 = csEndPoint * k1 ;
+state . P0 = H0 . xy * state . k0 ; vec2 P1 = H1 . xy * k1 ;
+state . P0 = (( state . P0 + vec2 (1) ) /2) * screendim ; P1 = (( P1 +
+vec2 (1) ) /2) * screendim ;
+// [ optional clipping ]
+# ifdef OPTIONAL_CLIPPING
+float xMax = screendim . x - 0.5 , xMin = 0.5 , yMax = screendim . y - 0.5 ,
+yMin = 0.5;
+float alpha = 0.0;
+if (( P1 . y > yMax ) || ( P1 . y < yMin ) )
+alpha = ( P1 . y - (( P1 . y > yMax ) ? yMax : yMin ) ) / ( P1 . y state . P0 . y ) ;
+if (( P1 . x > xMax ) || ( P1 . x < xMin ) )
+alpha = max ( alpha , ( P1 . x - (( P1 . x > xMax ) ? xMax : xMin ) ) / ( P1 . x state . P0 . x ) ) ;
+P1 = (1 - alpha ) * P1 + alpha * state . P0 ;
+k1 = (1 - alpha ) * k1 + alpha * state . k0 ;
+Q1 = (1 - alpha ) * Q1 + alpha * state . Q0 ;
+# endif
+P1 += vec2 (( distanceSquared ( state . P0 , P1 ) < 0.0001) ? 0.01 : 0.0) ;
+vec2 delta = P1 - state . P0 ;
+state . permute = false ;
+if ( abs ( delta . x ) < abs ( delta . y ) ) {
+state . permute = true ;
+delta = delta . yx ; state . P0 = state . P0 . yx ; P1 = P1 . yx ;
+}
+state . stepDir = sign ( delta . x ) ;
+float invdx = state . stepDir / delta . x ;
+state . dQ = ( Q1 - state . Q0 ) * invdx ;
+state . dk = ( k1 - state . k0 ) * invdx ;
+state . dP = vec2 ( state . stepDir , delta . y * invdx ) ;
+state . dP *= stride ; state . dQ *= stride ; state . dk *= stride ;
+state . end = P1 . x * state . stepDir ;
+}
+
+100
+101
+102
+103
+104
+105
+
+RayTracingResult traceRay ( in Ray ray ) {
+// setup and init to no hit found
+RayTracingResult result ;
+int bounces = 0;
+for ( int i = 0; i < BOUNCES ; ++ i )
+
+12
+
+result . hit [ i ] = false ;
+setupFor ( ray ) ;
+// slide P from P0 to P1 , same for Q and k
+vec2 P = state . P0 ; vec3 Q = state . Q0 ; float k = state . k0 ; float
+prevZMax = ray . orig . z ;
+// iterate
+for ( int i = 0; ( P . x * state . stepDir ) <= state . end && i < MAX_STEPS ;
+++ i )
+{
+P += state . dP ;
+Q . z -= state . dQ . z ;
+k += state . dk ;
+vec2 hitPixel = state . permute ? P . yx : P ;
+if (( hitPixel . x < 0) ||( hitPixel . y < 0) ||( hitPixel . x >=
+screendim . x ) ||( hitPixel . y >= screendim . y ) )
+return result ;
+float rayZMin = prevZMax ;
+float rayZMax = ( state . dQ . z * 0.5 f + Q . z ) / ( state . dk * 0.5 f + k ) ;
+prevZMax = rayZMax ;
+if ( rayZMin > rayZMax ) { float tmp = rayZMax ; rayZMax = rayZMin ;
+rayZMin = tmp ; }
+// traverse layers
+for ( int L = 0; L < LAYERS ; ++ L ) {
+if ( i == 0) break ; // WTF
+float sceneZMax = - texelFetch ( front_depth , ivec3 ( hitPixel , L ) ,
+0) . r * cam_near_far . y ; // eye space z
+float sceneZMin = sceneZMax - THICKNESS ;
+if ((( rayZMax >= sceneZMin ) && ( rayZMin <= sceneZMax ) ) ) {
+// hit
+Q . xy += state . dQ . xy * i ;
+vec3 csHitPoint = Q * (1. f / k ) ;
+result . hit [ bounces ] = true ;
+result . hitPos [ bounces ] = csHitPoint ;
+result . hitNorm [ bounces ] = texelFetch ( front_normal ,
+ivec3 ( hitPixel , L ) , 0) . rgb ;
+bounces ++;
+if ( bounces >= BOUNCES )
+return result ;
+// setup new ray
+vec3 dir reflect ( ray . dir , result . hitNorm [ bounces -1]) ;
+ray = Ray ( result . hitPos [ bounces -1] , dir , col . a ) ;
+setupFor ( ray ) ;
+P = state . P0 ; Q = state . Q0 ; k = state . k0 ; prevZMax = ray . orig . z ;
+}
+if ( sceneZMin < rayZMin ) break ;
+}
+}
+return result ;
+
+106
+107
+108
+109
+
+110
+111
+
+112
+113
+114
+115
+116
+117
+
+118
+119
+120
+121
+122
+
+123
+124
+125
+126
+
+127
+128
+129
+130
+131
+132
+133
+134
+
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+
+}
+
+13
+
+6
+
+HSSR Code
+
+6.1
+
+Fragment Collection Pass
+
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+
+47
+
+in vec4 pos_wc ;
+in vec3 norm_wc ;
+in vec2 tc ;
+layout ( std430 , binding = 0) buffer ListHeadsBuffer {
+uint list_heads [];
+};
+layout ( std430 , binding = 1) buffer ListDataBuffer {
+uvec4 list_data [];
+};
+layout ( binding = 2 , offset = 0) uniform atomic_uint counter ;
+// Journal of Computer Graphics Techniques Vol . 3 , No . 2 , 2014:
+vec2 signNotZero ( vec2 v ) {
+return vec2 (( v . x >= 0.0) ? +1.0 : -1.0 , ( v . y >= 0.0) ? +1.0 : -1.0) ;
+}
+vec2 float32x3_to_oct ( in vec3 v ) {
+vec2 p = v . xy * (1.0 / ( abs ( v . x ) + abs ( v . y ) + abs ( v . z ) ) ) ;
+return ( v . z <= 0.0) ? ((1.0 - abs ( p . yx ) ) * signNotZero ( p ) ) : p ;
+}
+uvec4 pack_data ( float depth , uint ptr , vec3 norm , vec3 col , float refl )
+{
+// x : 32 Bit depth , y : 32 Bit oct normals
+// z : 24 Bit rgb , 8 bit reflectiviy , w : 32 Bit pointer
+depth = clamp ( depth , 0 , 1) ;
+norm = normalize ( norm ) ;
+uint x = uint ( round ( depth * 4294967295. f ) ) ;
+uint y = packSnorm2x16 ( float32x3_to_oct ( norm ) ) ;
+col = clamp ( col , vec3 (0) , vec3 (1) ) ;
+uint z = packUnorm4x8 ( vec4 ( pow ( col , vec3 (2.2 f ) ) , refl ) ) ;
+uint w = ptr ;
+return uvec4 (x , y , z , w ) ;
+}
+void main () {
+if ( mask () < 0.2) { discard ; return ; } // sample alphamap
+vec4 pos_ec = view * pos_wc ;
+// linear depth
+float depth = ( - pos_ec . z ) * inv_far ;
+// normalmapping
+vec3 norm_ec = normal_matrix * norm_wc ;
+norm_ec = normalize ( normal ( norm_ec , pos_ec . xyz ) ) ; // sample normalmap
+// create linked list
+int at = int ( gl_FragCoord . y ) * screendim . x + int ( gl_FragCoord . x ) ;
+uint to = a to mi cCo un te rIn cr em ent ( counter ) ;
+uint old = atomicExchange ( list_heads [ at ] , to ) ;
+// pack and store data
+vec4 spec_col = specular () ; // sample specularmap
+float reflectivity = ( spec_col . r + spec_col . g + spec_col . b ) / 3. f ;
+list_data [ to ] = pack_data ( depth , old , norm_ec , diffuse () . rgb ,
+reflectivity ) ;
+}
+
+14
+
+6.2
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+Per-Pixel Linked-Lists Sorting Pass
+
+# version 430 core
+# define THREADS 16
+# define LAYERS 8
+// # define MIN_SEPARATION
+layout ( local_size_x = THREADS , local_size_y = THREADS ) in ;
+layout ( std430 , binding = 0) buffer ListHeadsBuffer {
+uint list_heads [];
+};
+layout ( std430 , binding = 1) buffer ListDataBuffer {
+uvec4 list_data [];
+};
+layout ( binding = 2 , offset = 0) uniform atomic_uint counter ;
+
+13
+14
+
+layout ( location = 0) uniform ivec2 screendim ;
+
+15
+16
+17
+
+shared uvec4 insertion [ THREADS * THREADS * LAYERS ];
+const uint local_pos = g l_ L oc al I nv oc a ti o nI nd e x * LAYERS ;
+
+18
+19
+20
+21
+22
+23
+24
+25
+26
+
+void main () {
+const ivec2 gid = ivec2 ( gl_G lobal Invo cati onID . xy ) ;
+if ( gid . x >= screendim . x || gid . y >= screendim . y ) return ;
+const uint at = gid . y * screendim . x + gid . x ;
+const uint start = list_heads [ at ];
+uint pos = start ;
+int n = 0;
+int i = 0;
+
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+
+// insertion sort PPLL
+while ( pos != 0 xFFFFFFFF ) {
+uvec4 curr = list_data [ pos ];
+pos = curr . w ;
+int to = n ;
+for ( int i = 0; i < n ; ++ i )
+if ( curr . x < insertion [ local_pos + i ]. x ) {
+to = i ;
+break ;
+}
+if ( to < LAYERS ) {
+for ( int move = min (n , LAYERS -1) ; move > to ; -- move )
+insertion [ local_pos + move ] = insertion [ local_pos + move -1];
+insertion [ local_pos + to ] = curr ;
+if ( n < LAYERS ) ++ n ;
+}
+}
+
+45
+46
+47
+48
+49
+50
+51
+52
+
+53
+54
+55
+
+// write sorted list as array
+const uint to = atomicCounter ( counter ) + at * LAYERS ;
+# ifdef MIN_SEPARATION
+# define SEPARATION uint (0.002 f * uint (0 xFFFFFFFF ) )
+int frags_out = 0;
+for ( int i = 0; i < n ; ++ i ) {
+if ( i > 0 && insertion [ local_pos + i ]. x insertion [ local_pos + frags_out -1]. x < SEPARATION )
+continue ;
+list_data [ to + frags_out ++] = insertion [ local_pos + i ];
+}
+
+15
+
+56
+57
+58
+59
+60
+61
+62
+
+n = frags_out ;
+# else
+for ( int i = 0; i < n ; ++ i )
+list_data [ to + i ] = insertion [ local_pos + i ];
+# endif
+list_heads [ at ] = uint ( clamp (n , 0 , 15) ) << 28 | ( to & 0 x0FFFFFFF ) ;
+}
+
+6.3
+1
+2
+3
+
+Hierarchy Construction
+
+# version 430 core
+# define THREADS 24
+# define LAYERS 8
+
+4
+5
+
+# define COMPRESS_FRAGS
+
+6
+7
+
+layout ( local_size_x = THREADS , local_size_y = THREADS ) in ;
+
+8
+9
+10
+11
+12
+13
+14
+
+layout ( std430 , binding = 0) buffer ListHeadsBuffer {
+uint list_heads [];
+};
+layout ( std430 , binding = 1) buffer ListDataBuffer {
+uvec2 list_data []; // uvec2 !
+};
+
+15
+16
+
+layout ( binding = 2 , offset = 0) uniform atomic_uint counter ;
+
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+layout ( location
+
+=
+=
+=
+=
+=
+=
+=
+=
+=
+=
+
+0)
+1)
+2)
+3)
+4)
+5)
+6)
+7)
+8)
+9)
+
+uniform
+uniform
+uniform
+uniform
+uniform
+uniform
+uniform
+uniform
+uniform
+uniform
+
+ivec2 screendim ;
+vec2 cam_near_far ;
+vec2 near_plane_size ;
+vec2 far_plane_size ;
+int epsilon_factor ;
+ivec2 source_dim ;
+ivec2 target_dim ;
+int source_offset ;
+int target_offset ;
+int level ; // [0 , mm_levels [
+
+28
+29
+30
+
+const float far = cam_near_far . y ;
+const float inv_far = 1. f / far ;
+
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - float unpack_depth ( uint data ) {
+const float f = 1 / float ( uint (0 xFFFFFFFF ) ) ;
+return float ( data ) * f ;
+}
+float unpack_depth ( uvec2 data ) {
+const float f = 1 / float ( uint (0 xFFFFFFFF ) ) ;
+return float ( data . x ) * f ;
+}
+float unpack_depth_end ( uvec2 data ) {
+const float f = 1 / float ( uint (0 xFFFFFFFF ) ) ;
+return float ( data . y ) * f ;
+}
+uint to_ptr ( uint handle ) {
+return ( handle & 0 x0FFFFFFF ) ;
+}
+
+16
+
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+
+76
+77
+78
+79
+80
+
+uint to_len ( uint handle ) {
+return ( handle & 0 xF0000000 ) >> 28;
+}
+uint to_handle ( uint len , uint ptr ) {
+return uint ( clamp ( len , 0 , 15) ) << 28 | ( ptr & 0 x0FFFFFFF ) ;
+}
+uvec2 load ( uint ptr , uint offset ) {
+# ifdef COMPRESS_FRAGS
+int stride = level == 0 ? 2 : 1;
+return list_data [2* ptr + stride * offset ];
+# else
+return list_data [2* ptr + 2* offset ];
+# endif
+}
+uvec2 load ( uvec2 filter_handle ) {
+return load ( to_ptr ( filter_handle . x ) , filter_handle . y ) ;
+}
+void save ( uint ptr , uint offset , uvec2 data ) {
+# ifdef COMPRESS_FRAGS
+list_data [2* ptr + offset ] = data ;
+# else
+list_data [2*( ptr + offset ) ] = data ;
+# endif
+}
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - float w ( float depth , int l = level ) {
+const float base_radius = near_plane_size . x / screendim . x ;
+const float add_radius = ( far_plane_size . x - near_plane_size . x ) /
+screendim . x ;
+return ( base_radius + depth * add_radius ) * float (1 << level ) ;
+}
+float epsilon ( float d_min ) {
+return epsilon_factor * w ( d_min , level +1) * inv_far ;
+}
+
+81
+82
+83
+84
+
+shared uvec2 handles [ THREADS * THREADS *4];
+shared uvec2 frags [ THREADS * THREADS *4];
+const uint local_pos = g l_ L oc al I nv oc a ti o nI nd e x *4;
+
+85
+86
+87
+
+88
+89
+90
+
+91
+92
+93
+94
+
+95
+96
+97
+98
+
+bool pop_closest ( inout float d_min , inout float d_max ) {
+uint closest = min ( min ( frags [ local_pos +0]. x , frags [ local_pos +1]. x ) ,
+min ( frags [ local_pos +2]. x , frags [ local_pos +3]. x ) ) ;
+if ( closest == -1) return false ;
+// found a fragment , update data structures
+int i = closest == frags [ local_pos +0]. x ? 0 : closest ==
+frags [ local_pos +1]. x ? 1 : closest == frags [ local_pos +2]. x ? 2 :
+3;
+d_min = unpack_depth ( closest ) ;
+d_max = d_min + epsilon ( d_min ) ;
+handles [ local_pos + i ]. y ++;
+frags [ local_pos + i ] = handles [ local_pos + i ]. y <
+to_len ( handles [ local_pos + i ]. x ) ? load ( handles [ local_pos + i ]) :
+uvec2 ( -1 , -1) ;
+return true ;
+}
+bool pop_within_epsilon ( in float d_min , inout float d_max ) {
+uint sec_closest = min ( min ( frags [ local_pos +0]. x ,
+frags [ local_pos +1]. x ) , min ( frags [ local_pos +2]. x ,
+
+17
+
+frags [ local_pos +3]. x ) ) ;
+if ( sec_closest == -1) return false ;
+// check if within EPSILON range
+int i = sec_closest == frags [ local_pos +0]. x ? 0 : sec_closest ==
+frags [ local_pos +1]. x ? 1 : sec_closest == frags [ local_pos +2]. x ?
+2 : 3;
+float d_sec_closest = unpack_depth ( sec_closest ) ;
+float d_sec_closest_end = level == 0 ? d_sec_closest :
+unpack_depth_end ( frags [ local_pos + i ]) ;
+if ( d_sec_closest - d_min > epsilon ( d_min ) ) return false ;
+// found a fragment , update data structures
+d_max = max ( d_max , d_sec_closest_end ) ;
+handles [ local_pos + i ]. y ++;
+frags [ local_pos + i ] = handles [ local_pos + i ]. y <
+to_len ( handles [ local_pos + i ]. x ) ? load ( handles [ local_pos + i ]) :
+uvec2 ( -1 , -1) ;
+return true ;
+
+99
+100
+101
+
+102
+103
+
+104
+105
+106
+107
+108
+
+109
+110
+
+}
+
+111
+112
+113
+114
+115
+116
+
+117
+
+118
+
+119
+
+120
+
+121
+
+122
+
+123
+
+124
+125
+126
+127
+128
+
+129
+
+130
+
+131
+
+132
+133
+134
+135
+
+void main () {
+const ivec2 gid = ivec2 ( gl_G lobal Invo cati onID . xy ) ;
+if ( gid . x >= target_dim . x || gid . y >= target_dim . y ) return ;
+// init data structures
+const ivec2 base0 = clamp (2* gid + ivec2 (0 , 0) , ivec2 (0) ,
+source_dim -1) ;
+const ivec2 base1 = clamp (2* gid + ivec2 (1 , 0) , ivec2 (0) ,
+source_dim -1) ;
+const ivec2 base2 = clamp (2* gid + ivec2 (0 , 1) , ivec2 (0) ,
+source_dim -1) ;
+const ivec2 base3 = clamp (2* gid + ivec2 (1 , 1) , ivec2 (0) ,
+source_dim -1) ;
+handles [ local_pos +0]. x = list_heads [ source_offset + base0 . y *
+source_dim . x + base0 . x ];
+handles [ local_pos +1]. x = list_heads [ source_offset + base1 . y *
+source_dim . x + base1 . x ];
+handles [ local_pos +2]. x = list_heads [ source_offset + base2 . y *
+source_dim . x + base2 . x ];
+handles [ local_pos +3]. x = list_heads [ source_offset + base3 . y *
+source_dim . x + base3 . x ];
+handles [ local_pos +0]. y = 0;
+handles [ local_pos +1]. y = 0;
+handles [ local_pos +2]. y = 0;
+handles [ local_pos +3]. y = 0;
+frags [ local_pos +0] = to_len ( handles [ local_pos +0]. x ) == 0 ? uvec2 ( -1 ,
+-1) : load ( handles [ local_pos +0]) ;
+frags [ local_pos +1] = to_len ( handles [ local_pos +1]. x ) == 0 ? uvec2 ( -1 ,
+-1) : load ( handles [ local_pos +1]) ;
+frags [ local_pos +2] = to_len ( handles [ local_pos +2]. x ) == 0 ? uvec2 ( -1 ,
+-1) : load ( handles [ local_pos +2]) ;
+frags [ local_pos +3] = to_len ( handles [ local_pos +3]. x ) == 0 ? uvec2 ( -1 ,
+-1) : load ( handles [ local_pos +3]) ;
+const uint target_at = target_offset + gid . y * target_dim . x + gid . x ;
+const uint to = int ( atomicCounter ( counter ) ) + target_at * LAYERS ;
+int fragments_out = 0;
+float d_min , d_max = 0;
+
+136
+137
+138
+
+# ifdef COMPRESS_FRAGS
+const int NUM = 2* LAYERS ;
+
+18
+
+139
+140
+141
+142
+143
+144
+145
+146
+147
+
+148
+149
+150
+151
+152
+
+# else
+const int NUM = LAYERS ;
+# endif
+// iterate lists and filter
+for ( int i = 0; i < NUM ; ++ i ) {
+if (! pop_closest ( d_min , d_max ) ) break ;
+while ( pop_within_epsilon ( d_min , d_max ) ) {}
+// save first fragment
+save ( to , fragments_out ++ , uvec2 ( uint ( clamp ( d_min , 0 , 1) *
+uint ( -1) ) , uint ( clamp ( d_max , 0 , 1) * uint ( -1) ) ) ) ;
+d_min = d_max = 0;
+}
+// update head handle
+list_heads [ target_at ] = to_handle ( fragments_out , to ) ;
+}
+
+6.4
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+
+Hierarchical Screen-Space Ray Tracer
+
+# version 430 core
+# extension GL_ARB_shader_ballot : require
+# extension G L _ AR B _ s ha d e r _g r o u p_ v o t e : require
+# define THREADS 32
+// parameters
+# define COMPRESS_FRAGS
+# define BALLOT_N 4
+// reload when num_active / N rays are done
+# define BALLOT_KILL_N 1 // kill N long rays in warp
+# define MAX_STEPS 100
+# define EPSILON 0.0001 f
+# define THICKNESS EPSILON * 5
+# define BOUNCES 2
+
+13
+14
+
+layout ( local_size_x = THREADS , local_size_y = THREADS ) in ;
+
+15
+16
+17
+18
+19
+20
+21
+
+layout ( std430 , binding = 0) buffer ListHeadsBuffer {
+uint list_heads [];
+};
+layout ( std430 , binding = 1) buffer ListDataBuffer {
+uvec2 list_data [];
+};
+
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+
+uniform mat4 view ;
+uniform mat4 proj ;
+uniform ivec2 screendim ;
+uniform vec2 cam_near_far ;
+uniform float aspect ;
+uniform float tan_fovy ;
+uniform int mm_levels ;
+uniform int half_res ;
+const ivec2 dim = ivec2 ( screendim * ( half_res == 1 ? 0.5 f : 1. f ) ) ;
+const float inv_far = 1. f / cam_near_far . y ;
+const mat4 inv_view = inverse ( view ) ;
+
+34
+35
+36
+37
+38
+39
+
+// Journal of Computer Graphics Techniques Vol . 3 , No . 2 , 2014:
+vec2 signNotZero ( vec2 v ) {
+return vec2 (( v . x >= 0.0) ? +1.0 : -1.0 , ( v . y >= 0.0) ? +1.0 : -1.0) ;
+}
+vec3 oct_to_float32x3 ( vec2 e ) {
+
+19
+
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+
+76
+77
+
+78
+79
+
+vec3 v = vec3 ( e . xy , 1.0 - abs ( e . x ) - abs ( e . y ) ) ;
+if ( v . z < 0) v . xy = (1.0 - abs ( v . yx ) ) * signNotZero ( v . xy ) ;
+return normalize ( v ) ;
+}
+float unpack_depth ( uvec2 data ) {
+const float f = 1 / float ( uint (0 xFFFFFFFF ) ) ;
+return float ( data . x ) * f ;
+}
+float unpack_depth_end ( uvec2 data ) {
+const float f = 1 / float ( uint (0 xFFFFFFFF ) ) ;
+return float ( data . y ) * f ;
+}
+vec3 unpack_norm ( uvec4 data ) {
+return oct_to_float32x3 ( unpackSnorm2x16 ( data . y ) ) ;
+}
+vec4 unpack_col ( uvec4 data ) {
+return unpackUnorm4x8 ( data . z ) ;
+}
+uint to_ptr ( uint handle ) {
+return handle & 0 x0FFFFFFF ;
+}
+uint to_len ( uint handle ) {
+return ( handle & 0 xF0000000 ) >> 28;
+}
+uvec2 load ( uint ptr , uint layer = 0 , int level = 0) {
+# ifdef COMPRESS_FRAGS
+int stride = level == 0 ? 2 : 1;
+return list_data [2* ptr + stride * layer ];
+# else
+return list_data [2* ptr + 2* layer ];
+# endif
+}
+uvec4 load_uvec4 ( uint ptr , uint layer = 0 , int level = 0) {
+# ifdef COMPRESS_FRAGS
+int stride = level == 0 ? 2 : 1;
+return uvec4 ( list_data [2* ptr + stride * layer ] , list_data [2* ptr +
+stride * layer + 1]) ;
+# else
+return uvec4 ( list_data [2* ptr + 2* layer ] , list_data [2* ptr + 2* layer +
+1]) ;
+# endif
+}
+
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+
+struct Ray {
+vec3 orig ;
+vec3 dir ;
+float f ;
+};
+struct RayTracingResult {
+bool hit [ BOUNCES ];
+vec3 hitPos [ BOUNCES ];
+i vec3 hitNorm [ BOUNCES ];
+};
+struct RayTracingState {
+vec2 P0 , dP ;
+vec3 Q0 , dQ ;
+float k0 , dk ;
+float t ;
+
+20
+
+96
+97
+98
+99
+100
+101
+
+int miplevel ;
+vec2 pixlen ;
+vec2 posdir ;
+int layer ;
+bool done ;
+} state ;
+
+102
+103
+104
+105
+106
+107
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+
+125
+
+126
+127
+
+128
+129
+130
+131
+132
+133
+134
+
+135
+136
+137
+138
+139
+140
+141
+142
+143
+
+void setupFor ( in Ray ray ) {
+// setup ray and perform frustum clipping
+vec4 H0 = proj * vec4 ( ray . orig , 1.0) ;
+state . k0 = 1.0 / H0 . w ; state . Q0 = ray . orig * state . k0 ;
+state . P0 = (( H0 . xy * state . k0 + 1. f ) /2. f ) * screendim ;
+vec2 P1 ;
+// compute distance to screen borders and clip in screen space
+vec4 Hclip = proj * vec4 ( ray . orig + ray . dir , 1. f ) ;
+vec2 Pclip = (( Hclip . xy / Hclip . w + 1. f ) /2. f ) * screendim ;
+vec2 dir_screen = normalize ( Pclip - state . P0 ) ;
+vec2 dest_screen = step (0 , dir_screen ) * ( screendim - ivec2 (1) ) ;
+vec2 dist_screen = ( dest_screen - state . P0 ) / dir_screen ;
+P1 = state . P0 + dir_screen * min ( dist_screen .x , dist_screen . y ) ;
+// clip against frustum in camera space
+vec3 csFar = reproject ( P1 , 1. f ) ;
+vec3 csFarDir = normalize ( csFar ) ;
+vec3 n = cross ( csFarDir , cross ( ray . dir , csFarDir ) ) ;
+float len = dot ( csFar - ray . orig , n ) / dot ( ray . dir , n ) ;
+vec3 ray_end = ray . orig + len * ray . dir ;
+// check for error , clip far plane
+if ( - ray_end . z > cam_near_far . y || len < 0)
+ray_end = ray . orig + ray . dir * ( cam_near_far . y + ray . orig . z ) /
+- ray . dir . z ;
+vec4 H1 = proj * vec4 ( ray_end , 1.0) ; float k1 = 1. f / H1 . w ; vec3 Q1 =
+ray_end * k1 ;
+P1 = (( H1 . xy * k1 + 1. f ) /2. f ) * screendim ;
+state . dQ = Q1 - state . Q0 ; state . dP = P1 - state . P0 ; state . dk = k1 state . k0 ;
+// setup variables
+state . posdir = step ( vec2 (0) , state . dP ) ;
+state . pixlen = 1. f / abs ( state . dP ) ;
+// interpolation factor and mip level
+state . miplevel = 0;
+// one initial step to not collide with the origin fragment
+vec2 dt = abs ( floor ( state . P0 + state . posdir ) - state . P0 ) *
+state . pixlen ;
+state . t = min ( dt .x , dt . y ) + EPSILON ;
+state . done = false ;
+}
+vec3 getCurrCSPos () {
+return ( state . Q0 + state . dQ * state . t ) / ( state . k0 + state . dk * state . t ) ;
+}
+vec2 getCurrSSPos () {
+return state . P0 + state . t * state . dP ;
+}
+
+144
+145
+146
+147
+148
+149
+
+RayTracingResult traceRay ( in Ray ray ) {
+// set dda state
+setupFor ( ray ) ;
+// additional state
+int bounces = 0;
+
+21
+
+150
+151
+152
+153
+154
+
+float acceleration_delay = 1;
+// init result to false
+RayTracingResult result ;
+for ( int i = 0; i < BOUNCES ; ++ i )
+result . hit [ i ] = false ;
+
+155
+156
+157
+158
+159
+160
+161
+
+162
+163
+164
+165
+166
+
+167
+
+168
+169
+170
+171
+
+172
+173
+174
+175
+176
+
+177
+
+178
+179
+180
+181
+182
+
+183
+184
+185
+
+186
+187
+188
+189
+190
+191
+192
+
+193
+194
+195
+196
+197
+198
+
+// iterate
+for ( int i = 0; i < MAX_STEPS && state . t < 1. f ; ++ i ) {
+// compute offset and divisor for current mip level
+int off = 0; int div = 1;
+for ( int i = 0; i < state . miplevel ; i ++) {
+off += int ( ceil ( float ( screendim . x ) / div ) ) *
+int ( ceil ( float ( screendim . y ) / div ) ) ; div *= 2;
+}
+// current screen space position
+vec2 Pcurr = getCurrSSPos () ;
+// clip ray vs pixel
+vec2 dt_entry = abs ( ceil ( Pcurr / div - state . posdir ) * div state . P0 ) * state . pixlen ;
+vec2 dt_exit = abs ( floor ( Pcurr / div + state . posdir ) * div state . P0 ) * state . pixlen ;
+float t_entry = clamp ( max ( dt_entry .x , dt_entry . y ) , 0 , state . t ) ;
+float t_exit = clamp ( min ( dt_exit .x , dt_exit . y ) , t_entry , 1) ;
+// get sample location
+uint handle = list_heads [ off + int ( Pcurr . y / div ) *
+int ( ceil ( float ( screendim . x ) / div ) ) + int ( Pcurr . x / div ) ];
+uint len = to_len ( handle ) ;
+if ( len == 0) { state . t = t_exit + EPSILON ; continue ; }
+uint pos = to_ptr ( handle ) ;
+// compute ray - frustum entry , exit depth
+float rayEntryDepth = -(( state . Q0 . z + state . dQ . z * t_entry ) /
+( state . k0 + state . dk * t_entry ) ) * inv_far ;
+float rayExitDepth = -(( state . Q0 . z + state . dQ . z * t_exit ) / ( state . k0
++ state . dk * t_exit ) ) * inv_far ;
+float rayDepthMin = min ( rayEntryDepth , rayExitDepth ) ;
+float rayDepthMax = max ( rayEntryDepth , rayExitDepth ) ;
+// sample list and check for collisions
+bool collision = false ;
+for ( state . layer = state . done ? state . layer : 0; state . layer < len
+&& ! state . done ; ++ state . layer ) {
+uvec2 data = load ( ptr , state . layer , state . miplevel ) ;
+float sceneDepthMin = unpack_depth ( data ) ;
+float sceneDepthMax = ( state . miplevel != 0 ?
+unpack_depth_end ( data ) : sceneDepthMin ) + THICKNESS ;
+if ( sceneDepthMin > rayDepthMax ) // early terminate
+break ;
+if ( sceneDepthMax < rayDepthMin ) // advance list
+continue ;
+collision = true ;
+// advance ray to point of collision
+float f = clamp (( sceneDepthMin - rayDepthMin ) / ( rayDepthMax rayDepthMin ) , 0 , 1) ;
+if (! state . done && ray . dir . z < 0)
+state . t = max ( state .t , t_exit * f + t_entry * (1 - f ) ) ;
+break ;
+}
+// check if done
+if ( collision && state . miplevel == 0)
+
+22
+
+state . done = true ;
+// update
+if (! state . done ) {
+state . t = collision ? state . t : t_exit + EPSILON ;
+// update current mip map level
+acceleration_delay = max (0 , collision ? 3 : acceleration_delay 1) ; // conservative delay
+int new_mip = clamp ( state . miplevel + ( collision ? -1 : 1) , 0 ,
+mm_levels ) ;
+state . miplevel = collision || acceleration_delay == 0 ? new_mip :
+state . miplevel ;
+}
+// query warp occupancy
+uint threadsTracing = bitCount ( uint ( ballotARB ( true ) ) ) ;
+uint threadsWantToReload = bitCount ( uint ( ballotARB ( state . done ) ) ) ;
+if ( BOUNCES > 1 && threadsWantToReload > threadsTracing / BALLOT_N &&
+state . done ) {
+// save hit
+result . hit [ bounces ] = true ;
+result . hitPos [ bounces ] = getCurrCSPos () ;
+ivec2 pixel = ivec2 ( Pcurr ) ;
+handle = list_heads [ pixel . y * screendim . x + pixel . x ];
+pos = to_ptr ( handle ) ;
+uvec4 data = load_uvec4 ( pos , state . layer ) ;
+result . hitNorm [ bounces ] = unpack_norm ( data ) ;
+bounces ++;
+if ( bounces >= BOUNCES )
+return result ;
+// setup next bounce
+vec3 dir = reflect ( ray . dir , result . hitNorm [ bounces -1]) ;
+ray = Ray ( result . hitPos [ bounces -1]+ dir * EPSILON , dir ) ;
+setupFor ( ray ) ;
+acceleration_delay = 1;
+}
+if ( threadsTracing <= BALLOT_KILL_N ||
+allInvocationsARB ( state . done ) )
+break ;
+
+199
+200
+201
+202
+203
+204
+
+205
+
+206
+
+207
+208
+209
+210
+211
+
+212
+213
+214
+215
+216
+217
+218
+219
+220
+221
+222
+223
+224
+225
+226
+227
+228
+229
+
+230
+
+}
+// end of trace loop
+
+231
+232
+233
+
+// save result if hasn ’t been already
+if ( state . done ) {
+result . hit [ bounces ] = true ;
+result . hitPos [ bounces ] = getCurrCSPos () ;
+ivec2 pixel = ivec2 ( getCurrSSPos () ) ;
+uint handle = list_heads [ pixel . y * screendim . x + pixel . x ];
+uint pos = to_ptr ( handle ) ;
+uvec4 data = load_uvec4 ( pos , state . layer ) ;
+result . hitNorm [ bounces ] = unpack_norm ( data ) ;
+}
+return result ;
+
+234
+235
+236
+237
+238
+239
+240
+241
+242
+243
+244
+245
+
+}
+
+23
+
+

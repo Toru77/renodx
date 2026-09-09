@@ -640,7 +640,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource dyncube_cam[2];
   reshade::api::resource_view dyncube_cam_srv[2];
   reshade::api::resource_view dyncube_cam_uav[2];
-  uint32_t dyncube_hist_cur = 0;           // current write set (0=A,1=B)
+  uint32_t dyncube_hist_cur = 0;           // current write set (0=A,1=B); reads use dyncube_readSet
   bool dyncube_needs_reset = true;         // clear history + first-frame reset
   bool dyncube_was_enabled = false;        // rising-edge latch for enabled->reset
   reshade::api::sampler dyncube_linear_sampler = {};     // trilinear clamp (GGX input mips)
@@ -662,6 +662,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet dyncube_worldbox_tables = {};
   bool dyncube_worldbox_reset_pending = true;   // set on recreate / toggle rising edge / manual button
   bool dyncube_worldbox_was_enabled = false;    // toggle rising-edge latch
+  // Delayed-validate commit (loading protection): consumers follow readSet, which
+  // advances only to validated captures. Staging holds the latest bounds copy.
+  reshade::api::resource dyncube_validStaging = {}; // 32B gpu_to_cpu staging copy of bounds
+  uint32_t dyncube_readSet = 0;            // validated consumer set (t29/previews/aliases/filter input)
+  uint32_t dyncube_filteredReadSet = 99u;  // readSet last fed into GGX filter (99 = none yet)
+  bool dyncube_boxCopyPending = false;     // staged validity copy enqueued, not yet consumed
+  bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
+  bool dyncube_hasValidRead = false;       // any validated readSet exists (gates first filter)
+  uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
   // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
   // partially-written cube is never exposed to lighting.
   uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..1024)
@@ -728,6 +737,8 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, uint32_t set);
+static void PromoteDynCubeReadSet(DeviceData* d);
+static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* d);
 static bool RunDynCubeInference(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool ggxOn);
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
@@ -3946,7 +3957,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
             || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
             || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f)) {
       int face = (int)std::clamp(shader_injection.dynCube_debug_face, 0.f, 5.f);
-      const uint32_t outSet = 1u - d->dyncube_hist_cur; // freshly written set (alias target)
+      const uint32_t outSet = d->dyncube_readSet; // validated read set (delayed-validate commit)
       reshade::api::resource srcTex = d->dyncube_texture;
       uint32_t srcSub = (uint32_t)face;
       uint32_t srcW = 0, srcH = 0;
@@ -4041,8 +4052,8 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
           || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
           || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f)) {
     int face = (int)std::clamp(shader_injection.dynCube_debug_face, 0.f, 5.f);
-    const uint32_t outSet = 1u - d->dyncube_hist_cur; // freshly written set (alias target)
-    reshade::api::resource srcTex = d->dyncube_texture;
+      const uint32_t outSet = d->dyncube_readSet; // validated read set (delayed-validate commit)
+      reshade::api::resource srcTex = d->dyncube_texture;
     uint32_t srcSub = (uint32_t)face;
     uint32_t srcW = 0, srcH = 0;
     if (shader_injection.dynCube_debug == 5.f) srcTex = d->dyncube_hist[outSet].pos;
@@ -4279,19 +4290,20 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       dd->dyncube_sched_frame = dd->frame_index;
       const uint32_t interval = std::max(1u, (uint32_t)std::clamp(shader_injection.dynCube_capture_interval, 1.f, 16.f));
 
+      // Delayed-validate commit: consume the staged hasGeom bit BEFORE any new
+      // capture/filter work, so promotion always pairs with the latest capture.
+      ConsumeDynCubeStagedValidity(dev, dd);
+
       // SSR runs every frame, independent of the Dynamic Cubemap update interval.
       if (shader_injection.dynCube_ssr_enabled > 0.5f) {
         (void)RunDynCubeSSR(cmd_list, dd);
       }
 
-      // Seed: on first activation (no completed cube yet) capture + filter immediately so
-      // the active cube is valid from the first frame (never a black/partial cube).
+      // Seed: on first activation (no completed cube yet) capture immediately; the
+      // filter is deferred to the gated Filter phase so an unvalidated first capture
+      // can never bake the GGX cubes (costs ~1 frame of first-image latency).
       if (!dd->dyncube_ggx_valid && RunDynCubeCapture(cmd_list, dd)) {
-        if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
-          dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
-          dd->dyncube_ggx_valid = true;
-        }
-        dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+        dd->dyncube_phase = DeviceData::DynCubePhase::Filter;
         dd->dyncube_next_update_frame = dd->frame_index + interval;
       }
 
@@ -4308,9 +4320,16 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           }
           break;
         case DeviceData::DynCubePhase::Filter:
-          if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
+          if (!dd->dyncube_hasValidRead) {
+            // No validated read set yet (e.g. loading at boot): wait, retry on cadence.
+            dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+          } else if (dd->dyncube_readSet == dd->dyncube_filteredReadSet) {
+            // Already filtered (frozen valid state): skip redundant work, no churn.
+            dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+          } else if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
             dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
             dd->dyncube_ggx_valid = true;
+            dd->dyncube_filteredReadSet = dd->dyncube_readSet;
             dd->dyncube_phase = DeviceData::DynCubePhase::Done;
           }
           break;
@@ -4334,6 +4353,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           msg += " ssr=" + std::to_string((int)shader_injection.dynCube_ssr_enabled);
           msg += " ggxValid=" + std::string(dd->dyncube_ggx_valid ? "1" : "0");
           msg += " capTot=" + std::to_string(dd->dyncube_capture_dispatches);
+          msg += " rej=" + std::to_string(dd->dyncube_rejected_captures);
+          msg += " rs=" + std::to_string(dd->dyncube_readSet);
           msg += " fltTot=" + std::to_string(dd->dyncube_filter_updates);
           msg += " ggxMips=" + std::to_string(dd->dyncube_ggx_mip_dispatches);
           msg += " faceCpy=" + std::to_string(dd->dyncube_face_copies);
@@ -4343,8 +4364,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
 
     // Bind the history position cube (t29) — Dynamic validity source for the blend.
+    // Reads the validated readSet (delayed-validate commit), never the raw write set.
     {
-      reshade::api::resource_view histPosSrv = dd->dyncube_hist[1u - dd->dyncube_hist_cur].pos_cube_srv;
+      reshade::api::resource_view histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
       if (histPosSrv.handle) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
           reshade::api::descriptor_table_update{{}, kDynCubeHistPosRegister, 0, 1,
@@ -4608,6 +4630,12 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& t : d->dyncube_ggx_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_hist_cur = 0;
   d->dyncube_needs_reset = true;
+  dr(d->dyncube_validStaging);
+  d->dyncube_readSet = 0;
+  d->dyncube_filteredReadSet = 99u;
+  d->dyncube_boxCopyPending = false;
+  d->dyncube_wasRejected = false;
+  d->dyncube_hasValidRead = false;
   dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
   dl(d->dyncube_capture_layout); dl(d->dyncube_solid_layout);
   for (auto& t : d->dyncube_capture_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
@@ -4836,6 +4864,22 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     d->dyncube_worldbox_reset_pending = true;
   }
 
+  // Validity staging for delayed-validate commit: 32B gpu_to_cpu copy of the bounds
+  // buffer (bounds[1].w carries per-frame hasGeom). Same lifetime as worldbox resources.
+  {
+    reshade::api::resource_desc rsb = {};
+    rsb.type = reshade::api::resource_type::buffer;
+    rsb.buffer.size = 32u;
+    rsb.buffer.stride = 0;
+    rsb.heap = reshade::api::memory_heap::gpu_to_cpu;
+    rsb.usage = reshade::api::resource_usage::copy_dest;
+    if (!dev->create_resource(rsb, nullptr, reshade::api::resource_usage::copy_dest, &d->dyncube_validStaging)) {
+      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create validity staging buffer");
+      DestroyDynCubeResources(dev, d);
+      return false;
+    }
+  }
+
   // ── Phase 3 GGX filtered cubes ──
   {
     // Mip count: 8 for all supported resolutions (128..1024); computed defensively.
@@ -4915,6 +4959,12 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
 
   d->dyncube_resources_created = true;
   d->dyncube_solid_written = false;
+  // Delayed-validate commit state: consumers start on set 0 (matches aliases above).
+  d->dyncube_readSet = 0;
+  d->dyncube_filteredReadSet = 99u;
+  d->dyncube_boxCopyPending = false;
+  d->dyncube_wasRejected = false;
+  d->dyncube_hasValidRead = false;
   if (should_log()) {
     const uint32_t mips = d->dyncube_mip_count;
     const double mips_wt = (mips >= 2) ? (4.0 / 3.0) : 1.0;
@@ -5250,6 +5300,11 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   d->dyncube_ggx_valid = false;
   d->dyncube_phase = DeviceData::DynCubePhase::Done;
   d->dyncube_next_update_frame = 0;
+  d->dyncube_readSet = 0;
+  d->dyncube_filteredReadSet = 99u;
+  d->dyncube_boxCopyPending = false;
+  d->dyncube_wasRejected = false;
+  d->dyncube_hasValidRead = false;
   d->dyncube_resources_created = true;
 }
 
@@ -5323,6 +5378,53 @@ static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d) {
   cl->barrier(d->dyncube_solid_cube, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   d->dyncube_solid_written = true;
   return true;
+}
+
+// Delayed-validate commit: promote the just-written set to the consumer read set
+// and advance the write cursor. Call ONLY with a validated set, except for the
+// reduction-unavailable fail-safe path (which preserves pre-protection behavior).
+// Aliases, t29, previews, and GGX input all follow readSet — never the raw write set.
+static void PromoteDynCubeReadSet(DeviceData* d) {
+  if (!d) return;
+  d->dyncube_readSet = d->dyncube_hist_cur;
+  d->dyncube_hist_cur = 1u - d->dyncube_hist_cur;
+  d->dyncube_texture = d->dyncube_hist[d->dyncube_readSet].color;
+  d->dyncube_srv = d->dyncube_hist[d->dyncube_readSet].color_cube_srv;
+  d->dyncube_uav = d->dyncube_hist[d->dyncube_readSet].color_uav;
+  d->dyncube_hasValidRead = true;
+}
+
+// Delayed-validate commit: consume the staged hasGeom bit (bounds[1].w, float index 7)
+// from the previous capture. Runs at scheduler entry before any new capture/filter work,
+// so the staged copy always describes the latest capture (no epochs needed). Blocking map
+// is safe: staged data is >=1 present old by construction. On map failure the pending flag
+// is kept and the system stays frozen (safe direction); a later copy overwrites the slot.
+static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* dd) {
+  if (!dev || !dd || !dd->dyncube_boxCopyPending || !dd->dyncube_validStaging.handle) return;
+  void* staged = nullptr;
+  if (!dev->map_buffer_region(dd->dyncube_validStaging, 0, 32, reshade::api::map_access::read_only, &staged) || staged == nullptr) {
+    return;
+  }
+  dd->dyncube_boxCopyPending = false;
+  const bool validNow = (reinterpret_cast<const float*>(staged)[7] > 0.5f);
+  dev->unmap_buffer_region(dd->dyncube_validStaging);
+  if (validNow) {
+    PromoteDynCubeReadSet(dd);
+    if (dd->dyncube_wasRejected && shader_injection.dynCube_debug_logging > 0.5f) {
+      reshade::log::message(reshade::log::level::info, "[DynCube] capture validation resumed (hasGeom valid)");
+    }
+    dd->dyncube_wasRejected = false;
+  } else {
+    // Rejected: readSet/aliases/filter input untouched; the scratch set will be
+    // overwritten by the next capture (self-cleaning). Limitation: an opaque loading
+    // backdrop that writes valid depth still yields hasGeom=true and cannot be
+    // rejected by geometry coverage (indistinguishable from real vista geometry).
+    ++dd->dyncube_rejected_captures;
+    if (!dd->dyncube_wasRejected && shader_injection.dynCube_debug_logging > 0.5f) {
+      reshade::log::message(reshade::log::level::info, "[DynCube] capture rejected (no valid geometry)");
+    }
+    dd->dyncube_wasRejected = true;
+  }
 }
 
 static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
@@ -5411,33 +5513,31 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   cl->barrier(d->dyncube_hist[cur].contrib, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   cl->barrier(d->dyncube_cam[cur], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
-  // World-fixed parallax bounds: only when enabled AND a capture actually ran
-  // (we are inside the post-capture barrier region, pre-swap). Nothing at all
-  // is dispatched for this feature when the toggle is OFF.
-  if (shader_injection.dynCube_worldbox_enabled > 0.5f) {
-    // The existing barrier set does not cover charmask — transition it for the
-    // reduction read, then restore UAV state for the next capture write.
-    cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
-    (void)RunDynCubeWorldBox(cl, d, cur);
-    cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+  // World-box reduction doubles as the capture-validity detector: it must run for
+  // every capture regardless of the World Fixed toggle (lighting use stays gated).
+  // Charmask transition for the reduction read, restored afterwards.
+  // NOTE: no swap/alias promotion here — the consumer readSet advances only via
+  // delayed validation (see scheduler consume), so an invalid capture can never
+  // become t29/t17/filter input. The write cursor advances on promotion only,
+  // which keeps rejected scratch sets disposable (overwritten by the next capture).
+  cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  if (!RunDynCubeWorldBox(cl, d, cur)) {
+    // Reduction unavailable: fall back to immediate promotion (pre-protection behavior).
+    PromoteDynCubeReadSet(d);
   }
+  cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
 
-  // Swap: next frame reads the just-written set as "previous" and writes the other set.
-  d->dyncube_hist_cur = prev;
-  // Aliases (t17 + preview + solid) point at the freshly written set.
-  d->dyncube_texture = d->dyncube_hist[cur].color;
-  d->dyncube_srv = d->dyncube_hist[cur].color_cube_srv;
-  d->dyncube_uav = d->dyncube_hist[cur].color_uav;
-  d->dyncube_solid_written = false; // now contains captured data
+  d->dyncube_solid_written = false; // capture ran (aliases still track the validated readSet)
   UnbindDynCubeComputeState(cl);
   return true;
 }
 
 // World-fixed parallax bounds reduction (Sora2nd v1). Reads the just-written
-// history set (pre-swap index `set`): pos/contrib/charmask array SRVs + camCur.
+// history set (write-cursor index `set`): pos/contrib/charmask array SRVs + camCur.
 // Two passes: per-group partials into scratch, then a single-group expand-only
 // merge into the persistent bounds (camera included unfiltered for containment).
-// No CPU readback. Runs only when the toggle is ON (caller-gated).
+// Runs for every capture (also doubles as the capture-validity detector for
+// delayed-validate commit); lighting use of the bounds stays toggle-gated.
 static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, uint32_t set) {
   if (!cl || !d || set > 1u) return false;
   if (!d->dyncube_resources_created) return false;
@@ -5448,7 +5548,8 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
       || !d->dyncube_cam_srv[set].handle
       || !d->dyncube_worldbox_scratch_uav.handle
       || !d->dyncube_worldbox_scratch_srv.handle
-      || !d->dyncube_worldbox_bounds_uav.handle) return false;
+      || !d->dyncube_worldbox_bounds_uav.handle
+      || !d->dyncube_validStaging.handle) return false;
   auto* dev = cl->get_device();
 
   const uint32_t sz = d->dyncube_size;
@@ -5492,6 +5593,12 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
     cl->dispatch(1, 1, 1);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
+  // Stage bounds for delayed-validate commit (consumed next scheduler entry; the
+  // per-frame hasGeom bit lives in staged bounds[1].w, float index 7).
+  cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
+  cl->copy_resource(d->dyncube_worldbox_bounds, d->dyncube_validStaging);
+  cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
+  d->dyncube_boxCopyPending = true;
   d->dyncube_worldbox_reset_pending = false;
   g_dyncube_worldbox_reset_request = false;
   UnbindDynCubeComputeState(cl);

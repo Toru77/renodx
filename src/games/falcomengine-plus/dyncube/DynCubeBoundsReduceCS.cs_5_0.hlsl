@@ -22,6 +22,13 @@ cbuffer DynCubeBoundsCB : register(b13)
 // indefinitely. Internal only, not a UI setting.
 static const float kWorldBoxMaxDist = 100.0;
 
+// Minimum probe-centered safety volume (world-unit half-extents). Unioned with
+// the geometry bounds so near-field reflection points P stay inside the parallax
+// AABB. Internal only, not a UI setting.
+static const float kWorldBoxSafetyHalfExtentX = 4.0;
+static const float kWorldBoxSafetyHalfExtentY = 3.0;
+static const float kWorldBoxSafetyHalfExtentZ = 4.0;
+
 Texture2DArray<float4> g_posTex      : register(t0);
 Texture2DArray<float>  g_contribTex  : register(t1);
 Texture2DArray<float4> g_charmaskTex : register(t2);
@@ -151,9 +158,16 @@ void main(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
             {
                 mergedMin = min(mergedMin, cam.xyz);
                 mergedMax = max(mergedMax, cam.xyz);
+                // Minimum probe-centered volume ensures near-field reflection points P stay inside the parallax AABB.
+                float3 safeMin = cam.xyz - float3(kWorldBoxSafetyHalfExtentX, kWorldBoxSafetyHalfExtentY, kWorldBoxSafetyHalfExtentZ);
+                float3 safeMax = cam.xyz + float3(kWorldBoxSafetyHalfExtentX, kWorldBoxSafetyHalfExtentY, kWorldBoxSafetyHalfExtentZ);
+                mergedMin = min(mergedMin, safeMin);
+                mergedMax = max(mergedMax, safeMax);
             }
             g_bounds[0] = float4(mergedMin, valid);
-            g_bounds[1] = float4(mergedMax, 0.0);
+            // Spare channel carries the CURRENT-frame geometry result (NOT the latched
+            // persistent flag): staged for delayed-validate commit decisions.
+            g_bounds[1] = float4(mergedMax, hasGeom ? 1.0f : 0.0f);
         }
     }
 }

@@ -187,7 +187,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         outContrib = 0.0;
     }
 
-    g_outColor[dtid]   = float4(max(0.0, outCol), 1.0);
+    g_outColor[dtid]   = float4(max(0.0, outCol), outValid);
     g_outPos[dtid]     = float4(outPos, outValid);
     g_outContrib[dtid] = outContrib;
 
