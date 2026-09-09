@@ -3059,8 +3059,8 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeCaptureBoost", .binding = &shader_injection.dynCube_capture_boost,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Capture Boost", .section = "Dynamic Cubemaps",
-      .tooltip = "Brightness multiplier for captured color before writing to cubemap. 1.0 = neutral, >1 brightens reflections.",
+      .default_value = 1.f, .label = "Reflection Brightness", .section = "Dynamic Cubemaps",
+      .tooltip = "Master brightness for SSR and dynamic cubemap reflections. 1.0 = neutral. Does not affect the vanilla fallback.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },

@@ -918,6 +918,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           && shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0;
       float3 dynCubeSampleDirA = r22.xyz * dynCubeFlipA;
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirA, dynCubeSampleMip).xyz;
+      // Package reflection brightness (dynamic + SSR only): mirrors the t17 override
+      // condition so vanilla/debug views stay untouched. Vanilla fallback never scaled.
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_debug != 4.f) {
+        r21.xyz *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+      }
       // Record the final sampled direction (including lookup flip) so validity and
       // vanilla fallback test the texel actually displayed, not its antipode.
       dynCubeReflDir = dynCubeSampleDirA;
@@ -952,6 +959,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           float2 ssrUV = resolutionScaling_g.xy * v1.zw;
           float4 ssrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0);
           r21.xyz = ssrTap.rgb;
+          if (shader_injection_data.dynCube_enabled > 0.5f
+              && shader_injection_data.dynCube_force_vanilla < 0.5f
+              && shader_injection_data.dynCube_debug != 4.f) {
+            r21.xyz *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+          }
           dynCubeReflSrc = 0;
         } else {
           const float layerMix = shader_injection_data.dynCube_layer_mix;
@@ -963,6 +975,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             float2 ssrUV = resolutionScaling_g.xy * v1.zw;
             float4 ssrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0);
             ssrCol = ssrTap.rgb;
+            if (shader_injection_data.dynCube_enabled > 0.5f
+                && shader_injection_data.dynCube_force_vanilla < 0.5f
+                && shader_injection_data.dynCube_debug != 4.f) {
+              ssrCol *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+            }
             ssrConf = ssrTap.a;
             if (layerMix < -0.5f) {
               float minEdge = min(min(ssrUV.x, 1.0 - ssrUV.x), min(ssrUV.y, 1.0 - ssrUV.y));
@@ -1121,6 +1138,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           && shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0;
       float3 dynCubeSampleDirB = dynCubeSampleDir * dynCubeFlipB;
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirB, dynCubeSampleMip2).xyz;
+      // Package reflection brightness (dynamic + SSR only): mirrors the t17 override
+      // condition so vanilla/debug views stay untouched. Vanilla fallback never scaled.
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_debug != 4.f) {
+        r21.xyz *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+      }
       // Record the final sampled direction (including lookup flip) so validity and
       // vanilla fallback test the texel actually displayed, not its antipode.
       dynCubeReflDir = dynCubeSampleDirB;
@@ -1153,6 +1177,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             float2 ssrUV2 = resolutionScaling_g.xy * v1.zw;
             float4 ssrTap2 = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV2, 0);
             r21.xyz = ssrTap2.rgb;
+            if (shader_injection_data.dynCube_enabled > 0.5f
+                && shader_injection_data.dynCube_force_vanilla < 0.5f
+                && shader_injection_data.dynCube_debug != 4.f) {
+              r21.xyz *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+            }
             dynCubeReflSrc = 0;
           } else {
             const float layerMix = shader_injection_data.dynCube_layer_mix;
@@ -1163,6 +1192,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               float2 ssrUV2 = resolutionScaling_g.xy * v1.zw;
               float4 ssrTap2 = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV2, 0);
               ssrCol = ssrTap2.rgb;
+              if (shader_injection_data.dynCube_enabled > 0.5f
+                  && shader_injection_data.dynCube_force_vanilla < 0.5f
+                  && shader_injection_data.dynCube_debug != 4.f) {
+                ssrCol *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+              }
               ssrConf = ssrTap2.a;
               if (layerMix < -0.5f) {
                 float minEdge = min(min(ssrUV2.x, 1.0 - ssrUV2.x), min(ssrUV2.y, 1.0 - ssrUV2.y));
