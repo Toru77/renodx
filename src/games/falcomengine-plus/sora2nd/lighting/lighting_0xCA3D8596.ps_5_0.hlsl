@@ -913,9 +913,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             ? shader_injection_data.dynCube_vanilla_blur
             : shader_injection_data.dynCube_blur);
       }
-      float3 dynCubeSampleDirA =
-          r22.xyz *
-          ((shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0);
+      // Lookup flip applies only when DynCube is active; vanilla lookups stay untouched.
+      float dynCubeFlipA = (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0;
+      float3 dynCubeSampleDirA = r22.xyz * dynCubeFlipA;
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirA, dynCubeSampleMip).xyz;
       // Record the final sampled direction (including lookup flip) so validity and
       // vanilla fallback test the texel actually displayed, not its antipode.
@@ -1099,9 +1100,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             ? shader_injection_data.dynCube_vanilla_blur
             : shader_injection_data.dynCube_blur);
       }
-      float3 dynCubeSampleDirB =
-          dynCubeSampleDir *
-          ((shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0);
+      // Lookup flip applies only when DynCube is active; vanilla lookups stay untouched.
+      float dynCubeFlipB = (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0;
+      float3 dynCubeSampleDirB = dynCubeSampleDir * dynCubeFlipB;
       r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirB, dynCubeSampleMip2).xyz;
       // Record the final sampled direction (including lookup flip) so validity and
       // vanilla fallback test the texel actually displayed, not its antipode.
