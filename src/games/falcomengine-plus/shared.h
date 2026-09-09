@@ -302,7 +302,8 @@ struct ShaderInjectData {
   float dynCube_parallax_debug;                // 0=off 1=on (tint reflection by probe-box exit face)
   float dynCube_reflect_sign_flip;               // 0=mathematical reflect ray (current), 1=physical ray (negated) — debug A/B
   float dynCube_ssr_enabled;                     // 0=off 1=on (simple screen-space SSR)
-  float dynCube_ssr_quality;                     // 0/1/2 -> Low/Medium/High (sample+dist mapping)
+  float dynCube_ssr_samples;                     // SSR march sample count [4..96], default 16
+  float dynCube_ssr_distance;                    // SSR search distance, world units [4..192], default 20
   float dynCube_ssr_blur;                        // SSR Gaussian blur sigma, 0=sharp
   float dynCube_ssr_distance_fade;               // hit-distance confidence falloff, 0..1
   float dynCube_ssr_edge_fade;                   // screen-edge confidence falloff, 0..1

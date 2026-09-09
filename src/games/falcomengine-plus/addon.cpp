@@ -271,7 +271,8 @@ ShaderInjectData shader_injection = {
   .dynCube_parallax_debug = 0.f,
   .dynCube_reflect_sign_flip = 0.f,
   .dynCube_ssr_enabled = 0.f,
-  .dynCube_ssr_quality = 1.f,
+  .dynCube_ssr_samples = 16.f,
+  .dynCube_ssr_distance = 20.f,
   .dynCube_ssr_blur = 2.f,
   .dynCube_ssr_distance_fade = 0.5f,
   .dynCube_ssr_edge_fade = 0.3f,
@@ -3203,11 +3204,20 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSSRQuality", .binding = &shader_injection.dynCube_ssr_quality,
+      .key = "DynCubeSSRSamples", .binding = &shader_injection.dynCube_ssr_samples,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "SSR Quality", .section = "Dynamic Cubemaps",
-      .tooltip = "Sample count and search distance. Low = 10 samples / 12 units. Medium = 16 / 20. High = 24 / 32.",
-      .labels = {"Low", "Medium", "High"},
+      .default_value = 16.f, .label = "SSR Sample Count", .section = "Dynamic Cubemaps",
+      .tooltip = "SSR ray-march sample count. Higher = more accurate at higher GPU cost. Old Medium preset = 16.",
+      .min = 4.f, .max = 96.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRDistance", .binding = &shader_injection.dynCube_ssr_distance,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 20.f, .label = "SSR Search Distance", .section = "Dynamic Cubemaps",
+      .tooltip = "SSR ray-march search distance in world units. Old Medium preset = 20.",
+      .min = 4.f, .max = 192.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -5596,13 +5606,9 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   dev->update_descriptor_tables(4, su);
   std::array<reshade::api::descriptor_table, 4> stables = {st->at(0), st->at(1), st->at(2), st->at(3)};
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 0, 4, stables.data());
-  // SSR Quality → (sampleCount, maxDist): Low 10/12, Medium 16/20, High 24/32.
-  const float quality = shader_injection.dynCube_ssr_quality;
-  uint32_t sampleCount = 16u;
-  float maxDist = 20.f;
-  if (quality < 0.5f) { sampleCount = 10u; maxDist = 12.f; }
-  else if (quality < 1.5f) { sampleCount = 16u; maxDist = 20.f; }
-  else { sampleCount = 24u; maxDist = 32.f; }
+  // Direct SSR march parameters (replaces the old Low/Medium/High quality presets).
+  const uint32_t sampleCount = (uint32_t)std::clamp((int)shader_injection.dynCube_ssr_samples, 4, 96);
+  const float maxDist = std::clamp(shader_injection.dynCube_ssr_distance, 4.f, 192.f);
   float pc[8] = {
       (float)sampleCount,
       maxDist,

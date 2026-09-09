@@ -1197,7 +1197,21 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           }
         }
       }
-      r19.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r19.xyz, r2.x).xyz;
+      // Transmission/refraction tap (game-original): r19 is the refracted direction,
+      // not the reflection vector, so it keeps the vanilla cubemap source with the
+      // game's roughness LOD rescaled onto the vanilla mip chain. Never the dynamic
+      // cube, never parallax-corrected, never dynCube_blur. When DynCube is off,
+      // t17 is already vanilla, so the original sample is kept as-is.
+      if (shader_injection_data.dynCube_enabled > 0.5f) {
+        uint vanW, vanH, vanL;
+        dynCubeVanillaTex.GetDimensions(0, vanW, vanH, vanL);
+        float transMip = (vanL > 1u && num_levels > 1u)
+            ? r2.x * (float)(vanL - 1) / (float)(num_levels - 1) : 0.0;
+        r19.xyz = dynCubeVanillaTex.SampleLevel(SmplCube_s, r19.xyz, transMip).xyz;
+      } else {
+        r19.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r19.xyz, r2.x).xyz;
+      }
+      r19.xyz = float3(1.0, 1.0, 1.0);  // TEST A TEMP DIAGNOSTIC: flatten transmission image, keep its energy scale
       r2.x = cmp(0 < r16.x);
       r5.y = 1 + -abs(r3.y);
       r5.y = max(0, r5.y);

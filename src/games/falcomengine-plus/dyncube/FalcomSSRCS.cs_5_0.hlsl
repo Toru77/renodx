@@ -117,7 +117,9 @@ void main(uint3 dtid : SV_DispatchThreadID)
     const float invCount = 1.0 / float(count);
 
     float3 cur = P;
-    float3 prev = P;  // last in-front point (for binary refinement)
+    float3 prev = P;  // previous march sample (step length + refinement fallback)
+    float3 bracketLo = P;      // most recent strictly-in-front sample (depthDiff < 0)
+    bool hasBracketLo = false; // true once such a sample has been observed
     bool crossed = false;
     float penetration = 0.0;     // rayDist - sceneDist at the crossing step (depth behind)
     float localStepLen = 1.0;    // view-space length of the crossing step
@@ -133,15 +135,26 @@ void main(uint3 dtid : SV_DispatchThreadID)
         float sceneDist = LinearizeDepth(g_depthTex.Load(int3(spx, 0)));
         if (sceneDist >= SSR_FLT_MAX * 0.5) continue;  // sky at this texel
         float rayDist = -cur.z;
+        float diff = rayDist - sceneDist;
         // Hit only when the ray is strictly BEHIND the surface by at least thickness.
-        if (rayDist >= sceneDist + thickness) {
+        if (diff >= thickness) {
             penetration = rayDist - sceneDist;
             crossed = true;
             break;
         }
+        // Track the most recent strictly-in-front sample for zero-crossing refinement.
+        if (diff < 0.0) {
+            bracketLo = cur;
+            hasBracketLo = true;
+        }
     }
 
     if (crossed) {
+        // Thickness gates coarse acceptance only; refinement targets the actual depth
+        // crossing (depthDiff = 0) so Thickness never offsets the final hit position.
+        // bracketLo is guaranteed strictly in front; otherwise fall back to prev
+        // (bounded: within one coarse step of detection, near the true crossing).
+        if (hasBracketLo) prev = bracketLo;
         // Binary refinement between the last in-front point (prev) and the crossing point (cur).
         for (uint b = 0u; b < kBinarySteps; ++b) {
             float3 mid = (prev + cur) * 0.5;
@@ -153,13 +166,15 @@ void main(uint3 dtid : SV_DispatchThreadID)
             int2 mpx = clamp(int2(muv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
             float mDist = -mid.z;
             float sDist = LinearizeDepth(g_depthTex.Load(int3(mpx, 0)));
-            if (mDist >= sDist + thickness) cur = mid; else prev = mid;
+            if (mDist >= sDist) cur = mid; else prev = mid;
         }
         float2 fuv = saturate(ProjectToUV(cur));
 
         // Confidence factors.
-        // hitConf: decisive vs grazing/borderline depth crossing (penetration relative to step).
-        float hitConf = saturate(penetration / max(localStepLen, 1e-3));
+        // hitConf: decisive vs grazing/borderline depth crossing (overshoot beyond
+        // the thickness acceptance boundary, relative to step). Subtracting thickness
+        // removes the artificial Thickness/SampleCount/SearchDistance dependence.
+        float hitConf = saturate((penetration - thickness) / max(localStepLen, 1e-3));
         // distanceConf: far hits lose authority.
         float hitT = length(cur - P);
         float distanceConf = 1.0 - smoothstep(0.0, 1.0, saturate(hitT / maxDist)) * g_distanceFade;
