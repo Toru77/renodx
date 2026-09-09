@@ -324,6 +324,8 @@ struct ShaderInjectData {
   float dynCube_worldbox_enabled;                // 0=off (camera-centered proxy), 1=on (persistent world-space proxy)
   float dynCube_worldbox_margin;                 // world-unit margin expanded around the stored bounds at lookup, default 1.0
   float dynCube_lookup_direction_flip;        // 0=off (current dynamic lookup), 1=negate final dynamic lookup dir — independent of parallax reflect sign
+  float dynCube_coverage_fade;                 // 0=off 1=on (smooth binary validity edge in direction space)
+  float dynCube_coverage_width;                // validity smoothing cone half-angle in degrees [0..8], default 2
 };
 
 #ifndef __cplusplus

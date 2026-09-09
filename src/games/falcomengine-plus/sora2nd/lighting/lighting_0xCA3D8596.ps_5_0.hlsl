@@ -983,16 +983,32 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           }
           // Final dynamic validity: raw histPos capture validity (>0.5 => captured).
           float dynamicConf;
-          {
-            float4 hpV = dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeReflDir, 0);
-            dynamicConf = (hpV.a > 0.5f) ? 1.0 : 0.0;
+          float4 hpV = dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeReflDir, 0);
+          dynamicConf = (hpV.a > 0.5f) ? 1.0 : 0.0;
+          // Smooth the binary dynamic-cubemap validity edge in direction space.
+          // Thickness/world-box/parallax data is intentionally not used for coverage.
+          float coverageFade = 1.0;
+          if (shader_injection_data.dynCube_coverage_fade > 0.5f) {
+            float3 covDir = dynCubeReflDir;
+            float3 covRef = (abs(covDir.x) < abs(covDir.y) && abs(covDir.x) < abs(covDir.z))
+                ? float3(1.0, 0.0, 0.0)
+                : ((abs(covDir.y) < abs(covDir.z)) ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0));
+            float3 covU = normalize(cross(covDir, covRef));
+            float3 covV = cross(covDir, covU);
+            float covR = tan(radians(max(shader_injection_data.dynCube_coverage_width, 0.0)));
+            float coverageSum = hpV.a;
+            coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir + covR * covU), 0).a;
+            coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir - covR * covU), 0).a;
+            coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir + covR * covV), 0).a;
+            coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir - covR * covV), 0).a;
+            coverageFade = smoothstep(0.0, 1.0, coverageSum * 0.2);
           }
           if (layerMix >= -0.5f) {
             // Manual override (0=SSR, 1=Dynamic, 2=Vanilla) with validity fallback:
             // SSR if confident, else Dynamic, else Vanilla; Dynamic if valid, else Vanilla.
             const bool dynUsable = (dynamicConf > 0.5f);
             const bool ssrUsable = dynCubeNewSSRActive && (ssrConf > 0.02f);
-            float3 dynLayer = dynUsable ? r21.xyz : vanillaCol;
+            float3 dynLayer = dynUsable ? lerp(vanillaCol, r21.xyz, coverageFade) : vanillaCol;
             float3 ssrLayer = ssrUsable ? ssrCol : dynLayer;
             float3 vanLayer = vanillaCol;
             if (layerMix <= 1.0f) {
@@ -1008,7 +1024,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           } else {
             // Automatic confidence blend (weights always sum to 1).
             float remaining = 1.0 - ssrWeight;
-            float dynamicWeight = remaining * dynamicConf;
+            float dynamicWeight = remaining * dynamicConf * coverageFade;
             float vanillaWeight = remaining - dynamicWeight;
             r21.xyz = ssrCol * ssrWeight + r21.xyz * dynamicWeight + vanillaCol * vanillaWeight;
             dynCubeReflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
@@ -1167,16 +1183,32 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             }
             // Final dynamic validity: raw histPos capture validity (>0.5 => captured).
             float dynamicConf;
-            {
-              float4 hpV2 = dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeReflDir, 0);
-              dynamicConf = (hpV2.a > 0.5f) ? 1.0 : 0.0;
+            float4 hpV2 = dynCubeHistPosTex.SampleLevel(samPoint_s, dynCubeReflDir, 0);
+            dynamicConf = (hpV2.a > 0.5f) ? 1.0 : 0.0;
+            // Smooth the binary dynamic-cubemap validity edge in direction space.
+            // Thickness/world-box/parallax data is intentionally not used for coverage.
+            float coverageFade = 1.0;
+            if (shader_injection_data.dynCube_coverage_fade > 0.5f) {
+              float3 covDir = dynCubeReflDir;
+              float3 covRef = (abs(covDir.x) < abs(covDir.y) && abs(covDir.x) < abs(covDir.z))
+                  ? float3(1.0, 0.0, 0.0)
+                  : ((abs(covDir.y) < abs(covDir.z)) ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0));
+              float3 covU = normalize(cross(covDir, covRef));
+              float3 covV = cross(covDir, covU);
+              float covR = tan(radians(max(shader_injection_data.dynCube_coverage_width, 0.0)));
+              float coverageSum = hpV2.a;
+              coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir + covR * covU), 0).a;
+              coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir - covR * covU), 0).a;
+              coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir + covR * covV), 0).a;
+              coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir - covR * covV), 0).a;
+              coverageFade = smoothstep(0.0, 1.0, coverageSum * 0.2);
             }
             if (layerMix >= -0.5f) {
               // Manual override (0=SSR, 1=Dynamic, 2=Vanilla) with validity fallback:
               // SSR if confident, else Dynamic, else Vanilla; Dynamic if valid, else Vanilla.
               const bool dynUsable = (dynamicConf > 0.5f);
               const bool ssrUsable = dynCubeNewSSRActive && (ssrConf > 0.02f);
-              float3 dynLayer = dynUsable ? r21.xyz : vanillaCol2;
+              float3 dynLayer = dynUsable ? lerp(vanillaCol2, r21.xyz, coverageFade) : vanillaCol2;
               float3 ssrLayer = ssrUsable ? ssrCol : dynLayer;
               float3 vanLayer = vanillaCol2;
               if (layerMix <= 1.0f) {
@@ -1192,7 +1224,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             } else {
               // Automatic confidence blend (weights always sum to 1).
               float remaining = 1.0 - ssrWeight;
-              float dynamicWeight = remaining * dynamicConf;
+              float dynamicWeight = remaining * dynamicConf * coverageFade;
               float vanillaWeight = remaining - dynamicWeight;
               r21.xyz = ssrCol * ssrWeight + r21.xyz * dynamicWeight + vanillaCol2 * vanillaWeight;
               dynCubeReflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0

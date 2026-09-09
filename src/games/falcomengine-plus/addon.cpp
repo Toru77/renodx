@@ -293,6 +293,8 @@ ShaderInjectData shader_injection = {
   .dynCube_worldbox_enabled = 0.f,
   .dynCube_worldbox_margin = 1.f,
   .dynCube_lookup_direction_flip = 0.f,
+  .dynCube_coverage_fade = 0.f,
+  .dynCube_coverage_width = 2.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3175,6 +3177,24 @@ renodx::utils::settings::Settings settings = {
         g_dyncube_worldbox_reset_request = true;
         return false;
       },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeCoverageFade", .binding = &shader_injection.dynCube_coverage_fade,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Dynamic Cubemap Coverage Fade", .section = "Dynamic Cubemaps",
+      .tooltip = "OFF = hard validity cutoff (current). ON = smooth the dynamic-cubemap validity edge in direction space so coverage boundaries fade into the fallback instead of cutting.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeCoverageWidth", .binding = &shader_injection.dynCube_coverage_width,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 2.f, .label = "Dynamic Cubemap Coverage Fade Width", .section = "Dynamic Cubemaps",
+      .tooltip = "Angular width of the validity smoothing cone in degrees. Controls transition softness only, not the valid boundary. 0 = binary cutoff.",
+      .min = 0.f, .max = 8.f, .format = "%.1f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_coverage_fade > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
