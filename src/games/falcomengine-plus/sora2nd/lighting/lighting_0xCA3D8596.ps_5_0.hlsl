@@ -1020,12 +1020,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir - covR * covV), 0).a;
             coverageFade = smoothstep(0.0, 1.0, coverageSum * 0.2);
           }
+          // Coverage fade replaces the binary center-validity gate when enabled, so the
+          // filtered signal crosses the validity boundary instead of multiplying after it.
+          float effectiveDynamicConf = (shader_injection_data.dynCube_coverage_fade > 0.5f)
+              ? coverageFade : dynamicConf;
           if (layerMix >= -0.5f) {
             // Manual override (0=SSR, 1=Dynamic, 2=Vanilla) with validity fallback:
             // SSR if confident, else Dynamic, else Vanilla; Dynamic if valid, else Vanilla.
             const bool dynUsable = (dynamicConf > 0.5f);
             const bool ssrUsable = dynCubeNewSSRActive && (ssrConf > 0.02f);
-            float3 dynLayer = dynUsable ? lerp(vanillaCol, r21.xyz, coverageFade) : vanillaCol;
+            float3 dynLayer = lerp(vanillaCol, r21.xyz, effectiveDynamicConf);
             float3 ssrLayer = ssrUsable ? ssrCol : dynLayer;
             float3 vanLayer = vanillaCol;
             if (layerMix <= 1.0f) {
@@ -1041,7 +1045,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           } else {
             // Automatic confidence blend (weights always sum to 1).
             float remaining = 1.0 - ssrWeight;
-            float dynamicWeight = remaining * dynamicConf * coverageFade;
+            float dynamicWeight = remaining * effectiveDynamicConf;
             float vanillaWeight = remaining - dynamicWeight;
             r21.xyz = ssrCol * ssrWeight + r21.xyz * dynamicWeight + vanillaCol * vanillaWeight;
             dynCubeReflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
@@ -1237,12 +1241,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               coverageSum += dynCubeHistPosTex.SampleLevel(samPoint_s, normalize(covDir - covR * covV), 0).a;
               coverageFade = smoothstep(0.0, 1.0, coverageSum * 0.2);
             }
+            // Coverage fade replaces the binary center-validity gate when enabled, so the
+            // filtered signal crosses the validity boundary instead of multiplying after it.
+            float effectiveDynamicConf = (shader_injection_data.dynCube_coverage_fade > 0.5f)
+                ? coverageFade : dynamicConf;
             if (layerMix >= -0.5f) {
               // Manual override (0=SSR, 1=Dynamic, 2=Vanilla) with validity fallback:
               // SSR if confident, else Dynamic, else Vanilla; Dynamic if valid, else Vanilla.
               const bool dynUsable = (dynamicConf > 0.5f);
               const bool ssrUsable = dynCubeNewSSRActive && (ssrConf > 0.02f);
-              float3 dynLayer = dynUsable ? lerp(vanillaCol2, r21.xyz, coverageFade) : vanillaCol2;
+              float3 dynLayer = lerp(vanillaCol2, r21.xyz, effectiveDynamicConf);
               float3 ssrLayer = ssrUsable ? ssrCol : dynLayer;
               float3 vanLayer = vanillaCol2;
               if (layerMix <= 1.0f) {
@@ -1258,7 +1266,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             } else {
               // Automatic confidence blend (weights always sum to 1).
               float remaining = 1.0 - ssrWeight;
-              float dynamicWeight = remaining * dynamicConf * coverageFade;
+              float dynamicWeight = remaining * effectiveDynamicConf;
               float vanillaWeight = remaining - dynamicWeight;
               r21.xyz = ssrCol * ssrWeight + r21.xyz * dynamicWeight + vanillaCol2 * vanillaWeight;
               dynCubeReflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0

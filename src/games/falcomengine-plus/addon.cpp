@@ -3026,7 +3026,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeBlur", .binding = &shader_injection.dynCube_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 4.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
+      .default_value = 3.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
       .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3059,7 +3059,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeCaptureBoost", .binding = &shader_injection.dynCube_capture_boost,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Reflection Brightness", .section = "Dynamic Cubemaps",
+      .default_value = 0.5f, .label = "Reflection Brightness", .section = "Dynamic Cubemaps",
       .tooltip = "Master brightness for SSR and dynamic cubemap reflections. 1.0 = neutral. Does not affect the vanilla fallback.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3067,7 +3067,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeHistoryBlend", .binding = &shader_injection.dynCube_history_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "History Blend", .section = "Dynamic Cubemaps",
+      .default_value = 0.75f, .label = "History Blend", .section = "Dynamic Cubemaps",
       .tooltip = "Temporal blend weight when current and previous samples are compatible. 0.5 = Skyrim-style 50/50.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_history > 0.5f; },
@@ -3152,7 +3152,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeWorldBox", .binding = &shader_injection.dynCube_worldbox_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "World-Fixed Parallax Box", .section = "Dynamic Cubemaps",
+      .default_value = 1.f, .label = "World-Fixed Parallax Box", .section = "Dynamic Cubemaps",
       .tooltip = "OFF = camera-centered parallax proxy (current). ON = persistent world-space proxy accumulated from captured geometry (stable across movement). Only relevant when dynamic cubemaps are active.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f; },
@@ -3161,7 +3161,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeWorldBoxMargin", .binding = &shader_injection.dynCube_worldbox_margin,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "World Box Margin", .section = "Dynamic Cubemaps",
+      .default_value = 23.f, .label = "World Box Margin", .section = "Dynamic Cubemaps",
       .tooltip = "World-unit margin expanded around the stored bounds at lookup time (never baked into the persistent bounds).",
       .min = 0.f, .max = 50.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f && shader_injection.dynCube_worldbox_enabled > 0.5f; },
@@ -3182,7 +3182,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeCoverageFade", .binding = &shader_injection.dynCube_coverage_fade,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Dynamic Cubemap Coverage Fade", .section = "Dynamic Cubemaps",
+      .default_value = 1.f, .label = "Dynamic Cubemap Coverage Fade", .section = "Dynamic Cubemaps",
       .tooltip = "OFF = hard validity cutoff (current). ON = smooth the dynamic-cubemap validity edge in direction space so coverage boundaries fade into the fallback instead of cutting.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3191,7 +3191,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeCoverageWidth", .binding = &shader_injection.dynCube_coverage_width,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.f, .label = "Dynamic Cubemap Coverage Fade Width", .section = "Dynamic Cubemaps",
+      .default_value = 1.f, .label = "Dynamic Cubemap Coverage Fade Width", .section = "Dynamic Cubemaps",
       .tooltip = "Angular width of the validity smoothing cone in degrees. Controls transition softness only, not the valid boundary. 0 = binary cutoff.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_coverage_fade > 0.5f; },
@@ -3235,7 +3235,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRDistance", .binding = &shader_injection.dynCube_ssr_distance,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 20.f, .label = "SSR Search Distance", .section = "Dynamic Cubemaps",
+      .default_value = 192.f, .label = "SSR Search Distance", .section = "Dynamic Cubemaps",
       .tooltip = "SSR ray-march search distance in world units. Old Medium preset = 20.",
       .min = 4.f, .max = 192.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
@@ -3244,7 +3244,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRBlur", .binding = &shader_injection.dynCube_ssr_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 8.f, .label = "SSR Blur", .section = "Dynamic Cubemaps",
+      .default_value = 4.f, .label = "SSR Blur", .section = "Dynamic Cubemaps",
       .tooltip = "Separable Gaussian blur sigma on the SSR result. 0 = sharp/raw SSR, higher = progressively blurrier.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
@@ -3307,7 +3307,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaBlur", .binding = &shader_injection.dynCube_vanilla_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Vanilla Cubemap Blur", .section = "Dynamic Cubemaps",
+      .default_value = 2.0f, .label = "Vanilla Cubemap Blur", .section = "Dynamic Cubemaps",
       .tooltip = "Mip-offset blur on the vanilla cubemap fallback. 0 = original/sharp, higher = progressively blurrier.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
