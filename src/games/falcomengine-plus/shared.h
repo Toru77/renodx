@@ -326,6 +326,10 @@ struct ShaderInjectData {
   float dynCube_lookup_direction_flip;        // 0=off (current dynamic lookup), 1=negate final dynamic lookup dir — independent of parallax reflect sign
   float dynCube_coverage_fade;                 // 0=off 1=on (smooth binary validity edge in direction space)
   float dynCube_coverage_width;                // validity smoothing cone half-angle in degrees [0..8], default 2
+  float dynCube_ssr_isfast_enabled;            // 0=off (hash phase), 1=on (IS-FAST phase when master+texture allow)
+  float dynCube_ssr_isfast_strength;           // [0..1] blend hash phase -> noise phase, default 1
+  float dynCube_ssr_isfast_spatial;            // [0.25..4] noise spatial scale, default 1
+  float dynCube_ssr_isfast_temporal;           // [0..5] noise animation speed, 0=frozen slice, default 1
 };
 
 #ifndef __cplusplus

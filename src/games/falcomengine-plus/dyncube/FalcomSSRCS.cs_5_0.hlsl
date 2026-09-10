@@ -6,7 +6,10 @@
 // captured frame color. Output RGBA16F: rgb = reflection color, a = combined confidence.
 // Confidence = hitConf * distanceConf * edgeConf * grazingConf.
 // Input : t0 captured color, t1 captured depth, t2 captured mrtTexture0 (normal),
-//         b0 cb_scene, b13 { sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade },
+//         t3 IS-FAST noise volume (128x128x32 RG8; fallback SRV when unavailable),
+//         b0 cb_scene, b13 { sampleCount, maxDist, thickness, distanceFade, edgeFade,
+//         grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound,
+//         isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, pad },
 //         s0 point clamp
 // Output: u0 ssr_raw
 
@@ -28,11 +31,20 @@ cbuffer cb_ssr : register(b13)
     float g_grazingFade;
     float g_charOccStrength;
     float g_charOccUpness;
+    float g_isfastEnabled;   // effective IS-FAST gate (master && SSR toggle), 0/1
+    float g_isfastBound;     // 1 = noise texture available (else hash fallback)
+    float g_isfastFrame;     // frame_index % 64 (temporal slice source)
+    float g_isfastStrength;  // [0..1] blend hash phase -> noise phase
+    float g_isfastSpatial;   // [0.25..4] noise spatial scale
+    float g_isfastTemporal;  // [0..5] noise animation speed, 0 = frozen slice
+    float g_isfastSeed;      // seed offset [0..64]
+    float g_isfastPad;       // padding (push-constant alignment)
 };
 
 Texture2D<float4> g_colorTex : register(t0);
 Texture2D<float>  g_depthTex : register(t1);
 Texture2D<uint4>  g_mrt0Tex  : register(t2);
+Texture3D<float2> g_isfastNoise : register(t3);  // IS-FAST spatio-temporal blue noise (128x128x32 RG8)
 SamplerState      g_pointClamp : register(s0);
 
 RWTexture2D<float4> g_out : register(u0);
@@ -174,9 +186,25 @@ void main(uint3 dtid : SV_DispatchThreadID)
     dk *= stride;
 
     float2 originPix = float2(px) + 0.5;
-    float2 walk = P0;
-    float3 Q = Q0;
-    float k = k0;
+    // DDA start phase: deterministic integer-hash by default; IS-FAST
+    // spatio-temporal blue noise when enabled. Same phase offsets walk/Q/k
+    // so they stay synchronized on the original camera-space ray.
+    uint phaseHash = (uint)(px.x) * 1973u + (uint)(px.y) * 9277u + 26699u;
+    phaseHash = (phaseHash ^ (phaseHash >> 13)) * 1274126177u;
+    phaseHash ^= phaseHash >> 16;
+    float hashPhase = (float)(phaseHash & 1023u) * (1.0 / 1024.0);
+    float phase = hashPhase;
+    if (g_isfastEnabled > 0.5 && g_isfastBound > 0.5) {
+        // Manual frac wrap: g_pointClamp is point-clamp, not point-wrap
+        // (same pattern as Kai shadow IS-FAST sampling).
+        float2 nxy = frac((float2((uint)px.x, (uint)px.y) + 0.5) / 128.0 * max(g_isfastSpatial, 1e-4));
+        float nz = frac((((float)(((uint)g_isfastFrame + (uint)max(g_isfastSeed, 0.0)) % 32u)) + 0.5) / 32.0 * max(g_isfastTemporal, 0.0));
+        float noisePhase = g_isfastNoise.SampleLevel(g_pointClamp, float3(nxy, nz), 0).x;
+        phase = lerp(hashPhase, noisePhase, saturate(g_isfastStrength));
+    }
+    float2 walk = P0 + dP * phase;
+    float3 Q = Q0 + dQ * phase;
+    float k = k0 + dk * phase;
     float end = P1.x * stepDir;
 
     float3 cur = P;

@@ -295,6 +295,10 @@ ShaderInjectData shader_injection = {
   .dynCube_lookup_direction_flip = 0.f,
   .dynCube_coverage_fade = 0.f,
   .dynCube_coverage_width = 2.f,
+  .dynCube_ssr_isfast_enabled = 1.f,
+  .dynCube_ssr_isfast_strength = 1.f,
+  .dynCube_ssr_isfast_spatial = 1.f,
+  .dynCube_ssr_isfast_temporal = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -332,6 +336,7 @@ constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debu
 constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
+constexpr uint32_t kDynCubeSSRLayoutVersion = 2u;  // bump when the SSR pipeline layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 // Max pass-0 reduction groups over all supported cube sizes (1024 -> 128x128x6).
 constexpr uint32_t kDynCubeWorldBoxMaxGroups = ((1024u + 7u) / 8u) * ((1024u + 7u) / 8u) * 6u;
@@ -710,6 +715,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view dyncube_ssr_blur_uav = {};
   reshade::api::pipeline_layout dyncube_ssr_layout = {};
   reshade::api::pipeline dyncube_ssr_pipeline = {};
+  uint32_t dyncube_ssr_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
   GTVBAODescriptorTableSet dyncube_ssr_tables = {};
   reshade::api::pipeline_layout dyncube_ssr_blur_layout = {};
   reshade::api::pipeline dyncube_ssr_blur_pipeline = {};
@@ -3316,6 +3322,41 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "SSR IS-FAST Phase", .section = "Dynamic Cubemaps",
+      .tooltip = "Use IS-FAST spatio-temporal blue noise for the SSR ray-march start phase (breaks up stride banding). Off = deterministic hash phase. Requires the master IS-FAST toggle.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRISFASTStrength", .binding = &shader_injection.dynCube_ssr_isfast_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "SSR IS-FAST Strength", .section = "Dynamic Cubemaps",
+      .tooltip = "Blend between the deterministic hash phase (0) and full IS-FAST noise phase (1).",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRISFASTSpatial", .binding = &shader_injection.dynCube_ssr_isfast_spatial,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "SSR IS-FAST Spatial Scale", .section = "Dynamic Cubemaps",
+      .tooltip = "Scale IS-FAST noise spatial frequency for SSR. <1 zooms in (smoother), >1 adds more detail.",
+      .min = 0.25f, .max = 4.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRISFASTTemporal", .binding = &shader_injection.dynCube_ssr_isfast_temporal,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "SSR IS-FAST Temporal Speed", .section = "Dynamic Cubemaps",
+      .tooltip = "Animate the IS-FAST noise slice for SSR. 0 = frozen (stable, no shimmer), higher = faster animation.",
+      .min = 0.f, .max = 5.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f && shader_injection.dynCube_ssr_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaBlur", .binding = &shader_injection.dynCube_vanilla_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 2.0f, .label = "Vanilla Cubemap Blur", .section = "Dynamic Cubemaps",
@@ -4624,6 +4665,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   if (d->dyncube_ssr_blur_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_blur_uav); d->dyncube_ssr_blur_uav = {}; }
   dp(d->dyncube_ssr_pipeline); dl(d->dyncube_ssr_layout);
   for (auto& t : d->dyncube_ssr_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  d->dyncube_ssr_layout_version = 0u;
   dp(d->dyncube_ssr_blur_pipeline); dl(d->dyncube_ssr_blur_layout);
   for (auto& t : d->dyncube_ssr_blur_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   dp(d->dyncube_ggx_pipeline); dl(d->dyncube_ggx_layout);
@@ -5109,16 +5151,22 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 
   // ── Simple SSR pipeline ──
   auto make_ssr_layout = [&](reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
+    if (out->handle != 0u && d->dyncube_ssr_layout_version == kDynCubeSSRLayoutVersion) return true;
+    if (out->handle != 0u) {
+      // Stale layout shape (e.g. pre-IS-FAST): drop layout, tables, and pipeline so they rebuild below.
+      for (auto& t : d->dyncube_ssr_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+      dev->destroy_pipeline_layout(*out); *out = {};
+      if (d->dyncube_ssr_pipeline.handle) { dev->destroy_pipeline(d->dyncube_ssr_pipeline); d->dyncube_ssr_pipeline = {}; }
+    }
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
     DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene
-    DR srv_r     = {0,0,0,3,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 color, t1 depth, t2 mrt_normal
+    DR srv_r     = {0,0,0,4,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 color, t1 depth, t2 mrt_normal, t3 IS-FAST noise
     DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 ssr_result
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 8; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness
+    push_range.count = 16; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, pad
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5127,7 +5175,9 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &uav_r;
     pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
     P params[5] = {p0,p1,p2,p3,pPush};
-    return dev->create_pipeline_layout(5, params, out);
+    if (!dev->create_pipeline_layout(5, params, out)) return false;
+    d->dyncube_ssr_layout_version = kDynCubeSSRLayoutVersion;
+    return true;
   };
   if (!make_ssr_layout(&d->dyncube_ssr_layout)) return false;
   if (!ensure(d->dyncube_ssr_layout, &d->dyncube_ssr_tables, 4)) return false;
@@ -5694,6 +5744,9 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_ssr_pipeline.handle) return false;
 
+  // ── IS-FAST noise texture (load once; GTVBAO path also loads it when active) ──
+  if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
+
   // Lazily create the full-res SSR textures (raw, blur_h, blur) sized to the captured color.
   auto colorRes = dev->get_resource_from_view(d->captured_color_srv);
   auto cd = dev->get_resource_desc(colorRes);
@@ -5723,11 +5776,13 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   // ── March pass → ssr_raw ──
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_pipeline);
   auto* st = &d->dyncube_ssr_tables;
-  reshade::api::resource_view srvs[3] = {d->captured_color_srv, d->captured_depth_srv, d->captured_mrt_normal_srv};
+  const reshade::api::resource_view isfastSrv =
+      d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv;
+  reshade::api::resource_view srvs[4] = {d->captured_color_srv, d->captured_depth_srv, d->captured_mrt_normal_srv, isfastSrv};
   reshade::api::descriptor_table_update su[4] = {
       {st->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
       {st->at(1), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
-      {st->at(2), 0, 0, 3, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
+      {st->at(2), 0, 0, 4, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
       {st->at(3), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ssr_raw_uav},
   };
   dev->update_descriptor_tables(4, su);
@@ -5736,7 +5791,10 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   // Direct SSR march parameters (replaces the old Low/Medium/High quality presets).
   const uint32_t sampleCount = (uint32_t)std::clamp((int)shader_injection.dynCube_ssr_samples, 4, 96);
   const float maxDist = std::clamp(shader_injection.dynCube_ssr_distance, 4.f, 192.f);
-  float pc[8] = {
+  // Effective IS-FAST gate: SSR toggle AND master toggle; shader falls back to hash phase otherwise.
+  const float ssrIsfastEffective =
+      (shader_injection.dynCube_ssr_isfast_enabled > 0.5f && g_isfast_enabled > 0.5f) ? 1.f : 0.f;
+  float pc[16] = {
       (float)sampleCount,
       maxDist,
       std::clamp(shader_injection.dynCube_ssr_thickness, 0.f, 10.f),
@@ -5745,8 +5803,16 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
       std::clamp(shader_injection.dynCube_ssr_grazing_fade, 0.f, 1.f),
       std::clamp(shader_injection.dynCube_ssr_char_occ_strength, 0.f, 1.f),
       std::clamp(shader_injection.dynCube_ssr_char_occ_upness, 0.f, 1.f),
+      ssrIsfastEffective,
+      d->isfast_texture_loaded ? 1.f : 0.f,
+      (float)(d->frame_index % 64u),
+      std::clamp(shader_injection.dynCube_ssr_isfast_strength, 0.f, 1.f),
+      std::clamp(shader_injection.dynCube_ssr_isfast_spatial, 0.25f, 4.f),
+      std::clamp(shader_injection.dynCube_ssr_isfast_temporal, 0.f, 5.f),
+      std::clamp(g_isfast_seed_offset, 0.f, 64.f),
+      0.f,
   };
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 8, pc);
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 16, pc);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_raw, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
