@@ -330,6 +330,7 @@ struct ShaderInjectData {
   float dynCube_ssr_isfast_strength;           // [0..1] blend hash phase -> noise phase, default 1
   float dynCube_ssr_isfast_spatial;            // [0.25..4] noise spatial scale, default 1
   float dynCube_ssr_isfast_temporal;           // [0..5] noise animation speed, 0=frozen slice, default 1
+  float dynCube_ssr_confidence_fallback;       // [0..0.9] AUTO SSR confidence fallback, 0 = today's weighting, higher = low-conf SSR yields to Dynamic sooner
 };
 
 #ifndef __cplusplus

@@ -985,7 +985,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               float minEdge = min(min(ssrUV.x, 1.0 - ssrUV.x), min(ssrUV.y, 1.0 - ssrUV.y));
               float edgeBand = max(shader_injection_data.dynCube_ssr_edge_fade * 0.25, 1e-4);
               float finalEdgeConf = smoothstep(0.0, edgeBand, minEdge);
-              ssrWeight = saturate(ssrTap.a * finalEdgeConf);
+              float rawSsr = saturate(ssrTap.a * finalEdgeConf);
+              // Continuous AUTO SSR confidence fallback: higher setting suppresses
+              // low-confidence SSR sooner (0 = today's weighting, no hard cutoff).
+              float ssrFallback = shader_injection_data.dynCube_ssr_confidence_fallback;
+              ssrWeight = saturate((rawSsr - ssrFallback) / max(1.0 - ssrFallback, 1e-4));
             }
           }
           // Vanilla fallback: use the vanilla cube's OWN mip chain (its level count), not the
@@ -1206,7 +1210,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
                 float minEdge = min(min(ssrUV2.x, 1.0 - ssrUV2.x), min(ssrUV2.y, 1.0 - ssrUV2.y));
                 float edgeBand = max(shader_injection_data.dynCube_ssr_edge_fade * 0.25, 1e-4);
                 float finalEdgeConf = smoothstep(0.0, edgeBand, minEdge);
-                ssrWeight = saturate(ssrTap2.a * finalEdgeConf);
+                float rawSsr = saturate(ssrTap2.a * finalEdgeConf);
+                // Continuous AUTO SSR confidence fallback: higher setting suppresses
+                // low-confidence SSR sooner (0 = today's weighting, no hard cutoff).
+                float ssrFallback = shader_injection_data.dynCube_ssr_confidence_fallback;
+                ssrWeight = saturate((rawSsr - ssrFallback) / max(1.0 - ssrFallback, 1e-4));
               }
             }
             // Vanilla fallback: use the vanilla cube's OWN mip chain (its level count), not the

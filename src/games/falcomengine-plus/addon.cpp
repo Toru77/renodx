@@ -299,6 +299,7 @@ ShaderInjectData shader_injection = {
   .dynCube_ssr_isfast_strength = 1.f,
   .dynCube_ssr_isfast_spatial = 1.f,
   .dynCube_ssr_isfast_temporal = 1.f,
+  .dynCube_ssr_confidence_fallback = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3320,6 +3321,15 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "SSR Character Occlusion Upness", .section = "Dynamic Cubemaps",
       .tooltip = "Surface upness threshold where the character-hit confidence reduction begins (smooth ±0.25 band). 0 = any up-facing surface, 0.5 = mostly horizontal, 1 = only fully horizontal (floor/water).",
       .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRConfidenceFallback", .binding = &shader_injection.dynCube_ssr_confidence_fallback,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "SSR Confidence Fallback", .section = "Dynamic Cubemaps",
+      .tooltip = "AUTO-mode remap of SSR confidence: 0 = today's weighting; higher values suppress low-confidence SSR sooner so Dynamic Cubemap takes over earlier. Smooth, no hard cutoff; conf = 1 always stays full SSR.",
+      .min = 0.f, .max = 0.9f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
