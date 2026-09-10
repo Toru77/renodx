@@ -297,7 +297,9 @@ void main(uint3 dtid : SV_DispatchThreadID)
         float grazingBand = lerp(0.01, 0.4, g_grazingFade);
         float grazingConf = smoothstep(0.0, grazingBand, nv);
 
-        float conf = saturate(hitConf * distanceConf * edgeConf * grazingConf);
+        static const float kSsrExistFloor = 0.35;  // hit-existence preference floor (no UI yet)
+        float existConf = lerp(kSsrExistFloor, 1.0, hitConf);
+        float conf = saturate(existConf * distanceConf * edgeConf * grazingConf);
 
         // Character-induced disocclusion: if the ray from a NON-character (e.g. floor)
         // surface hits a CHARACTER pixel on a HORIZONTAL surface, that character is a
