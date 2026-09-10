@@ -337,6 +337,7 @@ constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vani
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
 constexpr uint32_t kDynCubeSSRLayoutVersion = 2u;  // bump when the SSR pipeline layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 2u;  // bump when the SSR blur layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 // Max pass-0 reduction groups over all supported cube sizes (1024 -> 128x128x6).
 constexpr uint32_t kDynCubeWorldBoxMaxGroups = ((1024u + 7u) / 8u) * ((1024u + 7u) / 8u) * 6u;
@@ -719,6 +720,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet dyncube_ssr_tables = {};
   reshade::api::pipeline_layout dyncube_ssr_blur_layout = {};
   reshade::api::pipeline dyncube_ssr_blur_pipeline = {};
+  uint32_t dyncube_ssr_blur_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
   GTVBAODescriptorTableSet dyncube_ssr_blur_tables = {};
   uint32_t dyncube_pending_size = 0;                     // requested cube size, recreated at frame boundary
   bool dyncube_pending_recreate = false;                 // recreate (old set release deferred to Present)
@@ -4668,6 +4670,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_ssr_layout_version = 0u;
   dp(d->dyncube_ssr_blur_pipeline); dl(d->dyncube_ssr_blur_layout);
   for (auto& t : d->dyncube_ssr_blur_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  d->dyncube_ssr_blur_layout_version = 0u;
   dp(d->dyncube_ggx_pipeline); dl(d->dyncube_ggx_layout);
   for (auto& t : d->dyncube_ggx_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_hist_cur = 0;
@@ -5191,26 +5194,36 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
 
   // ── SSR separable blur pipeline (H then V) ──
   auto make_ssr_blur_layout = [&](reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
+    if (out->handle != 0u && d->dyncube_ssr_blur_layout_version == kDynCubeSSRBlurLayoutVersion) return true;
+    if (out->handle != 0u) {
+      // Stale layout shape (e.g. pre-depth-bilateral): drop layout, tables, and pipeline so they rebuild below.
+      for (auto& t : d->dyncube_ssr_blur_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+      dev->destroy_pipeline_layout(*out); *out = {};
+      if (d->dyncube_ssr_blur_pipeline.handle) { dev->destroy_pipeline(d->dyncube_ssr_blur_pipeline); d->dyncube_ssr_blur_pipeline = {}; }
+    }
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR srv_r     = {0,0,0,1,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 raw/blur_h
+    DR srv_r     = {0,0,0,2,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 raw/blur_h, t1 captured scene depth
     DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 blur_h/blur
+    DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene (proj for depth unpack)
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
     push_range.count = 2; // sigma, horizontal
     push_range.visibility = DS::all_compute;
-    P p0, p1, p2, pPush;
+    P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
     p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
     p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
+    p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &cbv_r;
     pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[4] = {p0,p1,p2,pPush};
-    return dev->create_pipeline_layout(4, params, out);
+    P params[5] = {p0,p1,p2,p3,pPush};
+    if (!dev->create_pipeline_layout(5, params, out)) return false;
+    d->dyncube_ssr_blur_layout_version = kDynCubeSSRBlurLayoutVersion;
+    return true;
   };
   if (!make_ssr_blur_layout(&d->dyncube_ssr_blur_layout)) return false;
-  if (!ensure(d->dyncube_ssr_blur_layout, &d->dyncube_ssr_blur_tables, 3)) return false;
+  if (!ensure(d->dyncube_ssr_blur_layout, &d->dyncube_ssr_blur_tables, 4)) return false;
   #ifdef __FalcomSSRBlurCS_EMBED_FILE
   if (!__FalcomSSRBlurCS.empty()) {
     if (!mkcs(__FalcomSSRBlurCS, d->dyncube_ssr_blur_layout, &d->dyncube_ssr_blur_pipeline)) {
@@ -5816,34 +5829,39 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_raw, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
-  // ── Separable blur: H (raw → blur_h), V (blur_h → blur) ──
+  // ── Separable bilateral blur: H (raw → blur_h), V (blur_h → blur) ──
+  // Both passes reference ORIGINAL captured scene depth (not blurred intermediates).
   if (!d->dyncube_ssr_blur_pipeline.handle) return false;
   const float sigma = std::clamp(shader_injection.dynCube_ssr_blur, 0.f, 8.f);
   auto* bt = &d->dyncube_ssr_blur_tables;
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_blur_pipeline);
   // H pass
-  reshade::api::descriptor_table_update bh[3] = {
+  reshade::api::resource_view hsrvs[2] = {d->dyncube_ssr_raw_srv, d->captured_depth_srv};
+  reshade::api::descriptor_table_update bh[4] = {
       {bt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
-      {bt->at(1), 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->dyncube_ssr_raw_srv},
+      {bt->at(1), 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, hsrvs},
       {bt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ssr_blur_h_uav},
+      {bt->at(3), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
   };
-  dev->update_descriptor_tables(3, bh);
-  std::array<reshade::api::descriptor_table, 3> btables = {bt->at(0), bt->at(1), bt->at(2)};
-  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 0, 3, btables.data());
+  dev->update_descriptor_tables(4, bh);
+  std::array<reshade::api::descriptor_table, 4> btables = {bt->at(0), bt->at(1), bt->at(2), bt->at(3)};
+  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 0, 4, btables.data());
   float pcH[2] = {sigma, 1.f};
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 3, 0, 2, pcH);
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 2, pcH);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur_h, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   // V pass
-  reshade::api::descriptor_table_update bv[3] = {
+  reshade::api::resource_view vsrvs[2] = {d->dyncube_ssr_blur_h_srv, d->captured_depth_srv};
+  reshade::api::descriptor_table_update bv[4] = {
       {bt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
-      {bt->at(1), 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->dyncube_ssr_blur_h_srv},
+      {bt->at(1), 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, vsrvs},
       {bt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ssr_blur_uav},
+      {bt->at(3), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
   };
-  dev->update_descriptor_tables(3, bv);
-  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 0, 3, btables.data());
+  dev->update_descriptor_tables(4, bv);
+  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 0, 4, btables.data());
   float pcV[2] = {sigma, 0.f};
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 3, 0, 2, pcV);
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 2, pcV);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   UnbindDynCubeComputeState(cl);
