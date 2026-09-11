@@ -61,10 +61,8 @@ void GetDepthUnpackConsts(out float mul_c, out float add_c)
     if (mul_c * add_c < 0.0) add_c = -add_c;
 }
 
-float LinearizeDepth(float ndc_depth)
+float LinearizeDepth(float ndc_depth, float mul_c, float add_c)
 {
-    float mul_c, add_c;
-    GetDepthUnpackConsts(mul_c, add_c);
     float denom = add_c - ndc_depth;
     float z = (abs(denom) > 1e-8) ? (mul_c / denom) : 0.0;
     z = max(z, 0.0);
@@ -80,10 +78,13 @@ float2 ProjectToUV(float3 view_pos)
 }
 
 // Decode surface normal from mrtTexture0 spherical encoding (validated convention).
-float3 DecodeWorldNormal(int2 px, int2 size)
+// Optionally returns the raw packed texel so callers needing its bit flags
+// (e.g. the character bit) don't fetch the same texel twice.
+float3 DecodeWorldNormal(int2 px, int2 size, out uint4 mrtRaw)
 {
     int2 tc = clamp(px, int2(0, 0), size - int2(1, 1));
-    uint4 mrt = g_mrt0Tex.Load(int3(tc, 0));
+    mrtRaw = g_mrt0Tex.Load(int3(tc, 0));
+    uint4 mrt = mrtRaw;
     float2 enc = float2(mrt.x, mrt.y) * (1.0 / 32767.5) - 1.0;
     float azimuth = 3.14159274 * enc.x;
     float ring = sqrt(saturate(1.0 - enc.y * enc.y));
@@ -115,7 +116,9 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float3 P = vp.xyz / vp.w;
 
     // Normal → view space (empirical-canonical), view vector, reflection.
-    float3 n_world = DecodeWorldNormal(px, int2(w, h));
+    // mrtOrigin reuses this exact fetch for the character-bit test below.
+    uint4 mrtOrigin;
+    float3 n_world = DecodeWorldNormal(px, int2(w, h), mrtOrigin);
     float3 N = normalize(mul(n_world, (float3x3)view_g));
     float3 V = normalize(-P);
     float nv = dot(N, V);
@@ -127,6 +130,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
     const float maxDist = max(g_maxDist, 0.001);
     const uint  count = max((uint)g_sampleCount, 2u);
     const float thickness = max(g_thickness, 1e-4);
+    // Depth-unpack constants are uniform for the whole dispatch; derive once
+    // instead of per depth sample (identical values, less ALU).
+    float ssaUnpackMul, ssaUnpackAdd;
+    GetDepthUnpackConsts(ssaUnpackMul, ssaUnpackAdd);
 
     // Clip the endpoint so the projected segment never goes behind the camera
     // (negative w would mirror UVs into a false in-bounds result). w(t) is linear.
@@ -227,7 +234,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
             break;  // ray left the screen: miss (march UVs are never clamped)
         } else {
             int2 spx = int2(hitPixF);
-            float sceneDist = LinearizeDepth(g_depthTex.Load(int3(spx, 0)));
+            float sceneDist = LinearizeDepth(g_depthTex.Load(int3(spx, 0)), ssaUnpackMul, ssaUnpackAdd);
             if (sceneDist < SSR_FLT_MAX * 0.5) {
                 float rayLo = min(prevRayDist, stepRayDist);
                 float rayHi = max(prevRayDist, stepRayDist);
@@ -270,7 +277,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
             }
             int2 mpx = clamp(int2(muv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
             float mDist = -mid.z;
-            float sDist = LinearizeDepth(g_depthTex.Load(int3(mpx, 0)));
+            float sDist = LinearizeDepth(g_depthTex.Load(int3(mpx, 0)), ssaUnpackMul, ssaUnpackAdd);
             if (mDist >= sDist) cur = mid; else prev = mid;
         }
         float2 fuvRaw = ProjectToUV(cur);
@@ -278,7 +285,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
         float2 fuv = fuvRaw;
         // Backface rejection (AMD rule): a hit whose outward normal faces along the
         // reflection ray was struck from behind and carries wrong-side content.
-        float3 hitN_view = normalize(mul(DecodeWorldNormal(int2(fuv * float2(w, h)), int2(w, h)), (float3x3)view_g));
+        // Only the sign of the dot product matters, and the decode output has
+        // nonzero length by construction, so normalization cannot flip the sign.
+        uint4 mrtHitUnused;
+        float3 hitN_view = mul(DecodeWorldNormal(int2(fuv * float2(w, h)), int2(w, h), mrtHitUnused), (float3x3)view_g);
         if (dot(hitN_view, R) > 0.0) return;
 
         // Confidence factors.
@@ -310,7 +320,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         if (g_charOccStrength > 0.0f) {
             int2 hitPx = clamp(int2(fuv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
             bool charHit  = ((g_mrt0Tex.Load(int3(hitPx, 0)).w & 1u) != 0u);
-            bool charOrig = ((g_mrt0Tex.Load(int3(px, 0)).w & 1u) != 0u);
+            bool charOrig = ((mrtOrigin.w & 1u) != 0u);
             if (charHit && !charOrig) {
                 float upness = abs(n_world.y);
                 float upLo = max(g_charOccUpness - 0.25, 0.0);

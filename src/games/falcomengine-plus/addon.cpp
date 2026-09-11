@@ -274,6 +274,7 @@ ShaderInjectData shader_injection = {
   .dynCube_ssr_samples = 16.f,
   .dynCube_ssr_distance = 20.f,
   .dynCube_ssr_blur = 2.f,
+  .dynCube_ssr_symmetric_weights = 0.f,
   .dynCube_ssr_distance_fade = 0.5f,
   .dynCube_ssr_edge_fade = 0.3f,
   .dynCube_ssr_grazing_fade = 0.5f,
@@ -345,7 +346,7 @@ constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vani
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
 constexpr uint32_t kDynCubeSSRLayoutVersion = 2u;  // bump when the SSR pipeline layout shape changes (forces recreate)
-constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 2u;  // bump when the SSR blur layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 3u;  // bump when the SSR blur layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;  // bump when the worldbox pipeline layout shape changes (forces recreate)
 // Max pass-0 reduction groups over all supported cube sizes (1024 -> 128x128x6).
@@ -688,6 +689,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_filteredReadSet = 99u;  // readSet last fed into GGX filter (99 = none yet)
   bool dyncube_boxCopyPending = false;     // staged validity copy enqueued, not yet consumed
   bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
+  bool dyncube_rejectedGap = false;        // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
   bool dyncube_hasValidRead = false;       // any validated readSet exists (gates first filter)
   uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
   // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
@@ -3345,6 +3347,15 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeSSRSymmetricWeights", .binding = &shader_injection.dynCube_ssr_symmetric_weights,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "SSR Symmetric Blur Weights (Test)", .section = "Dynamic Cubemaps",
+      .tooltip = "TEST A/B: evaluate each blur tap pair with a single shared Gaussian weight. Off = legacy per-tap loop (default, unchanged behavior).",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeSSRDistanceFade", .binding = &shader_injection.dynCube_ssr_distance_fade,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.f, .label = "SSR Distance Fade", .section = "Dynamic Cubemaps",
@@ -4768,6 +4779,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_filteredReadSet = 99u;
   d->dyncube_boxCopyPending = false;
   d->dyncube_wasRejected = false;
+  d->dyncube_rejectedGap = false;
   d->dyncube_hasValidRead = false;
   dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
   dl(d->dyncube_capture_layout); dl(d->dyncube_solid_layout);
@@ -5135,6 +5147,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   d->dyncube_filteredReadSet = 99u;
   d->dyncube_boxCopyPending = false;
   d->dyncube_wasRejected = false;
+  d->dyncube_rejectedGap = false;
   d->dyncube_hasValidRead = false;
   if (should_log()) {
     const uint32_t mips = d->dyncube_mip_count;
@@ -5335,7 +5348,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 2; // sigma, horizontal
+    push_range.count = 3; // sigma, horizontal, symmetricWeights
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5501,6 +5514,7 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   d->dyncube_filteredReadSet = 99u;
   d->dyncube_boxCopyPending = false;
   d->dyncube_wasRejected = false;
+  d->dyncube_rejectedGap = false;
   d->dyncube_hasValidRead = false;
   d->dyncube_resources_created = true;
 }
@@ -5675,6 +5689,7 @@ static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* 
     // backdrop that writes valid depth still yields hasGeom=true and cannot be
     // rejected by geometry coverage (indistinguishable from real vista geometry).
     ++dd->dyncube_rejected_captures;
+    dd->dyncube_rejectedGap = true;  // arm one-shot fast-forward: next dispatched capture hard-replaces stale history
     if (!dd->dyncube_wasRejected && shader_injection.dynCube_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::info, "[DynCube] capture rejected (no valid geometry)");
     }
@@ -5746,9 +5761,14 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     float reset = (shader_injection.dynCube_history < 0.5f) ? 1.0f : 0.0f;
     float charCapture = (shader_injection.dynCube_character_capture > 0.5f) ? 1.0f : 0.0f;
     float charMaskAvail = (d->captured_mrt_normal_srv.handle) ? 1.0f : 0.0f;
+    // One-shot fast-forward: first dispatched capture after a rejection gap uses
+    // blend=1.0, which is exactly the hard-replace branch outputs (no lerp with
+    // stale pre-gap history). Consumed here so exactly one capture sees it.
+    const bool fastForward = d->dyncube_rejectedGap;
+    d->dyncube_rejectedGap = false;
     float pc[7] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
-        std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
+        fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
         std::max(0.f, shader_injection.dynCube_history_pos_threshold),
         posScale,
         reset,
@@ -6048,8 +6068,8 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   dev->update_descriptor_tables(4, bh);
   std::array<reshade::api::descriptor_table, 4> btables = {bt->at(0), bt->at(1), bt->at(2), bt->at(3)};
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 0, 4, btables.data());
-  float pcH[2] = {sigma, 1.f};
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 2, pcH);
+  float pcH[3] = {sigma, 1.f, (shader_injection.dynCube_ssr_symmetric_weights > 0.5f) ? 1.f : 0.f};
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 3, pcH);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur_h, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   // V pass
@@ -6062,8 +6082,8 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   };
   dev->update_descriptor_tables(4, bv);
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 0, 4, btables.data());
-  float pcV[2] = {sigma, 0.f};
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 2, pcV);
+  float pcV[3] = {sigma, 0.f, (shader_injection.dynCube_ssr_symmetric_weights > 0.5f) ? 1.f : 0.f};
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_blur_layout, 4, 0, 3, pcV);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   UnbindDynCubeComputeState(cl);

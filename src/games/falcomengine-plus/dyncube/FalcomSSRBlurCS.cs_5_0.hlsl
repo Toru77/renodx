@@ -19,6 +19,7 @@ cbuffer cb_blur : register(b13)
 {
     float g_sigma;
     float g_horizontal;
+    float g_symmetricWeights;  // 0 = legacy tap loop (default), 1 = symmetric-pair loop (A/B test)
 };
 
 Texture2D<float4>  g_inTex : register(t0);
@@ -40,10 +41,8 @@ void GetDepthUnpackConsts(out float mul_c, out float add_c)
     if (mul_c * add_c < 0.0) add_c = -add_c;
 }
 
-float LinearizeDepth(float ndc_depth)
+float LinearizeDepth(float ndc_depth, float mul_c, float add_c)
 {
-    float mul_c, add_c;
-    GetDepthUnpackConsts(mul_c, add_c);
     float denom = add_c - ndc_depth;
     float z = (abs(denom) > 1e-8) ? (mul_c / denom) : 0.0;
     z = max(z, 0.0);
@@ -76,10 +75,14 @@ void main(uint3 dtid : SV_DispatchThreadID)
 
     // Center reference: own confidence stays authoritative; own linearized
     // depth is the bilateral reference (original scene depth, both passes).
+    // Depth-unpack constants are uniform for the whole dispatch; derive once
+    // instead of per depth sample (identical values, less ALU).
+    float blurUnpackMul, blurUnpackAdd;
+    GetDepthUnpackConsts(blurUnpackMul, blurUnpackAdd);
     float centerConf = g_inTex.Load(int3(px, 0)).a;
     float centerRaw = g_depthTex.Load(int3(px, 0));
     bool centerValid = IsSceneDepthValid(centerRaw);
-    float centerLin = centerValid ? LinearizeDepth(centerRaw) : 0.0;
+    float centerLin = centerValid ? LinearizeDepth(centerRaw, blurUnpackMul, blurUnpackAdd) : 0.0;
 
     // Confidence-gated color accumulation (valid donors only) x Gaussian x
     // depth-bilateral weight; confidence accumulation stays depth-independent
@@ -88,6 +91,50 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float colorDen = 0.0;
     float confNum = 0.0;
     float confDen = 0.0;
+    if (g_symmetricWeights > 0.5) {
+        // A/B path: center tap once, then symmetric pairs sharing one exp().
+        // Same tap set and encounter order as the legacy loop below.
+        {
+            float4 sample = g_inTex.Load(int3(px, 0));
+            float conf = sample.a;
+            if (conf > kConfEpsilon) {
+                colorNum += sample.rgb * conf;
+                colorDen += conf;
+            }
+            confNum += conf;
+            confDen += 1.0;
+        }
+        for (int dd = 1; dd <= radius; ++dd) {
+            float wgt = exp(-float(dd) * float(dd) * invSigma2);
+            for (int s = -1; s <= 1; s += 2) {
+                int2 tap = (g_horizontal > 0.5)
+                    ? int2(px.x + dd * s, px.y)
+                    : int2(px.x, px.y + dd * s);
+                tap = clamp(tap, int2(0, 0), int2(w, h) - int2(1, 1));
+                float4 sample = g_inTex.Load(int3(tap, 0));
+                float conf = sample.a;
+                float depthW = 1.0;
+                if (centerValid) {
+                    float tapRaw = g_depthTex.Load(int3(tap, 0));
+                    if (!IsSceneDepthValid(tapRaw)) {
+                        depthW = 0.0;  // sky tap: never a donor
+                    } else {
+                        float tapLin = LinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
+                        float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
+                        float depthRatio = relDiff / kDepthRelTol;
+                        depthW = exp(-depthRatio * depthRatio);
+                    }
+                }
+                if (conf > kConfEpsilon) {
+                    float effW = wgt * depthW;
+                    colorNum += sample.rgb * conf * effW;
+                    colorDen += conf * effW;
+                }
+                confNum += conf * wgt;
+                confDen += wgt;
+            }
+        }
+    } else {
     for (int d = -radius; d <= radius; ++d) {
         float wgt = exp(-float(d) * float(d) * invSigma2);
         int2 tap = (g_horizontal > 0.5)
@@ -102,7 +149,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
             if (!IsSceneDepthValid(tapRaw)) {
                 depthW = 0.0;  // sky tap: never a donor
             } else {
-                float tapLin = LinearizeDepth(tapRaw);
+                float tapLin = LinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
                 float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
                 float depthRatio = relDiff / kDepthRelTol;
                 depthW = exp(-depthRatio * depthRatio);
@@ -115,6 +162,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         }
         confNum += conf * wgt;
         confDen += wgt;
+    }
     }
     float meanConf = confNum / max(confDen, 1e-4);
     float finalConfidence = max(centerConf, meanConf);

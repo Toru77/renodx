@@ -305,6 +305,7 @@ struct ShaderInjectData {
   float dynCube_ssr_samples;                     // SSR march sample count [4..96], default 16
   float dynCube_ssr_distance;                    // SSR search distance, world units [4..192], default 20
   float dynCube_ssr_blur;                        // SSR Gaussian blur sigma, 0=sharp
+  float dynCube_ssr_symmetric_weights;           // 0=legacy blur tap loop (default), 1=symmetric-pair loop (A/B test)
   float dynCube_ssr_distance_fade;               // hit-distance confidence falloff, 0..1
   float dynCube_ssr_edge_fade;                   // screen-edge confidence falloff, 0..1
   float dynCube_ssr_grazing_fade;                // grazing-angle confidence falloff, 0..1
