@@ -5244,10 +5244,11 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     if (!mkcs(__DynamicCubemapCaptureCS, d->dyncube_capture_layout, &d->dyncube_capture_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] capture pipeline create failed (DynamicCubemapCaptureCS)");
     }
-  } else if (!__dyncube_capture.empty()) {
-    if (!mkcs(__dyncube_capture, d->dyncube_capture_layout, &d->dyncube_capture_pipeline)) {
-      if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] capture pipeline create failed (dyncube_capture)");
-    }
+  } else {
+    // Canonical capture shader missing (twin dyncube_capture.cs_5_0.hlsl was
+    // deduplicated); nothing to fall back to. Behavior unchanged: the removed
+    // twin was byte-identical and the old fallback branch never executed while both existed.
+    if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] capture pipeline create failed (DynamicCubemapCaptureCS)");
   }
   #else
   if (!__dyncube_capture.empty()) {

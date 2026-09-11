@@ -28,32 +28,10 @@ SamplerState       g_pointClamp : register(s0);
 
 RWTexture2D<float4> g_outTex : register(u0);
 
-static const float SSR_BLUR_FLT_MAX = 3.402823466e+38;
+#include "dyncube_common.hlsli"
+
 static const float kDepthRelTol = 0.25;  // relative view-distance bilateral tolerance (no UI yet)
 static const float kConfEpsilon = 0.01;  // minimum confidence for color donors
-
-// ── Depth linearization (identical math to FalcomSSRCS; handles standard and
-//    reversed Z by sign guard; gives positive view-space distance). ──
-void GetDepthUnpackConsts(out float mul_c, out float add_c)
-{
-    mul_c = -proj_g[3][2];
-    add_c =  proj_g[2][2];
-    if (mul_c * add_c < 0.0) add_c = -add_c;
-}
-
-float LinearizeDepth(float ndc_depth, float mul_c, float add_c)
-{
-    float denom = add_c - ndc_depth;
-    float z = (abs(denom) > 1e-8) ? (mul_c / denom) : 0.0;
-    z = max(z, 0.0);
-    return isfinite(z) && z > 0.0 ? z : SSR_BLUR_FLT_MAX;
-}
-
-// SSR depth validity convention (matches FalcomSSRCS sky test).
-bool IsSceneDepthValid(float hw_depth)
-{
-    return hw_depth > 0.0 && hw_depth < 1.0;
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 dtid : SV_DispatchThreadID)
@@ -78,11 +56,11 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // Depth-unpack constants are uniform for the whole dispatch; derive once
     // instead of per depth sample (identical values, less ALU).
     float blurUnpackMul, blurUnpackAdd;
-    GetDepthUnpackConsts(blurUnpackMul, blurUnpackAdd);
+    DynCubeGetDepthUnpackConsts(blurUnpackMul, blurUnpackAdd);
     float centerConf = g_inTex.Load(int3(px, 0)).a;
     float centerRaw = g_depthTex.Load(int3(px, 0));
-    bool centerValid = IsSceneDepthValid(centerRaw);
-    float centerLin = centerValid ? LinearizeDepth(centerRaw, blurUnpackMul, blurUnpackAdd) : 0.0;
+    bool centerValid = DynCubeIsSceneDepthValid(centerRaw);
+    float centerLin = centerValid ? DynCubeLinearizeDepth(centerRaw, blurUnpackMul, blurUnpackAdd) : 0.0;
 
     // Confidence-gated color accumulation (valid donors only) x Gaussian x
     // depth-bilateral weight; confidence accumulation stays depth-independent
@@ -116,10 +94,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 float depthW = 1.0;
                 if (centerValid) {
                     float tapRaw = g_depthTex.Load(int3(tap, 0));
-                    if (!IsSceneDepthValid(tapRaw)) {
+                    if (!DynCubeIsSceneDepthValid(tapRaw)) {
                         depthW = 0.0;  // sky tap: never a donor
                     } else {
-                        float tapLin = LinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
+                        float tapLin = DynCubeLinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
                         float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
                         float depthRatio = relDiff / kDepthRelTol;
                         depthW = exp(-depthRatio * depthRatio);
@@ -146,10 +124,10 @@ void main(uint3 dtid : SV_DispatchThreadID)
         float depthW = 1.0;
         if (centerValid) {
             float tapRaw = g_depthTex.Load(int3(tap, 0));
-            if (!IsSceneDepthValid(tapRaw)) {
+            if (!DynCubeIsSceneDepthValid(tapRaw)) {
                 depthW = 0.0;  // sky tap: never a donor
             } else {
-                float tapLin = LinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
+                float tapLin = DynCubeLinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
                 float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
                 float depthRatio = relDiff / kDepthRelTol;
                 depthW = exp(-depthRatio * depthRatio);

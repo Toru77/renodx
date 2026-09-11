@@ -49,25 +49,9 @@ SamplerState      g_pointClamp : register(s0);
 
 RWTexture2D<float4> g_out : register(u0);
 
-static const float SSR_FLT_MAX = 3.402823466e+38;
+#include "dyncube_common.hlsli"
+
 static const uint  kBinarySteps = 5u;    // internal binary refinement iterations
-
-// ── Depth linearization (identical math to the validated SSR/GTVBAO path; handles
-//    standard and reversed Z by sign guard; gives positive view-space distance). ──
-void GetDepthUnpackConsts(out float mul_c, out float add_c)
-{
-    mul_c = -proj_g[3][2];
-    add_c =  proj_g[2][2];
-    if (mul_c * add_c < 0.0) add_c = -add_c;
-}
-
-float LinearizeDepth(float ndc_depth, float mul_c, float add_c)
-{
-    float denom = add_c - ndc_depth;
-    float z = (abs(denom) > 1e-8) ? (mul_c / denom) : 0.0;
-    z = max(z, 0.0);
-    return isfinite(z) && z > 0.0 ? z : SSR_FLT_MAX;
-}
 
 // Project a view-space position (negative Z in front) to a screen UV.
 float2 ProjectToUV(float3 view_pos)
@@ -133,7 +117,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // Depth-unpack constants are uniform for the whole dispatch; derive once
     // instead of per depth sample (identical values, less ALU).
     float ssaUnpackMul, ssaUnpackAdd;
-    GetDepthUnpackConsts(ssaUnpackMul, ssaUnpackAdd);
+    DynCubeGetDepthUnpackConsts(ssaUnpackMul, ssaUnpackAdd);
 
     // Clip the endpoint so the projected segment never goes behind the camera
     // (negative w would mirror UVs into a false in-bounds result). w(t) is linear.
@@ -234,8 +218,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
             break;  // ray left the screen: miss (march UVs are never clamped)
         } else {
             int2 spx = int2(hitPixF);
-            float sceneDist = LinearizeDepth(g_depthTex.Load(int3(spx, 0)), ssaUnpackMul, ssaUnpackAdd);
-            if (sceneDist < SSR_FLT_MAX * 0.5) {
+            float sceneDist = DynCubeLinearizeDepth(g_depthTex.Load(int3(spx, 0)), ssaUnpackMul, ssaUnpackAdd);
+            if (sceneDist < DynCubeFltMax * 0.5) {
                 float rayLo = min(prevRayDist, stepRayDist);
                 float rayHi = max(prevRayDist, stepRayDist);
                 // Depth-interval overlap: ray slab vs [sceneDist, sceneDist + thickness].
@@ -277,7 +261,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
             }
             int2 mpx = clamp(int2(muv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
             float mDist = -mid.z;
-            float sDist = LinearizeDepth(g_depthTex.Load(int3(mpx, 0)), ssaUnpackMul, ssaUnpackAdd);
+            float sDist = DynCubeLinearizeDepth(g_depthTex.Load(int3(mpx, 0)), ssaUnpackMul, ssaUnpackAdd);
             if (mDist >= sDist) cur = mid; else prev = mid;
         }
         float2 fuvRaw = ProjectToUV(cur);
