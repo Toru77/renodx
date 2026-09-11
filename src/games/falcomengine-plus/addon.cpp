@@ -345,7 +345,7 @@ constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debu
 constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
-constexpr uint32_t kDynCubeSSRLayoutVersion = 2u;  // bump when the SSR pipeline layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeSSRLayoutVersion = 3u;  // bump when the SSR pipeline layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 3u;  // bump when the SSR blur layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;  // bump when the worldbox pipeline layout shape changes (forces recreate)
@@ -1138,6 +1138,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         },
     },
     // ── Kai cubemap (10 glass + floor shaders) ──
+    // Glass t17 override is handled globally in OnPushDescriptorsCapture
+    // (512/1024 UNORM cube criterion), so no per-shader callbacks are needed.
     CustomShaderEntryCallback(0xB1CCBCAE, nullptr),
     CustomShaderEntryCallback(0x1A17A133, nullptr),
     CustomShaderEntryCallback(0xCA715B78, nullptr),
@@ -3726,6 +3728,65 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
+    // Global Dynamic Cubemap t17 override: any pixel-shader bind of a 512x512 or
+    // 1024x1024 R8G8B8A8_UNORM cube view at slot 17 IS the game's vanilla env cubemap
+    // (strict criterion, UNORM only — sRGB never matches). Swap in the active
+    // dynamic cube so every consumer (lighting, glass, future shaders) gets live
+    // reflections with no per-shader registration. Respects Force Vanilla and
+    // debug 4 (vanilla A/B paths keep the game cube).
+    // Re-entrancy: our own cube is RGBA16F, so it fails the criterion and the
+    // handler terminates; a static guard makes this airtight regardless.
+    // The vanilla capture above requires IsLightingShader, so our pushes here
+    // can never poison the vanilla fallback.
+    if (update.binding == 17u && update.count >= 1
+        && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f
+        && shader_injection.dynCube_force_vanilla < 0.5f
+        && (int)shader_injection.dynCube_debug != 4
+        && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) {
+      static bool s_dynCubeT17SwapGuard = false;
+      if (!s_dynCubeT17SwapGuard) {
+        auto swapViewDesc = device->get_resource_view_desc(views[0]);
+        if (swapViewDesc.type == reshade::api::resource_view_type::texture_cube
+            && swapViewDesc.format == reshade::api::format::r8g8b8a8_unorm) {
+          auto swapRes = device->get_resource_from_view(views[0]);
+          if (swapRes.handle != 0u) {
+            auto swapResDesc = device->get_resource_desc(swapRes);
+            if (swapResDesc.type == reshade::api::resource_type::texture_2d
+                && (swapResDesc.texture.width == 1024u || swapResDesc.texture.width == 512u)
+                && swapResDesc.texture.width == swapResDesc.texture.height
+                && d && d->dyncube_resources_created) {
+              reshade::api::resource_view t17srv;
+              int swapDbg = (int)shader_injection.dynCube_debug;
+              if (swapDbg == 3) {
+                if (!RunDynCubeSolid(cmd_list, d)) t17srv = {};
+                else t17srv = d->dyncube_solid_cube_srv;
+              } else {
+                // Active completed filtered cube; raw history cube before first filter.
+                t17srv = d->dyncube_ggx_valid
+                    ? d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]
+                    : d->dyncube_srv;
+              }
+              // Once the vanilla cube is known, only swap onto that exact resource
+              // (extra safety against hijacking unrelated 512/1024 cubes). Before the
+              // first capture, the strict format/size/cube criterion identifies it.
+              bool swapAllowed = true;
+              if (d->captured_vanilla_env_srv.handle != 0u) {
+                auto knownRes = device->get_resource_from_view(d->captured_vanilla_env_srv);
+                swapAllowed = (knownRes.handle != 0u && knownRes.handle == swapRes.handle);
+              }
+              if (t17srv.handle && swapAllowed) {
+                s_dynCubeT17SwapGuard = true;
+                cmd_list->push_descriptors(reshade::api::shader_stage::pixel,
+                    reshade::api::pipeline_layout{0}, 0,
+                    reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
+                        reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
+                s_dynCubeT17SwapGuard = false;
+              }
+            }
+          }
+        }
+      }
+    }
   }
   if (update.type == reshade::api::descriptor_type::constant_buffer) {
     if (update.binding == kLightingSceneCbRegister && update.count >= 1) {
@@ -5187,7 +5248,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 7; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable
+    push_range.count = 9; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5309,7 +5370,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 16; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, pad
+    push_range.count = 18; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, charComp, charShift, pad
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5767,7 +5828,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     // stale pre-gap history). Consumed here so exactly one capture sees it.
     const bool fastForward = d->dyncube_rejectedGap;
     d->dyncube_rejectedGap = false;
-    float pc[7] = {
+    float pc[9] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
         fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
         std::max(0.f, shader_injection.dynCube_history_pos_threshold),
@@ -5775,8 +5836,11 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
         reset,
         charCapture,
         charMaskAvail,
+        // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0.
+        IsKai() ? 1.f : 0.f,
+        IsKai() ? 8.f : 0.f,
     };
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 7, pc);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 9, pc);
   }
 
   uint32_t sz = d->dyncube_size;
@@ -6030,7 +6094,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   // Effective IS-FAST gate: SSR toggle AND master toggle; shader falls back to hash phase otherwise.
   const float ssrIsfastEffective =
       (shader_injection.dynCube_ssr_isfast_enabled > 0.5f && g_isfast_enabled > 0.5f) ? 1.f : 0.f;
-  float pc[16] = {
+  float pc[18] = {
       (float)sampleCount,
       maxDist,
       std::clamp(shader_injection.dynCube_ssr_thickness, 0.f, 10.f),
@@ -6046,9 +6110,12 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
       std::clamp(shader_injection.dynCube_ssr_isfast_spatial, 0.25f, 4.f),
       std::clamp(shader_injection.dynCube_ssr_isfast_temporal, 0.f, 5.f),
       std::clamp(g_isfast_seed_offset, 0.f, 64.f),
+      // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0.
+      IsKai() ? 1.f : 0.f,
+      IsKai() ? 8.f : 0.f,
       0.f,
   };
-  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 16, pc);
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 18, pc);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_raw, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 

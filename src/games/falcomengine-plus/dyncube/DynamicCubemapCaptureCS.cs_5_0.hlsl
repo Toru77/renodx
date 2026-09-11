@@ -25,7 +25,9 @@ cbuffer DynCubeCB : register(b13)
     float g_reset;                 // 1 = ignore history this frame (fresh capture / history off)
     float g_characterCapture;      // 1 = capture characters, 0 = exclude characters (default)
     float g_charMaskAvailable;     // 1 = character mask data available
-    float3 _pad0;
+    float g_charComp;              // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
+    float g_charShift;             // bit shift applied to the selected component (Sora 0, Kai 8)
+    float _pad0;
 };
 
 Texture2D<float>       g_depthTex      : register(t0);
@@ -109,12 +111,17 @@ void main(uint3 dtid : SV_DispatchThreadID)
             float4 worldH = mul(viewProjInv_g, clipPos);
             curPos = worldH.xyz / max(worldH.w, 1e-6);
             curCol = g_colorTex.SampleLevel(g_pointClamp, uv, 0).rgb;
+            // Capture-brightness packaging (DynCubeCaptureBoost): baked here so every
+            // consumer (lighting resolve, glass t17 override, SSR march input) sees it.
+            // Sample-time multiplies were removed accordingly; history already carries
+            // boosted content, so the lerp below stays consistent.
+            curCol *= clamp(g_captureBoost, 0.0, 8.0);
             curValid = true;
         }
     }
 
-    // ── Character mask (GTVBAO-style: mrtTexture0.w & 1) — sample at the projected
-    //    screen UV (same coordinate as color/depth), not the cubemap texel. ──
+    // ── Character mask (game-specific bit: Sora mrtTexture0.w & 1, Kai (mrtTexture0.z >> 8) & 1
+    //    via g_charComp/g_charShift) — sample at the projected screen UV, not the cubemap texel. ──
     bool isCharacter = false;
     if (g_charMaskAvailable > 0.5f && inside)
     {
@@ -122,7 +129,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
         g_mrt0Tex.GetDimensions(mrtW, mrtH);
         int2 mrtPixel = int2(min(uv * float2(mrtW, mrtH) + 0.25f, float2(mrtW - 1, mrtH - 1)));
         uint4 mrt0 = g_mrt0Tex.Load(int3(mrtPixel, 0));
-        isCharacter = (mrt0.w & 1) != 0;
+        uint charWord = (g_charComp > 0.5f) ? mrt0.z : mrt0.w;
+        isCharacter = (((charWord >> (uint)g_charShift) & 1u) != 0u);
     }
 
     // ── Character mask exclusion (Phase 2) ──

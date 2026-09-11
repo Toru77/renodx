@@ -38,6 +38,8 @@ cbuffer cb_ssr : register(b13)
     float g_isfastSpatial;   // [0.25..4] noise spatial scale
     float g_isfastTemporal;  // [0..5] noise animation speed, 0 = frozen slice
     float g_isfastSeed;      // seed offset [0..64]
+    float g_charComp;        // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
+    float g_charShift;       // bit shift applied to the selected component (Sora 0, Kai 8)
     float g_isfastPad;       // padding (push-constant alignment)
 };
 
@@ -303,8 +305,11 @@ void main(uint3 dtid : SV_DispatchThreadID)
         // surfaces (mirrors/walls, low upness) keep the legitimate character reflection.
         if (g_charOccStrength > 0.0f) {
             int2 hitPx = clamp(int2(fuv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
-            bool charHit  = ((g_mrt0Tex.Load(int3(hitPx, 0)).w & 1u) != 0u);
-            bool charOrig = ((mrtOrigin.w & 1u) != 0u);
+            uint4 hitMrt = g_mrt0Tex.Load(int3(hitPx, 0));
+            uint hitWord = (g_charComp > 0.5f) ? hitMrt.z : hitMrt.w;
+            uint origWord = (g_charComp > 0.5f) ? mrtOrigin.z : mrtOrigin.w;
+            bool charHit  = (((hitWord >> (uint)g_charShift) & 1u) != 0u);
+            bool charOrig = (((origWord >> (uint)g_charShift) & 1u) != 0u);
             if (charHit && !charOrig) {
                 float upness = abs(n_world.y);
                 float upLo = max(g_charOccUpness - 0.25, 0.0);

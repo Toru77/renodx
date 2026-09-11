@@ -322,11 +322,19 @@ void main(
   r5.x = (int)r5.x + -1;
   r5.x = (uint)r5.x;
   r5.x = r9.y * r5.x;
+  // Cubemap mip boost (same mapping as lighting): applies only while the dynamic
+  // override is active, so the vanilla path below is untouched.
+  r5.x *= lerp(1.0, clamp(shader_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0), saturate(shader_injection_data.cubemap_improvements_enabled) * ((shader_injection_data.dynCube_enabled > 0.5f && shader_injection_data.dynCube_debug != 4.f && shader_injection_data.dynCube_force_vanilla < 0.5f) ? 1.0 : 0.0));
   
   // Modify glass cubemap
   r5.x += 0.0; // Adds X mip levels of blur
   r3.yzw = texEnvMap_g.SampleLevel(SmplCube_s, r3.yzw, r5.x).xyz;
-  r3.yzw *= lerp(1.0, 0.25, saturate(shader_injection_data.cubemap_improvements_enabled));
+  // Dynamic Cubemap lives on t17 now (addon pushes it on glass draws): keep the
+  // sampled env when the override is active, else preserve the original scaling.
+  bool kaiGlassDynOverride = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_debug != 4.f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f;
+  r3.yzw *= lerp(1.0, 0.25, saturate(shader_injection_data.cubemap_improvements_enabled) * (kaiGlassDynOverride ? 0.0 : 1.0));
   r5.x = cmp(0 < fresnel0_g);
   r8.x = 1 + -abs(r8.x);
   r8.x = max(0, r8.x);

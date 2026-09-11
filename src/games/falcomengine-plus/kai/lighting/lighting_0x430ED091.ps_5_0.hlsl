@@ -223,11 +223,20 @@ Texture2D<float4> texMirror_g : register(t21);
 Texture2D<uint> gtvbaoTexture : register(t22);
 Texture2D<float4> gtvbaoVBGITexture : register(t23);
 Texture3D<float2> isfast_noise : register(t24);
+// Shared Dynamic Cubemap + SSR bindings (same slots as Sora 2nd; pushed unconditionally by the addon).
+TextureCube<float4> dynCubeHistPosTex : register(t29);   // temporal history world pos (a = validity)
+TextureCube<float4> dynCubeVanillaTex : register(t30);   // vanilla reflection fallback
+Texture2D<float4> dynCubeSSRTex : register(t31);         // blurred SSR (rgb = color, a = confidence)
+Texture2D<float4> dynCubeSSRRawTex : register(t32);      // raw SSR result (debug views)
+StructuredBuffer<float4> dynCubeWorldBox : register(t33); // persistent world-space AABB ([0]=min+valid, [1]=max)
 
 #include "../../shared.h"
 #include "../../reference/rendering.hlsl"
 #include "../../reference/brdf.hlsli"
 #include "../../reference/local_sss.hlsl"
+#include "../../dyncube/dyncube_spatial.hlsli"
+#include "../../dyncube/dyncube_sample.hlsli"
+#include "../../dyncube/dyncube_resolve.hlsli"
 
 // 3Dmigoto declarations
 #define cmp -
@@ -922,6 +931,7 @@ void main(
   // ── BRDF view-dependent inputs (r2 = world position now valid) ──
   float3 brdf_V = normalize(float3(viewInv_g._m30 - r2.x, viewInv_g._m31 - r2.y, viewInv_g._m32 - r2.z));
   float brdf_NdotV = saturate(dot(brdf_N, brdf_V));
+  float3 kaiWorldPos = r2.xyz;  // pinned world pos for the shared DynCube lookup below (r2 is reused later)
   r4.w = dot(view_g._m02_m12_m22_m32, r2.xyzw);
   r7.zw = lightTileSizeInv_g.xy * v0.xy;
   r7.zw = (uint2)r7.zw;
@@ -1492,6 +1502,32 @@ void main(
   r7.w = r19.y ? r7.w : 0;
   r9.xyz = r7.www * r9.xyz;
   r9.xyz = lightColor_g.xyz * r9.xyz;
+  // SSR -> Dynamic -> Vanilla reflection source resolution (shared DynCube system).
+  // Same enable/force semantics as Sora 2nd; Kai supplies its own P/R/roughness below.
+  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_ssr_enabled > 0.5f;
+  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_force_dynamic > 0.5f;
+  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_force_ssr > 0.5f;
+  bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
+    && shader_injection_data.dynCube_force_vanilla < 0.5f;
+  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
+  float3 dynCubeReflDir = float3(0, 0, 0);
+  float dynCubeVanillaMipFactor = 0.0;   // Kai roughness->mip factor, for the vanilla fallback's own mip chain
+  bool dynCubeReflActive = false;
+  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
+  // Spatial-reprojection gate prefetch (experimental master toggle only).
+  // Kai v1.xy are 0-1 UVs, so the SSR tap needs no resolution scaling.
+  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
+  float dynCubeSsrGateConf = 1.0f;
+  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
+    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, v1.xy, 0).a;
+  }
   if (r19.z != 0) {
     r16.xy = r13.yz * r4.yz;
     r4.y = (int)r1.x & 32;
@@ -1504,6 +1540,18 @@ void main(
       r21.xyz = r5.xyw * -r7.www + r18.xyz;
       float3 exp_probe_dir_ws = normalize(r21.xyz);
       
+      // Dynamic Cubemap + SSR (shared implementation, see dyncube_sample/resolve.hlsli).
+      // DynCube OFF / force-vanilla runs the original vanilla path verbatim below, so the
+      // disabled behavior is bit-identical. kaiRoughBoostA carries Kai's native mip-boost
+      // mapping into both the dynamic sample and the vanilla fallback.
+      float kaiRoughBoostA = r16.y * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor);
+      dynCubeVanillaMipFactor = kaiRoughBoostA;
+      float3 kaiSampleColA = float3(0, 0, 0);
+      float3 kaiSampleFinalA = float3(0, 0, 0);
+      int kaiParallaxFaceA = -1;
+      uint kaiNumLevelsA = 0;
+      float kaiUnusedMipA = 0.0;  // site A never reuses the sample mip afterwards
+      if (!dynCubeReflResolveActive) {
       // Fixed GetDimensions
       uint w, h, levels;
       texEnvMap_g.GetDimensions(0, w, h, levels);
@@ -1512,11 +1560,39 @@ void main(
       float exp_env_mip = r16.y * max(r7.w - 1.0, 0.0);
       r21.xyz = float3(1,-1,-1) * exp_probe_dir_ws;
       r7.w = exp_env_mip;
-	  // cube
+      }
+      if (!dynCubeReflResolveActive) {
+      // cube (vanilla path, verbatim)
       r20.xyz = texEnvMap_g.SampleLevel(
           SmplCube_s,
           r21.xyz,
           r7.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
+      } else {
+        DynCubeSampleDynamic(
+            texEnvMap_g, SmplCube_s,
+            dynCubeHistPosTex, samPoint_s,
+            dynCubeWorldBox,
+            kaiWorldPos, exp_probe_dir_ws, kaiRoughBoostA, dynCubeReflectSign,
+            float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32),
+            dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+            kaiSampleColA, kaiSampleFinalA, kaiParallaxFaceA,
+            kaiNumLevelsA, kaiUnusedMipA);
+        r20.xyz = kaiSampleColA;
+        // Record the final sampled direction so validity and vanilla fallback test
+        // the texel actually displayed, not its antipode.
+        dynCubeReflDir = kaiSampleFinalA;
+        dynCubeReflActive = true;
+        // ── SSR > Dynamic > Vanilla resolution (shared, see dyncube_resolve.hlsli) ──
+        float3 kaiResolvedA = r20.xyz;
+        DynCubeResolveSSR(
+            dynCubeSSRTex, SmplLinearClamp_s,
+            dynCubeVanillaTex, SmplCube_s,
+            dynCubeHistPosTex, samPoint_s,
+            v1.xy, dynCubeReflDir, dynCubeVanillaMipFactor,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+            kaiResolvedA, dynCubeReflSrc);
+        r20.xyz = kaiResolvedA;
+      }
     }
     r7.w = cmp(0 < r6.x);
     r13.y = 1 + -abs(r7.z);
@@ -2425,6 +2501,35 @@ void main(
     } else {
       o0.xyz = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
     }
+    o0.w = 1;
+    o1.z = r0.y;
+    return;
+  }
+  // ── DynCube/SSR debug views (read-only overrides, same modes as Sora 2nd) ──
+  if (dynCubeNewSSRActive && (shader_injection_data.dynCube_debug == 9.f
+      || shader_injection_data.dynCube_debug == 10.f
+      || shader_injection_data.dynCube_debug == 12.f || shader_injection_data.dynCube_debug == 13.f)) {
+    float4 kaiSsrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, v1.xy, 0);  // blurred
+    if (shader_injection_data.dynCube_debug == 9.f) {
+      o0.xyz = kaiSsrTap.rgb;   // SSR Result (blurred)
+    } else if (shader_injection_data.dynCube_debug == 10.f) {
+      o0.xyz = float3(kaiSsrTap.a, kaiSsrTap.a, kaiSsrTap.a);  // SSR Confidence
+    } else if (shader_injection_data.dynCube_debug == 12.f) {
+      o0.xyz = dynCubeSSRRawTex.SampleLevel(SmplLinearClamp_s, v1.xy, 0).rgb;  // SSR Raw
+    } else {
+      float kaiMinEdge = min(min(v1.x, 1.0 - v1.x), min(v1.y, 1.0 - v1.y));
+      float kaiEdgeConf = smoothstep(0.0, max(shader_injection_data.dynCube_ssr_edge_fade * 0.25, 1e-4), kaiMinEdge);
+      o0.xyz = float3(kaiEdgeConf, kaiEdgeConf, kaiEdgeConf);  // SSR Edge Fade
+    }
+    o0.w = 1;
+    o1.z = r0.y;
+    return;
+  } else if (dynCubeReflResolveActive && shader_injection_data.dynCube_debug == 11.f) {
+    // Reflection Source: RED=SSR, GREEN=Dynamic, BLUE=Vanilla.
+    o0.xyz = !dynCubeReflActive ? float3(0, 0, 0)
+           : (dynCubeReflSrc == 0) ? float3(1, 0, 0)
+           : (dynCubeReflSrc == 1) ? float3(0, 1, 0)
+                                   : float3(0, 0, 1);
     o0.w = 1;
     o1.z = r0.y;
     return;
