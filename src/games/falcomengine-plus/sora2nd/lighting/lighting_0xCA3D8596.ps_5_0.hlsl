@@ -223,6 +223,51 @@ Texture2D<float4> texCloudShadow : register(t27);
 // 3Dmigoto declarations
 #define cmp -
 
+// Positional spatial reprojection (experimental): search a small tangent-space
+// neighborhood around a cube-space reflection direction for the temporal-cubemap
+// texel whose stored world position lies closest to the live world-space ray.
+// Returns true + best cube-space direction on a match; otherwise false.
+// Uses only existing resources (t29 positions, t17 colors sampled by caller).
+bool DynCubeSpatialReproject(
+    float3 Rcubedir, float3 Pworld, float3 Rworld,
+    float radius, int maxCand,
+    float errThreshold, float minDist,
+    out float3 bestDir)
+{
+  bestDir = Rcubedir;
+  float3 T = normalize(cross(Rcubedir, abs(Rcubedir.y) > 0.99f ? float3(1, 0, 0) : float3(0, 1, 0)));
+  float3 B = cross(Rcubedir, T);
+  float bestRel = errThreshold;
+  bool found = false;
+  for (int i = 0; i < 9; ++i) {
+    if (i >= maxCand) break;
+    float3 off;
+    if (i == 0) off = float3(0, 0, 0);
+    else if (i == 1) off = T * radius;
+    else if (i == 2) off = -T * radius;
+    else if (i == 3) off = B * radius;
+    else if (i == 4) off = -B * radius;
+    else if (i == 5) off = (T + B) * radius;
+    else if (i == 6) off = (T - B) * radius;
+    else if (i == 7) off = (-T + B) * radius;
+    else off = (-T - B) * radius;
+    float3 D = normalize(Rcubedir + off);
+    float4 Psample = dynCubeHistPosTex.SampleLevel(samPoint_s, D, 0);
+    if (Psample.a <= 0.5f) continue;
+    float3 Q = Psample.rgb * 1000.0f;  // stored pos is world * posScale (0.001)
+    if (!all(isfinite(Q))) continue;
+    float t = dot(Q - Pworld, Rworld);
+    if (t <= minDist) continue;
+    float rel = length(Q - (Pworld + Rworld * t)) / max(t, 1e-4f);
+    if (rel < bestRel) {
+      bestRel = rel;
+      bestDir = D;
+      found = true;
+    }
+  }
+  return found;
+}
+
 
 void main(
   float4 v0 : SV_Position0,
@@ -860,6 +905,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   float dynCubeVanillaMipFactor = 0.0;   // game roughness->mip factor, for the vanilla fallback's own mip chain
   bool dynCubeReflActive = false;
   int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
+  // Spatial-reprojection gate prefetch (experimental master toggle only).
+  // Fetches the SSR confidence early so the search below runs solely on
+  // weak/missing SSR pixels; the existing resolve tap later is untouched.
+  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
+  float dynCubeSsrGateConf = 1.0f;
+  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
+    float2 dynCubeSsrGateUV = resolutionScaling_g.xy * v1.zw;
+    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, dynCubeSsrGateUV, 0).a;
+  }
   if (r20.z != 0) {
     r5.yz = r15.yz * r9.yz;
     dynCubeVanillaMipFactor = r5.z;
@@ -871,6 +926,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     } else {
       r8.z = r3.y + r3.y;
       r22.xyz = r8.xyw * -r8.zzz + r19.xyz;
+      // Pre-parallax world reflection ray (spatial search base). Captured here so
+      // the experimental search below stays independent of world-box sizing.
+      float3 dynCubeRawReflA = r22.xyz * dynCubeReflectSign;
       // Parallax-corrected cubemap lookup (generic Falcom Engine+). Active only for the
       // dynamic cube (enabled + not force-vanilla) so the vanilla path is untouched.
       int parallaxFace = -1;
@@ -917,7 +975,42 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       float dynCubeFlipA = (shader_injection_data.dynCube_enabled > 0.5f
           && shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0;
       float3 dynCubeSampleDirA = r22.xyz * dynCubeFlipA;
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirA, dynCubeSampleMip).xyz;
+      // TEST: vertical offset tilt of the dynamic cubemap lookup (degrees, 0 = no-op,
+      // + slides content down). Applied before sampling so validity/vanilla follow it.
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && abs(shader_injection_data.dynCube_vertical_offset) > 1e-4) {
+        dynCubeSampleDirA.y -= tan(radians(shader_injection_data.dynCube_vertical_offset));
+        dynCubeSampleDirA = normalize(dynCubeSampleDirA);
+      }
+      // EXPERIMENTAL spatial reprojection: search around the uncorrected reflection
+      // for captured geometry on the live ray; on success sample that direction.
+      // Otherwise the existing dynamic path below runs exactly as before.
+      float3 dynCubeFinalDirA = dynCubeSampleDirA;
+      if (dynCubeSpatialActive
+          && !dynCubeForceSSRActive
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && dynCubeNewSSRActive && dynCubeSsrGateConf < 0.02f) {
+        float3 dynCubeSearchBaseA = dynCubeRawReflA;
+        dynCubeSearchBaseA = float3(1,-1,-1) * dynCubeSearchBaseA;
+        dynCubeSearchBaseA = dynCubeSearchBaseA * dynCubeFlipA;
+        if (abs(shader_injection_data.dynCube_vertical_offset) > 1e-4) {
+          dynCubeSearchBaseA.y -= tan(radians(shader_injection_data.dynCube_vertical_offset));
+          dynCubeSearchBaseA = normalize(dynCubeSearchBaseA);
+        }
+        float dynCubeSearchSamplesA = shader_injection_data.dynCube_spatial_reprojection_samples;
+        float3 dynCubeBestA;
+        if (DynCubeSpatialReproject(
+            dynCubeSearchBaseA, r4.xyz, dynCubeRawReflA,
+            shader_injection_data.dynCube_spatial_reprojection_radius,
+            dynCubeSearchSamplesA < 2.5f ? 1 : (dynCubeSearchSamplesA < 7.0f ? 5 : 9),
+            shader_injection_data.dynCube_spatial_reprojection_error,
+            shader_injection_data.dynCube_spatial_reprojection_min_distance,
+            dynCubeBestA)) {
+          dynCubeFinalDirA = dynCubeBestA;
+        }
+      }
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeFinalDirA, dynCubeSampleMip).xyz;
       // Package reflection brightness (dynamic + SSR only): mirrors the t17 override
       // condition so vanilla/debug views stay untouched. Vanilla fallback never scaled.
       if (shader_injection_data.dynCube_enabled > 0.5f
@@ -925,9 +1018,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           && shader_injection_data.dynCube_debug != 4.f) {
         r21.xyz *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
       }
-      // Record the final sampled direction (including lookup flip) so validity and
-      // vanilla fallback test the texel actually displayed, not its antipode.
-      dynCubeReflDir = dynCubeSampleDirA;
+      // Record the final sampled direction (including lookup flip and any spatial
+      // reprojection) so validity and vanilla fallback test the texel actually
+      // displayed, not its antipode.
+      dynCubeReflDir = dynCubeFinalDirA;
       dynCubeReflActive = true;
       // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
       if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace >= 0) {
@@ -1085,6 +1179,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     if (r2.x != 0) {
       r2.x = r3.y + r3.y;
       r21.xyz = r8.xyw * -r2.xxx + r19.xyz;
+      // Pre-parallax world reflection ray (spatial search base, site 2).
+      float3 dynCubeRawReflB = r21.xyz * dynCubeReflectSign;
       // Parallax-corrected cubemap lookup (generic Falcom Engine+). Active only for the
       // dynamic cube (enabled + not force-vanilla) so the vanilla path is untouched.
       int parallaxFace2 = -1;
@@ -1145,7 +1241,40 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       float dynCubeFlipB = (shader_injection_data.dynCube_enabled > 0.5f
           && shader_injection_data.dynCube_lookup_direction_flip > 0.5f) ? -1.0 : 1.0;
       float3 dynCubeSampleDirB = dynCubeSampleDir * dynCubeFlipB;
-      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeSampleDirB, dynCubeSampleMip2).xyz;
+      // TEST: vertical offset tilt of the dynamic cubemap lookup (degrees, 0 = no-op,
+      // + slides content down). Applied before sampling so validity/vanilla follow it.
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && abs(shader_injection_data.dynCube_vertical_offset) > 1e-4) {
+        dynCubeSampleDirB.y -= tan(radians(shader_injection_data.dynCube_vertical_offset));
+        dynCubeSampleDirB = normalize(dynCubeSampleDirB);
+      }
+      // EXPERIMENTAL spatial reprojection (site 2): same search as site 1.
+      float3 dynCubeFinalDirB = dynCubeSampleDirB;
+      if (dynCubeSpatialActive
+          && !dynCubeForceSSRActive
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && dynCubeNewSSRActive && dynCubeSsrGateConf < 0.02f) {
+        float3 dynCubeSearchBaseB = dynCubeRawReflB;
+        dynCubeSearchBaseB = float3(1,-1,-1) * dynCubeSearchBaseB;
+        dynCubeSearchBaseB = dynCubeSearchBaseB * dynCubeFlipB;
+        if (abs(shader_injection_data.dynCube_vertical_offset) > 1e-4) {
+          dynCubeSearchBaseB.y -= tan(radians(shader_injection_data.dynCube_vertical_offset));
+          dynCubeSearchBaseB = normalize(dynCubeSearchBaseB);
+        }
+        float dynCubeSearchSamplesB = shader_injection_data.dynCube_spatial_reprojection_samples;
+        float3 dynCubeBestB;
+        if (DynCubeSpatialReproject(
+            dynCubeSearchBaseB, r4.xyz, dynCubeRawReflB,
+            shader_injection_data.dynCube_spatial_reprojection_radius,
+            dynCubeSearchSamplesB < 2.5f ? 1 : (dynCubeSearchSamplesB < 7.0f ? 5 : 9),
+            shader_injection_data.dynCube_spatial_reprojection_error,
+            shader_injection_data.dynCube_spatial_reprojection_min_distance,
+            dynCubeBestB)) {
+          dynCubeFinalDirB = dynCubeBestB;
+        }
+      }
+      r21.xyz = texEnvMap_g.SampleLevel(SmplCube_s, dynCubeFinalDirB, dynCubeSampleMip2).xyz;
       // Package reflection brightness (dynamic + SSR only): mirrors the t17 override
       // condition so vanilla/debug views stay untouched. Vanilla fallback never scaled.
       if (shader_injection_data.dynCube_enabled > 0.5f
@@ -1153,9 +1282,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           && shader_injection_data.dynCube_debug != 4.f) {
         r21.xyz *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
       }
-      // Record the final sampled direction (including lookup flip) so validity and
-      // vanilla fallback test the texel actually displayed, not its antipode.
-      dynCubeReflDir = dynCubeSampleDirB;
+      // Record the final sampled direction (including lookup flip and any spatial
+      // reprojection) so validity and vanilla fallback test the texel actually
+      // displayed, not its antipode.
+      dynCubeReflDir = dynCubeFinalDirB;
       dynCubeReflActive = true;
       // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
       if (shader_injection_data.dynCube_parallax_debug > 0.5f && parallaxFace2 >= 0) {

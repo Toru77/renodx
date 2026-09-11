@@ -331,6 +331,13 @@ struct ShaderInjectData {
   float dynCube_ssr_isfast_spatial;            // [0.25..4] noise spatial scale, default 1
   float dynCube_ssr_isfast_temporal;           // [0..5] noise animation speed, 0=frozen slice, default 1
   float dynCube_ssr_confidence_fallback;       // [0..0.9] AUTO SSR confidence fallback, 0 = today's weighting, higher = low-conf SSR yields to Dynamic sooner
+  float dynCube_vertical_offset;               // TEST: vertical tilt of dyn cube lookup, degrees; 0 = no-op, + = slide content down
+  float dynCube_worldbox_contrib;              // [0..1] world-box candidate contrib threshold, default 0.25 (temporal coverage test)
+  float dynCube_spatial_reprojection;          // 0=off, 1=on — position-aware temporal cubemap reprojection (experimental A/B)
+  float dynCube_spatial_reprojection_radius;   // [0..0.25] tangent-space angular search radius around R, default 0.05
+  float dynCube_spatial_reprojection_samples;  // {1,5,9} candidate directions (1=center, 5=+cross, 9=+diagonals), default 5
+  float dynCube_spatial_reprojection_error;    // [0..1] max relative ray/position mismatch, default 0.10
+  float dynCube_spatial_reprojection_min_distance; // [0..10] min ray distance t for a match (world units), default 0.05
 };
 
 #ifndef __cplusplus
