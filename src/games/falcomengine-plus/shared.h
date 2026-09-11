@@ -324,7 +324,7 @@ struct ShaderInjectData {
   float dynCube_blur;                           // artistic mip-offset blur on the dynamic cube sample (fractional), 0=sharp
   float dynCube_worldbox_enabled;                // 0=off (camera-centered proxy), 1=on (persistent world-space proxy)
   float dynCube_worldbox_margin;                 // world-unit margin expanded around the stored bounds at lookup, default 1.0
-  float dynCube_lookup_direction_flip;        // 0=off (current dynamic lookup), 1=negate final dynamic lookup dir — independent of parallax reflect sign
+  float dynCube_lookup_direction_flip;        // reserved: sampling convention is baked in capture now (bare lookup correct); kept for b13 layout stability, always 0
   float dynCube_coverage_fade;                 // 0=off 1=on (smooth binary validity edge in direction space)
   float dynCube_coverage_width;                // validity smoothing cone half-angle in degrees [0..8], default 2
   float dynCube_ssr_isfast_enabled;            // 0=off (hash phase), 1=on (IS-FAST phase when master+texture allow)
@@ -339,6 +339,7 @@ struct ShaderInjectData {
   float dynCube_spatial_reprojection_samples;  // {1,5,9} candidate directions (1=center, 5=+cross, 9=+diagonals), default 5
   float dynCube_spatial_reprojection_error;    // [0..1] max relative ray/position mismatch, default 0.10
   float dynCube_spatial_reprojection_min_distance; // [0..10] min ray distance t for a match (world units), default 0.05
+  float dynCube_capture_soften;              // [0..1] baked capture blur, default 0 (appended last: do not insert above)
 };
 
 #ifndef __cplusplus

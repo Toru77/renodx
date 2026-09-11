@@ -27,7 +27,7 @@ cbuffer DynCubeCB : register(b13)
     float g_charMaskAvailable;     // 1 = character mask data available
     float g_charComp;              // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
     float g_charShift;             // bit shift applied to the selected component (Sora 0, Kai 8)
-    float _pad0;
+    float g_captureSoften;         // 0 = sharp (default), 1 = full 4-tap cross blur baked at capture
 };
 
 Texture2D<float>       g_depthTex      : register(t0);
@@ -91,7 +91,13 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // Falcom game samples t17 with (1,-1,-1)*reflect(...); store physical
     // radiance R at the same TextureCube address the lookup samples, so the
     // capture transform must equal the lookup transform: (1,-1,-1).
-    float3 worldDir = float3(1.0, -1.0, -1.0) * GetSamplingVector(dtid, w, h);
+    // Baked sampling convention: store physical radiance so that the game's bare
+    // (1,-1,-1)*reflect(...) lookup fetches the correct texel with NO runtime
+    // negation anywhere (lighting, glass, future consumers). The conjugate of the
+    // lookup flip through the reference capture negation (-GetSamplingVector) is
+    // X-only: float3(-1, 1, 1). Do NOT "fix" this to (1,-1,-1) without also
+    // re-adding a lookup negate on every consumer (see git 5931055f).
+    float3 worldDir = float3(-1.0, 1.0, 1.0) * GetSamplingVector(dtid, w, h);
     float3 viewDir = WorldToViewDir(worldDir);
     // Projection cull disabled for diagnostic (see Phase 0B). Keep IsOutside only.
     float2 uv = ViewToUV(viewDir);
@@ -111,6 +117,20 @@ void main(uint3 dtid : SV_DispatchThreadID)
             float4 worldH = mul(viewProjInv_g, clipPos);
             curPos = worldH.xyz / max(worldH.w, 1e-6);
             curCol = g_colorTex.SampleLevel(g_pointClamp, uv, 0).rgb;
+            // Baked soften (DynCubeCaptureSoften): 4-tap cross blur of the source,
+            // baked here so every consumer (lighting, glass t17, SSR) sees it.
+            // 0 = untouched sharp sample; history already carries softened content.
+            if (g_captureSoften > 1e-4f)
+            {
+                uint srcW, srcH;
+                g_colorTex.GetDimensions(srcW, srcH);
+                float2 texel = 1.0 / float2(max(srcW, 1u), max(srcH, 1u));
+                float3 taps = g_colorTex.SampleLevel(g_pointClamp, uv + float2(texel.x, 0.0), 0).rgb
+                            + g_colorTex.SampleLevel(g_pointClamp, uv - float2(texel.x, 0.0), 0).rgb
+                            + g_colorTex.SampleLevel(g_pointClamp, uv + float2(0.0, texel.y), 0).rgb
+                            + g_colorTex.SampleLevel(g_pointClamp, uv - float2(0.0, texel.y), 0).rgb;
+                curCol = lerp(curCol, taps * 0.25, clamp(g_captureSoften, 0.0, 1.0));
+            }
             // Capture-brightness packaging (DynCubeCaptureBoost): baked here so every
             // consumer (lighting resolve, glass t17 override, SSR march input) sees it.
             // Sample-time multiplies were removed accordingly; history already carries

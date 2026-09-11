@@ -308,6 +308,7 @@ ShaderInjectData shader_injection = {
   .dynCube_spatial_reprojection_samples = 5.f,
   .dynCube_spatial_reprojection_error = 0.10f,
   .dynCube_spatial_reprojection_min_distance = 0.05f,
+  .dynCube_capture_soften = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3101,6 +3102,14 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
+      .key = "DynCubeCaptureSoften", .binding = &shader_injection.dynCube_capture_soften,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.f, .label = "Capture Soften", .section = "Dynamic Cubemaps",
+      .tooltip = "Bakes a small blur into the captured cubemap (0 = sharp). Softens all dynamic reflections including glass, hiding capture faults. Does not affect the vanilla fallback.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeHistoryBlend", .binding = &shader_injection.dynCube_history_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.75f, .label = "History Blend", .section = "Dynamic Cubemaps",
@@ -3292,15 +3301,6 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Reflection Sign Flip", .section = "Dynamic Cubemaps",
       .tooltip = "Debug A/B: OFF = use the mathematical reflect ray (current). ON = use the physical reflection ray (negated) for box-parallax correction. Test which direction the correction moves.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "DynCubeLookupDirectionFlip", .binding = &shader_injection.dynCube_lookup_direction_flip,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Dynamic Cubemap Reflection Direction Flip", .section = "Dynamic Cubemaps",
-      .tooltip = "A/B test for the dynamic cubemap sampling direction only. OFF = current lookup direction. ON = negate the final dynamic lookup direction. Independent from Reflection Sign Flip (parallax-only).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -5248,7 +5248,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 9; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift
+    push_range.count = 10; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5828,7 +5828,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     // stale pre-gap history). Consumed here so exactly one capture sees it.
     const bool fastForward = d->dyncube_rejectedGap;
     d->dyncube_rejectedGap = false;
-    float pc[9] = {
+    float pc[10] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
         fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
         std::max(0.f, shader_injection.dynCube_history_pos_threshold),
@@ -5839,8 +5839,9 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
         // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0.
         IsKai() ? 1.f : 0.f,
         IsKai() ? 8.f : 0.f,
+        std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f),
     };
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 9, pc);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 10, pc);
   }
 
   uint32_t sz = d->dyncube_size;
