@@ -27,7 +27,7 @@ cbuffer DynCubeCB : register(b13)
     float g_charMaskAvailable;     // 1 = character mask data available
     float g_charComp;              // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
     float g_charShift;             // bit shift applied to the selected component (Sora 0, Kai 8)
-    float g_captureSoften;         // 0 = sharp (default), 1 = full 4-tap cross blur baked at capture
+    float g_captureSoften;         // reserved (soften applies in the variant pass, not here); kept for push/CB alignment
 };
 
 Texture2D<float>       g_depthTex      : register(t0);
@@ -37,7 +37,8 @@ Texture2DArray<float4> g_prevPosTex    : register(t3);
 Texture2DArray<float>  g_prevContribTex: register(t4);
 Texture2D<float4>      g_camPrevTex    : register(t5);
 Texture2D<uint4>       g_mrt0Tex       : register(t6);
-SamplerState           g_pointClamp    : register(s0);
+TextureCube<float4>  g_vanillaTex    : register(t7);  // game vanilla cube: painted where dynamic has no info (never black canvas)
+SamplerState         g_pointClamp    : register(s0);
 
 RWTexture2DArray<float4> g_outColor   : register(u0);
 RWTexture2DArray<float4> g_outPos     : register(u1);
@@ -117,25 +118,11 @@ void main(uint3 dtid : SV_DispatchThreadID)
             float4 worldH = mul(viewProjInv_g, clipPos);
             curPos = worldH.xyz / max(worldH.w, 1e-6);
             curCol = g_colorTex.SampleLevel(g_pointClamp, uv, 0).rgb;
-            // Baked soften (DynCubeCaptureSoften): 4-tap cross blur of the source,
-            // baked here so every consumer (lighting, glass t17, SSR) sees it.
-            // 0 = untouched sharp sample; history already carries softened content.
-            if (g_captureSoften > 1e-4f)
-            {
-                uint srcW, srcH;
-                g_colorTex.GetDimensions(srcW, srcH);
-                float2 texel = 1.0 / float2(max(srcW, 1u), max(srcH, 1u));
-                float3 taps = g_colorTex.SampleLevel(g_pointClamp, uv + float2(texel.x, 0.0), 0).rgb
-                            + g_colorTex.SampleLevel(g_pointClamp, uv - float2(texel.x, 0.0), 0).rgb
-                            + g_colorTex.SampleLevel(g_pointClamp, uv + float2(0.0, texel.y), 0).rgb
-                            + g_colorTex.SampleLevel(g_pointClamp, uv - float2(0.0, texel.y), 0).rgb;
-                curCol = lerp(curCol, taps * 0.25, clamp(g_captureSoften, 0.0, 1.0));
-            }
-            // Capture-brightness packaging (DynCubeCaptureBoost): baked here so every
-            // consumer (lighting resolve, glass t17 override, SSR march input) sees it.
-            // Sample-time multiplies were removed accordingly; history already carries
-            // boosted content, so the lerp below stays consistent.
-            curCol *= clamp(g_captureBoost, 0.0, 8.0);
+            // NOTE: capture soften is intentionally NOT baked here (it would reach
+            // lighting too); soften applies in the variant pass for global pushes.
+            // NOTE: capture brightness is intentionally NOT baked here (sample-time
+            // lighting multiply only).
+            curValid = true;
             curValid = true;
         }
     }
@@ -209,7 +196,13 @@ void main(uint3 dtid : SV_DispatchThreadID)
     }
     else
     {
-        outCol = 0.0;
+        // No live or history content: paint the vanilla cube instead of a black
+        // canvas, so every consumer (lighting fallback AND raw t17 samplers like
+        // glass) sees vanilla where dynamic has no info. Sampled at the texel's
+        // address direction — the same convention the game uses — so dynamic and
+        // vanilla texels agree. Validity/contrib/pos stay 0: the resolver still
+        // blends to vanilla and worldbox still ignores these texels.
+        outCol = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
         outPos = 0.0;
         outValid = 0.0;
         outContrib = 0.0;

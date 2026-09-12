@@ -339,7 +339,8 @@ struct ShaderInjectData {
   float dynCube_spatial_reprojection_samples;  // {1,5,9} candidate directions (1=center, 5=+cross, 9=+diagonals), default 5
   float dynCube_spatial_reprojection_error;    // [0..1] max relative ray/position mismatch, default 0.10
   float dynCube_spatial_reprojection_min_distance; // [0..10] min ray distance t for a match (world units), default 0.05
-  float dynCube_capture_soften;              // [0..1] baked capture blur, default 0 (appended last: do not insert above)
+  float dynCube_capture_soften;              // [0..1] variant soften for global pushes (lighting unaffected), default 0
+  float dynCube_global_strength;             // [0..1] variant strength for global pushes (lighting unaffected), default 1 (appended last: do not insert above)
 };
 
 #ifndef __cplusplus

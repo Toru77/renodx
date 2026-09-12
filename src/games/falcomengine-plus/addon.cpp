@@ -309,6 +309,7 @@ ShaderInjectData shader_injection = {
   .dynCube_spatial_reprojection_error = 0.10f,
   .dynCube_spatial_reprojection_min_distance = 0.05f,
   .dynCube_capture_soften = 0.f,
+  .dynCube_global_strength = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -691,6 +692,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool dyncube_boxCopyPending = false;     // staged validity copy enqueued, not yet consumed
   bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
   bool dyncube_rejectedGap = false;        // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
+  bool dyncube_captureDirty = false;          // capture-content settings changed since last filter: force one filter pass
+  bool dyncube_dirtyFastForward = false;      // settings-dirty one-shot: next dispatched capture hard-replaces history
+  float dyncube_lastVariantSoften = -1.f;      // soften value baked into the variant (-1 = none yet)
+  float dyncube_lastVariantStrength = -1.f;    // strength value baked into the variant (-1 = none yet)
+  float dyncube_lastCharCapture = -1.f;       // character-capture value fed into the last filter pass
   bool dyncube_hasValidRead = false;       // any validated readSet exists (gates first filter)
   uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
   // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
@@ -716,6 +722,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline_layout dyncube_ggx_layout = {};
   reshade::api::pipeline dyncube_ggx_pipeline = {};
   GTVBAODescriptorTableSet dyncube_ggx_tables = {};
+  // Global-push variant cube (soften + strength for non-lighting t17 consumers).
+  // Derived from ggx_out[active]; rebuilt on demand, never part of per-size cache.
+  reshade::api::resource dyncube_variant = {};                // RGBA16F cube, N mips
+  reshade::api::resource_view dyncube_variant_cube_srv = {};  // full-chain SRV (global serve)
+  reshade::api::resource_view dyncube_variant_mip0_uav = {};  // mip0 array UAV (variant write)
+  reshade::api::pipeline_layout dyncube_variant_layout = {};
+  reshade::api::pipeline dyncube_variant_pipeline = {};
+  GTVBAODescriptorTableSet dyncube_variant_tables = {};
+  bool dyncube_variant_valid = false;          // variant matches current ggx_out + settings
   // Dedicated solid-color debug cube (Phase 0A). Never aliases history/ggx resources.
   reshade::api::resource dyncube_solid_cube = {};          // RGBA16F cube, 1 mip
   reshade::api::resource_view dyncube_solid_cube_srv = {};   // TextureCube SRV (t17 for debug 3)
@@ -765,6 +780,7 @@ static void PromoteDynCubeReadSet(DeviceData* d);
 static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* d);
 static bool RunDynCubeInference(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool ggxOn);
+static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 
 // VBGI is now integrated into GTVBAO main pass — no separate RunVBGI needed.
@@ -3105,7 +3121,15 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeCaptureSoften", .binding = &shader_injection.dynCube_capture_soften,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.f, .label = "Capture Soften", .section = "Dynamic Cubemaps",
-      .tooltip = "Bakes a small blur into the captured cubemap (0 = sharp). Softens all dynamic reflections including glass, hiding capture faults. Does not affect the vanilla fallback.",
+      .tooltip = "Softens globally-pushed dynamic reflections (glass etc.) via a dedicated variant cube. Does not affect the lighting resolve or the vanilla fallback.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeGlobalStrength", .binding = &shader_injection.dynCube_global_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Global Reflection Strength", .section = "Dynamic Cubemaps",
+      .tooltip = "Scales globally-pushed dynamic reflections (glass etc.) so they don't dominate. 1 = full. Does not affect the lighting resolve or the vanilla fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
@@ -3629,6 +3653,24 @@ static void DestroyGTVBAODescriptorTables(
   }
 }
 
+// ── Vanilla env-cube identification (strict) ──
+// A 512/1024 square R8G8B8A8_UNORM cube view is the game's vanilla env cubemap.
+// Shared by the vanilla capture and the global t17 swap so both agree exactly.
+// Doubles as self-exclusion: our pushed cubes are RGBA16F and can never match,
+// regardless of push-event re-entrancy. sRGB never matches by design.
+static bool IsVanillaEnvCubeView(reshade::api::device* device, reshade::api::resource_view view) {
+  if (!device || view.handle == 0u) return false;
+  auto vdesc = device->get_resource_view_desc(view);
+  if (vdesc.type != reshade::api::resource_view_type::texture_cube
+      || vdesc.format != reshade::api::format::r8g8b8a8_unorm) return false;
+  auto res = device->get_resource_from_view(view);
+  if (res.handle == 0u) return false;
+  auto rdesc = device->get_resource_desc(res);
+  return rdesc.type == reshade::api::resource_type::texture_2d
+      && (rdesc.texture.width == 1024u || rdesc.texture.width == 512u)
+      && rdesc.texture.width == rdesc.texture.height;
+}
+
 // ── Scene CBV helper ──
 
 static bool IsSceneCbvCandidateValid(reshade::api::device* device,
@@ -3716,74 +3758,81 @@ static void OnPushDescriptorsCapture(
       }
     }
     // Capture the game's vanilla texEnvMap_g (t17) binding — the vanilla cubemap
-    // fallback layer. Only from the lighting shader, before our own t17 override,
-    // and only when Dynamic Cubemaps is enabled (no work when off).
+    // fallback layer (t30). From ANY pixel-shader t17 bind (lighting, glass, ...),
+    // refreshed on every bind so game reallocations/resizes can never leave a stale
+    // handle and the pre-first-capture window collapses to ~zero. Strict criterion
+    // via IsVanillaEnvCubeView (also self-excludes our own pushes). Only when
+    // Dynamic Cubemaps is enabled (no work when off).
     if (update.binding == 17u && update.count >= 1
-        && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (IsLightingShader(hash)) {
-          d->captured_vanilla_env_srv = views[0];
-        }
-      }
+        && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f
+        && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))
+        && IsVanillaEnvCubeView(device, views[0])) {
+      d->captured_vanilla_env_srv = views[0];
     }
     // Global Dynamic Cubemap t17 override: any pixel-shader bind of a 512x512 or
     // 1024x1024 R8G8B8A8_UNORM cube view at slot 17 IS the game's vanilla env cubemap
-    // (strict criterion, UNORM only — sRGB never matches). Swap in the active
-    // dynamic cube so every consumer (lighting, glass, future shaders) gets live
-    // reflections with no per-shader registration. Respects Force Vanilla and
-    // debug 4 (vanilla A/B paths keep the game cube).
-    // Re-entrancy: our own cube is RGBA16F, so it fails the criterion and the
-    // handler terminates; a static guard makes this airtight regardless.
-    // The vanilla capture above requires IsLightingShader, so our pushes here
-    // can never poison the vanilla fallback.
+    // (strict criterion via IsVanillaEnvCubeView, UNORM only — sRGB never matches).
+    // Swap in the active dynamic cube so every consumer (lighting, glass, future
+    // shaders) gets live reflections with no per-shader registration. Respects Force
+    // Vanilla and debug 4 (vanilla A/B paths keep the game cube). Normal display
+    // (dbg==0) additionally requires a captured vanilla cube, so pre-first-capture
+    // draws show true game vanilla instead of black dynamic; debug modes override
+    // regardless. Re-entrancy: our own cube fails the criterion and the handler
+    // terminates; a static guard makes this airtight regardless.
+    // The vanilla capture above requires no lighting hash, so our pushes here
+    // can never poison the vanilla fallback (criterion excludes them anyway).
     if (update.binding == 17u && update.count >= 1
         && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f
         && shader_injection.dynCube_force_vanilla < 0.5f
         && (int)shader_injection.dynCube_debug != 4
         && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) {
       static bool s_dynCubeT17SwapGuard = false;
-      if (!s_dynCubeT17SwapGuard) {
-        auto swapViewDesc = device->get_resource_view_desc(views[0]);
-        if (swapViewDesc.type == reshade::api::resource_view_type::texture_cube
-            && swapViewDesc.format == reshade::api::format::r8g8b8a8_unorm) {
-          auto swapRes = device->get_resource_from_view(views[0]);
-          if (swapRes.handle != 0u) {
-            auto swapResDesc = device->get_resource_desc(swapRes);
-            if (swapResDesc.type == reshade::api::resource_type::texture_2d
-                && (swapResDesc.texture.width == 1024u || swapResDesc.texture.width == 512u)
-                && swapResDesc.texture.width == swapResDesc.texture.height
-                && d && d->dyncube_resources_created) {
-              reshade::api::resource_view t17srv;
-              int swapDbg = (int)shader_injection.dynCube_debug;
-              if (swapDbg == 3) {
-                if (!RunDynCubeSolid(cmd_list, d)) t17srv = {};
-                else t17srv = d->dyncube_solid_cube_srv;
-              } else {
-                // Active completed filtered cube; raw history cube before first filter.
-                t17srv = d->dyncube_ggx_valid
-                    ? d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]
-                    : d->dyncube_srv;
-              }
-              // Once the vanilla cube is known, only swap onto that exact resource
-              // (extra safety against hijacking unrelated 512/1024 cubes). Before the
-              // first capture, the strict format/size/cube criterion identifies it.
-              bool swapAllowed = true;
-              if (d->captured_vanilla_env_srv.handle != 0u) {
-                auto knownRes = device->get_resource_from_view(d->captured_vanilla_env_srv);
-                swapAllowed = (knownRes.handle != 0u && knownRes.handle == swapRes.handle);
-              }
-              if (t17srv.handle && swapAllowed) {
-                s_dynCubeT17SwapGuard = true;
-                cmd_list->push_descriptors(reshade::api::shader_stage::pixel,
-                    reshade::api::pipeline_layout{0}, 0,
-                    reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
-                        reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
-                s_dynCubeT17SwapGuard = false;
-              }
-            }
-          }
+      int swapDbg = (int)shader_injection.dynCube_debug;
+      if (!s_dynCubeT17SwapGuard && IsVanillaEnvCubeView(device, views[0])
+          && (swapDbg != 0 || d->captured_vanilla_env_srv.handle != 0u)
+          && d && d->dyncube_resources_created) {
+        // Lighting draws always sample sharp (own sample-time blur/brightness);
+        // every other global consumer gets the softened/dimmed variant when one is
+        // active, sharp otherwise. Validity-gated on current settings so a stale
+        // variant can never serve after the sliders return to neutral.
+        bool swapIsLighting = false;
+        {
+          auto* swapState = renodx::utils::shader::GetCurrentState(cmd_list);
+          if (swapState) swapIsLighting = IsLightingShader(renodx::utils::shader::GetCurrentPixelShaderHash(swapState));
+        }
+        float swapSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
+        float swapStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
+        bool serveVariant = !swapIsLighting && d->dyncube_variant_valid
+            && (swapSoften > 1e-4f || swapStrength < 1.f - 1e-4f);
+        reshade::api::resource_view t17srv;
+        if (swapDbg == 3) {
+          if (!RunDynCubeSolid(cmd_list, d)) t17srv = {};
+          else t17srv = d->dyncube_solid_cube_srv;
+        } else if (serveVariant) {
+          t17srv = d->dyncube_variant_cube_srv;
+        } else {
+          // Active completed filtered cube; raw history cube before first filter.
+          t17srv = d->dyncube_ggx_valid
+              ? d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]
+              : d->dyncube_srv;
+        }
+        // Once the vanilla cube is known, only swap onto that exact resource
+        // (extra safety against hijacking unrelated 512/1024 cubes). Before the
+        // first capture, the strict criterion identifies it (and the dbg==0 gate
+        // above already required the capture, so this is belt-and-braces there).
+        bool swapAllowed = true;
+        if (d->captured_vanilla_env_srv.handle != 0u) {
+          auto swapResHere = device->get_resource_from_view(views[0]);
+          auto knownRes = device->get_resource_from_view(d->captured_vanilla_env_srv);
+          swapAllowed = (swapResHere.handle != 0u && knownRes.handle != 0u && knownRes.handle == swapResHere.handle);
+        }
+        if (t17srv.handle && swapAllowed) {
+          s_dynCubeT17SwapGuard = true;
+          cmd_list->push_descriptors(reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0}, 0,
+              reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
+                  reshade::api::descriptor_type::texture_shader_resource_view, &t17srv});
+          s_dynCubeT17SwapGuard = false;
         }
       }
     }
@@ -3987,7 +4036,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (!d) return;
   d->frame_index++;
 
-  // DynCube disabled -> free the resource set at the frame boundary (GPU idle on the old set).
+  // DynCube disable path (retained, currently untriggered): frees the resource set
+  // at the frame boundary. Toggle-off no longer arms this (cache is preserved by
+  // design); device-loss/swapchain paths call Destroy directly.
   // Runs before any early-out so it also happens when every feature is off.
   if (d->dyncube_pending_destroy) {
     d->dyncube_pending_destroy = false;
@@ -4325,12 +4376,16 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f;
   const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f;
   // Rising/falling-edge latch (runs before the early-out so it also happens when every
-  // feature is off): rising edge resets history; falling edge defers a resource free to
-  // OnPresent (the old set is released at the frame boundary).
+  // feature is off): rising edge schedules an immediate refresh cycle WITHOUT wiping
+  // history (toggle off/on preserves the cache; first boot still clears via Create).
+  // Falling edge only updates the latch — resources and cache are intentionally kept
+  // so re-enabling resumes instantly. (No destroy-on-disable by design.)
   auto* dd0 = cmd_list ? cmd_list->get_device()->get_private_data<DeviceData>() : nullptr;
   if (dd0) {
-    if (dyncube_active && !dd0->dyncube_was_enabled) dd0->dyncube_needs_reset = true;
-    if (!dyncube_active && dd0->dyncube_was_enabled) dd0->dyncube_pending_destroy = true;
+    if (dyncube_active && !dd0->dyncube_was_enabled) {
+      dd0->dyncube_phase = DeviceData::DynCubePhase::Capture;
+      dd0->dyncube_next_update_frame = 0;
+    }
     dd0->dyncube_was_enabled = dyncube_active;
     // World-fixed parallax: first use after enabling must ignore stale stored bounds.
     const bool worldbox_enabled = shader_injection.dynCube_worldbox_enabled > 0.5f;
@@ -4493,6 +4548,22 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       // capture/filter work, so promotion always pairs with the latest capture.
       ConsumeDynCubeStagedValidity(dev, dd);
 
+      // Capture-content settings dirtiness: character_capture bakes into history
+      // texels, but the served cube only rebuilds on readSet change. A toggle in a
+      // static scene would otherwise never reach t17. Force one filter pass +
+      // one-shot history fast-forward so feedback is immediate, then resume no-churn.
+      // Gated on effective t17 serving so untouched paths never pay for it.
+      // (Soften/strength drive the variant cube instead — tracked separately below;
+      // capture brightness stays sample-time by design and is not tracked here.)
+      {
+        bool serveT17 = !forceVanilla && dbg != 4;
+        float curCharCap = (shader_injection.dynCube_character_capture > 0.5f) ? 1.0f : 0.0f;
+        if (serveT17 && curCharCap != dd->dyncube_lastCharCapture) {
+          dd->dyncube_captureDirty = true;
+          dd->dyncube_dirtyFastForward = true;
+        }
+      }
+
       // SSR runs every frame, independent of the Dynamic Cubemap update interval.
       if (shader_injection.dynCube_ssr_enabled > 0.5f) {
         (void)RunDynCubeSSR(cmd_list, dd);
@@ -4522,16 +4593,55 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           if (!dd->dyncube_hasValidRead) {
             // No validated read set yet (e.g. loading at boot): wait, retry on cadence.
             dd->dyncube_phase = DeviceData::DynCubePhase::Done;
-          } else if (dd->dyncube_readSet == dd->dyncube_filteredReadSet) {
+          } else if (dd->dyncube_readSet == dd->dyncube_filteredReadSet && !dd->dyncube_captureDirty) {
             // Already filtered (frozen valid state): skip redundant work, no churn.
             dd->dyncube_phase = DeviceData::DynCubePhase::Done;
-          } else if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
-            dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
-            dd->dyncube_ggx_valid = true;
-            dd->dyncube_filteredReadSet = dd->dyncube_readSet;
-            dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+          } else {
+            // Settings-dirty path: the forced filter must rebuild from the LATEST
+            // capture, but readSet/aliases only advance on validated promotion (frozen
+            // in static scenes). Promote first — but ONLY when the normal flow did not
+            // just promote itself (readSet still equal): a second promote would flip
+            // past the fresh set onto stale content. Gated on hasValidRead above, so
+            // boot content can never be promoted; a mid-loader slider drag may
+            // transiently alias loading content until the next validated promote
+            // (self-healing, same exposure as gap-resume). Normal validation-gated
+            // flow otherwise untouched.
+            if (dd->dyncube_captureDirty && dd->dyncube_readSet == dd->dyncube_filteredReadSet)
+              PromoteDynCubeReadSet(dd);
+            if (RunDynCubeFilter(cmd_list, dd, (shader_injection.dynCube_ggx > 0.5f))) {
+              dd->dyncube_ggx_active = 1u - dd->dyncube_ggx_active;
+              dd->dyncube_ggx_valid = true;
+              dd->dyncube_filteredReadSet = dd->dyncube_readSet;
+              dd->dyncube_captureDirty = false;
+              dd->dyncube_lastCharCapture = (shader_injection.dynCube_character_capture > 0.5f) ? 1.0f : 0.0f;
+              // Keep the global-push variant in sync with fresh filter output, but only
+              // when wanted (soften/strength active); otherwise it stays invalid and the
+              // sharp cube serves. Snapshots update inside the variant build.
+              {
+                float vSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
+                float vStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
+                if (vSoften > 1e-4f || vStrength < 1.f - 1e-4f)
+                  (void)RunDynCubeVariant(cmd_list, dd);
+                else
+                  dd->dyncube_variant_valid = false;
+              }
+              dd->dyncube_phase = DeviceData::DynCubePhase::Done;
+            }
           }
           break;
+      }
+
+      // Variant refresh for global pushes (no capture/promote/filter churn): rebuild
+      // the softened/dimmed cube from the current filtered cube whenever its two
+      // settings drift. Lighting always samples sharp and is unaffected.
+      {
+        float vSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
+        float vStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
+        bool wantVariant = (vSoften > 1e-4f || vStrength < 1.f - 1e-4f);
+        if (dd->dyncube_ggx_valid && wantVariant
+            && (vSoften != dd->dyncube_lastVariantSoften || vStrength != dd->dyncube_lastVariantStrength)) {
+          (void)RunDynCubeVariant(cmd_list, dd);
+        }
       }
 
       // ── Throttled scheduler log (1/sec) — verify the state machine behavior ──
@@ -4606,9 +4716,11 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           reshade::api::descriptor_table_update{{}, kDynCubeRegister, 0, 1,
             reshade::api::descriptor_type::texture_shader_resource_view, &dd->dyncube_solid_cube_srv});
       }
-    } else if (overrideT17) {
+    } else if (overrideT17 && (dbg != 0 || dd->captured_vanilla_env_srv.handle != 0u)) {
       // Push the ACTIVE completed filtered cube (never a partially-written building cube).
       // Before the first filter completes, fall back to the raw history cube.
+      // Normal display additionally requires a captured vanilla cube (fallback must
+      // exist before dynamic takes over); debug modes override regardless.
       reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
           ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
           : dd->dyncube_srv;
@@ -4814,6 +4926,12 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
     for (auto& u : d->dyncube_ggx_out_mip_uav[i]) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
   }
   d->dyncube_ggx_valid = false;
+  // Global-push variant cube (derived): destroy with the rest, rebuild on demand.
+  dv(d->dyncube_variant_cube_srv); dr(d->dyncube_variant);
+  if (d->dyncube_variant_mip0_uav.handle) { dev->destroy_resource_view(d->dyncube_variant_mip0_uav); d->dyncube_variant_mip0_uav = {}; }
+  dp(d->dyncube_variant_pipeline); dl(d->dyncube_variant_layout);
+  for (auto& t : d->dyncube_variant_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  d->dyncube_variant_valid = false;
   // Dedicated solid-color debug cube
   dv(d->dyncube_solid_cube_srv); dr(d->dyncube_solid_cube);
   if (d->dyncube_solid_cube_uav.handle) { dev->destroy_resource_view(d->dyncube_solid_cube_uav); d->dyncube_solid_cube_uav = {}; }
@@ -4841,6 +4959,11 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_boxCopyPending = false;
   d->dyncube_wasRejected = false;
   d->dyncube_rejectedGap = false;
+  d->dyncube_captureDirty = false;
+  d->dyncube_dirtyFastForward = false;
+  d->dyncube_lastVariantSoften = -1.f;
+  d->dyncube_lastVariantStrength = -1.f;
+  d->dyncube_lastCharCapture = -1.f;
   d->dyncube_hasValidRead = false;
   dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
   dl(d->dyncube_capture_layout); dl(d->dyncube_solid_layout);
@@ -5176,6 +5299,33 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     }
     d->dyncube_ggx_active = 0;
     d->dyncube_ggx_valid = false;
+    // Global-push variant cube (soften + strength): same desc/shape as ggx_out
+    // (full mip chain for consumer roughness LOD), derived content, rebuilt on
+    // demand — never part of the per-size cache.
+    {
+      reshade::api::resource_desc rdv = {};
+      rdv.type = reshade::api::resource_type::texture_2d;
+      rdv.texture = {size, size, 6, (uint16_t)mips, reshade::api::format::r16g16b16a16_float, 1};
+      rdv.heap = reshade::api::memory_heap::gpu_only;
+      rdv.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+      rdv.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;
+      if (!dev->create_resource(rdv, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_variant)) {
+        if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create variant cube");
+        DestroyDynCubeResources(dev, d);
+        return false;
+      }
+      dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::shader_resource,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                         reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
+        &d->dyncube_variant_cube_srv);
+      dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::unordered_access,
+        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                         reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+        &d->dyncube_variant_mip0_uav);
+    }
+    d->dyncube_variant_valid = false;
+    d->dyncube_lastVariantSoften = -1.f;
+    d->dyncube_lastVariantStrength = -1.f;
   }
 
   // Dedicated solid-color debug cube (debug 3) — independent of history/ggx resources.
@@ -5209,6 +5359,11 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   d->dyncube_boxCopyPending = false;
   d->dyncube_wasRejected = false;
   d->dyncube_rejectedGap = false;
+  d->dyncube_captureDirty = false;
+  d->dyncube_dirtyFastForward = false;
+  d->dyncube_lastVariantSoften = -1.f;
+  d->dyncube_lastVariantStrength = -1.f;
+  d->dyncube_lastCharCapture = -1.f;
   d->dyncube_hasValidRead = false;
   if (should_log()) {
     const uint32_t mips = d->dyncube_mip_count;
@@ -5237,12 +5392,12 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
     return dev->create_pipeline(lo, 1, &so, out);
   };
-  // Phase 1+2: 7 SRVs (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0), 5 UAVs (curColor, curPos, curContrib, camCur, charmask), 7 push floats
+  // Phase 1+2: 7 SRVs (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0), 5 UAVs (curColor, curPos, curContrib, camCur, charmask), 10 push floats
   auto make_capture_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
     DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene only
-    DR srv_r     = {0,0,0,7,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t6 (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0)
+    DR srv_r     = {0,0,0,8,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t7 (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0, vanilla)
     DR uav_r     = {0,0,0,5,DS::all_compute,1,DT::texture_unordered_access_view}; // u0..u4 (curColor, curPos, curContrib, camCur, charmask)
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
@@ -5349,6 +5504,36 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!__SpecularIrradianceCS.empty()) {
     if (!mkcs(__SpecularIrradianceCS, d->dyncube_ggx_layout, &d->dyncube_ggx_pipeline)) {
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] GGX pipeline create failed");
+    }
+  }
+  #endif
+
+  // ── Global-push variant pipeline (soften + strength resample) ──
+  auto make_variant_layout = [&](reshade::api::pipeline_layout* out) -> bool {
+    if (out->handle != 0u) return true;
+    DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler}; // s0 trilinear clamp
+    DR srv_r     = {0,0,0,1,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 source cube
+    DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 variant mip0 array
+    reshade::api::constant_range push_range = {};
+    push_range.binding = 0;
+    push_range.dx_register_index = 13;
+    push_range.dx_register_space = 0;
+    push_range.count = 2; // srcMip, strength
+    push_range.visibility = DS::all_compute;
+    P p0, p1, p2, pPush;
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &srv_r;
+    p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
+    P params[4] = {p0,p1,p2,pPush};
+    return dev->create_pipeline_layout(4, params, out);
+  };
+  if (!make_variant_layout(&d->dyncube_variant_layout)) return false;
+  if (!ensure(d->dyncube_variant_layout, &d->dyncube_variant_tables, 3)) return false;
+  #ifdef __DynCubeVariantCS_EMBED_FILE
+  if (!__DynCubeVariantCS.empty()) {
+    if (!mkcs(__DynCubeVariantCS, d->dyncube_variant_layout, &d->dyncube_variant_pipeline)) {
+      if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] Variant pipeline create failed");
     }
   }
   #endif
@@ -5577,6 +5762,11 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   d->dyncube_boxCopyPending = false;
   d->dyncube_wasRejected = false;
   d->dyncube_rejectedGap = false;
+  d->dyncube_captureDirty = false;
+  d->dyncube_dirtyFastForward = false;
+  d->dyncube_lastVariantSoften = -1.f;
+  d->dyncube_lastVariantStrength = -1.f;
+  d->dyncube_lastCharCapture = -1.f;
   d->dyncube_hasValidRead = false;
   d->dyncube_resources_created = true;
 }
@@ -5591,6 +5781,11 @@ static void SaveActiveToCache(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_srv = {};
   d->dyncube_uav = {};
   d->dyncube_texture = {};
+  // Variant cube is derived (not cached): drop it here; it rebuilds on demand.
+  if (d->dyncube_variant_cube_srv.handle) { dev->destroy_resource_view(d->dyncube_variant_cube_srv); d->dyncube_variant_cube_srv = {}; }
+  if (d->dyncube_variant_mip0_uav.handle) { dev->destroy_resource_view(d->dyncube_variant_mip0_uav); d->dyncube_variant_mip0_uav = {}; }
+  if (d->dyncube_variant.handle) { dev->destroy_resource(d->dyncube_variant); d->dyncube_variant = {}; }
+  d->dyncube_variant_valid = false;
 }
 
 // Activate a cached set of the given size (returns false if not cached).
@@ -5790,8 +5985,8 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_capture_pipeline);
   auto* tbl = &d->dyncube_capture_tables;
 
-  // Previous set as SRVs (t2 prevColor, t3 prevPos, t4 prevContrib, t5 camPrev) + depth/color (t0/t1) + mrt0 (t6)
-  reshade::api::resource_view srvs[7] = {
+  // Previous set as SRVs (t2 prevColor, t3 prevPos, t4 prevContrib, t5 camPrev) + depth/color (t0/t1) + mrt0 (t6) + vanilla (t7, fallback paint)
+  reshade::api::resource_view srvs[8] = {
       d->captured_depth_srv,
       d->captured_color_srv,
       d->dyncube_hist[prev].color_arr_srv,
@@ -5799,6 +5994,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
       d->dyncube_hist[prev].contrib_arr_srv,
       d->dyncube_cam_srv[prev],
       d->captured_mrt_normal_srv,  // mrtTexture0 for character mask
+      d->captured_vanilla_env_srv,  // game vanilla cube (may be null pre-first-capture: reads 0, today's black)
   };
   // Current set as UAVs (u0 curColor, u1 curPos, u2 curContrib, u3 camCur, u4 charmask)
   reshade::api::resource_view uavs[5] = {
@@ -5811,23 +6007,25 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   reshade::api::descriptor_table_update ups[4];
   ups[0] = {tbl->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler};
   ups[1] = {tbl->at(1), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view};
-  ups[2] = {tbl->at(2), 0, 0, 7, reshade::api::descriptor_type::texture_shader_resource_view, srvs};
+  ups[2] = {tbl->at(2), 0, 0, 8, reshade::api::descriptor_type::texture_shader_resource_view, srvs};
   ups[3] = {tbl->at(3), 0, 0, 5, reshade::api::descriptor_type::texture_unordered_access_view, uavs};
   dev->update_descriptor_tables(4, ups);
   std::array<reshade::api::descriptor_table, 4> tables = {tbl->at(0), tbl->at(1), tbl->at(2), tbl->at(3)};
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 0, 4, tables.data());
 
-  // Push constants (b13): boost, blend, posThreshold(world), posScale, reset, characterCapture, charMaskAvailable
+  // Push constants (b13): boost, blend, posThreshold(world), posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften
   {
     const float posScale = 0.001f;
     float reset = (shader_injection.dynCube_history < 0.5f) ? 1.0f : 0.0f;
     float charCapture = (shader_injection.dynCube_character_capture > 0.5f) ? 1.0f : 0.0f;
     float charMaskAvail = (d->captured_mrt_normal_srv.handle) ? 1.0f : 0.0f;
-    // One-shot fast-forward: first dispatched capture after a rejection gap uses
-    // blend=1.0, which is exactly the hard-replace branch outputs (no lerp with
-    // stale pre-gap history). Consumed here so exactly one capture sees it.
-    const bool fastForward = d->dyncube_rejectedGap;
+    // One-shot fast-forward: first dispatched capture after a rejection gap (or a
+    // capture-content settings change) uses blend=1.0, which is exactly the
+    // hard-replace branch outputs (no lerp with stale pre-gap history).
+    // Consumed here so exactly one capture sees it.
+    const bool fastForward = d->dyncube_rejectedGap || d->dyncube_dirtyFastForward;
     d->dyncube_rejectedGap = false;
+    d->dyncube_dirtyFastForward = false;
     float pc[10] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
         fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
@@ -6032,6 +6230,47 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
   }
   cl->barrier(dst, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   UnbindDynCubeComputeState(cl);
+  return true;
+}
+
+// Global-push variant build: resample the served filtered cube (ggx_out[active])
+// at a fractional mip (soften) and scale it (strength) into the variant cube,
+// served ONLY on non-lighting t17 pushes. Lighting always samples sharp.
+// Runs on rebuild, never per frame.
+static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
+  static const float kVariantMaxBlurMip = 3.0f;  // soften=1 resamples this source LOD
+  if (!cl || !d) return false;
+  if (!d->dyncube_ggx_valid) return false;
+  if (!d->dyncube_variant.handle || !d->dyncube_variant_cube_srv.handle
+      || !d->dyncube_variant_mip0_uav.handle) return false;
+  if (!CreateDynCubePipelinesIfNeeded(cl->get_device(), d)) return false;
+  if (!d->dyncube_variant_pipeline.handle) return false;
+  auto* dev = cl->get_device();
+  const uint32_t mips = d->dyncube_mip_count;
+  const uint32_t sz = d->dyncube_size;
+  const float soften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
+  const float strength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
+  const float srcMip = std::min(soften * kVariantMaxBlurMip, (float)std::max(mips, 1u) - 1.f);
+  cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_variant_pipeline);
+  auto* vt = &d->dyncube_variant_tables;
+  reshade::api::descriptor_table_update vu[3] = {
+      {vt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_linear_sampler},
+      {vt->at(1), 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->dyncube_ggx_out_cube_srv[d->dyncube_ggx_active]},
+      {vt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_variant_mip0_uav},
+  };
+  dev->update_descriptor_tables(3, vu);
+  std::array<reshade::api::descriptor_table, 3> vtables = {vt->at(0), vt->at(1), vt->at(2)};
+  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_variant_layout, 0, 3, vtables.data());
+  float pc[2] = {srcMip, strength};
+  cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_variant_layout, 3, 0, 2, pc);
+  cl->barrier(d->dyncube_variant, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+  cl->dispatch((sz + 7u) / 8u, (sz + 7u) / 8u, 6);
+  cl->barrier(d->dyncube_variant, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  cl->generate_mipmaps(d->dyncube_variant_cube_srv);
+  UnbindDynCubeComputeState(cl);
+  d->dyncube_variant_valid = true;
+  d->dyncube_lastVariantSoften = soften;
+  d->dyncube_lastVariantStrength = strength;
   return true;
 }
 

@@ -116,8 +116,14 @@ void DynCubeSampleDynamic(
     }
   }
   dynCol = envTex.SampleLevel(cubeSampler, finalDir, sampleMip).xyz;
-  // NOTE: capture brightness (DynCubeCaptureBoost) is baked at capture time, so no
-  // sample-time scaling here; the vanilla fallback below is never scaled either.
+  // Package reflection brightness (dynamic + SSR only): mirrors the t17 override
+  // condition so vanilla/debug views stay untouched. Vanilla fallback never scaled.
+  // (Capture brightness stays sample-time by design; only soften bakes at capture.)
+  if (shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_debug != 4.f) {
+    dynCol *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+  }
   // Parallax debug: tint by the probe-box exit face (only on a valid box hit).
   if (shader_injection_data.dynCube_parallax_debug > 0.5f && face >= 0) {
     dynCol = DynCubeParallaxFaceColor(face);

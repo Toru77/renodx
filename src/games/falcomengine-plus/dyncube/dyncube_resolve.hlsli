@@ -30,9 +30,14 @@ void DynCubeResolveSSR(
       // Force Dynamic: keep the dynamic cube sample (dynCol).
       reflSrc = 1;
     } else if (forceSSRActive && newSSRActive) {
-      // Force SSR: use the SSR color directly (brightness already baked at capture).
+      // Force SSR: use the SSR color directly.
       float4 ssrTap = ssrTex.SampleLevel(ssrSampler, ssrUV, 0);
       dynCol = ssrTap.rgb;
+      if (shader_injection_data.dynCube_enabled > 0.5f
+          && shader_injection_data.dynCube_force_vanilla < 0.5f
+          && shader_injection_data.dynCube_debug != 4.f) {
+        dynCol *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+      }
       reflSrc = 0;
     } else {
       const float layerMix = shader_injection_data.dynCube_layer_mix;
@@ -42,7 +47,12 @@ void DynCubeResolveSSR(
       float ssrWeight = 0.0;
       if (newSSRActive) {
         float4 ssrTap = ssrTex.SampleLevel(ssrSampler, ssrUV, 0);
-        ssrCol = ssrTap.rgb;  // brightness already baked at capture
+        ssrCol = ssrTap.rgb;
+        if (shader_injection_data.dynCube_enabled > 0.5f
+            && shader_injection_data.dynCube_force_vanilla < 0.5f
+            && shader_injection_data.dynCube_debug != 4.f) {
+          ssrCol *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
+        }
         ssrConf = ssrTap.a;
         if (layerMix < -0.5f) {
           float minEdge = min(min(ssrUV.x, 1.0 - ssrUV.x), min(ssrUV.y, 1.0 - ssrUV.y));
