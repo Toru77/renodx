@@ -767,6 +767,7 @@ static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
 // ── Dynamic Cubemaps — forward decls ──
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size);
+static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips);
 static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d);
 static void SaveActiveToCache(reshade::api::device* dev, DeviceData* d);
 static bool RestoreFromCache(reshade::api::device* dev, DeviceData* d, uint32_t size);
@@ -2986,7 +2987,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeResolution", .binding = &shader_injection.dynCube_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Resolution", .section = "Dynamic Cubemaps",
+      .default_value = 3.f, .label = "Resolution", .section = "Dynamic Cubemaps",
       .tooltip = "Cubemap face size. 128 = quality eval floor, 1024 = max. Preview rectangle is clamped for visibility.",
       .labels = {"128", "256", "512", "768", "1024"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -2995,7 +2996,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeCharacterCapture", .binding = &shader_injection.dynCube_character_capture,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Character Capture", .section = "Dynamic Cubemaps",
+      .default_value = 0.f, .label = "Character Capture", .section = "Dynamic Cubemaps",
       .tooltip = "OFF = exclude characters from cubemap capture. ON = include characters in cubemap capture.",
       .labels = {"Off (Exclude)", "On (Include)"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3040,7 +3041,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeBlur", .binding = &shader_injection.dynCube_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 5.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
+      .default_value = 3.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
       .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3048,7 +3049,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeUpdateInterval", .binding = &shader_injection.dynCube_capture_interval,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
+      .default_value = 7.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
       .tooltip = "Frames between new cubemap captures (1=fastest 2-stage cadence, 2=every 2 frames, 4=every 4 frames, 8=every 8 frames). Capture and filter run on separate frames; the previous completed cube stays visible between updates.",
       .labels = {"1", "2", "3", "4", "5", "6", "7", "8"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3081,7 +3082,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeCaptureSoften", .binding = &shader_injection.dynCube_capture_soften,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.f, .label = "Capture Soften", .section = "Dynamic Cubemaps",
+      .default_value = 0.4f, .label = "Capture Soften", .section = "Dynamic Cubemaps",
       .tooltip = "Softens globally-pushed dynamic reflections (glass etc.) via a dedicated variant cube. Does not affect the lighting resolve or the vanilla fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3089,7 +3090,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeGlobalStrength", .binding = &shader_injection.dynCube_global_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.f, .label = "Global Reflection Strength", .section = "Dynamic Cubemaps",
+      .default_value = 0.5f, .label = "Global Reflection Strength", .section = "Dynamic Cubemaps",
       .tooltip = "Scales globally-pushed dynamic reflections (glass etc.) so they don't dominate. 1 = full. Does not affect the lighting resolve or the vanilla fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3764,6 +3765,7 @@ static void OnPushDescriptorsCapture(
         float swapSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
         float swapStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
         bool serveVariant = !swapIsLighting && d->dyncube_variant_valid
+            && d->dyncube_variant_cube_srv.handle != 0u
             && (swapSoften > 1e-4f || swapStrength < 1.f - 1e-4f);
         reshade::api::resource_view t17srv;
         if (swapDbg == 3) {
@@ -4062,6 +4064,11 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     if (!reused) {
       CreateDynCubeResources(dev, d, wantSize);
       CreateDynCubePipelinesIfNeeded(dev, d);
+    } else {
+      // Cache hit: variant cube is derived (never cached), so it was dropped by
+      // Save above — recreate it here. Without this, soften/strength stay dead
+      // until the next full Create, with snapshots endlessly mismatched.
+      CreateDynCubeVariantResources(dev, d, d->dyncube_size, d->dyncube_mip_count);
     }
     if (shader_injection.dynCube_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::info,
@@ -4601,6 +4608,11 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         bool wantVariant = (vSoften > 1e-4f || vStrength < 1.f - 1e-4f);
         if (dd->dyncube_ggx_valid && wantVariant
             && (vSoften != dd->dyncube_lastVariantSoften || vStrength != dd->dyncube_lastVariantStrength)) {
+          // Self-healing: variant handles may be gone (e.g. cache-hit restore path
+          // before this fix, driver eviction) — recreate here so the build below can
+          // proceed; RunDynCubeVariant still guards and fails safe otherwise.
+          if (!dd->dyncube_variant.handle)
+            CreateDynCubeVariantResources(dev, dd, dd->dyncube_size, dd->dyncube_mip_count);
           (void)RunDynCubeVariant(cmd_list, dd);
         }
       }
@@ -4934,6 +4946,35 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_solid_written = false;
 }
 
+// Global-push variant cube (soften + strength): same desc/shape as ggx_out (full mip
+// chain for consumer roughness LOD), derived content. Created here and on every path
+// that needs variant handles outside full Create (e.g. cache-hit restore, which never
+// runs Create): variant is intentionally NOT part of the per-size cache.
+static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips) {
+  if (!dev || !d) return false;
+  if (size < 64u) size = 64u;
+  if (mips < 1u) mips = 1u;
+  reshade::api::resource_desc rdv = {};
+  rdv.type = reshade::api::resource_type::texture_2d;
+  rdv.texture = {size, size, 6, (uint16_t)mips, reshade::api::format::r16g16b16a16_float, 1};
+  rdv.heap = reshade::api::memory_heap::gpu_only;
+  rdv.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+  rdv.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;
+  if (!dev->create_resource(rdv, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_variant)) {
+    reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create variant cube");
+    return false;
+  }
+  dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::shader_resource,
+    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                     reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
+    &d->dyncube_variant_cube_srv);
+  dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::unordered_access,
+    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                     reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+    &d->dyncube_variant_mip0_uav);
+  return true;
+}
+
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size) {
   DestroyDynCubeResources(dev, d);
   if (size < 128u) size = 128u;
@@ -5263,26 +5304,9 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     // Global-push variant cube (soften + strength): same desc/shape as ggx_out
     // (full mip chain for consumer roughness LOD), derived content, rebuilt on
     // demand — never part of the per-size cache.
-    {
-      reshade::api::resource_desc rdv = {};
-      rdv.type = reshade::api::resource_type::texture_2d;
-      rdv.texture = {size, size, 6, (uint16_t)mips, reshade::api::format::r16g16b16a16_float, 1};
-      rdv.heap = reshade::api::memory_heap::gpu_only;
-      rdv.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-      rdv.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;
-      if (!dev->create_resource(rdv, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_variant)) {
-        if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create variant cube");
-        DestroyDynCubeResources(dev, d);
-        return false;
-      }
-      dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::shader_resource,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                         reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
-        &d->dyncube_variant_cube_srv);
-      dev->create_resource_view(d->dyncube_variant, reshade::api::resource_usage::unordered_access,
-        reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                         reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-        &d->dyncube_variant_mip0_uav);
+    if (!CreateDynCubeVariantResources(dev, d, size, mips)) {
+      DestroyDynCubeResources(dev, d);
+      return false;
     }
     d->dyncube_variant_valid = false;
     d->dyncube_lastVariantSoften = -1.f;
@@ -5729,6 +5753,7 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   d->dyncube_lastVariantStrength = -1.f;
   d->dyncube_lastCharCapture = -1.f;
   d->dyncube_hasValidRead = false;
+  d->dyncube_variant_valid = false;
   d->dyncube_resources_created = true;
 }
 
@@ -6232,6 +6257,11 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
   d->dyncube_variant_valid = true;
   d->dyncube_lastVariantSoften = soften;
   d->dyncube_lastVariantStrength = strength;
+  if (shader_injection.dynCube_debug_logging > 0.5f) {
+    reshade::log::message(reshade::log::level::info,
+      (std::string("[DynCube] variant built: ") + std::to_string(sz) + "x" + std::to_string(sz) +
+       " srcMip=" + std::to_string(srcMip) + " strength=" + std::to_string(strength)).c_str());
+  }
   return true;
 }
 
