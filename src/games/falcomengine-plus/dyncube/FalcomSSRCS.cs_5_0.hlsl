@@ -278,10 +278,12 @@ void main(uint3 dtid : SV_DispatchThreadID)
         if (dot(hitN_view, R) > 0.0) return;
 
         // Confidence factors.
-        // hitConf: decisive vs grazing/borderline depth crossing (overshoot beyond
-        // the thickness acceptance boundary, relative to step). Subtracting thickness
-        // removes the artificial Thickness/SampleCount/SearchDistance dependence.
-        float hitConf = saturate((penetration - thickness) / max(localStepLen, 1e-3));
+        // hitConf: decisive vs grazing/borderline depth crossing (sink rate past
+        // the surface, relative to step). Thickness gates acceptance above and is
+        // deliberately NOT subtracted here: penetration and localStepLen scale
+        // together with DDA stride, so this ratio is iteration-count invariant,
+        // while a fixed thickness penalty would grow as steps get finer.
+        float hitConf = saturate(penetration / max(localStepLen, 1e-3));
         // distanceConf: far hits lose authority.
         float hitT = length(cur - P);
         float distanceConf = 1.0 - smoothstep(0.0, 1.0, saturate(hitT / maxDist)) * g_distanceFade;

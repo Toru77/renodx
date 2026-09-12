@@ -3324,7 +3324,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRSamples", .binding = &shader_injection.dynCube_ssr_samples,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "SSR Sample Count", .section = "Dynamic Cubemaps",
+      .default_value = 16.f, .label = "SSR Sample Count", .section = "Dynamic Cubemaps",
       .tooltip = "SSR ray-march sample count. Higher = more accurate at higher GPU cost. Old Medium preset = 16.",
       .min = 4.f, .max = 96.f, .format = "%d",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
