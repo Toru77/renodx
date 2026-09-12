@@ -212,6 +212,7 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
+Texture2D<float4> ssrMarchTex : register(t28);  // captured vanilla ssr1 result (replacement debug view 2)
   Texture3D<float4> volumeFogTexture_g : register(t26);
 Texture2D<float4> texCloudShadow : register(t27);
 
@@ -930,13 +931,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       if (dynCubeReflActive) {
         float2 dynCubeSsrUV = resolutionScaling_g.xy * v1.zw;
         float3 dynCubeResolvedA = r21.xyz;
+        float dynCubeUnusedVanillaWA;
         DynCubeResolveSSR(
             dynCubeSSRTex, SmplLinearClamp_s,
             dynCubeVanillaTex, SmplCube_s,
             dynCubeHistPosTex, samPoint_s,
             dynCubeSsrUV, dynCubeReflDir, dynCubeVanillaMipFactor,
             dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-            dynCubeResolvedA, dynCubeReflSrc);
+            dynCubeResolvedA, dynCubeReflSrc, dynCubeUnusedVanillaWA);
         r21.xyz = dynCubeResolvedA;
       }
     }
@@ -1024,13 +1026,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         if (dynCubeReflActive) {
           float2 dynCubeSsrUV2 = resolutionScaling_g.xy * v1.zw;
           float3 dynCubeResolvedB = r21.xyz;
+          float dynCubeUnusedVanillaWB;
           DynCubeResolveSSR(
               dynCubeSSRTex, SmplLinearClamp_s,
               dynCubeVanillaTex, SmplCube_s,
               dynCubeHistPosTex, samPoint_s,
               dynCubeSsrUV2, dynCubeReflDir, dynCubeVanillaMipFactor,
               dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-              dynCubeResolvedB, dynCubeReflSrc);
+              dynCubeResolvedB, dynCubeReflSrc, dynCubeUnusedVanillaWB);
           r21.xyz = dynCubeResolvedB;
         }
       }
@@ -1575,8 +1578,21 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       o0.xyz += giColor;  // Normal: add GI to scene
     }
   }
-  // DynCube/SSR debug views (read-only overrides).
-  if (dynCubeNewSSRActive && (shader_injection_data.dynCube_debug == 9.f
+  // SSR replacement debug views (read-only overrides, evaluated first).
+  // Visualize SSR chain stages fullscreen on lit surfaces: 1 = ssr1 input scene
+  // color, 2 = ssr1 march result, 3 = lighting SSR texture. Value 4 (lighting
+  // color) and 0 mean no override here: fall through to the normal output and
+  // the existing debug views below. For judging what each stage sees.
+  float ssrReplacementDbg = shader_injection_data.dynCube_ssr_replacement_debug;
+  if (ssrReplacementDbg > 0.5f && ssrReplacementDbg < 3.5f) {
+    if (ssrReplacementDbg < 1.5f) {
+      o0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;  // ssr1 input
+    } else if (ssrReplacementDbg < 2.5f) {
+      o0.xyz = ssrMarchTex.SampleLevel(SmplLinearClamp_s, v1.xy, 0).rgb;  // ssr1 march result
+    } else {
+      o0.xyz = texSSRMap_g.SampleLevel(SmplLinearClamp_s, v1.xy, 0).rgb;  // lighting SSR texture
+    }
+  } else if (ssrReplacementDbg < 0.5f && dynCubeNewSSRActive && (shader_injection_data.dynCube_debug == 9.f
       || shader_injection_data.dynCube_debug == 10.f
       || shader_injection_data.dynCube_debug == 12.f || shader_injection_data.dynCube_debug == 13.f)) {
     float2 ssrUV = resolutionScaling_g.xy * v1.zw;
@@ -1592,7 +1608,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       float edgeConf = smoothstep(0.0, max(shader_injection_data.dynCube_ssr_edge_fade * 0.25, 1e-4), minEdge);
       o0.xyz = float3(edgeConf, edgeConf, edgeConf);  // SSR Edge Fade
     }
-  } else if (dynCubeReflResolveActive && shader_injection_data.dynCube_debug == 11.f) {
+  } else if (ssrReplacementDbg < 0.5f && dynCubeReflResolveActive && shader_injection_data.dynCube_debug == 11.f) {
     // Reflection Source: RED=SSR, GREEN=Dynamic, BLUE=Vanilla.
     o0.xyz = !dynCubeReflActive ? float3(0, 0, 0)
            : (dynCubeReflSrc == 0) ? float3(1, 0, 0)

@@ -13,6 +13,10 @@
 // Resources are explicit parameters — no registers are declared here.
 // dynCol/reflSrc are inout because the caller seeds them (dynamic sample,
 // default source) and the resolver overwrites them on taken paths.
+// outVanillaWeight reports the vanilla fraction of the final blend (0 = fully
+// SSR/dynamic, 1 = fully vanilla) so consumers that encode confidence separately
+// (e.g. a downstream SSR target expecting w = non-vanilla weight) need no blend
+// re-derivation. Always assigned, including the !reflActive path (1.0 = vanilla).
 
 #ifndef __DYNCUBE_RESOLVE_HLSLI__
 #define __DYNCUBE_RESOLVE_HLSLI__
@@ -23,12 +27,14 @@ void DynCubeResolveSSR(
     TextureCube<float4> histPosTex, SamplerState pointSampler,
     float2 ssrUV, float3 reflDir, float vanillaMipFactor,
     bool reflActive, bool forceDynamicActive, bool forceSSRActive, bool newSSRActive,
-    inout float3 dynCol, inout int reflSrc)
+    inout float3 dynCol, inout int reflSrc, out float outVanillaWeight)
 {
+  outVanillaWeight = 1.0;
   if (reflActive) {
     if (forceDynamicActive) {
       // Force Dynamic: keep the dynamic cube sample (dynCol).
       reflSrc = 1;
+      outVanillaWeight = 0.0;
     } else if (forceSSRActive && newSSRActive) {
       // Force SSR: use the SSR color directly.
       float4 ssrTap = ssrTex.SampleLevel(ssrSampler, ssrUV, 0);
@@ -39,6 +45,7 @@ void DynCubeResolveSSR(
         dynCol *= clamp(shader_injection_data.dynCube_capture_boost, 0.0, 8.0);
       }
       reflSrc = 0;
+      outVanillaWeight = 0.0;
     } else {
       const float layerMix = shader_injection_data.dynCube_layer_mix;
       // SSR color + confidence (only when SSR active); ssrWeight computed only for automatic mode.
@@ -119,6 +126,7 @@ void DynCubeResolveSSR(
           dynCol = lerp(dynLayer, vanLayer, u);
           reflSrc = (u < 0.5f) ? (dynUsable ? 1 : 2) : 2;
         }
+        outVanillaWeight = (reflSrc == 2) ? 1.0 : 0.0;
       } else {
         // Automatic confidence blend (weights always sum to 1).
         float remaining = 1.0 - ssrWeight;
@@ -127,6 +135,7 @@ void DynCubeResolveSSR(
         dynCol = ssrCol * ssrWeight + dynCol * dynamicWeight + vanillaCol * vanillaWeight;
         reflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
                  : (dynamicWeight >= vanillaWeight) ? 1 : 2;
+        outVanillaWeight = vanillaWeight;
       }
     }
   }

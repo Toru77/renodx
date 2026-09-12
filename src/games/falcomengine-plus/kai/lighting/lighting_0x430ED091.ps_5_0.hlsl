@@ -1581,13 +1581,14 @@ void main(
         dynCubeReflActive = true;
         // ── SSR > Dynamic > Vanilla resolution (shared, see dyncube_resolve.hlsli) ──
         float3 kaiResolvedA = r20.xyz;
+        float kaiUnusedVanillaW;
         DynCubeResolveSSR(
             dynCubeSSRTex, SmplLinearClamp_s,
             dynCubeVanillaTex, SmplCube_s,
             dynCubeHistPosTex, samPoint_s,
             v1.xy, dynCubeReflDir, dynCubeVanillaMipFactor,
             dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-            kaiResolvedA, dynCubeReflSrc);
+            kaiResolvedA, dynCubeReflSrc, kaiUnusedVanillaW);
         r20.xyz = kaiResolvedA;
       }
     }
