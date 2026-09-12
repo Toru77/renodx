@@ -154,9 +154,9 @@ struct ShaderInjectData {
 
   // ── Kai / Daybreak 2 cubemap fields ──
   // Cubemap
-  float cubemap_improvements_enabled;  // 0=Vanilla, 1=Improved
-  float cubemap_lighting_mip_boost;    // [0.5..4], default 1.5 — lighting shader cubemap mip scale
-  float floor_cubemap_mip_scale;       // [0..4], default 4 — floor reflection roughness/mip response
+  float cubemap_improvements_enabled;  // UNUSED (Improved Cubemap removed): kept for b13 layout stability, always init 1
+  float cubemap_lighting_mip_boost;    // UNUSED (Improved Cubemap removed): kept for b13 layout stability, always init 1.5
+  float floor_cubemap_mip_scale;       // UNUSED (Improved Cubemap removed): kept for b13 layout stability, always init 4
   // SSGI (Falcom native, not GTVBAO)
   float ssgi_mod_enabled;              // 0=Off, 1=On
   float ssgi_color_boost;              // [0..3], default 1 — scales SSGI RGB before power shaping

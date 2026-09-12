@@ -1154,23 +1154,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeCharLightingDraw,
         },
     },
-    // ── Kai cubemap (10 glass + floor shaders) ──
-    // Glass t17 override is handled globally in OnPushDescriptorsCapture
-    // (512/1024 UNORM cube criterion), so no per-shader callbacks are needed.
-    CustomShaderEntryCallback(0xB1CCBCAE, nullptr),
-    CustomShaderEntryCallback(0x1A17A133, nullptr),
-    CustomShaderEntryCallback(0xCA715B78, nullptr),
-    CustomShaderEntryCallback(0xE1E0ACBB, nullptr),
-    CustomShaderEntryCallback(0xF237E72F, nullptr),
-    CustomShaderEntryCallback(0x07E984A7, nullptr),
-    CustomShaderEntryCallback(0xFDC5CDBF, nullptr),
-    CustomShaderEntryCallback(0x8337B262, nullptr),
-    CustomShaderEntryCallback(0xD97BD91B, nullptr),
-    CustomShaderEntryCallback(0xEFB6AC0F, nullptr),
-    // ── Daybreak 2 cubemap (3 glass shaders) ──
-    CustomShaderEntryCallback(0xE01674A5, nullptr),
-    CustomShaderEntryCallback(0xF19E927D, nullptr),
-    CustomShaderEntryCallback(0x27748076, nullptr),
+    // ── Kai cubemap shaders stay vanilla (no CustomShaderEntry overrides) ──
+    // ── Daybreak 2 cubemap shaders stay vanilla (no CustomShaderEntry overrides) ──
     // ── Daybreak 2 volumetric fog (Haze AA) ──
     CustomShaderEntryCallback(0x9A49E6E9, nullptr),
     // ── Daybreak 2 character lighting (Env SSS + Character Shadowing) ──
@@ -1279,30 +1264,6 @@ renodx::utils::settings::Settings settings = {
     },
 
     // ═══════════ Kai / Daybreak 2 - Specific Sections ═══════════
-
-    // ── Cubemap ──
-    new renodx::utils::settings::Setting{
-      .key = "CubemapImprovements", .binding = &shader_injection.cubemap_improvements_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Mode", .section = "Cubemap",
-      .labels = {"Vanilla", "Improved"},
-      .is_visible = []() { return IsKai() || IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "LightingCubemapMipBoost", .binding = &shader_injection.cubemap_lighting_mip_boost,
-      .default_value = 1.5f, .label = "Lighting Mip Boost", .section = "Cubemap",
-      .tooltip = "Lighting shader cubemap mip scale. Default is 1.5x.",
-      .min = 0.5f, .max = 4.f, .format = "%.1fx",
-      .is_enabled = []() { return shader_injection.cubemap_improvements_enabled >= 0.5f; },
-      .is_visible = []() { return (IsKai() || IsDaybreak2()) && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "FloorCubemapMipScale", .binding = &shader_injection.floor_cubemap_mip_scale,
-      .default_value = 4.f, .label = "Floor Mip Scale", .section = "Cubemap",
-      .tooltip = "Scales floor reflection roughness/mip response. 1.0 = Vanilla.",
-      .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_visible = []() { return (IsKai() || IsDaybreak2()) && IsAdvancedSettingsMode(); },
-    },
 
     // ── SSGI (Falcom) ──
     new renodx::utils::settings::Setting{

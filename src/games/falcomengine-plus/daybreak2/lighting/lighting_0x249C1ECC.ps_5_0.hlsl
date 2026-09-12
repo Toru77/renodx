@@ -190,10 +190,6 @@ void main(
 {
   float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22;
 
-  float cubemap_mode = shader_injection_data.cubemap_improvements_enabled;
-  float cubemap_improved_factor = saturate(cubemap_mode);
-  float cubemap_lighting_mip_boost = clamp(shader_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0);
-
   r0.xyzw = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyzw;
   {
     uint mrtW, mrtH, mrtMips;
@@ -906,7 +902,7 @@ void main(
       }
       r19.xyz = float3(1, -1, -1) * r19.xyz;
       r12.w = r8.z * r12.w;
-      r13.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r19.xyz, r12.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
+      r13.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r19.xyz, r12.w).xyz;
     }
     r12.w = (int)r3.z & 2;
     if (r12.w != 0) {
@@ -934,14 +930,6 @@ void main(
     r13.xyz = r13.xyz * r8.yyy;
     r13.xyz = r13.xyz * r6.xxx;
     r6.x = -r4.y * r14.z + 1;
-    if (cubemap_improved_factor >= 0.5 && r4.x == 0) {
-      float skylight_lum = max(0, dot(r13.xyz, float3(0.2126, 0.7152, 0.0722)));
-      float skylight_factor = smoothstep(0.0, 0.25, skylight_lum);
-      skylight_factor *= lerp(0.5, 1.0, saturate(r14.z));
-      skylight_factor *= lerp(0.4, 1.0, saturate(r6.x));
-      skylight_factor = lerp(0.3, 1.0, skylight_factor);
-      r13.xyz = max(float3(0, 0, 0), r13.xyz * skylight_factor);
-    }
     r13.xyz = r13.xyz * r6.xxx + r10.xyz;
     r10.xyz = r4.xxx ? r10.xyz : r13.xyz;
   } else {
@@ -968,14 +956,14 @@ void main(
       }
       r13.xyz = float3(1, -1, -1) * r13.xyz;
       r0.w = r4.x * r0.w;
-      r13.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r13.xyz, r0.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
+      r13.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r13.xyz, r0.w).xyz;
       r4.x = (int)r3.z & 2;
       if (r4.x != 0) {
         r20.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, v1.xy, 0).xyzw;
         r20.xyz = r20.xyz + -r13.xyz;
         r13.xyz = r20.www * r20.xyz + r13.xyz;
       }
-      r17.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r17.xyz, r0.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
+      r17.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r17.xyz, r0.w).xyz;
       r0.w = cmp(0 < r15.x);
       r4.x = 1 + -abs(r5.w);
       r4.x = max(0, r4.x);

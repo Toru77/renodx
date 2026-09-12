@@ -325,9 +325,6 @@ void main(
   float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16,r17,r18,r19,r20,r21,r22,r23,r24;
   uint4 bitmask, uiDest;
   float4 fDest;
-  float cubemap_mode = shader_injection_data.cubemap_improvements_enabled;
-  float cubemap_improved_factor = saturate(cubemap_mode);
-  float cubemap_lighting_mip_boost = clamp(shader_injection_data.cubemap_lighting_mip_boost, 0.5, 4.0);
   bool exp_fog_color_correction_enabled = shader_injection_data.fog_color_correction_enabled >= 0.5;
   float exp_fog_hue = clamp(shader_injection_data.fog_hue, 0.0, 2.0);
   float exp_fog_chrominance = clamp(shader_injection_data.fog_chrominance, 0.0, 2.0);
@@ -1305,9 +1302,9 @@ void main(
       float3 exp_probe_dir_ws = normalize(r21.xyz);
       // Dynamic Cubemap + SSR (shared implementation, see dyncube_sample/resolve.hlsli).
       // DynCube OFF / force-vanilla runs the original vanilla path verbatim below, so the
-      // disabled behavior is bit-identical. kaiRoughBoostA carries Kai's native mip-boost
-      // mapping into both the dynamic sample and the vanilla fallback.
-      float kaiRoughBoostA = r16.y * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor);
+      // disabled behavior is bit-identical. kaiRoughBoostA carries Kai's native
+      // roughness mapping into both the dynamic sample and the vanilla fallback.
+      float kaiRoughBoostA = r16.y;
       dynCubeVanillaMipFactor = kaiRoughBoostA;
       float3 kaiSampleColA = float3(0, 0, 0);
       float3 kaiSampleFinalA = float3(0, 0, 0);
@@ -1324,7 +1321,7 @@ void main(
       r20.xyz = texEnvMap_g.SampleLevel(
           SmplCube_s,
           r21.xyz,
-          r7.w * lerp(1.0, cubemap_lighting_mip_boost, cubemap_improved_factor)).xyz;
+          r7.w).xyz;
       } else {
         DynCubeSampleDynamic(
             texEnvMap_g, SmplCube_s,
@@ -1372,15 +1369,6 @@ void main(
     r16.xyz = r20.xyz * r7.www;
     r16.xyz = r16.xyz * r6.xxx;
     r6.x = -r4.z * r13.z + 1;
-    if (cubemap_improved_factor >= 0.5 && r4.y == 0) {
-      // Improved: skylight luminance modulation with roughness/AO shaping.
-      r13.y = max(0, dot(r20.xyz, float3(0.2126,0.7152,0.0722)));
-      r13.w = smoothstep(0.0, 0.25, r13.y);
-      r13.w = r13.w * lerp(0.5, 1.0, saturate(r13.z));
-      r13.w = r13.w * lerp(0.4, 1.0, saturate(r6.x));
-      r13.w = lerp(0.3, 1.0, r13.w);
-      r16.xyz = max(float3(0,0,0), r16.xyz * r13.www);
-    }
     r16.xyz = r16.xyz * r6.xxx + r9.xyz;
     r9.xyz = r4.y ? r9.xyz : r16.xyz;
   } else {
