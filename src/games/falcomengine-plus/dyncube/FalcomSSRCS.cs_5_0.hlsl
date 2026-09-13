@@ -39,8 +39,8 @@ cbuffer cb_ssr : register(b13)
     float g_isfastTemporal;  // [0..5] noise animation speed, 0 = frozen slice
     float g_isfastSeed;      // seed offset [0..64]
     float g_charComp;        // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
-    float g_charShift;       // bit shift applied to the selected component (Sora 0, Kai 8)
-    float g_isfastPad;       // padding (push-constant alignment)
+    float g_charShift;       // bit shift applied to the selected component (Sora 0, Kai 8, Sora1st 3)
+    float g_charInvert;      // 0 = set bit means character (Sora/Kai), 1 = clear bit means character (Sora1st: char = !(mrt.w & 8)); repurposed pad slot, push count unchanged
 };
 
 Texture2D<float4> g_colorTex : register(t0);
@@ -310,8 +310,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
             uint4 hitMrt = g_mrt0Tex.Load(int3(hitPx, 0));
             uint hitWord = (g_charComp > 0.5f) ? hitMrt.z : hitMrt.w;
             uint origWord = (g_charComp > 0.5f) ? mrtOrigin.z : mrtOrigin.w;
-            bool charHit  = (((hitWord >> (uint)g_charShift) & 1u) != 0u);
-            bool charOrig = (((origWord >> (uint)g_charShift) & 1u) != 0u);
+            bool charHit  = ((((hitWord >> (uint)g_charShift) & 1u) != 0u) != (g_charInvert > 0.5f));
+            bool charOrig = ((((origWord >> (uint)g_charShift) & 1u) != 0u) != (g_charInvert > 0.5f));
             if (charHit && !charOrig) {
                 float upness = abs(n_world.y);
                 float upLo = max(g_charOccUpness - 0.25, 0.0);

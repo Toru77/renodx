@@ -414,6 +414,30 @@ static bool IsSora2nd() {
   return is_sora2nd;
 }
 
+// ── Sora 1st detection ──
+static bool IsSora1st() {
+  static bool checked = false;
+  static bool is_sora1st = false;
+  if (!checked) {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string name(exePath);
+    auto lastSlash = name.find_last_of("\\/");
+    if (lastSlash != std::string::npos) name = name.substr(lastSlash + 1);
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    is_sora1st = (name == "sora_1st.exe");
+    checked = true;
+  }
+  return is_sora1st;
+}
+
+// ── Dynamic Cubemap t17 supported games ──
+// The global t17 vanilla-capture + dynamic override only serve Kai, Sora 1st and
+// Sora 2nd. Every other game keeps fully vanilla cubemap bindings.
+static bool IsDynCubeT17Game() {
+  return IsKai() || IsSora1st() || IsSora2nd();
+}
+
 // ── Daybreak 2 detection ──
 static bool IsDaybreak2() {
   static bool checked = false;
@@ -794,6 +818,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
+static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list);
+static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
@@ -1023,6 +1049,19 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .code = __0x17F931DE,
             .on_replace = OnReplaceSoraSSR2Draw,
             .on_draw = OnBeforeSoraSSR2Draw,
+        },
+    },
+    // ── Sora 1st SSR (fused march + temporal, replacement-gated) ──
+    // NOTE: the single pass runs the vanilla march inline and temporally filters
+    // it; the composite resolves march > dynamic > vanilla and keeps the vanilla
+    // temporal stage. Otherwise the game draws vanilla.
+    {
+        0x8B35370Au,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x8B35370Au,
+            .code = __0x8B35370A,
+            .on_replace = OnReplaceSora1stSSRDraw,
+            .on_draw = OnBeforeSora1stSSRDraw,
         },
     },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
@@ -3439,7 +3478,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeSSRReplacement", .binding = &shader_injection.dynCube_ssr_replacement,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "SSR Replacement", .section = "Dynamic Cubemaps",
-      .tooltip = "Replace Sora2nd ssr2 resolve with the DynCube composite (vanilla march + dynamic cubemap + vanilla fallback) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla ssr2. Off = fully vanilla SSR chain, nothing touched.",
+      .tooltip = "Replace the Sora (1st/2nd) water SSR resolve with the DynCube composite (game march + dynamic cubemap + vanilla fallback) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
@@ -3447,7 +3486,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeGameSSR", .binding = &shader_injection.dynCube_game_ssr,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Game SSR", .section = "Dynamic Cubemaps",
-      .tooltip = "Run the game's own ssr1 march and feed it to the SSR Replacement composite (vanilla reflection, then dynamic cubemap, then vanilla fallback). Off skips the march: water receives dynamic cubemap + vanilla fallback only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
+      .tooltip = "Run the game's own SSR march and feed it to the SSR Replacement composite (game reflection, then dynamic cubemap, then vanilla fallback). Off skips the march: water receives dynamic cubemap + vanilla fallback only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_replacement > 0.5f; },
     },
@@ -3804,9 +3843,11 @@ static void OnPushDescriptorsCapture(
     // refreshed on every bind so game reallocations/resizes can never leave a stale
     // handle and the pre-first-capture window collapses to ~zero. Strict criterion
     // via IsVanillaEnvCubeView (also self-excludes our own pushes). Only when
-    // Dynamic Cubemaps is enabled (no work when off).
+    // Dynamic Cubemaps is enabled (no work when off). Supported games only
+    // (Kai, Sora 1st, Sora 2nd).
     if (update.binding == 17u && update.count >= 1
         && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f
+        && IsDynCubeT17Game()
         && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))
         && IsVanillaEnvCubeView(device, views[0])) {
       d->captured_vanilla_env_srv = views[0];
@@ -3823,8 +3864,10 @@ static void OnPushDescriptorsCapture(
     // terminates; a static guard makes this airtight regardless.
     // The vanilla capture above requires no lighting hash, so our pushes here
     // can never poison the vanilla fallback (criterion excludes them anyway).
+    // Supported games only (Kai, Sora 1st, Sora 2nd).
     if (update.binding == 17u && update.count >= 1
         && views[0].handle != 0u && shader_injection.dynCube_enabled > 0.5f
+        && IsDynCubeT17Game()
         && shader_injection.dynCube_force_vanilla < 0.5f
         && (int)shader_injection.dynCube_debug != 4
         && (static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) {
@@ -4487,6 +4530,84 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
 // ssr2 code replacement gate: false keeps the vanilla shader (still draws).
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   return SoraSSRReplaceActive(cmd_list);
+}
+
+// ── Sora1st SSR Replacement (fused march + temporal composite) ──
+// Master gate mirrors the Sora2nd one (shared toggles), minus any mrt capture
+// requirement: the composite reads mrt0 from the game-bound t2, exactly like
+// the vanilla pass it replaces, so no capture can starve serving.
+static bool Sora1stSSRReplaceActive(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return false;
+  if (shader_injection.dynCube_ssr_replacement < 0.5f) return false;
+  if (shader_injection.dynCube_enabled < 0.5f
+      || shader_injection.dynCube_force_vanilla > 0.5f
+      || shader_injection.dynCube_debug == 4.f) return false;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return false;
+  auto* dd = dev->get_private_data<DeviceData>();
+  if (!dd) return false;
+  if (!dd->captured_vanilla_env_srv.handle) return false;
+  reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
+      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+      : dd->dyncube_srv;
+  if (!t17srv.handle) return false;
+  return true;
+}
+
+// sora1st ssr: push everything the composite PS needs (game binds
+// t0/t1/t2/t3/t4/s0/s1/b0/b2). No custom-SSR pushes: the composite resolves the
+// inline vanilla march, never t31. Pushes only when the composite serves;
+// otherwise vanilla draws untouched.
+static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list) {
+  if (!Sora1stSSRReplaceActive(cmd_list)) return true;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return true;
+  auto* dd = dev->get_private_data<DeviceData>();
+  if (!dd) return true;
+  reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
+      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+      : dd->dyncube_srv;
+  if (t17srv.handle) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kDynCubeRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &t17srv});
+  }
+  if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
+    auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kDynCubeHistPosRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &histPosSrv});
+  }
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel,
+      reshade::api::pipeline_layout{0}, 0,
+      reshade::api::descriptor_table_update{
+          {}, kDynCubeVanillaRegister, 0, 1,
+          reshade::api::descriptor_type::texture_shader_resource_view,
+          &dd->captured_vanilla_env_srv});
+  if (dd->dyncube_worldbox_bounds_srv.handle) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kDynCubeWorldBoxRegister, 0, 1,
+            reshade::api::descriptor_type::buffer_shader_resource_view,
+            &dd->dyncube_worldbox_bounds_srv});
+  }
+  return true;
+}
+
+// sora1st ssr code replacement gate: false keeps the vanilla shader (still draws).
+static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list) {
+  return Sora1stSSRReplaceActive(cmd_list);
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
@@ -5579,7 +5700,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 10; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften
+    push_range.count = 11; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -5731,7 +5852,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 18; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, charComp, charShift, pad
+    push_range.count = 18; // sampleCount, maxDist, thickness, distanceFade, edgeFade, grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound, isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, charComp, charShift, charInvert
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -6190,7 +6311,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   std::array<reshade::api::descriptor_table, 4> tables = {tbl->at(0), tbl->at(1), tbl->at(2), tbl->at(3)};
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 0, 4, tables.data());
 
-  // Push constants (b13): boost, blend, posThreshold(world), posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften
+  // Push constants (b13): boost, blend, posThreshold(world), posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert
   {
     const float posScale = 0.001f;
     float reset = (shader_injection.dynCube_history < 0.5f) ? 1.0f : 0.0f;
@@ -6203,7 +6324,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     const bool fastForward = d->dyncube_rejectedGap || d->dyncube_dirtyFastForward;
     d->dyncube_rejectedGap = false;
     d->dyncube_dirtyFastForward = false;
-    float pc[10] = {
+    float pc[11] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
         fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
         std::max(0.f, shader_injection.dynCube_history_pos_threshold),
@@ -6211,12 +6332,13 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
         reset,
         charCapture,
         charMaskAvail,
-        // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0.
+        // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0; Sora1st mrt.w bit 3, inverted.
         IsKai() ? 1.f : 0.f,
-        IsKai() ? 8.f : 0.f,
+        IsKai() ? 8.f : (IsSora1st() ? 3.f : 0.f),
         std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f),
+        IsSora1st() ? 1.f : 0.f,
     };
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 10, pc);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 11, pc);
   }
 
   uint32_t sz = d->dyncube_size;
@@ -6532,10 +6654,10 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
       std::clamp(shader_injection.dynCube_ssr_isfast_spatial, 0.25f, 4.f),
       std::clamp(shader_injection.dynCube_ssr_isfast_temporal, 0.f, 5.f),
       std::clamp(g_isfast_seed_offset, 0.f, 64.f),
-      // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0.
+      // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0; Sora1st mrt.w bit 3, inverted.
       IsKai() ? 1.f : 0.f,
-      IsKai() ? 8.f : 0.f,
-      0.f,
+      IsKai() ? 8.f : (IsSora1st() ? 3.f : 0.f),
+      IsSora1st() ? 1.f : 0.f,
   };
   cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 18, pc);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);

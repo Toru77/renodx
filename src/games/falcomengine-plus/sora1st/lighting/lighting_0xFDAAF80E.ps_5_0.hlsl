@@ -199,8 +199,17 @@ Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
 Texture2D<float4> texMirror_g : register(t21);
 Texture2D<float4> texSSRMap_g : register(t24);
+TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history world pos (.a = capture validity)
+TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
+Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
+Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
+StructuredBuffer<float4> dynCubeWorldBox : register(t33);  // persistent world-space AABB ([0]=min+valid, [1]=max+spare)
 
 #include "../../shared.h"
+#include "../../dyncube/parallax_cubemap.hlsli"
+#include "../../dyncube/dyncube_spatial.hlsli"
+#include "../../dyncube/dyncube_sample.hlsli"
+#include "../../dyncube/dyncube_resolve.hlsli"
 #include "../../reference/brdf.hlsli"
 
 
@@ -781,6 +790,35 @@ void main(
   r8.w = r16.y ? r8.w : 0;
   r9.xyz = r8.www * r9.xyz;
   r9.xyz = lightColor_g.xyz * r9.xyz;
+  // SSR -> Dynamic -> Vanilla reflection source resolution.
+  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_ssr_enabled > 0.5f;
+  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_force_dynamic > 0.5f;
+  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_force_ssr > 0.5f;
+  bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
+    && shader_injection_data.dynCube_force_vanilla < 0.5f;
+  // Debug A/B: negate the world reflection ray used by box-parallax correction.
+  // OFF = mathematical reflect(pixel->camera, N). ON = physical ray (the game's (1,-1,-1) flips to it).
+  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
+  float3 dynCubeReflDir = float3(0, 0, 0);
+  float dynCubeVanillaMipFactor = 0.0;   // game roughness->mip factor, for the vanilla fallback's own mip chain
+  bool dynCubeReflActive = false;
+  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
+  // Spatial-reprojection gate prefetch (experimental master toggle only).
+  // Fetches the SSR confidence early so the search below runs solely on
+  // weak/missing SSR pixels; the existing resolve tap later is untouched.
+  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
+  float dynCubeSsrGateConf = 1.0f;
+  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
+    float2 dynCubeSsrGateUV = resolutionScaling_g.xy * v1.zw;
+    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, dynCubeSsrGateUV, 0).a;
+  }
   if (r16.z != 0) {
     r16.xz = r13.yz * r7.yz;
     r7.y = (int)r1.w & 32;
@@ -791,18 +829,60 @@ void main(
     } else {
       r8.w = r6.z + r6.z;
       r18.xyz = r6.xyw * -r8.www + r15.xyz;
-      texEnvMap_g.GetDimensions(0, width, height, num_levels);
-      r18.xyz = float3(1,-1,-1) * r18.xyz;
-      r8.w = (float)(num_levels - 1);
-      r8.w = r16.z * r8.w;
-      r17.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r18.xyz, r8.w).xyz;
+      dynCubeVanillaMipFactor = r16.z;
+      // Dynamic-cubemap lookup chain (parallax, mip/flip/tilt, spatial search,
+      // sample, boost, face debug) — shared implementation, see dyncube_sample.hlsli.
+      // r16.z is the Sora roughness factor; r18.xyz is the pre-parallax world ray.
+      float3 dynCubeSampleColA;
+      float3 dynCubeSampleFinalA;
+      int parallaxFace;
+      uint dynCubeNumLevelsA;
+      float dynCubeUnusedMipA;  // site A never reuses the sample mip afterwards
+      DynCubeSampleDynamic(
+          texEnvMap_g, SmplCube_s,
+          dynCubeHistPosTex, samPoint_s,
+          dynCubeWorldBox,
+          r5.xyz, r18.xyz, r16.z, dynCubeReflectSign, viewInv_g._m30_m31_m32,
+          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+          dynCubeSampleColA, dynCubeSampleFinalA, parallaxFace,
+          dynCubeNumLevelsA, dynCubeUnusedMipA);
+      r17.xyz = dynCubeSampleColA;
+      num_levels = dynCubeNumLevelsA;
+      // Record the final sampled direction (including lookup flip and any spatial
+      // reprojection) so validity and vanilla fallback test the texel actually
+      // displayed, not its antipode.
+      dynCubeReflDir = dynCubeSampleFinalA;
+      dynCubeReflActive = true;
     }
-    r8.w = (int)r1.z & 2;
-    if (r8.w != 0) {
-      r18.xy = resolutionScaling_g.xy * v1.zw;
-      r18.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r18.xy, 0).xyzw;
+    if (!dynCubeReflResolveActive) {
+      // ── Existing vanilla SSR eligibility + blend (kept when no new SSR/force path) ──
+      r8.w = (int)r1.z & 2;
+      bool ssrVanillaElig = (r8.w != 0);
+      if (ssrVanillaElig) {
+        r18.xy = resolutionScaling_g.xy * v1.zw;
+        r18.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r18.xy, 0).xyzw;
+      } else {
+        r18.xyzw = float4(0, 0, 0, 0);   // no SSR contribution on this pixel
+      }
+      // Environment-vs-SSR replacement blend (AMD SSSR fallback model):
+      // α=0 → cubemap unchanged · α=1 → SSR replaces · intermediate blends.
       r18.xyz = r18.xyz + -r17.xyz;
       r17.xyz = r18.www * r18.xyz + r17.xyz;
+    } else {
+      // ── SSR > Dynamic > Vanilla resolution (shared implementation, see dyncube_resolve.hlsli) ──
+      if (dynCubeReflActive) {
+        float2 dynCubeSsrUV = resolutionScaling_g.xy * v1.zw;
+        float3 dynCubeResolvedA = r17.xyz;
+        float dynCubeUnusedVanillaWA;
+        DynCubeResolveSSR(
+            dynCubeSSRTex, SmplLinearClamp_s,
+            dynCubeVanillaTex, SmplCube_s,
+            dynCubeHistPosTex, samPoint_s,
+            dynCubeSsrUV, dynCubeReflDir, dynCubeVanillaMipFactor,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+            dynCubeResolvedA, dynCubeReflSrc, dynCubeUnusedVanillaWA);
+        r17.xyz = dynCubeResolvedA;
+      }
     }
     r8.w = cmp(0 < r2.x);
     r11.w = 1 + -abs(r6.z);
@@ -843,19 +923,75 @@ void main(
       r15.xyz = r1.www * -r15.xyz + -r19.xyz;
       r15.xyz = r7.yyy ? r15.xyz : 0;
       r1.w = r13.z * r7.z;
-      texEnvMap_g.GetDimensions(0, width, height, num_levels);
-      r17.xyz = float3(1,-1,-1) * r17.xyz;
-      r2.x = (float)(num_levels - 1);
-      r1.w = r2.x * r1.w;
-      r17.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r17.xyz, r1.w).xyz;
-      r2.x = (int)r1.z & 2;
-      if (r2.x != 0) {
-        r13.yw = resolutionScaling_g.xy * v1.zw;
-        r19.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r13.yw, 0).xyzw;
+      dynCubeVanillaMipFactor = r1.w;
+      // Dynamic-cubemap lookup chain — shared implementation, see dyncube_sample.hlsli.
+      // r1.w is the Sora roughness factor here; it is reloaded with the sample mip
+      // afterwards because the transmission tap below rescales it onto the vanilla chain.
+      // r17.xyz is the pre-parallax world ray.
+      float3 dynCubeSampleColB;
+      float3 dynCubeSampleFinalB;
+      int parallaxFace2;
+      uint dynCubeNumLevelsB;
+      float dynCubeSampleMipB;
+      DynCubeSampleDynamic(
+          texEnvMap_g, SmplCube_s,
+          dynCubeHistPosTex, samPoint_s,
+          dynCubeWorldBox,
+          r5.xyz, r17.xyz, r1.w, dynCubeReflectSign, viewInv_g._m30_m31_m32,
+          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+          dynCubeSampleColB, dynCubeSampleFinalB, parallaxFace2,
+          dynCubeNumLevelsB, dynCubeSampleMipB);
+      r17.xyz = dynCubeSampleColB;
+      r1.w = dynCubeSampleMipB;
+      num_levels = dynCubeNumLevelsB;
+      // Record the final sampled direction (including lookup flip and any spatial
+      // reprojection) so validity and vanilla fallback test the texel actually
+      // displayed, not its antipode.
+      dynCubeReflDir = dynCubeSampleFinalB;
+      dynCubeReflActive = true;
+      if (!dynCubeReflResolveActive) {
+        // ── Existing vanilla SSR eligibility + blend (site 2, kept when no new SSR/force path) ──
+        r2.x = (int)r1.z & 2;
+        bool ssrVanillaElig2 = (r2.x != 0);
+        if (ssrVanillaElig2) {
+          r13.yw = resolutionScaling_g.xy * v1.zw;
+          r19.xyzw = texSSRMap_g.SampleLevel(SmplLinearClamp_s, r13.yw, 0).xyzw;
+        } else {
+          r19.xyzw = float4(0, 0, 0, 0);
+        }
+        // Environment-vs-SSR replacement blend (site 2).
         r19.xyz = r19.xyz + -r17.xyz;
         r17.xyz = r19.www * r19.xyz + r17.xyz;
+      } else {
+        // ── SSR > Dynamic > Vanilla resolution (site 2; shared implementation, see dyncube_resolve.hlsli) ──
+        if (dynCubeReflActive) {
+          float2 dynCubeSsrUV2 = resolutionScaling_g.xy * v1.zw;
+          float3 dynCubeResolvedB = r17.xyz;
+          float dynCubeUnusedVanillaWB;
+          DynCubeResolveSSR(
+              dynCubeSSRTex, SmplLinearClamp_s,
+              dynCubeVanillaTex, SmplCube_s,
+              dynCubeHistPosTex, samPoint_s,
+              dynCubeSsrUV2, dynCubeReflDir, dynCubeVanillaMipFactor,
+              dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+              dynCubeResolvedB, dynCubeReflSrc, dynCubeUnusedVanillaWB);
+          r17.xyz = dynCubeResolvedB;
+        }
       }
-      r15.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r15.xyz, r1.w).xyz;
+      // Transmission/refraction tap (game-original): r15 is the refracted direction,
+      // not the reflection vector, so it keeps the vanilla cubemap source with the
+      // game's roughness LOD rescaled onto the vanilla mip chain. Never the dynamic
+      // cube, never parallax-corrected, never dynCube_blur. When DynCube is off,
+      // t17 is already vanilla, so the original sample is kept as-is.
+      if (shader_injection_data.dynCube_enabled > 0.5f) {
+        uint vanW, vanH, vanL;
+        dynCubeVanillaTex.GetDimensions(0, vanW, vanH, vanL);
+        float transMip = (vanL > 1u && num_levels > 1u)
+            ? r1.w * (float)(vanL - 1) / (float)(num_levels - 1) : 0.0;
+        r15.xyz = dynCubeVanillaTex.SampleLevel(SmplCube_s, r15.xyz, transMip).xyz;
+      } else {
+        r15.xyz = texEnvMap_g.SampleLevel(SmplCube_s, r15.xyz, r1.w).xyz;
+      }
       r1.w = cmp(0 < r14.x);
       r2.x = 1 + -abs(r6.z);
       r2.x = max(0, r2.x);
@@ -1548,6 +1684,42 @@ void main(
     } else {
       o0.xyz += giColor;  // Normal: add GI to scene
     }
+  }
+  // SSR replacement debug views (read-only overrides, evaluated first).
+  // Visualize SSR chain stages fullscreen on lit surfaces: 1 = scene color,
+  // 2 = fused SSR output (march + temporal), 3 = lighting SSR texture. Value 4
+  // (lighting color) and 0 mean no override here: fall through to the normal
+  // output and the existing debug views below. For judging what each stage sees.
+  // (Single-pass game: stages 2 and 3 both read the fused SSR buffer.)
+  float ssrReplacementDbg = shader_injection_data.dynCube_ssr_replacement_debug;
+  if (ssrReplacementDbg > 0.5f && ssrReplacementDbg < 3.5f) {
+    if (ssrReplacementDbg < 1.5f) {
+      o0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;  // scene color
+    } else {
+      o0.xyz = texSSRMap_g.SampleLevel(SmplLinearClamp_s, v1.xy, 0).rgb;  // fused SSR output
+    }
+  } else if (ssrReplacementDbg < 0.5f && dynCubeNewSSRActive && (shader_injection_data.dynCube_debug == 9.f
+      || shader_injection_data.dynCube_debug == 10.f
+      || shader_injection_data.dynCube_debug == 12.f || shader_injection_data.dynCube_debug == 13.f)) {
+    float2 ssrUV = resolutionScaling_g.xy * v1.zw;
+    float4 ssrTap = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0);  // blurred
+    if (shader_injection_data.dynCube_debug == 9.f) {
+      o0.xyz = ssrTap.rgb;   // SSR Result (blurred)
+    } else if (shader_injection_data.dynCube_debug == 10.f) {
+      o0.xyz = float3(ssrTap.a, ssrTap.a, ssrTap.a);  // SSR Confidence
+    } else if (shader_injection_data.dynCube_debug == 12.f) {
+      o0.xyz = dynCubeSSRRawTex.SampleLevel(SmplLinearClamp_s, ssrUV, 0).rgb;  // SSR Raw
+    } else {
+      float minEdge = min(min(ssrUV.x, 1.0 - ssrUV.x), min(ssrUV.y, 1.0 - ssrUV.y));
+      float edgeConf = smoothstep(0.0, max(shader_injection_data.dynCube_ssr_edge_fade * 0.25, 1e-4), minEdge);
+      o0.xyz = float3(edgeConf, edgeConf, edgeConf);  // SSR Edge Fade
+    }
+  } else if (ssrReplacementDbg < 0.5f && dynCubeReflResolveActive && shader_injection_data.dynCube_debug == 11.f) {
+    // Reflection Source: RED=SSR, GREEN=Dynamic, BLUE=Vanilla.
+    o0.xyz = !dynCubeReflActive ? float3(0, 0, 0)
+           : (dynCubeReflSrc == 0) ? float3(1, 0, 0)
+           : (dynCubeReflSrc == 1) ? float3(0, 1, 0)
+                                   : float3(0, 0, 1);
   }
   o0.w = 1;
   o2.x = 0;
