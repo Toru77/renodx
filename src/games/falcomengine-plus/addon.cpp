@@ -312,6 +312,7 @@ ShaderInjectData shader_injection = {
   .dynCube_global_strength = 1.f,
   .dynCube_ssr_replacement = 0.f,
   .dynCube_ssr_replacement_debug = 0.f,
+  .dynCube_game_ssr = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -560,6 +561,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view captured_mrt_normal_srv = {};
   reshade::api::resource_view captured_color_srv = {};   // t0 — lighting input color texture
   reshade::api::resource_view captured_ssr1_srv = {};   // ssr2-draw t0 — vanilla ssr1 march result (replacement debug view 2)
+  reshade::api::resource_view captured_ssr_mrt_srv = {};  // ssr1-draw t2 — march's own mrt0 (composite gate + normal decode)
   reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding — vanilla cube fallback
   reshade::api::resource_view captured_scene_cbv_view = {};  // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
@@ -790,7 +792,8 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 // VBGI is now integrated into GTVBAO main pass — no separate RunVBGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list);
-static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list);
+static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
+static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
@@ -1002,16 +1005,24 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         },
     },
     // ── Sora 2nd SSR (replacement-gated; vanilla when the toggle is off) ──
-    // NOTE: only ssr1 is replaced (composite). ssr2 runs vanilla temporal denoise
-    // over the composite output and delivers it downstream — no vanilla SSR math
-    // is computed-then-discarded, and history continuity is preserved.
+    // NOTE: ssr1 runs the vanilla march (composite input when replacing; skipped
+    // only when replacement is on and Game SSR is off). ssr2 runs the DynCube
+    // composite under the gate; otherwise the game draws vanilla.
     {
         0xE2F406C7u,
         renodx::mods::shader::CustomShader{
             .crc32 = 0xE2F406C7u,
             .code = __0xE2F406C7,
-            .on_replace = OnReplaceSoraSSR1Draw,
             .on_draw = OnBeforeSoraSSR1Draw,
+        },
+    },
+    {
+        0x17F931DEu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x17F931DEu,
+            .code = __0x17F931DE,
+            .on_replace = OnReplaceSoraSSR2Draw,
+            .on_draw = OnBeforeSoraSSR2Draw,
         },
     },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
@@ -3428,9 +3439,17 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeSSRReplacement", .binding = &shader_injection.dynCube_ssr_replacement,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "SSR Replacement", .section = "Dynamic Cubemaps",
-      .tooltip = "Replace Sora2nd vanilla SSR march (ssr1) with the DynCube composite (march + dynamic cubemap + vanilla fallback); vanilla ssr2 denoises it and delivers it downstream. Off = fully vanilla SSR chain, nothing touched.",
+      .tooltip = "Replace Sora2nd ssr2 resolve with the DynCube composite (vanilla march + dynamic cubemap + vanilla fallback) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla ssr2. Off = fully vanilla SSR chain, nothing touched.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeGameSSR", .binding = &shader_injection.dynCube_game_ssr,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Game SSR", .section = "Dynamic Cubemaps",
+      .tooltip = "Run the game's own ssr1 march and feed it to the SSR Replacement composite (vanilla reflection, then dynamic cubemap, then vanilla fallback). Off skips the march: water receives dynamic cubemap + vanilla fallback only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_replacement > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRReplacementDebug", .binding = &shader_injection.dynCube_ssr_replacement_debug,
@@ -3764,6 +3783,19 @@ static void OnPushDescriptorsCapture(
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (hash == 0x17F931DEu) {
           d->captured_ssr1_srv = views[0];
+        }
+      }
+    }
+    // Capture ssr1-draw t2 (the march's own mrt0) for the composite gate + normal
+    // decode at t4. Same-resource guarantee: the march decodes normals/flags from
+    // this exact view. ONLY from the ssr1 pixel shader.
+    if (update.binding == 2u && update.count >= 1
+        && views[0].handle != 0u) {
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (hash == 0xE2F406C7u) {
+          d->captured_ssr_mrt_srv = views[0];
         }
       }
     }
@@ -4353,12 +4385,13 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   shader_injection.gtvbao_vbgi_bound = 0.f;  // Reset for next frame's SSAO pass
 }
 
-// ── Sora2nd SSR Replacement (composite at ssr1, passthrough at ssr2) ──
+// ── Sora2nd SSR Replacement (vanilla march at ssr1, composite at ssr2) ──
 // Master gate: the composite can only serve when a vanilla fallback and a
-// servable dynamic cube exist. Deliberately NOT gated on our-SSR toggle or its
-// result: with our SSR off, unbound t31 reads 0 and the composite degrades to
-// dynamic + vanilla fallback, so water keeps dynamic reflections while only the
-// SSR term drops. Otherwise vanilla passes run.
+// servable dynamic cube exist. Deliberately NOT gated on the custom
+// SSR toggle or its result: the resolved SSR source is the vanilla march
+// (game-bound t0, live exactly when the Game SSR toggle runs it), so replacement
+// works standalone. Game-SSR-off degrades to dynamic/vanilla inside the shared
+// resolver. Otherwise vanilla passes run.
 static bool SoraSSRReplaceActive(reshade::api::command_list* cmd_list) {
   if (!cmd_list) return false;
   if (shader_injection.dynCube_ssr_replacement < 0.5f) return false;
@@ -4377,9 +4410,18 @@ static bool SoraSSRReplaceActive(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ssr1: push everything the composite PS needs (game binds t0/t1/t2/t3/s1/b0/b2).
-// Always returns true (never skips); replacement itself is gated separately.
+// ssr1: run the vanilla march, except skip it when replacement is on and Game SSR
+// is off (nothing consumes the march output then; the composite resolves
+// dynamic/vanilla only). No pushes needed: vanilla uses only game bindings.
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
+  if (shader_injection.dynCube_ssr_replacement > 0.5f
+      && shader_injection.dynCube_game_ssr < 0.5f) return false;
+  return true;
+}
+// ssr2: push everything the composite PS needs (game binds t0/t1/t2/s0/s1/b0/b2).
+// No custom-SSR pushes: the composite resolves the vanilla march tap, never t31.
+// Pushes only when the composite serves; otherwise vanilla draws untouched.
+static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   if (!SoraSSRReplaceActive(cmd_list)) return true;
   auto* dev = cmd_list->get_device();
   if (!dev) return true;
@@ -4414,23 +4456,6 @@ static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
           {}, kDynCubeVanillaRegister, 0, 1,
           reshade::api::descriptor_type::texture_shader_resource_view,
           &dd->captured_vanilla_env_srv});
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::pixel,
-      reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{
-          {}, kDynCubeSSRRegister, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &dd->dyncube_ssr_blur_srv});
-  // Raw SSR for composite debug view 12 (water-SSR observability).
-  if (dd->dyncube_ssr_raw_srv.handle) {
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{
-            {}, kDynCubeSSRRawRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view,
-            &dd->dyncube_ssr_raw_srv});
-  }
   if (dd->dyncube_worldbox_bounds_srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
@@ -4440,11 +4465,27 @@ static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
             reshade::api::descriptor_type::buffer_shader_resource_view,
             &dd->dyncube_worldbox_bounds_srv});
   }
+  // t4 mrt normals: prefer the march's own t2 capture (same resource the vanilla
+  // march decodes, so gate bits and resolution match by construction); fall back
+  // to the lighting capture. Unbound Load returns 0, which safely gates out to
+  // the vanilla branch — never garbage.
+  reshade::api::resource_view mrtSrv = dd->captured_ssr_mrt_srv.handle
+      ? dd->captured_ssr_mrt_srv
+      : dd->captured_mrt_normal_srv;
+  if (mrtSrv.handle) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, 4u, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &mrtSrv});
+  }
   return true;
 }
 
-// ssr1 code replacement gate: false keeps the vanilla shader (still draws).
-static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list) {
+// ssr2 code replacement gate: false keeps the vanilla shader (still draws).
+static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   return SoraSSRReplaceActive(cmd_list);
 }
 

@@ -1,15 +1,4 @@
 // ---- Created with 3Dmigoto v1.4.1 on Fri Aug 21 11:50:58 2026
-// RenoDX REPLACEMENT (hash kept): DynCube composite for Sora2nd forward water/puddles.
-// Active only when the SSR Replacement toggle serves it (see addon.cpp); otherwise the
-// game draws vanilla (this file is bypassed/replaced only under the same gate).
-//
-// What it does: resolves SSR > Dynamic > Vanilla per pixel with the shared dyncube
-// implementation and writes game-SSR-encoded output (rgb = resolved reflection,
-// w = non-vanilla fraction) into ssr1's RTV0. Vanilla ssr2 then denoises it and sends
-// it downstream, so no vanilla SSR math is wasted and temporal continuity is kept.
-// Reads: game bindings (t0 color, t1 depth, t2 mrt0, s1 point, b0), pushed t17/t29/
-// t30/t31/t32/t33, shader_injection (b13, auto-delivered). Ignores t3/b2.
-// Water/puddles are assumed smooth: roughness factor is hardcoded 0 (mirror LOD).
 
 cbuffer cb_scene : register(b0)
 {
@@ -63,145 +52,224 @@ cbuffer cb_scene : register(b0)
   float4 shadowBlurRadius_g : packoffset(c80);
 }
 
+cbuffer cb_ssr : register(b2)
+{
+  uint maxRayCount_g : packoffset(c0);
+  float rayLength_g : packoffset(c0.y);
+  float2 prevResolutionScaling_g : packoffset(c0.z);
+  float2 texelSize_g : packoffset(c1);
+  float2 uvClamp_g : packoffset(c1.z);
+  float4x4 ssrPrevViewProj_g : packoffset(c2);
+}
+
 SamplerState samPoint_s : register(s1);
 Texture2D<float4> colorTexture : register(t0);
 Texture2D<float4> depthTexture : register(t1);
 Texture2D<uint4> mrtTexture0 : register(t2);
-TextureCube<float4> texEnvMap_g : register(t17);
-TextureCube<float4> dynCubeHistPosTex : register(t29);
-TextureCube<float4> dynCubeVanillaTex : register(t30);
-Texture2D<float4> dynCubeSSRTex : register(t31);
-Texture2D<float4> dynCubeSSRRawTex : register(t32);
-StructuredBuffer<float4> dynCubeWorldBox : register(t33);
+Texture2D<uint2> mrtTexture2 : register(t3);
 
-#include "../../shared.h"
-#include "../../dyncube/dyncube_spatial.hlsli"
-#include "../../dyncube/dyncube_sample.hlsli"
-#include "../../dyncube/dyncube_resolve.hlsli"
 
-// Static cube sampler (game binds no cube sampler on ssr1 draws):
-// trilinear wrap is the cube-sampling standard. If seams ever appear,
-// capture the game's s14 object instead (see addon OnBeforeSoraSSR1Draw).
-SamplerState DynCubeCubeSampler
-{
-  Filter = MIN_MAG_MIP_LINEAR;
-  AddressU = Wrap;
-  AddressV = Wrap;
-  AddressW = Wrap;
-};
+// 3Dmigoto declarations
+#define cmp -
+
 
 void main(
   float4 v0 : SV_Position0,
   float4 v1 : TEXCOORD0,
   out float4 o0 : SV_Target0)
 {
-  // Composite debug views (water-SSR observability — the lighting-local debug
-  // views never execute on forward water pixels, so the composite carries its own).
-  // Writes through to ssr1's target, hence visible downstream on water surfaces.
-  if (shader_injection_data.dynCube_debug == 9.f) {
-    o0 = float4(dynCubeSSRTex.SampleLevel(samPoint_s, v1.xy, 0).rgb, 1.0);
-    return;
-  } else if (shader_injection_data.dynCube_debug == 10.f) {
-    float ssrConfDbg = dynCubeSSRTex.SampleLevel(samPoint_s, v1.xy, 0).a;
-    o0 = float4(ssrConfDbg, ssrConfDbg, ssrConfDbg, 1.0);
-    return;
-  } else if (shader_injection_data.dynCube_debug == 12.f) {
-    o0 = float4(dynCubeSSRRawTex.SampleLevel(samPoint_s, v1.xy, 0).rgb, 1.0);
-    return;
-  }
-  // Eligibility gate (verbatim game logic): only mrt0.w&2 pixels reflect.
-  // Anything else emits scene color with zero confidence, preserving vanilla
-  // cost profile (no resolve math) and strict vanilla coverage.
+  float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9;
+  uint4 bitmask, uiDest;
   float4 fDest;
+
   mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
-  float2 eligUV = v1.xy * fDest.xy;
-  uint4 mrtElig = mrtTexture0.Load(int3(int2(eligUV), 0));
-  if (((int)mrtElig.w & 2) == 0) {
-    o0.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
+  r0.xy = fDest.xy;
+  r0.zw = v1.xy * r0.xy;
+  r1.xy = (int2)r0.zw;
+  r1.zw = float2(0,0);
+  r1.xyz = mrtTexture0.Load(r1.xyz).xyw;
+  r0.z = (int)r1.z & 2;
+  if (r0.z == 0) {
+    r2.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
+    o0.xyz = r2.xyz;
     o0.w = 0;
     return;
   }
-  // World position (verbatim game reconstruct pattern): NDC from v1.zw.
-  float depth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-  float4 ndcPos = float4(v1.zw * float2(2, -2) + float2(-1, 1), 1, 1);
-  float4 worldH =
-      float4(dot(ndcPos, viewProjInv_g._m00_m10_m20_m30),
-             dot(ndcPos, viewProjInv_g._m01_m11_m21_m31),
-             dot(ndcPos, viewProjInv_g._m02_m12_m22_m32),
-             dot(ndcPos, viewProjInv_g._m03_m13_m23_m33));
-  float3 waterPos = worldH.xyz / worldH.w;
-
-  // World normal from the same mrt texel (same spherical packing the SSR march
-  // decodes; see FalcomSSRCS DecodeWorldNormal).
-  float2 enc = float2(mrtElig.x, mrtElig.y) * (1.0 / 32767.5) - 1.0;
-  float azimuth = 3.14159274 * enc.x;
-  float ring = sqrt(saturate(1.0 - enc.y * enc.y));
-  float3 waterN = float3(cos(azimuth) * ring, sin(azimuth) * ring, enc.y);
-  if (dot(waterN, waterN) < 1e-6) waterN = float3(0.0, 0.0, -1.0);
-  waterN = normalize(waterN);
-
-  // View / reflection (Site-A lighting convention: V = pixel -> camera).
-  float3 camPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
-  float3 waterV = normalize(camPos - waterPos);
-  float ndv = dot(waterN, waterV);
-  float3 waterR = waterN * (-(ndv + ndv)) + waterV;
-
-  // SSR -> Dynamic -> Vanilla enable set (mirrors Sora lighting setup).
-  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_ssr_enabled > 0.5f;
-  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_force_dynamic > 0.5f;
-  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_force_ssr > 0.5f;
-  bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
-    && shader_injection_data.dynCube_force_vanilla < 0.5f;
-  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-  float3 dynCubeReflDir = float3(0, 0, 0);
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(samPoint_s, v1.xy, 0).a;
+  mrtTexture2.GetDimensions(0, fDest.x, fDest.y, fDest.z);
+  r0.zw = fDest.xy;
+  r0.zw = v1.xy * r0.zw;
+  r2.xy = (int2)r0.zw;
+  r2.zw = float2(0,0);
+  r0.z = mrtTexture2.Load(r2.xyz).y;
+  r2.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+  r2.xy = v1.zw * float2(2,-2) + float2(-1,1);
+  r2.w = 1;
+  r3.x = dot(r2.xyzw, projInv_g._m00_m10_m20_m30);
+  r3.y = dot(r2.xyzw, projInv_g._m01_m11_m21_m31);
+  r3.z = dot(r2.xyzw, projInv_g._m02_m12_m22_m32);
+  r0.w = dot(r2.xyzw, projInv_g._m03_m13_m23_m33);
+  r2.xyz = r3.xyz / r0.www;
+  r1.xy = (uint2)r1.xy;
+  r1.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
+  r0.w = 3.14159274 * r1.z;
+  sincos(r0.w, r3.x, r4.x);
+  r0.w = -r1.w * r1.w + 1;
+  r0.w = sqrt(r0.w);
+  r1.x = r4.x * r0.w;
+  r1.y = r3.x * r0.w;
+  r0.w = dot(r1.xyw, r1.xyw);
+  r0.w = rsqrt(r0.w);
+  r1.xyz = r1.xyw * r0.www;
+  r3.x = dot(r1.xyz, view_g._m00_m10_m20);
+  r3.y = dot(r1.xyz, view_g._m01_m11_m21);
+  r3.z = dot(r1.xyz, view_g._m02_m12_m22);
+  r0.w = dot(r2.xyz, r2.xyz);
+  r0.w = rsqrt(r0.w);
+  r1.xyz = r2.xyz * r0.www;
+  r0.w = dot(r1.xyz, r3.xyz);
+  r0.w = r0.w + r0.w;
+  r1.xyz = r3.xyz * -r0.www + r1.xyz;
+  r0.w = dot(-r2.xyz, -r2.xyz);
+  r0.w = rsqrt(r0.w);
+  r4.xyz = -r2.xyz * r0.www;
+  r0.w = dot(r4.xyz, r3.xyz);
+  r0.z = (uint)r0.z;
+  r0.z = 0.0152590219 * r0.z;
+  r1.w = maxRayCount_g;
+  r0.z = r0.z / r1.w;
+  r3.xyz = sceneTime_g + r2.xyz;
+  r1.w = dot(r3.xyz, float3(12.9898005,78.2330017,56.7869987));
+  r1.w = sin(r1.w);
+  r1.w = 43758.5469 * r1.w;
+  r1.w = frac(r1.w);
+  r3.xy = float2(0.899999976,0.200000048) * r0.zz;
+  r0.z = r1.w * r3.y + r3.x;
+  r4.xyz = r1.xyz * r0.zzz;
+  r2.xyw = r1.xyz * r0.zzz + r2.xyz;
+  r0.z = 1 + -abs(r0.w);
+  r0.z = r0.z * r0.z;
+  r0.z = r0.z * r0.z;
+  r0.z = r0.z * r0.z;
+  r0.z = -r2.z * r0.z;
+  r0.z = 0.0199999996 * r0.z;
+  r2.xyz = r1.xyz * r0.zzz + r2.xyw;
+  r5.w = 1;
+  r6.y = 1;
+  r7.xyz = r4.xyz;
+  r0.zw = float2(0,0);
+  r1.w = 0;
+  r8.xyz = r2.xyz;
+  r2.w = 0;
+  while (true) {
+    r3.z = cmp((uint)r2.w >= maxRayCount_g);
+    if (r3.z != 0) break;
+    r5.xyz = r8.xyz;
+    r9.x = dot(r5.xyzw, proj_g._m00_m10_m20_m30);
+    r9.y = dot(r5.xyzw, proj_g._m01_m11_m21_m31);
+    r3.z = dot(r5.xyzw, proj_g._m03_m13_m23_m33);
+    r3.zw = r9.xy / r3.zz;
+    r6.zw = float2(0.5,0.5) * r3.zw;
+    r9.xy = r3.zw * float2(0.5,0.5) + float2(0.5,0.5);
+    r3.z = max(abs(r6.z), abs(r6.w));
+    r3.z = cmp(0.5 < r3.z);
+    if (r3.z != 0) {
+      r0.zw = r9.xy;
+      break;
+    }
+    r9.w = 1 + -r9.y;
+    r9.z = 1 + -r9.y;
+    r3.zw = resolutionScaling_g.xy * r9.xz;
+    r6.x = depthTexture.SampleLevel(samPoint_s, r3.zw, 0).x;
+    r3.z = dot(projInv_g._m22_m32, r6.xy);
+    r3.w = dot(projInv_g._m23_m33, r6.xy);
+    r3.z = r3.z / r3.w;
+    r3.z = -r8.z + r3.z;
+    r3.w = cmp(0 < r3.z);
+    r3.z = cmp(r3.z < 10);
+    r3.z = r3.z ? r3.w : 0;
+    if (r3.z != 0) {
+      r0.zw = r9.xz;
+      r1.w = -1;
+      break;
+    }
+    r6.xzw = sceneTime_g * r5.xyz;
+    r3.z = dot(r6.xzw, float3(12.9898005,78.2330017,56.7869987));
+    r3.z = sin(r3.z);
+    r3.z = 43758.5469 * r3.z;
+    r3.z = frac(r3.z);
+    r3.z = r3.z * r3.y + r3.x;
+    r7.xyz = r3.zzz * r1.xyz;
+    r8.xyz = r1.xyz * r3.zzz + r5.xyz;
+    r2.w = (int)r2.w + 1;
+    r0.zw = r9.xw;
+    r1.w = 0;
   }
-
-  // Dynamic sample. Water/puddles are assumed smooth (mirror LOD); the vanilla
-  // mip factor is 0 for the same reason. v1.xy are 0-1 UVs (no rescale).
-  float3 waterDynCol;
-  float3 waterFinalDir;
-  int waterParallaxFace;
-  uint waterNumLevels;
-  float waterSampleMip;
-  DynCubeSampleDynamic(
-      texEnvMap_g, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      dynCubeWorldBox,
-      waterPos, waterR, 0.0, dynCubeReflectSign, camPos,
-      dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-      waterDynCol, waterFinalDir, waterParallaxFace,
-      waterNumLevels, waterSampleMip);
-  dynCubeReflDir = waterFinalDir;
-  dynCubeReflActive = true;
-
-  // Resolve. Sky/depth-miss pixels carry no validity, so the resolver blends
-  // them to vanilla exactly like the lighting path does.
-  float3 waterResolved = waterDynCol;
-  float waterVanillaW = 1.0;
-  DynCubeResolveSSR(
-      dynCubeSSRTex, samPoint_s,
-      dynCubeVanillaTex, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      v1.xy, dynCubeReflDir, 0.0,
-      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-      waterResolved, dynCubeReflSrc, waterVanillaW);
-
-  // Game-SSR encoding: rgb = resolved reflection, w = non-vanilla fraction.
-  // Miss-everywhere yields {vanillaCol, 0}, identical in effect to a vanilla
-  // {sceneColor, 0} miss under downstream w-lerp blending.
-  o0 = float4(waterResolved, saturate(1.0 - waterVanillaW));
+  if (r1.w != 0) {
+    r1.xyz = r8.xyz + -r7.xyz;
+    r2.xyz = float3(0.25,0.25,0.25) * r7.xyz;
+    r3.w = 1;
+    r4.y = 1;
+    r3.xyz = r1.xyz;
+    r5.xy = r0.zw;
+    r1.w = 2;
+    r2.w = 2;
+    r4.z = 0;
+    while (true) {
+      r4.w = cmp((int)r4.z >= 4);
+      if (r4.w != 0) break;
+      r6.xyz = r2.xyz * r2.www;
+      r7.xyz = sceneTime_g * r3.xyz;
+      r4.w = dot(r7.xyz, float3(12.9898005,78.2330017,56.7869987));
+      r4.w = sin(r4.w);
+      r4.w = 43758.5469 * r4.w;
+      r4.w = frac(r4.w);
+      r4.w = r4.w * 0.200000048 + 0.899999976;
+      r3.xyz = r6.xyz * r4.www + r3.xyz;
+      r6.x = dot(r3.xyzw, proj_g._m00_m10_m20_m30);
+      r6.y = dot(r3.xyzw, proj_g._m01_m11_m21_m31);
+      r4.w = dot(r3.xyzw, proj_g._m03_m13_m23_m33);
+      r6.xy = r6.xy / r4.ww;
+      r5.xz = r6.xy * float2(0.5,0.5) + float2(0.5,0.5);
+      r1.w = 0.5 * r1.w;
+      r5.y = 1 + -r5.z;
+      r5.zw = resolutionScaling_g.xy * r5.xy;
+      r4.x = depthTexture.SampleLevel(samPoint_s, r5.zw, 0).x;
+      r4.w = dot(projInv_g._m22_m32, r4.xy);
+      r4.x = dot(projInv_g._m23_m33, r4.xy);
+      r4.x = r4.w / r4.x;
+      r4.x = r4.x + -r3.z;
+      r4.w = cmp(0 < r4.x);
+      r4.x = cmp(r4.x < 0);
+      r4.x = r4.x ? r4.w : 0;
+      r2.w = r4.x ? -r1.w : r1.w;
+      r4.z = (int)r4.z + 1;
+    }
+    r0.zw = r5.xy;
+    r1.xy = float2(-0.5,-0.5) + r0.zw;
+    r1.x = dot(r1.xy, r1.xy);
+    r1.x = sqrt(r1.x);
+    r1.x = r1.x + r1.x;
+    r1.y = r1.x * r1.x;
+    r1.x = -r1.x * r1.y + 1;
+    r1.yz = resolutionScaling_g.xy * r0.zw;
+    r0.xy = r1.yz * r0.xy;
+    r2.xy = (int2)r0.xy;
+    r2.zw = float2(0,0);
+    r0.x = mrtTexture0.Load(r2.xyz).w;
+    r0.x = (int)r0.x & 2;
+    r0.x = r0.x ? 0 : r1.x;
+  } else {
+    r1.xy = float2(-0.5,-0.5) + r0.zw;
+    r0.y = dot(r1.xy, r1.xy);
+    r0.y = sqrt(r0.y);
+    r0.y = r0.y + r0.y;
+    r1.x = r0.y * r0.y;
+    r0.x = -r0.y * r1.x + 1;
+  }
+  r0.yz = resolutionScaling_g.xy * r0.zw;
+  r0.yz = min(uvClamp_g.xy, r0.yz);
+  r0.yzw = colorTexture.SampleLevel(samPoint_s, r0.yz, 0).xyz;
+  o0.w = max(0, r0.x);
+  o0.xyz = r0.yzw;
   return;
 }

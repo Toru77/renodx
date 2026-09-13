@@ -343,6 +343,7 @@ struct ShaderInjectData {
   float dynCube_global_strength;             // [0..1] variant strength for global pushes (lighting unaffected), default 1
   float dynCube_ssr_replacement;             // 0=vanilla Sora SSR passes, 1=replace ssr1/ssr2 with DynCube composite (appended last: do not insert above)
   float dynCube_ssr_replacement_debug;       // 0=off, 1=ssr1 input, 2=ssr1 march result, 3=lighting SSR texture, 4=lighting color (appended last: do not insert above)
+  float dynCube_game_ssr;                    // 0=skip vanilla ssr1 march (water gets dynamic+vanilla only), 1=run it as composite input (appended last: do not insert above)
 };
 
 #ifndef __cplusplus
