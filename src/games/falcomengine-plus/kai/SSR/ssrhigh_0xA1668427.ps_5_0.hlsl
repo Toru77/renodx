@@ -1,4 +1,4 @@
-// ---- Created with 3Dmigoto v1.4.1 on Thu Feb 19 20:15:25 2026
+// ---- Created with 3Dmigoto v1.4.1 on Mon Sep 14 02:53:45 2026
 
 cbuffer cb_scene : register(b0)
 {
@@ -73,35 +73,9 @@ Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<uint4> mrtTexture1 : register(t3);
 Texture2D<float4> prevSSRTexture : register(t4);
 
-#include "../../shared.h"
-
 
 // 3Dmigoto declarations
 #define cmp -
-
-static const float kPi = 3.14159274;
-static const float kInvU16 = 3.05180438e-05;
-static const float kInvU8 = 0.00392156886;
-
-float ViewZFromDepth(const float depth_value) {
-  float view_z_num = dot(projInv_g._m22_m32, float2(depth_value, 1.0));
-  float view_z_den = dot(projInv_g._m23_m33, float2(depth_value, 1.0));
-  return view_z_num / view_z_den;
-}
-
-float3 DecodeMrt0NormalView(const uint4 mrt_sample) {
-  float2 enc = float2((float)mrt_sample.x, (float)mrt_sample.y) * kInvU16 + float2(-1.0, -1.0);
-  float sn, cs;
-  sincos(kPi * enc.x, sn, cs);
-  float xy = sqrt(saturate(1.0 - enc.y * enc.y));
-  float3 normal_world = normalize(float3(cs * xy, sn * xy, enc.y));
-
-  float3 normal_view;
-  normal_view.x = dot(normal_world, view_g._m00_m10_m20);
-  normal_view.y = dot(normal_world, view_g._m01_m11_m21);
-  normal_view.z = dot(normal_world, view_g._m02_m12_m22);
-  return normalize(normal_view);
-}
 
 
 void main(
@@ -112,31 +86,15 @@ void main(
   float4 r0,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10;
   uint4 bitmask, uiDest;
   float4 fDest;
-  uint4 ssr_mrt0_center;
-  uint4 ssr_mrt1_center;
-  float2 ssr_mrt0_dims;
-  float2 ssr_mrt0_max;
-  float2 ssr_mrt1_dims;
-  float2 ssr_mrt1_max;
-  float ssr_origin_material = 0;
-  float3 ssr_origin_view_pos = float3(0, 0, 0);
-  float3 ssr_origin_normal_vs = float3(0, 0, 1);
-  float ssr_current_view_z = 0;
-  float2 ssr_sample_uv = float2(0, 0);
-  float2 ssr_sample_uv_scaled = float2(0, 0);
-  float2 ssr_reproj_uv = float2(0, 0);
-  bool ssr_improved_mode = (shader_injection_data.ssr_mode >= 0.5);
 
   mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
   r0.xy = fDest.xy;
-  ssr_mrt0_dims = r0.xy;
-  ssr_mrt0_max = max(ssr_mrt0_dims + float2(-1, -1), float2(0, 0));
   r0.zw = v1.xy * r0.xy;
   r1.xy = (int2)r0.zw;
   r1.zw = float2(0,0);
-  ssr_mrt0_center = mrtTexture0.Load(r1.xyz);
-  r1.xyz = ssr_mrt0_center.xyz;
-  r0.z = (float)((ssr_mrt0_center.z >> 8) & 2u);
+  r1.xyz = mrtTexture0.Load(r1.xyz).xyz;
+  r0.z = (uint)r1.z >> 8;
+  r0.z = (int)r0.z & 2;
   if (r0.z == 0) {
     r2.xyz = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
     o0.xyz = r2.xyz;
@@ -144,17 +102,12 @@ void main(
     return;
   }
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
-  ssr_mrt1_dims = fDest.xy;
-  ssr_mrt1_max = max(ssr_mrt1_dims + float2(-1, -1), float2(0, 0));
   r0.zw = fDest.xy;
   r0.zw = v1.xy * r0.zw;
   r2.xy = (int2)r0.zw;
   r2.zw = float2(0,0);
-  ssr_mrt1_center = mrtTexture1.Load(r2.xyz);
-  r0.z = ssr_mrt1_center.x;
-  ssr_origin_material = (float)(ssr_mrt1_center.y & 255u) * kInvU8;
+  r0.z = mrtTexture1.Load(r2.xyz).x;
   r2.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-  ssr_current_view_z = ViewZFromDepth(r2.z);
   r2.xy = v1.zw * float2(2,-2) + float2(-1,1);
   r2.w = 1;
   r3.x = dot(r2.xyzw, projInv_g._m00_m10_m20_m30);
@@ -162,7 +115,6 @@ void main(
   r3.z = dot(r2.xyzw, projInv_g._m02_m12_m22_m32);
   r0.w = dot(r2.xyzw, projInv_g._m03_m13_m23_m33);
   r3.xyz = r3.xyz / r0.www;
-  ssr_origin_view_pos = r3.xyz;
   r1.xy = (uint2)r1.xy;
   r1.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
   r0.w = 3.14159274 * r1.z;
@@ -177,7 +129,6 @@ void main(
   r4.x = dot(r1.xyz, view_g._m00_m10_m20);
   r4.y = dot(r1.xyz, view_g._m01_m11_m21);
   r4.z = dot(r1.xyz, view_g._m02_m12_m22);
-  ssr_origin_normal_vs = normalize(r4.xyz);
   r0.w = dot(r3.xyz, r3.xyz);
   r0.w = rsqrt(r0.w);
   r1.xyz = r3.xyz * r0.www;
@@ -190,9 +141,7 @@ void main(
   r0.w = dot(r5.xyz, r4.xyz);
   r0.z = (uint)r0.z;
   r0.z = 0.0152590219 * r0.z;
-  float ssr_ray_count_scale = ssr_improved_mode ? clamp(shader_injection_data.ssr_ray_count_scale, 0.5, 8.0) : 1.0;
-  uint ssr_max_ray_count = max(1u, (uint)round((float)maxRayCount_g * ssr_ray_count_scale));
-  r1.w = (float)ssr_max_ray_count;
+  r1.w = maxRayCount_g;
   r0.z = r0.z / r1.w;
   r4.xyz = sceneTime_g * r3.xyz;
   r1.w = dot(r4.xyz, float3(12.9898005,78.2330017,56.7869987));
@@ -218,7 +167,7 @@ void main(
   r9.xyz = r3.xyz;
   r3.w = 0;
   while (true) {
-    r4.z = cmp((uint)r3.w >= ssr_max_ray_count);
+    r4.z = cmp((uint)r3.w >= maxRayCount_g);
     if (r4.z != 0) break;
     r6.xyz = r9.xyz;
     r10.x = dot(r6.xyzw, proj_g._m00_m10_m20_m30);
@@ -240,8 +189,9 @@ void main(
     r4.z = dot(projInv_g._m22_m32, r7.xy);
     r4.w = dot(projInv_g._m23_m33, r7.xy);
     r4.z = r4.z / r4.w;
-    float ray_depth_delta = -r9.z + r4.z;
-    if (ray_depth_delta > 0.0) {
+    r4.z = -r9.z + r4.z;
+    r4.z = cmp(0 < r4.z);
+    if (r4.z != 0) {
       r0.zw = r10.xz;
       r1.w = -1;
       break;
@@ -260,16 +210,16 @@ void main(
   }
   if (r1.w != 0) {
     r1.xyz = r9.xyz + -r8.xyz;
-    r3.xyz = float3(0.03125,0.03125,0.03125) * r8.xyz;
+    r3.xyz = float3(0.25,0.25,0.25) * r8.xyz;
     r4.w = 1;
     r5.y = 1;
     r4.xyz = r1.xyz;
     r6.xy = r0.zw;
-    r1.w = 16;
-    r3.w = 16;
+    r1.w = 2;
+    r3.w = 2;
     r5.z = 0;
     while (true) {
-      r5.w = cmp((int)r5.z >= 32);
+      r5.w = cmp((int)r5.z >= 4);
       if (r5.w != 0) break;
       r7.xyz = r3.xyz * r3.www;
       r8.xyz = sceneTime_g * r4.xyz;
@@ -291,8 +241,9 @@ void main(
       r5.w = dot(projInv_g._m22_m32, r5.xy);
       r5.x = dot(projInv_g._m23_m33, r5.xy);
       r5.x = r5.w / r5.x;
-      float refine_depth_delta = r5.x + -r4.z;
-      r3.w = (refine_depth_delta > 0.0) ? -r1.w : r1.w;
+      r5.x = r5.x + -r4.z;
+      r5.x = cmp(0 < r5.x);
+      r3.w = r5.x ? -r1.w : r1.w;
       r5.z = (int)r5.z + 1;
     }
     r0.zw = r6.xy;
@@ -306,9 +257,10 @@ void main(
     r0.xy = r1.yz * r0.xy;
     r3.xy = (int2)r0.xy;
     r3.zw = float2(0,0);
-    uint recursive_ssr_flags = mrtTexture0.Load(r3.xyz).z;
-    uint recursive_ssr_mask = (recursive_ssr_flags >> 8) & 2u;
-    r0.x = (recursive_ssr_mask != 0u) ? 0.0 : r1.x;
+    r0.x = mrtTexture0.Load(r3.xyz).z;
+    r0.x = (uint)r0.x >> 8;
+    r0.x = (int)r0.x & 2;
+    r0.x = r0.x ? 0 : r1.x;
   } else {
     r1.xy = float2(-0.5,-0.5) + r0.zw;
     r0.y = dot(r1.xy, r1.xy);
@@ -317,11 +269,7 @@ void main(
     r1.x = r0.y * r0.y;
     r0.x = -r0.y * r1.x + 1;
   }
-
-  ssr_sample_uv = r0.zw;
-
-  ssr_sample_uv_scaled = resolutionScaling_g.xy * ssr_sample_uv;
-  r0.yz = ssr_sample_uv_scaled;
+  r0.yz = resolutionScaling_g.xy * r0.zw;
   r1.xyz = colorTexture.SampleLevel(samPoint_s, r0.yz, 0).xyz;
   r1.w = max(0, r0.x);
   r0.x = dot(r2.xyzw, viewProjInv_g._m00_m10_m20_m30);
@@ -335,7 +283,6 @@ void main(
   r0.xy = r2.xy / r0.xx;
   r0.xy = r0.xy * float2(0.5,0.5) + float2(0.5,0.5);
   r0.z = 1 + -r0.y;
-  ssr_reproj_uv = float2(r0.x, r0.z);
   r0.yw = -v1.zw + r0.xz;
   r0.y = dot(r0.yw, r0.yw);
   r0.y = sqrt(r0.y);
@@ -345,7 +292,6 @@ void main(
   r0.xz = resolutionScaling_g.xy * r0.xz;
   r0.xz = prevResolutionScaling_g.xy * r0.xz;
   r2.xyzw = prevSSRTexture.SampleLevel(samLinear_s, r0.xz, 0).xyzw;
-
   r1.xyzw = -r2.xyzw + r1.xyzw;
   o0.xyzw = r0.yyyy * r1.xyzw + r2.xyzw;
   return;
