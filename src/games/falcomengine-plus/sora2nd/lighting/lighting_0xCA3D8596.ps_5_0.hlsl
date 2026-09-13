@@ -937,7 +937,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             dynCubeVanillaTex, SmplCube_s,
             dynCubeHistPosTex, samPoint_s,
             dynCubeSsrUV, dynCubeReflDir, dynCubeVanillaMipFactor,
-            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, true,
             dynCubeResolvedA, dynCubeReflSrc, dynCubeUnusedVanillaWA);
         r21.xyz = dynCubeResolvedA;
       }
@@ -1032,8 +1032,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
               dynCubeVanillaTex, SmplCube_s,
               dynCubeHistPosTex, samPoint_s,
               dynCubeSsrUV2, dynCubeReflDir, dynCubeVanillaMipFactor,
-              dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-              dynCubeResolvedB, dynCubeReflSrc, dynCubeUnusedVanillaWB);
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, true,
+            dynCubeResolvedB, dynCubeReflSrc, dynCubeUnusedVanillaWB);
           r21.xyz = dynCubeResolvedB;
         }
       }

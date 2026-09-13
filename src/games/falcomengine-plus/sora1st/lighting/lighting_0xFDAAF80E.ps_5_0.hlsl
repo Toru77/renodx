@@ -870,7 +870,10 @@ void main(
       r17.xyz = r18.www * r18.xyz + r17.xyz;
     } else {
       // ── SSR > Dynamic > Vanilla resolution (shared implementation, see dyncube_resolve.hlsli) ──
-      if (dynCubeReflActive) {
+      // SSR source selection: custom march while its toggle runs, else the game
+      // SSR buffer (composite-enriched when SSR Replacement serves, vanilla
+      // otherwise) so game SSR stays visible with custom SSR off.
+      if (dynCubeReflActive && dynCubeNewSSRActive) {
         float2 dynCubeSsrUV = resolutionScaling_g.xy * v1.zw;
         float3 dynCubeResolvedA = r17.xyz;
         float dynCubeUnusedVanillaWA;
@@ -879,9 +882,21 @@ void main(
             dynCubeVanillaTex, SmplCube_s,
             dynCubeHistPosTex, samPoint_s,
             dynCubeSsrUV, dynCubeReflDir, dynCubeVanillaMipFactor,
-            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, true,
             dynCubeResolvedA, dynCubeReflSrc, dynCubeUnusedVanillaWA);
         r17.xyz = dynCubeResolvedA;
+      } else if (dynCubeReflActive) {
+        float2 dynCubeGameSsrUV = resolutionScaling_g.xy * v1.zw;
+        float3 dynCubeResolvedAGame = r17.xyz;
+        float dynCubeUnusedVanillaWAGame;
+        DynCubeResolveSSR(
+            texSSRMap_g, SmplLinearClamp_s,
+            dynCubeVanillaTex, SmplCube_s,
+            dynCubeHistPosTex, samPoint_s,
+            dynCubeGameSsrUV, dynCubeReflDir, dynCubeVanillaMipFactor,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeReflResolveActive, true,
+            dynCubeResolvedAGame, dynCubeReflSrc, dynCubeUnusedVanillaWAGame);
+        r17.xyz = dynCubeResolvedAGame;
       }
     }
     r8.w = cmp(0 < r2.x);
@@ -964,7 +979,9 @@ void main(
         r17.xyz = r19.www * r19.xyz + r17.xyz;
       } else {
         // ── SSR > Dynamic > Vanilla resolution (site 2; shared implementation, see dyncube_resolve.hlsli) ──
-        if (dynCubeReflActive) {
+        // Same source selection as site A: custom march while its toggle runs,
+        // else the game SSR buffer.
+        if (dynCubeReflActive && dynCubeNewSSRActive) {
           float2 dynCubeSsrUV2 = resolutionScaling_g.xy * v1.zw;
           float3 dynCubeResolvedB = r17.xyz;
           float dynCubeUnusedVanillaWB;
@@ -973,9 +990,21 @@ void main(
               dynCubeVanillaTex, SmplCube_s,
               dynCubeHistPosTex, samPoint_s,
               dynCubeSsrUV2, dynCubeReflDir, dynCubeVanillaMipFactor,
-              dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-              dynCubeResolvedB, dynCubeReflSrc, dynCubeUnusedVanillaWB);
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, true,
+            dynCubeResolvedB, dynCubeReflSrc, dynCubeUnusedVanillaWB);
           r17.xyz = dynCubeResolvedB;
+        } else if (dynCubeReflActive) {
+          float2 dynCubeGameSsrUV2 = resolutionScaling_g.xy * v1.zw;
+          float3 dynCubeResolvedBGame = r17.xyz;
+          float dynCubeUnusedVanillaWBGame;
+          DynCubeResolveSSR(
+              texSSRMap_g, SmplLinearClamp_s,
+              dynCubeVanillaTex, SmplCube_s,
+              dynCubeHistPosTex, samPoint_s,
+              dynCubeGameSsrUV2, dynCubeReflDir, dynCubeVanillaMipFactor,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeReflResolveActive, true,
+            dynCubeResolvedBGame, dynCubeReflSrc, dynCubeUnusedVanillaWBGame);
+          r17.xyz = dynCubeResolvedBGame;
         }
       }
       // Transmission/refraction tap (game-original): r15 is the refracted direction,

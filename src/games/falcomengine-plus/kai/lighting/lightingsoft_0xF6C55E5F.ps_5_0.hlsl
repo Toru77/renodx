@@ -1345,7 +1345,7 @@ void main(
             dynCubeVanillaTex, SmplCube_s,
             dynCubeHistPosTex, samPoint_s,
             v1.xy, dynCubeReflDir, dynCubeVanillaMipFactor,
-            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+            dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, true,
             kaiResolvedA, dynCubeReflSrc, kaiUnusedVanillaW);
         r20.xyz = kaiResolvedA;
       }

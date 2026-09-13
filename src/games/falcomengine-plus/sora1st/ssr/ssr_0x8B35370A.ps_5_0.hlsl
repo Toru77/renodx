@@ -393,10 +393,11 @@ void main(
       dynCubeVanillaTex, DynCubeCubeSampler,
       dynCubeHistPosTex, samPoint_s,
       resolutionScaling_g.xy * v1.zw, dynCubeReflDir, s1Rough01,
-      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, false,
       s1Resolved, dynCubeReflSrc, s1VanillaW);
   // Game-SSR encoding for the temporal stage + downstream: rgb = resolved
   // reflection, w = non-vanilla fraction (march convention: w = confidence).
+  // Miss-everywhere yields {0, 0} (no vanilla-cube tint by design on this path).
   r1.xyz = s1Resolved;
   r1.w = saturate(1.0 - s1VanillaW);
   r0.x = dot(r2.xyzw, viewProjInv_g._m00_m10_m20_m30);

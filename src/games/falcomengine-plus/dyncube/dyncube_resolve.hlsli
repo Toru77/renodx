@@ -26,7 +26,7 @@ void DynCubeResolveSSR(
     TextureCube<float4> vanillaTex, SamplerState cubeSampler,
     TextureCube<float4> histPosTex, SamplerState pointSampler,
     float2 ssrUV, float3 reflDir, float vanillaMipFactor,
-    bool reflActive, bool forceDynamicActive, bool forceSSRActive, bool newSSRActive,
+    bool reflActive, bool forceDynamicActive, bool forceSSRActive, bool newSSRActive, bool vanillaFallbackActive,
     inout float3 dynCol, inout int reflSrc, out float outVanillaWeight)
 {
   outVanillaWeight = 1.0;
@@ -48,6 +48,10 @@ void DynCubeResolveSSR(
       outVanillaWeight = 0.0;
     } else {
       const float layerMix = shader_injection_data.dynCube_layer_mix;
+      // Manual layer mix toward Vanilla degrades to dynamic-or-miss when the
+      // vanilla fallback is off (SSR replacement path): the vanilla layer can
+      // never contribute visible color there.
+      const float effMix = vanillaFallbackActive ? layerMix : min(layerMix, 1.0f);
       // SSR color + confidence (only when SSR active); ssrWeight computed only for automatic mode.
       float3 ssrCol = float3(0, 0, 0);
       float ssrConf = 0.0;
@@ -108,7 +112,7 @@ void DynCubeResolveSSR(
       // filtered signal crosses the validity boundary instead of multiplying after it.
       float effectiveDynamicConf = (shader_injection_data.dynCube_coverage_fade > 0.5f)
           ? coverageFade : dynamicConf;
-      if (layerMix >= -0.5f) {
+      if (effMix >= -0.5f) {
         // Manual override (0=SSR, 1=Dynamic, 2=Vanilla) with validity fallback:
         // SSR if confident, else Dynamic, else Vanilla; Dynamic if valid, else Vanilla.
         const bool dynUsable = (dynamicConf > 0.5f);
@@ -116,23 +120,26 @@ void DynCubeResolveSSR(
         float3 dynLayer = lerp(vanillaCol, dynCol, effectiveDynamicConf);
         float3 ssrLayer = ssrUsable ? ssrCol : dynLayer;
         float3 vanLayer = vanillaCol;
-        if (layerMix <= 1.0f) {
-          float t = saturate(layerMix);
+        if (effMix <= 1.0f) {
+          float t = saturate(effMix);
           dynCol = lerp(ssrLayer, dynLayer, t);
           reflSrc = (t < 0.5f) ? (ssrUsable ? 0 : (dynUsable ? 1 : 2))
                                : (dynUsable ? 1 : 2);
         } else {
-          float u = saturate(layerMix - 1.0f);
+          float u = saturate(effMix - 1.0f);
           dynCol = lerp(dynLayer, vanLayer, u);
           reflSrc = (u < 0.5f) ? (dynUsable ? 1 : 2) : 2;
         }
         outVanillaWeight = (reflSrc == 2) ? 1.0 : 0.0;
       } else {
-        // Automatic confidence blend (weights always sum to 1).
+        // Automatic confidence blend (weights always sum to 1 when the vanilla
+        // fallback is on; with it off the vanilla share is dropped so misses
+        // decay to bed instead of showing vanilla-cube tint).
         float remaining = 1.0 - ssrWeight;
         float dynamicWeight = remaining * effectiveDynamicConf;
         float vanillaWeight = remaining - dynamicWeight;
-        dynCol = ssrCol * ssrWeight + dynCol * dynamicWeight + vanillaCol * vanillaWeight;
+        dynCol = ssrCol * ssrWeight + dynCol * dynamicWeight
+            + (vanillaFallbackActive ? vanillaCol * vanillaWeight : float3(0, 0, 0));
         reflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
                  : (dynamicWeight >= vanillaWeight) ? 1 : 2;
         outVanillaWeight = vanillaWeight;
@@ -151,7 +158,7 @@ void DynCubeResolveSSRValues(
     TextureCube<float4> vanillaTex, SamplerState cubeSampler,
     TextureCube<float4> histPosTex, SamplerState pointSampler,
     float2 ssrUV, float3 reflDir, float vanillaMipFactor,
-    bool reflActive, bool forceDynamicActive, bool forceSSRActive, bool newSSRActive,
+    bool reflActive, bool forceDynamicActive, bool forceSSRActive, bool newSSRActive, bool vanillaFallbackActive,
     inout float3 dynCol, inout int reflSrc, out float outVanillaWeight)
 {
   outVanillaWeight = 1.0;
@@ -172,6 +179,10 @@ void DynCubeResolveSSRValues(
       outVanillaWeight = 0.0;
     } else {
       const float layerMix = shader_injection_data.dynCube_layer_mix;
+      // Manual layer mix toward Vanilla degrades to dynamic-or-miss when the
+      // vanilla fallback is off (SSR replacement path): the vanilla layer can
+      // never contribute visible color there.
+      const float effMix = vanillaFallbackActive ? layerMix : min(layerMix, 1.0f);
       // SSR color + confidence arrive pre-computed; ssrWeight computed only for automatic mode.
       float ssrWeight = 0.0;
       if (newSSRActive) {
@@ -227,7 +238,7 @@ void DynCubeResolveSSRValues(
       // filtered signal crosses the validity boundary instead of multiplying after it.
       float effectiveDynamicConf = (shader_injection_data.dynCube_coverage_fade > 0.5f)
           ? coverageFade : dynamicConf;
-      if (layerMix >= -0.5f) {
+      if (effMix >= -0.5f) {
         // Manual override (0=SSR, 1=Dynamic, 2=Vanilla) with validity fallback:
         // SSR if confident, else Dynamic, else Vanilla; Dynamic if valid, else Vanilla.
         const bool dynUsable = (dynamicConf > 0.5f);
@@ -235,23 +246,26 @@ void DynCubeResolveSSRValues(
         float3 dynLayer = lerp(vanillaCol, dynCol, effectiveDynamicConf);
         float3 ssrLayer = ssrUsable ? ssrCol : dynLayer;
         float3 vanLayer = vanillaCol;
-        if (layerMix <= 1.0f) {
-          float t = saturate(layerMix);
+        if (effMix <= 1.0f) {
+          float t = saturate(effMix);
           dynCol = lerp(ssrLayer, dynLayer, t);
           reflSrc = (t < 0.5f) ? (ssrUsable ? 0 : (dynUsable ? 1 : 2))
                                : (dynUsable ? 1 : 2);
         } else {
-          float u = saturate(layerMix - 1.0f);
+          float u = saturate(effMix - 1.0f);
           dynCol = lerp(dynLayer, vanLayer, u);
           reflSrc = (u < 0.5f) ? (dynUsable ? 1 : 2) : 2;
         }
         outVanillaWeight = (reflSrc == 2) ? 1.0 : 0.0;
       } else {
-        // Automatic confidence blend (weights always sum to 1).
+        // Automatic confidence blend (weights always sum to 1 when the vanilla
+        // fallback is on; with it off the vanilla share is dropped so misses
+        // decay to bed instead of showing vanilla-cube tint).
         float remaining = 1.0 - ssrWeight;
         float dynamicWeight = remaining * effectiveDynamicConf;
         float vanillaWeight = remaining - dynamicWeight;
-        dynCol = ssrCol * ssrWeight + dynCol * dynamicWeight + vanillaCol * vanillaWeight;
+        dynCol = ssrCol * ssrWeight + dynCol * dynamicWeight
+            + (vanillaFallbackActive ? vanillaCol * vanillaWeight : float3(0, 0, 0));
         reflSrc = (ssrWeight >= dynamicWeight && ssrWeight >= vanillaWeight) ? 0
                  : (dynamicWeight >= vanillaWeight) ? 1 : 2;
         outVanillaWeight = vanillaWeight;

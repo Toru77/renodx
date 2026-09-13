@@ -275,12 +275,13 @@ void main(
       dynCubeVanillaTex, DynCubeCubeSampler,
       dynCubeHistPosTex, samPoint_s,
       v1.xy, dynCubeReflDir, 0.0,
-      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, false,
       waterResolved, dynCubeReflSrc, waterVanillaW);
 
   // Game-SSR encoding: rgb = resolved reflection, w = non-vanilla fraction.
-  // Miss-everywhere yields {vanillaCol, 0}, identical in effect to a vanilla
-  // {sceneColor, 0} miss under downstream w-lerp blending.
+  // Miss-everywhere yields {0, 0} (no vanilla-cube tint by design on this path):
+  // downstream w-lerp blending shows the bed, identical in effect to a vanilla
+  // {sceneColor, 0} miss.
   o0 = float4(waterResolved, saturate(1.0 - waterVanillaW));
   return;
 }
