@@ -3134,7 +3134,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeBlur", .binding = &shader_injection.dynCube_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 3.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
+      .default_value = 2.f, .label = "Dynamic Cubemap Blur", .section = "Dynamic Cubemaps",
       .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3225,7 +3225,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeForceMip", .binding = &shader_injection.dynCube_force_mip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Force Cubemap Mip", .section = "Dynamic Cubemaps",
+      .default_value = -1.f, .label = "Force Cubemap Mip", .section = "Dynamic Cubemaps",
       .tooltip = "Debug: force the t17 reflection mip. -1 = normal roughness LOD. 0..7 = always sample that mip (verifies the GGX chain reaches the reflection).",
       .min = -1.f, .max = 7.f, .format = "%d",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3502,7 +3502,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRReplacement", .binding = &shader_injection.dynCube_ssr_replacement,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "SSR Replacement", .section = "Dynamic Cubemaps",
+      .default_value = 1.f, .label = "SSR Replacement", .section = "Dynamic Cubemaps",
       .tooltip = "Replace the Sora (1st/2nd) / Kai water SSR resolve with the DynCube composite (game march + dynamic cubemap, misses decay with no vanilla-cube tint) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
