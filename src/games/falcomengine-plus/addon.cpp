@@ -820,6 +820,8 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list);
+static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list);
+static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
@@ -1053,8 +1055,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     },
     // ── Sora 1st SSR (fused march + temporal, replacement-gated) ──
     // NOTE: the single pass runs the vanilla march inline and temporally filters
-    // it; the composite resolves march > dynamic > vanilla and keeps the vanilla
-    // temporal stage. Otherwise the game draws vanilla.
+    // it; the composite resolves march > dynamic > miss (no vanilla cube on this
+    // path) and keeps the vanilla temporal stage. Otherwise the game draws vanilla.
     {
         0x8B35370Au,
         renodx::mods::shader::CustomShader{
@@ -1062,6 +1064,29 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .code = __0x8B35370A,
             .on_replace = OnReplaceSora1stSSRDraw,
             .on_draw = OnBeforeSora1stSSRDraw,
+        },
+    },
+    // ── Kai SSR (fused march + temporal, replacement-gated; High + Ultra) ──
+    // NOTE: both quality variants run the vanilla march inline and temporally
+    // filter it; each composite resolves march > dynamic > miss (no vanilla
+    // cube on this path) and keeps the vanilla temporal stage. Only one variant
+    // runs at a time. Otherwise the game draws vanilla.
+    {
+        0xA1668427u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xA1668427u,
+            .code = __0xA1668427,
+            .on_replace = OnReplaceKaiSSRDraw,
+            .on_draw = OnBeforeKaiSSRDraw,
+        },
+    },
+    {
+        0x209125C1u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x209125C1u,
+            .code = __0x209125C1,
+            .on_replace = OnReplaceKaiSSRDraw,
+            .on_draw = OnBeforeKaiSSRDraw,
         },
     },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
@@ -3478,7 +3503,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeSSRReplacement", .binding = &shader_injection.dynCube_ssr_replacement,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "SSR Replacement", .section = "Dynamic Cubemaps",
-      .tooltip = "Replace the Sora (1st/2nd) water SSR resolve with the DynCube composite (game march + dynamic cubemap + vanilla fallback) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
+      .tooltip = "Replace the Sora (1st/2nd) / Kai water SSR resolve with the DynCube composite (game march + dynamic cubemap, misses decay with no vanilla-cube tint) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
@@ -3486,7 +3511,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeGameSSR", .binding = &shader_injection.dynCube_game_ssr,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Game SSR", .section = "Dynamic Cubemaps",
-      .tooltip = "Run the game's own SSR march and feed it to the SSR Replacement composite (game reflection, then dynamic cubemap, then vanilla fallback). Off skips the march: water receives dynamic cubemap + vanilla fallback only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
+      .tooltip = "Run the game's own SSR march and feed it to the SSR Replacement composite (game reflection, then dynamic cubemap, misses decay with no vanilla-cube tint). Off skips the march: water receives dynamic cubemap only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_replacement > 0.5f; },
     },
@@ -4608,6 +4633,85 @@ static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list) {
 // sora1st ssr code replacement gate: false keeps the vanilla shader (still draws).
 static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list) {
   return Sora1stSSRReplaceActive(cmd_list);
+}
+
+// ── Kai SSR Replacement (fused march + temporal composites, High + Ultra) ──
+// Master gate mirrors the Sora gates (shared toggles), minus any mrt capture
+// requirement: each composite reads mrt0 from the game-bound t2, exactly like
+// the vanilla pass it replaces, so no capture can starve serving. Only one
+// quality variant runs at a time; the gate is identical for both.
+static bool KaiSSRReplaceActive(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return false;
+  if (shader_injection.dynCube_ssr_replacement < 0.5f) return false;
+  if (shader_injection.dynCube_enabled < 0.5f
+      || shader_injection.dynCube_force_vanilla > 0.5f
+      || shader_injection.dynCube_debug == 4.f) return false;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return false;
+  auto* dd = dev->get_private_data<DeviceData>();
+  if (!dd) return false;
+  if (!dd->captured_vanilla_env_srv.handle) return false;
+  reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
+      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+      : dd->dyncube_srv;
+  if (!t17srv.handle) return false;
+  return true;
+}
+
+// kai ssr: push everything the composite PS needs (game binds
+// t0/t1/t2/t3/t4/s0/s1/b0/b2). No custom-SSR pushes: each composite resolves
+// the inline vanilla march, never t31. Pushes only when the composite serves;
+// otherwise vanilla draws untouched.
+static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list) {
+  if (!KaiSSRReplaceActive(cmd_list)) return true;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return true;
+  auto* dd = dev->get_private_data<DeviceData>();
+  if (!dd) return true;
+  reshade::api::resource_view t17srv = dd->dyncube_ggx_valid
+      ? dd->dyncube_ggx_out_cube_srv[dd->dyncube_ggx_active]
+      : dd->dyncube_srv;
+  if (t17srv.handle) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kDynCubeRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &t17srv});
+  }
+  if (dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv.handle) {
+    auto histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kDynCubeHistPosRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &histPosSrv});
+  }
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel,
+      reshade::api::pipeline_layout{0}, 0,
+      reshade::api::descriptor_table_update{
+          {}, kDynCubeVanillaRegister, 0, 1,
+          reshade::api::descriptor_type::texture_shader_resource_view,
+          &dd->captured_vanilla_env_srv});
+  if (dd->dyncube_worldbox_bounds_srv.handle) {
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, kDynCubeWorldBoxRegister, 0, 1,
+            reshade::api::descriptor_type::buffer_shader_resource_view,
+            &dd->dyncube_worldbox_bounds_srv});
+  }
+  return true;
+}
+
+// kai ssr code replacement gate: false keeps the vanilla shader (still draws).
+static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list) {
+  return KaiSSRReplaceActive(cmd_list);
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
