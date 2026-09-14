@@ -68,6 +68,8 @@ Texture2D<float4> depthTexture : register(t1);
 Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<uint2> mrtTexture2 : register(t3);
 
+#include "../../shared.h"  // shader_injection (Vanilla SSR Improvements toggles); b13 auto-delivered
+
 
 // 3Dmigoto declarations
 #define cmp -
@@ -239,9 +241,18 @@ void main(
       r4.x = r4.w / r4.x;
       r4.x = r4.x + -r3.z;
       r4.w = cmp(0 < r4.x);
-      r4.x = cmp(r4.x < 0);
-      r4.x = r4.x ? r4.w : 0;
-      r2.w = r4.x ? -r1.w : r1.w;
+      // Refine backtrack fix (Vanilla SSR Improvements): step back when inside,
+      // Kai-style, so the 4 iterations bracket the crossing. Off = verbatim
+      // vanilla (forward-only step, A/B). The hit threshold is tunable: hit when
+      // the depth delta exceeds it (0 = any penetration, Kai behavior).
+      if (shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
+        bool refineHit = r4.x > shader_injection_data.dynCube_vanilla_refine_threshold;
+        r2.w = refineHit ? -r1.w : r1.w;
+      } else {
+        r4.x = cmp(r4.x < 0);
+        r4.x = r4.x ? r4.w : 0;
+        r2.w = r4.x ? -r1.w : r1.w;
+      }
       r4.z = (int)r4.z + 1;
     }
     r0.zw = r5.xy;

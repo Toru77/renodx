@@ -275,9 +275,16 @@ void main(
         r5.x = r5.w / r5.x;
         r5.x = r5.x + -r4.z;
         r5.w = cmp(0 < r5.x);
-        r5.x = cmp(r5.x < 0);
-        r5.x = r5.x ? r5.w : 0;
-        r3.w = r5.x ? -r1.w : r1.w;
+        // Refine backtrack fix (Vanilla SSR Improvements): step back when inside,
+        // Kai-style, so the 4 iterations bracket the crossing. Off = verbatim
+        // vanilla (forward-only step, A/B).
+        if (shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
+          r3.w = r5.w ? -r1.w : r1.w;
+        } else {
+          r5.x = cmp(r5.x < 0);
+          r5.x = r5.x ? r5.w : 0;
+          r3.w = r5.x ? -r1.w : r1.w;
+        }
         r5.z = (int)r5.z + 1;
       }
       r0.zw = r6.xy;

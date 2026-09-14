@@ -83,6 +83,7 @@ Texture2D<float4> ssrTexture : register(t0);
 Texture2D<float4> historyTexture : register(t1);
 Texture2D<float> depthTexture : register(t2);
 Texture2D<uint4> mrtTexture0 : register(t4);
+Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
@@ -92,6 +93,16 @@ StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 #include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
+
+// Static point-clamp sampler for the IS-FAST noise volume (mirrors the custom
+// march sampling: stable texel values, frac-wrapped UVs stay in [0,1)).
+SamplerState ssrIsfastNoiseSamp
+{
+  Filter = MIN_MAG_MIP_POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+  AddressW = Clamp;
+};
 
 // Static cube sampler (game binds no cube sampler on ssr2 draws):
 // trilinear wrap is the cube-sampling standard. If seams ever appear,
@@ -128,13 +139,15 @@ void main(
   int2 mrtPx = int2(min(v1.xy * float2(mrtW, mrtH), float2(mrtW - 1, mrtH - 1)));
   uint4 mrtRaw = mrtTexture0.Load(int3(mrtPx, 0));
   // Water-eligibility gate (verbatim game logic): only mrt0.w&2 pixels take the
-  // composite path below. Everything else — plus the whole frame under Force
-  // Vanilla / DynCube-off — runs the verbatim vanilla ssr2 body, so bed and
-  // non-water pixels are pixel-identical to vanilla.
+  // composite path below, and only while SSR Replacement serves. Everything
+  // else runs the vanilla ssr2 body — verbatim when all Vanilla SSR
+  // Improvements are off, improved when enabled — so bed and non-water pixels
+  // stay correct.
   bool dynCubeWaterEligible = ((((int)mrtRaw.w) & 2) != 0);
   bool dynCubeVanillaBypass = shader_injection_data.dynCube_enabled < 0.5f
       || shader_injection_data.dynCube_force_vanilla > 0.5f;
-  if (!dynCubeWaterEligible || dynCubeVanillaBypass) {
+  bool ssrReplacementServing = shader_injection_data.dynCube_ssr_replacement > 0.5f;
+  if (!dynCubeWaterEligible || dynCubeVanillaBypass || !ssrReplacementServing) {
     float4 r0,r1,r2,r3,r4,r5;
     uint4 bitmask, uiDest;
     float4 fDest;
@@ -153,9 +166,31 @@ void main(
     r0.xy = r1.xy / r0.xx;
     r0.xy = r0.xy * float2(0.5,0.5) + float2(0.5,0.5);
     r0.z = 1 + -r0.y;
+    // Reprojection motion (Vanilla SSR Improvements): unscaled flipped history
+    // UV vs current tap UV, same space Kai measures in. Feeds adaptive weight
+    // and the disocclusion tests below.
+    float2 ssrHistRawUV = r0.xz;
+    float ssrMotionD = length(ssrHistRawUV - v1.xy);
     r0.xy = resolutionScaling_g.xy * r0.xz;
     r0.xy = prevResolutionScaling_g.xy * r0.xy;
-    r0.xyzw = historyTexture.SampleLevel(samLinear_s, r0.xy, 0).xyzw;
+    float2 ssrHistTapUV = r0.xy;
+    // IS-FAST subpixel history distribution (Vanilla SSR Improvements):
+    // blue-noise offset of the single history tap so TAA/upscalers receive a
+    // temporally distributed signal. Mirrors the custom march pattern (same
+    // volume, frame slice, spatial scale, strength blend; strength 0 = zero
+    // offset = vanilla). Seed fixed at 0; frame -1 (noise unusable) disables.
+    float ssrIsfastFrame = shader_injection_data.dynCube_vanilla_isfast_frame;
+    bool ssrIsfastOn = shader_injection_data.dynCube_vanilla_isfast > 0.5f && ssrIsfastFrame >= 0.0f;
+    if (ssrIsfastOn) {
+      uint ssrHistW, ssrHistH;
+      historyTexture.GetDimensions(ssrHistW, ssrHistH);
+      float ssrIsfastSpatial = max(shader_injection_data.dynCube_ssr_isfast_spatial, 1e-4f);
+      float2 ssrIsfNxy = frac((v1.xy * float2(ssrHistW, ssrHistH) + 0.5) / 128.0 * ssrIsfastSpatial);
+      float ssrIsfNz = frac((fmod(ssrIsfastFrame, 32.0) + 0.5) / 32.0 * max(shader_injection_data.dynCube_ssr_isfast_temporal, 0.0f));
+      float2 ssrIsfN = dynCubeIsfastNoiseTex.SampleLevel(ssrIsfastNoiseSamp, float3(ssrIsfNxy, ssrIsfNz), 0).xy;
+      ssrHistTapUV += (ssrIsfN - 0.5) * texelSize_g.xy * clamp(shader_injection_data.dynCube_ssr_isfast_strength, 0.0f, 1.0f);
+    }
+    r0.xyzw = historyTexture.SampleLevel(samLinear_s, ssrHistTapUV, 0).xyzw;
     r1.xy = saturate(-texelSize_g.xy * float2(0.5,0.5) + v1.xy);
     r1.xyzw = ssrTexture.SampleLevel(samLinear_s, r1.xy, 0).xyzw;
     r2.xy = saturate(texelSize_g.xy * float2(0.5,0.5) + v1.xy);
@@ -191,7 +226,30 @@ void main(
     r1.x = min(1, r1.x);
     r0.xyzw = r0.xyzw * r1.xxxx + r2.xyzw;
     r0.xyzw = r0.xyzw + -r4.xyzw;
-    r0.xyzw = r0.xyzw * float4(0.899999976,0.899999976,0.899999976,0.899999976) + r4.xyzw;
+    // History blend (Vanilla SSR Improvements): fixed slider weight or
+    // motion-adaptive (Kai formula: 0.1 static → 0.4 fast). r0 = history.
+    float ssrCurFrac = (shader_injection_data.dynCube_vanilla_history_fixed > 0.5f)
+        ? (1.0f - clamp(shader_injection_data.dynCube_vanilla_history_weight, 0.0f, 0.99f))
+        : (0.4 - 0.3 * exp2(-1442.69507 * ssrMotionD));
+    float ssrHistFrac = 1.0f - ssrCurFrac;
+    r0.xyzw = r0.xyzw * ssrHistFrac + r4.xyzw;
+    // Disocclusion reject (Vanilla SSR Improvements): validate the reprojected
+    // history against current-frame scene data; on mismatch use the current
+    // SSR result instead of stale history. UV bounds exact; motion + depth via
+    // sliders. Confidence rides along (current conf on reject, like Kai).
+    bool ssrRejectHist = false;
+    if (shader_injection_data.dynCube_vanilla_disoc_reject > 0.5f) {
+      ssrRejectHist = any(ssrHistRawUV < 0.0f) || any(ssrHistRawUV > 1.0f)
+          || (ssrMotionD > clamp(shader_injection_data.dynCube_vanilla_disoc_uv, 0.0f, 0.25f));
+      if (!ssrRejectHist) {
+        float ssrDepthCur = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+        float ssrDepthHist = depthTexture.SampleLevel(samPoint_s, ssrHistRawUV, 0).x;
+        float ssrLinCur = dot(projInv_g._m22_m32, float2(ssrDepthCur, 1.0)) / dot(projInv_g._m23_m33, float2(ssrDepthCur, 1.0));
+        float ssrLinHist = dot(projInv_g._m22_m32, float2(ssrDepthHist, 1.0)) / dot(projInv_g._m23_m33, float2(ssrDepthHist, 1.0));
+        ssrRejectHist = abs(ssrLinHist - ssrLinCur) > clamp(shader_injection_data.dynCube_vanilla_disoc_depth, 0.0f, 2.0f);
+      }
+      if (ssrRejectHist) r0.xyzw = r4.xyzw;
+    }
     r0.xyzw = max(float4(0,0,0,0), r0.xyzw);
     o0.xyzw = min(float4(65472,65472,65472,65472), r0.xyzw);
     return;

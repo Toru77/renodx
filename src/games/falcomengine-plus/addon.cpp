@@ -313,6 +313,15 @@ ShaderInjectData shader_injection = {
   .dynCube_ssr_replacement = 0.f,
   .dynCube_ssr_replacement_debug = 0.f,
   .dynCube_game_ssr = 1.f,
+  .dynCube_vanilla_refine_fix = 1.f,
+  .dynCube_vanilla_refine_threshold = 0.5f,
+  .dynCube_vanilla_history_fixed = 0.f,
+  .dynCube_vanilla_history_weight = 0.9f,
+  .dynCube_vanilla_disoc_reject = 1.f,
+  .dynCube_vanilla_disoc_depth = 0.25f,
+  .dynCube_vanilla_disoc_uv = 0.05f,
+  .dynCube_vanilla_isfast = 1.f,
+  .dynCube_vanilla_isfast_frame = -1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -816,6 +825,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 // VBGI is now integrated into GTVBAO main pass — no separate RunVBGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list);
+static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list);
@@ -1041,6 +1051,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         renodx::mods::shader::CustomShader{
             .crc32 = 0xE2F406C7u,
             .code = __0xE2F406C7,
+            .on_replace = OnReplaceSoraSSR1Draw,
             .on_draw = OnBeforeSoraSSR1Draw,
         },
     },
@@ -3524,6 +3535,70 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 4.f, .format = "%d",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
+    // ── Vanilla SSR Improvements (Sora2nd march/denoise correctness, A/B) ──
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaRefineFix", .binding = &shader_injection.dynCube_vanilla_refine_fix,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Refine Backtrack Fix", .section = "Vanilla SSR Improvements",
+      .tooltip = "Fix Sora2nd ssr1 refinement to bracket the crossing (step back when inside, Kai-style) instead of stepping only forward. Off restores the verbatim vanilla behavior for A/B.",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaRefineThreshold", .binding = &shader_injection.dynCube_vanilla_refine_threshold,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Refine Hit Threshold", .section = "Vanilla SSR Improvements",
+      .tooltip = "Hit threshold on the refine depth delta (scene depth minus ray depth, view units): hit when delta exceeds this. 0 = any penetration counts (Kai behavior); higher is stricter (fewer, firmer hits). Only applies while Refine Backtrack Fix is on.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_refine_fix > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaHistoryFixed", .binding = &shader_injection.dynCube_vanilla_history_fixed,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fixed History Blend", .section = "Vanilla SSR Improvements",
+      .tooltip = "On = fixed history weight from the slider below (0.9 = vanilla); Off = motion-adaptive weighting (Kai formula: mostly history when static, mostly current when moving).",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaHistoryWeight", .binding = &shader_injection.dynCube_vanilla_history_weight,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.9f, .label = "Fixed History Weight", .section = "Vanilla SSR Improvements",
+      .tooltip = "History fraction used when Fixed History Blend is on (0.9 = vanilla). Higher = longer trails but stabler; lower = fresher but noisier.",
+      .min = 0.5f, .max = 0.99f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_history_fixed > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaDisocReject", .binding = &shader_injection.dynCube_vanilla_disoc_reject,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Disocclusion Reject", .section = "Vanilla SSR Improvements",
+      .tooltip = "Validate the reprojected history sample against current-frame scene data (UV bounds, motion distance, depth mismatch); on mismatch use the current SSR result instead of stale history.",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaDisocDepth", .binding = &shader_injection.dynCube_vanilla_disoc_depth,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.25f, .label = "Disocclusion Depth Threshold", .section = "Vanilla SSR Improvements",
+      .tooltip = "Reject history when |linear depth at history UV minus linear depth here| exceeds this (view units). 0 = always reject on depth. Only applies while Disocclusion Reject is on.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaDisocUV", .binding = &shader_injection.dynCube_vanilla_disoc_uv,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.05f, .label = "Disocclusion Motion Threshold", .section = "Vanilla SSR Improvements",
+      .tooltip = "Reject history when reprojection motion exceeds this (0-1 UV units, ~5% of screen at default). 0 = any motion rejects. Only applies while Disocclusion Reject is on.",
+      .min = 0.f, .max = 0.25f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaISFAST", .binding = &shader_injection.dynCube_vanilla_isfast,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "IS-FAST History Distribution", .section = "Vanilla SSR Improvements",
+      .tooltip = "Blue-noise subpixel distribution of the single history tap (same 128x128x32 volume, frame slice, spatial scale and strength blend as the custom SSR IS-FAST phase; strength 0 = off). Gives TAA/upscalers a temporally distributed signal. Needs IS-FAST noise available.",
+      .labels = {"Off", "On"},
+    },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4486,11 +4561,44 @@ static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
       && shader_injection.dynCube_game_ssr < 0.5f) return false;
   return true;
 }
+
+// ssr1 code replacement gate: the tree file must actually execute whenever any
+// consumer needs its edited behavior — the full replacement chain, or any
+// Vanilla SSR Improvements toggle (future toggles extend this OR). False keeps
+// the game bytecode (fully vanilla path, bit-exact).
+static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list) {
+  if (SoraSSRReplaceActive(cmd_list)) return true;
+  if (shader_injection.dynCube_vanilla_refine_fix > 0.5f) return true;
+  return false;
+}
+// ssr2 vanilla-improvement gate: the tree file must execute (instead of game
+// bytecode) whenever any Vanilla SSR Improvements toggle changes vanilla ssr2
+// behavior — motion-adaptive history, non-0.9 fixed weight, disocclusion
+// reject, or usable IS-FAST distribution. All off = bytecode, bit-exact.
+// (The replacement chain serves via SoraSSRReplaceActive separately.)
+static bool SoraSSRVanillaActive(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return false;
+  if (shader_injection.dynCube_ssr_replacement > 0.5f) return false;
+  if (shader_injection.dynCube_enabled < 0.5f
+      || shader_injection.dynCube_force_vanilla > 0.5f
+      || shader_injection.dynCube_debug == 4.f) return false;
+  if (shader_injection.dynCube_vanilla_history_fixed < 0.5f) return true;  // motion-adaptive differs from fixed 0.9
+  if (shader_injection.dynCube_vanilla_history_weight < 0.8999f
+      || shader_injection.dynCube_vanilla_history_weight > 0.9001f) return true;
+  if (shader_injection.dynCube_vanilla_disoc_reject > 0.5f) return true;
+  if (shader_injection.dynCube_vanilla_isfast > 0.5f && g_isfast_enabled > 0.5f) {
+    auto* dev = cmd_list->get_device();
+    auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+    if (dd && dd->isfast_noise_srv.handle) return true;
+  }
+  return false;
+}
 // ssr2: push everything the composite PS needs (game binds t0/t1/t2/s0/s1/b0/b2).
 // No custom-SSR pushes: the composite resolves the vanilla march tap, never t31.
-// Pushes only when the composite serves; otherwise vanilla draws untouched.
+// Pushes when the composite serves or vanilla improvements are active;
+// otherwise vanilla draws untouched.
 static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
-  if (!SoraSSRReplaceActive(cmd_list)) return true;
+  if (!SoraSSRReplaceActive(cmd_list) && !SoraSSRVanillaActive(cmd_list)) return true;
   auto* dev = cmd_list->get_device();
   if (!dev) return true;
   auto* dd = dev->get_private_data<DeviceData>();
@@ -4549,12 +4657,30 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
             reshade::api::descriptor_type::texture_shader_resource_view,
             &mrtSrv});
   }
+  // Vanilla-ISFAST frame slice (exact frame_index % 64 mirror of the custom
+  // march; -1 = noise unusable -> the shader falls back to hash behavior).
+  // IS-FAST noise volume (t5) only when usable; the shader gates sampling on it.
+  {
+    const bool noiseUsable = g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle;
+    shader_injection.dynCube_vanilla_isfast_frame = noiseUsable ? (float)(dd->frame_index % 64u) : -1.f;
+    if (noiseUsable && shader_injection.dynCube_vanilla_isfast > 0.5f) {
+      cmd_list->push_descriptors(
+          reshade::api::shader_stage::pixel,
+          reshade::api::pipeline_layout{0}, 0,
+          reshade::api::descriptor_table_update{
+              {}, 5u, 0, 1,
+              reshade::api::descriptor_type::texture_shader_resource_view,
+              &dd->isfast_noise_srv});
+    }
+  }
   return true;
 }
 
 // ssr2 code replacement gate: false keeps the vanilla shader (still draws).
+// Serves the tree file for the replacement composite and for vanilla temporal
+// improvements alike; the file selects its path in-shader.
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list) {
-  return SoraSSRReplaceActive(cmd_list);
+  return SoraSSRReplaceActive(cmd_list) || SoraSSRVanillaActive(cmd_list);
 }
 
 // ── Sora1st SSR Replacement (fused march + temporal composite) ──

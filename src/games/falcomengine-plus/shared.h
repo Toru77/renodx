@@ -344,6 +344,15 @@ struct ShaderInjectData {
   float dynCube_ssr_replacement;             // 0=vanilla Sora SSR passes, 1=replace ssr1/ssr2 with DynCube composite (appended last: do not insert above)
   float dynCube_ssr_replacement_debug;       // 0=off, 1=ssr1 input, 2=ssr1 march result, 3=lighting SSR texture, 4=lighting color (appended last: do not insert above)
   float dynCube_game_ssr;                    // 0=skip vanilla ssr1 march (water gets dynamic+vanilla only), 1=run it as composite input (appended last: do not insert above)
+  float dynCube_vanilla_refine_fix;          // 0=verbatim vanilla ssr1 refine (forward-only), 1=Kai-style backtrack when inside (appended last: do not insert above)
+  float dynCube_vanilla_refine_threshold;    // hit threshold on the refine depth delta (0=inside/behind surface, higher=stricter); used only when refine fix is on (appended last: do not insert above)
+  float dynCube_vanilla_history_fixed;       // 1=fixed history weight from slider, 0=motion-adaptive (Kai formula) (appended last: do not insert above)
+  float dynCube_vanilla_history_weight;      // fixed history fraction 0.5-0.99 (0.9=vanilla); used only when fixed mode on (appended last: do not insert above)
+  float dynCube_vanilla_disoc_reject;        // 0=off, 1=validate reprojected history vs current scene, use current on mismatch (appended last: do not insert above)
+  float dynCube_vanilla_disoc_depth;         // depth-mismatch reject threshold, view units 0-2 (appended last: do not insert above)
+  float dynCube_vanilla_disoc_uv;            // reprojection-motion reject threshold, 0-1 UV 0-0.25 (appended last: do not insert above)
+  float dynCube_vanilla_isfast;              // 0=off, 1=blue-noise subpixel history distribution (reuses SSR IS-FAST spatial/strength) (appended last: do not insert above)
+  float dynCube_vanilla_isfast_frame;        // runtime: frame_index % 64, or -1 when noise unusable (appended last: do not insert above)
 };
 
 #ifndef __cplusplus
