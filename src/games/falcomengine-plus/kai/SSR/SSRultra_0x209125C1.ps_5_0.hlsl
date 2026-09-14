@@ -93,6 +93,7 @@ Texture2D<float4> prevSSRTexture : register(t4);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
+Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
 StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 
 #include "../../shared.h"
@@ -102,6 +103,16 @@ StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 
 // Static cube sampler (game binds no cube sampler on ssr draws):
 // trilinear wrap is the cube-sampling standard.
+// Static point-clamp sampler for the IS-FAST noise volume (mirrors the custom
+// march sampling: stable texel values, frac-wrapped UVs stay in [0,1)).
+SamplerState kaiIsfastNoiseSamp
+{
+  Filter = MIN_MAG_MIP_POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+  AddressW = Clamp;
+};
+
 SamplerState DynCubeCubeSampler
 {
   Filter = MIN_MAG_MIP_LINEAR;
@@ -284,8 +295,18 @@ void main(
         r5.x = dot(projInv_g._m23_m33, r5.xy);
         r5.x = r5.w / r5.x;
         r5.x = r5.x + -r4.z;
+        float kaiRefineDelta = r5.x;
         r5.x = cmp(0 < r5.x);
-        r3.w = r5.x ? -r1.w : r1.w;
+        // Refine threshold (Vanilla SSR Improvements, shared slider): hit when
+        // the depth delta exceeds it (0 = any penetration, native Kai rule).
+        // Off = verbatim native backtrack, A/B.
+        if (shader_injection_data.dynCube_vanilla_ssr_enabled > 0.5f
+            && shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
+          bool kaiRefineHit = kaiRefineDelta > shader_injection_data.dynCube_vanilla_refine_threshold;
+          r3.w = kaiRefineHit ? -r1.w : r1.w;
+        } else {
+          r3.w = r5.x ? -r1.w : r1.w;
+        }
         r5.z = (int)r5.z + 1;
       }
       r0.zw = r6.xy;
@@ -329,96 +350,101 @@ void main(
   }
   float3 kaiMarchCol = r1.xyz;
   float kaiMarchConf = r1.w;
-  // World position (game reconstruct pattern): NDC from v1.zw, depth from t1.
-  float kaiDepth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-  float4 kaiNdc = float4(v1.zw * float2(2, -2) + float2(-1, 1), kaiDepth, 1);
-  float4 kaiWorldH =
-      float4(dot(kaiNdc, viewProjInv_g._m00_m10_m20_m30),
-             dot(kaiNdc, viewProjInv_g._m01_m11_m21_m31),
-             dot(kaiNdc, viewProjInv_g._m02_m12_m22_m32),
-             dot(kaiNdc, viewProjInv_g._m03_m13_m23_m33));
-  float3 kaiCamPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
-  // NaN guard: degenerate homogeneous w (camera-plane pixels) would poison the
-  // position, view vector, and reflection with inf/NaN, which the temporal
-  // filter then spreads as random black dots. Falling back to the camera
-  // position trips the view-vector guard below into a finite sky-ward ray.
-  // Triggers only on non-finite input: finite pixels take the verbatim path.
-  float3 kaiWaterPos = (abs(kaiWorldH.w) > 1e-6f)
-      ? (kaiWorldH.xyz / kaiWorldH.w) : kaiCamPos;
-  // World normal from the mrt texel — same spherical packing the march decodes
-  // (azimuth/ring form); the march transforms it to view space, we keep world.
-  uint kaiMrtW, kaiMrtH;
-  mrtTexture0.GetDimensions(kaiMrtW, kaiMrtH);
-  int2 kaiMrtPx = int2(min(v1.xy * float2(kaiMrtW, kaiMrtH), float2(kaiMrtW - 1, kaiMrtH - 1)));
-  uint4 kaiMrtRaw = mrtTexture0.Load(int3(kaiMrtPx, 0));
-  float2 kaiEnc = float2(kaiMrtRaw.x, kaiMrtRaw.y) * (1.0 / 32767.5) - 1.0;
-  float kaiAzimuth = 3.14159274 * kaiEnc.x;
-  float kaiRing = sqrt(saturate(1.0 - kaiEnc.y * kaiEnc.y));
-  float3 kaiWaterN = float3(cos(kaiAzimuth) * kaiRing, sin(kaiAzimuth) * kaiRing, kaiEnc.y);
-  if (dot(kaiWaterN, kaiWaterN) < 1e-6) kaiWaterN = float3(0.0, 0.0, -1.0);
-  kaiWaterN = normalize(kaiWaterN);
-  // View / reflection (V = pixel -> camera).
-  // NaN guard: zero-length view vector (camera-grazing pixels) makes
-  // normalize() return NaN. Finite sky-ward fallback; finite pixels take the
-  // verbatim normalize path.
-  float3 kaiToCam = kaiCamPos - kaiWaterPos;
-  float3 kaiWaterV = (dot(kaiToCam, kaiToCam) > 1e-12f) ? normalize(kaiToCam) : float3(0.0, 0.0, 1.0);
-  float kaiNdv = dot(kaiWaterN, kaiWaterV);
-  float3 kaiWaterR = kaiWaterN * (-(kaiNdv + kaiNdv)) + kaiWaterV;
-  // SSR -> Dynamic -> Miss enable set. The SSR leg is the inline vanilla
-  // march (live exactly when the gate above ran it); the custom march is never
-  // consumed here; the vanilla cube never contributes visible color here.
-  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_game_ssr > 0.5f;
-  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_force_dynamic > 0.5f;
-  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_force_ssr > 0.5f;
-  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-  float3 dynCubeReflDir = float3(0, 0, 0);
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    dynCubeSsrGateConf = kaiMarchConf;
+  // Replacement path only: dynamic sample + resolve. Vanilla-improved
+  // mode passes march output straight to temporal below.
+  bool kaiCompositeActive = shader_injection_data.dynCube_ssr_replacement > 0.5f;
+  if (kaiCompositeActive) {
+    // World position (game reconstruct pattern): NDC from v1.zw, depth from t1.
+    float kaiDepth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+    float4 kaiNdc = float4(v1.zw * float2(2, -2) + float2(-1, 1), kaiDepth, 1);
+    float4 kaiWorldH =
+        float4(dot(kaiNdc, viewProjInv_g._m00_m10_m20_m30),
+               dot(kaiNdc, viewProjInv_g._m01_m11_m21_m31),
+               dot(kaiNdc, viewProjInv_g._m02_m12_m22_m32),
+               dot(kaiNdc, viewProjInv_g._m03_m13_m23_m33));
+    float3 kaiCamPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
+    // NaN guard: degenerate homogeneous w (camera-plane pixels) would poison the
+    // position, view vector, and reflection with inf/NaN, which the temporal
+    // filter then spreads as random black dots. Falling back to the camera
+    // position trips the view-vector guard below into a finite sky-ward ray.
+    // Triggers only on non-finite input: finite pixels take the verbatim path.
+    float3 kaiWaterPos = (abs(kaiWorldH.w) > 1e-6f)
+        ? (kaiWorldH.xyz / kaiWorldH.w) : kaiCamPos;
+    // World normal from the mrt texel — same spherical packing the march decodes
+    // (azimuth/ring form); the march transforms it to view space, we keep world.
+    uint kaiMrtW, kaiMrtH;
+    mrtTexture0.GetDimensions(kaiMrtW, kaiMrtH);
+    int2 kaiMrtPx = int2(min(v1.xy * float2(kaiMrtW, kaiMrtH), float2(kaiMrtW - 1, kaiMrtH - 1)));
+    uint4 kaiMrtRaw = mrtTexture0.Load(int3(kaiMrtPx, 0));
+    float2 kaiEnc = float2(kaiMrtRaw.x, kaiMrtRaw.y) * (1.0 / 32767.5) - 1.0;
+    float kaiAzimuth = 3.14159274 * kaiEnc.x;
+    float kaiRing = sqrt(saturate(1.0 - kaiEnc.y * kaiEnc.y));
+    float3 kaiWaterN = float3(cos(kaiAzimuth) * kaiRing, sin(kaiAzimuth) * kaiRing, kaiEnc.y);
+    if (dot(kaiWaterN, kaiWaterN) < 1e-6) kaiWaterN = float3(0.0, 0.0, -1.0);
+    kaiWaterN = normalize(kaiWaterN);
+    // View / reflection (V = pixel -> camera).
+    // NaN guard: zero-length view vector (camera-grazing pixels) makes
+    // normalize() return NaN. Finite sky-ward fallback; finite pixels take the
+    // verbatim normalize path.
+    float3 kaiToCam = kaiCamPos - kaiWaterPos;
+    float3 kaiWaterV = (dot(kaiToCam, kaiToCam) > 1e-12f) ? normalize(kaiToCam) : float3(0.0, 0.0, 1.0);
+    float kaiNdv = dot(kaiWaterN, kaiWaterV);
+    float3 kaiWaterR = kaiWaterN * (-(kaiNdv + kaiNdv)) + kaiWaterV;
+    // SSR -> Dynamic -> Miss enable set. The SSR leg is the inline vanilla
+    // march (live exactly when the gate above ran it); the custom march is never
+    // consumed here; the vanilla cube never contributes visible color here.
+    bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_force_vanilla < 0.5f
+        && shader_injection_data.dynCube_game_ssr > 0.5f;
+    bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_force_vanilla < 0.5f
+        && shader_injection_data.dynCube_force_dynamic > 0.5f;
+    bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_force_vanilla < 0.5f
+        && shader_injection_data.dynCube_force_ssr > 0.5f;
+    float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
+    float3 dynCubeReflDir = float3(0, 0, 0);
+    bool dynCubeReflActive = false;
+    int dynCubeReflSrc = 1;
+    bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
+    float dynCubeSsrGateConf = 1.0f;
+    if (dynCubeSpatialActive && dynCubeNewSSRActive) {
+      dynCubeSsrGateConf = kaiMarchConf;
+    }
+    // Dynamic sample. v1.xy are 0-1 UVs (no rescale).
+    float3 kaiDynCol;
+    float3 kaiFinalDir;
+    int kaiParallaxFace;
+    uint kaiNumLevels;
+    float kaiSampleMip;
+    DynCubeSampleDynamic(
+        texEnvMap_g, DynCubeCubeSampler,
+        dynCubeHistPosTex, samPoint_s,
+        dynCubeWorldBox,
+        kaiWaterPos, kaiWaterR, kaiRough01, dynCubeReflectSign, kaiCamPos,
+        dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+        kaiDynCol, kaiFinalDir, kaiParallaxFace,
+        kaiNumLevels, kaiSampleMip);
+    dynCubeReflDir = kaiFinalDir;
+    dynCubeReflActive = true;
+    // Resolve march-values > dynamic > miss. Sky/depth-miss pixels carry no
+    // validity, so the resolver blends them to miss exactly like the Sora paths.
+    float3 kaiResolved = kaiDynCol;
+    float kaiVanillaW = 1.0;
+    DynCubeResolveSSRValues(
+        kaiMarchCol, kaiMarchConf,
+        dynCubeVanillaTex, DynCubeCubeSampler,
+        dynCubeHistPosTex, samPoint_s,
+        resolutionScaling_g.xy * v1.zw, dynCubeReflDir, kaiRough01,
+        dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, false,
+        kaiResolved, dynCubeReflSrc, kaiVanillaW);
+    // Game-SSR encoding for the temporal stage + downstream: rgb = resolved
+    // reflection, w = non-vanilla fraction (march convention: w = confidence).
+    // Miss-everywhere yields {0, 0}: downstream shows the bed, never black.
+    r1.xyz = kaiResolved;
+    r1.w = saturate(1.0 - kaiVanillaW);
   }
-  // Dynamic sample. v1.xy are 0-1 UVs (no rescale).
-  float3 kaiDynCol;
-  float3 kaiFinalDir;
-  int kaiParallaxFace;
-  uint kaiNumLevels;
-  float kaiSampleMip;
-  DynCubeSampleDynamic(
-      texEnvMap_g, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      dynCubeWorldBox,
-      kaiWaterPos, kaiWaterR, kaiRough01, dynCubeReflectSign, kaiCamPos,
-      dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-      kaiDynCol, kaiFinalDir, kaiParallaxFace,
-      kaiNumLevels, kaiSampleMip);
-  dynCubeReflDir = kaiFinalDir;
-  dynCubeReflActive = true;
-  // Resolve march-values > dynamic > miss. Sky/depth-miss pixels carry no
-  // validity, so the resolver blends them to miss exactly like the Sora paths.
-  float3 kaiResolved = kaiDynCol;
-  float kaiVanillaW = 1.0;
-  DynCubeResolveSSRValues(
-      kaiMarchCol, kaiMarchConf,
-      dynCubeVanillaTex, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      resolutionScaling_g.xy * v1.zw, dynCubeReflDir, kaiRough01,
-      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, false,
-      kaiResolved, dynCubeReflSrc, kaiVanillaW);
-  // Game-SSR encoding for the temporal stage + downstream: rgb = resolved
-  // reflection, w = non-vanilla fraction (march convention: w = confidence).
-  // Miss-everywhere yields {0, 0}: downstream shows the bed, never black.
-  r1.xyz = kaiResolved;
-  r1.w = saturate(1.0 - kaiVanillaW);
   r0.x = dot(r2.xyzw, viewProjInv_g._m00_m10_m20_m30);
   r0.y = dot(r2.xyzw, viewProjInv_g._m01_m11_m21_m31);
   r0.z = dot(r2.xyzw, viewProjInv_g._m02_m12_m22_m32);
@@ -431,6 +457,11 @@ void main(
   r0.xy = r0.xy * float2(0.5,0.5) + float2(0.5,0.5);
   r0.z = 1 + -r0.y;
   r0.yw = -v1.zw + r0.xz;
+  // Reprojection motion (Vanilla SSR Improvements): unscaled flipped history
+  // UV and its distance to current, same space Kai measures in. Feeds the
+  // fixed/adaptive blend selection and the disocclusion tests below.
+  float2 kaiHistRawUV = r0.xz;
+  float kaiMotionD = length(r0.yw);
   r0.y = dot(r0.yw, r0.yw);
   r0.y = sqrt(r0.y);
   r0.y = -1442.69507 * r0.y;
@@ -440,8 +471,50 @@ void main(
   if (!kaiMarchActive) r0.y = 1.0;
   r0.xz = resolutionScaling_g.xy * r0.xz;
   r0.xz = prevResolutionScaling_g.xy * r0.xz;
-  r2.xyzw = prevSSRTexture.SampleLevel(samLinear_s, r0.xz, 0).xyzw;
+  float2 kaiHistTapUV = r0.xz;
+  // IS-FAST subpixel history distribution (Vanilla SSR Improvements):
+  // blue-noise offset of the single history tap so TAA/upscalers receive a
+  // temporally distributed signal. Mirrors the custom march pattern (same
+  // volume, frame slice, spatial scale, strength blend; strength 0 = zero
+  // offset = vanilla). Seed fixed at 0; frame -1 (noise unusable) disables.
+  // Kai has no texelSize uniform: texel derived from history dims.
+  bool kaiVanillaImpr = shader_injection_data.dynCube_vanilla_ssr_enabled > 0.5f;
+  if (kaiVanillaImpr && shader_injection_data.dynCube_vanilla_isfast > 0.5f
+      && shader_injection_data.dynCube_vanilla_isfast_frame >= 0.0f) {
+    uint kaiHistW, kaiHistH;
+    prevSSRTexture.GetDimensions(kaiHistW, kaiHistH);
+    float2 kaiHistTexel = 1.0 / float2(kaiHistW, kaiHistH);
+    float kaiIsfastSpatial = max(shader_injection_data.dynCube_ssr_isfast_spatial, 1e-4f);
+    float2 kaiIsfNxy = frac((v1.xy * float2(kaiHistW, kaiHistH) + 0.5) / 128.0 * kaiIsfastSpatial);
+    float kaiIsfNz = frac((fmod(shader_injection_data.dynCube_vanilla_isfast_frame, 32.0) + 0.5) / 32.0 * max(shader_injection_data.dynCube_ssr_isfast_temporal, 0.0f));
+    float2 kaiIsfN = dynCubeIsfastNoiseTex.SampleLevel(kaiIsfastNoiseSamp, float3(kaiIsfNxy, kaiIsfNz), 0).xy;
+    kaiHistTapUV += (kaiIsfN - 0.5) * kaiHistTexel * clamp(shader_injection_data.dynCube_ssr_isfast_strength, 0.0f, 1.0f);
+  }
+  r2.xyzw = prevSSRTexture.SampleLevel(samLinear_s, kaiHistTapUV, 0).xyzw;
   r1.xyzw = -r2.xyzw + r1.xyzw;
-  o0.xyzw = r0.yyyy * r1.xyzw + r2.xyzw;
+  // History blend (Vanilla SSR Improvements): r0.y carries the vanilla
+  // motion-adaptive weight; fixed slider or master-off restore fixed paths.
+  float kaiCurFrac = r0.y;
+  if (kaiVanillaImpr && shader_injection_data.dynCube_vanilla_history_fixed > 0.5f) {
+    kaiCurFrac = 1.0f - clamp(shader_injection_data.dynCube_vanilla_history_weight, 0.0f, 0.99f);
+  }
+  o0.xyzw = kaiCurFrac * r1.xyzw + r2.xyzw;
+  // Disocclusion reject (Vanilla SSR Improvements): validate the reprojected
+  // history against current-frame scene data; on mismatch use the march
+  // current instead of stale history (r1 holds current-minus-history here, so
+  // current is r1+r2). UV bounds exact; motion + depth via shared sliders.
+  // Confidence rides along (march conf on reject, like Kai vanilla).
+  if (kaiVanillaImpr && shader_injection_data.dynCube_vanilla_disoc_reject > 0.5f) {
+    bool kaiRejectHist = any(kaiHistRawUV < 0.0f) || any(kaiHistRawUV > 1.0f)
+        || (kaiMotionD > clamp(shader_injection_data.dynCube_vanilla_disoc_uv, 0.0f, 0.25f));
+    if (!kaiRejectHist) {
+      float kaiDepthCur = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+      float kaiDepthHist = depthTexture.SampleLevel(samPoint_s, kaiHistRawUV, 0).x;
+      float kaiLinCur = dot(projInv_g._m22_m32, float2(kaiDepthCur, 1.0)) / dot(projInv_g._m23_m33, float2(kaiDepthCur, 1.0));
+      float kaiLinHist = dot(projInv_g._m22_m32, float2(kaiDepthHist, 1.0)) / dot(projInv_g._m23_m33, float2(kaiDepthHist, 1.0));
+      kaiRejectHist = abs(kaiLinHist - kaiLinCur) > clamp(shader_injection_data.dynCube_vanilla_disoc_depth, 0.0f, 2.0f);
+    }
+    if (kaiRejectHist) o0.xyzw = r1.xyzw + r2.xyzw;
+  }
   return;
 }
