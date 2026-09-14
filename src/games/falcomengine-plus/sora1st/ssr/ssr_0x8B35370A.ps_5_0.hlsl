@@ -82,12 +82,23 @@ Texture2D<float4> prevSSRTexture : register(t4);
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
+Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
 StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 
 #include "../../shared.h"
 #include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
+
+// Static point-clamp sampler for the IS-FAST noise volume (mirrors the custom
+// march sampling: stable texel values, frac-wrapped UVs stay in [0,1)).
+SamplerState s1IsfastNoiseSamp
+{
+  Filter = MIN_MAG_MIP_POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+  AddressW = Clamp;
+};
 
 // Static cube sampler (game binds no cube sampler on ssr draws):
 // trilinear wrap is the cube-sampling standard.
@@ -275,11 +286,14 @@ void main(
         r5.x = r5.w / r5.x;
         r5.x = r5.x + -r4.z;
         r5.w = cmp(0 < r5.x);
-        // Refine backtrack fix (Vanilla SSR Improvements): step back when inside,
-        // Kai-style, so the 4 iterations bracket the crossing. Off = verbatim
-        // vanilla (forward-only step, A/B).
-        if (shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
-          r3.w = r5.w ? -r1.w : r1.w;
+        // Refine backtrack fix (Vanilla SSR Improvements): step back when the
+        // depth delta exceeds the shared hit threshold (0 = any penetration,
+        // Kai behavior), Kai-style, so the 4 iterations bracket the crossing.
+        // Off = verbatim vanilla (forward-only step, A/B).
+        if (shader_injection_data.dynCube_vanilla_ssr_enabled > 0.5f
+            && shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
+          bool s1RefineHit = r5.x > shader_injection_data.dynCube_vanilla_refine_threshold;
+          r3.w = s1RefineHit ? -r1.w : r1.w;
         } else {
           r5.x = cmp(r5.x < 0);
           r5.x = r5.x ? r5.w : 0;
@@ -327,86 +341,91 @@ void main(
   }
   float3 s1MarchCol = r1.xyz;
   float s1MarchConf = r1.w;
-  // World position (game reconstruct pattern): NDC from v1.zw, depth from t1.
-  float s1Depth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-  float4 s1Ndc = float4(v1.zw * float2(2, -2) + float2(-1, 1), s1Depth, 1);
-  float4 s1WorldH =
-      float4(dot(s1Ndc, viewProjInv_g._m00_m10_m20_m30),
-             dot(s1Ndc, viewProjInv_g._m01_m11_m21_m31),
-             dot(s1Ndc, viewProjInv_g._m02_m12_m22_m32),
-             dot(s1Ndc, viewProjInv_g._m03_m13_m23_m33));
-  float3 s1WaterPos = s1WorldH.xyz / s1WorldH.w;
-  // World normal from the mrt texel — same spherical packing the march decodes
-  // (azimuth/ring form); the march transforms it to view space, we keep world.
-  uint s1MrtW, s1MrtH;
-  mrtTexture0.GetDimensions(s1MrtW, s1MrtH);
-  int2 s1MrtPx = int2(min(v1.xy * float2(s1MrtW, s1MrtH), float2(s1MrtW - 1, s1MrtH - 1)));
-  uint4 s1MrtRaw = mrtTexture0.Load(int3(s1MrtPx, 0));
-  float2 s1Enc = float2(s1MrtRaw.x, s1MrtRaw.y) * (1.0 / 32767.5) - 1.0;
-  float s1Azimuth = 3.14159274 * s1Enc.x;
-  float s1Ring = sqrt(saturate(1.0 - s1Enc.y * s1Enc.y));
-  float3 s1WaterN = float3(cos(s1Azimuth) * s1Ring, sin(s1Azimuth) * s1Ring, s1Enc.y);
-  if (dot(s1WaterN, s1WaterN) < 1e-6) s1WaterN = float3(0.0, 0.0, -1.0);
-  s1WaterN = normalize(s1WaterN);
-  // View / reflection (V = pixel -> camera).
-  float3 s1CamPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
-  float3 s1WaterV = normalize(s1CamPos - s1WaterPos);
-  float s1Ndv = dot(s1WaterN, s1WaterV);
-  float3 s1WaterR = s1WaterN * (-(s1Ndv + s1Ndv)) + s1WaterV;
-  // SSR -> Dynamic -> Vanilla enable set. The SSR leg is the inline vanilla
-  // march (live exactly when the gate above ran it); the custom march is never
-  // consumed here.
-  bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_game_ssr > 0.5f;
-  bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_force_dynamic > 0.5f;
-  bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_force_vanilla < 0.5f
-      && shader_injection_data.dynCube_force_ssr > 0.5f;
-  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-  float3 dynCubeReflDir = float3(0, 0, 0);
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    dynCubeSsrGateConf = s1MarchConf;
+  // Replacement path only: dynamic sample + resolve. Vanilla-improved
+  // mode passes march output straight to temporal below.
+  bool s1CompositeActive = shader_injection_data.dynCube_ssr_replacement > 0.5f && s1MarchActive;
+  if (s1CompositeActive) {
+    // World position (game reconstruct pattern): NDC from v1.zw, depth from t1.
+    float s1Depth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+    float4 s1Ndc = float4(v1.zw * float2(2, -2) + float2(-1, 1), s1Depth, 1);
+    float4 s1WorldH =
+        float4(dot(s1Ndc, viewProjInv_g._m00_m10_m20_m30),
+               dot(s1Ndc, viewProjInv_g._m01_m11_m21_m31),
+               dot(s1Ndc, viewProjInv_g._m02_m12_m22_m32),
+               dot(s1Ndc, viewProjInv_g._m03_m13_m23_m33));
+    float3 s1WaterPos = s1WorldH.xyz / s1WorldH.w;
+    // World normal from the mrt texel — same spherical packing the march decodes
+    // (azimuth/ring form); the march transforms it to view space, we keep world.
+    uint s1MrtW, s1MrtH;
+    mrtTexture0.GetDimensions(s1MrtW, s1MrtH);
+    int2 s1MrtPx = int2(min(v1.xy * float2(s1MrtW, s1MrtH), float2(s1MrtW - 1, s1MrtH - 1)));
+    uint4 s1MrtRaw = mrtTexture0.Load(int3(s1MrtPx, 0));
+    float2 s1Enc = float2(s1MrtRaw.x, s1MrtRaw.y) * (1.0 / 32767.5) - 1.0;
+    float s1Azimuth = 3.14159274 * s1Enc.x;
+    float s1Ring = sqrt(saturate(1.0 - s1Enc.y * s1Enc.y));
+    float3 s1WaterN = float3(cos(s1Azimuth) * s1Ring, sin(s1Azimuth) * s1Ring, s1Enc.y);
+    if (dot(s1WaterN, s1WaterN) < 1e-6) s1WaterN = float3(0.0, 0.0, -1.0);
+    s1WaterN = normalize(s1WaterN);
+    // View / reflection (V = pixel -> camera).
+    float3 s1CamPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
+    float3 s1WaterV = normalize(s1CamPos - s1WaterPos);
+    float s1Ndv = dot(s1WaterN, s1WaterV);
+    float3 s1WaterR = s1WaterN * (-(s1Ndv + s1Ndv)) + s1WaterV;
+    // SSR -> Dynamic -> Vanilla enable set. The SSR leg is the inline vanilla
+    // march (live exactly when the gate above ran it); the custom march is never
+    // consumed here.
+    bool dynCubeNewSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_force_vanilla < 0.5f
+        && shader_injection_data.dynCube_game_ssr > 0.5f;
+    bool dynCubeForceDynamicActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_force_vanilla < 0.5f
+        && shader_injection_data.dynCube_force_dynamic > 0.5f;
+    bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_force_vanilla < 0.5f
+        && shader_injection_data.dynCube_force_ssr > 0.5f;
+    float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
+    float3 dynCubeReflDir = float3(0, 0, 0);
+    bool dynCubeReflActive = false;
+    int dynCubeReflSrc = 1;
+    bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
+        && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
+    float dynCubeSsrGateConf = 1.0f;
+    if (dynCubeSpatialActive && dynCubeNewSSRActive) {
+      dynCubeSsrGateConf = s1MarchConf;
+    }
+    // Dynamic sample. v1.xy are 0-1 UVs (no rescale).
+    float3 s1DynCol;
+    float3 s1FinalDir;
+    int s1ParallaxFace;
+    uint s1NumLevels;
+    float s1SampleMip;
+    DynCubeSampleDynamic(
+        texEnvMap_g, DynCubeCubeSampler,
+        dynCubeHistPosTex, samPoint_s,
+        dynCubeWorldBox,
+        s1WaterPos, s1WaterR, s1Rough01, dynCubeReflectSign, s1CamPos,
+        dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+        s1DynCol, s1FinalDir, s1ParallaxFace,
+        s1NumLevels, s1SampleMip);
+    dynCubeReflDir = s1FinalDir;
+    dynCubeReflActive = true;
+    // Resolve march-values > dynamic > vanilla. Sky/depth-miss pixels carry no
+    // validity, so the resolver blends them to vanilla like the lighting path.
+    float3 s1Resolved = s1DynCol;
+    float s1VanillaW = 1.0;
+    DynCubeResolveSSRValues(
+        s1MarchCol, s1MarchConf,
+        dynCubeVanillaTex, DynCubeCubeSampler,
+        dynCubeHistPosTex, samPoint_s,
+        resolutionScaling_g.xy * v1.zw, dynCubeReflDir, s1Rough01,
+        dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, false,
+        s1Resolved, dynCubeReflSrc, s1VanillaW);
+    // Game-SSR encoding for the temporal stage + downstream: rgb = resolved
+    // reflection, w = non-vanilla fraction (march convention: w = confidence).
+    // Miss-everywhere yields {0, 0} (no vanilla-cube tint by design on this path).
+    r1.xyz = s1Resolved;
+    r1.w = saturate(1.0 - s1VanillaW);
   }
-  // Dynamic sample. v1.xy are 0-1 UVs (no rescale).
-  float3 s1DynCol;
-  float3 s1FinalDir;
-  int s1ParallaxFace;
-  uint s1NumLevels;
-  float s1SampleMip;
-  DynCubeSampleDynamic(
-      texEnvMap_g, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      dynCubeWorldBox,
-      s1WaterPos, s1WaterR, s1Rough01, dynCubeReflectSign, s1CamPos,
-      dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-      s1DynCol, s1FinalDir, s1ParallaxFace,
-      s1NumLevels, s1SampleMip);
-  dynCubeReflDir = s1FinalDir;
-  dynCubeReflActive = true;
-  // Resolve march-values > dynamic > vanilla. Sky/depth-miss pixels carry no
-  // validity, so the resolver blends them to vanilla like the lighting path.
-  float3 s1Resolved = s1DynCol;
-  float s1VanillaW = 1.0;
-  DynCubeResolveSSRValues(
-      s1MarchCol, s1MarchConf,
-      dynCubeVanillaTex, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      resolutionScaling_g.xy * v1.zw, dynCubeReflDir, s1Rough01,
-      dynCubeReflActive, dynCubeForceDynamicActive, dynCubeForceSSRActive, dynCubeNewSSRActive, false,
-      s1Resolved, dynCubeReflSrc, s1VanillaW);
-  // Game-SSR encoding for the temporal stage + downstream: rgb = resolved
-  // reflection, w = non-vanilla fraction (march convention: w = confidence).
-  // Miss-everywhere yields {0, 0} (no vanilla-cube tint by design on this path).
-  r1.xyz = s1Resolved;
-  r1.w = saturate(1.0 - s1VanillaW);
   r0.x = dot(r2.xyzw, viewProjInv_g._m00_m10_m20_m30);
   r0.y = dot(r2.xyzw, viewProjInv_g._m01_m11_m21_m31);
   r0.z = dot(r2.xyzw, viewProjInv_g._m02_m12_m22_m32);
@@ -419,6 +438,11 @@ void main(
   r0.xy = r0.xy * float2(0.5,0.5) + float2(0.5,0.5);
   r0.z = 1 + -r0.y;
   r0.yw = -v1.zw + r0.xz;
+  // Reprojection motion (Vanilla SSR Improvements): unscaled flipped history
+  // UV and its distance to current, same space Kai measures in. Feeds the
+  // fixed/adaptive blend selection and the disocclusion tests below.
+  float2 s1HistRawUV = r0.xz;
+  float s1MotionD = length(r0.yw);
   r0.y = dot(r0.yw, r0.yw);
   r0.y = sqrt(r0.y);
   r0.y = -1442.69507 * r0.y;
@@ -428,8 +452,50 @@ void main(
   if (!s1MarchActive) r0.y = 1.0;
   r0.xz = resolutionScaling_g.xy * r0.xz;
   r0.xz = prevResolutionScaling_g.xy * r0.xz;
-  r2.xyzw = prevSSRTexture.SampleLevel(samLinear_s, r0.xz, 0).xyzw;
+  float2 s1HistTapUV = r0.xz;
+  // IS-FAST subpixel history distribution (Vanilla SSR Improvements):
+  // blue-noise offset of the single history tap so TAA/upscalers receive a
+  // temporally distributed signal. Mirrors the custom march pattern (same
+  // volume, frame slice, spatial scale, strength blend; strength 0 = zero
+  // offset = vanilla). Seed fixed at 0; frame -1 (noise unusable) disables.
+  // Sora1st has no texelSize uniform: texel derived from history dims.
+  bool s1VanillaImpr = shader_injection_data.dynCube_vanilla_ssr_enabled > 0.5f;
+  if (s1VanillaImpr && shader_injection_data.dynCube_vanilla_isfast > 0.5f
+      && shader_injection_data.dynCube_vanilla_isfast_frame >= 0.0f) {
+    uint s1HistW, s1HistH;
+    prevSSRTexture.GetDimensions(s1HistW, s1HistH);
+    float2 s1HistTexel = 1.0 / float2(s1HistW, s1HistH);
+    float s1IsfastSpatial = max(shader_injection_data.dynCube_ssr_isfast_spatial, 1e-4f);
+    float2 s1IsfNxy = frac((v1.xy * float2(s1HistW, s1HistH) + 0.5) / 128.0 * s1IsfastSpatial);
+    float s1IsfNz = frac((fmod(shader_injection_data.dynCube_vanilla_isfast_frame, 32.0) + 0.5) / 32.0 * max(shader_injection_data.dynCube_ssr_isfast_temporal, 0.0f));
+    float2 s1IsfN = dynCubeIsfastNoiseTex.SampleLevel(s1IsfastNoiseSamp, float3(s1IsfNxy, s1IsfNz), 0).xy;
+    s1HistTapUV += (s1IsfN - 0.5) * s1HistTexel * clamp(shader_injection_data.dynCube_ssr_isfast_strength, 0.0f, 1.0f);
+  }
+  r2.xyzw = prevSSRTexture.SampleLevel(samLinear_s, s1HistTapUV, 0).xyzw;
   r1.xyzw = -r2.xyzw + r1.xyzw;
-  o0.xyzw = r0.yyyy * r1.xyzw + r2.xyzw;
+  // History blend (Vanilla SSR Improvements): r0.y carries the vanilla
+  // motion-adaptive weight; fixed slider or master-off restore fixed paths.
+  float s1CurFrac = r0.y;
+  if (s1VanillaImpr && shader_injection_data.dynCube_vanilla_history_fixed > 0.5f) {
+    s1CurFrac = 1.0f - clamp(shader_injection_data.dynCube_vanilla_history_weight, 0.0f, 0.99f);
+  }
+  o0.xyzw = s1CurFrac * r1.xyzw + r2.xyzw;
+  // Disocclusion reject (Vanilla SSR Improvements): validate the reprojected
+  // history against current-frame scene data; on mismatch use the march
+  // current instead of stale history (r1 holds current-minus-history here, so
+  // current is r1+r2). UV bounds exact; motion + depth via shared sliders.
+  // Confidence rides along (march conf on reject, like Kai).
+  if (s1VanillaImpr && shader_injection_data.dynCube_vanilla_disoc_reject > 0.5f) {
+    bool s1RejectHist = any(s1HistRawUV < 0.0f) || any(s1HistRawUV > 1.0f)
+        || (s1MotionD > clamp(shader_injection_data.dynCube_vanilla_disoc_uv, 0.0f, 0.25f));
+    if (!s1RejectHist) {
+      float s1DepthCur = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+      float s1DepthHist = depthTexture.SampleLevel(samPoint_s, s1HistRawUV, 0).x;
+      float s1LinCur = dot(projInv_g._m22_m32, float2(s1DepthCur, 1.0)) / dot(projInv_g._m23_m33, float2(s1DepthCur, 1.0));
+      float s1LinHist = dot(projInv_g._m22_m32, float2(s1DepthHist, 1.0)) / dot(projInv_g._m23_m33, float2(s1DepthHist, 1.0));
+      s1RejectHist = abs(s1LinHist - s1LinCur) > clamp(shader_injection_data.dynCube_vanilla_disoc_depth, 0.0f, 2.0f);
+    }
+    if (s1RejectHist) o0.xyzw = r1.xyzw + r2.xyzw;
+  }
   return;
 }
