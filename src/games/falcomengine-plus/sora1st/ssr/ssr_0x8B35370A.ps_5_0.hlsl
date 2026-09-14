@@ -342,8 +342,10 @@ void main(
   float3 s1MarchCol = r1.xyz;
   float s1MarchConf = r1.w;
   // Replacement path only: dynamic sample + resolve. Vanilla-improved
-  // mode passes march output straight to temporal below.
-  bool s1CompositeActive = shader_injection_data.dynCube_ssr_replacement > 0.5f && s1MarchActive;
+  // mode passes march output straight to temporal below. Conditioned on the
+  // replacement toggle alone — Game SSR OFF skips only the march (resolve
+  // degrades to dynamic/miss, temporal hard-replaces), never the dynamic.
+  bool s1CompositeActive = shader_injection_data.dynCube_ssr_replacement > 0.5f;
   if (s1CompositeActive) {
     // World position (game reconstruct pattern): NDC from v1.zw, depth from t1.
     float s1Depth = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
