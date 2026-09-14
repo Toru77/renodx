@@ -337,7 +337,14 @@ void main(
              dot(kaiNdc, viewProjInv_g._m01_m11_m21_m31),
              dot(kaiNdc, viewProjInv_g._m02_m12_m22_m32),
              dot(kaiNdc, viewProjInv_g._m03_m13_m23_m33));
-  float3 kaiWaterPos = kaiWorldH.xyz / kaiWorldH.w;
+  float3 kaiCamPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
+  // NaN guard: degenerate homogeneous w (camera-plane pixels) would poison the
+  // position, view vector, and reflection with inf/NaN, which the temporal
+  // filter then spreads as random black dots. Falling back to the camera
+  // position trips the view-vector guard below into a finite sky-ward ray.
+  // Triggers only on non-finite input: finite pixels take the verbatim path.
+  float3 kaiWaterPos = (abs(kaiWorldH.w) > 1e-6f)
+      ? (kaiWorldH.xyz / kaiWorldH.w) : kaiCamPos;
   // World normal from the mrt texel — same spherical packing the march decodes
   // (azimuth/ring form); the march transforms it to view space, we keep world.
   uint kaiMrtW, kaiMrtH;
@@ -351,8 +358,11 @@ void main(
   if (dot(kaiWaterN, kaiWaterN) < 1e-6) kaiWaterN = float3(0.0, 0.0, -1.0);
   kaiWaterN = normalize(kaiWaterN);
   // View / reflection (V = pixel -> camera).
-  float3 kaiCamPos = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
-  float3 kaiWaterV = normalize(kaiCamPos - kaiWaterPos);
+  // NaN guard: zero-length view vector (camera-grazing pixels) makes
+  // normalize() return NaN. Finite sky-ward fallback; finite pixels take the
+  // verbatim normalize path.
+  float3 kaiToCam = kaiCamPos - kaiWaterPos;
+  float3 kaiWaterV = (dot(kaiToCam, kaiToCam) > 1e-12f) ? normalize(kaiToCam) : float3(0.0, 0.0, 1.0);
   float kaiNdv = dot(kaiWaterN, kaiWaterV);
   float3 kaiWaterR = kaiWaterN * (-(kaiNdv + kaiNdv)) + kaiWaterV;
   // SSR -> Dynamic -> Miss enable set. The SSR leg is the inline vanilla
