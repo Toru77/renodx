@@ -245,7 +245,9 @@ void main(
       // Kai-style, so the 4 iterations bracket the crossing. Off = verbatim
       // vanilla (forward-only step, A/B). The hit threshold is tunable: hit when
       // the depth delta exceeds it (0 = any penetration, Kai behavior).
-      if (shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
+      // Master switch gates the whole section.
+      if (shader_injection_data.dynCube_vanilla_ssr_enabled > 0.5f
+          && shader_injection_data.dynCube_vanilla_refine_fix > 0.5f) {
         bool refineHit = r4.x > shader_injection_data.dynCube_vanilla_refine_threshold;
         r2.w = refineHit ? -r1.w : r1.w;
       } else {

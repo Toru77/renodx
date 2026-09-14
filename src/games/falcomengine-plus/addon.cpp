@@ -322,6 +322,7 @@ ShaderInjectData shader_injection = {
   .dynCube_vanilla_disoc_uv = 0.05f,
   .dynCube_vanilla_isfast = 1.f,
   .dynCube_vanilla_isfast_frame = -1.f,
+  .dynCube_vanilla_ssr_enabled = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3537,11 +3538,19 @@ renodx::utils::settings::Settings settings = {
     },
     // ── Vanilla SSR Improvements (Sora2nd march/denoise correctness, A/B) ──
     new renodx::utils::settings::Setting{
+      .key = "DynCubeVanillaSSREnabled", .binding = &shader_injection.dynCube_vanilla_ssr_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Enable Improvements", .section = "Vanilla SSR Improvements",
+      .tooltip = "Master switch for this section: off restores fully vanilla SSR code on every path (the SSR Replacement composite is unaffected and keeps its own toggle).",
+      .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaRefineFix", .binding = &shader_injection.dynCube_vanilla_refine_fix,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Refine Backtrack Fix", .section = "Vanilla SSR Improvements",
       .tooltip = "Fix Sora2nd ssr1 refinement to bracket the crossing (step back when inside, Kai-style) instead of stepping only forward. Off restores the verbatim vanilla behavior for A/B.",
       .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaRefineThreshold", .binding = &shader_injection.dynCube_vanilla_refine_threshold,
@@ -3549,7 +3558,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.5f, .label = "Refine Hit Threshold", .section = "Vanilla SSR Improvements",
       .tooltip = "Hit threshold on the refine depth delta (scene depth minus ray depth, view units): hit when delta exceeds this. 0 = any penetration counts (Kai behavior); higher is stricter (fewer, firmer hits). Only applies while Refine Backtrack Fix is on.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_refine_fix > 0.5f; },
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_refine_fix > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3558,6 +3567,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Fixed History Blend", .section = "Vanilla SSR Improvements",
       .tooltip = "On = fixed history weight from the slider below (0.9 = vanilla); Off = motion-adaptive weighting (Kai formula: mostly history when static, mostly current when moving).",
       .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaHistoryWeight", .binding = &shader_injection.dynCube_vanilla_history_weight,
@@ -3565,7 +3575,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.9f, .label = "Fixed History Weight", .section = "Vanilla SSR Improvements",
       .tooltip = "History fraction used when Fixed History Blend is on (0.9 = vanilla). Higher = longer trails but stabler; lower = fresher but noisier.",
       .min = 0.5f, .max = 0.99f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_history_fixed > 0.5f; },
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_history_fixed > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaDisocReject", .binding = &shader_injection.dynCube_vanilla_disoc_reject,
@@ -3573,6 +3583,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Disocclusion Reject", .section = "Vanilla SSR Improvements",
       .tooltip = "Validate the reprojected history sample against current-frame scene data (UV bounds, motion distance, depth mismatch); on mismatch use the current SSR result instead of stale history.",
       .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaDisocDepth", .binding = &shader_injection.dynCube_vanilla_disoc_depth,
@@ -3580,7 +3591,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.25f, .label = "Disocclusion Depth Threshold", .section = "Vanilla SSR Improvements",
       .tooltip = "Reject history when |linear depth at history UV minus linear depth here| exceeds this (view units). 0 = always reject on depth. Only applies while Disocclusion Reject is on.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3589,15 +3600,16 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.05f, .label = "Disocclusion Motion Threshold", .section = "Vanilla SSR Improvements",
       .tooltip = "Reject history when reprojection motion exceeds this (0-1 UV units, ~5% of screen at default). 0 = any motion rejects. Only applies while Disocclusion Reject is on.",
       .min = 0.f, .max = 0.25f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_disoc_reject > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaISFAST", .binding = &shader_injection.dynCube_vanilla_isfast,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "IS-FAST History Distribution", .section = "Vanilla SSR Improvements",
-      .tooltip = "Blue-noise subpixel distribution of the single history tap (same 128x128x32 volume, frame slice, spatial scale and strength blend as the custom SSR IS-FAST phase; strength 0 = off). Gives TAA/upscalers a temporally distributed signal. Needs IS-FAST noise available.",
+      .tooltip = "Blue-noise subpixel distribution of the single history tap (same 128x128x32 volume, frame slice, spatial scale and strength blend as the custom SSR IS-FAST phase; strength 0 = off). Gives TAA/upscalers a temporally distributed signal. Requires IS-FAST noise available: turn on ISFASTMasterEnable and check the IS-FAST debug log for loaded=yes; the effect is temporal stability in motion, not single-frame denoising.",
       .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
@@ -4568,7 +4580,8 @@ static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
 // the game bytecode (fully vanilla path, bit-exact).
 static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list) {
   if (SoraSSRReplaceActive(cmd_list)) return true;
-  if (shader_injection.dynCube_vanilla_refine_fix > 0.5f) return true;
+  if (shader_injection.dynCube_vanilla_ssr_enabled > 0.5f
+      && shader_injection.dynCube_vanilla_refine_fix > 0.5f) return true;
   return false;
 }
 // ssr2 vanilla-improvement gate: the tree file must execute (instead of game
@@ -4582,6 +4595,7 @@ static bool SoraSSRVanillaActive(reshade::api::command_list* cmd_list) {
   if (shader_injection.dynCube_enabled < 0.5f
       || shader_injection.dynCube_force_vanilla > 0.5f
       || shader_injection.dynCube_debug == 4.f) return false;
+  if (shader_injection.dynCube_vanilla_ssr_enabled < 0.5f) return false;
   if (shader_injection.dynCube_vanilla_history_fixed < 0.5f) return true;  // motion-adaptive differs from fixed 0.9
   if (shader_injection.dynCube_vanilla_history_weight < 0.8999f
       || shader_injection.dynCube_vanilla_history_weight > 0.9001f) return true;

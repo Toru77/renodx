@@ -171,6 +171,8 @@ void main(
     // and the disocclusion tests below.
     float2 ssrHistRawUV = r0.xz;
     float ssrMotionD = length(ssrHistRawUV - v1.xy);
+    // Master switch for Vanilla SSR Improvements (off = vanilla code only).
+    bool ssrVanillaImpr = shader_injection_data.dynCube_vanilla_ssr_enabled > 0.5f;
     r0.xy = resolutionScaling_g.xy * r0.xz;
     r0.xy = prevResolutionScaling_g.xy * r0.xy;
     float2 ssrHistTapUV = r0.xy;
@@ -180,7 +182,7 @@ void main(
     // volume, frame slice, spatial scale, strength blend; strength 0 = zero
     // offset = vanilla). Seed fixed at 0; frame -1 (noise unusable) disables.
     float ssrIsfastFrame = shader_injection_data.dynCube_vanilla_isfast_frame;
-    bool ssrIsfastOn = shader_injection_data.dynCube_vanilla_isfast > 0.5f && ssrIsfastFrame >= 0.0f;
+    bool ssrIsfastOn = ssrVanillaImpr && shader_injection_data.dynCube_vanilla_isfast > 0.5f && ssrIsfastFrame >= 0.0f;
     if (ssrIsfastOn) {
       uint ssrHistW, ssrHistH;
       historyTexture.GetDimensions(ssrHistW, ssrHistH);
@@ -228,9 +230,13 @@ void main(
     r0.xyzw = r0.xyzw + -r4.xyzw;
     // History blend (Vanilla SSR Improvements): fixed slider weight or
     // motion-adaptive (Kai formula: 0.1 static → 0.4 fast). r0 = history.
-    float ssrCurFrac = (shader_injection_data.dynCube_vanilla_history_fixed > 0.5f)
-        ? (1.0f - clamp(shader_injection_data.dynCube_vanilla_history_weight, 0.0f, 0.99f))
-        : (0.4 - 0.3 * exp2(-1442.69507 * ssrMotionD));
+    // Master switch off restores the fixed vanilla 0.1 blend exactly.
+    float ssrCurFrac = 0.1f;
+    if (ssrVanillaImpr) {
+      ssrCurFrac = (shader_injection_data.dynCube_vanilla_history_fixed > 0.5f)
+          ? (1.0f - clamp(shader_injection_data.dynCube_vanilla_history_weight, 0.0f, 0.99f))
+          : (0.4 - 0.3 * exp2(-1442.69507 * ssrMotionD));
+    }
     float ssrHistFrac = 1.0f - ssrCurFrac;
     r0.xyzw = r0.xyzw * ssrHistFrac + r4.xyzw;
     // Disocclusion reject (Vanilla SSR Improvements): validate the reprojected
@@ -238,7 +244,7 @@ void main(
     // SSR result instead of stale history. UV bounds exact; motion + depth via
     // sliders. Confidence rides along (current conf on reject, like Kai).
     bool ssrRejectHist = false;
-    if (shader_injection_data.dynCube_vanilla_disoc_reject > 0.5f) {
+    if (ssrVanillaImpr && shader_injection_data.dynCube_vanilla_disoc_reject > 0.5f) {
       ssrRejectHist = any(ssrHistRawUV < 0.0f) || any(ssrHistRawUV > 1.0f)
           || (ssrMotionD > clamp(shader_injection_data.dynCube_vanilla_disoc_uv, 0.0f, 0.25f));
       if (!ssrRejectHist) {
