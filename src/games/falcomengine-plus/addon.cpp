@@ -2983,7 +2983,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeEnabled", .binding = &shader_injection.dynCube_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Dynamic Cubemaps", .section = "Dynamic Cubemaps",
-      .tooltip = "Replace static texEnvMap_g(t17) with screen-captured dynamic cubemap. Off = vanilla.",
+      .tooltip = "Dynamic cubemap generation replacing game's static cubemaps.",
       .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -3471,7 +3471,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeVanillaSSREnabled", .binding = &shader_injection.dynCube_vanilla_ssr_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Enable Improvements", .section = "Vanilla SSR Improvements",
-      .tooltip = "Master switch for this section: off restores fully vanilla SSR code on every path (the SSR Replacement composite is unaffected and keeps its own toggle).",
+      .tooltip = "Improvements to Vanilla SSR denoising.",
       .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -3632,7 +3632,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "IS-FAST Jitter/Noise: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
+        .label = "IS-FAST Noise: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
         .section = "Info",
     },
     new renodx::utils::settings::Setting{
