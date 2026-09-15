@@ -2986,6 +2986,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Phase1: temporal accumulation. On = blend current capture with previous history. Off = no history (fresh capture each frame).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeDebug", .binding = &shader_injection.dynCube_debug,
@@ -2994,6 +2995,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "0=Normal (dynamic cube in lighting), 1=Show Dynamic Cube, 2=Face Visualization, 3=Solid Face Colors, 4=No Override (vanilla t17), 5=History Validity, 6=History Contribution, 7=Character Mask, 8=GGX Filtered Cube (mip-selectable), 9=SSR Result (blurred), 10=SSR Confidence, 11=Reflection Source, 12=SSR Raw, 13=SSR Edge Fade.",
       .labels = {"Normal", "Show Cube", "Face Viz", "Solid Colors", "No Override", "History Validity", "History Contribution", "Character Mask", "GGX Filtered", "SSR Result", "SSR Confidence", "Reflection Source", "SSR Raw", "SSR Edge Fade"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeResolution", .binding = &shader_injection.dynCube_resolution,
@@ -3002,7 +3004,6 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Cubemap face size. 128 = quality eval floor, 1024 = max. Preview rectangle is clamped for visibility.",
       .labels = {"128", "256", "512", "768", "1024"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeCharacterCapture", .binding = &shader_injection.dynCube_character_capture,
@@ -3056,6 +3057,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Artistic mip-offset blur on the dynamic cube sample (uses the existing GGX/HW mip chain, no extra pass). 0 = normal sharpness; fractional values give smooth trilinear control; higher = progressively blurrier. Independent of material roughness.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeUpdateInterval", .binding = &shader_injection.dynCube_capture_interval,
@@ -3064,6 +3066,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Frames between new cubemap captures (1=fastest 2-stage cadence, 2=every 2 frames, 4=every 4 frames, 8=every 8 frames). Capture and filter run on separate frames; the previous completed cube stays visible between updates.",
       .labels = {"1", "2", "3", "4", "5", "6", "7", "8"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeGGX", .binding = &shader_injection.dynCube_ggx,
@@ -3081,6 +3084,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Emits one log per second to help diagnose which part is broken: resource creation, capture inputs (depth/color/cbv), dispatch success, t17 override, and debug mode.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeCaptureBoost", .binding = &shader_injection.dynCube_capture_boost,
@@ -3089,6 +3093,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Master brightness for SSR and dynamic cubemap reflections. 1.0 = neutral. Does not affect the vanilla fallback.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeCaptureSoften", .binding = &shader_injection.dynCube_capture_soften,
@@ -3097,6 +3102,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Softens globally-pushed dynamic reflections (glass etc.) via a dedicated variant cube. Does not affect the lighting resolve or the vanilla fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeGlobalStrength", .binding = &shader_injection.dynCube_global_strength,
@@ -3105,6 +3111,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Scales globally-pushed dynamic reflections (glass etc.) so they don't dominate. 1 = full. Does not affect the lighting resolve or the vanilla fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeHistoryBlend", .binding = &shader_injection.dynCube_history_blend,
@@ -3131,6 +3138,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Face for debug preview when Debug View=1/2/5/6/7/8: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Preview samples the capture resource directly.",
       .labels = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f || shader_injection.dynCube_debug == 7.f || shader_injection.dynCube_debug == 8.f); },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeDebugMip", .binding = &shader_injection.dynCube_debug_mip,
@@ -3139,6 +3147,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Mip level for the GGX filtered cube preview when Debug View=8. 0=sharp history, 7=strongly blurred.",
       .labels = {"0", "1", "2", "3", "4", "5", "6", "7"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_debug == 8.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeForceMip", .binding = &shader_injection.dynCube_force_mip,
@@ -3147,6 +3156,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Debug: force the t17 reflection mip. -1 = normal roughness LOD. 0..7 = always sample that mip (verifies the GGX chain reaches the reflection).",
       .min = -1.f, .max = 7.f, .format = "%d",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeParallax", .binding = &shader_injection.dynCube_parallax_enabled,
@@ -3155,6 +3165,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "OFF = camera-centered cubemap lookup (current). ON = finite probe-box parallax correction for the t17 reflection lookup.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeParallaxBoxX", .binding = &shader_injection.dynCube_parallax_box_size_x,
@@ -3190,6 +3201,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "ON = tint the reflection by the probe-box exit face hit (requires Parallax Correction ON). For tuning the box and verifying ray-box intersection.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_parallax_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeWorldBox", .binding = &shader_injection.dynCube_worldbox_enabled,
@@ -3309,6 +3321,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "TEST: vertically tilt the dynamic cubemap lookup, in degrees. 0 = no change. Positive slides reflection content down, negative slides it up. Validity and vanilla fallback follow the shifted direction.",
       .min = -30.f, .max = 30.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSR", .binding = &shader_injection.dynCube_ssr_enabled,
@@ -3317,6 +3330,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Simple screen-space SSR ray march (no Hi-Z/temporal). Confidence blend: SSR > Dynamic Cube > Vanilla Cube.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRSamples", .binding = &shader_injection.dynCube_ssr_samples,
@@ -3424,6 +3438,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Replace the Sora (1st/2nd) / Kai water SSR resolve with the DynCube composite (game march + dynamic cubemap, misses decay with no vanilla-cube tint) on water-flagged pixels only. Bed and non-water pixels run verbatim vanilla. Off = fully vanilla SSR chain, nothing touched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeGameSSR", .binding = &shader_injection.dynCube_game_ssr,
@@ -3432,6 +3447,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Run the game's own SSR march and feed it to the SSR Replacement composite (game reflection, then dynamic cubemap, misses decay with no vanilla-cube tint). Off skips the march: water receives dynamic cubemap only. Only applies while SSR Replacement is on; otherwise the vanilla chain runs untouched.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_replacement > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRReplacementDebug", .binding = &shader_injection.dynCube_ssr_replacement_debug,
@@ -3441,6 +3457,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "SSR1 Input", "SSR2 Input", "Lighting SSR", "Lighting Color"},
       .min = 0.f, .max = 4.f, .format = "%d",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // ── Vanilla SSR Improvements (Sora2nd march/denoise correctness, A/B) ──
     new renodx::utils::settings::Setting{
@@ -3457,6 +3474,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Fix SSR refinement to bracket the crossing (step back when inside, Kai-style) instead of stepping only forward. Sora2nd ssr1, Sora1st and Kai fused marches. Off restores the verbatim vanilla behavior for A/B.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaRefineThreshold", .binding = &shader_injection.dynCube_vanilla_refine_threshold,
@@ -3474,6 +3492,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "On = fixed history weight from the slider below (0.9 = vanilla); Off = motion-adaptive weighting (Kai formula: mostly history when static, mostly current when moving).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaHistoryWeight", .binding = &shader_injection.dynCube_vanilla_history_weight,
@@ -3482,6 +3501,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "History fraction used when Fixed History Blend is on (0.9 = vanilla). Higher = longer trails but stabler; lower = fresher but noisier.",
       .min = 0.5f, .max = 0.99f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f && shader_injection.dynCube_vanilla_history_fixed > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaDisocReject", .binding = &shader_injection.dynCube_vanilla_disoc_reject,
@@ -3490,6 +3510,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Validate the reprojected history sample against current-frame scene data (UV bounds, motion distance, depth mismatch); on mismatch use the current SSR result instead of stale history.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaDisocDepth", .binding = &shader_injection.dynCube_vanilla_disoc_depth,
@@ -3516,6 +3537,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Blue-noise subpixel distribution of the single history tap (same 128x128x32 volume, frame slice, spatial scale and strength blend as the custom SSR IS-FAST phase; strength 0 = off). Gives TAA/upscalers a temporally distributed signal. Requires IS-FAST noise available: turn on ISFASTMasterEnable and check the IS-FAST debug log for loaded=yes; the effect is temporal stability in motion, not single-frame denoising.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
@@ -3524,6 +3546,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Use IS-FAST spatio-temporal blue noise for the SSR ray-march start phase (breaks up stride banding). Off = deterministic hash phase. Requires the master IS-FAST toggle.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f && g_isfast_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFASTStrength", .binding = &shader_injection.dynCube_ssr_isfast_strength,
