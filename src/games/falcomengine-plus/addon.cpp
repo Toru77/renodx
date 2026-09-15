@@ -341,6 +341,9 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
+// DynCube loading wipe: color captures older than this mean no lighting draws
+// (loading screen) — arm history hard-replace so the next scene rebuilds clean.
+constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
 // ── GTVBAO normal tuning globals (separate from ShaderInjectData) ──
@@ -602,6 +605,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::buffer_range captured_scene_cbv = {};
   bool captured_scene_cbv_valid = false;
   uint64_t captured_scene_cbv_frame = UINT64_MAX;
+  uint64_t captured_color_frame = UINT64_MAX;   // frame_index of last lighting t0 capture (stale = loading screen)
+  uint64_t captured_depth_frame = UINT64_MAX;   // frame_index of last lighting depth capture (kept for future detectors)
   bool resources_created = false;
   uint64_t frame_index = 0u;
   uint64_t resize_guard_until_frame = 0u;
@@ -732,6 +737,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool dyncube_boxCopyPending = false;     // staged validity copy enqueued, not yet consumed
   bool dyncube_wasRejected = false;        // edge latch for reject/resume logging
   bool dyncube_rejectedGap = false;        // a capture was rejected since the last dispatched capture (one-shot: first accepted capture hard-replaces history)
+  bool dyncube_loadingWipeDone = false;   // loading wipe already applied for the current stale episode (edge latch)
+  bool dyncube_loadingWipePending = false;  // OnPresent saw a loading-stale episode: wipe on the next scheduler tick
   bool dyncube_captureDirty = false;          // capture-content settings changed since last filter: force one filter pass
   bool dyncube_dirtyFastForward = false;      // settings-dirty one-shot: next dispatched capture hard-replaces history
   float dyncube_lastVariantSoften = -1.f;      // soften value baked into the variant (-1 = none yet)
@@ -3811,6 +3818,7 @@ static void OnPushDescriptorsCapture(
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
           d->captured_depth_srv = views[0];
+          d->captured_depth_frame = d->frame_index;
           d->captured_scene_cbv_frame = d->frame_index;
           if (shader_injection.gtvbao_debug_logging > 0.5f) {
             auto depth_res = device->get_resource_from_view(views[0]);
@@ -3850,6 +3858,7 @@ static void OnPushDescriptorsCapture(
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
           d->captured_color_srv = views[0];
+          d->captured_color_frame = d->frame_index;
         }
       }
     }
@@ -4163,6 +4172,27 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (!d) return;
   d->frame_index++;
 
+  // DynCube loading wipe (generic, all games): with no fresh lighting t0 for a
+  // while, no scene draws are running (loading screen) — arm history
+  // hard-replace so the next scene rebuilds from scratch instead of blending
+  // stale backdrops. Runs before any early-out; arming is idempotent (consumed
+  // once by the next dispatched capture) and safe on hitches (threshold).
+  // Covers the opaque-backdrop blind spot geometry rejection admits it can't see.
+  if (d->dyncube_resources_created
+      && d->captured_color_frame != UINT64_MAX
+      && d->frame_index >= d->captured_color_frame
+      && (d->frame_index - d->captured_color_frame) > kDynCubeLoadingStaleFrames) {
+    d->dyncube_rejectedGap = true;
+    // The DynCube scheduler only ticks on lighting draws, so it never runs during
+    // a load: hand the wipe to the next scheduler tick via a pending flag.
+    if (!d->dyncube_loadingWipeDone) {
+      d->dyncube_loadingWipeDone = true;
+      d->dyncube_loadingWipePending = true;
+    }
+  } else {
+    d->dyncube_loadingWipeDone = false;
+  }
+
   // DynCube disable path (retained, currently untriggered): frees the resource set
   // at the frame boundary. Toggle-off no longer arms this (cache is preserved by
   // design); device-loss/swapchain paths call Destroy directly.
@@ -4183,6 +4213,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     DestroyDynCubeResources(dev, d);
     DestroyDynCubeCache(dev, d);  // also free all cached per-size sets
   }
+
 
   // ── Basic mode startup guard: reset advanced-only settings to defaults if Basic is selected ──
   static bool s_basic_startup_checked = false;
@@ -5078,6 +5109,39 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       dd->dyncube_sched_frame = dd->frame_index;
       const uint32_t interval = std::max(1u, (uint32_t)std::clamp(shader_injection.dynCube_capture_interval, 1.f, 16.f));
 
+      // ── Loading wipe: consumes the OnPresent loading signal (this scheduler only
+      // ticks on lighting draws, so the stale predicate itself is evaluated there).
+      // Deletes the whole temporal cache once per stale episode so the next scene
+      // seeds from scratch: zeroed history reads as invalid (serves fall back to
+      // vanilla), the expand-only world-box re-latches via the existing reset path,
+      // and validation/filter rebuild from the first post-load capture. Custom SSR
+      // is stateless (march+blur from live inputs) so there is no SSR cache to clear.
+      if (dd->dyncube_loadingWipePending && dd->dyncube_resources_created) {
+        dd->dyncube_loadingWipePending = false;
+        float zero4[4] = {0, 0, 0, 0};
+        float zero1[4] = {0, 0, 0, 0};
+        for (auto& set : dd->dyncube_hist) {
+          if (set.color_uav.handle) cmd_list->clear_unordered_access_view_float(set.color_uav, zero4);
+          if (set.pos_uav.handle) cmd_list->clear_unordered_access_view_float(set.pos_uav, zero4);
+          if (set.contrib_uav.handle) cmd_list->clear_unordered_access_view_float(set.contrib_uav, zero1);
+        }
+        for (auto& u : dd->dyncube_cam_uav) if (u.handle) cmd_list->clear_unordered_access_view_float(u, zero4);
+        dd->dyncube_hasValidRead = false;
+        dd->dyncube_filteredReadSet = 99u;
+        dd->dyncube_ggx_valid = false;
+        dd->dyncube_variant_valid = false;
+        dd->dyncube_boxCopyPending = false;
+        dd->dyncube_wasRejected = false;
+        dd->dyncube_rejectedGap = false;
+        dd->dyncube_dirtyFastForward = false;
+        dd->dyncube_needs_reset = true;
+        dd->dyncube_worldbox_reset_pending = true;
+        dd->dyncube_next_update_frame = 0;
+        if (shader_injection.dynCube_debug_logging > 0.5f) {
+          reshade::log::message(reshade::log::level::info, "[DynCube] loading wipe: temporal cache cleared");
+        }
+      }
+
       // Delayed-validate commit: consume the staged hasGeom bit BEFORE any new
       // capture/filter work, so promotion always pairs with the latest capture.
       ConsumeDynCubeStagedValidity(dev, dd);
@@ -5498,6 +5562,8 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   for (auto& t : d->dyncube_ggx_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_hist_cur = 0;
   d->dyncube_needs_reset = true;
+  d->dyncube_loadingWipeDone = false;
+  d->dyncube_loadingWipePending = false;
   dr(d->dyncube_validStaging);
   dr(d->dyncube_faceExtStaging);
   d->dyncube_readSet = 0;
@@ -5659,6 +5725,8 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   // Aliases -> current history set (A initially); needs reset on first capture.
   d->dyncube_hist_cur = 0;
   d->dyncube_needs_reset = true;
+  d->dyncube_loadingWipeDone = false;
+  d->dyncube_loadingWipePending = false;
   d->dyncube_texture = d->dyncube_hist[0].color;
   d->dyncube_srv = d->dyncube_hist[0].color_cube_srv;
   d->dyncube_uav = d->dyncube_hist[0].color_uav;
@@ -6312,6 +6380,8 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   d->dyncube_uav = d->dyncube_hist[0].color_uav;
   d->dyncube_hist_cur = 0;
   d->dyncube_needs_reset = true;
+  d->dyncube_loadingWipeDone = false;
+  d->dyncube_loadingWipePending = false;
   d->dyncube_ggx_valid = false;
   d->dyncube_phase = DeviceData::DynCubePhase::Done;
   d->dyncube_next_update_frame = 0;
