@@ -354,6 +354,7 @@ struct ShaderInjectData {
   float dynCube_vanilla_isfast;              // 0=off, 1=blue-noise subpixel history distribution (reuses SSR IS-FAST spatial/strength) (appended last: do not insert above)
   float dynCube_vanilla_isfast_frame;        // runtime: frame_index % 64, or -1 when noise unusable (appended last: do not insert above)
   float dynCube_vanilla_ssr_enabled;         // master switch for Vanilla SSR Improvements: 0=all off (vanilla code only), 1=section active (appended last: do not insert above)
+  float gtvbao_optimization;               // 0=original dispatch/barrier behavior, 1=skip provably-dead copies/barriers (appended last: do not insert above)
 };
 
 #ifndef __cplusplus

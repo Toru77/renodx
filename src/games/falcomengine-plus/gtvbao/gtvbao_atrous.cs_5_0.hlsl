@@ -41,6 +41,7 @@ void main(uint2 dt : SV_DispatchThreadID)
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
   const float step = max(1.0, GTVBAO_atrous_step);
+  const int iStep = int(step);
   const float sigmaZ = max(0.01, GTVBAO_atrous_depth_sigma);
   // Quantize normal edge-stop exponent to a power of two: x^(2^sqSteps),
   // implemented with repeated squaring instead of pow().
@@ -59,7 +60,7 @@ void main(uint2 dt : SV_DispatchThreadID)
   // the filtered result is numerically ≈ center — skip the kernel entirely.
   bool flat = true;
   {
-    int2 probes[4] = { int2(-step, 0), int2(step, 0), int2(0, -step), int2(0, step) };
+    int2 probes[4] = { int2(-iStep, 0), int2(iStep, 0), int2(0, -iStep), int2(0, iStep) };
     [unroll]
     for (int p = 0; p < 4; ++p) {
       int2 pc = clamp(int2(dt) + probes[p], int2(0, 0), int2(width - 1, height - 1));
@@ -90,25 +91,29 @@ void main(uint2 dt : SV_DispatchThreadID)
     for (int dx = -2; dx <= 2; ++dx) {
       if (dx == 0 && dy == 0) continue;
 
-      int2 npc = clamp(int2(dt) + int2(dx, dy) * int2(step, step), int2(0, 0), int2(width - 1, height - 1));
+      int2 npc = clamp(int2(dt) + int2(dx, dy) * iStep, int2(0, 0), int2(width - 1, height - 1));
 
       float sampleAO = (float)g_srcAtrousAO.Load(int3(npc, 0)) * (1.0f / 255.0f);
 
-      float2 nuv = (float2(npc) + 0.5) * consts.ViewportPixelSize;
-      float nz = g_srcAtrousDepth.SampleLevel(g_samplerPointClamp, nuv, 0);
+      // Depth/normal loads use integer texels directly: all three textures
+      // share w,h and taps are texel-centered, so this matches the
+      // float-UV + point-sample + floor sequence exactly.
+      float nz = g_srcAtrousDepth.Load(int3(npc, 0));
 
       // Depth edge-stop: relative test scaled by world-space pixel footprint so
-      // distant geometry isn't over-rejected.
+      // distant geometry isn't over-rejected. Denominator hoisted out of the
+      // tap loop (center-only inputs).
       float worldPx = abs(centerZ) * abs(consts.NDCToViewMul_x_PixelSize.y) * step;
-      float dzW = exp(-abs(centerZ - nz) / max(sigmaZ * max(worldPx, 1e-4), 1e-4));
+      float dzDenom = max(sigmaZ * max(worldPx, 1e-4), 1e-4);
+      float dzW = exp(-abs(centerZ - nz) / dzDenom);
 
-      // Normal edge-stop — repeated squaring (x^(2^sqSteps)), no pow()
-      int2 snTc = min(int2(floor(nuv * float2(nw, nh))), int2(nw - 1, nh - 1));
-      float nd = saturate(dot(centerN, g_srcAtrousNormal.Load(int3(snTc, 0)).xyz));
+      // Normal edge-stop — repeated squaring (x^(2^sqSteps)), no pow().
+      // Squaring loop is counted (sqSteps is dispatch-uniform): identical math,
+      // no per-iteration branch evaluations.
+      float nd = saturate(dot(centerN, g_srcAtrousNormal.Load(int3(npc, 0)).xyz));
       float nW = nd;
-      [unroll]
-      for (int q = 0; q < 6; ++q) {
-        if (q < sqSteps) nW *= nW;
+      for (int q = 0; q < sqSteps; ++q) {
+        nW *= nW;
       }
 
       float weight = kw[dx + 2] * kw[dy + 2] * dzW * nW;

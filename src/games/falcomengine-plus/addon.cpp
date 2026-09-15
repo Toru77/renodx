@@ -323,6 +323,7 @@ ShaderInjectData shader_injection = {
   .dynCube_vanilla_isfast = 1.f,
   .dynCube_vanilla_isfast_frame = -1.f,
   .dynCube_vanilla_ssr_enabled = 1.f,
+  .gtvbao_optimization = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -2152,7 +2153,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousDepthSigma", .binding = &shader_injection.gtvbao_atrous_depth_sigma,
-      .default_value = 1.f, .label = "À-Trous Depth Stop", .section = "GTVBAO",
+      .default_value = 0.5f, .label = "À-Trous Depth Stop", .section = "GTVBAO",
       .tooltip = "Depth edge sensitivity for the à-trous filter. Higher = smoother across depth steps (more leak).",
       .min = 0.05f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
@@ -2160,7 +2161,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousNormalSigma", .binding = &shader_injection.gtvbao_atrous_normal_sigma,
-      .default_value = 32.f, .label = "À-Trous Normal Stop", .section = "GTVBAO",
+      .default_value = 64.f, .label = "À-Trous Normal Stop", .section = "GTVBAO",
       .tooltip = "Normal edge sensitivity for the à-trous filter. Quantized to powers of two; higher = sharper edges. 32 is the default.",
       .min = 2.f, .max = 64.f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
@@ -4264,6 +4265,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   // ── Light-buffer capture helper (runs after GTVBAO for multi-bounce feedback) ──
   auto capture_light_buffer_for_next_frame = [&]() {
     if (shader_injection.vbgi_enabled < 0.5f || !d->captured_light_buffer_texture.handle) return;
+    // Skip when captured color is live: both consumers (multibounce accumulate,
+    // main light-buffer select) prefer it and touch the light buffer only as
+    // fallback (terminal fallback_srv preserved).
+    if (d->captured_color_srv.handle) return;
     auto bb = sc->get_back_buffer(0);
     if (!bb.handle) return;
     // Recreate capture texture if back buffer format changed (e.g. HDR vs SDR mismatch).
@@ -7477,6 +7482,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     if (!mp.handle) mp = d->main_low_pipeline; }
   if (!mp.handle) return false;
   bind_pipe(mp);
+  // Edges UAV is unread by the atrous kernel (binds AO/depth/prepped-normal)
+  // and, with GI off, by the skipped stage-4 tail: route to fallback so the
+  // full-res write is dropped. Legacy/R2/GI paths keep the real UAV.
+  const bool atrous_no_edges = (int)shader_injection.gtvbao_denoiser_type == 0
+      && shader_injection.gtvbao_atrous_enabled > 0.5f
+      && d->atrous_pipeline.handle != 0u
+      && shader_injection.vbgi_enabled < 0.5f;
   {
     // Light buffer: HDR accumulated (multi-bounce ON) or direct-only (OFF).
     reshade::api::resource_view light_buf;
@@ -7518,7 +7530,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     // Shader register order: u0=AO, u1=edges, u2=GI, u3=debug
     reshade::api::resource_view main_uavs[4] = {
         d->ao_term_a_uav,
-        d->edges_uav,
+        atrous_no_edges ? d->fallback_uav : d->edges_uav,
         d->vbgi_output_uav.handle ? d->vbgi_output_uav : d->fallback_uav,
         d->debug_uav.handle ? d->debug_uav : d->fallback_uav
     };
@@ -7534,9 +7546,24 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
-  bar(d->edges_texture, UA, SR);
-  bar(d->vbgi_output_texture, UA, SR);  // GI output ready for denoise
-  bar(d->debug_texture, UA, SR);         // Debug output ready for read
+  if (!atrous_no_edges)
+    bar(d->edges_texture, UA, SR);
+  // Skip barriers for UAVs nothing reads. vbgi_output is read only by the
+  // denoise GI section (gated on vbgi_enabled in-shader) and debug view 1;
+  // debug_texture only by debug views 5 / 6-8 (see t23 pushes).
+  {
+    const bool giRead = shader_injection.vbgi_enabled > 0.5f;
+    const bool vbgiDbg1 = shader_injection.vbgi_debug_view > 0.5f
+        && (int)shader_injection.vbgi_debug_view == 1;
+    if (giRead || vbgiDbg1)
+      bar(d->vbgi_output_texture, UA, SR);  // GI output ready for denoise
+    const bool dbgRead = (shader_injection.vbgi_debug_view > 0.5f
+            && (int)shader_injection.vbgi_debug_view == 5)
+        || (shader_injection.gtvbao_debug_view > 5.5f
+            && shader_injection.gtvbao_debug_view < 8.5f);
+    if (dbgRead)
+      bar(d->debug_texture, UA, SR);         // Debug output ready for read
+  }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 2 (main) done.");
   if (shader_injection.vbgi_debug_logging > 0.5f) {
@@ -7642,7 +7669,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u_t);
       auto pc_t = BuildGTVBAOPushConstants(d, false, -1.f, false, /*stage*/1);
       cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 70, pc_t.data());
-      cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+      // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the
+      // grid; bounds-fail handles the overhang identically.
+      cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
       bar(d->ao_term_b_texture, UA, SR);
       d->history_ao_read_from_a = !d->history_ao_read_from_a;  // temporal stage owns history flip
 
@@ -7677,7 +7706,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
           apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
           auto pc = BuildGTVBAOPushConstants(d, last, -1.f, false, /*stage*/ last ? 2 : 0);
           cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 70, pc.data());
-          cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+          // denoise_last threads cover 2 px each: halve the grid (bounds-fail covers overhang).
+          cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
           bar(dst_tex, UA, SR);
           use_a = !use_a;
           if (last) d->gtvbao_final_in_b = !use_a;  // final result lands in the just-written buffer
@@ -7689,6 +7719,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       // (stage 4) keeps the GI bilateral running. ──
       run_normal_prep();
       d->gtvbao_final_in_b = run_atrous_chain(/*start_in_b*/false);  // main wrote ao_term_a
+      // Stage-4 GI tail writes nothing when GI is off (empty stage body, gated
+      // GI bilateral): skip bind/push/dispatch, keep flags/barriers downstream.
+      if (shader_injection.vbgi_enabled > 0.5f) {
       bind_pipe(last_pipe);
       reshade::api::resource_view sv_g[6] = {
           d->fallback_srv,                                                    // t0 AO (unused by stage 4)
@@ -7708,7 +7741,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u_g);
       auto pc_g = BuildGTVBAOPushConstants(d, true, -1.f, false, /*stage*/4);
       cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 70, pc_g.data());
-      cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+      // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the grid.
+      cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
+      }  // end GI-on stage-4 dispatch
       // vbgi_denoised barrier happens after the Pass-3 block.
     } else {
       // ── Legacy path (Spatial / Poisson): unchanged combined structure. ──
@@ -7744,7 +7779,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
         auto pc = BuildGTVBAOPushConstants(d, last, -1.f, false, /*stage*/0);
         cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 70, pc.data());
-        cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        // denoise_last threads cover 2 px each: halve the grid (bounds-fail covers overhang).
+        cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
         bar(dst_tex, UA, SR);
         use_a = !use_a;
         if (last) {
@@ -7754,7 +7790,17 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       }
     }
   }
-  bar(d->vbgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read
+  // vbgi_denoised is read by the t23 push (VBGI on), debug view 2, and
+  // next-frame multibounce (toggle on, valid after this denoise). Skip the
+  // flush only when no reader can exist.
+  {
+    const bool denRead = shader_injection.vbgi_enabled > 0.5f
+        || (shader_injection.vbgi_debug_view > 0.5f
+            && (int)shader_injection.vbgi_debug_view == 2)
+        || shader_injection.vbgi_multibounce > 0.5f;
+    if (denRead)
+      bar(d->vbgi_denoised_texture, UA, SR);  // Denoised GI ready for t23 read
+  }
   if (!d->vbgi_denoised_valid) {
     d->vbgi_denoised_valid = true;            // Multi-bounce feedback active next frame
     if (shader_injection.vbgi_debug_logging > 0.5f)
