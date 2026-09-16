@@ -1,0 +1,17 @@
+{
+  "$schema": "https://clshortfuse.github.io/renodx/renodx-metadata-schema.json",
+  "id": "farcry6-dlss",
+  "title": "Far Cry 6 - DLSS",
+  "summary": "Replaces Far Cry 6 TAA with NVIDIA DLSS Super Resolution.",
+  "status": "in-dev",
+  "deploy": {
+    "game_exe": "FarCry6.exe",
+    "process_name": "FarCry6",
+    "api": "d3d12",
+    "steam_appid": 2369390,
+    "architecture": [
+      "x64"
+    ],
+    "platform": "steam"
+  }
+}
