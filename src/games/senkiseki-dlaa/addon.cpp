@@ -5408,7 +5408,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAHdrInject", .binding = &shader_injection.dlaa_hdr_inject,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 2.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
-        .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
+        .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the finished composite at FXAA (post-DOF/post-tonemap); with the HDR mod the FXAA draw runs on the DLAA output so the HDR swapchain stays fed.",
         .labels = {"Auto","Pre-ToneMap","Composite"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
@@ -5741,8 +5741,10 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
     return true;
 
   // AA=DLAA: run DLSS (unless the pre-tone-map final_blending draw already ran
-  // it this frame), then native-copy the DLAA'd image into RTV0 and skip the
-  // FXAA draw so the game's FXAA does not re-AA the DLSS output.
+  // it this frame), then get the DLAA'd image to the screen. Without the HDR
+  // mod that is a native copy into RTV0 with the FXAA draw skipped; with the
+  // HDR mod the FXAA draw must run (it writes the backbuffer the HDR swapchain
+  // proxy presents), so it runs on the DLAA'd composite instead.
   if (HdrFinalPathActive(cmd_list)) {
     if (d && d->dlaa_ran_this_frame) {
       // DLSS ran at final_blending; the HDR mod's final_blending then tone-mapped
@@ -5753,6 +5755,7 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
     // we don't hook) — run DLSS here on the composite as before.
   }
   RunDLAA(cmd_list);
+  if (d && d->hdr_detected) return true;
   return !CopyFinalToRtv0(cmd_list, d);
 }
 
