@@ -373,11 +373,22 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Number of prev-bone SRV slots per skinned snapshot (nearest-root-bone
   // selection). MUST equal kBoneSlots in dxbc_patch.hpp.
   static constexpr uint32_t kBoneSlots = 4u;
+  struct BoneSlotMeta {
+    uint64_t owner = 0u;
+    uint64_t bone = 0u;
+    uint64_t frame = 0u;
+    uint64_t seq = 0u;
+    uint64_t serial = 0u;
+  };
   struct PrevBoneSnap {
     ID3D11Buffer* cur_buffer[kBoneSlots] = {};    // addon-owned structured buffers (this frame's bones)
     ID3D11ShaderResourceView* cur_srv[kBoneSlots] = {};
     ID3D11Buffer* prev_buffer[kBoneSlots] = {};   // addon-owned structured buffers (prev frame's bones)
     ID3D11ShaderResourceView* prev_srv[kBoneSlots] = {};
+    BoneSlotMeta slot_meta[kBoneSlots] = {};
+    BoneSlotMeta prev_meta[kBoneSlots] = {};
+    uint64_t serial = 0u;
+    uint64_t cap_seq = 0u;
     uint32_t size = 0u;                    // byte size (== game bone buffer)
     uint32_t rr = 0u;                      // round-robin capture cursor (reset at present)
     uint64_t last_draw_frame = 0u;         // frame of the last draw-time capture
@@ -390,6 +401,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     bool drawn_since_last_present = false;
   };
   std::unordered_map<uint64_t, PrevBoneSnap> prev_bone_snaps;  // key = instance composite
+  uint64_t bone_snap_serial = 0u;
+  bool skinned_po_motion_valid = true;
   ID3D11ShaderResourceView* last_bound_bone_srv[kBoneSlots] = {};  // our bound SRVs (is-ours check)
   bool bound_real_prev_bones = false;  // this draw bound a real per-instance snapshot (vs identity)
 
@@ -1535,6 +1548,11 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
   const auto vit = d->patched_vs_by_hash.find(vh);
   const bool is_po_vs = vit != d->patched_vs_by_hash.end() && vit->second.emits_velocity;
   const bool is_phasee_candidate = d->phasee_ps_candidates.contains(ph);
+  if (is_po_vs && !vit->second.is_rigid && !d->skinned_po_motion_valid) {
+    RestoreAppendedMotionRtv(cmd_list, d);
+    RestorePhaseEPixelShader(cmd_list, d);
+    return;
+  }
 
   if (PhasebDbgActive() && (is_po_vs || is_phasee_candidate)) {
     if (DiagCtxActive(d)) {
@@ -1817,6 +1835,7 @@ static DeviceData::PrevBoneSnap* EnsurePrevBoneSnap(reshade::api::device* dev, D
       return nullptr;
     }
   snap.size = bytes;
+  snap.serial = ++d->bone_snap_serial;
   snap.last_draw_frame = 0u;
   d->prev_bone_snaps.emplace(key, snap);
   return &d->prev_bone_snaps[key];
@@ -2375,9 +2394,11 @@ static void CapturePrevBones(reshade::api::command_list* cmd_list, DeviceData* d
     // draw-time capture (NOT a frame counter: d->frame_index advances inside
     // RunDLAA before present, so a counter comparison always fails here).
     if (g_opt_promote_drawn_only >= 0.5f && !snap.drawn_since_last_present) continue;
-    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
+    for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
       if (snap.prev_buffer[s] && snap.cur_buffer[s])
         ctx->CopyResource(snap.prev_buffer[s], snap.cur_buffer[s]);
+      snap.prev_meta[s] = snap.slot_meta[s];
+    }
     snap.prev_capture_frame = snap.last_draw_frame;  // prev now holds the cur captured at this frame
     snap.drawn_since_last_present = false;
     snap.rr = 0u;
@@ -2902,6 +2923,9 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   // the identity placeholder (never leave a patched skinned VS slot unbound).
   DeviceData::PrevBoneSnap* bound_snap = nullptr;
   int snap_miss_reason = 0;
+  int own_sel_slot = -1;
+  int own_reason_code = 4;
+  d->skinned_po_motion_valid = true;
   if (shader_injection.dlaa_per_object_motion >= 0.5f &&
       (g_opt_bind_capture_only < 0.5f ||
        d->phasee_ps_candidates.contains(CurrentPsHash(cmd_list, d)))) {
@@ -3082,50 +3106,69 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                 const uint32_t cap_slot = snap->rr % DeviceData::kBoneSlots;
                 snap->rr = (snap->rr + 1u) % DeviceData::kBoneSlots;
                 if (snap->cur_buffer[cap_slot]) ctx->CopyResource(snap->cur_buffer[cap_slot], gb);
+                snap->slot_meta[cap_slot] = {key, gbk, d->frame_index, ++snap->cap_seq, snap->serial};
                 // OPT 1: mark this snap's cur as refreshed during THIS present
                 // cycle, so CapturePrevBones promotes exactly the snaps that
                 // were actually drawn (frame counters are unreliable at present
                 // time — see CapturePrevBones).
                 snap->drawn_since_last_present = true;
                 snap->last_draw_frame = d->frame_index;
-                // ── Staleness guard (round 21 + strict A/B): ──
-                // If the prev content is older than the allowed gap (the
-                // character was culled / LOD-switched, or the snapshot key
-                // changed -> a brand-new snapshot with empty prev), binding that
-                // stale prev makes the patched VS compute a wrong object delta on
-                // the draw(s) after the gap -> a visible pop/jitter that also
-                // smears DLAA history. Force prev = cur (just captured above) so
-                // THIS draw computes delta = 0 (camera-only, invisible) and the
-                // next present promotes normally. Age 1 (normal 1-frame prev)
-                // never fires.
-                //   Default (round 21): allow up to age 2 — but age 2 uses a
-                //   prev that is TWO frames old -> a 2-frame accumulated delta
-                //   that intermittently crosses the confidence gate = the
-                //   flashing yellow/purple HSV regions on intermittently-drawn
-                //   parts.
-                //   Strict (DLAAPhaseBStrictPrev): only age 1 (exactly 1-frame
-                //   old prev) is used; anything stale -> prev=cur (delta 0,
-                //   camera path). Every-frame parts keep their constant real MV.
+                // ── Strict per-slot ownership: a prev slot is usable only when
+                // its owner key, serial, and bone handle prove it is this
+                // object's pose from exactly the previous frame. Zero, stale,
+                // mismatched, or multi-handle (ambiguous co-tenant) slots are
+                // rejected; the draw then binds no real prev and the motion
+                // target is not appended, so the pixel keeps camera/depth MV.
                 const uint64_t snap_age = snap->prev_capture_frame
                     ? (d->frame_index - snap->prev_capture_frame) : UINT64_MAX;
-                const uint64_t max_stale_age = (g_phaseb_strict_prev > 0.5f) ? 1u : 2u;
-                const bool guard_fired = snap_age > max_stale_age;
-                if (guard_fired)
-                  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s)
-                    if (snap->prev_buffer[s] && snap->cur_buffer[s])
-                      ctx->CopyResource(snap->prev_buffer[s], snap->cur_buffer[s]);
-                bound_snap = snap;
+                int own_sel = -1;
+                int own_reason = 4;
+                {
+                  const uint64_t f = d->frame_index;
+                  int newest = -1;
+                  uint64_t newest_seq = 0u;
+                  uint64_t bones[DeviceData::kBoneSlots] = {};
+                  uint32_t nb = 0u;
+                  bool saw_owner = false;
+                  bool saw_frame = false;
+                  for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
+                    const auto& pm = snap->prev_meta[s];
+                    if (pm.owner == 0u || pm.bone == 0u) continue;
+                    if (pm.owner != key || pm.serial != snap->serial) continue;
+                    saw_owner = true;
+                    if (f < 1u || f - pm.frame != 1u) continue;
+                    saw_frame = true;
+                    bool known = false;
+                    for (uint32_t i = 0u; i < nb; ++i)
+                      if (bones[i] == pm.bone) { known = true; break; }
+                    if (!known && nb < DeviceData::kBoneSlots) bones[nb++] = pm.bone;
+                    if (newest < 0 || pm.seq > newest_seq) { newest = (int)s; newest_seq = pm.seq; }
+                  }
+                  if (!saw_owner) own_reason = 2;
+                  else if (!saw_frame) own_reason = 1;
+                  else if (nb > 1u) own_reason = 3;
+                  else { own_sel = newest; own_reason = 0; }
+                }
+                if (own_sel >= 0) {
+                  bound_snap = snap;
+                  d->skinned_po_motion_valid = true;
+                } else {
+                  bound_snap = nullptr;
+                  snap_miss_reason = 7;
+                  d->skinned_po_motion_valid = false;
+                }
+                own_sel_slot = own_sel;
+                own_reason_code = own_reason;
                 // ── Diag (throttled per key): the snapshot's prev-bone
                 // freshness/state at THIS draw. age = frames since the prev
                 // content was captured; captured = this draw is the first draw
                 // of the frame for this key (cur refreshed from the game's t0);
-                // refreshed = the staleness guard just forced prev=cur. If age
-                // is huge the prev bones were stale (garbage deltas); if
-                // refreshed fires constantly prev==cur (delta ~0). ──
+                // refreshed = strict ownership rejected this draw so the object
+                // path is suppressed and the pixel falls back to camera/depth MV.
                 if (DiagCtxActive(d) ||
                     shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
                   const bool captured_this = (prev_last_draw != d->frame_index);
-                  const bool refreshed_this = guard_fired;
+                  const bool refreshed_this = (own_sel_slot < 0);
                   if (DiagCtxActive(d)) {
                     char sline[256];
                     snprintf(sline, sizeof(sline),
@@ -3144,6 +3187,35 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                                  "prevCapF=%llu lastDraw=%llu size=%u",
                                  vh, key, snap_age, (int)captured_this, (int)refreshed_this,
                                  snap->prev_capture_frame, snap->last_draw_frame, snap->size);
+                  }
+                }
+                if (DiagCtxActive(d) ||
+                    shader_injection.dlaa_phaseb_debug_logging > 0.5f) {
+                  uint64_t so = 0u, sb = 0u, sf = 0u, ss = 0u, sl = 0u;
+                  if (own_sel_slot >= 0) {
+                    const auto& sm = snap->prev_meta[(uint32_t)own_sel_slot];
+                    so = sm.owner; sb = sm.bone; sf = sm.frame; ss = sm.seq; sl = sm.serial;
+                  }
+                  if (DiagCtxActive(d)) {
+                    char oline[256];
+                    snprintf(oline, sizeof(oline),
+                             "[DLAA] own vs=0x%08X key=0x%llX bone=0x%llX frame=%u sel=%d "
+                             "owner=0x%llX obone=0x%llX oframe=%llu oseq=%llu oserial=%llu ok=%d rsn=%d",
+                             vh, (unsigned long long)key, (unsigned long long)gbk, d->frame_index,
+                             own_sel_slot, (unsigned long long)so, (unsigned long long)sb,
+                             (unsigned long long)sf, (unsigned long long)ss, (unsigned long long)sl,
+                             (int)(own_sel_slot >= 0), own_reason_code);
+                    reshade::log::message(reshade::log::level::info, oline);
+                  } else {
+                    LogThrottled(ThrottleKey("snap-own", vh, (uint32_t)key,
+                                             (uint32_t)(key >> 32u)).c_str(),
+                                 reshade::log::level::info, 1u, 120u,
+                                 "[DLAA] own vs=0x%08X key=0x%llX bone=0x%llX frame=%u sel=%d "
+                                 "owner=0x%llX obone=0x%llX oframe=%llu oseq=%llu oserial=%llu ok=%d rsn=%d",
+                                 vh, (unsigned long long)key, (unsigned long long)gbk, d->frame_index,
+                                 own_sel_slot, (unsigned long long)so, (unsigned long long)sb,
+                                 (unsigned long long)sf, (unsigned long long)ss, (unsigned long long)sl,
+                                 (int)(own_sel_slot >= 0), own_reason_code);
                   }
                 }
                 // ── Robot hash-gated diagnostic ──
@@ -3203,7 +3275,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                         vh, ph_robot, (unsigned long long)key,
                         (unsigned long long)b0k, (unsigned long long)vbk,
                         (unsigned long long)gbk, (unsigned long long)snap_age,
-                        (int)(prev_last_draw != d->frame_index), (int)guard_fired,
+                        (int)(prev_last_draw != d->frame_index), (int)(own_sel_slot < 0),
                         gt[0], gt[1], gt[2],
                         pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
                         pt[2][0], pt[2][1], pt[2][2], pt[3][0], pt[3][1], pt[3][2],
@@ -3235,7 +3307,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                                       it->second.new_hash == 0x1D90829Au);
                   const bool cm_ps = (ph_char == 0x159A34A3u || ph_char == 0x1DE48D94u);
                   if (g_char_motion_debug > 0.5f && (cm_vs || cm_ps)) {
-                    const bool cd_anomaly = guard_fired || snap_age != 1u;
+                    const bool cd_anomaly = (own_sel_slot < 0) || snap_age != 1u;
                     const uint64_t cd_last = snap->charmv_last_log_frame;
                     const bool cd_recent = cd_last != 0u &&
                                            (d->frame_index - cd_last) < 60u;
@@ -3286,7 +3358,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
                           "[DLAA] charmv vs=0x%08X ps=0x%08X f=%llu key=0x%llX rr=%u cap=%u age=%llu refr=%d real=%d game=(%+.4f,%+.4f,%+.4f) p0=(%+.4f,%+.4f,%+.4f) p1=(%+.4f,%+.4f,%+.4f) p2=(%+.4f,%+.4f,%+.4f) p3=(%+.4f,%+.4f,%+.4f) best=%u d=%.4f dBone=(%+.4f,%+.4f,%+.4f)",
                           vh, ph_char, (unsigned long long)d->frame_index,
                           (unsigned long long)key, snap->rr, cap_slot,
-                          (unsigned long long)snap_age, (int)guard_fired,
+                          (unsigned long long)snap_age, (int)(own_sel_slot < 0),
                           (int)(bound_snap != nullptr),
                           gt[0], gt[1], gt[2],
                           pt[0][0], pt[0][1], pt[0][2], pt[1][0], pt[1][1], pt[1][2],
@@ -3439,7 +3511,8 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   ID3D11ShaderResourceView* bone_srvs[DeviceData::kBoneSlots];
   for (uint32_t s = 0u; s < DeviceData::kBoneSlots; ++s) {
     ID3D11ShaderResourceView* sv = d->prev_bones_srv;
-    if (bound_snap && bound_snap->prev_srv[s]) sv = bound_snap->prev_srv[s];
+    if (bound_snap && own_sel_slot >= 0 && bound_snap->prev_srv[(uint32_t)own_sel_slot])
+      sv = bound_snap->prev_srv[(uint32_t)own_sel_slot];
     bone_srvs[s] = sv;
     d->last_bound_bone_srv[s] = sv;
   }
