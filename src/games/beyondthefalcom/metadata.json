@@ -1,0 +1,12 @@
+{
+  "$schema": "../../renodx-metadata-schema.json",
+  "id": "beyondthefalcom",
+  "title": "Beyond The Falcom Engine",
+  "status": "experimental",
+  "summary": "Standalone DX11 scene-extraction addon for Falcom Engine games (geometry capture foundation for a future external renderer).",
+  "tags": ["experimental", "scene-extraction"],
+  "deploy": {
+    "api": "d3d11",
+    "architecture": ["x64"]
+  }
+}
