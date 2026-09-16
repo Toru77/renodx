@@ -5408,7 +5408,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAHdrInject", .binding = &shader_injection.dlaa_hdr_inject,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 2.f, .label = "HDR Pre-ToneMap Inject", .section = "Antialiasing",
-        .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (_renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
+        .tooltip = "Where DLAA runs the DLSS pass. Auto: runs at the final_blending draw (raw untonemapped scene) when the HDR mod (renodx-senkiseki.addon64) is loaded, so the HDR mod tone maps the DLAA'd image itself. Pre-ToneMap: force that path. Composite: run DLSS on the tone-mapped composite at FXAA (old path — SDR-capped with the HDR mod).",
         .labels = {"Auto","Pre-ToneMap","Composite"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
     },
@@ -6358,9 +6358,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_device>([](reshade::api::device* dev) {
         auto* d = dev->create_private_data<DeviceData>();
         // HDR-mod detection selects the pre-tone-map injection path in Auto mode.
-        d->hdr_detected = GetModuleHandleA("_renodx-senkiseki.addon64") != nullptr;
+        d->hdr_detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
         reshade::log::message(reshade::log::level::info,
-          d->hdr_detected ? "[DLAA] HDR mod detected: _renodx-senkiseki.addon64"
+          d->hdr_detected ? "[DLAA] HDR mod detected: renodx-senkiseki.addon64"
                           : "[DLAA] HDR mod not detected");
         WatchdogStart(d);
       });
