@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
@@ -597,25 +598,37 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet denoise_tables = {};
 
   reshade::api::resource_view captured_depth_srv = {};
-  bool captured_depth_live = true;      // present-time resolved; false = target freed since capture
+  std::atomic<bool> captured_depth_live{true};  // destroy-event driven; false = target freed since capture
+  uint64_t captured_depth_res = 0u;             // resource behind the view (destroy matching)
+  std::string captured_depth_dims = "none";     // cached at capture (push context only)
   reshade::api::resource_view captured_ssao_srv = {};
   reshade::api::resource_view captured_mrt_normal_srv = {};
-  bool captured_mrt_live = true;        // present-time resolved; false = target freed since capture
+  std::atomic<bool> captured_mrt_live{true};    // destroy-event driven; false = target freed since capture
+  uint64_t captured_mrt_res = 0u;               // resource behind the view (destroy matching)
+  std::string captured_mrt_dims = "none";       // cached at capture (push context only)
   reshade::api::resource_view captured_color_srv = {};   // t0 — lighting input color texture
-  bool captured_color_live = true;      // present-time resolved; false = target freed since capture
+  std::atomic<bool> captured_color_live{true};  // destroy-event driven; false = target freed since capture
+  uint64_t captured_color_res = 0u;             // resource behind the view (destroy matching)
+  std::string captured_color_dims = "none";     // cached at capture (push context only)
+  uint32_t captured_color_w = 0u, captured_color_h = 0u;  // cached dims (SSR sizing, no draw-time query)
   reshade::api::resource_view captured_ssr1_srv = {};   // ssr2-draw t0 — vanilla ssr1 march result (replacement debug view 2)
+  std::atomic<bool> captured_ssr1_live{true};   // destroy-event driven
+  uint64_t captured_ssr1_res = 0u;              // resource behind the view (destroy matching)
   reshade::api::resource_view captured_ssr_mrt_srv = {};  // ssr1-draw t2 — march's own mrt0 (composite gate + normal decode)
+  std::atomic<bool> captured_ssr_mrt_live{true};  // destroy-event driven
+  uint64_t captured_ssr_mrt_res = 0u;             // resource behind the view (destroy matching)
   reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding — vanilla cube fallback
   reshade::api::resource_view captured_scene_cbv_view = {};  // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
   bool captured_scene_cbv_valid = false;
-  bool captured_cbv_live = true;        // present-time resolved; false = buffer freed since capture
+  std::atomic<bool> captured_cbv_live{true};  // destroy-event driven; false = buffer freed since capture
+  uint64_t captured_cbv_res = 0u;             // buffer behind the range (destroy matching)
+  std::string captured_cbv_dims = "none";     // cached at capture (push/bind context only)
+  // Deferred snapshot destroy tracking (plain copies at snapshot time; matched like captured).
+  std::atomic<bool> defDepthLive{true}, defMrtLive{true}, defCbvLive{true};
+  uint64_t deferred_depth_res = 0u, deferred_mrt_res = 0u, deferred_cbv_res = 0u;
   uint64_t captured_scene_cbv_frame = UINT64_MAX;
   uint64_t captured_color_frame = UINT64_MAX;   // frame_index of last lighting t0 capture (stale = loading screen)
-  // Present-time liveness tracking (lazy re-resolve bookkeeping; see resolver).
-  uint64_t live_last_depth = 0u, live_last_color = 0u, live_last_mrt = 0u, live_last_cbv = 0u;
-  uint64_t live_last_defDepth = 0u, live_last_defMrt = 0u, live_last_defCbv = 0u;
-  uint64_t live_sweep_frame = 0u;
   uint64_t captured_depth_frame = UINT64_MAX;   // frame_index of last lighting depth capture (kept for future detectors)
   bool resources_created = false;
   uint64_t frame_index = 0u;
@@ -863,6 +876,8 @@ static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
 static void CSLog(const char* tag, const std::string& msg, bool warn = false);
 static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_view v);
 static bool DynCubeSceneLive(const DeviceData* d);
+struct CapturedViewInfo { uint64_t res; std::string dims; uint32_t w; uint32_t h; };
+static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api::resource_view v);
 
 // ── IS-FAST sync helpers (sync g_isfast_* globals → shader_injection) ──
 static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
@@ -3848,8 +3863,12 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
-          if (d->captured_depth_srv.handle != views[0].handle)
-            CSLog("capture", std::string("depth handle -> ") + CSViewDims(device, views[0]));
+          if (d->captured_depth_srv.handle != views[0].handle) {
+            auto info = CSResolveCapture(device, views[0]);
+            d->captured_depth_res = info.res;
+            d->captured_depth_dims = info.dims;
+            CSLog("capture", std::string("depth handle -> ") + info.dims);
+          }
           d->captured_depth_srv = views[0];
           d->captured_depth_live = true;
           d->captured_depth_frame = d->frame_index;
@@ -3879,8 +3898,12 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
-          if (d->captured_mrt_normal_srv.handle != views[0].handle)
-            CSLog("capture", std::string("mrt handle -> ") + CSViewDims(device, views[0]));
+          if (d->captured_mrt_normal_srv.handle != views[0].handle) {
+            auto info = CSResolveCapture(device, views[0]);
+            d->captured_mrt_res = info.res;
+            d->captured_mrt_dims = info.dims;
+            CSLog("capture", std::string("mrt handle -> ") + info.dims);
+          }
           d->captured_mrt_normal_srv = views[0];
           d->captured_mrt_live = true;
         }
@@ -3894,8 +3917,14 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
-          if (d->captured_color_srv.handle != views[0].handle)
-            CSLog("capture", std::string("color handle -> ") + CSViewDims(device, views[0]));
+          if (d->captured_color_srv.handle != views[0].handle) {
+            auto info = CSResolveCapture(device, views[0]);
+            d->captured_color_res = info.res;
+            d->captured_color_dims = info.dims;
+            d->captured_color_w = info.w;
+            d->captured_color_h = info.h;
+            CSLog("capture", std::string("color handle -> ") + info.dims);
+          }
           d->captured_color_srv = views[0];
           d->captured_color_live = true;
           d->captured_color_frame = d->frame_index;
@@ -3911,9 +3940,13 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (hash == 0x17F931DEu) {
-          if (d->captured_ssr1_srv.handle != views[0].handle)
-            CSLog("capture", std::string("ssr1 handle -> ") + CSViewDims(device, views[0]));
+          if (d->captured_ssr1_srv.handle != views[0].handle) {
+            auto info = CSResolveCapture(device, views[0]);
+            d->captured_ssr1_res = info.res;
+            CSLog("capture", std::string("ssr1 handle -> ") + info.dims);
+          }
           d->captured_ssr1_srv = views[0];
+          d->captured_ssr1_live = true;
         }
       }
     }
@@ -3926,9 +3959,13 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (hash == 0xE2F406C7u) {
-          if (d->captured_ssr_mrt_srv.handle != views[0].handle)
-            CSLog("capture", std::string("ssrMrt handle -> ") + CSViewDims(device, views[0]));
+          if (d->captured_ssr_mrt_srv.handle != views[0].handle) {
+            auto info = CSResolveCapture(device, views[0]);
+            d->captured_ssr_mrt_res = info.res;
+            CSLog("capture", std::string("ssrMrt handle -> ") + info.dims);
+          }
           d->captured_ssr_mrt_srv = views[0];
+          d->captured_ssr_mrt_live = true;
         }
       }
     }
@@ -4036,8 +4073,11 @@ static void OnPushDescriptorsCapture(
         if (desc.type == reshade::api::resource_type::buffer
             && desc.buffer.size >= 200u
             && desc.buffer.size <= (64u * 1024u)) {
-          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle)
+          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle) {
             CSLog("capture", std::string("cbv handle -> buf:") + std::to_string(desc.buffer.size));
+            d->captured_cbv_res = buf.handle;
+            d->captured_cbv_dims = std::string("buf:") + std::to_string(desc.buffer.size);
+          }
           d->captured_scene_cbv = { buf, 0, desc.buffer.size };
           d->captured_scene_cbv_valid = true;
           d->captured_cbv_live = true;
@@ -4150,6 +4190,8 @@ static void OnBindDescriptorTables(
         reshade::api::buffer_range cbv = it->second[bo].buffer_range;
         if (IsSceneCbvCandidateValid(device, cbv)) {
           d->captured_scene_cbv = cbv;
+          d->captured_cbv_res = cbv.buffer.handle;
+          d->captured_cbv_dims = std::string("buf:") + std::to_string(cbv.size);
           d->captured_scene_cbv_valid = true;
           d->captured_cbv_live = true;
           d->captured_scene_cbv_frame = d->frame_index;
@@ -4226,7 +4268,12 @@ static void ApplyGTVBAOCSDispatchFix(
 // never re-log (steady state is silent); warnings repeat at most once per second.
 // A 1/sec "beat" line carries frame + key state as the crash recency anchor.
 // ReShade log flushes synchronously per call, so the last lines before a crash survive.
+// Log mutex: destroy-event handlers can fire on loader threads while the render
+// thread logs. Recursive (handlers log through CSLog while holding it).
+static std::recursive_mutex s_cslogMutex;
 static void CSLog(const char* tag, const std::string& msg, bool warn) {
+  if (shader_injection.custom_shader_logging < 0.5f) return;
+  std::lock_guard<std::recursive_mutex> csLogLock(s_cslogMutex);
   if (shader_injection.custom_shader_logging < 0.5f) return;
   using clock = std::chrono::steady_clock;
   // Per-message suppression: alternating messages under one tag must not defeat
@@ -4249,6 +4296,7 @@ static void CSLog(const char* tag, const std::string& msg, bool warn) {
 // 1/sec heartbeat emitter (recency anchor). Gated by the same toggle.
 static void CSBeat(const std::string& msg) {
   if (shader_injection.custom_shader_logging < 0.5f) return;
+  std::lock_guard<std::recursive_mutex> csBeatLock(s_cslogMutex);
   using clock = std::chrono::steady_clock;
   static clock::time_point s_last{};
   static bool s_init = false;
@@ -4281,6 +4329,64 @@ static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_
   if (desc.type == reshade::api::resource_type::buffer)
     return "buf:" + std::to_string(desc.buffer.size);
   return std::to_string(desc.texture.width) + "x" + std::to_string(desc.texture.height);
+}
+
+// Push/bind-context ONLY capture resolver: describes a captured view and caches it
+// (proven-safe query context, same calls the t17 swap already makes per bind).
+// Never call from draw/present paths — liveness there comes from destroy events.
+static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api::resource_view v) {
+  CapturedViewInfo info = {0u, "null", 0u, 0u};
+  if (!dev || !v.handle) return info;
+  auto res = dev->get_resource_from_view(v);
+  if (!res.handle) { info.dims = "dead"; return info; }
+  info.res = res.handle;
+  auto desc = dev->get_resource_desc(res);
+  if (desc.type == reshade::api::resource_type::buffer) {
+    info.dims = "buf:" + std::to_string(desc.buffer.size);
+  } else {
+    info.w = desc.texture.width;
+    info.h = desc.texture.height;
+    info.dims = std::to_string(info.w) + "x" + std::to_string(info.h);
+  }
+  return info;
+}
+
+// Destroy-event liveness: the authoritative death source for tracked game inputs.
+// Runs on whatever thread frees the target (often the loader thread) — touches only
+// tracked handles/flags plus the mutex-guarded log. No view queries of any kind.
+static void KillTrackedInput(DeviceData* d, reshade::api::resource_view tracked, uint64_t resHandle,
+                             std::atomic<bool>& live, const char* name, uint64_t deadView, uint64_t deadRes) {
+  if (!d) return;
+  if (tracked.handle != 0u && (tracked.handle == deadView || (resHandle != 0u && resHandle == deadRes))) {
+    if (live.load()) {
+      live.store(false);
+      CSLog("capture", std::string(name) + " view DEAD", true);
+    }
+  }
+}
+static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
+  if (!d) return;
+  KillTrackedInput(d, d->captured_depth_srv, d->captured_depth_res, d->captured_depth_live, "depth", deadView, deadRes);
+  KillTrackedInput(d, d->captured_color_srv, d->captured_color_res, d->captured_color_live, "color", deadView, deadRes);
+  KillTrackedInput(d, d->captured_mrt_normal_srv, d->captured_mrt_res, d->captured_mrt_live, "mrt", deadView, deadRes);
+  KillTrackedInput(d, d->captured_scene_cbv_view, d->captured_cbv_res, d->captured_cbv_live, "cbv", deadView, deadRes);
+  KillTrackedInput(d, d->deferred_depth_srv, d->deferred_depth_res, d->defDepthLive, "defDepth", deadView, deadRes);
+  KillTrackedInput(d, d->deferred_mrt_normal_srv, d->deferred_mrt_res, d->defMrtLive, "defMrt", deadView, deadRes);
+  KillTrackedInput(d, d->deferred_scene_cbv_view, d->deferred_cbv_res, d->defCbvLive, "defCbv", deadView, deadRes);
+  KillTrackedInput(d, d->captured_ssr1_srv, d->captured_ssr1_res, d->captured_ssr1_live, "ssr1", deadView, deadRes);
+  KillTrackedInput(d, d->captured_ssr_mrt_srv, d->captured_ssr_mrt_res, d->captured_ssr_mrt_live, "ssrMrt", deadView, deadRes);
+}
+static void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
+  if (!device || !view.handle) return;
+  auto* d = device->get_private_data<DeviceData>();
+  if (!d) return;
+  KillAllTracked(d, view.handle, 0u);
+}
+static void OnDestroyResource(reshade::api::device* device, reshade::api::resource res) {
+  if (!device || !res.handle) return;
+  auto* d = device->get_private_data<DeviceData>();
+  if (!d) return;
+  KillAllTracked(d, 0u, res.handle);
 }
 
 // Present watchdog: proves render-thread stalls vs process death across silent gaps.
@@ -4355,7 +4461,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   // state is this line alone.
   CSBeat(std::string("frame=") + std::to_string(d->frame_index) +
     " working=" + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) +
-    " liveDepth=" + CSViewDims(dev, d->captured_depth_srv) +
+    " liveDepth=" + (d->captured_depth_srv.handle ? d->captured_depth_dims : "none") +
     " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISS") +
     " gtvbaoRes=" + (d->resources_created ? "1" : "0") +
     " cubeRes=" + (d->dyncube_resources_created ? "1" : "0") +
@@ -4432,30 +4538,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   const bool dynCube_present_active = shader_injection.dynCube_enabled > 0.5f;
   if (shader_injection.gtvbao_mode < 0.5f && !dynCube_present_active) return;
 
-  // Present-time input liveness: re-resolve captured game views here (proven-safe
-  // query context, next to the existing depth/backbuffer reads). Draw callbacks
-  // must never issue these queries. Queries run only when a watched handle changed
-  // since the last check, plus a ~1/sec full sweep (handle reuse would otherwise
-  // be invisible). Transitions flip flags; dispatches check flags.
+  // Liveness checkpoint (region marker only): input liveness is maintained by
+  // capture edges (bind = live) and destroy events (free = dead) — no view
+  // queries here or anywhere on the render thread outside push/bind captures.
   s_presentRegion.store(2);
-  const bool liveSweep = (d->frame_index - d->live_sweep_frame) >= 60u;
-  if (liveSweep) d->live_sweep_frame = d->frame_index;
-  {
-    auto resolveLive = [&](reshade::api::resource_view v, uint64_t& last, bool& flag, const char* name) {
-      if (!v.handle) { last = 0u; return; }
-      if (v.handle == last && !liveSweep) return;
-      last = v.handle;
-      const bool live = CSViewDims(dev, v) != "dead";
-      if (live != flag) {
-        flag = live;
-        CSLog("capture", std::string(name) + (live ? " revived" : " view DEAD"), !live);
-      }
-    };
-    resolveLive(d->captured_depth_srv, d->live_last_depth, d->captured_depth_live, "depth");
-    resolveLive(d->captured_color_srv, d->live_last_color, d->captured_color_live, "color");
-    resolveLive(d->captured_mrt_normal_srv, d->live_last_mrt, d->captured_mrt_live, "mrt");
-    if (d->captured_scene_cbv_valid) resolveLive(d->captured_scene_cbv_view, d->live_last_cbv, d->captured_cbv_live, "cbv");
-  }
   if (d->frame_index <= kGTVBAOStartupGuardFrames) {
     if (d->frame_index == kGTVBAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
@@ -4591,24 +4677,12 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   };
 
   // Inline dispatch active (deferred off) — GTVBAO runs during lighting pass, not here.
-  // Drop snapshots whose targets died since capture (transition realloc): dispatching
-  // on them is never correct. Handle-nonzero alone cannot prove liveness. Lazy like
-  // the resolver above (shared sweep epoch): re-check only on handle change.
+  // Drop snapshots whose targets died since capture (destroy events flip the flags;
+  // no queries here). Dispatching on them is never correct.
   s_presentRegion.store(4);
-  if (d->deferred_pending) {
-    auto checkDef = [&](reshade::api::resource_view v, uint64_t& last) -> bool {
-      if (!v.handle) { last = 0u; return false; }
-      if (v.handle == last && !liveSweep) return false;
-      last = v.handle;
-      return CSViewDims(dev, v) == "dead";
-    };
-    bool drop = checkDef(d->deferred_depth_srv, d->live_last_defDepth);
-    drop = checkDef(d->deferred_mrt_normal_srv, d->live_last_defMrt) || drop;
-    drop = checkDef(d->deferred_scene_cbv_view, d->live_last_defCbv) || drop;
-    if (drop) {
-      CSLog("gtvbao", "deferred snapshot DEAD: dropped", true);
-      d->deferred_pending = false;
-    }
+  if (d->deferred_pending && (!d->defDepthLive || !d->defMrtLive || !d->defCbvLive)) {
+    CSLog("gtvbao", "deferred snapshot DEAD: dropped", true);
+    d->deferred_pending = false;
   }
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     capture_light_buffer_for_next_frame();
@@ -4661,12 +4735,19 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     return;
   }
   // Restore deferred snapshots as active captures for RunGTVBAO / RunVBGI.
+  // Liveness travels with the views (plain flag copies, no queries).
   d->captured_depth_srv = d->deferred_depth_srv;
+  d->captured_depth_res = d->deferred_depth_res;
+  d->captured_depth_live = d->defDepthLive.load();
   d->captured_ssao_srv = d->deferred_ssao_srv;
   d->captured_mrt_normal_srv = d->deferred_mrt_normal_srv;
+  d->captured_mrt_res = d->deferred_mrt_res;
+  d->captured_mrt_live = d->defMrtLive.load();
   d->captured_scene_cbv_view = d->deferred_scene_cbv_view;
   d->captured_scene_cbv = d->deferred_scene_cbv;
   d->captured_scene_cbv_valid = d->deferred_scene_cbv_valid;
+  d->captured_cbv_res = d->deferred_cbv_res;
+  d->captured_cbv_live = d->defCbvLive.load();
   d->captured_scene_cbv_frame = d->deferred_scene_cbv_frame;
   d->deferred_pending = false;
 
@@ -4687,7 +4768,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
 
   bool ok = true;
   if (shader_injection.gtvbao_mode > 0.5f) {
-    const std::string liveDepth = CSViewDims(cl->get_device(), d->captured_depth_srv);
+    const std::string liveDepth = d->captured_depth_srv.handle ? d->captured_depth_dims : "none";
     const std::string wantDims = std::to_string(d->working_width) + "x" + std::to_string(d->working_height);
     const bool dimMismatch = (liveDepth != wantDims);
     CSLog("gtvbao", std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth +
@@ -4873,11 +4954,11 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   }
   // t4 mrt normals: prefer the march's own t2 capture (same resource the vanilla
   // march decodes, so gate bits and resolution match by construction); fall back
-  // to the lighting capture. Unbound Load returns 0, which safely gates out to
-  // the vanilla branch — never garbage.
-  reshade::api::resource_view mrtSrv = dd->captured_ssr_mrt_srv.handle
-      ? dd->captured_ssr_mrt_srv
-      : dd->captured_mrt_normal_srv;
+  // to the lighting capture. First-live-wins: dead views keep game bindings.
+  // Unbound Load returns 0, which safely gates out to the vanilla branch.
+  reshade::api::resource_view mrtSrv = {};
+  if (dd->captured_ssr_mrt_srv.handle && dd->captured_ssr_mrt_live) mrtSrv = dd->captured_ssr_mrt_srv;
+  else if (dd->captured_mrt_normal_srv.handle && dd->captured_mrt_live) mrtSrv = dd->captured_mrt_normal_srv;
   if (mrtSrv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
@@ -5217,10 +5298,18 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   if (!dd) return true;
 
   // ── Deferred dispatch path: capture snapshots for OnPresent (kai-style). ──
-  if (g_cpuopt_deferred_dispatch > 0.5f) {
+  // Plain copies only (no queries): resource pairs + live flags travel with the views.
+  // GTVBAO-only: with the mode off there is nothing to defer to.
+  if (g_cpuopt_deferred_dispatch > 0.5f && shader_injection.gtvbao_mode > 0.5f) {
     dd->deferred_depth_srv = dd->captured_depth_srv;
+    dd->deferred_depth_res = dd->captured_depth_res;
+    dd->defDepthLive = dd->captured_depth_live.load();
     dd->deferred_mrt_normal_srv = dd->captured_mrt_normal_srv;
+    dd->deferred_mrt_res = dd->captured_mrt_res;
+    dd->defMrtLive = dd->captured_mrt_live.load();
     dd->deferred_scene_cbv_view = dd->captured_scene_cbv_view;
+    dd->deferred_cbv_res = dd->captured_cbv_res;
+    dd->defCbvLive = dd->captured_cbv_live.load();
     dd->deferred_scene_cbv = dd->captured_scene_cbv;
     dd->deferred_scene_cbv_valid = dd->captured_scene_cbv_valid;
     dd->deferred_scene_cbv_frame = dd->captured_scene_cbv_frame;
@@ -5235,7 +5324,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       renodx::utils::state::CommandListState prev = {};
       if (cs) prev = *cs;
 
-      const std::string liveDepth = CSViewDims(cmd_list->get_device(), dd->captured_depth_srv);
+      const std::string liveDepth = dd->captured_depth_srv.handle ? dd->captured_depth_dims : "none";
       const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
       CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
         liveDepth != wantDims);
@@ -5574,8 +5663,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       }
     }
     // Bind the captured vanilla ssr1 march result (t28) for the SSR replacement
-    // debug view. Only needed for diagnostics; skipped when never captured.
-    if (dd->captured_ssr1_srv.handle) {
+    // debug view. Only needed for diagnostics; skipped when never captured or dead.
+    if (dd->captured_ssr1_srv.handle && dd->captured_ssr1_live) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{{}, 28u, 0, 1,
           reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_ssr1_srv});
@@ -6853,10 +6942,11 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     uint32_t sz = DynCubeResolveSize(shader_injection.dynCube_resolution);
     if (!CreateDynCubeResources(cl->get_device(), d, sz)) return false;
   }
-  // Phase 1: require live depth+color+cbv (rawDepth >=1-1e-5 reject). Liveness flags
-  // come from the present-time resolver (draw callbacks must not query views).
+  // Phase 1: require live depth+color+mrt+cbv (rawDepth >=1-1e-5 reject). Liveness flags
+  // come from capture edges (bind = live) and destroy events (free = dead).
   if (!d->captured_depth_srv.handle || !d->captured_color_srv.handle || !d->captured_scene_cbv_valid
-      || !d->captured_depth_live || !d->captured_color_live || !d->captured_cbv_live) {
+      || !d->captured_depth_live || !d->captured_color_live || !d->captured_cbv_live
+      || !d->captured_mrt_live) {
     CSLog("dyncube", "capture SKIP (missing or dead inputs)", true);
     return false;
   }
@@ -7205,9 +7295,9 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
 
   // Lazily create the full-res SSR textures (raw, blur_h, blur) sized to the captured color.
-  auto colorRes = dev->get_resource_from_view(d->captured_color_srv);
-  auto cd = dev->get_resource_desc(colorRes);
-  uint32_t w = cd.texture.width, h = cd.texture.height;
+  // Cached dims (no draw-time queries): refreshed at every color capture in push context.
+  uint32_t w = d->captured_color_w, h = d->captured_color_h;
+  if (w == 0u || h == 0u) return false;
   auto make_tex = [&](reshade::api::resource* r, reshade::api::resource_view* srv, reshade::api::resource_view* uav,
                       const char* name) -> bool {
     if (r->handle) return true;
@@ -7719,7 +7809,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     return false;
   }
   {
-    const std::string liveDepth = CSViewDims(dev, d->captured_depth_srv);
+    const std::string liveDepth = d->captured_depth_srv.handle ? d->captured_depth_dims : "none";
     const std::string wantDims = std::to_string(w) + "x" + std::to_string(h);
     CSLog("gtvbao", std::string("run entry working=") + wantDims + " liveDepth=" + liveDepth, liveDepth != wantDims);
   }
@@ -8228,6 +8318,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       break;
     case DLL_PROCESS_DETACH:
       s_watchdogStop.store(true);
@@ -8239,6 +8331,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       reshade::unregister_addon(h_module);
       break;
   }
