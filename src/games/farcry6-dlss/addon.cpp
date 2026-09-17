@@ -25,6 +25,14 @@
 
 namespace {
 
+inline const char* SlotState(int i) {
+  switch (farcry6_dlss::dlss::slot_hit[i].load()) {
+    case 1: return "hit";
+    case 2: return "dummy";
+    default: return "-";
+  }
+}
+
 static bool DlssStatusDraw() {
   using namespace farcry6_dlss::dlss;
   const std::string devices = DeviceSummary();
@@ -48,6 +56,8 @@ static bool DlssStatusDraw() {
     if (s.count > 0u || s.is_push) ++learned_count;
   }
   ImGui::Text("Inputs: %d/5 slots learned", learned_count);
+  ImGui::Text("Slots: b0:%s t0:%s t2:%s t5:%s t6:%s", SlotState(0), SlotState(1), SlotState(2),
+              SlotState(3), SlotState(4));
   return false;
 }
 
@@ -70,6 +80,17 @@ renodx::utils::settings::Settings settings = {
         .label = "DLSS Replacement",
         .section = "Antialiasing",
         .tooltip = "Runs NVIDIA DLSS in place of Far Cry 6's TAA passes when the TAA resources can be resolved. Requires nvngx_dlss.dll next to the game executable. When off (or when resources cannot be resolved), the game's own TAA runs unchanged.",
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSAllowFallback",
+        .binding = &farcry6_dlss::dlss::dlss_allow_fallback,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Experimental Fallback",
+        .section = "Antialiasing",
+        .tooltip = "Run DLSS even when some TAA inputs do not resolve, using zero-motion / far-plane stand-ins. The image will be softer than TAA. Pipeline testing only; off keeps vanilla TAA whenever inputs are missing.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{

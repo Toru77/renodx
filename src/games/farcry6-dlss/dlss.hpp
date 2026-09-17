@@ -94,6 +94,10 @@ inline float dlss_jitter_source = 1.f;
 // Calibration multiplier for the unpacked motion vectors.
 inline float dlss_mv_scale = 1.f;
 inline float dlss_debug_logging = 0.f;
+// Experimental fallback: run DLSS even when some TAA inputs don't resolve,
+// using zero-motion / far-plane stand-ins. Image will be softer than TAA.
+// Pipeline testing only; default off (unresolved inputs keep vanilla TAA).
+inline float dlss_allow_fallback = 0.f;
 
 struct InstanceData {
   Microsoft::WRL::ComPtr<ID3D12Device> device;
@@ -137,6 +141,69 @@ struct UnpackData {
 
 inline UnpackData unpack;
 inline reshade::api::device* unpack_device = nullptr;
+
+// ── Fallback stand-in resources (experimental degraded mode) ──
+// Zero-motion MVs (RG16F) and far-plane depth (R32F), sized to the DLSS input.
+// Well-formed by construction, so they bypass the sanity guards that fence
+// stale journal entries. Created on demand, released with the device.
+struct FallbackData {
+  reshade::api::resource mv_texture = {};
+  reshade::api::resource depth_texture = {};
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+};
+
+inline FallbackData fallback;
+
+inline void ReleaseFallback(reshade::api::device* device) {
+  if (device == nullptr) return;
+  if (fallback.mv_texture.handle) device->destroy_resource(fallback.mv_texture);
+  if (fallback.depth_texture.handle) device->destroy_resource(fallback.depth_texture);
+  fallback = {};
+}
+
+inline bool EnsureFallback(reshade::api::device* device, uint32_t width, uint32_t height) {
+  if (device == nullptr || width == 0u || height == 0u) return false;
+  if (fallback.mv_texture.handle != 0u && fallback.width == width && fallback.height == height) return true;
+  ReleaseFallback(device);
+  // Explicit initial data (GPU memory is not zero-filled): zero motion and
+  // far-plane depth. See below.
+  reshade::api::resource_desc mv_rd = {};
+  mv_rd.type = reshade::api::resource_type::texture_2d;
+  mv_rd.texture = {width, height, 1, 1, reshade::api::format::r16g16_float, 1};
+  mv_rd.heap = reshade::api::memory_heap::gpu_only;
+  mv_rd.usage = reshade::api::resource_usage::shader_resource;
+  reshade::api::resource_desc dep_rd = {};
+  dep_rd.type = reshade::api::resource_type::texture_2d;
+  dep_rd.texture = {width, height, 1, 1, reshade::api::format::r32_float, 1};
+  dep_rd.heap = reshade::api::memory_heap::gpu_only;
+  dep_rd.usage = reshade::api::resource_usage::shader_resource;
+  // Zero motion (0.0f) initial data: "no motion anywhere" signal.
+  std::vector<uint16_t> zero_mv(static_cast<size_t>(width) * height * 2u, 0u);
+  reshade::api::subresource_data mv_init = {};
+  mv_init.data = zero_mv.data();
+  mv_init.row_pitch = static_cast<uint32_t>(static_cast<size_t>(width) * 2u * sizeof(uint16_t));
+  mv_init.slice_pitch = static_cast<uint32_t>(zero_mv.size() * sizeof(uint16_t));
+  // Far plane (1.0f) initial data for depth: minimal disocclusion influence.
+  std::vector<float> far_plane(static_cast<size_t>(width) * height, 1.0f);
+  reshade::api::subresource_data dep_init = {};
+  dep_init.data = far_plane.data();
+  dep_init.row_pitch = static_cast<uint32_t>(static_cast<size_t>(width) * sizeof(float));
+  dep_init.slice_pitch = static_cast<uint32_t>(far_plane.size() * sizeof(float));
+  if (!device->create_resource(mv_rd, &mv_init, reshade::api::resource_usage::shader_resource, &fallback.mv_texture)
+      || fallback.mv_texture.handle == 0u) {
+    ReleaseFallback(device);
+    return false;
+  }
+  if (!device->create_resource(dep_rd, &dep_init, reshade::api::resource_usage::shader_resource, &fallback.depth_texture)
+      || fallback.depth_texture.handle == 0u) {
+    ReleaseFallback(device);
+    return false;
+  }
+  fallback.width = width;
+  fallback.height = height;
+  return true;
+}
 
 // ── Jitter auto-detect state (scans b0 for a per-frame varying pair) ──
 struct JitterState {
@@ -220,6 +287,11 @@ inline void NoteSuccess() {
 // recorded update type. Push-bound slots need no capture at all.
 static constexpr uint32_t kLearnedSlots = 5u;  // b0, t0, t2, t5, t6
 static constexpr uint32_t kMaxCandidates = 3u;
+// Last-TAA-draw per-slot resolve results, for the Status readout only.
+// 0=miss, 1=real journal/push entry, 2=fallback dummy. Written by the
+// resolvers / EvaluateDLSS, read by the overlay.
+inline std::atomic<int> slot_hit[kLearnedSlots];
+inline bool logged_fallback = false;
 static constexpr uint32_t kMaxInterestTables = 32u;
 
 inline uint32_t LearnIndexForSlot(uint32_t slot, bool is_cbv) {
@@ -274,6 +346,11 @@ inline std::unordered_map<uint64_t, RecordedDesc> seen;
 inline bool seen_reserved = false;
 inline std::atomic<size_t> seen_count{0};
 inline bool logged_seen_cap = false;
+// Native device owning the journaled heaps (0 = unset). Set on first insert;
+// a *different* native at init time means fresh heap objects, so the journal
+// is wiped. Same-native re-init (wrapper churn) keeps it.
+inline std::atomic<uint64_t> capture_device_native{0};
+inline std::atomic<uint64_t> last_evict_present{0};
 // Last input/output native handles: any change forces an NGX history reset
 // (kills history poisoning when heap slots recycle across resources).
 inline uint64_t last_in_color = 0u;
@@ -282,8 +359,41 @@ inline uint64_t last_in_depth = 0u;
 inline uint64_t last_in_output = 0u;
 inline bool logged_size_guard = false;
 
-// Known NVIDIA device natives for lock-free event filtering (≤4 devices).
+// Known NVIDIA device natives for lock-free draw gating (≤4 devices).
 inline std::atomic<uint64_t> nvidia_devs[4];
+
+// Every device ReShade initializes (any vendor), for fail-open journal
+// filtering. Heap handles are native-unique, so foreign heaps can never
+// collide with TAA keys — while a strict NVIDIA-only filter here would
+// silently discard writes on any unexpected wrapper (total blindness). Draws
+// themselves stay strictly NVIDIA-gated.
+inline std::atomic<uint64_t> seen_devs[8];
+
+inline void NoteSeenDevice(uint64_t native) {
+  if (native == 0u) return;
+  for (uint32_t i = 0u; i < 8u; ++i) {
+    if (seen_devs[i].load() == native) return;
+  }
+  for (uint32_t i = 0u; i < 8u; ++i) {
+    uint64_t empty = 0u;
+    if (seen_devs[i].compare_exchange_strong(empty, native)) return;
+  }
+}
+
+inline void ForgetSeenDevice(uint64_t native) {
+  if (native == 0u) return;
+  for (uint32_t i = 0u; i < 8u; ++i) {
+    if (seen_devs[i].load() == native) seen_devs[i].store(0u);
+  }
+}
+
+inline bool IsSeenDevice(uint64_t native) {
+  if (native == 0u) return false;
+  for (uint32_t i = 0u; i < 8u; ++i) {
+    if (seen_devs[i].load() == native) return true;
+  }
+  return false;
+}
 
 inline bool IsKnownNvidiaNative(uint64_t native) {
   if (native == 0u) return false;
@@ -317,6 +427,7 @@ inline void ClearCapture() {
   interest_count.store(0u);
   seen.clear();
   seen_reserved = false;
+  capture_device_native.store(0u);
   for (uint32_t i = 0u; i < kRawCacheSize; ++i) raw_cache_raw[i].store(0u);
   full_capture_frames.store(0);
   resolved_once.store(false);
@@ -526,6 +637,7 @@ inline void ReleaseUnpack(reshade::api::device* device) {
 inline void ReleaseNgx() {
   if (unpack_device != nullptr) {
     ReleaseUnpack(unpack_device);
+    ReleaseFallback(unpack_device);
     unpack_device = nullptr;
   }
   ReleaseFeature();
@@ -541,10 +653,6 @@ inline void ReleaseNgx() {
   ngx.supported = false;
   ngx.init_failed = false;
   jitter_state = {};
-  {
-    std::lock_guard<std::mutex> lock(capture_mutex);
-    ClearCapture();
-  }
   stat_resolve_fail_streak.store(0);
   logged_taa_draw_detected = false;
   logged_missing_constants = false;
@@ -1068,9 +1176,11 @@ inline reshade::api::resource_view ResolveSlotSrv(
     const CommandListData* data,
     uint32_t slot) {
   if (cmd_list == nullptr || data == nullptr || slot >= kTrackedSrvCount) return {0};
-  if (data->push_srvs[slot].handle != 0u) return data->push_srvs[slot];
-
   const uint32_t li = LearnIndexForSlot(slot, false);
+  if (li != UINT32_MAX && data->push_srvs[slot].handle != 0u) {
+    slot_hit[li].store(1);
+    return data->push_srvs[slot];
+  }
   if (li == UINT32_MAX) return {0};
 
   // Journal lookup (boot-time writes included), type-checked. Candidates are
@@ -1091,12 +1201,14 @@ inline reshade::api::resource_view ResolveSlotSrv(
       if (!CanonicalBindingCached(device, table, bindings[k], heap, offset)) continue;
       const auto rit = seen.find(HeapKey(heap, offset));
       if (rit != seen.end() && rit->second.has_view && rit->second.has_type && IsSrvType(rit->second.type)) {
+        slot_hit[li].store(1);
         return rit->second.view;
       }
     }
   }
   // Miss: (re-)learn from the current bindings so the update hook is armed
   // for the next frame. This frame falls back to vanilla TAA.
+  slot_hit[li].store(0);
   LearnTaaBindings(cmd_list, data);
   return {0};
 }
@@ -1109,6 +1221,7 @@ inline bool ResolveB0(
   if (data == nullptr) return false;
   if (data->constant_buffers[0].buffer.handle != 0u) {
     out = data->constant_buffers[0];
+    slot_hit[0].store(1);
     return true;
   }
   if (cmd_list == nullptr) return false;
@@ -1131,12 +1244,43 @@ inline bool ResolveB0(
           && rit->second.has_type
           && rit->second.type == reshade::api::descriptor_type::constant_buffer) {
         out = rit->second.cbv;
+        slot_hit[0].store(1);
         return true;
       }
     }
   }
+  slot_hit[0].store(0);
   LearnTaaBindings(cmd_list, data);
   return false;
+}
+
+// Evicts non-learned journal entries to make room for learned traffic.
+// Caller must hold capture_mutex. Throttled to one pass per 300 presents so
+// effect-churn refills cannot turn it into a per-frame O(n) scan.
+inline void EvictNonLearnedLocked() {
+  if (stat_presents.load() - last_evict_present.load() < 300u) return;
+  last_evict_present.store(stat_presents.load());
+  uint64_t keep[kMaxInterestTables] = {};
+  uint32_t n = interest_count.load();
+  if (n > kMaxInterestTables) n = kMaxInterestTables;
+  for (uint32_t j = 0u; j < n; ++j) {
+    keep[j] = HeapKey(interest_heaps[j].load(), interest_offs[j].load());
+  }
+  for (auto it = seen.begin(); it != seen.end();) {
+    bool learned = false;
+    for (uint32_t j = 0u; j < n; ++j) {
+      if (it->first == keep[j]) {
+        learned = true;
+        break;
+      }
+    }
+    if (learned) {
+      ++it;
+    } else {
+      it = seen.erase(it);
+    }
+  }
+  seen_count.store(seen.size());
 }
 
 // Own update hook: from attach until the first resolve, records every SRV /
@@ -1150,9 +1294,10 @@ inline bool OnUpdateDescriptorTables(
     uint32_t count,
     const reshade::api::descriptor_table_update* updates) {
   if (device == nullptr || count == 0u || updates == nullptr) return false;
-  // WARP/other-adapter devices share these global events; ignore them
-  // lock-free (their heaps can never back the NVIDIA TAA draws).
-  if (!IsKnownNvidiaNative(device->get_native())) return false;
+  // Fail-open journal filter: accept writes from any initialized device.
+  // Heap handles are native-unique so foreign heaps cannot collide; a strict
+  // NVIDIA-only filter here risks silently discarding the writes we need.
+  if (!IsSeenDevice(device->get_native())) return false;
   const bool full = full_capture_frames.load() > 0;
   const bool targeted = resolved_once.load() && !full;
   if (targeted && interest_count.load() == 0u) return false;
@@ -1200,6 +1345,7 @@ inline bool OnUpdateDescriptorTables(
       seen.reserve(kSeenReserve);
       seen_reserved = true;
     }
+    if (capture_device_native.load() == 0u) capture_device_native.store(device->get_native());
     // Targeted mode records only overlapping ks (learned traffic bypasses
     // caps unconditionally); otherwise every descriptor in the update.
     const uint32_t iters = targeted ? overlap_n : update.count;
@@ -1207,14 +1353,26 @@ inline bool OnUpdateDescriptorTables(
       const uint32_t k = targeted ? overlap_ks[ii] : ii;
       const uint32_t off = base + k;
       const uint64_t key = HeapKey(heap, off);
-      if (!full && targeted == false && seen.size() >= kSeenCap && seen.find(key) == seen.end()) {
-        if (!logged_seen_cap) {
-          logged_seen_cap = true;
-          reshade::log::message(reshade::log::level::warning,
-                                "Far Cry 6 DLSS: descriptor journal full before first resolve; "
-                                "TAA inputs may need a re-arm (see log)");
+      if (seen.size() >= kSeenCap && seen.find(key) == seen.end()) {
+        if (targeted) {
+          // Learned traffic always lands: evict non-learned entries to make
+          // room (throttled; see EvictNonLearnedLocked). Cap-full blindness
+          // for TAA inputs is structurally impossible after this point.
+          EvictNonLearnedLocked();
+          if (seen.size() >= kSeenCap && seen.find(key) == seen.end()) continue;
+        } else {
+          if (full) {
+            // Full-window re-arm bypasses the cap (bounded to 5 frames).
+          } else {
+            if (!logged_seen_cap) {
+              logged_seen_cap = true;
+              reshade::log::message(reshade::log::level::warning,
+                                    "Far Cry 6 DLSS: descriptor journal full before first resolve; "
+                                    "TAA inputs may need a re-arm (see log)");
+            }
+            continue;
+          }
         }
-        continue;
       }
       auto& rec = seen[key];
       rec.type = update.type;
@@ -1352,6 +1510,52 @@ inline bool CheckTaaDraw(reshade::api::command_list* cmd_list, CommandListData*&
   return data->rtvs[0].handle != 0u;
 }
 
+// Shared resolve-failure path: streak accounting, duty-cycle-limited
+// re-arm, one-shot log. Returns false (vanilla TAA) always.
+inline bool FailResolveResources(ID3D12Resource* color, ID3D12Resource* packed_motion, ID3D12Resource* depth,
+                                 ID3D12Resource* output_target) {
+  NoteFail(kFailResolve);
+  // Resolve misses are expected while learning (first frames, heap churn).
+  // After a sustained streak, arm the time-boxed full-record fallback for a
+  // few frames. Re-arms are duty-cycle limited (600 presents) and logged, so
+  // a pathological table-churn case cannot become a permanent hitch cycle.
+  // If the journal hit its cap while still unresolved, drop it first: the
+  // re-arm window then re-observes the live heap state.
+  const int streak = stat_resolve_fail_streak.fetch_add(1) + 1;
+  const uint64_t presents = stat_presents.load();
+  if (streak % 30 == 0 && full_capture_frames.load() == 0
+      && presents - last_arm_present.load() > kRearmCooldownPresents) {
+    last_arm_present.store(presents);
+    {
+      std::lock_guard<std::mutex> lock(capture_mutex);
+      if (seen.size() >= kSeenCap) {
+        seen.clear();
+        seen_count.store(0);
+      }
+    }
+    full_capture_frames.store(5);
+    {
+      std::lock_guard<std::mutex> lock(capture_mutex);
+      char buf[192];
+      snprintf(buf, sizeof(buf),
+               "Far Cry 6 DLSS: arming 5-frame full descriptor record to locate TAA inputs (journal=%llu)",
+               static_cast<unsigned long long>(seen.size()));
+      reshade::log::message(reshade::log::level::info, buf);
+    }
+  }
+  if (!logged_missing_resources) {
+    logged_missing_resources = true;
+    std::stringstream s;
+    s << "Far Cry 6 DLSS: TAA draw found, but resources failed to resolve"
+      << " color=" << reinterpret_cast<void*>(color)
+      << " packed_mv=" << reinterpret_cast<void*>(packed_motion)
+      << " depth=" << reinterpret_cast<void*>(depth)
+      << " rtv0=" << reinterpret_cast<void*>(output_target);
+    reshade::log::message(reshade::log::level::warning, s.str().c_str());
+  }
+  return false;
+}
+
 inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandListData* data, uint32_t hash) {
   if (cmd_list == nullptr || data == nullptr || dlss_enabled == 0.f || !IsSupported()) return false;
   auto* device = cmd_list->get_device();
@@ -1360,6 +1564,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   auto* command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (command_list == nullptr) return false;
   if (ngx.eval_failed) return false;
+  for (auto& hit : slot_hit) hit.store(0);  // resolvers set per-slot results below
   {
     // Per-device gate: WARP/other-adapter command lists keep vanilla TAA.
     std::lock_guard<std::mutex> lock(device_mutex);
@@ -1369,16 +1574,19 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     }
   }
 
-  // b0 is required both for the jitter scan and as proof the draw is tracked.
-  // It may arrive via push descriptors or via a descriptor table (captured).
+  // b0 feeds the jitter scan only. Without it jitter stays zero; the draw
+  // proceeds only in experimental fallback mode, else vanilla TAA.
   reshade::api::buffer_range b0_range = {};
-  if (!ResolveB0(cmd_list, data, b0_range)) {
-    NoteFail(kFailB0);
-    if (!logged_missing_constants) {
-      logged_missing_constants = true;
-      reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: TAA draw found, but b0 constants were not captured");
+  const bool b0_ok = ResolveB0(cmd_list, data, b0_range);
+  if (!b0_ok) {
+    if (dlss_allow_fallback == 0.f) {
+      NoteFail(kFailB0);
+      if (!logged_missing_constants) {
+        logged_missing_constants = true;
+        reshade::log::message(reshade::log::level::warning, "Far Cry 6 DLSS: TAA draw found, but b0 constants were not captured");
+      }
+      return false;
     }
-    return false;
   }
 
   const uint32_t depth_slot = (dlss_depth_source > 0.5f) ? 6u : 5u;
@@ -1389,41 +1597,15 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   auto* packed_motion = GetNativeResource(device, motion_view);
   auto* depth = GetNativeResource(device, depth_view);
   auto* output_target = GetNativeResource(device, data->rtvs[0]);
-  if (color == nullptr || packed_motion == nullptr || depth == nullptr || output_target == nullptr) {
-    NoteFail(kFailResolve);
-    // Resolve misses are expected while learning (first frames, heap churn).
-    // After a sustained streak, arm the time-boxed full-record fallback for a
-    // few frames. Re-arms are duty-cycle limited (600 presents) and logged, so
-    // a pathological table-churn case cannot become a permanent hitch cycle.
-    // If the journal hit its cap while still unresolved, drop it first: the
-    // re-arm window then re-observes the live heap state.
-    const int streak = stat_resolve_fail_streak.fetch_add(1) + 1;
-    const uint64_t presents = stat_presents.load();
-    if (streak % 30 == 0 && full_capture_frames.load() == 0
-        && presents - last_arm_present.load() > kRearmCooldownPresents) {
-      last_arm_present.store(presents);
-      {
-        std::lock_guard<std::mutex> lock(capture_mutex);
-        if (seen.size() >= kSeenCap) {
-          seen.clear();
-          seen_count.store(0);
-        }
-      }
-      full_capture_frames.store(5);
-      reshade::log::message(reshade::log::level::info,
-                            "Far Cry 6 DLSS: arming 5-frame full descriptor record to locate TAA inputs");
-    }
-    if (!logged_missing_resources) {
-      logged_missing_resources = true;
-      std::stringstream s;
-      s << "Far Cry 6 DLSS: TAA draw found, but resources failed to resolve"
-        << " color=" << reinterpret_cast<void*>(color)
-        << " packed_mv=" << reinterpret_cast<void*>(packed_motion)
-        << " depth=" << reinterpret_cast<void*>(depth)
-        << " rtv0=" << reinterpret_cast<void*>(output_target);
-      reshade::log::message(reshade::log::level::warning, s.str().c_str());
-    }
-    return false;
+  // Color and the output target are mandatory: DLSS cannot run without them,
+  // in any mode.
+  if (color == nullptr || output_target == nullptr) {
+    return FailResolveResources(color, packed_motion, depth, output_target);
+  }
+  const bool mv_real = packed_motion != nullptr;
+  const bool depth_real = depth != nullptr;
+  if ((!mv_real || !depth_real) && dlss_allow_fallback == 0.f) {
+    return FailResolveResources(color, packed_motion, depth, output_target);
   }
 
   const D3D12_RESOURCE_DESC color_desc = color->GetDesc();
@@ -1466,6 +1648,27 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     }
   }
 
+  // Experimental fallback: stand-ins for unresolvable MV/depth. Reached
+  // only when color+output resolved and the fallback setting is on.
+  const bool use_mv_dummy = !mv_real;
+  const bool use_depth_dummy = !depth_real;
+  if (use_mv_dummy || use_depth_dummy) {
+    if (!EnsureFallback(device, input_width, input_height)) {
+      NoteFail(kFailResolve);
+      return false;
+    }
+    if (use_mv_dummy) slot_hit[LearnIndexForSlot(kSlotPackedMv, false)].store(2);
+    if (use_depth_dummy) slot_hit[LearnIndexForSlot(depth_slot, false)].store(2);
+    if (!logged_fallback) {
+      logged_fallback = true;
+      std::stringstream s;
+      s << "Far Cry 6 DLSS: experimental fallback engaged (mv_dummy=" << (use_mv_dummy ? 1 : 0)
+        << " depth_dummy=" << (use_depth_dummy ? 1 : 0)
+        << "): image will be softer than TAA until real inputs resolve";
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
+  }
+
   // NGX output format follows the TAA target. Only formats NGX accepts as
   // DLSS output are usable; anything else keeps vanilla TAA (no regression).
   DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
@@ -1501,12 +1704,34 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   if (!EnsureOutputTexture(ngx.device.Get(), target_width, target_height, output_format)) return false;
 
+  // Effective MV/depth: real journal entries, or fallback stand-ins.
+  // Zeroed MVs are not jittered: report that honestly to NGX.
+  ID3D12Resource* motion_vectors = nullptr;
+  ID3D12Resource* depth_res = depth;
+  int feature_flags = GetFeatureFlags();
+  if (use_mv_dummy) {
+    motion_vectors = reinterpret_cast<ID3D12Resource*>(fallback.mv_texture.handle);
+    feature_flags &= ~NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
+  } else {
+    if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height)) {
+      NoteFail(kFailUnpack);
+      return false;
+    }
+    motion_vectors = unpack.texture.handle != 0u
+        ? reinterpret_cast<ID3D12Resource*>(unpack.texture.handle)
+        : nullptr;
+  }
+  if (use_depth_dummy) {
+    depth_res = reinterpret_cast<ID3D12Resource*>(fallback.depth_texture.handle);
+  }
+  if (motion_vectors == nullptr || depth_res == nullptr) return false;
+
   // Any input/output swap (heap-slot recycling, resizes) invalidates DLSS
   // history: force a reset instead of poisoning it with a stale frame.
   {
     const uint64_t handles[4] = {
-        reinterpret_cast<uint64_t>(color), reinterpret_cast<uint64_t>(packed_motion),
-        reinterpret_cast<uint64_t>(depth), reinterpret_cast<uint64_t>(output_target)};
+        reinterpret_cast<uint64_t>(color), reinterpret_cast<uint64_t>(motion_vectors),
+        reinterpret_cast<uint64_t>(depth_res), reinterpret_cast<uint64_t>(output_target)};
     if (handles[0] != last_in_color || handles[1] != last_in_mv || handles[2] != last_in_depth
         || handles[3] != last_in_output) {
       ngx.reset = true;
@@ -1518,7 +1743,6 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
 
   const int render_preset = GetRenderPresetValue();
-  const int feature_flags = GetFeatureFlags();
   const int perf_quality = GetPerfQualityValue(input_width, input_height, target_width, target_height);
   if (!EnsureFeature(command_list, input_width, input_height, target_width, target_height,
                      render_preset, feature_flags, perf_quality)) {
@@ -1526,20 +1750,12 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
 
-  if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height)) {
-    NoteFail(kFailUnpack);
-    return false;
-  }
-  auto* motion_vectors = unpack.texture.handle != 0u
-      ? reinterpret_cast<ID3D12Resource*>(unpack.texture.handle)
-      : nullptr;
-  if (motion_vectors == nullptr) return false;
-
-  // Jitter: game estimate (b0 scan) or zero. Convert a small-magnitude
-  // estimate as UV (x resolution); a pixel-scale estimate passes through.
+  // Jitter: game estimate (b0 scan) or zero. Without b0 (fallback mode) it
+  // stays zero. Convert a small-magnitude estimate as UV (x resolution); a
+  // pixel-scale estimate passes through.
   float jitter_x = 0.f;
   float jitter_y = 0.f;
-  if (dlss_jitter_source > 0.5f) {
+  if (b0_ok && dlss_jitter_source > 0.5f) {
     std::vector<float> b0;
     if (ReadB0Floats(b0_range, b0, 512u)) {
       UpdateJitterEstimate(b0);
@@ -1558,7 +1774,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
   eval.Feature.pInColor = color;
   eval.Feature.pInOutput = ngx.output_texture.Get();
-  eval.pInDepth = depth;
+  eval.pInDepth = depth_res;
   eval.pInMotionVectors = motion_vectors;
   eval.InJitterOffsetX = jitter_x;
   eval.InJitterOffsetY = jitter_y;
@@ -1735,6 +1951,22 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
 
 inline void OnInitDevice(reshade::api::device* device) {
   if (device == nullptr) return;
+  NoteSeenDevice(device->get_native());
+  {
+    // Fresh heap objects deserve a fresh journal — but only on a genuinely
+    // different native device. Same-native re-init (wrapper churn) keeps it.
+    const uint64_t native = device->get_native();
+    const uint64_t owner = capture_device_native.load();
+    if (owner != 0u && owner != native) {
+      std::lock_guard<std::mutex> lock(capture_mutex);
+      ClearCapture();
+      char buf[192];
+      snprintf(buf, sizeof(buf),
+               "Far Cry 6 DLSS: capture switched devices (0x%llX -> 0x%llX), journal reset",
+               static_cast<unsigned long long>(owner), static_cast<unsigned long long>(native));
+      reshade::log::message(reshade::log::level::info, buf);
+    }
+  }
   int vendor_id = 0;
   const bool is_nvidia = device->get_property(reshade::api::device_properties::vendor_id, &vendor_id) && vendor_id == 0x10de;
   {
@@ -1775,10 +2007,11 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     }
     if (was_ours) ReleaseNgx();
     RemoveNvidiaNative(device->get_native());
-  }
-  {
-    std::lock_guard<std::mutex> lock(capture_mutex);
-    ClearCapture();
+    ForgetSeenDevice(device->get_native());
+    // Rare by definition. The journal is intentionally NOT wiped here: if the
+    // same native re-initializes (wrapper churn) its heaps are still alive.
+    // A genuinely different native wipes on its init (see OnInitDevice).
+    reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
   }
 }
 
@@ -1796,12 +2029,10 @@ inline void OnPresent(
 }
 
 inline void Use(DWORD fdw_reason) {
-  // NOTE: deliberately no copy_descriptor_tables subscription at all. The
-  // effect runtime issues ~20K copy events/frame; subscribing forces
-  // ReShade's expensive per-call path for all of them while measured game
-  // value is zero (every real hit came from the update journal). The update
-  // journal below is the sole capture path. pipeline_layout/resource utils
-  // are create-time cost only.
+  // NOTE on copy_descriptor_tables: deliberately UNSUBSCRIBED (measured).
+  // A prior build subscribed with an overlap-gated handler; FPS regressed
+  // and no copy-fed heap ever converted to a deployment, so the subscription
+  // bought cost without value. The update journal is the sole capture path.
   // utils::shader::Use attaches the pipeline/state tracking our draw
   // identification and layout resolution read (GetCurrentState,
   // GetCurrentPixelShaderHash, PopulateStageState). No replacements are
