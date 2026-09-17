@@ -20,6 +20,7 @@
 #include <map>
 #include <shared_mutex>
 #include <sstream>
+#include <thread>
 #include <vector>
 #include <Windows.h>
 
@@ -324,6 +325,7 @@ ShaderInjectData shader_injection = {
   .dynCube_vanilla_isfast_frame = -1.f,
   .dynCube_vanilla_ssr_enabled = 1.f,
   .gtvbao_optimization = 1.f,
+  .custom_shader_logging = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -595,21 +597,30 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet denoise_tables = {};
 
   reshade::api::resource_view captured_depth_srv = {};
+  bool captured_depth_live = true;      // present-time resolved; false = target freed since capture
   reshade::api::resource_view captured_ssao_srv = {};
   reshade::api::resource_view captured_mrt_normal_srv = {};
+  bool captured_mrt_live = true;        // present-time resolved; false = target freed since capture
   reshade::api::resource_view captured_color_srv = {};   // t0 — lighting input color texture
+  bool captured_color_live = true;      // present-time resolved; false = target freed since capture
   reshade::api::resource_view captured_ssr1_srv = {};   // ssr2-draw t0 — vanilla ssr1 march result (replacement debug view 2)
   reshade::api::resource_view captured_ssr_mrt_srv = {};  // ssr1-draw t2 — march's own mrt0 (composite gate + normal decode)
   reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding — vanilla cube fallback
   reshade::api::resource_view captured_scene_cbv_view = {};  // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
   bool captured_scene_cbv_valid = false;
+  bool captured_cbv_live = true;        // present-time resolved; false = buffer freed since capture
   uint64_t captured_scene_cbv_frame = UINT64_MAX;
   uint64_t captured_color_frame = UINT64_MAX;   // frame_index of last lighting t0 capture (stale = loading screen)
+  // Present-time liveness tracking (lazy re-resolve bookkeeping; see resolver).
+  uint64_t live_last_depth = 0u, live_last_color = 0u, live_last_mrt = 0u, live_last_cbv = 0u;
+  uint64_t live_last_defDepth = 0u, live_last_defMrt = 0u, live_last_defCbv = 0u;
+  uint64_t live_sweep_frame = 0u;
   uint64_t captured_depth_frame = UINT64_MAX;   // frame_index of last lighting depth capture (kept for future detectors)
   bool resources_created = false;
   uint64_t frame_index = 0u;
   uint64_t resize_guard_until_frame = 0u;
+  reshade::api::command_list* immediate_cmd_list = nullptr;  // refreshed every present; scheduler ctx check
 
   // Deferred dispatch snapshots (kai-style): captured at lighting draw, used at present.
   reshade::api::resource_view deferred_depth_srv = {};
@@ -847,6 +858,11 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list);
 static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages, reshade::api::pipeline_layout layout,
     uint32_t param_index, const reshade::api::descriptor_table_update& update);
+
+// ── Custom Shader crash-tracing log (defined before OnPresent; used everywhere) ──
+static void CSLog(const char* tag, const std::string& msg, bool warn = false);
+static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_view v);
+static bool DynCubeSceneLive(const DeviceData* d);
 
 // ── IS-FAST sync helpers (sync g_isfast_* globals → shader_injection) ──
 static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
@@ -3094,6 +3110,15 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "CustomShaderLogging", .binding = &shader_injection.custom_shader_logging,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Custom Shader Log", .section = "Dynamic Cubemaps",
+      .tooltip = "Throttled step log for GTVBAO + Dynamic Cubemaps + SSR dispatches (sizes, inputs, create/destroy). Arm before a resolution/DLSS change repro: the last line marks the crash step.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f || shader_injection.gtvbao_mode > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeCaptureBoost", .binding = &shader_injection.dynCube_capture_boost,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.66f, .label = "Reflection Brightness", .section = "Dynamic Cubemaps",
@@ -3705,7 +3730,10 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
   if (!d) return;
   if (resize) {
     d->resize_guard_until_frame = d->frame_index + kGTVBAOResizeGuardFrames;
+    CSLog("swapchain", "init resize: 4-frame guard armed, depth/ssao/cbv cleared, GTVBAO+DynCube+cache destroyed");
     d->captured_depth_srv = {}; d->captured_ssao_srv = {};
+    d->captured_depth_live = true; d->captured_mrt_live = true;
+    d->captured_color_live = true; d->captured_cbv_live = true;
     d->captured_scene_cbv_view = {};
     d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
@@ -3719,7 +3747,10 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
   auto* d = sc->get_device()->get_private_data<DeviceData>();
   if (!d) return;
   if (resize) {
+    CSLog("swapchain", "destroy resize: depth/ssao/cbv cleared, DynCube+cache destroyed");
     d->captured_depth_srv = {}; d->captured_ssao_srv = {};
+    d->captured_depth_live = true; d->captured_mrt_live = true;
+    d->captured_color_live = true; d->captured_cbv_live = true;
     d->captured_scene_cbv_view = {};
     d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
     d->captured_scene_cbv_frame = UINT64_MAX;
@@ -3817,7 +3848,10 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
+          if (d->captured_depth_srv.handle != views[0].handle)
+            CSLog("capture", std::string("depth handle -> ") + CSViewDims(device, views[0]));
           d->captured_depth_srv = views[0];
+          d->captured_depth_live = true;
           d->captured_depth_frame = d->frame_index;
           d->captured_scene_cbv_frame = d->frame_index;
           if (shader_injection.gtvbao_debug_logging > 0.5f) {
@@ -3845,7 +3879,10 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
+          if (d->captured_mrt_normal_srv.handle != views[0].handle)
+            CSLog("capture", std::string("mrt handle -> ") + CSViewDims(device, views[0]));
           d->captured_mrt_normal_srv = views[0];
+          d->captured_mrt_live = true;
         }
       }
     }
@@ -3857,7 +3894,10 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (IsLightingShader(hash)) {
+          if (d->captured_color_srv.handle != views[0].handle)
+            CSLog("capture", std::string("color handle -> ") + CSViewDims(device, views[0]));
           d->captured_color_srv = views[0];
+          d->captured_color_live = true;
           d->captured_color_frame = d->frame_index;
         }
       }
@@ -3871,6 +3911,8 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (hash == 0x17F931DEu) {
+          if (d->captured_ssr1_srv.handle != views[0].handle)
+            CSLog("capture", std::string("ssr1 handle -> ") + CSViewDims(device, views[0]));
           d->captured_ssr1_srv = views[0];
         }
       }
@@ -3884,6 +3926,8 @@ static void OnPushDescriptorsCapture(
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
         if (hash == 0xE2F406C7u) {
+          if (d->captured_ssr_mrt_srv.handle != views[0].handle)
+            CSLog("capture", std::string("ssrMrt handle -> ") + CSViewDims(device, views[0]));
           d->captured_ssr_mrt_srv = views[0];
         }
       }
@@ -3933,7 +3977,15 @@ static void OnPushDescriptorsCapture(
         bool swapIsLighting = false;
         {
           auto* swapState = renodx::utils::shader::GetCurrentState(cmd_list);
-          if (swapState) swapIsLighting = IsLightingShader(renodx::utils::shader::GetCurrentPixelShaderHash(swapState));
+          if (swapState) {
+            uint32_t swapHash = renodx::utils::shader::GetCurrentPixelShaderHash(swapState);
+            swapIsLighting = IsLightingShader(swapHash);
+            if (swapHash != 0u) {
+              std::ostringstream hs;
+              hs << std::hex << swapHash;
+              CSLog("draw", std::string("t17 draw hash=0x") + hs.str());
+            }
+          }
         }
         float swapSoften = std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f);
         float swapStrength = std::clamp(shader_injection.dynCube_global_strength, 0.f, 1.f);
@@ -3962,7 +4014,9 @@ static void OnPushDescriptorsCapture(
           auto knownRes = device->get_resource_from_view(d->captured_vanilla_env_srv);
           swapAllowed = (swapResHere.handle != 0u && knownRes.handle != 0u && knownRes.handle == swapResHere.handle);
         }
-        if (t17srv.handle && swapAllowed) {
+        if (t17srv.handle && swapAllowed && !DynCubeSceneLive(d))
+          CSLog("serve", "t17 swap skipped (stale scene)");
+        if (t17srv.handle && swapAllowed && DynCubeSceneLive(d)) {
           s_dynCubeT17SwapGuard = true;
           cmd_list->push_descriptors(reshade::api::shader_stage::pixel,
               reshade::api::pipeline_layout{0}, 0,
@@ -3982,8 +4036,11 @@ static void OnPushDescriptorsCapture(
         if (desc.type == reshade::api::resource_type::buffer
             && desc.buffer.size >= 200u
             && desc.buffer.size <= (64u * 1024u)) {
+          if (d->captured_scene_cbv_view.handle != cbv_views[0].handle)
+            CSLog("capture", std::string("cbv handle -> buf:") + std::to_string(desc.buffer.size));
           d->captured_scene_cbv = { buf, 0, desc.buffer.size };
           d->captured_scene_cbv_valid = true;
+          d->captured_cbv_live = true;
           d->captured_scene_cbv_frame = d->frame_index;
           d->captured_scene_cbv_view = cbv_views[0];
         }
@@ -4094,6 +4151,7 @@ static void OnBindDescriptorTables(
         if (IsSceneCbvCandidateValid(device, cbv)) {
           d->captured_scene_cbv = cbv;
           d->captured_scene_cbv_valid = true;
+          d->captured_cbv_live = true;
           d->captured_scene_cbv_frame = d->frame_index;
         }
       }
@@ -4161,6 +4219,119 @@ static void ApplyGTVBAOCSDispatchFix(
   if (cs) *cs = prev;
 }
 
+// ── Custom Shader crash-tracing log ──
+// Changes-only step log for GTVBAO + Dynamic Cubemaps + SSR dispatches. Gated by the
+// "Custom Shader Log" toggle (default Off): zero overhead and zero log lines when off.
+// Semantics per tag: first sight and any change log immediately; identical repeats
+// never re-log (steady state is silent); warnings repeat at most once per second.
+// A 1/sec "beat" line carries frame + key state as the crash recency anchor.
+// ReShade log flushes synchronously per call, so the last lines before a crash survive.
+static void CSLog(const char* tag, const std::string& msg, bool warn) {
+  if (shader_injection.custom_shader_logging < 0.5f) return;
+  using clock = std::chrono::steady_clock;
+  // Per-message suppression: alternating messages under one tag must not defeat
+  // the throttle (each differs from the previous). First sight and any change log
+  // immediately; identical repeats never re-log; warnings repeat at most 1/sec.
+  // Callers keep rotating values (e.g. frame numbers) OUT of messages.
+  static std::map<std::string, clock::time_point> s_last;
+  const auto now = clock::now();
+  const std::string key = std::string(tag) + '\x1f' + msg;
+  auto it = s_last.find(key);
+  if (it != s_last.end()) {
+    if (!warn) return;
+    if ((now - it->second) < std::chrono::seconds(1)) return;
+  }
+  s_last[key] = now;
+  reshade::log::message(warn ? reshade::log::level::warning : reshade::log::level::info,
+    (std::string("[CustomShader] ") + tag + ": " + msg).c_str());
+}
+
+// 1/sec heartbeat emitter (recency anchor). Gated by the same toggle.
+static void CSBeat(const std::string& msg) {
+  if (shader_injection.custom_shader_logging < 0.5f) return;
+  using clock = std::chrono::steady_clock;
+  static clock::time_point s_last{};
+  static bool s_init = false;
+  const auto now = clock::now();
+  if (s_init && (now - s_last) < std::chrono::seconds(1)) return;
+  s_init = true;
+  s_last = now;
+  reshade::log::message(reshade::log::level::info,
+    (std::string("[CustomShader] beat: ") + msg).c_str());
+}
+
+// Scene liveness for transition gating: true while lighting draws are stamping
+// fresh captures. False across loading screens (and before first capture).
+// The t17 swap and present-time readers use it to stay off dead inputs.
+static bool DynCubeSceneLive(const DeviceData* d) {
+  if (!d) return false;
+  if (d->captured_color_frame == UINT64_MAX) return false;
+  if (d->frame_index < d->captured_color_frame) return false;
+  return (d->frame_index - d->captured_color_frame) <= kDynCubeLoadingStaleFrames;
+}
+
+// ViewDims for crash tracing: "WxH" for textures, "buf:N" for buffers, "null" for
+// empty handles, "dead" when the view no longer resolves to a resource (the game
+// freed the target — e.g. a DLSS/resolution realloc the addon was never told about).
+static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_view v) {
+  if (!dev || !v.handle) return "null";
+  auto res = dev->get_resource_from_view(v);
+  if (!res.handle) return "dead";
+  auto desc = dev->get_resource_desc(res);
+  if (desc.type == reshade::api::resource_type::buffer)
+    return "buf:" + std::to_string(desc.buffer.size);
+  return std::to_string(desc.texture.width) + "x" + std::to_string(desc.texture.height);
+}
+
+// Present watchdog: proves render-thread stalls vs process death across silent gaps.
+// Touches no D3D state (one atomic timestamp). Silent unless presents stall >2.5s.
+static std::atomic<uint64_t> s_lastPresentMs{0};
+static std::atomic<bool> s_watchdogStop{false};
+static std::thread s_watchdogThread;
+static bool s_watchdogStarted = false;
+
+// Render-thread region tracking: the watchdog reports where a stalled present stopped.
+// 1=entry 2=liveness-resolver 3=recreate 4=deferred-dispatch; 0=idle (between presents).
+// RAII scope resets to idle on EVERY return path so a stale region can never mislead.
+static std::atomic<int> s_presentRegion{0};
+static const char* PresentRegionName(int r) {
+  switch (r) {
+    case 1: return "entry";
+    case 2: return "resolver";
+    case 3: return "recreate";
+    case 4: return "deferred";
+    default: return "idle";
+  }
+}
+struct PresentRegionScope {
+  PresentRegionScope() { s_presentRegion.store(1); }
+  ~PresentRegionScope() { s_presentRegion.store(0); }
+};
+static void WatchdogThreadMain() {
+  using clock = std::chrono::steady_clock;
+  auto now_ms = []() -> uint64_t {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        clock::now().time_since_epoch()).count();
+  };
+  while (!s_watchdogStop.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (shader_injection.custom_shader_logging < 0.5f) continue;
+    const uint64_t last = s_lastPresentMs.load();
+    if (last == 0u) continue;
+    const uint64_t now = now_ms();
+    const uint64_t gap = (now >= last) ? (now - last) : 0u;
+    if (gap > 2500u) {
+      const int region = s_presentRegion.load();
+      CSLog("watchdog", std::string("no present for ") + std::to_string(gap / 1000u) +
+        "s (stuck in " + PresentRegionName(region) + "?)", true);
+    }
+  }
+}
+static inline uint64_t WatchdogNowMs() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // ── Present hook ──
 
 static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* sc,
@@ -4171,6 +4342,26 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->frame_index++;
+  d->immediate_cmd_list = queue->get_immediate_command_list();
+  s_lastPresentMs.store(WatchdogNowMs());
+  if (!s_watchdogStarted) {
+    s_watchdogStarted = true;
+    s_watchdogThread = std::thread(&WatchdogThreadMain);
+  }
+  PresentRegionScope presentRegionScope;
+
+  // 1/sec heartbeat: recency anchor for crashes + transition detector (photo mode,
+  // DLSS toggle, loads). Everything else in this log is changes-only, so steady
+  // state is this line alone.
+  CSBeat(std::string("frame=") + std::to_string(d->frame_index) +
+    " working=" + std::to_string(d->working_width) + "x" + std::to_string(d->working_height) +
+    " liveDepth=" + CSViewDims(dev, d->captured_depth_srv) +
+    " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISS") +
+    " gtvbaoRes=" + (d->resources_created ? "1" : "0") +
+    " cubeRes=" + (d->dyncube_resources_created ? "1" : "0") +
+    " rs=" + std::to_string(d->dyncube_readSet) +
+    " flt=" + std::to_string(d->dyncube_filteredReadSet) +
+    " rej=" + std::to_string(d->dyncube_rejected_captures));
 
   // DynCube loading wipe (generic, all games): with no fresh lighting t0 for a
   // while, no scene draws are running (loading screen) — arm history
@@ -4240,6 +4431,31 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   // DynCube can dispatch independently of GTVBAO — must not early-out
   const bool dynCube_present_active = shader_injection.dynCube_enabled > 0.5f;
   if (shader_injection.gtvbao_mode < 0.5f && !dynCube_present_active) return;
+
+  // Present-time input liveness: re-resolve captured game views here (proven-safe
+  // query context, next to the existing depth/backbuffer reads). Draw callbacks
+  // must never issue these queries. Queries run only when a watched handle changed
+  // since the last check, plus a ~1/sec full sweep (handle reuse would otherwise
+  // be invisible). Transitions flip flags; dispatches check flags.
+  s_presentRegion.store(2);
+  const bool liveSweep = (d->frame_index - d->live_sweep_frame) >= 60u;
+  if (liveSweep) d->live_sweep_frame = d->frame_index;
+  {
+    auto resolveLive = [&](reshade::api::resource_view v, uint64_t& last, bool& flag, const char* name) {
+      if (!v.handle) { last = 0u; return; }
+      if (v.handle == last && !liveSweep) return;
+      last = v.handle;
+      const bool live = CSViewDims(dev, v) != "dead";
+      if (live != flag) {
+        flag = live;
+        CSLog("capture", std::string(name) + (live ? " revived" : " view DEAD"), !live);
+      }
+    };
+    resolveLive(d->captured_depth_srv, d->live_last_depth, d->captured_depth_live, "depth");
+    resolveLive(d->captured_color_srv, d->live_last_color, d->captured_color_live, "color");
+    resolveLive(d->captured_mrt_normal_srv, d->live_last_mrt, d->captured_mrt_live, "mrt");
+    if (d->captured_scene_cbv_valid) resolveLive(d->captured_scene_cbv_view, d->live_last_cbv, d->captured_cbv_live, "cbv");
+  }
   if (d->frame_index <= kGTVBAOStartupGuardFrames) {
     if (d->frame_index == kGTVBAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
@@ -4247,11 +4463,15 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
     return;
   }
-  if (d->frame_index < d->resize_guard_until_frame) return;
+  if (d->frame_index < d->resize_guard_until_frame) {
+    CSLog("present", "in resize guard");
+    return;
+  }
 
   // DynCube cube-resolution change: at the frame boundary, reuse a cached set of the
   // target size when available (zero create/destroy); otherwise cache the current set
   // and create a fresh one. Old sets are never destroyed during resize (VRAM leak).
+  s_presentRegion.store(3);
   if (d->dyncube_pending_recreate && d->dyncube_pending_size != 0u) {
     const uint32_t wantSize = d->dyncube_pending_size;
     SaveActiveToCache(dev, d);  // cache the current set first (never destroy during resize)
@@ -4270,6 +4490,8 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
         (std::string("[DynCube] resized to ") + std::to_string(wantSize) +
          (reused ? " (cache hit)" : "")).c_str());
     }
+    CSLog("dyncube", std::string("cube recreate: want=") + std::to_string(wantSize) +
+      (reused ? " (cache hit)" : " (fresh)") + " active=" + std::to_string(d->dyncube_size));
     d->dyncube_pending_size = 0u;
     d->dyncube_pending_recreate = false;
   }
@@ -4308,6 +4530,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       d->last_created_game_width = gw;
       d->last_created_game_height = gh;
       d->resources_created = true;
+      CSLog("gtvbao", std::string("resources (re)created: working=") +
+        std::to_string(d->working_width) + "x" + std::to_string(d->working_height) +
+        " depth=" + std::to_string(gw) + "x" + std::to_string(gh));
       reshade::log::message(reshade::log::level::info,
         (std::string("[GTVBAO] Resources created: ") +
          std::to_string(d->working_width) + "x" +
@@ -4366,6 +4591,25 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   };
 
   // Inline dispatch active (deferred off) — GTVBAO runs during lighting pass, not here.
+  // Drop snapshots whose targets died since capture (transition realloc): dispatching
+  // on them is never correct. Handle-nonzero alone cannot prove liveness. Lazy like
+  // the resolver above (shared sweep epoch): re-check only on handle change.
+  s_presentRegion.store(4);
+  if (d->deferred_pending) {
+    auto checkDef = [&](reshade::api::resource_view v, uint64_t& last) -> bool {
+      if (!v.handle) { last = 0u; return false; }
+      if (v.handle == last && !liveSweep) return false;
+      last = v.handle;
+      return CSViewDims(dev, v) == "dead";
+    };
+    bool drop = checkDef(d->deferred_depth_srv, d->live_last_defDepth);
+    drop = checkDef(d->deferred_mrt_normal_srv, d->live_last_defMrt) || drop;
+    drop = checkDef(d->deferred_scene_cbv_view, d->live_last_defCbv) || drop;
+    if (drop) {
+      CSLog("gtvbao", "deferred snapshot DEAD: dropped", true);
+      d->deferred_pending = false;
+    }
+  }
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     capture_light_buffer_for_next_frame();
     // DynCube debug face preview — must run even when GTVBAO deferred off
@@ -4442,7 +4686,15 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (cs) prev = *cs;
 
   bool ok = true;
-  if (shader_injection.gtvbao_mode > 0.5f) ok = RunGTVBAO(cl, d);
+  if (shader_injection.gtvbao_mode > 0.5f) {
+    const std::string liveDepth = CSViewDims(cl->get_device(), d->captured_depth_srv);
+    const std::string wantDims = std::to_string(d->working_width) + "x" + std::to_string(d->working_height);
+    const bool dimMismatch = (liveDepth != wantDims);
+    CSLog("gtvbao", std::string("invoke working=") + wantDims + " liveDepth=" + liveDepth +
+      " cbv=" + (d->captured_scene_cbv_valid ? "ok" : "MISSING"), dimMismatch || !d->captured_scene_cbv_valid);
+    ok = RunGTVBAO(cl, d);
+    CSLog("gtvbao", std::string("invoke exit") + (ok ? " ok" : " FAILED"), !ok);
+  }
 
   // Restore: apply dispatch fix, then restore previous state.
   ApplyGTVBAOCSDispatchFix(cl, cs, prev);
@@ -4983,7 +5235,12 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       renodx::utils::state::CommandListState prev = {};
       if (cs) prev = *cs;
 
+      const std::string liveDepth = CSViewDims(cmd_list->get_device(), dd->captured_depth_srv);
+      const std::string wantDims = std::to_string(dd->working_width) + "x" + std::to_string(dd->working_height);
+      CSLog("gtvbao", std::string("inline invoke working=") + wantDims + " liveDepth=" + liveDepth,
+        liveDepth != wantDims);
       bool ok = RunGTVBAO(cmd_list, dd);
+      CSLog("gtvbao", std::string("inline invoke exit") + (ok ? " ok" : " FAILED"), !ok);
 
       ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
       (void)ok;
@@ -5109,6 +5366,11 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       dd->dyncube_sched_frame = dd->frame_index;
       const uint32_t interval = std::max(1u, (uint32_t)std::clamp(shader_injection.dynCube_capture_interval, 1.f, 16.f));
 
+      // Execution context for crash tracing (edge-only): photo mode rendering on
+      // a deferred list would run all of the below dispatches there.
+      CSLog("ctx", std::string("scheduler on ") +
+        ((dd->immediate_cmd_list != nullptr && dd->immediate_cmd_list == cmd_list) ? "immediate" : "DEFERRED"));
+
       // ── Loading wipe: consumes the OnPresent loading signal (this scheduler only
       // ticks on lighting draws, so the stale predicate itself is evaluated there).
       // Deletes the whole temporal cache once per stale episode so the next scene
@@ -5137,9 +5399,10 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         dd->dyncube_needs_reset = true;
         dd->dyncube_worldbox_reset_pending = true;
         dd->dyncube_next_update_frame = 0;
-        if (shader_injection.dynCube_debug_logging > 0.5f) {
-          reshade::log::message(reshade::log::level::info, "[DynCube] loading wipe: temporal cache cleared");
-        }
+            if (shader_injection.dynCube_debug_logging > 0.5f) {
+              reshade::log::message(reshade::log::level::info, "[DynCube] loading wipe: temporal cache cleared");
+            }
+            CSLog("dyncube", "loading wipe applied");
       }
 
       // Delayed-validate commit: consume the staged hasGeom bit BEFORE any new
@@ -6576,6 +6839,7 @@ static void ConsumeDynCubeStagedValidity(reshade::api::device* dev, DeviceData* 
     // rejected by geometry coverage (indistinguishable from real vista geometry).
     ++dd->dyncube_rejected_captures;
     dd->dyncube_rejectedGap = true;  // arm one-shot fast-forward: next dispatched capture hard-replaces stale history
+    CSLog("dyncube", "capture REJECTED (no valid geometry)", true);
     if (!dd->dyncube_wasRejected && shader_injection.dynCube_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::info, "[DynCube] capture rejected (no valid geometry)");
     }
@@ -6589,8 +6853,13 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     uint32_t sz = DynCubeResolveSize(shader_injection.dynCube_resolution);
     if (!CreateDynCubeResources(cl->get_device(), d, sz)) return false;
   }
-  // Phase 1: require depth+color+cbv (rawDepth >=1-1e-5 reject)
-  if (!d->captured_depth_srv.handle || !d->captured_color_srv.handle || !d->captured_scene_cbv_valid) return false;
+  // Phase 1: require live depth+color+cbv (rawDepth >=1-1e-5 reject). Liveness flags
+  // come from the present-time resolver (draw callbacks must not query views).
+  if (!d->captured_depth_srv.handle || !d->captured_color_srv.handle || !d->captured_scene_cbv_valid
+      || !d->captured_depth_live || !d->captured_color_live || !d->captured_cbv_live) {
+    CSLog("dyncube", "capture SKIP (missing or dead inputs)", true);
+    return false;
+  }
   auto* dev = cl->get_device();
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_capture_pipeline.handle) return false;
@@ -6692,6 +6961,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   if (!RunDynCubeWorldBox(cl, d, cur)) {
     // Reduction unavailable: fall back to immediate promotion (pre-protection behavior).
+    CSLog("dyncube", "worldbox UNAVAILABLE: immediate-promote fallback", true);
     PromoteDynCubeReadSet(d);
   }
   cl->barrier(d->dyncube_charmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
@@ -6754,6 +7024,8 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
         std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f)};
     cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 5, pc);
     cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+    CSLog("dyncube", std::string("worldbox pass0 dispatch groups=") + std::to_string(g) +
+      (reset > 0.5f ? " RESET" : ""));
     cl->dispatch(g, g, 6);
   }
   // Pass 1: single-group merge. Scratch UAV->SRV, bounds SRV->UAV, then merge,
@@ -6765,6 +7037,7 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
     cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
     cl->barrier(d->dyncube_faceextents, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+    CSLog("dyncube", "worldbox pass1 merge dispatch");
     cl->dispatch(1, 1, 1);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
@@ -6823,7 +7096,10 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
 
   if (!ggxOn) {
     // Hardware box-filtered mips: mip0 = sharp history copy, rest = GenerateMips.
-    if (!copy_mip0(dst)) return false;
+    if (!copy_mip0(dst)) {
+      CSLog("dyncube", "filter FAILED: mip0 face copy", true);
+      return false;
+    }
     cl->generate_mipmaps(d->dyncube_ggx_out_cube_srv[building]);
     return true;
   }
@@ -6913,8 +7189,14 @@ static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d) {
 // (rgb = reflected frame color, a = hit). Independent of history/ggx/inferred.
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (!cl || !d) return false;
+  // Require live inputs (flags from the present-time resolver; draw callbacks must
+  // not query views). Transition reallocs leave nonzero dangling views.
   if (!d->captured_color_srv.handle || !d->captured_depth_srv.handle
-      || !d->captured_mrt_normal_srv.handle || !d->captured_scene_cbv_valid) return false;
+      || !d->captured_mrt_normal_srv.handle || !d->captured_scene_cbv_valid
+      || !d->captured_color_live || !d->captured_depth_live || !d->captured_mrt_live || !d->captured_cbv_live) {
+    CSLog("dyncube", "ssr SKIP (missing or dead inputs)", true);
+    return false;
+  }
   auto* dev = cl->get_device();
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_ssr_pipeline.handle) return false;
@@ -6947,6 +7229,15 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (!make_tex(&d->dyncube_ssr_raw, &d->dyncube_ssr_raw_srv, &d->dyncube_ssr_raw_uav, "SSR raw")) return false;
   if (!make_tex(&d->dyncube_ssr_blur_h, &d->dyncube_ssr_blur_h_srv, &d->dyncube_ssr_blur_h_uav, "SSR blur H")) return false;
   if (!make_tex(&d->dyncube_ssr_blur, &d->dyncube_ssr_blur_srv, &d->dyncube_ssr_blur_uav, "SSR blur")) return false;
+  {
+    // Mismatch-only (silent when matching): stale-small targets after a
+    // resolution change are a shared-input divergence worth one warning.
+    auto rawRes = dev->get_resource_from_view(d->dyncube_ssr_raw_srv);
+    auto rawDesc = (rawRes.handle != 0u) ? dev->get_resource_desc(rawRes) : reshade::api::resource_desc{};
+    if (rawDesc.texture.width != w || rawDesc.texture.height != h)
+      CSLog("dyncube", std::string("ssr targets MISMATCH: color=") + std::to_string(w) + "x" + std::to_string(h) +
+        " raw=" + std::to_string(rawDesc.texture.width) + "x" + std::to_string(rawDesc.texture.height), true);
+  }
 
   // ── March pass → ssr_raw ──
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_pipeline);
@@ -7423,7 +7714,15 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables)) return false;
 
   uint32_t w = d->working_width, h = d->working_height;
-  if (w < 64 || h < 64) return false;
+  if (w < 64 || h < 64) {
+    CSLog("gtvbao", "run entry ABORT: working too small", true);
+    return false;
+  }
+  {
+    const std::string liveDepth = CSViewDims(dev, d->captured_depth_srv);
+    const std::string wantDims = std::to_string(w) + "x" + std::to_string(h);
+    CSLog("gtvbao", std::string("run entry working=") + wantDims + " liveDepth=" + liveDepth, liveDepth != wantDims);
+  }
 
   // Save + reset per-frame foliage tracking (set true in foliage shader on_draw callbacks)
   bool had_foliage_draws = d->foliage_drawn_this_frame;
@@ -7763,6 +8062,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       auto pc_t = BuildGTVBAOPushConstants(d, false, -1.f, false, /*stage*/1);
       cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 70, pc_t.data());
       // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the
+      // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the
       // grid; bounds-fail handles the overhang identically.
       cl->dispatch((w + 15) / 16, (h + 7) / 8, 1);
       bar(d->ao_term_b_texture, UA, SR);
@@ -7902,6 +8202,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] All passes complete.");
+  CSLog("gtvbao", "run exit ok");
   return true;
 }
 
@@ -7929,6 +8230,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
       break;
     case DLL_PROCESS_DETACH:
+      s_watchdogStop.store(true);
+      if (s_watchdogThread.joinable()) s_watchdogThread.join();
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
