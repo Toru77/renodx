@@ -546,7 +546,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             lpfloat sliceK = (slice+noiseSlice) / sliceCount;
             // lines 5, 6 from the paper
             lpfloat phi;
-            if (GTVBAO_gtvbao_cosine_enabled > 0.5f) {
+            // Cosine sampling: always On (UI toggle removed). Mode selects the method.
+            {
                 float NdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
                 float rnd0 = frac(noiseSample + sliceK * 0.618034f);
                 int mode = (int)GTVBAO_gtvbao_cosine_mode;
@@ -562,8 +563,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     // Mode 3 (default): CDF importance sampling
                     phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, NdotV);
                 }
-            } else {
-                phi = sliceK * GT_VBAO_PI;
             }
             lpfloat cosPhi = cos(phi);
             lpfloat sinPhi = sin(phi);
@@ -667,16 +666,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     // Fix 5: skip sample if thickness > 2x sample distance.
                     if (fixMode == 5 && (float)sampleDist < thickness * 2.0f) continue;
 
-                    // ── Front-face and back-face (offset by thickness) ──
+                    // ── Front-face and back-face (per-sample thickness offset, always On) ──
                     float3 sampleHorizonVec = (float3)(sampleDelta / sampleDist);
-                    float3 sampleDeltaBack;
-                    if (GTVBAO_gtvbao_thickness_enabled > 0.5f) {
-                        // GTVBAO: per-sample thickness direction
-                        sampleDeltaBack = GTVBAO_ThicknessOffset(sampleDelta, (float)sampleDist, (float3)viewVec, thickness);
-                    } else {
-                        // Baseline: offset along view vector
-                        sampleDeltaBack = sampleDelta - (float3)viewVec * thickness;
-                    }
+                    float3 sampleDeltaBack = GTVBAO_ThicknessOffset(sampleDelta, (float)sampleDist, (float3)viewVec, thickness);
                     float3 sampleHorizonVecBack = normalize( sampleDeltaBack );
 
                     // Horizon cosines relative to viewVec (same as GTAO's shc).
@@ -694,8 +686,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     float sd = sideSign;  // samplingDirection: +1 right, -1 left
                     frontBackHorizon = saturate(((sd * -frontBackHorizon) + (float)n + GT_VBAO_PI_HALF) / GT_VBAO_PI);
 
-                    // ── GTVBAO: CDF remap horizon angles ──
-                    if (GTVBAO_gtvbao_cdf_enabled > 0.5f) {
+                    // ── GTVBAO: CDF remap horizon angles (always On) ──
+                    {
                         float NdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
                         frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, NdotV);
                         frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, NdotV);
@@ -764,9 +756,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // ── AO for this slice: fraction of unoccluded sectors ──
             lpfloat sliceAO = (lpfloat)1.0 - (lpfloat)GTVBAO_CountBits(sliceBitmask) / (lpfloat)GT_VBAO_BITMASK_SECTOR_COUNT;
 
-            // ── GTVBAO Mode 0: cosine weight per slice ──
-            if (GTVBAO_gtvbao_cosine_enabled > 0.5f
-                && (int)GTVBAO_gtvbao_cosine_mode == 0) {
+            // ── GTVBAO Mode 0: cosine weight per slice (cosine sampling always On) ──
+            if ((int)GTVBAO_gtvbao_cosine_mode == 0) {
                 // Weight by cosine falloff from projected normal direction
                 float angN = GT_VBAO_PI_HALF - (float)n; // projected normal angle
                 float cosWeight = saturate(cos((float)phi - angN));
@@ -938,8 +929,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #endif
         }
         // Normalize: use sum of cosine weights (Mode 0) or uniform slice count
-        visibility /= (GTVBAO_gtvbao_cosine_enabled > 0.5f
-                        && (int)GTVBAO_gtvbao_cosine_mode == 0)
+        visibility /= ((int)GTVBAO_gtvbao_cosine_mode == 0)
                         ? max(totalWeight, (lpfloat)1e-5)
                         : (lpfloat)sliceCount;
         visibility = pow( visibility, (lpfloat)consts.FinalValuePower );
@@ -1299,335 +1289,7 @@ void GTVBAO_Denoise( const uint2 pixCoordBase, const GTAOConstants consts, Textu
     }
 }
 
-
-// ──────────────────────────────────────────────────────────────────────────
-// Poisson Denoiser (denoiser_type = 2)
-// Based on "Self-Supervised Poisson-Gaussian Denoising" (Khademi et al., WACV 2021)
-// and "Poisson2Sparse" (2022). Uses luma/depth/normal similarity weights.
-// ──────────────────────────────────────────────────────────────────────────
-
-// ── Procedural Poisson disk sample: golden-angle spiral ──
-// Returns (offset2D, radius01). The offset is in [-radius, +radius] range.
-float3 GTVBAO_PoissonSample(uint idx, uint total, float rotAngle)
-{
-    // Golden-angle spiral: 2*PI * (golden ratio conjugate) * idx + rotation
-    float angle = 6.283185307f * 0.381966011f * (float)idx + rotAngle;
-    float radius = (total <= 1u) ? 0.0f : ((float)idx / (float)(total - 1u));
-    return float3(cos(angle) * radius, sin(angle) * radius, radius);
-}
-
-// ── Hash-based rotation angle from pixel + frame ──
-float GTVBAO_PoissonRotation(uint2 pixCoord)
-{
-    // Standard hash: frac(sin(dot) * largePrime)
-    float h = frac(sin(dot((float2)pixCoord, float2(12.9898f, 78.233f))) * 43758.5453f);
-    return h * 6.283185307f; // 0..2PI
-}
-
-// ── Compute viewspace normal from depth (5-tap Sobel-like) ──
-float3 GTVBAO_ComputeNormalFromDepth(
-    uint2 pixCoord, uint2 texSize,
-    Texture2D<float> depthTex, SamplerState samp)
-{
-    float2 uv = ((float2)pixCoord + 0.5f) / (float2)texSize;
-    float2 ts = 1.0f / (float2)texSize;
-
-    float dC = depthTex.SampleLevel(samp, uv, 0);
-    float dL = depthTex.SampleLevel(samp, uv - float2(ts.x, 0), 0);
-    float dR = depthTex.SampleLevel(samp, uv + float2(ts.x, 0), 0);
-    float dT = depthTex.SampleLevel(samp, uv + float2(0, ts.y), 0);
-    float dB = depthTex.SampleLevel(samp, uv - float2(0, ts.y), 0);
-
-    // Choose closer neighbor for each axis (depth edge-aware)
-    float dx = (abs(dL - dC) < abs(dR - dC)) ? (dC - dL) : (dR - dC);
-    float dy = (abs(dB - dC) < abs(dT - dC)) ? (dC - dB) : (dT - dC);
-
-    // Reconstruct viewspace positions for center and neighbors
-    float2 uvL = uv - float2(ts.x, 0);
-    float2 uvD = uv - float2(0, ts.y);
-    float3 vC = float3((uv * 2.0f - 1.0f) * dC, dC);
-    float3 vL = float3((uvL * 2.0f - 1.0f) * dL, dL);
-    float3 vD = float3((uvD * 2.0f - 1.0f) * dB, dB);
-    float3 vR = float3(((uv + float2(ts.x, 0)) * 2.0f - 1.0f) * dR, dR);
-    float3 vU = float3(((uv + float2(0, ts.y)) * 2.0f - 1.0f) * dT, dT);
-
-    float3 dpdx = (abs(dL - dC) < abs(dR - dC)) ? (vC - vL) : (vR - vC);
-    float3 dpdy = (abs(dB - dC) < abs(dT - dC)) ? (vC - vD) : (vU - vC);
-
-    float3 n = cross(dpdx, dpdy);
-    return (dot(n, n) > 1e-10f) ? normalize(n) : float3(0, 0, 1);
-}
-
-// ── Poisson denoise for AO (single-channel) ──
-// AO-value similarity only — depth edges naturally appear in AO data.
-// Respects DenoiseBlurBeta. Intermediate passes use relaxed phi.
-void GTVBAO_DenoiseAO_Poisson(
-    uint2 pixCoordBase, GTAOConstants consts,
-    Texture2D<uint> srcAO, Texture2D<float> depthTex,
-    Texture2D<uint4> mrtNormalTex,
-    SamplerState samp, RWTexture2D<uint> outAO,
-    const uniform bool finalApply)
-{
-    uint w, h;
-    srcAO.GetDimensions(w, h);
-    uint totalSamples = max(1u, (uint)GTVBAO_poisson_samples);
-
-    float beta = max(0.5f, consts.DenoiseBlurBeta);
-    float betaScale = 20.0f / beta;
-    float lumaPhi = max(0.5f, GTVBAO_poisson_luma_phi * betaScale);
-    if (!finalApply) { lumaPhi *= 4.0f; totalSamples = max(2u, totalSamples / 2u); }
-    float sampleRadiusPx = (finalApply ? 2.5f : 1.5f) * (float)max(w, h) * 0.015f;
-    float invLumaPhi = 1.0f / lumaPhi;
-
-    // Center weight proportional to DenoiseBlurBeta (matching existing denoiser)
-    float centerWeight = max(1.0f, beta * 0.5f);
-
-    // Shared rotation for both pixels
-    float h0 = frac(sin(float(pixCoordBase.x) * 12.9898f + float(pixCoordBase.y) * 78.233f) * 43758.5453f);
-
-    [unroll(2)]
-    for (int side = 0; side < 2; side++)
-    {
-        int2 pc = int2(pixCoordBase.x + side, pixCoordBase.y);
-        if (pc.x >= (int)w || pc.y >= (int)h) continue;
-
-        float centerAO = (float)srcAO.Load(int3(pc, 0)) * 0.0039215686f; // /255
-
-        // ── Optional depth-aware bilateral pre-filter ──
-        if (GTVBAO_prefilter_enabled > 0.5f) {
-            float centerDepth = depthTex.Load(int3(pc, 0));
-            float filteredSum = centerAO, filteredW = 1.0f;
-            [unroll]
-            for (int dy2 = -1; dy2 <= 1; dy2++) {
-                [unroll]
-                for (int dx2 = -1; dx2 <= 1; dx2++) {
-                    if (dx2 == 0 && dy2 == 0) continue;
-                    int2 npc = int2(pc.x + dx2, pc.y + dy2);
-                    if (npc.x < 0 || npc.y < 0 || npc.x >= (int)w || npc.y >= (int)h) continue;
-                    float nAO = (float)srcAO.Load(int3(npc, 0)) * 0.0039215686f;
-                    float nDepth = depthTex.Load(int3(npc, 0));
-                    float depthW = exp(-abs(centerDepth - nDepth) * 10.0f);
-                    filteredSum += nAO * depthW;
-                    filteredW += depthW;
-                }
-            }
-            centerAO = filteredSum / filteredW;
-        }
-
-        float sum = centerAO * centerWeight, totalW = centerWeight;
-
-        [loop]
-        for (uint i = 0u; i < totalSamples; i++)
-        {
-            float a = (float)i * 2.3999632297f + h0 * 6.283185307f;
-            float r = (totalSamples <= 1u) ? 0.0f : ((float)i / (float)(totalSamples - 1u));
-            int2 nc = int2(float2(pc) + float2(cos(a) * r, sin(a) * r) * sampleRadiusPx + 0.5f);
-            nc = clamp(nc, int2(0, 0), int2(w - 1, h - 1));
-
-            float nAO = (float)srcAO.Load(int3(nc, 0)) * 0.0039215686f;
-            float wgt = max(1.0f - abs(centerAO - nAO) * invLumaPhi, 0.0f);
-            sum += nAO * wgt;
-            totalW += wgt;
-        }
-
-        float denoised = sum / max(totalW, 1e-5f);
-        GTVBAO_Output(pc, outAO, (AOTermType)denoised, finalApply);
-    }
-}
-
-// ── Poisson denoise for GI (float3 color) ──
-// Luma + depth + normal similarity. Respects DenoiseBlurBeta.
-void GTVBAO_DenoiseGI_Poisson(
-    uint2 pixCoordBase, GTAOConstants consts,
-    Texture2D<float4> srcGI, Texture2D<float> depthTex,
-    Texture2D<uint4> mrtNormalTex,
-    SamplerState samp, RWTexture2D<float4> outGI)
-{
-    uint w, h;
-    srcGI.GetDimensions(w, h);
-    uint totalSamples = max(1u, (uint)GTVBAO_poisson_samples);
-
-    float beta = max(0.5f, consts.DenoiseBlurBeta);
-    float betaScale = 20.0f / beta;
-    float lumaPhi  = max(0.01f, GTVBAO_poisson_luma_phi * betaScale);
-    float depthPhi = max(0.01f, GTVBAO_poisson_depth_phi * betaScale);
-    float normalPhi = max(0.01f, GTVBAO_poisson_normal_phi * betaScale);
-    float sampleRadiusPx = 2.5f * (float)max(w, h) * 0.015f;
-    float invLumaPhi = 1.0f / max(lumaPhi, 0.001f);
-    float invDepthPhi = 1.0f / max(depthPhi, 0.001f);
-
-    float h0 = frac(sin(float(pixCoordBase.x) * 12.9898f + float(pixCoordBase.y) * 78.233f) * 43758.5453f);
-
-    [unroll(2)]
-    for (int side = 0; side < 2; side++)
-    {
-        int2 pc = int2(pixCoordBase.x + side, pixCoordBase.y);
-        if (pc.x >= (int)w || pc.y >= (int)h) continue;
-
-        float centerDepth = depthTex.Load(int3(pc, 0));
-        float3 centerGI = srcGI.Load(int3(pc, 0)).rgb;
-        float centerLuma = dot(centerGI, float3(0.299f, 0.587f, 0.114f));
-
-        float3 centerNormal;
-        if (GTVBAO_mrt_normal_available > 0.5f) {
-            uint4 packed = mrtNormalTex.Load(int3(pc, 0));
-            float2 enc = float2((float)packed.x, (float)packed.y) * (1.0f / 32767.5f) + float2(-1.0f, -1.0f);
-            float azimuth = 3.14159274f * enc.x;
-            float sin_a, cos_a;
-            sincos(azimuth, sin_a, cos_a);
-            float ring = sqrt(saturate(1.0f - enc.y * enc.y));
-            centerNormal = float3(cos_a * ring, sin_a * ring, enc.y);
-        } else {
-            centerNormal = GTVBAO_ComputeNormalFromDepth(pc, uint2(w, h), depthTex, samp);
-        }
-
-        float3 sum = centerGI;
-        float totalW = 1.0f;
-
-        [loop]
-        for (uint i = 0u; i < totalSamples; i++)
-        {
-            float a = (float)i * 2.3999632297f + h0 * 6.283185307f;
-            float r = (totalSamples <= 1u) ? 0.0f : ((float)i / (float)(totalSamples - 1u));
-            int2 nc = int2(float2(pc) + float2(cos(a) * r, sin(a) * r) * sampleRadiusPx + 0.5f);
-            nc = clamp(nc, int2(0, 0), int2(w - 1, h - 1));
-
-            float3 nGI = srcGI.Load(int3(nc, 0)).rgb;
-            float nLuma = dot(nGI, float3(0.299f, 0.587f, 0.114f));
-            float nDepth = depthTex.Load(int3(nc, 0));
-
-            float lw = max(1.0f - abs(centerLuma - nLuma) * invLumaPhi, 0.0f);
-            float dw = max(1.0f - abs(centerDepth - nDepth) * invDepthPhi, 0.0f);
-
-            float3 nNormal;
-            if (GTVBAO_mrt_normal_available > 0.5f) {
-                uint4 packed = mrtNormalTex.Load(int3(nc, 0));
-                float2 enc = float2((float)packed.x, (float)packed.y) * (1.0f / 32767.5f) + float2(-1.0f, -1.0f);
-                float az = 3.14159274f * enc.x;
-                float sa, ca;
-                sincos(az, sa, ca);
-                float ring = sqrt(saturate(1.0f - enc.y * enc.y));
-                nNormal = float3(ca * ring, sa * ring, enc.y);
-            } else {
-                nNormal = GTVBAO_ComputeNormalFromDepth(nc, uint2(w, h), depthTex, samp);
-            }
-            float nw = pow(saturate(dot(centerNormal, nNormal)), normalPhi);
-
-            sum += nGI * lw * dw * nw;
-            totalW += lw * dw * nw;
-        }
-
-        outGI[pc] = float4(sum / max(totalW, 1e-5f), 1.0f);
-    }
-}
-
-// ── Merged AO+GI Poisson denoise — single sample loop, shared reads ──
-void GTVBAO_Denoise_Poisson(
-    uint2 pixCoordBase, GTAOConstants consts,
-    Texture2D<uint> srcAO, Texture2D<float4> srcGI,
-    Texture2D<float> depthTex, Texture2D<uint4> mrtNormalTex,
-    SamplerState samp,
-    RWTexture2D<uint> outAO, RWTexture2D<float4> outGI,
-    const uniform bool finalApply)
-{
-    uint w, h;
-    srcAO.GetDimensions(w, h);
-    uint totalSamples = max(1u, (uint)GTVBAO_poisson_samples);
-
-    float beta = max(0.5f, consts.DenoiseBlurBeta);
-    float betaScale = 20.0f / beta;
-
-    float aoLumaPhi = max(0.5f, GTVBAO_poisson_luma_phi * betaScale);
-    uint aoTotalSamples = totalSamples;
-    if (!finalApply) { aoLumaPhi *= 4.0f; aoTotalSamples = max(2u, aoTotalSamples / 2u); }
-    float aoRadiusPx = (finalApply ? 2.5f : 1.5f) * (float)max(w, h) * 0.015f;
-    float aoInvLumaPhi = 1.0f / aoLumaPhi;
-
-    bool doGI = (g_gi_enabled > 0.5f);
-    float giLumaPhi, giDepthPhi, giNormalPhi, giInvLPhi, giInvDPhi, giRadiusPx;
-    if (doGI) {
-        giLumaPhi  = max(0.01f, GTVBAO_poisson_luma_phi * betaScale);
-        giDepthPhi = max(0.01f, GTVBAO_poisson_depth_phi * betaScale);
-        giNormalPhi = max(0.01f, GTVBAO_poisson_normal_phi * betaScale);
-        giInvLPhi = 1.0f / max(giLumaPhi, 0.001f);
-        giInvDPhi = 1.0f / max(giDepthPhi, 0.001f);
-        giRadiusPx = 2.5f * (float)max(w, h) * 0.015f;
-    }
-
-    float h0 = frac(sin(float(pixCoordBase.x) * 12.9898f + float(pixCoordBase.y) * 78.233f) * 43758.5453f);
-
-    [unroll(2)]
-    for (int side = 0; side < 2; side++)
-    {
-        int2 pc = int2(pixCoordBase.x + side, pixCoordBase.y);
-        if (pc.x >= (int)w || pc.y >= (int)h) continue;
-
-        float centerAO = (float)srcAO.Load(int3(pc, 0)) * 0.0039215686f;
-        float sumAO = centerAO, totalWAO = 1.0f;
-
-        float3 sumGI = float3(0, 0, 0);
-        float totalWGI = 0.0f;
-        float centerDepth = 0.0f, centerLuma = 0.0f;
-        float3 centerNormal = float3(0, 0, 0);
-        if (doGI) {
-            centerDepth = depthTex.Load(int3(pc, 0));
-            float3 cGI = srcGI.Load(int3(pc, 0)).rgb;
-            centerLuma = dot(cGI, float3(0.299f, 0.587f, 0.114f));
-            sumGI = cGI; totalWGI = 1.0f;
-            if (GTVBAO_mrt_normal_available > 0.5f) {
-                uint4 p = mrtNormalTex.Load(int3(pc, 0));
-                float2 e = float2((float)p.x, (float)p.y) * (1.0f / 32767.5f) + float2(-1.0f, -1.0f);
-                float az = 3.14159274f * e.x; float sa, ca; sincos(az, sa, ca);
-                centerNormal = float3(ca * sqrt(saturate(1.0f - e.y * e.y)), sa * sqrt(saturate(1.0f - e.y * e.y)), e.y);
-            } else {
-                centerNormal = GTVBAO_ComputeNormalFromDepth(pc, uint2(w, h), depthTex, samp);
-            }
-        }
-
-        uint maxS = doGI ? max(aoTotalSamples, totalSamples) : aoTotalSamples;
-        [loop]
-        for (uint i = 0u; i < maxS; i++)
-        {
-            float a = (float)i * 2.3999632297f + h0 * 6.283185307f;
-
-            if (i < aoTotalSamples) {
-                float r = (aoTotalSamples <= 1u) ? 0.0f : ((float)i / (float)(aoTotalSamples - 1u));
-                int2 nc = int2(float2(pc) + float2(cos(a) * r, sin(a) * r) * aoRadiusPx + 0.5f);
-                nc = clamp(nc, int2(0, 0), int2(w - 1, h - 1));
-                float nAO = (float)srcAO.Load(int3(nc, 0)) * 0.0039215686f;
-                float aw = max(1.0f - abs(centerAO - nAO) * aoInvLumaPhi, 0.0f);
-                sumAO += nAO * aw; totalWAO += aw;
-            }
-
-            if (doGI && i < totalSamples) {
-                float r = (totalSamples <= 1u) ? 0.0f : ((float)i / (float)(totalSamples - 1u));
-                int2 nc = int2(float2(pc) + float2(cos(a) * r, sin(a) * r) * giRadiusPx + 0.5f);
-                nc = clamp(nc, int2(0, 0), int2(w - 1, h - 1));
-                float3 nGI = srcGI.Load(int3(nc, 0)).rgb;
-                float nDepth = depthTex.Load(int3(nc, 0));
-                float lw = max(1.0f - abs(centerLuma - dot(nGI, float3(0.299f, 0.587f, 0.114f))) * giInvLPhi, 0.0f);
-                float dw = max(1.0f - abs(centerDepth - nDepth) * giInvDPhi, 0.0f);
-
-                float3 nN;
-                if (GTVBAO_mrt_normal_available > 0.5f) {
-                    uint4 p = mrtNormalTex.Load(int3(nc, 0));
-                    float2 e = float2((float)p.x, (float)p.y) * (1.0f / 32767.5f) + float2(-1.0f, -1.0f);
-                    float az = 3.14159274f * e.x; float sa, ca; sincos(az, sa, ca);
-                    nN = float3(ca * sqrt(saturate(1.0f - e.y * e.y)), sa * sqrt(saturate(1.0f - e.y * e.y)), e.y);
-                } else {
-                    nN = GTVBAO_ComputeNormalFromDepth(nc, uint2(w, h), depthTex, samp);
-                }
-                float nw = pow(saturate(dot(centerNormal, nN)), giNormalPhi);
-                sumGI += nGI * lw * dw * nw; totalWGI += lw * dw * nw;
-            }
-        }
-
-        float dAO = sumAO / max(totalWAO, 1e-5f);
-        GTVBAO_Output(pc, outAO, (AOTermType)dAO, finalApply);
-        if (doGI) outGI[pc] = float4(sumGI / max(totalWGI, 1e-5f), 1.0f);
-    }
-}
-
+// ── Poisson denoisers removed (spatial-only): GTVBAO_DenoiseAO_Poisson, GTVBAO_DenoiseGI_Poisson, GTVBAO_Denoise_Poisson, GTVBAO_PoissonSample/Rotation, GTVBAO_ComputeNormalFromDepth deleted. ──
 
 // Generic viewspace normal generate pass
 float3 GTVBAO_ComputeViewspaceNormal( const uint2 pixCoord, const GTAOConstants consts, Texture2D<float> sourceNDCDepth, SamplerState depthSampler )

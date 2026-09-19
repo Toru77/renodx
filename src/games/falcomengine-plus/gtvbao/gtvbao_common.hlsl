@@ -102,29 +102,29 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_isfast_seed;             // c[42] — IS-FAST seed offset [0..64]
   float GTVBAO_denoise_leak_threshold;  // c[43] — edge leak threshold [1..4], default 2.5
   float GTVBAO_denoise_leak_strength;   // c[44] — edge leak strength [0..1], default 0.5
-  float GTVBAO_denoiser_type;           // c[45] — 0=Spatial, 1=Spatio-Temporal
-  float GTVBAO_temporal_blend;          // c[46] — history blend weight [0.5..0.95], default 0.85
-  float GTVBAO_disocclusion_threshold;  // c[47] — depth diff to reject history [0.001..0.1], default 0.01
+  float GTVBAO_denoiser_type;           // c[45] — always 0=Spatial (Spatio-Temporal/Poisson removed)
+  float GTVBAO_temporal_blend;          // c[46] — always 0 (spatial only)
+  float GTVBAO_disocclusion_threshold;  // c[47] — unused (spatial only)
   float GTVBAO_noise_type;             // c[49] — 0=IS-FAST, 1=IGN, 2=Hilbert
-  // ── GTVBAO upgrade toggles ──
-  float GTVBAO_gtvbao_cdf_enabled;     // c[50] — 0=off, 1=CDF remap
-  float GTVBAO_gtvbao_cosine_enabled;  // c[51] — 0=off, 1=cosine slice sampling
-  float GTVBAO_gtvbao_cosine_mode;     // c[52] — 0=Weight, 1=Project, 2=CDF
-  float GTVBAO_gtvbao_thickness_enabled; // c[53] — 0=off, 1=per-sample thickness
-  // ── Poisson denoiser ──
-  float GTVBAO_poisson_samples;       // c[54] — [4..32], default 8
-  float GTVBAO_poisson_luma_phi;      // c[55] — [0.5..20], default 5
-  float GTVBAO_poisson_depth_phi;     // c[56] — [0.5..20], default 5
-  float GTVBAO_poisson_normal_phi;    // c[57] — [0.5..20], default 5
+  // ── GTVBAO upgrades: always On (UI toggles removed) ──
+  float GTVBAO_gtvbao_cdf_enabled;     // c[50] — always 1
+  float GTVBAO_gtvbao_cosine_enabled;  // c[51] — always 1
+  float GTVBAO_gtvbao_cosine_mode;     // c[52] — 0=Weight, 1=Project, 2=CDF (retained)
+  float GTVBAO_gtvbao_thickness_enabled; // c[53] — always 1
+  // ── Poisson denoiser removed: slots kept for layout stability (unread) ──
+  float GTVBAO_poisson_samples;       // c[54] — unused
+  float GTVBAO_poisson_luma_phi;      // c[55] — unused
+  float GTVBAO_poisson_depth_phi;     // c[56] — unused
+  float GTVBAO_poisson_normal_phi;    // c[57] — unused
   float GTVBAO_prefilter_enabled;      // c[58] — 0=Off, 1=On
   float GTVBAO_exclude_foliage;        // c[59] — 0=Off, 1=On — skip AO on foliage
   float GTVBAO_foliage_ao_value;       // c[60] — [0..1] — AO value for excluded foliage
   float GTVBAO_foliage_channel_mode;   // c[61] — 0=o1.w (Sora), 1=o1.z (Kai)
   float GTVBAO_foliage_mask_valid;     // c[62] — 1 = mask pre-pass ran this frame (mask is fresh)
-  // ── Denoiser upgrades (R1-R4) ──
-  float GTVBAO_denoise_stage;          // c[63] — denoise_last dispatch mode: 0=legacy combined, 1=temporal-only, 2=spatial-final-no-temporal, 3=passthrough scale-back
-  float GTVBAO_temporal_normal_reject; // c[64] — [0..1] history normal similarity threshold (dot), 0=off
-  float GTVBAO_ghost_clamp;            // c[65] — [0..4] variance clamp extent (σ of current 3×3 neighborhood), 0=off
+  // ── Spatial-only: temporal/atrous tails ──
+  float GTVBAO_denoise_stage;          // c[63] — denoise_last dispatch mode: 0=spatial combined, 2=spatial-final-no-temporal, 4=GI-only tail (1=temporal-only removed)
+  float GTVBAO_temporal_normal_reject; // c[64] — unused (spatial only)
+  float GTVBAO_ghost_clamp;            // c[65] — unused (spatial only)
   float GTVBAO_atrous_enabled;         // c[66] — 0=Off, 1=On — à-trous wavelet spatial filter
   float GTVBAO_atrous_depth_sigma;     // c[67] — [0.05..4] relative depth edge-stop strength
   float GTVBAO_atrous_normal_sigma;    // c[68] — [2..128] normal edge-stop power

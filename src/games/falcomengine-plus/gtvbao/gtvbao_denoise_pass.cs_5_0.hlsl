@@ -79,20 +79,10 @@ void main(uint2 dt : SV_DispatchThreadID)
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
-  if (GTVBAO_denoiser_type >= 1.5f)
-  {
-    // ── Poisson denoiser (AO only) ──
-    GTVBAO_DenoiseAO_Poisson(dt * uint2(2, 1), consts,
-        g_srcWorkingAOTerm, g_srcDepth, g_mrtNormalTexture, g_samplerPointClamp,
-        g_outFinalAOTerm, false);
-  }
-  else
-  {
-    // ── 5×5 edge-aware spatial denoiser ──
-    GTVBAO_Denoise(dt * uint2(2, 1), consts,
-        g_srcWorkingAOTerm, g_srcWorkingEdges, g_samplerPointClamp,
-        g_outFinalAOTerm, false);
-  }
+  // ── 5×5 edge-aware spatial denoiser (spatial-only; Poisson removed) ──
+  GTVBAO_Denoise(dt * uint2(2, 1), consts,
+      g_srcWorkingAOTerm, g_srcWorkingEdges, g_samplerPointClamp,
+      g_outFinalAOTerm, false);
 
   // GI always uses original 3×3 bilateral
   if (g_gi_enabled > 0.5f)
