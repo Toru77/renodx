@@ -1482,7 +1482,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "DOFFarScale", .binding = &shader_injection.dof_far_scale,
-      .default_value = 1.5f, .label = "Far Scale", .section = "Depth of Field",
+      .default_value = 1.35f, .label = "Far Scale", .section = "Depth of Field",
       .tooltip = "Scales far-field CoC response.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
