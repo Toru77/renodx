@@ -327,6 +327,7 @@ ShaderInjectData shader_injection = {
   .dynCube_vanilla_ssr_enabled = 1.f,
   .gtvbao_optimization = 1.f,
   .custom_shader_logging = 0.f,
+  .dynCube_sparkle_rejection = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -367,12 +368,13 @@ constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debu
 constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
-constexpr uint32_t kDynCubeSSRLayoutVersion = 3u;  // bump when the SSR pipeline layout shape changes (forces recreate)
-constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 3u;  // bump when the SSR blur layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeSSRLayoutVersion = 5u;  // bump when the SSR pipeline layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 5u;  // bump when the SSR blur layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;  // bump when the worldbox pipeline layout shape changes (forces recreate)
-// Max pass-0 reduction groups over all supported cube sizes (1024 -> 128x128x6).
-constexpr uint32_t kDynCubeWorldBoxMaxGroups = ((1024u + 7u) / 8u) * ((1024u + 7u) / 8u) * 6u;
+constexpr uint32_t kDynCubeCaptureLayoutVersion = 1u;  // bump when the capture pipeline layout shape changes (forces recreate)
+// Pass-0 reduction groups are computed per active cube size at creation;
+// the live scratch buffer's capacity is tracked in dyncube_worldbox_scratch_groups.
 // Manual Reset World Box request (set by the UI button, consumed by the reduction).
 static bool g_dyncube_worldbox_reset_request = false;
 constexpr uint32_t kDynCubeDefaultSize = 128u;
@@ -702,6 +704,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::sampler dyncube_sampler = {};         // point clamp
   reshade::api::pipeline_layout dyncube_capture_layout = {};
   reshade::api::pipeline dyncube_capture_pipeline = {};
+  uint32_t dyncube_capture_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
   reshade::api::pipeline_layout dyncube_solid_layout = {};
   reshade::api::pipeline dyncube_solid_pipeline = {};
   GTVBAODescriptorTableSet dyncube_capture_tables = {};
@@ -744,7 +747,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource dyncube_faceextents = {};              // structured buffer, 2x float4: [0]=(+X,+Y,+Z,mask) [1]=(-X,-Y,-Z,spare)
   reshade::api::resource_view dyncube_faceextents_uav = {};     // buffer UAV (reduction per-face extent write)
   reshade::api::resource dyncube_faceExtStaging = {};           // 32B gpu_to_cpu staging copy of extents
-  reshade::api::resource dyncube_worldbox_scratch = {};      // structured buffer, maxGroups*2 float4 partials
+  reshade::api::resource dyncube_worldbox_scratch = {};      // structured buffer, groups*2 float4 partials (sized per cube size)
+  uint64_t dyncube_worldbox_scratch_groups = 0u;  // pass-0 group capacity of the live scratch buffer
   reshade::api::resource_view dyncube_worldbox_scratch_srv = {}; // buffer SRV (pass-1 read)
   reshade::api::resource_view dyncube_worldbox_scratch_uav = {}; // buffer UAV (pass-0 write)
   reshade::api::pipeline_layout dyncube_worldbox_layout = {};
@@ -772,7 +776,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
   // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
   // partially-written cube is never exposed to lighting.
-  uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..1024)
+  uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..4096)
   reshade::api::resource dyncube_ggx_in = {};            // RGBA16F cube, N mips (GGX input chain)
   reshade::api::resource_view dyncube_ggx_in_cube_srv = {};
   reshade::api::resource dyncube_ggx_out[2] = {};        // RGBA16F cubes, N mips (filtered output)
@@ -2929,9 +2933,9 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeResolution", .binding = &shader_injection.dynCube_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 3.f, .label = "Resolution", .section = "Dynamic Cubemaps",
-      .tooltip = "Cubemap face size. 128 = quality eval floor, 1024 = max. Preview rectangle is clamped for visibility.",
-      .labels = {"128", "256", "512", "768", "1024"},
+      .default_value = 4.f, .label = "Resolution", .section = "Dynamic Cubemaps",
+      .tooltip = "Cubemap face size. 1536+ costs significant VRAM (a full 2048 set needs ~2GB with history+GGX). Preview rectangle is clamped for visibility.",
+      .labels = {"128", "256", "512", "768", "1024", "1536", "2048"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
     },
     new renodx::utils::settings::Setting{
@@ -3045,7 +3049,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeGlobalStrength", .binding = &shader_injection.dynCube_global_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Global Reflection Strength", .section = "Dynamic Cubemaps",
+      .default_value = 0.4f, .label = "Global Reflection Strength", .section = "Dynamic Cubemaps",
       .tooltip = "Scales globally-pushed dynamic reflections (glass etc.) so they don't dominate. 1 = full. Does not affect the lighting resolve or the vanilla fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
@@ -3304,6 +3308,15 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "TEST A/B: evaluate each blur tap pair with a single shared Gaussian weight. Off = legacy per-tap loop (default, unchanged behavior).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DynCubeSparkleRejection", .binding = &shader_injection.dynCube_sparkle_rejection,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Sparkle Rejection", .section = "Dynamic Cubemaps",
+      .tooltip = "A/B test: reject isolated HDR spikes at depth discontinuities plus non-finite input in capture. No HDR caps: broad legitimate brights pass through. Off = current behavior.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4451,8 +4464,13 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   s_presentRegion.store(3);
   if (d->dyncube_pending_recreate && d->dyncube_pending_size != 0u) {
     const uint32_t wantSize = d->dyncube_pending_size;
-    SaveActiveToCache(dev, d);  // cache the current set first (never destroy during resize)
-    const bool reused = RestoreFromCache(dev, d, wantSize);
+    // VRAM spike guard: at 1536+ a full set is huge (2048 ~= 2GB), so the old
+    // set must not sit cached while the new one allocates. Evict the cache and
+    // take the fresh path (destroys active before allocating: peak ~= one set).
+    // Small sizes keep cache fast-switching (overlap is cheap there).
+    if (wantSize >= 1536u) DestroyDynCubeCache(dev, d);
+    else SaveActiveToCache(dev, d);  // cache the current set first (never destroy during resize)
+    const bool reused = (wantSize >= 1536u) ? false : RestoreFromCache(dev, d, wantSize);
     if (!reused) {
       CreateDynCubeResources(dev, d, wantSize);
       CreateDynCubePipelinesIfNeeded(dev, d);
@@ -5736,7 +5754,9 @@ static uint32_t DynCubeResolveSize(float v) {
     case 1: return 256u;
     case 2: return 512u;
     case 3: return 768u;
-    default: return 1024u;
+    case 4: return 1024u;
+    case 5: return 1536u;
+    default: return 2048u;
   }
 }
 
@@ -5767,6 +5787,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   dv(d->dyncube_faceextents_uav); dr(d->dyncube_faceextents);
   dr(d->dyncube_faceExtStaging);
   dv(d->dyncube_worldbox_scratch_srv); dv(d->dyncube_worldbox_scratch_uav); dr(d->dyncube_worldbox_scratch);
+  d->dyncube_worldbox_scratch_groups = 0u;
   dp(d->dyncube_worldbox_pipeline); dl(d->dyncube_worldbox_layout);
   for (auto& t : d->dyncube_worldbox_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_worldbox_layout_version = 0u;
@@ -5822,6 +5843,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_hasValidRead = false;
   dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
   dl(d->dyncube_capture_layout); dl(d->dyncube_solid_layout);
+  d->dyncube_capture_layout_version = 0u;
   for (auto& t : d->dyncube_capture_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   for (auto& t : d->dyncube_solid_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_resources_created = false;
@@ -5860,7 +5882,7 @@ static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData*
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size) {
   DestroyDynCubeResources(dev, d);
   if (size < 128u) size = 128u;
-  if (size > 1024u) size = 1024u;
+  if (size > 2048u) size = 2048u;
   d->dyncube_size = size;
 
   // Throttled logger helper (1/sec) — only when debug logging enabled
@@ -6047,10 +6069,11 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       DestroyDynCubeResources(dev, d);
       return false;
     }
-    // scratch: per-group min/max pairs, sized for the largest supported cube (1024).
+    // scratch: per-group min/max pairs, sized for the active cube size (not a fixed max).
+    const uint64_t scratchGroups = (uint64_t)((size + 7u) / 8u) * ((size + 7u) / 8u) * 6u;
     reshade::api::resource_desc rs = {};
     rs.type = reshade::api::resource_type::buffer;
-    rs.buffer.size = (uint64_t)kDynCubeWorldBoxMaxGroups * 2u * 16u;
+    rs.buffer.size = scratchGroups * 2u * 16u;
     rs.buffer.stride = 16;
     rs.heap = reshade::api::memory_heap::gpu_only;
     rs.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
@@ -6059,7 +6082,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       DestroyDynCubeResources(dev, d);
       return false;
     }
-    const uint64_t scratchElements = (uint64_t)kDynCubeWorldBoxMaxGroups * 2u;
+    const uint64_t scratchElements = scratchGroups * 2u;
     if (!dev->create_resource_view(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource,
         reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, scratchElements),
         &d->dyncube_worldbox_scratch_srv)
@@ -6076,6 +6099,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       DestroyDynCubeResources(dev, d);
       return false;
     }
+    d->dyncube_worldbox_scratch_groups = scratchGroups;
     // faceExtents: 2x float4 [0]=(+X,+Y,+Z,faceMask) [1]=(-X,-Y,-Z,spare); written by pass 1, staged for logging.
     float initExtents[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     reshade::api::subresource_data initExtData = {initExtents, sizeof(initExtents), sizeof(initExtents)};
@@ -6135,7 +6159,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
 
   // ── Phase 3 GGX filtered cubes ──
   {
-    // Mip count: 8 for all supported resolutions (128..1024); computed defensively.
+    // Mip count: 8 for all supported resolutions (128..4096); computed defensively.
     uint32_t mips = 1;
     while ((size >> mips) >= 1u && mips < 8u) ++mips;
     d->dyncube_mip_count = mips;
@@ -6263,7 +6287,13 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   };
   // Phase 1+2: 7 SRVs (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0), 5 UAVs (curColor, curPos, curContrib, camCur, charmask), 10 push floats
   auto make_capture_layout = [&](reshade::api::pipeline_layout* out) -> bool {
-    if (out->handle != 0u) return true;
+    if (out->handle != 0u && d->dyncube_capture_layout_version == kDynCubeCaptureLayoutVersion) return true;
+    if (out->handle != 0u) {
+      // Stale layout shape: drop layout, tables, and pipeline so they rebuild below.
+      for (auto& t : d->dyncube_capture_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+      dev->destroy_pipeline_layout(*out); *out = {};
+      if (d->dyncube_capture_pipeline.handle) { dev->destroy_pipeline(d->dyncube_capture_pipeline); d->dyncube_capture_pipeline = {}; }
+    }
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
     DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene only
     DR srv_r     = {0,0,0,8,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t7 (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0, vanilla)
@@ -6272,7 +6302,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 11; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert
+    push_range.count = 12; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert, sparkleReject
     push_range.visibility = DS::all_compute;
     P p0, p1, p2, p3, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
@@ -6281,7 +6311,9 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &uav_r;
     pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
     P params[5] = {p0,p1,p2,p3,pPush};
-    return dev->create_pipeline_layout(5, params, out);
+    if (!dev->create_pipeline_layout(5, params, out)) return false;
+    d->dyncube_capture_layout_version = kDynCubeCaptureLayoutVersion;
+    return true;
   };
   auto make_solid_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
@@ -6664,6 +6696,10 @@ static void SaveActiveToCache(reshade::api::device* dev, DeviceData* d) {
 static bool RestoreFromCache(reshade::api::device* dev, DeviceData* d, uint32_t size) {
   auto it = d->dyncube_cache.find(size);
   if (it == d->dyncube_cache.end()) return false;
+  // Scratch is a DeviceData singleton (not per-set): a cache hit is only usable when
+  // it fits the restored size, otherwise fall through to a fresh create (sizes scratch).
+  const uint64_t neededGroups = (uint64_t)((size + 7u) / 8u) * ((size + 7u) / 8u) * 6u;
+  if (d->dyncube_worldbox_scratch_groups < neededGroups) return false;
   MoveSetToActive(d, it->second);
   d->dyncube_size = size;
   d->dyncube_cache.erase(it);
@@ -6905,7 +6941,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     const bool fastForward = d->dyncube_rejectedGap || d->dyncube_dirtyFastForward;
     d->dyncube_rejectedGap = false;
     d->dyncube_dirtyFastForward = false;
-    float pc[11] = {
+    float pc[12] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
         fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
         std::max(0.f, shader_injection.dynCube_history_pos_threshold),
@@ -6918,8 +6954,9 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
         IsKai() ? 8.f : (IsSora1st() ? 3.f : 0.f),
         std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f),
         IsSora1st() ? 1.f : 0.f,
+        (shader_injection.dynCube_sparkle_rejection > 0.5f) ? 1.f : 0.f,
     };
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 11, pc);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 12, pc);
   }
 
   uint32_t sz = d->dyncube_size;

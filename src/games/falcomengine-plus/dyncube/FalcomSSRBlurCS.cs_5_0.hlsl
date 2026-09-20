@@ -143,7 +143,9 @@ void main(uint3 dtid : SV_DispatchThreadID)
     }
     }
     float meanConf = confNum / max(confDen, 1e-4);
-    float finalConfidence = max(centerConf, meanConf);
+    // No max(centerConf, ...) pop: the max re-injects the center pixel's
+    // frame-to-frame march jitter into an otherwise stable neighborhood mean.
+    float finalConfidence = meanConf;
     float3 finalColor = colorNum / max(colorDen, 1e-4);
     g_outTex[px] = float4(max(0.0, finalColor), finalConfidence);
 }

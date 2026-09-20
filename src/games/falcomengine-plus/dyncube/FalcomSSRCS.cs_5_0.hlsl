@@ -321,6 +321,12 @@ void main(uint3 dtid : SV_DispatchThreadID)
             }
         }
 
-        g_out[px] = float4(max(0.0, g_colorTex.SampleLevel(g_pointClamp, fuv, 0).rgb), conf);
+        // Hit color point load: a filtered sample blends swimming texels coherently
+        // (visible shimmer under temporal upscalers even on a still camera); point
+        // load keeps per-pixel changes independent so the spatial blur converges
+        // instead of oscillating. Same texel the MRT decode uses.
+        int2 hitTex = clamp(int2(fuv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
+        float3 hitCol = g_colorTex.Load(int3(hitTex, 0)).rgb;
+        g_out[px] = float4(max(0.0, hitCol), conf);
     }
 }

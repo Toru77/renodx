@@ -29,6 +29,7 @@ cbuffer DynCubeCB : register(b13)
     float g_charShift;             // bit shift applied to the selected component (Sora 0, Kai 8, Sora1st 3)
     float g_captureSoften;         // reserved (soften applies in the variant pass, not here); kept for push/CB alignment
     float g_charInvert;            // 0 = set bit means character (Sora/Kai), 1 = clear bit means character (Sora1st: char = !(mrt.w & 8)); appended last, push count 10 -> 11
+    float g_sparkleReject;         // 0 = off (default), 1 = reject isolated HDR spikes at depth edges + non-finite input; appended last, push count 11 -> 12
 };
 
 Texture2D<float>       g_depthTex      : register(t0);
@@ -126,6 +127,44 @@ void main(uint3 dtid : SV_DispatchThreadID)
             curValid = true;
             curValid = true;
         }
+
+    // ── Sparkle rejection (toggle): kill isolated HDR spikes at depth edges ──
+    // No caps anywhere: broad legitimate brights pass through untouched. Only a lone
+    // texel that is BOTH a depth outlier vs all valid neighbors AND far brighter than
+    // the brightest valid neighbor is marked invalid (history/vanilla survive instead
+    // of baking the spike). Non-finite input is always invalid under the toggle.
+    if (g_sparkleReject > 0.5 && curValid)
+    {
+        float curSum = curCol.x + curCol.y + curCol.z + curPos.x + curPos.y + curPos.z;
+        if (!isfinite(curSum))
+        {
+            curValid = false;
+        }
+        else
+        {
+            uint cW, cH;
+            g_colorTex.GetDimensions(cW, cH);
+            float2 texel = 1.0 / float2(max(cW, 1u), max(cH, 1u));
+            float centerLum = dot(curCol, float3(0.2126, 0.7152, 0.0722));
+            float neighMaxLum = 0.0;
+            uint validNeigh = 0u;
+            bool allNearer = true;
+            for (int ni = 0; ni < 4; ++ni)
+            {
+                float2 nuv = uv + float2((ni == 0) ? texel.x : ((ni == 1) ? -texel.x : 0.0),
+                                         (ni == 2) ? texel.y : ((ni == 3) ? -texel.y : 0.0));
+                if (IsOutside(nuv)) continue;
+                float nDepth = g_depthTex.SampleLevel(g_pointClamp, nuv, 0);
+                if (nDepth >= 1.0 - 1e-5) continue;
+                validNeigh++;
+                if (rawDepth <= nDepth * 1.1) allNearer = false;
+                float3 nCol = g_colorTex.SampleLevel(g_pointClamp, nuv, 0).rgb;
+                neighMaxLum = max(neighMaxLum, dot(nCol, float3(0.2126, 0.7152, 0.0722)));
+            }
+            if (validNeigh > 0u && allNearer && centerLum > max(neighMaxLum * 4.0, 1.0))
+                curValid = false;
+        }
+    }
     }
 
     // ── Character mask (game-specific bit: Sora mrtTexture0.w & 1, Kai (mrtTexture0.z >> 8) & 1,
