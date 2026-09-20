@@ -137,9 +137,10 @@ float CHSS_Shadow(
   // Step 2: Penumbra estimate (paper Listing 4: saturate(scale * ((z - avg)/avg)^2))
   float avg_blocker = blocker_depth_sum / blocker_count;
   float depth_diff = receiver_z - avg_blocker;
-  // Depth cap bounds the depth difference before normalization
-  float penumbra_ratio = saturate(min(shader_injection_data.shadow_chss_depth_cap, depth_diff) / avg_blocker);
-  penumbra_ratio *= penumbra_ratio;
+  // Onset bias moves response closer to contact; curve replaces the fixed square.
+  float depth_diff_effective = max(0.0, depth_diff + shader_injection_data.shadow_chss_onset_bias);
+  float penumbra_ratio = saturate(min(shader_injection_data.shadow_chss_depth_cap, depth_diff_effective) / max(avg_blocker, 1e-5));
+  penumbra_ratio = pow(penumbra_ratio, max(0.5, shader_injection_data.shadow_chss_penumbra_curve));
   float penumbra = saturate(shader_injection_data.shadow_chss_penumbra_scale * penumbra_ratio);
   penumbra += shader_injection_data.shadow_base_softness;
   // filter_radius = penumbra × search radius (contact-hard at 0)

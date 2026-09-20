@@ -135,6 +135,8 @@ struct ShaderInjectData {
   float shadow_chss_post_blur;         // [0..100], default 0 — blur strength (0=off/passthrough, 100=full)
   float shadow_chss_blocker_count;     // [4..64], default 16 — blocker search sample count
   float shadow_chss_sample_count;      // [4..64], default 16 — PCF filter sample count
+  float shadow_chss_onset_bias;        // [0..0.2], default 0 — added to receiver/blocker separation before penumbra
+  float shadow_chss_penumbra_curve;    // [0.5..4], default 2 — penumbra response exponent
   // —— Colored Shadow Penumbra (Improved mode) ——
   float shadow_penumbra_color_strength;// [0..2], default 1.0 — how strongly to apply vibrancy effect
   float shadow_penumbra_vibrance;      // [0..100], default 1.0 — 0=grayscale, 1=neutral, >1=vivid
