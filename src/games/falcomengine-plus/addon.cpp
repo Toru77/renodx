@@ -2648,7 +2648,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowCHSSFilterSamples", .binding = &shader_injection.shadow_chss_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 16.f, .label = "Filter Samples", .section = "Shadow Maps",
+      .default_value = 64.f, .label = "Filter Samples", .section = "Shadow Maps",
       .tooltip = "Sample count for the variable-radius PCF filter. Higher = softer, less noisy shadows, lower = faster.",
       .min = 4.f, .max = 64.f, .format = "%d",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -2675,7 +2675,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.1f, .label = "Base Softness", .section = "Shadow Maps",
+      .default_value = 0.0f, .label = "Base Softness", .section = "Shadow Maps",
       .tooltip = "Constant minimum penumbra width. Contact-hard at 0, always soft at 0.5.",
       .min = 0.0f, .max = 1.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -2711,7 +2711,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowCHSSMinRadius", .binding = &shader_injection.shadow_chss_min_radius,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 3.f, .label = "Min Filter Radius", .section = "Shadow Maps",
+      .default_value = 0.f, .label = "Min Filter Radius", .section = "Shadow Maps",
       .tooltip = "Guaranteed minimum PCF filter radius in shadow map texels. Prevents filter from collapsing. 0=off.",
       .min = 0.f, .max = 100.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -2720,7 +2720,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowCHSSPostBlur", .binding = &shader_injection.shadow_chss_post_blur,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 60.f, .label = "Post Blur", .section = "Shadow Maps",
+      .default_value = 100.f, .label = "Post Blur", .section = "Shadow Maps",
       .tooltip = "Strength of the screen-space bilateral blur applied to the CHSS shadow mask. 0 = off (passthrough), 100 = full strength.",
       .min = 0.0f, .max = 100.0f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
@@ -2738,7 +2738,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ShadowCHSSPenumbraCurve", .binding = &shader_injection.shadow_chss_penumbra_curve,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 2.f, .label = "Penumbra Curve", .section = "Shadow Maps",
+      .default_value = 1.5f, .label = "Penumbra Curve", .section = "Shadow Maps",
       .tooltip = "Exponent applied to normalized penumbra separation. Values below 2 respond more aggressively near contact; values above 2 stay harder longer.",
       .min = 0.5f, .max = 4.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
