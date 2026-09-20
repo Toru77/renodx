@@ -287,10 +287,14 @@ void main(uint3 dtid : SV_DispatchThreadID)
         // distanceConf: far hits lose authority.
         float hitT = length(cur - P);
         float distanceConf = 1.0 - smoothstep(0.0, 1.0, saturate(hitT / maxDist)) * g_distanceFade;
-        // edgeConf: screen-edge vignette.
-        float minEdge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-        float edgeBand = max(g_edgeFade * 0.25, 1e-4);
-        float edgeConf = smoothstep(0.0, edgeBand, minEdge);
+        // edgeConf: screen-edge vignette, anisotropic — left/right borders use the
+        // full slider band, top/bottom use half (floor/ceiling reflections keep
+        // authority closer to the screen edge).
+        float edgeX = min(uv.x, 1.0 - uv.x);
+        float edgeY = min(uv.y, 1.0 - uv.y);
+        float edgeBandX = max(g_edgeFade * 0.25, 1e-4);
+        float edgeBandY = max(g_edgeFade * 0.125, 1e-4);
+        float edgeConf = min(smoothstep(0.0, edgeBandX, edgeX), smoothstep(0.0, edgeBandY, edgeY));
         // grazingConf: reduce authority at grazing view angles.
         float grazingBand = lerp(0.01, 0.4, g_grazingFade);
         float grazingConf = smoothstep(0.0, grazingBand, nv);
