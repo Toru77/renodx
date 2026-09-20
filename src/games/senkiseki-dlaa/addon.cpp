@@ -5021,8 +5021,9 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
     // Read camera matrices from the game's _Globals CBV (depth-projection velocity)
     auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
     ReadSceneMatrices(dev, d, cl);
-    LogThrottled("vel-mv", reshade::log::level::info, 3u, 60u,
-                 "[DLAA] veloc: matrices_valid=%d", (int)d->matrices_valid);
+    if (shader_injection.dlaa_debug_logging > 0.5f)
+      LogThrottled("vel-mv", reshade::log::level::info, 3u, 60u,
+                   "[DLAA] veloc: matrices_valid=%d", (int)d->matrices_valid);
 
     if (d->matrices_valid) {
       // ── Phase 3 fix: robust DLSS color source ──
@@ -5105,6 +5106,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
         };
         ID3D11RenderTargetView* om_rtvs[8] = {};
         ID3D11DepthStencilView* om_dsv = nullptr;
+      if (shader_injection.dlaa_debug_logging > 0.5f) {
         UINT om_num = 0;
         cl->OMGetRenderTargets(8, om_rtvs, &om_dsv);
         ID3D11Resource* dsv_res = nullptr;
@@ -5127,6 +5129,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
         if (om_dsv) om_dsv->Release();
         if (dsv_res) dsv_res->Release();
         if (cs_cb) cs_cb->Release();
+      }
       }
 
       dev->update_descriptor_tables(7, u);
@@ -5893,11 +5896,14 @@ static void FgPresentTick(reshade::api::device* dev, reshade::api::command_queue
   if (fg->spike_on && !fg->prev_spike_on) {
     fg->swap_latched = false;
     fg->swap_step = 0;
+    fg->hook_install_latched = false;
+    fg->hook_fail_count = 0u;
   }
   if (!fg->spike_on && fg->prev_spike_on) {
     fg->hook_fatal = false;
     fg->proxy_pattern = true;
     fg->pattern_ok = 0u;
+    senkiseki3::fg::FgProxyTeardown(fg);
   }
   fg->prev_spike_on = fg->spike_on;
   const bool want = g_fg_enabled > 0.5f || spike_want;
@@ -6783,7 +6789,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       });
       reshade::register_event<reshade::addon_event::destroy_device>([](reshade::api::device* dev) {
         auto* d = dev->get_private_data<DeviceData>();
-        if (d) { senkiseki3::fg::FgProxyRelease(&d->fg); Destroy(dev, d); dev->destroy_private_data<DeviceData>(); }
+        if (d) {
+          if (senkiseki3::fg::g_hook_fg == &d->fg) senkiseki3::fg::g_hook_fg = nullptr;
+          senkiseki3::fg::FgProxyRelease(&d->fg);
+          Destroy(dev, d);
+          dev->destroy_private_data<DeviceData>();
+        }
       });
       break;
     case DLL_PROCESS_DETACH:

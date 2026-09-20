@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 #include <include/reshade.hpp>
 
@@ -108,6 +109,9 @@ struct FgRuntime {
   double proxy_pub_ms = 0.0;
   int last_present_hr = 0;
   int last_hook_code = 0;
+  uint64_t last_hook_attempt_tick = 0u;
+  uint32_t hook_fail_count = 0u;
+  bool hook_install_latched = false;
   HANDLE swap_thread = nullptr;
   HANDLE swap_work = nullptr;
   HANDLE swap_done = nullptr;
@@ -484,7 +488,34 @@ static int g_patch_kind[12] = {};
 static uint32_t g_patch_n = 0u;
 static FgRuntime* g_hook_fg = nullptr;
 
-static bool FgFnInDxgi(void* fn);
+static bool FgTableInSystemDxgi(void** vt, char* owner, size_t owner_len) {
+  if (owner && owner_len > 0u) owner[0] = 0;
+  if (!vt) return false;
+  MEMORY_BASIC_INFORMATION mbi = {};
+  if (!VirtualQuery((void*)vt, &mbi, sizeof(mbi)) || !mbi.AllocationBase) return false;
+  char path[MAX_PATH] = {};
+  if (!GetModuleFileNameA((HMODULE)mbi.AllocationBase, path, (DWORD)sizeof(path))) return false;
+  if (owner && owner_len > 0u) {
+    size_t n = 0u;
+    while (n + 1u < owner_len && path[n]) {
+      owner[n] = path[n];
+      n++;
+    }
+    owner[n] = 0;
+  }
+  size_t n = 0u;
+  while (path[n]) n++;
+  const char* tail = "\\system32\\dxgi.dll";
+  size_t m = 0u;
+  while (tail[m]) m++;
+  if (n < m) return false;
+  for (size_t i = 0u; i < m; ++i) {
+    char a = path[n - m + i];
+    if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+    if (a != tail[i]) return false;
+  }
+  return true;
+}
 
 using FgPresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using FgPresent1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT,
@@ -504,6 +535,26 @@ static void FgObsTouch(FgRuntime* fg, void* chain) {
       fg->obs[i].count = 1u;
       return;
     }
+  }
+}
+
+static void FgProxyTeardown(FgRuntime* fg) {
+  if (!fg) return;
+  const bool had = fg->proxy_swap || fg->alt_swap;
+  if (fg->proxy_rtv_heap) { fg->proxy_rtv_heap->Release(); fg->proxy_rtv_heap = nullptr; }
+  if (fg->proxy_chain3) { fg->proxy_chain3->Release(); fg->proxy_chain3 = nullptr; }
+  if (fg->proxy_swap) { fg->proxy_swap->Release(); fg->proxy_swap = nullptr; }
+  fg->proxy_chain = nullptr;
+  fg->proxy_w = 0u;
+  fg->proxy_h = 0u;
+  if (fg->alt_rtv) { fg->alt_rtv->Release(); fg->alt_rtv = nullptr; }
+  if (fg->alt_swap) { fg->alt_swap->Release(); fg->alt_swap = nullptr; }
+  fg->alt_w = 0u;
+  fg->alt_h = 0u;
+  if (had) {
+    char line[128];
+    snprintf(line, sizeof(line), "[DLAA] FG proxy: presentation torn down");
+    reshade::log::message(reshade::log::level::info, line);
   }
 }
 
@@ -626,7 +677,7 @@ static int FgSuppressedFrame(FgRuntime* fg) {
       ctx->CopyResource(abuf, fg->shared11);
       abuf->Release();
     }
-    phr = fg->alt_swap->Present(0u, 0u);
+    phr = fg->alt_swap->Present(1u, 0u);
   } else {
     return -2;
   }
@@ -720,15 +771,22 @@ static bool FgPatchSlot(void** vt, uint32_t slot, void* hookfn, int kind) {
   for (uint32_t i = 0u; i < g_patch_n; ++i)
     if (g_patch_slot[i] == (void*)pslot) return true;
   if (g_patch_n >= 12u) return false;
-  void* orig = *pslot;
-  if (!FgFnInDxgi(orig)) {
-    char line[128];
-    snprintf(line, sizeof(line), "[DLAA] FG proxy: skipping non-DXGI table slot %u", slot);
+  char owner[MAX_PATH] = {};
+  if (!FgTableInSystemDxgi(vt, owner, sizeof(owner))) {
+    char line[256];
+    snprintf(line, sizeof(line), "[DLAA] FG proxy: skipping non-system table slot %u owner=%s",
+             slot, owner[0] ? owner : "?");
     reshade::log::message(reshade::log::level::info, line);
     return false;
   }
+  void* orig = *pslot;
   DWORD old = 0u;
-  if (!VirtualProtect(pslot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+  if (!VirtualProtect(pslot, sizeof(void*), PAGE_READWRITE, &old)) {
+    char line[128];
+    snprintf(line, sizeof(line), "[DLAA] FG proxy: table slot %u not writable", slot);
+    reshade::log::message(reshade::log::level::warning, line);
+    return false;
+  }
   *pslot = hookfn;
   VirtualProtect(pslot, sizeof(void*), old, &old);
   g_patch_slot[g_patch_n] = (void*)pslot;
@@ -741,6 +799,9 @@ static bool FgPatchSlot(void** vt, uint32_t slot, void* hookfn, int kind) {
 static bool FgHookEnsure(FgRuntime* fg) {
   if (!fg || fg->hook_installed || (!fg->proxy_swap && !fg->alt_swap))
     return fg && fg->hook_installed;
+  if (fg->hook_install_latched) return false;
+  if (fg->tick_count - fg->last_hook_attempt_tick < 180u) return false;
+  fg->last_hook_attempt_tick = fg->tick_count;
   char line[192];
   IDXGISwapChain* src = fg->proxy_swap ? fg->proxy_swap : fg->alt_swap;
   IUnknown* qis[5] = {};
@@ -800,8 +861,15 @@ static bool FgHookEnsure(FgRuntime* fg) {
     fg->proxy_code = kFgProxyErrHookInstall;
     snprintf(line, sizeof(line), "[DLAA] FG proxy: Present hook install failed");
     reshade::log::message(reshade::log::level::error, line);
+    fg->hook_fail_count++;
+    if (fg->hook_fail_count >= 5u && !fg->hook_install_latched) {
+      fg->hook_install_latched = true;
+      snprintf(line, sizeof(line), "[DLAA] FG proxy: hook install latched off until retoggled");
+      reshade::log::message(reshade::log::level::error, line);
+    }
     return false;
   }
+  fg->hook_fail_count = 0u;
   g_hook_fg = fg;
   fg->hook_installed = true;
   snprintf(line, sizeof(line), "[DLAA] FG proxy: Present hook installed (%u slots), observing", patched);
@@ -864,15 +932,6 @@ static bool FgProxyRtvEnsure(FgRuntime* fg) {
     fg->proxy_rtv[i] = h;
   }
   return true;
-}
-
-static bool FgFnInDxgi(void* fn) {
-  static HMODULE dxgi_mod = nullptr;
-  if (!dxgi_mod) dxgi_mod = GetModuleHandleW(L"dxgi.dll");
-  if (!dxgi_mod || !fn) return false;
-  MEMORY_BASIC_INFORMATION mbi = {};
-  if (!VirtualQuery(fn, &mbi, sizeof(mbi))) return false;
-  return mbi.AllocationBase == (void*)dxgi_mod;
 }
 
 static IDXGIInfoQueue* FgDxgiCaptureBegin();
