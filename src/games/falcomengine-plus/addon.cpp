@@ -2995,7 +2995,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeUpdateInterval", .binding = &shader_injection.dynCube_capture_interval,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 7.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
+      .default_value = 3.f, .label = "Dynamic Cubemap Update Interval", .section = "Dynamic Cubemaps",
       .tooltip = "Frames between new cubemap captures (1=fastest 2-stage cadence, 2=every 2 frames, 4=every 4 frames, 8=every 8 frames). Capture and filter run on separate frames; the previous completed cube stays visible between updates.",
       .labels = {"1", "2", "3", "4", "5", "6", "7", "8"},
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
