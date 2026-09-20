@@ -1502,7 +1502,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "DOFEdgeThreshold", .binding = &shader_injection.dof_edge_threshold,
-      .default_value = 0.02f, .label = "Edge Threshold", .section = "Depth of Field",
+      .default_value = 0.05f, .label = "Edge Threshold", .section = "Depth of Field",
       .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
       .min = 0.02f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
