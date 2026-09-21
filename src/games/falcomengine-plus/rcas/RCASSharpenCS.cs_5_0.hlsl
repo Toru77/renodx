@@ -93,22 +93,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
   float3 f = RCASLoad(sp + int2(1, 0), dims).rgb;
   float3 h = RCASLoad(sp + int2(0, 1), dims).rgb;
 
-  // Luma times 2 (reference weights, verbatim). Needed for the optional
-  // noise term below; cheap since the taps are already loaded.
-  float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
-  float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
-  float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
-  float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
-  float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
-
-  // Noise detection (reference equations, exact rcp instead of the
-  // approximation). Normalized high-pass in [0,1], shaped to nz in
+  // Luma + noise term, computed only when denoise is on (default off):
+  // zero output change when off (nz unused there), ~10 ALU saved per pixel.
+  // Noise detection: reference equations, exact rcp instead of the
+  // approximation. Normalized high-pass in [0,1], shaped to nz in
   // [0.5,1.0]: structured edges keep ~1.0, grain-like variation drops
   // toward 0.5. Only applied when g_denoise is on (reference default off).
-  float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
-  nz = saturate(abs(nz) / max(max(max(bL, dL), max(eL, max(fL, hL)))
-      - min(min(bL, dL), min(eL, min(fL, hL))), 1e-6));
-  nz = -0.5 * nz + 1.0;
+  float nz = 1.0;
+  if (g_denoise > 0.5) {
+    // Luma times 2 (reference weights, verbatim).
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
+    float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
+    float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+    float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
+    float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+    nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+    nz = saturate(abs(nz) / max(max(max(bL, dL), max(eL, max(fL, hL)))
+        - min(min(bL, dL), min(eL, min(fL, hL))), 1e-6));
+    nz = -0.5 * nz + 1.0;
+  }
 
   // Min and max of ring (per channel).
   float3 mn4 = min(min(b, d), min(f, h));

@@ -115,25 +115,9 @@ void main(
         neighborhood[n++] = colorTexture.SampleLevel(samPoint_s, tapUV, 0).xyz;
       }
     }
-    if (clipMode == CUSTOM_TAA_CLIP_KDOP) {
-      int setSel = (int)(shader_injection_data.custom_taa_kdop_axes + 0.5);
-      history = CustomTAA_ClipKDOP(
-          current, history, neighborhood, setSel,
-          shader_injection_data.custom_taa_kdop_epsilon, clipT, overshootR);
-    } else {
-      float3 minC = neighborhood[0];
-      float3 maxC = neighborhood[0];
-      [unroll]
-      for (int k = 1; k < 9; ++k) {
-        minC = min(minC, neighborhood[k]);
-        maxC = max(maxC, neighborhood[k]);
-      }
-      history = CustomTAA_ClipToExtents(current, history, minC, maxC, clipT, overshootR);
-    }
-    // Relative detail: max channel range over center luma (vanilla luma
-    // weights, 1e-2 floor against near-black noise). Bright smooth regions
-    // read low even when their absolute range is large; dark textured detail
-    // reads high. Test value 8.0 opens fully at relativeDetail 0.125.
+    // Shared neighborhood extents (single reduction pass over the already
+    // gathered taps; reused by the AABB clip and the detail gate below).
+    // Bit-exact vs the former two separate passes: same taps, same order.
     float3 nMin = neighborhood[0];
     float3 nMax = neighborhood[0];
     [unroll]
@@ -141,6 +125,18 @@ void main(
       nMin = min(nMin, neighborhood[q]);
       nMax = max(nMax, neighborhood[q]);
     }
+    if (clipMode == CUSTOM_TAA_CLIP_KDOP) {
+      int setSel = (int)(shader_injection_data.custom_taa_kdop_axes + 0.5);
+      history = CustomTAA_ClipKDOP(
+          current, history, neighborhood, setSel,
+          shader_injection_data.custom_taa_kdop_epsilon, clipT, overshootR);
+    } else {
+      history = CustomTAA_ClipToExtents(current, history, nMin, nMax, clipT, overshootR);
+    }
+    // Relative detail: max channel range over center luma (vanilla luma
+    // weights, 1e-2 floor against near-black noise). Bright smooth regions
+    // read low even when their absolute range is large; dark textured detail
+    // reads high. Test value 8.0 opens fully at relativeDetail 0.125.
     float detailRange = max(nMax.x - nMin.x, max(nMax.y - nMin.y, nMax.z - nMin.z));
     float refLuma = max(dot(current, float3(0.299, 0.587, 0.114)), 1e-2);
     detailGate = saturate((detailRange / refLuma) * shader_injection_data.custom_taa_detail_restore);
