@@ -26,18 +26,27 @@
 // buffer before sharpening, and only that copy is ever bound as t2.
 
 cbuffer RCASCB : register(b13) {
-  float g_con;     // lobe multiplier 0..1, pushed directly from the UI strength
-                   // (linear response: visible effect is ~linear in con
-                   // pre-clamp). S=0 never dispatches (CPU passthrough).
+  float g_con;     // base lobe multiplier 0..1 from UI Sharpening (linear).
+                   // S=0 never dispatches (CPU passthrough).
   float g_width;   // target width in pixels (float; converted to int)
   float g_height;  // target height in pixels (float; converted to int)
   float g_denoise; // 0 = reference default (full sharpening); 1 = apply the
                    // noise term (lobe *= nz), reducing sharpening where local
                    // variation looks grain-like (0.5..1.0 scale range).
+  float g_motionOn;       // 1 = Motion Sharpening UI on AND motion view live.
+                          // 0 = base path exactly (motion lookup skipped).
+  float g_motionThreshold;// px: motion below this adds no sharpening (jitter floor).
+  float g_motionRange;    // px of additional motion to reach the motion target.
+  float g_motionResponse; // pow curvature of the threshold->target transition.
+  float g_conMotion;      // ABSOLUTE motion target (NOT base+target):
+                          // max motion interpolates base -> motion, never sums.
+  float g_debug;          // 0 = normal sharpen; 1 = motion-strength heatmap
+                          // (green = no boost, yellow = partial, red = full).
 };
 
-Texture2D<float4> g_src : register(t0);  // unsharpened TAA output
-RWTexture2D<float4> g_dst : register(u0);  // owned sharpened temp target
+Texture2D<float4> g_src : register(t0);     // unsharpened TAA output
+Texture2D<float4> g_motion : register(t1);  // game motion buffer (texel units, jitter-inclusive)
+RWTexture2D<float4> g_dst : register(u0);   // owned sharpened temp target
 
 #define RCAS_LIMIT (0.25 - (1.0 / 16.0))
 
@@ -51,6 +60,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
   int2 dims = int2((int)(g_width + 0.5), (int)(g_height + 0.5));
   if (tid.x >= (uint)dims.x || tid.y >= (uint)dims.y) return;
   int2 sp = int2(tid.xy);
+
+  // Motion-adaptive strength (Stage 2): absolute interpolation between the
+  // base and motion targets -- never summed. Jitter-level motion stays under
+  // the threshold, so static pixels keep exactly the base strength.
+  // Motion buffer shares output UV space (same assumption the TAA shader
+  // itself makes), so integer texel loads apply. Skipped entirely when off.
+  float con = g_con;
+  float motionT = 0.0;
+  if (g_motionOn > 0.5) {
+    float motionPixels = length(g_motion.Load(int3(sp, 0)).xy);
+    motionT = saturate((motionPixels - g_motionThreshold) / max(g_motionRange, 1e-4));
+    motionT = pow(motionT, g_motionResponse);
+    con = lerp(g_con, g_conMotion, motionT);
+  }
+
+  // Motion-strength heatmap (diagnostic): visualizes the same mask the real
+  // path uses (green = no boost, yellow = partial, red = full motion target).
+  // Skips color work; normal path below is untouched when debug is off.
+  if (g_debug > 0.5) {
+    float3 heat = lerp(float3(0.0, 1.0, 0.0), float3(1.0, 1.0, 0.0), saturate(motionT * 2.0));
+    heat = lerp(heat, float3(1.0, 0.0, 0.0), saturate(motionT * 2.0 - 1.0));
+    g_dst[sp] = float4(heat, 1.0);
+    return;
+  }
 
   // 5-tap cross (reference b/d/e/f/h).
   float3 b = RCASLoad(sp + int2(0, -1), dims).rgb;
@@ -90,7 +123,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
   float3 lobe3 = max(-hitMin, hitMax);
   // HLSL max() follows fmax semantics (non-NaN wins), matching the
   // reference behavior on degenerate flat fields (e.g. mn == peak).
-  float lobe = max(-RCAS_LIMIT, min(max(lobe3.x, max(lobe3.y, lobe3.z)), 0.0)) * g_con;
+  float lobe = max(-RCAS_LIMIT, min(max(lobe3.x, max(lobe3.y, lobe3.z)), 0.0)) * con;
   if (g_denoise > 0.5) {
     lobe *= nz;
   }
