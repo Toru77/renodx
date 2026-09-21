@@ -1504,7 +1504,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "DOFEdgeThreshold", .binding = &shader_injection.dof_edge_threshold,
-      .default_value = 0.05f, .label = "Edge Threshold", .section = "Depth of Field",
+      .default_value = 0.3f, .label = "Edge Threshold", .section = "Depth of Field",
       .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
       .min = 0.02f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
@@ -3351,7 +3351,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSREdgeFade", .binding = &shader_injection.dynCube_ssr_edge_fade,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.4f, .label = "SSR Edge Fade", .section = "Dynamic Cubemaps",
+      .default_value = 0.2f, .label = "SSR Edge Fade", .section = "Dynamic Cubemaps",
       .tooltip = "Screen-edge vignette strength on SSR confidence. 0 = none, 1 = fades over 25% from each edge.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
