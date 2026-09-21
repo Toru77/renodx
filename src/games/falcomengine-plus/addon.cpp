@@ -331,6 +331,19 @@ ShaderInjectData shader_injection = {
   .custom_shader_logging = 0.f,
   .dynCube_sparkle_rejection = 0.f,
   .char_outline_intensity = 1.f,
+  // ── Custom TAA (Sora 1st/2nd) defaults: off = vanilla TAA runs untouched ──
+  .custom_taa_enabled = 0.f,
+  .custom_taa_history_filter = 0.f,
+  .custom_taa_clip_mode = 0.f,
+  .custom_taa_kdop_axes = 0.f,
+  .custom_taa_dmin = 0.048f,
+  .custom_taa_kdop_epsilon = 0.00001f,
+  .custom_taa_static_feedback = 0.9f,
+  .custom_taa_dynamic_feedback = 0.5f,
+  .custom_taa_motion_scale = 0.125f,
+  .custom_taa_debug = 0.f,
+  .custom_taa_history_valid = 0.f,
+  .custom_taa_overshoot_softness = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -870,6 +883,8 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list);
+static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
+static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
@@ -1122,6 +1137,28 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .code = __0x8B35370A,
             .on_replace = OnReplaceSora1stSSRDraw,
             .on_draw = OnBeforeSora1stSSRDraw,
+        },
+    },
+    // ── Custom TAA (Sora 1st/2nd, replacement-gated; vanilla when off) ──
+    // NOTE: custom files use unique embed stems (taa_custom_sora1st/2nd) so the
+    // dumped vanilla reference files under sora1st/taa and sora2nd/taa keep
+    // compiling untouched; the runtime CRCs below are the game's TAA hashes.
+    {
+        0xFA37EA04u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xFA37EA04u,
+            .code = __taa_custom_sora1st,
+            .on_replace = OnReplaceCustomTAADraw,
+            .on_draw = OnBeforeCustomTAADraw,
+        },
+    },
+    {
+        0x9D91FAC3u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x9D91FAC3u,
+            .code = __taa_custom_sora2nd,
+            .on_replace = OnReplaceCustomTAADraw,
+            .on_draw = OnBeforeCustomTAADraw,
         },
     },
     // ── Kai SSR (fused march + temporal, replacement-gated; High + Ultra) ──
@@ -3519,6 +3556,105 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
+    // ── Custom TAA (Sora 1st / 2nd, from-scratch replacement) ──
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAEnabled", .binding = &shader_injection.custom_taa_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Enable Custom TAA", .section = "Custom TAA",
+      .tooltip = "Off = the game's original TAA runs untouched. On = the from-scratch custom TAA serves the TAA pass (first custom frame outputs current only, then accumulates).",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAHistoryFilter", .binding = &shader_injection.custom_taa_history_filter,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "History Filter", .section = "Custom TAA",
+      .tooltip = "History reconstruction: Bilinear (TAA-0 baseline), Adaptive high-order (edge-gated bicubic), Full bicubic.",
+      .labels = {"Bilinear", "Adaptive", "Full"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAClipMode", .binding = &shader_injection.custom_taa_clip_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "History Validation", .section = "Custom TAA",
+      .tooltip = "History validation: None (TAA-0/1), RGB AABB baseline (TAA-2), k-DOP polytope clip (TAA-3).",
+      .labels = {"None", "AABB", "k-DOP"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAStaticFeedback", .binding = &shader_injection.custom_taa_static_feedback,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.95f, .label = "Static Feedback", .section = "Custom TAA",
+      .tooltip = "TAA-5 history weight for static pixels: result = lerp(current, history, feedback). High values accumulate many frames on stable pixels.",
+      .min = 0.f, .max = 0.99f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAADynamicFeedback", .binding = &shader_injection.custom_taa_dynamic_feedback,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.5f, .label = "Dynamic Feedback", .section = "Custom TAA",
+      .tooltip = "TAA-5 history weight for fast-moving pixels. Lower values cut trailing/temporal softness during motion.",
+      .min = 0.f, .max = 0.99f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAMotionScale", .binding = &shader_injection.custom_taa_motion_scale,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.66f, .label = "Motion Scale", .section = "Custom TAA",
+      .tooltip = "TAA-5 pixels-to-weight scale: weight = saturate(motionPixels * scale). Motion is in pixels/frame and includes the subpixel jitter delta, so the default is small: ~1px stays near Static, ~4px blends halfway, ~8px reaches Dynamic. Do not change during the first test pass.",
+      .min = 0.f, .max = 2.f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAOvershootSoftness", .binding = &shader_injection.custom_taa_overshoot_softness,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Overshoot Softness", .section = "Custom TAA",
+      .tooltip = "Selective-tolerance experiment (keep epsilon at 0.01 for A/B): history near the k-DOP hull keeps feedback and averages out flicker; history far outside loses feedback and stays responsive. 100 ~= prior behavior (not bit-exact), 1.0 = experiment default, 0.5 = stronger rejection.",
+      .min = 0.25f, .max = 100.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAKDOPAxes", .binding = &shader_injection.custom_taa_kdop_axes,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "k-DOP Axis Count", .section = "Custom TAA",
+      .tooltip = "k-DOP polytope density: 16-DOP General subset (default, first 8 axes of the paper's 32-DOP set), 22-DOP Paper lightweight set, 32-DOP Paper full set. The paper's scene-optimized 16-DOP sets are future experiments.",
+      .labels = {"16-DOP General", "22-DOP Paper", "32-DOP Paper"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 1.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAADmin", .binding = &shader_injection.custom_taa_dmin,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.048f, .label = "Adaptive Threshold", .section = "Custom TAA",
+      .tooltip = "Edge D-term gate for adaptive history filtering (paper start point, tune per game). Below this: bilinear; above: full bicubic correction.",
+      .min = 0.f, .max = 0.5f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_history_filter > 0.5f && shader_injection.custom_taa_history_filter < 1.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAKDOPEpsilon", .binding = &shader_injection.custom_taa_kdop_epsilon,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.05f, .label = "k-DOP Epsilon", .section = "Custom TAA",
+      .tooltip = "Slab extent padding for k-DOP clipping (paper default 1e-5). Investigation range: higher values retain more history (reduces shadow jitter but risks stale-history drag on highlights).",
+      .min = 0.f, .max = 0.1f, .format = "%.5f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 1.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAADebug", .binding = &shader_injection.custom_taa_debug,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Debug View", .section = "Custom TAA",
+      .tooltip = "Dev only: Normal, History only (is reconstruction working?), Clip factor (is k-DOP rejecting?), Adapt-Bilin x20 (where does adaptive differ from bilinear?), Full-Bilin x20 (where does full bicubic differ?).",
+      .labels = {"Normal", "History", "Clip", "Adapt-Bilin", "Full-Bilin"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -5050,6 +5186,38 @@ static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list) {
 // improvements alike; the file selects its path in-shader.
 static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list) {
   return Sora1stSSRReplaceActive(cmd_list) || Sora1stSSRVanillaActive(cmd_list);
+}
+
+// ── Custom TAA gate (Sora 1st/2nd) ──
+// OFF (or non-Sora exe): on_replace returns false so the game's original TAA
+// draws untouched; the dumped vanilla files are reference only, never edited.
+// ON: the from-scratch custom shader serves the TAA hash.
+// History validity: the first custom frame after the OFF->ON transition must
+// never accumulate against stale vanilla history, so on_draw reports invalid
+// (shader outputs current only) and arms accumulation from the next frame.
+// Resolution-change auto-reset is TAA-5 work; toggle transition is enough for
+// TAA-0 A/B cleanliness.
+static bool s_custom_taa_was_active = false;
+
+static bool CustomTAAReplaceActive(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return false;
+  if (shader_injection.custom_taa_enabled < 0.5f) return false;
+  if (!IsSora1st() && !IsSora2nd()) return false;
+  return true;
+}
+
+static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list) {
+  return CustomTAAReplaceActive(cmd_list);
+}
+
+static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
+  if (!CustomTAAReplaceActive(cmd_list)) {
+    s_custom_taa_was_active = false;
+    return true;
+  }
+  shader_injection.custom_taa_history_valid = s_custom_taa_was_active ? 1.f : 0.f;
+  s_custom_taa_was_active = true;
+  return true;
 }
 
 // ── Kai SSR Replacement (fused march + temporal composites, High + Ultra) ──

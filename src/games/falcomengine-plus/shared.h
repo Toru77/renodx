@@ -360,6 +360,19 @@ struct ShaderInjectData {
   float custom_shader_logging;             // 0=Off, 1=On - throttled step log (GTVBAO + DynCube + SSR) for crash diagnosis (appended last: do not insert above)
   float dynCube_sparkle_rejection;         // 0=off, 1=reject isolated HDR spikes at depth edges + non-finite input, no HDR caps (appended last: do not insert above)
   float char_outline_intensity;            // [0..1], 1=vanilla outline strength, applied before saturate (appended last: do not insert above)
+  // —— Custom TAA (Sora 1st/2nd, from-scratch replacement; vanilla TAA files stay untouched) ——
+  float custom_taa_enabled;                // 0=Off (game TAA runs), 1=On (custom replacement serves the TAA hashes)
+  float custom_taa_history_filter;         // 0=Bilinear, 1=Adaptive high-order (edge-gated bicubic), 2=Full bicubic
+  float custom_taa_clip_mode;              // 0=None, 1=RGB AABB, 2=k-DOP
+  float custom_taa_kdop_axes;              // 0=16-DOP General subset (first 8 axes of paper 32-DOP set), 1=22-DOP Paper lightweight, 2=32-DOP Paper full
+  float custom_taa_dmin;                   // adaptive gate threshold on edge D-terms (paper start point ~0.048, tune per game)
+  float custom_taa_kdop_epsilon;           // slab extent padding for k-DOP clipping (paper default 1e-5)
+  float custom_taa_static_feedback;        // TAA-5 static history weight [0..0.99], default 0.9
+  float custom_taa_dynamic_feedback;       // TAA-5 moving history weight [0..0.99], default 0.5
+  float custom_taa_motion_scale;           // TAA-5 pixels-to-weight scale: weight = saturate(motionPixels * scale)
+  float custom_taa_debug;                  // 0=Normal, 1=History only, 2=Clip factor, 3=|Adaptive-Bilinear|x20, 4=|Full-Bilinear|x20 (dev/Advanced only)
+  float custom_taa_history_valid;          // runtime: 0=first custom frame (output current, no accumulate), 1=accumulate
+  float custom_taa_overshoot_softness;       // selective-tolerance experiment: fb *= 1/(1+(r/k)^2), r = normalized hull overshoot; k=100 ~= prior behavior
 };
 
 #ifndef __cplusplus

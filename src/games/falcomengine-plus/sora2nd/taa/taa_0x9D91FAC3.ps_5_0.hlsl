@@ -35,7 +35,7 @@ void main(
   r0.xy = float2(-1,-1);
   r1.xy = float2(0,0);
   r1.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-  r2.xyzw = -texelSize_g.xy + v1.xyxy;
+  r2.xyzw = -texelSize_g.xyxy + v1.xyxy;
   r2.xy = saturate(r2.xy);
   r0.z = depthTexture.SampleLevel(samPoint_s, r2.xy, 0).x;
   r0.w = cmp(r0.z >= r1.z);
