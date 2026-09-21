@@ -373,6 +373,15 @@ struct ShaderInjectData {
   float custom_taa_debug;                  // 0=Normal, 1=History only, 2=Clip factor, 3=|Adaptive-Bilinear|x20, 4=|Full-Bilinear|x20 (dev/Advanced only)
   float custom_taa_history_valid;          // runtime: 0=first custom frame (output current, no accumulate), 1=accumulate
   float custom_taa_overshoot_softness;       // selective-tolerance experiment: fb *= 1/(1+(r/k)^2), r = normalized hull overshoot; k=100 ~= prior behavior
+  float custom_taa_silhouette_rejection;     // wrong-surface experiment: disocc = 1 - motionWeight*saturate(spread*k); 0 = prior behavior
+  float custom_taa_squared_motion_response;  // 0=linear motion weight (baseline), 1=squared (more history at low/moderate motion)
+  float custom_taa_detail_restore;           // 0=off (exact prior behavior); test 8.0: restore fb toward static on detailed+agreeing pixels
+  float custom_taa_detail_target;            // selective above-static window for high-detail/low-motion/agreeing pixels; == staticFb = off (exact prior)
+  // —— RCAS post-TAA sharpening (dedicated pass; never feeds TAA history) ——
+  // Always on: strength 0 is the off position (passthrough, zero dispatch).
+  float rcas_strength;                       // [0..1], default 0.2 — linear lobe multiplier (0 = off/passthrough)
+  float rcas_enabled;                        // 0=forced 0 sharpening (stage still runs: hist copy + t2 path intact), 1=strength applies; default On
+  float rcas_denoise;                        // 0=off (reference default), 1=apply nz grain reduction (lobe *= nz, 0.5..1.0 range)
 };
 
 #ifndef __cplusplus

@@ -65,10 +65,11 @@ float2 CustomTAA_Reproject(
     Texture2D<float4> depthTexture, SamplerState samPoint,
     Texture2D<float4> motionTexture, SamplerState samLinear,
     float2 texelSize, float2 prevResolutionScale,
-    out float motionPixels) {
+    out float motionPixels, out float depthSpread) {
   float centerDepth = depthTexture.SampleLevel(samPoint, uv, 0).x;
   float2 bestOffset = float2(0.0, 0.0);
   float bestDepth = centerDepth;
+  float minDepth = centerDepth;
   // Diagonal taps, matching the game's 5-tap footprint.
   const float2 kOffsets[4] = {
     float2(-1.0, -1.0), float2(1.0, -1.0),
@@ -82,7 +83,12 @@ float2 CustomTAA_Reproject(
       bestDepth = tapDepth;
       bestOffset = kOffsets[i];
     }
+    minDepth = min(minDepth, tapDepth);
   }
+  // Relative depth discontinuity from the same 5 taps (no new samples):
+  // ~0 = locally flat, larger = silhouette/edge. Relative form only assumes
+  // monotonic depth (larger = nearer, per the max-wins selection above).
+  depthSpread = (bestDepth - minDepth) / max(bestDepth, 1e-4);
   float2 motionUV = saturate(uv + bestOffset * texelSize);
   float2 motionTexels = motionTexture.SampleLevel(samLinear, motionUV, 0).xy;
   // No explicit jitter-delta correction, by evidence (not assumption):

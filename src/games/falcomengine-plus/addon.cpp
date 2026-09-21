@@ -344,6 +344,14 @@ ShaderInjectData shader_injection = {
   .custom_taa_debug = 0.f,
   .custom_taa_history_valid = 0.f,
   .custom_taa_overshoot_softness = 1.f,
+  .custom_taa_silhouette_rejection = 4.f,
+  .custom_taa_squared_motion_response = 0.f,
+  .custom_taa_detail_restore = 0.f,
+  .custom_taa_detail_target = 0.85f,
+  // ── RCAS post-TAA sharpening defaults: always on, strength 0 = off ──
+  .rcas_strength = 0.2f,
+  .rcas_enabled = 1.f,
+  .rcas_denoise = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -389,6 +397,18 @@ constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 5u;  // bump when the SSR blur
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;  // bump when the worldbox pipeline layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeCaptureLayoutVersion = 1u;  // bump when the capture pipeline layout shape changes (forces recreate)
+constexpr uint32_t kRCASLayoutVersion = 2u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
+// Strip sRGB encoding for UAV-compatible temp storage and raw (non-decoding)
+// SRV reads. Copies stay bitwise so the game keeps decoding exactly as before.
+// Non-sRGB formats map to identity (FP16 HDR path unchanged).
+static reshade::api::format RCASLinearFormat(reshade::api::format fmt) {
+  using F = reshade::api::format;
+  switch (fmt) {
+    case F::r8g8b8a8_unorm_srgb: return F::r8g8b8a8_unorm;
+    case F::b8g8r8a8_unorm_srgb: return F::b8g8r8a8_unorm;
+    default: return fmt;
+  }
+}
 // Pass-0 reduction groups are computed per active cube size at creation;
 // the live scratch buffer's capacity is tracked in dyncube_worldbox_scratch_groups.
 // Manual Reset World Box request (set by the UI button, consumed by the reduction).
@@ -848,6 +868,27 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool dyncube_pending_recreate = false;                 // recreate (old set release deferred to Present)
   bool dyncube_pending_destroy = false;                  // feature disabled -> free the set at Present
   std::map<uint32_t, DynCubeSet> dyncube_cache;          // cached per-size sets (never destroyed during resize)
+  // ── RCAS post-TAA sharpening (Stage 1; motion sharpening is Stage 2) ──
+  // Flow per frame when enabled: TAA draw completes -> copy unsharpened TAA
+  // output to rcas_hist (this copy alone is ever bound as next frame's t2) ->
+  // RCAS compute reads TAA output, writes rcas_temp -> copy rcas_temp back
+  // over the TAA output so downstream reads see sharpened pixels. History
+  // isolation is structural: sharpened data never enters rcas_hist or t2.
+  reshade::api::resource rcas_temp_texture = {};         // owned sharpened target (dims of TAA output, linear/UAV-legal variant format)
+  reshade::api::resource_view rcas_temp_srv = {};        // (kept for debugging; not bound downstream)
+  reshade::api::resource_view rcas_temp_uav = {};        // compute write target (u0)
+  reshade::api::resource rcas_hist_texture = {};         // owned UNSHARPENED copy; sole source of overridden t2
+  reshade::api::resource_view rcas_hist_srv = {};        // bound as t2 when RCAS serves history; also the dispatch input (t0)
+  uint32_t rcas_w = 0u, rcas_h = 0u;                     // live dims of temp/hist set
+  reshade::api::format rcas_fmt = reshade::api::format::unknown;  // live format (preserved, never converted)
+  bool rcas_have_copy = false;                           // true once an unsharpened copy exists for t2 override
+  bool rcas_format_logged = false;                       // one-time format log per resource set
+  bool rcas_dispatch_logged = false;                     // one-time dispatch-shape log per resource set
+  reshade::api::pipeline_layout rcas_layout = {};
+  reshade::api::pipeline rcas_pipeline = {};
+  uint32_t rcas_layout_version = 0u;
+  std::array<reshade::api::descriptor_table, 2> rcas_tables = {};  // [0]=srv t0, [1]=uav u0
+  reshade::api::resource_view rcas_last_rtv0 = {};            // latest bound RTV0 (D3D11 immediate-list assumption; sampled at TAA on_draw)
 };
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
@@ -883,8 +924,14 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list);
+// ── RCAS post-TAA sharpening — forward decls ──
+static void CreateRCASResources(reshade::api::device* dev, DeviceData* d,
+                                uint32_t w, uint32_t h, reshade::api::format fmt);
+static void DestroyRCASResources(reshade::api::device* dev, DeviceData* d);
+static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
+static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
@@ -1150,6 +1197,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .code = __taa_custom_sora1st,
             .on_replace = OnReplaceCustomTAADraw,
             .on_draw = OnBeforeCustomTAADraw,
+            .on_drawn = OnDrawnCustomTAA,
         },
     },
     {
@@ -1159,6 +1207,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .code = __taa_custom_sora2nd,
             .on_replace = OnReplaceCustomTAADraw,
             .on_draw = OnBeforeCustomTAADraw,
+            .on_drawn = OnDrawnCustomTAA,
         },
     },
     // ── Kai SSR (fused march + temporal, replacement-gated; High + Ultra) ──
@@ -3586,7 +3635,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CustomTAAStaticFeedback", .binding = &shader_injection.custom_taa_static_feedback,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.95f, .label = "Static Feedback", .section = "Custom TAA",
+      .default_value = 0.85f, .label = "Static Feedback", .section = "Custom TAA",
       .tooltip = "TAA-5 history weight for static pixels: result = lerp(current, history, feedback). High values accumulate many frames on stable pixels.",
       .min = 0.f, .max = 0.99f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
@@ -3611,12 +3660,48 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "CustomTAASquaredMotionResponse", .binding = &shader_injection.custom_taa_squared_motion_response,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Squared Motion Response", .section = "Custom TAA",
+      .tooltip = "Motion-weight curve A/B: Off = linear (baseline), On = squared (same static/dynamic endpoints, more history at low/moderate motion). Applies to feedback and silhouette rejection together.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAADetailRestore", .binding = &shader_injection.custom_taa_detail_restore,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Detail Restore", .section = "Custom TAA",
+      .tooltip = "Feedback restoration experiment: restores history feedback toward Static on high-relative-detail pixels whose history agrees with current (flat or disagreeing pixels unchanged). 0 = prior behavior exactly; test value 8.0. Requires validation on.",
+      .min = 0.f, .max = 32.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAADetailTarget", .binding = &shader_injection.custom_taa_detail_target,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.95f, .label = "Detail Target", .section = "Custom TAA",
+      .tooltip = "Selective above-static accumulation experiment: high-detail, low-motion, history-agreeing pixels (and silhouette-valid) approach this feedback (~20-frame window at 0.95) without giving that window to the whole image. Equal to Static = off (exact prior behavior); test 0.95 against Static 0.85. Requires validation on.",
+      .min = 0.85f, .max = 0.99f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "CustomTAAOvershootSoftness", .binding = &shader_injection.custom_taa_overshoot_softness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 1.0f, .label = "Overshoot Softness", .section = "Custom TAA",
       .tooltip = "Selective-tolerance experiment (keep epsilon at 0.01 for A/B): history near the k-DOP hull keeps feedback and averages out flicker; history far outside loses feedback and stays responsive. 100 ~= prior behavior (not bit-exact), 1.0 = experiment default, 0.5 = stronger rejection.",
       .min = 0.25f, .max = 100.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAASilhouetteRejection", .binding = &shader_injection.custom_taa_silhouette_rejection,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.f, .label = "Silhouette Rejection", .section = "Custom TAA",
+      .tooltip = "Wrong-surface history experiment: attenuates history feedback where depth discontinuity meets motion (disocc = 1 - motionWeight * saturate(spread * k)). Static detail keeps history regardless of depth edges. 0 = prior behavior exactly.",
+      .min = 0.f, .max = 16.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3653,6 +3738,33 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Dev only: Normal, History only (is reconstruction working?), Clip factor (is k-DOP rejecting?), Adapt-Bilin x20 (where does adaptive differ from bilinear?), Full-Bilin x20 (where does full bicubic differ?).",
       .labels = {"Normal", "History", "Clip", "Adapt-Bilin", "Full-Bilin"},
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    // ── RCAS post-TAA sharpening (dedicated pass; never feeds TAA history) ──
+    new renodx::utils::settings::Setting{
+      .key = "RCASEnabled", .binding = &shader_injection.rcas_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Enable RCAS", .section = "Custom TAA",
+      .tooltip = "On = sharpening applies per the Sharpening slider. Off = forces 0 sharpening (passthrough); the stage machinery (history copy, t2 path) keeps running identically.",
+      .labels = {"Off", "On"},
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "RCASStrength", .binding = &shader_injection.rcas_strength,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.2f, .label = "Sharpening", .section = "Custom TAA",
+      .tooltip = "RCAS strength 0..1, linear response (0 = off/passthrough, 0.2 = mild). Each step adds roughly equal sharpening. Test 0 vs 0.20 on static/moving detail, foliage, thin geometry and HDR highlights; watch for ringing, halos and amplified shimmer.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "RCASDenoise", .binding = &shader_injection.rcas_denoise,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "RCAS Denoise", .section = "Custom TAA",
+      .tooltip = "Reference FSR_RCAS_DENOISE behavior: scales the lobe by the noise term (0.5..1.0), reducing sharpening where local variation looks grain-like. Off = reference default (full sharpening). May also soften legitimate fine detail such as grass/foliage texture.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3803,6 +3915,7 @@ static void OnDestroyDevice(reshade::api::device* device) {
     DestroyGTVBAOResources(device, d);
     DestroyDynCubeResources(device, d);
     DestroyDynCubeCache(device, d);
+    DestroyRCASResources(device, d);
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
     device->destroy_private_data<DeviceData>();
@@ -4456,6 +4569,9 @@ static void OnDestroyResource(reshade::api::device* device, reshade::api::resour
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
   KillAllTracked(d, 0u, res.handle);
+  // RCAS note: no per-resource tracking remains. The dispatch reads only the
+  // owned unsharpened copy; a dead game target is detected next TAA drawn via
+  // dims/format mismatch (set recreated) or desc query failure (skip frame).
 }
 
 // Present watchdog: proves render-thread stalls vs process death across silent gaps.
@@ -5213,11 +5329,273 @@ static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list) {
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
   if (!CustomTAAReplaceActive(cmd_list)) {
     s_custom_taa_was_active = false;
-    return true;
+  } else {
+    shader_injection.custom_taa_history_valid = s_custom_taa_was_active ? 1.f : 0.f;
+    s_custom_taa_was_active = true;
   }
-  shader_injection.custom_taa_history_valid = s_custom_taa_was_active ? 1.f : 0.f;
-  s_custom_taa_was_active = true;
+  // ── RCAS history isolation: serve the owned UNSHARPENED copy as t2 ──
+  // Runs only while Custom TAA is on (same gate as the stage itself). The
+  // sharpened temp/RT is never bound here; only rcas_hist_srv is.
+  if (shader_injection.custom_taa_enabled > 0.5f && (IsSora1st() || IsSora2nd())) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (auto* dd = dev->get_private_data<DeviceData>()) {
+        if (dd->rcas_have_copy && dd->rcas_hist_srv.handle) {
+          reshade::api::resource_view srv = dd->rcas_hist_srv;
+          cmd_list->push_descriptors(
+              reshade::api::shader_stage::pixel,
+              reshade::api::pipeline_layout{0}, 0,
+              reshade::api::descriptor_table_update{
+                  {}, 2u, 0, 1,
+                  reshade::api::descriptor_type::texture_shader_resource_view,
+                  &srv,
+              });
+        }
+      }
+    }
+  }
   return true;
+}
+
+// ═══════════ RCAS post-TAA sharpening — implementation (Stage 1) ═══════════
+// Per-frame flow (all inline, same command list, zero added latency):
+//  TAA draw completes (on_drawn) -> copy unsharpened TAA output to rcas_hist
+//  -> RCAS compute reads rcas_hist (owned, never RTV-bound: no D3D11
+//  SRV<->RTV binding hazard), writes rcas_temp -> copy rcas_temp back
+//  over the TAA output so downstream reads see sharpened pixels.
+// Next frame's TAA draw gets t2 overridden to rcas_hist_srv above, so TAA
+// history is always unsharpened. Sharpened data can never enter history:
+// rcas_temp/rcas_temp_srv are never bound as t2 anywhere in this file.
+
+static void DestroyRCASSet(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+  dv(d->rcas_temp_srv); dv(d->rcas_temp_uav); dr(d->rcas_temp_texture);
+  dv(d->rcas_hist_srv); dr(d->rcas_hist_texture);
+  d->rcas_w = 0u; d->rcas_h = 0u;
+  d->rcas_fmt = reshade::api::format::unknown;
+  d->rcas_have_copy = false;
+  d->rcas_format_logged = false;
+  d->rcas_dispatch_logged = false;
+}
+
+static void DestroyRCASResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  DestroyRCASSet(dev, d);
+  for (auto& t : d->rcas_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  if (d->rcas_pipeline.handle) { dev->destroy_pipeline(d->rcas_pipeline); d->rcas_pipeline = {}; }
+  if (d->rcas_layout.handle) { dev->destroy_pipeline_layout(d->rcas_layout); d->rcas_layout = {}; }
+  d->rcas_layout_version = 0u;
+}
+
+static void CreateRCASResources(reshade::api::device* dev, DeviceData* d,
+                                uint32_t w, uint32_t h, reshade::api::format fmt) {
+  DestroyRCASSet(dev, d);
+  if (!dev || !d || w == 0u || h == 0u || fmt == reshade::api::format::unknown) return;
+  auto mk = [&](reshade::api::format vfmt,
+                reshade::api::resource* res, reshade::api::resource_view* srv,
+                reshade::api::resource_view* uav) {
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_2d;
+    rd.texture = {w, h, 1, 1, vfmt, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, res)) return;
+    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, vfmt, 0, 1, 0, 1);
+    if (srv && !dev->create_resource_view(*res, reshade::api::resource_usage::shader_resource, vd, srv)) return;
+    if (uav) dev->create_resource_view(*res, reshade::api::resource_usage::unordered_access, vd, uav);
+  };
+  // Temp uses the linear (UAV-legal) variant; hist keeps the verbatim game
+  // format so RT<->hist copies stay bitwise and t2 decodes exactly as before.
+  mk(RCASLinearFormat(fmt), &d->rcas_temp_texture, &d->rcas_temp_srv, &d->rcas_temp_uav);
+  mk(fmt, &d->rcas_hist_texture, &d->rcas_hist_srv, nullptr);
+  if (!d->rcas_temp_texture.handle || !d->rcas_temp_uav.handle || !d->rcas_hist_texture.handle) {
+    DestroyRCASSet(dev, d);
+    return;
+  }
+  d->rcas_w = w; d->rcas_h = h; d->rcas_fmt = fmt;
+}
+
+static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d) {
+  using DR = reshade::api::descriptor_range;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using P = reshade::api::pipeline_layout_param;
+  if (!dev || !d) return false;
+  auto mkcs = [&](std::span<const uint8_t> bc, reshade::api::pipeline_layout lo, reshade::api::pipeline* out) -> bool {
+    if (bc.empty() || !lo.handle) return false;
+    if (out->handle != 0u) return true;
+    reshade::api::shader_desc sd = {};
+    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = "main";
+    reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
+    return dev->create_pipeline(lo, 1, &so, out);
+  };
+  if (d->rcas_layout.handle == 0u || d->rcas_layout_version != kRCASLayoutVersion) {
+    if (d->rcas_layout.handle) {
+      for (auto& t : d->rcas_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+      dev->destroy_pipeline_layout(d->rcas_layout); d->rcas_layout = {};
+      if (d->rcas_pipeline.handle) { dev->destroy_pipeline(d->rcas_pipeline); d->rcas_pipeline = {}; }
+    }
+    DR srv_r = {0,0,0,1,DS::all_compute,1,DT::texture_shader_resource_view};  // t0 TAA output
+    DR uav_r = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 sharpened temp
+    reshade::api::constant_range push_range = {};
+    push_range.binding = 0;
+    push_range.dx_register_index = 13;
+    push_range.dx_register_space = 0;
+    push_range.count = 4;  // con, width, height, denoise
+    push_range.visibility = DS::all_compute;
+    P p0, p1, pPush;
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
+    P params[3] = {p0,p1,pPush};
+    if (!dev->create_pipeline_layout(3, params, &d->rcas_layout)) return false;
+    d->rcas_layout_version = kRCASLayoutVersion;
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (d->rcas_tables[i].handle == 0u) {
+      if (!dev->allocate_descriptor_table(d->rcas_layout, i, &d->rcas_tables[i])) return false;
+    }
+  }
+#ifdef __RCASSharpenCS_EMBED_FILE
+  if (!__RCASSharpenCS.empty()) {
+    if (!mkcs(__RCASSharpenCS, d->rcas_layout, &d->rcas_pipeline)) {
+      CSLog("rcas", "pipeline create failed", true);
+      return false;
+    }
+  }
+#endif
+  return d->rcas_pipeline.handle != 0u;
+}
+
+// Runs inline on the TAA draw's own command list, immediately after the draw
+// completes: no added frame latency, strict ordering vs downstream readers.
+static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
+  // RCAS runs only while Custom TAA is on (it sharpens the custom TAA output
+  // specifically). Strength 0 is the off position (passthrough below).
+  if (!cmd_list) return;
+  if (shader_injection.custom_taa_enabled < 0.5f) return;
+  if (!IsSora1st() && !IsSora2nd()) return;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return;
+  reshade::api::resource_view rtv = d->rcas_last_rtv0;
+  if (!rtv.handle) return;
+  reshade::api::resource srcRes = dev->get_resource_from_view(rtv);
+  if (!srcRes.handle) return;
+  auto desc = dev->get_resource_desc(srcRes);
+  if (desc.type != reshade::api::resource_type::texture_2d) return;
+  if (desc.texture.samples != 1) {  // multisampled targets cannot be shader-loaded; skip
+    if (!d->rcas_format_logged) {
+      reshade::log::message(reshade::log::level::warning, "[RCAS] skip: multisampled TAA target");
+      d->rcas_format_logged = true;
+    }
+    return;
+  }
+  uint32_t w = desc.texture.width, h = desc.texture.height;
+  auto fmt = desc.texture.format;
+  if (w == 0u || h == 0u || fmt == reshade::api::format::unknown) return;
+  // Pipeline first: no barrier/copy may be issued unless the dispatch below
+  // is guaranteed to run. (Previously the pipeline check sat after the first
+  // barriers — a failure there could leave the target in a wrong state.)
+  if (!CreateRCASPipelineIfNeeded(dev, d)) {
+    if (!d->rcas_format_logged) {
+      reshade::log::message(reshade::log::level::warning, "[RCAS] skip: pipeline unavailable");
+      d->rcas_format_logged = true;
+    }
+    return;
+  }
+  // (Re)create the owned set when the TAA target changes shape. Game format is
+  // preserved for hist/copies; temp uses the linear variant (UAV-legal).
+  if (!d->rcas_temp_texture.handle || !d->rcas_temp_uav.handle
+      || d->rcas_w != w || d->rcas_h != h || d->rcas_fmt != fmt) {
+    CreateRCASResources(dev, d, w, h, fmt);
+    if (!d->rcas_temp_texture.handle || !d->rcas_temp_uav.handle) {
+      if (!d->rcas_format_logged) {
+        reshade::log::message(reshade::log::level::warning, "[RCAS] skip: owned target creation failed");
+        d->rcas_format_logged = true;
+      }
+      return;
+    }
+    if (!d->rcas_format_logged) {
+      reshade::log::message(reshade::log::level::info,
+        (std::string("[RCAS] target ") + std::to_string(w) + "x" + std::to_string(h)
+          + " fmt=" + std::to_string((int)fmt)
+          + " work=" + std::to_string((int)RCASLinearFormat(fmt))).c_str());
+      d->rcas_format_logged = true;
+    }
+  }
+  // Dispatch input is the owned UNSHARPENED copy (rcas_hist_srv, game format).
+
+  // 1) Save the UNSHARPENED output for next frame's t2 BEFORE sharpening.
+  cmd_list->barrier(srcRes, reshade::api::resource_usage::render_target,
+                    reshade::api::resource_usage::copy_source);
+  cmd_list->barrier(d->rcas_hist_texture, reshade::api::resource_usage::shader_resource,
+                    reshade::api::resource_usage::copy_dest);
+  cmd_list->copy_texture_region(srcRes, 0, nullptr, d->rcas_hist_texture, 0, nullptr);
+  cmd_list->barrier(d->rcas_hist_texture, reshade::api::resource_usage::copy_dest,
+                    reshade::api::resource_usage::shader_resource);
+  cmd_list->barrier(srcRes, reshade::api::resource_usage::copy_source,
+                    reshade::api::resource_usage::shader_resource);
+  d->rcas_have_copy = true;
+  // Enable toggle forces 0 sharpening (stage machinery above runs identically).
+  // Strength 0 is the off position: unsharpened output stays in place.
+  float effStrength = (shader_injection.rcas_enabled > 0.5f) ? shader_injection.rcas_strength : 0.f;
+  if (effStrength <= 0.0005f) return;
+
+  // 2) RCAS compute: reads the owned unsharpened copy (t0), writes temp (u0).
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->rcas_pipeline);
+  reshade::api::descriptor_table_update ups[2];
+  ups[0] = {d->rcas_tables[0], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->rcas_hist_srv};
+  ups[1] = {d->rcas_tables[1], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->rcas_temp_uav};
+  dev->update_descriptor_tables(2, ups);
+  std::array<reshade::api::descriptor_table, 2> tables = {d->rcas_tables[0], d->rcas_tables[1]};
+  cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->rcas_layout, 0, 2, tables.data());
+  {
+    // Linear response: con = S directly (visible effect is ~linear in con
+    // pre-clamp). S=0 never reaches here (passthrough early-out above);
+    // S=1 matches the old mapping's maximum exactly.
+    float s = std::clamp(effStrength, 0.f, 1.f);
+    float dn = (shader_injection.rcas_denoise > 0.5f) ? 1.f : 0.f;
+    float pc[4] = {s, (float)w, (float)h, dn};  // con, width, height, denoise
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, d->rcas_layout, 2, 0, 4, pc);
+    if (!d->rcas_dispatch_logged) {
+      reshade::log::message(reshade::log::level::info,
+        (std::string("[RCAS] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)
+          + " con=" + std::to_string(pc[0])
+          + " tables=" + std::to_string(d->rcas_tables[0].handle) + "/" + std::to_string(d->rcas_tables[1].handle)
+          + " src=" + std::to_string(srcRes.handle)).c_str());
+      d->rcas_dispatch_logged = true;
+    }
+  }
+  cmd_list->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+
+  // 3) Publish: copy sharpened temp back over the TAA output so downstream
+  // reads see sharpened pixels. History already saved unsharpened in (1).
+  cmd_list->barrier(d->rcas_temp_texture, reshade::api::resource_usage::unordered_access,
+                    reshade::api::resource_usage::copy_source);
+  cmd_list->barrier(srcRes, reshade::api::resource_usage::shader_resource,
+                    reshade::api::resource_usage::copy_dest);
+  cmd_list->copy_texture_region(d->rcas_temp_texture, 0, nullptr, srcRes, 0, nullptr);
+  cmd_list->barrier(srcRes, reshade::api::resource_usage::copy_dest,
+                    reshade::api::resource_usage::render_target);
+  cmd_list->barrier(d->rcas_temp_texture, reshade::api::resource_usage::copy_source,
+                    reshade::api::resource_usage::unordered_access);
+}
+
+// Latest-bound RTV0 tracker for the RCAS stage (D3D11 immediate-list
+// assumption, same as the rest of this file's per-frame capture logic:
+// binds and draws are ordered on one list, and on_draw fires after binds).
+static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32_t count,
+                                    const reshade::api::resource_view* rtvs,
+                                    reshade::api::resource_view /*dsv*/) {
+  if (!cmd_list || !rtvs) return;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return;
+  d->rcas_last_rtv0 = (count > 0) ? rtvs[0] : reshade::api::resource_view{};
 }
 
 // ── Kai SSR Replacement (fused march + temporal composites, High + Ultra) ──
@@ -8356,6 +8734,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       break;
@@ -8369,6 +8748,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       reshade::unregister_addon(h_module);

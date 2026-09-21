@@ -41,9 +41,10 @@ void main(
 
   // --- Reproject (game coordinate convention, custom code) ---
   float motionPixels = 0.0;
+  float depthSpread = 0.0;
   float2 historyUV = CustomTAA_Reproject(
       uv, depthTexture, samPoint_s, motionTexture, samLinear_s,
-      texelSize, prevResolutionScale_g.xy, motionPixels);
+      texelSize, prevResolutionScale_g.xy, motionPixels, depthSpread);
 
   float3 current = colorTexture.SampleLevel(samLinear_s, uv, 0).xyz;
 
@@ -97,6 +98,11 @@ void main(
   // --- Validate against the current 3x3 neighborhood ---
   float clipT = 1.0;
   float overshootR = 0.0;
+  // Detail gate for feedback restoration (experiment): HDR-safe relative
+  // detail from the already-gathered 3x3 (zero new taps). Computed inside this
+  // block where the neighborhood array is live; stays 0 when validation is
+  // off (no agreement signal there). Default 0 = exact prior behavior.
+  float detailGate = 0.0;
   int clipMode = (int)(shader_injection_data.custom_taa_clip_mode + 0.5);
   if (clipMode != CUSTOM_TAA_CLIP_NONE) {
     float3 neighborhood[9];
@@ -124,6 +130,20 @@ void main(
       }
       history = CustomTAA_ClipToExtents(current, history, minC, maxC, clipT, overshootR);
     }
+    // Relative detail: max channel range over center luma (vanilla luma
+    // weights, 1e-2 floor against near-black noise). Bright smooth regions
+    // read low even when their absolute range is large; dark textured detail
+    // reads high. Test value 8.0 opens fully at relativeDetail 0.125.
+    float3 nMin = neighborhood[0];
+    float3 nMax = neighborhood[0];
+    [unroll]
+    for (int q = 1; q < 9; ++q) {
+      nMin = min(nMin, neighborhood[q]);
+      nMax = max(nMax, neighborhood[q]);
+    }
+    float detailRange = max(nMax.x - nMin.x, max(nMax.y - nMin.y, nMax.z - nMin.z));
+    float refLuma = max(dot(current, float3(0.299, 0.587, 0.114)), 1e-2);
+    detailGate = saturate((detailRange / refLuma) * shader_injection_data.custom_taa_detail_restore);
   }
 
   if (shader_injection_data.custom_taa_debug > 1.5) {
@@ -137,6 +157,13 @@ void main(
   // dynamicFeedback to cut trailing/temporal softness. Independent of the
   // vanilla static/dynamic/motionSensitivity equations by design.
   float motionWeight = saturate(motionPixels * shader_injection_data.custom_taa_motion_scale);
+  // Squared-response A/B: same endpoints (0 -> static, saturated -> dynamic),
+  // more history at low/moderate motion when enabled. Single variable, so
+  // silhouette rejection softens mid-curve too -- judge ghosting with that
+  // coupling in mind.
+  if (shader_injection_data.custom_taa_squared_motion_response > 0.5) {
+    motionWeight = motionWeight * motionWeight;
+  }
   float adaptiveFeedback = lerp(shader_injection_data.custom_taa_static_feedback,
                                 shader_injection_data.custom_taa_dynamic_feedback,
                                 motionWeight);
@@ -147,7 +174,28 @@ void main(
   // bit-exact: the divisor is never exactly 1). Clip boundary itself untouched.
   float softK = max(shader_injection_data.custom_taa_overshoot_softness, 1e-4);
   float overshootScale = 1.0 / (1.0 + (overshootR / softK) * (overshootR / softK));
-  float feedback = clamp(adaptiveFeedback * overshootScale, 0.0, 0.99);
+  // Silhouette rejection (wrong-surface history experiment): depth
+  // discontinuity alone never rejects (static detail keeps history); it only
+  // attenuates feedback in proportion to motion. kSpread=0 reproduces prior
+  // behavior exactly. Screen-edge term deliberately not included.
+  float disocc = 1.0 - motionWeight * saturate(depthSpread * shader_injection_data.custom_taa_silhouette_rejection);
+  // Restoration requires history agreement (overshootScale), so
+  // detailed-but-changed pixels are NOT boosted.
+  float restoreGate = detailGate * overshootScale;
+  float feedback = clamp(adaptiveFeedback * overshootScale * disocc, 0.0, 0.99);
+  feedback = lerp(feedback, shader_injection_data.custom_taa_static_feedback, saturate(restoreGate));
+  // Selective above-static accumulation (experiment): high-detail, low-motion,
+  // history-agreeing pixels approach detailTarget (~20-frame window) without
+  // giving that window to the whole image. All gates must agree -- detail,
+  // validation (overshootScale AND silhouette disocc), stillness -- and the
+  // branch is skipped entirely at default (target == static), preserving exact
+  // prior behavior. Silhouette rejection is never bypassed: disocc attenuates
+  // the base feedback first and also closes this gate.
+  float detailTarget = shader_injection_data.custom_taa_detail_target;
+  if (detailTarget > shader_injection_data.custom_taa_static_feedback) {
+    float boostGate = detailGate * overshootScale * disocc * (1.0 - motionWeight);
+    feedback = lerp(feedback, min(detailTarget, 0.99), saturate(boostGate));
+  }
   float3 result = lerp(current, history, feedback);
   o0 = float4(clamp(result, 0.0, 65472.0), 1.0);
 }
