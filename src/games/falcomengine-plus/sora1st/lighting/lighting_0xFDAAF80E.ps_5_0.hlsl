@@ -584,6 +584,7 @@ void main(
         r3.z = r3.z * r3.z;
         r3.z = r3.z * r9.w;
         r3.z = density_g * r3.z;
+        r3.z = r3.z * shader_injection_data.char_outline_intensity;
         r3.z = min(1, r3.z);
         r3.z = r3.z * r3.w;
         r3.w = 1 + -r8.x;

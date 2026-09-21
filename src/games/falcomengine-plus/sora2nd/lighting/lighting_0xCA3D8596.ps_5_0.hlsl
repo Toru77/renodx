@@ -648,6 +648,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r5.y = r5.y * r5.y;
         r5.y = r5.y * r12.w;
         r5.y = density_g * r5.y;
+        r5.y = r5.y * shader_injection_data.char_outline_intensity;
         r5.y = min(1, r5.y);
         r5.y = r5.y * r5.z;
         r5.z = 1 + -r11.x;

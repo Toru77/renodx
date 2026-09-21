@@ -359,6 +359,7 @@ struct ShaderInjectData {
   float gtvbao_optimization;               // 0=original dispatch/barrier behavior, 1=skip provably-dead copies/barriers (appended last: do not insert above)
   float custom_shader_logging;             // 0=Off, 1=On - throttled step log (GTVBAO + DynCube + SSR) for crash diagnosis (appended last: do not insert above)
   float dynCube_sparkle_rejection;         // 0=off, 1=reject isolated HDR spikes at depth edges + non-finite input, no HDR caps (appended last: do not insert above)
+  float char_outline_intensity;            // [0..1], 1=vanilla outline strength, applied before saturate (appended last: do not insert above)
 };
 
 #ifndef __cplusplus

@@ -330,6 +330,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_optimization = 1.f,
   .custom_shader_logging = 0.f,
   .dynCube_sparkle_rejection = 0.f,
+  .char_outline_intensity = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3509,6 +3510,14 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    // ── Character Outline (Sora 1st / 2nd) ──
+    new renodx::utils::settings::Setting{
+      .key = "CharOutlineIntensity", .binding = &shader_injection.char_outline_intensity,
+      .default_value = 1.f, .label = "Outline Intensity", .section = "Character Outline",
+      .tooltip = "Scales the character outline blend weight before saturate. 0 = no outline, 1 = vanilla strength.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
