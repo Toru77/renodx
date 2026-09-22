@@ -1,29 +1,21 @@
 // RCASSharpenCS.cs_5_0.hlsl — post-TAA Robust Contrast Adaptive Sharpening.
 //
-// RCAS mathematics ported from AMD FidelityFX Super Resolution 1 (FSR 1)
-// ffx_fsr1.h, function FsrRcasF (32-bit float path) with FsrRcasCon sharpness
-// setup done on the CPU side (see addon.cpp RunRCASAfterTAA):
-//   Copyright (c) 2021 Advanced Micro Devices, Inc. (MIT License).
-// Only FSR_RCAS_F + PASSTHROUGH_ALPHA behavior is ported; EASU, CAS,
-// FSR_RCAS_DENOISE and the 16-bit packed path are intentionally not used.
-//
-// Deviations from the reference (deliberate, documented):
-// 1. Loads are integer texel loads (compute) instead of sampler fetches.
-// 2. Exact 1.0/x replaces the APrxMedRcp/ARcp approximations.
-// 3. The noise term (nz) is computed but only applied when g_denoise is on
-//    (reference FSR_RCAS_DENOISE behavior, default off; film grain, if any,
-//    belongs after sharpening per AMD guidance).
-// 4. HDR peak adaptation: reference solves the lobe limiter against a {0,1}
-//    range (peakC = 1.0). Here peak = max(1.0, localMax) per channel, so LDR
-//    input reproduces the reference exactly while HDR highlights keep a
-//    meaningful anti-clip limiter instead of a miscalibrated one.
-// 5. No output clamp exists in the reference and none is added here: HDR
-//    values pass through unclipped. Alpha is passed through untouched.
+// Thin wrapper over rcas_common.hlsli (single shared RCAS implementation,
+// also consumed by the Sora2nd temporal-upscaling blit). Behavior is
+// bit-identical to the former inline implementation: same taps, same order,
+// same equations. See rcas_common.hlsli for the math and its deliberate
+// deviations from AMD FidelityFX FSR 1 ffx_fsr1.h (MIT, AMD).
 //
 // This pass NEVER feeds TAA history: it reads the finished TAA output and
 // writes an owned temp resource. History isolation is enforced CPU-side
 // (addon.cpp): the unsharpened TAA output is copied to a separate history
 // buffer before sharpening, and only that copy is ever bound as t2.
+//
+// NOTE (temporal upscaler era): this compute pass now serves Sora1st only,
+// plus Sora2nd while its blit upscaler is off. Sora2nd with the upscaler on
+// sharpens inside the blit via the same shared core (no double sharpening).
+
+#include "rcas_common.hlsli"
 
 cbuffer RCASCB : register(b13) {
   float g_con;     // base lobe multiplier 0..1 from UI Sharpening (linear).
@@ -47,8 +39,6 @@ cbuffer RCASCB : register(b13) {
 Texture2D<float4> g_src : register(t0);     // unsharpened TAA output
 Texture2D<float4> g_motion : register(t1);  // game motion buffer (texel units, jitter-inclusive)
 RWTexture2D<float4> g_dst : register(u0);   // owned sharpened temp target
-
-#define RCAS_LIMIT (0.25 - (1.0 / 16.0))
 
 float4 RCASLoad(int2 p, int2 dims) {
   p = clamp(p, int2(0, 0), dims - int2(1, 1));
@@ -93,46 +83,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
   float3 f = RCASLoad(sp + int2(1, 0), dims).rgb;
   float3 h = RCASLoad(sp + int2(0, 1), dims).rgb;
 
-  // Luma + noise term, computed only when denoise is on (default off):
-  // zero output change when off (nz unused there), ~10 ALU saved per pixel.
-  // Noise detection: reference equations, exact rcp instead of the
-  // approximation. Normalized high-pass in [0,1], shaped to nz in
-  // [0.5,1.0]: structured edges keep ~1.0, grain-like variation drops
-  // toward 0.5. Only applied when g_denoise is on (reference default off).
-  float nz = 1.0;
-  if (g_denoise > 0.5) {
-    // Luma times 2 (reference weights, verbatim).
-    float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
-    float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
-    float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
-    float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
-    float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
-    nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
-    nz = saturate(abs(nz) / max(max(max(bL, dL), max(eL, max(fL, hL)))
-        - min(min(bL, dL), min(eL, min(fL, hL))), 1e-6));
-    nz = -0.5 * nz + 1.0;
-  }
-
-  // Min and max of ring (per channel).
-  float3 mn4 = min(min(b, d), min(f, h));
-  float3 mx4 = max(max(b, d), max(f, h));
-
-  // Limiter peaks: reference peakC.x = 1.0. Generalized to
-  // peak = max(1.0, localMax) so LDR matches the reference exactly
-  // while HDR keeps headroom-aware limiting. peakC.y = -4*peak.
-  float3 peak = max(float3(1.0, 1.0, 1.0), max(mx4, e));
-  float3 hitMin = min(mn4, e) / (4.0 * mx4);
-  float3 hitMax = (peak - max(mx4, e)) / (4.0 * mn4 - 4.0 * peak);
-  float3 lobe3 = max(-hitMin, hitMax);
-  // HLSL max() follows fmax semantics (non-NaN wins), matching the
-  // reference behavior on degenerate flat fields (e.g. mn == peak).
-  float lobe = max(-RCAS_LIMIT, min(max(lobe3.x, max(lobe3.y, lobe3.z)), 0.0)) * con;
-  if (g_denoise > 0.5) {
-    lobe *= nz;
-  }
-
-  // Resolve (reference equation, verbatim).
-  float rcpL = 1.0 / (4.0 * lobe + 1.0);
-  float3 outColor = (lobe * (b + d + f + h) + e) * rcpL;
+  float3 outColor = RCASSharpen(b, d, e, f, h, con, (g_denoise > 0.5f) ? 1.0f : 0.0f);
   g_dst[sp] = float4(outColor, alpha);
 }
