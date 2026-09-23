@@ -1,20 +1,17 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// falcomengine-plus GTVBAO — Half-res upscale 4-TAP JOINT (A/B diagnostic)
+// falcomengine-plus GTVBAO — Half-res upscale (4-TAP JOINT)
 //
-// Bilinear-neighborhood counterpart to gtvbao_upscale.cs (5x5 Joint): per
-// full-res pixel, the four surrounding half-res texels are combined with
-// ordinary bilinear spatial weights multiplied by the SAME geometry-aware
-// terms as the 5x5 mode (plane/depth compatibility, normal compatibility),
-// normalized, with shared weights for AO and GI.
+// Per full-res pixel, the four surrounding half-res texels are combined with
+// ordinary bilinear spatial weights multiplied by geometry-aware terms
+// (plane/depth compatibility, normal compatibility), normalized, with shared
+// weights for AO and GI.
 //
 //   weight = bilinearWeight * exp(-|dot(Nf, Plow-Pf)| * sigma)
 //                             * pow(saturate(dot(Nf, Nlow)), power)
 //
-// Same bindings as the 5x5 upscale (upscale_layout: 5 SRV + 3 UAV) so it
-// plugs into the same descriptor tables; only the pipeline object differs.
-// Geometry mapping (half->full block centers, odd-safe point loads) matches
-// the 5x5 mode; the ONLY intended difference is the 4-tap bilinear footprint
-// versus the 25-tap footprint.
+// Geometry mapping (half->full block centers, odd-safe point loads).
+// Requires pre-decoded full-res normals (normal_prep), so the CPU always runs
+// the normal-prep pass before this dispatch when the à-trous chain is off.
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "gtvbao_common.hlsl"
@@ -148,7 +145,7 @@ void main(uint2 dt : SV_DispatchThreadID) {
   g_outFullAO[dt] = (uint)(aoOut * 255.0f + 0.5f);
   g_outFullGI[dt] = giOut;
 
-  // ── Diagnostics (same numbering/display mapping as the 5x5 mode) ──
+  // ── Diagnostics ──
   if (wantDbg) {
     int dbg = (int)GTVBAO_upscale_debug;
     float4 dbgOut = float4(0, 0, 0, 0);

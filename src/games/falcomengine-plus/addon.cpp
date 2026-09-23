@@ -368,11 +368,10 @@ ShaderInjectData shader_injection = {
   .fxaa_edge_threshold = 0.166f,
   .fxaa_edge_threshold_min = 0.0625f,
   // —— GTVBAO half-resolution spatial pipeline defaults: Full = existing behavior ——
-  .gtvbao_resolution = 0.f,
+  .gtvbao_resolution = 1.f,
   .gtvbao_upscale_plane_sigma = 40.f,
   .gtvbao_upscale_normal_power = 16.f,
   .gtvbao_upscale_debug = 0.f,
-  .gtvbao_upscale_mode = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -642,9 +641,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view upscale_gi_srv = {};
   reshade::api::resource_view upscale_gi_uav = {};
   reshade::api::pipeline_layout upscale_layout = {};
-  reshade::api::pipeline upscale_pipeline = {};
-  reshade::api::pipeline upscale_nearest_pipeline = {};  // temporary A/B diagnostic
-  reshade::api::pipeline upscale_4tap_pipeline = {};      // 4-tap joint A/B diagnostic
+  reshade::api::pipeline upscale_pipeline = {};  // 4-Tap joint reconstruction (Half mode)
   GTVBAODescriptorTableSet upscale_tables = {};
 
   reshade::api::pipeline_layout prefilter_layout = {};
@@ -2290,18 +2287,10 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
-      .tooltip = "Full = existing full-resolution AO/GI. Half = half-resolution AO/GI with full-resolution joint reconstruction.",
+      .default_value = 1.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
+      .tooltip = "Half is recommended at high or native resolutions, but it halves whatever resolution you render at, so it can get very low when upscaling is enabled.",
       .labels = {"Full", "Half"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOUpscaleMode", .binding = &shader_injection.gtvbao_upscale_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Half-Res Reconstruction", .section = "GTVBAO",
-      .tooltip = "Temporary A/B diagnostic for reconstruction cost. 5x5 Joint = production joint bilateral (default). Nearest = minimal point sampling (lower quality). 4-Tap Joint = bilinear-neighborhood joint reconstruction. No effect in Full mode.",
-      .labels = {"5x5 Joint", "Nearest", "4-Tap Joint"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_resolution > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOUpscalePlaneSigma", .binding = &shader_injection.gtvbao_upscale_plane_sigma,
@@ -4373,6 +4362,20 @@ static void DestroyGTVBAODescriptorTables(
   for (auto& t : *tables) {
     if (t.handle) { device->free_descriptor_table(t); t = {}; }
   }
+}
+
+// The half-res GI chain (raw -> denoised -> full upscale) is usable only when
+// the half denoised texture exists AND both of its views were created. The
+// texture, SRV and UAV come from separate create calls, so they are not
+// guaranteed to succeed together; if only some exist, a consumer that picks
+// its target from a different subset silently reads or writes a different
+// buffer than its neighbour. Every GI consumer must therefore derive its
+// target from this single predicate.
+static bool GTVBAO_GiHalfChainReady(const DeviceData* d, bool half_mode) {
+  return half_mode
+      && d->vbgi_denoised_half_texture.handle
+      && d->vbgi_denoised_half_srv.handle
+      && d->vbgi_denoised_half_uav.handle;
 }
 
 // ── Vanilla env-cube identification (strict) ──
@@ -6601,22 +6604,17 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // shows the reconstructed full-res GI (same t23 slot as Full mode).
   const bool half_gi_active = shader_injection.gtvbao_resolution > 0.5f
       && dd->upscale_gi_srv.handle;
-  // Upscale reconstruction diagnostics: first priority so sliding the control
-  // shows it immediately without requiring another debug view to be set.
+  // Upscale reconstruction diagnostics are lowest priority so an explicitly
+  // requested VBGI/GTVBAO debug view is never silently overridden.
   // Sora/Kyoto replace via gtvbao_vbgi_debug; Kai/Daybreak2 via the widened
   // vbgi_debug_view || gtvbao_upscale_debug checks in their lighting shaders.
   const bool upscale_dbg_active = half_gi_active
       && shader_injection.gtvbao_upscale_debug > 0.5f
       && dd->debug_srv.handle;
-  if (upscale_dbg_active) {
-    push_srv = dd->debug_srv;
-    do_push = true;
-    debug_replace = true;
-  }
-  else if (shader_injection.vbgi_debug_view > 0.5f) {
+  if (shader_injection.vbgi_debug_view > 0.5f) {
     int dv = (int)shader_injection.vbgi_debug_view;
     if (dv == 1)      push_srv = dd->vbgi_output_srv;
-    else if (dv == 2) push_srv = (half_gi_active && dd->vbgi_denoised_half_srv.handle)
+    else if (dv == 2) push_srv = GTVBAO_GiHalfChainReady(dd, half_gi_active)
         ? dd->vbgi_denoised_half_srv : dd->vbgi_denoised_srv;
     else if (dv == 3) push_srv = dd->captured_color_srv.handle
         ? dd->captured_color_srv : dd->captured_light_buffer_srv;
@@ -6629,6 +6627,11 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   }
   // Bitmask debug views 6-8: push dedicated debug UAV output.
   else if (shader_injection.gtvbao_debug_view > 5.5f && shader_injection.gtvbao_debug_view < 8.5f) {
+    push_srv = dd->debug_srv;
+    do_push = true;
+    debug_replace = true;
+  }
+  else if (upscale_dbg_active) {
     push_srv = dd->debug_srv;
     do_push = true;
     debug_replace = true;
@@ -7029,6 +7032,14 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
        &d->upscale_ao_texture, &d->upscale_ao_srv, &d->upscale_ao_uav);
     mk(w, h, reshade::api::format::r16g16b16a16_float,
        &d->upscale_gi_texture, &d->upscale_gi_srv, &d->upscale_gi_uav);
+    // Texture/SRV/UAV are separate create calls; report partial failure
+    // explicitly instead of letting the GI chain degrade silently later.
+    if (!GTVBAO_GiHalfChainReady(d, true)
+        || !d->upscale_ao_uav.handle || !d->upscale_gi_uav.handle) {
+      reshade::log::message(reshade::log::level::error,
+          "[GTVBAO] Half-res reconstruction resources incomplete — "
+          "VBGI reconstruction will be unavailable in Half mode.");
+    }
   }
   // Foliage mask (full-res R8_UINT)
   mk(w, h, reshade::api::format::r8_uint,
@@ -7078,7 +7089,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dv(d->vbgi_denoised_half_srv); dv(d->vbgi_denoised_half_uav); dr(d->vbgi_denoised_half_texture);
   dv(d->upscale_ao_srv); dv(d->upscale_ao_uav); dr(d->upscale_ao_texture);
   dv(d->upscale_gi_srv); dv(d->upscale_gi_uav); dr(d->upscale_gi_texture);
-  dp(d->upscale_pipeline); dp(d->upscale_nearest_pipeline); dp(d->upscale_4tap_pipeline); dl(d->upscale_layout);
+  dp(d->upscale_pipeline); dl(d->upscale_layout);
   DestroyGTVBAODescriptorTables(dev, &d->upscale_tables);
   dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
   dv(d->multibounce_srv); dv(d->multibounce_uav); dr(d->multibounce_texture);
@@ -8705,12 +8716,12 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 75> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f,
                                                        bool foliage_mask_valid = false,
                                                        int denoise_stage = 0,
                                                        float atrous_step = 1.f) {
-  std::array<float, 75> c = {};
+  std::array<float, 74> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -8803,7 +8814,6 @@ static std::array<float, 75> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[71] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
   c[72] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
   c[73] = shader_injection.gtvbao_upscale_debug;
-  c[74] = std::clamp(shader_injection.gtvbao_upscale_mode, 0.f, 2.f);  // temporary A/B
   return c;
 }
 
@@ -8832,8 +8842,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->atrous_pipeline);
   dp(d->normal_prep_pipeline);
   dp(d->upscale_pipeline);
-  dp(d->upscale_nearest_pipeline);
-  dp(d->upscale_4tap_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -8870,7 +8878,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 54;
+    push_constants_range.count = 74;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -8929,8 +8937,6 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->normal_prep_pipeline.handle) mkcs(__gtvbao_normal_prep, "main", d->normal_prep_layout, &d->normal_prep_pipeline);
   if (!d->multibounce_pipeline.handle)   mkcs(__gtvbao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
   if (!d->upscale_pipeline.handle) mkcs(__gtvbao_upscale, "main", d->upscale_layout, &d->upscale_pipeline);
-  if (!d->upscale_nearest_pipeline.handle) mkcs(__gtvbao_upscale_nearest, "main", d->upscale_layout, &d->upscale_nearest_pipeline);
-  if (!d->upscale_4tap_pipeline.handle) mkcs(__gtvbao_upscale_4tap, "main", d->upscale_layout, &d->upscale_4tap_pipeline);
 
   // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
   // no separate VBGI pipeline needed — main_layout handles both AO and GI outputs.
@@ -9182,7 +9188,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
@@ -9210,7 +9216,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       reshade::log::message(reshade::log::level::info, msg.c_str());
     }
 
-    if (mb_enabled && mb_gi_ready && mb_pipe_ok && !skip_multibounce) {
+    // Skip the full-res accumulate when VBGI is effectively off and no consumer
+    // can observe it. Exempted: debug view 4 (reads the accumulator) and
+    // Albedo adaptive mode (samples t2 in main even with GI off).
+    const bool mb_unused = ssgi_enabled_this_frame < 0.5f
+        && (int)shader_injection.vbgi_debug_view != 4
+        && shader_injection.vbgi_adaptive_mode < 0.5f;
+    if (mb_enabled && mb_gi_ready && mb_pipe_ok && !skip_multibounce && !mb_unused) {
       bind_pipe(d->multibounce_pipeline);
       reshade::api::resource_view acc_color = mb_color_ok
           ? d->captured_color_srv : d->fallback_srv;
@@ -9232,7 +9244,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
       };
       apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
-      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 75,
+      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 74,
                          BuildGTVBAOPushConstants(d, false).data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->multibounce_texture, UA, SR);
@@ -9265,7 +9277,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
+    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
     cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
     bar(d->foliage_mask_texture, UA, SR);
   }
@@ -9340,7 +9352,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid);
-    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -9389,12 +9401,37 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         && d->atrous_pipeline.handle != 0u;
     // Half mode: GI denoise targets the half-res denoised buffer; the
     // full-res upscale result feeds t23 + next-frame multibounce instead.
-    reshade::api::resource_view gi_denoised_uav = d->vbgi_denoised_uav.handle
-        ? d->vbgi_denoised_uav : d->fallback_uav;
-    reshade::api::resource gi_denoised_tex = d->vbgi_denoised_texture;
-    if (half_mode && d->vbgi_denoised_half_uav.handle) {
-      gi_denoised_uav = d->vbgi_denoised_half_uav;
-      gi_denoised_tex = d->vbgi_denoised_half_texture;
+    // Target selection is shared with the upscale t1 read and the t23 debug
+    // view so the tail can never write a different buffer than they read.
+    const bool gi_half_chain = GTVBAO_GiHalfChainReady(d, half_mode);
+    reshade::api::resource_view gi_denoised_uav = gi_half_chain
+        ? d->vbgi_denoised_half_uav
+        : (d->vbgi_denoised_uav.handle ? d->vbgi_denoised_uav : d->fallback_uav);
+    reshade::api::resource gi_denoised_tex = gi_half_chain
+        ? d->vbgi_denoised_half_texture
+        : d->vbgi_denoised_texture;
+    {
+      static uint32_t logged_w = 0u, logged_h = 0u;
+      if (w != logged_w || h != logged_h) {
+        logged_w = w; logged_h = h;
+        // SRV and UAV come from separate create calls; identity mismatch means
+        // the tail writes a different texture than the upscale samples.
+        const uint64_t r_half_srv = d->vbgi_denoised_half_srv.handle
+            ? dev->get_resource_from_view(d->vbgi_denoised_half_srv).handle : 0u;
+        const uint64_t r_half_uav = d->vbgi_denoised_half_uav.handle
+            ? dev->get_resource_from_view(d->vbgi_denoised_half_uav).handle : 0u;
+        std::ostringstream ids;
+        ids << std::hex << r_half_srv << "/" << r_half_uav;
+        reshade::log::message(reshade::log::level::info,
+          (std::string("[GTVBAO] GI tail: halfMode=") + (half_mode ? "1" : "0")
+           + " target=" + (gi_half_chain ? "HALF" : "FULL")
+           + " halfTex=" + (d->vbgi_denoised_half_texture.handle ? "ok" : "NULL")
+           + " halfSRV=" + (d->vbgi_denoised_half_srv.handle ? "ok" : "NULL")
+           + " halfUAV=" + (d->vbgi_denoised_half_uav.handle ? "ok" : "NULL")
+           + " resSRV/UAV=" + ids.str()
+           + (r_half_srv == r_half_uav ? " MATCH" : " MISMATCH")
+           + " aw=" + std::to_string(aw) + " ah=" + std::to_string(ah)).c_str());
+      }
     }
 
     // ── À-trous helpers (spatial-only) ──
@@ -9412,7 +9449,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
       auto pc_np = BuildGTVBAOPushConstants(d, false);
-      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_np.data());
+      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_np.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->normal_prep_texture, UA, SR);
     };
@@ -9439,7 +9476,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         apply_descriptors(d->atrous_layout, &d->atrous_tables, 4, au);
         auto pc_a = BuildGTVBAOPushConstants(d, last_iter, -1.f, false, /*stage*/0,
                                              /*step*/float(1 << i));
-        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_a.data());
+        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_a.data());
         cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
         bar(a_dst_tex, UA, SR);
         cur_b = !cur_b;
@@ -9458,8 +9495,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       // GI bilateral): skip bind/push/dispatch, keep flags/barriers downstream.
       if (shader_injection.vbgi_enabled > 0.5f) {
       bind_pipe(last_pipe);
+      // t0 supplies working dimensions only: BuildGTAOConstants reads its
+      // size, and the stage-4 body never samples it. Binding the 1x1 fallback
+      // made ViewportPixelSize (1,1) and collapsed every GI edge-stop depth
+      // sample onto one edge texel, so bind the real half-res AO term.
+      reshade::api::resource_view gi_tail_ao_src = d->gtvbao_final_in_b
+          ? d->ao_term_b_srv : d->ao_term_a_srv;
       reshade::api::resource_view sv_g[6] = {
-          d->fallback_srv,                                                    // t0 AO (unused by stage 4)
+          gi_tail_ao_src.handle ? gi_tail_ao_src : d->fallback_srv,           // t0 half AO (dims only)
           d->edges_srv,                                                       // t1 depth for GI filter
           d->vbgi_output_srv.handle ? d->vbgi_output_srv : d->fallback_srv,   // t2 raw GI
           d->fallback_srv, d->depth_mips_srv,
@@ -9475,11 +9518,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u_g);
       auto pc_g = BuildGTVBAOPushConstants(d, true, -1.f, false, /*stage*/4);
-      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_g.data());
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_g.data());
       // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the grid.
       cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
       }  // end GI-on stage-4 dispatch
-      // vbgi_denoised barrier happens after the Pass-3 block.
+      // The vbgi_denoised UAV->SR barrier is emitted at the top of the
+      // upscale block below, so it lands after this write but before any
+      // descriptor that samples the buffer is published.
     } else {
       // ── Spatial bilateral chain (Poisson / temporal removed). ──
       bool use_a = true;
@@ -9507,7 +9552,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         };
         apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
         auto pc = BuildGTVBAOPushConstants(d, last, -1.f, false, /*stage*/0);
-        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
+        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
         // denoise_last threads cover 2 px each: halve the grid (bounds-fail covers overhang).
         cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
         bar(dst_tex, UA, SR);
@@ -9518,27 +9563,33 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       }
     }
 
-    // —— Half mode: full-resolution joint reconstruction (5x5 bilateral) ——
+    // —— Half mode: full-resolution joint reconstruction (4-Tap) ——
     // Half AO/GI (+ half denoise above) -> full AO/GI for t22/t23 +
-    // next-frame multibounce. Bilateral path needs pre-decoded normals too.
-    // Temporary A/B: 0=5x5 Joint (default), 1=Nearest, 2=4-Tap Joint.
-    // Nearest bypasses the 5x5 joint reconstruction (and the bilateral-only
-    // normal prep, which exists solely to serve joint reconstruction, so the
-    // measured delta isolates the reconstruction cost). 4-Tap needs the prep.
-    const int up_mode = (int)std::clamp(shader_injection.gtvbao_upscale_mode + 0.5f, 0.f, 2.f);
-    reshade::api::pipeline up_pipe = (up_mode == 2)
-        ? d->upscale_4tap_pipeline
-        : ((up_mode == 1) ? d->upscale_nearest_pipeline : d->upscale_pipeline);
+    // next-frame multibounce. The joint reconstruction consumes pre-decoded
+    // full-res normals, so the normal prep must run when the à-trous chain
+    // (which produces them) is off.
+    reshade::api::pipeline up_pipe = d->upscale_pipeline;
     if (half_mode && up_pipe.handle && d->upscale_ao_uav.handle
         && d->upscale_gi_uav.handle) {
-      if (!atrous_active && up_mode != 1) run_normal_prep();
+      // Demote the GI tail output to SR BEFORE any descriptor that samples it
+      // is published. update_descriptor_tables copies descriptors into the GPU
+      // heap at call time, so publishing t1 while the resource is still UAV
+      // bound captures an unusable view and the upscale Load() returns zero.
+      // This is the same ordering the main pass uses for vbgi_output
+      // (dispatch -> bar -> apply_descriptors), which is known to work.
+      bar(gi_denoised_tex, UA, SR);
+      if (!atrous_active) run_normal_prep();
       bind_pipe(up_pipe);
       reshade::api::resource_view up_ao_src = d->gtvbao_final_in_b
           ? d->ao_term_b_srv : d->ao_term_a_srv;
+      // t1 follows the same shared predicate as the GI tail write above, so
+      // the upscale always samples the exact buffer the tail just wrote.
+      reshade::api::resource_view up_gi_src = gi_half_chain
+          ? d->vbgi_denoised_half_srv
+          : d->fallback_srv;
       reshade::api::resource_view up_srvs[5] = {
           up_ao_src.handle ? up_ao_src : d->fallback_srv,                    // t0 half AO denoised
-          d->vbgi_denoised_half_srv.handle ? d->vbgi_denoised_half_srv       // t1 half GI denoised
-              : d->fallback_srv,
+          up_gi_src.handle ? up_gi_src : d->fallback_srv,                    // t1 half GI denoised
           d->depth_mips_srv,                                                // t2 full depth MIPs
           d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv    // t3 full MRT
               : d->fallback_srv,
@@ -9559,8 +9610,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->upscale_layout, &d->upscale_tables, 4, uu);
       auto pc_u = BuildGTVBAOPushConstants(d, true);
-      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_u.data());
-      bar(gi_denoised_tex, UA, SR);  // half GI denoise -> upscale read
+      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_u.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->upscale_ao_texture, UA, SR);
       if (shader_injection.vbgi_enabled > 0.5f)

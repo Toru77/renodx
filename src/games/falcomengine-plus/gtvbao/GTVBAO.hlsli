@@ -562,8 +562,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // lines 5, 6 from the paper
             lpfloat phi;
             // Cosine sampling: always On (UI toggle removed). Mode selects the method.
+            // S3 experiment needs this at slice scope for per-side reuse (same value).
+            float sliceNdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
             {
-                float NdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
                 float rnd0 = frac(noiseSample + sliceK * 0.618034f);
                 int mode = (int)GTVBAO_gtvbao_cosine_mode;
                 if (mode == 0) {
@@ -576,7 +577,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         pixCenterPos, normalizedScreenPos, consts);
                 } else {
                     // Mode 3 (default): CDF importance sampling
-                    phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, NdotV);
+                    phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, sliceNdotV);
                 }
             }
             lpfloat cosPhi = cos(phi);
@@ -633,7 +634,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 lpfloat stepNoise = frac(noiseSample + stepBaseNoise);
 
                 lpfloat s = (step+stepNoise) / (stepsPerSlice);
-                s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
+                // pow(s,1)==s: skip the pow when distribution is exactly 1.0.
+                if (sampleDistributionPower != 1.0f) {
+                  s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
+                }
                 s += minS;
 
                 lpfloat2 sampleOffset = s * omega;
@@ -702,8 +706,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     frontBackHorizon = saturate(((sd * -frontBackHorizon) + (float)n + GT_VBAO_PI_HALF) / GT_VBAO_PI);
 
                     // ── GTVBAO: CDF remap horizon angles (always On) ──
+                    // Reuses the per-slice NdotV (bit-exact: same inputs, same ops).
                     {
-                        float NdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
+                        float NdotV = (float)sliceNdotV;
                         frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, NdotV);
                         frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, NdotV);
                     }
@@ -721,15 +726,19 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #ifdef GT_VBAO_COMPUTE_GI
                     // ── GI contribution (paper Algorithm 1, line 23) ──
                     // b_j & ~b_i: sectors this sample covers that are NOT yet occluded.
-                    uint newSectors = sampleMask & ~sliceBitmask;
-                    uint newCount = GTVBAO_CountBits(newSectors);
+                    // GI-only sector work: skipped when GI is off (result discarded).
+                    uint newCount = 0u;
+                    if (enableGI) {
+                      uint newSectors = sampleMask & ~sliceBitmask;
+                      newCount = GTVBAO_CountBits(newSectors);
+                    }
                     if (newCount > 0u && enableGI)
                     {
                         // Read HDR light color at sample position (with exposure scale).
                         float3 lightColor = lightBuffer.SampleLevel(lightSampler, sampleScreenPos, 0).rgb * g_gi_light_exposure;
 
-                        // Light direction from pixel to sample.
-                        float3 lightDir = (float3)(sampleDelta / sampleDist);
+                        // Light direction from pixel to sample (== sampleHorizonVec).
+                        float3 lightDir = (float3)sampleHorizonVec;
                         float NdotL = saturate(dot((float3)viewspaceNormal, lightDir));
 
                         // Sample normal for (n_j · −l_j) weighting.
