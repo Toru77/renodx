@@ -389,25 +389,6 @@ struct ShaderInjectData {
   float rcas_motion_range;                   // px [0.25..8], default 2.0 — additional motion to reach the target
   float rcas_motion_response;                // [0.5..3], default 1.0 — pow curvature of the transition
   float rcas_debug;                          // 0=normal sharpen, 1=motion-strength heatmap (green/yellow/red); default Normal
-  // —— Temporal upscaler (Sora2nd blit; output-res history is sole accumulator) ——
-  float upsampler_enabled;                   // 0=off (vanilla blit), 1=temporal upscale in blit (Sora2nd only)
-  float taa_bypass_accumulation;             // runtime, C++-set: 1 = TAA outputs raw current (Sora2nd+upscaler only; Sora1st never sets this)
-  float upsample_inW;                        // input (TAA output) width px, set per blit draw (from motion-buffer dims)
-  float upsample_inH;                        // input height px, set per blit draw
-  float upsample_outW;                       // output (blit target) width px, set per blit draw
-  float upsample_outH;                       // output height px, set per blit draw
-  float upsampler_history_valid;             // runtime: 0=spatial-only frame, 1=accumulate
-  float upsampler_motion_live;               // runtime: 1 = motion view live for blit (else motion treated as 0)
-  float upsampler_spatial_bilinear;          // 0 = Full Catmull-Rom spatial resolve, 1 = bilinear current (weights/beta/history/validation/feedback/RCAS unchanged)
-  // —— Jitter-aware reconstruction experiment (Sora2nd TAAU; appended last: do not insert above) ——
-  float upsampler_jitter_reconstruction;     // 0=Off (current fixed-position CR/bilinear path, bit-identical), 1=jitter-aware box reconstruction of current
-  float upsampler_jitter_live;               // runtime: 1 = captured TAA b2 is current-frame (else box path falls back to fixed reconstruction)
-  float upsampler_jitter_reconstruction_filter; // jitter-path kernel: 0=Box (proven reference), 1=Gaussian; no effect unless jitter reconstruction is on
-  float upsampler_jitter_source;             // jitter source: 0=TAA b2 jitter_g (baseline), 1=frame-CB projection p8_2/p9_2 (experiment)
-  float upsampler_reconstruction_confidence; // beta source: 0=Normalized Max (maxWeight/sumWeight, baseline), 1=Raw Max (maxWeight, experiment)
-  float upsampler_history_validation;        // history verdict: 0=Normal (clip + overshoot penalty), 1=Accept History diagnostic (reprojected history kept, penalty released)
-  float upsampler_history_diagnostic;        // display only: 0=Normal final output, 1=History Only (show validated reprojected history; accumulation/writes unchanged)
-  float upsampler_jitter_units;              // b2 jitter units: 0=Current/Raw (input pixels, baseline), 1=NDC->Input Pixels convert (experiment)
 };
 
 #ifndef __cplusplus

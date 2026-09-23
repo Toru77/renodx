@@ -28,10 +28,6 @@
 #include "../../mods/shader.hpp"
 #include "../../utils/descriptor.hpp"
 #include "../../utils/pipeline_layout.hpp"
-// TEMPORARY jitter investigation probe master switch (must precede all
-// FALCOM_JITTER_PROBE guards: probe block, OnDestroyDevice line, registrations).
-#define FALCOM_JITTER_PROBE 1
-#define FALCOM_JITTER_PROBE_FRAMES 120u
 #include "../../utils/resource.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
@@ -362,24 +358,6 @@ ShaderInjectData shader_injection = {
   .rcas_motion_range = 2.0f,
   .rcas_motion_response = 1.0f,
   .rcas_debug = 0.f,
-  // ── Temporal upscaler (Sora2nd blit) defaults: off = vanilla blit ──
-  .upsampler_enabled = 0.f,
-  .taa_bypass_accumulation = 0.f,
-  .upsample_inW = 0.f,
-  .upsample_inH = 0.f,
-  .upsample_outW = 0.f,
-  .upsample_outH = 0.f,
-  .upsampler_history_valid = 0.f,
-  .upsampler_motion_live = 0.f,
-  .upsampler_spatial_bilinear = 0.f,
-  .upsampler_jitter_reconstruction = 0.f,
-  .upsampler_jitter_live = 0.f,
-  .upsampler_jitter_reconstruction_filter = 0.f,
-  .upsampler_jitter_source = 0.f,
-  .upsampler_reconstruction_confidence = 0.f,
-  .upsampler_history_validation = 0.f,
-  .upsampler_history_diagnostic = 0.f,
-  .upsampler_jitter_units = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -920,46 +898,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view rcas_motion_srv = {};          // game motion buffer (t3) captured from TAA draws (Stage 2)
   uint64_t rcas_motion_res = 0u;
   std::atomic<bool> rcas_motion_live{true};                  // destroy-event driven; false = buffer freed since capture
-  uint32_t rcas_motion_w = 0u, rcas_motion_h = 0u;           // motion buffer dims (== TAA input dims; upscaler input size source)
-  reshade::api::buffer_range taa_cb_range = {};              // game TAA b2 (cb_taa) captured from Sora2nd TAA draws; current-frame jitter source for the blit
-  uint64_t taa_cb_res = 0u;
-  std::atomic<bool> taa_cb_live{true};                       // destroy-event driven; false = buffer freed since capture
-  uint32_t taa_cb_frame = 0u;                                 // frame_index at capture; blit requires same-frame or treats jitter as unavailable
-  // ── TEMPORARY jitter investigation probe (FALCOM_JITTER_PROBE; delete these fields with the probe block) ──
-  uint32_t probe_taa_frame = UINT32_MAX;  // last frame_index with a TAA c0 event sample (one sample per frame)
-  uint32_t probe_taa_samples = 0u;    // total TAA c0 event samples (arms the staging fallback while zero)
-  uint32_t probe_log_frame = 0u;      // frame_index of the current per-frame log cap window
-  uint32_t probe_log_count = 0u;      // logs emitted in the current frame (cap)
-  bool probe_staging_armed = false;   // staging fallback armed (event path produced nothing)
-  bool probe_copy_pending = false;    // staging holds an unread copy from the previous present
-  uint32_t probe_copy_frame = 0u;     // presented-frame index the pending copy belongs to
-  reshade::api::resource probe_staging = {};  // 16B gpu_to_cpu staging for the TAA b2 fallback
-  // ── TAA-draw b0 probe: actual frame-CB range bound on the Sora2nd TAA draw ──
-  reshade::api::buffer_range taa_b0_range = {};  // b0 range pushed at the TAA draw (buffer+offset+size); copied, never rebound
-  uint64_t taa_b0_res = 0u;
-  std::atomic<bool> taa_b0_live{true};           // destroy-event driven
-  uint32_t taa_b0_frame = UINT32_MAX;            // frame_index at capture (must equal draw frame)
-  bool probe_b0_pending = false;                 // b0 staging holds an unread copy from a TAA draw
-  uint32_t probe_b0_copy_frame = UINT32_MAX;     // frame_index the pending b0 copy belongs to
-  reshade::api::resource probe_b0_staging = {};  // 1152B gpu_to_cpu staging (range-relative bytes 128..1280)
-  uint64_t bb_handle = 0u;                                     // swapchain backbuffer resource handle, cached per present (upscaler final-draw gate)
-  uint32_t bb_w = 0u, bb_h = 0u;                               // swapchain backbuffer dims, cached per present
-  // ── Temporal upscaler (Sora2nd blit; output-res history is sole accumulator) ──
-  // The blit writes sharpened pixels to its own target and the unsharpened
-  // accumulation to up_hist via UAV in the same draw: no extra dispatch, no
-  // copies, and sharpened data can never enter history.
-  // PING-PONG (two sets, never aliased in one draw): set[up_read] is SRV/read
-  // (last frame's completed accumulation); set[1-up_read] is UAV/write. The
-  // indices flip once per COMPLETED blit draw (on_drawn only), so no draw can
-  // ever sample a set being written — simultaneous SRV+UAV binding of one
-  // resource is invalid D3D11 and was the black-line/jitter root cause.
-  reshade::api::resource up_hist_texture[2] = {};
-  reshade::api::resource_view up_hist_srv[2] = {};
-  reshade::api::resource_view up_hist_uav[2] = {};
-  uint32_t up_read = 0u;  // read-set index; write set is always 1 - up_read
-  uint32_t up_ow = 0u, up_oh = 0u, up_iw = 0u, up_ih = 0u;    // live output/input dims of the history sets
-  bool up_ready = false;  // last ensure found a complete, dims-matched pair
-  bool up_shape_changed = true;  // last ensure saw new/resized sets (forces invalid frame)
 };
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
@@ -1003,11 +941,6 @@ static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
 static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list);
-static bool OnBeforeBlitUpscaleDraw(reshade::api::command_list* cmd_list);
-static bool OnReplaceBlitUpscaleDraw(reshade::api::command_list* cmd_list);
-static void OnDrawnBlitUpscale(reshade::api::command_list* cmd_list);
-static void DestroyUpscalerHistory(reshade::api::device* dev, DeviceData* d);
-static void DestroyUpscalerHistory(reshade::api::device* dev, DeviceData* d);
 static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSsaoShaderDraw(reshade::api::command_list* cmd_list);
@@ -1284,20 +1217,6 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_replace = OnReplaceCustomTAADraw,
             .on_draw = OnBeforeCustomTAADraw,
             .on_drawn = OnDrawnCustomTAA,
-        },
-    },
-    // ── Temporal upscaler (Sora2nd blit v1; TAA-style output-res accumulation) ──
-    // NOTE: hash-addressed file (blit_0xC9FA40B7) so the dumped vanilla blit
-    // stays untouched as reference; the runtime CRC is the game's blit hash.
-    // Gated on upscaler + Custom TAA (raw passthrough input) + Sora2nd.
-    {
-        0xC9FA40B7u,
-        renodx::mods::shader::CustomShader{
-            .crc32 = 0xC9FA40B7u,
-            .code = __0xC9FA40B7,
-            .on_replace = OnReplaceBlitUpscaleDraw,
-            .on_draw = OnBeforeBlitUpscaleDraw,
-            .on_drawn = OnDrawnBlitUpscale,
         },
     },
     // ── Kai SSR (fused march + temporal, replacement-gated; High + Ultra) ──
@@ -3911,87 +3830,6 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
-    // ── Temporal upscaler (Sora2nd blit v1) ──
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerEnabled", .binding = &shader_injection.upsampler_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Enable Temporal Upscaler", .section = "Upscaler",
-      .tooltip = "Off = vanilla bilinear blit (exact prior behavior). On (Sora2nd only) = TAA-style temporal accumulation at output resolution with fused RCAS, sharing the Custom TAA feedback/validation/sharpening controls. Requires Custom TAA enabled (it provides the raw passthrough input); input TAA accumulation is bypassed while active, so there is no stacked double accumulation.",
-      .labels = {"Off", "On"},
-      .is_visible = []() { return IsSora2nd(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerSpatialBilinear", .binding = &shader_injection.upsampler_spatial_bilinear,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Spatial Reconstruction", .section = "Upscaler",
-      .tooltip = "Spatial resolve for the current frame: Full Catmull-Rom (sharper, may ring on 1px detail) or Bilinear (softer, keeps CR weights/beta, history, validation, feedback and RCAS identical).",
-      .labels = {"Full Catmull-Rom", "Bilinear"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerJitterReconstruction", .binding = &shader_injection.upsampler_jitter_reconstruction,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Jitter-Aware Reconstruction", .section = "Upscaler",
-      .tooltip = "Experimental A/B: Off = current fixed-position reconstruction (baseline, bit-identical). On = scale-aware box reconstruction from actual low-res samples at jitter-offset output positions, so different frames contribute different samples. History, validation, feedback and RCAS unchanged.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerJitterReconstructionFilter", .binding = &shader_injection.upsampler_jitter_reconstruction_filter,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Jitter Reconstruction Filter", .section = "Upscaler",
-      .tooltip = "Kernel for the jitter-aware current reconstruction (requires Jitter-Aware Reconstruction on): Box = proven overlap-area reference; Gaussian = scale-aware Gaussian on the same jittered sample positions, testing whether it reduces aliasing while preserving temporal detail. History, validation, feedback and RCAS unchanged.",
-      .labels = {"Box", "Gaussian"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f && shader_injection.upsampler_jitter_reconstruction > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerJitterSource", .binding = &shader_injection.upsampler_jitter_source,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "TAAU Jitter Source", .section = "Upscaler",
-      .tooltip = "Absolute jitter source for the jitter-aware reconstruction (requires Jitter-Aware Reconstruction on): TAA b2 = game TAA constant-buffer jitter (baseline); Projection = frame-CB projection offsets p8_2/p9_2 converted to input pixels. Reconstruction, beta, validation, feedback, history and RCAS are identical; only the jitter metadata changes.",
-      .labels = {"TAA b2", "Projection"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f && shader_injection.upsampler_jitter_reconstruction > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerReconstructionConfidence", .binding = &shader_injection.upsampler_reconstruction_confidence,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "TAAU Reconstruction Confidence", .section = "Upscaler",
-      .tooltip = "Beta source for the jitter-aware reconstruction (requires Jitter-Aware Reconstruction on): Normalized Max = maxWeight/sumWeight (current behavior); Raw Max = unclamped raw maxWeight, testing whether normalization suppresses temporal accumulation. Weights, reconstruction, validation, feedback, history and RCAS unchanged.",
-      .labels = {"Normalized Max", "Raw Max"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f && shader_injection.upsampler_jitter_reconstruction > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerHistoryValidation", .binding = &shader_injection.upsampler_history_validation,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "TAAU History Validation", .section = "Upscaler",
-      .tooltip = "History verdict diagnostic (requires Jitter-Aware Reconstruction on): Normal = current k-DOP/AABB clip plus overshoot penalty; Accept History = keep the reprojected history sample and release the overshoot penalty, testing whether validation suppresses useful temporal samples. Footprint, thresholds, feedback, motion and silhouette logic unchanged; expect possible ghosting.",
-      .labels = {"Normal", "Accept History"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f && shader_injection.upsampler_jitter_reconstruction > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerHistoryDiagnostic", .binding = &shader_injection.upsampler_history_diagnostic,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "TAAU History Diagnostic", .section = "Upscaler",
-      .tooltip = "Display-only diagnostic (requires Jitter-Aware Reconstruction on): Normal = final accumulated output; History Only = show the validated reprojected history the resolver already uses. Accumulation, history writes, feedback, validation and RCAS run unchanged; temporary, do not keep.",
-      .labels = {"Normal", "History Only"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f && shader_injection.upsampler_jitter_reconstruction > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "UpscalerJitterUnits", .binding = &shader_injection.upsampler_jitter_units,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "TAAU Jitter Units", .section = "Upscaler",
-      .tooltip = "Units of TAA b2 jitter_g for the jitter-aware reconstruction (requires Jitter-Aware Reconstruction on): Current/Raw = input pixels (current behavior); NDC->Input Pixels = interpret jitter_g as NDC offsets scaled by render dims, testing a unit mismatch. Projection source, weights, beta, validation, feedback, history, motion and RCAS unchanged.",
-      .labels = {"Current / Raw", "NDC -> Input Pixels"},
-      .is_enabled = []() { return shader_injection.upsampler_enabled > 0.5f && shader_injection.upsampler_jitter_reconstruction > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },
     new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4141,11 +3979,6 @@ static void OnDestroyDevice(reshade::api::device* device) {
     DestroyDynCubeResources(device, d);
     DestroyDynCubeCache(device, d);
     DestroyRCASResources(device, d);
-    DestroyUpscalerHistory(device, d);
-#if FALCOM_JITTER_PROBE
-    if (d->probe_staging.handle) device->destroy_resource(d->probe_staging);
-    if (d->probe_b0_staging.handle) device->destroy_resource(d->probe_b0_staging);
-#endif
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
     device->destroy_private_data<DeviceData>();
@@ -4338,8 +4171,6 @@ static void OnPushDescriptorsCapture(
           if (d->rcas_motion_srv.handle != views[0].handle) {
             auto info = CSResolveCapture(device, views[0]);
             d->rcas_motion_res = info.res;
-            d->rcas_motion_w = info.w;
-            d->rcas_motion_h = info.h;
             reshade::log::message(reshade::log::level::info,
               (std::string("[RCAS] motion ") + info.dims).c_str());
           }
@@ -4522,54 +4353,6 @@ static void OnPushDescriptorsCapture(
           d->captured_cbv_live = true;
           d->captured_scene_cbv_frame = d->frame_index;
           d->captured_scene_cbv_view = cbv_views[0];
-        }
-      }
-    }
-    // Capture TAA b2 (cb_taa) — ONLY from the Sora2nd TAA draw: c0.xy carries
-    // the game's current-frame jitter (input pixels). The full buffer_range
-    // (buffer+offset+size) is stored and re-pushed verbatim onto the upscaler
-    // blit, so the jitter-aware reconstruction reads the exact game value with
-    // no CPU readback and no extra frame of latency.
-    if (update.binding == 2u && update.count >= 1 && IsSora2nd()) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0x9D91FAC3u) {
-          auto* ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
-          if (ranges[0].buffer.handle != 0u) {
-            auto bdesc = device->get_resource_desc(ranges[0].buffer);
-            uint64_t rangeSize = (ranges[0].size == UINT64_MAX) ? bdesc.buffer.size : ranges[0].size;
-            if (bdesc.type == reshade::api::resource_type::buffer
-                && ranges[0].offset + 8u <= bdesc.buffer.size && rangeSize >= 8u) {
-              d->taa_cb_range = ranges[0];
-              d->taa_cb_res = ranges[0].buffer.handle;
-              d->taa_cb_live = true;
-              d->taa_cb_frame = d->frame_index;
-            }
-          }
-        }
-      }
-    }
-    // Capture TAA-draw b0 (frame CB) — ONLY from the Sora2nd TAA draw, for the
-    // TAA-bound-vs-upload comparison probe. The stored range is copied at
-    // on_draw into owned staging and logged; never rebound, never patched.
-    if (update.binding == 0u && update.count >= 1 && IsSora2nd()) {
-      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-      if (ss) {
-        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == 0x9D91FAC3u) {
-          auto* ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
-          if (ranges[0].buffer.handle != 0u) {
-            auto bdesc = device->get_resource_desc(ranges[0].buffer);
-            uint64_t rangeSize = (ranges[0].size == UINT64_MAX) ? bdesc.buffer.size : ranges[0].size;
-            if (bdesc.type == reshade::api::resource_type::buffer
-                && ranges[0].offset + 1280u <= bdesc.buffer.size && rangeSize >= 1280u) {
-              d->taa_b0_range = ranges[0];
-              d->taa_b0_res = ranges[0].buffer.handle;
-              d->taa_b0_live = true;
-              d->taa_b0_frame = d->frame_index;
-            }
-          }
         }
       }
     }
@@ -4863,20 +4646,6 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->captured_ssr1_srv, d->captured_ssr1_res, d->captured_ssr1_live, "ssr1", deadView, deadRes);
   KillTrackedInput(d, d->captured_ssr_mrt_srv, d->captured_ssr_mrt_res, d->captured_ssr_mrt_live, "ssrMrt", deadView, deadRes);
   KillTrackedInput(d, d->rcas_motion_srv, d->rcas_motion_res, d->rcas_motion_live, "rcasMotion", deadView, deadRes);
-  // TAA b2 is tracked as a buffer range (not a view): kill by resource handle.
-  if (d->taa_cb_res != 0u && d->taa_cb_res == deadRes) {
-    if (d->taa_cb_live.load()) {
-      d->taa_cb_live.store(false);
-      CSLog("capture", std::string("taaCB buffer DEAD"), true);
-    }
-  }
-  // TAA-draw b0 probe range: same treatment (probe copies guard on live).
-  if (d->taa_b0_res != 0u && d->taa_b0_res == deadRes) {
-    if (d->taa_b0_live.load()) {
-      d->taa_b0_live.store(false);
-      CSLog("capture", std::string("taaB0 buffer DEAD"), true);
-    }
-  }
 }
 static void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
   if (!device || !view.handle) return;
@@ -4945,187 +4714,6 @@ static inline uint64_t WatchdogNowMs() {
 
 // ── Present hook ──
 
-// ═══════════ TEMPORARY jitter investigation probe (observer only) ═══════════
-// FALCOM_JITTER_PROBE = 1 enables behavior-neutral logging of (a) frame-CB
-// uploads (projection/jitter region) and (b) TAA b2 c0.xy (absolute jitter
-// sequence) for the first FALCOM_JITTER_PROBE_FRAMES presents on Sora2nd.
-// Guarantees: never returns true from update_buffer_region (never skips an
-// upload), never writes through observed pointers, never rebinds anything,
-// never touches rendering state. To remove cleanly: delete this block, the
-// probe DeviceData fields, the OnPresent probe section, the OnDestroyDevice
-// staging line, and the 2 event registrations below.
-#if FALCOM_JITTER_PROBE
-static uint32_t ProbeFNV(const uint8_t* p, uint64_t n) {
-  uint32_t h = 2166136261u;
-  for (uint64_t i = 0; i < n; ++i) { h ^= p[i]; h *= 16777619u; }
-  return h;
-}
-// Intersect update/map range [off, off+size) with wanted [w0, w1); returns the
-// relative [r0, r1) window into the observed data pointer (false when empty).
-static bool ProbeSlice(uint64_t off, uint64_t size, uint64_t w0, uint64_t w1, uint64_t* r0, uint64_t* r1) {
-  uint64_t end = off + size;
-  if (end <= w0 || off >= w1) return false;
-  uint64_t a = (off > w0) ? off : w0;
-  uint64_t b = (end < w1) ? end : w1;
-  *r0 = a - off; *r1 = b - off;
-  return true;
-}
-static std::string ProbeFloat(const void* base, uint64_t rel) {
-  float v = 0.f;
-  memcpy(&v, static_cast<const uint8_t*>(base) + rel, 4);
-  return std::to_string((double)v);  // 6 decimals, no extra includes
-}
-static std::string ProbeHex(uint32_t h, bool partial) {
-  static const char* digits = "0123456789ABCDEF";
-  std::string s(8, '0');
-  for (int i = 7; i >= 0; --i) { s[i] = digits[h & 0xFu]; h >>= 4; }
-  if (partial) s += "*";
-  return s;
-}
-// Frame-CB identity: exact handle match against the captured b0 buffer; while
-// the handle is still unknown (frame 0), any large constant-buffer update that
-// must contain c79. No get_resource_desc in the hot path once known.
-static bool ProbeIsFrameCB(reshade::api::device* dev, DeviceData* d, reshade::api::resource dest, uint64_t size) {
-  if (d->captured_cbv_res != 0u) return dest.handle == d->captured_cbv_res;
-  if (size < kSceneCbMinimumBytes) return false;
-  auto dd = dev->get_resource_desc(dest);
-  return dd.type == reshade::api::resource_type::buffer && dd.buffer.size >= kSceneCbMinimumBytes;
-}
-// TAA b2 identity: exact handle match; while unknown, small updates covering
-// byte 0 (c0.xy at range offset, expected 0) logged distinctly as candidates.
-static bool ProbeIsTaaCB(reshade::api::device* dev, DeviceData* d, reshade::api::resource dest,
-                         uint64_t destOff, uint64_t size, bool* exact) {
-  if (d->taa_cb_res != 0u) { *exact = true; return dest.handle == d->taa_cb_res; }
-  *exact = false;
-  if (destOff != 0u || size < 8u || size > 256u) return false;
-  auto dd = dev->get_resource_desc(dest);
-  return dd.type == reshade::api::resource_type::buffer && dd.buffer.size >= 48u && dd.buffer.size <= 1024u;
-}
-static void ProbeLogFrameCB(DeviceData* d, const char* path, uint64_t destHandle,
-                            uint64_t destOff, uint64_t size, const void* base) {
-  if (d->probe_log_frame != d->frame_index) { d->probe_log_frame = d->frame_index; d->probe_log_count = 0u; }
-  if (d->probe_log_count >= 10u) return;
-  d->probe_log_count++;
-  uint64_t r0 = 0u, r1 = 0u;
-  std::ostringstream os;
-  os << "[JitterProbe] frame=" << d->frame_index << " path=" << path
-     << " dest=" << destHandle << " off=" << destOff << " size=" << size;
-  if (ProbeSlice(destOff, size, 128u, 192u, &r0, &r1)) {
-    uint32_t h = ProbeFNV(static_cast<const uint8_t*>(base) + r0, r1 - r0);
-    os << " h128=" << ProbeHex(h, (r1 - r0) < 64u);
-  } else { os << " h128=n/a"; }
-  if (ProbeSlice(destOff, size, 1200u, 1280u, &r0, &r1)) {
-    uint32_t h = ProbeFNV(static_cast<const uint8_t*>(base) + r0, r1 - r0);
-    os << " h1200=" << ProbeHex(h, (r1 - r0) < 80u);
-  } else { os << " h1200=n/a"; }
-  // Candidate jitter slots + jitterDiff (absolute buffer bytes; '*' = column-
-  // major guess bytes 136/152, row-major guess 160/164, diff at 1264/1268).
-  const uint64_t slots[6] = {136u, 152u, 160u, 164u, 1264u, 1268u};
-  const char* names[6] = {"j136", "j152", "j160", "j164", "jdx", "jdy"};
-  for (int i = 0; i < 6; ++i) {
-    if (slots[i] >= destOff && slots[i] + 4u <= destOff + size) {
-      os << " " << names[i] << "=" << ProbeFloat(base, slots[i] - destOff);
-    } else { os << " " << names[i] << "=n/a"; }
-  }
-  reshade::log::message(reshade::log::level::info, os.str().c_str());
-  // Full projection region (c8..c11, bytes 128..191) as 16 scalars for
-  // jitter-slot identification against the known 8-position TAA sequence.
-  // Separate line, same frame attribution; only when fully covered.
-  if (destOff <= 128u && 192u <= destOff + size) {
-    std::ostringstream ps;
-    ps << "[JitterProbe] PROJ frame=" << d->frame_index;
-    for (int r = 0; r < 4; ++r) {
-      for (int c = 0; c < 4; ++c) {
-        ps << " p" << (8 + r) << "_" << c << "="
-           << ProbeFloat(base, (128u + (uint64_t)(r * 16 + c * 4)) - destOff);
-      }
-    }
-    reshade::log::message(reshade::log::level::info, ps.str().c_str());
-  }
-}
-static void ProbeLogTaa(DeviceData* d, const char* path, float jx, float jy) {
-  std::ostringstream os;
-  os << "[JitterProbe] TAA frame=" << d->frame_index << " path=" << path
-     << " jx=" << jx << " jy=" << jy;
-  reshade::log::message(reshade::log::level::info, os.str().c_str());
-}
-// update_buffer_region observer: data pointer is synchronously valid. ALWAYS
-// returns false (never skips the upload).
-static bool OnProbeUpdateBuffer(reshade::api::device* device, const void* data,
-                                reshade::api::resource dest, uint64_t destOff, uint64_t size) {
-  if (!IsSora2nd() || !data || dest.handle == 0u) return false;
-  auto* d = device->get_private_data<DeviceData>();
-  if (!d || d->frame_index >= FALCOM_JITTER_PROBE_FRAMES) return false;
-  if (ProbeIsFrameCB(device, d, dest, size)) {
-    ProbeLogFrameCB(d, "update", dest.handle, destOff, size, data);
-  }
-  bool exact = false;
-  if (ProbeIsTaaCB(device, d, dest, destOff, size, &exact)) {
-    if (exact) {
-      // Exact handle match: one sample per frame; never blocked by candidates.
-      if (d->taa_cb_range.offset >= destOff && d->taa_cb_range.offset + 8u <= destOff + size
-          && d->frame_index != d->probe_taa_frame) {
-        d->probe_taa_frame = d->frame_index;
-        d->probe_taa_samples++;
-        float jx = 0.f, jy = 0.f;
-        uint64_t rel = d->taa_cb_range.offset - destOff;
-        memcpy(&jx, static_cast<const uint8_t*>(data) + rel, 4);
-        memcpy(&jy, static_cast<const uint8_t*>(data) + rel + 4, 4);
-        ProbeLogTaa(d, "update", jx, jy);
-      }
-    } else {
-      // Heuristic candidate: shared per-frame cap, never consumes the exact slot.
-      if (d->probe_log_frame != d->frame_index) { d->probe_log_frame = d->frame_index; d->probe_log_count = 0u; }
-      if (d->probe_log_count < 10u) {
-        d->probe_log_count++;
-        float jx = 0.f, jy = 0.f;
-        memcpy(&jx, data, 4);
-        memcpy(&jy, static_cast<const uint8_t*>(data) + 4, 4);
-        ProbeLogTaa(d, "update-cand", jx, jy);
-      }
-    }
-  }
-  return false;
-}
-// map_buffer_region observer: *data is valid here (post-map); read-only.
-static void OnProbeMapBuffer(reshade::api::device* device, reshade::api::resource resource,
-                             uint64_t offset, uint64_t size, reshade::api::map_access access, void** data) {
-  (void)access;
-  if (!IsSora2nd() || !data || !*data || resource.handle == 0u) return;
-  auto* d = device->get_private_data<DeviceData>();
-  if (!d || d->frame_index >= FALCOM_JITTER_PROBE_FRAMES) return;
-  if (ProbeIsFrameCB(device, d, resource, size)) {
-    ProbeLogFrameCB(d, "map", resource.handle, offset, size, *data);
-  }
-  bool exact = false;
-  if (ProbeIsTaaCB(device, d, resource, offset, size, &exact)) {
-    if (exact) {
-      if (d->taa_cb_range.offset >= offset && d->taa_cb_range.offset + 8u <= offset + size
-          && d->frame_index != d->probe_taa_frame) {
-        d->probe_taa_frame = d->frame_index;
-        d->probe_taa_samples++;
-        float jx = 0.f, jy = 0.f;
-        uint64_t rel = d->taa_cb_range.offset - offset;
-        memcpy(&jx, static_cast<const uint8_t*>(*data) + rel, 4);
-        memcpy(&jy, static_cast<const uint8_t*>(*data) + rel + 4, 4);
-        ProbeLogTaa(d, "map", jx, jy);
-      }
-    } else {
-      if (d->probe_log_frame != d->frame_index) { d->probe_log_frame = d->frame_index; d->probe_log_count = 0u; }
-      if (d->probe_log_count < 10u) {
-        d->probe_log_count++;
-        float jx = 0.f, jy = 0.f;
-        memcpy(&jx, *data, 4);
-        memcpy(&jy, static_cast<const uint8_t*>(*data) + 4, 4);
-        ProbeLogTaa(d, "map-cand", jx, jy);
-      }
-    }
-  }
-}
-#endif  // FALCOM_JITTER_PROBE
-
-// ── Present hook ──
-
 static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* sc,
                        const reshade::api::rect*, const reshade::api::rect*,
                        uint32_t, const reshade::api::rect*) {
@@ -5134,119 +4722,6 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->frame_index++;
-#if FALCOM_JITTER_PROBE
-  // Probe staging pump (observer only): read the previous present's copy
-  // (GPU long done: no stall), then queue a fresh copy of the current TAA b2.
-  // Active only on Sora2nd inside the probe window, and only when the event
-  // path produced no TAA samples (staging fallback armed at frame 10).
-  if (IsSora2nd() && d->frame_index < FALCOM_JITTER_PROBE_FRAMES && d->frame_index >= 1u) {
-    if (d->frame_index == 1u) {
-      reshade::log::message(reshade::log::level::info,
-        "[JitterProbe] active: 120-frame window, Sora2nd only, observer-only (no uploads skipped, nothing patched or rebound)");
-    }
-    if (d->probe_copy_pending && d->probe_staging.handle) {
-      void* staged = nullptr;
-      if (dev->map_buffer_region(d->probe_staging, 0, 16, reshade::api::map_access::read_only, &staged)
-          && staged != nullptr) {
-        float jx = 0.f, jy = 0.f;
-        memcpy(&jx, staged, 4);
-        memcpy(&jy, static_cast<const uint8_t*>(staged) + 4, 4);
-        std::ostringstream os;
-        os << "[JitterProbe] TAA frame=" << d->probe_copy_frame << " path=staging"
-           << " jx=" << jx << " jy=" << jy;
-        reshade::log::message(reshade::log::level::info, os.str().c_str());
-        dev->unmap_buffer_region(d->probe_staging);
-      }
-      d->probe_copy_pending = false;
-    }
-    if (!d->probe_staging_armed && d->frame_index >= 10u && d->probe_taa_samples == 0u
-        && d->taa_cb_res != 0u && d->taa_cb_range.buffer.handle != 0u && d->taa_cb_live.load()) {
-      auto tdesc = dev->get_resource_desc(d->taa_cb_range.buffer);
-      if (tdesc.type == reshade::api::resource_type::buffer
-          && d->taa_cb_range.offset + 16u <= tdesc.buffer.size) {
-        reshade::api::resource_desc rsb = {};
-        rsb.type = reshade::api::resource_type::buffer;
-        rsb.buffer.size = 16u;
-        rsb.buffer.stride = 0;
-        rsb.heap = reshade::api::memory_heap::gpu_to_cpu;
-        rsb.usage = reshade::api::resource_usage::copy_dest;
-        if (dev->create_resource(rsb, nullptr, reshade::api::resource_usage::copy_dest, &d->probe_staging)) {
-          d->probe_staging_armed = true;
-          reshade::log::message(reshade::log::level::info,
-            "[JitterProbe] no TAA b2 upload events observed; staging fallback armed (16B copy per present)");
-        }
-      } else {
-        static bool s_probe_staging_nack = false;
-        if (!s_probe_staging_nack) {
-          s_probe_staging_nack = true;
-          reshade::log::message(reshade::log::level::info,
-            "[JitterProbe] staging fallback unavailable (TAA range too small); event path only");
-        }
-      }
-    }
-    if (d->probe_staging_armed && d->probe_staging.handle && d->taa_cb_range.buffer.handle != 0u
-        && d->taa_cb_live.load() && !d->probe_copy_pending) {
-      cl->copy_buffer_region(d->taa_cb_range.buffer, d->taa_cb_range.offset, d->probe_staging, 0u, 16u);
-      d->probe_copy_pending = true;
-      d->probe_copy_frame = d->frame_index - 1u;  // presented frame whose TAA values were just copied
-    }
-    // TAA-bound b0 readback (observer only): the on_draw copy above holds
-    // range-relative bytes [128,1280); GPU long done, so the map is stall-free.
-    if (d->probe_b0_pending && d->probe_b0_staging.handle) {
-      void* b0staged = nullptr;
-      if (dev->map_buffer_region(d->probe_b0_staging, 0, 1152, reshade::api::map_access::read_only, &b0staged)
-          && b0staged != nullptr) {
-        const uint8_t* bb0 = static_cast<const uint8_t*>(b0staged);
-        std::ostringstream os;
-        os << "[JitterProbe] TAA_B0 frame=" << d->probe_b0_copy_frame
-           << " buffer=" << d->taa_b0_range.buffer.handle
-           << " offset=" << d->taa_b0_range.offset
-           << " size=" << d->taa_b0_range.size;
-        for (int r = 0; r < 4; ++r) {
-          for (int c = 0; c < 4; ++c) {
-            float v = 0.f;
-            memcpy(&v, bb0 + (uint64_t)(r * 16 + c * 4), 4);
-            os << " p" << (8 + r) << "_" << c << "=" << v;
-          }
-        }
-        float jdx = 0.f, jdy = 0.f;
-        memcpy(&jdx, bb0 + 1136u, 4);  // range-relative c79 (1264/1268) minus staging base 128
-        memcpy(&jdy, bb0 + 1140u, 4);
-        os << " jdx=" << jdx << " jdy=" << jdy;
-        reshade::log::message(reshade::log::level::info, os.str().c_str());
-        dev->unmap_buffer_region(d->probe_b0_staging);
-      }
-      d->probe_b0_pending = false;
-    }
-    if (d->frame_index >= 10u && d->probe_b0_copy_frame == UINT32_MAX) {
-      // No TAA-draw b0 copy in 10 frames: hash gate never matched (state
-      // tracking unavailable on_draw?) or b0 is table-bound, not pushed.
-      static bool s_probe_b0_never = false;
-      if (!s_probe_b0_never) {
-        s_probe_b0_never = true;
-        reshade::log::message(reshade::log::level::info,
-          "[JitterProbe] no TAA-draw b0 copy yet (on_draw hash gate or table-bound b0); TAA_B0 lines absent");
-      }
-    }
-  }
-#endif  // FALCOM_JITTER_PROBE
-  // Cache the current backbuffer identity + dims for the upscaler final-draw
-  // gate (distinguishes the real final blit from same-size intermediates).
-  // Refreshed every present; never cleared on failure (stale values only ever
-  // fall back to vanilla). A one-frame lag after mode changes is harmless:
-  // mismatch direction also only falls back to vanilla.
-  {
-    auto bb = sc->get_current_back_buffer();
-    if (bb.handle) {
-      auto bb_desc = dev->get_resource_desc(bb);
-      if (bb_desc.type == reshade::api::resource_type::texture_2d
-          && bb_desc.texture.width >= 64u && bb_desc.texture.height >= 64u) {
-        d->bb_handle = bb.handle;
-        d->bb_w = bb_desc.texture.width;
-        d->bb_h = bb_desc.texture.height;
-      }
-    }
-  }
   d->immediate_cmd_list = queue->get_immediate_command_list();
   s_lastPresentMs.store(WatchdogNowMs());
   if (!s_watchdogStarted) {
@@ -5941,11 +5416,6 @@ static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list) {
 }
 
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
-  // Upscaler bypass flag (Sora2nd temporal upscaler owns ALL accumulation
-  // when active; Sora1st shares the TAA files but this stays 0 there).
-  // Set here (pre-draw) so the current draw's b13 injection carries it.
-  shader_injection.taa_bypass_accumulation =
-      (shader_injection.upsampler_enabled > 0.5f && IsSora2nd()) ? 1.f : 0.f;
   if (!CustomTAAReplaceActive(cmd_list)) {
     s_custom_taa_was_active = false;
   } else {
@@ -5953,12 +5423,9 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
     s_custom_taa_was_active = true;
   }
   // ── RCAS history isolation: serve the owned UNSHARPENED copy as t2 ──
-  // Runs only while Custom TAA is on (same gate as the stage itself), except
-  // Sora2nd with the blit upscaler active (bypassed TAA ignores history and
-  // the legacy dispatch above is skipped, so no override is served either).
-  // The sharpened temp/RT is never bound here; only rcas_hist_srv is.
-  if (shader_injection.custom_taa_enabled > 0.5f && (IsSora1st() || IsSora2nd())
-      && !(IsSora2nd() && shader_injection.upsampler_enabled > 0.5f)) {
+  // Runs only while Custom TAA is on (same gate as the stage itself). The
+  // sharpened temp/RT is never bound here; only rcas_hist_srv is.
+  if (shader_injection.custom_taa_enabled > 0.5f && (IsSora1st() || IsSora2nd())) {
     if (auto* dev = cmd_list->get_device()) {
       if (auto* dd = dev->get_private_data<DeviceData>()) {
         if (dd->rcas_have_copy && dd->rcas_hist_srv.handle) {
@@ -5975,54 +5442,6 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
       }
     }
   }
-#if FALCOM_JITTER_PROBE
-  // TAA-draw b0 probe copy (observer only): first Sora2nd TAA draw of the
-  // frame copies range-relative bytes [128,1280) (c8..c11 + c75..c79) into
-  // owned staging; read back and logged at the next present. No rebinds,
-  // no skips, no state touched. Fires regardless of Custom TAA state.
-  if (IsSora2nd()) {
-    if (auto* dev = cmd_list->get_device()) {
-      if (auto* dd = dev->get_private_data<DeviceData>()) {
-        if (dd->frame_index < FALCOM_JITTER_PROBE_FRAMES) {
-          auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-          uint32_t hash = ss ? renodx::utils::shader::GetCurrentPixelShaderHash(ss) : 0u;
-          if (hash == 0x9D91FAC3u) {
-            if (dd->taa_b0_frame == dd->frame_index && dd->taa_b0_live.load()
-                && dd->taa_b0_range.buffer.handle != 0u
-                && dd->probe_b0_copy_frame != dd->frame_index && !dd->probe_b0_pending) {
-              if (!dd->probe_b0_staging.handle) {
-                reshade::api::resource_desc rsb = {};
-                rsb.type = reshade::api::resource_type::buffer;
-                rsb.buffer.size = 1152u;
-                rsb.buffer.stride = 0;
-                rsb.heap = reshade::api::memory_heap::gpu_to_cpu;
-                rsb.usage = reshade::api::resource_usage::copy_dest;
-                dev->create_resource(rsb, nullptr, reshade::api::resource_usage::copy_dest,
-                                     &dd->probe_b0_staging);
-              }
-              if (dd->probe_b0_staging.handle) {
-                cmd_list->copy_buffer_region(dd->taa_b0_range.buffer,
-                                             dd->taa_b0_range.offset + 128u,
-                                             dd->probe_b0_staging, 0u, 1152u);
-                dd->probe_b0_pending = true;
-                dd->probe_b0_copy_frame = dd->frame_index;
-              }
-            } else if (dd->taa_b0_frame != dd->frame_index
-                       && dd->probe_b0_copy_frame != dd->frame_index) {
-              // TAA draw without a same-frame b0 push (table-bound?): one-time notice.
-              static bool s_probe_b0_nopush = false;
-              if (!s_probe_b0_nopush) {
-                s_probe_b0_nopush = true;
-                reshade::log::message(reshade::log::level::info,
-                  "[JitterProbe] TAA draw without b0 push observed (static tables?); TAA_B0 lines will be absent");
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-#endif  // FALCOM_JITTER_PROBE
   return true;
 }
 
@@ -6146,11 +5565,6 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   if (!cmd_list) return;
   if (shader_injection.custom_taa_enabled < 0.5f) return;
   if (!IsSora1st() && !IsSora2nd()) return;
-  // Sora2nd with the blit upscaler active: the blit owns sharpening (fused)
-  // and TAA history flows naturally from the bypassed raw output, so this
-  // legacy stage stands down entirely (no dispatch, and the t2 override below
-  // is gated identically). Sora1st and Sora2nd-without-upscaler unchanged.
-  if (IsSora2nd() && shader_injection.upsampler_enabled > 0.5f) return;
   auto* dev = cmd_list->get_device();
   if (!dev) return;
   auto* d = dev->get_private_data<DeviceData>();
@@ -6286,281 +5700,6 @@ static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->rcas_last_rtv0 = (count > 0) ? rtvs[0] : reshade::api::resource_view{};
-}
-
-// ═══════════ Temporal upscaler (Sora2nd blit v1) ═══════════
-// Gate: upscaler toggle + Custom TAA (which provides the bypassed raw input)
-// + Sora2nd. Vanilla blit draws otherwise (zero overhead, exact prior).
-static bool s_upscaler_was_active = false;
-
-static bool BlitUpscalerActive() {
-  return shader_injection.upsampler_enabled > 0.5f
-      && shader_injection.custom_taa_enabled > 0.5f
-      && IsSora2nd();
-}
-
-static void DestroyUpscalerHistory(reshade::api::device* dev, DeviceData* d) {
-  if (!dev || !d) return;
-  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
-  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  for (int s = 0; s < 2; ++s) {
-    dv(d->up_hist_srv[s]); dv(d->up_hist_uav[s]); dr(d->up_hist_texture[s]);
-  }
-  d->up_ow = 0u; d->up_oh = 0u; d->up_iw = 0u; d->up_ih = 0u;
-  d->up_read = 0u;
-  d->up_ready = false;
-  d->up_shape_changed = true;
-}
-
-// Readiness shared by the replace gate and on_draw (see below): detects dims,
-// (re)creates the output-res history, publishes validity + dims into the
-// injection data. Idempotent within a frame: a second call finds no shape
-// change and re-asserts identical values. Returns true only when the
-// replacement shader has everything it samples, so on_replace never serves
-// a draw whose pushed bindings would be missing.
-static bool UpscalerEnsureReady(reshade::api::command_list* cmd_list) {
-  auto* dev = cmd_list->get_device();
-  if (!dev) return false;
-  auto* d = dev->get_private_data<DeviceData>();
-  if (!d) return false;
-  // Output dims + identity from the blit target (same RTV tracker the legacy
-  // RCAS stage uses; sampled synchronously in this draw's callback).
-  uint32_t ow = 0u, oh = 0u;
-  reshade::api::resource outRes = {};
-  if (d->rcas_last_rtv0.handle) {
-    outRes = dev->get_resource_from_view(d->rcas_last_rtv0);
-    if (outRes.handle) {
-      auto odesc = dev->get_resource_desc(outRes);
-      if (odesc.type == reshade::api::resource_type::texture_2d) {
-        ow = odesc.texture.width; oh = odesc.texture.height;
-      }
-    }
-  }
-  // Input dims from the motion buffer (== TAA input dims); fall back to 1:1
-  // (output dims) when motion was never captured — degrades to native-res
-  // accumulation rather than failing.
-  uint32_t iw = (d->rcas_motion_w >= 64u) ? d->rcas_motion_w : ow;
-  uint32_t ih = (d->rcas_motion_h >= 64u) ? d->rcas_motion_h : oh;
-  bool dimsOk = (ow >= 64u && oh >= 64u && iw >= 64u && ih >= 64u);
-  // Serve gate: which blit draws get the replacement. The trivial copy shader
-  // is reused engine-wide (observed: a 1:1 1280x720 copy alternating with the
-  // main blit, which recreated history every draw and pinned validity at 0
-  // forever). Serve iff any holds (all else falls back to vanilla with zero
-  // state touched):
-  //  1. genuine upscale (target strictly larger than input), or
-  //  2. target resource IS the cached swapchain backbuffer (identity — immune
-  //     to same-size intermediates), or
-  //  3. target dims match cached backbuffer dims (covers present-via-copy
-  //     layouts where the blit itself never touches the backbuffer).
-  // Mismatch direction always falls back to vanilla: safe under stale cache
-  // (first frame, mode change) and under future impostors.
-  bool isUpscale = dimsOk && ow > iw && oh > ih;
-  bool isBackbuffer = dimsOk && d->bb_handle != 0u && outRes.handle == d->bb_handle;
-  bool isBackbufferSized = dimsOk && d->bb_w >= 64u && d->bb_h >= 64u && ow == d->bb_w && oh == d->bb_h;
-  if (!(isUpscale || isBackbuffer || isBackbufferSized)) {
-    static bool s_upscaler_skip_logged = false;
-    if (!s_upscaler_skip_logged) {
-      s_upscaler_skip_logged = true;
-      reshade::log::message(reshade::log::level::info,
-        (std::string("[Upscaler] skip (not the final blit: ") + std::to_string(ow) + "x" + std::to_string(oh)
-          + " <- " + std::to_string(iw) + "x" + std::to_string(ih)
-          + " bb=" + std::to_string(d->bb_w) + "x" + std::to_string(d->bb_h) + ")").c_str());
-    }
-    return false;
-  }
-  bool shapeChanged = dimsOk && (d->up_ow != ow || d->up_oh != oh || d->up_iw != iw || d->up_ih != ih);
-  if ((shapeChanged || !d->up_hist_texture[0].handle || !d->up_hist_texture[1].handle) && dimsOk) {
-    DestroyUpscalerHistory(dev, d);
-    // History is internal precision (always FP16); the game target keeps its
-    // own format. No copies flow between them (UAV store + SRV read only).
-    // BOTH sets are (re)created together so the read set always exists when
-    // the write set does; per-set completeness is verified below.
-    for (int s = 0; s < 2; ++s) {
-      reshade::api::resource_desc rd = {};
-      rd.type = reshade::api::resource_type::texture_2d;
-      rd.texture = {ow, oh, 1, 1, reshade::api::format::r16g16b16a16_float, 1};
-      rd.heap = reshade::api::memory_heap::gpu_only;
-      rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-      if (dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->up_hist_texture[s])) {
-        reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d,
-                                            reshade::api::format::r16g16b16a16_float, 0, 1, 0, 1);
-        dev->create_resource_view(d->up_hist_texture[s], reshade::api::resource_usage::shader_resource, vd, &d->up_hist_srv[s]);
-        dev->create_resource_view(d->up_hist_texture[s], reshade::api::resource_usage::unordered_access, vd, &d->up_hist_uav[s]);
-      }
-    }
-    if (d->up_hist_texture[0].handle && d->up_hist_srv[0].handle && d->up_hist_uav[0].handle
-        && d->up_hist_texture[1].handle && d->up_hist_srv[1].handle && d->up_hist_uav[1].handle) {
-      d->up_ow = ow; d->up_oh = oh; d->up_iw = iw; d->up_ih = ih;
-      reshade::log::message(reshade::log::level::info,
-        (std::string("[Upscaler] history pair ") + std::to_string(ow) + "x" + std::to_string(oh)
-          + " <- " + std::to_string(iw) + "x" + std::to_string(ih)).c_str());
-    } else {
-      DestroyUpscalerHistory(dev, d);
-    }
-  }
-  bool haveSet = dimsOk
-      && d->up_hist_texture[0].handle && d->up_hist_srv[0].handle && d->up_hist_uav[0].handle
-      && d->up_hist_texture[1].handle && d->up_hist_srv[1].handle && d->up_hist_uav[1].handle
-      && d->up_ow == ow && d->up_oh == oh && d->up_iw == iw && d->up_ih == ih;
-  // NOTE: validity (upsampler_history_valid) and s_upscaler_was_active are
-  // advanced ONLY in on_draw / on_drawn, never here, so the replace-gate call
-  // cannot commit state early (that double-commit allowed fresh garbage
-  // history to read as valid on frame one).
-  d->up_ready = haveSet;
-  // Latch: set on new/incomplete sets; cleared ONLY by on_drawn after a
-  // completed draw. A second ensure call in the same frame must not clear
-  // what the first call set (dims now match stored values by construction).
-  if (!haveSet || shapeChanged) {
-    d->up_shape_changed = true;
-  }
-  shader_injection.upsample_inW = (float)iw;
-  shader_injection.upsample_inH = (float)ih;
-  shader_injection.upsample_outW = (float)ow;
-  shader_injection.upsample_outH = (float)oh;
-  bool motionLive = d->rcas_motion_srv.handle && d->rcas_motion_live.load();
-  shader_injection.upsampler_motion_live = motionLive ? 1.f : 0.f;
-  return haveSet;
-}
-
-static bool OnReplaceBlitUpscaleDraw(reshade::api::command_list* cmd_list) {
-  if (!BlitUpscalerActive()) return false;
-  return UpscalerEnsureReady(cmd_list);
-}
-
-static bool OnBeforeBlitUpscaleDraw(reshade::api::command_list* cmd_list) {
-  if (!cmd_list) return true;
-  if (!BlitUpscalerActive()) {
-    s_upscaler_was_active = false;
-    shader_injection.upsampler_history_valid = 0.f;
-    return true;
-  }
-  if (!UpscalerEnsureReady(cmd_list)) return true;  // vanilla-safe: no pushes, replacement not served
-  auto* dev = cmd_list->get_device();
-  if (!dev) return true;
-  auto* d = dev->get_private_data<DeviceData>();
-  if (!d) return true;
-  // Validity advances ONLY here (pre-draw), never in the replace-gate ensure
-  // call above: a set counts as history only after a completed draw wrote it
-  // (see on_drawn), so a fresh/resized set can never read as valid early.
-  shader_injection.upsampler_history_valid =
-      (d->up_ready && s_upscaler_was_active && !d->up_shape_changed) ? 1.f : 0.f;
-  uint32_t readSet = d->up_read & 1u;
-  uint32_t writeSet = 1u - readSet;
-  if (!d->up_hist_srv[readSet].handle || !d->up_hist_uav[writeSet].handle) return true;
-  bool motionLive = d->rcas_motion_srv.handle && d->rcas_motion_live.load();
-  // Push game/motion/depth/history bindings the vanilla blit never had.
-  // Depth falls back to 1x1 white (= far everywhere -> spread 0, graceful);
-  // motion falls back likewise (reads ignored while motion_live == 0).
-  // History SRV reads set[read], UAV writes set[write]: distinct resources,
-  // so no draw ever binds one resource as SRV and UAV simultaneously.
-  reshade::api::resource_view motionSrv = motionLive ? d->rcas_motion_srv : d->fallback_srv;
-  reshade::api::resource_view depthSrv = (d->captured_depth_srv.handle && d->captured_depth_live.load())
-      ? d->captured_depth_srv : d->fallback_srv;
-  reshade::api::resource_view histSrv = d->up_hist_srv[readSet];
-  reshade::api::resource_view histUav = d->up_hist_uav[writeSet];
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::pixel,
-      reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{
-          {}, 10u, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &motionSrv,
-      });
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::pixel,
-      reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{
-          {}, 11u, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &depthSrv,
-      });
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::pixel,
-      reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{
-          {}, 12u, 0, 1,
-          reshade::api::descriptor_type::texture_shader_resource_view,
-          &histSrv,
-      });
-  cmd_list->push_descriptors(
-      reshade::api::shader_stage::pixel,
-      reshade::api::pipeline_layout{0}, 0,
-      reshade::api::descriptor_table_update{
-          {}, 1u, 0, 1,
-          reshade::api::descriptor_type::texture_unordered_access_view,
-          &histUav,
-      });
-  // Re-push the captured TAA b2 (cb_taa) at b2: the game's blit-time b2 (if
-  // any) is irrelevant to the replacement shader, which declares its own b2
-  // solely for the current-frame jitter. Same-frame only — a stale range
-  // would offset reconstruction by the wrong jitter phase.
-  bool jitterLive = d->taa_cb_live.load() && d->taa_cb_res != 0u
-      && d->taa_cb_range.buffer.handle != 0u && d->taa_cb_frame == d->frame_index;
-  shader_injection.upsampler_jitter_live = jitterLive ? 1.f : 0.f;
-  if (jitterLive) {
-    cmd_list->push_descriptors(
-        reshade::api::shader_stage::pixel,
-        reshade::api::pipeline_layout{0}, 0,
-        reshade::api::descriptor_table_update{
-            {}, 2u, 0, 1,
-            reshade::api::descriptor_type::constant_buffer,
-            &d->taa_cb_range,
-        });
-  } else if (shader_injection.upsampler_jitter_reconstruction > 0.5f) {
-    static bool s_jitter_cb_warned = false;
-    if (!s_jitter_cb_warned) {
-      s_jitter_cb_warned = true;
-      reshade::log::message(reshade::log::level::info,
-        "[Upscaler] TAA b2 unavailable (push-bound?); jitter path falls back to fixed reconstruction");
-    }
-  }
-  // Push the captured frame CB (cb_scene) at b8 for the projection-jitter
-  // experiment: the replacement shader reads only p8_2/p9_2 from it. The
-  // range is pushed verbatim (buffer+offset+size), so HLSL c8/c9 land exactly
-  // where the game shader sees them. Pushed whenever available regardless of
-  // the selected source (UI toggling never changes push behavior); same-frame
-  // only, never stale. b13 is untouched (framework injection lives there).
-  {
-    const auto& fr = d->captured_scene_cbv;
-    bool frCoverC9 = (fr.size == UINT64_MAX) || (fr.size >= 160u);
-    bool projLive = d->captured_cbv_live.load() && fr.buffer.handle != 0u
-        && d->captured_scene_cbv_frame == d->frame_index && frCoverC9;
-    if (projLive) {
-      cmd_list->push_descriptors(
-          reshade::api::shader_stage::pixel,
-          reshade::api::pipeline_layout{0}, 0,
-          reshade::api::descriptor_table_update{
-              {}, 8u, 0, 1,
-              reshade::api::descriptor_type::constant_buffer,
-              &d->captured_scene_cbv,
-          });
-    } else if (shader_injection.upsampler_jitter_source > 0.5f
-               && shader_injection.upsampler_jitter_reconstruction > 0.5f) {
-      static bool s_proj_cb_warned = false;
-      if (!s_proj_cb_warned) {
-        s_proj_cb_warned = true;
-        reshade::log::message(reshade::log::level::info,
-          "[Upscaler] frame CB unavailable for projection jitter; shader reads zeros (static reconstruction)");
-      }
-    }
-  }
-  return true;
-}
-
-// Post-draw commit for the ping-pong history: runs strictly AFTER the blit
-// draw completed, so the just-written set becomes next frame's read set here
-// and only here. Read/write indices, first-frame validity, and the shape
-// latch all advance at this single point — never in on_draw/on_replace.
-static void OnDrawnBlitUpscale(reshade::api::command_list* cmd_list) {
-  if (!cmd_list) return;
-  if (!BlitUpscalerActive()) return;
-  auto* dev = cmd_list->get_device();
-  if (!dev) return;
-  auto* d = dev->get_private_data<DeviceData>();
-  if (!d) return;
-  d->up_read = 1u - (d->up_read & 1u);
-  d->up_shape_changed = false;
-  s_upscaler_was_active = true;
 }
 
 // ── Kai SSR Replacement (fused march + temporal composites, High + Ultra) ──
@@ -9702,11 +8841,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
-#if FALCOM_JITTER_PROBE
-      // TEMPORARY probe observers (delete with the probe block).
-      reshade::register_event<reshade::addon_event::update_buffer_region>(OnProbeUpdateBuffer);
-      reshade::register_event<reshade::addon_event::map_buffer_region>(OnProbeMapBuffer);
-#endif
       break;
     case DLL_PROCESS_DETACH:
       s_watchdogStop.store(true);
@@ -9721,10 +8855,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
-#if FALCOM_JITTER_PROBE
-      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnProbeUpdateBuffer);
-      reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnProbeMapBuffer);
-#endif
       reshade::unregister_addon(h_module);
       break;
   }

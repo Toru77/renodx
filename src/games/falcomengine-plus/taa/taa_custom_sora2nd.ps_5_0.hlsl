@@ -48,15 +48,6 @@ void main(
 
   float3 current = colorTexture.SampleLevel(samLinear_s, uv, 0).xyz;
 
-  // --- Upscaler bypass: raw jittered passthrough, no temporal work ---
-  // Gated by C++-set uniform: active only for Sora2nd while its temporal
-  // upscaler runs (Sora1st shares this file but never sets it). The
-  // output-resolution upscaler owns ALL temporal accumulation downstream.
-  if (shader_injection_data.taa_bypass_accumulation > 0.5) {
-    o0 = float4(clamp(current, 0.0, 65472.0), 1.0);
-    return;
-  }
-
   // --- History reset: first custom frame outputs current only ---
   if (shader_injection_data.custom_taa_history_valid < 0.5) {
     o0 = float4(clamp(current, 0.0, 65472.0), 1.0);
