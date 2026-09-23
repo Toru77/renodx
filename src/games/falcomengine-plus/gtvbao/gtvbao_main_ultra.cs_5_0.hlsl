@@ -92,13 +92,34 @@ float3 SafeNormalize3(float3 v, float3 fallback)
 
 float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
 {
-  int2 size = max(consts.ViewportSize, int2(1, 1));
-  int2 tc = int2(pix);
-  float c = g_srcWorkingDepth.Load(int3(clamp(tc, int2(0,0), size-1), 0));
-  float l = g_srcWorkingDepth.Load(int3(clamp(tc+int2(-1,0), int2(0,0), size-1), 0));
-  float r = g_srcWorkingDepth.Load(int3(clamp(tc+int2(1,0), int2(0,0), size-1), 0));
-  float t = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,-1), int2(0,0), size-1), 0));
-  float b = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,1), int2(0,0), size-1), 0));
+  if (GTVBAO_resolution < 0.5f) {
+    int2 size = max(consts.ViewportSize, int2(1, 1));
+    int2 tc = int2(pix);
+    float c = g_srcWorkingDepth.Load(int3(clamp(tc, int2(0,0), size-1), 0));
+    float l = g_srcWorkingDepth.Load(int3(clamp(tc+int2(-1,0), int2(0,0), size-1), 0));
+    float r = g_srcWorkingDepth.Load(int3(clamp(tc+int2(1,0), int2(0,0), size-1), 0));
+    float t = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,-1), int2(0,0), size-1), 0));
+    float b = g_srcWorkingDepth.Load(int3(clamp(tc+int2(0,1), int2(0,0), size-1), 0));
+    float delta = max(max(abs(l-c), abs(r-c)), max(abs(t-c), abs(b-c)));
+    return saturate(delta * 1.0);
+  }
+  // Half mode: edge metric lives in the half-res AO domain. Each half-res
+  // sample (center + 4 half-neighbours) maps to its full-res block center
+  // (min(h*2+1, full-1), odd-safe); depths are point-loaded there.
+  uint fw, fh;
+  g_srcWorkingDepth.GetDimensions(fw, fh);
+  int2 halfDims = max(consts.ViewportSize, int2(1, 1));
+  int2 fullDims = int2(max(fw, 1u), max(fh, 1u));
+  int2 hc = clamp(int2(pix), int2(0, 0), halfDims - 1);
+  int2 hL = clamp(hc + int2(-1, 0), int2(0, 0), halfDims - 1);
+  int2 hR = clamp(hc + int2( 1, 0), int2(0, 0), halfDims - 1);
+  int2 hT = clamp(hc + int2( 0,-1), int2(0, 0), halfDims - 1);
+  int2 hB = clamp(hc + int2( 0, 1), int2(0, 0), halfDims - 1);
+  float c = g_srcWorkingDepth.Load(int3(GTVBAO_HalfToFullCenter(hc, fullDims), 0));
+  float l = g_srcWorkingDepth.Load(int3(GTVBAO_HalfToFullCenter(hL, fullDims), 0));
+  float r = g_srcWorkingDepth.Load(int3(GTVBAO_HalfToFullCenter(hR, fullDims), 0));
+  float t = g_srcWorkingDepth.Load(int3(GTVBAO_HalfToFullCenter(hT, fullDims), 0));
+  float b = g_srcWorkingDepth.Load(int3(GTVBAO_HalfToFullCenter(hB, fullDims), 0));
   float delta = max(max(abs(l-c), abs(r-c)), max(abs(t-c), abs(b-c)));
   return saturate(delta * 1.0);
 }
@@ -127,11 +148,35 @@ float3 TransformNormalToView(float3 decoded)
 
 float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
 {
-  float2 u = (float2(pix) + 0.5) * consts.ViewportPixelSize;
-  float4 ul = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize);
-  float4 br = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize, int2(1,1));
-  return DepthNormal(pix, u, ul.y, ul.x, br.z, ul.z, br.x,
-      GTVBAO_CalculateEdges(ul.y, ul.x, br.z, ul.z, br.x), consts);
+  if (GTVBAO_resolution < 0.5f) {
+    float2 u = (float2(pix) + 0.5) * consts.ViewportPixelSize;
+    float4 ul = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize);
+    float4 br = g_srcWorkingDepth.GatherRed(g_samplerPointClamp, float2(pix) * consts.ViewportPixelSize, int2(1,1));
+    return DepthNormal(pix, u, ul.y, ul.x, br.z, ul.z, br.x,
+        GTVBAO_CalculateEdges(ul.y, ul.x, br.z, ul.z, br.x), consts);
+  }
+  // Half mode: point-load the block-center cross on the full-res depth.
+  uint fw, fh;
+  g_srcWorkingDepth.GetDimensions(fw, fh);
+  int2 fullDims = int2(max(fw, 1u), max(fh, 1u));
+  int2 halfDims = max(consts.ViewportSize, int2(1, 1));
+  int2 fmax = max(fullDims - 1, int2(0, 0));
+  int2 fc = GTVBAO_HalfToFullCenter(clamp(int2(pix), int2(0, 0), halfDims - 1), fullDims);
+  float2 fullPx = 1.0 / max(float2(fullDims), float2(1, 1));
+  float2 uC = (float2(fc) + 0.5) * fullPx;
+  float z = g_srcWorkingDepth.Load(int3(fc, 0));
+  float l = g_srcWorkingDepth.Load(int3(clamp(fc + int2(-1, 0), int2(0, 0), fmax), 0));
+  float r = g_srcWorkingDepth.Load(int3(clamp(fc + int2( 1, 0), int2(0, 0), fmax), 0));
+  float t = g_srcWorkingDepth.Load(int3(clamp(fc + int2( 0,-1), int2(0, 0), fmax), 0));
+  float b = g_srcWorkingDepth.Load(int3(clamp(fc + int2( 0, 1), int2(0, 0), fmax), 0));
+  float3 C = GTVBAO_ComputeViewspacePosition(uC, z, consts);
+  float3 L = GTVBAO_ComputeViewspacePosition(uC + float2(-1, 0) * fullPx, l, consts);
+  float3 R = GTVBAO_ComputeViewspacePosition(uC + float2( 1, 0) * fullPx, r, consts);
+  float3 T = GTVBAO_ComputeViewspacePosition(uC + float2( 0,-1) * fullPx, t, consts);
+  float3 B = GTVBAO_ComputeViewspacePosition(uC + float2( 0, 1) * fullPx, b, consts);
+  return (float3)GTVBAO_CalculateNormal(
+      GTVBAO_CalculateEdges((lpfloat)z, (lpfloat)l, (lpfloat)r, (lpfloat)t, (lpfloat)b),
+      C, L, R, T, B);
 }
 
 float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants consts)
@@ -175,8 +220,9 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
 [numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]
 void main(uint2 p : SV_DispatchThreadID)
 {
+  // Output domain drives the constants: half-res output in Half mode (depth stays full).
   uint width, height;
-  g_srcWorkingDepth.GetDimensions(width, height);
+  g_outWorkingAOTerm.GetDimensions(width, height);
   if (p.x >= width || p.y >= height) return;
 
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));

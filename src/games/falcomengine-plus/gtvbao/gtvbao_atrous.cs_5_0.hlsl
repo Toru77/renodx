@@ -49,9 +49,28 @@ void main(uint2 dt : SV_DispatchThreadID)
   const bool isLastPass = GTVBAO_denoise_is_last_pass > 0.5f;
 
   float2 uv = (float2(dt) + 0.5) * consts.ViewportPixelSize;
-  float centerZ = g_srcAtrousDepth.SampleLevel(g_samplerPointClamp, uv, 0);
-  int2 centerTc = min(int2(floor(uv * float2(nw, nh))), int2(nw - 1, nh - 1));
-  float3 centerN = g_srcAtrousNormal.Load(int3(centerTc, 0)).xyz;
+  // Half mode: depth/normal inputs stay full-res; map half taps to full
+  // block centers (odd-safe). AO input matches the output domain.
+  uint dwFull, dhFull;
+  g_srcAtrousDepth.GetDimensions(dwFull, dhFull);
+  int2 depthFullDims = int2(max(dwFull, 1u), max(dhFull, 1u));
+  const bool halfGeo = GTVBAO_resolution > 0.5f;
+  float centerZ;
+  int2 centerTc;
+  float3 centerN;
+  if (!halfGeo) {
+    centerZ = g_srcAtrousDepth.SampleLevel(g_samplerPointClamp, uv, 0);
+    centerTc = min(int2(floor(uv * float2(nw, nh))), int2(nw - 1, nh - 1));
+    centerN = g_srcAtrousNormal.Load(int3(centerTc, 0)).xyz;
+  } else {
+    int2 fc = GTVBAO_HalfToFullCenter(
+        clamp(int2(dt), int2(0, 0), max(int2(width, height) - 1, int2(0, 0))), depthFullDims);
+    centerZ = g_srcAtrousDepth.Load(int3(fc, 0));
+    int2 nm = int2(max(nw, 1u), max(nh, 1u));
+    centerTc = GTVBAO_HalfToFullCenter(
+        clamp(int2(dt), int2(0, 0), max(int2(width, height) - 1, int2(0, 0))), nm);
+    centerN = g_srcAtrousNormal.Load(int3(centerTc, 0)).xyz;
+  }
 
   float centerAO = (float)g_srcAtrousAO.Load(int3(dt, 0)) * (1.0f / 255.0f);
 
@@ -98,7 +117,18 @@ void main(uint2 dt : SV_DispatchThreadID)
       // Depth/normal loads use integer texels directly: all three textures
       // share w,h and taps are texel-centered, so this matches the
       // float-UV + point-sample + floor sequence exactly.
-      float nz = g_srcAtrousDepth.Load(int3(npc, 0));
+      // Half mode: map the half-res tap to the full-res block center.
+      float nz;
+      float3 tapN;
+      if (!halfGeo) {
+        nz = g_srcAtrousDepth.Load(int3(npc, 0));
+        tapN = g_srcAtrousNormal.Load(int3(npc, 0)).xyz;
+      } else {
+        int2 hmax = max(int2(width, height) - 1, int2(0, 0));
+        nz = g_srcAtrousDepth.Load(int3(GTVBAO_HalfToFullCenter(clamp(npc, int2(0, 0), hmax), depthFullDims), 0));
+        int2 nm2 = int2(max(nw, 1u), max(nh, 1u));
+        tapN = g_srcAtrousNormal.Load(int3(GTVBAO_HalfToFullCenter(clamp(npc, int2(0, 0), hmax), nm2), 0)).xyz;
+      }
 
       // Depth edge-stop: relative test scaled by world-space pixel footprint so
       // distant geometry isn't over-rejected. Denominator hoisted out of the
@@ -110,7 +140,7 @@ void main(uint2 dt : SV_DispatchThreadID)
       // Normal edge-stop — repeated squaring (x^(2^sqSteps)), no pow().
       // Squaring loop is counted (sqSteps is dispatch-uniform): identical math,
       // no per-iteration branch evaluations.
-      float nd = saturate(dot(centerN, g_srcAtrousNormal.Load(int3(npc, 0)).xyz));
+      float nd = saturate(dot(centerN, tapN));
       float nW = nd;
       for (int q = 0; q < sqSteps; ++q) {
         nW *= nW;

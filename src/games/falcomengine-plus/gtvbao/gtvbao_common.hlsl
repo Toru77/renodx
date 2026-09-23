@@ -129,7 +129,34 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_atrous_depth_sigma;     // c[67] — [0.05..4] relative depth edge-stop strength
   float GTVBAO_atrous_normal_sigma;    // c[68] — [2..128] normal edge-stop power
   float GTVBAO_atrous_step;            // c[69] — à-trous stride for this dispatch (1, 2, 4)
+  // ── Half-resolution spatial pipeline (appended; Full path ignores these) ──
+  float GTVBAO_resolution;             // c[70] — 0=Full, 1=Half
+  float GTVBAO_upscale_plane_sigma;    // c[71] — reconstruction plane edge-stop sigma
+  float GTVBAO_upscale_normal_power;   // c[72] — reconstruction normal weight power
+  float GTVBAO_upscale_debug;          // c[73] — reconstruction diagnostics mode
 };
+
+// ── Half-res → full-res block-center mapping (odd-dimension safe) ──
+// halfTexel covers full block {2*h, 2*h+1}; center representative is 2*h+1,
+// clamped for odd full dims (e.g. full=5, half=3: h=2 -> min(5,4)=4).
+int2 GTVBAO_HalfToFullCenter(int2 halfTC, int2 fullDims) {
+  return min(halfTC * 2 + 1, max(fullDims - 1, int2(0, 0)));
+}
+float2 GTVBAO_HalfToFullCenterUV(int2 halfTC, int2 halfDims, int2 fullDims) {
+  int2 fullTC = GTVBAO_HalfToFullCenter(
+      clamp(halfTC, int2(0, 0), max(halfDims - 1, int2(0, 0))), fullDims);
+  return (float2(fullTC) + 0.5) / max(float2(fullDims), float2(1, 1));
+}
+
+// Point-load full-res depth at the block center for a half-res texel
+// (odd-safe). halfDims = denoiser/AO working domain.
+float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDims) {
+  uint fw, fh;
+  depthTex.GetDimensions(fw, fh);
+  int2 fullDims = int2(max(fw, 1u), max(fh, 1u));
+  int2 htc = clamp(halfTC, int2(0, 0), max(halfDims - 1, int2(0, 0)));
+  return depthTex.Load(int3(GTVBAO_HalfToFullCenter(htc, fullDims), 0));
+}
 
 // ── GI parameters are native cb_gtvbao fields (c[25]-c[33]) — no aliases needed.
 #define g_isfast_enabled        GTVBAO_isfast_enabled            // IS-FAST enable (0/1)

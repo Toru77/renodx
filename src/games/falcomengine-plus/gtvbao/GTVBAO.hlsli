@@ -384,8 +384,34 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 {                                                                       
     float2 normalizedScreenPos = (pixCoord + float2( 0.5, 0.5 )) * consts.ViewportPixelSize;
 
-    lpfloat4 valuesUL   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize )               );
-    lpfloat4 valuesBR   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2( 1, 1 ) );
+    // ── Half-res mode: output domain is half, depth input stays full. ──
+    // Full path below is untouched; Half uses block-center point loads
+    // (fullTexel = min(half*2+1, full-1), odd-safe) instead of Gather.
+    uint g_fullDepthW, g_fullDepthH;
+    sourceViewspaceDepth.GetDimensions(g_fullDepthW, g_fullDepthH);
+    const bool g_halfRes = GTVBAO_resolution > 0.5f;
+    const int2 g_workDims = g_halfRes ? consts.ViewportSize : int2(g_fullDepthW, g_fullDepthH);
+
+    lpfloat viewspaceZ;
+    lpfloat pixLZ, pixTZ, pixRZ, pixBZ;
+    if (!g_halfRes) {
+      lpfloat4 valuesUL   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize )               );
+      lpfloat4 valuesBR   = sourceViewspaceDepth.GatherRed( depthSampler, float2( pixCoord * consts.ViewportPixelSize ), int2( 1, 1 ) );
+      viewspaceZ  = valuesUL.y;
+      pixLZ = valuesUL.x;
+      pixTZ = valuesUL.z;
+      pixRZ = valuesBR.z;
+      pixBZ = valuesBR.x;
+    } else {
+      int2 htc = clamp(int2(pixCoord), int2(0, 0), max(g_workDims - 1, int2(0, 0)));
+      int2 ftc = GTVBAO_HalfToFullCenter(htc, int2(g_fullDepthW, g_fullDepthH));
+      int2 fmax = int2(max((int)g_fullDepthW - 1, 0), max((int)g_fullDepthH - 1, 0));
+      viewspaceZ = (lpfloat)sourceViewspaceDepth.Load(int3(ftc, 0));
+      pixLZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2(-1, 0), int2(0, 0), fmax), 0));
+      pixRZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2( 1, 0), int2(0, 0), fmax), 0));
+      pixTZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2( 0,-1), int2(0, 0), fmax), 0));
+      pixBZ = (lpfloat)sourceViewspaceDepth.Load(int3(clamp(ftc + int2( 0, 1), int2(0, 0), fmax), 0));
+    }
 
     // Cache texture dimensions for foliage mask checks (only when mask is fresh this frame).
     uint g_mrtW, g_mrtH;
@@ -393,15 +419,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     uint g_maskW = 1, g_maskH = 1;
     if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f)
         foliageMaskTexture.GetDimensions(g_maskW, g_maskH);
-
-    // viewspace Z at the center
-    lpfloat viewspaceZ  = valuesUL.y; //sourceViewspaceDepth.SampleLevel( depthSampler, normalizedScreenPos, 0 ).x; 
-
-    // viewspace Zs left top right bottom
-    const lpfloat pixLZ = valuesUL.x;
-    const lpfloat pixTZ = valuesUL.z;
-    const lpfloat pixRZ = valuesBR.z;
-    const lpfloat pixBZ = valuesBR.x;
 
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
     outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
@@ -415,9 +432,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     bool gtvbao_foliage_pixel = false;
     bool checkFoliage = (GTVBAO_debug_mode > 8.5f) || (GTVBAO_exclude_foliage > 0.5f);
     if (checkFoliage) {
-      uint workW, workH;
-      sourceViewspaceDepth.GetDimensions(workW, workH);
-      float2 mrtScale = float2(g_mrtW, g_mrtH) / max(float2(workW, workH), 1.0.xx);
+      float2 mrtScale = float2(g_mrtW, g_mrtH) / max(float2(g_workDims), 1.0.xx);
       int2 mrtTC = min(int2(floor((float2(pixCoord) + 0.5) * mrtScale)), int2(g_mrtW - 1, g_mrtH - 1));
       uint4 _mrtV = mrtNormalTexture.Load(int3(mrtTC, 0));
       uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;

@@ -117,7 +117,9 @@ void main(uint2 dt : SV_DispatchThreadID)
         int2 pc = int2(dt.x * 2 + pf_side, dt.y);
         if (pc.x >= (int)pf_w || pc.y >= (int)pf_h) continue;
         float centerAO = (float)g_srcWorkingAOTerm.Load(int3(pc, 0)) * (1.0f / 255.0f);
-        float centerDepth = g_srcDepth.Load(int3(pc, 0));
+        float centerDepth = (GTVBAO_resolution > 0.5f)
+            ? GTVBAO_LoadMappedDepth(g_srcDepth, pc, int2(pf_w, pf_h))
+            : g_srcDepth.Load(int3(pc, 0));
         float filteredSum = centerAO, filteredW = 1.0f;
         [unroll]
         for (int dy = -1; dy <= 1; dy++) {
@@ -127,7 +129,9 @@ void main(uint2 dt : SV_DispatchThreadID)
             int2 npc = int2(pc.x + dx, pc.y + dy);
             if (npc.x < 0 || npc.y < 0 || npc.x >= (int)pf_w || npc.y >= (int)pf_h) continue;
             float nAO = (float)g_srcWorkingAOTerm.Load(int3(npc, 0)) * (1.0f / 255.0f);
-            float nDepth = g_srcDepth.Load(int3(npc, 0));
+            float nDepth = (GTVBAO_resolution > 0.5f)
+                ? GTVBAO_LoadMappedDepth(g_srcDepth, npc, int2(pf_w, pf_h))
+                : g_srcDepth.Load(int3(npc, 0));
             float depthW = exp(-abs(centerDepth - nDepth) * 10.0f);
             filteredSum += nAO * depthW;
             filteredW += depthW;
@@ -157,7 +161,9 @@ void main(uint2 dt : SV_DispatchThreadID)
         int2 pc = int2(dt.x * 2 + pf_side, dt.y);
         if (pc.x >= (int)pf_w || pc.y >= (int)pf_h) continue;
         float centerAO = (float)g_srcWorkingAOTerm.Load(int3(pc, 0)) * (1.0f / 255.0f);
-        float centerDepth = g_srcDepth.Load(int3(pc, 0));
+        float centerDepth = (GTVBAO_resolution > 0.5f)
+            ? GTVBAO_LoadMappedDepth(g_srcDepth, pc, int2(pf_w, pf_h))
+            : g_srcDepth.Load(int3(pc, 0));
         float filteredSum = centerAO, filteredW = 1.0f;
         [unroll]
         for (int dy = -1; dy <= 1; dy++) {
@@ -167,7 +173,9 @@ void main(uint2 dt : SV_DispatchThreadID)
             int2 npc = int2(pc.x + dx, pc.y + dy);
             if (npc.x < 0 || npc.y < 0 || npc.x >= (int)pf_w || npc.y >= (int)pf_h) continue;
             float nAO = (float)g_srcWorkingAOTerm.Load(int3(npc, 0)) * (1.0f / 255.0f);
-            float nDepth = g_srcDepth.Load(int3(npc, 0));
+            float nDepth = (GTVBAO_resolution > 0.5f)
+                ? GTVBAO_LoadMappedDepth(g_srcDepth, npc, int2(pf_w, pf_h))
+                : g_srcDepth.Load(int3(npc, 0));
             float depthW = exp(-abs(centerDepth - nDepth) * 10.0f);
             filteredSum += nAO * depthW;
             filteredW += depthW;
