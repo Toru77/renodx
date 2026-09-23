@@ -382,9 +382,10 @@ struct ShaderInjectData {
   float rcas_strength;                       // [0..1], default 0.2 — linear lobe multiplier (0 = off/passthrough)
   float rcas_enabled;                        // 0=forced 0 sharpening (stage still runs: hist copy + t2 path intact), 1=strength applies; default On
   float rcas_denoise;                        // 0=off (reference default), 1=apply nz grain reduction (lobe *= nz, 0.5..1.0 range)
-  // —— RCAS Stage 2 motion-adaptive sharpening (absolute base -> motion interpolation) ——
+  // —— RCAS Stage 2 motion-adaptive sharpening (base * multiplier, clamped to max) ——
   float rcas_motion_on;                      // 0=base strength exactly (previous behavior), 1=per-pixel interpolation; default On
-  float rcas_motion_strength;                // ABSOLUTE motion target [0..1], default 0.6 (never base+target)
+  float rcas_motion_multiplier;              // [1..10], default 2.0 — motion value = min(base * multiplier, max)
+  float rcas_motion_max;                     // [0..3], default 1.0 — clamp for the motion value (may exceed 1)
   float rcas_motion_threshold;               // px [0..3], default 1.0 — motion below this adds nothing (jitter floor)
   float rcas_motion_range;                   // px [0.25..8], default 2.0 — additional motion to reach the target
   float rcas_motion_response;                // [0.5..3], default 1.0 — pow curvature of the transition

@@ -353,7 +353,8 @@ ShaderInjectData shader_injection = {
   .rcas_enabled = 1.f,
   .rcas_denoise = 0.f,
   .rcas_motion_on = 1.f,
-  .rcas_motion_strength = 0.6f,
+  .rcas_motion_multiplier = 2.0f,
+  .rcas_motion_max = 1.0f,
   .rcas_motion_threshold = 1.0f,
   .rcas_motion_range = 2.0f,
   .rcas_motion_response = 1.0f,
@@ -403,7 +404,7 @@ constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 5u;  // bump when the SSR blur
 constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persistent world-space AABB for world-fixed parallax)
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;  // bump when the worldbox pipeline layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeCaptureLayoutVersion = 1u;  // bump when the capture pipeline layout shape changes (forces recreate)
-constexpr uint32_t kRCASLayoutVersion = 4u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
+constexpr uint32_t kRCASLayoutVersion = 5u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
 // Strip sRGB encoding for UAV-compatible temp storage and raw (non-decoding)
 // SRV reads. Copies stay bitwise so the game keeps decoding exactly as before.
 // Non-sRGB formats map to identity (FP16 HDR path unchanged).
@@ -3619,7 +3620,7 @@ renodx::utils::settings::Settings settings = {
       .key = "CustomTAAEnabled", .binding = &shader_injection.custom_taa_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Enable Custom TAA", .section = "Custom TAA",
-      .tooltip = "Off = the game's original TAA runs untouched. On = the from-scratch custom TAA serves the TAA pass (first custom frame outputs current only, then accumulates).",
+      .tooltip = "Smooths jagged edges and flickering while moving. On = cleaner custom anti-aliasing. Off = the game's original anti-aliasing.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
@@ -3630,7 +3631,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "History reconstruction: Bilinear (TAA-0 baseline), Adaptive high-order (edge-gated bicubic), Full bicubic.",
       .labels = {"Bilinear", "Adaptive", "Full"},
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CustomTAAClipMode", .binding = &shader_injection.custom_taa_clip_mode,
@@ -3639,7 +3640,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "History validation: None (TAA-0/1), RGB AABB baseline (TAA-2), k-DOP polytope clip (TAA-3).",
       .labels = {"None", "AABB", "k-DOP"},
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CustomTAAStaticFeedback", .binding = &shader_injection.custom_taa_static_feedback,
@@ -3680,7 +3681,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CustomTAADetailRestore", .binding = &shader_injection.custom_taa_detail_restore,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Detail Restore", .section = "Custom TAA",
+      .default_value = 0.25f, .label = "Detail Restore", .section = "Custom TAA",
       .tooltip = "Feedback restoration experiment: restores history feedback toward Static on high-relative-detail pixels whose history agrees with current (flat or disagreeing pixels unchanged). 0 = prior behavior exactly; test value 8.0. Requires validation on.",
       .min = 0.f, .max = 32.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
@@ -3689,7 +3690,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CustomTAADetailTarget", .binding = &shader_injection.custom_taa_detail_target,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.95f, .label = "Detail Target", .section = "Custom TAA",
+      .default_value = 0.99f, .label = "Detail Target", .section = "Custom TAA",
       .tooltip = "Selective above-static accumulation experiment: high-detail, low-motion, history-agreeing pixels (and silhouette-valid) approach this feedback (~20-frame window at 0.95) without giving that window to the whole image. Equal to Static = off (exact prior behavior); test 0.95 against Static 0.85. Requires validation on.",
       .min = 0.85f, .max = 0.99f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.custom_taa_clip_mode > 0.5f; },
@@ -3754,7 +3755,7 @@ renodx::utils::settings::Settings settings = {
       .key = "RCASEnabled", .binding = &shader_injection.rcas_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Enable RCAS", .section = "Custom TAA",
-      .tooltip = "On = sharpening applies per the Sharpening slider. Off = forces 0 sharpening (passthrough); the stage machinery (history copy, t2 path) keeps running identically.",
+      .tooltip = "Turns image sharpening on or off.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
@@ -3762,7 +3763,7 @@ renodx::utils::settings::Settings settings = {
       .key = "RCASStrength", .binding = &shader_injection.rcas_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.3f, .label = "Sharpening", .section = "Custom TAA",
-      .tooltip = "RCAS strength 0..1, linear response (0 = off/passthrough, 0.2 = mild). Each step adds roughly equal sharpening. Test 0 vs 0.20 on static/moving detail, foliage, thin geometry and HDR highlights; watch for ringing, halos and amplified shimmer.",
+      .tooltip = "How crisp the image looks. Higher values give a sharper picture but can cause glowing edges if set too high. 0 turns sharpening off.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
@@ -3774,16 +3775,25 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Automatically strengthens sharpening while the camera or objects move, then relaxes it back when the image is still. Off = always use the Sharpening value above.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "RCASMotionStrength", .binding = &shader_injection.rcas_motion_strength,
+      .key = "RCASMotionMultiplier", .binding = &shader_injection.rcas_motion_multiplier,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Motion Sharpening Strength", .section = "Custom TAA",
-      .tooltip = "How strong sharpening gets during fast movement. This replaces the Sharpening value while moving -- it is never added on top. Example: Sharpening 0.20 with this at 0.60 means a still image uses 0.20 and fast motion uses 0.60.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .default_value = 4.0f, .label = "Motion Sharpening Multiplier", .section = "Custom TAA",
+      .tooltip = "Scales the Sharpening value during fast movement: motion value = base x multiplier, clamped to Max Motion Sharpening below. Example: Sharpening 0.30 with this at 2.0 means a still image uses 0.30 and fast motion uses 0.60.",
+      .min = 1.f, .max = 10.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
-      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "RCASMotionMax", .binding = &shader_injection.rcas_motion_max,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 1.0f, .label = "Max Motion Sharpening", .section = "Custom TAA",
+      .tooltip = "Clamps the motion sharpening value from above. May exceed 1 for stronger motion sharpening (watch for ringing/halos at high values). Example: Sharpening 0.30 with 10x multiplier reaches 3.00 but is clamped to this value.",
+      .min = 0.f, .max = 3.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "RCASMotionThreshold", .binding = &shader_injection.rcas_motion_threshold,
@@ -5531,7 +5541,7 @@ static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 10;  // con, width, height, denoise, motionOn, threshold, range, response, conMotion, debug
+    push_range.count = 11;  // con, width, height, denoise, motionOn, threshold, range, response, mult, debug, max
     push_range.visibility = DS::all_compute;
     P p0, p1, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
@@ -5630,8 +5640,14 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   d->rcas_have_copy = true;
   // Enable toggle forces 0 sharpening (stage machinery above runs identically).
   // Strength 0 is the off position: unsharpened output stays in place.
+  // Dispatch runs whenever base sharpening or motion sharpening could apply;
+  // base 0 with motion on + live motion view still dispatches (motion value
+  // comes from base x multiplier, so it is 0 there by arithmetic, exactly).
   float effStrength = (shader_injection.rcas_enabled > 0.5f) ? shader_injection.rcas_strength : 0.f;
-  if (effStrength <= 0.0005f) return;
+  bool motionCouldApply = (shader_injection.rcas_enabled > 0.5f)
+      && (shader_injection.rcas_motion_on > 0.5f)
+      && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
+  if (effStrength <= 0.0005f && !motionCouldApply) return;
 
   // 2) RCAS compute: reads the owned unsharpened copy (t0) + motion (t1),
   // writes temp (u0). Motion view falls back to the 1x1 white fallback (never
@@ -5648,22 +5664,22 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->rcas_layout, 0, 2, tables.data());
   {
     // Linear response: con = S directly (visible effect is ~linear in con
-    // pre-clamp). S=0 never reaches here (passthrough early-out above);
-    // S=1 matches the old mapping's maximum exactly.
-    // Motion sharpening interpolates base -> motion target per pixel; Off (or
-    // dead/missing motion view) uses base con exactly = previous behavior.
+    // pre-clamp). S=1 matches the old mapping's maximum exactly.
+    // Motion sharpening interpolates base -> min(base x multiplier, max) per
+    // pixel; Off (or dead/missing motion view) uses base con exactly.
     float s = std::clamp(effStrength, 0.f, 1.f);
     float dn = (shader_injection.rcas_denoise > 0.5f) ? 1.f : 0.f;
     bool motionOk = (shader_injection.rcas_motion_on > 0.5f)
         && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
-    float pc[10] = {s, (float)w, (float)h, dn,
+    float pc[11] = {s, (float)w, (float)h, dn,
                    motionOk ? 1.f : 0.f,
                    std::max(0.f, shader_injection.rcas_motion_threshold),
                    std::max(0.25f, shader_injection.rcas_motion_range),
                    std::clamp(shader_injection.rcas_motion_response, 0.5f, 3.f),
-                   std::clamp(shader_injection.rcas_motion_strength, 0.f, 1.f),
-                   shader_injection.rcas_debug > 0.5f ? 1.f : 0.f};
-    cmd_list->push_constants(reshade::api::shader_stage::all_compute, d->rcas_layout, 2, 0, 10, pc);
+                   std::clamp(shader_injection.rcas_motion_multiplier, 1.f, 10.f),
+                   shader_injection.rcas_debug > 0.5f ? 1.f : 0.f,
+                   std::clamp(shader_injection.rcas_motion_max, 0.f, 3.f)};
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, d->rcas_layout, 2, 0, 11, pc);
     if (!d->rcas_dispatch_logged) {
       reshade::log::message(reshade::log::level::info,
         (std::string("[RCAS] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)

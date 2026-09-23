@@ -27,7 +27,7 @@
 
 cbuffer RCASCB : register(b13) {
   float g_con;     // base lobe multiplier 0..1 from UI Sharpening (linear).
-                   // S=0 never dispatches (CPU passthrough).
+                   // S=0 with motion off skips dispatch (CPU passthrough).
   float g_width;   // target width in pixels (float; converted to int)
   float g_height;  // target height in pixels (float; converted to int)
   float g_denoise; // 0 = reference default (full sharpening); 1 = apply the
@@ -38,10 +38,10 @@ cbuffer RCASCB : register(b13) {
   float g_motionThreshold;// px: motion below this adds no sharpening (jitter floor).
   float g_motionRange;    // px of additional motion to reach the motion target.
   float g_motionResponse; // pow curvature of the threshold->target transition.
-  float g_conMotion;      // ABSOLUTE motion target (NOT base+target):
-                          // max motion interpolates base -> motion, never sums.
+  float g_motionMult;     // motion multiplier [1..10]: motion value = min(base * mult, max).
   float g_debug;          // 0 = normal sharpen; 1 = motion-strength heatmap
                           // (green = no boost, yellow = partial, red = full).
+  float g_motionMax;      // clamp for the motion value [0..3] (may exceed 1).
 };
 
 Texture2D<float4> g_src : register(t0);     // unsharpened TAA output
@@ -61,9 +61,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
   if (tid.x >= (uint)dims.x || tid.y >= (uint)dims.y) return;
   int2 sp = int2(tid.xy);
 
-  // Motion-adaptive strength (Stage 2): absolute interpolation between the
-  // base and motion targets -- never summed. Jitter-level motion stays under
-  // the threshold, so static pixels keep exactly the base strength.
+  // Motion-adaptive strength (Stage 2): per-pixel interpolation between the
+  // base and the motion value (min(base * multiplier, max)) -- never summed.
+  // Jitter-level motion stays under the threshold, so static pixels keep
+  // exactly the base strength. Base 0 gives motion 0 by arithmetic; the stage
+  // itself still dispatches (CPU gate) so any base > 0 ramps correctly.
   // Motion buffer shares output UV space (same assumption the TAA shader
   // itself makes), so integer texel loads apply. Skipped entirely when off.
   float con = g_con;
@@ -72,7 +74,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float motionPixels = length(g_motion.Load(int3(sp, 0)).xy);
     motionT = saturate((motionPixels - g_motionThreshold) / max(g_motionRange, 1e-4));
     motionT = pow(motionT, g_motionResponse);
-    con = lerp(g_con, g_conMotion, motionT);
+    con = lerp(g_con, min(g_con * g_motionMult, g_motionMax), motionT);
   }
 
   // Motion-strength heatmap (diagnostic): visualizes the same mask the real
