@@ -401,6 +401,7 @@ struct ShaderInjectData {
   float gtvbao_upscale_plane_sigma;          // reconstruction plane edge-stop sigma, default 40
   float gtvbao_upscale_normal_power;         // reconstruction normal weight power, default 16
   float gtvbao_upscale_debug;                // 0=Final, others=reconstruction diagnostics
+  float gtvbao_upscale_mode;                 // temporary A/B: 0=5x5 Joint (default), 1=Nearest (diagnostic)
 };
 
 #ifndef __cplusplus

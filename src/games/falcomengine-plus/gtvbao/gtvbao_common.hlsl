@@ -134,6 +134,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_upscale_plane_sigma;    // c[71] — reconstruction plane edge-stop sigma
   float GTVBAO_upscale_normal_power;   // c[72] — reconstruction normal weight power
   float GTVBAO_upscale_debug;          // c[73] — reconstruction diagnostics mode
+  float GTVBAO_upscale_mode;           // c[74] — 0=5x5 Joint, 1=Nearest (temporary A/B)
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──

@@ -372,6 +372,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_upscale_plane_sigma = 40.f,
   .gtvbao_upscale_normal_power = 16.f,
   .gtvbao_upscale_debug = 0.f,
+  .gtvbao_upscale_mode = 0.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -642,6 +643,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view upscale_gi_uav = {};
   reshade::api::pipeline_layout upscale_layout = {};
   reshade::api::pipeline upscale_pipeline = {};
+  reshade::api::pipeline upscale_nearest_pipeline = {};  // temporary A/B diagnostic
+  reshade::api::pipeline upscale_4tap_pipeline = {};      // 4-tap joint A/B diagnostic
   GTVBAODescriptorTableSet upscale_tables = {};
 
   reshade::api::pipeline_layout prefilter_layout = {};
@@ -2291,6 +2294,14 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Full = existing full-resolution AO/GI. Half = half-resolution AO/GI with full-resolution joint reconstruction.",
       .labels = {"Full", "Half"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOUpscaleMode", .binding = &shader_injection.gtvbao_upscale_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Half-Res Reconstruction", .section = "GTVBAO",
+      .tooltip = "Temporary A/B diagnostic for reconstruction cost. 5x5 Joint = production joint bilateral (default). Nearest = minimal point sampling (lower quality). 4-Tap Joint = bilinear-neighborhood joint reconstruction. No effect in Full mode.",
+      .labels = {"5x5 Joint", "Nearest", "4-Tap Joint"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_resolution > 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOUpscalePlaneSigma", .binding = &shader_injection.gtvbao_upscale_plane_sigma,
@@ -7067,7 +7078,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dv(d->vbgi_denoised_half_srv); dv(d->vbgi_denoised_half_uav); dr(d->vbgi_denoised_half_texture);
   dv(d->upscale_ao_srv); dv(d->upscale_ao_uav); dr(d->upscale_ao_texture);
   dv(d->upscale_gi_srv); dv(d->upscale_gi_uav); dr(d->upscale_gi_texture);
-  dp(d->upscale_pipeline); dl(d->upscale_layout);
+  dp(d->upscale_pipeline); dp(d->upscale_nearest_pipeline); dp(d->upscale_4tap_pipeline); dl(d->upscale_layout);
   DestroyGTVBAODescriptorTables(dev, &d->upscale_tables);
   dv(d->captured_light_buffer_srv); dr(d->captured_light_buffer_texture);
   dv(d->multibounce_srv); dv(d->multibounce_uav); dr(d->multibounce_texture);
@@ -8694,12 +8705,12 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 75> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f,
                                                        bool foliage_mask_valid = false,
                                                        int denoise_stage = 0,
                                                        float atrous_step = 1.f) {
-  std::array<float, 74> c = {};
+  std::array<float, 75> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -8792,6 +8803,7 @@ static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[71] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
   c[72] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
   c[73] = shader_injection.gtvbao_upscale_debug;
+  c[74] = std::clamp(shader_injection.gtvbao_upscale_mode, 0.f, 2.f);  // temporary A/B
   return c;
 }
 
@@ -8820,6 +8832,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   dp(d->atrous_pipeline);
   dp(d->normal_prep_pipeline);
   dp(d->upscale_pipeline);
+  dp(d->upscale_nearest_pipeline);
+  dp(d->upscale_4tap_pipeline);
   if (g_cpuopt_ensure_pipelines < 0.5f) {
     DestroyGTVBAODescriptorTables(dev, &d->prefilter_tables);
     DestroyGTVBAODescriptorTables(dev, &d->main_tables);
@@ -8915,6 +8929,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->normal_prep_pipeline.handle) mkcs(__gtvbao_normal_prep, "main", d->normal_prep_layout, &d->normal_prep_pipeline);
   if (!d->multibounce_pipeline.handle)   mkcs(__gtvbao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
   if (!d->upscale_pipeline.handle) mkcs(__gtvbao_upscale, "main", d->upscale_layout, &d->upscale_pipeline);
+  if (!d->upscale_nearest_pipeline.handle) mkcs(__gtvbao_upscale_nearest, "main", d->upscale_layout, &d->upscale_nearest_pipeline);
+  if (!d->upscale_4tap_pipeline.handle) mkcs(__gtvbao_upscale_4tap, "main", d->upscale_layout, &d->upscale_4tap_pipeline);
 
   // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
   // no separate VBGI pipeline needed — main_layout handles both AO and GI outputs.
@@ -9166,7 +9182,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
@@ -9216,7 +9232,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
       };
       apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
-      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 74,
+      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 75,
                          BuildGTVBAOPushConstants(d, false).data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->multibounce_texture, UA, SR);
@@ -9249,7 +9265,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
     cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
     bar(d->foliage_mask_texture, UA, SR);
   }
@@ -9324,7 +9340,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid);
-    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -9396,7 +9412,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
       auto pc_np = BuildGTVBAOPushConstants(d, false);
-      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_np.data());
+      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_np.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->normal_prep_texture, UA, SR);
     };
@@ -9423,7 +9439,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         apply_descriptors(d->atrous_layout, &d->atrous_tables, 4, au);
         auto pc_a = BuildGTVBAOPushConstants(d, last_iter, -1.f, false, /*stage*/0,
                                              /*step*/float(1 << i));
-        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_a.data());
+        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_a.data());
         cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
         bar(a_dst_tex, UA, SR);
         cur_b = !cur_b;
@@ -9459,7 +9475,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u_g);
       auto pc_g = BuildGTVBAOPushConstants(d, true, -1.f, false, /*stage*/4);
-      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_g.data());
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_g.data());
       // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the grid.
       cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
       }  // end GI-on stage-4 dispatch
@@ -9491,7 +9507,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         };
         apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
         auto pc = BuildGTVBAOPushConstants(d, last, -1.f, false, /*stage*/0);
-        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc.data());
         // denoise_last threads cover 2 px each: halve the grid (bounds-fail covers overhang).
         cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
         bar(dst_tex, UA, SR);
@@ -9505,10 +9521,18 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     // —— Half mode: full-resolution joint reconstruction (5x5 bilateral) ——
     // Half AO/GI (+ half denoise above) -> full AO/GI for t22/t23 +
     // next-frame multibounce. Bilateral path needs pre-decoded normals too.
-    if (half_mode && d->upscale_pipeline.handle && d->upscale_ao_uav.handle
+    // Temporary A/B: 0=5x5 Joint (default), 1=Nearest, 2=4-Tap Joint.
+    // Nearest bypasses the 5x5 joint reconstruction (and the bilateral-only
+    // normal prep, which exists solely to serve joint reconstruction, so the
+    // measured delta isolates the reconstruction cost). 4-Tap needs the prep.
+    const int up_mode = (int)std::clamp(shader_injection.gtvbao_upscale_mode + 0.5f, 0.f, 2.f);
+    reshade::api::pipeline up_pipe = (up_mode == 2)
+        ? d->upscale_4tap_pipeline
+        : ((up_mode == 1) ? d->upscale_nearest_pipeline : d->upscale_pipeline);
+    if (half_mode && up_pipe.handle && d->upscale_ao_uav.handle
         && d->upscale_gi_uav.handle) {
-      if (!atrous_active) run_normal_prep();
-      bind_pipe(d->upscale_pipeline);
+      if (!atrous_active && up_mode != 1) run_normal_prep();
+      bind_pipe(up_pipe);
       reshade::api::resource_view up_ao_src = d->gtvbao_final_in_b
           ? d->ao_term_b_srv : d->ao_term_a_srv;
       reshade::api::resource_view up_srvs[5] = {
@@ -9535,7 +9559,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->upscale_layout, &d->upscale_tables, 4, uu);
       auto pc_u = BuildGTVBAOPushConstants(d, true);
-      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_u.data());
+      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 75, pc_u.data());
       bar(gi_denoised_tex, UA, SR);  // half GI denoise -> upscale read
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->upscale_ao_texture, UA, SR);
