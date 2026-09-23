@@ -1362,7 +1362,9 @@ void main(
   }
   
   // ── GTVBAO Debug Views ──
-  if (shader_injection_data.vbgi_debug_view > 0.5) {
+  // gtvbao_upscale_debug also triggers (t23 then carries upscale diagnostics).
+  if (shader_injection_data.vbgi_debug_view > 0.5
+      || shader_injection_data.gtvbao_upscale_debug > 0.5) {
     o0.xyz = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
     o0.w = 1;
     return;

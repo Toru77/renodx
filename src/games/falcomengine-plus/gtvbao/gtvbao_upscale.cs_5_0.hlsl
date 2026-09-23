@@ -153,10 +153,14 @@ void main(uint2 dt : SV_DispatchThreadID) {
   // ── Diagnostics (GTVBAO_upscale_debug) ──
   int dbg = (int)GTVBAO_upscale_debug;
   float4 dbgOut = float4(0, 0, 0, 0);
+  // AO diagnostics use a display-only pow curve: real AO lives in ~0.7-1.0,
+  // which is near-white when shown raw. u0/u1 outputs above are untouched.
   if (dbg == 1 || dbg == 2) {
-    dbgOut = float4(nearestAO, nearestAO, nearestAO, 1);
+    float av = pow(saturate(nearestAO), 3.0f);
+    dbgOut = float4(av, av, av, 1);
   } else if (dbg == 3) {
-    dbgOut = float4(aoOut, aoOut, aoOut, 1);
+    float av = pow(saturate(aoOut), 3.0f);
+    dbgOut = float4(av, av, av, 1);
   } else if (dbg == 4) {
     float d = saturate(dwAcc / 25.0f);
     dbgOut = float4(d, 0.5f * (1.0f - d), 1.0f - d, 1);
@@ -165,10 +169,12 @@ void main(uint2 dt : SV_DispatchThreadID) {
     dbgOut = float4(d, d, d, 1);
   } else if (dbg == 6) {
     dbgOut = float4(wAvg, wAvg, wAvg, 1);
+  // GI diagnostics use a display-only x4 gain: real VBGI lives in ~0.0-0.3,
+  // which is near-black when shown raw. u0/u1 outputs above are untouched.
   } else if (dbg == 7 || dbg == 8) {
-    dbgOut = float4(saturate(nearestGI.rgb), 1);
+    dbgOut = float4(saturate(nearestGI.rgb * 4.0f), 1);
   } else if (dbg == 9) {
-    dbgOut = float4(saturate(giOut.rgb), 1);
+    dbgOut = float4(saturate(giOut.rgb * 4.0f), 1);
   }
   g_outFullDebug[dt] = dbgOut;
 }

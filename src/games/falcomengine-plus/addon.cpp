@@ -2312,7 +2312,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOUpscaleDebug", .binding = &shader_injection.gtvbao_upscale_debug,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Upscale Debug", .section = "GTVBAO",
-      .tooltip = "Half-mode reconstruction diagnostics (writes to the debug texture; view via GTVBAO Debug View 6/7/8).",
+      .tooltip = "Half-mode reconstruction diagnostics (replaces the scene while active).",
       .labels = {"Final", "Raw Half AO", "Denoised Half AO", "Reconstructed AO", "Depth Weight", "Normal Weight", "Combined Weight", "Raw Half GI", "Denoised Half GI", "Reconstructed GI"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -6590,7 +6590,19 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // shows the reconstructed full-res GI (same t23 slot as Full mode).
   const bool half_gi_active = shader_injection.gtvbao_resolution > 0.5f
       && dd->upscale_gi_srv.handle;
-  if (shader_injection.vbgi_debug_view > 0.5f) {
+  // Upscale reconstruction diagnostics: first priority so sliding the control
+  // shows it immediately without requiring another debug view to be set.
+  // Sora/Kyoto replace via gtvbao_vbgi_debug; Kai/Daybreak2 via the widened
+  // vbgi_debug_view || gtvbao_upscale_debug checks in their lighting shaders.
+  const bool upscale_dbg_active = half_gi_active
+      && shader_injection.gtvbao_upscale_debug > 0.5f
+      && dd->debug_srv.handle;
+  if (upscale_dbg_active) {
+    push_srv = dd->debug_srv;
+    do_push = true;
+    debug_replace = true;
+  }
+  else if (shader_injection.vbgi_debug_view > 0.5f) {
     int dv = (int)shader_injection.vbgi_debug_view;
     if (dv == 1)      push_srv = dd->vbgi_output_srv;
     else if (dv == 2) push_srv = (half_gi_active && dd->vbgi_denoised_half_srv.handle)
@@ -9507,10 +9519,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
           d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv    // t3 full MRT
               : d->fallback_srv,
           d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv}; // t4 full normals
+      // Debug UAV only when upscale diagnostics are requested; otherwise the
+      // main-pass bitmask/sample-activity debug output survives untouched.
+      const bool upscale_dbg_out = shader_injection.gtvbao_upscale_debug > 0.5f
+          && d->debug_uav.handle;
       reshade::api::resource_view up_uavs[3] = {
           d->upscale_ao_uav,
           (shader_injection.vbgi_enabled > 0.5f) ? d->upscale_gi_uav : d->fallback_uav,
-          d->debug_uav.handle ? d->debug_uav : d->fallback_uav};
+          upscale_dbg_out ? d->debug_uav : d->fallback_uav};
       reshade::api::descriptor_table_update uu[4] = {
         {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
         {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
@@ -9525,6 +9541,8 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       bar(d->upscale_ao_texture, UA, SR);
       if (shader_injection.vbgi_enabled > 0.5f)
         bar(d->upscale_gi_texture, UA, SR);
+      if (upscale_dbg_out)
+        bar(d->debug_texture, UA, SR);  // upscale diagnostics -> t23 read
     }
   }
   // vbgi_denoised is read by the t23 push (VBGI on), debug view 2, and

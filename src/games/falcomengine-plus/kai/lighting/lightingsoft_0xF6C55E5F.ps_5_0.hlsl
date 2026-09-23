@@ -2157,7 +2157,9 @@ void main(
   // Add GTVBAO VBGI directly to final scene (bypasses game's SSGI formula)
   r3.xyz = r3.xyz + r24.xyz;
   // ── SSGI Debug Views: replace scene with debug texture ──
-  if (shader_injection_data.vbgi_debug_view > 0.5) {
+  // gtvbao_upscale_debug also triggers (t23 then carries upscale diagnostics).
+  if (shader_injection_data.vbgi_debug_view > 0.5
+      || shader_injection_data.gtvbao_upscale_debug > 0.5) {
     int dbgMode = (int)shader_injection_data.vbgi_debug_view;
     if (dbgMode == 7) {
       o0.xyz = r15.xyz;  // Final GI (combined Falcom + GTVBAO with all processing)
