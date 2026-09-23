@@ -390,6 +390,12 @@ struct ShaderInjectData {
   float rcas_motion_range;                   // px [0.25..8], default 2.0 — additional motion to reach the target
   float rcas_motion_response;                // [0.5..3], default 1.0 — pow curvature of the transition
   float rcas_debug;                          // 0=normal sharpen, 1=motion-strength heatmap (green/yellow/red); default Normal
+  // —— FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) ——
+  float fxaa_enabled;                        // 0=off (passthrough: RCAS reads hist as before), 1=on; default On
+  float fxaa_quality;                        // 0=Standard (preset 12, reference default), 1=High (preset 29); default High
+  float fxaa_subpix;                         // [0..1], default 0.75 — sub-pixel aliasing removal (sharpness tradeoff)
+  float fxaa_edge_threshold;                 // default 0.166 — local-contrast gate (reference: 0.333 faster .. 0.063 overkill)
+  float fxaa_edge_threshold_min;             // default 0.0625 — dark trim (0 = process darks fully)
 };
 
 #ifndef __cplusplus

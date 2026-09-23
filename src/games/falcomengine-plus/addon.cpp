@@ -359,6 +359,12 @@ ShaderInjectData shader_injection = {
   .rcas_motion_range = 2.0f,
   .rcas_motion_response = 1.0f,
   .rcas_debug = 0.f,
+  // ── FXAA post-TAA defaults: on (between TAA and RCAS), High quality ──
+  .fxaa_enabled = 1.f,
+  .fxaa_quality = 1.f,
+  .fxaa_subpix = 0.75f,
+  .fxaa_edge_threshold = 0.166f,
+  .fxaa_edge_threshold_min = 0.0625f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -405,6 +411,7 @@ constexpr uint32_t kDynCubeWorldBoxRegister = 33u; // t33 dynCubeWorldBox (persi
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;  // bump when the worldbox pipeline layout shape changes (forces recreate)
 constexpr uint32_t kDynCubeCaptureLayoutVersion = 1u;  // bump when the capture pipeline layout shape changes (forces recreate)
 constexpr uint32_t kRCASLayoutVersion = 5u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
+constexpr uint32_t kFXAALayoutVersion = 1u;  // bump when the FXAA pipeline layout shape changes (forces recreate)
 // Strip sRGB encoding for UAV-compatible temp storage and raw (non-decoding)
 // SRV reads. Copies stay bitwise so the game keeps decoding exactly as before.
 // Non-sRGB formats map to identity (FP16 HDR path unchanged).
@@ -899,6 +906,27 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view rcas_motion_srv = {};          // game motion buffer (t3) captured from TAA draws (Stage 2)
   uint64_t rcas_motion_res = 0u;
   std::atomic<bool> rcas_motion_live{true};                  // destroy-event driven; false = buffer freed since capture
+  // ── FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) ──
+  // Layout/tables are shared by all three FXAA pipelines (same t0/t1/u0
+  // shape); only the bytecode differs (luma prepass vs quality preset).
+  reshade::api::resource fxaa_temp_texture = {};       // owned FXAA output (dims of TAA output, linear/UAV-legal variant format)
+  reshade::api::resource_view fxaa_temp_srv = {};      // RCAS t0 when FXAA serves (or publish source when RCAS skips)
+  reshade::api::resource_view fxaa_temp_uav = {};      // FXAA main write target (u0)
+  reshade::api::resource fxaa_luma_texture = {};       // owned perceptual luma (R8_UNORM)
+  reshade::api::resource_view fxaa_luma_srv = {};      // FXAA main luma input (t1)
+  reshade::api::resource_view fxaa_luma_uav = {};      // luma prepass write target (u0)
+  reshade::api::resource_view fxaa_hist_srv = {};      // linear-variant view of rcas_hist_texture (no sRGB decode); falls back to rcas_hist_srv
+  bool fxaa_hist_srv_owned = false;                  // false when fxaa_hist_srv aliases rcas_hist_srv (do not destroy)
+  reshade::api::resource fxaa_hist_seen = {};          // hist texture handle the views above were built from (recreate on change)
+  uint32_t fxaa_w = 0u, fxaa_h = 0u;                   // live dims of the FXAA set
+  reshade::api::format fxaa_fmt = reshade::api::format::unknown;  // live format
+  bool fxaa_logged = false;                            // one-time log per resource set
+  reshade::api::pipeline_layout fxaa_layout = {};
+  reshade::api::pipeline fxaa_luma_pipeline = {};
+  reshade::api::pipeline fxaa_standard_pipeline = {};
+  reshade::api::pipeline fxaa_high_pipeline = {};
+  uint32_t fxaa_layout_version = 0u;
+  std::array<reshade::api::descriptor_table, 2> fxaa_tables = {};  // [0]=srv t0+t1, [1]=uav u0
 };
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
@@ -939,6 +967,10 @@ static void CreateRCASResources(reshade::api::device* dev, DeviceData* d,
                                 uint32_t w, uint32_t h, reshade::api::format fmt);
 static void DestroyRCASResources(reshade::api::device* dev, DeviceData* d);
 static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d);
+static void CreateFXAAResources(reshade::api::device* dev, DeviceData* d,
+                                uint32_t w, uint32_t h, reshade::api::format fmt);
+static void DestroyFXAAResources(reshade::api::device* dev, DeviceData* d);
+static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
 static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list);
@@ -3841,6 +3873,51 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "FXAAEnabled", .binding = &shader_injection.fxaa_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Enable FXAA", .section = "Custom TAA",
+      .tooltip = "Morphological anti-aliasing between TAA and sharpening. Smooths leftover jagged edges the temporal pass misses. Off = exact prior behavior (RCAS reads the TAA output directly). Never feeds TAA history.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FXAAQuality", .binding = &shader_injection.fxaa_quality,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "FXAA Quality", .section = "Custom TAA",
+      .tooltip = "Reference FXAA 3.11 quality preset. Standard (12) is the reference default; High (29) searches longer edges at a small extra cost.",
+      .labels = {"Standard", "High"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FXAASubpix", .binding = &shader_injection.fxaa_subpix,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.33f, .label = "FXAA Subpixel", .section = "Custom TAA",
+      .tooltip = "Amount of sub-pixel aliasing removal. Higher softens more (1.00 = softest), lower stays sharper (0.00 = off). Reference default 0.75.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FXAAEdgeThreshold", .binding = &shader_injection.fxaa_edge_threshold,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.166f, .label = "FXAA Edge Threshold", .section = "Custom TAA",
+      .tooltip = "Minimum local contrast required before FXAA engages. Lower catches more edges but costs more (reference: 0.333 faster, 0.250 low, 0.166 default, 0.125 high, 0.063 overkill).",
+      .min = 0.031f, .max = 0.333f, .format = "%.3f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "FXAAEdgeThresholdMin", .binding = &shader_injection.fxaa_edge_threshold_min,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.0625f, .label = "FXAA Edge Threshold Min", .section = "Custom TAA",
+      .tooltip = "Trims FXAA from processing darks. Lower processes more dark detail but costs more (reference: 0.0833 default, 0.0625 high quality, 0.0312 visible limit). 0 = process darks fully.",
+      .min = 0.f, .max = 0.0833f, .format = "%.4f",
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.fxaa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "DynCubeSSRISFAST", .binding = &shader_injection.dynCube_ssr_isfast_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "SSR IS-FAST Phase", .section = "Dynamic Cubemaps",
@@ -3989,6 +4066,7 @@ static void OnDestroyDevice(reshade::api::device* device) {
     DestroyDynCubeResources(device, d);
     DestroyDynCubeCache(device, d);
     DestroyRCASResources(device, d);
+    DestroyFXAAResources(device, d);
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
     device->destroy_private_data<DeviceData>();
@@ -5567,6 +5645,154 @@ static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
   return d->rcas_pipeline.handle != 0u;
 }
 
+// ── FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) ──
+// Owns fxaa_temp (FXAA output, linear/UAV-legal variant format so RCAS sees
+// the same raw convention as before) + fxaa_luma (R8 perceptual luma) +
+// fxaa_hist_srv (linear-variant SRV view of the RCAS-owned hist texture, so
+// SampleLevel never sRGB-decodes; falls back to rcas_hist_srv if the
+// reinterpreted view fails). The hist texture is RCAS-owned and may be
+// recreated at any time: fxaa_hist_seen tracks the handle the views were
+// built from and forces a rebuild on change.
+static void DestroyFXAASet(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+  dv(d->fxaa_temp_srv); dv(d->fxaa_temp_uav); dr(d->fxaa_temp_texture);
+  dv(d->fxaa_luma_srv); dv(d->fxaa_luma_uav); dr(d->fxaa_luma_texture);
+  if (d->fxaa_hist_srv_owned) dv(d->fxaa_hist_srv);
+  d->fxaa_hist_srv = {};
+  d->fxaa_hist_srv_owned = false;
+  d->fxaa_hist_seen = {};
+  d->fxaa_w = 0u; d->fxaa_h = 0u;
+  d->fxaa_fmt = reshade::api::format::unknown;
+  d->fxaa_logged = false;
+}
+
+static void DestroyFXAAResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  DestroyFXAASet(dev, d);
+  for (auto& t : d->fxaa_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+  if (d->fxaa_luma_pipeline.handle) { dev->destroy_pipeline(d->fxaa_luma_pipeline); d->fxaa_luma_pipeline = {}; }
+  if (d->fxaa_standard_pipeline.handle) { dev->destroy_pipeline(d->fxaa_standard_pipeline); d->fxaa_standard_pipeline = {}; }
+  if (d->fxaa_high_pipeline.handle) { dev->destroy_pipeline(d->fxaa_high_pipeline); d->fxaa_high_pipeline = {}; }
+  if (d->fxaa_layout.handle) { dev->destroy_pipeline_layout(d->fxaa_layout); d->fxaa_layout = {}; }
+  d->fxaa_layout_version = 0u;
+}
+
+static void CreateFXAAResources(reshade::api::device* dev, DeviceData* d,
+                                uint32_t w, uint32_t h, reshade::api::format fmt) {
+  DestroyFXAASet(dev, d);
+  if (!dev || !d || w == 0u || h == 0u || fmt == reshade::api::format::unknown) return;
+  if (!d->rcas_hist_texture.handle) return;  // hist view needs the RCAS-owned texture
+  auto mk = [&](reshade::api::format vfmt,
+                reshade::api::resource* res, reshade::api::resource_view* srv,
+                reshade::api::resource_view* uav) {
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_2d;
+    rd.texture = {w, h, 1, 1, vfmt, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, res)) return;
+    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, vfmt, 0, 1, 0, 1);
+    if (srv && !dev->create_resource_view(*res, reshade::api::resource_usage::shader_resource, vd, srv)) return;
+    if (uav) dev->create_resource_view(*res, reshade::api::resource_usage::unordered_access, vd, uav);
+  };
+  mk(RCASLinearFormat(fmt), &d->fxaa_temp_texture, &d->fxaa_temp_srv, &d->fxaa_temp_uav);
+  mk(reshade::api::format::r8_unorm, &d->fxaa_luma_texture, &d->fxaa_luma_srv, &d->fxaa_luma_uav);
+  // Linear-variant view of the hist texture (same bits, no sRGB decode).
+  // Non-typeless sRGB resources reject reinterpretation: fall back to the
+  // game-format view (hardware decode on sample; luma mode 0 still applies).
+  reshade::api::resource_view_desc hvd(reshade::api::resource_view_type::texture_2d,
+                                       RCASLinearFormat(fmt), 0, 1, 0, 1);
+  if (!dev->create_resource_view(d->rcas_hist_texture, reshade::api::resource_usage::shader_resource,
+                                 hvd, &d->fxaa_hist_srv)) {
+    d->fxaa_hist_srv = d->rcas_hist_srv;
+    d->fxaa_hist_srv_owned = false;
+  } else {
+    d->fxaa_hist_srv_owned = true;
+  }
+  if (!d->fxaa_temp_texture.handle || !d->fxaa_temp_uav.handle
+      || !d->fxaa_luma_texture.handle || !d->fxaa_luma_uav.handle
+      || !d->fxaa_hist_srv.handle) {
+    DestroyFXAASet(dev, d);
+    return;
+  }
+  d->fxaa_w = w; d->fxaa_h = h; d->fxaa_fmt = fmt;
+  d->fxaa_hist_seen = d->rcas_hist_texture;
+}
+
+static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d) {
+  using DR = reshade::api::descriptor_range;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using P = reshade::api::pipeline_layout_param;
+  if (!dev || !d) return false;
+  auto mkcs = [&](std::span<const uint8_t> bc, reshade::api::pipeline_layout lo, reshade::api::pipeline* out) -> bool {
+    if (bc.empty() || !lo.handle) return false;
+    if (out->handle != 0u) return true;
+    reshade::api::shader_desc sd = {};
+    sd.code = bc.data(); sd.code_size = bc.size(); sd.entry_point = "main";
+    reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
+    return dev->create_pipeline(lo, 1, &so, out);
+  };
+  if (d->fxaa_layout.handle == 0u || d->fxaa_layout_version != kFXAALayoutVersion) {
+    if (d->fxaa_layout.handle) {
+      for (auto& t : d->fxaa_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+      dev->destroy_pipeline_layout(d->fxaa_layout); d->fxaa_layout = {};
+      if (d->fxaa_luma_pipeline.handle) { dev->destroy_pipeline(d->fxaa_luma_pipeline); d->fxaa_luma_pipeline = {}; }
+      if (d->fxaa_standard_pipeline.handle) { dev->destroy_pipeline(d->fxaa_standard_pipeline); d->fxaa_standard_pipeline = {}; }
+      if (d->fxaa_high_pipeline.handle) { dev->destroy_pipeline(d->fxaa_high_pipeline); d->fxaa_high_pipeline = {}; }
+    }
+    DR srv_r = {0,0,0,2,DS::all_compute,1,DT::texture_shader_resource_view};  // t0 color copy, t1 luma
+    DR uav_r = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 target
+    reshade::api::constant_range push_range = {};
+    push_range.binding = 0;
+    push_range.dx_register_index = 13;
+    push_range.dx_register_space = 0;
+    push_range.count = 6;  // width, height, subpix, edgeThreshold, edgeThresholdMin, lumaMode
+    push_range.visibility = DS::all_compute;
+    P p0, p1, pPush;
+    p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &srv_r;
+    p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &uav_r;
+    pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
+    P params[3] = {p0,p1,pPush};
+    if (!dev->create_pipeline_layout(3, params, &d->fxaa_layout)) return false;
+    d->fxaa_layout_version = kFXAALayoutVersion;
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (d->fxaa_tables[i].handle == 0u) {
+      if (!dev->allocate_descriptor_table(d->fxaa_layout, i, &d->fxaa_tables[i])) return false;
+    }
+  }
+#ifdef __FXAALuma_EMBED_FILE
+  if (!__FXAALuma.empty()) {
+    if (!mkcs(__FXAALuma, d->fxaa_layout, &d->fxaa_luma_pipeline)) {
+      CSLog("fxaa", "luma pipeline create failed", true);
+      return false;
+    }
+  }
+#endif
+#ifdef __FXAAStandard_EMBED_FILE
+  if (!__FXAAStandard.empty()) {
+    if (!mkcs(__FXAAStandard, d->fxaa_layout, &d->fxaa_standard_pipeline)) {
+      CSLog("fxaa", "standard pipeline create failed", true);
+      return false;
+    }
+  }
+#endif
+#ifdef __FXAAHigh_EMBED_FILE
+  if (!__FXAAHigh.empty()) {
+    if (!mkcs(__FXAAHigh, d->fxaa_layout, &d->fxaa_high_pipeline)) {
+      CSLog("fxaa", "high pipeline create failed", true);
+      return false;
+    }
+  }
+#endif
+  return d->fxaa_luma_pipeline.handle != 0u
+      && d->fxaa_standard_pipeline.handle != 0u
+      && d->fxaa_high_pipeline.handle != 0u;
+}
+
 // Runs inline on the TAA draw's own command list, immediately after the draw
 // completes: no added frame latency, strict ordering vs downstream readers.
 static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
@@ -5638,6 +5864,77 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   cmd_list->barrier(srcRes, reshade::api::resource_usage::copy_source,
                     reshade::api::resource_usage::shader_resource);
   d->rcas_have_copy = true;
+  // 1b) FXAA (optional, default on): luma prepass reads the unsharpened copy
+  // (linear-variant view: raw convention, no sRGB decode), main pass writes
+  // fxaa_temp. rcas_hist is never touched here, so TAA history stays clean.
+  // Off (or any setup failure) leaves fxaa_active false and every downstream
+  // reader uses rcas_hist exactly as before: zero behavior change.
+  bool fxaa_active = false;
+  if (shader_injection.fxaa_enabled > 0.5f) {
+    if (CreateFXAAPipelineIfNeeded(dev, d)) {
+      if (!d->fxaa_temp_texture.handle || !d->fxaa_temp_uav.handle
+          || !d->fxaa_luma_texture.handle || !d->fxaa_luma_uav.handle
+          || !d->fxaa_hist_srv.handle || d->fxaa_w != w || d->fxaa_h != h
+          || d->fxaa_fmt != fmt || d->fxaa_hist_seen.handle != d->rcas_hist_texture.handle) {
+        CreateFXAAResources(dev, d, w, h, fmt);
+      }
+      if (d->fxaa_temp_uav.handle && d->fxaa_luma_uav.handle && d->fxaa_hist_srv.handle) {
+        using F = reshade::api::format;
+        const bool hdr = (fmt == F::r16g16b16a16_float) || (fmt == F::r11g11b10_float)
+            || (fmt == F::r32g32b32a32_float);
+        float pc[6] = {(float)w, (float)h,
+                       std::clamp(shader_injection.fxaa_subpix, 0.f, 1.f),
+                       std::clamp(shader_injection.fxaa_edge_threshold, 0.031f, 0.333f),
+                       std::clamp(shader_injection.fxaa_edge_threshold_min, 0.f, 0.0833f),
+                       hdr ? 1.f : 0.f};
+        // Luma prepass: hist(SRV) -> luma(UAV).
+        cmd_list->barrier(d->fxaa_luma_texture, reshade::api::resource_usage::shader_resource,
+                          reshade::api::resource_usage::unordered_access);
+        cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->fxaa_luma_pipeline);
+        reshade::api::descriptor_table_update luma_ups[2];
+        reshade::api::resource_view luma_srvs[2] = {d->fxaa_hist_srv, d->fallback_srv};
+        luma_ups[0] = {d->fxaa_tables[0], 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, luma_srvs};
+        luma_ups[1] = {d->fxaa_tables[1], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->fxaa_luma_uav};
+        dev->update_descriptor_tables(2, luma_ups);
+        std::array<reshade::api::descriptor_table, 2> luma_tables = {d->fxaa_tables[0], d->fxaa_tables[1]};
+        cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->fxaa_layout, 0, 2, luma_tables.data());
+        cmd_list->push_constants(reshade::api::shader_stage::all_compute, d->fxaa_layout, 2, 0, 6, pc);
+        cmd_list->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+        cmd_list->barrier(d->fxaa_luma_texture, reshade::api::resource_usage::unordered_access,
+                          reshade::api::resource_usage::shader_resource);
+        // Main pass: hist + luma(SRV) -> temp(UAV); temp ends in SRV state for RCAS/publish.
+        cmd_list->barrier(d->fxaa_temp_texture, reshade::api::resource_usage::shader_resource,
+                          reshade::api::resource_usage::unordered_access);
+        cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute,
+                                (shader_injection.fxaa_quality > 0.5f) ? d->fxaa_high_pipeline : d->fxaa_standard_pipeline);
+        reshade::api::descriptor_table_update main_ups[2];
+        reshade::api::resource_view main_srvs[2] = {d->fxaa_hist_srv, d->fxaa_luma_srv};
+        main_ups[0] = {d->fxaa_tables[0], 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, main_srvs};
+        main_ups[1] = {d->fxaa_tables[1], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->fxaa_temp_uav};
+        dev->update_descriptor_tables(2, main_ups);
+        std::array<reshade::api::descriptor_table, 2> main_tables = {d->fxaa_tables[0], d->fxaa_tables[1]};
+        cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->fxaa_layout, 0, 2, main_tables.data());
+        cmd_list->push_constants(reshade::api::shader_stage::all_compute, d->fxaa_layout, 2, 0, 6, pc);
+        cmd_list->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+        cmd_list->barrier(d->fxaa_temp_texture, reshade::api::resource_usage::unordered_access,
+                          reshade::api::resource_usage::shader_resource);
+        fxaa_active = true;
+        if (!d->fxaa_logged) {
+          reshade::log::message(reshade::log::level::info,
+            (std::string("[FXAA] dispatch groups=") + std::to_string((w + 7u) / 8u) + "x" + std::to_string((h + 7u) / 8u)
+              + " quality=" + (shader_injection.fxaa_quality > 0.5f ? "high" : "standard")
+              + " luma=" + (hdr ? "hdr" : "ldr")).c_str());
+          d->fxaa_logged = true;
+        }
+      } else if (!d->fxaa_logged) {
+        reshade::log::message(reshade::log::level::warning, "[FXAA] skip: owned target creation failed");
+        d->fxaa_logged = true;
+      }
+    } else if (!d->fxaa_logged) {
+      reshade::log::message(reshade::log::level::warning, "[FXAA] skip: pipeline unavailable");
+      d->fxaa_logged = true;
+    }
+  }
   // Enable toggle forces 0 sharpening (stage machinery above runs identically).
   // Strength 0 is the off position: unsharpened output stays in place.
   // Dispatch runs whenever base sharpening or motion sharpening could apply;
@@ -5647,16 +5944,31 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   bool motionCouldApply = (shader_injection.rcas_enabled > 0.5f)
       && (shader_injection.rcas_motion_on > 0.5f)
       && d->rcas_motion_srv.handle && d->rcas_motion_live.load();
-  if (effStrength <= 0.0005f && !motionCouldApply) return;
+  if (effStrength <= 0.0005f && !motionCouldApply) {
+    if (!fxaa_active) return;
+    // RCAS skipped: publish the FXAA result over the TAA output so downstream
+    // reads see FXAA'd pixels. History already saved un-FXAA'd in (1).
+    cmd_list->barrier(d->fxaa_temp_texture, reshade::api::resource_usage::shader_resource,
+                      reshade::api::resource_usage::copy_source);
+    cmd_list->barrier(srcRes, reshade::api::resource_usage::shader_resource,
+                      reshade::api::resource_usage::copy_dest);
+    cmd_list->copy_texture_region(d->fxaa_temp_texture, 0, nullptr, srcRes, 0, nullptr);
+    cmd_list->barrier(srcRes, reshade::api::resource_usage::copy_dest,
+                      reshade::api::resource_usage::render_target);
+    cmd_list->barrier(d->fxaa_temp_texture, reshade::api::resource_usage::copy_source,
+                      reshade::api::resource_usage::shader_resource);
+    return;
+  }
 
   // 2) RCAS compute: reads the owned unsharpened copy (t0) + motion (t1),
-  // writes temp (u0). Motion view falls back to the 1x1 white fallback (never
-  // sampled: availability is folded into motionOn below).
+  // writes temp (u0). t0 is the FXAA output when FXAA served, else the hist
+  // copy exactly as before. Motion view falls back to the 1x1 white fallback
+  // (never sampled: availability is folded into motionOn below).
   reshade::api::resource_view motionSrv =
       (d->rcas_motion_srv.handle && d->rcas_motion_live.load()) ? d->rcas_motion_srv : d->fallback_srv;
   cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->rcas_pipeline);
   reshade::api::descriptor_table_update ups[2];
-  reshade::api::resource_view srvs[2] = {d->rcas_hist_srv, motionSrv};
+  reshade::api::resource_view srvs[2] = {fxaa_active ? d->fxaa_temp_srv : d->rcas_hist_srv, motionSrv};
   ups[0] = {d->rcas_tables[0], 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, srvs};
   ups[1] = {d->rcas_tables[1], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->rcas_temp_uav};
   dev->update_descriptor_tables(2, ups);
