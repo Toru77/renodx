@@ -22,6 +22,8 @@
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <Windows.h>
 
@@ -927,6 +929,27 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline fxaa_high_pipeline = {};
   uint32_t fxaa_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> fxaa_tables = {};  // [0]=srv t0+t1, [1]=uav u0
+  // ── Custom TAA cross-addon slot claim (compat with the falcomengine addon,
+  // which replaces the same TAA hashes unconditionally) ──
+  // Replacement bytecode lives in one cross-addon shared slot per hash
+  // (last registration wins), while on_draw/on_drawn callbacks stay
+  // per-addon: without a claim the friend's TAA serves and only our
+  // callbacks run. While Custom TAA is on, the slot holds our bytecode;
+  // on off, the previously saved bytes are restored (friend's) or the
+  // slot is removed (friend absent -> vanilla, today's behavior).
+  bool taa_slot_claimed = false;
+  uint32_t taa_claimed_hash = 0u;
+  std::span<const uint8_t> taa_claimed_code = {};  // our embed bytes currently in the slot (static storage)
+  std::vector<uint8_t> taa_saved_code = {};
+  bool taa_saved_valid = false;
+  // Per-pipeline deep clones of TAA pipeline subobjects, captured at
+  // init_pipeline (handle known there) keyed by pipeline handle. Feeds the
+  // draw-time rebuild, which cannot use details->subobjects (only stored by
+  // shared infra when use_replace_async/use_shader_cache is set — neither
+  // addon sets them). taa_subobjects_owned tracks handles whose tracked
+  // details currently hold OUR clone (ownership for later replacement).
+  std::unordered_map<uint64_t, std::pair<reshade::api::pipeline_subobject*, uint32_t>> taa_subobject_clones = {};
+  std::unordered_set<uint64_t> taa_subobjects_owned = {};
 };
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
@@ -973,6 +996,152 @@ static void DestroyFXAAResources(reshade::api::device* dev, DeviceData* d);
 static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
+static void ClaimTAASlot(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> code);
+static void ReleaseTAASlot(reshade::api::device* dev);
+static void OnInitPipelineCapture(
+    reshade::api::device* device,
+    reshade::api::pipeline_layout layout,
+    uint32_t subobject_count,
+    const reshade::api::pipeline_subobject* subobjects,
+    reshade::api::pipeline pipeline);
+static void OnDestroyPipelineCapture(reshade::api::device* device, reshade::api::pipeline pipeline);
+// Forces the draw-time machinery to rebuild the replacement on the next draw
+// for every tracked pipeline whose hashes contain `hash` and for which we
+// captured init-time subobjects. The rebuild (stock BuildReplacementPipeline)
+// clones details->subobjects, which shared infra only stores when
+// use_replace_async/use_shader_cache is set (neither addon sets them), so the
+// per-handle clones captured below are assigned first; without them the
+// rebuild would index an empty array (heap corruption — the startup crash).
+// Two-phase (collect handles under a read lock, then reset per handle) so no
+// map lock is held across operations. The orphaned replacement pipeline is
+// deliberately NOT destroyed here (it may still be bound on this list);
+// its tracking entry is dropped for handle-reuse safety and the object leaks
+// bounded (~1 per toggle transition) until device/process teardown.
+static void ResetTAAReplacementPipelines(reshade::api::device* dev, uint32_t hash) {
+  if (!dev || hash == 0u) return;
+  if (renodx::utils::shader::shared.data == nullptr) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return;
+  std::vector<uint64_t> stale;
+  renodx::utils::shader::shared.data->pipeline_shader_details.for_each(
+      [&](const auto& pair) {
+        const auto& details = pair.second;
+        if (details.device != dev) return;
+        if (details.shader_hashes.find(hash) == details.shader_hashes.end()) return;
+        stale.push_back(pair.first);
+      });
+  for (uint64_t handle : stale) {
+    auto cit = d->taa_subobject_clones.find(handle);
+    if (cit == d->taa_subobject_clones.end()) continue;  // no safe source: leave stale (today's behavior)
+    reshade::api::pipeline orphan = {0u};
+    renodx::utils::shader::shared.data->pipeline_shader_details.modify_if(
+        handle,
+        [&](std::pair<const uint64_t, renodx::utils::shader::PipelineShaderDetails>& pair) {
+          auto& details = pair.second;
+          if (details.subobjects.empty()) {
+            auto* fresh = renodx::utils::pipeline::ClonePipelineSubObjects(
+                cit->second.first, cit->second.second);
+            if (!fresh) return;  // leave flags: a flag-only reset would rebuild from nothing
+            details.subobjects.assign(fresh, fresh + cit->second.second);
+            delete[] fresh;
+            d->taa_subobjects_owned.insert(handle);
+          } else if (d->taa_subobjects_owned.contains(handle)) {
+            // Replace our previous clone (stock never populates these when
+            // async/cache are off; when on (devkit), stock owns non-empty
+            // entries we must not free — those handles are never in owned).
+            renodx::utils::pipeline::DestroyPipelineSubobjects(details.subobjects);
+            auto* fresh = renodx::utils::pipeline::ClonePipelineSubObjects(
+                cit->second.first, cit->second.second);
+            if (!fresh) {
+              details.subobjects.clear();
+              d->taa_subobjects_owned.erase(handle);
+              return;
+            }
+            details.subobjects.assign(fresh, fresh + cit->second.second);
+            delete[] fresh;
+          }
+          // else: stock-populated (devkit async/cache): leave descs, just reset below.
+          orphan = details.replacement_pipeline;
+          details.replacement_pipeline = {0u};
+          details.initialized_replacement = false;
+        });
+    // Outside the map lock (erase re-enters the map): drop the orphaned
+    // replacement's tracking entry. The object itself is deliberately not
+    // destroyed (may still be bound); bounded leak until teardown.
+    if (orphan.handle != 0u) {
+      renodx::utils::shader::shared.data->pipeline_shader_details.erase_if(
+          orphan.handle, [](const auto&) { return true; });
+      // The orphan may itself have been captured at init (friend-bytecode
+      // rebuilds match the inverse fallback): drop that clone too.
+      auto oit = d->taa_subobject_clones.find(orphan.handle);
+      if (oit != d->taa_subobject_clones.end()) {
+        renodx::utils::pipeline::DestroyPipelineSubobjects(oit->second.first, oit->second.second);
+        d->taa_subobject_clones.erase(oit);
+        d->taa_subobjects_owned.erase(orphan.handle);
+      }
+    }
+  }
+}
+
+// Captures a deep clone of TAA pipeline subobjects at init time (the pipeline
+// handle is known here; original descs die with the event return). Matched on
+// the vanilla TAA hashes, with an inverse-map fallback for pipelines already
+// baked by another addon (load-order robustness).
+static void OnInitPipelineCapture(
+    reshade::api::device* device,
+    reshade::api::pipeline_layout /*layout*/,
+    uint32_t subobject_count,
+    const reshade::api::pipeline_subobject* subobjects,
+    reshade::api::pipeline pipeline) {
+  if (!device || !subobjects || subobject_count == 0u || pipeline.handle == 0u) return;
+  auto* d = device->get_private_data<DeviceData>();
+  if (!d) return;
+  static const uint32_t kTAAHashes[2] = {0xFA37EA04u, 0x9D91FAC3u};
+  bool match = false;
+  for (uint32_t i = 0; i < subobject_count && !match; ++i) {
+    if (subobjects[i].type != reshade::api::pipeline_subobject_type::pixel_shader) continue;
+    auto* desc = static_cast<const reshade::api::shader_desc*>(subobjects[i].data);
+    if (!desc || desc->code_size == 0u) continue;
+    const uint32_t h = renodx::utils::hash::ComputeCRC32(
+        static_cast<const uint8_t*>(desc->code), desc->code_size);
+    for (uint32_t want : kTAAHashes) {
+      if (h == want) { match = true; break; }
+    }
+    if (!match && renodx::utils::shader::shared.data != nullptr) {
+      renodx::utils::shader::shared.data->shader_replacements_inverse.if_contains(
+          std::pair<reshade::api::device*, uint32_t>{device, h},
+          [&](const auto& pair) {
+            for (uint32_t want : kTAAHashes) {
+              if (pair.second == want) { match = true; break; }
+            }
+          });
+    }
+  }
+  if (!match) return;
+  auto it = d->taa_subobject_clones.find(pipeline.handle);
+  if (it != d->taa_subobject_clones.end()) {
+    renodx::utils::pipeline::DestroyPipelineSubobjects(it->second.first, it->second.second);
+    d->taa_subobject_clones.erase(it);
+    d->taa_subobjects_owned.erase(pipeline.handle);
+  }
+  reshade::api::pipeline_subobject* clone =
+      renodx::utils::pipeline::ClonePipelineSubObjects(subobjects, subobject_count);
+  if (!clone) return;
+  d->taa_subobject_clones.emplace(pipeline.handle, std::make_pair(clone, subobject_count));
+}
+
+// Frees a stored subobject clone when its pipeline dies (bounds the store
+// across level loads) and drops any ownership tracking for the handle.
+static void OnDestroyPipelineCapture(reshade::api::device* device, reshade::api::pipeline pipeline) {
+  if (!device || pipeline.handle == 0u) return;
+  auto* d = device->get_private_data<DeviceData>();
+  if (!d) return;
+  auto it = d->taa_subobject_clones.find(pipeline.handle);
+  if (it == d->taa_subobject_clones.end()) return;
+  renodx::utils::pipeline::DestroyPipelineSubobjects(it->second.first, it->second.second);
+  d->taa_subobject_clones.erase(it);
+  d->taa_subobjects_owned.erase(pipeline.handle);
+}
 static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list);
@@ -3789,6 +3958,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Enable RCAS", .section = "Custom TAA",
       .tooltip = "Turns image sharpening on or off.",
       .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
@@ -3797,7 +3967,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.3f, .label = "Sharpening", .section = "Custom TAA",
       .tooltip = "How crisp the image looks. Higher values give a sharper picture but can cause glowing edges if set too high. 0 turns sharpening off.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
@@ -3806,7 +3976,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Motion Sharpening", .section = "Custom TAA",
       .tooltip = "Automatically strengthens sharpening while the camera or objects move, then relaxes it back when the image is still. Off = always use the Sharpening value above.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3815,7 +3985,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 4.0f, .label = "Motion Sharpening Multiplier", .section = "Custom TAA",
       .tooltip = "Scales the Sharpening value during fast movement: motion value = base x multiplier, clamped to Max Motion Sharpening below. Example: Sharpening 0.30 with this at 2.0 means a still image uses 0.30 and fast motion uses 0.60.",
       .min = 1.f, .max = 10.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3824,7 +3994,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.0f, .label = "Max Motion Sharpening", .section = "Custom TAA",
       .tooltip = "Clamps the motion sharpening value from above. May exceed 1 for stronger motion sharpening (watch for ringing/halos at high values). Example: Sharpening 0.30 with 10x multiplier reaches 3.00 but is clamped to this value.",
       .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3833,7 +4003,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.01f, .label = "Motion Threshold", .section = "Custom TAA",
       .tooltip = "How much movement is ignored before motion sharpening kicks in. Filters out tiny per-frame jitter so a still camera keeps normal sharpening instead of flickering stronger.",
       .min = 0.f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3842,7 +4012,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.25f, .label = "Motion Range", .section = "Custom TAA",
       .tooltip = "How much more movement it takes to ramp from normal sharpening up to the full motion value. Lower = reaches full strength sooner.",
       .min = 0.25f, .max = 8.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3851,7 +4021,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.5f, .label = "Motion Response", .section = "Custom TAA",
       .tooltip = "Shape of the ramp from normal to full motion sharpening. 1.0 = even ramp; higher values stay gentle longer, then climb steeply near full motion.",
       .min = 0.5f, .max = 3.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f && shader_injection.rcas_motion_on > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3860,7 +4030,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "RCAS Debug View", .section = "Custom TAA",
       .tooltip = "Diagnostic only: Motion Heat shows where motion sharpening engages (green = base strength, yellow = partial, red = full motion target). Toggle back to Normal for image-quality testing (heat frames pollute TAA history while active).",
       .labels = {"Normal", "Motion Heat"},
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3869,7 +4039,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "RCAS Denoise", .section = "Custom TAA",
       .tooltip = "Reference FSR_RCAS_DENOISE behavior: scales the lobe by the noise term (0.5..1.0), reducing sharpening where local variation looks grain-like. Off = reference default (full sharpening). May also soften legitimate fine detail such as grass/foliage texture.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.rcas_enabled > 0.5f; },
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f && shader_injection.rcas_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4067,6 +4237,11 @@ static void OnDestroyDevice(reshade::api::device* device) {
     DestroyDynCubeCache(device, d);
     DestroyRCASResources(device, d);
     DestroyFXAAResources(device, d);
+    for (auto& [handle, clone] : d->taa_subobject_clones) {
+      renodx::utils::pipeline::DestroyPipelineSubobjects(clone.first, clone.second);
+    }
+    d->taa_subobject_clones.clear();
+    d->taa_subobjects_owned.clear();
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
     device->destroy_private_data<DeviceData>();
@@ -5503,7 +5678,74 @@ static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list) {
   return CustomTAAReplaceActive(cmd_list);
 }
 
+// Claims the cross-addon replacement slot for a TAA hash with our bytecode.
+// Saves the currently registered bytes first (the friend's, when present) so
+// ReleaseTAASlot can restore them. Transition-only cost: AddRuntimeReplacement
+// invalidates cached replacement pipelines once per claim.
+static void ClaimTAASlot(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> code) {
+  if (!dev || hash == 0u || code.empty()) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return;
+  if (renodx::utils::shader::shared.data == nullptr) return;  // shared state unavailable: keep today's behavior
+  if (d->taa_slot_claimed) {
+    if (d->taa_claimed_hash == hash) return;
+    ReleaseTAASlot(dev);
+  }
+  d->taa_saved_code.clear();
+  d->taa_saved_valid = false;
+  renodx::utils::shader::shared.data->runtime_replacements.if_contains(
+      std::pair<reshade::api::device*, uint32_t>{dev, hash},
+      [&](const auto& pair) {
+        d->taa_saved_code.assign(pair.second.begin(), pair.second.end());
+        d->taa_saved_valid = true;
+      });
+  renodx::utils::shader::AddRuntimeReplacement(dev, hash, code);
+  ResetTAAReplacementPipelines(dev, hash);
+  d->taa_slot_claimed = true;
+  d->taa_claimed_hash = hash;
+  d->taa_claimed_code = code;
+}
+
+// Releases a claimed TAA slot. Saved bytes identical to ours mean no other
+// addon registered the hash: remove the slot (vanilla serves, today's
+// behavior). Otherwise restore the saved (friend's) bytes.
+static void ReleaseTAASlot(reshade::api::device* dev) {
+  if (!dev) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d || !d->taa_slot_claimed) return;
+  if (renodx::utils::shader::shared.data == nullptr) return;
+  const uint32_t hash = d->taa_claimed_hash;
+  const std::span<const uint8_t> code = d->taa_claimed_code;
+  d->taa_slot_claimed = false;
+  d->taa_claimed_hash = 0u;
+  d->taa_claimed_code = {};
+  const bool same_as_ours = d->taa_saved_valid
+      && d->taa_saved_code.size() == code.size()
+      && std::equal(d->taa_saved_code.begin(), d->taa_saved_code.end(), code.begin());
+  if (same_as_ours || !d->taa_saved_valid || d->taa_saved_code.empty()) {
+    renodx::utils::shader::RemoveRuntimeReplacements(dev, {hash});
+  } else {
+    renodx::utils::shader::AddRuntimeReplacement(
+        dev, hash, std::span<const uint8_t>{d->taa_saved_code.data(), d->taa_saved_code.size()});
+  }
+  ResetTAAReplacementPipelines(dev, hash);
+  d->taa_saved_code.clear();
+  d->taa_saved_valid = false;
+}
+
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
+  // Cross-addon slot claim: runs before on_replace/ApplyReplacement in the
+  // same handler invocation, so the served bytecode follows the toggle.
+  if (cmd_list) {
+    if (auto* dev = cmd_list->get_device()) {
+      if (CustomTAAReplaceActive(cmd_list)) {
+        if (IsSora1st()) ClaimTAASlot(dev, 0xFA37EA04u, __taa_custom_sora1st);
+        else if (IsSora2nd()) ClaimTAASlot(dev, 0x9D91FAC3u, __taa_custom_sora2nd);
+      } else {
+        ReleaseTAASlot(dev);
+      }
+    }
+  }
   if (!CustomTAAReplaceActive(cmd_list)) {
     s_custom_taa_was_active = false;
   } else {
@@ -9169,6 +9411,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
+      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
       break;
     case DLL_PROCESS_DETACH:
       s_watchdogStop.store(true);
@@ -9183,6 +9427,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
       reshade::unregister_addon(h_module);
       break;
   }
