@@ -379,7 +379,8 @@ void main(
       r4.yzw = -r6.xyz * r5.xyz + r0.xyz;
       r6.xyz = r1.www * r4.yzw + r7.xyz;
       r1.w = (int)r1.z & 4;
-      if (r1.w == 0) {
+      float outlineScale = saturate(shader_injection_data.character_outline_thickness);
+      if (r1.w == 0 && outlineScale > 0.0f) {
         r3.zw = outlinePrepareTexture.SampleLevel(samPoint_s, v1.xy, 0).xy;
         r7.x = r3.z;
         r7.yw = float2(1,1);
@@ -394,6 +395,7 @@ void main(
         r10.y = depthThresholdFar_g + -r9.y;
         r10.z = densityByDepthDiffFar_g + -r9.z;
         r4.yzw = r8.yzw * r10.xyz + r9.xyz;
+        r4.y *= outlineScale; // Scale all eight outline sample offsets.
         r5.yz = offsetsAndWeights[0].xy * r4.yy + v1.xy;
         r5.yz = min(uvClamp_g.xy, r5.yz);
         r7.xz = outlinePrepareTexture.SampleLevel(samLinear_s, r5.yz, 0).yx;
