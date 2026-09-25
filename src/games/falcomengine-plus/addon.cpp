@@ -357,6 +357,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_upscale_plane_sigma = 40.f,
   .gtvbao_upscale_normal_power = 16.f,
   .gtvbao_upscale_debug = 0.f,
+  .character_outline_thickness = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -3705,6 +3706,14 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // ── Character Outline (Sora 1st / 2nd) ──
+    new renodx::utils::settings::Setting{
+      .key = "CharacterOutlineThickness", .binding = &shader_injection.character_outline_thickness,
+      .default_value = 100.f, .label = "Outline Thickness", .section = "Character Outline",
+      .tooltip = "Scales outline sampling radii in Sora 1st / 2nd. 0% disables outlines; 100% preserves the original width. Independent of Outline Intensity.",
+      .min = 0.f, .max = 100.f, .format = "%.1f%%",
+      .parse = [](float value) { return value * 0.01f; },
+      .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
     new renodx::utils::settings::Setting{
       .key = "CharOutlineIntensity", .binding = &shader_injection.char_outline_intensity,
       .default_value = 1.f, .label = "Outline Intensity", .section = "Character Outline",

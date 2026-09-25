@@ -416,7 +416,8 @@ void main(
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
       r3.z = (int)r1.z & 4;
-      if (r3.z == 0) {
+      float outlineScale = saturate(shader_injection_data.character_outline_thickness);
+      if (r3.z == 0 && outlineScale > 0.0f) {
         r5.yz = outlinePrepareTexture.SampleLevel(samLinear_s, v1.xy, 0).xy;
         r10.x = r5.y;
         r10.yw = float2(1,1);
@@ -431,10 +432,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r13.y = depthThresholdFar_g + -r12.y;
         r13.z = densityByDepthDiffFar_g + -r12.z;
         r8.yzw = r11.yzw * r13.xyz + r12.xyz;
-        r5.yw = offsetsAndWeights[0].xy * r8.yy + v1.xy;
-        r5.yw = min(uvClamp_g.xy, r5.yw);
         r6.w = 0.5 * r8.y;
         r6.w = max(1, r6.w);
+        // Scale both sampling radii after the original minimum-radius clamp.
+        r8.y *= outlineScale;
+        r6.w *= outlineScale;
+        r5.yw = offsetsAndWeights[0].xy * r8.yy + v1.xy;
+        r5.yw = min(uvClamp_g.xy, r5.yw);
         r10.xy = offsetsAndWeights[0].xy * r6.ww + v1.xy;
         r10.xy = min(uvClamp_g.xy, r10.xy);
         r10.z = outlinePrepareTexture.SampleLevel(samLinear_s, r5.yw, 0).x;
