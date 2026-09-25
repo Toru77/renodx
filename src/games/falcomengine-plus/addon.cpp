@@ -532,40 +532,6 @@ static float g_gtvbao_jitter_toggle       = 0.f;  // enable jitter even when den
 using GTVBAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
 
-// A complete Dynamic Cubemap resource set for one cube resolution. Cached per size so a
-// resolution change never destroys/recreates GPU allocations (D3D11 release-timing leak).
-struct DynCubeSet {
-  struct HistSet {
-    reshade::api::resource color;             // RGBA16F cube-compatible
-    reshade::api::resource_view color_cube_srv;
-    reshade::api::resource_view color_arr_srv;
-    reshade::api::resource_view color_uav;
-    reshade::api::resource pos;               // rgb=scaled pos, a=validity
-    reshade::api::resource_view pos_arr_srv;
-    reshade::api::resource_view pos_cube_srv;
-    reshade::api::resource_view pos_uav;
-    reshade::api::resource contrib;           // R16F
-    reshade::api::resource_view contrib_arr_srv;
-    reshade::api::resource_view contrib_uav;
-  } hist[2];
-  reshade::api::resource cam[2];
-  reshade::api::resource_view cam_srv[2];
-  reshade::api::resource_view cam_uav[2];
-  reshade::api::resource charmask;
-  reshade::api::resource_view charmask_srv;
-  reshade::api::resource_view charmask_arr_srv;
-  reshade::api::resource_view charmask_uav;
-  reshade::api::resource ggx_in;
-  reshade::api::resource_view ggx_in_cube_srv;
-  reshade::api::resource ggx_out[2];
-  reshade::api::resource_view ggx_out_cube_srv[2];
-  reshade::api::resource_view ggx_out_mip_uav[2][8];
-  reshade::api::resource solid_cube;
-  reshade::api::resource_view solid_cube_srv;
-  reshade::api::resource_view solid_cube_uav;
-  uint32_t mip_count = 8;
-};
-
 struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t working_width = 0u;
   uint32_t working_height = 0u;
@@ -885,7 +851,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_pending_size = 0;                     // requested cube size, recreated at frame boundary
   bool dyncube_pending_recreate = false;                 // recreate (old set release deferred to Present)
   bool dyncube_pending_destroy = false;                  // feature disabled -> free the set at Present
-  std::map<uint32_t, DynCubeSet> dyncube_cache;          // cached per-size sets (never destroyed during resize)
   // ── RCAS post-TAA sharpening (Stage 1; motion sharpening is Stage 2) ──
   // Flow per frame when enabled: TAA draw completes -> copy unsharpened TAA
   // output to rcas_hist (this copy alone is ever bound as next frame's t2) ->
@@ -965,10 +930,10 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
 // ── Dynamic Cubemaps — forward decls ──
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size);
 static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips);
+static bool CreateDynCubeSolidResources(reshade::api::device* dev, DeviceData* d);
+static bool CreateDynCubeGGXInResources(reshade::api::device* dev, DeviceData* d);
 static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d);
-static void SaveActiveToCache(reshade::api::device* dev, DeviceData* d);
-static bool RestoreFromCache(reshade::api::device* dev, DeviceData* d, uint32_t size);
-static void DestroyDynCubeCache(reshade::api::device* dev, DeviceData* d);
+static uint64_t DynCubeEstimatedBytes(const DeviceData* d);
 static void UnbindDynCubeComputeState(reshade::api::command_list* cl);
 static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d);
@@ -1783,9 +1748,10 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DOFSampleCount", .binding = &shader_injection.dof_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 24.f, .label = "Sample Count", .section = "Depth of Field",
+      .default_value = 48.f, .label = "Sample Count", .section = "Depth of Field",
       .tooltip = "Higher values produce smoother bokeh at higher cost.",
       .min = 4.f, .max = 64.f, .format = "%d",
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFNearScale", .binding = &shader_injection.dof_near_scale,
@@ -4130,7 +4096,6 @@ static void OnDestroyDevice(reshade::api::device* device) {
   if (d) {
     DestroyGTVBAOResources(device, d);
     DestroyDynCubeResources(device, d);
-    DestroyDynCubeCache(device, d);
     DestroyRCASResources(device, d);
     DestroyFXAAResources(device, d);
     for (auto& [handle, clone] : d->taa_subobject_clones) {
@@ -4150,7 +4115,7 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
   if (!d) return;
   if (resize) {
     d->resize_guard_until_frame = d->frame_index + kGTVBAOResizeGuardFrames;
-    CSLog("swapchain", "init resize: 4-frame guard armed, depth/ssao/cbv cleared, GTVBAO+DynCube+cache destroyed");
+    CSLog("swapchain", "init resize: 4-frame guard armed, depth/ssao/cbv cleared, GTVBAO+DynCube destroyed");
     d->captured_depth_srv = {}; d->captured_ssao_srv = {};
     d->captured_depth_live = true; d->captured_mrt_live = true;
     d->captured_color_live = true; d->captured_cbv_live = true;
@@ -4159,7 +4124,6 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
     d->captured_scene_cbv_frame = UINT64_MAX;
     DestroyGTVBAOResources(sc->get_device(), d);
     DestroyDynCubeResources(sc->get_device(), d);
-    DestroyDynCubeCache(sc->get_device(), d);
   }
 }
 
@@ -4167,7 +4131,7 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
   auto* d = sc->get_device()->get_private_data<DeviceData>();
   if (!d) return;
   if (resize) {
-    CSLog("swapchain", "destroy resize: depth/ssao/cbv cleared, DynCube+cache destroyed");
+    CSLog("swapchain", "destroy resize: depth/ssao/cbv cleared, DynCube destroyed");
     d->captured_depth_srv = {}; d->captured_ssao_srv = {};
     d->captured_depth_live = true; d->captured_mrt_live = true;
     d->captured_color_live = true; d->captured_cbv_live = true;
@@ -4176,12 +4140,10 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
     d->captured_scene_cbv_frame = UINT64_MAX;
     d->resources_created = false;
     DestroyDynCubeResources(sc->get_device(), d);
-    DestroyDynCubeCache(sc->get_device(), d);
     return;
   }
   DestroyGTVBAOResources(sc->get_device(), d);
   DestroyDynCubeResources(sc->get_device(), d);
-  DestroyDynCubeCache(sc->get_device(), d);
 }
 
 // ── Descriptor table helpers ──
@@ -4939,24 +4901,18 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   }
 
   // DynCube disable path (retained, currently untriggered): frees the resource set
-  // at the frame boundary. Toggle-off no longer arms this (cache is preserved by
-  // design); device-loss/swapchain paths call Destroy directly.
-  // Runs before any early-out so it also happens when every feature is off.
+  // at the frame boundary. Toggle-off no longer arms this; device-loss/swapchain
+  // paths call Destroy directly. Runs before any early-out so it also happens
+  // when every feature is off.
   if (d->dyncube_pending_destroy) {
     d->dyncube_pending_destroy = false;
     d->dyncube_pending_recreate = false;
     if (shader_injection.dynCube_debug_logging > 0.5f && d->dyncube_resources_created) {
-      const uint32_t sz = d->dyncube_size;
-      const uint32_t mips = d->dyncube_mip_count;
-      const double mips_wt = (mips >= 2) ? (4.0 / 3.0) : 1.0;
-      const double base = (double)sz * (double)sz * 6.0;
-      const double bytes = 2.0 * base * (8.0 + 8.0 + 2.0) + base * mips_wt * 8.0 * 3.0 + 2.0 * base * 8.0;
       reshade::log::message(reshade::log::level::info,
-        (std::string("[DynCube] disabled: freed ") + std::to_string(sz) + "x" + std::to_string(sz) +
-         " set (~" + std::to_string((long long)(bytes / (1024.0 * 1024.0))) + " MB)").c_str());
+        (std::string("[DynCube] disabled: freed ") + std::to_string(d->dyncube_size) + "x" + std::to_string(d->dyncube_size) +
+         " set (~" + std::to_string((long long)(DynCubeEstimatedBytes(d) / (1024ull * 1024ull))) + " MB)").c_str());
     }
     DestroyDynCubeResources(dev, d);
-    DestroyDynCubeCache(dev, d);  // also free all cached per-size sets
   }
 
 
@@ -5002,35 +4958,22 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     return;
   }
 
-  // DynCube cube-resolution change: at the frame boundary, reuse a cached set of the
-  // target size when available (zero create/destroy); otherwise cache the current set
-  // and create a fresh one. Old sets are never destroyed during resize (VRAM leak).
+  // DynCube cube-resolution change: at the frame boundary, destroy the active set
+  // and create one of the target size. No per-size sets are retained, so the peak
+  // is a single set regardless of how many resolutions were visited this session.
   s_presentRegion.store(3);
   if (d->dyncube_pending_recreate && d->dyncube_pending_size != 0u) {
     const uint32_t wantSize = d->dyncube_pending_size;
-    // VRAM spike guard: at 1536+ a full set is huge (2048 ~= 2GB), so the old
-    // set must not sit cached while the new one allocates. Evict the cache and
-    // take the fresh path (destroys active before allocating: peak ~= one set).
-    // Small sizes keep cache fast-switching (overlap is cheap there).
-    if (wantSize >= 1536u) DestroyDynCubeCache(dev, d);
-    else SaveActiveToCache(dev, d);  // cache the current set first (never destroy during resize)
-    const bool reused = (wantSize >= 1536u) ? false : RestoreFromCache(dev, d, wantSize);
-    if (!reused) {
-      CreateDynCubeResources(dev, d, wantSize);
-      CreateDynCubePipelinesIfNeeded(dev, d);
-    } else {
-      // Cache hit: variant cube is derived (never cached), so it was dropped by
-      // Save above — recreate it here. Without this, soften/strength stay dead
-      // until the next full Create, with snapshots endlessly mismatched.
-      CreateDynCubeVariantResources(dev, d, d->dyncube_size, d->dyncube_mip_count);
-    }
+    // CreateDynCubeResources destroys the active set before allocating, so the old
+    // size is always released (no leak) and never overlaps the new one.
+    CreateDynCubeResources(dev, d, wantSize);
+    CreateDynCubePipelinesIfNeeded(dev, d);
     if (shader_injection.dynCube_debug_logging > 0.5f) {
       reshade::log::message(reshade::log::level::info,
-        (std::string("[DynCube] resized to ") + std::to_string(wantSize) +
-         (reused ? " (cache hit)" : "")).c_str());
+        (std::string("[DynCube] resized to ") + std::to_string(wantSize)).c_str());
     }
     CSLog("dyncube", std::string("cube recreate: want=") + std::to_string(wantSize) +
-      (reused ? " (cache hit)" : " (fresh)") + " active=" + std::to_string(d->dyncube_size));
+      " active=" + std::to_string(d->dyncube_size));
     d->dyncube_pending_size = 0u;
     d->dyncube_pending_recreate = false;
   }
@@ -6678,9 +6621,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         bool wantVariant = (vSoften > 1e-4f || vStrength < 1.f - 1e-4f);
         if (dd->dyncube_ggx_valid && wantVariant
             && (vSoften != dd->dyncube_lastVariantSoften || vStrength != dd->dyncube_lastVariantStrength)) {
-          // Self-healing: variant handles may be gone (e.g. cache-hit restore path
-          // before this fix, driver eviction) — recreate here so the build below can
-          // proceed; RunDynCubeVariant still guards and fails safe otherwise.
+          // Self-healing: the variant cube is derived and never part of a full
+          // Create, so it may be absent (first use, or a resize destroyed it) —
+          // build it here. Guarded on the handle so this never re-creates.
           if (!dd->dyncube_variant.handle)
             CreateDynCubeVariantResources(dev, dd, dd->dyncube_size, dd->dyncube_mip_count);
           (void)RunDynCubeVariant(cmd_list, dd);
@@ -7054,10 +6997,36 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_solid_written = false;
 }
 
+// Texels across a full cube mip chain (mips clamped by the caller-supplied count).
+static double DynCubeChainTexels(uint32_t size, uint32_t mips) {
+  double total = 0.0;
+  for (uint32_t m = 0; m < mips; ++m) {
+    const uint32_t dim = std::max(1u, size >> m);
+    total += static_cast<double>(dim) * static_cast<double>(dim) * 6.0;
+  }
+  return total;
+}
+
+// Estimated GPU bytes for the active set. Only counts resources that actually
+// exist, so the log tracks the real VRAM delta: the GGX input chain, the global
+// variant cube, and the solid debug cube are all created on demand.
+static uint64_t DynCubeEstimatedBytes(const DeviceData* d) {
+  if (d == nullptr || !d->dyncube_resources_created || d->dyncube_size == 0u) return 0u;
+  const uint64_t base = static_cast<uint64_t>(d->dyncube_size) * d->dyncube_size * 6u;
+  const uint64_t chain = static_cast<uint64_t>(DynCubeChainTexels(d->dyncube_size, d->dyncube_mip_count));
+  uint64_t bytes = 2u * base * (8u + 8u + 2u);  // history color + position + contribution
+  bytes += base * 8u;                           // character mask
+  bytes += 2u * chain * 8u;                     // filtered A/B cubes
+  if (d->dyncube_ggx_in.handle != 0u) bytes += chain * 8u;
+  if (d->dyncube_variant.handle != 0u) bytes += chain * 8u;
+  if (d->dyncube_solid_cube.handle != 0u) bytes += base * 8u;
+  bytes += d->dyncube_worldbox_scratch_groups * 2u * 16u;
+  return bytes;
+}
+
 // Global-push variant cube (soften + strength): same desc/shape as ggx_out (full mip
-// chain for consumer roughness LOD), derived content. Created here and on every path
-// that needs variant handles outside full Create (e.g. cache-hit restore, which never
-// runs Create): variant is intentionally NOT part of the per-size cache.
+// chain for consumer roughness LOD), derived content. Created on demand by the
+// variant rebuild, which is the only consumer, so it is not part of a full Create.
 static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips) {
   if (!dev || !d) return false;
   if (size < 64u) size = 64u;
@@ -7081,6 +7050,62 @@ static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData*
                                      reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
     &d->dyncube_variant_mip0_uav);
   return true;
+}
+
+// Dedicated solid-color debug cube (debug face 3), one mip, sized to the active
+// cube. Only RunDynCubeSolid reads it, so it is created on first debug use instead
+// of on every full Create.
+static bool CreateDynCubeSolidResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return false;
+  if (!d->dyncube_resources_created || d->dyncube_size == 0u) return false;
+  if (d->dyncube_solid_cube.handle != 0u) {
+    return d->dyncube_solid_cube_srv.handle != 0u && d->dyncube_solid_cube_uav.handle != 0u;
+  }
+  reshade::api::resource_desc rs = {};
+  rs.type = reshade::api::resource_type::texture_2d;
+  rs.texture = {d->dyncube_size, d->dyncube_size, 6, 1, reshade::api::format::r16g16b16a16_float, 1};
+  rs.heap = reshade::api::memory_heap::gpu_only;
+  rs.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+  rs.flags = reshade::api::resource_flags::cube_compatible;
+  if (!dev->create_resource(rs, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_solid_cube)) {
+    reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create solid cube");
+    return false;
+  }
+  dev->create_resource_view(d->dyncube_solid_cube, reshade::api::resource_usage::shader_resource,
+    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                     reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+    &d->dyncube_solid_cube_srv);
+  dev->create_resource_view(d->dyncube_solid_cube, reshade::api::resource_usage::unordered_access,
+    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
+                                     reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
+    &d->dyncube_solid_cube_uav);
+  d->dyncube_solid_written = false;
+  return d->dyncube_solid_cube_srv.handle != 0u && d->dyncube_solid_cube_uav.handle != 0u;
+}
+
+// GGX-only input chain (mip0 + hardware mips) used to seed the roughness filter
+// without an SRV/UAV same-resource hazard. The hardware-mips path never reads it,
+// so it is only allocated when GGX filtering is enabled.
+static bool CreateDynCubeGGXInResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return false;
+  if (!d->dyncube_resources_created || d->dyncube_size == 0u) return false;
+  if (d->dyncube_ggx_in.handle != 0u) return d->dyncube_ggx_in_cube_srv.handle != 0u;
+  reshade::api::resource_desc rdi = {};
+  rdi.type = reshade::api::resource_type::texture_2d;
+  rdi.texture = {d->dyncube_size, d->dyncube_size, 6, (uint16_t)d->dyncube_mip_count,
+                 reshade::api::format::r16g16b16a16_float, 1};
+  rdi.heap = reshade::api::memory_heap::gpu_only;
+  rdi.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+  rdi.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;
+  if (!dev->create_resource(rdi, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_ggx_in)) {
+    reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create GGX input");
+    return false;
+  }
+  dev->create_resource_view(d->dyncube_ggx_in, reshade::api::resource_usage::shader_resource,
+    reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
+                                     reshade::api::format::r16g16b16a16_float, 0, d->dyncube_mip_count, 0, 6),
+    &d->dyncube_ggx_in_cube_srv);
+  return d->dyncube_ggx_in_cube_srv.handle != 0u;
 }
 
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size) {
@@ -7361,29 +7386,12 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     }
   }
 
-  // ── Phase 3 GGX filtered cubes ──
+  // ── Phase 3 filtered cubes ──
   {
     // Mip count: 8 for all supported resolutions (128..4096); computed defensively.
     uint32_t mips = 1;
     while ((size >> mips) >= 1u && mips < 8u) ++mips;
     d->dyncube_mip_count = mips;
-
-    // Input chain: RGBA16F cube, N mips, hardware GenerateMips flag (variance-reduction source).
-    reshade::api::resource_desc rdi = {};
-    rdi.type = reshade::api::resource_type::texture_2d;
-    rdi.texture = {size, size, 6, (uint16_t)mips, reshade::api::format::r16g16b16a16_float, 1};
-    rdi.heap = reshade::api::memory_heap::gpu_only;
-    rdi.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-    rdi.flags = reshade::api::resource_flags::cube_compatible | reshade::api::resource_flags::generate_mipmaps;
-    if (!dev->create_resource(rdi, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_ggx_in)) {
-      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create GGX input");
-      DestroyDynCubeResources(dev, d);
-      return false;
-    }
-    dev->create_resource_view(d->dyncube_ggx_in, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, mips, 0, 6),
-      &d->dyncube_ggx_in_cube_srv);
 
     // Output: two RGBA16F cubes, N mips each (mip0 = sharp history copy, mips 1..N-1 = filtered).
     // Double-buffered (Active/Building) so a partially-written cube is never exposed to t17.
@@ -7413,39 +7421,11 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     }
     d->dyncube_ggx_active = 0;
     d->dyncube_ggx_valid = false;
-    // Global-push variant cube (soften + strength): same desc/shape as ggx_out
-    // (full mip chain for consumer roughness LOD), derived content, rebuilt on
-    // demand — never part of the per-size cache.
-    if (!CreateDynCubeVariantResources(dev, d, size, mips)) {
-      DestroyDynCubeResources(dev, d);
-      return false;
-    }
+    // Global-push variant cube (soften + strength) and the solid-color debug cube are
+    // both derived: created on demand by their own passes, never allocated here.
     d->dyncube_variant_valid = false;
     d->dyncube_lastVariantSoften = -1.f;
     d->dyncube_lastVariantStrength = -1.f;
-  }
-
-  // Dedicated solid-color debug cube (debug 3) — independent of history/ggx resources.
-  {
-    reshade::api::resource_desc rs = {};
-    rs.type = reshade::api::resource_type::texture_2d;
-    rs.texture = {size, size, 6, 1, reshade::api::format::r16g16b16a16_float, 1};
-    rs.heap = reshade::api::memory_heap::gpu_only;
-    rs.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
-    rs.flags = reshade::api::resource_flags::cube_compatible;
-    if (!dev->create_resource(rs, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_solid_cube)) {
-      if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create solid cube");
-      DestroyDynCubeResources(dev, d);
-      return false;
-    }
-    dev->create_resource_view(d->dyncube_solid_cube, reshade::api::resource_usage::shader_resource,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_cube,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_solid_cube_srv);
-    dev->create_resource_view(d->dyncube_solid_cube, reshade::api::resource_usage::unordered_access,
-      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
-                                       reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
-      &d->dyncube_solid_cube_uav);
   }
 
   d->dyncube_resources_created = true;
@@ -7464,13 +7444,10 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   d->dyncube_lastSparkleRejection = -1.f;
   d->dyncube_hasValidRead = false;
   if (should_log()) {
-    const uint32_t mips = d->dyncube_mip_count;
-    const double mips_wt = (mips >= 2) ? (4.0 / 3.0) : 1.0;
-    const double base = (double)size * (double)size * 6.0;
-    const double bytes = 2.0 * base * (8.0 + 8.0 + 2.0) + base * mips_wt * 8.0 * 3.0 + 2.0 * base * 8.0;
     reshade::log::message(reshade::log::level::info,
       (std::string("[DynCube] Resources created: ") + std::to_string(size) + "x" + std::to_string(size) +
-       "x6, mips=" + std::to_string(mips) + ", ~" + std::to_string((long long)(bytes / (1024.0 * 1024.0))) + " MB").c_str());
+       "x6, mips=" + std::to_string(d->dyncube_mip_count) +
+       ", ~" + std::to_string((long long)(DynCubeEstimatedBytes(d) / (1024ull * 1024ull))) + " MB").c_str());
   }
   return true;
 }
@@ -7481,6 +7458,10 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   using DT = reshade::api::descriptor_type;
   using P = reshade::api::pipeline_layout_param;
   if (!dev || !d) return false;
+
+  // GGX input chain is only read by the GGX filter branch, so it exists only when
+  // GGX is on. This runs on every filter pass, so toggling it allocates on demand.
+  if (shader_injection.dynCube_ggx > 0.5f) CreateDynCubeGGXInResources(dev, d);
 
   auto mkcs = [&](std::span<const uint8_t> bc, reshade::api::pipeline_layout lo, reshade::api::pipeline* out) -> bool {
     if (bc.empty() || !lo.handle) return false;
@@ -7781,172 +7762,11 @@ static void UnbindDynCubeComputeState(reshade::api::command_list* cl) {
         reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
 }
 
-// Move the current (active) DynCube resource handles out of the DeviceData members into a
-// snapshot (zeroing the members). Used to cache the old set on a resize without destroying it.
-static void MoveActiveSetTo(DeviceData* d, DynCubeSet& s) {
-  for (uint32_t i = 0; i < 2; ++i) {
-    s.hist[i].color = d->dyncube_hist[i].color; d->dyncube_hist[i].color = {};
-    s.hist[i].color_cube_srv = d->dyncube_hist[i].color_cube_srv; d->dyncube_hist[i].color_cube_srv = {};
-    s.hist[i].color_arr_srv = d->dyncube_hist[i].color_arr_srv; d->dyncube_hist[i].color_arr_srv = {};
-    s.hist[i].color_uav = d->dyncube_hist[i].color_uav; d->dyncube_hist[i].color_uav = {};
-    s.hist[i].pos = d->dyncube_hist[i].pos; d->dyncube_hist[i].pos = {};
-    s.hist[i].pos_arr_srv = d->dyncube_hist[i].pos_arr_srv; d->dyncube_hist[i].pos_arr_srv = {};
-    s.hist[i].pos_cube_srv = d->dyncube_hist[i].pos_cube_srv; d->dyncube_hist[i].pos_cube_srv = {};
-    s.hist[i].pos_uav = d->dyncube_hist[i].pos_uav; d->dyncube_hist[i].pos_uav = {};
-    s.hist[i].contrib = d->dyncube_hist[i].contrib; d->dyncube_hist[i].contrib = {};
-    s.hist[i].contrib_arr_srv = d->dyncube_hist[i].contrib_arr_srv; d->dyncube_hist[i].contrib_arr_srv = {};
-    s.hist[i].contrib_uav = d->dyncube_hist[i].contrib_uav; d->dyncube_hist[i].contrib_uav = {};
-    s.cam[i] = d->dyncube_cam[i]; d->dyncube_cam[i] = {};
-    s.cam_srv[i] = d->dyncube_cam_srv[i]; d->dyncube_cam_srv[i] = {};
-    s.cam_uav[i] = d->dyncube_cam_uav[i]; d->dyncube_cam_uav[i] = {};
-  }
-  s.charmask = d->dyncube_charmask; d->dyncube_charmask = {};
-  s.charmask_srv = d->dyncube_charmask_srv; d->dyncube_charmask_srv = {};
-  s.charmask_arr_srv = d->dyncube_charmask_arr_srv; d->dyncube_charmask_arr_srv = {};
-  s.charmask_uav = d->dyncube_charmask_uav; d->dyncube_charmask_uav = {};
-  s.ggx_in = d->dyncube_ggx_in; d->dyncube_ggx_in = {};
-  s.ggx_in_cube_srv = d->dyncube_ggx_in_cube_srv; d->dyncube_ggx_in_cube_srv = {};
-  for (uint32_t i = 0; i < 2; ++i) {
-    s.ggx_out[i] = d->dyncube_ggx_out[i]; d->dyncube_ggx_out[i] = {};
-    s.ggx_out_cube_srv[i] = d->dyncube_ggx_out_cube_srv[i]; d->dyncube_ggx_out_cube_srv[i] = {};
-    for (uint32_t m = 0; m < 8; ++m) {
-      s.ggx_out_mip_uav[i][m] = d->dyncube_ggx_out_mip_uav[i][m]; d->dyncube_ggx_out_mip_uav[i][m] = {};
-    }
-  }
-  s.solid_cube = d->dyncube_solid_cube; d->dyncube_solid_cube = {};
-  s.solid_cube_srv = d->dyncube_solid_cube_srv; d->dyncube_solid_cube_srv = {};
-  s.solid_cube_uav = d->dyncube_solid_cube_uav; d->dyncube_solid_cube_uav = {};
-  s.mip_count = d->dyncube_mip_count;
-}
-
-// Reverse of MoveActiveSetTo: move a cached snapshot back into the active DeviceData members.
-static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
-  for (uint32_t i = 0; i < 2; ++i) {
-    d->dyncube_hist[i].color = s.hist[i].color; s.hist[i].color = {};
-    d->dyncube_hist[i].color_cube_srv = s.hist[i].color_cube_srv; s.hist[i].color_cube_srv = {};
-    d->dyncube_hist[i].color_arr_srv = s.hist[i].color_arr_srv; s.hist[i].color_arr_srv = {};
-    d->dyncube_hist[i].color_uav = s.hist[i].color_uav; s.hist[i].color_uav = {};
-    d->dyncube_hist[i].pos = s.hist[i].pos; s.hist[i].pos = {};
-    d->dyncube_hist[i].pos_arr_srv = s.hist[i].pos_arr_srv; s.hist[i].pos_arr_srv = {};
-    d->dyncube_hist[i].pos_cube_srv = s.hist[i].pos_cube_srv; s.hist[i].pos_cube_srv = {};
-    d->dyncube_hist[i].pos_uav = s.hist[i].pos_uav; s.hist[i].pos_uav = {};
-    d->dyncube_hist[i].contrib = s.hist[i].contrib; s.hist[i].contrib = {};
-    d->dyncube_hist[i].contrib_arr_srv = s.hist[i].contrib_arr_srv; s.hist[i].contrib_arr_srv = {};
-    d->dyncube_hist[i].contrib_uav = s.hist[i].contrib_uav; s.hist[i].contrib_uav = {};
-    d->dyncube_cam[i] = s.cam[i]; s.cam[i] = {};
-    d->dyncube_cam_srv[i] = s.cam_srv[i]; s.cam_srv[i] = {};
-    d->dyncube_cam_uav[i] = s.cam_uav[i]; s.cam_uav[i] = {};
-  }
-  d->dyncube_charmask = s.charmask; s.charmask = {};
-  d->dyncube_charmask_srv = s.charmask_srv; s.charmask_srv = {};
-  d->dyncube_charmask_arr_srv = s.charmask_arr_srv; s.charmask_arr_srv = {};
-  d->dyncube_charmask_uav = s.charmask_uav; s.charmask_uav = {};
-  d->dyncube_ggx_in = s.ggx_in; s.ggx_in = {};
-  d->dyncube_ggx_in_cube_srv = s.ggx_in_cube_srv; s.ggx_in_cube_srv = {};
-  for (uint32_t i = 0; i < 2; ++i) {
-    d->dyncube_ggx_out[i] = s.ggx_out[i]; s.ggx_out[i] = {};
-    d->dyncube_ggx_out_cube_srv[i] = s.ggx_out_cube_srv[i]; s.ggx_out_cube_srv[i] = {};
-    for (uint32_t m = 0; m < 8; ++m) {
-      d->dyncube_ggx_out_mip_uav[i][m] = s.ggx_out_mip_uav[i][m]; s.ggx_out_mip_uav[i][m] = {};
-    }
-  }
-  d->dyncube_solid_cube = s.solid_cube; s.solid_cube = {};
-  d->dyncube_solid_cube_srv = s.solid_cube_srv; s.solid_cube_srv = {};
-  d->dyncube_solid_cube_uav = s.solid_cube_uav; s.solid_cube_uav = {};
-  d->dyncube_mip_count = s.mip_count;
-  // Aliases point at the freshly-restored set A.
-  d->dyncube_texture = d->dyncube_hist[0].color;
-  d->dyncube_srv = d->dyncube_hist[0].color_cube_srv;
-  d->dyncube_uav = d->dyncube_hist[0].color_uav;
-  d->dyncube_hist_cur = 0;
-  d->dyncube_needs_reset = true;
-  d->dyncube_loadingWipeDone = false;
-  d->dyncube_loadingWipePending = false;
-  d->dyncube_ggx_valid = false;
-  d->dyncube_phase = DeviceData::DynCubePhase::Done;
-  d->dyncube_next_update_frame = 0;
-  d->dyncube_readSet = 0;
-  d->dyncube_filteredReadSet = 99u;
-  d->dyncube_boxCopyPending = false;
-  d->dyncube_wasRejected = false;
-  d->dyncube_rejectedGap = false;
-  d->dyncube_captureDirty = false;
-  d->dyncube_dirtyFastForward = false;
-  d->dyncube_lastVariantSoften = -1.f;
-  d->dyncube_lastVariantStrength = -1.f;
-  d->dyncube_lastCharCapture = -1.f;
-  d->dyncube_lastSparkleRejection = -1.f;
-  d->dyncube_hasValidRead = false;
-  d->dyncube_variant_valid = false;
-  d->dyncube_resources_created = true;
-}
-
-// Cache the current active set under its size (never destroys anything).
-static void SaveActiveToCache(reshade::api::device* dev, DeviceData* d) {
-  if (!d || !d->dyncube_resources_created || d->dyncube_size == 0u) return;
-  DynCubeSet s;
-  MoveActiveSetTo(d, s);
-  d->dyncube_cache[d->dyncube_size] = std::move(s);
-  d->dyncube_resources_created = false;
-  d->dyncube_srv = {};
-  d->dyncube_uav = {};
-  d->dyncube_texture = {};
-  // Variant cube is derived (not cached): drop it here; it rebuilds on demand.
-  if (d->dyncube_variant_cube_srv.handle) { dev->destroy_resource_view(d->dyncube_variant_cube_srv); d->dyncube_variant_cube_srv = {}; }
-  if (d->dyncube_variant_mip0_uav.handle) { dev->destroy_resource_view(d->dyncube_variant_mip0_uav); d->dyncube_variant_mip0_uav = {}; }
-  if (d->dyncube_variant.handle) { dev->destroy_resource(d->dyncube_variant); d->dyncube_variant = {}; }
-  d->dyncube_variant_valid = false;
-}
-
-// Activate a cached set of the given size (returns false if not cached).
-static bool RestoreFromCache(reshade::api::device* dev, DeviceData* d, uint32_t size) {
-  auto it = d->dyncube_cache.find(size);
-  if (it == d->dyncube_cache.end()) return false;
-  // Scratch is a DeviceData singleton (not per-set): a cache hit is only usable when
-  // it fits the restored size, otherwise fall through to a fresh create (sizes scratch).
-  const uint64_t neededGroups = (uint64_t)((size + 7u) / 8u) * ((size + 7u) / 8u) * 6u;
-  if (d->dyncube_worldbox_scratch_groups < neededGroups) return false;
-  MoveSetToActive(d, it->second);
-  d->dyncube_size = size;
-  d->dyncube_cache.erase(it);
-  return true;
-}
-
-// Destroy every handle in a cached set snapshot.
-static void DestroyDynCubeSet(reshade::api::device* dev, DynCubeSet& s) {
-  if (!dev) return;
-  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
-  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  for (auto& h : s.hist) {
-    dv(h.color_cube_srv); dv(h.color_arr_srv); dv(h.color_uav); dr(h.color);
-    dv(h.pos_arr_srv); dv(h.pos_cube_srv); dv(h.pos_uav); dr(h.pos);
-    dv(h.contrib_arr_srv); dv(h.contrib_uav); dr(h.contrib);
-  }
-  for (uint32_t i = 0; i < 2; ++i) {
-    dv(s.cam_srv[i]); dv(s.cam_uav[i]); dr(s.cam[i]);
-  }
-  dv(s.charmask_srv); dv(s.charmask_arr_srv); dr(s.charmask);
-  if (s.charmask_uav.handle) { dev->destroy_resource_view(s.charmask_uav); s.charmask_uav = {}; }
-  dv(s.ggx_in_cube_srv); dr(s.ggx_in);
-  for (uint32_t i = 0; i < 2; ++i) {
-    dv(s.ggx_out_cube_srv[i]); dr(s.ggx_out[i]);
-    for (auto& u : s.ggx_out_mip_uav[i]) { if (u.handle) { dev->destroy_resource_view(u); u = {}; } }
-  }
-  dv(s.solid_cube_srv); dr(s.solid_cube);
-  if (s.solid_cube_uav.handle) { dev->destroy_resource_view(s.solid_cube_uav); s.solid_cube_uav = {}; }
-}
-
-// Destroy all cached per-size sets (used on disable / device / swapchain teardown).
-static void DestroyDynCubeCache(reshade::api::device* dev, DeviceData* d) {
-  if (!dev || !d) return;
-  for (auto& [size, set] : d->dyncube_cache) DestroyDynCubeSet(dev, set);
-  d->dyncube_cache.clear();
-}
-
 static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d) {
   // Writes a DEDICATED solid-color cube — never the history/ggx resources.
-  if (!cl || !d || !d->dyncube_solid_cube_uav.handle) return false;
+  if (!cl || !d) return false;
   auto* dev = cl->get_device();
+  if (!CreateDynCubeSolidResources(dev, d)) return false;
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_solid_pipeline.handle) return false;
 
