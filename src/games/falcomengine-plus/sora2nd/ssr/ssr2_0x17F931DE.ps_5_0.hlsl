@@ -87,10 +87,8 @@ Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x
 TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
-StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 
 #include "../../shared.h"
-#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 
@@ -301,32 +299,18 @@ void main(
       && shader_injection_data.dynCube_force_ssr > 0.5f;
   bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
     && shader_injection_data.dynCube_force_vanilla < 0.5f;
-  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-  float3 dynCubeReflDir = float3(0, 0, 0);
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    dynCubeSsrGateConf = ssrTexture.SampleLevel(samLinear_s, v1.xy, 0).a;
-  }
-
-  // Dynamic sample. Water/puddles are assumed smooth (mirror LOD); the vanilla
-  // mip factor is 0 for the same reason. v1.xy are 0-1 UVs (no rescale).
-  float3 waterDynCol;
-  float3 waterFinalDir;
-  int waterParallaxFace;
-  uint waterNumLevels;
-  float waterSampleMip;
-  DynCubeSampleDynamic(
-      texEnvMap_g, DynCubeCubeSampler,
-      dynCubeHistPosTex, samPoint_s,
-      dynCubeWorldBox,
-      waterPos, waterR, 0.0, dynCubeReflectSign, camPos,
-      dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-      waterDynCol, waterFinalDir, waterParallaxFace,
-      waterNumLevels, waterSampleMip);
+   float3 dynCubeReflDir = float3(0, 0, 0);
+   bool dynCubeReflActive = false;
+   int dynCubeReflSrc = 1;
+   float3 waterDynCol;
+   float3 waterFinalDir;
+   uint waterNumLevels;
+   float waterSampleMip;
+   DynCubeSampleDynamic(
+       texEnvMap_g, DynCubeCubeSampler,
+       waterR, 0.0,
+       waterDynCol, waterFinalDir,
+       waterNumLevels, waterSampleMip);
   dynCubeReflDir = waterFinalDir;
   dynCubeReflActive = true;
 

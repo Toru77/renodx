@@ -297,12 +297,12 @@ struct ShaderInjectData {
   float dynCube_debug_face;                // 0..5 face for preview when debug=1/2/5/6
   float dynCube_debug_mip;                 // 0..7 mip for GGX filtered preview when debug=8
   float dynCube_force_mip;                 // debug: -1=normal roughness LOD, 0..7=force t17 mip
-  float dynCube_parallax_enabled;              // 0=off 1=on (probe-box parallax correction)
-  float dynCube_parallax_box_size_x;           // probe box size X (world units), default 20
-  float dynCube_parallax_box_size_y;           // default 10
-  float dynCube_parallax_box_size_z;           // default 20
-  float dynCube_parallax_debug;                // 0=off 1=on (tint reflection by probe-box exit face)
-  float dynCube_reflect_sign_flip;               // 0=mathematical reflect ray (current), 1=physical ray (negated) — debug A/B
+  float dynCube_reserved_0;
+  float dynCube_reserved_1;
+  float dynCube_reserved_2;
+  float dynCube_reserved_3;
+  float dynCube_reserved_4;
+  float dynCube_reserved_5;
   float dynCube_ssr_enabled;                     // 0=off 1=on (simple screen-space SSR)
   float dynCube_ssr_samples;                     // SSR march sample count [4..96], default 16
   float dynCube_ssr_distance;                    // SSR search distance, world units [4..192], default 20
@@ -324,8 +324,8 @@ struct ShaderInjectData {
   float dynCube_force_ssr;                      // 0=off 1=on (debug: SSR only)
   float dynCube_layer_mix;                      // -1=automatic confidence blend, 0..2=manual (0=SSR,1=Dynamic,2=Vanilla)
   float dynCube_blur;                           // artistic mip-offset blur on the dynamic cube sample (fractional), 0=sharp
-  float dynCube_worldbox_enabled;                // 0=off (camera-centered proxy), 1=on (persistent world-space proxy)
-  float dynCube_worldbox_margin;                 // world-unit margin expanded around the stored bounds at lookup, default 1.0
+  float dynCube_reserved_6;
+  float dynCube_reserved_7;
   float dynCube_lookup_direction_flip;        // reserved: sampling convention is baked in capture now (bare lookup correct); kept for b13 layout stability, always 0
   float dynCube_coverage_fade;                 // 0=off 1=on (smooth binary validity edge in direction space)
   float dynCube_coverage_width;                // validity smoothing cone half-angle in degrees [0..8], default 2
@@ -335,12 +335,12 @@ struct ShaderInjectData {
   float dynCube_ssr_isfast_temporal;           // [0..5] noise animation speed, 0=frozen slice, default 1
   float dynCube_ssr_confidence_fallback;       // [0..0.9] AUTO SSR confidence fallback, 0 = today's weighting, higher = low-conf SSR yields to Dynamic sooner
   float dynCube_vertical_offset;               // TEST: vertical tilt of dyn cube lookup, degrees; 0 = no-op, + = slide content down
-  float dynCube_worldbox_contrib;              // [0..1] world-box candidate contrib threshold, default 0.25 (temporal coverage test)
-  float dynCube_spatial_reprojection;          // 0=off, 1=on — position-aware temporal cubemap reprojection (experimental A/B)
-  float dynCube_spatial_reprojection_radius;   // [0..0.25] tangent-space angular search radius around R, default 0.05
-  float dynCube_spatial_reprojection_samples;  // {1,5,9} candidate directions (1=center, 5=+cross, 9=+diagonals), default 5
-  float dynCube_spatial_reprojection_error;    // [0..1] max relative ray/position mismatch, default 0.10
-  float dynCube_spatial_reprojection_min_distance; // [0..10] min ray distance t for a match (world units), default 0.05
+  float dynCube_worldbox_contrib;
+  float dynCube_reserved_8;
+  float dynCube_reserved_9;
+  float dynCube_reserved_10;
+  float dynCube_reserved_11;
+  float dynCube_reserved_12;
   float dynCube_capture_soften;              // [0..1] variant soften for global pushes (lighting unaffected), default 0
   float dynCube_global_strength;             // [0..1] variant strength for global pushes (lighting unaffected), default 1
   float dynCube_ssr_replacement;             // 0=vanilla Sora SSR passes, 1=replace ssr1/ssr2 with DynCube composite (appended last: do not insert above)

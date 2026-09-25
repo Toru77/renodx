@@ -228,12 +228,10 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);   // temporal history wor
 TextureCube<float4> dynCubeVanillaTex : register(t30);   // vanilla reflection fallback
 Texture2D<float4> dynCubeSSRTex : register(t31);         // blurred SSR (rgb = color, a = confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);      // raw SSR result (debug views)
-StructuredBuffer<float4> dynCubeWorldBox : register(t33); // persistent world-space AABB ([0]=min+valid, [1]=max)
 
 #include "../../shared.h"
 #include "../../reference/rendering.hlsl"
 #include "../../reference/brdf.hlsli"
-#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 
@@ -927,7 +925,6 @@ void main(
   // ── BRDF view-dependent inputs (r2 = world position now valid) ──
   float3 brdf_V = normalize(float3(viewInv_g._m30 - r2.x, viewInv_g._m31 - r2.y, viewInv_g._m32 - r2.z));
   float brdf_NdotV = saturate(dot(brdf_N, brdf_V));
-  float3 kaiWorldPos = r2.xyz;  // pinned world pos for the shared DynCube lookup below (r2 is reused later)
   r4.w = dot(view_g._m02_m12_m22_m32, r2.xyzw);
   r7.zw = lightTileSizeInv_g.xy * v0.xy;
   r7.zw = (uint2)r7.zw;
@@ -1511,19 +1508,10 @@ void main(
       && shader_injection_data.dynCube_force_ssr > 0.5f;
   bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
     && shader_injection_data.dynCube_force_vanilla < 0.5f;
-  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
   float3 dynCubeReflDir = float3(0, 0, 0);
-  float dynCubeVanillaMipFactor = 0.0;   // Kai roughness->mip factor, for the vanilla fallback's own mip chain
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
-  // Spatial-reprojection gate prefetch (experimental master toggle only).
-  // Kai v1.xy are 0-1 UVs, so the SSR tap needs no resolution scaling.
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, v1.xy, 0).a;
-  }
+   float dynCubeVanillaMipFactor = 0.0;
+   bool dynCubeReflActive = false;
+   int dynCubeReflSrc = 1;
   if (r19.z != 0) {
     r16.xy = r13.yz * r4.yz;
     r4.y = (int)r1.x & 32;
@@ -1542,11 +1530,10 @@ void main(
       // roughness mapping into both the dynamic sample and the vanilla fallback.
       float kaiRoughBoostA = r16.y;
       dynCubeVanillaMipFactor = kaiRoughBoostA;
-      float3 kaiSampleColA = float3(0, 0, 0);
-      float3 kaiSampleFinalA = float3(0, 0, 0);
-      int kaiParallaxFaceA = -1;
-      uint kaiNumLevelsA = 0;
-      float kaiUnusedMipA = 0.0;  // site A never reuses the sample mip afterwards
+       float3 kaiSampleColA = float3(0, 0, 0);
+       float3 kaiSampleFinalA = float3(0, 0, 0);
+       uint kaiNumLevelsA = 0;
+       float kaiUnusedMipA = 0.0;
       if (!dynCubeReflResolveActive) {
       // Fixed GetDimensions
       uint w, h, levels;
@@ -1564,15 +1551,11 @@ void main(
           r21.xyz,
           r7.w).xyz;
       } else {
-        DynCubeSampleDynamic(
-            texEnvMap_g, SmplCube_s,
-            dynCubeHistPosTex, samPoint_s,
-            dynCubeWorldBox,
-            kaiWorldPos, exp_probe_dir_ws, kaiRoughBoostA, dynCubeReflectSign,
-            float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32),
-            dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-            kaiSampleColA, kaiSampleFinalA, kaiParallaxFaceA,
-            kaiNumLevelsA, kaiUnusedMipA);
+         DynCubeSampleDynamic(
+             texEnvMap_g, SmplCube_s,
+             exp_probe_dir_ws, kaiRoughBoostA,
+             kaiSampleColA, kaiSampleFinalA,
+             kaiNumLevelsA, kaiUnusedMipA);
         r20.xyz = kaiSampleColA;
         // Record the final sampled direction so validity and vanilla fallback test
         // the texel actually displayed, not its antipode.

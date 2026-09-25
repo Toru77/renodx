@@ -203,11 +203,8 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history 
 TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
 Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
-StructuredBuffer<float4> dynCubeWorldBox : register(t33);  // persistent world-space AABB ([0]=min+valid, [1]=max+spare)
 
 #include "../../shared.h"
-#include "../../dyncube/parallax_cubemap.hlsli"
-#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 #include "../../reference/brdf.hlsli"
@@ -803,23 +800,10 @@ void main(
       && shader_injection_data.dynCube_force_ssr > 0.5f;
   bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
     && shader_injection_data.dynCube_force_vanilla < 0.5f;
-  // Debug A/B: negate the world reflection ray used by box-parallax correction.
-  // OFF = mathematical reflect(pixel->camera, N). ON = physical ray (the game's (1,-1,-1) flips to it).
-  float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
   float3 dynCubeReflDir = float3(0, 0, 0);
-  float dynCubeVanillaMipFactor = 0.0;   // game roughness->mip factor, for the vanilla fallback's own mip chain
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
-  // Spatial-reprojection gate prefetch (experimental master toggle only).
-  // Fetches the SSR confidence early so the search below runs solely on
-  // weak/missing SSR pixels; the existing resolve tap later is untouched.
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    float2 dynCubeSsrGateUV = resolutionScaling_g.xy * v1.zw;
-    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, dynCubeSsrGateUV, 0).a;
-  }
+   float dynCubeVanillaMipFactor = 0.0;
+   bool dynCubeReflActive = false;
+   int dynCubeReflSrc = 1;
   if (r16.z != 0) {
     r16.xz = r13.yz * r7.yz;
     r7.y = (int)r1.w & 32;
@@ -831,22 +815,15 @@ void main(
       r8.w = r6.z + r6.z;
       r18.xyz = r6.xyw * -r8.www + r15.xyz;
       dynCubeVanillaMipFactor = r16.z;
-      // Dynamic-cubemap lookup chain (parallax, mip/flip/tilt, spatial search,
-      // sample, boost, face debug) — shared implementation, see dyncube_sample.hlsli.
-      // r16.z is the Sora roughness factor; r18.xyz is the pre-parallax world ray.
-      float3 dynCubeSampleColA;
-      float3 dynCubeSampleFinalA;
-      int parallaxFace;
-      uint dynCubeNumLevelsA;
-      float dynCubeUnusedMipA;  // site A never reuses the sample mip afterwards
-      DynCubeSampleDynamic(
-          texEnvMap_g, SmplCube_s,
-          dynCubeHistPosTex, samPoint_s,
-          dynCubeWorldBox,
-          r5.xyz, r18.xyz, r16.z, dynCubeReflectSign, viewInv_g._m30_m31_m32,
-          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-          dynCubeSampleColA, dynCubeSampleFinalA, parallaxFace,
-          dynCubeNumLevelsA, dynCubeUnusedMipA);
+       float3 dynCubeSampleColA;
+       float3 dynCubeSampleFinalA;
+       uint dynCubeNumLevelsA;
+       float dynCubeUnusedMipA;
+       DynCubeSampleDynamic(
+           texEnvMap_g, SmplCube_s,
+           r18.xyz, r16.z,
+           dynCubeSampleColA, dynCubeSampleFinalA,
+           dynCubeNumLevelsA, dynCubeUnusedMipA);
       r17.xyz = dynCubeSampleColA;
       num_levels = dynCubeNumLevelsA;
       // Record the final sampled direction (including lookup flip and any spatial
@@ -940,23 +917,15 @@ void main(
       r15.xyz = r7.yyy ? r15.xyz : 0;
       r1.w = r13.z * r7.z;
       dynCubeVanillaMipFactor = r1.w;
-      // Dynamic-cubemap lookup chain — shared implementation, see dyncube_sample.hlsli.
-      // r1.w is the Sora roughness factor here; it is reloaded with the sample mip
-      // afterwards because the transmission tap below rescales it onto the vanilla chain.
-      // r17.xyz is the pre-parallax world ray.
-      float3 dynCubeSampleColB;
-      float3 dynCubeSampleFinalB;
-      int parallaxFace2;
-      uint dynCubeNumLevelsB;
-      float dynCubeSampleMipB;
-      DynCubeSampleDynamic(
-          texEnvMap_g, SmplCube_s,
-          dynCubeHistPosTex, samPoint_s,
-          dynCubeWorldBox,
-          r5.xyz, r17.xyz, r1.w, dynCubeReflectSign, viewInv_g._m30_m31_m32,
-          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-          dynCubeSampleColB, dynCubeSampleFinalB, parallaxFace2,
-          dynCubeNumLevelsB, dynCubeSampleMipB);
+       float3 dynCubeSampleColB;
+       float3 dynCubeSampleFinalB;
+       uint dynCubeNumLevelsB;
+       float dynCubeSampleMipB;
+       DynCubeSampleDynamic(
+           texEnvMap_g, SmplCube_s,
+           r17.xyz, r1.w,
+           dynCubeSampleColB, dynCubeSampleFinalB,
+           dynCubeNumLevelsB, dynCubeSampleMipB);
       r17.xyz = dynCubeSampleColB;
       r1.w = dynCubeSampleMipB;
       num_levels = dynCubeNumLevelsB;
