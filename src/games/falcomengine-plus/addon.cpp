@@ -30,12 +30,9 @@
 #include "../../mods/shader.hpp"
 #include "../../utils/descriptor.hpp"
 #include "../../utils/pipeline_layout.hpp"
-#include "../../utils/resource.hpp"
-#include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
 #include "../../utils/state.hpp"
-#include "../../utils/swapchain.hpp"
 #include "../../utils/dlss_hook.hpp"
 #include "./shared.h"
 #include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
@@ -436,19 +433,6 @@ static float g_isfast_seed_offset   = 0.f;
 // ── Settings visibility ──
 static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
 static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
-static float g_custom_taa_fp16_experiment = 0.f;  // 0=original TAA target, 1=experimental FP16 clone
-static renodx::utils::resource::ResourceUpgradeInfo taa_fp16_clone_target = {
-    .old_format = reshade::api::format::unknown,
-    .new_format = reshade::api::format::r16g16b16a16_float,
-    .use_resource_view_cloning = true,
-    .use_resource_view_hot_swap = true,
-    .usage_set = static_cast<uint32_t>(
-        reshade::api::resource_usage::render_target
-        | reshade::api::resource_usage::shader_resource
-        | reshade::api::resource_usage::copy_source
-        | reshade::api::resource_usage::copy_dest),
-    .view_upgrades = renodx::utils::resource::VIEW_UPGRADES_RGBA16F,
-};
 
 // ── Kai detection ──
 static float g_char_vbgi_composite_method = 1.f;  // Kai Character VBGI master toggle
@@ -923,13 +907,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t rcas_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> rcas_tables = {};  // [0]=srv t0, [1]=uav u0
   reshade::api::resource_view rcas_last_rtv0 = {};            // latest bound RTV0 (D3D11 immediate-list assumption; sampled at TAA on_draw)
-  reshade::api::resource taa_fp16_resource = {};                 // observed original TAA target while the experiment is active
-  reshade::api::resource taa_fp16_clone = {};                    // FP16 clone of the observed TAA target
-  reshade::api::resource_view taa_fp16_original_rtv = {};        // original RTV rewritten while the experiment is active
-  reshade::api::resource_view taa_fp16_clone_rtv = {};           // active FP16 RTV
-  bool taa_fp16_active = false;                                  // an experimental FP16 TAA RTV is currently bound
-  bool taa_fp16_logged = false;                                  // one-time status/skip log for the current experimental state
-  std::atomic<bool> taa_fp16_history_reset{false};               // a destroyed experimental target requires history reset
   reshade::api::resource_view rcas_motion_srv = {};          // game motion buffer (t3) captured from TAA draws (Stage 2)
   uint64_t rcas_motion_res = 0u;
   std::atomic<bool> rcas_motion_live{true};                  // destroy-event driven; false = buffer freed since capture
@@ -3745,15 +3722,6 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "CustomTAAFP16Experiment", .binding = &g_custom_taa_fp16_experiment,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Experimental TAA FP16", .section = "Custom TAA",
-      .tooltip = "Partial experiment only: clones the observed TAA render target to RGBA16F at runtime. Scene-color input is unchanged, history resets on transitions, and a friend HDR upgrade can make Off inconclusive.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
-      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "CustomTAAHistoryFilter", .binding = &shader_injection.custom_taa_history_filter,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 2.f, .label = "History Filter", .section = "Custom TAA",
@@ -4842,17 +4810,6 @@ static void KillTrackedInput(DeviceData* d, reshade::api::resource_view tracked,
 }
 static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   if (!d) return;
-  if ((d->taa_fp16_original_rtv.handle != 0u && d->taa_fp16_original_rtv.handle == deadView)
-      || (d->taa_fp16_clone_rtv.handle != 0u && d->taa_fp16_clone_rtv.handle == deadView)
-      || (d->taa_fp16_resource.handle != 0u && d->taa_fp16_resource.handle == deadRes)
-      || (d->taa_fp16_clone.handle != 0u && d->taa_fp16_clone.handle == deadRes)) {
-    d->taa_fp16_active = false;
-    d->taa_fp16_resource = {};
-    d->taa_fp16_clone = {};
-    d->taa_fp16_original_rtv = {};
-    d->taa_fp16_clone_rtv = {};
-    d->taa_fp16_history_reset.store(true);
-  }
   KillTrackedInput(d, d->captured_depth_srv, d->captured_depth_res, d->captured_depth_live, "depth", deadView, deadRes);
   KillTrackedInput(d, d->captured_color_srv, d->captured_color_res, d->captured_color_live, "color", deadView, deadRes);
   KillTrackedInput(d, d->captured_mrt_normal_srv, d->captured_mrt_res, d->captured_mrt_live, "mrt", deadView, deadRes);
@@ -5674,231 +5631,6 @@ static void EnsureTAAPayload(
   d->taa_claimed_code = desired;
 }
 
-static bool TAAFP16EligibleFormat(reshade::api::format fmt) {
-  using F = reshade::api::format;
-  switch (fmt) {
-    case F::r8g8b8a8_unorm:
-    case F::b8g8r8a8_unorm:
-    case F::r10g10b10a2_unorm:
-    case F::b10g10r10a2_unorm:
-    case F::r11g11b10_float:
-      return true;
-    default:
-      return false;
-  }
-}
-
-// Partial experiment: clone only the observed TAA render target to FP16 and
-// hot-swap its RTV. Scene-color input is intentionally unchanged. Returns true
-// only on an activation/deactivation/resource transition, so the caller can
-// reset TAA history exactly when precision changes.
-static bool ApplyTAAFP16Experiment(reshade::api::command_list* cmd_list) {
-  if (!cmd_list) return false;
-  auto* dev = cmd_list->get_device();
-  if (!dev || dev->get_api() != reshade::api::device_api::d3d11) return false;
-  auto* d = dev->get_private_data<DeviceData>();
-  if (!d) return false;
-  const bool want = g_custom_taa_fp16_experiment > 0.5f
-      && shader_injection.custom_taa_enabled > 0.5f
-      && (IsSora1st() || IsSora2nd());
-  if (d->taa_fp16_history_reset.exchange(false)) {
-    s_custom_taa_was_active = false;
-    shader_injection.custom_taa_history_valid = 0.f;
-  }
-  auto& rtvs = renodx::utils::swapchain::GetRenderTargets(cmd_list);
-  if (rtvs.empty() || rtvs[0].handle == 0u) return false;
-  reshade::api::resource original = dev->get_resource_from_view(rtvs[0]);
-  if (original.handle == 0u) return false;
-  const auto desc = dev->get_resource_desc(original);
-  if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples != 1u
-      || desc.texture.width == 0u || desc.texture.height == 0u
-      || desc.texture.format == reshade::api::format::unknown) {
-    return false;
-  }
-  if (desc.texture.format == reshade::api::format::r16g16b16a16_float) {
-    if (d->taa_fp16_active) {
-      d->taa_fp16_active = false;
-      d->taa_fp16_resource = {};
-      d->taa_fp16_clone = {};
-      d->taa_fp16_original_rtv = {};
-      d->taa_fp16_clone_rtv = {};
-      d->taa_fp16_logged = false;
-      s_custom_taa_was_active = false;
-      shader_injection.custom_taa_history_valid = 0.f;
-      reshade::log::message(reshade::log::level::info, "[TAA] FP16 experiment idle: target is already FP16");
-      return true;
-    }
-    if (!d->taa_fp16_logged) {
-      reshade::log::message(reshade::log::level::info, "[TAA] FP16 experiment idle: target is already FP16");
-      d->taa_fp16_logged = true;
-    }
-    return false;
-  }
-  if (!want) {
-    if (!d->taa_fp16_active) return false;
-    if (d->taa_fp16_original_rtv.handle != 0u) {
-      if (dev->get_resource_from_view(d->taa_fp16_original_rtv).handle != 0u) {
-        renodx::utils::resource::upgrade::DeactivateCloneHotSwap(dev, d->taa_fp16_original_rtv);
-      }
-    }
-    renodx::utils::resource::upgrade::RewriteRenderTargets(
-        cmd_list,
-        static_cast<uint32_t>(rtvs.size()),
-        rtvs.data(),
-        renodx::utils::swapchain::GetDepthStencil(cmd_list));
-    d->rcas_last_rtv0 = rtvs[0];
-    d->taa_fp16_active = false;
-    d->taa_fp16_resource = {};
-    d->taa_fp16_clone = {};
-    d->taa_fp16_original_rtv = {};
-    d->taa_fp16_clone_rtv = {};
-    d->taa_fp16_logged = false;
-    s_custom_taa_was_active = false;
-    shader_injection.custom_taa_history_valid = 0.f;
-    reshade::log::message(reshade::log::level::info, "[TAA] FP16 experiment off: restored original target");
-    return true;
-  }
-  if (!TAAFP16EligibleFormat(desc.texture.format)) {
-    if (!d->taa_fp16_logged) {
-      reshade::log::message(
-          reshade::log::level::warning,
-          ("[TAA] FP16 experiment skipped: unsupported target format "
-           + std::to_string(static_cast<int>(desc.texture.format))).c_str());
-      d->taa_fp16_logged = true;
-    }
-    return false;
-  }
-  renodx::utils::resource::ResourceUpgradeInfo* existing_target = nullptr;
-  reshade::api::resource existing_clone = {0u};
-  bool existing_clone_fp16 = false;
-  bool tracked = false;
-  if (!renodx::utils::resource::GetLiveResourceInfo(
-          original,
-          [&](const renodx::utils::resource::ResourceInfo& info) {
-            tracked = true;
-            existing_target = info.clone_target;
-            if (info.clone.handle != 0u && !info.destroyed
-                && info.desc.texture.format != reshade::api::format::unknown) {
-              existing_clone = info.clone;
-            }
-          })) {
-    tracked = false;
-  }
-  if (!tracked) {
-    if (!d->taa_fp16_logged) {
-      reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: target is untracked");
-      d->taa_fp16_logged = true;
-    }
-    return false;
-  }
-  if (existing_target != nullptr
-      && (existing_target->new_format != reshade::api::format::r16g16b16a16_float
-          || !existing_target->use_resource_view_hot_swap)) {
-    if (!d->taa_fp16_logged) {
-      reshade::log::message(
-          reshade::log::level::warning, "[TAA] FP16 experiment skipped: target is owned by another upgrade target");
-      d->taa_fp16_logged = true;
-    }
-    return false;
-  }
-  if (existing_target == nullptr) {
-    bool assigned = false;
-    renodx::utils::resource::UpdateResourceInfo(
-        original,
-        [&](renodx::utils::resource::ResourceInfo* info) {
-          if (info->destroyed || info->clone_target != nullptr) return;
-          info->clone_target = &taa_fp16_clone_target;
-          assigned = true;
-        });
-    if (!assigned) {
-      if (!d->taa_fp16_logged) {
-        reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: cannot assign clone target");
-        d->taa_fp16_logged = true;
-      }
-      return false;
-    }
-  }
-  // Reuse a valid FP16 clone (ours or the friend's); otherwise create one.
-  // No content copy: the TAA draw fully overwrites its target, and history is
-  // reset on every transition below.
-  reshade::api::resource clone = {0u};
-  if (existing_clone.handle != 0u) {
-    bool live_fp16 = false;
-    renodx::utils::resource::GetLiveResourceInfo(
-        existing_clone,
-        [&](const renodx::utils::resource::ResourceInfo& info) {
-          live_fp16 = !info.destroyed && info.desc.texture.format == reshade::api::format::r16g16b16a16_float;
-        });
-    if (!live_fp16) {
-      if (!d->taa_fp16_logged) {
-        reshade::log::message(
-            reshade::log::level::warning, "[TAA] FP16 experiment skipped: existing clone is unusable");
-        d->taa_fp16_logged = true;
-      }
-      return false;
-    }
-    clone = existing_clone;
-  } else {
-    renodx::utils::resource::upgrade::ResourceCloneOptions create_options = {};
-    create_options.require_enabled = false;
-    create_options.allow_create = true;
-    create_options.activate = false;
-    clone = renodx::utils::resource::upgrade::GetResourceClone(original, create_options);
-    if (clone.handle == 0u) {
-      if (!d->taa_fp16_logged) {
-        reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: clone creation failed");
-        d->taa_fp16_logged = true;
-      }
-      return false;
-    }
-  }
-  const bool already = d->taa_fp16_active && d->taa_fp16_resource.handle == original.handle
-      && d->taa_fp16_clone.handle == clone.handle;
-  // Same proven pattern as the friend HDR addon's RTV upgrades: mark the
-  // clone active, then rebind so the TAA draw renders into FP16.
-  renodx::utils::resource::upgrade::ActivateCloneHotSwap(dev, rtvs[0]);
-  renodx::utils::resource::upgrade::RewriteRenderTargets(
-      cmd_list,
-      static_cast<uint32_t>(rtvs.size()),
-      rtvs.data(),
-      renodx::utils::swapchain::GetDepthStencil(cmd_list));
-  renodx::utils::resource::upgrade::ResourceViewCloneOptions query_options = {};
-  query_options.require_enabled = true;
-  query_options.allow_create = true;
-  query_options.activate = false;
-  reshade::api::resource_view clone_rtv =
-      renodx::utils::resource::upgrade::GetResourceViewClone(rtvs[0], query_options);
-  if (clone_rtv.handle == 0u) {
-    if (!d->taa_fp16_logged) {
-      reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: clone view creation failed");
-      d->taa_fp16_logged = true;
-    }
-    return false;
-  }
-  d->rcas_last_rtv0 = clone_rtv;
-  d->taa_fp16_clone_rtv = clone_rtv;
-  if (already) return false;
-  // Retire a previous target when switching resources; the old clone keeps its
-  // contents but stops intercepting that target's views.
-  if (d->taa_fp16_active && d->taa_fp16_resource.handle != original.handle
-      && d->taa_fp16_original_rtv.handle != 0u
-      && dev->get_resource_from_view(d->taa_fp16_original_rtv).handle != 0u) {
-    renodx::utils::resource::upgrade::DeactivateCloneHotSwap(dev, d->taa_fp16_original_rtv);
-  }
-  d->taa_fp16_resource = original;
-  d->taa_fp16_clone = clone;
-  d->taa_fp16_original_rtv = rtvs[0];
-  d->taa_fp16_active = true;
-  d->taa_fp16_logged = false;
-  s_custom_taa_was_active = false;
-  shader_injection.custom_taa_history_valid = 0.f;
-  reshade::log::message(
-      reshade::log::level::info,
-      ("[TAA] FP16 experiment on: cloned "
-       + std::to_string(static_cast<int>(desc.texture.format)) + " to FP16").c_str());
-  return true;
-}
-
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
   // Cross-addon slot ownership: runs before on_replace/ApplyReplacement in the
   // same handler invocation, so the served bytecode follows the toggle. OFF
@@ -5927,13 +5659,6 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
               dev, IsSora1st() ? 0xFA37EA04u : (IsSora2nd() ? 0x9D91FAC3u : 0u));
           dd->taa_pending_resets.clear();
         }
-      }
-      // Partial FP16 experiment runs before history handling so a precision
-      // transition forces current-only output on the next custom frame.
-      const bool taa_fp16_transition = ApplyTAAFP16Experiment(cmd_list);
-      if (taa_fp16_transition) {
-        s_custom_taa_was_active = false;
-        shader_injection.custom_taa_history_valid = 0.f;
       }
     }
   }
@@ -9785,10 +9510,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
-      if (IsSora1st() || IsSora2nd()) {
-        renodx::utils::resource::upgrade::use_resource_cloning = true;
-        renodx::utils::resource::upgrade::Use(fdw_reason);
-      }
       break;
     case DLL_PROCESS_DETACH:
       s_watchdogStop.store(true);
@@ -9805,9 +9526,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
-      if (IsSora1st() || IsSora2nd()) {
-        renodx::utils::resource::upgrade::Use(fdw_reason);
-      }
       reshade::unregister_addon(h_module);
       break;
   }
