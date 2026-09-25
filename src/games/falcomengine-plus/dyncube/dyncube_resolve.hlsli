@@ -91,7 +91,7 @@ void DynCubeResolveSSR(
       float4 hpV = histPosTex.SampleLevel(pointSampler, reflDir, 0);
       dynamicConf = (hpV.a > 0.5f) ? 1.0 : 0.0;
       // Smooth the binary dynamic-cubemap validity edge in direction space.
-       // Thickness and spatial metadata are intentionally not used for coverage.
+      // Thickness/world-box/parallax data is intentionally not used for coverage.
       float coverageFade = 1.0;
       if (shader_injection_data.dynCube_coverage_fade > 0.5f) {
         float3 covDir = reflDir;
@@ -217,7 +217,7 @@ void DynCubeResolveSSRValues(
       float4 hpV = histPosTex.SampleLevel(pointSampler, reflDir, 0);
       dynamicConf = (hpV.a > 0.5f) ? 1.0 : 0.0;
       // Smooth the binary dynamic-cubemap validity edge in direction space.
-       // Thickness and spatial metadata are intentionally not used for coverage.
+      // Thickness/world-box/parallax data is intentionally not used for coverage.
       float coverageFade = 1.0;
       if (shader_injection_data.dynCube_coverage_fade > 0.5f) {
         float3 covDir = reflDir;

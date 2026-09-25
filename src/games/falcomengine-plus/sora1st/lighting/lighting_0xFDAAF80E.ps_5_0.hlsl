@@ -203,9 +203,11 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history 
 TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
 Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
+StructuredBuffer<float4> dynCubeWorldBox : register(t33);  // persistent world-space AABB ([0]=min+valid, [1]=max+spare)
 
 #include "../../shared.h"
-#include "../../dyncube/dyncube_sample.hlsli"
+#include "../../dyncube/parallax_cubemap.hlsli"
+#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 #include "../../reference/brdf.hlsli"
@@ -259,7 +261,18 @@ void main(
     uint4 GTVBAO_raw = gtvbaoTexture.Load(int3(texel, 0));
     float GTVBAO_ao = float(GTVBAO_raw.x) / 255.0;
 
-    ao_sample.x = GTVBAO_ao;
+    int fix = (int)shader_injection_data.gtvbao_fix_experimental;
+    if (fix == 1) {
+      ao_sample.x = 1.0;  // Neutral: test if veil is from AO value
+    } else if (fix == 2) {
+      ao_sample.x = float(GTVBAO_raw.x) / 255.0;  // Full uint, no 0xFF mask
+    } else if (fix == 3) {
+      ao_sample.x = 1.0 - GTVBAO_ao;  // Inverted encoding
+    } else if (fix == 4) {
+      ao_sample = float3(GTVBAO_ao, GTVBAO_ao, GTVBAO_ao);  // All channels GTVBAO
+    } else {
+      ao_sample.x = GTVBAO_ao;  // Default current
+    }
   }
   r4.xyz = ao_sample;
 
@@ -274,7 +287,12 @@ void main(
     if (shader_injection_data.vbgi_max_clamp > 0.0) {
       giColor = min(giColor, shader_injection_data.vbgi_max_clamp);
     }
-
+    if (shader_injection_data.vbgi_affect_lights > 0.5f) {
+      float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
+      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.vbgi_lights_saturation);
+      lightContrib = saturate(lightContrib);
+      giColor += lightContrib * shader_injection_data.vbgi_lights_strength * 0.2f;
+    }
     cachedVBGI = giColor;
     cachedVBGILuma = dot(cachedVBGI, float3(0.333, 0.333, 0.333));
   }
@@ -589,7 +607,16 @@ void main(
       r6.xyz *= gtvbaoAO;
     }
 
-
+    // Probe ambient debug — show lightProbe_g[0] DC term (indoor/outdoor signal)
+    if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
+      float3 probeAmbient = lightProbe_g[0].xyz;
+      r6.xyz = probeAmbient * 0.5;
+      r6.w = r0.w;
+      o0.xyzw = r6.xyzw;
+      o1.xyzw = r2.xyzw;
+      o2.xy = r3.xy;
+      return;
+    }
 
     if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       float3 giColor = cachedVBGI;
@@ -734,7 +761,9 @@ void main(
       shader_injection_data.brdf_roughness_max);
   float3 brdf_F0 = r9.xyz;
   float3 brdf_V = r15.xyz;
+  bool brdf_use_hammon = shader_injection_data.brdf_hammon_diffuse_enabled > 0.5f;
   bool brdf_use_ggx = shader_injection_data.brdf_multiscatter_specular_enabled > 0.5f;
+  float brdf_diffuse_str = shader_injection_data.brdf_diffuse_strength;
   float brdf_specular_str = shader_injection_data.brdf_specular_strength;
   r0.w = r16.x ? r0.w : 1.0f;
   r17.xyz = r12.xyz * r1.yyy + -lightDirection_g.xyz;
@@ -774,11 +803,23 @@ void main(
       && shader_injection_data.dynCube_force_ssr > 0.5f;
   bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
     && shader_injection_data.dynCube_force_vanilla < 0.5f;
+  // Debug A/B: negate the world reflection ray used by box-parallax correction.
+  // OFF = mathematical reflect(pixel->camera, N). ON = physical ray (the game's (1,-1,-1) flips to it).
   float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-   float3 dynCubeReflDir = float3(0, 0, 0);
-   float dynCubeVanillaMipFactor = 0.0;
-   bool dynCubeReflActive = false;
-   int dynCubeReflSrc = 1;
+  float3 dynCubeReflDir = float3(0, 0, 0);
+  float dynCubeVanillaMipFactor = 0.0;   // game roughness->mip factor, for the vanilla fallback's own mip chain
+  bool dynCubeReflActive = false;
+  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
+  // Spatial-reprojection gate prefetch (experimental master toggle only).
+  // Fetches the SSR confidence early so the search below runs solely on
+  // weak/missing SSR pixels; the existing resolve tap later is untouched.
+  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
+  float dynCubeSsrGateConf = 1.0f;
+  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
+    float2 dynCubeSsrGateUV = resolutionScaling_g.xy * v1.zw;
+    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, dynCubeSsrGateUV, 0).a;
+  }
   if (r16.z != 0) {
     r16.xz = r13.yz * r7.yz;
     r7.y = (int)r1.w & 32;
@@ -790,15 +831,22 @@ void main(
       r8.w = r6.z + r6.z;
       r18.xyz = r6.xyw * -r8.www + r15.xyz;
       dynCubeVanillaMipFactor = r16.z;
-       float3 dynCubeSampleColA;
-       float3 dynCubeSampleFinalA;
-       uint dynCubeNumLevelsA;
-       float dynCubeUnusedMipA;
-       DynCubeSampleDynamic(
-           texEnvMap_g, SmplCube_s,
-           r18.xyz, r16.z, dynCubeReflectSign,
-           dynCubeSampleColA, dynCubeSampleFinalA,
-           dynCubeNumLevelsA, dynCubeUnusedMipA);
+      // Dynamic-cubemap lookup chain (parallax, mip/flip/tilt, spatial search,
+      // sample, boost, face debug) — shared implementation, see dyncube_sample.hlsli.
+      // r16.z is the Sora roughness factor; r18.xyz is the pre-parallax world ray.
+      float3 dynCubeSampleColA;
+      float3 dynCubeSampleFinalA;
+      int parallaxFace;
+      uint dynCubeNumLevelsA;
+      float dynCubeUnusedMipA;  // site A never reuses the sample mip afterwards
+      DynCubeSampleDynamic(
+          texEnvMap_g, SmplCube_s,
+          dynCubeHistPosTex, samPoint_s,
+          dynCubeWorldBox,
+          r5.xyz, r18.xyz, r16.z, dynCubeReflectSign, viewInv_g._m30_m31_m32,
+          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+          dynCubeSampleColA, dynCubeSampleFinalA, parallaxFace,
+          dynCubeNumLevelsA, dynCubeUnusedMipA);
       r17.xyz = dynCubeSampleColA;
       num_levels = dynCubeNumLevelsA;
       // Record the final sampled direction (including lookup flip and any spatial
@@ -892,15 +940,23 @@ void main(
       r15.xyz = r7.yyy ? r15.xyz : 0;
       r1.w = r13.z * r7.z;
       dynCubeVanillaMipFactor = r1.w;
-       float3 dynCubeSampleColB;
-       float3 dynCubeSampleFinalB;
-       uint dynCubeNumLevelsB;
-       float dynCubeSampleMipB;
-       DynCubeSampleDynamic(
-           texEnvMap_g, SmplCube_s,
-           r17.xyz, r1.w, dynCubeReflectSign,
-           dynCubeSampleColB, dynCubeSampleFinalB,
-           dynCubeNumLevelsB, dynCubeSampleMipB);
+      // Dynamic-cubemap lookup chain — shared implementation, see dyncube_sample.hlsli.
+      // r1.w is the Sora roughness factor here; it is reloaded with the sample mip
+      // afterwards because the transmission tap below rescales it onto the vanilla chain.
+      // r17.xyz is the pre-parallax world ray.
+      float3 dynCubeSampleColB;
+      float3 dynCubeSampleFinalB;
+      int parallaxFace2;
+      uint dynCubeNumLevelsB;
+      float dynCubeSampleMipB;
+      DynCubeSampleDynamic(
+          texEnvMap_g, SmplCube_s,
+          dynCubeHistPosTex, samPoint_s,
+          dynCubeWorldBox,
+          r5.xyz, r17.xyz, r1.w, dynCubeReflectSign, viewInv_g._m30_m31_m32,
+          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
+          dynCubeSampleColB, dynCubeSampleFinalB, parallaxFace2,
+          dynCubeNumLevelsB, dynCubeSampleMipB);
       r17.xyz = dynCubeSampleColB;
       r1.w = dynCubeSampleMipB;
       num_levels = dynCubeNumLevelsB;
@@ -955,7 +1011,7 @@ void main(
       // Transmission/refraction tap (game-original): r15 is the refracted direction,
       // not the reflection vector, so it keeps the vanilla cubemap source with the
       // game's roughness LOD rescaled onto the vanilla mip chain. Never the dynamic
-       // cube, never dynCube_blur. When DynCube is off,
+      // cube, never parallax-corrected, never dynCube_blur. When DynCube is off,
       // t17 is already vanilla, so the original sample is kept as-is.
       if (shader_injection_data.dynCube_enabled > 0.5f) {
         uint vanW, vanH, vanL;
@@ -1132,15 +1188,24 @@ void main(
         r11.xyz = r11.xyz * r3.zzz;
         float brdf_translucency_pt = dynamicLights_g[r2.w].translucency;
         float brdf_rawNdotL_pt = dot(r11.xyz, r6.xyw);
-         float3 brdf_H_pt = normalize(brdf_V + r11.xyz);
-         float brdf_NdotH_pt = saturate(dot(brdf_H_pt, r6.xyw));
-         float brdf_VdotH_pt = saturate(dot(brdf_V, brdf_H_pt));
-         float brdf_combinedAtten_pt = brdf_rawDistAtten_pt * max(brdf_rawNdotL_pt, brdf_translucency_pt);
-         r13.y = dynamicLights_g[r2.w].color.x;
-         r13.z = dynamicLights_g[r2.w].color.y;
-         r13.w = dynamicLights_g[r2.w].color.z;
-         r10.xyz = r13.yzw * brdf_combinedAtten_pt + r10.xyz;
-
+        // Compute H early for BRDF
+        float3 brdf_H_pt = normalize(brdf_V + r11.xyz);
+        float brdf_NdotH_pt = saturate(dot(brdf_H_pt, r6.xyw));
+        float brdf_VdotH_pt = saturate(dot(brdf_V, brdf_H_pt));
+        float brdf_combinedAtten_pt = brdf_rawDistAtten_pt * max(brdf_rawNdotL_pt, brdf_translucency_pt);
+        r13.y = dynamicLights_g[r2.w].color.x;
+        r13.z = dynamicLights_g[r2.w].color.y;
+        r13.w = dynamicLights_g[r2.w].color.z;
+        // ── BRDF Diffuse (Hammon) ──
+        if (brdf_use_hammon) {
+          float3 brdf_hammon_correction = HammonEnergyRatio(brdf_rawNdotL_pt, brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness, float3(1,1,1));
+          brdf_hammon_correction = brdf_hammon_correction * (1.0f / 1.05f);  // * 1/1.05 to normalize at zero-roughness normal incidence
+          float3 brdf_vanilla_diffuse_pt = r13.yzw * brdf_combinedAtten_pt;
+          float3 brdf_hammon_diffuse_pt = brdf_vanilla_diffuse_pt * brdf_hammon_correction;
+          r10.xyz = lerp(brdf_vanilla_diffuse_pt, brdf_hammon_diffuse_pt, brdf_diffuse_str) + r10.xyz;
+        } else {
+          r10.xyz = r13.yzw * brdf_combinedAtten_pt + r10.xyz;
+        }
         // ── Specular ──
         r14.x = dynamicLights_g[r2.w].specularIntensity;
         r14.y = dynamicLights_g[r2.w].specularGlossiness;
@@ -1247,8 +1312,16 @@ void main(
           r16.x = dynamicLights_g[r2.w].color.x;
           r16.y = dynamicLights_g[r2.w].color.y;
           r16.z = dynamicLights_g[r2.w].color.z;
-           r14.xyz = r16.xyz * brdf_combinedAtten_sp + r14.xyz;
-
+          // ── BRDF Diffuse (Hammon) ──
+          if (brdf_use_hammon) {
+            float3 brdf_hammon_correction_sp = HammonEnergyRatio(brdf_rawNdotL_sp, brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness, float3(1,1,1));
+            brdf_hammon_correction_sp = brdf_hammon_correction_sp * (1.0f / 1.05f);
+            float3 brdf_vanilla_diffuse_sp = r16.xyz * brdf_combinedAtten_sp;
+            float3 brdf_hammon_diffuse_sp = brdf_vanilla_diffuse_sp * brdf_hammon_correction_sp;
+            r14.xyz = lerp(brdf_vanilla_diffuse_sp, brdf_hammon_diffuse_sp, brdf_diffuse_str) + r14.xyz;
+          } else {
+            r14.xyz = r16.xyz * brdf_combinedAtten_sp + r14.xyz;
+          }
           // ── Specular ──
           r17.x = dynamicLights_g[r2.w].specularIntensity;
           r17.y = dynamicLights_g[r2.w].specularGlossiness;
@@ -1300,11 +1373,23 @@ void main(
         float brdf_rawNdotL_env = dot(r10.xyz, r6.xyw);
         float brdf_maxNdotL_env = max(brdf_rawNdotL_env, brdf_translucency_env);
         float brdf_combinedAtten_env = brdf_rawDistAtten_env * brdf_maxNdotL_env;
-         r10.x = dynamicLights_g[r1.w].color.x;
-         r10.y = dynamicLights_g[r1.w].color.y;
-         r10.z = dynamicLights_g[r1.w].color.z;
-         r9.xyz = r10.xyz * brdf_combinedAtten_env + r9.xyz;
-
+        // Compute H early for Hammon
+        float3 brdf_H_env = normalize(brdf_V + r10.xyz);  // V + L
+        float brdf_NdotH_env = saturate(dot(brdf_H_env, r6.xyw));
+        float brdf_VdotH_env = saturate(dot(brdf_V, brdf_H_env));
+        r10.x = dynamicLights_g[r1.w].color.x;
+        r10.y = dynamicLights_g[r1.w].color.y;
+        r10.z = dynamicLights_g[r1.w].color.z;
+        // ── BRDF Diffuse (Hammon) ──
+        if (brdf_use_hammon) {
+          float3 brdf_hammon_correction_env = HammonEnergyRatio(brdf_rawNdotL_env, brdf_NdotV, brdf_NdotH_env, brdf_VdotH_env, brdf_roughness, float3(1,1,1));
+          brdf_hammon_correction_env = brdf_hammon_correction_env * (1.0f / 1.05f);
+          float3 brdf_vanilla_diffuse_env = r10.xyz * brdf_combinedAtten_env;
+          float3 brdf_hammon_diffuse_env = brdf_vanilla_diffuse_env * brdf_hammon_correction_env;
+          r9.xyz = lerp(brdf_vanilla_diffuse_env, brdf_hammon_diffuse_env, brdf_diffuse_str) + r9.xyz;
+        } else {
+          r9.xyz = r10.xyz * brdf_combinedAtten_env + r9.xyz;
+        }
       }
       r9.w = (int)r9.w + 1;
     }
@@ -1389,11 +1474,22 @@ void main(
           float brdf_rawNdotL_env_sp = dot(r11.xyz, r6.xyw);
           float brdf_maxNdotL_env_sp = max(brdf_rawNdotL_env_sp, r12.x);
           float brdf_combinedAtten_env_sp = brdf_maxNdotL_env_sp * brdf_shadowAtten_env_sp;
-           r11.x = dynamicLights_g[r1.w].color.x;
-           r11.y = dynamicLights_g[r1.w].color.y;
-           r11.z = dynamicLights_g[r1.w].color.z;
-           r10.xyz = r11.xyz * brdf_combinedAtten_env_sp + r10.xyz;
-
+          float3 brdf_H_env_sp = normalize(brdf_V + r11.xyz);
+          float brdf_NdotH_env_sp = saturate(dot(brdf_H_env_sp, r6.xyw));
+          float brdf_VdotH_env_sp = saturate(dot(brdf_V, brdf_H_env_sp));
+          r11.x = dynamicLights_g[r1.w].color.x;
+          r11.y = dynamicLights_g[r1.w].color.y;
+          r11.z = dynamicLights_g[r1.w].color.z;
+          // ── BRDF Diffuse (Hammon) ──
+          if (brdf_use_hammon) {
+            float3 brdf_hammon_correction_env_sp = HammonEnergyRatio(brdf_rawNdotL_env_sp, brdf_NdotV, brdf_NdotH_env_sp, brdf_VdotH_env_sp, brdf_roughness, float3(1,1,1));
+            brdf_hammon_correction_env_sp = brdf_hammon_correction_env_sp * (1.0f / 1.05f);
+            float3 brdf_vanilla_diffuse_env_sp = r11.xyz * brdf_combinedAtten_env_sp;
+            float3 brdf_hammon_diffuse_env_sp = brdf_vanilla_diffuse_env_sp * brdf_hammon_correction_env_sp;
+            r10.xyz = lerp(brdf_vanilla_diffuse_env_sp, brdf_hammon_diffuse_env_sp, brdf_diffuse_str) + r10.xyz;
+          } else {
+            r10.xyz = r11.xyz * brdf_combinedAtten_env_sp + r10.xyz;
+          }
         }
       }
       r10.w = (int)r10.w + 1;
@@ -1589,7 +1685,16 @@ void main(
   o2.y = min(0x0000ffff, (uint)r0.x);
   o0.xyz = r0.yzw;
 
-
+  // Probe ambient debug — character pixel path
+  if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
+    float3 probeAmbient = lightProbe_g[0].xyz;
+    o0.xyz = probeAmbient * 0.5;
+    o0.w = 1;
+    o1.xyzw = r2.xyzw;
+    o2.xy = r3.xy;
+    o2.x = 0;
+    return;
+  }
 
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     float3 giColor = cachedVBGI;
