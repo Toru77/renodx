@@ -356,7 +356,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         // glass) sees vanilla where dynamic has no info. Sampled at the texel's
         // address direction — the same convention the game uses — so dynamic and
         // vanilla texels agree. Validity/contrib/pos stay 0: the resolver still
-        // blends to vanilla and worldbox still ignores these texels.
+         // blends to vanilla and validity remains false for these texels.
         outCol = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
         outPos = 0.0;
         outValid = 0.0;

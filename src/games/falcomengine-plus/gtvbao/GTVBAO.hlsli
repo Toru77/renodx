@@ -664,26 +664,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     float3 sampleDelta = samplePos - float3(pixCenterPos);
                     lpfloat sampleDist = (lpfloat)length( sampleDelta );
 
-                    // ── Experimental fix mode from push constant c[24] ──
-                    int fixMode = (int)GTVBAO_copyback_preserve_yzw;
-
                     // Skip samples beyond the effect radius.
                     if (sampleDist > effectRadius) continue;
 
                     // Compute effective thickness.
-                    // BUG: constant thickness can exceed sampleDist for near samples,
-                    // pushing back-face behind the pixel and saturating all sectors.
                     float thickness = (float)thinOccluderCompensation;
-                    // Fix 1: clamp thickness to 50% of sample distance.
-                    if (fixMode == 1) thickness = min(thickness, (float)sampleDist * 0.5f);
-                    // Fix 2: clamp thickness to 100% of sample distance.
-                    if (fixMode == 2) thickness = min(thickness, (float)sampleDist);
-                    // Fix 3: scale thickness by (1 - distance/radius) → near=thicker, far=thinner.
-                    if (fixMode == 3) thickness = thickness * (1.0f - (float)sampleDist / max(effectRadius, 0.001f));
-                    // Fix 4: skip sample if back-face would go behind pixel.
-                    if (fixMode == 4 && (float)sampleDist < thickness) continue;
-                    // Fix 5: skip sample if thickness > 2x sample distance.
-                    if (fixMode == 5 && (float)sampleDist < thickness * 2.0f) continue;
 
                     // ── Front-face and back-face (per-sample thickness offset, always On) ──
                     float3 sampleHorizonVec = (float3)(sampleDelta / sampleDist);

@@ -80,7 +80,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_normal_max_darkening;
   float GTVBAO_normal_darkening_mode;
   float GTVBAO_normal_transform_mode;   // 0=view_g, 1=viewInv_g, 2=passthrough
-  float GTVBAO_copyback_preserve_yzw;
+  float GTVBAO_reserved_c24;
   float g_gi_enabled;                    // c[25] — 0=off, 1=on
   float g_gi_light_exposure;             // c[26] — HDR light buffer exposure scale [0.001..10]
   float g_gi_power;                      // c[27] — GI power curve (fixed 1.5)

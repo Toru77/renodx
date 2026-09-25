@@ -83,10 +83,8 @@ TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
 Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
-StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 
 #include "../../shared.h"
-#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 
@@ -385,30 +383,19 @@ void main(
     bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
         && shader_injection_data.dynCube_force_vanilla < 0.5f
         && shader_injection_data.dynCube_force_ssr > 0.5f;
-    float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-    float3 dynCubeReflDir = float3(0, 0, 0);
-    bool dynCubeReflActive = false;
-    int dynCubeReflSrc = 1;
-    bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-        && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-    float dynCubeSsrGateConf = 1.0f;
-    if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-      dynCubeSsrGateConf = s1MarchConf;
-    }
-    // Dynamic sample. v1.xy are 0-1 UVs (no rescale).
-    float3 s1DynCol;
-    float3 s1FinalDir;
-    int s1ParallaxFace;
-    uint s1NumLevels;
-    float s1SampleMip;
-    DynCubeSampleDynamic(
-        texEnvMap_g, DynCubeCubeSampler,
-        dynCubeHistPosTex, samPoint_s,
-        dynCubeWorldBox,
-        s1WaterPos, s1WaterR, s1Rough01, dynCubeReflectSign, s1CamPos,
-        dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-        s1DynCol, s1FinalDir, s1ParallaxFace,
-        s1NumLevels, s1SampleMip);
+     float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
+     float3 dynCubeReflDir = float3(0, 0, 0);
+     bool dynCubeReflActive = false;
+     int dynCubeReflSrc = 1;
+     float3 s1DynCol;
+     float3 s1FinalDir;
+     uint s1NumLevels;
+     float s1SampleMip;
+     DynCubeSampleDynamic(
+         texEnvMap_g, DynCubeCubeSampler,
+         s1WaterR, s1Rough01, dynCubeReflectSign,
+         s1DynCol, s1FinalDir,
+         s1NumLevels, s1SampleMip);
     dynCubeReflDir = s1FinalDir;
     dynCubeReflActive = true;
     // Resolve march-values > dynamic > vanilla. Sky/depth-miss pixels carry no

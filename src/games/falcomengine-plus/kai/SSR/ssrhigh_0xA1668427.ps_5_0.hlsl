@@ -94,10 +94,8 @@ TextureCube<float4> texEnvMap_g : register(t17);
 TextureCube<float4> dynCubeHistPosTex : register(t29);
 TextureCube<float4> dynCubeVanillaTex : register(t30);
 Texture3D<float2> dynCubeIsfastNoiseTex : register(t5);  // IS-FAST volume (128x128x32 RG8), pushed when usable
-StructuredBuffer<float4> dynCubeWorldBox : register(t33);
 
 #include "../../shared.h"
-#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 
@@ -402,30 +400,19 @@ void main(
     bool dynCubeForceSSRActive = shader_injection_data.dynCube_enabled > 0.5f
         && shader_injection_data.dynCube_force_vanilla < 0.5f
         && shader_injection_data.dynCube_force_ssr > 0.5f;
-    float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-    float3 dynCubeReflDir = float3(0, 0, 0);
-    bool dynCubeReflActive = false;
-    int dynCubeReflSrc = 1;
-    bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-        && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-    float dynCubeSsrGateConf = 1.0f;
-    if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-      dynCubeSsrGateConf = kaiMarchConf;
-    }
-    // Dynamic sample. v1.xy are 0-1 UVs (no rescale).
-    float3 kaiDynCol;
-    float3 kaiFinalDir;
-    int kaiParallaxFace;
-    uint kaiNumLevels;
-    float kaiSampleMip;
-    DynCubeSampleDynamic(
-        texEnvMap_g, DynCubeCubeSampler,
-        dynCubeHistPosTex, samPoint_s,
-        dynCubeWorldBox,
-        kaiWaterPos, kaiWaterR, kaiRough01, dynCubeReflectSign, kaiCamPos,
-        dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-        kaiDynCol, kaiFinalDir, kaiParallaxFace,
-        kaiNumLevels, kaiSampleMip);
+     float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
+     float3 dynCubeReflDir = float3(0, 0, 0);
+     bool dynCubeReflActive = false;
+     int dynCubeReflSrc = 1;
+     float3 kaiDynCol;
+     float3 kaiFinalDir;
+     uint kaiNumLevels;
+     float kaiSampleMip;
+     DynCubeSampleDynamic(
+         texEnvMap_g, DynCubeCubeSampler,
+         kaiWaterR, kaiRough01, dynCubeReflectSign,
+         kaiDynCol, kaiFinalDir,
+         kaiNumLevels, kaiSampleMip);
     dynCubeReflDir = kaiFinalDir;
     dynCubeReflActive = true;
     // Resolve march-values > dynamic > miss. Sky/depth-miss pixels carry no

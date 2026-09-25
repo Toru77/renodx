@@ -206,7 +206,6 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history 
 TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
 Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
-StructuredBuffer<float4> dynCubeWorldBox : register(t33);  // persistent world-space AABB ([0]=min+valid, [1]=max+spare)
   Texture2DArray<float4> spotShadowMaps : register(t18);
 Texture3D<float4> atmosphereInscatterLUT : register(t19);
 Texture3D<float4> atmosphereExtinctionLUT : register(t20);
@@ -217,8 +216,6 @@ Texture2D<float4> ssrMarchTex : register(t28);  // captured vanilla ssr1 result 
 Texture2D<float4> texCloudShadow : register(t27);
 
 #include "../../shared.h"
-#include "../../dyncube/parallax_cubemap.hlsli"
-#include "../../dyncube/dyncube_spatial.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 #include "../../reference/brdf.hlsli"
@@ -226,9 +223,6 @@ Texture2D<float4> texCloudShadow : register(t27);
 
 // 3Dmigoto declarations
 #define cmp -
-
-// NOTE: DynCubeSpatialReproject() now lives in ../../dyncube/dyncube_spatial.hlsli
-// (moved verbatim; histPos texture + sampler are explicit parameters).
 
 
 void main(
@@ -277,18 +271,7 @@ void main(
     uint4 GTVBAO_raw = gtvbaoTexture.Load(int3(texel, 0));
     float GTVBAO_ao = float(GTVBAO_raw.x) / 255.0;
 
-    int fix = (int)shader_injection_data.gtvbao_fix_experimental;
-    if (fix == 1) {
-      ao_sample.x = 1.0;  // Neutral: test if veil is from AO value
-    } else if (fix == 2) {
-      ao_sample.x = float(GTVBAO_raw.x) / 255.0;  // Full uint, no 0xFF mask
-    } else if (fix == 3) {
-      ao_sample.x = 1.0 - GTVBAO_ao;  // Inverted encoding
-    } else if (fix == 4) {
-      ao_sample = float3(GTVBAO_ao, GTVBAO_ao, GTVBAO_ao);  // All channels GTVBAO
-    } else {
-      ao_sample.x = GTVBAO_ao;  // Default current
-    }
+    ao_sample.x = GTVBAO_ao;
   }
   r5.xyz = ao_sample;
 
@@ -303,12 +286,7 @@ void main(
     if (shader_injection_data.vbgi_max_clamp > 0.0) {
       giColor = min(giColor, shader_injection_data.vbgi_max_clamp);
     }
-    if (shader_injection_data.vbgi_affect_lights > 0.5f) {
-      float lightLuma = dot(lightColor_g.xyz, float3(0.299f, 0.587f, 0.114f));
-      float3 lightContrib = lerp(lightLuma.xxx, lightColor_g.xyz, shader_injection_data.vbgi_lights_saturation);
-      lightContrib = saturate(lightContrib);
-      giColor += lightContrib * shader_injection_data.vbgi_lights_strength * 0.2f;
-    }
+
     cachedVBGI = giColor;
     cachedVBGILuma = dot(cachedVBGI, float3(0.333, 0.333, 0.333));
   }
@@ -674,15 +652,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       float gtvbaoAO = lerp(r5.x, 1.0, gtvbaoCharMask);
       charColor *= gtvbaoAO;
     }
-    // Probe ambient debug — show lightProbe_g[0] DC term (indoor/outdoor signal)
-    if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
-      float3 probeAmbient = lightProbe_g[0].xyz;
-      o0.xyz = probeAmbient * 0.5;
-      o0.w = r0.w;
-      o1.xyzw = r2.xyzw;
-      o2.xy = r3.xy;
-      return;
-    }
+
     if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
       float3 giColor = cachedVBGI;
       // Light Color debug view — shows sun color uniformly
@@ -861,23 +831,11 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       && shader_injection_data.dynCube_force_ssr > 0.5f;
   bool dynCubeReflResolveActive = shader_injection_data.dynCube_enabled > 0.5f
     && shader_injection_data.dynCube_force_vanilla < 0.5f;
-  // Debug A/B: negate the world reflection ray used by box-parallax correction.
-  // OFF = mathematical reflect(pixel->camera, N). ON = physical ray (the game's (1,-1,-1) flips to it).
   float dynCubeReflectSign = (shader_injection_data.dynCube_reflect_sign_flip > 0.5f) ? -1.0 : 1.0;
-  float3 dynCubeReflDir = float3(0, 0, 0);
-  float dynCubeVanillaMipFactor = 0.0;   // game roughness->mip factor, for the vanilla fallback's own mip chain
-  bool dynCubeReflActive = false;
-  int dynCubeReflSrc = 1;  // 0=SSR, 1=Dynamic, 2=Vanilla (debug 11)
-  // Spatial-reprojection gate prefetch (experimental master toggle only).
-  // Fetches the SSR confidence early so the search below runs solely on
-  // weak/missing SSR pixels; the existing resolve tap later is untouched.
-  bool dynCubeSpatialActive = shader_injection_data.dynCube_enabled > 0.5f
-      && shader_injection_data.dynCube_spatial_reprojection > 0.5f;
-  float dynCubeSsrGateConf = 1.0f;
-  if (dynCubeSpatialActive && dynCubeNewSSRActive) {
-    float2 dynCubeSsrGateUV = resolutionScaling_g.xy * v1.zw;
-    dynCubeSsrGateConf = dynCubeSSRTex.SampleLevel(SmplLinearClamp_s, dynCubeSsrGateUV, 0).a;
-  }
+   float3 dynCubeReflDir = float3(0, 0, 0);
+   float dynCubeVanillaMipFactor = 0.0;
+   bool dynCubeReflActive = false;
+   int dynCubeReflSrc = 1;
   if (r20.z != 0) {
     r5.yz = r15.yz * r9.yz;
     dynCubeVanillaMipFactor = r5.z;
@@ -889,22 +847,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     } else {
       r8.z = r3.y + r3.y;
       r22.xyz = r8.xyw * -r8.zzz + r19.xyz;
-      // Dynamic-cubemap lookup chain (parallax, mip/flip/tilt, spatial search,
-      // sample, boost, face debug) — shared implementation, see dyncube_sample.hlsli.
-      // r5.z is the Sora roughness factor; r22.xyz is the pre-parallax world ray.
-      float3 dynCubeSampleColA;
-      float3 dynCubeSampleFinalA;
-      int parallaxFace;
-      uint dynCubeNumLevelsA;
-      float dynCubeUnusedMipA;  // site A never reuses the sample mip afterwards
-      DynCubeSampleDynamic(
-          texEnvMap_g, SmplCube_s,
-          dynCubeHistPosTex, samPoint_s,
-          dynCubeWorldBox,
-          r4.xyz, r22.xyz, r5.z, dynCubeReflectSign, viewInv_g._m30_m31_m32,
-          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-          dynCubeSampleColA, dynCubeSampleFinalA, parallaxFace,
-          dynCubeNumLevelsA, dynCubeUnusedMipA);
+       float3 dynCubeSampleColA;
+       float3 dynCubeSampleFinalA;
+       uint dynCubeNumLevelsA;
+       float dynCubeUnusedMipA;
+       DynCubeSampleDynamic(
+           texEnvMap_g, SmplCube_s,
+           r22.xyz, r5.z, dynCubeReflectSign,
+           dynCubeSampleColA, dynCubeSampleFinalA,
+           dynCubeNumLevelsA, dynCubeUnusedMipA);
       r21.xyz = dynCubeSampleColA;
       num_levels = dynCubeNumLevelsA;
       // Record the final sampled direction (including lookup flip and any spatial
@@ -973,7 +924,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       // Dynamic-cubemap lookup chain — shared implementation, see dyncube_sample.hlsli.
       // r2.x is the Sora roughness factor here; it is reloaded with the sample mip
       // afterwards because the transmission tap below rescales it onto the vanilla chain.
-      // r21.xyz is the pre-parallax world ray.
+       // r21.xyz is the reflection ray.
       // Sora refraction (game-specific transmission physics) stays inline, unchanged.
       r2.x = 1 / r15.w;
       r5.y = dot(-r19.xyz, r8.xyw);
@@ -988,19 +939,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       r19.xyz = r5.zzz ? r19.xyz : 0;
       r2.x = r15.z * r9.z;
       dynCubeVanillaMipFactor = r2.x;
-      float3 dynCubeSampleColB;
-      float3 dynCubeSampleFinalB;
-      int parallaxFace2;
-      uint dynCubeNumLevelsB;
-      float dynCubeSampleMipB;
-      DynCubeSampleDynamic(
-          texEnvMap_g, SmplCube_s,
-          dynCubeHistPosTex, samPoint_s,
-          dynCubeWorldBox,
-          r4.xyz, r21.xyz, r2.x, dynCubeReflectSign, viewInv_g._m30_m31_m32,
-          dynCubeSsrGateConf, dynCubeSpatialActive, dynCubeForceSSRActive, dynCubeNewSSRActive,
-          dynCubeSampleColB, dynCubeSampleFinalB, parallaxFace2,
-          dynCubeNumLevelsB, dynCubeSampleMipB);
+       float3 dynCubeSampleColB;
+       float3 dynCubeSampleFinalB;
+       uint dynCubeNumLevelsB;
+       float dynCubeSampleMipB;
+       DynCubeSampleDynamic(
+           texEnvMap_g, SmplCube_s,
+           r21.xyz, r2.x, dynCubeReflectSign,
+           dynCubeSampleColB, dynCubeSampleFinalB,
+           dynCubeNumLevelsB, dynCubeSampleMipB);
       r21.xyz = dynCubeSampleColB;
       r2.x = dynCubeSampleMipB;
       num_levels = dynCubeNumLevelsB;
@@ -1041,7 +988,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
       // Transmission/refraction tap (game-original): r19 is the refracted direction,
       // not the reflection vector, so it keeps the vanilla cubemap source with the
       // game's roughness LOD rescaled onto the vanilla mip chain. Never the dynamic
-      // cube, never parallax-corrected, never dynCube_blur. When DynCube is off,
+       // cube, never dynCube_blur. When DynCube is off,
       // t17 is already vanilla, so the original sample is kept as-is.
       if (shader_injection_data.dynCube_enabled > 0.5f) {
         uint vanW, vanH, vanL;
@@ -1552,16 +1499,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.z = combineAlpha_g * r1.z;
   r1.xyw = r1.xyw + -r0.xyz;
   o0.xyz = r1.zzz * r1.xyw + r0.xyz;
-  // Probe ambient debug — character pixel path
-  if (shader_injection_data.vbgi_cascade_debug > 0.5f) {
-    float3 probeAmbient = lightProbe_g[0].xyz;
-    o0.xyz = probeAmbient * 0.5;
-    o0.w = 1;
-    o1.xyzw = (uint4)(float4(0, 255, 0, 0) * saturate(0.1 * r0.w));  // native o1
-    o2.y = min(0x0000ffff, (uint)(65.535 * r18.x));                  // native o2.y
-    o2.x = 0;
-    return;
-  }
+
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     float3 giColor = cachedVBGI;
     // Light Color debug view — shows sun color uniformly
