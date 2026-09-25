@@ -32,6 +32,8 @@ cbuffer DynCubeCB : register(b13)
     float g_sparkleReject;         // 0 = off (default), 1 = reject isolated HDR spikes at depth edges + non-finite input; appended last, push count 11 -> 12
 };
 
+#include "dyncube_common.hlsli"
+
 Texture2D<float>       g_depthTex      : register(t0);
 Texture2D<float4>      g_colorTex      : register(t1);
 Texture2DArray<float4> g_prevColorTex  : register(t2);
@@ -110,6 +112,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float3 curCol = 0.0;
     float3 curPos = 0.0;
     bool curValid = false;
+    float3 forcedVanilla = 0.0;
+    bool hasForcedVanilla = false;
     if (inside)
     {
         float rawDepth = g_depthTex.SampleLevel(g_pointClamp, uv, 0);
@@ -128,15 +132,18 @@ void main(uint3 dtid : SV_DispatchThreadID)
             curValid = true;
         }
 
-    // ── Sparkle rejection (toggle): kill isolated HDR spikes at depth edges ──
-    // No caps anywhere: broad legitimate brights pass through untouched. Only a lone
-    // texel that is BOTH a depth outlier vs all valid neighbors AND far brighter than
-    // the brightest valid neighbor is marked invalid (history/vanilla survive instead
-    // of baking the spike). Non-finite input is always invalid under the toggle.
+    float3 invalidCol = 0.0;
+    bool hasInvalidCol = false;
+    bool depthInvalid = !(rawDepth > 0.0 && rawDepth < 1.0 - 1e-5);
+    if (g_sparkleReject > 0.5 && depthInvalid)
+    {
+        invalidCol = g_colorTex.SampleLevel(g_pointClamp, uv, 0).rgb;
+        hasInvalidCol = true;
+    }
     if (g_sparkleReject > 0.5 && curValid)
     {
-        float curSum = curCol.x + curCol.y + curCol.z + curPos.x + curPos.y + curPos.z;
-        if (!isfinite(curSum))
+        float curHeader = curCol.x + curCol.y + curCol.z + curPos.x + curPos.y + curPos.z;
+        if (!isfinite(curHeader))
         {
             curValid = false;
         }
@@ -146,23 +153,124 @@ void main(uint3 dtid : SV_DispatchThreadID)
             g_colorTex.GetDimensions(cW, cH);
             float2 texel = 1.0 / float2(max(cW, 1u), max(cH, 1u));
             float centerLum = dot(curCol, float3(0.2126, 0.7152, 0.0722));
-            float neighMaxLum = 0.0;
-            uint validNeigh = 0u;
-            bool allNearer = true;
-            for (int ni = 0; ni < 4; ++ni)
+            if (centerLum > 1.0)
             {
-                float2 nuv = uv + float2((ni == 0) ? texel.x : ((ni == 1) ? -texel.x : 0.0),
-                                         (ni == 2) ? texel.y : ((ni == 3) ? -texel.y : 0.0));
-                if (IsOutside(nuv)) continue;
-                float nDepth = g_depthTex.SampleLevel(g_pointClamp, nuv, 0);
-                if (nDepth >= 1.0 - 1e-5) continue;
-                validNeigh++;
-                if (rawDepth <= nDepth * 1.1) allNearer = false;
-                float3 nCol = g_colorTex.SampleLevel(g_pointClamp, nuv, 0).rgb;
-                neighMaxLum = max(neighMaxLum, dot(nCol, float3(0.2126, 0.7152, 0.0722)));
+                float unpackMul, unpackAdd;
+                DynCubeGetDepthUnpackConsts(unpackMul, unpackAdd);
+                float centerLin = DynCubeLinearizeDepth(rawDepth, unpackMul, unpackAdd);
+                if (centerLin > 0.0 && centerLin < DynCubeFltMax)
+                {
+                    float depthTol = max(centerLin * 0.02, 0.05);
+                    float brightFloor = max(centerLum * 0.25, 1.0);
+                    uint validNeigh = 0u;
+                    uint brightNeigh = 0u;
+                    uint sameDepthNeigh = 0u;
+                    uint nearerNeigh = 0u;
+                    float neighSumLum = 0.0;
+                    for (int oy = -1; oy <= 1; ++oy)
+                    {
+                        for (int ox = -1; ox <= 1; ++ox)
+                        {
+                            if (ox == 0 && oy == 0) continue;
+                            float2 nuv = uv + float2((float)ox, (float)oy) * texel;
+                            if (IsOutside(nuv)) continue;
+                            float nDepth = g_depthTex.SampleLevel(g_pointClamp, nuv, 0);
+                            if (!(nDepth > 0.0 && nDepth < 1.0 - 1e-5)) continue;
+                            float3 nCol = g_colorTex.SampleLevel(g_pointClamp, nuv, 0).rgb;
+                            float nHeader = nCol.x + nCol.y + nCol.z;
+                            if (!isfinite(nHeader)) continue;
+                            float nLin = DynCubeLinearizeDepth(nDepth, unpackMul, unpackAdd);
+                            if (!(nLin > 0.0 && nLin < DynCubeFltMax)) continue;
+                            float nLum = dot(nCol, float3(0.2126, 0.7152, 0.0722));
+                            validNeigh++;
+                            neighSumLum += nLum;
+                            if (nLum >= brightFloor) brightNeigh++;
+                            if (abs(nLin - centerLin) <= depthTol) sameDepthNeigh++;
+                            else if (nLin < centerLin - depthTol) nearerNeigh++;
+                        }
+                    }
+                    if (validNeigh == 0u)
+                    {
+                        float3 vanillaCol = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
+                        float vanillaHeader = vanillaCol.x + vanillaCol.y + vanillaCol.z;
+                        if (isfinite(vanillaHeader))
+                        {
+                            float vanillaLum = dot(vanillaCol, float3(0.2126, 0.7152, 0.0722));
+                            if (vanillaLum > 0.01 && centerLum > max(vanillaLum * 4.0, 1.0))
+                            {
+                                forcedVanilla = vanillaCol;
+                                hasForcedVanilla = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        bool depthOutlier = (sameDepthNeigh == 0u)
+                            || (sameDepthNeigh * 2u <= validNeigh && nearerNeigh * 2u >= validNeigh);
+                        if (brightNeigh <= 2u && depthOutlier
+                            && centerLum > max((neighSumLum / (float)validNeigh) * 4.0, 1.0))
+                        {
+                            float3 vanillaReplace = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
+                            float replaceHeader = vanillaReplace.x + vanillaReplace.y + vanillaReplace.z;
+                            if (isfinite(replaceHeader))
+                            {
+                                forcedVanilla = vanillaReplace;
+                                hasForcedVanilla = true;
+                            }
+                            else
+                            {
+                                curValid = false;
+                            }
+                        }
+                    }
+                    if (!hasForcedVanilla)
+                    {
+                        float3 vanillaStable = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
+                        float vanillaStableHeader = vanillaStable.x + vanillaStable.y + vanillaStable.z;
+                        if (isfinite(vanillaStableHeader))
+                        {
+                            float vanillaStableLum = dot(vanillaStable, float3(0.2126, 0.7152, 0.0722));
+                            if (vanillaStableLum > 0.01 && centerLum > max(vanillaStableLum * 4.0, 1.0))
+                            {
+                                forcedVanilla = vanillaStable;
+                                hasForcedVanilla = true;
+                            }
+                        }
+                    }
+                }
             }
-            if (validNeigh > 0u && allNearer && centerLum > max(neighMaxLum * 4.0, 1.0))
-                curValid = false;
+        }
+    }
+    if (g_sparkleReject > 0.5 && !curValid && hasInvalidCol && !hasForcedVanilla)
+    {
+        float invalidHeader = invalidCol.x + invalidCol.y + invalidCol.z;
+        if (!isfinite(invalidHeader))
+        {
+            float3 vanillaInvalid = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
+            float vanillaInvalidHeader = vanillaInvalid.x + vanillaInvalid.y + vanillaInvalid.z;
+            if (isfinite(vanillaInvalidHeader))
+            {
+                forcedVanilla = vanillaInvalid;
+                hasForcedVanilla = true;
+            }
+        }
+        else
+        {
+            float invalidLum = dot(invalidCol, float3(0.2126, 0.7152, 0.0722));
+            if (invalidLum > 1.0)
+            {
+                float3 vanillaSky = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
+                float vanillaSkyHeader = vanillaSky.x + vanillaSky.y + vanillaSky.z;
+                if (isfinite(vanillaSkyHeader))
+                {
+                    float vanillaSkyLum = dot(vanillaSky, float3(0.2126, 0.7152, 0.0722));
+                    if (vanillaSkyLum > 0.01 && invalidLum > max(vanillaSkyLum * 4.0, 1.0))
+                    {
+                        forcedVanilla = vanillaSky;
+                        hasForcedVanilla = true;
+                    }
+                }
+            }
         }
     }
     }
@@ -208,7 +316,14 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float3 outPos;
     float  outValid;
     float  outContrib;
-    if (curValid)
+    if (hasForcedVanilla)
+    {
+        outCol = forcedVanilla;
+        outPos = 0.0;
+        outValid = 0.0;
+        outContrib = 0.0;
+    }
+    else if (curValid)
     {
         float3 curPosScaled = curPos * g_posScale;
         float posDelta = length(prevPosComp - curPosScaled);

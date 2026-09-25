@@ -31,6 +31,7 @@
 #include "../../utils/descriptor.hpp"
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/resource.hpp"
+#include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
 #include "../../utils/state.hpp"
@@ -453,6 +454,19 @@ static float g_isfast_seed_offset   = 0.f;
 // ── Settings visibility ──
 static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
 static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
+static float g_custom_taa_fp16_experiment = 0.f;  // 0=original TAA target, 1=experimental FP16 clone
+static renodx::utils::resource::ResourceUpgradeInfo taa_fp16_clone_target = {
+    .old_format = reshade::api::format::unknown,
+    .new_format = reshade::api::format::r16g16b16a16_float,
+    .use_resource_view_cloning = true,
+    .use_resource_view_hot_swap = true,
+    .usage_set = static_cast<uint32_t>(
+        reshade::api::resource_usage::render_target
+        | reshade::api::resource_usage::shader_resource
+        | reshade::api::resource_usage::copy_source
+        | reshade::api::resource_usage::copy_dest),
+    .view_upgrades = renodx::utils::resource::VIEW_UPGRADES_RGBA16F,
+};
 
 // ── Kai detection ──
 static float g_char_vbgi_composite_method = 1.f;  // Kai Character VBGI master toggle
@@ -846,6 +860,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   float dyncube_lastVariantSoften = -1.f;      // soften value baked into the variant (-1 = none yet)
   float dyncube_lastVariantStrength = -1.f;    // strength value baked into the variant (-1 = none yet)
   float dyncube_lastCharCapture = -1.f;       // character-capture value fed into the last filter pass
+  float dyncube_lastSparkleRejection = -1.f;
   bool dyncube_hasValidRead = false;       // any validated readSet exists (gates first filter)
   uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
   // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
@@ -927,6 +942,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t rcas_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> rcas_tables = {};  // [0]=srv t0, [1]=uav u0
   reshade::api::resource_view rcas_last_rtv0 = {};            // latest bound RTV0 (D3D11 immediate-list assumption; sampled at TAA on_draw)
+  reshade::api::resource taa_fp16_resource = {};                 // observed original TAA target while the experiment is active
+  reshade::api::resource taa_fp16_clone = {};                    // FP16 clone of the observed TAA target
+  reshade::api::resource_view taa_fp16_original_rtv = {};        // original RTV rewritten while the experiment is active
+  reshade::api::resource_view taa_fp16_clone_rtv = {};           // active FP16 RTV
+  bool taa_fp16_active = false;                                  // an experimental FP16 TAA RTV is currently bound
+  bool taa_fp16_logged = false;                                  // one-time status/skip log for the current experimental state
+  std::atomic<bool> taa_fp16_history_reset{false};               // a destroyed experimental target requires history reset
   reshade::api::resource_view rcas_motion_srv = {};          // game motion buffer (t3) captured from TAA draws (Stage 2)
   uint64_t rcas_motion_res = 0u;
   std::atomic<bool> rcas_motion_live{true};                  // destroy-event driven; false = buffer freed since capture
@@ -951,19 +973,17 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline fxaa_high_pipeline = {};
   uint32_t fxaa_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> fxaa_tables = {};  // [0]=srv t0+t1, [1]=uav u0
-  // ── Custom TAA cross-addon slot claim (compat with the falcomengine addon,
+  // ── Custom TAA cross-addon slot ownership (compat with the falcomengine addon,
   // which replaces the same TAA hashes unconditionally) ──
   // Replacement bytecode lives in one cross-addon shared slot per hash
   // (last registration wins), while on_draw/on_drawn callbacks stay
-  // per-addon: without a claim the friend's TAA serves and only our
-  // callbacks run. While Custom TAA is on, the slot holds our bytecode;
-  // on off, the previously saved bytes are restored (friend's) or the
-  // slot is removed (friend absent -> vanilla, today's behavior).
+  // per-addon. This addon persistently owns the slot for the device lifetime:
+  // Custom TAA ON selects the custom bytecode, while OFF selects this addon's
+  // vanilla reference bytecode. The friend addon's bytes are never restored.
   bool taa_slot_claimed = false;
   uint32_t taa_claimed_hash = 0u;
-  std::span<const uint8_t> taa_claimed_code = {};  // our embed bytes currently in the slot (static storage)
-  std::vector<uint8_t> taa_saved_code = {};
-  bool taa_saved_valid = false;
+  std::span<const uint8_t> taa_claimed_code = {};  // embed bytes currently in the slot (static storage)
+  bool taa_other_addon_active = false;  // another payload was seen for a TAA hash
   // Per-pipeline deep clones of TAA pipeline subobjects, captured at
   // init_pipeline (handle known there) keyed by pipeline handle. Feeds the
   // draw-time rebuild, which cannot use details->subobjects (only stored by
@@ -972,6 +992,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // details currently hold OUR clone (ownership for later replacement).
   std::unordered_map<uint64_t, std::pair<reshade::api::pipeline_subobject*, uint32_t>> taa_subobject_clones = {};
   std::unordered_set<uint64_t> taa_subobjects_owned = {};
+  // Pipelines captured after the slot payload stabilized (level loads,
+  // resolution changes, device resets): their creation-time build used
+  // whatever the slot held before, so force one reset on the next TAA draw.
+  std::unordered_set<uint64_t> taa_pending_resets = {};
 };
 
 static void CreateGTVBAOResources(reshade::api::device* device, DeviceData* data,
@@ -1018,8 +1042,7 @@ static void DestroyFXAAResources(reshade::api::device* dev, DeviceData* d);
 static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d);
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
-static void ClaimTAASlot(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> code);
-static void ReleaseTAASlot(reshade::api::device* dev);
+static void EnsureTAAPayload(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> desired, std::span<const uint8_t> alternate);
 static void OnInitPipelineCapture(
     reshade::api::device* device,
     reshade::api::pipeline_layout layout,
@@ -1150,6 +1173,11 @@ static void OnInitPipelineCapture(
       renodx::utils::pipeline::ClonePipelineSubObjects(subobjects, subobject_count);
   if (!clone) return;
   d->taa_subobject_clones.emplace(pipeline.handle, std::make_pair(clone, subobject_count));
+  // If the slot payload is already owned, this pipeline's creation-time build
+  // may have used stale bytes: schedule one reset on the next TAA draw.
+  if (d->taa_slot_claimed) {
+    d->taa_pending_resets.insert(pipeline.handle);
+  }
 }
 
 // Frees a stored subobject clone when its pipeline dies (bounds the store
@@ -1163,6 +1191,7 @@ static void OnDestroyPipelineCapture(reshade::api::device* device, reshade::api:
   renodx::utils::pipeline::DestroyPipelineSubobjects(it->second.first, it->second.second);
   d->taa_subobject_clones.erase(it);
   d->taa_subobjects_owned.erase(pipeline.handle);
+  d->taa_pending_resets.erase(pipeline.handle);
 }
 static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list);
 static bool OnBeforeKaiSSRDraw(reshade::api::command_list* cmd_list);
@@ -1419,15 +1448,17 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeSora1stSSRDraw,
         },
     },
-    // ── Custom TAA (Sora 1st/2nd, replacement-gated; vanilla when off) ──
+    // ── Custom TAA (Sora 1st/2nd; vanilla baseline, custom when enabled) ──
     // NOTE: custom files use unique embed stems (taa_custom_sora1st/2nd) so the
     // dumped vanilla reference files under sora1st/taa and sora2nd/taa keep
     // compiling untouched; the runtime CRCs below are the game's TAA hashes.
+    // The initial slot payload is vanilla. OnBeforeCustomTAADraw selects the
+    // custom payload when enabled and reasserts vanilla when disabled.
     {
         0xFA37EA04u,
         renodx::mods::shader::CustomShader{
             .crc32 = 0xFA37EA04u,
-            .code = __taa_custom_sora1st,
+            .code = __0xFA37EA04,
             .on_replace = OnReplaceCustomTAADraw,
             .on_draw = OnBeforeCustomTAADraw,
             .on_drawn = OnDrawnCustomTAA,
@@ -1437,7 +1468,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         0x9D91FAC3u,
         renodx::mods::shader::CustomShader{
             .crc32 = 0x9D91FAC3u,
-            .code = __taa_custom_sora2nd,
+            .code = __0x9D91FAC3,
             .on_replace = OnReplaceCustomTAADraw,
             .on_draw = OnBeforeCustomTAADraw,
             .on_drawn = OnDrawnCustomTAA,
@@ -3683,15 +3714,6 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "DynCubeSparkleRejection", .binding = &shader_injection.dynCube_sparkle_rejection,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Sparkle Rejection", .section = "Dynamic Cubemaps",
-      .tooltip = "A/B test: reject isolated HDR spikes at depth discontinuities plus non-finite input in capture. No HDR caps: broad legitimate brights pass through. Off = current behavior.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "DynCubeSSRDistanceFade", .binding = &shader_injection.dynCube_ssr_distance_fade,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.f, .label = "SSR Distance Fade", .section = "Dynamic Cubemaps",
@@ -3878,6 +3900,15 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Smooths jagged edges and flickering while moving. On = cleaner custom anti-aliasing. Off = the game's original anti-aliasing.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "CustomTAAFP16Experiment", .binding = &g_custom_taa_fp16_experiment,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Experimental TAA FP16", .section = "Custom TAA",
+      .tooltip = "Partial experiment only: clones the observed TAA render target to RGBA16F at runtime. Scene-color input is unchanged, history resets on transitions, and a friend HDR upgrade can make Off inconclusive.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
+      .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CustomTAAHistoryFilter", .binding = &shader_injection.custom_taa_history_filter,
@@ -4296,6 +4327,7 @@ static void OnDestroyDevice(reshade::api::device* device) {
     }
     d->taa_subobject_clones.clear();
     d->taa_subobjects_owned.clear();
+    d->taa_pending_resets.clear();
     if (d->fallback_srv.handle) device->destroy_resource_view(d->fallback_srv);
     if (d->fallback_texture.handle) device->destroy_resource(d->fallback_texture);
     device->destroy_private_data<DeviceData>();
@@ -4967,6 +4999,17 @@ static void KillTrackedInput(DeviceData* d, reshade::api::resource_view tracked,
 }
 static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   if (!d) return;
+  if ((d->taa_fp16_original_rtv.handle != 0u && d->taa_fp16_original_rtv.handle == deadView)
+      || (d->taa_fp16_clone_rtv.handle != 0u && d->taa_fp16_clone_rtv.handle == deadView)
+      || (d->taa_fp16_resource.handle != 0u && d->taa_fp16_resource.handle == deadRes)
+      || (d->taa_fp16_clone.handle != 0u && d->taa_fp16_clone.handle == deadRes)) {
+    d->taa_fp16_active = false;
+    d->taa_fp16_resource = {};
+    d->taa_fp16_clone = {};
+    d->taa_fp16_original_rtv = {};
+    d->taa_fp16_clone_rtv = {};
+    d->taa_fp16_history_reset.store(true);
+  }
   KillTrackedInput(d, d->captured_depth_srv, d->captured_depth_res, d->captured_depth_live, "depth", deadView, deadRes);
   KillTrackedInput(d, d->captured_color_srv, d->captured_color_res, d->captured_color_live, "color", deadView, deadRes);
   KillTrackedInput(d, d->captured_mrt_normal_srv, d->captured_mrt_res, d->captured_mrt_live, "mrt", deadView, deadRes);
@@ -5727,9 +5770,10 @@ static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list) {
 }
 
 // ── Custom TAA gate (Sora 1st/2nd) ──
-// OFF (or non-Sora exe): on_replace returns false so the game's original TAA
-// draws untouched; the dumped vanilla files are reference only, never edited.
-// ON: the from-scratch custom shader serves the TAA hash.
+// ON: the from-scratch custom shader serves the TAA hash. OFF: this addon's
+// vanilla reference serves the TAA hash when another addon has registered it;
+// otherwise the game's original TAA draws untouched. The dumped vanilla files
+// are reference only, never edited.
 // History validity: the first custom frame after the OFF->ON transition must
 // never accumulate against stale vanilla history, so on_draw reports invalid
 // (shader outputs current only) and arms accumulation from the next frame.
@@ -5745,74 +5789,326 @@ static bool CustomTAAReplaceActive(reshade::api::command_list* cmd_list) {
 }
 
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list) {
-  return CustomTAAReplaceActive(cmd_list);
+  if (!cmd_list) return false;
+  if (CustomTAAReplaceActive(cmd_list)) return true;
+  // When another addon has registered the same TAA hash, keep forcing this
+  // addon's selected payload (vanilla when Custom TAA is off). Otherwise leave
+  // the game's original pipeline untouched.
+  if (!IsSora1st() && !IsSora2nd()) return false;
+  auto* dev = cmd_list->get_device();
+  auto* d = (dev != nullptr) ? dev->get_private_data<DeviceData>() : nullptr;
+  return d != nullptr && d->taa_other_addon_active;
 }
 
-// Claims the cross-addon replacement slot for a TAA hash with our bytecode.
-// Saves the currently registered bytes first (the friend's, when present) so
-// ReleaseTAASlot can restore them. Transition-only cost: AddRuntimeReplacement
-// invalidates cached replacement pipelines once per claim.
-static void ClaimTAASlot(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> code) {
-  if (!dev || hash == 0u || code.empty()) return;
+// Compares replacement payloads before rewriting the shared slot. Transition
+// cost comes only from changed payloads: AddRuntimeReplacement invalidates
+// cached replacement pipelines.
+static bool TAASpanEquals(std::span<const uint8_t> a, std::span<const uint8_t> b) {
+  return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+// Persistently owns a TAA replacement slot for the device lifetime. The
+// caller supplies both this addon's custom and vanilla payloads; the slot
+// holds whichever payload is desired. Only a changed payload rewrites the
+// shared map and resets cached replacement pipelines.
+static void EnsureTAAPayload(
+    reshade::api::device* dev,
+    uint32_t hash,
+    std::span<const uint8_t> desired,
+    std::span<const uint8_t> alternate) {
+  if (!dev || hash == 0u || desired.empty()) return;
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   if (renodx::utils::shader::shared.data == nullptr) return;  // shared state unavailable: keep today's behavior
-  if (d->taa_slot_claimed) {
-    if (d->taa_claimed_hash == hash) return;
-    ReleaseTAASlot(dev);
-  }
-  d->taa_saved_code.clear();
-  d->taa_saved_valid = false;
+  bool present = false;
+  bool matches_desired = false;
+  bool matches_alternate = false;
   renodx::utils::shader::shared.data->runtime_replacements.if_contains(
       std::pair<reshade::api::device*, uint32_t>{dev, hash},
       [&](const auto& pair) {
-        d->taa_saved_code.assign(pair.second.begin(), pair.second.end());
-        d->taa_saved_valid = true;
+        present = true;
+        matches_desired = TAASpanEquals(pair.second, desired);
+        matches_alternate = !alternate.empty() && TAASpanEquals(pair.second, alternate);
       });
-  renodx::utils::shader::AddRuntimeReplacement(dev, hash, code);
+  // A nonempty payload different from both known payloads means another addon
+  // has registered this TAA hash. Remember that so replacement stays forced
+  // even when Custom TAA is off.
+  if (present && !matches_desired && !matches_alternate) {
+    d->taa_other_addon_active = true;
+  }
+  if (matches_desired) {
+    d->taa_slot_claimed = true;
+    d->taa_claimed_hash = hash;
+    d->taa_claimed_code = desired;
+    return;
+  }
+  renodx::utils::shader::AddRuntimeReplacement(dev, hash, desired);
   ResetTAAReplacementPipelines(dev, hash);
   d->taa_slot_claimed = true;
   d->taa_claimed_hash = hash;
-  d->taa_claimed_code = code;
+  d->taa_claimed_code = desired;
 }
 
-// Releases a claimed TAA slot. Saved bytes identical to ours mean no other
-// addon registered the hash: remove the slot (vanilla serves, today's
-// behavior). Otherwise restore the saved (friend's) bytes.
-static void ReleaseTAASlot(reshade::api::device* dev) {
-  if (!dev) return;
-  auto* d = dev->get_private_data<DeviceData>();
-  if (!d || !d->taa_slot_claimed) return;
-  if (renodx::utils::shader::shared.data == nullptr) return;
-  const uint32_t hash = d->taa_claimed_hash;
-  const std::span<const uint8_t> code = d->taa_claimed_code;
-  d->taa_slot_claimed = false;
-  d->taa_claimed_hash = 0u;
-  d->taa_claimed_code = {};
-  const bool same_as_ours = d->taa_saved_valid
-      && d->taa_saved_code.size() == code.size()
-      && std::equal(d->taa_saved_code.begin(), d->taa_saved_code.end(), code.begin());
-  if (same_as_ours || !d->taa_saved_valid || d->taa_saved_code.empty()) {
-    renodx::utils::shader::RemoveRuntimeReplacements(dev, {hash});
-  } else {
-    renodx::utils::shader::AddRuntimeReplacement(
-        dev, hash, std::span<const uint8_t>{d->taa_saved_code.data(), d->taa_saved_code.size()});
+static bool TAAFP16EligibleFormat(reshade::api::format fmt) {
+  using F = reshade::api::format;
+  switch (fmt) {
+    case F::r8g8b8a8_unorm:
+    case F::b8g8r8a8_unorm:
+    case F::r10g10b10a2_unorm:
+    case F::b10g10r10a2_unorm:
+    case F::r11g11b10_float:
+      return true;
+    default:
+      return false;
   }
-  ResetTAAReplacementPipelines(dev, hash);
-  d->taa_saved_code.clear();
-  d->taa_saved_valid = false;
+}
+
+// Partial experiment: clone only the observed TAA render target to FP16 and
+// hot-swap its RTV. Scene-color input is intentionally unchanged. Returns true
+// only on an activation/deactivation/resource transition, so the caller can
+// reset TAA history exactly when precision changes.
+static bool ApplyTAAFP16Experiment(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return false;
+  auto* dev = cmd_list->get_device();
+  if (!dev || dev->get_api() != reshade::api::device_api::d3d11) return false;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return false;
+  const bool want = g_custom_taa_fp16_experiment > 0.5f
+      && shader_injection.custom_taa_enabled > 0.5f
+      && (IsSora1st() || IsSora2nd());
+  if (d->taa_fp16_history_reset.exchange(false)) {
+    s_custom_taa_was_active = false;
+    shader_injection.custom_taa_history_valid = 0.f;
+  }
+  auto& rtvs = renodx::utils::swapchain::GetRenderTargets(cmd_list);
+  if (rtvs.empty() || rtvs[0].handle == 0u) return false;
+  reshade::api::resource original = dev->get_resource_from_view(rtvs[0]);
+  if (original.handle == 0u) return false;
+  const auto desc = dev->get_resource_desc(original);
+  if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples != 1u
+      || desc.texture.width == 0u || desc.texture.height == 0u
+      || desc.texture.format == reshade::api::format::unknown) {
+    return false;
+  }
+  if (desc.texture.format == reshade::api::format::r16g16b16a16_float) {
+    if (d->taa_fp16_active) {
+      d->taa_fp16_active = false;
+      d->taa_fp16_resource = {};
+      d->taa_fp16_clone = {};
+      d->taa_fp16_original_rtv = {};
+      d->taa_fp16_clone_rtv = {};
+      d->taa_fp16_logged = false;
+      s_custom_taa_was_active = false;
+      shader_injection.custom_taa_history_valid = 0.f;
+      reshade::log::message(reshade::log::level::info, "[TAA] FP16 experiment idle: target is already FP16");
+      return true;
+    }
+    if (!d->taa_fp16_logged) {
+      reshade::log::message(reshade::log::level::info, "[TAA] FP16 experiment idle: target is already FP16");
+      d->taa_fp16_logged = true;
+    }
+    return false;
+  }
+  if (!want) {
+    if (!d->taa_fp16_active) return false;
+    if (d->taa_fp16_original_rtv.handle != 0u) {
+      if (dev->get_resource_from_view(d->taa_fp16_original_rtv).handle != 0u) {
+        renodx::utils::resource::upgrade::DeactivateCloneHotSwap(dev, d->taa_fp16_original_rtv);
+      }
+    }
+    renodx::utils::resource::upgrade::RewriteRenderTargets(
+        cmd_list,
+        static_cast<uint32_t>(rtvs.size()),
+        rtvs.data(),
+        renodx::utils::swapchain::GetDepthStencil(cmd_list));
+    d->rcas_last_rtv0 = rtvs[0];
+    d->taa_fp16_active = false;
+    d->taa_fp16_resource = {};
+    d->taa_fp16_clone = {};
+    d->taa_fp16_original_rtv = {};
+    d->taa_fp16_clone_rtv = {};
+    d->taa_fp16_logged = false;
+    s_custom_taa_was_active = false;
+    shader_injection.custom_taa_history_valid = 0.f;
+    reshade::log::message(reshade::log::level::info, "[TAA] FP16 experiment off: restored original target");
+    return true;
+  }
+  if (!TAAFP16EligibleFormat(desc.texture.format)) {
+    if (!d->taa_fp16_logged) {
+      reshade::log::message(
+          reshade::log::level::warning,
+          ("[TAA] FP16 experiment skipped: unsupported target format "
+           + std::to_string(static_cast<int>(desc.texture.format))).c_str());
+      d->taa_fp16_logged = true;
+    }
+    return false;
+  }
+  renodx::utils::resource::ResourceUpgradeInfo* existing_target = nullptr;
+  reshade::api::resource existing_clone = {0u};
+  bool existing_clone_fp16 = false;
+  bool tracked = false;
+  if (!renodx::utils::resource::GetLiveResourceInfo(
+          original,
+          [&](const renodx::utils::resource::ResourceInfo& info) {
+            tracked = true;
+            existing_target = info.clone_target;
+            if (info.clone.handle != 0u && !info.destroyed
+                && info.desc.texture.format != reshade::api::format::unknown) {
+              existing_clone = info.clone;
+            }
+          })) {
+    tracked = false;
+  }
+  if (!tracked) {
+    if (!d->taa_fp16_logged) {
+      reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: target is untracked");
+      d->taa_fp16_logged = true;
+    }
+    return false;
+  }
+  if (existing_target != nullptr
+      && (existing_target->new_format != reshade::api::format::r16g16b16a16_float
+          || !existing_target->use_resource_view_hot_swap)) {
+    if (!d->taa_fp16_logged) {
+      reshade::log::message(
+          reshade::log::level::warning, "[TAA] FP16 experiment skipped: target is owned by another upgrade target");
+      d->taa_fp16_logged = true;
+    }
+    return false;
+  }
+  if (existing_target == nullptr) {
+    bool assigned = false;
+    renodx::utils::resource::UpdateResourceInfo(
+        original,
+        [&](renodx::utils::resource::ResourceInfo* info) {
+          if (info->destroyed || info->clone_target != nullptr) return;
+          info->clone_target = &taa_fp16_clone_target;
+          assigned = true;
+        });
+    if (!assigned) {
+      if (!d->taa_fp16_logged) {
+        reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: cannot assign clone target");
+        d->taa_fp16_logged = true;
+      }
+      return false;
+    }
+  }
+  // Reuse a valid FP16 clone (ours or the friend's); otherwise create one.
+  // No content copy: the TAA draw fully overwrites its target, and history is
+  // reset on every transition below.
+  reshade::api::resource clone = {0u};
+  if (existing_clone.handle != 0u) {
+    bool live_fp16 = false;
+    renodx::utils::resource::GetLiveResourceInfo(
+        existing_clone,
+        [&](const renodx::utils::resource::ResourceInfo& info) {
+          live_fp16 = !info.destroyed && info.desc.texture.format == reshade::api::format::r16g16b16a16_float;
+        });
+    if (!live_fp16) {
+      if (!d->taa_fp16_logged) {
+        reshade::log::message(
+            reshade::log::level::warning, "[TAA] FP16 experiment skipped: existing clone is unusable");
+        d->taa_fp16_logged = true;
+      }
+      return false;
+    }
+    clone = existing_clone;
+  } else {
+    renodx::utils::resource::upgrade::ResourceCloneOptions create_options = {};
+    create_options.require_enabled = false;
+    create_options.allow_create = true;
+    create_options.activate = false;
+    clone = renodx::utils::resource::upgrade::GetResourceClone(original, create_options);
+    if (clone.handle == 0u) {
+      if (!d->taa_fp16_logged) {
+        reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: clone creation failed");
+        d->taa_fp16_logged = true;
+      }
+      return false;
+    }
+  }
+  const bool already = d->taa_fp16_active && d->taa_fp16_resource.handle == original.handle
+      && d->taa_fp16_clone.handle == clone.handle;
+  // Same proven pattern as the friend HDR addon's RTV upgrades: mark the
+  // clone active, then rebind so the TAA draw renders into FP16.
+  renodx::utils::resource::upgrade::ActivateCloneHotSwap(dev, rtvs[0]);
+  renodx::utils::resource::upgrade::RewriteRenderTargets(
+      cmd_list,
+      static_cast<uint32_t>(rtvs.size()),
+      rtvs.data(),
+      renodx::utils::swapchain::GetDepthStencil(cmd_list));
+  renodx::utils::resource::upgrade::ResourceViewCloneOptions query_options = {};
+  query_options.require_enabled = true;
+  query_options.allow_create = true;
+  query_options.activate = false;
+  reshade::api::resource_view clone_rtv =
+      renodx::utils::resource::upgrade::GetResourceViewClone(rtvs[0], query_options);
+  if (clone_rtv.handle == 0u) {
+    if (!d->taa_fp16_logged) {
+      reshade::log::message(reshade::log::level::warning, "[TAA] FP16 experiment skipped: clone view creation failed");
+      d->taa_fp16_logged = true;
+    }
+    return false;
+  }
+  d->rcas_last_rtv0 = clone_rtv;
+  d->taa_fp16_clone_rtv = clone_rtv;
+  if (already) return false;
+  // Retire a previous target when switching resources; the old clone keeps its
+  // contents but stops intercepting that target's views.
+  if (d->taa_fp16_active && d->taa_fp16_resource.handle != original.handle
+      && d->taa_fp16_original_rtv.handle != 0u
+      && dev->get_resource_from_view(d->taa_fp16_original_rtv).handle != 0u) {
+    renodx::utils::resource::upgrade::DeactivateCloneHotSwap(dev, d->taa_fp16_original_rtv);
+  }
+  d->taa_fp16_resource = original;
+  d->taa_fp16_clone = clone;
+  d->taa_fp16_original_rtv = rtvs[0];
+  d->taa_fp16_active = true;
+  d->taa_fp16_logged = false;
+  s_custom_taa_was_active = false;
+  shader_injection.custom_taa_history_valid = 0.f;
+  reshade::log::message(
+      reshade::log::level::info,
+      ("[TAA] FP16 experiment on: cloned "
+       + std::to_string(static_cast<int>(desc.texture.format)) + " to FP16").c_str());
+  return true;
 }
 
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
-  // Cross-addon slot claim: runs before on_replace/ApplyReplacement in the
-  // same handler invocation, so the served bytecode follows the toggle.
+  // Cross-addon slot ownership: runs before on_replace/ApplyReplacement in the
+  // same handler invocation, so the served bytecode follows the toggle. OFF
+  // selects this addon's vanilla reference bytecode, never a friend payload.
   if (cmd_list) {
     if (auto* dev = cmd_list->get_device()) {
-      if (CustomTAAReplaceActive(cmd_list)) {
-        if (IsSora1st()) ClaimTAASlot(dev, 0xFA37EA04u, __taa_custom_sora1st);
-        else if (IsSora2nd()) ClaimTAASlot(dev, 0x9D91FAC3u, __taa_custom_sora2nd);
-      } else {
-        ReleaseTAASlot(dev);
+      const bool custom_taa_on = CustomTAAReplaceActive(cmd_list);
+      if (IsSora1st()) {
+        EnsureTAAPayload(
+            dev,
+            0xFA37EA04u,
+            custom_taa_on ? __taa_custom_sora1st : __0xFA37EA04,
+            custom_taa_on ? __0xFA37EA04 : __taa_custom_sora1st);
+      } else if (IsSora2nd()) {
+        EnsureTAAPayload(
+            dev,
+            0x9D91FAC3u,
+            custom_taa_on ? __taa_custom_sora2nd : __0x9D91FAC3,
+            custom_taa_on ? __0x9D91FAC3 : __taa_custom_sora2nd);
+      }
+      // Pipelines created after the slot stabilized (level loads, resolution
+      // changes) were built from stale bytes: reset once on the next draw.
+      if (auto* dd = dev->get_private_data<DeviceData>()) {
+        if (!dd->taa_pending_resets.empty()) {
+          ResetTAAReplacementPipelines(
+              dev, IsSora1st() ? 0xFA37EA04u : (IsSora2nd() ? 0x9D91FAC3u : 0u));
+          dd->taa_pending_resets.clear();
+        }
+      }
+      // Partial FP16 experiment runs before history handling so a precision
+      // transition forces current-only output on the next custom frame.
+      const bool taa_fp16_transition = ApplyTAAFP16Experiment(cmd_list);
+      if (taa_fp16_transition) {
+        s_custom_taa_was_active = false;
+        shader_injection.custom_taa_history_valid = 0.f;
       }
     }
   }
@@ -6757,7 +7053,12 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       {
         bool serveT17 = !forceVanilla && dbg != 4;
         float curCharCap = (shader_injection.dynCube_character_capture > 0.5f) ? 1.0f : 0.0f;
+        float curSparkleReject = (shader_injection.dynCube_sparkle_rejection > 0.5f) ? 1.0f : 0.0f;
         if (serveT17 && curCharCap != dd->dyncube_lastCharCapture) {
+          dd->dyncube_captureDirty = true;
+          dd->dyncube_dirtyFastForward = true;
+        }
+        if (serveT17 && curSparkleReject != dd->dyncube_lastSparkleRejection) {
           dd->dyncube_captureDirty = true;
           dd->dyncube_dirtyFastForward = true;
         }
@@ -6813,6 +7114,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
               dd->dyncube_filteredReadSet = dd->dyncube_readSet;
               dd->dyncube_captureDirty = false;
               dd->dyncube_lastCharCapture = (shader_injection.dynCube_character_capture > 0.5f) ? 1.0f : 0.0f;
+              dd->dyncube_lastSparkleRejection = (shader_injection.dynCube_sparkle_rejection > 0.5f) ? 1.0f : 0.0f;
               // Keep the global-push variant in sync with fresh filter output, but only
               // when wanted (soften/strength active); otherwise it stays invalid and the
               // sharp cube serves. Snapshots update inside the variant build.
@@ -7212,6 +7514,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   d->dyncube_lastVariantSoften = -1.f;
   d->dyncube_lastVariantStrength = -1.f;
   d->dyncube_lastCharCapture = -1.f;
+  d->dyncube_lastSparkleRejection = -1.f;
   d->dyncube_hasValidRead = false;
   dp(d->dyncube_capture_pipeline); dp(d->dyncube_solid_pipeline);
   dl(d->dyncube_capture_layout); dl(d->dyncube_solid_layout);
@@ -7629,6 +7932,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   d->dyncube_lastVariantSoften = -1.f;
   d->dyncube_lastVariantStrength = -1.f;
   d->dyncube_lastCharCapture = -1.f;
+  d->dyncube_lastSparkleRejection = -1.f;
   d->dyncube_hasValidRead = false;
   if (should_log()) {
     const uint32_t mips = d->dyncube_mip_count;
@@ -8042,6 +8346,7 @@ static void MoveSetToActive(DeviceData* d, DynCubeSet& s) {
   d->dyncube_lastVariantSoften = -1.f;
   d->dyncube_lastVariantStrength = -1.f;
   d->dyncube_lastCharCapture = -1.f;
+  d->dyncube_lastSparkleRejection = -1.f;
   d->dyncube_hasValidRead = false;
   d->dyncube_variant_valid = false;
   d->dyncube_resources_created = true;
@@ -9676,6 +9981,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
+      if (IsSora1st() || IsSora2nd()) {
+        renodx::utils::resource::upgrade::use_resource_cloning = true;
+        renodx::utils::resource::upgrade::Use(fdw_reason);
+      }
       break;
     case DLL_PROCESS_DETACH:
       s_watchdogStop.store(true);
@@ -9692,6 +10001,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
+      if (IsSora1st() || IsSora2nd()) {
+        renodx::utils::resource::upgrade::Use(fdw_reason);
+      }
       reshade::unregister_addon(h_module);
       break;
   }

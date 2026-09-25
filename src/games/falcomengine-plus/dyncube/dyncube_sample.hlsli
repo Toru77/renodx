@@ -116,6 +116,18 @@ void DynCubeSampleDynamic(
     }
   }
   dynCol = envTex.SampleLevel(cubeSampler, finalDir, sampleMip).xyz;
+  if (shader_injection_data.dynCube_enabled > 0.5f
+      && shader_injection_data.dynCube_force_vanilla < 0.5f
+      && shader_injection_data.dynCube_debug != 4.f) {
+    float hdrLum = dot(max(dynCol, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if (isfinite(hdrLum) && hdrLum > 1.0) {
+      const float hdrKnee = 1.0;
+      const float hdrRange = 1.0;
+      float hdrExcess = hdrLum - hdrKnee;
+      float compressedLum = hdrKnee + hdrExcess / (1.0 + hdrExcess / hdrRange);
+      dynCol *= compressedLum / hdrLum;
+    }
+  }
   // Package reflection brightness (dynamic + SSR only): mirrors the t17 override
   // condition so vanilla/debug views stay untouched. Vanilla fallback never scaled.
   // (Capture brightness stays sample-time by design; only soften bakes at capture.)
