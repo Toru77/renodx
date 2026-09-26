@@ -240,21 +240,20 @@ float GTVBAO_QBias(float x, float b) {
     return x + (x - x * x) * b;
 }
 
-// ── InvSinStep with stretch parameter (reference analytic formula) ──
-float GTVBAO_InvSinStepStretch(float y, float s) {
-    if (s < 0.00001f) return y;
-    float u = asin(sin(s * GT_VBAO_PI * 0.5f) * (1.0f - 2.0f * y));
-    return 0.5f - u * (1.0f / (GT_VBAO_PI * s));
-}
-
 // ── Cosine-weighted slice sampling (Mode 3: CDF importance sampling, optimized) ──
 // Maps uniform [0,1] to phi angle [0, PI] from cosine-weighted lobe.
 // Per doc.txt: outer SinStep/InvSinStep cancelled by working in mapped space.
-float GTVBAO_SampleSliceCosine_Mode3(float rnd, float NdotV) {
-    float sinNV = sqrt(saturate(1.0f - NdotV * NdotV));
-    float s = GTVBAO_QBias(sinNV, 0.15f);
-    float y = GTVBAO_InvSinStepStretch(rnd, s);
-    return y * GT_VBAO_PI;
+//
+// The stretch factor s = QBias(sqrt(1 - NdotV^2), 0.15) and everything derived
+// from it are per-pixel (they depend only on NdotV), so the caller evaluates
+// them once via GTVBAO_CdfSinK / GTVBAO_CdfInvPiS / GTVBAO_CdfDegenerate and
+// calls the sampler below per slice. This keeps only the asin() in the loop.
+float GTVBAO_SampleSliceCosine_Mode3(float rnd, float sinK, float invPiS, bool degenerate) {
+    // s -> 0 when the normal points straight at the viewer; the reference
+    // analytic form is the identity there, so preserve that.
+    if (degenerate) return rnd * GT_VBAO_PI;
+    float u = asin(sinK * (1.0f - 2.0f * rnd));
+    return (0.5f - u * invPiS) * GT_VBAO_PI;
 }
 
 // ── Cosine-weighted slice sampling (Mode 2: Ray projection) ──
@@ -292,23 +291,17 @@ float GTVBAO_SampleSliceCosine_Mode2(float rnd0, float rnd1, float3 N_view,
 
 // ── CDF remapping of horizon angles ──
 // Accounts for non-uniform sample density near the view pole.
-float GTVBAO_RemapHorizonCDF(float t, float NdotV) {
-    // t is the [0,1] mapped horizon angle from baseline VBAO
-    // Apply correction: near view pole (high |NdotV|), distribution is narrower
-    float sinNV = sqrt(saturate(1.0f - NdotV * NdotV));
-    // Blend factor: 0 = pure VBAO (sinNV=1, NdotV=0), 1 = view pole (sinNV=0)
-    float blend = 1.0f - sinNV;
-    // CDF-corrected value: compress toward 0.5 near the pole
+// sinNV / blend depend only on NdotV (per pixel), so the caller hoists them
+// once per pixel via GTVBAO_CdfRemapSinNV and passes them here.
+float GTVBAO_CdfRemapSinNV(float NdotV) {
+    return sqrt(saturate(1.0f - NdotV * NdotV));
+}
+float GTVBAO_RemapHorizonCDF(float t, float sinNV, float blend) {
+    // t is the [0,1] mapped horizon angle from baseline VBAO.
+    // Blend factor: 0 = pure VBAO (sinNV=1, NdotV=0), 1 = view pole (sinNV=0).
+    // CDF-corrected value: compress toward 0.5 near the pole.
     float corrected = lerp(t, 0.5f + (t - 0.5f) * sinNV, blend);
     return saturate(corrected);
-}
-
-// ── Per-sample thickness offset ──
-// Computes back-face position using sample direction instead of fixed viewVec.
-float3 GTVBAO_ThicknessOffset(float3 sampleDelta, float sampleDist, float3 viewVec, float thickness) {
-    float3 sampleDir = sampleDelta / max(sampleDist, 1e-5f);
-    // Offset along the sample direction (instead of viewVec)
-    return sampleDelta - sampleDir * thickness;
 }
 
 uint GTVBAO_EncodeVisibilityBentNormal( lpfloat visibility, lpfloat3 bentNormal )
@@ -387,6 +380,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     // ── Half-res mode: output domain is half, depth input stays full. ──
     // Full path below is untouched; Half uses block-center point loads
     // (fullTexel = min(half*2+1, full-1), odd-safe) instead of Gather.
+    // The point loads are deliberate: GatherRed's centre component is a
+    // *neighbour* of its anchor texel, so gathering here would feed a 2x2
+    // block-edge depth in as the pixel centre and corrupt pixCenterPos and
+    // the edge term.
     uint g_fullDepthW, g_fullDepthH;
     sourceViewspaceDepth.GetDimensions(g_fullDepthW, g_fullDepthH);
     const bool g_halfRes = GTVBAO_resolution > 0.5f;
@@ -502,6 +499,18 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 #ifdef GT_VBAO_COMPUTE_GI
     float3 giAccum = float3(0, 0, 0);
 #endif
+    // ── Per-pixel constants hoisted out of the slice/sample loops ──
+    // viewspaceNormal and viewVec are per-pixel, so NdotV, the CDF horizon
+    // remap terms and the Mode-3 slice-sampler terms are all invariant
+    // across every slice and sample of this pixel. Evaluating them once here
+    // removes ~108 sqrt and ~18 transcendental ops per pixel at Ultra.
+    const float g_sliceNdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
+    const float g_remapSinNV = GTVBAO_CdfRemapSinNV(g_sliceNdotV);
+    const float g_remapBlend = 1.0f - g_remapSinNV;
+    const float sCdf = GTVBAO_QBias(g_remapSinNV, 0.15f);
+    const bool  g_cdfDegen  = sCdf < 0.00001f;
+    const float g_cdfSinK   = g_cdfDegen ? 0.0f : sin(sCdf * GT_VBAO_PI * 0.5f);
+    const float g_cdfInvPiS = g_cdfDegen ? 0.0f : 1.0f / (GT_VBAO_PI * sCdf);
     // ── Debug accumulators for bitmask viz (modes 6-8) ──
     uint debugTotalSectorCoverage = 0u;
     uint debugTotalSamples = 0u;
@@ -562,8 +571,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // lines 5, 6 from the paper
             lpfloat phi;
             // Cosine sampling: always On (UI toggle removed). Mode selects the method.
-            // S3 experiment needs this at slice scope for per-side reuse (same value).
-            float sliceNdotV = saturate(dot((float3)viewspaceNormal, (float3)viewVec));
             {
                 float rnd0 = frac(noiseSample + sliceK * 0.618034f);
                 int mode = (int)GTVBAO_gtvbao_cosine_mode;
@@ -576,8 +583,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     phi = GTVBAO_SampleSliceCosine_Mode2(rnd0, rnd1, (float3)viewspaceNormal,
                         pixCenterPos, normalizedScreenPos, consts);
                 } else {
-                    // Mode 3 (default): CDF importance sampling
-                    phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, sliceNdotV);
+                    // Mode 3 (default): CDF importance sampling, per-pixel
+                    // constants supplied from the hoist above.
+                    phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, g_cdfSinK, g_cdfInvPiS, g_cdfDegen);
                 }
             }
             lpfloat cosPhi = cos(phi);
@@ -636,7 +644,13 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 lpfloat s = (step+stepNoise) / (stepsPerSlice);
                 // pow(s,1)==s: skip the pow when distribution is exactly 1.0.
                 if (sampleDistributionPower != 1.0f) {
-                  s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
+                  // Closed forms for the exponents reachable from the UI's
+                  // common values: one sqrt / one multiply instead of the
+                  // log2+exp2 pair a generic pow() needs.
+                  if (sampleDistributionPower == 1.5f)      s = (lpfloat)(s * sqrt(s));
+                  else if (sampleDistributionPower == 2.0f) s = (lpfloat)(s * s);
+                  else if (sampleDistributionPower == 3.0f) s = (lpfloat)(s * s * s);
+                  else                                      s = (lpfloat)pow( s, (lpfloat)sampleDistributionPower );
                 }
                 s += minS;
 
@@ -687,7 +701,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
                     // ── Front-face and back-face (per-sample thickness offset, always On) ──
                     float3 sampleHorizonVec = (float3)(sampleDelta / sampleDist);
-                    float3 sampleDeltaBack = GTVBAO_ThicknessOffset(sampleDelta, (float)sampleDist, (float3)viewVec, thickness);
+                    // Offset along the sample direction, reusing the direction
+                    // already computed above instead of dividing a second time.
+                    float3 sampleDeltaBack = sampleDelta - sampleHorizonVec * thickness;
                     float3 sampleHorizonVecBack = normalize( sampleDeltaBack );
 
                     // Horizon cosines relative to viewVec (same as GTAO's shc).
@@ -706,12 +722,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     frontBackHorizon = saturate(((sd * -frontBackHorizon) + (float)n + GT_VBAO_PI_HALF) / GT_VBAO_PI);
 
                     // ── GTVBAO: CDF remap horizon angles (always On) ──
-                    // Reuses the per-slice NdotV (bit-exact: same inputs, same ops).
-                    {
-                        float NdotV = (float)sliceNdotV;
-                        frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, NdotV);
-                        frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, NdotV);
-                    }
+                    // sinNV / blend are per-pixel; see the hoist above.
+                    frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, g_remapSinNV, g_remapBlend);
+                    frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, g_remapSinNV, g_remapBlend);
 
                     // samplingDirection inverts min/max ordering.
                     frontBackHorizon = (sd >= 0.0) ? frontBackHorizon.yx : frontBackHorizon.xy;
@@ -720,6 +733,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     uint sampleMask = GTVBAO_UpdateSectors(frontBackHorizon.x, frontBackHorizon.y, 0u);
 
                     // ── Debug: track per-sample sector coverage ──
+                    // Read by Bitmask debug views 6-8, so this stays.
                     debugTotalSectorCoverage += GTVBAO_CountBits(sampleMask);
                     debugTotalSamples += 1u;
 
@@ -746,9 +760,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         float3 sampleNormal = (float3)viewspaceNormal;
                         if (GTVBAO_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
                         {
-                            // Map sample screen pos to MRT texel.
-                            uint mw2, mh2;
-                            mrtNormalTexture.GetDimensions(mw2, mh2);
+                            // Dimensions were cached once above; do not re-query
+                            // them per sample.
+                            uint mw2 = g_mrtW, mh2 = g_mrtH;
                             if (mw2 > 0 && mh2 > 0)
                             {
                                 int2 mrtTc = int2(sampleScreenPos * float2(mw2, mh2));

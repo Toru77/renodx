@@ -118,6 +118,10 @@ void main(uint2 dt : SV_DispatchThreadID) {
       float planeD = abs(dot(Nf, Plow - Pf));
       float depthW = exp(-planeD * planeSigma);
       float normalW = pow(saturate(dot(Nf, Nlow)), normalPower);
+      // No floor on the geometry term: when every tap is rejected the weighted
+      // sum collapses to the nearest-tap fallback, which is correct here —
+      // bilinear across taps that straddle a depth discontinuity would bleed
+      // AO/GI over the silhouette instead.
       float w = bw * depthW * normalW;
 
       aoSum += aoLow * w;
