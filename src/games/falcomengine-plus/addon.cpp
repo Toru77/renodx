@@ -360,6 +360,34 @@ ShaderInjectData shader_injection = {
   // —— DOF IS-FAST rotated gather ——
   .dof_isfast_enabled = 1.f,
   .dof_isfast_noise_frame = -1.f,
+  // —— Motion Blur (Guertin 2013) defaults: off = no dispatches, no pushes ——
+  .mb_mode = 0.f,
+  .mb_intensity = 1.f,
+  .mb_sample_count = 25.f,
+  .mb_max_radius_px = 40.f,
+  .mb_center_weight_k = 40.f,
+  .mb_jitter_h = 0.95f,
+  .mb_min_velocity_g = 1.5f,
+  .mb_neighbor_t = 1.f,
+  .mb_depth_tolerance = 0.1f,
+  .mb_velocity_format = 0.f,  // DEPRECATED, unread (no velocity surface remains)
+  .mb_jitter_source = 0.f,
+  .mb_jitter_ready = 0.f,
+  .mb_debug_view = 0.f,
+  .mb_working_w = 0.f,
+  .mb_working_h = 0.f,
+  .mb_depth_w = 0.f,
+  .mb_depth_h = 0.f,
+  .mb_motion_w = 0.f,
+  .mb_motion_h = 0.f,
+  .mb_tiles_x = 1.f,
+  .mb_tiles_y = 1.f,
+  .mb_tile_uv = 0.f,
+  .mb_pass = 0.f,
+  .mb_frame_index = 0.f,
+  .mb_motion_valid = 0.f,
+  .mb_debug_chain = 0.f,
+  .mb_local_velocity_weights = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -381,6 +409,32 @@ constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 // (loading screen) — arm history hard-replace so the next scene rebuilds clean.
 constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
+
+// ── Motion Blur (Guertin et al. 2013) ──
+// Fixed pass order; the indices address the layout/pipeline/table arrays in
+// DeviceData so the stages cannot drift out of sync. Declared here because
+// DeviceData sizes its arrays with it.
+//
+// Four dispatches, three shaders: TileMax is compiled once and dispatched twice
+// (mb_pass selects the axis). There is deliberately no full-resolution
+// intermediate for velocity or for linear depth — the gather and the tile
+// stages read the game's own motion and depth textures and convert at the point
+// of use. Those intermediates cost 44 MB of writes per frame at 1440p, enough
+// to evict the gather's working set from L2 and push its 25 taps per pixel out
+// to DRAM, which measured as the dominant cost of the whole feature.
+enum MotionBlurPass : uint32_t {
+  kMbTileMax = 0, kMbNeighborMax = 1, kMbGather = 2,
+  kMotionBlurPassCount = 3,
+};
+// Sora 2nd post-TAA resolve / tonemap. Registered with an EMPTY payload on
+// purpose: the game keeps running its own bytecode and we only take a per-draw
+// hook, so the tonemap can never regress.
+constexpr uint32_t kSora2ndTonemapHash = 0xC9FA40B7u;
+// Height the shaders divide pixel-denominated paper constants by, so a 4K
+// player sees the same blur as a 1080p player. Must match MB_REF_H in
+// motionblur/motion_blur_common.hlsli.
+constexpr float kMotionBlurRefHeight = 1080.0f;
+constexpr uint32_t kMotionBlurLogFrameGap = 120u;
 
 // ── GTVBAO normal tuning globals (separate from ShaderInjectData) ──
 static float g_gtvbao_normal_input_mode     = 1.f;
@@ -899,6 +953,56 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline fxaa_high_pipeline = {};
   uint32_t fxaa_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> fxaa_tables = {};  // [0]=srv t0+t1, [1]=uav u0
+  // ── Motion Blur (Guertin 2013), Sora 2nd ──
+  // Four owned resources: the two TileMax intermediates, NeighborMax, and the
+  // gather output. There is no velocity or linear-depth surface — both are read
+  // straight from the game's textures and converted in the consuming shader.
+  reshade::api::resource mb_tilemax_h_texture = {};
+  reshade::api::resource_view mb_tilemax_h_srv = {};
+  reshade::api::resource_view mb_tilemax_h_uav = {};
+  reshade::api::resource mb_tilemax_texture = {};
+  reshade::api::resource_view mb_tilemax_srv = {};
+  reshade::api::resource_view mb_tilemax_uav = {};
+  reshade::api::resource mb_neighbormax_texture = {};
+  reshade::api::resource_view mb_neighbormax_srv = {};
+  reshade::api::resource_view mb_neighbormax_uav = {};
+  reshade::api::resource mb_output_texture = {};       // gather result
+  reshade::api::resource_view mb_output_srv = {};
+  reshade::api::resource_view mb_output_uav = {};
+  // 1x1x1 stand-in bound at the gather's t4 when IS-FAST is off or missing, so
+  // that slot is never a null descriptor.
+  reshade::api::resource mb_noise_fallback_res = {};
+  reshade::api::resource_view mb_noise_fallback_srv = {};
+  // Point-clamp sampler for this chain's own descriptor table slot. Owned here
+  // rather than borrowed from GTVBAO: point_clamp_sampler is created and
+  // destroyed by CreateGTVBAOResources, so sharing its handle tied this chain's
+  // lifetime to GTVBAO's, and a null handle there made sampling return zero.
+  // The gather no longer samples at all, but the shared layout still declares
+  // the slot, so it must be filled with a valid descriptor.
+  reshade::api::sampler mb_point_clamp_sampler = {};
+  std::array<reshade::api::pipeline_layout, kMotionBlurPassCount> mb_layouts = {};
+  std::array<reshade::api::pipeline, kMotionBlurPassCount> mb_pipelines = {};
+  std::array<GTVBAODescriptorTableSet, kMotionBlurPassCount> mb_tables = {};
+  uint32_t mb_working_w = 0u, mb_working_h = 0u;
+  uint32_t mb_motion_h = 0u;   // sizes the tilemax_h intermediate
+  uint32_t mb_tiles_x = 0u, mb_tiles_y = 0u;
+  uint32_t mb_radius_px = 0u;
+  reshade::api::format mb_output_fmt = reshade::api::format::unknown;
+  bool mb_resources_ready = false;
+  bool mb_warned_tonemap_src = false;
+  // True once the prep passes have run at least once against the current
+  // resource set, so "Gather Only" never dispatches against garbage.
+  bool mb_prep_valid = false;
+  bool mb_warned_gather_only = false;
+  int mb_last_chain = -1;  // last chain value logged, so toggles are confirmed
+  uint64_t mb_last_log_frame = 0u;
+  // Deploy: the tonemap's t0, captured for both the gather's colour input and
+  // the exact format the gather output must match before it can replace t0.
+  reshade::api::resource_view mb_tonemap_src_srv = {};
+  uint64_t mb_tonemap_src_res = 0u;
+  std::atomic<bool> mb_tonemap_src_live{true};
+  // Frame in which the Sora 2nd DoF gather last drew; the "Cutscene Only" gate.
+  uint64_t mb_dof_drew_frame = UINT64_MAX;
   // ── Custom TAA cross-addon slot ownership (compat with the falcomengine addon,
   // which replaces the same TAA hashes unconditionally) ──
   // Replacement bytecode lives in one cross-addon shared slot per hash
@@ -966,6 +1070,7 @@ static void CreateFXAAResources(reshade::api::device* dev, DeviceData* d,
                                 uint32_t w, uint32_t h, reshade::api::format fmt);
 static void DestroyFXAAResources(reshade::api::device* dev, DeviceData* d);
 static bool CreateFXAAPipelineIfNeeded(reshade::api::device* dev, DeviceData* d);
+static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d);
 static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
 static void EnsureTAAPayload(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> desired, std::span<const uint8_t> alternate);
@@ -1317,6 +1422,10 @@ static bool OnBeforeDofGatherDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+// ── Motion Blur callbacks (implemented in the Motion Blur section) ──
+static void OnDrawnDofGather(reshade::api::command_list* cmd_list);
+static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list);
+
 // ═══════════ Custom shaders ═══════════
 
 renodx::mods::shader::CustomShaders custom_shaders = {
@@ -1631,10 +1740,29 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // ── Sora 2nd DOF shaders (port Kai improved) ──
     CustomShaderEntryCallback(0x5BBEC5A3, nullptr),
     // Gather pass — shared by Sora 2nd and Sora 1st (Sora 1st supplies its own
-    // CoC pass, 0x1CA8DE95, and reuses this one).
-    CustomShaderEntryCallback(0xCD6FC25D, OnBeforeDofGatherDraw),
+    // CoC pass, 0x1CA8DE95, and reuses this one). on_drawn is the "Cutscene
+    // Only" motion blur deploy point; on_replace keeps the IS-FAST t5 push.
+    {
+        0xCD6FC25Du,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xCD6FC25Du,
+            .code = __0xCD6FC25D,
+            .on_replace = OnBeforeDofGatherDraw,
+            .on_drawn = OnDrawnDofGather,
+        },
+    },
     // ── Sora 1st DOF shaders ──
     CustomShaderEntryCallback(0x1CA8DE95, nullptr),
+    // ── Motion Blur "Always On" deploy point: the post-TAA tonemap ──
+    // Empty payload = no replacement; the game's own shader runs and we only
+    // swap t0 for the blurred result.
+    {
+        kSora2ndTonemapHash,
+        renodx::mods::shader::CustomShader{
+            .crc32 = kSora2ndTonemapHash,
+            .on_draw = OnBeforeTonemapDraw,
+        },
+    },
     //__ALL_CUSTOM_SHADERS,
 };
 
@@ -1844,6 +1972,119 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+
+    // ── Motion Blur (Guertin et al. 2013) ──
+    // Sora 2nd only for now. Both modes share one deploy point at the tonemap;
+    // mode only changes the trigger.
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurMode", .binding = &shader_injection.mb_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Mode", .section = "Motion Blur",
+      .tooltip = "Off. Cutscene Only blurs on frames where the game dispatches depth of field, which it only does in cutscenes. Always On blurs every frame. Both apply the blur after depth of field and after TAA, under the game's own tonemap.",
+      .labels = {"Off", "Cutscene Only", "Always On"},
+      .is_visible = []() { return IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurIntensity", .binding = &shader_injection.mb_intensity,
+      .default_value = 1.f, .label = "Intensity", .section = "Motion Blur",
+      .tooltip = "Shutter angle on the blur's integration domain, not on the motion vectors. 1.00x is a true 1:1 shutter, where the streak length equals the frame's actual motion. 0 is an exact no-op. The domain is capped at one tile, so at the default 40 px Max Radius the slider stays useful all the way to about 1.9x.",
+      .min = 0.f, .max = 2.f, .format = "%.2fx",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+  .key = "MotionBlurSamples", .binding = &shader_injection.mb_sample_count,
+  .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+  .default_value = 25.f, .label = "Max Samples", .section = "Motion Blur",
+  .tooltip = "Upper bound on gather taps (paper N). The adaptive ladder spends fewer where the neighbourhood is slow and reaches this only at the top rung, so cost rises with motion rather than staying flat. Pin it to 4 to force a fixed 4-tap blur.",
+      .min = 4.f, .max = 48.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurMaxRadius", .binding = &shader_injection.mb_max_radius_px,
+      .default_value = 40.f, .label = "Max Radius", .section = "Motion Blur",
+      .tooltip = "Longest streak and the tile size (paper r), in 1080p-equivalent pixels. The filter scales itself to your resolution, so 4K shows the same blur length as 1080p. Also changes the tile grid, so the buffers rebuild when you move it.",
+      .min = 8.f, .max = 80.f, .format = "%.0f px",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurCenterWeight", .binding = &shader_injection.mb_center_weight_k,
+      .default_value = 40.f, .label = "Center Weight", .section = "Motion Blur",
+      .tooltip = "Centre-sample weight divisor (paper k). The unblurred centre contributes N/(k*|v|) of the total, so LOWER keeps more of the original pixel and higher lets the streak dominate. Raise it if thin objects ghost, lower it if fast motion smears too little.",
+      .min = 1.f, .max = 100.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurJitter", .binding = &shader_injection.mb_jitter_h,
+      .default_value = 0.95f, .label = "Jitter", .section = "Motion Blur",
+      .tooltip = "How far past the streak length the integration domain reaches (paper h). Breaks up banding; too high softens the streak.",
+      .min = 0.f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurMinVelocity", .binding = &shader_injection.mb_min_velocity_g,
+      .default_value = 1.5f, .label = "Velocity Threshold", .section = "Motion Blur",
+      .tooltip = "Below this a pixel's own velocity is replaced by the direction perpendicular to the tile velocity (paper g).",
+      .min = 0.f, .max = 8.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurNeighborFalloff", .binding = &shader_injection.mb_neighbor_t,
+      .default_value = 1.f, .label = "NB Max Falloff", .section = "Motion Blur",
+      .tooltip = "Slope of the stochastic tile lookup near tile borders (paper t), in tiles. Trades tile-edge banding for noise.",
+      .min = 0.f, .max = 4.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurDepthTolerance", .binding = &shader_injection.mb_depth_tolerance,
+      .default_value = 0.1f, .label = "Depth Tolerance", .section = "Motion Blur",
+      .tooltip = "Width of the soft depth transition that separates foreground from background samples. Higher lets more background bleed across depth edges.",
+      .min = 0.01f, .max = 1.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurJitterSource", .binding = &shader_injection.mb_jitter_source,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Jitter Source", .section = "Motion Blur",
+      .tooltip = "Halton is the paper's deterministic per-pixel sequence. IS-FAST uses the blue-noise volume already loaded for DoF and shadows; it animates, so residual sampling noise reads much less. Falls back to Halton when the volume is unavailable.",
+      .labels = {"Halton", "IS-FAST"},
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurLocalVelocity", .binding = &shader_injection.mb_local_velocity_weights,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Local Velocity Weights", .section = "Motion Blur",
+      .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather) at the cost of more bleeding. A/B it on a high-contrast edge.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurDebugChain", .binding = &shader_injection.mb_debug_chain,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Debug Chain", .section = "Motion Blur",
+      .tooltip = "Diagnostic only. Full runs everything. Prep Only runs the three preprocessing dispatches and skips the gather, leaving the image untouched. Gather Only runs just the gather, reusing the PREVIOUS frame's prep, so do not read its image as a correctness comparison, and do not use it to time a moving scene: with prep frozen the tile grid is stale and almost nothing passes the gather's early-out. If preparation has never run it falls back to Full for that frame.",
+      .labels = {"Full", "Prep Only", "Gather Only"},
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurDebugView", .binding = &shader_injection.mb_debug_view,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Debug View", .section = "Motion Blur",
+      .tooltip = "Velocity, NeighborMax, the tile grid, linearized depth, blur amount, or sample count. Use these to confirm the motion buffer is live and the tile grid is resolution independent. Sample Count shows black where the blur early-outs and one distinct hue per rung of the adaptive ladder, which is what Max Samples now bounds: this is also the readout for tuning the rungs later.",
+      .labels = {"Off", "Velocity", "Neighbor Max", "Tile Grid", "Linear Depth", "Blur Amount", "Sample Count"},
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
 
     // ── Character SSGI ──
@@ -4141,6 +4382,7 @@ static void OnDestroyDevice(reshade::api::device* device) {
     DestroyDynCubeResources(device, d);
     DestroyRCASResources(device, d);
     DestroyFXAAResources(device, d);
+    DestroyMotionBlurResources(device, d);
     for (auto& [handle, clone] : d->taa_subobject_clones) {
       renodx::utils::pipeline::DestroyPipelineSubobjects(clone.first, clone.second);
     }
@@ -4355,6 +4597,23 @@ static void OnPushDescriptorsCapture(
           }
           d->rcas_motion_srv = views[0];
           d->rcas_motion_live = true;
+        }
+      }
+    }
+    // Capture the tonemap's t0 for the motion blur deploy. The blit samples t0 and
+    // writes the output-resolution target, so we need t0's own view for the
+    // gather's colour input AND its exact format: the gather output is pushed
+    // back at t0 and must stay format compatible with what the game's shader
+    // expects. Over-capture of binding 0 is prevented by the hash gate.
+    if (update.binding == 0u && update.count >= 1
+        && views[0].handle != 0u) {
+      auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+      if (ss) {
+        uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+        if (hash == kSora2ndTonemapHash) {
+          d->mb_tonemap_src_srv = views[0];
+          d->mb_tonemap_src_res = device->get_resource_from_view(views[0]).handle;
+          d->mb_tonemap_src_live = true;
         }
       }
     }
@@ -4825,6 +5084,7 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->captured_ssr1_srv, d->captured_ssr1_res, d->captured_ssr1_live, "ssr1", deadView, deadRes);
   KillTrackedInput(d, d->captured_ssr_mrt_srv, d->captured_ssr_mrt_res, d->captured_ssr_mrt_live, "ssrMrt", deadView, deadRes);
   KillTrackedInput(d, d->rcas_motion_srv, d->rcas_motion_res, d->rcas_motion_live, "rcasMotion", deadView, deadRes);
+  KillTrackedInput(d, d->mb_tonemap_src_srv, d->mb_tonemap_src_res, d->mb_tonemap_src_live, "mbTonemapSrc", deadView, deadRes);
 }
 static void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
   if (!device || !view.handle) return;
@@ -6172,6 +6432,544 @@ static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->rcas_last_rtv0 = (count > 0) ? rtvs[0] : reshade::api::resource_view{};
+}
+
+// ═══════════ Motion Blur (Guertin et al. 2013) ═══════════
+//
+// Six dispatches, run inline on the deploy draw's own command list so ordering
+// against the game's own work is strict and no frame of latency is added:
+//
+//   linearize depth -> velocity -> tilemax X -> tilemax Y -> neighbormax -> gather
+//
+// Two modes, ONE deploy point. The chain runs inline on the tonemap draw's own
+// command list, so ordering against the game's own work is strict and no frame of
+// latency is added:
+//
+//   1 Cutscene Only: same deploy, but only on frames whose DoF gather drew.
+//     This game dispatches depth of field only in cutscenes, so that draw is the
+//     cutscene signal. Because the tonemap is dispatched after the DoF chain, the
+//     blur still lands on top of DoF.
+//   2 Always On: same deploy, every frame.
+//
+// Exactly one motion blur is ever active; mode only changes the trigger. There is
+// no second deploy point and no copy-out/copy-back, because the result is pushed
+// at the tonemap's t0 and the game's own shader consumes it.
+//
+// Resources are created lazily from inside the deploy callback rather than from
+// the present hook. That is deliberate: the previous attempt created them under
+// the present hook's GTVBAO gate, which meant motion blur silently did nothing
+// unless GTVBAO was enabled.
+
+static void DestroyMotionBlurSet(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+  auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+  dv(d->mb_tilemax_h_srv); dv(d->mb_tilemax_h_uav); dr(d->mb_tilemax_h_texture);
+  dv(d->mb_tilemax_srv); dv(d->mb_tilemax_uav); dr(d->mb_tilemax_texture);
+  dv(d->mb_neighbormax_srv); dv(d->mb_neighbormax_uav); dr(d->mb_neighbormax_texture);
+  dv(d->mb_output_srv); dv(d->mb_output_uav); dr(d->mb_output_texture);
+  d->mb_working_w = 0u; d->mb_working_h = 0u;
+  d->mb_motion_h = 0u;
+  d->mb_tiles_x = 0u; d->mb_tiles_y = 0u;
+  d->mb_radius_px = 0u;
+  d->mb_output_fmt = reshade::api::format::unknown;
+  d->mb_resources_ready = false;
+  d->mb_prep_valid = false;
+}
+
+// Full teardown, including the immutable per-device pieces. Called from device
+// teardown only; the day-to-day path is DestroyMotionBlurSet.
+static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  DestroyMotionBlurSet(dev, d);
+  for (auto& set : d->mb_tables) {
+    for (auto& t : set) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
+    set = {};
+  }
+  for (auto& p : d->mb_pipelines) { if (p.handle) { dev->destroy_pipeline(p); p = {}; } }
+  for (auto& l : d->mb_layouts) { if (l.handle) { dev->destroy_pipeline_layout(l); l = {}; } }
+  if (d->mb_noise_fallback_srv.handle) { dev->destroy_resource_view(d->mb_noise_fallback_srv); d->mb_noise_fallback_srv = {}; }
+  if (d->mb_noise_fallback_res.handle) { dev->destroy_resource(d->mb_noise_fallback_res); d->mb_noise_fallback_res = {}; }
+  if (d->mb_point_clamp_sampler.handle) { dev->destroy_sampler(d->mb_point_clamp_sampler); d->mb_point_clamp_sampler = {}; }
+}
+
+static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) {
+  using DR = reshade::api::descriptor_range;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using P = reshade::api::pipeline_layout_param;
+  if (!dev || !d) return false;
+  // Same layout shape as the GTVBAO stages: four descriptor tables at root
+  // params 0-3, push constants at root param 4. The push block is the WHOLE
+  // ShaderInjectData rather than a hand-mapped subset, because the motion blur
+  // shaders include shared.h and read the mb_* fields directly — one source of
+  // truth, no per-shader re-declaration to drift.
+  static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 5u};
+  static const std::span<const uint8_t> kBytecode[kMotionBlurPassCount] = {
+      __motion_blur_tilemax, __motion_blur_neighbormax, __motion_blur_gather};
+  for (uint32_t pass = 0; pass < kMotionBlurPassCount; ++pass) {
+    if (d->mb_layouts[pass].handle == 0u) {
+      DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
+      DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer};
+      DR srv_r     = {0,0,0,kSrvPerPass[pass],DS::all_compute,1,DT::texture_shader_resource_view};
+      DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view};
+      reshade::api::constant_range push_range = {};
+      push_range.binding = 0;
+      push_range.dx_register_index = 13;
+      push_range.dx_register_space = 0;
+      push_range.count = static_cast<uint32_t>(sizeof(ShaderInjectData) / sizeof(uint32_t));
+      push_range.visibility = DS::all_compute;
+      P param_sampler, param_cbv, param_srv, param_uav, param_constants;
+      param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+      param_sampler.descriptor_table.count = 1; param_sampler.descriptor_table.ranges = &sampler_r;
+      param_cbv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+      param_cbv.descriptor_table.count = 1; param_cbv.descriptor_table.ranges = &cbv_r;
+      param_srv.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+      param_srv.descriptor_table.count = 1; param_srv.descriptor_table.ranges = &srv_r;
+      param_uav.type = reshade::api::pipeline_layout_param_type::descriptor_table;
+      param_uav.descriptor_table.count = 1; param_uav.descriptor_table.ranges = &uav_r;
+      param_constants.type = reshade::api::pipeline_layout_param_type::push_constants;
+      param_constants.push_constants = push_range;
+      P params[5] = {param_sampler, param_cbv, param_srv, param_uav, param_constants};
+      if (!dev->create_pipeline_layout(5, params, &d->mb_layouts[pass])) return false;
+    }
+    if (!EnsureGTVBAODescriptorTables(dev, d->mb_layouts[pass], &d->mb_tables[pass])) return false;
+    if (d->mb_pipelines[pass].handle == 0u) {
+      if (kBytecode[pass].empty() || d->mb_layouts[pass].handle == 0u) return false;
+      reshade::api::shader_desc sd = {};
+      sd.code = kBytecode[pass].data();
+      sd.code_size = kBytecode[pass].size();
+      sd.entry_point = "main";
+      reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
+      if (!dev->create_pipeline(d->mb_layouts[pass], 1, &so, &d->mb_pipelines[pass])) return false;
+    }
+  }
+  return true;
+}
+
+// The shared layout still declares a sampler table at root param 0 and apply()
+// fills it for every pass, so the descriptor must be valid even though the
+// gather stopped sampling. Owned by this chain, not borrowed from GTVBAO: the
+// GTVBAO handle is destroyed and recreated with that feature's resources, and a
+// null sampler there makes D3D11 sampling return zero, which silently zeroes the
+// filter's only input.
+static bool EnsureMotionBlurSampler(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return false;
+  if (d->mb_point_clamp_sampler.handle) return true;
+  reshade::api::sampler_desc sd = {};
+  sd.filter = reshade::api::filter_mode::min_mag_mip_point;
+  sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
+  return dev->create_sampler(sd, &d->mb_point_clamp_sampler);
+}
+
+// The gather declares a Texture3D at t4 even when the jitter source is the
+// Halton sequence, and a null descriptor is not a legal binding, so a 1x1x1
+// stand-in is bound whenever the real IS-FAST volume is unusable.
+static bool EnsureMotionBlurNoiseFallback(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d || d->mb_noise_fallback_srv.handle) return d->mb_noise_fallback_srv.handle != 0u;
+  reshade::api::resource_desc rd = {};
+  rd.type = reshade::api::resource_type::texture_3d;
+  rd.texture = {1, 1, 1, 1, reshade::api::format::r8_unorm, 1};
+  rd.heap = reshade::api::memory_heap::gpu_only;
+  rd.usage = reshade::api::resource_usage::shader_resource;
+  if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->mb_noise_fallback_res)) return false;
+  reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_3d,
+                                       reshade::api::format::r8_unorm, 0, 1, 0, 1);
+  if (!dev->create_resource_view(d->mb_noise_fallback_res, reshade::api::resource_usage::shader_resource,
+                                 vd, &d->mb_noise_fallback_srv)) {
+    dev->destroy_resource(d->mb_noise_fallback_res);
+    d->mb_noise_fallback_res = {};
+    return false;
+  }
+  return true;
+}
+
+static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
+                                uint32_t workingW, uint32_t workingH,
+                                uint32_t motionH, uint32_t tilesX, uint32_t tilesY,
+                                reshade::api::format outputFormat) {
+  DestroyMotionBlurSet(dev, d);
+  if (!dev || !d) return;
+  auto mk = [&](uint32_t w, uint32_t h, reshade::api::format fmt,
+                reshade::api::resource* res, reshade::api::resource_view* srv,
+                reshade::api::resource_view* uav) -> bool {
+    reshade::api::resource_desc rd = {};
+    rd.type = reshade::api::resource_type::texture_2d;
+    rd.texture = {w, h, 1, 1, fmt, 1};
+    rd.heap = reshade::api::memory_heap::gpu_only;
+    rd.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, res)) return false;
+    reshade::api::resource_view_desc vd(reshade::api::resource_view_type::texture_2d, fmt, 0, 1, 0, 1);
+    if (srv && !dev->create_resource_view(*res, reshade::api::resource_usage::shader_resource, vd, srv)) return false;
+    if (uav && !dev->create_resource_view(*res, reshade::api::resource_usage::unordered_access, vd, uav)) return false;
+    return true;
+  };
+  // Tile textures hold plain UV velocity read straight from the game's RG16F
+  // motion texture, so there is no re-encode step and no 8-bit variant to switch
+  // on, and the shaders declare float2 over them either way.
+  //
+  // The format must have GUARANTEED D3D11.0 UAV type-write support. R16G16_FLOAT
+  // does not: level 11_0 requires R32_*, RG32_*, RGBA8_*, RGBA16_UINT/SNORM/
+  // FLOAT and RGBA32_*, and R16G16_FLOAT only joins the required set in D3D11.1
+  // / feature level 12_0. Reading it as an SRV is always legal, which is why the
+  // game stores motion in it and why the gather's Velocity view reads correctly
+  // while the tile chain sits at zero -- a dropped UAV write leaves tilemax and
+  // neighbormax zeroed, so vmax is zero, the early-out always fires, and the
+  // filter is a silent passthrough with no error anywhere.
+  //
+  // RGBA16F is in the required set and is what the pre-Phase-2 velocity
+  // intermediate used. The extra bandwidth is irrelevant at this size: the tile
+  // set is tiles*tileH + 2*tiles*tiles texels (~40k at 1440p), so 8 B/texel
+  // costs ~160 KB more against a 2560x1440 output buffer. The bandwidth argument
+  // that justified R16G16F applied to the full-resolution velocity intermediate,
+  // which no longer exists. The shaders declare float2 over this, taking .xy.
+  const auto tileFmt = reshade::api::format::r16g16b16a16_float;
+  const bool ok =
+     mk(tilesX, std::max(motionH, 1u), tileFmt,
+        &d->mb_tilemax_h_texture, &d->mb_tilemax_h_srv, &d->mb_tilemax_h_uav)
+   && mk(tilesX, tilesY, tileFmt,
+        &d->mb_tilemax_texture, &d->mb_tilemax_srv, &d->mb_tilemax_uav)
+   && mk(tilesX, tilesY, tileFmt,
+        &d->mb_neighbormax_texture, &d->mb_neighbormax_srv, &d->mb_neighbormax_uav)
+   && mk(workingW, workingH, outputFormat,
+        &d->mb_output_texture, &d->mb_output_srv, &d->mb_output_uav);
+  if (!ok) {
+    DestroyMotionBlurSet(dev, d);
+    return;
+  }
+  d->mb_working_w = workingW; d->mb_working_h = workingH;
+  d->mb_motion_h = motionH;
+  d->mb_tiles_x = tilesX; d->mb_tiles_y = tilesY;
+  d->mb_radius_px = static_cast<uint32_t>(std::max(shader_injection.mb_max_radius_px, 8.f));
+  d->mb_output_fmt = outputFormat;
+  d->mb_resources_ready = true;
+}
+
+// Resolves the game's depth and motion inputs, recreates the owned set when
+// anything that affects shape or layout moved, and mirrors everything the
+// shaders read into the push block. Returns false when the chain cannot run.
+// motionOut receives the exact view that mb_motion_valid describes: the game's
+// motion texture when valid, the 1x1 stand-in otherwise. Callers bind that
+// return value; they must not re-resolve it from DeviceData.
+static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
+                              uint32_t workingW, uint32_t workingH,
+                              reshade::api::format outputFormat,
+                              reshade::api::resource_view* motionOut) {
+  if (!dev || !d || !motionOut) return false;
+  *motionOut = d->fallback_srv;
+  if (workingW == 0u || workingH == 0u) return false;
+  if (outputFormat == reshade::api::format::unknown) return false;
+  if (!EnsureMotionBlurPipelines(dev, d)) return false;
+  if (!EnsureMotionBlurSampler(dev, d)) return false;
+  if (!EnsureMotionBlurNoiseFallback(dev, d)) return false;
+
+  // Depth: the game's scene depth, captured from the lighting pass. Queried
+  // here rather than cached at capture time so it can never go stale.
+  uint32_t depthW = 0u, depthH = 0u;
+  if (d->captured_depth_srv.handle != 0u) {
+    reshade::api::resource dres = dev->get_resource_from_view(d->captured_depth_srv);
+    if (dres.handle != 0u) {
+      auto ddesc = dev->get_resource_desc(dres);
+      if (ddesc.type == reshade::api::resource_type::texture_2d) {
+        depthW = ddesc.texture.width;
+        depthH = ddesc.texture.height;
+      }
+    }
+  }
+  if (depthW == 0u || depthH == 0u) return false;
+
+  // Motion: the game's t3 from the TAA draw.
+  //
+  // The view handed back through motionOut and the mb_motion_valid flag are
+  // derived from the SAME branch on purpose. They must never be decided in two
+  // places: binding the 1x1 white stand-in while reporting the buffer valid
+  // makes every pixel read a uniform ~0.0004 UV velocity, which silently
+  // collapses the whole filter to a passthrough (black Blur Amount view, cyan
+  // Velocity view, no blur at all). Validity lives in the push block rather than
+  // in a null binding, matching the DoF IS-FAST pattern; the gather zeroes vmax
+  // when it is invalid, so the chain degrades to a passthrough by design.
+  //
+  // motionBound is the ONLY thing that decides the binding and the flag, and it
+  // is deliberately the same two-part test RCAS uses (RCASSharpenCS binds the
+  // same view the same way). The resource desc query below is a REFINEMENT of
+  // the divisor and the tile height, never a gate: a view that failed to resolve
+  // is still perfectly readable, and treating the query as authoritative is what
+  // silently disabled this filter once already. It must not be re-promoted.
+  const bool motionBound = d->rcas_motion_srv.handle != 0u && d->rcas_motion_live.load();
+  uint32_t motionW = workingW, motionH = workingH;
+  if (motionBound) {
+    reshade::api::resource mres = dev->get_resource_from_view(d->rcas_motion_srv);
+    if (mres.handle != 0u) {
+      auto mdesc = dev->get_resource_desc(mres);
+      if (mdesc.type == reshade::api::resource_type::texture_2d
+          && mdesc.texture.width > 0u && mdesc.texture.height > 0u) {
+        motionW = mdesc.texture.width;
+        motionH = mdesc.texture.height;
+      }
+    }
+  }
+  *motionOut = motionBound ? d->rcas_motion_srv : d->fallback_srv;
+
+  const uint32_t radiusPx = static_cast<uint32_t>(std::max(shader_injection.mb_max_radius_px, 8.f));
+  // Tiles are sized in PIXELS, not counted, so they stay square on a 16:9 frame.
+  // A square count gave 27x27 over 2560x1440, i.e. 95x54 px tiles, and the paper's
+  // 1-ring property plus the Section 4.2 t-in-tiles falloff both assume roughly
+  // uniform tiles; 54 px was only 1.3x the longest streak.
+  //
+  // Two tiles of headroom keeps the whole 0..2 Intensity range meaningful: the
+  // domain is (|v|max + jitter) * intensity <= (40 + 1.3) px at 1080p reference,
+  // so a 2*40 px tile leaves ~1.94 before the gather's one-tile clamp engages.
+  // Total tilemax loads are unchanged by this (tilesX * motionH * tileW is
+  // invariant), so prep should neither improve nor regress -- the win is
+  // correctness, not speed.
+  const uint32_t tilePx = std::max(1u, radiusPx * 2u);
+  const uint32_t tilesX = std::max(1u, (workingW + tilePx - 1u) / tilePx);
+  const uint32_t tilesY = std::max(1u, (workingH + tilePx - 1u) / tilePx);
+  // Depth and motion dimensions are no longer resource-sizing inputs: the
+  // gather samples the game's textures directly and the conversion scale is a
+  // per-frame push. Only motionH still matters, because it is the height of the
+  // tilemax_h intermediate.
+  const bool needRecreate =
+      !d->mb_resources_ready
+      || d->mb_working_w != workingW || d->mb_working_h != workingH
+      || d->mb_motion_h != motionH
+      || d->mb_tiles_x != tilesX || d->mb_tiles_y != tilesY
+      || d->mb_radius_px != radiusPx
+      || d->mb_output_fmt != outputFormat;
+  if (needRecreate) {
+    CreateMotionBlurSet(dev, d, workingW, workingH, motionH, tilesX, tilesY, outputFormat);
+    if (!d->mb_resources_ready) return false;
+  }
+
+  // ── push block ──
+  shader_injection.mb_working_w = static_cast<float>(workingW);
+  shader_injection.mb_working_h = static_cast<float>(workingH);
+  shader_injection.mb_depth_w = static_cast<float>(std::max(depthW, 1u));
+  shader_injection.mb_depth_h = static_cast<float>(std::max(depthH, 1u));
+  shader_injection.mb_motion_w = static_cast<float>(std::max(motionW, 1u));
+  shader_injection.mb_motion_h = static_cast<float>(std::max(motionH, 1u));
+  shader_injection.mb_tiles_x = static_cast<float>(d->mb_tiles_x);
+  shader_injection.mb_tiles_y = static_cast<float>(d->mb_tiles_y);
+  shader_injection.mb_tile_uv = radiusPx / kMotionBlurRefHeight;
+  shader_injection.mb_frame_index = static_cast<float>(d->frame_index % 32u);
+  shader_injection.mb_motion_valid = motionBound ? 1.f : 0.f;
+  // Availability only; the user's mb_jitter_source choice is never overwritten,
+  // so it survives the volume being briefly unavailable.
+  shader_injection.mb_jitter_ready = d->isfast_noise_srv.handle != 0u ? 1.f : 0.f;
+  return true;
+}
+
+// Runs the six-pass chain over colorSrc. Returns the gather output view, or an
+// empty view if anything failed; the caller decides how to publish it.
+static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl, DeviceData* d,
+                                                 reshade::api::resource_view colorSrc,
+                                                 reshade::api::resource_view motionSrc) {
+  if (!cl || !d || !colorSrc.handle) return {};
+  auto* dev = cl->get_device();
+  if (!dev || !d->mb_resources_ready) return {};
+
+  const auto CS = reshade::api::shader_stage::all_compute;
+  const auto AC = reshade::api::pipeline_stage::all_compute;
+  const auto SR = reshade::api::resource_usage::shader_resource;
+  const auto UA = reshade::api::resource_usage::unordered_access;
+  auto bar = [&](reshade::api::resource r, reshade::api::resource_usage o, reshade::api::resource_usage n) {
+    if (r.handle) cl->barrier(r, o, n);
+  };
+  auto apply = [&](uint32_t pass, reshade::api::resource_view* srvs, uint32_t srvCount,
+                   reshade::api::resource_view uav) {
+    std::array<reshade::api::descriptor_table_update, kGtvbaoDescriptorTableParamCount> u = {{
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->mb_point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,srvCount,reshade::api::descriptor_type::texture_shader_resource_view,srvs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&uav},
+    }};
+    for (uint32_t i = 0; i < kGtvbaoDescriptorTableParamCount; ++i) u[i].table = d->mb_tables[pass][i];
+    dev->update_descriptor_tables(kGtvbaoDescriptorTableParamCount, u.data());
+    std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount> tables = {
+        d->mb_tables[pass][0], d->mb_tables[pass][1], d->mb_tables[pass][2], d->mb_tables[pass][3]};
+    cl->bind_descriptor_tables(CS, d->mb_layouts[pass], 0, kGtvbaoDescriptorTableParamCount, tables.data());
+    cl->push_constants(CS, d->mb_layouts[pass], kGtvbaoPushConstantsLayoutParam, 0,
+                       static_cast<uint32_t>(sizeof(ShaderInjectData) / sizeof(uint32_t)),
+                       static_cast<const void*>(&shader_injection));
+  };
+
+  const uint32_t W = d->mb_working_w, H = d->mb_working_h;
+  const uint32_t MH = std::max(d->mb_motion_h, 1u);
+  const uint32_t TX = d->mb_tiles_x, TY = d->mb_tiles_y;
+  reshade::api::resource_view depthSrc =
+      d->captured_depth_srv.handle != 0u ? d->captured_depth_srv : d->fallback_srv;
+  // motionSrc is supplied by PrepareMotionBlur and is the same view
+  // mb_motion_valid describes. Resolving it here instead would let the bound
+  // view and the flag drift apart, which silently degrades the filter to a
+  // passthrough with no error anywhere.
+
+  // ── Diagnostic chain isolation (mb_debug_chain) ──
+  // 0 Full, 1 Prep Only, 2 Gather Only. Branched here rather than in a shader
+  // because every gate in this chain is already a CPU decision (including the
+  // TileMax axis), and because "Gather Only" must not touch passes 1-5 at all.
+  //
+  //   chain | prep valid | runPrep | runGather
+  //   ------+------------+---------+-----------
+  //     0   |     -      |   yes   |    yes    (Full)
+  //     1   |     -      |   yes   |    no     (Prep Only)
+  //     2   |    yes     |   no    |    yes    (Gather Only)
+  //     2   |     no     |   yes   |    yes    (fallback to Full)
+  //
+  // The fallback avoids a misleading result on the first frame after the owned
+  // set is rebuilt, when no prep pass has run against the new textures.
+  const int chain = static_cast<int>(shader_injection.mb_debug_chain + 0.5f);
+  const bool gatherOnly = (chain == 2) && d->mb_prep_valid;
+  if (chain != d->mb_last_chain) {
+    d->mb_last_chain = chain;
+    d->mb_warned_gather_only = false;
+    reshade::log::message(reshade::log::level::info,
+        chain == 0 ? "[MotionBlur] debug chain: Full"
+        : chain == 1 ? "[MotionBlur] debug chain: Prep Only (gather skipped, image untouched)"
+        : "[MotionBlur] debug chain: Gather Only (previous frame's prep)");
+  }
+  if (chain == 2 && !gatherOnly && !d->mb_warned_gather_only) {
+    d->mb_warned_gather_only = true;
+    reshade::log::message(reshade::log::level::warning,
+        "[MotionBlur] Gather Only ran before any prep pass; running the full chain "
+        "for this frame instead of dispatching against unprepared textures.");
+  }
+  const bool runPrep = !gatherOnly;
+  const bool runGather = (chain != 1);
+
+  if (runPrep) {
+  {  // P1: TileMax, horizontal (separable, paper Section 3) over game motion
+    cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
+    shader_injection.mb_pass = 0.f;
+    reshade::api::resource_view srvs[1] = {motionSrc};
+    apply(kMbTileMax, srvs, 1, d->mb_tilemax_h_uav);
+    cl->dispatch((TX + 7u) / 8u, (MH + 7u) / 8u, 1u);
+    bar(d->mb_tilemax_h_texture, UA, SR);
+  }
+  {  // P2: TileMax, vertical
+    cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
+    shader_injection.mb_pass = 1.f;
+    reshade::api::resource_view srvs[1] = {d->mb_tilemax_h_srv};
+    apply(kMbTileMax, srvs, 1, d->mb_tilemax_uav);
+    cl->dispatch((TX + 7u) / 8u, (TY + 7u) / 8u, 1u);
+    bar(d->mb_tilemax_texture, UA, SR);
+  }
+  {  // P3: NeighborMax, 3x3 one-ring with Section 4.4 diagonal culling
+    cl->bind_pipeline(AC, d->mb_pipelines[kMbNeighborMax]);
+    reshade::api::resource_view srvs[1] = {d->mb_tilemax_srv};
+    apply(kMbNeighborMax, srvs, 1, d->mb_neighbormax_uav);
+    cl->dispatch((TX + 7u) / 8u, (TY + 7u) / 8u, 1u);
+    bar(d->mb_neighbormax_texture, UA, SR);
+  }
+    d->mb_prep_valid = true;
+  }
+  if (runGather) {  // P4: the gather
+    cl->bind_pipeline(AC, d->mb_pipelines[kMbGather]);
+    reshade::api::resource_view noise = d->isfast_noise_srv.handle != 0u
+        ? d->isfast_noise_srv : d->mb_noise_fallback_srv;
+    reshade::api::resource_view srvs[5] = {colorSrc, motionSrc, d->mb_neighbormax_srv,
+                                           depthSrc, noise};
+    apply(kMbGather, srvs, 5, d->mb_output_uav);
+    cl->dispatch((W + 7u) / 8u, (H + 7u) / 8u, 1u);
+    bar(d->mb_output_texture, UA, SR);
+  } else {
+    // Nothing was produced, so the caller must not publish. Returning an empty
+    // view makes the deploy callback skip the t0 push, leaving the game's
+    // tonemap reading the original image — which is exactly the isolation
+    // "Prep Only" is for.
+    return {};
+  }
+  return d->mb_output_srv;
+}
+
+static void LogMotionBlurOnce(DeviceData* d, const std::string& message) {
+  if (!d) return;
+  if (d->frame_index < d->mb_last_log_frame + kMotionBlurLogFrameGap) return;
+  d->mb_last_log_frame = d->frame_index;
+  reshade::log::message(reshade::log::level::info, ("[MotionBlur] " + message).c_str());
+}
+
+// ── Motion Blur cutscene gate ──
+// The DoF gather draws only when the game dispatches depth of field, which in
+// Sora 2nd it does only in cutscenes, so "the DoF gather drew" IS the cutscene
+// signal and nothing has to be kept in sync with a separate flag. frame_index is
+// incremented once per present (addon.cpp OnPresent), so every draw inside one
+// frame compares equal.
+//
+// The tonemap is dispatched after the DoF chain, so gating there still puts
+// motion blur on top of depth of field. This callback only records the frame: it
+// never touches D3D state and never dispatches anything.
+static void OnDrawnDofGather(reshade::api::command_list* cmd_list) {
+  if (!cmd_list || !IsSora2nd()) return;
+  if (auto* dev = cmd_list->get_device()) {
+    if (auto* d = dev->get_private_data<DeviceData>()) {
+      d->mb_dof_drew_frame = d->frame_index;
+    }
+  }
+}
+
+// ── Motion Blur deploy point (both modes) ──
+// One deploy serves both modes. The gather result replaces the tonemap's t0 and
+// the game's own blit/tonemap runs on it, so the tonemap stays bit-identical to
+// vanilla and cannot regress. Mode only changes the trigger:
+//
+//   1 Cutscene Only : run, but only on frames whose DoF gather drew
+//   2 Always On     : run every frame
+//
+// Being post-TAA means TAA never accumulates over the blur; being pre-tonemap
+// means the blur is computed on true HDR linear values. The game's original t0
+// view supplies both the gather's colour input and the exact output format,
+// because the result is pushed back at t0 and must stay format compatible with
+// what the game's shader expects.
+static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
+  if (!cmd_list) return true;
+  if (shader_injection.mb_mode < 0.5f) return true;
+  if (!IsSora2nd()) return true;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return true;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return true;
+
+  // Cutscene gate. A stale value simply fails the comparison, so an unexpected
+  // draw order degrades to "no blur" rather than to blur in the wrong place.
+  const bool cutsceneOnly = shader_injection.mb_mode < 1.5f;
+  if (cutsceneOnly && d->mb_dof_drew_frame != d->frame_index) return true;
+
+  if (d->mb_tonemap_src_srv.handle == 0u || !d->mb_tonemap_src_live.load()) {
+    if (!d->mb_warned_tonemap_src) {
+      d->mb_warned_tonemap_src = true;
+      reshade::log::message(reshade::log::level::warning,
+          "[MotionBlur] needs the tonemap's t0 view, which has not been captured. "
+          "The tonemap may bind through descriptor tables rather than push descriptors.");
+    }
+    return true;
+  }
+  d->mb_warned_tonemap_src = false;
+
+  reshade::api::resource srcRes = dev->get_resource_from_view(d->mb_tonemap_src_srv);
+  if (!srcRes.handle) return true;
+  auto desc = dev->get_resource_desc(srcRes);
+  if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples != 1) return true;
+  uint32_t w = desc.texture.width, h = desc.texture.height;
+  if (w == 0u || h == 0u || desc.texture.format == reshade::api::format::unknown) return true;
+
+  reshade::api::resource_view motionSrc;
+  if (!PrepareMotionBlur(dev, d, w, h, RCASLinearFormat(desc.texture.format), &motionSrc)) {
+    LogMotionBlurOnce(d, "inactive: depth, motion or pipelines unavailable");
+    return true;
+  }
+  auto blurred = RunMotionBlur(cmd_list, d, d->mb_tonemap_src_srv, motionSrc);
+  if (!blurred.handle) return true;
+
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
+      reshade::api::descriptor_table_update{{}, 0u, 0, 1,
+          reshade::api::descriptor_type::texture_shader_resource_view, &blurred});
+  const char* chainName = cutsceneOnly ? "cutscene-only" : "always-on";
+  const char* stage = shader_injection.mb_debug_chain < 0.5f ? "full"
+                     : (shader_injection.mb_debug_chain < 1.5f ? "prep-only" : "gather-only");
+  LogMotionBlurOnce(d, std::string("active: ") + chainName
+      + " MB under the game's tonemap, chain=" + stage);
+  return true;
 }
 
 // ── Kai SSR Replacement (fused march + temporal composites, High + Ultra) ──

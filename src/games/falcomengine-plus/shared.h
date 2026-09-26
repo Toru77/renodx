@@ -404,6 +404,52 @@ struct ShaderInjectData {
   // —— DOF IS-FAST rotated gather (appended last: do not insert above) ——
   float dof_isfast_enabled;                  // 0/1 — per-pixel rotated bokeh gather (Improved mode)
   float dof_isfast_noise_frame;              // runtime: frame_index % 64, or -1 when noise unusable
+  // —— Motion Blur (Guertin et al. 2013, Sora 2nd) ——
+  // Deploy: 0=Off, 1=Cutscene Only (DoF draw), 2=Always On (tonemap draw).
+  // Motion blur runs in UV space; every length below is a 1080p-equivalent
+  // pixel value and is converted by motionblur/motion_blur_common.hlsli, so a
+  // 4K player sees the same blur as a 1080p player.
+  float mb_mode;                    // 0=Off, 1=Cutscene Only, 2=Always On
+  float mb_intensity;               // [0..2], default 1 — shutter scale on the gather's
+                                    // integration DOMAIN (not on velocity); 0 is an exact
+                                    // no-op, and the domain is capped at one tile
+  float mb_sample_count;            // [4..48], default 25 — CEILING on taps (paper N).
+                                    // The adaptive ladder picks a rung at or below this;
+                                    // pinning it to 4 makes every rung clamp to 4.
+  float mb_max_radius_px;           // [8..80], default 40 — paper r; also drives the
+                                    // square tile size (2x this in pixels)
+  float mb_center_weight_k;         // [1..100], default 40 — paper k (centre weight bias)
+  float mb_jitter_h;                // [0..4], default 0.95 — paper h, integration domain extension
+  float mb_min_velocity_g;          // [0..8], default 1.5 — paper g, vc blend threshold
+  float mb_neighbor_t;              // [0..4], default 1 — paper t, Section 4.2 falloff in TILES
+  float mb_depth_tolerance;         // [0.01..1], default 0.1 — zCompare soft band
+  float mb_velocity_format;         // DEPRECATED, unread: the full-resolution velocity
+                                    // intermediate was removed, so there is nothing left
+                                    // to quantise. Kept so later packoffsets do not shift.
+  float mb_jitter_source;           // 0=Halton (paper), 1=IS-FAST volume
+  float mb_jitter_ready;            // runtime: 0/1 — IS-FAST volume actually usable
+  float mb_debug_view;              // 0=Off, 1=Velocity, 2=NeighborMax, 3=Tile grid,
+                                    // 4=Linear depth, 5=Blur amount, 6=Sample count
+  // Runtime, written by the addon immediately before the b13 push.
+  float mb_working_w, mb_working_h; // gather/velocity resolution (colour source dims)
+  float mb_depth_w, mb_depth_h;     // game depth / linear depth texture dims
+  float mb_motion_w, mb_motion_h;   // game motion texture dims
+  float mb_tiles_x, mb_tiles_y;     // tile grid dims
+  float mb_tile_uv;                 // paper r in UV = mb_max_radius_px / 1080
+  float mb_pass;                    // TileMax axis selector: 0=X, 1=Y
+  float mb_frame_index;             // IS-FAST volume slice
+  float mb_motion_valid;            // 0/1 — 0 when the motion buffer is unavailable
+  // Diagnostic chain selector, branched on the CPU (not read by any shader):
+  // 0 = Full (everything), 1 = Prep Only (the three prep dispatches, no gather),
+  // 2 = Gather Only (gather alone, reusing the previous frame's prep). Isolate
+  // per-stage GPU cost. Gather Only reads a FROZEN tile grid, so it is not a
+  // valid cost measurement while the scene is moving.
+  float mb_debug_chain;
+  // 0/1, default 1. When 0 the gather stops loading the motion texture per tap and
+  // weights by the composite direction instead: ~25 fewer loads/pixel, at the cost
+  // of the paper's local-velocity feature awareness (more foreground bleeding).
+  // Appended at the tail so no existing packoffset moves.
+  float mb_local_velocity_weights;
 };
 
 #ifndef __cplusplus

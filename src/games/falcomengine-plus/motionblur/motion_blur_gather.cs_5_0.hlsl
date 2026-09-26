@@ -1,0 +1,279 @@
+// Motion Blur P3 — the Guertin gather.
+//
+// Paper Appendix A, implemented in UV space (see motion_blur_common.hlsli for
+// the unit derivation). What the paper contributes over single-velocity
+// filtering, and what is present here:
+//
+//   * multi-direction sampling: samples alternate between the tile dominant
+//     velocity vmax and the per-pixel composite direction vc, so pixels whose
+//     own motion differs from the neighbourhood still contribute (Section 4.1)
+//   * vc = rnmix(vp_perp, norm(vp), (|vp| - 0.5)/g), i.e. as a pixel's own
+//     velocity fades out it is replaced by the direction perpendicular to
+//     vmax rather than wasting its sample budget (Eq. 1)
+//   * feature-aware weights: each of the three phenomenological cases is
+//     additionally weighted by the dot product between the sampling direction
+//     and the velocity direction at the sample (Section 4.1)
+//   * the mid-point sample is NOT discarded and the centre weight is
+//     normalised, so thin features survive and the weight does not drift with
+//     the sample count (Section 4.3)
+//   * stochastic on-axis tile lookup near tile borders (Section 4.2), which
+//     MBNeighborTile resolves
+//   * deterministic Halton jitter of the integration domain (Section 4.5)
+//
+// Both inputs are the game's own textures, read directly: motion at t1 and depth
+// at t3, with no full-resolution intermediate in between. Depth is linearized
+// inline because cb_scene is already bound at b0 for every stage of this chain;
+// that costs one reciprocal per sample against 25 texture fetches already being
+// issued, and it removes a 14.7 MB per-frame write at 1440p. The gather
+// point-samples either way, so the result is identical.
+//
+// Deliberately excluded, both sanctioned by the paper itself:
+//   * TileVariance sample distribution (Section 4.1) — the paper disables it
+//     in its own Section 5 results
+//   * the (px+py)&1 FXAA luminance hint (Section 4.5) — this filter runs after
+//     FXAA, so there is no downstream edge detector to consume it
+//
+// Output alpha is the CENTRE sample's alpha, so the gather never disturbs
+// whatever the source encodes there.
+
+#include "motion_blur_common.hlsli"
+
+cbuffer cb_scene : register(b0)
+{
+  float4x4 view_g    : packoffset(c0);
+  float4x4 viewInv_g : packoffset(c4);
+  float4x4 proj_g    : packoffset(c8);
+  float4x4 projInv_g : packoffset(c12);
+};
+
+Texture2D<float4>    g_srcColor       : register(t0);
+Texture2D<float2>    g_srcMotion      : register(t1);
+Texture2D<float2>    g_srcNeighborMax : register(t2);
+// Single-channel, matching the game's other depth readers (gtvbao, ssrr2,
+// lighting). Declaring this float2 made `addC - g_srcDepth[texel]` a float2
+// silently truncated to .x, which is the same number but is a real type
+// mismatch the compiler rightly flagged.
+Texture2D<float>     g_srcDepth       : register(t3);
+Texture3D<float2>    g_isfastNoise    : register(t4);
+RWTexture2D<float4>  g_outColor       : register(u0);
+
+// Point lookup: a tap is a real pixel, not a filtered one. Also keeps depth
+// reads off silhouette interpolations.
+float SampleLinearDepth(float2 uv, int2 dims, float mulC, float addC) {
+  int2 texel = clamp(int2(uv * float2(dims)), int2(0, 0), dims - 1);
+  float denom = addC - g_srcDepth[texel];
+  float z = (abs(denom) > 1e-8) ? (mulC / denom) : 0.0;
+  z = max(z, 0.0);
+  // Cleared/sky depth linearizes to 0 or garbage depending on the projection;
+  // clamping to a finite positive distance keeps zCompare well defined.
+  if (!isfinite(z)) z = 0.0;
+  return min(z, 1.0e9);
+}
+
+float2 SampleJitter(int2 p) {
+  if (shader_injection_data.mb_jitter_source > 0.5 && shader_injection_data.mb_jitter_ready > 0.5) {
+    // IS-FAST blue-noise volume: temporally varying, so the residual sampling
+    // noise reads far less than a static per-pixel Halton pattern. This matters
+    // more than usual here because motion blur is applied ON TOP of depth of
+    // field, so the paper's "DoF blurs our noise" benefit is unavailable.
+    // mb_jitter_ready is the runtime availability flag, so the user's choice in
+    // mb_jitter_source is never overwritten.
+    int3 c = int3(int(p.x) & 127, int(p.y) & 127, int(shader_injection_data.mb_frame_index) & 31);
+    return frac(g_isfastNoise.Load(int4(c, 0)));
+  }
+  return MBJitterHalton(p);
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
+  int2 p = int2(dispatchThreadID.xy);
+  int workingW = (int)shader_injection_data.mb_working_w;
+  int workingH = (int)shader_injection_data.mb_working_h;
+  if (workingW <= 0 || workingH <= 0) return;
+  if (p.x >= workingW || p.y >= workingH) return;
+
+  int2 depthDims = max(int2(shader_injection_data.mb_depth_w, shader_injection_data.mb_depth_h), int2(1, 1));
+  int2 motionDims = max(int2(shader_injection_data.mb_motion_w, shader_injection_data.mb_motion_h), int2(1, 1));
+  int2 tiles = max(int2(shader_injection_data.mb_tiles_x,
+                        shader_injection_data.mb_tiles_y), int2(1, 1));
+  float tileUV = max(shader_injection_data.mb_tile_uv, 1e-6);
+  bool motionValid = shader_injection_data.mb_motion_valid > 0.5;
+
+  // Paper pixel constants expressed in UV (see motion_blur_common.hlsli).
+  float minVelocityUV = 0.5 / MB_REF_H;
+  float jitterUV = clamp(shader_injection_data.mb_jitter_h, 0.0, 4.0) / MB_REF_H;
+  float gUV = max(shader_injection_data.mb_min_velocity_g, 1e-4) / MB_REF_H;
+  float kUV = max(shader_injection_data.mb_center_weight_k, 1e-3) * MB_REF_H;
+  const bool localWeights = shader_injection_data.mb_local_velocity_weights > 0.5;
+
+  // Depth linearization constants, hoisted out of the sample loop.
+  float mulC = -proj_g[3][2];
+  float addC =  proj_g[2][2];
+  if (mulC * addC < 0.0) addC = -addC;
+
+  float2 uv = (float2(p) + 0.5) / float2(workingW, workingH);
+  float4 centerSample = g_srcColor[p];
+  float2 jitter = SampleJitter(p);
+
+  int2 neighborTile = MBNeighborTile(uv, jitter);
+  // An unavailable motion buffer must not be allowed to read the 1x1 fallback
+  // stand-in, which would look like a uniform velocity everywhere. Zeroing vmax
+  // makes every pixel take the early-out below, i.e. a passthrough.
+  //
+  // Point Load, not SampleLevel: this is the filter's only input, and it must
+  // not depend on a sampler's descriptor being valid.
+  float2 vmax = motionValid ? g_srcNeighborMax[neighborTile] : float2(0.0, 0.0);
+  float vmaxLength = length(vmax);
+  const bool blurred = motionValid && (vmaxLength > minVelocityUV);
+
+  int debugView = (int)(shader_injection_data.mb_debug_view + 0.5);
+
+  // Adaptive ladder. N comes from the bucket, bounded by Max Samples.
+  int bucket = blurred ? MBSampleBucket(vmaxLength / tileUV) : 0;
+
+  // ---- debug views (no filter output; alpha 1) ----
+  if (debugView == 6) {
+    g_outColor[p] = float4(MBBucketColor(bucket), 1.0);
+    return;
+  }
+  if (debugView == 1) {
+    // Gated on motionValid, which reflects the BOUND view, never on `blurred`.
+    // `blurred` is a filter outcome: gating a motion diagnostic on it makes a
+    // TileMax/NeighborMax fault look exactly like a dead motion buffer, which is
+    // precisely the misdiagnosis this view caused once already.
+    float2 centerVelocity = motionValid
+        ? MBGameMotionToUV(g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)])
+        : float2(0.0, 0.0);
+    float centerLength = length(centerVelocity);
+    float2 dir = (centerLength > 1e-8) ? centerVelocity / centerLength : float2(0.0, 0.0);
+    g_outColor[p] = float4(float3(saturate(centerLength / tileUV), dir * 0.5 + 0.5), 1.0);
+    return;
+  }
+  if (debugView == 2) {
+    float2 dir = (vmaxLength > 1e-8) ? vmax / vmaxLength : float2(0.0, 0.0);
+    g_outColor[p] = float4(float3(saturate(vmaxLength / tileUV), dir * 0.5 + 0.5), 1.0);
+    return;
+  }
+  if (debugView == 3) {
+    // 1 unit of the neighbormax grid is 1 texel, so the distance to the
+    // nearest tile border is directly readable in texels.
+    float2 pos = frac(uv * float2(tiles));
+    float2 distToBorder = min(pos, 1.0 - pos);
+    float edge = 1.0 - smoothstep(0.0, 1.5, min(distToBorder.x, distToBorder.y));
+    g_outColor[p] = float4(edge.xxx, 1.0);
+    return;
+  }
+  if (debugView == 4) {
+    g_outColor[p] = float4(saturate(SampleLinearDepth(uv, depthDims, mulC, addC) * 0.01).xxx, 1.0);
+    return;
+  }
+  if (debugView == 5) {
+    g_outColor[p] = float4(saturate(vmaxLength / tileUV).xxx, 1.0);
+    return;
+  }
+
+  // Paper early-out: nothing is moving here, or the motion buffer is unusable.
+  if (!blurred) {
+    g_outColor[p] = centerSample;
+    return;
+  }
+
+  // ---- Section 4.1: two sampling directions ----
+  float2 wn = vmax / vmaxLength;
+  float2 centerVelocity = MBGameMotionToUV(
+      g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)]);
+  float centerLength = length(centerVelocity);
+  float2 wp = float2(-wn.y, wn.x);
+  if (dot(wp, centerVelocity) < 0.0) wp = -wp;  // Appendix A sign flip
+  float2 vc = MBRNMix(wp, MBNorm(centerVelocity), saturate((centerLength - minVelocityUV) / gUV));
+
+  // Appendix A seeds the accumulator with
+  //     totalWeight = N / (k * |vc|),  result = color[p] * totalWeight
+  // where the pseudocode's `vc` is V[p], the PER-PIXEL velocity, not the
+  // composite direction (that one is `wc`). The centre sample is therefore a
+  // vanishing fraction of the total and its job is only to anchor the
+  // degenerate all-weights-equal case.
+  //
+  // The denominator is floored at the paper's own minimum-velocity threshold.
+  // Eq. 1 already treats a pixel below that as having no velocity of its own, so
+  // without the floor a pixel reading exactly zero would make N/(k*0) enormous
+  // and pin itself to its original colour, killing the very transparency effect
+  // Section 4.2 is about.
+  //
+  // NOTE: paper Section 4.3 describes the centre weight as `w_p = |v|*k + N/k`
+  // and argues the single-velocity form was under-weighted, which does not
+  // reconcile numerically with the Appendix A expression above (they differ by
+  // orders of magnitude). Appendix A is the executable specification and is
+  // what is implemented; if thin features ghost in practice, this is the line
+  // to revisit against the original PDF.
+  // Adaptive ladder: the neighbourhood velocity already says how much smear this
+  // pixel needs, so taps scale with it instead of being flat. `maxSamples` is a
+  // CEILING, not the count. The [loop] attribute below is load-bearing: it stops
+  // the compiler unrolling a now-dynamic bound, and divergence stays limited
+  // because buckets are tile-coherent (see MBSampleBucket).
+  const int maxSamples = clamp((int)(shader_injection_data.mb_sample_count + 0.5), 4, 48);
+  const int sampleCount = (int)MBSampleCount(bucket, (uint)maxSamples);
+  float totalWeight = (float)sampleCount
+                    / max(kUV * max(centerLength, minVelocityUV), 1e-8);
+  float3 result = centerSample.rgb * totalWeight;
+  const float centerDepth = SampleLinearDepth(uv, depthDims, mulC, addC);
+
+  // Section 4.5: Halton-jittered stratified integration. h extends the domain
+  // slightly past |vmax| (the paper's "larger maximum jitter value").
+  //
+  // r bounds the TILE search, not the integration length: the paper's domain is
+  // |vmax| + h. Clamping the scaled domain to tileUV is what made the Intensity
+  // slider inert, because |v| is already clamped to tileUV, so any motion at or
+  // above Max Radius saturated the product. Clamp to ONE TILE instead, which is
+  // the actual constraint the 1-ring property imposes.
+  float maxTileUV = 1.0 / float(max(tiles.y, 1));
+  float maxT = min((vmaxLength + jitterUV) * max(shader_injection_data.mb_intensity, 0.0), maxTileUV);
+
+  [loop]
+  for (int i = 0; i < sampleCount; ++i) {
+    // lerp, not mix: mix is a pixel-stage intrinsic and this is a compute shader.
+    float t = lerp(-1.0, 1.0, ((float)i + jitter.x + 1.0) / (float)(sampleCount + 1));
+    float T = t * maxT;
+    float2 d = (i & 1) ? vc : wn;  // even samples follow vmax, odd follow vc
+
+    float2 sampleUV = clamp(uv + T * d, 0.0, 1.0);
+    int2 sampleTexel = clamp(int2(sampleUV * float2(workingW, workingH)),
+                             int2(0, 0), int2(workingW - 1, workingH - 1));
+
+    // Fore/background classification relative to p. zCompare is symmetric, so
+    // f and b coincide; the paper's fore/background distinction is carried by
+    // the two different cone half-widths and by wA vs wB below.
+    float depthAgree = MBZCompare(centerDepth, SampleLinearDepth(sampleUV, depthDims, mulC, addC));
+
+    // wB is the paper's local-velocity term: it asks whether the motion AT THIS
+    // TAP agrees with the sampling direction, which is what stops foreground
+    // bleeding across a depth edge. It is the only reason to load the motion
+    // texture per tap. With it disabled we reuse the composite direction, which
+    // removes ~25 loads/pixel; the cone term then mirrors the wA term, so the
+    // weight shape does change and not just the cost. That is why it is a toggle
+    // rather than a free win.
+    float wA = dot(vc, d);
+    float wB = wA;
+    float sampleLength = centerLength;
+    if (localWeights) {
+      int2 motionTexel = clamp(int2(sampleUV * float2(motionDims)), int2(0, 0), motionDims - 1);
+      float2 sampleVelocity = MBGameMotionToUV(g_srcMotion[motionTexel]);
+      wB = dot(MBNorm(sampleVelocity), d);
+      sampleLength = length(sampleVelocity);
+    }
+
+    // The three phenomenological cases, each additionally weighted by how well
+    // the local velocity direction agrees with the sampling direction.
+    float weight =
+        depthAgree * MBCone(T, 1.0 / max(sampleLength, 1e-6)) * max(wB, 0.0)
+      + depthAgree * MBCone(T, 1.0 / max(centerLength, 1e-6)) * max(wA, 0.0)
+      + MBCylinder(T, min(sampleLength, centerLength)) * max(wA, wB) * 2.0;
+
+    weight = max(weight, 0.0);
+    totalWeight += weight;
+    result += g_srcColor[sampleTexel].rgb * weight;
+  }
+
+  result = (totalWeight > 1e-6) ? result / totalWeight : centerSample.rgb;
+  g_outColor[p] = float4(clamp(result, 0.0, 65472.0), centerSample.a);
+}
