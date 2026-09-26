@@ -17,6 +17,16 @@ cbuffer cb_dof : register(b2)
 SamplerState samPoint_s : register(s0);
 SamplerState samLinear_s : register(s1);
 Texture2D<float4> colorTexture : register(t0);
+// ── IS-FAST volume for the per-pixel rotated gather (pushed at t5 when usable) ──
+Texture3D<float2> dofIsfastNoiseTex : register(t5);
+// Static point-clamp sampler (mirrors the Vanilla-SSR IS-FAST sampling).
+SamplerState dofIsfastNoiseSamp
+{
+  Filter = MIN_MAG_MIP_POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+  AddressW = Clamp;
+};
 
 
 // 3Dmigoto declarations
@@ -39,6 +49,26 @@ float3 GatherDOFImproved(float2 uv, float2 texel_size, float4 center_sample) {
 
   const float golden_angle = 2.39996322973f;
 
+  // ── IS-FAST per-pixel spiral rotation ──
+  // The golden-angle spiral is deterministic, so every pixel undersamples in
+  // the same directions and the residual error reads as structured spiral/ring
+  // ghosting rather than noise. Rotating per pixel decorrelates neighbouring
+  // pixels, turning that structure into high-frequency noise that TAA or an
+  // upscaler can resolve. Tap weights are derived from each tap's sampled CoC,
+  // never from the tap direction, so rotation cannot alter the layering, sign
+  // or coverage logic. Gated on dof_isfast_noise_frame < 0 (set by the addon
+  // when the master toggle, this toggle, Improved mode or the volume is
+  // unavailable) so the gather stays deterministic when disabled.
+  float gather_rot = 0.0f;
+  {
+    float isfast_frame = shader_injection_data.dof_isfast_noise_frame;
+    if (shader_injection_data.dof_isfast_enabled > 0.5f && isfast_frame >= 0.0f) {
+      float2 isf_nxy = frac((uv / texel_size + 0.5) / 128.0);
+      float isf_nz = frac((fmod(isfast_frame, 32.0) + 0.5) / 32.0);
+      gather_rot = 6.28318548 * dofIsfastNoiseTex.SampleLevel(dofIsfastNoiseSamp, float3(isf_nxy, isf_nz), 0).x;
+    }
+  }
+
   // Option A: de-biased anchor — the sharp center participates with a finite
   // weight so starved thin features converge toward surviving taps instead of
   // snapping back to the unblurred pixel.
@@ -58,7 +88,7 @@ float3 GatherDOFImproved(float2 uv, float2 texel_size, float4 center_sample) {
 
     float t = ((float)tap + 0.5f) / (float)sample_count;
     float ring = sqrt(t);
-    float angle = golden_angle * (float)tap;
+    float angle = golden_angle * (float)tap + gather_rot;
     float2 dir = float2(cos(angle), sin(angle));
 
     float2 offset_px = (dir * ring) * radius_px;

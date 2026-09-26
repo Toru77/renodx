@@ -357,6 +357,9 @@ ShaderInjectData shader_injection = {
   .gtvbao_upscale_plane_sigma = 40.f,
   .gtvbao_upscale_normal_power = 16.f,
   .gtvbao_upscale_debug = 0.f,
+  // —— DOF IS-FAST rotated gather ——
+  .dof_isfast_enabled = 1.f,
+  .dof_isfast_noise_frame = -1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -1284,6 +1287,36 @@ static bool OnBeforeFoliageDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
+// ── DOF gather (Improved) draw: IS-FAST rotation ──
+// The gather shaders sample only t0, so t5 is free for the IS-FAST volume.
+// Mirrors the Vanilla-SSR IS-FAST path exactly (same volume, same frame
+// slice, same "frame < 0 means unusable" gating), so the noise the bokeh
+// gathers match the noise the other effects already use.
+static bool OnBeforeDofGatherDraw(reshade::api::command_list* cmd_list) {
+  auto* dev = cmd_list->get_device();
+  if (!dev) return true;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return true;
+  const bool noiseUsable = g_isfast_enabled > 0.5f
+      && shader_injection.dof_isfast_enabled > 0.5f
+      && shader_injection.dof_mode >= 0.5f
+      && d->isfast_noise_srv.handle != 0u;
+  // -1 disables sampling in the shader, which keeps the gather deterministic.
+  shader_injection.dof_isfast_noise_frame = noiseUsable
+      ? (float)(d->frame_index % 64u) : -1.f;
+  if (noiseUsable) {
+    reshade::api::resource_view srv = d->isfast_noise_srv;
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0}, 0,
+        reshade::api::descriptor_table_update{
+            {}, 5u, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view,
+            &srv});
+  }
+  return true;
+}
+
 // ═══════════ Custom shaders ═══════════
 
 renodx::mods::shader::CustomShaders custom_shaders = {
@@ -1594,10 +1627,12 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     },
     // ── Kai DOF shaders ──
     CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
-    CustomShaderEntryCallback(0x2734F870, nullptr),
+    CustomShaderEntryCallback(0x2734F870, OnBeforeDofGatherDraw),
     // ── Sora 2nd DOF shaders (port Kai improved) ──
     CustomShaderEntryCallback(0x5BBEC5A3, nullptr),
-    CustomShaderEntryCallback(0xCD6FC25D, nullptr),
+    // Gather pass — shared by Sora 2nd and Sora 1st (Sora 1st supplies its own
+    // CoC pass, 0x1CA8DE95, and reuses this one).
+    CustomShaderEntryCallback(0xCD6FC25D, OnBeforeDofGatherDraw),
     // ── Sora 1st DOF shaders ──
     CustomShaderEntryCallback(0x1CA8DE95, nullptr),
     //__ALL_CUSTOM_SHADERS,
@@ -1748,7 +1783,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "DOFSampleCount", .binding = &shader_injection.dof_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 48.f, .label = "Sample Count", .section = "Depth of Field",
+      .default_value = 24.f, .label = "Sample Count", .section = "Depth of Field",
       .tooltip = "Higher values produce smoother bokeh at higher cost.",
       .min = 4.f, .max = 64.f, .format = "%d",
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -1783,6 +1818,15 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Rejects CoC-mismatched taps to reduce foreground/background bleeding.",
       .min = 0.02f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFISFAST", .binding = &shader_injection.dof_isfast_enabled,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "IS-FAST Rotation", .section = "Depth of Field",
+      .tooltip = "Rotates the bokeh gather per pixel with IS-FAST noise. The golden-angle spiral is otherwise identical at every pixel, so undersampling shows up as fixed spiral/ring ghosting; rotating decorrelates neighbouring pixels and turns it into fine noise. Needs the IS-FAST master toggle.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f && g_isfast_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{

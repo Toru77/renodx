@@ -401,6 +401,9 @@ struct ShaderInjectData {
   float gtvbao_upscale_plane_sigma;          // reconstruction plane edge-stop sigma, default 40
   float gtvbao_upscale_normal_power;         // reconstruction normal weight power, default 16
   float gtvbao_upscale_debug;                // 0=Final, others=reconstruction diagnostics
+  // —— DOF IS-FAST rotated gather (appended last: do not insert above) ——
+  float dof_isfast_enabled;                  // 0/1 — per-pixel rotated bokeh gather (Improved mode)
+  float dof_isfast_noise_frame;              // runtime: frame_index % 64, or -1 when noise unusable
 };
 
 #ifndef __cplusplus
