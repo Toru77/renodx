@@ -99,12 +99,35 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   float tileUV = max(shader_injection_data.mb_tile_uv, 1e-6);
   bool motionValid = shader_injection_data.mb_motion_valid > 0.5;
 
+  // Loop invariants, hoisted explicitly rather than left to the compiler. The
+  // per-pixel motion weight is mandatory: dropping it was measured to cost
+  // visible foreground bleeding, so it is no longer a quality/perf trade.
+  const bool localWeights = shader_injection_data.mb_local_velocity_weights > 0.5;
+  // Off drops the per-tap depth fetch and both cone terms, leaving the cylinder
+  // term alone. Uniform across the dispatch, so the branch costs no divergence.
+  const bool depthTest = shader_injection_data.mb_depth_test > 0.5;
+  // Split-resolution routing. Inactive when Half Resolution is off, in which case
+  // this one full-res dispatch owns all motion and the chain is the same four
+  // dispatches as before. When it is on, the shader is dispatched TWICE with
+  // mb_gather_side flipped: side 0 owns short motion at full res, side 1 owns
+  // long motion at half res.
+  const bool splitActive = shader_injection_data.mb_halfres > 0.5;
+  const bool ownsLong = shader_injection_data.mb_gather_side > 0.5;
+  const float halfResUV = max(shader_injection_data.mb_halfres_px, 0.0) / MB_REF_H;
+  const float2 workingF = float2(workingW, workingH);
+  const int2 workingMax = int2(workingW - 1, workingH - 1);
+  const float2 motionF = float2(motionDims);
+  const int2 motionMax = motionDims - 1;
+
   // Paper pixel constants expressed in UV (see motion_blur_common.hlsli).
+  // jitterUV carries mb_frame_scale so its RATIO to |vmax| -- which is what
+  // actually determines the look -- stays constant across framerates. |vmax|
+  // arrives from neighbormax already scaled, so it must not be scaled again.
   float minVelocityUV = 0.5 / MB_REF_H;
-  float jitterUV = clamp(shader_injection_data.mb_jitter_h, 0.0, 4.0) / MB_REF_H;
+  float jitterUV = clamp(shader_injection_data.mb_jitter_h, 0.0, 4.0) / MB_REF_H
+                 * max(shader_injection_data.mb_frame_scale, 0.0);
   float gUV = max(shader_injection_data.mb_min_velocity_g, 1e-4) / MB_REF_H;
   float kUV = max(shader_injection_data.mb_center_weight_k, 1e-3) * MB_REF_H;
-  const bool localWeights = shader_injection_data.mb_local_velocity_weights > 0.5;
 
   // Depth linearization constants, hoisted out of the sample loop.
   float mulC = -proj_g[3][2];
@@ -113,6 +136,20 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
   float2 uv = (float2(p) + 0.5) / float2(workingW, workingH);
   float4 centerSample = g_srcColor[p];
+
+  // Routing happens here, before the noise load, so a pixel the other gather owns
+  // costs two fetches (colour + routing) instead of three.
+  if (splitActive) {
+    float2 routingVMax = motionValid ? g_srcNeighborMax[MBRoutingTile(uv)] : float2(0.0, 0.0);
+    if ((length(routingVMax) >= halfResUV) != ownsLong) {
+      // Not this dispatch's motion class. Always write, and write the untouched
+      // source, so that a pixel the composite misjudges at a tile boundary shows
+      // an unblurred frame rather than stale data from a previous one.
+      g_outColor[p] = centerSample;
+      return;
+    }
+  }
+
   float2 jitter = SampleJitter(p);
 
   int2 neighborTile = MBNeighborTile(uv, jitter);
@@ -128,8 +165,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
   int debugView = (int)(shader_injection_data.mb_debug_view + 0.5);
 
-  // Adaptive ladder. N comes from the bucket, bounded by Max Samples.
-  int bucket = blurred ? MBSampleBucket(vmaxLength / tileUV) : 0;
+  // Adaptive ladder. N comes from the bucket, bounded by Max Samples. Keyed to
+  // |vmax| in absolute UV, so it does not move when Max Radius does.
+  int bucket = blurred ? MBSampleBucket(vmaxLength) : 0;
 
   // ---- debug views (no filter output; alpha 1) ----
   if (debugView == 6) {
@@ -216,7 +254,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   float totalWeight = (float)sampleCount
                     / max(kUV * max(centerLength, minVelocityUV), 1e-8);
   float3 result = centerSample.rgb * totalWeight;
-  const float centerDepth = SampleLinearDepth(uv, depthDims, mulC, addC);
+  // Only fetched when the depth test will actually consume it. MBZCompare is
+  // multiplied by mb_depth_tolerance, so a very low tolerance already scales both
+  // cone terms down to near nothing while still paying one depth load per tap.
+  const float centerDepth = depthTest ? SampleLinearDepth(uv, depthDims, mulC, addC) : 0.0;
 
   // Section 4.5: Halton-jittered stratified integration. h extends the domain
   // slightly past |vmax| (the paper's "larger maximum jitter value").
@@ -237,26 +278,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float2 d = (i & 1) ? vc : wn;  // even samples follow vmax, odd follow vc
 
     float2 sampleUV = clamp(uv + T * d, 0.0, 1.0);
-    int2 sampleTexel = clamp(int2(sampleUV * float2(workingW, workingH)),
-                             int2(0, 0), int2(workingW - 1, workingH - 1));
-
-    // Fore/background classification relative to p. zCompare is symmetric, so
-    // f and b coincide; the paper's fore/background distinction is carried by
-    // the two different cone half-widths and by wA vs wB below.
-    float depthAgree = MBZCompare(centerDepth, SampleLinearDepth(sampleUV, depthDims, mulC, addC));
-
     // wB is the paper's local-velocity term: it asks whether the motion AT THIS
     // TAP agrees with the sampling direction, which is what stops foreground
-    // bleeding across a depth edge. It is the only reason to load the motion
-    // texture per tap. With it disabled we reuse the composite direction, which
-    // removes ~25 loads/pixel; the cone term then mirrors the wA term, so the
-    // weight shape does change and not just the cost. That is why it is a toggle
-    // rather than a free win.
+    // bleeding across a depth edge. Measured to be necessary for image quality,
+    // so it stays on by default and the toggle is only a future optimisation hook.
     float wA = dot(vc, d);
     float wB = wA;
     float sampleLength = centerLength;
     if (localWeights) {
-      int2 motionTexel = clamp(int2(sampleUV * float2(motionDims)), int2(0, 0), motionDims - 1);
+      int2 motionTexel = clamp(int2(sampleUV * motionF), int2(0, 0), motionMax);
       float2 sampleVelocity = MBGameMotionToUV(g_srcMotion[motionTexel]);
       wB = dot(MBNorm(sampleVelocity), d);
       sampleLength = length(sampleVelocity);
@@ -264,16 +294,36 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
     // The three phenomenological cases, each additionally weighted by how well
     // the local velocity direction agrees with the sampling direction.
-    float weight =
-        depthAgree * MBCone(T, 1.0 / max(sampleLength, 1e-6)) * max(wB, 0.0)
-      + depthAgree * MBCone(T, 1.0 / max(centerLength, 1e-6)) * max(wA, 0.0)
-      + MBCylinder(T, min(sampleLength, centerLength)) * max(wA, wB) * 2.0;
+    //
+    // MBConeByLength takes the velocity directly: the old form built 1/L and then
+    // divided by it, spending two divides per cone term for a product.
+    float weight = MBCylinder(T, min(sampleLength, centerLength)) * max(wA, wB) * 2.0;
+    if (depthTest) {
+      // Fore/background classification relative to p. zCompare is symmetric, so f
+      // and b coincide; the paper's distinction is carried by the two cone
+      // half-widths and by wA vs wB above.
+      float depthAgree = MBZCompare(centerDepth, SampleLinearDepth(sampleUV, depthDims, mulC, addC));
+      weight += depthAgree * MBConeByLength(T, sampleLength) * max(wB, 0.0)
+              + depthAgree * MBConeByLength(T, centerLength) * max(wA, 0.0);
+    }
 
+    // Colour is the most expensive fetch in the loop (8 B against 4 B for motion
+    // and depth), so it is deferred until the weight is known. A tap rejected by
+    // the depth test has weight 0 and contributes nothing, and across a
+    // high-contrast edge that is a large share of them. Identical result for
+    // finite colour, and strictly safer than before: the unconditional form
+    // evaluated colour * 0, which is NaN for a non-finite texel and would poison
+    // the whole pixel. Divergence limits the win, since a warp with a mix of
+    // accepted and rejected lanes still pays for the fetch.
     weight = max(weight, 0.0);
-    totalWeight += weight;
-    result += g_srcColor[sampleTexel].rgb * weight;
+    if (weight > 0.0) {
+      totalWeight += weight;
+      result += g_srcColor[clamp(int2(sampleUV * workingF), int2(0, 0), workingMax)].rgb * weight;
+    }
   }
 
   result = (totalWeight > 1e-6) ? result / totalWeight : centerSample.rgb;
+  // Every dispatched pixel is written, so the two gathers together always cover
+  // the frame and the composite never reads a stale texel.
   g_outColor[p] = float4(clamp(result, 0.0, 65472.0), centerSample.a);
 }

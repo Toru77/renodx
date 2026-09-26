@@ -388,6 +388,13 @@ ShaderInjectData shader_injection = {
   .mb_motion_valid = 0.f,
   .mb_debug_chain = 0.f,
   .mb_local_velocity_weights = 1.f,
+  .mb_depth_test = 1.f,
+  .mb_halfres = 0.f,
+  .mb_output_mask = 0.f,
+  .mb_gather_side = 0.f,
+  .mb_halfres_px = 10.f,
+  .mb_frame_rate_reference = 60.f,
+  .mb_frame_scale = 1.f,
 };
 
 // ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
@@ -423,8 +430,18 @@ constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 // to evict the gather's working set from L2 and push its 25 taps per pixel out
 // to DRAM, which measured as the dominant cost of the whole feature.
 enum MotionBlurPass : uint32_t {
-  kMbTileMax = 0, kMbNeighborMax = 1, kMbGather = 2,
-  kMotionBlurPassCount = 3,
+  // kMbDownsample and kMbComposite bracket the gather and only run when
+  // MotionBlurHalfRes is on. They are separate passes rather than compile-time
+  // variants of the gather because the gather itself is already resolution
+  // agnostic: every dimension it reads is either a push constant or derived from
+  // UV, so halving mb_working_w/h is all it takes to gather at half res.
+  //
+  // The composite is not optional polish: the gather's early-out writes its
+  // centre sample unchanged, so a static frame routed through the reduction would
+  // come out softened. It restores unblurred pixels from the full-res source using
+  // the mask the gather leaves in alpha.
+  kMbDownsample = 0, kMbTileMax = 1, kMbNeighborMax = 2, kMbGather = 3, kMbComposite = 4,
+  kMotionBlurPassCount = 5,
 };
 // Sora 2nd post-TAA resolve / tonemap. Registered with an EMPTY payload on
 // purpose: the game keeps running its own bytecode and we only take a per-draw
@@ -969,6 +986,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource mb_output_texture = {};       // gather result
   reshade::api::resource_view mb_output_srv = {};
   reshade::api::resource_view mb_output_uav = {};
+  // Half-resolution chain, allocated ONLY while MotionBlurHalfRes is on so the
+  // default path costs nothing. Both are ceil(W/2) x ceil(H/2).
+  reshade::api::resource mb_half_color_texture = {};   // downsampled gather input
+  reshade::api::resource_view mb_half_color_srv = {};
+  reshade::api::resource_view mb_half_color_uav = {};
+  reshade::api::resource mb_half_result_texture = {}; // half-res gather output
+  reshade::api::resource_view mb_half_result_srv = {};
+  reshade::api::resource_view mb_half_result_uav = {};
   // 1x1x1 stand-in bound at the gather's t4 when IS-FAST is off or missing, so
   // that slot is never a null descriptor.
   reshade::api::resource mb_noise_fallback_res = {};
@@ -987,6 +1012,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t mb_motion_h = 0u;   // sizes the tilemax_h intermediate
   uint32_t mb_tiles_x = 0u, mb_tiles_y = 0u;
   uint32_t mb_radius_px = 0u;
+  // Last framerate-normalisation factor written to the log, so only real changes
+  // are reported. -1 forces the first frame to log.
+  float mb_last_frame_scale = -1.f;
+  bool mb_halfres = false;         // half-res surfaces currently allocated
   reshade::api::format mb_output_fmt = reshade::api::format::unknown;
   bool mb_resources_ready = false;
   bool mb_warned_tonemap_src = false;
@@ -2060,10 +2089,45 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "MotionBlurFrameRateReference", .binding = &shader_injection.mb_frame_rate_reference,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 60.f, .label = "Frame Rate Reference", .section = "Motion Blur",
+      .tooltip = "Motion vectors are per-frame displacements, so without this the streak length, the sample ladder, the velocity threshold and the half-resolution split would all change with framerate. Setting a framerate here rescales the motion so all of them are expressed in that framerate's units, which makes the result identical at any rate. 0 turns it off. At your own framerate this does nothing. Above the reference the streak gets longer than a physical shutter would give, which is the price of a consistent look.",
+      .min = 0.f, .max = 240.f, .format = "%d",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd(); },
+      },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurHalfResThreshold", .binding = &shader_injection.mb_halfres_px,
+      .default_value = 10.f, .label = "Half Res Threshold", .section = "Motion Blur",
+      .tooltip = "Streak length, in 1080p-equivalent pixels, at which a tile switches to half resolution. Below it the gather runs at full resolution, because a streak that short is dominated by detail that half resolution has already thrown away. Above it the blur dominates and the cheaper path costs little visually. Sits where the sample ladder jumps to its most expensive rungs, so the tiles doing the most work are the ones that get cheaper. Try 4, 6 and 10.",
+      .min = 0.f, .max = 24.f, .format = "%.0f px",
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f && shader_injection.mb_halfres > 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurHalfRes", .binding = &shader_injection.mb_halfres,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 0.f, .label = "Half Resolution", .section = "Motion Blur",
+      .tooltip = "Splits the gather by motion magnitude: tiles whose streak is short run at full resolution, tiles whose streak is long run at half resolution, and the result is selected per tile rather than blended. A streak too short to see cannot hide the detail that half resolution discards, so this keeps the two aligned. Off by default because the extra full-resolution pass costs about as much as the static gather it replaces. Toggling rebuilds the buffers, costing one frame.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurDepthTest", .binding = &shader_injection.mb_depth_test,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Depth Test", .section = "Motion Blur",
+      .tooltip = "On: every tap reads the game depth and taps that disagree with the centre pixel are down-weighted, which is what separates foreground from background. Off: that fetch and the two cone terms are dropped and only the cylinder term remains, saving one texture load per tap, at the cost of bleeding across depth edges. Note Depth Tolerance already scales the same terms, so a very low value suppresses most of their effect while still paying for the fetch.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
+      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      },
+    new renodx::utils::settings::Setting{
       .key = "MotionBlurLocalVelocity", .binding = &shader_injection.mb_local_velocity_weights,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Local Velocity Weights", .section = "Motion Blur",
-      .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather) at the cost of more bleeding. A/B it on a high-contrast edge.",
+      .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather). A/B it on a high-contrast edge.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.mb_mode >= 0.5f; },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
@@ -6467,12 +6531,15 @@ static void DestroyMotionBlurSet(reshade::api::device* dev, DeviceData* d) {
   dv(d->mb_tilemax_h_srv); dv(d->mb_tilemax_h_uav); dr(d->mb_tilemax_h_texture);
   dv(d->mb_tilemax_srv); dv(d->mb_tilemax_uav); dr(d->mb_tilemax_texture);
   dv(d->mb_neighbormax_srv); dv(d->mb_neighbormax_uav); dr(d->mb_neighbormax_texture);
+  dv(d->mb_half_color_srv); dv(d->mb_half_color_uav); dr(d->mb_half_color_texture);
+  dv(d->mb_half_result_srv); dv(d->mb_half_result_uav); dr(d->mb_half_result_texture);
   dv(d->mb_output_srv); dv(d->mb_output_uav); dr(d->mb_output_texture);
   d->mb_working_w = 0u; d->mb_working_h = 0u;
   d->mb_motion_h = 0u;
   d->mb_tiles_x = 0u; d->mb_tiles_y = 0u;
   d->mb_radius_px = 0u;
   d->mb_output_fmt = reshade::api::format::unknown;
+  d->mb_halfres = false;
   d->mb_resources_ready = false;
   d->mb_prep_valid = false;
 }
@@ -6504,9 +6571,10 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
   // ShaderInjectData rather than a hand-mapped subset, because the motion blur
   // shaders include shared.h and read the mb_* fields directly — one source of
   // truth, no per-shader re-declaration to drift.
-  static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 5u};
+  static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 1u, 5u, 2u};
   static const std::span<const uint8_t> kBytecode[kMotionBlurPassCount] = {
-      __motion_blur_tilemax, __motion_blur_neighbormax, __motion_blur_gather};
+      __motion_blur_downsample, __motion_blur_tilemax, __motion_blur_neighbormax,
+      __motion_blur_gather, __motion_blur_composite};
   for (uint32_t pass = 0; pass < kMotionBlurPassCount; ++pass) {
     if (d->mb_layouts[pass].handle == 0u) {
       DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
@@ -6587,7 +6655,7 @@ static bool EnsureMotionBlurNoiseFallback(reshade::api::device* dev, DeviceData*
 static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
                                 uint32_t workingW, uint32_t workingH,
                                 uint32_t motionH, uint32_t tilesX, uint32_t tilesY,
-                                reshade::api::format outputFormat) {
+                                reshade::api::format outputFormat, bool halfRes) {
   DestroyMotionBlurSet(dev, d);
   if (!dev || !d) return;
   auto mk = [&](uint32_t w, uint32_t h, reshade::api::format fmt,
@@ -6624,7 +6692,7 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   // that justified R16G16F applied to the full-resolution velocity intermediate,
   // which no longer exists. The shaders declare float2 over this, taking .xy.
   const auto tileFmt = reshade::api::format::r16g16b16a16_float;
-  const bool ok =
+  const bool tileOk =
      mk(tilesX, std::max(motionH, 1u), tileFmt,
         &d->mb_tilemax_h_texture, &d->mb_tilemax_h_srv, &d->mb_tilemax_h_uav)
    && mk(tilesX, tilesY, tileFmt,
@@ -6633,6 +6701,18 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
         &d->mb_neighbormax_texture, &d->mb_neighbormax_srv, &d->mb_neighbormax_uav)
    && mk(workingW, workingH, outputFormat,
         &d->mb_output_texture, &d->mb_output_srv, &d->mb_output_uav);
+  // Half-res surfaces are optional and only exist while the toggle is on, so the
+  // default path allocates nothing extra. They use the blit's own format so the
+  // gather input and output match what the final reconstruct expects.
+  const uint32_t halfW = std::max(1u, (workingW + 1u) / 2u);
+  const uint32_t halfH = std::max(1u, (workingH + 1u) / 2u);
+  bool ok = tileOk;
+  if (ok && halfRes) {
+    ok = mk(halfW, halfH, outputFormat,
+            &d->mb_half_color_texture, &d->mb_half_color_srv, &d->mb_half_color_uav)
+      && mk(halfW, halfH, outputFormat,
+            &d->mb_half_result_texture, &d->mb_half_result_srv, &d->mb_half_result_uav);
+  }
   if (!ok) {
     DestroyMotionBlurSet(dev, d);
     return;
@@ -6642,7 +6722,45 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   d->mb_tiles_x = tilesX; d->mb_tiles_y = tilesY;
   d->mb_radius_px = static_cast<uint32_t>(std::max(shader_injection.mb_max_radius_px, 8.f));
   d->mb_output_fmt = outputFormat;
+  d->mb_halfres = halfRes;
   d->mb_resources_ready = true;
+}
+
+// Framerate normalisation. A motion vector is a per-frame displacement, so a
+// camera crossing the same point covers half as many pixels at 120 fps as at 60.
+// Every length in this filter derives from that vector -- the streak, the ladder
+// buckets, the early-out threshold, and the half-resolution split -- so all of
+// them would move with framerate. Scaling the velocity by
+// (reference interval / actual interval) puts them into reference-frame units in
+// one place and makes every one of those thresholds framerate-independent for
+// free. That is the point: patching the split threshold alone would have fixed
+// the reported symptom and left the streak, the ladder and the early-out still
+// rate-dependent.
+//
+// Timing mirrors starfield's AdvanceEyeAdaptationClock (steady_clock, 1/60
+// default, rejecting non-positive and absurd deltas) with two differences that
+// matter here: an EMA instead of a raw delta, so a single stall cannot change
+// the blur length, and a relative rejection band that still admits a genuine 2x
+// framerate change -- a tighter band would refuse to converge on exactly the
+// case this exists to handle.
+//
+// This measures the RENDER rate, not the display rate. For normally-paced games
+// they agree; a game rendering internally faster than it presents would size the
+// streak for the render rate. Reading the swapchain's present count would fix
+// that and is far more machinery than this is worth.
+static float MotionBlurFrameScale() {
+  const float referenceFps = shader_injection.mb_frame_rate_reference;
+  if (referenceFps <= 0.5f) return 1.0f;
+  static std::chrono::steady_clock::time_point last{};
+  static float smoothed = 0.0f;  // seconds
+  const auto now = std::chrono::steady_clock::now();
+  const float dt = std::chrono::duration<float>(now - last).count();
+  last = now;
+  if (dt > 0.0f && dt < 0.5f && (smoothed <= 0.0f || dt <= smoothed * 3.0f)) {
+    smoothed = (smoothed <= 0.0f) ? dt : smoothed + (dt - smoothed) * 0.1f;
+  }
+  if (smoothed <= 0.0f) return 1.0f;  // not warmed up yet
+  return std::clamp((1.0f / referenceFps) / smoothed, 0.25f, 4.0f);
 }
 
 // Resolves the game's depth and motion inputs, recreates the owned set when
@@ -6725,6 +6843,10 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   const uint32_t tilePx = std::max(1u, radiusPx * 2u);
   const uint32_t tilesX = std::max(1u, (workingW + tilePx - 1u) / tilePx);
   const uint32_t tilesY = std::max(1u, (workingH + tilePx - 1u) / tilePx);
+  // The half-res surfaces are part of the owned set, so toggling the setting has
+  // to rebuild it. That is the same one-frame hitch Max Radius already causes and
+  // is why the surfaces are not simply kept allocated while unused.
+  const bool halfRes = shader_injection.mb_halfres > 0.5f;
   // Depth and motion dimensions are no longer resource-sizing inputs: the
   // gather samples the game's textures directly and the conversion scale is a
   // per-frame push. Only motionH still matters, because it is the height of the
@@ -6735,9 +6857,10 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
       || d->mb_motion_h != motionH
       || d->mb_tiles_x != tilesX || d->mb_tiles_y != tilesY
       || d->mb_radius_px != radiusPx
+      || d->mb_halfres != halfRes
       || d->mb_output_fmt != outputFormat;
   if (needRecreate) {
-    CreateMotionBlurSet(dev, d, workingW, workingH, motionH, tilesX, tilesY, outputFormat);
+    CreateMotionBlurSet(dev, d, workingW, workingH, motionH, tilesX, tilesY, outputFormat, halfRes);
     if (!d->mb_resources_ready) return false;
   }
 
@@ -6756,6 +6879,24 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   // Availability only; the user's mb_jitter_source choice is never overwritten,
   // so it survives the volume being briefly unavailable.
   shader_injection.mb_jitter_ready = d->isfast_noise_srv.handle != 0u ? 1.f : 0.f;
+  // Default so the single-dispatch full-res path is correct without the dispatch
+  // having to remember to clear it; RunMotionBlur flips it around the half-res
+  // gather when the split is active.
+  shader_injection.mb_gather_side = 0.f;
+  // Once per frame here, at the top of the push block, because MBGameMotionToUV
+  // reads it in every shader of the chain. 1.0 at the reference rate, so the
+  // default is a no-op there.
+  shader_injection.mb_frame_scale = MotionBlurFrameScale();
+  // Log movement in the factor. A clamp or a value stuck at 1.0 would otherwise
+  // silently disable the compensation with nothing on screen to say so, and
+  // "which framerate is it actually normalising to" is otherwise unobservable.
+  if (std::fabs(shader_injection.mb_frame_scale - d->mb_last_frame_scale) >= 0.1f) {
+    d->mb_last_frame_scale = shader_injection.mb_frame_scale;
+    reshade::log::message(reshade::log::level::info,
+        ("[MotionBlur] frame scale " + std::to_string(shader_injection.mb_frame_scale)
+         + " (reference " + std::to_string(static_cast<int>(
+                shader_injection.mb_frame_rate_reference)) + " fps)").c_str());
+  }
   return true;
 }
 
@@ -6796,6 +6937,14 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   const uint32_t W = d->mb_working_w, H = d->mb_working_h;
   const uint32_t MH = std::max(d->mb_motion_h, 1u);
   const uint32_t TX = d->mb_tiles_x, TY = d->mb_tiles_y;
+  // Half res is a whole-pipeline decision, not a gather-only one, so it is
+  // resolved from the ALLOCATED surfaces rather than from the setting. If those
+  // are missing the chain silently runs full res instead of dispatching against
+  // null descriptors.
+  const bool halfRes = d->mb_halfres
+      && d->mb_half_color_uav.handle != 0u && d->mb_half_result_uav.handle != 0u;
+  const uint32_t GW = halfRes ? std::max(1u, (W + 1u) / 2u) : W;  // gather resolution
+  const uint32_t GH = halfRes ? std::max(1u, (H + 1u) / 2u) : H;
   reshade::api::resource_view depthSrc =
       d->captured_depth_srv.handle != 0u ? d->captured_depth_srv : d->fallback_srv;
   // motionSrc is supplied by PrepareMotionBlur and is the same view
@@ -6808,15 +6957,17 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   // because every gate in this chain is already a CPU decision (including the
   // TileMax axis), and because "Gather Only" must not touch passes 1-5 at all.
   //
-  //   chain | prep valid | runPrep | runGather
-  //   ------+------------+---------+-----------
-  //     0   |     -      |   yes   |    yes    (Full)
-  //     1   |     -      |   yes   |    no     (Prep Only)
-  //     2   |    yes     |   no    |    yes    (Gather Only)
-  //     2   |     no     |   yes   |    yes    (fallback to Full)
+  //   chain | prep valid | runPrep | runGather | half-res downsample
+  //   ------+------------+---------+-----------+---------------------
+  //     0   |     -      |   yes   |    yes    | yes
+  //     1   |     -      |   yes   |    no     | no (output unused)
+  //     2   |    yes     |   no    |    yes    | no (stale colour reused)
+  //     2   |     no     |   yes   |    yes    | yes (fallback to Full)
   //
   // The fallback avoids a misleading result on the first frame after the owned
-  // set is rebuilt, when no prep pass has run against the new textures.
+  // set is rebuilt, when no prep pass has run against the new textures. Gather
+  // Only reuses the previous frame's downsampled colour, exactly as it already
+  // reuses a stale neighbormax: it is a timing mode, not a correctness one.
   const int chain = static_cast<int>(shader_injection.mb_debug_chain + 0.5f);
   const bool gatherOnly = (chain == 2) && d->mb_prep_valid;
   if (chain != d->mb_last_chain) {
@@ -6836,6 +6987,16 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   const bool runPrep = !gatherOnly;
   const bool runGather = (chain != 1);
 
+  if (runGather && halfRes) {
+    // P0: reduce the colour input the half-res gather will read. Runs at FULL
+    // working dims, which is what this shader reads to derive its own destination
+    // size. The gather is left at full dims: the full-res gather needs them.
+    cl->bind_pipeline(AC, d->mb_pipelines[kMbDownsample]);
+    reshade::api::resource_view srvs[1] = {colorSrc};
+    apply(kMbDownsample, srvs, 1, d->mb_half_color_uav);
+    cl->dispatch((GW + 7u) / 8u, (GH + 7u) / 8u, 1u);
+    bar(d->mb_half_color_texture, UA, SR);
+  }
   if (runPrep) {
   {  // P1: TileMax, horizontal (separable, paper Section 3) over game motion
     cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
@@ -6862,14 +7023,48 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   }
     d->mb_prep_valid = true;
   }
-  if (runGather) {  // P4: the gather
-    cl->bind_pipeline(AC, d->mb_pipelines[kMbGather]);
+  if (runGather) {
     reshade::api::resource_view noise = d->isfast_noise_srv.handle != 0u
         ? d->isfast_noise_srv : d->mb_noise_fallback_srv;
-    reshade::api::resource_view srvs[5] = {colorSrc, motionSrc, d->mb_neighbormax_srv,
-                                           depthSrc, noise};
-    apply(kMbGather, srvs, 5, d->mb_output_uav);
+
+    // P4: full-res gather, owns the SHORT-motion tiles. Writes every pixel:
+    // blurred where it owns them, untouched source where it does not, so the
+    // composite never reads a stale texel and a boundary misjudgement shows an
+    // unblurred frame rather than a ghost.
+    cl->bind_pipeline(AC, d->mb_pipelines[kMbGather]);
+    shader_injection.mb_gather_side = 0.f;
+    reshade::api::resource_view fullSrvs[5] = {colorSrc, motionSrc, d->mb_neighbormax_srv,
+                                                depthSrc, noise};
+    apply(kMbGather, fullSrvs, 5, d->mb_output_uav);
     cl->dispatch((W + 7u) / 8u, (H + 7u) / 8u, 1u);
+
+    if (halfRes) {
+      // The prep passes are agnostic (tilemax reads mb_motion_w/h and
+      // mb_tiles_x/y, neighbormax reads mb_tiles_x/y), so this is the only point
+      // where the gather resolution is halved.
+      shader_injection.mb_working_w = static_cast<float>(GW);
+      shader_injection.mb_working_h = static_cast<float>(GH);
+      // P5: same shader, other half of the partition, at half resolution. The
+      // routing test inside the shader keeps it off the short-motion tiles.
+      cl->bind_pipeline(AC, d->mb_pipelines[kMbGather]);
+      shader_injection.mb_gather_side = 1.f;
+      reshade::api::resource_view halfSrvs[5] = {d->mb_half_color_srv, motionSrc,
+                                                  d->mb_neighbormax_srv, depthSrc, noise};
+      apply(kMbGather, halfSrvs, 5, d->mb_half_result_uav);
+      cl->dispatch((GW + 7u) / 8u, (GH + 7u) / 8u, 1u);
+      bar(d->mb_half_result_texture, UA, SR);
+      // Full resolution back for the composite, which derives the half size itself.
+      shader_injection.mb_working_w = static_cast<float>(W);
+      shader_injection.mb_working_h = static_cast<float>(H);
+      // P6: write-only overlay. It overwrites ONLY the long-motion tiles with the
+      // half-res result and never reads mb_output_texture, so a UAV barrier between
+      // the two writers is sufficient and no second full-res buffer is needed.
+      cl->bind_pipeline(AC, d->mb_pipelines[kMbComposite]);
+      bar(d->mb_output_texture, UA, UA);
+      reshade::api::resource_view cmp[2] = {d->mb_neighbormax_srv, d->mb_half_result_srv};
+      apply(kMbComposite, cmp, 2, d->mb_output_uav);
+      cl->dispatch((W + 7u) / 8u, (H + 7u) / 8u, 1u);
+    }
     bar(d->mb_output_texture, UA, SR);
   } else {
     // Nothing was produced, so the caller must not publish. Returning an empty

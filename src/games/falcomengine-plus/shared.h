@@ -446,10 +446,46 @@ struct ShaderInjectData {
   // valid cost measurement while the scene is moving.
   float mb_debug_chain;
   // 0/1, default 1. When 0 the gather stops loading the motion texture per tap and
-  // weights by the composite direction instead: ~25 fewer loads/pixel, at the cost
-  // of the paper's local-velocity feature awareness (more foreground bleeding).
-  // Appended at the tail so no existing packoffset moves.
+  // weights by the composite direction instead: ~25 fewer loads/pixel. Measured to
+  // cost visible foreground bleeding, so it is treated as a quality feature and this
+  // is kept only as a hook for a future optimisation pass.
   float mb_local_velocity_weights;
+  // 0/1, default 1. When 0 the gather skips the per-tap depth fetch and both cone
+  // terms, weighting by the cylinder term alone: one fewer load per tap. Costs
+  // foreground/background separation, and note MBZCompare is scaled by
+  // mb_depth_tolerance, so a very low tolerance already suppresses the cone terms
+  // while still paying for the fetch.
+  float mb_depth_test;
+  // 0/1, default 0. Gathers at half resolution and bilinearly reconstructs to the
+  // blit target. Roughly quarters the gather's pixel count, which is ~80% of the
+  // moving-frame cost, at the price of blending four pixels before the depth test
+  // sees them: edges soften and can ghost on high-contrast depth discontinuities.
+  // Off by default for that reason.
+  float mb_halfres;
+  // 0/1, default 0. DEPRECATED, unread: an earlier half-res design had the gather
+  // report "did this pixel blur" in its output alpha so a composite could blend
+  // untouched pixels back at full resolution. The split-resolution design selects
+  // per tile instead, so nothing reads alpha. Kept so later packoffsets do not move.
+  float mb_output_mask;
+  // 0/1, default 0. Which motion class this gather dispatch owns: 0 = short
+  // motion at full resolution, 1 = long motion at half resolution. The gather
+  // shader is dispatched twice with this flipped when Half Resolution is on, and
+  // the routing test itself is bypassed when it is off, in which case a single
+  // full-res dispatch owns all motion.
+  float mb_gather_side;
+  float mb_halfres_px;           // [0..24], default 10 — 1080-reference pixels of
+                                  // streak at which a tile moves to half resolution.
+                                  // Sits where the sample ladder jumps to 16 taps, so
+                                  // the most expensive rungs take the cheap path.
+  float mb_frame_rate_reference;  // [0..240], default 60 — framerate the motion is
+                                  // normalised TO, in fps. 0 disables normalisation.
+  float mb_frame_scale;           // runtime: (1/referenceFps) / smoothedFrameInterval,
+                                  // clamped to [0.25..4]. Motion vectors are per-frame
+                                  // displacements, so without this the streak, the
+                                  // ladder buckets, the early-out and the half-res split
+                                  // would all change with framerate. Applying it once,
+                                  // in MBGameMotionToUV, puts all of them into
+                                  // reference-frame units together. 1.0 = no-op.
 };
 
 #ifndef __cplusplus

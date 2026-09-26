@@ -60,12 +60,21 @@ float2 MBNorm(float2 v) {
 // Paper "rnmix": linear interpolation followed by normalization.
 float2 MBRNMix(float2 a, float2 b, float t) { return MBNorm(lerp(a, b, t)); }
 
-// Paper "cone" (McGuire et al. 2012): linear falloff of half-width `halfWidth`.
-float MBCone(float t, float halfWidth) {
-  return max(0.0, 1.0 - abs(t) / max(halfWidth, 1e-6));
+// Paper "cone" (McGuire et al. 2012): linear falloff over a domain of half-width
+// `halfWidth`, i.e. max(0, 1 - |t|/halfWidth).
+//
+// Every call site passed halfWidth as 1/L for a velocity L, which cost a divide to
+// build the reciprocal and a second divide to apply it. Since
+//     1 - |t| / (1/L)  ==  1 - |t| * L
+// the length is taken directly and the pair of divides collapses to a multiply.
+// Two of these per tap is 2x16 divides per pixel saved at the default tap count.
+float MBConeByLength(float t, float len) {
+  return max(0.0, 1.0 - abs(t) * len);
 }
 
 // Paper "cylinder" (McGuire et al. 2012): quadratic falloff of half-width.
+// Unlike the cone this is already one divide (t/L squared), so there is nothing
+// to reclaim without changing the arithmetic.
 float MBCylinder(float t, float halfWidth) {
   float w = max(halfWidth, 1e-6);
   float x = t / w;
@@ -140,16 +149,42 @@ float2 MBJitterHalton(int2 p) {
 // engine's per-frame jitter delta then dominates and the result crawls. The
 // gather applies the shutter to the integration domain instead, where it
 // belongs.
+//
+// mb_frame_scale IS applied here, and this is the single place it is applied.
+// Motion vectors are per-frame displacements, so a camera crossing the same
+// point covers half as many pixels at 120 fps as at 60. Every length in this
+// filter is derived from that vector -- the streak, the ladder buckets, the
+// early-out, and the half-resolution split -- so they would all move with
+// framerate. Scaling once, here, puts TileMax, NeighborMax and the gather's
+// per-pixel reads into the same reference-frame units, and every downstream
+// threshold becomes framerate-independent for free. Scaling it anywhere else
+// would double-apply it: vmax arrives from neighbormax already converted.
 float2 MBGameMotionToUV(float2 motionPx) {
   float2 dims = max(float2(shader_injection_data.mb_motion_w,
                             shader_injection_data.mb_motion_h), float2(1.0, 1.0));
-  float2 velocity = motionPx / dims;
+  float2 velocity = motionPx / dims * max(shader_injection_data.mb_frame_scale, 0.0);
   // Paper Section 3: the sample domain is 1D along vmax and the tile is r, so
   // clamping |v| at r is what preserves the "a pixel is at most influenced by
   // its 1-ring neighbouring tiles" property the whole filter relies on.
   float maxLength = max(shader_injection_data.mb_tile_uv, 1e-8);
   float len = length(velocity);
   return (len > maxLength) ? (velocity * (maxLength / len)) : velocity;
+}
+
+// ── split-resolution routing ──
+// Which resolution owns a pixel. Deliberately JITTER-FREE: every pass that makes
+// this decision must reach the same answer, and the filter's own lookup below is
+// jittered, so routing cannot reuse it. It works in UV, so it is resolution
+// independent and the full-res and half-res gathers agree on the same tile even
+// though their pixel indices, and therefore their Halton/IS-FAST jitter, differ.
+//
+// Per-tile rather than per-pixel is what makes the agreement possible, and it
+// also means a gather rejects whole 8x8 groups with no intra-warp divergence. The
+// cost is that the resolution switch is quantised to the tile grid.
+int2 MBRoutingTile(float2 uv) {
+  float2 tiles = max(float2(shader_injection_data.mb_tiles_x,
+                            shader_injection_data.mb_tiles_y), 1.0);
+  return clamp(int2(uv * tiles), int2(0, 0), int2(tiles) - 1);
 }
 
 // ── Section 4.2 stochastic on-axis NeighborMax lookup ──
@@ -184,12 +219,20 @@ int2 MBNeighborTile(float2 uv, float2 jitter) {
 // grid. It is not guaranteed uniform within a tile: the Section 4.2 stochastic
 // border lookup can split a tile boundary between two buckets, so warp
 // divergence is limited and clustered, not per pixel.
-int MBSampleBucket(float vmaxRatio) {
-  if (vmaxRatio < 0.20f) return 1;
-  if (vmaxRatio < 0.40f) return 2;
-  if (vmaxRatio < 0.60f) return 3;
-  if (vmaxRatio < 0.80f) return 4;
-  if (vmaxRatio < 1.00f) return 5;
+//
+// The count is keyed to |vmax| in 1080-REFERENCE PIXELS, deliberately NOT as a
+// fraction of the tile radius. Keying it to tileUV coupled the tap count to an
+// unrelated setting: dropping Max Radius from 40 to 24 moved the thresholds from
+// 8/16/24/32/40 px down to 4.8/9.6/14.4/19.2/24, which pushed an entire moving
+// scene onto the 12-16 tap rungs and cancelled most of the ladder's saving. How
+// many taps a pixel needs is a function of how much smear is happening there,
+// nothing else.
+int MBSampleBucket(float vmaxUV) {
+  if (vmaxUV < 1.5f / MB_REF_H) return 1;
+  if (vmaxUV < 3.0f / MB_REF_H) return 2;
+  if (vmaxUV < 6.0f / MB_REF_H) return 3;
+  if (vmaxUV < 10.0f / MB_REF_H) return 4;
+  if (vmaxUV < 16.0f / MB_REF_H) return 5;
   return 6;
 }
 
@@ -197,12 +240,17 @@ int MBSampleBucket(float vmaxRatio) {
 // Returning max(maxSamples, 20) instead would let a ceiling of 8 emit 20 taps,
 // which inverts the setting. Pinning maxSamples to 4 clamps every rung to 4,
 // which is how a fixed low tap count is requested.
+//
+// NOTE: with a per-pixel bound a warp runs to its longest member, so the realised
+// saving is bounded by divergence rather than by the mean. Rungs are tile-coherent
+// and 8x8 groups sit well inside a tile, so that is expected to be mild, but the
+// ladder's payoff is not strictly linear in the average tap count.
 uint MBSampleCount(int bucket, uint maxSamples) {
   uint n = 4u;
-  if (bucket == 2) n = 8u;
-  else if (bucket == 3) n = 12u;
-  else if (bucket == 4) n = 16u;
-  else if (bucket == 5) n = 20u;
+  if (bucket == 2) n = 6u;
+  else if (bucket == 3) n = 8u;
+  else if (bucket == 4) n = 12u;
+  else if (bucket == 5) n = 16u;
   else if (bucket >= 6) n = maxSamples;
   return clamp(n, 4u, max(maxSamples, 4u));
 }
