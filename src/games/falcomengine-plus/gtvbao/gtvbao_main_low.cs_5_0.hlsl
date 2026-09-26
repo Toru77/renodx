@@ -226,13 +226,19 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
   GTAOConstants consts = BuildGTAOConstants(uint2(width, height));
 
   uint noise_idx = consts.NoiseIndex < 0 ? 0u : (uint)consts.NoiseIndex;
+  // Half mode evaluates on a half-res grid, so index the noise at full-res
+  // frequency. Indexing with the output coordinate instead magnifies the
+  // pattern 2x on screen (the Hilbert 64x64 tile would cover 128x128 full-res
+  // pixels), which reads as coarse mottling on flat surfaces rather than the
+  // fine dither it is meant to be.
+  const uint2 noiseP = (GTVBAO_resolution > 0.5f) ? (pixCoord * 2u) : pixCoord;
   lpfloat2 n;
   if (g_isfast_enabled > 0.5f) {
-    if (GTVBAO_noise_type < 0.5f)      n = SpatioTemporalNoise_ISFAST(pixCoord, noise_idx);
-    else if (GTVBAO_noise_type < 1.5f) n = SpatioTemporalNoise_IGN(pixCoord, noise_idx);
-    else                               n = SpatioTemporalNoise_Hilbert(pixCoord, noise_idx);
+    if (GTVBAO_noise_type < 0.5f)      n = SpatioTemporalNoise_ISFAST(noiseP, noise_idx);
+    else if (GTVBAO_noise_type < 1.5f) n = SpatioTemporalNoise_IGN(noiseP, noise_idx);
+    else                               n = SpatioTemporalNoise_Hilbert(noiseP, noise_idx);
   } else {
-    n = SpatioTemporalNoise_Hilbert(pixCoord, noise_idx);
+    n = SpatioTemporalNoise_Hilbert(noiseP, noise_idx);
   }
 
   lpfloat3 normal = (lpfloat3)BuildSelectedInputNormal(pixCoord, uint2(width, height), consts);

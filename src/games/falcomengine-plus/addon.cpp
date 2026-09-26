@@ -2395,7 +2395,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousDepthSigma", .binding = &shader_injection.gtvbao_atrous_depth_sigma,
-      .default_value = 0.5f, .label = "À-Trous Depth Stop", .section = "GTVBAO",
+      .default_value = 1.0f, .label = "À-Trous Depth Stop", .section = "GTVBAO",
       .tooltip = "Depth edge sensitivity for the à-trous filter. Higher = smoother across depth steps (more leak).",
       .min = 0.05f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
