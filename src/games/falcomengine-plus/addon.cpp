@@ -2261,7 +2261,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "MotionBlurMotionVectorInput", .binding = &g_mb_motion_input,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Motion Vector Input", .section = "Motion Blur",
+      .default_value = 0.f, .label = "Motion Vector Input", .section = "Motion Blur",
       .tooltip = "Where the blur reads its motion vectors from. TAA Motion Buffer is the copy the anti-aliasing pass reads, and is the safe default. Game RTV is the engine's own motion output, which is the only source available when anti-aliasing is switched off; the blur makes its own view onto it, so it is worth trying if the blur is missing without anti-aliasing. Both hold the same values, so they should look identical. Kai has no anti-aliasing in this addon, so it always reads the render target.",
       // Index order must match the tests: < 0.5 selects the render target, >= 0.5
       // selects TAA t3. The default is therefore 1, which is why TAA is the
@@ -2276,7 +2276,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "MotionBlurQuality", .binding = &g_mb_quality,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Quality", .section = "Motion Blur",
+      .default_value = 2.f, .label = "Quality", .section = "Motion Blur",
       .tooltip = "How many times a pixel gets sampled while blurring, which keeps fast movement smooth instead of steppy, at a performance cost.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return MotionBlurActive(true); },
@@ -2841,7 +2841,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
+      .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
       .tooltip = "Half is recommended at high or native resolutions, but it halves whatever resolution you render at, so it can get very low when upscaling is enabled.",
       .labels = {"Full", "Half"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },

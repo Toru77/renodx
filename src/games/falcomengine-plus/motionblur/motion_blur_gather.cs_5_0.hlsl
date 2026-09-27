@@ -70,13 +70,18 @@ RWTexture2D<float4>  g_outColor       : register(u0);
 //
 // Filtering DEPTH would be wrong even though the depth buffer is the more blocky
 // of the two when it is smaller than colour. An interpolated depth across a
-// silhouette belongs to no real surface, and MBZCompare would then accept taps it
-// should reject, which reads as halos and light leaking around object edges. Note
+// silhouette belongs to no real surface, and the relative-depth test would then
+// accept taps it should reject, which reads as halos and light leaking around
+// object edges. Note
 // that this is not a correctness gap: every read addresses by normalised UV
 // against this texture's OWN dimensions, so a resolution mismatch is already
 // handled exactly. What a mismatch costs is only the stair-stepping on the
 // boundary where the depth test cuts motion off, and that is a deliberate trade
 // for a clean silhouette. The addon reports whether it happened in the log.
+//
+// Only the Depth debug view still needs a linearized distance. The tap loop does
+// not: it compares u = addC - rawDepth directly, which is the same relative test
+// with the linearization cancelled out. See the note at the tap's depth test.
 float SampleLinearDepth(float2 uv, int2 dims, float mulC, float addC) {
   int2 texel = clamp(int2(uv * float2(dims)), int2(0, 0), dims - 1);
   float denom = addC - g_srcDepth[texel];
@@ -188,6 +193,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   const int2 workingMax = int2(workingW - 1, workingH - 1);
   const float2 motionF = float2(motionDims);
   const int2 motionMax = motionDims - 1;
+  // The tap loop's motionPx -> UV conversion factor, hoisted out of the loop.
+  // MBGameMotionToUV evaluates `motionPx / dims * max(frame_scale, 0)` on every
+  // call, so leaving it in the tap loop costs a float2 divide per tap for a
+  // factor that is constant for the whole pixel. max(motionDims, 1) reproduces
+  // the guard MBGameMotionToUV applies, so a zero-sized buffer still cannot
+  // divide by zero. The tap loop multiplies by this directly; see the note
+  // there for why it also drops that function's clamp.
+  const float2 motionInvScale = max(shader_injection_data.mb_frame_scale, 0.0)
+                              / max(float2(motionDims), float2(1.0, 1.0));
 
   // Paper pixel constants expressed in UV (see motion_blur_common.hlsli).
   // jitterUV carries mb_frame_scale so its RATIO to |vmax| -- which is what
@@ -393,13 +407,35 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   // because buckets are tile-coherent (see MBSampleBucket).
   const int maxSamples = clamp((int)(shader_injection_data.mb_sample_count + 0.5), 4, 48);
   const int sampleCount = (int)MBSampleCount(bucket, (uint)maxSamples);
+  // Stratified sample positions, hoisted. The naive form is
+  //   lerp(-1, 1, (i + jitter.x + 1) / (sampleCount + 1))
+  // which is one divide PER TAP even though the divisor depends only on this
+  // pixel's bucket. Rewritten in closed form -- 2*((i + j + 1) / (N+1)) - 1
+  // expands to (i + j + 1) * stepT - 1 -- so the divide happens once and the tap
+  // becomes a single mad.
+  //
+  // Closed form, NOT an accumulator: `T += stepT` would drift across the loop and
+  // cost the same add. `mad` keeps it to one instruction and stays exact.
+  const float stepT = 2.0 / (float)(sampleCount + 1);
+  const float baseT = -1.0 + (jitter.x + 1.0) * stepT;
   float totalWeight = (float)sampleCount
                     / max(kUV * max(centerLength, minVelocityUV), 1e-8);
   float3 result = centerSample.rgb * totalWeight;
-  // Only fetched when the depth test will actually consume it. MBZCompare is
-  // multiplied by mb_depth_tolerance, so a very low tolerance already scales both
-  // cone terms down to near nothing while still paying one depth load per tap.
-  const float centerDepth = depthTest ? SampleLinearDepth(uv, depthDims, mulC, addC) : 0.0;
+  // Only fetched when the depth test will actually consume it. The depth
+  // agreement is multiplied by mb_depth_tolerance, so a very low tolerance
+  // already scales both cone terms down to near nothing while still paying one
+  // depth load per tap.
+  //
+  // Stored as u = addC - rawDepth, NOT as a linearized distance. See the note at
+  // the tap's depth test for the algebra; the short version is that
+  // |za-zb|/min(za,zb) is invariant under the fractional-linear map
+  // z = mulC/u, so the relative comparison never needed linear depth at all.
+  // u also costs one subtract per tap where SampleLinearDepth cost a divide plus
+  // a guard divide.
+  const float centerURaw = depthTest
+      ? (addC - g_srcDepth[clamp(int2(uv * float2(depthDims)), int2(0, 0), depthDims - 1)])
+      : 0.0;
+  const float centerAbsU = abs(centerURaw);
 
   // Section 4.5: Halton-jittered stratified integration. h extends the domain
   // slightly past |vmax| (the paper's "larger maximum jitter value").
@@ -414,12 +450,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
   [loop]
   for (int i = 0; i < sampleCount; ++i) {
-    // lerp, not mix: mix is a pixel-stage intrinsic and this is a compute shader.
-    float t = lerp(-1.0, 1.0, ((float)i + jitter.x + 1.0) / (float)(sampleCount + 1));
-    float T = t * maxT;
+    // Closed form of lerp(-1, 1, (i + jitter.x + 1) / (sampleCount + 1)), with the
+    // divide hoisted into stepT/baseT above. mad, not mix: mix is a pixel-stage
+    // intrinsic and this is a compute shader.
+    float T = mad((float)i, stepT, baseT) * maxT;
     float2 d = (i & 1) ? vc : wn;  // even samples follow vmax, odd follow vc
 
-    float2 sampleUV = clamp(uv + T * d, 0.0, 1.0);
+    // No clamp on sampleUV. Every consumer below re-derives its own texel and
+    // clamps that index: the motion read clamps to motionMax, the depth read and
+    // the colour read clamp to their own dims-1. The outer clamp was therefore
+    // unreachable work. It also never protected the float itself -- |T| <= maxT
+    // bounds the excursion to at most one tile, so sampleUV can leave [0,1] by
+    // less than that and the inner clamps absorb it.
+    float2 sampleUV = uv + T * d;
     // wB is the paper's local-velocity term: it asks whether the motion AT THIS
     // TAP agrees with the sampling direction, which is what stops foreground
     // bleeding across a depth edge. Measured to be necessary for image quality,
@@ -429,7 +472,23 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float sampleLength = centerLength;
     if (localWeights) {
       int2 motionTexel = clamp(int2(sampleUV * motionF), int2(0, 0), motionMax);
-        float2 sampleVelocity = MBGameMotionToUV(g_srcMotion[motionTexel].xy);
+      // Not MBGameMotionToUV. Two reasons, both about t1 specifically:
+      //
+      //   1. Its clamp is dead here. It bounds |v| to mb_tile_uv, and
+      //      motion_blur_resolve already clamped .xy to that same inequality in
+      //      PIXEL units (maxPx = mb_tile_uv * |dims| / frame_scale, which is the
+      //      same condition after dividing by dims and multiplying by
+      //      frame_scale). RunMotionBlur only ever binds t1 to mb_resolve_srv --
+      //      the resolve output -- because mb_resolve_uav is allocated
+      //      unconditionally and RunMotionBlur returns early when the owned set
+      //      is missing. The clamp can never fire, so its length() and divide are
+      //      dead weight per tap.
+      //   2. The scale is loop-invariant, so it is applied from motionInvScale.
+      //
+      // The velocity debug views deliberately do NOT take this path: view 8
+      // reads the camera term and view 9 the raw game motion minus it, and the
+      // resolve does not clamp .zw, so those still use the real MBGameMotionToUV.
+      float2 sampleVelocity = g_srcMotion[motionTexel].xy * motionInvScale;
       wB = dot(MBNorm(sampleVelocity), d);
       sampleLength = length(sampleVelocity);
     }
@@ -441,10 +500,36 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // divided by it, spending two divides per cone term for a product.
     float weight = MBCylinder(T, min(sampleLength, centerLength)) * max(wA, wB) * 2.0;
     if (depthTest) {
-      // Fore/background classification relative to p. zCompare is symmetric, so f
-      // and b coincide; the paper's distinction is carried by the two cone
+      // Fore/background classification relative to p. The comparison is symmetric,
+      // so f and b coincide; the paper's distinction is carried by the two cone
       // half-widths and by wA vs wB above.
-      float depthAgree = MBZCompare(centerDepth, SampleLinearDepth(sampleUV, depthDims, mulC, addC));
+      //
+      // This used to be MBZCompare(za, zb), testing |za - zb| / min(za, zb) on
+      // LINEARIZED depths; that helper is gone, and this is the same test with
+      // the linearization cancelled out. With z = mulC / u and
+      // u = addC - rawDepth the ratio is invariant:
+      //     |z1 - z2| / min(z1, z2) == |u1 - u2| / min(|u1|, |u2|)
+      // (1/u is monotonic, so min(z) pairs with max(u), and the residual
+      // difference simplifies). And |u1 - u2| is exactly |raw1 - raw2| because
+      // addC cancels in the subtraction. So the whole comparison runs on the
+      // hardware depth buffer with no linearization, which removes a divide and
+      // the guard divide that guarded it.
+      //
+      // This is also strictly MORE accurate than the old form: |za - zb|
+      // subtracts two large similar linear distances and loses digits, whereas
+      // |raw1 - raw2| subtracts the original values.
+      const float uTap = addC
+          - g_srcDepth[clamp(int2(sampleUV * float2(depthDims)), int2(0, 0), depthDims - 1)];
+      const float ratio = abs(centerURaw - uTap) / max(min(centerAbsU, abs(uTap)), 1e-4);
+      // The finite/NaN guard is carried over deliberately. SampleLinearDepth had
+      // `if (!isfinite(z)) z = 0.0` because a garbage texel would otherwise make
+      // every weight NaN; the same protection is required here or a NaN depth
+      // would poison the whole pixel. The 1e-4 floor is the old min() floor and is
+      // what makes a far-plane sample (u -> 0 under infinite-far reversed-Z)
+      // saturate the agreement to 0 instead of dividing by zero.
+      float depthAgree = (isfinite(ratio) && centerAbsU > 1e-8)
+          ? saturate(1.0 - ratio) * saturate(shader_injection_data.mb_depth_tolerance)
+          : 0.0;
       weight += depthAgree * MBConeByLength(T, sampleLength) * max(wB, 0.0)
               + depthAgree * MBConeByLength(T, centerLength) * max(wA, 0.0);
     }

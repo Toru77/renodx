@@ -81,17 +81,24 @@ float MBCylinder(float t, float halfWidth) {
   return max(0.0, 1.0 - x * x);
 }
 
-// Paper Section 5 relative depth test, scene independent by construction:
-//   zCompare[za,zb] = min(max(0, 1 - |za-zb| / min(za,zb)), 1)
-// Fed LINEAR view depth, which is what makes the relative form meaningful; a
-// raw hardware depth buffer collapses min(za,zb) at distance and the term
-// saturates. mb_depth_tolerance widens the soft transition (the paper's form
-// has no tolerance control).
-float MBZCompare(float za, float zb) {
-  float denom = max(min(za, zb), 1e-4);
-  return saturate(1.0 - abs(za - zb) / denom)
-       * saturate(shader_injection_data.mb_depth_tolerance);
-}
+// Paper Section 5 relative depth test. REMOVED: MBZCompare lived here and is
+// gone. The gather now evaluates the same quantity without linearizing, which
+// removes a divide and its guard per tap.
+//
+//   zCompare[za,zb] = saturate(1 - |za-zb| / min(za,zb)) * tolerance
+//
+// The change is exact, not an approximation. For z = mulC / u with u = A - d,
+// the ratio is invariant under that fractional-linear map:
+//   |z1 - z2| / min(z1, z2)  ==  |u1 - u2| / min(|u1|, |u2|)
+// and |u1 - u2| == |d1 - d2| because A cancels in the subtraction. So the
+// relative test was never actually about linear distance; feeding it linearized
+// depths only added rounding (and lost digits, since |za - zb| subtracts two
+// large similar numbers).
+//
+// The old note that the relative form "needs linear view depth" was wrong, and
+// was the reason this cost a divide per tap. It stays here as a warning against
+// reintroducing the linearization. See motion_blur_gather.cs_5_0.hlsl at the
+// tap's depth test for the working form.
 
 // ── per-pixel jitter (paper Section 4.5 deterministic Halton) ──
 float MBHalton2(uint index) {
