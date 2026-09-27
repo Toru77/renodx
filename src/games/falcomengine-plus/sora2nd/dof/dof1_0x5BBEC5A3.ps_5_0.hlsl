@@ -1,7 +1,19 @@
-// ---- Created with 3Dmigoto v1.4.1 on Fri Aug 21 11:50:58 2026
-
-#include "../../shared.h"
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Sora 2nd DoF CoC pass -- per-game shell only.
+//
+// The algorithm (Improved CoC curve plus the preserved 3Dmigoto vanilla path) is
+// not here; it lives in dof/dof_common.hlsli and is shared verbatim with Sora 1st
+// and Kai. Change it there and all three games change together.
+//
+// What genuinely belongs to this game is the cb_scene layout below, and nothing
+// else: the CoC pass reads a single field, projInv_g, from it. The block is kept
+// in full rather than trimmed to that one field, because it is the record of this
+// engine's scene layout and is what located prevViewProj_g at c75 / jitterDiff_g
+// at c79 for the motion blur Kai work.
+//
+// Do not edit the include into anything but the include guard it uses. This file
+// is gated on compiling to byte-identical bytecode.
+// ─────────────────────────────────────────────────────────────────────────────
 cbuffer cb_scene : register(b0)
 {
   float4x4 view_g : packoffset(c0);
@@ -54,67 +66,5 @@ cbuffer cb_scene : register(b0)
   float4 shadowBlurRadius_g : packoffset(c80);
 }
 
-cbuffer cb_dof : register(b2)
-{
-  float2 uv_clamp : packoffset(c0);
-  float cocMaxRadius : packoffset(c0.z);
-  float nearZ : packoffset(c0.w);
-  float farZ : packoffset(c1);
-  float invNearFade : packoffset(c1.y);
-  float invFarFade : packoffset(c1.z);
-  float nearFadeExp : packoffset(c1.w);
-  float farFadeExp : packoffset(c2);
-}
-
-SamplerState samPoint_s : register(s0);
-SamplerState samLinear_s : register(s1);
-Texture2D<float4> colorTexture : register(t0);
-Texture2D<float4> depthTexture : register(t1);
-
-
-// 3Dmigoto declarations
-#define cmp -
-
-
-void main(
-  float4 v0 : SV_Position0,
-  float4 v1 : TEXCOORD0,
-  out float4 o0 : SV_Target0)
-{
-  float4 r0;
-  uint4 bitmask, uiDest;
-  float4 fDest;
-
-  r0.x = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
-  r0.y = 1;
-  r0.z = dot(projInv_g._m22_m32, r0.xy);
-  r0.x = dot(projInv_g._m23_m33, r0.xy);
-  r0.x = r0.z / r0.x;
-  r0.y = -farZ + -r0.x;
-  r0.y = invFarFade * r0.y;
-  r0.y = min(1, r0.y);
-  r0.y = log2(r0.y);
-  r0.y = farFadeExp * r0.y;
-  r0.y = exp2(r0.y);
-  r0.z = cmp(farZ < -r0.x);
-  r0.y = r0.z ? r0.y : 0;
-  r0.z = nearZ + r0.x;
-  r0.x = cmp(-r0.x < nearZ);
-  r0.z = invNearFade * r0.z;
-  r0.z = min(1, r0.z);
-  r0.z = log2(r0.z);
-  r0.z = nearFadeExp * r0.z;
-  r0.z = exp2(r0.z);
-  o0.w = r0.x ? -r0.z : r0.y;
-  if (shader_injection_data.dof_mode > 0.5f) {
-    float near_coc = saturate(max(0.0, -o0.w) * max(shader_injection_data.dof_near_scale, 0.0));
-    float far_coc = saturate(max(0.0, o0.w) * max(shader_injection_data.dof_far_scale, 0.0));
-    float coc_curve = max(shader_injection_data.dof_coc_curve, 0.01);
-    near_coc = pow(near_coc, coc_curve);
-    far_coc = pow(far_coc, coc_curve);
-    o0.w = (o0.w < 0.0) ? -near_coc : far_coc;
-  }
-  r0.xyz = colorTexture.SampleLevel(samLinear_s, v1.xy, 0).xyz;
-  o0.xyz = r0.xyz;
-  return;
-}
+#define DOF_PASS_COC
+#include "../../dof/dof_common.hlsli"
