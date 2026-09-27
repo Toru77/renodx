@@ -462,7 +462,7 @@ constexpr uint32_t kSoraTonemapHash = 0xC9FA40B7u;
 // Kai's own deploy pass. Different game, different hash, same job. Named rather
 // than left as a literal so the registration and the t0 capture below cannot drift
 // apart -- see IsMotionBlurDeployHash.
-constexpr uint32_t kKaiTonemapHash = 0x2D620443u;
+constexpr uint32_t kKaiTonemapHash = 0x034581D3u;
 
 
 // ── Motion blur activation ────────────────────────────────────────────────────
