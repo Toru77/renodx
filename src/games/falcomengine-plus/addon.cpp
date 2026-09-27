@@ -454,10 +454,11 @@ enum MotionBlurPass : uint32_t {
   kMbResolve = 5,
   kMotionBlurPassCount = 6,
 };
-// Sora 2nd post-TAA resolve / tonemap. Registered with an EMPTY payload on
+// Sora 1st and Sora 2nd post-TAA resolve / tonemap. Confirmed the SAME hash in
+// both games, so one constant serves both. Registered with an EMPTY payload on
 // purpose: the game keeps running its own bytecode and we only take a per-draw
 // hook, so the tonemap can never regress.
-constexpr uint32_t kSora2ndTonemapHash = 0xC9FA40B7u;
+constexpr uint32_t kSoraTonemapHash = 0xC9FA40B7u;
 
 // ── Motion blur activation ────────────────────────────────────────────────────
 // One channel, gated on shader_injection.mb_mode. Cutscene Only is resolved
@@ -493,6 +494,19 @@ static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
 // quality name, so translating here keeps the push block unchanged and stops a
 // preset index from ever reaching the gather as if it were a sample count.
 static float g_mb_quality = 1.f;  // 0 Low, 1 Medium, 2 High, 3 Ultra
+
+// ── Motion vector source ──────────────────────────────────────────────────────
+// 0 = the GBuffer's RTV4 (the engine's own motion output, written every frame),
+// 1 = the TAA draw's t3 (today's path, which only exists once TAA has run).
+//
+// Deliberately NOT in ShaderInjectData: no shader needs to know which route the
+// motion arrived by. The two views hold the same bytes in the same encoding, so
+// every pass downstream is unchanged by this setting.
+static float g_mb_motion_input = 0.f;  // RTV4 is the default: it does not depend on TAA
+
+static const char* MBMotionInputName() {
+  return (g_mb_motion_input < 0.5f) ? "RTV4" : "TAA t3";
+}
 
 // Medium is the default. Note this is a change from the old 25: the presets top
 // out at 24 because the ladder's own rungs stop at 16 and only the top bucket uses
@@ -617,6 +631,17 @@ static bool IsSora1st() {
     checked = true;
   }
   return is_sora1st;
+}
+
+// ── Sora family ──
+// The two Sora engines, for features that both support.
+//
+// Deliberately NOT IsDynCubeT17Game() below, which happens to be the same
+// predicate. That one is named for the global t17 cubemap capture, and reusing it
+// here would tie motion blur's availability to an unrelated feature's naming --
+// which is exactly the sort of coupling that breaks when one of the two changes.
+static bool IsSoraFamily() {
+  return IsSora1st() || IsSora2nd();
 }
 
 // ── Dynamic Cubemap t17 supported games ──
@@ -1007,6 +1032,52 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view rcas_motion_srv = {};          // game motion buffer (t3) captured from TAA draws (Stage 2)
   uint64_t rcas_motion_res = 0u;
   std::atomic<bool> rcas_motion_live{true};                  // destroy-event driven; false = buffer freed since capture
+  // Motion vectors read from the GBuffer's fourth render target instead of the
+  // TAA's t3. Same buffer, different bind point: the writers are
+  // staticfoliage_0xF1EC53A8.ps_5_0.hlsl:201-207 and its 13 siblings, all
+  // `o4.xy = jitterDiff_g.xy + (cur - prev) * vpSize_g`, i.e. pixel displacement
+  // plus the jitter delta. That is exactly the convention MBGameMotionToUV and the
+  // resolve pass already assume, so the two sources are interchangeable downstream
+  // and this needs no shader change. The difference is availability, not data:
+  // RTV4 is written by the GBuffer pass every frame, whereas t3 only exists once the
+  // TAA draw has run.
+  reshade::api::resource_view mb_rtv4_srv = {};              // GBuffer RTV4, captured from bind_render_targets
+  uint64_t mb_rtv4_res = 0u;
+  std::atomic<bool> mb_rtv4_live{true};
+  bool mb_rtv4_warned_fmt = false;                           // one-shot format sanity warning
+  bool mb_logged_rtv4_dims = false;                          // one-shot RTV4 dimensions log
+  // OUR OWN shader-resource view on the motion resource, and nothing else.
+  //
+  // This is not a safety measure, it is a correctness one. ReShade's D3D11
+  // update_descriptor_tables memcpy's the 64-bit handle straight into the
+  // descriptor table with no type check, and the driver then consumes it as an
+  // ID3D11ShaderResourceView. Handing it the ID3D11RenderTargetView that
+  // OMSetRenderTargets gave us made it walk an RTV vtable as an SRV, which is a
+  // bad indirect call: 0xC0000005 / BEX64, faulting module "unknown", the instant
+  // the chain updated its first table. The TAA t3 source never showed this
+  // because that view already IS an SRV.
+  //
+  // The chain threads one variable, motionSrc, to both places that read the
+  // game's motion -- the resolve at t0 and the gather at t5 -- so making
+  // motionSrc this view fixes both. No copy is involved: it is a view onto the
+  // game's own motion resource, recreated only when that resource changes.
+  reshade::api::resource_view mb_rtv4_owned_srv = {};
+  // Set when the motion resource dies, so the owned view is destroyed and rebuilt
+  // on the RENDER thread by MBMotionRtv4Ensure. It is deliberately not destroyed in
+  // the destroy event itself: those run on the loader thread and every other
+  // handler there is comment-documented as touching no view objects at all.
+  bool mb_rtv4_owned_dirty = false;
+  // First-wins-per-frame guard. Several passes bind exactly five render targets,
+  // and the GBuffer's is only the FIRST of them, so a last-wins capture gets
+  // clobbered by a later pass that happens to have something else in slot 4. This
+  // mirrors captured_color_frame / captured_depth_frame, including the UINT64_MAX
+  // initialiser so frame 0 captures instead of being skipped.
+  uint64_t mb_rtv4_frame = UINT64_MAX;
+  // Rejections allowed per frame, so a frame in which NO five-target bind is the
+  // motion target cannot spin: each rejection re-arms the capture, and after the
+  // cap the blur simply stays off for that frame.
+  uint32_t mb_rtv4_rejects = 0u;
+  static constexpr uint32_t kMotionBlurRtv4RejectCap = 4u;
   // ── FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) ──
   // Layout/tables are shared by all three FXAA pipelines (same t0/t1/u0
   // shape); only the bytecode differs (luma prepass vs quality preset).
@@ -1098,6 +1169,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // textures actually match the tonemap's resolution, which decides whether the
   // gather's filtered motion reads engage.
   bool mb_logged_dims = false;
+  // One-shot: names which resolve bytecode variant is in the pipeline.
+  bool mb_logged_resolve_variant = false;
   int mb_last_chain = -1;  // last chain value logged, so toggles are confirmed
   uint64_t mb_last_log_frame = 0u;
   // Deploy: the tonemap's t0, captured for both the gather's colour input and
@@ -1861,9 +1934,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     // Empty payload = no replacement; the game's own shader runs and we only
     // swap t0 for the blurred result.
     {
-        kSora2ndTonemapHash,
+        kSoraTonemapHash,
         renodx::mods::shader::CustomShader{
-            .crc32 = kSora2ndTonemapHash,
+            .crc32 = kSoraTonemapHash,
             .on_draw = OnBeforeTonemapDraw,
         },
     },
@@ -2088,7 +2161,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Mode", .section = "Motion Blur",
       .tooltip = "When the blur runs: never, only inside cutscenes, or always.",
       .labels = {"Off", "Cutscene Only", "Always On"},
-      .is_visible = []() { return IsSora2nd(); },
+      .is_visible = []() { return IsSoraFamily(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurCameraDirection", .binding = &shader_injection.mb_camera_sign,
@@ -2096,7 +2169,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Camera Direction", .section = "Motion Blur",
       .tooltip = "Convention probe, not a look control. The game writes motion as one signed difference of the previous and current clip positions, but the shader varyings holding them are unlabelled, so which way round it is can only be settled from the image. On a static scene with the camera moving, set Debug View to Object Residual: the correct value here renders it BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means this is backwards. Leave it alone once you have picked the right one.",
       .labels = {"Forward (cur - prev)", "Reversed (prev - cur)"},
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurCameraCut", .binding = &shader_injection.mb_camera_cut,
@@ -2104,7 +2177,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Reject Camera Cuts", .section = "Motion Blur",
       .tooltip = "Detects a teleport or a cutscene transition, where the view transform is replaced in a single frame, and writes zero velocity for that frame. Without it the whole screen smears toward the warp point for one frame. The test is on the camera transform, not the motion buffer, so a fast camera whip and a moving object cannot trigger it on their own. Toggle this off to A/B against a cut you can see; a false positive costs one sharp frame, a false negative costs the smear.",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurLogging", .binding = &g_mb_logging,
@@ -2112,21 +2185,21 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Logging", .section = "Motion Blur",
       .tooltip = "Writes motion blur diagnostics to the ReShade log: the frame rate scale, which chain stage is running, a one-time report of the colour, motion and depth buffer sizes, and any reason the effect could not run. Turn it off to keep the log quiet. The effect itself is not affected either way.",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },    new renodx::utils::settings::Setting{
-      .key = "MotionBlurCameraCutThreshold", .binding = &shader_injection.mb_camera_cut_px,
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{      .key = "MotionBlurCameraCutThreshold", .binding = &shader_injection.mb_camera_cut_px,
       .default_value = 360.f, .label = "Camera Cut Threshold", .section = "Motion Blur",
       .tooltip = "How far the view transform may move in one frame before it counts as a cut, in 1080-reference pixels, measured at a nominal depth. A fast whip at 60 fps is roughly 30-80 px; a scene cut is hundreds. Raise it if ordinary camera movement is being rejected, lower it if a real cut is smearing.",
       .min = 8.f, .max = 512.f, .format = "%.0f px",
       .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_camera_cut > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
-    },    new renodx::utils::settings::Setting{
-      .key = "MotionBlurCameraJitter", .binding = &shader_injection.mb_camera_jitter,
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{      .key = "MotionBlurCameraJitter", .binding = &shader_injection.mb_camera_jitter,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Camera Jitter", .section = "Motion Blur",
       .tooltip = "Convention probe, not a look control. The game adds a per-frame jitter delta to every motion vector, and prevViewProj_g may already contain that jitter. Adding it again inflates the camera term, and because object motion is computed as game minus camera, the inflation lands in the object channel at full size. Judge it the same way as Camera Direction: with the camera moving on a static scene, Object Residual must be BLACK.",
       .labels = {"Add jitter delta", "Omit jitter delta"},
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurIntensity", .binding = &shader_injection.mb_intensity,
@@ -2134,7 +2207,19 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How far the blur smears, as a fraction of how far things actually moved: 0 is off, higher is softer.",
       .min = 0.f, .max = 2.f, .format = "%.2fx",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd(); },
+      .is_visible = []() { return IsSoraFamily(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "MotionBlurMotionVectorInput", .binding = &g_mb_motion_input,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 1.f, .label = "Motion Vector Input", .section = "Motion Blur",
+      .tooltip = "Where the blur reads its motion vectors from. TAA Motion Buffer is the copy the anti-aliasing pass reads, and is the safe default. Game RTV4 is the engine's own motion output, which is the only source available when anti-aliasing is switched off; the blur makes its own view onto it, so it is worth trying if the blur is missing without anti-aliasing. Both hold the same values, so they should look identical.",
+      // Index order must match the tests: < 0.5 selects RTV4, >= 0.5 selects TAA t3.
+      // The default is therefore 1, which is why TAA is the default despite being
+      // listed second.
+      .labels = {"Game RTV4", "TAA Motion Buffer"},
+      .is_enabled = []() { return MotionBlurActive(true); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurQuality", .binding = &g_mb_quality,
@@ -2143,7 +2228,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How many times a pixel gets sampled while blurring, which keeps fast movement smooth instead of steppy, at a performance cost.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd(); },
+      .is_visible = []() { return IsSoraFamily(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurMaxRadius", .binding = &shader_injection.mb_max_radius_px,
@@ -2151,7 +2236,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "The longest streak the blur can produce.",
       .min = 8.f, .max = 80.f, .format = "%.0f px",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd(); },
+      .is_visible = []() { return IsSoraFamily(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurCenterWeight", .binding = &shader_injection.mb_center_weight_k,
@@ -2159,7 +2244,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Centre-sample weight divisor (paper k). The unblurred centre contributes N/(k*|v|) of the total, so LOWER keeps more of the original pixel and higher lets the streak dominate. Raise it if thin objects ghost, lower it if fast motion smears too little.",
       .min = 1.f, .max = 100.f, .format = "%.0f",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurJitter", .binding = &shader_injection.mb_jitter_h,
@@ -2167,7 +2252,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How far past the streak length the integration domain reaches (paper h). Breaks up banding; too high softens the streak.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurMinVelocity", .binding = &shader_injection.mb_min_velocity_g,
@@ -2175,7 +2260,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Below this a pixel's own velocity is replaced by the direction perpendicular to the tile velocity (paper g).",
       .min = 0.f, .max = 8.f, .format = "%.2f",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurNeighborFalloff", .binding = &shader_injection.mb_neighbor_t,
@@ -2183,7 +2268,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Slope of the stochastic tile lookup near tile borders (paper t), in tiles. Trades tile-edge banding for noise.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurDepthTolerance", .binding = &shader_injection.mb_depth_tolerance,
@@ -2191,7 +2276,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Width of the soft depth transition that separates foreground from background samples. Higher lets more background bleed across depth edges.",
       .min = 0.01f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurJitterSource", .binding = &shader_injection.mb_jitter_source,
@@ -2200,7 +2285,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Halton is the paper's deterministic per-pixel sequence. IS-FAST uses the blue-noise volume already loaded for DoF and shadows; it animates, so residual sampling noise reads much less. Falls back to Halton when the volume is unavailable.",
       .labels = {"Halton", "IS-FAST"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurFrameRateReference", .binding = &shader_injection.mb_frame_rate_reference,
@@ -2209,7 +2294,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How the streak is tied to framerate. 0 (default) matches Unreal's r.MotionBlurTargetFPS 0: the measured frame time is tracked with a 0.1 moving average and the shutter spans the REAL frame, so a lower framerate gives a proportionally longer streak, and a change of rate ramps over about ten frames instead of stepping. Set a framerate above 0 to rescale the motion into that rate's units instead, which makes the result identical at every framerate at the cost of no longer being physically scaled.",
       .min = 0.f, .max = 240.f, .format = "%d",
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurHalfResThreshold", .binding = &shader_injection.mb_halfres_px,
@@ -2217,7 +2302,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Streak length, in 1080p-equivalent pixels, at which a tile switches to half resolution. Below it the gather runs at full resolution, because a streak that short is dominated by detail that half resolution has already thrown away. Above it the blur dominates and the cheaper path costs little visually. Sits where the sample ladder jumps to its most expensive rungs, so the tiles doing the most work are the ones that get cheaper. Try 4, 6 and 10.",
       .min = 0.f, .max = 96.f, .format = "%.0f px",
       .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_halfres > 0.5f; },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurHalfRes", .binding = &shader_injection.mb_halfres,
@@ -2226,7 +2311,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Splits the gather by motion magnitude: tiles whose streak is short run at full resolution, tiles whose streak is long run at half resolution, and the result is selected per tile rather than blended. A streak too short to see cannot hide the detail that half resolution discards, so this keeps the two aligned. Off by default because the extra full-resolution pass costs about as much as the static gather it replaces. Toggling rebuilds the buffers, costing one frame.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurDepthTest", .binding = &shader_injection.mb_depth_test,
@@ -2235,7 +2320,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "On: every tap reads the game depth and taps that disagree with the centre pixel are down-weighted, which is what separates foreground from background. Off: that fetch and the two cone terms are dropped and only the cylinder term remains, saving one texture load per tap, at the cost of bleeding across depth edges. Note Depth Tolerance already scales the same terms, so a very low value suppresses most of their effect while still paying for the fetch.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurLocalVelocity", .binding = &shader_injection.mb_local_velocity_weights,
@@ -2244,7 +2329,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather). A/B it on a high-contrast edge.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurDebugChain", .binding = &shader_injection.mb_debug_chain,
@@ -2253,7 +2338,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Diagnostic only. Full runs everything. Prep Only runs the three preprocessing dispatches and skips the gather, leaving the image untouched. Gather Only runs just the gather, reusing the PREVIOUS frame's prep, so do not read its image as a correctness comparison, and do not use it to time a moving scene: with prep frozen the tile grid is stale and almost nothing passes the gather's early-out. If preparation has never run it falls back to Full for that frame.",
       .labels = {"Full", "Prep Only", "Gather Only"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurDebugView", .binding = &shader_injection.mb_debug_view,
@@ -2262,7 +2347,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Velocity, NeighborMax, the tile grid, linearized depth, blur amount, sample count, the half resolution split, the reconstructed camera term, or the error in it. Use these to confirm the motion buffer is live and the tile grid is resolution independent. Sample Count shows black where the blur early-outs and one distinct hue per rung of the adaptive ladder, which is what Quality now bounds: this is also the readout for tuning the rungs later. Half Res Detect draws the split partition itself: GREEN = blurred at full resolution, RED = blurred at half resolution, GREY = below the early-out so it will not blur at all, BLUE = Half Resolution is off so everything is full resolution. Boundaries are tile-quantised, so it also reads as the verification that the split no longer changes with framerate. Camera Velocity is the reconstructed camera term on its own. Object Residual is the difference against the game's own motion, and it is the one to settle the Camera Direction and Camera Jitter settings: on a STATIC scene with the camera moving it must be BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means the camera estimate is inverted or mis-scaled. It is also a direct readout of what the blur is doing, because the streak length is the camera's share of the total, so anything bright here is exactly the object contribution that was removed.",
       .labels = {"Off", "Velocity", "Neighbor Max", "Tile Grid", "Linear Depth", "Blur Amount", "Sample Count", "Half Res Detect", "Camera Velocity", "Object Residual"},
       .is_enabled = []() { return MotionBlurActive(true); },
-      .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
+      .is_visible = []() { return IsSoraFamily() && IsAdvancedSettingsMode(); },
     },
 
     // ── Character SSGI ──
@@ -4788,7 +4873,7 @@ static void OnPushDescriptorsCapture(
       auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
       if (ss) {
         uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
-        if (hash == kSora2ndTonemapHash) {
+        if (hash == kSoraTonemapHash) {
           d->mb_tonemap_src_srv = views[0];
           d->mb_tonemap_src_res = device->get_resource_from_view(views[0]).handle;
           d->mb_tonemap_src_live = true;
@@ -5262,6 +5347,7 @@ static void KillAllTracked(DeviceData* d, uint64_t deadView, uint64_t deadRes) {
   KillTrackedInput(d, d->captured_ssr1_srv, d->captured_ssr1_res, d->captured_ssr1_live, "ssr1", deadView, deadRes);
   KillTrackedInput(d, d->captured_ssr_mrt_srv, d->captured_ssr_mrt_res, d->captured_ssr_mrt_live, "ssrMrt", deadView, deadRes);
   KillTrackedInput(d, d->rcas_motion_srv, d->rcas_motion_res, d->rcas_motion_live, "rcasMotion", deadView, deadRes);
+  KillTrackedInput(d, d->mb_rtv4_srv, d->mb_rtv4_res, d->mb_rtv4_live, "mbRtv4Motion", deadView, deadRes);
   KillTrackedInput(d, d->mb_tonemap_src_srv, d->mb_tonemap_src_res, d->mb_tonemap_src_live, "mbTonemapSrc", deadView, deadRes);
 }
 static void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
@@ -5275,6 +5361,15 @@ static void OnDestroyResource(reshade::api::device* device, reshade::api::resour
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
   KillAllTracked(d, 0u, res.handle);
+  // The motion resource died, so our SRV onto it is dead too. Flag it rather than
+  // destroying it here: this handler runs on the loader thread, and the render
+  // thread rebuilds it via MBMotionRtv4Ensure. Leaving a dead view bound for even
+  // one frame is the thing that must not happen, and the flag is set before the
+  // next chain run, which is the same frame's tonemap.
+  if (d->mb_rtv4_res != 0u && d->mb_rtv4_res == res.handle) {
+    d->mb_rtv4_res = 0u;
+    d->mb_rtv4_owned_dirty = true;
+  }
   // RCAS note: no per-resource tracking remains. The dispatch reads only the
   // owned unsharpened copy; a dead game target is detected next TAA drawn via
   // dims/format mismatch (set recreated) or desc query failure (skip frame).
@@ -5339,6 +5434,9 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->frame_index++;
+  // RTV4 re-arm budget is per frame; a rejected candidate may be retried a few
+  // times, but never across a frame boundary.
+  d->mb_rtv4_rejects = 0u;
   d->immediate_cmd_list = queue->get_immediate_command_list();
   s_lastPresentMs.store(WatchdogNowMs());
   if (!s_watchdogStarted) {
@@ -6598,9 +6696,131 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
                     reshade::api::resource_usage::unordered_access);
 }
 
-// Latest-bound RTV0 tracker for the RCAS stage (D3D11 immediate-list
-// assumption, same as the rest of this file's per-frame capture logic:
-// binds and draws are ordered on one list, and on_draw fires after binds).
+// Resolve the GBuffer RTV4 to its resource, REJECT anything that is not plausibly
+// the motion buffer, and keep OUR OWN shader-resource view on what survives.
+//
+// The game's render target can never be handed to the chain directly. ReShade's
+// D3D11 update_descriptor_tables copies the handle verbatim and the driver then
+// consumes it as an ID3D11ShaderResourceView, so passing an
+// ID3D11RenderTargetView is a bad indirect call. Passing OUR view, which is a real
+// SRV on the same resource, costs no copy and no extra memory.
+//
+// Rejecting rather than warning is the point. A wrong capture used to bind
+// anyway, which produced an image that looked plausible and was wrong -- the
+// hardest kind of bug to notice. Now a wrong candidate is refused, logged once with
+// what it actually was, and the capture is re-armed so a later five-target bind in
+// the same frame can still take its place. The blur is off for that frame, which
+// is a state you can act on.
+//
+// Id3D11View::GetResource is the one view call that IS valid on a render target,
+// and it is the same call the TAA path already makes successfully every frame.
+static void MBMotionRtv4Ensure(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  if (d->mb_rtv4_srv.handle == 0u || !d->mb_rtv4_live.load()) return;
+  // Rebuild requested by the resource-destroy event: drop the dead view first, on
+  // this thread, then fall through and make a new one.
+  if (d->mb_rtv4_owned_dirty) {
+    d->mb_rtv4_owned_dirty = false;
+    if (d->mb_rtv4_owned_srv.handle != 0u) {
+      dev->destroy_resource_view(d->mb_rtv4_owned_srv);
+      d->mb_rtv4_owned_srv = {};
+    }
+  }
+  reshade::api::resource mres = dev->get_resource_from_view(d->mb_rtv4_srv);
+  if (mres.handle == 0u) return;
+  if (mres.handle == d->mb_rtv4_res && d->mb_rtv4_owned_srv.handle != 0u) return;
+
+  if (d->mb_rtv4_owned_srv.handle != 0u) {
+    dev->destroy_resource_view(d->mb_rtv4_owned_srv);
+    d->mb_rtv4_owned_srv = {};
+  }
+  d->mb_rtv4_res = mres.handle;
+
+  // .texture is a union member, so .type has to be tested before it is read.
+  // Reading it on a buffer desc is undefined behaviour, and undefined behaviour
+  // resolves differently under Release optimisation.
+  auto rdesc = dev->get_resource_desc(mres);
+  const bool isTexture = (rdesc.type == reshade::api::resource_type::texture_2d);
+  const bool isMotionFormat = isTexture && (rdesc.texture.format == reshade::api::format::r16g16_float);
+  const bool isPlausibleSize = isTexture && (rdesc.texture.width > 0u && rdesc.texture.height > 0u);
+
+  if (!isMotionFormat || !isPlausibleSize) {
+    d->mb_rtv4_res = 0u;
+    // Re-arm, but only while the per-frame budget allows it, so a frame where no
+    // five-target bind is the motion target cannot spin.
+    if (d->mb_rtv4_rejects < DeviceData::kMotionBlurRtv4RejectCap) {
+      d->mb_rtv4_rejects++;
+      d->mb_rtv4_frame = UINT64_MAX;
+    }
+    if (!d->mb_rtv4_warned_fmt) {
+      d->mb_rtv4_warned_fmt = true;
+      const std::string got = isTexture
+          ? (std::to_string(rdesc.texture.width) + "x" + std::to_string(rdesc.texture.height)
+             + " format=" + std::to_string(static_cast<int>(rdesc.texture.format)))
+          : std::string("not a texture_2d");
+      reshade::log::message(reshade::log::level::warning,
+          ("[MotionBlur] the first five-target bind's slot 4 is not the motion buffer "
+           "(" + got + "). Expected r16g16_float. Blur is off this frame and the "
+           "capture is retried; this message appears once.").c_str());
+    }
+    return;
+  }
+  dev->create_resource_view(mres, reshade::api::resource_usage::shader_resource,
+      reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                       rdesc.texture.format, 0, 1, 0, 1),
+      &d->mb_rtv4_owned_srv);
+  if (d->mb_rtv4_owned_srv.handle == 0u) {
+    d->mb_rtv4_res = 0u;
+    reshade::log::message(reshade::log::level::warning,
+        "[MotionBlur] could not create a shader resource view on the RTV4 motion "
+        "resource. Blur is off this frame; it will retry. This is a declared "
+        "limitation, not a fallback to the render target.");
+  }
+}
+
+// The selected motion view, or an empty view when it is not available. NO fallback
+// to the other source: a silent substitution would make the setting lie, and with
+// two candidates the only way to diagnose a stopped blur is a log line naming the
+// one that is absent.
+//
+// The RTV4 branch returns OUR view, never the game's render target -- see
+// MBMotionRtv4Ensure. MBMotionRtv4Ensure must have run first.
+//
+// Defined here rather than beside the other motion blur statics because it needs
+// DeviceData complete, and that struct is declared further down the file.
+static reshade::api::resource_view MBMotionInputView(DeviceData* d) {
+  if (!d) return {};
+  if (g_mb_motion_input < 0.5f) {
+    return (d->mb_rtv4_owned_srv.handle != 0u)
+             ? d->mb_rtv4_owned_srv : reshade::api::resource_view{};
+  }
+  return (d->rcas_motion_srv.handle != 0u && d->rcas_motion_live.load())
+           ? d->rcas_motion_srv : reshade::api::resource_view{};
+}
+
+// Latest-bound RTV0 tracker for the RCAS stage, plus the motion blur's RTV4
+// motion capture (D3D11 immediate-list assumption, same as the rest of this
+// file's per-frame capture logic: binds and draws are ordered on one list, and
+// on_draw fires after binds).
+//
+// ── THIS FUNCTION MUST MAKE NO DEVICE CALLS ───────────────────────────────────
+// It runs on every OMSetRenderTargets in the process, including those issued by
+// the upscaler proxies, which own their own D3D11 devices and views. ReShade's
+// get_resource_from_view is an unchecked reinterpret_cast plus a virtual call,
+// guarded only by an assert, and an assert is compiled out of a Release build:
+//
+//   assert(view != 0);
+//   reinterpret_cast<ID3D11View *>(view.handle)->GetResource(&resource);
+//
+// So a view handle that is non-zero but not a live ID3D11View on THIS device is a
+// wild pointer dereference, and it took the process down with 0xC0000005 inside
+// d3d11.dll. Only a null slot is detectable here, and a null slot is the one
+// case that cannot be a live view.
+//
+// Everything that needs to query the device -- resolving the resource, the
+// r16g16_float check, the dimensions log -- happens in PrepareMotionBlur, at a
+// point where the device and command list are known correct and the identical
+// query already succeeds for the TAA motion view every frame.
 static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32_t count,
                                     const reshade::api::resource_view* rtvs,
                                     reshade::api::resource_view /*dsv*/) {
@@ -6610,6 +6830,31 @@ static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   d->rcas_last_rtv0 = (count > 0) ? rtvs[0] : reshade::api::resource_view{};
+
+  // ── Motion blur: GBuffer RTV4 as the motion vector source ──
+  //
+  // count == 5 EXACTLY, not > 4. The GBuffer pass declares five targets, SV_Target0
+  // through SV_Target4, with the motion vectors in slot 4
+  // (staticfoliage_0xF1EC53A8.ps_5_0.hlsl:96-100). A wider "five or more" test
+  // let any later pass that happens to bind five or more overwrite the capture,
+  // which is how this ended up reading a 2560x1440 texture that was not the motion
+  // buffer. Note that index 4 is the FIFTH slot, so `count == 4` would be an
+  // out-of-bounds read; the GBuffer's signature is 5.
+  //
+  // FIRST five-target bind of the frame wins. The GBuffer is the earliest such bind
+  // in a frame, so first-wins is the GBuffer and later passes cannot clobber it.
+  // MBMotionRtv4Ensure clears mb_rtv4_frame when it rejects a candidate, which
+  // re-arms this for the rest of that frame.
+  //
+  // Captured unconditionally rather than only when the setting selects it, so
+  // flipping the setting does not have to wait for the next GBuffer draw, and so
+  // the destroy tracking always has something to track. This is a struct copy and
+  // a couple of compares; that is the entire cost.
+  if (count != 5u || rtvs[4].handle == 0u) return;
+  if (d->mb_rtv4_frame == d->frame_index) return;
+  d->mb_rtv4_frame = d->frame_index;
+  d->mb_rtv4_srv = rtvs[4];
+  d->mb_rtv4_live = true;
 }
 
 // ═══════════ Motion Blur (Guertin et al. 2013) ═══════════
@@ -6673,6 +6918,12 @@ static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d)
   if (d->mb_noise_fallback_srv.handle) { dev->destroy_resource_view(d->mb_noise_fallback_srv); d->mb_noise_fallback_srv = {}; }
   if (d->mb_noise_fallback_res.handle) { dev->destroy_resource(d->mb_noise_fallback_res); d->mb_noise_fallback_res = {}; }
   if (d->mb_point_clamp_sampler.handle) { dev->destroy_sampler(d->mb_point_clamp_sampler); d->mb_point_clamp_sampler = {}; }
+  // Our SRV on the game's motion resource. Not part of mb_layouts/mb_tables: it is
+  // a view on a game-owned resource, and those are freed on a set rebuild, not on
+  // device teardown.
+  if (d->mb_rtv4_owned_srv.handle) { dev->destroy_resource_view(d->mb_rtv4_owned_srv); d->mb_rtv4_owned_srv = {}; }
+  d->mb_rtv4_res = 0u;
+  d->mb_rtv4_owned_dirty = false;
 }
 
 static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) {
@@ -6721,10 +6972,21 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
     }
     if (!EnsureGTVBAODescriptorTables(dev, d->mb_layouts[pass], &d->mb_tables[pass])) return false;
     if (d->mb_pipelines[pass].handle == 0u) {
-      if (kBytecode[pass].empty() || d->mb_layouts[pass].handle == 0u) return false;
+      // Two resolve variants, one pass slot. HLSL packoffset() is a compile-time
+      // constant and the two games disagree on the scene cbuffer layout
+      // (prevViewProj_g / jitterDiff_g are c74/c78 on Sora 1st and c75/c79 on
+      // Sora 2nd), so the difference has to live in the bytecode. The game is
+      // fixed for the process lifetime, so this is decided once here and never
+      // needs a rebuild guard. RunMotionBlur logs which variant is in the
+      // pipeline, so a wrong pick shows up as one line rather than a wrong image.
+      const bool sora1st = IsSora1st();
+      const std::span<const uint8_t> code = (pass == kMbResolve && sora1st)
+          ? std::span<const uint8_t>(__motion_blur_resolve_sora1st)
+          : kBytecode[pass];
+      if (code.empty() || d->mb_layouts[pass].handle == 0u) return false;
       reshade::api::shader_desc sd = {};
-      sd.code = kBytecode[pass].data();
-      sd.code_size = kBytecode[pass].size();
+      sd.code = code.data();
+      sd.code_size = code.size();
       sd.entry_point = "main";
       reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
       if (!dev->create_pipeline(d->mb_layouts[pass], 1, &so, &d->mb_pipelines[pass])) return false;
@@ -6965,20 +7227,39 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   // the divisor and the tile height, never a gate: a view that failed to resolve
   // is still perfectly readable, and treating the query as authoritative is what
   // silently disabled this filter once already. It must not be re-promoted.
-  const bool motionBound = d->rcas_motion_srv.handle != 0u && d->rcas_motion_live.load();
+  // RTV4 source: build our own SRV on the motion resource FIRST, so that whatever
+  // MBMotionInputView hands the chain below is a view the chain may legally bind.
+  if (g_mb_motion_input < 0.5f) {
+    MBMotionRtv4Ensure(dev, d);
+  }
+  const reshade::api::resource_view motionView = MBMotionInputView(d);
+  const bool motionBound = motionView.handle != 0u;
   uint32_t motionW = workingW, motionH = workingH;
   if (motionBound) {
-    reshade::api::resource mres = dev->get_resource_from_view(d->rcas_motion_srv);
+    reshade::api::resource mres = dev->get_resource_from_view(motionView);
     if (mres.handle != 0u) {
+      // mdesc.texture is a union member: .type must be tested before it is read,
+      // exactly as CSResolveCapture does. Reading it on a buffer desc is undefined
+      // behaviour and resolves differently under Release optimisation.
       auto mdesc = dev->get_resource_desc(mres);
-      if (mdesc.type == reshade::api::resource_type::texture_2d
-          && mdesc.texture.width > 0u && mdesc.texture.height > 0u) {
-        motionW = mdesc.texture.width;
-        motionH = mdesc.texture.height;
+      if (mdesc.type == reshade::api::resource_type::texture_2d) {
+        if (mdesc.texture.width > 0u && mdesc.texture.height > 0u) {
+          motionW = mdesc.texture.width;
+          motionH = mdesc.texture.height;
+        }
+        // The RTV4 format check lives in MBMotionRtv4Ensure, next to the view it
+        // describes. Only the dimensions report is left here.
+        if (g_mb_motion_input < 0.5f && !d->mb_logged_rtv4_dims
+            && MotionBlurLogEnabled()) {
+          d->mb_logged_rtv4_dims = true;
+          reshade::log::message(reshade::log::level::info,
+              ("[MotionBlur] RTV4 motion " + std::to_string(motionW) + "x"
+               + std::to_string(motionH) + " bound as our own SRV").c_str());
+        }
       }
     }
   }
-  *motionOut = motionBound ? d->rcas_motion_srv : d->fallback_srv;
+  *motionOut = motionBound ? motionView : d->fallback_srv;
 
   const uint32_t radiusPx = static_cast<uint32_t>(std::max(shader_injection.mb_max_radius_px, 8.f));
   // Tiles are sized in PIXELS, not counted, so they stay square on a 16:9 frame.
@@ -7043,6 +7324,7 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
           ("[MotionBlur] buffers: colour " + std::to_string(workingW) + "x" + std::to_string(workingH)
            + " | motion " + std::to_string(motionW) + "x" + std::to_string(motionH)
            + " | depth " + std::to_string(depthW) + "x" + std::to_string(depthH)
+           + " | source " + MBMotionInputName()
            + (motionDiffers
                 ? " -- motion differs, gather is using filtered reads"
                 : " -- motion matches, single-tap reads")
@@ -7200,6 +7482,17 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   // instead would be a different image, not a cheaper equivalent.
   const bool runResolve = d->mb_resolve_uav.handle != 0u;
   if (runResolve) {
+    // Which resolve bytecode is actually in the resolve pipeline. A wrong variant
+    // on Sora 1st would not crash -- it would read a different cbuffer slot as the
+    // previous view-projection and produce a subtly wrong streak length, which is
+    // exactly the kind of failure that is hard to notice. One line settles it.
+    if (!d->mb_logged_resolve_variant && MotionBlurLogEnabled()) {
+      d->mb_logged_resolve_variant = true;
+      reshade::log::message(reshade::log::level::info,
+          IsSora1st()
+              ? "[MotionBlur] scene cbuffer variant: sora1st (prevViewProj c74, jitterDiff c78)"
+              : "[MotionBlur] scene cbuffer variant: sora2nd (prevViewProj c75, jitterDiff c79)");
+    }
     // P0: reconstruct .xy = camera-length-scaled motion / .zw = camera only.
     // Runs at the MOTION texture's resolution, not the working resolution, and
     // before prep because everything downstream reduces what it writes.
@@ -7313,7 +7606,7 @@ static void LogMotionBlurOnce(DeviceData* d, const std::string& message) {
 // motion blur on top of depth of field. This callback only records the frame: it
 // never touches D3D state and never dispatches anything.
 static void OnDrawnDofGather(reshade::api::command_list* cmd_list) {
-  if (!cmd_list || !IsSora2nd()) return;
+  if (!cmd_list || !IsSoraFamily()) return;
   if (auto* dev = cmd_list->get_device()) {
     if (auto* d = dev->get_private_data<DeviceData>()) {
       d->mb_dof_drew_frame = d->frame_index;
@@ -7336,7 +7629,7 @@ static void OnDrawnDofGather(reshade::api::command_list* cmd_list) {
 // what the game's shader expects.
 static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
   if (!cmd_list) return true;
-  if (!IsSora2nd()) return true;
+  if (!IsSoraFamily()) return true;
   auto* dev = cmd_list->get_device();
   if (!dev) return true;
   auto* d = dev->get_private_data<DeviceData>();
@@ -7375,7 +7668,16 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
 
   reshade::api::resource_view motionSrc;
   if (!PrepareMotionBlur(dev, d, w, h, RCASLinearFormat(desc.texture.format), &motionSrc)) {
-    LogMotionBlurOnce(d, "inactive: depth, motion or pipelines unavailable");
+    // With two selectable sources and no fallback, "unavailable" is not actionable
+    // on its own: the useful fact is WHICH source is missing, because that is what
+    // tells you whether the GBuffer pass is not writing four targets or the TAA
+    // draw has not run.
+    if (d && MBMotionInputView(d).handle == 0u) {
+      LogMotionBlurOnce(d, std::string("inactive: ") + MBMotionInputName()
+                                + " motion view not captured this frame");
+    } else {
+      LogMotionBlurOnce(d, "inactive: depth or pipelines unavailable");
+    }
     return true;
   }
   auto blurred = RunMotionBlur(cmd_list, d, d->mb_tonemap_src_srv, motionSrc);
