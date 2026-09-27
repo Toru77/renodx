@@ -47,10 +47,10 @@ cbuffer cb_scene : register(b0)
 };
 
 Texture2D<float4>    g_srcColor       : register(t0);
-// float4, not float2: motion_blur_resolve writes .xy = camera/object blend and
-// .zw = camera-only. TileMax still declares float2 over the same resource and
-// takes .xy. When the resolve pass is skipped this is the game's own motion
-// texture, where .zw is unused.
+// float4, not float2: motion_blur_resolve writes .xy = the game motion scaled by
+// the camera's share of its length, and .zw = camera-only. TileMax still declares
+// float2 over the same resource and takes .xy. The resolve pass always runs, so
+// .zw is always a real camera term and never the game's raw texture contents.
 Texture2D<float4>    g_srcMotion      : register(t1);
 Texture2D<float2>    g_srcNeighborMax : register(t2);
 // Single-channel, matching the game's other depth readers (gtvbao, ssrr2,
@@ -60,8 +60,8 @@ Texture2D<float2>    g_srcNeighborMax : register(t2);
 Texture2D<float>     g_srcDepth       : register(t3);
 Texture3D<float2>    g_isfastNoise    : register(t4);
 // The game's UNRESOLVED motion, bound beside the resolved one. Read only by the
-// Camera/Object Velocity views, which return before the tap loop, so the filter
-// itself never issues a load against it.
+// Object Residual view, which returns before the tap loop, so the filter itself
+// never issues a load against it.
 Texture2D<float2>    g_srcGameMotion  : register(t5);
 RWTexture2D<float4>  g_outColor       : register(u0);
 
@@ -244,21 +244,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     g_outColor[p] = float4(saturate(vmaxLength / tileUV).xxx, 1.0);
     return;
   }
-  if (debugView == 8 || debugView == 9) {
-    // 8 = camera only, 9 = object only. The CPU forces the resolve pass on for
-    // these two, so .zw really is camera velocity and not whatever the game
-    // texture happened to carry there.
-    //
-    // Object is the DIFFERENCE against the game's own motion, which is what makes
-    // it the decisive test: the jitter delta is present in both terms, so it
-    // cancels here and the view must read pure black for a static camera AND a
-    // static scene. A structured ~0.5-1px residual means the resolve pass is
-    // adding jitterDiff_g on top of a prevViewProj_g that already carries it.
+  if (debugView == 8) {
+    // 8 = the camera term on its own. The resolve pass always runs, so .zw really
+    // is the reconstructed camera velocity and not whatever the game texture
+    // happened to carry there.
     float2 px = float2(0.0, 0.0);
     if (motionValid) {
       const int2 mtexel = clamp(int2(uv * float2(motionDims)), 0, motionDims - 1);
-      const float2 cameraPx = g_srcMotion[mtexel].zw;
-      px = (debugView == 8) ? cameraPx : (g_srcGameMotion[mtexel] - cameraPx);
+      px = g_srcMotion[mtexel].zw;
     }
     float2 vel = MBGameMotionToUV(px);
     float len = length(vel);
@@ -267,13 +260,17 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     return;
   }
 
-  if (debugView == 10) {
-    // Object Residual: on a STATIC scene the object channel must be zero, because
+  if (debugView == 9) {
+    // Object Residual: on a STATIC scene the object term must be zero, because
     // the game's motion is then entirely camera motion. So this view is a pure
     // error readout for the camera term -- objPx = gamePx - camPx means every
     // camera error lands here at FULL size, negated, rather than being averaged
     // away. A clean mirror of the Camera Velocity view in this one means the
-    // camera estimate is inverted or mis-scaled, not that object motion exists.
+    // camera estimate is inverted or mis-scaled.
+    //
+    // This is the decisive check that the camera path is not eating object
+    // motion: the streak length is scaled by camLen/(camLen+objLen), so a bright
+    // residual here is exactly the object contribution that was just removed.
     //
     // Full scale is minVelocityUV, the gather's own 0.5px early-out, so this asks
     // exactly the question the filter asks: anything bright here WILL blur. Black

@@ -409,11 +409,9 @@ struct ShaderInjectData {
   // Motion blur runs in UV space; every length below is a 1080p-equivalent
   // pixel value and is converted by motionblur/motion_blur_common.hlsli, so a
   // 4K player sees the same blur as a 1080p player.
-    // 0=Off, 1=Cutscene Only, 2=Always On. RETIRED, unread by any shader and now
-    // written by nothing: the per-channel modes live in CPU-side statics because
-    // they are gates, and only the two resolved weights are pushed (see
-    // mb_camera_weight). Kept so later packoffsets do not move.
-    float mb_mode;
+  // 0=Off, 1=Cutscene Only, 2=Always On. Read on the CPU as the single gate for
+  // the whole chain; no shader reads it.
+  float mb_mode;
   float mb_intensity;               // [0..2], default 1 — shutter scale on the gather's
                                     // integration DOMAIN (not on velocity); 0 is an exact
                                     // no-op, and the domain is capped at one tile
@@ -433,7 +431,9 @@ struct ShaderInjectData {
   float mb_jitter_source;           // 0=Halton (paper), 1=IS-FAST volume
   float mb_jitter_ready;            // runtime: 0/1 — IS-FAST volume actually usable
   float mb_debug_view;              // 0=Off, 1=Velocity, 2=NeighborMax, 3=Tile grid,
-                                    // 4=Linear depth, 5=Blur amount, 6=Sample count
+                                    // 4=Linear depth, 5=Blur amount, 6=Sample count,
+                                    // 7=Half-res partition, 8=Camera velocity,
+                                    // 9=Object residual
   // Runtime, written by the addon immediately before the b13 push.
   float mb_working_w, mb_working_h; // gather/velocity resolution (colour source dims)
   float mb_depth_w, mb_depth_h;     // game depth / linear depth texture dims
@@ -490,20 +490,15 @@ struct ShaderInjectData {
                                   // would all change with framerate. Applying it once,
                                    // in MBGameMotionToUV, puts all of them into
                                    // reference-frame units together. 1.0 = no-op.
-  // ---- camera / object velocity separation (appended last) ----
-  // How much of the streak LENGTH each source is responsible for, for THIS frame,
-  // already resolved from its mode (Off / Cutscene Only / Always On), its amount
-  // and the cutscene signal, on the CPU. 0 means that source contributes nothing.
-  //
-  // The resolve pass does NOT sum the two vectors. Doing so let each slider steer
-  // the streak's DIRECTION, so lowering one lengthened the streak by swapping in
-  // the other vector instead of shortening it, and the labels read backwards. It
-  // fixes the direction to the true screen motion and scales only the length:
+  // ---- camera term (appended last) ----
+  // The object channel is gone; the streak LENGTH is now the camera's share of
+  // the total magnitude, and that ratio is a compile-time constant in
+  // motion_blur_resolve (gain = camLen / (camLen + objLen)). It used to arrive
+  // here as two weights and
   //     out = game * (camLen*w_cam + objLen*w_obj) / (camLen + objLen)
-  // Both weights at 1 makes the ratio exactly 1, so out == game and the CPU can
-  // skip the pass entirely, reproducing the pre-separation image bit for bit.
-  float mb_camera_weight;  // [0..2], default 1
-  float mb_object_weight;  // [0..2], default 1
+  // with the sum evaluated per pixel. RETIRED, unread by any shader and now
+  // written by nothing. Kept so later packoffsets do not move.
+  float mb_reserved_length;
   // ---- convention probe (appended last) ----
   // The game's motion encoding is documented inconsistently in this repo:
   // motion_blur_common.hlsli says prevPixel - curPixel, while the decompiled

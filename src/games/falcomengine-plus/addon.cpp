@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  */
@@ -395,8 +395,7 @@ ShaderInjectData shader_injection = {
   .mb_halfres_px = 10.f,
   .mb_frame_rate_reference = 60.f,
       .mb_frame_scale = 1.f,
-      .mb_camera_weight = 1.f,
-      .mb_object_weight = 1.f,
+      .mb_reserved_length = 1.f,
       .mb_camera_sign = 1.f,
       .mb_camera_jitter = 1.f,
 };
@@ -458,47 +457,19 @@ enum MotionBlurPass : uint32_t {
 // hook, so the tonemap can never regress.
 constexpr uint32_t kSora2ndTonemapHash = 0xC9FA40B7u;
 
-// ── Motion blur: camera / object channels ─────────────────────────────────────
-// The game writes ONE motion texture holding camera motion, object motion and the
-// jitter delta summed together, so the two are inseparable at the point of use.
-// motion_blur_resolve splits them per pixel and blends by these weights.
-//
-// Deliberately NOT in ShaderInjectData: they are CPU-side gates, and the shaders
-// only ever see the two resolved weights. This keeps four dead floats out of the
-// pushed block and makes it obvious that no shader can read them.
-//
-// Defaults preserve the previous behaviour exactly: both channels Off, because
-// the single pre-split MotionBlurMode defaulted to Off.
-static float g_mb_camera_mode = 0.f;    // 0 Off, 1 Cutscene Only, 2 Always On
-static float g_mb_object_mode = 0.f;    // 0 Off, 1 Cutscene Only, 2 Always On
-static float g_mb_camera_amount = 1.f;  // [0..1] scales this channel's streak length
-static float g_mb_object_amount = 1.f;  // [0..1]
-
-// Effective activation of one channel this frame. Cutscene Only is resolved
-// against the DoF-dispatch signal, which only fires in cutscenes.
-static bool MotionBlurChannelActive(float mode, bool cutscene) {
-  return mode >= 1.5f || (mode >= 0.5f && cutscene);
+// ── Motion blur activation ────────────────────────────────────────────────────
+// One channel, gated on shader_injection.mb_mode. Cutscene Only is resolved
+// against the DoF-dispatch signal, which only fires in cutscenes, so that half of
+// the test needs the frame's cutscene flag and cannot live in the setting
+// predicate.
+static bool MotionBlurActive(bool cutscene) {
+  return shader_injection.mb_mode >= 1.5f
+      || (shader_injection.mb_mode >= 0.5f && cutscene);
 }
-
-// Weight a channel contributes this frame. An inactive channel is 0, so
-// "activate separately" needs no special path downstream: the chain runs when
-// EITHER weight is positive, and each gather reads the same single blend.
-static float MotionBlurChannelWeight(float mode, float amount, bool cutscene) {
-  if (!MotionBlurChannelActive(mode, cutscene)) return 0.f;
-  // NOT clamped at 1: the sliders go to 2 so a single channel can be pushed past
-  // the undivided amount. Clamping here made anything above 1 silently
-  // unreachable, which is what made 1.25 and 0.75 indistinguishable.
-  return amount < 0.f ? 0.f : amount;
-}
-
-// True when either channel is switched on. The settings that both channels share
-// (Max Radius, Max Samples, Half Resolution, the debug views) gate on this rather
-// than on either one, so turning a channel off never greys out a parameter the
-// other still uses.
-static bool MotionBlurAnyChannelActive() {
-  return MotionBlurChannelActive(g_mb_camera_mode, true)
-      || MotionBlurChannelActive(g_mb_object_mode, true);
-}
+// The settings that hang off the chain (Max Radius, Max Samples, Half Resolution,
+// the debug views) pass cutscene=true to ask whether the mode could EVER run,
+// which is the right question for greying out a control: the answer must not
+// flicker as the user walks in and out of a cutscene.
 // Height the shaders divide pixel-denominated paper constants by, so a 4K
 // player sees the same blur as a 1080p player. Must match MB_REF_H in
 // motionblur/motion_blur_common.hlsli.
@@ -1079,7 +1050,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   float mb_last_frame_scale = -1.f;
   // Per-channel weights resolved once by the deploy gate, which is where the
   // cutscene signal lives, and pushed by PrepareMotionBlur.
-  float mb_cam_w = 0.f, mb_obj_w = 0.f;
   bool mb_halfres = false;         // half-res surfaces currently allocated
   reshade::api::format mb_output_fmt = reshade::api::format::unknown;
   bool mb_resources_ready = false;
@@ -2069,32 +2039,14 @@ renodx::utils::settings::Settings settings = {
     },
 
     // ── Motion Blur (Guertin et al. 2013) ──
-    // Sora 2nd only for now. Both modes share one deploy point at the tonemap;
-    // mode only changes the trigger.
+    // Sora 2nd only for now. One deploy point at the tonemap; the mode only changes
+    // the trigger.
     new renodx::utils::settings::Setting{
-      // Key kept from the single pre-split Mode so existing configs keep working;
-      // the binding moved to the camera channel, which is what it has always
-      // effectively controlled (it is the only thing that was separable before).
-      .key = "MotionBlurMode", .binding = &g_mb_camera_mode,
+      // Key kept from the pre-split Mode so existing configs keep working.
+      .key = "MotionBlurMode", .binding = &shader_injection.mb_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Camera Motion Blur", .section = "Motion Blur",
-      .tooltip = "Blur from camera movement alone: panning, rotating, dollying. Off. Cutscene Only blurs on frames where the game dispatches depth of field, which it only does in cutscenes. Always On blurs every frame. Separated from Object Motion Blur by reprojecting prevViewProj_g against the current view, so the two can be tuned and switched independently. Both apply after depth of field and after TAA, under the game's own tonemap.",
-      .labels = {"Off", "Cutscene Only", "Always On"},
-      .is_visible = []() { return IsSora2nd(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurCameraAmount", .binding = &g_mb_camera_amount,
-      .default_value = 1.f, .label = "Camera Amount", .section = "Motion Blur",
-      .tooltip = "How much of the streak length the camera is responsible for. 1.00 is the real, undivided screen motion, so both channels at 1.00 is exactly the blur you had before this split existed. Dropping this to 0 removes the camera's share and leaves a shorter streak, it does NOT redirect the streak onto the camera. Raising it above 1 lengthens the streak. The direction always follows the true screen motion, so no setting can smear a surface somewhere it is not going.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurChannelActive(g_mb_camera_mode, true); },
-      .is_visible = []() { return IsSora2nd(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "MotionBlurObjectMode", .binding = &g_mb_object_mode,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Object Motion Blur", .section = "Motion Blur",
-      .tooltip = "Blur from object movement alone, with camera movement divided out. Off. Cutscene Only blurs on frames where the game dispatches depth of field, which it only does in cutscenes. Always On blurs every frame. The component is the game's own motion minus the camera's, so the two channels are exact complements and enabling both at full amount reproduces undivided motion exactly.",
+      .default_value = 0.f, .label = "Mode", .section = "Motion Blur",
+      .tooltip = "Off. Cutscene Only blurs on frames where the game dispatches depth of field, which it only does in cutscenes. Always On blurs every frame. The streak follows each surface's own screen motion, which for a static world IS the camera's motion, so panning smears the whole frame. Its LENGTH is limited to the camera's share of that motion, so a moving character does not smear as hard as a camera pan. Applied after depth of field and after TAA, under the game's own tonemap.",
       .labels = {"Off", "Cutscene Only", "Always On"},
       .is_visible = []() { return IsSora2nd(); },
     },
@@ -2115,19 +2067,11 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "MotionBlurObjectAmount", .binding = &g_mb_object_amount,
-      .default_value = 1.f, .label = "Object Amount", .section = "Motion Blur",
-      .tooltip = "How much of the streak length the moving objects are responsible for. 1.00 is the real, undivided screen motion. Dropping this to 0 removes the objects' share and leaves a shorter streak on a moving character -- it does NOT smear the character along the camera. Raising it above 1 lengthens the streak. This is the control for a stabilised camera look: set Camera Amount to 0 and keep this at 1.",
-      .min = 0.f, .max = 2.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurChannelActive(g_mb_object_mode, true); },
-      .is_visible = []() { return IsSora2nd(); },
-    },
-    new renodx::utils::settings::Setting{
       .key = "MotionBlurIntensity", .binding = &shader_injection.mb_intensity,
       .default_value = 1.f, .label = "Intensity", .section = "Motion Blur",
       .tooltip = "Shutter angle on the blur's integration domain, not on the motion vectors. 1.00x is a true 1:1 shutter, where the streak length equals the frame's actual motion. 0 is an exact no-op. The domain is capped at one tile, so at the default 40 px Max Radius the slider stays useful all the way to about 1.9x.",
       .min = 0.f, .max = 2.f, .format = "%.2fx",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
@@ -2136,7 +2080,7 @@ renodx::utils::settings::Settings settings = {
   .default_value = 25.f, .label = "Max Samples", .section = "Motion Blur",
   .tooltip = "Upper bound on gather taps (paper N). The adaptive ladder spends fewer where the neighbourhood is slow and reaches this only at the top rung, so cost rises with motion rather than staying flat. Pin it to 4 to force a fixed 4-tap blur.",
       .min = 4.f, .max = 48.f, .format = "%d",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
@@ -2144,7 +2088,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 40.f, .label = "Max Radius", .section = "Motion Blur",
       .tooltip = "Longest streak and the tile size (paper r), in 1080p-equivalent pixels. The filter scales itself to your resolution, so 4K shows the same blur length as 1080p. Also changes the tile grid, so the buffers rebuild when you move it.",
       .min = 8.f, .max = 80.f, .format = "%.0f px",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd(); },
     },
     new renodx::utils::settings::Setting{
@@ -2152,7 +2096,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 40.f, .label = "Center Weight", .section = "Motion Blur",
       .tooltip = "Centre-sample weight divisor (paper k). The unblurred centre contributes N/(k*|v|) of the total, so LOWER keeps more of the original pixel and higher lets the streak dominate. Raise it if thin objects ghost, lower it if fast motion smears too little.",
       .min = 1.f, .max = 100.f, .format = "%.0f",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2160,7 +2104,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.95f, .label = "Jitter", .section = "Motion Blur",
       .tooltip = "How far past the streak length the integration domain reaches (paper h). Breaks up banding; too high softens the streak.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2168,7 +2112,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.5f, .label = "Velocity Threshold", .section = "Motion Blur",
       .tooltip = "Below this a pixel's own velocity is replaced by the direction perpendicular to the tile velocity (paper g).",
       .min = 0.f, .max = 8.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2176,7 +2120,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "NB Max Falloff", .section = "Motion Blur",
       .tooltip = "Slope of the stochastic tile lookup near tile borders (paper t), in tiles. Trades tile-edge banding for noise.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2184,7 +2128,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.1f, .label = "Depth Tolerance", .section = "Motion Blur",
       .tooltip = "Width of the soft depth transition that separates foreground from background samples. Higher lets more background bleed across depth edges.",
       .min = 0.01f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2193,7 +2137,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Jitter Source", .section = "Motion Blur",
       .tooltip = "Halton is the paper's deterministic per-pixel sequence. IS-FAST uses the blue-noise volume already loaded for DoF and shadows; it animates, so residual sampling noise reads much less. Falls back to Halton when the volume is unavailable.",
       .labels = {"Halton", "IS-FAST"},
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -2202,7 +2146,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 60.f, .label = "Frame Rate Reference", .section = "Motion Blur",
       .tooltip = "Motion vectors are per-frame displacements, so without this the streak length, the sample ladder, the velocity threshold and the half-resolution split would all change with framerate. Setting a framerate here rescales the motion so all of them are expressed in that framerate's units, which makes the result identical at any rate. 0 turns it off. At your own framerate this does nothing. Above the reference the streak gets longer than a physical shutter would give, which is the price of a consistent look.",
       .min = 0.f, .max = 240.f, .format = "%d",
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd(); },
       },
     new renodx::utils::settings::Setting{
@@ -2210,7 +2154,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 10.f, .label = "Half Res Threshold", .section = "Motion Blur",
       .tooltip = "Streak length, in 1080p-equivalent pixels, at which a tile switches to half resolution. Below it the gather runs at full resolution, because a streak that short is dominated by detail that half resolution has already thrown away. Above it the blur dominates and the cheaper path costs little visually. Sits where the sample ladder jumps to its most expensive rungs, so the tiles doing the most work are the ones that get cheaper. Try 4, 6 and 10.",
       .min = 0.f, .max = 96.f, .format = "%.0f px",
-      .is_enabled = []() { return MotionBlurAnyChannelActive() && shader_injection.mb_halfres > 0.5f; },
+      .is_enabled = []() { return MotionBlurActive(true) && shader_injection.mb_halfres > 0.5f; },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
@@ -2219,7 +2163,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Half Resolution", .section = "Motion Blur",
       .tooltip = "Splits the gather by motion magnitude: tiles whose streak is short run at full resolution, tiles whose streak is long run at half resolution, and the result is selected per tile rather than blended. A streak too short to see cannot hide the detail that half resolution discards, so this keeps the two aligned. Off by default because the extra full-resolution pass costs about as much as the static gather it replaces. Toggling rebuilds the buffers, costing one frame.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
@@ -2228,7 +2172,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Depth Test", .section = "Motion Blur",
       .tooltip = "On: every tap reads the game depth and taps that disagree with the centre pixel are down-weighted, which is what separates foreground from background. Off: that fetch and the two cone terms are dropped and only the cylinder term remains, saving one texture load per tap, at the cost of bleeding across depth edges. Note Depth Tolerance already scales the same terms, so a very low value suppresses most of their effect while still paying for the fetch.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
@@ -2237,7 +2181,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Local Velocity Weights", .section = "Motion Blur",
       .tooltip = "On: each tap reads the motion texture and is weighted by its own direction, which is the paper's feature-aware term and what stops foreground bleeding across depth edges. Off: taps reuse the composite direction, removing ~25 texture loads per pixel (roughly a third of the gather). A/B it on a high-contrast edge.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
       },
     new renodx::utils::settings::Setting{
@@ -2246,16 +2190,16 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Debug Chain", .section = "Motion Blur",
       .tooltip = "Diagnostic only. Full runs everything. Prep Only runs the three preprocessing dispatches and skips the gather, leaving the image untouched. Gather Only runs just the gather, reusing the PREVIOUS frame's prep, so do not read its image as a correctness comparison, and do not use it to time a moving scene: with prep frozen the tile grid is stale and almost nothing passes the gather's early-out. If preparation has never run it falls back to Full for that frame.",
       .labels = {"Full", "Prep Only", "Gather Only"},
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MotionBlurDebugView", .binding = &shader_injection.mb_debug_view,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "Motion Blur",
-      .tooltip = "Velocity, NeighborMax, the tile grid, linearized depth, blur amount, sample count, the half resolution split, the camera/object split, or the camera-term error. Use these to confirm the motion buffer is live and the tile grid is resolution independent. Sample Count shows black where the blur early-outs and one distinct hue per rung of the adaptive ladder, which is what Max Samples now bounds: this is also the readout for tuning the rungs later. Half Res Detect draws the split partition itself: GREEN = blurred at full resolution, RED = blurred at half resolution, GREY = below the early-out so it will not blur at all, BLUE = Half Resolution is off so everything is full resolution. Boundaries are tile-quantised, so it also reads as the verification that the split no longer changes with framerate. Camera Velocity and Object Velocity are the two halves of the game motion. Object Residual is the one to settle the Camera Direction and Camera Jitter settings: on a STATIC scene the object channel must be zero, so anything lit there is error in the camera term, scaled so that full brightness means it would actually blur.",
-      .labels = {"Off", "Velocity", "Neighbor Max", "Tile Grid", "Linear Depth", "Blur Amount", "Sample Count", "Half Res Detect", "Camera Velocity", "Object Velocity", "Object Residual"},
-      .is_enabled = []() { return MotionBlurAnyChannelActive(); },
+      .tooltip = "Velocity, NeighborMax, the tile grid, linearized depth, blur amount, sample count, the half resolution split, the reconstructed camera term, or the error in it. Use these to confirm the motion buffer is live and the tile grid is resolution independent. Sample Count shows black where the blur early-outs and one distinct hue per rung of the adaptive ladder, which is what Max Samples now bounds: this is also the readout for tuning the rungs later. Half Res Detect draws the split partition itself: GREEN = blurred at full resolution, RED = blurred at half resolution, GREY = below the early-out so it will not blur at all, BLUE = Half Resolution is off so everything is full resolution. Boundaries are tile-quantised, so it also reads as the verification that the split no longer changes with framerate. Camera Velocity is the reconstructed camera term on its own. Object Residual is the difference against the game's own motion, and it is the one to settle the Camera Direction and Camera Jitter settings: on a STATIC scene with the camera moving it must be BLACK, because object motion is then zero by definition. A lit residual that mirrors Camera Velocity means the camera estimate is inverted or mis-scaled. It is also a direct readout of what the blur is doing, because the streak length is the camera's share of the total, so anything bright here is exactly the object contribution that was removed.",
+      .labels = {"Off", "Velocity", "Neighbor Max", "Tile Grid", "Linear Depth", "Blur Amount", "Sample Count", "Half Res Detect", "Camera Velocity", "Object Residual"},
+      .is_enabled = []() { return MotionBlurActive(true); },
       .is_visible = []() { return IsSora2nd() && IsAdvancedSettingsMode(); },
     },
 
@@ -7009,11 +6953,6 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   // reads it in every shader of the chain. 1.0 at the reference rate, so the
   // default is a no-op there.
   shader_injection.mb_frame_scale = MotionBlurFrameScale();
-  // Resolved by the deploy gate, which is the only place the cutscene signal is
-  // available. 0 for an inactive channel, which is what makes the two channels
-  // independently switchable with no separate code path.
-  shader_injection.mb_camera_weight = d->mb_cam_w;
-  shader_injection.mb_object_weight = d->mb_obj_w;
   // Log movement in the factor. A clamp or a value stuck at 1.0 would otherwise
   // silently disable the compensation with nothing on screen to say so, and
   // "which framerate is it actually normalising to" is otherwise unobservable.
@@ -7133,18 +7072,14 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     cl->dispatch((GW + 7u) / 8u, (GH + 7u) / 8u, 1u);
     bar(d->mb_half_color_texture, UA, SR);
   }
-  // ── camera / object split ──
-  // Skipped whenever both weights are 1, because camera + (game - camera) == game
-  // makes the pass a mathematical no-op; the chain then binds the game motion
-  // directly and reproduces the pre-split image exactly. The two velocity views
-  // force it on, since they are the only way to read the components out.
-  const int mbView = static_cast<int>(shader_injection.mb_debug_view + 0.5f);
-  const bool needSplit = (shader_injection.mb_camera_weight < 0.999f
-                       || shader_injection.mb_object_weight < 0.999f
-                       || (mbView >= 8 && mbView <= 10));
-  const bool runResolve = needSplit && d->mb_resolve_uav.handle != 0u;
+  // ── camera term reconstruction ──
+  // Always runs. It is not an optional separation: it scales the streak length by
+  // the camera's share of the total magnitude, which is the whole reason object
+  // motion does not reach the camera path. Binding the game's motion directly
+  // instead would be a different image, not a cheaper equivalent.
+  const bool runResolve = d->mb_resolve_uav.handle != 0u;
   if (runResolve) {
-    // P0: split the game's single motion texture into .xy blended / .zw camera.
+    // P0: reconstruct .xy = camera-length-scaled motion / .zw = camera only.
     // Runs at the MOTION texture's resolution, not the working resolution, and
     // before prep because everything downstream reduces what it writes.
     cl->bind_pipeline(AC, d->mb_pipelines[kMbResolve]);
@@ -7153,8 +7088,8 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     cl->dispatch((std::max(d->mb_motion_w, 1u) + 7u) / 8u, (std::max(MH, 1u) + 7u) / 8u, 1u);
     bar(d->mb_resolve_texture, UA, SR);
   }
-  // What tilemax and the gather read. TileMax declares float2 and takes .xy, which
-  // is the blend; the gather declares float4 and takes .zw for the velocity views.
+  // What tilemax and the gather read. TileMax declares float2 and takes .xy; the
+  // gather declares float4 and takes .zw for the velocity views.
   const reshade::api::resource_view motionForChain = runResolve ? d->mb_resolve_srv : motionSrc;
 
   if (runPrep) {
@@ -7297,9 +7232,7 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
   // effect. A stale frame index simply fails the comparison, so an unexpected
   // draw order degrades to "no blur" rather than to blur in the wrong place.
   const bool cutscene = (d->mb_dof_drew_frame == d->frame_index);
-  d->mb_cam_w = MotionBlurChannelWeight(g_mb_camera_mode, g_mb_camera_amount, cutscene);
-  d->mb_obj_w = MotionBlurChannelWeight(g_mb_object_mode, g_mb_object_amount, cutscene);
-  if (d->mb_cam_w <= 0.f && d->mb_obj_w <= 0.f) return true;
+  if (!MotionBlurActive(cutscene)) return true;
 
   if (d->mb_tonemap_src_srv.handle == 0u || !d->mb_tonemap_src_live.load()) {
     if (!d->mb_warned_tonemap_src) {
@@ -7331,16 +7264,13 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
       reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{{}, 0u, 0, 1,
           reshade::api::descriptor_type::texture_shader_resource_view, &blurred});
-  // The chain can now run for one channel, the other, or both, so report both.
-  // Passing cutscene=true asks "is this channel configured to ever run", which is
-  // the right question for a log line, unlike the per-frame weights above.
-  const char* camName = !MotionBlurChannelActive(g_mb_camera_mode, true) ? "off"
-                     : (g_mb_camera_mode >= 1.5f ? "always-on" : "cutscene-only");
-  const char* objName = !MotionBlurChannelActive(g_mb_object_mode, true) ? "off"
-                     : (g_mb_object_mode >= 1.5f ? "always-on" : "cutscene-only");
+  // Passing cutscene=true asks "is the mode configured to ever run", which is the
+  // right question for a log line, unlike the per-frame gate above.
+  const char* mbName = !MotionBlurActive(true) ? "off"
+                     : (shader_injection.mb_mode >= 1.5f ? "always-on" : "cutscene-only");
   const char* stage = shader_injection.mb_debug_chain < 0.5f ? "full"
                      : (shader_injection.mb_debug_chain < 1.5f ? "prep-only" : "gather-only");
-  LogMotionBlurOnce(d, std::string("active: camera=") + camName + " object=" + objName
+  LogMotionBlurOnce(d, std::string("active: mode=") + mbName
       + " MB under the game's tonemap, chain=" + stage);
   return true;
 }

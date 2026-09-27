@@ -1,19 +1,23 @@
-// Motion Blur — camera / object velocity separation.
+// Motion Blur — camera-length weighting over the game's motion buffer.
 //
 // The game writes ONE motion texture and it is the sum of two different things:
 //   * camera motion, from prevViewProj_g vs the current view-projection, and
 //   * object motion, from the object's own previous world matrix,
 // plus the frame-to-frame jitter delta. A camera pan therefore reports the same
 // full-screen velocity as a fast-moving object, and the filter cannot tell them
-// apart. That matters for two reasons: the user cannot ask for object blur
-// without also getting camera blur, and a camera pan drives tiles onto the
-// half-resolution path for motion that is not really the scene's.
+// apart from the value alone.
 //
-// The separation is a per-pixel reprojection. It cannot live in TileMax, because
-// TileMax is a REDUCTION (one velocity out per tile) and the reprojection needs
-// this pixel's own depth. So it gets its own pass, and it feeds the rest of the
-// chain a single blended motion vector, leaving tilemax2 / neighbormax / vmax /
-// the sample ladder / the early-out / the half-res routing all untouched.
+// This pass recovers the camera term per pixel so the streak LENGTH can be
+// limited to it. Direction is left alone: the output always follows the true
+// screen motion gamePx, so a surface is never smeared somewhere it is not going.
+// What is removed is the object's share of the LENGTH, which is the part that
+// made a walking character smear as hard as a camera pan.
+//
+// The reconstruction is per-pixel. It cannot live in TileMax, because TileMax is
+// a REDUCTION (one velocity out per tile) and the reconstruction needs this
+// pixel's own depth. So it gets its own pass, and it feeds the rest of the chain
+// a single motion vector, leaving tilemax2 / neighbormax / the sample ladder /
+// the early-out / the half-res routing all untouched.
 //
 // ── WHY THIS REPRODUCES THE GAME'S OWN MATH ──────────────────────────────────
 // This is not an independent derivation. sora2nd/foliage/staticfoliage_
@@ -47,30 +51,29 @@
 // the product order for a layout whose convention is exactly the thing being
 // gotten wrong; the product is already supplied.
 //
-// ── WHY DEFAULTS ARE EXACT ───────────────────────────────────────────────────
-//   out = camera*cw + object*ow,  object = game - camera
-// With cw == ow == 1 this is camera + (game - camera) == game, bit for bit, so
-// the CPU skips this pass entirely and binds the game motion directly. The
-// pre-separation image is then reproduced without this shader running at all.
-// This also holds in EVERY configuration, not just at 1: the two channels are
-// exact complements ALGEBRAICALLY, and that is a trap worth stating plainly: it
-// does NOT mean the two are independently safe. objectPx = gamePx - camPx means
-// every error in the camera term is inherited by the object term at FULL size, with
-// the sign flipped. An unbounded camera error on even a few percent of the frame
-// therefore becomes unbounded object motion, and TileMax's per-tile max then
-// amplifies a single bad pixel into a fully blurred tile. That is precisely how a
-// garbage sky reconstruction leaked camera motion into Object Only. The camera
-// term must be validated on its own; see the self-validation note at the call site.
+// ── WHY THIS PASS MUST ALWAYS RUN ─────────────────────────────────────────────
+//   gain = camLen / (camLen + objLen),  out = gamePx * gain
+// objPx = gamePx - camPx is an exact complement ALGEBRAICALLY, and that is a trap
+// worth stating plainly: it does NOT mean the two are independently safe. Every
+// error in the camera term is inherited by objPx at FULL size, with the sign
+// flipped. TileMax's per-tile max then amplifies a single bad pixel into a fully
+// blurred tile. That is precisely how a garbage sky reconstruction leaked into
+// the result. The camera term is therefore validated on its own below, and there
+// is NO configuration in which skipping this pass is equivalent: skipping it binds
+// the undivided game motion, in which a moving object contributes its full screen
+// displacement to the streak.
 //
 // ── JITTER ───────────────────────────────────────────────────────────────────
-// jitterDiff_g is added because the game adds it, and because object = game -
-// camera subtracts two terms carrying the SAME jitter, so the jitter cancels in
+// jitterDiff_g is added because the game adds it, and because objPx = gamePx -
+// camPx subtracts two terms carrying the SAME jitter, so the jitter cancels in
 // the object component regardless of whether prevViewProj_g is jitter-inclusive.
-// It therefore only affects how much is ATTRIBUTED to camera, never object
-// correctness. It is sub-pixel by construction (it is a per-frame jitter delta),
-// and the gather's early-out is 0.5px, so a misattribution sits below the
-// threshold where it could be visible. A still camera and scene with the Object
-// Velocity view is the readout: it must be black.
+// It therefore only affects how much is ATTRIBUTED to camera, never the
+// correctness of the difference. It is sub-pixel by construction (it is a
+// per-frame jitter delta), and the gather's early-out is 0.5px, so a
+// misattribution sits below the threshold where it could be visible. A still
+// camera and scene read through the Object Residual view is the readout: it must
+// be black, and a structured sub-pixel residual there means jitterDiff_g is being
+// added on top of a prevViewProj_g that already carries it.
 
 #include "motion_blur_common.hlsli"
 
@@ -213,27 +216,20 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     objPx = float2(0.0, 0.0);
   }
 
-  // ── Direction is fixed; the channels own the LENGTH ────────────────────────
-  // Summing the two channel vectors gave each label control of the streak's
-  // DIRECTION rather than its length, so the numbers read backwards. On a follow
-  // camera cam and obj very largely cancel, which is why the character looks
-  // sharp at 1/1: the streak there is the small TRUE total. |cam| on its own is
-  // large. Dropping Object to 0 therefore swapped the streak onto the longer
-  // camera vector and produced MORE smear -- the exact opposite of the label.
+  // ── LENGTH is the camera's share; DIRECTION is the true screen motion ───────
+  // The streak always follows gamePx = camPx + objPx, the real screen motion, so
+  // no setting can point it somewhere the surface is not going. What the pass
+  // limits is the LENGTH, by the camera's fraction of the total magnitude.
   //
-  // Here the streak always follows gamePx = camPx + objPx, the real screen
-  // motion, and each channel contributes only its share of the LENGTH. No slider
-  // can point the streak somewhere the surface is not actually going.
-  //
-  // At both weights 1 the ratio is exactly 1 (a/b over max(a+b, eps), with
-  // a+b >= eps whenever gamePx is non-zero) and gamePx * 1 == gamePx, so the
-  // pre-separation result is reproduced bit for bit and the CPU can still skip
-  // this pass entirely.
+  // Summing the two vectors instead would have let each term steer the streak's
+  // DIRECTION, so on a follow camera where cam and obj very largely cancel the
+  // numbers read backwards: |cam| alone is large, and dividing it out swapped the
+  // streak onto the longer camera vector for MORE smear. Fixing the direction to
+  // gamePx and scaling only the magnitude is what makes "drop the object motion"
+  // actually shorten the streak.
   const float camLen = length(camPx);
   const float objLen = length(objPx);
-  const float contrib = camLen * max(shader_injection_data.mb_camera_weight, 0.0)
-                       + objLen * max(shader_injection_data.mb_object_weight, 0.0);
-  const float gain = contrib / max(camLen + objLen, 1e-6);
+  const float gain = camLen / max(camLen + objLen, 1e-6);
   const float2 blended = gamePx * gain;
   // .xy is what the tile chain reduces; .zw carries camera-only so the gather's
   // velocity views can read the components without a second reduction.
