@@ -114,6 +114,71 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     return;
   }
 
+  // ── CAMERA-CUT REJECTION ────────────────────────────────────────────────────
+  // A teleport or a cutscene transition replaces the view transform in a single
+  // frame. The game still writes motion vectors as though the camera had moved
+  // continuously, so the entire frame smears toward the warp point. UE's velocity
+  // pass suppresses velocity for one frame when it detects this; this is the same
+  // behaviour, and it is here rather than in the gather because the gather has
+  // already lost the information by the time it runs.
+  //
+  // The test is on the CAMERA TRANSFORM, not on the motion texture. That
+  // distinction is the whole point: the game's motion buffer mixes camera and
+  // object motion, so neither a magnitude threshold nor a "did the average change
+  // abruptly" test on it can separate a fast whip from a cut. mul(view_g, proj_g)
+  // is the CURRENT view-projection in the same convention as prevViewProj_g, so
+  // comparing the two measures only how far the view moved this frame -- a moving
+  // object cannot trigger it, and neither can a smooth pan.
+  //
+  // On the unvalidated c75 offset: this is the ONE place relying on it is safe,
+  // and the reason is asymmetric. Reconstructing exact velocity needs the offset
+  // to be precisely right, and getting it wrong was catastrophic. A magnitude
+  // THRESHOLD does not: a wrong mul() convention yields a bounded, smooth
+  // displacement, a real cut yields one orders of magnitude larger. The test
+  // survives the first and catches the second.
+  //
+  // Note that the depth consistency gate below does NOT catch this. A cut produces
+  // enormous but internally self-consistent values, so `consistent` is satisfied
+  // and `projectable` passes. That is exactly the hole this fills.
+  //
+  // The result is uniform across the dispatch, so the compiler hoists it, and it
+  // runs before the depth fetch so a cut costs one matrix evaluation and no loads.
+  bool cut = false;
+  if (shader_injection_data.mb_camera_cut > 0.5f) {
+    const float limitPx = max(shader_injection_data.mb_camera_cut_px, 1.0f);
+    const float4x4 curViewProj = mul(view_g, proj_g);
+    // Five probes at a nominal depth: the centre catches a pure translation, the
+    // corners catch rotation and FOV change. Deliberately not perspective-
+    // corrected points -- both projections are evaluated the same way, so the
+    // comparison stays like-for-like and the measure remains valid.
+    const float2 probes[5] = {float2(0.0, 0.0), float2(-0.5, -0.5), float2(0.5, -0.5),
+                              float2(-0.5, 0.5), float2(0.5, 0.5)};
+    [loop]
+    for (int i = 0; i < 5; ++i) {
+      const float4 probe = float4(probes[i], 0.5, 1.0);
+      const float4 cur = mul(probe, curViewProj);
+      const float4 prv = mul(probe, prevViewProj_g);
+      // A degenerate probe means the transform is not usable at all. Treat it as a
+      // cut: a false positive costs one sharp frame, a false negative costs a
+      // full-screen smear, and the two are not worth trading equally.
+      if (!(abs(cur.w) > 1e-6) || !(abs(prv.w) > 1e-6)
+          || !all(isfinite(cur.xy)) || !all(isfinite(prv.xy))) {
+        cut = true;
+        break;
+      }
+      const float2 curUV = (cur.xy / cur.w) * float2(0.5, -0.5) + 0.5;
+      const float2 prvUV = (prv.xy / prv.w) * float2(0.5, -0.5) + 0.5;
+      if (length((curUV - prvUV) * MB_REF_H) > limitPx) {
+        cut = true;
+        break;
+      }
+    }
+  }
+  if (cut) {
+    g_outMotion[p] = float4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+
   const float2 uv = (float2(p) + 0.5) / float2(motionDims);
   const int2 depthDims = max(int2(shader_injection_data.mb_depth_w,
                                   shader_injection_data.mb_depth_h), int2(1, 1));
@@ -231,7 +296,35 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   const float objLen = length(objPx);
   const float gain = camLen / max(camLen + objLen, 1e-6);
   const float2 blended = gamePx * gain;
+
+  // ── VELOCITY CLAMP, BEFORE THE TILE REDUCTION ───────────────────────────────
+  // UE orders this velocity flatten -> clamp -> tile reduction. We used to clamp
+  // only inside MBGameMotionToUV, in the gather, which is too late to matter:
+  // TileMax is a per-tile MAXIMUM, so a single garbage pixel from a bad
+  // reconstruction seizes its entire tile's velocity, and a clamp applied after
+  // the reduction only shortens a value that is already wrong. Clamping here, at
+  // the last point before TileMax, bounds one bad pixel to one tile of plausible
+  // motion instead of a fully smeared tile.
+  //
+  // The limit is Max Radius, the SAME bound the gather applied, expressed in the
+  // same units by dividing the reference-frame limit back out through
+  // mb_frame_scale. This therefore RELOCATES the clamp rather than tightening the
+  // image: any frame that did not already saturate the gather's clamp produces a
+  // bit-identical velocity.
+  // The gather clamps the length of the UV-space vector, where x is normalised by
+  // the motion width and y by its height, so the equivalent limit in pixels uses
+  // the MAGNITUDE of both dimensions. Using one dimension would clamp tighter
+  // horizontally than vertically and silently change the image.
+  const float maxPx = shader_injection_data.mb_tile_uv
+                    * length(float2(motionDims))
+                    / max(shader_injection_data.mb_frame_scale, 1e-4);
+  const float blendedLen = length(blended);
+  const float2 clamped = (blendedLen > maxPx && blendedLen > 1e-6f)
+                       ? blended * (maxPx / blendedLen)
+                       : blended;
   // .xy is what the tile chain reduces; .zw carries camera-only so the gather's
-  // velocity views can read the components without a second reduction.
-  g_outMotion[p] = float4(blended, camPx);
+  // velocity views can read the components without a second reduction. .zw is
+  // deliberately NOT clamped: the Camera Velocity view exists to show the camera
+  // term, and clamping it here would hide exactly the garbage it is for.
+  g_outMotion[p] = float4(clamped, camPx);
 }

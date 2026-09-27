@@ -67,6 +67,16 @@ RWTexture2D<float4>  g_outColor       : register(u0);
 
 // Point lookup: a tap is a real pixel, not a filtered one. Also keeps depth
 // reads off silhouette interpolations.
+//
+// Filtering DEPTH would be wrong even though the depth buffer is the more blocky
+// of the two when it is smaller than colour. An interpolated depth across a
+// silhouette belongs to no real surface, and MBZCompare would then accept taps it
+// should reject, which reads as halos and light leaking around object edges. Note
+// that this is not a correctness gap: every read addresses by normalised UV
+// against this texture's OWN dimensions, so a resolution mismatch is already
+// handled exactly. What a mismatch costs is only the stair-stepping on the
+// boundary where the depth test cuts motion off, and that is a deliberate trade
+// for a clean silhouette. The addon reports whether it happened in the log.
 float SampleLinearDepth(float2 uv, int2 dims, float mulC, float addC) {
   int2 texel = clamp(int2(uv * float2(dims)), int2(0, 0), dims - 1);
   float denom = addC - g_srcDepth[texel];
@@ -76,6 +86,58 @@ float SampleLinearDepth(float2 uv, int2 dims, float mulC, float addC) {
   // clamping to a finite positive distance keeps zCompare well defined.
   if (!isfinite(z)) z = 0.0;
   return min(z, 1.0e9);
+}
+
+// ── Motion reads, resolution-aware ────────────────────────────────────────────
+// The game's motion and depth textures track its INTERNAL render resolution,
+// while the tonemap colour the filter reads is at OUTPUT resolution. Rendering
+// below native and letting the display upscale therefore hands this shader a
+// motion buffer smaller than the image it is filtering.
+//
+// Every read here addresses by normalised UV against motionDims, so the texel
+// chosen is always correct and nothing needs to be resampled into a matching
+// buffer. Upscaling motion to colour resolution and then point sampling it back
+// would be a no-op that costs a pass and bandwidth. What a mismatch actually
+// costs is that nearest-neighbour MAGNIFICATION stair-steps, which shows up as a
+// blocky velocity field and a blocky early-out boundary.
+//
+// So filter on read instead. Manual bilinear in four Loads rather than a
+// SampleLevel, because the chain is deliberately sampler-free: a descriptor
+// being invalid must not be able to break the filter's only input. The mismatch
+// test is uniform across the dispatch, so it is free, and when the resolutions
+// agree this collapses back to the single Load the shader always issued.
+//
+// Magnification is the case worth supporting. If motion ever ends up FINER than
+// colour, bilinear is no worse than nearest, but it is not a true minification
+// filter and the buffer has no mips to fall back on.
+//
+// Only the centre read is filtered. The per-tap read inside the tap loop is left
+// point sampled: bilinear there would turn N loads into 4N, and it only refines a
+// weighting term, whereas the centre read is what sets the visible streak
+// direction and where the blur starts and stops. The debug views deliberately keep
+// direct Loads so they show the buffer as the game wrote it.
+float2 SampleMotionFiltered(float2 uv, int2 dims, int2 working) {
+  // One return and an explicitly initialised result, rather than returning early
+  // from each branch: FXC reports X4000 on the multi-return form even though both
+  // paths assign. The branch is uniform across the dispatch, so the untaken side
+  // costs nothing, and each side issues only the loads it needs.
+  const bool sameRes = (dims.x == working.x && dims.y == working.y);
+  const int2 hi = dims - 1;
+  // Named result_, not out: `out` is reserved in HLSL.
+  float2 result_ = float2(0.0, 0.0);
+  if (sameRes) {
+    result_ = g_srcMotion[clamp(int2(uv * float2(dims)), int2(0, 0), hi)].xy;
+  } else {
+    const float2 t = uv * float2(dims) - 0.5;
+    const float2 f = frac(t);
+    const int2 b = (int2)floor(t);
+    const float2 top = lerp(g_srcMotion[clamp(b, int2(0, 0), hi)].xy,
+                            g_srcMotion[clamp(b + int2(1, 0), int2(0, 0), hi)].xy, f.x);
+    const float2 bot = lerp(g_srcMotion[clamp(b + int2(0, 1), int2(0, 0), hi)].xy,
+                            g_srcMotion[clamp(b + int2(1, 1), int2(0, 0), hi)].xy, f.x);
+    result_ = lerp(top, bot, f.y);
+  }
+  return result_;
 }
 
 float2 SampleJitter(int2 p) {
@@ -200,7 +262,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   float vmaxLength = length(vmax);
   const bool blurred = motionValid && (vmaxLength > minVelocityUV);
 
-  // Adaptive ladder. N comes from the bucket, bounded by Max Samples. Keyed to
+  // Adaptive ladder. N comes from the bucket, bounded by the Quality preset's
+  // tap count. Keyed to
   // |vmax| in absolute UV, so it does not move when Max Radius does.
   int bucket = blurred ? MBSampleBucket(vmaxLength) : 0;
 
@@ -294,8 +357,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
   // ---- Section 4.1: two sampling directions ----
   float2 wn = vmax / vmaxLength;
-    float2 centerVelocity = MBGameMotionToUV(
-        g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)].xy);
+  // Filtered read: this is the one that sets the visible streak direction, so it
+  // is the one where a motion buffer smaller than colour would stair-step. See
+  // SampleMotionFiltered for why the per-tap read below stays point sampled.
+  float2 centerVelocity = MBGameMotionToUV(
+      SampleMotionFiltered(uv, motionDims, int2(workingW, workingH)));
   float centerLength = length(centerVelocity);
   float2 wp = float2(-wn.y, wn.x);
   if (dot(wp, centerVelocity) < 0.0) wp = -wp;  // Appendix A sign flip

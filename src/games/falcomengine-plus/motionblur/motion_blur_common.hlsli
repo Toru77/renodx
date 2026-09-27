@@ -238,8 +238,16 @@ int MBSampleBucket(float vmaxUV) {
 
 // maxSamples is a CEILING: every rung is clamped to it and the top rung IS it.
 // Returning max(maxSamples, 20) instead would let a ceiling of 8 emit 20 taps,
-// which inverts the setting. Pinning maxSamples to 4 clamps every rung to 4,
-// which is how a fixed low tap count is requested.
+// which inverts the setting.
+//
+// The ceiling arrives from the Quality preset as 12/16/20/24, and the rungs below
+// are 4/6/8/12/16, so the presets interact with the ladder differently: at High
+// and Ultra every rung is distinct, while at Low (12) the top three rungs all
+// clamp to 12 and "very fast" stops being distinguishable from "extremely fast".
+// That is the intended cost of the Low preset, not a fault -- it is the only tier
+// where the ladder stops discriminating. Pinning the ceiling to 4 would clamp
+// every rung to 4, but no preset goes that low, so there is no longer a way to
+// force a fixed 4-tap blur from the UI.
 //
 // NOTE: with a per-pixel bound a warp runs to its longest member, so the realised
 // saving is bounded by divergence rather than by the mean. Rungs are tile-coherent

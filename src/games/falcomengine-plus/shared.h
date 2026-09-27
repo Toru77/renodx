@@ -415,9 +415,10 @@ struct ShaderInjectData {
   float mb_intensity;               // [0..2], default 1 — shutter scale on the gather's
                                     // integration DOMAIN (not on velocity); 0 is an exact
                                     // no-op, and the domain is capped at one tile
-  float mb_sample_count;            // [4..48], default 25 — CEILING on taps (paper N).
-                                    // The adaptive ladder picks a rung at or below this;
-                                    // pinning it to 4 makes every rung clamp to 4.
+  float mb_sample_count;            // 12/16/20/24, default 16 (Medium) - CEILING on
+                                    // taps (paper N). Written by the addon from the
+                                    // Quality preset; not bound to a setting, because
+                                    // the shader wants a tap count, not a preset index.
   float mb_max_radius_px;           // [8..80], default 40 — paper r; also drives the
                                     // square tile size (2x this in pixels)
   float mb_center_weight_k;         // [1..100], default 40 — paper k (centre weight bias)
@@ -481,15 +482,19 @@ struct ShaderInjectData {
                                   // streak at which a tile moves to half resolution.
                                   // Sits where the sample ladder jumps to 16 taps, so
                                   // the most expensive rungs take the cheap path.
-  float mb_frame_rate_reference;  // [0..240], default 60 — framerate the motion is
-                                  // normalised TO, in fps. 0 disables normalisation.
-  float mb_frame_scale;           // runtime: (1/referenceFps) / smoothedFrameInterval,
-                                  // clamped to [0.25..4]. Motion vectors are per-frame
-                                  // displacements, so without this the streak, the
-                                  // ladder buckets, the early-out and the half-res split
-                                  // would all change with framerate. Applying it once,
-                                   // in MBGameMotionToUV, puts all of them into
-                                   // reference-frame units together. 1.0 = no-op.
+  float mb_frame_rate_reference;  // [0..240], default 0 — framerate the motion is
+                                  // normalised TO, in fps. 0 = UE's
+                                  // r.MotionBlurTargetFPS 0: track the measured
+                                  // frame time with a 0.1 moving average, so the
+                                  // shutter spans the real frame and the scale
+                                  // converges to 1.0 at any steady rate.
+  float mb_frame_scale;           // runtime: targetDt / dt, clamped to [0.25..4].
+                                  // Motion vectors are per-frame displacements, so
+                                  // without this the streak, the ladder buckets, the
+                                  // early-out and the half-res split would all
+                                  // change with framerate. Applying it once,
+                                  // in MBGameMotionToUV, puts all of them into
+                                  // reference-frame units together. 1.0 = no-op.
   // ---- camera term (appended last) ----
   // The object channel is gone; the streak LENGTH is now the camera's share of
   // the total magnitude, and that ratio is a compile-time constant in
@@ -510,6 +515,17 @@ struct ShaderInjectData {
   // Debug View "Object Residual" black on a static scene.
   float mb_camera_sign;    // +1 = cur - prev, -1 = prev - cur. Default 1.
   float mb_camera_jitter;  // 1 = add jitterDiff_g, 0 = omit. Default 1.
+  // ---- camera-cut rejection ----
+  // 0/1 toggle. When on, motion_blur_resolve compares the current view-projection
+  // against prevViewProj_g and writes ZERO velocity for that frame if the implied
+  // screen displacement is implausibly large, which is what stops a teleport or a
+  // cutscene transition from smearing the whole frame toward the warp point.
+  // Separate from a threshold so it can be switched off wholesale for A/B.
+  float mb_camera_cut;
+  // [8..512], default 120 — that displacement limit in 1080-reference pixels,
+  // measured at a nominal depth. A fast camera whip is roughly 30-80 px/frame at
+  // 60 fps; a scene cut is hundreds. Read only when mb_camera_cut is on.
+  float mb_camera_cut_px;
 };
 
 #ifndef __cplusplus
