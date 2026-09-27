@@ -47,7 +47,11 @@ cbuffer cb_scene : register(b0)
 };
 
 Texture2D<float4>    g_srcColor       : register(t0);
-Texture2D<float2>    g_srcMotion      : register(t1);
+// float4, not float2: motion_blur_resolve writes .xy = camera/object blend and
+// .zw = camera-only. TileMax still declares float2 over the same resource and
+// takes .xy. When the resolve pass is skipped this is the game's own motion
+// texture, where .zw is unused.
+Texture2D<float4>    g_srcMotion      : register(t1);
 Texture2D<float2>    g_srcNeighborMax : register(t2);
 // Single-channel, matching the game's other depth readers (gtvbao, ssrr2,
 // lighting). Declaring this float2 made `addC - g_srcDepth[texel]` a float2
@@ -55,6 +59,10 @@ Texture2D<float2>    g_srcNeighborMax : register(t2);
 // mismatch the compiler rightly flagged.
 Texture2D<float>     g_srcDepth       : register(t3);
 Texture3D<float2>    g_isfastNoise    : register(t4);
+// The game's UNRESOLVED motion, bound beside the resolved one. Read only by the
+// Camera/Object Velocity views, which return before the tap loop, so the filter
+// itself never issues a load against it.
+Texture2D<float2>    g_srcGameMotion  : register(t5);
 RWTexture2D<float4>  g_outColor       : register(u0);
 
 // Point lookup: a tap is a real pixel, not a filtered one. Also keeps depth
@@ -137,17 +145,46 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   float2 uv = (float2(p) + 0.5) / float2(workingW, workingH);
   float4 centerSample = g_srcColor[p];
 
+  int debugView = (int)(shader_injection_data.mb_debug_view + 0.5);
+
+  // One routing decision, shared by the Half Res Detect view and the reject
+  // below. Guarded so the full-resolution path -- the default -- does not pay for
+  // a fetch it has never paid for: the decision is only needed when the split is
+  // active or when that view is being drawn, and both are uniform across the
+  // dispatch, so the branch costs nothing.
+  const bool needRouting = splitActive || (debugView == 7);
+  float2 routingVMax = float2(0.0, 0.0);
+  if (needRouting) {
+    routingVMax = motionValid ? g_srcNeighborMax[MBRoutingTile(uv)] : float2(0.0, 0.0);
+  }
+  const bool longMotion = length(routingVMax) >= halfResUV;
+
+  if (debugView == 7) {
+    // Must come BEFORE the reject below, which discards the pixels this dispatch
+    // does not own and would never reach a debug view otherwise.
+    //
+    // Grey marks a tile that will not blur at all (below the 0.5px early-out), so
+    // "slow but full res" is distinguishable from "not moving". That test uses the
+    // ROUTING vmax rather than the jittered filter vmax: the partition is per-tile,
+    // the two differ by at most one tile, and using the routing value avoids the
+    // 3D noise fetch the jittered lookup would otherwise need here.
+    const bool blursAtAll = motionValid && (length(routingVMax) > minVelocityUV);
+    float3 detect = !splitActive ? float3(0.0, 0.0, 1.0)       // split disabled
+                  : !blursAtAll  ? float3(0.25, 0.25, 0.25)  // too slow to blur
+                  : longMotion   ? float3(1.0, 0.0, 0.0)       // half resolution
+                                 : float3(0.0, 1.0, 0.0);      // full resolution
+    g_outColor[p] = float4(detect, 1.0);
+    return;
+  }
+
   // Routing happens here, before the noise load, so a pixel the other gather owns
   // costs two fetches (colour + routing) instead of three.
-  if (splitActive) {
-    float2 routingVMax = motionValid ? g_srcNeighborMax[MBRoutingTile(uv)] : float2(0.0, 0.0);
-    if ((length(routingVMax) >= halfResUV) != ownsLong) {
-      // Not this dispatch's motion class. Always write, and write the untouched
-      // source, so that a pixel the composite misjudges at a tile boundary shows
-      // an unblurred frame rather than stale data from a previous one.
-      g_outColor[p] = centerSample;
-      return;
-    }
+  if (splitActive && (longMotion != ownsLong)) {
+    // Not this dispatch's motion class. Always write, and write the untouched
+    // source, so that a pixel the composite misjudges at a tile boundary shows
+    // an unblurred frame rather than stale data from a previous one.
+    g_outColor[p] = centerSample;
+    return;
   }
 
   float2 jitter = SampleJitter(p);
@@ -162,8 +199,6 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   float2 vmax = motionValid ? g_srcNeighborMax[neighborTile] : float2(0.0, 0.0);
   float vmaxLength = length(vmax);
   const bool blurred = motionValid && (vmaxLength > minVelocityUV);
-
-  int debugView = (int)(shader_injection_data.mb_debug_view + 0.5);
 
   // Adaptive ladder. N comes from the bucket, bounded by Max Samples. Keyed to
   // |vmax| in absolute UV, so it does not move when Max Radius does.
@@ -180,7 +215,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // TileMax/NeighborMax fault look exactly like a dead motion buffer, which is
     // precisely the misdiagnosis this view caused once already.
     float2 centerVelocity = motionValid
-        ? MBGameMotionToUV(g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)])
+        ? MBGameMotionToUV(g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)].xy)
         : float2(0.0, 0.0);
     float centerLength = length(centerVelocity);
     float2 dir = (centerLength > 1e-8) ? centerVelocity / centerLength : float2(0.0, 0.0);
@@ -209,6 +244,50 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     g_outColor[p] = float4(saturate(vmaxLength / tileUV).xxx, 1.0);
     return;
   }
+  if (debugView == 8 || debugView == 9) {
+    // 8 = camera only, 9 = object only. The CPU forces the resolve pass on for
+    // these two, so .zw really is camera velocity and not whatever the game
+    // texture happened to carry there.
+    //
+    // Object is the DIFFERENCE against the game's own motion, which is what makes
+    // it the decisive test: the jitter delta is present in both terms, so it
+    // cancels here and the view must read pure black for a static camera AND a
+    // static scene. A structured ~0.5-1px residual means the resolve pass is
+    // adding jitterDiff_g on top of a prevViewProj_g that already carries it.
+    float2 px = float2(0.0, 0.0);
+    if (motionValid) {
+      const int2 mtexel = clamp(int2(uv * float2(motionDims)), 0, motionDims - 1);
+      const float2 cameraPx = g_srcMotion[mtexel].zw;
+      px = (debugView == 8) ? cameraPx : (g_srcGameMotion[mtexel] - cameraPx);
+    }
+    float2 vel = MBGameMotionToUV(px);
+    float len = length(vel);
+    float2 dir = (len > 1e-8) ? vel / len : float2(0.0, 0.0);
+    g_outColor[p] = float4(float3(saturate(len / tileUV), dir * 0.5 + 0.5), 1.0);
+    return;
+  }
+
+  if (debugView == 10) {
+    // Object Residual: on a STATIC scene the object channel must be zero, because
+    // the game's motion is then entirely camera motion. So this view is a pure
+    // error readout for the camera term -- objPx = gamePx - camPx means every
+    // camera error lands here at FULL size, negated, rather than being averaged
+    // away. A clean mirror of the Camera Velocity view in this one means the
+    // camera estimate is inverted or mis-scaled, not that object motion exists.
+    //
+    // Full scale is minVelocityUV, the gather's own 0.5px early-out, so this asks
+    // exactly the question the filter asks: anything bright here WILL blur. Black
+    // means it will not. That makes the Camera Direction / Camera Jitter
+    // combination self-determining without judging hues.
+    float2 px = float2(0.0, 0.0);
+    if (motionValid) {
+      const int2 mtexel = clamp(int2(uv * float2(motionDims)), 0, motionDims - 1);
+      px = g_srcGameMotion[mtexel] - g_srcMotion[mtexel].zw;
+    }
+    g_outColor[p] = float4(saturate(length(MBGameMotionToUV(px))
+                                   / max(minVelocityUV, 1e-8)).xxx, 1.0);
+    return;
+  }
 
   // Paper early-out: nothing is moving here, or the motion buffer is unusable.
   if (!blurred) {
@@ -218,8 +297,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
   // ---- Section 4.1: two sampling directions ----
   float2 wn = vmax / vmaxLength;
-  float2 centerVelocity = MBGameMotionToUV(
-      g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)]);
+    float2 centerVelocity = MBGameMotionToUV(
+        g_srcMotion[clamp(int2(uv * float2(motionDims)), 0, motionDims - 1)].xy);
   float centerLength = length(centerVelocity);
   float2 wp = float2(-wn.y, wn.x);
   if (dot(wp, centerVelocity) < 0.0) wp = -wp;  // Appendix A sign flip
@@ -287,7 +366,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float sampleLength = centerLength;
     if (localWeights) {
       int2 motionTexel = clamp(int2(sampleUV * motionF), int2(0, 0), motionMax);
-      float2 sampleVelocity = MBGameMotionToUV(g_srcMotion[motionTexel]);
+        float2 sampleVelocity = MBGameMotionToUV(g_srcMotion[motionTexel].xy);
       wB = dot(MBNorm(sampleVelocity), d);
       sampleLength = length(sampleVelocity);
     }

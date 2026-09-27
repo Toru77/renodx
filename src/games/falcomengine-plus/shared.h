@@ -409,7 +409,11 @@ struct ShaderInjectData {
   // Motion blur runs in UV space; every length below is a 1080p-equivalent
   // pixel value and is converted by motionblur/motion_blur_common.hlsli, so a
   // 4K player sees the same blur as a 1080p player.
-  float mb_mode;                    // 0=Off, 1=Cutscene Only, 2=Always On
+    // 0=Off, 1=Cutscene Only, 2=Always On. RETIRED, unread by any shader and now
+    // written by nothing: the per-channel modes live in CPU-side statics because
+    // they are gates, and only the two resolved weights are pushed (see
+    // mb_camera_weight). Kept so later packoffsets do not move.
+    float mb_mode;
   float mb_intensity;               // [0..2], default 1 — shutter scale on the gather's
                                     // integration DOMAIN (not on velocity); 0 is an exact
                                     // no-op, and the domain is capped at one tile
@@ -484,8 +488,33 @@ struct ShaderInjectData {
                                   // displacements, so without this the streak, the
                                   // ladder buckets, the early-out and the half-res split
                                   // would all change with framerate. Applying it once,
-                                  // in MBGameMotionToUV, puts all of them into
-                                  // reference-frame units together. 1.0 = no-op.
+                                   // in MBGameMotionToUV, puts all of them into
+                                   // reference-frame units together. 1.0 = no-op.
+  // ---- camera / object velocity separation (appended last) ----
+  // How much of the streak LENGTH each source is responsible for, for THIS frame,
+  // already resolved from its mode (Off / Cutscene Only / Always On), its amount
+  // and the cutscene signal, on the CPU. 0 means that source contributes nothing.
+  //
+  // The resolve pass does NOT sum the two vectors. Doing so let each slider steer
+  // the streak's DIRECTION, so lowering one lengthened the streak by swapping in
+  // the other vector instead of shortening it, and the labels read backwards. It
+  // fixes the direction to the true screen motion and scales only the length:
+  //     out = game * (camLen*w_cam + objLen*w_obj) / (camLen + objLen)
+  // Both weights at 1 makes the ratio exactly 1, so out == game and the CPU can
+  // skip the pass entirely, reproducing the pre-separation image bit for bit.
+  float mb_camera_weight;  // [0..2], default 1
+  float mb_object_weight;  // [0..2], default 1
+  // ---- convention probe (appended last) ----
+  // The game's motion encoding is documented inconsistently in this repo:
+  // motion_blur_common.hlsli says prevPixel - curPixel, while the decompiled
+  // writer (staticfoliage_0xF1EC53A8:201-207) reads as cur - prev because of the
+  // order of its arithmetic. Its v5/v6 varyings are never labelled, so which is
+  // the previous clip position is an INFERENCE, and getting it backwards negates
+  // the whole camera term. These two exist so that can be determined from the
+  // image rather than argued: the correct combination is the one that renders
+  // Debug View "Object Residual" black on a static scene.
+  float mb_camera_sign;    // +1 = cur - prev, -1 = prev - cur. Default 1.
+  float mb_camera_jitter;  // 1 = add jitterDiff_g, 0 = omit. Default 1.
 };
 
 #ifndef __cplusplus
