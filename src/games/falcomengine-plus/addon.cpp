@@ -2137,11 +2137,52 @@ renodx::utils::settings::Settings settings = {
       .min = 0.25f, .max = 2.5f, .format = "%.2fx",
     },
     new renodx::utils::settings::Setting{
-      .key = "DOFSampleCount", .binding = &shader_injection.dof_sample_count,
+      // Deliberately a different key from the old raw "DOFSampleCount" slider.
+      // That setting stored the tap count itself, and this one stores a 0-3
+      // quality INDEX, so the two cannot share a key: a saved preset holding 12,
+      // 24 or 64 would be clamped by LoadSetting into the valid index range and
+      // every one of them would silently resolve to "Ultra". Renaming orphans the
+      // stale value instead, so the tiers start clean at their default.
+      .key = "DOFQuality", .binding = &shader_injection.dof_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 24.f, .label = "Sample Count", .section = "Depth of Field",
-      .tooltip = "Higher values produce smoother bokeh at higher cost.",
-      .min = 4.f, .max = 64.f, .format = "%d",
+      .default_value = 2.f, .label = "Quality", .section = "Depth of Field",
+      .tooltip = "Bokeh gather quality: Low 12, Medium 18, High 24, Ultra 30 taps. "
+                 "Higher tiers produce smoother bokeh at higher cost. With Adaptive "
+                 "Samples on, this becomes the MAXIMUM and only the most blurred "
+                 "pixels reach it.",
+      .labels = {"Low", "Medium", "High", "Ultra"},
+      // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
+      // 4 would clamp the index into the empty range [4, 3] on load.
+      .min = 0.f,
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .parse = [](float value) {
+        static constexpr float taps[] = {12.f, 18.f, 24.f, 30.f};
+        const int index = static_cast<int>(value);
+        return taps[index < 0 ? 0 : (index > 3 ? 3 : index)];
+      },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFAdaptiveSamples", .binding = &shader_injection.dof_adaptive_samples,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Adaptive Samples", .section = "Depth of Field",
+      .tooltip = "Scales each pixel's tap count to its own blur radius, so lightly "
+                 "blurred pixels cost far less. Quality becomes the maximum. "
+                 "Off = every blurred pixel uses the full Quality tap count, as before.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "DOFTapCountView", .binding = &shader_injection.dof_debug_view,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Tap Count View", .section = "Depth of Field",
+      .tooltip = "Replaces the image with a per-pixel map of the adaptive ladder: one "
+                 "hue per tap-count rung, and BLACK where the pixel early-outs and "
+                 "costs nothing. Read the area fractions to find the real average tap "
+                 "count, which is what the ladder thresholds should be tuned against.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.dof_mode >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "DOFNearScale", .binding = &shader_injection.dof_near_scale,

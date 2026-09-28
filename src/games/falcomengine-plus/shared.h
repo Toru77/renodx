@@ -168,7 +168,7 @@ struct ShaderInjectData {
   float dof_mode;                      // 0=Vanilla, 1=Improved
   float dof_strength;                  // [0..2], default 1 — overall blend for improved DOF
   float dof_radius_scale;              // [0.25..2.5], default 1.33 — blur radius from CoC
-  float dof_sample_count;              // [4..64], default 24
+  float dof_sample_count;              // taps: 12/18/24/30 from the Quality tiers, default 24
   float dof_near_scale;                // [0..2], default 1 — near-field CoC response
   float dof_far_scale;                 // [0..2], default 1 — far-field CoC response
   float dof_coc_curve;                 // [0.25..4], default 1 — pow(CoC, Curve)
@@ -525,8 +525,23 @@ struct ShaderInjectData {
   // [8..512], default 120 — that displacement limit in 1080-reference pixels,
   // measured at a nominal depth. A fast camera whip is roughly 30-80 px/frame at
   // 60 fps; a scene cut is hundreds. Read only when mb_camera_cut is on.
-  float mb_camera_cut_px;
-};
+   float mb_camera_cut_px;
+   // ---- DoF adaptive sampling (appended last: do not insert above) ----
+   // 0/1 toggle, default 1. When on, the bokeh gather picks each pixel's tap
+   // count from its OWN blur radius instead of using dof_sample_count
+   // everywhere, and dof_sample_count becomes the CEILING rather than the count.
+   // When off, the gather is identical to the pre-adaptive algorithm.
+   //
+   // Appending here rather than beside the other dof_* fields is deliberate:
+   // this struct is pushed to every shader in the addon, so a mid-struct insert
+   // would move the packoffset of everything after it.
+   float dof_adaptive_samples;
+   // 0=Off, 1=Tap Count. The tap-count view colours every pixel by the rung the
+   // ladder gave it, and BLACK where the pixel early-outs and costs no taps at
+   // all -- a different state from the 4-tap rung, and the distinction is the
+   // whole point of the view. Read only when dof_adaptive_samples is on.
+   float dof_debug_view;
+ };
 
 #ifndef __cplusplus
 cbuffer shader_injection : register(b13) {

@@ -133,13 +133,99 @@ SamplerState dofIsfastNoiseSamp
 // 3Dmigoto declarations
 #define cmp -
 
+// ── Adaptive tap ladder (DoF) ────────────────────────────────────────────────
+// How many taps a pixel gets, as a function of its blur radius in PIXELS.
+//
+// Keyed to pixels, not to CoC, and the distinction is not cosmetic: banding is a
+// per-pixel phenomenon. The same CoC spans twice as many pixels at 4K as at
+// 1080p, and smoothing a wider disc needs proportionally more angular
+// resolution. Keying on |CoC| would therefore silently under-sample at high
+// resolution while looking perfectly tuned at 1080p.
+//
+// Absolute pixel thresholds also make this independent of cocMaxRadius, which is
+// a game-supplied constant, and of dof_radius_scale, which only scales the
+// result -- so neither a rebalance of those nor a resolution change silently
+// invalidates the tuning.
+//
+// TUNED AGAINST A MEASURED FAILURE, not against theory. The first version of this
+// ladder used absolute tap counts (4/6/8/14/24 at 2/5/10/18/30 px) and was
+// visibly wrong: in a real scene the 10-18 px band came out visibly undersampled
+// with visible bokeh structure, while the same scene at a flat 24 taps looked
+// correct. IS-FAST was confirmed on, so that was genuine undersampling rather
+// than the structured spiral ghosting an undecorrelated gather produces.
+//
+// The old ladder also had a dead rung: at a 24-tap ceiling, "24" and "maxTaps"
+// were the same number, so the ladder saturated before its own top rung and only
+// the aggressive part ever did anything. Inverting that was saving performance by
+// undersampling, which is exactly what the artefacts were.
+//
+// So the rungs are now FRACTIONS of the user's ceiling rather than fixed counts.
+// Two consequences, both wanted:
+//   * the ceiling engages from 10 px instead of 30 px, so the band that was
+//     failing now gets the full sample count;
+//   * raising Quality lifts the WHOLE ladder, instead of leaving the bottom
+//     rungs stranded where they were. That is what "it follows" has to mean if
+//     the ladder is to stay correct across the 12/18/24/30 tap tiers.
+//
+// This is deliberately conservative, and the performance that buys back is real
+// but smaller than the broken version appeared to offer: the saving is now
+// concentrated below 10 px of radius. That is the trade, made on purpose.
+uint MBDofTapCount(float radiusPx, uint maxTaps) {
+  float frac;
+  if      (radiusPx <  1.0f) frac = 0.17f;   // sub-pixel disc; 24 taps is wasted
+  else if (radiusPx <  2.5f) frac = 0.33f;
+  else if (radiusPx <  6.0f) frac = 0.58f;
+  else if (radiusPx < 10.0f) frac = 0.83f;
+  else                        frac = 1.00f;   // the band that was failing
+  return clamp((uint)round(frac * (float)maxTaps), 4u, max(maxTaps, 4u));
+}
+
+// The gather and the tap-count view both go through this, so the view cannot
+// disagree with what the filter actually did. When adaptive is off it returns
+// max_samples unchanged, which is what makes the off path bit-identical to the
+// pre-adaptive algorithm rather than merely close to it.
+int MBDofAdaptiveCount(float absCoc, int maxSamples) {
+  if (shader_injection_data.dof_adaptive_samples <= 0.5f) return maxSamples;
+  const float radius_px = absCoc * cocMaxRadius
+                        * max(shader_injection_data.dof_radius_scale, 0.001f);
+  return (int)MBDofTapCount(radius_px, (uint)maxSamples);
+}
+
+// One hue per rung, so the cost distribution is readable as area fractions at a
+// glance rather than as subtle grey steps. Never used for the output image.
+//
+// Keyed on the RUNG as a fraction of the ceiling, not on an absolute tap count.
+// The ladder is defined in ceiling fractions, so absolute thresholds would
+// mislabel everything the moment Quality moved: at the 30-tap ceiling the
+// rungs are 5/10/17/25/30 and every one of them would fall past a "<= 24" bucket
+// and read red. Same five colours in the same order, so the ladder always reads
+// the same way at any ceiling.
+//
+// The top hue is RED, which now means "this pixel is at the ceiling". Under the
+// first version of the ladder yellow was the failing band; after re-pitching
+// that same band sits at the ceiling, so it shows red. The colour that matters
+// for "is this region under-sampled" is red, and it is now the honest signal for
+// it.
+float3 MBDofBucketColor(int taps, int maxTaps) {
+  const float f = (float)taps / (float)max(maxTaps, 1);
+  if (f < 0.25f) return float3(0.10, 0.10, 0.55);  // lowest rung
+  if (f < 0.45f) return float3(0.10, 0.55, 0.55);
+  if (f < 0.70f) return float3(0.15, 0.65, 0.15);
+  if (f < 0.95f) return float3(0.75, 0.75, 0.10);
+  return float3(0.85, 0.10, 0.10);                // at the ceiling
+}
+
 float3 GatherDOFImproved(float2 uv, float2 texel_size, float4 center_sample) {
   const float center_coc = center_sample.w;
   const float abs_center_coc = abs(center_coc);
   const float radius_px = abs_center_coc * cocMaxRadius * max(shader_injection_data.dof_radius_scale, 0.001f);
   if (radius_px <= 1e-4f) return center_sample.rgb;
 
-  const int sample_count = clamp((int)round(shader_injection_data.dof_sample_count), 4, 64);
+  // max_samples is what the Quality setting says (12/18/24/30). With adaptive off,
+  // sample_count IS max_samples and every use of it below is unchanged; with it
+  // on, sample_count is a per-pixel rung under that ceiling.
+  const int max_samples = clamp((int)round(shader_injection_data.dof_sample_count), 4, 64);
+  const int sample_count = MBDofAdaptiveCount(abs_center_coc, max_samples);
   const float edge_threshold = max(shader_injection_data.dof_edge_threshold, 1e-4f);
   // Option A: opposite-layer taps are attenuated by sign_softness instead of hard-rejected.
   const float sign_softness = saturate(shader_injection_data.dof_sign_softness);
@@ -173,20 +259,32 @@ float3 GatherDOFImproved(float2 uv, float2 texel_size, float4 center_sample) {
   // Option A: de-biased anchor — the sharp center participates with a finite
   // weight so starved thin features converge toward surviving taps instead of
   // snapping back to the unblurred pixel.
-  const float anchor_weight = 0.25f;
+  //
+  // Scaled by the tap count because that weight is RELATIVE, and the tap weights
+  // are not. Tap weight is exp2(-2*ring^2), so their sum grows with the tap
+  // count (roughly 2.15 at 4 taps, ~30 at 64) while the anchor stays fixed at
+  // 0.25. Left alone, the centre pixel would carry ~10% of the weight at 4 taps
+  // against ~0.8% at 64, and the ladder would quietly reduce BLUR STRENGTH on the
+  // lightly blurred pixels it was supposed to make cheaper and nothing else.
+  // Dividing by the count ratio holds the centre's share constant.
+  //
+  // This is self-disabling: with adaptive off, sample_count == max_samples, so
+  // the ratio is exactly 1.0 and the anchor is 0.25 as before.
+  const float anchor_weight = 0.25f * ((float)sample_count / (float)max_samples);
   float3 accum = center_sample.rgb * anchor_weight;
   float weight_sum = anchor_weight;
 
   // Option B accumulators (taps only; center excluded from coverage stats).
-  float3 plain_accum = float3(0.0f, 0.0f, 0.0f);
+  float3 plain_accum = float3(0.0, 0.0, 0.0);
   float plain_wsum = 0.0f;
   float layer_tap_wsum = 0.0f;
   float all_tap_wsum = 0.0f;
 
+  // Bound is the per-pixel count directly. It used to be a static 64 with a
+  // `if (tap >= sample_count) break;` inside, which cost two compares per tap;
+  // that shape also assumed sample_count was uniform, which it no longer is.
   [loop]
-  for (int tap = 0; tap < 64; ++tap) {
-    if (tap >= sample_count) break;
-
+  for (int tap = 0; tap < sample_count; ++tap) {
     float t = ((float)tap + 0.5f) / (float)sample_count;
     float ring = sqrt(t);
     float angle = golden_angle * (float)tap + gather_rot;
@@ -249,6 +347,25 @@ void main(
     float layer_scale = (center_sample.w < 0.0f)
                             ? max(shader_injection_data.dof_near_scale, 0.0f)
                             : max(shader_injection_data.dof_far_scale, 0.0f);
+
+    // Tap Count view. Placed BEFORE the blend early-out on purpose: the pixels
+    // that early-out are usually the majority of the frame and they cost NOTHING,
+    // which is a different state from being in the 4-tap rung. If this came after
+    // the early-out they would all be reported as centre samples and the view
+    // would overstate the cost of the whole frame.
+    //
+    // Routed through MBDofAdaptiveCount so the view is computed by the same code
+    // the gather uses and cannot drift from it.
+    if (shader_injection_data.dof_debug_view > 0.5f) {
+      const int dbg_max = clamp((int)round(shader_injection_data.dof_sample_count), 4, 64);
+      const float dbg_radius = coc_abs * cocMaxRadius
+                             * max(shader_injection_data.dof_radius_scale, 0.001f);
+      o0 = float4(dbg_radius <= 1e-4f
+                     ? float3(0.0f, 0.0f, 0.0f)   // black = early-out, costs no taps
+                     : MBDofBucketColor(MBDofAdaptiveCount(coc_abs, dbg_max), dbg_max), 1.0f);
+      return;
+    }
+
     float blend = saturate(coc_abs * layer_scale * max(shader_injection_data.dof_strength, 0.0f));
     if (blend <= 1e-4f) {
       o0 = center_sample;
