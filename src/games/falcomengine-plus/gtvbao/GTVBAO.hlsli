@@ -196,6 +196,14 @@ lpfloat GTVBAO_FastACos( lpfloat inX )
 
 #define GT_VBAO_BITMASK_SECTOR_COUNT 32u
 
+// Texel offset for the depth-derived SAMPLE normal used by the GI's
+// (n_j . -l_j) term when MRT g-buffer normals are unavailable. 2 rather than 1
+// because the depth chain is already prefiltered, so a single-texel difference
+// is too noisy to build a stable normal from.
+#ifndef GT_VBAO_GI_NORMAL_TAP
+#define GT_VBAO_GI_NORMAL_TAP 2.0f
+#endif
+
 // Population count (count set bits in uint).
 uint GTVBAO_CountBits(uint v)
 {
@@ -756,8 +764,27 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         float3 lightDir = (float3)sampleHorizonVec;
                         float NdotL = saturate(dot((float3)viewspaceNormal, lightDir));
 
-                        // Sample normal for (n_j · −l_j) weighting.
-                        // Use MRT g-buffer normal if available, else fall back to pixel normal.
+                        // Sample normal for the (n_j . -l_j) weighting.
+                        //
+                        // MRT g-buffer normal is the accurate source, used
+                        // whenever available. The fallback must NOT be the
+                        // pixel normal: that makes this term the exact
+                        // complement of NdotL above, because with
+                        // sampleNormal == viewspaceNormal and
+                        //     NdotL  = saturate( dot(N,  L))
+                        //     NsDotL = saturate( dot(N, -L))
+                        // the product is saturate(x) * saturate(-x), which is
+                        // zero for EVERY x -- positive, negative or zero. So
+                        // it is identically zero across the whole image and
+                        // VBGI rendered black whenever MRT normals were off.
+                        // It only ever produced light because on the MRT path
+                        // the sample's own normal genuinely differs from the
+                        // pixel's.
+                        //
+                        // So reconstruct the sample's surface normal from the
+                        // depth buffer instead. The centre is already in hand
+                        // (SZ / samplePos), so this costs two extra taps and
+                        // runs only for samples that already pass newCount > 0.
                         float3 sampleNormal = (float3)viewspaceNormal;
                         if (GTVBAO_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
                         {
@@ -771,6 +798,34 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                                 float3 decoded = DecodeMrtNormalAsIs((uint2)mrtTc);
                                 sampleNormal = TransformNormalToView(decoded);
                             }
+                        }
+                        else
+                        {
+                            // Depth-derived sample normal. Same mip as the
+                            // sample, so the reconstructed geometry matches the
+                            // one the horizon was taken from.
+                            float2 giTexel = (float2)consts.ViewportPixelSize * (float)GT_VBAO_GI_NORMAL_TAP;
+                            float2 uR = sampleScreenPos + float2( giTexel.x, 0.0 );
+                            float2 uD = sampleScreenPos + float2( 0.0, giTexel.y );
+                            float  zR = sourceViewspaceDepth.SampleLevel( depthSampler, uR, mipLevel ).x;
+                            float  zD = sourceViewspaceDepth.SampleLevel( depthSampler, uD, mipLevel ).x;
+                            float3 pR = GTVBAO_ComputeViewspacePosition( uR, zR, consts );
+                            float3 pD = GTVBAO_ComputeViewspacePosition( uD, zD, consts );
+                            // samplePos is already the centre view position.
+                            float3 nrm  = cross( pR - samplePos, pD - samplePos );
+                            float  nlen = length( nrm );
+                            if (nlen > 1e-8) {
+                                sampleNormal = nrm / nlen;
+                                // Do not trust the cross product's handedness --
+                                // it depends on the NDC->view basis. Orient
+                                // toward the camera, or this term collapses to
+                                // zero for the same reason the fallback did.
+                                if (dot( sampleNormal, (float3)viewVec ) < 0.0)
+                                    sampleNormal = -sampleNormal;
+                            }
+                            // nlen <= 1e-8: flat or clamped-border sample. Keep
+                            // the pixel normal, costing that one sample its GI
+                            // weight rather than producing a NaN.
                         }
                         float NsDotL = saturate(dot(sampleNormal, -lightDir));
 
