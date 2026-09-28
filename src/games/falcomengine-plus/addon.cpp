@@ -108,7 +108,6 @@ ShaderInjectData shader_injection = {
   .gtvbao_denoise_blur_beta = 20.0f,
   .gtvbao_denoise_leak_threshold = 2.5f,
   .gtvbao_denoise_leak_strength = 0.5f,
-  .gtvbao_bitmask_falloff = 0.f,
   .gtvbao_temporal_blend = 0.f,
   .gtvbao_disocclusion_threshold = 0.01f,
   .gtvbao_debug_view = 0.f,
@@ -228,14 +227,6 @@ ShaderInjectData shader_injection = {
   .gtvbao_cosine_mode = 2.f,
   .gtvbao_thickness_enabled = 1.f,
   // ── Bitmask fix toggles: all default OFF = previously shipped behaviour ──
-  .gtvbao_fix_backface = 0.f,
-  .gtvbao_fix_sector_round = 0.f,
-  .gtvbao_sector_jitter = 0.f,
-  .gtvbao_fix_cdf_reference = 0.f,
-  .gtvbao_fix_slice_vvs = 0.f,
-  .gtvbao_gi_depth_binding = 0.f,
-  .gtvbao_gi_single_intensity = 0.f,
-  .gtvbao_gi_power = 0.f,
   .char_gtvbao_mode = 0.f,
   .char_gtvbao_mask_strength = 0.f,
   .char_gtvbgi_mask_strength = 0.f,
@@ -3098,7 +3089,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalDetailResponse", .binding = &g_gtvbao_normal_detail_response,
-      .default_value = 1.0f, .label = "Normal Detail Response", .section = "GTVBAO",
+      .default_value = 0.01f, .label = "Normal Detail Response", .section = "GTVBAO",
       .min = 0.01f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3150,96 +3141,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── Bitmask fix toggles (A/B against the baseline; all Off = shipped behaviour) ──
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOFixBackface", .binding = &shader_injection.gtvbao_fix_backface,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: Back Face (Alg.1 L15)", .section = "GTVBAO",
-      .tooltip = "Off: back face is offset along the sample ray, so the sector arc measures "
-                 "parallax along the view axis instead of the occluder's angular extent.\n"
-                 "On: offset along the view ray per Algorithm 1 line 15 (s_b = s_f - (p/|p|)t).",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOFixSectorRound", .binding = &shader_injection.gtvbao_fix_sector_round,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: Sector Half-Coverage", .section = "GTVBAO",
-      .tooltip = "Off: ceil - a sample activates a sector as soon as it touches it (+0.5 sector bias).\n"
-                 "On: round - the paper's half-coverage criterion, plus shift-range guards.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOSectorJitter", .binding = &shader_injection.gtvbao_sector_jitter,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: Sector Index Jitter", .section = "GTVBAO",
-      .tooltip = "Dither the sector index once per slice to break up the 32 hard bands. "
-                 "No temporal accumulation exists here, so the staircase never averages out.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOFixCdfReference", .binding = &shader_injection.gtvbao_fix_cdf_reference,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: Reference Horizon CDF", .section = "GTVBAO",
-      .tooltip = "Off: per-pixel similarity transform whose slope is sin(N.V) - identity at "
-                 "grazing angles, collapses every arc to a point when the normal faces the viewer.\n"
-                 "On: the reference slice-relative CDF, per slice, driven by that slice's projected normal.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOFixSliceVvs", .binding = &shader_injection.gtvbao_fix_slice_vvs,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: VVS Slice Frame (Mode 3)", .section = "GTVBAO",
-      .tooltip = "Off: the slice lobe has the right shape but a fixed screen-space orientation, "
-                 "mis-weighting any surface whose normal is not screen-up.\n"
-                 "On: draw the slice in the view-vec-space frame so the density peak lands on the "
-                 "projected normal. Cosine sampling mode must be 2 (CDF). Costs extra ALU.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOBitmaskFalloff", .binding = &shader_injection.gtvbao_bitmask_falloff,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: Distance Thickness Ramp", .section = "GTVBAO",
-      .tooltip = "Stand-in for the GTAO radial falloff the bitmask branch never had: the sector "
-                 "arc grows as t/distance, so a flat t starves distant occluders. Only has an "
-                 "effect together with Fix: Back Face.",
-      .labels = {"Off", "On"},
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOGiDepthBinding", .binding = &shader_injection.gtvbao_gi_depth_binding,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: GI Denoise Depth Source", .section = "GTVBAO",
-      .tooltip = "Off: the GI denoiser's depth edge-stop reads the 2-bit packed edge buffer.\n"
-                 "On: read the real view-space depth MIP0.",
-      .labels = {"Off", "On"},
-    .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOGiSingleIntensity", .binding = &shader_injection.gtvbao_gi_single_intensity,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: GI Intensity Once", .section = "GTVBAO",
-      .tooltip = "Off: vbgi_intensity is applied in the main pass and again in the lighting "
-                 "composite, so it is squared.\nOn: apply it once, in the main pass.",
-      .labels = {"Off", "On"},
-    .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "GTVBAOGiPower", .binding = &shader_injection.gtvbao_gi_power,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Fix: GI Power Curve", .section = "GTVBAO",
-      .tooltip = "Apply the 1.5 GI power curve that was reserved at c[27] but never read. "
-                 "Off reproduces the shipped output exactly.",
-      .labels = {"Off", "On"},
-    .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
-    .is_visible = []() { return IsAdvancedSettingsMode(); },
-    },
+    // ── GTVBAO scheduling ──
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFrameSkip", .binding = &g_gtvbao_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3496,7 +3398,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIMaxClamp", .binding = &shader_injection.vbgi_max_clamp,
-      .default_value = 0.2f, .label = "GI Max Clamp", .section = "VBGI",
+      .default_value = 0.0f, .label = "GI Max Clamp", .section = "VBGI",
       .tooltip = "Clamp GI per-channel to this maximum. 0 = off.",
       .min = 0.0f, .max = 20.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
@@ -10174,12 +10076,12 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
 
 // ── Push constants builder (kai-vanillaplus style) ──
 
-static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, 65> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f,
                                                        bool foliage_mask_valid = false,
                                                        int denoise_stage = 0,
                                                        float atrous_step = 1.f) {
-  std::array<float, 74> c = {};
+  std::array<float, 65> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -10207,70 +10109,61 @@ static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[21] = g_gtvbao_normal_max_darkening;
   c[22] = g_gtvbao_normal_darkening_mode;
   c[23] = g_gtvbao_normal_transform_mode;
-  c[24] = shader_injection.gtvbao_fix_backface;  // bitmask back-face direction (Alg.1 L15)
   // ── GI parameters (IS-FAST repurpose) ──
-  // isfast_passes (c[25]) = g_gi_enabled
-  c[25] = (ssgi_enabled_override >= 0.f) ? ssgi_enabled_override : shader_injection.vbgi_enabled; // GI enable
-  // isfast_samples (c[26]) = g_gi_light_exposure
-  c[26] = std::clamp(g_vbgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
-  c[27] = shader_injection.gtvbao_gi_power;  // GI power curve toggle (fixed 1.5 exponent, applied when on)
-  // isfast_edge_sensitivity (c[28]) = g_gi_intensity
-  c[28] = std::clamp(shader_injection.vbgi_intensity, 0.f, 5.f);  // GI intensity
-  // isfast_spatial_sigma (c[29]) = g_gi_saturation
-  c[29] = std::clamp(shader_injection.vbgi_saturation, 0.f, 2.f); // GI saturation
-  // isfast_hybrid_blend (c[30]) = g_gi_multibounce
-  c[30] = shader_injection.vbgi_multibounce;                       // multi-bounce (0/1)
-  c[31] = std::clamp(shader_injection.vbgi_multibounce_strength, 0.f, 10.f);  // feedback strength
-  c[32] = std::clamp(shader_injection.vbgi_multibounce_saturation, 0.f, 2.f); // feedback saturation
-  c[33] = std::clamp(shader_injection.vbgi_multibounce_max_clamp, 0.f, 20.f);  // multi-bounce max clamp
-  c[34] = shader_injection.vbgi_debug_view;                         // VBGI debug view
-  c[35] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
-  c[36] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
-  c[37] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
-  c[38] = shader_injection.vbgi_adaptive_mode;                       // 0=GI color, 1=albedo
-  c[39] = std::clamp(shader_injection.vbgi_adaptive_luma_strength, 0.f, 5.f); // 0=off
-  c[40] = std::clamp(shader_injection.vbgi_adaptive_luma_blend, 0.f, 1.f);
-  c[41] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
-  c[42] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
-  c[43] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
+  // c[24] = g_gi_enabled
+  c[24] = (ssgi_enabled_override >= 0.f) ? ssgi_enabled_override : shader_injection.vbgi_enabled; // GI enable
+  // c[25] = g_gi_light_exposure
+  c[25] = std::clamp(g_vbgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
+  // c[26] = g_gi_intensity
+  c[26] = std::clamp(shader_injection.vbgi_intensity, 0.f, 5.f);  // GI intensity
+  // c[27] = g_gi_saturation
+  c[27] = std::clamp(shader_injection.vbgi_saturation, 0.f, 2.f); // GI saturation
+  // c[28] = g_gi_multibounce
+  c[28] = shader_injection.vbgi_multibounce;                       // multi-bounce (0/1)
+  c[29] = std::clamp(shader_injection.vbgi_multibounce_strength, 0.f, 10.f);  // feedback strength
+  c[30] = std::clamp(shader_injection.vbgi_multibounce_saturation, 0.f, 2.f); // feedback saturation
+  c[31] = std::clamp(shader_injection.vbgi_multibounce_max_clamp, 0.f, 20.f);  // multi-bounce max clamp
+  c[32] = shader_injection.vbgi_debug_view;                         // VBGI debug view
+  c[33] = g_isfast_enabled;                                          // IS-FAST enable (0/1)
+  c[34] = std::clamp(g_isfast_strength, 0.f, 1.f);                   // IS-FAST noise strength
+  c[35] = (data && data->isfast_texture_loaded) ? 1.f : 0.f;         // IS-FAST texture loaded flag
+  c[36] = shader_injection.vbgi_adaptive_mode;                       // 0=GI color, 1=albedo
+  c[37] = std::clamp(shader_injection.vbgi_adaptive_luma_strength, 0.f, 5.f); // 0=off
+  c[38] = std::clamp(shader_injection.vbgi_adaptive_luma_blend, 0.f, 1.f);
+  c[39] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
+  c[40] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
+  c[41] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
   // ── Denoiser leak parameters ──
-  c[44] = std::clamp(shader_injection.gtvbao_denoise_leak_threshold, 1.f, 4.f);
-  c[45] = std::clamp(shader_injection.gtvbao_denoise_leak_strength, 0.f, 1.f);
+  c[42] = std::clamp(shader_injection.gtvbao_denoise_leak_threshold, 1.f, 4.f);
+  c[43] = std::clamp(shader_injection.gtvbao_denoise_leak_strength, 0.f, 1.f);
   // ── Spatial denoiser only (Spatio-Temporal / Poisson removed) ──
-  c[46] = shader_injection.gtvbao_bitmask_falloff;  // 0=Off, 1=On (was denoiser_type)
-  c[47] = 0.f;  // temporal_blend: off (spatial only)
-  c[48] = 0.01f;  // disocclusion_threshold: unused by spatial path
-  c[49] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
+  c[44] = 0.f;  // temporal_blend: off (spatial only)
+  c[45] = 0.01f;  // disocclusion_threshold: unused by spatial path
+  c[46] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
   // ── GTVBAO upgrades: always On (UI toggles removed) ──
-  c[50] = 1.f;  // cdf_enabled
-  c[51] = 1.f;  // cosine_enabled
-  c[52] = shader_injection.gtvbao_cosine_mode;
-  c[53] = 1.f;  // thickness_enabled
-  // ── Bitmask fix toggles (Poisson slots repurposed; all Off = shipped baseline) ──
-  c[54] = shader_injection.gtvbao_fix_sector_round;
-  c[55] = shader_injection.gtvbao_sector_jitter;
-  c[56] = shader_injection.gtvbao_fix_cdf_reference;
-  c[57] = shader_injection.gtvbao_fix_slice_vvs;
-  c[58] = shader_injection.gtvbao_prefilter_enabled;
+  c[47] = 1.f;  // cdf_enabled
+  c[48] = 1.f;  // cosine_enabled
+  c[49] = shader_injection.gtvbao_cosine_mode;
+  c[50] = 1.f;  // thickness_enabled
+  // ── Foliage / prefilter ──
+  c[51] = shader_injection.gtvbao_prefilter_enabled;
   // ── Foliage exclusion ──
-  c[59] = shader_injection.gtvbao_exclude_foliage;
-  c[60] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
-  c[61] = IsKai() ? 1.f : 0.f;
-  // c[62] — foliage mask is only fresh when the pre-pass dispatched this frame.
-  c[62] = foliage_mask_valid ? 1.f : 0.f;
+  c[52] = shader_injection.gtvbao_exclude_foliage;
+  c[53] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
+  c[54] = IsKai() ? 1.f : 0.f;
+  // c[55] - foliage mask is only fresh when the pre-pass dispatched this frame.
+  c[55] = foliage_mask_valid ? 1.f : 0.f;
   // ── Denoiser upgrades (R1-R4) ──
-  c[63] = (float)denoise_stage;                                        // dispatch mode for denoise_last
-  c[64] = shader_injection.gtvbao_gi_depth_binding;   // 0=Off packed edges, 1=On real depth
-  c[65] = shader_injection.gtvbao_gi_single_intensity; // 0=Off, 1=On single intensity apply
-  c[66] = shader_injection.gtvbao_atrous_enabled;
-  c[67] = std::clamp(shader_injection.gtvbao_atrous_depth_sigma, 0.01f, 8.f);
-  c[68] = std::clamp(shader_injection.gtvbao_atrous_normal_sigma, 1.f, 128.f);
-  c[69] = std::clamp(atrous_step, 1.f, 8.f);                           // à-trous stride (1/2/4)
+  c[56] = (float)denoise_stage;                                        // dispatch mode for denoise_last
+  c[57] = shader_injection.gtvbao_atrous_enabled;
+  c[58] = std::clamp(shader_injection.gtvbao_atrous_depth_sigma, 0.01f, 8.f);
+  c[59] = std::clamp(shader_injection.gtvbao_atrous_normal_sigma, 1.f, 128.f);
+  c[60] = std::clamp(atrous_step, 1.f, 8.f);                           // à-trous stride (1/2/4)
   // —— Half-resolution spatial pipeline (appended; Full path ignores these) ——
-  c[70] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
-  c[71] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
-  c[72] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
-  c[73] = shader_injection.gtvbao_upscale_debug;
+  c[61] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
+  c[62] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
+  c[63] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
+  c[64] = shader_injection.gtvbao_upscale_debug;
   return c;
 }
 
@@ -10335,7 +10228,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 74;
+    push_constants_range.count = 65;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -10645,7 +10538,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
@@ -10701,7 +10594,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
       };
       apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
-      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 74,
+      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 65,
                          BuildGTVBAOPushConstants(d, false).data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->multibounce_texture, UA, SR);
@@ -10734,7 +10627,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
     cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
     bar(d->foliage_mask_texture, UA, SR);
   }
@@ -10809,7 +10702,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid);
-    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -10906,7 +10799,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
       auto pc_np = BuildGTVBAOPushConstants(d, false);
-      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_np.data());
+      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_np.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->normal_prep_texture, UA, SR);
     };
@@ -10933,7 +10826,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         apply_descriptors(d->atrous_layout, &d->atrous_tables, 4, au);
         auto pc_a = BuildGTVBAOPushConstants(d, last_iter, -1.f, false, /*stage*/0,
                                              /*step*/float(1 << i));
-        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_a.data());
+        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_a.data());
         cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
         bar(a_dst_tex, UA, SR);
         cur_b = !cur_b;
@@ -10975,7 +10868,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u_g);
       auto pc_g = BuildGTVBAOPushConstants(d, true, -1.f, false, /*stage*/4);
-      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_g.data());
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_g.data());
       // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the grid.
       cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
       }  // end GI-on stage-4 dispatch
@@ -11009,7 +10902,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         };
         apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
         auto pc = BuildGTVBAOPushConstants(d, last, -1.f, false, /*stage*/0);
-        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc.data());
+        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
         // denoise_last threads cover 2 px each: halve the grid (bounds-fail covers overhang).
         cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
         bar(dst_tex, UA, SR);
@@ -11067,7 +10960,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->upscale_layout, &d->upscale_tables, 4, uu);
       auto pc_u = BuildGTVBAOPushConstants(d, true);
-      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 74, pc_u.data());
+      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_u.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->upscale_ao_texture, UA, SR);
       if (shader_injection.vbgi_enabled > 0.5f)

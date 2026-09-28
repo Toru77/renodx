@@ -69,74 +69,67 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_noise_index;
   float GTVBAO_debug_mode;
   float GTVBAO_denoise_is_last_pass;
-  float GTVBAO_normal_input_mode;
-  float GTVBAO_mrt_normal_available;
-  float GTVBAO_normal_influence;
-  float GTVBAO_normal_depth_blend;
-  float GTVBAO_normal_sharpness;
-  float GTVBAO_normal_edge_rejection;
-  float GTVBAO_normal_z_preservation;
-  float GTVBAO_normal_detail_response;
-  float GTVBAO_normal_max_darkening;
-  float GTVBAO_normal_darkening_mode;
-  float GTVBAO_normal_transform_mode;   // 0=view_g, 1=viewInv_g, 2=passthrough
-  // Was GTVBAO_copyback_preserve_yzw (bitmask fixMode 1-5, now deleted).
-  float GTVBAO_fix_backface;             // 0=legacy radial offset, 1=Algorithm 1 line 15 (view-ray offset)
-  float g_gi_enabled;                    // c[25] — 0=off, 1=on
-  float g_gi_light_exposure;             // c[26] — HDR light buffer exposure scale [0.001..10]
-  float GTVBAO_gi_power;                 // c[27] — 0=off, 1=on (exponent 1.5 was reserved here, unread)
-  float g_gi_intensity;                  // c[28] — GI intensity [0..5]
-  float g_gi_saturation;                 // c[29] — GI saturation [0..2]
-  float g_gi_multibounce;                // c[30] — multi-bounce enable (0/1)
-  float g_gi_multibounce_strength;       // c[31] — feedback intensity [0..10]
-  float g_gi_multibounce_saturation;     // c[32] — feedback color saturation [0..2]
-  float g_gi_multibounce_max_clamp;      // c[33] — max multi-bounce per-channel (0=off)
-  float g_vbgi_debug_view;               // c[34] — SSGI debug view mode
-  float GTVBAO_isfast_enabled;           // c[34] — IS-FAST enable (0/1)
-  float GTVBAO_isfast_strength;          // c[35] — IS-FAST noise strength [0..1]
-  float GTVBAO_isfast_debug;             // c[36] — IS-FAST texture loaded flag (set by shader check)
-  float GTVBAO_adaptive_mode;           // c[37] — 0=GI color, 1=albedo
-  float GTVBAO_adaptive_luma_strength;  // c[38] — target luma (0=off)
-  float GTVBAO_adaptive_luma_blend;     // c[39] — blend original↔normalized
-  float GTVBAO_isfast_spatial_scale;    // c[40] — IS-FAST spatial scale [0.25..4]
-  float GTVBAO_isfast_temporal_speed;   // c[41] — IS-FAST temporal speed [0..5]
-  float GTVBAO_isfast_seed;             // c[42] — IS-FAST seed offset [0..64]
-  float GTVBAO_denoise_leak_threshold;  // c[43] — edge leak threshold [1..4], default 2.5
-  float GTVBAO_denoise_leak_strength;   // c[44] — edge leak strength [0..1], default 0.5
-  // Was GTVBAO_denoiser_type (always 0=Spatial).
-  float GTVBAO_bitmask_falloff;         // c[46] — 0=Off, 1=On — paper's distance-increasing thickness
-  float GTVBAO_temporal_blend;          // c[47] — always 0 (spatial only)
-  float GTVBAO_disocclusion_threshold;  // c[48] — unused (spatial only)
-  float GTVBAO_noise_type;             // c[49] — 0=IS-FAST, 1=IGN, 2=Hilbert
-  // ── GTVBAO upgrades: always On (UI toggles removed) ──
-  float GTVBAO_gtvbao_cdf_enabled;     // c[50] — always 1
-  float GTVBAO_gtvbao_cosine_enabled;  // c[51] — always 1
-  float GTVBAO_gtvbao_cosine_mode;     // c[52] — 0=Weight, 1=Project, 2=CDF (retained)
-  float GTVBAO_gtvbao_thickness_enabled; // c[53] — always 1
-  // ── Bitmask fix toggles. Reuses the removed Poisson denoiser's slots;
-  //    all 0 reproduces the previously shipped behaviour exactly. ──
-  float GTVBAO_fix_sector_round;       // c[54] — 0=Off ceil, 1=On round + range guards
-  float GTVBAO_sector_jitter;          // c[55] — 0=Off, 1=On — per-slice sector-index dither
-  float GTVBAO_fix_cdf_reference;      // c[56] — 0=Off, 1=On — reference slice-relative CDF
-  float GTVBAO_fix_slice_vvs;          // c[57] — 0=Off, 1=On — VVS normal-aligned slice frame
-  float GTVBAO_prefilter_enabled;      // c[58] — 0=Off, 1=On
-  float GTVBAO_exclude_foliage;        // c[59] — 0=Off, 1=On — skip AO on foliage
-  float GTVBAO_foliage_ao_value;       // c[60] — [0..1] — AO value for excluded foliage
-  float GTVBAO_foliage_channel_mode;   // c[61] — 0=o1.w (Sora), 1=o1.z (Kai)
-  float GTVBAO_foliage_mask_valid;     // c[62] — 1 = mask pre-pass ran this frame (mask is fresh)
-  // ── Spatial-only: temporal/atrous tails ──
-  float GTVBAO_denoise_stage;          // c[63] — denoise_last dispatch mode: 0=spatial combined, 2=spatial-final-no-temporal, 4=GI-only tail (1=temporal-only removed)
-  float GTVBAO_gi_depth_binding;       // c[64] — 0=Off packed edges, 1=On real depth MIP0
-  float GTVBAO_gi_single_intensity;    // c[65] — 0=Off, 1=On — apply vbgi_intensity once
-  float GTVBAO_atrous_enabled;         // c[66] — 0=Off, 1=On — à-trous wavelet spatial filter
-  float GTVBAO_atrous_depth_sigma;     // c[67] — [0.05..4] relative depth edge-stop strength
-  float GTVBAO_atrous_normal_sigma;    // c[68] — [2..128] normal edge-stop power
-  float GTVBAO_atrous_step;            // c[69] — à-trous stride for this dispatch (1, 2, 4)
-  // ── Half-resolution spatial pipeline (appended; Full path ignores these) ──
-  float GTVBAO_resolution;             // c[70] — 0=Full, 1=Half
-  float GTVBAO_upscale_plane_sigma;    // c[71] — reconstruction plane edge-stop sigma
-  float GTVBAO_upscale_normal_power;   // c[72] — reconstruction normal weight power
-  float GTVBAO_upscale_debug;          // c[73] — reconstruction diagnostics mode
+  // The c[NN] tags below are 0-based indices into the array built by
+  // BuildGTVBAOPushConstants() in addon.cpp; the two lists must stay in lockstep.
+  float GTVBAO_normal_input_mode;       // c[13] - 0=depth-derived, 1=MRT g-buffer
+  float GTVBAO_mrt_normal_available;    // c[14]
+  float GTVBAO_normal_influence;        // c[15]
+  float GTVBAO_normal_depth_blend;      // c[16]
+  float GTVBAO_normal_sharpness;        // c[17]
+  float GTVBAO_normal_edge_rejection;   // c[18]
+  float GTVBAO_normal_z_preservation;   // c[19]
+  float GTVBAO_normal_detail_response;  // c[20]
+  float GTVBAO_normal_max_darkening;    // c[21]
+  float GTVBAO_normal_darkening_mode;   // c[22]
+  float GTVBAO_normal_transform_mode;   // c[23] - 0=view_g, 1=viewInv_g, 2=passthrough
+  // - GI parameters -
+  float g_gi_enabled;                   // c[24] - 0=off, 1=on
+  float g_gi_light_exposure;            // c[25] - HDR light buffer exposure scale [0.001..10]
+  float g_gi_intensity;                 // c[26] - GI intensity [0..5]
+  float g_gi_saturation;                // c[27] - GI saturation [0..2]
+  float g_gi_multibounce;               // c[28] - multi-bounce enable (0/1)
+  float g_gi_multibounce_strength;      // c[29] - feedback intensity [0..10]
+  float g_gi_multibounce_saturation;    // c[30] - feedback color saturation [0..2]
+  float g_gi_multibounce_max_clamp;     // c[31] - max multi-bounce per-channel (0=off)
+  // - SSGI / IS-FAST noise -
+  float g_vbgi_debug_view;              // c[32] - SSGI debug view mode
+  float GTVBAO_isfast_enabled;          // c[33] - IS-FAST enable (0/1)
+  float GTVBAO_isfast_strength;         // c[34] - IS-FAST noise strength [0..1]
+  float GTVBAO_isfast_debug;            // c[35] - IS-FAST texture loaded flag (set by shader check)
+  float GTVBAO_adaptive_mode;           // c[36] - 0=GI color, 1=albedo
+  float GTVBAO_adaptive_luma_strength;  // c[37] - target luma (0=off)
+  float GTVBAO_adaptive_luma_blend;     // c[38] - blend original<->normalized
+  float GTVBAO_isfast_spatial_scale;    // c[39] - IS-FAST spatial scale [0.25..4]
+  float GTVBAO_isfast_temporal_speed;   // c[40] - IS-FAST temporal speed [0..5]
+  float GTVBAO_isfast_seed;             // c[41] - IS-FAST seed offset [0..64]
+  // - Denoiser -
+  float GTVBAO_denoise_leak_threshold;  // c[42] - edge leak threshold [1..4], default 2.5
+  float GTVBAO_denoise_leak_strength;   // c[43] - edge leak strength [0..1], default 0.5
+  float GTVBAO_temporal_blend;          // c[44] - always 0 (spatial only)
+  float GTVBAO_disocclusion_threshold;  // c[45] - unused (spatial only)
+  float GTVBAO_noise_type;              // c[46] - 0=IS-FAST, 1=IGN, 2=Hilbert
+  // - GTVBAO upgrades: always On (UI toggles removed) -
+  float GTVBAO_gtvbao_cdf_enabled;      // c[47] - always 1
+  float GTVBAO_gtvbao_cosine_enabled;   // c[48] - always 1
+  float GTVBAO_gtvbao_cosine_mode;      // c[49] - 0=Weight, 1=Project, 2=CDF
+  float GTVBAO_gtvbao_thickness_enabled;// c[50] - always 1
+  float GTVBAO_prefilter_enabled;       // c[51] - 0=Off, 1=On
+  // - Foliage -
+  float GTVBAO_exclude_foliage;         // c[52] - 0=Off, 1=On - skip AO on foliage
+  float GTVBAO_foliage_ao_value;        // c[53] - [0..1] - AO value for excluded foliage
+  float GTVBAO_foliage_channel_mode;    // c[54] - 0=o1.w (Sora), 1=o1.z (Kai)
+  float GTVBAO_foliage_mask_valid;      // c[55] - 1 = mask pre-pass ran this frame (mask is fresh)
+  float GTVBAO_denoise_stage;           // c[56] - denoise_last dispatch mode: 0=spatial combined, 2=spatial-final-no-temporal, 4=GI-only tail
+  // - a-trous wavelet filter -
+  float GTVBAO_atrous_enabled;          // c[57] - 0=Off, 1=On - wavelet spatial filter
+  float GTVBAO_atrous_depth_sigma;      // c[58] - [0.05..4] relative depth edge-stop strength
+  float GTVBAO_atrous_normal_sigma;     // c[59] - [2..128] normal edge-stop power
+  float GTVBAO_atrous_step;             // c[60] - wavelet stride for this dispatch (1, 2, 4)
+  // - Half-resolution spatial pipeline (appended; Full path ignores these) -
+  float GTVBAO_resolution;              // c[61] - 0=Full, 1=Half
+  float GTVBAO_upscale_plane_sigma;     // c[62] - reconstruction plane edge-stop sigma
+  float GTVBAO_upscale_normal_power;    // c[63] - reconstruction normal weight power
+  float GTVBAO_upscale_debug;           // c[64] - reconstruction diagnostics mode
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
@@ -175,8 +168,7 @@ float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDi
 #define g_gi_adaptive_mode      GTVBAO_adaptive_mode             // 0=GI color, 1=albedo
 #define g_gi_adaptive_luma_strength GTVBAO_adaptive_luma_strength // [0..5] target luma
 #define g_gi_adaptive_luma_blend GTVBAO_adaptive_luma_blend       // [0..1] blend
-// g_gi_light_exposure (c[26]) is a native field; the GI power curve moved to the
-// GTVBAO_gi_power toggle at c[27].
+// g_gi_light_exposure (c[25]) is a native field.
 // ── GI resources are passed as function parameters to GTVBAO_MainPass ──
 // (avoids fxc X3003 redefinition errors from forward declarations).
 // The wrapper .cs_5_0.hlsl files declare and pass them.

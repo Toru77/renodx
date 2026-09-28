@@ -209,26 +209,12 @@ uint GTVBAO_CountBits(uint v)
 
 // Mark sectors between minHorizon and maxHorizon as occluded.
 // minHorizon, maxHorizon: normalized [0, 1] across the hemisphere slice.
-//
-// roundMode == false (legacy): ceil rounding — the sample activates a sector as
-//   soon as it touches it, which biases the arc ~+0.5 sectors per sample.
-//
-// roundMode == true: the paper's criterion ("we used the round criterion which
-//   requires the sector to be half covered"), plus the range guards the
-//   reference carries (bufferc.txt:787-788). Without the guards a start index of
-//   32 or a width above 32 makes the shift count leave [0,31] and the top sectors
-//   are silently dropped.
-uint GTVBAO_UpdateSectors(float minHorizon, float maxHorizon, uint globalOccludedBitfield, bool roundMode)
+// Half-coverage criterion (paper: "we used the round criterion which requires
+// the sector to be half covered"), plus the range guards the reference carries
+// (bufferc.txt:787-788). Without the guards a start index of 32 or a width above
+// 32 makes the shift count leave [0,31] and the top sectors are silently dropped.
+uint GTVBAO_UpdateSectors(float minHorizon, float maxHorizon, uint globalOccludedBitfield)
 {
-    if (!roundMode) {
-        uint startHorizonInt = (uint)(minHorizon * GT_VBAO_BITMASK_SECTOR_COUNT);
-        uint angleHorizonInt = (uint)ceil((maxHorizon - minHorizon) * GT_VBAO_BITMASK_SECTOR_COUNT);
-        uint angleHorizonBitfield = angleHorizonInt > 0u
-            ? (0xFFFFFFFFu >> (GT_VBAO_BITMASK_SECTOR_COUNT - angleHorizonInt))
-            : 0u;
-        uint currentOccludedBitfield = angleHorizonBitfield << startHorizonInt;
-        return globalOccludedBitfield | currentOccludedBitfield;
-    }
     uint startHorizonInt = min((uint)(minHorizon * GT_VBAO_BITMASK_SECTOR_COUNT), GT_VBAO_BITMASK_SECTOR_COUNT - 1u);
     uint angleHorizonInt = (uint)round(saturate(maxHorizon - minHorizon) * GT_VBAO_BITMASK_SECTOR_COUNT);
     if (angleHorizonInt == 0u) return globalOccludedBitfield;
@@ -317,122 +303,6 @@ float GTVBAO_RemapHorizonCDF(float t, float sinNV, float blend) {
     // CDF-corrected value: compress toward 0.5 near the pole.
     float corrected = lerp(t, 0.5f + (t - 0.5f) * sinNV, blend);
     return saturate(corrected);
-}
-
-// ── Slice-relative horizon CDF (reference formulation, bufferc.txt:506-522) ──
-// The reference remaps the min/max horizons with the analytic CDF of the slice's
-// own sample distribution. It depends on the per-slice projected-normal angle
-// angN and its cosine cosN, and its strength stays O(1) at every NdotV.
-//
-// GTVBAO_RemapHorizonCDF is not that: it is a per-pixel similarity transform
-// whose slope is sinNV, so it degenerates to the identity at grazing angles and
-// collapses every arc to a point (hor01 -> 0.5) when the normal faces the
-// viewer — the exact inverse of the reference's behaviour. GTVBAO_fix_cdf_reference
-// swaps in this version.
-float GTVBAO_SliceRelCDF_Cos(float x, float angN, float cosN, bool isPhiLargerThanAngN)
-{
-    if (x <= 0.0f || x >= 1.0f) return x;
-
-    float phi = x * GT_VBAO_PI - GT_VBAO_PI_HALF;
-
-    float n0 = isPhiLargerThanAngN ?  3.0f : 1.0f;
-    float n1 = isPhiLargerThanAngN ? -1.0f : 1.0f;
-    float n2 = isPhiLargerThanAngN ?  4.0f : 0.0f;
-
-    float t0 = n0 * cosN + n1 * cos(angN - 2.0f * phi) + (n2 * angN + (n1 * 2.0f) * phi + GT_VBAO_PI) * sin(angN);
-    float t1 = 4.0f * (cosN + angN * sin(angN));
-
-    return t0 / t1;
-}
-
-// ═══════════════════════════════════════════════════════════════
-// View-vec-space (VVS) slice frame — GTVBAO_fix_slice_vvs
-// Ported from bufferc.txt:326-397. The sampling direction is drawn in the frame
-// whose z axis is the view vector, so the density peak lands on the projected
-// normal, then that direction is carried back into view space.
-// ═══════════════════════════════════════════════════════════════
-
-// Rotation taking +z onto 'to' (V). from = (0,0,1), to = V.
-float4 GTVBAO_GetQuaternionToV(float3 to)
-{
-    float4 q;
-    q.xyz = float3(to.y, -to.x, 0.0f);
-    float s = -to.z;
-    float u = rsqrt(max(0.0f, s * 0.5f + 0.5f));
-    q.w = 1.0f / u;
-    q.xyz *= u * 0.5f;
-    return q;
-}
-
-// Rotate a view-vec-space xy0 direction into view space.
-// The reference writes `b * q.xyxw` and leans on GLSL's implicit vec3
-// truncation of the swizzle; spell that out so the compiler does not warn.
-float3 GTVBAO_TransformVz0Qz0(float2 v, float4 q)
-{
-    float o = v.y * q.x;
-    float c = v.x * q.y;
-    float3 b = float3(o - c, -o + c, o - c);
-    return float3(v, 0.0f) + 2.0f * (b * float3(q.x, q.y, q.x));
-}
-
-// Rotate a view-space vector into the view-vec-space frame.
-float3 GTVBAO_TransformQz0Vz0(float3 v, float4 q)
-{
-    float k = v.y * q.x - v.x * q.y;
-    float g = 2.0f * (v.z * q.w + k);
-    float3 r;
-    r.xy = v.xy + q.yx * float2(g, -g);
-    r.z = v.z + 2.0f * (q.w * k - v.z * dot(q.xy, q.xy));
-    return r;
-}
-
-// Slice direction in the view-vec-space XY plane, importance sampled so the
-// density peaks on the projected normal (bufferc.txt:170-236, HQ variant).
-// Returns a non-unit direction; only its direction is meaningful.
-float2 GTVBAO_SampleSliceDirVVS(float3 vvsN, float rnd01)
-{
-    float2 dir0 = float2(cos(rnd01 * GT_VBAO_PI), sin(rnd01 * GT_VBAO_PI));
-
-    float l = length(vvsN.xy);
-    if (l == 0.0f) return dir0;
-
-    // Fold the uniform draw into the half-circle that contains the normal.
-    dir0 *= dot(dir0, vvsN.xy) < 0.0f ? -1.0f : 1.0f;
-
-    float2 n = vvsN.xy / l;
-
-    // Rotate so the normal is the x axis; x is then the uniform coordinate in
-    // the normal-aligned frame.
-    float x = dir0.x * n.y - dir0.y * n.x;
-
-    float s = GTVBAO_QBias(l, 0.15f);
-
-    // Stretched inverse acos — the high-accuracy branch of the reference.
-    float y = acos(clamp(x * sin(s * GT_VBAO_PI_HALF), -1.0f, 1.0f)) * (2.0f / GT_VBAO_PI);
-
-    float ys = 1.0f / s;
-    float2 dir;
-    dir.y = ys - ys * y;
-    dir.x = sqrt(saturate(1.0f - dir.y * dir.y));
-
-    // Rotate the x axis back onto the normal.
-    return float2(dir.x * n.x - dir.y * n.y,
-                  dir.y * n.x + dir.x * n.y);
-}
-
-// View-space azimuth of the VVS-importance-sampled slice, in radians.
-// Range is atan2's [-PI, PI]; every consumer takes cos/sin of it, so the
-// branch cut is harmless and no wrapping is applied.
-float GTVBAO_SampleSliceVVSViewAzimuth(float rnd, float3 viewspaceNormal, float3 viewVec)
-{
-    float4 qToV   = GTVBAO_GetQuaternionToV(viewVec);
-    float4 qFromV = qToV * float4(-1.0f, -1.0f, -1.0f, 1.0f);
-
-    float3 normalVVS = GTVBAO_TransformQz0Vz0((float3)viewspaceNormal, qFromV);
-    float2 dir = GTVBAO_SampleSliceDirVVS(normalVVS, rnd);
-
-    float3 smplDirVS = GTVBAO_TransformVz0Qz0(dir, qToV);
-    return atan2(smplDirVS.y, smplDirVS.x);
 }
 
 uint GTVBAO_EncodeVisibilityBentNormal( lpfloat visibility, lpfloat3 bentNormal )
@@ -642,17 +512,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     const bool  g_cdfDegen  = sCdf < 0.00001f;
     const float g_cdfSinK   = g_cdfDegen ? 0.0f : sin(sCdf * GT_VBAO_PI * 0.5f);
     const float g_cdfInvPiS = g_cdfDegen ? 0.0f : 1.0f / (GT_VBAO_PI * sCdf);
-    // ── Fix / upgrade toggles (all off = current shipped behaviour) ──
-    const bool g_fixBackface    = GTVBAO_fix_backface     > 0.5f;
-    const bool g_fixSectorRound = GTVBAO_fix_sector_round > 0.5f;
-    const bool g_sectorJitter   = GTVBAO_sector_jitter    > 0.5f;
-    const bool g_fixCdfRef      = GTVBAO_fix_cdf_reference > 0.5f;
-    const bool g_fixSliceVvs    = GTVBAO_fix_slice_vvs    > 0.5f;
-    const bool g_bitmaskFalloff = GTVBAO_bitmask_falloff  > 0.5f;
-#ifdef GT_VBAO_COMPUTE_GI
-    const bool g_giPower        = GTVBAO_gi_power         > 0.5f;
-    const bool g_giSingleIntens = GTVBAO_gi_single_intensity > 0.5f;
-#endif
     // ── Debug accumulators for bitmask viz (modes 6-8) ──
     uint debugTotalSectorCoverage = 0u;
     uint debugTotalSamples = 0u;
@@ -727,17 +586,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 } else {
                     // Mode 3 (default): CDF importance sampling, per-pixel
                     // constants supplied from the hoist above.
-                    if (g_fixSliceVvs) {
-                        // VVS frame: the lobe is drawn in the view-vec-space XY
-                        // plane so its density peak lands on the projected
-                        // normal, then carried back into view space. Without this
-                        // the draw has the right shape but a fixed screen-space
-                        // orientation, which mis-weights every surface whose
-                        // normal is not screen-up.
-                        phi = GTVBAO_SampleSliceVVSViewAzimuth(rnd0, (float3)viewspaceNormal, (float3)viewVec);
-                    } else {
-                        phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, g_cdfSinK, g_cdfInvPiS, g_cdfDegen);
-                    }
+                    phi = GTVBAO_SampleSliceCosine_Mode3(rnd0, g_cdfSinK, g_cdfInvPiS, g_cdfDegen);
                 }
             }
             lpfloat cosPhi = cos(phi);
@@ -788,10 +637,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // One decorrelated draw per slice, shared by min and max so the arc
             // width survives. The reference dithers the sector index this way
             // (bufferc.txt:767) to break up the 32 hard bands; without it the
-            // quantiser staircase is fixed in screen space.
-            const float sliceJitter = g_sectorJitter
-                ? (frac(noiseSample + sliceK * 0.75487766624669276) * (1.0f / (float)GT_VBAO_BITMASK_SECTOR_COUNT))
-                : 0.0f;
+            // quantiser staircase is fixed in screen space and there is no
+            // temporal accumulation here to average it away.
+            const float sliceJitter =
+                frac(noiseSample + sliceK * 0.75487766624669276) * (1.0f / (float)GT_VBAO_BITMASK_SECTOR_COUNT);
 
             [unroll]
             for( lpfloat step = 0; step < stepsPerSlice; step++ )
@@ -840,40 +689,19 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     // Skip samples beyond the effect radius.
                     if (sampleDist > effectRadius) continue;
 
-                    // Effective thickness. GTVBAO_bitmask_falloff applies the
-                    // paper's distance ramp ("we give the option to increase t
-                    // linearly over the distance"), which is what stands in for
-                    // the GTAO radial falloff the bitmask branch never had: the
-                    // sector arc grows as t/d, so holding t flat starves distant
-                    // occluders.
-                    float thickness = (float)thinOccluderCompensation;
-                    if (g_bitmaskFalloff) {
-                        thickness *= 1.0f + (float)sampleDist / max((float)effectRadius, 0.001f);
-                    }
+                    // Effective thickness. The paper's distance ramp ("we give
+                    // the option to increase t linearly over the distance") stands
+                    // in for the GTAO radial falloff the bitmask branch never
+                    // had: the sector arc grows as t/distance, so a flat t
+                    // starves distant occluders.
+                    float thickness = (float)thinOccluderCompensation
+                        * (1.0f + (float)sampleDist / max((float)effectRadius, 0.001f));
 
                     // ── Front-face and back-face (per-sample thickness offset, always On) ──
                     float3 sampleHorizonVec = (float3)(sampleDelta / sampleDist);
-                    float3 sampleDeltaBack;
-                    if (g_fixBackface) {
-                        // Algorithm 1 line 15: s_b <- s_f - (p/||p||)t, and
-                        // viewVec = -p/||p||, so the back face is the sample
-                        // pushed t further along the view ray.
-                        //
-                        // The legacy form below subtracts along the sample ray, so
-                        // the back face stays collinear with the front face: the
-                        // arc measures parallax along the view axis rather than
-                        // the occluder's angular extent, which is zero for
-                        // same-depth samples and non-zero mainly across depth
-                        // discontinuities. That turns the bitmask into a
-                        // depth-discontinuity detector and confines the GI term
-                        // to contact points.
-                        sampleDeltaBack = sampleDelta + (float3)viewVec * thickness;
-                    } else {
-                        // Legacy: offset along the sample direction, reusing the
-                        // direction already computed above instead of dividing
-                        // a second time.
-                        sampleDeltaBack = sampleDelta - sampleHorizonVec * thickness;
-                    }
+                    // Offset along the sample direction, reusing the direction
+                    // already computed above instead of dividing a second time.
+                    float3 sampleDeltaBack = sampleDelta - sampleHorizonVec * thickness;
                     float3 sampleHorizonVecBack = normalize( sampleDeltaBack );
 
                     // Horizon cosines relative to viewVec (same as GTAO's shc).
@@ -893,26 +721,17 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
                     // ── GTVBAO: CDF remap horizon angles (always On) ──
                     // sinNV / blend are per-pixel; see the hoist above.
-                    if (g_fixCdfRef) {
-                        // Reference formulation: per-slice, driven by this
-                        // slice's own projected-normal angle.
-                        frontBackHorizon.x = GTVBAO_SliceRelCDF_Cos(frontBackHorizon.x, (float)n, (float)cosNorm, sd > 0.0f);
-                        frontBackHorizon.y = GTVBAO_SliceRelCDF_Cos(frontBackHorizon.y, (float)n, (float)cosNorm, sd > 0.0f);
-                    } else {
-                        frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, g_remapSinNV, g_remapBlend);
-                        frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, g_remapSinNV, g_remapBlend);
-                    }
+                    frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, g_remapSinNV, g_remapBlend);
+                    frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, g_remapSinNV, g_remapBlend);
 
                     // samplingDirection inverts min/max ordering.
                     frontBackHorizon = (sd >= 0.0) ? frontBackHorizon.yx : frontBackHorizon.xy;
 
                     // Dither both ends by the same offset, preserving arc width.
-                    if (g_sectorJitter) {
-                        frontBackHorizon = saturate(frontBackHorizon + sliceJitter);
-                    }
+                    frontBackHorizon = saturate(frontBackHorizon + sliceJitter);
 
                     // Compute sample bitmask and update global bitmask.
-                    uint sampleMask = GTVBAO_UpdateSectors(frontBackHorizon.x, frontBackHorizon.y, 0u, g_fixSectorRound);
+                    uint sampleMask = GTVBAO_UpdateSectors(frontBackHorizon.x, frontBackHorizon.y, 0u);
 
                     // ── Debug: track per-sample sector coverage ──
                     // Read by Bitmask debug views 6-8, so this stays.
@@ -956,13 +775,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         float NsDotL = saturate(dot(sampleNormal, -lightDir));
 
                         float weight = (float)newCount / (float)GT_VBAO_BITMASK_SECTOR_COUNT;
-                        // The composite applies vbgi_intensity again after
-                        // sampling the denoised GI (e.g. kai/lighting/
-                        // lighting_0x430ED091.ps_5_0.hlsl:609), so the shipped
-                        // path squares it. GTVBAO_gi_single_intensity moves the
-                        // single application here.
-                        float giGain = g_giSingleIntens ? giIntensity : (giIntensity * giIntensity);
-                        sliceGI += weight * lightColor * NdotL * NsDotL * giGain;
+                        // vbgi_intensity is applied here only; the lighting
+                        // composite does not re-apply it to this term.
+                        sliceGI += weight * lightColor * NdotL * NsDotL * giIntensity;
                         activityContributed += 1u;
                     } else if (enableGI) {
                         activityRejected += 1u;
@@ -1163,15 +978,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
 #ifdef GT_VBAO_COMPUTE_GI
         giAccum /= max((float)sliceCount, 1.0);
-
-        // ── GI power curve (GTVBAO_gi_power) ──
-        // Algorithm 1 line 28 returns GI/N_d with no shaping; the fixed 1.5
-        // exponent was reserved at c[27] but never read, so it had no effect.
-        if (g_giPower) {
-            // abs() is a no-op on the accumulated value (every factor in the sum
-            // is non-negative) but makes the non-negative base explicit for pow.
-            giAccum = pow(abs(giAccum), 1.5f);
-        }
 
         // ── RGB Adaptive Boost: amplify channels proportional to dominance ──
         // Mode 0 (GI Color): boost based on GI's own per-channel strength.
