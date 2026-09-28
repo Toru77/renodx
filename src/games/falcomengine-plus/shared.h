@@ -84,7 +84,7 @@ struct ShaderInjectData {
   float gtvbao_denoise_blur_beta;   // Denoise sharpness, default 1.2
   float gtvbao_denoise_leak_threshold; // [1..4], default 2.5 — edge leak threshold (lower=more leak)
   float gtvbao_denoise_leak_strength; // [0..1], default 0.5 — edge leak strength (higher=less flicker)
-  float gtvbao_denoiser_type;        // DEPRECATED: always Spatial (0). Spatio-Temporal/Poisson removed.
+  float gtvbao_bitmask_falloff;     // 0=Off, 1=On — paper's distance-increasing bitmask thickness
   float gtvbao_temporal_blend;       // DEPRECATED: always 0 (spatial only)
   float gtvbao_temporal_frame_count; // DEPRECATED: unused (spatial only)
   float gtvbao_disocclusion_threshold; // DEPRECATED: unused (spatial only)
@@ -92,7 +92,7 @@ struct ShaderInjectData {
   float gtvbao_debug_view;          // 0=Off, 1=AO gray, 2=GI only, 3=Bitmask viz
   float gtvbao_debug_logging;       // 0=Off, 1=On
   float gtvbao_dedicated_bound;     // 0/1 — set at runtime: t22 holds valid GTVBAO AO
-  float gtvbao_fix_experimental;    // 0=Off, 1-5=experimental (unused in bitmask path)
+  float gtvbao_fix_experimental;    // 0=Off, 1-5 — composite-side AO encoding diagnostic (sora1st/sora2nd lighting only)
   float gtvbao_vbgi_bound;          // 0/1 — set at runtime: t23 holds valid VBGI
   float gtvbao_vbgi_debug;          // 0=Off (add GI), 1=On (replace scene with GI)
 
@@ -248,11 +248,15 @@ struct ShaderInjectData {
   float gtvbao_cosine_enabled;  // DEPRECATED: always 1
   float gtvbao_cosine_mode;     // 0=Weight, 1=Project, 2=CDF — cosine sampling method (retained)
   float gtvbao_thickness_enabled; // DEPRECATED: always 1
-  // —— Poisson denoiser removed: fixed neutral values (unread by spatial path) ——
-  float gtvbao_poisson_samples;     // DEPRECATED
-  float gtvbao_poisson_luma_phi;    // DEPRECATED
-  float gtvbao_poisson_depth_phi;   // DEPRECATED
-  float gtvbao_poisson_normal_phi;  // DEPRECATED
+  // —— Bitmask fix toggles: all 0 reproduces the previously shipped behaviour ——
+  float gtvbao_fix_backface;      // 0=Off, 1=On — Alg.1 L15 back face (view-ray offset, not radial)
+  float gtvbao_fix_sector_round;  // 0=Off (ceil), 1=On — half-coverage round + shift-range guards
+  float gtvbao_sector_jitter;     // 0=Off, 1=On — per-slice sector-index dither
+  float gtvbao_fix_cdf_reference; // 0=Off, 1=On — reference slice-relative horizon CDF
+  float gtvbao_fix_slice_vvs;     // 0=Off, 1=On — VVS normal-aligned slice frame (Mode 3)
+  float gtvbao_gi_depth_binding;  // 0=Off packed edges, 1=On real depth MIP0 for GI denoise
+  float gtvbao_gi_single_intensity; // 0=Off, 1=On — apply vbgi_intensity once, not squared
+  float gtvbao_gi_power;          // 0=Off, 1=On — reserved 1.5 GI power curve
   // —— Character GTVBAO / GTVBGI ——
   float char_gtvbao_mode;            // 0=Off, 1=On, 2=Combined
   float char_gtvbao_mask_strength;   // [0..1], 0=full AO on chars, 1=no AO on chars
@@ -280,8 +284,6 @@ struct ShaderInjectData {
   float dof_sign_softness;                 // [0..1], default 0.4 — opposite-layer tap acceptance (0=hard reject)
   float dof_coverage_enabled;              // 0 Off, 1 On — coverage-aware composite (blend by same-layer fraction)
   // —— Denoiser upgrades: temporal settings deprecated (spatial only), à-trous kept ——
-  float gtvbao_temporal_normal_reject;     // DEPRECATED: always 0 (spatial only)
-  float gtvbao_ghost_clamp;                // DEPRECATED: always 0 (spatial only)
   float gtvbao_atrous_enabled;             // 0 Off, 1 On — à-trous wavelet spatial filter (replaces bilateral chain)
   float gtvbao_atrous_depth_sigma;         // [0.05..4] default 1.0 — relative depth edge-stop strength
   float gtvbao_atrous_normal_sigma;        // [2..128] default 32 — normal edge-stop power

@@ -33,12 +33,17 @@ float GTVBAO_DenoiseGI_EdgeWeight(float centerDepth, float neighborDepth)
 }
 
 void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
-    Texture2D<float4> srcGI, Texture2D<lpfloat> srcDepth,
-    SamplerState samp, RWTexture2D<float4> outGI)
+    Texture2D<float4> srcGI, Texture2D<lpfloat> srcEdges, Texture2D<float> srcDepth,
+    bool useRealDepth, SamplerState samp, RWTexture2D<float4> outGI)
 {
     uint w, h;
     srcGI.GetDimensions(w, h);
 
+    // GTVBAO_gi_depth_binding: the packed-edge buffer is a depth-discontinuity
+    // map in [0,1], so using it as the edge-stop source makes that stop a weak
+    // uniform blur rather than a real depth guard. Both sources are passed in
+    // and the sampled scalar is selected here — the ?: operator will not unify
+    // two Texture2D objects whose component types are nominally distinct.
     for (int side = 0; side < 2; side++)
     {
         int2 pixCoord = int2(pixCoordBase.x + side, pixCoordBase.y);
@@ -46,7 +51,9 @@ void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
 
     float2 uv = (float2(pixCoord) + 0.5) * consts.ViewportPixelSize;
     float4 centerGI = srcGI.Load(int3(pixCoord, 0));
-    float centerDepth = srcDepth.SampleLevel(samp, uv, 0);
+    float centerDepth = useRealDepth
+        ? srcDepth.SampleLevel(samp, uv, 0)
+        : srcEdges.SampleLevel(samp, uv, 0);
 
     float4 sum = centerGI;
     float weightSum = 1.0;
@@ -63,7 +70,9 @@ void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
         int2 nc = clamp(pixCoord + offsets[i], int2(0,0), int2(w-1, h-1));
         float4 neighborGI = srcGI.Load(int3(nc, 0));
         float2 nuv = (float2(nc) + 0.5) * consts.ViewportPixelSize;
-        float neighborDepth = srcDepth.SampleLevel(samp, nuv, 0);
+        float neighborDepth = useRealDepth
+            ? srcDepth.SampleLevel(samp, nuv, 0)
+            : srcEdges.SampleLevel(samp, nuv, 0);
 
         float depthW = GTVBAO_DenoiseGI_EdgeWeight(centerDepth, neighborDepth);
         float colorDiff = length(neighborGI.rgb - centerGI.rgb) / max(length(centerGI.rgb), 0.001);
@@ -198,7 +207,8 @@ void main(uint2 dt : SV_DispatchThreadID)
   if (g_gi_enabled > 0.5f)
   {
       GTVBAO_DenoiseGI(dt * uint2(2, 1), consts,
-          g_srcRawGI, g_srcWorkingEdges, g_samplerPointClamp,
-          g_outGI);
+          g_srcRawGI, g_srcWorkingEdges, g_srcDepth,
+          GTVBAO_gi_depth_binding > 0.5f,
+          g_samplerPointClamp, g_outGI);
   }
 }

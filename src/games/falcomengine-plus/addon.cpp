@@ -108,7 +108,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_denoise_blur_beta = 20.0f,
   .gtvbao_denoise_leak_threshold = 2.5f,
   .gtvbao_denoise_leak_strength = 0.5f,
-  .gtvbao_denoiser_type = 0.f,
+  .gtvbao_bitmask_falloff = 0.f,
   .gtvbao_temporal_blend = 0.f,
   .gtvbao_disocclusion_threshold = 0.01f,
   .gtvbao_debug_view = 0.f,
@@ -227,10 +227,15 @@ ShaderInjectData shader_injection = {
   .gtvbao_cosine_enabled = 1.f,
   .gtvbao_cosine_mode = 2.f,
   .gtvbao_thickness_enabled = 1.f,
-  .gtvbao_poisson_samples = 8.f,
-  .gtvbao_poisson_luma_phi = 5.f,
-  .gtvbao_poisson_depth_phi = 5.f,
-  .gtvbao_poisson_normal_phi = 5.f,
+  // ── Bitmask fix toggles: all default OFF = previously shipped behaviour ──
+  .gtvbao_fix_backface = 0.f,
+  .gtvbao_fix_sector_round = 0.f,
+  .gtvbao_sector_jitter = 0.f,
+  .gtvbao_fix_cdf_reference = 0.f,
+  .gtvbao_fix_slice_vvs = 0.f,
+  .gtvbao_gi_depth_binding = 0.f,
+  .gtvbao_gi_single_intensity = 0.f,
+  .gtvbao_gi_power = 0.f,
   .char_gtvbao_mode = 0.f,
   .char_gtvbao_mask_strength = 0.f,
   .char_gtvbgi_mask_strength = 0.f,
@@ -251,8 +256,6 @@ ShaderInjectData shader_injection = {
   .foliage_grass_ao_curve = 0.5f,
   .dof_sign_softness = 0.4f,
   .dof_coverage_enabled = 1.f,
-  .gtvbao_temporal_normal_reject = 0.f,
-  .gtvbao_ghost_clamp = 0.f,
   .gtvbao_atrous_enabled = 0.f,
   .gtvbao_atrous_depth_sigma = 1.f,
   .gtvbao_atrous_normal_sigma = 32.f,
@@ -2942,7 +2945,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.35f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 0.15f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -2956,7 +2959,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
-      .default_value = 1.457f, .label = "Radius Multiplier", .section = "GTVBAO",
+      .default_value = 1.0f, .label = "Radius Multiplier", .section = "GTVBAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3143,8 +3146,98 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOFixExperimental", .binding = &shader_injection.gtvbao_fix_experimental,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Fix Experimental", .section = "GTVBAO",
-      .tooltip = "Bitmask AO experimental fixes. 0=Off (baseline). Test each mode to diagnose darkening.",
-      .labels = {"Off", "1:Clamp50%", "2:Clamp100%", "3:ScaleDist", "4:SkipBehind", "5:Skip2x"},
+      .tooltip = "Composite-side AO encoding diagnostic (Sora lighting shaders only). 0=Off (baseline).",
+      .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    // ── Bitmask fix toggles (A/B against the baseline; all Off = shipped behaviour) ──
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOFixBackface", .binding = &shader_injection.gtvbao_fix_backface,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: Back Face (Alg.1 L15)", .section = "GTVBAO",
+      .tooltip = "Off: back face is offset along the sample ray, so the sector arc measures "
+                 "parallax along the view axis instead of the occluder's angular extent.\n"
+                 "On: offset along the view ray per Algorithm 1 line 15 (s_b = s_f - (p/|p|)t).",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOFixSectorRound", .binding = &shader_injection.gtvbao_fix_sector_round,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: Sector Half-Coverage", .section = "GTVBAO",
+      .tooltip = "Off: ceil - a sample activates a sector as soon as it touches it (+0.5 sector bias).\n"
+                 "On: round - the paper's half-coverage criterion, plus shift-range guards.",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOSectorJitter", .binding = &shader_injection.gtvbao_sector_jitter,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: Sector Index Jitter", .section = "GTVBAO",
+      .tooltip = "Dither the sector index once per slice to break up the 32 hard bands. "
+                 "No temporal accumulation exists here, so the staircase never averages out.",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOFixCdfReference", .binding = &shader_injection.gtvbao_fix_cdf_reference,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: Reference Horizon CDF", .section = "GTVBAO",
+      .tooltip = "Off: per-pixel similarity transform whose slope is sin(N.V) - identity at "
+                 "grazing angles, collapses every arc to a point when the normal faces the viewer.\n"
+                 "On: the reference slice-relative CDF, per slice, driven by that slice's projected normal.",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOFixSliceVvs", .binding = &shader_injection.gtvbao_fix_slice_vvs,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: VVS Slice Frame (Mode 3)", .section = "GTVBAO",
+      .tooltip = "Off: the slice lobe has the right shape but a fixed screen-space orientation, "
+                 "mis-weighting any surface whose normal is not screen-up.\n"
+                 "On: draw the slice in the view-vec-space frame so the density peak lands on the "
+                 "projected normal. Cosine sampling mode must be 2 (CDF). Costs extra ALU.",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOBitmaskFalloff", .binding = &shader_injection.gtvbao_bitmask_falloff,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: Distance Thickness Ramp", .section = "GTVBAO",
+      .tooltip = "Stand-in for the GTAO radial falloff the bitmask branch never had: the sector "
+                 "arc grows as t/distance, so a flat t starves distant occluders. Only has an "
+                 "effect together with Fix: Back Face.",
+      .labels = {"Off", "On"},
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGiDepthBinding", .binding = &shader_injection.gtvbao_gi_depth_binding,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: GI Denoise Depth Source", .section = "GTVBAO",
+      .tooltip = "Off: the GI denoiser's depth edge-stop reads the 2-bit packed edge buffer.\n"
+                 "On: read the real view-space depth MIP0.",
+      .labels = {"Off", "On"},
+    .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGiSingleIntensity", .binding = &shader_injection.gtvbao_gi_single_intensity,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: GI Intensity Once", .section = "GTVBAO",
+      .tooltip = "Off: vbgi_intensity is applied in the main pass and again in the lighting "
+                 "composite, so it is squared.\nOn: apply it once, in the main pass.",
+      .labels = {"Off", "On"},
+    .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGiPower", .binding = &shader_injection.gtvbao_gi_power,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Fix: GI Power Curve", .section = "GTVBAO",
+      .tooltip = "Apply the 1.5 GI power curve that was reserved at c[27] but never read. "
+                 "Off reproduces the shipped output exactly.",
+      .labels = {"Off", "On"},
+    .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3386,7 +3479,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveLumaStrength", .binding = &shader_injection.vbgi_adaptive_luma_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.1f, .label = "Adaptive Luma Strength", .section = "VBGI",
+      .default_value = 0.0f, .label = "Adaptive Luma Strength", .section = "VBGI",
       .tooltip = "Target brightness for GI normalization. 0=off. Higher = brighter target. Evens out indoor/outdoor GI.",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
@@ -3395,7 +3488,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIAdaptiveLumaBlend", .binding = &shader_injection.vbgi_adaptive_luma_blend,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.15f, .label = "Adaptive Luma Blend", .section = "VBGI",
+      .default_value = 0.0f, .label = "Adaptive Luma Blend", .section = "VBGI",
       .tooltip = "Blend between original GI (0) and luma-normalized GI (1).",
       .min = 0.0f, .max = 1.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
@@ -10114,14 +10207,13 @@ static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[21] = g_gtvbao_normal_max_darkening;
   c[22] = g_gtvbao_normal_darkening_mode;
   c[23] = g_gtvbao_normal_transform_mode;
-  c[24] = shader_injection.gtvbao_fix_experimental;  // bitmask experimental fix selector (0-5)
+  c[24] = shader_injection.gtvbao_fix_backface;  // bitmask back-face direction (Alg.1 L15)
   // ── GI parameters (IS-FAST repurpose) ──
   // isfast_passes (c[25]) = g_gi_enabled
   c[25] = (ssgi_enabled_override >= 0.f) ? ssgi_enabled_override : shader_injection.vbgi_enabled; // GI enable
   // isfast_samples (c[26]) = g_gi_light_exposure
   c[26] = std::clamp(g_vbgi_light_exposure, 0.001f, 10.f);    // HDR light buffer exposure
-  // isfast_radius (c[27]) = g_gi_power
-  c[27] = 1.5f;  // GI power (fixed, removed from UI)
+  c[27] = shader_injection.gtvbao_gi_power;  // GI power curve toggle (fixed 1.5 exponent, applied when on)
   // isfast_edge_sensitivity (c[28]) = g_gi_intensity
   c[28] = std::clamp(shader_injection.vbgi_intensity, 0.f, 5.f);  // GI intensity
   // isfast_spatial_sigma (c[29]) = g_gi_saturation
@@ -10145,7 +10237,7 @@ static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[44] = std::clamp(shader_injection.gtvbao_denoise_leak_threshold, 1.f, 4.f);
   c[45] = std::clamp(shader_injection.gtvbao_denoise_leak_strength, 0.f, 1.f);
   // ── Spatial denoiser only (Spatio-Temporal / Poisson removed) ──
-  c[46] = 0.f;  // denoiser_type: Spatial always
+  c[46] = shader_injection.gtvbao_bitmask_falloff;  // 0=Off, 1=On (was denoiser_type)
   c[47] = 0.f;  // temporal_blend: off (spatial only)
   c[48] = 0.01f;  // disocclusion_threshold: unused by spatial path
   c[49] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
@@ -10154,11 +10246,11 @@ static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[51] = 1.f;  // cosine_enabled
   c[52] = shader_injection.gtvbao_cosine_mode;
   c[53] = 1.f;  // thickness_enabled
-  // ── Poisson denoiser removed: fixed neutral values (unread by spatial path) ──
-  c[54] = 8.f;
-  c[55] = 5.f;
-  c[56] = 5.f;
-  c[57] = 5.f;
+  // ── Bitmask fix toggles (Poisson slots repurposed; all Off = shipped baseline) ──
+  c[54] = shader_injection.gtvbao_fix_sector_round;
+  c[55] = shader_injection.gtvbao_sector_jitter;
+  c[56] = shader_injection.gtvbao_fix_cdf_reference;
+  c[57] = shader_injection.gtvbao_fix_slice_vvs;
   c[58] = shader_injection.gtvbao_prefilter_enabled;
   // ── Foliage exclusion ──
   c[59] = shader_injection.gtvbao_exclude_foliage;
@@ -10168,8 +10260,8 @@ static std::array<float, 74> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[62] = foliage_mask_valid ? 1.f : 0.f;
   // ── Denoiser upgrades (R1-R4) ──
   c[63] = (float)denoise_stage;                                        // dispatch mode for denoise_last
-  c[64] = 0.f;  // temporal_normal_reject: off (spatial only)
-  c[65] = 0.f;  // ghost_clamp: off (spatial only)
+  c[64] = shader_injection.gtvbao_gi_depth_binding;   // 0=Off packed edges, 1=On real depth
+  c[65] = shader_injection.gtvbao_gi_single_intensity; // 0=Off, 1=On single intensity apply
   c[66] = shader_injection.gtvbao_atrous_enabled;
   c[67] = std::clamp(shader_injection.gtvbao_atrous_depth_sigma, 0.01f, 8.f);
   c[68] = std::clamp(shader_injection.gtvbao_atrous_normal_sigma, 1.f, 128.f);
