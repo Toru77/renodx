@@ -1179,12 +1179,17 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r9.xyz = r15.yzw + -r10.xyz;
   r9.xyz = r0.www * r9.xyz + r10.xyz;
   // Sun contact shadows apply HERE, to the sun diffuse and before r13.xyz (ambient)
-  // is added. See FalcomApplyContactToSun: scaling the final colour instead is what
-  // made contact shadows appear in interiors, where the CSM has already removed the
-  // sun and there is nothing left for them to shadow.
+  // is added, gated on real sun visibility. See FalcomApplyContactToSun: scaling the
+  // final colour darkened interiors, and scaling the sun term alone still darkened
+  // them wherever the CSM reports "lit" -- which indoors is most surfaces, because
+  // the cascade clamps past its last split instead of falling off. r3.z is the CSM
+  // visibility (shadowTexture sample, line 741) and is unwritten through here.
+  // shadowSplitDistance_g.z is the inferred outermost split: unlike Kai, this shader
+  // declares the global but never reads it, so the component order is unconfirmed.
   r9.xyz = FalcomApplyContactToSun(
       r9.xyz * lightColor_g.xyz, csIsCharacter > 0.5,
-      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0)) + r13.xyz;
+      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
+      r3.z, shadowSplitDistance_g.z, csDepthTex, samPoint_s, v1.xy) + r13.xyz;
   r0.w = min(1, r3.x);
   r10.xyz = float3(1,1,1) + -r9.xyz;
   r9.xyz = r0.www * r10.xyz + r9.xyz;

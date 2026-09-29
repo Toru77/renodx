@@ -442,6 +442,8 @@ ShaderInjectData shader_injection = {
   // The AO-quantisation dither is off by default: it only helps on surfaces where
   // GTVBAO's 8-bit visibility visibly bands, and it costs a noise sample per pixel.
   .cs_micro_isfast_enabled = 0.f,
+  // 0 = derive the sun-contact range gate from the engine's last cascade split.
+  .cs_contact_sun_range = 0.f,
   };
 
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
@@ -4181,6 +4183,21 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Lifts the ray origin along the surface normal. More stable than depth "
                  "bias on curved surfaces.",
       .min = 0.f, .max = 1.f, .format = "%.4f",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsSunRange", .binding = &shader_injection.cs_contact_sun_range,
+      .default_value = 0.f, .label = "Sun Range", .section = "Contact Shadows",
+      .tooltip = "World distance past which sun contact shadows stop being applied, "
+                 "because the CSM no longer has real coverage there. 0 = use the "
+                 "engine's own last cascade split. This is the gate that keeps contact "
+                 "shadows off interior walls: indoors the engine keeps a sun term "
+                 "because the cascade clamps past its split instead of falling off, so "
+                 "without this the effect darkens rooms. Raise it only if contact "
+                 "shadows vanish too early outdoors; lower it if they still reach into "
+                 "interiors. Contact shadows are a near-field effect, so a smaller "
+                 "value is usually the honest one.",
+      .min = 0.f, .max = 500.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
     },
     new renodx::utils::settings::Setting{

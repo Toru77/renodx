@@ -310,6 +310,66 @@ float3 FalcomApplyMicroShadows(float3 lit, bool isCharacter, float4 micro)
       shader_injection_data.cs_micro_char_strength, 1.0);
 }
 
+// ── Sun-contact range gate ──
+//
+// Contact shadows are a sun technique, so they must only darken light the sun
+// actually delivered. There are two distinct reasons a pixel must be skipped, and
+// they are not the same test:
+//
+//   1. The CSM says this pixel is not sunlit. There is no sun term to shadow, so
+//      contact is meaningless.
+//   2. The pixel is BEYOND the CSM's coverage. Past the last cascade split the
+//      engine clamps to the outermost cascade instead of falling off, so the
+//      visibility it reports there is a clamp artefact, not a measurement. The
+//      engine then treats the pixel as lit. This is the case that put contact
+//      shadows on interior walls: an apartment sits at distances the CSM was
+//      never fitted for, so every interior surface reads as "sunlit" and the
+//      contact term darkens it.
+//
+// The engine measures cascade coverage against the RADIAL distance from the camera
+// to the surface -- Kai/lighting_0x430ED091:1180-1193 takes the camera position
+// from viewInv_g and does `length(worldPos - camPos)`. That is NOT the same
+// quantity as the linear eye depth FalcomLinearDepth returns (which is the
+// perpendicular distance along the view axis), so the reconstruction below is
+// deliberately radial. Comparing eye depth against the split would underestimate
+// distance by up to the field of view and let interior pixels through the gate.
+//
+// viewInv_g and viewProjInv_g are declared at the same packoffsets in all five
+// titles' lighting shaders (c4 and c20 of cb_scene), which is what lets this
+// shared file reference them with no per-game #ifdef.
+float3 FalcomCameraWorldPosition()
+{
+  // Same indexing the engine uses at kai/lighting_0x430ED091:1180-1182.
+  return float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
+}
+
+// Radial distance from the camera to whatever surface this pixel shades, matched
+// to the engine's own cascade metric. Reconstructed from the depth buffer rather
+// than read from a register: the registers that hold it are clobbered long before
+// the sun composite in every one of the four call sites (Kai's r7.w is rewritten
+// eight times between the cascade select and the contact call), so a register-based
+// version would be correct on paper and wrong in practice.
+float FalcomRadialDistance(Texture2D<float4> depthTex, SamplerState samp,
+                           float2 screenUV, float2 unpack)
+{
+  const float deviceDepth = depthTex.SampleLevel(samp, screenUV, 0).x;
+  if (!isfinite(deviceDepth)) return 1.0e9;
+  const float4 clip = float4(screenUV.x * 2.0 - 1.0, 1.0 - screenUV.y * 2.0, deviceDepth, 1.0);
+  const float4 worldH = mul(clip, viewProjInv_g);
+  if (!isfinite(worldH.w) || abs(worldH.w) <= 1e-6) return 1.0e9;
+  return length(worldH.xyz / worldH.w - FalcomCameraWorldPosition());
+}
+
+// 1 inside the CSM's coverage, falling to 0 across the last 15% of the range so the
+// boundary does not draw a line across the scene. A range of 0 means "unknown" and
+// passes through, which is the correct behaviour for a title whose split we could
+// not read: gating on a wrong number would be worse than not gating.
+float FalcomSunRangeFade(float radialDist, float rangeMax)
+{
+  if (rangeMax <= 0.0) return 1.0;
+  return saturate((rangeMax - radialDist) / max(rangeMax * 0.15, 1.0));
+}
+
 // ── Contact Shadows: applied to the SUN'S OWN contribution ──
 //
 // Call this at the point where the sun diffuse is multiplied by the light colour
@@ -320,11 +380,40 @@ float3 FalcomApplyMicroShadows(float3 lit, bool isCharacter, float4 micro)
 //   Sora 1st r7.xyz = r7.xyz * lightColor_g.xyz + r11.xyz;
 //
 // so each call site is a one-line change that scales the sun and leaves the
-// ambient term untouched. Indoors the CSM has already driven the sun diffuse to
-// ~0, so this multiply is a no-op there and the interior ambient stays lit.
-float3 FalcomApplyContactToSun(float3 sunDiffuse, bool isCharacter, float4 contact)
+// ambient term untouched.
+//
+// `sunVis` is the CSM visibility already in a register at every one of those sites
+// (Sora 1st r0.w, Sora 2nd r3.z, Kai and Kai soft r8.w); each was checked to be
+// unwritten between its last read and the call. `csmRangeMax` is that game's
+// outermost cascade split. Both gates are applied HERE rather than at the call
+// sites so that all four stay identical and none can silently lose one.
+//
+// The gate is the whole point of this function. An earlier version applied contact
+// only to the sun term and relied on the sun term being ~0 indoors, which it is
+// not: the engine's directional term stays non-zero wherever the CSM fails to
+// report occlusion, and indoors that is most surfaces. Scaling it by the contact
+// term then darkened interiors. Gating on real sun visibility is what makes the
+// multiply a no-op where there is no sun.
+float3 FalcomApplyContactToSun(float3 sunDiffuse, bool isCharacter, float4 contact,
+                               float sunVis, float csmRangeMax,
+                               Texture2D<float4> depthTex, SamplerState pointSampler,
+                               float2 screenUV)
 {
   if (shader_injection_data.cs_contact_dedicated_bound < 0.5f) return sunDiffuse;
+
+  float gate = saturate(sunVis);
+  const float rangeMax = shader_injection_data.cs_contact_sun_range > 0.0
+      ? shader_injection_data.cs_contact_sun_range : csmRangeMax;
+  if (rangeMax > 0.0) {
+    gate *= FalcomSunRangeFade(
+        FalcomRadialDistance(depthTex, pointSampler, screenUV, FalcomDepthUnpackConsts()),
+        rangeMax);
+  }
+
+  // lerp toward a fully lit term, so a gated pixel is a bit-exact no-op rather than
+  // a multiply by zero that could still perturb a zero-valued register.
+  contact.x = lerp(1.0, contact.x, gate);
+
   return sunDiffuse * FalcomShadowStrength(
       contact.x, shader_injection_data.cs_contact_strength, isCharacter,
       shader_injection_data.cs_contact_env_strength,

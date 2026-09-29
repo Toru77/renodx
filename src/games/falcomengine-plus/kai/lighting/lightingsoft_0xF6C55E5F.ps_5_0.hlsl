@@ -1500,12 +1500,13 @@ void main(
     }
   }
   // Sun contact shadows apply HERE, to the sun diffuse and before r12.xyz (ambient)
-  // is added. See FalcomApplyContactToSun: scaling the final colour instead is what
-  // made contact shadows appear in interiors, where the CSM has already removed the
-  // sun and there is nothing left for them to shadow.
+  // is added, gated on real sun visibility. See FalcomApplyContactToSun for why the
+  // gate is required rather than assuming the sun term is already ~0 indoors.
+  // r8.w is the cascade-resolved visibility, unwritten through here.
   r8.xyz = FalcomApplyContactToSun(
       r8.xyz * lightColor_g.xyz, is_character_pixel,
-      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0)) + r12.xyz;
+      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
+      r8.w, shadowSplitDistance_g.y, csDepthTex, samPoint_s, v1.xy) + r12.xyz;
   r4.y = min(1, r6.w);
   r6.xyw = float3(1,1,1) + -r8.xyz;
   r6.xyw = r4.yyy * r6.xyw + r8.xyz;

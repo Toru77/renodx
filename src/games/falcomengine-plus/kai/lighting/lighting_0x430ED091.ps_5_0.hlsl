@@ -1780,14 +1780,17 @@ void main(
     }
   }
   // Sun contact shadows apply HERE, to the sun diffuse and before r12.xyz (ambient)
-  // is added. r8.xyz is the CSM-attenuated sun diffuse (r4.y = r7.x * r8.w at 1721
-  // folds the shadow visibility in), so indoors this term is already ~0 and the
-  // multiply is a no-op -- which is the point: the previous version scaled the
-  // FINAL colour, so with no sun left to shadow it went on darkening the interior
-  // ambient instead.
+  // is added, gated on real sun visibility. The previous version relied on the CSM
+  // having already driven this term to ~0 indoors; it has not, because past the last
+  // cascade split the engine clamps rather than falls off and then treats the pixel
+  // as lit, so interior surfaces kept a full sun term and contact darkened them.
+  // r8.w is the cascade-resolved visibility (shadowMaps.SampleCmpLevelZero at 1146),
+  // unwritten through here. shadowSplitDistance_g.y is the outermost split, the same
+  // one this shader's own cascade select compares radial distance against at 1284.
   r8.xyz = FalcomApplyContactToSun(
       r8.xyz * lightColor_g.xyz, is_character_pixel,
-      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0)) + r12.xyz;
+      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
+      r8.w, shadowSplitDistance_g.y, csDepthTex, samPoint_s, v1.xy) + r12.xyz;
   r4.y = min(1, r6.w);
   r6.xyw = float3(1,1,1) + -r8.xyz;
   r6.xyw = r4.yyy * r6.xyw + r8.xyz;

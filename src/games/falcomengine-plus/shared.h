@@ -652,6 +652,12 @@ struct ShaderInjectData {
   // Off by default because it trades visible noise for that, and most scenes do
   // not band. On for users who see stepping on large smooth surfaces under GTVBAO.
   float cs_micro_isfast_enabled;
+  // Manual override for the sun-contact range gate, in world units. 0 = derive the
+  // cutoff from the engine's own last-cascade split. The override exists because
+  // that split is only read in-shader by Kai and Kai soft; the Sora shaders
+  // declare the same global but never use it, so which component holds the
+  // outermost split is an inference there and may need correcting per title.
+  float cs_contact_sun_range;
  };
 
 #ifndef __cplusplus
