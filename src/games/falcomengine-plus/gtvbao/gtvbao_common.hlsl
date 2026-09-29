@@ -149,6 +149,9 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_gi_normal_influence;       // c[66] - xy scale, 1 = untouched
   float GTVBAO_gi_normal_z_preservation;  // c[67] - z scale, 1 = untouched
   float GTVBAO_gi_normal_transform_mode;  // c[68] - same encoding as c[23]
+  // Fraction of the local direct light re-emitted per bounce (diffuse albedo).
+  // Read only by the multi-bounce accumulate pass.
+  float g_gi_multibounce_bounce_fraction;  // c[69] - [0..0.5], 0.15 = subtle
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──

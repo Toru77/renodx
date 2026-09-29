@@ -122,6 +122,7 @@ ShaderInjectData shader_injection = {
   .vbgi_char_mask_strength = 0.f,
   .vbgi_multibounce = 0.f,
   .vbgi_multibounce_strength = 1.f,
+  .vbgi_multibounce_bounce_fraction = 0.15f,
   .vbgi_multibounce_saturation = 1.f,
   .vbgi_multibounce_max_clamp = 0.f,
   .vbgi_adaptive_r = 0.f,
@@ -412,7 +413,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 69;
+constexpr uint32_t kGtvbaoPushConstantFloats = 70;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
@@ -3394,8 +3395,17 @@ renodx::utils::settings::Settings settings = {
       .key = "SSGIMultiBounceStrength", .binding = &shader_injection.vbgi_multibounce_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 1.0f, .label = "Multi-Bounce Strength", .section = "VBGI",
-      .tooltip = "Intensity of the multi-bounce feedback. 1.0 = natural, higher = stronger accumulation.",
+      .tooltip = "Extra gain on top of the bounce fraction. 1.0 = use the fraction as-is. The feedback is already normalised per pixel, so this is only a trim; the pair is capped at 1.0.",
       .min = 0.0f, .max = 10.0f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "SSGIMultiBounceBounceFraction", .binding = &shader_injection.vbgi_multibounce_bounce_fraction,
+      .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+      .default_value = 0.15f, .label = "Multi-Bounce Bounce Fraction", .section = "VBGI",
+      .tooltip = "Fraction of local direct light re-emitted per bounce (diffuse albedo). The feedback is normalised per pixel, so this is the fraction actually added everywhere instead of only in bright, unoccluded pockets. 0.15 = subtle, 0.3 = strong, 0.5 = very strong.",
+      .min = 0.0f, .max = 0.5f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -10262,6 +10272,7 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[66] = g_gtvbao_gi_normal_influence;
   c[67] = g_gtvbao_gi_normal_z_preservation;
   c[68] = g_gtvbao_gi_normal_transform_mode;
+  c[69] = std::clamp(shader_injection.vbgi_multibounce_bounce_fraction, 0.f, 0.5f); // bounce fraction (albedo)
   return c;
 }
 

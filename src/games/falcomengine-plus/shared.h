@@ -101,7 +101,13 @@ struct ShaderInjectData {
   float vbgi_saturation;            // [0..2], default 1.0
   float vbgi_char_mask_strength;    // [0..1], default 0 — reduce VBGI on characters (0=off, 1=fully masked)
   float vbgi_multibounce;           // 0=Off, 1=On
-  float vbgi_multibounce_strength;  // [0..10], default 1.0 — feedback intensity
+  float vbgi_multibounce_strength;  // [0..10], default 1.0 — extra gain on the normalized bounce
+  // Fraction of the local direct light re-emitted per bounce (a diffuse
+  // albedo). The accumulate pass normalises the feedback against the pixel's
+  // own light, so this is the fraction actually added regardless of how much
+  // the gather attenuated the GI, instead of a blind multiplier over an
+  // unknown and highly geometry-dependent gain.
+  float vbgi_multibounce_bounce_fraction; // [0..0.5], default 0.15
   float vbgi_multibounce_saturation;// [0..2], default 1.0 — color saturation of feedback
   float vbgi_multibounce_max_clamp; // [0..20], default 0 — max multi-bounce per-channel (0=off)
   float vbgi_adaptive_r;            // [0..1], default 0 — per-channel red adaptive boost
