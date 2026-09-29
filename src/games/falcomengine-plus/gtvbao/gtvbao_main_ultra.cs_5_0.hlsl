@@ -84,12 +84,7 @@ float3 DepthNormal(uint2 p, float2 u, lpfloat z, lpfloat l, lpfloat r,
 }
 
 // ── MRT normal helpers (from kai-vanillaplus) ──
-float3 SafeNormalize3(float3 v, float3 fallback)
-{
-  float len2 = dot(v, v);
-  return (len2 < 1e-5) ? fallback : v * rsqrt(len2);
-}
-
+// SafeNormalize3 / TransformNormalToView now live in gtvbao_common.hlsl.
 float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
 {
   if (GTVBAO_resolution < 0.5f) {
@@ -126,24 +121,7 @@ float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
 
 float3 DecodeMrtNormalAsIs(uint2 texel)
 {
-  uint4 sample = g_srcMrtNormal.Load(int3(texel, 0));
-  float2 enc = float2((float)sample.x, (float)sample.y) * (1.0 / 32767.5) + float2(-1.0, -1.0);
-  float azimuth = 3.14159274 * enc.x;
-  float sin_a, cos_a;
-  sincos(azimuth, sin_a, cos_a);
-  float ring = sqrt(saturate(1.0 - enc.y * enc.y));
-  float3 n = float3(cos_a * ring, sin_a * ring, enc.y);
-  return SafeNormalize3(n, float3(0, 0, 1));
-}
-
-float3 TransformNormalToView(float3 decoded)
-{
-  // 0=view_g (default), 1=viewInv_g, 2=passthrough
-  float3x3 m = (float3x3)view_g;
-  if (GTVBAO_normal_transform_mode > 1.5) return SafeNormalize3(decoded, float3(0, 0, 1));
-  if (GTVBAO_normal_transform_mode > 0.5) m = (float3x3)viewInv_g;
-  float3 vn = mul(m, decoded);
-  return SafeNormalize3(vn, float3(0, 0, 1));
+  return GTVBAO_DecodeMrtNormalPacked(g_srcMrtNormal.Load(int3(texel, 0)).xy);
 }
 
 float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
@@ -191,25 +169,36 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   g_srcMrtNormal.GetDimensions(mw, mh);
   if (mw == 0 || mh == 0) return selected;
 
-  float2 scale = float2(mw, mh) / max(float2(working_size), 1.0.xx);
-  int2 mrt_tc = min(int2(floor((float2(pix) + 0.5) * scale)), int2(mw-1, mh-1));
+  // Same texel mapping the GI path uses (GTVBAO_MrtTexel), so a pixel and a
+  // sample at the same UV cannot read different normals. The scale is applied
+  // here so the helper sees texel-space coordinates, exactly as before.
+  int2 mrt_tc = GTVBAO_MrtTexel((float2(pix) + 0.5) * (float2(mw, mh) / max(float2(working_size), 1.0.xx)),
+                                float2(mw, mh));
 
   float3 decoded = DecodeMrtNormalAsIs((uint2)mrt_tc);
-  if (dot(decoded, decoded) < 1e-5) return selected;
+  if (!GTVBAO_NormalValid(decoded)) return selected;
 
-  float3 mrt_normal = TransformNormalToView(decoded);
-  float3 tuned = mrt_normal;
-  tuned.xy *= max(0.0, GTVBAO_normal_influence);
-  tuned.z  *= max(0.0, GTVBAO_normal_z_preservation);
-  tuned = SafeNormalize3(tuned, mrt_normal);
+  // Shaping lives in GTVBAO_TuneNormal so the GI per-sample path applies the
+  // identical MRT normal tuning.
+  float3 mrt_normal = TransformNormalToView(decoded, GTVBAO_normal_transform_mode);
+  float3 tuned = GTVBAO_TuneNormal(mrt_normal, GTVBAO_normal_influence, GTVBAO_normal_z_preservation);
 
+  // Every term below is a no-op at its neutral setting, so `tuned` reaches the
+  // main pass exactly as decoded: the MRT normal is used verbatim and the
+  // depth-derived normal only acts as a fallback. Each term starts doing
+  // something only once its setting leaves neutral.
   float sharpness = max(0.01, GTVBAO_normal_sharpness);
   float base_blend = pow(saturate(GTVBAO_normal_depth_blend), 1.0 / sharpness);
   float edge_metric = ComputeDepthEdgeMetric(pix, consts);
   float edge_att = 1.0 - saturate(edge_metric * max(0.0, GTVBAO_normal_edge_rejection));
   float normal_delta = 1.0 - saturate(dot(depth_fallback, tuned));
-  float detail_response = max(0.01, GTVBAO_normal_detail_response);
-  float detail_gain = lerp(0.35, 1.25, pow(normal_delta, 1.0 / detail_response));
+  // Reweight by MRT-vs-depth disagreement. 0 = neutral, i.e. gain exactly 1.0.
+  // 1 = the full 0.35..1.25 swing, which leans on the depth normal where the
+  // two agree and on the MRT normal where they diverge. The 0.5 exponent is
+  // the disagreement ramp; it is a constant now that the setting drives
+  // strength rather than the exponent.
+  float detail_gain = lerp(1.0, lerp(0.35, 1.25, pow(normal_delta, 0.5)),
+                           saturate(GTVBAO_normal_detail_response));
   float final_blend = saturate(base_blend * edge_att * detail_gain);
   if (GTVBAO_normal_darkening_mode < 0.5)
     final_blend *= saturate(GTVBAO_normal_max_darkening);

@@ -115,9 +115,14 @@ void main(uint2 dt : SV_DispatchThreadID) {
         Nlow = Tap4DepthNormal(fcc, fullDims, fullPx, fconsts);
       }
 
+      // planeD is already 0 when Nf is the zero placeholder, so depthW comes
+      // out neutral on its own. The normal term must be forced neutral too,
+      // otherwise pow(0, power) rejects every tap and the whole reconstruction
+      // collapses onto the nearest-tap fallback.
       float planeD = abs(dot(Nf, Plow - Pf));
       float depthW = exp(-planeD * planeSigma);
-      float normalW = pow(saturate(dot(Nf, Nlow)), normalPower);
+      float normalW = (GTVBAO_NormalValid(Nf) && GTVBAO_NormalValid(Nlow))
+                    ? pow(saturate(dot(Nf, Nlow)), normalPower) : 1.0;
       // No floor on the geometry term: when every tap is rejected the weighted
       // sum collapses to the nearest-tap fallback, which is correct here —
       // bilinear across taps that straddle a depth discontinuity would bleed

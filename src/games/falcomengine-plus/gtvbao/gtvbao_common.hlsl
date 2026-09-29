@@ -29,6 +29,13 @@
 // Enable visibility bitmask AO (replaces GTAO horizon angles).
 #define GT_VBAO_USE_BITMASK 1
 
+// Floor for the "normal Z preservation" tuning weight. Scaling n.z to exactly 0
+// discards the only component that distinguishes an up-facing surface from a
+// down-facing one, and renormalizing the remaining XY turns the normal into a
+// horizontal vector for every pixel. Clamp the weight instead of the result so
+// the knob stays usable without ever producing a degenerate normal.
+#define GT_VBAO_MIN_NORMAL_Z_SCALE 0.05
+
 // We do NOT compute bent normals (AO visibility only).
 // #define GT_VBAO_COMPUTE_BENT_NORMALS
 
@@ -81,7 +88,7 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_normal_detail_response;  // c[20]
   float GTVBAO_normal_max_darkening;    // c[21]
   float GTVBAO_normal_darkening_mode;   // c[22]
-  float GTVBAO_normal_transform_mode;   // c[23] - 0=view_g, 1=viewInv_g, 2=passthrough
+  float GTVBAO_normal_transform_mode;   // c[23] - 0=view_g+flipZ, 1=viewInv_g, 2=passthrough, 3=view_g, 4=viewInv_g+flipZ
   // - GI parameters -
   float g_gi_enabled;                   // c[24] - 0=off, 1=on
   float g_gi_light_exposure;            // c[25] - HDR light buffer exposure scale [0.001..10]
@@ -130,6 +137,18 @@ cbuffer cb_gtvbao : register(b13)
   float GTVBAO_upscale_plane_sigma;     // c[62] - reconstruction plane edge-stop sigma
   float GTVBAO_upscale_normal_power;    // c[63] - reconstruction normal weight power
   float GTVBAO_upscale_debug;           // c[64] - reconstruction diagnostics mode
+  // ── VBGI (GI) MRT normal settings — INDEPENDENT of the AO ones above ──
+  // VBGI is a bleeding effect and often wants different geometry handling from
+  // AO, so it gets its own copy rather than mirroring c[13]/c[15]/c[19]/c[23].
+  // These are push-constant scalars, so both consumers branch on a UNIFORM
+  // value: no warp divergence and no extra memory traffic, and only one of the
+  // MRT / depth paths ever executes. Texel mapping, decode and transform
+  // arithmetic are deliberately NOT duplicated -- those are correctness
+  // surfaces, and letting AO and GI disagree on them is how drift starts.
+  float GTVBAO_gi_normal_input_mode;      // c[65] - 0=depth, 1=MRT g-buffer
+  float GTVBAO_gi_normal_influence;       // c[66] - xy scale, 1 = untouched
+  float GTVBAO_gi_normal_z_preservation;  // c[67] - z scale, 1 = untouched
+  float GTVBAO_gi_normal_transform_mode;  // c[68] - same encoding as c[23]
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
@@ -173,9 +192,141 @@ float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDi
 // (avoids fxc X3003 redefinition errors from forward declarations).
 // The wrapper .cs_5_0.hlsl files declare and pass them.
 
-// ── Helper function prototypes (defined in wrapper .cs_5_0.hlsl files) ──
+// ── MRT normal helpers ──
+// GTVBAO_DecodeMrtNormalPacked / TransformNormalToView are defined here so every
+// pass that touches an MRT normal (main passes, normal_prep, upscale, à-trous)
+// shares one definition and cannot drift.
+// DecodeMrtNormalAsIs stays per-wrapper only as a thin binding shim: it reads
+// that pass's own `g_srcMrtNormal`, which is a per-pass resource.
+
+float3 SafeNormalize3(float3 v, float3 fallback)
+{
+  float len2 = dot(v, v);
+  return (len2 < 1e-5) ? fallback : v * rsqrt(len2);
+}
+
+// True when a normal is usable geometry rather than a placeholder.
+bool GTVBAO_NormalValid(float3 n) { return dot(n, n) > 1e-5; }
+
+// Texel address for a screen UV in a source whose resolution differs from the
+// AO working domain. Both the main pass and the GI per-sample path must land on
+// the SAME texel for the same UV, or the two read different normals for one
+// pixel. Previously the GI path truncated `uv * dims` with no texel-centre
+// offset while the main pass used `floor((pix + 0.5) * scale)`, which could
+// disagree by up to a texel.
+//
+// The caller passes the already-scaled texel-space coordinate (i.e.
+// `uv * dims`), NOT a normalized UV, and that scaling is done ONCE by the
+// caller. Computing `(pix + 0.5) / work * dims` here instead would round twice
+// and can land just under an integer boundary, e.g. half-res 960 -> full 1920
+// at pix 252 gives 504.99999999999994 and floors to 504 where the old
+// `floor((252 + 0.5) * 2)` correctly gave 505. Keep the arithmetic in the
+// form the main pass used to keep the existing mapping bit-identical.
+int2 GTVBAO_MrtTexel(float2 uvTexelSpace, float2 mrtDims)
+{
+  int2 d = max(int2(mrtDims), int2(1, 1));
+  return clamp(int2(floor(uvTexelSpace)), int2(0, 0), d - 1);
+}
+
+// The normal-tuning shaping that BuildSelectedInputNormal applies, extracted so
+// the GI path can apply exactly the same shaping to its per-sample normal.
+// Without this, the GI term silently ignored every MRT normal tuning setting
+// and AO and VBGI diverged as soon as a knob was moved. At the neutral defaults
+// (influence 1, z_preservation 1) this is the identity, so it does not change
+// current output -- it only keeps the two paths from drifting apart later.
+//
+// `viewNormal` must already be in GTVBAO view space (i.e. post
+// TransformNormalToView). `influence` and `zPreservation` are passed in rather
+// than read from the AO constants so VBGI can apply its own independent values
+// through the same code. Returns a unit vector.
+float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation)
+{
+  float3 tuned = viewNormal;
+  tuned.xy *= max(0.0, influence);
+  tuned.z  *= max(GT_VBAO_MIN_NORMAL_Z_SCALE, zPreservation);
+  return SafeNormalize3(tuned, viewNormal);
+}
+
+// Falcom packs the world-space normal as a cylindrical (azimuth, cos-polar)
+// pair: .x = atan2(N.y, N.x)/PI + 1, .y = N.z + 1, each scaled by 32767.5.
+// Matches the vanilla lighting decode (see sora2nd/lighting/lighting.asm:
+// `mad r8.zw` -> `sincos` -> `dp3 r3.y, r8.xywx`).
+//
+// Returns a ZERO vector for a texel the G-buffer never wrote. A cleared texel is
+// all-zero, which decodes to enc = (-1,-1) and therefore to the world-straight-
+// down normal (0,0,-1): unit length, so it survives a naive validity test and
+// would silently replace the depth normal. A written texel always has
+// raw.y ~= 32767 when N.z == 0, so an exact (0,0) pair can only mean "no
+// g-buffer data here". Callers fall back to the depth-derived normal on a zero
+// result, which is the same path they already use for an unavailable MRT.
+float3 GTVBAO_DecodeMrtNormalPacked(uint2 packed)
+{
+  if (packed.x == 0u && packed.y == 0u) return float3(0.0, 0.0, 0.0);
+
+  float2 enc = float2((float)packed.x, (float)packed.y) * (1.0 / 32767.5) + float2(-1.0, -1.0);
+  float sin_a, cos_a;
+  sincos(3.14159274 * enc.x, sin_a, cos_a);
+  float ring = sqrt(saturate(1.0 - enc.y * enc.y));
+  return SafeNormalize3(float3(cos_a * ring, sin_a * ring, enc.y), float3(0.0, 0.0, 0.0));
+}
+
+// GTVBAO's own view space is +Z forward: GTVBAO_ComputeViewspacePosition
+// returns ret.z = viewspaceDepth (positive, increasing with distance) and
+// viewVec = normalize(-pixCenterPos) points back at the camera, so a
+// camera-facing normal has NEGATIVE z there.
+//
+// The engine's view_g is -Z forward (D3D right-handed). Proof: the vanilla
+// lighting shader negates the view-space z to build a fog coordinate --
+//   sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl:379,381
+//     r1.w = dot(view_g._m02_m12_m22_m32, r4.xyzw);  // view-space z
+//     r3.z = -r1.w / volumeCameraFarClip_g;          // negated
+// An already-positive view z would make that fog coordinate negative.
+//
+// So the two spaces are Z-mirrored relative to each other and the transform
+// must negate Z. Without it, NdotV = saturate(dot(N, viewVec)) collapses
+// toward 0 (GTVBAO.hlsli:516), the horizon search treats the surface as
+// edge-on, and AO reports occlusion that tracks the per-frame noise rotation
+// instead of the geometry.
+//
+// X and Y already agree: GTVBAO's NDCToViewMul maps uv.x to +right and uv.y to
+// +up, matching the engine's world-up convention.
+//
+// The mode is a full 2x2 so every combination can be A/B tested in-game without
+// a rebuild: {view_g, viewInv_g} x {flip Z, no flip}.
+//
+//   0 = view_g    + flip Z   <- believed correct
+//   1 = viewInv_g (no flip)
+//   2 = passthrough
+//   3 = view_g    (no flip)
+//   4 = viewInv_g + flip Z
+// `transformMode` is passed in rather than read from the AO constant so VBGI
+// can select a different matrix through the same code.
+float3 TransformNormalToView(float3 decoded, float transformMode)
+{
+  if (!GTVBAO_NormalValid(decoded)) return float3(0.0, 0.0, 0.0);
+
+  const int mode = (int)transformMode;
+
+  // 2: leave the world-space normal completely alone (diagnostic only - the
+  // result is not in view space at all, so the AO maths is meaningless).
+  if (mode == 2) return SafeNormalize3(decoded, float3(0.0, 0.0, 0.0));
+
+  // viewInv_g is the inverse of view_g, so for a rigid (orthonormal rotation)
+  // view matrix it is the transpose of view_g's rotation. It is only a
+  // meaningful normal transform if the two spaces happen to coincide, which is
+  // why modes 1 and 4 exist purely as comparison baselines.
+  const bool use_viewInv = (mode == 1 || mode == 4);
+  const bool flip_z      = (mode == 0 || mode == 4);
+
+  float3x3 m = (float3x3)view_g;
+  if (use_viewInv) m = (float3x3)viewInv_g;
+
+  float3 vn = mul(m, decoded);
+  if (flip_z) vn.z = -vn.z;
+  return SafeNormalize3(vn, float3(0.0, 0.0, 0.0));
+}
+
 float3 DecodeMrtNormalAsIs(uint2 texel);
-float3 TransformNormalToView(float3 decoded);
 
 #include "GTVBAO.h"
 #include "GTVBAO.hlsli"

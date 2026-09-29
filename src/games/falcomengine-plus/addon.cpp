@@ -169,7 +169,7 @@ ShaderInjectData shader_injection = {
   .shadow_isfast_spatial_scale = 1.f,
   .shadow_isfast_temporal_speed = 1.f,
   .shadow_isfast_seed_offset = 0.f,
-  // ── Kai-specific defaults ──
+  // -- Kai-specific defaults --
   .cubemap_improvements_enabled = 1.f,
   .cubemap_lighting_mip_boost = 1.5f,
   .floor_cubemap_mip_scale = 4.f,
@@ -226,7 +226,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_cosine_enabled = 1.f,
   .gtvbao_cosine_mode = 2.f,
   .gtvbao_thickness_enabled = 1.f,
-  // ── Bitmask fix toggles: all default OFF = previously shipped behaviour ──
+  // -- Bitmask fix toggles: all default OFF = previously shipped behaviour --
   .char_gtvbao_mode = 0.f,
   .char_gtvbao_mask_strength = 0.f,
   .char_gtvbgi_mask_strength = 0.f,
@@ -250,7 +250,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_atrous_enabled = 0.f,
   .gtvbao_atrous_depth_sigma = 1.f,
   .gtvbao_atrous_normal_sigma = 32.f,
-  // —— Dynamic Cubemaps (Sora 2nd) ——
+  // �� Dynamic Cubemaps (Sora 2nd) ��
   .dynCube_enabled = 0.f,
   .dynCube_debug = 0.f,
   .dynCube_resolution = 0.f,
@@ -312,7 +312,7 @@ ShaderInjectData shader_injection = {
   .custom_shader_logging = 0.f,
   .dynCube_sparkle_rejection = 0.f,
   .char_outline_intensity = 1.f,
-  // ── Custom TAA (Sora 1st/2nd) defaults: off = vanilla TAA runs untouched ──
+  // -- Custom TAA (Sora 1st/2nd) defaults: off = vanilla TAA runs untouched --
   .custom_taa_enabled = 0.f,
   .custom_taa_history_filter = 0.f,
   .custom_taa_clip_mode = 0.f,
@@ -329,7 +329,7 @@ ShaderInjectData shader_injection = {
   .custom_taa_squared_motion_response = 0.f,
   .custom_taa_detail_restore = 0.f,
   .custom_taa_detail_target = 0.85f,
-  // ── RCAS post-TAA sharpening defaults: always on, strength 0 = off ──
+  // -- RCAS post-TAA sharpening defaults: always on, strength 0 = off --
   .rcas_strength = 0.2f,
   .rcas_enabled = 1.f,
   .rcas_denoise = 0.f,
@@ -340,21 +340,21 @@ ShaderInjectData shader_injection = {
   .rcas_motion_range = 2.0f,
   .rcas_motion_response = 1.0f,
   .rcas_debug = 0.f,
-  // ── FXAA post-TAA defaults: on (between TAA and RCAS), High quality ──
+  // -- FXAA post-TAA defaults: on (between TAA and RCAS), High quality --
   .fxaa_enabled = 1.f,
   .fxaa_quality = 1.f,
   .fxaa_subpix = 0.75f,
   .fxaa_edge_threshold = 0.166f,
   .fxaa_edge_threshold_min = 0.0625f,
-  // —— GTVBAO half-resolution spatial pipeline defaults: Full = existing behavior ——
+  // �� GTVBAO half-resolution spatial pipeline defaults: Full = existing behavior ��
   .gtvbao_resolution = 1.f,
   .gtvbao_upscale_plane_sigma = 40.f,
   .gtvbao_upscale_normal_power = 16.f,
   .gtvbao_upscale_debug = 0.f,
-  // —— DOF IS-FAST rotated gather ——
+  // �� DOF IS-FAST rotated gather ��
   .dof_isfast_enabled = 1.f,
   .dof_isfast_noise_frame = -1.f,
-  // —— Motion Blur (Guertin 2013) defaults: off = no dispatches, no pushes ——
+  // �� Motion Blur (Guertin 2013) defaults: off = no dispatches, no pushes ��
   .mb_mode = 0.f,
   .mb_intensity = 1.f,
         .mb_sample_count = 16.f,
@@ -396,7 +396,7 @@ ShaderInjectData shader_injection = {
         .mb_camera_cut_px = 120.f,
   };
 
-// ═══════════ GTVBAO Backend — constants, types, fwd decls ═══════════
+// ----------- GTVBAO Backend � constants, types, fwd decls -----------
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister   = 23u;  // t23 = vbgiTexture
@@ -408,22 +408,27 @@ constexpr uint32_t kLightingSceneCbRegister = 0u; // b0 = cb_scene
 constexpr uint32_t kGTVBAODepthMipLevels = 5u;
 constexpr uint32_t kGtvbaoDescriptorTableParamCount = 4u;  // sampler, cbv, srv, uav
 constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at b13
+// Float count of the GTVBAO push-constant block (cbuffer cb_gtvbao at b13).
+// Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
+// the layout range and all nine push sites cannot drift apart -- a mismatch
+// here silently truncates the tail of the block rather than failing loudly.
+constexpr uint32_t kGtvbaoPushConstantFloats = 69;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
 // DynCube loading wipe: color captures older than this mean no lighting draws
-// (loading screen) — arm history hard-replace so the next scene rebuilds clean.
+// (loading screen) � arm history hard-replace so the next scene rebuilds clean.
 constexpr uint64_t kDynCubeLoadingStaleFrames = 5u;
 constexpr uint64_t kSceneCbMinimumBytes = 95u * 16u;
 
-// ── Motion Blur (Guertin et al. 2013) ──
+// -- Motion Blur (Guertin et al. 2013) --
 // Fixed pass order; the indices address the layout/pipeline/table arrays in
 // DeviceData so the stages cannot drift out of sync. Declared here because
 // DeviceData sizes its arrays with it.
 //
 // Four dispatches, three shaders: TileMax is compiled once and dispatched twice
 // (mb_pass selects the axis). There is deliberately no full-resolution
-// intermediate for velocity or for linear depth — the gather and the tile
+// intermediate for velocity or for linear depth � the gather and the tile
 // stages read the game's own motion and depth textures and convert at the point
 // of use. Those intermediates cost 44 MB of writes per frame at 1440p, enough
 // to evict the gather's working set from L2 and push its 25 taps per pixel out
@@ -459,7 +464,7 @@ constexpr uint32_t kSoraTonemapHash = 0xC9FA40B7u;
 constexpr uint32_t kKaiTonemapHash = 0x034581D3u;
 
 
-// ── Motion blur activation ────────────────────────────────────────────────────
+// -- Motion blur activation ----------------------------------------------------
 // One channel, gated on shader_injection.mb_mode. Cutscene Only is resolved
 // against the DoF-dispatch signal, which only fires in cutscenes, so that half of
 // the test needs the frame's cutscene flag and cannot live in the setting
@@ -473,7 +478,7 @@ static bool MotionBlurActive(bool cutscene) {
 // which is the right question for greying out a control: the answer must not
 // flicker as the user walks in and out of a cutscene.
 
-// ── Motion blur logging ───────────────────────────────────────────────────────
+// -- Motion blur logging -------------------------------------------------------
 // Deliberately NOT in ShaderInjectData: no shader can read it, so it must not
 // consume a float in the pushed block.
 //
@@ -483,7 +488,7 @@ static bool MotionBlurActive(bool cutscene) {
 static float g_mb_logging = 1.f;
 static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
 
-// ── Motion blur quality preset ────────────────────────────────────────────────
+// -- Motion blur quality preset ------------------------------------------------
 // Replaces the raw Max Samples slider. The slider's useful range was narrow, the
 // bottom of it produced visible stepping in fast movement, and the exact number
 // is not something a user can judge without an A/B against a specific scene --
@@ -494,7 +499,7 @@ static bool MotionBlurLogEnabled() { return g_mb_logging > 0.5f; }
 // preset index from ever reaching the gather as if it were a sample count.
 static float g_mb_quality = 1.f;  // 0 Low, 1 Medium, 2 High, 3 Ultra
 
-// ── Motion vector source ──────────────────────────────────────────────────────
+// -- Motion vector source ------------------------------------------------------
 // 0 = the GBuffer's RTV4 (the engine's own motion output, written every frame),
 // 1 = the TAA draw's t3 (today's path, which only exists once TAA has run).
 //
@@ -521,19 +526,45 @@ static float MBQualitySampleCount(float quality) {
 constexpr float kMotionBlurRefHeight = 1080.0f;
 constexpr uint32_t kMotionBlurLogFrameGap = 120u;
 
-// ── GTVBAO normal tuning globals (separate from ShaderInjectData) ──
-static float g_gtvbao_normal_input_mode     = 1.f;
-static float g_gtvbao_normal_influence      = 1.f;
-static float g_gtvbao_normal_z_preservation = 1.f;
-static float g_gtvbao_normal_depth_blend    = 0.70f;
-static float g_gtvbao_normal_sharpness      = 0.75f;
-static float g_gtvbao_normal_edge_rejection = 0.5f;
-static float g_gtvbao_normal_detail_response = 0.75f;
-static float g_gtvbao_normal_max_darkening  = 0.50f;
+// -- GTVBAO normal tuning globals (separate from ShaderInjectData) --
+// Every default below is the NEUTRAL value for its knob: with all of them at
+// these values the MRT normal reaches GTVBAO_MainPass completely unmodified
+// (final_blend == 1.0, no xy/z scaling), so the g-buffer normal is the only
+// thing driving the horizon search and the depth-derived normal is a fallback
+// only. Raising a knob turns that one term on; nothing biases the result by
+// default.
+//
+// NOTE: the authoritative defaults are the Setting .default_value entries in
+// the GTVBAO settings block below. LoadSettings() overwrites these with
+// default_value whenever the key is absent from the ReShade ini, and
+// ResetSettings() restores default_value on top of them, so a divergence
+// between the two is silently lost at runtime. Keep them in sync; the values
+// here only apply before the first LoadSettings() pass.
+static float g_gtvbao_normal_input_mode     = 1.f;   // 1 = use the g-buffer normal
+static float g_gtvbao_normal_influence      = 1.f;   // xy scale: 1 = untouched
+static float g_gtvbao_normal_z_preservation = 1.f;   // z  scale: 1 = untouched
+static float g_gtvbao_normal_depth_blend    = 1.f;   // MRT weight before shaping
+static float g_gtvbao_normal_sharpness      = 1.f;   // gamma: 1 = passthrough
+static float g_gtvbao_normal_edge_rejection = 0.f;   // 0 = no silhouette rejection
+static float g_gtvbao_normal_detail_response = 0.f; // 0 = no disagreement reweight
+static float g_gtvbao_normal_max_darkening  = 1.f;   // cap: 1 = uncapped
 static float g_gtvbao_normal_darkening_mode = 0.f;
-static float g_gtvbao_normal_transform_mode = 0.f; // 0=view_g, 1=viewInv_g, 2=passthrough
+// 2x2 A/B matrix: {view_g, viewInv_g} x {flip Z, no flip}.
+// 0=view_g+flipZ (suspected correct: GTVBAO is +Z forward, view_g is -Z),
+// 1=viewInv_g, 2=passthrough, 3=view_g, 4=viewInv_g+flipZ
+static float g_gtvbao_normal_transform_mode = 0.f;
+// -- VBGI (GI) normal settings: independent copies of the four that shape the
+// GI sample normal (input mode, influence, z preservation, transform mode) --
+// Defaults match the AO neutral values, so enabling VBGI changes nothing until
+// a knob moves. Deliberately NOT split: texel mapping, the packed decode, and
+// the transform arithmetic. Those are correctness surfaces, and letting AO and
+// GI read different texels or decode differently is how the two drift apart.
+static float g_gtvbao_gi_normal_input_mode     = 1.f;
+static float g_gtvbao_gi_normal_influence      = 1.f;
+static float g_gtvbao_gi_normal_z_preservation = 1.f;
+static float g_gtvbao_gi_normal_transform_mode = 0.f;
 
-// ── Dynamic Cubemaps (Sora 2nd) — standalone t17 replacement ──
+// -- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement --
 constexpr uint32_t kDynCubeRegister = 17u; // t17 texEnvMap_g
 constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debug 11/12)
 constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
@@ -559,12 +590,12 @@ static reshade::api::format RCASLinearFormat(reshade::api::format fmt) {
 constexpr uint32_t kDynCubeDefaultSize = 128u;
 static uint32_t DynCubeResolveSize(float v);
 
-// ── VBGI globals removed — now controlled via ShaderInjectData fields (shared.h). ──
+// -- VBGI globals removed � now controlled via ShaderInjectData fields (shared.h). --
 // vbgi_enabled, vbgi_intensity, vbgi_saturation, vbgi_multibounce, vbgi_gi_power
 // are all part of shader_injection and pushed via BuildGTVBAOPushConstants.
 static float g_vbgi_light_exposure = 0.05f;  // HDR light buffer exposure scale (lower = dimmer GI)
 
-// ── IS-FAST noise ──
+// -- IS-FAST noise --
 static float g_isfast_enabled       = 0.f;
 static float g_isfast_strength      = 1.f;
 static float g_isfast_debug_logging = 0.f;
@@ -572,11 +603,11 @@ static float g_isfast_spatial_scale = 1.f;
 static float g_isfast_temporal_speed = 1.f;
 static float g_isfast_seed_offset   = 0.f;
 
-// ── Settings visibility ──
+// -- Settings visibility --
 static float g_settings_mode            = 0.f;   // 0=Basic, 1=Advanced
 static bool IsAdvancedSettingsMode() { return g_settings_mode >= 0.5f; }
 
-// ── Kai detection ──
+// -- Kai detection --
 static float g_char_vbgi_composite_method = 1.f;  // Kai Character VBGI master toggle
 
 static bool IsKai() {
@@ -595,7 +626,7 @@ static bool IsKai() {
   return is_kai;
 }
 
-// ── Sora 2nd detection ──
+// -- Sora 2nd detection --
 static bool IsSora2nd() {
   static bool checked = false;
   static bool is_sora2nd = false;
@@ -612,7 +643,7 @@ static bool IsSora2nd() {
   return is_sora2nd;
 }
 
-// ── Sora 1st detection ──
+// -- Sora 1st detection --
 static bool IsSora1st() {
   static bool checked = false;
   static bool is_sora1st = false;
@@ -666,14 +697,14 @@ static const char* MBMotionInputName() {
   return MBMotionUseRtv() ? "GBuffer RTV" : "TAA t3";
 }
 
-// ── Dynamic Cubemap t17 supported games ──
+// -- Dynamic Cubemap t17 supported games --
 // The global t17 vanilla-capture + dynamic override only serve Kai, Sora 1st and
 // Sora 2nd. Every other game keeps fully vanilla cubemap bindings.
 static bool IsDynCubeT17Game() {
   return IsKai() || IsSora1st() || IsSora2nd();
 }
 
-// ── Daybreak 2 detection ──
+// -- Daybreak 2 detection --
 static bool IsDaybreak2() {
   static bool checked = false;
   static bool is_db2 = false;
@@ -690,7 +721,7 @@ static bool IsDaybreak2() {
   return is_db2;
 }
 
-// ── Lighting shader identification (Sora + Kai) ──
+// -- Lighting shader identification (Sora + Kai) --
 static bool IsLightingShader(uint32_t hash) {
   return hash == 0xFDAAF80Eu    // Sora lighting
       || hash == 0xCA3D8596u    // Sora 2nd lighting
@@ -699,8 +730,8 @@ static bool IsLightingShader(uint32_t hash) {
       || hash == 0xF6C55E5Fu;   // Kai lighting soft
 }
 
-// ── CPU optimization toggles ──
-static float g_gtvbao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, …)
+// -- CPU optimization toggles --
+static float g_gtvbao_frame_skip         = 0.f;  // per-component frame skip (0=off, 1=every 2nd, �)
 static float g_gtvbao_cs_dispatch_fix    = 0.f;  // 0=Off, 1=Restore, 2=Null, 3=Null+Restore
 static float g_vbgi_frame_skip           = 0.f;
 static float g_multibounce_frame_skip    = 0.f;
@@ -742,7 +773,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view composite_srv = {};
   reshade::api::resource_view composite_uav = {};
 
-  // 1×1 white fallback — always valid, returned when GTVBAO is off / not ready.
+  // 1�1 white fallback � always valid, returned when GTVBAO is off / not ready.
   reshade::api::resource fallback_texture = {};
   reshade::api::resource_view fallback_srv = {};
 
@@ -781,11 +812,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline denoise_last_pipeline = {};
   reshade::api::pipeline denoise_last_kai_pipeline = {};  // Kai: correct prevViewProj_g offset (c85)
   reshade::api::pipeline denoise_last_sora2nd_pipeline = {};  // Sora 2nd: correct prevViewProj_g offset (c75)
-  // ── À-trous wavelet spatial filter (R3) ──
+  // -- �-trous wavelet spatial filter (R3) --
   reshade::api::pipeline_layout atrous_layout = {};
   reshade::api::pipeline atrous_pipeline = {};
   GTVBAODescriptorTableSet atrous_tables = {};
-  // Normal pre-decode pass (à-trous perf): decoded MRT normals, RGBA16F
+  // Normal pre-decode pass (�-trous perf): decoded MRT normals, RGBA16F
   reshade::api::pipeline_layout normal_prep_layout = {};
   reshade::api::pipeline normal_prep_pipeline = {};
   GTVBAODescriptorTableSet normal_prep_tables = {};
@@ -793,7 +824,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource_view normal_prep_srv = {};
   reshade::api::resource_view normal_prep_uav = {};
 
-  // Descriptor tables — pre-allocated per pass.
+  // Descriptor tables � pre-allocated per pass.
   GTVBAODescriptorTableSet prefilter_tables = {};
   GTVBAODescriptorTableSet main_tables = {};
   GTVBAODescriptorTableSet denoise_tables = {};
@@ -807,18 +838,18 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   std::atomic<bool> captured_mrt_live{true};    // destroy-event driven; false = target freed since capture
   uint64_t captured_mrt_res = 0u;               // resource behind the view (destroy matching)
   std::string captured_mrt_dims = "none";       // cached at capture (push context only)
-  reshade::api::resource_view captured_color_srv = {};   // t0 — lighting input color texture
+  reshade::api::resource_view captured_color_srv = {};   // t0 � lighting input color texture
   std::atomic<bool> captured_color_live{true};  // destroy-event driven; false = target freed since capture
   uint64_t captured_color_res = 0u;             // resource behind the view (destroy matching)
   std::string captured_color_dims = "none";     // cached at capture (push context only)
   uint32_t captured_color_w = 0u, captured_color_h = 0u;  // cached dims (SSR sizing, no draw-time query)
-  reshade::api::resource_view captured_ssr1_srv = {};   // ssr2-draw t0 — vanilla ssr1 march result (replacement debug view 2)
+  reshade::api::resource_view captured_ssr1_srv = {};   // ssr2-draw t0 � vanilla ssr1 march result (replacement debug view 2)
   std::atomic<bool> captured_ssr1_live{true};   // destroy-event driven
   uint64_t captured_ssr1_res = 0u;              // resource behind the view (destroy matching)
-  reshade::api::resource_view captured_ssr_mrt_srv = {};  // ssr1-draw t2 — march's own mrt0 (composite gate + normal decode)
+  reshade::api::resource_view captured_ssr_mrt_srv = {};  // ssr1-draw t2 � march's own mrt0 (composite gate + normal decode)
   std::atomic<bool> captured_ssr_mrt_live{true};  // destroy-event driven
   uint64_t captured_ssr_mrt_res = 0u;             // resource behind the view (destroy matching)
-  reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding — vanilla cube fallback
+  reshade::api::resource_view captured_vanilla_env_srv = {};  // game's texEnvMap_g (t17) binding � vanilla cube fallback
   reshade::api::resource_view captured_scene_cbv_view = {};  // push_descriptors passes CBV as resource_view
   reshade::api::buffer_range captured_scene_cbv = {};
   bool captured_scene_cbv_valid = false;
@@ -846,7 +877,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t deferred_scene_cbv_frame = UINT64_MAX;
   bool deferred_pending = false;
 
-  // ── GI resources (now integrated — no separate VBGI pipeline) ──
+  // -- GI resources (now integrated � no separate VBGI pipeline) --
   reshade::api::resource vbgi_output_texture = {};
   reshade::api::resource_view vbgi_output_srv = {};
   reshade::api::resource_view vbgi_output_uav = {};
@@ -856,7 +887,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource captured_light_buffer_texture = {};
   reshade::api::resource_view captured_light_buffer_srv = {};
   bool captured_light_buffer_valid = false;   // true after first frame's capture
-  // ── Multi-bounce accumulation (HDR light buffer + previous GI) ──
+  // -- Multi-bounce accumulation (HDR light buffer + previous GI) --
   reshade::api::resource multibounce_texture = {};
   reshade::api::resource_view multibounce_srv = {};
   reshade::api::resource_view multibounce_uav = {};
@@ -865,18 +896,18 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet multibounce_tables = {};
   bool vbgi_denoised_valid = false;            // true after first denoise completes
   reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
-  // ── Foliage mask (quarter-res R8_UINT, pre-pass) ──
+  // -- Foliage mask (quarter-res R8_UINT, pre-pass) --
   reshade::api::resource foliage_mask_texture = {};
   reshade::api::resource_view foliage_mask_srv = {};
   reshade::api::resource_view foliage_mask_uav = {};
   reshade::api::pipeline_layout foliage_mask_layout = {};
   reshade::api::pipeline foliage_mask_pipeline = {};
   GTVBAODescriptorTableSet foliage_mask_tables = {};
-  // ── Debug UAV (bitmask debug views 6-8) ──
+  // -- Debug UAV (bitmask debug views 6-8) --
   reshade::api::resource debug_texture = {};
   reshade::api::resource_view debug_srv = {};
   reshade::api::resource_view debug_uav = {};
-  // ── IS-FAST noise ──
+  // -- IS-FAST noise --
   reshade::api::resource isfast_noise_texture = {};
   reshade::api::resource_view isfast_noise_srv = {};
   reshade::api::sampler isfast_sampler = {};
@@ -884,7 +915,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   bool isfast_texture_attempted = false;  // only try DDS load once
   bool vbgi_bound = false;
   bool foliage_drawn_this_frame = false;  // set by foliage shader on_draw, reset per frame
-  // ── GTVBAO: which ao_term buffer holds the latest final AO result ──
+  // -- GTVBAO: which ao_term buffer holds the latest final AO result --
   bool gtvbao_final_in_b = true;
 
   // CPU optimization tracking
@@ -895,8 +926,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t last_cbv_handle = 0u;
   uint64_t last_sampler_handle = 0u;
 
-  // ── Dynamic Cubemaps (Sora 2nd) — Phase 0A/B + Phase 1 history ──
-  // Aliases to the current (just-written) history set — dyncube_srv is the cube SRV for t17.
+  // -- Dynamic Cubemaps (Sora 2nd) � Phase 0A/B + Phase 1 history --
+  // Aliases to the current (just-written) history set � dyncube_srv is the cube SRV for t17.
   reshade::api::resource dyncube_texture = {};        // current color resource (alias)
   reshade::api::resource_view dyncube_srv = {};       // current color cube SRV (alias, t17)
   reshade::api::resource_view dyncube_uav = {};       // current color UAV (alias, capture/solid write)
@@ -973,7 +1004,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   float dyncube_lastSparkleRejection = -1.f;
   bool dyncube_hasValidRead = false;       // any validated readSet exists (gates first filter)
   uint64_t dyncube_rejected_captures = 0;  // rejected (unpromoted) capture count
-  // Phase 3 GGX prefilter — double-buffered filtered cube (Active/Building) so a
+  // Phase 3 GGX prefilter � double-buffered filtered cube (Active/Building) so a
   // partially-written cube is never exposed to lighting.
   uint32_t dyncube_mip_count = 8;                        // computed mips (8 for 128..4096)
   reshade::api::resource dyncube_ggx_in = {};            // RGBA16F cube, N mips (GGX input chain)
@@ -1009,7 +1040,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource dyncube_solid_cube = {};          // RGBA16F cube, 1 mip
   reshade::api::resource_view dyncube_solid_cube_srv = {};   // TextureCube SRV (t17 for debug 3)
   reshade::api::resource_view dyncube_solid_cube_uav = {};   // Texture2DArray UAV (solid write)
-  // Simple SSR (screen-space ray march) — independent of history/ggx/inferred.
+  // Simple SSR (screen-space ray march) � independent of history/ggx/inferred.
   reshade::api::resource dyncube_ssr_raw = {};          // RGBA16F 2D, march output (rgb=color, a=confidence)
   reshade::api::resource_view dyncube_ssr_raw_srv = {};
   reshade::api::resource_view dyncube_ssr_raw_uav = {};
@@ -1030,7 +1061,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_pending_size = 0;                     // requested cube size, recreated at frame boundary
   bool dyncube_pending_recreate = false;                 // recreate (old set release deferred to Present)
   bool dyncube_pending_destroy = false;                  // feature disabled -> free the set at Present
-  // ── RCAS post-TAA sharpening (Stage 1; motion sharpening is Stage 2) ──
+  // -- RCAS post-TAA sharpening (Stage 1; motion sharpening is Stage 2) --
   // Flow per frame when enabled: TAA draw completes -> copy unsharpened TAA
   // output to rcas_hist (this copy alone is ever bound as next frame's t2) ->
   // RCAS compute reads TAA output, writes rcas_temp -> copy rcas_temp back
@@ -1100,7 +1131,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // cap the blur simply stays off for that frame.
   uint32_t mb_rtv4_rejects = 0u;
   static constexpr uint32_t kMotionBlurRtv4RejectCap = 4u;
-  // ── FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) ──
+  // -- FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) --
   // Layout/tables are shared by all three FXAA pipelines (same t0/t1/u0
   // shape); only the bytecode differs (luma prepass vs quality preset).
   reshade::api::resource fxaa_temp_texture = {};       // owned FXAA output (dims of TAA output, linear/UAV-legal variant format)
@@ -1121,9 +1152,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::pipeline fxaa_high_pipeline = {};
   uint32_t fxaa_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> fxaa_tables = {};  // [0]=srv t0+t1, [1]=uav u0
-  // ── Motion Blur (Guertin 2013), Sora 2nd ──
+  // -- Motion Blur (Guertin 2013), Sora 2nd --
   // Four owned resources: the two TileMax intermediates, NeighborMax, and the
-  // gather output. There is no velocity or linear-depth surface — both are read
+  // gather output. There is no velocity or linear-depth surface � both are read
   // straight from the game's textures and converted in the consuming shader.
   reshade::api::resource mb_tilemax_h_texture = {};
   reshade::api::resource_view mb_tilemax_h_srv = {};
@@ -1202,8 +1233,8 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   std::atomic<bool> mb_tonemap_src_live{true};
   // Frame in which the Sora 2nd DoF gather last drew; the "Cutscene Only" gate.
   uint64_t mb_dof_drew_frame = UINT64_MAX;
-  // ── Custom TAA cross-addon slot ownership (compat with the falcomengine addon,
-  // which replaces the same TAA hashes unconditionally) ──
+  // -- Custom TAA cross-addon slot ownership (compat with the falcomengine addon,
+  // which replaces the same TAA hashes unconditionally) --
   // Replacement bytecode lives in one cross-addon shared slot per hash
   // (last registration wins), while on_draw/on_drawn callbacks stay
   // per-addon. This addon persistently owns the slot for the device lifetime:
@@ -1216,7 +1247,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // Per-pipeline deep clones of TAA pipeline subobjects, captured at
   // init_pipeline (handle known there) keyed by pipeline handle. Feeds the
   // draw-time rebuild, which cannot use details->subobjects (only stored by
-  // shared infra when use_replace_async/use_shader_cache is set — neither
+  // shared infra when use_replace_async/use_shader_cache is set � neither
   // addon sets them). taa_subobjects_owned tracks handles whose tracked
   // details currently hold OUR clone (ownership for later replacement).
   std::unordered_map<uint64_t, std::pair<reshade::api::pipeline_subobject*, uint32_t>> taa_subobject_clones = {};
@@ -1233,7 +1264,7 @@ static void DestroyGTVBAOResources(reshade::api::device* device, DeviceData* dat
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* device, DeviceData* data);
 static bool RunGTVBAO(reshade::api::command_list* cmd_list, DeviceData* data);
 static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d);
-// ── Dynamic Cubemaps — forward decls ──
+// -- Dynamic Cubemaps � forward decls --
 static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uint32_t size);
 static bool CreateDynCubeVariantResources(reshade::api::device* dev, DeviceData* d, uint32_t size, uint32_t mips);
 static bool CreateDynCubeSolidResources(reshade::api::device* dev, DeviceData* d);
@@ -1252,7 +1283,7 @@ static bool RunDynCubeFilter(reshade::api::command_list* cl, DeviceData* d, bool
 static bool RunDynCubeVariant(reshade::api::command_list* cl, DeviceData* d);
 static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 
-// VBGI is now integrated into GTVBAO main pass — no separate RunVBGI needed.
+// VBGI is now integrated into GTVBAO main pass � no separate RunVBGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list);
@@ -1260,7 +1291,7 @@ static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSora1stSSRDraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list);
-// ── RCAS post-TAA sharpening — forward decls ──
+// -- RCAS post-TAA sharpening � forward decls --
 static void CreateRCASResources(reshade::api::device* dev, DeviceData* d,
                                 uint32_t w, uint32_t h, reshade::api::format fmt);
 static void DestroyRCASResources(reshade::api::device* dev, DeviceData* d);
@@ -1286,7 +1317,7 @@ static void OnDestroyPipelineCapture(reshade::api::device* device, reshade::api:
 // clones details->subobjects, which shared infra only stores when
 // use_replace_async/use_shader_cache is set (neither addon sets them), so the
 // per-handle clones captured below are assigned first; without them the
-// rebuild would index an empty array (heap corruption — the startup crash).
+// rebuild would index an empty array (heap corruption � the startup crash).
 // Two-phase (collect handles under a read lock, then reset per handle) so no
 // map lock is held across operations. The orphaned replacement pipeline is
 // deliberately NOT destroyed here (it may still be bound on this list);
@@ -1323,7 +1354,7 @@ static void ResetTAAReplacementPipelines(reshade::api::device* dev, uint32_t has
           } else if (d->taa_subobjects_owned.contains(handle)) {
             // Replace our previous clone (stock never populates these when
             // async/cache are off; when on (devkit), stock owns non-empty
-            // entries we must not free — those handles are never in owned).
+            // entries we must not free � those handles are never in owned).
             renodx::utils::pipeline::DestroyPipelineSubobjects(details.subobjects);
             auto* fresh = renodx::utils::pipeline::ClonePipelineSubObjects(
                 cit->second.first, cit->second.second);
@@ -1433,14 +1464,14 @@ static void OnPushDescriptorsCapture(reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages, reshade::api::pipeline_layout layout,
     uint32_t param_index, const reshade::api::descriptor_table_update& update);
 
-// ── Custom Shader crash-tracing log (defined before OnPresent; used everywhere) ──
+// -- Custom Shader crash-tracing log (defined before OnPresent; used everywhere) --
 static void CSLog(const char* tag, const std::string& msg, bool warn = false);
 static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_view v);
 static bool DynCubeSceneLive(const DeviceData* d);
 struct CapturedViewInfo { uint64_t res; std::string dims; uint32_t w; uint32_t h; };
 static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api::resource_view v);
 
-// ── IS-FAST sync helpers (sync g_isfast_* globals → shader_injection) ──
+// -- IS-FAST sync helpers (sync g_isfast_* globals ? shader_injection) --
 static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
   shader_injection.shadow_isfast_enabled = g_isfast_enabled;
   shader_injection.shadow_isfast_spatial_scale = g_isfast_spatial_scale;
@@ -1453,7 +1484,7 @@ static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
   }
 }
 
-// ── Shadow draw callbacks (sync IS-FAST + push IS-FAST SRV at t3) ──
+// -- Shadow draw callbacks (sync IS-FAST + push IS-FAST SRV at t3) --
 static bool OnBeforeShadowCSMDraw(reshade::api::command_list* cmd_list) {
   SyncISFASTToShaderInjection(cmd_list);
   // Push IS-FAST noise texture at t3 (same pattern as t22 in lighting shader)
@@ -1484,7 +1515,7 @@ static bool OnBeforeShadowBlurDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── Volfog IS-FAST sync + push IS-FAST SRV at t3 ──
+// -- Volfog IS-FAST sync + push IS-FAST SRV at t3 --
 static void SyncVolFogISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
   shader_injection.volfog_isfast_spatial_scale = g_isfast_spatial_scale;
   if (auto* dev = cmd_list->get_device()) {
@@ -1526,7 +1557,7 @@ static bool OnBeforeVolFogDraw(reshade::api::command_list* cmd_list) {
 
 static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
   SyncVolFogISFASTToShaderInjection(cmd_list);
-  // Sync Sora volfog settings → Kai volfog fields
+  // Sync Sora volfog settings ? Kai volfog fields
   shader_injection.volfog_tricubic_enabled = shader_injection.volfog_haze_aa_mode;
   shader_injection.volfog_is_fast_enabled = shader_injection.volfog_isfast_enabled;
   // Note: volfog_color_correction_strength is bound to Fog3DCorrectionStrength setting;
@@ -1558,7 +1589,7 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── Kai + Daybreak 2 character lighting callback (Env SSS + Character Shadowing) ──
+// -- Kai + Daybreak 2 character lighting callback (Env SSS + Character Shadowing) --
 static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list) {
   // Character shader reads shader_injection_data automatically via b13 injection.
   // Push IS-FAST noise at t15 (Kai char shader uses it; Daybreak 2 char does not).
@@ -1583,7 +1614,7 @@ static bool OnBeforeCharLightingDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── Foliage draw tracking (for GTVBAO foliage exclusion performance) ──
+// -- Foliage draw tracking (for GTVBAO foliage exclusion performance) --
 static bool OnBeforeFoliageDraw(reshade::api::command_list* cmd_list) {
   auto* device = cmd_list->get_device();
   auto* data = device->get_private_data<DeviceData>();
@@ -1591,7 +1622,7 @@ static bool OnBeforeFoliageDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── DOF gather (Improved) draw: IS-FAST rotation ──
+// -- DOF gather (Improved) draw: IS-FAST rotation --
 // The gather shaders sample only t0, so t5 is free for the IS-FAST volume.
 // Mirrors the Vanilla-SSR IS-FAST path exactly (same volume, same frame
 // slice, same "frame < 0 means unusable" gating), so the noise the bokeh
@@ -1621,11 +1652,11 @@ static bool OnBeforeDofGatherDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── Motion Blur callbacks (implemented in the Motion Blur section) ──
+// -- Motion Blur callbacks (implemented in the Motion Blur section) --
 static void OnDrawnDofGather(reshade::api::command_list* cmd_list);
 static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list);
 
-// ═══════════ Custom shaders ═══════════
+// ----------- Custom shaders -----------
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     {
@@ -1652,7 +1683,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeShadowBlurDraw,
         },
     },
-    // ── Sora 2nd shadow pipeline ──
+    // -- Sora 2nd shadow pipeline --
     {
         0xF320152Cu,
         renodx::mods::shader::CustomShader{
@@ -1677,7 +1708,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeLightingShaderDraw,
         },
     },
-    // ── Sora 2nd SSR (replacement-gated; vanilla when the toggle is off) ──
+    // -- Sora 2nd SSR (replacement-gated; vanilla when the toggle is off) --
     // NOTE: ssr1 runs the vanilla march (composite input when replacing; skipped
     // only when replacement is on and Game SSR is off). ssr2 runs the DynCube
     // composite under the gate; otherwise the game draws vanilla.
@@ -1699,7 +1730,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeSoraSSR2Draw,
         },
     },
-    // ── Sora 1st SSR (fused march + temporal, replacement-gated) ──
+    // -- Sora 1st SSR (fused march + temporal, replacement-gated) --
     // NOTE: the single pass runs the vanilla march inline and temporally filters
     // it; the composite resolves march > dynamic > miss (no vanilla cube on this
     // path) and keeps the vanilla temporal stage. Otherwise the game draws vanilla.
@@ -1712,7 +1743,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeSora1stSSRDraw,
         },
     },
-    // ── Custom TAA (Sora 1st/2nd; vanilla baseline, custom when enabled) ──
+    // -- Custom TAA (Sora 1st/2nd; vanilla baseline, custom when enabled) --
     // NOTE: custom files use unique embed stems (taa_custom_sora1st/2nd) so the
     // dumped vanilla reference files under sora1st/taa and sora2nd/taa keep
     // compiling untouched; the runtime CRCs below are the game's TAA hashes.
@@ -1738,7 +1769,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_drawn = OnDrawnCustomTAA,
         },
     },
-    // ── Kai SSR (fused march + temporal, replacement-gated; High + Ultra) ──
+    // -- Kai SSR (fused march + temporal, replacement-gated; High + Ultra) --
     // NOTE: both quality variants run the vanilla march inline and temporally
     // filter it; each composite resolves march > dynamic > miss (no vanilla
     // cube on this path) and keeps the vanilla temporal stage. Only one variant
@@ -1762,9 +1793,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
         },
     },
     CustomShaderEntryCallback(0x485E0022, OnBeforeSsaoShaderDraw),
-    // ── Sora 2nd ssao (GTVBAO gate) ──
+    // -- Sora 2nd ssao (GTVBAO gate) --
     CustomShaderEntryCallback(0x752B2580, OnBeforeSsaoShaderDraw),
-    // ── Sora foliage (GTVBAO foliage marker bit 15 in o1.w) ──
+    // -- Sora foliage (GTVBAO foliage marker bit 15 in o1.w) --
     {
         0x76E6E95Eu,
         renodx::mods::shader::CustomShader{
@@ -1781,7 +1812,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
-    // ── Sora clutter/flower foliage ──
+    // -- Sora clutter/flower foliage --
     {
         0xb03759DAu,
         renodx::mods::shader::CustomShader{
@@ -1798,7 +1829,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
-    // ── Sora potflower foliage ──
+    // -- Sora potflower foliage --
     {
         0xd9becfb1u,
         renodx::mods::shader::CustomShader{
@@ -1807,7 +1838,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
-    // ── Sora 2nd foliage (GTVBAO foliage marker bit 15 in o1.w) ──
+    // -- Sora 2nd foliage (GTVBAO foliage marker bit 15 in o1.w) --
     {
         0x46FCDC51u,
         renodx::mods::shader::CustomShader{
@@ -1872,7 +1903,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
-    // ── Kai foliage (GTVBAO foliage marker) ──
+    // -- Kai foliage (GTVBAO foliage marker) --
     {
         0x534E54EAu,
         renodx::mods::shader::CustomShader{
@@ -1906,12 +1937,12 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeLightingShaderDraw,
         },
     },
-    // ── Kai lighting (GTVBAO + VBGI) ──
+    // -- Kai lighting (GTVBAO + VBGI) --
     CustomShaderEntryCallback(0x430ED091, OnBeforeLightingShaderDraw),
     CustomShaderEntryCallback(0xF6C55E5F, OnBeforeLightingShaderDraw),
-    // ── Kai volumetric fog (IS-FAST + Haze AA) ──
+    // -- Kai volumetric fog (IS-FAST + Haze AA) --
     CustomShaderEntryCallback(0xBD7DFE49, OnBeforeKaiVolFogDraw),
-    // ── Kai character lighting (Env SSS + Character Shadowing) ──
+    // -- Kai character lighting (Env SSS + Character Shadowing) --
     {
         0x445A1838u,
         renodx::mods::shader::CustomShader{
@@ -1920,11 +1951,11 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeCharLightingDraw,
         },
     },
-    // ── Kai cubemap shaders stay vanilla (no CustomShaderEntry overrides) ──
-    // ── Daybreak 2 cubemap shaders stay vanilla (no CustomShaderEntry overrides) ──
-    // ── Daybreak 2 volumetric fog (Haze AA) ──
+    // -- Kai cubemap shaders stay vanilla (no CustomShaderEntry overrides) --
+    // -- Daybreak 2 cubemap shaders stay vanilla (no CustomShaderEntry overrides) --
+    // -- Daybreak 2 volumetric fog (Haze AA) --
     CustomShaderEntryCallback(0x9A49E6E9, nullptr),
-    // ── Daybreak 2 character lighting (Env SSS + Character Shadowing) ──
+    // -- Daybreak 2 character lighting (Env SSS + Character Shadowing) --
     {
         0xAC3BA23Cu,
         renodx::mods::shader::CustomShader{
@@ -1933,7 +1964,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeCharLightingDraw,
         },
     },
-    // ── Kai DOF shaders ──
+    // -- Kai DOF shaders --
     CustomShaderEntryCallback(0xAB6DBF4D, nullptr),
     // Expanded from CustomShaderEntryCallback, which only sets on_draw, to the
     // explicit struct so it ALSO gets on_drawn. That is what makes Kai's
@@ -1949,9 +1980,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     .on_drawn = OnDrawnDofGather,
     },
     },
-    // ── Sora 2nd DOF shaders (port Kai improved) ──
+    // -- Sora 2nd DOF shaders (port Kai improved) --
     CustomShaderEntryCallback(0x5BBEC5A3, nullptr),
-    // Gather pass — shared by Sora 2nd and Sora 1st (Sora 1st supplies its own
+    // Gather pass � shared by Sora 2nd and Sora 1st (Sora 1st supplies its own
     // CoC pass, 0x1CA8DE95, and reuses this one). on_drawn is the "Cutscene
     // Only" motion blur deploy point; on_replace keeps the IS-FAST t5 push.
     {
@@ -1963,9 +1994,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_drawn = OnDrawnDofGather,
         },
     },
-    // ── Sora 1st DOF shaders ──
+    // -- Sora 1st DOF shaders --
     CustomShaderEntryCallback(0x1CA8DE95, nullptr),
-    // ── Motion Blur "Always On" deploy point: the post-TAA tonemap ──
+    // -- Motion Blur "Always On" deploy point: the post-TAA tonemap --
     // Empty payload = no replacement; the game's own shader runs and we only
     // swap t0 for the blurred result.
     {
@@ -1988,7 +2019,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
   //__ALL_CUSTOM_SHADERS,
 };
 
-// ═══════════ Settings ═══════════
+// ----------- Settings -----------
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
@@ -2001,7 +2032,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Settings",
         .labels = {"Basic", "Advanced"},
         .on_change = []() {
-          if (g_settings_mode < 0.5f) {  // Switched to Basic — reset advanced-only settings
+          if (g_settings_mode < 0.5f) {  // Switched to Basic � reset advanced-only settings
             float saved = g_settings_mode;
             g_settings_mode = 1.0f;
             std::vector<renodx::utils::settings::Setting*> advanced;
@@ -2020,7 +2051,7 @@ renodx::utils::settings::Settings settings = {
         },
         .is_global = true,
     },
-    // —— IS-FAST Master Toggle (top-level) ——
+    // �� IS-FAST Master Toggle (top-level) ��
     new renodx::utils::settings::Setting{
       .key = "ISFASTMasterEnable", .binding = &g_isfast_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -2073,9 +2104,9 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
-    // ═══════════ Kai / Daybreak 2 - Specific Sections ═══════════
+    // ----------- Kai / Daybreak 2 - Specific Sections -----------
 
-    // ── SSGI (Falcom) ──
+    // -- SSGI (Falcom) --
     new renodx::utils::settings::Setting{
       .key = "KaiSSGIEnable", .binding = &shader_injection.ssgi_mod_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -2108,7 +2139,7 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
 
-    // ── Depth of Field ──
+    // -- Depth of Field --
     new renodx::utils::settings::Setting{
       .key = "DOFMode", .binding = &shader_injection.dof_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -2237,7 +2268,7 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
-    // ── Motion Blur (Guertin et al. 2013) ──.
+    // -- Motion Blur (Guertin et al. 2013) --.
     new renodx::utils::settings::Setting{
       // Key kept from the pre-split Mode so existing configs keep working.
       .key = "MotionBlurMode", .binding = &shader_injection.mb_mode,
@@ -2437,7 +2468,7 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsMotionBlurGame() && IsAdvancedSettingsMode(); },
     },
 
-    // ── Character SSGI ──
+    // -- Character SSGI --
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeMethod", .binding = &g_char_vbgi_composite_method,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -2534,7 +2565,7 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
 
-    // ── Fog Color Correction ──
+    // -- Fog Color Correction --
     new renodx::utils::settings::Setting{
       .key = "FogColorCorrectionMode", .binding = &shader_injection.fog_color_correction_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -2858,7 +2889,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "SSS Mask", "Shadow Value"},
     .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
-    // —— GTVBAO ——
+    // �� GTVBAO ��
     new renodx::utils::settings::Setting{
       .key = "GTVBAOMode", .binding = &shader_injection.gtvbao_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -2909,7 +2940,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAODenoisePasses", .binding = &shader_injection.gtvbao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Denoise Passes", .section = "GTVBAO",
-      .tooltip = "Bilateral chain strength. Ignored while À-Trous Filter is On (fixed 3 wavelet iterations).",
+      .tooltip = "Bilateral chain strength. Ignored while �-Trous Filter is On (fixed 3 wavelet iterations).",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_atrous_enabled < 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -2936,7 +2967,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.15f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 1.0f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -2950,7 +2981,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
-      .default_value = 1.0f, .label = "Radius Multiplier", .section = "GTVBAO",
+      .default_value = 1.8f, .label = "Radius Multiplier", .section = "GTVBAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -2964,24 +2995,24 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOSampleDistribution", .binding = &shader_injection.gtvbao_sample_distribution,
-      .default_value = 1.0f, .label = "Sample Distribution", .section = "GTVBAO",
+      .default_value = 1.5f, .label = "Sample Distribution", .section = "GTVBAO",
       .min = 1.0f, .max = 3.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOBitmaskThickness", .binding = &shader_injection.gtvbao_bitmask_thickness,
-      .default_value = 0.2f, .label = "Bitmask Thickness", .section = "GTVBAO",
+      .default_value = 0.5f, .label = "Bitmask Thickness", .section = "GTVBAO",
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // —— GTVBAO Upgrade (visibility bitmask accuracy improvements, always On) ——
+    // �� GTVBAO Upgrade (visibility bitmask accuracy improvements, always On) ��
     new renodx::utils::settings::Setting{
       .key = "GTVBAOGTVBAOCosineMode", .binding = &shader_injection.gtvbao_cosine_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Cosine Sampling Mode", .section = "GTVBAO",
       .tooltip = "Mode 1: Uniform slices with per-slice weight. Mode 2: Ray projection from world-space lobe. Mode 3: CDF importance sampling (best quality/speed).",
       .labels = {"Weight", "Project", "CDF"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -3017,11 +3048,11 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // Spatial denoiser only (Spatio-Temporal / Poisson removed). À-Trous kept below.
+    // Spatial denoiser only (Spatio-Temporal / Poisson removed). �-Trous kept below.
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousEnabled", .binding = &shader_injection.gtvbao_atrous_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "À-Trous Filter", .section = "GTVBAO",
+      .default_value = 1.f, .label = "�-Trous Filter", .section = "GTVBAO",
       .tooltip = "Edge-aware wavelet spatial filter (3 iterations, growing radius). Replaces the bilateral chain.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
@@ -3029,16 +3060,16 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousDepthSigma", .binding = &shader_injection.gtvbao_atrous_depth_sigma,
-      .default_value = 1.0f, .label = "À-Trous Depth Stop", .section = "GTVBAO",
-      .tooltip = "Depth edge sensitivity for the à-trous filter. Higher = smoother across depth steps (more leak).",
+      .default_value = 1.0f, .label = "�-Trous Depth Stop", .section = "GTVBAO",
+      .tooltip = "Depth edge sensitivity for the �-trous filter. Higher = smoother across depth steps (more leak).",
       .min = 0.05f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousNormalSigma", .binding = &shader_injection.gtvbao_atrous_normal_sigma,
-      .default_value = 64.f, .label = "À-Trous Normal Stop", .section = "GTVBAO",
-      .tooltip = "Normal edge sensitivity for the à-trous filter. Quantized to powers of two; higher = sharper edges. 32 is the default.",
+      .default_value = 64.f, .label = "�-Trous Normal Stop", .section = "GTVBAO",
+      .tooltip = "Normal edge sensitivity for the �-trous filter. Quantized to powers of two; higher = sharper edges. 32 is the default.",
       .min = 2.f, .max = 64.f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3062,6 +3093,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalDepthBlend", .binding = &g_gtvbao_normal_depth_blend,
       .default_value = 1.f, .label = "Normal Depth Blend", .section = "GTVBAO",
+      .tooltip = "Base blend weight between the depth-derived normal and the MRT normal. 1.0 (neutral) uses the MRT normal in full; the depth normal is then only a fallback.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3069,34 +3101,39 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalSharpness", .binding = &g_gtvbao_normal_sharpness,
       .default_value = 1.f, .label = "Normal Sharpness", .section = "GTVBAO",
+      .tooltip = "Gamma applied to the depth blend. 1.0 (neutral) is a straight passthrough; higher values push the weight toward the depth normal faster.",
       .min = 0.01f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalEdgeRejection", .binding = &g_gtvbao_normal_edge_rejection,
-      .default_value = 0.5f, .label = "Normal Edge Rejection", .section = "GTVBAO",
+      .default_value = 0.f, .label = "Normal Edge Rejection", .section = "GTVBAO",
+      .tooltip = "Rejects the MRT normal on depth discontinuities. 0.0 (neutral) applies no rejection; raise it to fall back toward the depth normal at silhouettes.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalZPreservation", .binding = &g_gtvbao_normal_z_preservation,
-      .default_value = 0.f, .label = "Normal Z Preservation", .section = "GTVBAO",
+      .default_value = 1.0f, .label = "Normal Z Preservation", .section = "GTVBAO",
+      .tooltip = "Scales the view-space n.z of the MRT normal. 1.0 keeps the encoded normal intact; lower values tilt it. The shader floors this so it can never reach 0 and flatten the normal.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalDetailResponse", .binding = &g_gtvbao_normal_detail_response,
-      .default_value = 0.01f, .label = "Normal Detail Response", .section = "GTVBAO",
-      .min = 0.01f, .max = 1.f, .format = "%.2f",
+      .default_value = 0.f, .label = "Normal Detail Response", .section = "GTVBAO",
+      .tooltip = "Reweights the MRT normal by how far it disagrees with the depth normal. 0.0 (neutral) is an exact no-op; 1.0 leans on the depth normal where they agree and the MRT normal where they diverge.",
+      .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalMaxDarkening", .binding = &g_gtvbao_normal_max_darkening,
       .default_value = 1.f, .label = "Normal Max Darkening", .section = "GTVBAO",
+      .tooltip = "Caps the final MRT normal blend weight in Multiply mode. 1.0 (neutral) applies no cap.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3105,16 +3142,51 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAONormalDarkeningMode", .binding = &g_gtvbao_normal_darkening_mode,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Normal Darkening Mode", .section = "GTVBAO",
+      .tooltip = "Multiply applies the Normal Max Darkening cap to the final blend weight; Replace skips it. Neutral either way while Max Darkening is at 1.0.",
       .labels = {"Multiply", "Replace"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .key = "GTVBAOGINormalInputMode", .binding = &g_gtvbao_gi_normal_input_mode,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "VBGI Normal Input", .section = "GTVBAO",
+      .tooltip = "VBGI's own normal source, independent of the AO one above. Off = depth-derived sample normals, which are softer and produce fewer fireflies. On = the same g-buffer normals AO uses.",
+      .labels = {"Off (Depth)", "On (MRT)"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGINormalInfluence", .binding = &g_gtvbao_gi_normal_influence,
+      .default_value = 1.f, .label = "VBGI Normal Influence", .section = "GTVBAO",
+      .tooltip = "Scales the XY of VBGI's sample normal. 1.0 (neutral) leaves it untouched.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGINormalZPreservation", .binding = &g_gtvbao_gi_normal_z_preservation,
+      .default_value = 1.f, .label = "VBGI Normal Z Preservation", .section = "GTVBAO",
+      .tooltip = "Scales the view-space n.z of VBGI's sample normal. 1.0 (neutral) keeps it intact; the shader floors this so it can never flatten the normal.",
+      .min = 0.f, .max = 2.f, .format = "%.2f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOGINormalTransformMode", .binding = &g_gtvbao_gi_normal_transform_mode,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 3.f, .label = "VBGI Normal Transform Mode", .section = "GTVBAO",
+      .tooltip = "Same encoding as the AO transform mode, applied independently. Use this only if VBGI's normals look rotated while AO's are correct.",
+      .labels = {"view_g + flip Z (default)", "viewInv_g", "Passthrough", "view_g (no flip)", "viewInv_g + flip Z"},
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
+    .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
       .key = "GTVBAONormalTransformMode", .binding = &g_gtvbao_normal_transform_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "Normal Transform Mode", .section = "GTVBAO",
-      .tooltip = "How to transform MRT normals to view space. Try alternatives if normals look wrong at some camera angles.",
-      .labels = {"view_g (default)", "viewInv_g", "Passthrough"},
+      .default_value = 4.f, .label = "Normal Transform Mode", .section = "GTVBAO",
+      .tooltip = "How to transform MRT normals into GTVBAO's view space. The MRT stores WORLD-space normals and GTVBAO's space is +Z forward while the engine's view_g is -Z forward, so view_g needs a Z flip. The other modes are wrong baselines kept for A/B comparison.",
+      .labels = {"view_g + flip Z (suspected correct)", "viewInv_g (no flip)", "Passthrough (no transform)", "view_g (no flip)", "viewInv_g + flip Z"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -3123,7 +3195,10 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Debug View", .section = "GTVBAO",
       .labels = {"Off", "AO Only", "GTVBAO raw .a", "GTVBAO RGBA", "Vanilla SSAO", "Depth",
-                 "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits", "9:FoliageMask"},
+                 "6:BitmaskHeat", "7:SectorCount", "8:1stSliceBits", "9:FoliageMask",
+                 "10-21:Kai MRT (see Kai shader)", "22:Raw MRT0 xy", "23:Decoded normal + valid",
+                 "24:View normal (GTVBAO space)", "25:NdotV + source", "26:cosNorm/projLen/vis",
+                 "27:Raw slice AO", "28:Weighting loss", "29:NdotV/MRT Z/occlusion"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -3141,7 +3216,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── GTVBAO scheduling ──
+    // -- GTVBAO scheduling --
     new renodx::utils::settings::Setting{
       .key = "GTVBAOFrameSkip", .binding = &g_gtvbao_frame_skip,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3155,12 +3230,12 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOPrefilter", .binding = &shader_injection.gtvbao_prefilter_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Pre-filter AO", .section = "GTVBAO",
-      .tooltip = "Depth-aware 3×3 bilateral pre-filter on raw AO before power curve (reduces bitmask noise).",
+      .tooltip = "Depth-aware 3�3 bilateral pre-filter on raw AO before power curve (reduces bitmask noise).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── GTVBAO Foliage ──
+    // -- GTVBAO Foliage --
     new renodx::utils::settings::Setting{
       .key = "GTVBAOExcludeFoliage", .binding = &shader_injection.gtvbao_exclude_foliage,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3179,12 +3254,12 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_exclude_foliage > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── Foliage Grass AO ──
+    // -- Foliage Grass AO --
     new renodx::utils::settings::Setting{
       .key = "FoliageGrassAOEnabled", .binding = &shader_injection.foliage_grass_ao_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Grass AO", .section = "Foliage Grass AO",
-      .tooltip = "Per-blade vertical AO gradient: dark at root, bright at tip. Replaces noisy SSAO/GTAO on foliage with a stable bake. (Ghost of Tsushima §1.5e-ii)",
+      .tooltip = "Per-blade vertical AO gradient: dark at root, bright at tip. Replaces noisy SSAO/GTAO on foliage with a stable bake. (Ghost of Tsushima �1.5e-ii)",
       .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -3214,7 +3289,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.foliage_grass_ao_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── BRDF Improvement ──
+    // -- BRDF Improvement --
     new renodx::utils::settings::Setting{
       .key = "BRDFHammonDiffuse", .binding = &shader_injection.brdf_hammon_diffuse_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3236,7 +3311,7 @@ renodx::utils::settings::Settings settings = {
       .key = "BRDFMultiScatterSpecular", .binding = &shader_injection.brdf_multiscatter_specular_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
-      .tooltip = "Replaces Blinn-Phong specular with GGX D·V·F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
+      .tooltip = "Replaces Blinn-Phong specular with GGX D�V�F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
       .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -3264,7 +3339,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.5f, .max = 1.f, .format = "%.2f",
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── GTVBAO dispatch Fix (for double volumetrics) ──
+    // -- GTVBAO dispatch Fix (for double volumetrics) --
     new renodx::utils::settings::Setting{
       .key = "GTVBAOCSDispatchFix", .binding = &g_gtvbao_cs_dispatch_fix,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3273,7 +3348,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Fix 1: Restore State", "Fix 2: Null Compute", "Fix 3: Null + Restore"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // —— SSGI (Screen Space Global Illumination — integrated into GTVBAO) ——
+    // �� SSGI (Screen Space Global Illumination � integrated into GTVBAO) ��
     new renodx::utils::settings::Setting{
       .key = "SSGIEnable", .binding = &shader_injection.vbgi_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3284,7 +3359,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
-      .default_value = 0.75f, .label = "Intensity", .section = "VBGI",
+      .default_value = 1.0f, .label = "Intensity", .section = "VBGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3447,7 +3522,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f && shader_injection.vbgi_multibounce > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // —— VBGI debug ——
+    // �� VBGI debug ��
     new renodx::utils::settings::Setting{
       .key = "SSGIDebugView", .binding = &shader_injection.vbgi_debug_view,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3464,7 +3539,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "On"},
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── Kai: GTVBAO VBGI Falcom SSGI consumption ──
+    // -- Kai: GTVBAO VBGI Falcom SSGI consumption --
     new renodx::utils::settings::Setting{
       .key = "SSGIKaiConsumeFalcom", .binding = &shader_injection.vbgi_kai_consume_falcom,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3491,7 +3566,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.vbgi_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
-    // —— SSGI Affect Lights ——
+    // �� SSGI Affect Lights ��
     new renodx::utils::settings::Setting{
       .key = "SSGIAffectLights", .binding = &shader_injection.vbgi_affect_lights,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3530,7 +3605,7 @@ renodx::utils::settings::Settings settings = {
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
-      .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default OFF — avoids latency.",
+      .tooltip = "Move GTVBAO/VBGI dispatch to OnPresent (1-frame latency). Kai-only, default OFF � avoids latency.",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -3542,7 +3617,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "On"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // —— Shadow Maps ——
+    // �� Shadow Maps ��
     new renodx::utils::settings::Setting{
       .key = "ShadowFilterMethod", .binding = &shader_injection.shadow_filter_method,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3559,7 +3634,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Falcom", "Improved"},
       .is_visible = []() { return !IsKai(); },
     },
-    // —— CHSS Settings (enabled when ShadowFilterMethod = CHSS) ——
+    // �� CHSS Settings (enabled when ShadowFilterMethod = CHSS) ��
     new renodx::utils::settings::Setting{
       .key = "ShadowCHSSJitter", .binding = &shader_injection.shadow_pcss_jitter_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3686,7 +3761,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.shadow_filter_method > 1.5f; },
     .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
-    // —— Colored Shadow Penumbra (Improved mode) ——
+    // �� Colored Shadow Penumbra (Improved mode) ��
     new renodx::utils::settings::Setting{
       .key = "ShadowPenumbraColorStrength", .binding = &shader_injection.shadow_penumbra_color_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
@@ -3768,7 +3843,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.shadow_edge_tint > 1.5f; },
     .is_visible = []() { return !IsKai() && IsAdvancedSettingsMode(); },
     },
-    // —— Shadows (Kai) ——
+    // �� Shadows (Kai) ��
     new renodx::utils::settings::Setting{
       .key = "KaiShadowBaseSoftness", .binding = &shader_injection.shadow_base_softness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
@@ -3803,7 +3878,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.shadow_pcss_jitter_enabled > 0.5f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
-    // ── Colored Shadow Penumbra (Kai) ──
+    // -- Colored Shadow Penumbra (Kai) --
     new renodx::utils::settings::Setting{
       .key = "KaiPenumbraMode", .binding = &shader_injection.shadow_edge_tint_kai,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -3812,7 +3887,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Improved"},
       .is_visible = []() { return IsKai(); },
     },
-    // —— Character hero light (Kai) ——
+    // �� Character hero light (Kai) ��
     new renodx::utils::settings::Setting{
       .key = "KaiCharacterLight", .binding = &shader_injection.character_light_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
@@ -3866,7 +3941,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.shadow_edge_tint >= 1.0f; },
       .is_visible = []() { return IsKai() && IsAdvancedSettingsMode(); },
     },
-    // —— Dynamic Cubemaps — standalone t17 replacement ——
+    // �� Dynamic Cubemaps � standalone t17 replacement ��
     new renodx::utils::settings::Setting{
       .key = "DynCubeEnabled", .binding = &shader_injection.dynCube_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4183,7 +4258,7 @@ renodx::utils::settings::Settings settings = {
       .key = "DynCubeSSRCharOccUpness", .binding = &shader_injection.dynCube_ssr_char_occ_upness,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
       .default_value = 0.f, .label = "SSR Character Occlusion Upness", .section = "Dynamic Cubemaps",
-      .tooltip = "Surface upness threshold where the character-hit confidence reduction begins (smooth ±0.25 band). 0 = any up-facing surface, 0.5 = mostly horizontal, 1 = only fully horizontal (floor/water).",
+      .tooltip = "Surface upness threshold where the character-hit confidence reduction begins (smooth �0.25 band). 0 = any up-facing surface, 0.5 = mostly horizontal, 1 = only fully horizontal (floor/water).",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f && shader_injection.dynCube_ssr_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -4225,7 +4300,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.dynCube_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── Vanilla SSR Improvements (Sora2nd march/denoise correctness, A/B) ──
+    // -- Vanilla SSR Improvements (Sora2nd march/denoise correctness, A/B) --
     new renodx::utils::settings::Setting{
       .key = "DynCubeVanillaSSREnabled", .binding = &shader_injection.dynCube_vanilla_ssr_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4305,7 +4380,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.dynCube_vanilla_ssr_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
-    // ── Character Outline (Sora 1st / 2nd) ──
+    // -- Character Outline (Sora 1st / 2nd) --
     new renodx::utils::settings::Setting{
       .key = "CharOutlineIntensity", .binding = &shader_injection.char_outline_intensity,
       .default_value = 1.f, .label = "Outline Intensity", .section = "Character Outline",
@@ -4313,7 +4388,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_visible = []() { return IsSora1st() || IsSora2nd(); },
     },
-    // ── Custom TAA (Sora 1st / 2nd, from-scratch replacement) ──
+    // -- Custom TAA (Sora 1st / 2nd, from-scratch replacement) --
     new renodx::utils::settings::Setting{
       .key = "CustomTAAEnabled", .binding = &shader_injection.custom_taa_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4448,7 +4523,7 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.custom_taa_enabled > 0.5f; },
       .is_visible = []() { return (IsSora1st() || IsSora2nd()) && IsAdvancedSettingsMode(); },
     },
-    // ── RCAS post-TAA sharpening (dedicated pass; never feeds TAA history) ──
+    // -- RCAS post-TAA sharpening (dedicated pass; never feeds TAA history) --
     new renodx::utils::settings::Setting{
       .key = "RCASEnabled", .binding = &shader_injection.rcas_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -4697,17 +4772,17 @@ renodx::utils::settings::Settings settings = {
         .section = "Info",
         .is_visible = []() { return IsKai(); },
     },
-    // ── VBGI debug views removed — use GTVBAO debug View for GI inspection. ──
+    // -- VBGI debug views removed � use GTVBAO debug View for GI inspection. --
 
 };
 
-// ═══════════ GTVBAO Backend — implementation ═══════════
+// ----------- GTVBAO Backend � implementation -----------
 
 static void OnInitDevice(reshade::api::device* device) {
-  reshade::log::message(reshade::log::level::info, "[sora-vanillaplus] Device init — addon loaded.");
+  reshade::log::message(reshade::log::level::info, "[sora-vanillaplus] Device init � addon loaded.");
   auto* d = renodx::utils::data::Create<DeviceData>(device);
 
-  // 1×1 white fallback texture so t22 is never bound to null.
+  // 1�1 white fallback texture so t22 is never bound to null.
   uint32_t white = 0xFFFFFFFF;
   reshade::api::subresource_data initial = {&white, 4u, 4u};
   reshade::api::resource_desc rd = {};
@@ -4723,7 +4798,7 @@ static void OnInitDevice(reshade::api::device* device) {
                                     reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1),
                                 &d->fallback_srv);
 
-  reshade::log::message(reshade::log::level::info, "[GTVBAO] Device init — fallback SRV created.");
+  reshade::log::message(reshade::log::level::info, "[GTVBAO] Device init � fallback SRV created.");
 }
 
 static void OnDestroyDevice(reshade::api::device* device) {
@@ -4782,7 +4857,7 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
   DestroyDynCubeResources(sc->get_device(), d);
 }
 
-// ── Descriptor table helpers ──
+// -- Descriptor table helpers --
 
 static bool EnsureGTVBAODescriptorTables(
     reshade::api::device* device,
@@ -4819,7 +4894,7 @@ static bool GTVBAO_GiHalfChainReady(const DeviceData* d, bool half_mode) {
       && d->vbgi_denoised_half_uav.handle;
 }
 
-// ── Vanilla env-cube identification (strict) ──
+// -- Vanilla env-cube identification (strict) --
 // A 512/1024 square R8G8B8A8_UNORM cube view is the game's vanilla env cubemap.
 // Shared by the vanilla capture and the global t17 swap so both agree exactly.
 // Doubles as self-exclusion: our pushed cubes are RGBA16F and can never match,
@@ -4837,7 +4912,7 @@ static bool IsVanillaEnvCubeView(reshade::api::device* device, reshade::api::res
       && rdesc.texture.width == rdesc.texture.height;
 }
 
-// ── Scene CBV helper ──
+// -- Scene CBV helper --
 
 static bool IsSceneCbvCandidateValid(reshade::api::device* device,
                                       const reshade::api::buffer_range& range) {
@@ -4849,7 +4924,7 @@ static bool IsSceneCbvCandidateValid(reshade::api::device* device,
       && range.offset + range.size <= desc.buffer.size;
 }
 
-// ── Push-descriptors event → capture lighting inputs (kai pattern) ──
+// -- Push-descriptors event ? capture lighting inputs (kai pattern) --
 
 static void OnPushDescriptorsCapture(
     reshade::api::command_list* cmd_list,
@@ -4887,10 +4962,10 @@ static void OnPushDescriptorsCapture(
   auto* d = device->get_private_data<DeviceData>();
   if (!d) return;
 
-  // ── Capture depth/SSAO/CBV — unconditional (register-based, kai-style). ──
+  // -- Capture depth/SSAO/CBV � unconditional (register-based, kai-style). --
   if (update.type == reshade::api::descriptor_type::texture_shader_resource_view) {
     auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
-  // Capture depth: t4 (Sora) or t3 (Kai) — ONLY from lighting shader, game-specific binding.
+  // Capture depth: t4 (Sora) or t3 (Kai) � ONLY from lighting shader, game-specific binding.
     uint32_t depthBinding = IsKai() ? kLightingDepthRegisterKai : kLightingDepthRegister;
     if (update.binding == depthBinding && update.count >= 1
         && views[0].handle != 0u) {
@@ -4921,7 +4996,7 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-  // Capture SSAO: t5 (Sora) or t4 (Kai) — game-specific binding.
+  // Capture SSAO: t5 (Sora) or t4 (Kai) � game-specific binding.
     uint32_t ssaoBinding = IsKai() ? kLightingSsaoRegisterKai : kLightingSsaoRegister;
     if (update.binding == ssaoBinding && update.count >= 1
         && views[0].handle != 0u) {
@@ -4944,7 +5019,7 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    // Capture motion buffer t3 — ONLY from TAA draws (both Sora hashes), for
+    // Capture motion buffer t3 � ONLY from TAA draws (both Sora hashes), for
     // RCAS Stage 2 motion-adaptive sharpening. Same over-capture rationale as
     // the lighting-gated captures above: t3 means different things per shader.
     if (update.binding == 3u && update.count >= 1
@@ -4981,7 +5056,7 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    // Capture t0 color texture — ONLY from the lighting shader (hash 0xFDAAF80E).
+    // Capture t0 color texture � ONLY from the lighting shader (hash 0xFDAAF80E).
     // Unconditional capture would grab binding 0 from any shader, causing wrong colors.
     if (update.binding == 0u && update.count >= 1
         && views[0].handle != 0u) {
@@ -5004,7 +5079,7 @@ static void OnPushDescriptorsCapture(
       }
     }
     // Capture ssr2-draw t0 (vanilla ssr1 march result) for the SSR replacement
-    // debug view. ONLY from the ssr2 pixel shader — same over-capture rationale
+    // debug view. ONLY from the ssr2 pixel shader � same over-capture rationale
     // as the color capture above.
     if (update.binding == 0u && update.count >= 1
         && views[0].handle != 0u) {
@@ -5041,7 +5116,7 @@ static void OnPushDescriptorsCapture(
         }
       }
     }
-    // Capture the game's vanilla texEnvMap_g (t17) binding — the vanilla cubemap
+    // Capture the game's vanilla texEnvMap_g (t17) binding � the vanilla cubemap
     // fallback layer (t30). From ANY pixel-shader t17 bind (lighting, glass, ...),
     // refreshed on every bind so game reallocations/resizes can never leave a stale
     // handle and the pre-first-capture window collapses to ~zero. Strict criterion
@@ -5057,7 +5132,7 @@ static void OnPushDescriptorsCapture(
     }
     // Global Dynamic Cubemap t17 override: any pixel-shader bind of a 512x512 or
     // 1024x1024 R8G8B8A8_UNORM cube view at slot 17 IS the game's vanilla env cubemap
-    // (strict criterion via IsVanillaEnvCubeView, UNORM only — sRGB never matches).
+    // (strict criterion via IsVanillaEnvCubeView, UNORM only � sRGB never matches).
     // Swap in the active dynamic cube so every consumer (lighting, glass, future
     // shaders) gets live reflections with no per-shader registration. Respects Force
     // Vanilla and debug 4 (vanilla A/B paths keep the game cube). Normal display
@@ -5159,12 +5234,12 @@ static void OnPushDescriptorsCapture(
       }
     }
   }
-  // ── Per-draw gating (only when GTVBAO or SSGI is on). ──
+  // -- Per-draw gating (only when GTVBAO or SSGI is on). --
   if (shader_injection.gtvbao_mode < 0.5f) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
 }
 
-// ── Bind-descriptor-tables event → capture lighting inputs ──
+// -- Bind-descriptor-tables event ? capture lighting inputs --
 
 static void OnBindDescriptorTables(
     reshade::api::command_list* cmd_list,
@@ -5273,7 +5348,7 @@ static void OnBindDescriptorTables(
   }
 }
 
-// ── GTVBAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics ──
+// -- GTVBAO CS Dispatch Fix: clears stale compute bindings that cause double volumetrics --
 static void ApplyGTVBAOCSDispatchFix(
     reshade::api::command_list* cmd_list,
     renodx::utils::state::CommandListState* cs,
@@ -5333,7 +5408,7 @@ static void ApplyGTVBAOCSDispatchFix(
   if (cs) *cs = prev;
 }
 
-// ── Custom Shader crash-tracing log ──
+// -- Custom Shader crash-tracing log --
 // Changes-only step log for GTVBAO + Dynamic Cubemaps + SSR dispatches. Gated by the
 // "Custom Shader Log" toggle (default Off): zero overhead and zero log lines when off.
 // Semantics per tag: first sight and any change log immediately; identical repeats
@@ -5392,7 +5467,7 @@ static bool DynCubeSceneLive(const DeviceData* d) {
 
 // ViewDims for crash tracing: "WxH" for textures, "buf:N" for buffers, "null" for
 // empty handles, "dead" when the view no longer resolves to a resource (the game
-// freed the target — e.g. a DLSS/resolution realloc the addon was never told about).
+// freed the target � e.g. a DLSS/resolution realloc the addon was never told about).
 static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_view v) {
   if (!dev || !v.handle) return "null";
   auto res = dev->get_resource_from_view(v);
@@ -5405,7 +5480,7 @@ static std::string CSViewDims(reshade::api::device* dev, reshade::api::resource_
 
 // Push/bind-context ONLY capture resolver: describes a captured view and caches it
 // (proven-safe query context, same calls the t17 swap already makes per bind).
-// Never call from draw/present paths — liveness there comes from destroy events.
+// Never call from draw/present paths � liveness there comes from destroy events.
 static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api::resource_view v) {
   CapturedViewInfo info = {0u, "null", 0u, 0u};
   if (!dev || !v.handle) return info;
@@ -5424,7 +5499,7 @@ static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api
 }
 
 // Destroy-event liveness: the authoritative death source for tracked game inputs.
-// Runs on whatever thread frees the target (often the loader thread) — touches only
+// Runs on whatever thread frees the target (often the loader thread) � touches only
 // tracked handles/flags plus the mutex-guarded log. No view queries of any kind.
 static void KillTrackedInput(DeviceData* d, reshade::api::resource_view tracked, uint64_t resHandle,
                              std::atomic<bool>& live, const char* name, uint64_t deadView, uint64_t deadRes) {
@@ -5525,7 +5600,7 @@ static inline uint64_t WatchdogNowMs() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// ── Present hook ──
+// -- Present hook --
 
 static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* sc,
                        const reshade::api::rect*, const reshade::api::rect*,
@@ -5560,7 +5635,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     " rej=" + std::to_string(d->dyncube_rejected_captures));
 
   // DynCube loading wipe (generic, all games): with no fresh lighting t0 for a
-  // while, no scene draws are running (loading screen) — arm history
+  // while, no scene draws are running (loading screen) � arm history
   // hard-replace so the next scene rebuilds from scratch instead of blending
   // stale backdrops. Runs before any early-out; arming is idempotent (consumed
   // once by the next dispatched capture) and safe on hitches (threshold).
@@ -5596,7 +5671,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   }
 
 
-  // ── Basic mode startup guard: reset advanced-only settings to defaults if Basic is selected ──
+  // -- Basic mode startup guard: reset advanced-only settings to defaults if Basic is selected --
   static bool s_basic_startup_checked = false;
   if (!s_basic_startup_checked) {
     s_basic_startup_checked = true;
@@ -5618,18 +5693,18 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     }
   }
 
-  // DynCube can dispatch independently of GTVBAO — must not early-out
+  // DynCube can dispatch independently of GTVBAO � must not early-out
   const bool dynCube_present_active = shader_injection.dynCube_enabled > 0.5f;
   if (shader_injection.gtvbao_mode < 0.5f && !dynCube_present_active) return;
 
   // Liveness checkpoint (region marker only): input liveness is maintained by
-  // capture edges (bind = live) and destroy events (free = dead) — no view
+  // capture edges (bind = live) and destroy events (free = dead) � no view
   // queries here or anywhere on the render thread outside push/bind captures.
   s_presentRegion.store(2);
   if (d->frame_index <= kGTVBAOStartupGuardFrames) {
     if (d->frame_index == kGTVBAOStartupGuardFrames) {
       reshade::log::message(reshade::log::level::info,
-        "[GTVBAO] Startup guard complete — dispatch begins next frame.");
+        "[GTVBAO] Startup guard complete � dispatch begins next frame.");
     }
     return;
   }
@@ -5704,8 +5779,8 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
          std::to_string(gw) + "x" + std::to_string(gh) + ")").c_str());
     }
   }
-  // Use deferred snapshots from lighting draw (kai-style) — deferred dispatch only.
-  // ── Light-buffer capture helper (runs after GTVBAO for multi-bounce feedback) ──
+  // Use deferred snapshots from lighting draw (kai-style) � deferred dispatch only.
+  // -- Light-buffer capture helper (runs after GTVBAO for multi-bounce feedback) --
   auto capture_light_buffer_for_next_frame = [&]() {
     if (shader_injection.vbgi_enabled < 0.5f || !d->captured_light_buffer_texture.handle) return;
     // Skip when captured color is live: both consumers (multibounce accumulate,
@@ -5754,7 +5829,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     d->captured_light_buffer_valid = true;
   };
 
-  // Inline dispatch active (deferred off) — GTVBAO runs during lighting pass, not here.
+  // Inline dispatch active (deferred off) � GTVBAO runs during lighting pass, not here.
   // Drop snapshots whose targets died since capture (destroy events flip the flags;
   // no queries here). Dispatching on them is never correct.
   s_presentRegion.store(4);
@@ -5764,7 +5839,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   }
   if (!d->deferred_pending || !d->deferred_depth_srv.handle) {
     capture_light_buffer_for_next_frame();
-    // DynCube debug face preview — must run even when GTVBAO deferred off
+    // DynCube debug face preview � must run even when GTVBAO deferred off
     if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
         && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
             || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
@@ -5829,7 +5904,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   d->captured_scene_cbv_frame = d->deferred_scene_cbv_frame;
   d->deferred_pending = false;
 
-  // GTVBAO reads proj_g directly from the game's scene CBV (b0) in-shader —
+  // GTVBAO reads proj_g directly from the game's scene CBV (b0) in-shader �
   // no CPU-side mapping needed (kai-vanillaplus approach).
 
   if (shader_injection.gtvbao_debug_logging > 0.5f)
@@ -5867,14 +5942,14 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
     reshade::log::message(reshade::log::level::warning, "[GTVBAO] Dispatch failed.");
   }
 
-  // ── GI is now integrated into GTVBAO main pass (visibility bitmask AO+GI). ──
+  // -- GI is now integrated into GTVBAO main pass (visibility bitmask AO+GI). --
   // The GI output (vbgi_denoised_srv) is produced during RunGTVBAO denoise pass.
   // No separate VBGI dispatch needed.
 
-  // ── Capture light buffer for next frame's multi-bounce (after GI applied) ──
+  // -- Capture light buffer for next frame's multi-bounce (after GI applied) --
   capture_light_buffer_for_next_frame();
 
-  // ── DynCube debug face preview — samples capture resources directly (not t17) ──
+  // -- DynCube debug face preview � samples capture resources directly (not t17) --
   if (d->dyncube_resources_created && d->dyncube_srv.handle && shader_injection.dynCube_enabled >0.5f
       && (shader_injection.dynCube_debug == 1.f || shader_injection.dynCube_debug == 2.f
           || shader_injection.dynCube_debug == 5.f || shader_injection.dynCube_debug == 6.f
@@ -5915,7 +5990,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   shader_injection.gtvbao_vbgi_bound = 0.f;  // Reset for next frame's SSAO pass
 }
 
-// ── Sora2nd SSR Replacement (vanilla march at ssr1, composite at ssr2) ──
+// -- Sora2nd SSR Replacement (vanilla march at ssr1, composite at ssr2) --
 // Master gate: the composite can only serve when a vanilla fallback and a
 // servable dynamic cube exist. Deliberately NOT gated on the custom
 // SSR toggle or its result: the resolved SSR source is the vanilla march
@@ -5950,7 +6025,7 @@ static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list) {
 }
 
 // ssr1 code replacement gate: the tree file must actually execute whenever any
-// consumer needs its edited behavior — the full replacement chain, or any
+// consumer needs its edited behavior � the full replacement chain, or any
 // Vanilla SSR Improvements toggle (future toggles extend this OR). False keeps
 // the game bytecode (fully vanilla path, bit-exact).
 static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list) {
@@ -5961,7 +6036,7 @@ static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list) {
 }
 // ssr2 vanilla-improvement gate: the tree file must execute (instead of game
 // bytecode) whenever any Vanilla SSR Improvements toggle changes vanilla ssr2
-// behavior — motion-adaptive history, non-0.9 fixed weight, disocclusion
+// behavior � motion-adaptive history, non-0.9 fixed weight, disocclusion
 // reject, or usable IS-FAST distribution. All off = bytecode, bit-exact.
 // (The replacement chain serves via SoraSSRReplaceActive separately.)
 static bool SoraSSRVanillaActive(reshade::api::command_list* cmd_list) {
@@ -6063,7 +6138,7 @@ static bool OnReplaceSoraSSR2Draw(reshade::api::command_list* cmd_list) {
   return SoraSSRReplaceActive(cmd_list) || SoraSSRVanillaActive(cmd_list);
 }
 
-// ── Sora1st SSR Replacement (fused march + temporal composite) ──
+// -- Sora1st SSR Replacement (fused march + temporal composite) --
 // Master gate mirrors the Sora2nd one (shared toggles), minus any mrt capture
 // requirement: the composite reads mrt0 from the game-bound t2, exactly like
 // the vanilla pass it replaces, so no capture can starve serving.
@@ -6087,7 +6162,7 @@ static bool Sora1stSSRReplaceActive(reshade::api::command_list* cmd_list) {
 
 // sora1st ssr vanilla-improvement gate: the tree file must execute (instead of
 // game bytecode) whenever any Vanilla SSR Improvements toggle changes vanilla
-// behavior — refine fix, motion-adaptive history, non-0.9 fixed weight,
+// behavior � refine fix, motion-adaptive history, non-0.9 fixed weight,
 // disocclusion reject, or usable IS-FAST distribution. All off = bytecode,
 // bit-exact. (The replacement chain serves via Sora1stSSRReplaceActive.)
 static bool Sora1stSSRVanillaActive(reshade::api::command_list* cmd_list) {
@@ -6174,7 +6249,7 @@ static bool OnReplaceSora1stSSRDraw(reshade::api::command_list* cmd_list) {
   return Sora1stSSRReplaceActive(cmd_list) || Sora1stSSRVanillaActive(cmd_list);
 }
 
-// ── Custom TAA gate (Sora 1st/2nd) ──
+// -- Custom TAA gate (Sora 1st/2nd) --
 // ON: the from-scratch custom shader serves the TAA hash. OFF: this addon's
 // vanilla reference serves the TAA hash when another addon has registered it;
 // otherwise the game's original TAA draws untouched. The dumped vanilla files
@@ -6291,7 +6366,7 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
     shader_injection.custom_taa_history_valid = s_custom_taa_was_active ? 1.f : 0.f;
     s_custom_taa_was_active = true;
   }
-  // ── RCAS history isolation: serve the owned UNSHARPENED copy as t2 ──
+  // -- RCAS history isolation: serve the owned UNSHARPENED copy as t2 --
   // Runs only while Custom TAA is on (same gate as the stage itself). The
   // sharpened temp/RT is never bound here; only rcas_hist_srv is.
   if (shader_injection.custom_taa_enabled > 0.5f && (IsSora1st() || IsSora2nd())) {
@@ -6314,7 +6389,7 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ═══════════ RCAS post-TAA sharpening — implementation (Stage 1) ═══════════
+// ----------- RCAS post-TAA sharpening � implementation (Stage 1) -----------
 // Per-frame flow (all inline, same command list, zero added latency):
 //  TAA draw completes (on_drawn) -> copy unsharpened TAA output to rcas_hist
 //  -> RCAS compute reads rcas_hist (owned, never RTV-bound: no D3D11
@@ -6426,7 +6501,7 @@ static bool CreateRCASPipelineIfNeeded(reshade::api::device* dev, DeviceData* d)
   return d->rcas_pipeline.handle != 0u;
 }
 
-// ── FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) ──
+// -- FXAA post-TAA (TAA -> FXAA -> RCAS; never feeds TAA history) --
 // Owns fxaa_temp (FXAA output, linear/UAV-legal variant format so RCAS sees
 // the same raw convention as before) + fxaa_luma (R8 perceptual luma) +
 // fxaa_hist_srv (linear-variant SRV view of the RCAS-owned hist texture, so
@@ -6604,7 +6679,7 @@ static void OnDrawnCustomTAA(reshade::api::command_list* cmd_list) {
   if (w == 0u || h == 0u || fmt == reshade::api::format::unknown) return;
   // Pipeline first: no barrier/copy may be issued unless the dispatch below
   // is guaranteed to run. (Previously the pipeline check sat after the first
-  // barriers — a failure there could leave the target in a wrong state.)
+  // barriers � a failure there could leave the target in a wrong state.)
   if (!CreateRCASPipelineIfNeeded(dev, d)) {
     if (!d->rcas_format_logged) {
       reshade::log::message(reshade::log::level::warning, "[RCAS] skip: pipeline unavailable");
@@ -6904,7 +6979,7 @@ static reshade::api::resource_view MBMotionInputView(DeviceData* d) {
 // file's per-frame capture logic: binds and draws are ordered on one list, and
 // on_draw fires after binds).
 //
-// ── THIS FUNCTION MUST MAKE NO DEVICE CALLS ───────────────────────────────────
+// -- THIS FUNCTION MUST MAKE NO DEVICE CALLS -----------------------------------
 // It runs on every OMSetRenderTargets in the process, including those issued by
 // the upscaler proxies, which own their own D3D11 devices and views. ReShade's
 // get_resource_from_view is an unchecked reinterpret_cast plus a virtual call,
@@ -6959,7 +7034,7 @@ static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32
   d->mb_rtv4_live = true;
 }
 
-// ═══════════ Motion Blur (Guertin et al. 2013) ═══════════
+// ----------- Motion Blur (Guertin et al. 2013) -----------
 //
 // Six dispatches, run inline on the deploy draw's own command list so ordering
 // against the game's own work is strict and no frame of latency is added:
@@ -7037,7 +7112,7 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
   // Same layout shape as the GTVBAO stages: four descriptor tables at root
   // params 0-3, push constants at root param 4. The push block is the WHOLE
   // ShaderInjectData rather than a hand-mapped subset, because the motion blur
-  // shaders include shared.h and read the mb_* fields directly — one source of
+  // shaders include shared.h and read the mb_* fields directly � one source of
   // truth, no per-shader re-declaration to drift.
     // gather binds 6: color, motion, neighbormax, depth, noise, and the GAME
     // motion alongside the resolved one, which only the two velocity views read
@@ -7235,7 +7310,7 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
 // one place and makes every one of those thresholds framerate-independent for
 // free. That is the point: patching the split threshold alone would have fixed
 // the reported symptom and left the streak, the ladder and the early-out still
-// ── Frame-rate scaling: UE's r.MotionBlurTargetFPS semantics ───────────────────
+// -- Frame-rate scaling: UE's r.MotionBlurTargetFPS semantics -------------------
 //
 // Motion vectors are per-frame displacements, so a camera crossing the same point
 // covers half as many pixels at 120 fps as at 60. Every length in the filter is
@@ -7409,7 +7484,7 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
     if (!d->mb_resources_ready) return false;
   }
 
-  // ── push block ──
+  // -- push block --
   shader_injection.mb_working_w = static_cast<float>(workingW);
   shader_injection.mb_working_h = static_cast<float>(workingH);
   shader_injection.mb_depth_w = static_cast<float>(std::max(depthW, 1u));
@@ -7525,7 +7600,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   // view and the flag drift apart, which silently degrades the filter to a
   // passthrough with no error anywhere.
 
-  // ── Diagnostic chain isolation (mb_debug_chain) ──
+  // -- Diagnostic chain isolation (mb_debug_chain) --
   // 0 Full, 1 Prep Only, 2 Gather Only. Branched here rather than in a shader
   // because every gate in this chain is already a CPU decision (including the
   // TileMax axis), and because "Gather Only" must not touch passes 1-5 at all.
@@ -7586,7 +7661,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     cl->dispatch((GW + 7u) / 8u, (GH + 7u) / 8u, 1u);
     bar(d->mb_half_color_texture, UA, SR);
   }
-  // ── camera term reconstruction ──
+  // -- camera term reconstruction --
   // Always runs. It is not an optional separation: it scales the streak length by
   // the camera's share of the total magnitude, which is the whole reason object
   // motion does not reach the camera path. Binding the game's motion directly
@@ -7694,7 +7769,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   } else {
     // Nothing was produced, so the caller must not publish. Returning an empty
     // view makes the deploy callback skip the t0 push, leaving the game's
-    // tonemap reading the original image — which is exactly the isolation
+    // tonemap reading the original image � which is exactly the isolation
     // "Prep Only" is for.
     return {};
   }
@@ -7708,7 +7783,7 @@ static void LogMotionBlurOnce(DeviceData* d, const std::string& message) {
   reshade::log::message(reshade::log::level::info, ("[MotionBlur] " + message).c_str());
 }
 
-// ── Motion Blur cutscene gate ──
+// -- Motion Blur cutscene gate --
 // The DoF gather draws only when the game dispatches depth of field, which in
 // Sora 2nd it does only in cutscenes, so "the DoF gather drew" IS the cutscene
 // signal and nothing has to be kept in sync with a separate flag. frame_index is
@@ -7727,7 +7802,7 @@ static void OnDrawnDofGather(reshade::api::command_list* cmd_list) {
   }
 }
 
-// ── Motion Blur deploy point (both modes) ──
+// -- Motion Blur deploy point (both modes) --
 // One deploy serves both modes. The gather result replaces the tonemap's t0 and
 // the game's own blit/tonemap runs on it, so the tonemap stays bit-identical to
 // vanilla and cannot regress. Mode only changes the trigger:
@@ -7837,7 +7912,7 @@ static bool OnBeforeTonemapDraw(reshade::api::command_list* cmd_list) {
   return true;
 }
 
-// ── Kai SSR Replacement (fused march + temporal composites, High + Ultra) ──
+// -- Kai SSR Replacement (fused march + temporal composites, High + Ultra) --
 // Master gate mirrors the Sora gates (shared toggles), minus any mrt capture
 // requirement: each composite reads mrt0 from the game-bound t2, exactly like
 // the vanilla pass it replaces, so no capture can starve serving. Only one
@@ -7862,7 +7937,7 @@ static bool KaiSSRReplaceActive(reshade::api::command_list* cmd_list) {
 
 // kai ssr vanilla-improvement gate: the tree files must execute (instead of
 // game bytecode) whenever any Vanilla SSR Improvements toggle changes vanilla
-// behavior — refine threshold, fixed history, disocclusion reject, or usable
+// behavior � refine threshold, fixed history, disocclusion reject, or usable
 // IS-FAST distribution. All off = bytecode, bit-exact. (The replacement chain
 // serves via KaiSSRReplaceActive separately.)
 static bool KaiSSRVanillaActive(reshade::api::command_list* cmd_list) {
@@ -7953,7 +8028,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   shader_injection.gtvbao_dedicated_bound = 0.f;
   SyncISFASTToShaderInjection(cmd_list);  // keep IS-FAST mirrors in sync
-  // Push IS-FAST noise texture for PCSS shadow jitter (t24 only — NO sampler push,
+  // Push IS-FAST noise texture for PCSS shadow jitter (t24 only � NO sampler push,
   // uses game's samPoint_s at s0 with manual wrap in shader to avoid heap corruption)
   if (g_isfast_enabled > 0.5f) {
     if (auto* dev = cmd_list->get_device()) {
@@ -7971,7 +8046,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
   }
 
-  // ── Kai sync: Character VBGI master toggle + PCSS jitter ──
+  // -- Kai sync: Character VBGI master toggle + PCSS jitter --
   shader_injection.char_gi_enabled = (g_char_vbgi_composite_method >= 0.5f) ? 1.f : 0.f;
   shader_injection.shadow_isfast_jitter_amount = shader_injection.shadow_pcss_jitter_amount;
   shader_injection.shadow_isfast_jitter_speed = shader_injection.shadow_pcss_jitter_speed;
@@ -7984,13 +8059,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_debug_mode = shader_injection.gtvbao_debug_view;
   shader_injection.foliage_debug_mode = shader_injection.debug_show_env_sss;
 
-  // Dynamic Cubemaps — standalone, must run even when GTVBAO/SSR off (any Falcom title)
+  // Dynamic Cubemaps � standalone, must run even when GTVBAO/SSR off (any Falcom title)
   const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f;
   const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f;
   // Rising/falling-edge latch (runs before the early-out so it also happens when every
   // feature is off): rising edge schedules an immediate refresh cycle WITHOUT wiping
   // history (toggle off/on preserves the cache; first boot still clears via Create).
-  // Falling edge only updates the latch — resources and cache are intentionally kept
+  // Falling edge only updates the latch � resources and cache are intentionally kept
   // so re-enabling resumes instantly. (No destroy-on-disable by design.)
   auto* dd0 = cmd_list ? cmd_list->get_device()->get_private_data<DeviceData>() : nullptr;
   if (dd0) {
@@ -8007,7 +8082,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (!dd) return true;
 
-  // ── Deferred dispatch path: capture snapshots for OnPresent (kai-style). ──
+  // -- Deferred dispatch path: capture snapshots for OnPresent (kai-style). --
   // Plain copies only (no queries): resource pairs + live flags travel with the views.
   // GTVBAO-only: with the mode off there is nothing to defer to.
   if (g_cpuopt_deferred_dispatch > 0.5f && shader_injection.gtvbao_mode > 0.5f) {
@@ -8026,7 +8101,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     dd->deferred_pending = true;
   }
 
-  // ── Inline dispatch: Run GTVBAO on this frame's command list (only when NOT deferred). ──
+  // -- Inline dispatch: Run GTVBAO on this frame's command list (only when NOT deferred). --
   if (gtvbao_active && g_cpuopt_deferred_dispatch < 0.5f) {
     if (dd->captured_depth_srv.handle && dd->captured_scene_cbv_valid
         && dd->ao_term_a_srv.handle) {
@@ -8049,8 +8124,8 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // Push the GTVBAO AO result at t22.
   // In inline mode: fresh from dispatch above.
   // In deferred mode: result from previous frame's OnPresent dispatch.
-  // The buffer is tracked by RunGTVBAO (gtvbao_final_in_b) — parity depends on
-  // the active denoiser path (legacy / R2 two-stage / à-trous).
+  // The buffer is tracked by RunGTVBAO (gtvbao_final_in_b) � parity depends on
+  // the active denoiser path (legacy / R2 two-stage / �-trous).
   if (gtvbao_active) {
     // Half mode: lighting sees the reconstructed full-res AO (same t22 slot).
     const bool half_active = shader_injection.gtvbao_resolution > 0.5f
@@ -8071,15 +8146,25 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
   }
 
-  // ── SSGI push t23 (GI is produced by RunGTVBAO) ──
+  // -- SSGI push t23 (GI is produced by RunGTVBAO) --
   if (gtvbao_active) {
   shader_injection.gtvbao_vbgi_bound = 0.f;
   shader_injection.gtvbao_vbgi_debug = 0.f;
+  // Reset every frame: the lighting shader reads this to decide whether the
+  // t23 push is a diagnostic texture it should display. Leaving it set would
+  // make a later frame show a stale debug view.
+  shader_injection.gtvbao_mrt_normal_debug = 0.f;
 
   // Determine what to push to t23.
   reshade::api::resource_view push_srv = {};
   bool do_push = false;
   bool debug_replace = false;
+  // Set when the pushed texture is the GTVBAO compute pass's own debug UAV
+  // (bitmask views 6-8, MRT/horizon diagnostics 22-25). The lighting shader
+  // displays it on this flag rather than on vbgi_debug_view, which is a
+  // persistent user setting and must not be overwritten to make the push
+  // visible.
+  bool push_is_gtvbao_debug = false;
 
   // VBGI debug views (1=Raw GI, 2=Denoised GI, 3=Light Buffer, 4=Accumulated, 5=Samples).
   // Half mode: raw/denoised views show the half buffers; the normal path
@@ -8107,11 +8192,14 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     do_push = true;
     debug_replace = true;
   }
-  // Bitmask debug views 6-8: push dedicated debug UAV output.
-  else if (shader_injection.gtvbao_debug_view > 5.5f && shader_injection.gtvbao_debug_view < 8.5f) {
+  // Bitmask debug views 6-8, and MRT/horizon diagnostics 22-29: push the
+  // dedicated debug UAV output to the lighting shader's VBGI debug slot.
+  else if ((shader_injection.gtvbao_debug_view > 5.5f && shader_injection.gtvbao_debug_view < 8.5f)
+        || (shader_injection.gtvbao_debug_view > 21.5f && shader_injection.gtvbao_debug_view < 29.5f)) {
     push_srv = dd->debug_srv;
     do_push = true;
     debug_replace = true;
+    push_is_gtvbao_debug = true;
   }
   else if (upscale_dbg_active) {
     push_srv = dd->debug_srv;
@@ -8139,6 +8227,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           });
       shader_injection.gtvbao_vbgi_bound = 1.f;
       if (debug_replace) shader_injection.gtvbao_vbgi_debug = 1.f;
+      if (push_is_gtvbao_debug) shader_injection.gtvbao_mrt_normal_debug = 1.f;
     }
     // VBGI debug logging.
     if (shader_injection.vbgi_debug_logging > 0.5f) {
@@ -8151,7 +8240,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   }
   }  // gtvbao_active (t23 section)
 
-  // ── Dynamic Cubemaps (Sora2nd): t17 override — Phase 0A/B + Phase 1/2 standalone ──
+  // -- Dynamic Cubemaps (Sora2nd): t17 override � Phase 0A/B + Phase 1/2 standalone --
   // D3D11 hazard: capture writes UAV, then lighting reads SRV. RunDynCube* does
   // UAV->SRV barrier. We dispatch inline here before the draw that consumes t17.
   if (dyncube_active) {
@@ -8181,7 +8270,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       CreateDynCubePipelinesIfNeeded(dev, dd);
     }
 
-    // ── Multi-frame Dynamic Cubemap scheduler — runs ONCE per present frame ──
+    // -- Multi-frame Dynamic Cubemap scheduler � runs ONCE per present frame --
     if (dd->dyncube_sched_frame != dd->frame_index) {
       dd->dyncube_sched_frame = dd->frame_index;
       const uint32_t interval = std::max(1u, (uint32_t)std::clamp(shader_injection.dynCube_capture_interval, 1.f, 16.f));
@@ -8191,7 +8280,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       CSLog("ctx", std::string("scheduler on ") +
         ((dd->immediate_cmd_list != nullptr && dd->immediate_cmd_list == cmd_list) ? "immediate" : "DEFERRED"));
 
-      // ── Loading wipe: consumes the OnPresent loading signal (this scheduler only
+      // -- Loading wipe: consumes the OnPresent loading signal (this scheduler only
       // ticks on lighting draws, so the stale predicate itself is evaluated there).
       // Deletes the whole temporal cache once per stale episode so the next scene
       // seeds from scratch: zeroed history reads as invalid (serves fall back to
@@ -8234,7 +8323,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       // static scene would otherwise never reach t17. Force one filter pass +
       // one-shot history fast-forward so feedback is immediate, then resume no-churn.
       // Gated on effective t17 serving so untouched paths never pay for it.
-      // (Soften/strength drive the variant cube instead — tracked separately below;
+      // (Soften/strength drive the variant cube instead � tracked separately below;
       // capture brightness stays sample-time by design and is not tracked here.)
       {
         bool serveT17 = !forceVanilla && dbg != 4;
@@ -8285,7 +8374,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
           } else {
             // Settings-dirty path: the forced filter must rebuild from the LATEST
             // capture, but readSet/aliases only advance on validated promotion (frozen
-            // in static scenes). Promote first — but ONLY when the normal flow did not
+            // in static scenes). Promote first � but ONLY when the normal flow did not
             // just promote itself (readSet still equal): a second promote would flip
             // past the fresh set onto stale content. Gated on hasValidRead above, so
             // boot content can never be promoted; a mid-loader slider drag may
@@ -8328,7 +8417,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         if (dd->dyncube_ggx_valid && wantVariant
             && (vSoften != dd->dyncube_lastVariantSoften || vStrength != dd->dyncube_lastVariantStrength)) {
           // Self-healing: the variant cube is derived and never part of a full
-          // Create, so it may be absent (first use, or a resize destroyed it) —
+          // Create, so it may be absent (first use, or a resize destroyed it) �
           // build it here. Guarded on the handle so this never re-creates.
           if (!dd->dyncube_variant.handle)
             CreateDynCubeVariantResources(dev, dd, dd->dyncube_size, dd->dyncube_mip_count);
@@ -8336,7 +8425,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         }
       }
 
-      // ── Throttled scheduler log (1/sec) — verify the state machine behavior ──
+      // -- Throttled scheduler log (1/sec) � verify the state machine behavior --
       if (shader_injection.dynCube_debug_logging > 0.5f) {
         static auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
         auto now = std::chrono::steady_clock::now();
@@ -8364,7 +8453,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
       }
     }
 
-    // Bind the history position cube (t29) — Dynamic validity source for the blend.
+    // Bind the history position cube (t29) � Dynamic validity source for the blend.
     // Reads the validated readSet (delayed-validate commit), never the raw write set.
     {
       reshade::api::resource_view histPosSrv = dd->dyncube_hist[dd->dyncube_readSet].pos_cube_srv;
@@ -8380,7 +8469,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
         reshade::api::descriptor_table_update{{}, kDynCubeVanillaRegister, 0, 1,
           reshade::api::descriptor_type::texture_shader_resource_view, &dd->captured_vanilla_env_srv});
     }
-    // Bind the SSR result (t31 blurred) + raw (t32) — produced once per frame by the scheduler.
+    // Bind the SSR result (t31 blurred) + raw (t32) � produced once per frame by the scheduler.
     if (shader_injection.dynCube_ssr_enabled > 0.5f && dd->dyncube_ssr_blur_srv.handle) {
       cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{{}, kDynCubeSSRRegister, 0, 1,
@@ -8400,7 +8489,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
     }
 
     if (dbg == 3) {
-      // Solid face colors — validates t17 binding + handedness without capture.
+      // Solid face colors � validates t17 binding + handedness without capture.
       // Uses the DEDICATED solid cube so history resources are never touched.
       if (!forceVanilla && RunDynCubeSolid(cmd_list, dd)) {
         cmd_list->push_descriptors(reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
@@ -8432,7 +8521,7 @@ static bool OnBeforeSsaoShaderDraw(reshade::api::command_list*) {
   return true;
 }
 
-// ── Resource create / destroy ──
+// -- Resource create / destroy --
 
 static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
                                    uint32_t gw, uint32_t gh) {
@@ -8482,7 +8571,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     if (uav) dev->create_resource_view(*res, reshade::api::resource_usage::unordered_access, vd, uav);
   };
 
-  // —— Half-resolution spatial pipeline: ao/edges/raw-GI follow the AO evaluation
+  // �� Half-resolution spatial pipeline: ao/edges/raw-GI follow the AO evaluation
   // resolution; everything else stays full. Ceiling division (odd-safe).
   const bool half_mode = shader_injection.gtvbao_resolution > 0.5f;
   const uint32_t hw = (w + 1u) / 2u;
@@ -8498,7 +8587,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
   mk(aw, ah, reshade::api::format::r32_float, &d->edges_texture, &d->edges_srv, &d->edges_uav);
   mk(gw, gh, reshade::api::format::r8g8b8a8_unorm, &d->composite_texture, &d->composite_srv, &d->composite_uav);
 
-  // ── GI resources (same resolution as AO per user preference) ──
+  // -- GI resources (same resolution as AO per user preference) --
   mk(aw, ah, reshade::api::format::r16g16b16a16_float,
      &d->vbgi_output_texture, &d->vbgi_output_srv, &d->vbgi_output_uav);
   // Existing full-res denoised GI is always kept (Full path + debug use).
@@ -8517,7 +8606,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
     if (!GTVBAO_GiHalfChainReady(d, true)
         || !d->upscale_ao_uav.handle || !d->upscale_gi_uav.handle) {
       reshade::log::message(reshade::log::level::error,
-          "[GTVBAO] Half-res reconstruction resources incomplete — "
+          "[GTVBAO] Half-res reconstruction resources incomplete � "
           "VBGI reconstruction will be unavailable in Half mode.");
     }
   }
@@ -8526,7 +8615,7 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
      &d->foliage_mask_texture, &d->foliage_mask_srv, &d->foliage_mask_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
      &d->debug_texture, &d->debug_srv, &d->debug_uav);
-  // À-trous normal pre-decode target (full-res RGBA16F)
+  // �-trous normal pre-decode target (full-res RGBA16F)
   mk(w, h, reshade::api::format::r16g16b16a16_float,
      &d->normal_prep_texture, &d->normal_prep_srv, &d->normal_prep_uav);
   // Light buffer capture at full back-buffer resolution
@@ -8563,7 +8652,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   DestroyGTVBAODescriptorTables(dev, &d->main_tables);
   DestroyGTVBAODescriptorTables(dev, &d->denoise_tables);
   DestroyGTVBAODescriptorTables(dev, &d->foliage_mask_tables);
-  // GI resources (now integrated — no separate VBGI pipeline)
+  // GI resources (now integrated � no separate VBGI pipeline)
   dv(d->vbgi_output_srv); dv(d->vbgi_output_uav); dr(d->vbgi_output_texture);
   dv(d->vbgi_denoised_srv); dv(d->vbgi_denoised_uav); dr(d->vbgi_denoised_texture);
   dv(d->vbgi_denoised_half_srv); dv(d->vbgi_denoised_half_uav); dr(d->vbgi_denoised_half_texture);
@@ -8578,7 +8667,7 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   dv(d->debug_srv); dv(d->debug_uav); dr(d->debug_texture);
   dp(d->multibounce_pipeline); dl(d->multibounce_layout);
   DestroyGTVBAODescriptorTables(dev, &d->multibounce_tables);
-  // À-trous wavelet filter + normal pre-decode
+  // �-trous wavelet filter + normal pre-decode
   dp(d->atrous_pipeline); dl(d->atrous_layout);
   DestroyGTVBAODescriptorTables(dev, &d->atrous_tables);
   dp(d->normal_prep_pipeline); dl(d->normal_prep_layout);
@@ -8589,16 +8678,16 @@ static void DestroyGTVBAOResources(reshade::api::device* dev, DeviceData* d) {
   if (d->isfast_sampler.handle) { dev->destroy_sampler(d->isfast_sampler); d->isfast_sampler = {}; }
   d->isfast_texture_loaded = false;
   d->isfast_texture_attempted = false;
-  // Do NOT clear captured_depth_srv / captured_scene_cbv —
+  // Do NOT clear captured_depth_srv / captured_scene_cbv �
   // those reference game-owned resources that survive recreation.
   d->resources_created = false;
 }
 
-// ═══════════ Custom SSR (Sora 2nd) — Phase 1: Hi-Z pyramid ═══════════
+// ----------- Custom SSR (Sora 2nd) � Phase 1: Hi-Z pyramid -----------
 
 
 
-// ═══════════ Dynamic Cubemaps (Sora 2nd) — standalone t17 replacement ═══════════
+// ----------- Dynamic Cubemaps (Sora 2nd) � standalone t17 replacement -----------
 
 static uint32_t DynCubeResolveSize(float v) {
   switch ((int)v) {
@@ -8624,7 +8713,7 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
     dv(set.pos_arr_srv); dv(set.pos_cube_srv); dv(set.pos_uav); dr(set.pos);
     dv(set.contrib_arr_srv); dv(set.contrib_uav); dr(set.contrib);
   }
-  // Aliases are copies of the above handles — zero them (never double-destroy).
+  // Aliases are copies of the above handles � zero them (never double-destroy).
   d->dyncube_srv = {};
   d->dyncube_uav = {};
   d->dyncube_texture = {};
@@ -8820,7 +8909,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
   if (size > 2048u) size = 2048u;
   d->dyncube_size = size;
 
-  // Throttled logger helper (1/sec) — only when debug logging enabled
+  // Throttled logger helper (1/sec) � only when debug logging enabled
   auto should_log = []() -> bool {
     if (shader_injection.dynCube_debug_logging < 0.5f) return false;
     static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(2);
@@ -8830,7 +8919,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     return true;
   };
 
-  // Point clamp sampler for diagnostic — no filtering to test projection
+  // Point clamp sampler for diagnostic � no filtering to test projection
   reshade::api::sampler_desc sd = {};
   sd.filter = reshade::api::filter_mode::min_mag_mip_point;
   sd.address_u = reshade::api::texture_address_mode::clamp;
@@ -8862,7 +8951,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
                                        reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
       &d->dyncube_hist[idx].color_uav);
-    // Position (RGBA16F, rgb=scaled pos, a=validity) — array SRV/UAV + cube SRV (debug 11/12)
+    // Position (RGBA16F, rgb=scaled pos, a=validity) � array SRV/UAV + cube SRV (debug 11/12)
     if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_hist[idx].pos)) {
       if (should_log()) reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create history pos");
       return false;
@@ -8879,7 +8968,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d_array,
                                        reshade::api::format::r16g16b16a16_float, 0, 1, 0, 6),
       &d->dyncube_hist[idx].pos_uav);
-    // Contribution (R16F) — array SRV/UAV only
+    // Contribution (R16F) � array SRV/UAV only
     reshade::api::resource_desc rc = {};
     rc.type = reshade::api::resource_type::texture_2d;
     rc.texture = {size, size, 6, 1, reshade::api::format::r16_float, 1};
@@ -8966,7 +9055,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       &d->dyncube_charmask_uav);
   }
 
-  // ── World-fixed parallax bounds (Sora2nd v1): persistent, size-independent ──
+  // -- World-fixed parallax bounds (Sora2nd v1): persistent, size-independent --
   {
     // bounds: 2x float4 [0]=(min,valid) [1]=(max,spare); initialized empty/invalid.
     // Initial upload + in-shader stored-validity check make the first merge safe.
@@ -8987,7 +9076,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
       return false;
     }
     // NOTE: buffer view offset/size are STRUCTURED ELEMENT counts for the D3D11
-    // backend (FirstElement/NumElements), not bytes — UINT64_MAX is invalid here.
+    // backend (FirstElement/NumElements), not bytes � UINT64_MAX is invalid here.
     if (!dev->create_resource_view(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource,
         reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0, 2),
         &d->dyncube_worldbox_bounds_srv)
@@ -9092,7 +9181,7 @@ static bool CreateDynCubeResources(reshade::api::device* dev, DeviceData* d, uin
     }
   }
 
-  // ── Phase 3 filtered cubes ──
+  // -- Phase 3 filtered cubes --
   {
     // Mip count: 8 for all supported resolutions (128..4096); computed defensively.
     uint32_t mips = 1;
@@ -9271,7 +9360,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
       if (pipelog_should()) reshade::log::message(reshade::log::level::warning, "[DynCube] solid pipeline create failed");
     }
 
-  // ── Phase 3 GGX prefilter pipeline ──
+  // -- Phase 3 GGX prefilter pipeline --
   auto make_ggx_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
@@ -9301,7 +9390,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   }
   #endif
 
-  // ── Global-push variant pipeline (soften + strength resample) ──
+  // -- Global-push variant pipeline (soften + strength resample) --
   auto make_variant_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u) return true;
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler}; // s0 trilinear clamp
@@ -9331,7 +9420,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   }
   #endif
 
-  // ── Simple SSR pipeline ──
+  // -- Simple SSR pipeline --
   auto make_ssr_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u && d->dyncube_ssr_layout_version == kDynCubeSSRLayoutVersion) return true;
     if (out->handle != 0u) {
@@ -9371,7 +9460,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   }
   #endif
 
-  // ── SSR separable blur pipeline (H then V) ──
+  // -- SSR separable blur pipeline (H then V) --
   auto make_ssr_blur_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u && d->dyncube_ssr_blur_layout_version == kDynCubeSSRBlurLayoutVersion) return true;
     if (out->handle != 0u) {
@@ -9411,7 +9500,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   }
   #endif
 
-  // ── World-fixed parallax bounds reduction pipeline ──
+  // -- World-fixed parallax bounds reduction pipeline --
   // 4 SRVs (pos, contrib, charmask, camCur), 2 UAVs (scratch, bounds), 5 push floats
   auto make_worldbox_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u && d->dyncube_worldbox_layout_version == kDynCubeWorldBoxLayoutVersion) return true;
@@ -9469,7 +9558,7 @@ static void UnbindDynCubeComputeState(reshade::api::command_list* cl) {
 }
 
 static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d) {
-  // Writes a DEDICATED solid-color cube — never the history/ggx resources.
+  // Writes a DEDICATED solid-color cube � never the history/ggx resources.
   if (!cl || !d) return false;
   auto* dev = cl->get_device();
   if (!CreateDynCubeSolidResources(dev, d)) return false;
@@ -9491,7 +9580,7 @@ static bool RunDynCubeSolid(reshade::api::command_list* cl, DeviceData* d) {
 // Delayed-validate commit: promote the just-written set to the consumer read set
 // and advance the write cursor. Call ONLY with a validated set, except for the
 // reduction-unavailable fail-safe path (which preserves pre-protection behavior).
-// Aliases, t29, previews, and GGX input all follow readSet — never the raw write set.
+// Aliases, t29, previews, and GGX input all follow readSet � never the raw write set.
 static void PromoteDynCubeReadSet(DeviceData* d) {
   if (!d) return;
   d->dyncube_readSet = d->dyncube_hist_cur;
@@ -9704,7 +9793,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
   // World-box reduction doubles as the capture-validity detector: it must run for
   // every capture regardless of the World Fixed toggle (lighting use stays gated).
   // Charmask transition for the reduction read, restored afterwards.
-  // NOTE: no swap/alias promotion here — the consumer readSet advances only via
+  // NOTE: no swap/alias promotion here � the consumer readSet advances only via
   // delayed validation (see scheduler consume), so an invalid capture can never
   // become t29/t17/filter input. The write cursor advances on promotion only,
   // which keeps rejected scratch sets disposable (overwritten by the next capture).
@@ -9951,7 +10040,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (!CreateDynCubePipelinesIfNeeded(dev, d)) return false;
   if (!d->dyncube_ssr_pipeline.handle) return false;
 
-  // ── IS-FAST noise texture (load once; GTVBAO path also loads it when active) ──
+  // -- IS-FAST noise texture (load once; GTVBAO path also loads it when active) --
   if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
 
   // Lazily create the full-res SSR textures (raw, blur_h, blur) sized to the captured color.
@@ -9989,7 +10078,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
         " raw=" + std::to_string(rawDesc.texture.width) + "x" + std::to_string(rawDesc.texture.height), true);
   }
 
-  // ── March pass → ssr_raw ──
+  // -- March pass ? ssr_raw --
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_pipeline);
   auto* st = &d->dyncube_ssr_tables;
   const reshade::api::resource_view isfastSrv =
@@ -10035,7 +10124,7 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_raw, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
-  // ── Separable bilateral blur: H (raw → blur_h), V (blur_h → blur) ──
+  // -- Separable bilateral blur: H (raw ? blur_h), V (blur_h ? blur) --
   // Both passes reference ORIGINAL captured scene depth (not blurred intermediates).
   if (!d->dyncube_ssr_blur_pipeline.handle) return false;
   const float sigma = std::clamp(shader_injection.dynCube_ssr_blur, 0.f, 8.f);
@@ -10074,14 +10163,14 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   return true;
 }
 
-// ── Push constants builder (kai-vanillaplus style) ──
+// -- Push constants builder (kai-vanillaplus style) --
 
-static std::array<float, 65> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
+static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(DeviceData* data, bool denoise_last_pass,
                                                        float ssgi_enabled_override = -1.f,
                                                        bool foliage_mask_valid = false,
                                                        int denoise_stage = 0,
                                                        float atrous_step = 1.f) {
-  std::array<float, 65> c = {};
+  std::array<float, kGtvbaoPushConstantFloats> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
   c[1]  = (float)denoise_passes;
@@ -10109,7 +10198,7 @@ static std::array<float, 65> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[21] = g_gtvbao_normal_max_darkening;
   c[22] = g_gtvbao_normal_darkening_mode;
   c[23] = g_gtvbao_normal_transform_mode;
-  // ── GI parameters (IS-FAST repurpose) ──
+  // -- GI parameters (IS-FAST repurpose) --
   // c[24] = g_gi_enabled
   c[24] = (ssgi_enabled_override >= 0.f) ? ssgi_enabled_override : shader_injection.vbgi_enabled; // GI enable
   // c[25] = g_gi_light_exposure
@@ -10133,41 +10222,50 @@ static std::array<float, 65> BuildGTVBAOPushConstants(DeviceData* data, bool den
   c[39] = std::clamp(g_isfast_spatial_scale, 0.25f, 4.f);          // IS-FAST spatial scale
   c[40] = std::clamp(g_isfast_temporal_speed, 0.f, 5.f);           // IS-FAST temporal speed
   c[41] = std::clamp(g_isfast_seed_offset, 0.f, 64.f);             // IS-FAST seed offset
-  // ── Denoiser leak parameters ──
+  // -- Denoiser leak parameters --
   c[42] = std::clamp(shader_injection.gtvbao_denoise_leak_threshold, 1.f, 4.f);
   c[43] = std::clamp(shader_injection.gtvbao_denoise_leak_strength, 0.f, 1.f);
-  // ── Spatial denoiser only (Spatio-Temporal / Poisson removed) ──
+  // -- Spatial denoiser only (Spatio-Temporal / Poisson removed) --
   c[44] = 0.f;  // temporal_blend: off (spatial only)
   c[45] = 0.01f;  // disocclusion_threshold: unused by spatial path
   c[46] = shader_injection.gtvbao_noise_type;    // 0=IS-FAST, 1=IGN, 2=Hilbert
-  // ── GTVBAO upgrades: always On (UI toggles removed) ──
+  // -- GTVBAO upgrades: always On (UI toggles removed) --
   c[47] = 1.f;  // cdf_enabled
   c[48] = 1.f;  // cosine_enabled
   c[49] = shader_injection.gtvbao_cosine_mode;
   c[50] = 1.f;  // thickness_enabled
-  // ── Foliage / prefilter ──
+  // -- Foliage / prefilter --
   c[51] = shader_injection.gtvbao_prefilter_enabled;
-  // ── Foliage exclusion ──
+  // -- Foliage exclusion --
   c[52] = shader_injection.gtvbao_exclude_foliage;
   c[53] = std::clamp(shader_injection.gtvbao_foliage_ao_value, 0.f, 1.f);
   c[54] = IsKai() ? 1.f : 0.f;
   // c[55] - foliage mask is only fresh when the pre-pass dispatched this frame.
   c[55] = foliage_mask_valid ? 1.f : 0.f;
-  // ── Denoiser upgrades (R1-R4) ──
+  // -- Denoiser upgrades (R1-R4) --
   c[56] = (float)denoise_stage;                                        // dispatch mode for denoise_last
   c[57] = shader_injection.gtvbao_atrous_enabled;
   c[58] = std::clamp(shader_injection.gtvbao_atrous_depth_sigma, 0.01f, 8.f);
   c[59] = std::clamp(shader_injection.gtvbao_atrous_normal_sigma, 1.f, 128.f);
-  c[60] = std::clamp(atrous_step, 1.f, 8.f);                           // à-trous stride (1/2/4)
-  // —— Half-resolution spatial pipeline (appended; Full path ignores these) ——
+  c[60] = std::clamp(atrous_step, 1.f, 8.f);                           // �-trous stride (1/2/4)
+  // �� Half-resolution spatial pipeline (appended; Full path ignores these) ��
   c[61] = shader_injection.gtvbao_resolution > 0.5f ? 1.f : 0.f;
   c[62] = std::clamp(shader_injection.gtvbao_upscale_plane_sigma, 1.f, 400.f);
   c[63] = std::clamp(shader_injection.gtvbao_upscale_normal_power, 1.f, 64.f);
   c[64] = shader_injection.gtvbao_upscale_debug;
+  // -- VBGI (GI) normal settings, independent of the AO ones at c[13]/c[15]/
+  // c[19]/c[23]. VBGI is a bleeding effect and frequently wants different
+  // geometry handling from AO -- most often MRT normals for AO (accurate but
+  // sharp) and depth-derived for GI (softer, fewer fireflies). Defaults match
+  // the AO neutral values so enabling VBGI changes nothing until a knob moves.
+  c[65] = g_gtvbao_gi_normal_input_mode;
+  c[66] = g_gtvbao_gi_normal_influence;
+  c[67] = g_gtvbao_gi_normal_z_preservation;
+  c[68] = g_gtvbao_gi_normal_transform_mode;
   return c;
 }
 
-// ── Pipeline creation ──
+// -- Pipeline creation --
 
 static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData* d) {
   // CPU opt: when ensure mode is on, skip destruction (kai-style).
@@ -10228,7 +10326,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     push_constants_range.binding = 0;
     push_constants_range.dx_register_index = 13;
     push_constants_range.dx_register_space = 0;
-    push_constants_range.count = 65;
+    push_constants_range.count = kGtvbaoPushConstantFloats;
     push_constants_range.visibility = DS::all_compute;
     P param_sampler, param_cbv, param_srv, param_uav, param_constants;
     param_sampler.type = reshade::api::pipeline_layout_param_type::descriptor_table;
@@ -10246,7 +10344,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   };
 
   if (!make_layout(1u, kGTVBAODepthMipLevels, &d->prefilter_layout)) return false;
-  // Foliage mask (t0=depth, t1=MRT normal → u0=foliage mask)
+  // Foliage mask (t0=depth, t1=MRT normal ? u0=foliage mask)
   if (!make_layout(2u, 1u, &d->foliage_mask_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables);
   if (!d->foliage_mask_pipeline.handle)
@@ -10255,7 +10353,7 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!make_layout(5u, 4u, &d->main_layout)) return false;
   // Denoise: 6 SRVs (AO, edges, raw GI, history AO, depth mip, MRT normal) + 3 UAVs (denoised AO, denoised GI, history AO)
   if (!make_layout(6u, 3u, &d->denoise_layout)) return false;
-  // À-trous: 3 SRVs (AO src, depth MIP0, pre-decoded normals) + 1 UAV (AO dst)
+  // �-trous: 3 SRVs (AO src, depth MIP0, pre-decoded normals) + 1 UAV (AO dst)
   if (!make_layout(3u, 1u, &d->atrous_layout)) return false;
   EnsureGTVBAODescriptorTables(dev, d->atrous_layout, &d->atrous_tables);
   // Normal prep: 1 SRV (MRT normal) + 1 UAV (decoded normals)
@@ -10281,21 +10379,21 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!d->denoise_last_kai_pipeline.handle) mkcs(__gtvbao_denoise_last_kai, "main", d->denoise_layout, &d->denoise_last_kai_pipeline);
   // Sora 2nd variant: same layout, different CSO with correct prevViewProj_g at c75
   if (!d->denoise_last_sora2nd_pipeline.handle) mkcs(__gtvbao_denoise_last_sora2nd, "main", d->denoise_layout, &d->denoise_last_sora2nd_pipeline);
-  // À-trous wavelet spatial filter (R3)
+  // �-trous wavelet spatial filter (R3)
   if (!d->atrous_pipeline.handle) mkcs(__gtvbao_atrous, "main", d->atrous_layout, &d->atrous_pipeline);
-  // Normal pre-decode (à-trous perf)
+  // Normal pre-decode (�-trous perf)
   if (!d->normal_prep_pipeline.handle) mkcs(__gtvbao_normal_prep, "main", d->normal_prep_layout, &d->normal_prep_pipeline);
   if (!d->multibounce_pipeline.handle)   mkcs(__gtvbao_multibounce_accumulate, "main", d->multibounce_layout, &d->multibounce_pipeline);
   if (!d->upscale_pipeline.handle) mkcs(__gtvbao_upscale, "main", d->upscale_layout, &d->upscale_pipeline);
 
-  // ── SSGI is now integrated into the main pass (visibility bitmask AO+GI). ──
-  // no separate VBGI pipeline needed — main_layout handles both AO and GI outputs.
+  // -- SSGI is now integrated into the main pass (visibility bitmask AO+GI). --
+  // no separate VBGI pipeline needed � main_layout handles both AO and GI outputs.
   return d->prefilter_pipeline.handle && d->main_high_pipeline.handle
       && d->denoise_pipeline.handle && d->denoise_last_pipeline.handle
       && d->multibounce_pipeline.handle;
 }
 
-// ── IS-FAST DDS loader (64×64×64, RG8_UNORM Texture3D) ──
+// -- IS-FAST DDS loader (64�64�64, RG8_UNORM Texture3D) --
 
 #pragma pack(push, 1)
 struct DDS_PIXELFORMAT { uint32_t dwSize, dwFlags, dwFourCC, dwRGBBitCount, dwRBitMask, dwGBitMask, dwBBitMask, dwABitMask; };
@@ -10331,7 +10429,7 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   if (byte_count < sizeof(DDS_HEADER) + 4) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] Embedded fast_noise_ea.dds too small — using IGN fallback.");
+        "[IS-FAST] Embedded fast_noise_ea.dds too small � using IGN fallback.");
     return false;
   }
 
@@ -10353,7 +10451,7 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
     if (byte_count < header_size) {
       if (g_isfast_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::warning,
-          "[IS-FAST] Embedded fast_noise_ea.dds truncated DX10 header — using IGN fallback.");
+          "[IS-FAST] Embedded fast_noise_ea.dds truncated DX10 header � using IGN fallback.");
       return false;
     }
     DDS_HEADER_DXT10 dx10 = {};
@@ -10362,23 +10460,23 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
     if (dx10.resourceDimension != 4) return false; // must be Texture3D
   }
 
-  // DXGI_FORMAT_R8G8_UNORM = 49, expected dims: 128×128×32
+  // DXGI_FORMAT_R8G8_UNORM = 49, expected dims: 128�128�32
   if (w != 128 || h != 128 || ddsDepth != 32 || fmt != 49) {
     if (g_isfast_debug_logging > 0.5f) {
       std::string msg = "[IS-FAST] Unexpected DDS: ";
       msg += std::to_string(w) + "x" + std::to_string(h) + "x" + std::to_string(ddsDepth);
-      msg += " fmt=" + std::to_string(fmt) + " (expected 128x128x32 RG8_UNORM) — using IGN fallback.";
+      msg += " fmt=" + std::to_string(fmt) + " (expected 128x128x32 RG8_UNORM) � using IGN fallback.";
       reshade::log::message(reshade::log::level::warning, msg.c_str());
     }
     return false;
   }
 
-  // Payload: 128×128×32 × 2 bytes = 1,048,576 bytes
+  // Payload: 128�128�32 � 2 bytes = 1,048,576 bytes
   size_t dataSize = (size_t)w * h * ddsDepth * 2;
   if (byte_count < header_size + dataSize) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] Embedded fast_noise_ea.dds truncated payload — using IGN fallback.");
+        "[IS-FAST] Embedded fast_noise_ea.dds truncated payload � using IGN fallback.");
     return false;
   }
   std::vector<uint8_t> data(dataSize);
@@ -10394,13 +10492,13 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   reshade::api::subresource_data sub = {};
   sub.data = data.data();
   sub.row_pitch = w * 2;
-  sub.slice_pitch = w * 2 * h;       // bytes per 2D slice (row_pitch × height)
+  sub.slice_pitch = w * 2 * h;       // bytes per 2D slice (row_pitch � height)
 
   if (!dev->create_resource(rd, &sub, reshade::api::resource_usage::shader_resource,
                             &d->isfast_noise_texture)) {
     if (g_isfast_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::warning,
-        "[IS-FAST] Failed to create 3D noise texture — using IGN fallback.");
+        "[IS-FAST] Failed to create 3D noise texture � using IGN fallback.");
     return false;
   }
 
@@ -10422,16 +10520,16 @@ static bool LoadISFASTNoiseTexture(reshade::api::device* dev, DeviceData* d) {
   d->isfast_texture_loaded = true;
   if (g_isfast_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info,
-      "[IS-FAST] Texture loaded (embedded): 128x128x32 RG8_UNORM — noise source: TEXTURE");
+      "[IS-FAST] Texture loaded (embedded): 128x128x32 RG8_UNORM � noise source: TEXTURE");
   return true;
 }
 
-// ── Dispatch ──
+// -- Dispatch --
 
 static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!d->captured_depth_srv.handle) return false;
 
-  // ── Frame skips (independent per component) ──
+  // -- Frame skips (independent per component) --
   auto skip_this_frame = [&](float setting) -> bool {
     if (setting <= 0.5f) return false;
     uint64_t n = (uint64_t)setting + 1u;
@@ -10447,7 +10545,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (skip_ssgi) ssgi_enabled_this_frame = 0.f;
   auto* dev = cl->get_device();
 
-  // ── IS-FAST noise texture (load once) ──
+  // -- IS-FAST noise texture (load once) --
   if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, d);
 
   if (shader_injection.gtvbao_debug_logging > 0.5f)
@@ -10467,9 +10565,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     CSLog("gtvbao", "run entry ABORT: working too small", true);
     return false;
   }
-  // —— Half-resolution spatial pipeline: AO/GI evaluation domain. Full path
+  // �� Half-resolution spatial pipeline: AO/GI evaluation domain. Full path
   // uses w/h everywhere (existing behavior); Half uses hw/hh for main,
-  // denoise, and à-trous while depth/MRT/light/multibounce stay full.
+  // denoise, and �-trous while depth/MRT/light/multibounce stay full.
   const bool half_mode = shader_injection.gtvbao_resolution > 0.5f
       && d->half_width >= 32u && d->half_height >= 32u
       && d->ao_term_a_texture.handle && d->upscale_ao_texture.handle;
@@ -10538,14 +10636,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->prefilter_layout, &d->prefilter_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
+    cl->push_constants(CS, d->prefilter_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((w + 15) / 16, (h + 15) / 16, 1);
   bar(d->depth_mips_texture, UA, SR);
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1 (prefilter) done.");
 
-  // ── Multi-bounce accumulate (HDR light buffer + previous GI) ──
+  // -- Multi-bounce accumulate (HDR light buffer + previous GI) --
   // Runs BEFORE main pass to create an HDR accumulated light buffer.
   {
     bool mb_enabled  = shader_injection.vbgi_multibounce > 0.5f;
@@ -10594,7 +10692,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&acc_uav_arr},
       };
       apply_descriptors(d->multibounce_layout, &d->multibounce_tables, 4, au);
-      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, 65,
+      cl->push_constants(CS, d->multibounce_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats,
                          BuildGTVBAOPushConstants(d, false).data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->multibounce_texture, UA, SR);
@@ -10603,7 +10701,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     } else if (mb_enabled && !mb_gi_ready) {
       if (shader_injection.vbgi_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::info,
-            "[SSGI] MultiBounce: SKIPPED (denoised GI not valid yet — first frame or GTVBAO never ran).");
+            "[SSGI] MultiBounce: SKIPPED (denoised GI not valid yet � first frame or GTVBAO never ran).");
     } else if (mb_enabled && !mb_pipe_ok) {
       if (shader_injection.vbgi_debug_logging > 0.5f)
         reshade::log::message(reshade::log::level::warning,
@@ -10611,13 +10709,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     }
   }
 
-  // ── Foliage mask pre-pass (full-res, reads MRT normal, writes R8_UINT) ──
+  // -- Foliage mask pre-pass (full-res, reads MRT normal, writes R8_UINT) --
   if (foliage_mask_valid) {
     uint32_t mkW = w, mkH = h;
     bind_pipe(d->foliage_mask_pipeline);
     reshade::api::resource_view fm_srvs[2] = {
-        d->depth_mips_srv,                          // t0 — working depth (GetDimensions)
-        d->captured_mrt_normal_srv                  // t1 — G-buffer normal (bit 15 test)
+        d->depth_mips_srv,                          // t0 � working depth (GetDimensions)
+        d->captured_mrt_normal_srv                  // t1 � G-buffer normal (bit 15 test)
     };
     reshade::api::descriptor_table_update fu[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
@@ -10627,7 +10725,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->foliage_mask_layout, &d->foliage_mask_tables, 4, fu);
     auto pc = BuildGTVBAOPushConstants(d, false);
-    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
+    cl->push_constants(CS, d->foliage_mask_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
     cl->dispatch((mkW + 7) / 8, (mkH + 7) / 8, 1);
     bar(d->foliage_mask_texture, UA, SR);
   }
@@ -10702,7 +10800,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
     auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid);
-    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
+    cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
   bar(d->ao_term_a_texture, UA, SR);
@@ -10720,7 +10818,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     const bool dbgRead = (shader_injection.vbgi_debug_view > 0.5f
             && (int)shader_injection.vbgi_debug_view == 5)
         || (shader_injection.gtvbao_debug_view > 5.5f
-            && shader_injection.gtvbao_debug_view < 8.5f);
+            && shader_injection.gtvbao_debug_view < 8.5f)
+        || (shader_injection.gtvbao_debug_view > 21.5f
+            && shader_injection.gtvbao_debug_view < 29.5f);
     if (dbgRead)
       bar(d->debug_texture, UA, SR);         // Debug output ready for read
   }
@@ -10739,7 +10839,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     reshade::log::message(reshade::log::level::info, msg.c_str());
   }
 
-  // Pass 3: Denoise (ping-pong) — always run at least one pass to apply
+  // Pass 3: Denoise (ping-pong) � always run at least one pass to apply
   // the XE_GTAO_OCCLUSION_TERM_SCALE multiply-back (1.5x) in GTVBAO_Output.
   // When dpc==0 the DenoiseBlurBeta=10000 effectively disables blur.
   int dpc = (int)shader_injection.gtvbao_denoise_passes;
@@ -10784,7 +10884,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       }
     }
 
-    // ── À-trous helpers (spatial-only) ──
+    // -- �-trous helpers (spatial-only) --
 
     // Pre-decode MRT normals once so atrous taps skip the sincos/sqrt decode.
     auto run_normal_prep = [&]() {
@@ -10799,13 +10899,13 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
       auto pc_np = BuildGTVBAOPushConstants(d, false);
-      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_np.data());
+      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_np.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->normal_prep_texture, UA, SR);
     };
 
-    // 3 à-trous iterations (strides 1/2/4). The last iteration folds the
-    // ×OCCLUSION_TERM_SCALE multiply-back via denoise_is_last_pass.
+    // 3 �-trous iterations (strides 1/2/4). The last iteration folds the
+    // �OCCLUSION_TERM_SCALE multiply-back via denoise_is_last_pass.
     // Returns true when the final result lives in ao_term_b.
     auto run_atrous_chain = [&](bool start_in_b) -> bool {
       bool cur_b = start_in_b;
@@ -10826,7 +10926,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         apply_descriptors(d->atrous_layout, &d->atrous_tables, 4, au);
         auto pc_a = BuildGTVBAOPushConstants(d, last_iter, -1.f, false, /*stage*/0,
                                              /*step*/float(1 << i));
-        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_a.data());
+        cl->push_constants(CS, d->atrous_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_a.data());
         cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
         bar(a_dst_tex, UA, SR);
         cur_b = !cur_b;
@@ -10834,11 +10934,11 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       return cur_b;
     };
 
-    // ── Spatial-only paths (Spatio-Temporal R2 / Poisson removed) ──
+    // -- Spatial-only paths (Spatio-Temporal R2 / Poisson removed) --
     if (atrous_active && last_pipe.handle) {
-      // ── Spatial-only + à-trous: wavelet chain replaces the combined final
+      // -- Spatial-only + �-trous: wavelet chain replaces the combined final
       // dispatch; scale-back folds into the last iteration. A GI-only tail
-      // (stage 4) keeps the GI bilateral running. ──
+      // (stage 4) keeps the GI bilateral running. --
       run_normal_prep();
       d->gtvbao_final_in_b = run_atrous_chain(/*start_in_b*/false);  // main wrote ao_term_a
       // Stage-4 GI tail writes nothing when GI is off (empty stage body, gated
@@ -10868,7 +10968,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u_g);
       auto pc_g = BuildGTVBAOPushConstants(d, true, -1.f, false, /*stage*/4);
-      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_g.data());
+      cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_g.data());
       // denoise_last threads cover 2 px each (dt*uint2(2,1) + sides): halve the grid.
       cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
       }  // end GI-on stage-4 dispatch
@@ -10876,7 +10976,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       // upscale block below, so it lands after this write but before any
       // descriptor that samples the buffer is published.
     } else {
-      // ── Spatial bilateral chain (Poisson / temporal removed). ──
+      // -- Spatial bilateral chain (Poisson / temporal removed). --
       bool use_a = true;
       for (int p = 0; p < dpc; ++p) {
         bool last = (p == dpc - 1);
@@ -10902,7 +11002,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
         };
         apply_descriptors(d->denoise_layout, &d->denoise_tables, 4, u);
         auto pc = BuildGTVBAOPushConstants(d, last, -1.f, false, /*stage*/0);
-        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc.data());
+        cl->push_constants(CS, d->denoise_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
         // denoise_last threads cover 2 px each: halve the grid (bounds-fail covers overhang).
         cl->dispatch((aw + 15) / 16, (ah + 7) / 8, 1);
         bar(dst_tex, UA, SR);
@@ -10913,10 +11013,10 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       }
     }
 
-    // —— Half mode: full-resolution joint reconstruction (4-Tap) ——
+    // �� Half mode: full-resolution joint reconstruction (4-Tap) ��
     // Half AO/GI (+ half denoise above) -> full AO/GI for t22/t23 +
     // next-frame multibounce. The joint reconstruction consumes pre-decoded
-    // full-res normals, so the normal prep must run when the à-trous chain
+    // full-res normals, so the normal prep must run when the �-trous chain
     // (which produces them) is off.
     reshade::api::pipeline up_pipe = d->upscale_pipeline;
     if (half_mode && up_pipe.handle && d->upscale_ao_uav.handle
@@ -10960,7 +11060,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       };
       apply_descriptors(d->upscale_layout, &d->upscale_tables, 4, uu);
       auto pc_u = BuildGTVBAOPushConstants(d, true);
-      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, 65, pc_u.data());
+      cl->push_constants(CS, d->upscale_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_u.data());
       cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
       bar(d->upscale_ao_texture, UA, SR);
       if (shader_injection.vbgi_enabled > 0.5f)
@@ -10991,7 +11091,7 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     d->vbgi_denoised_valid = true;            // Multi-bounce feedback active next frame
     if (shader_injection.vbgi_debug_logging > 0.5f)
       reshade::log::message(reshade::log::level::info,
-          "[SSGI] MultiBounce: denoised GI now valid — accumulate will run next frame.");
+          "[SSGI] MultiBounce: denoised GI now valid � accumulate will run next frame.");
   }
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] All passes complete.");

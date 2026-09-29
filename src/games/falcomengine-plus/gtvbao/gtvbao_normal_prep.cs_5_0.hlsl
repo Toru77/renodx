@@ -20,15 +20,15 @@ void main(uint2 dt : SV_DispatchThreadID)
   g_outPrepNormal.GetDimensions(width, height);
   if (dt.x >= width || dt.y >= height) return;
 
-  uint4 s = g_srcPrepMrtNormal.Load(int3(dt, 0));
-  float2 enc = float2((float)s.x, (float)s.y) * (1.0 / 32767.5) + float2(-1.0, -1.0);
-  float azimuth = 3.14159274 * enc.x;
-  float sin_a, cos_a;
-  sincos(azimuth, sin_a, cos_a);
-  float ring = sqrt(saturate(1.0 - enc.y * enc.y));
-  float3 n = float3(cos_a * ring, sin_a * ring, enc.y);
-  float len = length(n);
-  if (len > 1e-4) n /= len; else n = float3(0, 0, 1);
-
-  g_outPrepNormal[dt] = float4(n, 0.0);
+  // Same shared decode + transform as the main pass, so the two can never
+  // disagree. Unwritten texels stay a ZERO vector, which the à-trous and
+  // upscale consumers read as "no g-buffer normal here" and fall back to
+  // depth-only weighting for.
+  // This texture feeds the AO-side filters (à-trous, upscale), so it uses the
+  // AO transform mode, not the independent VBGI one.
+  g_outPrepNormal[dt] = float4(
+      TransformNormalToView(
+          GTVBAO_DecodeMrtNormalPacked(g_srcPrepMrtNormal.Load(int3(dt, 0)).xy),
+          GTVBAO_normal_transform_mode),
+      0.0);
 }

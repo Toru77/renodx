@@ -438,8 +438,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     bool gtvbao_foliage_pixel = false;
     bool checkFoliage = (GTVBAO_debug_mode > 8.5f) || (GTVBAO_exclude_foliage > 0.5f);
     if (checkFoliage) {
-      float2 mrtScale = float2(g_mrtW, g_mrtH) / max(float2(g_workDims), 1.0.xx);
-      int2 mrtTC = min(int2(floor((float2(pixCoord) + 0.5) * mrtScale)), int2(g_mrtW - 1, g_mrtH - 1));
+      // GTVBAO_MrtTexel so the foliage test reads exactly the texel the normal
+      // decode reads; a one-texel disagreement would mark the wrong pixel.
+      int2 mrtTC = GTVBAO_MrtTexel((float2(pixCoord) + 0.5) * (float2(g_mrtW, g_mrtH) / max(float2(g_workDims), 1.0.xx)),
+                                    float2(g_mrtW, g_mrtH));
       uint4 _mrtV = mrtNormalTexture.Load(int3(mrtTC, 0));
       uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;
       gtvbao_foliage_pixel = (_mrtC & 0x8000u) != 0u;
@@ -528,6 +530,16 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     // ── SSGI debug view 5: sample activity counters ──
     uint activityContributed = 0u;  // samples that added GI
     uint activityRejected = 0u;     // samples valid but newCount==0
+    // ── Horizon-term accumulators for MRT/horizon diagnostics (26-29) ──
+    // These are the per-slice intermediates of the NON-bitmask horizon path,
+    // averaged over slices. They are the terms that decide occlusion, so
+    // they are what a "why is this surface too dark" question actually needs.
+    // float, not lpfloat, so the accumulation stays in fp32.
+    float dbgCosNormSum = 0.0f;        // sum of per-slice cosNorm
+    float dbgProjLenSum = 0.0f;        // sum of per-slice projectedNormalVecLength
+    float dbgSliceAOSum = 0.0f;        // sum of per-slice unweighted sliceAO
+    float dbgSliceN = 0.0f;            // number of slices accumulated
+    float dbgFinalVisibility = 0.0f;   // final accumulated visibility
 
 #ifdef GT_VBAO_SHOW_DEBUG_VIZ
     float3 dbgWorldPos          = mul(g_globals.ViewInv, float4(pixCenterPos, 1)).xyz;
@@ -786,17 +798,36 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         // (SZ / samplePos), so this costs two extra taps and
                         // runs only for samples that already pass newCount > 0.
                         float3 sampleNormal = (float3)viewspaceNormal;
-                        if (GTVBAO_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
+                        // VBGI's normal source and shaping are INDEPENDENT of
+                        // the AO settings above. Both are push-constant scalars,
+                        // so this is a uniform branch across the whole
+                        // dispatch -- no divergence, and only one of the MRT /
+                        // depth paths ever runs. Texel mapping, decode and
+                        // transform arithmetic are shared deliberately.
+                        if (GTVBAO_gi_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
                         {
                             // Dimensions were cached once above; do not re-query
                             // them per sample.
                             uint mw2 = g_mrtW, mh2 = g_mrtH;
                             if (mw2 > 0 && mh2 > 0)
                             {
-                                int2 mrtTc = int2(sampleScreenPos * float2(mw2, mh2));
-                                mrtTc = clamp(mrtTc, int2(0,0), int2(mw2-1, mh2-1));
+                                // GTVBAO_MrtTexel, the same mapping the main
+                                // pass uses for the centre pixel. Truncating
+                                // `sampleScreenPos * dims` directly (as this
+                                // did) has no texel-centre offset, so a sample
+                                // could read a different normal than the pixel
+                                // it is contributing to.
+                                int2 mrtTc = GTVBAO_MrtTexel(sampleScreenPos * float2(mw2, mh2),
+                                                         float2(mw2, mh2));
+                                // Keep the pixel normal when the texel is one the
+                                // G-buffer never wrote: a zero normal would make
+                                // NsDotL zero and silently drop this sample's GI.
                                 float3 decoded = DecodeMrtNormalAsIs((uint2)mrtTc);
-                                sampleNormal = TransformNormalToView(decoded);
+                                if (GTVBAO_NormalValid(decoded))
+                                    sampleNormal = GTVBAO_TuneNormal(
+                                        TransformNormalToView(decoded, GTVBAO_gi_normal_transform_mode),
+                                        GTVBAO_gi_normal_influence,
+                                        GTVBAO_gi_normal_z_preservation);
                             }
                         }
                         else
@@ -851,6 +882,17 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
 
             // ── AO for this slice: fraction of unoccluded sectors ──
             lpfloat sliceAO = (lpfloat)1.0 - (lpfloat)GTVBAO_CountBits(sliceBitmask) / (lpfloat)GT_VBAO_BITMASK_SECTOR_COUNT;
+
+            // ── Horizon-term accumulation for diagnostics (26-29) ──
+            // Captured before the cosine weighting below so mode 27 shows the
+            // raw unoccluded fraction. `n` is the signed angle between the
+            // projected normal and the slice direction: near +-PI/2 means the
+            // slice is tangential to the normal, near 0 means the normal
+            // points straight along the slice.
+            dbgCosNormSum += (float)cosNorm;
+            dbgProjLenSum += (float)projectedNormalVecLength;
+            dbgSliceAOSum  += (float)sliceAO;
+            dbgSliceN      += 1.0f;
 
             // ── GTVBAO Mode 0: cosine weight per slice (cosine sampling always On) ──
             if ((int)GTVBAO_gtvbao_cosine_mode == 0) {
@@ -1120,6 +1162,108 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         float g = (float)((bm >> 8u) & 0xFFu) / 255.0f;
         float b = (float)((bm >> 16u) & 0xFFu) / 255.0f;
         outDebug[pixCoord] = float4(r, g, b, 1.0f);
+    } else if (dbgMode >= 22 && dbgMode <= 29) {
+        // ── MRT normal / horizon diagnostics (22-29) ──
+        // These run inside the main pass on purpose: they use the SAME
+        // mrtNormalTexture binding, the SAME GTVBAO_DecodeMrtNormalPacked and
+        // the SAME TransformNormalToView the AO actually uses, so what is shown
+        // is the ground truth rather than a reimplementation that can drift.
+        //
+        // outDebug is a full-res texture, but pixCoord indexes the AO output
+        // domain, which is half-res in Half mode. Map through the same
+        // block-center rule the half-res paths use so the image is not written
+        // into a quarter of the target.
+        int2 dbgOutTC = g_halfRes
+            ? GTVBAO_HalfToFullCenter(clamp(int2(pixCoord), int2(0, 0), max(g_workDims - 1, int2(0, 0))),
+                                      int2(g_fullDepthW, g_fullDepthH))
+            : int2(pixCoord);
+
+        int2 mrtTcDbg = GTVBAO_MrtTexel((float2(pixCoord) + 0.5) * (float2(g_mrtW, g_mrtH) / max(float2(g_workDims), 1.0.xx)),
+                                        float2(g_mrtW, g_mrtH));
+        uint4 rawDbg = mrtNormalTexture.Load(int3(mrtTcDbg, 0));
+        float3 decodedDbg = GTVBAO_DecodeMrtNormalPacked(rawDbg.xy);
+        bool  texelWrittenDbg = GTVBAO_NormalValid(decodedDbg);
+        float3 viewNDbg = texelWrittenDbg ? TransformNormalToView(decodedDbg, GTVBAO_normal_transform_mode) : float3(0, 0, 0);
+
+        if (dbgMode == 22) {
+            // Raw packed values. 0x0000 in BOTH channels means the G-buffer
+            // never wrote this texel: a real normal always has raw.y ~= 32767
+            // when N.z == 0, so (0,0) is unambiguous. Pure black here on your
+            // wall == that wall does not write MRT0 at all.
+            outDebug[dbgOutTC] = float4((float)rawDbg.x / 65535.0f,
+                                        (float)rawDbg.y / 65535.0f,
+                                        0.0f, 1.0f);
+        } else if (dbgMode == 23) {
+            // Decoded WORLD-space normal, + validity in alpha.
+            // Black RGB with alpha 0 == zeroed/cleared texel (depth fallback).
+            outDebug[dbgOutTC] = float4(decodedDbg * 0.5f + 0.5f,
+                                        texelWrittenDbg ? 1.0f : 0.0f);
+        } else if (dbgMode == 24) {
+            // The exact view-space normal the horizon search consumed,
+            // NdotV-style remapped for viewing. Green == faces the camera.
+            float3 vd = saturate(viewNDbg * 0.5f + 0.5f);
+            if (!texelWrittenDbg) vd = float3(0.0f, 0.0f, 0.0f);
+            outDebug[dbgOutTC] = float4(vd, 1.0f);
+        } else if (dbgMode == 25) {
+            // 25: NdotV and the selected-normal provenance in one view.
+            // R = saturate(dot(N, viewVec)) -- the term that collapses when the
+            // normal's Z sign is wrong. G = 1 when the MRT normal was used,
+            // 0 when the depth-derived fallback was taken. B = foliage mark.
+            float3 vv = (float3)normalize(-pixCenterPos);
+            float ndotv = saturate(dot((float3)viewspaceNormal, vv));
+            outDebug[dbgOutTC] = float4(ndotv,
+                                        (GTVBAO_normal_input_mode > 0.5f
+                                         && GTVBAO_mrt_normal_available > 0.5f
+                                         && texelWrittenDbg) ? 1.0f : 0.0f,
+                                        gtvbao_foliage_pixel ? 1.0f : 0.0f,
+                                        1.0f);
+        } else if (dbgMode >= 26 && dbgMode <= 29) {
+            // ── Horizon-term diagnostics (26-29) ──
+            // These are the per-slice intermediates of the LIVE bitmask AO
+            // path, averaged over slices. They answer "why is this surface
+            // too dark" directly instead of inferring it from the AO value.
+            float invSlices = (dbgSliceN > 0.0f) ? (1.0f / dbgSliceN) : 0.0f;
+            float avgCosNorm = dbgCosNormSum * invSlices;
+            float avgProjLen = dbgProjLenSum * invSlices;
+            float avgSliceAO = dbgSliceAOSum * invSlices;
+            float3 vvDbg = (float3)normalize(-pixCenterPos);
+
+            if (dbgMode == 26) {
+                // cosNorm / projectedNormalVecLength / final visibility.
+                // projectedNormalVecLength is forced toward 1 by the 0.05 fudge
+                // at the top of this path; a wall pinned near 1.0 here while
+                // its true length is small is the overdarkening signature.
+                outDebug[dbgOutTC] = float4(saturate(avgCosNorm),
+                                            saturate(avgProjLen),
+                                            saturate((float)visibility),
+                                            1.0f);
+            } else if (dbgMode == 27) {
+                // Mean unoccluded sector fraction BEFORE the cosine weighting
+                // and before the FinalValuePower curve. 0 = fully occluded.
+                outDebug[dbgOutTC] = float4(saturate(avgSliceAO),
+                                            saturate(avgSliceAO),
+                                            saturate(avgSliceAO),
+                                            1.0f);
+            } else if (dbgMode == 28) {
+                // Post-weighting visibility vs. mean raw slice AO: shows how
+                // much the cosine weights + power curve darken a surface.
+                // Equal channels => the weighting is not the cause.
+                outDebug[dbgOutTC] = float4(saturate((float)visibility),
+                                            saturate(avgSliceAO),
+                                            saturate(avgSliceAO - (float)visibility),
+                                            1.0f);
+            } else {
+                // 29: NdotV, the MRT normal actually used, and how much the
+                // AO was darkened. If the MRT normal is rotated wrongly
+                // relative to the geometry, R stays high while the AO goes
+                // dark; if the horizon math is at fault instead, R is normal
+                // and only the AO collapses.
+                outDebug[dbgOutTC] = float4(saturate(dot((float3)viewspaceNormal, vvDbg)),
+                                            texelWrittenDbg ? saturate(viewNDbg.z * 0.5f + 0.5f) : 0.0f,
+                                            saturate(1.0f - (float)visibility),
+                                            1.0f);
+            }
+        }
     } else {
         outDebug[pixCoord] = float4(0, 0, 0, 0);
     }

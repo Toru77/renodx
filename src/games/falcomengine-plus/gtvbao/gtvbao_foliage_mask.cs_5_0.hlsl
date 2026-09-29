@@ -25,8 +25,11 @@ if (p.x >= maskW || p.y >= maskH) return;
     if (GTVBAO_exclude_foliage > 0.5f) {
         uint mrtW, mrtH;
         g_srcMrtNormal.GetDimensions(mrtW, mrtH);
-        float2 mrtScale = float2(mrtW, mrtH) / max(float2(maskW, maskH), 1.0.xx);
-        int2 mrtTC = min(int2(floor((float2(p) + 0.5) * mrtScale)), int2(mrtW - 1, mrtH - 1));
+        // GTVBAO_MrtTexel: same mapping the main pass and GI path use, so the
+        // mask marks the pixel whose normal is actually read. Texel-space
+        // coordinates, matching the original arithmetic exactly.
+        int2 mrtTC = GTVBAO_MrtTexel((float2(p) + 0.5) * (float2(mrtW, mrtH) / float2(max(maskW, 1u), max(maskH, 1u))),
+                                     float2(mrtW, mrtH));
         uint4 _mrtV = g_srcMrtNormal.Load(int3(mrtTC, 0));
         uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;
         if (_mrtC & 0x8000u) {

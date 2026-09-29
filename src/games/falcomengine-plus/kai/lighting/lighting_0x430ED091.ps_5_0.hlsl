@@ -454,7 +454,11 @@ void main(
       o1 = r1;
       return;
     }
-    if (is_character_pixel) {
+    // Characters are not masked out for the MRT normal diagnostics: the whole
+    // question is whether a given pixel has a G-buffer normal at all, and
+    // characters are forward-shaded so they typically never get one. Blacking
+    // them out here would hide exactly the case worth inspecting.
+    if (is_character_pixel && !(GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 29u)) {
       o0 = float4(0.0, 0.0, 0.0, 1.0);
       o1 = r1;
       return;
@@ -582,6 +586,30 @@ void main(
           is_foliage_pixel_t1_broad ? 1.0 : 0.0,
           is_foliage_pixel_t1_sss ? 1.0 : 0.0,
           t10_debug);
+    } else if (GTVBAO_debug_mode_ui >= 22u && GTVBAO_debug_mode_ui <= 29u) {
+      // ── MRT normal / horizon diagnostics (22-29) ──
+      // The compute pass wrote these into its debug UAV, which the host pushed
+      // to t23 (see the debug_replace branch of the t23 push). Reading them
+      // here instead of recomputing means the picture is the ground truth:
+      // same mrtNormalTexture binding, same GTVBAO_DecodeMrtNormalPacked, same
+      // TransformNormalToView the AO actually used. Recomputing here with this
+      // shader's own transform is what made the earlier 10-21 views useless
+      // for diagnosing the GTVBAO path.
+      //   22 = raw packed MRT0 .xy   (black => G-buffer never wrote it)
+      //   23 = decoded world normal  (black => zeroed/cleared texel)
+      //   24 = view normal in GTVBAO space
+      //   25 = R=NdotV  G=MRT normal used  B=foliage
+      //   26-29 = horizon terms (see GTVBAO.hlsli)
+      //
+      // If the host did not push the debug texture this frame, t23 still holds
+      // whatever was there before and the view would silently show stale
+      // content -- which is exactly how the first attempt looked (uniform
+      // white / uniform blue). Flag it magenta so that failure is loud.
+      if (shader_injection_data.gtvbao_mrt_normal_debug < 0.5) {
+        debug_color = float3(1.0, 0.0, 1.0);
+      } else {
+        debug_color = gtvbaoVBGITexture.SampleLevel(samLinear_s, v1.zw, 0).xyz;
+      }
     }
 
     o0 = float4(debug_color, 1.0);

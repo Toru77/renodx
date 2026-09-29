@@ -533,7 +533,16 @@ struct ShaderInjectData {
    // all -- a different state from the 4-tap rung, and the distinction is the
    // whole point of the view. Read only when dof_adaptive_samples is on.
    float dof_debug_view;
- };
+   // ---- GTVBAO MRT normal / horizon diagnostics (appended last) ----
+   // 0/1, set at runtime (not a user setting). The GTVBAO main pass writes its
+   // MRT/horizon diagnostic views into the debug UAV, which the host pushes to
+   // t23 for the lighting shader to display. That display is gated on this flag
+   // rather than on vbgi_debug_view, because that field is a persistent user
+   // setting (SSGIDebugView) and reusing it would clobber the user's choice --
+   // which is why the earlier 22-25 views pushed the texture but rendered the
+   // fallback instead. Set only while the push is active; reset every frame.
+   float gtvbao_mrt_normal_debug;
+  };
 
 #ifndef __cplusplus
 cbuffer shader_injection : register(b13) {
