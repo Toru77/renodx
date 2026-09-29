@@ -144,7 +144,7 @@ void main(uint2 dt : SV_DispatchThreadID)
       // it would be 0 and reject every tap, so fall back to neutral (1.0) and
       // let the depth edge-stop alone govern — that is what the constant
       // placeholder this replaced effectively did.
-      float nd = (GTVBAO_NormalValid(centerN) && GTVBAO_NormalValid(tapN))
+      float nd = (FalcomNormalValid(centerN) && FalcomNormalValid(tapN))
                ? saturate(dot(centerN, tapN)) : 1.0;
       float nW = nd;
       for (int q = 0; q < sqSteps; ++q) {

@@ -203,8 +203,18 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);  // dynamic cube history 
 TextureCube<float4> dynCubeVanillaTex : register(t30);  // game's vanilla cubemap (fallback layer)
 Texture2D<float4> dynCubeSSRTex : register(t31);        // blurred SSR result (rgb=color, a=confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);     // raw SSR result (debug 12)
+Texture2D<float4> microShadowTex : register(t33);       // Micro Shadows term + diagnostics (rgba8_unorm)
+Texture2D<float4> contactShadowTex : register(t34);     // Contact Shadows term + diagnostics (rgba8_unorm)
+// t35 carries the IS-FAST volume for the local-light contact march. It cannot
+// reuse t24: on Sora 1st that is texSSRMap_g, which the game samples.
+Texture3D<float2> csIsfastNoise : register(t35);
+// t36 is the scene depth for the local-light march. The game binds its own depth
+// at t4; the shadow path takes its own binding to the same resource so the
+// element type can be fixed in the shared helper (see shadows_common.hlsli).
+Texture2D<float4> csDepthTex : register(t36);
 
 #include "../../shared.h"
+#include "../../shadows/shadows_common.hlsli"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
 #include "../../reference/brdf.hlsli"
@@ -225,6 +235,10 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
   uint width, height, num_levels;
+  // Captured here because the flag word in r1.z is consumed and overwritten long
+  // before either output site, and the environment/character split needs it.
+  // Sora reads "bit 3 CLEAR" as the character flag (inverted vs Kai's bit 8).
+  float csIsCharacter = 0.0;
 
   r0.xyzw = colorTexture.SampleLevel(samPoint_s, v1.xy, 0).xyzw;
   mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -357,6 +371,7 @@ void main(
     }
   }
   bool is_character_pixel = (((uint)r1.z & 8u) == 0u);
+  csIsCharacter = is_character_pixel ? 1.0 : 0.0;
   uint2 mrt0_xy_raw = (uint2)r1.xy;
   r1.w = (int)r1.z & 8;
   if (r1.w == 0) {
@@ -372,7 +387,10 @@ void main(
       r6.x = r0.x;
       r6.yz = float2(0.0322580636,0.0322580636);
       r7.xyz = r6.xyz * r5.xyz;
-      r1.w = r4.y * r4.z;
+      // Was ao.y * ao.z, the character AO gated by the ssao pass's SSS shadow
+      // channel. That raymarch is replaced by the Contact / Micro Shadow compute
+      // passes, applied once at the output below, so only the AO term is left.
+      r1.w = r4.y;
       r4.yzw = -r6.xyz * r5.xyz + r0.xyz;
       r6.xyz = r1.www * r4.yzw + r7.xyz;
       r1.w = (int)r1.z & 4;
@@ -596,6 +614,21 @@ void main(
       r4.yzw = r0.xyz * mapAOColor_g.xyz + -r0.xyz;
       r6.xyz = r1.www * r4.yzw + r0.xyz;
     }
+    // The SSAO pass writes the ENGINE's own screen-space character shadow into the
+    // AO target's .z channel (sora1st/ssao r4.z, which survives into o0.z on both the
+    // GTVBAO early-out and the temporal blend). This is the only consumer of that
+    // channel, and it is what makes "Vanilla Character Shadowing" do anything.
+    //
+    // Applied to the resolved colour, not folded into ao_sample: the AO term r4.x is
+    // consumed by the ambient branches directly above and is also the GTVBAO
+    // character mask's input, so scaling it would darken the AO itself and double-count
+    // against that mask. Multiplying the colour cannot.
+    //
+    // This is the vanilla march, not the retired SSS raymarch -- that one was driven by
+    // the EnvSSS settings and is gone from every game.
+    if (is_character_pixel && shader_injection_data.char_shadow_mode >= 0.5f) {
+      r6.xyz *= saturate(ssao_sample.z);
+    }
     // GTVBAO on characters — apply bitmask AO to character pixels
     if (is_character_pixel && shader_injection_data.char_gtvbao_mode > 0.5f
         && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
@@ -640,7 +673,13 @@ void main(
       }
     }
     r6.w = r0.w;
-    o0.xyzw = r6.xyzw;
+    // Early return BEFORE the sun composite at 1152, and r6.xyz is built from the
+    // character/SSGI/GI terms with no isolable sun contribution. Contact is
+    // therefore not applied here: attaching it to the final colour instead is the
+    // bug that put contact shadows in interiors. Micro still applies.
+    o0.xyz = FalcomApplyShadowTerms(r6.xyz, v1.xy, csIsCharacter > 0.5, samPoint_s,
+                                    microShadowTex, contactShadowTex);
+    o0.w = r6.w;
     o1.xyzw = r2.xyzw;
     o2.xy = r3.xy;
     return;
@@ -1114,7 +1153,13 @@ void main(
   r1.w = r1.w * r7.x;
   r7.xyz = r13.yzw + -r8.xyz;
   r7.xyz = r1.www * r7.xyz + r8.xyz;
-  r7.xyz = r7.xyz * lightColor_g.xyz + r11.xyz;
+  // Sun contact shadows apply HERE, to the sun diffuse and before r11.xyz (ambient)
+  // is added. See FalcomApplyContactToSun: scaling the final colour instead is what
+  // made contact shadows appear in interiors, where the CSM has already removed the
+  // sun and there is nothing left for them to shadow.
+  r7.xyz = FalcomApplyContactToSun(
+      r7.xyz * lightColor_g.xyz, is_character_pixel,
+      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0)) + r11.xyz;
   r1.w = min(1, r3.z);
   r8.xyz = float3(1,1,1) + -r7.xyz;
   r7.xyz = r1.www * r8.xyz + r7.xyz;
@@ -1126,6 +1171,30 @@ void main(
   r1.w = exp2(r1.w);
   r1.w = min(1, r1.w);
   r8.xyz = r10.xyz * r1.www + r9.xyz;
+  // -- Local contact shadows: setup shared by the point and spot loops below --
+  // The budget is per pixel and shared by both loops, so a pixel covered by many
+  // lights pays for a bounded number of marches rather than one per light. Every
+  // value here is loop-invariant; only the budget counter changes per light.
+  const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
+  FalcomContactParams csLocalParams;
+  csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
+  csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
+  csLocalParams.bias = max(0.0, shader_injection_data.cs_contact_bias);
+  csLocalParams.sampleCount =
+      max(1.0, floor(shader_injection_data.cs_contact_local_sample_count + 0.5));
+  csLocalParams.strength = saturate(shader_injection_data.cs_contact_local_strength);
+  float csLocalBudget = csLocalOn
+      ? max(0.0, floor(shader_injection_data.cs_contact_local_max_lights + 0.5)) : 0.0;
+  const float2 csDepthUnpack = FalcomDepthUnpackConsts();
+  const float csLocalJitter = shader_injection_data.cs_contact_isfast_enabled > 0.5f
+      ? FalcomSampleISFAST(csIsfastNoise, samPoint_s, uint2(v0.xy), 
+                           (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
+                           128.0, 32.0,
+                           shader_injection_data.shadow_isfast_spatial_scale,
+                           shader_injection_data.shadow_isfast_temporal_speed,
+                           shader_injection_data.shadow_isfast_seed_offset,
+                           shader_injection_data.shadow_isfast_texture_loaded)
+      : 0.5f;
   if (r16.y != 0) {
     r1.w = lightIndices_g[r3.y].pointLightCount;
     r1.w = min(63, (uint)r1.w);
@@ -1165,6 +1234,14 @@ void main(
         r13.y = dynamicLights_g[r2.w].color.x;
         r13.z = dynamicLights_g[r2.w].color.y;
         r13.w = dynamicLights_g[r2.w].color.z;
+        if (csLocalBudget > 0.0) {
+          csLocalBudget -= 1.0;
+          float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
+                                     dynamicLights_g[r2.w].pos.z);
+          r13.yzw = FalcomApplyLocalContactShadow(r13.yzw, csLightPos, r5.xyz, csLocalParams,
+                                                  csDepthUnpack, csLocalJitter,
+                                                  csDepthTex, samPoint_s);
+        }
         // ── BRDF Diffuse (Hammon) ──
         if (brdf_use_hammon) {
           float3 brdf_hammon_correction = HammonEnergyRatio(brdf_rawNdotL_pt, brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness, float3(1,1,1));
@@ -1281,6 +1358,14 @@ void main(
           r16.x = dynamicLights_g[r2.w].color.x;
           r16.y = dynamicLights_g[r2.w].color.y;
           r16.z = dynamicLights_g[r2.w].color.z;
+          if (csLocalBudget > 0.0) {
+            csLocalBudget -= 1.0;
+            float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
+                                       dynamicLights_g[r2.w].pos.z);
+            r16.xyz = FalcomApplyLocalContactShadow(r16.xyz, csLightPos, r5.xyz, csLocalParams,
+                                                    csDepthUnpack, csLocalJitter,
+                                                    csDepthTex, samPoint_s);
+          }
           // ── BRDF Diffuse (Hammon) ──
           if (brdf_use_hammon) {
             float3 brdf_hammon_correction_sp = HammonEnergyRatio(brdf_rawNdotL_sp, brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness, float3(1,1,1));
@@ -1652,7 +1737,8 @@ void main(
   r0.x = 65.5350037 * r1.x;
   r0.x = (uint)r0.x;
   o2.y = min(0x0000ffff, (uint)r0.x);
-  o0.xyz = r0.yzw;
+  o0.xyz = FalcomApplyShadowTerms(r0.yzw, v1.xy, csIsCharacter > 0.5, samPoint_s,
+                                  microShadowTex, contactShadowTex);
 
   // Probe ambient debug — character pixel path
   if (shader_injection_data.vbgi_cascade_debug > 0.5f) {

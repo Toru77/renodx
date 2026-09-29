@@ -210,7 +210,10 @@ StructuredBuffer<LightParam> dynamicLights_g : register(t11);
 StructuredBuffer<LightIndexData> lightIndices_g : register(t12);
 StructuredBuffer<LightProbeParam> localLightProbes_g : register(t13);
 StructuredBuffer<float4x4> spotShadowMatrices_g : register(t14);
-Texture2D<float4> sssShadowTexture : register(t15);
+// t15 was the char pass's dedicated SSS shadow texture. The raymarch that
+// produced it is gone; the slot is left declared-but-unused so the registers
+// below keep the numbers the game binds them at.
+Texture2D<float4> sssShadowTexture_unused : register(t15);
 Texture2DArray<float4> shadowMaps : register(t16);
 TextureCube<float4> texEnvMap_g : register(t17);
 Texture2DArray<float4> spotShadowMaps : register(t18);
@@ -225,8 +228,17 @@ TextureCube<float4> dynCubeHistPosTex : register(t29);   // temporal history wor
 TextureCube<float4> dynCubeVanillaTex : register(t30);   // vanilla reflection fallback
 Texture2D<float4> dynCubeSSRTex : register(t31);         // blurred SSR (rgb = color, a = confidence)
 Texture2D<float4> dynCubeSSRRawTex : register(t32);      // raw SSR result (debug views)
+Texture2D<float4> microShadowTex : register(t33);        // Micro Shadows term + diagnostics (rgba8_unorm)
+Texture2D<float4> contactShadowTex : register(t34);      // Contact Shadows term + diagnostics (rgba8_unorm)
+// t35/t36 are the local-light march's own inputs: the IS-FAST volume and the
+// scene depth. Deliberately not the game's registers (t24 is the IS-FAST push
+// the addon already makes, t3 is the game's own Texture2D<float> depth) so the
+// shared helper can fix one element type -- see shadows_common.hlsli.
+Texture3D<float2> csIsfastNoise : register(t35);
+Texture2D<float4> csDepthTex : register(t36);
 
 #include "../../shared.h"
+#include "../../shadows/shadows_common.hlsli"
 #include "../../reference/rendering.hlsl"
 #include "../../dyncube/dyncube_sample.hlsli"
 #include "../../dyncube/dyncube_resolve.hlsli"
@@ -401,7 +413,6 @@ void main(
   const bool GTVBAO_bent_normals_enabled = shader_injection_data.gtvbao_bent_normals >= 0.5;
   const bool GTVBAO_debug_blackout = shader_injection_data.gtvbao_debug_blackout >= 0.5;
   const bool GTVBAO_ao_active_for_draw = shader_injection_data.gtvbao_ao_active_for_draw >= 0.5;
-  const bool sss_dedicated_bound = shader_injection_data.sss_dedicated_bound >= 0.5;
   const float GTVBAO_foliage_blend = saturate(shader_injection_data.gtvbao_foliage_ao_blend);
   float3 GTVBAO_sample = ssao_sample;
   if (GTVBAO_bound) {
@@ -420,15 +431,24 @@ void main(
   } else if (GTVBAO_force_neutral_x) {
     ao_sample.x = 1.0;
   }
-  float sss_shadow_sample = saturate(ssao_sample.z);
-  if (sss_dedicated_bound) {
-    sss_shadow_sample = saturate(sssShadowTexture.SampleLevel(samLinear_s, v1.xy, 0).z);
+  // The character pass writes the ENGINE's own screen-space character shadow into
+  // the AO target's .z channel (kai/charlighting/char_0x445A1838: o0.z == r2.y).
+  // This is the only consumer of that channel, and it is what makes the "Vanilla
+  // Character Shadowing" setting do anything.
+  //
+  // Not the retired SSS raymarch: that was driven by the EnvSSS settings and is
+  // gone from every game. This is the vanilla march, gated by char_shadow_mode
+  // alone, with no t15 read and no sss_dedicated_bound second source.
+  float char_shadow_sample = 1.0;
+  if (shader_injection_data.char_shadow_mode >= 0.5f) {
+    char_shadow_sample = saturate(ssao_sample.z);
   }
-  const bool is_foliage_ao_mask_pixel =
-      is_foliage_pixel && (!sss_dedicated_bound || sss_shadow_sample < 0.999);
-  if (GTVBAO_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+  if (GTVBAO_ao_active_for_draw && is_foliage_pixel) {
     ao_sample.x = lerp(1.0, ao_sample.x, GTVBAO_foliage_blend);
   }
+  // Environment pixels write 1.0 into .z, so gating the AO by it here affects
+  // characters only and needs no explicit mask test.
+  ao_sample.y = ao_sample.y * char_shadow_sample;
   r4.xyz = ao_sample;
   uint GTVBAO_debug_mode_ui = (uint)round(max(shader_injection_data.gtvbao_debug_mode, 0.0));
   const bool run_GTVBAO_debug = !GTVBAO_force_neutral_x
@@ -447,21 +467,16 @@ void main(
     }
     float3 ssao_debug_sample = ssao_sample;
     float3 GTVBAO_debug_source = GTVBAO_sample;
-    float sss_shadow_debug = sss_shadow_sample;
     float depth_raw = saturate(r2.z);
     if (GTVBAO_debug_mode_ui <= 9u) {
       ssao_debug_sample = GTVBAODebugLoad4(ssaoTexture, v1.xy).xyz;
       GTVBAO_debug_source = GTVBAO_bound ? GTVBAO_sample : ssao_debug_sample;
-      sss_shadow_debug = saturate(ssao_debug_sample.z);
-      if (shader_injection_data.sss_dedicated_bound >= 0.5) {
-        sss_shadow_debug = saturate(GTVBAODebugLoad4(sssShadowTexture, v1.xy).z);
-      }
       depth_raw = saturate(GTVBAODebugLoad1(depthTexture, v1.xy));
     }
 
     const bool GTVBAO_effective_character_masked = GTVBAO_bound && !is_character_pixel;
     float3 GTVBAO_debug_sample = GTVBAO_effective_character_masked ? GTVBAO_debug_source : ssao_debug_sample;
-    if (GTVBAO_ao_active_for_draw && is_foliage_ao_mask_pixel) {
+    if (GTVBAO_ao_active_for_draw && is_foliage_pixel) {
       GTVBAO_debug_sample.x = lerp(1.0, GTVBAO_debug_sample.x, GTVBAO_foliage_blend);
     }
     float3 ao_debug_sample = is_character_pixel ? ssao_debug_sample : ao_sample;
@@ -509,7 +524,11 @@ void main(
     } else if (GTVBAO_debug_mode_ui == 7u) {
       debug_color = depth_edge.xxx;
     } else if (GTVBAO_debug_mode_ui == 8u) {
-      debug_color = sss_shadow_debug.xxx;
+      // Was the SSS shadow channel. Now shows the Contact Shadow term, which is
+      // what replaced it: white = lit, black = occluded.
+      debug_color = (shader_injection_data.cs_contact_dedicated_bound >= 0.5)
+          ? contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0).xxx
+          : float3(1.0, 1.0, 1.0);
     } else if (GTVBAO_debug_mode_ui == 9u) {
       debug_color = float3(0.0, saturate(ao_sample.y), saturate(ao_sample.z));
     } else if (GTVBAO_debug_mode_ui == 10u) {
@@ -546,11 +565,10 @@ void main(
     } else if (GTVBAO_debug_mode_ui == 18u) {
       debug_color = saturate(ao_debug_sample);
     } else if (GTVBAO_debug_mode_ui == 19u) {
-      float ao_effective = saturate(max(ao_debug_sample.x, ao_debug_sample.y * sss_shadow_sample));
+      float ao_effective = saturate(max(ao_debug_sample.x, ao_debug_sample.y));
       debug_color = ao_effective.xxx;
     } else if (GTVBAO_debug_mode_ui == 20u) {
-      const bool foliage_shadow_gate = !sss_dedicated_bound || sss_shadow_debug < 0.999;
-      const bool foliage_gate_active = GTVBAO_ao_active_for_draw && is_foliage_pixel && foliage_shadow_gate;
+      const bool foliage_gate_active = GTVBAO_ao_active_for_draw && is_foliage_pixel;
       if (!GTVBAO_ao_active_for_draw) {
         debug_color = float3(0.0, 0.0, 1.0);
       } else if (foliage_gate_active) {
@@ -576,7 +594,6 @@ void main(
   }
   r0.w = (uint)r3.z >> 8;
   // mrt0z_raw/is_foliage_pixel are decoded above and reused below.
-  float foliage_saved_shadow = sss_shadow_sample;     // active SSS source (vanilla AO.z policy)
   float3 foliage_debug_ssao = ssao_sample;            // debug: full ssaoTexture sample
   float foliage_debug_mrt0z = r3.z;                   // debug: raw mrtTexture0.z value
   r3.xy = (uint2)r3.xy;
@@ -617,7 +634,10 @@ void main(
       r7.x = r0.x;
       r7.yz = float2(0.00392156886,0.00392156886);
       r8.xyz = r7.xyz * r6.xyz;
-      r3.x = r4.y * sss_shadow_sample;
+      // Was r4.y * sss_shadow_sample. r4.y is the AO .y channel, already gated by
+      // the engine character shadow at the ao_sample site, so this is the same
+      // product and must not multiply by the shadow a second time.
+      r3.x = r4.y;
       r4.yzw = -r7.xyz * r6.xyz + r0.xyz;
       r4.yzw = r3.xxx * r4.yzw + r8.xyz;
       r3.x = (int)r0.w & 4;
@@ -827,7 +847,12 @@ void main(
 
     // Add GTVBAO VBGI to early-return output (bypassing game's SSGI formula)
     r4.yzw = r4.yzw + r24.xyz;
-    o0.xyz = r4.yzw;
+    // Early return BEFORE the sun composite at 1498, and r4.yzw is built from the
+    // character/SSGI terms with no isolable sun contribution. Contact is therefore
+    // not applied here: attaching it to the final colour instead is the bug that put
+    // contact shadows in interiors. Micro still applies.
+    o0.xyz = FalcomApplyShadowTerms(r4.yzw, v1.xy, is_character_pixel, samPoint_s,
+                                    microShadowTex, contactShadowTex);
     o0.w = 1;
     o1.xyzw = r1.xyzw;
     return;
@@ -1027,7 +1052,10 @@ void main(
   float4 chargi_ssgi_saved = r15;
   // Use mrt0z_raw from mrtTexture0 (t1) which already has the character bit
   bool chargi_is_character = ((mrt0z_raw >> 8u) & 1u) != 0u;
-  float chargi_ao_raw = saturate(max(r4.x, r4.y * sss_shadow_sample));
+  // Was max(r4.x, r4.y * sss_shadow_sample). r4.y is the AO's .y channel, already
+  // gated by the engine character shadow above, so the original's multiply by the
+  // shadow sample is now baked in and must not be repeated.
+  float chargi_ao_raw = saturate(max(r4.x, r4.y));
   float chargi_depth_center = max(r2.z, 1e-6);
   // Soft-lighting variant uses a stable shadow kernel (no temporal jitter).
   bool shadow_use_jitter = shader_injection_data.shadow_pcss_jitter_enabled >= 0.5;
@@ -1471,10 +1499,40 @@ void main(
       o0.a = 1.0; o1.xyzw = r1.xyzw; return;
     }
   }
-  r8.xyz = r8.xyz * lightColor_g.xyz + r12.xyz;
+  // Sun contact shadows apply HERE, to the sun diffuse and before r12.xyz (ambient)
+  // is added. See FalcomApplyContactToSun: scaling the final colour instead is what
+  // made contact shadows appear in interiors, where the CSM has already removed the
+  // sun and there is nothing left for them to shadow.
+  r8.xyz = FalcomApplyContactToSun(
+      r8.xyz * lightColor_g.xyz, is_character_pixel,
+      contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0)) + r12.xyz;
   r4.y = min(1, r6.w);
   r6.xyw = float3(1,1,1) + -r8.xyz;
   r6.xyw = r4.yyy * r6.xyw + r8.xyz;
+  // -- Local contact shadows: setup shared by every light loop below --
+  // The budget is per pixel and shared across the loops, so a pixel covered by
+  // many lights pays for a bounded number of marches rather than one per light.
+  // Every value here is loop-invariant; only the counter changes.
+  const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
+  FalcomContactParams csLocalParams;
+  csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
+  csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
+  csLocalParams.bias = max(0.0, shader_injection_data.cs_contact_bias);
+  csLocalParams.sampleCount =
+      max(1.0, floor(shader_injection_data.cs_contact_local_sample_count + 0.5));
+  csLocalParams.strength = saturate(shader_injection_data.cs_contact_local_strength);
+  float csLocalBudget = csLocalOn
+      ? max(0.0, floor(shader_injection_data.cs_contact_local_max_lights + 0.5)) : 0.0;
+  const float2 csDepthUnpack = FalcomDepthUnpackConsts();
+  const float csLocalJitter = shader_injection_data.cs_contact_isfast_enabled > 0.5f
+      ? FalcomSampleISFAST(csIsfastNoise, samPoint_s, uint2(v0.xy),
+                           (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
+                           128.0, 32.0,
+                           shader_injection_data.shadow_isfast_spatial_scale,
+                           shader_injection_data.shadow_isfast_temporal_speed,
+                           shader_injection_data.shadow_isfast_seed_offset,
+                           shader_injection_data.shadow_isfast_texture_loaded)
+      : 0.5f;
   r4.y = 1 + -abs(r7.z);
   r4.y = max(0, r4.y);
   r4.y = r4.y * r10.w;
@@ -1518,6 +1576,13 @@ void main(
         r11.x = dynamicLights_g[lightIdx].color.x;
         r11.y = dynamicLights_g[lightIdx].color.y;
         r11.z = dynamicLights_g[lightIdx].color.z;
+        if (csLocalBudget > 0.0) {
+          csLocalBudget -= 1.0;
+          r11.xyz = FalcomApplyLocalContactShadow(r11.xyz,
+              float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
+                     dynamicLights_g[lightIdx].pos.z),
+              r2.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+        }
         r9.xyz = r11.xyz * r10.www + r9.xyz;
         r10.xyz = r17.xyz * r3.yyy + r10.xyz;
         r11.w = dot(r10.xyz, r10.xyz);
@@ -1618,6 +1683,13 @@ void main(
           r13.y = dynamicLights_g[lightIdx].color.x;
           r13.z = dynamicLights_g[lightIdx].color.y;
           r13.w = dynamicLights_g[lightIdx].color.z;
+          if (csLocalBudget > 0.0) {
+            csLocalBudget -= 1.0;
+            r13.yzw = FalcomApplyLocalContactShadow(r13.yzw,
+                float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
+                       dynamicLights_g[lightIdx].pos.z),
+                r2.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+          }
           r11.xyz = r13.yzw * r10.www + r11.xyz;
           r12.xyz = r17.xyz * r3.yyy + r12.xyz;
           r11.w = dot(r12.xyz, r12.xyz);
@@ -1672,6 +1744,13 @@ void main(
         r10.x = dynamicLights_g[lightIdx].color.x;
         r10.y = dynamicLights_g[lightIdx].color.y;
         r10.z = dynamicLights_g[lightIdx].color.z;
+        if (csLocalBudget > 0.0) {
+          csLocalBudget -= 1.0;
+          r10.xyz = FalcomApplyLocalContactShadow(r10.xyz,
+              float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
+                     dynamicLights_g[lightIdx].pos.z),
+              r2.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+        }
         r10.xyz = r10.xyz * r6.zzz;
         r9.xyz = r10.xyz * r4.zzz + r9.xyz;
       }
@@ -1755,6 +1834,13 @@ void main(
           r10.x = dynamicLights_g[lightIdx].color.x;
           r10.y = dynamicLights_g[lightIdx].color.y;
           r10.z = dynamicLights_g[lightIdx].color.z;
+          if (csLocalBudget > 0.0) {
+            csLocalBudget -= 1.0;
+            r10.xyz = FalcomApplyLocalContactShadow(r10.xyz,
+                float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
+                       dynamicLights_g[lightIdx].pos.z),
+                r2.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+          }
           r10.xyz = r10.xyz * r4.zzz;
           r9.xyz = r10.xyz * r6.www + r9.xyz;
         }
@@ -1787,24 +1873,10 @@ void main(
   r0.y = 1 + -r4.x;
   r4.xyz = r5.xyz * r6.xyz + -r5.xyz;
   r4.xyz = r0.yyy * r4.xyz + r5.xyz;
-  // --- RenoDx SSS Shadow ---
-  if (is_foliage_pixel && foliage_saved_shadow < 0.999) {
-    float sss_shadow = foliage_saved_shadow;
-    // ── CSM gate: skip SSS on pixels already in deep directional shadow ──
-    // r8.w = CSM shadow visibility (0 = fully shadowed, 1 = fully lit)
-    if (shader_injection_data.env_sss_csm_gate > 0.5f) {
-      float csm_gate = saturate(r8.w * 5.0);
-      sss_shadow = lerp(1.0, sss_shadow, csm_gate);
-    }
-    // Brightness rejection: reduce shadow on bright pixels (lamps, emissives)
-    float bright_reject_thresh = shader_injection_data.env_sss_bright_reject_threshold;
-    float bright_reject_fade = max(shader_injection_data.env_sss_bright_reject_fade, 1e-5);
-    float pixel_luma = dot(r4.xyz, float3(0.2126, 0.7152, 0.0722));
-    float bright_mask = smoothstep(bright_reject_thresh, bright_reject_thresh + bright_reject_fade, pixel_luma);
-    sss_shadow = lerp(sss_shadow, 1.0, bright_mask);
-    r4.xyz *= sss_shadow;
-  }
-  // --- End RenoDx SSS Shadow ---
+  // The RenoDx SSS block that used to sit here multiplied r4.xyz by the
+  // raymarched shadow from ssaoTexture.z. That is now the Contact / Micro Shadow
+  // compute term, applied with the environment/character split at the output
+  // site below.
   r0.y = -fogNearDistance_g + -r4.w;
   r0.y = saturate(fogFadeRangeInv_g * r0.y);
   r0.z = -fogHeight_g + r2.y;
@@ -2111,7 +2183,10 @@ void main(
   if (foliage_dbg == 1) {
     r3.xyz = is_foliage_pixel ? float3(0, 1, 0) : r3.xyz * 0.3;
   } else if (foliage_dbg == 2) {
-    r3.xyz = is_foliage_pixel ? foliage_saved_shadow.xxx : r3.xyz * 0.3;
+    r3.xyz = is_foliage_pixel
+        ? ((shader_injection_data.cs_contact_dedicated_bound >= 0.5)
+               ? contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0).xxx : r3.xyz)
+        : r3.xyz * 0.3;
   } else if (foliage_dbg == 3) {
     r3.xyz = is_foliage_pixel ? foliage_debug_ssao : r3.xyz * 0.3;
   } else if (foliage_dbg == 4) {
@@ -2182,7 +2257,8 @@ void main(
     o1.z = r0.y;
     return;
   }
-  o0.xyz = r3.xyz;
+  o0.xyz = FalcomApplyShadowTerms(r3.xyz, v1.xy, is_character_pixel, samPoint_s,
+                                  microShadowTex, contactShadowTex);
   o0.w = 1;
   o1.z = r0.y;
   return;

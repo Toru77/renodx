@@ -85,452 +85,15 @@ SamplerState samLinear_s : register(s1);
 Texture2D<float4> depthTexture : register(t0);
 Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<float4> prevTexture : register(t3);
+Texture2D<float4> microShadowTex : register(t33);      // Micro Shadows term + diagnostics (rgba8_unorm)
+Texture2D<float4> contactShadowTex : register(t34);    // Contact Shadows term + diagnostics (rgba8_unorm)
 
 #include "../../shared.h"
+#include "../../shadows/shadows_common.hlsli"
 #include "../../reference/rendering.hlsl"
 
 // 3Dmigoto declarations
 #define cmp -
-
-static const float CHAR_SHADOW_FAR_DEPTH_VALUE = 0.0;
-
-static float ComputeFoliageSunShadow(float2 uv, float3 normalWS)
-{
-  int sampleCount = max((int)round(shader_injection_data.env_sss_sample_count), 1);
-  int hardShadowSamples = max(sampleCount / 8, 1);
-  int fadeOutSamples = max(sampleCount / 3, 1);
-  if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
-    fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
-  }
-
-  float surfaceThickness = max(shader_injection_data.env_sss_surface_thickness, 1e-5);
-  float shadowContrast = max(shader_injection_data.env_sss_contrast, 0.0);
-  bool useJitter = shader_injection_data.env_sss_jitter_enabled >= 0.5;
-
-  float startDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * uv, 0).x;
-  if (startDepth <= CHAR_SHADOW_FAR_DEPTH_VALUE) {
-    return 1.0;
-  }
-
-  float normalLenSq = dot(normalWS, normalWS);
-  if (normalLenSq <= 1e-8) {
-    return 1.0;
-  }
-  float3 normalDirWS = normalWS * rsqrt(normalLenSq);
-
-  float4 clipPos = float4(uv * float2(2, -2) + float2(-1, 1), startDepth, 1.0);
-  float4 viewPosH;
-  viewPosH.x = dot(clipPos, projInv_g._m00_m10_m20_m30);
-  viewPosH.y = dot(clipPos, projInv_g._m01_m11_m21_m31);
-  viewPosH.z = dot(clipPos, projInv_g._m02_m12_m22_m32);
-  viewPosH.w = dot(clipPos, projInv_g._m03_m13_m23_m33);
-  if (abs(viewPosH.w) <= 1e-6) {
-    return 1.0;
-  }
-  float3 viewPos = viewPosH.xyz / viewPosH.www;
-
-  float4 viewPos4 = float4(viewPos, 1.0);
-  float3 worldPos;
-  worldPos.x = dot(viewPos4, viewInv_g._m00_m10_m20_m30);
-  worldPos.y = dot(viewPos4, viewInv_g._m01_m11_m21_m31);
-  worldPos.z = dot(viewPos4, viewInv_g._m02_m12_m22_m32);
-
-  float foliageHeightMask = 1.0;
-  if (shader_injection_data.env_sss_height_enabled >= 0.5) {
-    // Search downward in screen space to find the ground surface
-    float searchPixels = max(shader_injection_data.env_sss_height_max, 1.0);
-    float2 groundUV = uv + float2(0.0, searchPixels * invVPSize_g.y);
-    groundUV = saturate(groundUV);
-
-    float groundDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * groundUV, 0).x;
-
-    // Reconstruct world position of the ground sample
-    float4 groundClipPos = float4(groundUV * float2(2, -2) + float2(-1, 1), groundDepth, 1.0);
-    float4 groundViewPosH;
-    groundViewPosH.x = dot(groundClipPos, projInv_g._m00_m10_m20_m30);
-    groundViewPosH.y = dot(groundClipPos, projInv_g._m01_m11_m21_m31);
-    groundViewPosH.z = dot(groundClipPos, projInv_g._m02_m12_m22_m32);
-    groundViewPosH.w = dot(groundClipPos, projInv_g._m03_m13_m23_m33);
-    float3 groundViewPos = groundViewPosH.xyz / max(abs(groundViewPosH.w), 1e-6);
-
-    float4 groundViewPos4 = float4(groundViewPos, 1.0);
-    float3 groundWorldPos;
-    groundWorldPos.x = dot(groundViewPos4, viewInv_g._m00_m10_m20_m30);
-    groundWorldPos.y = dot(groundViewPos4, viewInv_g._m01_m11_m21_m31);
-    groundWorldPos.z = dot(groundViewPos4, viewInv_g._m02_m12_m22_m32);
-
-    // Height above the ground sample
-    float heightAboveGround = abs(worldPos.y - groundWorldPos.y);
-
-    float heightThreshold = max(shader_injection_data.env_sss_height_min, 0.0);
-    float heightFade = max(shader_injection_data.env_sss_height_fade, 1e-5);
-    foliageHeightMask = 1.0 - smoothstep(heightThreshold, heightThreshold + heightFade, heightAboveGround);
-
-    if (foliageHeightMask <= 1e-4) {
-      return 1.0;
-    }
-  }
-
-  float lightDirLenSq = dot(lightDirection_g.xyz, lightDirection_g.xyz);
-  if (lightDirLenSq <= 1e-8) {
-    return 1.0;
-  }
-  float3 pixelToLightWS = -lightDirection_g.xyz * rsqrt(lightDirLenSq);
-
-  // Vertical rejection: skip surfaces whose normal is too horizontal (walls, pillars)
-  float verticalReject = shader_injection_data.env_sss_vertical_reject;
-  if (verticalReject > 0.0) {
-    float uprightness = abs(normalDirWS.y);
-    float verticalMask = smoothstep(verticalReject - 0.1, verticalReject + 0.1, uprightness);
-    if (verticalMask <= 1e-4) {
-      return 1.0;
-    }
-    foliageHeightMask *= verticalMask;
-  }
-
-  float ndotl = saturate(abs(dot(normalDirWS, pixelToLightWS)));
-  if (ndotl <= 0.001) {
-    return 1.0;
-  }
-
-  float jitter = 0.0;
-  if (useJitter) {
-    float2 pixelCoord = floor(uv * vpSize_g.xy);
-    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
-    jitter = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
-  }
-
-  float3 viewForwardWS = float3(viewInv_g._m20, viewInv_g._m21, viewInv_g._m22);
-  viewForwardWS = viewForwardWS * rsqrt(max(dot(viewForwardWS, viewForwardWS), 1e-8));
-  float normalViewFactor = saturate(abs(dot(normalDirWS, viewForwardWS)));
-  float surfaceStartBias = normalViewFactor * -0.00249999994 + 0.00749999983;
-  float rayStepLength = normalViewFactor * 0.00150000001 + 0.000500000024;
-  float3 rayStepWS = pixelToLightWS * rayStepLength;
-  float3 rayStartWS = worldPos + normalDirWS * surfaceStartBias;
-
-  float depthThickness = max(abs(CHAR_SHADOW_FAR_DEPTH_VALUE - startDepth) * surfaceThickness, 1e-5);
-  float hardShadow = 1.0;
-  float4 shadowValue = 1.0;
-  int validSamples = 0;
-
-  [loop]
-  for (int i = 0; i < sampleCount; ++i) {
-    float sampleIndex = (float)(i + 1) + jitter;
-    float3 samplePosWS = rayStartWS + rayStepWS * sampleIndex;
-    float4 samplePosWS4 = float4(samplePosWS, 1.0);
-
-    float4 sampleClip;
-    sampleClip.x = dot(samplePosWS4, viewProj_g._m00_m10_m20_m30);
-    sampleClip.y = dot(samplePosWS4, viewProj_g._m01_m11_m21_m31);
-    sampleClip.z = dot(samplePosWS4, viewProj_g._m02_m12_m22_m32);
-    sampleClip.w = dot(samplePosWS4, viewProj_g._m03_m13_m23_m33);
-    if (abs(sampleClip.w) <= 1e-6) {
-      break;
-    }
-
-    float3 sampleNdc = sampleClip.xyz / sampleClip.www;
-    float2 sampleUV = sampleNdc.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
-    if (sampleUV.x <= invVPSize_g.x || sampleUV.y <= invVPSize_g.y ||
-        sampleUV.x >= (1.0 - invVPSize_g.x) || sampleUV.y >= (1.0 - invVPSize_g.y)) {
-      break;
-    }
-
-    validSamples++;
-
-    float sampleDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * sampleUV, 0).x;
-    float shadowSample = 1.0;
-    float depthDelta = sampleDepth - sampleNdc.z;
-    if (depthDelta > 0) {
-      float depthMatch = abs(depthDelta / depthThickness - 1.0);
-      shadowSample = saturate(depthMatch * shadowContrast + (1.0 - shadowContrast));
-    }
-
-    if (i < hardShadowSamples) {
-      hardShadow = min(hardShadow, shadowSample);
-    } else {
-      if (i >= (sampleCount - fadeOutSamples)) {
-        float fadeOut = (float)(i + 1 - (sampleCount - fadeOutSamples)) / (float)(fadeOutSamples + 1) * 0.75;
-        shadowSample = saturate(shadowSample + fadeOut);
-      }
-      int bucket = i & 3;
-      if (bucket == 0) shadowValue.x = min(shadowValue.x, shadowSample);
-      if (bucket == 1) shadowValue.y = min(shadowValue.y, shadowSample);
-      if (bucket == 2) shadowValue.z = min(shadowValue.z, shadowSample);
-      if (bucket == 3) shadowValue.w = min(shadowValue.w, shadowSample);
-    }
-  }
-
-  float result = dot(shadowValue, 0.25);
-  result = min(result, hardShadow);
-
-  // Max darkening floor: prevent shadow from going darker than this value
-  float maxDarkening = saturate(shader_injection_data.env_sss_max_darkening);
-  result = max(result, 1.0 - maxDarkening);
-
-  float validSampleFade = saturate((float)validSamples / (float)sampleCount);
-  validSampleFade = validSampleFade * validSampleFade;
-  float directionalStrength = ndotl * validSampleFade * foliageHeightMask;
-  return lerp(1.0, result, directionalStrength);
-}
-
-static float ComputeCharacterSunShadow(float2 uv, float3 normalWS)
-{
-  int sampleCount = max((int)round(shader_injection_data.char_shadow_sample_count), 1);
-  int hardShadowSamples = clamp((int)round(shader_injection_data.char_shadow_hard_shadow_samples), 0, sampleCount);
-  int fadeOutSamples = clamp((int)round(shader_injection_data.char_shadow_fade_out_samples), 0, sampleCount);
-  if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
-    fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
-  }
-
-  float surfaceThickness = max(shader_injection_data.char_shadow_surface_thickness, 1e-5);
-  float shadowContrast = max(shader_injection_data.char_shadow_contrast, 0.0);
-  float fadeStart = min(shader_injection_data.char_shadow_light_screen_fade_start, shader_injection_data.char_shadow_light_screen_fade_end);
-  float fadeEnd = max(shader_injection_data.char_shadow_light_screen_fade_start, shader_injection_data.char_shadow_light_screen_fade_end);
-  float minOccluderDepthScale = max(shader_injection_data.char_shadow_min_occluder_depth_scale, 0.0);
-  bool useJitter = shader_injection_data.char_shadow_jitter_enabled >= 0.5;
-
-  float startDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * uv, 0).x;
-  if (startDepth <= CHAR_SHADOW_FAR_DEPTH_VALUE) {
-    return 1.0;
-  }
-
-  float normalLenSq = dot(normalWS, normalWS);
-  if (normalLenSq <= 1e-8) {
-    return 1.0;
-  }
-  float3 normalDirWS = normalWS * rsqrt(normalLenSq);
-
-  float4 clipPos = float4(uv * float2(2, -2) + float2(-1, 1), startDepth, 1.0);
-  float4 viewPosH;
-  viewPosH.x = dot(clipPos, projInv_g._m00_m10_m20_m30);
-  viewPosH.y = dot(clipPos, projInv_g._m01_m11_m21_m31);
-  viewPosH.z = dot(clipPos, projInv_g._m02_m12_m22_m32);
-  viewPosH.w = dot(clipPos, projInv_g._m03_m13_m23_m33);
-  if (abs(viewPosH.w) <= 1e-6) {
-    return 1.0;
-  }
-  float3 viewPos = viewPosH.xyz / viewPosH.www;
-
-  float4 viewPos4 = float4(viewPos, 1.0);
-  float3 worldPos;
-  worldPos.x = dot(viewPos4, viewInv_g._m00_m10_m20_m30);
-  worldPos.y = dot(viewPos4, viewInv_g._m01_m11_m21_m31);
-  worldPos.z = dot(viewPos4, viewInv_g._m02_m12_m22_m32);
-
-  float lightDirLenSq = dot(lightDirection_g.xyz, lightDirection_g.xyz);
-  if (lightDirLenSq <= 1e-8) {
-    return 1.0;
-  }
-  float3 pixelToLightWS = -lightDirection_g.xyz * rsqrt(lightDirLenSq);
-  float ndotl = saturate(abs(dot(normalDirWS, pixelToLightWS)));
-  if (ndotl <= 0.001) {
-    return 1.0;
-  }
-
-  float2 lightViewXY;
-  lightViewXY.x = dot(lightDirection_g.xyz, view_g._m00_m10_m20);
-  lightViewXY.y = dot(lightDirection_g.xyz, view_g._m01_m11_m21);
-  float lightLenSq = dot(lightViewXY, lightViewXY);
-  if (lightLenSq <= 1e-6) {
-    return 1.0;
-  }
-
-  float lightScreenLen = sqrt(lightLenSq);
-  float lightScreenFade = saturate((lightScreenLen - fadeStart) / max(fadeEnd - fadeStart, 1e-5));
-  if (lightScreenFade <= 0.001) {
-    return 1.0;
-  }
-
-  float jitter = 0.0;
-  if (useJitter) {
-    float2 pixelCoord = floor(uv * vpSize_g.xy);
-    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
-    jitter = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
-  }
-
-  float3 viewForwardWS = float3(viewInv_g._m20, viewInv_g._m21, viewInv_g._m22);
-  viewForwardWS = viewForwardWS * rsqrt(max(dot(viewForwardWS, viewForwardWS), 1e-8));
-  float normalViewFactor = saturate(abs(dot(normalDirWS, viewForwardWS)));
-  float surfaceStartBias = normalViewFactor * -0.00249999994 + 0.00749999983;
-  float rayStepLength = normalViewFactor * 0.00150000001 + 0.000500000024;
-  float3 rayStepWS = pixelToLightWS * rayStepLength;
-  float3 rayStartWS = worldPos + normalDirWS * surfaceStartBias;
-
-  float depthThickness = max(abs(CHAR_SHADOW_FAR_DEPTH_VALUE - startDepth) * surfaceThickness, 1e-5);
-  float hardShadow = 1.0;
-  float4 shadowValue = 1.0;
-  int validSamples = 0;
-
-  [loop]
-  for (int i = 0; i < sampleCount; ++i) {
-    float sampleIndex = (float)(i + 1) + jitter;
-    float3 samplePosWS = rayStartWS + rayStepWS * sampleIndex;
-    float4 samplePosWS4 = float4(samplePosWS, 1.0);
-
-    float4 sampleClip;
-    sampleClip.x = dot(samplePosWS4, viewProj_g._m00_m10_m20_m30);
-    sampleClip.y = dot(samplePosWS4, viewProj_g._m01_m11_m21_m31);
-    sampleClip.z = dot(samplePosWS4, viewProj_g._m02_m12_m22_m32);
-    sampleClip.w = dot(samplePosWS4, viewProj_g._m03_m13_m23_m33);
-    if (abs(sampleClip.w) <= 1e-6) {
-      break;
-    }
-
-    float3 sampleNdc = sampleClip.xyz / sampleClip.www;
-    float2 sampleUV = sampleNdc.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
-    if (sampleUV.x <= invVPSize_g.x || sampleUV.y <= invVPSize_g.y ||
-        sampleUV.x >= (1.0 - invVPSize_g.x) || sampleUV.y >= (1.0 - invVPSize_g.y)) {
-      break;
-    }
-
-    validSamples++;
-
-    float sampleDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * sampleUV, 0).x;
-    float shadowSample = 1.0;
-    float depthDelta = sampleDepth - sampleNdc.z;
-    if (depthDelta > (depthThickness * minOccluderDepthScale)) {
-      float depthMatch = abs(depthDelta / depthThickness - 1.0);
-      shadowSample = saturate(depthMatch * shadowContrast + (1.0 - shadowContrast));
-    }
-
-    if (i < hardShadowSamples) {
-      hardShadow = min(hardShadow, shadowSample);
-    } else {
-      if (i >= (sampleCount - fadeOutSamples)) {
-        float fadeOut = (float)(i + 1 - (sampleCount - fadeOutSamples)) / (float)(fadeOutSamples + 1) * 0.75;
-        shadowSample = saturate(shadowSample + fadeOut);
-      }
-      int bucket = i & 3;
-      if (bucket == 0) shadowValue.x = min(shadowValue.x, shadowSample);
-      if (bucket == 1) shadowValue.y = min(shadowValue.y, shadowSample);
-      if (bucket == 2) shadowValue.z = min(shadowValue.z, shadowSample);
-      if (bucket == 3) shadowValue.w = min(shadowValue.w, shadowSample);
-    }
-  }
-
-  float result = dot(shadowValue, 0.25);
-  result = min(result, hardShadow);
-  float validSampleFade = saturate((float)validSamples / (float)sampleCount);
-  validSampleFade = validSampleFade * validSampleFade;
-  float directionalStrength = lightScreenFade * ndotl * validSampleFade;
-  return lerp(1.0, result, directionalStrength);
-}
-
-// ── Camera-space Bend_SSS ray-march (matches Sora's ComputeCharacterCameraShadow) ──
-static float ComputeKaiCameraShadow(float2 uv, float3 normalWS)
-{
-  int sampleCount = max((int)round(shader_injection_data.char_shadow_sample_count), 1);
-  int hardShadowSamples = clamp((int)round(shader_injection_data.char_shadow_hard_shadow_samples), 0, sampleCount);
-  int fadeOutSamples = clamp((int)round(shader_injection_data.char_shadow_fade_out_samples), 0, sampleCount);
-  if ((hardShadowSamples + fadeOutSamples) > sampleCount) {
-    fadeOutSamples = max(sampleCount - hardShadowSamples, 0);
-  }
-
-  float surfaceThickness = max(shader_injection_data.char_shadow_surface_thickness, 1e-5);
-  float shadowContrast = max(shader_injection_data.char_shadow_contrast, 0.0);
-  float minOccluderDepthScale = max(shader_injection_data.char_shadow_min_occluder_depth_scale, 0.0);
-  bool useJitter = shader_injection_data.char_shadow_jitter_enabled >= 0.5;
-
-  float startDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * uv, 0).x;
-  if (startDepth <= CHAR_SHADOW_FAR_DEPTH_VALUE) return 1.0;
-
-  float normalLenSq = dot(normalWS, normalWS);
-  if (normalLenSq <= 1e-8) return 1.0;
-  float3 normalDirWS = normalWS * rsqrt(normalLenSq);
-
-  float4 clipPos = float4(uv * float2(2, -2) + float2(-1, 1), startDepth, 1.0);
-  float4 viewPosH;
-  viewPosH.x = dot(clipPos, projInv_g._m00_m10_m20_m30);
-  viewPosH.y = dot(clipPos, projInv_g._m01_m11_m21_m31);
-  viewPosH.z = dot(clipPos, projInv_g._m02_m12_m22_m32);
-  viewPosH.w = dot(clipPos, projInv_g._m03_m13_m23_m33);
-  if (abs(viewPosH.w) <= 1e-6) return 1.0;
-  float3 viewPos = viewPosH.xyz / viewPosH.www;
-
-  float4 viewPos4 = float4(viewPos, 1.0);
-  float3 worldPos;
-  worldPos.x = dot(viewPos4, viewInv_g._m00_m10_m20_m30);
-  worldPos.y = dot(viewPos4, viewInv_g._m01_m11_m21_m31);
-  worldPos.z = dot(viewPos4, viewInv_g._m02_m12_m22_m32);
-
-  float rayDirLenSq = dot(rayMarchShadowDir_g.xyz, rayMarchShadowDir_g.xyz);
-  if (rayDirLenSq <= 1e-8) return 1.0;
-  // rayMarchShadowDir_g is already the ray-march direction — use directly, no negation
-  float3 pixelToLightWS = rayMarchShadowDir_g.xyz * rsqrt(rayDirLenSq);
-  float ndotl = saturate(abs(dot(normalDirWS, pixelToLightWS)));
-  if (ndotl <= 0.001) return 1.0;
-
-  float jitter = 0.0;
-  if (useJitter) {
-    float2 pixelCoord = floor(uv * vpSize_g.xy);
-    uint frameIndex = (uint)max(sceneTime_g * 60.0, 0.0);
-    jitter = renodx::rendering::InterleavedGradientNoiseTemporal(pixelCoord, frameIndex);
-  }
-
-  float3 viewForwardWS = float3(viewInv_g._m20, viewInv_g._m21, viewInv_g._m22);
-  viewForwardWS = viewForwardWS * rsqrt(max(dot(viewForwardWS, viewForwardWS), 1e-8));
-  float normalViewFactor = saturate(abs(dot(normalDirWS, viewForwardWS)));
-  float surfaceStartBias = normalViewFactor * -0.00249999994 + 0.00749999983;
-  float rayStepLength = normalViewFactor * 0.00150000001 + 0.000500000024;
-  float3 rayStepWS = pixelToLightWS * rayStepLength;
-  float3 rayStartWS = worldPos + normalDirWS * surfaceStartBias;
-
-  float depthThickness = max(abs(CHAR_SHADOW_FAR_DEPTH_VALUE - startDepth) * surfaceThickness, 1e-5);
-  float hardShadow = 1.0;
-  float4 shadowValue = 1.0;
-  int validSamples = 0;
-
-  [loop]
-  for (int i = 0; i < sampleCount; ++i) {
-    float sampleIndex = (float)(i + 1) + jitter;
-    float3 samplePosWS = rayStartWS + rayStepWS * sampleIndex;
-    float4 samplePosWS4 = float4(samplePosWS, 1.0);
-
-    float4 sampleClip;
-    sampleClip.x = dot(samplePosWS4, viewProj_g._m00_m10_m20_m30);
-    sampleClip.y = dot(samplePosWS4, viewProj_g._m01_m11_m21_m31);
-    sampleClip.z = dot(samplePosWS4, viewProj_g._m02_m12_m22_m32);
-    sampleClip.w = dot(samplePosWS4, viewProj_g._m03_m13_m23_m33);
-    if (abs(sampleClip.w) <= 1e-6) break;
-
-    float3 sampleNdc = sampleClip.xyz / sampleClip.www;
-    float2 sampleUV = sampleNdc.xy * float2(0.5, -0.5) + float2(0.5, 0.5);
-    if (sampleUV.x <= invVPSize_g.x || sampleUV.y <= invVPSize_g.y ||
-        sampleUV.x >= (1.0 - invVPSize_g.x) || sampleUV.y >= (1.0 - invVPSize_g.y)) break;
-
-    validSamples++;
-
-    float sampleDepth = depthTexture.SampleLevel(samPoint_s, resolutionScaling_g.xy * sampleUV, 0).x;
-    float shadowSample = 1.0;
-    float depthDelta = sampleDepth - sampleNdc.z;
-    if (depthDelta > (depthThickness * minOccluderDepthScale)) {
-      float depthMatch = abs(depthDelta / depthThickness - 1.0);
-      shadowSample = saturate(depthMatch * shadowContrast + (1.0 - shadowContrast));
-    }
-
-    if (i < hardShadowSamples) {
-      hardShadow = min(hardShadow, shadowSample);
-    } else {
-      if (i >= (sampleCount - fadeOutSamples)) {
-        float fadeOut = (float)(i + 1 - (sampleCount - fadeOutSamples)) / (float)(fadeOutSamples + 1) * 0.75;
-        shadowSample = saturate(shadowSample + fadeOut);
-      }
-      int bucket = i & 3;
-      if (bucket == 0) shadowValue.x = min(shadowValue.x, shadowSample);
-      if (bucket == 1) shadowValue.y = min(shadowValue.y, shadowSample);
-      if (bucket == 2) shadowValue.z = min(shadowValue.z, shadowSample);
-      if (bucket == 3) shadowValue.w = min(shadowValue.w, shadowSample);
-    }
-  }
-
-  float result = dot(shadowValue, 0.25);
-  result = min(result, hardShadow);
-
-  float validSampleFade = saturate((float)validSamples / (float)sampleCount);
-  validSampleFade = validSampleFade * validSampleFade;
-  float directionalStrength = ndotl * validSampleFade;
-  return lerp(1.0, result, directionalStrength);
-}
 
 
 void main(
@@ -622,12 +185,9 @@ void main(
       r4.z = (int)r4.z + 1;
     }
     r1.z = 0.100000001 * r3.w;
-    int charShadowMode = clamp((int)round(shader_injection_data.char_shadow_mode), 0, 2);
-    int charShadowType = clamp((int)round(shader_injection_data.char_shadow_type), 0, 2);
-    float cameraStrength = saturate(shader_injection_data.char_shadow_camera_strength);
-    float worldStrength = saturate(shader_injection_data.char_shadow_world_strength);
-    float camShadowVal = 1.0;
-    float worldShadowVal = 1.0;
+    // 0 = off, 1 = the engine's own camera-facing march. Mode 2 (the deleted
+    // Bend_SSS ray-march) is gone, so anything other than 1 takes the off path.
+    int charShadowMode = (shader_injection_data.char_shadow_mode >= 0.5f) ? 1 : 0;
 
     if (charShadowMode == 1) {
       // Vanilla: game's native 10-step ray-march camera shadow
@@ -666,26 +226,12 @@ void main(
       }
       r1.x = 1 + -r2.w;
       r1.x = max(0, r1.x);
-    } else if (charShadowMode == 2) {
-      // Bend_SSS: use Sora-style algorithms, respecting char_shadow_type
-      if (charShadowType == 0 || charShadowType == 2) {
-        camShadowVal = ComputeKaiCameraShadow(v1.zw, r1.xyw);
-      }
-      if (charShadowType == 1 || charShadowType == 2) {
-        worldShadowVal = ComputeCharacterSunShadow(v1.zw, r1.xyw);
-      }
-
-      camShadowVal = lerp(1.0, camShadowVal, cameraStrength);
-      worldShadowVal = lerp(1.0, worldShadowVal, worldStrength);
-
-      if (charShadowType == 0) {
-        r1.x = camShadowVal;
-      } else if (charShadowType == 1) {
-        r1.x = worldShadowVal;
-      } else {
-        r1.x = camShadowVal * worldShadowVal;
-      }
     } else {
+      // Off, and the retired Bend_SSS mode. The screen-space shadow raymarch that
+      // used to run here (camera and world variants) is replaced by the Contact /
+      // Micro Shadow compute passes, whose terms are applied at the output site
+      // below with the character/environment split. Kai's lighting shader no
+      // longer reads the SSS channel this pass used to write.
       r1.x = 1;
     }
 
@@ -698,31 +244,10 @@ void main(
     r2.y = r1.y * r1.w + r1.x;
   } else {
     r1.z = 0;
-    // Detect SSS target mask by vanilla mrtTexture0.z values (2303=0x8FF, 3327=0xCFF)
-    bool is_foliage = (mrt0_z_class == 2303u || mrt0_z_class == 3327u);
-    if (is_foliage && shader_injection_data.env_sss_enabled >= 0.5) {
-      // Decode normal from mrtTexture0.xy (spherical encoding)
-      float2 enc = (float2)((uint2)r1.xy) * float2(3.05180438e-05, 3.05180438e-05) + float2(-1, -1);
-      float angle = 3.14159274 * enc.x;
-      float sn, cs;
-      sincos(angle, sn, cs);
-      float xy_len = sqrt(max(1.0 - enc.y * enc.y, 0.0));
-      float3 foliageNormal = float3(cs * xy_len, sn * xy_len, enc.y);
-
-      float foliageShadow = ComputeFoliageSunShadow(v1.zw, foliageNormal);
-      float foliageShadowStr = saturate(shader_injection_data.env_sss_strength);
-      foliageShadow = lerp(1.0, foliageShadow, foliageShadowStr);
-
-      // Edge fade to avoid artifacts at screen borders (same as character)
-      float2 edgeDist = float2(0.5, 0.5) - v1.zw;
-      float edgeFade = max(abs(edgeDist.x), abs(edgeDist.y));
-      edgeFade = max(edgeFade - 0.449999988, 0.0);
-      edgeFade = min(edgeFade * 20.0, 1.0);
-      float shadowFade = 1.0 - foliageShadow;
-      r2.y = edgeFade * shadowFade + foliageShadow;
-    } else {
-      r2.y = 1;
-    }
+    // The Env/foliage SSS raymarch that used to run here is replaced by the same
+    // compute terms, so the shadow channel this pass handed to the lighting
+    // shader is no longer written.
+    r2.y = 1;
   }
   r2.x = 1 + -r1.z;
   r0.xy = v1.zw * float2(2,-2) + float2(-1,1);
@@ -743,22 +268,35 @@ void main(
   r0.xyz = prevTexture.SampleLevel(samLinear_s, r0.xy, 0).xyz;
   r2.z = 1;
   r1.xyz = r2.zxy + -r0.xyz;
-  o0.xyz = r1.xyz * float3(0.25,0.25,1) + r0.xyz;
+  // The character pass output is the character AO/history blend, not a sun-lit
+  // colour: there is no lightColor_g multiply and no ambient add to separate, so
+  // contact has no sun term to attach to here. Micro still applies -- it is an
+  // AO-driven aperture term and belongs on the resolved colour. This is also the
+  // pass that writes the ENGINE's character shadow into the AO target's .z, which
+  // the lighting shader's "Vanilla Character Shadowing" toggle consumes.
+  o0.xyz = FalcomApplyShadowTerms(r1.xyz * float3(0.25,0.25,1) + r0.xyz, v1.zw,
+                                  ((mrt0_z_class >> 8u) & 1u) != 0u, samPoint_s,
+                                  microShadowTex, contactShadowTex);
   o0.w = 1;
 
-  // --- SSS Debug in char shader ---
+  // --- Foliage / character mask debug in char shader ---
   int foliage_dbg_char = (int)shader_injection_data.foliage_debug_mode;
   bool dbg_is_foliage = (mrt0_z_class == 2303u || mrt0_z_class == 3327u);
   if (foliage_dbg_char == 1) {
-    // SSS mask: green = target, red dim = character, black = other
+    // Mask: green = foliage, red dim = character, black = other
     bool dbg_is_char = (((mrt0_z_class >> 8u) & 1u) != 0u);
     o0.xyz = dbg_is_foliage ? float3(0, 1, 0)
            : dbg_is_char    ? float3(0.3, 0, 0)
            :                  float3(0, 0, 0);
     o0.w = 1;
   } else if (foliage_dbg_char == 2) {
-    // Shadow channel value on SSS target (grayscale), dim on others
-    o0.xyz = dbg_is_foliage ? r2.yyy : float3(0.1, 0.1, 0.1);
+    // Was the SSS shadow channel. Now shows the Contact Shadow term, which is
+    // what replaced it: white = lit, black = occluded.
+    o0.xyz = dbg_is_foliage
+        ? ((shader_injection_data.cs_contact_dedicated_bound >= 0.5)
+               ? contactShadowTex.SampleLevel(samPoint_s, v1.zw, 0).xxx
+               : float3(1.0, 1.0, 1.0))
+        : float3(0.1, 0.1, 0.1);
     o0.w = 1;
   } else if (foliage_dbg_char == 6) {
     // Vanilla value detect (same as lighting debug)

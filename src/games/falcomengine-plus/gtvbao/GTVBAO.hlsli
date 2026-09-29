@@ -823,7 +823,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                                 // G-buffer never wrote: a zero normal would make
                                 // NsDotL zero and silently drop this sample's GI.
                                 float3 decoded = DecodeMrtNormalAsIs((uint2)mrtTc);
-                                if (GTVBAO_NormalValid(decoded))
+                                if (FalcomNormalValid(decoded))
                                     sampleNormal = GTVBAO_TuneNormal(
                                         TransformNormalToView(decoded, GTVBAO_gi_normal_transform_mode),
                                         GTVBAO_gi_normal_influence,
@@ -1165,7 +1165,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     } else if (dbgMode >= 22 && dbgMode <= 29) {
         // ── MRT normal / horizon diagnostics (22-29) ──
         // These run inside the main pass on purpose: they use the SAME
-        // mrtNormalTexture binding, the SAME GTVBAO_DecodeMrtNormalPacked and
+        // mrtNormalTexture binding, the SAME DecodeFalcomMrtNormal and
         // the SAME TransformNormalToView the AO actually uses, so what is shown
         // is the ground truth rather than a reimplementation that can drift.
         //
@@ -1181,8 +1181,8 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         int2 mrtTcDbg = GTVBAO_MrtTexel((float2(pixCoord) + 0.5) * (float2(g_mrtW, g_mrtH) / max(float2(g_workDims), 1.0.xx)),
                                         float2(g_mrtW, g_mrtH));
         uint4 rawDbg = mrtNormalTexture.Load(int3(mrtTcDbg, 0));
-        float3 decodedDbg = GTVBAO_DecodeMrtNormalPacked(rawDbg.xy);
-        bool  texelWrittenDbg = GTVBAO_NormalValid(decodedDbg);
+        float3 decodedDbg = DecodeFalcomMrtNormal(rawDbg.xy);
+        bool  texelWrittenDbg = FalcomNormalValid(decodedDbg);
         float3 viewNDbg = texelWrittenDbg ? TransformNormalToView(decodedDbg, GTVBAO_normal_transform_mode) : float3(0, 0, 0);
 
         if (dbgMode == 22) {

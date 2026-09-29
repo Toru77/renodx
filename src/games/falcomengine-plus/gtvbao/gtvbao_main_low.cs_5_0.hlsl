@@ -118,7 +118,7 @@ float ComputeDepthEdgeMetric(uint2 pix, GTAOConstants consts)
 
 float3 DecodeMrtNormalAsIs(uint2 texel)
 {
-  return GTVBAO_DecodeMrtNormalPacked(g_srcMrtNormal.Load(int3(texel, 0)).xy);
+  return DecodeFalcomMrtNormal(g_srcMrtNormal.Load(int3(texel, 0)).xy);
 }
 
 float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
@@ -173,7 +173,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
                                 float2(mw, mh));
 
   float3 decoded = DecodeMrtNormalAsIs((uint2)mrt_tc);
-  if (!GTVBAO_NormalValid(decoded)) return selected;
+  if (!FalcomNormalValid(decoded)) return selected;
 
   // Shaping lives in GTVBAO_TuneNormal so the GI per-sample path applies the
   // identical MRT normal tuning.
@@ -200,7 +200,7 @@ float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants con
   if (GTVBAO_normal_darkening_mode < 0.5)
     final_blend *= saturate(GTVBAO_normal_max_darkening);
 
-  return SafeNormalize3(lerp(depth_fallback, tuned, final_blend), depth_fallback);
+  return FalcomSafeNormalize3(lerp(depth_fallback, tuned, final_blend), depth_fallback);
 }
 
 [numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]

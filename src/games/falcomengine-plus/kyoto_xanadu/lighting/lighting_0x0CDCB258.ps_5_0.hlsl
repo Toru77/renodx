@@ -185,8 +185,16 @@ Texture2DArray<float4> spotShadowMaps : register(t24);
 Texture2D<float4> texMirror_g : register(t26);
 Texture2D<uint4> gtvbaoTexture : register(t22);  // GTVBAO AO (r32_uint, packed 0-255)
 Texture2D<float4> vbgiTexture : register(t23);   // VBGI indirect diffuse (R16G16B16A16)
+Texture2D<float4> microShadowTex : register(t33); // Micro Shadows term + diagnostics (rgba8_unorm)
+Texture2D<float4> contactShadowTex : register(t34); // Contact Shadows term + diagnostics (rgba8_unorm)
+// t35/t36 are the local-light march's own inputs: the IS-FAST volume and the
+// scene depth. Deliberately not the game's own registers, so the shared helper
+// can fix one element type -- see shadows_common.hlsli.
+Texture3D<float2> csIsfastNoise : register(t35);
+Texture2D<float4> csDepthTex : register(t36);
 
 #include "../../shared.h"
+#include "../../shadows/shadows_common.hlsli"
 
 
 // 3Dmigoto declarations
@@ -214,6 +222,14 @@ void main(
   r0.xy = (int2)r0.xy;
   r0.zw = float2(0,0);
   r0.xyzw = mrtTexture0.Load(r0.xyz).xyzw;
+  // Kyoto had no character-mask decode of its own, so this is the Kai-family
+  // convention (bit 8 of the flag word set == character) applied to the same
+  // G-buffer word. It is the one per-game assumption in this migration that is not
+  // corroborated by another shader in this repo, which is why the Contact Shadows
+  // debug view has a "Character Mask" mode: an all-white or all-black result
+  // means the bit is wrong, and that is visible immediately rather than being
+  // mistaken for a tuning problem.
+  const bool csIsCharacter = (((uint)r0.z >> 8u) & 1u) != 0u;
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
   r1.xy = fDest.xy;
   r1.xy = v1.xy * r1.xy;
@@ -871,6 +887,30 @@ void main(
   r0.x = exp2(r0.x);
   r0.x = min(1, r0.x);
   r7.xyz = r9.xyz * r0.xxx + r8.xyz;
+  // -- Local contact shadows: setup shared by every light loop below --
+  // The budget is per pixel and shared across the loops, so a pixel covered by
+  // many lights pays for a bounded number of marches rather than one per light.
+  // Every value here is loop-invariant; only the counter changes.
+  const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
+  FalcomContactParams csLocalParams;
+  csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
+  csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
+  csLocalParams.bias = max(0.0, shader_injection_data.cs_contact_bias);
+  csLocalParams.sampleCount =
+      max(1.0, floor(shader_injection_data.cs_contact_local_sample_count + 0.5));
+  csLocalParams.strength = saturate(shader_injection_data.cs_contact_local_strength);
+  float csLocalBudget = csLocalOn
+      ? max(0.0, floor(shader_injection_data.cs_contact_local_max_lights + 0.5)) : 0.0;
+  const float2 csDepthUnpack = FalcomDepthUnpackConsts();
+  const float csLocalJitter = shader_injection_data.cs_contact_isfast_enabled > 0.5f
+      ? FalcomSampleISFAST(csIsfastNoise, samPoint_s, uint2(v0.xy),
+                           (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
+                           128.0, 32.0,
+                           shader_injection_data.shadow_isfast_spatial_scale,
+                           shader_injection_data.shadow_isfast_temporal_speed,
+                           shader_injection_data.shadow_isfast_seed_offset,
+                           shader_injection_data.shadow_isfast_texture_loaded)
+      : 0.5f;
   if (r16.y != 0) {
     r0.xz = lightTileWidthInv_g * v0.xy;
     r1.x = lightTileDepthInv_g * -r3.w;
@@ -917,6 +957,13 @@ void main(
         r12.y = dynamicLights_g[r1.w].color.x;
         r12.z = dynamicLights_g[r1.w].color.y;
         r12.w = dynamicLights_g[r1.w].color.z;
+        if (csLocalBudget > 0.0) {
+          csLocalBudget -= 1.0;
+          r12.yzw = FalcomApplyLocalContactShadow(r12.yzw,
+              float3(dynamicLights_g[r1.w].pos.x, dynamicLights_g[r1.w].pos.y,
+                     dynamicLights_g[r1.w].pos.z),
+              r4.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+        }
         r9.xyz = r12.yzw * r2.xxx + r9.xyz;
         r10.xyz = r14.xyz * r5.www + r10.xyz;
         r7.w = dot(r10.xyz, r10.xyz);
@@ -1006,6 +1053,13 @@ void main(
           r15.x = dynamicLights_g[r1.w].color.x;
           r15.y = dynamicLights_g[r1.w].color.y;
           r15.z = dynamicLights_g[r1.w].color.z;
+          if (csLocalBudget > 0.0) {
+            csLocalBudget -= 1.0;
+            r15.xyz = FalcomApplyLocalContactShadow(r15.xyz,
+                float3(dynamicLights_g[r1.w].pos.x, dynamicLights_g[r1.w].pos.y,
+                       dynamicLights_g[r1.w].pos.z),
+                r4.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+          }
           r12.yzw = r15.xyz * r2.xxx + r12.yzw;
           r13.xyz = r14.xyz * r5.www + r13.xyz;
           r7.w = dot(r13.xyz, r13.xyz);
@@ -1071,6 +1125,13 @@ void main(
         r9.x = dynamicLights_g[r2.x].color.x;
         r9.y = dynamicLights_g[r2.x].color.y;
         r9.z = dynamicLights_g[r2.x].color.z;
+        if (csLocalBudget > 0.0) {
+          csLocalBudget -= 1.0;
+          r9.xyz = FalcomApplyLocalContactShadow(r9.xyz,
+              float3(dynamicLights_g[r2.x].pos.x, dynamicLights_g[r2.x].pos.y,
+                     dynamicLights_g[r2.x].pos.z),
+              r4.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+        }
         r9.xyz = r9.xyz * r7.www;
         r8.xyz = r9.xyz * r5.www + r8.xyz;
       }
@@ -1143,6 +1204,13 @@ void main(
           r9.x = dynamicLights_g[r2.x].color.x;
           r9.y = dynamicLights_g[r2.x].color.y;
           r9.z = dynamicLights_g[r2.x].color.z;
+          if (csLocalBudget > 0.0) {
+            csLocalBudget -= 1.0;
+            r9.xyz = FalcomApplyLocalContactShadow(r9.xyz,
+                float3(dynamicLights_g[r2.x].pos.x, dynamicLights_g[r2.x].pos.y,
+                       dynamicLights_g[r2.x].pos.z),
+                r4.xyz, csLocalParams, csDepthUnpack, csLocalJitter, csDepthTex, samPoint_s);
+          }
           r9.xyz = r9.xyz * r5.www;
           r8.xyz = r9.xyz * r7.www + r8.xyz;
         }
@@ -1401,7 +1469,16 @@ void main(
     }
   }
 
-  o0.xyz = r1.xyz;
+  // Kyoto has no separable sun composite: this shader never multiplies a sun
+  // diffuse by lightColor_g and adds ambient to it the way Kai / Sora 1st / Sora 2nd
+  // do, and it has no CSM sample at all. So contact cannot be attached to a sun term
+  // here, and it is deliberately NOT applied to the final colour either -- that is
+  // the bug that put contact shadows in interiors. Micro applies normally.
+  //
+  // Kyoto is also hidden for both techniques (see the is_visible gates in addon.cpp),
+  // so this path is reachable only if a saved config forces the terms on.
+  o0.xyz = FalcomApplyShadowTerms(r1.xyz, v1.xy, csIsCharacter, samPoint_s,
+                                  microShadowTex, contactShadowTex);
   o0.w = 1;
   o2.y = 0;
   return;

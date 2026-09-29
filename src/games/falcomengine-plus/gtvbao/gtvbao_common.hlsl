@@ -42,6 +42,10 @@
 // GI is enabled per-shader-variant via GT_VBAO_COMPUTE_GI.
 // This common header provides the bindings used when it is defined.
 
+// Falcom MRT world-normal decode, shared with the shadow compute passes.
+// Must come first: the helpers below and GTVBAO.hlsli both call it.
+#include "../include/mrt_normal.hlsli"
+
 // ── Game's scene constant buffer (b0) ──
 // Must be declared BEFORE GTVBAO.hlsli so GTVBAO_MainPass can reference its members.
 cbuffer cb_scene : register(b0)
@@ -196,20 +200,13 @@ float GTVBAO_LoadMappedDepth(Texture2D<float> depthTex, int2 halfTC, int2 halfDi
 // The wrapper .cs_5_0.hlsl files declare and pass them.
 
 // ── MRT normal helpers ──
-// GTVBAO_DecodeMrtNormalPacked / TransformNormalToView are defined here so every
-// pass that touches an MRT normal (main passes, normal_prep, upscale, à-trous)
-// shares one definition and cannot drift.
+// The encode/decode itself lives in include/mrt_normal.hlsli, shared with the
+// shadow compute passes so the two features cannot disagree about what a texel
+// means. Only the GTVBAO-specific reshaping stays here, so every pass that
+// touches an MRT normal (main passes, normal_prep, upscale, à-trous) shares one
+// definition and cannot drift.
 // DecodeMrtNormalAsIs stays per-wrapper only as a thin binding shim: it reads
 // that pass's own `g_srcMrtNormal`, which is a per-pass resource.
-
-float3 SafeNormalize3(float3 v, float3 fallback)
-{
-  float len2 = dot(v, v);
-  return (len2 < 1e-5) ? fallback : v * rsqrt(len2);
-}
-
-// True when a normal is usable geometry rather than a placeholder.
-bool GTVBAO_NormalValid(float3 n) { return dot(n, n) > 1e-5; }
 
 // Texel address for a screen UV in a source whose resolution differs from the
 // AO working domain. Both the main pass and the GI per-sample path must land on
@@ -247,30 +244,7 @@ float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation
   float3 tuned = viewNormal;
   tuned.xy *= max(0.0, influence);
   tuned.z  *= max(GT_VBAO_MIN_NORMAL_Z_SCALE, zPreservation);
-  return SafeNormalize3(tuned, viewNormal);
-}
-
-// Falcom packs the world-space normal as a cylindrical (azimuth, cos-polar)
-// pair: .x = atan2(N.y, N.x)/PI + 1, .y = N.z + 1, each scaled by 32767.5.
-// Matches the vanilla lighting decode (see sora2nd/lighting/lighting.asm:
-// `mad r8.zw` -> `sincos` -> `dp3 r3.y, r8.xywx`).
-//
-// Returns a ZERO vector for a texel the G-buffer never wrote. A cleared texel is
-// all-zero, which decodes to enc = (-1,-1) and therefore to the world-straight-
-// down normal (0,0,-1): unit length, so it survives a naive validity test and
-// would silently replace the depth normal. A written texel always has
-// raw.y ~= 32767 when N.z == 0, so an exact (0,0) pair can only mean "no
-// g-buffer data here". Callers fall back to the depth-derived normal on a zero
-// result, which is the same path they already use for an unavailable MRT.
-float3 GTVBAO_DecodeMrtNormalPacked(uint2 packed)
-{
-  if (packed.x == 0u && packed.y == 0u) return float3(0.0, 0.0, 0.0);
-
-  float2 enc = float2((float)packed.x, (float)packed.y) * (1.0 / 32767.5) + float2(-1.0, -1.0);
-  float sin_a, cos_a;
-  sincos(3.14159274 * enc.x, sin_a, cos_a);
-  float ring = sqrt(saturate(1.0 - enc.y * enc.y));
-  return SafeNormalize3(float3(cos_a * ring, sin_a * ring, enc.y), float3(0.0, 0.0, 0.0));
+  return FalcomSafeNormalize3(tuned, viewNormal);
 }
 
 // GTVBAO's own view space is +Z forward: GTVBAO_ComputeViewspacePosition
@@ -306,13 +280,13 @@ float3 GTVBAO_DecodeMrtNormalPacked(uint2 packed)
 // can select a different matrix through the same code.
 float3 TransformNormalToView(float3 decoded, float transformMode)
 {
-  if (!GTVBAO_NormalValid(decoded)) return float3(0.0, 0.0, 0.0);
+  if (!FalcomNormalValid(decoded)) return float3(0.0, 0.0, 0.0);
 
   const int mode = (int)transformMode;
 
   // 2: leave the world-space normal completely alone (diagnostic only - the
   // result is not in view space at all, so the AO maths is meaningless).
-  if (mode == 2) return SafeNormalize3(decoded, float3(0.0, 0.0, 0.0));
+  if (mode == 2) return FalcomSafeNormalize3(decoded, float3(0.0, 0.0, 0.0));
 
   // viewInv_g is the inverse of view_g, so for a rigid (orthonormal rotation)
   // view matrix it is the transpose of view_g's rotation. It is only a
@@ -326,7 +300,7 @@ float3 TransformNormalToView(float3 decoded, float transformMode)
 
   float3 vn = mul(m, decoded);
   if (flip_z) vn.z = -vn.z;
-  return SafeNormalize3(vn, float3(0.0, 0.0, 0.0));
+  return FalcomSafeNormalize3(vn, float3(0.0, 0.0, 0.0));
 }
 
 float3 DecodeMrtNormalAsIs(uint2 texel);

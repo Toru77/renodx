@@ -121,7 +121,7 @@ void main(uint2 dt : SV_DispatchThreadID) {
       // collapses onto the nearest-tap fallback.
       float planeD = abs(dot(Nf, Plow - Pf));
       float depthW = exp(-planeD * planeSigma);
-      float normalW = (GTVBAO_NormalValid(Nf) && GTVBAO_NormalValid(Nlow))
+      float normalW = (FalcomNormalValid(Nf) && FalcomNormalValid(Nlow))
                     ? pow(saturate(dot(Nf, Nlow)), normalPower) : 1.0;
       // No floor on the geometry term: when every tap is rejected the weighted
       // sum collapses to the nearest-tap fallback, which is correct here —

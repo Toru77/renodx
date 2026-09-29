@@ -28,7 +28,7 @@ void main(uint2 dt : SV_DispatchThreadID)
   // AO transform mode, not the independent VBGI one.
   g_outPrepNormal[dt] = float4(
       TransformNormalToView(
-          GTVBAO_DecodeMrtNormalPacked(g_srcPrepMrtNormal.Load(int3(dt, 0)).xy),
+          DecodeFalcomMrtNormal(g_srcPrepMrtNormal.Load(int3(dt, 0)).xy),
           GTVBAO_normal_transform_mode),
       0.0);
 }

@@ -20,28 +20,41 @@ struct ShaderInjectData {
   float volfog_isfast_dedicated_sampler;// 0=s1 point, 1=s2 dedicated point-wrap sampler
 
   // Character Shadowing
+  // The screen-space shadow RAYMARCH behind these (mode 2, "Bend_SSS") was
+  // The Bend_SSS character ray-march (char_shadow_* below) and the environment
+  // "Sun SSS" ray-march (env_sss_* below) have both been deleted from every
+  // shader in this mod, daybreak2/char included, and their settings are gone.
+  // The slots stay declared so that the packoffset of every later field is
+  // unchanged: this block is a contiguous range, and removing a line from the
+  // middle would shift the whole tail of the struct on both sides of the C++ /
+  // HLSL boundary.
+  //
+  // The one survivor is char_shadow_mode itself, which no longer selects a
+  // ray-march but gates the game's own native character shadow:
+  //   0 = off, 1 = the engine's own camera-facing march.
+  // That engine code is still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
-  float char_shadow_sample_count;
-  float char_shadow_hard_shadow_samples;
-  float char_shadow_fade_out_samples;
-  float char_shadow_surface_thickness;
-  float char_shadow_contrast;
-  float char_shadow_light_screen_fade_start;
-  float char_shadow_light_screen_fade_end;
-  float char_shadow_min_occluder_depth_scale;
-  float char_shadow_jitter_enabled;
-  // Shadow type: 0 = Camera, 1 = World, 2 = Combined
+  float char_shadow_sample_count;   // RETIRED: Bend_SSS, unread
+  float char_shadow_hard_shadow_samples;   // RETIRED: Bend_SSS, unread
+  float char_shadow_fade_out_samples;       // RETIRED: Bend_SSS, unread
+  float char_shadow_surface_thickness;      // RETIRED: Bend_SSS, unread
+  float char_shadow_contrast;               // RETIRED: Bend_SSS, unread
+  float char_shadow_light_screen_fade_start; // RETIRED: Bend_SSS, unread
+  float char_shadow_light_screen_fade_end;   // RETIRED: Bend_SSS, unread
+  float char_shadow_min_occluder_depth_scale; // RETIRED: Bend_SSS, unread
+  float char_shadow_jitter_enabled;          // RETIRED: Bend_SSS, unread
+  // Shadow type: 0 = Camera, 1 = World, 2 = Combined. RETIRED: Bend_SSS, unread.
   float char_shadow_type;
-  // Per-pass strengths (0..1).
+  // Per-pass strengths (0..1). RETIRED: Bend_SSS, unread.
   float char_shadow_camera_strength;
   float char_shadow_world_strength;
 
-  // Environment Screen Space Shadows
+  // Environment "Sun SSS" ray-march. RETIRED across the whole mod; unread.
   float env_sss_enabled;
   float env_sss_strength;
   float env_sss_sample_count;
-  float env_sss_hard_shadow_samples; // 0=auto (sampleCount/8), >0=override
-  float env_sss_fade_out_samples;    // 0=auto (sampleCount/3), >0=override
+  float env_sss_hard_shadow_samples; // RETIRED, unread
+  float env_sss_fade_out_samples;    // RETIRED, unread
   float env_sss_surface_thickness;
   float env_sss_contrast;
   float env_sss_jitter_enabled;
@@ -53,22 +66,30 @@ struct ShaderInjectData {
   float env_sss_max_darkening;
   float env_sss_bright_reject_threshold;
   float env_sss_bright_reject_fade;
-  float env_sss_csm_gate;            // 0=Off, 1=On — skip SSS when CSM shadow is deep (indoor)
-  // Debug view mode (0 = off, 1..4 = inspection views)
+  float env_sss_csm_gate;
+  // Foliage / character mask debug view. Still live: view 1 is the mask the
+  // GTVBAO character options act on, 2 the contact term, 3 the AO the micro
+  // pass reads, 4 raw mrt0.z.
   float debug_show_env_sss;
 
   // —— Local Screen Space Shadows (Bend_SSS for point/spot lights) ——
-  float local_sss_enabled;             // 0=Off, 1=On
-  float local_sss_strength;            // [0..1]
-  float local_sss_light_type;          // 0=Spot, 1=Point, 2=Both
-  float local_sss_sample_count;        // [1..64]
-  float local_sss_hard_shadow_samples; // 0=auto (sampleCount/8)
-  float local_sss_fade_out_samples;    // 0=auto (sampleCount/3)
-  float local_sss_surface_thickness;   // [0.001..0.2]
-  float local_sss_contrast;            // [0..12]
-  float local_sss_light_fade_start;    // [0..1]
-  float local_sss_light_fade_end;      // [0..1]
-  float local_sss_occluder_depth_scale;// [0..4]
+  // 0/1, DEPRECATED and unread. These eleven slots were allocated for a
+  // per-local-light screen-space shadow that was never implemented -- no .hlsl
+  // file in this mod has ever read them. The feature is now covered properly by
+  // the Contact Shadows local-light march (cs_contact_local_*), which reuses the
+  // shared clip-space marcher instead of duplicating it per game. Kept in place
+  // so the packoffset of every field after this one is unchanged.
+  float local_sss_enabled;             // RETIRED: unread
+  float local_sss_strength;            // RETIRED: unread
+  float local_sss_light_type;          // RETIRED: unread
+  float local_sss_sample_count;        // RETIRED: unread
+  float local_sss_hard_shadow_samples; // RETIRED: unread
+  float local_sss_fade_out_samples;    // RETIRED: unread
+  float local_sss_surface_thickness;   // RETIRED: unread
+  float local_sss_contrast;            // RETIRED: unread
+  float local_sss_light_fade_start;    // RETIRED: unread
+  float local_sss_light_fade_end;      // RETIRED: unread
+  float local_sss_occluder_depth_scale;// RETIRED: unread
 
   // —— GTVBAO (Visibility Bitmask AO + optional VBGI) ——
   float gtvbao_mode;                // 0=Off (vanilla AO), 1=On (Bitmask AO)
@@ -223,8 +244,16 @@ struct ShaderInjectData {
   float gtvbao_debug_mode;             // Kai GTVBAO debug mode (distinct from gtvbao_debug_view)
   float gtvbao_normal_input_mode;      // Kai: 0=off, 1=on (mirrors global g_gtvbao_normal_input_mode)
   // Kai char shadow / misc
+  // RETIRED and unread: no .hlsl file has ever read this. The per-technique
+  // character control the mod needs is cs_micro_char_strength / cs_contact_char_strength.
+  // Kept so the packoffsets after it do not move.
   float char_shadow_strength;
+  // Foliage/character mask debug views. View 2 now shows the Contact Shadow term
+  // rather than the retired SSS shadow channel.
   float foliage_debug_mode;
+  // DEPRECATED and unread: flagged "the ssao pass's dedicated SSS shadow texture
+  // is bound". The raymarch that produced that texture is gone, so nothing sets
+  // this and nothing reads it. Kept so later packoffsets do not move.
   float sss_dedicated_bound;
   float shadow_isfast_jitter_amount;
   float shadow_isfast_jitter_speed;
@@ -547,8 +576,83 @@ struct ShaderInjectData {
    // setting (SSGIDebugView) and reusing it would clobber the user's choice --
    // which is why the earlier 22-25 views pushed the texture but rendered the
    // fallback instead. Set only while the push is active; reset every frame.
-   float gtvbao_mrt_normal_debug;
-  };
+  float gtvbao_mrt_normal_debug;
+  // ---- Contact Shadows + Micro Shadows compute passes (appended last: do not insert above) ----
+  // Two independent screen-space shadow techniques computed in shadows/*.cs_5_0.hlsl
+  // and consumed by the lighting shaders. They supersede the inline screen-space
+  // shadow raymarchs (char_shadow_* / env_sss_* / local_sss_* above, now retired).
+  //
+  // Micro Shadows: an AO-driven aperture term (Uncharted 4) applied to NdotL.
+  // Contact Shadows: a clip-space depth march toward the light, jittered with
+  // IS-FAST blue noise and resolved by the game's TAA.
+  //
+  // The two passes are separate because they need different inputs and have very
+  // different cost: micro is a handful of ALU ops, contact is a raymarch.
+
+  // Micro Shadows
+  float cs_micro_enabled;           // 0=Off, 1=On
+  float cs_micro_strength;          // [0..1] global blend of the micro term
+  float cs_micro_env_strength;      // [0..1] strength on non-character pixels
+  float cs_micro_char_strength;     // [0..1] strength on character pixels
+  float cs_micro_opacity;           // [0..1] lerp(1, microshadow, opacity) from the paper
+  float cs_micro_aperture_scale;    // [0..2], default 1 — scales the 2*AO*AO aperture
+  float cs_micro_debug;             // 0=Off, 1=raw micro term, 2=diagnostic channels
+  // AO source for the micro pass: 0 = the game's deferred AO (a float channel),
+  // 1 = the GTVBAO AO (visibility in byte 0 of an r32_uint). Both are bound every
+  // frame and the shader decodes each in its own encoding, because reading either
+  // as the wrong type yields plausible garbage rather than an error.
+  // 1 is the default: the game AO capture is not reliably available every frame,
+  // and with AO = 1 the micro term saturate(NdotL + 2*AO*AO - 1) is identically
+  // 1 at every pixel, i.e. the effect does nothing at all.
+  float cs_micro_ao_source;
+
+  // Contact Shadows
+  float cs_contact_enabled;         // 0=Off, 1=On
+  float cs_contact_strength;        // [0..1] global blend of the contact term
+  float cs_contact_env_strength;    // [0..1] strength on non-character pixels
+  float cs_contact_char_strength;   // [0..1] strength on character pixels
+  float cs_contact_sample_count;    // march steps; 4/8/16/32. 8 is the default the
+                                     // reference settled on (same count UE uses).
+  float cs_contact_ray_length;      // world units the ray travels [1..200], default 50
+  float cs_contact_thickness;       // [0.001..4] world-space occluder thickness
+  float cs_contact_bias;            // [0..0.2] minimum penetration before a hit counts
+  float cs_contact_normal_bias;     // [0..1] world units to lift the origin along N
+  // Early-out for the sky: a device depth linearizing beyond this is treated as
+  // no geometry, so the march is skipped. Lower = cheaper, higher = less sky.
+  float cs_contact_sky_depth;       // world units [100..1e6]
+  float cs_contact_max_darkening;   // [0..1] floor on the contact term (0 = full black)
+  float cs_contact_isfast_enabled;  // 0=Off, 1=On — IS-FAST jitter (no IGN fallback by
+                                    // design: without it the march is unjittered)
+  float cs_contact_debug;           // 0=Off, 1=raw contact term (white = lit)
+  // Local (point/spot) contact shadows, evaluated inside the dynamic light loop.
+  // Off by default: it is per-light work in a pixel shader, so the cost scales
+  // with the per-pixel light count rather than being one full-screen pass.
+  float cs_contact_local_enabled;      // 0=Off, 1=On
+  float cs_contact_local_strength;     // [0..1]
+  float cs_contact_local_sample_count;  // march steps per local light [2..16], default 4
+  float cs_contact_local_ray_length;   // world units [0.1..20], default 2
+  float cs_contact_local_max_lights;   // per-pixel light budget [1..16], default 4
+
+  // Runtime, written by the addon immediately before the b13 push.
+  float cs_noise_frame;            // IS-FAST volume slice (frame_index % 32), or -1 when
+                                   // the volume is unusable and the caller must not sample
+  float cs_working_w, cs_working_h; // shadow output / depth texture dims
+  float cs_ao_bound;               // 0/1 — a usable AO capture was bound to the micro pass
+  float cs_micro_dedicated_bound;  // 0/1 — t33 holds a valid micro term this frame
+  float cs_contact_dedicated_bound;// 0/1 — t34 holds a valid contact term this frame
+  // IS-FAST dither for the micro pass. Appended last, and OFF by default.
+  //
+  // The micro term is a closed-form function of NdotL and AO with no ray to march,
+  // so there is no sample position to jitter. What this actually dithers is the AO
+  // QUANTISATION: GTVBAO stores visibility in a single byte, so a slowly varying
+  // surface steps through discrete AO cells and the aperture term turns that into
+  // visible banding. Offsetting the AO read by the blue-noise value walks
+  // neighbouring cells per pixel and lets TAA average them back out.
+  //
+  // Off by default because it trades visible noise for that, and most scenes do
+  // not band. On for users who see stepping on large smooth surfaces under GTVBAO.
+  float cs_micro_isfast_enabled;
+ };
 
 #ifndef __cplusplus
 cbuffer shader_injection : register(b13) {
