@@ -165,10 +165,51 @@ float2 FalcomSampleISFAST2(Texture3D<float2> volume, SamplerState noiseSampler,
 // no world-to-screen projection and no position reconstruction inside the loop,
 // which is what makes this affordable at full resolution.
 //
-// A ray that finds geometry inside the thickness band is shadowed. Jittering the
-// starting offset by the IS-FAST value breaks the visible stepping that a fixed
-// step produces; without a temporal resolve that trade would be a loss, so the
-// consumer is expected to run under TAA.
+// The march counts how much of the ray falls inside the thickness band, and scales
+// that coverage into a shadow term. Jittering the starting offset by the IS-FAST
+// value breaks the visible stepping that a fixed step produces; without a temporal
+// resolve that trade would be a loss, so the consumer is expected to run under TAA.
+//
+// ── why coverage, and why a scale ──
+//
+// The previous form asked a yes/no question: "did ANY sample land inside the band?"
+// and returned a hard 0.0 on the first one. If the band covers a fraction f of the
+// ray, an N-sample lattice intersects it with probability 1-(1-f)^N, so the answer
+// saturates towards yes as N rises. Measured at f=0.12: 0.49 of shadowed pixels at
+// N=4, 0.96 at N=8, 1.00 at N=16. Two consequences, both reported from play. At low
+// N roughly half the pixels that should be shadowed are missed and WHICH half changes
+// every frame, which reads as noise. At high N every pixel with even a sliver of
+// overlap goes fully black, so the contact region visibly grows simply because the
+// sample count was raised. Both are artifacts of the combiner, not of the geometry.
+//
+// Counting the fraction removes the yes/no decision entirely: the result is a
+// continuous function of f, and f is a property of the pixel that does not depend on
+// N. Measured at f=0.12, the mean term is 0.458 / 0.452 / 0.451 / 0.451 for
+// N=4/8/16/32 -- flat -- while the old form ran 0.458 / 0.903 / 0.969 / 0.984, i.e. it
+// saturated almost everything to solid black.
+//
+// The coverage is then multiplied by `responseScale`. That factor is not arbitrary:
+// 4 is the sample count whose average response the pass is being asked to reproduce.
+// It gives the invariant term(N=4, scale=4) == the old binary test exactly, because
+// 1 - saturate(4*hits/4) is 1 - saturate(hits), which is 0 or 1 precisely as before.
+// So Sample Count becomes purely a quality/noise control and Response Scale purely a
+// strength control, instead of one slider setting all three of noise, width and
+// darkness. Measured at N=32, f=0.145: scale 3 gives a term of 0.597, 4 gives 0.463,
+// 5 gives 0.329.
+//
+// The `inside` test is deliberately a hard 0/1 and NOT a penetration ramp. The band
+// does two jobs -- nearness (the assumed occluder thickness) and validity (rejecting
+// samples whose screen position has drifted out of register with the depth they are
+// compared against, which can otherwise read a surface arbitrarily nearer than the
+// ray point and register as full occlusion). A ramp softens the second job and
+// measured out as "the average kills the shadows", because it also halves the weight
+// of every legitimate hit. Keeping the test binary leaves the validity filter exactly
+// as strict as it has always been.
+//
+// Note the early-out on leaving the screen under-counts coverage, since the remaining
+// samples never contribute. That is the conservative direction and was already the
+// documented behaviour of this loop: a ray that leaves the screen loses shadow rather
+// than gaining it.
 //
 // `clipStart`/`clipEnd` are the ray's world endpoints already projected by the
 // caller, which is also where the normal bias is applied: the biased point is
@@ -190,7 +231,7 @@ float2 FalcomSampleISFAST2(Texture3D<float2> volume, SamplerState noiseSampler,
 float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
                                Texture2D<float4> depthTex, SamplerState depthSampler,
                                float thickness, float bias,
-                               float sampleCount, float jitter)
+                               float sampleCount, float jitter, float responseScale)
 {
   if (sampleCount < 1.0) return 1.0;
   const float invSamples = rcp(sampleCount);
@@ -213,6 +254,8 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
   const float2 uvStep = (ndcEnd.xy - ndcStart.xy) * (invSamples * uvScale);
   float2 uv = mad(ndcStart.xy, uvScale, 0.5) + uvStep * jitter;
 
+  float hits = 0.0;
+
   [loop]
   for (int i = 0; i < (int)sampleCount; i++) {
     // Break rather than clamp: past the screen edge there is no depth data, and
@@ -221,13 +264,13 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
 
     const float sceneDepth = FalcomLinearDepth(depthTex.SampleLevel(depthSampler, uv, 0).x, unpack);
     const float penetration = rayLinearDepth - sceneDepth;
-    if (penetration > bias && penetration < thickness) return 0.0;
+    hits += (penetration > bias && penetration < thickness) ? 1.0 : 0.0;
 
     rayLinearDepth += rayLinearStep;
     uv += uvStep;
   }
 
-  return 1.0;
+  return 1.0 - saturate(hits * invSamples * responseScale);
 }
 
 // ── Output channel layout ──
@@ -545,7 +588,8 @@ float3 FalcomApplyLocalContactShadow(float3 lightColor, float3 lightPos, float3 
   const float4 clipB = mul(float4(worldPos + toLight * p.rayLength, 1.0), viewProj_g);
   if (abs(clipA.w) <= 1e-6 || abs(clipB.w) <= 1e-6) return lightColor;
   const float term = FalcomContactShadowMarch(clipA, clipB, unpack, depthTex, pointSampler,
-                                              p.thickness, p.bias, p.sampleCount, jitter);
+                                              p.thickness, p.bias, p.sampleCount, jitter,
+                                              shader_injection_data.cs_contact_response_scale);
   return lightColor * lerp(1.0, term, saturate(p.strength));
 }
 

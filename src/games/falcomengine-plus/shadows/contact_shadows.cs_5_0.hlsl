@@ -144,6 +144,7 @@ void main(uint2 p : SV_DispatchThreadID)
                               max(0.0, shader_injection_data.cs_contact_thickness),
                               max(0.0, shader_injection_data.cs_contact_bias),
                               max(1.0, floor(shader_injection_data.cs_contact_sample_count + 0.5)),
-                              jitter),
+                              jitter,
+                              max(0.0, shader_injection_data.cs_contact_response_scale)),
       kContactDiagMarched, saturate(linearDepth * 0.001), 1.0);
 }

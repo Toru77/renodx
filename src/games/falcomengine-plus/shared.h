@@ -658,6 +658,13 @@ struct ShaderInjectData {
   // declare the same global but never use it, so which component holds the
   // outermost split is an inference there and may need correcting per title.
   float cs_contact_sun_range;
+  // Strength of the contact term, relative to the ORIGINAL 4-sample appearance.
+  // Not a physical unit and not derived from geometry: 4 is the sample count whose
+  // average response the pass is being asked to reproduce, so that raising Sample
+  // Count buys noise reduction without also changing how dark the contact reads.
+  // At Sample Count 4 with this at 4 the estimator is exactly the old binary
+  // any-hit test, value for value, which is what makes it a safe default.
+  float cs_contact_response_scale;
  };
 
 #ifndef __cplusplus

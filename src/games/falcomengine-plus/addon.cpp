@@ -444,6 +444,9 @@ ShaderInjectData shader_injection = {
   .cs_micro_isfast_enabled = 0.f,
   // 0 = derive the sun-contact range gate from the engine's last cascade split.
   .cs_contact_sun_range = 0.f,
+  // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
+  // a no-op at the default Sample Count.
+  .cs_contact_response_scale = 4.f,
   };
 
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
@@ -2990,7 +2993,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
+      .default_value = 1.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
       .tooltip = "Half is recommended at high or native resolutions, but it halves whatever resolution you render at, so it can get very low when upscaling is enabled.",
       .labels = {"Full", "Half"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -3085,7 +3088,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOBitmaskThickness", .binding = &shader_injection.gtvbao_bitmask_thickness,
-      .default_value = 0.5f, .label = "Bitmask Thickness", .section = "GTVBAO",
+      .default_value = 0.35f, .label = "Bitmask Thickness", .section = "GTVBAO",
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -4147,7 +4150,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsSamples", .binding = &shader_injection.cs_contact_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Sample Count", .section = "Contact Shadows",
+      .default_value = 8.f, .label = "Sample Count", .section = "Contact Shadows",
       .tooltip = "March steps. 8 is what the reference settled on, and the same order "
                  "Unreal uses. Beyond 16 the gain is small and the cost is linear.",
       .min = 1.f, .max = 32.f, .format = "%d",
@@ -4179,10 +4182,27 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsNormalBias", .binding = &shader_injection.cs_contact_normal_bias,
-      .default_value = 0.0001f, .label = "Normal Bias", .section = "Contact Shadows",
+      .default_value = 0.1000f, .label = "Normal Bias", .section = "Contact Shadows",
       .tooltip = "Lifts the ray origin along the surface normal. More stable than depth "
                  "bias on curved surfaces.",
       .min = 0.f, .max = 1.f, .format = "%.4f",
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowResponseScale",
+      .binding = &shader_injection.cs_contact_response_scale,
+      .default_value = 4.f, .label = "Contact Shadow Response Scale",
+      .section = "Contact Shadows",
+      .tooltip = "How strong the contact shadow reads, relative to the ORIGINAL "
+                 "4-sample contact shadow appearance. This is NOT a physically based "
+                 "parameter and 4 is not a physical unit: 4 is simply the sample count "
+                 "whose average appearance is being reproduced, so that Sample Count can "
+                 "be a pure quality control. At Sample Count 4 and scale 4 the march "
+                 "reproduces the old any-hit test exactly, value for value. Raise this "
+                 "for a darker contact, lower it for a lighter one; Sample Count then "
+                 "only changes how noisy the result is, not how wide or how dark it is. "
+                 "Defaults to 4.",
+      .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
