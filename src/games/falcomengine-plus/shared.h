@@ -665,6 +665,20 @@ struct ShaderInjectData {
   // At Sample Count 4 with this at 4 the estimator is exactly the old binary
   // any-hit test, value for value, which is what makes it a safe default.
   float cs_contact_response_scale;
+  // Which local light classes the contact march runs on. 0 = Point, 1 = Spot,
+  // 2 = Both (the default, and what the feature did before this setting existed).
+  //
+  // The march is IDENTICAL for both classes -- it derives its direction from
+  // lightPos - worldPos, which a point light and a spot light define the same
+  // way -- so this is a cost/appearance selection, not a different technique.
+  // The spot cone is not tested; the light's own angular attenuation already
+  // handles that, and gating the march by it would only re-apply a term the
+  // engine has computed.
+  //
+  // A disabled class marches zero times and therefore spends NO budget, so
+  // Point-only hands the whole Local Light Budget to point lights rather than
+  // letting the disabled loop eat it.
+  float cs_contact_local_light_type;  // (appended last: do not insert above)
  };
 
 #ifndef __cplusplus

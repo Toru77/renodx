@@ -1807,6 +1807,12 @@ void main(
   // pixel covered by many lights pays for a bounded number of marches rather than
   // one per light. Every value here is loop-invariant; only the counter changes.
   const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
+  // Light Type picks which of the loops below are instrumented. Both march
+  // identically -- each derives its direction from the light's position -- so a
+  // disabled class is simply never called and therefore never spends budget.
+  // Both default to true, which is the behaviour that had no setting at all.
+  const bool csLocalPointOn = csLocalOn && shader_injection_data.cs_contact_local_light_type != 1.0f;
+  const bool csLocalSpotOn  = csLocalOn && shader_injection_data.cs_contact_local_light_type != 0.0f;
   FalcomContactParams csLocalParams;
   csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
   csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
@@ -1864,7 +1870,7 @@ void main(
         r11.x = dynamicLights_g[lightIdx].color.x;
         r11.y = dynamicLights_g[lightIdx].color.y;
         r11.z = dynamicLights_g[lightIdx].color.z;
-        if (csLocalBudget > 0.0) {
+        if (csLocalPointOn && csLocalBudget > 0.0) {
           csLocalBudget -= 1.0;
           r11.xyz = FalcomApplyLocalContactShadow(r11.xyz,
               float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
@@ -1986,7 +1992,7 @@ void main(
         r13.y = dynamicLights_g[lightIdx].color.x;
           r13.z = dynamicLights_g[lightIdx].color.y;
           r13.w = dynamicLights_g[lightIdx].color.z;
-          if (csLocalBudget > 0.0) {
+          if (csLocalSpotOn && csLocalBudget > 0.0) {
             csLocalBudget -= 1.0;
             r13.yzw = FalcomApplyLocalContactShadow(r13.yzw,
                 float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
@@ -2062,7 +2068,7 @@ void main(
         r10.x = dynamicLights_g[lightIdx].color.x;
         r10.y = dynamicLights_g[lightIdx].color.y;
         r10.z = dynamicLights_g[lightIdx].color.z;
-        if (csLocalBudget > 0.0) {
+        if (csLocalPointOn && csLocalBudget > 0.0) {
           csLocalBudget -= 1.0;
           r10.xyz = FalcomApplyLocalContactShadow(r10.xyz,
               float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,
@@ -2155,7 +2161,7 @@ void main(
           r10.x = dynamicLights_g[lightIdx].color.x;
           r10.y = dynamicLights_g[lightIdx].color.y;
           r10.z = dynamicLights_g[lightIdx].color.z;
-          if (csLocalBudget > 0.0) {
+          if (csLocalSpotOn && csLocalBudget > 0.0) {
             csLocalBudget -= 1.0;
             r10.xyz = FalcomApplyLocalContactShadow(r10.xyz,
                 float3(dynamicLights_g[lightIdx].pos.x, dynamicLights_g[lightIdx].pos.y,

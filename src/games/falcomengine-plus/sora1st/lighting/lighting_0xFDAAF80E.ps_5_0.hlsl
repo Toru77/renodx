@@ -1173,11 +1173,17 @@ void main(
   r1.w = exp2(r1.w);
   r1.w = min(1, r1.w);
   r8.xyz = r10.xyz * r1.www + r9.xyz;
-  // -- Local contact shadows: setup shared by the point and spot loops below --
-  // The budget is per pixel and shared by both loops, so a pixel covered by many
+  // -- Local contact shadows: setup shared by all four light loops below --
+  // The budget is per pixel and shared by every loop, so a pixel covered by many
   // lights pays for a bounded number of marches rather than one per light. Every
   // value here is loop-invariant; only the budget counter changes per light.
   const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
+  // Light Type picks which of the loops below are instrumented. Both march
+  // identically -- each derives its direction from the light's position -- so a
+  // disabled class is simply never called and therefore never spends budget.
+  // Both defaults to true, which is the behaviour that had no setting at all.
+  const bool csLocalPointOn = csLocalOn && shader_injection_data.cs_contact_local_light_type != 1.0f;
+  const bool csLocalSpotOn  = csLocalOn && shader_injection_data.cs_contact_local_light_type != 0.0f;
   FalcomContactParams csLocalParams;
   csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
   csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
@@ -1236,7 +1242,7 @@ void main(
         r13.y = dynamicLights_g[r2.w].color.x;
         r13.z = dynamicLights_g[r2.w].color.y;
         r13.w = dynamicLights_g[r2.w].color.z;
-        if (csLocalBudget > 0.0) {
+        if (csLocalPointOn && csLocalBudget > 0.0) {
           csLocalBudget -= 1.0;
           float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
                                      dynamicLights_g[r2.w].pos.z);
@@ -1359,8 +1365,8 @@ void main(
           float brdf_VdotH_sp = saturate(dot(brdf_V, brdf_H_sp));
           r16.x = dynamicLights_g[r2.w].color.x;
           r16.y = dynamicLights_g[r2.w].color.y;
-          r16.z = dynamicLights_g[r2.w].color.z;
-          if (csLocalBudget > 0.0) {
+        r16.z = dynamicLights_g[r2.w].color.z;
+        if (csLocalSpotOn && csLocalBudget > 0.0) {
             csLocalBudget -= 1.0;
             float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
                                        dynamicLights_g[r2.w].pos.z);
@@ -1436,6 +1442,20 @@ void main(
         r10.x = dynamicLights_g[r1.w].color.x;
         r10.y = dynamicLights_g[r1.w].color.y;
         r10.z = dynamicLights_g[r1.w].color.z;
+        // Env path (diffuse only), point light. This loop and the spot loop below
+        // were the two the local march missed: the spec branch above has them and
+        // this branch did not, so an env-lit surface got no contact shadow from
+        // its local lights at all. r10.xyz holds the colour, r11.xyz still holds
+        // the normalised light vector but brdf_rawNdotL_env has already consumed
+        // it by now, and r1.w is the light index.
+        if (csLocalPointOn && csLocalBudget > 0.0) {
+          csLocalBudget -= 1.0;
+          float3 csLightPos = float3(dynamicLights_g[r1.w].pos.x, dynamicLights_g[r1.w].pos.y,
+                                     dynamicLights_g[r1.w].pos.z);
+          r10.xyz = FalcomApplyLocalContactShadow(r10.xyz, csLightPos, r5.xyz, csLocalParams,
+                                                  csDepthUnpack, csLocalJitter,
+                                                  csDepthTex, samPoint_s);
+        }
         // ── BRDF Diffuse (Hammon) ──
         if (brdf_use_hammon) {
           float3 brdf_hammon_correction_env = HammonEnergyRatio(brdf_rawNdotL_env, brdf_NdotV, brdf_NdotH_env, brdf_VdotH_env, brdf_roughness, float3(1,1,1));
@@ -1536,6 +1556,19 @@ void main(
           r11.x = dynamicLights_g[r1.w].color.x;
           r11.y = dynamicLights_g[r1.w].color.y;
           r11.z = dynamicLights_g[r1.w].color.z;
+          // Env path (diffuse only), spot light -- the second half of the pair the
+          // local march missed. brdf_rawNdotL_env_sp has already consumed r11.xyz
+          // as the light vector, so the colour that overwrote it is free to be
+          // scaled here, and the spot shadow map if shadowmapIndex != -1 has
+          // already been folded into r3.z.
+          if (csLocalSpotOn && csLocalBudget > 0.0) {
+            csLocalBudget -= 1.0;
+            float3 csLightPos = float3(dynamicLights_g[r1.w].pos.x, dynamicLights_g[r1.w].pos.y,
+                                       dynamicLights_g[r1.w].pos.z);
+            r11.xyz = FalcomApplyLocalContactShadow(r11.xyz, csLightPos, r5.xyz, csLocalParams,
+                                                    csDepthUnpack, csLocalJitter,
+                                                    csDepthTex, samPoint_s);
+          }
           // ── BRDF Diffuse (Hammon) ──
           if (brdf_use_hammon) {
             float3 brdf_hammon_correction_env_sp = HammonEnergyRatio(brdf_rawNdotL_env_sp, brdf_NdotV, brdf_NdotH_env_sp, brdf_VdotH_env_sp, brdf_roughness, float3(1,1,1));

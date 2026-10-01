@@ -447,6 +447,11 @@ ShaderInjectData shader_injection = {
   // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
   // a no-op at the default Sample Count.
   .cs_contact_response_scale = 4.f,
+  // 2 = Both, which is exactly what the local march did before the setting
+  // existed. Must stay in declaration order with shared.h: designated
+  // initialisers are evaluated in the order written, so a mismatch here is a
+  // hard compile error rather than a silent misassignment.
+  .cs_contact_local_light_type = 2.f,
   };
 
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
@@ -4268,6 +4273,24 @@ renodx::utils::settings::Settings settings = {
                  "one full-screen pass.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalLightType", .binding = &shader_injection.cs_contact_local_light_type,
+      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .default_value = 2.f, .label = "Light Type", .section = "Contact Shadows",
+      .tooltip = "Which local light classes get the contact march. Both is the default and is "
+                 "exactly what this feature did before the setting existed. The march itself is "
+                 "identical for both classes -- it derives its direction from the light's position, "
+                 "which a point light and a spot light define the same way -- so this is a cost "
+                 "and appearance trade, not a different technique. Pick Point to spend the budget "
+                 "only on point lights, which have NO shadow map of their own in this engine and "
+                 "so have nothing but this march for their contact detail. Spot lights can already "
+                 "carry a real shadow map (a 5-tap PCF) whenever their shadowmapIndex is not -1, "
+                 "so for them the march mostly adds the near-field detail a shadow map cannot. "
+                 "A disabled class marches zero times and does not consume the budget, so the "
+                 "class you leave on gets all of it.",
+      .labels = {"Point", "Spot", "Both"},
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalStrength", .binding = &shader_injection.cs_contact_local_strength,
