@@ -363,6 +363,32 @@ void main(uint3 dtid : SV_DispatchThreadID)
         outContrib = 0.0;
     }
 
+    // Over-ceiling guard for the history store. The blend above cannot decay a
+    // non-finite value -- lerp(Inf, Inf, t) == Inf and lerp(NaN, NaN, t) == NaN --
+    // so a single over-range sample latches a texel until the history is manually
+    // cleared. It arrives two ways: the scene target already holds Inf/NaN, or a
+    // bright transient overflows fp16 on the store below (r16g16b16a16_float
+    // maxes at 65504, so anything above commits as +Inf). Capping also heals
+    // texels latched by an earlier capture, because reading back Inf and writing
+    // min(Inf, ceiling) breaks the latch. NaN needs an explicit test: it compares
+    // false against every ceiling and min() is undefined for it.
+    const float kDynCubeCeiling = 1024.0;
+    if (all(isfinite(outCol)))
+    {
+        outCol = min(outCol, kDynCubeCeiling);
+    }
+    else
+    {
+        // Repaint from vanilla with validity dropped, matching the no-content
+        // branch above: raw t17 consumers (glass) read color without consulting
+        // validity, so they need real radiance here rather than black.
+        outCol = g_vanillaTex.SampleLevel(g_pointClamp, GetSamplingVector(dtid, w, h), 0).rgb;
+        if (!all(isfinite(outCol))) outCol = 0.0;
+        outPos = 0.0;
+        outValid = 0.0;
+        outContrib = 0.0;
+    }
+
     g_outColor[dtid]   = float4(max(0.0, outCol), outValid);
     g_outPos[dtid]     = float4(outPos, outValid);
     g_outContrib[dtid] = outContrib;
