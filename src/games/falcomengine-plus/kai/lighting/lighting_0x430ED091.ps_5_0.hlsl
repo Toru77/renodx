@@ -905,38 +905,16 @@ void main(
           ? (1.0 - saturate(shader_injection_data.char_gtvbgi_mask_strength)) : 1.0;
       r4.yzw = r4.yzw + r24.xyz * giCharScale;
     }
-    // Custom character SUN contact shadow. See FalcomApplyCharSunShadow for why this
-    // has to attach to the resolved colour, and for why its gate is the whole defence
-    // rather than an optimisation.
-    //
-    // is_character_pixel (mrt0.z bit 8) is the same test that opened this block, so
-    // the gate is a pass-through today. It is passed anyway so the four lighting
-    // shaders share one call shape and so relocating this outside the branch later
-    // fails closed instead of quietly darkening the environment. mrt0_raw is the load
-    // from line 379 and is never overwritten.
-    float2 charSunDiag;
-    r4.yzw = FalcomApplyCharSunShadow(
-        r4.yzw, is_character_pixel,
-        csDepthTex.SampleLevel(samPoint_s, v1.xy, 0).x,
-        DecodeFalcomMrtNormal(mrt0_raw.xy), v1.xy, v0.xy, shadowSplitDistance_g.y,
-        csDepthTex, samPoint_s, csIsfastNoise, charSunDiag);
     // This early return happens BEFORE the sun composite at 1776, and it builds its
-    // colour from the character/SSGI terms with no isolable sun contribution. The
-    // generic Contact Shadows term is therefore still not applied here: the custom
-    // character sun pass above is what covers characters now. Micro still applies:
-    // it is an AO-driven aperture term and belongs on the resolved colour.
+    // colour from the character/SSGI terms with no isolable sun contribution. So
+    // contact shadows are NOT applied here -- there is no sun term to attach them
+    // to, and applying them to the final colour instead is exactly the bug that put
+    // contact shadows in interiors. Micro still applies: it is an AO-driven aperture
+    // term and belongs on the resolved colour.
     o0.xyz = FalcomApplyShadowTerms(r4.yzw, v1.xy, is_character_pixel, samPoint_s,
                                     microShadowTex, contactShadowTex);
     o0.w = 1;
     o1.xyzw = r1.xyzw;
-    // Sun Debug View, after FalcomApplyShadowTerms so it shows what this pass did and
-    // not the micro term layered on top of it.
-    float3 charSunDbgColour;
-    if (FalcomCharSunDebugView(charSunDiag, is_character_pixel,
-                               (int)shader_injection_data.char_sun_debug, charSunDbgColour)) {
-      o0.xyz = charSunDbgColour;
-      o0.w = 1;
-    }
     return;
   }
   r3.x = (int)r3.z & 255;

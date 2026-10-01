@@ -453,47 +453,40 @@ ShaderInjectData shader_injection = {
   // hard compile error rather than a silent misassignment.
   .cs_contact_local_light_type = 2.f,
   // ── Character Shadowing: custom camera pass ──
-  // Both passes are on by default but only do anything in char_shadow_mode 2, and
-  // their sliders mirror the Contact Shadows defaults exactly so the two sections
-  // mean the same thing by the same number. Declaration order must match shared.h.
+  // On by default but only does anything in char_shadow_mode 2. Declaration order must
+  // match shared.h.
   .char_cam_enabled = 1.f,
   .char_cam_strength = 1.f,
   .char_cam_sample_count = 8.f,
-  // The engine's own march is ~0.02 world units, so the default is in that
-  // neighbourhood rather than cs_contact's 2.0: the camera-facing march is a
-  // silhouette/self-occlusion term, not a long reach for the sun. The Camera Pass
-  // "Axis Length" debug view measures the real engine value to tune against.
+  // Silhouette reach, in the same neighbourhood as the engine's own march (the vanilla
+  // block steps 0.0005..0.002 for 10 steps, so ~0.005..0.02 world units).
   .char_cam_ray_length = 0.02f,
-  .char_cam_thickness = 0.29f,
+  // Must be comparable to the ray length. A band much larger than the ray puts the
+  // whole ray inside or outside it, the coverage estimator degenerates to a binary
+  // any-hit test, and Sample Count stops doing anything.
+  .char_cam_thickness = 0.008f,
   .char_cam_bias = 0.0001f,
-  // Matches the constant the vanilla march uses as its normal lift, scaled down
-  // because this pass's step is a real world-space length rather than an engine
-  // pre-scaled one.
-  .char_cam_normal_bias = 0.0075f,
-  .char_cam_response_scale = 4.f,
-  .char_cam_max_darkening = 1.f,
+  // The shader folds this into the hit threshold (bias = lift + char_cam_bias) so the
+  // receiver cannot occlude itself, so it is the true clearance off the surface. A
+  // millimetre suits a 2 cm ray; anything comparable to the ray would start the march
+  // in free air beside the face.
+  .char_cam_normal_bias = 0.0015f,
+  // 2, not 4: at 4 with 8 samples a single spurious sample already costs half the
+  // available darkening, which is what made this read as a hard patch. The
+  // 4-is-the-original invariant is documented on the environment contact pass and is
+  // meaningful THERE, where the geometry is a wall or a floor and its numbers -- a 0.29
+  // band against a 2.0 ray -- are proportionate to it. Those numbers are not
+  // transferable to a character at all.
+  .char_cam_response_scale = 2.f,
+  // Below 1 because this multiplies probe-lit ambient and cannot prove the pixel was
+  // lit; a face going to solid black reads as a hole.
+  .char_cam_max_darkening = 0.6f,
   .char_cam_isfast_enabled = 1.f,
   .char_cam_debug = 0.f,
-  // ── Character Shadowing: custom sun pass ──
-  .char_sun_enabled = 1.f,
-  .char_sun_strength = 1.f,
-  .char_sun_sample_count = 8.f,
-  .char_sun_ray_length = 2.f,
-  .char_sun_thickness = 0.29f,
-  .char_sun_bias = 0.0001f,
-  .char_sun_normal_bias = 0.1f,
-  .char_sun_response_scale = 4.f,
-  // 0.5, not 1: this pass multiplies the resolved character colour and is gated
-  // by range + NdotL rather than by a real CSM visibility read, so it has no
-  // hard guarantee that every pixel it touches is sunlit. Half strength is the
-  // honest cost of that.
-  .char_sun_max_darkening = 0.5f,
-  .char_sun_isfast_enabled = 1.f,
-  .char_sun_range = 0.f,
-  .char_sun_debug = 0.f,
-  // Pad, not a setting. See the field's comment in shared.h: the struct has to end
-  // on a float4 boundary for the host's CB13 range to match what fxc declares.
-  .char_shadowing_reserved = 0.f,
+  // char_shadowing_reserved is deliberately NOT initialised: it is padding, and an
+  // aggregate initialiser value-initialises it to zero on its own. See the field's
+  // comment in shared.h -- the struct has to end on a float4 boundary for the host's
+  // CB13 range to match what fxc declares.
   };
 
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
@@ -1783,46 +1776,20 @@ static bool OnBeforeKaiVolFogDraw(reshade::api::command_list* cmd_list) {
 
 // -- Inline shadow-march inputs (t35 noise, t36 depth) --
 //
-// Two consumers run a contact march inside a pixel shader rather than in a compute
-// pass: the local-light march in the dynamic light loops, and the custom character
-// sun pass at the character early return. Both need the same two resources a pass
-// would have supplied, and both read the same two slots, so they are bound together
-// and gated together rather than given a second pair.
+// The local-light march runs inside the dynamic light loops rather than in a pass, so
+// it needs the two resources a pass would have supplied: the depth buffer and the
+// noise volume. They go to slots the lighting shaders declare for the shadow path
+// alone (t35/t36), never to the game's own registers.
 //
-// Split out of DeployShadows and called BEFORE its "no compute pass is on" early-out
-// on purpose: the character sun pass is enabled independently of Contact Shadows, and
-// in that configuration DeployShadows used to return before reaching any push. The
-// symptom would be a sun pass that samples whatever t35/t36 last held, which reads as
-// noise rather than as a missing binding.
+// Split out of DeployShadows purely for readability -- it is one gate and two pushes.
+// It is called from the same place the inline block used to live, after the contact
+// and micro enables are known.
 static void pushInlineShadowInputs(reshade::api::command_list* cmd_list, DeviceData* d) {
-  const bool local_march = shader_injection.cs_contact_enabled > 0.5f
-      && shader_injection.cs_contact_local_enabled > 0.5f;
-  const bool char_sun = shader_injection.char_shadow_mode >= 1.5f
-      && shader_injection.char_sun_enabled >= 0.5f;
-  if (!local_march && !char_sun) return;
-
-  // The volume has to be loaded here, not only inside RunShadows: that call is gated
-  // on the contact pass's own IS-FAST toggle and is skipped entirely when Contact
-  // Shadows is off, which is exactly the configuration where the character sun pass
-  // is the only consumer left.
-  //
-  // The load is gated on the IS-FAST MASTER, not on whether the volume happens to be
-  // bound yet. There are three writers of cs_noise_frame in the frame -- this one, the
-  // character/SSAO hook, and RunShadows -- and they each read the same frame counter
-  // in whatever order the game happens to issue its draws. If they disagreed about
-  // whether to attempt a load, the value each consumer read would depend on that
-  // order; gating them all on the one master toggle makes them order-independent.
-  //
-  // cs_noise_frame is written for the same reason, and by the same argument. It is
-  // the temporal slice both inline marches jitter with, and -1 pins it to slice 0
-  // forever -- one fixed pattern, which is not noise and does not average out. The
-  // two writers have to agree or the camera pass and the sun pass on the same frame
-  // march with different dither.
-  if (g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(cmd_list->get_device(), d);
-  const bool isfast_ready = d->isfast_texture_loaded && d->isfast_noise_srv.handle != 0u;
-  shader_injection.cs_noise_frame = isfast_ready
-      ? static_cast<float>(d->frame_index % 32u) : -1.f;
-  if (isfast_ready) {
+  if (!(shader_injection.cs_contact_enabled > 0.5f
+        && shader_injection.cs_contact_local_enabled > 0.5f)) {
+    return;
+  }
+  if (d->isfast_noise_srv.handle) {
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{
@@ -1864,10 +1831,12 @@ static void DeployShadows(reshade::api::command_list* cmd_list, int fromHook) {
 
   const bool micro_on = shader_injection.cs_micro_enabled > 0.5f;
   const bool contact_on = shader_injection.cs_contact_enabled > 0.5f;
-  // Before the early-out: this binds the inputs for the two inline marches, and
-  // either of those can be the only shadow feature enabled in the frame.
-  pushInlineShadowInputs(cmd_list, d);
   if (!micro_on && !contact_on) return;
+
+  // The local-light march runs inside the dynamic light loop rather than in a pass,
+  // so it needs the two resources a pass would have supplied: the depth buffer and
+  // the noise volume.
+  pushInlineShadowInputs(cmd_list, d);
 
   // The shadow grid is the DEPTH buffer's grid: both passes read depth, and both
   // sample the G-buffer on the same texels. Sizing the output to anything else
@@ -3016,20 +2985,16 @@ renodx::utils::settings::Settings settings = {
       .section = "Character Shadowing",
       .tooltip = "Which character shadowing technique runs. Vanilla is the ENGINE's "
                  "own 10-step camera-facing march, untouched. Custom replaces it with "
-                 "two independent screen-space contact marches -- one along the same "
-                 "camera-facing axis, one toward the sun -- each with its own tuning "
-                 "and its own toggle. Off by default, so the contact and micro terms "
-                 "own character shadowing unless you deliberately want a character "
-                 "term as well. Hidden on Kyoto, which has no character lighting "
-                 "pass, and on Daybreak 2, which is out of scope for this add-on.",
+                 "a screen-space contact march along the same camera-facing axis, with "
+                 "a tunable sample count, coverage-based response and IS-FAST dither. "
+                 "Off by default, so the contact and micro terms own character "
+                 "shadowing unless you deliberately want a character term as well. "
+                 "Hidden on Kyoto, which has no character lighting pass, and on "
+                 "Daybreak 2, which is out of scope for this add-on.",
       .labels = {"Off", "Vanilla", "Custom"},
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     // ── Character Shadowing: custom camera pass ──
-    // The two passes below deliberately have identical slider sets, defaults and
-    // ranges. They answer different questions and are applied at different sites,
-    // so sharing one set is what makes the two comparable while they are tuned --
-    // a difference in the lists would read as a difference in meaning.
     new renodx::utils::settings::Setting{
       .key = "CharCamEnabled", .binding = &shader_injection.char_cam_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -3068,22 +3033,29 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharCamRayLength", .binding = &shader_injection.char_cam_ray_length,
       .default_value = 0.02f, .label = "Camera Ray Length", .section = "Character Shadowing",
-      .tooltip = "March length in world units. The engine's own march is a short "
-                 "silhouette term, so this wants to stay small; set the Camera Debug "
-                 "view to 'Axis Length' to read the engine's real value off screen "
-                 "rather than guessing at it.",
-      .min = 0.001f, .max = 2.f, .format = "%.4f",
+      .tooltip = "March length in world units (1 unit is about 1 metre, a head about "
+                 "0.18). This is a SILHOUETTE reach, not a contact one: the axis is the "
+                 "camera axis, so the ray always heads into the receiver's own surface "
+                 "and a screen-space depth test cannot tell that from a real occluder. "
+                 "The engine's vanilla march has the same degeneracy and only survives "
+                 "it because it is a binary any-hit that the AO channel smooths "
+                 "temporally. Expect a softened depth gradient, not a shadow.",
+      .min = 0.001f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamThickness", .binding = &shader_injection.char_cam_thickness,
-      .default_value = 0.29f, .label = "Camera Surface Thickness", .section = "Character Shadowing",
-      .tooltip = "How thick an occluder is assumed to be, in world units. Also acts "
-                 "as the validity filter for samples that have drifted out of "
-                 "register with the depth they are compared against.",
-      .min = 0.001f, .max = 4.f, .format = "%.3f",
+      .default_value = 0.2f, .label = "Camera Surface Thickness", .section = "Character Shadowing",
+      .tooltip = "How thick an occluder is assumed to be, in world units. KEEP THIS "
+                 "COMPARABLE TO RAY LENGTH. A band much larger than the ray puts the "
+                 "whole ray inside or outside it, which collapses the coverage "
+                 "estimator into a binary any-hit test and makes Sample Count do "
+                 "nothing. At the original 0.29 against a 0.02 ray that is exactly what "
+                 "happened. It also acts as the validity filter for samples that have "
+                 "drifted out of register with the depth they are compared against.",
+      .min = 0.0005f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
@@ -3091,30 +3063,38 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharCamBias", .binding = &shader_injection.char_cam_bias,
       .default_value = 0.0001f, .label = "Camera Depth Bias", .section = "Character Shadowing",
-      .tooltip = "Minimum penetration before a sample counts as a hit. Raise it to "
-                 "stop thin features (hair, straps) shadowing themselves.",
-      .min = 0.f, .max = 0.2f, .format = "%.4f",
+      .tooltip = "Extra penetration required beyond the normal lift. The shader passes "
+                 "lift + this to the marcher as its hit threshold, which is what stops "
+                 "the receiver reporting itself as its own occluder.",
+      .min = 0.f, .max = 0.05f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamNormalBias", .binding = &shader_injection.char_cam_normal_bias,
-      .default_value = 0.0075f, .label = "Camera Normal Bias", .section = "Character Shadowing",
-      .tooltip = "Lift along the surface normal before marching. Without it the "
-                 "first sample sits on the receiver's own depth and reports a "
-                 "self-hit, which reads as a dark band over the whole character.",
-      .min = 0.f, .max = 1.f, .format = "%.4f",
+      .default_value = 0.0015f, .label = "Camera Normal Bias", .section = "Character Shadowing",
+      .tooltip = "Lift along the surface normal, and simultaneously the floor of the "
+                 "marcher's hit threshold (the shader passes lift + Depth Bias). "
+                 "Without it the first sample sits on the receiver's own depth and "
+                 "reports a self-hit, which reads as a dark band over the whole "
+                 "character. Keep it small relative to Ray Length: the original 0.0075 "
+                 "was a third of a 0.02 ray, so the march started in free air beside "
+                 "the face.",
+      .min = 0.f, .max = 0.05f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamResponseScale", .binding = &shader_injection.char_cam_response_scale,
-      .default_value = 4.f, .label = "Camera Response Scale", .section = "Character Shadowing",
-      .tooltip = "How strongly the camera term reads, relative to the ORIGINAL "
-                 "4-sample appearance. At Sample Count 4 and scale 4 the estimator "
-                 "is exactly the old binary any-hit test, value for value.",
+      .default_value = 2.f, .label = "Camera Response Scale", .section = "Character Shadowing",
+      .tooltip = "How strongly the camera term reads. Higher makes each agreeing "
+                 "sample count for more, so this is a strength control once the band "
+                 "and the ray are the same size. It defaults to 2 rather than the 4 "
+                 "that reproduces the old binary any-hit exactly: at 4 with 8 samples a "
+                 "single spurious sample already costs half the available darkening, "
+                 "which is what made this read as a hard patch.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
@@ -3122,9 +3102,11 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamMaxDarkening", .binding = &shader_injection.char_cam_max_darkening,
-      .default_value = 1.f, .label = "Camera Max Darkening", .section = "Character Shadowing",
-      .tooltip = "Cap on how dark a shadowed character pixel may get. 1 permits "
-                 "solid black, 0 removes the effect.",
+      .default_value = 1.0f, .label = "Camera Max Darkening", .section = "Character Shadowing",
+      .tooltip = "Cap on how dark a shadowed character pixel may get. 0 removes the "
+                 "effect, 1 permits solid black. Capped below 1 by default because "
+                 "this pass multiplies probe-lit ambient and cannot prove the pixel "
+                 "was lit, and a face going to solid black reads as a hole.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
@@ -3148,150 +3130,15 @@ renodx::utils::settings::Settings settings = {
       .key = "CharCamDebug", .binding = &shader_injection.char_cam_debug,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Camera Debug View", .section = "Character Shadowing",
-      .tooltip = "Axis Length reports the world-space magnitude of the engine's "
-                 "rayMarchShadowDir_g, which is the number the Ray Length default "
-                 "should be measured against.",
+      .tooltip = "Axis Length reports the magnitude of the engine's rayMarchShadowDir_g "
+                 "on a log scale. It is on a log scale because nothing in the engine "
+                 "settles whether that symbol is a unit direction (Daybreak 2's 39-step "
+                 "character march reads as if it is) or a pre-scaled vector (the Sora "
+                 "and Kai 10-step march needs it to be), and a linear greyscale cannot "
+                 "show both.",
       .labels = {"Off", "Raw Term", "Coverage", "Axis Length"},
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    // ── Character Shadowing: custom sun pass ──
-    new renodx::utils::settings::Setting{
-      .key = "CharSunEnabled", .binding = &shader_injection.char_sun_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Sun Pass", .section = "Character Shadowing",
-      .tooltip = "A depth march from the character toward the sun, applied on top of "
-                 "the camera pass rather than blended into it. Independent of the "
-                 "camera pass: either, both or neither can run. NOTE: characters "
-                 "leave the lighting shader before the sun composite, so this has no "
-                 "separable sun term to attach to and multiplies the resolved "
-                 "character colour instead. It is gated on the cascade range and on "
-                 "NdotL, NOT on a real shadow-map read, so verify Sun Debug View = "
-                 "Gate is black indoors before trusting it.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunStrength", .binding = &shader_injection.char_sun_strength,
-      .default_value = 1.f, .label = "Sun Strength", .section = "Character Shadowing",
-      .tooltip = "Blend strength for the sun-facing character term.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunSamples", .binding = &shader_injection.char_sun_sample_count,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 8.f, .label = "Sun Sample Count", .section = "Character Shadowing",
-      .tooltip = "March steps for the sun pass. Quality/noise only, for the same "
-                 "reason as the camera pass.",
-      .min = 1.f, .max = 32.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunRayLength", .binding = &shader_injection.char_sun_ray_length,
-      .default_value = 2.f, .label = "Sun Ray Length", .section = "Character Shadowing",
-      .tooltip = "March length toward the sun, in world units. The sun is a "
-                 "directional light, so this is a reach limit rather than a "
-                 "distance-to-light.",
-      .min = 0.1f, .max = 50.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunThickness", .binding = &shader_injection.char_sun_thickness,
-      .default_value = 0.29f, .label = "Sun Surface Thickness", .section = "Character Shadowing",
-      .tooltip = "How thick an occluder is assumed to be, in world units.",
-      .min = 0.001f, .max = 4.f, .format = "%.3f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunBias", .binding = &shader_injection.char_sun_bias,
-      .default_value = 0.0001f, .label = "Sun Depth Bias", .section = "Character Shadowing",
-      .tooltip = "Minimum penetration before a sample counts as a hit. Raise it if a "
-                 "character shadows itself from the light it is directly facing.",
-      .min = 0.f, .max = 0.2f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunNormalBias", .binding = &shader_injection.char_sun_normal_bias,
-      .default_value = 0.1f, .label = "Sun Normal Bias", .section = "Character Shadowing",
-      .tooltip = "Lift along the surface normal before marching toward the sun. Same "
-                 "self-hit reasoning as the camera pass.",
-      .min = 0.f, .max = 1.f, .format = "%.4f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunResponseScale", .binding = &shader_injection.char_sun_response_scale,
-      .default_value = 4.f, .label = "Sun Response Scale", .section = "Character Shadowing",
-      .tooltip = "How strongly the sun term reads, relative to the ORIGINAL 4-sample "
-                 "appearance. At Sample Count 4 and scale 4 the estimator is exactly "
-                 "the old binary any-hit test.",
-      .min = 0.f, .max = 8.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunMaxDarkening", .binding = &shader_injection.char_sun_max_darkening,
-      .default_value = 0.5f, .label = "Sun Max Darkening", .section = "Character Shadowing",
-      .tooltip = "Cap on how dark a shadowed character pixel may get. Defaults to "
-                 "half rather than full because this pass has no CSM visibility read "
-                 "to prove the pixel was sunlit; the cap is the margin for that.",
-      .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunISFAST", .binding = &shader_injection.char_sun_isfast_enabled,
-      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Sun IS-FAST Jitter", .section = "Character Shadowing",
-      .tooltip = "Dither the step offset with IS-FAST blue noise. Unlike the camera "
-                 "pass this term is NOT written to a temporally resolved channel -- it "
-                 "multiplies the final character colour -- so its noise is visible "
-                 "per frame. Leave it on, and consider a lower Sample Count if the "
-                 "dither reads as shimmer on a moving character.",
-      .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunRange", .binding = &shader_injection.char_sun_range,
-      .default_value = 0.f, .label = "Sun Range", .section = "Character Shadowing",
-      .tooltip = "World-space cutoff for the sun term, measured as radial distance "
-                 "from the camera. 0 = derive it from the engine's own last cascade "
-                 "split, which is the correct value indoors but is an inference on the "
-                 "Sora titles. Tighten it if Sun Debug View = Gate shows the term "
-                 "firing indoors.",
-      .min = 0.f, .max = 500.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
-    },
-    new renodx::utils::settings::Setting{
-      .key = "CharSunDebug", .binding = &shader_injection.char_sun_debug,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f, .label = "Sun Debug View", .section = "Character Shadowing",
-      .tooltip = "Gate renders the range-and-NdotL gate as greyscale. It is the "
-                 "load-bearing diagnostic for this pass: white means the term is live "
-                 "there, so a white pixel indoors is a mis-gated pass, not a shadow.",
-      .labels = {"Off", "Raw Term", "Gate"},
-      .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
-                               && shader_injection.char_sun_enabled >= 0.5f; },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{

@@ -279,7 +279,12 @@ void main(
           charCamRawTerm = FalcomContactShadowMarch(
               clipA, clipB, FalcomDepthUnpackConsts(), depthTexture, samPoint_s,
               max(0.0, shader_injection_data.char_cam_thickness),
-              max(0.0, shader_injection_data.char_cam_bias),
+              // Lift folded into the hit threshold, so the receiver sits exactly on it
+              // and can never satisfy it. Without this the ray -- which is the camera
+              // axis, so it always heads into the character's own surface -- reports
+              // the character as its own occluder for the whole march.
+              max(0.0, shader_injection_data.char_cam_normal_bias)
+                  + max(0.0, shader_injection_data.char_cam_bias),
               max(1.0, floor(shader_injection_data.char_cam_sample_count + 0.5)),
               camJitter,
               max(0.0, shader_injection_data.char_cam_response_scale),

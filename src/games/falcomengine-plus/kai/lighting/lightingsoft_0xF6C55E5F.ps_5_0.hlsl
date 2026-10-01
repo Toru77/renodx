@@ -847,37 +847,14 @@ void main(
 
     // Add GTVBAO VBGI to early-return output (bypassing game's SSGI formula)
     r4.yzw = r4.yzw + r24.xyz;
-    // Custom character SUN contact shadow. See FalcomApplyCharSunShadow for why this
-    // has to attach to the resolved colour, and for why its gate is the whole defence
-    // rather than an optimisation.
-    //
-    // is_character_pixel (mrt0.z bit 8) is the same test that opened this block, so
-    // the gate is a pass-through today. It is passed anyway so the four lighting
-    // shaders share one call shape and so relocating this outside the branch later
-    // fails closed instead of quietly darkening the environment. mrt0_raw is the load
-    // at 372 and is never overwritten.
-    float2 charSunDiag;
-    r4.yzw = FalcomApplyCharSunShadow(
-        r4.yzw, is_character_pixel,
-        csDepthTex.SampleLevel(samPoint_s, v1.xy, 0).x,
-        DecodeFalcomMrtNormal(mrt0_raw.xy), v1.xy, v0.xy, shadowSplitDistance_g.y,
-        csDepthTex, samPoint_s, csIsfastNoise, charSunDiag);
     // Early return BEFORE the sun composite at 1498, and r4.yzw is built from the
-    // character/SSGI terms with no isolable sun contribution. The generic Contact
-    // Shadows term is therefore still not applied here: the custom character sun pass
-    // above is what covers characters now. Micro still applies.
+    // character/SSGI terms with no isolable sun contribution. Contact is therefore
+    // not applied here: attaching it to the final colour instead is the bug that put
+    // contact shadows in interiors. Micro still applies.
     o0.xyz = FalcomApplyShadowTerms(r4.yzw, v1.xy, is_character_pixel, samPoint_s,
                                     microShadowTex, contactShadowTex);
     o0.w = 1;
     o1.xyzw = r1.xyzw;
-    // Sun Debug View, after FalcomApplyShadowTerms so it shows what this pass did and
-    // not the micro term layered on top of it.
-    float3 charSunDbgColour;
-    if (FalcomCharSunDebugView(charSunDiag, is_character_pixel,
-                               (int)shader_injection_data.char_sun_debug, charSunDbgColour)) {
-      o0.xyz = charSunDbgColour;
-      o0.w = 1;
-    }
     return;
   }
   r3.x = (int)r3.z & 255;
