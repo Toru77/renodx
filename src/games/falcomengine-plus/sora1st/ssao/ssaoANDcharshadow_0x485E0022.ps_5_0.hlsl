@@ -80,8 +80,10 @@ Texture2D<float4> depthTexture : register(t0);
 Texture2D<uint4> mrtTexture0 : register(t1);
 Texture2D<float4> intensityMap : register(t2);
 Texture2D<float4> prevTexture : register(t3);
+Texture3D<float2> csIsfastNoise : register(t35);  // IS-FAST volume, custom camera pass dither
 
 #include "../../shared.h"
+#include "../../shadows/shadows_common.hlsli"
 #include "../../reference/rendering.hlsl"
 
 
@@ -102,6 +104,27 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
 
+  // Saved at the mrt load because r1 is overwritten repeatedly below and the
+  // character bit is needed again at the very end of main by the custom camera pass
+  // debug view. The .xy half was already being kept this way.
+  uint mrt0_z_raw;
+
+  // Custom camera pass diagnostics, written inside the character branch and read by
+  // the debug block at the very end of main. Declared at function scope because that
+  // block is outside the branch; defaulted to lit/unmeasured so mode 0, mode 1 and
+  // every early-out in the march report "nothing" rather than a value never computed.
+  float charCamRawTerm = 1.0f;
+  float charCamAxisLen = 0.0f;
+  float charCamValid = 0.0f;
+  // The reconstructed VIEW position, snapshotted at the projInv divide below (which
+  // runs for every pixel, not just characters). The vanilla march below turns it into
+  // a world position in r6.xyz, but r6 is sphere-loop scratch by the time control
+  // reaches the custom pass, so that value is only readable from inside the branch
+  // that wrote it. The custom pass therefore takes its own copy and does the same
+  // world transform itself, rather than depending on which registers the branch it
+  // does not run happened to leave intact.
+  float3 charViewPos = float3(0.0, 0.0, 0.0);
+
   r0.z = depthTexture.SampleLevel(samLinear_s, v1.xy, 0).x;
   mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
   r1.xy = fDest.xy;
@@ -111,6 +134,7 @@ void main(
   r1.xy = (int2)r1.xy;
   r1.zw = float2(0,0);
   r1.xyzw = mrtTexture0.Load(r1.xyz).xyzw;
+  mrt0_z_raw = (uint)r1.w;
   uint2 mrt0_xy_raw = (uint2)r1.xy;
   r0.xy = v1.zw * float2(2,-2) + float2(-1,1);
   r0.w = 1;
@@ -119,6 +143,7 @@ void main(
   r2.z = dot(r0.xyzw, projInv_g._m02_m12_m22_m32);
   r2.w = dot(r0.xyzw, projInv_g._m03_m13_m23_m33);
   r2.xyz = r2.xyz / r2.www;
+  charViewPos = r2.xyz;
   r4.w = 1.0;
   r3.x = (int)r1.w & 1;
   if (r3.x != 0) {
@@ -182,9 +207,11 @@ void main(
       r4.z = (int)r4.z + 1;
     }
       r5.y = 0.100000001 * r1.y;
-      // 0 = off, 1 = the engine's own camera-facing march. Mode 2 (the deleted
-      // Bend_SSS ray-march) is gone, so anything other than 1 takes the off path.
-      int charShadowMode = (shader_injection_data.char_shadow_mode >= 0.5f) ? 1 : 0;
+      // 0 = off, 1 = the engine's own camera-facing march, 2 = our custom
+      // camera-facing contact march. Modes 1 and 2 write the same channel and are
+      // consumed by the same `char_shadow_mode >= 0.5f` gate in the lighting shader, so
+      // nothing downstream has to know which one produced the value.
+      int charShadowMode = clamp((int)round(shader_injection_data.char_shadow_mode), 0, 2);
 
       if (charShadowMode == 1) {
         r2.w = 1;
@@ -221,12 +248,65 @@ void main(
         }
         r1.x = 1 + -r1.x;
         r1.x = max(0, r1.x);
+      } else if (charShadowMode == 2 && shader_injection_data.char_cam_enabled >= 0.5f) {
+        // Custom camera-facing contact march: the same family of shadow the vanilla
+        // block above produces -- same axis, same normal lift, same output channel --
+        // but through the shared clip-space marcher, so the sample count, response
+        // scale, thickness, bias and IS-FAST dither are tunable instead of being
+        // engine constants.
+        //
+      // Two register facts make this readable rather than a rewrite: r4.xyw is the
+      // world-space MRT normal the vanilla branch also marches from, and charViewPos
+      // is the view position that branch starts from. The world transform below is the
+      // same one the vanilla branch performs on r6.xyz -- a register it writes itself,
+      // and loop scratch besides, so it is not readable from here.
+      const float3 camAxis = FalcomCameraFacingAxis(rayMarchShadowDir_g);
+      const float3 charNormalWS = FalcomSafeNormalize3(r4.xyw, float3(0.0, 0.0, 0.0));
+      charCamAxisLen = length(rayMarchShadowDir_g);
+      if (FalcomNormalValid(camAxis) && FalcomNormalValid(charNormalWS)) {
+        const float3 charPosWS = mul(float4(charViewPos, 1.0), viewInv_g).xyz
+            + charNormalWS * max(0.0, shader_injection_data.char_cam_normal_bias);
+          const float4 clipA = mul(float4(charPosWS, 1.0), viewProj_g);
+          const float4 clipB = mul(float4(
+              charPosWS + camAxis * max(0.0, shader_injection_data.char_cam_ray_length), 1.0),
+              viewProj_g);
+          if (abs(clipA.w) > 1e-6 && abs(clipB.w) > 1e-6) {
+            const float camJitter = shader_injection_data.char_cam_isfast_enabled > 0.5f
+                ? FalcomSampleISFAST(csIsfastNoise, samPoint_s, uint2(v0.xy),
+                                     (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
+                                     128.0, 32.0,
+                                     shader_injection_data.shadow_isfast_spatial_scale,
+                                     shader_injection_data.shadow_isfast_temporal_speed,
+                                     shader_injection_data.shadow_isfast_seed_offset,
+                                     shader_injection_data.shadow_isfast_texture_loaded)
+                : 0.5f;
+            charCamRawTerm = FalcomContactShadowMarch(
+                clipA, clipB, FalcomDepthUnpackConsts(), depthTexture, samPoint_s,
+                max(0.0, shader_injection_data.char_cam_thickness),
+                max(0.0, shader_injection_data.char_cam_bias),
+                max(1.0, floor(shader_injection_data.char_cam_sample_count + 0.5)),
+                camJitter,
+                max(0.0, shader_injection_data.char_cam_response_scale),
+                resolutionScaling_g.xy);
+            charCamValid = 1.0f;
+            r1.x = FalcomShadowStrength(
+                charCamRawTerm, shader_injection_data.char_cam_strength,
+                /*isCharacter=*/true, 1.0, 1.0,
+                shader_injection_data.char_cam_max_darkening);
+          } else {
+            r1.x = 1;
+          }
+        } else {
+          r1.x = 1;
+        }
       } else {
-        // Off, and the retired Bend_SSS mode. The camera and world screen-space
-        // shadow raymarchs that used to run here are replaced by the Contact /
-        // Micro Shadow compute passes, which the lighting shader reads at t33/t34
-        // with the environment/character split. This pass therefore no longer
-        // writes a shadow into the .z channel.
+        // Off, and Custom with the camera pass switched off. The camera and world
+        // screen-space shadow raymarchs that used to run here are replaced by the
+        // Contact / Micro Shadow compute passes, which the lighting shader reads at
+        // t33/t34 with the environment/character split. This pass therefore no longer
+        // writes a shadow into the .z channel on this path; Custom writes 1.0, which
+        // the lighting shader's `char_shadow_mode >= 0.5f` gate still multiplies in as
+        // a no-op.
         r1.x = 1;
       }
     r3.yz = float2(0.5,0.5) + -v1.zw;
@@ -368,9 +448,22 @@ void main(
     // Env SSS is extracted to the lighting pass.
   }
   r4.xy = float2(1,1) + -r5.xy;
+  // Custom camera pass debug, resolved ONCE and applied at both exits below. This
+  // pass has two: the GTVBAO shortcut and the temporal blend. A view reachable from
+  // only one of them would look like a broken setting whenever the other was active,
+  // which is exactly when someone is diagnosing. Only character pixels are touched;
+  // this pass also writes the environment AO, and painting that with a
+  // character-only diagnostic reads as a broken frame rather than a debug view.
+  float3 charCamDbgColour;
+  const bool charCamDbgActive = (mrt0_z_raw & 1u) != 0u
+      && FalcomCharCamDebugView(charCamRawTerm, charCamAxisLen, charCamValid,
+                                (int)shader_injection_data.char_cam_debug,
+                                shader_injection_data.char_cam_response_scale,
+                                charCamDbgColour);
   // When GTVBAO is active, skip temporal blend — preserve character shadow in z.
   if (shader_injection_data.gtvbao_mode > 0.5f) {
     o0 = float4(1, 1, r4.z, 1);
+    if (charCamDbgActive) o0.rgb = charCamDbgColour;
     return;
   }
   r1.x = dot(r0.xyzw, viewProjInv_g._m00_m10_m20_m30);
@@ -390,5 +483,6 @@ void main(
   r1.xyz = r4.xyz + -r0.xyz;
   o0.xyz = r1.xyz * float3(0.25,0.25,1) + r0.xyz;
   o0.w = saturate(r4.w);
+  if (charCamDbgActive) o0.rgb = charCamDbgColour;
   return;
 }

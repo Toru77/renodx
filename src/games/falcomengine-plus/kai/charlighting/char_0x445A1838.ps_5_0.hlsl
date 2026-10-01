@@ -87,6 +87,7 @@ Texture2D<uint4> mrtTexture0 : register(t2);
 Texture2D<float4> prevTexture : register(t3);
 Texture2D<float4> microShadowTex : register(t33);      // Micro Shadows term + diagnostics (rgba8_unorm)
 Texture2D<float4> contactShadowTex : register(t34);    // Contact Shadows term + diagnostics (rgba8_unorm)
+Texture3D<float2> csIsfastNoise : register(t35);       // IS-FAST volume, custom camera pass dither
 
 #include "../../shared.h"
 #include "../../shadows/shadows_common.hlsli"
@@ -104,6 +105,20 @@ void main(
   float4 r0,r1,r2,r3,r4,r5;
   uint4 bitmask, uiDest;
   float4 fDest;
+
+  // Custom camera pass diagnostics, written inside the character branch and read by
+  // the debug block at the very end of main. Declared at function scope because that
+  // block is outside the branch; defaulted to lit/unmeasured so mode 0, mode 1 and
+  // every early-out in the march report "nothing" rather than a value never computed.
+  float charCamRawTerm = 1.0f;
+  float charCamAxisLen = 0.0f;
+  float charCamValid = 0.0f;
+  // The reconstructed VIEW position, snapshotted at the projInv divide below. The
+  // vanilla march below turns it into a world position in r3.xyz, but r3 is
+  // sphere-loop scratch by the time control reaches the custom pass, so that value is
+  // only readable from inside the branch that wrote it. The custom pass therefore
+  // takes its own copy and does the same world transform itself.
+  float3 charViewPos = float3(0.0, 0.0, 0.0);
 
   r0.z = depthTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
   mrtTexture0.GetDimensions(0, fDest.x, fDest.y, fDest.z);
@@ -125,6 +140,7 @@ void main(
     r2.z = dot(r0.xyzw, projInv_g._m02_m12_m22_m32);
     r1.z = dot(r0.xyzw, projInv_g._m03_m13_m23_m33);
     r2.xyz = r2.xyz / r1.zzz;
+    charViewPos = r2.xyz;
     r1.xy = (uint2)r1.xy;
     r1.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);
     r1.z = 3.14159274 * r1.z;
@@ -185,9 +201,11 @@ void main(
       r4.z = (int)r4.z + 1;
     }
     r1.z = 0.100000001 * r3.w;
-    // 0 = off, 1 = the engine's own camera-facing march. Mode 2 (the deleted
-    // Bend_SSS ray-march) is gone, so anything other than 1 takes the off path.
-    int charShadowMode = (shader_injection_data.char_shadow_mode >= 0.5f) ? 1 : 0;
+    // 0 = off, 1 = the engine's own camera-facing march, 2 = our custom
+    // camera-facing contact march. Modes 1 and 2 write the same channel and are
+    // consumed by the same `char_shadow_mode >= 0.5f` gate in the lighting shader, so
+    // nothing downstream has to know which one produced the value.
+    int charShadowMode = clamp((int)round(shader_injection_data.char_shadow_mode), 0, 2);
 
     if (charShadowMode == 1) {
       // Vanilla: game's native 10-step ray-march camera shadow
@@ -226,12 +244,64 @@ void main(
       }
       r1.x = 1 + -r2.w;
       r1.x = max(0, r1.x);
+    } else if (charShadowMode == 2 && shader_injection_data.char_cam_enabled >= 0.5f) {
+      // Custom camera-facing contact march: the same family of shadow the vanilla
+      // block above produces -- same axis, same normal lift, same output channel --
+      // but through the shared clip-space marcher, so the sample count, response
+      // scale, thickness, bias and IS-FAST dither are tunable instead of being
+      // engine constants.
+      //
+      // Two register facts make this readable rather than a rewrite: r1.xyw is the
+      // world-space MRT normal the vanilla branch also marches from, and charViewPos
+      // is the view position that branch starts from. The world transform below is the
+      // same one the vanilla branch performs on r3.xyz -- a register it writes itself,
+      // and loop scratch besides, so it is not readable from here.
+      const float3 camAxis = FalcomCameraFacingAxis(rayMarchShadowDir_g);
+      const float3 charNormalWS = FalcomSafeNormalize3(r1.xyw, float3(0.0, 0.0, 0.0));
+      charCamAxisLen = length(rayMarchShadowDir_g);
+      if (FalcomNormalValid(camAxis) && FalcomNormalValid(charNormalWS)) {
+        const float3 charPosWS = mul(float4(charViewPos, 1.0), viewInv_g).xyz
+            + charNormalWS * max(0.0, shader_injection_data.char_cam_normal_bias);
+        const float4 clipA = mul(float4(charPosWS, 1.0), viewProj_g);
+        const float4 clipB = mul(float4(
+            charPosWS + camAxis * max(0.0, shader_injection_data.char_cam_ray_length), 1.0),
+            viewProj_g);
+        if (abs(clipA.w) > 1e-6 && abs(clipB.w) > 1e-6) {
+          const float camJitter = shader_injection_data.char_cam_isfast_enabled > 0.5f
+              ? FalcomSampleISFAST(csIsfastNoise, samPoint_s, uint2(v0.xy),
+                                   (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
+                                   128.0, 32.0,
+                                   shader_injection_data.shadow_isfast_spatial_scale,
+                                   shader_injection_data.shadow_isfast_temporal_speed,
+                                   shader_injection_data.shadow_isfast_seed_offset,
+                                   shader_injection_data.shadow_isfast_texture_loaded)
+              : 0.5f;
+          charCamRawTerm = FalcomContactShadowMarch(
+              clipA, clipB, FalcomDepthUnpackConsts(), depthTexture, samPoint_s,
+              max(0.0, shader_injection_data.char_cam_thickness),
+              max(0.0, shader_injection_data.char_cam_bias),
+              max(1.0, floor(shader_injection_data.char_cam_sample_count + 0.5)),
+              camJitter,
+              max(0.0, shader_injection_data.char_cam_response_scale),
+              resolutionScaling_g.xy);
+          charCamValid = 1.0f;
+          r1.x = FalcomShadowStrength(
+              charCamRawTerm, shader_injection_data.char_cam_strength,
+              /*isCharacter=*/true, 1.0, 1.0,
+              shader_injection_data.char_cam_max_darkening);
+        } else {
+          r1.x = 1;
+        }
+      } else {
+        r1.x = 1;
+      }
     } else {
-      // Off, and the retired Bend_SSS mode. The screen-space shadow raymarch that
-      // used to run here (camera and world variants) is replaced by the Contact /
-      // Micro Shadow compute passes, whose terms are applied at the output site
-      // below with the character/environment split. Kai's lighting shader no
-      // longer reads the SSS channel this pass used to write.
+      // Off, and Custom with the camera pass switched off. The environment
+      // screen-space shadow raymarchs that used to run here are replaced by the
+      // Contact / Micro Shadow compute passes, which the lighting shader reads at
+      // t33/t34. This pass therefore no longer writes a shadow into the .z channel
+      // on this path; Custom writes 1.0, which the lighting shader's
+      // `char_shadow_mode >= 0.5f` gate still multiplies in as a no-op.
       r1.x = 1;
     }
 
@@ -272,8 +342,8 @@ void main(
   // colour: there is no lightColor_g multiply and no ambient add to separate, so
   // contact has no sun term to attach to here. Micro still applies -- it is an
   // AO-driven aperture term and belongs on the resolved colour. This is also the
-  // pass that writes the ENGINE's character shadow into the AO target's .z, which
-  // the lighting shader's "Vanilla Character Shadowing" toggle consumes.
+  // pass that writes the character shadow into the AO target's .z, which the
+  // lighting shader's "Character Shadowing -> Mode" toggle consumes.
   o0.xyz = FalcomApplyShadowTerms(r1.xyz * float3(0.25,0.25,1) + r0.xyz, v1.zw,
                                   ((mrt0_z_class >> 8u) & 1u) != 0u, samPoint_s,
                                   microShadowTex, contactShadowTex);
@@ -310,6 +380,22 @@ void main(
     o0.w = 1;
   }
   // --- End SSS Debug ---
+
+  // --- Character Shadowing: custom camera pass debug ---
+  // Placed after the block above so it wins: it is the narrower view of the two and
+  // the one the user turned on deliberately. Only character pixels are touched --
+  // this pass also writes the environment AO, and painting that with a
+  // character-only diagnostic reads as a broken frame rather than as a debug view.
+  float3 charCamDbgColour;
+  if (((mrt0_z_class >> 8u) & 1u) != 0u
+      && FalcomCharCamDebugView(charCamRawTerm, charCamAxisLen, charCamValid,
+                                (int)shader_injection_data.char_cam_debug,
+                                shader_injection_data.char_cam_response_scale,
+                                charCamDbgColour)) {
+    o0.xyz = charCamDbgColour;
+    o0.w = 1;
+  }
+  // --- End Character Shadowing Debug ---
 
   return;
 }

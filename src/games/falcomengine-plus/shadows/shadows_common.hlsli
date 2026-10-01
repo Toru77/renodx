@@ -221,6 +221,16 @@ float2 FalcomSampleISFAST2(Texture3D<float2> volume, SamplerState noiseSampler,
 // deliberately NOT a parameter: in clip space the step size follows from the two
 // endpoints, so passing it would only create a second thing to keep consistent.
 //
+// `depthUvScale` exists because the games disagree about what space the depth
+// buffer's own UVs live in. The compute pass and all four lighting shaders sample
+// the same buffer unscaled, because the shadow targets are already sized to it.
+// The character and SSAO passes sample the game's own depth binding as
+// resolutionScaling_g.xy * uv, i.e. the depth buffer is at render resolution while
+// the interpolants are not. Marching with the wrong one tests the ray against the
+// wrong texels, so the caller states its convention and the default keeps every
+// existing call site byte-identical. Pass resolutionScaling_g.xy from the
+// character/SSAO passes, nothing from the compute and lighting paths.
+//
 // The depth texture is taken as Texture2D<float4>. The element type is irrelevant
 // (only .x is read) but the games disagree on it -- Kai declares depthTexture as
 // Texture2D<float> at t3, Sora and Kyoto declare Texture2D<float4> at t4 -- and
@@ -231,7 +241,8 @@ float2 FalcomSampleISFAST2(Texture3D<float2> volume, SamplerState noiseSampler,
 float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
                                Texture2D<float4> depthTex, SamplerState depthSampler,
                                float thickness, float bias,
-                               float sampleCount, float jitter, float responseScale)
+                               float sampleCount, float jitter, float responseScale,
+                               float2 depthUvScale = float2(1.0, 1.0))
 {
   if (sampleCount < 1.0) return 1.0;
   const float invSamples = rcp(sampleCount);
@@ -262,7 +273,8 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
     // a clamped fetch would test against the frame's border geometry instead.
     if (any(uv < 0.0) || any(uv > 1.0)) break;
 
-    const float sceneDepth = FalcomLinearDepth(depthTex.SampleLevel(depthSampler, uv, 0).x, unpack);
+    const float sceneDepth = FalcomLinearDepth(
+        depthTex.SampleLevel(depthSampler, uv * depthUvScale, 0).x, unpack);
     const float penetration = rayLinearDepth - sceneDepth;
     hits += (penetration > bias && penetration < thickness) ? 1.0 : 0.0;
 
@@ -272,6 +284,79 @@ float FalcomContactShadowMarch(float4 clipStart, float4 clipEnd, float2 unpack,
 
   return 1.0 - saturate(hits * invSamples * responseScale);
 }
+
+// ── Character shadow axis: rayMarchShadowDir_g is PRE-SCALED ──
+//
+// cb_local2's rayMarchShadowDir_g is not a unit direction. The engine uses it
+// directly as `dir * (0.0005 + 0.0015 * |dot(N, camRight)|)` across 10 steps
+// (kai/charlighting/char_0x445A1838:202-225, and the same block in both Sora
+// SSAO passes), so the effective world-space march length is an engine constant
+// scaled by a Fresnel-like term. The custom character pass therefore has to
+// NORMALISE it and take its own length from a user setting, or every "Ray Length"
+// value would be multiplied by a constant nobody can read and cannot be tuned.
+//
+// It is also the axis the engine calls camera-facing, and that is the whole point
+// of reusing it: the custom camera pass has to keep producing the same family of
+// shadow, only better resolved. Picking a different axis here would silently turn
+// the camera pass into a second sun pass.
+//
+// Returns a zero vector when the engine did not supply a direction; callers must
+// treat that as "no march" rather than as a direction.
+float3 FalcomCameraFacingAxis(float3 rayMarchShadowDir)
+{
+  return FalcomSafeNormalize3(rayMarchShadowDir, float3(0.0, 0.0, 0.0));
+}
+
+// ── Custom character camera pass: diagnostic view ──
+//
+// Renders the camera march's internals as a colour for the "Camera Debug View"
+// setting.
+//
+// A function rather than an inline block for two reasons. Three passes need it --
+// the Kai character pass and both Sora SSAO passes -- so one definition is the only
+// way the three cannot disagree about what a view means. And each of those passes
+// has more than one exit (the Sora pair shortcut out early when GTVBAO is on), so a
+// view reachable from only one exit would look like a broken setting whenever the
+// other was active, which is exactly when someone is diagnosing.
+//
+// Returns false when the view is off, in which case the caller must leave its own
+// output alone. `valid` is 0 when the march never ran for a reason -- no engine
+// axis, no usable MRT normal, a degenerate clip w -- and reports magenta, because
+// "did nothing" and "correctly found no occlusion" otherwise both render light.
+bool FalcomCharCamDebugView(float rawTerm, float axisLength, float valid,
+                            int view, float responseScale, out float3 colour)
+{
+  colour = float3(0.0, 0.0, 0.0);
+  if (view <= 0) return false;
+  if (valid < 0.5f) {
+    colour = float3(1.0, 0.0, 1.0);
+    return true;
+  }
+  if (view == 1) {
+    colour = rawTerm;
+    return true;
+  }
+  if (view == 2) {
+    // Hit fraction. The marcher returns 1 - saturate(coverage * responseScale), so
+    // dividing the dark fraction back out recovers the coverage the samples actually
+    // agreed on, which is the quantity Sample Count controls.
+    colour = saturate((1.0f - rawTerm) / max(responseScale, 1e-3f)).xxx;
+    return true;
+  }
+  // view == 3: |rayMarchShadowDir_g|, the engine constant the Ray Length default has
+  // to be measured against. Scaled x10 because the useful values sit near 0.02 and an
+  // unscaled greyscale would be indistinguishable from black.
+  colour = saturate(axisLength * 10.0f).xxx;
+  return true;
+}
+
+// ── Custom character sun contact shadow ──
+//
+// The custom character SUN contact march is NOT here: it needs FalcomRadialDistance
+// and FalcomSunRangeFade, which live further down with the sun-contact range gate it
+// shares its gating semantics with. Keeping the two together is why the character sun
+// pass and the environment sun contact can never disagree about what "inside the
+// range" means.
 
 // ── Output channel layout ──
 // Both passes write an rgba8_unorm target. RGBA8_UNORM is in the D3D11.0
@@ -411,6 +496,138 @@ float FalcomSunRangeFade(float radialDist, float rangeMax)
 {
   if (rangeMax <= 0.0) return 1.0;
   return saturate((rangeMax - radialDist) / max(rangeMax * 0.15, 1.0));
+}
+
+// ── Custom character SUN contact shadow ──
+//
+// Applies the sun-facing character contact march to an already resolved character
+// colour, and reports what it did through `diag` = (rawTerm, gate).
+//
+// WHY it multiplies the colour rather than a sun term. Every one of the four
+// lighting shaders returns for a character pixel BEFORE the sun composite: on the
+// character branch, before lightColor_g is ever applied and before the shadow map is
+// sampled (kai/lighting_0x430ED091:941, lightingsoft_0xF6C55E5F:880,
+// sora1st/lighting_0xFDAAF80E:697, sora2nd/lighting_0xCA3D8596:752). There is no sun
+// contribution there to peel out, so the term attaches to the whole colour. That is
+// the arrangement this file's own header calls the interior bug -- scaling a colour
+// that is all ambient -- so the gate below is not an optimisation, it is the only
+// thing keeping this pass honest.
+//
+// WHY the gate is enough, and what it deliberately does NOT do. It does not read the
+// shadow map. FalcomApplyContactToSun gates on real cascade visibility because it runs
+// after the composite, where that visibility is already in a register; here it is not,
+// and a per-title CSM read in a branch the engine only added for characters is a much
+// larger change than this pass is worth. So the gate is the cascade RANGE (the same
+// test the environment pass uses, which is exactly the interior case: past the last
+// split the engine clamps rather than falls off and then treats the pixel as lit)
+// multiplied by NdotL. `csmRangeMax` is the game's outermost split, and on the Sora
+// titles which component holds it is an inference -- hence the char_sun_range
+// override, and hence why the Gate debug view is a diagnostic rather than a nicety.
+//
+// `diag` is the (term, gate) pair the Sun Debug View renders. It is filled whether or
+// not the view is on, so a caller cannot read a value from a path that never set it.
+// `isCharacter` is a parameter rather than something derived here, and at all four
+// call sites it happens to be equivalent to the branch the call sits in -- the early
+// return is entered on the same bit that decides "character" in each of the four
+// shaders, so today the gate excludes nothing. It is still taken explicitly, for two
+// reasons. Each title spells the test differently (Kai and Kai-soft use mrt0.z bit 8,
+// both Sora titles use mrt0.w bit 3 clear), and re-deriving that here would mean
+// hard-coding a four-way encoding difference in a file that is supposed to be
+// game-agnostic. And the whole point of the parameter is to fail loudly if someone
+// later relocates the call outside that branch: the alternative failure is a sun term
+// silently darkening the environment through a path that has no sun composite, which
+// is the interior bug the gate above exists to prevent.
+float3 FalcomApplyCharSunShadow(float3 lit, bool isCharacter, float deviceDepth,
+                                float3 normalWS, float2 screenUV, float2 pixelCoord,
+                                float csmRangeMax, Texture2D<float4> depthTex,
+                                SamplerState pointSampler,
+                                Texture3D<float2> noiseVolume, out float2 diag)
+{
+  diag = float2(1.0, 0.0);
+  if (!isCharacter) return lit;
+  if (shader_injection_data.char_shadow_mode < 1.5f) return lit;
+  if (shader_injection_data.char_sun_enabled < 0.5f) return lit;
+
+  const float3 sunAxis = FalcomDirectionToLight();
+  if (!FalcomNormalValid(sunAxis)) return lit;
+  const float3 n = FalcomSafeNormalize3(normalWS, float3(0.0, 0.0, 0.0));
+  if (!FalcomNormalValid(n)) return lit;
+
+  const float2 unpack = FalcomDepthUnpackConsts();
+
+  // A surface turned away from the sun has no sun term to occlude, so there is nothing
+  // to march for. abs() rather than a plain saturate, to match the convention the
+  // character passes use elsewhere: the engine's character decode can hand back a
+  // normal on the far side of the surface, and rejecting that outright would drop the
+  // shadow for every back-facing character.
+  float gate = abs(dot(n, sunAxis));
+  if (gate <= 0.001f) return lit;
+
+  const float rangeMax = shader_injection_data.char_sun_range > 0.0f
+      ? shader_injection_data.char_sun_range : csmRangeMax;
+  if (rangeMax > 0.0f) {
+    gate *= FalcomSunRangeFade(
+        FalcomRadialDistance(depthTex, pointSampler, screenUV, unpack), rangeMax);
+  }
+  if (gate <= 0.001f) return lit;
+
+  const float4 worldH = mul(
+      float4(screenUV.x * 2.0 - 1.0, 1.0 - screenUV.y * 2.0, deviceDepth, 1.0),
+      viewProjInv_g);
+  if (abs(worldH.w) <= 1e-6 || !isfinite(worldH.w)) return lit;
+
+  const float3 rayStart = worldH.xyz / worldH.w
+      + n * max(0.0, shader_injection_data.char_sun_normal_bias);
+  const float4 clipA = mul(float4(rayStart, 1.0), viewProj_g);
+  const float4 clipB = mul(float4(
+      rayStart + sunAxis * max(0.0, shader_injection_data.char_sun_ray_length), 1.0), viewProj_g);
+  if (abs(clipA.w) <= 1e-6 || abs(clipB.w) <= 1e-6) return lit;
+
+  const float jitter = shader_injection_data.char_sun_isfast_enabled > 0.5f
+      ? FalcomSampleISFAST(noiseVolume, pointSampler, uint2(pixelCoord),
+                           (uint)max(shader_injection_data.cs_noise_frame, 0.0f),
+                           128.0, 32.0,
+                           shader_injection_data.shadow_isfast_spatial_scale,
+                           shader_injection_data.shadow_isfast_temporal_speed,
+                           shader_injection_data.shadow_isfast_seed_offset,
+                           shader_injection_data.shadow_isfast_texture_loaded)
+      : 0.5f;
+
+  const float rawTerm = FalcomContactShadowMarch(
+      clipA, clipB, unpack, depthTex, pointSampler,
+      max(0.0, shader_injection_data.char_sun_thickness),
+      max(0.0, shader_injection_data.char_sun_bias),
+      max(1.0, floor(shader_injection_data.char_sun_sample_count + 0.5)),
+      jitter,
+      max(0.0, shader_injection_data.char_sun_response_scale));
+  diag = float2(rawTerm, gate);
+
+  // lerp toward a fully lit term first, so a pixel the gate closed is a bit-exact
+  // no-op rather than a multiply that could still perturb a zero-valued register.
+  return lit * FalcomShadowStrength(
+      lerp(1.0, rawTerm, gate), shader_injection_data.char_sun_strength,
+      /*isCharacter=*/true, 1.0, 1.0,
+      shader_injection_data.char_sun_max_darkening);
+}
+
+// Diagnostic for the above. `diag` is the (rawTerm, gate) pair it returned.
+//
+// Returns false when the view is off, in which case the caller must leave its own
+// output alone. `active` is the caller's own "this is a character pixel" test, passed
+// in because each of the four lighting shaders spells that test differently and
+// re-deriving it here would be a second, wrong version of it.
+bool FalcomCharSunDebugView(float2 diag, bool active, int view, out float3 colour)
+{
+  colour = float3(0.0, 0.0, 0.0);
+  if (view <= 0 || !active) return false;
+  if (view == 1) {
+    colour = diag.x.xxx;
+    return true;
+  }
+  // The gate is the load-bearing diagnostic for this pass: white means the term is
+  // live on this pixel, so a white pixel indoors is a mis-gated pass, not a shadow.
+  colour = diag.y.xxx;
+  return true;
 }
 
 // ── Contact Shadows: applied to the SUN'S OWN contribution ──

@@ -30,9 +30,13 @@ struct ShaderInjectData {
   // HLSL boundary.
   //
   // The one survivor is char_shadow_mode itself, which no longer selects a
-  // ray-march but gates the game's own native character shadow:
-  //   0 = off, 1 = the engine's own camera-facing march.
-  // That engine code is still in the Sora and Kai character/SSAO shaders.
+  // ray-march but picks the character shadowing technique:
+  //   0 = off, 1 = the engine's own camera-facing march, 2 = our custom pair of
+  //   contact marches (char_cam_* / char_sun_* at the tail of this struct).
+  // In every mode except 0 the character/SSAO pass writes the character shadow
+  // into the AO target's .z channel, which is why the lighting shaders gate their
+  // read on `char_shadow_mode >= 0.5f` and not on `== 1`. That engine code is
+  // still in the Sora and Kai character/SSAO shaders.
   float char_shadow_mode;
   float char_shadow_sample_count;   // RETIRED: Bend_SSS, unread
   float char_shadow_hard_shadow_samples;   // RETIRED: Bend_SSS, unread
@@ -678,7 +682,88 @@ struct ShaderInjectData {
   // A disabled class marches zero times and therefore spends NO budget, so
   // Point-only hands the whole Local Light Budget to point lights rather than
   // letting the disabled loop eat it.
-  float cs_contact_local_light_type;  // (appended last: do not insert above)
+  float cs_contact_local_light_type;
+
+  // —— Character Shadowing: the two custom character contact passes ——
+  //
+  // These do NOT extend the cs_contact_* block above, and they are not the same
+  // feature. That block drives the full-screen compute pass, whose terms reach
+  // characters only where the lighting shader's main composite runs -- and
+  // characters leave before that composite in every one of the four lighting
+  // shaders (kai/lighting_0x430ED091:918, lightingsoft:854, sora1st:685,
+  // sora2nd:734). So the compute pass's character half has always been dead, and
+  // these two passes are what actually shadow a character.
+  //
+  // The two are deliberately independent rather than one march with a direction
+  // picker, because they are applied at different sites by different terms:
+  //
+  //   char_cam_*  runs in the character/SSAO pixel pass, along the engine's own
+  //               camera-facing axis (rayMarchShadowDir_g, normalised -- see
+  //               FalcomCameraFacingAxis), and writes the same AO-target .z
+  //               channel the vanilla march wrote, so the engine's own temporal
+  //               blend resolves the jitter for free.
+  //   char_sun_*  runs in the lighting shader at the character early return,
+  //               toward the sun, and multiplies the resolved character colour.
+  //
+  // They are applied ON TOP of one another, never blended into one value: the two
+  // answer different questions (where does the camera-facing silhouette self-occlude
+  // vs. is this surface shadowed from the sun) and averaging them would make each
+  // one's tuning affect the other's shadow.
+  //
+  // char_cam_* defaults are tuned to sit on top of the vanilla march's response,
+  // not to be independently pretty: see the note on char_cam_ray_length.
+
+  // Master mode, in char_shadow_mode above: 0 = Off, 1 = Vanilla, 2 = Custom.
+  // Every field below is read only in mode 2, and the mode is what decides whether
+  // the lighting shaders consume the AO .z channel at all.
+
+  // Camera pass.
+  float char_cam_enabled;             // 0/1 — run the camera-facing march
+  float char_cam_strength;            // [0..1] blend of the resulting term
+  float char_cam_sample_count;        // [1..32] march steps
+  // World-space march length, in the same units as cs_contact_ray_length. The
+  // engine's own march length is an unreadable constant baked into
+  // rayMarchShadowDir_g, so this default is deliberately small and must be tuned
+  // against the axis length reported by the Camera Pass debug view.
+  float char_cam_ray_length;
+  float char_cam_thickness;           // assumed occluder thickness, same units as cs_contact_thickness
+  float char_cam_bias;                // minimum penetration before a hit counts
+  float char_cam_normal_bias;         // world-space lift along the surface normal
+  float char_cam_response_scale;      // see cs_contact_response_scale
+  float char_cam_max_darkening;       // [0..1] cap on how dark a shadowed pixel gets
+  float char_cam_isfast_enabled;      // 0/1 — IS-FAST blue-noise dither of the step offset
+  // 0 = Off, 1 = Raw Term, 2 = Coverage, 3 = Axis Length. Axis Length shows the
+  // world-space length of |rayMarchShadowDir_g| so char_cam_ray_length can be set
+  // against a measured number instead of a guess.
+  float char_cam_debug;
+
+  // Sun pass.
+  float char_sun_enabled;             // 0/1 — run the sun march
+  float char_sun_strength;            // [0..1] blend of the resulting term
+  float char_sun_sample_count;        // [1..32] march steps
+  float char_sun_ray_length;          // world units toward the sun
+  float char_sun_thickness;
+  float char_sun_bias;
+  float char_sun_normal_bias;
+  float char_sun_response_scale;
+  float char_sun_max_darkening;       // defaults to 0.5, not 1: see the note below
+  float char_sun_isfast_enabled;
+  // Manual override for the sun range gate, in world units. 0 = derive the cutoff
+  // from the engine's own last-cascade split, exactly as cs_contact_sun_range does.
+  float char_sun_range;
+  // 0 = Off, 1 = Raw Term, 2 = Gate. Gate is the load-bearing one: this pass
+  // deliberately does not sample the CSM, so the range + NdotL gate is the only
+  // thing standing between it and darkening interior characters. Render it and
+  // check it is black indoors before trusting the shadow.
+  float char_sun_debug;
+  // Not read by anything. Present so the struct stays a whole number of float4s:
+  // the 23 fields above take it from 424 to 447, and 447 dwords is 1788 bytes, which
+  // is a multiple of 4 but NOT of 16. The host declares this range as a D3D constant
+  // buffer of sizeof(ShaderInjectData) bytes (CreateShadowsPipelinesIfNeeded and
+  // RunShadows), and fxc sizes CB13 from the same struct, so a size that is not a
+  // whole number of float4s makes the shader's own declaration and the host's range
+  // disagree. One pad float puts it back at 448 = 112 float4s = 1792 bytes.
+  float char_shadowing_reserved;
  };
 
 #ifndef __cplusplus

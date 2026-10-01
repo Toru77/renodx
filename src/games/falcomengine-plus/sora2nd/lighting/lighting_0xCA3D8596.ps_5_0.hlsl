@@ -258,6 +258,10 @@ void main(
   r1.xy = (int2)r1.xy;
   r1.zw = float2(0,0);
   r1.xyz = mrtTexture0.Load(r1.xyz).xyw;
+  // Kept because r1 is overwritten repeatedly below and the custom character sun
+  // contact shadow at the character early return needs the encoded world normal
+  // again, long after the engine's own copy is gone.
+  uint2 mrt0_xy_raw = (uint2)r1.xy;
   mrtTexture1.GetDimensions(0, fDest.x, fDest.y, fDest.z);
   r2.xy = fDest.xy;
   r2.xy = v1.xy * r2.xy;
@@ -722,15 +726,37 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         charColor += giColor;  // Normal: add GI to scene
       }
     }
+    // Custom character SUN contact shadow. See FalcomApplyCharSunShadow for why this
+    // has to attach to the resolved colour, and for why its gate is the whole defence
+    // rather than an optimisation.
+    //
+    // Here the surrounding branch IS the character test (mrt0.w bit 3 clear), so
+    // csIsCharacter is tautologically true; it is still passed rather than assumed, so
+    // all four lighting shaders have the same call and a future change to the branch
+    // condition cannot silently widen this to the environment.
+    float2 charSunDiag;
+    charColor = FalcomApplyCharSunShadow(
+        charColor, csIsCharacter > 0.5,
+        csDepthTex.SampleLevel(samPoint_s, v1.xy, 0).x,
+        DecodeFalcomMrtNormal(mrt0_xy_raw), v1.xy, v0.xy, shadowSplitDistance_g.z,
+        csDepthTex, samPoint_s, csIsfastNoise, charSunDiag);
     // Early return BEFORE the sun composite at 1177, and charColor is built from
-    // the character/SSGI/GI terms with no isolable sun contribution. Contact is
-    // therefore not applied here: attaching it to the final colour instead is the
-    // bug that put contact shadows in interiors. Micro still applies.
+    // the character/SSGI/GI terms with no isolable sun contribution. The generic
+    // Contact Shadows term is therefore still not applied here: the custom character
+    // sun pass above is what covers characters now. Micro still applies.
     o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
                                     microShadowTex, contactShadowTex);
     o0.w = r0.w;
     o1.xyzw = r2.xyzw;
     o2.xy = r3.xy;
+    // Sun Debug View, after FalcomApplyShadowTerms so it shows what this pass did and
+    // not the micro term layered on top of it.
+    float3 charSunDbgColour;
+    if (FalcomCharSunDebugView(charSunDiag, csIsCharacter > 0.5,
+                               (int)shader_injection_data.char_sun_debug, charSunDbgColour)) {
+      o0.xyz = charSunDbgColour;
+      o0.w = 1.0f;
+    }
     return;
   }
   r3.zw = r4.xz * cloudShadowScale_g + cloudShadowOffset_g.xy;
