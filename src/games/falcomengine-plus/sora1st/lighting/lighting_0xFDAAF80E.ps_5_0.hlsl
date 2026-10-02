@@ -1267,10 +1267,10 @@ void main(
         float brdf_blinn_pt = exp2(log2(max(brdf_NdotH_pt, 0.0001f)) * max(brdf_gloss_pt, 0.001f));
         float brdf_spec_shape_pt = brdf_blinn_pt;
         if (brdf_use_ggx) {
-          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_rawNdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
-          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_rawNdotL_pt, brdf_roughness, brdf_F0);
-          float brdf_ggx_scalar_pt = brdf_ggx_spec_pt.x * brdf_rawNdotL_pt;
-          brdf_spec_shape_pt = lerp(brdf_blinn_pt, brdf_ggx_scalar_pt, brdf_specular_str);
+          float brdf_NdotL_pt = saturate(brdf_rawNdotL_pt);
+          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
+          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_roughness, brdf_F0);
+          brdf_spec_shape_pt = lerp(brdf_blinn_pt, brdf_ggx_spec_pt.x, brdf_specular_str);
           brdf_spec_shape_pt = max(brdf_spec_shape_pt, 0.0f);
         }
         r9.xyz = r13.yzw * brdf_spec_shape_pt * brdf_combinedAtten_pt * r14.x + r9.xyz;
@@ -1391,10 +1391,10 @@ void main(
           float brdf_blinn_sp = exp2(log2(max(brdf_NdotH_sp, 0.0001f)) * max(brdf_gloss_sp, 0.001f));
           float brdf_spec_shape_sp = brdf_blinn_sp;
           if (brdf_use_ggx) {
-            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_rawNdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
-            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_rawNdotL_sp, brdf_roughness, brdf_F0);
-            float brdf_ggx_scalar_sp = brdf_ggx_spec_sp.x * brdf_rawNdotL_sp;
-            brdf_spec_shape_sp = lerp(brdf_blinn_sp, brdf_ggx_scalar_sp, brdf_specular_str);
+            float brdf_NdotL_sp = saturate(brdf_rawNdotL_sp);
+            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
+            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_roughness, brdf_F0);
+            brdf_spec_shape_sp = lerp(brdf_blinn_sp, brdf_ggx_spec_sp.x, brdf_specular_str);
             brdf_spec_shape_sp = max(brdf_spec_shape_sp, 0.0f);
           }
           r13.yzw = r16.xyz * brdf_spec_shape_sp * brdf_combinedAtten_sp * r17.x + r13.yzw;

@@ -1897,7 +1897,7 @@ void main(
           float brdf_VdotH_pt = saturate(dot(brdf_V, r10.xyz));
           float3 brdf_ggx_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
           brdf_ggx_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_roughness, brdf_F0);
-          spec_result_pt = lerp(brdf_blinn_pt, brdf_ggx_pt.x * brdf_NdotL_pt, brdf_specular_str);
+          spec_result_pt = lerp(brdf_blinn_pt, brdf_ggx_pt.x, brdf_specular_str);
         } else {
           spec_result_pt = brdf_blinn_pt;
         }
@@ -2019,7 +2019,7 @@ void main(
             float brdf_VdotH_sp = saturate(dot(brdf_V, r12.xyz));
             float3 brdf_ggx_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
             brdf_ggx_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_roughness, brdf_F0);
-            spec_result_sp = lerp(brdf_blinn_sp, brdf_ggx_sp.x * brdf_NdotL_sp, brdf_specular_str);
+            spec_result_sp = lerp(brdf_blinn_sp, brdf_ggx_sp.x, brdf_specular_str);
           } else {
             spec_result_sp = brdf_blinn_sp;
           }

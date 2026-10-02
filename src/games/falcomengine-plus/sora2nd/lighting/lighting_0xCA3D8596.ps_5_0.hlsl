@@ -1293,10 +1293,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r2.w = r5.z * r2.w;
         r2.w = exp2(r2.w);
         if (brdf_use_ggx) {
-          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_rawNdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
-          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_rawNdotL_pt, brdf_roughness, brdf_F0);
-          float brdf_ggx_scalar_pt = brdf_ggx_spec_pt.x * brdf_rawNdotL_pt;
-          r2.w = lerp(r2.w, brdf_ggx_scalar_pt, brdf_specular_str);
+          float brdf_NdotL_pt = saturate(brdf_rawNdotL_pt);
+          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
+          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_roughness, brdf_F0);
+          r2.w = lerp(r2.w, brdf_ggx_spec_pt.x, brdf_specular_str);
           r2.w = max(r2.w, 0.0f);
         }
         r12.xyz = r13.xyz * r2.www;
@@ -1416,10 +1416,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r2.w = r5.z * r2.w;
           r2.w = exp2(r2.w);
           if (brdf_use_ggx) {
-            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_rawNdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
-            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_rawNdotL_sp, brdf_roughness, brdf_F0);
-            float brdf_ggx_scalar_sp = brdf_ggx_spec_sp.x * brdf_rawNdotL_sp;
-            r2.w = lerp(r2.w, brdf_ggx_scalar_sp, brdf_specular_str);
+            float brdf_NdotL_sp = saturate(brdf_rawNdotL_sp);
+            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
+            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_roughness, brdf_F0);
+            r2.w = lerp(r2.w, brdf_ggx_spec_sp.x, brdf_specular_str);
             r2.w = max(r2.w, 0.0f);
           }
           r16.xyz = r19.xyz * r2.www;

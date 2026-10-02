@@ -3635,7 +3635,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.1f, .label = "Specular Blend", .section = "BRDF Improvement",
+      .default_value = 1.0f, .label = "Specular Blend", .section = "BRDF Improvement",
       .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
@@ -4493,7 +4493,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnabled", .binding = &shader_injection.cs_contact_local_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Local Lights", .section = "Contact Shadows",
+      .default_value = 0.f, .label = "Local Lights", .section = "Contact Shadows",
       .tooltip = "Extends the contact march to point and spot lights, evaluated inside the "
                  "dynamic light loop. Off by default: it is per-light work in a pixel "
                  "shader, so the cost scales with the per-pixel light count instead of being "

@@ -141,19 +141,18 @@ float3 GGX_Specular(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Directional Albedo E(μ, α)  — Turquin 2019 rational polynomial fit
+// Directional Albedo E(μ, α)  — fit to GGX + Smith height-correlated albedo
 // ──────────────────────────────────────────────────────────────────────────────
 float GGX_DirectionalAlbedo(float NdotV, float roughness)
 {
   float mu  = NdotV;
   float a   = roughness;
-  float a2  = a * a;
   float mu2 = mu * mu;
 
   float num = 1.0f
-            + mu  * (-1.0816f + a * 0.0378f)
-            + mu2 * ( 0.1696f + a * 0.0856f)
-            + a   * (-0.6992f + a * (1.4424f + a * (-1.3616f + a * 0.4504f)));
+            + mu  * (-0.1099867f - 0.8622854f * a)
+            + mu2 * ( 0.2331208f + 0.2112286f * a)
+            + a   * (-0.1707002f + a * (-0.1734666f + a * (0.1252620f + a * 0.0572908f)));
 
   return saturate(num);
 }
@@ -164,7 +163,7 @@ float GGX_DirectionalAlbedo(float NdotV, float roughness)
 float GGX_AverageAlbedo(float roughness)
 {
   float a = roughness;
-  return saturate(1.0f + a * (-0.7127f + a * (0.4364f + a * (-0.1188f))));
+  return saturate(1.0130526f + a * (-0.3818696f + a * (-0.7315008f + a * 0.5171084f)));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
