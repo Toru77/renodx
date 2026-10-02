@@ -49,8 +49,10 @@ cbuffer cb_scene : register(b0)
 Texture2D<float4>    g_srcColor       : register(t0);
 // float4, not float2: motion_blur_resolve writes .xy = the game motion scaled by
 // the camera's share of its length, and .zw = camera-only. TileMax still declares
-// float2 over the same resource and takes .xy. The resolve pass always runs, so
-// .zw is always a real camera term and never the game's raw texture contents.
+// float2 over the same resource and takes .xy. The .zw term only exists on the
+// WIDE resolve surface, which is allocated exactly while Debug View is 8 or 9;
+// the shipping RG16F surface carries .xy alone, and the tap loop and every debug
+// view below the camera-term pair read .xy only.
 Texture2D<float4>    g_srcMotion      : register(t1);
 Texture2D<float2>    g_srcNeighborMax : register(t2);
 // Single-channel, matching the game's other depth readers (gtvbao, ssrr2,
@@ -432,10 +434,18 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   // z = mulC/u, so the relative comparison never needed linear depth at all.
   // u also costs one subtract per tap where SampleLinearDepth cost a divide plus
   // a guard divide.
-  const float centerURaw = depthTest
-      ? (addC - g_srcDepth[clamp(int2(uv * float2(depthDims)), int2(0, 0), depthDims - 1)])
-      : 0.0;
-  const float centerAbsU = abs(centerURaw);
+  //
+  // Fetched only when the depth test will consume it. The ternary form used to be
+  // if-converted by FXC: the load and its index math ran for every pixel and the
+  // result was masked afterwards, which cost a fetch plus its addressing at the
+  // default (Depth Test off). The branch is uniform across the dispatch, so it is
+  // free when off and issues exactly the same load when on.
+  float centerURaw = 0.0;
+  float centerAbsU = 0.0;
+  if (depthTest) {
+    centerURaw = addC - g_srcDepth[clamp(int2(uv * float2(depthDims)), int2(0, 0), depthDims - 1)];
+    centerAbsU = abs(centerURaw);
+  }
 
   // Section 4.5: Halton-jittered stratified integration. h extends the domain
   // slightly past |vmax| (the paper's "larger maximum jitter value").
@@ -454,15 +464,28 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // divide hoisted into stepT/baseT above. mad, not mix: mix is a pixel-stage
     // intrinsic and this is a compute shader.
     float T = mad((float)i, stepT, baseT) * maxT;
+
+    // Exact zero-weight cull, Depth Test off only. With the depth test off the
+    // cylinder is the only weight term, and its half-width is
+    // min(sampleLength, centerLength) <= centerLength, so |T| >= centerLength
+    // already proves the tap contributes exactly nothing. Both values are known
+    // before any fetch, so the whole tap -- motion, depth and colour -- is
+    // skipped. The 1e-6 floor mirrors MBCylinder's own guard, so a zero-velocity
+    // pixel still keeps the T == 0 tap, where the cylinder is exactly 1.
+    //
+    // With the depth test on this is NOT safe: the two cone terms use half-widths
+    // of 1/L and stay near 1 across the whole integration domain, so they can
+    // contribute even where the cylinder has reached zero.
+    if (!depthTest && abs(T) >= max(centerLength, 1e-6)) continue;
+
     float2 d = (i & 1) ? vc : wn;  // even samples follow vmax, odd follow vc
 
-    // No clamp on sampleUV. Every consumer below re-derives its own texel and
-    // clamps that index: the motion read clamps to motionMax, the depth read and
-    // the colour read clamp to their own dims-1. The outer clamp was therefore
-    // unreachable work. It also never protected the float itself -- |T| <= maxT
-    // bounds the excursion to at most one tile, so sampleUV can leave [0,1] by
-    // less than that and the inner clamps absorb it.
-    float2 sampleUV = uv + T * d;
+    // Saturated, which is exactly the lower half of the texel clamp: for a
+    // non-negative coordinate int2() truncates, so saturate yields index 0
+    // wherever the old imax would have, and every consumer below needs only its
+    // top clamp. The fetched texel is identical in every case -- out-of-range UV
+    // selected the edge texel before and still does.
+    float2 sampleUV = saturate(uv + T * d);
     // wB is the paper's local-velocity term: it asks whether the motion AT THIS
     // TAP agrees with the sampling direction, which is what stops foreground
     // bleeding across a depth edge. Measured to be necessary for image quality,
@@ -471,7 +494,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float wB = wA;
     float sampleLength = centerLength;
     if (localWeights) {
-      int2 motionTexel = clamp(int2(sampleUV * motionF), int2(0, 0), motionMax);
+      int2 motionTexel = min(int2(sampleUV * motionF), motionMax);
       // Not MBGameMotionToUV. Two reasons, both about t1 specifically:
       //
       //   1. Its clamp is dead here. It bounds |v| to mb_tile_uv, and
@@ -489,8 +512,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
       // reads the camera term and view 9 the raw game motion minus it, and the
       // resolve does not clamp .zw, so those still use the real MBGameMotionToUV.
       float2 sampleVelocity = g_srcMotion[motionTexel].xy * motionInvScale;
-      wB = dot(MBNorm(sampleVelocity), d);
-      sampleLength = length(sampleVelocity);
+      // One root instead of two. MBNorm and length() each took their own
+      // sqrt/rsqrt of the same squared length, so the guarded reciprocal now
+      // produces both the normalized dot and the length. The guard is the same
+      // 1e-16 MBNorm used, and a length below it is at most 1e-8 UV -- far under
+      // the 0.5 px early-out, so collapsing it to zero changes nothing visible.
+      float lenSq = dot(sampleVelocity, sampleVelocity);
+      float invLen = (lenSq > 1e-16) ? rsqrt(lenSq) : 0.0;
+      wB = dot(sampleVelocity, d) * invLen;
+      sampleLength = lenSq * invLen;
     }
 
     // The three phenomenological cases, each additionally weighted by how well
@@ -519,7 +549,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
       // subtracts two large similar linear distances and loses digits, whereas
       // |raw1 - raw2| subtracts the original values.
       const float uTap = addC
-          - g_srcDepth[clamp(int2(sampleUV * float2(depthDims)), int2(0, 0), depthDims - 1)];
+          - g_srcDepth[min(int2(sampleUV * float2(depthDims)), depthDims - 1)];
       const float ratio = abs(centerURaw - uTap) / max(min(centerAbsU, abs(uTap)), 1e-4);
       // The finite/NaN guard is carried over deliberately. SampleLinearDepth had
       // `if (!isfinite(z)) z = 0.0` because a garbage texel would otherwise make
@@ -545,7 +575,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     weight = max(weight, 0.0);
     if (weight > 0.0) {
       totalWeight += weight;
-      result += g_srcColor[clamp(int2(sampleUV * workingF), int2(0, 0), workingMax)].rgb * weight;
+      result += g_srcColor[min(int2(sampleUV * workingF), workingMax)].rgb * weight;
     }
   }
 

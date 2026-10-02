@@ -575,7 +575,13 @@ enum MotionBlurPass : uint32_t {
   // blended vector in .xy, so every pass above is unchanged by it, and is SKIPPED
   // entirely when both weights are 1 (camera + (game - camera) == game).
   kMbResolve = 5,
-  kMotionBlurPassCount = 6,
+  // Appended last so the indices above keep their meaning. The same resolve
+  // source compiled with the wide (RGBA16F, .zw camera term) output declaration,
+  // selected by RunMotionBlur only while Debug View is 8 or 9. A separate pass
+  // rather than a runtime pipeline swap keeps both pipelines created at startup,
+  // so the toggle costs nothing but the surface rebuild.
+  kMbResolveWide = 6,
+  kMotionBlurPassCount = 7,
 };
 // Sora 1st and Sora 2nd post-TAA resolve / tonemap. Confirmed the SAME hash in
 // both games, so one constant serves both. Registered with an EMPTY payload on
@@ -1316,10 +1322,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // that slot is never a null descriptor.
   reshade::api::resource mb_noise_fallback_res = {};
   // Camera/object split, at the MOTION texture's resolution. .xy is the blended
-  // velocity the tile chain reduces, .zw is camera-only for the velocity views.
-  // This is the full-resolution velocity intermediate that Phase 2 removed, and
-  // it only exists while the two channels disagree -- at equal weights the pass
-  // is skipped and the game motion is bound directly instead.
+  // velocity the tile chain reduces; .zw is camera-only for the velocity views,
+  // so it only exists on the wide surface. The shipping format is RG16F -- the
+  // filter reads only .xy -- and it is RGBA16F while Debug View is 8 or 9. See
+  // CreateMotionBlurSet for the capability fallback.
   reshade::api::resource mb_resolve_texture = {};
   reshade::api::resource_view mb_resolve_srv = {};
   reshade::api::resource_view mb_resolve_uav = {};
@@ -1347,6 +1353,15 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // cutscene signal lives, and pushed by PrepareMotionBlur.
   bool mb_halfres = false;         // half-res surfaces currently allocated
   reshade::api::format mb_output_fmt = reshade::api::format::unknown;
+  // The resolve surface's active width: true when it is RG16F (the shipping
+  // path), false when RGBA16F (either a camera-term debug view is selected or
+  // the device refused the narrow UAV). RunMotionBlur picks the matching
+  // resolve pipeline from this, so it must always describe the allocated set.
+  bool mb_resolve_narrow = false;
+  // Latched when the device refuses the RG16F resolve UAV. Without it the
+  // recreate test below would see "requested narrow, active wide" every frame
+  // and rebuild the whole set in a loop.
+  bool mb_resolve_narrow_failed = false;
   bool mb_resources_ready = false;
   bool mb_warned_tonemap_src = false;
   // True once the prep passes have run at least once against the current
@@ -3278,7 +3293,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 1.0f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 0.8f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3292,7 +3307,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
-      .default_value = 1.8f, .label = "Radius Multiplier", .section = "GTVBAO",
+      .default_value = 0.88f, .label = "Radius Multiplier", .section = "GTVBAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3435,7 +3450,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalZPreservation", .binding = &g_gtvbao_normal_z_preservation,
-      .default_value = 1.0f, .label = "Normal Z Preservation", .section = "GTVBAO",
+      .default_value = 2.0f, .label = "Normal Z Preservation", .section = "GTVBAO",
       .tooltip = "Scales the view-space n.z of the MRT normal. 1.0 keeps the encoded normal intact; lower values tilt it. The shader floors this so it can never reach 0 and flatten the normal.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
@@ -3443,7 +3458,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAONormalDetailResponse", .binding = &g_gtvbao_normal_detail_response,
-      .default_value = 0.f, .label = "Normal Detail Response", .section = "GTVBAO",
+      .default_value = 1.f, .label = "Normal Detail Response", .section = "GTVBAO",
       .tooltip = "Reweights the MRT normal by how far it disagrees with the depth normal. 0.0 (neutral) is an exact no-op; 1.0 leans on the depth normal where they agree and the MRT normal where they diverge.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && g_gtvbao_normal_input_mode > 0.5f; },
@@ -3694,7 +3709,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "SSGISaturation", .binding = &shader_injection.vbgi_saturation,
-      .default_value = 1.5f, .label = "Saturation", .section = "VBGI",
+      .default_value = 1.0f, .label = "Saturation", .section = "VBGI",
       .tooltip = "0 = grayscale GI, 1 = full color GI.",
       .min = 0.0f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
@@ -7736,6 +7751,9 @@ static void DestroyMotionBlurSet(reshade::api::device* dev, DeviceData* d) {
   d->mb_radius_px = 0u;
   d->mb_output_fmt = reshade::api::format::unknown;
   d->mb_halfres = false;
+  // Active width, not the capability latch: mb_resolve_narrow_failed survives a
+  // set rebuild on purpose, so a device that refused RG16F is not asked again.
+  d->mb_resolve_narrow = false;
   d->mb_resources_ready = false;
   d->mb_prep_valid = false;
 }
@@ -7745,6 +7763,8 @@ static void DestroyMotionBlurSet(reshade::api::device* dev, DeviceData* d) {
 static void DestroyMotionBlurResources(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   DestroyMotionBlurSet(dev, d);
+  // Full teardown, so the RG16F capability latch is re-probed on the next set.
+  d->mb_resolve_narrow_failed = false;
   for (auto& set : d->mb_tables) {
     for (auto& t : set) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
     set = {};
@@ -7776,10 +7796,11 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
     // gather binds 6: color, motion, neighbormax, depth, noise, and the GAME
     // motion alongside the resolved one, which only the two velocity views read
     // (they return before the tap loop, so it costs nothing in the normal path).
-    static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 1u, 6u, 2u, 2u};
+    static constexpr uint32_t kSrvPerPass[kMotionBlurPassCount] = {1u, 1u, 1u, 6u, 2u, 2u, 2u};
     static const std::span<const uint8_t> kBytecode[kMotionBlurPassCount] = {
         __motion_blur_downsample, __motion_blur_tilemax, __motion_blur_neighbormax,
-        __motion_blur_gather, __motion_blur_composite, __motion_blur_resolve};
+        __motion_blur_gather, __motion_blur_composite, __motion_blur_resolve,
+        __motion_blur_resolve_wide};
   for (uint32_t pass = 0; pass < kMotionBlurPassCount; ++pass) {
     if (d->mb_layouts[pass].handle == 0u) {
       DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
@@ -7808,8 +7829,9 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
     }
     if (!EnsureGTVBAODescriptorTables(dev, d->mb_layouts[pass], &d->mb_tables[pass])) return false;
     if (d->mb_pipelines[pass].handle == 0u) {
-      // THREE resolve variants, one pass slot. HLSL packoffset() is a compile-time
-      // constant and the three games disagree on the scene cbuffer layout:
+      // THREE resolve variants, each in a narrow and a wide form (six bytecodes,
+      // two pass slots). HLSL packoffset() is a compile-time constant and the
+      // three games disagree on the scene cbuffer layout:
       //
       //   prevViewProj_g / jitter     Sora 1st  c74 / jitterDiff_g c78
       //                              Sora 2nd  c75 / jitterDiff_g c79
@@ -7824,9 +7846,13 @@ static bool EnsureMotionBlurPipelines(reshade::api::device* dev, DeviceData* d) 
       // and never needs a rebuild guard. RunMotionBlur logs which variant is in the
       // pipeline, so a wrong pick shows up as one line rather than a wrong image.
       std::span<const uint8_t> code = kBytecode[pass];
-      if (pass == kMbResolve) {
-        if (IsKai())          code = __motion_blur_resolve_kai;
-        else if (IsSora1st()) code = __motion_blur_resolve_sora1st;
+      if (pass == kMbResolve || pass == kMbResolveWide) {
+        // Wide is the same source with MB_RESOLVE_WIDE defined, so the game
+        // variant still has to be picked here as well.
+        const bool wide = (pass == kMbResolveWide);
+        if (IsKai())          code = wide ? __motion_blur_resolve_kai_wide : __motion_blur_resolve_kai;
+        else if (IsSora1st()) code = wide ? __motion_blur_resolve_sora1st_wide : __motion_blur_resolve_sora1st;
+        else if (wide)        code = __motion_blur_resolve_wide;
       }
       if (code.empty() || d->mb_layouts[pass].handle == 0u) return false;
       reshade::api::shader_desc sd = {};
@@ -7881,7 +7907,8 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
                                 uint32_t workingW, uint32_t workingH,
                                 uint32_t motionW, uint32_t motionH,
                                 uint32_t tilesX, uint32_t tilesY,
-                                reshade::api::format outputFormat, bool halfRes) {
+                                reshade::api::format outputFormat, bool halfRes,
+                                bool narrowResolve) {
   DestroyMotionBlurSet(dev, d);
   if (!dev || !d) return;
   auto mk = [&](uint32_t w, uint32_t h, reshade::api::format fmt,
@@ -7911,36 +7938,56 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   // neighbormax zeroed, so vmax is zero, the early-out always fires, and the
   // filter is a silent passthrough with no error anywhere.
   //
-  // RGBA16F is in the required set and is what the pre-Phase-2 velocity
-  // intermediate used. The extra bandwidth is irrelevant at this size: the tile
-  // set is tiles*tileH + 2*tiles*tiles texels (~40k at 1440p), so 8 B/texel
-  // costs ~160 KB more against a 2560x1440 output buffer. The bandwidth argument
-  // that justified R16G16F applied to the full-resolution velocity intermediate,
-  // which no longer exists. The shaders declare float2 over this, taking .xy.
+  // The tile set is tiny (tiles*tileH + 2*tiles*tiles texels, ~40k at 1440p), so
+  // its extra bytes are irrelevant and it stays RGBA16F unconditionally. The
+  // resolve surface is the opposite case: the gather fetches it once per tap, so
+  // it is allocated RG16F -- the filter reads only .xy -- whenever the device
+  // accepts the UAV. See the allocation below.
   const auto tileFmt = reshade::api::format::r16g16b16a16_float;
-  const bool tileOk =
+  bool ok =
      mk(tilesX, std::max(motionH, 1u), tileFmt,
         &d->mb_tilemax_h_texture, &d->mb_tilemax_h_srv, &d->mb_tilemax_h_uav)
    && mk(tilesX, tilesY, tileFmt,
         &d->mb_tilemax_texture, &d->mb_tilemax_srv, &d->mb_tilemax_uav)
    && mk(tilesX, tilesY, tileFmt,
         &d->mb_neighbormax_texture, &d->mb_neighbormax_srv, &d->mb_neighbormax_uav)
-    && mk(workingW, workingH, outputFormat,
-         &d->mb_output_texture, &d->mb_output_srv, &d->mb_output_uav)
-    // The camera/object split output, at the MOTION texture's resolution (which
-    // is not necessarily workingW/H). Allocated unconditionally: it is only read
-    // or written when the two weights differ, so at defaults this is 29.5 MB of
-    // untouched VRAM at 1440p, which is a far better trade than tying resource
-    // lifetime to a settings value and rebuilding the whole set when it moves.
-    // RGBA16F, not R16G16F, for the same reason as the tile chain above.
-    && mk(std::max(motionW, 1u), std::max(motionH, 1u), tileFmt,
-         &d->mb_resolve_texture, &d->mb_resolve_srv, &d->mb_resolve_uav);
+   && mk(workingW, workingH, outputFormat,
+         &d->mb_output_texture, &d->mb_output_srv, &d->mb_output_uav);
+  // The camera/object split output, at the MOTION texture's resolution (which is
+  // not necessarily workingW/H). .xy is the blended velocity every pass above
+  // reduces or samples; .zw is camera-only, read by the two camera-term debug
+  // views only.
+  //
+  // Narrow (RG16F) is the shipping format: the filter reads .xy and nothing
+  // else, and the stored half values are identical to the wide surface's, so
+  // this is a pure bandwidth change on the most-fetched texture in the chain.
+  // The caller requests wide while Debug View 8 or 9 is selected, because those
+  // read .zw. A device without the FL11.1 typed-UAV store that RG16F needs falls
+  // back here once, latched in mb_resolve_narrow_failed so the recreate test
+  // cannot loop.
+  bool narrow = false;
+  if (ok) {
+    const uint32_t resolveW = std::max(motionW, 1u), resolveH = std::max(motionH, 1u);
+    if (narrowResolve) {
+      narrow = mk(resolveW, resolveH, reshade::api::format::r16g16_float,
+                  &d->mb_resolve_texture, &d->mb_resolve_srv, &d->mb_resolve_uav);
+    }
+    if (!narrow) {
+      // mk() leaves whichever handles it did create in place when a later step
+      // fails, so tear the partial attempt down before overwriting the pointers.
+      auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
+      auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
+      dv(d->mb_resolve_srv); dv(d->mb_resolve_uav); dr(d->mb_resolve_texture);
+      ok = mk(resolveW, resolveH, tileFmt,
+              &d->mb_resolve_texture, &d->mb_resolve_srv, &d->mb_resolve_uav);
+    }
+    if (narrowResolve && !narrow) d->mb_resolve_narrow_failed = true;
+  }
   // Half-res surfaces are optional and only exist while the toggle is on, so the
   // default path allocates nothing extra. They use the blit's own format so the
   // gather input and output match what the final reconstruct expects.
   const uint32_t halfW = std::max(1u, (workingW + 1u) / 2u);
   const uint32_t halfH = std::max(1u, (workingH + 1u) / 2u);
-  bool ok = tileOk;
   if (ok && halfRes) {
     ok = mk(halfW, halfH, outputFormat,
             &d->mb_half_color_texture, &d->mb_half_color_srv, &d->mb_half_color_uav)
@@ -7957,6 +8004,7 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   d->mb_radius_px = static_cast<uint32_t>(std::max(shader_injection.mb_max_radius_px, 8.f));
   d->mb_output_fmt = outputFormat;
   d->mb_halfres = halfRes;
+  d->mb_resolve_narrow = narrow;
   d->mb_resources_ready = true;
 }
 
@@ -8125,6 +8173,13 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   // to rebuild it. That is the same one-frame hitch Max Radius already causes and
   // is why the surfaces are not simply kept allocated while unused.
   const bool halfRes = shader_injection.mb_halfres > 0.5f;
+  // The resolve surface is RG16F while neither camera-term debug view is
+  // selected -- those read the camera-only .zw, which only RGBA16F carries -- and
+  // the capability fallback lives in CreateMotionBlurSet. The latch means a
+  // device that refused RG16F asks for wide for good instead of rebuilding the
+  // set every frame.
+  const int debugView = static_cast<int>(shader_injection.mb_debug_view + 0.5f);
+  const bool wantNarrow = !d->mb_resolve_narrow_failed && (debugView != 8 && debugView != 9);
   // Depth and motion dimensions are no longer resource-sizing inputs for the
   // gather: it samples the game's textures directly and the conversion scale is a
   // per-frame push. motionH still matters because it is the height of the
@@ -8137,9 +8192,11 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
       || d->mb_tiles_x != tilesX || d->mb_tiles_y != tilesY
       || d->mb_radius_px != radiusPx
       || d->mb_halfres != halfRes
-      || d->mb_output_fmt != outputFormat;
+      || d->mb_output_fmt != outputFormat
+      || d->mb_resolve_narrow != wantNarrow;
   if (needRecreate) {
-    CreateMotionBlurSet(dev, d, workingW, workingH, motionW, motionH, tilesX, tilesY, outputFormat, halfRes);
+    CreateMotionBlurSet(dev, d, workingW, workingH, motionW, motionH, tilesX, tilesY, outputFormat,
+                        halfRes, wantNarrow);
     if (!d->mb_resources_ready) return false;
   }
 
@@ -8169,6 +8226,7 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
           ("[MotionBlur] buffers: colour " + std::to_string(workingW) + "x" + std::to_string(workingH)
            + " | motion " + std::to_string(motionW) + "x" + std::to_string(motionH)
            + " | depth " + std::to_string(depthW) + "x" + std::to_string(depthH)
+           + " | resolve " + (d->mb_resolve_narrow ? "RG16F" : "RGBA16F")
            + " | source " + MBMotionInputName()
            + (motionDiffers
                 ? " -- motion differs, gather is using filtered reads"
@@ -8342,10 +8400,14 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
     }
     // P0: reconstruct .xy = camera-length-scaled motion / .zw = camera only.
     // Runs at the MOTION texture's resolution, not the working resolution, and
-    // before prep because everything downstream reduces what it writes.
-    cl->bind_pipeline(AC, d->mb_pipelines[kMbResolve]);
+    // before prep because everything downstream reduces what it writes. Narrow is
+    // the shipping bytecode: RG16F output, .xy only. Wide writes the same values
+    // plus the .zw camera term, and PrepareMotionBlur allocated the surface to
+    // match this selection, so the two cannot disagree.
+    const uint32_t resolvePass = d->mb_resolve_narrow ? kMbResolve : kMbResolveWide;
+    cl->bind_pipeline(AC, d->mb_pipelines[resolvePass]);
     reshade::api::resource_view srvs[2] = {motionSrc, depthSrc};
-    apply(kMbResolve, srvs, 2, d->mb_resolve_uav);
+    apply(resolvePass, srvs, 2, d->mb_resolve_uav);
     cl->dispatch((std::max(d->mb_motion_w, 1u) + 7u) / 8u, (std::max(MH, 1u) + 7u) / 8u, 1u);
     bar(d->mb_resolve_texture, UA, SR);
   }

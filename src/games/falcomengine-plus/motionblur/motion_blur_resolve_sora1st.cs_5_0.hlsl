@@ -66,7 +66,19 @@ cbuffer cb_scene : register(b0)
 
 Texture2D<float2>   g_srcMotion : register(t0);
 Texture2D<float>    g_srcDepth  : register(t1);
+#if defined(MB_RESOLVE_WIDE)
+// Wide variant, bound only while a camera-term debug view (8/9) is active: the
+// RGBA16F surface is what can carry the camera-only term in .zw. See the wrapper
+// files and the addon's resolve-format selection.
 RWTexture2D<float4> g_outMotion : register(u0);
+#else
+// Shipping variant. The filter reads only .xy, so the surface is RG16F and this
+// declaration is exactly the two channels it writes. Halves the bytes per texel
+// on the texture the gather fetches once per tap, and stores the identical half
+// values the wide surface would have held. Debug views 8/9 read .zw and force
+// the wide variant instead.
+RWTexture2D<float2> g_outMotion : register(u0);
+#endif
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
@@ -80,7 +92,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   // A dead motion buffer must not be interpreted as "the camera did not move";
   // the gather early-outs on zero motion, which is the correct passthrough.
   if (shader_injection_data.mb_motion_valid < 0.5) {
-    g_outMotion[p] = float4(0.0, 0.0, 0.0, 0.0);
+    // Scalar broadcast, so the early-out is correct on both the narrow and the
+    // wide declaration without an implicit truncation warning.
+    g_outMotion[p] = 0.0;
     return;
   }
 
@@ -145,7 +159,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     }
   }
   if (cut) {
-    g_outMotion[p] = float4(0.0, 0.0, 0.0, 0.0);
+    // Scalar broadcast, so the early-out is correct on both the narrow and the
+    // wide declaration without an implicit truncation warning.
+    g_outMotion[p] = 0.0;
     return;
   }
 
@@ -280,6 +296,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
   // .xy is what the tile chain reduces; .zw carries camera-only so the gather's
   // velocity views can read the components without a second reduction. .zw is
   // deliberately NOT clamped: the Camera Velocity view exists to show the camera
-  // term, and clamping it here would hide exactly the garbage it is for.
+  // term, and clamping it here would hide exactly the garbage it is for. The
+  // shipping (narrow) variant has no .zw to write.
+#if defined(MB_RESOLVE_WIDE)
   g_outMotion[p] = float4(clamped, camPx);
+#else
+  g_outMotion[p] = clamped;
+#endif
 }
