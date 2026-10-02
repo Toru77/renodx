@@ -3300,7 +3300,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.8f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 0.35f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3314,7 +3314,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadiusMultiplier", .binding = &shader_injection.gtvbao_radius_multiplier,
-      .default_value = 0.88f, .label = "Radius Multiplier", .section = "GTVBAO",
+      .default_value = 1.7f, .label = "Radius Multiplier", .section = "GTVBAO",
       .min = 0.3f, .max = 3.0f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3335,7 +3335,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOBitmaskThickness", .binding = &shader_injection.gtvbao_bitmask_thickness,
-      .default_value = 0.35f, .label = "Bitmask Thickness", .section = "GTVBAO",
+      .default_value = 0.30f, .label = "Bitmask Thickness", .section = "GTVBAO",
       .tooltip = "World-space thickness for visibility bitmask. Higher = more light passes behind surfaces.",
       .min = 0.01f, .max = 2.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
@@ -4547,7 +4547,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalSpot", .binding = &shader_injection.cs_contact_local_spot,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Spot", .section = "Contact Shadows",
+      .default_value = 0.f, .label = "Spot", .section = "Contact Shadows",
       .tooltip = "Contact march for spot lights on the specular-enabled material path. Spot "
                  "lights can already carry a real shadow map (a 5-tap PCF) whenever their "
                  "shadowmapIndex is not -1, so for them the march mostly adds the near-field "
@@ -4570,7 +4570,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnvSpot", .binding = &shader_injection.cs_contact_local_env_spot,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Env Spot", .section = "Contact Shadows",
+      .default_value = 0.f, .label = "Env Spot", .section = "Contact Shadows",
       .tooltip = "Contact march for spot lights on the diffuse-only material path, the env-path "
                  "counterpart of Spot. The march is identical and costs the same. A disabled "
                  "class marches zero times and spends none of the Local Light Budget.",
