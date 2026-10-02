@@ -4305,7 +4305,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsEnabled", .binding = &shader_injection.cs_micro_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Micro Shadows", .section = "Micro Shadows",
+      .default_value = 0.f, .label = "Micro Shadows", .section = "Micro Shadows",
       .tooltip = "An AO-driven aperture term applied to NdotL (Uncharted 4). A surface "
                  "buried in ambient occlusion stops receiving as much key light, which "
                  "restores the soft darkening a rasteriser cannot produce on its own.",
@@ -4387,7 +4387,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsEnabled", .binding = &shader_injection.cs_contact_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Contact Shadows", .section = "Contact Shadows",
+      .default_value = 1.f, .label = "Contact Shadows", .section = "Contact Shadows",
       .tooltip = "A clip-space depth march from each surface toward the light, jittered with "
                  "IS-FAST blue noise and resolved by the game's TAA. This is the term that "
                  "grounds characters and props; Micro Shadows only handles the soft "
