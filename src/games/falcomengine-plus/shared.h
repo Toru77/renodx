@@ -316,6 +316,7 @@ struct ShaderInjectData {
   float gtvbao_atrous_enabled;             // 0 Off, 1 On — à-trous wavelet spatial filter (replaces bilateral chain)
   float gtvbao_atrous_depth_sigma;         // [0.05..4] default 1.0 — relative depth edge-stop strength
   float gtvbao_atrous_normal_sigma;        // [2..128] default 32 — normal edge-stop power
+  float gtvbao_atrous_passes;              // [1..3] default 3 — wavelet iterations; stride i is 1<<i (radius 2, 4, 8 px)
   // —— Dynamic Cubemaps (Sora 2nd) — Phase 0A/B standalone ———
   float dynCube_enabled;                   // 0=Off (vanilla t17), 1=On (dynamic)
   float dynCube_debug;                     // 0=Off(normal) 1=ShowDynamicCube 2=FaceViz 3=SolidColors 4=NoOverride
@@ -744,14 +745,13 @@ struct ShaderInjectData {
   // a pre-scaled vector (the Sora/Kai 10-step march needs it to be), and the Ray
   // Length default should be set against a measured number rather than a guess.
   float char_cam_debug;
-  // Not read by anything, and never will be: this exists only so the struct ends on a
-  // float4 boundary. The 11 fields above take it from 424 to 435, and 435 dwords is
-  // 1740 bytes -- a multiple of 4 but NOT of 16. The host declares this range as a D3D
+  // The struct must end on a float4 boundary: the host declares this range as a D3D
   // constant buffer of sizeof(ShaderInjectData) bytes (CreateShadowsPipelinesIfNeeded
   // and RunShadows) while fxc sizes CB13 from the same struct, so a size that is not a
   // whole number of float4s makes the shader's own declaration and the host's range
-  // disagree. One pad float puts it at 436 = 109 float4s = 1744 bytes.
-  float char_shadowing_reserved;
+  // disagree. It is 436 floats = 109 float4s = 1744 bytes, which already satisfies that,
+  // so there is no trailing pad any more. Adding a field means the count has to stay 436:
+  // trade it against another float rather than appending past the boundary.
  };
 
 #ifndef __cplusplus

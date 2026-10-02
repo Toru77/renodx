@@ -254,6 +254,7 @@ ShaderInjectData shader_injection = {
   .gtvbao_atrous_enabled = 0.f,
   .gtvbao_atrous_depth_sigma = 1.f,
   .gtvbao_atrous_normal_sigma = 32.f,
+  .gtvbao_atrous_passes = 3.f,
   // �� Dynamic Cubemaps (Sora 2nd) ��
   .dynCube_enabled = 0.f,
   .dynCube_debug = 0.f,
@@ -483,10 +484,8 @@ ShaderInjectData shader_injection = {
   .char_cam_max_darkening = 0.6f,
   .char_cam_isfast_enabled = 1.f,
   .char_cam_debug = 0.f,
-  // char_shadowing_reserved is deliberately NOT initialised: it is padding, and an
-  // aggregate initialiser value-initialises it to zero on its own. See the field's
-  // comment in shared.h -- the struct has to end on a float4 boundary for the host's
-  // CB13 range to match what fxc declares.
+  // ShaderInjectData ends on a float4 boundary with no pad field, so every float in the
+  // struct needs a default here. See the closing comment in shared.h.
   };
 
 // ----------- GTVBAO Backend � constants, types, fwd decls -----------
@@ -3251,7 +3250,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAODenoisePasses", .binding = &shader_injection.gtvbao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Denoise Passes", .section = "GTVBAO",
-      .tooltip = "Bilateral chain strength. Ignored while �-Trous Filter is On (fixed 3 wavelet iterations).",
+      .tooltip = "Bilateral chain strength. Ignored while �-Trous Filter is On (iteration count comes from the A-Trous Passes slider).",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_atrous_enabled < 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3364,9 +3363,17 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOAtrousEnabled", .binding = &shader_injection.gtvbao_atrous_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "�-Trous Filter", .section = "GTVBAO",
-      .tooltip = "Edge-aware wavelet spatial filter (3 iterations, growing radius). Replaces the bilateral chain.",
+      .tooltip = "Edge-aware wavelet spatial filter, replacing the bilateral chain. Iteration count is set by the A-Trous Passes slider below.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOAtrousPasses", .binding = &shader_injection.gtvbao_atrous_passes,
+      .default_value = 1.f, .label = "à-Trous Passes", .section = "GTVBAO",
+      .tooltip = "Wavelet iterations, one per dispatch with strides 1/2/4. Fewer = sharper but noisier AO and less cost; more = smoother but softer contact detail. 3 = default.",
+      .min = 1.f, .max = 3.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -11919,13 +11926,14 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       bar(d->normal_prep_texture, UA, SR);
     };
 
-    // 3 �-trous iterations (strides 1/2/4). The last iteration folds the
-    // �OCCLUSION_TERM_SCALE multiply-back via denoise_is_last_pass.
+    // atrous iterations (strides 1/2/4), count from gtvbao_atrous_passes. The last
+    // iteration folds the OCCLUSION_TERM_SCALE multiply-back via denoise_is_last_pass.
     // Returns true when the final result lives in ao_term_b.
     auto run_atrous_chain = [&](bool start_in_b) -> bool {
       bool cur_b = start_in_b;
-      for (int i = 0; i < 3; ++i) {
-        const bool last_iter = (i == 2);
+      const int apc = std::clamp((int)shader_injection.gtvbao_atrous_passes, 1, 3);
+      for (int i = 0; i < apc; ++i) {
+        const bool last_iter = (i == apc - 1);
         bind_pipe(d->atrous_pipeline);
         reshade::api::resource_view a_src = cur_b ? d->ao_term_b_srv : d->ao_term_a_srv;
         reshade::api::resource_view a_dst_uav = cur_b ? d->ao_term_a_uav : d->ao_term_b_uav;

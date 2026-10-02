@@ -3,7 +3,8 @@
 //
 // SVGF-lite: edge-preserving wavelet blur with doubling stride. Replaces the
 // XeGTAO bilateral chain when GTVBAO_atrous_enabled is on. Each dispatch is one
-// iteration; the addon runs 3 iterations with strides 1, 2, 4.
+// iteration; the addon runs 1 to 3 iterations with strides 1, 2, 4, so this shader
+// needs no pass-count uniform -- the host just issues fewer dispatches.
 //
 // Perf optimizations:
 //   • Normals come pre-decoded from gtvbao_normal_prep (no per-tap sincos/sqrt)
