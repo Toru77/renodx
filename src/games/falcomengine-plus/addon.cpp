@@ -449,11 +449,15 @@ ShaderInjectData shader_injection = {
   // 4 reproduces the original 4-sample appearance exactly, so the estimator change is
   // a no-op at the default Sample Count.
   .cs_contact_response_scale = 4.f,
-  // 2 = Both, which is exactly what the local march did before the setting
-  // existed. Must stay in declaration order with shared.h: designated
-  // initialisers are evaluated in the order written, so a mismatch here is a
-  // hard compile error rather than a silent misassignment.
-  .cs_contact_local_light_type = 2.f,
+  // All four local light loops marched by default, which is exactly what the
+  // feature did before the per-class toggles existed. Must stay in declaration
+  // order with shared.h: designated initialisers are evaluated in the order
+  // written, so a mismatch here is a hard compile error rather than a silent
+  // misassignment.
+  .cs_contact_local_point = 1.f,
+  .cs_contact_local_spot = 1.f,
+  .cs_contact_local_env_point = 1.f,
+  .cs_contact_local_env_spot = 1.f,
   // ── Character Shadowing: custom camera pass ──
   // On by default but only does anything in char_shadow_mode 2. Declaration order must
   // match shared.h.
@@ -3627,7 +3631,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFHammonDiffuse", .binding = &shader_injection.brdf_hammon_diffuse_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Hammon 2017 Diffuse", .section = "BRDF Improvement",
+      .default_value = 1.f, .label = "Hammon 2017 Diffuse", .section = "BRDF Improvement",
       .tooltip = "Applies the Hammon 2017 GGX+Smith multi-scatter energy-conserving diffuse correction to the sun and point/spot/environment lights (GDC 2017).",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3702,7 +3706,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
-      .default_value = 1.0f, .label = "Intensity", .section = "VBGI",
+      .default_value = 0.75f, .label = "Intensity", .section = "VBGI",
       .min = 0.0f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -4299,7 +4303,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsEnabled", .binding = &shader_injection.cs_micro_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Micro Shadows", .section = "Micro Shadows",
+      .default_value = 1.f, .label = "Micro Shadows", .section = "Micro Shadows",
       .tooltip = "An AO-driven aperture term applied to NdotL (Uncharted 4). A surface "
                  "buried in ambient occlusion stops receiving as much key light, which "
                  "restores the soft darkening a rasteriser cannot produce on its own.",
@@ -4518,7 +4522,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnabled", .binding = &shader_injection.cs_contact_local_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 0.f, .label = "Local Lights", .section = "Contact Shadows",
+      .default_value = 1.f, .label = "Local Lights", .section = "Contact Shadows",
       .tooltip = "Extends the contact march to point and spot lights, evaluated inside the "
                  "dynamic light loop. Off by default: it is per-light work in a pixel "
                  "shader, so the cost scales with the per-pixel light count instead of being "
@@ -4527,21 +4531,47 @@ renodx::utils::settings::Settings settings = {
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalLightType", .binding = &shader_injection.cs_contact_local_light_type,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 2.f, .label = "Light Type", .section = "Contact Shadows",
-      .tooltip = "Which local light classes get the contact march. Both is the default and is "
-                 "exactly what this feature did before the setting existed. The march itself is "
-                 "identical for both classes -- it derives its direction from the light's position, "
-                 "which a point light and a spot light define the same way -- so this is a cost "
-                 "and appearance trade, not a different technique. Pick Point to spend the budget "
-                 "only on point lights, which have NO shadow map of their own in this engine and "
-                 "so have nothing but this march for their contact detail. Spot lights can already "
-                 "carry a real shadow map (a 5-tap PCF) whenever their shadowmapIndex is not -1, "
-                 "so for them the march mostly adds the near-field detail a shadow map cannot. "
-                 "A disabled class marches zero times and does not consume the budget, so the "
-                 "class you leave on gets all of it.",
-      .labels = {"Point", "Spot", "Both"},
+      .key = "ContactShadowsLocalPoint", .binding = &shader_injection.cs_contact_local_point,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Point", .section = "Contact Shadows",
+      .tooltip = "Contact march for point lights on the specular-enabled material path. Point "
+                 "lights have NO shadow map of their own in this engine, so this march is their "
+                 "only contact detail. A disabled class marches zero times and spends none of the "
+                 "Local Light Budget, so the classes left on get all of it.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalSpot", .binding = &shader_injection.cs_contact_local_spot,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Spot", .section = "Contact Shadows",
+      .tooltip = "Contact march for spot lights on the specular-enabled material path. Spot "
+                 "lights can already carry a real shadow map (a 5-tap PCF) whenever their "
+                 "shadowmapIndex is not -1, so for them the march mostly adds the near-field "
+                 "detail a shadow map cannot. A disabled class marches zero times and spends "
+                 "none of the Local Light Budget.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalEnvPoint", .binding = &shader_injection.cs_contact_local_env_point,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 0.f, .label = "Env Point", .section = "Contact Shadows",
+      .tooltip = "Contact march for point lights on the diffuse-only material path -- surfaces "
+                 "that take their specular from the environment cube instead of dynamic lights. "
+                 "The march is identical to Point and costs the same. A disabled class marches "
+                 "zero times and spends none of the Local Light Budget.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "ContactShadowsLocalEnvSpot", .binding = &shader_injection.cs_contact_local_env_spot,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+      .default_value = 1.f, .label = "Env Spot", .section = "Contact Shadows",
+      .tooltip = "Contact march for spot lights on the diffuse-only material path, the env-path "
+                 "counterpart of Spot. The march is identical and costs the same. A disabled "
+                 "class marches zero times and spends none of the Local Light Budget.",
+      .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
     },
     new renodx::utils::settings::Setting{

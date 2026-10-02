@@ -671,20 +671,25 @@ struct ShaderInjectData {
   // At Sample Count 4 with this at 4 the estimator is exactly the old binary
   // any-hit test, value for value, which is what makes it a safe default.
   float cs_contact_response_scale;
-  // Which local light classes the contact march runs on. 0 = Point, 1 = Spot,
-  // 2 = Both (the default, and what the feature did before this setting existed).
+  // Which of the four local light loops the contact march runs on. All four
+  // march identically -- each derives its direction from lightPos - worldPos --
+  // so this is a cost/appearance selection, not a different technique. The spot
+  // cone is not tested; the light's own angular attenuation already handles
+  // that, and gating the march by it would only re-apply a term the engine has
+  // computed.
   //
-  // The march is IDENTICAL for both classes -- it derives its direction from
-  // lightPos - worldPos, which a point light and a spot light define the same
-  // way -- so this is a cost/appearance selection, not a different technique.
-  // The spot cone is not tested; the light's own angular attenuation already
-  // handles that, and gating the march by it would only re-apply a term the
-  // engine has computed.
+  // The engine evaluates each light class twice: once on the specular-enabled
+  // material path (cs_contact_local_point / cs_contact_local_spot) and once on
+  // the diffuse-only path whose specular comes from the environment cube
+  // (cs_contact_local_env_point / cs_contact_local_env_spot).
   //
-  // A disabled class marches zero times and therefore spends NO budget, so
-  // Point-only hands the whole Local Light Budget to point lights rather than
-  // letting the disabled loop eat it.
-  float cs_contact_local_light_type;
+  // A disabled loop marches zero times and therefore spends NO budget, so the
+  // loops left on get the whole Local Light Budget rather than sharing it with
+  // loops that are gated off.
+  float cs_contact_local_point;
+  float cs_contact_local_spot;
+  float cs_contact_local_env_point;
+  float cs_contact_local_env_spot;
 
   // —— Character Shadowing: the custom character contact pass ——
   //
@@ -750,9 +755,9 @@ struct ShaderInjectData {
   // constant buffer of sizeof(ShaderInjectData) bytes (CreateShadowsPipelinesIfNeeded
   // and RunShadows) while fxc sizes CB13 from the same struct, so a size that is not a
   // whole number of float4s makes the shader's own declaration and the host's range
-  // disagree. It is 436 floats = 109 float4s = 1744 bytes, which already satisfies that,
-  // so there is no trailing pad any more. Adding a field means the count has to stay 436:
-  // trade it against another float rather than appending past the boundary.
+  // disagree. It is 440 floats = 110 float4s = 1760 bytes, which already satisfies that,
+  // so there is no trailing pad any more. Adding a field means the count has to stay a
+  // multiple of 4: trade it against another float rather than appending past the boundary.
  };
 
 #ifndef __cplusplus

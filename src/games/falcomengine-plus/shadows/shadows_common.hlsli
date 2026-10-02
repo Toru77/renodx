@@ -639,16 +639,15 @@ float3 FalcomApplyShadowTerms(float3 lit, float2 screenUV, bool isCharacter,
 // local lights in this engine mostly have shadow casting disabled, so the march
 // is the only shadow detail they get.
 //
-// Which light classes are marched is a CALLER-SIDE decision
-// (cs_contact_local_light_type), not one made in here: the engine's two dynamic
-// light loops are separate blocks of code and each one simply has to decide
-// whether to call this. The march is identical for a point light and a spot
-// light, because both derive their direction from lightPos - worldPos and
-// neither the cone nor the range enters the march. A light class the caller
-// skips also spends none of the per-pixel budget, so the class left enabled
-// gets all of it. Do not look for a light-type test in this file; there is
-// deliberately none, and adding one here would have to be undone by every
-// caller.
+// Which loops are marched is a CALLER-SIDE decision (cs_contact_local_point /
+// _spot / _env_point / _env_spot), not one made in here: the engine evaluates
+// each light class in two separate material-path loops, and each one simply has
+// to decide whether to call this. The march is identical for every loop,
+// because each derives its direction from lightPos - worldPos and neither the
+// cone nor the range enters the march. A loop the caller skips also spends none
+// of the per-pixel budget, so the loops left enabled get all of it. Do not look
+// for a light-type test in this file; there is deliberately none, and adding
+// one here would have to be undone by every caller.
 struct FalcomContactParams
 {
   float rayLength;    // world units toward the light

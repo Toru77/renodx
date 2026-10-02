@@ -1216,12 +1216,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   // lights pays for a bounded number of marches rather than one per light. Every
   // value here is loop-invariant; only the budget counter changes per light.
   const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
-  // Light Type picks which of the loops below are instrumented. Both march
+  // Four toggles pick which of the loops below are instrumented. All four march
   // identically -- each derives its direction from the light's position -- so a
-  // disabled class is simply never called and therefore never spends budget.
-  // Both default to true, which is the behaviour that had no setting at all.
-  const bool csLocalPointOn = csLocalOn && shader_injection_data.cs_contact_local_light_type != 1.0f;
-  const bool csLocalSpotOn  = csLocalOn && shader_injection_data.cs_contact_local_light_type != 0.0f;
+  // disabled loop is simply never called and therefore never spends budget.
+  // Point/Spot are the specular-enabled material path; EnvPoint/EnvSpot are the
+  // diffuse-only path whose specular comes from the environment cube. All four
+  // default to true, which is the behaviour that had no setting at all.
+  const bool csLocalPointOn    = csLocalOn && shader_injection_data.cs_contact_local_point > 0.5f;
+  const bool csLocalSpotOn     = csLocalOn && shader_injection_data.cs_contact_local_spot > 0.5f;
+  const bool csLocalEnvPointOn = csLocalOn && shader_injection_data.cs_contact_local_env_point > 0.5f;
+  const bool csLocalEnvSpotOn  = csLocalOn && shader_injection_data.cs_contact_local_env_spot > 0.5f;
   FalcomContactParams csLocalParams;
   csLocalParams.rayLength = max(0.0, shader_injection_data.cs_contact_local_ray_length);
   csLocalParams.thickness = max(0.0, shader_injection_data.cs_contact_thickness);
@@ -1505,7 +1509,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r11.x = dynamicLights_g[r1.y].color.x;
         r11.y = dynamicLights_g[r1.y].color.y;
         r11.z = dynamicLights_g[r1.y].color.z;
-        if (csLocalPointOn && csLocalBudget > 0.0) {
+        if (csLocalEnvPointOn && csLocalBudget > 0.0) {
           csLocalBudget -= 1.0;
           float3 csLightPos = float3(dynamicLights_g[r1.y].pos.x, dynamicLights_g[r1.y].pos.y,
                                      dynamicLights_g[r1.y].pos.z);
@@ -1609,7 +1613,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r12.x = dynamicLights_g[r1.y].color.x;
           r12.y = dynamicLights_g[r1.y].color.y;
           r12.z = dynamicLights_g[r1.y].color.z;
-          if (csLocalSpotOn && csLocalBudget > 0.0) {
+          if (csLocalEnvSpotOn && csLocalBudget > 0.0) {
             csLocalBudget -= 1.0;
             float3 csLightPos = float3(dynamicLights_g[r1.y].pos.x, dynamicLights_g[r1.y].pos.y,
                                        dynamicLights_g[r1.y].pos.z);
