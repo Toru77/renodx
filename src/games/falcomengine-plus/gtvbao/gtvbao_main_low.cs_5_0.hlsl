@@ -19,6 +19,8 @@ SamplerState           g_samplerLightBuffer : register(s1);
 // ── IS-FAST noise (t3 = 3D noise texture / unused when off) ──
 Texture3D<float2>      g_isfastNoiseTexture : register(t3);
 Texture2D<uint>        g_srcFoliageMask    : register(t4);
+// ── à-trous pre-decoded normals (t5) — optimized GI sample path ──
+Texture2D<float4>      g_srcPreppedNormal  : register(t5);
 
 RWTexture2D<uint>          g_outWorkingAOTerm : register(u0);
 RWTexture2D<float>         g_outWorkingEdges  : register(u1);
@@ -156,6 +158,33 @@ float3 BuildDepthFallbackNormal(uint2 pix, GTAOConstants consts)
 
 float3 BuildSelectedInputNormal(uint2 pix, uint2 working_size, GTAOConstants consts)
 {
+  // ── Neutral fast path ──
+  // At the neutral shaping values below the MRT normal is returned verbatim
+  // (final_blend == 1), so the depth fallback normal and the depth edge metric
+  // are dead work. Decode first and return early; any non-neutral setting (or
+  // an MRT texel the G-buffer never wrote) falls through to the full path.
+  if (GTVBAO_normal_input_mode > 0.5f
+      && GTVBAO_mrt_normal_available > 0.5f
+      && GTVBAO_normal_depth_blend >= 1.0f
+      && GTVBAO_normal_edge_rejection <= 0.0f
+      && GTVBAO_normal_detail_response <= 0.0f
+      && (GTVBAO_normal_darkening_mode >= 0.5f || GTVBAO_normal_max_darkening >= 1.0f))
+  {
+    uint omw, omh;
+    g_srcMrtNormal.GetDimensions(omw, omh);
+    if (omw != 0 && omh != 0)
+    {
+      int2 omrt_tc = GTVBAO_MrtTexel((float2(pix) + 0.5) * (float2(omw, omh) / max(float2(working_size), 1.0.xx)),
+                                     float2(omw, omh));
+      float3 odecoded = DecodeMrtNormalAsIs((uint2)omrt_tc);
+      if (FalcomNormalValid(odecoded))
+      {
+        float3 omrt_normal = TransformNormalToView(odecoded, GTVBAO_normal_transform_mode);
+        return GTVBAO_TuneNormal(omrt_normal, GTVBAO_normal_influence, GTVBAO_normal_z_preservation);
+      }
+    }
+  }
+
   float3 depth_fallback = BuildDepthFallbackNormal(pix, consts);
   float3 selected = depth_fallback;
 
@@ -245,6 +274,7 @@ void main(uint2 pixCoord : SV_DispatchThreadID)
       g_outWorkingAOTerm, g_outWorkingEdges,
       g_srcMrtNormal,
       g_srcFoliageMask,
+      g_srcPreppedNormal,
       (g_gi_enabled > 0.5f), g_gi_intensity,
       g_srcLightBuffer, g_samplerLightBuffer,
       g_outGI,

@@ -21,58 +21,8 @@ SamplerState       g_samplerPointClamp : register(s0);
 RWTexture2D<uint>  g_outFinalAOTerm   : register(u0);
 RWTexture2D<float4> g_outGI            : register(u1);
 
-// ── GI denoise helpers ──
-float GTVBAO_DenoiseGI_EdgeWeight(float centerDepth, float neighborDepth)
-{
-    float diff = abs(centerDepth - neighborDepth);
-    return exp(-diff * 10.0);
-}
-
-void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
-    Texture2D<float4> srcGI, Texture2D<float> srcDepth,
-    SamplerState samp, RWTexture2D<float4> outGI)
-{
-    uint w, h;
-    srcGI.GetDimensions(w, h);
-
-    for (int side = 0; side < 2; side++)
-    {
-        int2 pixCoord = int2(pixCoordBase.x + side, pixCoordBase.y);
-        if (pixCoord.x >= w || pixCoord.y >= h) continue;
-
-    float2 uv = (float2(pixCoord) + 0.5) * consts.ViewportPixelSize;
-    float4 centerGI = srcGI.Load(int3(pixCoord, 0));
-    float centerDepth = srcDepth.SampleLevel(samp, uv, 0);
-
-    float4 sum = centerGI;
-    float weightSum = 1.0;
-
-    const int2 offsets[8] = {
-        int2(-1,-1), int2(0,-1), int2(1,-1),
-        int2(-1, 0),            int2(1, 0),
-        int2(-1, 1), int2(0, 1), int2(1, 1)
-    };
-
-    [unroll]
-    for (uint i = 0; i < 8; ++i)
-    {
-        int2 nc = clamp(pixCoord + offsets[i], int2(0,0), int2(w-1, h-1));
-        float4 neighborGI = srcGI.Load(int3(nc, 0));
-        float2 nuv = (float2(nc) + 0.5) * consts.ViewportPixelSize;
-        float neighborDepth = srcDepth.SampleLevel(samp, nuv, 0);
-
-        float depthW = GTVBAO_DenoiseGI_EdgeWeight(centerDepth, neighborDepth);
-        float colorDiff = length(neighborGI.rgb - centerGI.rgb) / max(length(centerGI.rgb), 0.001);
-        float colorW = exp(-colorDiff * 2.0);
-        float w = depthW * colorW;
-
-        sum += neighborGI * w;
-        weightSum += w;
-    }
-
-    outGI[pixCoord] = sum / max(weightSum, 0.001);
-    }
-}
+// ── GI denoise lives in gtvbao_common.hlsl (GTVBAO_DenoiseGI) so the
+// intermediate and final denoise passes cannot drift apart. ──
 
 [numthreads(GT_VBAO_NUMTHREADS_X, GT_VBAO_NUMTHREADS_Y, 1)]
 void main(uint2 dt : SV_DispatchThreadID)

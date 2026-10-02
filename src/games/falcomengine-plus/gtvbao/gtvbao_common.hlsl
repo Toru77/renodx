@@ -156,6 +156,11 @@ cbuffer cb_gtvbao : register(b13)
   // Fraction of the local direct light re-emitted per bounce (diffuse albedo).
   // Read only by the multi-bounce accumulate pass.
   float g_gi_multibounce_bounce_fraction;  // c[69] - [0..0.5], 0.15 = subtle
+  // c[70] 1 = the GI sample path may reuse the à-trous normal pre-decode.
+  // Host enables it only when the pre-decode ran, the GI/AO normal transforms
+  // match and the GI normal scaling is neutral, so the prepped normal equals
+  // the per-sample decode result.
+  float GTVBAO_gi_prepped_normal;          // c[70] - 0/1
 };
 
 // ── Half-res → full-res block-center mapping (odd-dimension safe) ──
@@ -241,6 +246,12 @@ int2 GTVBAO_MrtTexel(float2 uvTexelSpace, float2 mrtDims)
 // through the same code. Returns a unit vector.
 float3 GTVBAO_TuneNormal(float3 viewNormal, float influence, float zPreservation)
 {
+  // Neutral scaling leaves the vector unchanged, and the input is already unit
+  // length (TransformNormalToView normalizes), so the multiply + renormalize
+  // would be a no-op. Any real scaling still goes through the full path below.
+  if (influence == 1.0f && zPreservation == 1.0f)
+    return viewNormal;
+
   float3 tuned = viewNormal;
   tuned.xy *= max(0.0, influence);
   tuned.z  *= max(GT_VBAO_MIN_NORMAL_Z_SCALE, zPreservation);
@@ -307,6 +318,87 @@ float3 DecodeMrtNormalAsIs(uint2 texel);
 
 #include "GTVBAO.h"
 #include "GTVBAO.hlsli"
+
+// ── GI denoise (3×3 edge-stopped bilateral) ──
+// Shared by the spatial denoise path (stage 0) and the à-trous GI tail (stage
+// 4) so the two can never diverge. The two pixels a thread owns are filtered
+// from one shared 4×3 fetch grid (12 depth + 12 GI loads instead of 16 + 16),
+// Full mode uses a point Load for the depth tap (identical to the point
+// SampleLevel at a texel centre; Half mode keeps the SampleLevel block-centre
+// mapping), the per-pixel GI length is hoisted out of the tap loop, and the
+// depth/colour exponentials are evaluated as one exp of the summed exponent.
+void GTVBAO_DenoiseGI(uint2 pixCoordBase, GTAOConstants consts,
+    Texture2D<float4> srcGI, Texture2D<float> srcDepth,
+    SamplerState samp, RWTexture2D<float4> outGI)
+{
+    uint w, h;
+    srcGI.GetDimensions(w, h);
+
+    const int2 maxTC = int2(max((int)w - 1, 0), max((int)h - 1, 0));
+    // Grid: columns cover leftPixel.x-1 .. leftPixel.x+2, rows cover
+    // leftPixel.y-1 .. leftPixel.y+1, which is both side pixels' 3×3.
+    const int2 gridBase = clamp(int2(pixCoordBase), int2(0, 0), maxTC) - int2(1, 1);
+    const bool halfDepth = GTVBAO_resolution > 0.5f;
+
+    float4 giGrid[4][3];
+    float depthGrid[4][3];
+    [unroll]
+    for (int gy = 0; gy < 3; ++gy)
+    {
+        [unroll]
+        for (int gx = 0; gx < 4; ++gx)
+        {
+            int2 tc = clamp(gridBase + int2(gx, gy), int2(0, 0), maxTC);
+            giGrid[gx][gy] = srcGI.Load(int3(tc, 0));
+            if (halfDepth)
+            {
+                float2 uv = (float2(tc) + 0.5) * consts.ViewportPixelSize;
+                depthGrid[gx][gy] = srcDepth.SampleLevel(samp, uv, 0);
+            }
+            else
+            {
+                depthGrid[gx][gy] = srcDepth.Load(int3(tc, 0));
+            }
+        }
+    }
+
+    const int2 offsets[8] = {
+        int2(-1,-1), int2(0,-1), int2(1,-1),
+        int2(-1, 0),            int2(1, 0),
+        int2(-1, 1), int2(0, 1), int2(1, 1)
+    };
+
+    [unroll]
+    for (int side = 0; side < 2; ++side)
+    {
+        int2 pixCoord = int2(pixCoordBase) + int2(side, 0);
+        if (pixCoord.x >= (int)w || pixCoord.y >= (int)h) continue;
+
+        float4 centerGI = giGrid[side + 1][1];
+        float centerDepth = depthGrid[side + 1][1];
+        float invCenterLen = 1.0 / max(length(centerGI.rgb), 0.001);
+
+        float4 sum = centerGI;
+        float weightSum = 1.0;
+
+        [unroll]
+        for (uint i = 0; i < 8; ++i)
+        {
+            int2 off = offsets[i];
+            float4 neighborGI = giGrid[side + 1 + off.x][1 + off.y];
+            float neighborDepth = depthGrid[side + 1 + off.x][1 + off.y];
+
+            float depthDiff = abs(centerDepth - neighborDepth);
+            float colorDiff = length(neighborGI.rgb - centerGI.rgb) * invCenterLen;
+            float weight = exp(-(depthDiff * 10.0 + colorDiff * 2.0));
+
+            sum += neighborGI * weight;
+            weightSum += weight;
+        }
+
+        outGI[pixCoord] = sum / max(weightSum, 0.001);
+    }
+}
 
 // ── Build GTAOConstants from scene CB + push constants ──
 GTAOConstants BuildGTAOConstants(uint2 viewport_size)

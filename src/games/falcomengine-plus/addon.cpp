@@ -314,7 +314,6 @@ ShaderInjectData shader_injection = {
   .dynCube_vanilla_isfast = 1.f,
   .dynCube_vanilla_isfast_frame = -1.f,
   .dynCube_vanilla_ssr_enabled = 1.f,
-  .gtvbao_optimization = 1.f,
   .custom_shader_logging = 0.f,
   .dynCube_sparkle_rejection = 0.f,
   .char_outline_intensity = 1.f,
@@ -509,7 +508,7 @@ constexpr uint32_t kGtvbaoPushConstantsLayoutParam = 4u;   // push_constants at 
 // Must match the cbuffer declared in gtvbao_common.hlsl. Named so the builder,
 // the layout range and all nine push sites cannot drift apart -- a mismatch
 // here silently truncates the tail of the block rather than failing loudly.
-constexpr uint32_t kGtvbaoPushConstantFloats = 70;
+constexpr uint32_t kGtvbaoPushConstantFloats = 71;
 constexpr uint32_t kLightingMrtNormalRegister = 1u;  // t1 = mrtTexture0 (g-buffer normals)
 constexpr uint64_t kGTVBAOStartupGuardFrames = 8u;
 constexpr uint64_t kGTVBAOResizeGuardFrames = 4u;
@@ -11330,7 +11329,8 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
                                                        float ssgi_enabled_override = -1.f,
                                                        bool foliage_mask_valid = false,
                                                        int denoise_stage = 0,
-                                                       float atrous_step = 1.f) {
+                                                       float atrous_step = 1.f,
+                                                       bool gi_prepped_normals = false) {
   std::array<float, kGtvbaoPushConstantFloats> c = {};
   const uint32_t denoise_passes = (uint32_t)shader_injection.gtvbao_denoise_passes;
   c[0]  = shader_injection.gtvbao_quality_level;
@@ -11424,6 +11424,10 @@ static std::array<float, kGtvbaoPushConstantFloats> BuildGTVBAOPushConstants(Dev
   c[67] = g_gtvbao_gi_normal_z_preservation;
   c[68] = g_gtvbao_gi_normal_transform_mode;
   c[69] = std::clamp(shader_injection.vbgi_multibounce_bounce_fraction, 0.f, 0.5f); // bounce fraction (albedo)
+  // c[70] GI pre-decoded-normal reuse. Only the main pass sets this; the
+  // caller computed the matching predicate so the shader can trust the flag
+  // (it still re-checks the texture domains as a safety net).
+  c[70] = gi_prepped_normals ? 1.f : 0.f;
   return c;
 }
 
@@ -11511,8 +11515,8 @@ static bool CreateComputePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   EnsureGTVBAODescriptorTables(dev, d->foliage_mask_layout, &d->foliage_mask_tables);
   if (!d->foliage_mask_pipeline.handle)
     mkcs(__gtvbao_foliage_mask, "main", d->foliage_mask_layout, &d->foliage_mask_pipeline);
-  // Main: 5 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise, foliage mask) + 4 UAVs (AO, edges, GI, debug)
-  if (!make_layout(5u, 4u, &d->main_layout)) return false;
+  // Main: 6 SRVs (depth MIPs, MRT normal, light buffer, IS-FAST noise, foliage mask, pre-decoded normals) + 4 UAVs (AO, edges, GI, debug)
+  if (!make_layout(6u, 4u, &d->main_layout)) return false;
   // Denoise: 6 SRVs (AO, edges, raw GI, history AO, depth mip, MRT normal) + 3 UAVs (denoised AO, denoised GI, history AO)
   if (!make_layout(6u, 3u, &d->denoise_layout)) return false;
   // �-trous: 3 SRVs (AO src, depth MIP0, pre-decoded normals) + 1 UAV (AO dst)
@@ -11783,6 +11787,26 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     cl->bind_pipeline(AC, p);
   };
 
+  // Pre-decode MRT normals once so the à-trous taps skip the sincos/sqrt
+  // decode. Defined before Pass 2 because the optimized GI path reuses this
+  // texture and must have it dispatched before the main pass.
+  auto run_normal_prep = [&]() {
+    bind_pipe(d->normal_prep_pipeline);
+    reshade::api::resource_view np_srvs[1] = {
+        d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv};
+    reshade::api::descriptor_table_update nu[4] = {
+      {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
+      {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
+      {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
+      {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->normal_prep_uav},
+    };
+    apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
+    auto pc_np = BuildGTVBAOPushConstants(d, false);
+    cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_np.data());
+    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    bar(d->normal_prep_texture, UA, SR);
+  };
+
   // Pass 1: Prefilter
   if (shader_injection.gtvbao_debug_logging > 0.5f)
     reshade::log::message(reshade::log::level::info, "[GTVBAO] Pass 1: binding pipeline...");
@@ -11892,6 +11916,29 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     bar(d->foliage_mask_texture, UA, SR);
   }
 
+  // ── GI pre-decoded normals ──
+  // Predicts whether the main pass may reuse the à-trous normal pre-decode for
+  // its per-sample GI normals. The exact same predicate drives c[70], so the
+  // shader's decode fallback and this flag can never disagree. Requires Full
+  // mode (the pre-decode is full-res) and à-trous active (the pre-decode would
+  // run anyway), plus matching GI/AO normal transforms and neutral GI scaling.
+  const bool gi_prepped_normals = shader_injection.vbgi_enabled > 0.5f
+      && shader_injection.gtvbao_atrous_enabled > 0.5f
+      && shader_injection.gtvbao_resolution < 0.5f
+      && d->normal_prep_pipeline.handle != 0u
+      && d->normal_prep_srv.handle != 0u
+      && d->captured_mrt_normal_srv.handle != 0u
+      && g_gtvbao_gi_normal_input_mode > 0.5f
+      && g_gtvbao_gi_normal_input_mode == g_gtvbao_normal_input_mode
+      && g_gtvbao_gi_normal_transform_mode == g_gtvbao_normal_transform_mode
+      && g_gtvbao_gi_normal_influence == 1.f
+      && g_gtvbao_gi_normal_z_preservation == 1.f;
+  bool normal_prep_done = false;
+  if (gi_prepped_normals) {
+    run_normal_prep();
+    normal_prep_done = true;
+  }
+
   // Pass 2: Main
   reshade::api::pipeline mp = d->main_high_pipeline;
   { int q = (int)shader_injection.gtvbao_quality_level;
@@ -11904,11 +11951,10 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
   if (!mp.handle) return false;
   bind_pipe(mp);
   // Edges UAV is unread by the atrous kernel (binds AO/depth/prepped-normal)
-  // and, with GI off, by the skipped stage-4 tail: route to fallback so the
-  // full-res write is dropped. Spatial-only path keeps the real UAV otherwise.
+  // and by the stage-4 GI tail, so it is always routed to the fallback when
+  // à-trous runs; only the spatial bilateral chain reads the edge texture.
   const bool atrous_no_edges = shader_injection.gtvbao_atrous_enabled > 0.5f
-      && d->atrous_pipeline.handle != 0u
-      && shader_injection.vbgi_enabled < 0.5f;
+      && d->atrous_pipeline.handle != 0u;
   {
     // Light buffer: HDR accumulated (multi-bounce ON) or direct-only (OFF).
     reshade::api::resource_view light_buf;
@@ -11940,28 +11986,34 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       msg += " colorSRV="; msg += d->captured_color_srv.handle ? "OK" : "no";
       reshade::log::message(reshade::log::level::info, msg.c_str());
     }
-    reshade::api::resource_view main_srvs[5] = {
+    reshade::api::resource_view main_srvs[6] = {
         d->depth_mips_srv,
         d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv,
         light_buf,
         d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv,  // t3 IS-FAST noise
-        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv   // t4 foliage mask
+        d->foliage_mask_srv.handle ? d->foliage_mask_srv : d->fallback_srv,  // t4 foliage mask
+        d->normal_prep_srv.handle ? d->normal_prep_srv : d->fallback_srv     // t5 pre-decoded normals
     };
+    // The debug UAV is only read while a debug view is active; bind the
+    // fallback otherwise so nothing can sample stale debug output.
+    const bool gtvbao_debug_active = shader_injection.vbgi_debug_view > 0.5f
+        || shader_injection.gtvbao_debug_view > 0.5f;
     // Shader register order: u0=AO, u1=edges, u2=GI, u3=debug
     reshade::api::resource_view main_uavs[4] = {
         d->ao_term_a_uav,
         atrous_no_edges ? d->fallback_uav : d->edges_uav,
         d->vbgi_output_uav.handle ? d->vbgi_output_uav : d->fallback_uav,
-        d->debug_uav.handle ? d->debug_uav : d->fallback_uav
+        (gtvbao_debug_active && d->debug_uav.handle) ? d->debug_uav : d->fallback_uav
     };
     reshade::api::descriptor_table_update u[4] = {
       {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
       {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-      {{},0,0,5,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
+      {{},0,0,6,reshade::api::descriptor_type::texture_shader_resource_view,main_srvs},
       {{},0,0,4,reshade::api::descriptor_type::texture_unordered_access_view,main_uavs},
     };
     apply_descriptors(d->main_layout, &d->main_tables, 4, u);
-    auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid);
+    auto pc = BuildGTVBAOPushConstants(d, false, ssgi_enabled_this_frame, foliage_mask_valid,
+                                       /*stage*/0, /*atrous_step*/1.f, gi_prepped_normals);
     cl->push_constants(CS, d->main_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc.data());
   }
   cl->dispatch((aw + 7) / 8, (ah + 7) / 8, 1);
@@ -12048,24 +12100,6 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 
     // -- �-trous helpers (spatial-only) --
 
-    // Pre-decode MRT normals once so atrous taps skip the sincos/sqrt decode.
-    auto run_normal_prep = [&]() {
-      bind_pipe(d->normal_prep_pipeline);
-      reshade::api::resource_view np_srvs[1] = {
-          d->captured_mrt_normal_srv.handle ? d->captured_mrt_normal_srv : d->fallback_srv};
-      reshade::api::descriptor_table_update nu[4] = {
-        {{},0,0,1,reshade::api::descriptor_type::sampler,&d->point_clamp_sampler},
-        {{},0,0,1,reshade::api::descriptor_type::constant_buffer,&d->captured_scene_cbv_view},
-        {{},0,0,1,reshade::api::descriptor_type::texture_shader_resource_view,np_srvs},
-        {{},0,0,1,reshade::api::descriptor_type::texture_unordered_access_view,&d->normal_prep_uav},
-      };
-      apply_descriptors(d->normal_prep_layout, &d->normal_prep_tables, 4, nu);
-      auto pc_np = BuildGTVBAOPushConstants(d, false);
-      cl->push_constants(CS, d->normal_prep_layout, kGtvbaoPushConstantsLayoutParam, 0, kGtvbaoPushConstantFloats, pc_np.data());
-      cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
-      bar(d->normal_prep_texture, UA, SR);
-    };
-
     // atrous iterations (strides 1/2/4), count from gtvbao_atrous_passes. The last
     // iteration folds the OCCLUSION_TERM_SCALE multiply-back via denoise_is_last_pass.
     // Returns true when the final result lives in ao_term_b.
@@ -12102,7 +12136,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
       // -- Spatial-only + �-trous: wavelet chain replaces the combined final
       // dispatch; scale-back folds into the last iteration. A GI-only tail
       // (stage 4) keeps the GI bilateral running. --
-      run_normal_prep();
+      // The optimized GI path may already have dispatched the pre-decode
+      // before the main pass; only run it here when it has not.
+      if (!normal_prep_done) run_normal_prep();
       d->gtvbao_final_in_b = run_atrous_chain(/*start_in_b*/false);  // main wrote ao_term_a
       // Stage-4 GI tail writes nothing when GI is off (empty stage body, gated
       // GI bilateral): skip bind/push/dispatch, keep flags/barriers downstream.

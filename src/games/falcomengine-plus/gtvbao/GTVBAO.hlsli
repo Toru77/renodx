@@ -299,18 +299,11 @@ float GTVBAO_SampleSliceCosine_Mode2(float rnd0, float rnd1, float3 N_view,
 }
 
 // ── CDF remapping of horizon angles ──
-// Accounts for non-uniform sample density near the view pole.
-// sinNV / blend depend only on NdotV (per pixel), so the caller hoists them
-// once per pixel via GTVBAO_CdfRemapSinNV and passes them here.
+// Accounts for non-uniform sample density near the view pole. sinNV and blend
+// depend only on NdotV, so GTVBAO_MainPass hoists them (and the resulting
+// t*mul+add coefficients) once per pixel.
 float GTVBAO_CdfRemapSinNV(float NdotV) {
     return sqrt(saturate(1.0f - NdotV * NdotV));
-}
-float GTVBAO_RemapHorizonCDF(float t, float sinNV, float blend) {
-    // t is the [0,1] mapped horizon angle from baseline VBAO.
-    // Blend factor: 0 = pure VBAO (sinNV=1, NdotV=0), 1 = view pole (sinNV=0).
-    // CDF-corrected value: compress toward 0.5 near the pole.
-    float corrected = lerp(t, 0.5f + (t - 0.5f) * sinNV, blend);
-    return saturate(corrected);
 }
 
 uint GTVBAO_EncodeVisibilityBentNormal( lpfloat visibility, lpfloat3 bentNormal )
@@ -375,7 +368,8 @@ lpfloat3x3 GTVBAO_RotFromToMatrix( lpfloat3 from, lpfloat3 to )
 void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPerSlice, const lpfloat2 localNoise, lpfloat3 viewspaceNormal, const GTAOConstants consts, 
     Texture2D<lpfloat> sourceViewspaceDepth, SamplerState depthSampler, RWTexture2D<uint> outWorkingAOTerm, RWTexture2D<float> outWorkingEdges,
     Texture2D<uint4> mrtNormalTexture,
-    Texture2D<uint> foliageMaskTexture
+    Texture2D<uint> foliageMaskTexture,
+    Texture2D<float4> preppedNormalTexture
 #ifdef GT_VBAO_COMPUTE_GI
     , bool enableGI, float giIntensity,
     Texture2D<float4> lightBuffer, SamplerState lightSampler,
@@ -385,6 +379,12 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     )
 {                                                                       
     float2 normalizedScreenPos = (pixCoord + float2( 0.5, 0.5 )) * consts.ViewportPixelSize;
+
+    // Debug accumulation is only observable through the GTVBAO debug modes
+    // (6-8, 22-29) or the VBGI sample-activity view (5). When neither is
+    // selected the counters and the full-res debug write are dead.
+    const bool g_trackDebug = GTVBAO_debug_mode > 0.5f
+        || g_vbgi_debug_view > 0.5f;
 
     // ── Half-res mode: output domain is half, depth input stays full. ──
     // Full path below is untouched; Half uses block-center point loads
@@ -426,8 +426,23 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     if (GTVBAO_exclude_foliage > 0.5f && GTVBAO_foliage_mask_valid > 0.5f)
         foliageMaskTexture.GetDimensions(g_maskW, g_maskH);
 
+    // ── GI pre-decoded normals ──
+    // c[70] plus the domain/transform match guarantee the à-trous normal
+    // pre-decode is exactly what the per-sample decode would produce. Any
+    // mismatch falls back to the per-sample decode below.
+    uint g_prepW = 0, g_prepH = 0;
+    if (GTVBAO_gi_prepped_normal > 0.5f)
+        preppedNormalTexture.GetDimensions(g_prepW, g_prepH);
+    const bool g_giUsePrepped = (GTVBAO_gi_prepped_normal > 0.5f)
+        && all(int2(g_prepW, g_prepH) == g_workDims)
+        && all(int2(g_mrtW, g_mrtH) == g_workDims);
+
     lpfloat4 edgesLRTB  = GTVBAO_CalculateEdges( (lpfloat)viewspaceZ, (lpfloat)pixLZ, (lpfloat)pixRZ, (lpfloat)pixTZ, (lpfloat)pixBZ );
-    outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
+    // The à-trous chain never reads the edge texture (it edge-stops on depth
+    // and pre-decoded normals), so the pack + full-res write are only needed
+    // for the spatial bilateral chain.
+    if (GTVBAO_atrous_enabled < 0.5f)
+        outWorkingEdges[pixCoord] = GTVBAO_PackEdges(edgesLRTB);
 
     // ── Foliage detection (toggle on, or debug mode 9 always checks) ──
     // Foliage PS sets o1.w bit 15 (0x8000) to mark the pixel.
@@ -522,6 +537,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     const bool  g_cdfDegen  = sCdf < 0.00001f;
     const float g_cdfSinK   = g_cdfDegen ? 0.0f : sin(sCdf * GT_VBAO_PI * 0.5f);
     const float g_cdfInvPiS = g_cdfDegen ? 0.0f : 1.0f / (GT_VBAO_PI * sCdf);
+    // RemapHorizonCDF(t) = lerp(t, 0.5 + (t - 0.5) * sinNV, blend) reduces to
+    // t * mul + add with these per-pixel coefficients.
+    const float g_cdfRemapMul = 1.0f - g_remapBlend + g_remapBlend * g_remapSinNV;
+    const float g_cdfRemapAdd = 0.5f * g_remapBlend * (1.0f - g_remapSinNV);
     // ── Debug accumulators for bitmask viz (modes 6-8) ──
     uint debugTotalSectorCoverage = 0u;
     uint debugTotalSamples = 0u;
@@ -539,7 +558,6 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     float dbgProjLenSum = 0.0f;        // sum of per-slice projectedNormalVecLength
     float dbgSliceAOSum = 0.0f;        // sum of per-slice unweighted sliceAO
     float dbgSliceN = 0.0f;            // number of slices accumulated
-    float dbgFinalVisibility = 0.0f;   // final accumulated visibility
 
 #ifdef GT_VBAO_SHOW_DEBUG_VIZ
     float3 dbgWorldPos          = mul(g_globals.ViewInv, float4(pixCenterPos, 1)).xyz;
@@ -683,7 +701,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                 s += minS;
 
                 lpfloat2 sampleOffset = s * omega;
-                lpfloat sampleOffsetLength = length( sampleOffset );
+                // |omega| == screenspaceRadius by construction (unit direction
+                // scaled by it), so the length is s * screenspaceRadius.
+                lpfloat sampleOffsetLength = (lpfloat)(s * screenspaceRadius);
                 const lpfloat mipLevel = (lpfloat)clamp( log2( sampleOffsetLength ) - consts.DepthMIPSamplingOffset, 0, GT_VBAO_DEPTH_MIP_LEVELS );
                 sampleOffset = round(sampleOffset) * (lpfloat2)consts.ViewportPixelSize;
 
@@ -740,9 +760,10 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     frontBackHorizon = saturate(((sd * -frontBackHorizon) + (float)n + GT_VBAO_PI_HALF) / GT_VBAO_PI);
 
                     // ── GTVBAO: CDF remap horizon angles (always On) ──
-                    // sinNV / blend are per-pixel; see the hoist above.
-                    frontBackHorizon.x = GTVBAO_RemapHorizonCDF(frontBackHorizon.x, g_remapSinNV, g_remapBlend);
-                    frontBackHorizon.y = GTVBAO_RemapHorizonCDF(frontBackHorizon.y, g_remapSinNV, g_remapBlend);
+                    // sinNV / blend are per-pixel; apply the hoisted
+                    // t*mul+add form of the CDF remap.
+                    frontBackHorizon.x = saturate(frontBackHorizon.x * g_cdfRemapMul + g_cdfRemapAdd);
+                    frontBackHorizon.y = saturate(frontBackHorizon.y * g_cdfRemapMul + g_cdfRemapAdd);
 
                     // samplingDirection inverts min/max ordering.
                     frontBackHorizon = (sd >= 0.0) ? frontBackHorizon.yx : frontBackHorizon.xy;
@@ -754,9 +775,12 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                     uint sampleMask = GTVBAO_UpdateSectors(frontBackHorizon.x, frontBackHorizon.y, 0u);
 
                     // ── Debug: track per-sample sector coverage ──
-                    // Read by Bitmask debug views 6-8, so this stays.
-                    debugTotalSectorCoverage += GTVBAO_CountBits(sampleMask);
-                    debugTotalSamples += 1u;
+                    // Read by Bitmask debug views 6-8; skipped when no debug
+                    // view consumes it.
+                    if (g_trackDebug) {
+                        debugTotalSectorCoverage += GTVBAO_CountBits(sampleMask);
+                        debugTotalSamples += 1u;
+                    }
 
 #ifdef GT_VBAO_COMPUTE_GI
                     // ── GI contribution (paper Algorithm 1, line 23) ──
@@ -804,7 +828,20 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         // dispatch -- no divergence, and only one of the MRT /
                         // depth paths ever runs. Texel mapping, decode and
                         // transform arithmetic are shared deliberately.
-                        if (GTVBAO_gi_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
+                        //
+                        // Reuse the à-trous normal pre-decode (fp16). The host
+                        // only enables c[70] when that pass ran and the GI/AO
+                        // transforms and scaling match, so this equals the
+                        // decode+transform+tune below.
+                        if (g_giUsePrepped)
+                        {
+                            int2 prepTc = GTVBAO_MrtTexel(sampleScreenPos * float2(g_mrtW, g_mrtH),
+                                                          float2(g_mrtW, g_mrtH));
+                            float3 prepped = preppedNormalTexture.Load(int3(prepTc, 0)).xyz;
+                            if (FalcomNormalValid(prepped))
+                                sampleNormal = (float3)prepped;
+                        }
+                        else if (GTVBAO_gi_normal_input_mode > 0.5 && GTVBAO_mrt_normal_available > 0.5)
                         {
                             // Dimensions were cached once above; do not re-query
                             // them per sample.
@@ -864,9 +901,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
                         // vbgi_intensity is applied here only; the lighting
                         // composite does not re-apply it to this term.
                         sliceGI += weight * lightColor * NdotL * NsDotL * giIntensity;
-                        activityContributed += 1u;
+                        if (g_trackDebug) activityContributed += 1u;
                     } else if (enableGI) {
-                        activityRejected += 1u;
+                        if (g_trackDebug) activityRejected += 1u;
                     }
 #endif // GT_VBAO_COMPUTE_GI
 
@@ -875,7 +912,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             }
 
             // ── Debug: save first slice's final bitmask ──
-            if (!debugFirstSliceSaved) {
+            if (g_trackDebug && !debugFirstSliceSaved) {
                 debugFirstSliceBitmask = sliceBitmask;
                 debugFirstSliceSaved = true;
             }
@@ -889,10 +926,12 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
             // projected normal and the slice direction: near +-PI/2 means the
             // slice is tangential to the normal, near 0 means the normal
             // points straight along the slice.
-            dbgCosNormSum += (float)cosNorm;
-            dbgProjLenSum += (float)projectedNormalVecLength;
-            dbgSliceAOSum  += (float)sliceAO;
-            dbgSliceN      += 1.0f;
+            if (g_trackDebug) {
+                dbgCosNormSum += (float)cosNorm;
+                dbgProjLenSum += (float)projectedNormalVecLength;
+                dbgSliceAOSum  += (float)sliceAO;
+                dbgSliceN      += 1.0f;
+            }
 
             // ── GTVBAO Mode 0: cosine weight per slice (cosine sampling always On) ──
             if ((int)GTVBAO_gtvbao_cosine_mode == 0) {
@@ -1134,6 +1173,9 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     }
 
 #ifdef GT_VBAO_COMPUTE_GI
+    // When no debug view is active, skip the whole debug write (previously a
+    // full-res float4 write for every pixel).
+    if (g_trackDebug) {
     // ── SSGI debug view 5: sample activity heatmap ──
     // Red = rejected samples (valid but newCount==0), Green = contributed, Yellow = mix
     int vbgiDbgMode = (int)g_vbgi_debug_view;
@@ -1268,6 +1310,7 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
         outDebug[pixCoord] = float4(0, 0, 0, 0);
     }
     } // end vbgiDbgMode==5 vs bitmask debug
+    } // end g_trackDebug
 
     if (enableGI)
         outGI[pixCoord] = float4(giAccum, (float)visibility);
