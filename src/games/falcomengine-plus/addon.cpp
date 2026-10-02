@@ -2999,7 +2999,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "CharShadowMode", .binding = &shader_injection.char_shadow_mode,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f,
+      .default_value = 2.f,
       .label = "Mode",
       .section = "Character Shadowing",
       .tooltip = "Which character shadowing technique runs. Vanilla is the ENGINE's "
