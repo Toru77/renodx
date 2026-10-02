@@ -30,10 +30,10 @@ float3 HammonDiffuseBRDF(
   // Facing term
   float facing = 0.5f + 0.5f * VdotH;
 
-  // Rough surface approximation — avoid singularity at grazing half-vector.
-  // max(NdotH, 1e-3) caps the reciprocal to ~500, preventing sparkles.
+  // Rough surface approximation — the reciprocal is capped so the grazing
+  // half-vector singularity cannot push the correction into its clamp.
   float rough = facing * (0.9f - 0.4f * facing)
-              * ((0.5f + NdotH) / max(NdotH, 1e-3f));
+              * min(SafeDivideF(0.5f + NdotH, NdotH, 1.0f), 2.0f);
 
   // Smooth surface approximation — pow5(1-x) expanded manually
   float oneMinusNdotL = 1.0f - NdotL;
@@ -74,6 +74,39 @@ float3 HammonEnergyRatio(
   ratio.z = SafeDivideF(hammon.z, lambert.z, 1.0f);
 
   return ratio;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Hammon Diffuse Correction — deferred-lighting energy ratio
+//
+// Albedo-independent (albedo is applied later by the deferred resolve),
+// normalized to 1.0 at smooth/normal incidence, clamped to 2.0× for firefly
+// safety.  Inputs must be saturated.
+// ──────────────────────────────────────────────────────────────────────────────
+float3 HammonDiffuseCorrection(
+    float NdotL, float NdotV, float NdotH, float VdotH, float roughness)
+{
+  float3 ratio = HammonEnergyRatio(NdotL, NdotV, NdotH, VdotH, roughness, float3(1.0f, 1.0f, 1.0f));
+  return min(ratio * (1.0f / 1.05f), 2.0f);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Soft Specular Peak Clamp
+//
+// Identity below half of `peak`, then a smooth knee that asymptotes to `peak`.
+// Used to bound GGX highlights without flattening the lobe top.  peak <= 0
+// disables the clamp.
+// ──────────────────────────────────────────────────────────────────────────────
+float SoftClampSpecular(float x, float peak)
+{
+  if (peak <= 0.0f)
+    return x;
+
+  float knee = peak * 0.5f;
+  if (x <= knee)
+    return x;
+
+  return knee + (x - knee) / (1.0f + (x - knee) / (peak - knee));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

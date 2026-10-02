@@ -801,6 +801,7 @@ void main(
   bool brdf_use_ggx = shader_injection_data.brdf_multiscatter_specular_enabled > 0.5f;
   float brdf_diffuse_str = shader_injection_data.brdf_diffuse_strength;
   float brdf_specular_str = shader_injection_data.brdf_specular_strength;
+  float brdf_specular_peak = shader_injection_data.brdf_specular_peak_clamp;
   r0.w = r16.x ? r0.w : 1.0f;
   r17.xyz = r12.xyz * r1.yyy + -lightDirection_g.xyz;
   r8.w = dot(r17.xyz, r17.xyz);
@@ -811,14 +812,17 @@ void main(
   r8.w = max(0.00100000005, r8.w);
   // ── BRDF Sun GGX ──
   float brdf_blinn_sun = exp2(log2(max(r11.w, 0.0001f)) * r8.w);
+  float brdf_NdotH_sun = r11.w;
+  float brdf_NdotL_sun = saturate(dot(r6.xyw, -lightDirection_g.xyz));
+  float brdf_VdotH_sun = saturate(dot(r15.xyz, r17.xyz));
   if (brdf_use_ggx) {
-    float brdf_NdotL_sun = saturate(dot(r6.xyw, -lightDirection_g.xyz));
-    float brdf_VdotH_sun = saturate(dot(r15.xyz, r17.xyz));
-    float3 brdf_ggx_sun = GGX_Specular(r11.w, brdf_NdotV, brdf_NdotL_sun,
+    float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun,
                                        brdf_VdotH_sun, brdf_roughness, brdf_F0);
     brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun,
                                              brdf_roughness, brdf_F0);
-    r8.w = lerp(brdf_blinn_sun, brdf_ggx_sun.x * brdf_NdotL_sun, brdf_specular_str);
+    r8.w = lerp(brdf_blinn_sun,
+                SoftClampSpecular(brdf_ggx_sun.x * brdf_NdotL_sun, brdf_specular_peak),
+                brdf_specular_str);
   } else {
     r8.w = brdf_blinn_sun;
   }
@@ -1158,6 +1162,11 @@ void main(
   // gate is required rather than assuming the sun term is already ~0 indoors.
   // r0.w is the CSM visibility (shadowTexture sample, line 696) and is unwritten
   // through here. shadowSplitDistance_g.z is the inferred outermost split.
+  if (brdf_use_hammon) {
+    r7.xyz *= lerp(float3(1,1,1),
+        HammonDiffuseCorrection(brdf_NdotL_sun, brdf_NdotV, brdf_NdotH_sun, brdf_VdotH_sun, brdf_roughness),
+        brdf_diffuse_str);
+  }
   r7.xyz = FalcomApplyContactToSun(
       r7.xyz * lightColor_g.xyz, is_character_pixel,
       contactShadowTex.SampleLevel(samPoint_s, v1.xy, 0),
@@ -1251,29 +1260,37 @@ void main(
                                                   csDepthTex, samPoint_s);
         }
         // ── BRDF Diffuse (Hammon) ──
+        float3 brdf_vanilla_diffuse_pt = r13.yzw * brdf_combinedAtten_pt;
         if (brdf_use_hammon) {
-          float3 brdf_hammon_correction = HammonEnergyRatio(brdf_rawNdotL_pt, brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness, float3(1,1,1));
-          brdf_hammon_correction = brdf_hammon_correction * (1.0f / 1.05f);  // * 1/1.05 to normalize at zero-roughness normal incidence
-          float3 brdf_vanilla_diffuse_pt = r13.yzw * brdf_combinedAtten_pt;
-          float3 brdf_hammon_diffuse_pt = brdf_vanilla_diffuse_pt * brdf_hammon_correction;
-          r10.xyz = lerp(brdf_vanilla_diffuse_pt, brdf_hammon_diffuse_pt, brdf_diffuse_str) + r10.xyz;
-        } else {
-          r10.xyz = r13.yzw * brdf_combinedAtten_pt + r10.xyz;
+          brdf_vanilla_diffuse_pt *= lerp(float3(1,1,1),
+              HammonDiffuseCorrection(saturate(brdf_rawNdotL_pt), brdf_NdotV, brdf_NdotH_pt, brdf_VdotH_pt, brdf_roughness),
+              brdf_diffuse_str);
         }
+        r10.xyz = brdf_vanilla_diffuse_pt + r10.xyz;
         // ── Specular ──
         r14.x = dynamicLights_g[r2.w].specularIntensity;
         r14.y = dynamicLights_g[r2.w].specularGlossiness;
         float brdf_gloss_pt = r14.y * r2.y;
         float brdf_blinn_pt = exp2(log2(max(brdf_NdotH_pt, 0.0001f)) * max(brdf_gloss_pt, 0.001f));
-        float brdf_spec_shape_pt = brdf_blinn_pt;
+        float brdf_spec_pt = brdf_blinn_pt * brdf_combinedAtten_pt;
         if (brdf_use_ggx) {
           float brdf_NdotL_pt = saturate(brdf_rawNdotL_pt);
-          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_roughness, brdf_F0);
-          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_roughness, brdf_F0);
-          brdf_spec_shape_pt = lerp(brdf_blinn_pt, brdf_ggx_spec_pt.x, brdf_specular_str);
-          brdf_spec_shape_pt = max(brdf_spec_shape_pt, 0.0f);
+          // Match the GGX lobe to the authored Blinn exponent and normalize its
+          // energy so sharp local lights cannot spread or blow out.  The GGX half
+          // uses the physical NdotL attenuation (no translucency wrap).
+          float brdf_gloss_pt_safe = max(brdf_gloss_pt, 0.001f);
+          float brdf_rough_pt = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_pt_safe + 2.0f), 0.25f)), 0.08f, 1.0f);
+          float brdf_Eo_pt = GGX_DirectionalAlbedo(brdf_NdotV, brdf_rough_pt);
+          float brdf_Ei_pt = GGX_DirectionalAlbedo(brdf_NdotL_pt, brdf_rough_pt);
+          float brdf_scale_pt = saturate((6.2831853f / (brdf_gloss_pt_safe + 2.0f)) / max(brdf_Eo_pt * brdf_Ei_pt, 0.05f));
+          float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_rough_pt, brdf_F0);
+          brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_rough_pt, brdf_F0);
+          brdf_ggx_spec_pt *= brdf_scale_pt;
+          brdf_spec_pt = lerp(brdf_spec_pt,
+                              SoftClampSpecular(brdf_ggx_spec_pt.x * (brdf_rawDistAtten_pt * brdf_NdotL_pt), brdf_specular_peak),
+                              brdf_specular_str);
         }
-        r9.xyz = r13.yzw * brdf_spec_shape_pt * brdf_combinedAtten_pt * r14.x + r9.xyz;
+        r9.xyz = r13.yzw * brdf_spec_pt * r14.x + r9.xyz;
       }
       r2.x = (int)r2.x + 1;
     }
@@ -1375,29 +1392,34 @@ void main(
                                                     csDepthTex, samPoint_s);
           }
           // ── BRDF Diffuse (Hammon) ──
+          float3 brdf_vanilla_diffuse_sp = r16.xyz * brdf_combinedAtten_sp;
           if (brdf_use_hammon) {
-            float3 brdf_hammon_correction_sp = HammonEnergyRatio(brdf_rawNdotL_sp, brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness, float3(1,1,1));
-            brdf_hammon_correction_sp = brdf_hammon_correction_sp * (1.0f / 1.05f);
-            float3 brdf_vanilla_diffuse_sp = r16.xyz * brdf_combinedAtten_sp;
-            float3 brdf_hammon_diffuse_sp = brdf_vanilla_diffuse_sp * brdf_hammon_correction_sp;
-            r14.xyz = lerp(brdf_vanilla_diffuse_sp, brdf_hammon_diffuse_sp, brdf_diffuse_str) + r14.xyz;
-          } else {
-            r14.xyz = r16.xyz * brdf_combinedAtten_sp + r14.xyz;
+            brdf_vanilla_diffuse_sp *= lerp(float3(1,1,1),
+                HammonDiffuseCorrection(saturate(brdf_rawNdotL_sp), brdf_NdotV, brdf_NdotH_sp, brdf_VdotH_sp, brdf_roughness),
+                brdf_diffuse_str);
           }
+          r14.xyz = brdf_vanilla_diffuse_sp + r14.xyz;
           // ── Specular ──
           r17.x = dynamicLights_g[r2.w].specularIntensity;
           r17.y = dynamicLights_g[r2.w].specularGlossiness;
           float brdf_gloss_sp = r17.y * r2.y;
           float brdf_blinn_sp = exp2(log2(max(brdf_NdotH_sp, 0.0001f)) * max(brdf_gloss_sp, 0.001f));
-          float brdf_spec_shape_sp = brdf_blinn_sp;
+          float brdf_spec_sp = brdf_blinn_sp * brdf_combinedAtten_sp;
           if (brdf_use_ggx) {
             float brdf_NdotL_sp = saturate(brdf_rawNdotL_sp);
-            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_roughness, brdf_F0);
-            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_roughness, brdf_F0);
-            brdf_spec_shape_sp = lerp(brdf_blinn_sp, brdf_ggx_spec_sp.x, brdf_specular_str);
-            brdf_spec_shape_sp = max(brdf_spec_shape_sp, 0.0f);
+            float brdf_gloss_sp_safe = max(brdf_gloss_sp, 0.001f);
+            float brdf_rough_sp = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_sp_safe + 2.0f), 0.25f)), 0.08f, 1.0f);
+            float brdf_Eo_sp = GGX_DirectionalAlbedo(brdf_NdotV, brdf_rough_sp);
+            float brdf_Ei_sp = GGX_DirectionalAlbedo(brdf_NdotL_sp, brdf_rough_sp);
+            float brdf_scale_sp = saturate((6.2831853f / (brdf_gloss_sp_safe + 2.0f)) / max(brdf_Eo_sp * brdf_Ei_sp, 0.05f));
+            float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_rough_sp, brdf_F0);
+            brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_rough_sp, brdf_F0);
+            brdf_ggx_spec_sp *= brdf_scale_sp;
+            brdf_spec_sp = lerp(brdf_spec_sp,
+                                SoftClampSpecular(brdf_ggx_spec_sp.x * (brdf_shadowAtten_sp * brdf_NdotL_sp), brdf_specular_peak),
+                                brdf_specular_str);
           }
-          r13.yzw = r16.xyz * brdf_spec_shape_sp * brdf_combinedAtten_sp * r17.x + r13.yzw;
+          r13.yzw = r16.xyz * brdf_spec_sp * r17.x + r13.yzw;
         }
       }
       r2.x = (int)r2.x + 1;
@@ -1457,15 +1479,13 @@ void main(
                                                   csDepthTex, samPoint_s);
         }
         // ── BRDF Diffuse (Hammon) ──
+        float3 brdf_vanilla_diffuse_env = r10.xyz * brdf_combinedAtten_env;
         if (brdf_use_hammon) {
-          float3 brdf_hammon_correction_env = HammonEnergyRatio(brdf_rawNdotL_env, brdf_NdotV, brdf_NdotH_env, brdf_VdotH_env, brdf_roughness, float3(1,1,1));
-          brdf_hammon_correction_env = brdf_hammon_correction_env * (1.0f / 1.05f);
-          float3 brdf_vanilla_diffuse_env = r10.xyz * brdf_combinedAtten_env;
-          float3 brdf_hammon_diffuse_env = brdf_vanilla_diffuse_env * brdf_hammon_correction_env;
-          r9.xyz = lerp(brdf_vanilla_diffuse_env, brdf_hammon_diffuse_env, brdf_diffuse_str) + r9.xyz;
-        } else {
-          r9.xyz = r10.xyz * brdf_combinedAtten_env + r9.xyz;
+          brdf_vanilla_diffuse_env *= lerp(float3(1,1,1),
+              HammonDiffuseCorrection(saturate(brdf_rawNdotL_env), brdf_NdotV, brdf_NdotH_env, brdf_VdotH_env, brdf_roughness),
+              brdf_diffuse_str);
         }
+        r9.xyz = brdf_vanilla_diffuse_env + r9.xyz;
       }
       r9.w = (int)r9.w + 1;
     }
@@ -1570,15 +1590,13 @@ void main(
                                                     csDepthTex, samPoint_s);
           }
           // ── BRDF Diffuse (Hammon) ──
+          float3 brdf_vanilla_diffuse_env_sp = r11.xyz * brdf_combinedAtten_env_sp;
           if (brdf_use_hammon) {
-            float3 brdf_hammon_correction_env_sp = HammonEnergyRatio(brdf_rawNdotL_env_sp, brdf_NdotV, brdf_NdotH_env_sp, brdf_VdotH_env_sp, brdf_roughness, float3(1,1,1));
-            brdf_hammon_correction_env_sp = brdf_hammon_correction_env_sp * (1.0f / 1.05f);
-            float3 brdf_vanilla_diffuse_env_sp = r11.xyz * brdf_combinedAtten_env_sp;
-            float3 brdf_hammon_diffuse_env_sp = brdf_vanilla_diffuse_env_sp * brdf_hammon_correction_env_sp;
-            r10.xyz = lerp(brdf_vanilla_diffuse_env_sp, brdf_hammon_diffuse_env_sp, brdf_diffuse_str) + r10.xyz;
-          } else {
-            r10.xyz = r11.xyz * brdf_combinedAtten_env_sp + r10.xyz;
+            brdf_vanilla_diffuse_env_sp *= lerp(float3(1,1,1),
+                HammonDiffuseCorrection(saturate(brdf_rawNdotL_env_sp), brdf_NdotV, brdf_NdotH_env_sp, brdf_VdotH_env_sp, brdf_roughness),
+                brdf_diffuse_str);
           }
+          r10.xyz = brdf_vanilla_diffuse_env_sp + r10.xyz;
         }
       }
       r10.w = (int)r10.w + 1;

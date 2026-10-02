@@ -293,10 +293,11 @@ struct ShaderInjectData {
   // —— GTVBAO pre-filter ——
   float gtvbao_prefilter_enabled;    // 0=Off, 1=On — depth-aware bilateral pre-filter on raw AO
   // —— BRDF Improvement ——
-  float brdf_hammon_diffuse_enabled;       // 0=Off, 1=On
+  float brdf_hammon_diffuse_enabled;       // 0=Off, 1=On — sun + local lights
   float brdf_multiscatter_specular_enabled;// 0=Off, 1=On
   float brdf_diffuse_strength;             // [0..2] blend 0=vanilla → 1=Hammon
   float brdf_specular_strength;            // [0..2] blend 0=vanilla → 1=GGX+MS
+  float brdf_specular_peak_clamp;          // [0..16] soft GGX highlight cap, 0=off
   float brdf_roughness_min;                // [0..0.5] default 0.04
   float brdf_roughness_max;                // [0.5..1] default 1.0
   float brdf_f0_source;                    // reserved (0=specularColor)
