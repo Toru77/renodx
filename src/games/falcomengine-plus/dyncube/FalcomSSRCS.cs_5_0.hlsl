@@ -11,7 +11,7 @@
 //         grazingFade, charOccStrength, charOccUpness, isfastEnabled, isfastBound,
 //         isfastFrame, isfastStrength, isfastSpatial, isfastTemporal, isfastSeed, pad },
 //         s0 point clamp
-// Output: u0 ssr_raw
+// Output: u0 ssr_raw, u1 per-8x8-tile hit mask (atomic OR, blur early-out)
 
 cbuffer cb_scene : register(b0)
 {
@@ -50,6 +50,7 @@ Texture3D<float2> g_isfastNoise : register(t3);  // IS-FAST spatio-temporal blue
 SamplerState      g_pointClamp : register(s0);
 
 RWTexture2D<float4> g_out : register(u0);
+RWTexture2D<uint> g_tileMask : register(u1);  // per-8x8-tile hit flag for the blur early-out
 
 #include "dyncube_common.hlsli"
 
@@ -310,9 +311,9 @@ void main(uint3 dtid : SV_DispatchThreadID)
         // confidence so the Dynamic/Vanilla fallback takes over smoothly. Vertical
         // surfaces (mirrors/walls, low upness) keep the legitimate character reflection.
         if (g_charOccStrength > 0.0f) {
-            int2 hitPx = clamp(int2(fuv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
-            uint4 hitMrt = g_mrt0Tex.Load(int3(hitPx, 0));
-            uint hitWord = (g_charComp > 0.5f) ? hitMrt.z : hitMrt.w;
+            // Reuse the raw texel DecodeWorldNormal just loaded at this same
+            // clamped hit pixel (mrtHitUnused); no second MRT fetch.
+            uint hitWord = (g_charComp > 0.5f) ? mrtHitUnused.z : mrtHitUnused.w;
             uint origWord = (g_charComp > 0.5f) ? mrtOrigin.z : mrtOrigin.w;
             bool charHit  = ((((hitWord >> (uint)g_charShift) & 1u) != 0u) != (g_charInvert > 0.5f));
             bool charOrig = ((((origWord >> (uint)g_charShift) & 1u) != 0u) != (g_charInvert > 0.5f));
@@ -332,5 +333,12 @@ void main(uint3 dtid : SV_DispatchThreadID)
         int2 hitTex = clamp(int2(fuv * float2(w, h)), int2(0, 0), int2(w, h) - int2(1, 1));
         float3 hitCol = g_colorTex.Load(int3(hitTex, 0)).rgb;
         g_out[px] = float4(max(0.0, hitCol), conf);
+        // Per-8x8-tile donor flag for the blur's empty-tile early-out. Atomic OR:
+        // this shader has no group-wide sync (miss pixels return above), so the
+        // flag cannot be built with a groupshared reduction. Only donor pixels
+        // (conf > the blur's kConfEpsilon) ever set a bit.
+        if (conf > 0.01f) {
+            InterlockedOr(g_tileMask[uint2(px) / 8u], 1u);
+        }
     }
 }

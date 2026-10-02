@@ -700,10 +700,10 @@ constexpr uint32_t kDynCubeHistPosRegister = 29u; // t29 dynCubeHistPosTex (debu
 constexpr uint32_t kDynCubeVanillaRegister = 30u; // t30 dynCubeVanillaTex (vanilla cube fallback)
 constexpr uint32_t kDynCubeSSRRegister = 31u;     // t31 dynCubeSSRTex (blurred SSR result)
 constexpr uint32_t kDynCubeSSRRawRegister = 32u;  // t32 dynCubeSSRRawTex (raw SSR, debug 17)
-constexpr uint32_t kDynCubeSSRLayoutVersion = 5u;
-constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 5u;
+constexpr uint32_t kDynCubeSSRLayoutVersion = 6u;
+constexpr uint32_t kDynCubeSSRBlurLayoutVersion = 6u;
 constexpr uint32_t kDynCubeWorldBoxLayoutVersion = 2u;
-constexpr uint32_t kDynCubeCaptureLayoutVersion = 1u;  // bump when the capture pipeline layout shape changes (forces recreate)
+constexpr uint32_t kDynCubeCaptureLayoutVersion = 2u;  // bump when the capture pipeline layout shape changes (forces recreate)
 constexpr uint32_t kRCASLayoutVersion = 5u;  // bump when the RCAS pipeline layout shape changes (forces recreate)
 constexpr uint32_t kFXAALayoutVersion = 1u;  // bump when the FXAA pipeline layout shape changes (forces recreate)
 // Strip sRGB encoding for UAV-compatible temp storage and raw (non-decoding)
@@ -1083,7 +1083,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t dyncube_capture_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
   reshade::api::pipeline_layout dyncube_solid_layout = {};
   reshade::api::pipeline dyncube_solid_pipeline = {};
-  GTVBAODescriptorTableSet dyncube_capture_tables = {};
+  std::array<reshade::api::descriptor_table, 5> dyncube_capture_tables = {};  // sampler, cbv, srv, texture uavs, buffer uav (scratch)
   GTVBAODescriptorTableSet dyncube_solid_tables = {};
   bool dyncube_resources_created = false;
   uint32_t dyncube_size = kDynCubeDefaultSize;
@@ -1196,6 +1196,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource dyncube_ssr_blur = {};         // RGBA16F 2D, final blurred result (t31)
   reshade::api::resource_view dyncube_ssr_blur_srv = {};
   reshade::api::resource_view dyncube_ssr_blur_uav = {};
+  reshade::api::resource dyncube_ssr_hitmask = {};      // R32_UINT 2D, per-8x8-tile SSR hit mask (atomics require R32)
+  reshade::api::resource_view dyncube_ssr_hitmask_srv = {};
+  reshade::api::resource_view dyncube_ssr_hitmask_uav = {};
   reshade::api::pipeline_layout dyncube_ssr_layout = {};
   reshade::api::pipeline dyncube_ssr_pipeline = {};
   uint32_t dyncube_ssr_layout_version = 0u;  // recreate layout/tables/pipeline when shape changes
@@ -9880,6 +9883,8 @@ static void DestroyDynCubeResources(reshade::api::device* dev, DeviceData* d) {
   if (d->dyncube_ssr_blur_h_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_blur_h_uav); d->dyncube_ssr_blur_h_uav = {}; }
   dv(d->dyncube_ssr_blur_srv); dr(d->dyncube_ssr_blur);
   if (d->dyncube_ssr_blur_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_blur_uav); d->dyncube_ssr_blur_uav = {}; }
+  dv(d->dyncube_ssr_hitmask_srv); dr(d->dyncube_ssr_hitmask);
+  if (d->dyncube_ssr_hitmask_uav.handle) { dev->destroy_resource_view(d->dyncube_ssr_hitmask_uav); d->dyncube_ssr_hitmask_uav = {}; }
   dp(d->dyncube_ssr_pipeline); dl(d->dyncube_ssr_layout);
   for (auto& t : d->dyncube_ssr_tables) { if (t.handle) { dev->free_descriptor_table(t); t = {}; } }
   d->dyncube_ssr_layout_version = 0u;
@@ -10389,7 +10394,8 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     reshade::api::pipeline_subobject so = {reshade::api::pipeline_subobject_type::compute_shader, 1, &sd};
     return dev->create_pipeline(lo, 1, &so, out);
   };
-  // Phase 1+2: 7 SRVs (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0), 5 UAVs (curColor, curPos, curContrib, camCur, charmask), 10 push floats
+  // Phase 1+2 + folded world-box pass 0: 8 SRVs (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0, vanilla),
+  // 5 texture UAVs (curColor, curPos, curContrib, camCur, charmask) + 1 buffer UAV (bounds scratch), 14 push floats
   auto make_capture_layout = [&](reshade::api::pipeline_layout* out) -> bool {
     if (out->handle != 0u && d->dyncube_capture_layout_version == kDynCubeCaptureLayoutVersion) return true;
     if (out->handle != 0u) {
@@ -10402,20 +10408,22 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene only
     DR srv_r     = {0,0,0,8,DS::all_compute,1,DT::texture_shader_resource_view}; // t0..t7 (depth, color, prevColor, prevPos, prevContrib, camPrev, mrt0, vanilla)
     DR uav_r     = {0,0,0,5,DS::all_compute,1,DT::texture_unordered_access_view}; // u0..u4 (curColor, curPos, curContrib, camCur, charmask)
+    DR uav_buf_r = {0,5,0,1,DS::all_compute,1,DT::buffer_unordered_access_view}; // u5 (world-box per-group partials)
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
     push_range.dx_register_space = 0;
-    push_range.count = 12; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert, sparkleReject
+    push_range.count = 14; // boost, blend, posThreshold, posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert, sparkleReject, contribThreshold, writeCharmask
     push_range.visibility = DS::all_compute;
-    P p0, p1, p2, p3, pPush;
+    P p0, p1, p2, p3, p4, pPush;
     p0.type = reshade::api::pipeline_layout_param_type::descriptor_table; p0.descriptor_table.count = 1; p0.descriptor_table.ranges = &sampler_r;
     p1.type = reshade::api::pipeline_layout_param_type::descriptor_table; p1.descriptor_table.count = 1; p1.descriptor_table.ranges = &cbv_r;
     p2.type = reshade::api::pipeline_layout_param_type::descriptor_table; p2.descriptor_table.count = 1; p2.descriptor_table.ranges = &srv_r;
     p3.type = reshade::api::pipeline_layout_param_type::descriptor_table; p3.descriptor_table.count = 1; p3.descriptor_table.ranges = &uav_r;
+    p4.type = reshade::api::pipeline_layout_param_type::descriptor_table; p4.descriptor_table.count = 1; p4.descriptor_table.ranges = &uav_buf_r;
     pPush.type = reshade::api::pipeline_layout_param_type::push_constants; pPush.push_constants = push_range;
-    P params[5] = {p0,p1,p2,p3,pPush};
-    if (!dev->create_pipeline_layout(5, params, out)) return false;
+    P params[6] = {p0,p1,p2,p3,p4,pPush};
+    if (!dev->create_pipeline_layout(6, params, out)) return false;
     d->dyncube_capture_layout_version = kDynCubeCaptureLayoutVersion;
     return true;
   };
@@ -10429,15 +10437,15 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
   if (!make_capture_layout(&d->dyncube_capture_layout)) return false;
   if (!make_solid_layout(&d->dyncube_solid_layout)) return false;
   // Ensure tables
-  auto ensure = [&](reshade::api::pipeline_layout lo, GTVBAODescriptorTableSet* tbl, uint32_t count) -> bool {
+  auto ensure = [&](reshade::api::pipeline_layout lo, std::span<reshade::api::descriptor_table> tbl, uint32_t count) -> bool {
     for (uint32_t i = 0; i < count; ++i) {
-      if ((*tbl)[i].handle != 0u) continue;
-      if (!dev->allocate_descriptor_table(lo, i, &(*tbl)[i])) return false;
+      if (tbl[i].handle != 0u) continue;
+      if (!dev->allocate_descriptor_table(lo, i, &tbl[i])) return false;
     }
     return true;
   };
-  if (!ensure(d->dyncube_capture_layout, &d->dyncube_capture_tables, 4)) return false;
-  if (!ensure(d->dyncube_solid_layout, &d->dyncube_solid_tables, 1)) return false;
+  if (!ensure(d->dyncube_capture_layout, d->dyncube_capture_tables, 5)) return false;
+  if (!ensure(d->dyncube_solid_layout, d->dyncube_solid_tables, 1)) return false;
 
   // Embedded shaders are inline constexpr spans defined in <embed/shaders.h>
   // Prefer generic DynamicCubemapCaptureCS, fallback to legacy dyncube_capture for compat.
@@ -10504,7 +10512,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     return dev->create_pipeline_layout(4, params, out);
   };
   if (!make_ggx_layout(&d->dyncube_ggx_layout)) return false;
-  if (!ensure(d->dyncube_ggx_layout, &d->dyncube_ggx_tables, 3)) return false;
+  if (!ensure(d->dyncube_ggx_layout, d->dyncube_ggx_tables, 3)) return false;
   #ifdef __SpecularIrradianceCS_EMBED_FILE
   if (!__SpecularIrradianceCS.empty()) {
     if (!mkcs(__SpecularIrradianceCS, d->dyncube_ggx_layout, &d->dyncube_ggx_pipeline)) {
@@ -10534,7 +10542,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     return dev->create_pipeline_layout(4, params, out);
   };
   if (!make_variant_layout(&d->dyncube_variant_layout)) return false;
-  if (!ensure(d->dyncube_variant_layout, &d->dyncube_variant_tables, 3)) return false;
+  if (!ensure(d->dyncube_variant_layout, d->dyncube_variant_tables, 3)) return false;
   #ifdef __DynCubeVariantCS_EMBED_FILE
   if (!__DynCubeVariantCS.empty()) {
     if (!mkcs(__DynCubeVariantCS, d->dyncube_variant_layout, &d->dyncube_variant_pipeline)) {
@@ -10555,7 +10563,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
     DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene
     DR srv_r     = {0,0,0,4,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 color, t1 depth, t2 mrt_normal, t3 IS-FAST noise
-    DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 ssr_result
+    DR uav_r     = {0,0,0,2,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 ssr_result, u1 per-tile hit mask
     reshade::api::constant_range push_range = {};
     push_range.binding = 0;
     push_range.dx_register_index = 13;
@@ -10574,7 +10582,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     return true;
   };
   if (!make_ssr_layout(&d->dyncube_ssr_layout)) return false;
-  if (!ensure(d->dyncube_ssr_layout, &d->dyncube_ssr_tables, 4)) return false;
+  if (!ensure(d->dyncube_ssr_layout, d->dyncube_ssr_tables, 4)) return false;
   #ifdef __FalcomSSRCS_EMBED_FILE
   if (!__FalcomSSRCS.empty()) {
     if (!mkcs(__FalcomSSRCS, d->dyncube_ssr_layout, &d->dyncube_ssr_pipeline)) {
@@ -10593,7 +10601,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
       if (d->dyncube_ssr_blur_pipeline.handle) { dev->destroy_pipeline(d->dyncube_ssr_blur_pipeline); d->dyncube_ssr_blur_pipeline = {}; }
     }
     DR sampler_r = {0,0,0,1,DS::all_compute,1,DT::sampler};
-    DR srv_r     = {0,0,0,2,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 raw/blur_h, t1 captured scene depth
+    DR srv_r     = {0,0,0,3,DS::all_compute,1,DT::texture_shader_resource_view}; // t0 raw/blur_h, t1 captured scene depth, t2 per-tile hit mask
     DR uav_r     = {0,0,0,1,DS::all_compute,1,DT::texture_unordered_access_view}; // u0 blur_h/blur
     DR cbv_r     = {0,0,0,1,DS::all_compute,1,DT::constant_buffer}; // b0 cb_scene (proj for depth unpack)
     reshade::api::constant_range push_range = {};
@@ -10614,7 +10622,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     return true;
   };
   if (!make_ssr_blur_layout(&d->dyncube_ssr_blur_layout)) return false;
-  if (!ensure(d->dyncube_ssr_blur_layout, &d->dyncube_ssr_blur_tables, 4)) return false;
+  if (!ensure(d->dyncube_ssr_blur_layout, d->dyncube_ssr_blur_tables, 4)) return false;
   #ifdef __FalcomSSRBlurCS_EMBED_FILE
   if (!__FalcomSSRBlurCS.empty()) {
     if (!mkcs(__FalcomSSRBlurCS, d->dyncube_ssr_blur_layout, &d->dyncube_ssr_blur_pipeline)) {
@@ -10651,7 +10659,7 @@ static bool CreateDynCubePipelinesIfNeeded(reshade::api::device* dev, DeviceData
     return true;
   };
   if (!make_worldbox_layout(&d->dyncube_worldbox_layout)) return false;
-  if (!ensure(d->dyncube_worldbox_layout, &d->dyncube_worldbox_tables, 2)) return false;
+  if (!ensure(d->dyncube_worldbox_layout, d->dyncube_worldbox_tables, 2)) return false;
   #ifdef __DynCubeBoundsReduceCS_EMBED_FILE
   if (!__DynCubeBoundsReduceCS.empty()) {
     if (!mkcs(__DynCubeBoundsReduceCS, d->dyncube_worldbox_layout, &d->dyncube_worldbox_pipeline)) {
@@ -10672,10 +10680,10 @@ static void UnbindDynCubeComputeState(reshade::api::command_list* cl) {
   reshade::api::sampler null_sampler = {};
   cl->push_descriptors(reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{{}, 0, 0, 1, reshade::api::descriptor_type::sampler, &null_sampler});
-  for (int i = 0; i <= 6; ++i)
+  for (int i = 0; i <= 7; ++i)
     cl->push_descriptors(reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &null_srv});
-  for (int i = 0; i <= 4; ++i)
+  for (int i = 0; i <= 5; ++i)
     cl->push_descriptors(reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
         reshade::api::descriptor_table_update{{}, (uint32_t)i, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &null_uav});
 }
@@ -10863,16 +10871,17 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
       d->dyncube_cam_uav[cur],
       d->dyncube_charmask_uav,
   };
-  reshade::api::descriptor_table_update ups[4];
+  reshade::api::descriptor_table_update ups[5];
   ups[0] = {tbl->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler};
   ups[1] = {tbl->at(1), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view};
   ups[2] = {tbl->at(2), 0, 0, 8, reshade::api::descriptor_type::texture_shader_resource_view, srvs};
   ups[3] = {tbl->at(3), 0, 0, 5, reshade::api::descriptor_type::texture_unordered_access_view, uavs};
-  dev->update_descriptor_tables(4, ups);
-  std::array<reshade::api::descriptor_table, 4> tables = {tbl->at(0), tbl->at(1), tbl->at(2), tbl->at(3)};
-  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 0, 4, tables.data());
+  ups[4] = {tbl->at(4), 0, 0, 1, reshade::api::descriptor_type::buffer_unordered_access_view, &d->dyncube_worldbox_scratch_uav};
+  dev->update_descriptor_tables(5, ups);
+  std::array<reshade::api::descriptor_table, 5> tables = {tbl->at(0), tbl->at(1), tbl->at(2), tbl->at(3), tbl->at(4)};
+  cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 0, 5, tables.data());
 
-  // Push constants (b13): boost, blend, posThreshold(world), posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert
+  // Push constants (b13): boost, blend, posThreshold(world), posScale, reset, characterCapture, charMaskAvailable, charComp, charShift, soften, charInvert, sparkleReject, contribThreshold, writeCharmask
   {
     const float posScale = 0.001f;
     float reset = (shader_injection.dynCube_history < 0.5f) ? 1.0f : 0.0f;
@@ -10885,7 +10894,7 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
     const bool fastForward = d->dyncube_rejectedGap || d->dyncube_dirtyFastForward;
     d->dyncube_rejectedGap = false;
     d->dyncube_dirtyFastForward = false;
-    float pc[12] = {
+    float pc[14] = {
         std::clamp(shader_injection.dynCube_capture_boost, 0.f, 8.f),
         fastForward ? 1.0f : std::clamp(shader_injection.dynCube_history_blend, 0.f, 1.f),
         std::max(0.f, shader_injection.dynCube_history_pos_threshold),
@@ -10899,8 +10908,12 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
         std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f),
         IsSora1st() ? 1.f : 0.f,
         (shader_injection.dynCube_sparkle_rejection > 0.5f) ? 1.f : 0.f,
+        // Folded world-box pass 0: same contrib cutoff the reduce used to take.
+        std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f),
+        // Character mask store is only consumed by Debug View 7.
+        (shader_injection.dynCube_debug == 7.f) ? 1.f : 0.f,
     };
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 12, pc);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 14, pc);
   }
 
   uint32_t sz = d->dyncube_size;
@@ -10934,9 +10947,10 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
 }
 
 // World-fixed parallax bounds reduction (Sora2nd v1). Reads the just-written
-// history set (write-cursor index `set`): pos/contrib/charmask array SRVs + camCur.
-// Two passes: per-group partials into scratch, then a single-group expand-only
-// merge into the persistent bounds (camera included unfiltered for containment).
+// history set (write-cursor index `set`). Pass 0 (per-group partials) is folded
+// into the capture dispatch, which writes the scratch buffer from its in-register
+// values; this function runs the single-group expand-only merge into the
+// persistent bounds (camera included unfiltered for containment).
 // Runs for every capture (also doubles as the capture-validity detector for
 // delayed-validate commit); lighting use of the bounds stays toggle-gated.
 static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, uint32_t set) {
@@ -10980,18 +10994,9 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
   cl->bind_descriptor_tables(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 0, 2, tables.data());
 
   const float reset = d->dyncube_worldbox_reset_pending ? 1.0f : 0.0f;
-  // Pass 0: per-group partials. Scratch must be UAV-writable.
-  {
-    float pc[5] = {0.0f, 0.001f, reset, (float)groups,
-        std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f)};
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_worldbox_layout, 2, 0, 5, pc);
-    cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-    CSLog("dyncube", std::string("worldbox pass0 dispatch groups=") + std::to_string(g) +
-      (reset > 0.5f ? " RESET" : ""));
-    cl->dispatch(g, g, 6);
-  }
-  // Pass 1: single-group merge. Scratch UAV->SRV, bounds SRV->UAV, then merge,
-  // then bounds UAV->SRV so lighting (t33) reads the finished result.
+  // Merge pass: the per-group partials were written by the capture dispatch
+  // (folded pass 0); scratch is UAV-written there, so transition it before the
+  // merge reads. Bounds/faceExt are SRV-tracked and need their UAV transition.
   {
     float pc[5] = {1.0f, 0.001f, reset, (float)groups,
         std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f)};
@@ -10999,7 +11004,7 @@ static bool RunDynCubeWorldBox(reshade::api::command_list* cl, DeviceData* d, ui
     cl->barrier(d->dyncube_worldbox_scratch, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
     cl->barrier(d->dyncube_faceextents, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
-    CSLog("dyncube", "worldbox pass1 merge dispatch");
+    CSLog("dyncube", "worldbox merge dispatch");
     cl->dispatch(1, 1, 1);
     cl->barrier(d->dyncube_worldbox_bounds, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
@@ -11191,6 +11196,32 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   if (!make_tex(&d->dyncube_ssr_raw, &d->dyncube_ssr_raw_srv, &d->dyncube_ssr_raw_uav, "SSR raw")) return false;
   if (!make_tex(&d->dyncube_ssr_blur_h, &d->dyncube_ssr_blur_h_srv, &d->dyncube_ssr_blur_h_uav, "SSR blur H")) return false;
   if (!make_tex(&d->dyncube_ssr_blur, &d->dyncube_ssr_blur_srv, &d->dyncube_ssr_blur_uav, "SSR blur")) return false;
+  // Per-8x8-tile hit mask (one R32_UINT texel per blur group): 1 = tile holds at
+  // least one donor (conf > 0.01). Cleared and rebuilt by the march every frame;
+  // the blur uses it to skip tiles whose donor neighborhood is empty.
+  if (!d->dyncube_ssr_hitmask.handle) {
+    reshade::api::resource_desc md = {};
+    md.type = reshade::api::resource_type::texture_2d;
+    md.texture = {(w + 7u) / 8u, (h + 7u) / 8u, 1, 1, reshade::api::format::r32_uint, 1};
+    md.heap = reshade::api::memory_heap::gpu_only;
+    md.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::unordered_access;
+    if (!dev->create_resource(md, nullptr, reshade::api::resource_usage::shader_resource, &d->dyncube_ssr_hitmask)) {
+      reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create SSR hit mask");
+      return false;
+    }
+    reshade::api::resource_view_desc mvd(reshade::api::resource_view_type::texture_2d,
+                                         reshade::api::format::r32_uint, 0, 1, 0, 1);
+    dev->create_resource_view(d->dyncube_ssr_hitmask, reshade::api::resource_usage::shader_resource, mvd, &d->dyncube_ssr_hitmask_srv);
+    dev->create_resource_view(d->dyncube_ssr_hitmask, reshade::api::resource_usage::unordered_access, mvd, &d->dyncube_ssr_hitmask_uav);
+    if (!d->dyncube_ssr_hitmask_srv.handle || !d->dyncube_ssr_hitmask_uav.handle) {
+      reshade::log::message(reshade::log::level::error, "[DynCube] Failed to create SSR hit mask views");
+      dev->destroy_resource(d->dyncube_ssr_hitmask);
+      d->dyncube_ssr_hitmask = {};
+      d->dyncube_ssr_hitmask_srv = {};
+      d->dyncube_ssr_hitmask_uav = {};
+      return false;
+    }
+  }
   {
     // Mismatch-only (silent when matching): stale-small targets after a
     // resolution change are a shared-input divergence worth one warning.
@@ -11207,11 +11238,12 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   const reshade::api::resource_view isfastSrv =
       d->isfast_noise_srv.handle ? d->isfast_noise_srv : d->fallback_srv;
   reshade::api::resource_view srvs[4] = {d->captured_color_srv, d->captured_depth_srv, d->captured_mrt_normal_srv, isfastSrv};
+  reshade::api::resource_view suavs[2] = {d->dyncube_ssr_raw_uav, d->dyncube_ssr_hitmask_uav};
   reshade::api::descriptor_table_update su[4] = {
       {st->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
       {st->at(1), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
       {st->at(2), 0, 0, 4, reshade::api::descriptor_type::texture_shader_resource_view, srvs},
-      {st->at(3), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ssr_raw_uav},
+      {st->at(3), 0, 0, 2, reshade::api::descriptor_type::texture_unordered_access_view, suavs},
   };
   dev->update_descriptor_tables(4, su);
   std::array<reshade::api::descriptor_table, 4> stables = {st->at(0), st->at(1), st->at(2), st->at(3)};
@@ -11244,8 +11276,14 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
       IsSora1st() ? 1.f : 0.f,
   };
   cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 18, pc);
+  // Mask is atomic-OR built, so zero it first; the march then flags every tile
+  // that receives at least one donor.
+  uint32_t maskClear[4] = {0u, 0u, 0u, 0u};
+  cl->barrier(d->dyncube_ssr_hitmask, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::unordered_access);
+  cl->clear_unordered_access_view_uint(d->dyncube_ssr_hitmask_uav, maskClear, 0u, nullptr);
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_raw, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  cl->barrier(d->dyncube_ssr_hitmask, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
   // -- Separable bilateral blur: H (raw ? blur_h), V (blur_h ? blur) --
   // Both passes reference ORIGINAL captured scene depth (not blurred intermediates).
@@ -11254,10 +11292,10 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   auto* bt = &d->dyncube_ssr_blur_tables;
   cl->bind_pipeline(reshade::api::pipeline_stage::all_compute, d->dyncube_ssr_blur_pipeline);
   // H pass
-  reshade::api::resource_view hsrvs[2] = {d->dyncube_ssr_raw_srv, d->captured_depth_srv};
+  reshade::api::resource_view hsrvs[3] = {d->dyncube_ssr_raw_srv, d->captured_depth_srv, d->dyncube_ssr_hitmask_srv};
   reshade::api::descriptor_table_update bh[4] = {
       {bt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
-      {bt->at(1), 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, hsrvs},
+      {bt->at(1), 0, 0, 3, reshade::api::descriptor_type::texture_shader_resource_view, hsrvs},
       {bt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ssr_blur_h_uav},
       {bt->at(3), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
   };
@@ -11269,10 +11307,10 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
   cl->dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
   cl->barrier(d->dyncube_ssr_blur_h, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   // V pass
-  reshade::api::resource_view vsrvs[2] = {d->dyncube_ssr_blur_h_srv, d->captured_depth_srv};
+  reshade::api::resource_view vsrvs[3] = {d->dyncube_ssr_blur_h_srv, d->captured_depth_srv, d->dyncube_ssr_hitmask_srv};
   reshade::api::descriptor_table_update bv[4] = {
       {bt->at(0), 0, 0, 1, reshade::api::descriptor_type::sampler, &d->dyncube_sampler},
-      {bt->at(1), 0, 0, 2, reshade::api::descriptor_type::texture_shader_resource_view, vsrvs},
+      {bt->at(1), 0, 0, 3, reshade::api::descriptor_type::texture_shader_resource_view, vsrvs},
       {bt->at(2), 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->dyncube_ssr_blur_uav},
       {bt->at(3), 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv_view},
   };

@@ -30,6 +30,8 @@ cbuffer DynCubeCB : register(b13)
     float g_captureSoften;         // reserved (soften applies in the variant pass, not here); kept for push/CB alignment
     float g_charInvert;            // 0 = set bit means character (Sora/Kai), 1 = clear bit means character (Sora1st: char = !(mrt.w & 8)); appended last, push count 10 -> 11
     float g_sparkleReject;         // 0 = off (default), 1 = reject isolated HDR spikes at depth edges + non-finite input; appended last, push count 11 -> 12
+    float g_contribThreshold;      // world-box bounds candidate contrib cutoff (folded pass 0), push count 12 -> 13
+    float g_writeCharmask;         // 1 = store character mask (debug view 7), 0 = skip store (folded bounds uses the in-register flag), push count 13 -> 14
 };
 
 #include "dyncube_common.hlsli"
@@ -49,6 +51,13 @@ RWTexture2DArray<float4> g_outPos     : register(u1);
 RWTexture2DArray<float>  g_outContrib : register(u2);
 RWTexture2D<float4>      g_camCurTex  : register(u3);
 RWTexture2DArray<float4> g_outCharMask: register(u4);
+RWStructuredBuffer<float4> g_boundsScratch : register(u5);  // world-box pass-0 partials, folded here
+
+// Folded world-box pass 0: per-group min/max candidates, reduced identically to
+// DynCubeBoundsReduceCS pass 0 (same sentinels, same index layout) so the merge
+// pass and the resulting bounds are unchanged.
+groupshared float4 s_boundsMin[64];
+groupshared float4 s_boundsMax[64];
 
 float3 WorldToViewDir(float3 dir)
 {
@@ -91,7 +100,9 @@ void main(uint3 dtid : SV_DispatchThreadID)
 {
     uint w, h, el;
     g_outColor.GetDimensions(w, h, el);
-    if (dtid.x >= w || dtid.y >= h || dtid.z >= 6) return;
+    // No bounds early-out: the dispatch is exactly (size+7)/8 and every supported
+    // cube size is a multiple of 8, so every thread is in bounds. All threads must
+    // reach the folded world-box barrier below (sync in uniform flow control).
 
     // Falcom game samples t17 with (1,-1,-1)*reflect(...); store physical
     // radiance R at the same TextureCube address the lookup samples, so the
@@ -296,7 +307,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
     }
 
     // ── Previous history (same face/texel layout — direct Load) ──
-    float4 prevColor = g_prevColorTex.Load(int4(dtid, 0));
+    // prevColor is loaded lazily: the off-screen preservation path (below) skips
+    // both its load and its store. Position is always loaded (camera comp).
     float4 prevPos   = g_prevPosTex.Load(int4(dtid, 0));
     float  prevContrib = g_prevContribTex.Load(int4(dtid, 0)).x;
     float4 camPrev   = g_camPrevTex.Load(int3(0, 0, 0));
@@ -312,6 +324,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         prevPosComp += (camPrev.xyz - camCur.xyz) * g_posScale;
     }
 
+    bool skipColorStore = false;
     float3 outCol;
     float3 outPos;
     float  outValid;
@@ -330,6 +343,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
         bool compatible = (!prevValid) || (posDelta < (g_historyPosThreshold * g_posScale));
         if (compatible)
         {
+            float4 prevColor = g_prevColorTex.Load(int4(dtid, 0));
             outCol = lerp(prevColor.rgb, curCol, g_historyBlend);
             outPos = lerp(prevPosComp, curPosScaled, g_historyBlend);
         }
@@ -341,9 +355,31 @@ void main(uint3 dtid : SV_DispatchThreadID)
         outValid = 1.0;
         outContrib = 1.0;
     }
+    else if (prevValid && !inside)
+    {
+        // Off-screen fast path: no current screen content. Only the camera-anchored
+        // position and the aged contribution are stored. Color is copied forward
+        // whenever the read set is fresher (contrib 1.0 = written by the previous
+        // capture), so the two history sets can never diverge when a direction is
+        // visible for only one capture before going off-screen. In steady-state
+        // off-screen (both sets already agree) the color load/store is skipped.
+        outPos = prevPosComp;
+        outValid = prevPos.a;
+        outContrib = prevContrib * 0.5;
+        if (prevContrib > 0.75f)
+        {
+            outCol = g_prevColorTex.Load(int4(dtid, 0)).rgb;
+        }
+        else
+        {
+            outCol = 0.0;  // unused: color store skipped below
+            skipColorStore = true;
+        }
+    }
     else if (prevValid)
     {
         // No current sample — preserve previous history
+        float4 prevColor = g_prevColorTex.Load(int4(dtid, 0));
         outCol = prevColor.rgb;
         outPos = prevPosComp;
         outValid = prevPos.a;
@@ -389,13 +425,64 @@ void main(uint3 dtid : SV_DispatchThreadID)
         outContrib = 0.0;
     }
 
-    g_outColor[dtid]   = float4(max(0.0, outCol), outValid);
+    if (!skipColorStore)
+        g_outColor[dtid] = float4(max(0.0, outCol), outValid);
     g_outPos[dtid]     = float4(outPos, outValid);
     g_outContrib[dtid] = outContrib;
 
-    // Write character mask (1 = character, 0 = non-character)
-    float charMask = isCharacter ? 1.0 : 0.0;
-    g_outCharMask[dtid] = float4(charMask, charMask, charMask, 1.0);
+    // Character mask (1 = character, 0 = non-character). Only the debug preview
+    // consumes this texture; the folded bounds reduction below uses the
+    // in-register flag, so the store is skipped unless the debug view asks for it.
+    if (g_writeCharmask > 0.5f)
+    {
+        float charMask = isCharacter ? 1.0 : 0.0;
+        g_outCharMask[dtid] = float4(charMask, charMask, charMask, 1.0);
+    }
+
+    // ── Folded world-box pass 0 (per-group partials) ──
+    // Mirrors DynCubeBoundsReduceCS BoundsCandidate + pass-0 reduction: same
+    // validity/contrib/character gates (with the same <= NaN semantics), same
+    // world-space conversion, distance cap, sentinels and scratch indexing.
+    // Consumes the final in-register values (including the over-ceiling guard
+    // resets); the former texture read saw the same values rounded through the
+    // fp16 history store, so bounds can differ only by that store rounding.
+    {
+        const float kWorldBoxMaxDist = 100.0;
+        const float kFltMax = 3.402823466e+38;
+        bool boundsOk = !(outValid <= 0.5f) && !(outContrib <= g_contribThreshold) && !isCharacter;
+        float3 boundsPos = 0.0;
+        if (boundsOk)
+        {
+            if (!all(isfinite(outPos))) boundsOk = false;
+            else
+            {
+                boundsPos = outPos / max(g_posScale, 1e-9);
+                if (!all(isfinite(boundsPos))) boundsOk = false;
+                else if (distance(boundsPos, camCur) > kWorldBoxMaxDist) boundsOk = false;
+            }
+        }
+        uint li = (dtid.y & 7u) * 8u + (dtid.x & 7u);
+        s_boundsMin[li] = boundsOk ? float4(boundsPos, 0.0) : float4(kFltMax, kFltMax, kFltMax, 0.0);
+        s_boundsMax[li] = boundsOk ? float4(boundsPos, 0.0) : float4(-kFltMax, -kFltMax, -kFltMax, 0.0);
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = 32u; s > 0u; s >>= 1)
+        {
+            if (li < s)
+            {
+                s_boundsMin[li] = min(s_boundsMin[li], s_boundsMin[li + s]);
+                s_boundsMax[li] = max(s_boundsMax[li], s_boundsMax[li + s]);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (li == 0u)
+        {
+            uint boundsGx = (w + 7u) / 8u;
+            uint boundsGy = (h + 7u) / 8u;
+            uint groupIdx = (dtid.z * boundsGy + (dtid.y / 8u)) * boundsGx + (dtid.x / 8u);
+            g_boundsScratch[2u * groupIdx + 0u] = s_boundsMin[0];
+            g_boundsScratch[2u * groupIdx + 1u] = s_boundsMax[0];
+        }
+    }
 
     // Record current camera position for next frame (thread 0 of face 0)
     if (dtid.x == 0 && dtid.y == 0 && dtid.z == 0)

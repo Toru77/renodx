@@ -6,6 +6,7 @@
 // screen-depth bilateral rejection (relative linearized view distance) x
 // center-preserving confidence. Both passes reference ORIGINAL scene depth.
 // Input : t0 source (raw or blur_h), t1 captured scene depth (HW depth, SSR grid),
+//         t2 per-8x8-tile march hit mask (empty-tile early-out),
 //         b0 cb_scene (proj for depth unpack, same convention as SSR march),
 //         b13 { sigma, horizontal }, s0 point clamp
 // Output: u0 dest (blur_h or blur)
@@ -24,6 +25,7 @@ cbuffer cb_blur : register(b13)
 
 Texture2D<float4>  g_inTex : register(t0);
 Texture2D<float>   g_depthTex : register(t1);
+Texture2D<uint>    g_hitMask : register(t2);  // per-8x8-tile march hit flags
 SamplerState       g_pointClamp : register(s0);
 
 RWTexture2D<float4> g_outTex : register(u0);
@@ -33,18 +35,54 @@ RWTexture2D<float4> g_outTex : register(u0);
 static const float kDepthRelTol = 0.25;  // relative view-distance bilateral tolerance (no UI yet)
 static const float kConfEpsilon = 0.01;  // minimum confidence for color donors
 
+groupshared uint s_hitTile[25];  // 5x5 raw-hit tile neighborhood around this group
+
 [numthreads(8, 8, 1)]
 void main(uint3 dtid : SV_DispatchThreadID)
 {
     uint w, h;
     g_outTex.GetDimensions(w, h);
-    if (dtid.x >= w || dtid.y >= h) return;
-
+    const bool active = (dtid.x < w) && (dtid.y < h);
     const int2 px = int2(dtid.xy);
 
     if (g_sigma <= 0.01) {
-        g_outTex[px] = g_inTex.Load(int3(px, 0));
+        if (active) g_outTex[px] = g_inTex.Load(int3(px, 0));
         return;
+    }
+
+    // ── Empty-tile early-out ──
+    // The march flags every 8x8 tile that holds at least one donor (conf >
+    // kConfEpsilon). A tile whose donor neighborhood holds no flag accumulates
+    // zero color and a sub-epsilon confidence mean, so it is written as exact
+    // zero without touching the color or depth textures. The 5x5 neighborhood
+    // covers the maximum radius (16 px = 2 tiles) on both axes. All threads must
+    // reach the barrier, so out-of-range threads participate in the cooperative
+    // load and return right after it.
+    {
+        uint gx = (w + 7u) / 8u;
+        uint gy = (h + 7u) / 8u;
+        uint li = (dtid.y & 7u) * 8u + (dtid.x & 7u);
+        if (li < 25u) {
+            int tX = clamp((int)(dtid.x / 8u) + (int)(li % 5u) - 2, 0, (int)gx - 1);
+            int tY = clamp((int)(dtid.y / 8u) + (int)(li / 5u) - 2, 0, (int)gy - 1);
+            s_hitTile[li] = g_hitMask.Load(int3(tX, tY, 0));
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (!active) return;
+
+        bool donorsPresent = false;
+        if (g_horizontal > 0.5) {
+            // Horizontal pass: donors lie on this tile row only.
+            for (uint i = 10u; i <= 14u; ++i) donorsPresent = donorsPresent || (s_hitTile[i] != 0u);
+        } else {
+            // Vertical pass: H support is a raw hit dilated by two tiles in both
+            // axes, so the full 5x5 raw-hit neighborhood is the exact test.
+            for (uint i = 0u; i < 25u; ++i) donorsPresent = donorsPresent || (s_hitTile[i] != 0u);
+        }
+        if (!donorsPresent) {
+            g_outTex[px] = float4(0.0, 0.0, 0.0, 0.0);
+            return;
+        }
     }
 
     const int radius = min((int)ceil(3.0 * g_sigma), 16);
@@ -57,7 +95,6 @@ void main(uint3 dtid : SV_DispatchThreadID)
     // instead of per depth sample (identical values, less ALU).
     float blurUnpackMul, blurUnpackAdd;
     DynCubeGetDepthUnpackConsts(blurUnpackMul, blurUnpackAdd);
-    float centerConf = g_inTex.Load(int3(px, 0)).a;
     float centerRaw = g_depthTex.Load(int3(px, 0));
     bool centerValid = DynCubeIsSceneDepthValid(centerRaw);
     float centerLin = centerValid ? DynCubeLinearizeDepth(centerRaw, blurUnpackMul, blurUnpackAdd) : 0.0;
@@ -91,19 +128,22 @@ void main(uint3 dtid : SV_DispatchThreadID)
                 tap = clamp(tap, int2(0, 0), int2(w, h) - int2(1, 1));
                 float4 sample = g_inTex.Load(int3(tap, 0));
                 float conf = sample.a;
-                float depthW = 1.0;
-                if (centerValid) {
-                    float tapRaw = g_depthTex.Load(int3(tap, 0));
-                    if (!DynCubeIsSceneDepthValid(tapRaw)) {
-                        depthW = 0.0;  // sky tap: never a donor
-                    } else {
-                        float tapLin = DynCubeLinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
-                        float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
-                        float depthRatio = relDiff / kDepthRelTol;
-                        depthW = exp(-depthRatio * depthRatio);
-                    }
-                }
                 if (conf > kConfEpsilon) {
+                    // Depth rejection only matters for taps that can donate color;
+                    // hoisting the gate above the depth fetch/exp leaves the output
+                    // unchanged and skips them for every non-donor tap.
+                    float depthW = 1.0;
+                    if (centerValid) {
+                        float tapRaw = g_depthTex.Load(int3(tap, 0));
+                        if (!DynCubeIsSceneDepthValid(tapRaw)) {
+                            depthW = 0.0;  // sky tap: never a donor
+                        } else {
+                            float tapLin = DynCubeLinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
+                            float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
+                            float depthRatio = relDiff / kDepthRelTol;
+                            depthW = exp(-depthRatio * depthRatio);
+                        }
+                    }
                     float effW = wgt * depthW;
                     colorNum += sample.rgb * conf * effW;
                     colorDen += conf * effW;
@@ -121,19 +161,21 @@ void main(uint3 dtid : SV_DispatchThreadID)
         tap = clamp(tap, int2(0, 0), int2(w, h) - int2(1, 1));
         float4 sample = g_inTex.Load(int3(tap, 0));
         float conf = sample.a;
-        float depthW = 1.0;
-        if (centerValid) {
-            float tapRaw = g_depthTex.Load(int3(tap, 0));
-            if (!DynCubeIsSceneDepthValid(tapRaw)) {
-                depthW = 0.0;  // sky tap: never a donor
-            } else {
-                float tapLin = DynCubeLinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
-                float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
-                float depthRatio = relDiff / kDepthRelTol;
-                depthW = exp(-depthRatio * depthRatio);
-            }
-        }
         if (conf > kConfEpsilon) {
+            // Same gate hoist as the symmetric path: depth rejection is only
+            // consumed by donor taps, so non-donors skip the fetch and exp.
+            float depthW = 1.0;
+            if (centerValid) {
+                float tapRaw = g_depthTex.Load(int3(tap, 0));
+                if (!DynCubeIsSceneDepthValid(tapRaw)) {
+                    depthW = 0.0;  // sky tap: never a donor
+                } else {
+                    float tapLin = DynCubeLinearizeDepth(tapRaw, blurUnpackMul, blurUnpackAdd);
+                    float relDiff = abs(tapLin - centerLin) / max(centerLin, 1e-4);
+                    float depthRatio = relDiff / kDepthRelTol;
+                    depthW = exp(-depthRatio * depthRatio);
+                }
+            }
             float effW = wgt * depthW;
             colorNum += sample.rgb * conf * effW;
             colorDen += conf * effW;
@@ -143,7 +185,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
     }
     }
     float meanConf = confNum / max(confDen, 1e-4);
-    // No max(centerConf, ...) pop: the max re-injects the center pixel's
+    // No max(raw confidence, ...) pop: the max re-injects the center pixel's
     // frame-to-frame march jitter into an otherwise stable neighborhood mean.
     float finalConfidence = meanConf;
     float3 finalColor = colorNum / max(colorDen, 1e-4);
