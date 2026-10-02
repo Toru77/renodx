@@ -2819,7 +2819,7 @@ renodx::utils::settings::Settings settings = {
     // -- Character SSGI --
     new renodx::utils::settings::Setting{
       .key = "CharacterSSGICompositeMethod", .binding = &g_char_vbgi_composite_method,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Apply Game SSGI", .section = "Character SSGI",
       .labels = {"Off", "On"},
       .is_visible = []() { return IsKai(); },
@@ -3027,7 +3027,7 @@ renodx::utils::settings::Settings settings = {
                  "blend resolves the dither with no extra resolve pass.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamStrength", .binding = &shader_injection.char_cam_strength,
@@ -3036,7 +3036,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamSamples", .binding = &shader_injection.char_cam_sample_count,
@@ -3049,7 +3049,7 @@ renodx::utils::settings::Settings settings = {
       .min = 1.f, .max = 32.f, .format = "%d",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamRayLength", .binding = &shader_injection.char_cam_ray_length,
@@ -3064,7 +3064,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.001f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamThickness", .binding = &shader_injection.char_cam_thickness,
@@ -3079,7 +3079,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.0005f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamBias", .binding = &shader_injection.char_cam_bias,
@@ -3090,7 +3090,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 0.05f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamNormalBias", .binding = &shader_injection.char_cam_normal_bias,
@@ -3105,7 +3105,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 0.05f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamResponseScale", .binding = &shader_injection.char_cam_response_scale,
@@ -3119,7 +3119,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamMaxDarkening", .binding = &shader_injection.char_cam_max_darkening,
@@ -3131,7 +3131,7 @@ renodx::utils::settings::Settings settings = {
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamISFAST", .binding = &shader_injection.char_cam_isfast_enabled,
@@ -3145,7 +3145,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharCamDebug", .binding = &shader_injection.char_cam_debug,
@@ -3160,7 +3160,7 @@ renodx::utils::settings::Settings settings = {
       .labels = {"Off", "Raw Term", "Coverage", "Axis Length"},
       .is_enabled = []() { return shader_injection.char_shadow_mode >= 1.5f
                                && shader_injection.char_cam_enabled >= 0.5f; },
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMode", .binding = &shader_injection.char_gtvbao_mode,
@@ -3238,7 +3238,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
       .tooltip = "Half is recommended at high or native resolutions, but it halves whatever resolution you render at, so it can get very low when upscaling is enabled.",
       .labels = {"Full", "Half"},
@@ -3636,7 +3636,6 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "Hammon 2017 Diffuse", .section = "BRDF Improvement",
       .tooltip = "Applies the Hammon 2017 GGX+Smith multi-scatter energy-conserving diffuse correction to the sun and point/spot/environment lights (GDC 2017).",
       .labels = {"Off", "On"},
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "BRDFDiffuseStrength", .binding = &shader_injection.brdf_diffuse_strength,
@@ -3960,6 +3959,11 @@ renodx::utils::settings::Settings settings = {
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
+      .value_type = renodx::utils::settings::SettingValueType::TEXT,
+      .label = "Requires GTVBAO on.",
+      .section = "VBGI",
+    },
+    new renodx::utils::settings::Setting{
       .key = "CPUOptDeferredDispatch", .binding = &g_cpuopt_deferred_dispatch,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f, .label = "Deferred Dispatch", .section = "CPU Opt",
@@ -4239,7 +4243,7 @@ renodx::utils::settings::Settings settings = {
     // -- Colored Shadow Penumbra (Kai) --
     new renodx::utils::settings::Setting{
       .key = "KaiPenumbraMode", .binding = &shader_injection.shadow_edge_tint_kai,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+      .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Colored Penumbra", .section = "Shadows",
       .tooltip = "Improved mode applies vibrance boost in shadow penumbra regions. No Falcom fallback on Kai.",
       .labels = {"Off", "Improved"},
@@ -4310,7 +4314,7 @@ renodx::utils::settings::Settings settings = {
                  "buried in ambient occlusion stops receiving as much key light, which "
                  "restores the soft darkening a rasteriser cannot produce on its own.",
       .labels = {"Off", "On"},
-      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2() && IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsEnvStrength", .binding = &shader_injection.cs_micro_env_strength,
@@ -4318,6 +4322,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Strength of the micro term on non-character pixels.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsCharStrength", .binding = &shader_injection.cs_micro_char_strength,
@@ -4326,6 +4331,7 @@ renodx::utils::settings::Settings settings = {
                  "foliage/character mask.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsOpacity", .binding = &shader_injection.cs_micro_opacity,
@@ -4334,6 +4340,7 @@ renodx::utils::settings::Settings settings = {
                  "fully; 0 leaves the surface unshadowed.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsAperture", .binding = &shader_injection.cs_micro_aperture_scale,
@@ -4343,6 +4350,7 @@ renodx::utils::settings::Settings settings = {
                  "shadow; 0 disables the term entirely without turning the pass off.",
       .min = 0.f, .max = 4.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsAOSource", .binding = &shader_injection.cs_micro_ao_source,
@@ -4357,6 +4365,7 @@ renodx::utils::settings::Settings settings = {
                  "while GTVBAO is disabled.",
       .labels = {"Game SSAO", "GTVBAO"},
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsISFAST", .binding = &shader_injection.cs_micro_isfast_enabled,
@@ -4371,6 +4380,7 @@ renodx::utils::settings::Settings settings = {
                  "surfaces under GTVBAO; it trades a little noise for that.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "MicroShadowsDebug", .binding = &shader_injection.cs_micro_debug,
@@ -4382,6 +4392,7 @@ renodx::utils::settings::Settings settings = {
                  "indistinguishable from 'the effect does nothing'.",
       .labels = {"Off", "Raw Term", "Diagnostics"},
       .is_enabled = []() { return shader_injection.cs_micro_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- Contact Shadows ------------------------------------------------
     new renodx::utils::settings::Setting{
@@ -4401,6 +4412,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Strength of the contact term on non-character pixels.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsCharStrength", .binding = &shader_injection.cs_contact_char_strength,
@@ -4409,6 +4421,7 @@ renodx::utils::settings::Settings settings = {
                  "foliage/character mask.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsSamples", .binding = &shader_injection.cs_contact_sample_count,
@@ -4418,6 +4431,7 @@ renodx::utils::settings::Settings settings = {
                  "Unreal uses. Beyond 16 the gain is small and the cost is linear.",
       .min = 1.f, .max = 32.f, .format = "%d",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsRayLength", .binding = &shader_injection.cs_contact_ray_length,
@@ -4426,6 +4440,7 @@ renodx::utils::settings::Settings settings = {
                  "the term to contact; long values reach genuine occluders.",
       .min = 1.f, .max = 200.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsThickness", .binding = &shader_injection.cs_contact_thickness,
@@ -4434,6 +4449,7 @@ renodx::utils::settings::Settings settings = {
                  "geometry and depth noise from self-shadowing.",
       .min = 0.001f, .max = 4.f, .format = "%.3f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsBias", .binding = &shader_injection.cs_contact_bias,
@@ -4442,6 +4458,7 @@ renodx::utils::settings::Settings settings = {
                  "you see acne.",
       .min = 0.f, .max = 0.2f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsNormalBias", .binding = &shader_injection.cs_contact_normal_bias,
@@ -4450,6 +4467,7 @@ renodx::utils::settings::Settings settings = {
                  "bias on curved surfaces.",
       .min = 0.f, .max = 1.f, .format = "%.4f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowResponseScale",
@@ -4467,6 +4485,7 @@ renodx::utils::settings::Settings settings = {
                  "Defaults to 4.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsSunRange", .binding = &shader_injection.cs_contact_sun_range,
@@ -4482,6 +4501,7 @@ renodx::utils::settings::Settings settings = {
                  "value is usually the honest one.",
       .min = 0.f, .max = 500.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsSkyDepth", .binding = &shader_injection.cs_contact_sky_depth,
@@ -4490,6 +4510,7 @@ renodx::utils::settings::Settings settings = {
                  "march is skipped early. Higher is safer, lower is cheaper on open sky.",
       .min = 100.f, .max = 1000000.f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsMaxDarkening", .binding = &shader_injection.cs_contact_max_darkening,
@@ -4499,6 +4520,7 @@ renodx::utils::settings::Settings settings = {
                  "contact shadows from crushing in dark scenes.",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsISFAST", .binding = &shader_injection.cs_contact_isfast_enabled,
@@ -4509,6 +4531,7 @@ renodx::utils::settings::Settings settings = {
                  "and bands visibly, which the log reports once.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsDebug", .binding = &shader_injection.cs_contact_debug,
@@ -4520,6 +4543,7 @@ renodx::utils::settings::Settings settings = {
                  "nothing; G of 1, 2 or 4 means it bails out before marching.",
       .labels = {"Off", "Raw Term", "Diagnostics"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnabled", .binding = &shader_injection.cs_contact_local_enabled,
@@ -4531,6 +4555,7 @@ renodx::utils::settings::Settings settings = {
                  "one full-screen pass.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalPoint", .binding = &shader_injection.cs_contact_local_point,
@@ -4542,6 +4567,7 @@ renodx::utils::settings::Settings settings = {
                  "Local Light Budget, so the classes left on get all of it.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalSpot", .binding = &shader_injection.cs_contact_local_spot,
@@ -4554,6 +4580,7 @@ renodx::utils::settings::Settings settings = {
                  "none of the Local Light Budget.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnvPoint", .binding = &shader_injection.cs_contact_local_env_point,
@@ -4565,6 +4592,7 @@ renodx::utils::settings::Settings settings = {
                  "zero times and spends none of the Local Light Budget.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalEnvSpot", .binding = &shader_injection.cs_contact_local_env_spot,
@@ -4575,12 +4603,14 @@ renodx::utils::settings::Settings settings = {
                  "class marches zero times and spends none of the Local Light Budget.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalStrength", .binding = &shader_injection.cs_contact_local_strength,
       .default_value = 1.f, .label = "Local Strength", .section = "Contact Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalSamples", .binding = &shader_injection.cs_contact_local_sample_count,
@@ -4590,6 +4620,7 @@ renodx::utils::settings::Settings settings = {
                  "pixel.",
       .min = 2.f, .max = 16.f, .format = "%d",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalRayLength", .binding = &shader_injection.cs_contact_local_ray_length,
@@ -4598,6 +4629,7 @@ renodx::utils::settings::Settings settings = {
                  "so this is much smaller than the sun ray length above.",
       .min = 0.1f, .max = 20.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalMaxLights", .binding = &shader_injection.cs_contact_local_max_lights,
@@ -4607,6 +4639,7 @@ renodx::utils::settings::Settings settings = {
                  "cannot multiply the cost without limit.",
       .min = 1.f, .max = 16.f, .format = "%d",
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
     // �� Dynamic Cubemaps � standalone t17 replacement ��
@@ -5398,6 +5431,11 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .value_type = renodx::utils::settings::SettingValueType::TEXT,
+      .label = "If you like the addon, consider supporting development on Patreon.",
+      .section = "Info",
+    },
+    new renodx::utils::settings::Setting{
+      .value_type = renodx::utils::settings::SettingValueType::TEXT,
       .label = "Addon made by Toru.",
       .section = "Info",
     },
@@ -5414,7 +5452,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = "IS-FAST Noise: Dont enable if you are not using TAA/FSR/DLSS/XeSS.",
-        .section = "Info",
+        .section = "IS-FAST",
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
@@ -5445,6 +5483,8 @@ renodx::utils::settings::Settings settings = {
 };
 
 // ----------- GTVBAO Backend � implementation -----------
+
+#include "./settings_ui.h"
 
 static void OnInitDevice(reshade::api::device* device) {
   reshade::log::message(reshade::log::level::info, "[sora-vanillaplus] Device init � addon loaded.");
@@ -12344,7 +12384,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_addon(h_module);
       break;
   }
-  renodx::utils::settings::Use(fdw_reason, &settings);
+  falcom_ui::Use(fdw_reason, &settings);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   return TRUE;
 }
