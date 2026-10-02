@@ -38,9 +38,9 @@ cbuffer cb_ssr : register(b13)
     float g_isfastSpatial;   // [0.25..4] noise spatial scale
     float g_isfastTemporal;  // [0..5] noise animation speed, 0 = frozen slice
     float g_isfastSeed;      // seed offset [0..64]
-    float g_charComp;        // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
-    float g_charShift;       // bit shift applied to the selected component (Sora 0, Kai 8, Sora1st 3)
-    float g_charInvert;      // 0 = set bit means character (Sora/Kai), 1 = clear bit means character (Sora1st: char = !(mrt.w & 8)); repurposed pad slot, push count unchanged
+    float g_charComp;        // 0 = char bit in mrt .w (Sora 1st/2nd), 1 = mrt .z shifted bit (Kai)
+    float g_charShift;       // bit shift applied to the selected component (Sora 1st/2nd 3, Kai 8)
+    float g_charInvert;      // 0 = set bit means character (Kai), 1 = clear bit means character (Sora 1st/2nd: char = !(mrt.w & 8)); repurposed pad slot, push count unchanged
 };
 
 Texture2D<float4> g_colorTex : register(t0);

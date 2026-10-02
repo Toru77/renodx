@@ -25,10 +25,10 @@ cbuffer DynCubeCB : register(b13)
     float g_reset;                 // 1 = ignore history this frame (fresh capture / history off)
     float g_characterCapture;      // 1 = capture characters, 0 = exclude characters (default)
     float g_charMaskAvailable;     // 1 = character mask data available
-    float g_charComp;              // 0 = char bit in mrt .w (Sora), 1 = mrt .z shifted bit (Kai)
-    float g_charShift;             // bit shift applied to the selected component (Sora 0, Kai 8, Sora1st 3)
+    float g_charComp;              // 0 = char bit in mrt .w (Sora 1st/2nd), 1 = mrt .z shifted bit (Kai)
+    float g_charShift;             // bit shift applied to the selected component (Sora 1st/2nd 3, Kai 8)
     float g_captureSoften;         // reserved (soften applies in the variant pass, not here); kept for push/CB alignment
-    float g_charInvert;            // 0 = set bit means character (Sora/Kai), 1 = clear bit means character (Sora1st: char = !(mrt.w & 8)); appended last, push count 10 -> 11
+    float g_charInvert;            // 0 = set bit means character (Kai), 1 = clear bit means character (Sora 1st/2nd: char = !(mrt.w & 8)); appended last, push count 10 -> 11
     float g_sparkleReject;         // 0 = off (default), 1 = reject isolated HDR spikes at depth edges + non-finite input; appended last, push count 11 -> 12
     float g_contribThreshold;      // world-box bounds candidate contrib cutoff (folded pass 0), push count 12 -> 13
     float g_writeCharmask;         // 1 = store character mask (debug view 7), 0 = skip store (folded bounds uses the in-register flag), push count 13 -> 14
@@ -286,8 +286,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
     }
     }
 
-    // ── Character mask (game-specific bit: Sora mrtTexture0.w & 1, Kai (mrtTexture0.z >> 8) & 1,
-    //    Sora1st !(mrtTexture0.w & 8) via g_charComp/g_charShift/g_charInvert) — sample at the projected screen UV, not the cubemap texel. ──
+    // ── Character mask (game-specific bit: Kai (mrtTexture0.z >> 8) & 1 set,
+    //    Sora 1st/2nd !(mrtTexture0.w & 8) via g_charComp/g_charShift/g_charInvert) — sample at the projected screen UV, not the cubemap texel. ──
     bool isCharacter = false;
     if (g_charMaskAvailable > 0.5f && inside)
     {

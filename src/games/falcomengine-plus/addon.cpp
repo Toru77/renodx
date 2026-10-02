@@ -10902,18 +10902,18 @@ static bool RunDynCubeCapture(reshade::api::command_list* cl, DeviceData* d) {
         reset,
         charCapture,
         charMaskAvail,
-        // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0; Sora1st mrt.w bit 3, inverted.
+        // Character-bit location: Kai (mrt.z >> 8) & 1 set; Sora 1st/2nd !(mrt.w & 8) (bit 3 clear).
         IsKai() ? 1.f : 0.f,
-        IsKai() ? 8.f : (IsSora1st() ? 3.f : 0.f),
+        IsKai() ? 8.f : 3.f,
         std::clamp(shader_injection.dynCube_capture_soften, 0.f, 1.f),
-        IsSora1st() ? 1.f : 0.f,
+        IsKai() ? 0.f : 1.f,
         (shader_injection.dynCube_sparkle_rejection > 0.5f) ? 1.f : 0.f,
         // Folded world-box pass 0: same contrib cutoff the reduce used to take.
         std::clamp(shader_injection.dynCube_worldbox_contrib, 0.f, 1.f),
         // Character mask store is only consumed by Debug View 7.
         (shader_injection.dynCube_debug == 7.f) ? 1.f : 0.f,
     };
-    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 4, 0, 14, pc);
+    cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_capture_layout, 5, 0, 14, pc);
   }
 
   uint32_t sz = d->dyncube_size;
@@ -11270,10 +11270,10 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d) {
       std::clamp(shader_injection.dynCube_ssr_isfast_spatial, 0.25f, 4.f),
       std::clamp(shader_injection.dynCube_ssr_isfast_temporal, 0.f, 5.f),
       std::clamp(g_isfast_seed_offset, 0.f, 64.f),
-      // Character-bit location: Sora mrt.w bit 0; Kai (mrt.z >> 8) bit 0; Sora1st mrt.w bit 3, inverted.
+      // Character-bit location: Kai (mrt.z >> 8) & 1 set; Sora 1st/2nd !(mrt.w & 8) (bit 3 clear).
       IsKai() ? 1.f : 0.f,
-      IsKai() ? 8.f : (IsSora1st() ? 3.f : 0.f),
-      IsSora1st() ? 1.f : 0.f,
+      IsKai() ? 8.f : 3.f,
+      IsKai() ? 0.f : 1.f,
   };
   cl->push_constants(reshade::api::shader_stage::all_compute, d->dyncube_ssr_layout, 4, 0, 18, pc);
   // Mask is atomic-OR built, so zero it first; the march then flags every tile
