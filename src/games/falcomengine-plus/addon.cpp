@@ -3218,7 +3218,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOResolution", .binding = &shader_injection.gtvbao_resolution,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 1.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
+      .default_value = 0.f, .label = "GTVBAO Resolution", .section = "GTVBAO",
       .tooltip = "Half is recommended at high or native resolutions, but it halves whatever resolution you render at, so it can get very low when upscaling is enabled.",
       .labels = {"Full", "Half"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
