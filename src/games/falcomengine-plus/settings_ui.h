@@ -67,7 +67,7 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Info", "General"},
 };
 
-static constexpr float kSidebarWidth = 168.f;
+static constexpr float kSidebarWidth = 184.f;
 static constexpr float kSidebarItemHeight = 30.f;
 
 // ---------------------------------------------------------------------------
@@ -659,6 +659,34 @@ static void DrawSidebar(float height) {
 
     ImGui::PopStyleColor(selected ? 4 : 3);
   }
+
+  const ImGuiStyle& style = ImGui::GetStyle();
+  const float buttons_height = (ImGui::GetFrameHeight() * 2.f) + style.ItemSpacing.y;
+  const float remaining = ImGui::GetContentRegionAvail().y;
+  if (remaining > buttons_height + style.ItemSpacing.y) {
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + remaining - buttons_height);
+  } else {
+    ImGui::Spacing();
+  }
+
+  ImGui::PushStyleColor(ImGuiCol_Button, kPatreon);
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kPatreonHover);
+  ImGui::PushStyleColor(ImGuiCol_ButtonActive, kPatreonActive);
+  if (ImGui::Button("Patreon", ImVec2(-FLT_MIN, 0.f))) {
+    renodx::utils::platform::LaunchURL("https://www.patreon.com/c/Toru77");
+  }
+  ImGui::PopStyleColor(3);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Support development on Patreon.");
+  }
+
+  if (ImGui::Button("Discord", ImVec2(-FLT_MIN, 0.f))) {
+    renodx::utils::platform::LaunchURL("https://discord.com/invite/renodx");
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Join the RenoDX Discord.");
+  }
+
   ImGui::EndChild();
   ImGui::PopStyleColor();
 }
