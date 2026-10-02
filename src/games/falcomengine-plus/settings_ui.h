@@ -67,7 +67,7 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Info", "General"},
 };
 
-static constexpr float kSidebarWidth = 184.f;
+static constexpr float kSidebarWidth = 200.f;
 static constexpr float kSidebarItemHeight = 30.f;
 
 // ---------------------------------------------------------------------------
