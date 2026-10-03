@@ -843,6 +843,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r5.y = lightSpecularGlossiness_g * r2.y;
   r5.z = saturate(dot(r21.xyz, r8.xyw));
   r5.y = max(0.00100000005, r5.y);
+  float brdf_gloss_sun = r5.y;
   r5.z = log2(r5.z);
   r5.y = r5.y * r5.z;
   r5.y = exp2(r5.y);
@@ -866,12 +867,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   float brdf_NdotL_sun = saturate(dot(r8.xyw, -lightDirection_g.xyz));
   float brdf_VdotH_sun = saturate(dot(r19.xyz, r21.xyz));
   if (brdf_use_ggx) {
-    // Fresnel is applied once by the specularColor multiply below; MSC still
-    // takes brdf_F0 for the energy fit.
+    // Match the GGX lobe to the authored sun Blinn exponent, like the local
+    // lights, so the highlight keeps the authored width instead of the clamped
+    // material roughness. Fresnel is applied once by the specularColor multiply
+    // below; MSC still takes brdf_F0 for the energy fit.
+    float brdf_rough_sun = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_sun + 2.0f), 0.25f)), 0.08f, 1.0f);
     float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun,
-                                       brdf_VdotH_sun, brdf_roughness, float3(1.0f, 1.0f, 1.0f));
+                                       brdf_VdotH_sun, brdf_rough_sun, float3(1.0f, 1.0f, 1.0f));
     brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun,
-                                             brdf_roughness, brdf_F0);
+                                             brdf_rough_sun, brdf_F0);
     r5.y = lerp(brdf_blinn_sun,
                 SoftClampSpecular(brdf_ggx_sun.x * brdf_NdotL_sun, brdf_specular_peak),
                 brdf_specular_str);

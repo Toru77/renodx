@@ -387,10 +387,16 @@ void main(
       r6.x = r0.x;
       r6.yz = float2(0.0322580636,0.0322580636);
       r7.xyz = r6.xyz * r5.xyz;
-      // Was ao.y * ao.z, the character AO gated by the ssao pass's SSS shadow
-      // channel. That raymarch is replaced by the Contact / Micro Shadow compute
-      // passes, applied once at the output below, so only the AO term is left.
+      // Vanilla used ao.y * ao.z here: ssao.z is the ENGINE's own screen-space
+      // character shadow, and it is exactly what "Character Shadowing -> Mode"
+      // drives. With the engine mode off, the Contact / Micro Shadow compute
+      // passes own character shadowing, so only the AO term is kept. Folding it
+      // into this weight (as vanilla did) cannot darken the AO itself or
+      // double-count against the GTVBAO character mask.
       r1.w = r4.y;
+      if (shader_injection_data.char_shadow_mode >= 0.5f) {
+        r1.w *= saturate(r4.z);
+      }
       r4.yzw = -r6.xyz * r5.xyz + r0.xyz;
       r6.xyz = r1.www * r4.yzw + r7.xyz;
       r1.w = (int)r1.z & 4;
@@ -616,19 +622,9 @@ void main(
     }
     // The SSAO pass writes the ENGINE's own screen-space character shadow into the
     // AO target's .z channel (sora1st/ssao r4.z, which survives into o0.z on both the
-    // GTVBAO early-out and the temporal blend). This is the only consumer of that
-    // channel, and it is what makes "Character Shadowing -> Mode" do anything.
-    //
-    // Applied to the resolved colour, not folded into ao_sample: the AO term r4.x is
-    // consumed by the ambient branches directly above and is also the GTVBAO
-    // character mask's input, so scaling it would darken the AO itself and double-count
-    // against that mask. Multiplying the colour cannot.
-    //
-    // This is the vanilla march, not the retired SSS raymarch -- that one was driven by
-    // the EnvSSS settings and is gone from every game.
-    if (is_character_pixel && shader_injection_data.char_shadow_mode >= 0.5f) {
-      r6.xyz *= saturate(ssao_sample.z);
-    }
+    // GTVBAO early-out and the temporal blend). It is consumed by the character AO
+    // weight above when "Character Shadowing -> Mode" selects the engine path; the
+    // retired SSS raymarch that used to drive it is gone from every game.
     // GTVBAO on characters — apply bitmask AO to character pixels
     if (is_character_pixel && shader_injection_data.char_gtvbao_mode > 0.5f
         && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
@@ -815,13 +811,17 @@ void main(
   float brdf_NdotH_sun = r11.w;
   float brdf_NdotL_sun = saturate(dot(r6.xyw, -lightDirection_g.xyz));
   float brdf_VdotH_sun = saturate(dot(r15.xyz, r17.xyz));
+  float brdf_gloss_sun = r8.w;
   if (brdf_use_ggx) {
-    // Fresnel is applied once by the specularColor multiply below; MSC still
-    // takes brdf_F0 for the energy fit.
+    // Match the GGX lobe to the authored sun Blinn exponent, like the local
+    // lights, so the highlight keeps the authored width instead of the clamped
+    // material roughness. Fresnel is applied once by the specularColor multiply
+    // below; MSC still takes brdf_F0 for the energy fit.
+    float brdf_rough_sun = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_sun + 2.0f), 0.25f)), 0.08f, 1.0f);
     float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun,
-                                       brdf_VdotH_sun, brdf_roughness, float3(1.0f, 1.0f, 1.0f));
+                                       brdf_VdotH_sun, brdf_rough_sun, float3(1.0f, 1.0f, 1.0f));
     brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun,
-                                             brdf_roughness, brdf_F0);
+                                             brdf_rough_sun, brdf_F0);
     r8.w = lerp(brdf_blinn_sun,
                 SoftClampSpecular(brdf_ggx_sun.x * brdf_NdotL_sun, brdf_specular_peak),
                 brdf_specular_str);

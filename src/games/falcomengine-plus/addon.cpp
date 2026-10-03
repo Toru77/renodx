@@ -2186,6 +2186,39 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
+    // -- Sora 1st foliage (new hashes) --
+    {
+        0x8C297700u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x8C297700u,
+            .code = __0x8C297700,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x545AFAA5u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x545AFAA5u,
+            .code = __0x545AFAA5,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x26233414u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x26233414u,
+            .code = __0x26233414,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x6076C5A8u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x6076C5A8u,
+            .code = __0x6076C5A8,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
     // -- Sora 2nd foliage (GTVBAO foliage marker bit 15 in o1.w) --
     {
         0x46FCDC51u,
@@ -3649,14 +3682,14 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFMultiScatterSpecular", .binding = &shader_injection.brdf_multiscatter_specular_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
+      .default_value = 1.0f, .label = "Multi-Scatter GGX Specular", .section = "BRDF Improvement",
       .tooltip = "Replaces Blinn-Phong specular with GGX D�V�F + Kulla-Conty multi-scatter compensation (SIGGRAPH 2017).",
       .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
       .key = "BRDFSpecularStrength", .binding = &shader_injection.brdf_specular_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 1.0f, .label = "Specular Blend", .section = "BRDF Improvement",
+      .default_value = 0.5f, .label = "Specular Blend", .section = "BRDF Improvement",
       .tooltip = "Blend between vanilla Blinn-Phong and GGX+multi-scatter specular. 0=vanilla, 1=full GGX+MS, 2=2x boost.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
@@ -3665,7 +3698,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFSpecularPeakClamp", .binding = &shader_injection.brdf_specular_peak_clamp,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 4.0f, .label = "Specular Peak Clamp", .section = "BRDF Improvement",
+      .default_value = 2.0f, .label = "Specular Peak Clamp", .section = "BRDF Improvement",
       .tooltip = "Soft cap on GGX highlight intensity. Identity below half the value, asymptotes to it. 0 = off.",
       .min = 0.f, .max = 16.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_multiscatter_specular_enabled > 0.5f; },
