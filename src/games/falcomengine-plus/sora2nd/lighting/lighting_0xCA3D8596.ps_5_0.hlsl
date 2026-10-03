@@ -852,7 +852,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   float brdf_roughness = clamp(brdf_roughness_src,
       shader_injection_data.brdf_roughness_min,
       shader_injection_data.brdf_roughness_max);
-  float3 brdf_F0 = r9.xyz;
+  // deferredParams_g.specularColor (r11.xyz); r9.xyz holds packed MRT1 bytes here.
+  float3 brdf_F0 = r11.xyz;
   float3 brdf_V = r19.xyz;
   bool brdf_use_ggx = shader_injection_data.brdf_multiscatter_specular_enabled > 0.5f;
   bool brdf_use_hammon = shader_injection_data.brdf_hammon_diffuse_enabled > 0.5f;
@@ -865,8 +866,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   float brdf_NdotL_sun = saturate(dot(r8.xyw, -lightDirection_g.xyz));
   float brdf_VdotH_sun = saturate(dot(r19.xyz, r21.xyz));
   if (brdf_use_ggx) {
+    // Fresnel is applied once by the specularColor multiply below; MSC still
+    // takes brdf_F0 for the energy fit.
     float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun,
-                                       brdf_VdotH_sun, brdf_roughness, brdf_F0);
+                                       brdf_VdotH_sun, brdf_roughness, float3(1.0f, 1.0f, 1.0f));
     brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun,
                                              brdf_roughness, brdf_F0);
     r5.y = lerp(brdf_blinn_sun,
@@ -1314,18 +1317,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r5.z = log2(r5.z);
         r2.w = r5.z * r2.w;
         r2.w = exp2(r2.w);
-        float brdf_spec_pt = r2.w * r5.y;
+        float3 brdf_spec_pt = r2.w * r5.y;
         if (brdf_use_ggx) {
           float brdf_NdotL_pt = saturate(brdf_rawNdotL_pt);
           float brdf_rough_pt = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_pt + 2.0f), 0.25f)), 0.08f, 1.0f);
-          float brdf_Eo_pt = GGX_DirectionalAlbedo(brdf_NdotV, brdf_rough_pt);
-          float brdf_Ei_pt = GGX_DirectionalAlbedo(brdf_NdotL_pt, brdf_rough_pt);
-          float brdf_scale_pt = saturate((6.2831853f / (brdf_gloss_pt + 2.0f)) / max(brdf_Eo_pt * brdf_Ei_pt, 0.05f));
           float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_rough_pt, brdf_F0);
           brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_rough_pt, brdf_F0);
-          brdf_ggx_spec_pt *= brdf_scale_pt;
           brdf_spec_pt = lerp(brdf_spec_pt,
-                              SoftClampSpecular(brdf_ggx_spec_pt.x * (brdf_rawDistAtten_pt * brdf_NdotL_pt), brdf_specular_peak),
+                              SoftClampSpecular(brdf_ggx_spec_pt * (brdf_rawDistAtten_pt * brdf_NdotL_pt), brdf_specular_peak),
                               brdf_specular_str);
         }
         r12.xyz = r13.xyz * brdf_spec_pt;
@@ -1451,18 +1450,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r5.z = log2(r5.z);
           r2.w = r5.z * r2.w;
           r2.w = exp2(r2.w);
-          float brdf_spec_sp = r2.w * r5.y;
+          float3 brdf_spec_sp = r2.w * r5.y;
           if (brdf_use_ggx) {
             float brdf_NdotL_sp = saturate(brdf_rawNdotL_sp);
             float brdf_rough_sp = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_sp + 2.0f), 0.25f)), 0.08f, 1.0f);
-            float brdf_Eo_sp = GGX_DirectionalAlbedo(brdf_NdotV, brdf_rough_sp);
-            float brdf_Ei_sp = GGX_DirectionalAlbedo(brdf_NdotL_sp, brdf_rough_sp);
-            float brdf_scale_sp = saturate((6.2831853f / (brdf_gloss_sp + 2.0f)) / max(brdf_Eo_sp * brdf_Ei_sp, 0.05f));
             float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_rough_sp, brdf_F0);
             brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_rough_sp, brdf_F0);
-            brdf_ggx_spec_sp *= brdf_scale_sp;
             brdf_spec_sp = lerp(brdf_spec_sp,
-                                SoftClampSpecular(brdf_ggx_spec_sp.x * (brdf_specAtten_sp * brdf_NdotL_sp), brdf_specular_peak),
+                                SoftClampSpecular(brdf_ggx_spec_sp * (brdf_specAtten_sp * brdf_NdotL_sp), brdf_specular_peak),
                                 brdf_specular_str);
           }
           r16.xyz = r19.xyz * brdf_spec_sp;

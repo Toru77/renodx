@@ -3640,7 +3640,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFDiffuseStrength", .binding = &shader_injection.brdf_diffuse_strength,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.66f, .label = "Diffuse Blend", .section = "BRDF Improvement",
+      .default_value = 1.0f, .label = "Diffuse Blend", .section = "BRDF Improvement",
       .tooltip = "Blend between vanilla Lambert and Hammon diffuse. 0=vanilla, 1=full Hammon, 2=2x boost.",
       .min = 0.f, .max = 2.f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.brdf_hammon_diffuse_enabled > 0.5f; },
@@ -3674,17 +3674,17 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "BRDFRoughnessMin", .binding = &shader_injection.brdf_roughness_min,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.5f, .label = "Roughness Min", .section = "BRDF Improvement",
+      .default_value = 0.65f, .label = "Roughness Min", .section = "BRDF Improvement",
       .tooltip = "Clamp minimum perceptual roughness to prevent GGX singularity. 0.04 is a safe minimum for most materials.",
-      .min = 0.f, .max = 0.5f, .format = "%.2f",
+      .min = 0.f, .max = 0.8f, .format = "%.2f",
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "BRDFRoughnessMax", .binding = &shader_injection.brdf_roughness_max,
       .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-      .default_value = 0.75f, .label = "Roughness Max", .section = "BRDF Improvement",
+      .default_value = 1.0f, .label = "Roughness Max", .section = "BRDF Improvement",
       .tooltip = "Clamp maximum perceptual roughness. 1.0 = no clamping.",
-      .min = 0.5f, .max = 1.f, .format = "%.2f",
+      .min = 0.2f, .max = 1.f, .format = "%.2f",
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- GTVBAO dispatch Fix (for double volumetrics) --

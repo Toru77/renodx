@@ -816,8 +816,10 @@ void main(
   float brdf_NdotL_sun = saturate(dot(r6.xyw, -lightDirection_g.xyz));
   float brdf_VdotH_sun = saturate(dot(r15.xyz, r17.xyz));
   if (brdf_use_ggx) {
+    // Fresnel is applied once by the specularColor multiply below; MSC still
+    // takes brdf_F0 for the energy fit.
     float3 brdf_ggx_sun = GGX_Specular(brdf_NdotH_sun, brdf_NdotV, brdf_NdotL_sun,
-                                       brdf_VdotH_sun, brdf_roughness, brdf_F0);
+                                       brdf_VdotH_sun, brdf_roughness, float3(1.0f, 1.0f, 1.0f));
     brdf_ggx_sun *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sun,
                                              brdf_roughness, brdf_F0);
     r8.w = lerp(brdf_blinn_sun,
@@ -1276,22 +1278,19 @@ void main(
         r14.y = dynamicLights_g[r2.w].specularGlossiness;
         float brdf_gloss_pt = r14.y * r2.y;
         float brdf_blinn_pt = exp2(log2(max(brdf_NdotH_pt, 0.0001f)) * max(brdf_gloss_pt, 0.001f));
-        float brdf_spec_pt = brdf_blinn_pt * brdf_combinedAtten_pt;
+        float3 brdf_spec_pt = brdf_blinn_pt * brdf_combinedAtten_pt;
         if (brdf_use_ggx) {
           float brdf_NdotL_pt = saturate(brdf_rawNdotL_pt);
-          // Match the GGX lobe to the authored Blinn exponent and normalize its
-          // energy so sharp local lights cannot spread or blow out.  The GGX half
-          // uses the physical NdotL attenuation (no translucency wrap).
+          // Match the GGX lobe to the authored Blinn exponent; Kulla-Conty
+          // multi-scatter compensation restores the energy the single-scatter
+          // lobe loses.  The GGX half uses the physical NdotL attenuation (no
+          // translucency wrap).
           float brdf_gloss_pt_safe = max(brdf_gloss_pt, 0.001f);
           float brdf_rough_pt = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_pt_safe + 2.0f), 0.25f)), 0.08f, 1.0f);
-          float brdf_Eo_pt = GGX_DirectionalAlbedo(brdf_NdotV, brdf_rough_pt);
-          float brdf_Ei_pt = GGX_DirectionalAlbedo(brdf_NdotL_pt, brdf_rough_pt);
-          float brdf_scale_pt = saturate((6.2831853f / (brdf_gloss_pt_safe + 2.0f)) / max(brdf_Eo_pt * brdf_Ei_pt, 0.05f));
           float3 brdf_ggx_spec_pt = GGX_Specular(brdf_NdotH_pt, brdf_NdotV, brdf_NdotL_pt, brdf_VdotH_pt, brdf_rough_pt, brdf_F0);
           brdf_ggx_spec_pt *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_pt, brdf_rough_pt, brdf_F0);
-          brdf_ggx_spec_pt *= brdf_scale_pt;
           brdf_spec_pt = lerp(brdf_spec_pt,
-                              SoftClampSpecular(brdf_ggx_spec_pt.x * (brdf_rawDistAtten_pt * brdf_NdotL_pt), brdf_specular_peak),
+                              SoftClampSpecular(brdf_ggx_spec_pt * (brdf_rawDistAtten_pt * brdf_NdotL_pt), brdf_specular_peak),
                               brdf_specular_str);
         }
         r9.xyz = r13.yzw * brdf_spec_pt * r14.x + r9.xyz;
@@ -1408,19 +1407,15 @@ void main(
           r17.y = dynamicLights_g[r2.w].specularGlossiness;
           float brdf_gloss_sp = r17.y * r2.y;
           float brdf_blinn_sp = exp2(log2(max(brdf_NdotH_sp, 0.0001f)) * max(brdf_gloss_sp, 0.001f));
-          float brdf_spec_sp = brdf_blinn_sp * brdf_combinedAtten_sp;
+          float3 brdf_spec_sp = brdf_blinn_sp * brdf_combinedAtten_sp;
           if (brdf_use_ggx) {
             float brdf_NdotL_sp = saturate(brdf_rawNdotL_sp);
             float brdf_gloss_sp_safe = max(brdf_gloss_sp, 0.001f);
             float brdf_rough_sp = clamp(min(brdf_roughness, pow(2.0f / (brdf_gloss_sp_safe + 2.0f), 0.25f)), 0.08f, 1.0f);
-            float brdf_Eo_sp = GGX_DirectionalAlbedo(brdf_NdotV, brdf_rough_sp);
-            float brdf_Ei_sp = GGX_DirectionalAlbedo(brdf_NdotL_sp, brdf_rough_sp);
-            float brdf_scale_sp = saturate((6.2831853f / (brdf_gloss_sp_safe + 2.0f)) / max(brdf_Eo_sp * brdf_Ei_sp, 0.05f));
             float3 brdf_ggx_spec_sp = GGX_Specular(brdf_NdotH_sp, brdf_NdotV, brdf_NdotL_sp, brdf_VdotH_sp, brdf_rough_sp, brdf_F0);
             brdf_ggx_spec_sp *= MultiScatterCompensation(brdf_NdotV, brdf_NdotL_sp, brdf_rough_sp, brdf_F0);
-            brdf_ggx_spec_sp *= brdf_scale_sp;
             brdf_spec_sp = lerp(brdf_spec_sp,
-                                SoftClampSpecular(brdf_ggx_spec_sp.x * (brdf_shadowAtten_sp * brdf_NdotL_sp), brdf_specular_peak),
+                                SoftClampSpecular(brdf_ggx_spec_sp * (brdf_shadowAtten_sp * brdf_NdotL_sp), brdf_specular_peak),
                                 brdf_specular_str);
           }
           r13.yzw = r16.xyz * brdf_spec_sp * r17.x + r13.yzw;

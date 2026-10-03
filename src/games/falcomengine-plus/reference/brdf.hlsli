@@ -109,6 +109,16 @@ float SoftClampSpecular(float x, float peak)
   return knee + (x - knee) / (1.0f + (x - knee) / (peak - knee));
 }
 
+// Per-channel form, for callers that keep a coloured Fresnel. Each channel is
+// clamped on its own, so a tinted highlight cannot push one channel over the
+// cap while the others stay below it.
+float3 SoftClampSpecular(float3 x, float peak)
+{
+  return float3(SoftClampSpecular(x.x, peak),
+                SoftClampSpecular(x.y, peak),
+                SoftClampSpecular(x.z, peak));
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // GGX Normal Distribution Function  (Trowbridge-Reitz)
 // ──────────────────────────────────────────────────────────────────────────────
