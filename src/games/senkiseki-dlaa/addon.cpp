@@ -1004,7 +1004,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
            "reason=%s detail=%s | color=%s f=%u | depth=%s f=%u | rtv0=%s f=%u | "
            "globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X tracked=%d b0buf=0x%llX | "
            "depthCand=%d %ux%u b=%u reject=%s | ngx=sup%d init%d feat%d evalFail%d | "
-           "velpipe=%d prevDepth=%d invalidations=%u",
+           "velpipe=%d prevDepth=%d dlssOut=%s invalidations=%u",
            (int)shader_injection.dlaa_enabled, (int)d->hdr_detected, hdr_path ? "pre" : "composite",
            diag.final_entry, diag.fxaa_entry, diag.run_calls, diag.eval_ok,
            diag.last_deploy_entry == 1u ? "final" : diag.last_deploy_entry == 2u ? "fxaa" : "none",
@@ -1018,6 +1018,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
            (int)senkiseki3::dlss::ngx.supported, (int)senkiseki3::dlss::ngx.initialized,
            (int)(senkiseki3::dlss::ngx.feature != nullptr), (int)senkiseki3::dlss::ngx.eval_failed,
            (int)(d->velocity_pipeline.handle != 0u), (int)(d->prev_depth_srv.handle != 0u),
+           (senkiseki3::dlss::dlss_output_format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? "float" : "8bit",
            diag.capture_invalidations);
   reshade::log::message(reshade::log::level::info, buf);
 }
@@ -1047,12 +1048,13 @@ static bool DlaaStatusDraw() {
   ImGui::Text("NGX sup=%d init=%d feat=%d evalFail=%d",
               (int)senkiseki3::dlss::ngx.supported, (int)senkiseki3::dlss::ngx.initialized,
               (int)(senkiseki3::dlss::ngx.feature != nullptr), (int)senkiseki3::dlss::ngx.eval_failed);
-  ImGui::Text("globalsVP=%d matrices=%d HDR=%d path=%s",
+  ImGui::Text("globalsVP=%d matrices=%d HDR=%d path=%s dlssOut=%s",
               (int)d->globals_vp_captured, (int)d->matrices_valid,
               (int)d->hdr_detected,
               ((int)shader_injection.dlaa_hdr_inject == 1 ||
                ((int)shader_injection.dlaa_hdr_inject == 0 && d->hdr_detected))
-                  ? "pre" : "composite");
+                  ? "pre" : "composite",
+              (senkiseki3::dlss::dlss_output_format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? "float" : "8bit");
   return false;
 }
 
@@ -5359,14 +5361,17 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   senkiseki3::dlss::dlss_flag_is_hdr = shader_injection.dlaa_flag_is_hdr;
   senkiseki3::dlss::dlss_flag_depth_inverted = shader_injection.dlaa_flag_depth_inverted;
   senkiseki3::dlss::dlss_flag_auto_exposure = shader_injection.dlaa_flag_auto_exposure;
-  // DLSS output format. On the COMPOSITE path (no pre-tone-map) the DLAA image
-  // is copied straight into the FXAA output target (RTV0, 8-bit SDR), so DLSS
-  // must write 8-bit UNORM for the native copy to match formats. The float
-  // output toggle only matters on the pre-tone-map path, where the HDR mod's
-  // final_blending tone maps UNCLAMPED values (8-bit UNORM clamps highlights
-  // before the tone map -> clipping/banding).
+  // DLSS output format (HDR: Float DLSS Output toggle). Float is required
+  // whenever the HDR mod is loaded: its tonemap writes UNCLAMPED values (>1)
+  // into the float post chain, and an 8-bit UNORM output would clip highlights
+  // before the swapchain proxy PQ-encodes them. This applies to BOTH injection
+  // points — pre-tone-map and Composite (the composite is the post-DOF HDR
+  // image). Without the HDR mod, Composite keeps 8-bit UNORM so the native copy
+  // into the 8-bit RTV0 matches formats.
+  // NOTE: HdrFinalPathActive() refreshes d->hdr_detected on every call.
+  const bool hdr_mod_loaded = HdrFinalPathActive(cmd_list) || d->hdr_detected;
   senkiseki3::dlss::dlss_output_format =
-      (HdrFinalPathActive(cmd_list) && shader_injection.dlaa_hdr_float_out > 0.5f)
+      (hdr_mod_loaded && shader_injection.dlaa_hdr_float_out > 0.5f)
           ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
 
   // DLAA evaluate (only when all resources ready + NGX supported). The gate and
@@ -5998,7 +6003,7 @@ renodx::utils::settings::Settings settings = {
         .key = "DLAAHdrFloatOut", .binding = &shader_injection.dlaa_hdr_float_out,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "HDR: Float DLSS Output", .section = "Antialiasing",
-        .tooltip = "Makes the DLSS output texture r16g16b16a16_float instead of r8g8b8a8. The 8-bit UNORM output clamps highlight values before the HDR mod's tone map can recover them (clipping/banding on the Pre-ToneMap path). Float preserves the range through the tone map. Recreates the DLSS feature once on toggle.",
+        .tooltip = "Makes the DLSS output texture r16g16b16a16_float instead of r8g8b8a8. The 8-bit UNORM output clamps highlight values before the HDR mod's tone map / swapchain proxy can recover them (clipping/banding). Float preserves the range and applies on BOTH Pre-ToneMap and Composite when the HDR mod is loaded; without the HDR mod, Composite stays 8-bit. Recreates the DLSS feature once on toggle.",
         .labels = {"Off (8-bit)","On (r16 float)"},
         .is_enabled = []{ return shader_injection.dlaa_enabled > 1.5f; },
         .is_visible = []{ return g_fg_page < 0.5f; },
@@ -6666,22 +6671,24 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
 // image. No renodx/HDR settings are read or replicated: if the HDR mod author
 // changes the tone map or nits, we never know or care.
 static bool HdrFinalPathActive(reshade::api::command_list* cmd_list) {
+  // Re-check the module every call in ALL modes so addon load order cannot lock
+  // a stale HDR-detected flag for the session. The Composite path needs this to
+  // keep the DLSS output in float (HDR mod's unclamped post chain).
+  auto* dev = cmd_list ? cmd_list->get_device() : nullptr;
+  auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  if (d) {
+    const bool detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
+    if (detected != d->hdr_detected) {
+      d->hdr_detected = detected;
+      reshade::log::message(reshade::log::level::info,
+          detected ? "[DLAA] HDR mod detected (late): renodx-senkiseki.addon64"
+                   : "[DLAA] HDR mod unloaded");
+    }
+  }
   const int mode = (int)shader_injection.dlaa_hdr_inject;
   if (mode == 1) return true;   // Force Pre-ToneMap
   if (mode == 2) return false;  // Force Composite
-  // Auto: active when the HDR mod is loaded. Re-check every call so addon load
-  // order cannot lock the wrong path for the whole session.
-  auto* dev = cmd_list ? cmd_list->get_device() : nullptr;
-  auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
-  if (!d) return false;
-  const bool detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
-  if (detected != d->hdr_detected) {
-    d->hdr_detected = detected;
-    reshade::log::message(reshade::log::level::info,
-        detected ? "[DLAA] HDR mod detected (late): renodx-senkiseki.addon64"
-                 : "[DLAA] HDR mod unloaded");
-  }
-  return d->hdr_detected;
+  return d && d->hdr_detected;
 }
 
 static bool OnBeforeFinalBlendingDraw(reshade::api::command_list* cmd_list) {
