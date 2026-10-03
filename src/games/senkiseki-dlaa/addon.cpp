@@ -387,6 +387,88 @@ static void CpuProfileLogFrame() {
   g_cpu_profile_state.frames = 0u;
 }
 
+// ── DLAA deployment diagnostics ─────────────────────────────────────────────
+// A single reason code names the FIRST gate that blocked DLAA deployment in the
+// current frame; the edge logs and the 1 Hz status line report it plus every
+// input identity, so "why didn't DLAA deploy?" is answerable from one log line.
+enum DlaaDeployReason : uint32_t {
+  kDlaaReasonOk = 0u,
+  kDlaaReasonNoEntry,          // neither FXAA nor final_blending on_draw fired
+  kDlaaReasonMissingColorSrv,  // captured_color_srv never captured
+  kDlaaReasonMissingDepthSrv,  // captured_depth_srv never captured
+  kDlaaReasonMissingSceneCbv,  // no scene-geometry VS b0 captured
+  kDlaaReasonMissingRtv0,      // no render-target bind captured RTV0
+  kDlaaReasonNgxUnsupported,   // NGX reports DLAA unsupported
+  kDlaaReasonNgxInitFailed,    // NGX init failed / not initialized
+  kDlaaReasonNgxFeatureFailed, // DLSS feature creation failed (latched)
+  kDlaaReasonNgxEvalFailed,    // NGX evaluate failed (latched until input changes)
+  kDlaaReasonNgxOutputFailed,  // NGX output texture creation failed
+  kDlaaReasonEvalFalse,        // EvaluateDLSS returned false (other)
+  kDlaaReasonVelPipelineFailed,
+  kDlaaReasonEffectMaskFailed,
+  kDlaaReasonMotionTargetFailed,
+  kDlaaReasonPrevDepthFailed,
+  kDlaaReasonMatricesInvalid,
+  kDlaaReasonNullDescriptor,
+  kDlaaReasonCount,
+};
+static const char* const kDlaaReasonNames[kDlaaReasonCount] = {
+    "ok", "no-entry-point", "missing-color-srv", "missing-depth-srv",
+    "missing-scene-cbv", "missing-rtv0", "ngx-unsupported", "ngx-init-failed",
+    "ngx-feature-failed", "ngx-eval-failed", "ngx-output-failed", "eval-false",
+    "velocity-pipeline-failed", "effect-mask-failed", "motion-target-failed",
+    "prev-depth-failed", "matrices-invalid", "null-descriptor"};
+static const char* DlaaReasonName(uint32_t reason) {
+  return reason < kDlaaReasonCount ? kDlaaReasonNames[reason] : "unknown";
+}
+// Depth-candidate rejection classification for the capture diagnostics.
+static const char* DlaaDepthRejectName(uint32_t reject) {
+  switch (reject) {
+    case 1: return "not-depth-format";
+    case 2: return "dims!=swapchain";
+    case 3: return "depth-source-gate";
+    case 4: return "linear-fallback-already-used";
+    default: return "none";
+  }
+}
+
+struct DlaaDeployDiag {
+  uint32_t reason = kDlaaReasonOk;
+  char detail[128] = {};
+  // Per-present counters (reset at present after the edge/status evaluation).
+  uint32_t final_entry = 0u;   // OnBeforeFinalBlendingDraw calls (AA=DLAA, HDR path)
+  uint32_t fxaa_entry = 0u;    // OnBeforeFxaaDraw calls (AA=DLAA)
+  uint32_t run_calls = 0u;     // RunDLAA invocations
+  uint32_t eval_ok = 0u;       // successful RunDLAA (eval or debug output bound)
+  uint32_t eval_fail = 0u;     // failed EvaluateDLSS
+  uint32_t presents_without_entry = 0u;
+  // Last-present copies for the ImGui row (counters are reset before ImGui draws).
+  uint32_t final_entry_last = 0u, fxaa_entry_last = 0u, run_calls_last = 0u;
+  uint32_t eval_ok_last = 0u, eval_fail_last = 0u;
+  // Deploy edge tracking.
+  bool deploy_active = false;
+  uint32_t last_logged_reason = kDlaaReasonOk;
+  uint32_t last_deploy_entry = 0u;  // 1=final_blending, 2=FXAA
+  // Log cadence.
+  std::chrono::steady_clock::time_point last_log_time{};
+  std::chrono::steady_clock::time_point last_reason_log_time{};
+  // Capture diagnostics (last seen candidates).
+  uint32_t last_t0_ps_hash = 0u;
+  uint32_t last_b0_vs_hash = 0u;
+  bool last_b0_vs_listed = false;
+  int last_depth_fmt = 0;
+  uint32_t last_depth_w = 0u, last_depth_h = 0u;
+  uint32_t last_depth_binding = 0u;
+  uint32_t last_depth_reject = 0u;
+  uint32_t cbv_capture_frame = 0u;
+  uint32_t rtv0_capture_frame = 0u;
+  // Robustness diagnostics: captures cleared by destroy_resource/view.
+  uint32_t capture_invalidations = 0u;
+  // NGX eval-failure identity (recoverable latch).
+  uint64_t eval_fail_color_res = 0u;
+  uint32_t eval_fail_w = 0u, eval_fail_h = 0u;
+};
+
 // ── Descriptor table helpers ──
 // Sized for the velocity compute layout: 8 descriptor tables (s0, b13, t0,
 // t1, u0, t2, t3-history SRV, u1-history UAV) + push constants. The velocity
@@ -850,6 +932,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11Texture2D* ngx_dump_staging = nullptr;   // CPU-readable copy of NGX output (luma diag)
   bool hdr_detected = false;                     // _renodx-senkiseki.addon64 loaded (Phase 3 auto-default)
   bool dlaa_ran_this_frame = false;              // DLSS bound t0 at a final_blending draw this frame
+  DlaaDeployDiag dlaa_diag;                      // deployment reason/status diagnostics
 
   // ── Robust DLSS color source (Phase 3 fix) ──
   // The game's PS t0 at the FXAA draw IS the composite. Read it live so the
@@ -877,6 +960,106 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint64_t diag_ctx_until = 0u;             // frame-burst context capture: log per-draw Phase B diag
                                             // unthrottled through this frame (armed by a maxD spike)
 };
+
+// ── Deployment diagnostics helpers ──
+static void DlaaDiagSet(DeviceData* d, uint32_t reason, const char* fmt, ...) {
+  if (!d) return;
+  d->dlaa_diag.reason = reason;
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(d->dlaa_diag.detail, sizeof(d->dlaa_diag.detail), fmt, args);
+  va_end(args);
+}
+static void DlaaDiagOk(DeviceData* d) {
+  if (!d) return;
+  d->dlaa_diag.reason = kDlaaReasonOk;
+  d->dlaa_diag.detail[0] = '\0';
+}
+// Last D3D11 DeviceData, for the ImGui status row (render thread only).
+static DeviceData* g_dlaa_diag_device = nullptr;
+
+// 1 Hz deployment status line: every gate input + the last-seen capture
+// candidates, so a single log line names why DLAA is not deploying.
+static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return;
+  auto& diag = d->dlaa_diag;
+  auto res_info = [&](reshade::api::resource res, char* out, size_t out_size) {
+    int fmt = 0;
+    uint32_t w = 0u, h = 0u;
+    if (res.handle) {
+      auto rd = dev->get_resource_desc(res);
+      if (rd.type == reshade::api::resource_type::texture_2d) {
+        fmt = (int)rd.texture.format;
+        w = rd.texture.width;
+        h = rd.texture.height;
+      }
+    }
+    snprintf(out, out_size, "0x%llX %ux%u fmt=%d", (unsigned long long)res.handle, w, h, fmt);
+  };
+  char color[80], depth[80], rtv0[80];
+  res_info(d->captured_color_res, color, sizeof(color));
+  res_info(d->captured_depth_res, depth, sizeof(depth));
+  res_info(d->captured_rtv0_res, rtv0, sizeof(rtv0));
+  const bool hdr_path = (int)shader_injection.dlaa_hdr_inject == 1 ||
+                        ((int)shader_injection.dlaa_hdr_inject == 0 && d->hdr_detected);
+  char buf[768];
+  snprintf(buf, sizeof(buf),
+           "[DLAA] status: aa=%d hdr=%d path=%s entry(final=%u fxaa=%u) run=%u ok=%u lastEntry=%s | "
+           "reason=%s detail=%s | color=%s f=%u | depth=%s f=%u | rtv0=%s f=%u | "
+           "cbv=0x%llX valid=%d f=%u | globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X listed=%d | "
+           "depthCand=%d %ux%u b=%u reject=%s | ngx=sup%d init%d feat%d evalFail%d | "
+           "velpipe=%d prevDepth=%d invalidations=%u",
+           (int)shader_injection.dlaa_enabled, (int)d->hdr_detected, hdr_path ? "pre" : "composite",
+           diag.final_entry, diag.fxaa_entry, diag.run_calls, diag.eval_ok,
+           diag.last_deploy_entry == 1u ? "final" : diag.last_deploy_entry == 2u ? "fxaa" : "none",
+           DlaaReasonName(diag.reason), diag.detail,
+           color, d->color_capture_frame, depth, d->depth_capture_frame, rtv0, diag.rtv0_capture_frame,
+           (unsigned long long)d->captured_scene_cbv.buffer.handle, (int)d->captured_scene_cbv_valid,
+           diag.cbv_capture_frame,
+           (int)d->globals_vp_captured, (int)d->matrices_valid,
+           diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_listed,
+           diag.last_depth_fmt, diag.last_depth_w, diag.last_depth_h, diag.last_depth_binding,
+           DlaaDepthRejectName(diag.last_depth_reject),
+           (int)senkiseki3::dlss::ngx.supported, (int)senkiseki3::dlss::ngx.initialized,
+           (int)(senkiseki3::dlss::ngx.feature != nullptr), (int)senkiseki3::dlss::ngx.eval_failed,
+           (int)(d->velocity_pipeline.handle != 0u), (int)(d->prev_depth_srv.handle != 0u),
+           diag.capture_invalidations);
+  reshade::log::message(reshade::log::level::info, buf);
+}
+
+// Live ImGui row (same content as the status line) for the settings panel.
+static bool DlaaStatusDraw() {
+  auto* d = g_dlaa_diag_device;
+  if (!d) {
+    ImGui::Text("DLAA: no D3D11 device");
+    return false;
+  }
+  const auto& diag = d->dlaa_diag;
+  ImGui::Text("Deploy: %s", diag.deploy_active ? "ON" : "OFF");
+  ImGui::Text("Reason: %s", DlaaReasonName(diag.reason));
+  if (diag.detail[0] != '\0') ImGui::TextWrapped("%s", diag.detail);
+  ImGui::Text("Entry: final=%u fxaa=%u run=%u ok=%u fail=%u noEntry=%u",
+              diag.final_entry_last, diag.fxaa_entry_last, diag.run_calls_last,
+              diag.eval_ok_last, diag.eval_fail_last, diag.presents_without_entry);
+  ImGui::Text("Color f=%u  Depth f=%u  RTV0 f=%u  CBV f=%u valid=%d",
+              d->color_capture_frame, d->depth_capture_frame, diag.rtv0_capture_frame,
+              diag.cbv_capture_frame, (int)d->captured_scene_cbv_valid);
+  ImGui::Text("LastT0=0x%08X  LastB0Vs=0x%08X listed=%d",
+              diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_listed);
+  ImGui::Text("DepthCand fmt=%d %ux%u b=%u reject=%s", diag.last_depth_fmt,
+              diag.last_depth_w, diag.last_depth_h, diag.last_depth_binding,
+              DlaaDepthRejectName(diag.last_depth_reject));
+  ImGui::Text("NGX sup=%d init=%d feat=%d evalFail=%d",
+              (int)senkiseki3::dlss::ngx.supported, (int)senkiseki3::dlss::ngx.initialized,
+              (int)(senkiseki3::dlss::ngx.feature != nullptr), (int)senkiseki3::dlss::ngx.eval_failed);
+  ImGui::Text("globalsVP=%d matrices=%d HDR=%d path=%s",
+              (int)d->globals_vp_captured, (int)d->matrices_valid,
+              (int)d->hdr_detected,
+              ((int)shader_injection.dlaa_hdr_inject == 1 ||
+               ((int)shader_injection.dlaa_hdr_inject == 0 && d->hdr_detected))
+                  ? "pre" : "composite");
+  return false;
+}
 
 // OPT 5: per-draw shader hashes. When DLAAPhaseBSharedState is on, the draw
 // hook queries GetCurrentState ONCE per draw and caches the VS/PS hashes in
@@ -4313,6 +4496,14 @@ static void OnDestroyResourceView(reshade::api::device* dev, reshade::api::resou
   if (!d) return;
   d->view_resource_cache.erase(view.handle);
   d->non_depth_views.erase(view.handle);
+  if (d->captured_depth_srv.handle == view.handle) {
+    d->captured_depth_srv = {};
+    ++d->dlaa_diag.capture_invalidations;
+  }
+  if (d->captured_color_srv.handle == view.handle) {
+    d->captured_color_srv = {};
+    ++d->dlaa_diag.capture_invalidations;
+  }
   if (d->captured_rtv0_view == view.handle) {
     d->captured_rtv0_view = 0u;
     d->captured_rtv0_res = {};
@@ -4324,6 +4515,36 @@ static void OnDestroyResourceView(reshade::api::device* dev, reshade::api::resou
         break;
       }
     }
+  }
+}
+
+// ── Robustness: a destroyed resource invalidates every capture that still
+// points at it, forcing a fresh capture instead of a dangling read. Scene
+// transitions destroy render targets/depth/CBVs, and without this the deploy
+// gate keeps "passing" on dead handles. ──
+static void OnDestroyResource(reshade::api::device* dev, reshade::api::resource res) {
+  if (!dev || !res.handle) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return;
+  if (d->captured_depth_res.handle == res.handle) {
+    d->captured_depth_res = {};
+    d->captured_depth_srv = {};
+    ++d->dlaa_diag.capture_invalidations;
+  }
+  if (d->captured_color_res.handle == res.handle) {
+    d->captured_color_res = {};
+    d->captured_color_srv = {};
+    ++d->dlaa_diag.capture_invalidations;
+  }
+  if (d->captured_rtv0_res.handle == res.handle) {
+    d->captured_rtv0_res = {};
+    d->captured_rtv0_view = 0u;
+    ++d->dlaa_diag.capture_invalidations;
+  }
+  if (d->captured_scene_cbv.buffer.handle == res.handle) {
+    d->captured_scene_cbv = {};
+    d->captured_scene_cbv_valid = false;
+    ++d->dlaa_diag.capture_invalidations;
   }
 }
 
@@ -4352,6 +4573,7 @@ static void OnBindRenderTargets(
     }
     d->captured_rtv0_view = rtvs[0].handle;
   }
+  d->dlaa_diag.rtv0_capture_frame = d->frame_index;
   // Track the bound RT set for the effect-mask re-bind (skip our own echo).
   bool has_mask = false;
   bool has_motion = false;
@@ -4471,9 +4693,16 @@ static bool IssueSceneCbvCopy(reshade::api::command_list* cmd_list, DeviceData* 
 //   curr_view_proj     = this frame's ViewProjection
 //   curr_view_proj_inv = ProjectionInverse * ViewInverse (= inverse(ViewProjection))
 static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11DeviceContext* ctx) {
-  if (!dev || !d || !ctx || !d->captured_scene_cbv_valid) return false;
+  if (!dev || !d || !ctx) return false;
+  if (!d->captured_scene_cbv_valid) {
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV never captured");
+    return false;
+  }
   auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
-  if (!cb) return false;
+  if (!cb) {
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV handle null");
+    return false;
+  }
 
   std::array<float, 16> view_proj = {};
   if (g_opt_readback_skip >= 0.5f && d->globals_vp_captured) {
@@ -4492,7 +4721,10 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
       const uint64_t max_read = (offset < bdesc.buffer.size) ? (bdesc.buffer.size - offset) : 0u;
       if (range_size > max_read) range_size = max_read;
     }
-    if (range_size < 352ull) return false;  // can't reach the matrices
+    if (range_size < 352ull) {  // can't reach the matrices
+      DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV range < 352 bytes");
+      return false;
+    }
     const uint32_t need = static_cast<uint32_t>(range_size);
 
     if (!d->scene_cbv_staging || d->scene_cbv_staging_size < need) {
@@ -4502,7 +4734,10 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
       bd.Usage = D3D11_USAGE_STAGING;
       bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
       auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
-      if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) return false;
+      if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) {
+        DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "staging buffer create failed (%u bytes)", need);
+        return false;
+      }
       d->scene_cbv_staging_size = need;
     }
 
@@ -4520,7 +4755,10 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
     d->scene_cbv_copy_issued = false;  // consumed this frame
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(ctx->Map(d->scene_cbv_staging, 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    if (FAILED(ctx->Map(d->scene_cbv_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+      DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "staging Map failed");
+      return false;
+    }
     const float* data = static_cast<const float*>(mapped.pData);
     memcpy(view_proj.data(), data + 160 / 4, 64);  // c10 ViewProjection
     ctx->Unmap(d->scene_cbv_staging, 0);
@@ -4540,7 +4778,11 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
 
   float sum = 0.f;
   for (float v : view_proj) sum += v;
-  if (sum == 0.f) return false;  // uninitialized / zeroed matrix
+  if (sum == 0.f) {  // uninitialized / zeroed matrix
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "ViewProjection is zero (globals=%d)",
+                (int)d->globals_vp_captured);
+    return false;
+  }
 
   d->prev_view_proj = d->curr_view_proj;
   d->curr_view_proj = view_proj;
@@ -4556,7 +4798,10 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
   // depth-dependent reprojection error -> the static radial MV field (ghosting).
   // Inverting the real VP makes the unproject->reproject round trip exact, so a
   // static camera yields ~zero velocity on static content.
-  if (!InvertMat4(view_proj.data(), d->curr_view_proj_inv.data())) return false;
+  if (!InvertMat4(view_proj.data(), d->curr_view_proj_inv.data())) {
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "ViewProjection not invertible");
+    return false;
+  }
   d->matrices_valid = true;
   // Inject the current frame's ViewProjection for the VS per-object path
   // (the replaced VS consumes it on the NEXT frame as prevViewProjection).
@@ -4855,6 +5100,7 @@ static void OnPushDescriptorsCapture(
         auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
         if (ss) {
           uint32_t hash = renodx::utils::shader::GetCurrentPixelShaderHash(ss);
+          d->dlaa_diag.last_t0_ps_hash = hash;  // capture diagnostics
           if (hash == 0x96BB8CFFu || hash == 0xE8C7EBA2u) {
             d->captured_color_srv = views[0];
             d->captured_color_res = res;
@@ -4883,46 +5129,60 @@ static void OnPushDescriptorsCapture(
         bool is_fallback = (fmt == 41 || fmt == 53 || fmt == 54 || fmt == 56);
         if (g_opt_desc_cache >= 0.5f && !is_primary && !is_fallback)
           d->non_depth_views.insert(views[0].handle);
-        if ((is_primary || is_fallback)
-            && (float)rd.texture.width == d->swapchain_w
-            && (float)rd.texture.height == d->swapchain_h) {
-          auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
-          uint32_t hash = ss ? renodx::utils::shader::GetCurrentPixelShaderHash(ss) : 0u;
-          // Depth-source scan: log each distinct full-res depth pass once (debug).
-          if (shader_injection.dlaa_debug_logging > 0.5f) {
-            LogThrottled("depth-push", reshade::log::level::info, 25u, 0u,
-                         "[DLAA] Depth push: hash=0x%08X binding=%u fmt=%d %ux%u",
-                         hash, update.binding, fmt,
-                         (int)rd.texture.width, (int)rd.texture.height);
-          }
-          // Optional hash gate to a selected depth pass.
-          bool src_match = true;
-          if (shader_injection.dlaa_depth_source >= 0.5f) {
-            uint32_t want = 0;
-            switch ((int)shader_injection.dlaa_depth_source) {
-              case 1: want = 0x0E83E74Eu; break;
-              case 2: want = 0x55D61207u; break;
-              case 3: want = 0x322E20D4u; break;
-              default: want = 0u; break;
+        if (is_primary || is_fallback) {
+          // Capture diagnostics: record the last depth-family candidate and why
+          // it was rejected, so a missing depth input is explainable.
+          d->dlaa_diag.last_depth_fmt = fmt;
+          d->dlaa_diag.last_depth_w = rd.texture.width;
+          d->dlaa_diag.last_depth_h = rd.texture.height;
+          d->dlaa_diag.last_depth_binding = update.binding;
+          d->dlaa_diag.last_depth_reject = 0u;
+          if ((float)rd.texture.width != d->swapchain_w
+              || (float)rd.texture.height != d->swapchain_h) {
+            d->dlaa_diag.last_depth_reject = 2u;  // dims != swapchain
+          } else {
+            auto* ss = renodx::utils::shader::GetCurrentState(cmd_list);
+            uint32_t hash = ss ? renodx::utils::shader::GetCurrentPixelShaderHash(ss) : 0u;
+            // Depth-source scan: log each distinct full-res depth pass once (debug).
+            if (shader_injection.dlaa_debug_logging > 0.5f) {
+              LogThrottled("depth-push", reshade::log::level::info, 25u, 0u,
+                           "[DLAA] Depth push: hash=0x%08X binding=%u fmt=%d %ux%u",
+                           hash, update.binding, fmt,
+                           (int)rd.texture.width, (int)rd.texture.height);
             }
-            src_match = (want == 0u) || (hash == want);
-          }
-          // Prefer perspective depth; only use a linear/processed one if no
-          // perspective depth has been captured this frame.
-          if (src_match && (is_primary || !d->depth_primary_captured)) {
-            d->captured_depth_srv = views[0];
-            d->captured_depth_res = res;
-            d->viewport_w = (float)rd.texture.width;
-            d->viewport_h = (float)rd.texture.height;
-            d->depth_source_hash = hash;
-            // Frame-pairing stamp: which frame this depth was captured on + the
-            // resource identity. The velocity reprojection unprojects this depth
-            // with curr VP and reprojects with prev VP — if the depth is from a
-            // different frame than those matrices, the MV error scales with the
-            // per-frame displacement (bad at 30 FPS, invisible at 170 FPS).
-            d->depth_capture_frame = d->frame_index;
-            d->depth_capture_res_handle = res.handle;
-            if (is_primary) d->depth_primary_captured = true;
+            // Optional hash gate to a selected depth pass.
+            bool src_match = true;
+            if (shader_injection.dlaa_depth_source >= 0.5f) {
+              uint32_t want = 0;
+              switch ((int)shader_injection.dlaa_depth_source) {
+                case 1: want = 0x0E83E74Eu; break;
+                case 2: want = 0x55D61207u; break;
+                case 3: want = 0x322E20D4u; break;
+                default: want = 0u; break;
+              }
+              src_match = (want == 0u) || (hash == want);
+            }
+            // Prefer perspective depth; only use a linear/processed one if no
+            // perspective depth has been captured this frame.
+            if (!src_match) {
+              d->dlaa_diag.last_depth_reject = 3u;  // depth-source-gate
+            } else if (!is_primary && d->depth_primary_captured) {
+              d->dlaa_diag.last_depth_reject = 4u;  // linear fallback already used
+            } else {
+              d->captured_depth_srv = views[0];
+              d->captured_depth_res = res;
+              d->viewport_w = (float)rd.texture.width;
+              d->viewport_h = (float)rd.texture.height;
+              d->depth_source_hash = hash;
+              // Frame-pairing stamp: which frame this depth was captured on + the
+              // resource identity. The velocity reprojection unprojects this depth
+              // with curr VP and reprojects with prev VP — if the depth is from a
+              // different frame than those matrices, the MV error scales with the
+              // per-frame displacement (bad at 30 FPS, invisible at 170 FPS).
+              d->depth_capture_frame = d->frame_index;
+              d->depth_capture_res_handle = res.handle;
+              if (is_primary) d->depth_primary_captured = true;
+            }
           }
         }
       }
@@ -4940,9 +5200,13 @@ static void OnPushDescriptorsCapture(
         auto* cbv_ss = renodx::utils::shader::GetCurrentState(cmd_list);
         uint32_t vhash = cbv_ss ? renodx::utils::shader::GetCurrentVertexShaderHash(cbv_ss) : 0u;
         uint32_t phash = cbv_ss ? renodx::utils::shader::GetCurrentPixelShaderHash(cbv_ss) : 0u;
-        if (IsSceneGeometryVs(vhash)) {
+        const bool scene_vs = IsSceneGeometryVs(vhash);
+        d->dlaa_diag.last_b0_vs_hash = vhash;  // capture diagnostics
+        d->dlaa_diag.last_b0_vs_listed = scene_vs;
+        if (scene_vs) {
           d->captured_scene_cbv = *cbv;
           d->captured_scene_cbv_valid = true;
+          d->dlaa_diag.cbv_capture_frame = d->frame_index;
           // Queue the camera-matrix staging copy EARLY so the Map at FXAA
           // (ReadSceneMatrices) doesn't stall the GPU pipeline mid-frame.
           // OPT 9: when the upload-time VP capture is active, ReadSceneMatrices
@@ -5242,17 +5506,28 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return false;
   ScopedCpuTimer cpu_site(kCpuRunDlaa);
+  d->dlaa_diag.run_calls++;
+  DlaaDiagOk(d);
 
   if (!d->captured_depth_srv.handle || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle) {
-    static int missing_log_count = 0;
-    if (shader_injection.dlaa_debug_logging > 0.5f && ++missing_log_count % 300 == 0) {
-      std::string miss = "[DLAA] Missing:";
-      if (!d->captured_depth_srv.handle) miss += " depth";
-      if (!d->captured_scene_cbv_valid) miss += " cbv";
-      if (!d->captured_color_srv.handle) miss += " color";
-      miss += " — skipping";
-      reshade::log::message(reshade::log::level::warning, miss.c_str());
-    }
+    if (!d->captured_depth_srv.handle)
+      DlaaDiagSet(d, kDlaaReasonMissingDepthSrv,
+                  "no full-res depth SRV captured (lastCand fmt=%d %ux%u b=%u reject=%s)",
+                  d->dlaa_diag.last_depth_fmt, d->dlaa_diag.last_depth_w,
+                  d->dlaa_diag.last_depth_h, d->dlaa_diag.last_depth_binding,
+                  DlaaDepthRejectName(d->dlaa_diag.last_depth_reject));
+    else if (!d->captured_scene_cbv_valid)
+      DlaaDiagSet(d, kDlaaReasonMissingSceneCbv,
+                  "no scene-geometry b0 captured (lastVs=0x%08X listed=%d)",
+                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_listed);
+    else
+      DlaaDiagSet(d, kDlaaReasonMissingColorSrv,
+                  "no composite/FXAA t0 color captured (lastT0Ps=0x%08X)",
+                  d->dlaa_diag.last_t0_ps_hash);
+    // Unconditional: the first occurrence must always be in the log.
+    LogThrottled("dlaa-missing-input", reshade::log::level::warning, 1u, 60u,
+                 "[DLAA] deploy blocked: %s — %s",
+                 DlaaReasonName(d->dlaa_diag.reason), d->dlaa_diag.detail);
     return false;
   }
 
@@ -5294,16 +5569,32 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   if (!d->velocity_pipeline.handle && !CreateVelocityPipeline(dev, d)) {
     // Unconditional (not debug-gated): a crash log must always show why the
     // velocity dispatch didn't run.
+    DlaaDiagSet(d, kDlaaReasonVelPipelineFailed, "CreateVelocityPipeline failed");
     LogThrottled("vel-pipe-fail", reshade::log::level::warning, 3u, 60u,
                  "[DLAA] veloc: pipeline create FAILED");
     return false;
   }
 
   // Effect mask (r16g16_float) for the DLAA opt-out of particles/effects.
-  EnsureEffectMask(dev, d, w, h);
+  if (!EnsureEffectMask(dev, d, w, h)) {
+    DlaaDiagSet(d, kDlaaReasonEffectMaskFailed, "effect mask %ux%u create failed", w, h);
+    LogThrottled("dlaa-effect-mask-fail", reshade::log::level::warning, 1u, 60u,
+                 "[DLAA] deploy blocked: effect mask create failed (%ux%u)", w, h);
+    return false;
+  }
   // Per-object motion target (32-bit float) for character MVs.
-  EnsureMotionTarget(dev, d, w, h);
-  EnsurePrevDepthTexture(dev, d, w, h);
+  if (!EnsureMotionTarget(dev, d, w, h)) {
+    DlaaDiagSet(d, kDlaaReasonMotionTargetFailed, "motion target %ux%u create failed", w, h);
+    LogThrottled("dlaa-motion-target-fail", reshade::log::level::warning, 1u, 60u,
+                 "[DLAA] deploy blocked: motion target create failed (%ux%u)", w, h);
+    return false;
+  }
+  if (!EnsurePrevDepthTexture(dev, d, w, h)) {
+    DlaaDiagSet(d, kDlaaReasonPrevDepthFailed, "prev-depth texture %ux%u create failed", w, h);
+    LogThrottled("dlaa-prev-depth-fail", reshade::log::level::warning, 1u, 60u,
+                 "[DLAA] deploy blocked: prev-depth texture create failed (%ux%u)", w, h);
+    return false;
+  }
 
   const auto UA = reshade::api::resource_usage::unordered_access;
   const auto SR = reshade::api::resource_usage::shader_resource;
@@ -5341,12 +5632,25 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       && d->captured_color_res.handle && d->captured_rtv0_res.handle
       && d->captured_depth_res.handle;
   if (!dlss_res_ready) {
-    LogThrottled("vel-gate", reshade::log::level::info, 3u, 60u,
-                 "[DLAA] veloc: gate fail (ngx=%d color=%d rtv0=%d depth=%d)",
+    if (senkiseki3::dlss::ngx.init_failed)
+      DlaaDiagSet(d, kDlaaReasonNgxInitFailed, "NGX init failed (see earlier error)");
+    else if (!senkiseki3::dlss::ngx.initialized)
+      DlaaDiagSet(d, kDlaaReasonNgxInitFailed, "NGX not initialized yet");
+    else if (!senkiseki3::dlss::ngx.supported)
+      DlaaDiagSet(d, kDlaaReasonNgxUnsupported, "NGX reports DLAA unsupported");
+    else if (!d->captured_color_res.handle)
+      DlaaDiagSet(d, kDlaaReasonMissingColorSrv, "captured color resource is null");
+    else if (!d->captured_rtv0_res.handle)
+      DlaaDiagSet(d, kDlaaReasonMissingRtv0, "no render-target bind captured RTV0");
+    else
+      DlaaDiagSet(d, kDlaaReasonMissingDepthSrv, "captured depth resource is null");
+    LogThrottled("vel-gate", reshade::log::level::warning, 1u, 60u,
+                 "[DLAA] veloc: gate fail (ngx=%d color=%d rtv0=%d depth=%d) reason=%s",
                  (int)senkiseki3::dlss::ngx.supported,
                  d->captured_color_res.handle ? 1 : 0,
                  d->captured_rtv0_res.handle ? 1 : 0,
-                 d->captured_depth_res.handle ? 1 : 0);
+                 d->captured_depth_res.handle ? 1 : 0,
+                 DlaaReasonName(d->dlaa_diag.reason));
   } else {
     // Read camera matrices from the game's _Globals CBV (depth-projection velocity)
     auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -5420,9 +5724,16 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
           !d->captured_depth_srv.handle || !motion_src.handle ||
           !d->velocity_uav.handle || !d->effect_mask_srv.handle ||
           !d->prev_depth_srv.handle) {
-        if (shader_injection.dlaa_debug_logging > 0.5f)
-          LogThrottled("veloc-skip", reshade::log::level::warning, 3u, 60u,
-                       "[DLAA] veloc: SKIP dispatch (null descriptor)");
+        const char* missing = !d->point_sampler.handle ? "sampler"
+            : !d->captured_scene_cbv.buffer.handle ? "scene-cbv"
+            : !d->captured_depth_srv.handle ? "depth-srv"
+            : !motion_src.handle ? "motion-src"
+            : !d->velocity_uav.handle ? "velocity-uav"
+            : !d->effect_mask_srv.handle ? "effect-mask-srv"
+            : "prev-depth-srv";
+        DlaaDiagSet(d, kDlaaReasonNullDescriptor, "velocity dispatch missing %s", missing);
+        LogThrottled("veloc-skip", reshade::log::level::warning, 1u, 60u,
+                     "[DLAA] veloc: SKIP dispatch (null descriptor: %s)", missing);
         return false;
       }
       if (shader_injection.dlaa_debug_logging > 0.5f) {
@@ -5499,8 +5810,12 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
           // MV debug screen (modes: 1=HSV, 2=Arrows, 3=Magnitude, 4=Reprojection).
           // Fully native path: dispatch writes into the NGX output texture and
           // the display uses the same native SRV binding as the working DLAA path.
-          if (!EnsurePrevColorTexture(dev, d, w, h)) return false;
+          if (!EnsurePrevColorTexture(dev, d, w, h)) {
+            DlaaDiagSet(d, kDlaaReasonEvalFalse, "MV debug prev-color texture create failed");
+            return false;
+          }
           if (!EnsureDebugNative(dev, d)) {
+            DlaaDiagSet(d, kDlaaReasonEvalFalse, "MV debug native setup failed");
             reshade::log::message(reshade::log::level::error,
               "[DLAA] MV debug native setup failed");
             return false;
@@ -5624,6 +5939,16 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
               ? d->live_color_res
               : reinterpret_cast<ID3D11Resource*>(d->captured_color_res.handle);
           src = color_src_res;
+          // Recoverable NGX eval latch: a transient bad eval must not kill DLAA
+          // for the whole session. Retry once the color identity changes.
+          const uint64_t color_identity = (uint64_t)(uintptr_t)color_src_res;
+          if (senkiseki3::dlss::ngx.eval_failed &&
+              (d->dlaa_diag.eval_fail_color_res != color_identity ||
+               d->dlaa_diag.eval_fail_w != w || d->dlaa_diag.eval_fail_h != h)) {
+            senkiseki3::dlss::ngx.eval_failed = false;
+            reshade::log::message(reshade::log::level::info,
+                "[DLAA] NGX eval-failure latch cleared (color identity changed)");
+          }
           dlaa_ok = senkiseki3::dlss::EvaluateDLSS(cl, src, ngx_out, mv, dep,
                        jitter_px_x, jitter_px_y, mv_scale_x, mv_scale_y);
           // The DLSS output texture may have been recreated by the eval (e.g.
@@ -5637,8 +5962,26 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
                 EnsureNgxDumpStaging(dev, d, w, h)) {
               LogNgxOutputLuma(cl, d);
             }
+          } else {
+            d->dlaa_diag.eval_fail++;
+            d->dlaa_diag.eval_fail_color_res = color_identity;
+            d->dlaa_diag.eval_fail_w = w;
+            d->dlaa_diag.eval_fail_h = h;
+            if (senkiseki3::dlss::ngx.eval_failed)
+              DlaaDiagSet(d, kDlaaReasonNgxEvalFailed,
+                          "NGX evaluate failed (latched; clears when color identity changes)");
+            else if (senkiseki3::dlss::ngx.create_failed)
+              DlaaDiagSet(d, kDlaaReasonNgxFeatureFailed, "DLSS feature create failed (latched)");
+            else if (senkiseki3::dlss::ngx.output_texture == nullptr)
+              DlaaDiagSet(d, kDlaaReasonNgxOutputFailed, "NGX output texture create failed");
+            else
+              DlaaDiagSet(d, kDlaaReasonEvalFalse, "EvaluateDLSS returned false");
           }
         }
+      } else {
+        DlaaDiagSet(d, kDlaaReasonEvalFalse,
+                    "eval prerequisites missing (cl=%d src=%d mv=%d dep=%d ngxOut=%d)",
+                    cl ? 1 : 0, src ? 1 : 0, mv ? 1 : 0, dep ? 1 : 0, ngx_out ? 1 : 0);
       }
       // Replace t0 with DLAA output SRV (falcomengine-plus pattern).
       // In MV debug mode the velocity SRV is already bound to t0 above.
@@ -5702,6 +6045,10 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
     }
   }
 
+  if (dlaa_ok) {
+    d->dlaa_diag.eval_ok++;
+    DlaaDiagOk(d);
+  }
   d->frame_index++;
   return dlaa_ok;  // true = DLSS/debug output was bound at t0 on this draw
 }
@@ -6224,6 +6571,14 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off","On"},
         .is_visible = []{ return g_fg_page < 0.5f; },
     },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAStatus", .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .default_value = 0.f, .label = "Status", .section = "Antialiasing",
+        .tooltip = "Live DLAA deployment status: which gate is blocking and which inputs were captured.",
+        .on_draw = [] { return DlaaStatusDraw(); },
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
 };
 
 static void FgUpdateStatus(DeviceData* d) {
@@ -6547,6 +6902,8 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
   if (shader_injection.dlaa_enabled < 1.5f)
     return true;
 
+  if (d) ++d->dlaa_diag.fxaa_entry;
+
   // AA=DLAA: run DLSS (unless the pre-tone-map final_blending draw already ran
   // it this frame), then get the DLAA'd image to the screen. Without the HDR
   // mod that is a native copy into RTV0 with the FXAA draw skipped; with the
@@ -6561,6 +6918,7 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
     // Fallback: no final_blending draw ran DLSS this frame (e.g. a final variant
     // we don't hook) — run DLSS here on the composite as before.
   }
+  if (d) d->dlaa_diag.last_deploy_entry = 2u;
   RunDLAA(cmd_list);
   if (d && d->hdr_detected) return true;
   return !CopyFinalToRtv0(cmd_list, d);
@@ -6577,10 +6935,19 @@ static bool HdrFinalPathActive(reshade::api::command_list* cmd_list) {
   const int mode = (int)shader_injection.dlaa_hdr_inject;
   if (mode == 1) return true;   // Force Pre-ToneMap
   if (mode == 2) return false;  // Force Composite
-  // Auto: active when the HDR mod is loaded.
+  // Auto: active when the HDR mod is loaded. Re-check every call so addon load
+  // order cannot lock the wrong path for the whole session.
   auto* dev = cmd_list ? cmd_list->get_device() : nullptr;
   auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
-  return d && d->hdr_detected;
+  if (!d) return false;
+  const bool detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
+  if (detected != d->hdr_detected) {
+    d->hdr_detected = detected;
+    reshade::log::message(reshade::log::level::info,
+        detected ? "[DLAA] HDR mod detected (late): renodx-senkiseki.addon64"
+                 : "[DLAA] HDR mod unloaded");
+  }
+  return d->hdr_detected;
 }
 
 static bool OnBeforeFinalBlendingDraw(reshade::api::command_list* cmd_list) {
@@ -6589,6 +6956,8 @@ static bool OnBeforeFinalBlendingDraw(reshade::api::command_list* cmd_list) {
   auto* dev = cmd_list->get_device();
   auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (!d) return true;
+  ++d->dlaa_diag.final_entry;
+  d->dlaa_diag.last_deploy_entry = 1u;
   d->dlaa_ran_this_frame = RunDLAA(cmd_list);
   return true;  // never skip — the HDR mod's final_blending must tone-map t0
 }
@@ -7006,6 +7375,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       // OPT 13 / OPT 10-12-14 cache invalidation events.
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipelinePsTrack);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       // OPT 8: alternate VP write paths into tracked _Globals buffers.
       reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionInvalidate);
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourceInvalidate);
@@ -7133,6 +7503,67 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
             auto* pcmd = queue->get_immediate_command_list();
             if (pcmd) MaybeLogMotionFrameBurst(pcmd, d);
           }
+          // ── DLAA deployment diagnostics: edge logs + 1 Hz status ──
+          {
+            auto& diag = d->dlaa_diag;
+            const bool aa_dlaa = shader_injection.dlaa_enabled > 1.5f;
+            if (aa_dlaa && diag.run_calls == 0u) {
+              ++diag.presents_without_entry;
+              DlaaDiagSet(d, kDlaaReasonNoEntry,
+                          "no RunDLAA call (final=%u fxaa=%u) — the FXAA/final_blending on_draw hook is not firing",
+                          diag.final_entry, diag.fxaa_entry);
+              if (diag.presents_without_entry == 60u) {
+                reshade::log::message(reshade::log::level::warning,
+                    "[DLAA] deploy blocked: no entry point for 60 frames — check for "
+                    "utils::shader 'Pipeline not found' warnings / an unlisted final pass");
+              }
+            } else {
+              diag.presents_without_entry = 0u;
+            }
+            const bool edge_allowed = diag.last_reason_log_time.time_since_epoch().count() == 0 ||
+                                      now - diag.last_reason_log_time >= std::chrono::seconds(1);
+            const bool deploy_now = diag.eval_ok > 0u;
+            if (deploy_now != diag.deploy_active) {
+              diag.deploy_active = deploy_now;
+              if (edge_allowed) {
+                diag.last_reason_log_time = now;
+                if (deploy_now) {
+                  char edge[128];
+                  snprintf(edge, sizeof(edge), "[DLAA] deploy ON (entry=%s)",
+                           diag.last_deploy_entry == 1u ? "final" :
+                           diag.last_deploy_entry == 2u ? "fxaa" : "?");
+                  reshade::log::message(reshade::log::level::info, edge);
+                } else {
+                  char edge[256];
+                  snprintf(edge, sizeof(edge), "[DLAA] deploy OFF reason=%s detail=%s",
+                           DlaaReasonName(diag.reason), diag.detail);
+                  reshade::log::message(reshade::log::level::warning, edge);
+                }
+              }
+            } else if (diag.reason != diag.last_logged_reason && diag.reason != kDlaaReasonOk &&
+                       edge_allowed) {
+              diag.last_reason_log_time = now;
+              char edge[256];
+              snprintf(edge, sizeof(edge), "[DLAA] deploy blocked: reason=%s detail=%s",
+                       DlaaReasonName(diag.reason), diag.detail);
+              reshade::log::message(reshade::log::level::warning, edge);
+            }
+            diag.last_logged_reason = diag.reason;
+            if (shader_injection.dlaa_debug_logging > 0.5f &&
+                (diag.last_log_time.time_since_epoch().count() == 0 ||
+                 now - diag.last_log_time >= std::chrono::seconds(1))) {
+              diag.last_log_time = now;
+              DlaaDeployStatusLog(dev, d);
+            }
+            // Keep last-present copies for the ImGui row, then reset.
+            diag.final_entry_last = diag.final_entry;
+            diag.fxaa_entry_last = diag.fxaa_entry;
+            diag.run_calls_last = diag.run_calls;
+            diag.eval_ok_last = diag.eval_ok;
+            diag.eval_fail_last = diag.eval_fail;
+            diag.final_entry = 0u; diag.fxaa_entry = 0u; diag.run_calls = 0u;
+            diag.eval_ok = 0u; diag.eval_fail = 0u;
+          }
         }
         if (shader_injection.dlaa_enabled < 1.5f) return;  // NGX only in DLAA mode (2)
         CpuProfileLogFrame();  // CPU profile: per-site ms breakdown every 120 DLAA frames
@@ -7178,6 +7609,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_device>([](reshade::api::device* dev) {
         if (!dev || dev->get_api() != reshade::api::device_api::d3d11) return;
         auto* d = dev->create_private_data<DeviceData>();
+        g_dlaa_diag_device = d;
         // HDR-mod detection selects the pre-tone-map injection path in Auto mode.
         d->hdr_detected = GetModuleHandleA("renodx-senkiseki.addon64") != nullptr;
         reshade::log::message(reshade::log::level::info,
@@ -7192,6 +7624,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::register_event<reshade::addon_event::destroy_device>([](reshade::api::device* dev) {
         auto* d = dev->get_private_data<DeviceData>();
         if (d) {
+          if (g_dlaa_diag_device == d) g_dlaa_diag_device = nullptr;
           if (senkiseki3::fg::g_hook_fg == &d->fg) senkiseki3::fg::g_hook_fg = nullptr;
           senkiseki3::fg::FgProxyRelease(&d->fg);
           Destroy(dev, d);
@@ -7207,6 +7640,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipelinePsTrack);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionInvalidate);
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourceInvalidate);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
