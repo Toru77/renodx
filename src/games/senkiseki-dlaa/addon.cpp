@@ -270,8 +270,122 @@ static float g_opt_shared_state = 0.f;        // OPT 5: query GetCurrentState ON
 static float g_opt_desc_cache = 0.f;          // OPT 6: OnPushDescriptorsCapture caches view handles already classified
                                               // as "not a depth resource" so repeated t0/t1 pushes skip the
                                               // get_resource_from_view + get_resource_desc lookups.
-static float g_opt_rec_map = 0.f;             // OPT 7: FindGlobalsRec uses an index map (handle -> rec) instead of a
+static float g_opt_rec_map = 0.f;            // OPT 7: FindGlobalsRec uses an index map (handle -> rec) instead of a
                                               // linear scan over up to 128 _Globals buffer records per lookup.
+
+// ── CPU optimizations round 2 (DLAA-mode only, all behavior-preserving
+// unless noted). Each is independently toggleable. ──
+static float g_opt_jitter_write_skip = 1.f;  // OPT 8: skip the draw-time 64-byte _Globals jitter
+                                             // update_buffer_region when the buffer has not been
+                                             // re-uploaded since our last write this frame. upload_seq
+                                             // is bumped by every captured _Globals upload and by a
+                                             // Map/Unmap of a tracked buffer, so a re-upload always
+                                             // invalidates the skip; the bytes skipped are byte-identical.
+static float g_opt_readback_skip = 1.f;      // OPT 9: skip the _Globals staging copy + synchronous Map
+                                             // readback in ReadSceneMatrices when the upload-time VP was
+                                             // captured — that capture already overrides the readback
+                                             // value, so the staged branch is discarded work.
+static float g_opt_color_cache = 1.f;        // OPT 10: cache view -> resource for the t0 color capture in
+                                             // OnPushDescriptorsCapture (a view maps to one immutable
+                                             // resource; entries are erased on destroy_resource_view).
+static float g_opt_scene_vs_set = 1.f;       // OPT 11: IsSceneGeometryVs uses a hash set instead of the
+                                             // 51-entry linear scan (runs per VS b0 CBV push).
+static float g_opt_rt_cache = 1.f;           // OPT 12: OnBindRenderTargets only resolves RTV0's resource
+                                             // when the view handle changes (invalidated on view destroy).
+static float g_opt_ps_twin_track = 0.f;      // OPT 13 (A/B, default OFF): track whether the game rebound
+                                             // its PS since our Phase E twin swap (bind_pipeline event), so
+                                             // Ensure/RestorePhaseEPixelShader skip PSGetShader in steady
+                                             // state. Falls back to the proven query path on any doubt.
+static float g_opt_motion_rtv_cache = 1.f;   // OPT 14: MaybeAppendMotionRtvStrict caches the live three-RTV
+                                             // G-buffer compatibility verdict (RTV descriptors are immutable)
+                                             // instead of re-querying descs/resources every character draw.
+
+// ── CPU profiler (DLAACpuProfile, default off, DLAA mode only) ──
+// Per-site QueryPerformanceCounter accumulators. The scoped timer costs two
+// predictable branches when the toggle is off. Present logs a per-frame ms
+// breakdown every 120 frames.
+static float g_cpu_profile = 0.f;
+enum CpuProfileSite : uint32_t {
+  kCpuDrawHook = 0u,
+  kCpuRestoreBinds,
+  kCpuWriteGlobalsVp,
+  kCpuBindPatchedVs,
+  kCpuBindRigidVs,
+  kCpuMotionRtv,
+  kCpuPushDescriptors,
+  kCpuBindRenderTargets,
+  kCpuUpdateBufferRegion,
+  kCpuRunDlaa,
+  kCpuPresent,
+  kCpuSiteCount,
+};
+static const char* const kCpuProfileNames[kCpuSiteCount] = {
+    "draw", "restore", "vp-write", "bind-vs", "bind-rigid", "motion-rtv",
+    "push-desc", "bind-rt", "buf-update", "run-dlaa", "present"};
+struct CpuProfileState {
+  std::atomic<uint64_t> ticks[kCpuSiteCount] = {};
+  std::atomic<uint32_t> calls[kCpuSiteCount] = {};
+  uint32_t frames = 0u;
+};
+static CpuProfileState g_cpu_profile_state;
+
+static inline bool CpuProfileActive() {
+  return g_cpu_profile > 0.5f && shader_injection.dlaa_enabled > 1.5f;
+}
+static inline uint64_t CpuNow() {
+  LARGE_INTEGER v;
+  QueryPerformanceCounter(&v);
+  return static_cast<uint64_t>(v.QuadPart);
+}
+static inline uint64_t CpuFrequency() {
+  static const uint64_t freq = [] {
+    LARGE_INTEGER v;
+    QueryPerformanceFrequency(&v);
+    return static_cast<uint64_t>(v.QuadPart);
+  }();
+  return freq;
+}
+struct ScopedCpuTimer {
+  uint64_t start;
+  CpuProfileSite site;
+  explicit ScopedCpuTimer(CpuProfileSite s) : site(s) {
+    start = CpuProfileActive() ? CpuNow() : 0u;
+  }
+  ~ScopedCpuTimer() {
+    if (start == 0u) return;
+    g_cpu_profile_state.ticks[site].fetch_add(CpuNow() - start, std::memory_order_relaxed);
+    g_cpu_profile_state.calls[site].fetch_add(1u, std::memory_order_relaxed);
+  }
+};
+static void CpuProfileLogFrame() {
+  if (!CpuProfileActive()) {
+    // Reset so a later enable starts clean.
+    for (uint32_t i = 0u; i < kCpuSiteCount; ++i) {
+      g_cpu_profile_state.ticks[i].store(0u, std::memory_order_relaxed);
+      g_cpu_profile_state.calls[i].store(0u, std::memory_order_relaxed);
+    }
+    g_cpu_profile_state.frames = 0u;
+    return;
+  }
+  ++g_cpu_profile_state.frames;
+  if (g_cpu_profile_state.frames < 120u) return;
+  const double freq = (double)CpuFrequency();
+  const double frames = (double)g_cpu_profile_state.frames;
+  char buf[640];
+  int pos = snprintf(buf, sizeof(buf), "[DLAA] cpu/%.0ff", frames);
+  for (uint32_t i = 0u; i < kCpuSiteCount && pos > 0 && pos < (int)sizeof(buf); ++i) {
+    const double ms = (double)g_cpu_profile_state.ticks[i].load(std::memory_order_relaxed) * 1000.0 / (freq * frames);
+    const uint32_t calls = g_cpu_profile_state.calls[i].load(std::memory_order_relaxed);
+    pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, " %s=%.3fms/%uc", kCpuProfileNames[i], ms,
+                    (unsigned)(calls / (uint32_t)frames));
+  }
+  reshade::log::message(reshade::log::level::info, buf);
+  for (uint32_t i = 0u; i < kCpuSiteCount; ++i) {
+    g_cpu_profile_state.ticks[i].store(0u, std::memory_order_relaxed);
+    g_cpu_profile_state.calls[i].store(0u, std::memory_order_relaxed);
+  }
+  g_cpu_profile_state.frames = 0u;
+}
 
 // ── Descriptor table helpers ──
 // Sized for the velocity compute layout: 8 descriptor tables (s0, b13, t0,
@@ -382,6 +496,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // True only while Phase E has appended motion_rtv at OM slot 3. The next
   // unrelated draw restores the game's exact three-RT set before it runs.
   bool motion_rtv_appended = false;
+  // OPT 14: last validated/rejected live three-RTV G-buffer set and the motion
+  // target it was checked against. RTV descriptors are immutable, so the
+  // verdict can be reused until the set or the target changes; entries are
+  // invalidated when one of the cached views is destroyed.
+  ID3D11RenderTargetView* motion_compat_rtvs[3] = {};
+  ID3D11RenderTargetView* motion_compat_target = nullptr;
+  bool motion_compat_result = false;
+  bool motion_compat_valid = false;
 
   // ── Generic DXBC patcher (Phase B): per-object MVs WITHOUT per-shader HLSL ──
   // On create_pipeline we run PatchSkinnedVertexShader on any skinned VS that
@@ -436,6 +558,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11PixelShader* phasee_active_original_ps = nullptr;
   ID3D11PixelShader* phasee_active_patched_ps = nullptr;
   uint32_t phasee_active_ps_hash = 0u;
+  // OPT 13 (A/B): true while we believe our last PSSetShader(patched) is still
+  // the bound PS (no game pixel-pipeline bind observed since). Lets Ensure/
+  // RestorePhaseEPixelShader skip PSGetShader in steady state.
+  bool phasee_twin_binding_intact = false;
   // Legacy trace set. Phase E no longer means "patched at creation".
   std::unordered_set<uint32_t> patched_ps_hashes;
   // Dynamic 64-byte native cbuffer holding prev_view_proj (the unjittered
@@ -575,6 +701,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // OPT 6: view handles already classified as NOT depth-format (skips repeated
   // get_resource_from_view/get_resource_desc on the same texture at t0/t1).
   std::unordered_set<uint64_t> non_depth_views;
+  // OPT 10/12: view handle -> resource handle cache for the t0 color capture and
+  // the per-bind RTV0 capture. Views map to one immutable resource; entries are
+  // erased on destroy_resource_view so handle reuse cannot go stale.
+  std::unordered_map<uint64_t, uint64_t> view_resource_cache;
+  uint64_t captured_rtv0_view = 0u;  // OPT 12: view the current captured_rtv0_res was resolved from
   uint32_t depth_source_hash = 0u;  // PS hash that last pushed the captured depth (source identity)
   bool depth_primary_captured = false;  // a perspective (non-linear) depth was captured this frame
   // ── Frame-pairing diagnostic ──
@@ -606,6 +737,10 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   float jitter_x = 0.f, jitter_y = 0.f;             // RENDER jitter (what the source patch applies)
   float report_jitter_x = 0.f, report_jitter_y = 0.f;  // REPORT jitter (what NGX is told; = render unless decoupled)
   float prev_jitter_x = 0.f, prev_jitter_y = 0.f;  // previous frame's jitter (for MV jitter-delta baking)
+  // OPT 8: monotonic per-presented-frame jitter identity. frame_index advances
+  // inside RunDLAA (and never in AA=Off/FXAA), so it cannot identify "this
+  // frame's jitter"; this epoch is bumped once per present by UpdateJitter.
+  uint32_t jitter_epoch = 0u;
   // Global jitter (Jitter Method = Global): unjittered ViewProjection captured
   // from the game's b0 _Globals upload, plus the last VP write state so the
   // per-draw bind-time write only happens when the jitter state actually flips.
@@ -620,6 +755,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
     std::array<float, 16> unjittered_vp = {};
     bool depth_only = false;  // character depth/shadow pass buffer: keep VP UNJITTERED
     uint64_t buffer_size = 0u;  // OPT 4/7: buffer byte size cached at upload time (skips get_resource_desc per draw)
+    uint64_t upload_seq = 0u;  // bumped on every captured _Globals upload (and Map/Unmap invalidation)
+    // OPT 8: upload_seq / jitter epoch / jitter state at our last draw-time
+    // jitter write. A repeat write in the same jitter epoch with the same seq +
+    // jitter state is a no-op.
+    uint64_t jitter_write_seq = ~0ull;
+    uint32_t jitter_write_epoch = 0u;
+    bool jitter_write_jittered = false;
   };
   std::vector<GlobalsBufferRec> globals_recs;
   // OPT 7: handle -> index into globals_recs (always maintained on push_back;
@@ -795,6 +937,9 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   }
   d->phasee_ps_candidates.clear();
   d->last_rtv_count = 0; d->last_dsv = {};
+  d->view_resource_cache.clear();
+  d->captured_rtv0_view = 0u;
+  d->phasee_twin_binding_intact = false;
   d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
   dv(d->captured_depth_srv); dv(d->captured_color_srv);
   d->captured_depth_res = {}; d->captured_color_res = {};
@@ -1537,16 +1682,23 @@ static void RestorePhaseEPixelShader(reshade::api::command_list* cmd_list, Devic
   if (!cmd_list || !d || !d->phasee_active_original_ps) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return;
-  ID3D11PixelShader* current = nullptr;
-  UINT class_count = 0u;
-  ctx->PSGetShader(&current, nullptr, &class_count);
-  if (current == d->phasee_active_patched_ps && class_count == 0u)
+  if (g_opt_ps_twin_track >= 0.5f && d->phasee_twin_binding_intact) {
+    // OPT 13: no game pixel-pipeline bind was observed since our swap, so our
+    // twin is still bound — put the original back directly (no PSGetShader).
     ctx->PSSetShader(d->phasee_active_original_ps, nullptr, 0u);
-  if (current) current->Release();
+  } else {
+    ID3D11PixelShader* current = nullptr;
+    UINT class_count = 0u;
+    ctx->PSGetShader(&current, nullptr, &class_count);
+    if (current == d->phasee_active_patched_ps && class_count == 0u)
+      ctx->PSSetShader(d->phasee_active_original_ps, nullptr, 0u);
+    if (current) current->Release();
+  }
   d->phasee_active_original_ps->Release();
   d->phasee_active_original_ps = nullptr;
   d->phasee_active_patched_ps = nullptr;
   d->phasee_active_ps_hash = 0u;
+  d->phasee_twin_binding_intact = false;
 }
 
 // Build and bind a native PS twin only at a draw that has already proven the
@@ -1563,13 +1715,21 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
   if (!ctx || !native_dev) return false;
 
   if (d->phasee_active_original_ps) {
-    ID3D11PixelShader* current = nullptr;
-    UINT class_count = 0u;
-    ctx->PSGetShader(&current, nullptr, &class_count);
-    const bool already_active = current == d->phasee_active_patched_ps &&
-                                class_count == 0u &&
-                                d->phasee_active_ps_hash == original_hash;
-    if (current) current->Release();
+    bool already_active;
+    if (g_opt_ps_twin_track >= 0.5f) {
+      // OPT 13: our twin is still bound unless a game pixel-pipeline bind was
+      // observed since the swap; the hash then names the same original twin.
+      already_active = d->phasee_twin_binding_intact &&
+                       d->phasee_active_ps_hash == original_hash;
+    } else {
+      ID3D11PixelShader* current = nullptr;
+      UINT class_count = 0u;
+      ctx->PSGetShader(&current, nullptr, &class_count);
+      already_active = current == d->phasee_active_patched_ps &&
+                       class_count == 0u &&
+                       d->phasee_active_ps_hash == original_hash;
+      if (current) current->Release();
+    }
     if (already_active) return true;
     RestorePhaseEPixelShader(cmd_list, d);
   }
@@ -1620,6 +1780,7 @@ static bool EnsureLazyPhaseEPixelShader(reshade::api::command_list* cmd_list,
   d->phasee_active_original_ps = original;  // retains PSGetShader's AddRef
   d->phasee_active_patched_ps = info.native_patched;
   d->phasee_active_ps_hash = original_hash;
+  d->phasee_twin_binding_intact = true;
   return true;
 }
 
@@ -1636,6 +1797,7 @@ static bool DiagCtxActive(DeviceData* d) {
 }
 static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
+  ScopedCpuTimer cpu_site(kCpuMotionRtv);
   const uint32_t vh = CurrentVsHash(cmd_list, d);
   const uint32_t ph = CurrentPsHash(cmd_list, d);
   const auto vit = d->patched_vs_by_hash.find(vh);
@@ -1692,31 +1854,49 @@ static void MaybeAppendMotionRtvStrict(reshade::api::command_list* cmd_list, Dev
     return;
   }
 
-  D3D11_TEXTURE2D_DESC motion_desc = {};
-  motion_tex->GetDesc(&motion_desc);
-  bool compatible = motion_desc.Width != 0u && motion_desc.SampleDesc.Count == 1u;
-  for (uint32_t i = 0u; compatible && i < 3u; ++i) {
-    D3D11_RENDER_TARGET_VIEW_DESC view_desc = {};
-    rtvs[i]->GetDesc(&view_desc);
-    if (view_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || view_desc.Texture2D.MipSlice != 0u) {
-      compatible = false;
-      break;
+  bool compatible;
+  if (g_opt_motion_rtv_cache >= 0.5f && d->motion_compat_valid &&
+      d->motion_compat_target == motion_rtv &&
+      d->motion_compat_rtvs[0] == rtvs[0] && d->motion_compat_rtvs[1] == rtvs[1] &&
+      d->motion_compat_rtvs[2] == rtvs[2]) {
+    // OPT 14: this exact live three-RTV set was already validated against this
+    // motion target; RTV descriptors are immutable, so reuse the verdict.
+    compatible = d->motion_compat_result;
+  } else {
+    D3D11_TEXTURE2D_DESC motion_desc = {};
+    motion_tex->GetDesc(&motion_desc);
+    compatible = motion_desc.Width != 0u && motion_desc.SampleDesc.Count == 1u;
+    for (uint32_t i = 0u; compatible && i < 3u; ++i) {
+      D3D11_RENDER_TARGET_VIEW_DESC view_desc = {};
+      rtvs[i]->GetDesc(&view_desc);
+      if (view_desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || view_desc.Texture2D.MipSlice != 0u) {
+        compatible = false;
+        break;
+      }
+      ID3D11Resource* resource = nullptr;
+      rtvs[i]->GetResource(&resource);
+      D3D11_RESOURCE_DIMENSION type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      D3D11_TEXTURE2D_DESC target_desc = {};
+      if (resource) {
+        resource->GetType(&type);
+        if (type == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+          static_cast<ID3D11Texture2D*>(resource)->GetDesc(&target_desc);
+        resource->Release();
+      }
+      if (type != D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
+          target_desc.Width != motion_desc.Width || target_desc.Height != motion_desc.Height ||
+          target_desc.SampleDesc.Count != motion_desc.SampleDesc.Count ||
+          target_desc.SampleDesc.Quality != motion_desc.SampleDesc.Quality)
+        compatible = false;
     }
-    ID3D11Resource* resource = nullptr;
-    rtvs[i]->GetResource(&resource);
-    D3D11_RESOURCE_DIMENSION type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-    D3D11_TEXTURE2D_DESC target_desc = {};
-    if (resource) {
-      resource->GetType(&type);
-      if (type == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        static_cast<ID3D11Texture2D*>(resource)->GetDesc(&target_desc);
-      resource->Release();
+    if (g_opt_motion_rtv_cache >= 0.5f) {
+      d->motion_compat_rtvs[0] = rtvs[0];
+      d->motion_compat_rtvs[1] = rtvs[1];
+      d->motion_compat_rtvs[2] = rtvs[2];
+      d->motion_compat_target = motion_rtv;
+      d->motion_compat_result = compatible;
+      d->motion_compat_valid = true;
     }
-    if (type != D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
-        target_desc.Width != motion_desc.Width || target_desc.Height != motion_desc.Height ||
-        target_desc.SampleDesc.Count != motion_desc.SampleDesc.Count ||
-        target_desc.SampleDesc.Quality != motion_desc.SampleDesc.Quality)
-      compatible = false;
   }
   if (!compatible) {
     release_om();
@@ -2933,6 +3113,7 @@ static void FlushCrashRing(DeviceData* d) {
 // BEFORE MaybeBindPatchedVs in the draw hook.
 static void MaybeRestorePatchedBinds(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!d || !d->patched_bind_restore_pending) return;
+  ScopedCpuTimer cpu_site(kCpuRestoreBinds);
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
   if (!ctx) return;
   ID3D11Buffer* rb_b = nullptr;
@@ -2998,6 +3179,7 @@ static void MaybeBindPatchedVs(reshade::api::command_list* cmd_list, DeviceData*
   auto it = d->patched_vs_by_hash.find(vh);
   if (it == d->patched_vs_by_hash.end()) return;
   if (it->second.is_rigid) return;  // rigid (weapon) VSs are handled by MaybeBindPatchedRigidVs
+  ScopedCpuTimer cpu_site(kCpuBindPatchedVs);
   // Ensure the prevVP cbuffer exists BEFORE binding (frame 0's first draw
   // happens before the first present, which was the old lazy-creation point).
   if (!d->prev_vp_cb) EnsurePrevVpCb(cmd_list->get_device(), d);
@@ -3675,6 +3857,7 @@ static void MaybeBindPatchedRigidVs(reshade::api::command_list* cmd_list, Device
   uint32_t vh = CurrentVsHash(cmd_list, d);
   auto it = d->patched_vs_by_hash.find(vh);
   if (it == d->patched_vs_by_hash.end() || !it->second.is_rigid) return;
+  ScopedCpuTimer cpu_site(kCpuBindRigidVs);
   if (!d->prev_vp_cb) EnsurePrevVpCb(cmd_list->get_device(), d);
   if (!EnsurePrevWorldCb(cmd_list->get_device(), d)) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -3865,6 +4048,7 @@ static bool IsDepthWriteDraw(reshade::api::command_list* cmd_list, DeviceData* d
 static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
   if (shader_injection.dlaa_jitter_enabled < 0.5f) return;
+  ScopedCpuTimer cpu_site(kCpuWriteGlobalsVp);
   if (!d->globals_vp_captured || !d->last_b0_buffer.handle) {
     if (shader_injection.dlaa_debug_logging > 0.5f) {
       LogThrottled("draw-skip-cap", reshade::log::level::info, 5u, 250u,
@@ -3930,6 +4114,22 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
   // un-jitter / depth_only G-buffer jitter), else the global captured VP
   // (jittered for untracked scene fallback, unjittered for untracked effect
   // fallback).
+  // OPT 8: the write below is deterministic in (buffer content, frame jitter).
+  // If this tracked buffer has not been re-uploaded since our last write in the
+  // SAME jitter epoch, the exact 64 bytes are already in place — skip the driver
+  // update. upload_seq is bumped by every captured _Globals upload (and by
+  // Map/Unmap or Copy* into a tracked buffer), so any re-upload invalidates it.
+  if (g_opt_jitter_write_skip >= 0.5f && rec &&
+      rec->jitter_write_epoch == d->jitter_epoch &&
+      rec->jitter_write_seq == rec->upload_seq &&
+      rec->jitter_write_jittered == want_jittered) {
+    if (shader_injection.dlaa_debug_logging > 0.5f) {
+      LogThrottled("vp-write-skip", reshade::log::level::info, 5u, 250u,
+                   "[DLAA] global: draw VP write SKIPPED (unchanged) buffer=0x%llX jittered=%d",
+                   (unsigned long long)d->last_b0_buffer.handle, (int)want_jittered);
+    }
+    return;
+  }
   std::array<float, 16> vp = rec ? rec->unjittered_vp : d->globals_unjittered_vp;
   if (want_jittered) {
     for (int i = 0; i < 4; ++i) {
@@ -3938,6 +4138,11 @@ static void MaybeWriteGlobalsVp(reshade::api::command_list* cmd_list, DeviceData
     }
   }
   dev->update_buffer_region(vp.data(), d->last_b0_buffer, 160ull, 64ull);
+  if (rec) {
+    rec->jitter_write_seq = rec->upload_seq;
+    rec->jitter_write_epoch = d->jitter_epoch;
+    rec->jitter_write_jittered = want_jittered;
+  }
   if (shader_injection.dlaa_debug_logging > 0.5f) {
     LogThrottled("vp-write", reshade::log::level::info, 5u, 250u,
                  "[DLAA] global: draw VP write buffer=0x%llX size=%llu jittered=%d depth_only=%d ps=0x%08X",
@@ -4027,6 +4232,7 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
+    ScopedCpuTimer cpu_site(kCpuDrawHook);
     // OPT 5: query the current pipeline state ONCE per draw and share the VS/PS
     // hashes with all per-draw helpers (the hook never changes pipeline state,
     // so every helper sees the same hashes).
@@ -4057,6 +4263,7 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (d) {
+    ScopedCpuTimer cpu_site(kCpuDrawHook);
     // OPT 5: query the current pipeline state ONCE per draw and share the VS/PS
     // hashes with all per-draw helpers (the hook never changes pipeline state,
     // so every helper sees the same hashes).
@@ -4083,6 +4290,43 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
   return false;
 }
 
+// ── OPT 13 event: any game pixel-pipeline bind invalidates the Phase E twin
+// binding assumption. Our own native PSSetShader calls do not fire this event,
+// so the flag stays true only while the game has not rebound its PS.
+static void OnBindPipelinePsTrack(reshade::api::command_list* cmd_list,
+                                  reshade::api::pipeline_stage stages, reshade::api::pipeline) {
+  if (g_opt_ps_twin_track < 0.5f) return;
+  if (!cmd_list) return;
+  auto* dev = cmd_list->get_device();
+  if (!dev) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d || !d->phasee_twin_binding_intact) return;
+  if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::pipeline_stage::pixel_shader)) == 0u) return;
+  d->phasee_twin_binding_intact = false;
+}
+
+// ── OPT 10/12/14: drop cached view-derived state when a view is destroyed so
+// handle reuse cannot resurrect a stale resource mapping or RT verdict. ──
+static void OnDestroyResourceView(reshade::api::device* dev, reshade::api::resource_view view) {
+  if (!dev || !view.handle) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d) return;
+  d->view_resource_cache.erase(view.handle);
+  d->non_depth_views.erase(view.handle);
+  if (d->captured_rtv0_view == view.handle) {
+    d->captured_rtv0_view = 0u;
+    d->captured_rtv0_res = {};
+  }
+  if (d->motion_compat_valid) {
+    for (auto* rtv : d->motion_compat_rtvs) {
+      if (reinterpret_cast<uint64_t>(rtv) == view.handle) {
+        d->motion_compat_valid = false;
+        break;
+      }
+    }
+  }
+}
+
 // ── Event: capture RTV0 (FXAA output target) ──
 static void OnBindRenderTargets(
     reshade::api::command_list* cmd_list, uint32_t count,
@@ -4092,7 +4336,22 @@ static void OnBindRenderTargets(
   if (!dev) return;
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
-  d->captured_rtv0_res = dev->get_resource_from_view(rtvs[0]);
+  ScopedCpuTimer cpu_site(kCpuBindRenderTargets);
+  // OPT 12: resolve RTV0's resource only on a view change. Views map to one
+  // immutable resource; destroy_resource_view clears the cached mapping.
+  if (g_opt_rt_cache >= 0.5f && d->captured_rtv0_view == rtvs[0].handle) {
+    // Same view as the last bind — captured_rtv0_res is already current.
+  } else {
+    auto cached = d->view_resource_cache.find(rtvs[0].handle);
+    if (cached != d->view_resource_cache.end()) {
+      d->captured_rtv0_res.handle = cached->second;
+    } else {
+      d->captured_rtv0_res = dev->get_resource_from_view(rtvs[0]);
+      if (d->captured_rtv0_res.handle)
+        d->view_resource_cache[rtvs[0].handle] = d->captured_rtv0_res.handle;
+    }
+    d->captured_rtv0_view = rtvs[0].handle;
+  }
   // Track the bound RT set for the effect-mask re-bind (skip our own echo).
   bool has_mask = false;
   bool has_motion = false;
@@ -4216,61 +4475,66 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
   auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
   if (!cb) return false;
 
-  // Clamp the read window (must cover c10..c21 = 352 bytes).
-  uint64_t range_size = d->captured_scene_cbv.size;
-  if (range_size < 352ull) range_size = 352ull;
-  if (range_size > 65536ull) range_size = 65536ull;
-  auto bdesc = dev->get_resource_desc(d->captured_scene_cbv.buffer);
-  if (bdesc.buffer.size > 0) {
-    const uint64_t offset = d->captured_scene_cbv.offset;
-    const uint64_t max_read = (offset < bdesc.buffer.size) ? (bdesc.buffer.size - offset) : 0u;
-    if (range_size > max_read) range_size = max_read;
-  }
-  if (range_size < 352ull) return false;  // can't reach the matrices
-  const uint32_t need = static_cast<uint32_t>(range_size);
-
-  if (!d->scene_cbv_staging || d->scene_cbv_staging_size < need) {
-    if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
-    D3D11_BUFFER_DESC bd = {};
-    bd.ByteWidth = need;
-    bd.Usage = D3D11_USAGE_STAGING;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
-    if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) return false;
-    d->scene_cbv_staging_size = need;
-  }
-
-  if (!d->scene_cbv_copy_issued) {
-    // Fallback: no early copy was queued this frame (e.g. DLAA toggled on
-    // mid-frame). This path stalls the pipeline; the early copy in
-    // OnPushDescriptorsCapture is the normal path.
-    D3D11_BOX box = {};
-    box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
-    box.right = box.left + need;
-    box.bottom = 1;
-    box.back = 1;
-    ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
-  }
-  d->scene_cbv_copy_issued = false;  // consumed this frame
-
-  D3D11_MAPPED_SUBRESOURCE mapped = {};
-  if (FAILED(ctx->Map(d->scene_cbv_staging, 0, D3D11_MAP_READ, 0, &mapped))) return false;
-  const float* data = static_cast<const float*>(mapped.pData);
-  std::array<float, 16> view_proj, view_inv, proj_inv;
-  memcpy(view_proj.data(), data + 160 / 4, 64);  // c10 ViewProjection
-  memcpy(view_inv.data(),  data + 224 / 4, 64);  // c14 ViewInverse
-  memcpy(proj_inv.data(),  data + 288 / 4, 64);  // c18 ProjectionInverse
-  ctx->Unmap(d->scene_cbv_staging, 0);
-
-  // Global jitter method: the staged copy captured the JITTERED VP (we patch
-  // b0 at bind time). Prefer the exact unjittered VP captured from the game's
-  // upload so the velocity reprojection stays jitter-free.
-  if (d->globals_vp_captured) {
+  std::array<float, 16> view_proj = {};
+  if (g_opt_readback_skip >= 0.5f && d->globals_vp_captured) {
+    // OPT 9: the upload-time capture already holds the exact unjittered VP that
+    // the staged readback below would be overridden with, so the staging copy +
+    // synchronous Map are discarded work. The staging path remains the fallback.
     view_proj = d->globals_unjittered_vp;
   } else {
-    for (int i = 0; i < 4; ++i) {
-      view_proj[i] -= d->jitter_x * view_proj[12 + i];
-      view_proj[4 + i] -= d->jitter_y * view_proj[12 + i];
+    // Clamp the read window (must cover c10..c21 = 352 bytes).
+    uint64_t range_size = d->captured_scene_cbv.size;
+    if (range_size < 352ull) range_size = 352ull;
+    if (range_size > 65536ull) range_size = 65536ull;
+    auto bdesc = dev->get_resource_desc(d->captured_scene_cbv.buffer);
+    if (bdesc.buffer.size > 0) {
+      const uint64_t offset = d->captured_scene_cbv.offset;
+      const uint64_t max_read = (offset < bdesc.buffer.size) ? (bdesc.buffer.size - offset) : 0u;
+      if (range_size > max_read) range_size = max_read;
+    }
+    if (range_size < 352ull) return false;  // can't reach the matrices
+    const uint32_t need = static_cast<uint32_t>(range_size);
+
+    if (!d->scene_cbv_staging || d->scene_cbv_staging_size < need) {
+      if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
+      D3D11_BUFFER_DESC bd = {};
+      bd.ByteWidth = need;
+      bd.Usage = D3D11_USAGE_STAGING;
+      bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
+      if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) return false;
+      d->scene_cbv_staging_size = need;
+    }
+
+    if (!d->scene_cbv_copy_issued) {
+      // Fallback: no early copy was queued this frame (e.g. DLAA toggled on
+      // mid-frame). This path stalls the pipeline; the early copy in
+      // OnPushDescriptorsCapture is the normal path.
+      D3D11_BOX box = {};
+      box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
+      box.right = box.left + need;
+      box.bottom = 1;
+      box.back = 1;
+      ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
+    }
+    d->scene_cbv_copy_issued = false;  // consumed this frame
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(d->scene_cbv_staging, 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    const float* data = static_cast<const float*>(mapped.pData);
+    memcpy(view_proj.data(), data + 160 / 4, 64);  // c10 ViewProjection
+    ctx->Unmap(d->scene_cbv_staging, 0);
+
+    // Global jitter method: the staged copy captured the JITTERED VP (we patch
+    // b0 at bind time). Prefer the exact unjittered VP captured from the game's
+    // upload; only recover it from the staged copy when no upload was captured.
+    if (d->globals_vp_captured) {
+      view_proj = d->globals_unjittered_vp;
+    } else {
+      for (int i = 0; i < 4; ++i) {
+        view_proj[i] -= d->jitter_x * view_proj[12 + i];
+        view_proj[4 + i] -= d->jitter_y * view_proj[12 + i];
+      }
     }
   }
 
@@ -4367,6 +4631,12 @@ static const std::array<uint32_t, 51> SCENE_GEOMETRY_VS_HASHES = {
 };
 
 static bool IsSceneGeometryVs(uint32_t hash) {
+  if (g_opt_scene_vs_set >= 0.5f) {
+    // OPT 11: this runs per VS b0 CBV push; the set replaces the 51-entry scan.
+    static const std::unordered_set<uint32_t> scene_geometry_vs(
+        SCENE_GEOMETRY_VS_HASHES.begin(), SCENE_GEOMETRY_VS_HASHES.end());
+    return scene_geometry_vs.find(hash) != scene_geometry_vs.end();
+  }
   for (uint32_t h : SCENE_GEOMETRY_VS_HASHES) {
     if (h == hash) return true;
   }
@@ -4532,6 +4802,7 @@ static void OnPushDescriptorsCapture(
   if (!dev) return;
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
+  ScopedCpuTimer cpu_site(kCpuPushDescriptors);
 
   // Phase 0 prev-pose probe: log vertex-stage SRV pushes (bone buffer) under
   // the SEPARATE DLAAPhase0Logging toggle (never the general debug logging).
@@ -4564,7 +4835,20 @@ static void OnPushDescriptorsCapture(
     // t0 (PSGetShaderResources); this event capture is the fallback + feeds the
     // reprojection debug view.
     if (update.binding == 0u && update.count >= 1 && views[0].handle != 0u) {
-      auto res = dev->get_resource_from_view(views[0]);
+      // OPT 10: resolve each view once. A view maps to one immutable resource;
+      // the cache is erased on destroy_resource_view so handle reuse is safe.
+      reshade::api::resource res = {};
+      if (g_opt_color_cache >= 0.5f) {
+        auto cached = d->view_resource_cache.find(views[0].handle);
+        if (cached != d->view_resource_cache.end()) {
+          res.handle = cached->second;
+        } else {
+          res = dev->get_resource_from_view(views[0]);
+          if (res.handle) d->view_resource_cache[views[0].handle] = res.handle;
+        }
+      } else {
+        res = dev->get_resource_from_view(views[0]);
+      }
       bool is_ngx_out = senkiseki3::dlss::ngx.output_texture &&
           res.handle == reinterpret_cast<uintptr_t>(senkiseki3::dlss::ngx.output_texture.Get());
       if (res.handle && !is_ngx_out) {
@@ -4661,7 +4945,10 @@ static void OnPushDescriptorsCapture(
           d->captured_scene_cbv_valid = true;
           // Queue the camera-matrix staging copy EARLY so the Map at FXAA
           // (ReadSceneMatrices) doesn't stall the GPU pipeline mid-frame.
-          if (shader_injection.dlaa_enabled > 1.5f && !d->scene_cbv_copy_issued) {
+          // OPT 9: when the upload-time VP capture is active, ReadSceneMatrices
+          // uses it directly and never reads the staging buffer — skip the copy.
+          if (shader_injection.dlaa_enabled > 1.5f && !d->scene_cbv_copy_issued &&
+              !(g_opt_readback_skip >= 0.5f && d->globals_vp_captured)) {
             d->scene_cbv_copy_issued = IssueSceneCbvCopy(cmd_list, d);
           }
         }
@@ -4709,6 +4996,14 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
   auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
   // Recursion guard: our own re-issued upload below must land unchanged.
   if (d && d->in_own_upload) return false;
+  ScopedCpuTimer cpu_site(kCpuUpdateBufferRegion);
+  // OPT 8: ANY upload to a tracked _Globals buffer invalidates the draw-time
+  // jitter-write skip for it. This also covers partial/offset uploads that the
+  // VP-capture filters below ignore but which can still touch the VP region.
+  if (g_opt_jitter_write_skip >= 0.5f && d && dest.handle) {
+    auto rec_it = d->globals_rec_index.find(dest.handle);
+    if (rec_it != d->globals_rec_index.end()) ++d->globals_recs[rec_it->second].upload_seq;
+  }
   // ── PROBE: log the first few large-buffer uploads (before any gates) so we
   // can see whether the game uploads b0 via UpdateSubresource and with what
   // offsets/sizes. ──
@@ -4755,11 +5050,13 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
       d->globals_recs.back().res = dest;
       d->globals_recs.back().unjittered_vp = d->globals_unjittered_vp;
       d->globals_recs.back().buffer_size = rd.buffer.size;
+      d->globals_recs.back().upload_seq = 1u;  // OPT 8: first observed upload
       d->globals_rec_index[dest.handle] = (uint32_t)(d->globals_recs.size() - 1u);
     }
   } else {
     rec->unjittered_vp = d->globals_unjittered_vp;
     rec->buffer_size = rd.buffer.size;
+    ++rec->upload_seq;  // OPT 8: invalidate any pending draw-time jitter write
   }
   // ── Character depth/shadow pass buffers: keep VP UNJITTERED ──
   // The depth VSs (DEPTH_VS_HASHES) write the character's depth into the main
@@ -4804,6 +5101,32 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
   return true;  // block the game's original (unjittered) upload
 }
 
+// OPT 8: invalidate the draw-time jitter-write skip for a tracked _Globals
+// buffer whose contents may have been rewritten through a path other than the
+// hooked update_buffer_region (Map/Unmap, CopyResource, CopySubresourceRegion).
+static void InvalidateTrackedGlobalsUpload(reshade::api::device* dev, reshade::api::resource dest) {
+  if (!dev || !dest.handle) return;
+  auto* d = dev->get_private_data<DeviceData>();
+  if (!d || !d->globals_vp_captured) return;
+  auto it = d->globals_rec_index.find(dest.handle);
+  if (it != d->globals_rec_index.end()) ++d->globals_recs[it->second].upload_seq;
+}
+
+static bool OnCopyBufferRegionInvalidate(reshade::api::command_list* cmd_list,
+                                         reshade::api::resource, uint64_t,
+                                         reshade::api::resource dest, uint64_t, uint64_t) {
+  if (g_opt_jitter_write_skip >= 0.5f && cmd_list)
+    InvalidateTrackedGlobalsUpload(cmd_list->get_device(), dest);
+  return false;  // never block the game's copy
+}
+
+static bool OnCopyResourceInvalidate(reshade::api::command_list* cmd_list, reshade::api::resource,
+                                     reshade::api::resource dest) {
+  if (g_opt_jitter_write_skip >= 0.5f && cmd_list)
+    InvalidateTrackedGlobalsUpload(cmd_list->get_device(), dest);
+  return false;  // never block the game's copy
+}
+
 // ── PROBE: log the first few large-buffer Map calls. If the game uploads b0 via
 // Map/Unmap instead of UpdateSubresource, update_buffer_region never fires and
 // we need Map-based interception instead. ──
@@ -4811,6 +5134,11 @@ static void OnMapBufferRegionProbe(reshade::api::device* dev, reshade::api::reso
                                    uint64_t offset, uint64_t size, reshade::api::map_access access,
                                    void** data) {
   if (!dev || !res.handle || !data) return;
+  // OPT 8: a Map/Unmap upload of a tracked _Globals buffer invalidates its
+  // upload_seq so the next draw re-writes the jittered VP even though
+  // update_buffer_region did not observe this write path.
+  if (g_opt_jitter_write_skip >= 0.5f && shader_injection.dlaa_jitter_enabled >= 0.5f)
+    InvalidateTrackedGlobalsUpload(dev, res);
   if (shader_injection.dlaa_debug_logging < 0.5f) return;
   auto rd = dev->get_resource_desc(res);
   if (rd.type != reshade::api::resource_type::buffer || rd.buffer.size < 768ull) return;
@@ -4835,6 +5163,7 @@ static void UpdateJitter(DeviceData* d) {
   d->jitter_y = jy;
   d->report_jitter_x = jx;
   d->report_jitter_y = jy;
+  ++d->jitter_epoch;  // OPT 8: new presented frame -> draw-time jitter writes must re-run
   // The shared ViewProjection patch is the only jitter source.
   shader_injection.jitter_offset_x = 0.f;
   shader_injection.jitter_offset_y = 0.f;
@@ -4912,6 +5241,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return false;
+  ScopedCpuTimer cpu_site(kCpuRunDlaa);
 
   if (!d->captured_depth_srv.handle || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle) {
     static int missing_log_count = 0;
@@ -5830,6 +6160,70 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off","On"},
         .is_visible = []{ return g_fg_page < 0.5f; },
     },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptJitterWriteSkip", .binding = &g_opt_jitter_write_skip,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Opt 8: Skip Redundant VP Writes", .section = "Antialiasing",
+        .tooltip = "CPU opt 8: skip the draw-time 64-byte _Globals jitter write when this buffer has not been re-uploaded since our last write this frame (upload_seq tracking; Map/Unmap invalidates). Behavior-preserving: the same bytes are already in place. Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptReadbackSkip", .binding = &g_opt_readback_skip,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Opt 9: Skip VP Staging Readback", .section = "Antialiasing",
+        .tooltip = "CPU opt 9: when the upload-time unjittered ViewProjection was captured (the value ReadSceneMatrices already prefers), skip the _Globals staging copy + synchronous Map entirely. The staging path stays as the fallback when no upload was captured. Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptColorCache", .binding = &g_opt_color_cache,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Opt 10: Cache t0 Color Views", .section = "Antialiasing",
+        .tooltip = "CPU opt 10: cache view -> resource for the t0 color capture (views map to one immutable resource; entries are dropped on destroy_resource_view). Removes get_resource_from_view from every repeated t0 SRV push. Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptSceneVsSet", .binding = &g_opt_scene_vs_set,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Opt 11: Scene VS Hash Set", .section = "Antialiasing",
+        .tooltip = "CPU opt 11: IsSceneGeometryVs uses a hash set instead of the 51-entry linear scan (runs on every VS b0 CBV push). Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptRtCache", .binding = &g_opt_rt_cache,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Opt 12: Cache RTV0 Resource", .section = "Antialiasing",
+        .tooltip = "CPU opt 12: OnBindRenderTargets resolves RTV0's resource only when the view handle changes (cached, invalidated on destroy_resource_view). Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptPsTwinTrack", .binding = &g_opt_ps_twin_track,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "Opt 13: PS Twin Bind Tracking (A/B)", .section = "Antialiasing",
+        .tooltip = "CPU opt 13 (A/B, default OFF): track whether the game rebound its PS since our Phase E twin swap (bind_pipeline event) so Ensure/RestorePhaseEPixelShader skip PSGetShader in steady state. Falls back to the proven query path on any doubt. If per-object MVs break with this ON, turn it OFF. Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAAOptMotionRtvCache", .binding = &g_opt_motion_rtv_cache,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f, .label = "Opt 14: Cache Motion RTV Compat", .section = "Antialiasing",
+        .tooltip = "CPU opt 14: MaybeAppendMotionRtvStrict caches the live three-RTV G-buffer compatibility verdict (RTV descriptors are immutable; invalidated when one of the cached views is destroyed) instead of re-querying descs/resources on every character draw. Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLAACpuProfile", .binding = &g_cpu_profile,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f, .label = "CPU Profile (DLAA)", .section = "Antialiasing",
+        .tooltip = "Diagnostic: while DLAA mode is active, accumulate QueryPerformanceCounter time per hook site (draw, restore, vp-write, bind-vs, bind-rigid, motion-rtv, push-desc, bind-rt, buf-update, run-dlaa, present) and log a per-frame ms breakdown to ReShade.log every 120 frames. Live.",
+        .labels = {"Off","On"},
+        .is_visible = []{ return g_fg_page < 0.5f; },
+    },
 };
 
 static void FgUpdateStatus(DeviceData* d) {
@@ -6609,6 +7003,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsCapture);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionProbe);
+      // OPT 13 / OPT 10-12-14 cache invalidation events.
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipelinePsTrack);
+      reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      // OPT 8: alternate VP write paths into tracked _Globals buffers.
+      reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionInvalidate);
+      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourceInvalidate);
       reshade::register_event<reshade::addon_event::draw>(OnDrawMaskHook);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawMaskHookIndexed);
       // Phase B: generic skinned-VS DXBC patcher. Registered BEFORE
@@ -6623,6 +7023,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
              const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
         auto* dev = swapchain->get_device();
         if (!dev) return;
+        ScopedCpuTimer cpu_site(kCpuPresent);
         // Always track output resolution for depth validation
         auto* d = dev->get_private_data<DeviceData>();
         if (d) {
@@ -6734,6 +7135,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           }
         }
         if (shader_injection.dlaa_enabled < 1.5f) return;  // NGX only in DLAA mode (2)
+        CpuProfileLogFrame();  // CPU profile: per-site ms breakdown every 120 DLAA frames
         if (!senkiseki3::dlss::ngx.initialized && !senkiseki3::dlss::ngx.init_failed) {
           if (shader_injection.dlaa_debug_logging > 0.5f)
             reshade::log::message(reshade::log::level::info, "[DLAA] Attempting NGX init...");
@@ -6803,6 +7205,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawMaskHookIndexed);
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionProbe);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipelinePsTrack);
+      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionInvalidate);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourceInvalidate);
       reshade::unregister_event<reshade::addon_event::create_pipeline>(OnCreatePipeline);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchainFg);
       reshade::unregister_addon(h_module);
