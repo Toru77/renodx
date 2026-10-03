@@ -288,8 +288,6 @@ static float g_opt_readback_skip = 1.f;      // OPT 9: skip the _Globals staging
 static float g_opt_color_cache = 1.f;        // OPT 10: cache view -> resource for the t0 color capture in
                                              // OnPushDescriptorsCapture (a view maps to one immutable
                                              // resource; entries are erased on destroy_resource_view).
-static float g_opt_scene_vs_set = 1.f;       // OPT 11: IsSceneGeometryVs uses a hash set instead of the
-                                             // 51-entry linear scan (runs per VS b0 CBV push).
 static float g_opt_rt_cache = 1.f;           // OPT 12: OnBindRenderTargets only resolves RTV0's resource
                                              // when the view handle changes (invalidated on view destroy).
 static float g_opt_ps_twin_track = 0.f;      // OPT 13 (A/B, default OFF): track whether the game rebound
@@ -455,7 +453,7 @@ struct DlaaDeployDiag {
   // Capture diagnostics (last seen candidates).
   uint32_t last_t0_ps_hash = 0u;
   uint32_t last_b0_vs_hash = 0u;
-  bool last_b0_vs_listed = false;
+  bool last_b0_vs_tracked = false;
   int last_depth_fmt = 0;
   uint32_t last_depth_w = 0u, last_depth_h = 0u;
   uint32_t last_depth_binding = 0u;
@@ -1014,7 +1012,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
   snprintf(buf, sizeof(buf),
            "[DLAA] status: aa=%d hdr=%d path=%s entry(final=%u fxaa=%u) run=%u ok=%u lastEntry=%s | "
            "reason=%s detail=%s | color=%s f=%u | depth=%s f=%u | rtv0=%s f=%u | "
-           "cbv=0x%llX valid=%d f=%u b0=%s | globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X listed=%d | "
+           "cbv=0x%llX valid=%d f=%u b0=%s | globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X tracked=%d | "
            "depthCand=%d %ux%u b=%u reject=%s | ngx=sup%d init%d feat%d evalFail%d | "
            "velpipe=%d prevDepth=%d invalidations=%u",
            (int)shader_injection.dlaa_enabled, (int)d->hdr_detected, hdr_path ? "pre" : "composite",
@@ -1026,7 +1024,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
            diag.cbv_capture_frame,
            (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy",
            (int)d->globals_vp_captured, (int)d->matrices_valid,
-           diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_listed,
+           diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_tracked,
            diag.last_depth_fmt, diag.last_depth_w, diag.last_depth_h, diag.last_depth_binding,
            DlaaDepthRejectName(diag.last_depth_reject),
            (int)senkiseki3::dlss::ngx.supported, (int)senkiseki3::dlss::ngx.initialized,
@@ -1054,8 +1052,8 @@ static bool DlaaStatusDraw() {
               d->color_capture_frame, d->depth_capture_frame, diag.rtv0_capture_frame,
               diag.cbv_capture_frame, (int)d->captured_scene_cbv_valid,
               (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy");
-  ImGui::Text("LastT0=0x%08X  LastB0Vs=0x%08X listed=%d",
-              diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_listed);
+  ImGui::Text("LastT0=0x%08X  LastB0Vs=0x%08X tracked=%d",
+              diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_tracked);
   ImGui::Text("DepthCand fmt=%d %ux%u b=%u reject=%s", diag.last_depth_fmt,
               diag.last_depth_w, diag.last_depth_h, diag.last_depth_binding,
               DlaaDepthRejectName(diag.last_depth_reject));
@@ -1621,20 +1619,6 @@ static bool IsEffectPs(uint32_t hash) {
   return false;
 }
 
-// VSs paired with the excluded effect PSs — these must NOT apply the DLAA
-// rasterization jitter (they render as a native current-frame fallback).
-static const std::array<uint32_t, 4> EFFECT_VS_HASHES = {
-    0x7D3553A7u,  // particle
-    0x8AFF0B4Fu,  // water/particle
-    0x795F3AD3u,  // world-space effect
-    0xC8FE8FC4u,  // transparent texture
-};
-
-static bool IsEffectVs(uint32_t hash) {
-  for (uint32_t h : EFFECT_VS_HASHES) if (h == hash) return true;
-  return false;
-}
-
 // Character depth/shadow-casting VSs (skinned, output only SV_POSITION; write
 // the character's depth into the MAIN depth buffer). These read
 // scene.ViewProjection (c10) which the global source patch jitters — but their
@@ -1801,43 +1785,9 @@ static void MaybeAppendEffectMask(reshade::api::command_list* cmd_list, DeviceDa
 }
 
 // ── Per-object motion (Stage 1): dedicated 16-bit target ──
-// VSs whose replacement outputs prevClip in TEXCOORD5 (o7/o8). All the skinned
-// character-part VSs are patched to emit prevClip; the paired PS must be
-// patched to write o3/SV_TARGET3 (otherwise that part falls back to camera
-// motion). Full list = the character's mesh parts (hair, skin, clothing, eyes,
-// outline, face).
-static const std::array<uint32_t, 24> PER_OBJECT_MOTION_VS_HASHES = {
-    0x0D5DABC6u,  // main skinned character (face)
-    0xB2F338C8u,  // skinned
-    0xB1C24E2Au,  // skinned
-    0xBCB30859u,  // skinned
-    0x5C1A50E5u,  // hair
-    0xB5759643u,  // skinned
-    0x4A030C25u,  // clothing
-    0x3641D444u,  // eyeball
-    0xF426BC1Cu,  // skinned
-    0xC8F5D77Bu,  // skin
-    0x38656EB3u,  // skinned
-    0xF8C9B92Du,  // clothing
-    0x5E5AE3FBu,  // character outline
-    0xB662509Au,  // clothing
-    0x0045297Du,  // skinned (draw 39)
-    0x59001D8Eu,  // skinned (draw 40)
-    0x63C867BAu,  // skinned (draw 41)
-    0xB0A80DEFu,  // skinned outline (draw 42)
-    0x1DF2E2BBu,  // skinned (draw 45)
-    0x38BCCCA0u,  // skinned (draw 52)
-    0x6285DCF3u,  // skinned (draw 73)
-    0xFC588329u,  // skinned (draw 80)
-    0x5AA04209u,  // skinned (draw 84)
-    0x835760A3u,  // skinned outline (draw 85)
-};
-
-static bool IsPerObjectMotionVs(uint32_t hash) {
-  for (uint32_t h : PER_OBJECT_MOTION_VS_HASHES) if (h == hash) return true;
-  return false;
-}
-
+// The former hardcoded PER_OBJECT_MOTION_VS_HASHES list was removed: the
+// generic DXBC patcher's patched_vs_by_hash map is now the single source of
+// truth for "is this a patched per-object VS" in the diagnostics below.
 // Create the full-res per-object motion target (r32g32b32a32_float, RT + SRV).
 // 32-bit: the 16-bit target quantized prevNDC to ~0.6px steps at 1440p, which
 // flickered frame-to-frame under jitter (shifting rasterization coverage made
@@ -4185,14 +4135,14 @@ static void MaybeBindPatchedRigidVs(reshade::api::command_list* cmd_list, Device
                  vp_slot);
 }
 
-// ── Diagnostics: log the first ~20 effect draws (VS/PS hashes + exclusion flag).
-// Tells us whether 0xC8FE8FC4-type draws are being masked (PS in EFFECT_PS_HASHES)
-// and whether the exclude toggle is 1 at draw time (VS gate should fire).
+// ── Diagnostics: log the first ~20 effect draws (PS hashes + exclusion flag).
+// Tells us whether effect passes are being masked (PS in EFFECT_PS_HASHES) and
+// whether the exclude toggle is 1 at draw time.
 static void MaybeLogEffectDraw(reshade::api::command_list* cmd_list, DeviceData* d) {
   if (!cmd_list || !d) return;
   uint32_t vhash = CurrentVsHash(cmd_list, d);
   uint32_t phash = CurrentPsHash(cmd_list, d);
-  if (!IsEffectVs(vhash) && !IsEffectPs(phash) && vhash != 0xDFE5A75Du) return;
+  if (!IsEffectPs(phash)) return;
   LogThrottled("effect-draw", reshade::log::level::info, 20u, 0u,
                "[DLAA] effect draw: vs=0x%08X ps=0x%08X exclude=%d rtvs=%u",
                vhash, phash, (int)(shader_injection.dlaa_exclude_effects > 0.5f), d->last_rtv_count);
@@ -4387,7 +4337,7 @@ static void MaybeLogOmState(reshade::api::command_list* cmd_list, DeviceData* d)
   if (shader_injection.dlaa_phaseb_debug_logging <= 0.5f || !cmd_list || !d) return;
   const uint32_t vh = CurrentVsHash(cmd_list, d);
   const uint32_t ph = CurrentPsHash(cmd_list, d);
-  const bool is_po_vs = d->patched_vs_by_hash.contains(vh) || IsPerObjectMotionVs(vh);
+  const bool is_po_vs = d->patched_vs_by_hash.contains(vh);
   const bool is_phasee_candidate = d->phasee_ps_candidates.contains(ph);
   if (!is_po_vs && !is_phasee_candidate) return;
   auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
@@ -4849,84 +4799,10 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
   return true;
 }
 
-// ── Scene-geometry vertex shader set (hash-gated) ──
-// These are the VSs that rasterize the 3D scene into the 3-MRT G-buffer
-// (captured live via the devkit; see tmp/senkiseki3/dump). Each one transforms
-// with scene.ViewProjection (cb0 c10) from the per-object _Globals, so the
-// jitter is applied directly in each replaced VS (boot/0xHASH.vs_4_1.hlsl).
-//
-// NOTE: b0 is a PER-OBJECT cbuffer (contains World at c44) — that is why the
-// proxy-cbuffer jitter approach is unworkable (a shared proxy would give every
-// object the first object's World matrix). Jitter must live in the VS.
-static const std::array<uint32_t, 51> SCENE_GEOMETRY_VS_HASHES = {
-    0x37F1DE22u,  // world/terrain (primary)
-    0xCBF171E5u,  // world
-    0xDF1D933Fu,  // world
-    0x9BB882F5u,  // terrain tiles
-    0x43ED1D83u,  // world
-    0xC1F80CF6u,  // world
-    0x8BB470CEu,  // world
-    0x4E107313u,  // world (COLOR input)
-    0x09394015u,  // unskinned characters/NPCs
-    0x0D5DABC6u,  // skinned characters/NPCs
-    0xB2F338C8u,  // skinned
-    0xB1C24E2Au,  // skinned
-    0x5C1A50E5u,  // character hair
-    0x4A030C25u,  // character clothing
-    0x3641D444u,  // eyeball
-    0xC8F5D77Bu,  // character skin
-    0xF8C9B92Du,  // character clothing
-    0xB662509Au,  // character clothing
-    // Foliage/world VSs discovered in the foliage scene:
-    0x29513853u,  // foliage (main)
-    0xED3D1A43u,  // foliage
-    0x7D5282A3u,  // scene/world
-    0x066E7DFBu,  // scene/world
-    0x714E4C33u,  // scene/world
-    0x7A711F41u,  // scene/world
-    0x09BD12FAu,  // scene/world
-    0x030AD345u,  // scene/world
-    0x8913640Au,  // scene/world
-    0x2DC04A66u,  // scene/world (G-buffer, 7 SRVs)
-    0x34AA271Fu,  // scene/world (G-buffer)
-    0xDFE5A75Du,  // scene/world (G-buffer)
-    0x8ED5035Bu,  // scene/world (G-buffer)
-    0x97E9A1ECu,  // scene/world (G-buffer)
-    0x4D37FA49u,  // scene/world (G-buffer)
-    0x9596CBC1u,  // scene/world (G-buffer)
-    0xE4C6D6F4u,  // scene/world (G-buffer)
-    0x8AFF0B4Fu,  // world-space effect (water/particle, RT=1)
-    0x795F3AD3u,  // world-space effect (RT=1)
-    0x5E5AE3FBu,  // character outline
-    0x77355EEDu,  // forest impostor billboard (sky)
-    0xC8FE8FC4u,  // transparent texture (world-space)
-    0x7D3553A7u,  // particle (world-space)
-    // Remaining char-part VSs from the 39-86 sweep (also scene geometry for the
-    // b0 camera-matrix capture gate).
-    0x0045297Du,  // draw 39
-    0x59001D8Eu,  // draw 40
-    0x63C867BAu,  // draw 41
-    0xB0A80DEFu,  // draw 42 (outline)
-    0x1DF2E2BBu,  // draw 45
-    0x38BCCCA0u,  // draw 52
-    0x6285DCF3u,  // draw 73
-    0xFC588329u,  // draw 80
-    0x5AA04209u,  // draw 84
-    0x835760A3u,  // draw 85 (outline)
-};
-
-static bool IsSceneGeometryVs(uint32_t hash) {
-  if (g_opt_scene_vs_set >= 0.5f) {
-    // OPT 11: this runs per VS b0 CBV push; the set replaces the 51-entry scan.
-    static const std::unordered_set<uint32_t> scene_geometry_vs(
-        SCENE_GEOMETRY_VS_HASHES.begin(), SCENE_GEOMETRY_VS_HASHES.end());
-    return scene_geometry_vs.find(hash) != scene_geometry_vs.end();
-  }
-  for (uint32_t h : SCENE_GEOMETRY_VS_HASHES) {
-    if (h == hash) return true;
-  }
-  return false;
-}
+// (The former hardcoded SCENE_GEOMETRY_VS_HASHES list and IsSceneGeometryVs were
+// removed: the scene CBV is now captured hash-free from any vertex-stage b0
+// bound to a tracked _Globals buffer. See the CBV capture in
+// OnPushDescriptorsCapture.)
 
 // ── Phase 0 prev-pose probe (separate DLAAPhase0Logging toggle) ──
 // Logs the game's vertex-stage t0 SRV pushes — expected to be the per-character
@@ -4959,8 +4835,8 @@ static void Phase0ProbeVertexSrv(reshade::api::device* dev, reshade::api::comman
     if (logged.insert(key).second) {
       char buf[160];
       snprintf(buf, sizeof(buf),
-               "[P0] VS t%u SRV push (perobj=%d) vs=0x%08X — would conflict with prev-bone t1",
-               update.binding, (int)IsPerObjectMotionVs(vhash), vhash);
+               "[P0] VS t%u SRV push (patched=%d) vs=0x%08X — would conflict with prev-bone t1",
+               update.binding, (int)d->patched_vs_by_hash.contains(vhash), vhash);
       reshade::log::message(reshade::log::level::info, buf);
     }
     return;
@@ -4978,8 +4854,8 @@ static void Phase0ProbeVertexSrv(reshade::api::device* dev, reshade::api::comman
   d->last_bone_size = (uint32_t)size;
   d->last_bone_stride = stride;
 
-  // Track per per-object VS hash which bone buffer it used (0 = none seen yet).
-  if (IsPerObjectMotionVs(vhash)) {
+  // Track per patched-VS hash which bone buffer it used (0 = none seen yet).
+  if (d->patched_vs_by_hash.contains(vhash)) {
     auto& seen_handle = d->p0_vs_bone_handle[vhash];
     if (seen_handle == 0u) seen_handle = res.handle;
   }
@@ -4987,8 +4863,8 @@ static void Phase0ProbeVertexSrv(reshade::api::device* dev, reshade::api::comman
   // Distinct (vhash, bone-handle) combos can be unbounded (per-frame dynamic
   // bone buffers) — cap the total so the per-object probe can't flood the log.
   LogThrottled("p0-srv0", reshade::log::level::info, 30u, 300u,
-               "[P0] VS t0 SRV push vs=0x%08X perobj=%d bone=0x%llX size=%llu stride=%u",
-               vhash, (int)IsPerObjectMotionVs(vhash),
+               "[P0] VS t0 SRV push vs=0x%08X patched=%d bone=0x%llX size=%llu stride=%u",
+               vhash, (int)d->patched_vs_by_hash.contains(vhash),
                (unsigned long long)res.handle, (unsigned long long)size, stride);
 }
 
@@ -5003,7 +4879,7 @@ static void Phase0ProbeDraw(reshade::api::command_list* cmd_list, DeviceData* d)
   if (shader_injection.dlaa_phase0_logging < 0.5f) return;
   if (!cmd_list || !d) return;
   uint32_t vhash = CurrentVsHash(cmd_list, d);
-  if (!IsPerObjectMotionVs(vhash)) return;
+  if (!d->patched_vs_by_hash.contains(vhash)) return;
   uint32_t phash = CurrentPsHash(cmd_list, d);
 
   // Skinned = a bone SRV was seen for this VS; World-only = none (no entry).
@@ -5230,20 +5106,24 @@ static void OnPushDescriptorsCapture(
   }
 
   // ── CBV capture (b0 _Globals) ──
-  // Hash-gated: only capture when a scene-geometry VS is bound, so
-  // captured_scene_cbv reliably points at the camera _Globals (not the post
-  // cbuffer, shadow matrices, or per-effect buffers).
+  // Hash-free: the game's camera _Globals is any vertex-stage b0 bound to a
+  // buffer the upload path already identified as a tracked _Globals (>= 768B,
+  // VP-like matrix at c10). This replaces the former 51-entry scene-VS hash
+  // list, so scenes using unlisted/untracked VSs still get the staging
+  // fallback and diagnostics.
   if (update.type == reshade::api::descriptor_type::constant_buffer) {
-    if (update.binding == 0u && update.count >= 1) {
+    if (update.binding == 0u && update.count >= 1 &&
+        (stage & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex) {
       auto* cbv = static_cast<const reshade::api::buffer_range*>(update.descriptors);
       if (cbv->buffer.handle) {
+        d->last_b0_buffer = cbv->buffer;
+        const bool tracked_globals =
+            d->globals_rec_index.find(cbv->buffer.handle) != d->globals_rec_index.end();
         auto* cbv_ss = renodx::utils::shader::GetCurrentState(cmd_list);
-        uint32_t vhash = cbv_ss ? renodx::utils::shader::GetCurrentVertexShaderHash(cbv_ss) : 0u;
-        uint32_t phash = cbv_ss ? renodx::utils::shader::GetCurrentPixelShaderHash(cbv_ss) : 0u;
-        const bool scene_vs = IsSceneGeometryVs(vhash);
-        d->dlaa_diag.last_b0_vs_hash = vhash;  // capture diagnostics
-        d->dlaa_diag.last_b0_vs_listed = scene_vs;
-        if (scene_vs) {
+        d->dlaa_diag.last_b0_vs_hash =
+            cbv_ss ? renodx::utils::shader::GetCurrentVertexShaderHash(cbv_ss) : 0u;
+        d->dlaa_diag.last_b0_vs_tracked = tracked_globals;
+        if (tracked_globals) {
           d->captured_scene_cbv = *cbv;
           d->captured_scene_cbv_valid = true;
           d->dlaa_diag.cbv_capture_frame = d->frame_index;
@@ -5256,19 +5136,13 @@ static void OnPushDescriptorsCapture(
             d->scene_cbv_copy_issued = IssueSceneCbvCopy(cmd_list, d);
           }
         }
-        // Track the last b0 buffer bound for the VERTEX stage (the VS reads the
-        // ViewProjection from it). PS-stage b0 binds (material cbuffers) must
-        // NOT overwrite this, or the draw-time write would target the wrong
-        // (often small) buffer.
-        if ((stage & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex) {
-          d->last_b0_buffer = cbv->buffer;
-          if (shader_injection.dlaa_debug_logging > 0.5f) {
-            auto brd = dev->get_resource_desc(cbv->buffer);
-            LogThrottled("b0-vs-bind", reshade::log::level::info, 5u, 250u,
-                         "[DLAA] global: b0 VS bind buffer=0x%llX size=%llu",
-                         (unsigned long long)cbv->buffer.handle,
-                         (unsigned long long)(brd.type == reshade::api::resource_type::buffer ? brd.buffer.size : 0ull));
-          }
+        if (shader_injection.dlaa_debug_logging > 0.5f) {
+          auto brd = dev->get_resource_desc(cbv->buffer);
+          LogThrottled("b0-vs-bind", reshade::log::level::info, 5u, 250u,
+                       "[DLAA] global: b0 VS bind buffer=0x%llX size=%llu tracked=%d",
+                       (unsigned long long)cbv->buffer.handle,
+                       (unsigned long long)(brd.type == reshade::api::resource_type::buffer ? brd.buffer.size : 0ull),
+                       (int)tracked_globals);
         }
       }
     }
@@ -5322,7 +5196,6 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
     }
   }
   if (!dev || !data || !dest.handle) return false;
-  if (shader_injection.dlaa_jitter_enabled < 0.5f) return false;
   if (!d) return false;
   // Must reach the VP region (c10, bytes 160..208) — excludes small
   // post/shadow cbuffers and our own 64-byte VP writes (size < 208).
@@ -5377,6 +5250,9 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
     }
     return false;  // let the game's original (unjittered) upload proceed
   }
+  // Jitter disabled: the VP capture above is all the velocity compute needs;
+  // there is no jittered re-upload to issue, so let the original upload stand.
+  if (shader_injection.dlaa_jitter_enabled < 0.5f) return false;
   ++d->globals_patch_count;
   // ── SOURCE-LEVEL PATCH (reliable jitter) ──
   // We are on the immediate context right before the game's UpdateSubresource
@@ -5559,8 +5435,8 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
                   DlaaDepthRejectName(d->dlaa_diag.last_depth_reject));
     else if (!d->captured_scene_cbv_valid && !d->globals_vp_captured)
       DlaaDiagSet(d, kDlaaReasonMissingVpSource,
-                  "no scene-geometry b0 AND no upload VP captured (lastVs=0x%08X listed=%d globals=%d)",
-                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_listed,
+                  "no tracked _Globals b0 AND no upload VP captured (lastVs=0x%08X tracked=%d globals=%d)",
+                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_tracked,
                   (int)d->globals_vp_captured);
     else
       DlaaDiagSet(d, kDlaaReasonMissingColorSrv,
@@ -6581,14 +6457,6 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Opt 10: Cache t0 Color Views", .section = "Antialiasing",
         .tooltip = "CPU opt 10: cache view -> resource for the t0 color capture (views map to one immutable resource; entries are dropped on destroy_resource_view). Removes get_resource_from_view from every repeated t0 SRV push. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "DLAAOptSceneVsSet", .binding = &g_opt_scene_vs_set,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 11: Scene VS Hash Set", .section = "Antialiasing",
-        .tooltip = "CPU opt 11: IsSceneGeometryVs uses a hash set instead of the 51-entry linear scan (runs on every VS b0 CBV push). Live.",
         .labels = {"Off","On"},
         .is_visible = []{ return g_fg_page < 0.5f; },
     },
