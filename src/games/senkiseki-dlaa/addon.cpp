@@ -281,10 +281,6 @@ static float g_opt_jitter_write_skip = 1.f;  // OPT 8: skip the draw-time 64-byt
                                              // is bumped by every captured _Globals upload and by a
                                              // Map/Unmap of a tracked buffer, so a re-upload always
                                              // invalidates the skip; the bytes skipped are byte-identical.
-static float g_opt_readback_skip = 1.f;      // OPT 9: skip the _Globals staging copy + synchronous Map
-                                             // readback in ReadSceneMatrices when the upload-time VP was
-                                             // captured — that capture already overrides the readback
-                                             // value, so the staged branch is discarded work.
 static float g_opt_color_cache = 1.f;        // OPT 10: cache view -> resource for the t0 color capture in
                                              // OnPushDescriptorsCapture (a view maps to one immutable
                                              // resource; entries are erased on destroy_resource_view).
@@ -458,7 +454,6 @@ struct DlaaDeployDiag {
   uint32_t last_depth_w = 0u, last_depth_h = 0u;
   uint32_t last_depth_binding = 0u;
   uint32_t last_depth_reject = 0u;
-  uint32_t cbv_capture_frame = 0u;
   uint32_t rtv0_capture_frame = 0u;
   // Robustness diagnostics: captures cleared by destroy_resource/view.
   uint32_t capture_invalidations = 0u;
@@ -774,8 +769,6 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   // buffer, so a Luma-style prev-vertex capture is feasible for that mesh.
   std::unordered_map<uint32_t, uint32_t> p0_vs_vb_bind_flags;
 
-  reshade::api::buffer_range captured_scene_cbv = {};  // _Globals cbuffer at b0
-  bool captured_scene_cbv_valid = false;
   // Velocity compute b0 placeholder: the CS layout binds a constant buffer at b0
   // but the shader never reads it (all matrices come from the push constants at
   // b13). When the game's scene CBV was never captured (scene VS not in the
@@ -812,14 +805,11 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   reshade::api::resource captured_color_res = {};
   reshade::api::resource captured_rtv0_res = {};
 
-  // Camera matrices for depth-projection velocity (read from _Globals CBV)
+  // Camera matrices for depth-projection velocity (read from the upload capture)
   std::array<float, 16> prev_view_proj = {};
   std::array<float, 16> curr_view_proj = {};
   std::array<float, 16> curr_view_proj_inv = {};
   bool matrices_valid = false;
-  ID3D11Buffer* scene_cbv_staging = nullptr;
-  uint32_t scene_cbv_staging_size = 0u;
-  bool scene_cbv_copy_issued = false;  // a camera-matrix staging copy is queued this frame
   float viewport_w = 2560.f, viewport_h = 1440.f;
   float swapchain_w = 2560.f, swapchain_h = 1440.f;
   float jitter_x = 0.f, jitter_y = 0.f;             // RENDER jitter (what the source patch applies)
@@ -1012,7 +1002,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
   snprintf(buf, sizeof(buf),
            "[DLAA] status: aa=%d hdr=%d path=%s entry(final=%u fxaa=%u) run=%u ok=%u lastEntry=%s | "
            "reason=%s detail=%s | color=%s f=%u | depth=%s f=%u | rtv0=%s f=%u | "
-           "cbv=0x%llX valid=%d f=%u b0=%s | globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X tracked=%d | "
+           "globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X tracked=%d b0buf=0x%llX | "
            "depthCand=%d %ux%u b=%u reject=%s | ngx=sup%d init%d feat%d evalFail%d | "
            "velpipe=%d prevDepth=%d invalidations=%u",
            (int)shader_injection.dlaa_enabled, (int)d->hdr_detected, hdr_path ? "pre" : "composite",
@@ -1020,11 +1010,9 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
            diag.last_deploy_entry == 1u ? "final" : diag.last_deploy_entry == 2u ? "fxaa" : "none",
            DlaaReasonName(diag.reason), diag.detail,
            color, d->color_capture_frame, depth, d->depth_capture_frame, rtv0, diag.rtv0_capture_frame,
-           (unsigned long long)d->captured_scene_cbv.buffer.handle, (int)d->captured_scene_cbv_valid,
-           diag.cbv_capture_frame,
-           (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy",
            (int)d->globals_vp_captured, (int)d->matrices_valid,
            diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_tracked,
+           (unsigned long long)d->last_b0_buffer.handle,
            diag.last_depth_fmt, diag.last_depth_w, diag.last_depth_h, diag.last_depth_binding,
            DlaaDepthRejectName(diag.last_depth_reject),
            (int)senkiseki3::dlss::ngx.supported, (int)senkiseki3::dlss::ngx.initialized,
@@ -1048,10 +1036,9 @@ static bool DlaaStatusDraw() {
   ImGui::Text("Entry: final=%u fxaa=%u run=%u ok=%u fail=%u noEntry=%u",
               diag.final_entry_last, diag.fxaa_entry_last, diag.run_calls_last,
               diag.eval_ok_last, diag.eval_fail_last, diag.presents_without_entry);
-  ImGui::Text("Color f=%u  Depth f=%u  RTV0 f=%u  CBV f=%u valid=%d b0=%s",
+  ImGui::Text("Color f=%u  Depth f=%u  RTV0 f=%u  b0buf=0x%llX",
               d->color_capture_frame, d->depth_capture_frame, diag.rtv0_capture_frame,
-              diag.cbv_capture_frame, (int)d->captured_scene_cbv_valid,
-              (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy");
+              (unsigned long long)d->last_b0_buffer.handle);
   ImGui::Text("LastT0=0x%08X  LastB0Vs=0x%08X tracked=%d",
               diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_tracked);
   ImGui::Text("DepthCand fmt=%d %ux%u b=%u reject=%s", diag.last_depth_fmt,
@@ -1131,12 +1118,8 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   d->view_resource_cache.clear();
   d->captured_rtv0_view = 0u;
   d->phasee_twin_binding_intact = false;
-  d->captured_scene_cbv = {}; d->captured_scene_cbv_valid = false;
   dv(d->captured_depth_srv); dv(d->captured_color_srv);
   d->captured_depth_res = {}; d->captured_color_res = {};
-  if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
-  d->scene_cbv_staging_size = 0u;
-  d->scene_cbv_copy_issued = false;
   d->matrices_valid = false;
   if (d->point_sampler.handle) dev->destroy_sampler(d->point_sampler);
   d->point_sampler = {};
@@ -4526,11 +4509,6 @@ static void OnDestroyResource(reshade::api::device* dev, reshade::api::resource 
     d->captured_rtv0_view = 0u;
     ++d->dlaa_diag.capture_invalidations;
   }
-  if (d->captured_scene_cbv.buffer.handle == res.handle) {
-    d->captured_scene_cbv = {};
-    d->captured_scene_cbv_valid = false;
-    ++d->dlaa_diag.capture_invalidations;
-  }
 }
 
 // ── Event: capture RTV0 (FXAA output target) ──
@@ -4624,153 +4602,23 @@ static bool InvertMat4(const float* m, float* out) {
   return true;
 }
 
-// Queue the GPU copy of the camera matrices (c10..c21) into the staging buffer
-// EARLY — at the hash-gated scene b0 capture — so the Map in ReadSceneMatrices
-// (at FXAA, end of frame) finds the copy already complete and does NOT drain the
-// GPU pipeline. D3D11_MAP_READ on a just-copied staging buffer forces a full
-// pipeline flush mid-frame (GPU utilization dropped to ~76% with copy-at-FXAA);
-// issuing the copy at the first scene draw hides it behind the frame's GPU work.
-static bool IssueSceneCbvCopy(reshade::api::command_list* cmd_list, DeviceData* d) {
-  if (!cmd_list || !d || !d->captured_scene_cbv_valid) return false;
-  auto* dev = cmd_list->get_device();
-  if (!dev) return false;
-  auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
-  if (!cb) return false;
-
-  // Read window must cover c10..c21 = 352 bytes.
-  uint64_t range_size = d->captured_scene_cbv.size;
-  if (range_size < 352ull) range_size = 352ull;
-  if (range_size > 65536ull) range_size = 65536ull;
-  auto bdesc = dev->get_resource_desc(d->captured_scene_cbv.buffer);
-  if (bdesc.buffer.size > 0) {
-    const uint64_t offset = d->captured_scene_cbv.offset;
-    const uint64_t max_read = (offset < bdesc.buffer.size) ? (bdesc.buffer.size - offset) : 0u;
-    if (range_size > max_read) range_size = max_read;
-  }
-  if (range_size < 352ull) return false;  // can't reach the matrices
-  const uint32_t need = static_cast<uint32_t>(range_size);
-
-  if (!d->scene_cbv_staging || d->scene_cbv_staging_size < need) {
-    if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
-    D3D11_BUFFER_DESC bd = {};
-    bd.ByteWidth = need;
-    bd.Usage = D3D11_USAGE_STAGING;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
-    if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) return false;
-    d->scene_cbv_staging_size = need;
-  }
-
-  auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
-  if (!ctx) return false;
-  D3D11_BOX box = {};
-  box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
-  box.right = box.left + need;
-  box.bottom = 1;
-  box.back = 1;
-  ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
-  return true;
-}
-
-// Read the game's _Globals camera matrices (ViewProjection c10, ViewInverse c14,
-// ProjectionInverse c18) via a staging copy of the captured scene CBV, then:
+// Read the game's upload-captured camera ViewProjection:
 //   prev_view_proj     = last frame's ViewProjection
 //   curr_view_proj     = this frame's ViewProjection
-//   curr_view_proj_inv = ProjectionInverse * ViewInverse (= inverse(ViewProjection))
-static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11DeviceContext* ctx) {
-  if (!dev || !d || !ctx) return false;
-  if (!d->captured_scene_cbv_valid && !d->globals_vp_captured) {
-    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "no scene CBV and no upload VP captured");
+//   curr_view_proj_inv = inverse(ViewProjection)
+static bool ReadSceneMatrices(DeviceData* d) {
+  if (!d) return false;
+  if (!d->globals_vp_captured) {
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "no upload VP captured");
     return false;
   }
 
-  std::array<float, 16> view_proj = {};
-  if (g_opt_readback_skip >= 0.5f && d->globals_vp_captured) {
-    // OPT 9: the upload-time capture already holds the exact unjittered VP that
-    // the staged readback below would be overridden with, so the staging copy +
-    // synchronous Map are discarded work. The staging path remains the fallback.
-    view_proj = d->globals_unjittered_vp;
-  } else if (!d->captured_scene_cbv_valid) {
-    // No scene CBV (scene VS not in the hash list, or an untracked pipeline) but
-    // the upload capture exists: use it directly. This is the exact value the
-    // staging path would have overridden the staged VP with.
-    view_proj = d->globals_unjittered_vp;
-  } else {
-    auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
-    if (!cb) {
-      DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV handle null");
-      return false;
-    }
-    // Clamp the read window (must cover c10..c21 = 352 bytes).
-    uint64_t range_size = d->captured_scene_cbv.size;
-    if (range_size < 352ull) range_size = 352ull;
-    if (range_size > 65536ull) range_size = 65536ull;
-    auto bdesc = dev->get_resource_desc(d->captured_scene_cbv.buffer);
-    if (bdesc.buffer.size > 0) {
-      const uint64_t offset = d->captured_scene_cbv.offset;
-      const uint64_t max_read = (offset < bdesc.buffer.size) ? (bdesc.buffer.size - offset) : 0u;
-      if (range_size > max_read) range_size = max_read;
-    }
-    if (range_size < 352ull) {  // can't reach the matrices
-      DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV range < 352 bytes");
-      return false;
-    }
-    const uint32_t need = static_cast<uint32_t>(range_size);
-
-    if (!d->scene_cbv_staging || d->scene_cbv_staging_size < need) {
-      if (d->scene_cbv_staging) { d->scene_cbv_staging->Release(); d->scene_cbv_staging = nullptr; }
-      D3D11_BUFFER_DESC bd = {};
-      bd.ByteWidth = need;
-      bd.Usage = D3D11_USAGE_STAGING;
-      bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      auto* nd = reinterpret_cast<ID3D11Device*>(dev->get_native());
-      if (!nd || FAILED(nd->CreateBuffer(&bd, nullptr, &d->scene_cbv_staging)) || !d->scene_cbv_staging) {
-        DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "staging buffer create failed (%u bytes)", need);
-        return false;
-      }
-      d->scene_cbv_staging_size = need;
-    }
-
-    if (!d->scene_cbv_copy_issued) {
-      // Fallback: no early copy was queued this frame (e.g. DLAA toggled on
-      // mid-frame). This path stalls the pipeline; the early copy in
-      // OnPushDescriptorsCapture is the normal path.
-      D3D11_BOX box = {};
-      box.left = static_cast<UINT>(d->captured_scene_cbv.offset);
-      box.right = box.left + need;
-      box.bottom = 1;
-      box.back = 1;
-      ctx->CopySubresourceRegion(d->scene_cbv_staging, 0, 0, 0, 0, cb, 0, &box);
-    }
-    d->scene_cbv_copy_issued = false;  // consumed this frame
-
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(ctx->Map(d->scene_cbv_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
-      DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "staging Map failed");
-      return false;
-    }
-    const float* data = static_cast<const float*>(mapped.pData);
-    memcpy(view_proj.data(), data + 160 / 4, 64);  // c10 ViewProjection
-    ctx->Unmap(d->scene_cbv_staging, 0);
-
-    // Global jitter method: the staged copy captured the JITTERED VP (we patch
-    // b0 at bind time). Prefer the exact unjittered VP captured from the game's
-    // upload; only recover it from the staged copy when no upload was captured.
-    if (d->globals_vp_captured) {
-      view_proj = d->globals_unjittered_vp;
-    } else {
-      for (int i = 0; i < 4; ++i) {
-        view_proj[i] -= d->jitter_x * view_proj[12 + i];
-        view_proj[4 + i] -= d->jitter_y * view_proj[12 + i];
-      }
-    }
-  }
+  std::array<float, 16> view_proj = d->globals_unjittered_vp;
 
   float sum = 0.f;
   for (float v : view_proj) sum += v;
   if (sum == 0.f) {  // uninitialized / zeroed matrix
-    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "ViewProjection is zero (globals=%d)",
-                (int)d->globals_vp_captured);
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "ViewProjection is zero");
     return false;
   }
 
@@ -4781,7 +4629,6 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
   // VP as prevViewProj — so prev_view_proj must be exactly one frame older.
   d->prev_vp_frame = d->vp_read_frame;
   d->vp_read_frame = d->frame_index;
-  d->vp_cbv_handle = d->captured_scene_cbv.buffer.handle;
   // Invert the ACTUAL ViewProjection (c10) directly instead of composing the
   // game's separate ViewInverse/ProjectionInverse (c14/c18). If those stored
   // inverses don't exactly match the forward VP, every pixel gets a
@@ -4800,9 +4647,8 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
 }
 
 // (The former hardcoded SCENE_GEOMETRY_VS_HASHES list and IsSceneGeometryVs were
-// removed: the scene CBV is now captured hash-free from any vertex-stage b0
-// bound to a tracked _Globals buffer. See the CBV capture in
-// OnPushDescriptorsCapture.)
+// removed: the ViewProjection now comes solely from the _Globals upload capture
+// in OnUpdateBufferRegion.)
 
 // ── Phase 0 prev-pose probe (separate DLAAPhase0Logging toggle) ──
 // Logs the game's vertex-stage t0 SRV pushes — expected to be the per-character
@@ -5105,12 +4951,10 @@ static void OnPushDescriptorsCapture(
     }
   }
 
-  // ── CBV capture (b0 _Globals) ──
-  // Hash-free: the game's camera _Globals is any vertex-stage b0 bound to a
-  // buffer the upload path already identified as a tracked _Globals (>= 768B,
-  // VP-like matrix at c10). This replaces the former 51-entry scene-VS hash
-  // list, so scenes using unlisted/untracked VSs still get the staging
-  // fallback and diagnostics.
+  // ── b0 tracking (vertex stage) ──
+  // The game's camera _Globals is bound at vertex b0. The ViewProjection itself
+  // comes from the upload capture (OnUpdateBufferRegion); this only tracks the
+  // last-bound buffer for the draw-time jitter write and diagnostics.
   if (update.type == reshade::api::descriptor_type::constant_buffer) {
     if (update.binding == 0u && update.count >= 1 &&
         (stage & reshade::api::shader_stage::vertex) == reshade::api::shader_stage::vertex) {
@@ -5123,19 +4967,6 @@ static void OnPushDescriptorsCapture(
         d->dlaa_diag.last_b0_vs_hash =
             cbv_ss ? renodx::utils::shader::GetCurrentVertexShaderHash(cbv_ss) : 0u;
         d->dlaa_diag.last_b0_vs_tracked = tracked_globals;
-        if (tracked_globals) {
-          d->captured_scene_cbv = *cbv;
-          d->captured_scene_cbv_valid = true;
-          d->dlaa_diag.cbv_capture_frame = d->frame_index;
-          // Queue the camera-matrix staging copy EARLY so the Map at FXAA
-          // (ReadSceneMatrices) doesn't stall the GPU pipeline mid-frame.
-          // OPT 9: when the upload-time VP capture is active, ReadSceneMatrices
-          // uses it directly and never reads the staging buffer — skip the copy.
-          if (shader_injection.dlaa_enabled > 1.5f && !d->scene_cbv_copy_issued &&
-              !(g_opt_readback_skip >= 0.5f && d->globals_vp_captured)) {
-            d->scene_cbv_copy_issued = IssueSceneCbvCopy(cmd_list, d);
-          }
-        }
         if (shader_injection.dlaa_debug_logging > 0.5f) {
           auto brd = dev->get_resource_desc(cbv->buffer);
           LogThrottled("b0-vs-bind", reshade::log::level::info, 5u, 250u,
@@ -5205,9 +5036,6 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
   // Full-buffer (null-box) updates report UINT64_MAX: clamp to the buffer size.
   if (size == UINT64_MAX) size = rd.buffer.size;
   if (size < 208ull) return false;
-  // (captured_scene_cbv gate removed: it was tied to the 41-VS hash list and
-  // could miss the other per-material _Globals variants; the size + sanity
-  // checks and the globals_buffers set cover all of them.)
   // Sanity: reject an empty/zero matrix. NOTE: D3D perspective projections have
   // m33 == 0, so we must NOT require m33 != 0 — that rejected every VP.
   const float* vp0 = reinterpret_cast<const float*>(
@@ -5218,6 +5046,7 @@ static bool OnUpdateBufferRegion(reshade::api::device* dev, const void* data,
   // Save the game's UNJITTERED ViewProjection for the velocity compute.
   memcpy(d->globals_unjittered_vp.data(), vp0, 64);
   d->globals_vp_captured = true;
+  d->vp_cbv_handle = dest.handle;  // diag: buffer the VP was captured from
   // Per-buffer record: this buffer's own unjittered VP (used by the draw-time
   // effect un-jitter so we never write a stale VP from another buffer).
   auto* rec = FindGlobalsRec(d, dest);
@@ -5425,19 +5254,17 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   d->dlaa_diag.run_calls++;
   DlaaDiagOk(d);
 
-  if (!d->captured_depth_srv.handle || (!d->captured_scene_cbv_valid && !d->globals_vp_captured) ||
-      !d->captured_color_srv.handle) {
+  if (!d->captured_depth_srv.handle || !d->globals_vp_captured || !d->captured_color_srv.handle) {
     if (!d->captured_depth_srv.handle)
       DlaaDiagSet(d, kDlaaReasonMissingDepthSrv,
                   "no full-res depth SRV captured (lastCand fmt=%d %ux%u b=%u reject=%s)",
                   d->dlaa_diag.last_depth_fmt, d->dlaa_diag.last_depth_w,
                   d->dlaa_diag.last_depth_h, d->dlaa_diag.last_depth_binding,
                   DlaaDepthRejectName(d->dlaa_diag.last_depth_reject));
-    else if (!d->captured_scene_cbv_valid && !d->globals_vp_captured)
+    else if (!d->globals_vp_captured)
       DlaaDiagSet(d, kDlaaReasonMissingVpSource,
-                  "no tracked _Globals b0 AND no upload VP captured (lastVs=0x%08X tracked=%d globals=%d)",
-                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_tracked,
-                  (int)d->globals_vp_captured);
+                  "no _Globals upload VP captured (lastVs=0x%08X tracked=%d)",
+                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_tracked);
     else
       DlaaDiagSet(d, kDlaaReasonMissingColorSrv,
                   "no composite/FXAA t0 color captured (lastT0Ps=0x%08X)",
@@ -5570,9 +5397,9 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
                  d->captured_depth_res.handle ? 1 : 0,
                  DlaaReasonName(d->dlaa_diag.reason));
   } else {
-    // Read camera matrices from the game's _Globals CBV (depth-projection velocity)
+    // Camera matrices come from the upload capture (depth-projection velocity).
     auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
-    ReadSceneMatrices(dev, d, cl);
+    ReadSceneMatrices(d);
     if (shader_injection.dlaa_debug_logging > 0.5f)
       LogThrottled("vel-mv", reshade::log::level::info, 3u, 60u,
                    "[DLAA] veloc: matrices_valid=%d", (int)d->matrices_valid);
@@ -5630,29 +5457,24 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       // set), and log the exact bound state + OM (RTV/DSV) state so a repeat
       // names the bad descriptor instead of guessing.
       // The CS binds a constant buffer at b0 but never reads it (all matrices
-      // come from the b13 push constants). Prefer the game's scene _Globals when
-      // captured; otherwise bind the addon-owned placeholder so an unlisted /
-      // untracked scene VS cannot block deployment.
+      // come from the b13 push constants); bind the addon-owned placeholder so
+      // the descriptor is always valid.
       EnsureVelocityDummyCb(dev, d);
-      reshade::api::buffer_range scene_cbv_bind =
-          (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle)
-              ? d->captured_scene_cbv
-              : d->velocity_dummy_cbv;
       reshade::api::descriptor_table_update u[7] = {
         { d->velocity_tables[0], 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_sampler },
-        { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &scene_cbv_bind },
+        { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->velocity_dummy_cbv },
         { d->velocity_tables[2], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_depth_srv },
         { d->velocity_tables[3], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &motion_src },
         { d->velocity_tables[4], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->velocity_uav },
         { d->velocity_tables[5], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->effect_mask_srv },
         { d->velocity_tables[6], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->prev_depth_srv },
       };
-      if (!d->point_sampler.handle || !scene_cbv_bind.buffer.handle ||
+      if (!d->point_sampler.handle || !d->velocity_dummy_cbv.buffer.handle ||
           !d->captured_depth_srv.handle || !motion_src.handle ||
           !d->velocity_uav.handle || !d->effect_mask_srv.handle ||
           !d->prev_depth_srv.handle) {
         const char* missing = !d->point_sampler.handle ? "sampler"
-            : !scene_cbv_bind.buffer.handle ? "scene-cbv"
+            : !d->velocity_dummy_cbv.buffer.handle ? "b0-cbv"
             : !d->captured_depth_srv.handle ? "depth-srv"
             : !motion_src.handle ? "motion-src"
             : !d->velocity_uav.handle ? "velocity-uav"
@@ -5685,12 +5507,11 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
         if (cs_cb) cs_cb->GetDesc(&cbd);
         LogThrottled("veloc-dispatch", reshade::log::level::info, 3u, 60u,
                      "[DLAA] veloc: dispatch %ux%u depth=%s motion=%s mask=%s out=%s "
-                     "cbv=0x%llX/%uB(%s) b13=%uB omRtv=%u omDsv=%s dsvIsDepth=%d",
+                     "b0=0x%llX/%uB(dummy) b13=%uB omRtv=%u omDsv=%s dsvIsDepth=%d",
                      w, h, vdstr(d->captured_depth_srv).c_str(), vdstr(motion_src).c_str(),
                      vdstr(d->effect_mask_srv).c_str(), vdstr(d->velocity_uav).c_str(),
-                     (unsigned long long)scene_cbv_bind.buffer.handle,
-                     (unsigned)(scene_cbv_bind.size),
-                     (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy",
+                     (unsigned long long)d->velocity_dummy_cbv.buffer.handle,
+                     (unsigned)(d->velocity_dummy_cbv.size),
                      cbd.ByteWidth, om_num,
                      om_dsv ? "yes" : "no",
                      (dsv_res && dsv_res == reinterpret_cast<ID3D11Resource*>(d->captured_depth_res.handle)) ? 1 : 0);
@@ -6441,14 +6262,6 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 1.f, .label = "Opt 8: Skip Redundant VP Writes", .section = "Antialiasing",
         .tooltip = "CPU opt 8: skip the draw-time 64-byte _Globals jitter write when this buffer has not been re-uploaded since our last write this frame (upload_seq tracking; Map/Unmap invalidates). Behavior-preserving: the same bytes are already in place. Live.",
-        .labels = {"Off","On"},
-        .is_visible = []{ return g_fg_page < 0.5f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "DLAAOptReadbackSkip", .binding = &g_opt_readback_skip,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f, .label = "Opt 9: Skip VP Staging Readback", .section = "Antialiasing",
-        .tooltip = "CPU opt 9: when the upload-time unjittered ViewProjection was captured (the value ReadSceneMatrices already prefers), skip the _Globals staging copy + synchronous Map entirely. The staging path stays as the fallback when no upload was captured. Live.",
         .labels = {"Off","On"},
         .is_visible = []{ return g_fg_page < 0.5f; },
     },
@@ -7333,9 +7146,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           // Reset the per-frame depth-source preference (captures happen during the
           // next frame, before RunDLAA at FXAA).
           d->depth_primary_captured = false;
-          // The early scene-CBV staging copy is issued once per frame (at the
-          // first scene-geometry b0 push) and consumed at FXAA.
-          d->scene_cbv_copy_issued = false;
           // Effect mask is cleared at the first effect pass each frame.
           d->effect_mask_cleared_this_frame = false;
           // Per-object motion target cleared at the first char draw each frame.
