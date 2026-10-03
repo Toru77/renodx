@@ -396,7 +396,7 @@ enum DlaaDeployReason : uint32_t {
   kDlaaReasonNoEntry,          // neither FXAA nor final_blending on_draw fired
   kDlaaReasonMissingColorSrv,  // captured_color_srv never captured
   kDlaaReasonMissingDepthSrv,  // captured_depth_srv never captured
-  kDlaaReasonMissingSceneCbv,  // no scene-geometry VS b0 captured
+  kDlaaReasonMissingVpSource,  // no scene-geometry VS b0 AND no upload VP captured
   kDlaaReasonMissingRtv0,      // no render-target bind captured RTV0
   kDlaaReasonNgxUnsupported,   // NGX reports DLAA unsupported
   kDlaaReasonNgxInitFailed,    // NGX init failed / not initialized
@@ -414,7 +414,7 @@ enum DlaaDeployReason : uint32_t {
 };
 static const char* const kDlaaReasonNames[kDlaaReasonCount] = {
     "ok", "no-entry-point", "missing-color-srv", "missing-depth-srv",
-    "missing-scene-cbv", "missing-rtv0", "ngx-unsupported", "ngx-init-failed",
+    "missing-vp-source", "missing-rtv0", "ngx-unsupported", "ngx-init-failed",
     "ngx-feature-failed", "ngx-eval-failed", "ngx-output-failed", "eval-false",
     "velocity-pipeline-failed", "effect-mask-failed", "motion-target-failed",
     "prev-depth-failed", "matrices-invalid", "null-descriptor"};
@@ -778,6 +778,14 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
 
   reshade::api::buffer_range captured_scene_cbv = {};  // _Globals cbuffer at b0
   bool captured_scene_cbv_valid = false;
+  // Velocity compute b0 placeholder: the CS layout binds a constant buffer at b0
+  // but the shader never reads it (all matrices come from the push constants at
+  // b13). When the game's scene CBV was never captured (scene VS not in the
+  // hash list, or an untracked pipeline), binding this addon-owned 64-byte
+  // buffer keeps the descriptor valid so DLAA can still deploy from the
+  // upload-captured ViewProjection.
+  reshade::api::resource velocity_dummy_cb = {};
+  reshade::api::buffer_range velocity_dummy_cbv = {};
   reshade::api::resource_view captured_depth_srv = {};
   reshade::api::resource captured_depth_res = {};
   // OPT 6: view handles already classified as NOT depth-format (skips repeated
@@ -1006,7 +1014,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
   snprintf(buf, sizeof(buf),
            "[DLAA] status: aa=%d hdr=%d path=%s entry(final=%u fxaa=%u) run=%u ok=%u lastEntry=%s | "
            "reason=%s detail=%s | color=%s f=%u | depth=%s f=%u | rtv0=%s f=%u | "
-           "cbv=0x%llX valid=%d f=%u | globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X listed=%d | "
+           "cbv=0x%llX valid=%d f=%u b0=%s | globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X listed=%d | "
            "depthCand=%d %ux%u b=%u reject=%s | ngx=sup%d init%d feat%d evalFail%d | "
            "velpipe=%d prevDepth=%d invalidations=%u",
            (int)shader_injection.dlaa_enabled, (int)d->hdr_detected, hdr_path ? "pre" : "composite",
@@ -1016,6 +1024,7 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
            color, d->color_capture_frame, depth, d->depth_capture_frame, rtv0, diag.rtv0_capture_frame,
            (unsigned long long)d->captured_scene_cbv.buffer.handle, (int)d->captured_scene_cbv_valid,
            diag.cbv_capture_frame,
+           (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy",
            (int)d->globals_vp_captured, (int)d->matrices_valid,
            diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_listed,
            diag.last_depth_fmt, diag.last_depth_w, diag.last_depth_h, diag.last_depth_binding,
@@ -1041,9 +1050,10 @@ static bool DlaaStatusDraw() {
   ImGui::Text("Entry: final=%u fxaa=%u run=%u ok=%u fail=%u noEntry=%u",
               diag.final_entry_last, diag.fxaa_entry_last, diag.run_calls_last,
               diag.eval_ok_last, diag.eval_fail_last, diag.presents_without_entry);
-  ImGui::Text("Color f=%u  Depth f=%u  RTV0 f=%u  CBV f=%u valid=%d",
+  ImGui::Text("Color f=%u  Depth f=%u  RTV0 f=%u  CBV f=%u valid=%d b0=%s",
               d->color_capture_frame, d->depth_capture_frame, diag.rtv0_capture_frame,
-              diag.cbv_capture_frame, (int)d->captured_scene_cbv_valid);
+              diag.cbv_capture_frame, (int)d->captured_scene_cbv_valid,
+              (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy");
   ImGui::Text("LastT0=0x%08X  LastB0Vs=0x%08X listed=%d",
               diag.last_t0_ps_hash, diag.last_b0_vs_hash, (int)diag.last_b0_vs_listed);
   ImGui::Text("DepthCand fmt=%d %ux%u b=%u reject=%s", diag.last_depth_fmt,
@@ -1132,6 +1142,9 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   d->matrices_valid = false;
   if (d->point_sampler.handle) dev->destroy_sampler(d->point_sampler);
   d->point_sampler = {};
+  if (d->velocity_dummy_cb.handle) dev->destroy_resource(d->velocity_dummy_cb);
+  d->velocity_dummy_cb = {};
+  d->velocity_dummy_cbv = {};
   dv(d->prev_color_srv); dr(d->prev_color_texture);
   if (d->prev_depth_srv.handle) { reinterpret_cast<ID3D11ShaderResourceView*>(d->prev_depth_srv.handle)->Release(); d->prev_depth_srv = {}; }
   if (d->prev_depth_tex) { d->prev_depth_tex->Release(); d->prev_depth_tex = nullptr; }
@@ -1201,6 +1214,24 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
 // CreateVelocityPipeline calls FlushCrashRing when the device is found dead.)
 static void FlushCrashRing(DeviceData* d);
 
+// Addon-owned b0 placeholder for the velocity compute: the CS layout binds a
+// constant buffer at b0 but the shader never reads it (all matrices come from
+// the b13 push constants). Keeps the descriptor valid when the game's scene CBV
+// was never captured (unlisted/untracked scene VS). Retried at every RunDLAA so
+// a transient create failure cannot permanently block deployment.
+static bool EnsureVelocityDummyCb(reshade::api::device* dev, DeviceData* d) {
+  if (!dev || !d) return false;
+  if (d->velocity_dummy_cb.handle) return true;
+  // Create through ReShade's API so the descriptor-table emulation tracks it.
+  reshade::api::resource_desc rd(64ull, reshade::api::memory_heap::gpu_only,
+                                 reshade::api::resource_usage::constant_buffer);
+  if (!dev->create_resource(rd, nullptr, reshade::api::resource_usage::constant_buffer,
+                            &d->velocity_dummy_cb) || !d->velocity_dummy_cb.handle)
+    return false;
+  d->velocity_dummy_cbv = {d->velocity_dummy_cb, 0ull, 64ull};
+  return true;
+}
+
 static bool CreateVelocityPipeline(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d || d->velocity_pipeline.handle) return true;
 
@@ -1208,6 +1239,10 @@ static bool CreateVelocityPipeline(reshade::api::device* dev, DeviceData* d) {
   sd.filter = reshade::api::filter_mode::min_mag_mip_point;
   sd.address_u = sd.address_v = sd.address_w = reshade::api::texture_address_mode::clamp;
   dev->create_sampler(sd, &d->point_sampler);
+
+  // b0 placeholder (unused by the CS): keeps the velocity constant-buffer
+  // descriptor non-null when the game's scene CBV was never captured.
+  EnsureVelocityDummyCb(dev, d);
 
   using DS = reshade::api::shader_stage;
   using DT = reshade::api::descriptor_type;
@@ -4694,13 +4729,8 @@ static bool IssueSceneCbvCopy(reshade::api::command_list* cmd_list, DeviceData* 
 //   curr_view_proj_inv = ProjectionInverse * ViewInverse (= inverse(ViewProjection))
 static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11DeviceContext* ctx) {
   if (!dev || !d || !ctx) return false;
-  if (!d->captured_scene_cbv_valid) {
-    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV never captured");
-    return false;
-  }
-  auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
-  if (!cb) {
-    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV handle null");
+  if (!d->captured_scene_cbv_valid && !d->globals_vp_captured) {
+    DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "no scene CBV and no upload VP captured");
     return false;
   }
 
@@ -4710,7 +4740,17 @@ static bool ReadSceneMatrices(reshade::api::device* dev, DeviceData* d, ID3D11De
     // the staged readback below would be overridden with, so the staging copy +
     // synchronous Map are discarded work. The staging path remains the fallback.
     view_proj = d->globals_unjittered_vp;
+  } else if (!d->captured_scene_cbv_valid) {
+    // No scene CBV (scene VS not in the hash list, or an untracked pipeline) but
+    // the upload capture exists: use it directly. This is the exact value the
+    // staging path would have overridden the staged VP with.
+    view_proj = d->globals_unjittered_vp;
   } else {
+    auto* cb = reinterpret_cast<ID3D11Buffer*>(d->captured_scene_cbv.buffer.handle);
+    if (!cb) {
+      DlaaDiagSet(d, kDlaaReasonMatricesInvalid, "scene CBV handle null");
+      return false;
+    }
     // Clamp the read window (must cover c10..c21 = 352 bytes).
     uint64_t range_size = d->captured_scene_cbv.size;
     if (range_size < 352ull) range_size = 352ull;
@@ -5509,17 +5549,19 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
   d->dlaa_diag.run_calls++;
   DlaaDiagOk(d);
 
-  if (!d->captured_depth_srv.handle || !d->captured_scene_cbv_valid || !d->captured_color_srv.handle) {
+  if (!d->captured_depth_srv.handle || (!d->captured_scene_cbv_valid && !d->globals_vp_captured) ||
+      !d->captured_color_srv.handle) {
     if (!d->captured_depth_srv.handle)
       DlaaDiagSet(d, kDlaaReasonMissingDepthSrv,
                   "no full-res depth SRV captured (lastCand fmt=%d %ux%u b=%u reject=%s)",
                   d->dlaa_diag.last_depth_fmt, d->dlaa_diag.last_depth_w,
                   d->dlaa_diag.last_depth_h, d->dlaa_diag.last_depth_binding,
                   DlaaDepthRejectName(d->dlaa_diag.last_depth_reject));
-    else if (!d->captured_scene_cbv_valid)
-      DlaaDiagSet(d, kDlaaReasonMissingSceneCbv,
-                  "no scene-geometry b0 captured (lastVs=0x%08X listed=%d)",
-                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_listed);
+    else if (!d->captured_scene_cbv_valid && !d->globals_vp_captured)
+      DlaaDiagSet(d, kDlaaReasonMissingVpSource,
+                  "no scene-geometry b0 AND no upload VP captured (lastVs=0x%08X listed=%d globals=%d)",
+                  d->dlaa_diag.last_b0_vs_hash, (int)d->dlaa_diag.last_b0_vs_listed,
+                  (int)d->globals_vp_captured);
     else
       DlaaDiagSet(d, kDlaaReasonMissingColorSrv,
                   "no composite/FXAA t0 color captured (lastT0Ps=0x%08X)",
@@ -5711,21 +5753,30 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       // valid. Guards: skip on a null descriptor (never dispatch on a partial
       // set), and log the exact bound state + OM (RTV/DSV) state so a repeat
       // names the bad descriptor instead of guessing.
+      // The CS binds a constant buffer at b0 but never reads it (all matrices
+      // come from the b13 push constants). Prefer the game's scene _Globals when
+      // captured; otherwise bind the addon-owned placeholder so an unlisted /
+      // untracked scene VS cannot block deployment.
+      EnsureVelocityDummyCb(dev, d);
+      reshade::api::buffer_range scene_cbv_bind =
+          (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle)
+              ? d->captured_scene_cbv
+              : d->velocity_dummy_cbv;
       reshade::api::descriptor_table_update u[7] = {
         { d->velocity_tables[0], 0, 0, 1, reshade::api::descriptor_type::sampler, &d->point_sampler },
-        { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &d->captured_scene_cbv },
+        { d->velocity_tables[1], 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &scene_cbv_bind },
         { d->velocity_tables[2], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->captured_depth_srv },
         { d->velocity_tables[3], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &motion_src },
         { d->velocity_tables[4], 0, 0, 1, reshade::api::descriptor_type::texture_unordered_access_view, &d->velocity_uav },
         { d->velocity_tables[5], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->effect_mask_srv },
         { d->velocity_tables[6], 0, 0, 1, reshade::api::descriptor_type::texture_shader_resource_view, &d->prev_depth_srv },
       };
-      if (!d->point_sampler.handle || !d->captured_scene_cbv.buffer.handle ||
+      if (!d->point_sampler.handle || !scene_cbv_bind.buffer.handle ||
           !d->captured_depth_srv.handle || !motion_src.handle ||
           !d->velocity_uav.handle || !d->effect_mask_srv.handle ||
           !d->prev_depth_srv.handle) {
         const char* missing = !d->point_sampler.handle ? "sampler"
-            : !d->captured_scene_cbv.buffer.handle ? "scene-cbv"
+            : !scene_cbv_bind.buffer.handle ? "scene-cbv"
             : !d->captured_depth_srv.handle ? "depth-srv"
             : !motion_src.handle ? "motion-src"
             : !d->velocity_uav.handle ? "velocity-uav"
@@ -5758,11 +5809,13 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
         if (cs_cb) cs_cb->GetDesc(&cbd);
         LogThrottled("veloc-dispatch", reshade::log::level::info, 3u, 60u,
                      "[DLAA] veloc: dispatch %ux%u depth=%s motion=%s mask=%s out=%s "
-                     "cbv=0x%llX/%uB b13=%uB omRtv=%u omDsv=%s dsvIsDepth=%d",
+                     "cbv=0x%llX/%uB(%s) b13=%uB omRtv=%u omDsv=%s dsvIsDepth=%d",
                      w, h, vdstr(d->captured_depth_srv).c_str(), vdstr(motion_src).c_str(),
                      vdstr(d->effect_mask_srv).c_str(), vdstr(d->velocity_uav).c_str(),
-                     (unsigned long long)d->captured_scene_cbv.buffer.handle,
-                     (unsigned)(d->captured_scene_cbv.size), cbd.ByteWidth, om_num,
+                     (unsigned long long)scene_cbv_bind.buffer.handle,
+                     (unsigned)(scene_cbv_bind.size),
+                     (d->captured_scene_cbv_valid && d->captured_scene_cbv.buffer.handle) ? "scene" : "dummy",
+                     cbd.ByteWidth, om_num,
                      om_dsv ? "yes" : "no",
                      (dsv_res && dsv_res == reinterpret_cast<ID3D11Resource*>(d->captured_depth_res.handle)) ? 1 : 0);
         for (UINT i = 0; i < om_num; ++i)
