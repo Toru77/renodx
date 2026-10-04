@@ -2219,6 +2219,47 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
+    // -- Sora 1st foliage (legacy hashes) --
+    {
+        0x68C07DEAu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x68C07DEAu,
+            .code = __0x68C07DEA,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xBA6CE3DAu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xBA6CE3DAu,
+            .code = __0xBA6CE3DA,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x4942F14Cu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x4942F14Cu,
+            .code = __0x4942F14C,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xAAAD1F02u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xAAAD1F02u,
+            .code = __0xAAAD1F02,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x9645D00Fu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x9645D00Fu,
+            .code = __0x9645D00F,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
     // -- Sora 2nd foliage (GTVBAO foliage marker bit 15 in o1.w) --
     {
         0x46FCDC51u,
