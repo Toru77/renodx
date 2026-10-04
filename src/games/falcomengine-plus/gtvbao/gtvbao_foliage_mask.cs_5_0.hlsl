@@ -23,16 +23,14 @@ void main(uint2 p : SV_DispatchThreadID)
 g_outFoliageMask.GetDimensions(maskW, maskH);
 if (p.x >= maskW || p.y >= maskH) return;
     if (GTVBAO_exclude_foliage > 0.5f) {
-        uint mrtW, mrtH;
+        uint mrtW, mrtH, fullW, fullH;
         g_srcMrtNormal.GetDimensions(mrtW, mrtH);
-        // GTVBAO_MrtTexel: same mapping the main pass and GI path use, so the
-        // mask marks the pixel whose normal is actually read. Texel-space
-        // coordinates, matching the original arithmetic exactly.
-        int2 mrtTC = GTVBAO_MrtTexel((float2(p) + 0.5) * (float2(mrtW, mrtH) / float2(max(maskW, 1u), max(maskH, 1u))),
-                                     float2(mrtW, mrtH));
-        uint4 _mrtV = g_srcMrtNormal.Load(int3(mrtTC, 0));
-        uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;
-        if (_mrtC & 0x8000u) {
+        g_srcWorkingDepth.GetDimensions(fullW, fullH);
+        // Same predicate the main pass uses, so the mask marks a half texel
+        // exactly when the pixel detection would mark it.
+        if (GTVBAO_FoliageMarked(g_srcMrtNormal, p, uint2(maskW, maskH), uint2(fullW, fullH),
+                                 uint2(mrtW, mrtH), GTVBAO_foliage_channel_mode >= 0.5f,
+                                 GTVBAO_resolution > 0.5f)) {
             g_outFoliageMask[p] = 1u;
             return;
         }

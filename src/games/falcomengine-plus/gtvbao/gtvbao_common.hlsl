@@ -233,6 +233,41 @@ int2 GTVBAO_MrtTexel(float2 uvTexelSpace, float2 mrtDims)
   return clamp(int2(floor(uvTexelSpace)), int2(0, 0), d - 1);
 }
 
+// ── Foliage mark test (bit 15 of the MRT normal's Sora .w / Kai .z) ──
+// Full mode tests the single texel the work->MRT ratio selects, which is the
+// exact expression the main pass always used. Half mode tests the whole
+// full-res footprint of the half texel: the {2t, 2t+1} block, mapped through
+// the full->MRT ratio. A single representative texel is insufficient because
+// alpha-tested foliage marks only the leaf texels, so a block's other texel can
+// hold the mark the representative misses.
+bool GTVBAO_FoliageMarked(Texture2D<uint4> mrtNormal, uint2 workTC, uint2 workDims,
+                          uint2 fullDims, uint2 mrtDims, bool useZ, bool halfRes)
+{
+  if (!halfRes)
+  {
+    const float2 scale = float2(mrtDims) / max(float2(workDims), 1.0.xx);
+    uint4 mrtV = mrtNormal.Load(int3(GTVBAO_MrtTexel((float2(workTC) + 0.5) * scale, float2(mrtDims)), 0));
+    uint mrtC = useZ ? mrtV.z : mrtV.w;
+    return (mrtC & 0x8000u) != 0u;
+  }
+
+  const float2 scaleFull = float2(mrtDims) / max(float2(fullDims), 1.0.xx);
+  const int2 blockBase = int2(workTC) * 2;
+  [unroll]
+  for (int by = 0; by < 2; ++by)
+  {
+    [unroll]
+    for (int bx = 0; bx < 2; ++bx)
+    {
+      uint4 mrtV = mrtNormal.Load(int3(
+          GTVBAO_MrtTexel((float2(blockBase + int2(bx, by)) + 0.5) * scaleFull, float2(mrtDims)), 0));
+      uint mrtC = useZ ? mrtV.z : mrtV.w;
+      if ((mrtC & 0x8000u) != 0u) return true;
+    }
+  }
+  return false;
+}
+
 // The normal-tuning shaping that BuildSelectedInputNormal applies, extracted so
 // the GI path can apply exactly the same shaping to its per-sample normal.
 // Without this, the GI term silently ignored every MRT normal tuning setting

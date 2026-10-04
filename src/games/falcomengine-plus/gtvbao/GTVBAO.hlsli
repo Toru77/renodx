@@ -453,13 +453,11 @@ void GTVBAO_MainPass( const uint2 pixCoord, lpfloat sliceCount, lpfloat stepsPer
     bool gtvbao_foliage_pixel = false;
     bool checkFoliage = (GTVBAO_debug_mode > 8.5f) || (GTVBAO_exclude_foliage > 0.5f);
     if (checkFoliage) {
-      // GTVBAO_MrtTexel so the foliage test reads exactly the texel the normal
-      // decode reads; a one-texel disagreement would mark the wrong pixel.
-      int2 mrtTC = GTVBAO_MrtTexel((float2(pixCoord) + 0.5) * (float2(g_mrtW, g_mrtH) / max(float2(g_workDims), 1.0.xx)),
-                                    float2(g_mrtW, g_mrtH));
-      uint4 _mrtV = mrtNormalTexture.Load(int3(mrtTC, 0));
-      uint _mrtC = (GTVBAO_foliage_channel_mode < 0.5f) ? _mrtV.w : _mrtV.z;
-      gtvbao_foliage_pixel = (_mrtC & 0x8000u) != 0u;
+      // Half mode tests the whole {2t, 2t+1} block, so the mark cannot be
+      // missed by the parity the single-texel ratio mapping happens to select.
+      gtvbao_foliage_pixel = GTVBAO_FoliageMarked(
+          mrtNormalTexture, pixCoord, (uint2)g_workDims, uint2(g_fullDepthW, g_fullDepthH),
+          uint2(g_mrtW, g_mrtH), GTVBAO_foliage_channel_mode >= 0.5f, g_halfRes);
     }
 
 	// Generating screen space normals in-place is faster than generating normals in a separate pass but requires
