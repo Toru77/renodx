@@ -2284,6 +2284,55 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
+    // -- Sora 2nd foliage (new hashes) --
+    {
+        0x5F527E52u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x5F527E52u,
+            .code = __0x5F527E52,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x73DC9D7Eu,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x73DC9D7Eu,
+            .code = __0x73DC9D7E,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xA2E80908u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xA2E80908u,
+            .code = __0xA2E80908,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x882FADE1u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x882FADE1u,
+            .code = __0x882FADE1,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0xAA835FE0u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xAA835FE0u,
+            .code = __0xAA835FE0,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
+    {
+        0x2DADE2B8u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x2DADE2B8u,
+            .code = __0x2DADE2B8,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
     // -- Kai foliage (GTVBAO foliage marker) --
     {
         0x534E54EAu,
