@@ -41,6 +41,7 @@ static constexpr std::string_view kCategories[] = {
     "Character",
     "Anti-Aliasing",
     "Post Processing",
+    "Ray Tracing",
 };
 
 // Section -> category for rows visible in Basic mode.
@@ -64,6 +65,7 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Custom TAA", "Anti-Aliasing"},
     {"Depth of Field", "Post Processing"},
     {"Motion Blur", "Post Processing"},
+    {"Ray Tracing", "Ray Tracing"},
     {"Info", "General"},
 };
 
@@ -838,6 +840,8 @@ static void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
   DrawSidebar(content_height);
   ImGui::SameLine();
   any_change |= DrawCategoryContent(ActiveCategory(), content_height);
+
+  falcom_world::DrawDebugOverlay();
 
   PopOverlayTheme();
 
