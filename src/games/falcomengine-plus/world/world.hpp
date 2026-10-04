@@ -16,10 +16,13 @@
 #include "capture/state_capture.hpp"
 #include "capture/draw_census.hpp"
 #include "capture/mesh_capture.hpp"
+#include "capture/depth_probe.hpp"
 #include "research/classification.hpp"
 #include "research/coverage.hpp"
 #include "research/reference_hints.hpp"
 #include "research/transform_candidates.hpp"
+#include "research/world_report.hpp"
+#include "research/auto_research.hpp"
 #include "debug/overlay.hpp"
 #include "world_settings.hpp"
 
@@ -58,7 +61,11 @@ inline void Use(DWORD fdw_reason, bool supported) {
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
       reshade::register_event<reshade::addon_event::present>(OnWorldPresent);
+      reshade::register_event<reshade::addon_event::present>(OnWorldPresentAuto);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceProbe);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
+      reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
       break;
     }
     case DLL_PROCESS_DETACH: {
@@ -70,7 +77,11 @@ inline void Use(DWORD fdw_reason, bool supported) {
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
       reshade::unregister_event<reshade::addon_event::present>(OnWorldPresent);
+      reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentAuto);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceProbe);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
+      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
       renodx::utils::command_action::Unregister(WorldDrawCallback{});
       renodx::utils::constants::Use(fdw_reason);
       renodx::utils::scene::Use(fdw_reason);

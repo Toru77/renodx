@@ -8,6 +8,7 @@
 // split structured-buffer copy on the game's command list (resolved at
 // present) so dynamic buffers cannot alias the captured draw.
 
+#include <algorithm>
 #include <type_traits>
 
 #include "../world_state.hpp"
@@ -62,6 +63,7 @@ inline void ArmCapture(uint32_t vs_hash, uint32_t serial) {
   g_state.arm_active = true;
   g_state.arm_vs_hash = vs_hash;
   g_state.arm_serial = serial;
+  g_state.arm_vs_set.clear();
   g_state.status = "armed for next matching draw";
 }
 
@@ -109,7 +111,13 @@ inline void TryCaptureArmedDraw(
     WorldCommandListData* cl_data) {
   std::lock_guard<std::mutex> lock(g_state.mutex);
   if (!g_state.arm_active) return;
-  if (g_state.arm_vs_hash != 0u && g_state.arm_vs_hash != draw.vs_hash) return;
+  if (!g_state.arm_vs_set.empty()) {
+    if (std::find(g_state.arm_vs_set.begin(), g_state.arm_vs_set.end(), draw.vs_hash) == g_state.arm_vs_set.end()) {
+      return;
+    }
+  } else if (g_state.arm_vs_hash != 0u && g_state.arm_vs_hash != draw.vs_hash) {
+    return;
+  }
   if (g_state.arm_serial != 0u && g_state.arm_serial != draw.serial) return;
 
   g_state.arm_active = false;
@@ -259,6 +267,24 @@ inline void CommitDrawRecord(
         std::lock_guard<std::mutex> lock(g_state.mutex);
         CaptureCameraFromBytes(bytes, record.frame);
       }
+    }
+    const reshade::api::resource_view depth_view = cl_data->ps_srv_view[kLightingDepthRegisterSora2nd];
+    const reshade::api::resource depth_resource = cl_data->ps_srv[kLightingDepthRegisterSora2nd];
+    if (depth_view.handle != 0u && depth_resource.handle != 0u) {
+      uint32_t width = 0u;
+      uint32_t height = 0u;
+      const auto desc = device->get_resource_desc(depth_resource);
+      if (desc.type == reshade::api::resource_type::texture_2d) {
+        width = desc.texture.width;
+        height = desc.texture.height;
+      }
+      std::lock_guard<std::mutex> lock(g_state.mutex);
+      g_state.depth_source.valid = true;
+      g_state.depth_source.frame = record.frame;
+      g_state.depth_source.view = depth_view;
+      g_state.depth_source.resource = depth_resource;
+      g_state.depth_source.width = width;
+      g_state.depth_source.height = height;
     }
   }
 

@@ -34,6 +34,14 @@ inline constexpr uint32_t kMaxCbSnapshots = 32u;
 inline constexpr uint32_t kMaxSrvSnapshots = 8u;
 inline constexpr uint64_t kMaxSrvReadBytes = 4ull * 1024ull * 1024ull;
 inline constexpr uint32_t kLightingHashSora2nd = 0xCA3D8596u;
+inline constexpr uint32_t kLightingDepthRegisterSora2nd = 4u;
+inline constexpr uint32_t kProbeTopCandidates = 8u;
+inline constexpr uint32_t kProbeInstances = 4u;
+inline constexpr uint32_t kProbeVertices = 12u;
+inline constexpr uint32_t kProbeMaxSamples = kProbeInstances * kProbeVertices;
+inline constexpr uint32_t kMinDepthMatches = 6u;
+inline constexpr uint64_t kAutoRunTimeoutFrames = 18000u;   // ~5 minutes at 60 fps
+inline constexpr uint64_t kAutoCaptureSpacingFrames = 120u; // ~2 seconds at 60 fps
 
 enum class CandidateKind : uint8_t {
   Cb4x4Row = 0,
@@ -200,6 +208,7 @@ struct FamilyStats {
   bool transform_found = false;
   uint8_t label = 0u;
   uint8_t label_source = 0u;
+  bool label_prefilled = false;
   // Confirmed transform source, recorded when the family is marked verified.
   uint8_t transform_kind = 0u;
   uint32_t transform_slot = 0u;
@@ -207,6 +216,113 @@ struct FamilyStats {
   uint32_t transform_stride = 0u;
   uint32_t transform_base = 0u;
   bool transform_has_prev = false;
+  // Automated runtime verification (decompilation remains a separate step).
+  uint8_t auto_verdict = 0u;
+  uint32_t captures_attempted = 0u;
+  uint32_t captures_ok = 0u;
+  float depth_match_ratio = 0.f;
+};
+
+struct DepthSource {
+  bool valid = false;
+  uint32_t frame = UINT32_MAX;
+  reshade::api::resource_view view = {0u};
+  reshade::api::resource resource = {0u};
+  uint32_t width = 0u;
+  uint32_t height = 0u;
+};
+
+struct ProbeSampleDiag {
+  uint32_t instance = 0u;
+  float uv[2] = {};
+  float expected_linear = 0.f;
+  float sampled_linear = 0.f;
+  float error = 0.f;
+  uint8_t classification = 0u;  // 0 out-of-screen, 1 match, 2 occluded, 3 mismatch
+};
+
+struct ProbeMetrics {
+  uint32_t samples = 0u;
+  uint32_t out_of_screen = 0u;
+  uint32_t match = 0u;
+  uint32_t occluded = 0u;
+  uint32_t mismatch = 0u;
+  float match_ratio = 0.f;
+  float mean_abs_error = 0.f;
+  float mean_expected = 0.f;
+  bool valid = false;
+  std::vector<ProbeSampleDiag> diag;
+};
+
+enum class AutoVerdict : uint8_t {
+  Pending = 0,
+  Verified,
+  VerifiedSingleCapture,
+  Failed,
+  NotObserved,
+};
+
+inline const char* AutoVerdictName(uint8_t verdict) {
+  switch (static_cast<AutoVerdict>(verdict)) {
+    case AutoVerdict::Verified: return "Verified";
+    case AutoVerdict::VerifiedSingleCapture: return "Verified (single capture)";
+    case AutoVerdict::Failed: return "Failed";
+    case AutoVerdict::NotObserved: return "Not observed";
+    default: return "Pending";
+  }
+}
+
+struct AutoCapture {
+  uint32_t frame = 0u;
+  uint32_t draw_serial = 0u;
+  CandidateKind kind = CandidateKind::Cb4x4Row;
+  uint8_t stage = 0u;
+  uint32_t slot = 0u;
+  uint32_t matrix_offset = 0u;
+  uint32_t stride = 0u;
+  uint32_t base_offset = 0u;
+  uint32_t instances_tested = 0u;
+  uint32_t instances_ok = 0u;
+  float projection_score = 0.f;
+  ProbeMetrics probe;
+  std::vector<float> matrices;       // bounded: up to 4 instances
+  std::vector<float> prev_matrices;  // bounded: up to 4 instances when available
+  bool candidate_valid = false;
+  bool depth_ok = false;
+  bool pass = false;
+  std::string failure_reason;
+};
+
+struct AutoFamilyResult {
+  uint32_t vs_hash = 0u;
+  std::vector<AutoCapture> captures;
+  uint8_t verdict = 0u;
+  std::string failure_reason;
+  bool runtime_verified = false;
+  bool depth_pass = false;
+  bool cross_capture_pass = false;
+  uint32_t srv_mask = 0u;
+  int32_t instance_offset = 0;
+  uint32_t read_stride = 0u;
+  uint64_t read_offset = 0u;
+  uint64_t read_size = 0u;
+};
+
+struct AutoState {
+  bool active = false;
+  bool stop_requested = false;
+  bool rerun_all = false;
+  uint32_t rounds = 3u;  // target captures per family
+  std::vector<uint32_t> queue;
+  std::vector<uint32_t> pending;
+  uint32_t last_vs = 0u;
+  uint64_t deadline_frame = 0u;
+  uint64_t start_frame = 0u;
+  uint64_t next_capture_frame = 0u;
+  uint32_t families_done = 0u;
+  uint32_t last_processed_serial = 0u;
+  std::vector<AutoFamilyResult> results;
+  bool finalized = false;
 };
 
 struct State {
@@ -216,6 +332,11 @@ struct State {
   float setting_overlay_mode = 0.f;
   float setting_overlay_stride = 8.f;
   float setting_overlay_show_prev = 0.f;
+  float setting_probe_threshold = 0.35f;
+  float setting_probe_tol_rel = 0.05f;
+  float setting_probe_tol_abs = 0.002f;
+  float setting_auto_rounds = 3.f;
+  float setting_auto_rerun = 0.f;
 
   std::atomic<uint32_t> frame{0u};
   std::atomic<uint32_t> next_serial{0u};
@@ -230,10 +351,13 @@ struct State {
   bool arm_active = false;
   uint32_t arm_vs_hash = 0u;
   uint32_t arm_serial = 0u;
+  std::vector<uint32_t> arm_vs_set;  // non-empty = opportunistic multi-family arming
 
   bool mesh_capture_pending = false;
   CapturedDraw captured;
   CameraSnapshot camera;
+  DepthSource depth_source;
+  AutoState auto_research;
 
   std::vector<TransformCandidate> candidates;
   uint32_t selected_family = 0u;

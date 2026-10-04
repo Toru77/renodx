@@ -95,7 +95,8 @@ inline bool ProjectCandidateInstance(
     uint32_t instance,
     const std::array<float, 3>& point,
     float* out_uv,
-    float* out_world) {
+    float* out_world,
+    float* out_ndc_z = nullptr) {
   if (out_uv == nullptr || out_world == nullptr) return false;
   const uint32_t floats = KindMatrixFloats(candidate.kind);
   if (candidate.matrices.size() < (static_cast<size_t>(instance) + 1u) * floats) return false;
@@ -145,7 +146,36 @@ inline bool ProjectCandidateInstance(
   const float inv_w = 1.f / clip[3];
   out_uv[0] = clip[0] * inv_w * 0.5f + 0.5f;
   out_uv[1] = -clip[1] * inv_w * 0.5f + 0.5f;
+  if (out_ndc_z != nullptr) *out_ndc_z = clip[2] * inv_w;
   return true;
+}
+
+inline uint64_t CandidateSignature(const TransformCandidate& candidate) {
+  uint64_t hash = 1469598103934665603ull;
+  const auto mix = [&hash](uint64_t value) {
+    hash ^= value;
+    hash *= 1099511628211ull;
+  };
+  mix(static_cast<uint64_t>(candidate.kind));
+  mix(candidate.slot);
+  mix(candidate.matrix_offset);
+  mix(candidate.stride);
+  mix(candidate.base_offset);
+  return hash;
+}
+
+inline void CollectProbeCandidates(
+    const std::vector<TransformCandidate>& candidates,
+    std::vector<uint32_t>* out_indices,
+    uint32_t max_candidates) {
+  if (out_indices == nullptr) return;
+  out_indices->clear();
+  std::unordered_set<uint64_t> seen;
+  for (uint32_t i = 0; i < candidates.size() && out_indices->size() < max_candidates; ++i) {
+    const uint64_t signature = CandidateSignature(candidates[i]);
+    if (!seen.insert(signature).second) continue;
+    out_indices->push_back(i);
+  }
 }
 
 inline bool ProjectCandidatePrevInstance(

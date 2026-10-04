@@ -17,6 +17,8 @@ struct __declspec(uuid("e0b7d0f1-3f6a-4b21-9c8e-5a1d2f3b4c50")) WorldCommandList
   std::array<reshade::api::resource, kCbSlotCapacity> ps_cb = {};
   std::array<reshade::api::resource, kSrvSlotCapacity> vs_srv = {};
   std::array<reshade::api::resource_view, kSrvSlotCapacity> vs_srv_view = {};
+  std::array<reshade::api::resource, kSrvSlotCapacity> ps_srv = {};
+  std::array<reshade::api::resource_view, kSrvSlotCapacity> ps_srv_view = {};
 };
 
 inline WorldCommandListData* GetWorldCommandListData(reshade::api::command_list* cmd_list) {
@@ -68,7 +70,7 @@ inline void OnPushDescriptorsWorld(
   }
 
   if (update.type == reshade::api::descriptor_type::shader_resource_view) {
-    if (!vertex_stage) return;
+    if (!vertex_stage && !pixel_stage) return;
     auto* device = cmd_list->get_device();
     if (device == nullptr) return;
     const auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
@@ -76,13 +78,15 @@ inline void OnPushDescriptorsWorld(
       const uint32_t slot = update.binding + i;
       if (slot >= kSrvSlotCapacity) continue;
       const reshade::api::resource_view view = views[i];
-      if (view.handle == 0u) {
-        data->vs_srv[slot] = {};
-        data->vs_srv_view[slot] = {};
-        continue;
+      const reshade::api::resource resource = (view.handle != 0u) ? device->get_resource_from_view(view) : reshade::api::resource{0u};
+      if (vertex_stage) {
+        data->vs_srv_view[slot] = view;
+        data->vs_srv[slot] = resource;
       }
-      data->vs_srv_view[slot] = view;
-      data->vs_srv[slot] = device->get_resource_from_view(view);
+      if (pixel_stage) {
+        data->ps_srv_view[slot] = view;
+        data->ps_srv[slot] = resource;
+      }
     }
   }
 }

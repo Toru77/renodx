@@ -36,6 +36,7 @@
 #include "../../utils/dlss_hook.hpp"
 #include "./shared.h"
 #include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
+#include "./world/world.hpp"  // Phase 0 world-space research module (DevKit-only)
 
 namespace {
 
@@ -1041,7 +1042,7 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   GTVBAODescriptorTableSet multibounce_tables = {};
   bool vbgi_denoised_valid = false;            // true after first denoise completes
   reshade::api::resource_view fallback_uav = {};  // 1x1 UAV fallback
-  // -- Foliage mask (quarter-res R8_UINT, pre-pass) --
+  // -- Foliage mask (AO-domain R8_UINT, pre-pass) --
   reshade::api::resource foliage_mask_texture = {};
   reshade::api::resource_view foliage_mask_srv = {};
   reshade::api::resource_view foliage_mask_uav = {};
@@ -9541,8 +9542,8 @@ static void CreateGTVBAOResources(reshade::api::device* dev, DeviceData* d,
           "VBGI reconstruction will be unavailable in Half mode.");
     }
   }
-  // Foliage mask (full-res R8_UINT)
-  mk(w, h, reshade::api::format::r8_uint,
+  // Foliage mask (AO working domain R8_UINT: full in Full, half in Half)
+  mk(aw, ah, reshade::api::format::r8_uint,
      &d->foliage_mask_texture, &d->foliage_mask_srv, &d->foliage_mask_uav);
   mk(w, h, reshade::api::format::r8g8b8a8_unorm,
      &d->debug_texture, &d->debug_srv, &d->debug_uav);
@@ -12058,9 +12059,9 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
     }
   }
 
-  // -- Foliage mask pre-pass (full-res, reads MRT normal, writes R8_UINT) --
+  // -- Foliage mask pre-pass (AO working domain, reads MRT normal, writes R8_UINT) --
   if (foliage_mask_valid) {
-    uint32_t mkW = w, mkH = h;
+    uint32_t mkW = aw, mkH = ah;
     bind_pipe(d->foliage_mask_pipeline);
     reshade::api::resource_view fm_srvs[2] = {
         d->depth_mips_srv,                          // t0 � working depth (GetDimensions)
@@ -12507,6 +12508,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_addon(h_module);
       break;
   }
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    falcom_world::AddSettings(&settings, IsSora2nd());
+  }
+  falcom_world::Use(fdw_reason, IsSora2nd());
   falcom_ui::Use(fdw_reason, &settings);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   return TRUE;
