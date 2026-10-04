@@ -431,13 +431,16 @@ struct DlaaDeployDiag {
   char detail[128] = {};
   // Per-present counters (reset at present after the edge/status evaluation).
   uint32_t final_entry = 0u;   // OnBeforeFinalBlendingDraw calls (AA=DLAA, HDR path)
+  uint32_t dof_entry = 0u;     // DLSS evals at the DOF FocusBuffer producer (Pre-ToneMap)
   uint32_t fxaa_entry = 0u;    // OnBeforeFxaaDraw calls (AA=DLAA)
   uint32_t run_calls = 0u;     // RunDLAA invocations
   uint32_t eval_ok = 0u;       // successful RunDLAA (eval or debug output bound)
   uint32_t eval_fail = 0u;     // failed EvaluateDLSS
   uint32_t presents_without_entry = 0u;
+  uint32_t last_dof_ps = 0u;   // PS hash of the last DOF producer that triggered
+  uint32_t last_dof_slot = 0u; // scene-color slot used at that producer
   // Last-present copies for the ImGui row (counters are reset before ImGui draws).
-  uint32_t final_entry_last = 0u, fxaa_entry_last = 0u, run_calls_last = 0u;
+  uint32_t final_entry_last = 0u, dof_entry_last = 0u, fxaa_entry_last = 0u, run_calls_last = 0u;
   uint32_t eval_ok_last = 0u, eval_fail_last = 0u;
   // Deploy edge tracking.
   bool deploy_active = false;
@@ -928,6 +931,13 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   ID3D11Texture2D* ngx_dump_staging = nullptr;   // CPU-readable copy of NGX output (luma diag)
   bool hdr_detected = false;                     // _renodx-senkiseki.addon64 loaded (Phase 3 auto-default)
   bool dlaa_ran_this_frame = false;              // DLSS bound t0 at a final_blending draw this frame
+  bool dlaa_ran_at_dof_producer = false;         // DLSS evaluated at the DOF FocusBuffer producer this frame
+  // Pre-ToneMap DOF resolve: the final's t0 (raw scene) and t3 (FocusBuffer,
+  // full-res non-depth) resources, captured at the final. The draw that writes
+  // t3 AND reads t0 runs the DLSS eval, so the DOF blur consumes the resolved
+  // scene instead of the aliased one.
+  reshade::api::resource dof_scene_res = {};
+  reshade::api::resource dof_focus_res = {};
   DlaaDeployDiag dlaa_diag;                      // deployment reason/status diagnostics
 
   // ── Robust DLSS color source (Phase 3 fix) ──
@@ -1000,14 +1010,15 @@ static void DlaaDeployStatusLog(reshade::api::device* dev, DeviceData* d) {
                         ((int)shader_injection.dlaa_hdr_inject == 0 && d->hdr_detected);
   char buf[768];
   snprintf(buf, sizeof(buf),
-           "[DLAA] status: aa=%d hdr=%d path=%s entry(final=%u fxaa=%u) run=%u ok=%u lastEntry=%s | "
+           "[DLAA] status: aa=%d hdr=%d path=%s entry(final=%u dof=%u fxaa=%u) run=%u ok=%u lastEntry=%s | "
            "reason=%s detail=%s | color=%s f=%u | depth=%s f=%u | rtv0=%s f=%u | "
            "globalsVP=%d matrices=%d | lastT0=0x%08X lastB0Vs=0x%08X tracked=%d b0buf=0x%llX | "
            "depthCand=%d %ux%u b=%u reject=%s | ngx=sup%d init%d feat%d evalFail%d | "
            "velpipe=%d prevDepth=%d dlssOut=%s invalidations=%u",
            (int)shader_injection.dlaa_enabled, (int)d->hdr_detected, hdr_path ? "pre" : "composite",
-           diag.final_entry, diag.fxaa_entry, diag.run_calls, diag.eval_ok,
-           diag.last_deploy_entry == 1u ? "final" : diag.last_deploy_entry == 2u ? "fxaa" : "none",
+           diag.final_entry, diag.dof_entry, diag.fxaa_entry, diag.run_calls, diag.eval_ok,
+           diag.last_deploy_entry == 1u ? "final" : diag.last_deploy_entry == 2u ? "fxaa"
+               : diag.last_deploy_entry == 3u ? "dof" : "none",
            DlaaReasonName(diag.reason), diag.detail,
            color, d->color_capture_frame, depth, d->depth_capture_frame, rtv0, diag.rtv0_capture_frame,
            (int)d->globals_vp_captured, (int)d->matrices_valid,
@@ -1034,9 +1045,10 @@ static bool DlaaStatusDraw() {
   ImGui::Text("Deploy: %s", diag.deploy_active ? "ON" : "OFF");
   ImGui::Text("Reason: %s", DlaaReasonName(diag.reason));
   if (diag.detail[0] != '\0') ImGui::TextWrapped("%s", diag.detail);
-  ImGui::Text("Entry: final=%u fxaa=%u run=%u ok=%u fail=%u noEntry=%u",
-              diag.final_entry_last, diag.fxaa_entry_last, diag.run_calls_last,
+  ImGui::Text("Entry: final=%u dof=%u fxaa=%u run=%u ok=%u fail=%u noEntry=%u",
+              diag.final_entry_last, diag.dof_entry_last, diag.fxaa_entry_last, diag.run_calls_last,
               diag.eval_ok_last, diag.eval_fail_last, diag.presents_without_entry);
+  ImGui::Text("DOF: ps=0x%08X sceneSlot=%u", diag.last_dof_ps, diag.last_dof_slot);
   ImGui::Text("Color f=%u  Depth f=%u  RTV0 f=%u  b0buf=0x%llX",
               d->color_capture_frame, d->depth_capture_frame, diag.rtv0_capture_frame,
               (unsigned long long)d->last_b0_buffer.handle);
@@ -1084,6 +1096,10 @@ static void WatchdogStampDraw(reshade::api::command_list* cmd_list, DeviceData* 
 static void WatchdogStart(DeviceData* d);
 static void WatchdogStop(DeviceData* d);
 
+// DLSS dispatch (defined below): color_slot selects which PS t0..N the game's
+// color source is read from and where the DLAA output is bound.
+static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot);
+
 // ── Halton jitter ──
 static float Halton(uint32_t n, uint32_t base) {
   float r = 0.f, inv = 1.f / (float)base, f = 1.f;
@@ -1122,6 +1138,7 @@ static void Destroy(reshade::api::device* dev, DeviceData* d) {
   d->phasee_twin_binding_intact = false;
   dv(d->captured_depth_srv); dv(d->captured_color_srv);
   d->captured_depth_res = {}; d->captured_color_res = {};
+  d->dof_scene_res = {}; d->dof_focus_res = {};
   d->matrices_valid = false;
   if (d->point_sampler.handle) dev->destroy_sampler(d->point_sampler);
   d->point_sampler = {};
@@ -4380,6 +4397,62 @@ static void MaybeLogOmState(reshade::api::command_list* cmd_list, DeviceData* d)
                reshade::log::level::info, 1u, 250u, "%s", line);
 }
 
+// ── Pre-ToneMap DOF resolve ──
+// In Pre-ToneMap mode DLSS normally runs at the final, but the final's DOF
+// blends the sharp scene with FocusBuffer, which was blurred from the RAW
+// (aliased) scene before the final -> DOF aliasing. When a draw that writes
+// FocusBuffer (captured at the final's t3) also reads the scene color (the
+// final's t0), run the DLSS eval THERE and bind the resolved image to that
+// scene slot: the blur then consumes the DLAA output. The final only re-binds
+// the DLAA output to t0 (no second eval). If no such producer appears this
+// frame, the final evaluates as before (fallback, no behavior change).
+static bool MaybeRunDofProducerDlaa(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (!cmd_list || !d) return false;
+  if (shader_injection.dlaa_enabled < 1.5f) return false;
+  if (d->dlaa_ran_at_dof_producer || d->dlaa_ran_this_frame) return false;
+  if (!d->dof_focus_res.handle || !d->dof_scene_res.handle) return false;
+  const int mode = (int)shader_injection.dlaa_hdr_inject;
+  if (!(mode == 1 || (mode == 0 && d->hdr_detected))) return false;  // Pre-ToneMap only
+  if (d->captured_rtv0_res.handle != d->dof_focus_res.handle) return false;
+  auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!cl) return false;
+  ID3D11ShaderResourceView* srvs[8] = {};
+  cl->PSGetShaderResources(0, 8, srvs);
+  uint32_t scene_slot = 0xFFFFFFFFu;
+  for (UINT i = 0; i < 8u && scene_slot == 0xFFFFFFFFu; ++i) {
+    if (!srvs[i]) continue;
+    ID3D11Resource* res = nullptr;
+    srvs[i]->GetResource(&res);
+    if (res) {
+      if (reinterpret_cast<uintptr_t>(res) == d->dof_scene_res.handle) scene_slot = i;
+      res->Release();
+    }
+  }
+  for (UINT i = 0; i < 8u; ++i) if (srvs[i]) srvs[i]->Release();
+  const uint32_t ps = CurrentPsHash(cmd_list, d);
+  if (scene_slot == 0xFFFFFFFFu) {
+    // The FocusBuffer writer does not read the full-res scene directly (e.g. a
+    // multi-pass blur reading an intermediate). Name it for the next iteration.
+    if (shader_injection.dlaa_debug_logging > 0.5f)
+      LogThrottled("dof-producer-nosrc", reshade::log::level::info, 2u, 600u,
+                   "[DLAA] DOF producer candidate ps=0x%08X does not read the scene SRV", ps);
+    return false;
+  }
+  d->dlaa_ran_at_dof_producer = RunDLAA(cmd_list, scene_slot);
+  if (d->dlaa_ran_at_dof_producer) {
+    d->dlaa_ran_this_frame = true;
+    ++d->dlaa_diag.dof_entry;
+    d->dlaa_diag.last_dof_ps = ps;
+    d->dlaa_diag.last_dof_slot = scene_slot;
+    d->dlaa_diag.last_deploy_entry = 3u;
+    if (shader_injection.dlaa_debug_logging > 0.5f)
+      LogThrottled("dof-producer-run", reshade::log::level::info, 1u, 300u,
+                   "[DLAA] DOF resolve: DLSS at FocusBuffer producer ps=0x%08X sceneSlot=t%u",
+                   ps, scene_slot);
+  }
+  return d->dlaa_ran_at_dof_producer;
+}
+
 static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
   auto* dev = cmd_list->get_device();
   if (!dev) return false;
@@ -4407,6 +4480,7 @@ static bool OnDrawMaskHook(reshade::api::command_list* cmd_list, uint32_t, uint3
     MaybeBindPatchedVs(cmd_list, d);
     MaybeBindPatchedRigidVs(cmd_list, d);
     MaybeAppendMotionRtvStrict(cmd_list, d);
+    MaybeRunDofProducerDlaa(cmd_list, d);
     WatchdogStampDraw(cmd_list, d, "done");
   }
   return false;
@@ -4438,6 +4512,7 @@ static bool OnDrawMaskHookIndexed(reshade::api::command_list* cmd_list, uint32_t
     MaybeBindPatchedVs(cmd_list, d);
     MaybeBindPatchedRigidVs(cmd_list, d);
     MaybeAppendMotionRtvStrict(cmd_list, d);
+    MaybeRunDofProducerDlaa(cmd_list, d);
     WatchdogStampDraw(cmd_list, d, "done");
   }
   return false;
@@ -4511,6 +4586,8 @@ static void OnDestroyResource(reshade::api::device* dev, reshade::api::resource 
     d->captured_rtv0_view = 0u;
     ++d->dlaa_diag.capture_invalidations;
   }
+  if (d->dof_scene_res.handle == res.handle) d->dof_scene_res = {};
+  if (d->dof_focus_res.handle == res.handle) d->dof_focus_res = {};
 }
 
 // ── Event: capture RTV0 (FXAA output target) ──
@@ -5247,7 +5324,28 @@ static std::array<float, 60> BuildVelocityPC(DeviceData* d) {
 // ── DLAA dispatch ──
 static bool HdrFinalPathActive(reshade::api::command_list* cmd_list);  // defined below
 
-static bool RunDLAA(reshade::api::command_list* cmd_list) {
+// Bind the NGX output as an SRV at `slot` so the current draw consumes the
+// DLAA-resolved image. Used by RunDLAA (after the eval) and by the Pre-ToneMap
+// DOF path (bind-only at the final when the eval already ran at the producer).
+static bool BindDlaaOutputSrv(ID3D11DeviceContext* cl, uint32_t slot) {
+  if (!cl || !senkiseki3::dlss::ngx.output_texture || !senkiseki3::dlss::ngx.device)
+    return false;
+  D3D11_TEXTURE2D_DESC ngx_desc = {};
+  senkiseki3::dlss::ngx.output_texture->GetDesc(&ngx_desc);
+  D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+  srvd.Format = ngx_desc.Format;
+  srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  srvd.Texture2D.MipLevels = 1;
+  ID3D11ShaderResourceView* srv = nullptr;
+  senkiseki3::dlss::ngx.device->CreateShaderResourceView(
+      senkiseki3::dlss::ngx.output_texture.Get(), &srvd, &srv);
+  if (!srv) return false;
+  cl->PSSetShaderResources(slot, 1, &srv);
+  srv->Release();
+  return true;
+}
+
+static bool RunDLAA(reshade::api::command_list* cmd_list, uint32_t color_slot) {
   auto* dev = cmd_list->get_device();
   if (!dev) return false;
   auto* d = dev->get_private_data<DeviceData>();
@@ -5418,7 +5516,7 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
       if (d->live_color_srv) { d->live_color_srv->Release(); d->live_color_srv = nullptr; }
       if (d->live_color_res) { d->live_color_res->Release(); d->live_color_res = nullptr; }
       ID3D11ShaderResourceView* live_t0 = nullptr;
-      cl->PSGetShaderResources(0, 1, &live_t0);
+      cl->PSGetShaderResources(color_slot, 1, &live_t0);
       if (live_t0) {
         ID3D11Resource* live_res = nullptr;
         live_t0->GetResource(&live_res);
@@ -5738,36 +5836,21 @@ static bool RunDLAA(reshade::api::command_list* cmd_list) {
                     "eval prerequisites missing (cl=%d src=%d mv=%d dep=%d ngxOut=%d)",
                     cl ? 1 : 0, src ? 1 : 0, mv ? 1 : 0, dep ? 1 : 0, ngx_out ? 1 : 0);
       }
-      // Replace t0 with DLAA output SRV (falcomengine-plus pattern).
-      // In MV debug mode the velocity SRV is already bound to t0 above.
+      // Replace the game's color SRV with the DLAA output (falcomengine-plus
+      // pattern). In MV debug mode the velocity SRV is already bound above.
       if (dlaa_ok && shader_injection.dlaa_debug_view <= 0.5f) {
-        ID3D11ShaderResourceView* dlaa_srv = nullptr;
-        bool release_srv = false;
-        {
-          D3D11_TEXTURE2D_DESC ngx_desc;
+        static int fmt_log = 0;
+        if (shader_injection.dlaa_debug_logging > 0.5f && ++fmt_log <= 2) {
+          D3D11_TEXTURE2D_DESC ngx_desc = {};
           senkiseki3::dlss::ngx.output_texture->GetDesc(&ngx_desc);
-          static int fmt_log = 0;
-          if (shader_injection.dlaa_debug_logging > 0.5f && ++fmt_log <= 2) {
-            char buf[96];
-            snprintf(buf, sizeof(buf), "[DLAA] NGX output: %ux%u fmt=%d",
-                     ngx_desc.Width, ngx_desc.Height, (int)ngx_desc.Format);
-            reshade::log::message(reshade::log::level::info, buf);
-          }
-          D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
-          srvd.Format = ngx_desc.Format;
-          srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-          srvd.Texture2D.MipLevels = 1;
-          senkiseki3::dlss::ngx.device->CreateShaderResourceView(
-              senkiseki3::dlss::ngx.output_texture.Get(), &srvd, &dlaa_srv);
-          release_srv = (dlaa_srv != nullptr);
+          char buf[96];
+          snprintf(buf, sizeof(buf), "[DLAA] NGX output: %ux%u fmt=%d",
+                   ngx_desc.Width, ngx_desc.Height, (int)ngx_desc.Format);
+          reshade::log::message(reshade::log::level::info, buf);
         }
-        if (dlaa_srv) {
-          cl->PSSetShaderResources(0, 1, &dlaa_srv);
-          if (release_srv) dlaa_srv->Release();
-        } else {
+        if (!BindDlaaOutputSrv(cl, color_slot))
           LogThrottled("ngx-srv-fail", reshade::log::level::warning, 1u, 120u,
                        "[DLAA] Failed to create SRV for NGX output");
-        }
       }
     }
   }
@@ -6658,7 +6741,7 @@ static bool OnBeforeFxaaDraw(reshade::api::command_list* cmd_list) {
     // we don't hook) — run DLSS here on the composite as before.
   }
   if (d) d->dlaa_diag.last_deploy_entry = 2u;
-  RunDLAA(cmd_list);
+  RunDLAA(cmd_list, 0u);
   if (d && d->hdr_detected) return true;
   return !CopyFinalToRtv0(cmd_list, d);
 }
@@ -6691,15 +6774,66 @@ static bool HdrFinalPathActive(reshade::api::command_list* cmd_list) {
   return d && d->hdr_detected;
 }
 
+// Capture the Pre-ToneMap DOF-resolve trigger inputs from the final's live PS
+// bindings, BEFORE any t0 replacement: t0 = raw scene color, t3 = FocusBuffer
+// (when present, full-res and not a depth format). The next frame's draw that
+// writes t3 and reads t0 then runs the DLSS eval (MaybeRunDofProducerDlaa).
+static void CaptureDofProducerRefs(reshade::api::command_list* cmd_list, DeviceData* d) {
+  if (!cmd_list || !d) return;
+  auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+  if (!cl) return;
+  ID3D11ShaderResourceView* srvs[6] = {};
+  cl->PSGetShaderResources(0, 6, srvs);
+  d->dof_scene_res = {};
+  d->dof_focus_res = {};
+  if (srvs[0]) {
+    ID3D11Resource* res = nullptr;
+    srvs[0]->GetResource(&res);
+    if (res) {
+      D3D11_TEXTURE2D_DESC td = {};
+      static_cast<ID3D11Texture2D*>(res)->GetDesc(&td);
+      if (td.Width != 0u)
+        d->dof_scene_res.handle = reinterpret_cast<uintptr_t>(res);
+      res->Release();
+    }
+  }
+  if (srvs[3]) {
+    ID3D11Resource* res = nullptr;
+    srvs[3]->GetResource(&res);
+    if (res) {
+      D3D11_TEXTURE2D_DESC td = {};
+      static_cast<ID3D11Texture2D*>(res)->GetDesc(&td);
+      if (td.Width == (UINT)d->viewport_w && td.Height == (UINT)d->viewport_h) {
+        const int fmt = (int)td.Format;
+        const bool depth = fmt == 40 || fmt == 44 || fmt == 45 || fmt == 46 ||
+                           fmt == 41 || fmt == 53 || fmt == 54 || fmt == 56;
+        if (!depth) d->dof_focus_res.handle = reinterpret_cast<uintptr_t>(res);
+      }
+      res->Release();
+    }
+  }
+  for (UINT i = 0; i < 6u; ++i) if (srvs[i]) srvs[i]->Release();
+}
+
 static bool OnBeforeFinalBlendingDraw(reshade::api::command_list* cmd_list) {
   if (shader_injection.dlaa_enabled < 1.5f) return true;  // DLAA only (mode 2)
-  if (!HdrFinalPathActive(cmd_list)) return true;          // pre-tone-map path off
   auto* dev = cmd_list->get_device();
   auto* d = dev ? dev->get_private_data<DeviceData>() : nullptr;
   if (!d) return true;
+  if (!HdrFinalPathActive(cmd_list)) return true;          // pre-tone-map path off
+  // Capture the DOF-resolve trigger inputs before any t0 replacement.
+  CaptureDofProducerRefs(cmd_list, d);
   ++d->dlaa_diag.final_entry;
+  if (d->dlaa_ran_at_dof_producer) {
+    // DLSS already evaluated at the FocusBuffer producer this frame; feed the
+    // resolved scene to the final without a second eval.
+    d->dlaa_diag.last_deploy_entry = 3u;
+    auto* cl = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+    if (cl && BindDlaaOutputSrv(cl, 0u)) d->dlaa_ran_this_frame = true;
+    return true;
+  }
   d->dlaa_diag.last_deploy_entry = 1u;
-  d->dlaa_ran_this_frame = RunDLAA(cmd_list);
+  d->dlaa_ran_this_frame = RunDLAA(cmd_list, 0u);
   return true;  // never skip — the HDR mod's final_blending must tone-map t0
 }
 
@@ -7159,6 +7293,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
           d->motion_cleared_this_frame = false;
           // HDR pre-tone-map path: DLSS ran at a final_blending draw this frame?
           d->dlaa_ran_this_frame = false;
+          // Pre-ToneMap DOF resolve: DLSS ran at the FocusBuffer producer?
+          d->dlaa_ran_at_dof_producer = false;
           // Jitter is computed once per frame at PRESENT time, before the next frame's
           // composite (0xE8C7EBA2) draws. Both the composite UV shift and the NGX jitter
           // offsets then read the SAME stored value -> rendered jitter == reported jitter.
@@ -7295,12 +7431,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID) {
             }
             // Keep last-present copies for the ImGui row, then reset.
             diag.final_entry_last = diag.final_entry;
+            diag.dof_entry_last = diag.dof_entry;
             diag.fxaa_entry_last = diag.fxaa_entry;
             diag.run_calls_last = diag.run_calls;
             diag.eval_ok_last = diag.eval_ok;
             diag.eval_fail_last = diag.eval_fail;
-            diag.final_entry = 0u; diag.fxaa_entry = 0u; diag.run_calls = 0u;
-            diag.eval_ok = 0u; diag.eval_fail = 0u;
+            diag.final_entry = 0u; diag.dof_entry = 0u; diag.fxaa_entry = 0u;
+            diag.run_calls = 0u; diag.eval_ok = 0u; diag.eval_fail = 0u;
           }
         }
         if (shader_injection.dlaa_enabled < 1.5f) return;  // NGX only in DLAA mode (2)
