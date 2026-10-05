@@ -7,11 +7,13 @@
 // used) and only mapped at present. This mirrors the CB snapshot rationale:
 // correctness of the selected readback beats its one-shot cost.
 
+#include <algorithm>
 #include <mutex>
 #include <utility>
 
 #include "../world_state.hpp"
 #include "cb_tracking.hpp"
+#include "mesh_capture.hpp"
 
 namespace falcom_world {
 
@@ -189,6 +191,136 @@ inline void ResolveStructuredBufferCopies(
       snapshot.valid = true;
       captured->srv_buffers.push_back(std::move(snapshot));
       queue->get_device()->unmap_buffer_region(copy.staging);
+    }
+    ReleaseStaging(queue->get_device(), copy.staging);
+  }
+  pending.clear();
+}
+
+// ── Constant-buffer one-shot snapshots ────────────────────────────────────────
+// CPU-side utils::constants caches can miss large/ring constant buffers (the
+// b1 instance-offset buffer did). These copy the live bytes on the game's
+// command list at the captured draw and resolve at present.
+
+struct PendingCbCopy {
+  bool camera = false;
+  uint8_t stage = 0u;
+  uint32_t slot = 0u;
+  uint32_t frame = 0u;
+  reshade::api::resource source = {0u};
+  reshade::api::resource staging = {0u};
+  uint64_t source_size = 0u;
+  uint64_t read_size = 0u;
+};
+
+inline std::vector<PendingCbCopy>& PendingCbCopies() {
+  static std::vector<PendingCbCopy> copies;
+  return copies;
+}
+
+inline void IssueCbCopies(
+    reshade::api::command_list* cmd_list,
+    reshade::api::device* device,
+    WorldCommandListData* cl_data,
+    const DrawRecord& draw) {
+  if (cmd_list == nullptr || device == nullptr || cl_data == nullptr) return;
+  std::lock_guard<std::mutex> lock(ReadbackMutex());
+  auto& pending = PendingCbCopies();
+  for (auto& copy : pending) {
+    ReleaseStaging(device, copy.staging);
+  }
+  pending.clear();
+
+  for (uint32_t slot = 0; slot < 6u && slot < kCbSlotCapacity; ++slot) {
+    const reshade::api::resource source = cl_data->vs_cb[slot];
+    if (source.handle == 0u) continue;
+    const auto desc = device->get_resource_desc(source);
+    if (desc.type != reshade::api::resource_type::buffer) continue;
+    const uint64_t read_size = (std::min)(desc.buffer.size, static_cast<uint64_t>(4096u));
+    if (read_size == 0u) continue;
+    const reshade::api::resource staging = AcquireStaging(device, read_size);
+    if (staging.handle == 0u) continue;
+    cmd_list->copy_buffer_region(source, 0u, staging, 0u, read_size);
+    PendingCbCopy copy;
+    copy.stage = 1u;
+    copy.slot = slot;
+    copy.frame = draw.frame;
+    copy.source = source;
+    copy.staging = staging;
+    copy.source_size = desc.buffer.size;
+    copy.read_size = read_size;
+    pending.push_back(copy);
+  }
+}
+
+inline void IssueCameraCbCopy(
+    reshade::api::command_list* cmd_list,
+    reshade::api::device* device,
+    WorldCommandListData* cl_data,
+    uint32_t frame) {
+  if (cmd_list == nullptr || device == nullptr || cl_data == nullptr) return;
+  std::lock_guard<std::mutex> lock(ReadbackMutex());
+  const reshade::api::resource source = cl_data->ps_cb[0];
+  if (source.handle == 0u) return;
+  const auto desc = device->get_resource_desc(source);
+  if (desc.type != reshade::api::resource_type::buffer) return;
+  const uint64_t read_size = (std::min)(desc.buffer.size, static_cast<uint64_t>(4096u));
+  if (read_size == 0u) return;
+  const reshade::api::resource staging = AcquireStaging(device, read_size);
+  if (staging.handle == 0u) return;
+  cmd_list->copy_buffer_region(source, 0u, staging, 0u, read_size);
+  PendingCbCopy copy;
+  copy.camera = true;
+  copy.stage = 2u;
+  copy.slot = 0u;
+  copy.frame = frame;
+  copy.source = source;
+  copy.staging = staging;
+  copy.source_size = desc.buffer.size;
+  copy.read_size = read_size;
+  PendingCbCopies().push_back(copy);
+}
+
+inline void ResolveCbCopies(
+    reshade::api::command_queue* queue,
+    CapturedDraw* captured) {
+  if (queue == nullptr) return;
+  std::lock_guard<std::mutex> lock(ReadbackMutex());
+  auto& pending = PendingCbCopies();
+  if (pending.empty()) return;
+  queue->flush_immediate_command_list();
+  queue->wait_idle();
+
+  for (auto& copy : pending) {
+    if (copy.staging.handle == 0u) continue;
+    void* mapped = nullptr;
+    if (queue->get_device()->map_buffer_region(
+            copy.staging, 0u, copy.read_size, reshade::api::map_access::read_only, &mapped)
+        && mapped != nullptr) {
+      std::vector<uint8_t> bytes(
+          static_cast<const uint8_t*>(mapped),
+          static_cast<const uint8_t*>(mapped) + static_cast<size_t>(copy.read_size));
+      queue->get_device()->unmap_buffer_region(copy.staging);
+      if (copy.camera) {
+        CaptureCameraFromBytes(bytes, copy.frame, 2u);
+      } else if (captured != nullptr) {
+        CbSnapshot snapshot;
+        snapshot.stage = copy.stage;
+        snapshot.slot = copy.slot;
+        snapshot.bytes = std::move(bytes);
+        snapshot.gpu_snapshot = true;
+        snapshot.resource_size = copy.source_size;
+        snapshot.snapshot_size = copy.read_size;
+        bool replaced = false;
+        for (auto& existing : captured->cbs) {
+          if (existing.stage == copy.stage && existing.slot == copy.slot) {
+            existing = std::move(snapshot);
+            replaced = true;
+            break;
+          }
+        }
+        if (!replaced) captured->cbs.push_back(std::move(snapshot));
+      }
     }
     ReleaseStaging(queue->get_device(), copy.staging);
   }

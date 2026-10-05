@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "../world_state.hpp"
+#include "../bvh/bvh_pool.hpp"
 #include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
 #include "../capture/mesh_capture.hpp"
@@ -51,6 +52,7 @@ inline void ResetCensus() {
   g_state.resource_sizes.clear();
   g_state.next_serial.store(0u);
   g_state.arm_active = false;
+  g_state.arm_window_open = false;
   g_state.captured = {};
   g_state.candidates.clear();
   g_state.selected_family = 0u;
@@ -110,15 +112,44 @@ inline void TryCaptureArmedDraw(
     const DrawRecord& draw,
     WorldCommandListData* cl_data) {
   std::lock_guard<std::mutex> lock(g_state.mutex);
+  const bool in_arm_set =
+      !g_state.arm_vs_set.empty()
+      && std::find(g_state.arm_vs_set.begin(), g_state.arm_vs_set.end(), draw.vs_hash) != g_state.arm_vs_set.end();
+  if (g_state.auto_research.active && g_state.arm_window_open && in_arm_set) {
+    g_state.auto_research.armed_draws[draw.vs_hash] += 1u;
+    g_state.auto_research.round_armed_draws[draw.vs_hash] += 1u;
+    g_state.auto_research.window_armed_draws[draw.vs_hash] += 1u;
+  }
   if (!g_state.arm_active) return;
   if (!g_state.arm_vs_set.empty()) {
-    if (std::find(g_state.arm_vs_set.begin(), g_state.arm_vs_set.end(), draw.vs_hash) == g_state.arm_vs_set.end()) {
-      return;
-    }
+    if (!in_arm_set) return;
   } else if (g_state.arm_vs_hash != 0u && g_state.arm_vs_hash != draw.vs_hash) {
     return;
   }
   if (g_state.arm_serial != 0u && g_state.arm_serial != draw.serial) return;
+
+  if (g_state.auto_research.active && in_arm_set) {
+    const auto retry_it = g_state.auto_research.probe_retry_counts.find(draw.vs_hash);
+    const uint32_t retries =
+        retry_it != g_state.auto_research.probe_retry_counts.end() ? retry_it->second : 0u;
+    if (retries < kProbeRetryBudget) {
+      const auto rejected_it = g_state.auto_research.probe_rejected_draws.find(draw.vs_hash);
+      if (rejected_it != g_state.auto_research.probe_rejected_draws.end()) {
+        auto& rejected = rejected_it->second;
+        const auto key_it = rejected.find(HintDrawKey(draw));
+        if (key_it != rejected.end()) {
+          if (key_it->second > 0u) {
+            key_it->second -= 1u;
+            // A skipped retired draw continues the same scheduling window; it
+            // must not be counted as a fresh arm window or round window.
+            g_state.auto_research.window_continuation = true;
+            return;
+          }
+          rejected.erase(key_it);
+        }
+      }
+    }
+  }
 
   g_state.arm_active = false;
   g_state.captured = {};
@@ -128,6 +159,7 @@ inline void TryCaptureArmedDraw(
   SnapshotDrawConstants(device, cl_data, &g_state.captured);
   ParseInstanceOffset(&g_state.captured);
   IssueStructuredBufferCopies(cmd_list, device, cl_data, draw, &g_state.captured);
+  IssueCbCopies(cmd_list, device, cl_data, draw);
 
   if (draw.rtv0.handle != 0u) {
     const auto rtv_resource = device->get_resource_from_view(draw.rtv0);
@@ -260,13 +292,22 @@ inline void CommitDrawRecord(
   }
 
   if (IsLightingHash(record.ps_hash) && cl_data != nullptr) {
+    bool captured_frame_matches = false;
+    {
+      std::lock_guard<std::mutex> lock(g_state.mutex);
+      captured_frame_matches = g_state.captured.draw.vs_hash != 0u
+                               && g_state.captured.draw.frame == record.frame;
+    }
     const reshade::api::resource cb = cl_data->ps_cb[0].handle != 0u ? cl_data->ps_cb[0] : cl_data->vs_cb[0];
     if (cb.handle != 0u) {
       const auto bytes = renodx::utils::constants::GetResourceCache(device, cb);
       if (!bytes.empty()) {
         std::lock_guard<std::mutex> lock(g_state.mutex);
-        CaptureCameraFromBytes(bytes, record.frame);
+        CaptureCameraFromBytes(bytes, record.frame, 1u);
       }
+    }
+    if (captured_frame_matches && cl_data->ps_cb[0].handle != 0u) {
+      IssueCameraCbCopy(cmd_list, device, cl_data, record.frame);
     }
     const reshade::api::resource_view depth_view = cl_data->ps_srv_view[kLightingDepthRegisterSora2nd];
     const reshade::api::resource depth_resource = cl_data->ps_srv[kLightingDepthRegisterSora2nd];
@@ -340,6 +381,7 @@ struct WorldDrawCallback {
     }
 
     CommitDrawRecord(record, device, context.cmd_list, cl_data);
+    bvh::OnPoolScanDraw(device, context.cmd_list, record, cl_data);
     return {};
   }
 
@@ -381,8 +423,11 @@ inline void OnWorldPresent(
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     ResolveStructuredBufferCopies(queue, &g_state.captured);
+    ResolveCbCopies(queue, &g_state.captured);
+    ParseInstanceOffset(&g_state.captured);
   }
   RunPendingMeshCapture(queue);
+  bvh::DrainPoolScan(queue->get_device(), queue);
 }
 
 }  // namespace falcom_world

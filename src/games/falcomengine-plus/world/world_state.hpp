@@ -37,11 +37,17 @@ inline constexpr uint32_t kLightingHashSora2nd = 0xCA3D8596u;
 inline constexpr uint32_t kLightingDepthRegisterSora2nd = 4u;
 inline constexpr uint32_t kProbeTopCandidates = 8u;
 inline constexpr uint32_t kProbeInstances = 4u;
-inline constexpr uint32_t kProbeVertices = 12u;
+inline constexpr uint32_t kProbeVertices = 32u;
 inline constexpr uint32_t kProbeMaxSamples = kProbeInstances * kProbeVertices;
 inline constexpr uint32_t kMinDepthMatches = 6u;
-inline constexpr uint64_t kAutoRunTimeoutFrames = 18000u;   // ~5 minutes at 60 fps
+inline constexpr uint32_t kProbeRetryBudget = 12u;
+inline constexpr uint32_t kNoDrawDeferralWindows = 4u;
+inline constexpr uint64_t kAutoDeadlineMarginFrames = 1800u;  // ~30 seconds at 60 fps
 inline constexpr uint64_t kAutoCaptureSpacingFrames = 120u; // ~2 seconds at 60 fps
+// Deferred (no-draw) families become eligible again after this cooldown so a
+// later camera position can observe their draws; retries are bounded.
+inline constexpr uint64_t kAutoDeferredRetryCooldownFrames = 600u;  // ~10 seconds at 60 fps
+inline constexpr uint32_t kAutoDeferredMaxRetries = 2u;
 
 enum class CandidateKind : uint8_t {
   Cb4x4Row = 0,
@@ -52,6 +58,20 @@ enum class CandidateKind : uint8_t {
   Inst4x4Col,
   Count,
 };
+
+enum class CandidateSource : uint8_t {
+  Generic = 0,
+  HintDiagnostic,
+  PreferredSignature,
+};
+
+inline const char* CandidateSourceName(uint8_t source) {
+  switch (static_cast<CandidateSource>(source)) {
+    case CandidateSource::HintDiagnostic: return "hint_diagnostic";
+    case CandidateSource::PreferredSignature: return "preferred_signature";
+    default: return "generic";
+  }
+}
 
 enum class FamilyLabel : uint8_t {
   Unknown = 0,
@@ -120,6 +140,9 @@ struct CbSnapshot {
   uint8_t stage = 0u;  // 1 = vertex, 2 = pixel
   uint32_t slot = 0u;
   std::vector<uint8_t> bytes;
+  bool gpu_snapshot = false;
+  uint64_t resource_size = 0u;
+  uint64_t snapshot_size = 0u;
 };
 
 struct SrvBufferSnapshot {
@@ -151,7 +174,9 @@ struct CapturedDraw {
 struct CameraSnapshot {
   bool valid = false;
   uint32_t frame = 0u;
+  uint8_t source = 0u;  // 0 = unknown, 1 = cache, 2 = gpu snapshot
   float view[16] = {};
+  float view_inv[16] = {};
   float proj[16] = {};
   float view_proj[16] = {};
   float view_proj_inv[16] = {};
@@ -161,6 +186,8 @@ struct CameraSnapshot {
 
 struct TransformCandidate {
   CandidateKind kind = CandidateKind::Cb4x4Row;
+  CandidateSource source = CandidateSource::Generic;
+  bool row_dot = false;  // audited row-dot convention (hint diagnostics only)
   uint8_t stage = 0u;
   uint32_t slot = 0u;
   uint32_t matrix_offset = 0u;  // bytes in a CB, or within the element for structured
@@ -172,6 +199,8 @@ struct TransformCandidate {
   float set_score = 0.f;
   float mean_inside = 0.f;
   float bbox_area = 0.f;
+  float ndc_z_valid_ratio = 0.f;
+  bool projection_valid = false;
   std::vector<float> matrices;       // 12 (4x3) or 16 (4x4) per instance
   std::vector<float> prev_matrices;  // 12 per instance when has_prev
   bool valid = false;
@@ -179,6 +208,7 @@ struct TransformCandidate {
 
 struct CandidateSummary {
   CandidateKind kind = CandidateKind::Cb4x4Row;
+  CandidateSource source = CandidateSource::Generic;
   uint8_t stage = 0u;
   uint32_t slot = 0u;
   uint32_t matrix_offset = 0u;
@@ -189,6 +219,16 @@ struct CandidateSummary {
   bool has_prev = false;
   float set_score = 0.f;
   float mean_inside = 0.f;
+  float ndc_z_valid_ratio = 0.f;
+};
+
+struct SrvBufferSummary {
+  uint8_t slot = 0u;
+  uint32_t stride = 0u;
+  uint64_t size = 0u;
+  uint64_t read_offset = 0u;
+  uint64_t read_size = 0u;
+  bool truncated = false;
 };
 
 struct FamilyStats {
@@ -254,6 +294,55 @@ struct ProbeMetrics {
   std::vector<ProbeSampleDiag> diag;
 };
 
+struct HintDiagnosticRecord {
+  bool valid = false;
+  CandidateKind kind = CandidateKind::Inst4x3Row;
+  uint8_t slot = 0u;
+  uint32_t matrix_offset = 0u;
+  uint32_t stride = 0u;
+  int32_t base = 0;
+  bool projection_valid = false;
+  float projection_score = 0.f;
+  float mean_inside = 0.f;
+  float ndc_z_valid_ratio = 0.f;
+  uint32_t instance_first = 0u;
+  uint32_t instance_count = 0u;
+  uint32_t element_first = 0u;
+  uint32_t element_count = 0u;
+  ProbeMetrics probe;
+  bool pass = false;
+};
+
+struct HintProbePipelineInfo {
+  bool frame_match = false;
+  bool candidate_created = false;
+  uint32_t candidate_skipped = 0u;
+  std::vector<std::string> skip_reasons;
+  bool probe_dispatched = false;
+  bool probe_readback = false;
+  std::string probe_skip_reason;
+};
+
+struct CandidateDiagnosticRecord {
+  CandidateSource source = CandidateSource::Generic;
+  CandidateKind kind = CandidateKind::Cb4x4Row;
+  uint8_t stage = 0u;
+  uint32_t slot = 0u;
+  uint32_t matrix_offset = 0u;
+  uint32_t stride = 0u;
+  uint32_t base_offset = 0u;
+  bool projection_valid = false;
+  float projection_score = 0.f;
+  float ndc_z_valid_ratio = 0.f;
+  uint32_t match = 0u;
+  uint32_t occluded = 0u;
+  uint32_t mismatch = 0u;
+  uint32_t out_of_screen = 0u;
+  float match_ratio = 0.f;
+  bool pass = false;
+  bool selected = false;
+};
+
 enum class AutoVerdict : uint8_t {
   Pending = 0,
   Verified,
@@ -275,7 +364,9 @@ inline const char* AutoVerdictName(uint8_t verdict) {
 struct AutoCapture {
   uint32_t frame = 0u;
   uint32_t draw_serial = 0u;
+  uint32_t camera_frame = 0u;
   CandidateKind kind = CandidateKind::Cb4x4Row;
+  CandidateSource source = CandidateSource::Generic;
   uint8_t stage = 0u;
   uint32_t slot = 0u;
   uint32_t matrix_offset = 0u;
@@ -283,14 +374,32 @@ struct AutoCapture {
   uint32_t base_offset = 0u;
   uint32_t instances_tested = 0u;
   uint32_t instances_ok = 0u;
+  uint32_t draw_instance_count = 0u;
+  int32_t instance_offset_g = 0;
+  bool instance_offset_found = false;
+  bool dsv_matches_depth_source = false;
   float projection_score = 0.f;
+  float ndc_z_valid_ratio = 0.f;
   ProbeMetrics probe;
   std::vector<float> matrices;       // bounded: up to 4 instances
   std::vector<float> prev_matrices;  // bounded: up to 4 instances when available
+  std::vector<HintDiagnosticRecord> hint_diagnostics;
+  std::vector<CandidateDiagnosticRecord> candidate_diagnostics;
+  std::vector<SrvBufferSummary> srv_buffers;
   bool candidate_valid = false;
   bool depth_ok = false;
   bool pass = false;
   std::string failure_reason;
+};
+
+struct PassingLayout {
+  CandidateKind kind = CandidateKind::Cb4x4Row;
+  uint8_t stage = 0u;
+  uint32_t slot = 0u;
+  uint32_t matrix_offset = 0u;
+  uint32_t stride = 0u;
+  uint32_t base_offset = 0u;
+  uint32_t count = 0u;
 };
 
 struct AutoFamilyResult {
@@ -301,11 +410,20 @@ struct AutoFamilyResult {
   bool runtime_verified = false;
   bool depth_pass = false;
   bool cross_capture_pass = false;
+  std::vector<PassingLayout> passing_layouts;
   uint32_t srv_mask = 0u;
   int32_t instance_offset = 0;
+  bool instance_offset_found = false;
   uint32_t read_stride = 0u;
   uint64_t read_offset = 0u;
   uint64_t read_size = 0u;
+  std::vector<SrvBufferSummary> srv_buffers;
+  std::vector<HintDiagnosticRecord> hint_diagnostics;
+  bool pending_at_end = false;
+  uint32_t armed_draws = 0u;
+  std::string skip_reason;
+  bool deferred_no_draw = false;
+  uint32_t probe_retries = 0u;
 };
 
 struct AutoState {
@@ -323,6 +441,30 @@ struct AutoState {
   uint32_t last_processed_serial = 0u;
   std::vector<AutoFamilyResult> results;
   bool finalized = false;
+  std::string finalize_reason;
+  uint32_t arm_windows = 0u;
+  uint32_t arm_set_size = 0u;
+  uint32_t pending_at_end = 0u;
+  std::unordered_map<uint32_t, uint32_t> armed_draws;
+  std::unordered_set<uint32_t> deferred;
+  std::unordered_map<uint32_t, uint64_t> deferred_until;
+  std::unordered_map<uint32_t, uint32_t> deferred_retries;
+  bool round_active = false;
+  uint32_t round_target_count = 0u;
+  uint32_t round_budget = 0u;
+  uint32_t round_windows_used = 0u;
+  uint32_t rounds_started = 0u;
+  uint32_t windows_retired = 0u;
+  std::vector<uint32_t> round_cohort;
+  std::unordered_map<uint32_t, uint32_t> round_armed_draws;
+  std::unordered_map<uint32_t, uint32_t> probe_retry_counts;
+  std::unordered_map<uint32_t, std::unordered_map<uint64_t, uint32_t>> probe_rejected_draws;
+  std::unordered_map<uint32_t, uint32_t> probe_retry_totals;
+  std::unordered_map<uint32_t, uint32_t> window_armed_draws;
+  std::unordered_map<uint32_t, uint32_t> no_draw_windows;
+  bool last_capture_blind = false;
+  bool last_capture_pass = true;
+  bool window_continuation = false;
 };
 
 struct State {
@@ -349,11 +491,16 @@ struct State {
   std::unordered_map<uint64_t, uint64_t> resource_sizes;
 
   bool arm_active = false;
+  bool arm_window_open = false;  // diagnostic observation window for armed draws
   uint32_t arm_vs_hash = 0u;
   uint32_t arm_serial = 0u;
   std::vector<uint32_t> arm_vs_set;  // non-empty = opportunistic multi-family arming
 
   bool mesh_capture_pending = false;
+  bool probe_hint_requested = false;
+  uint32_t probe_hint_vs = 0u;
+  uint64_t probe_hint_deadline_frame = 0u;
+  uint32_t probe_hint_last_serial = 0u;
   CapturedDraw captured;
   CameraSnapshot camera;
   DepthSource depth_source;

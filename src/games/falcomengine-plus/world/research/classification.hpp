@@ -52,6 +52,9 @@ inline bool IsGeometryCandidate(const DrawRecord& draw) {
   if (draw.ps_hash == 0u || IsKnownNonGeometryPs(draw.ps_hash)) return false;
   if (draw.has_skin_inputs) return false;
   if (draw.vb.handle == 0u || draw.dsv.handle == 0u || draw.method != 1u || !draw.has_index_buffer) return false;
+  // Shadow/depth-only passes render without a color target; the camera color
+  // pass supplies the same static geometry, so they are not pool candidates.
+  if (draw.rtv0.handle == 0u) return false;
   if (draw.index_count < 3u || (draw.index_count % 3u) != 0u) return false;
   if (draw.blend_enable || !draw.depth_enable || !draw.depth_write) return false;
   if (draw.topology != reshade::api::primitive_topology::undefined
@@ -74,6 +77,20 @@ inline uint64_t MeshKey(const DrawRecord& draw) {
   mix(static_cast<uint64_t>(static_cast<int64_t>(draw.vertex_offset)));
   mix(draw.vb_stride);
   mix(draw.input_layout.handle);
+  return key;
+}
+
+inline uint64_t HintDrawKey(const DrawRecord& draw) {
+  uint64_t key = MeshKey(draw);
+  const auto mix = [&key](uint64_t value) {
+    key ^= value;
+    key *= 1099511628211ull;
+  };
+  mix(draw.first_instance);
+  mix(draw.instance_count);
+  mix(draw.vs_hash);
+  mix(draw.ps_hash);
+  mix(draw.method);
   return key;
 }
 

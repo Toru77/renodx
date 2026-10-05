@@ -157,7 +157,7 @@ inline void BuildProbeForCandidates(
         out->samples.push_back(uv[0]);
         out->samples.push_back(uv[1]);
         out->samples.push_back(ok ? ndc_z : 0.f);
-        out->samples.push_back(static_cast<float>(c));
+        out->samples.push_back(ok ? 1.f : 0.f);  // w: 1 = real sample, 0 = sentinel
         ProbeSampleDiag diag;
         diag.instance = inst;
         diag.uv[0] = uv[0];
@@ -205,8 +205,11 @@ inline void ParseProbeResults(
     if (build != nullptr && sample_bytes.size() >= (static_cast<size_t>(c) + 1u) * samples_per_candidate * 16u) {
       metrics.diag.clear();
       for (uint32_t s = 0; s < samples_per_candidate && metrics.diag.size() < kProbeMaxSamples; ++s) {
-        const size_t base = (static_cast<size_t>(c) * samples_per_candidate + s) * 4u;
-        ProbeSampleDiag diag = build->diag[static_cast<size_t>(c) * samples_per_candidate + s];
+        const size_t sample_index = static_cast<size_t>(c) * samples_per_candidate + s;
+        if (build->samples.size() < (sample_index + 1u) * 4u) break;
+        if (build->samples[sample_index * 4u + 3u] < 0.5f) continue;  // sentinel: never emitted
+        const size_t base = sample_index * 4u;
+        ProbeSampleDiag diag = build->diag[sample_index];
         diag.sampled_linear = samples[base + 0u];
         diag.error = samples[base + 1u];
         diag.classification = static_cast<uint8_t>(samples[base + 2u] + 0.5f);

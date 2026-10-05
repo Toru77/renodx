@@ -22,13 +22,32 @@
 
 namespace falcom_world {
 
-inline void TransformRow(const float* m, float x, float y, float z, float w, float* out) {
-  out[0] = x * m[0] + y * m[4] + z * m[8] + w * m[12];
-  out[1] = x * m[1] + y * m[5] + z * m[9] + w * m[13];
-  out[2] = x * m[2] + y * m[6] + z * m[10] + w * m[14];
-  out[3] = x * m[3] + y * m[7] + z * m[11] + w * m[15];
+// Row-dot reference forms: each output component is the dot of one matrix row
+// with the position. Verified against the captured Sora 2nd vertex shader and
+// the controlled Props probe (t15 / stride 160 / b1 / offset 0).
+inline void TransformRowDot4(const float* m, float x, float y, float z, float w, float* out) {
+  out[0] = m[0] * x + m[1] * y + m[2] * z + m[3] * w;
+  out[1] = m[4] * x + m[5] * y + m[6] * z + m[7] * w;
+  out[2] = m[8] * x + m[9] * y + m[10] * z + m[11] * w;
+  out[3] = m[12] * x + m[13] * y + m[14] * z + m[15] * w;
 }
 
+inline void TransformInst4x3RowDot(const float* m, float x, float y, float z, float* out) {
+  out[0] = m[0] * x + m[1] * y + m[2] * z + m[3];
+  out[1] = m[4] * x + m[5] * y + m[6] * z + m[7];
+  out[2] = m[8] * x + m[9] * y + m[10] * z + m[11];
+}
+
+// Shared row-vector hypothesis now uses the verified row-dot semantics.
+inline void TransformRow(const float* m, float x, float y, float z, float w, float* out) {
+  TransformRowDot4(m, x, y, z, w, out);
+}
+
+inline void TransformInst4x3Row(const float* m, float x, float y, float z, float* out) {
+  TransformInst4x3RowDot(m, x, y, z, out);
+}
+
+// Column-dot alternative (retained for other layouts/games).
 inline void TransformCol(const float* m, float x, float y, float z, float w, float* out) {
   out[0] = m[0] * x + m[4] * y + m[8] * z + m[12] * w;
   out[1] = m[1] * x + m[5] * y + m[9] * z + m[13] * w;
@@ -36,19 +55,11 @@ inline void TransformCol(const float* m, float x, float y, float z, float w, flo
   out[3] = m[3] * x + m[7] * y + m[11] * z + m[15] * w;
 }
 
-// float4x3 row-major storage with row-vector multiply (matches the tagged
-// instance shaders: translation in m[9..11]).
-inline void TransformInst4x3Row(const float* m, float x, float y, float z, float* out) {
+// Legacy 4x3 row-vector alternative, made coherent (previously a hybrid).
+inline void TransformInst4x3Col(const float* m, float x, float y, float z, float* out) {
   out[0] = x * m[0] + y * m[3] + z * m[6] + m[9];
   out[1] = x * m[1] + y * m[4] + z * m[7] + m[10];
   out[2] = x * m[2] + y * m[5] + z * m[8] + m[11];
-}
-
-// float4x3 column-major storage with column-vector multiply.
-inline void TransformInst4x3Col(const float* m, float x, float y, float z, float* out) {
-  out[0] = m[0] * x + m[1] * y + m[2] * z + m[3];
-  out[1] = m[4] * x + m[5] * y + m[6] * z + m[7];
-  out[2] = m[8] * x + m[9] * y + m[10] * z + m[11];
 }
 
 inline bool IsCameraMatrix(const float* m, const CameraSnapshot& camera) {
@@ -81,6 +92,7 @@ struct SetScore {
   float set_score = 0.f;
   float mean_inside = 0.f;
   float bbox_area = 0.f;
+  float ndc_z_valid_ratio = 0.f;
   uint32_t instances_ok = 0u;
   uint32_t instances_tested = 0u;
   bool valid = false;
@@ -88,7 +100,8 @@ struct SetScore {
 
 // Projects one instance of a candidate. For CB kinds the matrix maps straight
 // to clip; for instance kinds the matrix maps model->world and the camera
-// view-projection is applied afterwards.
+// view-projection is applied afterwards. row_dot selects the audited row-dot
+// convention (hint diagnostics only); generic candidates keep the legacy path.
 inline bool ProjectCandidateInstance(
     const TransformCandidate& candidate,
     const CameraSnapshot& camera,
@@ -96,51 +109,82 @@ inline bool ProjectCandidateInstance(
     const std::array<float, 3>& point,
     float* out_uv,
     float* out_world,
-    float* out_ndc_z = nullptr) {
+    float* out_ndc_z = nullptr,
+    float* out_clip = nullptr) {
   if (out_uv == nullptr || out_world == nullptr) return false;
   const uint32_t floats = KindMatrixFloats(candidate.kind);
   if (candidate.matrices.size() < (static_cast<size_t>(instance) + 1u) * floats) return false;
   const float* matrix = candidate.matrices.data() + static_cast<size_t>(instance) * floats;
 
+  const bool is_cb = (candidate.kind == CandidateKind::Cb4x4Row || candidate.kind == CandidateKind::Cb4x4Col);
+  const bool is_4x3 = (candidate.kind == CandidateKind::Inst4x3Row || candidate.kind == CandidateKind::Inst4x3Col);
+
   float clip[4] = {};
-  const bool row_vector = IsRowVectorKind(candidate.kind);
-  if (candidate.kind == CandidateKind::Cb4x4Row) {
-    TransformRow(matrix, point[0], point[1], point[2], 1.f, clip);
-    out_world[0] = point[0];
-    out_world[1] = point[1];
-    out_world[2] = point[2];
-  } else if (candidate.kind == CandidateKind::Cb4x4Col) {
-    TransformCol(matrix, point[0], point[1], point[2], 1.f, clip);
-    out_world[0] = point[0];
-    out_world[1] = point[1];
-    out_world[2] = point[2];
-  } else {
-    float world[3] = {};
-    if (candidate.kind == CandidateKind::Inst4x3Row) {
-      TransformInst4x3Row(matrix, point[0], point[1], point[2], world);
-    } else if (candidate.kind == CandidateKind::Inst4x3Col) {
-      TransformInst4x3Col(matrix, point[0], point[1], point[2], world);
+  if (candidate.row_dot) {
+    float world[3] = {point[0], point[1], point[2]};
+    if (is_cb) {
+      TransformRowDot4(matrix, point[0], point[1], point[2], 1.f, clip);
     } else {
-      float world4[4] = {};
-      if (candidate.kind == CandidateKind::Inst4x4Row) {
-        TransformRow(matrix, point[0], point[1], point[2], 1.f, world4);
+      if (is_4x3) {
+        TransformInst4x3RowDot(matrix, point[0], point[1], point[2], world);
       } else {
-        TransformCol(matrix, point[0], point[1], point[2], 1.f, world4);
+        float world4[4] = {};
+        TransformRowDot4(matrix, point[0], point[1], point[2], 1.f, world4);
+        world[0] = world4[0];
+        world[1] = world4[1];
+        world[2] = world4[2];
       }
-      world[0] = world4[0];
-      world[1] = world4[1];
-      world[2] = world4[2];
-    }
-    if (row_vector) {
-      TransformRow(camera.view_proj, world[0], world[1], world[2], 1.f, clip);
-    } else {
-      TransformCol(camera.view_proj, world[0], world[1], world[2], 1.f, clip);
+      TransformRowDot4(camera.view_proj, world[0], world[1], world[2], 1.f, clip);
     }
     out_world[0] = world[0];
     out_world[1] = world[1];
     out_world[2] = world[2];
+  } else {
+    const bool row_vector = IsRowVectorKind(candidate.kind);
+    if (candidate.kind == CandidateKind::Cb4x4Row) {
+      TransformRow(matrix, point[0], point[1], point[2], 1.f, clip);
+      out_world[0] = point[0];
+      out_world[1] = point[1];
+      out_world[2] = point[2];
+    } else if (candidate.kind == CandidateKind::Cb4x4Col) {
+      TransformCol(matrix, point[0], point[1], point[2], 1.f, clip);
+      out_world[0] = point[0];
+      out_world[1] = point[1];
+      out_world[2] = point[2];
+    } else {
+      float world[3] = {};
+      if (candidate.kind == CandidateKind::Inst4x3Row) {
+        TransformInst4x3Row(matrix, point[0], point[1], point[2], world);
+      } else if (candidate.kind == CandidateKind::Inst4x3Col) {
+        TransformInst4x3Col(matrix, point[0], point[1], point[2], world);
+      } else {
+        float world4[4] = {};
+        if (candidate.kind == CandidateKind::Inst4x4Row) {
+          TransformRow(matrix, point[0], point[1], point[2], 1.f, world4);
+        } else {
+          TransformCol(matrix, point[0], point[1], point[2], 1.f, world4);
+        }
+        world[0] = world4[0];
+        world[1] = world4[1];
+        world[2] = world4[2];
+      }
+      if (row_vector) {
+        TransformRow(camera.view_proj, world[0], world[1], world[2], 1.f, clip);
+      } else {
+        TransformCol(camera.view_proj, world[0], world[1], world[2], 1.f, clip);
+      }
+      out_world[0] = world[0];
+      out_world[1] = world[1];
+      out_world[2] = world[2];
+    }
   }
 
+  if (out_clip != nullptr) {
+    out_clip[0] = clip[0];
+    out_clip[1] = clip[1];
+    out_clip[2] = clip[2];
+    out_clip[3] = clip[3];
+  }
   if (!std::isfinite(clip[0]) || !std::isfinite(clip[1]) || !std::isfinite(clip[2]) || !std::isfinite(clip[3])) return false;
   if (clip[3] <= 1e-6f) return false;
   const float inv_w = 1.f / clip[3];
@@ -150,18 +194,23 @@ inline bool ProjectCandidateInstance(
   return true;
 }
 
-inline uint64_t CandidateSignature(const TransformCandidate& candidate) {
+inline uint64_t CandidateSignature(CandidateKind kind, uint32_t slot, uint32_t matrix_offset, uint32_t stride) {
   uint64_t hash = 1469598103934665603ull;
   const auto mix = [&hash](uint64_t value) {
     hash ^= value;
     hash *= 1099511628211ull;
   };
-  mix(static_cast<uint64_t>(candidate.kind));
-  mix(candidate.slot);
-  mix(candidate.matrix_offset);
-  mix(candidate.stride);
-  mix(candidate.base_offset);
+  mix(static_cast<uint64_t>(kind));
+  mix(slot);
+  mix(matrix_offset);
+  mix(stride);
+  // base_offset is intentionally NOT part of the signature: instanceOffset_g is
+  // draw-dependent, so consistency is structural (kind/slot/offset/stride).
   return hash;
+}
+
+inline uint64_t CandidateSignature(const TransformCandidate& candidate) {
+  return CandidateSignature(candidate.kind, candidate.slot, candidate.matrix_offset, candidate.stride);
 }
 
 inline void CollectProbeCandidates(
@@ -233,6 +282,8 @@ inline SetScore ScoreCandidateSet(
   const size_t stride = count > max_samples ? ((count + max_samples - 1u) / max_samples) : 1u;
   float sum_inside = 0.f;
   float min_u = 1e9f, max_u = -1e9f, min_v = 1e9f, max_v = -1e9f;
+  size_t z_valid = 0u;
+  size_t z_total = 0u;
 
   for (uint32_t instance = 0; instance < instances; ++instance) {
     size_t sampled = 0u;
@@ -241,9 +292,12 @@ inline SetScore ScoreCandidateSet(
     for (size_t i = 0u; i < count; i += stride) {
       float uv[2] = {};
       float world[3] = {};
+      float ndc_z = 0.f;
       sampled += 1u;
-      if (!ProjectCandidateInstance(candidate, camera, instance, positions[i], uv, world)) continue;
+      if (!ProjectCandidateInstance(candidate, camera, instance, positions[i], uv, world, &ndc_z)) continue;
       valid_count += 1u;
+      z_total += 1u;
+      if (ndc_z >= 0.f && ndc_z <= 1.f) z_valid += 1u;
       if (uv[0] > -0.05f && uv[0] < 1.05f && uv[1] > -0.05f && uv[1] < 1.05f) {
         inside_count += 1u;
         min_u = (std::min)(min_u, uv[0]);
@@ -260,6 +314,7 @@ inline SetScore ScoreCandidateSet(
   }
 
   if (result.instances_tested == 0u) return result;
+  result.ndc_z_valid_ratio = z_total > 0u ? static_cast<float>(z_valid) / static_cast<float>(z_total) : 0.f;
   result.mean_inside = sum_inside / static_cast<float>(result.instances_tested);
   result.bbox_area = (max_u - min_u) * (max_v - min_v);
   const float ok_fraction = static_cast<float>(result.instances_ok) / static_cast<float>(result.instances_tested);
@@ -365,6 +420,8 @@ inline void PushStructuredCandidate(
   candidate.set_score = score.set_score;
   candidate.mean_inside = score.mean_inside;
   candidate.bbox_area = score.bbox_area;
+  candidate.ndc_z_valid_ratio = score.ndc_z_valid_ratio;
+  candidate.projection_valid = score.valid;
   candidate.instances_ok = score.instances_ok;
   candidate.valid = true;
 
@@ -393,6 +450,8 @@ inline void PushConstantBufferCandidate(
   candidate.set_score = score.set_score;
   candidate.mean_inside = score.mean_inside;
   candidate.bbox_area = score.bbox_area;
+  candidate.ndc_z_valid_ratio = score.ndc_z_valid_ratio;
+  candidate.projection_valid = score.valid;
   candidate.instances_ok = score.instances_ok;
   candidate.valid = true;
   candidates->push_back(std::move(candidate));
@@ -480,6 +539,7 @@ inline void ScanCandidates() {
 inline CandidateSummary MakeCandidateSummary(const TransformCandidate& candidate) {
   CandidateSummary summary;
   summary.kind = candidate.kind;
+  summary.source = candidate.source;
   summary.stage = candidate.stage;
   summary.slot = candidate.slot;
   summary.matrix_offset = candidate.matrix_offset;
@@ -490,6 +550,7 @@ inline CandidateSummary MakeCandidateSummary(const TransformCandidate& candidate
   summary.has_prev = candidate.has_prev;
   summary.set_score = candidate.set_score;
   summary.mean_inside = candidate.mean_inside;
+  summary.ndc_z_valid_ratio = candidate.ndc_z_valid_ratio;
   return summary;
 }
 

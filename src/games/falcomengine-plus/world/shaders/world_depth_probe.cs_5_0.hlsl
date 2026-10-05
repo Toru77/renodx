@@ -55,11 +55,18 @@ void main(uint3 dtid : SV_DispatchThreadID)
     for (uint i = 0; i < g_samples_per_candidate; ++i)
     {
         const float4 s = g_samples[base + i];
+        if (s.w < 0.5)
+        {
+            // Sentinel slot (no real instance/vertex): never counted.
+            g_sample_results[base + i] = float4(0.0, 0.0, 0.0, 0.0);
+            continue;
+        }
         const float2 uv = s.xy;
         const float expected = s.z;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
         {
             out_count += 1.0;
+            g_sample_results[base + i] = float4(0.0, 0.0, 0.0, 0.0);
             continue;
         }
 

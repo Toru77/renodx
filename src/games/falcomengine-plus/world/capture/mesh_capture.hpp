@@ -39,13 +39,14 @@ inline renodx::utils::scene::DrawRecord ToSceneRecord(const DrawRecord& draw) {
   return record;
 }
 
-inline void CaptureCameraFromBytes(const std::vector<uint8_t>& bytes, uint32_t frame) {
+inline void CaptureCameraFromBytes(const std::vector<uint8_t>& bytes, uint32_t frame, uint8_t source = 1u) {
   const size_t float_count = bytes.size() / sizeof(float);
   if (float_count < 96u) return;
 
   const auto* data = reinterpret_cast<const float*>(bytes.data());
   auto& camera = g_state.camera;
   std::memcpy(camera.view, data + 0u, sizeof(float) * 16u);
+  std::memcpy(camera.view_inv, data + 16u, sizeof(float) * 16u);
   std::memcpy(camera.proj, data + 32u, sizeof(float) * 16u);
   std::memcpy(camera.view_proj, data + 64u, sizeof(float) * 16u);
   std::memcpy(camera.view_proj_inv, data + 80u, sizeof(float) * 16u);
@@ -56,6 +57,7 @@ inline void CaptureCameraFromBytes(const std::vector<uint8_t>& bytes, uint32_t f
   }
   camera.valid = true;
   camera.frame = frame;
+  camera.source = source;
 }
 
 inline void CaptureCameraFromLighting(

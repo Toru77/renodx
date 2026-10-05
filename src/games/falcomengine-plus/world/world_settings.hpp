@@ -14,6 +14,7 @@
 #include <shellapi.h>
 
 #include "world_state.hpp"
+#include "bvh/world_bvh.hpp"
 #include "capture/draw_census.hpp"
 #include "research/auto_research.hpp"
 #include "research/coverage.hpp"
@@ -96,6 +97,18 @@ inline void OpenLatestReport() {
   ShellExecuteA(nullptr, "open", path.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+inline void OpenLatestSummary() {
+  const std::filesystem::path path = LatestSummaryPath();
+  if (!std::filesystem::exists(path)) return;
+  ShellExecuteA(nullptr, "open", path.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+inline void OpenHintProbeReport() {
+  const std::filesystem::path path = WorldOutputDir() / "world_hint_probe_latest.json";
+  if (!std::filesystem::exists(path)) return;
+  ShellExecuteA(nullptr, "open", path.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 struct AutoProgressSnapshot {
   bool active = false;
   uint32_t rounds = 0u;
@@ -109,6 +122,9 @@ struct AutoProgressSnapshot {
   uint32_t failed = 0u;
   uint32_t not_observed = 0u;
   uint32_t pending_verdict = 0u;
+  uint32_t arm_windows = 0u;
+  uint32_t deferred = 0u;
+  std::string finalize_reason;
 };
 
 inline AutoProgressSnapshot SnapshotAutoProgress() {
@@ -122,6 +138,9 @@ inline AutoProgressSnapshot SnapshotAutoProgress() {
   snapshot.pending = static_cast<uint32_t>(state.pending.size());
   snapshot.last_vs = state.last_vs;
   snapshot.captures_target = snapshot.families_total * state.rounds;
+  snapshot.arm_windows = state.arm_windows;
+  snapshot.deferred = static_cast<uint32_t>(state.deferred.size());
+  snapshot.finalize_reason = state.finalize_reason;
   for (const auto& result : state.results) {
     snapshot.captures_done += static_cast<uint32_t>(result.captures.size());
     switch (static_cast<AutoVerdict>(result.verdict)) {
@@ -150,9 +169,11 @@ inline void DrawResearchPanel() {
   bool do_dump = false;
   bool do_arm = false;
   bool do_scan = false;
+  bool do_probe_hint = false;
   bool do_auto_start = false;
   bool do_auto_stop = false;
   bool do_open_report = false;
+  bool do_open_summary = false;
   uint32_t arm_vs = 0u;
 
   std::vector<FamilyStats> families;
@@ -176,6 +197,7 @@ inline void DrawResearchPanel() {
   bool arm_active = false;
   bool camera_valid = false;
   bool camera_has_prev = false;
+  bool probe_hint_pending = false;
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     families.reserve(g_state.families.size());
@@ -205,6 +227,7 @@ inline void DrawResearchPanel() {
     arm_active = g_state.arm_active;
     camera_valid = g_state.camera.valid;
     camera_has_prev = g_state.camera.has_prev;
+    probe_hint_pending = g_state.probe_hint_requested;
     status = g_state.status;
   }
 
@@ -231,15 +254,22 @@ inline void DrawResearchPanel() {
   ImGui::SameLine();
   if (ImGui::Button("Open Latest Report")) do_open_report = true;
   ImGui::SameLine();
+  if (ImGui::Button("Open Summary")) do_open_summary = true;
+  ImGui::SameLine();
   if (ImGui::Button("Dump CSV")) do_dump = true;
 
   if (auto_progress.active || auto_progress.families_done > 0u) {
-    ImGui::Text("Captures: %u/%u   Pending families: %u",
+    ImGui::Text("Captures: %u/%u   Pending families: %u   Deferred: %u",
                 auto_progress.captures_done, auto_progress.captures_target,
-                auto_progress.pending);
+                auto_progress.pending, auto_progress.deferred);
     if (auto_progress.last_vs != 0u) {
       ImGui::Text("Last captured: 0x%08X", auto_progress.last_vs);
     }
+  }
+  if (!auto_progress.active && auto_progress.families_done > 0u) {
+    ImGui::Text("Last run: %s   Arm windows: %u",
+                auto_progress.finalize_reason.empty() ? "unknown" : auto_progress.finalize_reason.c_str(),
+                auto_progress.arm_windows);
   }
   ImGui::Text("Verified: %u   Failed: %u   Not observed: %u   Pending: %u",
               auto_progress.verified, auto_progress.failed,
@@ -361,6 +391,20 @@ inline void DrawResearchPanel() {
     ImGui::SameLine();
     if (ImGui::Button("Reset Census")) do_reset = true;
 
+    const ReferenceHint* selected_hint = selected_family != 0u ? FindReferenceHint(selected_family) : nullptr;
+    const bool hint_available = selected_hint != nullptr && selected_hint->structured_instance;
+    ImGui::BeginDisabled(!hint_available || auto_progress.active);
+    if (ImGui::Button("Probe Hint Candidate")) do_probe_hint = true;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Open Hint Probe")) OpenHintProbeReport();
+    if (selected_family != 0u && !hint_available) {
+      ImGui::TextDisabled("No structured instance hint for the selected family.");
+    }
+    if (probe_hint_pending) {
+      ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "Hint probe pending: waiting for a frame-aligned capture.");
+    }
+
     if (!captured_valid) {
       ImGui::TextDisabled("No draw captured yet.");
     } else {
@@ -434,9 +478,18 @@ inline void DrawResearchPanel() {
   if (do_dump) DumpCensusCsv();
   if (do_arm) ArmCapture(arm_vs, 0u);
   if (do_scan) ScanCandidates();
+  if (do_probe_hint) {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    const uint32_t target = selected_family != 0u ? selected_family : captured_draw.vs_hash;
+    g_state.probe_hint_vs = target;
+    g_state.probe_hint_requested = true;
+    g_state.probe_hint_deadline_frame = static_cast<uint64_t>(g_state.frame.load()) + 600u;
+    g_state.status = "hint probe requested; waiting for frame-aligned capture...";
+  }
   if (do_auto_start) StartAutoResearch();
   if (do_auto_stop) StopAutoResearch();
   if (do_open_report) OpenLatestReport();
+  if (do_open_summary) OpenLatestSummary();
 }
 
 inline void AddSettings(renodx::utils::settings::Settings* settings, bool supported) {
@@ -562,6 +615,18 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "Ray Tracing",
       .on_draw = []() {
         DrawResearchPanel();
+        return false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "WorldBvhPanel",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Phase 1 World BVH",
+      .section = "Ray Tracing",
+      .on_draw = []() {
+        bvh::DrawBvhPanel();
         return false;
       },
       .is_visible = visible,

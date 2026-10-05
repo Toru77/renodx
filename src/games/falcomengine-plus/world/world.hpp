@@ -25,6 +25,7 @@
 #include "research/auto_research.hpp"
 #include "debug/overlay.hpp"
 #include "world_settings.hpp"
+#include "bvh/world_bvh.hpp"
 
 #include "../../../utils/command_action.hpp"
 #include "../../../utils/constants.hpp"
@@ -42,6 +43,8 @@ inline void Use(DWORD fdw_reason, bool supported) {
       attached = true;
 
       g_state.ring.reserve(kCensusRingSize);
+
+      bvh::Use(fdw_reason);
 
       renodx::utils::scene::Use(fdw_reason);
       if (renodx::utils::scene::shared.data != nullptr) {
@@ -71,6 +74,7 @@ inline void Use(DWORD fdw_reason, bool supported) {
     case DLL_PROCESS_DETACH: {
       if (!attached) return;
       attached = false;
+      bvh::Use(fdw_reason);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
