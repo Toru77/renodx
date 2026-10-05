@@ -82,6 +82,12 @@ inline void DrawBvhPanel() {
               stats.skipped_no_base,
               stats.skipped_beyond_snapshot,
               stats.mesh_failures);
+  ImGui::Text("Gate skips: non-candidate: %u  no SRV: %u  slot invalid: %u  no buffer: %u  indirect drops: %llu",
+              stats.skipped_not_candidate,
+              stats.skipped_no_srv,
+              stats.skipped_slot_invalid,
+              stats.skipped_no_buffer,
+              static_cast<unsigned long long>(IndirectDroppedCalls()));
   if (camera_valid) {
     ImGui::Text("Camera: %.1f %.1f %.1f   Region cell min: %.0f %.0f %.0f",
                 camera[0], camera[1], camera[2],

@@ -25,6 +25,7 @@
 
 #include "../../../../utils/path.hpp"
 #include "../world_state.hpp"
+#include "bvh_pool.hpp"
 
 namespace falcom_world::bvh {
 
@@ -316,14 +317,24 @@ inline uint32_t LoadWorldRecipes() {
     FamilyStats& family = g_state.families[vs_hash];
     family.vs_hash = vs_hash;
     family.verified = result->runtime_verified;
+    family.transform_cross_capture = result->cross_capture_pass;
     family.transform_found = result->runtime_verified && !result->passing_layouts.empty();
     if (family.transform_found) {
-      const PassingLayout& layout = result->passing_layouts[0];
-      family.transform_kind = static_cast<uint8_t>(layout.kind);
-      family.transform_slot = layout.slot;
-      family.transform_offset = layout.matrix_offset;
-      family.transform_stride = layout.stride;
-      family.transform_base = layout.base_offset;
+      // Prefer the canonical instance layout so the pool's persistent fallback
+      // resolves the engine's t15/stride-160 path instead of a coincidental
+      // probe match.
+      PassingLayout chosen;
+      const PassingLayout* layout = nullptr;
+      if (SelectPoolInstanceLayout(result->passing_layouts, &chosen)) {
+        layout = &chosen;
+      } else {
+        layout = &result->passing_layouts[0];
+      }
+      family.transform_kind = static_cast<uint8_t>(layout->kind);
+      family.transform_slot = layout->slot;
+      family.transform_offset = layout->matrix_offset;
+      family.transform_stride = layout->stride;
+      family.transform_base = layout->base_offset;
     }
     loaded += 1u;
   }

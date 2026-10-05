@@ -108,7 +108,7 @@ inline void DumpCensusCsv() {
 
   std::ostringstream family_csv;
   family_csv << "vs_hash,hint_tag,hint_category,label,label_source,draws,unique_meshes,instances,"
-                "weighted_triangles,indices,candidate,verified,transform_kind,transform_slot,"
+                "weighted_triangles,indices,candidate,candidate_draws,verified,transform_kind,transform_slot,"
                 "transform_offset,transform_stride,transform_base,transform_has_prev,"
                 "depth_write_draws,blend_draws,skin_draws,ps_hashes\n";
   for (const auto& family : families) {
@@ -125,6 +125,7 @@ inline void DumpCensusCsv() {
                << family.triangles << ","
                << family.indices << ","
                << (family.candidate ? 1 : 0) << ","
+               << family.candidate_draws << ","
                << (family.verified ? 1 : 0) << ","
                << (has_transform ? CandidateKindName(static_cast<CandidateKind>(family.transform_kind)) : "") << ","
                << (has_transform ? family.transform_slot : 0u) << ","

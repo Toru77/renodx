@@ -332,6 +332,28 @@ inline void CommitDrawRecord(
   TryCaptureArmedDraw(device, cmd_list, record, cl_data);
 }
 
+// Records which constant-buffer and VS SRV slots are bound for a draw so the
+// census/report can reproduce the draw's binding footprint.
+inline void FillDrawBindingMasks(DrawRecord* record, const WorldCommandListData* cl_data) {
+  if (record == nullptr || cl_data == nullptr) return;
+  for (uint32_t slot = 0; slot < kCbSlotCapacity; ++slot) {
+    if (cl_data->vs_cb[slot].handle != 0u) {
+      record->vs_cb_mask |= (1u << slot);
+      if (slot == 0u) record->vs_cb0 = cl_data->vs_cb[slot];
+    }
+    if (cl_data->ps_cb[slot].handle != 0u) {
+      record->ps_cb_mask |= (1u << slot);
+      if (slot == 0u) record->ps_cb0 = cl_data->ps_cb[slot];
+    }
+  }
+  for (uint32_t slot = 0; slot < kSrvSlotCapacity; ++slot) {
+    if (cl_data->vs_srv[slot].handle != 0u) {
+      record->vs_srv_mask |= (1u << slot);
+      if (record->vs_srv0.handle == 0u) record->vs_srv0 = cl_data->vs_srv[slot];
+    }
+  }
+}
+
 struct WorldDrawCallback {
   template <typename Arguments>
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<Arguments>>
@@ -361,24 +383,7 @@ struct WorldDrawCallback {
     record.is_candidate = IsGeometryCandidate(record);
 
     auto* cl_data = GetWorldCommandListData(context.cmd_list);
-    if (cl_data != nullptr) {
-      for (uint32_t slot = 0; slot < kCbSlotCapacity; ++slot) {
-        if (cl_data->vs_cb[slot].handle != 0u) {
-          record.vs_cb_mask |= (1u << slot);
-          if (slot == 0u) record.vs_cb0 = cl_data->vs_cb[slot];
-        }
-        if (cl_data->ps_cb[slot].handle != 0u) {
-          record.ps_cb_mask |= (1u << slot);
-          if (slot == 0u) record.ps_cb0 = cl_data->ps_cb[slot];
-        }
-      }
-      for (uint32_t slot = 0; slot < kSrvSlotCapacity; ++slot) {
-        if (cl_data->vs_srv[slot].handle != 0u) {
-          record.vs_srv_mask |= (1u << slot);
-          if (record.vs_srv0.handle == 0u) record.vs_srv0 = cl_data->vs_srv[slot];
-        }
-      }
-    }
+    FillDrawBindingMasks(&record, cl_data);
 
     CommitDrawRecord(record, device, context.cmd_list, cl_data);
     bvh::OnPoolScanDraw(device, context.cmd_list, record, cl_data);
@@ -394,12 +399,166 @@ struct WorldDrawCallback {
   operator()(renodx::utils::command_action::CommandContext<renodx::utils::command_action::DrawIndexedArguments>& context) const {
     return Record(context, 1u);
   }
+
+  // Indirect draws carry their counts in a GPU buffer; the copy is issued on
+  // the game's command list here and resolved at present, so the args match
+  // the draw (the buffer can be rewritten later in the frame).
+  renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<renodx::utils::command_action::IndirectArguments>>
+  operator()(renodx::utils::command_action::CommandContext<renodx::utils::command_action::IndirectArguments>& context) const {
+    if (!CensusEnabled() || context.cmd_list == nullptr) return {};
+    auto* device = context.cmd_list->get_device();
+    if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return {};
+
+    const auto& args = context.arguments;
+    if (args.buffer.handle == 0u) return {};
+    switch (args.command) {
+      case reshade::api::indirect_command::unknown:
+        if (args.unknown_command_is_dispatch) return {};
+        break;
+      case reshade::api::indirect_command::draw:
+      case reshade::api::indirect_command::draw_indexed:
+        break;
+      default:
+        return {};
+    }
+    const bool indexed = args.command != reshade::api::indirect_command::draw;
+    // D3D11 reports a single draw with stride 0 (the args layout is implied):
+    // 20 bytes for indexed draws, 16 for non-indexed. Other APIs pass the
+    // actual stride/count.
+    const uint32_t stride = args.stride != 0u ? args.stride : (indexed ? 20u : 16u);
+    uint32_t draw_count = args.draw_count != 0u ? args.draw_count : 1u;
+
+    auto& pending = PendingIndirectDraws();
+    if (pending.size() >= kMaxIndirectCallsPerFrame) {
+      IndirectDroppedCalls() += 1u;
+      return {};
+    }
+
+    if (draw_count > kMaxIndirectDrawsPerCall) draw_count = kMaxIndirectDrawsPerCall;
+    const uint64_t read_size = static_cast<uint64_t>(draw_count) * stride;
+    if (read_size == 0u) return {};
+
+    auto* cl_data = GetWorldCommandListData(context.cmd_list);
+    reshade::api::resource instance_cb = {0u};
+    uint64_t cb_size = 0u;
+    if (cl_data != nullptr) {
+      instance_cb = cl_data->vs_cb[bvh::kPoolInstanceCbSlot];
+      if (instance_cb.handle != 0u) {
+        const auto desc = device->get_resource_desc(instance_cb);
+        if (desc.type == reshade::api::resource_type::buffer) {
+          cb_size = (std::min)(desc.buffer.size, static_cast<uint64_t>(16u));
+        }
+        if (cb_size < sizeof(int32_t)) cb_size = 0u;
+      }
+    }
+
+    if (IndirectStagingUsed() + read_size + cb_size > kMaxIndirectReadBytes) {
+      IndirectDroppedCalls() += 1u;
+      return {};
+    }
+    if (!EnsureIndirectStaging(device, IndirectStagingUsed() + read_size + cb_size)) {
+      IndirectDroppedCalls() += 1u;
+      return {};
+    }
+
+    PendingIndirectDraw draw;
+    draw.indexed = indexed;
+    draw.args_buffer = args.buffer;
+    draw.args_offset = args.offset;
+    draw.draw_count = draw_count;
+    draw.stride = stride;
+    draw.read_size = read_size;
+    draw.staging_offset = IndirectStagingUsed();
+    context.cmd_list->copy_buffer_region(
+        args.buffer, args.offset, IndirectStagingResource(), IndirectStagingUsed(), read_size);
+    IndirectStagingUsed() += read_size;
+    if (cb_size != 0u) {
+      draw.cb_size = static_cast<uint32_t>(cb_size);
+      draw.cb_staging_offset = IndirectStagingUsed();
+      context.cmd_list->copy_buffer_region(
+          instance_cb, 0u, IndirectStagingResource(), IndirectStagingUsed(), cb_size);
+      IndirectStagingUsed() += cb_size;
+    }
+
+    FillCommonDrawRecord(&draw.record, context.cmd_list, device);
+    draw.record.method = indexed ? 1u : 0u;
+    draw.record.frame = g_state.frame.load();
+    FillDrawBindingMasks(&draw.record, cl_data);
+    if (cl_data != nullptr) draw.cl_data = *cl_data;
+    pending.push_back(std::move(draw));
+    return {};
+  }
 };
+
+// Resolves queued indirect draws at present: the args were copied on the game's
+// command list at the draw, so the counts match what the GPU executed. Each
+// sub-draw runs through the same classification/commit/pool-scan pipeline as a
+// direct draw, using the bindings captured at draw time.
+inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
+  if (queue == nullptr) return;
+  auto& pending = PendingIndirectDraws();
+  if (pending.empty()) return;
+  auto* device = queue->get_device();
+  auto* cmd_list = queue->get_immediate_command_list();
+  if (device == nullptr || cmd_list == nullptr) {
+    pending.clear();
+    IndirectStagingUsed() = 0u;
+    return;
+  }
+  queue->flush_immediate_command_list();
+  queue->wait_idle();
+
+  void* mapped = nullptr;
+  const uint64_t map_size = IndirectStagingUsed();
+  const bool mapped_ok =
+      map_size != 0u && IndirectStagingResource().handle != 0u
+      && device->map_buffer_region(
+             IndirectStagingResource(), 0u, map_size, reshade::api::map_access::read_only, &mapped)
+      && mapped != nullptr;
+  if (mapped_ok) {
+    const auto* base_bytes = static_cast<const uint8_t*>(mapped);
+    for (auto& draw : pending) {
+      const uint8_t* args_bytes = base_bytes + draw.staging_offset;
+      int32_t base = 0;
+      const bool has_base = draw.cb_size >= sizeof(int32_t);
+      if (has_base) {
+        std::memcpy(&base, base_bytes + draw.cb_staging_offset, sizeof(int32_t));
+      }
+      for (uint32_t i = 0; i < draw.draw_count; ++i) {
+        DrawRecord record = draw.record;
+        const uint8_t* element = args_bytes + static_cast<uint64_t>(i) * draw.stride;
+        if (draw.indexed) {
+          if (draw.stride < 20u) break;
+          std::memcpy(&record.index_count, element + 0u, sizeof(uint32_t));
+          std::memcpy(&record.instance_count, element + 4u, sizeof(uint32_t));
+          std::memcpy(&record.first_index, element + 8u, sizeof(uint32_t));
+          std::memcpy(&record.vertex_offset, element + 12u, sizeof(uint32_t));
+          std::memcpy(&record.first_instance, element + 16u, sizeof(uint32_t));
+        } else {
+          if (draw.stride < 16u) break;
+          std::memcpy(&record.vertex_count, element + 0u, sizeof(uint32_t));
+          std::memcpy(&record.instance_count, element + 4u, sizeof(uint32_t));
+          std::memcpy(&record.first_vertex, element + 8u, sizeof(uint32_t));
+          std::memcpy(&record.first_instance, element + 12u, sizeof(uint32_t));
+        }
+        record.serial = g_state.next_serial.fetch_add(1u);
+        record.is_candidate = IsGeometryCandidate(record);
+        CommitDrawRecord(record, device, cmd_list, &draw.cl_data);
+        bvh::OnPoolScanDraw(device, cmd_list, record, &draw.cl_data, has_base ? base : INT32_MIN);
+      }
+    }
+    device->unmap_buffer_region(IndirectStagingResource());
+  }
+  pending.clear();
+  IndirectStagingUsed() = 0u;
+}
 
 inline void RegisterCensus() {
   renodx::utils::command_action::RegisterCallback(
       WorldDrawCallback{},
-      {.shader_hash = 0u, .command_types = renodx::utils::command_action::COMMAND_TYPE_DIRECT_DRAW});
+      {.shader_hash = 0u,
+       .command_types = renodx::utils::command_action::COMMAND_TYPE_DIRECT_DRAW
+                        | renodx::utils::command_action::COMMAND_TYPE_INDIRECT});
 }
 
 inline void OnWorldPresent(
@@ -426,6 +585,7 @@ inline void OnWorldPresent(
     ResolveCbCopies(queue, &g_state.captured);
     ParseInstanceOffset(&g_state.captured);
   }
+  ResolveIndirectDraws(queue);
   RunPendingMeshCapture(queue);
   bvh::DrainPoolScan(queue->get_device(), queue);
 }

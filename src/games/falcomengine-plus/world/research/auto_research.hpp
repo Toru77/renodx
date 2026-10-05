@@ -19,6 +19,7 @@
 #include <unordered_map>
 
 #include "../world_state.hpp"
+#include "../bvh/bvh_pool.hpp"
 #include "transform_candidates.hpp"
 #include "classification.hpp"
 #include "reference_hints.hpp"
@@ -237,6 +238,10 @@ inline void StartAutoResearch() {
     state.arm_windows += 1u;
   }
   state.arm_set_size = static_cast<uint32_t>(g_state.arm_vs_set.size());
+  // The pool must see the same draws the research pass does; keep the scan on
+  // for the whole run so families verified here cannot be missed by a closed
+  // scan window. The Pool Scan checkbox still allows a manual override.
+  bvh::g_pool.scan_active.store(true, std::memory_order_relaxed);
   g_state.status = "auto research started: " + std::to_string(state.queue.size()) + " families";
 }
 
@@ -330,15 +335,28 @@ inline void FinalizeAutoResearch() {
         family.captures_attempted = static_cast<uint32_t>(result.captures.size());
         family.captures_ok = passes;
         family.depth_match_ratio = best_ratio;
+        family.transform_cross_capture = result.cross_capture_pass;
         if (result.runtime_verified && best_capture.count(best_signature) != 0u) {
           const AutoCapture* capture = best_capture[best_signature];
           family.verified = true;
           family.transform_found = true;
-          family.transform_kind = static_cast<uint8_t>(capture->kind);
-          family.transform_slot = capture->slot;
-          family.transform_offset = capture->matrix_offset;
-          family.transform_stride = capture->stride;
-          family.transform_base = capture->base_offset;
+          // Prefer the canonical instance layout so the pool's persistent
+          // fallback resolves the engine's t15/stride-160 path instead of a
+          // coincidental probe match.
+          PassingLayout chosen;
+          if (bvh::SelectPoolInstanceLayout(result.passing_layouts, &chosen)) {
+            family.transform_kind = static_cast<uint8_t>(chosen.kind);
+            family.transform_slot = chosen.slot;
+            family.transform_offset = chosen.matrix_offset;
+            family.transform_stride = chosen.stride;
+            family.transform_base = chosen.base_offset;
+          } else {
+            family.transform_kind = static_cast<uint8_t>(capture->kind);
+            family.transform_slot = capture->slot;
+            family.transform_offset = capture->matrix_offset;
+            family.transform_stride = capture->stride;
+            family.transform_base = capture->base_offset;
+          }
           family.transform_has_prev = !capture->prev_matrices.empty();
         }
       }
@@ -515,6 +533,50 @@ inline bool ProcessAutoCapture(
             probe_candidates.push_back(std::move(candidate));
           } else if (probe_candidates.size() > hint_positions.size()) {
             probe_candidates.back() = std::move(candidate);
+          }
+        }
+      }
+    }
+
+    // Force the engine's canonical instance candidate (t15, offset 0, stride
+    // 160, 4x3 row) into the probe list when the capture provides one.
+    // Families whose canonical candidate ranked below coincidental CB matches
+    // must still be probed on the canonical path, otherwise they verify with a
+    // coincidental layout and the pool cannot admit them.
+    {
+      const uint32_t preferred_base = (instance_offset_found && instance_offset >= 0)
+                                          ? static_cast<uint32_t>(instance_offset)
+                                          : 0u;
+      const TransformCandidate* canonical = nullptr;
+      for (const auto& candidate : candidates) {
+        if (candidate.kind != CandidateKind::Inst4x3Row) continue;
+        if (candidate.slot != bvh::kPoolInstanceSlot || candidate.stride != bvh::kPoolInstanceStride) continue;
+        if (candidate.matrix_offset != 0u) continue;
+        if (candidate.base_offset == preferred_base) {
+          canonical = &candidate;
+          break;
+        }
+        if (canonical == nullptr) canonical = &candidate;
+      }
+      if (canonical != nullptr) {
+        bool present = false;
+        for (const auto& candidate : probe_candidates) {
+          if (candidate.kind == canonical->kind
+              && candidate.slot == canonical->slot
+              && candidate.matrix_offset == canonical->matrix_offset
+              && candidate.stride == canonical->stride
+              && candidate.base_offset == canonical->base_offset) {
+            present = true;
+            break;
+          }
+        }
+        if (!present) {
+          TransformCandidate forced = *canonical;
+          forced.source = CandidateSource::PreferredSignature;
+          if (probe_candidates.size() < kProbeTopCandidates) {
+            probe_candidates.push_back(std::move(forced));
+          } else if (probe_candidates.size() > hint_positions.size()) {
+            probe_candidates.back() = std::move(forced);
           }
         }
       }

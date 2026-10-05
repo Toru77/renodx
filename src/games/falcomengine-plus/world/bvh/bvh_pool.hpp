@@ -28,6 +28,7 @@
 #include "../../../../utils/constants.hpp"
 #include "../../../../utils/path.hpp"
 #include "../../../../utils/scene.hpp"
+#include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
 #include "../capture/mesh_capture.hpp"
 #include "../research/classification.hpp"
@@ -54,7 +55,7 @@ inline constexpr uint32_t kPoolInstanceSlot = 15u;
 inline constexpr uint32_t kPoolInstanceCbSlot = 1u;
 inline constexpr uint32_t kPoolInstanceStride = 160u;
 inline constexpr float kPoolRegionMinSize = 64.f;
-inline constexpr float kPoolRegionMaxSize = 256.f;
+inline constexpr float kPoolRegionMaxSize = 512.f;
 
 struct WorldMesh {
   uint64_t mesh_key = 0u;
@@ -142,6 +143,12 @@ struct PoolFamilyRecipe {
   int32_t used_base = 0;
   bool canonical_override = false;
   uint32_t rejected_implausible = 0u;
+  // Skip-reason counters so a pool dump names the gate that rejected a family
+  // instead of leaving its absence unexplained.
+  uint32_t skipped_not_candidate = 0u;
+  uint32_t skipped_no_srv = 0u;
+  uint32_t skipped_slot_invalid = 0u;
+  uint32_t skipped_no_buffer = 0u;
   bool has_sample_matrix = false;
   float sample_matrix[16] = {};
   bool has_sample_base = false;
@@ -160,6 +167,7 @@ struct PoolPendingCopy {
   uint64_t cb_staging_offset = 0u;
   uint32_t cb_size = 0u;
   bool has_cb = false;
+  bool has_base_override = false;
 };
 
 struct PoolResourceSnapshot {
@@ -183,11 +191,25 @@ struct PoolStats {
   uint32_t skipped_no_base = 0u;
   uint32_t skipped_beyond_snapshot = 0u;
   uint32_t mesh_failures = 0u;
+  uint32_t skipped_not_candidate = 0u;
+  uint32_t skipped_no_srv = 0u;
+  uint32_t skipped_slot_invalid = 0u;
+  uint32_t skipped_no_buffer = 0u;
+  uint64_t scan_first_frame = 0u;
+  uint64_t scan_last_frame = 0u;
+};
+
+// One draw identity's scheduling attempts plus the mesh it belongs to, so a
+// late mesh capture can re-arm the attempts that expired while the mesh was
+// still queued.
+struct PoolEntryAttempt {
+  uint32_t count = 0u;
+  uint64_t mesh_key = 0u;
 };
 
 struct PoolState {
   std::atomic_bool scan_active{false};
-  float region_size = 128.f;
+  float region_size = 512.f;
   std::mutex mutex;
   std::vector<PoolPendingCopy> pending_snapshots;
   std::vector<PoolScanEntry> mesh_queue;
@@ -198,7 +220,7 @@ struct PoolState {
   std::unordered_map<InstanceKey, ObservedInstance, InstanceKeyHash> observations;
   std::vector<WorldInstance> instances;
   std::unordered_map<uint32_t, PoolFamilyRecipe> family_recipes;
-  std::unordered_map<uint64_t, uint32_t> entry_attempts;
+  std::unordered_map<uint64_t, PoolEntryAttempt> entry_attempts;
   std::unordered_map<uint64_t, PoolResourceSnapshot> frame_snapshots;
   uint64_t revision = 0u;
   reshade::api::device* staging_device = nullptr;
@@ -217,6 +239,42 @@ inline bool IsPoolStructuredKind(uint8_t kind) {
          || kind == static_cast<uint8_t>(CandidateKind::Inst4x3Col)
          || kind == static_cast<uint8_t>(CandidateKind::Inst4x4Row)
          || kind == static_cast<uint8_t>(CandidateKind::Inst4x4Col);
+}
+
+// Chooses the instance layout the pool should use: the engine's canonical
+// path (slot 15, stride 160) first, row kinds before col, then any other
+// instance layout. Returns false when the family has no instance layout.
+inline bool SelectPoolInstanceLayout(
+    const std::vector<PassingLayout>& layouts,
+    PassingLayout* out_layout) {
+  if (out_layout == nullptr) return false;
+  const PassingLayout* canonical_col = nullptr;
+  const PassingLayout* fallback = nullptr;
+  for (const auto& layout : layouts) {
+    if (!IsPoolStructuredKind(static_cast<uint8_t>(layout.kind))) continue;
+    const bool canonical_slot = layout.slot == kPoolInstanceSlot && layout.stride == kPoolInstanceStride;
+    if (canonical_slot) {
+      const uint8_t kind_value = static_cast<uint8_t>(layout.kind);
+      const bool row_kind = kind_value == static_cast<uint8_t>(CandidateKind::Inst4x3Row)
+                            || kind_value == static_cast<uint8_t>(CandidateKind::Inst4x4Row);
+      if (row_kind) {
+        *out_layout = layout;
+        return true;
+      }
+      if (canonical_col == nullptr) canonical_col = &layout;
+    } else if (fallback == nullptr) {
+      fallback = &layout;
+    }
+  }
+  if (canonical_col != nullptr) {
+    *out_layout = *canonical_col;
+    return true;
+  }
+  if (fallback != nullptr) {
+    *out_layout = *fallback;
+    return true;
+  }
+  return false;
 }
 
 inline void TransformPoolPoint(uint8_t kind, const float* matrix, const float* point, float* out) {
@@ -521,6 +579,20 @@ inline void AdmitPendingInstancesForMesh(uint64_t mesh_key, uint32_t mesh_id) {
   }
 }
 
+// A mesh can be captured many frames after its first draws (the mesh queue is
+// drained one entry per frame). Re-arm the family's exhausted identities so
+// the next draws re-observe and admit their instances now that the mesh
+// exists. Caller holds g_pool.mutex.
+inline void ClearPoolEntryAttemptsForMesh(uint64_t mesh_key) {
+  for (auto it = g_pool.entry_attempts.begin(); it != g_pool.entry_attempts.end();) {
+    if (it->second.mesh_key == mesh_key) {
+      it = g_pool.entry_attempts.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 inline void ExtractPoolInstances(
     const PoolScanEntry& entry,
     int32_t base,
@@ -571,7 +643,9 @@ inline void ExtractPoolInstances(
     if (!observed.admitted && !observed.rejected) any_unadmitted = true;
   }
   if (!any_unadmitted) {
-    g_pool.entry_attempts[PoolEntryIdentity(entry)] = kPoolMaxEntryAttempts;
+    PoolEntryAttempt& attempt = g_pool.entry_attempts[PoolEntryIdentity(entry)];
+    attempt.count = kPoolMaxEntryAttempts;
+    attempt.mesh_key = entry.mesh_key;
   }
 }
 
@@ -614,6 +688,7 @@ inline void CaptureOnePoolMesh(reshade::api::device* device, reshade::api::comma
   g_pool.mesh_by_key[entry.mesh_key] = mesh_id;
   g_pool.revision += 1u;
   AdmitPendingInstancesForMesh(entry.mesh_key, mesh_id);
+  ClearPoolEntryAttemptsForMesh(entry.mesh_key);
 }
 
 inline bool EnsurePoolFrameStaging(reshade::api::device* device, uint64_t needed) {
@@ -660,9 +735,20 @@ inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
     const DrawRecord& draw,
-    WorldCommandListData* cl_data) {
+    WorldCommandListData* cl_data,
+    int32_t base_override = INT32_MIN) {
   if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
-  if (!draw.is_candidate || cl_data == nullptr) return;
+  if (cl_data == nullptr) return;
+  // Pool geometry gate: the census gate in relaxed mode (no color target or
+  // pixel shader required), because Auto Research verifies families from
+  // depth-only prepass draws too. Duplicate geometry from shadow/prepass
+  // passes dedupes on MeshKey/InstanceKey.
+  if (!IsGeometryCandidate(draw, true)) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.skipped_not_candidate += 1u;
+    g_pool.family_recipes[draw.vs_hash].skipped_not_candidate += 1u;
+    return;
+  }
 
   uint8_t kind = 0u;
   uint32_t slot = 0u;
@@ -690,53 +776,63 @@ inline void OnPoolScanDraw(
     // non-canonical layout is only used when it passed cross-capture
     // verification; otherwise the family is skipped rather than admitting
     // geometry with a wrong transform source.
-    const PassingLayout* instance_layout = nullptr;
-    const PassingLayout* canonical_col_layout = nullptr;
-    const PassingLayout* fallback_layout = nullptr;
-    if (result != nullptr) {
-      for (const auto& layout : result->passing_layouts) {
-        if (!IsPoolStructuredKind(static_cast<uint8_t>(layout.kind))) continue;
-        const bool canonical_slot = layout.slot == kPoolInstanceSlot && layout.stride == kPoolInstanceStride;
-        if (canonical_slot) {
-          const uint8_t kind_value = static_cast<uint8_t>(layout.kind);
-          const bool row_kind = kind_value == static_cast<uint8_t>(CandidateKind::Inst4x3Row)
-                                || kind_value == static_cast<uint8_t>(CandidateKind::Inst4x4Row);
-          if (row_kind) {
-            instance_layout = &layout;
-            break;
-          }
-          if (canonical_col_layout == nullptr) canonical_col_layout = &layout;
-        } else if (fallback_layout == nullptr) {
-          fallback_layout = &layout;
-        }
-      }
-      if (instance_layout == nullptr) instance_layout = canonical_col_layout;
-      if (instance_layout == nullptr && fallback_layout != nullptr && result->cross_capture_pass) {
-        instance_layout = fallback_layout;
+    //
+    // The transient Auto Research result list is cleared by every run and only
+    // contains unverified families, so recipe-verified families fall back to
+    // the persistent FamilyStats transform recorded by the recipe loader or
+    // the verification pass.
+    PassingLayout selected;
+    bool have_layout = false;
+    if (result != nullptr && SelectPoolInstanceLayout(result->passing_layouts, &selected)) {
+      const bool canonical = selected.slot == kPoolInstanceSlot && selected.stride == kPoolInstanceStride;
+      have_layout = canonical || result->cross_capture_pass;
+    }
+    if (!have_layout && family.transform_found && IsPoolStructuredKind(family.transform_kind)) {
+      const bool canonical = family.transform_slot == kPoolInstanceSlot
+                             && family.transform_stride == kPoolInstanceStride;
+      if (canonical || family.transform_cross_capture) {
+        selected.kind = static_cast<CandidateKind>(family.transform_kind);
+        selected.slot = family.transform_slot;
+        selected.matrix_offset = family.transform_offset;
+        selected.stride = family.transform_stride;
+        selected.base_offset = family.transform_base;
+        have_layout = true;
       }
     }
-    if (instance_layout == nullptr) {
+    if (!have_layout) {
       g_pool.stats.skipped_non_instance += 1u;
       return;
     }
-    kind = static_cast<uint8_t>(instance_layout->kind);
+    kind = static_cast<uint8_t>(selected.kind);
     if (kind == static_cast<uint8_t>(CandidateKind::Inst4x3Col)) {
       kind = static_cast<uint8_t>(CandidateKind::Inst4x3Row);
     } else if (kind == static_cast<uint8_t>(CandidateKind::Inst4x4Col)) {
       kind = static_cast<uint8_t>(CandidateKind::Inst4x4Row);
     }
-    slot = instance_layout->slot;
-    recorded_offset = instance_layout->matrix_offset;
-    stride = instance_layout->stride;
-    recorded_base = instance_layout->base_offset;
+    slot = selected.slot;
+    recorded_offset = selected.matrix_offset;
+    stride = selected.stride;
+    recorded_base = selected.base_offset;
   }
-  if (slot >= kSrvSlotCapacity || stride == 0u) return;
+  if (slot >= kSrvSlotCapacity || stride == 0u) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.skipped_slot_invalid += 1u;
+    g_pool.family_recipes[draw.vs_hash].skipped_slot_invalid += 1u;
+    return;
+  }
   const reshade::api::resource instance_buffer = cl_data->vs_srv[slot];
-  if (instance_buffer.handle == 0u) return;
+  if (instance_buffer.handle == 0u) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.skipped_no_srv += 1u;
+    g_pool.family_recipes[draw.vs_hash].skipped_no_srv += 1u;
+    return;
+  }
 
   int32_t base = 0;
+  const bool base_overridden = base_override != INT32_MIN;
+  if (base_overridden) base = base_override;
   const reshade::api::resource instance_cb = cl_data->vs_cb[kPoolInstanceCbSlot];
-  if (instance_cb.handle != 0u && device != nullptr) {
+  if (!base_overridden && instance_cb.handle != 0u && device != nullptr) {
     const auto bytes = renodx::utils::constants::GetResourceCache(device, instance_cb);
     if (bytes.size() >= sizeof(int32_t)) std::memcpy(&base, bytes.data(), sizeof(int32_t));
   }
@@ -762,7 +858,12 @@ inline void OnPoolScanDraw(
   if (cmd_list == nullptr || device == nullptr) return;
 
   const uint64_t buffer_size = device->get_resource_desc(instance_buffer).buffer.size;
-  if (buffer_size == 0u) return;
+  if (buffer_size == 0u) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.skipped_no_buffer += 1u;
+    g_pool.family_recipes[draw.vs_hash].skipped_no_buffer += 1u;
+    return;
+  }
 
   const uint64_t identity = PoolEntryIdentity(entry);
   std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -782,7 +883,7 @@ inline void OnPoolScanDraw(
   }
   if (recorded_offset != 0u) recipe.canonical_override = true;
   const auto attempts_it = g_pool.entry_attempts.find(identity);
-  if (attempts_it != g_pool.entry_attempts.end() && attempts_it->second >= kPoolMaxEntryAttempts) {
+  if (attempts_it != g_pool.entry_attempts.end() && attempts_it->second.count >= kPoolMaxEntryAttempts) {
     g_pool.stats.skipped_satisfied += 1u;
     return;
   }
@@ -815,7 +916,7 @@ inline void OnPoolScanDraw(
   }
 
   uint64_t cb_copy_size = 0u;
-  if (instance_cb.handle != 0u) {
+  if (!base_overridden && instance_cb.handle != 0u) {
     const uint64_t cb_buffer_size = device->get_resource_desc(instance_cb).buffer.size;
     cb_copy_size = (std::min)(cb_buffer_size, static_cast<uint64_t>(16u));
     if (cb_copy_size < sizeof(int32_t)) cb_copy_size = 0u;
@@ -839,6 +940,7 @@ inline void OnPoolScanDraw(
   pending.entry = entry;
   pending.snapshot_offset = snapshot_it->second.staging_offset;
   pending.snapshot_size = snapshot_it->second.size;
+  pending.has_base_override = base_overridden;
   if (cb_copy_size != 0u) {
     // Draw-time b1 snapshot: the constants cache can miss this buffer
     // entirely, which would silently read element 0 for every family.
@@ -856,6 +958,11 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   if (device == nullptr || queue == nullptr) return;
   if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
   const uint32_t frame = g_state.frame.load();
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (g_pool.stats.scan_first_frame == 0u) g_pool.stats.scan_first_frame = frame;
+    g_pool.stats.scan_last_frame = frame;
+  }
 
   CaptureOnePoolMesh(device, queue);
 
@@ -879,13 +986,17 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     if (mapped_ok) {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       for (const auto& copy : pending) {
+        const auto* bytes = static_cast<const uint8_t*>(mapped) + copy.snapshot_offset;
+        if (copy.has_base_override) {
+          ExtractPoolInstances(copy.entry, copy.entry.base, bytes, copy.snapshot_size, frame);
+          continue;
+        }
         if (!copy.has_cb || copy.cb_size < sizeof(int32_t)) {
           g_pool.stats.skipped_no_base += 1u;
           continue;
         }
         int32_t base = 0;
         std::memcpy(&base, static_cast<const uint8_t*>(mapped) + copy.cb_staging_offset, sizeof(int32_t));
-        const auto* bytes = static_cast<const uint8_t*>(mapped) + copy.snapshot_offset;
         ExtractPoolInstances(copy.entry, base, bytes, copy.snapshot_size, frame);
       }
       device->unmap_buffer_region(staging);
@@ -902,8 +1013,9 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     for (const auto& copy : pending) {
       const uint64_t identity = PoolEntryIdentity(copy.entry);
       if (!attempted_identities.insert(identity).second) continue;
-      auto& attempts = g_pool.entry_attempts[identity];
-      if (attempts < kPoolMaxEntryAttempts) attempts += 1u;
+      PoolEntryAttempt& attempt = g_pool.entry_attempts[identity];
+      if (attempt.count < kPoolMaxEntryAttempts) attempt.count += 1u;
+      attempt.mesh_key = copy.entry.mesh_key;
     }
     for (auto it = g_pool.observations.begin(); it != g_pool.observations.end();) {
       if ((it->second.rejected || !it->second.admitted) && frame > it->second.last_frame + kPoolPruneAge) {
@@ -1011,7 +1123,14 @@ inline void DumpWorldPool() {
       << ", \"copy_drops\": " << stats.copy_drops
       << ", \"skipped_no_base\": " << stats.skipped_no_base
       << ", \"skipped_beyond_snapshot\": " << stats.skipped_beyond_snapshot
-      << ", \"mesh_failures\": " << stats.mesh_failures << "},\n";
+      << ", \"mesh_failures\": " << stats.mesh_failures
+      << ", \"skipped_not_candidate\": " << stats.skipped_not_candidate
+      << ", \"skipped_no_srv\": " << stats.skipped_no_srv
+      << ", \"skipped_slot_invalid\": " << stats.skipped_slot_invalid
+      << ", \"skipped_no_buffer\": " << stats.skipped_no_buffer
+      << ", \"scan_first_frame\": " << stats.scan_first_frame
+      << ", \"scan_last_frame\": " << stats.scan_last_frame
+      << ", \"indirect_dropped_calls\": " << IndirectDroppedCalls() << "},\n";
   out << "  \"families\": [";
   bool first = true;
   for (const auto& [vs_hash, aggregate] : families) {
@@ -1028,6 +1147,14 @@ inline void DumpWorldPool() {
         << ", \"bounds_max\": [" << aggregate.bounds_max[0] << ", " << aggregate.bounds_max[1] << ", " << aggregate.bounds_max[2] << "]";
     if (recipe_it != recipes.end()) {
       const PoolFamilyRecipe& recipe = recipe_it->second;
+      out << ", \"skipped_not_candidate\": " << recipe.skipped_not_candidate
+          << ", \"skipped_no_srv\": " << recipe.skipped_no_srv
+          << ", \"skipped_slot_invalid\": " << recipe.skipped_slot_invalid
+          << ", \"skipped_no_buffer\": " << recipe.skipped_no_buffer;
+      if (!recipe.initialized) {
+        out << "}";
+        continue;
+      }
       out << ", \"recorded_recipe\": {\"kind\": \"" << CandidateKindName(static_cast<CandidateKind>(recipe.recorded_kind))
           << "\", \"slot\": " << recipe.recorded_slot
           << ", \"offset\": " << recipe.recorded_offset

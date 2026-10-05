@@ -256,6 +256,7 @@ struct FamilyStats {
   uint32_t transform_stride = 0u;
   uint32_t transform_base = 0u;
   bool transform_has_prev = false;
+  bool transform_cross_capture = false;
   // Automated runtime verification (decompilation remains a separate step).
   uint8_t auto_verdict = 0u;
   uint32_t captures_attempted = 0u;
