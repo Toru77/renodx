@@ -15,6 +15,7 @@
 #include <string>
 
 #include "../contract/shader_registry.hpp"
+#include "../debug/crash_log.hpp"
 #include "bvh_debug.hpp"
 #include "bvh_pool.hpp"
 
@@ -86,10 +87,50 @@ inline void DrawBvhPanel() {
   if (ImGui::Checkbox("Pool Scan", &scan)) {
     g_pool.scan_active.store(scan, std::memory_order_relaxed);
     RefreshPoolCaptureRequest();
+    LogPoolSwitches();
   }
   ImGui::SameLine();
   ImGui::SetNextItemWidth(150.f);
   ImGui::SliderFloat("Region (m)", &g_pool.region_size, kPoolRegionMinSize, kPoolRegionMaxSize, "%.0f");
+
+  // Diagnostic switches: turn one pool stage off at a time to find which one
+  // a crash needs. Logging only happens while "Log mesh captures" is on.
+  bool capture_meshes = g_pool.capture_meshes.load(std::memory_order_relaxed);
+  bool scan_indirect = g_pool.scan_indirect.load(std::memory_order_relaxed);
+  bool log_captures = g_pool.log_captures.load(std::memory_order_relaxed);
+  bool switches_changed = false;
+  if (ImGui::Checkbox("Capture meshes", &capture_meshes)) {
+    g_pool.capture_meshes.store(capture_meshes, std::memory_order_relaxed);
+    switches_changed = true;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Reads the vertex and index buffer of each new mesh at present.\n"
+                      "Off: no new mesh is read; instances of meshes not read yet wait unadmitted.");
+  }
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Scan indirect draws", &scan_indirect)) {
+    g_pool.scan_indirect.store(scan_indirect, std::memory_order_relaxed);
+    switches_changed = true;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Off: indirect draws (counts kept on the GPU) are ignored by the pool.");
+  }
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Log mesh captures", &log_captures)) {
+    g_pool.log_captures.store(log_captures, std::memory_order_relaxed);
+    switches_changed = true;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Writes ReShade.log lines before and after each mesh capture,\n"
+                      "and when buffers the pool tracks are released.");
+  }
+  bool log_crashes = CrashLogEnabled();
+  if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("On a crash, writes the error, the pool stage and the call stack to ReShade.log.\n"
+                      "The game still crashes as before.");
+  }
+  if (switches_changed) LogPoolSwitches();
 
   const contract::RegistryCounts registry = contract::SnapshotRegistryCounts();
   PoolStats stats;
@@ -134,6 +175,17 @@ inline void DrawBvhPanel() {
   ImGui::Text("Rigid draws skipped: %s", skips.empty() ? "none" : skips.c_str());
   ImGui::Text("Draw state reasons: %s", draw_state.empty() ? "none" : draw_state.c_str());
   ImGui::Text("Indirect draws: %s", indirect_classes.empty() ? "none" : indirect_classes.c_str());
+  {
+    uint64_t scanned = 0u;
+    for (const uint64_t count : stats.draws_by_vs_class) scanned += count;
+    uint64_t indirect = 0u;
+    for (const uint64_t count : stats.indirect_by_vs_class) indirect += count;
+    ImGui::Text("On deferred contexts: draws %llu of %llu  indirect %llu of %llu",
+                static_cast<unsigned long long>(stats.draws_on_deferred),
+                static_cast<unsigned long long>(scanned),
+                static_cast<unsigned long long>(stats.indirect_on_deferred),
+                static_cast<unsigned long long>(indirect));
+  }
   if (!indirect_classes.empty()) {
     ImGui::TextDisabled("Indirect: copied %llu  read %llu  empty %llu  truncated %llu  buffer released %llu",
                         static_cast<unsigned long long>(stats.indirect_copied),
@@ -175,12 +227,17 @@ inline void DrawBvhPanel() {
   if (!matrix_rejects.empty()) ImGui::Text("Bad matrix reasons: %s", matrix_rejects.c_str());
   ImGui::Text("Near misses (same mesh, almost the same matrix): %llu",
               static_cast<unsigned long long>(stats.near_misses));
-  ImGui::Text("Meshes: captured %llu  queued %llu  same-content merges %u  failures %u  cap %u",
+  ImGui::Text("Meshes: captured %llu  queued %llu  started %llu  same-content merges %u  failures %u  cap %u",
               static_cast<unsigned long long>(stats.meshes),
               static_cast<unsigned long long>(stats.mesh_queue),
+              static_cast<unsigned long long>(stats.mesh_attempts),
               stats.mesh_dedup,
               stats.mesh_failures,
               stats.mesh_cap_drops);
+  if (stats.destroyed_during_capture != 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Buffers released during a mesh capture: %u",
+                       stats.destroyed_during_capture);
+  }
   ImGui::Text("Retired by buffer release: meshes %u  instances %u  (buffer events %u)",
               stats.meshes_retired,
               stats.instances_retired,

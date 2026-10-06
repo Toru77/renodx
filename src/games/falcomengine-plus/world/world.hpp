@@ -22,6 +22,7 @@
 #include "research/classification.hpp"
 #include "research/reference_hints.hpp"
 #include "research/transform_candidates.hpp"
+#include "debug/crash_log.hpp"
 #include "debug/overlay.hpp"
 #include "world_settings.hpp"
 #include "bvh/world_bvh.hpp"
@@ -71,11 +72,14 @@ inline void Use(DWORD fdw_reason, bool supported) {
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
+      reshade::register_event<reshade::addon_event::present>(OnCrashLogPresent);
       break;
     }
     case DLL_PROCESS_DETACH: {
       if (!attached) return;
       attached = false;
+      // The crash handler lives in this module: remove it before unloading.
+      SetCrashLogEnabled(false);
       bvh::Use(fdw_reason);
       contract::UnregisterShaderRegistry();
       UnregisterCbTracker();
@@ -89,6 +93,7 @@ inline void Use(DWORD fdw_reason, bool supported) {
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
+      reshade::unregister_event<reshade::addon_event::present>(OnCrashLogPresent);
       renodx::utils::command_action::Unregister(WorldDrawCallback{});
       renodx::utils::constants::Use(fdw_reason);
       renodx::utils::scene::Use(fdw_reason);

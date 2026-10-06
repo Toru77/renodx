@@ -27,10 +27,27 @@
 // few per frame, merged by content, and retired with their instances when
 // their vertex or index buffer is destroyed, so a map change empties the pool
 // instead of leaving the previous map's geometry behind.
+//
+// Diagnostic switches (BVH panel): "Capture meshes" turns the present-time
+// VB/IB readback off (instances are still observed; new meshes wait),
+// "Scan indirect draws" ignores indirect draws, and "Log mesh captures"
+// writes ReShade.log lines around each capture and when tracked buffers are
+// released. Nothing is logged unless that last switch is on. Each pool entry
+// point also records its stage per thread (debug/pool_stage.hpp) for the
+// crash log (debug/crash_log.hpp, "Log crashes").
+//
+// Lock rule: no graphics API call while g_pool.mutex is held. A D3D11 call
+// can run deferred object destruction on the calling thread, which raises
+// destroy_resource, whose handler (OnDestroyResourcePool) takes this mutex
+// again (MSVC std::mutex then throws, and the uncaught exception aborts the
+// game). The draw-time copies are therefore reserved under the lock and
+// recorded after it is released. Verified in game 2026-10-06: recording them
+// under the lock crashed (ucrtbase 0xC0000409); after the lock, no crash.
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +60,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../../../../utils/log.hpp"
 #include "../../../../utils/path.hpp"
 #include "../../../../utils/scene.hpp"
 #include "../capture/buffer_readback.hpp"
@@ -50,6 +68,7 @@
 #include "../capture/cb_value_tracker.hpp"
 #include "../capture/mesh_capture.hpp"
 #include "../contract/shader_registry.hpp"
+#include "../debug/pool_stage.hpp"
 #include "../research/transform_candidates.hpp"
 #include "../world_state.hpp"
 
@@ -288,6 +307,10 @@ struct PoolStats {
   std::array<uint64_t, static_cast<size_t>(PoolSkip::Count)> skips = {};
   std::array<uint64_t, static_cast<size_t>(PoolDrawState::Count)> draw_state = {};
   uint64_t copied_draws = 0u;
+  // Scanned draws recorded on a command list other than the immediate one
+  // (deferred contexts); direct and indirect.
+  uint64_t draws_on_deferred = 0u;
+  uint64_t indirect_on_deferred = 0u;
   // Indirect draws (sub-draws seen while scanning; also counted above).
   std::array<uint64_t, static_cast<size_t>(contract::VsClass::Count)> indirect_by_vs_class = {};
   uint64_t indirect_copied = 0u;
@@ -311,6 +334,8 @@ struct PoolStats {
   uint32_t dedup_instances = 0u;
   uint32_t instance_cap_drops = 0u;
   // Meshes.
+  uint64_t mesh_attempts = 0u;            // captures started
+  uint32_t destroyed_during_capture = 0u; // VB/IB released on another thread while its readback ran
   uint32_t mesh_failures = 0u;
   uint32_t mesh_dedup = 0u;
   uint32_t mesh_cap_drops = 0u;
@@ -331,8 +356,21 @@ struct PoolStats {
 
 struct PoolState {
   std::atomic_bool scan_active{false};
+  // Diagnostic switches (see the header comment).
+  std::atomic_bool capture_meshes{true};
+  std::atomic_bool scan_indirect{true};
+  std::atomic_bool log_captures{false};
+  // The immediate command list (set at present), to tell deferred-context draws apart.
+  std::atomic_uint64_t immediate_cmd_list{0u};
   float region_size = 512.f;
   std::mutex mutex;
+
+  // The mesh capture running now (serial 0 when idle) and the buffers it
+  // reads, so a release of either on another thread is counted and logged.
+  uint64_t capture_serial = 0u;
+  uint64_t capturing_vb = 0u;
+  uint64_t capturing_ib = 0u;
+  uint32_t logged_invalidations = 0u;  // stats.resource_invalidations at the last present
 
   // Staging ring. Draws of the frame in flight write `write_slot`.
   reshade::api::device* staging_device = nullptr;
@@ -947,6 +985,30 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
   if (draw.ib.handle != draw.vb.handle) g_pool.keys_by_resource[draw.ib.handle].push_back(mesh_key);
 }
 
+// One draw-time copy, reserved under g_pool.mutex and recorded after it.
+// Trivial on purpose: arrays of it are not cleared, only [0, count) is used.
+struct PoolCopyCommand {
+  reshade::api::resource source;
+  uint64_t source_offset;
+  reshade::api::resource dest;
+  uint64_t dest_offset;
+  uint64_t size;
+};
+
+inline void IssuePoolCopies(reshade::api::command_list* cmd_list, const PoolCopyCommand* commands, uint32_t count) {
+  for (uint32_t i = 0; i < count; ++i) {
+    const PoolCopyCommand& command = commands[i];
+    cmd_list->copy_buffer_region(command.source, command.source_offset, command.dest, command.dest_offset, command.size);
+  }
+}
+
+// True for a command list other than the immediate one (a deferred context).
+// Unknown until the first present has recorded the immediate list.
+inline bool IsPoolDeferredList(const reshade::api::command_list* cmd_list) {
+  const uint64_t immediate = g_pool.immediate_cmd_list.load(std::memory_order_relaxed);
+  return immediate != 0u && reinterpret_cast<uint64_t>(cmd_list) != immediate;
+}
+
 inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -954,11 +1016,14 @@ inline void OnPoolScanDraw(
     WorldCommandListData* cl_data) {
   if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
   if (device == nullptr || cmd_list == nullptr || cl_data == nullptr) return;
+  PoolStageScope stage("direct draw: gate");
+  const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, true);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   const uint32_t count = draw.instance_count == 0u ? 1u : draw.instance_count;
+  stage.Set("direct draw: slice");
   if (skip == PoolSkip::None) skip = ResolvePoolSlice(device, cmd_list, cl_data, &slice);
   if (skip == PoolSkip::None) {
     if (count > kPoolMaxInstancesPerDraw) {
@@ -971,44 +1036,51 @@ inline void OnPoolScanDraw(
   const uint32_t frame = g_state.frame.load();
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
-  PoolFamilyStats& family = g_pool.families[draw.vs_hash];
-  family.vs_class = static_cast<uint8_t>(gate.vs_class);
-  family.draws += 1u;
+  stage.Set("direct draw: reserve");
+  std::array<PoolCopyCommand, 2> commands;
+  uint32_t command_count = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
+    if (deferred) g_pool.stats.draws_on_deferred += 1u;
+    PoolFamilyStats& family = g_pool.families[draw.vs_hash];
+    family.vs_class = static_cast<uint8_t>(gate.vs_class);
+    family.draws += 1u;
 
-  if (skip == PoolSkip::None) {
-    const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
-    PoolSchedule* schedule = nullptr;
-    skip = ReservePoolCopy(
-        device, PoolScheduleKey(mesh_key, draw.first_instance, count), frame, kPoolCbCopyBytes + slice_bytes, &schedule);
     if (skip == PoolSkip::None) {
-      PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
-      PoolPendingCopy copy;
-      copy.cb_offset = slot.used;
-      copy.slice_offset = slot.used + kPoolCbCopyBytes;
-      copy.count = count;
-      copy.cpu_base = slice.base;
-      copy.frame = frame;
-      copy.vs_hash = draw.vs_hash;
-      copy.mesh_key = mesh_key;
-      // The b1 copy runs at this point of the command stream, so it holds
-      // exactly the offset this draw reads; resolve compares it to `base`.
-      cmd_list->copy_buffer_region(slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes);
-      cmd_list->copy_buffer_region(
-          slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride,
-          slot.buffer, copy.slice_offset, slice_bytes);
-      slot.used += kPoolCbCopyBytes + slice_bytes;
-      slot.copies.push_back(copy);
-      schedule->copy_frame = frame;
-      schedule->next_frame = frame + kPoolRecaptureFrames;
-      g_pool.stats.copied_draws += 1u;
-      family.copied += 1u;
-      QueuePoolMesh(mesh_key, draw.vs_hash, draw);
-      return;
+      const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
+      PoolSchedule* schedule = nullptr;
+      skip = ReservePoolCopy(
+          device, PoolScheduleKey(mesh_key, draw.first_instance, count), frame, kPoolCbCopyBytes + slice_bytes,
+          &schedule);
+      if (skip == PoolSkip::None) {
+        PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
+        PoolPendingCopy copy;
+        copy.cb_offset = slot.used;
+        copy.slice_offset = slot.used + kPoolCbCopyBytes;
+        copy.count = count;
+        copy.cpu_base = slice.base;
+        copy.frame = frame;
+        copy.vs_hash = draw.vs_hash;
+        copy.mesh_key = mesh_key;
+        // The b1 copy is recorded before this draw, so it holds exactly the
+        // offset the draw reads; resolve compares it to `base`.
+        commands[command_count++] = {slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes};
+        commands[command_count++] = {slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride,
+                                     slot.buffer, copy.slice_offset, slice_bytes};
+        slot.used += kPoolCbCopyBytes + slice_bytes;
+        slot.copies.push_back(copy);
+        schedule->copy_frame = frame;
+        schedule->next_frame = frame + kPoolRecaptureFrames;
+        g_pool.stats.copied_draws += 1u;
+        family.copied += 1u;
+        QueuePoolMesh(mesh_key, draw.vs_hash, draw);
+      }
     }
+    if (skip != PoolSkip::None) CountPoolSkip(family, skip, gate.state);
   }
-  CountPoolSkip(family, skip, gate.state);
+  stage.Set("direct draw: copy");
+  IssuePoolCopies(cmd_list, commands.data(), command_count);
 }
 
 // DrawIndexedInstancedIndirect and friends. `draw` carries the bindings at
@@ -1023,15 +1095,20 @@ inline void OnPoolScanIndirectDraw(
     uint32_t draw_count,
     uint32_t stride) {
   if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
+  if (!g_pool.scan_indirect.load(std::memory_order_relaxed)) return;
   if (device == nullptr || cmd_list == nullptr || cl_data == nullptr || args_buffer.handle == 0u) return;
+  PoolStageScope stage("indirect draw: gate");
+  const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, false);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
+  stage.Set("indirect draw: slice");
   if (skip == PoolSkip::None) skip = ResolvePoolSlice(device, cmd_list, cl_data, &slice);
   const uint32_t window = static_cast<uint32_t>((std::min)(static_cast<uint64_t>(kPoolIndirectWindow), slice.available));
   if (skip == PoolSkip::None && window == 0u) skip = PoolSkip::SliceRange;
   uint64_t args_size = 0u;
+  stage.Set("indirect draw: args size");
   if (skip == PoolSkip::None) {
     const auto args_desc = device->get_resource_desc(args_buffer);
     args_size = args_desc.type == reshade::api::resource_type::buffer ? args_desc.buffer.size : 0u;
@@ -1041,55 +1118,67 @@ inline void OnPoolScanIndirectDraw(
   const uint32_t sub_draws = (std::min)(draw_count == 0u ? 1u : draw_count, kPoolMaxIndirectSubDraws);
   const uint64_t bytes = kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
 
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  PoolFamilyStats& family = g_pool.families[draw.vs_hash];
-  family.vs_class = static_cast<uint8_t>(gate.vs_class);
-  for (uint32_t i = 0; i < sub_draws; ++i) {
-    g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
-    g_pool.stats.indirect_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
-    family.draws += 1u;
-    family.indirect_draws += 1u;
+  stage.Set("indirect draw: reserve");
+  std::array<PoolCopyCommand, 3u * kPoolMaxIndirectSubDraws> commands;
+  uint32_t command_count = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    PoolFamilyStats& family = g_pool.families[draw.vs_hash];
+    family.vs_class = static_cast<uint8_t>(gate.vs_class);
+    for (uint32_t i = 0; i < sub_draws; ++i) {
+      g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
+      g_pool.stats.indirect_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
+      if (deferred) {
+        g_pool.stats.draws_on_deferred += 1u;
+        g_pool.stats.indirect_on_deferred += 1u;
+      }
+      family.draws += 1u;
+      family.indirect_draws += 1u;
 
-    PoolSkip sub_skip = skip;
-    const uint64_t sub_args_offset = args_offset + static_cast<uint64_t>(i) * stride;
-    if (sub_skip == PoolSkip::None && sub_args_offset + kPoolIndirectArgsCopyBytes > args_size) {
-      sub_skip = PoolSkip::SliceRange;
-    }
-    PoolSchedule* schedule = nullptr;
-    if (sub_skip == PoolSkip::None) {
-      sub_skip = ReservePoolCopy(
-          device, PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset), frame, bytes, &schedule);
-    }
-    if (sub_skip != PoolSkip::None) {
-      CountPoolSkip(family, sub_skip, gate.state);
-      continue;
-    }
+      PoolSkip sub_skip = skip;
+      const uint64_t sub_args_offset = args_offset + static_cast<uint64_t>(i) * stride;
+      if (sub_skip == PoolSkip::None && sub_args_offset + kPoolIndirectArgsCopyBytes > args_size) {
+        sub_skip = PoolSkip::SliceRange;
+      }
+      PoolSchedule* schedule = nullptr;
+      if (sub_skip == PoolSkip::None) {
+        sub_skip = ReservePoolCopy(
+            device, PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset), frame, bytes, &schedule);
+      }
+      if (sub_skip != PoolSkip::None) {
+        CountPoolSkip(family, sub_skip, gate.state);
+        continue;
+      }
 
-    PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
-    PoolPendingCopy copy;
-    copy.cb_offset = slot.used;
-    copy.args_offset = slot.used + kPoolCbCopyBytes;
-    copy.slice_offset = slot.used + kPoolCbCopyBytes + kPoolIndirectArgsBytes;
-    copy.count = window;
-    copy.cpu_base = slice.base;
-    copy.frame = frame;
-    copy.vs_hash = draw.vs_hash;
-    copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
-    cmd_list->copy_buffer_region(slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes);
-    cmd_list->copy_buffer_region(args_buffer, sub_args_offset, slot.buffer, copy.args_offset, kPoolIndirectArgsCopyBytes);
-    cmd_list->copy_buffer_region(
-        slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride,
-        slot.buffer, copy.slice_offset, static_cast<uint64_t>(window) * kPoolInstanceStride);
-    slot.used += bytes;
-    slot.copies.push_back(copy);
-    slot.indirect_draws.push_back(draw);
-    AddPoolIndirectRefs(draw);
-    schedule->copy_frame = frame;
-    schedule->next_frame = frame + kPoolRecaptureFrames;
-    g_pool.stats.copied_draws += 1u;
-    g_pool.stats.indirect_copied += 1u;
-    family.copied += 1u;
+      PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
+      PoolPendingCopy copy;
+      copy.cb_offset = slot.used;
+      copy.args_offset = slot.used + kPoolCbCopyBytes;
+      copy.slice_offset = slot.used + kPoolCbCopyBytes + kPoolIndirectArgsBytes;
+      copy.count = window;
+      copy.cpu_base = slice.base;
+      copy.frame = frame;
+      copy.vs_hash = draw.vs_hash;
+      copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
+      PoolCopyCommand* sub_commands = commands.data() + command_count;
+      sub_commands[0] = {slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes};
+      sub_commands[1] = {args_buffer, sub_args_offset, slot.buffer, copy.args_offset, kPoolIndirectArgsCopyBytes};
+      sub_commands[2] = {slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride, slot.buffer,
+                         copy.slice_offset, static_cast<uint64_t>(window) * kPoolInstanceStride};
+      command_count += 3u;
+      slot.used += bytes;
+      slot.copies.push_back(copy);
+      slot.indirect_draws.push_back(draw);
+      AddPoolIndirectRefs(draw);
+      schedule->copy_frame = frame;
+      schedule->next_frame = frame + kPoolRecaptureFrames;
+      g_pool.stats.copied_draws += 1u;
+      g_pool.stats.indirect_copied += 1u;
+      family.copied += 1u;
+    }
   }
+  stage.Set("indirect draw: copy");
+  IssuePoolCopies(cmd_list, commands.data(), command_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,16 +1204,29 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
 
 inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::resource resource) {
   (void)device;
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
-    g_pool.indirect_dead.insert(resource.handle);
+  const PoolStageScope stage("buffer release");
+  uint64_t capture_serial = 0u;  // nonzero: the running mesh capture reads this buffer
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (g_pool.capture_serial != 0u && resource.handle != 0u
+        && (resource.handle == g_pool.capturing_vb || resource.handle == g_pool.capturing_ib)) {
+      capture_serial = g_pool.capture_serial;
+      g_pool.stats.destroyed_during_capture += 1u;
+    }
+    if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
+      g_pool.indirect_dead.insert(resource.handle);
+    }
+    const auto it = g_pool.keys_by_resource.find(resource.handle);
+    if (it != g_pool.keys_by_resource.end()) {
+      for (const uint64_t mesh_key : it->second) InvalidatePoolMeshKey(mesh_key);
+      g_pool.keys_by_resource.erase(it);
+      g_pool.stats.resource_invalidations += 1u;
+    }
   }
-  if (g_pool.keys_by_resource.empty()) return;
-  const auto it = g_pool.keys_by_resource.find(resource.handle);
-  if (it == g_pool.keys_by_resource.end()) return;
-  for (const uint64_t mesh_key : it->second) InvalidatePoolMeshKey(mesh_key);
-  g_pool.keys_by_resource.erase(it);
-  g_pool.stats.resource_invalidations += 1u;
+  if (capture_serial != 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
+    renodx::utils::log::e("falcom_world::pool: buffer ", renodx::utils::log::AsPtr(resource.handle),
+                          " released while mesh capture #", capture_serial, " reads it");
+  }
 }
 
 // Caller holds g_pool.mutex. Removes instances admitted through invalidated
@@ -1214,42 +1316,36 @@ inline uint64_t PoolMeshSignature(const renodx::utils::scene::CapturedMesh& mesh
   return PoolMix(hash, mesh.positions.size());
 }
 
-inline void CaptureOnePoolMesh(reshade::api::device* device, reshade::api::command_queue* queue) {
-  PoolMeshRequest request;
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (g_pool.mesh_queue.empty()) return;
-    request = std::move(g_pool.mesh_queue.back());
-    g_pool.mesh_queue.pop_back();
-  }
-  renodx::utils::scene::CapturedMesh mesh;
-  std::string error;
-  const bool captured =
-      renodx::utils::scene::CaptureDrawIndexed(device, queue, ToSceneRecord(request.draw), &mesh, &error)
-      && !mesh.positions.empty() && !mesh.triangles.empty();
-
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
+// Caller holds g_pool.mutex. Applies one finished capture and returns what
+// happened to it (for the capture log).
+inline const char* ApplyPoolMeshCapture(
+    const PoolMeshRequest& request,
+    bool captured,
+    renodx::utils::scene::CapturedMesh& mesh,
+    const std::string& error) {
   // Invalidated while the capture ran: the buffers are gone, drop the result.
-  if (g_pool.mesh_queued.count(request.mesh_key) == 0u) return;
+  if (g_pool.mesh_queued.count(request.mesh_key) == 0u) return "dropped (buffer released)";
   if (!captured) {
     g_pool.failed_meshes.insert(request.mesh_key);
     g_pool.stats.mesh_failures += 1u;
     g_pool.stats.last_mesh_error = error.empty() ? std::string("empty mesh") : error;
-    return;
+    return "failed";
   }
-  if (g_pool.mesh_by_key.count(request.mesh_key) != 0u) return;
+  if (g_pool.mesh_by_key.count(request.mesh_key) != 0u) return "already captured";
 
+  const char* outcome = "added";
   uint32_t mesh_id = 0u;
   const uint64_t signature = PoolMeshSignature(mesh);
   const auto signature_it = g_pool.mesh_by_signature.find(signature);
   if (signature_it != g_pool.mesh_by_signature.end()) {
     mesh_id = signature_it->second;
     g_pool.stats.mesh_dedup += 1u;
+    outcome = "merged (same content)";
   } else {
     if (g_pool.meshes.size() >= kPoolMaxMeshes) {
       g_pool.stats.mesh_cap_drops += 1u;
       g_pool.failed_meshes.insert(request.mesh_key);
-      return;
+      return "dropped (mesh cap)";
     }
     WorldMesh world_mesh;
     world_mesh.mesh_key = request.mesh_key;
@@ -1274,6 +1370,80 @@ inline void CaptureOnePoolMesh(reshade::api::device* device, reshade::api::comma
   g_pool.meshes[mesh_id].live_keys += 1u;
   g_pool.mesh_by_key[request.mesh_key] = mesh_id;
   AdmitPendingInstancesForMesh(request.mesh_key, mesh_id);
+  return outcome;
+}
+
+// Reads the vertex and index buffer of one queued mesh (GPU wait). With
+// "Log mesh captures" on, a line is written before the buffers are touched
+// and one after, so a crash inside the readback leaves a "begin" line
+// without its "end".
+inline void CaptureOnePoolMesh(reshade::api::device* device, reshade::api::command_queue* queue) {
+  PoolMeshRequest request;
+  uint64_t serial = 0u;
+  size_t queue_left = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (g_pool.mesh_queue.empty()) return;
+    request = std::move(g_pool.mesh_queue.back());
+    g_pool.mesh_queue.pop_back();
+    queue_left = g_pool.mesh_queue.size();
+    g_pool.stats.mesh_attempts += 1u;
+    serial = g_pool.stats.mesh_attempts;
+    g_pool.capture_serial = serial;
+    g_pool.capturing_vb = request.draw.vb.handle;
+    g_pool.capturing_ib = request.draw.ib.handle;
+  }
+  const bool log = g_pool.log_captures.load(std::memory_order_relaxed);
+  if (log) {
+    namespace log_utils = renodx::utils::log;
+    const DrawRecord& draw = request.draw;
+    const uint32_t frame = g_state.frame.load();
+    log_utils::i("falcom_world::pool: mesh capture #", serial, " begin: frame ", frame,
+                 ", queued at frame ", draw.frame, ", ", queue_left, " more queued | vs ",
+                 log_utils::AsHex(request.vs_hash), " key ", log_utils::AsHex(request.mesh_key),
+                 " | vb ", log_utils::AsPtr(draw.vb.handle), " size ", draw.vb_size, " offset ", draw.vb_offset,
+                 " stride ", draw.vb_stride,
+                 " | ib ", log_utils::AsPtr(draw.ib.handle), " size ", draw.ib_size, " offset ", draw.ib_offset,
+                 " index size ", draw.index_size,
+                 " | indices ", draw.index_count, " first ", draw.first_index, " base vertex ", draw.vertex_offset,
+                 " | input layout ", log_utils::AsPtr(draw.input_layout.handle));
+  }
+  PoolStageScope stage("present: mesh capture (readback)");
+  const auto start = std::chrono::steady_clock::now();
+  renodx::utils::scene::CapturedMesh mesh;
+  std::string error;
+  const bool captured =
+      renodx::utils::scene::CaptureDrawIndexed(device, queue, ToSceneRecord(request.draw), &mesh, &error)
+      && !mesh.positions.empty() && !mesh.triangles.empty();
+  const double elapsed_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  const size_t triangles = mesh.triangles.size();
+  const uint64_t vb_bytes = mesh.vertex_buffer_size;
+  const uint64_t ib_bytes = mesh.index_buffer_size;
+
+  stage.Set("present: mesh capture (apply)");
+  const char* outcome = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.capture_serial = 0u;
+    g_pool.capturing_vb = 0u;
+    g_pool.capturing_ib = 0u;
+    outcome = ApplyPoolMeshCapture(request, captured, mesh, error);
+  }
+  if (log) {
+    renodx::utils::log::i("falcom_world::pool: mesh capture #", serial, " end: ", outcome, ", ", triangles,
+                          " triangles, vb ", vb_bytes, " bytes, ib ", ib_bytes, " bytes, ", elapsed_ms, " ms",
+                          error.empty() ? "" : " | error: ", error);
+  }
+}
+
+// Writes the switch states to ReShade.log while "Log mesh captures" is on, so
+// a log shows which pool stages were running before a crash.
+inline void LogPoolSwitches() {
+  if (!g_pool.log_captures.load(std::memory_order_relaxed)) return;
+  const auto on = [](const std::atomic_bool& value) { return value.load(std::memory_order_relaxed) ? "on" : "off"; };
+  renodx::utils::log::i("falcom_world::pool: frame ", g_state.frame.load(), " switches: pool scan ", on(g_pool.scan_active),
+                        ", capture meshes ", on(g_pool.capture_meshes), ", scan indirect draws ", on(g_pool.scan_indirect));
 }
 
 struct PoolResolvedCopy {
@@ -1302,6 +1472,7 @@ inline void CountPoolMatrixReject(PoolFamilyStats& family, PoolMatrixReject reje
 // its copies. The map happens without holding g_pool.mutex so recording
 // threads are not blocked; the slot is flagged `resolving` meanwhile.
 inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
+  PoolStageScope stage("present: resolve (map)");
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
   reshade::api::resource buffer = {0u};
@@ -1358,6 +1529,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     device->unmap_buffer_region(buffer);
   }
 
+  stage.Set("present: resolve (apply)");
   std::lock_guard<std::mutex> lock(g_pool.mutex);
   PoolStagingSlot& slot = g_pool.slots[slot_index];
   slot.resolving = false;
@@ -1451,10 +1623,14 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   if (device == nullptr || queue == nullptr) return;
   const bool scanning = g_pool.scan_active.load(std::memory_order_relaxed);
   const uint32_t frame = g_state.frame.load();
+  g_pool.immediate_cmd_list.store(reinterpret_cast<uint64_t>(queue->get_immediate_command_list()),
+                                  std::memory_order_relaxed);
 
+  PoolStageScope stage("present: staging");
   if (scanning) EnsurePoolStaging(device);
 
   uint32_t resolve_slot = UINT32_MAX;
+  stage.Set("present: compact");
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     CompactPool();
@@ -1469,13 +1645,30 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
       resolve_slot = g_pool.write_slot;
     }
   }
+  stage.Set("present: resolve");
   if (resolve_slot != UINT32_MAX) ResolvePoolSlot(device, resolve_slot);
 
-  for (uint32_t i = 0; i < kPoolMeshCapturesPerFrame; ++i) CaptureOnePoolMesh(device, queue);
+  stage.Set("present: mesh capture");
+  if (g_pool.capture_meshes.load(std::memory_order_relaxed)) {
+    for (uint32_t i = 0; i < kPoolMeshCapturesPerFrame; ++i) CaptureOnePoolMesh(device, queue);
+  }
 
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  if ((frame % 60u) == 0u) PrunePool(frame);
-  UpdatePoolStats();
+  stage.Set("present: prune");
+  uint32_t released = 0u;
+  size_t mesh_queue = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if ((frame % 60u) == 0u) PrunePool(frame);
+    UpdatePoolStats();
+    const uint32_t invalidations = g_pool.stats.resource_invalidations;
+    released = invalidations >= g_pool.logged_invalidations ? invalidations - g_pool.logged_invalidations : invalidations;
+    g_pool.logged_invalidations = invalidations;
+    mesh_queue = g_pool.mesh_queue.size();
+  }
+  if (released != 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
+    renodx::utils::log::i("falcom_world::pool: frame ", frame, ": ", released,
+                          " tracked vertex/index buffers released, ", mesh_queue, " mesh captures queued");
+  }
 }
 
 inline void ResetWorldPool() {
@@ -1506,6 +1699,7 @@ inline void ResetWorldPool() {
   g_pool.families.clear();
   g_pool.revision += 1u;
   g_pool.stats = {};
+  g_pool.logged_invalidations = 0u;
 }
 
 // ---------------------------------------------------------------------------
@@ -1566,6 +1760,8 @@ inline void DumpWorldPool() {
   out << "  \"generated_frame\": " << g_state.frame.load() << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
+  out << "  \"switches\": {\"capture_meshes\": " << (g_pool.capture_meshes.load() ? "true" : "false")
+      << ", \"scan_indirect\": " << (g_pool.scan_indirect.load() ? "true" : "false") << "},\n";
   out << "  \"region\": {\"size\": " << region.size
       << ", \"min\": [" << region.min[0] << ", " << region.min[1] << ", " << region.min[2]
       << "], \"max\": [" << region.max[0] << ", " << region.max[1] << ", " << region.max[2] << "]},\n";
@@ -1610,6 +1806,8 @@ inline void DumpWorldPool() {
   }
   out << "}"
       << ", \"copied_draws\": " << stats.copied_draws
+      << ", \"draws_on_deferred\": " << stats.draws_on_deferred
+      << ", \"indirect_on_deferred\": " << stats.indirect_on_deferred
       << ", \"indirect_copied\": " << stats.indirect_copied
       << ", \"indirect_resolved\": " << stats.indirect_resolved
       << ", \"indirect_empty\": " << stats.indirect_empty
@@ -1630,6 +1828,8 @@ inline void DumpWorldPool() {
       << ", \"instance_cap_drops\": " << stats.instance_cap_drops
       << ", \"meshes\": " << stats.meshes
       << ", \"mesh_queue\": " << stats.mesh_queue
+      << ", \"mesh_attempts\": " << stats.mesh_attempts
+      << ", \"destroyed_during_capture\": " << stats.destroyed_during_capture
       << ", \"mesh_failures\": " << stats.mesh_failures
       << ", \"mesh_dedup\": " << stats.mesh_dedup
       << ", \"mesh_cap_drops\": " << stats.mesh_cap_drops
@@ -1768,15 +1968,35 @@ inline void DumpWorldPoolObj(size_t max_vertices = 2000000u) {
     region = CurrentPoolRegion();
   }
 
-  std::ostringstream out;
-  out << "# falcomengine-plus world pool (region instances, world space)\n";
-  size_t vertex_base = 1u;
-  size_t written = 0u;
+  // One OBJ object per vertex-shader family ("vs_0x........", the shader that
+  // drew the instance when it was admitted), so a family can be shown or
+  // hidden on its own in Blender.
+  std::vector<const WorldInstance*> ordered;
+  ordered.reserve(instances.size());
   for (const auto& instance : instances) {
     if (!PoolInstanceInRegion(instance, region)) continue;
     if (instance.mesh_id >= meshes.size()) continue;
+    ordered.push_back(&instance);
+  }
+  std::stable_sort(ordered.begin(), ordered.end(), [](const WorldInstance* a, const WorldInstance* b) {
+    return a->source_vs_hash < b->source_vs_hash;
+  });
+
+  std::ostringstream out;
+  out << "# falcomengine-plus world pool (region instances, world space, one object per vertex shader)\n";
+  size_t vertex_base = 1u;
+  size_t written = 0u;
+  bool have_family = false;
+  uint32_t family = 0u;
+  for (const WorldInstance* entry : ordered) {
+    const WorldInstance& instance = *entry;
     const WorldMesh& mesh = meshes[instance.mesh_id];
     if (written + mesh.positions.size() > max_vertices) break;
+    if (!have_family || instance.source_vs_hash != family) {
+      have_family = true;
+      family = instance.source_vs_hash;
+      out << "o vs_" << PoolHashText(family) << "\n";
+    }
     for (const auto& position : mesh.positions) {
       float world[3] = {};
       TransformPoolPoint(instance.kind, instance.matrix, position.data(), world);
