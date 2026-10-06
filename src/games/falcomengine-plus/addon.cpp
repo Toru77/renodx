@@ -2375,6 +2375,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
+    {
+        0x20792A02u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0x20792A02u,
+            .code = __0x20792A02,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
     // -- Kai foliage (GTVBAO foliage marker) --
     {
         0x534E54EAu,
