@@ -1,12 +1,12 @@
 #pragma once
 
-// Phase 0 draw census.
+// Draw observation: the census and the lighting-pass inputs.
 //
-// Records a bounded ring of draw metadata plus per-VS-hash aggregates while
-// the research toggle is on. The census never reads back GPU data; the armed
-// capture snapshots CB bytes from utils::constants' CPU cache and issues a
-// split structured-buffer copy on the game's command list (resolved at
-// present) so dynamic buffers cannot alias the captured draw.
+// While the census toggle is on, records a bounded ring of draw metadata plus
+// per-VS-hash aggregates. Whenever draw observation is active (census, Pool
+// Scan or a GPU debug view) every draw also feeds the world pool, and the
+// lighting pass provides the camera (cb0, from utils::constants' CPU cache)
+// and the game depth view.
 
 #include <algorithm>
 #include <type_traits>
@@ -15,7 +15,7 @@
 #include "../bvh/bvh_pool.hpp"
 #include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
-#include "../capture/mesh_capture.hpp"
+#include "../capture/camera_capture.hpp"
 #include "../capture/state_capture.hpp"
 #include "../research/classification.hpp"
 #include "../../../../utils/command_action.hpp"
@@ -51,95 +51,7 @@ inline void ResetCensus() {
   g_state.families.clear();
   g_state.resource_sizes.clear();
   g_state.next_serial.store(0u);
-  g_state.arm_active = false;
-  g_state.captured = {};
-  g_state.candidates.clear();
-  g_state.selected_family = 0u;
-  g_state.selected_candidate = 0;
   g_state.status = "census reset";
-}
-
-inline void ArmCapture(uint32_t vs_hash, uint32_t serial) {
-  std::lock_guard<std::mutex> lock(g_state.mutex);
-  g_state.arm_active = true;
-  g_state.arm_vs_hash = vs_hash;
-  g_state.arm_serial = serial;
-  g_state.status = "armed for next matching draw";
-}
-
-inline void SnapshotDrawConstants(
-    reshade::api::device* device,
-    WorldCommandListData* cl_data,
-    CapturedDraw* out) {
-  if (device == nullptr || cl_data == nullptr || out == nullptr) return;
-  const auto snapshot = [&](uint8_t stage, const std::array<reshade::api::resource, kCbSlotCapacity>& slots) {
-    for (uint32_t slot = 0; slot < kCbSlotCapacity; ++slot) {
-      if (out->cbs.size() >= kMaxCbSnapshots) return;
-      const reshade::api::resource resource = slots[slot];
-      if (resource.handle == 0u) continue;
-      auto bytes = renodx::utils::constants::GetResourceCache(device, resource);
-      if (bytes.empty() || bytes.size() > kMaxCbBytes) continue;
-      CbSnapshot cb;
-      cb.stage = stage;
-      cb.slot = slot;
-      cb.bytes = std::move(bytes);
-      out->cbs.push_back(std::move(cb));
-    }
-  };
-  snapshot(1u, cl_data->vs_cb);
-  snapshot(2u, cl_data->ps_cb);
-}
-
-inline void ParseInstanceOffset(CapturedDraw* out) {
-  if (out == nullptr) return;
-  out->instance_offset_found = false;
-  out->instance_offset_g = 0;
-  for (const auto& cb : out->cbs) {
-    if (cb.stage != 1u || cb.slot != 1u || cb.bytes.size() < 4u) continue;
-    int32_t value = 0;
-    std::memcpy(&value, cb.bytes.data(), sizeof(int32_t));
-    out->instance_offset_g = value;
-    out->instance_offset_found = true;
-    return;
-  }
-}
-
-inline void TryCaptureArmedDraw(
-    reshade::api::device* device,
-    reshade::api::command_list* cmd_list,
-    const DrawRecord& draw,
-    WorldCommandListData* cl_data) {
-  std::lock_guard<std::mutex> lock(g_state.mutex);
-  if (!g_state.arm_active) return;
-  if (g_state.arm_vs_hash != 0u && g_state.arm_vs_hash != draw.vs_hash) return;
-  if (g_state.arm_serial != 0u && g_state.arm_serial != draw.serial) return;
-
-  g_state.arm_active = false;
-  g_state.captured = {};
-  g_state.captured.draw = draw;
-  g_state.candidates.clear();
-  g_state.selected_candidate = 0;
-  SnapshotDrawConstants(device, cl_data, &g_state.captured);
-  ParseInstanceOffset(&g_state.captured);
-  IssueStructuredBufferCopies(cmd_list, device, cl_data, draw, &g_state.captured);
-  IssueCbCopies(cmd_list, device, cl_data, draw);
-
-  if (draw.rtv0.handle != 0u) {
-    const auto rtv_resource = device->get_resource_from_view(draw.rtv0);
-    if (rtv_resource.handle != 0u) {
-      const auto desc = device->get_resource_desc(rtv_resource);
-      if (desc.type == reshade::api::resource_type::texture_2d) {
-        g_state.captured.rtv_w = desc.texture.width;
-        g_state.captured.rtv_h = desc.texture.height;
-      }
-    }
-  }
-
-  g_state.mesh_capture_pending = true;
-  g_state.status = "captured draw serial " + std::to_string(draw.serial)
-                   + " vs=0x" + std::to_string(draw.vs_hash)
-                   + " cbs=" + std::to_string(g_state.captured.cbs.size())
-                   + " srvs=" + std::to_string(g_state.captured.srv_buffers.size());
 }
 
 inline bool LayoutHasSkinInputs(const reshade::api::pipeline& input_layout) {
@@ -224,20 +136,13 @@ inline void FillCommonDrawRecord(
   }
 }
 
-// Camera and lighting depth come from the lighting pass; the pool region,
-// the GPU debug views and research all read them.
+// Camera and lighting depth come from the lighting pass; the pool region and
+// the GPU debug views read them.
 inline void CaptureLightingInputs(
     const DrawRecord& record,
     reshade::api::device* device,
-    reshade::api::command_list* cmd_list,
     WorldCommandListData* cl_data) {
   if (!IsLightingHash(record.ps_hash) || cl_data == nullptr) return;
-  bool captured_frame_matches = false;
-  {
-    std::lock_guard<std::mutex> lock(g_state.mutex);
-    captured_frame_matches = g_state.captured.draw.vs_hash != 0u
-                             && g_state.captured.draw.frame == record.frame;
-  }
   const reshade::api::resource cb = cl_data->ps_cb[0].handle != 0u ? cl_data->ps_cb[0] : cl_data->vs_cb[0];
   if (cb.handle != 0u) {
     const auto bytes = renodx::utils::constants::GetResourceCache(device, cb);
@@ -245,9 +150,6 @@ inline void CaptureLightingInputs(
       std::lock_guard<std::mutex> lock(g_state.mutex);
       CaptureCameraFromBytes(bytes, record.frame, 1u);
     }
-  }
-  if (captured_frame_matches && cl_data->ps_cb[0].handle != 0u) {
-    IssueCameraCbCopy(cmd_list, device, cl_data, record.frame);
   }
   const reshade::api::resource_view depth_view = cl_data->ps_srv_view[kLightingDepthRegisterSora2nd];
   const reshade::api::resource depth_resource = cl_data->ps_srv[kLightingDepthRegisterSora2nd];
@@ -276,7 +178,6 @@ inline void CaptureLightingInputs(
 inline void CommitDrawRecord(
     const DrawRecord& record,
     reshade::api::device* device,
-    reshade::api::command_list* cmd_list,
     WorldCommandListData* cl_data) {
   const bool census = CensusEnabled();
   if (census) {
@@ -306,9 +207,7 @@ inline void CommitDrawRecord(
     family.ps_hashes.insert(record.ps_hash);
   }
 
-  CaptureLightingInputs(record, device, cmd_list, cl_data);
-
-  if (census) TryCaptureArmedDraw(device, cmd_list, record, cl_data);
+  CaptureLightingInputs(record, device, cl_data);
 }
 
 // Records which constant-buffer and VS SRV slots are bound for a draw so the
@@ -364,7 +263,7 @@ struct WorldDrawCallback {
     auto* cl_data = GetWorldCommandListData(context.cmd_list);
     FillDrawBindingMasks(&record, cl_data);
 
-    CommitDrawRecord(record, device, context.cmd_list, cl_data);
+    CommitDrawRecord(record, device, cl_data);
     bvh::OnPoolScanDraw(device, context.cmd_list, record, cl_data);
     return {};
   }
@@ -471,8 +370,7 @@ inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
   auto& pending = PendingIndirectDraws();
   if (pending.empty()) return;
   auto* device = queue->get_device();
-  auto* cmd_list = queue->get_immediate_command_list();
-  if (device == nullptr || cmd_list == nullptr) {
+  if (device == nullptr) {
     pending.clear();
     IndirectStagingUsed() = 0u;
     return;
@@ -510,7 +408,7 @@ inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
         }
         record.serial = g_state.next_serial.fetch_add(1u);
         record.is_candidate = IsGeometryCandidate(record);
-        CommitDrawRecord(record, device, cmd_list, &draw.cl_data);
+        CommitDrawRecord(record, device, &draw.cl_data);
       }
     }
     device->unmap_buffer_region(IndirectStagingResource());
@@ -545,14 +443,7 @@ inline void OnWorldPresent(
     renodx::utils::constants::shared.data->capture_constant_buffers = true;
   }
   if (queue == nullptr) return;
-  {
-    std::lock_guard<std::mutex> lock(g_state.mutex);
-    ResolveStructuredBufferCopies(queue, &g_state.captured);
-    ResolveCbCopies(queue, &g_state.captured);
-    ParseInstanceOffset(&g_state.captured);
-  }
   ResolveIndirectDraws(queue);
-  RunPendingMeshCapture(queue);
   bvh::DrainPoolScan(queue->get_device(), queue);
 }
 

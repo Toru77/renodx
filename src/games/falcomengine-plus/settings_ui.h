@@ -841,8 +841,6 @@ static void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
   ImGui::SameLine();
   any_change |= DrawCategoryContent(ActiveCategory(), content_height);
 
-  falcom_world::DrawDebugOverlay();
-
   PopOverlayTheme();
 
   if (any_change) {

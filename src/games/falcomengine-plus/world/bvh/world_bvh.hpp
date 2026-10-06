@@ -104,8 +104,9 @@ inline void DrawBvhPanel() {
     switches_changed = true;
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Reads the vertex and index buffer of each new mesh at present.\n"
-                      "Off: no new mesh is read; instances of meshes not read yet wait unadmitted.");
+    ImGui::SetTooltip("Copies the index, then the vertex range of each new mesh at its draws and reads them\n"
+                      "two frames later (no GPU wait). Off: no new mesh is read; instances of meshes\n"
+                      "not read yet wait unadmitted.");
   }
   ImGui::SameLine();
   if (ImGui::Checkbox("Scan indirect draws", &scan_indirect)) {
@@ -121,7 +122,7 @@ inline void DrawBvhPanel() {
     switches_changed = true;
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Writes ReShade.log lines before and after each mesh capture,\n"
+    ImGui::SetTooltip("Writes ReShade.log lines for each mesh copy and read,\n"
                       "and when buffers the pool tracks are released.");
   }
   bool log_crashes = CrashLogEnabled();
@@ -187,12 +188,15 @@ inline void DrawBvhPanel() {
                 static_cast<unsigned long long>(indirect));
   }
   if (!indirect_classes.empty()) {
-    ImGui::TextDisabled("Indirect: copied %llu  read %llu  empty %llu  truncated %llu  buffer released %llu",
+    ImGui::TextDisabled("Indirect: copied %llu  read %llu  empty %llu  truncated %llu  buffer released %llu  avg window %.0f",
                         static_cast<unsigned long long>(stats.indirect_copied),
                         static_cast<unsigned long long>(stats.indirect_resolved),
                         static_cast<unsigned long long>(stats.indirect_empty),
                         static_cast<unsigned long long>(stats.indirect_truncated),
-                        static_cast<unsigned long long>(stats.indirect_dead));
+                        static_cast<unsigned long long>(stats.indirect_dead),
+                        stats.indirect_copied != 0u
+                            ? static_cast<double>(stats.indirect_window_instances) / static_cast<double>(stats.indirect_copied)
+                            : 0.0);
   }
 
   const ImVec4 base_color = stats.base_mismatch == 0u ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
@@ -227,16 +231,25 @@ inline void DrawBvhPanel() {
   if (!matrix_rejects.empty()) ImGui::Text("Bad matrix reasons: %s", matrix_rejects.c_str());
   ImGui::Text("Near misses (same mesh, almost the same matrix): %llu",
               static_cast<unsigned long long>(stats.near_misses));
-  ImGui::Text("Meshes: captured %llu  queued %llu  started %llu  same-content merges %u  failures %u  cap %u",
+  ImGui::Text("Meshes: captured %llu  waiting %llu  in flight %llu  same-content merges %u  failures %u  cap %u",
               static_cast<unsigned long long>(stats.meshes),
               static_cast<unsigned long long>(stats.mesh_queue),
-              static_cast<unsigned long long>(stats.mesh_attempts),
+              static_cast<unsigned long long>(stats.mesh_in_flight),
               stats.mesh_dedup,
               stats.mesh_failures,
               stats.mesh_cap_drops);
-  if (stats.destroyed_during_capture != 0u) {
-    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Buffers released during a mesh capture: %u",
-                       stats.destroyed_during_capture);
+  ImGui::TextDisabled("Mesh copies: indices %llu  vertices %llu  (%.1f MB)  postponed (staging full) %u  "
+                      "dropped (buffer released) %u  expired %u",
+                      static_cast<unsigned long long>(stats.mesh_index_copies),
+                      static_cast<unsigned long long>(stats.mesh_vertex_copies),
+                      static_cast<double>(stats.mesh_copy_bytes) / (1024.0 * 1024.0),
+                      stats.mesh_budget_full,
+                      stats.mesh_dropped,
+                      stats.mesh_expired);
+  if (stats.mesh_deferred_skips != 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f),
+                       "Mesh copies not taken at deferred-context draws: %llu (meshes drawn only there wait)",
+                       static_cast<unsigned long long>(stats.mesh_deferred_skips));
   }
   ImGui::Text("Retired by buffer release: meshes %u  instances %u  (buffer events %u)",
               stats.meshes_retired,

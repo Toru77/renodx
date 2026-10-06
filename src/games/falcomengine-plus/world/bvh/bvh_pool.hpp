@@ -18,21 +18,35 @@
 // used when the GPU-side b1 equals the CPU base it was sliced with.
 //
 // Indirect draws keep their index and instance counts in a GPU buffer, so at
-// the draw the pool copies b1, the 20-byte args and a window of up to
-// kPoolIndirectWindow elements from base; resolve reads the counts from the
-// copied args and uses the first instance_count elements of the window.
+// the draw the pool copies b1, the 20-byte args and a window of elements from
+// base; resolve reads the counts from the copied args and uses the first
+// instance_count elements of the window. The window adapts per draw identity:
+// what the draw used last time plus a margin, a small window after empty
+// args, doubled after a truncation, at most kPoolIndirectWindow.
 //
 // An instance is admitted once the same (mesh, world matrix) pair was read in
-// two different frames, which keeps moving objects out. Meshes are captured a
-// few per frame, merged by content, and retired with their instances when
-// their vertex or index buffer is destroyed, so a map change empties the pool
-// instead of leaving the previous map's geometry behind.
+// two different frames, which keeps moving objects out. Its matrix must be
+// plausible: finite, axes between kPoolMinScale and kPoolMaxScale and not
+// parallel, translation within +-kPoolMaxPosition (objects parked far away
+// are placeholders or horizon pieces).
 //
-// Diagnostic switches (BVH panel): "Capture meshes" turns the present-time
-// VB/IB readback off (instances are still observed; new meshes wait),
-// "Scan indirect draws" ignores indirect draws, and "Log mesh captures"
-// writes ReShade.log lines around each capture and when tracked buffers are
-// released. Nothing is logged unless that last switch is on. Each pool entry
+// Meshes are read without waiting for the GPU, in two copies made at draws
+// that bind the mesh's buffers (bound buffers are alive): first the draw's
+// index range, then, once those indices are read two presents later, the
+// vertex range they cover. Both go to a per-slot mesh staging buffer of the
+// same ring and are decoded at present outside the lock. Copies are taken
+// only at draws on the immediate context: a deferred command list may run
+// after its slot is read, and a mesh has no check like b1 that would catch
+// stale bytes. Meshes are merged
+// by content and retired with their instances when their vertex or index
+// buffer is destroyed, so a map change empties the pool instead of leaving
+// the previous map's geometry behind.
+//
+// Diagnostic switches (BVH panel): "Capture meshes" stops new mesh copies
+// (instances are still observed; new meshes wait), "Scan indirect draws"
+// ignores indirect draws, and "Log mesh captures" writes ReShade.log lines
+// for each mesh copy and read and when tracked buffers are released. Nothing
+// is logged unless that last switch is on. Each pool entry
 // point also records its stage per thread (debug/pool_stage.hpp) for the
 // crash log (debug/crash_log.hpp, "Log crashes").
 //
@@ -47,7 +61,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -66,11 +79,10 @@
 #include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
 #include "../capture/cb_value_tracker.hpp"
-#include "../capture/mesh_capture.hpp"
 #include "../contract/shader_registry.hpp"
 #include "../debug/pool_stage.hpp"
-#include "../research/transform_candidates.hpp"
 #include "../world_state.hpp"
+#include "pool_transform.hpp"
 
 namespace falcom_world::bvh {
 
@@ -93,11 +105,18 @@ inline constexpr uint64_t kPoolCbCopyBytes = 16u;           // b1 copy, keeps sl
 inline constexpr uint32_t kPoolMaxInstancesPerDraw = 4096u;
 inline constexpr uint64_t kPoolIndirectArgsBytes = 32u;     // 20-byte indexed args, padded to 16
 inline constexpr uint32_t kPoolIndirectArgsCopyBytes = 20u;
-inline constexpr uint32_t kPoolIndirectWindow = 512u;       // instances copied per indirect draw
+inline constexpr uint32_t kPoolIndirectWindow = 512u;       // most instances copied per indirect draw
+inline constexpr uint32_t kPoolIndirectEmptyWindow = 16u;   // window after the args came back empty
+inline constexpr uint32_t kPoolIndirectWindowStep = 16u;    // windows are rounded up to this
 inline constexpr uint32_t kPoolMaxIndirectSubDraws = 64u;
 inline constexpr uint32_t kPoolMaxRejectSamples = 2u;       // per family, for the dump
 inline constexpr size_t kPoolMaxNearIndex = 500000u;
-inline constexpr uint32_t kPoolMeshCapturesPerFrame = 2u;
+inline constexpr uint64_t kPoolMeshSlotBytes = 4ull * 1024ull * 1024ull;  // mesh copies per slot (frame)
+inline constexpr uint32_t kPoolMeshCopiesPerFrame = 64u;
+inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
+inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
+inline constexpr float kPoolMaxScale = 10000.f;
+inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr size_t kPoolMaxMeshes = 8192u;
 inline constexpr size_t kPoolMaxInstances = 2000000u;
@@ -172,8 +191,9 @@ enum class PoolMatrixReject : uint8_t {
   None = 0,
   NonFinite,
   ZeroScale,   // an axis shorter than 1e-6: collapsed / hidden instance
-  SmallScale,  // an axis shorter than 0.05
-  LargeScale,  // an axis 50 or longer
+  FarAway,     // translation beyond +-kPoolMaxPosition: parked placeholder or horizon piece
+  SmallScale,  // an axis shorter than kPoolMinScale
+  LargeScale,  // an axis kPoolMaxScale or longer
   Skewed,      // two axes nearly parallel
   Count,
 };
@@ -182,6 +202,7 @@ inline const char* PoolMatrixRejectName(PoolMatrixReject reject) {
   switch (reject) {
     case PoolMatrixReject::NonFinite:  return "non_finite";
     case PoolMatrixReject::ZeroScale:  return "zero_scale";
+    case PoolMatrixReject::FarAway:    return "far_away";
     case PoolMatrixReject::SmallScale: return "small_scale";
     case PoolMatrixReject::LargeScale: return "large_scale";
     case PoolMatrixReject::Skewed:     return "skewed";
@@ -237,11 +258,53 @@ struct ObservedInstance {
   float matrix[kPoolWorldFloats] = {};
 };
 
-// One queued mesh capture: the draw that first showed the geometry.
+// Positions and triangles of one decoded mesh (vertices remapped in first-use order).
+struct PoolDecodedMesh {
+  std::vector<std::array<float, 3>> positions;
+  std::vector<std::array<uint32_t, 3>> triangles;
+  std::array<float, 3> bbox_min = {0.f, 0.f, 0.f};
+  std::array<float, 3> bbox_max = {0.f, 0.f, 0.f};
+};
+
+// What the next copy of a queued mesh reads.
+enum class PoolMeshPhase : uint8_t {
+  Indices = 0,  // the draw's index range
+  Vertices,     // the vertex range those indices cover
+};
+
+inline const char* PoolMeshPhaseName(PoolMeshPhase phase) {
+  return phase == PoolMeshPhase::Indices ? "indices" : "vertices";
+}
+
+// One queued mesh: the draw that first showed the geometry, its position
+// layout and, after the index read, the vertices it uses.
 struct PoolMeshRequest {
   uint64_t mesh_key = 0u;
+  uint64_t serial = 0u;      // copies in flight carry it; a re-queued key gets a new one
+  uint64_t buffer_key = 0u;  // the VB/IB bindings a draw must have to serve its copies
   uint32_t vs_hash = 0u;
+  uint32_t last_frame = 0u;  // queued, last sighting, or last copy issued or read
   DrawRecord draw;
+  int32_t pos_offset = 0;
+  reshade::api::format pos_format = reshade::api::format::unknown;
+  PoolMeshPhase phase = PoolMeshPhase::Indices;
+  bool in_flight = false;
+  std::vector<uint32_t> indices;  // absolute vertex indices, after the index read
+  uint32_t min_vertex = 0u;
+  uint32_t max_vertex = 0u;
+};
+
+// One mesh copy in a staging slot.
+struct PoolMeshCopy {
+  uint64_t mesh_key = 0u;
+  uint64_t serial = 0u;
+  PoolMeshPhase phase = PoolMeshPhase::Indices;
+  uint64_t staging_offset = 0u;
+  uint64_t skip = 0u;    // bytes before the wanted range (the source is copied 4-byte aligned)
+  uint64_t size = 0u;    // wanted bytes
+  uint64_t copied = 0u;  // bytes copied
+  uint64_t source = 0u;  // VB or IB handle, for the log
+  uint64_t source_offset = 0u;
 };
 
 struct PoolPendingCopy {
@@ -253,9 +316,11 @@ struct PoolPendingCopy {
   uint32_t vs_hash = 0u;
   uint64_t mesh_key = 0u;  // 0 for an indirect draw until its args are read
   // Indirect draws only: the draw record in PoolStagingSlot::indirect_draws
-  // (its counts are filled from the args at resolve) and the args location.
+  // (its counts are filled from the args at resolve), the args location and
+  // the draw identity whose next window the args decide.
   uint32_t indirect_index = UINT32_MAX;
   uint64_t args_offset = 0u;
+  uint64_t schedule_key = 0u;
 };
 
 struct PoolStagingSlot {
@@ -264,6 +329,10 @@ struct PoolStagingSlot {
   bool resolving = false;
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
+  // Mesh copies of the same frame, in their own buffer.
+  reshade::api::resource mesh_buffer = {0u};
+  uint64_t mesh_used = 0u;
+  std::vector<PoolMeshCopy> mesh_copies;
 };
 
 struct PoolMatrixSample {
@@ -281,6 +350,7 @@ struct PoolNearEntry {
 struct PoolSchedule {
   uint32_t copy_frame = 0u;
   uint32_t next_frame = 0u;
+  uint32_t indirect_window = 0u;  // indirect draws: next window (0 = not known yet)
 };
 
 struct PoolFamilyStats {
@@ -318,6 +388,7 @@ struct PoolStats {
   uint64_t indirect_empty = 0u;      // args with zero indices or instances
   uint64_t indirect_truncated = 0u;  // instance_count larger than the copied window
   uint64_t indirect_dead = 0u;       // VB/IB released before the args were read
+  uint64_t indirect_window_instances = 0u;  // instances copied for indirect draws (sum of windows)
   // Read back.
   uint64_t base_verified = 0u;
   uint64_t base_mismatch = 0u;
@@ -334,8 +405,13 @@ struct PoolStats {
   uint32_t dedup_instances = 0u;
   uint32_t instance_cap_drops = 0u;
   // Meshes.
-  uint64_t mesh_attempts = 0u;            // captures started
-  uint32_t destroyed_during_capture = 0u; // VB/IB released on another thread while its readback ran
+  uint64_t mesh_index_copies = 0u;   // index ranges copied
+  uint64_t mesh_vertex_copies = 0u;  // vertex ranges copied
+  uint64_t mesh_copy_bytes = 0u;
+  uint32_t mesh_budget_full = 0u;    // copies postponed: the frame's mesh staging was full
+  uint32_t mesh_dropped = 0u;        // copies read after their mesh was released or re-queued
+  uint32_t mesh_expired = 0u;        // requests not drawn for kPoolPruneAge frames
+  uint64_t mesh_deferred_skips = 0u; // draws on a deferred context that could have served a copy
   uint32_t mesh_failures = 0u;
   uint32_t mesh_dedup = 0u;
   uint32_t mesh_cap_drops = 0u;
@@ -345,7 +421,8 @@ struct PoolStats {
   std::string last_mesh_error;
   // Sizes (refreshed by UpdatePoolStats).
   size_t queued = 0u;
-  size_t mesh_queue = 0u;
+  size_t mesh_queue = 0u;      // waiting for a copy
+  size_t mesh_in_flight = 0u;  // copy issued, not read yet
   size_t meshes = 0u;
   size_t observed = 0u;
   size_t admitted = 0u;
@@ -365,11 +442,6 @@ struct PoolState {
   float region_size = 512.f;
   std::mutex mutex;
 
-  // The mesh capture running now (serial 0 when idle) and the buffers it
-  // reads, so a release of either on another thread is counted and logged.
-  uint64_t capture_serial = 0u;
-  uint64_t capturing_vb = 0u;
-  uint64_t capturing_ib = 0u;
   uint32_t logged_invalidations = 0u;  // stats.resource_invalidations at the last present
 
   // Staging ring. Draws of the frame in flight write `write_slot`.
@@ -378,7 +450,9 @@ struct PoolState {
   uint32_t write_slot = 0u;
 
   // Meshes.
-  std::vector<PoolMeshRequest> mesh_queue;
+  std::unordered_map<uint64_t, PoolMeshRequest> mesh_requests;       // by mesh key
+  std::unordered_map<uint64_t, std::vector<uint64_t>> mesh_waiting;  // buffer key -> keys waiting for a copy
+  uint64_t next_mesh_serial = 1u;
   std::unordered_set<uint64_t> mesh_queued;   // keys queued or captured since last invalidation
   std::unordered_set<uint64_t> failed_meshes;
   std::unordered_map<uint64_t, uint32_t> mesh_by_key;
@@ -471,8 +545,15 @@ inline PoolMatrixReject CheckPoolWorld(const float* matrix) {
   for (int r = 0; r < 3; ++r) {
     lengths[r] = std::sqrt(rows[r][0] * rows[r][0] + rows[r][1] * rows[r][1] + rows[r][2] * rows[r][2]);
     if (!(lengths[r] >= 1e-6f)) return PoolMatrixReject::ZeroScale;
-    if (!(lengths[r] > 0.05f)) return PoolMatrixReject::SmallScale;
-    if (!(lengths[r] < 50.f)) return PoolMatrixReject::LargeScale;
+  }
+  // Parked placeholders and horizon pieces sit 100 km out (seen at -100000 on
+  // one axis and on a 100 km ring); real scene objects are far inside.
+  for (const uint32_t element : {3u, 7u, 11u}) {
+    if (!(std::fabs(matrix[element]) <= kPoolMaxPosition)) return PoolMatrixReject::FarAway;
+  }
+  for (int r = 0; r < 3; ++r) {
+    if (!(lengths[r] >= kPoolMinScale)) return PoolMatrixReject::SmallScale;
+    if (!(lengths[r] < kPoolMaxScale)) return PoolMatrixReject::LargeScale;
   }
   for (int a = 0; a < 3; ++a) {
     for (int b = a + 1; b < 3; ++b) {
@@ -605,7 +686,13 @@ inline void UpdatePoolStats() {
   size_t queued = 0u;
   for (const auto& slot : g_pool.slots) queued += slot.copies.size();
   g_pool.stats.queued = queued;
-  g_pool.stats.mesh_queue = g_pool.mesh_queue.size();
+  size_t in_flight = 0u;
+  for (const auto& [key, request] : g_pool.mesh_requests) {
+    (void)key;
+    if (request.in_flight) in_flight += 1u;
+  }
+  g_pool.stats.mesh_in_flight = in_flight;
+  g_pool.stats.mesh_queue = g_pool.mesh_requests.size() - in_flight;
   g_pool.stats.meshes = g_pool.meshes.size();
   g_pool.stats.observed = g_pool.observations.size();
   g_pool.stats.admitted = g_pool.instances.size();
@@ -732,11 +819,19 @@ inline bool ReleasePoolIndirectRefs(const DrawRecord& draw) {
 }
 
 // Caller holds g_pool.mutex. Detaches the ring and returns its buffers.
+// Meshes whose copies are dropped with it go back to waiting.
 inline std::vector<reshade::api::resource> DetachPoolStaging(reshade::api::device** out_device) {
   std::vector<reshade::api::resource> buffers;
   for (auto& slot : g_pool.slots) {
     if (slot.buffer.handle != 0u) buffers.push_back(slot.buffer);
+    if (slot.mesh_buffer.handle != 0u) buffers.push_back(slot.mesh_buffer);
     for (const DrawRecord& draw : slot.indirect_draws) ReleasePoolIndirectRefs(draw);
+    for (const PoolMeshCopy& copy : slot.mesh_copies) {
+      const auto request = g_pool.mesh_requests.find(copy.mesh_key);
+      if (request == g_pool.mesh_requests.end() || request->second.serial != copy.serial) continue;
+      request->second.in_flight = false;
+      g_pool.mesh_waiting[request->second.buffer_key].push_back(copy.mesh_key);
+    }
     slot = {};
   }
   *out_device = g_pool.staging_device;
@@ -757,15 +852,17 @@ inline void EnsurePoolStaging(reshade::api::device* device) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (g_pool.staging_device == device) return;
   }
+  // Per slot: the instance buffer, then the mesh buffer.
   std::vector<reshade::api::resource> created;
-  for (uint32_t i = 0; i < kPoolStagingSlots; ++i) {
+  for (uint32_t i = 0; i < 2u * kPoolStagingSlots; ++i) {
     const reshade::api::resource_desc desc(
-        kPoolStagingSlotBytes, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest);
+        (i % 2u) == 0u ? kPoolStagingSlotBytes : kPoolMeshSlotBytes, reshade::api::memory_heap::gpu_to_cpu,
+        reshade::api::resource_usage::copy_dest);
     reshade::api::resource buffer = {0u};
     if (!device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &buffer)) break;
     created.push_back(buffer);
   }
-  if (created.size() != kPoolStagingSlots) {
+  if (created.size() != 2u * kPoolStagingSlots) {
     DestroyPoolStagingBuffers(device, created);
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.staging_failures += 1u;
@@ -776,7 +873,10 @@ inline void EnsurePoolStaging(reshade::api::device* device) {
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     previous = DetachPoolStaging(&previous_device);
-    for (uint32_t i = 0; i < kPoolStagingSlots; ++i) g_pool.slots[i].buffer = created[i];
+    for (uint32_t i = 0; i < kPoolStagingSlots; ++i) {
+      g_pool.slots[i].buffer = created[2u * i];
+      g_pool.slots[i].mesh_buffer = created[2u * i + 1u];
+    }
     g_pool.staging_device = device;
   }
   DestroyPoolStagingBuffers(previous_device, previous);
@@ -976,13 +1076,117 @@ inline PoolSkip ReservePoolCopy(
   return PoolSkip::None;
 }
 
+// The VB/IB bindings of a draw: any draw that has them bound can serve the
+// mesh copies of every queued mesh drawn from them.
+inline uint64_t PoolBufferKey(const DrawRecord& draw) {
+  uint64_t key = 1469598103934665603ull;
+  key = PoolMix(key, draw.vb.handle);
+  key = PoolMix(key, draw.vb_offset);
+  key = PoolMix(key, draw.vb_stride);
+  key = PoolMix(key, draw.ib.handle);
+  key = PoolMix(key, draw.ib_offset);
+  return PoolMix(key, draw.index_size);
+}
+
 // Caller holds g_pool.mutex.
+inline void AddPoolMeshWaiting(const PoolMeshRequest& request) {
+  g_pool.mesh_waiting[request.buffer_key].push_back(request.mesh_key);
+}
+
+// Caller holds g_pool.mutex.
+inline void RemovePoolMeshWaiting(uint64_t buffer_key, uint64_t mesh_key) {
+  const auto it = g_pool.mesh_waiting.find(buffer_key);
+  if (it == g_pool.mesh_waiting.end()) return;
+  auto& keys = it->second;
+  keys.erase(std::remove(keys.begin(), keys.end(), mesh_key), keys.end());
+  if (keys.empty()) g_pool.mesh_waiting.erase(it);
+}
+
+// Caller holds g_pool.mutex. Records a mesh failure; the key stays queued
+// (not retried) until its buffers are released.
+inline void RecordPoolMeshFailure(uint64_t mesh_key, const char* reason) {
+  g_pool.failed_meshes.insert(mesh_key);
+  g_pool.stats.mesh_failures += 1u;
+  g_pool.stats.last_mesh_error = reason;
+}
+
+// Caller holds g_pool.mutex, and has already taken the key out of
+// mesh_waiting (or it is in flight).
+inline void FailPoolMesh(std::unordered_map<uint64_t, PoolMeshRequest>::iterator request, const char* reason) {
+  RecordPoolMeshFailure(request->first, reason);
+  g_pool.mesh_requests.erase(request);
+}
+
+// Position layout of a draw's vertex stream 0, from its input layout.
+// Returns nullptr when usable, else why not.
+inline const char* ResolvePoolMeshLayout(
+    const DrawRecord& draw, int32_t* pos_offset, reshade::api::format* pos_format) {
+  namespace scene = renodx::utils::scene;
+  if (draw.method != 1u || !draw.has_index_buffer || draw.vb.handle == 0u || draw.ib.handle == 0u) {
+    return "not an indexed draw";
+  }
+  if (draw.index_size != 2u && draw.index_size != 4u) return "unsupported index size";
+  if (draw.index_count < 3u || (draw.index_count % 3u) != 0u) return "index count is not a triangle list";
+  if (draw.vb_stride == 0u) return "vertex stride is zero";
+  scene::InputLayoutInfo layout_info;
+  bool found = false;
+  if (scene::shared.data != nullptr && draw.input_layout.handle != 0u) {
+    scene::shared.data->input_layouts.if_contains(draw.input_layout.handle, [&](const auto& pair) {
+      layout_info = pair.second;
+      found = true;
+    });
+  }
+  if (!found) return "no input layout";
+  scene::MeshLayout layout;
+  if (!scene::BuildMeshLayout(layout_info, draw.vb_stride, draw.index_size, &layout)) return "input layout not decodable";
+  if (layout.topology != reshade::api::primitive_topology::undefined
+      && layout.topology != reshade::api::primitive_topology::triangle_list) {
+    return "not a triangle list";
+  }
+  const scene::FormatInfo* info = scene::FindFormatInfo(layout.pos_format);
+  if (info == nullptr) return "unsupported position format";
+  if (layout.pos_off < 0 || static_cast<uint64_t>(layout.pos_off) + info->byte_size > draw.vb_stride) {
+    return "position outside the vertex";
+  }
+  *pos_offset = layout.pos_off;
+  *pos_format = layout.pos_format;
+  return nullptr;
+}
+
+// Caller holds g_pool.mutex. Queues the mesh a draw shows, once per key until
+// its buffers are released.
+// Caller holds g_pool.mutex. Maps a VB/IB handle to a draw key once (a key
+// queued again after it expired is already mapped).
+inline void AddPoolResourceKey(uint64_t handle, uint64_t mesh_key) {
+  auto& keys = g_pool.keys_by_resource[handle];
+  if (std::find(keys.begin(), keys.end(), mesh_key) == keys.end()) keys.push_back(mesh_key);
+}
+
 inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw) {
-  if (!g_pool.mesh_queued.insert(mesh_key).second) return;
+  if (!g_pool.mesh_queued.insert(mesh_key).second) {
+    // Seen again: a waiting mesh is still drawn, so it does not expire.
+    const auto request = g_pool.mesh_requests.find(mesh_key);
+    if (request != g_pool.mesh_requests.end()) request->second.last_frame = g_state.frame.load();
+    return;
+  }
   if (g_pool.mesh_by_key.count(mesh_key) != 0u || g_pool.failed_meshes.count(mesh_key) != 0u) return;
-  g_pool.mesh_queue.push_back({mesh_key, vs_hash, draw});
-  g_pool.keys_by_resource[draw.vb.handle].push_back(mesh_key);
-  if (draw.ib.handle != draw.vb.handle) g_pool.keys_by_resource[draw.ib.handle].push_back(mesh_key);
+  AddPoolResourceKey(draw.vb.handle, mesh_key);
+  if (draw.ib.handle != draw.vb.handle) AddPoolResourceKey(draw.ib.handle, mesh_key);
+
+  PoolMeshRequest request;
+  request.mesh_key = mesh_key;
+  request.vs_hash = vs_hash;
+  request.last_frame = g_state.frame.load();
+  request.draw = draw;
+  const char* error = ResolvePoolMeshLayout(draw, &request.pos_offset, &request.pos_format);
+  if (error != nullptr) {
+    RecordPoolMeshFailure(mesh_key, error);
+    return;
+  }
+  request.serial = g_pool.next_mesh_serial++;
+  request.buffer_key = PoolBufferKey(draw);
+  AddPoolMeshWaiting(request);
+  g_pool.mesh_requests.emplace(mesh_key, std::move(request));
 }
 
 // One draw-time copy, reserved under g_pool.mutex and recorded after it.
@@ -999,6 +1203,111 @@ inline void IssuePoolCopies(reshade::api::command_list* cmd_list, const PoolCopy
   for (uint32_t i = 0; i < count; ++i) {
     const PoolCopyCommand& command = commands[i];
     cmd_list->copy_buffer_region(command.source, command.source_offset, command.dest, command.dest_offset, command.size);
+  }
+}
+
+// Caller holds g_pool.mutex. Reserves copies for meshes waiting on the
+// buffers this draw has bound. A bound buffer is alive, so copying from it at
+// the draw is safe (the instance copies rely on the same). Draws on a
+// deferred context do not serve copies (see the header comment). Writes up
+// to `capacity` commands plus the matching copies (for the log); returns how
+// many.
+inline uint32_t ReservePoolMeshCopies(
+    reshade::api::device* device,
+    const DrawRecord& draw,
+    bool deferred,
+    uint32_t frame,
+    PoolCopyCommand* commands,
+    PoolMeshCopy* copies,
+    uint32_t capacity) {
+  if (capacity == 0u || g_pool.mesh_waiting.empty()) return 0u;
+  if (!g_pool.capture_meshes.load(std::memory_order_relaxed)) return 0u;
+  if (draw.method != 1u || !draw.has_index_buffer || draw.vb.handle == 0u || draw.ib.handle == 0u) return 0u;
+  if (draw.vb_size == 0u || draw.ib_size == 0u) return 0u;
+  const auto waiting = g_pool.mesh_waiting.find(PoolBufferKey(draw));
+  if (waiting == g_pool.mesh_waiting.end()) return 0u;
+  if (deferred) {
+    g_pool.stats.mesh_deferred_skips += 1u;
+    return 0u;
+  }
+  PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
+  if (g_pool.staging_device != device || slot.mesh_buffer.handle == 0u || slot.resolving) return 0u;
+
+  std::vector<uint64_t>& keys = waiting->second;
+  uint32_t count = 0u;
+  size_t index = 0u;
+  while (index < keys.size() && count < capacity && slot.mesh_copies.size() < kPoolMeshCopiesPerFrame) {
+    const auto request_it = g_pool.mesh_requests.find(keys[index]);
+    if (request_it == g_pool.mesh_requests.end() || request_it->second.in_flight) {
+      keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
+      continue;
+    }
+    PoolMeshRequest& request = request_it->second;
+    const DrawRecord& queued = request.draw;
+    const bool indices = request.phase == PoolMeshPhase::Indices;
+    const reshade::api::resource source = indices ? draw.ib : draw.vb;
+    const uint64_t buffer_size = indices ? draw.ib_size : draw.vb_size;
+    const uint64_t begin =
+        indices ? queued.ib_offset + static_cast<uint64_t>(queued.first_index) * queued.index_size
+                : queued.vb_offset + static_cast<uint64_t>(request.min_vertex) * queued.vb_stride;
+    const uint64_t end =
+        indices ? begin + static_cast<uint64_t>(queued.index_count) * queued.index_size
+                : queued.vb_offset + (static_cast<uint64_t>(request.max_vertex) + 1u) * queued.vb_stride;
+    const uint64_t aligned_begin = begin & ~uint64_t{3};
+    const uint64_t aligned_end = (std::min)((end + 3u) & ~uint64_t{3}, buffer_size);
+    const char* error = nullptr;
+    if (end <= begin || end > buffer_size) {
+      error = indices ? "index range outside the index buffer" : "vertex range outside the vertex buffer";
+    } else if (aligned_end - aligned_begin > kPoolMeshSlotBytes) {
+      error = indices ? "index range larger than the mesh staging" : "vertex range larger than the mesh staging";
+    }
+    if (error != nullptr) {
+      keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
+      FailPoolMesh(request_it, error);
+      continue;
+    }
+    const uint64_t offset = (slot.mesh_used + 15u) & ~uint64_t{15};
+    if (offset + (aligned_end - aligned_begin) > kPoolMeshSlotBytes) {
+      g_pool.stats.mesh_budget_full += 1u;
+      break;
+    }
+    PoolMeshCopy copy;
+    copy.mesh_key = request.mesh_key;
+    copy.serial = request.serial;
+    copy.phase = request.phase;
+    copy.staging_offset = offset;
+    copy.skip = begin - aligned_begin;
+    copy.size = end - begin;
+    copy.copied = aligned_end - aligned_begin;
+    copy.source = source.handle;
+    copy.source_offset = aligned_begin;
+    slot.mesh_used = offset + copy.copied;
+    slot.mesh_copies.push_back(copy);
+    commands[count] = {source, aligned_begin, slot.mesh_buffer, offset, copy.copied};
+    copies[count] = copy;
+    ++count;
+    request.in_flight = true;
+    request.last_frame = frame;
+    if (indices) {
+      g_pool.stats.mesh_index_copies += 1u;
+    } else {
+      g_pool.stats.mesh_vertex_copies += 1u;
+    }
+    g_pool.stats.mesh_copy_bytes += copy.copied;
+    keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
+  }
+  if (keys.empty()) g_pool.mesh_waiting.erase(waiting);
+  return count;
+}
+
+inline void LogPoolMeshCopies(const PoolMeshCopy* copies, uint32_t count, uint32_t frame) {
+  if (count == 0u || !g_pool.log_captures.load(std::memory_order_relaxed)) return;
+  namespace log_utils = renodx::utils::log;
+  for (uint32_t i = 0; i < count; ++i) {
+    const PoolMeshCopy& copy = copies[i];
+    log_utils::i("falcom_world::pool: mesh ", log_utils::AsHex(copy.mesh_key), " ", PoolMeshPhaseName(copy.phase),
+                 " copy issued: frame ", frame, " | source ", log_utils::AsPtr(copy.source), " offset ",
+                 copy.source_offset, " bytes ", copy.copied);
   }
 }
 
@@ -1037,8 +1346,10 @@ inline void OnPoolScanDraw(
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
   stage.Set("direct draw: reserve");
-  std::array<PoolCopyCommand, 2> commands;
+  std::array<PoolCopyCommand, 2u + kPoolMeshCopiesPerDraw> commands;
+  std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   uint32_t command_count = 0u;
+  uint32_t mesh_count = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
@@ -1078,9 +1389,13 @@ inline void OnPoolScanDraw(
       }
     }
     if (skip != PoolSkip::None) CountPoolSkip(family, skip, gate.state);
+    mesh_count = ReservePoolMeshCopies(device, draw, deferred, frame, commands.data() + command_count,
+                                       mesh_copies.data(), kPoolMeshCopiesPerDraw);
+    command_count += mesh_count;
   }
   stage.Set("direct draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
+  LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
 }
 
 // DrawIndexedInstancedIndirect and friends. `draw` carries the bindings at
@@ -1105,8 +1420,9 @@ inline void OnPoolScanIndirectDraw(
   PoolSlice slice;
   stage.Set("indirect draw: slice");
   if (skip == PoolSkip::None) skip = ResolvePoolSlice(device, cmd_list, cl_data, &slice);
-  const uint32_t window = static_cast<uint32_t>((std::min)(static_cast<uint64_t>(kPoolIndirectWindow), slice.available));
-  if (skip == PoolSkip::None && window == 0u) skip = PoolSkip::SliceRange;
+  const uint32_t max_window =
+      static_cast<uint32_t>((std::min)(static_cast<uint64_t>(kPoolIndirectWindow), slice.available));
+  if (skip == PoolSkip::None && max_window == 0u) skip = PoolSkip::SliceRange;
   uint64_t args_size = 0u;
   stage.Set("indirect draw: args size");
   if (skip == PoolSkip::None) {
@@ -1116,11 +1432,12 @@ inline void OnPoolScanIndirectDraw(
 
   const uint32_t frame = g_state.frame.load();
   const uint32_t sub_draws = (std::min)(draw_count == 0u ? 1u : draw_count, kPoolMaxIndirectSubDraws);
-  const uint64_t bytes = kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
 
   stage.Set("indirect draw: reserve");
-  std::array<PoolCopyCommand, 3u * kPoolMaxIndirectSubDraws> commands;
+  std::array<PoolCopyCommand, 3u * kPoolMaxIndirectSubDraws + kPoolMeshCopiesPerDraw> commands;
+  std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   uint32_t command_count = 0u;
+  uint32_t mesh_count = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
@@ -1140,10 +1457,19 @@ inline void OnPoolScanIndirectDraw(
       if (sub_skip == PoolSkip::None && sub_args_offset + kPoolIndirectArgsCopyBytes > args_size) {
         sub_skip = PoolSkip::SliceRange;
       }
+      // The window this identity needs: decided by its last args (see
+      // NextPoolIndirectWindow), the full window until they were read once.
+      const uint64_t schedule_key = PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset);
+      uint32_t window = max_window;
+      const auto known = g_pool.schedule.find(schedule_key);
+      if (known != g_pool.schedule.end() && known->second.indirect_window != 0u) {
+        window = (std::min)(known->second.indirect_window, max_window);
+      }
+      const uint64_t bytes =
+          kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
       PoolSchedule* schedule = nullptr;
       if (sub_skip == PoolSkip::None) {
-        sub_skip = ReservePoolCopy(
-            device, PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset), frame, bytes, &schedule);
+        sub_skip = ReservePoolCopy(device, schedule_key, frame, bytes, &schedule);
       }
       if (sub_skip != PoolSkip::None) {
         CountPoolSkip(family, sub_skip, gate.state);
@@ -1160,6 +1486,7 @@ inline void OnPoolScanIndirectDraw(
       copy.frame = frame;
       copy.vs_hash = draw.vs_hash;
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
+      copy.schedule_key = schedule_key;
       PoolCopyCommand* sub_commands = commands.data() + command_count;
       sub_commands[0] = {slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes};
       sub_commands[1] = {args_buffer, sub_args_offset, slot.buffer, copy.args_offset, kPoolIndirectArgsCopyBytes};
@@ -1174,11 +1501,16 @@ inline void OnPoolScanIndirectDraw(
       schedule->next_frame = frame + kPoolRecaptureFrames;
       g_pool.stats.copied_draws += 1u;
       g_pool.stats.indirect_copied += 1u;
+      g_pool.stats.indirect_window_instances += window;
       family.copied += 1u;
     }
+    mesh_count = ReservePoolMeshCopies(device, draw, deferred, frame, commands.data() + command_count,
+                                       mesh_copies.data(), kPoolMeshCopiesPerDraw);
+    command_count += mesh_count;
   }
   stage.Set("indirect draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
+  LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,10 +1522,13 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.mesh_queued.erase(mesh_key);
   g_pool.failed_meshes.erase(mesh_key);
   g_pool.invalidated_keys.insert(mesh_key);
-  g_pool.mesh_queue.erase(
-      std::remove_if(g_pool.mesh_queue.begin(), g_pool.mesh_queue.end(),
-                     [mesh_key](const PoolMeshRequest& request) { return request.mesh_key == mesh_key; }),
-      g_pool.mesh_queue.end());
+  // A queued mesh is forgotten; a copy of it still in flight is dropped when
+  // read (no request with its serial is left).
+  const auto request = g_pool.mesh_requests.find(mesh_key);
+  if (request != g_pool.mesh_requests.end()) {
+    if (!request->second.in_flight) RemovePoolMeshWaiting(request->second.buffer_key, mesh_key);
+    g_pool.mesh_requests.erase(request);
+  }
   const auto it = g_pool.mesh_by_key.find(mesh_key);
   if (it == g_pool.mesh_by_key.end()) return;
   WorldMesh& mesh = g_pool.meshes[it->second];
@@ -1205,28 +1540,15 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
 inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::resource resource) {
   (void)device;
   const PoolStageScope stage("buffer release");
-  uint64_t capture_serial = 0u;  // nonzero: the running mesh capture reads this buffer
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (g_pool.capture_serial != 0u && resource.handle != 0u
-        && (resource.handle == g_pool.capturing_vb || resource.handle == g_pool.capturing_ib)) {
-      capture_serial = g_pool.capture_serial;
-      g_pool.stats.destroyed_during_capture += 1u;
-    }
-    if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
-      g_pool.indirect_dead.insert(resource.handle);
-    }
-    const auto it = g_pool.keys_by_resource.find(resource.handle);
-    if (it != g_pool.keys_by_resource.end()) {
-      for (const uint64_t mesh_key : it->second) InvalidatePoolMeshKey(mesh_key);
-      g_pool.keys_by_resource.erase(it);
-      g_pool.stats.resource_invalidations += 1u;
-    }
+  std::lock_guard<std::mutex> lock(g_pool.mutex);
+  if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
+    g_pool.indirect_dead.insert(resource.handle);
   }
-  if (capture_serial != 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
-    renodx::utils::log::e("falcom_world::pool: buffer ", renodx::utils::log::AsPtr(resource.handle),
-                          " released while mesh capture #", capture_serial, " reads it");
-  }
+  const auto it = g_pool.keys_by_resource.find(resource.handle);
+  if (it == g_pool.keys_by_resource.end()) return;
+  for (const uint64_t mesh_key : it->second) InvalidatePoolMeshKey(mesh_key);
+  g_pool.keys_by_resource.erase(it);
+  g_pool.stats.resource_invalidations += 1u;
 }
 
 // Caller holds g_pool.mutex. Removes instances admitted through invalidated
@@ -1299,7 +1621,7 @@ inline void CompactPool() {
 // ---------------------------------------------------------------------------
 // Present-time work.
 
-inline uint64_t PoolMeshSignature(const renodx::utils::scene::CapturedMesh& mesh) {
+inline uint64_t PoolMeshSignature(const PoolDecodedMesh& mesh) {
   uint64_t hash = 1469598103934665603ull;
   for (const auto& position : mesh.positions) {
     for (const float value : position) {
@@ -1316,22 +1638,11 @@ inline uint64_t PoolMeshSignature(const renodx::utils::scene::CapturedMesh& mesh
   return PoolMix(hash, mesh.positions.size());
 }
 
-// Caller holds g_pool.mutex. Applies one finished capture and returns what
-// happened to it (for the capture log).
-inline const char* ApplyPoolMeshCapture(
-    const PoolMeshRequest& request,
-    bool captured,
-    renodx::utils::scene::CapturedMesh& mesh,
-    const std::string& error) {
-  // Invalidated while the capture ran: the buffers are gone, drop the result.
-  if (g_pool.mesh_queued.count(request.mesh_key) == 0u) return "dropped (buffer released)";
-  if (!captured) {
-    g_pool.failed_meshes.insert(request.mesh_key);
-    g_pool.stats.mesh_failures += 1u;
-    g_pool.stats.last_mesh_error = error.empty() ? std::string("empty mesh") : error;
-    return "failed";
-  }
-  if (g_pool.mesh_by_key.count(request.mesh_key) != 0u) return "already captured";
+// Caller holds g_pool.mutex. Adds one decoded mesh, or maps the key to an
+// existing mesh with the same content, and admits the instances waiting for
+// it. Returns what happened, for the log.
+inline const char* ApplyPoolMesh(uint64_t mesh_key, uint32_t vs_hash, PoolDecodedMesh& mesh) {
+  if (g_pool.mesh_by_key.count(mesh_key) != 0u) return "already captured";
 
   const char* outcome = "added";
   uint32_t mesh_id = 0u;
@@ -1344,13 +1655,13 @@ inline const char* ApplyPoolMeshCapture(
   } else {
     if (g_pool.meshes.size() >= kPoolMaxMeshes) {
       g_pool.stats.mesh_cap_drops += 1u;
-      g_pool.failed_meshes.insert(request.mesh_key);
+      g_pool.failed_meshes.insert(mesh_key);
       return "dropped (mesh cap)";
     }
     WorldMesh world_mesh;
-    world_mesh.mesh_key = request.mesh_key;
+    world_mesh.mesh_key = mesh_key;
     world_mesh.mesh_id = static_cast<uint32_t>(g_pool.meshes.size());
-    world_mesh.source_vs_hash = request.vs_hash;
+    world_mesh.source_vs_hash = vs_hash;
     world_mesh.signature = signature;
     world_mesh.triangle_count = static_cast<uint32_t>(mesh.triangles.size());
     std::memcpy(world_mesh.bbox_min, mesh.bbox_min.data(), sizeof(float) * 3u);
@@ -1368,73 +1679,109 @@ inline const char* ApplyPoolMeshCapture(
     g_pool.revision += 1u;
   }
   g_pool.meshes[mesh_id].live_keys += 1u;
-  g_pool.mesh_by_key[request.mesh_key] = mesh_id;
-  AdmitPendingInstancesForMesh(request.mesh_key, mesh_id);
+  g_pool.mesh_by_key[mesh_key] = mesh_id;
+  AdmitPendingInstancesForMesh(mesh_key, mesh_id);
   return outcome;
 }
 
-// Reads the vertex and index buffer of one queued mesh (GPU wait). With
-// "Log mesh captures" on, a line is written before the buffers are touched
-// and one after, so a crash inside the readback leaves a "begin" line
-// without its "end".
-inline void CaptureOnePoolMesh(reshade::api::device* device, reshade::api::command_queue* queue) {
-  PoolMeshRequest request;
-  uint64_t serial = 0u;
-  size_t queue_left = 0u;
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (g_pool.mesh_queue.empty()) return;
-    request = std::move(g_pool.mesh_queue.back());
-    g_pool.mesh_queue.pop_back();
-    queue_left = g_pool.mesh_queue.size();
-    g_pool.stats.mesh_attempts += 1u;
-    serial = g_pool.stats.mesh_attempts;
-    g_pool.capture_serial = serial;
-    g_pool.capturing_vb = request.draw.vb.handle;
-    g_pool.capturing_ib = request.draw.ib.handle;
+// Index read: the draw's indices with the base vertex applied, and the
+// vertex range they cover. Returns nullptr on success, else why the mesh
+// cannot be captured.
+inline const char* DecodePoolMeshIndices(
+    const uint8_t* bytes,
+    uint64_t size,
+    uint32_t index_size,
+    uint32_t index_count,
+    int32_t vertex_offset,
+    uint32_t stride,
+    std::vector<uint32_t>* indices,
+    uint32_t* min_vertex,
+    uint32_t* max_vertex) {
+  if (index_size != 2u && index_size != 4u) return "unsupported index size";
+  if (size < static_cast<uint64_t>(index_count) * index_size) return "index copy shorter than the draw";
+  indices->clear();
+  indices->reserve(index_count);
+  int64_t lowest = INT64_MAX;
+  int64_t highest = -1;
+  for (uint32_t i = 0; i < index_count; ++i) {
+    uint32_t raw = 0u;
+    if (index_size == 2u) {
+      uint16_t value = 0u;
+      std::memcpy(&value, bytes + static_cast<size_t>(i) * 2u, sizeof(value));
+      raw = value;
+    } else {
+      std::memcpy(&raw, bytes + static_cast<size_t>(i) * 4u, sizeof(raw));
+    }
+    const int64_t absolute = static_cast<int64_t>(raw) + vertex_offset;
+    if (absolute < 0 || absolute > static_cast<int64_t>(UINT32_MAX - 1u)) return "index outside the vertex buffer";
+    indices->push_back(static_cast<uint32_t>(absolute));
+    lowest = (std::min)(lowest, absolute);
+    highest = (std::max)(highest, absolute);
   }
-  const bool log = g_pool.log_captures.load(std::memory_order_relaxed);
-  if (log) {
-    namespace log_utils = renodx::utils::log;
-    const DrawRecord& draw = request.draw;
-    const uint32_t frame = g_state.frame.load();
-    log_utils::i("falcom_world::pool: mesh capture #", serial, " begin: frame ", frame,
-                 ", queued at frame ", draw.frame, ", ", queue_left, " more queued | vs ",
-                 log_utils::AsHex(request.vs_hash), " key ", log_utils::AsHex(request.mesh_key),
-                 " | vb ", log_utils::AsPtr(draw.vb.handle), " size ", draw.vb_size, " offset ", draw.vb_offset,
-                 " stride ", draw.vb_stride,
-                 " | ib ", log_utils::AsPtr(draw.ib.handle), " size ", draw.ib_size, " offset ", draw.ib_offset,
-                 " index size ", draw.index_size,
-                 " | indices ", draw.index_count, " first ", draw.first_index, " base vertex ", draw.vertex_offset,
-                 " | input layout ", log_utils::AsPtr(draw.input_layout.handle));
+  if (highest < 0) return "no indices";
+  if (static_cast<uint64_t>(highest - lowest + 1) * stride > kPoolMeshSlotBytes) {
+    return "vertex range larger than the mesh staging";
   }
-  PoolStageScope stage("present: mesh capture (readback)");
-  const auto start = std::chrono::steady_clock::now();
-  renodx::utils::scene::CapturedMesh mesh;
-  std::string error;
-  const bool captured =
-      renodx::utils::scene::CaptureDrawIndexed(device, queue, ToSceneRecord(request.draw), &mesh, &error)
-      && !mesh.positions.empty() && !mesh.triangles.empty();
-  const double elapsed_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-  const size_t triangles = mesh.triangles.size();
-  const uint64_t vb_bytes = mesh.vertex_buffer_size;
-  const uint64_t ib_bytes = mesh.index_buffer_size;
+  *min_vertex = static_cast<uint32_t>(lowest);
+  *max_vertex = static_cast<uint32_t>(highest);
+  return nullptr;
+}
 
-  stage.Set("present: mesh capture (apply)");
-  const char* outcome = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    g_pool.capture_serial = 0u;
-    g_pool.capturing_vb = 0u;
-    g_pool.capturing_ib = 0u;
-    outcome = ApplyPoolMeshCapture(request, captured, mesh, error);
+// Vertex read: `bytes` starts at vertex min_vertex. Positions of the vertices
+// the indices use, remapped in first-use order, and the triangles.
+inline const char* DecodePoolMeshVertices(
+    const uint8_t* bytes,
+    uint64_t size,
+    uint32_t stride,
+    int32_t pos_offset,
+    reshade::api::format pos_format,
+    const std::vector<uint32_t>& indices,
+    uint32_t min_vertex,
+    uint32_t max_vertex,
+    PoolDecodedMesh* mesh) {
+  namespace scene = renodx::utils::scene;
+  const scene::FormatInfo* info = scene::FindFormatInfo(pos_format);
+  if (info == nullptr) return "unsupported position format";
+  if (max_vertex < min_vertex || pos_offset < 0) return "bad vertex range";
+  const uint64_t vertex_count = static_cast<uint64_t>(max_vertex) - min_vertex + 1u;
+  if (size < (vertex_count - 1u) * stride + static_cast<uint64_t>(pos_offset) + info->byte_size) {
+    return "vertex copy shorter than the range";
   }
-  if (log) {
-    renodx::utils::log::i("falcom_world::pool: mesh capture #", serial, " end: ", outcome, ", ", triangles,
-                          " triangles, vb ", vb_bytes, " bytes, ib ", ib_bytes, " bytes, ", elapsed_ms, " ms",
-                          error.empty() ? "" : " | error: ", error);
+  std::vector<uint32_t> remap(static_cast<size_t>(vertex_count), UINT32_MAX);
+  mesh->positions.clear();
+  mesh->triangles.clear();
+  mesh->triangles.reserve(indices.size() / 3u);
+  for (size_t i = 0; i + 2u < indices.size(); i += 3u) {
+    std::array<uint32_t, 3> triangle = {0u, 0u, 0u};
+    for (size_t k = 0; k < 3u; ++k) {
+      const uint32_t absolute = indices[i + k];
+      if (absolute < min_vertex || absolute > max_vertex) return "index outside the vertex range";
+      uint32_t& fresh = remap[absolute - min_vertex];
+      if (fresh == UINT32_MAX) {
+        float position[4] = {};
+        const uint8_t* vertex = bytes + static_cast<uint64_t>(absolute - min_vertex) * stride + pos_offset;
+        if (!scene::DecodeAttribute(vertex, *info, position) || !std::isfinite(position[0])
+            || !std::isfinite(position[1]) || !std::isfinite(position[2])) {
+          return "vertex position not decodable";
+        }
+        fresh = static_cast<uint32_t>(mesh->positions.size());
+        mesh->positions.push_back({position[0], position[1], position[2]});
+      }
+      triangle[k] = fresh;
+    }
+    mesh->triangles.push_back(triangle);
   }
+  if (mesh->positions.empty()) return "no vertices decoded";
+  mesh->bbox_min = mesh->positions[0];
+  mesh->bbox_max = mesh->positions[0];
+  for (const auto& position : mesh->positions) {
+    for (int k = 0; k < 3; ++k) {
+      mesh->bbox_min[k] = (std::min)(mesh->bbox_min[k], position[k]);
+      mesh->bbox_max[k] = (std::max)(mesh->bbox_max[k], position[k]);
+    }
+  }
+  if (mesh->bbox_min == mesh->bbox_max) return "decoded bounding box is degenerate";
+  return nullptr;
 }
 
 // Writes the switch states to ReShade.log while "Log mesh captures" is on, so
@@ -1454,6 +1801,24 @@ struct PoolResolvedCopy {
   uint32_t args[5] = {};    // indirect: index_count, instance_count, first_index, vertex_offset, first_instance
 };
 
+// One mesh copy being read: what decoding needs from its request (taken when
+// the slot is read, so decoding runs without the lock) and the result.
+struct PoolMeshJob {
+  PoolMeshCopy copy;
+  bool queued = false;  // a request with this serial existed when the slot was read
+  uint32_t index_size = 0u;
+  uint32_t index_count = 0u;
+  int32_t vertex_offset = 0;
+  uint32_t stride = 0u;
+  int32_t pos_offset = 0;
+  reshade::api::format pos_format = reshade::api::format::unknown;
+  std::vector<uint32_t> indices;  // index read: output; vertex read: moved from the request
+  uint32_t min_vertex = 0u;
+  uint32_t max_vertex = 0u;
+  const char* error = nullptr;
+  PoolDecodedMesh mesh;
+};
+
 // Caller holds g_pool.mutex.
 inline void CountPoolMatrixReject(PoolFamilyStats& family, PoolMatrixReject reject, const float* world) {
   g_pool.stats.rejected_matrix += 1u;
@@ -1468,41 +1833,84 @@ inline void CountPoolMatrixReject(PoolFamilyStats& family, PoolMatrixReject reje
   }
 }
 
+// Window for the next copy of an indirect draw: what it drew last time plus
+// a margin, a small window when it drew nothing, at least double the last
+// window when that one was too small; rounded up, at most kPoolIndirectWindow.
+inline uint32_t NextPoolIndirectWindow(uint32_t instance_count, uint32_t window) {
+  uint32_t next = kPoolIndirectEmptyWindow;
+  if (instance_count != 0u) {
+    next = instance_count + instance_count / 4u + kPoolIndirectWindowStep;
+    if (instance_count > window) next = (std::max)(next, window * 2u);
+  }
+  next = (std::min)(next, kPoolIndirectWindow);
+  return (next + kPoolIndirectWindowStep - 1u) / kPoolIndirectWindowStep * kPoolIndirectWindowStep;
+}
+
 // Reads one staging slot that the GPU finished two presents ago and applies
-// its copies. The map happens without holding g_pool.mutex so recording
-// threads are not blocked; the slot is flagged `resolving` meanwhile.
+// its copies. Mapping and mesh decoding happen without holding g_pool.mutex
+// so recording threads are not blocked; the slot is flagged `resolving`
+// meanwhile.
 inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
-  PoolStageScope stage("present: resolve (map)");
+  PoolStageScope stage("present: resolve (take)");
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
+  std::vector<PoolMeshJob> jobs;
   reshade::api::resource buffer = {0u};
+  reshade::api::resource mesh_buffer = {0u};
   uint64_t used = 0u;
+  uint64_t mesh_used = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolStagingSlot& slot = g_pool.slots[slot_index];
-    if (slot.copies.empty()) {
+    if (slot.copies.empty() && slot.mesh_copies.empty()) {
       slot.used = 0u;
+      slot.mesh_used = 0u;
       slot.indirect_draws.clear();
       return;
     }
     copies.swap(slot.copies);
     indirect_draws.swap(slot.indirect_draws);
+    jobs.reserve(slot.mesh_copies.size());
+    for (const PoolMeshCopy& copy : slot.mesh_copies) {
+      PoolMeshJob job;
+      job.copy = copy;
+      const auto request = g_pool.mesh_requests.find(copy.mesh_key);
+      if (request != g_pool.mesh_requests.end() && request->second.serial == copy.serial) {
+        PoolMeshRequest& queued = request->second;
+        job.queued = true;
+        job.index_size = queued.draw.index_size;
+        job.index_count = queued.draw.index_count;
+        job.vertex_offset = queued.draw.vertex_offset;
+        job.stride = queued.draw.vb_stride;
+        job.pos_offset = queued.pos_offset;
+        job.pos_format = queued.pos_format;
+        job.min_vertex = queued.min_vertex;
+        job.max_vertex = queued.max_vertex;
+        if (copy.phase == PoolMeshPhase::Vertices) job.indices = std::move(queued.indices);
+      }
+      jobs.push_back(std::move(job));
+    }
+    slot.mesh_copies.clear();
     buffer = slot.buffer;
     used = slot.used;
+    mesh_buffer = slot.mesh_buffer;
+    mesh_used = slot.mesh_used;
     slot.resolving = true;
   }
   const auto is_indirect = [&indirect_draws](const PoolPendingCopy& copy) {
     return copy.indirect_index != UINT32_MAX && copy.indirect_index < indirect_draws.size();
   };
 
+  stage.Set("present: resolve (map)");
   std::vector<PoolResolvedCopy> resolved(copies.size());
   std::vector<float> worlds;  // kPoolWorldFloats per instance of verified copies
   std::vector<uint8_t> moving;
   void* mapped = nullptr;
-  const bool mapped_ok = buffer.handle != 0u && used != 0u
-                         && device->map_buffer_region(buffer, 0u, used, reshade::api::map_access::read_only, &mapped)
-                         && mapped != nullptr;
-  if (mapped_ok) {
+  const bool mapped_ok = copies.empty()
+                         || (buffer.handle != 0u && used != 0u
+                             && device->map_buffer_region(buffer, 0u, used, reshade::api::map_access::read_only, &mapped)
+                             && mapped != nullptr);
+  if (mapped_ok && !copies.empty()) {
     const auto* bytes = static_cast<const uint8_t*>(mapped);
     for (size_t i = 0; i < copies.size(); ++i) {
       const PoolPendingCopy& copy = copies[i];
@@ -1529,76 +1937,166 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     device->unmap_buffer_region(buffer);
   }
 
+  // Mesh copies are decoded straight from the mapped staging.
+  stage.Set("present: resolve (decode meshes)");
+  void* mesh_mapped = nullptr;
+  const bool meshes_ok = jobs.empty()
+                         || (mesh_buffer.handle != 0u && mesh_used != 0u
+                             && device->map_buffer_region(mesh_buffer, 0u, mesh_used, reshade::api::map_access::read_only,
+                                                          &mesh_mapped)
+                             && mesh_mapped != nullptr);
+  if (meshes_ok && !jobs.empty()) {
+    const auto* bytes = static_cast<const uint8_t*>(mesh_mapped);
+    for (PoolMeshJob& job : jobs) {
+      if (!job.queued) continue;
+      const uint8_t* data = bytes + job.copy.staging_offset + job.copy.skip;
+      if (job.copy.phase == PoolMeshPhase::Indices) {
+        job.error = DecodePoolMeshIndices(data, job.copy.size, job.index_size, job.index_count, job.vertex_offset,
+                                          job.stride, &job.indices, &job.min_vertex, &job.max_vertex);
+      } else {
+        job.error = DecodePoolMeshVertices(data, job.copy.size, job.stride, job.pos_offset, job.pos_format, job.indices,
+                                           job.min_vertex, job.max_vertex, &job.mesh);
+      }
+    }
+    device->unmap_buffer_region(mesh_buffer);
+  }
+
   stage.Set("present: resolve (apply)");
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  PoolStagingSlot& slot = g_pool.slots[slot_index];
-  slot.resolving = false;
-  slot.used = 0u;
-  if (!mapped_ok) {
-    g_pool.stats.map_failures += 1u;
-    for (const DrawRecord& draw : indirect_draws) ReleasePoolIndirectRefs(draw);
-    return;
-  }
-  for (size_t i = 0; i < copies.size(); ++i) {
-    const PoolPendingCopy& copy = copies[i];
-    const PoolResolvedCopy& result = resolved[i];
-    PoolFamilyStats& family = g_pool.families[copy.vs_hash];
-    const bool indirect = is_indirect(copy);
-    const bool buffers_dead = indirect && ReleasePoolIndirectRefs(indirect_draws[copy.indirect_index]);
-    if (!result.verified) {
-      g_pool.stats.base_mismatch += 1u;
-      g_pool.stats.last_mismatch_cpu = copy.cpu_base;
-      g_pool.stats.last_mismatch_gpu = result.gpu_base;
-      family.base_mismatch += 1u;
-      continue;
-    }
-    g_pool.stats.base_verified += 1u;
+  const bool log = g_pool.log_captures.load(std::memory_order_relaxed);
+  const uint32_t frame = g_state.frame.load();
+  std::vector<std::string> log_lines;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    PoolStagingSlot& slot = g_pool.slots[slot_index];
+    slot.resolving = false;
+    slot.used = 0u;
+    slot.mesh_used = 0u;
 
-    uint64_t mesh_key = copy.mesh_key;
-    if (indirect) {
-      g_pool.stats.indirect_resolved += 1u;
-      const uint32_t index_count = result.args[0];
-      const uint32_t instance_count = result.args[1];
-      if (index_count == 0u || instance_count == 0u) {
-        g_pool.stats.indirect_empty += 1u;
-        continue;
+    // Meshes first, so instances read in this slot can admit right away.
+    if (!meshes_ok) g_pool.stats.map_failures += 1u;
+    for (PoolMeshJob& job : jobs) {
+      const auto request = g_pool.mesh_requests.find(job.copy.mesh_key);
+      const bool current = job.queued && request != g_pool.mesh_requests.end()
+                           && request->second.serial == job.copy.serial;
+      const char* outcome = nullptr;
+      if (!current) {
+        g_pool.stats.mesh_dropped += 1u;
+        outcome = "dropped (mesh released or re-queued)";
+      } else if (!meshes_ok) {
+        // Staging not readable: back in line for another copy.
+        PoolMeshRequest& queued = request->second;
+        if (job.copy.phase == PoolMeshPhase::Vertices) queued.indices = std::move(job.indices);
+        queued.in_flight = false;
+        AddPoolMeshWaiting(queued);
+        outcome = "staging not readable, copy again";
+      } else if (job.error != nullptr) {
+        FailPoolMesh(request, job.error);
+        outcome = job.error;
+      } else if (job.copy.phase == PoolMeshPhase::Indices) {
+        PoolMeshRequest& queued = request->second;
+        queued.indices = std::move(job.indices);
+        queued.min_vertex = job.min_vertex;
+        queued.max_vertex = job.max_vertex;
+        queued.phase = PoolMeshPhase::Vertices;
+        queued.in_flight = false;
+        queued.last_frame = frame;
+        AddPoolMeshWaiting(queued);
+        outcome = "read, vertex copy next";
+      } else {
+        const PoolMeshRequest& queued = request->second;
+        outcome = ApplyPoolMesh(queued.mesh_key, queued.vs_hash, job.mesh);
+        g_pool.mesh_requests.erase(request);
       }
-      if (index_count < 3u || (index_count % 3u) != 0u) {
-        g_pool.stats.draw_state[static_cast<size_t>(PoolDrawState::IndexCount)] += 1u;
-        family.draw_state[static_cast<size_t>(PoolDrawState::IndexCount)] += 1u;
-        continue;
+      if (log) {
+        namespace log_utils = renodx::utils::log;
+        std::string line = log_utils::BuildString(
+            "falcom_world::pool: mesh ", log_utils::AsHex(job.copy.mesh_key), " ", PoolMeshPhaseName(job.copy.phase),
+            " read: frame ", frame, " | ", outcome);
+        if (current && job.error == nullptr && meshes_ok) {
+          if (job.copy.phase == PoolMeshPhase::Indices) {
+            line += log_utils::BuildString(" | ", job.index_count, " indices, vertices ", job.min_vertex, "..",
+                                           job.max_vertex);
+          } else {
+            line += log_utils::BuildString(" | ", job.mesh.triangles.size(), " triangles");
+          }
+        }
+        log_lines.push_back(std::move(line));
       }
-      if (instance_count > copy.count) g_pool.stats.indirect_truncated += 1u;
-      if (buffers_dead) {
-        g_pool.stats.indirect_dead += 1u;
-        continue;
-      }
-      DrawRecord record = indirect_draws[copy.indirect_index];
-      record.index_count = index_count;
-      record.instance_count = instance_count;
-      record.first_index = result.args[2];
-      record.vertex_offset = static_cast<int32_t>(result.args[3]);
-      record.first_instance = result.args[4];
-      mesh_key = PoolMeshKey(record);
-      QueuePoolMesh(mesh_key, copy.vs_hash, record);
     }
 
-    for (uint32_t element = 0; element < result.count; ++element) {
-      const size_t index = result.first_world + element;
-      const float* world = worlds.data() + index * kPoolWorldFloats;
-      g_pool.stats.instances_seen += 1u;
-      family.instances_seen += 1u;
-      if (moving[index] != 0u) g_pool.stats.moving_instances += 1u;
-      const PoolMatrixReject reject = CheckPoolWorld(world);
-      if (reject != PoolMatrixReject::None) {
-        CountPoolMatrixReject(family, reject, world);
+    if (!mapped_ok) {
+      g_pool.stats.map_failures += 1u;
+      for (const DrawRecord& draw : indirect_draws) ReleasePoolIndirectRefs(draw);
+      copies.clear();
+    }
+    for (size_t i = 0; i < copies.size(); ++i) {
+      const PoolPendingCopy& copy = copies[i];
+      const PoolResolvedCopy& result = resolved[i];
+      PoolFamilyStats& family = g_pool.families[copy.vs_hash];
+      const bool indirect = is_indirect(copy);
+      const bool buffers_dead = indirect && ReleasePoolIndirectRefs(indirect_draws[copy.indirect_index]);
+      if (!result.verified) {
+        g_pool.stats.base_mismatch += 1u;
+        g_pool.stats.last_mismatch_cpu = copy.cpu_base;
+        g_pool.stats.last_mismatch_gpu = result.gpu_base;
+        family.base_mismatch += 1u;
         continue;
       }
-      ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame);
+      g_pool.stats.base_verified += 1u;
+
+      uint64_t mesh_key = copy.mesh_key;
+      if (indirect) {
+        g_pool.stats.indirect_resolved += 1u;
+        const uint32_t index_count = result.args[0];
+        const uint32_t instance_count = result.args[1];
+        // The args decide the next window of this draw identity.
+        const auto schedule = g_pool.schedule.find(copy.schedule_key);
+        if (schedule != g_pool.schedule.end()) {
+          schedule->second.indirect_window = NextPoolIndirectWindow(index_count == 0u ? 0u : instance_count, copy.count);
+        }
+        if (index_count == 0u || instance_count == 0u) {
+          g_pool.stats.indirect_empty += 1u;
+          continue;
+        }
+        if (index_count < 3u || (index_count % 3u) != 0u) {
+          g_pool.stats.draw_state[static_cast<size_t>(PoolDrawState::IndexCount)] += 1u;
+          family.draw_state[static_cast<size_t>(PoolDrawState::IndexCount)] += 1u;
+          continue;
+        }
+        if (instance_count > copy.count) g_pool.stats.indirect_truncated += 1u;
+        if (buffers_dead) {
+          g_pool.stats.indirect_dead += 1u;
+          continue;
+        }
+        DrawRecord record = indirect_draws[copy.indirect_index];
+        record.index_count = index_count;
+        record.instance_count = instance_count;
+        record.first_index = result.args[2];
+        record.vertex_offset = static_cast<int32_t>(result.args[3]);
+        record.first_instance = result.args[4];
+        mesh_key = PoolMeshKey(record);
+        QueuePoolMesh(mesh_key, copy.vs_hash, record);
+      }
+
+      for (uint32_t element = 0; element < result.count; ++element) {
+        const size_t index = result.first_world + element;
+        const float* world = worlds.data() + index * kPoolWorldFloats;
+        g_pool.stats.instances_seen += 1u;
+        family.instances_seen += 1u;
+        if (moving[index] != 0u) g_pool.stats.moving_instances += 1u;
+        const PoolMatrixReject reject = CheckPoolWorld(world);
+        if (reject != PoolMatrixReject::None) {
+          CountPoolMatrixReject(family, reject, world);
+          continue;
+        }
+        ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame);
+      }
     }
   }
+  for (const std::string& line : log_lines) renodx::utils::log::i(line);
 }
 
+// Caller holds g_pool.mutex.
 inline void PrunePool(uint32_t frame) {
   for (auto it = g_pool.observations.begin(); it != g_pool.observations.end();) {
     if (!it->second.admitted && frame > it->second.last_frame + kPoolPruneAge) {
@@ -1610,6 +2108,19 @@ inline void PrunePool(uint32_t frame) {
   for (auto it = g_pool.schedule.begin(); it != g_pool.schedule.end();) {
     if (frame > it->second.next_frame + kPoolPruneAge) {
       it = g_pool.schedule.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // Meshes not drawn for a while (QueuePoolMesh refreshes last_frame at each
+  // sighting): forget them and their indices; the next sighting queues them
+  // again.
+  for (auto it = g_pool.mesh_requests.begin(); it != g_pool.mesh_requests.end();) {
+    if (frame > it->second.last_frame + kPoolPruneAge) {
+      if (!it->second.in_flight) RemovePoolMeshWaiting(it->second.buffer_key, it->first);
+      g_pool.mesh_queued.erase(it->first);
+      g_pool.stats.mesh_expired += 1u;
+      it = g_pool.mesh_requests.erase(it);
     } else {
       ++it;
     }
@@ -1648,14 +2159,9 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   stage.Set("present: resolve");
   if (resolve_slot != UINT32_MAX) ResolvePoolSlot(device, resolve_slot);
 
-  stage.Set("present: mesh capture");
-  if (g_pool.capture_meshes.load(std::memory_order_relaxed)) {
-    for (uint32_t i = 0; i < kPoolMeshCapturesPerFrame; ++i) CaptureOnePoolMesh(device, queue);
-  }
-
   stage.Set("present: prune");
   uint32_t released = 0u;
-  size_t mesh_queue = 0u;
+  size_t mesh_waiting = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if ((frame % 60u) == 0u) PrunePool(frame);
@@ -1663,11 +2169,11 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     const uint32_t invalidations = g_pool.stats.resource_invalidations;
     released = invalidations >= g_pool.logged_invalidations ? invalidations - g_pool.logged_invalidations : invalidations;
     g_pool.logged_invalidations = invalidations;
-    mesh_queue = g_pool.mesh_queue.size();
+    mesh_waiting = g_pool.stats.mesh_queue;
   }
   if (released != 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
     renodx::utils::log::i("falcom_world::pool: frame ", frame, ": ", released,
-                          " tracked vertex/index buffers released, ", mesh_queue, " mesh captures queued");
+                          " tracked vertex/index buffers released, ", mesh_waiting, " meshes waiting");
   }
 }
 
@@ -1680,9 +2186,12 @@ inline void ResetWorldPool() {
       slot.copies.clear();
       slot.indirect_draws.clear();
       slot.used = 0u;
+      slot.mesh_copies.clear();
+      slot.mesh_used = 0u;
     }
   }
-  g_pool.mesh_queue.clear();
+  g_pool.mesh_requests.clear();
+  g_pool.mesh_waiting.clear();
   g_pool.mesh_queued.clear();
   g_pool.failed_meshes.clear();
   g_pool.mesh_by_key.clear();
@@ -1813,6 +2322,7 @@ inline void DumpWorldPool() {
       << ", \"indirect_empty\": " << stats.indirect_empty
       << ", \"indirect_truncated\": " << stats.indirect_truncated
       << ", \"indirect_dead\": " << stats.indirect_dead
+      << ", \"indirect_window_instances\": " << stats.indirect_window_instances
       << ", \"near_misses\": " << stats.near_misses
       << ", \"base_verified\": " << stats.base_verified
       << ", \"base_mismatch\": " << stats.base_mismatch
@@ -1828,8 +2338,14 @@ inline void DumpWorldPool() {
       << ", \"instance_cap_drops\": " << stats.instance_cap_drops
       << ", \"meshes\": " << stats.meshes
       << ", \"mesh_queue\": " << stats.mesh_queue
-      << ", \"mesh_attempts\": " << stats.mesh_attempts
-      << ", \"destroyed_during_capture\": " << stats.destroyed_during_capture
+      << ", \"mesh_in_flight\": " << stats.mesh_in_flight
+      << ", \"mesh_index_copies\": " << stats.mesh_index_copies
+      << ", \"mesh_vertex_copies\": " << stats.mesh_vertex_copies
+      << ", \"mesh_copy_bytes\": " << stats.mesh_copy_bytes
+      << ", \"mesh_budget_full\": " << stats.mesh_budget_full
+      << ", \"mesh_dropped\": " << stats.mesh_dropped
+      << ", \"mesh_expired\": " << stats.mesh_expired
+      << ", \"mesh_deferred_skips\": " << stats.mesh_deferred_skips
       << ", \"mesh_failures\": " << stats.mesh_failures
       << ", \"mesh_dedup\": " << stats.mesh_dedup
       << ", \"mesh_cap_drops\": " << stats.mesh_cap_drops
