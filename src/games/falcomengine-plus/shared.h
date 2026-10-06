@@ -617,8 +617,9 @@ struct ShaderInjectData {
   float cs_contact_strength;        // [0..1] global blend of the contact term
   float cs_contact_env_strength;    // [0..1] strength on non-character pixels
   float cs_contact_char_strength;   // [0..1] strength on character pixels
-  float cs_contact_sample_count;    // march steps; 4/8/16/32. 8 is the default the
-                                     // reference settled on (same count UE uses).
+  float cs_contact_sample_count;    // march steps; quality tiers 4/8/12/16, default 8
+                                     // (Medium). 8 is the count the reference settled on
+                                     // (same count UE uses).
   float cs_contact_ray_length;      // world units the ray travels [1..200], default 50
   float cs_contact_thickness;       // [0.001..4] world-space occluder thickness
   float cs_contact_bias;            // [0..0.2] minimum penetration before a hit counts
@@ -635,7 +636,8 @@ struct ShaderInjectData {
   // with the per-pixel light count rather than being one full-screen pass.
   float cs_contact_local_enabled;      // 0=Off, 1=On
   float cs_contact_local_strength;     // [0..1]
-  float cs_contact_local_sample_count;  // march steps per local light [2..16], default 4
+  float cs_contact_local_sample_count;  // march steps per local light; quality tiers
+                                        // 4/8/12/16, default 8 (Medium), matching the sun
   float cs_contact_local_ray_length;   // world units [0.1..20], default 2
   float cs_contact_local_max_lights;   // per-pixel light budget [1..16], default 4
 

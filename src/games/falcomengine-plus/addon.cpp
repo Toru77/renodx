@@ -431,7 +431,10 @@ ShaderInjectData shader_injection = {
   .cs_contact_debug = 0.f,
   .cs_contact_local_enabled = 0.f,
   .cs_contact_local_strength = 1.f,
-  .cs_contact_local_sample_count = 4.f,
+  // Medium (8 steps): the local march default moved up from the old raw-slider
+  // default of 4 when the sample count became a quality tier, matching the sun
+  // march above. Keep in sync with ContactShadowsLocalQuality.
+  .cs_contact_local_sample_count = 8.f,
   .cs_contact_local_ray_length = 2.f,
   .cs_contact_local_max_lights = 4.f,
   // Runtime values, written by the addon immediately before the push.
@@ -649,6 +652,16 @@ static float MBQualitySampleCount(float quality) {
     case 3:  return 24.f;  // Ultra
     default: return 16.f;  // Medium
   }
+}
+// -- Contact shadow quality ladder ---------------------------------------------
+// Replaces the raw Sample Count sliders on both the sun and local marches, and
+// backs the .parse() of the two Quality settings below. The stored setting value
+// is a 0-3 index; parse() writes the step count straight into the injected field,
+// so the push block and every shader keep seeing a plain march-step count.
+static float ContactShadowQualitySamples(float quality) {
+  static constexpr float samples[] = {4.f, 8.f, 12.f, 16.f};
+  const int index = static_cast<int>(quality);
+  return samples[index < 0 ? 0 : (index > 3 ? 3 : index)];
 }
 // Height the shaders divide pixel-denominated paper constants by, so a 4K
 // player sees the same blur as a 1080p player. Must match MB_REF_H in
@@ -3136,14 +3149,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 2.f,
       .label = "Mode",
       .section = "Character Shadowing",
-      .tooltip = "Which character shadowing technique runs. Vanilla is the ENGINE's "
-                 "own 10-step camera-facing march, untouched. Custom replaces it with "
-                 "a screen-space contact march along the same camera-facing axis, with "
-                 "a tunable sample count, coverage-based response and IS-FAST dither. "
-                 "Off by default, so the contact and micro terms own character "
-                 "shadowing unless you deliberately want a character term as well. "
-                 "Hidden on Kyoto, which has no character lighting pass, and on "
-                 "Daybreak 2, which is out of scope for this add-on.",
+      .tooltip = "Off = Disables Screen Space Shadows on characters. Vanilla = Falcom Algorithm. Custom = Customized algorithm.",
       .labels = {"Off", "Vanilla", "Custom"},
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
@@ -4531,10 +4537,7 @@ renodx::utils::settings::Settings settings = {
       .key = "ContactShadowsEnabled", .binding = &shader_injection.cs_contact_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Contact Shadows", .section = "Contact Shadows",
-      .tooltip = "A clip-space depth march from each surface toward the light, jittered with "
-                 "IS-FAST blue noise and resolved by the game's TAA. This is the term that "
-                 "grounds characters and props; Micro Shadows only handles the soft "
-                 "ambient half.",
+      .tooltip = "Contact Shadows add subtle shadows where objects and characters meet the ground, making them feel more naturally connected to their surroundings.",
       .labels = {"Off", "On"},
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
@@ -4556,14 +4559,25 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsSamples", .binding = &shader_injection.cs_contact_sample_count,
+      // Deliberately a different key from the old raw "ContactShadowsSamples"
+      // slider. That setting stored the step count itself; this one stores a 0-3
+      // quality INDEX, so a saved preset holding 32 would be clamped into the
+      // index range and silently resolve to Ultra. Renaming orphans the stale
+      // value instead, so the tiers start clean at their default. Same reasoning
+      // as DOFQuality.
+      .key = "ContactShadowsQuality", .binding = &shader_injection.cs_contact_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 8.f, .label = "Sample Count", .section = "Contact Shadows",
-      .tooltip = "March steps. 8 is what the reference settled on, and the same order "
-                 "Unreal uses. Beyond 16 the gain is small and the cost is linear.",
-      .min = 1.f, .max = 32.f, .format = "%d",
+      .default_value = 1.f, .label = "Quality", .section = "Contact Shadows",
+      .tooltip = "March quality: Low 4, Medium 8, High 12, Ultra 16 steps. Higher "
+                 "tiers resolve a cleaner contact term at linearly higher cost.",
+      .labels = {"Low", "Medium", "High", "Ultra"},
+      // .min must be 0: with .labels, GetMax() is labels.size() - 1, and a .min of
+      // 1 would clamp a saved "Low" (0) up to Medium and make Low unreachable
+      // across restarts.
+      .min = 0.f,
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .parse = [](float value) { return ContactShadowQualitySamples(value); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsRayLength", .binding = &shader_injection.cs_contact_ray_length,
@@ -4609,12 +4623,12 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "How strong the contact shadow reads, relative to the ORIGINAL "
                  "4-sample contact shadow appearance. This is NOT a physically based "
                  "parameter and 4 is not a physical unit: 4 is simply the sample count "
-                 "whose average appearance is being reproduced, so that Sample Count can "
-                 "be a pure quality control. At Sample Count 4 and scale 4 the march "
-                 "reproduces the old any-hit test exactly, value for value. Raise this "
-                 "for a darker contact, lower it for a lighter one; Sample Count then "
-                 "only changes how noisy the result is, not how wide or how dark it is. "
-                 "Defaults to 4.",
+                 "whose average appearance is being reproduced, so that the Quality "
+                 "setting can be a pure quality control. At Quality Low (4 steps) and "
+                 "scale 4 the march reproduces the old any-hit test exactly, value for "
+                 "value. Raise this for a darker contact, lower it for a lighter one; "
+                 "Quality then only changes how noisy the result is, not how wide or "
+                 "how dark it is. Defaults to 4.",
       .min = 0.f, .max = 8.f, .format = "%.1f",
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -4681,10 +4695,7 @@ renodx::utils::settings::Settings settings = {
       .key = "ContactShadowsLocalEnabled", .binding = &shader_injection.cs_contact_local_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Local Lights", .section = "Contact Shadows",
-      .tooltip = "Extends the contact march to point and spot lights, evaluated inside the "
-                 "dynamic light loop. Off by default: it is per-light work in a pixel "
-                 "shader, so the cost scales with the per-pixel light count instead of being "
-                 "one full-screen pass.",
+      .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
@@ -4745,14 +4756,20 @@ renodx::utils::settings::Settings settings = {
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
-      .key = "ContactShadowsLocalSamples", .binding = &shader_injection.cs_contact_local_sample_count,
+      // Key renamed with the slider-to-tier change, same reasoning as
+      // ContactShadowsQuality above. The default is also new: Medium (8 steps)
+      // rather than the old raw slider's 4.
+      .key = "ContactShadowsLocalQuality", .binding = &shader_injection.cs_contact_local_sample_count,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 4.f, .label = "Local Sample Count", .section = "Contact Shadows",
-      .tooltip = "March steps per local light. Keep this low: it is paid once per light, per "
-                 "pixel.",
-      .min = 2.f, .max = 16.f, .format = "%d",
+      .default_value = 1.f, .label = "Local Quality", .section = "Contact Shadows",
+      .tooltip = "March quality per local light: Low 4, Medium 8, High 12, Ultra 16 "
+                 "steps. Paid once per light, per pixel, so higher tiers cost more "
+                 "here than the sun march's equivalents in a crowded scene.",
+      .labels = {"Low", "Medium", "High", "Ultra"},
+      .min = 0.f,
       .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
-      .is_visible = []() { return IsAdvancedSettingsMode(); },
+      .parse = [](float value) { return ContactShadowQualitySamples(value); },
+      .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalRayLength", .binding = &shader_injection.cs_contact_local_ray_length,
