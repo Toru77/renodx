@@ -2,15 +2,19 @@
 
 // Phase 1 world BVH runtime entry.
 //
-// M1 provides the persistent CPU world pool; M2a uploads it to GPU buffers and
-// exposes the reconstruction debug view. The present hook drives both the
-// upload/revision handling and the debug pass. M3+ adds BLAS/TLAS here.
+// The pool admits geometry by bytecode shader class (bvh_pool.hpp); M2a
+// uploads it to GPU buffers and exposes the reconstruction debug view. The
+// present hook drives both the upload/revision handling and the debug pass.
+// M3+ adds BLAS/TLAS here.
 //
 // The whole module remains DevKit-gated through falcom_world::Use.
 
 #include <Windows.h>
 #include <shellapi.h>
 
+#include <string>
+
+#include "../contract/shader_registry.hpp"
 #include "bvh_debug.hpp"
 #include "bvh_pool.hpp"
 
@@ -26,11 +30,13 @@ inline void Use(DWORD fdw_reason) {
     case DLL_PROCESS_ATTACH:
       LoadWorldRecipes();
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
       reshade::register_event<reshade::addon_event::present>(OnWorldPresentBvh);
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
       reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentBvh);
       break;
@@ -39,61 +45,107 @@ inline void Use(DWORD fdw_reason) {
   }
 }
 
+// Appends "label count" pairs for non-zero counts, so long breakdowns stay
+// readable in the panel.
+inline void AppendPoolCount(std::string* text, const char* label, uint64_t count) {
+  if (count == 0u) return;
+  if (!text->empty()) text->append("  ");
+  text->append(label);
+  text->push_back(' ');
+  text->append(std::to_string(count));
+}
+
 inline void DrawBvhPanel() {
-  ImGui::TextDisabled("Phase 1: persistent world pool + GPU reconstruction (runtime_verified structured-instance families).");
+  ImGui::TextDisabled("Pool admits draws whose vertex shader the bytecode classifier marks rigid and whose pixel shader does not alpha-test.");
 
   bool scan = g_pool.scan_active.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Pool Scan", &scan)) {
     g_pool.scan_active.store(scan, std::memory_order_relaxed);
+    RefreshPoolCaptureRequest();
   }
   ImGui::SameLine();
   ImGui::SetNextItemWidth(150.f);
   ImGui::SliderFloat("Region (m)", &g_pool.region_size, kPoolRegionMinSize, kPoolRegionMaxSize, "%.0f");
 
+  const contract::RegistryCounts registry = contract::SnapshotRegistryCounts();
   PoolStats stats;
   PoolRegion region;
-  size_t queued = 0u;
-  size_t mesh_queue = 0u;
   float camera[3] = {};
   const bool camera_valid = PoolCameraPosition(camera);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     UpdatePoolStats();
     stats = g_pool.stats;
-    queued = g_pool.pending_snapshots.size();
-    mesh_queue = g_pool.mesh_queue.size();
     region = CurrentPoolRegion();
   }
 
-  ImGui::Text("Pending snapshots: %llu  Meshes queued: %llu  Meshes captured: %llu",
-              static_cast<unsigned long long>(queued),
-              static_cast<unsigned long long>(mesh_queue),
-              static_cast<unsigned long long>(stats.meshes));
-  ImGui::Text("Observed instances: %llu  Admitted: %llu  In region: %llu",
+  std::string vertex_classes;
+  for (size_t i = 0; i < registry.vertex.size(); ++i) {
+    AppendPoolCount(&vertex_classes, contract::VsClassName(static_cast<contract::VsClass>(i)), registry.vertex[i]);
+  }
+  std::string pixel_classes;
+  for (size_t i = 0; i < registry.pixel.size(); ++i) {
+    AppendPoolCount(&pixel_classes, contract::PsClassName(static_cast<contract::PsClass>(i)), registry.pixel[i]);
+  }
+  ImGui::Text("Vertex shaders: %s", vertex_classes.empty() ? "none yet" : vertex_classes.c_str());
+  ImGui::Text("Pixel shaders: %s", pixel_classes.empty() ? "none yet" : pixel_classes.c_str());
+
+  std::string draw_classes;
+  for (size_t i = 0; i < stats.draws_by_vs_class.size(); ++i) {
+    AppendPoolCount(&draw_classes, contract::VsClassName(static_cast<contract::VsClass>(i)), stats.draws_by_vs_class[i]);
+  }
+  std::string skips;
+  for (size_t i = static_cast<size_t>(PoolSkip::DrawState); i < stats.skips.size(); ++i) {
+    AppendPoolCount(&skips, PoolSkipName(static_cast<PoolSkip>(i)), stats.skips[i]);
+  }
+  AppendPoolCount(&skips, "indirect", stats.skipped_indirect);
+  ImGui::Text("Draws scanned: %s", draw_classes.empty() ? "none" : draw_classes.c_str());
+  ImGui::Text("Rigid draws skipped: %s", skips.empty() ? "none" : skips.c_str());
+
+  const ImVec4 base_color = stats.base_mismatch == 0u ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
+  ImGui::Text("Copied draws: %llu", static_cast<unsigned long long>(stats.copied_draws));
+  ImGui::SameLine();
+  ImGui::TextColored(base_color, "b1 verified %llu  mismatch %llu",
+                     static_cast<unsigned long long>(stats.base_verified),
+                     static_cast<unsigned long long>(stats.base_mismatch));
+  if (stats.base_mismatch != 0u) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(last cpu %d gpu %d)", stats.last_mismatch_cpu, stats.last_mismatch_gpu);
+  }
+  if (stats.map_failures != 0u || stats.staging_failures != 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Readback map failures %u  staging failures %u",
+                       stats.map_failures, stats.staging_failures);
+  }
+  ImGui::Text("Instances: seen %llu  observed %llu  admitted %llu  in region %llu",
+              static_cast<unsigned long long>(stats.instances_seen),
               static_cast<unsigned long long>(stats.observed),
               static_cast<unsigned long long>(stats.admitted),
               static_cast<unsigned long long>(stats.region));
-  ImGui::Text("Skipped unverified: %u  non-instance: %u  satisfied: %u  drops: %u  copy drops: %u  no base: %u  beyond snapshot: %u  mesh failures: %u",
-              stats.skipped_unverified,
-              stats.skipped_non_instance,
-              stats.skipped_satisfied,
-              stats.queue_drops,
-              stats.copy_drops,
-              stats.skipped_no_base,
-              stats.skipped_beyond_snapshot,
-              stats.mesh_failures);
-  ImGui::Text("Gate skips: non-candidate: %u  no SRV: %u  slot invalid: %u  no buffer: %u  indirect drops: %llu",
-              stats.skipped_not_candidate,
-              stats.skipped_no_srv,
-              stats.skipped_slot_invalid,
-              stats.skipped_no_buffer,
-              static_cast<unsigned long long>(IndirectDroppedCalls()));
+  ImGui::Text("Instance rejects: bad matrix %llu  bad bounds %u  duplicates %u  cap %u   (moving at draw: %llu)",
+              static_cast<unsigned long long>(stats.rejected_matrix),
+              stats.rejected_bounds,
+              stats.dedup_instances,
+              stats.instance_cap_drops,
+              static_cast<unsigned long long>(stats.moving_instances));
+  ImGui::Text("Meshes: captured %llu  queued %llu  same-content merges %u  failures %u  cap %u",
+              static_cast<unsigned long long>(stats.meshes),
+              static_cast<unsigned long long>(stats.mesh_queue),
+              stats.mesh_dedup,
+              stats.mesh_failures,
+              stats.mesh_cap_drops);
+  ImGui::Text("Retired by buffer release: meshes %u  instances %u  (buffer events %u)",
+              stats.meshes_retired,
+              stats.instances_retired,
+              stats.resource_invalidations);
+  if (!stats.last_mesh_error.empty()) {
+    ImGui::TextDisabled("Last mesh capture error: %s", stats.last_mesh_error.c_str());
+  }
   if (camera_valid) {
     ImGui::Text("Camera: %.1f %.1f %.1f   Region cell min: %.0f %.0f %.0f",
                 camera[0], camera[1], camera[2],
                 region.min[0], region.min[1], region.min[2]);
   } else {
-    ImGui::TextDisabled("Camera position unavailable (viewInv not captured yet).");
+    ImGui::TextDisabled("Camera position unavailable (lighting pass not seen yet).");
   }
 
   bool do_dump = false;
@@ -113,7 +165,7 @@ inline void DrawBvhPanel() {
   if (do_dump_obj) DumpWorldPoolObj();
   if (do_reset) ResetWorldPool();
 
-  ImGui::SeparatorText("Recipes");
+  ImGui::SeparatorText("Research Recipes (not used by the pool)");
   if (ImGui::Button("Save Recipes")) SaveWorldRecipes();
   ImGui::SameLine();
   if (ImGui::Button("Load Recipes")) LoadWorldRecipes();
@@ -129,6 +181,7 @@ inline void DrawBvhPanel() {
   const char* modes = "Off\0Instance ID\0Mesh ID\0World Position\0Flat Normal\0Instance AABB\0Shaded\0BVH Trace (Shaded)\0BVH Trace (Instance ID)\0";
   if (ImGui::Combo("GPU Debug", &mode, modes)) {
     g_bvh_debug.mode.store(mode, std::memory_order_relaxed);
+    RefreshPoolCaptureRequest();
     if (mode >= 7) g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
   }
   ImGui::SameLine();

@@ -495,7 +495,15 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
     active = ComputeActiveIndices(instances, region);
     revision = g_pool.revision;
   }
-  if (meshes.empty() || instances.empty()) return false;
+  if (meshes.empty() || instances.empty()) {
+    // An emptied pool (Reset, or every mesh retired after a map change) must
+    // not leave the previous upload on screen or in the BVH.
+    data->ready = false;
+    data->bvh_ready = false;
+    data->uploaded_revision = revision;
+    data->build_status = "pool empty";
+    return false;
+  }
   BuildDrawGroups(meshes, instances, active, &grouped, &draw_groups);
 
   std::vector<float> vertices;

@@ -111,8 +111,6 @@ struct PendingIndirectDraw {
   uint32_t stride = 0u;
   uint64_t staging_offset = 0u;
   uint64_t read_size = 0u;
-  uint64_t cb_staging_offset = 0u;
-  uint32_t cb_size = 0u;
   WorldCommandListData cl_data = {};
 };
 

@@ -7,6 +7,12 @@
 // and descriptors are buffer_range. Shader-resource binds use
 // descriptor_type::shader_resource_view with resource_view descriptors.
 // Both carry absolute register indices on this backend.
+//
+// Tracking runs whenever the module is attached, not only while a capture
+// toggle is on: the pool copies from the tracked t15/b1 resources, and a
+// binding missed during a gap would leave a stale handle that may name a
+// destroyed buffer. Null binds clear the slot, and a deferred context's
+// bindings are dropped when its recording finishes (its state resets).
 
 #include "../world_state.hpp"
 
@@ -37,6 +43,11 @@ inline void OnDestroyWorldCommandList(reshade::api::command_list* cmd_list) {
   renodx::utils::data::Delete<WorldCommandListData>(cmd_list);
 }
 
+inline void OnResetWorldCommandList(reshade::api::command_list* cmd_list) {
+  auto* data = GetWorldCommandListData(cmd_list);
+  if (data != nullptr) *data = {};
+}
+
 inline void OnPushDescriptorsWorld(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -45,7 +56,6 @@ inline void OnPushDescriptorsWorld(
     const reshade::api::descriptor_table_update& update) {
   (void)layout;
   (void)param_index;
-  if (!CensusEnabled()) return;
   if (update.count == 0u || update.descriptors == nullptr) return;
 
   auto* data = GetWorldCommandListData(cmd_list);
@@ -62,7 +72,6 @@ inline void OnPushDescriptorsWorld(
       const uint32_t slot = update.binding + i;
       if (slot >= kCbSlotCapacity) continue;
       const reshade::api::resource resource = ranges[i].buffer;
-      if (resource.handle == 0u) continue;
       if (vertex_stage) data->vs_cb[slot] = resource;
       if (pixel_stage) data->ps_cb[slot] = resource;
     }

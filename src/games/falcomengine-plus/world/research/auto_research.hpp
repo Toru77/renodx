@@ -238,10 +238,6 @@ inline void StartAutoResearch() {
     state.arm_windows += 1u;
   }
   state.arm_set_size = static_cast<uint32_t>(g_state.arm_vs_set.size());
-  // The pool must see the same draws the research pass does; keep the scan on
-  // for the whole run so families verified here cannot be missed by a closed
-  // scan window. The Pool Scan checkbox still allows a manual override.
-  bvh::g_pool.scan_active.store(true, std::memory_order_relaxed);
   g_state.status = "auto research started: " + std::to_string(state.queue.size()) + " families";
 }
 

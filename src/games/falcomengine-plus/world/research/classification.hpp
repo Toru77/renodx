@@ -48,16 +48,12 @@ inline bool IsLightingHash(uint32_t hash) {
   return hash == kLightingHashSora2nd;
 }
 
-// relaxed=true is the pool gate: depth-only prepass draws have no color
-// target and often no pixel shader, yet Auto Research verifies families from
-// them too, and the pool dedupes the duplicate geometry on MeshKey/InstanceKey
-// instead of excluding the pass.
-inline bool IsGeometryCandidate(const DrawRecord& draw, bool relaxed = false) {
+inline bool IsGeometryCandidate(const DrawRecord& draw) {
   if (draw.ps_hash != 0u && IsKnownNonGeometryPs(draw.ps_hash)) return false;
-  if (!relaxed && draw.ps_hash == 0u) return false;
+  if (draw.ps_hash == 0u) return false;
   if (draw.has_skin_inputs) return false;
   if (draw.vb.handle == 0u || draw.dsv.handle == 0u || draw.method != 1u || !draw.has_index_buffer) return false;
-  if (!relaxed && draw.rtv0.handle == 0u) return false;
+  if (draw.rtv0.handle == 0u) return false;
   if (draw.index_count < 3u || (draw.index_count % 3u) != 0u) return false;
   if (draw.blend_enable || !draw.depth_enable || !draw.depth_write) return false;
   if (draw.topology != reshade::api::primitive_topology::undefined

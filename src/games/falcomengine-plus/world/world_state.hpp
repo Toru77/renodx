@@ -105,6 +105,10 @@ struct DrawRecord {
   uint32_t first_instance = 0u;
   uint32_t vs_hash = 0u;
   uint32_t ps_hash = 0u;
+  // Bound shader objects (pipeline handles); the shader registry classifies
+  // them from their bytecode, which is what the pool admits on.
+  uint64_t vs_pipeline = 0u;
+  uint64_t ps_pipeline = 0u;
   reshade::api::resource vb = {0u};
   uint64_t vb_offset = 0u;
   uint32_t vb_stride = 0u;
@@ -483,6 +487,9 @@ struct State {
 
   std::atomic<uint32_t> frame{0u};
   std::atomic<uint32_t> next_serial{0u};
+  // Set by the BVH module while Pool Scan or a GPU debug view needs draws
+  // observed (pool capture, live camera) without the research census.
+  std::atomic_bool pool_capture_requested{false};
   uint32_t draw_counter = 0u;
 
   std::mutex mutex;
@@ -517,6 +524,11 @@ struct State {
 inline State g_state;
 
 inline bool CensusEnabled() { return g_state.setting_enabled > 0.5f; }
+
+// Draw observation runs when the census or the BVH module needs it.
+inline bool CaptureActive() {
+  return CensusEnabled() || g_state.pool_capture_requested.load(std::memory_order_relaxed);
+}
 
 inline uint32_t OverlayMode() {
   const int mode = static_cast<int>(g_state.setting_overlay_mode + 0.5f);

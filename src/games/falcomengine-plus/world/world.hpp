@@ -13,6 +13,8 @@
 #include "world_state.hpp"
 #include "capture/buffer_readback.hpp"
 #include "capture/cb_tracking.hpp"
+#include "capture/cb_value_tracker.hpp"
+#include "contract/shader_registry.hpp"
 #include "capture/state_capture.hpp"
 #include "capture/draw_census.hpp"
 #include "capture/mesh_capture.hpp"
@@ -57,9 +59,14 @@ inline void Use(DWORD fdw_reason, bool supported) {
         renodx::utils::constants::shared.data->capture_constant_buffers = true;
       }
 
+      // Bytecode classifier and b1 mirror: what the BVH pool admits on.
+      contract::RegisterShaderRegistry();
+      RegisterCbTracker();
+
       RegisterCensus();
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
+      reshade::register_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
@@ -75,8 +82,11 @@ inline void Use(DWORD fdw_reason, bool supported) {
       if (!attached) return;
       attached = false;
       bvh::Use(fdw_reason);
+      contract::UnregisterShaderRegistry();
+      UnregisterCbTracker();
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
+      reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);

@@ -325,6 +325,14 @@ inline void RunBvhDebugPass(
   pass.Render(cmd_list, queue);
 }
 
+// Draw observation (pool scan, live camera for the debug views) runs while
+// either needs it, independently of the research census toggle.
+inline void RefreshPoolCaptureRequest() {
+  const bool requested = g_pool.scan_active.load(std::memory_order_relaxed)
+                         || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+  g_state.pool_capture_requested.store(requested, std::memory_order_relaxed);
+}
+
 inline void OnWorldPresentBvh(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -340,6 +348,7 @@ inline void OnWorldPresentBvh(
   auto* device = queue->get_device();
   if (device == nullptr) return;
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
+  RefreshPoolCaptureRequest();
 
   // Persist verified recipes once per Auto Research run so later launches can
   // skip the full verification pass.

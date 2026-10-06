@@ -202,6 +202,8 @@ inline void FillCommonDrawRecord(
   if (shader_state != nullptr) {
     record->vs_hash = renodx::utils::shader::GetCurrentVertexShaderHash(shader_state);
     record->ps_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
+    record->vs_pipeline = shader_state->stage_states[renodx::utils::shader::VERTEX_INDEX].pipeline.handle;
+    record->ps_pipeline = shader_state->stage_states[renodx::utils::shader::PIXEL_INDEX].pipeline.handle;
   }
 
   auto* render_state = renodx::utils::state::GetCurrentState(cmd_list);
@@ -259,12 +261,58 @@ inline void FillCommonDrawRecord(
   }
 }
 
+// Camera and lighting depth come from the lighting pass; the pool region,
+// the GPU debug views and research all read them.
+inline void CaptureLightingInputs(
+    const DrawRecord& record,
+    reshade::api::device* device,
+    reshade::api::command_list* cmd_list,
+    WorldCommandListData* cl_data) {
+  if (!IsLightingHash(record.ps_hash) || cl_data == nullptr) return;
+  bool captured_frame_matches = false;
+  {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    captured_frame_matches = g_state.captured.draw.vs_hash != 0u
+                             && g_state.captured.draw.frame == record.frame;
+  }
+  const reshade::api::resource cb = cl_data->ps_cb[0].handle != 0u ? cl_data->ps_cb[0] : cl_data->vs_cb[0];
+  if (cb.handle != 0u) {
+    const auto bytes = renodx::utils::constants::GetResourceCache(device, cb);
+    if (!bytes.empty()) {
+      std::lock_guard<std::mutex> lock(g_state.mutex);
+      CaptureCameraFromBytes(bytes, record.frame, 1u);
+    }
+  }
+  if (captured_frame_matches && cl_data->ps_cb[0].handle != 0u) {
+    IssueCameraCbCopy(cmd_list, device, cl_data, record.frame);
+  }
+  const reshade::api::resource_view depth_view = cl_data->ps_srv_view[kLightingDepthRegisterSora2nd];
+  const reshade::api::resource depth_resource = cl_data->ps_srv[kLightingDepthRegisterSora2nd];
+  if (depth_view.handle != 0u && depth_resource.handle != 0u) {
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    const auto desc = device->get_resource_desc(depth_resource);
+    if (desc.type == reshade::api::resource_type::texture_2d) {
+      width = desc.texture.width;
+      height = desc.texture.height;
+    }
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    g_state.depth_source.valid = true;
+    g_state.depth_source.frame = record.frame;
+    g_state.depth_source.view = depth_view;
+    g_state.depth_source.resource = depth_resource;
+    g_state.depth_source.width = width;
+    g_state.depth_source.height = height;
+  }
+}
+
 inline void CommitDrawRecord(
     const DrawRecord& record,
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
     WorldCommandListData* cl_data) {
-  {
+  const bool census = CensusEnabled();
+  if (census) {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     if (g_state.ring.size() < kCensusRingSize) {
       g_state.ring.push_back(record);
@@ -291,45 +339,9 @@ inline void CommitDrawRecord(
     family.ps_hashes.insert(record.ps_hash);
   }
 
-  if (IsLightingHash(record.ps_hash) && cl_data != nullptr) {
-    bool captured_frame_matches = false;
-    {
-      std::lock_guard<std::mutex> lock(g_state.mutex);
-      captured_frame_matches = g_state.captured.draw.vs_hash != 0u
-                               && g_state.captured.draw.frame == record.frame;
-    }
-    const reshade::api::resource cb = cl_data->ps_cb[0].handle != 0u ? cl_data->ps_cb[0] : cl_data->vs_cb[0];
-    if (cb.handle != 0u) {
-      const auto bytes = renodx::utils::constants::GetResourceCache(device, cb);
-      if (!bytes.empty()) {
-        std::lock_guard<std::mutex> lock(g_state.mutex);
-        CaptureCameraFromBytes(bytes, record.frame, 1u);
-      }
-    }
-    if (captured_frame_matches && cl_data->ps_cb[0].handle != 0u) {
-      IssueCameraCbCopy(cmd_list, device, cl_data, record.frame);
-    }
-    const reshade::api::resource_view depth_view = cl_data->ps_srv_view[kLightingDepthRegisterSora2nd];
-    const reshade::api::resource depth_resource = cl_data->ps_srv[kLightingDepthRegisterSora2nd];
-    if (depth_view.handle != 0u && depth_resource.handle != 0u) {
-      uint32_t width = 0u;
-      uint32_t height = 0u;
-      const auto desc = device->get_resource_desc(depth_resource);
-      if (desc.type == reshade::api::resource_type::texture_2d) {
-        width = desc.texture.width;
-        height = desc.texture.height;
-      }
-      std::lock_guard<std::mutex> lock(g_state.mutex);
-      g_state.depth_source.valid = true;
-      g_state.depth_source.frame = record.frame;
-      g_state.depth_source.view = depth_view;
-      g_state.depth_source.resource = depth_resource;
-      g_state.depth_source.width = width;
-      g_state.depth_source.height = height;
-    }
-  }
+  CaptureLightingInputs(record, device, cmd_list, cl_data);
 
-  TryCaptureArmedDraw(device, cmd_list, record, cl_data);
+  if (census) TryCaptureArmedDraw(device, cmd_list, record, cl_data);
 }
 
 // Records which constant-buffer and VS SRV slots are bound for a draw so the
@@ -358,7 +370,7 @@ struct WorldDrawCallback {
   template <typename Arguments>
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<Arguments>>
   Record(renodx::utils::command_action::CommandContext<Arguments>& context, uint8_t method) const {
-    if (!CensusEnabled() || context.cmd_list == nullptr) return {};
+    if (!CaptureActive() || context.cmd_list == nullptr) return {};
     auto* device = context.cmd_list->get_device();
     if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return {};
 
@@ -405,7 +417,7 @@ struct WorldDrawCallback {
   // the draw (the buffer can be rewritten later in the frame).
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<renodx::utils::command_action::IndirectArguments>>
   operator()(renodx::utils::command_action::CommandContext<renodx::utils::command_action::IndirectArguments>& context) const {
-    if (!CensusEnabled() || context.cmd_list == nullptr) return {};
+    if (!CaptureActive() || context.cmd_list == nullptr) return {};
     auto* device = context.cmd_list->get_device();
     if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return {};
 
@@ -439,24 +451,11 @@ struct WorldDrawCallback {
     if (read_size == 0u) return {};
 
     auto* cl_data = GetWorldCommandListData(context.cmd_list);
-    reshade::api::resource instance_cb = {0u};
-    uint64_t cb_size = 0u;
-    if (cl_data != nullptr) {
-      instance_cb = cl_data->vs_cb[bvh::kPoolInstanceCbSlot];
-      if (instance_cb.handle != 0u) {
-        const auto desc = device->get_resource_desc(instance_cb);
-        if (desc.type == reshade::api::resource_type::buffer) {
-          cb_size = (std::min)(desc.buffer.size, static_cast<uint64_t>(16u));
-        }
-        if (cb_size < sizeof(int32_t)) cb_size = 0u;
-      }
-    }
-
-    if (IndirectStagingUsed() + read_size + cb_size > kMaxIndirectReadBytes) {
+    if (IndirectStagingUsed() + read_size > kMaxIndirectReadBytes) {
       IndirectDroppedCalls() += 1u;
       return {};
     }
-    if (!EnsureIndirectStaging(device, IndirectStagingUsed() + read_size + cb_size)) {
+    if (!EnsureIndirectStaging(device, IndirectStagingUsed() + read_size)) {
       IndirectDroppedCalls() += 1u;
       return {};
     }
@@ -472,13 +471,6 @@ struct WorldDrawCallback {
     context.cmd_list->copy_buffer_region(
         args.buffer, args.offset, IndirectStagingResource(), IndirectStagingUsed(), read_size);
     IndirectStagingUsed() += read_size;
-    if (cb_size != 0u) {
-      draw.cb_size = static_cast<uint32_t>(cb_size);
-      draw.cb_staging_offset = IndirectStagingUsed();
-      context.cmd_list->copy_buffer_region(
-          instance_cb, 0u, IndirectStagingResource(), IndirectStagingUsed(), cb_size);
-      IndirectStagingUsed() += cb_size;
-    }
 
     FillCommonDrawRecord(&draw.record, context.cmd_list, device);
     draw.record.method = indexed ? 1u : 0u;
@@ -492,8 +484,9 @@ struct WorldDrawCallback {
 
 // Resolves queued indirect draws at present: the args were copied on the game's
 // command list at the draw, so the counts match what the GPU executed. Each
-// sub-draw runs through the same classification/commit/pool-scan pipeline as a
-// direct draw, using the bindings captured at draw time.
+// sub-draw runs through the same classification/commit pipeline as a direct
+// draw, using the bindings captured at draw time. The pool only counts them:
+// its instance slice has to be copied at the draw, before the counts exist.
 inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
   if (queue == nullptr) return;
   auto& pending = PendingIndirectDraws();
@@ -519,11 +512,6 @@ inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
     const auto* base_bytes = static_cast<const uint8_t*>(mapped);
     for (auto& draw : pending) {
       const uint8_t* args_bytes = base_bytes + draw.staging_offset;
-      int32_t base = 0;
-      const bool has_base = draw.cb_size >= sizeof(int32_t);
-      if (has_base) {
-        std::memcpy(&base, base_bytes + draw.cb_staging_offset, sizeof(int32_t));
-      }
       for (uint32_t i = 0; i < draw.draw_count; ++i) {
         DrawRecord record = draw.record;
         const uint8_t* element = args_bytes + static_cast<uint64_t>(i) * draw.stride;
@@ -544,7 +532,7 @@ inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
         record.serial = g_state.next_serial.fetch_add(1u);
         record.is_candidate = IsGeometryCandidate(record);
         CommitDrawRecord(record, device, cmd_list, &draw.cl_data);
-        bvh::OnPoolScanDraw(device, cmd_list, record, &draw.cl_data, has_base ? base : INT32_MIN);
+        bvh::CountPoolIndirectDraw();
       }
     }
     device->unmap_buffer_region(IndirectStagingResource());
@@ -575,7 +563,7 @@ inline void OnWorldPresent(
   (void)dirty_rects;
   g_state.frame.fetch_add(1u);
   g_state.draw_counter = 0u;
-  if (CensusEnabled() && renodx::utils::constants::shared.data != nullptr) {
+  if (CaptureActive() && renodx::utils::constants::shared.data != nullptr) {
     renodx::utils::constants::shared.data->capture_constant_buffers = true;
   }
   if (queue == nullptr) return;
