@@ -1,12 +1,13 @@
 #pragma once
 
-// Phase 1 M2b: raster reconstruction debug view.
+// Phase 1 GPU debug views (trace only).
 //
-// Uploads the M1 CPU pool to GPU buffers (once per pool revision), then
-// rasterizes the actual pool triangles with the game camera into a debug
-// texture and replaces the backbuffer with it. Modes: instance id, mesh id,
-// world position, flat normal, instance AABB. This is the human-readable
-// validation path for the GPU pool and the raster reference for M4.
+// Uploads the CPU pool to GPU buffers (once per pool revision), rebuilds the
+// BVH, and on request replaces the backbuffer with a primary-ray trace of the
+// BVH: shaded, instance id, or a per-pixel depth comparison against the game.
+// The trace writes a debug texture through a UAV; a blit pass copies it to the
+// backbuffer. The earlier raster reconstruction views were removed: the trace
+// reads the same pool data and is the only view that exercises the BVH.
 
 #include <algorithm>
 #include <atomic>
@@ -15,16 +16,13 @@
 
 #include "../../../../utils/render.hpp"
 #include "bvh_build.hpp"
-#include "bvh_recipes.hpp"
 #include "bvh_resources.hpp"
 #include "bvh_trace.hpp"
 
 namespace falcom_world::bvh {
 
-inline constexpr uint32_t kRasterPushConstantCount = 24u;
-
 struct BvhDebugState {
-  std::atomic_int mode{0};
+  std::atomic_int mode{0};  // BvhView
   std::atomic_bool force_upload{false};
   std::atomic<reshade::api::device*> device{nullptr};
 };
@@ -34,47 +32,20 @@ inline BvhDebugState g_bvh_debug;
 inline void DestroyBvhDebugResources(reshade::api::device* device) {
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr) return;
-  if (data->raster_pipeline.handle != 0u) {
-    device->destroy_pipeline(data->raster_pipeline);
-    data->raster_pipeline = {0u};
-  }
-  if (data->aabb_pipeline.handle != 0u) {
-    device->destroy_pipeline(data->aabb_pipeline);
-    data->aabb_pipeline = {0u};
-  }
-  for (auto& table : data->raster_tables) {
-    if (table.handle != 0u) {
-      device->free_descriptor_table(table);
-      table = {0u};
-    }
-  }
-  if (data->raster_layout.handle != 0u) {
-    device->destroy_pipeline_layout(data->raster_layout);
-    data->raster_layout = {0u};
-  }
-  DestroyBuffer(device, &data->debug_srv, &data->debug_texture);
-  data->debug_rtv = {0u};
   if (data->debug_uav.handle != 0u) {
     device->destroy_resource_view(data->debug_uav);
     data->debug_uav = {0u};
   }
-  if (data->depth_dsv.handle != 0u) {
-    device->destroy_resource_view(data->depth_dsv);
-    data->depth_dsv = {0u};
-  }
-  if (data->depth_texture.handle != 0u) {
-    device->destroy_resource(data->depth_texture);
-    data->depth_texture = {0u};
-  }
-  data->raster_ready = false;
+  DestroyBuffer(device, &data->debug_srv, &data->debug_texture);
   data->debug_width = 0u;
   data->debug_height = 0u;
 }
 
-inline bool EnsureBvhRasterResources(reshade::api::device* device, uint32_t width, uint32_t height) {
+// Backbuffer-sized debug texture the trace writes (UAV) and the blit reads (SRV).
+inline bool EnsureBvhDebugTarget(reshade::api::device* device, uint32_t width, uint32_t height) {
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr || width == 0u || height == 0u) return false;
-  if (data->raster_ready && data->debug_width == width && data->debug_height == height) return true;
+  if (data->debug_texture.handle != 0u && data->debug_width == width && data->debug_height == height) return true;
   DestroyBvhDebugResources(device);
 
   reshade::api::resource_desc color_desc = {};
@@ -86,18 +57,9 @@ inline bool EnsureBvhRasterResources(reshade::api::device* device, uint32_t widt
   color_desc.texture.format = reshade::api::format::r8g8b8a8_unorm;
   color_desc.texture.samples = 1u;
   color_desc.heap = reshade::api::memory_heap::gpu_only;
-  color_desc.usage = reshade::api::resource_usage::render_target
-                     | reshade::api::resource_usage::shader_resource
+  color_desc.usage = reshade::api::resource_usage::shader_resource
                      | reshade::api::resource_usage::unordered_access;
-  if (!device->create_resource(color_desc, nullptr, reshade::api::resource_usage::render_target, &data->debug_texture)) {
-    return false;
-  }
-  if (!device->create_resource_view(
-          data->debug_texture, reshade::api::resource_usage::render_target,
-          reshade::api::resource_view_desc(
-              reshade::api::resource_view_type::texture_2d, reshade::api::format::r8g8b8a8_unorm, 0, 1, 0, 1),
-          &data->debug_rtv)) {
-    DestroyBvhDebugResources(device);
+  if (!device->create_resource(color_desc, nullptr, reshade::api::resource_usage::unordered_access, &data->debug_texture)) {
     return false;
   }
   if (!device->create_resource_view(
@@ -116,113 +78,42 @@ inline bool EnsureBvhRasterResources(reshade::api::device* device, uint32_t widt
     DestroyBvhDebugResources(device);
     return false;
   }
-
-  reshade::api::resource_desc depth_desc = {};
-  depth_desc.type = reshade::api::resource_type::texture_2d;
-  depth_desc.texture.width = width;
-  depth_desc.texture.height = height;
-  depth_desc.texture.depth_or_layers = 1u;
-  depth_desc.texture.levels = 1u;
-  depth_desc.texture.format = reshade::api::format::d32_float;
-  depth_desc.texture.samples = 1u;
-  depth_desc.heap = reshade::api::memory_heap::gpu_only;
-  depth_desc.usage = reshade::api::resource_usage::depth_stencil;
-  if (!device->create_resource(depth_desc, nullptr, reshade::api::resource_usage::depth_stencil, &data->depth_texture)) {
-    DestroyBvhDebugResources(device);
-    return false;
-  }
-  if (!device->create_resource_view(
-          data->depth_texture, reshade::api::resource_usage::depth_stencil,
-          reshade::api::resource_view_desc(
-              reshade::api::resource_view_type::texture_2d, reshade::api::format::d32_float, 0, 1, 0, 1),
-          &data->depth_dsv)) {
-    DestroyBvhDebugResources(device);
-    return false;
-  }
-
-#if defined(__world_bvh_raster_vs_EMBED_FILE) && defined(__world_bvh_raster_ps_EMBED_FILE) && defined(__world_bvh_aabb_vs_EMBED_FILE)
-  using DR = reshade::api::descriptor_range;
-  using DS = reshade::api::shader_stage;
-  using DT = reshade::api::descriptor_type;
-  using P = reshade::api::pipeline_layout_param;
-
-  DR srv_range = {0, 0, 0, 5, DS::all_graphics, 1, DT::shader_resource_view};
-  reshade::api::constant_range push_range = {};
-  push_range.binding = 0;
-  push_range.dx_register_index = 13;
-  push_range.dx_register_space = 0;
-  push_range.count = kRasterPushConstantCount;
-  push_range.visibility = DS::all_graphics;
-  P p0 = {};
-  P p_push = {};
-  p0.type = reshade::api::pipeline_layout_param_type::descriptor_table;
-  p0.descriptor_table.count = 1;
-  p0.descriptor_table.ranges = &srv_range;
-  p_push.type = reshade::api::pipeline_layout_param_type::push_constants;
-  p_push.push_constants = push_range;
-  P params[2] = {p0, p_push};
-  if (!device->create_pipeline_layout(2, params, &data->raster_layout)) {
-    DestroyBvhDebugResources(device);
-    return false;
-  }
-  if (!device->allocate_descriptor_table(data->raster_layout, 0, &data->raster_tables[0])
-      || !device->allocate_descriptor_table(data->raster_layout, 0, &data->raster_tables[1])) {
-    DestroyBvhDebugResources(device);
-    return false;
-  }
-
-  const auto make_shader = [](std::span<const uint8_t> code, reshade::api::shader_desc* out) {
-    *out = {};
-    out->code = code.data();
-    out->code_size = code.size();
-    out->entry_point = "main";
-  };
-  reshade::api::shader_desc raster_vs = {};
-  reshade::api::shader_desc raster_ps = {};
-  reshade::api::shader_desc aabb_vs = {};
-  make_shader(__world_bvh_raster_vs, &raster_vs);
-  make_shader(__world_bvh_raster_ps, &raster_ps);
-  make_shader(__world_bvh_aabb_vs, &aabb_vs);
-  // The engine renders reversed-Z (nearer = larger device depth), so the
-  // debug pass must test GREATER against a depth buffer cleared to 0.
-  reshade::api::depth_stencil_desc depth_state = {};
-  depth_state.depth_enable = true;
-  depth_state.depth_write_mask = true;
-  depth_state.depth_func = reshade::api::compare_op::greater;
-  reshade::api::pipeline_subobject raster_subobjects[3] = {
-      {reshade::api::pipeline_subobject_type::vertex_shader, 1, &raster_vs},
-      {reshade::api::pipeline_subobject_type::pixel_shader, 1, &raster_ps},
-      {reshade::api::pipeline_subobject_type::depth_stencil_state, 1, &depth_state},
-  };
-  if (!device->create_pipeline(data->raster_layout, 3, raster_subobjects, &data->raster_pipeline)) {
-    DestroyBvhDebugResources(device);
-    return false;
-  }
-  reshade::api::pipeline_subobject aabb_subobjects[3] = {
-      {reshade::api::pipeline_subobject_type::vertex_shader, 1, &aabb_vs},
-      {reshade::api::pipeline_subobject_type::pixel_shader, 1, &raster_ps},
-      {reshade::api::pipeline_subobject_type::depth_stencil_state, 1, &depth_state},
-  };
-  if (!device->create_pipeline(data->raster_layout, 3, aabb_subobjects, &data->aabb_pipeline)) {
-    DestroyBvhDebugResources(device);
-    return false;
-  }
-#else
-  return false;
-#endif
-
   data->debug_width = width;
   data->debug_height = height;
-  data->raster_ready = data->raster_pipeline.handle != 0u && data->aabb_pipeline.handle != 0u;
-  return data->raster_ready;
+  return true;
+}
+
+// Game depth for Depth Compare. Only this frame's lighting depth is used: the
+// view of an earlier frame may be stale or already released.
+inline BvhTraceDepthInput GetBvhTraceDepthInput(BvhView view) {
+  BvhTraceDepthInput input;
+  if (view != BvhView::DepthCompare) return input;
+  std::lock_guard<std::mutex> lock(g_state.mutex);
+  const DepthSource& depth = g_state.depth_source;
+  if (!depth.valid || depth.view.handle == 0u || depth.frame != g_state.frame.load()) return input;
+  if (depth.viewport_width > 0.f && depth.viewport_height > 0.f) {
+    input.rect[0] = depth.viewport_x;
+    input.rect[1] = depth.viewport_y;
+    input.rect[2] = depth.viewport_width;
+    input.rect[3] = depth.viewport_height;
+  } else {
+    input.rect[2] = static_cast<float>(depth.width);
+    input.rect[3] = static_cast<float>(depth.height);
+  }
+  if (input.rect[2] <= 0.f || input.rect[3] <= 0.f) return input;
+  input.view = depth.view;
+  // Inside a quarter of the region size the TLAS always holds every admitted
+  // instance (the region keeps the camera that far from its border).
+  input.compare_range = g_pool.region_size * 0.25f;
+  return input;
 }
 
 inline void RunBvhDebugPass(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain) {
   if (queue == nullptr || swapchain == nullptr) return;
-  const int mode = g_bvh_debug.mode.load(std::memory_order_relaxed);
-  if (mode <= 0) return;
+  const auto view = static_cast<BvhView>(g_bvh_debug.mode.load(std::memory_order_relaxed));
+  if (view != BvhView::TraceShaded && view != BvhView::TraceInstance && view != BvhView::DepthCompare) return;
   auto* device = queue->get_device();
   if (device == nullptr) return;
   BvhDeviceData* data = GetBvhDeviceData(device);
@@ -234,81 +125,22 @@ inline void RunBvhDebugPass(
   if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
   const uint32_t width = backbuffer_desc.texture.width;
   const uint32_t height = backbuffer_desc.texture.height;
-  if (!EnsureBvhRasterResources(device, width, height)) return;
+  if (!EnsureBvhDebugTarget(device, width, height)) return;
 
   auto* cmd_list = queue->get_immediate_command_list();
   if (cmd_list == nullptr) return;
 
-  reshade::api::resource_view raster_srvs[5] = {
-      data->vertex_srv, data->mesh_srv, data->instance_srv, data->grouped_srv, data->index_srv};
-  reshade::api::descriptor_table_update raster_update = {
-      data->raster_tables[0], 0, 0, 5, reshade::api::descriptor_type::shader_resource_view, raster_srvs};
-  device->update_descriptor_tables(1, &raster_update);
-  reshade::api::resource_view aabb_srvs[5] = {
-      data->vertex_srv, data->mesh_srv, data->instance_srv, data->active_srv, data->index_srv};
-  reshade::api::descriptor_table_update aabb_update = {
-      data->raster_tables[1], 0, 0, 5, reshade::api::descriptor_type::shader_resource_view, aabb_srvs};
-  device->update_descriptor_tables(1, &aabb_update);
-
-  float view_proj[16] = {};
-  {
-    std::lock_guard<std::mutex> lock(g_state.mutex);
-    std::memcpy(view_proj, g_state.camera.view_proj, sizeof(float) * 16u);
+  const BvhTraceDepthInput depth = GetBvhTraceDepthInput(view);
+  if (depth.view.handle != 0u) {
+    // The game may still have its depth bound for output; D3D11 would then
+    // drop the compute SRV. Nothing of the game's frame draws after present.
+    cmd_list->bind_render_targets_and_depth_stencil(0, nullptr, {0u});
   }
-
-  const bool trace_mode = mode >= 7;
-  if (!trace_mode) {
-    cmd_list->bind_render_targets_and_depth_stencil(1, &data->debug_rtv, data->depth_dsv);
-    reshade::api::viewport viewport = {
-        0.f, 0.f, static_cast<float>(width), static_cast<float>(height), 0.f, 1.f};
-    cmd_list->bind_viewports(0, 1, &viewport);
-    reshade::api::rect scissor = {
-        0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
-    cmd_list->bind_scissor_rects(0, 1, &scissor);
-    const float clear_color[4] = {0.02f, 0.02f, 0.03f, 1.f};
-    cmd_list->clear_render_target_view(data->debug_rtv, clear_color);
-    const float clear_depth[1] = {0.f};  // reversed-Z far plane
-    cmd_list->clear_depth_stencil_view(data->depth_dsv, clear_depth, nullptr);
-  }
-
-  const auto push_constants = [&](uint32_t mode_value, uint32_t mesh_id, uint32_t group_offset) {
-    float constants[kRasterPushConstantCount] = {};
-    std::memcpy(constants, view_proj, sizeof(float) * 16u);
-    constants[16] = *reinterpret_cast<const float*>(&mode_value);
-    constants[17] = *reinterpret_cast<const float*>(&mesh_id);
-    constants[18] = *reinterpret_cast<const float*>(&group_offset);
-    cmd_list->push_constants(
-        reshade::api::shader_stage::all_graphics, data->raster_layout, 1, 0, kRasterPushConstantCount, constants);
-  };
-
-  if (trace_mode) {
-    DispatchBvhTrace(device, cmd_list, data, static_cast<uint32_t>(mode), width, height);
-    cmd_list->barrier(
-        data->debug_texture, reshade::api::resource_usage::unordered_access,
-        reshade::api::resource_usage::shader_resource);
-    MaybeCaptureBvhTraceStats(device, queue, data);
-  } else if (mode == 5) {
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, data->aabb_pipeline);
-    cmd_list->bind_descriptor_tables(
-        reshade::api::shader_stage::all_graphics, data->raster_layout, 0, 1, &data->raster_tables[1]);
-    push_constants(1u, 0u, 0u);
-    cmd_list->draw(24u, data->active_count, 0u, 0u);
-  } else {
-    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_graphics, data->raster_pipeline);
-    cmd_list->bind_descriptor_tables(
-        reshade::api::shader_stage::all_graphics, data->raster_layout, 0, 1, &data->raster_tables[0]);
-    for (const auto& group : data->draw_groups) {
-      if (group.index_count == 0u || group.group_count == 0u) continue;
-      push_constants(static_cast<uint32_t>(mode), group.mesh_id, group.group_offset);
-      cmd_list->draw(group.index_count, group.group_count, 0u, 0u);
-    }
-  }
-
-  if (!trace_mode) {
-    cmd_list->barrier(
-        data->debug_texture, reshade::api::resource_usage::render_target,
-        reshade::api::resource_usage::shader_resource);
-  }
+  DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth);
+  cmd_list->barrier(
+      data->debug_texture, reshade::api::resource_usage::unordered_access,
+      reshade::api::resource_usage::shader_resource);
+  MaybeCaptureBvhTraceStats(device, queue, data);
 
   renodx::utils::render::RenderPass pass;
   pass.pipeline_subobjects.vertex_shader = __world_bvh_blit_vs;
@@ -349,21 +181,6 @@ inline void OnWorldPresentBvh(
   if (device == nullptr) return;
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
-
-  // Persist verified recipes once per Auto Research run so later launches can
-  // skip the full verification pass.
-  bool save_recipes = false;
-  {
-    std::lock_guard<std::mutex> lock(g_state.mutex);
-    const bool finalized = g_state.auto_research.finalized;
-    if (finalized && !g_recipes.auto_saved) {
-      g_recipes.auto_saved = true;
-      save_recipes = true;
-    } else if (!finalized && g_recipes.auto_saved) {
-      g_recipes.auto_saved = false;
-    }
-  }
-  if (save_recipes) SaveWorldRecipes();
 
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr) return;

@@ -2,10 +2,12 @@
 
 // Phase 1 M4: primary-ray BVH traversal pass and one-shot trace statistics.
 //
-// Modes 7/8 dispatch world_bvh_trace against the region TLAS/BLAS; the trace
-// pass writes the debug texture directly and accumulates integer counters into
-// a small stats buffer. Statistics are read back only on request (mode
-// activation or UI button) so the per-frame path stays synchronization-free.
+// The debug views dispatch world_bvh_trace against the region TLAS/BLAS; the
+// trace pass writes the debug texture directly and accumulates integer
+// counters into a small stats buffer. Statistics are read back only on request
+// (view activation or UI button) so the per-frame path stays
+// synchronization-free. Depth Compare additionally binds the game's
+// current-frame lighting depth at t9 and classifies every pixel.
 
 #include <atomic>
 #include <cstdint>
@@ -19,17 +21,44 @@
 
 namespace falcom_world::bvh {
 
-inline constexpr uint32_t kTraceSrvCount = 9u;
+inline constexpr uint32_t kTraceSrvCount = 10u;
 inline constexpr uint32_t kTraceUavCount = 2u;
-inline constexpr uint32_t kTracePushConstantCount = 24u;
-inline constexpr uint32_t kTraceStatsCount = 7u;
+inline constexpr uint32_t kTracePushConstantCount = 32u;
+inline constexpr uint32_t kTraceStatsCount = 14u;
 
 // Push-constant float offsets, matching cb_trace in world_bvh_trace.cs_5_0.hlsl:
-// [0..15] view_proj_inv, [16..19] camera_position, [20] mode, [21] width, [22] height.
+// [0..15] view_proj_inv, [16..19] camera_position, [20] mode, [21] width,
+// [22] height, [23] compare range, [24..27] game depth rect, [28..31] spare.
 inline constexpr uint32_t kTraceCameraPositionOffset = 16u;
 inline constexpr uint32_t kTraceModeOffset = 20u;
 inline constexpr uint32_t kTraceWidthOffset = 21u;
 inline constexpr uint32_t kTraceHeightOffset = 22u;
+inline constexpr uint32_t kTraceCompareRangeOffset = 23u;
+inline constexpr uint32_t kTraceDepthRectOffset = 24u;
+
+// Debug views offered in the panel, and the trace shader mode each one runs.
+enum class BvhView : int {
+  Off = 0,
+  TraceShaded = 1,
+  TraceInstance = 2,
+  DepthCompare = 3,
+};
+
+inline uint32_t TraceShaderMode(BvhView view) {
+  switch (view) {
+    case BvhView::TraceInstance: return 8u;
+    case BvhView::DepthCompare:  return 9u;
+    default:                     return 7u;
+  }
+}
+
+// Game depth for Depth Compare: the lighting pass depth view of the current
+// frame and the texel rectangle the frame actually covers.
+struct BvhTraceDepthInput {
+  reshade::api::resource_view view = {0u};
+  float rect[4] = {};  // x, y, width, height in depth texels
+  float compare_range = 0.f;
+};
 
 struct BvhTraceState {
   std::atomic_bool stats_requested{false};
@@ -127,7 +156,8 @@ inline void DispatchBvhTrace(
     BvhDeviceData* data,
     uint32_t mode,
     uint32_t width,
-    uint32_t height) {
+    uint32_t height,
+    const BvhTraceDepthInput& depth) {
   if (device == nullptr || cmd_list == nullptr || data == nullptr) return;
   if (!EnsureBvhTraceResources(device, data)) return;
   if (!data->bvh_ready || data->blas_node_srv.handle == 0u || data->tlas_node_srv.handle == 0u) return;
@@ -136,10 +166,14 @@ inline void DispatchBvhTrace(
   const uint32_t zeros[kTraceStatsCount + 1u] = {};
   device->update_buffer_region(zeros, data->trace_stats_buffer, 0u, sizeof(zeros));
 
+  // Slot 9 is rewritten on every dispatch: a game view from an earlier frame
+  // may no longer exist, so it is null unless Depth Compare passes this
+  // frame's view.
   reshade::api::resource_view srvs[kTraceSrvCount] = {
       data->vertex_srv, data->index_srv, data->mesh_srv, data->instance_srv, data->active_srv,
-      data->blas_node_srv, data->blas_leaf_srv, data->tlas_node_srv, data->tlas_leaf_srv};
-  static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 9 entries");
+      data->blas_node_srv, data->blas_leaf_srv, data->tlas_node_srv, data->tlas_leaf_srv,
+      depth.view};
+  static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 10 entries");
   reshade::api::descriptor_table_update srv_update = {
       data->trace_srv_table, 0, 0, kTraceSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs};
   device->update_descriptor_tables(1, &srv_update);
@@ -172,7 +206,9 @@ inline void DispatchBvhTrace(
   constants[kTraceModeOffset] = *reinterpret_cast<const float*>(&mode);
   constants[kTraceWidthOffset] = *reinterpret_cast<const float*>(&width);
   constants[kTraceHeightOffset] = *reinterpret_cast<const float*>(&height);
-  static_assert(kTraceModeOffset + 3u <= kTracePushConstantCount, "trace push constants overflow");
+  constants[kTraceCompareRangeOffset] = depth.compare_range;
+  for (uint32_t i = 0; i < 4u; ++i) constants[kTraceDepthRectOffset + i] = depth.rect[i];
+  static_assert(kTraceDepthRectOffset + 4u <= kTracePushConstantCount, "trace push constants overflow");
   cmd_list->push_constants(
       reshade::api::shader_stage::all_compute, data->trace_layout, 2, 0, kTracePushConstantCount, constants);
   cmd_list->dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
@@ -200,6 +236,13 @@ inline bool ReadbackBvhTraceStats(
   data->trace_stats.stack_overflow = values[4];
   data->trace_stats.triangle_tests = values[5];
   data->trace_stats.max_stack_depth = values[6];
+  data->trace_stats.compare_match = values[7];
+  data->trace_stats.compare_missing = values[8];
+  data->trace_stats.compare_extra = values[9];
+  data->trace_stats.compare_extra_sky = values[10];
+  data->trace_stats.compare_far = values[11];
+  data->trace_stats.compare_sky = values[12];
+  data->trace_stats.compare_no_depth = values[13];
   data->trace_stats.valid = true;
   data->trace_stats.invariant_ok = data->trace_stats.rays == data->trace_stats.hits + data->trace_stats.misses;
   renodx::utils::log::i(
@@ -211,6 +254,19 @@ inline bool ReadbackBvhTraceStats(
       " triangle_tests=", data->trace_stats.triangle_tests,
       " max_stack_depth=", data->trace_stats.max_stack_depth,
       " invariant=", data->trace_stats.invariant_ok ? "ok" : "FAIL");
+  const BvhTraceStats& stats = data->trace_stats;
+  if (stats.compare_match + stats.compare_missing + stats.compare_extra + stats.compare_extra_sky
+          + stats.compare_far + stats.compare_sky + stats.compare_no_depth
+      != 0u) {
+    renodx::utils::log::i(
+        "[world-bvh] depth compare: match=", stats.compare_match,
+        " missing=", stats.compare_missing,
+        " extra=", stats.compare_extra,
+        " extra_sky=", stats.compare_extra_sky,
+        " far=", stats.compare_far,
+        " sky=", stats.compare_sky,
+        " no_depth=", stats.compare_no_depth);
+  }
   return true;
 }
 

@@ -28,7 +28,6 @@ inline void OnDestroyDeviceBvh(reshade::api::device* device) {
 inline void Use(DWORD fdw_reason) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
-      LoadWorldRecipes();
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
@@ -53,6 +52,31 @@ inline void AppendPoolCount(std::string* text, const char* label, uint64_t count
   text->append(label);
   text->push_back(' ');
   text->append(std::to_string(count));
+}
+
+inline float PoolPercent(uint64_t part, uint64_t total) {
+  return total == 0u ? 0.f : static_cast<float>(static_cast<double>(part) * 100.0 / static_cast<double>(total));
+}
+
+inline void DrawDepthCompareStats(const BvhTraceStats& stats) {
+  const uint64_t judged = static_cast<uint64_t>(stats.compare_match) + stats.compare_missing
+                          + stats.compare_extra + stats.compare_extra_sky;
+  if (judged == 0u && stats.compare_no_depth == 0u && stats.compare_far == 0u && stats.compare_sky == 0u) return;
+  if (judged == 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f),
+                       "Depth compare: no pixel judged (no game depth %u, far %u, sky %u)",
+                       stats.compare_no_depth, stats.compare_far, stats.compare_sky);
+    return;
+  }
+  ImGui::Text("Depth compare (within %.0f m): match %.1f%%  missing %.1f%%  extra %.1f%%  extra on sky %.1f%%",
+              g_pool.region_size * 0.25f,
+              PoolPercent(stats.compare_match, judged),
+              PoolPercent(stats.compare_missing, judged),
+              PoolPercent(stats.compare_extra, judged),
+              PoolPercent(stats.compare_extra_sky, judged));
+  ImGui::TextDisabled("pixels: match %u  missing %u  extra %u  extra on sky %u  far %u  sky %u  no depth %u",
+                      stats.compare_match, stats.compare_missing, stats.compare_extra, stats.compare_extra_sky,
+                      stats.compare_far, stats.compare_sky, stats.compare_no_depth);
 }
 
 inline void DrawBvhPanel() {
@@ -98,9 +122,26 @@ inline void DrawBvhPanel() {
   for (size_t i = static_cast<size_t>(PoolSkip::DrawState); i < stats.skips.size(); ++i) {
     AppendPoolCount(&skips, PoolSkipName(static_cast<PoolSkip>(i)), stats.skips[i]);
   }
-  AppendPoolCount(&skips, "indirect", stats.skipped_indirect);
+  std::string draw_state;
+  for (size_t i = 1; i < stats.draw_state.size(); ++i) {
+    AppendPoolCount(&draw_state, PoolDrawStateName(static_cast<PoolDrawState>(i)), stats.draw_state[i]);
+  }
+  std::string indirect_classes;
+  for (size_t i = 0; i < stats.indirect_by_vs_class.size(); ++i) {
+    AppendPoolCount(&indirect_classes, contract::VsClassName(static_cast<contract::VsClass>(i)), stats.indirect_by_vs_class[i]);
+  }
   ImGui::Text("Draws scanned: %s", draw_classes.empty() ? "none" : draw_classes.c_str());
   ImGui::Text("Rigid draws skipped: %s", skips.empty() ? "none" : skips.c_str());
+  ImGui::Text("Draw state reasons: %s", draw_state.empty() ? "none" : draw_state.c_str());
+  ImGui::Text("Indirect draws: %s", indirect_classes.empty() ? "none" : indirect_classes.c_str());
+  if (!indirect_classes.empty()) {
+    ImGui::TextDisabled("Indirect: copied %llu  read %llu  empty %llu  truncated %llu  buffer released %llu",
+                        static_cast<unsigned long long>(stats.indirect_copied),
+                        static_cast<unsigned long long>(stats.indirect_resolved),
+                        static_cast<unsigned long long>(stats.indirect_empty),
+                        static_cast<unsigned long long>(stats.indirect_truncated),
+                        static_cast<unsigned long long>(stats.indirect_dead));
+  }
 
   const ImVec4 base_color = stats.base_mismatch == 0u ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
   ImGui::Text("Copied draws: %llu", static_cast<unsigned long long>(stats.copied_draws));
@@ -127,6 +168,13 @@ inline void DrawBvhPanel() {
               stats.dedup_instances,
               stats.instance_cap_drops,
               static_cast<unsigned long long>(stats.moving_instances));
+  std::string matrix_rejects;
+  for (size_t i = 1; i < stats.matrix_rejects.size(); ++i) {
+    AppendPoolCount(&matrix_rejects, PoolMatrixRejectName(static_cast<PoolMatrixReject>(i)), stats.matrix_rejects[i]);
+  }
+  if (!matrix_rejects.empty()) ImGui::Text("Bad matrix reasons: %s", matrix_rejects.c_str());
+  ImGui::Text("Near misses (same mesh, almost the same matrix): %llu",
+              static_cast<unsigned long long>(stats.near_misses));
   ImGui::Text("Meshes: captured %llu  queued %llu  same-content merges %u  failures %u  cap %u",
               static_cast<unsigned long long>(stats.meshes),
               static_cast<unsigned long long>(stats.mesh_queue),
@@ -165,32 +213,24 @@ inline void DrawBvhPanel() {
   if (do_dump_obj) DumpWorldPoolObj();
   if (do_reset) ResetWorldPool();
 
-  ImGui::SeparatorText("Research Recipes (not used by the pool)");
-  if (ImGui::Button("Save Recipes")) SaveWorldRecipes();
-  ImGui::SameLine();
-  if (ImGui::Button("Load Recipes")) LoadWorldRecipes();
-  ImGui::SameLine();
-  ImGui::TextDisabled("%s", g_recipes.status.c_str());
-  ImGui::TextDisabled("loaded %u  saved %u  saved frame %u",
-                      g_recipes.loaded_count,
-                      g_recipes.saved_count,
-                      g_recipes.saved_frame);
-
-  ImGui::SeparatorText("GPU Reconstruction (M2b/M4)");
+  ImGui::SeparatorText("GPU BVH (trace views)");
   int mode = g_bvh_debug.mode.load(std::memory_order_relaxed);
-  const char* modes = "Off\0Instance ID\0Mesh ID\0World Position\0Flat Normal\0Instance AABB\0Shaded\0BVH Trace (Shaded)\0BVH Trace (Instance ID)\0";
+  const char* modes = "Off\0BVH Trace (Shaded)\0BVH Trace (Instance ID)\0Depth Compare\0";
   if (ImGui::Combo("GPU Debug", &mode, modes)) {
     g_bvh_debug.mode.store(mode, std::memory_order_relaxed);
     RefreshPoolCaptureRequest();
-    if (mode >= 7) g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+    if (mode != static_cast<int>(BvhView::Off)) g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
   }
   ImGui::SameLine();
   if (ImGui::Button("Upload Pool to GPU")) {
     g_bvh_debug.force_upload.store(true, std::memory_order_relaxed);
   }
   ImGui::SameLine();
-  if (ImGui::Button("Trace Stats")) {
+  if (ImGui::Button("Read Stats")) {
     g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+  }
+  if (mode == static_cast<int>(BvhView::DepthCompare)) {
+    ImGui::TextDisabled("green match  blue missing (game surface in front / no BVH hit)  red extra (BVH in front)  orange BVH on game sky  grey beyond range");
   }
 
   reshade::api::device* device = g_bvh_debug.device.load(std::memory_order_relaxed);
@@ -242,6 +282,7 @@ inline void DrawBvhPanel() {
                           data->trace_stats.stack_overflow,
                           data->trace_stats.triangle_tests,
                           data->trace_stats.max_stack_depth);
+      DrawDepthCompareStats(data->trace_stats);
     }
   } else {
     ImGui::TextDisabled("GPU pool not uploaded yet.");

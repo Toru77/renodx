@@ -4,8 +4,8 @@
 //
 // Uploads the validated M1 CPU pool (meshes, instances, region active list)
 // into GPU buffers, verifies the upload once per pool revision with a
-// readback checksum, and owns the resources shared by the raster
-// reconstruction debug view and the future BLAS/TLAS stages.
+// readback checksum, and owns the resources shared by the BLAS/TLAS build and
+// the trace debug views.
 
 #include <cmath>
 #include <cstdint>
@@ -44,13 +44,6 @@ struct WorldInstanceGPU {
 static_assert(sizeof(WorldMeshGPU) == 64u, "WorldMeshGPU layout must match world_bvh_types.hlsli");
 static_assert(sizeof(WorldInstanceGPU) == 176u, "WorldInstanceGPU layout must match world_bvh_types.hlsli");
 
-struct BvhDrawGroup {
-  uint32_t mesh_id = 0u;
-  uint32_t index_count = 0u;
-  uint32_t group_offset = 0u;
-  uint32_t group_count = 0u;
-};
-
 struct BvhTraceStats {
   uint32_t rays = 0u;
   uint32_t hits = 0u;
@@ -59,6 +52,14 @@ struct BvhTraceStats {
   uint32_t stack_overflow = 0u;
   uint32_t triangle_tests = 0u;
   uint32_t max_stack_depth = 0u;
+  // Depth Compare pixel classes (zero in the other views).
+  uint32_t compare_match = 0u;
+  uint32_t compare_missing = 0u;
+  uint32_t compare_extra = 0u;
+  uint32_t compare_extra_sky = 0u;
+  uint32_t compare_far = 0u;
+  uint32_t compare_sky = 0u;
+  uint32_t compare_no_depth = 0u;
   bool valid = false;
   bool invariant_ok = false;
 };
@@ -85,9 +86,6 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   reshade::api::resource_view instance_srv = {0u};
   reshade::api::resource active_buffer = {0u};
   reshade::api::resource_view active_srv = {0u};
-  reshade::api::resource grouped_buffer = {0u};
-  reshade::api::resource_view grouped_srv = {0u};
-  std::vector<BvhDrawGroup> draw_groups;
 
   bool checksum_valid = false;
   bool checksum_match = false;
@@ -96,17 +94,9 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
 
   reshade::api::resource debug_texture = {0u};
   reshade::api::resource_view debug_srv = {0u};
-  reshade::api::resource_view debug_rtv = {0u};
   reshade::api::resource_view debug_uav = {0u};
   uint32_t debug_width = 0u;
   uint32_t debug_height = 0u;
-  reshade::api::resource depth_texture = {0u};
-  reshade::api::resource_view depth_dsv = {0u};
-  reshade::api::pipeline_layout raster_layout = {0u};
-  reshade::api::descriptor_table raster_tables[2] = {};
-  reshade::api::pipeline raster_pipeline = {0u};
-  reshade::api::pipeline aabb_pipeline = {0u};
-  bool raster_ready = false;
 
   reshade::api::resource blas_leaf_buffer = {0u};
   reshade::api::resource_view blas_leaf_srv = {0u};
@@ -180,7 +170,6 @@ inline void DestroyBvhDeviceData(reshade::api::device* device) {
   DestroyBuffer(device, &data->mesh_srv, &data->mesh_buffer);
   DestroyBuffer(device, &data->instance_srv, &data->instance_buffer);
   DestroyBuffer(device, &data->active_srv, &data->active_buffer);
-  DestroyBuffer(device, &data->grouped_srv, &data->grouped_buffer);
   DestroyBuffer(device, &data->blas_leaf_srv, &data->blas_leaf_buffer);
   DestroyBuffer(device, &data->blas_node_uav, &data->blas_node_buffer);
   DestroyBuffer(device, &data->blas_node_srv, nullptr);
@@ -230,7 +219,6 @@ inline void DestroyBvhDeviceData(reshade::api::device* device) {
   data->blas_valid = false;
   data->tlas_valid = false;
   data->build_status = "not built";
-  data->draw_groups.clear();
   data->ready = false;
   data->checksum_valid = false;
   data->uploaded_revision = 0u;
@@ -392,33 +380,6 @@ inline void BuildMeshDescriptors(
   }
 }
 
-inline void BuildDrawGroups(
-    const std::vector<WorldMesh>& meshes,
-    const std::vector<WorldInstance>& instances,
-    const std::vector<uint32_t>& active,
-    std::vector<uint32_t>* out_grouped,
-    std::vector<BvhDrawGroup>* out_groups) {
-  if (out_grouped == nullptr || out_groups == nullptr) return;
-  out_grouped->clear();
-  out_groups->clear();
-  std::vector<std::vector<uint32_t>> per_mesh(meshes.size());
-  for (const uint32_t index : active) {
-    if (index >= instances.size()) continue;
-    const uint32_t mesh_id = instances[index].mesh_id;
-    if (mesh_id < per_mesh.size()) per_mesh[mesh_id].push_back(index);
-  }
-  for (uint32_t mesh_id = 0; mesh_id < per_mesh.size(); ++mesh_id) {
-    if (per_mesh[mesh_id].empty()) continue;
-    BvhDrawGroup group;
-    group.mesh_id = mesh_id;
-    group.index_count = static_cast<uint32_t>(meshes[mesh_id].indices.size());
-    group.group_offset = static_cast<uint32_t>(out_grouped->size());
-    group.group_count = static_cast<uint32_t>(per_mesh[mesh_id].size());
-    out_grouped->insert(out_grouped->end(), per_mesh[mesh_id].begin(), per_mesh[mesh_id].end());
-    out_groups->push_back(group);
-  }
-}
-
 // The pool matrix is stored in the game's row-dot layout: world.x = dot(p, row0)
 // with row0 = (m0, m1, m2, m3), and the engine only ever uses rows 0..2. The
 // stored fourth row is not part of the transform (Inst4x4 captures often leave
@@ -483,8 +444,6 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
   std::vector<WorldMesh> meshes;
   std::vector<WorldInstance> instances;
   std::vector<uint32_t> active;
-  std::vector<uint32_t> grouped;
-  std::vector<BvhDrawGroup> draw_groups;
   PoolRegion region;
   uint64_t revision = 0u;
   {
@@ -504,7 +463,6 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
     data->build_status = "pool empty";
     return false;
   }
-  BuildDrawGroups(meshes, instances, active, &grouped, &draw_groups);
 
   std::vector<float> vertices;
   std::vector<uint32_t> indices;
@@ -554,28 +512,24 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
   cpu_hash = HashPoolBytes(cpu_hash, reinterpret_cast<const uint8_t*>(mesh_descriptors.data()), mesh_descriptors.size() * sizeof(WorldMeshGPU));
   cpu_hash = HashPoolBytes(cpu_hash, reinterpret_cast<const uint8_t*>(instance_descriptors.data()), instance_descriptors.size() * sizeof(WorldInstanceGPU));
   cpu_hash = HashPoolBytes(cpu_hash, reinterpret_cast<const uint8_t*>(active.data()), active.size() * sizeof(uint32_t));
-  cpu_hash = HashPoolBytes(cpu_hash, reinterpret_cast<const uint8_t*>(grouped.data()), grouped.size() * sizeof(uint32_t));
 
   DestroyBuffer(device, &data->vertex_srv, &data->vertex_buffer);
   DestroyBuffer(device, &data->index_srv, &data->index_buffer);
   DestroyBuffer(device, &data->mesh_srv, &data->mesh_buffer);
   DestroyBuffer(device, &data->instance_srv, &data->instance_buffer);
   DestroyBuffer(device, &data->active_srv, &data->active_buffer);
-  DestroyBuffer(device, &data->grouped_srv, &data->grouped_buffer);
 
   if (!CreatePoolBuffer(device, vertices.data(), vertices.size() * sizeof(float), 16u, &data->vertex_buffer, &data->vertex_srv)) return false;
   if (!CreatePoolBuffer(device, indices.data(), indices.size() * sizeof(uint32_t), 4u, &data->index_buffer, &data->index_srv)) return false;
   if (!CreatePoolBuffer(device, mesh_descriptors.data(), mesh_descriptors.size() * sizeof(WorldMeshGPU), sizeof(WorldMeshGPU), &data->mesh_buffer, &data->mesh_srv)) return false;
   if (!CreatePoolBuffer(device, instance_descriptors.data(), instance_descriptors.size() * sizeof(WorldInstanceGPU), sizeof(WorldInstanceGPU), &data->instance_buffer, &data->instance_srv)) return false;
   if (!CreatePoolBuffer(device, active.data(), active.size() * sizeof(uint32_t), 4u, &data->active_buffer, &data->active_srv)) return false;
-  if (!CreatePoolBuffer(device, grouped.data(), grouped.size() * sizeof(uint32_t), 4u, &data->grouped_buffer, &data->grouped_srv)) return false;
 
   data->vertex_count = static_cast<uint32_t>(vertices.size() / 4u);
   data->index_count = static_cast<uint32_t>(indices.size());
   data->mesh_count = static_cast<uint32_t>(mesh_descriptors.size());
   data->instance_count = static_cast<uint32_t>(instance_descriptors.size());
   data->active_count = static_cast<uint32_t>(active.size());
-  data->draw_groups = std::move(draw_groups);
   data->uploaded_revision = revision;
   data->region_revision = revision;
   data->region_min[0] = region.min[0];
@@ -603,7 +557,6 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
   hash_resource(data->mesh_buffer, mesh_descriptors.size() * sizeof(WorldMeshGPU));
   hash_resource(data->instance_buffer, instance_descriptors.size() * sizeof(WorldInstanceGPU));
   hash_resource(data->active_buffer, active.size() * sizeof(uint32_t));
-  hash_resource(data->grouped_buffer, grouped.size() * sizeof(uint32_t));
   data->cpu_hash = cpu_hash;
   data->gpu_hash = gpu_hash;
   data->checksum_valid = checksum_ok;
@@ -617,7 +570,6 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
       " indices=", data->index_count,
       " instances=", data->instance_count,
       " active=", data->active_count,
-      " grouped=", grouped.size(),
       " checksum=", checksum_text);
   if (checksum_ok && !data->checksum_match) {
     renodx::utils::log::w(
@@ -625,31 +577,21 @@ inline bool UploadWorldPoolToGpu(reshade::api::device* device, reshade::api::com
         " gpu=", renodx::utils::log::AsHex(data->gpu_hash));
   }
 
-  // Diagnostic-only: dump the first draw groups with their descriptor ranges and
-  // bound-check every group against the global buffers.
+  // Diagnostic-only: bound-check every mesh descriptor against the global
+  // vertex/index buffers (the float offsets are exact below 2^24).
   uint32_t bound_violations = 0u;
-  for (size_t i = 0; i < data->draw_groups.size(); ++i) {
-    const BvhDrawGroup& group = data->draw_groups[i];
-    const uint64_t vertex_offset = static_cast<uint64_t>(mesh_descriptors[group.mesh_id].header[0]);
-    const uint64_t vertex_count = static_cast<uint64_t>(mesh_descriptors[group.mesh_id].header[1]);
-    const uint64_t index_offset = static_cast<uint64_t>(mesh_descriptors[group.mesh_id].header[2]);
-    const uint64_t index_count = static_cast<uint64_t>(mesh_descriptors[group.mesh_id].header[3]);
-    if (vertex_offset + vertex_count > data->vertex_count
-        || index_offset + index_count > data->index_count
-        || static_cast<uint64_t>(group.group_offset) + group.group_count > grouped.size()) {
+  for (const WorldMeshGPU& descriptor : mesh_descriptors) {
+    const uint64_t vertex_offset = static_cast<uint64_t>(descriptor.header[0]);
+    const uint64_t vertex_count = static_cast<uint64_t>(descriptor.header[1]);
+    const uint64_t index_offset = static_cast<uint64_t>(descriptor.header[2]);
+    const uint64_t index_count = static_cast<uint64_t>(descriptor.header[3]);
+    if (vertex_offset + vertex_count > data->vertex_count || index_offset + index_count > data->index_count) {
       bound_violations += 1u;
-    }
-    if (i < 8u) {
-      renodx::utils::log::i(
-          "[world-bvh] group mesh=", group.mesh_id,
-          " voff=", vertex_offset, " vcount=", vertex_count,
-          " ioff=", index_offset, " icount=", index_count,
-          " goff=", group.group_offset, " gcount=", group.group_count);
     }
   }
   renodx::utils::log::i(
-      "[world-bvh] group bounds: violations=", bound_violations,
-      " groups=", data->draw_groups.size());
+      "[world-bvh] mesh bounds: violations=", bound_violations,
+      " meshes=", mesh_descriptors.size());
   return true;
 }
 
@@ -657,35 +599,24 @@ inline bool UploadActiveInstancesToGpu(reshade::api::device* device, reshade::ap
   if (device == nullptr || queue == nullptr) return false;
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr || !data->ready) return false;
-  std::vector<WorldMesh> meshes;
   std::vector<WorldInstance> instances;
   std::vector<uint32_t> active;
-  std::vector<uint32_t> grouped;
-  std::vector<BvhDrawGroup> draw_groups;
   PoolRegion region;
   uint64_t revision = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    meshes = g_pool.meshes;
     instances = g_pool.instances;
     region = CurrentPoolRegion();
     active = ComputeActiveIndices(instances, region);
     revision = g_pool.revision;
   }
-  BuildDrawGroups(meshes, instances, active, &grouped, &draw_groups);
 
   DestroyBuffer(device, &data->active_srv, &data->active_buffer);
-  DestroyBuffer(device, &data->grouped_srv, &data->grouped_buffer);
   if (!active.empty()
       && !CreatePoolBuffer(device, active.data(), active.size() * sizeof(uint32_t), 4u, &data->active_buffer, &data->active_srv)) {
     return false;
   }
-  if (!grouped.empty()
-      && !CreatePoolBuffer(device, grouped.data(), grouped.size() * sizeof(uint32_t), 4u, &data->grouped_buffer, &data->grouped_srv)) {
-    return false;
-  }
   data->active_count = static_cast<uint32_t>(active.size());
-  data->draw_groups = std::move(draw_groups);
   data->region_revision = revision;
   data->region_min[0] = region.min[0];
   data->region_min[1] = region.min[1];

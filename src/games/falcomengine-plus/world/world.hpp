@@ -1,12 +1,12 @@
 #pragma once
 
-// falcomengine-plus Phase 0: world-space research module.
+// falcomengine-plus world module: draw census, world pool and world BVH.
 //
 // One entry point (Use) plus one settings hook (AddSettings). Everything is
 // DevKit-gated: when DevKit is not present, Use and AddSettings do nothing and
-// no events, capture state or per-frame work exist. This phase only researches
-// whether Sora 2nd static opaque geometry can be captured with a correct world
-// transform; there is no mesh pool, BVH, TLAS or ray consumer here.
+// no events, capture state or per-frame work exist. The pool admits geometry
+// by bytecode shader class (contract/), bvh/ builds and traces the BVH. There
+// is no ray-traced consumer yet.
 
 #include <Windows.h>
 
@@ -18,13 +18,10 @@
 #include "capture/state_capture.hpp"
 #include "capture/draw_census.hpp"
 #include "capture/mesh_capture.hpp"
-#include "capture/depth_probe.hpp"
+#include "capture/depth_source.hpp"
 #include "research/classification.hpp"
-#include "research/coverage.hpp"
 #include "research/reference_hints.hpp"
 #include "research/transform_candidates.hpp"
-#include "research/world_report.hpp"
-#include "research/auto_research.hpp"
 #include "debug/overlay.hpp"
 #include "world_settings.hpp"
 #include "bvh/world_bvh.hpp"
@@ -71,9 +68,7 @@ inline void Use(DWORD fdw_reason, bool supported) {
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
       reshade::register_event<reshade::addon_event::present>(OnWorldPresent);
-      reshade::register_event<reshade::addon_event::present>(OnWorldPresentAuto);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceProbe);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
       break;
@@ -91,9 +86,7 @@ inline void Use(DWORD fdw_reason, bool supported) {
       reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
       reshade::unregister_event<reshade::addon_event::present>(OnWorldPresent);
-      reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentAuto);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceProbe);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
       renodx::utils::command_action::Unregister(WorldDrawCallback{});

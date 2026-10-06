@@ -52,7 +52,6 @@ inline void ResetCensus() {
   g_state.resource_sizes.clear();
   g_state.next_serial.store(0u);
   g_state.arm_active = false;
-  g_state.arm_window_open = false;
   g_state.captured = {};
   g_state.candidates.clear();
   g_state.selected_family = 0u;
@@ -65,7 +64,6 @@ inline void ArmCapture(uint32_t vs_hash, uint32_t serial) {
   g_state.arm_active = true;
   g_state.arm_vs_hash = vs_hash;
   g_state.arm_serial = serial;
-  g_state.arm_vs_set.clear();
   g_state.status = "armed for next matching draw";
 }
 
@@ -112,44 +110,9 @@ inline void TryCaptureArmedDraw(
     const DrawRecord& draw,
     WorldCommandListData* cl_data) {
   std::lock_guard<std::mutex> lock(g_state.mutex);
-  const bool in_arm_set =
-      !g_state.arm_vs_set.empty()
-      && std::find(g_state.arm_vs_set.begin(), g_state.arm_vs_set.end(), draw.vs_hash) != g_state.arm_vs_set.end();
-  if (g_state.auto_research.active && g_state.arm_window_open && in_arm_set) {
-    g_state.auto_research.armed_draws[draw.vs_hash] += 1u;
-    g_state.auto_research.round_armed_draws[draw.vs_hash] += 1u;
-    g_state.auto_research.window_armed_draws[draw.vs_hash] += 1u;
-  }
   if (!g_state.arm_active) return;
-  if (!g_state.arm_vs_set.empty()) {
-    if (!in_arm_set) return;
-  } else if (g_state.arm_vs_hash != 0u && g_state.arm_vs_hash != draw.vs_hash) {
-    return;
-  }
+  if (g_state.arm_vs_hash != 0u && g_state.arm_vs_hash != draw.vs_hash) return;
   if (g_state.arm_serial != 0u && g_state.arm_serial != draw.serial) return;
-
-  if (g_state.auto_research.active && in_arm_set) {
-    const auto retry_it = g_state.auto_research.probe_retry_counts.find(draw.vs_hash);
-    const uint32_t retries =
-        retry_it != g_state.auto_research.probe_retry_counts.end() ? retry_it->second : 0u;
-    if (retries < kProbeRetryBudget) {
-      const auto rejected_it = g_state.auto_research.probe_rejected_draws.find(draw.vs_hash);
-      if (rejected_it != g_state.auto_research.probe_rejected_draws.end()) {
-        auto& rejected = rejected_it->second;
-        const auto key_it = rejected.find(HintDrawKey(draw));
-        if (key_it != rejected.end()) {
-          if (key_it->second > 0u) {
-            key_it->second -= 1u;
-            // A skipped retired draw continues the same scheduling window; it
-            // must not be counted as a fresh arm window or round window.
-            g_state.auto_research.window_continuation = true;
-            return;
-          }
-          rejected.erase(key_it);
-        }
-      }
-    }
-  }
 
   g_state.arm_active = false;
   g_state.captured = {};
@@ -303,6 +266,10 @@ inline void CaptureLightingInputs(
     g_state.depth_source.resource = depth_resource;
     g_state.depth_source.width = width;
     g_state.depth_source.height = height;
+    g_state.depth_source.viewport_x = record.has_viewport ? record.viewport.x : 0.f;
+    g_state.depth_source.viewport_y = record.has_viewport ? record.viewport.y : 0.f;
+    g_state.depth_source.viewport_width = record.has_viewport ? record.viewport.width : 0.f;
+    g_state.depth_source.viewport_height = record.has_viewport ? record.viewport.height : 0.f;
   }
 }
 
@@ -440,6 +407,22 @@ struct WorldDrawCallback {
     const uint32_t stride = args.stride != 0u ? args.stride : (indexed ? 20u : 16u);
     uint32_t draw_count = args.draw_count != 0u ? args.draw_count : 1u;
 
+    auto* cl_data = GetWorldCommandListData(context.cmd_list);
+    DrawRecord record;
+    FillCommonDrawRecord(&record, context.cmd_list, device);
+    record.method = indexed ? 1u : 0u;
+    record.frame = g_state.frame.load();
+    FillDrawBindingMasks(&record, cl_data);
+
+    // The pool copies b1, the args and the instance window on the command list
+    // here and reads them back later without waiting.
+    bvh::OnPoolScanIndirectDraw(
+        device, context.cmd_list, record, cl_data, args.buffer, args.offset, draw_count, stride);
+
+    // The census reads the args back at present with a GPU wait, so it only
+    // runs while the census itself is on.
+    if (!CensusEnabled()) return {};
+
     auto& pending = PendingIndirectDraws();
     if (pending.size() >= kMaxIndirectCallsPerFrame) {
       IndirectDroppedCalls() += 1u;
@@ -450,7 +433,6 @@ struct WorldDrawCallback {
     const uint64_t read_size = static_cast<uint64_t>(draw_count) * stride;
     if (read_size == 0u) return {};
 
-    auto* cl_data = GetWorldCommandListData(context.cmd_list);
     if (IndirectStagingUsed() + read_size > kMaxIndirectReadBytes) {
       IndirectDroppedCalls() += 1u;
       return {};
@@ -472,10 +454,7 @@ struct WorldDrawCallback {
         args.buffer, args.offset, IndirectStagingResource(), IndirectStagingUsed(), read_size);
     IndirectStagingUsed() += read_size;
 
-    FillCommonDrawRecord(&draw.record, context.cmd_list, device);
-    draw.record.method = indexed ? 1u : 0u;
-    draw.record.frame = g_state.frame.load();
-    FillDrawBindingMasks(&draw.record, cl_data);
+    draw.record = record;
     if (cl_data != nullptr) draw.cl_data = *cl_data;
     pending.push_back(std::move(draw));
     return {};
@@ -485,8 +464,8 @@ struct WorldDrawCallback {
 // Resolves queued indirect draws at present: the args were copied on the game's
 // command list at the draw, so the counts match what the GPU executed. Each
 // sub-draw runs through the same classification/commit pipeline as a direct
-// draw, using the bindings captured at draw time. The pool only counts them:
-// its instance slice has to be copied at the draw, before the counts exist.
+// draw, using the bindings captured at draw time. The pool handles indirect
+// draws itself (OnPoolScanIndirectDraw) and does not use this path.
 inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
   if (queue == nullptr) return;
   auto& pending = PendingIndirectDraws();
@@ -532,7 +511,6 @@ inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
         record.serial = g_state.next_serial.fetch_add(1u);
         record.is_candidate = IsGeometryCandidate(record);
         CommitDrawRecord(record, device, cmd_list, &draw.cl_data);
-        bvh::CountPoolIndirectDraw();
       }
     }
     device->unmap_buffer_region(IndirectStagingResource());

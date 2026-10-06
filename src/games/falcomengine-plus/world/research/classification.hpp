@@ -79,18 +79,4 @@ inline uint64_t MeshKey(const DrawRecord& draw) {
   return key;
 }
 
-inline uint64_t HintDrawKey(const DrawRecord& draw) {
-  uint64_t key = MeshKey(draw);
-  const auto mix = [&key](uint64_t value) {
-    key ^= value;
-    key *= 1099511628211ull;
-  };
-  mix(draw.first_instance);
-  mix(draw.instance_count);
-  mix(draw.vs_hash);
-  mix(draw.ps_hash);
-  mix(draw.method);
-  return key;
-}
-
 }  // namespace falcom_world

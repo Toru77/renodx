@@ -17,6 +17,11 @@
 // The slot is read back two presents later (no stall), and a copy is only
 // used when the GPU-side b1 equals the CPU base it was sliced with.
 //
+// Indirect draws keep their index and instance counts in a GPU buffer, so at
+// the draw the pool copies b1, the 20-byte args and a window of up to
+// kPoolIndirectWindow elements from base; resolve reads the counts from the
+// copied args and uses the first instance_count elements of the window.
+//
 // An instance is admitted once the same (mesh, world matrix) pair was read in
 // two different frames, which keeps moving objects out. Meshes are captured a
 // few per frame, merged by content, and retired with their instances when
@@ -67,6 +72,12 @@ inline constexpr uint32_t kPoolStagingSlots = 3u;           // read back two pre
 inline constexpr uint64_t kPoolStagingSlotBytes = 8ull * 1024ull * 1024ull;
 inline constexpr uint64_t kPoolCbCopyBytes = 16u;           // b1 copy, keeps slices 16-byte aligned
 inline constexpr uint32_t kPoolMaxInstancesPerDraw = 4096u;
+inline constexpr uint64_t kPoolIndirectArgsBytes = 32u;     // 20-byte indexed args, padded to 16
+inline constexpr uint32_t kPoolIndirectArgsCopyBytes = 20u;
+inline constexpr uint32_t kPoolIndirectWindow = 512u;       // instances copied per indirect draw
+inline constexpr uint32_t kPoolMaxIndirectSubDraws = 64u;
+inline constexpr uint32_t kPoolMaxRejectSamples = 2u;       // per family, for the dump
+inline constexpr size_t kPoolMaxNearIndex = 500000u;
 inline constexpr uint32_t kPoolMeshCapturesPerFrame = 2u;
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr size_t kPoolMaxMeshes = 8192u;
@@ -79,7 +90,7 @@ inline constexpr float kPoolRegionMaxSize = 512.f;
 enum class PoolSkip : uint8_t {
   None = 0,
   NotRigid,
-  DrawState,         // rigid VS, but not an opaque depth-writing indexed triangle list
+  DrawState,         // rigid VS, but not an opaque depth-writing indexed triangle list (see PoolDrawState)
   AlphaTested,       // pixel shader cuts holes (alphaTestThreshold_g)
   PixelUnknown,      // pixel shader unclassified or unparsable
   NoInstanceSrv,     // nothing bound at t15
@@ -106,6 +117,56 @@ inline const char* PoolSkipName(PoolSkip skip) {
     case PoolSkip::NoStaging:        return "no_staging";
     case PoolSkip::BudgetFull:       return "budget_full";
     default:                         return "none";
+  }
+}
+
+// First failing condition of the pool draw-state gate, in check order.
+enum class PoolDrawState : uint8_t {
+  Ok = 0,
+  NotIndexed,     // Draw / DrawInstanced(Indirect)
+  NoBuffers,      // no vertex or index buffer bound
+  NoDepthTarget,  // no depth-stencil view bound
+  IndexCount,     // fewer than 3 indices, or not a multiple of 3
+  Blend,          // blending on render target 0 (transparent, decals, clouds)
+  NoDepthTest,
+  NoDepthWrite,
+  Topology,       // not a triangle list
+  Count,
+};
+
+inline const char* PoolDrawStateName(PoolDrawState state) {
+  switch (state) {
+    case PoolDrawState::NotIndexed:    return "not_indexed";
+    case PoolDrawState::NoBuffers:     return "no_buffers";
+    case PoolDrawState::NoDepthTarget: return "no_depth_target";
+    case PoolDrawState::IndexCount:    return "index_count";
+    case PoolDrawState::Blend:         return "blend";
+    case PoolDrawState::NoDepthTest:   return "no_depth_test";
+    case PoolDrawState::NoDepthWrite:  return "no_depth_write";
+    case PoolDrawState::Topology:      return "topology";
+    default:                           return "ok";
+  }
+}
+
+// Why a world matrix failed the plausibility check (first failing test).
+enum class PoolMatrixReject : uint8_t {
+  None = 0,
+  NonFinite,
+  ZeroScale,   // an axis shorter than 1e-6: collapsed / hidden instance
+  SmallScale,  // an axis shorter than 0.05
+  LargeScale,  // an axis 50 or longer
+  Skewed,      // two axes nearly parallel
+  Count,
+};
+
+inline const char* PoolMatrixRejectName(PoolMatrixReject reject) {
+  switch (reject) {
+    case PoolMatrixReject::NonFinite:  return "non_finite";
+    case PoolMatrixReject::ZeroScale:  return "zero_scale";
+    case PoolMatrixReject::SmallScale: return "small_scale";
+    case PoolMatrixReject::LargeScale: return "large_scale";
+    case PoolMatrixReject::Skewed:     return "skewed";
+    default:                           return "none";
   }
 }
 
@@ -167,11 +228,15 @@ struct PoolMeshRequest {
 struct PoolPendingCopy {
   uint64_t cb_offset = 0u;
   uint64_t slice_offset = 0u;
-  uint32_t count = 0u;
+  uint32_t count = 0u;  // instances copied (the window for an indirect draw)
   int32_t cpu_base = 0;
   uint32_t frame = 0u;
   uint32_t vs_hash = 0u;
-  uint64_t mesh_key = 0u;
+  uint64_t mesh_key = 0u;  // 0 for an indirect draw until its args are read
+  // Indirect draws only: the draw record in PoolStagingSlot::indirect_draws
+  // (its counts are filled from the args at resolve) and the args location.
+  uint32_t indirect_index = UINT32_MAX;
+  uint64_t args_offset = 0u;
 };
 
 struct PoolStagingSlot {
@@ -179,6 +244,19 @@ struct PoolStagingSlot {
   uint64_t used = 0u;
   bool resolving = false;
   std::vector<PoolPendingCopy> copies;
+  std::vector<DrawRecord> indirect_draws;
+};
+
+struct PoolMatrixSample {
+  uint8_t reason = 0u;  // PoolMatrixReject (None for near-miss samples)
+  float matrix[kPoolWorldFloats] = {};
+};
+
+// First sighting of a (mesh, rounded placement); a later sighting with a
+// different exact matrix is a near miss (see ObservePoolInstance).
+struct PoolNearEntry {
+  uint64_t matrix_hash = 0u;
+  float matrix[kPoolWorldFloats] = {};
 };
 
 struct PoolSchedule {
@@ -189,20 +267,34 @@ struct PoolSchedule {
 struct PoolFamilyStats {
   uint8_t vs_class = 0u;
   uint64_t draws = 0u;
+  uint64_t indirect_draws = 0u;
   uint64_t copied = 0u;
   uint64_t instances_seen = 0u;
   uint32_t admitted = 0u;
   uint32_t base_mismatch = 0u;
   uint32_t rejected_matrix = 0u;
+  uint32_t near_misses = 0u;
+  float near_miss_max_delta = 0.f;  // largest element difference among near misses
   std::array<uint64_t, static_cast<size_t>(PoolSkip::Count)> skips = {};
+  std::array<uint64_t, static_cast<size_t>(PoolDrawState::Count)> draw_state = {};
+  std::array<uint32_t, static_cast<size_t>(PoolMatrixReject::Count)> matrix_rejects = {};
+  std::vector<PoolMatrixSample> reject_samples;
+  std::vector<PoolMatrixSample> near_miss_samples;  // pairs: first sighting, then the near miss
 };
 
 struct PoolStats {
   // Draw admission (counted per scanned draw).
   std::array<uint64_t, static_cast<size_t>(contract::VsClass::Count)> draws_by_vs_class = {};
   std::array<uint64_t, static_cast<size_t>(PoolSkip::Count)> skips = {};
+  std::array<uint64_t, static_cast<size_t>(PoolDrawState::Count)> draw_state = {};
   uint64_t copied_draws = 0u;
-  uint64_t skipped_indirect = 0u;
+  // Indirect draws (sub-draws seen while scanning; also counted above).
+  std::array<uint64_t, static_cast<size_t>(contract::VsClass::Count)> indirect_by_vs_class = {};
+  uint64_t indirect_copied = 0u;
+  uint64_t indirect_resolved = 0u;
+  uint64_t indirect_empty = 0u;      // args with zero indices or instances
+  uint64_t indirect_truncated = 0u;  // instance_count larger than the copied window
+  uint64_t indirect_dead = 0u;       // VB/IB released before the args were read
   // Read back.
   uint64_t base_verified = 0u;
   uint64_t base_mismatch = 0u;
@@ -212,6 +304,8 @@ struct PoolStats {
   uint32_t staging_failures = 0u;
   uint64_t instances_seen = 0u;
   uint64_t rejected_matrix = 0u;
+  std::array<uint64_t, static_cast<size_t>(PoolMatrixReject::Count)> matrix_rejects = {};
+  uint64_t near_misses = 0u;
   uint64_t moving_instances = 0u;  // world != prevWorld at the draw (diagnostic)
   uint32_t rejected_bounds = 0u;
   uint32_t dedup_instances = 0u;
@@ -260,6 +354,12 @@ struct PoolState {
   std::unordered_map<InstanceKey, ObservedInstance, InstanceKeyHash> observations;
   std::unordered_set<uint64_t> admitted_keys;  // (mesh_id, matrix) already in `instances`
   std::vector<WorldInstance> instances;
+  std::unordered_map<uint64_t, PoolNearEntry> near_index;  // (mesh, rounded placement) -> first sighting
+
+  // VB/IB handles referenced by indirect copies not read back yet, and the
+  // ones among them released meanwhile (their mesh must not be captured).
+  std::unordered_map<uint64_t, uint32_t> indirect_refs;
+  std::unordered_set<uint64_t> indirect_dead;
 
   std::unordered_map<uint64_t, PoolSchedule> schedule;
   std::unordered_map<uint32_t, PoolFamilyStats> families;  // by VS hash, display only
@@ -273,52 +373,6 @@ inline uint64_t PoolMix(uint64_t hash, uint64_t value) {
   hash ^= value;
   hash *= 1099511628211ull;
   return hash;
-}
-
-// ---------------------------------------------------------------------------
-// Research helpers (Auto Research still records layouts with these).
-
-inline bool IsPoolStructuredKind(uint8_t kind) {
-  return kind == static_cast<uint8_t>(CandidateKind::Inst4x3Row)
-         || kind == static_cast<uint8_t>(CandidateKind::Inst4x3Col)
-         || kind == static_cast<uint8_t>(CandidateKind::Inst4x4Row)
-         || kind == static_cast<uint8_t>(CandidateKind::Inst4x4Col);
-}
-
-// Chooses the instance layout research should record: the engine's canonical
-// path (slot 15, stride 160) first, row kinds before col, then any other
-// instance layout. Returns false when the family has no instance layout.
-inline bool SelectPoolInstanceLayout(
-    const std::vector<PassingLayout>& layouts,
-    PassingLayout* out_layout) {
-  if (out_layout == nullptr) return false;
-  const PassingLayout* canonical_col = nullptr;
-  const PassingLayout* fallback = nullptr;
-  for (const auto& layout : layouts) {
-    if (!IsPoolStructuredKind(static_cast<uint8_t>(layout.kind))) continue;
-    const bool canonical_slot = layout.slot == kPoolInstanceSlot && layout.stride == kPoolInstanceStride;
-    if (canonical_slot) {
-      const uint8_t kind_value = static_cast<uint8_t>(layout.kind);
-      const bool row_kind = kind_value == static_cast<uint8_t>(CandidateKind::Inst4x3Row)
-                            || kind_value == static_cast<uint8_t>(CandidateKind::Inst4x4Row);
-      if (row_kind) {
-        *out_layout = layout;
-        return true;
-      }
-      if (canonical_col == nullptr) canonical_col = &layout;
-    } else if (fallback == nullptr) {
-      fallback = &layout;
-    }
-  }
-  if (canonical_col != nullptr) {
-    *out_layout = *canonical_col;
-    return true;
-  }
-  if (fallback != nullptr) {
-    *out_layout = *fallback;
-    return true;
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,10 +418,11 @@ inline void PoolMatrixTranslation(const float* matrix, float* out) {
 }
 
 // The linear part must be a plausible rigid/scaled basis: finite, per-axis
-// length in (0.05, 50) and no two axes nearly parallel.
-inline bool PoolWorldPlausible(const float* matrix) {
+// length in (0.05, 50) and no two axes nearly parallel. Returns the first
+// failing test.
+inline PoolMatrixReject CheckPoolWorld(const float* matrix) {
   for (uint32_t i = 0; i < kPoolWorldFloats; ++i) {
-    if (!std::isfinite(matrix[i])) return false;
+    if (!std::isfinite(matrix[i])) return PoolMatrixReject::NonFinite;
   }
   const float rows[3][3] = {
       {matrix[0], matrix[1], matrix[2]},
@@ -377,16 +432,22 @@ inline bool PoolWorldPlausible(const float* matrix) {
   float lengths[3] = {};
   for (int r = 0; r < 3; ++r) {
     lengths[r] = std::sqrt(rows[r][0] * rows[r][0] + rows[r][1] * rows[r][1] + rows[r][2] * rows[r][2]);
-    if (!(lengths[r] > 0.05f && lengths[r] < 50.f)) return false;
+    if (!(lengths[r] >= 1e-6f)) return PoolMatrixReject::ZeroScale;
+    if (!(lengths[r] > 0.05f)) return PoolMatrixReject::SmallScale;
+    if (!(lengths[r] < 50.f)) return PoolMatrixReject::LargeScale;
   }
   for (int a = 0; a < 3; ++a) {
     for (int b = a + 1; b < 3; ++b) {
       const float dot = (rows[a][0] * rows[b][0] + rows[a][1] * rows[b][1] + rows[a][2] * rows[b][2])
                         / (lengths[a] * lengths[b]);
-      if (!(std::fabs(dot) < 0.995f)) return false;
+      if (!(std::fabs(dot) < 0.995f)) return PoolMatrixReject::Skewed;
     }
   }
-  return true;
+  return PoolMatrixReject::None;
+}
+
+inline bool PoolWorldPlausible(const float* matrix) {
+  return CheckPoolWorld(matrix) == PoolMatrixReject::None;
 }
 
 inline bool ComputePoolInstanceBounds(const WorldMesh& mesh, const float* matrix, float* out_min, float* out_max) {
@@ -523,14 +584,23 @@ inline void UpdatePoolStats() {
 
 // Opaque, depth-writing, indexed triangle-list geometry. No render target or
 // pixel shader is required: shadow casters are the same objects and also see
-// objects outside the camera view.
-inline bool IsPoolGeometryDraw(const DrawRecord& draw) {
-  if (draw.method != 1u || !draw.has_index_buffer) return false;
-  if (draw.vb.handle == 0u || draw.ib.handle == 0u || draw.dsv.handle == 0u) return false;
-  if (draw.index_count < 3u || (draw.index_count % 3u) != 0u) return false;
-  if (draw.blend_enable || !draw.depth_enable || !draw.depth_write) return false;
-  return draw.topology == reshade::api::primitive_topology::undefined
-         || draw.topology == reshade::api::primitive_topology::triangle_list;
+// objects outside the camera view. An indirect draw's index count is only
+// known once its args are read back, so it is checked there.
+inline PoolDrawState CheckPoolDrawState(const DrawRecord& draw, bool check_index_count) {
+  if (draw.method != 1u || !draw.has_index_buffer) return PoolDrawState::NotIndexed;
+  if (draw.vb.handle == 0u || draw.ib.handle == 0u) return PoolDrawState::NoBuffers;
+  if (draw.dsv.handle == 0u) return PoolDrawState::NoDepthTarget;
+  if (check_index_count && (draw.index_count < 3u || (draw.index_count % 3u) != 0u)) {
+    return PoolDrawState::IndexCount;
+  }
+  if (draw.blend_enable) return PoolDrawState::Blend;
+  if (!draw.depth_enable) return PoolDrawState::NoDepthTest;
+  if (!draw.depth_write) return PoolDrawState::NoDepthWrite;
+  if (draw.topology != reshade::api::primitive_topology::undefined
+      && draw.topology != reshade::api::primitive_topology::triangle_list) {
+    return PoolDrawState::Topology;
+  }
+  return PoolDrawState::Ok;
 }
 
 // Geometry identity of an indexed draw: the same VB/IB range is one mesh
@@ -563,17 +633,72 @@ inline uint64_t PoolAdmittedKey(uint32_t mesh_id, uint64_t matrix_hash) {
   return PoolMix(PoolMix(1469598103934665603ull, mesh_id), matrix_hash);
 }
 
+// Rate-limit identity of an indirect draw: its buffers and args location
+// (the counts themselves are not known at the draw).
+inline uint64_t PoolIndirectScheduleKey(const DrawRecord& draw, reshade::api::resource args_buffer, uint64_t args_offset) {
+  uint64_t key = PoolMix(1469598103934665603ull, draw.vb.handle);
+  key = PoolMix(key, draw.vb_offset);
+  key = PoolMix(key, draw.ib.handle);
+  key = PoolMix(key, draw.ib_offset);
+  key = PoolMix(key, args_buffer.handle);
+  return PoolMix(key, args_offset);
+}
+
+// (mesh, placement rounded to 1 cm and 1e-3 of the basis): two sightings with
+// the same near key but different exact matrices are almost the same
+// placement, which the exact-match stability rule would never admit.
+inline uint64_t PoolNearKey(uint64_t mesh_key, const float* world) {
+  uint64_t key = PoolMix(1469598103934665603ull, mesh_key);
+  for (int row = 0; row < 3; ++row) {
+    for (int column = 0; column < 3; ++column) {
+      key = PoolMix(key, static_cast<uint64_t>(std::llround(static_cast<double>(world[row * 4 + column]) * 1000.0)));
+    }
+    key = PoolMix(key, static_cast<uint64_t>(std::llround(static_cast<double>(world[row * 4 + 3]) * 100.0)));
+  }
+  return key;
+}
+
 // ---------------------------------------------------------------------------
 // Staging ring.
 
 // Staging buffers are created and destroyed outside g_pool.mutex: resource
 // events raised by those calls must never re-enter a held pool lock.
 
+// Caller holds g_pool.mutex. An indirect copy keeps its VB/IB handles until
+// its args are read; a release in between marks them dead so no mesh is
+// captured from a destroyed buffer.
+inline void AddPoolIndirectRefs(const DrawRecord& draw) {
+  g_pool.indirect_refs[draw.vb.handle] += 1u;
+  if (draw.ib.handle != draw.vb.handle) g_pool.indirect_refs[draw.ib.handle] += 1u;
+}
+
+// Caller holds g_pool.mutex. Returns true when one of the buffers was
+// released after the draw.
+inline bool ReleasePoolIndirectRefs(const DrawRecord& draw) {
+  bool dead = false;
+  const uint64_t handles[2] = {draw.vb.handle, draw.ib.handle};
+  for (uint32_t i = 0; i < 2u; ++i) {
+    const uint64_t handle = handles[i];
+    if (i == 1u && handle == handles[0]) break;
+    if (g_pool.indirect_dead.count(handle) != 0u) dead = true;
+    const auto it = g_pool.indirect_refs.find(handle);
+    if (it == g_pool.indirect_refs.end()) continue;
+    if (it->second > 1u) {
+      it->second -= 1u;
+    } else {
+      g_pool.indirect_refs.erase(it);
+      g_pool.indirect_dead.erase(handle);
+    }
+  }
+  return dead;
+}
+
 // Caller holds g_pool.mutex. Detaches the ring and returns its buffers.
 inline std::vector<reshade::api::resource> DetachPoolStaging(reshade::api::device** out_device) {
   std::vector<reshade::api::resource> buffers;
   for (auto& slot : g_pool.slots) {
     if (slot.buffer.handle != 0u) buffers.push_back(slot.buffer);
+    for (const DrawRecord& draw : slot.indirect_draws) ReleasePoolIndirectRefs(draw);
     slot = {};
   }
   *out_device = g_pool.staging_device;
@@ -680,6 +805,31 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
   const InstanceKey key{mesh_key, MatrixHash(world, kPoolWorldFloats)};
   ObservedInstance& observed = g_pool.observations[key];
   if (observed.rejected || observed.admitted) return;
+  if (observed.count == 0u) {
+    // Diagnostic only: a new exact matrix next to an earlier one for the same
+    // mesh. Counts objects whose matrix jitters instead of staying identical.
+    const auto [near_it, inserted] = g_pool.near_index.try_emplace(PoolNearKey(mesh_key, world));
+    if (inserted) {
+      near_it->second.matrix_hash = key.matrix_hash;
+      std::memcpy(near_it->second.matrix, world, sizeof(float) * kPoolWorldFloats);
+    } else if (near_it->second.matrix_hash != key.matrix_hash) {
+      PoolFamilyStats& family = g_pool.families[vs_hash];
+      g_pool.stats.near_misses += 1u;
+      family.near_misses += 1u;
+      for (uint32_t i = 0; i < kPoolWorldFloats; ++i) {
+        family.near_miss_max_delta = (std::max)(family.near_miss_max_delta, std::fabs(world[i] - near_it->second.matrix[i]));
+      }
+      if (family.near_miss_samples.size() < 2u * kPoolMaxRejectSamples) {
+        PoolMatrixSample first;
+        std::memcpy(first.matrix, near_it->second.matrix, sizeof(float) * kPoolWorldFloats);
+        PoolMatrixSample second;
+        std::memcpy(second.matrix, world, sizeof(float) * kPoolWorldFloats);
+        family.near_miss_samples.push_back(first);
+        family.near_miss_samples.push_back(second);
+      }
+    }
+    if (g_pool.near_index.size() > kPoolMaxNearIndex) g_pool.near_index.clear();
+  }
   if (observed.count == 0u || observed.last_frame != frame) {
     observed.count += 1u;
     observed.last_frame = frame;
@@ -694,13 +844,107 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
 // ---------------------------------------------------------------------------
 // Draw-time scan.
 
-// Indirect draws carry their counts in GPU memory, so the instance slice is
-// unknown when the draw is recorded. None were seen in Sora 2nd; count them
-// so a gap is visible if that changes.
-inline void CountPoolIndirectDraw() {
-  if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
-  std::lock_guard<std::mutex> lock(g_pool.mutex);
-  g_pool.stats.skipped_indirect += 1u;
+struct PoolDrawGate {
+  contract::VsClass vs_class = contract::VsClass::Unclassified;
+  PoolSkip skip = PoolSkip::None;
+  PoolDrawState state = PoolDrawState::Ok;
+};
+
+// Shader classes first, then draw state, then the pixel shader.
+inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count) {
+  PoolDrawGate gate;
+  gate.vs_class = contract::LookupVertexClass(draw.vs_pipeline);
+  if (gate.vs_class != contract::VsClass::Rigid) {
+    gate.skip = PoolSkip::NotRigid;
+    return gate;
+  }
+  gate.state = CheckPoolDrawState(draw, check_index_count);
+  if (gate.state != PoolDrawState::Ok) {
+    gate.skip = PoolSkip::DrawState;
+    return gate;
+  }
+  const contract::PsClass ps_class = contract::LookupPixelClass(draw.ps_pipeline);
+  if (ps_class == contract::PsClass::AlphaTested) {
+    gate.skip = PoolSkip::AlphaTested;
+  } else if (ps_class != contract::PsClass::Opaque) {
+    gate.skip = PoolSkip::PixelUnknown;
+  }
+  return gate;
+}
+
+// The draw's instance source: t15, b1 and the elements available from the
+// CPU-mirrored base to the end of t15. D3D11 SV_InstanceID starts at 0
+// whatever StartInstanceLocation is (that only offsets per-instance vertex
+// streams), so a draw reads [instanceOffset_g, + instance_count).
+struct PoolSlice {
+  reshade::api::resource instance_buffer = {0u};
+  reshade::api::resource instance_cb = {0u};
+  int32_t base = 0;
+  uint64_t cb_bytes = 0u;
+  uint64_t available = 0u;  // elements from base to the end of t15
+};
+
+inline PoolSkip ResolvePoolSlice(
+    reshade::api::device* device,
+    reshade::api::command_list* cmd_list,
+    const WorldCommandListData* cl_data,
+    PoolSlice* slice) {
+  slice->instance_buffer = cl_data->vs_srv[kPoolInstanceSlot];
+  slice->instance_cb = cl_data->vs_cb[kPoolInstanceCbSlot];
+  if (slice->instance_buffer.handle == 0u) return PoolSkip::NoInstanceSrv;
+  if (slice->instance_cb.handle == 0u || !ReadTrackedCbInt(cmd_list, slice->instance_cb, &slice->base)) {
+    return PoolSkip::NoCpuBase;
+  }
+  const auto cb_desc = device->get_resource_desc(slice->instance_cb);
+  slice->cb_bytes = cb_desc.type == reshade::api::resource_type::buffer
+                        ? (std::min)(cb_desc.buffer.size, kPoolCbCopyBytes)
+                        : 0u;
+  if (slice->cb_bytes < sizeof(int32_t)) return PoolSkip::NoCpuBase;
+  const auto buffer_desc = device->get_resource_desc(slice->instance_buffer);
+  const uint64_t elements = buffer_desc.type == reshade::api::resource_type::buffer
+                                ? buffer_desc.buffer.size / kPoolInstanceStride
+                                : 0u;
+  if (slice->base < 0 || static_cast<uint64_t>(slice->base) >= elements) return PoolSkip::SliceRange;
+  slice->available = elements - static_cast<uint64_t>(slice->base);
+  return PoolSkip::None;
+}
+
+// Caller holds g_pool.mutex.
+inline void CountPoolSkip(PoolFamilyStats& family, PoolSkip skip, PoolDrawState state) {
+  g_pool.stats.skips[static_cast<size_t>(skip)] += 1u;
+  family.skips[static_cast<size_t>(skip)] += 1u;
+  if (skip == PoolSkip::DrawState) {
+    g_pool.stats.draw_state[static_cast<size_t>(state)] += 1u;
+    family.draw_state[static_cast<size_t>(state)] += 1u;
+  }
+}
+
+// Caller holds g_pool.mutex. Applies the per-identity cooldown and checks the
+// write slot; on None, `*out_schedule` is the identity to stamp after copying.
+inline PoolSkip ReservePoolCopy(
+    reshade::api::device* device,
+    uint64_t schedule_key,
+    uint32_t frame,
+    uint64_t bytes,
+    PoolSchedule** out_schedule) {
+  PoolSchedule& schedule = g_pool.schedule[schedule_key];
+  const PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
+  if (schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
+    return PoolSkip::Cooldown;
+  }
+  if (g_pool.staging_device != device || slot.buffer.handle == 0u || slot.resolving) return PoolSkip::NoStaging;
+  if (slot.used + bytes > kPoolStagingSlotBytes) return PoolSkip::BudgetFull;
+  *out_schedule = &schedule;
+  return PoolSkip::None;
+}
+
+// Caller holds g_pool.mutex.
+inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw) {
+  if (!g_pool.mesh_queued.insert(mesh_key).second) return;
+  if (g_pool.mesh_by_key.count(mesh_key) != 0u || g_pool.failed_meshes.count(mesh_key) != 0u) return;
+  g_pool.mesh_queue.push_back({mesh_key, vs_hash, draw});
+  g_pool.keys_by_resource[draw.vb.handle].push_back(mesh_key);
+  if (draw.ib.handle != draw.vb.handle) g_pool.keys_by_resource[draw.ib.handle].push_back(mesh_key);
 }
 
 inline void OnPoolScanDraw(
@@ -711,57 +955,16 @@ inline void OnPoolScanDraw(
   if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
   if (device == nullptr || cmd_list == nullptr || cl_data == nullptr) return;
 
-  const contract::VsClass vs_class = contract::LookupVertexClass(draw.vs_pipeline);
-  PoolSkip skip = PoolSkip::None;
-  if (vs_class != contract::VsClass::Rigid) {
-    skip = PoolSkip::NotRigid;
-  } else if (!IsPoolGeometryDraw(draw)) {
-    skip = PoolSkip::DrawState;
-  } else {
-    const contract::PsClass ps_class = contract::LookupPixelClass(draw.ps_pipeline);
-    if (ps_class == contract::PsClass::AlphaTested) {
-      skip = PoolSkip::AlphaTested;
-    } else if (ps_class != contract::PsClass::Opaque) {
-      skip = PoolSkip::PixelUnknown;
-    }
-  }
-
-  reshade::api::resource instance_buffer = {0u};
-  reshade::api::resource instance_cb = {0u};
-  int32_t base = 0;
-  uint32_t count = 0u;
-  uint64_t slice_offset = 0u;
-  uint64_t slice_bytes = 0u;
-  uint64_t cb_bytes = 0u;
+  const PoolDrawGate gate = GatePoolDraw(draw, true);
+  PoolSkip skip = gate.skip;
+  PoolSlice slice;
+  const uint32_t count = draw.instance_count == 0u ? 1u : draw.instance_count;
+  if (skip == PoolSkip::None) skip = ResolvePoolSlice(device, cmd_list, cl_data, &slice);
   if (skip == PoolSkip::None) {
-    instance_buffer = cl_data->vs_srv[kPoolInstanceSlot];
-    instance_cb = cl_data->vs_cb[kPoolInstanceCbSlot];
-    count = draw.instance_count == 0u ? 1u : draw.instance_count;
-    if (instance_buffer.handle == 0u) {
-      skip = PoolSkip::NoInstanceSrv;
-    } else if (instance_cb.handle == 0u || !ReadTrackedCbInt(cmd_list, instance_cb, &base)) {
-      skip = PoolSkip::NoCpuBase;
-    } else if (count > kPoolMaxInstancesPerDraw) {
+    if (count > kPoolMaxInstancesPerDraw) {
       skip = PoolSkip::TooManyInstances;
-    } else {
-      const auto buffer_desc = device->get_resource_desc(instance_buffer);
-      const auto cb_desc = device->get_resource_desc(instance_cb);
-      // D3D11 SV_InstanceID starts at 0 whatever StartInstanceLocation is
-      // (that only offsets per-instance vertex streams), so the elements
-      // read are [instanceOffset_g, + count).
-      const int64_t first = static_cast<int64_t>(base);
-      const uint64_t buffer_size =
-          buffer_desc.type == reshade::api::resource_type::buffer ? buffer_desc.buffer.size : 0u;
-      cb_bytes = cb_desc.type == reshade::api::resource_type::buffer
-                     ? (std::min)(cb_desc.buffer.size, kPoolCbCopyBytes)
-                     : 0u;
-      slice_offset = first < 0 ? 0u : static_cast<uint64_t>(first) * kPoolInstanceStride;
-      slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
-      if (cb_bytes < sizeof(int32_t)) {
-        skip = PoolSkip::NoCpuBase;
-      } else if (first < 0 || slice_offset + slice_bytes > buffer_size) {
-        skip = PoolSkip::SliceRange;
-      }
+    } else if (count > slice.available) {
+      skip = PoolSkip::SliceRange;
     }
   }
 
@@ -769,52 +972,124 @@ inline void OnPoolScanDraw(
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
   std::lock_guard<std::mutex> lock(g_pool.mutex);
-  g_pool.stats.draws_by_vs_class[static_cast<size_t>(vs_class)] += 1u;
+  g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
   PoolFamilyStats& family = g_pool.families[draw.vs_hash];
-  family.vs_class = static_cast<uint8_t>(vs_class);
+  family.vs_class = static_cast<uint8_t>(gate.vs_class);
   family.draws += 1u;
 
   if (skip == PoolSkip::None) {
-    PoolSchedule& schedule = g_pool.schedule[PoolScheduleKey(mesh_key, draw.first_instance, count)];
-    PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
-    if (schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
-      skip = PoolSkip::Cooldown;
-    } else if (g_pool.staging_device != device || slot.buffer.handle == 0u || slot.resolving) {
-      skip = PoolSkip::NoStaging;
-    } else if (slot.used + kPoolCbCopyBytes + slice_bytes > kPoolStagingSlotBytes) {
-      skip = PoolSkip::BudgetFull;
-    } else {
+    const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
+    PoolSchedule* schedule = nullptr;
+    skip = ReservePoolCopy(
+        device, PoolScheduleKey(mesh_key, draw.first_instance, count), frame, kPoolCbCopyBytes + slice_bytes, &schedule);
+    if (skip == PoolSkip::None) {
+      PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
       PoolPendingCopy copy;
       copy.cb_offset = slot.used;
       copy.slice_offset = slot.used + kPoolCbCopyBytes;
       copy.count = count;
-      copy.cpu_base = base;
+      copy.cpu_base = slice.base;
       copy.frame = frame;
       copy.vs_hash = draw.vs_hash;
       copy.mesh_key = mesh_key;
       // The b1 copy runs at this point of the command stream, so it holds
       // exactly the offset this draw reads; resolve compares it to `base`.
-      cmd_list->copy_buffer_region(instance_cb, 0u, slot.buffer, copy.cb_offset, cb_bytes);
-      cmd_list->copy_buffer_region(instance_buffer, slice_offset, slot.buffer, copy.slice_offset, slice_bytes);
+      cmd_list->copy_buffer_region(slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes);
+      cmd_list->copy_buffer_region(
+          slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride,
+          slot.buffer, copy.slice_offset, slice_bytes);
       slot.used += kPoolCbCopyBytes + slice_bytes;
       slot.copies.push_back(copy);
-      schedule.copy_frame = frame;
-      schedule.next_frame = frame + kPoolRecaptureFrames;
+      schedule->copy_frame = frame;
+      schedule->next_frame = frame + kPoolRecaptureFrames;
       g_pool.stats.copied_draws += 1u;
       family.copied += 1u;
-
-      if (g_pool.mesh_queued.insert(mesh_key).second) {
-        if (g_pool.mesh_by_key.count(mesh_key) == 0u && g_pool.failed_meshes.count(mesh_key) == 0u) {
-          g_pool.mesh_queue.push_back({mesh_key, draw.vs_hash, draw});
-          g_pool.keys_by_resource[draw.vb.handle].push_back(mesh_key);
-          if (draw.ib.handle != draw.vb.handle) g_pool.keys_by_resource[draw.ib.handle].push_back(mesh_key);
-        }
-      }
+      QueuePoolMesh(mesh_key, draw.vs_hash, draw);
       return;
     }
   }
-  g_pool.stats.skips[static_cast<size_t>(skip)] += 1u;
-  family.skips[static_cast<size_t>(skip)] += 1u;
+  CountPoolSkip(family, skip, gate.state);
+}
+
+// DrawIndexedInstancedIndirect and friends. `draw` carries the bindings at
+// the draw; its counts come from the args at resolve.
+inline void OnPoolScanIndirectDraw(
+    reshade::api::device* device,
+    reshade::api::command_list* cmd_list,
+    const DrawRecord& draw,
+    WorldCommandListData* cl_data,
+    reshade::api::resource args_buffer,
+    uint64_t args_offset,
+    uint32_t draw_count,
+    uint32_t stride) {
+  if (!g_pool.scan_active.load(std::memory_order_relaxed)) return;
+  if (device == nullptr || cmd_list == nullptr || cl_data == nullptr || args_buffer.handle == 0u) return;
+
+  const PoolDrawGate gate = GatePoolDraw(draw, false);
+  PoolSkip skip = gate.skip;
+  PoolSlice slice;
+  if (skip == PoolSkip::None) skip = ResolvePoolSlice(device, cmd_list, cl_data, &slice);
+  const uint32_t window = static_cast<uint32_t>((std::min)(static_cast<uint64_t>(kPoolIndirectWindow), slice.available));
+  if (skip == PoolSkip::None && window == 0u) skip = PoolSkip::SliceRange;
+  uint64_t args_size = 0u;
+  if (skip == PoolSkip::None) {
+    const auto args_desc = device->get_resource_desc(args_buffer);
+    args_size = args_desc.type == reshade::api::resource_type::buffer ? args_desc.buffer.size : 0u;
+  }
+
+  const uint32_t frame = g_state.frame.load();
+  const uint32_t sub_draws = (std::min)(draw_count == 0u ? 1u : draw_count, kPoolMaxIndirectSubDraws);
+  const uint64_t bytes = kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
+
+  std::lock_guard<std::mutex> lock(g_pool.mutex);
+  PoolFamilyStats& family = g_pool.families[draw.vs_hash];
+  family.vs_class = static_cast<uint8_t>(gate.vs_class);
+  for (uint32_t i = 0; i < sub_draws; ++i) {
+    g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
+    g_pool.stats.indirect_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
+    family.draws += 1u;
+    family.indirect_draws += 1u;
+
+    PoolSkip sub_skip = skip;
+    const uint64_t sub_args_offset = args_offset + static_cast<uint64_t>(i) * stride;
+    if (sub_skip == PoolSkip::None && sub_args_offset + kPoolIndirectArgsCopyBytes > args_size) {
+      sub_skip = PoolSkip::SliceRange;
+    }
+    PoolSchedule* schedule = nullptr;
+    if (sub_skip == PoolSkip::None) {
+      sub_skip = ReservePoolCopy(
+          device, PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset), frame, bytes, &schedule);
+    }
+    if (sub_skip != PoolSkip::None) {
+      CountPoolSkip(family, sub_skip, gate.state);
+      continue;
+    }
+
+    PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
+    PoolPendingCopy copy;
+    copy.cb_offset = slot.used;
+    copy.args_offset = slot.used + kPoolCbCopyBytes;
+    copy.slice_offset = slot.used + kPoolCbCopyBytes + kPoolIndirectArgsBytes;
+    copy.count = window;
+    copy.cpu_base = slice.base;
+    copy.frame = frame;
+    copy.vs_hash = draw.vs_hash;
+    copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
+    cmd_list->copy_buffer_region(slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes);
+    cmd_list->copy_buffer_region(args_buffer, sub_args_offset, slot.buffer, copy.args_offset, kPoolIndirectArgsCopyBytes);
+    cmd_list->copy_buffer_region(
+        slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride,
+        slot.buffer, copy.slice_offset, static_cast<uint64_t>(window) * kPoolInstanceStride);
+    slot.used += bytes;
+    slot.copies.push_back(copy);
+    slot.indirect_draws.push_back(draw);
+    AddPoolIndirectRefs(draw);
+    schedule->copy_frame = frame;
+    schedule->next_frame = frame + kPoolRecaptureFrames;
+    g_pool.stats.copied_draws += 1u;
+    g_pool.stats.indirect_copied += 1u;
+    family.copied += 1u;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +1116,9 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
 inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::resource resource) {
   (void)device;
   std::lock_guard<std::mutex> lock(g_pool.mutex);
+  if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
+    g_pool.indirect_dead.insert(resource.handle);
+  }
   if (g_pool.keys_by_resource.empty()) return;
   const auto it = g_pool.keys_by_resource.find(resource.handle);
   if (it == g_pool.keys_by_resource.end()) return;
@@ -1002,13 +1280,30 @@ struct PoolResolvedCopy {
   bool verified = false;
   int32_t gpu_base = 0;
   size_t first_world = 0u;  // index into the parsed world list
+  uint32_t count = 0u;      // elements parsed
+  uint32_t args[5] = {};    // indirect: index_count, instance_count, first_index, vertex_offset, first_instance
 };
+
+// Caller holds g_pool.mutex.
+inline void CountPoolMatrixReject(PoolFamilyStats& family, PoolMatrixReject reject, const float* world) {
+  g_pool.stats.rejected_matrix += 1u;
+  g_pool.stats.matrix_rejects[static_cast<size_t>(reject)] += 1u;
+  family.rejected_matrix += 1u;
+  family.matrix_rejects[static_cast<size_t>(reject)] += 1u;
+  if (family.reject_samples.size() < kPoolMaxRejectSamples) {
+    PoolMatrixSample sample;
+    sample.reason = static_cast<uint8_t>(reject);
+    std::memcpy(sample.matrix, world, sizeof(float) * kPoolWorldFloats);
+    family.reject_samples.push_back(sample);
+  }
+}
 
 // Reads one staging slot that the GPU finished two presents ago and applies
 // its copies. The map happens without holding g_pool.mutex so recording
 // threads are not blocked; the slot is flagged `resolving` meanwhile.
 inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   std::vector<PoolPendingCopy> copies;
+  std::vector<DrawRecord> indirect_draws;
   reshade::api::resource buffer = {0u};
   uint64_t used = 0u;
   {
@@ -1016,13 +1311,18 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     PoolStagingSlot& slot = g_pool.slots[slot_index];
     if (slot.copies.empty()) {
       slot.used = 0u;
+      slot.indirect_draws.clear();
       return;
     }
     copies.swap(slot.copies);
+    indirect_draws.swap(slot.indirect_draws);
     buffer = slot.buffer;
     used = slot.used;
     slot.resolving = true;
   }
+  const auto is_indirect = [&indirect_draws](const PoolPendingCopy& copy) {
+    return copy.indirect_index != UINT32_MAX && copy.indirect_index < indirect_draws.size();
+  };
 
   std::vector<PoolResolvedCopy> resolved(copies.size());
   std::vector<float> worlds;  // kPoolWorldFloats per instance of verified copies
@@ -1035,11 +1335,17 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     const auto* bytes = static_cast<const uint8_t*>(mapped);
     for (size_t i = 0; i < copies.size(); ++i) {
       const PoolPendingCopy& copy = copies[i];
-      std::memcpy(&resolved[i].gpu_base, bytes + copy.cb_offset, sizeof(int32_t));
-      resolved[i].verified = resolved[i].gpu_base == copy.cpu_base;
-      if (!resolved[i].verified) continue;
-      resolved[i].first_world = worlds.size() / kPoolWorldFloats;
-      for (uint32_t element = 0; element < copy.count; ++element) {
+      PoolResolvedCopy& result = resolved[i];
+      std::memcpy(&result.gpu_base, bytes + copy.cb_offset, sizeof(int32_t));
+      result.verified = result.gpu_base == copy.cpu_base;
+      if (!result.verified) continue;
+      result.count = copy.count;
+      if (is_indirect(copy)) {
+        std::memcpy(result.args, bytes + copy.args_offset, sizeof(result.args));
+        result.count = (std::min)(result.args[1], copy.count);
+      }
+      result.first_world = worlds.size() / kPoolWorldFloats;
+      for (uint32_t element = 0; element < result.count; ++element) {
         const uint8_t* instance = bytes + copy.slice_offset + static_cast<uint64_t>(element) * kPoolInstanceStride;
         const size_t offset = worlds.size();
         worlds.resize(offset + kPoolWorldFloats);
@@ -1058,31 +1364,65 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   slot.used = 0u;
   if (!mapped_ok) {
     g_pool.stats.map_failures += 1u;
+    for (const DrawRecord& draw : indirect_draws) ReleasePoolIndirectRefs(draw);
     return;
   }
   for (size_t i = 0; i < copies.size(); ++i) {
     const PoolPendingCopy& copy = copies[i];
+    const PoolResolvedCopy& result = resolved[i];
     PoolFamilyStats& family = g_pool.families[copy.vs_hash];
-    if (!resolved[i].verified) {
+    const bool indirect = is_indirect(copy);
+    const bool buffers_dead = indirect && ReleasePoolIndirectRefs(indirect_draws[copy.indirect_index]);
+    if (!result.verified) {
       g_pool.stats.base_mismatch += 1u;
       g_pool.stats.last_mismatch_cpu = copy.cpu_base;
-      g_pool.stats.last_mismatch_gpu = resolved[i].gpu_base;
+      g_pool.stats.last_mismatch_gpu = result.gpu_base;
       family.base_mismatch += 1u;
       continue;
     }
     g_pool.stats.base_verified += 1u;
-    for (uint32_t element = 0; element < copy.count; ++element) {
-      const size_t index = resolved[i].first_world + element;
+
+    uint64_t mesh_key = copy.mesh_key;
+    if (indirect) {
+      g_pool.stats.indirect_resolved += 1u;
+      const uint32_t index_count = result.args[0];
+      const uint32_t instance_count = result.args[1];
+      if (index_count == 0u || instance_count == 0u) {
+        g_pool.stats.indirect_empty += 1u;
+        continue;
+      }
+      if (index_count < 3u || (index_count % 3u) != 0u) {
+        g_pool.stats.draw_state[static_cast<size_t>(PoolDrawState::IndexCount)] += 1u;
+        family.draw_state[static_cast<size_t>(PoolDrawState::IndexCount)] += 1u;
+        continue;
+      }
+      if (instance_count > copy.count) g_pool.stats.indirect_truncated += 1u;
+      if (buffers_dead) {
+        g_pool.stats.indirect_dead += 1u;
+        continue;
+      }
+      DrawRecord record = indirect_draws[copy.indirect_index];
+      record.index_count = index_count;
+      record.instance_count = instance_count;
+      record.first_index = result.args[2];
+      record.vertex_offset = static_cast<int32_t>(result.args[3]);
+      record.first_instance = result.args[4];
+      mesh_key = PoolMeshKey(record);
+      QueuePoolMesh(mesh_key, copy.vs_hash, record);
+    }
+
+    for (uint32_t element = 0; element < result.count; ++element) {
+      const size_t index = result.first_world + element;
       const float* world = worlds.data() + index * kPoolWorldFloats;
       g_pool.stats.instances_seen += 1u;
       family.instances_seen += 1u;
       if (moving[index] != 0u) g_pool.stats.moving_instances += 1u;
-      if (!PoolWorldPlausible(world)) {
-        g_pool.stats.rejected_matrix += 1u;
-        family.rejected_matrix += 1u;
+      const PoolMatrixReject reject = CheckPoolWorld(world);
+      if (reject != PoolMatrixReject::None) {
+        CountPoolMatrixReject(family, reject, world);
         continue;
       }
-      ObservePoolInstance(copy.mesh_key, copy.vs_hash, world, copy.frame);
+      ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame);
     }
   }
 }
@@ -1143,7 +1483,9 @@ inline void ResetWorldPool() {
   for (auto& slot : g_pool.slots) {
     // Copies already recorded into a slot still land there; only forget them.
     if (!slot.resolving) {
+      for (const DrawRecord& draw : slot.indirect_draws) ReleasePoolIndirectRefs(draw);
       slot.copies.clear();
+      slot.indirect_draws.clear();
       slot.used = 0u;
     }
   }
@@ -1159,6 +1501,7 @@ inline void ResetWorldPool() {
   g_pool.observations.clear();
   g_pool.admitted_keys.clear();
   g_pool.instances.clear();
+  g_pool.near_index.clear();
   g_pool.schedule.clear();
   g_pool.families.clear();
   g_pool.revision += 1u;
@@ -1219,7 +1562,7 @@ inline void DumpWorldPool() {
 
   std::ostringstream out;
   out << "{\n";
-  out << "  \"schema\": 2,\n";
+  out << "  \"schema\": 3,\n";
   out << "  \"generated_frame\": " << g_state.frame.load() << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
@@ -1250,9 +1593,29 @@ inline void DumpWorldPool() {
     if (i != 1u) out << ", ";
     out << "\"" << PoolSkipName(static_cast<PoolSkip>(i)) << "\": " << stats.skips[i];
   }
+  out << "}, \"draw_state\": {";
+  for (size_t i = 1; i < stats.draw_state.size(); ++i) {
+    if (i != 1u) out << ", ";
+    out << "\"" << PoolDrawStateName(static_cast<PoolDrawState>(i)) << "\": " << stats.draw_state[i];
+  }
+  out << "}, \"indirect_by_vs_class\": {";
+  for (size_t i = 0; i < stats.indirect_by_vs_class.size(); ++i) {
+    if (i != 0u) out << ", ";
+    out << "\"" << contract::VsClassName(static_cast<contract::VsClass>(i)) << "\": " << stats.indirect_by_vs_class[i];
+  }
+  out << "}, \"matrix_rejects\": {";
+  for (size_t i = 1; i < stats.matrix_rejects.size(); ++i) {
+    if (i != 1u) out << ", ";
+    out << "\"" << PoolMatrixRejectName(static_cast<PoolMatrixReject>(i)) << "\": " << stats.matrix_rejects[i];
+  }
   out << "}"
       << ", \"copied_draws\": " << stats.copied_draws
-      << ", \"skipped_indirect\": " << stats.skipped_indirect
+      << ", \"indirect_copied\": " << stats.indirect_copied
+      << ", \"indirect_resolved\": " << stats.indirect_resolved
+      << ", \"indirect_empty\": " << stats.indirect_empty
+      << ", \"indirect_truncated\": " << stats.indirect_truncated
+      << ", \"indirect_dead\": " << stats.indirect_dead
+      << ", \"near_misses\": " << stats.near_misses
       << ", \"base_verified\": " << stats.base_verified
       << ", \"base_mismatch\": " << stats.base_mismatch
       << ", \"last_mismatch_cpu\": " << stats.last_mismatch_cpu
@@ -1312,6 +1675,7 @@ inline void DumpWorldPool() {
     out << "\n    {\"vs_hash\": \"" << PoolHashText(vs_hash) << "\""
         << ", \"class\": \"" << contract::VsClassName(static_cast<contract::VsClass>(family.vs_class)) << "\""
         << ", \"draws\": " << family.draws
+        << ", \"indirect_draws\": " << family.indirect_draws
         << ", \"copied\": " << family.copied
         << ", \"instances_seen\": " << family.instances_seen
         << ", \"admitted\": " << family.admitted
@@ -1319,6 +1683,8 @@ inline void DumpWorldPool() {
         << ", \"meshes\": " << entry.meshes
         << ", \"base_mismatch\": " << family.base_mismatch
         << ", \"rejected_matrix\": " << family.rejected_matrix
+        << ", \"near_misses\": " << family.near_misses
+        << ", \"near_miss_max_delta\": " << family.near_miss_max_delta
         << ", \"skips\": {";
     bool first_skip = true;
     for (size_t i = 1; i < family.skips.size(); ++i) {
@@ -1327,7 +1693,43 @@ inline void DumpWorldPool() {
       first_skip = false;
       out << "\"" << PoolSkipName(static_cast<PoolSkip>(i)) << "\": " << family.skips[i];
     }
+    out << "}, \"draw_state\": {";
+    first_skip = true;
+    for (size_t i = 1; i < family.draw_state.size(); ++i) {
+      if (family.draw_state[i] == 0u) continue;
+      if (!first_skip) out << ", ";
+      first_skip = false;
+      out << "\"" << PoolDrawStateName(static_cast<PoolDrawState>(i)) << "\": " << family.draw_state[i];
+    }
+    out << "}, \"matrix_rejects\": {";
+    first_skip = true;
+    for (size_t i = 1; i < family.matrix_rejects.size(); ++i) {
+      if (family.matrix_rejects[i] == 0u) continue;
+      if (!first_skip) out << ", ";
+      first_skip = false;
+      out << "\"" << PoolMatrixRejectName(static_cast<PoolMatrixReject>(i)) << "\": " << family.matrix_rejects[i];
+    }
     out << "}";
+    const auto write_samples = [&out](const char* name, const std::vector<PoolMatrixSample>& samples, bool with_reason) {
+      if (samples.empty()) return;
+      out << ", \"" << name << "\": [";
+      for (size_t s = 0; s < samples.size(); ++s) {
+        if (s != 0u) out << ", ";
+        out << "{";
+        if (with_reason) {
+          out << "\"reason\": \"" << PoolMatrixRejectName(static_cast<PoolMatrixReject>(samples[s].reason)) << "\", ";
+        }
+        out << "\"world\": [";
+        for (uint32_t k = 0; k < kPoolWorldFloats; ++k) {
+          if (k != 0u) out << ", ";
+          out << samples[s].matrix[k];
+        }
+        out << "]}";
+      }
+      out << "]";
+    };
+    write_samples("reject_samples", family.reject_samples, true);
+    write_samples("near_miss_samples", family.near_miss_samples, false);
     if (family.admitted != 0u) {
       out << ", \"bounds_min\": [" << entry.bounds_min[0] << ", " << entry.bounds_min[1] << ", " << entry.bounds_min[2] << "]"
           << ", \"bounds_max\": [" << entry.bounds_max[0] << ", " << entry.bounds_max[1] << ", " << entry.bounds_max[2] << "]";

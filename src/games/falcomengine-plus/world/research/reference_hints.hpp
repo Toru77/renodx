@@ -4,9 +4,8 @@
 //
 // HINTS ONLY. Nothing here may accept or reject a candidate, classify a
 // family, gate coverage, exclude a shader, or validate a transform. Runtime
-// evidence always wins. The table is used to prioritize scan order, prefill
-// labels (marked as hint-sourced), improve UI readability, and record the
-// manual evidence column in the Phase 0 report.
+// evidence always wins. The table is used to prefill census labels (marked as
+// hint-sourced) and to improve UI readability.
 //
 // A VS hash absent from this table must remain fully discoverable by the
 // generic runtime path.
