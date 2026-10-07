@@ -23,20 +23,25 @@
 
 namespace falcom_world {
 
-inline uint64_t QueryResourceSize(reshade::api::device* device, reshade::api::resource resource) {
-  if (device == nullptr || resource.handle == 0u) return 0u;
+inline BufferInfo QueryBufferInfo(reshade::api::device* device, reshade::api::resource resource) {
+  if (device == nullptr || resource.handle == 0u) return {};
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
-    const auto it = g_state.resource_sizes.find(resource.handle);
-    if (it != g_state.resource_sizes.end()) return it->second;
+    const auto it = g_state.buffer_info.find(resource.handle);
+    if (it != g_state.buffer_info.end()) return it->second;
   }
   const auto desc = device->get_resource_desc(resource);
-  const uint64_t size = (desc.type == reshade::api::resource_type::buffer) ? desc.buffer.size : 0u;
+  BufferInfo info;
+  if (desc.type == reshade::api::resource_type::buffer) {
+    info.size = desc.buffer.size;
+    info.usage = static_cast<uint32_t>(desc.usage);
+    info.flags = static_cast<uint32_t>(desc.flags);
+  }
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
-    g_state.resource_sizes.insert_or_assign(resource.handle, size);
+    g_state.buffer_info.insert_or_assign(resource.handle, info);
   }
-  return size;
+  return info;
 }
 
 inline void SetStatus(const std::string& status) {
@@ -49,7 +54,7 @@ inline void ResetCensus() {
   g_state.ring.clear();
   g_state.ring_head = 0u;
   g_state.families.clear();
-  g_state.resource_sizes.clear();
+  g_state.buffer_info.clear();
   g_state.next_serial.store(0u);
   g_state.status = "census reset";
 }
@@ -126,13 +131,19 @@ inline void FillCommonDrawRecord(
       record->vb = vb.handle;
       record->vb_offset = vb.offset;
       record->vb_stride = vb.stride;
-      record->vb_size = QueryResourceSize(device, vb.handle);
+      const BufferInfo vb_info = QueryBufferInfo(device, vb.handle);
+      record->vb_size = vb_info.size;
+      record->vb_usage = vb_info.usage;
+      record->vb_flags = vb_info.flags;
     }
     record->ib = scene_state->index_buffer.handle;
     record->ib_offset = scene_state->index_buffer.offset;
     record->index_size = scene_state->index_buffer.index_size;
     record->has_index_buffer = scene_state->has_index_buffer;
-    record->ib_size = QueryResourceSize(device, record->ib);
+    const BufferInfo ib_info = QueryBufferInfo(device, record->ib);
+    record->ib_size = ib_info.size;
+    record->ib_usage = ib_info.usage;
+    record->ib_flags = ib_info.flags;
   }
 }
 

@@ -82,10 +82,14 @@ struct DrawRecord {
   uint64_t vb_offset = 0u;
   uint32_t vb_stride = 0u;
   uint64_t vb_size = 0u;
+  uint32_t vb_usage = 0u;  // reshade::api::resource_usage bits of the VB (bind flags)
+  uint32_t vb_flags = 0u;  // reshade::api::resource_flags bits (dynamic, immutable, ...)
   reshade::api::resource ib = {0u};
   uint64_t ib_offset = 0u;
   uint32_t index_size = 0u;
   uint64_t ib_size = 0u;
+  uint32_t ib_usage = 0u;
+  uint32_t ib_flags = 0u;
   bool has_index_buffer = false;
   reshade::api::pipeline input_layout = {0u};
   reshade::api::primitive_topology topology = reshade::api::primitive_topology::undefined;
@@ -105,6 +109,13 @@ struct DrawRecord {
   reshade::api::resource vs_cb0 = {0u};
   reshade::api::resource ps_cb0 = {0u};
   reshade::api::resource vs_srv0 = {0u};
+};
+
+// What a draw's vertex or index buffer is (size and creation flags).
+struct BufferInfo {
+  uint64_t size = 0u;
+  uint32_t usage = 0u;  // reshade::api::resource_usage bits
+  uint32_t flags = 0u;  // reshade::api::resource_flags bits
 };
 
 struct CameraSnapshot {
@@ -174,7 +185,7 @@ struct State {
   std::vector<DrawRecord> ring;
   uint32_t ring_head = 0u;
   std::unordered_map<uint32_t, FamilyStats> families;
-  std::unordered_map<uint64_t, uint64_t> resource_sizes;
+  std::unordered_map<uint64_t, BufferInfo> buffer_info;  // by handle; erased when the buffer is released
 
   CameraSnapshot camera;
   DepthSource depth_source;

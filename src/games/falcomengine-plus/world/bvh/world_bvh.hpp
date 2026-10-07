@@ -135,6 +135,27 @@ inline void DrawBvhPanel() {
     ImGui::SetTooltip("Writes ReShade.log lines for each mesh copy and read,\n"
                       "and when buffers the pool tracks are released.");
   }
+  bool verify_meshes = g_pool.verify_meshes.load(std::memory_order_relaxed);
+  bool legacy_scale = g_pool.legacy_scale.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Verify mesh captures", &verify_meshes)) {
+    g_pool.verify_meshes.store(verify_meshes, std::memory_order_relaxed);
+    switches_changed = true;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("A mesh enters the pool only after two separate captures decode to the same mesh.\n"
+                      "Differing captures are counted and written to ReShade.log; a mesh that never\n"
+                      "repeats is rejected. Applies to captures from now on: reset the pool after changing.");
+  }
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Legacy instance scale limits (0.05-50)", &legacy_scale)) {
+    g_pool.legacy_scale.store(legacy_scale, std::memory_order_relaxed);
+    switches_changed = true;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Rejects instances with an axis scale outside 0.05-50 (the limits before the\n"
+                      "draw-time capture rework) instead of 0.001-10000. For an A/B test: reset the pool\n"
+                      "after changing.");
+  }
   bool log_crashes = CrashLogEnabled();
   if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
   if (ImGui::IsItemHovered()) {
@@ -250,6 +271,16 @@ inline void DrawBvhPanel() {
               stats.mesh_dedup,
               stats.mesh_failures,
               stats.mesh_cap_drops);
+  {
+    const bool unstable = stats.mesh_capture_mismatches != 0u || stats.mesh_unstable != 0u;
+    ImGui::TextColored(unstable ? ImVec4(1.f, 0.8f, 0.3f, 1.f) : ImVec4(0.4f, 1.f, 0.4f, 1.f),
+                       "Mesh verification: confirmed %u  captures that differed %u  rejected as unstable %u",
+                       stats.mesh_verified, stats.mesh_capture_mismatches, stats.mesh_unstable);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Captures that differed: the same draw's index and vertex ranges read back different\n"
+                        "content on two captures (the first ones are in ReShade.log).");
+    }
+  }
   ImGui::TextDisabled("Mesh copies: indices %llu  vertices %llu  (%.1f MB)  postponed (staging full) %u  "
                       "dropped (buffer released) %u  expired %u",
                       static_cast<unsigned long long>(stats.mesh_index_copies),

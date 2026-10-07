@@ -925,8 +925,9 @@ inline void DescribeLiveInspect(BvhDeviceData* data) {
     inspect.lines.push_back(LiveFormat("Pixel (%u, %u): hit at %.2f m, point (%.2f, %.2f, %.2f).", inspect.x, inspect.y,
                                        inspect.t, inspect.position[0], inspect.position[1], inspect.position[2])
                             + compare_text);
-    inspect.lines.push_back(LiveFormat("Instance %u: VS 0x%08X, position (%.2f, %.2f, %.2f), axis scales (%.3f, %.3f, %.3f).",
-                                       inspect.instance, info.vs_hash, m[3], m[7], m[11], scale[0], scale[1], scale[2]));
+    inspect.lines.push_back(LiveFormat("Instance %u: VS 0x%08X, position (%.2f, %.2f, %.2f), axis scales (%.3f, %.3f, %.3f)%s.",
+                                       inspect.instance, info.vs_hash, m[3], m[7], m[11], scale[0], scale[1], scale[2],
+                                       PoolOutsideLegacyScale(m) ? ", outside the legacy scale limits" : ""));
 
     bool scene_fade = false;
     float near_fade_floor = 0.f;
@@ -966,6 +967,12 @@ inline void DescribeLiveInspect(BvhDeviceData* data) {
         mesh.source_ib = candidate.source_ib;
         mesh.from_indirect = candidate.from_indirect;
         mesh.writes_after_capture = candidate.writes_after_capture;
+        mesh.captures = candidate.captures;
+        mesh.verified = candidate.verified;
+        mesh.source_vb_usage = candidate.source_vb_usage;
+        mesh.source_vb_flags = candidate.source_vb_flags;
+        mesh.source_ib_usage = candidate.source_ib_usage;
+        mesh.source_ib_flags = candidate.source_ib_flags;
         mesh.camera_draws = candidate.camera_draws;
         mesh.camera_near_fade_draws = candidate.camera_near_fade_draws;
         mesh.light_draws = candidate.light_draws;
@@ -1009,6 +1016,10 @@ inline void DescribeLiveInspect(BvhDeviceData* data) {
                                          mesh.capture_frame, static_cast<unsigned long long>(mesh.source_vb),
                                          static_cast<unsigned long long>(mesh.source_ib), mesh.from_indirect ? "indirect" : "direct",
                                          mesh.source_vs_hash, mesh.live_keys, mesh.writes_after_capture));
+      inspect.lines.push_back(LiveFormat("Mesh buffers: VB %s, IB %s; captures taken %u (%s).",
+                                         PoolBufferText(mesh.source_vb_usage, mesh.source_vb_flags).c_str(),
+                                         PoolBufferText(mesh.source_ib_usage, mesh.source_ib_flags).c_str(), mesh.captures,
+                                         mesh.verified ? "the last two were identical" : "not verified"));
       inspect.lines.push_back(LiveFormat("Mesh draws sampled (all its instances): camera VS %u (%u with a near-fading PS; latest PS 0x%08X), light VS %u.",
                                          mesh.camera_draws, mesh.camera_near_fade_draws, mesh.camera_ps_hash, mesh.light_draws));
     } else {
