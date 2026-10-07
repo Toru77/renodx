@@ -38,6 +38,10 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
       reshade::register_event<reshade::addon_event::present>(OnWorldPresentBvh);
+      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeform);
+      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeformLive);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeformLive);
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
@@ -49,6 +53,10 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
       reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentBvh);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeform);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeformLive);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeformLive);
       break;
     default:
       break;
@@ -88,6 +96,142 @@ inline void DrawDepthCompareStats(const BvhTraceStats& stats) {
   ImGui::TextDisabled("pixels: match %u  missing %u  extra %u  extra on sky %u  far %u  sky %u  no depth %u",
                       stats.compare_match, stats.compare_missing, stats.compare_extra, stats.compare_extra_sky,
                       stats.compare_far, stats.compare_sky, stats.compare_no_depth);
+}
+
+// Stream-out probe of deforming vertex shaders (deform_probe.hpp).
+inline void DrawDeformProbePanel() {
+  ImGui::SeparatorText("Deforming meshes (stream-out probe)");
+  bool enabled = g_deform.enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Probe deforming shaders", &enabled)) {
+    g_deform.enabled.store(enabled, std::memory_order_relaxed);
+    RefreshPoolCaptureRequest();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Re-runs a few draws of skinned, wind, billboard and animated vertex shaders per frame\n"
+                      "(each shader at most every %u frames) with a stream-output geometry shader and nothing\n"
+                      "rasterized, then finds which output is the world position. Discovery only: nothing\n"
+                      "enters the BVH.",
+                      kDeformProbeInterval);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Dump Deform JSON")) DumpDeformProbe();
+  ImGui::SameLine();
+  if (ImGui::Button("Reset Probe Results")) ResetDeformProbeResults();
+  DeformStats stats;
+  const std::vector<DeformShaderRow> rows = SnapshotDeformShaders(&stats);
+  ImGui::Text("Probes %llu  read %llu  world position found %llu   shaders built %u  failed %u",
+              static_cast<unsigned long long>(stats.probes), static_cast<unsigned long long>(stats.reads),
+              static_cast<unsigned long long>(stats.matched), stats.shaders_created, stats.shader_failures);
+  if (stats.resource_failures != 0u || stats.map_failures != 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Resource failures %u  readback map failures %u",
+                       stats.resource_failures, stats.map_failures);
+  }
+  std::string skips;
+  for (size_t i = 1; i < stats.skips.size(); ++i) {
+    AppendPoolCount(&skips, DeformSkipName(static_cast<DeformSkip>(i)), stats.skips[i]);
+  }
+  if (!skips.empty()) ImGui::TextDisabled("Not probed: %s", skips.c_str());
+  std::string fails;
+  for (size_t i = 1; i < stats.read_fails.size(); ++i) {
+    AppendPoolCount(&fails, DeformReadFailName(static_cast<DeformReadFail>(i)), stats.read_fails[i]);
+  }
+  if (!fails.empty()) ImGui::TextDisabled("Reads not judged: %s", fails.c_str());
+  if (rows.empty()) return;
+  if (ImGui::BeginTable("deform_probe", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+    ImGui::TableSetupColumn("VS");
+    ImGui::TableSetupColumn("Class");
+    ImGui::TableSetupColumn("Probes/read/found");
+    ImGui::TableSetupColumn("World position");
+    ImGui::TableSetupColumn("Error");
+    ImGui::TableSetupColumn("Last capture");
+    ImGui::TableSetupColumn("Status");
+    ImGui::TableHeadersRow();
+    for (const DeformShaderRow& row : rows) {
+      const DeformShader& shader = row.shader;
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::Text("0x%08X", shader.hash);
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(contract::VsClassName(static_cast<contract::VsClass>(shader.cls)));
+      ImGui::TableNextColumn();
+      ImGui::Text("%u / %u / %u", shader.probes, shader.reads, shader.matched);
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(DeformChosenText(shader).c_str());
+      ImGui::TableNextColumn();
+      if (shader.matched != 0u) {
+        ImGui::Text("%.2g", shader.worst_error);
+      } else {
+        ImGui::TextDisabled("-");
+      }
+      ImGui::TableNextColumn();
+      if (shader.reads != 0u && shader.last_indirect) {
+        ImGui::Text("%u tris (indirect)", shader.last.triangles);
+      } else if (shader.reads != 0u) {
+        ImGui::Text("%u tris (%u x %u)", shader.last.triangles, shader.last_index_count / 3u, shader.last_instance_count);
+      } else {
+        ImGui::TextDisabled("-");
+      }
+      ImGui::TableNextColumn();
+      std::string status;
+      if (!shader.layout_ok) {
+        status = shader.layout_error;
+      } else if (shader.create_failed) {
+        char text[48] = {};
+        std::snprintf(text, sizeof(text), "shader failed (hr 0x%08X)", static_cast<uint32_t>(shader.create_hr));
+        status = text;
+      } else if (shader.inconsistent) {
+        status = "outputs differ between probes";
+      } else if (shader.reads != 0u && shader.matched == 0u) {
+        status = "no output matches";
+      } else if (shader.matched != 0u) {
+        status = "ok";
+      } else {
+        for (size_t i = 1; i < shader.skips.size(); ++i) AppendPoolCount(&status, DeformSkipName(static_cast<DeformSkip>(i)), shader.skips[i]);
+      }
+      ImGui::TextUnformatted(status.c_str());
+    }
+    ImGui::EndTable();
+  }
+}
+
+// Deforming meshes in the BVH (deform_live.hpp).
+inline void DrawDeformLivePanel() {
+  bool enabled = g_deform_live.enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Deforming meshes in the BVH (characters, water)", &enabled)) {
+    g_deform_live.enabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) g_deform.enabled.store(true, std::memory_order_relaxed);  // confirms each shader's world position
+    RefreshPoolCaptureRequest();
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Every frame, re-runs each camera draw of a skinned or animated vertex shader whose world\n"
+                      "position the probe confirmed, capturing its world-space triangles on the GPU. Each draw's\n"
+                      "tree is built once from its first capture and refit every frame; the trace walks them\n"
+                      "beside the static BVH. Turns the probe on (it confirms new shaders).");
+  }
+  DeformLiveStats stats;
+  uint32_t traced = 0u;
+  float refit_ms = -1.f;
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    stats = g_deform_live.stats;
+    traced = g_deform_live.object_count;
+    refit_ms = g_deform_live.refit_timer.last_ms;
+  }
+  if (!enabled) return;
+  ImGui::Text("This frame: captured %u draws (%llu vertices), traced %u, waiting for their tree %u",
+              stats.frame_captures, static_cast<unsigned long long>(stats.frame_vertices), traced, stats.frame_pending);
+  ImGui::Text("Draw identities %u: with a tree %u, failed %u   trees built %u, retired %u, store resets %u (%.1f MB used)",
+              stats.identities, stats.resident, stats.failed, stats.blas_built, stats.retired, stats.resets,
+              static_cast<double>(stats.used_bytes) / (1024.0 * 1024.0));
+  if (refit_ms >= 0.f) ImGui::TextDisabled("GPU refit %.3f ms", refit_ms);
+  std::string skips;
+  for (size_t i = 1; i < stats.skips.size(); ++i) AppendPoolCount(&skips, DynamicSkipName(static_cast<DynamicSkip>(i)), stats.skips[i]);
+  if (!skips.empty()) ImGui::TextDisabled("Not captured: %s", skips.c_str());
+  if (stats.resource_failures != 0u || stats.map_failures != 0u || stats.topology_mismatch != 0u || stats.object_cap_drops != 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Resource failures %u  map failures %u  size mismatches %u  object cap %u",
+                       stats.resource_failures, stats.map_failures, stats.topology_mismatch, stats.object_cap_drops);
+  }
+  if (!stats.last_failure.empty()) ImGui::TextDisabled("Last failure: %s", stats.last_failure.c_str());
 }
 
 inline void DrawBvhPanel() {
@@ -325,6 +469,9 @@ inline void DrawBvhPanel() {
   if (do_dump) DumpWorldPool();
   if (do_dump_obj) DumpWorldPoolObj();
   if (do_reset) ResetWorldPool();
+
+  DrawDeformProbePanel();
+  DrawDeformLivePanel();
 
   ImGui::SeparatorText("GPU BVH (live)");
   bool live = g_live_bvh.enabled.load(std::memory_order_relaxed);

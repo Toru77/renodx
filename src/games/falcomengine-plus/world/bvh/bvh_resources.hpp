@@ -259,6 +259,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   reshade::api::resource_view trace_stats_uav = {0u};
   BvhTraceStats trace_stats;
   bool trace_hiding = false;  // camera-view hiding setting of the last dispatch
+  uint32_t trace_dynamic_count = 0u;  // deforming objects bound to the last dispatch
   BvhInspect inspect;
   bool trace_ready = false;
   GpuTimer trace_timer;

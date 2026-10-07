@@ -105,6 +105,14 @@ inline const char* VsClassName(VsClass value) {
   }
 }
 
+// Classes whose vertex shader moves vertices with more than the instance
+// world matrix (bones, wind, camera facing, waves). Their world-space
+// triangles can only be taken from the shader's own outputs (stream out).
+inline bool IsDeformingClass(VsClass value) {
+  return value == VsClass::Skinned || value == VsClass::Wind || value == VsClass::Billboard
+         || value == VsClass::Animated;
+}
+
 inline const char* PsClassName(PsClass value) {
   switch (value) {
     case PsClass::Opaque:      return "opaque";

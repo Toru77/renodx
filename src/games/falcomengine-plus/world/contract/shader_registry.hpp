@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -36,10 +37,22 @@ struct ShaderTraits {
   uint32_t hash = 0u;  // CRC32 of the bytecode seen at creation (display only)
 };
 
+// Bytecode and output signature of a deforming vertex shader
+// (IsDeformingClass), kept so a stream-out geometry shader can be built from
+// it later (bvh/deform_probe.hpp).
+struct ShaderCode {
+  uint32_t hash = 0u;
+  uint8_t cls = 0u;
+  uint8_t flags = 0u;
+  std::vector<uint8_t> bytecode;
+  std::vector<dxbc::SignatureElement> outputs;
+};
+
 struct ShaderRegistry {
   std::shared_mutex mutex;
   std::unordered_map<uint64_t, ShaderTraits> vertex;
   std::unordered_map<uint64_t, ShaderTraits> pixel;
+  std::unordered_map<uint64_t, std::shared_ptr<const ShaderCode>> deforming_code;  // by VS pipeline handle
   std::array<uint32_t, static_cast<size_t>(VsClass::Count)> vertex_counts = {};
   std::array<uint32_t, static_cast<size_t>(PsClass::Count)> pixel_counts = {};
 };
@@ -89,9 +102,27 @@ inline void OnInitPipelineClassify(
     } else if (UsesContractNearFade(reflection)) {
       traits.flags |= kTraitNearFade;
     }
+    std::shared_ptr<const ShaderCode> code;
+    if (vertex && IsDeformingClass(static_cast<VsClass>(traits.cls))) {
+      auto copy = std::make_shared<ShaderCode>();
+      copy->hash = traits.hash;
+      copy->cls = traits.cls;
+      copy->flags = traits.flags;
+      const auto* bytes = static_cast<const uint8_t*>(desc->code);
+      copy->bytecode.assign(bytes, bytes + desc->code_size);
+      copy->outputs = reflection.outputs;
+      code = std::move(copy);
+    }
 
     auto& registry = Registry();
     std::unique_lock lock(registry.mutex);
+    if (vertex) {
+      if (code != nullptr) {
+        registry.deforming_code.insert_or_assign(pipeline.handle, std::move(code));
+      } else {
+        registry.deforming_code.erase(pipeline.handle);
+      }
+    }
     auto& map = vertex ? registry.vertex : registry.pixel;
     // A handle can be reused without a destroy event reaching us; keep the
     // per-class counts consistent with what the map holds.
@@ -114,6 +145,7 @@ inline void OnDestroyPipelineClassify(reshade::api::device* device, reshade::api
     if (count != 0u) count -= 1u;
     registry.vertex.erase(it);
   }
+  registry.deforming_code.erase(pipeline.handle);
   if (const auto it = registry.pixel.find(pipeline.handle); it != registry.pixel.end()) {
     auto& count = registry.pixel_counts[it->second.cls];
     if (count != 0u) count -= 1u;
@@ -159,6 +191,15 @@ inline ShaderTraits LookupPixelTraits(uint64_t pipeline) {
   std::shared_lock lock(registry.mutex);
   const auto it = registry.pixel.find(pipeline);
   return it != registry.pixel.end() ? it->second : traits;
+}
+
+// Bytecode of a deforming vertex shader pipeline, or null.
+inline std::shared_ptr<const ShaderCode> LookupDeformingCode(uint64_t pipeline) {
+  if (pipeline == 0u) return nullptr;
+  auto& registry = Registry();
+  std::shared_lock lock(registry.mutex);
+  const auto it = registry.deforming_code.find(pipeline);
+  return it != registry.deforming_code.end() ? it->second : nullptr;
 }
 
 struct RegistryCounts {

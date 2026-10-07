@@ -5,7 +5,7 @@
 // Reads only what the world shader classifier needs from a shader's own
 // bytecode: RDEF resource bindings, constant-buffer variables (with their
 // "used" flag), struct member layouts of structured-buffer elements, the
-// input signature, and whether the program contains a discard. There is no
+// input and output signatures, and whether the program contains a discard. There is no
 // D3DCompiler dependency and every offset is validated, so an unexpected
 // blob reports `valid = false` with an error instead of crashing.
 //
@@ -75,9 +75,20 @@ struct ConstantBuffer {
   std::vector<Variable> variables;
 };
 
+// D3D_REGISTER_COMPONENT_TYPE values of signature elements.
+inline constexpr uint32_t kComponentUint32 = 1u;
+inline constexpr uint32_t kComponentSint32 = 2u;
+inline constexpr uint32_t kComponentFloat32 = 3u;
+// D3D_NAME value of SV_Position.
+inline constexpr uint32_t kSystemValuePosition = 1u;
+
 struct SignatureElement {
   std::string semantic;
   uint32_t semantic_index = 0u;
+  uint32_t system_value = 0u;    // D3D_NAME (0 = none, 1 = SV_Position, ...)
+  uint32_t component_type = 0u;  // kComponent*
+  uint32_t reg = 0u;             // register index
+  uint8_t mask = 0u;             // components the element occupies (bit 0 = x)
 };
 
 struct Reflection {
@@ -89,6 +100,7 @@ struct Reflection {
   std::vector<ResourceBinding> resources;
   std::vector<ConstantBuffer> constant_buffers;
   std::vector<SignatureElement> inputs;
+  std::vector<SignatureElement> outputs;
   bool has_discard = false;
   std::string error;
 
@@ -314,18 +326,26 @@ inline bool ParseRdef(const Span& rdef, Reflection* out) {
   return true;
 }
 
-inline bool ParseInputSignature(const Span& signature, uint32_t element_size, uint32_t name_field, Reflection* out) {
+// ISGN/OSGN entries are 24 bytes (name, index, system value, component
+// type, register, mask, read/write mask); ISG1/OSG1 prefix a stream field
+// and append a min-precision field (32 bytes), so `name_field` is 4 there.
+inline bool ParseSignature(const Span& signature, uint32_t element_size, uint32_t name_field,
+                           std::vector<SignatureElement>* out) {
   uint32_t count = 0u;
   if (!signature.Read32(0u, &count) || count > 64u) return false;
-  out->inputs.reserve(count);
+  out->reserve(count);
   for (uint32_t i = 0; i < count; ++i) {
-    const size_t entry = 8u + static_cast<size_t>(i) * element_size;
+    const size_t entry = 8u + static_cast<size_t>(i) * element_size + name_field;
     uint32_t name_offset = 0u;
     SignatureElement element;
-    if (!signature.Read32(entry + name_field, &name_offset)) return false;
-    if (!signature.Read32(entry + name_field + 4u, &element.semantic_index)) return false;
+    if (!signature.Read32(entry, &name_offset)) return false;
+    if (!signature.Read32(entry + 4u, &element.semantic_index)) return false;
+    if (!signature.Read32(entry + 8u, &element.system_value)) return false;
+    if (!signature.Read32(entry + 12u, &element.component_type)) return false;
+    if (!signature.Read32(entry + 16u, &element.reg)) return false;
+    if (!signature.Read8(entry + 20u, &element.mask)) return false;
     if (!signature.ReadString(name_offset, &element.semantic)) return false;
-    out->inputs.push_back(std::move(element));
+    out->push_back(std::move(element));
   }
   return true;
 }
@@ -379,13 +399,24 @@ inline Reflection Parse(const void* code, size_t size) {
 
   internal::Span signature;
   if (internal::ChunkData(base, size, internal::FourCC('I', 'S', 'G', '1'), &signature)) {
-    if (!internal::ParseInputSignature(signature, 32u, 4u, &reflection)) {
+    if (!internal::ParseSignature(signature, 32u, 4u, &reflection.inputs)) {
       reflection.error = "malformed ISG1";
       return reflection;
     }
   } else if (internal::ChunkData(base, size, internal::FourCC('I', 'S', 'G', 'N'), &signature)) {
-    if (!internal::ParseInputSignature(signature, 24u, 0u, &reflection)) {
+    if (!internal::ParseSignature(signature, 24u, 0u, &reflection.inputs)) {
       reflection.error = "malformed ISGN";
+      return reflection;
+    }
+  }
+  if (internal::ChunkData(base, size, internal::FourCC('O', 'S', 'G', '1'), &signature)) {
+    if (!internal::ParseSignature(signature, 32u, 4u, &reflection.outputs)) {
+      reflection.error = "malformed OSG1";
+      return reflection;
+    }
+  } else if (internal::ChunkData(base, size, internal::FourCC('O', 'S', 'G', 'N'), &signature)) {
+    if (!internal::ParseSignature(signature, 24u, 0u, &reflection.outputs)) {
+      reflection.error = "malformed OSGN";
       return reflection;
     }
   }

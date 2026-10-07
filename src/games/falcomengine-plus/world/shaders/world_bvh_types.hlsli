@@ -2,7 +2,8 @@
 
 // world_bvh_types.hlsli - canonical GPU layout read by the trace shaders. The
 // BVH is built on the CPU (bvh_build.hpp, bvh_live.hpp); the C++ counterparts
-// in bvh_resources.hpp/bvh_build.hpp are size-asserted against these strides:
+// in bvh_resources.hpp/bvh_build.hpp/deform_live.hpp are size-asserted against these strides:
+//   DynamicObjectGPU 32 bytes
 //   WorldMeshGPU     64 bytes
 //   WorldInstanceGPU 192 bytes
 //   BVHNodeGPU       32 bytes
@@ -50,3 +51,21 @@ struct BVHNodeGPU
 };
 
 #define BVH_LEAF_FLAG 0x80000000u
+
+// A deforming mesh captured by stream output this frame (deform_live.hpp
+// DynamicObjectGPU, 32 bytes): its BLAS in the dynamic arenas, refit every
+// frame; its triangles are three world-space float3 each, from vertex_base.
+struct DynamicObjectGPU
+{
+    uint node_offset;
+    uint leaf_offset;
+    uint node_count;
+    uint vertex_base;
+    uint triangle_count;
+    uint refit_offset;
+    uint level_offset;   // level_count + 1 level starts, relative to refit_offset
+    uint level_count;
+};
+
+#define DYNAMIC_INSTANCE_FLAG 0x80000000u  // hit.instance of a dynamic object
+#define DYNAMIC_MESH_MARKER 0xFFFFFFFEu    // hit.mesh of a dynamic object

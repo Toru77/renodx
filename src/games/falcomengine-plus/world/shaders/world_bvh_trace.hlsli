@@ -21,6 +21,10 @@
 // by (camera_fade.hpp). With view.hide hidden surfaces are skipped (traversal
 // continues behind them); either way camera_hidden reports whether the
 // nearest BVH surface along the ray is one.
+//
+// Deforming meshes (characters, water) are traced after the TLAS: each
+// object's root bounds are tested, then its BLAS (already in world space, no
+// transform). The game camera drew them this frame, so they are always shown.
 
 #include "world_bvh_types.hlsli"
 
@@ -35,6 +39,14 @@ StructuredBuffer<BVHNodeGPU> g_trace_blas_nodes : register(t5);
 StructuredBuffer<BVHLeafGPU> g_trace_blas_leaves : register(t6);
 StructuredBuffer<BVHNodeGPU> g_trace_tlas_nodes : register(t7);
 StructuredBuffer<BVHLeafGPU> g_trace_tlas_leaves : register(t8);
+// Deforming meshes of this frame (deform_live.hpp): captured world-space
+// vertices (float3 as three floats), the objects, their refit BLAS.
+Buffer<float> g_trace_dynamic_vertices : register(t10);
+StructuredBuffer<DynamicObjectGPU> g_trace_dynamic_objects : register(t11);
+StructuredBuffer<BVHNodeGPU> g_trace_dynamic_nodes : register(t12);
+StructuredBuffer<BVHLeafGPU> g_trace_dynamic_leaves : register(t13);
+// Objects in g_trace_dynamic_objects; set by the including shader before tracing.
+static uint g_trace_dynamic_count = 0u;
 
 struct WorldTraceHit
 {
@@ -287,6 +299,98 @@ bool TraceBlas(
     return found;
 }
 
+// One deforming object's BLAS; its triangles are world-space float3 triples.
+bool TraceDynamicBlas(
+    DynamicObjectGPU object,
+    float3 origin,
+    float3 direction,
+    float t_min,
+    inout float t_max,
+    inout WorldTraceCounters counters,
+    out uint out_prim,
+    out float3 out_normal)
+{
+    out_prim = 0xFFFFFFFFu;
+    out_normal = float3(0.0, 0.0, 0.0);
+    const uint node_count = object.node_count;
+    if (node_count == 0u) return false;
+    const uint leaf_count = (node_count + 1u) / 2u;
+
+    uint stack[TRACE_STACK_SIZE];
+    uint stack_size = 0u;
+    uint node_index = 0u;
+    bool found = false;
+
+    while (true)
+    {
+        if (node_index >= node_count)
+        {
+            counters.invalid_refs++;
+        }
+        else
+        {
+            const BVHNodeGPU node = g_trace_dynamic_nodes[object.node_offset + node_index];
+            float t_near;
+            float t_far;
+            if (AabbIntersect(origin, direction, node.bounds_min, node.bounds_max, t_min, t_max, t_near, t_far))
+            {
+                if ((node.child_or_leaf & BVH_LEAF_FLAG) != 0u)
+                {
+                    const uint leaf_index = node.child_or_leaf & 0x7FFFFFFFu;
+                    const uint prim = leaf_index < leaf_count ? g_trace_dynamic_leaves[object.leaf_offset + leaf_index].prim : 0xFFFFFFFFu;
+                    if (prim >= object.triangle_count)
+                    {
+                        counters.invalid_refs++;
+                    }
+                    else
+                    {
+                        const uint base = (object.vertex_base + prim * 3u) * 3u;
+                        const float3 v0 = float3(g_trace_dynamic_vertices[base + 0u], g_trace_dynamic_vertices[base + 1u], g_trace_dynamic_vertices[base + 2u]);
+                        const float3 v1 = float3(g_trace_dynamic_vertices[base + 3u], g_trace_dynamic_vertices[base + 4u], g_trace_dynamic_vertices[base + 5u]);
+                        const float3 v2 = float3(g_trace_dynamic_vertices[base + 6u], g_trace_dynamic_vertices[base + 7u], g_trace_dynamic_vertices[base + 8u]);
+                        float tri_t;
+                        float3 tri_normal;
+                        counters.triangle_tests++;
+                        if (IntersectTriangle(origin, direction, v0, v1, v2, tri_t, tri_normal)
+                            && tri_t >= t_min && tri_t < t_max)
+                        {
+                            t_max = tri_t;
+                            out_prim = prim;
+                            out_normal = tri_normal;
+                            found = true;
+                        }
+                    }
+                }
+                else
+                {
+                    const uint left = node.child_or_leaf;
+                    const uint right = node.sibling_or_right;
+                    if (left >= node_count || right >= node_count || left == right)
+                    {
+                        counters.invalid_refs++;
+                    }
+                    else if (stack_size < TRACE_STACK_SIZE)
+                    {
+                        stack[stack_size] = right;
+                        stack_size++;
+                        counters.max_stack_depth = max(counters.max_stack_depth, stack_size);
+                        node_index = left;
+                        continue;
+                    }
+                    else
+                    {
+                        counters.stack_overflow++;
+                    }
+                }
+            }
+        }
+        if (stack_size == 0u) break;
+        stack_size--;
+        node_index = stack[stack_size];
+    }
+    return found;
+}
+
 WorldTraceHit TraceWorldRay(
     float3 origin,
     float3 direction,
@@ -470,6 +574,30 @@ WorldTraceHit TraceWorldRay(
         if (stack_size == 0u) break;
         stack_size--;
         node_index = stack[stack_size];
+    }
+
+    // Deforming meshes of this frame.
+    for (uint object_index = 0u; object_index < g_trace_dynamic_count; ++object_index)
+    {
+        const DynamicObjectGPU object = g_trace_dynamic_objects[object_index];
+        if (object.node_count == 0u) continue;
+        const BVHNodeGPU root = g_trace_dynamic_nodes[object.node_offset];
+        float root_near;
+        float root_far;
+        if (!AabbIntersect(origin, direction, root.bounds_min, root.bounds_max, t_min, best_t, root_near, root_far)) continue;
+        float object_t = best_t;
+        uint object_prim = 0xFFFFFFFFu;
+        float3 object_normal = float3(0.0, 0.0, 0.0);
+        if (TraceDynamicBlas(object, origin, direction, t_min, object_t, counters, object_prim, object_normal))
+        {
+            best_t = object_t;
+            best_instance = DYNAMIC_INSTANCE_FLAG | object_index;
+            best_mesh = DYNAMIC_MESH_MARKER;
+            best_prim = object_prim;
+            best_normal = object_normal;
+            best_hidden = 0u;
+            if (any_hit) break;
+        }
     }
 
     // A skipped hidden hit closer than the result (or than nothing) means the

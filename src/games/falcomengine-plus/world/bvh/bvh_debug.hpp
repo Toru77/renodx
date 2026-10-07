@@ -17,6 +17,7 @@
 #include "../../../../utils/render.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
+#include "deform_probe.hpp"
 #include "bvh_resources.hpp"
 #include "bvh_trace.hpp"
 
@@ -143,7 +144,11 @@ inline void RunBvhDebugPass(
   MaybeCaptureBvhTraceStats(device, queue, data);
   if (data->inspect.fresh) {
     data->inspect.fresh = false;
-    DescribeLiveInspect(data);
+    if (data->inspect.valid && data->inspect.hit && (data->inspect.instance & kDynamicInstanceFlag) != 0u) {
+      DescribeDynamicInspect(data->inspect, LiveCompareClassName(data->inspect.compare_class));
+    } else {
+      DescribeLiveInspect(data);
+    }
   }
 
   renodx::utils::render::RenderPass pass;
@@ -165,7 +170,9 @@ inline void RunBvhDebugPass(
 // either needs it, independently of the research census toggle.
 inline void RefreshPoolCaptureRequest() {
   const bool requested = g_pool.scan_active.load(std::memory_order_relaxed)
-                         || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+                         || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0
+                         || g_deform.enabled.load(std::memory_order_relaxed)
+                         || g_deform_live.enabled.load(std::memory_order_relaxed);
   g_state.pool_capture_requested.store(requested, std::memory_order_relaxed);
 }
 
@@ -187,6 +194,7 @@ inline void OnWorldPresentBvh(
   RefreshPoolCaptureRequest();
 
   UpdateLiveBvh(device, queue);
+  UpdateDeformLive(device, queue);
   RunBvhDebugPass(queue, swapchain);
 }
 

@@ -43,6 +43,7 @@ cbuffer cb_trace : register(b13)
     float4 g_depth_rect;  // valid game depth area in texels: x, y, width, height
     float4 g_inspect;     // x, y: pixel whose hit is reported; z > 0.5: report on
     float4 g_camera_view; // x > 0.5: hide what the game camera does not show; y: disableMapObjNearFade_g
+    uint4 g_dynamic;      // x: deforming objects bound at t11 (deform_live.hpp)
 };
 
 #define TRACE_STATS_COUNT 15u
@@ -176,6 +177,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         const float3 origin = g_camera_position.xyz;
         const float3 direction = normalize(far_point - origin);
 
+        g_trace_dynamic_count = g_dynamic.x;
         WorldCameraView view;
         view.hide = g_camera_view.x > 0.5;
         view.floor_value = g_camera_view.y;

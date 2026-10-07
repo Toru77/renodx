@@ -21,12 +21,13 @@
 #include "bvh_build.hpp"
 #include "bvh_pool.hpp"
 #include "bvh_resources.hpp"
+#include "deform_live.hpp"
 
 namespace falcom_world::bvh {
 
-inline constexpr uint32_t kTraceSrvCount = 10u;
+inline constexpr uint32_t kTraceSrvCount = 14u;  // t0..t9 static BVH and game depth, t10..t13 deforming meshes
 inline constexpr uint32_t kTraceUavCount = 2u;
-inline constexpr uint32_t kTracePushConstantCount = 36u;
+inline constexpr uint32_t kTracePushConstantCount = 40u;
 inline constexpr uint32_t kTraceStatsCount = 15u;
 inline constexpr uint32_t kTraceStatCameraHidden = 14u;
 // Inspect results follow the counters (world_bvh_trace.cs_5_0.hlsl
@@ -41,7 +42,7 @@ static_assert(kTraceInspectBase >= kTraceStatsCount, "trace inspect slots overla
 // [0..15] view_proj_inv, [16..19] camera_position, [20] mode, [21] width,
 // [22] height, [23] compare range, [24..27] game depth rect, [28..31] inspect
 // (pixel x, pixel y, on, unused), [32..35] camera view (hide, near-fade floor,
-// unused, unused).
+// unused, unused), [36..39] dynamic (deforming object count as uint, unused).
 inline constexpr uint32_t kTraceCameraPositionOffset = 16u;
 inline constexpr uint32_t kTraceModeOffset = 20u;
 inline constexpr uint32_t kTraceWidthOffset = 21u;
@@ -50,6 +51,7 @@ inline constexpr uint32_t kTraceCompareRangeOffset = 23u;
 inline constexpr uint32_t kTraceDepthRectOffset = 24u;
 inline constexpr uint32_t kTraceInspectOffset = 28u;
 inline constexpr uint32_t kTraceCameraViewOffset = 32u;
+inline constexpr uint32_t kTraceDynamicOffset = 36u;
 
 // Debug views offered in the panel, and the trace shader mode each one runs.
 enum class BvhView : int {
@@ -193,11 +195,12 @@ inline void DispatchBvhTrace(
   // Slot 9 is rewritten on every dispatch: a game view from an earlier frame
   // may no longer exist, so it is null unless Depth Compare passes this
   // frame's view.
+  const DynamicTraceInputs dynamic = GetDynamicTraceInputs(device);
   reshade::api::resource_view srvs[kTraceSrvCount] = {
       data->vertices.srv, data->indices.srv, data->mesh_srv, data->instance_srv, data->active_srv,
       data->blas_nodes.srv, data->blas_leaves.srv, data->tlas_node_srv, data->tlas_leaf_srv,
-      depth.view};
-  static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 10 entries");
+      depth.view, dynamic.vertices, dynamic.objects, dynamic.nodes, dynamic.leaves};
+  static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 14 entries");
   reshade::api::descriptor_table_update srv_update = {
       data->trace_srv_table, 0, 0, kTraceSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs};
   device->update_descriptor_tables(1, &srv_update);
@@ -240,9 +243,12 @@ inline void DispatchBvhTrace(
   data->trace_hiding = hiding;
   constants[kTraceCameraViewOffset + 0u] = hiding ? 1.f : 0.f;
   constants[kTraceCameraViewOffset + 1u] = near_fade_floor;
+  std::memcpy(&constants[kTraceDynamicOffset], &dynamic.count, sizeof(uint32_t));
+  data->trace_dynamic_count = dynamic.count;
   static_assert(kTraceDepthRectOffset + 4u <= kTraceInspectOffset, "trace push constants overlap");
   static_assert(kTraceInspectOffset + 4u <= kTraceCameraViewOffset, "trace push constants overlap");
-  static_assert(kTraceCameraViewOffset + 4u <= kTracePushConstantCount, "trace push constants overflow");
+  static_assert(kTraceCameraViewOffset + 4u <= kTraceDynamicOffset, "trace push constants overlap");
+  static_assert(kTraceDynamicOffset + 4u <= kTracePushConstantCount, "trace push constants overflow");
   data->inspect.requested = false;
   if (g_bvh_trace.inspect_pending.exchange(false, std::memory_order_relaxed) && width != 0u && height != 0u) {
     const float u = (std::min)((std::max)(g_bvh_trace.inspect_u.load(std::memory_order_relaxed), 0.f), 1.f);

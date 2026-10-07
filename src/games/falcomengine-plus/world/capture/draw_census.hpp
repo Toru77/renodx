@@ -13,6 +13,8 @@
 
 #include "../world_state.hpp"
 #include "../bvh/bvh_pool.hpp"
+#include "../bvh/deform_live.hpp"
+#include "../bvh/deform_probe.hpp"
 #include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
 #include "../capture/camera_capture.hpp"
@@ -276,6 +278,8 @@ struct WorldDrawCallback {
 
     CommitDrawRecord(record, device, cl_data);
     bvh::OnPoolScanDraw(device, context.cmd_list, record, cl_data);
+    bvh::OnDeformProbeDraw(device, context.cmd_list, record);
+    bvh::OnDeformCaptureDraw(device, context.cmd_list, record);
     return {};
   }
 
@@ -328,6 +332,7 @@ struct WorldDrawCallback {
     // here and reads them back later without waiting.
     bvh::OnPoolScanIndirectDraw(
         device, context.cmd_list, record, cl_data, args.buffer, args.offset, draw_count, stride);
+    bvh::OnDeformProbeIndirectDraw(device, context.cmd_list, record, args.buffer, args.offset, draw_count, args.stride);
 
     // The census reads the args back at present with a GPU wait, so it only
     // runs while the census itself is on.
@@ -456,6 +461,7 @@ inline void OnWorldPresent(
   if (queue == nullptr) return;
   ResolveIndirectDraws(queue);
   bvh::DrainPoolScan(queue->get_device(), queue);
+  bvh::DrainDeformProbe(queue->get_device(), queue);
 }
 
 }  // namespace falcom_world
