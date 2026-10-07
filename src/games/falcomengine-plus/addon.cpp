@@ -892,6 +892,12 @@ static float g_cpuopt_deferred_dispatch   = 1.f;  // dispatch GTVBAO/VBGI in OnP
 static float g_cpuopt_ensure_pipelines    = 0.f;  // kai-style: don't destroy/recreate pipelines every frame
 static float g_gtvbao_jitter_toggle       = 0.f;  // enable jitter even when denoise is off
 
+// Half-resolution à-trous iteration count. CPU-only: it only drives the C++
+// dispatch loop and no shader can read it, so it must not consume a
+// ShaderInjectData float. The Full-resolution count stays on
+// shader_injection.gtvbao_atrous_passes.
+static float g_gtvbao_atrous_passes_half  = 3.f;
+
 using GTVBAODescriptorTableSet =
     std::array<reshade::api::descriptor_table, kGtvbaoDescriptorTableParamCount>;
 
@@ -2396,6 +2402,14 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .on_draw = OnBeforeFoliageDraw,
         },
     },
+    {
+        0xFE7B3FC9u,
+        renodx::mods::shader::CustomShader{
+            .crc32 = 0xFE7B3FC9u,
+            .code = __0xFE7B3FC9,
+            .on_draw = OnBeforeFoliageDraw,
+        },
+    },
     // -- Kai foliage (GTVBAO foliage marker) --
     {
         0x534E54EAu,
@@ -3410,7 +3424,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAODenoisePasses", .binding = &shader_injection.gtvbao_denoise_passes,
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f, .label = "Denoise Passes", .section = "GTVBAO",
-      .tooltip = "Bilateral chain strength. Ignored while �-Trous Filter is On (iteration count comes from the A-Trous Passes slider).",
+      .tooltip = "Bilateral chain strength. Ignored while �-Trous Filter is On (iteration counts come from the à-Trous Passes sliders).",
       .labels = {"Off", "Sharp (1)", "Medium (2)", "Soft (3)"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_atrous_enabled < 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3437,7 +3451,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAORadius", .binding = &shader_injection.gtvbao_radius,
-      .default_value = 0.35f, .label = "Radius", .section = "GTVBAO",
+      .default_value = 0.25f, .label = "Radius", .section = "GTVBAO",
       .min = 0.01f, .max = 5.0f, .format = "%.2f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3523,7 +3537,7 @@ renodx::utils::settings::Settings settings = {
       .key = "GTVBAOAtrousEnabled", .binding = &shader_injection.gtvbao_atrous_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "�-Trous Filter", .section = "GTVBAO",
-      .tooltip = "Edge-aware wavelet spatial filter, replacing the bilateral chain. Iteration count is set by the A-Trous Passes slider below.",
+      .tooltip = "Edge-aware wavelet spatial filter, replacing the bilateral chain. Iteration counts are set by the à-Trous Passes sliders below (Full and Half resolution).",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -3531,7 +3545,15 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "GTVBAOAtrousPasses", .binding = &shader_injection.gtvbao_atrous_passes,
       .default_value = 1.f, .label = "à-Trous Passes", .section = "GTVBAO",
-      .tooltip = "Wavelet iterations, one per dispatch with strides 1/2/4. Fewer = sharper but noisier AO and less cost; more = smoother but softer contact detail. 3 = default.",
+      .tooltip = "Full-resolution GTVBAO wavelet iterations, one per dispatch with strides 1/2/4. Fewer = sharper but noisier AO and less cost; more = smoother but softer contact detail. 1 = default.",
+      .min = 1.f, .max = 3.f, .format = "%.0f",
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
+      .is_visible = []() { return IsAdvancedSettingsMode(); },
+    },
+    new renodx::utils::settings::Setting{
+      .key = "GTVBAOAtrousPassesHalf", .binding = &g_gtvbao_atrous_passes_half,
+      .default_value = 3.f, .label = "à-Trous Passes (Half)", .section = "GTVBAO",
+      .tooltip = "Half-resolution GTVBAO wavelet iterations, one per dispatch with strides 1/2/4. Fewer = sharper but noisier AO and less cost; more = smoother but softer contact detail.",
       .min = 1.f, .max = 3.f, .format = "%.0f",
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.gtvbao_denoise_passes > 0.f && shader_injection.gtvbao_atrous_enabled > 0.5f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
@@ -12289,12 +12311,16 @@ static bool RunGTVBAO(reshade::api::command_list* cl, DeviceData* d) {
 
     // -- �-trous helpers (spatial-only) --
 
-    // atrous iterations (strides 1/2/4), count from gtvbao_atrous_passes. The last
-    // iteration folds the OCCLUSION_TERM_SCALE multiply-back via denoise_is_last_pass.
+    // atrous iterations (strides 1/2/4), count from gtvbao_atrous_passes in Full
+    // mode or g_gtvbao_atrous_passes_half in Half mode, matching the resolution
+    // this chain runs at. The last iteration folds the OCCLUSION_TERM_SCALE
+    // multiply-back via denoise_is_last_pass.
     // Returns true when the final result lives in ao_term_b.
     auto run_atrous_chain = [&](bool start_in_b) -> bool {
       bool cur_b = start_in_b;
-      const int apc = std::clamp((int)shader_injection.gtvbao_atrous_passes, 1, 3);
+      const int apc = std::clamp((int)(half_mode
+          ? g_gtvbao_atrous_passes_half
+          : shader_injection.gtvbao_atrous_passes), 1, 3);
       for (int i = 0; i < apc; ++i) {
         const bool last_iter = (i == apc - 1);
         bind_pipe(d->atrous_pipeline);

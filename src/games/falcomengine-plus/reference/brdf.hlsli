@@ -30,10 +30,13 @@ float3 HammonDiffuseBRDF(
   // Facing term
   float facing = 0.5f + 0.5f * VdotH;
 
-  // Rough surface approximation — the reciprocal is capped so the grazing
-  // half-vector singularity cannot push the correction into its clamp.
+  // Rough surface approximation — the reciprocal is capped at 2 so the grazing
+  // half-vector singularity cannot push the correction into its clamp. The
+  // divide guard must return that same cap: callers saturate NdotH, so every
+  // below-tangent pixel lands on NdotH == 0, and any lower fallback would put
+  // a hard step in the correction along the N·H = 0 contour.
   float rough = facing * (0.9f - 0.4f * facing)
-              * min(SafeDivideF(0.5f + NdotH, NdotH, 1.0f), 2.0f);
+              * min(SafeDivideF(0.5f + NdotH, NdotH, 2.0f), 2.0f);
 
   // Smooth surface approximation — pow5(1-x) expanded manually
   float oneMinusNdotL = 1.0f - NdotL;
