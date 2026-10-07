@@ -18,6 +18,29 @@
 // are only carried for display. The classification answers one question:
 // can this vertex shader's draws be reproduced as "static mesh x instance
 // world matrix"?
+//
+// Camera visibility. The same element also carries what decides whether the
+// game camera shows an instance. Every decompiled map-object pixel shader that
+// reads disableMapObjNearFade_g (e.g. 0x2F107485, 0x5F527E52, 0x533C1853)
+// discards with
+//
+//   fade  = max(disableMapObjNearFade_g, min(1, (|camera - p| - param.x) * param.y))
+//           * mapColor_g.w
+//   alpha = opacity_g * color.w
+//   discard if fade * alpha < dither(4x4)   (pattern flipped when param.z > 0)
+//
+// with InstanceParam.color float4 at byte 96 and InstanceParam.param float4 at
+// byte 128. Shadow-pass vertex shaders (0xE35C18B9) pass only (param.z,
+// color.w) on, so shadow casters skip the near fade: an object the camera is
+// too close to is hidden in the main view yet still drawn into shadow maps.
+//
+// View. Every rigid vertex shader in the dumps projects either with the scene
+// camera (cb_scene.viewProj_g: G-buffer and other camera passes) or with the
+// light (cb_shadow.shadowViewProj_g: shadow maps, e.g. 0xE35C18B9,
+// 0xC3B9E234, 0x3168EA98). Shadow passes also have a render target bound, so
+// the vertex shader's view is what tells the passes apart. Geometry the game
+// only draws through light views (shadow-only casters) is never seen by the
+// camera.
 
 #include <cstdint>
 #include <string_view>
@@ -36,6 +59,10 @@ inline constexpr uint32_t kSceneCbSlot = 0u;
 inline constexpr uint32_t kBonesSlot = 0u;
 inline constexpr uint32_t kBonesStride = 48u;
 inline constexpr std::string_view kSceneCbName = "cb_scene";
+inline constexpr uint32_t kColorOffset = 96u;    // InstanceParam.color: w = opacity
+inline constexpr uint32_t kParamOffset = 128u;   // InstanceParam.param: x near-fade start, y near-fade 1/range, z dither flip
+inline constexpr uint32_t kSceneNearFadeFloorOffset = 412u;  // cb_scene.disableMapObjNearFade_g (c25.w)
+inline constexpr uint32_t kSceneMapColorOffset = 752u;       // cb_scene.mapColor_g (c47), w = map alpha
 
 enum class VsClass : uint8_t {
   Unclassified = 0,  // pipeline created before the classifier was listening
@@ -102,6 +129,78 @@ inline bool HasContractWorldLayout(const dxbc::Reflection& reflection, const dxb
            && member.columns == 3u;
   }
   return false;
+}
+
+inline bool IsContractFloat4(const dxbc::StructMember& member, uint32_t offset) {
+  return member.offset == offset && member.var_class == dxbc::kClassVector && member.var_type == dxbc::kTypeFloat
+         && member.rows == 1u && member.columns == 4u;
+}
+
+// The instance element declares `color` and `param` as float4 at the contract
+// offsets: the camera-visibility inputs above can be read from its bytes.
+inline bool HasContractVisibilityLayout(const dxbc::Reflection& reflection, const dxbc::ResourceBinding& instances) {
+  if (instances.stride != kInstanceStride) return false;
+  const dxbc::ConstantBuffer* layout = reflection.FindConstantBuffer(instances.name, dxbc::kCBufferResourceBindInfo);
+  if (layout == nullptr || layout->size != kInstanceStride || layout->variables.empty()) return false;
+  bool color = false;
+  bool param = false;
+  for (const auto& member : layout->variables.front().members) {
+    if (member.name == "color") color = IsContractFloat4(member, kColorOffset);
+    if (member.name == "param") param = IsContractFloat4(member, kParamOffset);
+  }
+  return color && param;
+}
+
+// A pixel shader applies the map-object near fade above when it reads
+// disableMapObjNearFade_g from cb_scene (b0) at the contract offset and reads
+// the instance element (t15) with the contract visibility layout.
+inline bool UsesContractNearFade(const dxbc::Reflection& reflection) {
+  if (!reflection.valid) return false;
+  const dxbc::ResourceBinding* scene = reflection.FindResource(dxbc::kInputCBuffer, kSceneCbSlot);
+  if (scene == nullptr || scene->name != kSceneCbName) return false;
+  const dxbc::ConstantBuffer* scene_layout = reflection.FindConstantBuffer(kSceneCbName, 0u);
+  if (scene_layout == nullptr) return false;
+  bool near_fade = false;
+  for (const auto& variable : scene_layout->variables) {
+    if (variable.name == "disableMapObjNearFade_g") {
+      near_fade = variable.used && variable.offset == kSceneNearFadeFloorOffset;
+    }
+  }
+  if (!near_fade) return false;
+  const dxbc::ResourceBinding* instances = reflection.FindResource(dxbc::kInputStructured, kInstanceSlot);
+  return instances != nullptr && HasContractVisibilityLayout(reflection, *instances);
+}
+
+// Which camera a vertex shader projects with (see "View" above).
+enum class VsView : uint8_t {
+  Other = 0,  // neither, or both
+  Camera,     // cb_scene.viewProj_g
+  Light,      // cb_shadow.shadowViewProj_g
+};
+
+inline const char* VsViewName(VsView view) {
+  switch (view) {
+    case VsView::Camera: return "camera";
+    case VsView::Light:  return "light";
+    default:             return "other";
+  }
+}
+
+inline bool UsesBufferVariable(const dxbc::Reflection& reflection, std::string_view buffer, std::string_view name) {
+  const dxbc::ConstantBuffer* layout = reflection.FindConstantBuffer(buffer, 0u);
+  if (layout == nullptr) return false;
+  for (const auto& variable : layout->variables) {
+    if (variable.used && variable.name == name) return true;
+  }
+  return false;
+}
+
+inline VsView ClassifyVertexView(const dxbc::Reflection& reflection) {
+  if (!reflection.valid) return VsView::Other;
+  const bool camera = UsesBufferVariable(reflection, kSceneCbName, "viewProj_g");
+  const bool light = UsesBufferVariable(reflection, "cb_shadow", "shadowViewProj_g");
+  if (camera == light) return VsView::Other;
+  return camera ? VsView::Camera : VsView::Light;
 }
 
 inline VsClass ClassifyVertexShader(const dxbc::Reflection& reflection) {

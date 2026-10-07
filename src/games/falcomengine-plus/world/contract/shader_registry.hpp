@@ -24,8 +24,15 @@
 
 namespace falcom_world::contract {
 
+// ShaderTraits::flags.
+inline constexpr uint8_t kTraitVisibilityLayout = 1u;  // vertex: instance element has the color/param contract layout
+inline constexpr uint8_t kTraitNearFade = 2u;          // pixel: applies the map-object near fade (UsesContractNearFade)
+inline constexpr uint8_t kTraitCameraView = 4u;        // vertex: projects with the scene camera (VsView::Camera)
+inline constexpr uint8_t kTraitLightView = 8u;         // vertex: projects with the light (VsView::Light)
+
 struct ShaderTraits {
   uint8_t cls = 0u;    // VsClass or PsClass, by the map it lives in
+  uint8_t flags = 0u;  // kTrait* bits
   uint32_t hash = 0u;  // CRC32 of the bytecode seen at creation (display only)
 };
 
@@ -71,6 +78,17 @@ inline void OnInitPipelineClassify(
 
     traits.cls = vertex ? static_cast<uint8_t>(ClassifyVertexShader(reflection))
                         : static_cast<uint8_t>(ClassifyPixelShader(reflection));
+    if (vertex) {
+      const dxbc::ResourceBinding* instances = reflection.FindResource(dxbc::kInputStructured, kInstanceSlot);
+      if (instances != nullptr && HasContractVisibilityLayout(reflection, *instances)) {
+        traits.flags |= kTraitVisibilityLayout;
+      }
+      const VsView view = ClassifyVertexView(reflection);
+      if (view == VsView::Camera) traits.flags |= kTraitCameraView;
+      if (view == VsView::Light) traits.flags |= kTraitLightView;
+    } else if (UsesContractNearFade(reflection)) {
+      traits.flags |= kTraitNearFade;
+    }
 
     auto& registry = Registry();
     std::unique_lock lock(registry.mutex);
@@ -121,6 +139,28 @@ inline PsClass LookupPixelClass(uint64_t pipeline) {
   return it != registry.pixel.end() ? static_cast<PsClass>(it->second.cls) : PsClass::Unclassified;
 }
 
+// Full traits (class as in LookupVertexClass / LookupPixelClass, plus flags)
+// with one lookup each.
+inline ShaderTraits LookupVertexTraits(uint64_t pipeline) {
+  ShaderTraits traits;
+  traits.cls = static_cast<uint8_t>(VsClass::Unclassified);
+  if (pipeline == 0u) return traits;
+  auto& registry = Registry();
+  std::shared_lock lock(registry.mutex);
+  const auto it = registry.vertex.find(pipeline);
+  return it != registry.vertex.end() ? it->second : traits;
+}
+
+inline ShaderTraits LookupPixelTraits(uint64_t pipeline) {
+  ShaderTraits traits;
+  traits.cls = static_cast<uint8_t>(pipeline == 0u ? PsClass::Opaque : PsClass::Unclassified);
+  if (pipeline == 0u) return traits;
+  auto& registry = Registry();
+  std::shared_lock lock(registry.mutex);
+  const auto it = registry.pixel.find(pipeline);
+  return it != registry.pixel.end() ? it->second : traits;
+}
+
 struct RegistryCounts {
   std::array<uint32_t, static_cast<size_t>(VsClass::Count)> vertex = {};
   std::array<uint32_t, static_cast<size_t>(PsClass::Count)> pixel = {};
@@ -140,6 +180,7 @@ inline RegistryCounts SnapshotRegistryCounts() {
 struct RegistryEntry {
   uint32_t hash = 0u;
   uint8_t cls = 0u;
+  uint8_t flags = 0u;
 };
 
 struct RegistryEntries {
@@ -152,13 +193,13 @@ inline RegistryEntries SnapshotRegistryEntries() {
   auto& registry = Registry();
   std::shared_lock lock(registry.mutex);
   const auto collect = [](const std::unordered_map<uint64_t, ShaderTraits>& map, std::vector<RegistryEntry>* out) {
-    std::unordered_map<uint32_t, uint8_t> unique;
+    std::unordered_map<uint32_t, ShaderTraits> unique;
     for (const auto& [handle, traits] : map) {
       (void)handle;
-      unique.try_emplace(traits.hash, traits.cls);
+      unique.try_emplace(traits.hash, traits);
     }
     out->reserve(unique.size());
-    for (const auto& [hash, cls] : unique) out->push_back({hash, cls});
+    for (const auto& [hash, traits] : unique) out->push_back({hash, traits.cls, traits.flags});
     std::sort(out->begin(), out->end(), [](const RegistryEntry& a, const RegistryEntry& b) {
       return a.cls != b.cls ? a.cls < b.cls : a.hash < b.hash;
     });

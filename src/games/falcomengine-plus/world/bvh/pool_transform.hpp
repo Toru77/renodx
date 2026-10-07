@@ -7,8 +7,10 @@
 // Sora 2nd instanced vertex shaders (t15, stride 160, b1 offset). The other
 // forms stay for CandidateKind values other layouts may use.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 
 namespace falcom_world {
 
@@ -50,6 +52,62 @@ inline uint64_t MatrixHash(const float* m, uint32_t count) {
     hash *= 1099511628211ull;
   }
   return hash;
+}
+
+// The pool matrix is stored in the game's row-dot layout: world.x = dot(p, row0)
+// with row0 = (m0, m1, m2, m3), and the engine only ever uses rows 0..2. The
+// stored fourth row is not part of the transform (Inst4x4 captures often leave
+// it zero or stale), so the canonical matrix is the affine 4x4 with last row
+// (0,0,0,1); invert that with Gauss-Jordan so scale/shear stay safe.
+inline void ComputeMatrixInverse(const float* matrix, float* out) {
+  float m[4][4] = {};
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      m[row][col] = matrix[row * 4 + col];
+    }
+  }
+  m[3][0] = 0.f;
+  m[3][1] = 0.f;
+  m[3][2] = 0.f;
+  m[3][3] = 1.f;
+  float inv[4][4] = {};
+  for (int i = 0; i < 4; ++i) inv[i][i] = 1.f;
+  bool singular = false;
+  for (int col = 0; col < 4 && !singular; ++col) {
+    int pivot = col;
+    for (int row = col + 1; row < 4; ++row) {
+      if (std::fabs(m[row][col]) > std::fabs(m[pivot][col])) pivot = row;
+    }
+    if (std::fabs(m[pivot][col]) < 1e-12f) {
+      singular = true;
+      break;
+    }
+    if (pivot != col) {
+      for (int k = 0; k < 4; ++k) {
+        std::swap(m[col][k], m[pivot][k]);
+        std::swap(inv[col][k], inv[pivot][k]);
+      }
+    }
+    const float scale = 1.f / m[col][col];
+    for (int k = 0; k < 4; ++k) {
+      m[col][k] *= scale;
+      inv[col][k] *= scale;
+    }
+    for (int row = 0; row < 4; ++row) {
+      if (row == col) continue;
+      const float factor = m[row][col];
+      if (factor == 0.f) continue;
+      for (int k = 0; k < 4; ++k) {
+        m[row][k] -= factor * m[col][k];
+        inv[row][k] -= factor * inv[col][k];
+      }
+    }
+  }
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      out[row * 4 + col] = singular ? ((row == col) ? 1.f : 0.f) : inv[row][col];
+    }
+  }
 }
 
 }  // namespace falcom_world

@@ -2,9 +2,9 @@
 
 // Phase 1 GPU debug views (trace only).
 //
-// Uploads the CPU pool to GPU buffers (once per pool revision), rebuilds the
-// BVH, and on request replaces the backbuffer with a primary-ray trace of the
-// BVH: shaded, instance id, or a per-pixel depth comparison against the game.
+// Keeps the live BVH current (bvh_live.hpp) at every present and on request
+// replaces the backbuffer with a primary-ray trace of the BVH: shaded,
+// instance id, or a per-pixel depth comparison against the game.
 // The trace writes a debug texture through a UAV; a blit pass copies it to the
 // backbuffer. The earlier raster reconstruction views were removed: the trace
 // reads the same pool data and is the only view that exercises the BVH.
@@ -16,6 +16,7 @@
 
 #include "../../../../utils/render.hpp"
 #include "bvh_build.hpp"
+#include "bvh_live.hpp"
 #include "bvh_resources.hpp"
 #include "bvh_trace.hpp"
 
@@ -23,7 +24,6 @@ namespace falcom_world::bvh {
 
 struct BvhDebugState {
   std::atomic_int mode{0};  // BvhView
-  std::atomic_bool force_upload{false};
   std::atomic<reshade::api::device*> device{nullptr};
 };
 
@@ -117,7 +117,7 @@ inline void RunBvhDebugPass(
   auto* device = queue->get_device();
   if (device == nullptr) return;
   BvhDeviceData* data = GetBvhDeviceData(device);
-  if (data == nullptr || !data->ready || data->active_count == 0u) return;
+  if (data == nullptr || !data->bvh_ready || data->active_count == 0u) return;
 
   const auto backbuffer = swapchain->get_current_back_buffer();
   if (backbuffer.handle == 0u) return;
@@ -141,6 +141,10 @@ inline void RunBvhDebugPass(
       data->debug_texture, reshade::api::resource_usage::unordered_access,
       reshade::api::resource_usage::shader_resource);
   MaybeCaptureBvhTraceStats(device, queue, data);
+  if (data->inspect.fresh) {
+    data->inspect.fresh = false;
+    DescribeLiveInspect(data);
+  }
 
   renodx::utils::render::RenderPass pass;
   pass.pipeline_subobjects.vertex_shader = __world_bvh_blit_vs;
@@ -182,33 +186,7 @@ inline void OnWorldPresentBvh(
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
 
-  BvhDeviceData* data = GetBvhDeviceData(device);
-  if (data == nullptr) return;
-
-  const bool scanning = g_pool.scan_active.load(std::memory_order_relaxed);
-  uint64_t revision = 0u;
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    revision = g_pool.revision;
-  }
-  const bool force = g_bvh_debug.force_upload.exchange(false, std::memory_order_relaxed);
-  if (revision != 0u && (force || (!scanning && data->uploaded_revision != revision))) {
-    if (UploadWorldPoolToGpu(device, queue)) {
-      BuildWorldBvh(device, queue);
-    }
-  } else if (data->ready && !scanning) {
-    const PoolRegion region = CurrentPoolRegion();
-    if (region.min[0] != data->region_min[0] || region.min[1] != data->region_min[1]
-        || region.min[2] != data->region_min[2]) {
-      if (UploadActiveInstancesToGpu(device, queue)) {
-        data->region_min[0] = region.min[0];
-        data->region_min[1] = region.min[1];
-        data->region_min[2] = region.min[2];
-        BuildWorldTlas(device, queue);
-      }
-    }
-  }
-
+  UpdateLiveBvh(device, queue);
   RunBvhDebugPass(queue, swapchain);
 }
 

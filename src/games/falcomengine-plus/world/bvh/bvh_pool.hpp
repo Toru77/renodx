@@ -82,6 +82,7 @@
 #include "../contract/shader_registry.hpp"
 #include "../debug/pool_stage.hpp"
 #include "../world_state.hpp"
+#include "camera_fade.hpp"
 #include "pool_transform.hpp"
 
 namespace falcom_world::bvh {
@@ -119,6 +120,8 @@ inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr size_t kPoolMaxMeshes = 8192u;
+inline constexpr uint32_t kPoolMassRetireMeshes = 32u;  // one compaction retiring this many: a map change (diagnostic)
+inline constexpr uint32_t kPoolTrackedBloomWords = 1024u;  // 65536-bit filter of VB/IB handles meshes come from
 inline constexpr size_t kPoolMaxInstances = 2000000u;
 inline constexpr float kPoolRegionMinSize = 64.f;
 inline constexpr float kPoolRegionMaxSize = 512.f;
@@ -210,8 +213,30 @@ inline const char* PoolMatrixRejectName(PoolMatrixReject reject) {
   }
 }
 
+// Camera-visibility inputs of one instance, read from its InstanceParam
+// (contract::kColorOffset / kParamOffset; formula in shader_contract.hpp).
+struct PoolVisibility {
+  bool valid = false;   // the drawing VS declares the contract layout
+  float color[4] = {};  // w: opacity
+  float param[4] = {};  // x: near-fade start (m), y: near-fade 1/range, z: dither flip when > 0
+};
+
+// Draw facts a copy carries to its resolve (PoolPendingCopy::pass). The view
+// comes from the vertex shader (contract::VsView): a render target is bound in
+// shadow passes too, so it says nothing about the pass.
+inline constexpr uint8_t kPoolPassCamera = 1u;      // VS projects with the scene camera
+inline constexpr uint8_t kPoolPassVisibility = 2u;  // the VS instance element has the contract visibility layout
+inline constexpr uint8_t kPoolPassNearFadePs = 4u;  // the PS applies the map-object near fade
+inline constexpr uint8_t kPoolPassLight = 8u;       // VS projects with the light (shadow maps)
+
+struct PoolSighting {
+  uint8_t pass = 0u;     // kPoolPass* bits
+  uint32_t ps_hash = 0u;
+};
+
 struct WorldMesh {
   uint64_t mesh_key = 0u;  // first draw key that produced this mesh
+  uint64_t uid = 0u;       // never reused; the live BVH store keys GPU meshes by it
   uint32_t mesh_id = 0u;
   uint32_t source_vs_hash = 0u;
   uint32_t triangle_count = 0u;
@@ -221,6 +246,18 @@ struct WorldMesh {
   std::vector<uint32_t> indices;  // flat, three per triangle
   uint64_t signature = 0u;        // content hash (positions + indices)
   uint32_t live_keys = 0u;        // draw keys still mapped to this mesh
+  // Provenance (diagnostic): the draw whose copies produced the mesh.
+  uint32_t capture_frame = 0u;
+  uint64_t source_vb = 0u;
+  uint64_t source_ib = 0u;
+  bool from_indirect = false;
+  uint32_t writes_after_capture = 0u;  // game writes to its VB/IB seen since (the mesh may be stale)
+  // Sampled draws of it per view; how many camera draws used a pixel shader
+  // that near-fades (GetPoolCameraVisibility).
+  uint32_t camera_draws = 0u;
+  uint32_t camera_near_fade_draws = 0u;
+  uint32_t light_draws = 0u;
+  uint32_t camera_ps_hash = 0u;  // latest camera-draw pixel shader (display)
 };
 
 struct WorldInstance {
@@ -231,8 +268,15 @@ struct WorldInstance {
   uint8_t source = static_cast<uint8_t>(InstanceSource::CanonicalInstance);
   uint32_t matrix_floats = kPoolWorldFloats;
   float matrix[16] = {};
+  float inverse_world[16] = {};  // inverse of the affine matrix (ComputeMatrixInverse), at admission
   float bounds_min[3] = {};
   float bounds_max[3] = {};
+  // Provenance (diagnostic).
+  uint32_t first_frame = 0u;  // first sighting of this (mesh, matrix)
+  uint32_t admit_frame = 0u;
+  float admit_camera[3] = {};
+  bool admit_camera_valid = false;
+  PoolVisibility visibility;  // camera-visibility inputs at admission
 };
 
 struct InstanceKey {
@@ -250,12 +294,27 @@ struct InstanceKeyHash {
 };
 
 struct ObservedInstance {
-  uint32_t count = 0u;
+  uint32_t count = 0u;       // frames it was seen in (kept counting after admission, diagnostic)
+  uint32_t first_frame = 0u;
   uint32_t last_frame = 0u;
   uint32_t vs_hash = 0u;
   bool admitted = false;
   bool rejected = false;
   float matrix[kPoolWorldFloats] = {};
+  // Per view (kept after admission): frames seen, and the latest inputs.
+  uint32_t camera_frames = 0u;  // drawn by a camera VS
+  uint32_t light_frames = 0u;   // drawn by a light VS (shadow maps)
+  uint32_t last_camera_frame = 0u;
+  uint32_t last_light_frame = 0u;
+  uint32_t camera_sightings = 0u;            // camera draws that read it
+  uint32_t camera_near_fade_sightings = 0u;  // ... with a pixel shader that near-fades
+  uint32_t camera_ps_hash = 0u;              // latest camera-draw pixel shader (display)
+  PoolVisibility camera_visibility;
+  PoolVisibility light_visibility;
+  // Admitted as a duplicate of an instance reached through another draw key
+  // (same mesh content and matrix): that key, whose observation also receives
+  // this one's sightings. 0 otherwise.
+  uint64_t merged_mesh_key = 0u;
 };
 
 // Positions and triangles of one decoded mesh (vertices remapped in first-use order).
@@ -289,6 +348,8 @@ struct PoolMeshRequest {
   reshade::api::format pos_format = reshade::api::format::unknown;
   PoolMeshPhase phase = PoolMeshPhase::Indices;
   bool in_flight = false;
+  bool from_indirect = false;
+  bool written = false;  // its VB/IB was written by the game while queued (diagnostic)
   std::vector<uint32_t> indices;  // absolute vertex indices, after the index read
   uint32_t min_vertex = 0u;
   uint32_t max_vertex = 0u;
@@ -314,6 +375,8 @@ struct PoolPendingCopy {
   int32_t cpu_base = 0;
   uint32_t frame = 0u;
   uint32_t vs_hash = 0u;
+  uint32_t ps_hash = 0u;
+  uint8_t pass = 0u;       // kPoolPass* bits of the draw
   uint64_t mesh_key = 0u;  // 0 for an indirect draw until its args are read
   // Indirect draws only: the draw record in PoolStagingSlot::indirect_draws
   // (its counts are filled from the args at resolve), the args location and
@@ -389,6 +452,7 @@ struct PoolStats {
   uint64_t indirect_truncated = 0u;  // instance_count larger than the copied window
   uint64_t indirect_dead = 0u;       // VB/IB released before the args were read
   uint64_t indirect_window_instances = 0u;  // instances copied for indirect draws (sum of windows)
+  uint64_t indirect_first_copies = 0u;      // copied with the full window: identity not read before
   // Read back.
   uint64_t base_verified = 0u;
   uint64_t base_mismatch = 0u;
@@ -415,6 +479,18 @@ struct PoolStats {
   uint32_t mesh_failures = 0u;
   uint32_t mesh_dedup = 0u;
   uint32_t mesh_cap_drops = 0u;
+  // Game writes to VB/IB that captured or queued meshes come from (diagnostic:
+  // a written buffer may no longer hold the captured geometry).
+  uint64_t tracked_buffer_writes = 0u;
+  uint32_t requests_written = 0u;
+  size_t meshes_written = 0u;  // refreshed by UpdatePoolStats
+  // Compactions that retired at least kPoolMassRetireMeshes meshes (map changes).
+  uint32_t mass_retirements = 0u;
+  uint32_t last_mass_retire_frame = 0u;
+  uint32_t last_mass_retire_meshes = 0u;
+  // Changes of what GetPoolCameraVisibility decides for admitted instances
+  // (each one asks the live BVH for a TLAS rebuild).
+  uint64_t visibility_changes = 0u;
   uint32_t meshes_retired = 0u;
   uint32_t instances_retired = 0u;
   uint32_t resource_invalidations = 0u;
@@ -444,6 +520,14 @@ struct PoolState {
 
   uint32_t logged_invalidations = 0u;  // stats.resource_invalidations at the last present
 
+  // Camera at the slot being resolved, stamped on instances admitted there.
+  float resolve_camera[3] = {};
+  bool resolve_camera_valid = false;
+  // Bloom filter of VB/IB handles in keys_by_resource, so the write events
+  // only take the lock for buffers a mesh may come from. Bits are never
+  // cleared (a stale bit only costs a lock and a lookup).
+  std::array<std::atomic_uint64_t, kPoolTrackedBloomWords> tracked_bloom{};
+
   // Staging ring. Draws of the frame in flight write `write_slot`.
   reshade::api::device* staging_device = nullptr;
   std::array<PoolStagingSlot, kPoolStagingSlots> slots;
@@ -453,6 +537,7 @@ struct PoolState {
   std::unordered_map<uint64_t, PoolMeshRequest> mesh_requests;       // by mesh key
   std::unordered_map<uint64_t, std::vector<uint64_t>> mesh_waiting;  // buffer key -> keys waiting for a copy
   uint64_t next_mesh_serial = 1u;
+  uint64_t next_mesh_uid = 1u;  // WorldMesh::uid, never reused (also not by ResetWorldPool)
   std::unordered_set<uint64_t> mesh_queued;   // keys queued or captured since last invalidation
   std::unordered_set<uint64_t> failed_meshes;
   std::unordered_map<uint64_t, uint32_t> mesh_by_key;
@@ -476,6 +561,7 @@ struct PoolState {
   std::unordered_map<uint64_t, PoolSchedule> schedule;
   std::unordered_map<uint32_t, PoolFamilyStats> families;  // by VS hash, display only
   uint64_t revision = 0u;
+  uint64_t visibility_revision = 0u;  // bumped when an admitted instance's camera visibility changes
   PoolStats stats;
 };
 
@@ -702,6 +788,11 @@ inline void UpdatePoolStats() {
     if (PoolInstanceInRegion(instance, region)) in_region += 1u;
   }
   g_pool.stats.region = in_region;
+  size_t written = 0u;
+  for (const auto& mesh : g_pool.meshes) {
+    if (mesh.writes_after_capture != 0u) written += 1u;
+  }
+  g_pool.stats.meshes_written = written;
 }
 
 // ---------------------------------------------------------------------------
@@ -902,9 +993,18 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
   const uint64_t admitted_key = PoolAdmittedKey(mesh_id, MatrixHash(observed.matrix, kPoolWorldFloats));
   if (g_pool.admitted_keys.count(admitted_key) != 0u) {
     // Same mesh content at the same place, reached through another draw key
-    // (another pass or a duplicate VB): one instance is enough.
+    // (another pass or a duplicate VB): one instance is enough. Its sightings
+    // are forwarded to that instance's observation (rare: one scan here).
     observed.admitted = true;
     g_pool.stats.dedup_instances += 1u;
+    const uint64_t matrix_hash = MatrixHash(observed.matrix, kPoolWorldFloats);
+    for (const WorldInstance& existing : g_pool.instances) {
+      if (existing.mesh_id == mesh_id && existing.mesh_key != mesh_key
+          && MatrixHash(existing.matrix, kPoolWorldFloats) == matrix_hash) {
+        observed.merged_mesh_key = existing.mesh_key;
+        break;
+      }
+    }
     return false;
   }
   if (g_pool.instances.size() >= kPoolMaxInstances) {
@@ -922,6 +1022,12 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
   instance.mesh_id = mesh_id;
   instance.source_vs_hash = observed.vs_hash;
   std::memcpy(instance.matrix, observed.matrix, sizeof(float) * kPoolWorldFloats);
+  ComputeMatrixInverse(instance.matrix, instance.inverse_world);
+  instance.first_frame = observed.first_frame;
+  instance.admit_frame = g_state.frame.load();
+  instance.admit_camera_valid = g_pool.resolve_camera_valid;
+  std::memcpy(instance.admit_camera, g_pool.resolve_camera, sizeof(instance.admit_camera));
+  instance.visibility = observed.camera_visibility.valid ? observed.camera_visibility : observed.light_visibility;
   g_pool.instances.push_back(instance);
   g_pool.admitted_keys.insert(admitted_key);
   g_pool.families[observed.vs_hash].admitted += 1u;
@@ -938,11 +1044,113 @@ inline void AdmitPendingInstancesForMesh(uint64_t mesh_key, uint32_t mesh_id) {
   }
 }
 
+// Caller holds g_pool.mutex. Per-view bookkeeping of one sighting (a VS of
+// neither view records nothing here).
+inline void NotePoolSighting(ObservedInstance& observed, const PoolSighting& sighting, const PoolVisibility* visibility,
+                             uint32_t frame) {
+  const bool has_inputs = visibility != nullptr && visibility->valid;
+  if ((sighting.pass & kPoolPassCamera) != 0u) {
+    if (observed.camera_frames == 0u || observed.last_camera_frame != frame) {
+      observed.camera_frames += 1u;
+      observed.last_camera_frame = frame;
+    }
+    observed.camera_sightings += 1u;
+    if ((sighting.pass & kPoolPassNearFadePs) != 0u) observed.camera_near_fade_sightings += 1u;
+    observed.camera_ps_hash = sighting.ps_hash;
+    if (has_inputs) observed.camera_visibility = *visibility;
+  } else if ((sighting.pass & kPoolPassLight) != 0u) {
+    if (observed.light_frames == 0u || observed.last_light_frame != frame) {
+      observed.light_frames += 1u;
+      observed.last_light_frame = frame;
+    }
+    if (has_inputs) observed.light_visibility = *visibility;
+  }
+}
+
+// More than half of the camera draws used a near-fading pixel shader.
+inline bool PoolMostlyNearFade(uint32_t near_fade, uint32_t total) {
+  return total != 0u && near_fade * 2u > total;
+}
+
+// What GetPoolCameraVisibility uses from one observation, compared before and
+// after a sighting: a change asks for a TLAS rebuild.
+struct PoolViewDecision {
+  bool camera_seen = false;
+  bool light_seen = false;
+  bool near_fade = false;
+  float inputs[2] = {};  // near-fade start and 1/range (bitwise compared: NaN-safe)
+};
+
+inline bool SamePoolView(const PoolViewDecision& a, const PoolViewDecision& b) {
+  return a.camera_seen == b.camera_seen && a.light_seen == b.light_seen && a.near_fade == b.near_fade
+         && std::memcmp(a.inputs, b.inputs, sizeof(a.inputs)) == 0;
+}
+
+inline PoolViewDecision PoolObservationView(const ObservedInstance& observed) {
+  PoolViewDecision decision;
+  decision.camera_seen = observed.camera_sightings != 0u;
+  decision.light_seen = observed.light_frames != 0u;
+  decision.near_fade = PoolMostlyNearFade(observed.camera_near_fade_sightings, observed.camera_sightings);
+  const PoolVisibility& inputs = observed.camera_visibility.valid ? observed.camera_visibility : observed.light_visibility;
+  if (inputs.valid) {
+    decision.inputs[0] = inputs.param[0];
+    decision.inputs[1] = inputs.param[1];
+  }
+  return decision;
+}
+
 // Caller holds g_pool.mutex.
-inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float* world, uint32_t frame) {
+inline void NotePoolVisibilityChange() {
+  g_pool.visibility_revision += 1u;
+  g_pool.stats.visibility_changes += 1u;
+}
+
+// Caller holds g_pool.mutex. NotePoolSighting, plus a visibility change when
+// it alters what an admitted instance's TLAS entry would get.
+inline void NotePoolSightingTracked(ObservedInstance& observed, const PoolSighting& sighting, const PoolVisibility* visibility,
+                                    uint32_t frame) {
+  const PoolViewDecision before = PoolObservationView(observed);
+  NotePoolSighting(observed, sighting, visibility, frame);
+  if (observed.admitted && !SamePoolView(before, PoolObservationView(observed))) NotePoolVisibilityChange();
+}
+
+// Caller holds g_pool.mutex. The view one sampled draw of a mesh ran in
+// (diagnostic: the camera visibility of instances is decided per instance).
+inline void NotePoolMeshPass(uint64_t mesh_key, const PoolSighting& sighting) {
+  const auto it = g_pool.mesh_by_key.find(mesh_key);
+  if (it == g_pool.mesh_by_key.end() || it->second >= g_pool.meshes.size()) return;
+  WorldMesh& mesh = g_pool.meshes[it->second];
+  if ((sighting.pass & kPoolPassCamera) != 0u) {
+    mesh.camera_draws += 1u;
+    if ((sighting.pass & kPoolPassNearFadePs) != 0u) mesh.camera_near_fade_draws += 1u;
+    mesh.camera_ps_hash = sighting.ps_hash;
+  } else if ((sighting.pass & kPoolPassLight) != 0u) {
+    mesh.light_draws += 1u;
+  }
+}
+
+// Caller holds g_pool.mutex. `sighting` and `visibility` (both optional) are
+// what the draw tells about the pass and the instance's camera visibility.
+inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float* world, uint32_t frame,
+                                const PoolSighting* sighting = nullptr, const PoolVisibility* visibility = nullptr) {
   const InstanceKey key{mesh_key, MatrixHash(world, kPoolWorldFloats)};
   ObservedInstance& observed = g_pool.observations[key];
-  if (observed.rejected || observed.admitted) return;
+  if (observed.rejected) return;
+  if (sighting != nullptr) {
+    NotePoolSightingTracked(observed, *sighting, visibility, frame);
+    if (observed.merged_mesh_key != 0u) {
+      const auto merged = g_pool.observations.find(InstanceKey{observed.merged_mesh_key, key.matrix_hash});
+      if (merged != g_pool.observations.end()) NotePoolSightingTracked(merged->second, *sighting, visibility, frame);
+    }
+  }
+  if (observed.admitted) {
+    // Diagnostic only: how often and how recently an admitted instance is seen.
+    if (observed.last_frame != frame) {
+      observed.count += 1u;
+      observed.last_frame = frame;
+    }
+    return;
+  }
   if (observed.count == 0u) {
     // Diagnostic only: a new exact matrix next to an earlier one for the same
     // mesh. Counts objects whose matrix jitters instead of staying identical.
@@ -968,6 +1176,7 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
     }
     if (g_pool.near_index.size() > kPoolMaxNearIndex) g_pool.near_index.clear();
   }
+  if (observed.count == 0u) observed.first_frame = frame;
   if (observed.count == 0u || observed.last_frame != frame) {
     observed.count += 1u;
     observed.last_frame = frame;
@@ -979,6 +1188,57 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
   if (mesh_it != g_pool.mesh_by_key.end()) AdmitPoolInstance(observed, mesh_key, mesh_it->second);
 }
 
+// What decides how the game camera sees an admitted instance (see
+// shader_contract.hpp): whether any camera vertex shader drew it (an instance
+// only ever drawn through light views is a shadow-only caster for the game),
+// whether a light view drew it (a shadow caster), its fade inputs (the latest
+// from a camera draw, else from a light draw, else those at admission) and
+// whether the near fade applies (most of its camera draws used a pixel shader
+// that near-fades). Sightings through another draw key of the same object
+// are forwarded at observation (ObservePoolInstance). Caller holds g_pool.mutex.
+struct PoolCameraVisibility {
+  PoolVisibility inputs;
+  const char* source = "none";  // where `inputs` came from: "camera draw", "light draw", "admission", "none"
+  bool camera_seen = false;     // drawn by a camera VS
+  bool light_seen = false;      // drawn by a light VS
+  bool near_fade = false;       // most camera draws near-fade it
+  uint32_t camera_ps_hash = 0u; // latest camera-draw pixel shader
+  bool observed = false;        // its observation still exists
+  uint32_t camera_frames = 0u;  // of the observation
+  uint32_t light_frames = 0u;
+  uint32_t camera_sightings = 0u;
+  uint32_t camera_near_fade_sightings = 0u;
+};
+
+inline PoolCameraVisibility GetPoolCameraVisibility(const WorldInstance& instance) {
+  PoolCameraVisibility result;
+  const auto it = g_pool.observations.find(InstanceKey{instance.mesh_key, MatrixHash(instance.matrix, kPoolWorldFloats)});
+  if (it != g_pool.observations.end()) {
+    const ObservedInstance& observed = it->second;
+    result.observed = true;
+    result.camera_frames = observed.camera_frames;
+    result.light_frames = observed.light_frames;
+    result.camera_sightings = observed.camera_sightings;
+    result.camera_near_fade_sightings = observed.camera_near_fade_sightings;
+    result.camera_seen = observed.camera_sightings != 0u;
+    result.light_seen = observed.light_frames != 0u;
+    result.near_fade = PoolMostlyNearFade(observed.camera_near_fade_sightings, observed.camera_sightings);
+    result.camera_ps_hash = observed.camera_ps_hash;
+    if (observed.camera_visibility.valid) {
+      result.inputs = observed.camera_visibility;
+      result.source = "camera draw";
+    } else if (observed.light_visibility.valid) {
+      result.inputs = observed.light_visibility;
+      result.source = "light draw";
+    }
+  }
+  if (!result.inputs.valid && instance.visibility.valid) {
+    result.inputs = instance.visibility;
+    result.source = "admission";
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Draw-time scan.
 
@@ -986,12 +1246,14 @@ struct PoolDrawGate {
   contract::VsClass vs_class = contract::VsClass::Unclassified;
   PoolSkip skip = PoolSkip::None;
   PoolDrawState state = PoolDrawState::Ok;
+  uint8_t pass = 0u;  // kPoolPass* bits, set when the draw passes the gate
 };
 
 // Shader classes first, then draw state, then the pixel shader.
 inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count) {
   PoolDrawGate gate;
-  gate.vs_class = contract::LookupVertexClass(draw.vs_pipeline);
+  const contract::ShaderTraits vs_traits = contract::LookupVertexTraits(draw.vs_pipeline);
+  gate.vs_class = static_cast<contract::VsClass>(vs_traits.cls);
   if (gate.vs_class != contract::VsClass::Rigid) {
     gate.skip = PoolSkip::NotRigid;
     return gate;
@@ -1001,11 +1263,18 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
     gate.skip = PoolSkip::DrawState;
     return gate;
   }
-  const contract::PsClass ps_class = contract::LookupPixelClass(draw.ps_pipeline);
+  const contract::ShaderTraits ps_traits = contract::LookupPixelTraits(draw.ps_pipeline);
+  const auto ps_class = static_cast<contract::PsClass>(ps_traits.cls);
   if (ps_class == contract::PsClass::AlphaTested) {
     gate.skip = PoolSkip::AlphaTested;
   } else if (ps_class != contract::PsClass::Opaque) {
     gate.skip = PoolSkip::PixelUnknown;
+  }
+  if (gate.skip == PoolSkip::None) {
+    gate.pass = static_cast<uint8_t>(((vs_traits.flags & contract::kTraitCameraView) != 0u ? kPoolPassCamera : 0u)
+                                     | ((vs_traits.flags & contract::kTraitLightView) != 0u ? kPoolPassLight : 0u)
+                                     | ((vs_traits.flags & contract::kTraitVisibilityLayout) != 0u ? kPoolPassVisibility : 0u)
+                                     | ((ps_traits.flags & contract::kTraitNearFade) != 0u ? kPoolPassNearFadePs : 0u));
   }
   return gate;
 }
@@ -1157,12 +1426,23 @@ inline const char* ResolvePoolMeshLayout(
 // its buffers are released.
 // Caller holds g_pool.mutex. Maps a VB/IB handle to a draw key once (a key
 // queued again after it expired is already mapped).
+inline uint32_t PoolBloomBit(uint64_t handle) {
+  return static_cast<uint32_t>(((handle >> 4u) * 0x9E3779B97F4A7C15ull) >> 48u);  // 16 bits
+}
+
+inline bool PoolBloomTest(uint64_t handle) {
+  const uint32_t bit = PoolBloomBit(handle);
+  return (g_pool.tracked_bloom[bit >> 6u].load(std::memory_order_relaxed) & (1ull << (bit & 63u))) != 0u;
+}
+
 inline void AddPoolResourceKey(uint64_t handle, uint64_t mesh_key) {
+  const uint32_t bit = PoolBloomBit(handle);
+  g_pool.tracked_bloom[bit >> 6u].fetch_or(1ull << (bit & 63u), std::memory_order_relaxed);
   auto& keys = g_pool.keys_by_resource[handle];
   if (std::find(keys.begin(), keys.end(), mesh_key) == keys.end()) keys.push_back(mesh_key);
 }
 
-inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw) {
+inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, bool from_indirect) {
   if (!g_pool.mesh_queued.insert(mesh_key).second) {
     // Seen again: a waiting mesh is still drawn, so it does not expire.
     const auto request = g_pool.mesh_requests.find(mesh_key);
@@ -1178,6 +1458,7 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
   request.vs_hash = vs_hash;
   request.last_frame = g_state.frame.load();
   request.draw = draw;
+  request.from_indirect = from_indirect;
   const char* error = ResolvePoolMeshLayout(draw, &request.pos_offset, &request.pos_format);
   if (error != nullptr) {
     RecordPoolMeshFailure(mesh_key, error);
@@ -1373,6 +1654,8 @@ inline void OnPoolScanDraw(
         copy.cpu_base = slice.base;
         copy.frame = frame;
         copy.vs_hash = draw.vs_hash;
+        copy.ps_hash = draw.ps_hash;
+        copy.pass = gate.pass;
         copy.mesh_key = mesh_key;
         // The b1 copy is recorded before this draw, so it holds exactly the
         // offset the draw reads; resolve compares it to `base`.
@@ -1385,7 +1668,7 @@ inline void OnPoolScanDraw(
         schedule->next_frame = frame + kPoolRecaptureFrames;
         g_pool.stats.copied_draws += 1u;
         family.copied += 1u;
-        QueuePoolMesh(mesh_key, draw.vs_hash, draw);
+        QueuePoolMesh(mesh_key, draw.vs_hash, draw, false);
       }
     }
     if (skip != PoolSkip::None) CountPoolSkip(family, skip, gate.state);
@@ -1462,9 +1745,8 @@ inline void OnPoolScanIndirectDraw(
       const uint64_t schedule_key = PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset);
       uint32_t window = max_window;
       const auto known = g_pool.schedule.find(schedule_key);
-      if (known != g_pool.schedule.end() && known->second.indirect_window != 0u) {
-        window = (std::min)(known->second.indirect_window, max_window);
-      }
+      const bool learned = known != g_pool.schedule.end() && known->second.indirect_window != 0u;
+      if (learned) window = (std::min)(known->second.indirect_window, max_window);
       const uint64_t bytes =
           kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
       PoolSchedule* schedule = nullptr;
@@ -1485,6 +1767,8 @@ inline void OnPoolScanIndirectDraw(
       copy.cpu_base = slice.base;
       copy.frame = frame;
       copy.vs_hash = draw.vs_hash;
+      copy.ps_hash = draw.ps_hash;
+      copy.pass = gate.pass;
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
       copy.schedule_key = schedule_key;
       PoolCopyCommand* sub_commands = commands.data() + command_count;
@@ -1502,6 +1786,7 @@ inline void OnPoolScanIndirectDraw(
       g_pool.stats.copied_draws += 1u;
       g_pool.stats.indirect_copied += 1u;
       g_pool.stats.indirect_window_instances += window;
+      if (!learned) g_pool.stats.indirect_first_copies += 1u;
       family.copied += 1u;
     }
     mesh_count = ReservePoolMeshCopies(device, draw, deferred, frame, commands.data() + command_count,
@@ -1535,6 +1820,59 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   if (mesh.live_keys != 0u) mesh.live_keys -= 1u;
   if (mesh.live_keys == 0u) g_pool.retire_pending = true;
   g_pool.mesh_by_key.erase(it);
+}
+
+// A game write to a VB/IB that a captured or queued mesh comes from
+// (diagnostic only): the mesh may no longer match the buffer's contents.
+// Other buffers cost a bloom-filter test and no lock. Called from the game's
+// own calls; the pool never makes graphics calls under its lock, so this
+// cannot re-enter it.
+inline void NotePoolBufferWrite(uint64_t handle) {
+  if (handle == 0u || !PoolBloomTest(handle)) return;
+  std::lock_guard<std::mutex> lock(g_pool.mutex);
+  const auto it = g_pool.keys_by_resource.find(handle);
+  if (it == g_pool.keys_by_resource.end()) return;
+  g_pool.stats.tracked_buffer_writes += 1u;
+  for (const uint64_t mesh_key : it->second) {
+    const auto mesh = g_pool.mesh_by_key.find(mesh_key);
+    if (mesh != g_pool.mesh_by_key.end() && mesh->second < g_pool.meshes.size()) {
+      uint32_t& writes = g_pool.meshes[mesh->second].writes_after_capture;
+      if (writes != UINT32_MAX) writes += 1u;
+    }
+    const auto request = g_pool.mesh_requests.find(mesh_key);
+    if (request != g_pool.mesh_requests.end() && !request->second.written) {
+      request->second.written = true;
+      g_pool.stats.requests_written += 1u;
+    }
+  }
+}
+
+inline bool OnUpdateBufferRegionPool(
+    reshade::api::device*, const void*, reshade::api::resource dest, uint64_t, uint64_t) {
+  NotePoolBufferWrite(dest.handle);
+  return false;
+}
+
+inline bool OnUpdateBufferRegionCommandPool(
+    reshade::api::command_list*, const void*, reshade::api::resource dest, uint64_t, uint64_t) {
+  NotePoolBufferWrite(dest.handle);
+  return false;
+}
+
+inline void OnMapBufferRegionPool(
+    reshade::api::device*, reshade::api::resource resource, uint64_t, uint64_t, reshade::api::map_access access, void**) {
+  if (access != reshade::api::map_access::read_only) NotePoolBufferWrite(resource.handle);
+}
+
+inline bool OnCopyBufferRegionPool(
+    reshade::api::command_list*, reshade::api::resource, uint64_t, reshade::api::resource dest, uint64_t, uint64_t) {
+  NotePoolBufferWrite(dest.handle);
+  return false;
+}
+
+inline bool OnCopyResourcePool(reshade::api::command_list*, reshade::api::resource, reshade::api::resource dest) {
+  NotePoolBufferWrite(dest.handle);
+  return false;
 }
 
 inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::resource resource) {
@@ -1571,9 +1909,11 @@ inline void CompactPool() {
   std::vector<uint32_t> remap(g_pool.meshes.size(), UINT32_MAX);
   std::vector<WorldMesh> meshes;
   meshes.reserve(g_pool.meshes.size());
+  uint32_t retired_now = 0u;
   for (auto& mesh : g_pool.meshes) {
     if (mesh.live_keys == 0u) {
       g_pool.stats.meshes_retired += 1u;
+      retired_now += 1u;
       continue;
     }
     remap[mesh.mesh_id] = static_cast<uint32_t>(meshes.size());
@@ -1581,6 +1921,11 @@ inline void CompactPool() {
     meshes.push_back(std::move(mesh));
   }
   g_pool.meshes = std::move(meshes);
+  if (retired_now >= kPoolMassRetireMeshes) {
+    g_pool.stats.mass_retirements += 1u;
+    g_pool.stats.last_mass_retire_frame = g_state.frame.load();
+    g_pool.stats.last_mass_retire_meshes = retired_now;
+  }
 
   std::vector<WorldInstance> instances;
   instances.reserve(g_pool.instances.size());
@@ -1641,7 +1986,8 @@ inline uint64_t PoolMeshSignature(const PoolDecodedMesh& mesh) {
 // Caller holds g_pool.mutex. Adds one decoded mesh, or maps the key to an
 // existing mesh with the same content, and admits the instances waiting for
 // it. Returns what happened, for the log.
-inline const char* ApplyPoolMesh(uint64_t mesh_key, uint32_t vs_hash, PoolDecodedMesh& mesh) {
+inline const char* ApplyPoolMesh(
+    uint64_t mesh_key, uint32_t vs_hash, PoolDecodedMesh& mesh, const PoolMeshRequest* origin = nullptr) {
   if (g_pool.mesh_by_key.count(mesh_key) != 0u) return "already captured";
 
   const char* outcome = "added";
@@ -1660,10 +2006,18 @@ inline const char* ApplyPoolMesh(uint64_t mesh_key, uint32_t vs_hash, PoolDecode
     }
     WorldMesh world_mesh;
     world_mesh.mesh_key = mesh_key;
+    world_mesh.uid = g_pool.next_mesh_uid++;
     world_mesh.mesh_id = static_cast<uint32_t>(g_pool.meshes.size());
     world_mesh.source_vs_hash = vs_hash;
     world_mesh.signature = signature;
     world_mesh.triangle_count = static_cast<uint32_t>(mesh.triangles.size());
+    world_mesh.capture_frame = g_state.frame.load();
+    if (origin != nullptr) {
+      world_mesh.source_vb = origin->draw.vb.handle;
+      world_mesh.source_ib = origin->draw.ib.handle;
+      world_mesh.from_indirect = origin->from_indirect;
+      world_mesh.writes_after_capture = origin->written ? 1u : 0u;
+    }
     std::memcpy(world_mesh.bbox_min, mesh.bbox_min.data(), sizeof(float) * 3u);
     std::memcpy(world_mesh.bbox_max, mesh.bbox_max.data(), sizeof(float) * 3u);
     world_mesh.positions = std::move(mesh.positions);
@@ -1905,6 +2259,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   std::vector<PoolResolvedCopy> resolved(copies.size());
   std::vector<float> worlds;  // kPoolWorldFloats per instance of verified copies
   std::vector<uint8_t> moving;
+  std::vector<PoolVisibility> visibility;  // per instance, like worlds
   void* mapped = nullptr;
   const bool mapped_ok = copies.empty()
                          || (buffer.handle != 0u && used != 0u
@@ -1932,6 +2287,12 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         moving.push_back(std::memcmp(instance, instance + kPoolPrevWorldOffset, sizeof(float) * kPoolWorldFloats) != 0
                              ? 1u
                              : 0u);
+        PoolVisibility& inputs = visibility.emplace_back();
+        if ((copy.pass & kPoolPassVisibility) != 0u) {
+          inputs.valid = true;
+          std::memcpy(inputs.color, instance + contract::kColorOffset, sizeof(inputs.color));
+          std::memcpy(inputs.param, instance + contract::kParamOffset, sizeof(inputs.param));
+        }
       }
     }
     device->unmap_buffer_region(buffer);
@@ -1962,6 +2323,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   }
 
   stage.Set("present: resolve (apply)");
+  const PoolCameraInfo camera = GetPoolCameraInfo();  // takes g_state.mutex: before the pool lock
   const bool log = g_pool.log_captures.load(std::memory_order_relaxed);
   const uint32_t frame = g_state.frame.load();
   std::vector<std::string> log_lines;
@@ -1971,6 +2333,9 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     slot.resolving = false;
     slot.used = 0u;
     slot.mesh_used = 0u;
+
+    g_pool.resolve_camera_valid = camera.valid;
+    std::memcpy(g_pool.resolve_camera, camera.position, sizeof(g_pool.resolve_camera));
 
     // Meshes first, so instances read in this slot can admit right away.
     if (!meshes_ok) g_pool.stats.map_failures += 1u;
@@ -2004,7 +2369,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         outcome = "read, vertex copy next";
       } else {
         const PoolMeshRequest& queued = request->second;
-        outcome = ApplyPoolMesh(queued.mesh_key, queued.vs_hash, job.mesh);
+        outcome = ApplyPoolMesh(queued.mesh_key, queued.vs_hash, job.mesh, &queued);
         g_pool.mesh_requests.erase(request);
       }
       if (log) {
@@ -2075,9 +2440,11 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         record.vertex_offset = static_cast<int32_t>(result.args[3]);
         record.first_instance = result.args[4];
         mesh_key = PoolMeshKey(record);
-        QueuePoolMesh(mesh_key, copy.vs_hash, record);
+        QueuePoolMesh(mesh_key, copy.vs_hash, record, true);
       }
 
+      const PoolSighting sighting{copy.pass, copy.ps_hash};
+      NotePoolMeshPass(mesh_key, sighting);
       for (uint32_t element = 0; element < result.count; ++element) {
         const size_t index = result.first_world + element;
         const float* world = worlds.data() + index * kPoolWorldFloats;
@@ -2089,7 +2456,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
           CountPoolMatrixReject(family, reject, world);
           continue;
         }
-        ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame);
+        ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame, &sighting, &visibility[index]);
       }
     }
   }
@@ -2227,13 +2594,191 @@ inline std::string PoolHashText(uint32_t hash) {
   return text;
 }
 
+// A float for the dump: game-supplied values may be NaN or infinite, which
+// JSON cannot hold.
+struct PoolJsonFloat {
+  float value = 0.f;
+};
+
+inline std::ostream& operator<<(std::ostream& out, PoolJsonFloat number) {
+  if (std::isfinite(number.value)) return out << number.value;
+  return out << "null";
+}
+
+// Camera visibility of the admitted instances, for the dump (see
+// GetPoolCameraVisibility and camera_fade.hpp).
+inline void WritePoolVisibilitySummary(
+    std::ostringstream& out,
+    const std::vector<WorldInstance>& instances,
+    const std::vector<PoolCameraVisibility>& visibility,
+    const std::vector<WorldMesh>& meshes,
+    const PoolCameraInfo& camera,
+    const PoolRegion& region,
+    float near_fade_floor,
+    uint64_t visibility_changes) {
+  uint32_t camera_visible = 0u;
+  uint32_t shadow_only = 0u;
+  uint32_t shadow_only_in_region = 0u;
+  uint32_t no_view = 0u;  // neither view recorded (observation gone, or a VS of another view)
+  std::unordered_map<uint32_t, uint32_t> shadow_only_by_vs;
+  uint32_t with_inputs = 0u;
+  uint32_t from_camera = 0u;
+  uint32_t from_light = 0u;
+  uint32_t from_admission = 0u;
+  uint32_t near_fade = 0u;
+  uint32_t start_buckets[6] = {};  // <=0, 0-2, 2-5, 5-10, 10-20, >20 m
+  uint32_t inv_range_zero = 0u;
+  uint32_t unusable = 0u;
+  float inv_range_min = 1e30f;
+  float inv_range_max = -1e30f;
+  uint32_t opacity_below_half = 0u;
+  uint32_t flipped = 0u;
+  uint32_t changed = 0u;
+  uint32_t hidden_at_camera = 0u;
+  struct Sample {
+    size_t index = 0u;
+    float distance = 0.f;
+    float fade = 1.f;
+    const char* reason = "";
+  };
+  std::vector<Sample> samples;
+  const auto closest_distance = [&camera](const WorldInstance& instance) {
+    float sum = 0.f;
+    for (int k = 0; k < 3; ++k) {
+      const float d = (std::max)((std::max)(instance.bounds_min[k] - camera.position[k], 0.f),
+                                 camera.position[k] - instance.bounds_max[k]);
+      sum += d * d;
+    }
+    return std::sqrt(sum);
+  };
+  for (size_t i = 0; i < instances.size() && i < visibility.size(); ++i) {
+    const WorldInstance& instance = instances[i];
+    const PoolCameraVisibility& entry = visibility[i];
+    const bool in_region = camera.valid && PoolInstanceInRegion(instance, region);
+    if (entry.camera_seen) {
+      camera_visible += 1u;
+    } else if (entry.light_seen) {
+      shadow_only += 1u;
+      shadow_only_by_vs[instance.source_vs_hash] += 1u;
+      if (in_region) shadow_only_in_region += 1u;
+    } else {
+      no_view += 1u;
+    }
+    if (!entry.camera_seen && in_region) {
+      samples.push_back({i, closest_distance(instance), 1.f, entry.light_seen ? "shadow-only" : "no view"});
+    }
+    if (!entry.inputs.valid) continue;
+    with_inputs += 1u;
+    if (std::strcmp(entry.source, "camera draw") == 0) {
+      from_camera += 1u;
+    } else if (std::strcmp(entry.source, "light draw") == 0) {
+      from_light += 1u;
+    } else {
+      from_admission += 1u;
+    }
+    const float* param = entry.inputs.param;
+    if (entry.inputs.color[3] < kCameraFadeShown) opacity_below_half += 1u;
+    if (param[2] > 0.f) flipped += 1u;
+    if (instance.visibility.valid
+        && (instance.visibility.param[0] != param[0] || instance.visibility.param[1] != param[1]
+            || instance.visibility.param[2] != param[2] || instance.visibility.color[3] != entry.inputs.color[3])) {
+      changed += 1u;
+    }
+    if (!entry.camera_seen || !entry.near_fade) continue;
+    if (!CameraFadeInputsUsable(param[0], param[1])) {
+      unusable += 1u;
+      continue;
+    }
+    near_fade += 1u;
+    const float start = param[0];
+    const int bucket = start <= 0.f ? 0 : start <= 2.f ? 1 : start <= 5.f ? 2 : start <= 10.f ? 3 : start <= 20.f ? 4 : 5;
+    start_buckets[bucket] += 1u;
+    if (param[1] == 0.f) inv_range_zero += 1u;
+    inv_range_min = (std::min)(inv_range_min, param[1]);
+    inv_range_max = (std::max)(inv_range_max, param[1]);
+    if (!in_region) continue;
+    const float distance = closest_distance(instance);
+    const float fade = CameraNearFade(distance, start, param[1], near_fade_floor);
+    if (fade < kCameraFadeShown) hidden_at_camera += 1u;
+    if (fade < 1.f) samples.push_back({i, distance, fade, "near fade"});
+  }
+  std::sort(samples.begin(), samples.end(), [](const Sample& a, const Sample& b) { return a.distance < b.distance; });
+  if (samples.size() > 24u) samples.resize(24u);
+  std::vector<std::pair<uint32_t, uint32_t>> by_vs(shadow_only_by_vs.begin(), shadow_only_by_vs.end());
+  std::sort(by_vs.begin(), by_vs.end(), [](const auto& a, const auto& b) { return a.second != b.second ? a.second > b.second : a.first < b.first; });
+  if (by_vs.size() > 12u) by_vs.resize(12u);
+
+  out << "  \"visibility\": {\"instances\": " << instances.size()
+      << ", \"camera_visible\": " << camera_visible
+      << ", \"shadow_only\": " << shadow_only
+      << ", \"shadow_only_in_region\": " << shadow_only_in_region
+      << ", \"no_view\": " << no_view
+      << ", \"shadow_only_by_vs\": {";
+  for (size_t v = 0; v < by_vs.size(); ++v) {
+    if (v != 0u) out << ", ";
+    out << "\"" << PoolHashText(by_vs[v].first) << "\": " << by_vs[v].second;
+  }
+  out << "}"
+      << ", \"with_inputs\": " << with_inputs
+      << ", \"inputs_from\": {\"camera_draw\": " << from_camera << ", \"light_draw\": " << from_light
+      << ", \"admission\": " << from_admission << "}"
+      << ", \"near_fade\": " << near_fade
+      << ", \"near_fade_start_m\": {\"<=0\": " << start_buckets[0] << ", \"0-2\": " << start_buckets[1]
+      << ", \"2-5\": " << start_buckets[2] << ", \"5-10\": " << start_buckets[3] << ", \"10-20\": " << start_buckets[4]
+      << ", \">20\": " << start_buckets[5] << "}"
+      << ", \"near_fade_inv_range\": {\"min\": " << PoolJsonFloat{inv_range_min <= inv_range_max ? inv_range_min : 0.f}
+      << ", \"max\": " << PoolJsonFloat{inv_range_min <= inv_range_max ? inv_range_max : 0.f} << ", \"zero\": " << inv_range_zero
+      << ", \"not_finite\": " << unusable << "}"
+      << ", \"opacity_below_half\": " << opacity_below_half
+      << ", \"dither_flip\": " << flipped
+      << ", \"changed_since_admission\": " << changed
+      << ", \"visibility_changes\": " << visibility_changes
+      << ", \"hidden_at_camera\": " << hidden_at_camera
+      << ", \"samples\": [";
+  for (size_t s = 0; s < samples.size(); ++s) {
+    const WorldInstance& instance = instances[samples[s].index];
+    const PoolCameraVisibility& entry = visibility[samples[s].index];
+    const WorldMesh* mesh = instance.mesh_id < meshes.size() ? &meshes[instance.mesh_id] : nullptr;
+    if (s != 0u) out << ",";
+    out << "\n    {\"reason\": \"" << samples[s].reason << "\""
+        << ", \"mesh_uid\": " << (mesh != nullptr ? mesh->uid : 0u)
+        << ", \"vs_hash\": \"" << PoolHashText(instance.source_vs_hash) << "\""
+        << ", \"position\": [" << instance.matrix[3] << ", " << instance.matrix[7] << ", " << instance.matrix[11] << "]"
+        << ", \"bounds_min\": [" << instance.bounds_min[0] << ", " << instance.bounds_min[1] << ", " << instance.bounds_min[2] << "]"
+        << ", \"bounds_max\": [" << instance.bounds_max[0] << ", " << instance.bounds_max[1] << ", " << instance.bounds_max[2] << "]"
+        << ", \"triangles\": " << (mesh != nullptr ? mesh->triangle_count : 0u)
+        << ", \"closest_distance\": " << PoolJsonFloat{samples[s].distance}
+        << ", \"fade_at_closest\": " << PoolJsonFloat{samples[s].fade}
+        << ", \"start\": " << PoolJsonFloat{entry.inputs.param[0]}
+        << ", \"inv_range\": " << PoolJsonFloat{entry.inputs.param[1]}
+        << ", \"opacity\": " << PoolJsonFloat{entry.inputs.color[3]}
+        << ", \"inputs\": \"" << entry.source << "\""
+        << ", \"camera_ps\": \"" << PoolHashText(entry.camera_ps_hash) << "\""
+        << ", \"camera_frames\": " << entry.camera_frames
+        << ", \"light_frames\": " << entry.light_frames
+        << ", \"mesh_camera_draws\": " << (mesh != nullptr ? mesh->camera_draws : 0u)
+        << ", \"mesh_light_draws\": " << (mesh != nullptr ? mesh->light_draws : 0u) << "}";
+  }
+  out << "\n  ]},\n";
+}
+
 inline void DumpWorldPool() {
   std::vector<WorldMesh> meshes;
   std::vector<WorldInstance> instances;
+  std::vector<PoolCameraVisibility> visibility;  // per instance
   std::unordered_map<uint32_t, PoolFamilyStats> families;
   PoolStats stats;
   PoolRegion region;
   const PoolCameraInfo camera = GetPoolCameraInfo();
+  bool scene_fade = false;
+  float near_fade_floor = 0.f;
+  float map_alpha = 1.f;
+  {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    scene_fade = g_state.camera.has_fade;
+    near_fade_floor = g_state.camera.near_fade_floor;
+    map_alpha = g_state.camera.map_alpha;
+  }
   const contract::RegistryCounts registry_counts = contract::SnapshotRegistryCounts();
   const contract::RegistryEntries registry_entries = contract::SnapshotRegistryEntries();
   {
@@ -2241,6 +2786,8 @@ inline void DumpWorldPool() {
     UpdatePoolStats();
     meshes = g_pool.meshes;
     instances = g_pool.instances;
+    visibility.reserve(instances.size());
+    for (const WorldInstance& instance : instances) visibility.push_back(GetPoolCameraVisibility(instance));
     families = g_pool.families;
     stats = g_pool.stats;
     region = CurrentPoolRegion();
@@ -2265,10 +2812,12 @@ inline void DumpWorldPool() {
 
   std::ostringstream out;
   out << "{\n";
-  out << "  \"schema\": 3,\n";
+  out << "  \"schema\": 5,\n";
   out << "  \"generated_frame\": " << g_state.frame.load() << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
+  out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
+      << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";
   out << "  \"switches\": {\"capture_meshes\": " << (g_pool.capture_meshes.load() ? "true" : "false")
       << ", \"scan_indirect\": " << (g_pool.scan_indirect.load() ? "true" : "false") << "},\n";
   out << "  \"region\": {\"size\": " << region.size
@@ -2323,6 +2872,7 @@ inline void DumpWorldPool() {
       << ", \"indirect_truncated\": " << stats.indirect_truncated
       << ", \"indirect_dead\": " << stats.indirect_dead
       << ", \"indirect_window_instances\": " << stats.indirect_window_instances
+      << ", \"indirect_first_copies\": " << stats.indirect_first_copies
       << ", \"near_misses\": " << stats.near_misses
       << ", \"base_verified\": " << stats.base_verified
       << ", \"base_mismatch\": " << stats.base_mismatch
@@ -2349,6 +2899,12 @@ inline void DumpWorldPool() {
       << ", \"mesh_failures\": " << stats.mesh_failures
       << ", \"mesh_dedup\": " << stats.mesh_dedup
       << ", \"mesh_cap_drops\": " << stats.mesh_cap_drops
+      << ", \"tracked_buffer_writes\": " << stats.tracked_buffer_writes
+      << ", \"requests_written\": " << stats.requests_written
+      << ", \"meshes_written\": " << stats.meshes_written
+      << ", \"mass_retirements\": " << stats.mass_retirements
+      << ", \"last_mass_retire_frame\": " << stats.last_mass_retire_frame
+      << ", \"last_mass_retire_meshes\": " << stats.last_mass_retire_meshes
       << ", \"meshes_retired\": " << stats.meshes_retired
       << ", \"instances_retired\": " << stats.instances_retired
       << ", \"resource_invalidations\": " << stats.resource_invalidations
@@ -2371,14 +2927,22 @@ inline void DumpWorldPool() {
   for (size_t i = 0; i < registry_entries.vertex.size(); ++i) {
     if (i != 0u) out << ",";
     out << "\n    {\"hash\": \"" << PoolHashText(registry_entries.vertex[i].hash) << "\", \"class\": \""
-        << contract::VsClassName(static_cast<contract::VsClass>(registry_entries.vertex[i].cls)) << "\"}";
+        << contract::VsClassName(static_cast<contract::VsClass>(registry_entries.vertex[i].cls)) << "\""
+        << ", \"view\": \""
+        << ((registry_entries.vertex[i].flags & contract::kTraitCameraView) != 0u  ? "camera"
+            : (registry_entries.vertex[i].flags & contract::kTraitLightView) != 0u ? "light"
+                                                                                    : "other")
+        << "\", \"visibility_layout\": "
+        << ((registry_entries.vertex[i].flags & contract::kTraitVisibilityLayout) != 0u ? "true" : "false") << "}";
   }
   out << "\n  ],\n";
   out << "  \"pixel_shaders\": [";
   for (size_t i = 0; i < registry_entries.pixel.size(); ++i) {
     if (i != 0u) out << ",";
     out << "\n    {\"hash\": \"" << PoolHashText(registry_entries.pixel[i].hash) << "\", \"class\": \""
-        << contract::PsClassName(static_cast<contract::PsClass>(registry_entries.pixel[i].cls)) << "\"}";
+        << contract::PsClassName(static_cast<contract::PsClass>(registry_entries.pixel[i].cls)) << "\""
+        << ", \"near_fade\": " << ((registry_entries.pixel[i].flags & contract::kTraitNearFade) != 0u ? "true" : "false")
+        << "}";
   }
   out << "\n  ],\n";
 
@@ -2454,6 +3018,11 @@ inline void DumpWorldPool() {
   }
   out << "\n  ],\n";
 
+  // Like the trace's assumption in its inspect lines: floor 0 until the scene
+  // constants are captured ("fade_constants" says which).
+  WritePoolVisibilitySummary(out, instances, visibility, meshes, camera, region, scene_fade ? near_fade_floor : 0.f,
+                             stats.visibility_changes);
+
   out << "  \"meshes\": [";
   first = true;
   for (const auto& mesh : meshes) {
@@ -2464,6 +3033,14 @@ inline void DumpWorldPool() {
         << ", \"vertices\": " << mesh.positions.size()
         << ", \"triangles\": " << mesh.triangle_count
         << ", \"live_keys\": " << mesh.live_keys
+        << ", \"uid\": " << mesh.uid
+        << ", \"capture_frame\": " << mesh.capture_frame
+        << ", \"from_indirect\": " << (mesh.from_indirect ? "true" : "false")
+        << ", \"writes_after_capture\": " << mesh.writes_after_capture
+        << ", \"camera_draws\": " << mesh.camera_draws
+        << ", \"near_fade_draws\": " << mesh.camera_near_fade_draws
+        << ", \"light_draws\": " << mesh.light_draws
+        << ", \"camera_ps\": \"" << PoolHashText(mesh.camera_ps_hash) << "\""
         << ", \"bbox_min\": [" << mesh.bbox_min[0] << ", " << mesh.bbox_min[1] << ", " << mesh.bbox_min[2] << "]"
         << ", \"bbox_max\": [" << mesh.bbox_max[0] << ", " << mesh.bbox_max[1] << ", " << mesh.bbox_max[2] << "]}";
   }

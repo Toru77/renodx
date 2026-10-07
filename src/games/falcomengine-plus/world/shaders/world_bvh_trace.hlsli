@@ -12,6 +12,15 @@
 // invalid_refs instead of dereferencing out of range, and the stack never
 // overflows (stack_overflow is counted instead). Per-thread counters are
 // accumulated by the caller.
+//
+// Game camera view (rays that start at the camera). A surface is hidden from
+// the game camera when its instance was never drawn by a camera vertex shader
+// (no INSTANCE_CAMERA_VISIBLE: shadow-only casters), or when its instance has
+// INSTANCE_NEAR_FADE and its t lies outside CameraFadeInterval: the distance
+// along a camera ray is the distance the game's map-object pixel shaders fade
+// by (camera_fade.hpp). With view.hide hidden surfaces are skipped (traversal
+// continues behind them); either way camera_hidden reports whether the
+// nearest BVH surface along the ray is one.
 
 #include "world_bvh_types.hlsli"
 
@@ -35,6 +44,7 @@ struct WorldTraceHit
     uint prim;
     float3 position;
     float3 normal;
+    uint hidden;           // 1: the game camera does not show the hit surface (only when view.hide is off)
 };
 
 struct WorldTraceCounters
@@ -45,6 +55,14 @@ struct WorldTraceCounters
     uint stack_overflow;
     uint triangle_tests;
     uint max_stack_depth;
+    uint camera_hidden;    // 1: the game camera does not show the nearest BVH surface along the ray
+};
+
+// Ray-wide game camera settings (rays from the camera only).
+struct WorldCameraView
+{
+    bool hide;             // skip surfaces the game camera does not show
+    float floor_value;     // cb_scene.disableMapObjNearFade_g
 };
 
 void TraceResetCounters(out WorldTraceCounters counters)
@@ -55,6 +73,32 @@ void TraceResetCounters(out WorldTraceCounters counters)
     counters.stack_overflow = 0u;
     counters.triangle_tests = 0u;
     counters.max_stack_depth = 0u;
+    counters.camera_hidden = 0u;
+}
+
+// Mirrors camera_fade.hpp CameraFadeInterval: the distances [lo, hi] at which
+// the near fade draws at least half of the dither pattern.
+#define CAMERA_FADE_SHOWN 0.5
+#define CAMERA_FADE_NEVER 3.0e38
+
+bool CameraFadeInterval(float start, float inv_range, float floor_value, out float lo, out float hi)
+{
+    lo = 0.0;
+    hi = CAMERA_FADE_NEVER;
+    if (floor_value >= CAMERA_FADE_SHOWN) return true;
+    if (inv_range > 0.0)
+    {
+        lo = start + CAMERA_FADE_SHOWN / inv_range;
+        return true;
+    }
+    if (inv_range < 0.0)
+    {
+        hi = start + CAMERA_FADE_SHOWN / inv_range;
+        if (hi >= 0.0) return true;
+    }
+    lo = CAMERA_FADE_NEVER;
+    hi = -1.0;
+    return false;
 }
 
 bool AabbIntersect(
@@ -109,18 +153,27 @@ bool IntersectTriangle(
     return true;
 }
 
+// shown_min / shown_max: the t range in which the game camera shows this
+// instance's surfaces. A hit outside it is skipped when hide_hidden (its t
+// goes to hidden_t), otherwise accepted with out_hidden = 1.
 bool TraceBlas(
     uint mesh_id,
     float3 origin,
     float3 direction,
     float t_min,
     inout float t_max,
+    float shown_min,
+    float shown_max,
+    bool hide_hidden,
+    inout float hidden_t,
     inout WorldTraceCounters counters,
     out uint out_prim,
-    out float3 out_normal)
+    out float3 out_normal,
+    out uint out_hidden)
 {
     out_prim = 0xFFFFFFFFu;
     out_normal = float3(0.0, 0.0, 0.0);
+    out_hidden = 0u;
 
     const WorldMeshGPU mesh = g_trace_meshes[mesh_id];
     const uint leaf_count = (uint)mesh.build.w;
@@ -186,10 +239,19 @@ bool TraceBlas(
                                 if (IntersectTriangle(origin, direction, v0, v1, v2, tri_t, tri_normal)
                                     && tri_t >= t_min && tri_t < t_max)
                                 {
-                                    t_max = tri_t;
-                                    out_prim = prim;
-                                    out_normal = tri_normal;
-                                    found = true;
+                                    const bool shown = tri_t >= shown_min && tri_t <= shown_max;
+                                    if (shown || !hide_hidden)
+                                    {
+                                        t_max = tri_t;
+                                        out_prim = prim;
+                                        out_normal = tri_normal;
+                                        out_hidden = shown ? 0u : 1u;
+                                        found = true;
+                                    }
+                                    else
+                                    {
+                                        hidden_t = min(hidden_t, tri_t);
+                                    }
                                 }
                             }
                         }
@@ -231,6 +293,7 @@ WorldTraceHit TraceWorldRay(
     float t_min,
     float t_max,
     bool any_hit,
+    WorldCameraView view,
     out WorldTraceCounters counters)
 {
     TraceResetCounters(counters);
@@ -242,6 +305,7 @@ WorldTraceHit TraceWorldRay(
     hit.prim = 0xFFFFFFFFu;
     hit.position = float3(0.0, 0.0, 0.0);
     hit.normal = float3(0.0, 0.0, 0.0);
+    hit.hidden = 0u;
 
     uint tlas_leaf_count = 0u;
     uint tlas_stride = 0u;
@@ -268,6 +332,8 @@ WorldTraceHit TraceWorldRay(
     uint best_mesh = 0xFFFFFFFFu;
     uint best_prim = 0xFFFFFFFFu;
     float3 best_normal = float3(0.0, 0.0, 0.0);
+    uint best_hidden = 0u;
+    float hidden_t = CAMERA_FADE_NEVER;  // nearest skipped hidden hit (view.hide)
 
     uint stack[TRACE_STACK_SIZE];
     uint stack_size = 0u;
@@ -328,15 +394,32 @@ WorldTraceHit TraceWorldRay(
                                         dot(direction_h, instance.inverse_world[0]),
                                         dot(direction_h, instance.inverse_world[1]),
                                         dot(direction_h, instance.inverse_world[2]));
+                                    // Where the game camera shows this instance's surfaces.
+                                    const uint visibility_flags = (uint)(instance.visibility.z + 0.5);
+                                    float shown_min = 0.0;
+                                    float shown_max = CAMERA_FADE_NEVER;
+                                    if ((visibility_flags & INSTANCE_CAMERA_VISIBLE) == 0u)
+                                    {
+                                        shown_min = CAMERA_FADE_NEVER;
+                                        shown_max = -1.0;
+                                    }
+                                    else if ((visibility_flags & INSTANCE_NEAR_FADE) != 0u)
+                                    {
+                                        CameraFadeInterval(instance.visibility.x, instance.visibility.y, view.floor_value, shown_min, shown_max);
+                                    }
                                     float local_best_t = best_t;
                                     uint local_prim = 0xFFFFFFFFu;
                                     float3 local_normal = float3(0.0, 0.0, 0.0);
-                                    if (TraceBlas(mesh_id, local_origin, local_direction, t_min, local_best_t, counters, local_prim, local_normal))
+                                    uint local_hidden = 0u;
+                                    if (TraceBlas(mesh_id, local_origin, local_direction, t_min, local_best_t,
+                                                  shown_min, shown_max, view.hide, hidden_t,
+                                                  counters, local_prim, local_normal, local_hidden))
                                     {
                                         best_t = local_best_t;
                                         best_instance = resolved;
                                         best_mesh = mesh_id;
                                         best_prim = local_prim;
+                                        best_hidden = local_hidden;
                                         const float4 normal_h = float4(local_normal, 0.0);
                                         best_normal = normalize(float3(
                                             dot(normal_h, instance.world[0]),
@@ -345,12 +428,14 @@ WorldTraceHit TraceWorldRay(
                                         if (any_hit)
                                         {
                                             counters.hits = 1u;
+                                            counters.camera_hidden = (best_hidden != 0u || hidden_t < best_t) ? 1u : 0u;
                                             hit.t = best_t;
                                             hit.instance = best_instance;
                                             hit.mesh = best_mesh;
                                             hit.prim = best_prim;
                                             hit.position = origin + direction * best_t;
                                             hit.normal = best_normal;
+                                            hit.hidden = best_hidden;
                                             return hit;
                                         }
                                     }
@@ -387,6 +472,9 @@ WorldTraceHit TraceWorldRay(
         node_index = stack[stack_size];
     }
 
+    // A skipped hidden hit closer than the result (or than nothing) means the
+    // game camera does not show the nearest BVH surface.
+    counters.camera_hidden = (best_hidden != 0u || hidden_t < best_t) ? 1u : 0u;
     if (best_prim == 0xFFFFFFFFu)
     {
         counters.misses = 1u;
@@ -399,15 +487,16 @@ WorldTraceHit TraceWorldRay(
     hit.prim = best_prim;
     hit.position = origin + direction * best_t;
     hit.normal = best_normal;
+    hit.hidden = best_hidden;
     return hit;
 }
 
-WorldTraceHit TraceWorldClosest(float3 origin, float3 direction, float t_min, float t_max, out WorldTraceCounters counters)
+WorldTraceHit TraceWorldClosest(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view, out WorldTraceCounters counters)
 {
-    return TraceWorldRay(origin, direction, t_min, t_max, false, counters);
+    return TraceWorldRay(origin, direction, t_min, t_max, false, view, counters);
 }
 
-WorldTraceHit TraceWorldAny(float3 origin, float3 direction, float t_min, float t_max, out WorldTraceCounters counters)
+WorldTraceHit TraceWorldAny(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view, out WorldTraceCounters counters)
 {
-    return TraceWorldRay(origin, direction, t_min, t_max, true, counters);
+    return TraceWorldRay(origin, direction, t_min, t_max, true, view, counters);
 }

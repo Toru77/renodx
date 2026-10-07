@@ -3870,7 +3870,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
       .key = "SSGIMultiBounce", .binding = &shader_injection.vbgi_multibounce,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-      .default_value = 1.f, .label = "Multi-Bounce", .section = "VBGI",
+      .default_value = 0.f, .label = "Multi-Bounce", .section = "VBGI",
       .tooltip = "Enables multi-bounce GI: previous frame's indirect light feeds back into the GI computation.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && shader_injection.vbgi_enabled > 0.5f; },

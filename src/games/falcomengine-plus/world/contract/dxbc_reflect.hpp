@@ -34,6 +34,7 @@ inline constexpr uint32_t kInputByteAddress = 7u;
 inline constexpr uint32_t kCBufferResourceBindInfo = 3u;
 
 // D3D_SHADER_VARIABLE_CLASS / TYPE values used by the layout check.
+inline constexpr uint16_t kClassVector = 1u;
 inline constexpr uint16_t kClassMatrixRows = 2u;
 inline constexpr uint16_t kClassMatrixColumns = 3u;
 inline constexpr uint16_t kTypeFloat = 3u;

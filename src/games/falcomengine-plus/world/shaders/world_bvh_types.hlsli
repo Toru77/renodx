@@ -1,10 +1,10 @@
 #pragma once
 
-// world_bvh_types.hlsli - canonical GPU layout shared by the BVH build and
-// trace shaders. The C++ counterparts in bvh_resources.hpp/bvh_build.hpp are
-// size-asserted against these strides:
+// world_bvh_types.hlsli - canonical GPU layout read by the trace shaders. The
+// BVH is built on the CPU (bvh_build.hpp, bvh_live.hpp); the C++ counterparts
+// in bvh_resources.hpp/bvh_build.hpp are size-asserted against these strides:
 //   WorldMeshGPU     64 bytes
-//   WorldInstanceGPU 176 bytes
+//   WorldInstanceGPU 192 bytes
 //   BVHNodeGPU       32 bytes
 //   BVHLeafGPU       48 bytes
 
@@ -23,7 +23,13 @@ struct WorldInstanceGPU
     float4 inverse_world[4];
     float4 bounds_min;
     float4 bounds_max;
+    float4 visibility;     // x = near-fade start (m), y = near-fade 1/range, z = INSTANCE_* flags, w = 0
 };
+
+// WorldInstanceGPU.visibility.z flags (bvh_resources.hpp kInstance*).
+#define INSTANCE_NEAR_FADE 1u       // camera rays apply the near fade
+#define INSTANCE_CAMERA_VISIBLE 2u  // drawn by a camera vertex shader
+#define INSTANCE_SHADOW_CASTER 4u   // drawn by a light vertex shader (shadow maps)
 
 struct BVHLeafGPU
 {

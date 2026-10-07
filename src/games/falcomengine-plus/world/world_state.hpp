@@ -118,6 +118,11 @@ struct CameraSnapshot {
   float view_proj_inv[16] = {};
   float prev_view_proj[16] = {};
   bool has_prev = false;
+  // cb_scene scalars of the map-object near fade (shader_contract.hpp), when
+  // the captured constants reach them.
+  bool has_fade = false;
+  float near_fade_floor = 0.f;  // disableMapObjNearFade_g
+  float map_alpha = 1.f;        // mapColor_g.w
 };
 
 struct FamilyStats {

@@ -2,10 +2,10 @@
 
 // Phase 1 world BVH runtime entry.
 //
-// The pool admits geometry by bytecode shader class (bvh_pool.hpp); M2a
-// uploads it to GPU buffers and exposes the reconstruction debug view. The
-// present hook drives both the upload/revision handling and the debug pass.
-// M3+ adds BLAS/TLAS here.
+// The pool admits geometry by bytecode shader class (bvh_pool.hpp); the live
+// BVH (bvh_live.hpp) keeps the GPU mesh store and region TLAS in step with it
+// at every present, and the trace debug views (bvh_debug.hpp) read them. This
+// file registers the events and draws the panel.
 //
 // The whole module remains DevKit-gated through falcom_world::Use.
 
@@ -31,12 +31,22 @@ inline void Use(DWORD fdw_reason) {
     case DLL_PROCESS_ATTACH:
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
+      reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegionPool);
+      reshade::register_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommandPool);
+      reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionPool);
+      reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionPool);
+      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
       reshade::register_event<reshade::addon_event::present>(OnWorldPresentBvh);
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
+      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegionPool);
+      reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommandPool);
+      reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionPool);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionPool);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
       reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentBvh);
       break;
@@ -188,7 +198,8 @@ inline void DrawBvhPanel() {
                 static_cast<unsigned long long>(indirect));
   }
   if (!indirect_classes.empty()) {
-    ImGui::TextDisabled("Indirect: copied %llu  read %llu  empty %llu  truncated %llu  buffer released %llu  avg window %.0f",
+    ImGui::TextDisabled("Indirect: copied %llu  read %llu  empty %llu  truncated %llu  buffer released %llu  avg window %.0f  "
+                        "first-time (full window) %llu",
                         static_cast<unsigned long long>(stats.indirect_copied),
                         static_cast<unsigned long long>(stats.indirect_resolved),
                         static_cast<unsigned long long>(stats.indirect_empty),
@@ -196,7 +207,8 @@ inline void DrawBvhPanel() {
                         static_cast<unsigned long long>(stats.indirect_dead),
                         stats.indirect_copied != 0u
                             ? static_cast<double>(stats.indirect_window_instances) / static_cast<double>(stats.indirect_copied)
-                            : 0.0);
+                            : 0.0,
+                        static_cast<unsigned long long>(stats.indirect_first_copies));
   }
 
   const ImVec4 base_color = stats.base_mismatch == 0u ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
@@ -283,7 +295,25 @@ inline void DrawBvhPanel() {
   if (do_dump_obj) DumpWorldPoolObj();
   if (do_reset) ResetWorldPool();
 
-  ImGui::SeparatorText("GPU BVH (trace views)");
+  ImGui::SeparatorText("GPU BVH (live)");
+  bool live = g_live_bvh.enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Live BVH", &live)) g_live_bvh.enabled.store(live, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Keeps the GPU BVH in step with the pool every frame: new meshes stream in with their BLAS\n"
+                      "built on the CPU (%llu triangles per frame), and the region TLAS is rebuilt when instances,\n"
+                      "meshes or the region change (at most every %u frames). Off: the GPU BVH stays as it is.",
+                      static_cast<unsigned long long>(kLiveTrianglesPerFrame), kLiveTlasInterval);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Rebuild BVH")) g_live_bvh.reset_requested.store(true, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drops every GPU mesh and streams the pool in again.");
+  ImGui::SameLine();
+  if (ImGui::Button("Check GPU Contents")) g_live_bvh.check_requested.store(true, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Reads the GPU BVH back and compares it with what was uploaded.\n"
+                      "Waits for the GPU: expect a short hitch.");
+  }
+
   int mode = g_bvh_debug.mode.load(std::memory_order_relaxed);
   const char* modes = "Off\0BVH Trace (Shaded)\0BVH Trace (Instance ID)\0Depth Compare\0";
   if (ImGui::Combo("GPU Debug", &mode, modes)) {
@@ -292,70 +322,104 @@ inline void DrawBvhPanel() {
     if (mode != static_cast<int>(BvhView::Off)) g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
   }
   ImGui::SameLine();
-  if (ImGui::Button("Upload Pool to GPU")) {
-    g_bvh_debug.force_upload.store(true, std::memory_order_relaxed);
-  }
-  ImGui::SameLine();
   if (ImGui::Button("Read Stats")) {
     g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+  }
+  bool hiding = g_bvh_trace.hide_camera_hidden.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Hide what the game camera does not show", &hiding)) {
+    g_bvh_trace.hide_camera_hidden.store(hiding, std::memory_order_relaxed);
+    g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Some BVH instances are never drawn by a camera vertex shader, only into the shadow maps\n"
+                      "(shadow-only casters), and the game near-fades map objects very close to the camera.\n"
+                      "Both stay in the BVH (shadow casters are wanted for ray-traced shadows).\n"
+                      "On: the trace views skip them the way the game camera does.\n"
+                      "Off: they stay visible and are counted as hidden-from-camera pixels.");
   }
   if (mode == static_cast<int>(BvhView::DepthCompare)) {
     ImGui::TextDisabled("green match  blue missing (game surface in front / no BVH hit)  red extra (BVH in front)  orange BVH on game sky  grey beyond range");
   }
+  // Inspect: middle-click anywhere while a trace view is on.
+  if (mode != static_cast<int>(BvhView::Off) && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x > 0.f && io.DisplaySize.y > 0.f) {
+      g_bvh_trace.inspect_u.store(io.MousePos.x / io.DisplaySize.x, std::memory_order_relaxed);
+      g_bvh_trace.inspect_v.store(io.MousePos.y / io.DisplaySize.y, std::memory_order_relaxed);
+      g_bvh_trace.inspect_pending.store(true, std::memory_order_relaxed);
+      g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+    }
+  }
 
   reshade::api::device* device = g_bvh_debug.device.load(std::memory_order_relaxed);
   BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
-  if (data != nullptr && data->ready) {
-    ImGui::Text("GPU pool: rev %llu  active %u / %u  meshes %u  instances %u  verts %u  indices %u",
-                static_cast<unsigned long long>(data->uploaded_revision),
-                data->active_count,
-                data->instance_count,
-                data->mesh_count,
-                data->instance_count,
-                data->vertex_count,
-                data->index_count);
-    if (data->checksum_valid) {
-      if (data->checksum_match) {
-        ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "Upload checksum: match");
-      } else {
-        ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Upload checksum: MISMATCH");
-      }
-      ImGui::Text("CPU hash %016llX  GPU hash %016llX",
-                  static_cast<unsigned long long>(data->cpu_hash),
-                  static_cast<unsigned long long>(data->gpu_hash));
-    } else {
-      ImGui::TextDisabled("Upload checksum: unavailable");
-    }
-    if (data->bvh_ready) {
-      const ImVec4 color = data->blas_valid && data->tlas_valid
-                               ? ImVec4(0.4f, 1.f, 0.4f, 1.f)
-                               : ImVec4(1.f, 0.4f, 0.4f, 1.f);
-      ImGui::TextColored(color, "BVH: %s", data->build_status.c_str());
-      ImGui::TextDisabled("built rev %llu  tlas rev %llu  degenerate %u",
-                          static_cast<unsigned long long>(data->bvh_built_revision),
-                          static_cast<unsigned long long>(data->tlas_built_revision),
-                          data->degenerate_leaf_count);
-    } else {
-      ImGui::TextDisabled("BVH: %s", data->build_status.c_str());
-    }
-    if (data->trace_stats.valid) {
-      const ImVec4 color = data->trace_stats.invariant_ok
-                               ? ImVec4(0.4f, 1.f, 0.4f, 1.f)
-                               : ImVec4(1.f, 0.4f, 0.4f, 1.f);
-      ImGui::TextColored(color, "Trace: rays %u  hits %u  misses %u  (hits+misses=%s)",
-                          data->trace_stats.rays,
-                          data->trace_stats.hits,
-                          data->trace_stats.misses,
-                          data->trace_stats.invariant_ok ? "ok" : "FAIL");
-      ImGui::TextDisabled("Trace: invalid %u  stack_overflow %u  tri_tests %u  max_depth %u",
-                          data->trace_stats.invalid_refs,
-                          data->trace_stats.stack_overflow,
-                          data->trace_stats.triangle_tests,
-                          data->trace_stats.max_stack_depth);
-      DrawDepthCompareStats(data->trace_stats);
-    }
-  } else {
-    ImGui::TextDisabled("GPU pool not uploaded yet.");
+  if (data == nullptr) {
+    ImGui::TextDisabled("No device yet.");
+    return;
+  }
+  const LiveBvhStats& live_stats = data->live;
+  const double megabyte = 1024.0 * 1024.0;
+  ImGui::Text("Meshes on GPU: %u of %u  waiting %u  failed %u  retired %u   (%.1f MB used, %.1f MB allocated, %.1f MB retired)",
+              live_stats.resident_meshes, live_stats.pool_meshes, live_stats.pending_meshes, live_stats.failed_meshes,
+              live_stats.meshes_retired, static_cast<double>(live_stats.used_bytes) / megabyte,
+              static_cast<double>(live_stats.capacity_bytes) / megabyte,
+              static_cast<double>(live_stats.garbage_bytes) / megabyte);
+  ImGui::TextDisabled("Uploaded %llu meshes (%llu triangles)  resident triangles %u  buffer grows %u  store resets %u%s%s",
+                      static_cast<unsigned long long>(live_stats.meshes_uploaded),
+                      static_cast<unsigned long long>(live_stats.triangles_uploaded),
+                      live_stats.resident_triangles, live_stats.grows, live_stats.resets,
+                      live_stats.last_reset_reason.empty() ? "" : "  last reset: ",
+                      live_stats.last_reset_reason.c_str());
+  const uint32_t frame = g_state.frame.load();
+  ImGui::Text("TLAS: %u instances (never drawn by the camera %u, near-fade %u)  %u nodes  waiting for their mesh %u  mesh failed %u  rebuilds %u  (last: %s, %u frames ago)",
+              live_stats.tlas_instances, live_stats.tlas_camera_hidden, live_stats.tlas_near_fade, live_stats.tlas_nodes,
+              live_stats.tlas_waiting,
+              live_stats.tlas_unusable,
+              live_stats.tlas_rebuilds,
+              live_stats.tlas_rebuilds != 0u ? live_stats.tlas_reason : "none",
+              live_stats.tlas_rebuilds != 0u && frame >= live_stats.tlas_frame ? frame - live_stats.tlas_frame : 0u);
+  ImGui::Text("CPU time: mesh uploads %.2f ms (max %.2f)  TLAS %.2f ms (max %.2f)",
+              live_stats.mesh_ms_last, live_stats.mesh_ms_max, live_stats.tlas_ms_last, live_stats.tlas_ms_max);
+  if (data->trace_timer.last_ms >= 0.f) {
+    ImGui::SameLine();
+    ImGui::Text("  GPU trace (debug view) %.2f ms", data->trace_timer.last_ms);
+  }
+  if (live_stats.blas_invalid != 0u || live_stats.tlas_invalid != 0u || live_stats.upload_failures != 0u) {
+    ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Failures: mesh BLAS %u  TLAS %u  GPU buffers %u   last: %s",
+                       live_stats.blas_invalid, live_stats.tlas_invalid, live_stats.upload_failures,
+                       live_stats.last_failure.c_str());
+  } else if (!live_stats.last_failure.empty()) {
+    ImGui::TextDisabled("Last: %s", live_stats.last_failure.c_str());
+  }
+  if (live_stats.gpu_checked) {
+    const ImVec4 color = live_stats.gpu_ok ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
+    ImGui::TextColored(color, "GPU contents: %s", live_stats.gpu_result.c_str());
+  }
+  if (!data->bvh_ready) {
+    ImGui::TextDisabled("BVH not traceable yet (%s).",
+                        live_stats.resident_meshes == 0u ? "no mesh on the GPU" : "no instance of an uploaded mesh in the region");
+  }
+  if (mode != static_cast<int>(BvhView::Off)) {
+    ImGui::TextDisabled("Inspect: middle-click a pixel of the trace view to see what the BVH hit there (also written to ReShade.log).");
+  }
+  for (const std::string& line : data->inspect.lines) ImGui::TextUnformatted(line.c_str());
+  if (data->trace_stats.valid) {
+    const ImVec4 color = data->trace_stats.invariant_ok
+                             ? ImVec4(0.4f, 1.f, 0.4f, 1.f)
+                             : ImVec4(1.f, 0.4f, 0.4f, 1.f);
+    ImGui::TextColored(color, "Trace: rays %u  hits %u  misses %u  (hits+misses=%s)",
+                        data->trace_stats.rays,
+                        data->trace_stats.hits,
+                        data->trace_stats.misses,
+                        data->trace_stats.invariant_ok ? "ok" : "FAIL");
+    ImGui::TextDisabled("Trace: invalid %u  stack_overflow %u  tri_tests %u  max_depth %u",
+                        data->trace_stats.invalid_refs,
+                        data->trace_stats.stack_overflow,
+                        data->trace_stats.triangle_tests,
+                        data->trace_stats.max_stack_depth);
+    ImGui::Text("Pixels the game camera does not show: %u (%s)", data->trace_stats.camera_hidden,
+                data->trace_stats.hiding ? "hidden, the ray continues behind" : "shown");
+    DrawDepthCompareStats(data->trace_stats);
   }
 }
 

@@ -19,6 +19,11 @@
 //               where the region TLAS is not complete; not judged
 //   sky         both empty
 //   no_depth    no current-frame game depth bound
+//
+// Every view traces from the camera, so what the game camera shows applies
+// (world_bvh_trace.hlsli): camera_hidden counts pixels whose nearest BVH
+// surface the game camera does not show, and g_camera_view.x hides those
+// surfaces (the ray continues behind them).
 
 #include "world_bvh_trace.hlsli"
 
@@ -36,10 +41,11 @@ cbuffer cb_trace : register(b13)
     uint g_height;
     float g_compare_range;
     float4 g_depth_rect;  // valid game depth area in texels: x, y, width, height
-    float4 g_spare;
+    float4 g_inspect;     // x, y: pixel whose hit is reported; z > 0.5: report on
+    float4 g_camera_view; // x > 0.5: hide what the game camera does not show; y: disableMapObjNearFade_g
 };
 
-#define TRACE_STATS_COUNT 14u
+#define TRACE_STATS_COUNT 15u
 #define STAT_RAYS 0u
 #define STAT_HITS 1u
 #define STAT_MISSES 2u
@@ -54,6 +60,10 @@ cbuffer cb_trace : register(b13)
 #define STAT_CMP_FAR 11u
 #define STAT_CMP_SKY 12u
 #define STAT_CMP_NO_DEPTH 13u
+#define STAT_CAMERA_HIDDEN 14u
+// One pixel reports its hit after the counters:
+// flags (1 traced, 2 hit, 4 hidden from the game camera), instance, mesh, prim, t, position xyz, compare class.
+#define TRACE_INSPECT_BASE 15u
 
 #define TRACE_MODE_SHADED 7u
 #define TRACE_MODE_INSTANCE 8u
@@ -166,15 +176,20 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         const float3 origin = g_camera_position.xyz;
         const float3 direction = normalize(far_point - origin);
 
+        WorldCameraView view;
+        view.hide = g_camera_view.x > 0.5;
+        view.floor_value = g_camera_view.y;
         WorldTraceCounters counters;
-        const WorldTraceHit hit = TraceWorldClosest(origin, direction, 0.001, 1e30, counters);
+        const WorldTraceHit hit = TraceWorldClosest(origin, direction, 0.001, 1e30, view, counters);
 
         float3 color = float3(0.02, 0.02, 0.03);
+        uint compare_stat = 0xFFFFFFFFu;
         if (g_mode == TRACE_MODE_DEPTH_COMPARE)
         {
             uint stat = STAT_CMP_NO_DEPTH;
             color = CompareWithGameDepth(uv, ndc, origin, direction, hit, stat);
             InterlockedAdd(gs_stats[stat], 1u);
+            compare_stat = stat;
         }
         else if (hit.prim != 0xFFFFFFFFu)
         {
@@ -189,6 +204,20 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         }
         g_trace_output[dtid.xy] = float4(color, 1.0);
 
+        // Inspect: a single thread writes these slots, plain stores.
+        if (g_inspect.z > 0.5 && dtid.x == (uint)g_inspect.x && dtid.y == (uint)g_inspect.y)
+        {
+            g_trace_stats[TRACE_INSPECT_BASE + 0u] = (hit.prim != 0xFFFFFFFFu ? 3u : 1u) | (counters.camera_hidden != 0u ? 4u : 0u);
+            g_trace_stats[TRACE_INSPECT_BASE + 1u] = hit.instance;
+            g_trace_stats[TRACE_INSPECT_BASE + 2u] = hit.mesh;
+            g_trace_stats[TRACE_INSPECT_BASE + 3u] = hit.prim;
+            g_trace_stats[TRACE_INSPECT_BASE + 4u] = asuint(hit.t);
+            g_trace_stats[TRACE_INSPECT_BASE + 5u] = asuint(hit.position.x);
+            g_trace_stats[TRACE_INSPECT_BASE + 6u] = asuint(hit.position.y);
+            g_trace_stats[TRACE_INSPECT_BASE + 7u] = asuint(hit.position.z);
+            g_trace_stats[TRACE_INSPECT_BASE + 8u] = compare_stat;
+        }
+
         InterlockedAdd(gs_stats[STAT_RAYS], 1u);
         InterlockedAdd(gs_stats[STAT_HITS], counters.hits);
         InterlockedAdd(gs_stats[STAT_MISSES], counters.misses);
@@ -196,6 +225,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         InterlockedAdd(gs_stats[STAT_STACK_OVERFLOW], counters.stack_overflow);
         InterlockedAdd(gs_stats[STAT_TRIANGLE_TESTS], counters.triangle_tests);
         InterlockedMax(gs_stats[STAT_MAX_STACK_DEPTH], counters.max_stack_depth);
+        InterlockedAdd(gs_stats[STAT_CAMERA_HIDDEN], counters.camera_hidden);
     }
 
     GroupMemoryBarrierWithGroupSync();
