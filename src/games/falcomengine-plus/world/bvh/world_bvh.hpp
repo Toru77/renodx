@@ -401,6 +401,23 @@ inline void DrawBvhPanel() {
               stats.dedup_instances,
               stats.instance_cap_drops,
               static_cast<unsigned long long>(stats.moving_instances));
+  {
+    // Motion probe (path 2 discovery): prevWorld vs world per sighting.
+    const PoolMotionStats& motion = stats.motion;
+    uint64_t repeat_noise = 0u;
+    for (size_t i = 0; i < kPoolMotionUlpBuckets; ++i) {
+      if (i <= PoolMotionUlpBucket(kPoolMotionUlpNoise)) repeat_noise += motion.repeat_ulps[i];
+    }
+    ImGui::Text("Motion (prevWorld vs world): matrix seen in an earlier frame %llu, within %u ULP %.1f%%, max %u ULP",
+                static_cast<unsigned long long>(motion.repeat), kPoolMotionUlpNoise,
+                motion.repeat != 0u ? 100.0 * static_cast<double>(repeat_noise) / static_cast<double>(motion.repeat) : 0.0,
+                motion.max_repeat_ulps);
+    ImGui::Text("  moved > 1 mm / rotated: %llu sightings (%llu of a known matrix) in %llu draws (%llu all moving, %llu indirect), %u meshes",
+                static_cast<unsigned long long>(motion.moved), static_cast<unsigned long long>(motion.moved_repeat),
+                static_cast<unsigned long long>(motion.moving_draws),
+                static_cast<unsigned long long>(motion.moving_draws_all),
+                static_cast<unsigned long long>(motion.moving_draws_indirect), motion.moved_meshes);
+  }
   std::string matrix_rejects;
   for (size_t i = 1; i < stats.matrix_rejects.size(); ++i) {
     AppendPoolCount(&matrix_rejects, PoolMatrixRejectName(static_cast<PoolMatrixReject>(i)), stats.matrix_rejects[i]);

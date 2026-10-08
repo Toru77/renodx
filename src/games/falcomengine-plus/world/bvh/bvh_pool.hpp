@@ -73,6 +73,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -138,6 +139,20 @@ inline constexpr float kPoolLegacyMinScale = 0.05f;
 inline constexpr float kPoolLegacyMaxScale = 50.f;
 inline constexpr uint32_t kPoolTrackedBloomWords = 1024u;  // 65536-bit filter of VB/IB handles meshes come from
 inline constexpr size_t kPoolMaxInstances = 2000000u;
+// Instance motion probe (path 2 discovery, diagnostic only): world vs
+// prevWorld of every instance read back. Buckets of the largest per-element
+// difference in float ULPs: 0, 1, 2-3, 4-15, 16-255, 256-65535, more (also
+// sign change or non-finite).
+inline constexpr size_t kPoolMotionUlpBuckets = 7u;
+// Buckets of the translation difference in meters: 0, <=1e-6, <=1e-5, <=1e-4,
+// <=1e-3, <=1e-2, <=1e-1, <=1, more (also non-finite).
+inline constexpr size_t kPoolMotionMeterBuckets = 9u;
+inline constexpr float kPoolMotionMovedMeters = 1e-3f;  // translation difference counted as moved
+inline constexpr float kPoolMotionMovedBasis = 1e-4f;   // basis element difference counted as moved (rotation)
+inline constexpr uint32_t kPoolMotionUlpNoise = 3u;     // largest difference still called float noise
+inline constexpr size_t kPoolMotionMaxSamples = 24u;    // per sample list
+inline constexpr uint32_t kPoolMotionSamplesPerFamily = 2u;
+inline constexpr size_t kPoolMotionMaxMeshKeys = 4096u;
 inline constexpr float kPoolRegionMinSize = 64.f;
 inline constexpr float kPoolRegionMaxSize = 512.f;
 
@@ -456,6 +471,68 @@ struct PoolSchedule {
   uint32_t indirect_window = 0u;  // indirect draws: next window (0 = not known yet)
 };
 
+// One instance sighting of the motion probe (see PoolMotionStats).
+struct PoolMotionSample {
+  uint32_t vs_hash = 0u;
+  uint64_t mesh_key = 0u;
+  uint32_t frame = 0u;
+  uint8_t pass = 0u;          // kPoolPass* bits of the draw
+  bool indirect = false;
+  uint32_t draw_instances = 0u;  // instances the draw read back
+  uint32_t element = 0u;         // this instance's element in the draw
+  uint32_t draw_moved = 0u;      // elements of the draw counted as moved
+  bool repeat = false;           // the same (mesh, world) was seen in an earlier frame
+  uint32_t observed_frames = 0u; // frames that (mesh, world) was seen in before
+  bool admitted = false;         // that (mesh, world) was already an instance
+  uint32_t ulps = 0u;            // largest element difference, world vs prevWorld
+  float meters = 0.f;            // translation difference
+  float basis = 0.f;             // largest basis element difference
+  float world[kPoolWorldFloats] = {};
+  float prev_world[kPoolWorldFloats] = {};
+};
+
+// What prevWorld (InstanceParam @48, the matrix the game's VS projects with
+// prevViewProj_g for motion vectors) holds relative to world. A "repeat"
+// sighting is one whose exact (mesh, world) the pool saw in an earlier frame:
+// the object has not moved since, so if prevWorld is last frame's world it
+// differs from world by float noise at most. A "first" sighting is a matrix
+// not seen before (a new object, or one that moved).
+struct PoolMotionStats {
+  uint64_t repeat = 0u;
+  uint64_t first = 0u;
+  uint64_t exact = 0u;  // world and prevWorld bitwise equal
+  uint64_t nonfinite = 0u;  // prevWorld has a non-finite element
+  std::array<uint64_t, kPoolMotionUlpBuckets> repeat_ulps = {};
+  std::array<uint64_t, kPoolMotionUlpBuckets> first_ulps = {};
+  std::array<uint64_t, kPoolMotionMeterBuckets> repeat_meters = {};
+  std::array<uint64_t, kPoolMotionMeterBuckets> first_meters = {};
+  uint32_t max_repeat_ulps = 0u;
+  float max_repeat_meters = 0.f;
+  // Moved: translation difference > kPoolMotionMovedMeters or a basis element
+  // difference > kPoolMotionMovedBasis.
+  uint64_t moved = 0u;
+  uint64_t moved_repeat = 0u;  // moved although the same world was seen before
+  uint64_t moved_indirect = 0u;
+  uint64_t moved_camera = 0u;  // drawn by a camera VS
+  uint64_t moved_light = 0u;   // drawn by a light VS
+  // Copies (draws read back) with at least one moved element, and how many
+  // of them had every element moved.
+  uint64_t moving_draws = 0u;
+  uint64_t moving_draws_all = 0u;
+  uint64_t moving_draws_indirect = 0u;
+  uint64_t moving_draw_instances = 0u;  // elements of those draws
+  uint32_t moved_meshes = 0u;  // distinct mesh keys seen moving (PoolMotionDetail)
+};
+
+// Sample lists and keys of the motion probe: kept out of PoolStats, which the
+// panel copies every frame. Reset with the stats.
+struct PoolMotionDetail {
+  std::vector<PoolMotionSample> moved_samples;   // first sightings that moved
+  std::vector<PoolMotionSample> repeat_samples;  // repeat sightings beyond float noise
+  std::unordered_set<uint64_t> moved_mesh_keys;  // meshes seen moving (capped)
+  bool moved_mesh_keys_full = false;
+};
+
 struct PoolFamilyStats {
   uint8_t vs_class = 0u;
   uint64_t draws = 0u;
@@ -469,6 +546,15 @@ struct PoolFamilyStats {
   float near_miss_max_delta = 0.f;  // largest element difference among near misses
   uint32_t mesh_mismatches = 0u;    // capture mismatches of meshes first queued by this VS
   uint32_t mesh_unstable = 0u;
+  // Motion probe (PoolMotionStats).
+  uint64_t motion_repeat = 0u;
+  uint64_t motion_first = 0u;
+  uint64_t motion_moved = 0u;
+  uint64_t motion_moved_indirect = 0u;
+  uint32_t motion_max_repeat_ulps = 0u;
+  float motion_max_moved_meters = 0.f;
+  uint32_t motion_moved_samples = 0u;
+  uint32_t motion_repeat_samples = 0u;
   std::array<uint64_t, static_cast<size_t>(PoolSkip::Count)> skips = {};
   std::array<uint64_t, static_cast<size_t>(PoolDrawState::Count)> draw_state = {};
   std::array<uint32_t, static_cast<size_t>(PoolMatrixReject::Count)> matrix_rejects = {};
@@ -507,6 +593,7 @@ struct PoolStats {
   std::array<uint64_t, static_cast<size_t>(PoolMatrixReject::Count)> matrix_rejects = {};
   uint64_t near_misses = 0u;
   uint64_t moving_instances = 0u;  // world != prevWorld at the draw (diagnostic)
+  PoolMotionStats motion;
   uint32_t rejected_bounds = 0u;
   uint32_t dedup_instances = 0u;
   uint32_t instance_cap_drops = 0u;
@@ -612,6 +699,7 @@ struct PoolState {
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;  // bumped when an admitted instance's camera visibility changes
   PoolStats stats;
+  PoolMotionDetail motion_detail;
 };
 
 inline PoolState g_pool;
@@ -1250,6 +1338,180 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
   if (observed.count < kPoolStableObservations) return;
   const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
   if (mesh_it != g_pool.mesh_by_key.end()) AdmitPoolInstance(observed, mesh_key, mesh_it->second);
+}
+
+// ---------------------------------------------------------------------------
+// Instance motion probe (diagnostic only; see PoolMotionStats).
+
+// Distance between two floats in ULPs (+0 and -0 are equal). UINT32_MAX when
+// either is non-finite; finite distances are capped below that.
+inline uint32_t PoolUlpDistance(float a, float b) {
+  if (!std::isfinite(a) || !std::isfinite(b)) return UINT32_MAX;
+  const auto ordered = [](float value) {
+    int32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits < 0 ? -static_cast<int64_t>(bits & 0x7FFFFFFF) : static_cast<int64_t>(bits);
+  };
+  const int64_t difference = ordered(a) - ordered(b);
+  const uint64_t distance = static_cast<uint64_t>(difference < 0 ? -difference : difference);
+  return distance >= UINT32_MAX ? UINT32_MAX - 1u : static_cast<uint32_t>(distance);
+}
+
+struct PoolMotion {
+  bool finite = true;    // prevWorld finite (world was checked plausible)
+  bool exact = false;    // bitwise equal
+  bool moved = false;    // beyond kPoolMotionMovedMeters / kPoolMotionMovedBasis
+  uint32_t ulps = 0u;    // largest element difference
+  float meters = 0.f;    // translation difference
+  float basis = 0.f;     // largest basis element difference
+};
+
+inline PoolMotion MeasurePoolMotion(const float* world, const float* prev_world) {
+  PoolMotion motion;
+  motion.exact = std::memcmp(world, prev_world, sizeof(float) * kPoolWorldFloats) == 0;
+  for (uint32_t i = 0; i < kPoolWorldFloats; ++i) {
+    if (!std::isfinite(prev_world[i])) motion.finite = false;
+    motion.ulps = (std::max)(motion.ulps, PoolUlpDistance(world[i], prev_world[i]));
+  }
+  if (!motion.finite) {
+    motion.meters = std::numeric_limits<float>::quiet_NaN();
+    motion.basis = std::numeric_limits<float>::quiet_NaN();
+    return motion;
+  }
+  float translation[3] = {};
+  float prev_translation[3] = {};
+  PoolMatrixTranslation(world, translation);
+  PoolMatrixTranslation(prev_world, prev_translation);
+  const float dx = translation[0] - prev_translation[0];
+  const float dy = translation[1] - prev_translation[1];
+  const float dz = translation[2] - prev_translation[2];
+  motion.meters = std::sqrt(dx * dx + dy * dy + dz * dz);
+  for (uint32_t i = 0; i < kPoolWorldFloats; ++i) {
+    if (i == 3u || i == 7u || i == 11u) continue;  // translation (PoolMatrixTranslation)
+    motion.basis = (std::max)(motion.basis, std::fabs(world[i] - prev_world[i]));
+  }
+  motion.moved = motion.meters > kPoolMotionMovedMeters || motion.basis > kPoolMotionMovedBasis;
+  return motion;
+}
+
+inline size_t PoolMotionUlpBucket(uint32_t ulps) {
+  if (ulps == 0u) return 0u;
+  if (ulps == 1u) return 1u;
+  if (ulps < 4u) return 2u;
+  if (ulps < 16u) return 3u;
+  if (ulps < 256u) return 4u;
+  if (ulps < 65536u) return 5u;
+  return 6u;
+}
+
+inline size_t PoolMotionMeterBucket(float meters) {
+  if (!(meters >= 0.f)) return kPoolMotionMeterBuckets - 1u;  // non-finite
+  if (meters == 0.f) return 0u;
+  constexpr float kLimits[] = {1e-6f, 1e-5f, 1e-4f, 1e-3f, 1e-2f, 1e-1f, 1.f};
+  for (size_t i = 0; i < sizeof(kLimits) / sizeof(kLimits[0]); ++i) {
+    if (meters <= kLimits[i]) return i + 1u;
+  }
+  return kPoolMotionMeterBuckets - 1u;
+}
+
+inline const char* PoolMotionUlpBucketName(size_t bucket) {
+  constexpr const char* kNames[kPoolMotionUlpBuckets] = {"0", "1", "2-3", "4-15", "16-255", "256-65535", "more"};
+  return bucket < kPoolMotionUlpBuckets ? kNames[bucket] : "?";
+}
+
+inline const char* PoolMotionMeterBucketName(size_t bucket) {
+  constexpr const char* kNames[kPoolMotionMeterBuckets] = {"0",     "<=1e-6", "<=1e-5", "<=1e-4", "<=1e-3",
+                                                           "<=0.01", "<=0.1", "<=1",    "more"};
+  return bucket < kPoolMotionMeterBuckets ? kNames[bucket] : "?";
+}
+
+// The draw one sighting came from (motion samples).
+struct PoolMotionDraw {
+  uint8_t pass = 0u;
+  bool indirect = false;
+  uint32_t instances = 0u;  // elements read back
+  uint32_t moved = 0u;      // of them counted as moved
+};
+
+// Caller holds g_pool.mutex. Before ObservePoolInstance of the same sighting
+// (whether its (mesh, world) was seen in an earlier frame is read here).
+inline void NotePoolMotion(PoolFamilyStats& family, uint64_t mesh_key, uint32_t vs_hash, const float* world,
+                           const float* prev_world, const PoolMotion& motion, uint32_t frame, const PoolMotionDraw& draw,
+                           uint32_t element) {
+  PoolMotionStats& stats = g_pool.stats.motion;
+  const auto observed = g_pool.observations.find(InstanceKey{mesh_key, MatrixHash(world, kPoolWorldFloats)});
+  const bool known = observed != g_pool.observations.end() && observed->second.count != 0u;
+  const bool repeat = known && observed->second.first_frame < frame;  // first seen in an earlier frame
+  const size_t ulp_bucket = PoolMotionUlpBucket(motion.ulps);
+  const size_t meter_bucket = PoolMotionMeterBucket(motion.meters);
+  if (motion.exact) stats.exact += 1u;
+  if (!motion.finite) stats.nonfinite += 1u;
+  if (repeat) {
+    stats.repeat += 1u;
+    family.motion_repeat += 1u;
+    stats.repeat_ulps[ulp_bucket] += 1u;
+    stats.repeat_meters[meter_bucket] += 1u;
+    stats.max_repeat_ulps = (std::max)(stats.max_repeat_ulps, motion.ulps);
+    family.motion_max_repeat_ulps = (std::max)(family.motion_max_repeat_ulps, motion.ulps);
+    if (motion.finite) stats.max_repeat_meters = (std::max)(stats.max_repeat_meters, motion.meters);
+  } else {
+    stats.first += 1u;
+    family.motion_first += 1u;
+    stats.first_ulps[ulp_bucket] += 1u;
+    stats.first_meters[meter_bucket] += 1u;
+  }
+  if (motion.moved) {
+    stats.moved += 1u;
+    family.motion_moved += 1u;
+    if (repeat) stats.moved_repeat += 1u;
+    if (draw.indirect) {
+      stats.moved_indirect += 1u;
+      family.motion_moved_indirect += 1u;
+    }
+    if ((draw.pass & kPoolPassCamera) != 0u) {
+      stats.moved_camera += 1u;
+    } else if ((draw.pass & kPoolPassLight) != 0u) {
+      stats.moved_light += 1u;
+    }
+    family.motion_max_moved_meters = (std::max)(family.motion_max_moved_meters, motion.meters);
+    PoolMotionDetail& detail = g_pool.motion_detail;
+    if (detail.moved_mesh_keys.size() < kPoolMotionMaxMeshKeys) {
+      if (detail.moved_mesh_keys.insert(mesh_key).second) stats.moved_meshes += 1u;
+    } else if (detail.moved_mesh_keys.count(mesh_key) == 0u) {
+      detail.moved_mesh_keys_full = true;
+    }
+  }
+  std::vector<PoolMotionSample>* samples = nullptr;
+  uint32_t* family_samples = nullptr;
+  if (motion.moved && !repeat) {
+    samples = &g_pool.motion_detail.moved_samples;
+    family_samples = &family.motion_moved_samples;
+  } else if (repeat && motion.ulps > kPoolMotionUlpNoise) {
+    samples = &g_pool.motion_detail.repeat_samples;
+    family_samples = &family.motion_repeat_samples;
+  }
+  if (samples == nullptr || samples->size() >= kPoolMotionMaxSamples
+      || *family_samples >= kPoolMotionSamplesPerFamily) {
+    return;
+  }
+  *family_samples += 1u;
+  PoolMotionSample& sample = samples->emplace_back();
+  sample.vs_hash = vs_hash;
+  sample.mesh_key = mesh_key;
+  sample.frame = frame;
+  sample.pass = draw.pass;
+  sample.indirect = draw.indirect;
+  sample.draw_instances = draw.instances;
+  sample.element = element;
+  sample.draw_moved = draw.moved;
+  sample.repeat = repeat;
+  sample.observed_frames = known ? observed->second.count : 0u;
+  sample.admitted = known && observed->second.admitted;
+  sample.ulps = motion.ulps;
+  sample.meters = motion.meters;
+  sample.basis = motion.basis;
+  std::memcpy(sample.world, world, sizeof(float) * kPoolWorldFloats);
+  std::memcpy(sample.prev_world, prev_world, sizeof(float) * kPoolWorldFloats);
 }
 
 // What decides how the game camera sees an admitted instance (see
@@ -2467,7 +2729,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
 
   stage.Set("present: resolve (map)");
   std::vector<PoolResolvedCopy> resolved(copies.size());
-  std::vector<float> worlds;  // kPoolWorldFloats per instance of verified copies
+  std::vector<float> worlds;       // kPoolWorldFloats per instance of verified copies
+  std::vector<float> prev_worlds;  // their prevWorld, like worlds (motion probe)
   std::vector<uint8_t> moving;
   std::vector<PoolVisibility> visibility;  // per instance, like worlds
   void* mapped = nullptr;
@@ -2494,6 +2757,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         const size_t offset = worlds.size();
         worlds.resize(offset + kPoolWorldFloats);
         std::memcpy(worlds.data() + offset, instance, sizeof(float) * kPoolWorldFloats);
+        prev_worlds.resize(offset + kPoolWorldFloats);
+        std::memcpy(prev_worlds.data() + offset, instance + kPoolPrevWorldOffset, sizeof(float) * kPoolWorldFloats);
         moving.push_back(std::memcmp(instance, instance + kPoolPrevWorldOffset, sizeof(float) * kPoolWorldFloats) != 0
                              ? 1u
                              : 0u);
@@ -2603,6 +2868,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       for (const DrawRecord& draw : indirect_draws) ReleasePoolIndirectRefs(draw);
       copies.clear();
     }
+    std::vector<PoolMatrixReject> rejects;  // per element of one copy
+    std::vector<PoolMotion> motions;
     for (size_t i = 0; i < copies.size(); ++i) {
       const PoolPendingCopy& copy = copies[i];
       const PoolResolvedCopy& result = resolved[i];
@@ -2654,17 +2921,42 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
 
       const PoolSighting sighting{copy.pass, copy.ps_hash};
       NotePoolMeshPass(mesh_key, sighting);
+      // Motion probe: measure the copy's plausible elements first, so each
+      // sample knows how many elements of its draw moved.
+      rejects.assign(result.count, PoolMatrixReject::None);
+      motions.assign(result.count, PoolMotion{});
+      PoolMotionDraw motion_draw;
+      motion_draw.pass = copy.pass;
+      motion_draw.indirect = indirect;
+      for (uint32_t element = 0; element < result.count; ++element) {
+        const size_t index = result.first_world + element;
+        rejects[element] = CheckPoolWorld(worlds.data() + index * kPoolWorldFloats);
+        if (rejects[element] != PoolMatrixReject::None) continue;
+        motions[element] = MeasurePoolMotion(worlds.data() + index * kPoolWorldFloats,
+                                             prev_worlds.data() + index * kPoolWorldFloats);
+        motion_draw.instances += 1u;
+        if (motions[element].moved) motion_draw.moved += 1u;
+      }
+      if (motion_draw.moved != 0u) {
+        PoolMotionStats& motion_stats = g_pool.stats.motion;
+        motion_stats.moving_draws += 1u;
+        if (motion_draw.moved == motion_draw.instances) motion_stats.moving_draws_all += 1u;
+        if (indirect) motion_stats.moving_draws_indirect += 1u;
+        motion_stats.moving_draw_instances += motion_draw.instances;
+      }
       for (uint32_t element = 0; element < result.count; ++element) {
         const size_t index = result.first_world + element;
         const float* world = worlds.data() + index * kPoolWorldFloats;
         g_pool.stats.instances_seen += 1u;
         family.instances_seen += 1u;
         if (moving[index] != 0u) g_pool.stats.moving_instances += 1u;
-        const PoolMatrixReject reject = CheckPoolWorld(world);
+        const PoolMatrixReject reject = rejects[element];
         if (reject != PoolMatrixReject::None) {
           CountPoolMatrixReject(family, reject, world);
           continue;
         }
+        NotePoolMotion(family, mesh_key, copy.vs_hash, world, prev_worlds.data() + index * kPoolWorldFloats,
+                       motions[element], copy.frame, motion_draw, element);
         ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame, &sighting, &visibility[index]);
       }
     }
@@ -2785,6 +3077,7 @@ inline void ResetWorldPool() {
   g_pool.families.clear();
   g_pool.revision += 1u;
   g_pool.stats = {};
+  g_pool.motion_detail = {};
   g_pool.logged_invalidations = 0u;
   g_pool.mismatch_lines_logged = 0u;
 }
@@ -2814,6 +3107,85 @@ struct PoolJsonFloat {
 inline std::ostream& operator<<(std::ostream& out, PoolJsonFloat number) {
   if (std::isfinite(number.value)) return out << number.value;
   return out << "null";
+}
+
+// Motion probe section of the dump (see PoolMotionStats). Also lists the
+// meshes seen moving with how many instances of them were admitted: an object
+// that moves and stops is admitted at every place it stops (ghosts).
+inline void WritePoolMotion(std::ostringstream& out, const PoolMotionStats& motion, const PoolMotionDetail& detail,
+                            const std::vector<WorldInstance>& instances) {
+  std::unordered_map<uint64_t, uint32_t> admitted_by_key;
+  std::unordered_map<uint64_t, uint32_t> vs_by_key;
+  uint32_t admitted_of_moved = 0u;
+  for (const WorldInstance& instance : instances) {
+    if (detail.moved_mesh_keys.count(instance.mesh_key) == 0u) continue;
+    admitted_of_moved += 1u;
+    admitted_by_key[instance.mesh_key] += 1u;
+    vs_by_key[instance.mesh_key] = instance.source_vs_hash;
+  }
+  const auto write_histogram = [&out](const char* name, const auto& buckets, auto bucket_name) {
+    out << "\"" << name << "\": {";
+    for (size_t i = 0; i < buckets.size(); ++i) {
+      if (i != 0u) out << ", ";
+      out << "\"" << bucket_name(i) << "\": " << buckets[i];
+    }
+    out << "}";
+  };
+  out << "  \"motion\": {\"repeat\": " << motion.repeat << ", \"first\": " << motion.first
+      << ", \"exact\": " << motion.exact << ", \"nonfinite_prev\": " << motion.nonfinite
+      << ", \"max_repeat_ulps\": " << motion.max_repeat_ulps
+      << ", \"max_repeat_meters\": " << PoolJsonFloat{motion.max_repeat_meters} << ",\n    ";
+  write_histogram("repeat_ulps", motion.repeat_ulps, PoolMotionUlpBucketName);
+  out << ",\n    ";
+  write_histogram("first_ulps", motion.first_ulps, PoolMotionUlpBucketName);
+  out << ",\n    ";
+  write_histogram("repeat_meters", motion.repeat_meters, PoolMotionMeterBucketName);
+  out << ",\n    ";
+  write_histogram("first_meters", motion.first_meters, PoolMotionMeterBucketName);
+  out << ",\n    \"moved\": " << motion.moved << ", \"moved_repeat\": " << motion.moved_repeat
+      << ", \"moved_indirect\": " << motion.moved_indirect << ", \"moved_camera\": " << motion.moved_camera
+      << ", \"moved_light\": " << motion.moved_light << ", \"moving_draws\": " << motion.moving_draws
+      << ", \"moving_draws_all\": " << motion.moving_draws_all
+      << ", \"moving_draws_indirect\": " << motion.moving_draws_indirect
+      << ", \"moving_draw_instances\": " << motion.moving_draw_instances
+      << ", \"moved_meshes\": " << motion.moved_meshes
+      << ", \"moved_meshes_capped\": " << (detail.moved_mesh_keys_full ? "true" : "false")
+      << ", \"admitted_of_moved_meshes\": " << admitted_of_moved << ",\n    \"moved_mesh_admitted\": [";
+  std::vector<std::pair<uint64_t, uint32_t>> by_count(admitted_by_key.begin(), admitted_by_key.end());
+  std::sort(by_count.begin(), by_count.end(), [](const auto& a, const auto& b) {
+    return a.second != b.second ? a.second > b.second : a.first < b.first;
+  });
+  for (size_t i = 0; i < by_count.size() && i < kPoolMotionMaxSamples; ++i) {
+    if (i != 0u) out << ", ";
+    out << "{\"mesh_key\": \"" << renodx::utils::log::AsHex(by_count[i].first) << "\", \"vs_hash\": \""
+        << PoolHashText(vs_by_key[by_count[i].first]) << "\", \"admitted\": " << by_count[i].second << "}";
+  }
+  out << "]";
+  const auto write_samples = [&out](const char* name, const std::vector<PoolMotionSample>& samples) {
+    out << ",\n    \"" << name << "\": [";
+    for (size_t i = 0; i < samples.size(); ++i) {
+      const PoolMotionSample& sample = samples[i];
+      out << (i != 0u ? ",\n      " : "\n      ") << "{\"vs_hash\": \"" << PoolHashText(sample.vs_hash)
+          << "\", \"mesh_key\": \"" << renodx::utils::log::AsHex(sample.mesh_key) << "\", \"frame\": " << sample.frame
+          << ", \"view\": \""
+          << ((sample.pass & kPoolPassCamera) != 0u ? "camera" : (sample.pass & kPoolPassLight) != 0u ? "light" : "other")
+          << "\", \"indirect\": " << (sample.indirect ? "true" : "false")
+          << ", \"draw_instances\": " << sample.draw_instances << ", \"element\": " << sample.element
+          << ", \"draw_moved\": " << sample.draw_moved << ", \"repeat\": " << (sample.repeat ? "true" : "false")
+          << ", \"observed_frames\": " << sample.observed_frames
+          << ", \"admitted\": " << (sample.admitted ? "true" : "false") << ", \"ulps\": " << sample.ulps
+          << ", \"meters\": " << PoolJsonFloat{sample.meters} << ", \"basis\": " << PoolJsonFloat{sample.basis}
+          << ", \"world\": [";
+      for (uint32_t k = 0; k < kPoolWorldFloats; ++k) out << (k != 0u ? ", " : "") << PoolJsonFloat{sample.world[k]};
+      out << "], \"prev_world\": [";
+      for (uint32_t k = 0; k < kPoolWorldFloats; ++k) out << (k != 0u ? ", " : "") << PoolJsonFloat{sample.prev_world[k]};
+      out << "]}";
+    }
+    out << "]";
+  };
+  write_samples("moved_samples", detail.moved_samples);
+  write_samples("repeat_samples", detail.repeat_samples);
+  out << "},\n";
 }
 
 // Camera visibility of the admitted instances, for the dump (see
@@ -2979,6 +3351,7 @@ inline void DumpWorldPool() {
   std::vector<PoolCameraVisibility> visibility;  // per instance
   std::unordered_map<uint32_t, PoolFamilyStats> families;
   PoolStats stats;
+  PoolMotionDetail motion_detail;
   PoolRegion region;
   const PoolCameraInfo camera = GetPoolCameraInfo();
   bool scene_fade = false;
@@ -3001,6 +3374,7 @@ inline void DumpWorldPool() {
     for (const WorldInstance& instance : instances) visibility.push_back(GetPoolCameraVisibility(instance));
     families = g_pool.families;
     stats = g_pool.stats;
+    motion_detail = g_pool.motion_detail;
     region = CurrentPoolRegion();
   }
 
@@ -3029,7 +3403,7 @@ inline void DumpWorldPool() {
 
   std::ostringstream out;
   out << "{\n";
-  out << "  \"schema\": 6,\n";
+  out << "  \"schema\": 7,\n";
   out << "  \"generated_frame\": " << g_state.frame.load() << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
@@ -3169,6 +3543,8 @@ inline void DumpWorldPool() {
   }
   out << "\n  ],\n";
 
+  WritePoolMotion(out, stats.motion, motion_detail, instances);
+
   out << "  \"families\": [";
   bool first = true;
   for (const auto& [vs_hash, family] : families) {
@@ -3187,10 +3563,16 @@ inline void DumpWorldPool() {
         << ", \"base_mismatch\": " << family.base_mismatch
         << ", \"rejected_matrix\": " << family.rejected_matrix
         << ", \"near_misses\": " << family.near_misses
-        << ", \"near_miss_max_delta\": " << family.near_miss_max_delta
+        << ", \"near_miss_max_delta\": " << PoolJsonFloat{family.near_miss_max_delta}
         << ", \"mesh_mismatches\": " << family.mesh_mismatches
         << ", \"mesh_unstable\": " << family.mesh_unstable
         << ", \"outside_legacy_scale\": " << entry.outside_legacy_scale
+        << ", \"motion\": {\"repeat\": " << family.motion_repeat
+        << ", \"first\": " << family.motion_first
+        << ", \"max_repeat_ulps\": " << family.motion_max_repeat_ulps
+        << ", \"moved\": " << family.motion_moved
+        << ", \"moved_indirect\": " << family.motion_moved_indirect
+        << ", \"max_moved_meters\": " << PoolJsonFloat{family.motion_max_moved_meters} << "}"
         << ", \"skips\": {";
     bool first_skip = true;
     for (size_t i = 1; i < family.skips.size(); ++i) {
