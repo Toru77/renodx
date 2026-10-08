@@ -529,7 +529,7 @@ struct DeformStats {
 };
 
 struct DeformProbeState {
-  std::atomic_bool enabled{false};
+  std::atomic_bool enabled{true};
   std::mutex mutex;
   DeformBackend backend = DefaultDeformBackend();
   reshade::api::device* device = nullptr;

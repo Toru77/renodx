@@ -351,6 +351,7 @@ int main() {
 
   HStage("1. Off: nothing.");
   // 1. Off: nothing.
+  bvh::g_deform_live.enabled.store(false);
   draw(kSkin, 0x11, 600);
   present();
   CHECK(cl.calls.empty() && dev.res.empty(), "off");

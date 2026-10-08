@@ -198,7 +198,7 @@ int main() {
   auto run = [&](int frames) { for (int i = 0; i < frames; ++i) run_frame(); };
   auto snapshot = [&]() {
     std::lock_guard lock(bvh::g_pool.mutex);
-    bvh::UpdatePoolStats();
+    bvh::UpdatePoolStats(bvh::PoolNewestSeenByKey());
     return bvh::g_pool.stats;
   };
   auto detail = [&]() {
@@ -324,7 +324,7 @@ int main() {
     CHECK(m.moved > 0u && m.repeat > 0u && m.moved_repeat == 0u, "moved and stopped");
     CHECK(s.admitted == 2u, "admitted at both stops (%zu)", s.admitted);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
+    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
     CHECK(text.find("\"admitted_of_moved_meshes\": 2") != std::string::npos, "ghost count in dump");
     CHECK(text.find("\"vs_hash\": \"0x00001000\", \"admitted\": 2}") != std::string::npos
               || text.find("\"admitted\": 2}") != std::string::npos, "moved mesh listed with 2 admitted");
@@ -640,7 +640,7 @@ int main() {
       for (const auto& mesh : bvh::g_pool.meshes) CHECK(!mesh.dynamic, "ApplyPoolDynamicKey does not flag a released key");
     }
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
+    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
     CHECK(text.find("\"rule_stale\": ") != std::string::npos && text.find("\"rule_stale_samples\": ") != std::string::npos,
           "rule_stale fields");
     CHECK(text.find("\"moving_keys\": 0, \"released\": 2") != std::string::npos
@@ -1113,7 +1113,7 @@ int main() {
     }});
     run(120);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 11") != std::string::npos, "dump: schema 11");
+    CHECK(text.find("\"schema\": 13") != std::string::npos, "dump: schema 13");
     CHECK(text.find("\"follow_moving\": true") != std::string::npos && text.find("\"follow\": {\"hits\"") != std::string::npos,
           "dump: follow object and switch");
     CHECK(text.find("\"follows\": ") != std::string::npos, "dump: per key follows");
@@ -1123,8 +1123,8 @@ int main() {
 
   check_every_frame = true;
 
-  HStage("29. Stopped prop: kept while seen; retired once when hidden 70 frames; re-admitted once.");
-  // 29. Stopped prop: kept while seen; retired once when hidden 70 frames; re-admitted once.
+  HStage("29. Stopped prop: kept while seen; a lone hidden one is kept 70 frames; a new pose retires the old one at 60.");
+  // 29. Stopped prop: kept while seen; a lone hidden one is kept 70 frames; a new pose retires the old one at 60.
   {
     fresh();
     bvh::g_pool.exclude_moving.store(false);
@@ -1141,12 +1141,37 @@ int main() {
           snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
     objects.clear();
     run(70);
-    CHECK(snapshot().admitted == 0u && snapshot().orphans_retired == 1u, "hidden 70 frames: retired once (admitted %zu, retired %llu)",
+    CHECK(snapshot().admitted == 1u && snapshot().orphans_retired == 0u, "lone hidden 70 frames: kept (admitted %zu, retired %llu)",
           snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
-    objects.push_back({vb, 1, [start](uint32_t, uint32_t, float* w, float* p) { Place(w, 2.f); Place(p, 2.f); }});
-    run(40);
-    CHECK(snapshot().admitted == 1u && snapshot().orphans_retired == 1u, "re-admitted once, not retired again (admitted %zu, retired %llu)",
-          snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
+  }
+
+  HStage("29b. Orphans: a superseded dynamic instance retires at 60 frames; a lone one is kept to 600.");
+  // 29b. Orphans: a superseded dynamic instance retires at 60 frames; a lone one is kept to 600.
+  {
+    fresh();
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.instances.clear();
+    bvh::WorldInstance old_pose;
+    old_pose.mesh_key = 0x77u;
+    old_pose.dynamic = true;
+    old_pose.admit_frame = 100u;
+    bvh::WorldInstance new_pose = old_pose;
+    new_pose.admit_frame = 200u;
+    bvh::WorldInstance lone = old_pose;
+    lone.mesh_key = 0x88u;
+    bvh::g_pool.instances = {old_pose, new_pose, lone};
+    std::vector<std::string> orphan_lines;
+    bvh::RetirePoolOrphans(160u, bvh::PoolNewestSeenByKey(), &orphan_lines);
+    CHECK(bvh::g_pool.instances.size() == 3u && bvh::g_pool.stats.orphans_retired == 0u, "60 frames: nothing retired yet");
+    bvh::RetirePoolOrphans(161u, bvh::PoolNewestSeenByKey(), &orphan_lines);
+    CHECK(bvh::g_pool.instances.size() == 2u && bvh::g_pool.stats.orphans_retired == 1u
+              && bvh::g_pool.instances[0].admit_frame == 200u,
+          "superseded at 61 unseen frames: retired, the lone one kept (%zu left, retired %llu)", bvh::g_pool.instances.size(),
+          (unsigned long long)bvh::g_pool.stats.orphans_retired);
+    bvh::RetirePoolOrphans(701u, bvh::PoolNewestSeenByKey(), &orphan_lines);
+    CHECK(bvh::g_pool.instances.size() == 1u && bvh::g_pool.stats.orphans_retired == 2u,
+          "lone one retired after 600 unseen frames (%zu left, retired %llu)", bvh::g_pool.instances.size(),
+          (unsigned long long)bvh::g_pool.stats.orphans_retired);
   }
 
   HStage("30. Retire, then destroy the VB, CompactPool and MarkPoolMeshDynamic: no second removal.");
@@ -1163,7 +1188,7 @@ int main() {
     }});
     run(50);
     objects.clear();
-    run(70);
+    run(610);  // a lone hidden instance is held for kPoolPruneAge (600) frames
     const auto before = snapshot();
     CHECK(before.orphans_retired == 1u && before.admitted == 0u, "retired once (retired %llu)", (unsigned long long)before.orphans_retired);
     bvh::OnDestroyResourcePool(&dev, resource{vb});
@@ -1201,9 +1226,9 @@ int main() {
     CHECK(snapshot().orphans_retired == 0u, "scan off: nothing retired (%llu)", (unsigned long long)snapshot().orphans_retired);
     bvh::g_pool.scan_active.store(true);
     run(30);
-    CHECK(snapshot().orphans_retired == 0u, "scan back on: grace, nothing retired yet");
-    run(60);
-    CHECK(snapshot().orphans_retired == 1u, "scan back on: retired after the grace (%llu)", (unsigned long long)snapshot().orphans_retired);
+    CHECK(snapshot().orphans_retired == 0u, "scan back on: nothing retired yet");
+    run(500);
+    CHECK(snapshot().orphans_retired == 1u, "scan back on: lone hidden instance retired after 600 frames (%llu)", (unsigned long long)snapshot().orphans_retired);
   }
   check_every_frame = false;
 

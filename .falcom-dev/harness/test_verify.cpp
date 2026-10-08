@@ -184,7 +184,7 @@ int main() {
   };
   auto snapshot = [&]() {
     std::lock_guard lock(bvh::g_pool.mutex);
-    bvh::UpdatePoolStats();
+    bvh::UpdatePoolStats(bvh::PoolNewestSeenByKey());
     return bvh::g_pool.stats;
   };
   auto fresh = [&]() {
@@ -280,33 +280,54 @@ int main() {
   }
 
   HStage("5. Contents change every frame: no two captures agree, the mesh is");
-  // 5. Contents change every frame: no two captures agree, the mesh is
-  // rejected after kPoolMeshMaxCaptures and its instances never admit.
+  // 5. Contents change every frame: no two captures agree. Each round of
+  // kPoolMeshMaxCaptures captures is retried kPoolMeshRetryRounds times, 180
+  // frames apart; the last round rejects the mesh and its instances never admit.
   {
     fresh();
     const resource vb = make_vb(4.f);
     objects.push_back({vb.handle, 2});
     float sx = 4.f;
-    for (int i = 0; i < 120 && snapshot().mesh_unstable == 0u; ++i) {
+    for (int i = 0; i < 1500 && snapshot().mesh_unstable == 0u; ++i) {
       sx += 0.01f;
       fixture::WriteVertices(dev.res[vb.handle].bytes, fixture::Box(sx));
       run_frame();
     }
     for (int i = 0; i < 80; ++i) run_frame();  // instances keep being seen
     const auto s = snapshot();
-    std::printf("unstable: mismatches %u unstable %u failures %u meshes %zu admitted %zu error '%s'\n",
-                s.mesh_capture_mismatches, s.mesh_unstable, s.mesh_failures, s.meshes, s.admitted, s.last_mesh_error.c_str());
-    CHECK(s.mesh_unstable == 1u && s.mesh_capture_mismatches == bvh::kPoolMeshMaxCaptures - 1u, "rejected after %u captures",
-          bvh::kPoolMeshMaxCaptures);
+    std::printf("unstable: mismatches %u unstable %u retries %u failures %u meshes %zu admitted %zu error '%s'\n",
+                s.mesh_capture_mismatches, s.mesh_unstable, s.mesh_retries, s.mesh_failures, s.meshes, s.admitted,
+                s.last_mesh_error.c_str());
+    constexpr uint32_t kRounds = bvh::kPoolMeshRetryRounds + 1u;
+    CHECK(s.mesh_unstable == 1u && s.mesh_retries == bvh::kPoolMeshRetryRounds
+              && s.mesh_capture_mismatches == (bvh::kPoolMeshMaxCaptures - 1u) * kRounds,
+          "rejected on round %u: %u retries, %u mismatches", kRounds, s.mesh_retries, s.mesh_capture_mismatches);
     CHECK(s.meshes == 0u && s.admitted == 0u && s.mesh_failures == 1u, "nothing added");
     CHECK(s.last_mesh_error.find("unstable") != std::string::npos, "reason");
-    CHECK(s.mesh_index_copies == bvh::kPoolMeshMaxCaptures && s.mesh_vertex_copies == bvh::kPoolMeshMaxCaptures,
+    CHECK(s.mesh_index_copies == bvh::kPoolMeshMaxCaptures * kRounds && s.mesh_vertex_copies == bvh::kPoolMeshMaxCaptures * kRounds,
           "no copy after the rejection (%llu+%llu)", (unsigned long long)s.mesh_index_copies,
           (unsigned long long)s.mesh_vertex_copies);
-    CHECK(CountLines("differs from the previous one", 'w') == bvh::kPoolMeshMaxCaptures - 1u, "each mismatch logged");
     CHECK(!Request(vb.handle).found, "request gone");
     std::lock_guard lock(bvh::g_pool.mutex);
     CHECK(bvh::g_pool.families[0x1000u].mesh_unstable == 1u, "family unstable count");
+  }
+
+  HStage("5b. Contents change during the first round only: the next round is stable and admits.");
+  // 5b. Contents change during the first round only: the next round is stable and admits.
+  {
+    fresh();
+    const resource vb = make_vb(4.f);
+    objects.push_back({vb.handle, 2});
+    float sx = 4.f;
+    for (int i = 0; i < 1500 && snapshot().mesh_retries == 0u; ++i) {
+      sx += 0.01f;
+      fixture::WriteVertices(dev.res[vb.handle].bytes, fixture::Box(sx));
+      run_frame();
+    }
+    CHECK(run_until([&] { return snapshot().meshes == 1u; }, 600) > 0, "stable on a later round: admitted");
+    const auto s = snapshot();
+    CHECK(s.mesh_retries == 1u && s.mesh_unstable == 0u && s.mesh_failures == 0u && s.admitted == 2u,
+          "one retry, not rejected (retries %u, unstable %u, admitted %zu)", s.mesh_retries, s.mesh_unstable, s.admitted);
   }
 
   HStage("6. The mismatch log is capped per pool reset; counting goes on.");
@@ -398,7 +419,7 @@ int main() {
     bvh::DumpWorldPool();
     std::ifstream json(json_path);
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
+    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
     CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true}") != std::string::npos, "switches");
     CHECK(text.find("\"admitted_outside_legacy_scale\": 2") != std::string::npos, "outside legacy count");
     CHECK(text.find("\"outside_legacy_scale\": 1") != std::string::npos, "family count");

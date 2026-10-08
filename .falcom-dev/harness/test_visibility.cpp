@@ -335,7 +335,7 @@ int main() {
   {
     std::ifstream f(bvh::PoolOutputDir() / "world_pool.json");
     const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
+    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
     CHECK(text.find("\"scene\": {\"fade_constants\": true") != std::string::npos, "scene constants");
     CHECK(text.find("\"visibility\": {\"instances\": 7, \"camera_visible\": 5, \"shadow_only\": 2") != std::string::npos
               && text.find("\"with_inputs\": 7") != std::string::npos, "visibility summary");

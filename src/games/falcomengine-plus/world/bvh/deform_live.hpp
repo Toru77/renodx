@@ -271,6 +271,13 @@ struct DynamicIdentity {
   uint64_t gpu_bytes = 0u;  // arena bytes (garbage once retired)
   float bbox_min[3] = {};   // at the topology capture
   float bbox_max[3] = {};
+  uint64_t vb = 0u;  // draw components at its first capture (diagnostic)
+  uint64_t ib = 0u;
+  uint64_t vb_offset = 0u;
+  uint64_t ib_offset = 0u;
+  uint32_t index_count = 0u;
+  uint32_t instance_count = 0u;
+  uint32_t first_instance = 0u;
 };
 
 struct DynamicCapture {
@@ -279,6 +286,13 @@ struct DynamicCapture {
   uint32_t vs_hash = 0u;
   uint32_t vertex_base = 0u;  // float3 vertices into the arena
   uint32_t triangles = 0u;
+  uint64_t vb = 0u;  // draw components at the capture (diagnostic)
+  uint64_t ib = 0u;
+  uint64_t vb_offset = 0u;
+  uint64_t ib_offset = 0u;
+  uint32_t index_count = 0u;
+  uint32_t instance_count = 0u;
+  uint32_t first_instance = 0u;
 };
 
 struct DynamicCaptureShader {
@@ -324,6 +338,7 @@ struct DeformLiveStats {
   uint32_t topology_mismatch = 0u;  // read size did not match the identity
   uint32_t blas_built = 0u;
   uint32_t retired = 0u;
+  uint32_t recreated = 0u;  // a key seen again after it was retired
   uint32_t resets = 0u;
   uint32_t resource_failures = 0u;
   uint32_t map_failures = 0u;
@@ -335,7 +350,7 @@ struct DeformLiveStats {
 };
 
 struct DeformLiveState {
-  std::atomic_bool enabled{false};
+  std::atomic_bool enabled{true};
   std::mutex mutex;
   reshade::api::device* device = nullptr;
   // Per-frame capture arena (vertices are written by stream output).
@@ -348,6 +363,7 @@ struct DeformLiveState {
   std::unordered_map<uint64_t, DynamicCaptureShader> shaders;  // by VS pipeline
   std::vector<uint64_t> retired_so_shaders;
   std::unordered_map<uint64_t, DynamicIdentity> identities;   // by DeformDrawKey
+  std::unordered_set<uint64_t> retired_keys;  // identities retired since (recreated count)
   // Topology readback ring.
   std::array<DynamicTopologySlot, kDynamicTopologySlots> topology;
   uint32_t topology_write = 0u;
@@ -367,6 +383,9 @@ struct DeformLiveState {
   reshade::api::pipeline refit_pipeline = {0u};
   bool refit_failed = false;
   GpuTimer refit_timer;
+  std::atomic_uint64_t cpu_us{0u};  // CPU time of OnDeformCaptureDraw and UpdateDeformLive (PoolCpuTimer)
+  std::atomic_uint64_t cpu_frame_us{0u};  // cpu_us of the last frame (moved by UpdateDeformLive)
+  uint32_t log_lines = 0u;          // identity and store reset lines written (kPoolLifecycleLogLines)
   DeformLiveStats stats;
 };
 
@@ -402,6 +421,7 @@ inline void CountDynamicSkip(DynamicSkip skip) { g_deform_live.stats.skips[stati
 // Draw event, after the probe. Captures the draw's world-space triangles.
 inline void OnDeformCaptureDraw(
     reshade::api::device* device, reshade::api::command_list* cmd_list, const DrawRecord& draw) {
+  const PoolCpuTimer cpu_timer{&g_deform_live.cpu_us};
   if (!g_deform_live.enabled.load(std::memory_order_relaxed)) return;
   if (device == nullptr || cmd_list == nullptr) return;
   const contract::ShaderTraits traits = contract::LookupVertexTraits(draw.vs_pipeline);
@@ -508,6 +528,13 @@ inline void OnDeformCaptureDraw(
   capture.vs_hash = confirmed.hash;
   capture.vertex_base = static_cast<uint32_t>(offset / kDynamicVertexBytes);
   capture.triangles = static_cast<uint32_t>(triangles);
+  capture.vb = draw.vb.handle;
+  capture.ib = draw.ib.handle;
+  capture.vb_offset = draw.vb_offset;
+  capture.ib_offset = draw.ib_offset;
+  capture.index_count = draw.index_count;
+  capture.instance_count = instances;
+  capture.first_instance = draw.first_instance;
   g_deform_live.captures.push_back(capture);
   g_deform_live.frame_keys.insert(key);
   g_deform_live.stats.captures += 1u;
@@ -750,6 +777,7 @@ inline void ReleaseDeformLive(reshade::api::device* device) {
     snapshot_holder.refit_timer = g_deform_live.refit_timer;  // released below, outside the lock
     g_deform_live.refit_timer = GpuTimer{};
     g_deform_live.identities.clear();
+    g_deform_live.retired_keys.clear();
     g_deform_live.captures.clear();
     g_deform_live.frame_keys.clear();
     g_deform_live.object_count = 0u;
@@ -943,6 +971,8 @@ inline void ResolveDynamicTopology(reshade::api::device* device, reshade::api::c
 // Present, before the trace (OnWorldPresentBvh): turns this frame's captures
 // into traced objects and refits their BLAS on the GPU.
 inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command_queue* queue) {
+  const PoolCpuTimer cpu_timer{&g_deform_live.cpu_us};
+  g_deform_live.cpu_frame_us = g_deform_live.cpu_us.exchange(0u);
   if (device == nullptr || queue == nullptr) return;
   if (!g_deform_live.enabled.load(std::memory_order_relaxed)) {
     if (g_deform_live.device != nullptr) ReleaseDeformLive(nullptr);
@@ -1011,6 +1041,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   reshade::api::resource arena = {0u};
   reshade::api::resource staging = {0u};
   bool reset = false;
+  std::vector<std::string> identity_lines;
   {
     std::lock_guard<std::mutex> lock(g_deform_live.mutex);
     DeformLiveState& state = g_deform_live;
@@ -1022,10 +1053,28 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
       for (const DynamicCapture& capture : state.captures) {
         DynamicIdentity& identity = state.identities[capture.key];
         if (identity.captures == 0u) {
+          if (state.retired_keys.erase(capture.key) != 0u) state.stats.recreated += 1u;
           identity.vs_pipeline = capture.vs_pipeline;
           identity.vs_hash = capture.vs_hash;
           identity.triangles = capture.triangles;
           identity.first_frame = frame;
+          identity.vb = capture.vb;
+          identity.ib = capture.ib;
+          identity.vb_offset = capture.vb_offset;
+          identity.ib_offset = capture.ib_offset;
+          identity.index_count = capture.index_count;
+          identity.instance_count = capture.instance_count;
+          identity.first_instance = capture.first_instance;
+          if (state.log_lines < kPoolLifecycleLogLines) {
+            state.log_lines += 1u;
+            identity_lines.push_back(renodx::utils::log::BuildString(
+                "falcom_world::deform: frame ", frame, ": new identity ", renodx::utils::log::AsHex(capture.key),
+                " VS ", renodx::utils::log::AsHex(capture.vs_hash), ", ", capture.triangles, " triangles, pipeline ",
+                renodx::utils::log::AsHex(capture.vs_pipeline), ", vb ", renodx::utils::log::AsHex(capture.vb),
+                " offset ", capture.vb_offset, ", ib ", renodx::utils::log::AsHex(capture.ib), " offset ",
+                capture.ib_offset, ", ", capture.index_count, " indices, ", capture.instance_count,
+                " instances from ", capture.first_instance));
+          }
         }
         identity.captures += 1u;
         identity.last_frame = frame;
@@ -1075,6 +1124,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
       if (frame - it->second.last_frame > kDynamicRetireFrames && !it->second.topology_pending) {
         state.stats.garbage_bytes += it->second.gpu_bytes;
         state.stats.retired += 1u;
+        state.retired_keys.insert(it->first);
         it = state.identities.erase(it);
       } else {
         ++it;
@@ -1094,6 +1144,12 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
       state.refit.used = 0u;
       state.stats.garbage_bytes = 0u;
       state.stats.resets += 1u;
+      if (state.log_lines < kPoolLifecycleLogLines) {
+        state.log_lines += 1u;
+        identity_lines.push_back(renodx::utils::log::BuildString("falcom_world::deform: frame ", frame,
+                                                                 ": BLAS store reset, ", state.identities.size(),
+                                                                 " identities rebuilt"));
+      }
       objects.clear();
       info.clear();
     }
@@ -1113,6 +1169,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     state.arena_used = 0u;
     state.capture_frame = frame + 1u;
   }
+  for (const std::string& line : identity_lines) renodx::utils::log::i(line);
   (void)reset;
   for (const TopologyCopy& copy : copies) cmd_list->copy_buffer_region(arena, copy.source_offset, staging, copy.dest_offset, copy.size);
 

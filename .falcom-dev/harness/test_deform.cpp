@@ -232,6 +232,7 @@ int main() {
 
   HStage("2. Off: nothing happens.");
   // 2. Off: nothing happens.
+  bvh::g_deform.enabled.store(false);
   bvh::OnDeformProbeDraw(&dev, &cl, draw_for(kSkin, 300, 1));
   present();
   CHECK(cl.calls.empty() && dev.resources_alive == 0 && row(kSkin).draws == 0u, "off: no work");

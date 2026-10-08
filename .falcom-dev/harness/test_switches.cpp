@@ -185,7 +185,7 @@ int main() {
   };
   auto snapshot = [&]() {
     std::lock_guard lock(bvh::g_pool.mutex);
-    bvh::UpdatePoolStats();
+    bvh::UpdatePoolStats(bvh::PoolNewestSeenByKey());
     return bvh::g_pool.stats;
   };
 
