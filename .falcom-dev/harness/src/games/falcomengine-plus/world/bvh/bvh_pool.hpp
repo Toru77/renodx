@@ -1688,7 +1688,7 @@ inline PoolSightingVerdict NotePoolMotion(PoolFamilyStats& family, uint64_t mesh
   PoolSightingVerdict verdict = PoolSightingVerdict::Unknown;
   if (prev_differs && !repeat) {
     verdict = PoolSightingVerdict::Moving;
-  } else if (camera && motion.finite && PoolPrevWorldFilled(prev_world)) {  // unchanged, or stale prev (repeat)
+  } else if (camera && motion.finite && !prev_differs && PoolPrevWorldFilled(prev_world)) {
     verdict = PoolSightingVerdict::Still;
   }
   const size_t ulp_bucket = PoolMotionUlpBucket(motion.ulps);
