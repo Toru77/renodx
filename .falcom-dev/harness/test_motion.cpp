@@ -680,6 +680,153 @@ int main() {
     CHECK(s.admitted == 1u && s.dynamic_meshes == 0u, "static admitted (admitted %zu, flagged %zu)", s.admitted, s.dynamic_meshes);
   }
 
+  // 21. prevWorld trace: A (far flip), B (sway 2 cm per frame), C (static) are
+  // selected, each records 120 consecutive frames; the trace is read-only.
+  {
+    struct Scenario {
+      bvh::PoolStats stats;
+      bvh::PoolPrevTrace trace;
+    };
+    auto scenario = [&](bool armed) {
+      fresh();
+      const resource vb_a = make_vb(8.f), vb_b = make_vb(9.f), vb_c = make_vb(10.f);
+      objects.push_back({vb_a.handle, 1, [](uint32_t, uint32_t, float* w, float* p) {
+        Place(w, 5.f, 0.f, 0.f, 3.14159265f); Place(p, 55.f);
+      }, 0u, 0u});
+      objects.push_back({vb_b.handle, 1, [](uint32_t f, uint32_t, float* w, float* p) {
+        const auto x = [](uint32_t g) { return 20.f + 0.02f * static_cast<float>(g); };
+        Place(w, x(f)); Place(p, x(f == 0u ? 0u : f - 1u));
+      }, 0u, 36u});
+      objects.push_back({vb_c.handle, 1, [](uint32_t, uint32_t, float* w, float* p) { Place(w, 40.f); Place(p, 40.f); }, 0u, 72u});
+      falcom_world::g_state.frame.store(1000u);
+      if (armed) {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        bvh::g_pool.prev_trace = {};
+        bvh::g_pool.prev_trace.armed_frame = falcom_world::g_state.frame.load();
+      }
+      run(400);
+      Scenario result;
+      result.stats = snapshot();
+      std::lock_guard lock(bvh::g_pool.mutex);
+      result.trace = bvh::g_pool.prev_trace;
+      return result;
+    };
+    const Scenario traced = scenario(true);
+    const Scenario plain = scenario(false);
+
+    // Read-only: the counters the trace must not move, armed or not.
+    const auto& t = traced.stats;
+    const auto& p = plain.stats;
+    CHECK(t.copied_draws == p.copied_draws && t.instances_seen == p.instances_seen && t.admitted == p.admitted
+              && t.base_verified == p.base_verified,
+          "copied %llu/%llu seen %llu/%llu admitted %zu/%zu verified %llu/%llu", (unsigned long long)t.copied_draws,
+          (unsigned long long)p.copied_draws, (unsigned long long)t.instances_seen, (unsigned long long)p.instances_seen,
+          t.admitted, p.admitted, (unsigned long long)t.base_verified, (unsigned long long)p.base_verified);
+    CHECK(t.motion.first == p.motion.first && t.motion.repeat == p.motion.repeat && t.motion.moved == p.motion.moved
+              && t.motion.rule_moving == p.motion.rule_moving && t.motion.rule_stale == p.motion.rule_stale,
+          "motion counters identical");
+    CHECK(t.dynamic_live_keys == p.dynamic_live_keys && t.dynamic_moving_keys == p.dynamic_moving_keys
+              && t.dynamic_meshes == p.dynamic_meshes && t.dynamic_retired == p.dynamic_retired
+              && t.dynamic_blocked == p.dynamic_blocked && t.dynamic_released == p.dynamic_released,
+          "dynamic counters identical");
+    CHECK(plain.trace.armed_frame == 0u && plain.trace.records.empty(), "unarmed: no trace");
+
+    // Selection: keys[0] = A, keys[1] = B, keys[2] = C, each Done with 120 frames.
+    const auto& keys = traced.trace.keys;
+    CHECK(traced.trace.written, "trace written");
+    CHECK(keys[0].state == bvh::PoolPrevTrace::KeyState::Done && keys[0].frames_recorded == 120u, "A done (%u)", keys[0].frames_recorded);
+    CHECK(keys[1].state == bvh::PoolPrevTrace::KeyState::Done && keys[1].frames_recorded == 120u, "B done (%u)", keys[1].frames_recorded);
+    CHECK(keys[2].state == bvh::PoolPrevTrace::KeyState::Done && keys[2].frames_recorded == 120u, "C done (%u)", keys[2].frames_recorded);
+    CHECK(keys[0].mesh_key != keys[1].mesh_key && keys[1].mesh_key != keys[2].mesh_key && keys[0].mesh_key != keys[2].mesh_key,
+          "three distinct keys");
+    CHECK(keys[0].max_meters >= 1.f && keys[1].max_meters < 0.1f && keys[2].camera_sightings >= 4u, "evidence");
+    for (size_t k = 0; k < 3; ++k) {
+      std::vector<bvh::PoolPrevTrace::Record> rows;
+      for (const auto& record : traced.trace.records) if (record.key == k) rows.push_back(record);
+      CHECK(rows.size() == 120u, "key %zu: 120 records (%zu)", k, rows.size());
+      bool consecutive = true;
+      for (size_t i = 1; i < rows.size(); ++i) if (rows[i].frame != rows[i - 1].frame + 1u) consecutive = false;
+      CHECK(consecutive && keys[k].missed == 0u, "key %zu: consecutive frames, missed %u", k, keys[k].missed);
+      if (k == 0u) continue;  // A: prevWorld is a flip, not the last world
+      size_t compared = 0u;
+      for (const auto& record : rows) {
+        if (!record.has_last) continue;
+        compared += 1u;
+        CHECK(record.prev_vs_last.exact, "key %zu frame %u: prev equals last world", k, record.frame);
+      }
+      CHECK(compared >= 118u, "key %zu: compared %zu", k, compared);
+    }
+    CHECK(traced.trace.records.size() == 360u, "records (%zu)", traced.trace.records.size());
+  }
+
+  // 21b. A traced key with 64 instances: trace copies are capped at
+  // kPoolTraceMaxElements per frame and leave the normal copy counters alone.
+  {
+    struct Scenario {
+      bvh::PoolStats stats;
+      bvh::PoolPrevTrace trace;
+    };
+    auto big = [&](bool armed) {
+      fresh();
+      objects.push_back({make_vb(8.f).handle, 64, [](uint32_t f, uint32_t i, float* w, float* p) {
+        Place(w, 5.f + 0.05f * f + 0.5f * i); Place(p, 5.f + 0.05f * (f == 0u ? 0u : f - 1u) + 0.5f * i);
+      }});
+      falcom_world::g_state.frame.store(2000u);
+      if (armed) {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        bvh::g_pool.prev_trace = {};
+        bvh::g_pool.prev_trace.armed_frame = falcom_world::g_state.frame.load();
+      }
+      run(300);
+      Scenario result;
+      result.stats = snapshot();
+      std::lock_guard lock(bvh::g_pool.mutex);
+      result.trace = bvh::g_pool.prev_trace;
+      return result;
+    };
+    const Scenario traced = big(true);
+    const Scenario plain = big(false);
+    const auto& t = traced.stats;
+    const auto& p = plain.stats;
+    CHECK(t.copied_draws == p.copied_draws && t.instances_seen == p.instances_seen && t.admitted == p.admitted
+              && t.base_verified == p.base_verified && t.queued == p.queued,
+          "big: copied %llu/%llu seen %llu/%llu admitted %zu/%zu", (unsigned long long)t.copied_draws,
+          (unsigned long long)p.copied_draws, (unsigned long long)t.instances_seen, (unsigned long long)p.instances_seen,
+          t.admitted, p.admitted);
+    CHECK(plain.trace.records.empty(), "big: unarmed no trace");
+    CHECK(!traced.trace.records.empty(), "big: trace records");
+    std::map<uint32_t, uint32_t> per_frame;
+    for (const auto& record : traced.trace.records) per_frame[record.frame] += 1u;
+    uint32_t most = 0u;
+    for (const auto& [frame, rows] : per_frame) most = (std::max)(most, rows);
+    CHECK(most > 0u && most <= bvh::kPoolTraceMaxElements, "big: records per frame %u (max %u)", most, bvh::kPoolTraceMaxElements);
+  }
+
+  // 21c. A key whose motion stopped more than kPoolMovingHoldFrames + 30 frames
+  // ago is not selected by the trace.
+  {
+    fresh();
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(8.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      auto x = [](uint32_t t) { return t < 40u ? 0.05f * t : 2.f; };
+      Place(w, x(f)); Place(p, x(f == 0u ? 0u : f - 1u));
+    }});
+    run(40);
+    run(bvh::kPoolMovingHoldFrames + 30u);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.prev_trace = {};
+      bvh::g_pool.prev_trace.armed_frame = falcom_world::g_state.frame.load();
+    }
+    run(120);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    const auto& trace = bvh::g_pool.prev_trace;
+    // A and B (moving keys) stay waiting; C (static, admitted) may be selected.
+    CHECK(trace.keys[0].state == bvh::PoolPrevTrace::KeyState::Waiting && trace.keys[1].state == bvh::PoolPrevTrace::KeyState::Waiting,
+          "stopped long ago: no moving key selected (A %d, B %d)", (int)trace.keys[0].state, (int)trace.keys[1].state);
+  }
+
   // 7. Reset clears the probe and the moving keys.
   {
     bvh::ResetWorldPool();

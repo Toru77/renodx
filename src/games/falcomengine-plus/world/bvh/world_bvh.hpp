@@ -445,6 +445,38 @@ inline void DrawBvhPanel() {
                         static_cast<unsigned long long>(motion.rule_moving), static_cast<unsigned long long>(motion.rule_stale));
     if (stats.dynamic_cap_drops != 0u) ImGui::TextDisabled("  moving keys not recorded (cap): %u", stats.dynamic_cap_drops);
   }
+  {
+    // prevWorld trace: read under the lock, formatted outside it.
+    uint32_t armed_frame = 0u;
+    bool written = false;
+    std::array<PoolPrevTrace::Key, kPoolTraceKeys> keys = {};
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      armed_frame = g_pool.prev_trace.armed_frame;
+      written = g_pool.prev_trace.written;
+      keys = g_pool.prev_trace.keys;
+    }
+    std::string line = "prevWorld trace:";
+    for (size_t k = 0; k < keys.size(); ++k) {
+      const PoolPrevTrace::Key& key = keys[k];
+      const char role = static_cast<char>('A' + k);
+      if (key.state == PoolPrevTrace::KeyState::Waiting) {
+        line += std::string("  ") + role + " waiting";
+      } else if (key.state == PoolPrevTrace::KeyState::GaveUp) {
+        line += "  " + std::string(1, role) + " " + std::to_string(key.mesh_key) + " (VS " + PoolHashText(key.vs_hash)
+                + ") gave up (" + std::to_string(key.frames_recorded) + "/" + std::to_string(kPoolTraceFrames) + ")";
+      } else {
+        line += "  " + std::string(1, role) + " " + std::to_string(key.mesh_key) + " (VS " + PoolHashText(key.vs_hash)
+                + ") " + std::to_string(key.frames_recorded) + "/" + std::to_string(kPoolTraceFrames);
+      }
+    }
+    if (armed_frame == 0u) {
+      ImGui::TextDisabled("%s off (press Trace prevWorld)", line.c_str());
+    } else {
+      ImGui::Text("%s  [armed f%u]%s", line.c_str(), armed_frame,
+                  written ? "  written: world_prev_trace.json" : "");
+    }
+  }
   std::string matrix_rejects;
   for (size_t i = 1; i < stats.matrix_rejects.size(); ++i) {
     AppendPoolCount(&matrix_rejects, PoolMatrixRejectName(static_cast<PoolMatrixReject>(i)), stats.matrix_rejects[i]);
@@ -500,7 +532,10 @@ inline void DrawBvhPanel() {
   bool do_dump = false;
   bool do_dump_obj = false;
   bool do_reset = false;
+  bool do_trace = false;
   if (ImGui::Button("Dump Pool JSON")) do_dump = true;
+  ImGui::SameLine();
+  if (ImGui::Button("Trace prevWorld (3 keys)")) do_trace = true;
   ImGui::SameLine();
   if (ImGui::Button("Dump Region OBJ")) do_dump_obj = true;
   ImGui::SameLine();
@@ -509,6 +544,11 @@ inline void DrawBvhPanel() {
   if (ImGui::Button("Open Pool Folder")) {
     const auto folder = PoolOutputDir();
     ShellExecuteA(nullptr, "open", folder.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  }
+  if (do_trace) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.prev_trace = {};
+    g_pool.prev_trace.armed_frame = g_state.frame.load();
   }
   if (do_dump) DumpWorldPool();
   if (do_dump_obj) DumpWorldPoolObj();

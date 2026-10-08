@@ -161,6 +161,19 @@ inline constexpr size_t kPoolMotionMaxMeshKeys = 4096u;
 inline constexpr float kPoolMovingMeters = 1e-5f;  // translation; also at least 4 ULP of the coordinate
 inline constexpr float kPoolMovingBasis = 1e-5f;   // basis element, times the largest basis element (>= 1)
 inline constexpr uint32_t kPoolMovingHoldFrames = 2u * kPoolRecaptureFrames;
+// prevWorld trace (diagnostic, read-only): three draw keys, kPoolTraceFrames
+// camera copies each (see PoolPrevTrace).
+inline constexpr uint32_t kPoolTraceFrames = 120u;
+inline constexpr uint32_t kPoolTraceMaxElements = 4u;
+inline constexpr size_t kPoolTraceKeys = 3u;
+inline constexpr uint32_t kPoolTraceWaitFrames = 1800u;
+inline constexpr uint32_t kPoolTraceActiveFrames = 600u;
+inline constexpr float kPoolTraceFarMeters = 1.f;
+inline constexpr float kPoolTraceFarBasis = 1.5f;
+inline constexpr float kPoolTraceSwayMeters = 0.1f;
+inline constexpr float kPoolTraceSwayBasis = 0.1f;
+inline constexpr uint32_t kPoolTraceStillSightings = 4u;
+inline constexpr size_t kPoolTraceMaxRecords = 1500u;
 inline constexpr size_t kPoolMaxDynamicKeys = 4096u;
 inline constexpr size_t kPoolMotionRuleSamples = 16u;
 inline constexpr float kPoolRegionMinSize = 64.f;
@@ -452,6 +465,7 @@ struct PoolPendingCopy {
   uint32_t indirect_index = UINT32_MAX;
   uint64_t args_offset = 0u;
   uint64_t schedule_key = 0u;
+  bool trace_only = false;  // prevWorld trace copy: not counted, not queued, not stamped
 };
 
 struct PoolStagingSlot {
@@ -692,6 +706,60 @@ struct PoolStats {
   uint64_t scan_last_frame = 0u;
 };
 
+struct PoolMotion {
+  bool finite = true;    // prevWorld finite (world was checked plausible)
+  bool exact = false;    // bitwise equal
+  bool moved = false;    // beyond kPoolMotionMovedMeters / kPoolMotionMovedBasis
+  uint32_t ulps = 0u;    // largest element difference
+  float meters = 0.f;    // translation difference
+  float basis = 0.f;     // largest basis element difference
+};
+
+// The prevWorld trace (diagnostic only): keys[0] = A (far flip), keys[1] = B
+// (slow sway), keys[2] = C (static, admitted). A key in Active state records
+// one camera copy per frame (world and prevWorld of each element, up to
+// kPoolTraceMaxElements), trace-only copies included; nothing else reads them.
+struct PoolPrevTrace {
+  enum class KeyState : uint8_t { Waiting, Active, Done, GaveUp };
+  struct Key {
+    KeyState state = KeyState::Waiting;
+    uint64_t mesh_key = 0u;
+    uint32_t vs_hash = 0u;
+    uint32_t selected_frame = 0u;
+    uint32_t frames_recorded = 0u;
+    uint32_t last_frame = 0u;   // frame of the last recorded copy
+    uint32_t last_count = 0u;   // its instance count
+    float last_world[kPoolWorldFloats] = {};  // its element 0
+    uint32_t extra_camera_draws = 0u;         // further camera copies of the key in a frame
+    uint32_t missed = 0u;                     // frames without a copy since the first
+    // Evidence the key was selected on.
+    float max_meters = 0.f;
+    float max_basis = 0.f;
+    uint64_t moving_sightings = 0u;
+    uint64_t camera_sightings = 0u;
+  };
+  struct Record {
+    uint8_t key = 0u;  // index into keys
+    uint32_t frame = 0u;
+    uint32_t element = 0u;
+    uint32_t draw_instances = 0u;
+    uint32_t camera_draws = 0u;  // camera copies of the key this frame recorded (always 1; more are extra_camera_draws)
+    int32_t cpu_base = 0;
+    bool trace_only = false;
+    float world[kPoolWorldFloats] = {};
+    float prev_world[kPoolWorldFloats] = {};
+    bool prev_filled = false;
+    PoolMotion prev_vs_world;
+    bool has_last = false;  // element 0, the key's previous copy was the previous frame
+    PoolMotion prev_vs_last;  // prev_world against the previous world
+    float world_step_meters = 0.f;
+  };
+  uint32_t armed_frame = 0u;  // 0 = not armed
+  bool written = false;
+  std::vector<Record> records;
+  std::array<Key, kPoolTraceKeys> keys = {};
+};
+
 struct PoolState {
   std::atomic_bool scan_active{false};
   // Diagnostic switches (see the header comment).
@@ -758,6 +826,7 @@ struct PoolState {
   // when the switch changes).
   std::unordered_map<uint64_t, PoolDynamicMesh> dynamic_keys;
   bool dynamic_applied = false;
+  PoolPrevTrace prev_trace;
 };
 
 inline PoolState g_pool;
@@ -980,7 +1049,11 @@ inline bool PoolInstanceInRegion(const WorldInstance& instance, const PoolRegion
 // Caller holds g_pool.mutex.
 inline void UpdatePoolStats() {
   size_t queued = 0u;
-  for (const auto& slot : g_pool.slots) queued += slot.copies.size();
+  for (const auto& slot : g_pool.slots) {
+    for (const auto& copy : slot.copies) {
+      if (!copy.trace_only) queued += 1u;
+    }
+  }
   g_pool.stats.queued = queued;
   size_t in_flight = 0u;
   for (const auto& [key, request] : g_pool.mesh_requests) {
@@ -1431,15 +1504,6 @@ inline uint32_t PoolUlpDistance(float a, float b) {
   const uint64_t distance = static_cast<uint64_t>(difference < 0 ? -difference : difference);
   return distance >= UINT32_MAX ? UINT32_MAX - 1u : static_cast<uint32_t>(distance);
 }
-
-struct PoolMotion {
-  bool finite = true;    // prevWorld finite (world was checked plausible)
-  bool exact = false;    // bitwise equal
-  bool moved = false;    // beyond kPoolMotionMovedMeters / kPoolMotionMovedBasis
-  uint32_t ulps = 0u;    // largest element difference
-  float meters = 0.f;    // translation difference
-  float basis = 0.f;     // largest basis element difference
-};
 
 inline PoolMotion MeasurePoolMotion(const float* world, const float* prev_world) {
   PoolMotion motion;
@@ -1928,10 +1992,11 @@ inline PoolSkip ReservePoolCopy(
     uint64_t schedule_key,
     uint32_t frame,
     uint64_t bytes,
-    PoolSchedule** out_schedule) {
+    PoolSchedule** out_schedule,
+    bool bypass_cooldown) {
   PoolSchedule& schedule = g_pool.schedule[schedule_key];
   const PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
-  if (schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
+  if (!bypass_cooldown && schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
     return PoolSkip::Cooldown;
   }
   if (g_pool.staging_device != device || slot.buffer.handle == 0u || slot.resolving) return PoolSkip::NoStaging;
@@ -2233,6 +2298,7 @@ inline void OnPoolScanDraw(
   std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
+  bool trace_declined = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
@@ -2242,23 +2308,38 @@ inline void OnPoolScanDraw(
     family.draws += 1u;
 
     if (skip == PoolSkip::None) {
-      const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
+      const uint64_t schedule_key = PoolScheduleKey(mesh_key, draw.first_instance, count);
+      const uint64_t copy_bytes = kPoolCbCopyBytes + static_cast<uint64_t>(count) * kPoolInstanceStride;
+      bool traced = false;  // a key in trace state: its copy may bypass the cooldown
+      if ((gate.pass & kPoolPassCamera) != 0u) {
+        for (const auto& key : g_pool.prev_trace.keys) {
+          if (key.state == PoolPrevTrace::KeyState::Active && key.mesh_key == mesh_key) traced = true;
+        }
+      }
       PoolSchedule* schedule = nullptr;
-      skip = ReservePoolCopy(
-          device, PoolScheduleKey(mesh_key, draw.first_instance, count), frame, kPoolCbCopyBytes + slice_bytes,
-          &schedule);
+      skip = ReservePoolCopy(device, schedule_key, frame, copy_bytes, &schedule, false);
+      const bool trace_only = traced && skip == PoolSkip::Cooldown;
+      uint32_t copy_count = count;
+      if (trace_only) {
+        copy_count = (std::min)(count, kPoolTraceMaxElements);
+        skip = ReservePoolCopy(device, schedule_key, frame, kPoolCbCopyBytes + static_cast<uint64_t>(copy_count) * kPoolInstanceStride,
+                               &schedule, true);
+        trace_declined = skip != PoolSkip::None;  // not a normal skip: not counted
+      }
       if (skip == PoolSkip::None) {
+        const uint64_t slice_bytes = static_cast<uint64_t>(copy_count) * kPoolInstanceStride;
         PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
         PoolPendingCopy copy;
         copy.cb_offset = slot.used;
         copy.slice_offset = slot.used + kPoolCbCopyBytes;
-        copy.count = count;
+        copy.count = copy_count;
         copy.cpu_base = slice.base;
         copy.frame = frame;
         copy.vs_hash = draw.vs_hash;
         copy.ps_hash = draw.ps_hash;
         copy.pass = gate.pass;
         copy.mesh_key = mesh_key;
+        copy.trace_only = trace_only;
         // The b1 copy is recorded before this draw, so it holds exactly the
         // offset the draw reads; resolve compares it to `base`.
         commands[command_count++] = {slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes};
@@ -2266,14 +2347,16 @@ inline void OnPoolScanDraw(
                                      slot.buffer, copy.slice_offset, slice_bytes};
         slot.used += kPoolCbCopyBytes + slice_bytes;
         slot.copies.push_back(copy);
-        schedule->copy_frame = frame;
-        schedule->next_frame = frame + kPoolRecaptureFrames;
-        g_pool.stats.copied_draws += 1u;
-        family.copied += 1u;
-        QueuePoolMesh(mesh_key, draw.vs_hash, draw, false);
+        if (!trace_only) {
+          schedule->copy_frame = frame;
+          schedule->next_frame = frame + kPoolRecaptureFrames;
+          g_pool.stats.copied_draws += 1u;
+          family.copied += 1u;
+          QueuePoolMesh(mesh_key, draw.vs_hash, draw, false);
+        }
       }
     }
-    if (skip != PoolSkip::None) CountPoolSkip(family, skip, gate.state);
+    if (skip != PoolSkip::None && !trace_declined) CountPoolSkip(family, skip, gate.state);
     mesh_count = ReservePoolMeshCopies(device, draw, false, deferred, frame, commands.data() + command_count,
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
@@ -2353,7 +2436,7 @@ inline void OnPoolScanIndirectDraw(
           kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
       PoolSchedule* schedule = nullptr;
       if (sub_skip == PoolSkip::None) {
-        sub_skip = ReservePoolCopy(device, schedule_key, frame, bytes, &schedule);
+        sub_skip = ReservePoolCopy(device, schedule_key, frame, bytes, &schedule, false);
       }
       if (sub_skip != PoolSkip::None) {
         CountPoolSkip(family, sub_skip, gate.state);
@@ -3160,12 +3243,63 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       const bool indirect = is_indirect(copy);
       const bool buffers_dead = indirect && ReleasePoolIndirectRefs(indirect_draws[copy.indirect_index]);
       if (!result.verified) {
-        g_pool.stats.base_mismatch += 1u;
-        g_pool.stats.last_mismatch_cpu = copy.cpu_base;
-        g_pool.stats.last_mismatch_gpu = result.gpu_base;
-        family.base_mismatch += 1u;
+        if (!copy.trace_only) {
+          g_pool.stats.base_mismatch += 1u;
+          g_pool.stats.last_mismatch_cpu = copy.cpu_base;
+          g_pool.stats.last_mismatch_gpu = result.gpu_base;
+          family.base_mismatch += 1u;
+        }
         continue;
       }
+      if (!indirect && (copy.pass & kPoolPassCamera) != 0u) {
+        // prevWorld trace: one record per element (first kPoolTraceMaxElements)
+        // and frame of each traced key; a second camera copy in a frame only counts.
+        for (size_t k = 0; k < g_pool.prev_trace.keys.size(); ++k) {
+          PoolPrevTrace::Key& key = g_pool.prev_trace.keys[k];
+          if (key.state != PoolPrevTrace::KeyState::Active || key.mesh_key != copy.mesh_key) continue;
+          if (key.frames_recorded != 0u && copy.frame == key.last_frame) {
+            key.extra_camera_draws += 1u;
+            break;
+          }
+          if (key.frames_recorded != 0u && copy.frame > key.last_frame + 1u) {
+            key.missed += copy.frame - key.last_frame - 1u;
+          }
+          const uint32_t recorded = (std::min)(result.count, kPoolTraceMaxElements);
+          for (uint32_t element = 0; element < recorded; ++element) {
+            if (g_pool.prev_trace.records.size() >= kPoolTraceMaxRecords) break;
+            const size_t index = result.first_world + element;
+            const float* world = worlds.data() + index * kPoolWorldFloats;
+            const float* prev = prev_worlds.data() + index * kPoolWorldFloats;
+            PoolPrevTrace::Record record;
+            record.key = static_cast<uint8_t>(k);
+            record.frame = copy.frame;
+            record.element = element;
+            record.draw_instances = copy.count;
+            record.camera_draws = 1u;
+            record.cpu_base = copy.cpu_base;
+            record.trace_only = copy.trace_only;
+            std::memcpy(record.world, world, sizeof(record.world));
+            std::memcpy(record.prev_world, prev, sizeof(record.prev_world));
+            record.prev_filled = PoolPrevWorldFilled(prev);
+            record.prev_vs_world = MeasurePoolMotion(world, prev);
+            if (element == 0u && key.last_count != 0u && key.last_frame + 1u == copy.frame) {
+              record.has_last = true;
+              record.prev_vs_last = MeasurePoolMotion(key.last_world, prev);
+              record.world_step_meters = MeasurePoolMotion(key.last_world, world).meters;
+            }
+            g_pool.prev_trace.records.push_back(record);
+          }
+          if (result.count != 0u) {
+            std::memcpy(key.last_world, worlds.data() + result.first_world * kPoolWorldFloats, sizeof(key.last_world));
+          }
+          key.last_count = result.count;
+          key.last_frame = copy.frame;
+          key.frames_recorded += 1u;
+          if (key.frames_recorded == kPoolTraceFrames) key.state = PoolPrevTrace::KeyState::Done;
+          break;
+        }
+      }
+      if (copy.trace_only) continue;
       g_pool.stats.base_verified += 1u;
 
       uint64_t mesh_key = copy.mesh_key;
@@ -3285,6 +3419,8 @@ inline void PrunePool(uint32_t frame) {
   }
 }
 
+inline void WritePoolPrevTrace(const PoolPrevTrace& trace);
+
 // Called once per present, after the frame's draws were recorded. Retires
 // invalidated meshes even while the scan is off, so the uploaded pool never
 // keeps geometry whose buffers are gone.
@@ -3321,6 +3457,8 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   stage.Set("present: prune");
   uint32_t released = 0u;
   size_t mesh_waiting = 0u;
+  bool trace_done = false;
+  PoolPrevTrace trace_out;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if ((frame % 60u) == 0u) PrunePool(frame);
@@ -3329,7 +3467,112 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     released = invalidations >= g_pool.logged_invalidations ? invalidations - g_pool.logged_invalidations : invalidations;
     g_pool.logged_invalidations = invalidations;
     mesh_waiting = g_pool.stats.mesh_queue;
+
+    // prevWorld trace: pick the keys while some are waiting (every 30 frames),
+    // give up on the ones that waited or ran too long, and write the file once
+    // no key is waiting or active.
+    PoolPrevTrace& trace = g_pool.prev_trace;
+    if (trace.armed_frame != 0u && !trace.written) {
+      bool waiting = false;
+      for (auto& key : trace.keys) {
+        if (key.state == PoolPrevTrace::KeyState::Waiting && frame > trace.armed_frame + kPoolTraceWaitFrames) {
+          key.state = PoolPrevTrace::KeyState::GaveUp;
+        }
+        if (key.state == PoolPrevTrace::KeyState::Active && key.frames_recorded < kPoolTraceFrames
+            && frame > key.selected_frame + kPoolTraceActiveFrames) {
+          key.state = PoolPrevTrace::KeyState::GaveUp;
+        }
+        if (key.state == PoolPrevTrace::KeyState::Waiting) waiting = true;
+      }
+      if (waiting && frame % 30u == 0u) {
+        // A: a far flip. B: a slow sway (moving a few times, only small steps).
+        // Both come from the moving draw keys; the families table decides
+        // whether a key's draws are indirect.
+        const PoolDynamicMesh* far_entry = nullptr;
+        const PoolDynamicMesh* sway = nullptr;
+        uint64_t far_key = 0u;
+        uint64_t sway_key = 0u;
+        float far_score = 0.f;
+        for (const auto& [mesh_key, entry] : g_pool.dynamic_keys) {
+          if (!entry.moving_now || entry.indirect_sightings != 0u) continue;
+          const auto family = g_pool.families.find(entry.vs_hash);
+          if (family != g_pool.families.end() && family->second.indirect_draws != 0u) continue;
+          if (frame <= entry.last_frame + kPoolMovingHoldFrames
+              && (entry.max_meters >= kPoolTraceFarMeters || entry.max_basis >= kPoolTraceFarBasis)) {
+            const float score = (std::max)(entry.max_meters, entry.max_basis);
+            if (far_entry == nullptr || score > far_score || (score == far_score && mesh_key < far_key)) {
+              far_entry = &entry;
+              far_key = mesh_key;
+              far_score = score;
+            }
+          } else if (frame <= entry.last_frame + kPoolMovingHoldFrames && entry.moving_sightings >= 3u && entry.max_meters < kPoolTraceSwayMeters
+                     && entry.max_basis < kPoolTraceSwayBasis) {
+            if (sway == nullptr || entry.moving_sightings > sway->moving_sightings
+                || (entry.moving_sightings == sway->moving_sightings && mesh_key < sway_key)) {
+              sway = &entry;
+              sway_key = mesh_key;
+            }
+          }
+        }
+        if (far_entry != nullptr && trace.keys[0].state == PoolPrevTrace::KeyState::Waiting) {
+          PoolPrevTrace::Key& key = trace.keys[0];
+          key.state = PoolPrevTrace::KeyState::Active;
+          key.mesh_key = far_key;
+          key.vs_hash = far_entry->vs_hash;
+          key.selected_frame = frame;
+          key.max_meters = far_entry->max_meters;
+          key.max_basis = far_entry->max_basis;
+          key.moving_sightings = far_entry->moving_sightings;
+          key.camera_sightings = far_entry->moving_sightings;
+        }
+        if (sway != nullptr && trace.keys[1].state == PoolPrevTrace::KeyState::Waiting) {
+          PoolPrevTrace::Key& key = trace.keys[1];
+          key.state = PoolPrevTrace::KeyState::Active;
+          key.mesh_key = sway_key;
+          key.vs_hash = sway->vs_hash;
+          key.selected_frame = frame;
+          key.max_meters = sway->max_meters;
+          key.max_basis = sway->max_basis;
+          key.moving_sightings = sway->moving_sightings;
+          key.camera_sightings = sway->moving_sightings;
+        }
+        // C: an admitted instance seen in a camera view recently, never moving.
+        if (trace.keys[2].state == PoolPrevTrace::KeyState::Waiting) {
+          const ObservedInstance* still = nullptr;
+          uint64_t still_key = 0u;
+          for (const auto& [instance_key, observed] : g_pool.observations) {
+            if (!observed.admitted || observed.camera_sightings < kPoolTraceStillSightings) continue;
+            if (frame > observed.last_camera_frame + 60u) continue;
+            if (g_pool.dynamic_keys.count(instance_key.mesh_key) != 0u) continue;
+            const auto family = g_pool.families.find(observed.vs_hash);
+            if (family != g_pool.families.end() && family->second.indirect_draws != 0u) continue;
+            if (still == nullptr || instance_key.mesh_key < still_key) {
+              still = &observed;
+              still_key = instance_key.mesh_key;
+            }
+          }
+          if (still != nullptr) {
+            PoolPrevTrace::Key& key = trace.keys[2];
+            key.state = PoolPrevTrace::KeyState::Active;
+            key.mesh_key = still_key;
+            key.vs_hash = still->vs_hash;
+            key.selected_frame = frame;
+            key.camera_sightings = still->camera_sightings;
+          }
+        }
+      }
+      bool open = false;
+      for (const auto& key : trace.keys) {
+        if (key.state == PoolPrevTrace::KeyState::Waiting || key.state == PoolPrevTrace::KeyState::Active) open = true;
+      }
+      if (!open) {
+        trace.written = true;
+        trace_done = true;
+        trace_out = trace;
+      }
+    }
   }
+  if (trace_done) WritePoolPrevTrace(trace_out);
   if (released != 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
     renodx::utils::log::i("falcom_world::pool: frame ", frame, ": ", released,
                           " tracked vertex/index buffers released, ", mesh_waiting, " meshes waiting");
@@ -3370,6 +3613,7 @@ inline void ResetWorldPool() {
   g_pool.motion_detail = {};
   g_pool.dynamic_keys.clear();
   g_pool.dynamic_applied = false;  // re-applied at the next present
+  g_pool.prev_trace = {};
   g_pool.logged_invalidations = 0u;
   g_pool.mismatch_lines_logged = 0u;
 }
@@ -4036,6 +4280,78 @@ inline void DumpWorldPool() {
 
   std::string text = out.str();
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool.json", text);
+}
+
+// The prevWorld trace (see PoolPrevTrace): each key's state and evidence, the
+// record summary, then every record. Written once, when no key is open.
+inline void WritePoolPrevTrace(const PoolPrevTrace& trace) {
+  constexpr const char* kStates[] = {"waiting", "active", "done", "gave_up"};
+  constexpr char kRoles[] = "ABC";
+  size_t compared = 0u;
+  size_t exact_last = 0u;
+  size_t within_noise_last = 0u;
+  size_t mismatch_last = 0u;
+  size_t unfilled = 0u;
+  size_t exact_world = 0u;
+  float max_mismatch_meters = 0.f;
+  for (const auto& record : trace.records) {
+    if (!record.prev_filled) unfilled += 1u;
+    if (record.prev_vs_world.exact) exact_world += 1u;
+    if (!record.has_last) continue;
+    compared += 1u;
+    if (record.prev_vs_last.exact) exact_last += 1u;
+    if (record.prev_vs_last.ulps <= kPoolMotionUlpNoise) {
+      within_noise_last += 1u;
+    } else {
+      mismatch_last += 1u;
+      max_mismatch_meters = (std::max)(max_mismatch_meters, record.prev_vs_last.meters);
+    }
+  }
+
+  std::ostringstream out;
+  out << "{\n  \"schema\": 1,\n  \"armed_frame\": " << trace.armed_frame << ",\n";
+  out << "  \"notes\": \"keys A (far flip), B (slow sway), C (static). One record per camera copy of a key and element "
+         "(element 0 only for prev_equals_last). prev_equals_last: prevWorld equals the previous frame's world of the "
+         "same key.\",\n";
+  out << "  \"keys\": [";
+  for (size_t k = 0; k < trace.keys.size(); ++k) {
+    const PoolPrevTrace::Key& key = trace.keys[k];
+    out << (k != 0u ? ", " : "") << "{\"role\": \"" << kRoles[k] << "\", \"state\": \""
+        << kStates[static_cast<size_t>(key.state)] << "\", \"mesh_key\": " << key.mesh_key << ", \"vs_hash\": \""
+        << PoolHashText(key.vs_hash) << "\", \"selected\": " << key.selected_frame << ", \"frames\": "
+        << key.frames_recorded << ", \"missed\": " << key.missed << ", \"extra\": " << key.extra_camera_draws
+        << ", \"evidence\": {\"max_meters\": " << PoolJsonFloat{key.max_meters}
+        << ", \"max_basis\": " << PoolJsonFloat{key.max_basis} << ", \"moving_sightings\": " << key.moving_sightings
+        << ", \"camera_sightings\": " << key.camera_sightings << "}}";
+  }
+  out << "],\n";
+  out << "  \"summary\": {\"records\": " << trace.records.size() << ", \"compared\": " << compared
+      << ", \"prev_exact_last\": " << exact_last << ", \"prev_within_3ulp_last\": " << within_noise_last
+      << ", \"prev_mismatch_last\": " << mismatch_last << ", \"max_mismatch_meters\": "
+      << PoolJsonFloat{max_mismatch_meters} << ", \"prev_unfilled\": " << unfilled << ", \"prev_exact_world\": "
+      << exact_world << "},\n";
+  out << "  \"records\": [";
+  for (size_t i = 0; i < trace.records.size(); ++i) {
+    const PoolPrevTrace::Record& record = trace.records[i];
+    out << (i != 0u ? ",\n    " : "\n    ") << "{\"role\": \"" << kRoles[record.key] << "\", \"frame\": " << record.frame
+        << ", \"element\": " << record.element << ", \"draw_instances\": " << record.draw_instances
+        << ", \"camera_draws\": " << record.camera_draws << ", \"cpu_base\": " << record.cpu_base
+        << ", \"trace_only\": " << (record.trace_only ? "true" : "false") << ", \"world\": [";
+    for (uint32_t k = 0; k < kPoolWorldFloats; ++k) out << (k != 0u ? ", " : "") << PoolJsonFloat{record.world[k]};
+    out << "], \"prev_world\": [";
+    for (uint32_t k = 0; k < kPoolWorldFloats; ++k) out << (k != 0u ? ", " : "") << PoolJsonFloat{record.prev_world[k]};
+    out << "], \"prev_filled\": " << (record.prev_filled ? "true" : "false")
+        << ", \"prev_equals_world\": " << (record.prev_vs_world.exact ? "true" : "false")
+        << ", \"has_last\": " << (record.has_last ? "true" : "false")
+        << ", \"prev_equals_last\": " << (record.prev_vs_last.exact ? "true" : "false")
+        << ", \"prev_last_ulps\": " << record.prev_vs_last.ulps
+        << ", \"prev_last_meters\": " << PoolJsonFloat{record.prev_vs_last.meters}
+        << ", \"world_step_meters\": " << PoolJsonFloat{record.world_step_meters} << "}";
+  }
+  out << "\n  ]\n}\n";
+
+  std::string text = out.str();
+  renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_prev_trace.json", text);
 }
 
 inline void DumpWorldPoolObj(size_t max_vertices = 2000000u) {
