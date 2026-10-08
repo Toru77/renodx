@@ -7,6 +7,7 @@
 #include <iterator>
 #include <map>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -194,9 +195,11 @@ int main() {
 
   bvh::g_pool.scan_active.store(true);
 
+  HStage("1. Defaults.");
   // 1. Defaults.
   CHECK(bvh::g_pool.verify_meshes.load() && !bvh::g_pool.legacy_scale.load(), "defaults: verify on, legacy scale off");
 
+  HStage("2. A stable mesh takes two identical captures: two index and two vertex");
   // 2. A stable mesh takes two identical captures: two index and two vertex
   // copies, then it is added and its instances admit.
   {
@@ -224,6 +227,7 @@ int main() {
     CHECK(snapshot().admitted == 2u, "instances admitted (%zu)", snapshot().admitted);
   }
 
+  HStage("3. Contents change once between the first and second capture: the second");
   // 3. Contents change once between the first and second capture: the second
   // differs (one mismatch, logged), the third repeats it and is applied.
   {
@@ -258,6 +262,7 @@ int main() {
     CHECK(bvh::g_pool.families[0x1000u].mesh_mismatches == 1u, "family mismatch count");
   }
 
+  HStage("4. Index contents change between captures: \"indices differ\".");
   // 4. Index contents change between captures: "indices differ".
   {
     fresh();
@@ -274,6 +279,7 @@ int main() {
     std::swap(indices[0], indices[1]);
   }
 
+  HStage("5. Contents change every frame: no two captures agree, the mesh is");
   // 5. Contents change every frame: no two captures agree, the mesh is
   // rejected after kPoolMeshMaxCaptures and its instances never admit.
   {
@@ -303,6 +309,7 @@ int main() {
     CHECK(bvh::g_pool.families[0x1000u].mesh_unstable == 1u, "family unstable count");
   }
 
+  HStage("6. The mismatch log is capped per pool reset; counting goes on.");
   // 6. The mismatch log is capped per pool reset; counting goes on.
   {
     fresh();
@@ -323,6 +330,7 @@ int main() {
     CHECK(bvh::g_pool.mismatch_lines_logged == 0u, "reset clears the cap");
   }
 
+  HStage("7. Verification off: one capture is applied as before.");
   // 7. Verification off: one capture is applied as before.
   {
     fresh();
@@ -337,6 +345,7 @@ int main() {
     bvh::g_pool.verify_meshes.store(true);
   }
 
+  HStage("8. Buffer released during the second capture: the request goes, nothing");
   // 8. Buffer released during the second capture: the request goes, nothing
   // is added, copies in flight are dropped.
   {
@@ -354,6 +363,7 @@ int main() {
     CHECK(dev.bad_copies == 0, "copies in range (%d)", dev.bad_copies);
   }
 
+  HStage("9. Deferred-context draws do not serve the second capture either.");
   // 9. Deferred-context draws do not serve the second capture either.
   {
     fresh();
@@ -372,6 +382,7 @@ int main() {
     CHECK(run_until([&] { return snapshot().meshes == 1u; }, 40) > 0, "verified at immediate draws");
   }
 
+  HStage("10. Legacy scale limits: 0.02 and 60 are admitted by default and rejected");
   // 10. Legacy scale limits: 0.02 and 60 are admitted by default and rejected
   // with the switch on; the dump counts admitted instances outside them.
   {
@@ -387,8 +398,8 @@ int main() {
     bvh::DumpWorldPool();
     std::ifstream json(json_path);
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
-    CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": true}") != std::string::npos, "switches");
+    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
+    CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true}") != std::string::npos, "switches");
     CHECK(text.find("\"admitted_outside_legacy_scale\": 2") != std::string::npos, "outside legacy count");
     CHECK(text.find("\"outside_legacy_scale\": 1") != std::string::npos, "family count");
     CHECK(text.find("\"mesh_verified\": 2, \"mesh_capture_mismatches\": 0, \"mesh_unstable\": 0") != std::string::npos, "stats");
@@ -414,6 +425,7 @@ int main() {
     bvh::g_pool.legacy_scale.store(false);
   }
 
+  HStage("11. Switch log line carries the new switches.");
   // 11. Switch log line carries the new switches.
   {
     renodx::utils::log::g_lines.clear();

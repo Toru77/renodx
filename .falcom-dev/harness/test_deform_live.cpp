@@ -12,6 +12,7 @@
 #include <set>
 #include <span>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #define __world_bvh_refit_EMBED_FILE
 inline constexpr std::uint8_t __world_bvh_refit_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_bvh_refit{__world_bvh_refit_base};
@@ -291,6 +292,7 @@ int main() {
   Confirm(kSkin, "TEXCOORD", 1);
   Confirm(kSkinB, "TEXCOORD", 1);
 
+  HStage("0. Refit order: every node once, children before parents.");
   // 0. Refit order: every node once, children before parents.
   {
     std::mt19937 rng(7);
@@ -347,11 +349,13 @@ int main() {
   };
   auto stats = [&]() { std::lock_guard lock(bvh::g_deform_live.mutex); return bvh::g_deform_live.stats; };
 
+  HStage("1. Off: nothing.");
   // 1. Off: nothing.
   draw(kSkin, 0x11, 600);
   present();
   CHECK(cl.calls.empty() && dev.res.empty(), "off");
 
+  HStage("2. On: resources, then the capture shader, then captures; the tree after the topology read.");
   // 2. On: resources, then the capture shader, then captures; the tree after the topology read.
   bvh::g_deform_live.enabled.store(true);
   present();
@@ -373,6 +377,7 @@ int main() {
     CHECK(s.blas_built == 1u && s.resident == 1u && bvh::g_deform_live.object_count == 1u, "traced");
   }
 
+  HStage("3. Refit over this frame's pose and trace vs brute force.");
   // 3. Refit over this frame's pose and trace vs brute force.
   auto check_frame = [&](const char* label) {
     EmulateRefit(dev);
@@ -417,6 +422,7 @@ int main() {
   };
   check_frame("one object");
 
+  HStage("4. A second identity and a duplicate; unconfirmed, light view, deferred, game state.");
   // 4. A second identity and a duplicate; unconfirmed, light view, deferred, game state.
   draw(kSkin, 0x11, 600);
   draw(kSkin, 0x11, 600);              // duplicate
@@ -447,6 +453,7 @@ int main() {
   }
   check_frame("two objects");
 
+  HStage("5. Arena full; inspect.");
   // 5. Arena full; inspect.
   draw(kSkin, 0x17, 3u * 800000u);
   CHECK(stats().skips[size_t(bvh::DynamicSkip::ArenaFull)] == 1u, "arena full");
@@ -461,6 +468,7 @@ int main() {
   }
   present();
 
+  HStage("6. An identity no longer drawn retires; its bytes become garbage.");
   // 6. An identity no longer drawn retires; its bytes become garbage.
   for (int i = 0; i < 610; ++i) { draw(kSkin, 0x11, 600); present(); }
   {
@@ -471,6 +479,7 @@ int main() {
   present();
   check_frame("after retirement");
 
+  HStage("7. Shader destroyed; off releases everything.");
   // 7. Shader destroyed; off releases everything.
   bvh::OnDestroyPipelineDeformLive(&dev, pipeline{kSkinB});
   bvh::g_deform_live.enabled.store(false);

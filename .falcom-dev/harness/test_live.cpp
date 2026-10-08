@@ -3,14 +3,21 @@
 // garbage reset, GPU allocation failure and retry, switches, failed meshes,
 // the lock rule, the GPU contents check, and a CPU port of the trace shader
 // run over the uploaded buffers and compared with brute force.
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <set>
+#include <string>
+#include <thread>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_live.hpp"
 
 using namespace reshade::api;
@@ -18,14 +25,10 @@ namespace bvh = falcom_world::bvh;
 
 static int g_failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_failures; std::printf("FAIL %s:%d %s | ", __FILE__, __LINE__, #cond); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
-static const auto g_t0 = std::chrono::steady_clock::now();
 static void Stage(const char* fmt, ...) {
-  static double last = 0.0;
-  const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t0).count();
-  std::printf("[%7.1fs +%6.1fs frame %u] ", now, now - last, static_cast<unsigned>(falcom_world::g_state.frame.load()));
-  last = now;
-  va_list args; va_start(args, fmt); std::vprintf(fmt, args); va_end(args);
-  std::printf("\n");
+  char msg[512];
+  va_list args; va_start(args, fmt); std::vsnprintf(msg, sizeof(msg), fmt, args); va_end(args);
+  HStage("frame %u: %s", static_cast<unsigned>(falcom_world::g_state.frame.load()), msg);
 }
 
 static int g_under_lock = 0;
@@ -427,8 +430,130 @@ static float BruteForce(F3 o, F3 d, const std::vector<RefInstance>& refs) {
   return any ? best : -1.f;
 }
 
+// Brute-force reference cache: one (t, faded) result per ray in temp/pooltest_cache/<key>.bin.
+// The key covers the version, platform, ray directions, origin, fade and every reference triangle.
+// A hit is spot-checked on 8 evenly spaced rays; a mismatch deletes the file and fails the run.
+static const uint32_t kRefCacheVersion = 1;  // bump when the reference or the ray generation changes
+static const char kPlatformTag[] = "windows-x64";
+static int g_cache_hits = 0, g_cache_misses = 0;
+static const bool g_quick = std::getenv("FALCOM_QUICK") != nullptr;  // rays / 5: not a full verification
+struct RefResult { float t; uint32_t faded; };
+static float BruteForceFade(F3 o, F3 d, const std::vector<RefInstance>& refs, Fade fade, uint32_t* faded);
+
+static void HashBytes(uint64_t* h, const void* data, size_t n) {
+  const auto* p = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < n; ++i) { *h ^= p[i]; *h *= 1099511628211ull; }
+}
+static uint64_t RefCacheKey(const std::vector<F3>& dirs, F3 origin, uint32_t seed, const std::vector<RefInstance>& refs,
+                            const Fade* fade) {
+  uint64_t h = 14695981039346656037ull;
+  HashBytes(&h, &kRefCacheVersion, sizeof kRefCacheVersion);
+  HashBytes(&h, kPlatformTag, sizeof kPlatformTag);
+  const uint64_t rays = dirs.size();
+  HashBytes(&h, &rays, sizeof rays);
+  HashBytes(&h, dirs.data(), dirs.size() * sizeof(F3));
+  HashBytes(&h, &seed, sizeof seed);
+  HashBytes(&h, &origin, sizeof origin);
+  const uint32_t fade_mode = fade ? (fade->hide ? 2u : 1u) : 0u;
+  const float floor_value = fade ? fade->floor_value : 0.f;
+  HashBytes(&h, &fade_mode, sizeof fade_mode);
+  HashBytes(&h, &floor_value, sizeof floor_value);
+  for (const auto& ref : refs) {
+    const uint64_t verts = ref.verts.size();
+    HashBytes(&h, &verts, sizeof verts);
+    HashBytes(&h, ref.verts.data(), verts * sizeof(F3));
+    const uint32_t vis_bits = (ref.vis.camera_seen ? 1u : 0u) | (ref.vis.near_fade ? 2u : 0u);
+    HashBytes(&h, &vis_bits, sizeof vis_bits);
+    HashBytes(&h, ref.vis.inputs.param, sizeof ref.vis.inputs.param);
+  }
+  return h;
+}
+static std::filesystem::path RefCachePath(uint64_t key) {
+  char name[32];
+  std::snprintf(name, sizeof name, "%016llx.bin", static_cast<unsigned long long>(key));
+  return std::filesystem::temp_directory_path() / "pooltest_cache" / name;
+}
+static bool ReadRefCache(const std::filesystem::path& path, uint64_t key, size_t n, std::vector<RefResult>* out) {
+  std::ifstream file(path, std::ios::binary);
+  uint64_t stored_key = 0, stored_n = 0;
+  file.read(reinterpret_cast<char*>(&stored_key), sizeof stored_key);
+  file.read(reinterpret_cast<char*>(&stored_n), sizeof stored_n);
+  if (!file || stored_key != key || stored_n != n) return false;
+  out->resize(n);
+  file.read(reinterpret_cast<char*>(out->data()), n * sizeof(RefResult));
+  return static_cast<bool>(file);
+}
+static void WriteRefCache(const std::filesystem::path& path, uint64_t key, const std::vector<RefResult>& results) {
+  std::filesystem::create_directories(path.parent_path());
+  const std::filesystem::path tmp = path.string() + ".tmp";
+  {
+    std::ofstream file(tmp, std::ios::binary);
+    const uint64_t n = results.size();
+    file.write(reinterpret_cast<const char*>(&key), sizeof key);
+    file.write(reinterpret_cast<const char*>(&n), sizeof n);
+    file.write(reinterpret_cast<const char*>(results.data()), n * sizeof(RefResult));
+  }
+  std::filesystem::rename(tmp, path);
+}
+// Each worker fills its own result slots, so the output does not depend on the worker count.
+template <typename Eval>
+static std::vector<RefResult> EvalRefs(size_t n, Eval eval) {
+  std::vector<RefResult> out(n);
+  const size_t workers = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 8);
+  std::vector<std::thread> threads;
+  for (size_t w = 0; w < workers; ++w) {
+    threads.emplace_back([&, w] {
+      for (size_t i = w; i < n; i += workers) out[i] = eval(i);
+    });
+  }
+  for (auto& t : threads) t.join();
+  return out;
+}
+// Reference results for every direction: from the cache when the key matches, else computed and stored.
+static std::vector<RefResult> RefResults(const std::vector<F3>& dirs, F3 origin, uint32_t seed,
+                                         const std::vector<RefInstance>& refs, const Fade* fade) {
+  auto eval = [&](size_t i) {
+    RefResult r{0.f, 0u};
+    if (fade) {
+      r.t = BruteForceFade(origin, dirs[i], refs, *fade, &r.faded);
+    } else {
+      r.t = BruteForce(origin, dirs[i], refs);
+    }
+    return r;
+  };
+  const size_t n = dirs.size();
+  const char* mode = std::getenv("FALCOM_REF_CACHE");
+  if (mode && std::string(mode) == "off") return EvalRefs(n, eval);
+  const uint64_t key = RefCacheKey(dirs, origin, seed, refs, fade);
+  const std::filesystem::path path = RefCachePath(key);
+  std::vector<RefResult> cached;
+  if (ReadRefCache(path, key, n, &cached)) {
+    bool agree = true;
+    for (size_t k = 0; k < 8 && n > 0; ++k) {
+      const size_t i = k * n / 8;
+      const RefResult r = eval(i);
+      agree = agree && r.t == cached[i].t && r.faded == cached[i].faded;
+    }
+    if (agree) {
+      ++g_cache_hits;
+      return cached;
+    }
+    std::filesystem::remove(path);
+    std::printf("  removed %s\n", path.string().c_str());
+    std::vector<RefResult> fresh = EvalRefs(n, eval);
+    WriteRefCache(path, key, fresh);
+    CHECK(false, "stale ref cache");
+    return fresh;
+  }
+  ++g_cache_misses;
+  std::vector<RefResult> results = EvalRefs(n, eval);
+  WriteRefCache(path, key, results);
+  return results;
+}
+
 // Rays at triangle centroids of random region instances, plus random rays.
 static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, const char* label, int rays, uint32_t seed) {
+  if (g_quick) rays /= 5;
   const bvh::PoolRegion region = bvh::CurrentPoolRegion();
   const TraceInputs in = Inputs(dev, data);
   std::mt19937 rng(seed);
@@ -460,10 +585,8 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
       }
     }
   }
-  const std::vector<RefInstance> refs = BuildRefInstances(data, region);
-  Stage("%s: start, %d rays", label, rays);
+  std::vector<F3> dirs;
   for (int i = 0; i < rays; ++i) {
-    if (i % 50 == 0) Stage("%s: ray %d/%d", label, i, rays);
     F3 dir;
     if (!targets.empty() && i % 2 == 0) {
       dir = targets[rng() % targets.size()] - origin;
@@ -472,15 +595,21 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
     }
     const float len = std::sqrt(Dot(dir, dir));
     if (len < 1e-6f) continue;
-    dir = dir * (1.f / len);
+    dirs.push_back(dir * (1.f / len));
+  }
+  const std::vector<RefInstance> refs = BuildRefInstances(data, region);
+  Stage("%s: start, %d rays", label, rays);
+  const std::vector<RefResult> ref = RefResults(dirs, origin, seed, refs, nullptr);
+  for (size_t i = 0; i < dirs.size(); ++i) {
+    if (i % 50 == 0) HProgress("  %s: ray %zu/%zu", label, i, dirs.size());
     uint32_t instance;
-    const float t_bvh = TraceWorld(in, origin, dir, c, &instance);
-    const float t_ref = BruteForce(origin, dir, refs);
+    const float t_bvh = TraceWorld(in, origin, dirs[i], c, &instance);
+    const float t_ref = ref[i].t;
     const bool agree = (t_bvh < 0.f && t_ref < 0.f)
                        || (t_bvh >= 0.f && t_ref >= 0.f && std::fabs(t_bvh - t_ref) <= 1e-3f * std::max(1.f, t_ref));
     if (t_ref >= 0.f) ++hits;
     if (!agree) {
-      if (mismatches < 3) std::printf("  %s ray %d: bvh %.5f ref %.5f\n", label, i, t_bvh, t_ref);
+      if (mismatches < 3) std::printf("  %s ray %zu: bvh %.5f ref %.5f\n", label, i, t_bvh, t_ref);
       ++mismatches;
     }
   }
@@ -522,6 +651,7 @@ static float BruteForceFade(F3 o, F3 d, const std::vector<RefInstance>& refs, Fa
 // port of the shader and by brute force, with the camera fade.
 static int CompareFadeTraces(const Device& dev, const bvh::BvhDeviceData& data, const char* label, Fade fade, int rays,
                              uint32_t seed, uint32_t* faded_rays) {
+  if (g_quick) rays /= 5;
   const bvh::PoolRegion region = bvh::CurrentPoolRegion();
   const TraceInputs in = Inputs(dev, data);
   std::mt19937 rng(seed);
@@ -539,24 +669,29 @@ static int CompareFadeTraces(const Device& dev, const bvh::BvhDeviceData& data, 
   int mismatches = 0;
   *faded_rays = 0u;
   Counters c;
-  const std::vector<RefInstance> refs = BuildRefInstances(data, region);
-  Stage("%s: start, %d rays", label, rays);
+  std::vector<F3> dirs;
   for (int i = 0; i < rays; ++i) {
-    if (i % 50 == 0) Stage("%s: ray %d/%d", label, i, rays);
     F3 dir = (i % 3 != 0 && !targets.empty()) ? targets[rng() % targets.size()] - origin + F3{uni(rng), uni(rng), uni(rng)}
                                               : F3{uni(rng), uni(rng) - 0.3f, uni(rng)};
     const float len = std::sqrt(Dot(dir, dir));
     if (len < 1e-6f) continue;
-    dir = dir * (1.f / len);
-    uint32_t instance, faded_bvh = 0u, faded_ref = 0u;
-    const float t_bvh = TraceWorld(in, origin, dir, c, &instance, fade, &faded_bvh);
-    const float t_ref = BruteForceFade(origin, dir, refs, fade, &faded_ref);
+    dirs.push_back(dir * (1.f / len));
+  }
+  const std::vector<RefInstance> refs = BuildRefInstances(data, region);
+  Stage("%s: start, %d rays", label, rays);
+  const std::vector<RefResult> ref = RefResults(dirs, origin, seed, refs, &fade);
+  for (size_t i = 0; i < dirs.size(); ++i) {
+    if (i % 50 == 0) HProgress("  %s: ray %zu/%zu", label, i, dirs.size());
+    uint32_t instance, faded_bvh = 0u;
+    const float t_bvh = TraceWorld(in, origin, dirs[i], c, &instance, fade, &faded_bvh);
+    const float t_ref = ref[i].t;
+    const uint32_t faded_ref = ref[i].faded;
     const bool agree = ((t_bvh < 0.f && t_ref < 0.f)
                         || (t_bvh >= 0.f && t_ref >= 0.f && std::fabs(t_bvh - t_ref) <= 1e-3f * std::max(1.f, t_ref)))
                        && faded_bvh == faded_ref;
     *faded_rays += faded_ref;
     if (!agree) {
-      if (mismatches < 3) std::printf("  %s ray %d: bvh %.5f/%u ref %.5f/%u\n", label, i, t_bvh, faded_bvh, t_ref, faded_ref);
+      if (mismatches < 3) std::printf("  %s ray %zu: bvh %.5f/%u ref %.5f/%u\n", label, i, t_bvh, faded_bvh, t_ref, faded_ref);
       ++mismatches;
     }
   }
@@ -580,9 +715,44 @@ static void AddFadedInstance(uint64_t key, float x, float y, float z, float star
   bvh::ObservePoolInstance(key, 0x1000u, w, g_obs_frame++, &sighting, &vis);
 }
 
+// Moves the dynamic instance admitted through `key` to (x, 0, z), the way
+// FollowPoolMovingInstance does: pose, inverse, bounds, admitted key, revision.
+static void MoveDynamicInstance(uint64_t key, float x, float z, uint32_t frame) {
+  float w[12];
+  World(x, 0.f, z, 1.f, 0.f, w);
+  std::lock_guard lock(bvh::g_pool.mutex);
+  for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+    if (inst.mesh_key != key) continue;
+    float mn[3], mx[3];
+    bvh::ComputePoolInstanceBounds(bvh::g_pool.meshes[inst.mesh_id], w, mn, mx);
+    bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
+    std::memcpy(inst.matrix, w, sizeof(w));
+    falcom_world::ComputeMatrixInverse(inst.matrix, inst.inverse_world);
+    std::memcpy(inst.bounds_min, mn, sizeof(mn));
+    std::memcpy(inst.bounds_max, mx, sizeof(mx));
+    bvh::g_pool.admitted_keys.insert(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
+    if (!inst.dynamic) bvh::g_pool.revision += 1u;  // as FollowPoolMovingInstance: a new dynamic flag re-partitions at a rebuild
+    inst.dynamic = true;
+    inst.last_follow_frame = frame;
+    bvh::g_pool.dynamic_revision += 1u;
+    return;
+  }
+}
+
+// Moves the instance admitted through `key` from the pose (from_x, 0, from_z) to
+// (to_x, 0, to_z) through FollowPoolMovingInstance itself, with a Moving verdict.
+static void FollowInstance(uint64_t key, float from_x, float from_z, float to_x, float to_z, uint32_t frame) {
+  float prev[12], world[12];
+  World(from_x, 0.f, from_z, 1.f, 0.f, prev);
+  World(to_x, 0.f, to_z, 1.f, 0.f, world);
+  std::lock_guard lock(bvh::g_pool.mutex);
+  bvh::FollowPoolMovingInstance(key, 0x1000u, world, prev, true, frame, bvh::PoolSightingVerdict::Moving);
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Stage("main start");
+  if (g_quick) std::printf("QUICK: not a full verification\n");
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   bvh::g_pool.region_size = 512.f;
   SetCamera(10.f, 5.f, 10.f);
@@ -1064,6 +1234,142 @@ int main() {
     CHECK(data->live.tlas_near_fade == 0u, "near-fade instances gone with their meshes (%u)", data->live.tlas_near_fade);
   }
 
+  Stage("8f refit");
+  // 8f. Refit: a moved dynamic instance refits the TLAS without a rebuild; the
+  // refit agrees with brute force; a failed refit forces a rebuild; 120 refits
+  // force a rebuild for tree quality.
+  {
+    const uint64_t kR = 0xF8;
+    AddMesh(kR, Grid(9, 9, 4.f, 0.7f));
+    AddInstance(kR, 5.f, 0.f, 5.f);
+    for (int i = 0; i < 12; ++i) present();
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (size_t i = 1; i < bvh::g_pool.instances.size(); ++i) {
+        CHECK(bvh::g_pool.instances[i - 1].id < bvh::g_pool.instances[i].id, "pool ids ascending");
+      }
+    }
+    MoveDynamicInstance(kR, 5.f, 5.f, frame.load());
+    for (int i = 0; i < 10; ++i) present();
+    const uint32_t rebuilds = data->live.tlas_rebuilds;
+    const uint32_t refits = data->live.tlas_refits;
+    MoveDynamicInstance(kR, 5.4f, 5.f, frame.load());
+    for (int i = 0; i < 10; ++i) present();
+    CHECK(data->live.tlas_refits > refits, "moved instance refitted (%u)", data->live.tlas_refits);
+    CHECK(data->live.tlas_rebuilds == rebuilds, "pose change: no rebuild (%u -> %u)", rebuilds, data->live.tlas_rebuilds);
+    CHECK(CompareTraces(dev, *data, "refit", 60, 21) == 0, "trace agrees after refit");
+    bvh::g_live_bvh.check_requested.store(true);
+    present();
+    CHECK(data->live.gpu_ok, "GPU check after refit: %s", data->live.gpu_result.c_str());
+
+    // Every instance dynamic: a rebuild puts the dynamic part first, from 0.
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (bvh::WorldInstance& inst : bvh::g_pool.instances) inst.dynamic = true;
+      bvh::g_pool.revision += 1u;
+    }
+    for (int i = 0; i < 10; ++i) present();
+    CHECK(data->tlas_dynamic_first == 0u, "all dynamic: dynamic part starts at 0 (%u)", data->tlas_dynamic_first);
+    CHECK(CompareTraces(dev, *data, "all dynamic", 40, 22) == 0, "trace agrees with all instances dynamic");
+    MoveDynamicInstance(kR, 150.f, 5.f, frame.load());
+    for (int i = 0; i < 10; ++i) present();
+    CHECK(CompareTraces(dev, *data, "far move", 60, 23) == 0, "trace agrees after a far move");
+
+    // An instance removed between the snapshot and the refit: refit_missing, then a rebuild.
+    const uint32_t missing = data->live.refit_missing;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (auto it = bvh::g_pool.instances.begin(); it != bvh::g_pool.instances.end(); ++it) {
+        if (it->mesh_key != kR) continue;
+        bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(it->mesh_id, falcom_world::MatrixHash(it->matrix, 12)));
+        const auto observed = bvh::g_pool.observations.find(bvh::InstanceKey{kR, falcom_world::MatrixHash(it->matrix, 12)});
+        if (observed != bvh::g_pool.observations.end()) observed->second.admitted = false;
+        bvh::g_pool.instances.erase(it);
+        break;
+      }
+      bvh::g_pool.dynamic_revision += 1u;
+    }
+    present();
+    CHECK(data->live.refit_missing > missing, "missing instance counted (%u)", data->live.refit_missing);
+    for (int i = 0; i < 3; ++i) present();
+    CHECK(std::string(data->live.tlas_reason) == "refit failed", "rebuild after a failed refit (%s)", data->live.tlas_reason);
+    CHECK(CompareTraces(dev, *data, "after missing instance", 40, 24) == 0, "trace agrees after the failed refit");
+
+    // 120 refits since a rebuild: the next one is a rebuild for quality.
+    AddMesh(0xF9, Grid(10, 10, 4.f, 0.6f));
+    AddInstance(0xF9, 5.f, 0.f, 5.f);
+    for (int i = 0; i < 12; ++i) present();
+    MoveDynamicInstance(0xF9, 5.f, 5.f, frame.load());
+    for (int i = 0; i < 130; ++i) {
+      MoveDynamicInstance(0xF9, 5.f + 0.01f * static_cast<float>(i % 2), 5.f, frame.load());
+      present();
+    }
+    CHECK(std::string(data->live.tlas_reason) == "refit quality", "refit quality rebuild (%s; refits %u, failures %u: %s)",
+          data->live.tlas_reason, data->live.tlas_refits, data->live.refit_failures, data->live.last_failure.c_str());
+  }
+
+  Stage("8f2 refit between structural changes");
+  // 8f2. A pool revision bump waits out the rebuild interval; the moved dynamic
+  // instance is still refitted, so its TLAS pose follows every frame.
+  {
+    const uint64_t kS = 0xF6;
+    AddMesh(kS, Grid(9, 9, 4.f, 0.5f));
+    AddInstance(kS, 5.f, 0.f, 5.f);
+    for (int i = 0; i < 12; ++i) present();
+    MoveDynamicInstance(kS, 5.f, 5.f, frame.load());
+    for (int i = 0; i < 10; ++i) present();
+    const uint32_t refits = data->live.tlas_refits;
+    uint32_t stale_frames = 0u;
+    for (int i = 0; i < 16; ++i) {
+      const float x = 5.f + 0.03f * static_cast<float>(i + 1);
+      MoveDynamicInstance(kS, x, 5.f, frame.load());
+      if (i % 2 == 0) {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        bvh::g_pool.revision += 1u;
+      }
+      present();
+      float expected[12];
+      World(x, 0.f, 5.f, 1.f, 0.f, expected);
+      bool stale = true;
+      for (const bvh::LiveTlasInstance& info : data->tlas_info) {
+        if (info.mesh_key == kS && std::memcmp(info.matrix, expected, sizeof(expected)) == 0) stale = false;
+      }
+      if (stale) stale_frames += 1u;
+    }
+    CHECK(stale_frames == 0u, "TLAS pose follows each frame under structural changes (%u stale frames)", stale_frames);
+    CHECK(data->live.tlas_refits - refits >= 12u, "refits between structural changes (%u)", data->live.tlas_refits - refits);
+    CHECK(CompareTraces(dev, *data, "structural changes", 60, 26) == 0, "trace agrees after structural changes");
+  }
+
+  Stage("8g static instance flips to dynamic");
+  // 8g. A static instance that turns dynamic through the follow path: the flip bumps
+  // the revision, so the next rebuild partitions it and its TLAS entry follows its pose.
+  {
+    const uint64_t kF = 0xF7;
+    AddMesh(kF, Grid(8, 8, 4.f, 0.6f));
+    AddInstance(kF, 5.f, 0.f, 5.f);
+    AddInstance(kF, -4.f, 0.f, 3.f);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.meshes[bvh::g_pool.mesh_by_key.at(kF)].dynamic = true;
+    }
+    for (int i = 0; i < 12; ++i) present();
+    FollowInstance(kF, -4.f, 3.f, -4.5f, 3.f, frame.load());
+    for (int i = 0; i < 10; ++i) present();
+    FollowInstance(kF, 5.f, 5.f, 5.6f, 5.f, frame.load());
+    for (int i = 0; i < 12; ++i) present();
+    CHECK(CompareTraces(dev, *data, "static instance flipped", 80, 25) == 0, "trace agrees after the flip");
+    bvh::g_live_bvh.check_requested.store(true);
+    present();
+    CHECK(data->live.gpu_ok, "GPU check after the flip: %s", data->live.gpu_result.c_str());
+  }
+
+  RetireMesh(0xF6);
+  RetireMesh(0xF7);
+  RetireMesh(0xF8);
+  RetireMesh(0xF9);
+  for (int i = 0; i < 9; ++i) present();
+
   Stage("9 requested reset");
   // 9. Rebuild on request, also inside an upload retry window.
   data->upload_retry_frame = frame.load() + 100u;
@@ -1110,6 +1416,7 @@ int main() {
   bvh::DestroyBvhDeviceData(&dev);
   CHECK(dev.res.empty() && dev.views.empty(), "leaks: %zu resources, %zu views", dev.res.size(), dev.views.size());
 
+  std::printf("ref cache: %d hit(s), %d miss(es)\n", g_cache_hits, g_cache_misses);
   Stage("done: %d failures", g_failures);
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

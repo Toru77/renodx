@@ -5,6 +5,7 @@
 #include <iterator>
 #include <map>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -227,6 +228,7 @@ int main() {
     CHECK(!fam_zero.reject_samples.empty() && fam_zero.reject_samples[0].reason == (uint8_t)bvh::PoolMatrixReject::ZeroScale, "reject sample");
   }
 
+  HStage("released VB");
   // A VB released between an indirect draw and its readback: no mesh capture.
   {
     std::vector<Object> dead_objects;
@@ -252,6 +254,7 @@ int main() {
     CHECK(bvh::g_pool.indirect_dead.empty(), "dead set cleared");
   }
 
+  HStage("instance growth");
   // A draw whose instance count grows: the window follows (32, then 144) and
   // every instance is admitted once it fits.
   {
@@ -276,6 +279,7 @@ int main() {
     CHECK(admitted == 100, "all grown instances admitted (%d)", admitted);
   }
 
+  HStage("reset in flight");
   // Reset with copies in flight releases their references.
   {
     { std::lock_guard lock(bvh::g_pool.mutex); bvh::g_pool.schedule.clear(); }

@@ -154,6 +154,15 @@ struct LiveBvhStats {
   float mesh_ms_max = 0.f;
   float tlas_ms_last = 0.f;
   float tlas_ms_max = 0.f;
+  // TLAS refits (RefitLiveTlas): moved dynamic instances without a rebuild.
+  uint32_t tlas_refits = 0u;
+  uint32_t refit_instances = 0u;  // descriptors that changed in the last refit
+  float refit_ms_last = 0.f;
+  float refit_ms_max = 0.f;
+  uint32_t refit_lag_last = 0u;   // frames since the oldest refit instance was followed
+  uint32_t refit_lag_max = 0u;
+  uint32_t refit_missing = 0u;    // refit instances no longer in the pool
+  uint32_t refit_failures = 0u;
   // GPU contents check (on request; waits for the GPU).
   bool gpu_checked = false;
   bool gpu_ok = false;
@@ -164,6 +173,8 @@ struct LiveBvhStats {
 // (kept per TLAS instance for the inspect tool).
 struct LiveTlasInstance {
   uint64_t uid = 0u;       // WorldMesh::uid
+  uint64_t id = 0u;        // PoolState instance id (ascending in the pool)
+  bool dynamic = false;    // moving instance: refitted, not rebuilt
   uint64_t mesh_key = 0u;  // draw key it was admitted through
   uint32_t vs_hash = 0u;
   uint8_t source = 0u;
@@ -236,8 +247,13 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   std::vector<LiveTlasInstance> tlas_info;           // pool provenance per TLAS instance (inspect)
   std::vector<BVHLeafGPU> tlas_leaves_cpu;
   std::vector<BVHNodeGPU> tlas_nodes_cpu;
+  std::vector<uint32_t> tlas_leaf_of_instance;  // TLAS instance -> its leaf (sorted leaves)
+  uint32_t tlas_dynamic_first = 0u;             // instances [first, end) are dynamic
+  uint32_t tlas_refits_since_rebuild = 0u;
+  bool tlas_refit_failed = false;               // the next TLAS update is a full rebuild
   uint64_t tlas_pool_revision = 0u;
   uint64_t tlas_visibility_revision = 0u;  // g_pool.visibility_revision the TLAS reflects
+  uint64_t tlas_dynamic_revision = 0u;     // g_pool.dynamic_revision the TLAS reflects
   uint64_t tlas_store_version = 0u;
   float tlas_region_min[3] = {1e30f, 1e30f, 1e30f};
   float tlas_region_size = 0.f;
@@ -309,6 +325,9 @@ inline void DestroyLiveTlas(reshade::api::device* device, BvhDeviceData* data) {
   data->tlas_info.clear();
   data->tlas_leaves_cpu.clear();
   data->tlas_nodes_cpu.clear();
+  data->tlas_leaf_of_instance.clear();
+  data->tlas_dynamic_first = 0u;
+  data->tlas_refits_since_rebuild = 0u;
   data->tlas_built = false;
   data->active_count = 0u;
   data->bvh_ready = false;

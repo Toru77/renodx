@@ -110,6 +110,8 @@ inline constexpr uint32_t kPoolStableObservations = 2u;     // frames with the s
 inline constexpr uint32_t kPoolRecaptureFrames = 30u;       // per draw identity
 inline constexpr uint32_t kPoolStagingSlots = 3u;           // read back two presents later
 inline constexpr uint64_t kPoolStagingSlotBytes = 8ull * 1024ull * 1024ull;
+// A follow copy (moving key, cooldown bypassed) may fill up to 1/share of a slot.
+inline constexpr uint64_t kPoolFollowSlotShare = 2u;
 inline constexpr uint64_t kPoolCbCopyBytes = 16u;           // b1 copy, keeps slices 16-byte aligned
 inline constexpr uint32_t kPoolMaxInstancesPerDraw = 4096u;
 inline constexpr uint64_t kPoolIndirectArgsBytes = 32u;     // 20-byte indexed args, padded to 16
@@ -161,6 +163,7 @@ inline constexpr size_t kPoolMotionMaxMeshKeys = 4096u;
 inline constexpr float kPoolMovingMeters = 1e-5f;  // translation; also at least 4 ULP of the coordinate
 inline constexpr float kPoolMovingBasis = 1e-5f;   // basis element, times the largest basis element (>= 1)
 inline constexpr uint32_t kPoolMovingHoldFrames = 2u * kPoolRecaptureFrames;
+inline constexpr uint32_t kPoolFollowRelinkFrames = 8u;     // unseen frames a moving instance may be relinked across
 // prevWorld trace (diagnostic, read-only): three draw keys, kPoolTraceFrames
 // camera copies each (see PoolPrevTrace).
 inline constexpr uint32_t kPoolTraceFrames = 120u;
@@ -338,6 +341,11 @@ struct WorldInstance {
   uint32_t admit_frame = 0u;
   float admit_camera[3] = {};
   bool admit_camera_valid = false;
+  // Follow mode (FollowPoolMovingInstance).
+  bool dynamic = false;  // admitted for a moving mesh (its pose follows the object)
+  uint32_t last_follow_frame = 0u;
+  uint32_t follows = 0u;  // pose updates
+  uint64_t id = 0u;       // PoolState::next_instance_id, never reused
   PoolVisibility visibility;  // camera-visibility inputs at admission
 };
 
@@ -466,11 +474,16 @@ struct PoolPendingCopy {
   uint64_t args_offset = 0u;
   uint64_t schedule_key = 0u;
   bool trace_only = false;  // prevWorld trace copy: not counted, not queued, not stamped
+  bool follow = false;      // moving key in follow mode: the copy bypassed the cooldown
 };
+
+// Normal copies keep the per-identity cooldown. Follow and Trace bypass it.
+enum class PoolCopyKind : uint8_t { Normal, Follow, Trace };
 
 struct PoolStagingSlot {
   reshade::api::resource buffer = {0u};
   uint64_t used = 0u;
+  uint64_t follow_used = 0u;  // bytes of Follow copies in `used`
   bool resolving = false;
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
@@ -496,6 +509,7 @@ struct PoolSchedule {
   uint32_t copy_frame = 0u;
   uint32_t next_frame = 0u;
   uint32_t indirect_window = 0u;  // indirect draws: next window (0 = not known yet)
+  bool follow = false;            // moving key in follow mode: copies bypass the cooldown
 };
 
 // One instance sighting of the motion probe (see PoolMotionStats).
@@ -582,7 +596,9 @@ struct PoolDynamicMesh {
   float max_meters = 0.f;  // translation difference world - prevWorld
   float max_basis = 0.f;
   uint32_t retired_instances = 0u;  // admitted instances of its mesh removed when it became dynamic
+  uint32_t retired_orphans = 0u;    // instances of its key retired as orphans (RetirePoolOrphans)
   uint64_t blocked = 0u;            // admissions refused since
+  uint64_t follows = 0u;            // pose updates of its instances (follow mode)
   bool moving_now = true;           // moving evidence not yet released (see NotePoolCameraMotion)
   uint32_t released = 0u;           // times released by a still sighting
   float world[kPoolWorldFloats] = {};       // the sighting with the largest translation difference
@@ -656,6 +672,16 @@ struct PoolStats {
   uint32_t dynamic_meshes_marked = 0u; // meshes flagged dynamic (counts re-flags after a switch change)
   uint32_t dynamic_retired = 0u;       // admitted instances removed with them
   uint64_t dynamic_blocked = 0u;       // admissions refused
+  uint64_t follow_hits = 0u;             // moving instances moved to their new pose
+  uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
+  uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
+  uint64_t follow_rejected_bounds = 0u;  // pose updates refused (bounds)
+  uint64_t follow_budget_skips = 0u;     // follow copies refused by the slot share
+  uint64_t max_slot_used = 0u;           // largest staging slot fill at resolve (bytes)
+  uint64_t max_follow_used = 0u;         // largest follow part of a staging slot at resolve (bytes)
+  uint64_t orphans = 0u;                 // dynamic instances not seen for kPoolMovingHoldFrames (pending retirement)
+  uint64_t orphans_retired = 0u;         // orphans removed by RetirePoolOrphans
+  uint64_t follow_relinks = 0u;          // moving instances relinked across a gap (FollowPoolMovingInstance)
   uint32_t dynamic_released = 0u;      // meshes unflagged when their moving keys were released
   size_t dynamic_moving_keys = 0u;     // draw keys moving now (refreshed by UpdatePoolStats)
   uint32_t rejected_bounds = 0u;
@@ -762,13 +788,16 @@ struct PoolPrevTrace {
 
 struct PoolState {
   std::atomic_bool scan_active{false};
+  bool scan_continuous = false;  // the scan has been on every frame since scan_since
+  uint32_t scan_since = 0u;
   // Diagnostic switches (see the header comment).
   std::atomic_bool capture_meshes{true};
   std::atomic_bool scan_indirect{true};
   std::atomic_bool log_captures{false};
   std::atomic_bool verify_meshes{true};   // admit a mesh only after two identical captures
   std::atomic_bool legacy_scale{false};   // instance scale limits of round 6 (0.05 .. 50)
-  std::atomic_bool exclude_moving{true};  // meshes seen moving in a camera view stay out of the static pool
+  std::atomic_bool exclude_moving{false};  // meshes seen moving in a camera view stay out of the static pool
+  std::atomic_bool follow_moving{true};    // moving meshes keep their instances, which follow the pose
   uint32_t mismatch_lines_logged = 0u;
   // The immediate command list (set at present), to tell deferred-context draws apart.
   std::atomic_uint64_t immediate_cmd_list{0u};
@@ -795,6 +824,7 @@ struct PoolState {
   std::unordered_map<uint64_t, std::vector<uint64_t>> mesh_waiting;  // buffer key -> keys waiting for a copy
   uint64_t next_mesh_serial = 1u;
   uint64_t next_mesh_uid = 1u;  // WorldMesh::uid, never reused (also not by ResetWorldPool)
+  uint64_t next_instance_id = 1u;  // WorldInstance::id, never reused (also not by ResetWorldPool)
   std::unordered_set<uint64_t> mesh_queued;   // keys queued or captured since last invalidation
   std::unordered_set<uint64_t> failed_meshes;
   std::unordered_map<uint64_t, uint32_t> mesh_by_key;
@@ -826,6 +856,7 @@ struct PoolState {
   // when the switch changes).
   std::unordered_map<uint64_t, PoolDynamicMesh> dynamic_keys;
   bool dynamic_applied = false;
+  uint64_t dynamic_revision = 0u;  // bumped when a moving instance changes pose (not a change of the set)
   PoolPrevTrace prev_trace;
 };
 
@@ -1047,6 +1078,61 @@ inline bool PoolInstanceInRegion(const WorldInstance& instance, const PoolRegion
 }
 
 // Caller holds g_pool.mutex.
+inline uint64_t PoolAdmittedKey(uint32_t mesh_id, uint64_t matrix_hash) {
+  return PoolMix(PoolMix(1469598103934665603ull, mesh_id), matrix_hash);
+}
+
+// Caller holds g_pool.mutex. The last frame an instance was seen: admitted,
+// followed, or sighted at its (mesh, matrix) observation.
+inline uint32_t PoolInstanceLastSeen(const WorldInstance& instance) {
+  uint32_t seen = (std::max)(instance.admit_frame, instance.last_follow_frame);
+  const auto observed = g_pool.observations.find(InstanceKey{instance.mesh_key, MatrixHash(instance.matrix, kPoolWorldFloats)});
+  if (observed != g_pool.observations.end()) {
+    seen = (std::max)({seen, observed->second.last_frame, observed->second.last_camera_frame, observed->second.last_light_frame});
+  }
+  return seen;
+}
+
+// A dynamic instance not seen for kPoolMovingHoldFrames: pending retirement.
+inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t frame) {
+  return instance.dynamic && frame > PoolInstanceLastSeen(instance) + kPoolMovingHoldFrames;
+}
+
+// Caller holds g_pool.mutex. Removes the instances `remove` selects (order kept),
+// erases their admitted keys, and bumps the revision once if any were removed.
+template <typename Remove>
+inline uint32_t RemovePoolInstances(Remove remove) {
+  uint32_t removed = 0u;
+  size_t write = 0u;
+  for (size_t read = 0u; read < g_pool.instances.size(); ++read) {
+    WorldInstance& instance = g_pool.instances[read];
+    if (remove(instance)) {
+      g_pool.admitted_keys.erase(PoolAdmittedKey(instance.mesh_id, MatrixHash(instance.matrix, kPoolWorldFloats)));
+      removed += 1u;
+      continue;
+    }
+    if (write != read) g_pool.instances[write] = std::move(instance);
+    write += 1u;
+  }
+  g_pool.instances.resize(write);
+  if (removed != 0u) g_pool.revision += 1u;
+  return removed;
+}
+
+// Caller holds g_pool.mutex. Retires the orphans: their exact-key observation no
+// longer counts as admitted, and the instance is removed. No graphics calls.
+inline void RetirePoolOrphans(uint32_t frame) {
+  const uint32_t removed = RemovePoolInstances([&](const WorldInstance& instance) {
+    if (!PoolInstanceIsOrphan(instance, frame)) return false;
+    const auto observed = g_pool.observations.find(InstanceKey{instance.mesh_key, MatrixHash(instance.matrix, kPoolWorldFloats)});
+    if (observed != g_pool.observations.end()) observed->second.admitted = false;
+    const auto dynamic = g_pool.dynamic_keys.find(instance.mesh_key);
+    if (dynamic != g_pool.dynamic_keys.end()) dynamic->second.retired_orphans += 1u;
+    return true;
+  });
+  g_pool.stats.orphans_retired += removed;
+}
+
 inline void UpdatePoolStats() {
   size_t queued = 0u;
   for (const auto& slot : g_pool.slots) {
@@ -1067,9 +1153,13 @@ inline void UpdatePoolStats() {
   g_pool.stats.admitted = g_pool.instances.size();
   const PoolRegion region = CurrentPoolRegion();
   size_t in_region = 0u;
+  uint64_t orphans = 0u;
+  const uint32_t frame = g_state.frame.load();
   for (const auto& instance : g_pool.instances) {
     if (PoolInstanceInRegion(instance, region)) in_region += 1u;
+    if (PoolInstanceIsOrphan(instance, frame)) orphans += 1u;
   }
+  g_pool.stats.orphans = orphans;
   g_pool.stats.region = in_region;
   size_t written = 0u;
   size_t dynamic_meshes = 0u;
@@ -1135,10 +1225,6 @@ inline uint64_t PoolScheduleKey(uint64_t mesh_key, uint32_t first_instance, uint
   uint64_t key = PoolMix(1469598103934665603ull, mesh_key);
   key = PoolMix(key, first_instance);
   return PoolMix(key, count);
-}
-
-inline uint64_t PoolAdmittedKey(uint32_t mesh_id, uint64_t matrix_hash) {
-  return PoolMix(PoolMix(1469598103934665603ull, mesh_id), matrix_hash);
 }
 
 // Rate-limit identity of an indirect draw: its buffers and args location
@@ -1280,9 +1366,9 @@ inline void OnDestroyDevicePool(reshade::api::device* device) {
 // Admission.
 
 // Caller holds g_pool.mutex.
-inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uint32_t mesh_id) {
+inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uint32_t mesh_id, bool follow = false) {
   if (mesh_id >= g_pool.meshes.size()) return false;
-  if (g_pool.meshes[mesh_id].dynamic) {
+  if (g_pool.meshes[mesh_id].dynamic && g_pool.exclude_moving.load(std::memory_order_relaxed)) {
     // Seen moving in a camera view (P2a): a pose of it would stay behind as a
     // ghost when it moves again.
     g_pool.stats.dynamic_blocked += 1u;
@@ -1321,10 +1407,13 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
   instance.mesh_key = mesh_key;
   instance.mesh_id = mesh_id;
   instance.source_vs_hash = observed.vs_hash;
+  instance.id = g_pool.next_instance_id++;
+  instance.dynamic = follow;
   std::memcpy(instance.matrix, observed.matrix, sizeof(float) * kPoolWorldFloats);
   ComputeMatrixInverse(instance.matrix, instance.inverse_world);
   instance.first_frame = observed.first_frame;
   instance.admit_frame = g_state.frame.load();
+  instance.last_follow_frame = instance.admit_frame;
   instance.admit_camera_valid = g_pool.resolve_camera_valid;
   std::memcpy(instance.admit_camera, g_pool.resolve_camera, sizeof(instance.admit_camera));
   instance.visibility = observed.camera_visibility.valid ? observed.camera_visibility : observed.light_visibility;
@@ -1614,25 +1703,12 @@ inline uint32_t MarkPoolMeshDynamic(uint32_t mesh_id) {
   if (mesh_id >= g_pool.meshes.size() || g_pool.meshes[mesh_id].dynamic) return 0u;
   g_pool.meshes[mesh_id].dynamic = true;
   g_pool.stats.dynamic_meshes_marked += 1u;
-  uint32_t removed = 0u;
-  size_t write = 0u;
-  for (size_t read = 0u; read < g_pool.instances.size(); ++read) {
-    WorldInstance& instance = g_pool.instances[read];
-    if (instance.mesh_id == mesh_id) {
-      g_pool.admitted_keys.erase(PoolAdmittedKey(mesh_id, MatrixHash(instance.matrix, kPoolWorldFloats)));
-      removed += 1u;
-      continue;
-    }
-    if (write != read) g_pool.instances[write] = std::move(instance);
-    write += 1u;
-  }
-  g_pool.instances.resize(write);
+  const uint32_t removed = RemovePoolInstances([mesh_id](const WorldInstance& instance) { return instance.mesh_id == mesh_id; });
   for (auto& [key, observed] : g_pool.observations) {
     if (!observed.admitted) continue;
     const auto mesh_it = g_pool.mesh_by_key.find(key.mesh_key);
     if (mesh_it != g_pool.mesh_by_key.end() && mesh_it->second == mesh_id) observed.admitted = false;
   }
-  if (removed != 0u) g_pool.revision += 1u;
   g_pool.stats.dynamic_retired += removed;
   return removed;
 }
@@ -1650,7 +1726,7 @@ inline void ApplyPoolDynamicKey(uint64_t mesh_key, PoolDynamicMesh& entry) {
 // the meshes of every key seen moving (removing their instances); off clears
 // the flags (their observations admit again at their next sighting).
 inline void ApplyPoolDynamicSwitch() {
-  const bool on = g_pool.exclude_moving.load(std::memory_order_relaxed);
+  const bool on = g_pool.exclude_moving.load(std::memory_order_relaxed) || g_pool.follow_moving.load(std::memory_order_relaxed);
   if (on == g_pool.dynamic_applied) return;
   g_pool.dynamic_applied = on;
   if (on) {
@@ -1736,6 +1812,108 @@ struct PoolMotionDraw {
   uint32_t instances = 0u;  // elements read back
   uint32_t moved = 0u;      // of them counted as moved
 };
+
+// Caller holds g_pool.mutex. Follow mode: moving objects stay in the pool.
+inline bool PoolFollowMode() {
+  return g_pool.follow_moving.load(std::memory_order_relaxed) && !g_pool.exclude_moving.load(std::memory_order_relaxed);
+}
+
+// Caller holds g_pool.mutex. Follow mode, a camera sighting of a mesh flagged
+// dynamic: the instance at prevWorld moves to world (its pose follows the
+// object). Without one, a moving pose is admitted directly when a copy of its
+// key may follow it; otherwise it is not admitted.
+// Translation distance of two 4x3 matrices (row-major, translation in [3], [7], [11]).
+inline float PoolTranslationDistance(const float* a, const float* b) {
+  const float dx = a[3] - b[3], dy = a[7] - b[7], dz = a[11] - b[11];
+  return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+inline void FollowPoolMovingInstance(uint64_t mesh_key, uint32_t vs_hash, const float* world, const float* prev_world,
+                                     bool copy_follow, uint32_t frame, PoolSightingVerdict verdict) {
+  if (!PoolFollowMode() || verdict == PoolSightingVerdict::Unknown) return;
+  const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
+  if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) return;
+  const uint32_t mesh_id = mesh_it->second;
+  if (!g_pool.meshes[mesh_id].dynamic) return;
+  if (std::memcmp(world, prev_world, sizeof(float) * kPoolWorldFloats) != 0) {
+    // One scan picks the target: the instance at prevWorld, else (Moving only) the
+    // nearest relink candidate of this key that was followed within the window.
+    WorldInstance* target = nullptr;
+    WorldInstance* relink = nullptr;
+    float relink_distance = 3.0e38f;
+    const float step = PoolTranslationDistance(world, prev_world);
+    const bool world_finite = std::isfinite(world[3]) && std::isfinite(world[7]) && std::isfinite(world[11]);
+    for (WorldInstance& instance : g_pool.instances) {
+      if (instance.mesh_id != mesh_id) continue;
+      if (std::memcmp(instance.matrix, prev_world, sizeof(float) * kPoolWorldFloats) == 0) {
+        target = &instance;
+        break;
+      }
+      if (!world_finite || verdict != PoolSightingVerdict::Moving || !instance.dynamic || instance.mesh_key != mesh_key) continue;
+      if (instance.last_follow_frame >= frame || frame - instance.last_follow_frame > kPoolFollowRelinkFrames) continue;
+      const float gap = static_cast<float>(frame - instance.last_follow_frame);
+      const float limit = (gap + 1.f) * (std::max)(step, 0.02f) * 1.5f + 0.1f;
+      const float distance = PoolTranslationDistance(instance.matrix, world);
+      if (distance <= limit && distance < relink_distance) {
+        relink = &instance;
+        relink_distance = distance;
+      }
+    }
+    WorldInstance* picked = target != nullptr ? target : relink;
+    if (picked != nullptr) {
+      float bounds_min[3] = {};
+      float bounds_max[3] = {};
+      if (!ComputePoolInstanceBounds(g_pool.meshes[mesh_id], world, bounds_min, bounds_max)) {
+        g_pool.stats.follow_rejected_bounds += 1u;
+        return;
+      }
+      WorldInstance& instance = *picked;
+      const uint64_t old_hash = MatrixHash(instance.matrix, kPoolWorldFloats);
+      const uint64_t new_hash = MatrixHash(world, kPoolWorldFloats);
+      g_pool.admitted_keys.erase(PoolAdmittedKey(mesh_id, old_hash));
+      g_pool.admitted_keys.insert(PoolAdmittedKey(mesh_id, new_hash));
+      std::memcpy(instance.matrix, world, sizeof(float) * kPoolWorldFloats);
+      ComputeMatrixInverse(instance.matrix, instance.inverse_world);
+      std::memcpy(instance.bounds_min, bounds_min, sizeof(bounds_min));
+      std::memcpy(instance.bounds_max, bounds_max, sizeof(bounds_max));
+      if (!instance.dynamic) g_pool.revision += 1u;  // a new dynamic instance is re-partitioned by a rebuild
+      instance.dynamic = true;
+      instance.last_follow_frame = frame;
+      instance.follows += 1u;
+      const auto dynamic = g_pool.dynamic_keys.find(mesh_key);
+      if (dynamic != g_pool.dynamic_keys.end()) dynamic->second.follows += 1u;
+      // The observation of the old pose continues at the new one. If the new pose
+      // already has an observation, insert() hands the node back and the old counts
+      // are dropped (observation re-key semantics are unchanged).
+      auto node = g_pool.observations.extract(InstanceKey{mesh_key, old_hash});
+      if (!node.empty()) {
+        node.key() = InstanceKey{mesh_key, new_hash};
+        ObservedInstance& observed = node.mapped();
+        std::memcpy(observed.matrix, world, sizeof(float) * kPoolWorldFloats);
+        observed.admitted = true;
+        observed.first_frame = frame;
+        g_pool.observations.insert(std::move(node));
+      }
+      if (target == nullptr) g_pool.stats.follow_relinks += 1u;
+      g_pool.dynamic_revision += 1u;
+      g_pool.stats.follow_hits += 1u;
+      return;
+    }
+  }
+  if (verdict != PoolSightingVerdict::Moving) return;
+  if (!copy_follow) {
+    g_pool.stats.follow_misses_skipped += 1u;
+    return;
+  }
+  const uint64_t matrix_hash = MatrixHash(world, kPoolWorldFloats);
+  if (g_pool.admitted_keys.count(PoolAdmittedKey(mesh_id, matrix_hash)) != 0u) return;
+  ObservedInstance& observed = g_pool.observations[InstanceKey{mesh_key, matrix_hash}];
+  if (observed.rejected) return;
+  if (observed.count == 0u) observed.first_frame = frame;
+  observed.vs_hash = vs_hash;
+  std::memcpy(observed.matrix, world, sizeof(float) * kPoolWorldFloats);
+  if (AdmitPoolInstance(observed, mesh_key, mesh_id, true)) g_pool.stats.follow_admits += 1u;
+}
 
 // Caller holds g_pool.mutex. Before ObservePoolInstance of the same sighting
 // (whether its (mesh, world) was seen in an earlier frame is read here).
@@ -1985,22 +2163,27 @@ inline void CountPoolSkip(PoolFamilyStats& family, PoolSkip skip, PoolDrawState 
   }
 }
 
-// Caller holds g_pool.mutex. Applies the per-identity cooldown and checks the
-// write slot; on None, `*out_schedule` is the identity to stamp after copying.
+// Caller holds g_pool.mutex. Normal copies apply the per-identity cooldown; all
+// kinds respect the slot; Follow is also limited to its share of the slot. On
+// None, `*out_schedule` is the identity to stamp after copying.
 inline PoolSkip ReservePoolCopy(
     reshade::api::device* device,
     uint64_t schedule_key,
     uint32_t frame,
     uint64_t bytes,
     PoolSchedule** out_schedule,
-    bool bypass_cooldown) {
+    PoolCopyKind kind) {
   PoolSchedule& schedule = g_pool.schedule[schedule_key];
   const PoolStagingSlot& slot = g_pool.slots[g_pool.write_slot];
-  if (!bypass_cooldown && schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
+  if (kind == PoolCopyKind::Normal && schedule.next_frame != 0u && schedule.copy_frame != frame && frame < schedule.next_frame) {
     return PoolSkip::Cooldown;
   }
   if (g_pool.staging_device != device || slot.buffer.handle == 0u || slot.resolving) return PoolSkip::NoStaging;
   if (slot.used + bytes > kPoolStagingSlotBytes) return PoolSkip::BudgetFull;
+  if (kind == PoolCopyKind::Follow && slot.follow_used + bytes > kPoolStagingSlotBytes / kPoolFollowSlotShare) {
+    g_pool.stats.follow_budget_skips += 1u;
+    return PoolSkip::BudgetFull;
+  }
   *out_schedule = &schedule;
   return PoolSkip::None;
 }
@@ -2309,6 +2492,9 @@ inline void OnPoolScanDraw(
 
     if (skip == PoolSkip::None) {
       const uint64_t schedule_key = PoolScheduleKey(mesh_key, draw.first_instance, count);
+      const auto known_schedule = g_pool.schedule.find(schedule_key);
+      const bool follow = (gate.pass & kPoolPassCamera) != 0u && known_schedule != g_pool.schedule.end()
+                          && known_schedule->second.follow;
       const uint64_t copy_bytes = kPoolCbCopyBytes + static_cast<uint64_t>(count) * kPoolInstanceStride;
       bool traced = false;  // a key in trace state: its copy may bypass the cooldown
       if ((gate.pass & kPoolPassCamera) != 0u) {
@@ -2317,13 +2503,14 @@ inline void OnPoolScanDraw(
         }
       }
       PoolSchedule* schedule = nullptr;
-      skip = ReservePoolCopy(device, schedule_key, frame, copy_bytes, &schedule, false);
+      skip = ReservePoolCopy(device, schedule_key, frame, copy_bytes, &schedule,
+                             follow ? PoolCopyKind::Follow : PoolCopyKind::Normal);
       const bool trace_only = traced && skip == PoolSkip::Cooldown;
       uint32_t copy_count = count;
       if (trace_only) {
         copy_count = (std::min)(count, kPoolTraceMaxElements);
         skip = ReservePoolCopy(device, schedule_key, frame, kPoolCbCopyBytes + static_cast<uint64_t>(copy_count) * kPoolInstanceStride,
-                               &schedule, true);
+                               &schedule, PoolCopyKind::Trace);
         trace_declined = skip != PoolSkip::None;  // not a normal skip: not counted
       }
       if (skip == PoolSkip::None) {
@@ -2339,6 +2526,8 @@ inline void OnPoolScanDraw(
         copy.ps_hash = draw.ps_hash;
         copy.pass = gate.pass;
         copy.mesh_key = mesh_key;
+        copy.schedule_key = schedule_key;
+        copy.follow = follow;
         copy.trace_only = trace_only;
         // The b1 copy is recorded before this draw, so it holds exactly the
         // offset the draw reads; resolve compares it to `base`.
@@ -2346,6 +2535,7 @@ inline void OnPoolScanDraw(
         commands[command_count++] = {slice.instance_buffer, static_cast<uint64_t>(slice.base) * kPoolInstanceStride,
                                      slot.buffer, copy.slice_offset, slice_bytes};
         slot.used += kPoolCbCopyBytes + slice_bytes;
+        if (follow) slot.follow_used += kPoolCbCopyBytes + slice_bytes;
         slot.copies.push_back(copy);
         if (!trace_only) {
           schedule->copy_frame = frame;
@@ -2431,12 +2621,14 @@ inline void OnPoolScanIndirectDraw(
       uint32_t window = max_window;
       const auto known = g_pool.schedule.find(schedule_key);
       const bool learned = known != g_pool.schedule.end() && known->second.indirect_window != 0u;
+      const bool follow = (gate.pass & kPoolPassCamera) != 0u && known != g_pool.schedule.end() && known->second.follow;
       if (learned) window = (std::min)(known->second.indirect_window, max_window);
       const uint64_t bytes =
           kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
       PoolSchedule* schedule = nullptr;
       if (sub_skip == PoolSkip::None) {
-        sub_skip = ReservePoolCopy(device, schedule_key, frame, bytes, &schedule, false);
+        sub_skip = ReservePoolCopy(device, schedule_key, frame, bytes, &schedule,
+                                   follow ? PoolCopyKind::Follow : PoolCopyKind::Normal);
       }
       if (sub_skip != PoolSkip::None) {
         CountPoolSkip(family, sub_skip, gate.state);
@@ -2456,6 +2648,7 @@ inline void OnPoolScanIndirectDraw(
       copy.pass = gate.pass;
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
       copy.schedule_key = schedule_key;
+      copy.follow = follow;
       PoolCopyCommand* sub_commands = commands.data() + command_count;
       sub_commands[0] = {slice.instance_cb, 0u, slot.buffer, copy.cb_offset, slice.cb_bytes};
       sub_commands[1] = {args_buffer, sub_args_offset, slot.buffer, copy.args_offset, kPoolIndirectArgsCopyBytes};
@@ -2463,6 +2656,7 @@ inline void OnPoolScanIndirectDraw(
                          copy.slice_offset, static_cast<uint64_t>(window) * kPoolInstanceStride};
       command_count += 3u;
       slot.used += bytes;
+      if (follow) slot.follow_used += bytes;
       slot.copies.push_back(copy);
       slot.indirect_draws.push_back(draw);
       AddPoolIndirectRefs(draw);
@@ -2851,7 +3045,8 @@ inline void LogPoolSwitches() {
   renodx::utils::log::i("falcom_world::pool: frame ", g_state.frame.load(), " switches: pool scan ", on(g_pool.scan_active),
                         ", capture meshes ", on(g_pool.capture_meshes), ", scan indirect draws ", on(g_pool.scan_indirect),
                         ", verify mesh captures ", on(g_pool.verify_meshes), ", legacy scale limits ",
-                        on(g_pool.legacy_scale), ", keep moving objects out ", on(g_pool.exclude_moving));
+                        on(g_pool.legacy_scale), ", keep moving objects out ", on(g_pool.exclude_moving),
+                        ", follow moving objects ", on(g_pool.follow_moving));
 }
 
 // Short text for how a VB/IB was created (reshade::api resource_usage /
@@ -3056,6 +3251,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     PoolStagingSlot& slot = g_pool.slots[slot_index];
     if (slot.copies.empty() && slot.mesh_copies.empty()) {
       slot.used = 0u;
+      slot.follow_used = 0u;
       slot.mesh_used = 0u;
       slot.indirect_draws.clear();
       return;
@@ -3085,6 +3281,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     slot.mesh_copies.clear();
     buffer = slot.buffer;
     used = slot.used;
+    g_pool.stats.max_slot_used = (std::max)(g_pool.stats.max_slot_used, slot.used);
+    g_pool.stats.max_follow_used = (std::max)(g_pool.stats.max_follow_used, slot.follow_used);
     mesh_buffer = slot.mesh_buffer;
     mesh_used = slot.mesh_used;
     slot.resolving = true;
@@ -3174,6 +3372,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     PoolStagingSlot& slot = g_pool.slots[slot_index];
     slot.resolving = false;
     slot.used = 0u;
+    slot.follow_used = 0u;
     slot.mesh_used = 0u;
 
     g_pool.resolve_camera_valid = camera.valid;
@@ -3380,7 +3579,16 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         if (verdict != PoolSightingVerdict::Unknown) {
           NotePoolCameraMotion(mesh_key, copy.vs_hash, world, prev_world, indirect, copy.frame, verdict);
         }
+        if ((copy.pass & kPoolPassCamera) != 0u) {
+          FollowPoolMovingInstance(mesh_key, copy.vs_hash, world, prev_world, copy.follow, copy.frame, verdict);
+        }
         ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame, &sighting, &visibility[index]);
+      }
+      const auto schedule = g_pool.schedule.find(copy.schedule_key);
+      if (schedule != g_pool.schedule.end()) {
+        const auto dynamic = g_pool.dynamic_keys.find(mesh_key);
+        schedule->second.follow = (copy.pass & kPoolPassCamera) != 0u && PoolFollowMode()
+                                  && dynamic != g_pool.dynamic_keys.end() && dynamic->second.moving_now;
       }
     }
   }
@@ -3443,6 +3651,10 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     if (scanning) {
       if (g_pool.stats.scan_first_frame == 0u) g_pool.stats.scan_first_frame = frame;
       g_pool.stats.scan_last_frame = frame;
+      if (!g_pool.scan_continuous) g_pool.scan_since = frame;
+      g_pool.scan_continuous = true;
+    } else {
+      g_pool.scan_continuous = false;
     }
     if (g_pool.staging_device == device) {
       // The slot the next frame writes was filled three frames ago; its
@@ -3462,6 +3674,9 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if ((frame % 60u) == 0u) PrunePool(frame);
+    if ((frame % 10u) == 0u && g_pool.scan_continuous && frame >= g_pool.scan_since + kPoolMovingHoldFrames) {
+      RetirePoolOrphans(frame);
+    }
     UpdatePoolStats();
     const uint32_t invalidations = g_pool.stats.resource_invalidations;
     released = invalidations >= g_pool.logged_invalidations ? invalidations - g_pool.logged_invalidations : invalidations;
@@ -3588,6 +3803,7 @@ inline void ResetWorldPool() {
       slot.copies.clear();
       slot.indirect_draws.clear();
       slot.used = 0u;
+      slot.follow_used = 0u;
       slot.mesh_copies.clear();
       slot.mesh_used = 0u;
     }
@@ -3784,7 +4000,8 @@ inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDyna
         << ", \"last_frame\": " << entry.last_frame << ", \"moving_sightings\": " << entry.moving_sightings
         << ", \"indirect_sightings\": " << entry.indirect_sightings
         << ", \"max_meters\": " << PoolJsonFloat{entry.max_meters} << ", \"max_basis\": " << PoolJsonFloat{entry.max_basis}
-        << ", \"retired_instances\": " << entry.retired_instances << ", \"blocked\": " << entry.blocked
+        << ", \"retired_instances\": " << entry.retired_instances << ", \"retired_orphans\": " << entry.retired_orphans
+        << ", \"blocked\": " << entry.blocked << ", \"follows\": " << entry.follows
         << ", \"moving_now\": " << (entry.moving_now ? "true" : "false") << ", \"released\": " << entry.released;
     if (item.has_mesh) {
       out << ", \"mesh_id\": " << item.mesh_id << ", \"mesh_uid\": " << item.mesh_uid
@@ -4021,7 +4238,7 @@ inline void DumpWorldPool() {
 
   std::ostringstream out;
   out << "{\n";
-  out << "  \"schema\": 9,\n";
+  out << "  \"schema\": 11,\n";
   out << "  \"generated_frame\": " << g_state.frame.load() << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
@@ -4031,7 +4248,14 @@ inline void DumpWorldPool() {
       << ", \"scan_indirect\": " << (g_pool.scan_indirect.load() ? "true" : "false")
       << ", \"verify_meshes\": " << (g_pool.verify_meshes.load() ? "true" : "false")
       << ", \"legacy_scale\": " << (g_pool.legacy_scale.load() ? "true" : "false")
-      << ", \"exclude_moving\": " << (g_pool.exclude_moving.load() ? "true" : "false") << "},\n";
+      << ", \"exclude_moving\": " << (g_pool.exclude_moving.load() ? "true" : "false")
+      << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false") << "},\n";
+  out << "  \"follow\": {\"hits\": " << g_pool.stats.follow_hits << ", \"admits\": " << g_pool.stats.follow_admits
+      << ", \"misses_skipped\": " << g_pool.stats.follow_misses_skipped
+      << ", \"rejected_bounds\": " << g_pool.stats.follow_rejected_bounds
+      << ", \"budget_skips\": " << g_pool.stats.follow_budget_skips << ", \"orphans\": " << g_pool.stats.orphans
+      << ", \"relinks\": " << g_pool.stats.follow_relinks << ", \"orphans_retired\": " << g_pool.stats.orphans_retired
+      << ", \"max_slot_used\": " << g_pool.stats.max_slot_used << ", \"max_follow_used\": " << g_pool.stats.max_follow_used << "},\n";
   out << "  \"region\": {\"size\": " << region.size
       << ", \"min\": [" << region.min[0] << ", " << region.min[1] << ", " << region.min[2]
       << "], \"max\": [" << region.max[0] << ", " << region.max[1] << ", " << region.max[2] << "]},\n";

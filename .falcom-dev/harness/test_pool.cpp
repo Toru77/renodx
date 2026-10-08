@@ -6,6 +6,7 @@
 #include <iterator>
 #include <map>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -79,6 +80,7 @@ int main() {
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   fixture::RegisterLayout();
 
+  HStage("shaders and buffers");
   // Shaders (real game bytecode).
   const uint64_t kRigid = 0xA1, kRigidShadow = 0xA3, kSkinned = 0xA2, kOpaque = 0xB1, kAlpha = 0xB2;
   Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
@@ -167,9 +169,11 @@ int main() {
   };
 
   bvh::g_pool.scan_active.store(true);
+  HStage("admission");
   // Admission mechanics as before P2a: "G moving" shares its mesh content
   // with A/B/C, which the mesh-level P2a flag would take out (test_motion).
   bvh::g_pool.exclude_moving.store(false);
+  bvh::g_pool.follow_moving.store(false);
   int frame = 1;
   for (; frame <= 40; ++frame) run_frame(frame, false);
   {
@@ -215,6 +219,7 @@ int main() {
     CHECK(bvh::g_pool.instances.size() == 8, "instances unchanged %zu", bvh::g_pool.instances.size());
   }
 
+  HStage("release and retire");
   // Releasing vb3 retires D's mesh and its three instances; vb1/vb2 remain.
   bvh::OnDestroyResourcePool(&dev, vb3);
   objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb3.handle; }), objects.end());
@@ -242,6 +247,7 @@ int main() {
     CHECK(p.instances.size() == 1 && p.instances[0].matrix[3] == 30.f, "only C remains (%zu)", p.instances.size());
   }
 
+  HStage("reused VB handle");
   // A reused VB handle with new content starts from scratch.
   resource vb4;
   dev.next = vb3.handle;  // force handle reuse

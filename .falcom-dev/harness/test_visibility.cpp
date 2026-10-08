@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <string>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -148,6 +149,7 @@ int main() {
     CHECK(near_fade == 3, "registry entries carry flags (%d)", near_fade);
   }
 
+  HStage("fade formula");
   // Fade formula.
   {
     float lo, hi;
@@ -278,6 +280,7 @@ int main() {
     }
   }
 
+  HStage("later sightings");
   // Later sightings refresh the inputs (B's start moves to 2 m) and ask for a
   // TLAS rebuild once; unchanged sightings do not.
   uint64_t visibility_before = 0u;
@@ -315,6 +318,7 @@ int main() {
           (unsigned long long)visibility_before, (unsigned long long)bvh::g_pool.visibility_revision);
   }
 
+  HStage("dump");
   // Dump: scene constants and the visibility section.
   {
     std::lock_guard lock(falcom_world::g_state.mutex);
@@ -331,7 +335,7 @@ int main() {
   {
     std::ifstream f(bvh::PoolOutputDir() / "world_pool.json");
     const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
+    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
     CHECK(text.find("\"scene\": {\"fade_constants\": true") != std::string::npos, "scene constants");
     CHECK(text.find("\"visibility\": {\"instances\": 7, \"camera_visible\": 5, \"shadow_only\": 2") != std::string::npos
               && text.find("\"with_inputs\": 7") != std::string::npos, "visibility summary");

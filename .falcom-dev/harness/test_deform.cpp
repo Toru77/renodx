@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "src/games/falcomengine-plus/world/bvh/deform_probe.hpp"
 
 using namespace reshade::api;
@@ -187,6 +188,7 @@ int main() {
   Classify(&dev, kSkinLight, "0x0417B98E.vs.cso");
   Classify(&dev, kRigid, "0x095017A3.vs.cso");
 
+  HStage("1. Output signature and layout from the real bytecode.");
   // 1. Output signature and layout from the real bytecode.
   {
     const auto code = contract::LookupDeformingCode(kSkin);
@@ -228,11 +230,13 @@ int main() {
     return bvh::DeformShader{};
   };
 
+  HStage("2. Off: nothing happens.");
   // 2. Off: nothing happens.
   bvh::OnDeformProbeDraw(&dev, &cl, draw_for(kSkin, 300, 1));
   present();
   CHECK(cl.calls.empty() && dev.resources_alive == 0 && row(kSkin).draws == 0u, "off: no work");
 
+  HStage("3. On: resources at the first present, shader at the first draw, probe at the next.");
   // 3. On: resources at the first present, shader at the first draw, probe at the next.
   bvh::g_deform.enabled.store(true);
   present();
@@ -263,6 +267,7 @@ int main() {
     CHECK(shader.last.candidates.size() == 6u && shader.last.candidates[4].error[0] > 1.f, "TEXCOORD5 (clip copy) rejected");
   }
 
+  HStage("4. Light-view, rigid and deferred draws.");
   // 4. Light-view, rigid and deferred draws.
   cl.calls.clear();
   bvh::OnDeformProbeDraw(&dev, &cl, draw_for(kSkinLight, 300, 1));
@@ -274,12 +279,14 @@ int main() {
   CHECK(row(kSkin).skips[(size_t)bvh::DeformSkip::Deferred] == 1u, "deferred");
   CHECK(bvh::SnapshotDeformShaders(nullptr).size() == 2u, "rigid VS not tracked");
 
+  HStage("5. Game state in the way: nothing bound, reason counted.");
   // 5. Game state in the way: nothing bound, reason counted.
   g_game_state = bvh::DeformSkip::GameGeometryShader;
   bvh::OnDeformProbeDraw(&dev, &cl, draw_for(kSkin, 300, 1));
   CHECK(cl.calls.empty() && row(kSkin).skips[(size_t)bvh::DeformSkip::GameGeometryShader] == 1u, "game GS");
   g_game_state = bvh::DeformSkip::None;
 
+  HStage("6. Overflow (fewer primitives written) and a camera from another frame.");
   // 6. Overflow (fewer primitives written) and a camera from another frame.
   scene.drop_primitives = 1;
   bvh::OnDeformProbeDraw(&dev, &cl, draw_for(kSkin, 300, 1));
@@ -293,6 +300,7 @@ int main() {
   camera_follows = true;
   CHECK(row(kSkin).read_fails[(size_t)bvh::DeformReadFail::CameraFrame] == 1u, "camera frame");
 
+  HStage("7. No world output; then not-ready statistics.");
   // 7. No world output; then not-ready statistics.
   for (int i = 0; i < 30; ++i) present();
   scene.world_output = false;
@@ -317,6 +325,7 @@ int main() {
     CHECK(row(kSkin).read_fails[(size_t)bvh::DeformReadFail::QueryError] == 1u, "query error");
   }
 
+  HStage("8. Transposed convention (direct evaluation).");
   // 8. Transposed convention (direct evaluation).
   {
     scene.transposed = true;
@@ -327,6 +336,7 @@ int main() {
     CHECK(row(kSkin).convention == 1u && row(kSkin).last.chosen == 2, "transposed found");
   }
 
+  HStage("9. Too large for a slot; create failure for another shader.");
   // 9. Too large for a slot; create failure for another shader.
   {
     for (int i = 0; i < 30; ++i) present();
@@ -342,6 +352,7 @@ int main() {
     CHECK(wind.create_failed && wind.create_hr == static_cast<int32_t>(0x80070057u) && wind.skips[(size_t)bvh::DeformSkip::ShaderCreateFailed] == 2u, "create failure kept");
   }
 
+  HStage("9b. Indirect draws: the capture takes the rest of the slot; the size comes from the statistics.");
   // 9b. Indirect draws: the capture takes the rest of the slot; the size comes from the statistics.
   {
     const uint64_t kSkinIndirect = 0x51E;
@@ -390,6 +401,7 @@ int main() {
     dev.destroy_resource(args);
   }
 
+  HStage("10. Pipeline destroyed: its shader is released at the next present; dump.");
   // 10. Pipeline destroyed: its shader is released at the next present; dump.
   {
     contract::OnDestroyPipelineClassify(&dev, pipeline{kSkin});
@@ -405,6 +417,7 @@ int main() {
     CHECK(text.find("\"world_output\": \"-\"") != std::string::npos && text.find("\"light_view\": 1") != std::string::npos, "dump rows");
   }
 
+  HStage("11. Re-classified handle with another bytecode resets its entry.");
   // 11. Re-classified handle with another bytecode resets its entry.
   {
     Classify(&dev, kSkin, "0x37E8915A.vs.cso");
@@ -413,6 +426,7 @@ int main() {
     CHECK(shader.probes == 0u && shader.draws == 1u, "fresh entry for new bytecode");
   }
 
+  HStage("12. Off: everything released.");
   // 12. Off: everything released.
   bvh::g_deform.enabled.store(false);
   present();

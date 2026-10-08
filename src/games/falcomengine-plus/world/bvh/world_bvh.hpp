@@ -311,6 +311,16 @@ inline void DrawBvhPanel() {
                       "leaves no copy behind where it stopped. Until the per-frame path exists, moving\n"
                       "objects are absent from the BVH. Off: admitted as before (applies at once).");
   }
+  bool follow_moving = g_pool.follow_moving.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Moving objects follow their pose", &follow_moving)) {
+    g_pool.follow_moving.store(follow_moving, std::memory_order_relaxed);
+    switches_changed = true;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Moving objects keep their instances and each one moves to the pose the object\n"
+                      "has now (a copy of a moving object is taken every frame). Off: the old behaviour.\n"
+                      "Ignored while \"Keep moving objects out\" is on.");
+  }
   bool log_crashes = CrashLogEnabled();
   if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
   if (ImGui::IsItemHovered()) {
@@ -441,6 +451,10 @@ inline void DrawBvhPanel() {
     ImGui::Text("Moving objects: %zu draw keys moving now (%zu seen), %zu meshes flagged, %u instances removed, %llu admissions refused",
                 stats.dynamic_moving_keys, stats.dynamic_live_keys, stats.dynamic_meshes, stats.dynamic_retired,
                 static_cast<unsigned long long>(stats.dynamic_blocked));
+    ImGui::TextDisabled("  follow: %llu pose updates, %llu relinked, %llu admitted directly, %llu orphans (%llu retired), %llu budget skips",
+                        static_cast<unsigned long long>(stats.follow_hits), static_cast<unsigned long long>(stats.follow_relinks),
+                        static_cast<unsigned long long>(stats.follow_admits), static_cast<unsigned long long>(stats.orphans),
+                        static_cast<unsigned long long>(stats.orphans_retired), static_cast<unsigned long long>(stats.follow_budget_skips));
     ImGui::TextDisabled("  rule: %llu camera sightings with prevWorld differing, %llu stale (matrix seen before, not moving)",
                         static_cast<unsigned long long>(motion.rule_moving), static_cast<unsigned long long>(motion.rule_stale));
     if (stats.dynamic_cap_drops != 0u) ImGui::TextDisabled("  moving keys not recorded (cap): %u", stats.dynamic_cap_drops);
@@ -642,6 +656,9 @@ inline void DrawBvhPanel() {
               live_stats.tlas_rebuilds != 0u && frame >= live_stats.tlas_frame ? frame - live_stats.tlas_frame : 0u);
   ImGui::Text("CPU time: mesh uploads %.2f ms (max %.2f)  TLAS %.2f ms (max %.2f)",
               live_stats.mesh_ms_last, live_stats.mesh_ms_max, live_stats.tlas_ms_last, live_stats.tlas_ms_max);
+  ImGui::Text("TLAS refits %u (%u instances last, lag last %u, max %u frames)  refit %.2f ms (max %.2f)  missing %u  failures %u",
+              live_stats.tlas_refits, live_stats.refit_instances, live_stats.refit_lag_last, live_stats.refit_lag_max,
+              live_stats.refit_ms_last, live_stats.refit_ms_max, live_stats.refit_missing, live_stats.refit_failures);
   if (data->trace_timer.last_ms >= 0.f) {
     ImGui::SameLine();
     ImGui::Text("  GPU trace (debug view) %.2f ms", data->trace_timer.last_ms);

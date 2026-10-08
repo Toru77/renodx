@@ -10,6 +10,7 @@
 #include <iterator>
 #include <map>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -83,6 +84,7 @@ static void Place(float* m, float x, float y = 0.f, float z = 0.f, float rot = 0
 }
 
 int main() {
+  HStage("0. ULP distance and buckets.");
   // 0. ULP distance and buckets.
   {
     const float one = 1.f, next = std::nextafter(1.f, 2.f);
@@ -144,6 +146,20 @@ int main() {
 
   uint64_t cursor = 777;
   std::vector<Object> objects;
+  bool check_every_frame = false;
+  // Ids strictly ascending; one admitted key per instance; every instance's key present.
+  auto check_invariants = [&]() {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (size_t i = 1; i < bvh::g_pool.instances.size(); ++i) {
+      CHECK(bvh::g_pool.instances[i - 1].id < bvh::g_pool.instances[i].id, "ids ascending at %zu", i);
+    }
+    CHECK(bvh::g_pool.admitted_keys.size() == bvh::g_pool.instances.size(), "admitted keys %zu, instances %zu",
+          bvh::g_pool.admitted_keys.size(), bvh::g_pool.instances.size());
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      CHECK(bvh::g_pool.admitted_keys.count(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, bvh::kPoolWorldFloats))) != 0u,
+            "instance key present (id %llu)", (unsigned long long)inst.id);
+    }
+  };
   auto run_frame = [&]() {
     const uint32_t frame = falcom_world::g_state.frame.load();
     for (size_t index = 0; index < objects.size(); ++index) {
@@ -177,6 +193,7 @@ int main() {
     }
     falcom_world::g_state.frame.fetch_add(1u);
     bvh::DrainPoolScan(&dev, &queue);
+    if (check_every_frame) check_invariants();
   };
   auto run = [&](int frames) { for (int i = 0; i < frames; ++i) run_frame(); };
   auto snapshot = [&]() {
@@ -205,10 +222,12 @@ int main() {
   };
 
   bvh::g_pool.scan_active.store(true);
-  CHECK(bvh::g_pool.exclude_moving.load(), "keep moving objects out: on by default");
-  // Sections 1-6 test the probe alone: P2a off (admission as before).
+  CHECK(!bvh::g_pool.exclude_moving.load() && bvh::g_pool.follow_moving.load(), "keep moving objects out off, follow on by default");
+  // Sections 1-6 test the probe alone: P2a and follow off (admission as before).
   bvh::g_pool.exclude_moving.store(false);
+  bvh::g_pool.follow_moving.store(false);
 
+  HStage("1. Static, prevWorld == world: every sighting after the first frame is a");
   // 1. Static, prevWorld == world: every sighting after the first frame is a
   // repeat in ULP bucket 0; nothing moves; admission as before.
   {
@@ -231,6 +250,7 @@ int main() {
     CHECK(f.motion_repeat == m.repeat && f.motion_first == 2u && f.motion_moved == 0u, "family counts");
   }
 
+  HStage("2. Static with prevWorld one ULP off in the translation: repeat in bucket");
   // 2. Static with prevWorld one ULP off in the translation: repeat in bucket
   // 1, not moved; the legacy bitwise counter counts it.
   {
@@ -249,6 +269,7 @@ int main() {
     CHECK(s.admitted == 1u, "admitted");
   }
 
+  HStage("3. A moving object (5 cm per frame, prevWorld = last frame's world):");
   // 3. A moving object (5 cm per frame, prevWorld = last frame's world):
   // every sighting is a first sighting that moved; never admitted.
   {
@@ -284,6 +305,7 @@ int main() {
           "family moved");
   }
 
+  HStage("4. Ghosts: moves, stops (admitted there), moves, stops elsewhere: two");
   // 4. Ghosts: moves, stops (admitted there), moves, stops elsewhere: two
   // admitted instances of one mesh; the dump lists them.
   {
@@ -302,13 +324,14 @@ int main() {
     CHECK(m.moved > 0u && m.repeat > 0u && m.moved_repeat == 0u, "moved and stopped");
     CHECK(s.admitted == 2u, "admitted at both stops (%zu)", s.admitted);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
+    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
     CHECK(text.find("\"admitted_of_moved_meshes\": 2") != std::string::npos, "ghost count in dump");
     CHECK(text.find("\"vs_hash\": \"0x00001000\", \"admitted\": 2}") != std::string::npos
               || text.find("\"admitted\": 2}") != std::string::npos, "moved mesh listed with 2 admitted");
     std::ofstream("motion_dump.json") << text;
   }
 
+  HStage("5. Mixed instanced draw: element 1 of 3 moves; draw counted as moving");
   // 5. Mixed instanced draw: element 1 of 3 moves; draw counted as moving
   // but not all-moving; the sample says 1 of 3.
   {
@@ -329,6 +352,7 @@ int main() {
     CHECK(s.admitted == 2u, "static siblings admitted (%zu)", s.admitted);
   }
 
+  HStage("6. Rotation in place, a non-finite prevWorld, and a static object whose");
   // 6. Rotation in place, a non-finite prevWorld, and a static object whose
   // prevWorld is far off (contradiction: repeat sample, moved_repeat).
   {
@@ -371,6 +395,7 @@ int main() {
   // ---- P2a: moving rigid objects ----
   bvh::g_pool.exclude_moving.store(true);
 
+  HStage("8. The rule.");
   // 8. The rule.
   {
     float w[12], p[12];
@@ -400,6 +425,7 @@ int main() {
     CHECK(!bvh::PoolSightingMoves(w, p), "non-finite prevWorld");
   }
 
+  HStage("9. Static, then moves, then stops: the static instance is removed when it");
   // 9. Static, then moves, then stops: the static instance is removed when it
   // is seen moving and no pose is admitted afterwards; a static neighbor is
   // unaffected; the dump lists the moving key with its evidence.
@@ -447,10 +473,12 @@ int main() {
     std::ofstream("motion_dump3.json") << text;
   }
 
+  HStage("10. Switch off: the stopped object's pose admits again at its next");
   // 10. Switch off: the stopped object's pose admits again at its next
   // sighting; on again: removed again.
   {
     bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(false);
     run(80);
     auto s = snapshot();
     CHECK(s.admitted == 2u && s.dynamic_meshes == 0u, "off: re-admitted (%zu, flagged %zu)", s.admitted, s.dynamic_meshes);
@@ -460,6 +488,7 @@ int main() {
     CHECK(s.admitted == 2u && s.dynamic_meshes == 0u, "on again: released key not re-flagged (%zu)", s.admitted);
   }
 
+  HStage("11. Same mesh content through another draw key: the static copy goes");
   // 11. Same mesh content through another draw key: the static copy goes
   // with it (mesh-level flag); a light-view draw of a static object with zero
   // prevWorld flags nothing.
@@ -486,6 +515,7 @@ int main() {
     CHECK(s.admitted == 1u && s.dynamic_retired == 1u, "static copy of the same mesh removed; light-view object stays");
   }
 
+  HStage("12. Seen moving before its mesh is captured: flagged at capture, never");
   // 12. Seen moving before its mesh is captured: flagged at capture, never
   // admitted.
   {
@@ -499,6 +529,7 @@ int main() {
           "flagged at capture (meshes %zu flagged %zu admitted %zu)", s.meshes, s.dynamic_meshes, s.admitted);
   }
 
+  HStage("13. The buffer is released: its key leaves the dynamic set with it.");
   // 13. The buffer is released: its key leaves the dynamic set with it.
   {
     std::vector<uint64_t> vbs;
@@ -510,6 +541,7 @@ int main() {
     CHECK(s.dynamic_live_keys == 0u && s.meshes == 0u, "released (keys %zu meshes %zu)", s.dynamic_live_keys, s.meshes);
   }
 
+  HStage("14. An unmoved object whose prevWorld is off (the M1 contradiction case)");
   // 14. An unmoved object whose prevWorld is off (the M1 contradiction case)
   // is flagged too, and counted and sampled as a rule failure.
   {
@@ -522,6 +554,7 @@ int main() {
           "stale rule sightings counted and sampled (%llu)", (unsigned long long)s.motion.rule_stale);
   }
 
+  HStage("15. Identity prevWorld (not filled) never moves an object.");
   // 15. Identity prevWorld (not filled) never moves an object.
   {
     fresh();
@@ -534,6 +567,7 @@ int main() {
           "identity prevWorld: static over 150 frames (admitted %zu, keys %zu)", s.admitted, s.dynamic_live_keys);
   }
 
+  HStage("16. Two instances under one draw key: the moving one flags the key's mesh;");
   // 16. Two instances under one draw key: the moving one flags the key's mesh;
   // the static one is not admitted with it.
   {
@@ -549,6 +583,7 @@ int main() {
           s.dynamic_meshes, s.admitted, (unsigned long long)s.dynamic_blocked);
   }
 
+  HStage("17. Two keys share a mesh: one stops and is released; the other still");
   // 17. Two keys share a mesh: one stops and is released; the other still
   // moves, so the shared mesh stays flagged.
   {
@@ -570,6 +605,7 @@ int main() {
           s.dynamic_moving_keys, s.dynamic_meshes, s.dynamic_released);
   }
 
+  HStage("18. Release, then moving again: the key re-arms and is flagged again; a");
   // 18. Release, then moving again: the key re-arms and is flagged again; a
   // second stop releases it again. ApplyPoolDynamicKey does not flag a
   // released key.
@@ -604,7 +640,7 @@ int main() {
       for (const auto& mesh : bvh::g_pool.meshes) CHECK(!mesh.dynamic, "ApplyPoolDynamicKey does not flag a released key");
     }
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
+    CHECK(text.find("\"schema\": 11") != std::string::npos, "schema 11");
     CHECK(text.find("\"rule_stale\": ") != std::string::npos && text.find("\"rule_stale_samples\": ") != std::string::npos,
           "rule_stale fields");
     CHECK(text.find("\"moving_keys\": 0, \"released\": 2") != std::string::npos
@@ -613,6 +649,7 @@ int main() {
     std::ofstream("motion_dump4.json") << text;
   }
 
+  HStage("19. The moving object's buffer is released while its key is still");
   // 19. The moving object's buffer is released while its key is still
   // flagged: the mesh is unflagged at compaction (the static key still holds
   // it), and the static pose admits again.
@@ -645,6 +682,7 @@ int main() {
           bvh::g_pool.instances.size());
   }
 
+  HStage("20. Two moving keys share a mesh: releasing one keeps the mesh flagged for");
   // 20. Two moving keys share a mesh: releasing one keeps the mesh flagged for
   // the other; releasing the last unflags it.
   {
@@ -680,6 +718,7 @@ int main() {
     CHECK(s.admitted == 1u && s.dynamic_meshes == 0u, "static admitted (admitted %zu, flagged %zu)", s.admitted, s.dynamic_meshes);
   }
 
+  HStage("21. prevWorld trace: A (far flip), B (sway 2 cm per frame), C (static) are");
   // 21. prevWorld trace: A (far flip), B (sway 2 cm per frame), C (static) are
   // selected, each records 120 consecutive frames; the trace is read-only.
   {
@@ -759,6 +798,7 @@ int main() {
     CHECK(traced.trace.records.size() == 360u, "records (%zu)", traced.trace.records.size());
   }
 
+  HStage("21b. A traced key with 64 instances: trace copies are capped at");
   // 21b. A traced key with 64 instances: trace copies are capped at
   // kPoolTraceMaxElements per frame and leave the normal copy counters alone.
   {
@@ -802,6 +842,7 @@ int main() {
     CHECK(most > 0u && most <= bvh::kPoolTraceMaxElements, "big: records per frame %u (max %u)", most, bvh::kPoolTraceMaxElements);
   }
 
+  HStage("21c. A key whose motion stopped more than kPoolMovingHoldFrames + 30 frames");
   // 21c. A key whose motion stopped more than kPoolMovingHoldFrames + 30 frames
   // ago is not selected by the trace.
   {
@@ -827,6 +868,346 @@ int main() {
           "stopped long ago: no moving key selected (A %d, B %d)", (int)trace.keys[0].state, (int)trace.keys[1].state);
   }
 
+  // ---- Follow mode (P2a off, follow on): a moving object keeps its instance and it follows the pose ----
+  check_every_frame = true;
+  HStage("22. One mover at 5 cm/frame: one instance per frame after warm-up, no ghost;");
+  // 22. One mover at 5 cm/frame: one instance per frame after warm-up, no ghost;
+  // its matrix is the pose of its last follow; inverse and bounds are recomputed;
+  // one admitted observation for the whole pose chain.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(9.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * f); Place(p, 0.05f * (f == 0u ? 0u : f - 1u));
+    }});
+    run(60);
+    size_t fewest = SIZE_MAX;
+    size_t most = 0u;
+    for (int i = 0; i < 140; ++i) {
+      run(1);
+      std::lock_guard lock(bvh::g_pool.mutex);
+      fewest = (std::min)(fewest, bvh::g_pool.instances.size());
+      most = (std::max)(most, bvh::g_pool.instances.size());
+    }
+    CHECK(fewest == 1u && most == 1u, "follow: instances per frame %zu..%zu (want 1)", fewest, most);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    const bvh::WorldInstance& inst = bvh::g_pool.instances[0];
+    float expect[12];
+    Place(expect, 0.05f * static_cast<float>(inst.last_follow_frame - start));
+    CHECK(std::memcmp(inst.matrix, expect, sizeof(expect)) == 0, "follow: matrix is the pose of its last follow (%u)", inst.last_follow_frame);
+    float inverse[16] = {};
+    falcom_world::ComputeMatrixInverse(inst.matrix, inverse);
+    float bounds_min[3] = {};
+    float bounds_max[3] = {};
+    bvh::ComputePoolInstanceBounds(bvh::g_pool.meshes[inst.mesh_id], inst.matrix, bounds_min, bounds_max);
+    CHECK(std::memcmp(inverse, inst.inverse_world, sizeof(inverse)) == 0, "follow: inverse recomputed");
+    CHECK(std::memcmp(bounds_min, inst.bounds_min, sizeof(bounds_min)) == 0
+              && std::memcmp(bounds_max, inst.bounds_max, sizeof(bounds_max)) == 0, "follow: bounds recomputed");
+    size_t admitted_observations = 0u;
+    for (const auto& [key, observed] : bvh::g_pool.observations) {
+      if (observed.admitted) admitted_observations += 1u;
+    }
+    CHECK(admitted_observations == 1u, "follow: admitted observations %zu (want 1)", admitted_observations);
+    CHECK(bvh::g_pool.stats.follow_admits == 1u && bvh::g_pool.stats.follow_hits >= 100u,
+          "follow: admits %llu hits %llu", (unsigned long long)bvh::g_pool.stats.follow_admits,
+          (unsigned long long)bvh::g_pool.stats.follow_hits);
+  }
+
+  HStage("23. A mover and a static neighbour under one draw key: the mover's start");
+  // 23. A mover and a static neighbour under one draw key: the mover's start
+  // pose and the neighbour are purged when the mesh is flagged; the neighbour
+  // re-admits and its matrix never changes.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(10.f).handle, 2, [start](uint32_t f, uint32_t i, float* w, float* p) {
+      f -= start;
+      if (i == 0u) {
+        Place(w, f < 40u ? 0.f : 0.05f * static_cast<float>(f - 40u));
+        Place(p, f <= 40u ? 0.f : 0.05f * static_cast<float>(f - 41u));
+      } else {
+        Place(w, -5.f); Place(p, -5.f);
+      }
+    }});
+    run(120);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    size_t statics = 0u;
+    size_t others = 0u;
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      float at3[12];
+      Place(at3, -5.f);
+      if (std::memcmp(inst.matrix, at3, sizeof(at3)) == 0) statics += 1u;
+      else others += 1u;
+    }
+    CHECK(statics == 1u && others == 1u, "neighbour: static %zu, mover %zu (want 1 and 1)", statics, others);
+    CHECK(bvh::g_pool.stats.dynamic_retired >= 1u, "neighbour: purged with the mesh flag (%llu)",
+          (unsigned long long)bvh::g_pool.stats.dynamic_retired);
+  }
+
+  HStage("24. A mover not drawn for one frame (its pose rejected): no orphan at once.");
+  // 24. A mover not drawn for one frame (its pose rejected): the gap relinks.
+  // One instance, one relink, no orphan, however long it runs after the gap.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    uint32_t gap_from = UINT32_MAX;
+    uint32_t gap_frames = 0u;
+    objects.push_back({make_vb(11.f).handle, 1, [start, &gap_from, &gap_frames](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      const bool gap = f >= gap_from && f < gap_from + gap_frames;
+      Place(w, gap ? NAN : 0.05f * f);
+      Place(p, gap ? NAN : 0.05f * (f == 0u ? 0u : f - 1u));
+    }});
+    run(60);
+    gap_from = falcom_world::g_state.frame.load() - start;
+    gap_frames = 1u;
+    run(1);
+    CHECK(snapshot().orphans == 0u, "gap: no orphan after one frame");
+    gap_frames = 0u;
+    run(bvh::kPoolMovingHoldFrames + 10u);
+    const auto s = snapshot();
+    CHECK(s.follow_relinks == 1u && s.admitted == 1u && s.orphans == 0u,
+          "gap relinks: relinks %llu admitted %zu orphans %llu (want 1, 1, 0)", (unsigned long long)s.follow_relinks, s.admitted,
+          (unsigned long long)s.orphans);
+  }
+
+  HStage("24b. A gap frame writes NaN into prevWorld only: the mover relinks, no second instance.");
+  // 24b. A gap frame writes NaN into prevWorld only: the mover relinks, no second instance.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(13.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * f);
+      Place(p, f == 60u ? NAN : 0.05f * (f == 0u ? 0u : f - 1u));
+    }});
+    run(120);
+    const auto s = snapshot();
+    CHECK(s.follow_relinks == 1u && s.admitted == 1u && s.orphans == 0u,
+          "NaN prev gap: relinks %llu admitted %zu orphans %llu (want 1, 1, 0)", (unsigned long long)s.follow_relinks, s.admitted,
+          (unsigned long long)s.orphans);
+  }
+
+  HStage("25. Move, stop until released, move again: one instance, at the current pose.");
+  // 25. Move, stop until released, move again: one instance, at the current pose.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(12.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      auto x = [](uint32_t t) { return t < 40u ? 0.05f * t : (t < 120u ? 2.f : 2.f + 0.05f * (t - 120u)); };
+      Place(w, x(f)); Place(p, x(f == 0u ? 0u : f - 1u));
+    }});
+    run(200);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    CHECK(bvh::g_pool.instances.size() == 1u, "stop and move: instances %zu (want 1)", bvh::g_pool.instances.size());
+    if (bvh::g_pool.instances.size() == 1u) {
+      const bvh::WorldInstance& inst = bvh::g_pool.instances[0];
+      float expect[12];
+      const uint32_t t = inst.last_follow_frame - start;
+      Place(expect, t < 40u ? 0.05f * t : (t < 120u ? 2.f : 2.f + 0.05f * (t - 120u)));
+      CHECK(std::memcmp(inst.matrix, expect, sizeof(expect)) == 0, "stop and move: matrix at the current pose (%u)", t);
+    }
+  }
+
+  check_every_frame = false;
+  HStage("26. Copies: a follow key takes one copy a frame; a static key one per");
+  // 26. Copies: a follow key takes one copy a frame; a static key one per
+  // kPoolRecaptureFrames. A follow copy may fill at most half a staging slot.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(13.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * f); Place(p, 0.05f * (f == 0u ? 0u : f - 1u));
+    }});
+    run(40);
+    const uint64_t moving_before = snapshot().copied_draws;
+    run(60);
+    const uint64_t moving_copies = snapshot().copied_draws - moving_before;
+    fresh();
+    objects.push_back({make_vb(14.f).handle, 1, [](uint32_t, uint32_t, float* w, float* p) { Place(w, 3.f); Place(p, 3.f); }});
+    run(40);
+    const uint64_t static_before = snapshot().copied_draws;
+    run(60);
+    const uint64_t static_copies = snapshot().copied_draws - static_before;
+    CHECK(moving_copies == 60u, "copies: moving %llu per 60 frames (want 60)", (unsigned long long)moving_copies);
+    CHECK(static_copies <= 60u / bvh::kPoolRecaptureFrames + 1u, "copies: static %llu per 60 frames",
+          (unsigned long long)static_copies);
+    fresh();
+    run(5);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::PoolStagingSlot& slot = bvh::g_pool.slots[bvh::g_pool.write_slot];
+    const uint64_t used = slot.used, follow_used = slot.follow_used;
+    const uint64_t skips = bvh::g_pool.stats.follow_budget_skips;
+    const uint64_t cap = bvh::kPoolStagingSlotBytes / bvh::kPoolFollowSlotShare;
+    bvh::PoolSchedule* out = nullptr;
+    auto reserve = [&](bvh::PoolCopyKind kind, uint64_t bytes) {
+      return bvh::ReservePoolCopy(&dev, 0x1234u, falcom_world::g_state.frame.load(), bytes, &out, kind);
+    };
+    // Normal bytes past half a slot do not refuse a follow copy that fits the follow cap.
+    slot.used = bvh::kPoolStagingSlotBytes / 2u + 1u;
+    slot.follow_used = 0u;
+    CHECK(reserve(bvh::PoolCopyKind::Follow, cap / 2u) == bvh::PoolSkip::None
+              && bvh::g_pool.stats.follow_budget_skips == skips,
+          "follow copy under the follow cap accepted past half a slot");
+    slot.used = cap - 100u;
+    slot.follow_used = cap - 100u;
+    CHECK(reserve(bvh::PoolCopyKind::Follow, 200u) == bvh::PoolSkip::BudgetFull
+              && bvh::g_pool.stats.follow_budget_skips == skips + 1u,
+          "follow copy over the follow cap refused and counted");
+    CHECK(reserve(bvh::PoolCopyKind::Trace, 200u) == bvh::PoolSkip::None
+              && bvh::g_pool.stats.follow_budget_skips == skips + 1u,
+          "trace copy at the follow cap accepted and not counted");
+    slot.follow_used = 0u;
+    CHECK(reserve(bvh::PoolCopyKind::Normal, 200u) == bvh::PoolSkip::None, "normal copy unchanged");
+    slot.used = used;
+    slot.follow_used = follow_used;
+    for (const auto& s : bvh::g_pool.slots) {
+      if (s.used == 0u) CHECK(s.follow_used == 0u, "follow_used zero on an empty slot");
+    }
+  }
+
+  HStage("27. Exclude on with follow on: the P2a path, the mover is never admitted.");
+  // 27. Exclude on with follow on: the P2a path, the mover is never admitted.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(true);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(15.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * f); Place(p, 0.05f * (f == 0u ? 0u : f - 1u));
+    }});
+    run(150);
+    const auto s = snapshot();
+    CHECK(s.follow_hits == 0u && s.follow_admits == 0u && s.admitted == 0u,
+          "exclude on: follow %llu/%llu admitted %zu", (unsigned long long)s.follow_hits,
+          (unsigned long long)s.follow_admits, s.admitted);
+    bvh::g_pool.exclude_moving.store(false);
+  }
+
+  HStage("28. The dump: schema 10, the follow object, switch values, per-key follows, balanced braces.");
+  // 28. The dump: schema 10, the follow object, switch values, per-key follows, balanced braces.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(16.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * f); Place(p, 0.05f * (f == 0u ? 0u : f - 1u));
+    }});
+    run(120);
+    const std::string text = read_dump();
+    CHECK(text.find("\"schema\": 11") != std::string::npos, "dump: schema 11");
+    CHECK(text.find("\"follow_moving\": true") != std::string::npos && text.find("\"follow\": {\"hits\"") != std::string::npos,
+          "dump: follow object and switch");
+    CHECK(text.find("\"follows\": ") != std::string::npos, "dump: per key follows");
+    CHECK(std::count(text.begin(), text.end(), '{') == std::count(text.begin(), text.end(), '}')
+              && std::count(text.begin(), text.end(), '[') == std::count(text.begin(), text.end(), ']'), "dump: balanced");
+  }
+
+  check_every_frame = true;
+
+  HStage("29. Stopped prop: kept while seen; retired once when hidden 70 frames; re-admitted once.");
+  // 29. Stopped prop: kept while seen; retired once when hidden 70 frames; re-admitted once.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    const uint32_t vb = make_vb(17.f).handle;
+    auto x = [](uint32_t t) { return t < 40u ? 0.05f * static_cast<float>(t) : 2.f; };
+    objects.push_back({vb, 1, [start, x](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, x(f)); Place(p, x(f == 0u ? 0u : f - 1u));
+    }});
+    run(300);
+    CHECK(snapshot().admitted == 1u && snapshot().orphans_retired == 0u, "prop kept while seen (admitted %zu, retired %llu)",
+          snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
+    objects.clear();
+    run(70);
+    CHECK(snapshot().admitted == 0u && snapshot().orphans_retired == 1u, "hidden 70 frames: retired once (admitted %zu, retired %llu)",
+          snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
+    objects.push_back({vb, 1, [start](uint32_t, uint32_t, float* w, float* p) { Place(w, 2.f); Place(p, 2.f); }});
+    run(40);
+    CHECK(snapshot().admitted == 1u && snapshot().orphans_retired == 1u, "re-admitted once, not retired again (admitted %zu, retired %llu)",
+          snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
+  }
+
+  HStage("30. Retire, then destroy the VB, CompactPool and MarkPoolMeshDynamic: no second removal.");
+  // 30. Retire, then destroy the VB, CompactPool and MarkPoolMeshDynamic: no second removal.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    const uint64_t vb = make_vb(18.f).handle;
+    objects.push_back({vb, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * static_cast<float>(f)); Place(p, 0.05f * static_cast<float>(f == 0u ? 0u : f - 1u));
+    }});
+    run(50);
+    objects.clear();
+    run(70);
+    const auto before = snapshot();
+    CHECK(before.orphans_retired == 1u && before.admitted == 0u, "retired once (retired %llu)", (unsigned long long)before.orphans_retired);
+    bvh::OnDestroyResourcePool(&dev, resource{vb});
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::CompactPool();
+      for (const auto& [key, entry] : bvh::g_pool.dynamic_keys) {
+        (void)entry;
+        const auto mesh_it = bvh::g_pool.mesh_by_key.find(key);
+        if (mesh_it != bvh::g_pool.mesh_by_key.end()) {
+          CHECK(bvh::MarkPoolMeshDynamic(mesh_it->second) == 0u, "mark after retire removes nothing");
+        }
+      }
+    }
+    const auto after = snapshot();
+    CHECK(after.orphans_retired == 1u && after.dynamic_retired == before.dynamic_retired, "no double removal (retired %llu, dynamic_retired %llu)",
+          (unsigned long long)after.orphans_retired, (unsigned long long)after.dynamic_retired);
+  }
+
+  HStage("31. Scan off 100 frames retires nothing; scan back on gives a grace period.");
+  // 31. Scan off 100 frames retires nothing; scan back on gives a grace period.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(19.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, 0.05f * static_cast<float>(f)); Place(p, 0.05f * static_cast<float>(f == 0u ? 0u : f - 1u));
+    }});
+    run(40);
+    objects.clear();
+    bvh::g_pool.scan_active.store(false);
+    run(100);
+    CHECK(snapshot().orphans_retired == 0u, "scan off: nothing retired (%llu)", (unsigned long long)snapshot().orphans_retired);
+    bvh::g_pool.scan_active.store(true);
+    run(30);
+    CHECK(snapshot().orphans_retired == 0u, "scan back on: grace, nothing retired yet");
+    run(60);
+    CHECK(snapshot().orphans_retired == 1u, "scan back on: retired after the grace (%llu)", (unsigned long long)snapshot().orphans_retired);
+  }
+  check_every_frame = false;
+
+  HStage("7. Reset clears the probe and the moving keys.");
   // 7. Reset clears the probe and the moving keys.
   {
     bvh::ResetWorldPool();

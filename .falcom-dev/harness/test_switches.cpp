@@ -6,6 +6,7 @@
 #include <map>
 #include <thread>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -196,12 +197,14 @@ int main() {
   bvh::g_pool.scan_active.store(true);
   int frame = 1;
 
+  HStage("1. Defaults: capture on, indirect on, log off, verification on. This test");
   // 1. Defaults: capture on, indirect on, log off, verification on. This test
   // covers single-capture mechanics; verification has test_verify.cpp.
   CHECK(bvh::g_pool.capture_meshes.load() && bvh::g_pool.scan_indirect.load() && !bvh::g_pool.log_captures.load(), "defaults");
   CHECK(bvh::g_pool.verify_meshes.load() && !bvh::g_pool.legacy_scale.load(), "verification defaults");
   bvh::g_pool.verify_meshes.store(false);
 
+  HStage("2. Capture meshes off: draws and instances are still observed, no mesh is copied.");
   // 2. Capture meshes off: draws and instances are still observed, no mesh is copied.
   bvh::g_pool.capture_meshes.store(false);
   for (int i = 0; i < 40; ++i) run_frame(frame++, objects);
@@ -217,6 +220,7 @@ int main() {
   }
   CHECK(renodx::utils::log::g_lines.empty(), "no log while the log switch is off (%zu)", renodx::utils::log::g_lines.size());
 
+  HStage("3. Capture back on: index copy, then vertex copy, then the instances admit.");
   // 3. Capture back on: index copy, then vertex copy, then the instances admit.
   bvh::g_pool.capture_meshes.store(true);
   for (int i = 0; i < 8; ++i) run_frame(frame++, objects);
@@ -233,6 +237,7 @@ int main() {
   }
   CHECK(renodx::utils::log::g_lines.empty(), "still no log (%zu)", renodx::utils::log::g_lines.size());
 
+  HStage("4. Scan indirect draws off: indirect draws leave no trace.");
   // 4. Scan indirect draws off: indirect draws leave no trace.
   {
     const auto before = snapshot();
@@ -258,6 +263,7 @@ int main() {
     CHECK(again.indirect_by_vs_class[(size_t)contract::VsClass::Rigid] > indirect_after, "indirect back on");
   }
 
+  HStage("5. Switch log: nothing while logging is off, one line when on.");
   // 5. Switch log: nothing while logging is off, one line when on.
   bvh::LogPoolSwitches();
   CHECK(renodx::utils::log::g_lines.empty(), "switch log gated");
@@ -265,6 +271,7 @@ int main() {
   bvh::LogPoolSwitches();
   CHECK(CountLines("switches: pool scan on, capture meshes on, scan indirect draws on, verify mesh captures off", 'i') == 1, "switch line");
 
+  HStage("6. Mesh log: a line per copy issued and per copy read.");
   // 6. Mesh log: a line per copy issued and per copy read.
   {
     const size_t lines = renodx::utils::log::g_lines.size();
@@ -281,6 +288,7 @@ int main() {
     for (size_t i = lines; i < renodx::utils::log::g_lines.size(); ++i) std::printf("  %s\n", renodx::utils::log::g_lines[i].second.c_str());
   }
 
+  HStage("7. A buffer released while its mesh copy is in flight: the copy is dropped");
   // 7. A buffer released while its mesh copy is in flight: the copy is dropped
   // when read, nothing is added.
   {
@@ -303,6 +311,7 @@ int main() {
     CHECK(CountLines("1 tracked vertex/index buffers released", 'i') == 1, "release summary");
   }
 
+  HStage("8. Release summary is gated, and turning the log on later does not dump old counts.");
   // 8. Release summary is gated, and turning the log on later does not dump old counts.
   {
     bvh::g_pool.log_captures.store(false);
@@ -316,6 +325,7 @@ int main() {
     CHECK(renodx::utils::log::g_lines.size() == lines, "no stale release line (%zu)", renodx::utils::log::g_lines.size() - lines);
   }
 
+  HStage("9. OBJ: one object per vertex-shader family, each once.");
   // 9. OBJ: one object per vertex-shader family, each once.
   {
     bvh::DumpWorldPoolObj();
@@ -334,6 +344,7 @@ int main() {
     CHECK(faces == s.region * 12u, "faces %zu region %zu", faces, s.region);
   }
 
+  HStage("10. JSON dump carries the switches and the new counters.");
   // 10. JSON dump carries the switches and the new counters.
   {
     bvh::g_pool.capture_meshes.store(false);
@@ -342,12 +353,13 @@ int main() {
     std::ifstream json(bvh::PoolOutputDir() / "world_pool.json");
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
     CHECK(text.find("\"switches\": {\"capture_meshes\": false, \"scan_indirect\": true, \"verify_meshes\": false, "
-                    "\"legacy_scale\": false, \"exclude_moving\": true}") != std::string::npos, "switches in dump");
+                    "\"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true}") != std::string::npos, "switches in dump");
     CHECK(text.find("\"mesh_dropped\": 1") != std::string::npos, "dropped in dump");
     CHECK(text.find("\"mesh_index_copies\": 5, \"mesh_vertex_copies\": 4") != std::string::npos, "copies in dump");
     bvh::g_pool.capture_meshes.store(true);
   }
 
+  HStage("11. Deferred-context counter and stage markers.");
   // 11. Deferred-context counter and stage markers.
   {
     CmdList deferred; deferred.dev = &dev;
@@ -378,6 +390,7 @@ int main() {
     }
   }
 
+  HStage("11b. Mesh copies are taken only at draws on the immediate context.");
   // 11b. Mesh copies are taken only at draws on the immediate context.
   {
     resource vb_f;
@@ -407,6 +420,7 @@ int main() {
     CHECK(dev.bad_copies == 0, "copies in range (%d)", dev.bad_copies);
   }
 
+  HStage("11c. A waiting mesh that is still drawn does not expire; one no longer");
   // 11c. A waiting mesh that is still drawn does not expire; one no longer
   // drawn does, and queueing it again maps its buffer once.
   {
@@ -443,6 +457,7 @@ int main() {
     objects.pop_back();
   }
 
+  HStage("12. Lock rule: copies are recorded outside g_pool.mutex, and a destroy");
   // 12. Lock rule: copies are recorded outside g_pool.mutex, and a destroy
   // event raised inside a copy (D3D11 deferred destruction) re-enters safely.
   {
@@ -469,6 +484,7 @@ int main() {
     cl.probe_lock = false;
   }
 
+  HStage("13. Reset clears the release baseline.");
   // 13. Reset clears the release baseline.
   bvh::ResetWorldPool();
   {

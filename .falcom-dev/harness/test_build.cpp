@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <random>
 #include "gen/mock_base.hpp"
+#include "harness_timer.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_build.hpp"
 namespace bvh = falcom_world::bvh;
 static int g_failures = 0;
@@ -59,6 +60,7 @@ static void BuildLbvh(const std::vector<bvh::BVHLeafGPU>& leaves, uint leaf_base
 // ---- end transcription ----
 
 int main() {
+  HStage("random trees vs GPU builder");
   std::mt19937 rng(11);
   int trees = 0;
   for (int round = 0; round < 400; ++round) {
@@ -83,11 +85,43 @@ int main() {
     CHECK(bvh::ValidateBvh(cpu, leaves).ok, "valid (n=%u)", n);
     ++trees;
   }
+  HStage("empty and blas cases");
   std::vector<bvh::BVHNodeGPU> none;
   CHECK(bvh::BuildBvhTree({}, &none) && none.empty(), "empty");
   bvh::MeshBlas blas;
   CHECK(bvh::BuildMeshBlas({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}, {0, 1, 2, 0, 1, 7}, &blas) == nullptr && blas.leaves.size() == 1 && blas.skipped_triangles == 1, "skips bad triangle");
   CHECK(std::string(bvh::BuildMeshBlas({{0, 0, 0}}, {0, 0, 9}, &blas)) == "no valid triangle", "no valid triangle");
+  // Refit: an unchanged tree refits to identical bytes; moved leaves keep a valid
+  // tree whose root covers the union of the new leaf bounds.
+  for (uint32_t n : {1u, 2u, 3u, 257u}) {
+    std::mt19937 r(n);
+    std::uniform_real_distribution<float> u(-20.f, 20.f);
+    std::vector<bvh::BVHLeafGPU> leaves;
+    for (uint32_t i = 0; i < n; ++i) {
+      const float c[3] = {u(r), u(r), u(r)};
+      const float mn[3] = {c[0] - 0.5f, c[1] - 0.5f, c[2] - 0.5f}, mx[3] = {c[0] + 0.5f, c[1] + 0.5f, c[2] + 0.5f};
+      leaves.push_back(bvh::MakeLeaf(mn, mx, i));
+    }
+    bvh::SortBvhLeaves(&leaves);
+    std::vector<bvh::BVHNodeGPU> built;
+    CHECK(bvh::BuildBvhTree(leaves, &built), "refit: built (n=%u)", n);
+    std::vector<bvh::BVHNodeGPU> refit = built;
+    bvh::RefitBvhNodes(leaves, &refit);
+    CHECK(std::memcmp(refit.data(), built.data(), built.size() * sizeof(bvh::BVHNodeGPU)) == 0, "refit: unchanged tree identical (n=%u)", n);
+    for (auto& leaf : leaves) {
+      const float d = u(r) * 0.1f;
+      for (int k = 0; k < 3; ++k) { leaf.bounds_min[k] += d; leaf.bounds_max[k] += d; }
+    }
+    bvh::RefitBvhNodes(leaves, &refit);
+    CHECK(bvh::ValidateBvh(refit, leaves).ok, "refit: valid after moving leaves (n=%u)", n);
+    float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+    for (const auto& leaf : leaves) {
+      for (int k = 0; k < 3; ++k) { mn[k] = (std::min)(mn[k], leaf.bounds_min[k]); mx[k] = (std::max)(mx[k], leaf.bounds_max[k]); }
+    }
+    bool covers = true;
+    for (int k = 0; k < 3; ++k) covers = covers && refit[0].bounds_min[k] == mn[k] && refit[0].bounds_max[k] == mx[k];
+    CHECK(covers, "refit: root covers the union (n=%u)", n);
+  }
   std::printf("%d trees identical to the GPU builder\n", trees);
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;

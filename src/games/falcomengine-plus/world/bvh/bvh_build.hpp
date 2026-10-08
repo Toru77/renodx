@@ -151,6 +151,30 @@ inline uint32_t SplitBvhRange(const std::vector<BVHLeafGPU>& leaves, uint32_t fi
   return lo;
 }
 
+// Refits the bounds of a tree of fixed topology: each leaf node takes its leaf's
+// bounds, then a reverse index sweep fits the internal nodes (parents are allocated
+// before their children, so every child is finished first).
+inline void RefitBvhNodes(const std::vector<BVHLeafGPU>& leaves, std::vector<BVHNodeGPU>* nodes) {
+  for (BVHNodeGPU& out : *nodes) {
+    if ((out.child_or_leaf & kBvhLeafFlag) == 0u) continue;
+    const BVHLeafGPU& leaf = leaves[out.child_or_leaf & ~kBvhLeafFlag];
+    for (int k = 0; k < 3; ++k) {
+      out.bounds_min[k] = leaf.bounds_min[k];
+      out.bounds_max[k] = leaf.bounds_max[k];
+    }
+  }
+  for (uint32_t i = static_cast<uint32_t>(nodes->size()); i-- > 0u;) {
+    BVHNodeGPU& out = (*nodes)[i];
+    if ((out.child_or_leaf & kBvhLeafFlag) != 0u) continue;
+    const BVHNodeGPU& left = (*nodes)[out.child_or_leaf];
+    const BVHNodeGPU& right = (*nodes)[out.sibling_or_right];
+    for (int k = 0; k < 3; ++k) {
+      out.bounds_min[k] = (std::min)(left.bounds_min[k], right.bounds_min[k]);
+      out.bounds_max[k] = (std::max)(left.bounds_max[k], right.bounds_max[k]);
+    }
+  }
+}
+
 // Builds the tree over sorted `leaves` into `nodes` (2n - 1 nodes).
 inline bool BuildBvhTree(const std::vector<BVHLeafGPU>& leaves, std::vector<BVHNodeGPU>* nodes) {
   nodes->clear();
@@ -215,18 +239,7 @@ inline bool BuildBvhTree(const std::vector<BVHLeafGPU>& leaves, std::vector<BVHN
   }
   if (node_count != node_total) return false;
 
-  // Parents are allocated before their children, so a reverse index sweep
-  // fits every internal node from its already-finished children.
-  for (uint32_t i = node_total; i-- > 0u;) {
-    BVHNodeGPU& out = (*nodes)[i];
-    if ((out.child_or_leaf & kBvhLeafFlag) != 0u) continue;
-    const BVHNodeGPU& left = (*nodes)[out.child_or_leaf];
-    const BVHNodeGPU& right = (*nodes)[out.sibling_or_right];
-    for (int k = 0; k < 3; ++k) {
-      out.bounds_min[k] = (std::min)(left.bounds_min[k], right.bounds_min[k]);
-      out.bounds_max[k] = (std::max)(left.bounds_max[k], right.bounds_max[k]);
-    }
-  }
+  RefitBvhNodes(leaves, nodes);
   return true;
 }
 

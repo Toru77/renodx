@@ -23,7 +23,11 @@
 // resident are snapshotted under the pool lock, their descriptors and TLAS are
 // built on the CPU, validated, and uploaded as exact-size buffers (the trace
 // reads their sizes with GetDimensions). A failed build or upload keeps the
-// previous TLAS.
+// previous TLAS. Dynamic (moving) instances are stable-partitioned last. When
+// only their poses changed, RefitLiveTlas rewrites their descriptors, leaf and
+// node bounds in place (same leaves and topology); after kLiveTlasRefitsPerRebuild
+// refits the TLAS is rebuilt. A failed refit keeps the previous TLAS and forces
+// a rebuild on the next update.
 //
 // Failures (GPU buffer creation, a tree that fails validation) keep the last
 // working state, record a reason in LiveBvhStats, and are retried after
@@ -65,6 +69,7 @@ namespace falcom_world::bvh {
 inline constexpr uint64_t kLiveTrianglesPerFrame = 16384u;  // BLAS work per present (at least one mesh)
 inline constexpr uint32_t kLiveMeshesPerFrame = 64u;
 inline constexpr uint32_t kLiveTlasInterval = 8u;           // frames between TLAS rebuilds
+inline constexpr uint32_t kLiveTlasRefitsPerRebuild = 120u;  // refits before a full rebuild (tree quality)
 inline constexpr uint64_t kLiveFloatExact = 1ull << 24u;    // mesh descriptor offsets are floats
 inline constexpr uint64_t kLiveResetGarbageBytes = 16ull * 1024ull * 1024ull;
 inline constexpr uint32_t kLiveRetryFrames = 120u;          // after a GPU buffer creation failure
@@ -498,6 +503,30 @@ inline uint32_t InstanceVisibilityFlags(const WorldInstanceGPU& instance) {
   return static_cast<uint32_t>(instance.visibility[2] + 0.5f);
 }
 
+// The TLAS descriptor of one instance, for the mesh slot its uid resolves to.
+inline WorldInstanceGPU MakeLiveInstanceGPU(const LiveTlasInstance& instance, uint32_t slot) {
+  WorldInstanceGPU descriptor = {};
+  descriptor.header[0] = static_cast<float>(slot);
+  descriptor.header[1] = static_cast<float>(instance.source);
+  const uint32_t floats = instance.matrix_floats == 0u ? 12u : (std::min)(instance.matrix_floats, 16u);
+  float matrix[16] = {};
+  std::memcpy(matrix, instance.matrix, sizeof(float) * floats);
+  // The engine's vertex transform uses only rows 0..2; the descriptor is
+  // explicitly affine so it always matches the computed inverse.
+  matrix[12] = 0.f;
+  matrix[13] = 0.f;
+  matrix[14] = 0.f;
+  matrix[15] = 1.f;
+  std::memcpy(descriptor.world, matrix, sizeof(matrix));
+  std::memcpy(descriptor.inverse_world, instance.inverse_world, sizeof(descriptor.inverse_world));
+  for (int k = 0; k < 3; ++k) {
+    descriptor.bounds_min[k] = instance.bounds_min[k];
+    descriptor.bounds_max[k] = instance.bounds_max[k];
+  }
+  FillInstanceVisibility(instance.visibility, descriptor.visibility);
+  return descriptor;
+}
+
 inline void RebuildLiveTlas(
     reshade::api::device* device,
     BvhDeviceData* data,
@@ -509,14 +538,18 @@ inline void RebuildLiveTlas(
   std::vector<LiveTlasInstance> snapshot;
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;
+  uint64_t dynamic_revision = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     revision = g_pool.revision;
     visibility_revision = g_pool.visibility_revision;
+    dynamic_revision = g_pool.dynamic_revision;
     for (const WorldInstance& instance : g_pool.instances) {
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
       LiveTlasInstance& copy = snapshot.emplace_back();
       copy.uid = g_pool.meshes[instance.mesh_id].uid;
+      copy.id = instance.id;
+      copy.dynamic = instance.dynamic;
       copy.mesh_key = instance.mesh_key;
       copy.vs_hash = instance.source_vs_hash;
       copy.first_frame = instance.first_frame;
@@ -532,15 +565,18 @@ inline void RebuildLiveTlas(
       copy.visibility = GetPoolCameraVisibility(instance);
     }
   }
+  std::stable_partition(snapshot.begin(), snapshot.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; });
   // What this TLAS reflects; recorded only once it is in place, so a failed
   // build is retried (after kLiveRetryFrames).
   const uint64_t store_version = data->store_version;
   const auto commit = [&]() {
     data->tlas_pool_revision = revision;
     data->tlas_visibility_revision = visibility_revision;
+    data->tlas_dynamic_revision = dynamic_revision;
     data->tlas_store_version = store_version;
     data->tlas_region_size = region.size;
     std::memcpy(data->tlas_region_min, region.min, sizeof(data->tlas_region_min));
+    data->tlas_refit_failed = false;
   };
   stats.tlas_frame = frame;
   stats.tlas_reason = reason;
@@ -566,25 +602,7 @@ inline void RebuildLiveTlas(
       }
       continue;
     }
-    WorldInstanceGPU descriptor = {};
-    descriptor.header[0] = static_cast<float>(slot_it->second);
-    descriptor.header[1] = static_cast<float>(instance.source);
-    const uint32_t floats = instance.matrix_floats == 0u ? 12u : (std::min)(instance.matrix_floats, 16u);
-    float matrix[16] = {};
-    std::memcpy(matrix, instance.matrix, sizeof(float) * floats);
-    // The engine's vertex transform uses only rows 0..2; the descriptor is
-    // explicitly affine so it always matches the computed inverse.
-    matrix[12] = 0.f;
-    matrix[13] = 0.f;
-    matrix[14] = 0.f;
-    matrix[15] = 1.f;
-    std::memcpy(descriptor.world, matrix, sizeof(matrix));
-    std::memcpy(descriptor.inverse_world, instance.inverse_world, sizeof(descriptor.inverse_world));
-    for (int k = 0; k < 3; ++k) {
-      descriptor.bounds_min[k] = instance.bounds_min[k];
-      descriptor.bounds_max[k] = instance.bounds_max[k];
-    }
-    FillInstanceVisibility(instance.visibility, descriptor.visibility);
+    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(instance, slot_it->second);
     const uint32_t flags = InstanceVisibilityFlags(descriptor);
     if ((flags & kInstanceNearFade) != 0u) near_fade += 1u;
     if ((flags & kInstanceCameraVisible) == 0u) camera_hidden += 1u;
@@ -611,6 +629,10 @@ inline void RebuildLiveTlas(
   }
 
   SortBvhLeaves(&leaves);
+  std::vector<uint32_t> leaf_of(leaves.size());
+  for (uint32_t l = 0; l < leaves.size(); ++l) leaf_of[leaves[l].prim] = l;
+  const uint32_t dynamic_first =
+      static_cast<uint32_t>(std::count_if(info.begin(), info.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; }));
   std::vector<BVHNodeGPU> nodes;
   const bool built = BuildBvhTree(leaves, &nodes);
   const char* invalid = built ? DescribeBvhValidation(ValidateBvh(nodes, leaves)) : "tree construction failed";
@@ -625,7 +647,8 @@ inline void RebuildLiveTlas(
 
   std::vector<uint32_t> active(instances.size());
   for (uint32_t i = 0; i < active.size(); ++i) active[i] = i;
-  const auto usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source;
+  const auto usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source
+                     | reshade::api::resource_usage::copy_dest;
   struct NewBuffer {
     reshade::api::resource buffer = {0u};
     reshade::api::resource_view view = {0u};
@@ -670,6 +693,8 @@ inline void RebuildLiveTlas(
   data->tlas_info = std::move(info);
   data->tlas_leaves_cpu = std::move(leaves);
   data->tlas_nodes_cpu = std::move(nodes);
+  data->tlas_leaf_of_instance = std::move(leaf_of);
+  data->tlas_dynamic_first = dynamic_first;
   data->tlas_built = true;
   commit();
   data->bvh_ready = data->mesh_srv.handle != 0u && data->vertices.srv.handle != 0u && data->indices.srv.handle != 0u
@@ -678,6 +703,123 @@ inline void RebuildLiveTlas(
   stats.tlas_near_fade = near_fade;
   stats.tlas_camera_hidden = camera_hidden;
   stats.tlas_nodes = static_cast<uint32_t>(data->tlas_nodes_cpu.size());
+  finish();
+}
+
+// Moves the dynamic instances of the TLAS to their pool poses without a rebuild:
+// same instances, leaves and node topology; new descriptors, leaf bounds and node
+// bounds. The pool is read under its lock, the writes follow after it is released.
+// Any failure keeps the previous TLAS and CPU copies and makes the next update a
+// full rebuild ("refit failed").
+inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data,
+                          uint32_t frame) {
+  const auto start = std::chrono::steady_clock::now();
+  LiveBvhStats& stats = data->live;
+  std::vector<LiveTlasInstance> updated = data->tlas_info;
+  uint64_t dynamic_revision = 0u;
+  uint32_t missing = 0u;
+  uint32_t lag = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    dynamic_revision = g_pool.dynamic_revision;
+    for (uint32_t i = data->tlas_dynamic_first; i < updated.size(); ++i) {
+      LiveTlasInstance& copy = updated[i];
+      // Pool instances are kept sorted by ascending id (test_motion checks it).
+      const auto it = std::lower_bound(g_pool.instances.begin(), g_pool.instances.end(), copy.id,
+                                       [](const WorldInstance& instance, uint64_t id) { return instance.id < id; });
+      if (it == g_pool.instances.end() || it->id != copy.id) {
+        missing += 1u;
+        continue;
+      }
+      const WorldInstance& instance = *it;
+      std::memcpy(copy.matrix, instance.matrix, sizeof(copy.matrix));
+      std::memcpy(copy.inverse_world, instance.inverse_world, sizeof(copy.inverse_world));
+      std::memcpy(copy.bounds_min, instance.bounds_min, sizeof(copy.bounds_min));
+      std::memcpy(copy.bounds_max, instance.bounds_max, sizeof(copy.bounds_max));
+      copy.visibility = GetPoolCameraVisibility(instance);
+      if (frame > instance.last_follow_frame) lag = (std::max)(lag, frame - instance.last_follow_frame);
+    }
+  }
+  const auto finish = [&]() {
+    stats.refit_ms_last = LiveElapsedMs(start);
+    stats.refit_ms_max = (std::max)(stats.refit_ms_max, stats.refit_ms_last);
+  };
+  const auto fail = [&](const std::string& why) {
+    stats.refit_failures += 1u;
+    stats.last_failure = "TLAS refit: " + why + " (previous TLAS kept)";
+    data->tlas_refit_failed = true;
+    finish();
+  };
+  stats.refit_missing += missing;
+  if (missing != 0u) {
+    fail("instance no longer in the pool");
+    return;
+  }
+
+  std::vector<WorldInstanceGPU> instances = data->tlas_instances_cpu;
+  std::vector<BVHLeafGPU> leaves = data->tlas_leaves_cpu;
+  uint32_t first = UINT32_MAX;
+  uint32_t last = 0u;
+  uint32_t changed = 0u;
+  for (uint32_t i = data->tlas_dynamic_first; i < updated.size(); ++i) {
+    const auto slot_it = data->slot_by_uid.find(updated[i].uid);
+    if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->descriptor_count) {
+      fail("mesh slot no longer resident");
+      return;
+    }
+    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(updated[i], slot_it->second);
+    if (std::memcmp(&descriptor, &instances[i], sizeof(descriptor)) == 0) continue;
+    instances[i] = descriptor;
+    BVHLeafGPU& leaf = leaves[data->tlas_leaf_of_instance[i]];
+    for (int k = 0; k < 3; ++k) {
+      leaf.bounds_min[k] = updated[i].bounds_min[k];
+      leaf.bounds_max[k] = updated[i].bounds_max[k];
+    }
+    first = (std::min)(first, i);
+    last = i;
+    changed += 1u;
+  }
+  if (changed == 0u) {
+    data->tlas_info = std::move(updated);
+    data->tlas_dynamic_revision = dynamic_revision;
+    finish();
+    return;
+  }
+
+  std::vector<BVHNodeGPU> nodes = data->tlas_nodes_cpu;
+  RefitBvhNodes(leaves, &nodes);
+  const char* invalid = DescribeBvhValidation(ValidateBvh(nodes, leaves));
+  if (invalid != nullptr) {
+    stats.tlas_invalid += 1u;
+    fail(invalid);
+    return;
+  }
+
+  std::string error;
+  const bool written =
+      WriteBufferRange(device, cmd_list, data->instance_buffer, sizeof(WorldInstanceGPU), first * sizeof(WorldInstanceGPU),
+                       &instances[first], (last - first + 1u) * sizeof(WorldInstanceGPU), &error)
+      && WriteBufferRange(device, cmd_list, data->tlas_leaf_buffer, sizeof(BVHLeafGPU), 0u, leaves.data(),
+                          leaves.size() * sizeof(BVHLeafGPU), &error)
+      && WriteBufferRange(device, cmd_list, data->tlas_node_buffer, sizeof(BVHNodeGPU), 0u, nodes.data(),
+                          nodes.size() * sizeof(BVHNodeGPU), &error);
+  if (!written) {
+    stats.upload_failures += 1u;
+    fail("upload: " + error);
+    return;
+  }
+
+  // Swapped only after every write succeeded.
+  data->tlas_instances_cpu = std::move(instances);
+  data->tlas_info = std::move(updated);
+  data->tlas_leaves_cpu = std::move(leaves);
+  data->tlas_nodes_cpu = std::move(nodes);
+  data->tlas_dynamic_revision = dynamic_revision;
+  data->tlas_refits_since_rebuild += 1u;
+  stats.tlas_refits += 1u;
+  stats.refit_instances = changed;
+  stats.refit_lag_last = lag;
+  stats.refit_lag_max = (std::max)(stats.refit_lag_max, lag);
   finish();
 }
 
@@ -1053,10 +1195,12 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     const uint32_t frame = g_state.frame.load();
     uint64_t revision = 0u;
     uint64_t visibility_revision = 0u;
+    uint64_t dynamic_revision = 0u;
     {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       revision = g_pool.revision;
       visibility_revision = g_pool.visibility_revision;
+      dynamic_revision = g_pool.dynamic_revision;
     }
     stage.Set("live bvh: meshes");
     // Pool changes (retirements) are handled at once; pending uploads wait
@@ -1070,6 +1214,15 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     if (change != nullptr && frame >= data->tlas_retry_frame
         && (data->live.tlas_rebuilds == 0u || frame - data->live.tlas_frame >= kLiveTlasInterval || frame < data->live.tlas_frame)) {
       RebuildLiveTlas(device, data, region, frame, change);
+    } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
+      RebuildLiveTlas(device, data, region, frame, "refit failed");
+    } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_store_version == data->store_version
+               && data->tlas_dynamic_revision != dynamic_revision) {
+      if (data->tlas_refits_since_rebuild >= kLiveTlasRefitsPerRebuild) {
+        RebuildLiveTlas(device, data, region, frame, "refit quality");
+      } else {
+        RefitLiveTlas(device, cmd_list, data, frame);
+      }
     }
   }
 
