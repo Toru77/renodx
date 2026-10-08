@@ -25,13 +25,13 @@
 namespace falcom_world {
 
 inline constexpr uint64_t kTrackedCbMaxBytes = 256u;
-inline constexpr uint32_t kTrackedCbBytes = 16u;
+inline constexpr uint32_t kTrackedCbBytes = 160u;
 
 struct TrackedCb {
   std::array<uint8_t, kTrackedCbBytes> bytes = {};
   uint64_t size = 0u;
   uint8_t* mapped = nullptr;
-  bool valid = false;
+  uint64_t valid_bytes = 0u;  // contiguous prefix of the buffer the mirror holds
 };
 
 struct CbValueTracker {
@@ -52,7 +52,7 @@ inline void MirrorCbWrite(TrackedCb* tracked, const void* data, uint64_t offset,
   if (data == nullptr || offset >= kTrackedCbBytes) return;
   const uint64_t count = (std::min)(size, static_cast<uint64_t>(kTrackedCbBytes) - offset);
   std::memcpy(tracked->bytes.data() + offset, data, static_cast<size_t>(count));
-  if (offset == 0u && count >= sizeof(int32_t)) tracked->valid = true;
+  if (offset <= tracked->valid_bytes && offset + count > tracked->valid_bytes) tracked->valid_bytes = offset + count;
 }
 
 inline void OnInitResourceCbTracker(
@@ -167,26 +167,31 @@ inline void OnDestroyCommandListCbTracker(reshade::api::command_list* cmd_list) 
   ForgetDeferredCbWrites(cmd_list);
 }
 
-// First int of a tracked constant buffer (instanceOffset_g for b1), as a draw
-// recorded on `cmd_list` sees it.
-inline bool ReadTrackedCbInt(reshade::api::command_list* cmd_list, reshade::api::resource resource, int32_t* out) {
-  if (out == nullptr || resource.handle == 0u) return false;
+// The first `bytes` of a tracked constant buffer as a draw recorded on
+// `cmd_list` sees them.
+inline bool ReadTrackedCbBytes(reshade::api::command_list* cmd_list, reshade::api::resource resource, void* out, uint64_t bytes) {
+  if (out == nullptr || resource.handle == 0u || bytes > kTrackedCbBytes) return false;
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
   if (cmd_list != nullptr && !tracker.deferred.empty()) {
     const auto list_it = tracker.deferred.find(reinterpret_cast<uintptr_t>(cmd_list));
     if (list_it != tracker.deferred.end()) {
       const auto entry_it = list_it->second.find(resource.handle);
-      if (entry_it != list_it->second.end() && entry_it->second.valid) {
-        std::memcpy(out, entry_it->second.bytes.data(), sizeof(int32_t));
+      if (entry_it != list_it->second.end() && entry_it->second.valid_bytes >= bytes) {
+        std::memcpy(out, entry_it->second.bytes.data(), static_cast<size_t>(bytes));
         return true;
       }
     }
   }
   const auto it = tracker.buffers.find(resource.handle);
-  if (it == tracker.buffers.end() || !it->second.valid) return false;
-  std::memcpy(out, it->second.bytes.data(), sizeof(int32_t));
+  if (it == tracker.buffers.end() || it->second.valid_bytes < bytes) return false;
+  std::memcpy(out, it->second.bytes.data(), static_cast<size_t>(bytes));
   return true;
+}
+
+// First int of a tracked constant buffer (instanceOffset_g for b1).
+inline bool ReadTrackedCbInt(reshade::api::command_list* cmd_list, reshade::api::resource resource, int32_t* out) {
+  return ReadTrackedCbBytes(cmd_list, resource, out, sizeof(int32_t));
 }
 
 inline void RegisterCbTracker() {

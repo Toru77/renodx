@@ -63,6 +63,11 @@ inline constexpr uint32_t kColorOffset = 96u;    // InstanceParam.color: w = opa
 inline constexpr uint32_t kParamOffset = 128u;   // InstanceParam.param: x near-fade start, y near-fade 1/range, z dither flip
 inline constexpr uint32_t kSceneNearFadeFloorOffset = 412u;  // cb_scene.disableMapObjNearFade_g (c25.w)
 inline constexpr uint32_t kSceneMapColorOffset = 752u;       // cb_scene.mapColor_g (c47), w = map alpha
+inline constexpr uint32_t kAlphaTexSlot = 0u;              // alpha-tested PS: Texture2D Tex0 (t0)
+inline constexpr uint32_t kAlphaMaterialSlot = 5u;          // alpha-tested PS: cb_local (b5)
+inline constexpr uint32_t kAlphaUvScrollOffset = 0u;         // cb_local.uvScroll0_g (c0)
+inline constexpr uint32_t kAlphaThresholdOffset = 112u;        // cb_local.alphaTestThreshold_g (c7)
+inline constexpr uint32_t kAlphaSwizzleSlot = 10u;            // cb_tex_swizzle.swizzle_flags_g (b10)
 
 enum class VsClass : uint8_t {
   Unclassified = 0,  // pipeline created before the classifier was listening
@@ -83,7 +88,7 @@ enum class VsClass : uint8_t {
 enum class PsClass : uint8_t {
   Unclassified = 0,
   Opaque,       // writes surfaces as-is (dithered near-fade discard is still opaque)
-  AlphaTested,  // cuts holes with alphaTestThreshold_g (leaves, fences): excluded until alpha is traced
+  AlphaTested,  // cuts holes with alphaTestThreshold_g (leaves, fences): refused unless alpha_foliage is on; kTraitAlphaMaterial marks the contract layout
   ParseFailed,
   Count,
 };
@@ -107,7 +112,8 @@ inline const char* VsClassName(VsClass value) {
 
 // Classes whose vertex shader moves vertices with more than the instance
 // world matrix (bones, wind, camera facing, waves). Their world-space
-// triangles can only be taken from the shader's own outputs (stream out).
+// triangles can only be taken from the shader's own outputs (stream out). Wind is also taken as a
+// rest pose (instance world, no sway) by the alpha-foliage pool path.
 inline bool IsDeformingClass(VsClass value) {
   return value == VsClass::Skinned || value == VsClass::Wind || value == VsClass::Billboard
          || value == VsClass::Animated;
@@ -260,6 +266,22 @@ inline VsClass ClassifyVertexShader(const dxbc::Reflection& reflection) {
   if (reflection.UsesVariable("viewInv_g") || reflection.UsesVariable("view_g")) return VsClass::Billboard;
   if (reflection.UsesVariable("gameTime_g") || reflection.UsesVariable("sceneTime_g")) return VsClass::Animated;
   return VsClass::Rigid;
+}
+
+// An alpha-tested pixel shader samples its cutout texture (t0) and reads the
+// threshold from the material cb (b5) at the contract offset.
+inline bool HasContractAlphaMaterial(const dxbc::Reflection& reflection) {
+  if (!reflection.valid) return false;
+  const dxbc::ResourceBinding* texture = reflection.FindResource(dxbc::kInputTexture, kAlphaTexSlot);
+  if (texture == nullptr) return false;
+  const dxbc::ResourceBinding* material = reflection.FindResource(dxbc::kInputCBuffer, kAlphaMaterialSlot);
+  if (material == nullptr) return false;
+  const dxbc::ConstantBuffer* layout = reflection.FindConstantBuffer(material->name, 0u);
+  if (layout == nullptr) return false;
+  for (const auto& variable : layout->variables) {
+    if (variable.name == "alphaTestThreshold_g") return variable.used && variable.offset == kAlphaThresholdOffset;
+  }
+  return false;
 }
 
 inline PsClass ClassifyPixelShader(const dxbc::Reflection& reflection) {

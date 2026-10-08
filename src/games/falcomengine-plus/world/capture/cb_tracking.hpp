@@ -21,6 +21,7 @@ namespace falcom_world {
 struct __declspec(uuid("e0b7d0f1-3f6a-4b21-9c8e-5a1d2f3b4c50")) WorldCommandListData {
   std::array<reshade::api::resource, kCbSlotCapacity> vs_cb = {};
   std::array<reshade::api::resource, kCbSlotCapacity> ps_cb = {};
+  std::array<uint64_t, kCbSlotCapacity> ps_cb_offset = {};  // buffer_range offset of the PS bind
   std::array<reshade::api::resource, kSrvSlotCapacity> vs_srv = {};
   std::array<reshade::api::resource_view, kSrvSlotCapacity> vs_srv_view = {};
   std::array<reshade::api::resource, kSrvSlotCapacity> ps_srv = {};
@@ -73,7 +74,10 @@ inline void OnPushDescriptorsWorld(
       if (slot >= kCbSlotCapacity) continue;
       const reshade::api::resource resource = ranges[i].buffer;
       if (vertex_stage) data->vs_cb[slot] = resource;
-      if (pixel_stage) data->ps_cb[slot] = resource;
+      if (pixel_stage) {
+        data->ps_cb[slot] = resource;
+        data->ps_cb_offset[slot] = ranges[i].offset;
+      }
     }
     return;
   }

@@ -324,7 +324,7 @@ int main() {
     CHECK(m.moved > 0u && m.repeat > 0u && m.moved_repeat == 0u, "moved and stopped");
     CHECK(s.admitted == 2u, "admitted at both stops (%zu)", s.admitted);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
+    CHECK(text.find("\"schema\": 15") != std::string::npos, "schema 15");
     CHECK(text.find("\"admitted_of_moved_meshes\": 2") != std::string::npos, "ghost count in dump");
     CHECK(text.find("\"vs_hash\": \"0x00001000\", \"admitted\": 2}") != std::string::npos
               || text.find("\"admitted\": 2}") != std::string::npos, "moved mesh listed with 2 admitted");
@@ -388,7 +388,7 @@ int main() {
     CHECK(found, "contradiction sampled");
     const std::string text = read_dump();
     for (const char* bad : {"nan,", "nan]", "nan}", "inf,", "inf]", "inf}"}) CHECK(text.find(bad) == std::string::npos, "no %s in JSON", bad);
-    std::ofstream("motion_dump2.json") << text;
+    std::ofstream("motion_dump.json") << text;
   }
 
 
@@ -470,7 +470,7 @@ int main() {
           "entry evidence");
     CHECK(text.find("\"moving_keys\": 0, \"released\": 1") != std::string::npos && text.find("\"moving_now\": false, \"released\": 1") != std::string::npos,
           "release evidence");
-    std::ofstream("motion_dump3.json") << text;
+    std::ofstream("motion_dump.json") << text;
   }
 
   HStage("10. Switch off: the stopped object's pose admits again at its next");
@@ -640,13 +640,13 @@ int main() {
       for (const auto& mesh : bvh::g_pool.meshes) CHECK(!mesh.dynamic, "ApplyPoolDynamicKey does not flag a released key");
     }
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
+    CHECK(text.find("\"schema\": 15") != std::string::npos, "schema 15");
     CHECK(text.find("\"rule_stale\": ") != std::string::npos && text.find("\"rule_stale_samples\": ") != std::string::npos,
           "rule_stale fields");
     CHECK(text.find("\"moving_keys\": 0, \"released\": 2") != std::string::npos
               && text.find("\"moving_now\": false, \"released\": 2") != std::string::npos,
           "dump: release counters");
-    std::ofstream("motion_dump4.json") << text;
+    std::ofstream("motion_dump.json") << text;
   }
 
   HStage("19. The moving object's buffer is released while its key is still");
@@ -1113,7 +1113,7 @@ int main() {
     }});
     run(120);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 14") != std::string::npos, "dump: schema 14");
+    CHECK(text.find("\"schema\": 15") != std::string::npos, "dump: schema 15");
     CHECK(text.find("\"follow_moving\": true") != std::string::npos && text.find("\"follow\": {\"hits\"") != std::string::npos,
           "dump: follow object and switch");
     CHECK(text.find("\"follows\": ") != std::string::npos, "dump: per key follows");

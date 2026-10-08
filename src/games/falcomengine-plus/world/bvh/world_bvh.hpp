@@ -226,6 +226,14 @@ inline void DrawBvhPanel() {
                         "leaves no copy behind where it stopped. Until the per-frame path exists, moving\n"
                         "objects are absent from the BVH. Off: admitted as before (applies at once).");
     }
+    bool alpha_foliage = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Alpha-tested foliage (not functional yet)", &alpha_foliage)) {
+      g_pool.alpha_foliage.store(alpha_foliage, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Work in progress: the GPU stage does not exist, ON admits nothing new (alpha meshes stay refused).");
+    }
     bool log_crashes = CrashLogEnabled();
     if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
     if (ImGui::IsItemHovered()) {
@@ -318,6 +326,12 @@ inline void DrawBvhPanel() {
   ImGui::Text("Instances: %llu admitted, %llu in region, following %llu, orphans retired %llu",
               static_cast<unsigned long long>(stats.admitted), static_cast<unsigned long long>(stats.region),
               static_cast<unsigned long long>(stats.following), static_cast<unsigned long long>(stats.orphans_retired));
+  ImGui::Text("Alpha foliage %s: draws %llu, conflicts %llu, meshes conflicted %llu, refused off %llu, conflict refused %llu, no UVs %llu, not ready %llu, removed %llu",
+              g_pool.alpha_foliage.load(std::memory_order_relaxed) ? "on" : "off", static_cast<unsigned long long>(stats.alpha_draws),
+              static_cast<unsigned long long>(stats.alpha_conflicts), static_cast<unsigned long long>(stats.alpha_meshes_conflicted),
+              static_cast<unsigned long long>(stats.alpha_refused_off), static_cast<unsigned long long>(stats.alpha_conflict_refused),
+              static_cast<unsigned long long>(stats.alpha_no_uv), static_cast<unsigned long long>(stats.alpha_not_ready),
+              static_cast<unsigned long long>(stats.alpha_removed));
   DrawDeformLivePanel(deform, deform_traced);
 
   ImGui::SeparatorText("GPU BVH (live)");

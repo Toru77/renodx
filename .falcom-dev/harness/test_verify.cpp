@@ -447,7 +447,7 @@ int main() {
     bvh::DumpWorldPool();
     std::ifstream json(json_path);
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
+    CHECK(text.find("\"schema\": 15") != std::string::npos, "schema 15");
     CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true, \"retry_unstable\": false}") != std::string::npos, "switches");
     CHECK(text.find("\"admitted_outside_legacy_scale\": 2") != std::string::npos, "outside legacy count");
     CHECK(text.find("\"outside_legacy_scale\": 1") != std::string::npos, "family count");
@@ -456,7 +456,7 @@ int main() {
     const std::string meshes_text((std::istreambuf_iterator<char>(meshes_json)), std::istreambuf_iterator<char>());
     CHECK(meshes_text.find("\"captures\": 2, \"verified\": true, \"vb\": \"default\", \"ib\": \"default\"") != std::string::npos,
           "mesh entries");
-    // Dump split (schema 14): three files, balanced braces, one frame, counts that agree with the summary.
+    // Dump split (schema 15): three files, balanced braces, one frame, counts that agree with the summary.
     std::ifstream instances_json(bvh::PoolOutputDir() / "world_pool_instances.json");
     const std::string instances_text((std::istreambuf_iterator<char>(instances_json)), std::istreambuf_iterator<char>());
     const auto balanced = [](const std::string& t) {

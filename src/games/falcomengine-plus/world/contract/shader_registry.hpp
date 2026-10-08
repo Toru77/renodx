@@ -30,6 +30,7 @@ inline constexpr uint8_t kTraitVisibilityLayout = 1u;  // vertex: instance eleme
 inline constexpr uint8_t kTraitNearFade = 2u;          // pixel: applies the map-object near fade (UsesContractNearFade)
 inline constexpr uint8_t kTraitCameraView = 4u;        // vertex: projects with the scene camera (VsView::Camera)
 inline constexpr uint8_t kTraitLightView = 8u;         // vertex: projects with the light (VsView::Light)
+inline constexpr uint8_t kTraitAlphaMaterial = 16u;   // pixel: alpha-tested with the contract texture/material layout
 
 struct ShaderTraits {
   uint8_t cls = 0u;    // VsClass or PsClass, by the map it lives in
@@ -101,6 +102,9 @@ inline void OnInitPipelineClassify(
       if (view == VsView::Light) traits.flags |= kTraitLightView;
     } else if (UsesContractNearFade(reflection)) {
       traits.flags |= kTraitNearFade;
+    }
+    if (!vertex && traits.cls == static_cast<uint8_t>(PsClass::AlphaTested) && HasContractAlphaMaterial(reflection)) {
+      traits.flags |= kTraitAlphaMaterial;
     }
     std::shared_ptr<const ShaderCode> code;
     if (vertex && IsDeformingClass(static_cast<VsClass>(traits.cls))) {

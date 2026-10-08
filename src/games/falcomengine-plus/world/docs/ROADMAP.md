@@ -199,3 +199,30 @@ Pool admission no longer uses Auto Research verdicts, recipes or hash lists.
 - M2: `poison_staging` switch (default OFF): poisoned, cpu-visible mesh staging with per-read head forensics and a 2-cycle residue table per slot.
 - M3: `world_deform_live.json` (identity gaps, presence counters, 64-event dropout ring).
 - M4/M5 not started (they need the in-game data from this round).
+
+## Round A3, 2026-10-08: alpha-tested foliage, stage B (working tree, not committed, not validated in game)
+- Owner decisions: go straight to real alpha testing (stage B); toggle in the Advanced section, session only, default OFF; switching OFF hides alpha instances at once, including shadow-only ones; wind foliage included as a rigid rest pose; billboards refused with a counted reason.
+- Plan review found: indirect alpha draws flagged a key that does not exist (fixed: material carried on the pending copy, flag at resolve on the real key); wind with an opaque PS is not alpha foliage (refused, `wind_opaque`); UVs were decoded for every mesh, changing dedup for everyone (fixed: alpha-flagged keys only).
+- Threshold constant: `alphaTestThreshold_g` is `packoffset(c7)` = byte 112 in the reference clutter shader, not 128 as the first plan said.
+- Done: contract and trait; CB mirror 160 bytes with a contiguous-valid prefix; pool gate, material capture, alpha flags, switch removal, UV decode for alpha keys; panel checkbox; dump schema 15 with an `alpha` section; `alpha_atlas.hpp` (CPU slice table and packing); `shaders/world_alpha_blit.cs_5_0.hlsl` (FXC and addon build pass); `test_alpha.cpp` (CPU atlas).
+- Default path check: with the toggle OFF, the harness produces the same counts as HEAD for all 10 existing tests (only timing lines differ).
+- Not done: GPU UV arena and atlas lifecycle (including the source-texture SRV lifetime), the per-frame blit dispatch, the trace-shader cutout (t14-t16, bary, any-hit, stats), the test_live extension, the remaining test_alpha cases, the dump swizzle field. With the toggle ON nothing new is admitted (`alpha_not_ready`).
+- Verification: addon build (`ninja-x64-release`, `falcomengine-plus`) passes; all 11 Windows harness tests pass after `refresh_world.ps1`. Not run: ASan/TSan builds, FXC of the trace shader (not changed), any GPU path (no D3D11 device here).
+- Harness: the Linux/WSL setup is retired; the harness is Windows-only (see `.falcom-dev/harness/README.md`). Earlier "all pass" claims for this round were made on a stale harness copy and are superseded by the run after `refresh_world.ps1`.
+- In-game check for the current state: Advanced checkbox present and OFF; ReShade.log switches line shows "alpha foliage off"; toggling ON and OFF changes nothing visible; dump schema 15 `alpha` counts; Depth Compare unchanged versus the previous build.
+
+## Round A3b, 2026-10-08: alpha review fixes (working tree, not validated in game)
+- Toggle OFF is the HEAD gate: wind and billboard draws are `not_rigid` (billboards no longer have their own skip); the alpha stats are written only while ON. Billboard draws are reported as `billboard_draws` in the alpha object.
+- Mesh conflict: a material conflict is recorded per draw key and per mesh (`PoolAlphaState`, `AbsorbPoolAlphaMaterial`), and a conflicted mesh is refused as `alpha_conflict_refused`. The flag and conflict clear in `CompactPool` only when no alpha key maps to the mesh.
+- Mismatch with the plan, decided by the code: a mesh captured while OFF has no UVs, so with ON it is refused as `alpha_no_uv` (fail closed), not `alpha_not_ready`. The `alpha_not_ready` case is covered by a run that starts ON.
+- The plan named two new counters (`alpha_meshes_conflicted`, `alpha_conflict_refused`); both were added. `alpha_conflicts` now counts conflicted keys.
+- UV decode guard (`DecodePoolMeshVertices`): UV dropped when outside the stride or the copy; uvs cleared unless one per position.
+- Dump: `alpha` object gains `meshes_conflicted`, `conflict_refused`, and `billboard_draws` replaces `billboard_skips`; `keys` comes from a snapshot taken under the lock; per-mesh `alpha_conflict`. Schema 15 unchanged (unreleased).
+- Note while OFF: a draw recorded while ON still flags its mesh if the switch flips OFF before its copy resolves (`NotePoolAlphaMaterial` has no toggle check); a draw recorded while OFF never reaches it.
+- test_motion.cpp and test_visibility.cpp keep their UTF-8 BOM (HEAD has it).
+
+Verification (2026-10-08):
+- `refresh_world.ps1`, then `run_win_all.ps1`: 11 of 11 PASS (test_pool, test_switches, test_motion, test_verify, test_visibility, test_indirect, test_deform, test_build, test_alpha, test_deform_live, test_live).
+- Addon: `cmake --build --preset ninja-x64-release --target falcomengine-plus`, rc=0, ends with the Linking line for renodx-falcomengine-plus.addon64.
+- Default path (toggle OFF) against HEAD: the implementer reports identical counts on the 10 existing tests (no output file kept).
+- Not verified: GPU, ReShade in game, ASan/TSan builds.

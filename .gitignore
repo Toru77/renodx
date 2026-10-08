@@ -56,3 +56,5 @@ __pycache__/
 .test/
 .venv-analysis/
 tmp/*
+# Harness test output (rewritten on every run)
+.falcom-dev/harness/motion_dump*.json

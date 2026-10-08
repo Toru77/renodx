@@ -13,6 +13,9 @@ Validated in game:
 Deployed, awaiting in-game validation (current step):
 - Path 2 / P2a: meshes seen moving in a camera view are kept out of the static pool (no ghosts). See section 3.
 
+Working tree, not committed, not validated in game (2026-10-08):
+- Alpha-tested foliage, Stage B, partial. The Advanced toggle "Alpha-tested foliage (not functional yet)" exists, default OFF. CPU pool logic and CPU atlas bookkeeping are done; GPU alpha atlas, UV arena, trace cutout and the test_live extension are NOT done. With the toggle ON nothing new is admitted yet (`alpha_not_ready`). See section 3c.
+
 Agreed plan, in order (owner's words in ROADMAP "Plan agreed 2026-10-07"):
 1. Deforming meshes (stream-out): done for characters and water. Wind foliage and billboards were moved into path 3 (they are indirect, GPU-culled, alpha-tested leaves).
 2. Moving rigid objects (doors, carts, the fork an NPC holds): in progress (P2a deployed, P2b next).
@@ -66,6 +69,34 @@ Plan: M0 mesh retry switch, M1 dump split, M2 staging forensics, M3 deform prese
 - M3 deform presence (`world_deform_live.json`, written by the same "Dump Pool JSON" button): per identity `first_frame`, `last_frame`, `gaps`, `max_gap`, `pending_frames`; stats `presents_no_objects`, `calls_max_per_frame`, `new_identities`, `new_after_warmup` (warm-up 600 frames), `resets_with_objects`, `reset_objects_dropped`, skips by reason; a ring of the last 64 `dropouts` (frame, key, vs, triangles, skips since the previous present).
 - Harness: test_verify (retry off/on, dump files, schema 14), test_visibility (near-fade check reads the meshes file), test_switches, test_motion, test_pool, test_indirect, test_build, test_deform, test_deform_live, test_live all pass at this round (see the round report). Poison staging: test_verify 10b (a copy whose range is left as poison: sentinel_words > 0 and head_class sentinel in the dump). Deform presence: test_deform_live 8 (identities non-empty; gaps, max_gap, pending_frames in the dump).
 
+## 3c. Path 3 (in progress, unvalidated): alpha-tested foliage
+
+Scope agreed by the owner: rigid alpha-tested geometry (fences, static leaves), plus wind foliage as a rigid rest pose. Billboards are not admitted: the gate takes only rigid vertex shaders, and wind only while the toggle is on, so billboards are `not_rigid` in both modes (their orientation depends on the camera, so they have no stable rest pose). Deforming wind is NOT routed through `deform_live` (it is indirect and GPU-culled; per-frame triangle count changes; see ROADMAP S1c).
+
+Toggle: "Alpha-tested foliage (not functional yet)" in Advanced, session only, default OFF. Tooltip: "Work in progress: the GPU stage does not exist, ON admits nothing new (alpha meshes stay refused)."
+
+Done (working tree):
+- Contract: `kAlphaThresholdOffset = 112` (`alphaTestThreshold_g` is `packoffset(c7)`, confirmed in `sora1st/foliage/clutter_0x68C07DEA.ps_5_0.hlsl`; the earlier plan's 128 was wrong), `kAlphaTexSlot` t0, `kAlphaMaterialSlot` b5, `kAlphaSwizzleSlot` b10, `kTraitAlphaMaterial` (16) on AlphaTested pixel shaders with that layout.
+- CB mirror widened to 160 bytes (`kTrackedCbBytes`); `valid_bytes` contiguous prefix; `ps_cb_offset` recorded so an offset bind fails closed.
+- Pool gate (`GatePoolDraw`, `alpha_on` read once). Toggle OFF is the HEAD gate: a rigid AlphaTested draw is `alpha_tested`, wind and billboard draws are `not_rigid`; no material is read and nothing is flagged. Toggle ON: the material is read only for a pixel shader with kTraitAlphaMaterial (else `pixel_unknown`), and an opaque pixel shader on wind is `wind_opaque`. The alpha flag and its stats come only from draws recorded while ON; such a draw still flags its mesh if the switch flips OFF before its copy resolves, and a flag persists after OFF until Reset Pool.
+- Material per draw key (`PoolAlphaState`, `AbsorbPoolAlphaMaterial`): the first readable material wins; an unreadable one (texture 0) never conflicts; a differing readable one sets `conflict`. `alpha_conflicts` counts conflicted keys.
+- Material per mesh: `WorldMesh::alpha_state` folds the states of its keys with the same rule. A conflicted mesh is refused (`alpha_conflict_refused`); `alpha_meshes_conflicted` counts meshes that took a conflict.
+- Clearing: the mesh flag and conflict are cleared in `CompactPool` only when no alpha key maps to the mesh (one invalidated key of several keeps them). Toggle OFF/ON does not clear them; `ResetWorldPool` clears everything.
+- Admission refusals while the mesh is flagged, in order: `alpha_refused_off` (OFF), `alpha_conflict_refused`, `alpha_no_uv`, `alpha_not_ready`. A mesh captured while OFF has no UVs (its alpha key did not exist at the capture), so with ON it is refused as `alpha_no_uv`. A mesh whose key is noted before its capture gets its UVs and is refused as `alpha_not_ready`.
+- UV decode (`DecodePoolMeshVertices`): UVs are dropped unless the UV element lies inside the stride and the copy holds it for every vertex, and all UVs are dropped unless there is one per position.
+- Blit shader `shaders/world_alpha_blit.cs_5_0.hlsl` compiles with FXC (repo `bin/fxc.exe`) and in the addon build. It is embedded by the CMake glob (CONFIGURE_DEPENDS), so no CMake change was needed. `bvh/alpha_atlas.hpp` is CPU only and harness-only (nothing in `world/` includes it): `AlphaMaterialGPU` (32 bytes), 4 alpha texels per uint, `AlphaSliceTable` (256 slices; `Acquire` returns -1 at the cap; double and out-of-range release ignored).
+- Dump: schema 15 (unreleased, no bump), `alpha` object on the main file (`alpha_foliage`, draws, cb_unavailable, conflicts, meshes_conflicted, refused_off, conflict_refused, no_uv, not_ready, removed, keys, billboard_draws, wind_opaque_skips), per-mesh `alpha`, `alpha_conflict` and `uvs` in the meshes file.
+- Harness: `test_alpha.cpp` covers the CPU atlas; the classifier on real bytecode (0x137F316A, 0x81F5709F, 0xAA835FE0 with kTraitAlphaMaterial; 0x049B0385, 0x2807FFC9, 0x2DADE2B8 without; 0x2162672F opaque); NotePoolAlphaMaterial (first wins, four kinds of conflict, unreadable then readable, an ON record still flags while OFF); the material read (fails closed on a partial mirror, unbound b5, offset b5, null t0, bad swizzle offset; full 160 bytes decodes); the switch ON/OFF/ON/OFF; UV decode cases; the gate in both modes; the admission refusals; per-mesh conflict in both capture orders; clearing; and the scan path OFF, ON, OFF; the indirect alpha path (an ON copy carries the pass and material and flags its real key, an ON record flags after OFF, OFF records nothing). Suite: 11 tests (10 existing + test_alpha), all pass.
+- Default-path check (toggle OFF against HEAD): the implementer reports identical counts on the 10 existing tests (no output file kept); see ROADMAP Round A3b.
+- Accepted for this round (owner): `ComparePoolMeshes` reports a UV count mismatch only when ON. Meshes captured while OFF have no UVs and stay `alpha_no_uv` after ON (deviation 3(b)); the in-game dump decides whether a recapture fix is needed before the GPU stage.
+
+Not done:
+1. GPU UV arena (stride 8, in lockstep with vertices in `bvh_resources.hpp`/`bvh_live.hpp`), the `Texture2DArray<uint>` atlas lifecycle, the per-frame blit dispatch from `UpdateLiveBvh`, and the SRV lifetime for each source texture. The lifetime is not safe yet: a texture handle could be reused after release. Nothing binds these resources today.
+2. Trace shader: t14 UVs, t15 atlas, t16 materials, `kTraceSrvCount` 14 -> 17, bary output from `IntersectTriangle`, any-hit cutout in `TraceBlas` (not `TraceDynamicBlas`), stats. Material slot as `header[2]` stored as slot+1 (0 = none). Must not start until item 1 exists: binding empty views would cut every alpha sample to zero.
+3. test_live extension (CPU transcription of AlphaPasses and any-hit trace vs brute force), the remaining alpha cases (UV mismatch on a changed buffer, dynamic and follow with alpha), test_pool case E update, dump swizzle field.
+
+In-game check for the current state (no visible alpha cutouts expected yet): Advanced checkbox present, labelled "Alpha-tested foliage (not functional yet)", and off; ReShade.log switches line says "alpha foliage off"; toggling ON and OFF changes nothing visible; dump schema 15 `alpha` counts (`not_ready`, `no_uv`, `refused_off`, `conflict_refused`); Depth Compare unchanged versus the previous build with the toggle OFF.
+
 ## 4. Code map (`world/`)
 
 - `world.hpp` entry; `world_settings.hpp` Ray Tracing tab; `world_state.hpp` census/camera/depth state.
@@ -90,13 +121,15 @@ Game facts: all world VS read `StructuredBuffer<InstanceParam> instances_g : t15
 - Files in the addon are CRLF; keep it.
 - New shaders in `world/shaders/` are embedded automatically (`__<name>_EMBED_FILE`, `__<name>` span; code guards with `#if defined(...)`).
 - Never put `.cso` files under `src/games/falcomengine-plus/` (CMake globs and embeds them).
-- FXC was never available in the cloud; shaders were checked with DXC cs_6_0 there. Your build is the FXC check.
+- FXC was never available in the cloud; shaders were checked with DXC cs_6_0 there. On this PC the addon build runs FXC (`fxc.exe` in the repo `bin/`); a clean addon build is the compile check.
 
 ## 6. Native test harness (`<repo>/.falcom-dev/harness`)
 
-Linux g++ (ASan/UBSan, TSan) harness with a mock ReShade device/command list (stream output emulation, ReShade's offset-0 and stride-0 quirks reproduced), stub `src/utils` (log/path/data/scene/settings), and transcriptions of the GPU shaders for CPU-vs-brute-force checks. Run it under WSL (Ubuntu, g++ 13+): see `.falcom-dev/harness/README.md`. Tests: test_pool, test_indirect, test_switches, test_visibility, test_live, test_build, test_verify, test_deform, test_deform_live, test_motion. All passed at the P2a deploy (TSan clean for switches/verify/motion). Real shader bytecode for the classifier tests is in `.falcom-dev/bytecode/`.
+Windows (MSVC) harness only. The Linux/WSL setup (`build.sh`, `run_all.sh`) is retired; do not use it. A mock ReShade device/command list (stream output emulation, ReShade's offset-0 and stride-0 quirks reproduced), stub `src/utils` (log/path/data/scene/settings), and transcriptions of the GPU shaders for CPU-vs-brute-force checks. See `.falcom-dev/harness/README.md`.
 
-Working method used so far for each round: implement in a copy, add/extend a harness test that reproduces the in-game situation, run all tests (+TSan for threaded paths), compile check, then deploy and give the owner exact in-game steps and what to send back.
+Workflow: `powershell -File refresh_world.ps1` (copies the repo's `world/` sources into the harness; always before a build), then `powershell -File run_win_all.ps1`, or `run_win_some.ps1 -Tests ...` / `run_win_one.ps1 -Test ...`. Tests: test_pool, test_indirect, test_switches, test_visibility, test_live, test_build, test_verify, test_deform, test_deform_live, test_motion, test_alpha. All 11 passed on current code after the last refresh (2026-10-08). No ThreadSanitizer or ASan run on Windows in this round; the earlier TSan results were from the Linux setup and do not cover later changes. Real shader bytecode for the classifier tests is in `.falcom-dev/bytecode/`.
+
+Working method for each round: implement, add/extend a harness test that reproduces the in-game situation, refresh and run all tests, build the addon target (the real compile check and FXC for shaders), then give the owner exact in-game steps and what to send back. Compare the default path (toggle OFF) against HEAD when a change touches shared pool logic.
 
 ## 7. Owner preferences
 

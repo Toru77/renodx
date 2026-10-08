@@ -206,6 +206,7 @@ enum class PoolSkip : uint8_t {
   Cooldown,          // same draw identity copied less than kPoolRecaptureFrames ago
   NoStaging,         // staging ring not ready (first frame, or slot being read)
   BudgetFull,        // staging slot full this frame
+  WindOpaque,        // wind vertex shader with an opaque pixel shader: not alpha foliage, refused while alpha_foliage is on
   Count,
 };
 
@@ -222,6 +223,7 @@ inline const char* PoolSkipName(PoolSkip skip) {
     case PoolSkip::Cooldown:         return "cooldown";
     case PoolSkip::NoStaging:        return "no_staging";
     case PoolSkip::BudgetFull:       return "budget_full";
+    case PoolSkip::WindOpaque:       return "wind_opaque";
     default:                         return "none";
   }
 }
@@ -293,10 +295,26 @@ inline constexpr uint8_t kPoolPassCamera = 1u;      // VS projects with the scen
 inline constexpr uint8_t kPoolPassVisibility = 2u;  // the VS instance element has the contract visibility layout
 inline constexpr uint8_t kPoolPassNearFadePs = 4u;  // the PS applies the map-object near fade
 inline constexpr uint8_t kPoolPassLight = 8u;       // VS projects with the light (shadow maps)
+inline constexpr uint8_t kPoolPassAlpha = 16u;       // PS alpha-tests (cutout material), admitted only with alpha_foliage on
 
 struct PoolSighting {
   uint8_t pass = 0u;     // kPoolPass* bits
   uint32_t ps_hash = 0u;
+};
+
+// Alpha material of a draw key (its first sighting): texture (t0 handle, 0 when unreadable),
+// threshold, UV scroll and swizzle from the material cbs.
+struct PoolAlphaMaterial {
+  uint64_t texture = 0u;
+  float threshold = 0.f;
+  float scroll[2] = {};
+  uint32_t swizzle = 0u;
+};
+
+// Material held by a draw key or a mesh, and whether a differing material was seen (AbsorbPoolAlphaMaterial).
+struct PoolAlphaState {
+  PoolAlphaMaterial material;
+  bool conflict = false;
 };
 
 struct WorldMesh {
@@ -308,8 +326,9 @@ struct WorldMesh {
   float bbox_min[3] = {};
   float bbox_max[3] = {};
   std::vector<std::array<float, 3>> positions;
+  std::vector<std::array<float, 2>> uvs;  // per position; empty when the layout has no UV
   std::vector<uint32_t> indices;  // flat, three per triangle
-  uint64_t signature = 0u;        // content hash (positions + indices)
+  uint64_t signature = 0u;        // content hash (positions + indices + UVs)
   uint32_t live_keys = 0u;        // draw keys still mapped to this mesh
   // Provenance (diagnostic): the draw whose copies produced the mesh.
   uint32_t capture_frame = 0u;
@@ -333,6 +352,9 @@ struct WorldMesh {
   // A draw key of this mesh was seen moving in a camera view (PoolDynamicMesh)
   // while "keep moving objects out" was on: no instance of it is admitted.
   bool dynamic = false;
+  // Alpha-tested material (MarkPoolMeshAlpha): no instance is admitted (AdmitPoolInstance refuses it).
+  bool alpha = false;
+  PoolAlphaState alpha_state;  // material and conflict of its alpha keys (AbsorbPoolAlphaMaterial)
 };
 
 struct WorldInstance {
@@ -400,6 +422,7 @@ struct ObservedInstance {
 // Positions and triangles of one decoded mesh (vertices remapped in first-use order).
 struct PoolDecodedMesh {
   std::vector<std::array<float, 3>> positions;
+  std::vector<std::array<float, 2>> uvs;  // per position, when the layout has a decodable UV
   std::vector<std::array<uint32_t, 3>> triangles;
   std::array<float, 3> bbox_min = {0.f, 0.f, 0.f};
   std::array<float, 3> bbox_max = {0.f, 0.f, 0.f};
@@ -528,6 +551,8 @@ struct PoolMeshRequest {
   DrawRecord draw;
   int32_t pos_offset = 0;
   reshade::api::format pos_format = reshade::api::format::unknown;
+  int32_t uv_offset = -1;  // -1: no decodable UV
+  reshade::api::format uv_format = reshade::api::format::unknown;
   PoolMeshPhase phase = PoolMeshPhase::Indices;
   bool in_flight = false;
   bool from_indirect = false;
@@ -595,6 +620,7 @@ struct PoolPendingCopy {
   uint64_t schedule_key = 0u;
   bool trace_only = false;  // prevWorld trace copy: not counted, not queued, not stamped
   bool follow = false;      // moving key in follow mode: the copy bypassed the cooldown
+  PoolAlphaMaterial alpha;  // indirect alpha draws: material read at the draw, flagged at resolve
 };
 
 // Normal copies keep the per-identity cooldown. Follow and Trace bypass it.
@@ -792,6 +818,16 @@ struct PoolStats {
   uint32_t dynamic_meshes_marked = 0u; // meshes flagged dynamic (counts re-flags after a switch change)
   uint32_t dynamic_retired = 0u;       // admitted instances removed with them
   uint64_t dynamic_blocked = 0u;       // admissions refused
+  // Alpha-tested foliage.
+  uint64_t alpha_draws = 0u;           // alpha-tested draws seen (material read or not)
+  uint64_t alpha_cb_unavailable = 0u;  // material not readable (unbound, offset, untracked): fails closed
+  uint64_t alpha_conflicts = 0u;       // keys whose draws read differing materials (first readable one kept)
+  uint64_t alpha_meshes_conflicted = 0u;  // meshes that took a conflicting key (refused until the conflict clears)
+  uint64_t alpha_conflict_refused = 0u;   // admissions refused: mesh conflict
+  uint64_t alpha_refused_off = 0u;     // admissions refused: alpha_foliage off
+  uint64_t alpha_no_uv = 0u;           // admissions refused: mesh has no UVs
+  uint64_t alpha_not_ready = 0u;       // admissions refused: material not on the GPU yet
+  uint64_t alpha_removed = 0u;         // instances removed by the alpha flag or the switch
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -943,6 +979,7 @@ struct PoolState {
   std::atomic_bool retry_unstable{false};  // diagnostic: unstable captures get kPoolMeshRetryRounds more rounds
   std::atomic_bool legacy_scale{false};   // instance scale limits of round 6 (0.05 .. 50)
   std::atomic_bool exclude_moving{false};  // meshes seen moving in a camera view stay out of the static pool
+  std::atomic_bool alpha_foliage{false};   // alpha-tested foliage (rigid, wind rest pose); session only, off by default
   std::atomic_bool follow_moving{true};    // moving meshes keep their instances, which follow the pose
   PoolInspectRecord inspect;               // last inspect result (bvh_debug.hpp), written by DumpWorldPool
   std::atomic_bool poison_staging{false};  // diagnostic: mesh staging cpu-visible, poisoned after each read
@@ -1027,6 +1064,8 @@ struct PoolState {
   // when the switch changes).
   std::unordered_map<uint64_t, PoolDynamicMesh> dynamic_keys;
   bool dynamic_applied = false;
+  std::unordered_map<uint64_t, PoolAlphaState> alpha_keys;  // by draw key; flags its mesh alpha-tested
+  bool alpha_off_applied = false;  // the switch-off removal ran (re-armed by switching on)
   uint64_t dynamic_revision = 0u;  // bumped when a moving instance changes pose (not a change of the set)
   PoolPrevTrace prev_trace;
 };
@@ -1585,6 +1624,20 @@ inline void OnDestroyDevicePool(reshade::api::device* device) {
 // Caller holds g_pool.mutex.
 inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uint32_t mesh_id, bool follow = false) {
   if (mesh_id >= g_pool.meshes.size()) return false;
+  if (g_pool.meshes[mesh_id].alpha) {
+    // Alpha-tested foliage: only with alpha_foliage on, with UVs, and once its material is on the
+    // GPU (alpha atlas, not built yet: refused, so the switch has no visible effect until then).
+    if (!g_pool.alpha_foliage.load(std::memory_order_relaxed)) {
+      g_pool.stats.alpha_refused_off += 1u;
+    } else if (g_pool.meshes[mesh_id].alpha_state.conflict) {
+      g_pool.stats.alpha_conflict_refused += 1u;
+    } else if (g_pool.meshes[mesh_id].uvs.empty()) {
+      g_pool.stats.alpha_no_uv += 1u;
+    } else {
+      g_pool.stats.alpha_not_ready += 1u;
+    }
+    return false;
+  }
   if (g_pool.meshes[mesh_id].dynamic && g_pool.exclude_moving.load(std::memory_order_relaxed)) {
     // Seen moving in a camera view (P2a): a pose of it would stay behind as a
     // ghost when it moves again.
@@ -1918,6 +1971,15 @@ inline bool PoolFollowMode() {
   return g_pool.follow_moving.load(std::memory_order_relaxed) && !g_pool.exclude_moving.load(std::memory_order_relaxed);
 }
 
+// Caller holds g_pool.mutex. Clears the admitted flag of the observations that map to a mesh.
+inline void ClearPoolMeshAdmitted(uint32_t mesh_id) {
+  for (auto& [key, observed] : g_pool.observations) {
+    if (!observed.admitted) continue;
+    const auto mesh_it = g_pool.mesh_by_key.find(key.mesh_key);
+    if (mesh_it != g_pool.mesh_by_key.end() && mesh_it->second == mesh_id) observed.admitted = false;
+  }
+}
+
 // Caller holds g_pool.mutex. Flags a mesh dynamic and removes its admitted
 // instances (their observations no longer count as admitted; AdmitPoolInstance
 // refuses them while the flag is set). Returns the instances removed.
@@ -1926,11 +1988,7 @@ inline uint32_t MarkPoolMeshDynamic(uint32_t mesh_id) {
   g_pool.meshes[mesh_id].dynamic = true;
   g_pool.stats.dynamic_meshes_marked += 1u;
   const uint32_t removed = RemovePoolInstances([mesh_id](const WorldInstance& instance) { return instance.mesh_id == mesh_id; });
-  for (auto& [key, observed] : g_pool.observations) {
-    if (!observed.admitted) continue;
-    const auto mesh_it = g_pool.mesh_by_key.find(key.mesh_key);
-    if (mesh_it != g_pool.mesh_by_key.end() && mesh_it->second == mesh_id) observed.admitted = false;
-  }
+  ClearPoolMeshAdmitted(mesh_id);
   g_pool.stats.dynamic_retired += removed;
   if (removed != 0u && g_pool.lifecycle_lines_logged < kPoolLifecycleLogLines) {
     g_pool.lifecycle_lines_logged += 1u;
@@ -1965,6 +2023,99 @@ inline void ApplyPoolDynamicSwitch() {
   }
 }
 
+// Caller holds g_pool.mutex. Removes the admitted instances of an alpha-tested mesh and
+// clears their observations' admitted flag (AdmitPoolInstance refuses them while off).
+inline uint32_t RetirePoolMeshAlpha(uint32_t mesh_id) {
+  const uint32_t removed = RemovePoolInstances([mesh_id](const WorldInstance& instance) { return instance.mesh_id == mesh_id; });
+  ClearPoolMeshAdmitted(mesh_id);
+  g_pool.stats.alpha_removed += removed;
+  return removed;
+}
+
+// Caller holds g_pool.mutex. Folds an incoming material into a key's or a mesh's state. An
+// unreadable material (texture 0) never conflicts; an empty state takes the first readable one;
+// a differing one sets conflict (bitwise float compare: a NaN threshold equals itself).
+// Returns true when conflict is newly set.
+inline bool AbsorbPoolAlphaMaterial(PoolAlphaState* held, const PoolAlphaMaterial& incoming, bool conflict) {
+  const bool was_conflict = held->conflict;
+  if (incoming.texture != 0u) {
+    const PoolAlphaMaterial& first = held->material;
+    if (first.texture == 0u) {
+      held->material = incoming;
+    } else if (first.texture != incoming.texture || first.swizzle != incoming.swizzle
+               || std::memcmp(&first.threshold, &incoming.threshold, sizeof(float)) != 0
+               || std::memcmp(first.scroll, incoming.scroll, sizeof(first.scroll)) != 0) {
+      held->conflict = true;
+    }
+  }
+  held->conflict = held->conflict || conflict;
+  return held->conflict && !was_conflict;
+}
+
+// Caller holds g_pool.mutex. Flags a mesh alpha-tested (MarkPoolMeshDynamic's pattern) and folds
+// its key's state into the mesh. Removes its instances when it is newly flagged or newly conflicted.
+inline uint32_t MarkPoolMeshAlpha(uint32_t mesh_id, const PoolAlphaState& key_state) {
+  if (mesh_id >= g_pool.meshes.size()) return 0u;
+  WorldMesh& mesh = g_pool.meshes[mesh_id];
+  const bool newly_flagged = !mesh.alpha;
+  mesh.alpha = true;
+  const bool newly_conflicted = AbsorbPoolAlphaMaterial(&mesh.alpha_state, key_state.material, key_state.conflict);
+  if (newly_conflicted) g_pool.stats.alpha_meshes_conflicted += 1u;
+  if (!newly_flagged && !newly_conflicted) return 0u;
+  return RetirePoolMeshAlpha(mesh_id);
+}
+
+// Caller holds g_pool.mutex. With alpha_foliage off, removes the instances of every
+// alpha-tested mesh once per switch-off.
+inline void ApplyPoolAlphaSwitch() {
+  if (g_pool.alpha_foliage.load(std::memory_order_relaxed)) {
+    g_pool.alpha_off_applied = false;
+    return;
+  }
+  if (g_pool.alpha_off_applied) return;
+  g_pool.alpha_off_applied = true;
+  for (uint32_t mesh_id = 0u; mesh_id < g_pool.meshes.size(); ++mesh_id) {
+    if (g_pool.meshes[mesh_id].alpha) RetirePoolMeshAlpha(mesh_id);
+  }
+}
+
+// Caller holds g_pool.mutex. Folds a draw's material into its key (a key whose draws read
+// differing materials is conflicted) and into the key's mesh when the mesh exists. A key
+// flagged before its mesh is captured is flagged at the capture (ApplyPoolMesh).
+inline void NotePoolAlphaMaterial(uint64_t mesh_key, const PoolAlphaMaterial& material) {
+  PoolAlphaState& key_state = g_pool.alpha_keys[mesh_key];
+  if (AbsorbPoolAlphaMaterial(&key_state, material, false)) g_pool.stats.alpha_conflicts += 1u;
+  const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
+  if (mesh_it != g_pool.mesh_by_key.end()) MarkPoolMeshAlpha(mesh_it->second, key_state);
+}
+
+// Reads the alpha material a pixel shader uses (t0 texture, b5 threshold and scroll,
+// b10 swizzle) for a draw whose pixel shader carries kTraitAlphaMaterial. False when
+// any part is not readable; the caller then flags the key with an empty material
+// (fails closed). Counts the draw in the alpha stats.
+inline bool ReadPoolAlphaDraw(reshade::api::command_list* cmd_list, const WorldCommandListData& cl_data, PoolAlphaMaterial* out) {
+  const reshade::api::resource material = cl_data.ps_cb[contract::kAlphaMaterialSlot];
+  const reshade::api::resource swizzle = cl_data.ps_cb[contract::kAlphaSwizzleSlot];
+  out->texture = cl_data.ps_srv[contract::kAlphaTexSlot].handle;
+  bool readable = out->texture != 0u && material.handle != 0u && cl_data.ps_cb_offset[contract::kAlphaMaterialSlot] == 0u;
+  std::array<uint8_t, contract::kAlphaThresholdOffset + sizeof(float)> bytes = {};
+  readable = readable && ReadTrackedCbBytes(cmd_list, material, bytes.data(), bytes.size());
+  if (readable) {
+    std::memcpy(&out->threshold, bytes.data() + contract::kAlphaThresholdOffset, sizeof(float));
+    std::memcpy(out->scroll, bytes.data() + contract::kAlphaUvScrollOffset, sizeof(out->scroll));
+    if (swizzle.handle != 0u) {
+      readable = cl_data.ps_cb_offset[contract::kAlphaSwizzleSlot] == 0u
+                 && ReadTrackedCbBytes(cmd_list, swizzle, &out->swizzle, sizeof(uint32_t));
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_pool.mutex);
+  g_pool.stats.alpha_draws += 1u;
+  if (!readable) {
+    g_pool.stats.alpha_cb_unavailable += 1u;
+    *out = {};
+  }
+  return readable;
+}
 // Verdict of one camera sighting (NotePoolMotion). Unknown: no evidence either way.
 enum class PoolSightingVerdict : uint8_t { Unknown, Still, Moving };
 
@@ -2308,6 +2459,7 @@ struct PoolDrawGate {
   PoolSkip skip = PoolSkip::None;
   PoolDrawState state = PoolDrawState::Ok;
   uint8_t pass = 0u;  // kPoolPass* bits, set when the draw passes the gate
+  bool alpha_material = false;  // alpha-tested pixel shader on a rigid or wind vertex shader (recorded even when skipped)
 };
 
 // Shader classes first, then draw state, then the pixel shader.
@@ -2315,7 +2467,9 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
   PoolDrawGate gate;
   const contract::ShaderTraits vs_traits = contract::LookupVertexTraits(draw.vs_pipeline);
   gate.vs_class = static_cast<contract::VsClass>(vs_traits.cls);
-  if (gate.vs_class != contract::VsClass::Rigid) {
+  // Wind foliage is captured as its rest pose (instance world, no sway) only while alpha_foliage is on.
+  const bool alpha_on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+  if (gate.vs_class != contract::VsClass::Rigid && (gate.vs_class != contract::VsClass::Wind || !alpha_on)) {
     gate.skip = PoolSkip::NotRigid;
     return gate;
   }
@@ -2326,16 +2480,25 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
   }
   const contract::ShaderTraits ps_traits = contract::LookupPixelTraits(draw.ps_pipeline);
   const auto ps_class = static_cast<contract::PsClass>(ps_traits.cls);
-  if (ps_class == contract::PsClass::AlphaTested) {
+  // The material is read only for a pixel shader the classifier gave the material layout (kTraitAlphaMaterial).
+  const bool alpha_class = ps_class == contract::PsClass::AlphaTested;
+  const bool alpha = alpha_class && alpha_on && (ps_traits.flags & contract::kTraitAlphaMaterial) != 0u;
+  gate.alpha_material = alpha;
+  if (alpha_class && !alpha_on) {
     gate.skip = PoolSkip::AlphaTested;
-  } else if (ps_class != contract::PsClass::Opaque) {
+  } else if (alpha_class && !alpha) {
     gate.skip = PoolSkip::PixelUnknown;
+  } else if (!alpha_class && ps_class != contract::PsClass::Opaque) {
+    gate.skip = PoolSkip::PixelUnknown;
+  } else if (gate.vs_class == contract::VsClass::Wind && !alpha) {
+    gate.skip = PoolSkip::WindOpaque;
   }
   if (gate.skip == PoolSkip::None) {
     gate.pass = static_cast<uint8_t>(((vs_traits.flags & contract::kTraitCameraView) != 0u ? kPoolPassCamera : 0u)
                                      | ((vs_traits.flags & contract::kTraitLightView) != 0u ? kPoolPassLight : 0u)
                                      | ((vs_traits.flags & contract::kTraitVisibilityLayout) != 0u ? kPoolPassVisibility : 0u)
-                                     | ((ps_traits.flags & contract::kTraitNearFade) != 0u ? kPoolPassNearFadePs : 0u));
+                                     | ((ps_traits.flags & contract::kTraitNearFade) != 0u ? kPoolPassNearFadePs : 0u)
+                                     | (alpha ? kPoolPassAlpha : 0u));
   }
   return gate;
 }
@@ -2490,7 +2653,7 @@ inline void FailPoolMesh(std::unordered_map<uint64_t, PoolMeshRequest>::iterator
 // Position layout of a draw's vertex stream 0, from its input layout.
 // Returns nullptr when usable, else why not.
 inline const char* ResolvePoolMeshLayout(
-    const DrawRecord& draw, int32_t* pos_offset, reshade::api::format* pos_format) {
+    const DrawRecord& draw, int32_t* pos_offset, reshade::api::format* pos_format, int32_t* uv_offset, reshade::api::format* uv_format) {
   namespace scene = renodx::utils::scene;
   if (draw.method != 1u || !draw.has_index_buffer || draw.vb.handle == 0u || draw.ib.handle == 0u) {
     return "not an indexed draw";
@@ -2520,6 +2683,14 @@ inline const char* ResolvePoolMeshLayout(
   }
   *pos_offset = layout.pos_off;
   *pos_format = layout.pos_format;
+  // A UV the vertex does not fully hold is left out (its meshes are not alpha-testable).
+  const scene::FormatInfo* uv_info = layout.uv_off >= 0 ? scene::FindFormatInfo(layout.uv_format) : nullptr;
+  *uv_offset = -1;
+  *uv_format = reshade::api::format::unknown;
+  if (uv_info != nullptr && static_cast<uint64_t>(layout.uv_off) + uv_info->byte_size <= draw.vb_stride) {
+    *uv_offset = layout.uv_off;
+    *uv_format = layout.uv_format;
+  }
   return nullptr;
 }
 
@@ -2562,7 +2733,7 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
   request.last_frame = g_state.frame.load();
   request.draw = draw;
   request.from_indirect = from_indirect;
-  const char* error = ResolvePoolMeshLayout(draw, &request.pos_offset, &request.pos_format);
+  const char* error = ResolvePoolMeshLayout(draw, &request.pos_offset, &request.pos_format, &request.uv_offset, &request.uv_format);
   if (error != nullptr) {
     RecordPoolMeshFailure(request, error);
     return;
@@ -2721,6 +2892,8 @@ inline void OnPoolScanDraw(
   const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, true);
+  PoolAlphaMaterial alpha_material;
+  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, &alpha_material);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   const uint32_t count = draw.instance_count == 0u ? 1u : draw.instance_count;
@@ -2745,6 +2918,7 @@ inline void OnPoolScanDraw(
   bool trace_declined = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material);
     g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
     if (deferred) g_pool.stats.draws_on_deferred += 1u;
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
@@ -2836,6 +3010,8 @@ inline void OnPoolScanIndirectDraw(
   const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, false);
+  PoolAlphaMaterial alpha_material;
+  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, &alpha_material);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   stage.Set("indirect draw: slice");
@@ -2908,6 +3084,7 @@ inline void OnPoolScanIndirectDraw(
       copy.vs_hash = draw.vs_hash;
       copy.ps_hash = draw.ps_hash;
       copy.pass = gate.pass;
+      copy.alpha = alpha_material;
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
       copy.schedule_key = schedule_key;
       copy.follow = follow;
@@ -2948,6 +3125,7 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.mesh_queued.erase(mesh_key);
   g_pool.failed_meshes.erase(mesh_key);
   g_pool.mesh_retry.erase(mesh_key);
+  g_pool.alpha_keys.erase(mesh_key);
   g_pool.invalidated_keys.insert(mesh_key);
   // A queued mesh is forgotten; a copy of it still in flight is dropped when
   // read (no request with its serial is left).
@@ -3107,6 +3285,18 @@ inline void CompactPool() {
   }
 
   for (const uint64_t key : invalidated) g_pool.dynamic_keys.erase(key);
+  // An alpha mesh keeps its flag and conflict only while an alpha key still maps to it.
+  std::vector<bool> alpha_held(g_pool.meshes.size(), false);
+  for (const auto& alpha_key : g_pool.alpha_keys) {
+    const auto mesh_it = g_pool.mesh_by_key.find(alpha_key.first);
+    if (mesh_it != g_pool.mesh_by_key.end() && mesh_it->second < alpha_held.size()) alpha_held[mesh_it->second] = true;
+  }
+  for (WorldMesh& mesh : g_pool.meshes) {
+    if (mesh.alpha && !alpha_held[mesh.mesh_id]) {
+      mesh.alpha = false;
+      mesh.alpha_state = {};
+    }
+  }
   if (g_pool.dynamic_applied) {
     // A mesh stays flagged only while a moving key still maps to it (mesh_by_key is already remapped).
     std::vector<bool> held(g_pool.meshes.size(), false);
@@ -3130,6 +3320,13 @@ inline uint64_t PoolMeshSignature(const PoolDecodedMesh& mesh) {
   uint64_t hash = 1469598103934665603ull;
   for (const auto& position : mesh.positions) {
     for (const float value : position) {
+      uint32_t bits = 0u;
+      std::memcpy(&bits, &value, sizeof(bits));
+      hash = PoolMix(hash, bits);
+    }
+  }
+  for (const auto& uv : mesh.uvs) {
+    for (const float value : uv) {
       uint32_t bits = 0u;
       std::memcpy(&bits, &value, sizeof(bits));
       hash = PoolMix(hash, bits);
@@ -3189,6 +3386,7 @@ inline const char* ApplyPoolMesh(
     std::memcpy(world_mesh.bbox_min, mesh.bbox_min.data(), sizeof(float) * 3u);
     std::memcpy(world_mesh.bbox_max, mesh.bbox_max.data(), sizeof(float) * 3u);
     world_mesh.positions = std::move(mesh.positions);
+    world_mesh.uvs = std::move(mesh.uvs);
     world_mesh.indices.reserve(mesh.triangles.size() * 3u);
     for (const auto& triangle : mesh.triangles) {
       world_mesh.indices.push_back(triangle[0]);
@@ -3205,6 +3403,8 @@ inline const char* ApplyPoolMesh(
   g_pool.mesh_by_key[mesh_key] = mesh_id;
   const auto dynamic = g_pool.dynamic_keys.find(mesh_key);
   if (dynamic != g_pool.dynamic_keys.end()) ApplyPoolDynamicKey(mesh_key, dynamic->second);  // seen moving before its capture
+  const auto alpha_key = g_pool.alpha_keys.find(mesh_key);
+  if (alpha_key != g_pool.alpha_keys.end()) MarkPoolMeshAlpha(mesh_id, alpha_key->second);  // alpha before its capture
   AdmitPendingInstancesForMesh(mesh_key, mesh_id);
   return outcome;
 }
@@ -3270,6 +3470,8 @@ inline const char* DecodePoolMeshVertices(
     uint32_t stride,
     int32_t pos_offset,
     reshade::api::format pos_format,
+    int32_t uv_offset,
+    reshade::api::format uv_format,
     const std::vector<uint32_t>& indices,
     uint32_t min_vertex,
     uint32_t max_vertex,
@@ -3284,6 +3486,10 @@ inline const char* DecodePoolMeshVertices(
   }
   std::vector<uint32_t> remap(static_cast<size_t>(vertex_count), UINT32_MAX);
   mesh->positions.clear();
+  mesh->uvs.clear();
+  const scene::FormatInfo* uv_info = uv_offset >= 0 ? scene::FindFormatInfo(uv_format) : nullptr;
+  const uint64_t uv_end = uv_info != nullptr ? static_cast<uint64_t>(uv_offset) + uv_info->byte_size : 0u;
+  if (uv_end > stride || size < (vertex_count - 1u) * stride + uv_end) uv_info = nullptr;  // UVs the copy does not hold
   mesh->triangles.clear();
   mesh->triangles.reserve(indices.size() / 3u);
   for (size_t i = 0; i + 2u < indices.size(); i += 3u) {
@@ -3301,12 +3507,20 @@ inline const char* DecodePoolMeshVertices(
         }
         fresh = static_cast<uint32_t>(mesh->positions.size());
         mesh->positions.push_back({position[0], position[1], position[2]});
+        if (uv_info != nullptr) {
+          float uv[4] = {};
+          const uint8_t* uv_vertex = bytes + static_cast<uint64_t>(absolute - min_vertex) * stride + uv_offset;
+          if (scene::DecodeAttribute(uv_vertex, *uv_info, uv) && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
+            mesh->uvs.push_back({uv[0], uv[1]});
+          }
+        }
       }
       triangle[k] = fresh;
     }
     mesh->triangles.push_back(triangle);
   }
   if (mesh->positions.empty()) return "no vertices decoded";
+  if (mesh->uvs.size() != mesh->positions.size()) mesh->uvs.clear();
   mesh->bbox_min = mesh->positions[0];
   mesh->bbox_max = mesh->positions[0];
   for (const auto& position : mesh->positions) {
@@ -3328,7 +3542,7 @@ inline void LogPoolSwitches() {
                         ", capture meshes ", on(g_pool.capture_meshes), ", scan indirect draws ", on(g_pool.scan_indirect),
                         ", verify mesh captures ", on(g_pool.verify_meshes), ", legacy scale limits ",
                         on(g_pool.legacy_scale), ", keep moving objects out ", on(g_pool.exclude_moving),
-                        ", follow moving objects ", on(g_pool.follow_moving), ", retry unstable meshes ", on(g_pool.retry_unstable));
+                        ", follow moving objects ", on(g_pool.follow_moving), ", retry unstable meshes ", on(g_pool.retry_unstable), ", alpha foliage ", on(g_pool.alpha_foliage));
 }
 
 // Short text for how a VB/IB was created (reshade::api resource_usage /
@@ -3351,7 +3565,9 @@ inline void ComparePoolMeshes(
   const size_t triangles = (std::min)(previous.triangles.size(), current.triangles.size());
   for (size_t t = 0; t < triangles; ++t) {
     for (int k = 0; k < 3; ++k) {
-      if (previous.positions[previous.triangles[t][k]] != current.positions[current.triangles[t][k]]) {
+      const bool uv_differs = previous.uvs.size() != current.uvs.size()
+                              || (!previous.uvs.empty() && previous.uvs[previous.triangles[t][k]] != current.uvs[current.triangles[t][k]]);
+      if (previous.positions[previous.triangles[t][k]] != current.positions[current.triangles[t][k]] || uv_differs) {
         if (*first == SIZE_MAX) *first = t;
         *differing += 1u;
         break;
@@ -3539,6 +3755,8 @@ struct PoolMeshJob {
   uint32_t stride = 0u;
   int32_t pos_offset = 0;
   reshade::api::format pos_format = reshade::api::format::unknown;
+  int32_t uv_offset = -1;
+  reshade::api::format uv_format = reshade::api::format::unknown;
   std::vector<uint32_t> indices;  // index read: output; vertex read: moved from the request
   uint32_t min_vertex = 0u;
   uint32_t max_vertex = 0u;
@@ -3648,6 +3866,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         job.stride = queued.draw.vb_stride;
         job.pos_offset = queued.pos_offset;
         job.pos_format = queued.pos_format;
+        job.uv_offset = g_pool.alpha_keys.count(queued.mesh_key) != 0u ? queued.uv_offset : -1;
+        job.uv_format = queued.uv_format;
         job.min_vertex = queued.min_vertex;
         job.max_vertex = queued.max_vertex;
         if (copy.phase == PoolMeshPhase::Vertices) job.indices = std::move(queued.indices);
@@ -3756,8 +3976,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
                                           job.stride, &job.indices, &job.min_vertex, &job.max_vertex,
                                           &job.raw_index_min, &job.raw_index_max, job.first_raw);
       } else {
-        job.error = DecodePoolMeshVertices(data, job.copy.size, job.stride, job.pos_offset, job.pos_format, job.indices,
-                                           job.min_vertex, job.max_vertex, &job.mesh);
+        job.error = DecodePoolMeshVertices(data, job.copy.size, job.stride, job.pos_offset, job.pos_format, job.uv_offset,
+                                           job.uv_format, job.indices, job.min_vertex, job.max_vertex, &job.mesh);
       }
     }
     device->unmap_buffer_region(mesh_buffer);
@@ -3957,6 +4177,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         record.vertex_offset = static_cast<int32_t>(result.args[3]);
         record.first_instance = result.args[4];
         mesh_key = PoolMeshKey(record);
+        if ((copy.pass & kPoolPassAlpha) != 0u) NotePoolAlphaMaterial(mesh_key, copy.alpha);
         QueuePoolMesh(mesh_key, copy.vs_hash, record, true);
       }
 
@@ -4076,6 +4297,7 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     CompactPool();
     ApplyPoolDynamicSwitch();
+    ApplyPoolAlphaSwitch();
     if (scanning) {
       if (g_pool.stats.scan_first_frame == 0u) g_pool.stats.scan_first_frame = frame;
       g_pool.stats.scan_last_frame = frame;
@@ -4297,6 +4519,8 @@ inline void ResetWorldPool() {
   g_pool.motion_detail = {};
   g_pool.dynamic_keys.clear();
   g_pool.dynamic_applied = false;  // re-applied at the next present
+  g_pool.alpha_keys.clear();
+  g_pool.alpha_off_applied = false;
   g_pool.prev_trace = {};
   g_pool.logged_invalidations = 0u;
   g_pool.mismatch_lines_logged = 0u;
@@ -4710,6 +4934,7 @@ inline void DumpWorldPool() {
   std::vector<PoolCameraVisibility> visibility;  // per instance
   std::unordered_map<uint32_t, PoolFamilyStats> families;
   PoolStats stats;
+  uint64_t alpha_key_count = 0u;
   PoolMotionDetail motion_detail;
   std::vector<PoolDynamicDumpEntry> dynamic;
   std::unordered_map<uint64_t, PoolMeshFailure> failed_meshes;
@@ -4742,6 +4967,7 @@ inline void DumpWorldPool() {
     }
     families = g_pool.families;
     stats = g_pool.stats;
+    alpha_key_count = g_pool.alpha_keys.size();
     failed_meshes = g_pool.failed_meshes;
     mismatch_meshes = g_pool.mismatch_meshes;
     mesh_retry = g_pool.mesh_retry;
@@ -4777,12 +5003,21 @@ inline void DumpWorldPool() {
   const uint32_t frame = g_state.frame.load();
   std::ostringstream out;
   out << "{\n";
-  out << "  \"schema\": 14,\n";
+  out << "  \"schema\": 15,\n";
   out << "  \"generated_frame\": " << frame << ",\n";
   out << "  \"files\": {\"summary\": \"world_pool.json\", \"meshes\": \"world_pool_meshes.json\", \"instances\": \"world_pool_instances.json\"},\n";
   out << "  \"meshes_total\": " << meshes.size() << ", \"instances_total\": " << instances.size()
       << ", \"instances_written\": " << (std::min)(instances.size(), kPoolDumpMaxInstances) << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
+  out << "  \"alpha\": {\"alpha_foliage\": " << (g_pool.alpha_foliage.load() ? "true" : "false") << ", \"draws\": " << stats.alpha_draws
+      << ", \"cb_unavailable\": " << stats.alpha_cb_unavailable << ", \"conflicts\": " << stats.alpha_conflicts
+      << ", \"meshes_conflicted\": " << stats.alpha_meshes_conflicted
+      << ", \"refused_off\": " << stats.alpha_refused_off << ", \"conflict_refused\": " << stats.alpha_conflict_refused
+      << ", \"no_uv\": " << stats.alpha_no_uv
+      << ", \"not_ready\": " << stats.alpha_not_ready << ", \"removed\": " << stats.alpha_removed
+      << ", \"keys\": " << alpha_key_count
+      << ", \"billboard_draws\": " << stats.draws_by_vs_class[static_cast<size_t>(contract::VsClass::Billboard)]
+      << ", \"wind_opaque_skips\": " << stats.skips[static_cast<size_t>(PoolSkip::WindOpaque)] << "},\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
       << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";
@@ -5020,7 +5255,7 @@ inline void DumpWorldPool() {
                              stats.visibility_changes);
 
   std::ostringstream meshes_out;
-  meshes_out << "{\n  \"schema\": 14,\n  \"generated_frame\": " << frame << ",\n  \"meshes\": [";
+  meshes_out << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"meshes\": [";
   first = true;
   for (const auto& mesh : meshes) {
     if (!first) meshes_out << ",";
@@ -5038,6 +5273,8 @@ inline void DumpWorldPool() {
         << ", \"verified\": " << (mesh.verified ? "true" : "false")
         << ", \"vb\": \"" << PoolBufferText(mesh.source_vb_usage, mesh.source_vb_flags) << "\""
         << ", \"ib\": \"" << PoolBufferText(mesh.source_ib_usage, mesh.source_ib_flags) << "\""
+        << ", \"alpha\": " << (mesh.alpha ? "true" : "false") << ", \"uvs\": " << mesh.uvs.size()
+        << ", \"alpha_conflict\": " << (mesh.alpha_state.conflict ? "true" : "false")
         << ", \"camera_draws\": " << mesh.camera_draws
         << ", \"near_fade_draws\": " << mesh.camera_near_fade_draws
         << ", \"light_draws\": " << mesh.light_draws
@@ -5053,7 +5290,7 @@ inline void DumpWorldPool() {
   meshes_out << "\n  ]\n}\n";
 
   std::ostringstream instances_out;
-  instances_out << "{\n  \"schema\": 14,\n  \"generated_frame\": " << frame << ",\n  \"instances\": [";
+  instances_out << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"instances\": [";
   first = true;
   for (size_t i = 0; i < instances.size() && i < kPoolDumpMaxInstances; ++i) {
     const WorldInstance& instance = instances[i];
