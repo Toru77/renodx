@@ -749,6 +749,186 @@ static void FollowInstance(uint64_t key, float from_x, float from_z, float to_x,
   bvh::FollowPoolMovingInstance(key, 0x1000u, world, prev, true, frame, bvh::PoolSightingVerdict::Moving);
 }
 
+struct F2 {
+  float x;
+  float y;
+};
+
+// Step 4 (alpha-tested foliage, CPU transcriptions): IntersectTriangle with barycentrics, AlphaCutHit,
+// the nearest non-cut hit (the any-hit semantics of TraceBlas), the blit's packing, and the TLAS descriptor's
+// material slot. The GPU side is compiled (FXC) and runs in game; these checks transcribe its arithmetic.
+static bool TriBary(F3 o, F3 d, F3 v0, F3 v1, F3 v2, float* t, float* bu, float* bv) {
+  const F3 edge1 = v1 - v0;
+  const F3 edge2 = v2 - v0;
+  const F3 p = Cross(d, edge2);
+  const float det = Dot(edge1, p);
+  if (std::fabs(det) < 1e-12f) return false;
+  const float inv_det = 1.f / det;
+  const F3 tv = o - v0;
+  const float u = Dot(tv, p) * inv_det;
+  if (u < 0.f || u > 1.f) return false;
+  const F3 q = Cross(tv, edge1);
+  const float v = Dot(d, q) * inv_det;
+  if (v < 0.f || u + v > 1.f) return false;
+  const float hit_t = Dot(edge2, q) * inv_det;
+  if (hit_t <= 0.f) return false;
+  *t = hit_t;
+  *bu = u;
+  *bv = v;
+  return true;
+}
+
+// The atlas slice as the GPU reads it: 256 words per row, 256 rows; texel x is byte x & 3 of word x >> 2.
+// Transcribes AlphaCutHit (world_bvh_trace.hlsli) after the UV lookup: true when the texel is cut.
+static bool AlphaCutCpu(const std::vector<uint32_t>& slice, float threshold, F2 scroll, F2 uv0, F2 uv1, F2 uv2, float bu, float bv) {
+  const float uvx = (1.f - bu - bv) * uv0.x + bu * uv1.x + bv * uv2.x;
+  const float uvy = (1.f - bu - bv) * uv0.y + bu * uv1.y + bv * uv2.y;
+  const float tx = uvx + scroll.x;
+  const float fx = tx - std::floor(tx);
+  const float ty = 1.f - (uvy + scroll.y);
+  const float fy = ty - std::floor(ty);
+  const uint32_t x = (std::min)(static_cast<uint32_t>(std::floor(fx * 1024.f)), 1023u);
+  const uint32_t y = (std::min)(static_cast<uint32_t>(std::floor(fy * 256.f)), 255u);
+  const uint32_t word = slice[y * 256u + (x >> 2u)];
+  const uint32_t texel = (word >> ((x & 3u) * 8u)) & 0xFFu;
+  return static_cast<float>(texel) * (1.f / 255.f) - threshold < 0.f;
+}
+
+static void TestAlphaCut() {
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  long long hits = 0, cut = 0, bad_bary = 0, bad_nearest = 0;
+  for (int scene = 0; scene < 40; ++scene) {
+    std::vector<uint32_t> slice(256u * 256u);
+    for (uint32_t& word : slice) word = static_cast<uint32_t>(rng());
+    const float threshold = unit(rng);
+    const F2 scroll = {unit(rng) * 4.f - 2.f, unit(rng) * 4.f - 2.f};
+    std::vector<std::array<F3, 3>> tris;
+    std::vector<std::array<F2, 3>> uvs;
+    for (int i = 0; i < 24; ++i) {
+      std::array<F3, 3> tri;
+      std::array<F2, 3> uv;
+      for (int k = 0; k < 3; ++k) {
+        tri[k] = {unit(rng) * 10.f - 5.f, unit(rng) * 10.f - 5.f, unit(rng) * 10.f - 5.f};
+        uv[k] = {unit(rng) * 4.f - 2.f, unit(rng) * 4.f - 2.f};
+      }
+      tris.push_back(tri);
+      uvs.push_back(uv);
+    }
+    for (int r = 0; r < 300; ++r) {
+      const F3 o = {unit(rng) * 14.f - 7.f, unit(rng) * 14.f - 7.f, unit(rng) * 14.f - 7.f};
+      const F3 target = {unit(rng) * 10.f - 5.f, unit(rng) * 10.f - 5.f, unit(rng) * 10.f - 5.f};
+      const F3 d = target - o;
+      // Any-hit as TraceBlas runs it: a cut triangle is skipped and leaves t_max alone.
+      float best = std::numeric_limits<float>::infinity();
+      int best_tri = -1;
+      std::vector<std::pair<float, int>> all;
+      for (int i = 0; i < static_cast<int>(tris.size()); ++i) {
+        float t = 0.f, bu = 0.f, bv = 0.f;
+        if (!TriBary(o, d, tris[i][0], tris[i][1], tris[i][2], &t, &bu, &bv)) continue;
+        hits += 1;
+        all.push_back({t, i});
+        const bool is_cut = AlphaCutCpu(slice, threshold, scroll, uvs[i][0], uvs[i][1], uvs[i][2], bu, bv);
+        if (is_cut) {
+          cut += 1;
+          continue;
+        }
+        if (t < best) {
+          best = t;
+          best_tri = i;
+        }
+        // The barycentrics rebuild the hit point.
+        const F3 p = o + d * t;
+        const F3 q = tris[i][0] * (1.f - bu - bv) + tris[i][1] * bu + tris[i][2] * bv;
+        if (std::fabs(p.x - q.x) + std::fabs(p.y - q.y) + std::fabs(p.z - q.z) > 1e-3f) bad_bary += 1;
+      }
+      // Reference: the nearest hit in t order that is not cut.
+      std::sort(all.begin(), all.end());
+      int ref_tri = -1;
+      for (const auto& hit : all) {
+        const int i = hit.second;
+        float t = 0.f, bu = 0.f, bv = 0.f;
+        TriBary(o, d, tris[i][0], tris[i][1], tris[i][2], &t, &bu, &bv);
+        if (!AlphaCutCpu(slice, threshold, scroll, uvs[i][0], uvs[i][1], uvs[i][2], bu, bv)) {
+          ref_tri = i;
+          break;
+        }
+      }
+      if (ref_tri != best_tri) bad_nearest += 1;
+    }
+  }
+  CHECK(hits > 1000 && cut > 0 && cut < hits, "triangle hits %lld, cut %lld", hits, cut);
+  CHECK(bad_bary == 0, "barycentrics rebuild the hit point (%lld bad)", bad_bary);
+  CHECK(bad_nearest == 0, "nearest non-cut hit equals the reference (%lld bad)", bad_nearest);
+  std::printf("alpha cut: %lld triangle hits, %lld cut, bary mismatches %lld, nearest mismatches %lld\n", hits, cut, bad_bary, bad_nearest);
+}
+
+// The blit (world_alpha_blit.cs_5_0.hlsl) in float: texel (x, y) of the slice samples the source at its centre
+// ((x + 0.5) / 1024, (y + 0.5) / 256) with bilinear filtering and clamp, quantised as saturate(a) * 255 + 0.5,
+// four texels per uint. Compared with a double-precision reference: at most 1 LSB apart.
+static void TestBlitPacking() {
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  int worst = 0;
+  long long texels = 0;
+  for (int scene = 0; scene < 12; ++scene) {
+    const int width = 1 + static_cast<int>(rng() % 64u);
+    const int height = 1 + static_cast<int>(rng() % 64u);
+    std::vector<float> source(static_cast<size_t>(width) * height);
+    for (float& a : source) a = unit(rng);
+    auto texel_at = [&](int x, int y) {
+      x = (std::max)(0, (std::min)(x, width - 1));
+      y = (std::max)(0, (std::min)(y, height - 1));
+      return source[static_cast<size_t>(y) * width + x];
+    };
+    for (uint32_t y = 0; y < falcom_world::kAlphaSliceTexelsY; ++y) {
+      for (uint32_t word = 0; word < falcom_world::kAlphaSliceWords; ++word) {
+        uint8_t gpu[4] = {};
+        uint8_t ref[4] = {};
+        for (uint32_t k = 0; k < 4u; ++k) {
+          const uint32_t x = word * 4u + k;
+          const float u = (static_cast<float>(x) + 0.5f) / 1024.f;
+          const float v = (static_cast<float>(y) + 0.5f) / 256.f;
+          const float fx = u * static_cast<float>(width) - 0.5f;
+          const float fy = v * static_cast<float>(height) - 0.5f;
+          const float ax = fx - std::floor(fx);
+          const float ay = fy - std::floor(fy);
+          const int x0 = static_cast<int>(std::floor(fx));
+          const int y0 = static_cast<int>(std::floor(fy));
+          const float a = (1.f - ax) * (1.f - ay) * texel_at(x0, y0) + ax * (1.f - ay) * texel_at(x0 + 1, y0)
+                          + (1.f - ax) * ay * texel_at(x0, y0 + 1) + ax * ay * texel_at(x0 + 1, y0 + 1);
+          gpu[k] = static_cast<uint8_t>((std::min)(std::max(a, 0.f), 1.f) * 255.f + 0.5f);
+          const double dx = (static_cast<double>(x) + 0.5) / 1024.0 * width - 0.5;
+          const double dy = (static_cast<double>(y) + 0.5) / 256.0 * height - 0.5;
+          const double tx = dx - std::floor(dx);
+          const double ty = dy - std::floor(dy);
+          const int rx = static_cast<int>(std::floor(dx));
+          const int ry = static_cast<int>(std::floor(dy));
+          const double rd = (1.0 - tx) * (1.0 - ty) * texel_at(rx, ry) + tx * (1.0 - ty) * texel_at(rx + 1, ry)
+                            + (1.0 - tx) * ty * texel_at(rx, ry + 1) + tx * ty * texel_at(rx + 1, ry + 1);
+          ref[k] = static_cast<uint8_t>(std::floor((std::min)((std::max)(rd, 0.0), 1.0) * 255.0 + 0.5));
+        }
+        const uint32_t packed = falcom_world::PackAlphaTexels(gpu);
+        for (uint32_t k = 0; k < 4u; ++k) {
+          const int diff = std::abs(static_cast<int>((packed >> (k * 8u)) & 0xFFu) - static_cast<int>(ref[k]));
+          worst = (std::max)(worst, diff);
+          texels += 1;
+        }
+      }
+    }
+  }
+  CHECK(worst <= 1, "blit packing within 1 LSB of the reference (worst %d over %lld texels)", worst, texels);
+  std::printf("blit packing: worst %d LSB over %lld texels\n", worst, texels);
+
+  // The TLAS descriptor carries the material slot (slice + 1) in header.z; the trace reads it there.
+  bvh::LiveTlasInstance instance;
+  instance.material = 5u;
+  const bvh::WorldInstanceGPU descriptor = bvh::MakeLiveInstanceGPU(instance, 3u);
+  CHECK(descriptor.header[0] == 3.f && descriptor.header[2] == 5.f, "descriptor header: mesh %f, material %f", descriptor.header[0], descriptor.header[2]);
+  bvh::LiveTlasInstance plain;
+  CHECK(bvh::MakeLiveInstanceGPU(plain, 1u).header[2] == 0.f, "no material: header.z 0");
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Stage("main start");
@@ -826,6 +1006,9 @@ int main() {
     CHECK(data->live.gpu_checked && data->live.gpu_ok, "GPU check");
     CHECK(renodx::utils::scene::g_readback_calls > calls, "check reads back");
   }
+  CHECK(data->uvs.buffer.handle == 0u && data->uvs.capacity == 0u && data->uvs.used == 0u, "no UV arena without UV meshes");
+  for (const bvh::LiveMeshSlot& slot : data->slots) CHECK(slot.uv_count == 0u, "slot without UVs (uid %llx)", (unsigned long long)slot.uid);
+  for (const bvh::WorldMeshGPU& d : data->mesh_descriptors) CHECK(d.bbox_min[3] == 0.f, "descriptor bbox_min.w is 0 without UVs");
 
   // 2. A new instance: TLAS rebuilt once the interval has passed.
   Stage("2 new instance");
@@ -1406,6 +1589,43 @@ int main() {
   for (int i = 0; i < 9; ++i) present();
   CHECK(!data->bvh_ready && data->live.tlas_instances == 0u, "empty BVH");
 
+  // 11b. UV arena (alpha foliage): a mesh with UVs gets them in the arena and bbox_min.w = uv_offset + 1;
+  // a mesh without UVs keeps bbox_min.w = 0 and adds nothing to the arena. The GPU check reads the arena back.
+  Stage("11b UV arena");
+  {
+    bvh::PoolDecodedMesh uv_mesh = BoxMesh(1.f);
+    for (const auto& p : uv_mesh.positions) uv_mesh.uvs.push_back({p[1] * 0.5f + 0.5f, p[2] * 0.5f + 0.5f});
+    AddMesh(0x1D, uv_mesh);
+    AddMesh(0x1E, BoxMesh(2.f));
+    present();
+    CHECK(data->slots.size() == 2u && data->uvs.used == uv_mesh.uvs.size(), "UV arena holds the UV mesh only (%zu, %llu)", data->slots.size(),
+          (unsigned long long)data->uvs.used);
+    const bvh::LiveMeshSlot* uv_slot = nullptr;
+    size_t uv_index = 0u;
+    for (size_t i = 0; i < data->slots.size(); ++i) {
+      if (data->slots[i].uv_count != 0u) { uv_slot = &data->slots[i]; uv_index = i; }
+    }
+    CHECK(uv_slot != nullptr && uv_slot->uv_count == uv_mesh.uvs.size(), "UV slot has one UV per vertex");
+    if (uv_slot != nullptr) {
+      CHECK(data->mesh_descriptors[uv_index].bbox_min[3] == static_cast<float>(uv_slot->uv_offset + 1u), "descriptor bbox_min.w = uv_offset + 1");
+      CHECK(data->mesh_descriptors[1 - uv_index].bbox_min[3] == 0.f, "mesh without UVs: bbox_min.w 0");
+      const Res& uvs = dev.res[data->uvs.buffer.handle];
+      CHECK(std::memcmp(uvs.bytes.data() + static_cast<size_t>(uv_slot->uv_offset) * 8u, uv_mesh.uvs.data(), uv_mesh.uvs.size() * 8u) == 0,
+            "UV bytes in the arena match");
+    }
+    CHECK(data->live.used_bytes == data->vertices.used * 16u + data->indices.used * 4u + data->blas_leaves.used * sizeof(bvh::BVHLeafGPU)
+          + data->blas_nodes.used * sizeof(bvh::BVHNodeGPU) + data->uvs.used * 8u, "used bytes count the UV arena");
+    bvh::g_live_bvh.check_requested.store(true);
+    present();
+    CHECK(data->live.gpu_ok, "GPU check with UVs: %s", data->live.gpu_result.c_str());
+    bvh::ResetWorldPool();
+    present();
+    CHECK(data->uvs.used == 0u && data->live.resident_meshes == 0u, "UV arena released with the pool");
+  }
+
+  Stage("11c alpha cut and blit (CPU)");
+  TestAlphaCut();
+  TestBlitPacking();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

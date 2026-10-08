@@ -28,6 +28,7 @@
 #include "../../../../utils/log.hpp"
 #include "../../../../utils/scene.hpp"
 #include "bvh_build.hpp"
+#include "alpha_atlas.hpp"
 #include "bvh_pool.hpp"
 #include "camera_fade.hpp"
 #include "gpu_timer.hpp"
@@ -76,6 +77,9 @@ struct BvhTraceStats {
   uint32_t compare_far = 0u;
   uint32_t compare_sky = 0u;
   uint32_t compare_no_depth = 0u;
+  // Alpha-tested foliage: triangle hits tested against the atlas, and those cut (invalid reads count as invalid_refs).
+  uint32_t alpha_tests = 0u;
+  uint32_t alpha_cut = 0u;
   // Rays whose nearest BVH surface the game camera does not show: an instance
   // no camera VS drew, or a near-faded surface (shown in the view when hiding
   // is off; skipped when it is on).
@@ -116,6 +120,9 @@ struct LiveMeshSlot {
   uint32_t node_count = 0u;
   float bbox_min[3] = {};
   float bbox_max[3] = {};
+  // UV arena range (one float2 per vertex); uv_count 0 = the mesh has no UVs.
+  uint32_t uv_offset = 0u;
+  uint32_t uv_count = 0u;
 };
 
 struct LiveBvhStats {
@@ -141,6 +148,8 @@ struct LiveBvhStats {
   uint32_t tlas_instances = 0u;   // in the TLAS
   uint32_t tlas_waiting = 0u;     // in the region, mesh not uploaded yet
   uint32_t tlas_unusable = 0u;    // in the region, mesh failed (no BLAS)
+  uint32_t tlas_alpha_instances = 0u;  // alpha-tested instances in the TLAS (with a material slot)
+  uint32_t tlas_alpha_waiting = 0u;    // alpha-tested instances left out: their material is not on the GPU yet
   uint32_t tlas_near_fade = 0u;      // in the TLAS with the game camera's near fade applied
   uint32_t tlas_camera_hidden = 0u;  // in the TLAS, never drawn by a camera VS (shadow-only or no view)
   uint32_t tlas_nodes = 0u;
@@ -173,6 +182,8 @@ struct LiveBvhStats {
 // (kept per TLAS instance for the inspect tool).
 struct LiveTlasInstance {
   uint64_t uid = 0u;       // WorldMesh::uid
+  bool alpha = false;      // alpha-tested mesh (copied under g_pool.mutex); traced through its atlas slice
+  uint32_t material = 0u;  // atlas slice + 1 at the TLAS build (descriptor header.z); 0 = not alpha-tested
   uint64_t id = 0u;        // PoolState instance id (ascending in the pool)
   bool dynamic = false;    // moving instance: refitted, not rebuilt
   uint64_t mesh_key = 0u;  // draw key it was admitted through
@@ -210,12 +221,36 @@ struct BvhInspect {
   std::vector<std::string> lines;
 };
 
+// GPU side of the atlas, owned by BvhDeviceData::alpha. Everything is null until the first
+// alpha mesh needs a slice, and is destroyed again when alpha_foliage goes off.
+struct AlphaGpu {
+  reshade::api::resource atlas = {0u};  // Texture2DArray<uint>, kAlphaAtlasSlices layers of 256 x 256
+  reshade::api::resource_view atlas_srv = {0u};
+  reshade::api::resource_view atlas_uav = {0u};
+  reshade::api::resource materials = {0u};  // AlphaMaterialGPU per slice (zero-initialised)
+  reshade::api::resource_view materials_srv = {0u};
+  reshade::api::sampler sampler = {0u};
+  reshade::api::pipeline_layout blit_layout = {0u};
+  reshade::api::descriptor_table blit_tables[3] = {};  // t0 source, s0 sampler, u0 atlas
+  reshade::api::pipeline blit_pipeline = {0u};
+  AlphaSliceTable slices;
+  std::unordered_map<uint64_t, uint32_t> slot_of_uid;     // mesh uid -> slice of its material (read by the TLAS)
+  std::vector<std::pair<uint32_t, uint32_t>> quarantine;  // (slice, frame released), reused after kAlphaSliceQuarantineFrames
+  GpuTimer timer;
+  uint64_t blits = 0u;       // slices filled since the atlas was created
+  uint32_t blits_frame = 0u;  // slices filled at the last present
+  uint64_t cap_refused = 0u;  // admissions without a slice (the atlas is full)
+  bool failure_logged = false;  // EnsureAlphaGpu logs its failure once
+};
+
 struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   // Live store (bvh_live.hpp).
   LiveArena vertices = MakeLiveArena(sizeof(float) * 4u);  // float4, w = 1
   LiveArena indices = MakeLiveArena(sizeof(uint32_t));     // mesh-local
   LiveArena blas_leaves = MakeLiveArena(sizeof(BVHLeafGPU));
   LiveArena blas_nodes = MakeLiveArena(sizeof(BVHNodeGPU));
+  LiveArena uvs = MakeLiveArena(sizeof(float) * 2u);  // float2, only meshes with UVs (alpha foliage)
+  AlphaGpu alpha;  // atlas, materials and blit (alpha_live.hpp); empty while alpha_foliage is off
   std::vector<LiveMeshSlot> slots;
   std::unordered_map<uint64_t, uint32_t> slot_by_uid;
   std::unordered_set<uint64_t> failed_uids;
@@ -255,6 +290,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   uint64_t tlas_visibility_revision = 0u;  // g_pool.visibility_revision the TLAS reflects
   uint64_t tlas_dynamic_revision = 0u;     // g_pool.dynamic_revision the TLAS reflects
   uint64_t tlas_store_version = 0u;
+  bool tlas_alpha_on = false;  // alpha_foliage at the last TLAS build (LiveTlasChange: a switch rebuilds it)
   float tlas_region_min[3] = {1e30f, 1e30f, 1e30f};
   float tlas_region_size = 0.f;
   bool tlas_built = false;
@@ -340,6 +376,7 @@ inline void DestroyLiveStore(reshade::api::device* device, BvhDeviceData* data) 
   DestroyLiveArena(device, &data->indices);
   DestroyLiveArena(device, &data->blas_leaves);
   DestroyLiveArena(device, &data->blas_nodes);
+  DestroyLiveArena(device, &data->uvs);
   DestroyBuffer(device, &data->mesh_srv, &data->mesh_buffer);
   data->mesh_descriptors.clear();
   data->descriptor_count = 0u;
@@ -354,9 +391,36 @@ inline void DestroyLiveStore(reshade::api::device* device, BvhDeviceData* data) 
   data->tlas_retry_frame = 0u;
 }
 
+// Destroys the alpha atlas, its materials and the blit (alpha_foliage off, or the device goes). The TLAS drops
+// the alpha instances (store_version). The counters are kept.
+inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
+  AlphaGpu& alpha = data->alpha;
+  if (!alpha.slot_of_uid.empty()) data->store_version += 1u;
+  for (reshade::api::descriptor_table& table : alpha.blit_tables) {
+    if (table.handle != 0u) device->free_descriptor_table(table);
+    table = {0u};
+  }
+  if (alpha.blit_pipeline.handle != 0u) device->destroy_pipeline(alpha.blit_pipeline);
+  if (alpha.blit_layout.handle != 0u) device->destroy_pipeline_layout(alpha.blit_layout);
+  if (alpha.sampler.handle != 0u) device->destroy_sampler(alpha.sampler);
+  DestroyBuffer(device, &alpha.atlas_srv, nullptr);
+  DestroyBuffer(device, &alpha.atlas_uav, &alpha.atlas);
+  DestroyBuffer(device, &alpha.materials_srv, &alpha.materials);
+  if (alpha.timer.created) DestroyGpuTimer(&alpha.timer);
+  alpha.blit_pipeline = {0u};
+  alpha.blit_layout = {0u};
+  alpha.sampler = {0u};
+  alpha.slices = {};
+  alpha.slot_of_uid.clear();
+  alpha.quarantine.clear();
+  alpha.blits_frame = 0u;
+}
+
 inline void DestroyBvhDeviceData(reshade::api::device* device) {
+  for (const reshade::api::resource proxy : TakePoolAlphaProxies(true)) device->destroy_resource(proxy);
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr) return;
+  DestroyAlphaGpu(device, data);
   DestroyLiveStore(device, data);
   if (data->trace_pipeline.handle != 0u) {
     device->destroy_pipeline(data->trace_pipeline);

@@ -86,6 +86,7 @@
 #include "../../../../utils/path.hpp"
 #include "../../../../utils/scene.hpp"
 #include "../capture/buffer_readback.hpp"
+#include "alpha_atlas.hpp"
 #include "../capture/cb_tracking.hpp"
 #include "../capture/cb_value_tracker.hpp"
 #include "../contract/shader_registry.hpp"
@@ -315,6 +316,33 @@ struct PoolAlphaMaterial {
 struct PoolAlphaState {
   PoolAlphaMaterial material;
   bool conflict = false;
+};
+
+// A copy of an alpha-tested draw's source texture (mip 0), made at draw time and blitted into the atlas
+// once its mesh is resident. Owned until its draw key is invalidated (at the next present) or alpha_foliage
+// goes off: a blit keeps the copy (blitted), so a slice dropped later (live store reset) is blitted again.
+struct PoolAlphaSource {
+  reshade::api::resource proxy = {0u};  // empty while its copy is being made
+  reshade::api::format format = reshade::api::format::unknown;  // the format of the view the game bound
+  uint64_t bytes = 0u;                  // mip 0 bytes (kAlphaSourceBytesMax)
+  bool blitted = false;                 // the atlas has been filled from it at least once
+};
+
+// The GPU stage's numbers as the pool last saw them (written under g_pool.mutex by SyncLiveAlpha at the start of
+// each present, so they lag one present; the trace fields come from the last readback). Read by the dump and the panel.
+struct PoolAlphaGpuStats {
+  uint32_t slices_used = 0u;
+  uint64_t blits = 0u;             // slices filled since the atlas was created
+  uint32_t blits_frame = 0u;       // slices filled at the last present
+  uint32_t proxies = 0u;           // source copies live
+  uint64_t proxy_bytes = 0u;       // bytes of the live source copies
+  uint64_t cap_refused = 0u;       // admissions without a slice (atlas full)
+  uint32_t tlas_instances = 0u;    // alpha-tested instances in the TLAS
+  uint32_t waiting = 0u;           // alpha-tested instances left out of the TLAS (no slice yet)
+  uint64_t tests = 0u;             // trace: triangle hits tested against the atlas (last readback)
+  uint64_t cut = 0u;               // trace: of those, cut
+  float blit_ms = -1.f;            // GPU ms of the blits (-1: not measured)
+  float trace_ms = -1.f;           // GPU ms of the last trace dispatch (-1: not measured)
 };
 
 struct WorldMesh {
@@ -826,8 +854,12 @@ struct PoolStats {
   uint64_t alpha_conflict_refused = 0u;   // admissions refused: mesh conflict
   uint64_t alpha_refused_off = 0u;     // admissions refused: alpha_foliage off
   uint64_t alpha_no_uv = 0u;           // admissions refused: mesh has no UVs
-  uint64_t alpha_not_ready = 0u;       // admissions refused: material not on the GPU yet
   uint64_t alpha_removed = 0u;         // instances removed by the alpha flag or the switch
+  uint64_t alpha_uv_requeues = 0u;     // meshes captured without UVs and queued again for them (once per key)
+  uint64_t alpha_source_copies = 0u;   // source textures copied for alpha draws (CapturePoolAlphaSource)
+  uint64_t alpha_source_refused = 0u;  // alpha draws whose source was not copied (texture kind, caps, deferred, failure)
+  uint64_t alpha_source_refused_bytes = 0u;   // of those: the byte cap (kAlphaSourceBytesMax) was reached
+  uint64_t alpha_source_refused_format = 0u;  // of those: the bound view's format is unknown or typeless
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -1066,6 +1098,15 @@ struct PoolState {
   bool dynamic_applied = false;
   std::unordered_map<uint64_t, PoolAlphaState> alpha_keys;  // by draw key; flags its mesh alpha-tested
   bool alpha_off_applied = false;  // the switch-off removal ran (re-armed by switching on)
+  std::unordered_set<uint64_t> alpha_uv_requeued;  // keys whose mesh was requeued for its UVs
+  std::unordered_map<uint64_t, PoolAlphaSource> alpha_sources;  // by draw key; an empty entry while its copy is made
+  std::unordered_set<uint64_t> alpha_source_done;  // draw keys needing no further copy (refused)
+  std::unordered_set<uint64_t> alpha_format_logged;  // texture handles whose refused format was logged
+  std::atomic_bool live_on{true};  // the live BVH is enabled (UpdateLiveBvh): no source copies while it is off
+  std::vector<reshade::api::resource> alpha_dead_proxies;  // proxies to free at the next present (never in a destroy event)
+  uint32_t alpha_copy_frame = 0u;
+  uint32_t alpha_copies_frame = 0u;  // source copies made in alpha_copy_frame
+  PoolAlphaGpuStats alpha_gpu;
   uint64_t dynamic_revision = 0u;  // bumped when a moving instance changes pose (not a change of the set)
   PoolPrevTrace prev_trace;
 };
@@ -1625,18 +1666,20 @@ inline void OnDestroyDevicePool(reshade::api::device* device) {
 inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uint32_t mesh_id, bool follow = false) {
   if (mesh_id >= g_pool.meshes.size()) return false;
   if (g_pool.meshes[mesh_id].alpha) {
-    // Alpha-tested foliage: only with alpha_foliage on, with UVs, and once its material is on the
-    // GPU (alpha atlas, not built yet: refused, so the switch has no visible effect until then).
+    // Alpha-tested foliage: refused with alpha_foliage off, in a conflict, or without UVs. Otherwise admitted;
+    // the TLAS takes it once its material has an atlas slice (alpha_waiting, alpha_live.hpp).
     if (!g_pool.alpha_foliage.load(std::memory_order_relaxed)) {
       g_pool.stats.alpha_refused_off += 1u;
-    } else if (g_pool.meshes[mesh_id].alpha_state.conflict) {
-      g_pool.stats.alpha_conflict_refused += 1u;
-    } else if (g_pool.meshes[mesh_id].uvs.empty()) {
-      g_pool.stats.alpha_no_uv += 1u;
-    } else {
-      g_pool.stats.alpha_not_ready += 1u;
+      return false;
     }
-    return false;
+    if (g_pool.meshes[mesh_id].alpha_state.conflict) {
+      g_pool.stats.alpha_conflict_refused += 1u;
+      return false;
+    }
+    if (g_pool.meshes[mesh_id].uvs.empty()) {
+      g_pool.stats.alpha_no_uv += 1u;
+      return false;
+    }
   }
   if (g_pool.meshes[mesh_id].dynamic && g_pool.exclude_moving.load(std::memory_order_relaxed)) {
     // Seen moving in a camera view (P2a): a pose of it would stay behind as a
@@ -2079,14 +2122,24 @@ inline void ApplyPoolAlphaSwitch() {
   }
 }
 
+void RequeuePoolMeshKey(uint64_t mesh_key);
+
 // Caller holds g_pool.mutex. Folds a draw's material into its key (a key whose draws read
 // differing materials is conflicted) and into the key's mesh when the mesh exists. A key
-// flagged before its mesh is captured is flagged at the capture (ApplyPoolMesh).
+// flagged before its mesh is captured is flagged at the capture (ApplyPoolMesh). With
+// alpha_foliage on, a mesh captured without UVs (captured before its key was flagged) is
+// requeued once for its UVs (alpha_uv_requeued).
 inline void NotePoolAlphaMaterial(uint64_t mesh_key, const PoolAlphaMaterial& material) {
   PoolAlphaState& key_state = g_pool.alpha_keys[mesh_key];
   if (AbsorbPoolAlphaMaterial(&key_state, material, false)) g_pool.stats.alpha_conflicts += 1u;
   const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
-  if (mesh_it != g_pool.mesh_by_key.end()) MarkPoolMeshAlpha(mesh_it->second, key_state);
+  if (mesh_it == g_pool.mesh_by_key.end()) return;
+  MarkPoolMeshAlpha(mesh_it->second, key_state);
+  if (g_pool.alpha_foliage.load(std::memory_order_relaxed) && material.texture != 0u
+      && g_pool.meshes[mesh_it->second].uvs.empty() && g_pool.alpha_uv_requeued.insert(mesh_key).second) {
+    RequeuePoolMeshKey(mesh_key);
+    g_pool.stats.alpha_uv_requeues += 1u;
+  }
 }
 
 // Reads the alpha material a pixel shader uses (t0 texture, b5 threshold and scroll,
@@ -2601,6 +2654,32 @@ inline void RemovePoolMeshWaiting(uint64_t buffer_key, uint64_t mesh_key) {
   if (keys.empty()) g_pool.mesh_waiting.erase(it);
 }
 
+// Caller holds g_pool.mutex. Unmaps one draw key from its mesh and drops its pending capture;
+// the mesh is retired (with its instances) once no draw key refers to it any more.
+inline void UnmapPoolMeshKey(uint64_t mesh_key) {
+  const auto request = g_pool.mesh_requests.find(mesh_key);
+  if (request != g_pool.mesh_requests.end()) {
+    if (!request->second.in_flight) RemovePoolMeshWaiting(request->second.buffer_key, mesh_key);
+    g_pool.mesh_requests.erase(request);
+  }
+  const auto it = g_pool.mesh_by_key.find(mesh_key);
+  if (it == g_pool.mesh_by_key.end()) return;
+  WorldMesh& mesh = g_pool.meshes[it->second];
+  if (mesh.live_keys != 0u) mesh.live_keys -= 1u;
+  if (mesh.live_keys == 0u) g_pool.retire_pending = true;
+  g_pool.mesh_by_key.erase(it);
+}
+
+// Caller holds g_pool.mutex. Captures a draw key again: its mesh is unmapped and the key is
+// queued on its next draw. Keeps the key's alpha material, observations and resource keys.
+inline void RequeuePoolMeshKey(uint64_t mesh_key) {
+  g_pool.mesh_queued.erase(mesh_key);
+  g_pool.failed_meshes.erase(mesh_key);
+  g_pool.mesh_retry.erase(mesh_key);
+  g_pool.alpha_source_done.erase(mesh_key);  // the new capture takes its own source copy
+  UnmapPoolMeshKey(mesh_key);
+}
+
 // Caller holds g_pool.mutex. Records a mesh failure; the key stays queued
 // (not retried) until its buffers are released.
 inline void RecordPoolMeshFailure(const PoolMeshRequest& request, const char* reason) {
@@ -2880,6 +2959,124 @@ inline bool IsPoolDeferredList(const reshade::api::command_list* cmd_list) {
   return immediate != 0u && reinterpret_cast<uint64_t>(cmd_list) != immediate;
 }
 
+// Caller holds g_pool.mutex. Moves every source copy to the dead list (freed at a present).
+inline void DrainPoolAlphaSources() {
+  for (const auto& source : g_pool.alpha_sources) {
+    if (source.second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source.second.proxy);
+  }
+  g_pool.alpha_sources.clear();
+  g_pool.alpha_source_done.clear();
+}
+
+// Takes the proxies to destroy: the dead ones and, with `all` (alpha_foliage off, device destroyed), every
+// live source copy. The caller destroys them outside the lock.
+inline std::vector<reshade::api::resource> TakePoolAlphaProxies(bool all) {
+  std::lock_guard<std::mutex> lock(g_pool.mutex);
+  if (all) DrainPoolAlphaSources();
+  std::vector<reshade::api::resource> proxies;
+  proxies.swap(g_pool.alpha_dead_proxies);
+  return proxies;
+}
+
+// Caller holds g_pool.mutex. Bytes of the live source copies (the byte cap, the dump and the panel).
+inline uint64_t PoolAlphaProxyBytes() {
+  uint64_t bytes = 0u;
+  for (const auto& source : g_pool.alpha_sources) bytes += source.second.bytes;
+  return bytes;
+}
+
+// Copies the source texture of an alpha-tested direct draw (mip 0 of a single-layer, non-multisampled 2D
+// texture) into an owned proxy, once per draw key, on the immediate context at draw time. The proxy has the
+// format of the view the game bound (not the texture's). Called only for a draw that is queued (skip None).
+// At most kAlphaCopiesPerFrame copies a frame, kAlphaSourcesMax live and kAlphaSourceBytesMax bytes; other
+// sources are refused and counted. No copy while the live BVH is off. Graphics calls run outside
+// g_pool.mutex. The texture is registered with its draw key, so destroying it invalidates the key (the proxy
+// is freed at the next present).
+inline void CapturePoolAlphaSource(
+    reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key, uint64_t view, bool immediate) {
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (!g_pool.alpha_foliage.load(std::memory_order_relaxed) || !g_pool.live_on.load(std::memory_order_relaxed)
+        || g_pool.alpha_source_done.count(mesh_key) != 0u || g_pool.alpha_sources.count(mesh_key) != 0u) {
+      return;
+    }
+  }
+  if (!immediate) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.alpha_source_refused += 1u;
+    return;
+  }
+  const reshade::api::resource texture = device->get_resource_from_view({view});
+  const reshade::api::resource_desc desc =
+      texture.handle != 0u ? device->get_resource_desc(texture) : reshade::api::resource_desc{};
+  if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.depth_or_layers != 1u || desc.texture.samples != 1u) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.alpha_source_done.insert(mesh_key);
+    g_pool.stats.alpha_source_refused += 1u;
+    return;
+  }
+  const reshade::api::format format = device->get_resource_view_desc({view}).format;
+  if (format == reshade::api::format::unknown || reshade::api::format_is_typeless(format)) {
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      g_pool.alpha_source_done.insert(mesh_key);
+      g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_format += 1u;
+      first = g_pool.alpha_format_logged.insert(texture.handle).second;
+    }
+    if (first) {
+      renodx::utils::log::w("[world-bvh] alpha source: bound view format unknown or typeless (texture ", texture.handle,
+                            "), draw key not copied");
+    }
+    return;
+  }
+  const uint64_t bytes = reshade::api::format_slice_pitch(
+      format, reshade::api::format_row_pitch(format, desc.texture.width), desc.texture.height);
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const uint32_t frame = g_state.frame.load();
+    if (g_pool.alpha_copy_frame != frame) {
+      g_pool.alpha_copy_frame = frame;
+      g_pool.alpha_copies_frame = 0u;
+    }
+    if (g_pool.alpha_copies_frame >= kAlphaCopiesPerFrame || g_pool.alpha_sources.size() >= kAlphaSourcesMax) {
+      g_pool.stats.alpha_source_refused += 1u;
+      return;
+    }
+    if (PoolAlphaProxyBytes() + bytes > kAlphaSourceBytesMax) {
+      g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_bytes += 1u;
+      return;
+    }
+    g_pool.alpha_copies_frame += 1u;
+    g_pool.alpha_sources[mesh_key].bytes = bytes;  // reserved while its copy is made
+  }
+  const reshade::api::resource_desc proxy_desc(
+      reshade::api::resource_type::texture_2d, desc.texture.width, desc.texture.height, 1, 1, format, 1,
+      reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest);
+  reshade::api::resource proxy = {0u};
+  const bool made = device->create_resource(proxy_desc, nullptr, reshade::api::resource_usage::copy_dest, &proxy);
+  if (made) cmd_list->copy_texture_region(texture, 0u, nullptr, proxy, 0u, nullptr);
+  bool kept = false;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const auto it = g_pool.alpha_sources.find(mesh_key);
+    if (made && it != g_pool.alpha_sources.end()) {
+      it->second.proxy = proxy;
+      it->second.format = format;
+      AddPoolResourceKey(texture.handle, mesh_key);
+      g_pool.stats.alpha_source_copies += 1u;
+      kept = true;
+    } else {
+      if (it != g_pool.alpha_sources.end()) g_pool.alpha_sources.erase(it);
+      if (!made) g_pool.alpha_source_done.insert(mesh_key);
+      g_pool.stats.alpha_source_refused += 1u;
+    }
+  }
+  if (made && !kept) device->destroy_resource(proxy);
+}
+
 inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -2915,6 +3112,9 @@ inline void OnPoolScanDraw(
   std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
+  if (skip == PoolSkip::None && gate.alpha_material && alpha_material.texture != 0u) {
+    CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.texture, !deferred);
+  }
   bool trace_declined = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -3126,20 +3326,17 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.failed_meshes.erase(mesh_key);
   g_pool.mesh_retry.erase(mesh_key);
   g_pool.alpha_keys.erase(mesh_key);
+  g_pool.alpha_uv_requeued.erase(mesh_key);
+  g_pool.alpha_source_done.erase(mesh_key);
+  const auto source = g_pool.alpha_sources.find(mesh_key);
+  if (source != g_pool.alpha_sources.end()) {
+    if (source->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source->second.proxy);
+    g_pool.alpha_sources.erase(source);
+  }
   g_pool.invalidated_keys.insert(mesh_key);
   // A queued mesh is forgotten; a copy of it still in flight is dropped when
   // read (no request with its serial is left).
-  const auto request = g_pool.mesh_requests.find(mesh_key);
-  if (request != g_pool.mesh_requests.end()) {
-    if (!request->second.in_flight) RemovePoolMeshWaiting(request->second.buffer_key, mesh_key);
-    g_pool.mesh_requests.erase(request);
-  }
-  const auto it = g_pool.mesh_by_key.find(mesh_key);
-  if (it == g_pool.mesh_by_key.end()) return;
-  WorldMesh& mesh = g_pool.meshes[it->second];
-  if (mesh.live_keys != 0u) mesh.live_keys -= 1u;
-  if (mesh.live_keys == 0u) g_pool.retire_pending = true;
-  g_pool.mesh_by_key.erase(it);
+  UnmapPoolMeshKey(mesh_key);
 }
 
 // A game write to a VB/IB that a captured or queued mesh comes from
@@ -4520,6 +4717,8 @@ inline void ResetWorldPool() {
   g_pool.dynamic_keys.clear();
   g_pool.dynamic_applied = false;  // re-applied at the next present
   g_pool.alpha_keys.clear();
+  g_pool.alpha_uv_requeued.clear();
+  DrainPoolAlphaSources();
   g_pool.alpha_off_applied = false;
   g_pool.prev_trace = {};
   g_pool.logged_invalidations = 0u;
@@ -4935,6 +5134,7 @@ inline void DumpWorldPool() {
   std::unordered_map<uint32_t, PoolFamilyStats> families;
   PoolStats stats;
   uint64_t alpha_key_count = 0u;
+  PoolAlphaGpuStats alpha_gpu;
   PoolMotionDetail motion_detail;
   std::vector<PoolDynamicDumpEntry> dynamic;
   std::unordered_map<uint64_t, PoolMeshFailure> failed_meshes;
@@ -4968,6 +5168,7 @@ inline void DumpWorldPool() {
     families = g_pool.families;
     stats = g_pool.stats;
     alpha_key_count = g_pool.alpha_keys.size();
+    alpha_gpu = g_pool.alpha_gpu;
     failed_meshes = g_pool.failed_meshes;
     mismatch_meshes = g_pool.mismatch_meshes;
     mesh_retry = g_pool.mesh_retry;
@@ -5014,10 +5215,21 @@ inline void DumpWorldPool() {
       << ", \"meshes_conflicted\": " << stats.alpha_meshes_conflicted
       << ", \"refused_off\": " << stats.alpha_refused_off << ", \"conflict_refused\": " << stats.alpha_conflict_refused
       << ", \"no_uv\": " << stats.alpha_no_uv
-      << ", \"not_ready\": " << stats.alpha_not_ready << ", \"removed\": " << stats.alpha_removed
+      << ", \"removed\": " << stats.alpha_removed
       << ", \"keys\": " << alpha_key_count
       << ", \"billboard_draws\": " << stats.draws_by_vs_class[static_cast<size_t>(contract::VsClass::Billboard)]
       << ", \"wind_opaque_skips\": " << stats.skips[static_cast<size_t>(PoolSkip::WindOpaque)] << "},\n";
+  out << "  \"alpha_gpu\": {\"slices_used\": " << alpha_gpu.slices_used << ", \"slices_total\": " << kAlphaAtlasSlices
+      << ", \"blits\": " << alpha_gpu.blits << ", \"blits_frame\": " << alpha_gpu.blits_frame
+      << ", \"proxies\": " << alpha_gpu.proxies << ", \"proxy_bytes\": " << alpha_gpu.proxy_bytes
+      << ", \"copies\": " << stats.alpha_source_copies << ", \"source_refused\": " << stats.alpha_source_refused
+      << ", \"source_refused_bytes\": " << stats.alpha_source_refused_bytes
+      << ", \"source_refused_format\": " << stats.alpha_source_refused_format
+      << ", \"uv_requeues\": " << stats.alpha_uv_requeues
+      << ", \"cap_refused\": " << alpha_gpu.cap_refused << ", \"tlas_alpha_instances\": " << alpha_gpu.tlas_instances
+      << ", \"alpha_waiting\": " << alpha_gpu.waiting << ", \"alpha_tests\": " << alpha_gpu.tests
+      << ", \"alpha_cut\": " << alpha_gpu.cut << ", \"blit_ms\": " << PoolJsonFloat{alpha_gpu.blit_ms}
+      << ", \"trace_ms\": " << PoolJsonFloat{alpha_gpu.trace_ms} << "},\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
       << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";

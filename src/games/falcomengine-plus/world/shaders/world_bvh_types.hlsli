@@ -8,6 +8,7 @@
 //   WorldInstanceGPU 192 bytes
 //   BVHNodeGPU       32 bytes
 //   BVHLeafGPU       48 bytes
+//   AlphaMaterialGPU 32 bytes
 
 struct WorldMeshGPU
 {
@@ -25,6 +26,16 @@ struct WorldInstanceGPU
     float4 bounds_min;
     float4 bounds_max;
     float4 visibility;     // x = near-fade start (m), y = near-fade 1/range, z = INSTANCE_* flags, w = 0
+};
+
+// One per atlas slice (bvh/alpha_atlas.hpp). An instance's header.z is slice + 1 (0 = not alpha-tested).
+struct AlphaMaterialGPU
+{
+    float threshold;
+    float2 scroll;
+    uint swizzle;
+    uint slice;
+    uint3 pad;
 };
 
 // WorldInstanceGPU.visibility.z flags (bvh_resources.hpp kInstance*).

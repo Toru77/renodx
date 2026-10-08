@@ -25,15 +25,18 @@
 
 namespace falcom_world::bvh {
 
-inline constexpr uint32_t kTraceSrvCount = 14u;  // t0..t9 static BVH and game depth, t10..t13 deforming meshes
+// t0..t9 static BVH and game depth, t10..t13 deforming meshes, t14..t16 alpha-tested foliage (UVs, atlas, materials).
+inline constexpr uint32_t kTraceSrvCount = 17u;
 inline constexpr uint32_t kTraceUavCount = 2u;
 inline constexpr uint32_t kTracePushConstantCount = 40u;
-inline constexpr uint32_t kTraceStatsCount = 15u;
+inline constexpr uint32_t kTraceStatsCount = 17u;
 inline constexpr uint32_t kTraceStatCameraHidden = 14u;
+inline constexpr uint32_t kTraceStatAlphaTests = 15u;
+inline constexpr uint32_t kTraceStatAlphaCut = 16u;
 // Inspect results follow the counters (world_bvh_trace.cs_5_0.hlsl
 // TRACE_INSPECT_BASE): flags (1 traced, 2 hit, 4 hidden from the game camera), instance, mesh,
 // prim, t, position xyz, depth compare class.
-inline constexpr uint32_t kTraceInspectBase = 15u;
+inline constexpr uint32_t kTraceInspectBase = 17u;
 inline constexpr uint32_t kTraceInspectCount = 9u;
 inline constexpr uint32_t kTraceStatsBufferCount = kTraceInspectBase + kTraceInspectCount;
 static_assert(kTraceInspectBase >= kTraceStatsCount, "trace inspect slots overlap the counters");
@@ -199,8 +202,9 @@ inline void DispatchBvhTrace(
   reshade::api::resource_view srvs[kTraceSrvCount] = {
       data->vertices.srv, data->indices.srv, data->mesh_srv, data->instance_srv, data->active_srv,
       data->blas_nodes.srv, data->blas_leaves.srv, data->tlas_node_srv, data->tlas_leaf_srv,
-      depth.view, dynamic.vertices, dynamic.objects, dynamic.nodes, dynamic.leaves};
-  static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 14 entries");
+      depth.view, dynamic.vertices, dynamic.objects, dynamic.nodes, dynamic.leaves,
+      data->uvs.srv, data->alpha.atlas_srv, data->alpha.materials_srv};
+  static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 17 entries");
   reshade::api::descriptor_table_update srv_update = {
       data->trace_srv_table, 0, 0, kTraceSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs};
   device->update_descriptor_tables(1, &srv_update);
@@ -313,6 +317,14 @@ inline bool ReadbackBvhTraceStats(
   data->trace_stats.compare_sky = values[12];
   data->trace_stats.compare_no_depth = values[13];
   data->trace_stats.camera_hidden = values[kTraceStatCameraHidden];
+  data->trace_stats.alpha_tests = values[kTraceStatAlphaTests];
+  data->trace_stats.alpha_cut = values[kTraceStatAlphaCut];
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.alpha_gpu.tests = values[kTraceStatAlphaTests];
+    g_pool.alpha_gpu.cut = values[kTraceStatAlphaCut];
+    g_pool.alpha_gpu.trace_ms = data->trace_timer.last_ms;
+  }
   data->trace_stats.hiding = data->trace_hiding;
   data->trace_stats.valid = true;
   data->trace_stats.invariant_ok = data->trace_stats.rays == data->trace_stats.hits + data->trace_stats.misses;
@@ -325,6 +337,8 @@ inline bool ReadbackBvhTraceStats(
       " triangle_tests=", data->trace_stats.triangle_tests,
       " max_stack_depth=", data->trace_stats.max_stack_depth,
       " camera_hidden=", data->trace_stats.camera_hidden,
+      " alpha_tests=", data->trace_stats.alpha_tests,
+      " alpha_cut=", data->trace_stats.alpha_cut,
       " invariant=", data->trace_stats.invariant_ok ? "ok" : "FAIL");
   const BvhTraceStats& stats = data->trace_stats;
   if (stats.compare_match + stats.compare_missing + stats.compare_extra + stats.compare_extra_sky

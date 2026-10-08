@@ -226,3 +226,9 @@ Verification (2026-10-08):
 - Addon: `cmake --build --preset ninja-x64-release --target falcomengine-plus`, rc=0, ends with the Linking line for renodx-falcomengine-plus.addon64.
 - Default path (toggle OFF) against HEAD: the implementer reports identical counts on the 10 existing tests (no output file kept).
 - Not verified: GPU, ReShade in game, ASan/TSan builds.
+
+## Round A3c, 2026-10-08: alpha-tested foliage, GPU stage (working tree, not committed, not validated in game)
+- Built on the CPU stage (HEAD 241c0fde): UV arena (`bvh_resources.hpp`, `bvh_live.hpp`; the descriptor's `bbox_min.w` = uv_offset + 1, 0 = no UVs), recapture of a UV-less mesh once with ON (`RequeuePoolMeshKey`), source copies at draw time (`CapturePoolAlphaSource`, freed at the present), the 256-slice atlas and the blit (`alpha_live.hpp`, `SyncLiveAlpha`), the trace cutout (t14-t16, bary, AlphaCutHit in TraceBlas, `alpha_tests` / `alpha_cut`), the TLAS material slot (header.z = slice + 1; alpha instances without a slice wait, OFF drops them and rebuilds at once), admission of ready alpha meshes (`alpha_not_ready` removed), the panel lines and the `alpha_gpu` object in world_pool.json.
+- Harness: test_alpha 11 tests and test_live pass (11 of 11 in the full run, PASS/FAIL equivalence on the harness (baseline_head.txt holds PASS lines and timings only); no count-level A/B was run). Wind foliage and billboards are excluded from this test (indirect-only alpha waits in the TLAS, alpha_waiting). The "Alpha GPU" and "Alpha TLAS" panel lines lag one present. Addon build and FXC of both new shaders pass.
+- Open: indirect alpha draws are not captured (no key at draw time), see HANDOFF 3c. Not verified in game; the D3D11 calls, the trace on the GPU and GPU time are unverified.
+- In-game steps and what to send back: HANDOFF 3c.

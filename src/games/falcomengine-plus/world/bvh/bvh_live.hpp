@@ -62,6 +62,7 @@
 #include "../debug/pool_stage.hpp"
 #include "bvh_build.hpp"
 #include "bvh_pool.hpp"
+#include "alpha_live.hpp"
 #include "bvh_resources.hpp"
 
 namespace falcom_world::bvh {
@@ -94,7 +95,8 @@ inline uint64_t LiveArenaBytes(const LiveArena& arena, uint64_t elements) {
 
 inline uint64_t LiveSlotBytes(const BvhDeviceData& data, const LiveMeshSlot& slot) {
   return LiveArenaBytes(data.vertices, slot.vertex_count) + LiveArenaBytes(data.indices, slot.index_count)
-         + LiveArenaBytes(data.blas_leaves, slot.leaf_count) + LiveArenaBytes(data.blas_nodes, slot.node_count);
+         + LiveArenaBytes(data.blas_leaves, slot.leaf_count) + LiveArenaBytes(data.blas_nodes, slot.node_count)
+         + LiveArenaBytes(data.uvs, slot.uv_count);
 }
 
 inline void UpdateLiveStoreStats(BvhDeviceData* data, uint32_t pool_meshes) {
@@ -113,11 +115,12 @@ inline void UpdateLiveStoreStats(BvhDeviceData* data, uint32_t pool_meshes) {
   }
   stats.used_bytes = LiveArenaBytes(data->vertices, data->vertices.used) + LiveArenaBytes(data->indices, data->indices.used)
                      + LiveArenaBytes(data->blas_leaves, data->blas_leaves.used)
-                     + LiveArenaBytes(data->blas_nodes, data->blas_nodes.used);
+                     + LiveArenaBytes(data->blas_nodes, data->blas_nodes.used) + LiveArenaBytes(data->uvs, data->uvs.used);
   stats.capacity_bytes = LiveArenaBytes(data->vertices, data->vertices.capacity)
                          + LiveArenaBytes(data->indices, data->indices.capacity)
                          + LiveArenaBytes(data->blas_leaves, data->blas_leaves.capacity)
-                         + LiveArenaBytes(data->blas_nodes, data->blas_nodes.capacity);
+                         + LiveArenaBytes(data->blas_nodes, data->blas_nodes.capacity)
+                         + LiveArenaBytes(data->uvs, data->uvs.capacity);
   stats.failed_meshes = static_cast<uint32_t>(data->failed_uids.size());
 }
 
@@ -139,6 +142,7 @@ struct LiveMeshUpload {
   float bbox_max[3] = {};
   std::vector<std::array<float, 3>> positions;
   std::vector<uint32_t> indices;
+  std::vector<std::array<float, 2>> uvs;  // empty unless the mesh has UVs
 };
 
 struct LiveMeshScan {
@@ -171,6 +175,7 @@ inline LiveMeshScan ScanLiveMeshes(const BvhDeviceData& data, bool collect_uploa
     std::memcpy(upload.bbox_max, mesh.bbox_max, sizeof(upload.bbox_max));
     upload.positions = mesh.positions;
     upload.indices = mesh.indices;
+    upload.uvs = mesh.uvs;
   }
   return scan;
 }
@@ -267,6 +272,7 @@ inline LiveUploadResult UploadLiveMeshes(
   uint64_t index_total = 0u;
   uint64_t leaf_total = 0u;
   uint64_t node_total = 0u;
+  uint64_t uv_total = 0u;
   for (LiveMeshUpload& upload : *uploads) {
     LiveBuiltMesh mesh;
     mesh.upload = &upload;
@@ -283,7 +289,8 @@ inline LiveUploadResult UploadLiveMeshes(
     if (data->vertices.used + vertex_total + upload.positions.size() > kLiveFloatExact
         || data->indices.used + index_total + upload.indices.size() > kLiveFloatExact
         || data->blas_leaves.used + leaf_total + mesh.blas.leaves.size() > kLiveFloatExact
-        || data->blas_nodes.used + node_total + mesh.blas.nodes.size() > kLiveFloatExact) {
+        || data->blas_nodes.used + node_total + mesh.blas.nodes.size() > kLiveFloatExact
+        || data->uvs.used + uv_total + upload.uvs.size() > kLiveFloatExact) {
       data->store_full = true;
       continue;
     }
@@ -291,6 +298,7 @@ inline LiveUploadResult UploadLiveMeshes(
     index_total += upload.indices.size();
     leaf_total += mesh.blas.leaves.size();
     node_total += mesh.blas.nodes.size();
+    uv_total += upload.uvs.size();
     built.push_back(std::move(mesh));
   }
   if (data->store_full) stats.last_failure = "store full: offsets would exceed 2^24 elements";
@@ -300,7 +308,8 @@ inline LiveUploadResult UploadLiveMeshes(
   if (!EnsureLiveArena(device, cmd_list, data, &data->vertices, data->vertices.used + vertex_total, &error)
       || !EnsureLiveArena(device, cmd_list, data, &data->indices, data->indices.used + index_total, &error)
       || !EnsureLiveArena(device, cmd_list, data, &data->blas_leaves, data->blas_leaves.used + leaf_total, &error)
-      || !EnsureLiveArena(device, cmd_list, data, &data->blas_nodes, data->blas_nodes.used + node_total, &error)) {
+      || !EnsureLiveArena(device, cmd_list, data, &data->blas_nodes, data->blas_nodes.used + node_total, &error)
+      || (uv_total != 0u && !EnsureLiveArena(device, cmd_list, data, &data->uvs, data->uvs.used + uv_total, &error))) {
     stats.upload_failures += 1u;
     stats.last_failure = "arena buffer creation failed: " + error;
     data->upload_retry_frame = frame + kLiveRetryFrames;
@@ -316,6 +325,8 @@ inline LiveUploadResult UploadLiveMeshes(
   index_batch.reserve(index_total);
   leaf_batch.reserve(leaf_total);
   node_batch.reserve(node_total);
+  std::vector<std::array<float, 2>> uv_batch;
+  uv_batch.reserve(uv_total);
   std::vector<LiveMeshSlot> new_slots;
   new_slots.reserve(built.size());
   for (const LiveBuiltMesh& mesh : built) {
@@ -332,6 +343,11 @@ inline LiveUploadResult UploadLiveMeshes(
     slot.node_count = static_cast<uint32_t>(mesh.blas.nodes.size());
     std::memcpy(slot.bbox_min, upload.bbox_min, sizeof(slot.bbox_min));
     std::memcpy(slot.bbox_max, upload.bbox_max, sizeof(slot.bbox_max));
+    if (!upload.uvs.empty()) {
+      slot.uv_offset = static_cast<uint32_t>(data->uvs.used + uv_batch.size());
+      slot.uv_count = static_cast<uint32_t>(upload.uvs.size());
+      uv_batch.insert(uv_batch.end(), upload.uvs.begin(), upload.uvs.end());
+    }
 
     for (const auto& position : upload.positions) {
       vertex_batch.push_back(position[0]);
@@ -354,7 +370,8 @@ inline LiveUploadResult UploadLiveMeshes(
   if (!append(&data->vertices, vertex_batch.data(), vertex_batch.size() / 4u)
       || !append(&data->indices, index_batch.data(), index_batch.size())
       || !append(&data->blas_leaves, leaf_batch.data(), leaf_batch.size())
-      || !append(&data->blas_nodes, node_batch.data(), node_batch.size())) {
+      || !append(&data->blas_nodes, node_batch.data(), node_batch.size())
+      || (!uv_batch.empty() && !append(&data->uvs, uv_batch.data(), uv_batch.size()))) {
     stats.upload_failures += 1u;
     stats.last_failure = "arena write failed: " + error;
     data->upload_retry_frame = frame + kLiveRetryFrames;
@@ -365,6 +382,7 @@ inline LiveUploadResult UploadLiveMeshes(
   data->indices.used += index_batch.size();
   data->blas_leaves.used += leaf_batch.size();
   data->blas_nodes.used += node_batch.size();
+  data->uvs.used += uv_batch.size();
 
   for (const LiveMeshSlot& slot : new_slots) {
     WorldMeshGPU descriptor = {};
@@ -376,6 +394,8 @@ inline LiveUploadResult UploadLiveMeshes(
       descriptor.bbox_min[k] = slot.bbox_min[k];
       descriptor.bbox_max[k] = slot.bbox_max[k];
     }
+    // bbox_min.w: uv_offset + 1 for a mesh with UVs, 0 for none (the trace reads UVs only when it is set).
+    if (slot.uv_count != 0u) descriptor.bbox_min[3] = static_cast<float>(slot.uv_offset + 1u);
     descriptor.build[0] = static_cast<float>(slot.node_offset);
     descriptor.build[1] = 0.f;
     descriptor.build[2] = static_cast<float>(slot.leaf_offset);
@@ -472,6 +492,7 @@ inline const char* LiveTlasChange(const BvhDeviceData& data, uint64_t revision, 
       || data.tlas_region_min[1] != region.min[1] || data.tlas_region_min[2] != region.min[2]) {
     return "region moved";
   }
+  if (data.tlas_alpha_on != g_pool.alpha_foliage.load(std::memory_order_relaxed)) return "alpha switch";
   return nullptr;
 }
 
@@ -508,6 +529,7 @@ inline WorldInstanceGPU MakeLiveInstanceGPU(const LiveTlasInstance& instance, ui
   WorldInstanceGPU descriptor = {};
   descriptor.header[0] = static_cast<float>(slot);
   descriptor.header[1] = static_cast<float>(instance.source);
+  descriptor.header[2] = static_cast<float>(instance.material);
   const uint32_t floats = instance.matrix_floats == 0u ? 12u : (std::min)(instance.matrix_floats, 16u);
   float matrix[16] = {};
   std::memcpy(matrix, instance.matrix, sizeof(float) * floats);
@@ -548,6 +570,7 @@ inline void RebuildLiveTlas(
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
       LiveTlasInstance& copy = snapshot.emplace_back();
       copy.uid = g_pool.meshes[instance.mesh_id].uid;
+      copy.alpha = g_pool.meshes[instance.mesh_id].alpha;
       copy.id = instance.id;
       copy.dynamic = instance.dynamic;
       copy.mesh_key = instance.mesh_key;
@@ -566,6 +589,8 @@ inline void RebuildLiveTlas(
     }
   }
   std::stable_partition(snapshot.begin(), snapshot.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; });
+  // The switch is read once: the TLAS reflects it (commit), so a later switch is seen as a change.
+  const bool alpha_on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
   // What this TLAS reflects; recorded only once it is in place, so a failed
   // build is retried (after kLiveRetryFrames).
   const uint64_t store_version = data->store_version;
@@ -574,6 +599,7 @@ inline void RebuildLiveTlas(
     data->tlas_visibility_revision = visibility_revision;
     data->tlas_dynamic_revision = dynamic_revision;
     data->tlas_store_version = store_version;
+    data->tlas_alpha_on = alpha_on;
     data->tlas_region_size = region.size;
     std::memcpy(data->tlas_region_min, region.min, sizeof(data->tlas_region_min));
     data->tlas_refit_failed = false;
@@ -592,7 +618,10 @@ inline void RebuildLiveTlas(
   uint32_t unusable = 0u;
   uint32_t near_fade = 0u;
   uint32_t camera_hidden = 0u;
-  for (const LiveTlasInstance& instance : snapshot) {
+  uint32_t alpha_instances = 0u;
+  uint32_t alpha_waiting = 0u;
+  for (LiveTlasInstance& instance : snapshot) {
+    if (instance.alpha && !alpha_on) continue;  // alpha_foliage off: alpha-tested meshes are not traced
     const auto slot_it = data->slot_by_uid.find(instance.uid);
     if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->descriptor_count) {
       if (data->failed_uids.count(instance.uid) != 0u) {
@@ -601,6 +630,16 @@ inline void RebuildLiveTlas(
         waiting += 1u;
       }
       continue;
+    }
+    if (instance.alpha) {
+      // The slice is written by the GPU stage (SyncLiveAlpha, same thread): slot_of_uid is read here, not under the lock.
+      const auto material_it = data->alpha.slot_of_uid.find(instance.uid);
+      if (material_it == data->alpha.slot_of_uid.end()) {
+        alpha_waiting += 1u;
+        continue;
+      }
+      instance.material = material_it->second + 1u;
+      alpha_instances += 1u;
     }
     const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(instance, slot_it->second);
     const uint32_t flags = InstanceVisibilityFlags(descriptor);
@@ -612,6 +651,8 @@ inline void RebuildLiveTlas(
   }
   stats.tlas_waiting = waiting;
   stats.tlas_unusable = unusable;
+  stats.tlas_alpha_instances = alpha_instances;
+  stats.tlas_alpha_waiting = alpha_waiting;
 
   const auto finish = [&]() {
     stats.tlas_ms_last = LiveElapsedMs(start);
@@ -866,6 +907,7 @@ inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::comman
   std::vector<uint8_t> indices;
   std::vector<uint8_t> leaves;
   std::vector<uint8_t> nodes;
+  std::vector<uint8_t> uvs;
   std::vector<uint8_t> descriptors;
   std::vector<uint8_t> instances;
   std::vector<uint8_t> active;
@@ -876,6 +918,7 @@ inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::comman
       && ReadLiveBytes(device, queue, data->indices.buffer, data->indices.used * data->indices.stride, &indices)
       && ReadLiveBytes(device, queue, data->blas_leaves.buffer, data->blas_leaves.used * data->blas_leaves.stride, &leaves)
       && ReadLiveBytes(device, queue, data->blas_nodes.buffer, data->blas_nodes.used * data->blas_nodes.stride, &nodes)
+      && ReadLiveBytes(device, queue, data->uvs.buffer, data->uvs.used * data->uvs.stride, &uvs)
       && ReadLiveBytes(device, queue, data->mesh_buffer, data->descriptor_count * sizeof(WorldMeshGPU), &descriptors)
       && ReadLiveBytes(device, queue, data->instance_buffer, data->active_count * sizeof(WorldInstanceGPU), &instances)
       && ReadLiveBytes(device, queue, data->active_buffer, data->active_count * sizeof(uint32_t), &active)
@@ -897,6 +940,7 @@ inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::comman
       copy.uid = mesh.uid;
       copy.positions = mesh.positions;
       copy.indices = mesh.indices;
+      copy.uvs = mesh.uvs;
     }
   }
 
@@ -933,7 +977,10 @@ inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::comman
         && range_equal(leaves, static_cast<uint64_t>(slot.leaf_offset) * data->blas_leaves.stride, blas.leaves.data(),
                        blas.leaves.size() * sizeof(BVHLeafGPU))
         && range_equal(nodes, static_cast<uint64_t>(slot.node_offset) * data->blas_nodes.stride, blas.nodes.data(),
-                       blas.nodes.size() * sizeof(BVHNodeGPU));
+                       blas.nodes.size() * sizeof(BVHNodeGPU))
+        && source->second.uvs.size() == slot.uv_count
+        && range_equal(uvs, static_cast<uint64_t>(slot.uv_offset) * data->uvs.stride, source->second.uvs.data(),
+                       source->second.uvs.size() * sizeof(std::array<float, 2>));
     if (!equal) meshes_bad += 1u;
     if (static_cast<uint64_t>(slot.node_offset) + slot.node_count <= data->blas_nodes.used
         && static_cast<uint64_t>(slot.leaf_offset) + slot.leaf_count <= data->blas_leaves.used) {
@@ -1191,7 +1238,13 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
   PoolStageScope stage("live bvh: reset");
   if (g_live_bvh.reset_requested.exchange(false, std::memory_order_relaxed)) ResetLiveStore(device, data, "requested");
 
-  if (g_live_bvh.enabled.load(std::memory_order_relaxed)) {
+  const bool live_on = g_live_bvh.enabled.load(std::memory_order_relaxed);
+  g_pool.live_on.store(live_on, std::memory_order_relaxed);
+  if (!live_on) {
+    // No source copy is made while the live BVH is off; the copies made before are freed here.
+    for (const reshade::api::resource proxy : TakePoolAlphaProxies(true)) device->destroy_resource(proxy);
+  }
+  if (live_on) {
     const uint32_t frame = g_state.frame.load();
     uint64_t revision = 0u;
     uint64_t visibility_revision = 0u;
@@ -1208,11 +1261,16 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     if (revision != data->mesh_revision || (data->mesh_scan_needed && frame >= data->upload_retry_frame)) {
       SyncLiveMeshes(device, cmd_list, data, frame);
     }
+    stage.Set("live bvh: alpha");
+    SyncLiveAlpha(device, cmd_list, data, frame);
     stage.Set("live bvh: tlas");
     const PoolRegion region = CurrentPoolRegion();
     const char* change = LiveTlasChange(*data, revision, visibility_revision, region);
+    // OFF drops the alpha instances at once, whatever else changed (the reason is not the test).
+    const bool alpha_off_now = data->tlas_alpha_on && !g_pool.alpha_foliage.load(std::memory_order_relaxed);
     if (change != nullptr && frame >= data->tlas_retry_frame
-        && (data->live.tlas_rebuilds == 0u || frame - data->live.tlas_frame >= kLiveTlasInterval || frame < data->live.tlas_frame)) {
+        && (data->live.tlas_rebuilds == 0u || frame - data->live.tlas_frame >= kLiveTlasInterval || frame < data->live.tlas_frame
+            || alpha_off_now)) {
       RebuildLiveTlas(device, data, region, frame, change);
     } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
       RebuildLiveTlas(device, data, region, frame, "refit failed");

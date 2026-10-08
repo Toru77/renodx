@@ -23,7 +23,8 @@
 // Every view traces from the camera, so what the game camera shows applies
 // (world_bvh_trace.hlsli): camera_hidden counts pixels whose nearest BVH
 // surface the game camera does not show, and g_camera_view.x hides those
-// surfaces (the ray continues behind them).
+// surfaces (the ray continues behind them). alpha_tests and alpha_cut count
+// the cutout tests of alpha-tested foliage (world_bvh_trace.hlsli AlphaCutHit).
 
 #include "world_bvh_trace.hlsli"
 
@@ -46,7 +47,7 @@ cbuffer cb_trace : register(b13)
     uint4 g_dynamic;      // x: deforming objects bound at t11 (deform_live.hpp)
 };
 
-#define TRACE_STATS_COUNT 15u
+#define TRACE_STATS_COUNT 17u
 #define STAT_RAYS 0u
 #define STAT_HITS 1u
 #define STAT_MISSES 2u
@@ -62,9 +63,11 @@ cbuffer cb_trace : register(b13)
 #define STAT_CMP_SKY 12u
 #define STAT_CMP_NO_DEPTH 13u
 #define STAT_CAMERA_HIDDEN 14u
+#define STAT_ALPHA_TESTS 15u
+#define STAT_ALPHA_CUT 16u
 // One pixel reports its hit after the counters:
 // flags (1 traced, 2 hit, 4 hidden from the game camera), instance, mesh, prim, t, position xyz, compare class.
-#define TRACE_INSPECT_BASE 15u
+#define TRACE_INSPECT_BASE 17u
 
 #define TRACE_MODE_SHADED 7u
 #define TRACE_MODE_INSTANCE 8u
@@ -228,6 +231,8 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         InterlockedAdd(gs_stats[STAT_TRIANGLE_TESTS], counters.triangle_tests);
         InterlockedMax(gs_stats[STAT_MAX_STACK_DEPTH], counters.max_stack_depth);
         InterlockedAdd(gs_stats[STAT_CAMERA_HIDDEN], counters.camera_hidden);
+        InterlockedAdd(gs_stats[STAT_ALPHA_TESTS], counters.alpha_tests);
+        InterlockedAdd(gs_stats[STAT_ALPHA_CUT], counters.alpha_cut);
     }
 
     GroupMemoryBarrierWithGroupSync();

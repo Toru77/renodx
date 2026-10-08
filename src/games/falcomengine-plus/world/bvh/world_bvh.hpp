@@ -227,12 +227,14 @@ inline void DrawBvhPanel() {
                         "objects are absent from the BVH. Off: admitted as before (applies at once).");
     }
     bool alpha_foliage = g_pool.alpha_foliage.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Alpha-tested foliage (not functional yet)", &alpha_foliage)) {
+    if (ImGui::Checkbox("Alpha-tested foliage (experimental)", &alpha_foliage)) {
       g_pool.alpha_foliage.store(alpha_foliage, std::memory_order_relaxed);
       switches_changed = true;
     }
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Work in progress: the GPU stage does not exist, ON admits nothing new (alpha meshes stay refused).");
+      ImGui::SetTooltip("Experimental, session only, default off. Off: alpha-tested meshes are not traced and their "
+                        "instances leave the BVH at once. On: their cutouts are traced through a 256-slice atlas, filled "
+                        "at the next present (copies of the source textures are made when drawn).");
     }
     bool log_crashes = CrashLogEnabled();
     if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
@@ -326,12 +328,25 @@ inline void DrawBvhPanel() {
   ImGui::Text("Instances: %llu admitted, %llu in region, following %llu, orphans retired %llu",
               static_cast<unsigned long long>(stats.admitted), static_cast<unsigned long long>(stats.region),
               static_cast<unsigned long long>(stats.following), static_cast<unsigned long long>(stats.orphans_retired));
-  ImGui::Text("Alpha foliage %s: draws %llu, conflicts %llu, meshes conflicted %llu, refused off %llu, conflict refused %llu, no UVs %llu, not ready %llu, removed %llu",
+  ImGui::Text("Alpha foliage %s: draws %llu, conflicts %llu, meshes conflicted %llu, refused off %llu, conflict refused %llu, no UVs %llu, removed %llu",
               g_pool.alpha_foliage.load(std::memory_order_relaxed) ? "on" : "off", static_cast<unsigned long long>(stats.alpha_draws),
               static_cast<unsigned long long>(stats.alpha_conflicts), static_cast<unsigned long long>(stats.alpha_meshes_conflicted),
               static_cast<unsigned long long>(stats.alpha_refused_off), static_cast<unsigned long long>(stats.alpha_conflict_refused),
-              static_cast<unsigned long long>(stats.alpha_no_uv), static_cast<unsigned long long>(stats.alpha_not_ready),
-              static_cast<unsigned long long>(stats.alpha_removed));
+              static_cast<unsigned long long>(stats.alpha_no_uv), static_cast<unsigned long long>(stats.alpha_removed));
+  PoolAlphaGpuStats gpu;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    gpu = g_pool.alpha_gpu;
+  }
+  ImGui::Text("Alpha GPU: slices %u/%u, blits %llu (%u this present), copies %llu, proxies %u (%.1f MB), source refused %llu (bytes %llu, format %llu), requeues %llu, cap refused %llu",
+              gpu.slices_used, kAlphaAtlasSlices, static_cast<unsigned long long>(gpu.blits), gpu.blits_frame,
+              static_cast<unsigned long long>(stats.alpha_source_copies), gpu.proxies, gpu.proxy_bytes / (1024.0 * 1024.0),
+              static_cast<unsigned long long>(stats.alpha_source_refused), static_cast<unsigned long long>(stats.alpha_source_refused_bytes),
+              static_cast<unsigned long long>(stats.alpha_source_refused_format), static_cast<unsigned long long>(stats.alpha_uv_requeues),
+              static_cast<unsigned long long>(gpu.cap_refused));
+  ImGui::Text("Alpha TLAS: instances %u, waiting %u; trace tests %llu, cut %llu; blit %.3f ms, trace %.3f ms",
+              gpu.tlas_instances, gpu.waiting, static_cast<unsigned long long>(gpu.tests), static_cast<unsigned long long>(gpu.cut),
+              gpu.blit_ms, gpu.trace_ms);
   DrawDeformLivePanel(deform, deform_traced);
 
   ImGui::SeparatorText("GPU BVH (live)");

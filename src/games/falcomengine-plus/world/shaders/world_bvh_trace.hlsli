@@ -45,6 +45,11 @@ Buffer<float> g_trace_dynamic_vertices : register(t10);
 StructuredBuffer<DynamicObjectGPU> g_trace_dynamic_objects : register(t11);
 StructuredBuffer<BVHNodeGPU> g_trace_dynamic_nodes : register(t12);
 StructuredBuffer<BVHLeafGPU> g_trace_dynamic_leaves : register(t13);
+// Alpha-tested foliage (alpha_live.hpp): UVs per vertex (a mesh with UVs has bbox_min.w = uv_offset + 1),
+// the atlas (one slice per material) and the material table.
+StructuredBuffer<float2> g_trace_uvs : register(t14);
+Texture2DArray<uint> g_alpha_atlas : register(t15);
+StructuredBuffer<AlphaMaterialGPU> g_alpha_materials : register(t16);
 // Objects in g_trace_dynamic_objects; set by the including shader before tracing.
 static uint g_trace_dynamic_count = 0u;
 
@@ -68,6 +73,8 @@ struct WorldTraceCounters
     uint triangle_tests;
     uint max_stack_depth;
     uint camera_hidden;    // 1: the game camera does not show the nearest BVH surface along the ray
+    uint alpha_tests;      // triangle hits of alpha-tested materials tested against the atlas
+    uint alpha_cut;        // of those, the ones cut (alpha below the threshold)
 };
 
 // Ray-wide game camera settings (rays from the camera only).
@@ -86,6 +93,8 @@ void TraceResetCounters(out WorldTraceCounters counters)
     counters.triangle_tests = 0u;
     counters.max_stack_depth = 0u;
     counters.camera_hidden = 0u;
+    counters.alpha_tests = 0u;
+    counters.alpha_cut = 0u;
 }
 
 // Mirrors camera_fade.hpp CameraFadeInterval: the distances [lo, hi] at which
@@ -140,10 +149,12 @@ bool IntersectTriangle(
     float3 v1,
     float3 v2,
     out float t,
-    out float3 normal)
+    out float3 normal,
+    out float2 bary)
 {
     t = 0.0;
     normal = float3(0.0, 1.0, 0.0);
+    bary = float2(0.0, 0.0);
     const float3 edge1 = v1 - v0;
     const float3 edge2 = v2 - v0;
     const float3 p = cross(direction, edge2);
@@ -160,9 +171,50 @@ bool IntersectTriangle(
     if (hit_t <= 0.0) return false;
     const float3 raw_normal = cross(edge1, edge2);
     const float normal_length = length(raw_normal);
+    bary = float2(u, v);
     t = hit_t;
     if (normal_length > 1e-12) normal = raw_normal / normal_length;
     return true;
+}
+
+// Alpha cutout of a triangle hit (alpha-tested foliage): true when the material's alpha at the hit's UV is
+// below its threshold. The UV is interpolated from the mesh's UVs (uv_slot = bbox_min.w, uv_offset + 1) and
+// transformed as the game's pixel shader does: (u + scroll.x, 1 - (v + scroll.y)), wrapped. The atlas is point
+// sampled at LOD 0. A material or UV that cannot be read counts as invalid_refs and keeps the surface solid.
+bool AlphaCutHit(uint material, float uv_slot, uint i0, uint i1, uint i2, float2 bary, inout WorldTraceCounters counters)
+{
+    if (material == 0u) return false;
+    uint material_count;
+    uint material_stride;
+    g_alpha_materials.GetDimensions(material_count, material_stride);
+    uint uv_count;
+    uint uv_stride;
+    g_trace_uvs.GetDimensions(uv_count, uv_stride);
+    if (material - 1u >= material_count || uv_slot < 1.0)
+    {
+        counters.invalid_refs++;
+        return false;
+    }
+    const AlphaMaterialGPU entry = g_alpha_materials[material - 1u];
+    if ((entry.swizzle & 1u) != 0u) return false;  // alpha forced to 1: solid
+    const uint uv_base = (uint)uv_slot - 1u;
+    if (uv_base + max(i0, max(i1, i2)) >= uv_count)
+    {
+        counters.invalid_refs++;
+        return false;
+    }
+    counters.alpha_tests++;
+    const float2 uv0 = g_trace_uvs[uv_base + i0];
+    const float2 uv1 = g_trace_uvs[uv_base + i1];
+    const float2 uv2 = g_trace_uvs[uv_base + i2];
+    const float2 uv = (1.0 - bary.x - bary.y) * uv0 + bary.x * uv1 + bary.y * uv2;
+    const uint x = min((uint)floor(frac(uv.x + entry.scroll.x) * 1024.0), 1023u);
+    const uint y = min((uint)floor(frac(1.0 - (uv.y + entry.scroll.y)) * 256.0), 255u);
+    const uint word = g_alpha_atlas.Load(int4(x >> 2u, y, entry.slice, 0));
+    const uint texel = (word >> ((x & 3u) * 8u)) & 0xFFu;
+    const bool cut = (float)texel * (1.0 / 255.0) - entry.threshold < 0.0;
+    if (cut) counters.alpha_cut++;
+    return cut;
 }
 
 // shown_min / shown_max: the t range in which the game camera shows this
@@ -170,6 +222,7 @@ bool IntersectTriangle(
 // goes to hidden_t), otherwise accepted with out_hidden = 1.
 bool TraceBlas(
     uint mesh_id,
+    uint material,
     float3 origin,
     float3 direction,
     float t_min,
@@ -247,9 +300,11 @@ bool TraceBlas(
                                 const float3 v2 = g_trace_vertices[vertex_offset + i2].xyz;
                                 float tri_t;
                                 float3 tri_normal;
+                                float2 tri_bary;
                                 counters.triangle_tests++;
-                                if (IntersectTriangle(origin, direction, v0, v1, v2, tri_t, tri_normal)
-                                    && tri_t >= t_min && tri_t < t_max)
+                                if (IntersectTriangle(origin, direction, v0, v1, v2, tri_t, tri_normal, tri_bary)
+                                    && tri_t >= t_min && tri_t < t_max
+                                    && !AlphaCutHit(material, mesh.bbox_min.w, i0, i1, i2, tri_bary, counters))
                                 {
                                     const bool shown = tri_t >= shown_min && tri_t <= shown_max;
                                     if (shown || !hide_hidden)
@@ -350,8 +405,9 @@ bool TraceDynamicBlas(
                         const float3 v2 = float3(g_trace_dynamic_vertices[base + 6u], g_trace_dynamic_vertices[base + 7u], g_trace_dynamic_vertices[base + 8u]);
                         float tri_t;
                         float3 tri_normal;
+                        float2 tri_bary;
                         counters.triangle_tests++;
-                        if (IntersectTriangle(origin, direction, v0, v1, v2, tri_t, tri_normal)
+                        if (IntersectTriangle(origin, direction, v0, v1, v2, tri_t, tri_normal, tri_bary)
                             && tri_t >= t_min && tri_t < t_max)
                         {
                             t_max = tri_t;
@@ -515,7 +571,7 @@ WorldTraceHit TraceWorldRay(
                                     uint local_prim = 0xFFFFFFFFu;
                                     float3 local_normal = float3(0.0, 0.0, 0.0);
                                     uint local_hidden = 0u;
-                                    if (TraceBlas(mesh_id, local_origin, local_direction, t_min, local_best_t,
+                                    if (TraceBlas(mesh_id, (uint)instance.header.z, local_origin, local_direction, t_min, local_best_t,
                                                   shown_min, shown_max, view.hide, hidden_t,
                                                   counters, local_prim, local_normal, local_hidden))
                                     {
