@@ -1,4 +1,4 @@
-// Native harness for the pool: mock device/command list execute copies
+﻿// Native harness for the pool: mock device/command list execute copies
 // immediately (as the GPU would at that point of the stream).
 #include <cassert>
 #include <cstdio>
@@ -331,7 +331,7 @@ int main() {
   {
     std::ifstream f(bvh::PoolOutputDir() / "world_pool.json");
     const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 8") != std::string::npos, "schema 8");
+    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
     CHECK(text.find("\"scene\": {\"fade_constants\": true") != std::string::npos, "scene constants");
     CHECK(text.find("\"visibility\": {\"instances\": 7, \"camera_visible\": 5, \"shadow_only\": 2") != std::string::npos
               && text.find("\"with_inputs\": 7") != std::string::npos, "visibility summary");

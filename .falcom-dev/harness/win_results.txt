@@ -1,0 +1,11 @@
+﻿test_pool rc=0 PASS (0 failures)
+test_indirect rc=0 last=PASS (0 failures)
+test_switches rc=0 last=PASS (0 failures)
+test_visibility rc=1 last=FAILED (1 failures)
+test_live BUILD FAILED (see test_live.win_build.log)
+test_build rc=0 last=PASS (0 failures)
+test_verify rc=1 last=FAILED (1 failures)
+test_deform rc=0 last=PASS (0 failures)
+test_deform_live BUILD FAILED (see test_deform_live.win_build.log)
+test_motion rc=1 last=FAILED (3 failures)
+DONE

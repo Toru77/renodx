@@ -1,0 +1,8 @@
+﻿cmd : 'build_win.bat' is not recognized as an internal or external command,
+At line:1 char:353
++ ... dx\.falcom-dev\harness; cmd /c "build_win.bat test_pool" 2>&1 | Out-F ...
++                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ('build_win.bat'...ternal command,:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+operable program or batch file.

@@ -1,0 +1,5 @@
+﻿test_visibility rc=0 last=PASS (0 failures)
+test_verify rc=0 last=PASS (0 failures)
+test_motion rc=1 last=FAILED (2 failures)
+test_live rc=-1 last=
+test_deform_live rc=0 last=PASS (0 failures)

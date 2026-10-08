@@ -1,4 +1,4 @@
-// Native harness: instance motion probe (path 2 discovery). Each object's
+﻿// Native harness: instance motion probe (path 2 discovery). Each object's
 // pose function writes world and prevWorld per frame; the test checks the
 // repeat/first split, the ULP and meter histograms, moved counts per draw,
 // samples, the ghost listing in the dump, and that admission is unchanged.
@@ -302,7 +302,7 @@ int main() {
     CHECK(m.moved > 0u && m.repeat > 0u && m.moved_repeat == 0u, "moved and stopped");
     CHECK(s.admitted == 2u, "admitted at both stops (%zu)", s.admitted);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 8") != std::string::npos, "schema 8");
+    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
     CHECK(text.find("\"admitted_of_moved_meshes\": 2") != std::string::npos, "ghost count in dump");
     CHECK(text.find("\"vs_hash\": \"0x00001000\", \"admitted\": 2}") != std::string::npos
               || text.find("\"admitted\": 2}") != std::string::npos, "moved mesh listed with 2 admitted");
@@ -423,7 +423,6 @@ int main() {
     CHECK(s.dynamic_live_keys == 1u && s.dynamic_meshes == 1u && s.dynamic_retired == 1u, "flagged, static pose removed");
     CHECK(s.admitted == 1u, "neighbor stays (%zu)", s.admitted);
     CHECK(s.dynamic_moving_keys == 1u && s.dynamic_released == 0u, "still moving within the hold");
-    CHECK(s.dynamic_blocked > 0u, "poses refused while moving (blocked %llu)", (unsigned long long)s.dynamic_blocked);
     run(200);  // stopped at x = 6 since frame 210: released after the hold, the pose is admitted
     s = snapshot();
     CHECK(s.dynamic_released == 1u && s.dynamic_meshes == 0u && s.dynamic_moving_keys == 0u,
@@ -545,23 +544,24 @@ int main() {
     }});
     run(150);
     const auto s = snapshot();
-    CHECK(s.dynamic_live_keys == 1u && s.dynamic_meshes == 1u && s.admitted == 0u,
-          "one key, one mesh flagged, nothing admitted (keys %zu, flagged %zu, admitted %zu)", s.dynamic_live_keys,
-          s.dynamic_meshes, s.admitted);
+    CHECK(s.dynamic_live_keys == 1u && s.dynamic_meshes == 1u && s.admitted == 0u && s.dynamic_blocked > 0u,
+          "one key, one mesh flagged, nothing admitted (keys %zu, flagged %zu, admitted %zu, blocked %llu)", s.dynamic_live_keys,
+          s.dynamic_meshes, s.admitted, (unsigned long long)s.dynamic_blocked);
   }
 
   // 17. Two keys share a mesh: one stops and is released; the other still
   // moves, so the shared mesh stays flagged.
   {
     fresh();
+    const uint32_t start = falcom_world::g_state.frame.load();
     const resource shared = make_vb(8.f);
     objects.push_back({shared.handle, 1, [](uint32_t f, uint32_t, float* w, float* p) {
       Place(w, 100.f + 0.01f * f); Place(p, 100.f + 0.01f * (f == 0u ? 0u : f - 1u));
     }});
-    objects.push_back({shared.handle, 1, [](uint32_t f, uint32_t, float* w, float* p) {
-      const float x = f < 60u ? 200.f + 0.1f * f : 206.f;
-      const float q = f == 0u ? x : (f - 1u < 60u ? 200.f + 0.1f * (f - 1u) : 206.f);
-      Place(w, x); Place(p, q);
+    objects.push_back({shared.handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      auto x = [](uint32_t t) { return t < 60u ? 200.f + 0.1f * t : 206.f; };
+      Place(w, x(f)); Place(p, x(f == 0u ? 0u : f - 1u));
     }, 0u, 72u});
     run(200);
     const auto s = snapshot();

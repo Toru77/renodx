@@ -1,0 +1,7 @@
+﻿visibility: meshes 2 instances 7
+A: source camera draw near 1 param 12.00 0.25 camera 3 light 1 ps 000000B3
+S110: source light draw near 0 camera 0 light 3
+mesh1: camera 6 near 2 light 4
+"visibility": {"instances": 7, "camera_visible": 5, "shadow_only": 2, "shadow_only_in_region": 2, "no_view": 0, "shadow_only_by_vs": {"0x000000A6": 2}, "with_inputs": 7, "inputs_from": {"camera_draw": 5, "light_draw": 2, "admission": 0}, "near_fade": 3, "near_fade_start_m": {"<=0": 0, "0-2": 0, "2-5": 2, "5-10": 0, "10-20": 1, ">20": 0}, "near_fade_inv_range": {"min": 0.25, "max": 0.5, "zero": 0, "not_finite": 0}, "opacity_below_half": 1, "dither_flip": 1, "changed_since_admission": 1, "visibility_changes": 2, "hidden_at_camera": 1, "samples": [
+    {"reason": "near fade", "mesh_uid": 1, "vs_hash": "0x000000A5", "position": [10, 0, 0], "bounds_min": [9, -1, -1], "bounds_max": [11, 1, 1], "triangles": 12, "closest_distance": 8, "fade_at_closest": 0, "start": 12, "inv_range": 0.25, "opacity": 1, "inputs": "camera draw", "camera_ps": "0x000000B3", "camera_frames": 6, "light_frames": 4, "mes
+PASS (0 failures)

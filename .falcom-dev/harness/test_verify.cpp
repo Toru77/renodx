@@ -1,4 +1,4 @@
-// Native harness: mesh capture verification (round 12) and the legacy
+﻿// Native harness: mesh capture verification (round 12) and the legacy
 // instance scale switch. A mesh enters the pool only after two captures in a
 // row decode to the same mesh; buffer contents the pool cannot see change
 // (GPU writes) are simulated by editing the mock buffers between frames.
@@ -387,7 +387,7 @@ int main() {
     bvh::DumpWorldPool();
     std::ifstream json(json_path);
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 8") != std::string::npos, "schema 8");
+    CHECK(text.find("\"schema\": 9") != std::string::npos, "schema 9");
     CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": true}") != std::string::npos, "switches");
     CHECK(text.find("\"admitted_outside_legacy_scale\": 2") != std::string::npos, "outside legacy count");
     CHECK(text.find("\"outside_legacy_scale\": 1") != std::string::npos, "family count");

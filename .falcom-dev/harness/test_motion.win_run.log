@@ -1,0 +1,7 @@
+﻿static exact: repeat 6 first 2 exact 8 moved 0 admitted 2
+moving: first 7 repeat 0 moved 7 draws 7 all 7 meshes 1 admitted 0 samples 2
+ghosts: moved 4 repeat 8 admitted 2 meshes 1
+mixed: moved 10 nonfinite 5 moved_repeat 4 repeat samples 2
+p2a moving: admitted 1 keys 1 moving 1 meshes 1 retired 1 blocked 0 rule 2 stale 0
+shared: admitted 1 keys 1 meshes 1 retired 1
+PASS (0 failures)

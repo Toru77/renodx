@@ -3,7 +3,9 @@
 // garbage reset, GPU allocation failure and retry, switches, failed meshes,
 // the lock rule, the GPU contents check, and a CPU port of the trace shader
 // run over the uploaded buffers and compared with brute force.
+#include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -16,6 +18,15 @@ namespace bvh = falcom_world::bvh;
 
 static int g_failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_failures; std::printf("FAIL %s:%d %s | ", __FILE__, __LINE__, #cond); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+static const auto g_t0 = std::chrono::steady_clock::now();
+static void Stage(const char* fmt, ...) {
+  static double last = 0.0;
+  const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t0).count();
+  std::printf("[%7.1fs +%6.1fs frame %u] ", now, now - last, static_cast<unsigned>(falcom_world::g_state.frame.load()));
+  last = now;
+  va_list args; va_start(args, fmt); std::vprintf(fmt, args); va_end(args);
+  std::printf("\n");
+}
 
 static int g_under_lock = 0;
 static void ProbeLock() {
@@ -441,7 +452,9 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
       }
     }
   }
+  Stage("%s: start, %d rays", label, rays);
   for (int i = 0; i < rays; ++i) {
+    if (i % 50 == 0) Stage("%s: ray %d/%d", label, i, rays);
     F3 dir;
     if (!targets.empty() && i % 2 == 0) {
       dir = targets[rng() % targets.size()] - origin;
@@ -530,7 +543,9 @@ static int CompareFadeTraces(const Device& dev, const bvh::BvhDeviceData& data, 
   int mismatches = 0;
   *faded_rays = 0u;
   Counters c;
+  Stage("%s: start, %d rays", label, rays);
   for (int i = 0; i < rays; ++i) {
+    if (i % 50 == 0) Stage("%s: ray %d/%d", label, i, rays);
     F3 dir = (i % 3 != 0 && !targets.empty()) ? targets[rng() % targets.size()] - origin + F3{uni(rng), uni(rng), uni(rng)}
                                               : F3{uni(rng), uni(rng) - 0.3f, uni(rng)};
     const float len = std::sqrt(Dot(dir, dir));
@@ -576,6 +591,8 @@ static uint32_t ExpectedRegionInstances(const bvh::BvhDeviceData& data) {
 }
 
 int main() {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  Stage("main start");
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   bvh::g_pool.region_size = 512.f;
   SetCamera(10.f, 5.f, 10.f);
@@ -586,11 +603,13 @@ int main() {
 
   // Meshes in pool order: A 180k triangles, B 30k, C 20k (each over the budget alone), D 12, E 28.8k.
   const uint64_t kA = 0xA, kB = 0xB, kC = 0xC, kD = 0xD, kE = 0xE;
+  Stage("adding meshes");
   AddMesh(kA, Grid(300, 300, 40.f, 2.f));
   AddMesh(kB, Grid(150, 100, 20.f, 1.f));
   AddMesh(kC, Grid(100, 100, 10.f, 1.f));
   AddMesh(kD, BoxMesh(1.f));
   AddMesh(kE, Grid(120, 120, 15.f, 3.f));
+  Stage("adding instances");
   AddInstance(kA, 0, 0, 0);
   AddInstance(kA, 60, -3, 40, 1.f, 0.5f);
   for (int i = 0; i < 5; ++i) AddInstance(kB, -60.f + i * 25.f, 2, -50, 1.f, 0.3f * i);
@@ -603,6 +622,7 @@ int main() {
     CHECK(bvh::g_pool.instances.size() == 39u, "instances %zu", bvh::g_pool.instances.size());
   }
 
+  Stage("1 streaming: 5 presents");
   // 1. Streaming under the budget.
   present();
   std::printf("frame 1: resident %u pending %u tlas %u waiting %u reason %s\n", data->live.resident_meshes,
@@ -627,6 +647,7 @@ int main() {
   CHECK(data->live.tlas_rebuilds == 2u && data->live.tlas_frame == first_tlas + bvh::kLiveTlasInterval, "rebuild after the interval (%u)", data->live.tlas_frame - first_tlas);
   CHECK(data->live.tlas_instances == 35u && data->live.tlas_waiting == 0u, "all region instances (%u)", data->live.tlas_instances);
   CHECK(data->live.tlas_instances == ExpectedRegionInstances(*data), "matches brute-force set");
+  Stage("1 idle presents");
   for (int i = 0; i < 20; ++i) present();
   CHECK(data->live.tlas_rebuilds == 2u, "nothing changed, no rebuild");
   std::printf("store: %.1f MB used %.1f MB allocated, grows %u, mesh ms max %.2f tlas ms max %.2f\n",
@@ -638,6 +659,7 @@ int main() {
   {
     const int calls = renodx::utils::scene::g_readback_calls;
     CHECK(calls == 0, "no readback outside the check (%d)", calls);
+    Stage("1 GPU check");
     bvh::g_live_bvh.check_requested.store(true);
     present();
     std::printf("check: %s\n", data->live.gpu_result.c_str());
@@ -646,11 +668,13 @@ int main() {
   }
 
   // 2. A new instance: TLAS rebuilt once the interval has passed.
+  Stage("2 new instance");
   AddInstance(kD, 5, 30, 5, 3.f);
   present();
   CHECK(std::string(data->live.tlas_reason) == "pool changed" && data->live.tlas_instances == 36u, "new instance (%s %u)", data->live.tlas_reason, data->live.tlas_instances);
 
   // 3. Region moves with the camera.
+  Stage("3 region move");
   SetCamera(2010.f, 0.f, 2005.f);
   for (int i = 0; i < 9; ++i) present();
   std::printf("moved: tlas %u reason %s\n", data->live.tlas_instances, data->live.tlas_reason);
@@ -666,6 +690,7 @@ int main() {
     std::lock_guard lock(bvh::g_pool.mutex);
     CHECK(bvh::g_pool.meshes[1].uid == 2u, "uid order");
   }
+  Stage("4 retire B");
   RetireMesh(kB);
   present();
   CHECK(data->live.meshes_retired == 1u && !data->slots[slot_b].live, "B retired");
@@ -678,11 +703,13 @@ int main() {
   for (int i = 0; i < 9; ++i) present();
   CHECK(data->live.tlas_instances == 31u, "B's 5 instances gone (%u)", data->live.tlas_instances);
   CHECK(CompareTraces(dev, *data, "retired", 300, 3) == 0, "trace agrees after retirement");
+  Stage("4 GPU check after retire");
   bvh::g_live_bvh.check_requested.store(true);
   present();
   CHECK(data->live.gpu_ok, "GPU check after retirement: %s", data->live.gpu_result.c_str());
 
   // 5. Retire A: retired data passes half of the store -> reset and restream.
+  Stage("5 retire A, reset, restream");
   RetireMesh(kA);
   present();
   std::printf("after A: resets %u reason '%s' slots %zu bvh_ready %d\n", data->live.resets, data->live.last_reset_reason.c_str(),
@@ -696,6 +723,7 @@ int main() {
   CHECK(CompareTraces(dev, *data, "restreamed", 300, 4) == 0, "trace agrees after reset");
 
   // 6. GPU allocation failure: retried after kLiveRetryFrames.
+  Stage("6 GPU alloc failure");
   const uint64_t kF = 0xF;
   AddMesh(kF, Grid(250, 250, 30.f, 1.f));
   AddInstance(kF, -100, 0, 100);
@@ -712,6 +740,7 @@ int main() {
   CHECK(data->live.tlas_instances == 30u, "F's instance in (%u)", data->live.tlas_instances);
 
   // 7. Live BVH off: nothing changes; on again: catches up.
+  Stage("7 live off/on");
   bvh::g_live_bvh.enabled.store(false);
   const uint64_t kG = 0x10;
   AddMesh(kG, BoxMesh(2.f));
@@ -724,6 +753,7 @@ int main() {
   CHECK(data->live.resident_meshes == 5u && data->live.tlas_instances == 31u, "caught up");
 
   // 8. A mesh without a usable triangle fails; its instances count as unusable.
+  Stage("8 failed mesh");
   const uint64_t kH = 0x11;
   {
     bvh::PoolDecodedMesh broken = BoxMesh(1.f);
@@ -738,6 +768,7 @@ int main() {
 
   // 8b. Descriptor buffer creation fails: the new slot is not traced until
   // the upload is retried; then the TLAS picks it up.
+  Stage("8b descriptor failure");
   const uint64_t kI = 0x12;
   AddMesh(kI, BoxMesh(0.5f));
   AddInstance(kI, -5, 40, -5);
@@ -761,6 +792,7 @@ int main() {
   // 8c. TLAS buffer creation fails: the previous TLAS stays and the build is
   // retried without any further change.
   {
+    Stage("8c TLAS create failure");
     for (int i = 0; i < 9; ++i) present();
     AddInstance(kD, 7, 45, 7);
     const uint32_t failures = data->live.upload_failures;
@@ -779,6 +811,7 @@ int main() {
 
   // 8d. Provenance, inspect description, write tracking, mass retirement.
   {
+    Stage("8d provenance/inspect");
     for (int i = 0; i < 9; ++i) present();
     CHECK(!data->tlas_info.empty() && data->tlas_info.size() == data->tlas_instances_cpu.size(), "provenance per TLAS instance");
     // Pick a TLAS instance of mesh C and describe it as if the trace hit it.
@@ -830,6 +863,7 @@ int main() {
       CHECK(s.tracked_buffer_writes == 2u && writes == 2u && s.meshes_written == 1u, "write tracking");
     }
     // 32 meshes retired in one compaction count as a map change.
+    Stage("8d mass retirement");
     for (uint64_t k = 0; k < 32; ++k) AddMesh(0x5000u + k, BoxMesh(3.f + 0.1f * k));
     {
       std::lock_guard lock(bvh::g_pool.mutex);
@@ -841,6 +875,7 @@ int main() {
     for (int i = 0; i < 9; ++i) present();
   }
 
+  Stage("8e HLSL interval transcription");
   // 8e. Game camera fade: GPU visibility, CPU port of the trace vs brute force.
   {
     // The HLSL transcription and camera_fade.hpp agree.
@@ -856,6 +891,7 @@ int main() {
     }
     CHECK(differ == 0, "HLSL interval transcription differs (%d)", differ);
 
+    Stage("8e add fade meshes/instances");
     const uint64_t kF = 0xF0u, kG = 0xF1u;
     AddMesh(kF, Grid(12, 12, 6.f, 0.5f));
     AddMesh(kG, BoxMesh(1.5f));
@@ -884,6 +920,7 @@ int main() {
       bvh::ObservePoolInstance(kG, 0x2000u, w, g_obs_frame++, &shadow, &vis);
       if (i == 3) bvh::ObservePoolInstance(kG, 0x2000u, w, g_obs_frame++, &camera, &vis);
     }
+    Stage("8e 12 presents");
     for (int i = 0; i < 12; ++i) present();
     std::printf("fade: tlas %u near-fade %u (expected %u)\n", data->live.tlas_instances, data->live.tlas_near_fade, near_fading);
     CHECK(data->live.tlas_near_fade == near_fading, "near-fade instances in the TLAS (%u vs %u)", data->live.tlas_near_fade, near_fading);
@@ -960,6 +997,7 @@ int main() {
       }
     }
     {
+      Stage("8e visibility change");
       // A later sighting with other inputs: the TLAS is rebuilt for it alone.
       const uint32_t rebuilds = data->live.tlas_rebuilds;
       float w[12];
@@ -993,6 +1031,7 @@ int main() {
       }
       for (int i = 0; i < 9; ++i) present();
     }
+    Stage("8e fade compares");
     uint32_t faded_off = 0u, faded_on = 0u;
     CHECK(CompareFadeTraces(dev, *data, "fade shown", {false, 0.f}, 600, 11, &faded_off) == 0, "fade shown agrees");
     CHECK(CompareFadeTraces(dev, *data, "fade hidden", {true, 0.f}, 600, 11, &faded_on) == 0, "fade hidden agrees");
@@ -1024,15 +1063,18 @@ int main() {
       }
     }
     CHECK(CompareTraces(dev, *data, "with faded instances", 300, 13) == 0, "plain trace unchanged by visibility data");
+    Stage("8e GPU check");
     bvh::g_live_bvh.check_requested.store(true);
     present();
     CHECK(data->live.gpu_checked && data->live.gpu_ok, "GPU check with visibility (%s)", data->live.gpu_result.c_str());
+    Stage("8e retire F,G");
     RetireMesh(kF);
     RetireMesh(kG);
     for (int i = 0; i < 9; ++i) present();
     CHECK(data->live.tlas_near_fade == 0u, "near-fade instances gone with their meshes (%u)", data->live.tlas_near_fade);
   }
 
+  Stage("9 requested reset");
   // 9. Rebuild on request, also inside an upload retry window.
   data->upload_retry_frame = frame.load() + 100u;
   bvh::g_live_bvh.reset_requested.store(true);
@@ -1042,10 +1084,12 @@ int main() {
   for (int i = 0; i < 12; ++i) present();
   CHECK(data->live.resident_meshes == 6u && data->bvh_ready, "restreamed after request (%u)", data->live.resident_meshes);
   CHECK(CompareTraces(dev, *data, "rebuilt", 300, 5) == 0, "trace agrees after rebuild");
+  Stage("9 GPU check after rebuild");
   bvh::g_live_bvh.check_requested.store(true);
   present();
   CHECK(data->live.gpu_ok, "GPU check after rebuild: %s", data->live.gpu_result.c_str());
 
+  Stage("10 corruption check");
   // 10. GPU check catches a corrupted node.
   {
     const bvh::LiveMeshSlot& slot = data->slots.back();
@@ -1059,20 +1103,24 @@ int main() {
   }
 
   // 11. Pool reset: no live mesh left -> store reset, BVH not traceable.
+  Stage("11 pool reset");
   bvh::ResetWorldPool();
   present();
   CHECK(data->live.resets == 3u && data->live.last_reset_reason == "no live mesh left", "pool reset (%s)", data->live.last_reset_reason.c_str());
   for (int i = 0; i < 9; ++i) present();
   CHECK(!data->bvh_ready && data->live.tlas_instances == 0u, "empty BVH");
 
+  Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);
   CHECK(dev.structured_mismatch_copies == 0, "GPU copies keep the element stride");
 
   // 12. Device teardown releases every buffer and view.
+  Stage("12 teardown");
   bvh::DestroyBvhDeviceData(&dev);
   CHECK(dev.res.empty() && dev.views.empty(), "leaks: %zu resources, %zu views", dev.res.size(), dev.views.size());
 
+  Stage("done: %d failures", g_failures);
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
