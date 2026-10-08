@@ -2561,6 +2561,17 @@ inline void CompactPool() {
   }
 
   for (const uint64_t key : invalidated) g_pool.dynamic_keys.erase(key);
+  if (g_pool.dynamic_applied) {
+    // A mesh stays flagged only while a moving key still maps to it (mesh_by_key is already remapped).
+    std::vector<bool> held(g_pool.meshes.size(), false);
+    for (const auto& [key, entry] : g_pool.dynamic_keys) {
+      const auto mesh_it = g_pool.mesh_by_key.find(key);
+      if (entry.moving_now && mesh_it != g_pool.mesh_by_key.end() && mesh_it->second < held.size()) held[mesh_it->second] = true;
+    }
+    for (WorldMesh& mesh : g_pool.meshes) {
+      if (mesh.dynamic && !held[mesh.mesh_id]) mesh.dynamic = false;
+    }
+  }
   g_pool.invalidated_keys.clear();
   g_pool.retire_pending = false;
   g_pool.revision += 1u;

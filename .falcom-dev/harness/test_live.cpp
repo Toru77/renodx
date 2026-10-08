@@ -390,32 +390,40 @@ static TraceInputs Inputs(const Device& dev, const bvh::BvhDeviceData& data) {
 }
 
 // Brute force over the pool's instances in the region whose mesh is on the GPU.
-struct Expected { uint32_t instances = 0; };
-static float BruteForce(F3 o, F3 d, const bvh::BvhDeviceData& data, const bvh::PoolRegion& region, uint32_t* count) {
+struct RefInstance { std::vector<F3> verts; bvh::PoolCameraVisibility vis; };  // 3 verts per triangle
+static std::vector<RefInstance> BuildRefInstances(const bvh::BvhDeviceData& data, const bvh::PoolRegion& region) {
   std::lock_guard lock(bvh::g_pool.mutex);
-  float best = 1e30f; bool any = false; uint32_t n = 0;
+  std::vector<RefInstance> refs;
   for (const auto& inst : bvh::g_pool.instances) {
     if (!bvh::PoolInstanceInRegion(inst, region)) continue;
     const auto& mesh = bvh::g_pool.meshes[inst.mesh_id];
     const auto slot = data.slot_by_uid.find(mesh.uid);
     if (slot == data.slot_by_uid.end() || slot->second >= data.descriptor_count) continue;
-    ++n;
+    RefInstance& ref = refs.emplace_back();
+    ref.vis = bvh::GetPoolCameraVisibility(inst);
     for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
       if (mesh.indices[t] >= mesh.positions.size() || mesh.indices[t + 1] >= mesh.positions.size()
           || mesh.indices[t + 2] >= mesh.positions.size()) {
         continue;  // like BuildMeshBlas: such triangles are not in the BVH
       }
-      F3 v[3];
       for (int k = 0; k < 3; ++k) {
         const auto& p = mesh.positions[mesh.indices[t + k]];
         float w[3]; falcom_world::TransformInst4x3RowDot(inst.matrix, p[0], p[1], p[2], w);
-        v[k] = {w[0], w[1], w[2]};
+        ref.verts.push_back({w[0], w[1], w[2]});
       }
-      float tt;
-      if (Tri(o, d, v[0], v[1], v[2], &tt) && tt >= 0.001f && tt < best) { best = tt; any = true; }
     }
   }
-  if (count) *count = n;
+  return refs;
+}
+
+static float BruteForce(F3 o, F3 d, const std::vector<RefInstance>& refs) {
+  float best = 1e30f; bool any = false;
+  for (const auto& ref : refs) {
+    for (size_t i = 0; i + 2 < ref.verts.size(); i += 3) {
+      float tt;
+      if (Tri(o, d, ref.verts[i], ref.verts[i + 1], ref.verts[i + 2], &tt) && tt >= 0.001f && tt < best) { best = tt; any = true; }
+    }
+  }
   return any ? best : -1.f;
 }
 
@@ -452,6 +460,7 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
       }
     }
   }
+  const std::vector<RefInstance> refs = BuildRefInstances(data, region);
   Stage("%s: start, %d rays", label, rays);
   for (int i = 0; i < rays; ++i) {
     if (i % 50 == 0) Stage("%s: ray %d/%d", label, i, rays);
@@ -466,7 +475,7 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
     dir = dir * (1.f / len);
     uint32_t instance;
     const float t_bvh = TraceWorld(in, origin, dir, c, &instance);
-    const float t_ref = BruteForce(origin, dir, data, region, nullptr);
+    const float t_ref = BruteForce(origin, dir, refs);
     const bool agree = (t_bvh < 0.f && t_ref < 0.f)
                        || (t_bvh >= 0.f && t_ref >= 0.f && std::fabs(t_bvh - t_ref) <= 1e-3f * std::max(1.f, t_ref));
     if (t_ref >= 0.f) ++hits;
@@ -483,15 +492,10 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
 
 // Brute force with the game camera fade, from the pool's own rule
 // (GetPoolCameraVisibility, CameraFadeApplies, camera_fade.hpp).
-static float BruteForceFade(F3 o, F3 d, const bvh::BvhDeviceData& data, const bvh::PoolRegion& region, Fade fade, uint32_t* faded) {
-  std::lock_guard lock(bvh::g_pool.mutex);
+static float BruteForceFade(F3 o, F3 d, const std::vector<RefInstance>& refs, Fade fade, uint32_t* faded) {
   float best = 1e30f; bool any = false; bool best_faded = false; float faded_t = 3.0e38f;
-  for (const auto& inst : bvh::g_pool.instances) {
-    if (!bvh::PoolInstanceInRegion(inst, region)) continue;
-    const auto& mesh = bvh::g_pool.meshes[inst.mesh_id];
-    const auto slot = data.slot_by_uid.find(mesh.uid);
-    if (slot == data.slot_by_uid.end() || slot->second >= data.descriptor_count) continue;
-    const bvh::PoolCameraVisibility vis = bvh::GetPoolCameraVisibility(inst);
+  for (const auto& ref : refs) {
+    const auto& vis = ref.vis;
     float lo = 0.f, hi = bvh::kCameraFadeNever;
     if (!vis.camera_seen) {
       lo = bvh::kCameraFadeNever;
@@ -499,17 +503,9 @@ static float BruteForceFade(F3 o, F3 d, const bvh::BvhDeviceData& data, const bv
     } else if (bvh::CameraFadeApplies(vis)) {
       bvh::CameraFadeInterval(vis.inputs.param[0], vis.inputs.param[1], fade.floor_value, &lo, &hi);
     }
-    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
-      if (mesh.indices[t] >= mesh.positions.size() || mesh.indices[t + 1] >= mesh.positions.size()
-          || mesh.indices[t + 2] >= mesh.positions.size()) continue;
-      F3 v[3];
-      for (int k = 0; k < 3; ++k) {
-        const auto& p = mesh.positions[mesh.indices[t + k]];
-        float w[3]; falcom_world::TransformInst4x3RowDot(inst.matrix, p[0], p[1], p[2], w);
-        v[k] = {w[0], w[1], w[2]};
-      }
+    for (size_t i = 0; i + 2 < ref.verts.size(); i += 3) {
       float tt;
-      if (!Tri(o, d, v[0], v[1], v[2], &tt) || tt < 0.001f) continue;
+      if (!Tri(o, d, ref.verts[i], ref.verts[i + 1], ref.verts[i + 2], &tt) || tt < 0.001f) continue;
       const bool shown = tt >= lo && tt <= hi;
       if (shown || !fade.hide) {
         if (tt < best) { best = tt; any = true; best_faded = !shown; }
@@ -543,6 +539,7 @@ static int CompareFadeTraces(const Device& dev, const bvh::BvhDeviceData& data, 
   int mismatches = 0;
   *faded_rays = 0u;
   Counters c;
+  const std::vector<RefInstance> refs = BuildRefInstances(data, region);
   Stage("%s: start, %d rays", label, rays);
   for (int i = 0; i < rays; ++i) {
     if (i % 50 == 0) Stage("%s: ray %d/%d", label, i, rays);
@@ -553,7 +550,7 @@ static int CompareFadeTraces(const Device& dev, const bvh::BvhDeviceData& data, 
     dir = dir * (1.f / len);
     uint32_t instance, faded_bvh = 0u, faded_ref = 0u;
     const float t_bvh = TraceWorld(in, origin, dir, c, &instance, fade, &faded_bvh);
-    const float t_ref = BruteForceFade(origin, dir, data, region, fade, &faded_ref);
+    const float t_ref = BruteForceFade(origin, dir, refs, fade, &faded_ref);
     const bool agree = ((t_bvh < 0.f && t_ref < 0.f)
                         || (t_bvh >= 0.f && t_ref >= 0.f && std::fabs(t_bvh - t_ref) <= 1e-3f * std::max(1.f, t_ref)))
                        && faded_bvh == faded_ref;
@@ -581,13 +578,6 @@ static void AddFadedInstance(uint64_t key, float x, float y, float z, float star
   std::lock_guard lock(bvh::g_pool.mutex);
   bvh::ObservePoolInstance(key, 0x1000u, w, g_obs_frame++, &sighting, &vis);
   bvh::ObservePoolInstance(key, 0x1000u, w, g_obs_frame++, &sighting, &vis);
-}
-
-static uint32_t ExpectedRegionInstances(const bvh::BvhDeviceData& data) {
-  float d[3] = {0, 1, 0};
-  uint32_t n = 0;
-  BruteForce({0, 0, 0}, {d[0], d[1], d[2]}, data, bvh::CurrentPoolRegion(), &n);
-  return n;
 }
 
 int main() {
@@ -646,7 +636,7 @@ int main() {
   present();
   CHECK(data->live.tlas_rebuilds == 2u && data->live.tlas_frame == first_tlas + bvh::kLiveTlasInterval, "rebuild after the interval (%u)", data->live.tlas_frame - first_tlas);
   CHECK(data->live.tlas_instances == 35u && data->live.tlas_waiting == 0u, "all region instances (%u)", data->live.tlas_instances);
-  CHECK(data->live.tlas_instances == ExpectedRegionInstances(*data), "matches brute-force set");
+  CHECK(data->live.tlas_instances == BuildRefInstances(*data, bvh::CurrentPoolRegion()).size(), "matches brute-force set");
   Stage("1 idle presents");
   for (int i = 0; i < 20; ++i) present();
   CHECK(data->live.tlas_rebuilds == 2u, "nothing changed, no rebuild");

@@ -39,7 +39,7 @@ P2a (deployed 2026-10-08, `bvh/bvh_pool.hpp`, panel in `bvh/world_bvh.hpp`):
 P2a revision (2026-10-08, not yet validated in game):
 - Identity prevWorld (elements 0,5,10 = 1, others 0) counts as not filled: no motion.
 - A camera sighting is Moving when prevWorld differs and its (mesh, world) was not seen in an earlier frame; Still when prevWorld is filled and matches; otherwise Unknown. A repeat sighting whose prevWorld differs is stale (`rule_stale`) and is not Moving.
-- A moving key stays moving (its mesh stays flagged) until a Still sighting comes at least `kPoolMovingHoldFrames` (60 frames) after its last moving sighting. Then the key is released (`moving_now` false, `released`++) and, when no other moving key maps to its mesh, the mesh is unflagged (`dynamic_released`++): the stopped pose is admitted again. Releases do not bump the revision. A released key is not re-flagged by the switch; a new moving sighting re-arms it.
+- A moving key stays moving (its mesh stays flagged) until a Still sighting comes at least `kPoolMovingHoldFrames` (60 frames) after its last moving sighting. Then the key is released (`moving_now` false, `released`++) and, when no other moving key maps to its mesh, the mesh is unflagged (`dynamic_released`++): the stopped pose is admitted again. Releases do not bump the revision. A released key is not re-flagged by the switch; a new moving sighting re-arms it. A mesh flagged through a key whose resources were destroyed is unflagged at CompactPool when no remaining moving key maps to it (tests 19 and 20 in test_motion.cpp).
 
 What to ask the owner to check for P2a (not yet done when the session moved):
 1. Pool Scan on, a few minutes around moving things (doors, carts, NPCs carrying items, swaying props).

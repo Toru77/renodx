@@ -613,6 +613,73 @@ int main() {
     std::ofstream("motion_dump4.json") << text;
   }
 
+  // 19. The moving object's buffer is released while its key is still
+  // flagged: the mesh is unflagged at compaction (the static key still holds
+  // it), and the static pose admits again.
+  {
+    fresh();
+    const resource vb_static = make_vb(8.f), vb_moving = make_vb(8.f);
+    objects.push_back({vb_static.handle, 1, [](uint32_t, uint32_t, float* w, float* p) { Place(w, 40.f); Place(p, 40.f); }, 0u, 0u});
+    objects.push_back({vb_moving.handle, 1, [](uint32_t f, uint32_t, float* w, float* p) {
+      Place(w, 300.f + 0.01f * f); Place(p, 300.f + 0.01f * (f == 0u ? 0u : f - 1u));
+    }, 0u, 36u});
+    run(150);
+    auto s = snapshot();
+    CHECK(s.meshes == 1u && s.dynamic_live_keys == 1u && s.dynamic_moving_keys == 1u && s.dynamic_meshes == 1u && s.admitted == 0u,
+          "moving and flagged (meshes %zu, keys %zu, moving %zu, flagged %zu, admitted %zu)", s.meshes, s.dynamic_live_keys,
+          s.dynamic_moving_keys, s.dynamic_meshes, s.admitted);
+    bvh::OnDestroyResourcePool(&dev, vb_moving);
+    objects.pop_back();
+    run(1);
+    s = snapshot();
+    CHECK(s.dynamic_live_keys == 0u && s.dynamic_moving_keys == 0u && s.dynamic_meshes == 0u && s.meshes == 1u,
+          "released key unflags the shared mesh (keys %zu, moving %zu, flagged %zu, meshes %zu)", s.dynamic_live_keys,
+          s.dynamic_moving_keys, s.dynamic_meshes, s.meshes);
+    const uint64_t blocked = s.dynamic_blocked;
+    run(70);
+    s = snapshot();
+    CHECK(s.admitted == 1u && s.dynamic_meshes == 0u && s.dynamic_blocked == blocked, "static admitted again (admitted %zu, flagged %zu)",
+          s.admitted, s.dynamic_meshes);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    CHECK(bvh::g_pool.instances.size() == 1u && bvh::g_pool.instances[0].matrix[3] == 40.f, "only the static pose (%zu)",
+          bvh::g_pool.instances.size());
+  }
+
+  // 20. Two moving keys share a mesh: releasing one keeps the mesh flagged for
+  // the other; releasing the last unflags it.
+  {
+    fresh();
+    const resource vb_static = make_vb(8.f), vb_a = make_vb(8.f), vb_b = make_vb(8.f);
+    objects.push_back({vb_static.handle, 1, [](uint32_t, uint32_t, float* w, float* p) { Place(w, 40.f); Place(p, 40.f); }, 0u, 0u});
+    objects.push_back({vb_a.handle, 1, [](uint32_t f, uint32_t, float* w, float* p) {
+      Place(w, 300.f + 0.01f * f); Place(p, 300.f + 0.01f * (f == 0u ? 0u : f - 1u));
+    }, 0u, 36u});
+    objects.push_back({vb_b.handle, 1, [](uint32_t f, uint32_t, float* w, float* p) {
+      Place(w, 400.f + 0.01f * f); Place(p, 400.f + 0.01f * (f == 0u ? 0u : f - 1u));
+    }, 0u, 72u});
+    run(150);
+    auto s = snapshot();
+    CHECK(s.meshes == 1u && s.dynamic_live_keys == 2u && s.dynamic_moving_keys == 2u && s.dynamic_meshes == 1u && s.admitted == 0u,
+          "two moving keys, one flagged mesh (meshes %zu, keys %zu, moving %zu, flagged %zu, admitted %zu)", s.meshes,
+          s.dynamic_live_keys, s.dynamic_moving_keys, s.dynamic_meshes, s.admitted);
+    bvh::OnDestroyResourcePool(&dev, vb_a);
+    objects.erase(objects.begin() + 1);
+    run(1);
+    s = snapshot();
+    CHECK(s.dynamic_live_keys == 1u && s.dynamic_moving_keys == 1u && s.dynamic_meshes == 1u && s.admitted == 0u,
+          "one key left, mesh still flagged (keys %zu, moving %zu, flagged %zu, admitted %zu)", s.dynamic_live_keys,
+          s.dynamic_moving_keys, s.dynamic_meshes, s.admitted);
+    bvh::OnDestroyResourcePool(&dev, vb_b);
+    objects.pop_back();
+    run(1);
+    s = snapshot();
+    CHECK(s.dynamic_live_keys == 0u && s.dynamic_meshes == 0u && s.meshes == 1u, "no moving key, mesh unflagged (keys %zu, flagged %zu, meshes %zu)",
+          s.dynamic_live_keys, s.dynamic_meshes, s.meshes);
+    run(70);
+    s = snapshot();
+    CHECK(s.admitted == 1u && s.dynamic_meshes == 0u, "static admitted (admitted %zu, flagged %zu)", s.admitted, s.dynamic_meshes);
+  }
+
   // 7. Reset clears the probe and the moving keys.
   {
     bvh::ResetWorldPool();

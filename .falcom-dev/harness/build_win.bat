@@ -11,7 +11,7 @@ if not exist "%VC%" set "VC=%ProgramFiles%\Microsoft Visual Studio\2022\Professi
 call "%VC%" >nul || exit /b 1
 pushd "%HERE%"
 set "REPO=%HERE%..\..\"
-cl /nologo /std:c++20 /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /Od /Zi /MD /fsanitize=address /W1 /wd4996 ^
+cl /nologo /std:c++20 /EHsc /DNOMINMAX /DWIN32_LEAN_AND_MEAN /O2 /Zi /MD /fsanitize=address /W1 /wd4996 ^
   /I. /Iinc /I"%REPO%external\reshade\include" ^
   /DFALCOM_BYTECODE_DIR=\"../bytecode/\" /DFALCOM_WINDOWS_HARNESS ^
   %NAME%.cpp /Fe:%NAME%.exe /Fo:%NAME%.obj /Fd:%NAME%.pdb
