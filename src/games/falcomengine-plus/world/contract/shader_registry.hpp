@@ -36,6 +36,8 @@ struct ShaderTraits {
   uint8_t cls = 0u;    // VsClass or PsClass, by the map it lives in
   uint8_t flags = 0u;  // kTrait* bits
   uint32_t hash = 0u;  // CRC32 of the bytecode seen at creation (display only)
+  uint8_t alpha_reason = 0u;      // AlphaMaterialReason, AlphaTested pixel shaders only (dumps)
+  int16_t alpha_offset = -1;      // threshold variable offset, -1 when not found (dumps)
 };
 
 // Bytecode and output signature of a deforming vertex shader
@@ -103,8 +105,12 @@ inline void OnInitPipelineClassify(
     } else if (UsesContractNearFade(reflection)) {
       traits.flags |= kTraitNearFade;
     }
-    if (!vertex && traits.cls == static_cast<uint8_t>(PsClass::AlphaTested) && HasContractAlphaMaterial(reflection)) {
-      traits.flags |= kTraitAlphaMaterial;
+    if (!vertex && traits.cls == static_cast<uint8_t>(PsClass::AlphaTested)) {
+      int32_t threshold_offset = -1;
+      const AlphaMaterialReason reason = ClassifyAlphaMaterial(reflection, &threshold_offset);
+      traits.alpha_reason = static_cast<uint8_t>(reason);
+      traits.alpha_offset = static_cast<int16_t>(threshold_offset);
+      if (reason == AlphaMaterialReason::Ok) traits.flags |= kTraitAlphaMaterial;
     }
     std::shared_ptr<const ShaderCode> code;
     if (vertex && IsDeformingClass(static_cast<VsClass>(traits.cls))) {
@@ -226,6 +232,8 @@ struct RegistryEntry {
   uint32_t hash = 0u;
   uint8_t cls = 0u;
   uint8_t flags = 0u;
+  uint8_t alpha_reason = 0u;
+  int16_t alpha_offset = -1;
 };
 
 struct RegistryEntries {
@@ -244,7 +252,7 @@ inline RegistryEntries SnapshotRegistryEntries() {
       unique.try_emplace(traits.hash, traits);
     }
     out->reserve(unique.size());
-    for (const auto& [hash, traits] : unique) out->push_back({hash, traits.cls, traits.flags});
+    for (const auto& [hash, traits] : unique) out->push_back({hash, traits.cls, traits.flags, traits.alpha_reason, traits.alpha_offset});
     std::sort(out->begin(), out->end(), [](const RegistryEntry& a, const RegistryEntry& b) {
       return a.cls != b.cls ? a.cls < b.cls : a.hash < b.hash;
     });

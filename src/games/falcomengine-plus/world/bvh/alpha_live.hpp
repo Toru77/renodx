@@ -98,8 +98,8 @@ inline bool EnsureAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
 }
 
 struct AlphaBlitJob {
-  uint64_t key = 0u;  // draw key of the source copy
-  uint64_t uid = 0u;  // mesh uid that gets the slice
+  uint64_t source = 0u;  // source texture handle of the copy (alpha_sources)
+  uint64_t uid = 0u;     // mesh uid that gets the slice
   reshade::api::resource proxy = {0u};
   reshade::api::format format = reshade::api::format::unknown;
   PoolAlphaMaterial material;
@@ -109,9 +109,16 @@ struct AlphaBlitJob {
 // present thread: the pool is read under its lock, and every graphics call runs after the lock is released.
 inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data, uint32_t frame) {
   AlphaGpu& alpha = data->alpha;
+  const bool on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
   {
     // The numbers of the previous present: the blit timer resolves a frame late.
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (!on) {
+      g_pool.alpha_sync_logged = false;
+    } else if (!g_pool.alpha_sync_logged) {
+      g_pool.alpha_sync_logged = true;
+      renodx::utils::log::i("[world-bvh] alpha stage: first SyncLiveAlpha since alpha foliage was switched on");
+    }
     PoolAlphaGpuStats& gpu = g_pool.alpha_gpu;
     gpu.slices_used = alpha.slices.used;
     gpu.blits = alpha.blits;
@@ -123,7 +130,6 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
     gpu.waiting = data->live.tlas_alpha_waiting;
     gpu.blit_ms = alpha.timer.last_ms;
   }
-  const bool on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
   for (const reshade::api::resource proxy : TakePoolAlphaProxies(!on)) device->destroy_resource(proxy);
   if (!on) {
     DestroyAlphaGpu(device, data);
@@ -139,43 +145,36 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
       if (mesh.alpha && !mesh.alpha_state.conflict && !mesh.uvs.empty()) ready_uids.insert(mesh.uid);
     }
     for (auto it = g_pool.alpha_sources.begin(); it != g_pool.alpha_sources.end();) {
-      if (it->second.proxy.handle == 0u) {  // its copy is being made (outside the lock)
+      const PoolAlphaSource& source = it->second;
+      if (source.proxy.handle == 0u) {  // its copy is being made (outside the lock)
         ++it;
         continue;
       }
-      const auto mesh_it = g_pool.mesh_by_key.find(it->first);
-      if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) {
-        // A blitted copy waits for its key (freed at its invalidation); a new one waits while its mesh is queued.
-        if (it->second.blitted || g_pool.mesh_queued.count(it->first) != 0u || g_pool.mesh_requests.count(it->first) != 0u) {
-          ++it;
-          continue;
+      bool wanted = false;  // a draw key of the copy has a mesh or waits for one
+      for (const uint64_t key : source.keys) {
+        wanted = wanted || g_pool.mesh_by_key.count(key) != 0u || g_pool.mesh_queued.count(key) != 0u
+                 || g_pool.mesh_requests.count(key) != 0u;
+      }
+      if (!wanted) {  // no key uses the copy: freed; an unblitted copy is not copied again until its key is drawn again
+        stale.push_back(source.proxy);
+        for (const uint64_t key : source.keys) {
+          g_pool.alpha_key_source.erase(key);
+          if (!source.blitted) g_pool.alpha_source_done.insert(key);
         }
-        stale.push_back(it->second.proxy);
         it = g_pool.alpha_sources.erase(it);
         continue;
       }
-      const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
-      if (ready_uids.count(mesh.uid) == 0u) {
-        ++it;
-        continue;
+      for (const uint64_t key : source.keys) {
+        const auto mesh_it = g_pool.mesh_by_key.find(key);
+        if (mesh_it == g_pool.mesh_by_key.end() || mesh_it->second >= g_pool.meshes.size()) continue;
+        const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
+        if (ready_uids.count(mesh.uid) == 0u || alpha.slot_of_uid.count(mesh.uid) != 0u) continue;
+        bool chosen = false;
+        for (const AlphaBlitJob& job : jobs) chosen = chosen || job.uid == mesh.uid;
+        // Blit only into a mesh resident in the live store (slot_by_uid); the copy stays in the map until then.
+        if (chosen || data->slot_by_uid.count(mesh.uid) == 0u || jobs.size() >= kAlphaBlitsPerFrame) continue;
+        jobs.push_back({it->first, mesh.uid, source.proxy, source.format, mesh.alpha_state.material});
       }
-      bool chosen = false;
-      for (const AlphaBlitJob& job : jobs) chosen = chosen || job.uid == mesh.uid;
-      if (chosen || alpha.slot_of_uid.count(mesh.uid) != 0u) {
-        if (it->second.blitted) {  // kept: its mesh has a slice or is blitted from another copy
-          ++it;
-        } else {
-          stale.push_back(it->second.proxy);  // a second copy of a mesh that already has its slice
-          it = g_pool.alpha_sources.erase(it);
-        }
-        continue;
-      }
-      // Blit only into a mesh resident in the live store (slot_by_uid); the copy stays in the map until then.
-      if (data->slot_by_uid.count(mesh.uid) == 0u || jobs.size() >= kAlphaBlitsPerFrame) {
-        ++it;
-        continue;
-      }
-      jobs.push_back({it->first, mesh.uid, it->second.proxy, it->second.format, mesh.alpha_state.material});
       ++it;
     }
   }
@@ -211,7 +210,7 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
   for (const AlphaBlitJob& job : jobs) {
     const int32_t slot = alpha.slices.Acquire(job.uid);
     if (slot < 0) {
-      alpha.cap_refused += 1u;  // every slice is taken: the mesh keeps its copy
+      if (alpha.cap_refused_uids.insert(job.uid).second) alpha.cap_refused += 1u;  // counted once per mesh
       continue;
     }
     const uint32_t slice = static_cast<uint32_t>(slot);
@@ -241,10 +240,10 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
       continue;
     }
     {
-      // The copy stays (blitted) so the slice can be filled again; if its key was invalidated meanwhile, the
+      // The copy stays (blitted) so the slice can be filled again; if its texture was invalidated meanwhile, the
       // invalidation already queued the proxy.
       std::lock_guard<std::mutex> lock(g_pool.mutex);
-      const auto source_it = g_pool.alpha_sources.find(job.key);
+      const auto source_it = g_pool.alpha_sources.find(job.source);
       if (source_it != g_pool.alpha_sources.end() && source_it->second.proxy.handle == job.proxy.handle) {
         source_it->second.blitted = true;
       }
@@ -257,6 +256,11 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
   }
   EndGpuTimer(cmd_list, &alpha.timer);
   if (blits != 0u) {
+    // Unbind the atlas UAV at u0: the trace binds the atlas as SRV t15, and D3D11 nulls an SRV that is still bound as a UAV.
+    const reshade::api::resource_view null_uav = {0u};
+    const reshade::api::descriptor_table_update unbind = {alpha.blit_tables[2], 0, 0, 1, DT::unordered_access_view, &null_uav};
+    device->update_descriptor_tables(1, &unbind);
+    cmd_list->bind_descriptor_tables(DS::all_compute, alpha.blit_layout, 2, 1, &alpha.blit_tables[2]);
     const reshade::api::resource atlas = alpha.atlas;
     const RU before = RU::unordered_access;
     const RU after = RU::shader_resource;
@@ -266,5 +270,4 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
   alpha.blits += blits;
   alpha.blits_frame = blits;
 }
-
 }  // namespace falcom_world::bvh

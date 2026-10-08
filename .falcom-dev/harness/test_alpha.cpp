@@ -27,11 +27,15 @@ using namespace reshade::api;
 namespace bvh = falcom_world;
 namespace pool = falcom_world::bvh;
 namespace contract = falcom_world::contract;
+// Reference layout of the three contract-layout shaders (alphaTestThreshold_g is packoffset(c7)). Not read at runtime:
+// the pool reads the offset each shader reports (ps traits alpha_offset).
+static constexpr uint32_t kReferenceThresholdOffset = 112u;
 
 static int g_failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_failures; std::printf("FAIL %s:%d %s | ", __FILE__, __LINE__, #cond); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
 
 struct Res { resource_desc desc; std::vector<uint8_t> bytes; };
+static int g_bad_view_calls = 0;  // get_resource_from_view / get_resource_view_desc on a handle that is not a registered view
 struct Device : mock::DeviceBase {
   std::map<uint64_t, Res> res;
   std::map<uint64_t, uint64_t> view_of;  // view handle -> resource handle
@@ -39,6 +43,15 @@ struct Device : mock::DeviceBase {
   uint64_t next = 0x1000;
   int bad_copies = 0;
   int creates = 0;  // create_resource calls
+  int texture_creates = 0;  // create_resource calls for 2D textures (the alpha proxies)
+  std::map<uint64_t, uint64_t> uav_of_table;  // descriptor table -> the UAV in its binding (0 when null)
+  void update_descriptor_tables(uint32_t count, const descriptor_table_update *updates) override {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (updates[i].type == descriptor_type::unordered_access_view) {
+        uav_of_table[updates[i].table.handle] = static_cast<const resource_view *>(updates[i].descriptors)[0].handle;
+      }
+    }
+  }
   device_api get_api() const override { return device_api::d3d11; }
   bool create_resource(const resource_desc &desc, const subresource_data *initial_data, resource_usage, resource *out, void ** = nullptr) override {
     Res r; r.desc = desc;
@@ -47,6 +60,7 @@ struct Device : mock::DeviceBase {
       if (initial_data && initial_data->data) std::memcpy(r.bytes.data(), initial_data->data, desc.buffer.size);
     }
     creates += 1;
+    if (desc.type == resource_type::texture_2d) texture_creates += 1;
     out->handle = next; next += 0x100; res[out->handle] = std::move(r);
     return true;
   }
@@ -57,10 +71,12 @@ struct Device : mock::DeviceBase {
   void destroy_resource_view(resource_view v) override { view_of.erase(v.handle); view_desc.erase(v.handle); }
   resource get_resource_from_view(resource_view v) const override {
     const auto it = view_of.find(v.handle);
+    if (it == view_of.end()) g_bad_view_calls += 1;
     return resource{it == view_of.end() ? 0u : it->second};
   }
   resource_view_desc get_resource_view_desc(resource_view v) const override {
     const auto it = view_desc.find(v.handle);
+    if (it == view_desc.end()) g_bad_view_calls += 1;
     return it == view_desc.end() ? resource_view_desc{} : it->second;
   }
   bool create_pipeline_layout(uint32_t, const pipeline_layout_param *, pipeline_layout *out) override { out->handle = next; next += 0x100; return true; }
@@ -85,6 +101,12 @@ struct CmdList : mock::CommandListBase {
   Device* dev = nullptr;
   int dispatches = 0;
   int copies = 0;
+  uint64_t u0 = 0u;  // the UAV at u0 after the last bind of compute set 2 (0 = null)
+  void bind_descriptor_tables(shader_stage, pipeline_layout, uint32_t first, uint32_t count, const descriptor_table *tables) override {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (first + i == 2u) u0 = dev->uav_of_table[tables[i].handle];
+    }
+  }
   device *get_device() override { return dev; }
   void dispatch(uint32_t, uint32_t, uint32_t) override { dispatches += 1; }
   void copy_texture_region(resource, uint32_t, const subresource_box *, resource, uint32_t, const subresource_box *, filter_mode = filter_mode::min_mag_mip_point) override { copies += 1; }
@@ -112,10 +134,12 @@ static void Classify(Device* dev, uint64_t handle, const std::string& file, bool
   contract::OnInitPipelineClassify(dev, {0}, 1, &sub, pipeline{handle});
 }
 
+static uint64_t SourceView(Device& dev, resource* texture);
+
 // Alpha material with the given texture, threshold and first scroll; swizzle as given.
 static pool::PoolAlphaMaterial Mat(uint64_t texture, float threshold, float scroll0 = 0.1f, uint32_t swizzle = 3u) {
   pool::PoolAlphaMaterial m;
-  m.texture = texture; m.threshold = threshold; m.scroll[0] = scroll0; m.scroll[1] = 0.2f; m.swizzle = swizzle;
+  m.view = texture; m.threshold = threshold; m.scroll[0] = scroll0; m.scroll[1] = 0.2f; m.swizzle = swizzle;
   return m;
 }
 
@@ -154,16 +178,27 @@ static resource TrackedCb(Device& dev, const uint8_t* data, uint64_t size) {
   return r;
 }
 
+static size_t LogCount(const char* text) {
+  std::lock_guard<std::mutex> lock(renodx::utils::log::g_lines_mutex);
+  size_t count = 0u;
+  for (const auto& line : renodx::utils::log::g_lines) count += line.second.find(text) != std::string::npos ? 1u : 0u;
+  return count;
+}
+
 static void TestClassifier(Device* dev) {
-  struct Case { const char* file; uint64_t handle; bool trait; };
+  struct Case { const char* file; uint64_t handle; bool trait; int32_t offset; };
   const std::array<Case, 6> alpha = {{
-      {"0x137F316A", 0xC101, true}, {"0x81F5709F", 0xC102, true}, {"0xAA835FE0", 0xC103, true},
-      {"0x049B0385", 0xC201, false}, {"0x2807FFC9", 0xC202, false}, {"0x2DADE2B8", 0xC203, false}}};
+      {"0x137F316A", 0xC101, true, 112}, {"0x81F5709F", 0xC102, true, 112}, {"0xAA835FE0", 0xC103, true, 112},
+      {"0x049B0385", 0xC201, true, 128}, {"0x2807FFC9", 0xC202, true, 120}, {"0x2DADE2B8", 0xC203, true, 128}}};
   for (const Case& c : alpha) {
     Classify(dev, c.handle, std::string(c.file) + ".ps.cso", false);
     const contract::ShaderTraits traits = contract::LookupPixelTraits(c.handle);
     CHECK(traits.cls == static_cast<uint8_t>(contract::PsClass::AlphaTested), "%s is alpha tested", c.file);
     CHECK(((traits.flags & contract::kTraitAlphaMaterial) != 0u) == c.trait, "%s kTraitAlphaMaterial %d", c.file, c.trait);
+    const auto reason = static_cast<contract::AlphaMaterialReason>(traits.alpha_reason);
+    CHECK((reason == contract::AlphaMaterialReason::Ok) == c.trait, "%s alpha reason %s", c.file, contract::AlphaMaterialReasonName(reason));
+    CHECK(traits.alpha_offset == c.offset, "%s threshold offset %d (want %d)", c.file, traits.alpha_offset, c.offset);
+    std::printf("alpha reason %s: %s (threshold offset %d)\n", c.file, contract::AlphaMaterialReasonName(reason), traits.alpha_offset);
   }
   Classify(dev, 0xC300, "0x2162672F.ps.cso", false);
   CHECK(contract::LookupPixelClass(0xC300) == contract::PsClass::Opaque, "0x2162672F is opaque");
@@ -194,10 +229,10 @@ static void TestNoteMaterial() {
   CHECK(keys.at(0x9005).conflict, "swizzle conflicts");
   pool::NotePoolAlphaMaterial(0x9006, pool::PoolAlphaMaterial{});  // unreadable first
   pool::NotePoolAlphaMaterial(0x9006, first);
-  CHECK(!keys.at(0x9006).conflict && keys.at(0x9006).material.texture == 0x100u, "unreadable then readable upgrades");
+  CHECK(!keys.at(0x9006).conflict && keys.at(0x9006).material.view == 0x100u, "unreadable then readable upgrades");
   pool::NotePoolAlphaMaterial(0x9007, pool::PoolAlphaMaterial{});
   pool::NotePoolAlphaMaterial(0x9007, Mat(0x101, 0.9f));
-  CHECK(!keys.at(0x9007).conflict && keys.at(0x9007).material.texture == 0x101u, "unreadable never conflicts");
+  CHECK(!keys.at(0x9007).conflict && keys.at(0x9007).material.view == 0x101u, "unreadable never conflicts");
   CHECK(pool::g_pool.stats.alpha_conflicts == 4u, "four conflicting keys: %llu", (unsigned long long)pool::g_pool.stats.alpha_conflicts);
   pool::g_pool.alpha_foliage.store(false);
   Capture(0x9008, 16.f, true);
@@ -207,9 +242,10 @@ static void TestNoteMaterial() {
 }
 
 static void TestReadDraw(Device& dev, CmdList& cl) {
+  const uint32_t threshold_offset = 112u;
   std::array<uint8_t, 160> bytes = {};
   const float threshold = 0.5f, scroll[2] = {0.25f, 0.75f};
-  std::memcpy(bytes.data() + contract::kAlphaThresholdOffset, &threshold, sizeof(float));
+  std::memcpy(bytes.data() + threshold_offset, &threshold, sizeof(float));
   std::memcpy(bytes.data() + contract::kAlphaUvScrollOffset, scroll, sizeof(scroll));
   const uint32_t swizzle_value = 3u;
   std::array<uint8_t, 16> swizzle_bytes = {};
@@ -221,32 +257,77 @@ static void TestReadDraw(Device& dev, CmdList& cl) {
   falcom_world::WorldCommandListData cl_data;
   cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
   cl_data.ps_cb[contract::kAlphaSwizzleSlot] = swizzle;
-  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x500u;
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x400u;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = 0x500u;
 
   pool::PoolAlphaMaterial out;
-  CHECK(pool::ReadPoolAlphaDraw(&cl, cl_data, &out), "full 160-byte material reads");
+  CHECK(pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out), "full 160-byte material reads");
   CHECK(out.threshold == threshold && out.scroll[0] == 0.25f && out.scroll[1] == 0.75f, "threshold and scroll decoded");
-  CHECK(out.swizzle == 3u && out.texture == 0x500u, "swizzle and texture decoded");
+  CHECK(out.swizzle == 1u && out.view == 0x500u, "swizzle (bit 0) and texture decoded");
+  std::array<uint8_t, 160> bytes_128 = {};
+  const float threshold_128 = 0.25f;
+  std::memcpy(bytes_128.data() + 128u, &threshold_128, sizeof(float));
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = TrackedCb(dev, bytes_128.data(), 160);
+  CHECK(pool::ReadPoolAlphaDraw(&cl, cl_data, 128u, &out) && out.threshold == threshold_128, "threshold read at offset 128: %f", out.threshold);
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
 
   cl_data.ps_cb[contract::kAlphaMaterialSlot] = partial;
-  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, &out) && out.texture == 0u, "partial cb mirror fails closed");
+  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out) && out.view == 0u, "partial cb mirror fails closed");
   cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
   cl_data.ps_cb[contract::kAlphaMaterialSlot].handle = 0u;
-  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, &out) && out.texture == 0u, "unbound b5 fails closed");
+  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out) && out.view == 0u, "unbound b5 fails closed");
   cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
   cl_data.ps_cb_offset[contract::kAlphaMaterialSlot] = 16u;
-  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, &out) && out.texture == 0u, "nonzero b5 offset fails closed");
+  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out) && out.view == 0u, "nonzero b5 offset fails closed");
   cl_data.ps_cb_offset[contract::kAlphaMaterialSlot] = 0u;
   cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0u;
-  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, &out) && out.texture == 0u, "null t0 fails closed");
-  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x500u;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = 0u;
+  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out) && out.view == 0u, "null t0 fails closed");
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x400u;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = 0x500u;
   cl_data.ps_cb_offset[contract::kAlphaSwizzleSlot] = 4u;
-  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, &out) && out.texture == 0u, "bad swizzle offset fails closed");
+  CHECK(!pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out) && out.view == 0u, "bad swizzle offset fails closed");
   cl_data.ps_cb_offset[contract::kAlphaSwizzleSlot] = 0u;
   {
     std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
     CHECK(pool::g_pool.stats.alpha_cb_unavailable == 5u, "five unreadable draws counted: %llu", (unsigned long long)pool::g_pool.stats.alpha_cb_unavailable);
   }
+}
+
+// The shader reads only bit 0 of swizzle_flags_g; other bits must not make a conflict.
+static void TestSwizzleBits(Device& dev, CmdList& cl) {
+  pool::ResetWorldPool();
+  pool::g_pool.alpha_foliage.store(true);
+  std::array<uint8_t, 160> bytes = {};
+  const float threshold = 0.5f;
+  std::memcpy(bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = TrackedCb(dev, bytes.data(), 160);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x400u;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = 0x500u;
+  const auto read = [&](uint32_t value) {
+    cl_data.ps_cb[contract::kAlphaSwizzleSlot] = TrackedCb(dev, reinterpret_cast<const uint8_t*>(&value), sizeof(value));
+    pool::PoolAlphaMaterial out;
+    CHECK(pool::ReadPoolAlphaDraw(&cl, cl_data, 112u, &out), "swizzle %u reads", value);
+    CHECK(out.swizzle <= 1u, "swizzle %u stores bit 0 only: %u", value, out.swizzle);
+    return out;
+  };
+  const uint32_t high_bits[4] = {0u, 2u, 4u, 6u};
+  for (uint32_t value : high_bits) {
+    const pool::PoolAlphaMaterial out = read(value);
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    pool::NotePoolAlphaMaterial(0xA001, out);
+  }
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    CHECK(!pool::g_pool.alpha_keys.at(0xA001).conflict, "swizzle 0/2/4/6 on one key: no conflict");
+  }
+  const pool::PoolAlphaMaterial bit0 = read(0u);
+  const pool::PoolAlphaMaterial bit0_set = read(1u);
+  std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+  pool::NotePoolAlphaMaterial(0xA002, bit0);
+  pool::NotePoolAlphaMaterial(0xA002, bit0_set);
+  CHECK(pool::g_pool.alpha_keys.at(0xA002).conflict, "swizzle bit 0 differing (0 vs 1): conflict");
 }
 
 static void TestSwitch() {
@@ -347,6 +428,30 @@ static void TestGate(Device& dev) {
     }
   }
   pool::g_pool.alpha_foliage.store(true);
+  const uint64_t kUnknownPs = 0xD7;  // never classified
+  CHECK(gate(kRigidVs, kUnknownPs).skip == pool::PoolSkip::PixelUnknown, "unclassified pixel shader: PixelUnknown");
+}
+
+// A PixelUnknown draw logs its (vs, ps) pair once, from the locked scan block, with the draw's hashes.
+static void TestPixelUnknownLog(Device& dev, CmdList& cl) {
+  pool::ResetWorldPool();
+  pool::g_pool.scan_active.store(true);
+  pool::g_pool.alpha_foliage.store(true);
+  const uint64_t kRigidVs = 0xD5, kUnknownPs = 0xD7;
+  Classify(&dev, kRigidVs, "0x095017A3.vs.cso", true);
+  falcom_world::DrawRecord draw;
+  draw.method = 1; draw.has_index_buffer = true; draw.vb = {0x1111}; draw.vb_stride = fixture::kStride; draw.ib = {0x2222};
+  draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {fixture::kLayout};
+  draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0; draw.instance_count = 1;
+  draw.depth_enable = true; draw.depth_write = true; draw.topology = primitive_topology::triangle_list;
+  draw.vs_pipeline = kRigidVs; draw.ps_pipeline = kUnknownPs; draw.vs_hash = 0xE1u; draw.ps_hash = 0xD7u;
+  falcom_world::WorldCommandListData cl_data;
+  const size_t before = LogCount("pixel_unknown: vs=");
+  pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+  pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+  CHECK(LogCount("pixel_unknown: vs=") == before + 1u, "pixel_unknown logged once per pair: %zu", LogCount("pixel_unknown: vs="));
+  CHECK(LogCount("pixel_unknown: vs=0x000000E1 ps=0x000000D7 reason=unclassified") > 0u, "pixel_unknown carries the draw's vs and ps hashes");
+  pool::g_pool.scan_active.store(false);
 }
 
 static void TestAdmit() {
@@ -547,14 +652,17 @@ static void TestScanPath(Device& dev, CmdList& cl, Queue& queue) {
   fixture::WriteIndices(dev.res[ib.handle].bytes);
   std::array<uint8_t, 160> material_bytes = {};
   const float threshold = 0.5f;
-  std::memcpy(material_bytes.data() + contract::kAlphaThresholdOffset, &threshold, sizeof(float));
+  std::memcpy(material_bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
   material = TrackedCb(dev, material_bytes.data(), 160);
 
   falcom_world::WorldCommandListData cl_data;
   cl_data.vs_srv[15] = t15;
   cl_data.vs_cb[1] = b1;
   cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
-  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x500u;
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
 
   uint64_t cursor = 0;
   auto draw_once = [&](uint64_t ps) {
@@ -670,7 +778,7 @@ static void TestIndirectAlpha(Device& dev, CmdList& cl, Queue& queue) {
   fixture::WriteIndices(dev.res[ib.handle].bytes);
   std::array<uint8_t, 160> material_bytes = {};
   const float threshold = 0.5f;
-  std::memcpy(material_bytes.data() + contract::kAlphaThresholdOffset, &threshold, sizeof(float));
+  std::memcpy(material_bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
   material = TrackedCb(dev, material_bytes.data(), 160);
   const uint32_t args_values[5] = {36u, 1u, 0u, 0u, 0u};
   std::memcpy(dev.res[args.handle].bytes.data(), args_values, sizeof(args_values));
@@ -685,7 +793,10 @@ static void TestIndirectAlpha(Device& dev, CmdList& cl, Queue& queue) {
   cl_data.vs_srv[15] = t15;
   cl_data.vs_cb[1] = b1;
   cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
-  cl_data.ps_srv[contract::kAlphaTexSlot].handle = 0x500u;
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
 
   const auto make_draw = [&](uint64_t ps) {
     falcom_world::DrawRecord draw;
@@ -721,7 +832,7 @@ static void TestIndirectAlpha(Device& dev, CmdList& cl, Queue& queue) {
   {
     std::lock_guard<std::mutex> lock(p.mutex);
     const auto& copies = p.slots[p.write_slot].copies;
-    CHECK(!copies.empty() && (copies.back().pass & pool::kPoolPassAlpha) != 0u && copies.back().alpha.texture == 0x500u && copies.back().alpha.threshold == threshold,
+    CHECK(!copies.empty() && (copies.back().pass & pool::kPoolPassAlpha) != 0u && copies.back().alpha.view == alpha_view && copies.back().alpha.threshold == threshold,
           "indirect ON: copy carries the alpha pass and material");
   }
   frames(40);
@@ -801,14 +912,16 @@ static void TestAtlas(Device& dev, CmdList& cl, Queue& queue) {
   const uint64_t view1 = SourceView(dev, &tex1);
   Capture(0x7001, 7.f, true);
   pool::NotePoolAlphaMaterial(0x7001, Mat(view1, 0.5f));
+  const int copies_before = cl.copies;
   pool::CapturePoolAlphaSource(&dev, &cl, 0x7001, view1, true);
-  CHECK(sources() == 1u && cl.copies == 1 && p.stats.alpha_source_copies == 1u, "copy made at draw time (%zu, %d)", sources(), cl.copies);
-  const uint64_t proxy1 = p.alpha_sources.at(0x7001).proxy.handle;
+  CHECK(sources() == 1u && cl.copies == copies_before + 1 && p.stats.alpha_source_copies == 1u, "copy made at draw time (%zu, %d)", sources(), cl.copies - copies_before);
+  const uint64_t proxy1 = p.alpha_sources.at(p.alpha_key_source.at(0x7001)).proxy.handle;
   CHECK(data->alpha.atlas.handle == 0u, "no atlas before the first blit");
   present();
   CHECK(data->alpha.atlas.handle != 0u && cl.dispatches == 1, "atlas made and one blit at the present (%d)", cl.dispatches);
+  CHECK(cl.u0 == 0u, "the atlas UAV is unbound at u0 after the blit (%llu)", (unsigned long long)cl.u0);
   CHECK(data->alpha.slot_of_uid.count(uid_of(0x7001)) == 1u && data->alpha.slices.used == 1u, "the mesh has its slice");
-  CHECK(sources() == 1u && p.alpha_sources.at(0x7001).blitted && dev.res.count(proxy1) == 1u,
+  CHECK(sources() == 1u && p.alpha_sources.at(p.alpha_key_source.at(0x7001)).blitted && dev.res.count(proxy1) == 1u,
         "copy kept by the blit (blitted, proxy alive): %zu sources", sources());
   CHECK(p.alpha_source_done.count(0x7001) == 0u, "a blitted key is not refused");
 
@@ -818,7 +931,7 @@ static void TestAtlas(Device& dev, CmdList& cl, Queue& queue) {
   Capture(0x7002, 8.f, true);
   pool::NotePoolAlphaMaterial(0x7002, Mat(view2, 0.5f));
   pool::CapturePoolAlphaSource(&dev, &cl, 0x7002, view2, true);
-  const uint64_t proxy2 = p.alpha_sources.at(0x7002).proxy.handle;
+  const uint64_t proxy2 = p.alpha_sources.at(p.alpha_key_source.at(0x7002)).proxy.handle;
   const int dispatch2 = cl.dispatches;
   dev.destroy_resource(tex2);
   pool::OnDestroyResourcePool(&dev, tex2);
@@ -839,6 +952,9 @@ static void TestAtlas(Device& dev, CmdList& cl, Queue& queue) {
   CHECK(cl.dispatches == dispatch3 && data->alpha.slot_of_uid.count(uid_of(0x7003)) == 0u, "full atlas: no slice, no blit");
   CHECK(data->alpha.cap_refused > cap_before && sources() == 2u, "full atlas: refused and the copy kept (%llu, %zu sources)",
         (unsigned long long)data->alpha.cap_refused, sources());
+  const uint64_t cap_once = data->alpha.cap_refused;
+  present();
+  CHECK(data->alpha.cap_refused == cap_once, "a refused mesh is counted once, not per present (%llu)", (unsigned long long)data->alpha.cap_refused);
   for (uint32_t s = 0; s < falcom_world::kAlphaAtlasSlices; ++s) {
     if (data->alpha.slices.owner[s] >= 0x9000u) data->alpha.slices.Release(s);
   }
@@ -875,6 +991,7 @@ static void TestAtlas(Device& dev, CmdList& cl, Queue& queue) {
   const int copies_off = cl.copies;
   for (int i = 0; i < 5; ++i) present();
   CHECK(dev.creates == creates_off && cl.dispatches == dispatch_off && cl.copies == copies_off, "off: no creation, blit or copy");
+  CHECK(!data->alpha.failure_logged && data->alpha.cap_refused_uids.empty(), "off: the failure latch and the refused set are reset");
   p.alpha_foliage.store(true);
   pool::ResetWorldPool();
   present();
@@ -990,7 +1107,7 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
   resource_view typed = {0};
   dev.create_resource_view(typeless, resource_usage::shader_resource, resource_view_desc(format::r8g8b8a8_unorm), &typed);
   pool::CapturePoolAlphaSource(&dev, &cl, 0x7610, typed.handle, true);
-  CHECK(p.alpha_sources.count(0x7610) == 1u && p.alpha_sources.at(0x7610).format == format::r8g8b8a8_unorm,
+  CHECK(p.alpha_key_source.count(0x7610) == 1u && p.alpha_sources.at(p.alpha_key_source.at(0x7610)).format == format::r8g8b8a8_unorm,
         "view format: the proxy has the bound view's format");
   resource_view unknown = {0};
   dev.create_resource_view(typeless, resource_usage::shader_resource, resource_view_desc(format::unknown), &unknown);
@@ -998,7 +1115,7 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
   pool::CapturePoolAlphaSource(&dev, &cl, 0x7611, unknown.handle, true);
   {
     std::lock_guard<std::mutex> lock(p.mutex);
-    CHECK(p.alpha_sources.count(0x7611) == 0u && p.alpha_source_done.count(0x7611) == 1u && p.stats.alpha_source_refused_format == 1u,
+    CHECK(p.alpha_key_source.count(0x7611) == 0u && p.alpha_source_done.count(0x7611) == 1u && p.stats.alpha_source_refused_format == 1u,
           "unknown view format: refused and counted (%llu)", (unsigned long long)p.stats.alpha_source_refused_format);
   }
   drain();
@@ -1024,7 +1141,7 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
   fixture::WriteIndices(dev.res[ib.handle].bytes);
   std::array<uint8_t, 160> material_bytes = {};
   const float threshold = 0.5f;
-  std::memcpy(material_bytes.data() + contract::kAlphaThresholdOffset, &threshold, sizeof(float));
+  std::memcpy(material_bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
   material = TrackedCb(dev, material_bytes.data(), 160);
   falcom_world::WorldCommandListData cl_data;
   cl_data.vs_srv[15] = t15;
@@ -1042,7 +1159,8 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
     const int32_t cb[4] = {base, 0, 0, 0};
     std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
     falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
-    cl_data.ps_srv[contract::kAlphaTexSlot].handle = view;
+    cl_data.ps_srv[contract::kAlphaTexSlot].handle = tex.handle;
+    cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = view;
     falcom_world::DrawRecord draw_record;
     draw_record.method = 1; draw_record.has_index_buffer = true; draw_record.vb = {vb.handle}; draw_record.vb_stride = kUvStride; draw_record.ib = ib;
     draw_record.vb_size = 4096; draw_record.ib_size = 4096; draw_record.input_layout = {kUvLayout};
@@ -1073,7 +1191,7 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
   // F7: live BVH off: no copy is made, and the copy made before is freed at the next present.
   falcom_world::g_state.frame.fetch_add(1u);
   pool::CapturePoolAlphaSource(&dev, &cl, 0x7700, view, true);
-  const uint64_t live_proxy = p.alpha_sources.at(0x7700).proxy.handle;
+  const uint64_t live_proxy = p.alpha_sources.at(p.alpha_key_source.at(0x7700)).proxy.handle;
   pool::g_live_bvh.enabled.store(false);
   pool::UpdateLiveBvh(&dev, &queue);
   CHECK(sources() == 0u && dev.res.count(live_proxy) == 0u, "live off: the copy is freed at the present");
@@ -1085,6 +1203,474 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
   pool::ResetWorldPool();
   p.alpha_foliage.store(true);
   pool::UpdateLiveBvh(&dev, &queue);
+}
+
+// FIX E: copies are per source texture. 70 draw keys over 3 textures make 3 copies, every key shares one copy and
+// gets a slice, and a texture's copy is freed with its last key.
+static void TestSharedCopies(Device& dev, CmdList& cl, Queue& queue) {
+  auto& p = pool::g_pool;
+  pool::BvhDeviceData* data = pool::GetBvhDeviceData(&dev);
+  auto present = [&] { falcom_world::g_state.frame.fetch_add(1u); pool::UpdateLiveBvh(&dev, &queue); };
+  auto sources = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.alpha_sources.size(); };
+  auto keys_mapped = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.alpha_key_source.size(); };
+  pool::ResetWorldPool();
+  p.alpha_foliage.store(true);
+  falcom_world::g_state.frame.store(7000u);
+  resource textures[3] = {};
+  uint64_t views[3] = {};
+  for (int i = 0; i < 3; ++i) views[i] = SourceView(dev, &textures[i]);
+  const int copies_before = cl.copies;
+  for (uint64_t i = 0; i < 70; ++i) {
+    Capture(0x7800 + i, 30.f + static_cast<float>(i), true);
+    pool::NotePoolAlphaMaterial(0x7800 + i, Mat(views[i % 3], 0.5f));
+    pool::CapturePoolAlphaSource(&dev, &cl, 0x7800 + i, views[i % 3], true);
+  }
+  CHECK(cl.copies - copies_before == 3, "70 keys over 3 textures: 3 copies (%d)", cl.copies - copies_before);
+  CHECK(sources() == 3u && keys_mapped() == 70u, "3 copies, 70 keys mapped (%zu, %zu)", sources(), keys_mapped());
+  for (int i = 0; i < 20; ++i) present();
+  size_t slices = 0;
+  for (uint64_t i = 0; i < 70; ++i) slices += data->alpha.slot_of_uid.count(p.meshes[MeshOf(0x7800 + i)].uid);
+  CHECK(slices == 70u, "all 70 keys have a slice (%zu)", slices);
+  CHECK(cl.u0 == 0u, "the atlas UAV is unbound at u0 (%llu)", (unsigned long long)cl.u0);
+  // Texture 0 dies: its copy and its 24 keys go; the other two copies stay.
+  pool::OnDestroyResourcePool(&dev, textures[0]);
+  dev.destroy_resource(textures[0]);
+  present();
+  CHECK(sources() == 2u && keys_mapped() == 46u, "texture 0 dies: its copy and 24 keys freed (%zu copies, %zu keys)", sources(), keys_mapped());
+  pool::ResetWorldPool();
+  present();
+}
+
+// FIX D and the view guard. An alpha draw whose bound t0 is not the resource of its view is refused and counted,
+// with no copy. A draw that is refused by the copy schedule (Cooldown) makes at most one copy over five presents.
+static void TestDrawCopies(Device& dev, CmdList& cl, Queue& queue) {
+  RegisterUvLayout();
+  pool::ResetWorldPool();
+  auto& p = pool::g_pool;
+  p.scan_active.store(true);
+  p.exclude_moving.store(false);
+  p.follow_moving.store(false);
+  p.alpha_foliage.store(true);
+  falcom_world::g_state.frame.store(9000u);
+
+  const uint64_t kRigid = 0xE1, kAlpha = 0xE3;
+  Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
+  Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
+  resource t15, b1, vb, ib, material;
+  const uint64_t ring_elements = 4096;
+  dev.create_resource(resource_desc(ring_elements * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  const fixture::TestMesh box = fixture::Box(1.f);
+  for (size_t i = 0; i < box.positions.size(); ++i) {
+    const float vertex[5] = {box.positions[i][0], box.positions[i][1], box.positions[i][2],
+                             box.positions[i][1] * 0.5f + 0.5f, box.positions[i][2] * 0.5f + 0.5f};
+    std::memcpy(dev.res[vb.handle].bytes.data() + i * kUvStride, vertex, sizeof(vertex));
+  }
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+  std::array<uint8_t, 160> material_bytes = {};
+  const float threshold = 0.5f;
+  std::memcpy(material_bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
+  material = TrackedCb(dev, material_bytes.data(), 160);
+
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[1] = b1;
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  resource other_tex = {0};
+  SourceView(dev, &other_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
+
+  uint64_t cursor = 0;
+  auto draw_once = [&]() {
+    if (cursor + 1 >= ring_elements) cursor = 0;
+    float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 48, world, 48);
+    const int32_t base = static_cast<int32_t>(cursor);
+    const int32_t cb[4] = {base, 0, 0, 0};
+    std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb.handle}; draw.vb_stride = kUvStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kUvLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0;
+    draw.instance_count = 1; draw.depth_enable = true; draw.depth_write = true;
+    draw.topology = primitive_topology::triangle_list; draw.vs_pipeline = kRigid; draw.ps_pipeline = kAlpha;
+    draw.vs_hash = static_cast<uint32_t>(kRigid);
+    pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+    cursor += 8;
+  };
+  auto refused_view = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.stats.alpha_source_refused_view; };
+  auto copies_stat = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.stats.alpha_source_copies; };
+
+  // Guard: t0 is another resource than the one the view belongs to. Refused and counted; no copy.
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = other_tex.handle;
+  const uint64_t refused_before = refused_view();
+  const int copies_guard = cl.copies;
+  draw_once();
+  CHECK(refused_view() == refused_before + 1u && cl.copies == copies_guard, "view of another resource: refused and counted (%llu, copies %d)",
+        (unsigned long long)(refused_view() - refused_before), cl.copies - copies_guard);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+
+  // Cooldown: the first queued draw copies; the same identity drawn over five presents copies at most once more.
+  pool::ResetWorldPool();
+  p.scan_active.store(true);
+  p.alpha_foliage.store(true);
+  const int copies_before = cl.copies;
+  const int texture_creates_before = dev.texture_creates;
+  const uint64_t copy_stat_before = copies_stat();
+  for (int i = 0; i < 5; ++i) {
+    draw_once();
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::DrainPoolScan(&dev, &queue);
+  }
+  CHECK(cl.copies - copies_before <= 1 && dev.texture_creates - texture_creates_before <= 1 && copies_stat() - copy_stat_before <= 1,
+        "cooldown-refused key over 5 presents: at most one copy and one create (copies %d, creates %d)",
+        cl.copies - copies_before, dev.texture_creates - texture_creates_before);
+}
+
+// FIX F. A capture without UVs against one with UVs is not a mismatch; a real UV difference still is.
+static void TestCompare() {
+  size_t first = std::numeric_limits<size_t>::max(), differing = 0;
+  pool::ComparePoolMeshes(BoxMesh(1.f, false), BoxMesh(1.f, true), &first, &differing);
+  CHECK(differing == 0u, "capture without UVs vs with UVs: no mismatch (%zu)", differing);
+  first = std::numeric_limits<size_t>::max(); differing = 0;
+  pool::PoolDecodedMesh moved = BoxMesh(1.f, true);
+  moved.uvs[0][0] += 0.25f;
+  pool::ComparePoolMeshes(BoxMesh(1.f, true), moved, &first, &differing);
+  CHECK(differing > 0u, "a real UV difference is still counted (%zu)", differing);
+}
+
+// Diagnostics round: vertex input UV verdicts, conflict masks, the dump keys.
+static renodx::utils::scene::InputElementCopy DiagElement(const char* semantic, uint32_t index, uint32_t slot, uint32_t offset,
+                                                          reshade::api::format format) {
+  renodx::utils::scene::InputElementCopy element;
+  element.semantic = semantic;
+  element.semantic_index = index;
+  element.buffer_binding = slot;
+  element.offset = offset;
+  element.format = format;
+  return element;
+}
+
+static renodx::utils::scene::InputLayoutInfo DiagLayout(const std::vector<renodx::utils::scene::InputElementCopy>& elements) {
+  renodx::utils::scene::InputLayoutInfo layout;
+  for (const auto& element : elements) layout.elements.push_back(element);
+  return layout;
+}
+
+static void TestUvLayoutDiag() {
+  using pool::PoolUvVerdict;
+  const auto position = DiagElement("POSITION", 0u, 0u, 0u, format::r32g32b32_float);
+  const auto texcoord0 = DiagElement("TEXCOORD", 0u, 0u, 12u, format::r32g32_float);
+  pool::PoolAlphaLayout layout;
+  CHECK(layout.verdict == PoolUvVerdict::NotEvaluated && !layout.valid, "default layout is not evaluated");
+
+  // Two streams: POSITION in slot 0, TEXCOORD in slot 1.
+  const auto two_stream = DiagLayout({position, DiagElement("TEXCOORD", 0u, 1u, 0u, format::r32g32_float)});
+  pool::ClassifyPoolUvLayout(two_stream, 12u, &layout);
+  CHECK(layout.valid && layout.verdict == PoolUvVerdict::TexcoordOtherSlot, "two-stream: texcoord_other_slot");
+  renodx::utils::scene::MeshLayout mesh_layout;
+  CHECK(renodx::utils::scene::BuildMeshLayout(two_stream, 12u, 2u, &mesh_layout) && mesh_layout.uv_off == -1,
+        "two-stream: BuildMeshLayout uv_off -1");
+  renodx::utils::scene::shared.data->input_layouts[0x7A1u] = two_stream;
+  falcom_world::DrawRecord draw;
+  draw.method = 1; draw.has_index_buffer = true; draw.vb = {0x1111}; draw.vb_stride = 12u; draw.ib = {0x2222};
+  draw.index_size = 2; draw.index_count = 36; draw.input_layout = {0x7A1u};
+  int32_t pos_offset = -1, uv_offset = -2;
+  format pos_format = format::unknown, uv_format = format::unknown;
+  CHECK(pool::ResolvePoolMeshLayout(draw, &pos_offset, &pos_format, &uv_offset, &uv_format) == nullptr && uv_offset == -1,
+        "two-stream: ResolvePoolMeshLayout uv_offset -1");
+
+  pool::ClassifyPoolUvLayout(DiagLayout({position}), 12u, &layout);
+  CHECK(layout.verdict == PoolUvVerdict::NoTexcoord && !layout.uv_exists, "no TEXCOORD: no_texcoord");
+  CHECK(layout.element_total == 1u && layout.elements[0].slot == 0u && layout.elements[0].format == static_cast<uint32_t>(format::r32g32b32_float),
+        "elements recorded (%u)", layout.element_total);
+
+  pool::ClassifyPoolUvLayout(DiagLayout({position, texcoord0}), 20u, &layout);
+  CHECK(layout.verdict == PoolUvVerdict::Ok && layout.uv_offset == 12u && layout.vertex_stride == 20u, "offset 12 stride 20: ok");
+  pool::ClassifyPoolUvLayout(DiagLayout({position, texcoord0}), 16u, &layout);
+  CHECK(layout.verdict == PoolUvVerdict::TexcoordBeyondStride, "offset 12 stride 16: texcoord_beyond_stride");
+  pool::ClassifyPoolUvLayout(DiagLayout({DiagElement("TEXCOORD", 0u, 0u, 0u, format::r32_float)}), 8u, &layout);
+  CHECK(layout.verdict == PoolUvVerdict::TexcoordUnsupportedFormat, "r32_float: texcoord_unsupported_format");
+  pool::ClassifyPoolUvLayout(DiagLayout({DiagElement("texcoord", 0u, 0u, 0u, format::r32g32_float)}), 8u, &layout);
+  CHECK(layout.verdict == PoolUvVerdict::Ok, "lower-case semantic matches (case-insensitive)");
+}
+
+// Conflict masks (kPoolAlphaDiff*) of a key from two notes, and the first-conflict record.
+static void TestConflictMasks() {
+  pool::ResetWorldPool();
+  pool::g_pool.alpha_foliage.store(true);
+  std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+  auto& p = pool::g_pool;
+  const auto mask_of = [&](uint64_t key, const pool::PoolAlphaMaterial& first, const pool::PoolAlphaMaterial& second) {
+    pool::NotePoolAlphaMaterial(key, first);
+    pool::NotePoolAlphaMaterial(key, second);
+    return p.alpha_keys.at(key).conflict_fields;
+  };
+  CHECK(mask_of(0xE001, Mat(0x100, 0.5f), Mat(0x101, 0.5f)) == 1u, "view only: mask 1");
+  CHECK(mask_of(0xE002, Mat(0x100, 0.5f), Mat(0x100, 0.6f)) == 4u, "threshold only: mask 4");
+  CHECK(mask_of(0xE003, Mat(0x100, 0.5f, 0.1f), Mat(0x100, 0.5f, 0.7f)) == 8u, "scroll only: mask 8");
+  CHECK(mask_of(0xE004, Mat(0x100, 0.5f, 0.1f, 3u), Mat(0x100, 0.5f, 0.1f, 4u)) == 2u, "swizzle only: mask 2");
+  pool::PoolAlphaMaterial other_resource = Mat(0x101, 0.5f);
+  other_resource.resource = 0x201u;
+  pool::PoolAlphaMaterial first_resource = Mat(0x100, 0.5f);
+  first_resource.resource = 0x200u;
+  CHECK(mask_of(0xE005, first_resource, other_resource) == 17u, "view with different resources: mask 17");
+  CHECK(p.alpha_keys.at(0xE005).conflict, "a view conflict sets the conflict flag");
+
+  // The first conflict is kept: a third differing note adds bits but does not replace conflict_incoming.
+  pool::NotePoolAlphaMaterial(0xE006, Mat(0x100, 0.5f));
+  pool::NotePoolAlphaMaterial(0xE006, Mat(0x100, 0.6f));
+  pool::NotePoolAlphaMaterial(0xE006, Mat(0x100, 0.5f, 0.1f, 4u));
+  CHECK(p.alpha_keys.at(0xE006).conflict_fields == 6u, "third note adds its bit: mask 6 (%u)", p.alpha_keys.at(0xE006).conflict_fields);
+  CHECK(p.alpha_keys.at(0xE006).conflict_incoming.threshold == 0.6f && p.alpha_keys.at(0xE006).conflict_incoming.swizzle == 3u,
+        "third note does not overwrite conflict_incoming");
+  CHECK(p.alpha_keys.at(0xE006).material.threshold == 0.5f, "the first material is kept");
+
+  // Two keys on one mesh: the second key's mask folds into the mesh with the first key's.
+  Capture(0xE101, 16.f, true);
+  CHECK(MeshOf(0xE101) != UINT32_MAX, "mesh captured");
+  pool::NotePoolAlphaMaterial(0xE101, Mat(0x100, 0.5f));
+  pool::NotePoolAlphaMaterial(0xE101, Mat(0x100, 0.6f));
+  Capture(0xE102, 16.f, true);
+  CHECK(MeshOf(0xE102) == MeshOf(0xE101), "same content merged");
+  pool::NotePoolAlphaMaterial(0xE102, Mat(0x100, 0.5f, 0.1f, 4u));
+  CHECK(p.meshes[MeshOf(0xE101)].alpha_state.conflict_fields == 6u, "mesh folds key masks and the second key's mask (%u)",
+        p.meshes[MeshOf(0xE101)].alpha_state.conflict_fields);
+}
+
+// The dump carries the UV verdict and conflict fields of an alpha mesh (world_pool_meshes.json).
+// Per-vertex UV of the two-stream fixture: distinct per vertex, so a wrong vertex or a wrong stride shows.
+static std::array<float, 2> TwoStreamUv(size_t i) {
+  return {0.01f + 0.1f * static_cast<float>(i), 0.5f + 0.05f * static_cast<float>(i)};
+}
+
+struct TwoStreamCase {
+  uint32_t uv_stride = 8u;
+  uint64_t uv_bytes = 4096u;        // the UV buffer size
+  bool destroy_uv_in_uvs = false;   // destroy the UV buffer when its request reaches the Uvs phase
+  uint64_t held_cap = 0u;           // 0: the pool default (alpha_held_bytes_max)
+};
+
+struct TwoStreamResult {
+  bool saw_uvs = false;
+  bool destroyed = false;
+  size_t meshes = 0u;
+  size_t requests = 0u;
+  bool uvs_match = false;
+  uint32_t failures = 0u;
+  std::string error;
+  uint64_t no_uv = 0u;
+};
+
+// POSITION in slot 0 (stride 12), TEXCOORD0 in slot 1 (case stride and size): the UV stream is copied on
+// its own over the vertex range. Runs 60 scan frames of one alpha draw and reports what the pool did.
+static TwoStreamResult RunTwoStream(Device& dev, CmdList& cl, Queue& queue, const TwoStreamCase& c) {
+  TwoStreamResult result;
+  pool::ResetWorldPool();
+  auto& p = pool::g_pool;
+  p.scan_active.store(true);
+  p.exclude_moving.store(false);
+  p.follow_moving.store(false);
+  p.alpha_foliage.store(true);
+  p.alpha_held_bytes_max = c.held_cap != 0u ? c.held_cap : uint64_t{64} << 20;
+  const uint64_t kTwoStreamLayout = 0x7A2u, kRigid = 0xF101, kAlpha = 0xF102;
+  renodx::utils::scene::InputLayoutInfo two;
+  two.elements.push_back(DiagElement("POSITION", 0u, 0u, 0u, format::r32g32b32_float));
+  two.elements.push_back(DiagElement("TEXCOORD", 0u, 1u, 0u, format::r32g32_float));
+  renodx::utils::scene::shared.data->input_layouts[kTwoStreamLayout] = two;
+  Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
+  Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
+
+  resource t15, b1, vb0, vb1, ib, material;
+  dev.create_resource(resource_desc(4096 * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb0);
+  dev.create_resource(resource_desc(c.uv_bytes, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  const fixture::TestMesh box = fixture::Box(1.f);
+  for (size_t i = 0; i < box.positions.size(); ++i) {
+    std::memcpy(dev.res[vb0.handle].bytes.data() + i * fixture::kStride, box.positions[i].data(), fixture::kStride);
+    if ((i + 1u) * c.uv_stride > c.uv_bytes) continue;
+    const auto uv = TwoStreamUv(i);
+    std::memcpy(dev.res[vb1.handle].bytes.data() + i * c.uv_stride, uv.data(), sizeof(uv));
+  }
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+  renodx::utils::scene::SceneCommandListData* scene_cl = nullptr;
+  renodx::utils::data::CreateOrGet(static_cast<reshade::api::command_list*>(&cl), scene_cl);
+  scene_cl->vertex_buffers.resize(2);
+  scene_cl->vertex_buffers[0] = {vb0, 0u, fixture::kStride};
+  scene_cl->vertex_buffers[1] = {vb1, 0u, c.uv_stride};
+
+  std::array<uint8_t, 160> material_bytes = {};
+  const float threshold = 0.5f;
+  std::memcpy(material_bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
+  material = TrackedCb(dev, material_bytes.data(), 160);
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[1] = b1;
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
+
+  falcom_world::DrawRecord draw;
+  draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb0.handle}; draw.vb_stride = fixture::kStride; draw.ib = ib;
+  draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kTwoStreamLayout};
+  draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0;
+  draw.instance_count = 1; draw.depth_enable = true; draw.depth_write = true;
+  draw.topology = primitive_topology::triangle_list; draw.vs_pipeline = kRigid; draw.ps_pipeline = kAlpha;
+  draw.vs_hash = static_cast<uint32_t>(kRigid);
+  for (uint32_t frame = 0; frame < 60u; ++frame) {
+    const uint64_t cursor = frame % 4000u;
+    float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 48, world, 48);
+    const int32_t cb[4] = {static_cast<int32_t>(cursor), 0, 0, 0};
+    std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+    pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::DrainPoolScan(&dev, &queue);
+    bool destroy_now = false;
+    {
+      std::lock_guard<std::mutex> lock(p.mutex);
+      const auto it = p.mesh_requests.find(pool::PoolMeshKey(draw));
+      if (it != p.mesh_requests.end() && it->second.phase == pool::PoolMeshPhase::Uvs) {
+        result.saw_uvs = true;
+        destroy_now = c.destroy_uv_in_uvs && !result.destroyed;
+      }
+    }
+    if (destroy_now) {
+      // No further draws or drains: only the destroy event can drop the request.
+      result.destroyed = true;
+      dev.destroy_resource(vb1);
+      pool::OnDestroyResourcePool(&dev, vb1);
+      break;
+    }
+  }
+  std::lock_guard<std::mutex> lock(p.mutex);
+  result.meshes = p.meshes.size();
+  result.requests = p.mesh_requests.size();
+  result.failures = p.stats.mesh_failures;
+  result.error = p.stats.last_mesh_error;
+  result.no_uv = p.stats.alpha_no_uv;
+  if (result.meshes == 1u) {
+    const auto& mesh = p.meshes[0];
+    result.uvs_match = mesh.uvs.size() == mesh.positions.size();
+    for (size_t k = 0; result.uvs_match && k < mesh.positions.size(); ++k) {
+      size_t i = 0;
+      while (i < box.positions.size() && box.positions[i] != mesh.positions[k]) ++i;
+      result.uvs_match = i < box.positions.size() && mesh.uvs[k] == TwoStreamUv(i);
+    }
+  }
+  return result;
+}
+
+static void TestTwoStreamUv(Device& dev, CmdList& cl, Queue& queue) {
+  // UVs come from slot 1: each mesh vertex carries the UV of its fixture vertex, and the Uvs phase ran.
+  const TwoStreamResult good = RunTwoStream(dev, cl, queue, TwoStreamCase{});
+  CHECK(good.saw_uvs, "two-stream: the request reached the uvs phase");
+  CHECK(good.meshes == 1u && good.uvs_match, "two-stream: each vertex has its own UV (meshes %zu)", good.meshes);
+  CHECK(good.no_uv == 0u, "two-stream: no no_uv refusal: %llu", static_cast<unsigned long long>(good.no_uv));
+
+  // A UV stream of another stride (C3): read at its own stride.
+  TwoStreamCase wide;
+  wide.uv_stride = 16u;
+  const TwoStreamResult stride16 = RunTwoStream(dev, cl, queue, wide);
+  CHECK(stride16.meshes == 1u && stride16.uvs_match, "uv stride 16: each vertex has its own UV (meshes %zu)", stride16.meshes);
+
+  // The UV buffer is shorter than the vertex range: refused and counted, no mesh.
+  TwoStreamCase shortbuf;
+  shortbuf.uv_bytes = 32u;
+  const TwoStreamResult shorted = RunTwoStream(dev, cl, queue, shortbuf);
+  CHECK(shorted.meshes == 0u && shorted.failures >= 1u && shorted.error.find("uv range outside") != std::string::npos,
+        "short uv buffer: refused and counted (%u failures, '%s')", shorted.failures, shorted.error.c_str());
+  CHECK(shorted.requests == 0u, "short uv buffer: its request and vertex bytes are dropped");
+
+  // The UV buffer is destroyed while its request is in the Uvs phase: the request is dropped, no mesh.
+  TwoStreamCase gone;
+  gone.destroy_uv_in_uvs = true;
+  const TwoStreamResult destroyed = RunTwoStream(dev, cl, queue, gone);
+  CHECK(destroyed.saw_uvs && destroyed.destroyed, "destroy: the request reached the uvs phase");
+  CHECK(destroyed.meshes == 0u && destroyed.requests == 0u, "destroy: request dropped, no mesh (meshes %zu, requests %zu)",
+        destroyed.meshes, destroyed.requests);
+
+  // Held vertex bytes over the cap (C4): the Vertices-to-Uvs step is refused and counted, the request dropped.
+  TwoStreamCase capped;
+  capped.held_cap = 8u;
+  const TwoStreamResult over = RunTwoStream(dev, cl, queue, capped);
+  CHECK(over.meshes == 0u && over.failures >= 1u && over.error.find("held vertex bytes") != std::string::npos,
+        "held cap: refused and counted (%u failures, '%s')", over.failures, over.error.c_str());
+  CHECK(over.requests == 0u, "held cap: refused request dropped with its vertex bytes");
+
+  // The stride is part of the buffer key: a draw with another stride does not serve these copies (C3).
+  falcom_world::DrawRecord key_draw;
+  key_draw.vb = {0x1111}; key_draw.ib = {0x2222}; key_draw.index_size = 2;
+  pool::PoolUvStream narrow;
+  narrow.buffer = {0x9001}; narrow.stride = 8u; narrow.format = format::r32g32_float; narrow.size = 4096u;
+  pool::PoolUvStream other = narrow;
+  other.stride = 16u;
+  CHECK(pool::PoolBufferKey(key_draw, narrow) != pool::PoolBufferKey(key_draw, other), "buffer key differs by uv stride");
+}
+
+// A queued key seen again with another TEXCOORD0 buffer is counted (its request keeps the first stream).
+static void TestUvStreamMismatch() {
+  pool::ResetWorldPool();
+  auto& p = pool::g_pool;
+  falcom_world::DrawRecord draw;
+  draw.method = 1; draw.has_index_buffer = true; draw.vb = {0x1111}; draw.vb_stride = fixture::kStride; draw.ib = {0x2222};
+  draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {fixture::kLayout};
+  draw.index_size = 2; draw.index_count = 36; draw.first_index = 0; draw.instance_count = 1;
+  pool::PoolUvStream first;
+  first.buffer = {0x9001}; first.stride = 8u; first.format = format::r32g32_float; first.size = 4096u;
+  pool::PoolUvStream second = first;
+  second.buffer = {0x9002};
+  std::lock_guard<std::mutex> lock(p.mutex);
+  pool::QueuePoolMesh(0x7701, 0xE1, draw, false, first);
+  CHECK(p.stats.alpha_uv_stream_mismatch == 0u, "same stream: not counted");
+  pool::QueuePoolMesh(0x7701, 0xE1, draw, false, second);
+  CHECK(p.stats.alpha_uv_stream_mismatch == 1u, "other TEXCOORD0 buffer: counted (%llu)", static_cast<unsigned long long>(p.stats.alpha_uv_stream_mismatch));
+  pool::QueuePoolMesh(0x7701, 0xE1, draw, false, first);
+  CHECK(p.stats.alpha_uv_stream_mismatch == 1u, "back to the request's buffer: not counted");
+}
+
+static void TestDumpEvidence() {
+  pool::ResetWorldPool();
+  pool::g_pool.alpha_foliage.store(true);
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    pool::NotePoolAlphaMaterial(0xF001, Mat(0x100, 0.5f));
+    pool::NotePoolAlphaMaterial(0xF001, Mat(0x101, 0.5f));
+    pool::NotePoolAlphaMaterial(0xF002, Mat(0x100, 0.5f));
+  }
+  Capture(0xF001, 17.f, true);
+  pool::DumpWorldPool();
+  std::ifstream meshes(pool::PoolOutputDir() / "world_pool_meshes.json");
+  const std::string meshes_text((std::istreambuf_iterator<char>(meshes)), std::istreambuf_iterator<char>());
+  CHECK(meshes_text.find("\"uv_verdict\": \"not_evaluated\"") != std::string::npos, "meshes: uv_verdict written");
+  CHECK(meshes_text.find("\"conflict_fields\": 1, \"conflict_first\"") != std::string::npos, "meshes: conflict_fields written");
+  CHECK(meshes_text.find("\"vbs_known\": false") != std::string::npos, "meshes: vbs_known written");
+  std::ifstream summary(pool::PoolOutputDir() / "world_pool.json");
+  const std::string summary_text((std::istreambuf_iterator<char>(summary)), std::istreambuf_iterator<char>());
+  CHECK(summary_text.find("\"alpha_keys_total\": 2") != std::string::npos, "summary: alpha_keys_total 2");
+  CHECK(summary_text.find("\"alpha_keys\": [") != std::string::npos && summary_text.find("\"mesh_id\": ") != std::string::npos,
+        "summary: alpha_keys entries carry mesh_id");
+  CHECK(LogCount("alpha diag: keys=") > 0u && LogCount("conflict_swizzle=") > 0u, "log: alpha diag line carries conflict_swizzle");
+  CHECK(LogCount("conflict_scroll=") > 0u && LogCount("conflict_any=") > 0u, "log: alpha diag line carries conflict_scroll and conflict_any");
+  CHECK(summary_text.find("\"alpha_reason\": \"ok\", \"alpha_threshold_offset\": 112") != std::string::npos,
+        "summary: alpha_tested pixel_shaders carry alpha_reason and alpha_threshold_offset");
 }
 
 int main() {
@@ -1121,31 +1707,51 @@ int main() {
   TestNoteMaterial();
   HStage("read material");
   TestReadDraw(dev, cl);
+  TestSwizzleBits(dev, cl);
   HStage("switch");
   TestSwitch();
   HStage("decode uv");
   TestDecodeUv();
   HStage("gate");
   TestGate(dev);
+  TestPixelUnknownLog(dev, cl);
   HStage("admission");
   TestAdmit();
   HStage("mesh conflict");
   TestMeshConflict();
+  HStage("uv layout diagnostics");
+  TestUvLayoutDiag();
+  TestConflictMasks();
+  TestDumpEvidence();
   HStage("requeue");
   TestRequeue();
   HStage("reset");
   TestResetClears();
   HStage("scan path");
   TestScanPath(dev, cl, queue);
+  HStage("two-stream uv");
+  TestTwoStreamUv(dev, cl, queue);
+  HStage("uv stream mismatch");
+  TestUvStreamMismatch();
+  std::printf("sizeof PoolPendingCopy=%zu WorldMesh=%zu PoolAlphaState=%zu PoolAlphaMaterialState=%zu PoolIndirectAlpha=%zu\n",
+              sizeof(pool::PoolPendingCopy), sizeof(pool::WorldMesh), sizeof(pool::PoolAlphaState),
+              sizeof(pool::PoolAlphaMaterialState), sizeof(pool::PoolIndirectAlpha));
+  // Regression guards (OFF memory): a copy carries no vertex-input or UV stream; a mesh carries no layout.
+  CHECK(sizeof(pool::PoolPendingCopy) <= 120u, "PoolPendingCopy %zu bytes (120 max)", sizeof(pool::PoolPendingCopy));
+  CHECK(sizeof(pool::WorldMesh) <= 288u, "WorldMesh %zu bytes (288 max)", sizeof(pool::WorldMesh));
   HStage("indirect alpha");
   TestIndirectAlpha(dev, cl, queue);
   HStage("atlas (GPU stage, mock)");
   TestAtlas(dev, cl, queue);
+  TestSharedCopies(dev, cl, queue);
+  TestDrawCopies(dev, cl, queue);
+  TestCompare();
   HStage("source guards (mock)");
   TestSourceGuards(dev, cl, queue);
   HStage("end to end (mock)");
   TestEndToEnd(dev, cl, queue);
 
+  CHECK(g_bad_view_calls == 0, "%d view lookups on non-view handles", g_bad_view_calls);
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;
 }

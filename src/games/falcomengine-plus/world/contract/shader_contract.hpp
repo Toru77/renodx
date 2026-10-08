@@ -66,7 +66,6 @@ inline constexpr uint32_t kSceneMapColorOffset = 752u;       // cb_scene.mapColo
 inline constexpr uint32_t kAlphaTexSlot = 0u;              // alpha-tested PS: Texture2D Tex0 (t0)
 inline constexpr uint32_t kAlphaMaterialSlot = 5u;          // alpha-tested PS: cb_local (b5)
 inline constexpr uint32_t kAlphaUvScrollOffset = 0u;         // cb_local.uvScroll0_g (c0)
-inline constexpr uint32_t kAlphaThresholdOffset = 112u;        // cb_local.alphaTestThreshold_g (c7)
 inline constexpr uint32_t kAlphaSwizzleSlot = 10u;            // cb_tex_swizzle.swizzle_flags_g (b10)
 
 enum class VsClass : uint8_t {
@@ -268,20 +267,65 @@ inline VsClass ClassifyVertexShader(const dxbc::Reflection& reflection) {
   return VsClass::Rigid;
 }
 
-// An alpha-tested pixel shader samples its cutout texture (t0) and reads the
-// threshold from the material cb (b5) at the contract offset.
-inline bool HasContractAlphaMaterial(const dxbc::Reflection& reflection) {
-  if (!reflection.valid) return false;
-  const dxbc::ResourceBinding* texture = reflection.FindResource(dxbc::kInputTexture, kAlphaTexSlot);
-  if (texture == nullptr) return false;
-  const dxbc::ResourceBinding* material = reflection.FindResource(dxbc::kInputCBuffer, kAlphaMaterialSlot);
-  if (material == nullptr) return false;
-  const dxbc::ConstantBuffer* layout = reflection.FindConstantBuffer(material->name, 0u);
-  if (layout == nullptr) return false;
-  for (const auto& variable : layout->variables) {
-    if (variable.name == "alphaTestThreshold_g") return variable.used && variable.offset == kAlphaThresholdOffset;
+// Why an alpha-tested pixel shader does or does not get the contract material
+// layout. Names: AlphaMaterialReasonName.
+enum class AlphaMaterialReason : uint8_t {
+  Ok,
+  NoReflection,
+  NoT0,
+  NoB5,
+  NoCbLayout,
+  NoThresholdVar,
+  ThresholdUnused,
+  ThresholdOffsetMismatch,  // threshold misaligned, outside the cb, or overlapping a used variable
+  UvScrollMismatch,         // uvScroll0_g missing or not at offset 0 (the trace reads scroll from offset 0)
+};
+
+inline const char* AlphaMaterialReasonName(AlphaMaterialReason reason) {
+  switch (reason) {
+    case AlphaMaterialReason::Ok: return "ok";
+    case AlphaMaterialReason::NoReflection: return "no_reflection";
+    case AlphaMaterialReason::NoT0: return "no_t0";
+    case AlphaMaterialReason::NoB5: return "no_b5";
+    case AlphaMaterialReason::NoCbLayout: return "no_cb_layout";
+    case AlphaMaterialReason::NoThresholdVar: return "no_threshold_var";
+    case AlphaMaterialReason::ThresholdUnused: return "threshold_unused";
+    case AlphaMaterialReason::ThresholdOffsetMismatch: return "threshold_offset_mismatch";
+    case AlphaMaterialReason::UvScrollMismatch: return "uv_scroll_mismatch";
   }
-  return false;
+  return "unknown";
+}
+
+// An alpha-tested pixel shader samples its cutout texture (t0) and reads the
+// threshold from the material cb (b5) at the offset the shader uses. threshold_offset
+// receives the threshold variable's offset (-1 when not found).
+inline AlphaMaterialReason ClassifyAlphaMaterial(const dxbc::Reflection& reflection, int32_t* threshold_offset) {
+  *threshold_offset = -1;
+  if (!reflection.valid) return AlphaMaterialReason::NoReflection;
+  const dxbc::ResourceBinding* texture = reflection.FindResource(dxbc::kInputTexture, kAlphaTexSlot);
+  if (texture == nullptr) return AlphaMaterialReason::NoT0;
+  const dxbc::ResourceBinding* material = reflection.FindResource(dxbc::kInputCBuffer, kAlphaMaterialSlot);
+  if (material == nullptr) return AlphaMaterialReason::NoB5;
+  const dxbc::ConstantBuffer* layout = reflection.FindConstantBuffer(material->name, 0u);
+  if (layout == nullptr) return AlphaMaterialReason::NoCbLayout;
+  for (const auto& variable : layout->variables) {
+    if (variable.name != "alphaTestThreshold_g") continue;
+    *threshold_offset = static_cast<int32_t>(variable.offset);
+    if (!variable.used) return AlphaMaterialReason::ThresholdUnused;
+    if (variable.offset % 4u != 0u || variable.offset + sizeof(float) > layout->size) {
+      return AlphaMaterialReason::ThresholdOffsetMismatch;
+    }
+    for (const auto& other : layout->variables) {
+      const bool overlaps = other.offset < variable.offset + sizeof(float) && variable.offset < other.offset + other.size;
+      if (other.name != variable.name && other.used && overlaps) return AlphaMaterialReason::ThresholdOffsetMismatch;
+    }
+    bool scroll_at_zero = false;
+    for (const auto& other : layout->variables) {
+      if (other.name == "uvScroll0_g") scroll_at_zero = other.offset == kAlphaUvScrollOffset;
+    }
+    return scroll_at_zero ? AlphaMaterialReason::Ok : AlphaMaterialReason::UvScrollMismatch;
+  }
+  return AlphaMaterialReason::NoThresholdVar;
 }
 
 inline PsClass ClassifyPixelShader(const dxbc::Reflection& reflection) {

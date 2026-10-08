@@ -76,6 +76,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -141,6 +142,7 @@ inline constexpr uint32_t kPoolMassRetireMeshes = 32u;  // one compaction retiri
 inline constexpr uint32_t kPoolMeshMaxCaptures = 4u;
 inline constexpr size_t kPoolMismatchMaxMeshes = 64u;  // mesh mismatch histories kept (diagnostic)
 inline constexpr size_t kPoolDumpMaxInstances = 20000u;  // instances[] in world_pool.json
+inline constexpr size_t kPoolDumpMaxAlphaKeys = 256u;   // alpha_keys[] in world_pool.json
 inline constexpr uint32_t kPoolMeshRetryRounds = 3u;      // unstable meshes captured again this many times
 inline constexpr uint32_t kPoolMeshRetryFrames = 180u;    // frames before each new round
 inline constexpr uint32_t kPoolLifecycleLogLines = 200u;  // orphan, moving and identity log lines per session (each its own)
@@ -303,31 +305,110 @@ struct PoolSighting {
   uint32_t ps_hash = 0u;
 };
 
-// Alpha material of a draw key (its first sighting): texture (t0 handle, 0 when unreadable),
-// threshold, UV scroll and swizzle from the material cbs.
+// Alpha material of a draw key (its first sighting): view (the SRV handle bound to t0, not the
+// resource; 0 when unreadable), threshold, UV scroll and swizzle from the material cbs.
 struct PoolAlphaMaterial {
-  uint64_t texture = 0u;
+  uint64_t view = 0u;
+  uint64_t resource = 0u;  // the t0 resource (diagnostics only; decisions use view)
   float threshold = 0.f;
   float scroll[2] = {};
   uint32_t swizzle = 0u;
 };
 
-// Material held by a draw key or a mesh, and whether a differing material was seen (AbsorbPoolAlphaMaterial).
-struct PoolAlphaState {
+// Which parts of a material differ from the first one (conflict_fields). Conflict is decided on
+// the first four bits; kPoolAlphaDiffResource marks a view whose resource differs too.
+inline constexpr uint8_t kPoolAlphaDiffView = 1u;
+inline constexpr uint8_t kPoolAlphaDiffSwizzle = 2u;
+inline constexpr uint8_t kPoolAlphaDiffThreshold = 4u;
+inline constexpr uint8_t kPoolAlphaDiffScroll = 8u;
+inline constexpr uint8_t kPoolAlphaDiffResource = 16u;
+
+// UV layout verdict of a draw's vertex input (ClassifyPoolUvLayout), for diagnostics.
+enum class PoolUvVerdict : uint8_t {
+  NotEvaluated,
+  Ok,
+  NoTexcoord,
+  TexcoordOtherSlot,
+  TexcoordUnsupportedFormat,
+  TexcoordBeyondStride,
+};
+
+inline constexpr uint32_t kPoolLayoutElementsMax = 16u;
+inline constexpr uint32_t kPoolVbSlotsMax = 4u;
+
+struct PoolLayoutElement {
+  char semantic[12] = {};
+  uint32_t index = 0u;
+  uint32_t slot = 0u;
+  uint32_t offset = 0u;
+  uint32_t format = 0u;
+};
+
+struct PoolVertexBufferSlot {
+  uint32_t slot = 0u;
+  uint64_t handle = 0u;
+  uint32_t stride = 0u;
+  uint64_t offset = 0u;
+};
+
+// The vertex buffer slots bound at a direct draw (up to kPoolVbSlotsMax, in slot order).
+struct PoolVertexBuffers {
+  uint32_t count = 0u;
+  std::array<PoolVertexBufferSlot, kPoolVbSlotsMax> slots = {};
+};
+
+// TEXCOORD0 bound in a vertex buffer slot other than 0: its own stream, copied with the
+// vertex range. buffer.handle 0 = no such stream.
+struct PoolUvStream {
+  reshade::api::resource buffer = {0u};
+  uint64_t offset = 0u;          // the slot's byte offset
+  uint32_t stride = 0u;          // the slot's stride
+  uint32_t element_offset = 0u;  // TEXCOORD0 offset within the stride
+  reshade::api::format format = reshade::api::format::unknown;
+  uint64_t size = 0u;            // buffer size (bounds of the copy)
+};
+
+// Vertex input of a draw key's mesh: the UV verdict and the first elements, for diagnostics.
+struct PoolAlphaLayout {
+  bool valid = false;  // ClassifyPoolUvLayout ran
+  PoolUvVerdict verdict = PoolUvVerdict::NotEvaluated;
+  bool uv_exists = false;
+  uint32_t uv_slot = 0u;
+  uint32_t uv_offset = 0u;
+  uint32_t uv_format = 0u;
+  uint32_t vertex_stride = 0u;
+  uint32_t element_total = 0u;
+  std::array<PoolLayoutElement, kPoolLayoutElementsMax> elements = {};
+  bool vbs_known = false;  // false for indirect draws (their slots are not read)
+  PoolVertexBuffers vbs;
+};
+
+// Material held by a draw key or a mesh. conflict_fields and conflict_incoming describe the
+// first conflict; the material held stays the first readable one.
+// The material part (what a mesh keeps for every mesh, ON or OFF).
+struct PoolAlphaMaterialState {
   PoolAlphaMaterial material;
   bool conflict = false;
+  uint8_t conflict_fields = 0u;
+  PoolAlphaMaterial conflict_incoming;
+};
+
+// A draw key's state: its material and its vertex input layout (ON only; kept out of meshes).
+struct PoolAlphaState : PoolAlphaMaterialState {
+  PoolAlphaLayout layout;
 };
 
 // A copy of an alpha-tested draw's source texture (mip 0), made at draw time and blitted into the atlas
-// once its mesh is resident. Owned until its draw key is invalidated (at the next present) or alpha_foliage
-// goes off: a blit keeps the copy (blitted), so a slice dropped later (live store reset) is blitted again.
+// once its mesh is resident. One copy per source texture: the draw keys that sample it are its refcount
+// (keys). It is freed when no key is left (their invalidation) or alpha_foliage goes off; a blitted copy
+// freed this way is copied again on demand.
 struct PoolAlphaSource {
   reshade::api::resource proxy = {0u};  // empty while its copy is being made
   reshade::api::format format = reshade::api::format::unknown;  // the format of the view the game bound
   uint64_t bytes = 0u;                  // mip 0 bytes (kAlphaSourceBytesMax)
   bool blitted = false;                 // the atlas has been filled from it at least once
+  std::unordered_set<uint64_t> keys;    // draw keys that use this texture
 };
-
 // The GPU stage's numbers as the pool last saw them (written under g_pool.mutex by SyncLiveAlpha at the start of
 // each present, so they lag one present; the trace fields come from the last readback). Read by the dump and the panel.
 struct PoolAlphaGpuStats {
@@ -382,7 +463,7 @@ struct WorldMesh {
   bool dynamic = false;
   // Alpha-tested material (MarkPoolMeshAlpha): no instance is admitted (AdmitPoolInstance refuses it).
   bool alpha = false;
-  PoolAlphaState alpha_state;  // material and conflict of its alpha keys (AbsorbPoolAlphaMaterial)
+  PoolAlphaMaterialState alpha_state;  // material and conflict of its alpha keys (AbsorbPoolAlphaMaterial)
 };
 
 struct WorldInstance {
@@ -460,10 +541,11 @@ struct PoolDecodedMesh {
 enum class PoolMeshPhase : uint8_t {
   Indices = 0,  // the draw's index range
   Vertices,     // the vertex range those indices cover
+  Uvs,          // the same vertex range of the TEXCOORD0 stream (PoolUvStream)
 };
 
 inline const char* PoolMeshPhaseName(PoolMeshPhase phase) {
-  return phase == PoolMeshPhase::Indices ? "indices" : "vertices";
+  return phase == PoolMeshPhase::Indices ? "indices" : phase == PoolMeshPhase::Vertices ? "vertices" : "uvs";
 }
 
 // An unstable mesh waiting for its next capture round.
@@ -581,6 +663,8 @@ struct PoolMeshRequest {
   reshade::api::format pos_format = reshade::api::format::unknown;
   int32_t uv_offset = -1;  // -1: no decodable UV
   reshade::api::format uv_format = reshade::api::format::unknown;
+  PoolUvStream uv;                       // TEXCOORD0 in another slot (buffer 0: none)
+  std::vector<uint8_t> vertex_bytes;     // the vertex read, held until the uv read decodes it
   PoolMeshPhase phase = PoolMeshPhase::Indices;
   bool in_flight = false;
   bool from_indirect = false;
@@ -649,10 +733,19 @@ struct PoolPendingCopy {
   bool trace_only = false;  // prevWorld trace copy: not counted, not queued, not stamped
   bool follow = false;      // moving key in follow mode: the copy bypassed the cooldown
   PoolAlphaMaterial alpha;  // indirect alpha draws: material read at the draw, flagged at resolve
+  uint32_t alpha_index = UINT32_MAX;  // indirect alpha draws only: PoolStagingSlot::indirect_alpha entry
 };
 
 // Normal copies keep the per-identity cooldown. Follow and Trace bypass it.
 enum class PoolCopyKind : uint8_t { Normal, Follow, Trace };
+
+// Indirect alpha draws only (ON): the slot bindings and TEXCOORD0 stream read at the draw, kept out of
+// PoolPendingCopy so every copy stays small with alpha_foliage off.
+struct PoolIndirectAlpha {
+  PoolUvStream uv;
+  PoolVertexBuffers vbs;
+  bool vbs_known = false;
+};
 
 struct PoolStagingSlot {
   reshade::api::resource buffer = {0u};
@@ -661,6 +754,7 @@ struct PoolStagingSlot {
   bool resolving = false;
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
+  std::vector<PoolIndirectAlpha> indirect_alpha;  // parallel to the alpha copies' alpha_index
   // Mesh copies of the same frame, in their own buffer.
   reshade::api::resource mesh_buffer = {0u};
   uint64_t mesh_used = 0u;
@@ -854,12 +948,14 @@ struct PoolStats {
   uint64_t alpha_conflict_refused = 0u;   // admissions refused: mesh conflict
   uint64_t alpha_refused_off = 0u;     // admissions refused: alpha_foliage off
   uint64_t alpha_no_uv = 0u;           // admissions refused: mesh has no UVs
+  uint64_t alpha_uv_stream_mismatch = 0u;  // a queued key seen with another TEXCOORD0 buffer (its request keeps the first)
   uint64_t alpha_removed = 0u;         // instances removed by the alpha flag or the switch
   uint64_t alpha_uv_requeues = 0u;     // meshes captured without UVs and queued again for them (once per key)
   uint64_t alpha_source_copies = 0u;   // source textures copied for alpha draws (CapturePoolAlphaSource)
   uint64_t alpha_source_refused = 0u;  // alpha draws whose source was not copied (texture kind, caps, deferred, failure)
   uint64_t alpha_source_refused_bytes = 0u;   // of those: the byte cap (kAlphaSourceBytesMax) was reached
   uint64_t alpha_source_refused_format = 0u;  // of those: the bound view's format is unknown or typeless
+  uint64_t alpha_source_refused_view = 0u;  // of those: the bound view does not belong to the bound t0 resource
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -1099,7 +1195,12 @@ struct PoolState {
   std::unordered_map<uint64_t, PoolAlphaState> alpha_keys;  // by draw key; flags its mesh alpha-tested
   bool alpha_off_applied = false;  // the switch-off removal ran (re-armed by switching on)
   std::unordered_set<uint64_t> alpha_uv_requeued;  // keys whose mesh was requeued for its UVs
-  std::unordered_map<uint64_t, PoolAlphaSource> alpha_sources;  // by draw key; an empty entry while its copy is made
+  std::set<std::pair<uint64_t, uint64_t>> pixel_unknown_logged;  // (vs, ps) pipelines logged as PixelUnknown once
+  uint64_t alpha_held_bytes_max = uint64_t{64} << 20;  // vertex bytes held by requests in the Uvs phase (ON): refused above
+  std::unordered_map<uint64_t, PoolAlphaSource> alpha_sources;  // by source texture handle; no proxy while its copy is made
+  std::unordered_map<uint64_t, uint64_t> alpha_key_source;  // draw key -> its source texture handle (alpha_sources)
+  bool alpha_capture_logged = false;  // the first capture after alpha_foliage was switched on is logged
+  bool alpha_sync_logged = false;     // the first SyncLiveAlpha after alpha_foliage was switched on is logged
   std::unordered_set<uint64_t> alpha_source_done;  // draw keys needing no further copy (refused)
   std::unordered_set<uint64_t> alpha_format_logged;  // texture handles whose refused format was logged
   std::atomic_bool live_on{true};  // the live BVH is enabled (UpdateLiveBvh): no source copies while it is off
@@ -2075,24 +2176,51 @@ inline uint32_t RetirePoolMeshAlpha(uint32_t mesh_id) {
   return removed;
 }
 
+// Which parts of an incoming material differ from the first one (kPoolAlphaDiff* bits).
+inline uint8_t PoolAlphaDiff(const PoolAlphaMaterial& first, const PoolAlphaMaterial& incoming) {
+  uint8_t fields = 0u;
+  if (first.view != incoming.view) {
+    fields |= kPoolAlphaDiffView;
+    if (first.resource != incoming.resource) fields |= kPoolAlphaDiffResource;
+  }
+  if (first.swizzle != incoming.swizzle) fields |= kPoolAlphaDiffSwizzle;
+  if (std::memcmp(&first.threshold, &incoming.threshold, sizeof(float)) != 0) fields |= kPoolAlphaDiffThreshold;
+  if (std::memcmp(first.scroll, incoming.scroll, sizeof(first.scroll)) != 0) fields |= kPoolAlphaDiffScroll;
+  return fields;
+}
+
+// Caller holds g_pool.mutex. Records conflict fields; the first conflict keeps its incoming
+// material. Returns true when a conflict is newly set.
+inline bool SetPoolAlphaConflict(PoolAlphaMaterialState* held, uint8_t fields, const PoolAlphaMaterial& incoming) {
+  if (fields == 0u) return false;
+  const bool newly = held->conflict_fields == 0u;
+  if (newly) held->conflict_incoming = incoming;
+  held->conflict_fields |= fields;
+  held->conflict = true;
+  return newly;
+}
+
 // Caller holds g_pool.mutex. Folds an incoming material into a key's or a mesh's state. An
 // unreadable material (texture 0) never conflicts; an empty state takes the first readable one;
 // a differing one sets conflict (bitwise float compare: a NaN threshold equals itself).
 // Returns true when conflict is newly set.
-inline bool AbsorbPoolAlphaMaterial(PoolAlphaState* held, const PoolAlphaMaterial& incoming, bool conflict) {
-  const bool was_conflict = held->conflict;
-  if (incoming.texture != 0u) {
-    const PoolAlphaMaterial& first = held->material;
-    if (first.texture == 0u) {
-      held->material = incoming;
-    } else if (first.texture != incoming.texture || first.swizzle != incoming.swizzle
-               || std::memcmp(&first.threshold, &incoming.threshold, sizeof(float)) != 0
-               || std::memcmp(first.scroll, incoming.scroll, sizeof(first.scroll)) != 0) {
-      held->conflict = true;
-    }
+inline bool AbsorbPoolAlphaMaterial(PoolAlphaMaterialState* held, const PoolAlphaMaterial& incoming) {
+  if (incoming.view == 0u) return false;
+  if (held->material.view == 0u) {
+    held->material = incoming;
+    return false;
   }
-  held->conflict = held->conflict || conflict;
-  return held->conflict && !was_conflict;
+  const uint8_t fields = PoolAlphaDiff(held->material, incoming);
+  return (fields & 15u) != 0u && SetPoolAlphaConflict(held, fields, incoming);
+}
+
+// Caller holds g_pool.mutex. Folds a key's state into a mesh's state: its material, its conflict
+// fields (the first conflict and its material are kept) and its layout when the mesh has none.
+// Returns true when conflict is newly set.
+inline bool FoldPoolAlphaState(PoolAlphaMaterialState* held, const PoolAlphaMaterialState& key_state) {
+  const bool newly_material = AbsorbPoolAlphaMaterial(held, key_state.material);
+  const bool newly_fields = SetPoolAlphaConflict(held, key_state.conflict_fields, key_state.conflict_incoming);
+  return newly_material || newly_fields;
 }
 
 // Caller holds g_pool.mutex. Flags a mesh alpha-tested (MarkPoolMeshDynamic's pattern) and folds
@@ -2102,7 +2230,7 @@ inline uint32_t MarkPoolMeshAlpha(uint32_t mesh_id, const PoolAlphaState& key_st
   WorldMesh& mesh = g_pool.meshes[mesh_id];
   const bool newly_flagged = !mesh.alpha;
   mesh.alpha = true;
-  const bool newly_conflicted = AbsorbPoolAlphaMaterial(&mesh.alpha_state, key_state.material, key_state.conflict);
+  const bool newly_conflicted = FoldPoolAlphaState(&mesh.alpha_state, key_state);
   if (newly_conflicted) g_pool.stats.alpha_meshes_conflicted += 1u;
   if (!newly_flagged && !newly_conflicted) return 0u;
   return RetirePoolMeshAlpha(mesh_id);
@@ -2129,36 +2257,43 @@ void RequeuePoolMeshKey(uint64_t mesh_key);
 // flagged before its mesh is captured is flagged at the capture (ApplyPoolMesh). With
 // alpha_foliage on, a mesh captured without UVs (captured before its key was flagged) is
 // requeued once for its UVs (alpha_uv_requeued).
-inline void NotePoolAlphaMaterial(uint64_t mesh_key, const PoolAlphaMaterial& material) {
+inline void NotePoolAlphaMaterial(uint64_t mesh_key, const PoolAlphaMaterial& material, const PoolVertexBuffers* vbs = nullptr) {
   PoolAlphaState& key_state = g_pool.alpha_keys[mesh_key];
-  if (AbsorbPoolAlphaMaterial(&key_state, material, false)) g_pool.stats.alpha_conflicts += 1u;
+  if (vbs != nullptr && !key_state.layout.vbs_known) {
+    key_state.layout.vbs = *vbs;
+    key_state.layout.vbs_known = true;
+  }
+  if (AbsorbPoolAlphaMaterial(&key_state, material)) g_pool.stats.alpha_conflicts += 1u;
   const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
   if (mesh_it == g_pool.mesh_by_key.end()) return;
   MarkPoolMeshAlpha(mesh_it->second, key_state);
-  if (g_pool.alpha_foliage.load(std::memory_order_relaxed) && material.texture != 0u
+  if (g_pool.alpha_foliage.load(std::memory_order_relaxed) && material.view != 0u
       && g_pool.meshes[mesh_it->second].uvs.empty() && g_pool.alpha_uv_requeued.insert(mesh_key).second) {
     RequeuePoolMeshKey(mesh_key);
     g_pool.stats.alpha_uv_requeues += 1u;
   }
 }
 
-// Reads the alpha material a pixel shader uses (t0 texture, b5 threshold and scroll,
-// b10 swizzle) for a draw whose pixel shader carries kTraitAlphaMaterial. False when
+// Reads the alpha material a pixel shader uses (t0 texture, b5 threshold at threshold_offset
+// and scroll, b10 swizzle) for a draw whose pixel shader carries kTraitAlphaMaterial. False when
 // any part is not readable; the caller then flags the key with an empty material
 // (fails closed). Counts the draw in the alpha stats.
-inline bool ReadPoolAlphaDraw(reshade::api::command_list* cmd_list, const WorldCommandListData& cl_data, PoolAlphaMaterial* out) {
+inline bool ReadPoolAlphaDraw(reshade::api::command_list* cmd_list, const WorldCommandListData& cl_data, uint32_t threshold_offset,
+                              PoolAlphaMaterial* out) {
   const reshade::api::resource material = cl_data.ps_cb[contract::kAlphaMaterialSlot];
   const reshade::api::resource swizzle = cl_data.ps_cb[contract::kAlphaSwizzleSlot];
-  out->texture = cl_data.ps_srv[contract::kAlphaTexSlot].handle;
-  bool readable = out->texture != 0u && material.handle != 0u && cl_data.ps_cb_offset[contract::kAlphaMaterialSlot] == 0u;
-  std::array<uint8_t, contract::kAlphaThresholdOffset + sizeof(float)> bytes = {};
-  readable = readable && ReadTrackedCbBytes(cmd_list, material, bytes.data(), bytes.size());
+  out->view = cl_data.ps_srv_view[contract::kAlphaTexSlot].handle;
+  out->resource = cl_data.ps_srv[contract::kAlphaTexSlot].handle;
+  bool readable = out->view != 0u && material.handle != 0u && cl_data.ps_cb_offset[contract::kAlphaMaterialSlot] == 0u;
+  std::array<uint8_t, kTrackedCbBytes> bytes = {};
+  readable = readable && ReadTrackedCbBytes(cmd_list, material, bytes.data(), threshold_offset + sizeof(float));
   if (readable) {
-    std::memcpy(&out->threshold, bytes.data() + contract::kAlphaThresholdOffset, sizeof(float));
+    std::memcpy(&out->threshold, bytes.data() + threshold_offset, sizeof(float));
     std::memcpy(out->scroll, bytes.data() + contract::kAlphaUvScrollOffset, sizeof(out->scroll));
     if (swizzle.handle != 0u) {
       readable = cl_data.ps_cb_offset[contract::kAlphaSwizzleSlot] == 0u
                  && ReadTrackedCbBytes(cmd_list, swizzle, &out->swizzle, sizeof(uint32_t));
+      out->swizzle &= 1u;  // the shader reads bit 0 only (other bits must not make a conflict)
     }
   }
   std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -2507,12 +2642,16 @@ inline PoolCameraVisibility GetPoolCameraVisibility(const WorldInstance& instanc
 // ---------------------------------------------------------------------------
 // Draw-time scan.
 
+inline std::string PoolHashText(uint32_t hash);
+
 struct PoolDrawGate {
   contract::VsClass vs_class = contract::VsClass::Unclassified;
   PoolSkip skip = PoolSkip::None;
   PoolDrawState state = PoolDrawState::Ok;
   uint8_t pass = 0u;  // kPoolPass* bits, set when the draw passes the gate
   bool alpha_material = false;  // alpha-tested pixel shader on a rigid or wind vertex shader (recorded even when skipped)
+  uint32_t alpha_threshold_offset = 0u;  // the pixel shader's threshold offset in b5 (alpha_material only)
+  const char* unknown_reason = nullptr;  // PixelUnknown only: logged once per pipeline pair (NotePoolPixelUnknown)
 };
 
 // Shader classes first, then draw state, then the pixel shader.
@@ -2537,6 +2676,7 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
   const bool alpha_class = ps_class == contract::PsClass::AlphaTested;
   const bool alpha = alpha_class && alpha_on && (ps_traits.flags & contract::kTraitAlphaMaterial) != 0u;
   gate.alpha_material = alpha;
+  if (alpha) gate.alpha_threshold_offset = static_cast<uint32_t>(ps_traits.alpha_offset);
   if (alpha_class && !alpha_on) {
     gate.skip = PoolSkip::AlphaTested;
   } else if (alpha_class && !alpha) {
@@ -2546,6 +2686,10 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
   } else if (gate.vs_class == contract::VsClass::Wind && !alpha) {
     gate.skip = PoolSkip::WindOpaque;
   }
+  if (gate.skip == PoolSkip::PixelUnknown) {
+    gate.unknown_reason = alpha_class ? contract::AlphaMaterialReasonName(static_cast<contract::AlphaMaterialReason>(ps_traits.alpha_reason))
+                                      : contract::PsClassName(ps_class);
+  }
   if (gate.skip == PoolSkip::None) {
     gate.pass = static_cast<uint8_t>(((vs_traits.flags & contract::kTraitCameraView) != 0u ? kPoolPassCamera : 0u)
                                      | ((vs_traits.flags & contract::kTraitLightView) != 0u ? kPoolPassLight : 0u)
@@ -2554,6 +2698,13 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
                                      | (alpha ? kPoolPassAlpha : 0u));
   }
   return gate;
+}
+
+// Caller holds g_pool.mutex. Logs a PixelUnknown pipeline pair once per session.
+inline void NotePoolPixelUnknown(const DrawRecord& draw, const char* reason) {
+  if (!g_pool.pixel_unknown_logged.insert({draw.vs_pipeline, draw.ps_pipeline}).second) return;
+  renodx::utils::log::i("[world-bvh] pixel_unknown: vs=", PoolHashText(draw.vs_hash), " ps=", PoolHashText(draw.ps_hash),
+                        " reason=", reason);
 }
 
 // The draw's instance source: t15, b1 and the elements available from the
@@ -2628,16 +2779,21 @@ inline PoolSkip ReservePoolCopy(
   return PoolSkip::None;
 }
 
-// The VB/IB bindings of a draw: any draw that has them bound can serve the
-// mesh copies of every queued mesh drawn from them.
-inline uint64_t PoolBufferKey(const DrawRecord& draw) {
+// The VB/IB bindings of a draw (and its TEXCOORD0 stream, when it has one): any draw that has them
+// bound can serve the mesh copies of every queued mesh drawn from them.
+inline uint64_t PoolBufferKey(const DrawRecord& draw, const PoolUvStream& uv) {
   uint64_t key = 1469598103934665603ull;
   key = PoolMix(key, draw.vb.handle);
   key = PoolMix(key, draw.vb_offset);
   key = PoolMix(key, draw.vb_stride);
   key = PoolMix(key, draw.ib.handle);
   key = PoolMix(key, draw.ib_offset);
-  return PoolMix(key, draw.index_size);
+  key = PoolMix(key, draw.index_size);
+  if (uv.buffer.handle == 0u) return key;
+  key = PoolMix(key, uv.buffer.handle);
+  key = PoolMix(key, uv.offset);
+  key = PoolMix(key, uv.stride);
+  return PoolMix(key, uv.element_offset);
 }
 
 // Caller holds g_pool.mutex.
@@ -2717,7 +2873,7 @@ inline void RecordPoolMeshFailure(const PoolMeshRequest& request, const char* re
   failure.raw_index_min = request.raw_index_min;
   failure.raw_index_max = request.raw_index_max;
   std::memcpy(failure.first_raw, request.first_raw, sizeof(failure.first_raw));
-  failure.raw_hash = request.phase == PoolMeshPhase::Vertices ? request.vertices_raw_hash : request.indices_raw_hash;
+  failure.raw_hash = request.phase != PoolMeshPhase::Indices ? request.vertices_raw_hash : request.indices_raw_hash;
   g_pool.stats.mesh_failures += 1u;
   g_pool.stats.last_mesh_error = reason;
 }
@@ -2727,6 +2883,67 @@ inline void RecordPoolMeshFailure(const PoolMeshRequest& request, const char* re
 inline void FailPoolMesh(std::unordered_map<uint64_t, PoolMeshRequest>::iterator request, const char* reason) {
   RecordPoolMeshFailure(request->second, reason);
   g_pool.mesh_requests.erase(request);
+}
+
+// The input layout a draw's vertex input was created with. False when not seen.
+inline bool FindPoolInputLayout(const DrawRecord& draw, renodx::utils::scene::InputLayoutInfo* out) {
+  namespace scene = renodx::utils::scene;
+  if (scene::shared.data == nullptr || draw.input_layout.handle == 0u) return false;
+  bool found = false;
+  scene::shared.data->input_layouts.if_contains(draw.input_layout.handle, [&](const auto& pair) {
+    *out = pair.second;
+    found = true;
+  });
+  return found;
+}
+
+// UV layout of a draw key's vertex input: the first TEXCOORD0 in any slot (semantic case-insensitive,
+// as BuildMeshLayout). The verdict says why a mesh cannot take its UVs from this layout.
+// The first TEXCOORD0 in any slot (semantic case-insensitive, as BuildMeshLayout), or null.
+inline const renodx::utils::scene::InputElementCopy* FindPoolTexcoord0(const renodx::utils::scene::InputLayoutInfo& info) {
+  for (const auto& element : info.elements) {
+    std::string semantic = element.semantic.c_str();
+    for (auto& c : semantic) c = static_cast<char>(::toupper(static_cast<unsigned char>(c)));
+    if (semantic == "TEXCOORD" && element.semantic_index == 0u) return &element;
+  }
+  return nullptr;
+}
+
+inline void ClassifyPoolUvLayout(const renodx::utils::scene::InputLayoutInfo& info, uint32_t stride, PoolAlphaLayout* out) {
+  namespace scene = renodx::utils::scene;
+  out->valid = true;
+  out->vertex_stride = stride;
+  out->element_total = static_cast<uint32_t>(info.elements.size());
+  for (size_t i = 0; i < info.elements.size(); ++i) {
+    const scene::InputElementCopy& element = info.elements[i];
+    if (i < kPoolLayoutElementsMax) {
+      PoolLayoutElement& dst = out->elements[i];
+      std::snprintf(dst.semantic, sizeof(dst.semantic), "%s", element.semantic.c_str());
+      dst.index = element.semantic_index;
+      dst.slot = element.buffer_binding;
+      dst.offset = element.offset;
+      dst.format = static_cast<uint32_t>(element.format);
+    }
+  }
+  const scene::InputElementCopy* uv = FindPoolTexcoord0(info);
+  out->uv_exists = uv != nullptr;
+  if (uv == nullptr) {
+    out->verdict = PoolUvVerdict::NoTexcoord;
+    return;
+  }
+  out->uv_slot = uv->buffer_binding;
+  out->uv_offset = uv->offset;
+  out->uv_format = static_cast<uint32_t>(uv->format);
+  const scene::FormatInfo* uv_info = scene::FindFormatInfo(uv->format);
+  if (uv->buffer_binding != 0u) {
+    out->verdict = PoolUvVerdict::TexcoordOtherSlot;
+  } else if (uv_info == nullptr) {
+    out->verdict = PoolUvVerdict::TexcoordUnsupportedFormat;
+  } else if (static_cast<uint64_t>(uv->offset) + uv_info->byte_size > stride) {
+    out->verdict = PoolUvVerdict::TexcoordBeyondStride;
+  } else {
+    out->verdict = PoolUvVerdict::Ok;
+  }
 }
 
 // Position layout of a draw's vertex stream 0, from its input layout.
@@ -2741,14 +2958,7 @@ inline const char* ResolvePoolMeshLayout(
   if (draw.index_count < 3u || (draw.index_count % 3u) != 0u) return "index count is not a triangle list";
   if (draw.vb_stride == 0u) return "vertex stride is zero";
   scene::InputLayoutInfo layout_info;
-  bool found = false;
-  if (scene::shared.data != nullptr && draw.input_layout.handle != 0u) {
-    scene::shared.data->input_layouts.if_contains(draw.input_layout.handle, [&](const auto& pair) {
-      layout_info = pair.second;
-      found = true;
-    });
-  }
-  if (!found) return "no input layout";
+  if (!FindPoolInputLayout(draw, &layout_info)) return "no input layout";
   scene::MeshLayout layout;
   if (!scene::BuildMeshLayout(layout_info, draw.vb_stride, draw.index_size, &layout)) return "input layout not decodable";
   if (layout.topology != reshade::api::primitive_topology::undefined
@@ -2773,6 +2983,42 @@ inline const char* ResolvePoolMeshLayout(
   return nullptr;
 }
 
+// The vertex buffer slots bound at a draw (the scene's command-list state). False when that state is not
+// available (the slots are not known; an indirect draw's are read at its draw).
+inline bool CollectPoolVertexBuffers(reshade::api::command_list* cmd_list, PoolVertexBuffers* out) {
+  const auto* scene_cl = renodx::utils::data::Get<renodx::utils::scene::SceneCommandListData>(cmd_list);
+  if (scene_cl == nullptr) return false;
+  for (uint32_t slot = 0u; slot < scene_cl->vertex_buffers.size() && slot < kPoolVbSlotsMax; ++slot) {
+    const auto& binding = scene_cl->vertex_buffers[slot];
+    out->slots[out->count++] = {slot, binding.handle.handle, binding.stride, binding.offset};
+  }
+  return true;
+}
+
+// The TEXCOORD0 stream of a draw when it is bound in a slot other than 0. Empty (no UVs) when the slot,
+// the element or the buffer does not fit. Reads the buffer size: call it before the pool lock.
+inline void ResolvePoolUvStream(reshade::api::device* device, const DrawRecord& draw, const PoolVertexBuffers& vbs, PoolUvStream* out) {
+  namespace scene = renodx::utils::scene;
+  *out = {};
+  scene::InputLayoutInfo layout_info;
+  if (!FindPoolInputLayout(draw, &layout_info)) return;
+  const scene::InputElementCopy* uv = FindPoolTexcoord0(layout_info);
+  if (uv == nullptr || uv->buffer_binding == 0u) return;
+  const scene::FormatInfo* info = scene::FindFormatInfo(uv->format);
+  for (uint32_t i = 0u; i < vbs.count; ++i) {
+    const PoolVertexBufferSlot& slot = vbs.slots[i];
+    if (slot.slot != uv->buffer_binding) continue;
+    if (info == nullptr || slot.handle == 0u || slot.stride == 0u || uv->offset + info->byte_size > slot.stride) return;
+    out->buffer = {slot.handle};
+    out->offset = slot.offset;
+    out->stride = slot.stride;
+    out->element_offset = uv->offset;
+    out->format = uv->format;
+    out->size = device->get_resource_desc(out->buffer).buffer.size;
+    return;
+  }
+}
+
 // Caller holds g_pool.mutex. Queues the mesh a draw shows, once per key until
 // its buffers are released.
 // Caller holds g_pool.mutex. Maps a VB/IB handle to a draw key once (a key
@@ -2793,18 +3039,29 @@ inline void AddPoolResourceKey(uint64_t handle, uint64_t mesh_key) {
   if (std::find(keys.begin(), keys.end(), mesh_key) == keys.end()) keys.push_back(mesh_key);
 }
 
-inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, bool from_indirect) {
+inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord& draw, bool from_indirect, const PoolUvStream& uv) {
+  const auto alpha_key = g_pool.alpha_keys.find(mesh_key);
+  if (alpha_key != g_pool.alpha_keys.end() && !alpha_key->second.layout.valid) {
+    renodx::utils::scene::InputLayoutInfo layout_info;
+    if (FindPoolInputLayout(draw, &layout_info)) ClassifyPoolUvLayout(layout_info, draw.vb_stride, &alpha_key->second.layout);
+  }
   const auto retry = g_pool.mesh_retry.find(mesh_key);
   if (retry != g_pool.mesh_retry.end() && g_state.frame.load() < retry->second.next_frame) return;
   if (!g_pool.mesh_queued.insert(mesh_key).second) {
     // Seen again: a waiting mesh is still drawn, so it does not expire.
     const auto request = g_pool.mesh_requests.find(mesh_key);
-    if (request != g_pool.mesh_requests.end()) request->second.last_frame = g_state.frame.load();
+    if (request != g_pool.mesh_requests.end()) {
+      request->second.last_frame = g_state.frame.load();
+      if (request->second.uv.buffer.handle != uv.buffer.handle) g_pool.stats.alpha_uv_stream_mismatch += 1u;
+    }
     return;
   }
   if (g_pool.mesh_by_key.count(mesh_key) != 0u || g_pool.failed_meshes.count(mesh_key) != 0u) return;
   AddPoolResourceKey(draw.vb.handle, mesh_key);
   if (draw.ib.handle != draw.vb.handle) AddPoolResourceKey(draw.ib.handle, mesh_key);
+  if (uv.buffer.handle != 0u && uv.buffer.handle != draw.vb.handle && uv.buffer.handle != draw.ib.handle) {
+    AddPoolResourceKey(uv.buffer.handle, mesh_key);  // destroying the UV buffer drops the request
+  }
 
   PoolMeshRequest request;
   request.mesh_key = mesh_key;
@@ -2818,7 +3075,8 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
     return;
   }
   request.serial = g_pool.next_mesh_serial++;
-  request.buffer_key = PoolBufferKey(draw);
+  request.uv = uv;
+  request.buffer_key = PoolBufferKey(draw, uv);
   AddPoolMeshWaiting(request);
   g_pool.mesh_requests.emplace(mesh_key, std::move(request));
 }
@@ -2849,6 +3107,7 @@ inline void IssuePoolCopies(reshade::api::command_list* cmd_list, const PoolCopy
 inline uint32_t ReservePoolMeshCopies(
     reshade::api::device* device,
     const DrawRecord& draw,
+    const PoolUvStream& uv,
     bool indirect_draw,
     bool deferred,
     uint32_t frame,
@@ -2859,7 +3118,7 @@ inline uint32_t ReservePoolMeshCopies(
   if (!g_pool.capture_meshes.load(std::memory_order_relaxed)) return 0u;
   if (draw.method != 1u || !draw.has_index_buffer || draw.vb.handle == 0u || draw.ib.handle == 0u) return 0u;
   if (draw.vb_size == 0u || draw.ib_size == 0u) return 0u;
-  const auto waiting = g_pool.mesh_waiting.find(PoolBufferKey(draw));
+  const auto waiting = g_pool.mesh_waiting.find(PoolBufferKey(draw, uv));
   if (waiting == g_pool.mesh_waiting.end()) return 0u;
   if (deferred) {
     g_pool.stats.mesh_deferred_skips += 1u;
@@ -2880,21 +3139,33 @@ inline uint32_t ReservePoolMeshCopies(
     PoolMeshRequest& request = request_it->second;
     const DrawRecord& queued = request.draw;
     const bool indices = request.phase == PoolMeshPhase::Indices;
-    const reshade::api::resource source = indices ? draw.ib : draw.vb;
-    const uint64_t buffer_size = indices ? draw.ib_size : draw.vb_size;
+    const bool uvs = request.phase == PoolMeshPhase::Uvs;
+    if (uvs && uv.buffer.handle == 0u) {  // no stream for this draw: never copy from a null source
+      keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
+      continue;
+    }
+    const reshade::api::resource source = indices ? draw.ib : uvs ? uv.buffer : draw.vb;
+    const uint64_t buffer_size = indices ? draw.ib_size : uvs ? uv.size : draw.vb_size;
+    // The UV stream is read over the same vertex range, at its own offset and stride.
+    const uint64_t vertex_base = uvs ? request.uv.offset : queued.vb_offset;
+    const uint64_t vertex_stride = uvs ? request.uv.stride : queued.vb_stride;
     const uint64_t begin =
         indices ? queued.ib_offset + static_cast<uint64_t>(queued.first_index) * queued.index_size
-                : queued.vb_offset + static_cast<uint64_t>(request.min_vertex) * queued.vb_stride;
+                : vertex_base + static_cast<uint64_t>(request.min_vertex) * vertex_stride;
     const uint64_t end =
         indices ? begin + static_cast<uint64_t>(queued.index_count) * queued.index_size
-                : queued.vb_offset + (static_cast<uint64_t>(request.max_vertex) + 1u) * queued.vb_stride;
+                : vertex_base + (static_cast<uint64_t>(request.max_vertex) + 1u) * vertex_stride;
     const uint64_t aligned_begin = begin & ~uint64_t{3};
     const uint64_t aligned_end = (std::min)((end + 3u) & ~uint64_t{3}, buffer_size);
     const char* error = nullptr;
     if (end <= begin || end > buffer_size) {
-      error = indices ? "index range outside the index buffer" : "vertex range outside the vertex buffer";
+      error = indices ? "index range outside the index buffer"
+              : uvs   ? "uv range outside the uv buffer"
+                      : "vertex range outside the vertex buffer";
     } else if (aligned_end - aligned_begin > kPoolMeshSlotBytes) {
-      error = indices ? "index range larger than the mesh staging" : "vertex range larger than the mesh staging";
+      error = indices ? "index range larger than the mesh staging"
+              : uvs   ? "uv range larger than the mesh staging"
+                      : "vertex range larger than the mesh staging";
     }
     if (error != nullptr) {
       keys.erase(keys.begin() + static_cast<std::ptrdiff_t>(index));
@@ -2928,7 +3199,7 @@ inline uint32_t ReservePoolMeshCopies(
       request.indices_served_indirect = indirect_draw;
       request.indices_source_offset = begin;
       request.indices_frame = frame;
-    } else {
+    } else if (!uvs) {
       g_pool.stats.mesh_vertex_copies += 1u;
       request.vertices_served_indirect = indirect_draw;
       request.vertices_source_offset = begin;
@@ -2965,6 +3236,7 @@ inline void DrainPoolAlphaSources() {
     if (source.second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source.second.proxy);
   }
   g_pool.alpha_sources.clear();
+  g_pool.alpha_key_source.clear();
   g_pool.alpha_source_done.clear();
 }
 
@@ -2986,19 +3258,26 @@ inline uint64_t PoolAlphaProxyBytes() {
 }
 
 // Copies the source texture of an alpha-tested direct draw (mip 0 of a single-layer, non-multisampled 2D
-// texture) into an owned proxy, once per draw key, on the immediate context at draw time. The proxy has the
-// format of the view the game bound (not the texture's). Called only for a draw that is queued (skip None).
-// At most kAlphaCopiesPerFrame copies a frame, kAlphaSourcesMax live and kAlphaSourceBytesMax bytes; other
-// sources are refused and counted. No copy while the live BVH is off. Graphics calls run outside
-// g_pool.mutex. The texture is registered with its draw key, so destroying it invalidates the key (the proxy
-// is freed at the next present).
+// texture) into an owned proxy, once per source texture: draw keys that sample the same texture share the copy
+// (PoolAlphaSource::keys). Called only for a draw that is queued (skip None), outside g_pool.mutex. The proxy has
+// the format of the view the game bound (not the texture's). At most kAlphaCopiesPerFrame copies a frame,
+// kAlphaSourcesMax live and kAlphaSourceBytesMax bytes; other sources are refused and counted. No copy while the
+// live BVH is off. Graphics calls run outside g_pool.mutex. The texture is registered with its draw keys, so
+// destroying it invalidates them (the proxy is freed at the next present).
 inline void CapturePoolAlphaSource(
     reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key, uint64_t view, bool immediate) {
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (!g_pool.alpha_foliage.load(std::memory_order_relaxed) || !g_pool.live_on.load(std::memory_order_relaxed)
-        || g_pool.alpha_source_done.count(mesh_key) != 0u || g_pool.alpha_sources.count(mesh_key) != 0u) {
+    const bool enabled = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+    if (!enabled) g_pool.alpha_capture_logged = false;
+    if (!enabled || !g_pool.live_on.load(std::memory_order_relaxed)
+        || g_pool.alpha_source_done.count(mesh_key) != 0u || g_pool.alpha_key_source.count(mesh_key) != 0u) {
       return;
+    }
+    if (!g_pool.alpha_capture_logged) {
+      g_pool.alpha_capture_logged = true;
+      renodx::utils::log::i("[world-bvh] alpha stage: first source capture since alpha foliage was switched on (draw key ",
+                            mesh_key, ")");
     }
   }
   if (!immediate) {
@@ -3035,6 +3314,13 @@ inline void CapturePoolAlphaSource(
       format, reshade::api::format_row_pitch(format, desc.texture.width), desc.texture.height);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const auto source_it = g_pool.alpha_sources.find(texture.handle);
+    if (source_it != g_pool.alpha_sources.end()) {  // the texture has its copy: this key shares it
+      source_it->second.keys.insert(mesh_key);
+      g_pool.alpha_key_source[mesh_key] = texture.handle;
+      AddPoolResourceKey(texture.handle, mesh_key);
+      return;
+    }
     const uint32_t frame = g_state.frame.load();
     if (g_pool.alpha_copy_frame != frame) {
       g_pool.alpha_copy_frame = frame;
@@ -3050,7 +3336,10 @@ inline void CapturePoolAlphaSource(
       return;
     }
     g_pool.alpha_copies_frame += 1u;
-    g_pool.alpha_sources[mesh_key].bytes = bytes;  // reserved while its copy is made
+    PoolAlphaSource& source = g_pool.alpha_sources[texture.handle];  // reserved while its copy is made
+    source.bytes = bytes;
+    source.keys.insert(mesh_key);
+    g_pool.alpha_key_source[mesh_key] = texture.handle;
   }
   const reshade::api::resource_desc proxy_desc(
       reshade::api::resource_type::texture_2d, desc.texture.width, desc.texture.height, 1, 1, format, 1,
@@ -3061,22 +3350,26 @@ inline void CapturePoolAlphaSource(
   bool kept = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    const auto it = g_pool.alpha_sources.find(mesh_key);
+    const auto it = g_pool.alpha_sources.find(texture.handle);
     if (made && it != g_pool.alpha_sources.end()) {
       it->second.proxy = proxy;
       it->second.format = format;
-      AddPoolResourceKey(texture.handle, mesh_key);
+      for (const uint64_t key : it->second.keys) AddPoolResourceKey(texture.handle, key);
       g_pool.stats.alpha_source_copies += 1u;
       kept = true;
     } else {
-      if (it != g_pool.alpha_sources.end()) g_pool.alpha_sources.erase(it);
-      if (!made) g_pool.alpha_source_done.insert(mesh_key);
+      if (it != g_pool.alpha_sources.end()) {  // the copy failed: its keys are refused
+        for (const uint64_t key : it->second.keys) {
+          g_pool.alpha_key_source.erase(key);
+          g_pool.alpha_source_done.insert(key);
+        }
+        g_pool.alpha_sources.erase(it);
+      }
       g_pool.stats.alpha_source_refused += 1u;
     }
   }
   if (made && !kept) device->destroy_resource(proxy);
 }
-
 inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -3090,7 +3383,11 @@ inline void OnPoolScanDraw(
 
   const PoolDrawGate gate = GatePoolDraw(draw, true);
   PoolAlphaMaterial alpha_material;
-  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, &alpha_material);
+  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
+  PoolVertexBuffers vbs;
+  const bool vbs_known = gate.alpha_material && CollectPoolVertexBuffers(cmd_list, &vbs);
+  PoolUvStream uv;
+  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   const uint32_t count = draw.instance_count == 0u ? 1u : draw.instance_count;
@@ -3112,13 +3409,11 @@ inline void OnPoolScanDraw(
   std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
-  if (skip == PoolSkip::None && gate.alpha_material && alpha_material.texture != 0u) {
-    CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.texture, !deferred);
-  }
   bool trace_declined = false;
+  bool queued = false;  // this draw is queued for a copy (ReservePoolCopy None, QueuePoolMesh ran)
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material);
+    if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
     g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
     if (deferred) g_pool.stats.draws_on_deferred += 1u;
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
@@ -3177,14 +3472,27 @@ inline void OnPoolScanDraw(
           schedule->next_frame = frame + kPoolRecaptureFrames;
           g_pool.stats.copied_draws += 1u;
           family.copied += 1u;
-          QueuePoolMesh(mesh_key, draw.vs_hash, draw, false);
+          QueuePoolMesh(mesh_key, draw.vs_hash, draw, false, uv);
+          queued = true;
         }
       }
     }
     if (skip != PoolSkip::None && !trace_declined) CountPoolSkip(family, skip, gate.state);
-    mesh_count = ReservePoolMeshCopies(device, draw, false, deferred, frame, commands.data() + command_count,
+    if (gate.skip == PoolSkip::PixelUnknown) NotePoolPixelUnknown(draw, gate.unknown_reason);
+    mesh_count = ReservePoolMeshCopies(device, draw, uv, false, deferred, frame, commands.data() + command_count,
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
+  }
+  if (queued && gate.alpha_material && alpha_material.view != 0u) {
+    const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
+    if (source.handle != cl_data->ps_srv[contract::kAlphaTexSlot].handle) {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      g_pool.alpha_source_done.insert(mesh_key);
+      g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_view += 1u;
+    } else {
+      CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred);
+    }
   }
   stage.Set("direct draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
@@ -3211,7 +3519,11 @@ inline void OnPoolScanIndirectDraw(
 
   const PoolDrawGate gate = GatePoolDraw(draw, false);
   PoolAlphaMaterial alpha_material;
-  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, &alpha_material);
+  if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
+  PoolVertexBuffers vbs;
+  const bool vbs_known = gate.alpha_material && CollectPoolVertexBuffers(cmd_list, &vbs);
+  PoolUvStream uv;
+  if (vbs_known) ResolvePoolUvStream(device, draw, vbs, &uv);
   PoolSkip skip = gate.skip;
   PoolSlice slice;
   stage.Set("indirect draw: slice");
@@ -3238,6 +3550,7 @@ inline void OnPoolScanIndirectDraw(
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
     family.vs_class = static_cast<uint8_t>(gate.vs_class);
+    if (gate.skip == PoolSkip::PixelUnknown) NotePoolPixelUnknown(draw, gate.unknown_reason);
     for (uint32_t i = 0; i < sub_draws; ++i) {
       g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
       g_pool.stats.indirect_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
@@ -3285,6 +3598,10 @@ inline void OnPoolScanIndirectDraw(
       copy.ps_hash = draw.ps_hash;
       copy.pass = gate.pass;
       copy.alpha = alpha_material;
+      if (gate.alpha_material) {
+        copy.alpha_index = static_cast<uint32_t>(slot.indirect_alpha.size());
+        slot.indirect_alpha.push_back({uv, vbs, vbs_known});
+      }
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
       copy.schedule_key = schedule_key;
       copy.follow = follow;
@@ -3307,7 +3624,7 @@ inline void OnPoolScanIndirectDraw(
       if (!learned) g_pool.stats.indirect_first_copies += 1u;
       family.copied += 1u;
     }
-    mesh_count = ReservePoolMeshCopies(device, draw, true, deferred, frame, commands.data() + command_count,
+    mesh_count = ReservePoolMeshCopies(device, draw, uv, true, deferred, frame, commands.data() + command_count,
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
   }
@@ -3328,10 +3645,17 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.alpha_keys.erase(mesh_key);
   g_pool.alpha_uv_requeued.erase(mesh_key);
   g_pool.alpha_source_done.erase(mesh_key);
-  const auto source = g_pool.alpha_sources.find(mesh_key);
-  if (source != g_pool.alpha_sources.end()) {
-    if (source->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source->second.proxy);
-    g_pool.alpha_sources.erase(source);
+  const auto key_source = g_pool.alpha_key_source.find(mesh_key);
+  if (key_source != g_pool.alpha_key_source.end()) {
+    const auto source = g_pool.alpha_sources.find(key_source->second);
+    if (source != g_pool.alpha_sources.end()) {
+      source->second.keys.erase(mesh_key);
+      if (source->second.keys.empty()) {  // no key uses the copy any more
+        if (source->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source->second.proxy);
+        g_pool.alpha_sources.erase(source);
+      }
+    }
+    g_pool.alpha_key_source.erase(key_source);
   }
   g_pool.invalidated_keys.insert(mesh_key);
   // A queued mesh is forgotten; a copy of it still in flight is dropped when
@@ -3672,8 +3996,16 @@ inline const char* DecodePoolMeshVertices(
     const std::vector<uint32_t>& indices,
     uint32_t min_vertex,
     uint32_t max_vertex,
-    PoolDecodedMesh* mesh) {
+    PoolDecodedMesh* mesh,
+    const uint8_t* uv_bytes = nullptr,  // a TEXCOORD0 stream of its own (uv_offset is its offset): null = in `bytes`
+    uint64_t uv_size = 0u,
+    uint32_t uv_stride = 0u) {
   namespace scene = renodx::utils::scene;
+  if (uv_bytes == nullptr) {
+    uv_bytes = bytes;
+    uv_size = size;
+    uv_stride = stride;
+  }
   const scene::FormatInfo* info = scene::FindFormatInfo(pos_format);
   if (info == nullptr) return "unsupported position format";
   if (max_vertex < min_vertex || pos_offset < 0) return "bad vertex range";
@@ -3686,7 +4018,7 @@ inline const char* DecodePoolMeshVertices(
   mesh->uvs.clear();
   const scene::FormatInfo* uv_info = uv_offset >= 0 ? scene::FindFormatInfo(uv_format) : nullptr;
   const uint64_t uv_end = uv_info != nullptr ? static_cast<uint64_t>(uv_offset) + uv_info->byte_size : 0u;
-  if (uv_end > stride || size < (vertex_count - 1u) * stride + uv_end) uv_info = nullptr;  // UVs the copy does not hold
+  if (uv_end > uv_stride || uv_size < (vertex_count - 1u) * uv_stride + uv_end) uv_info = nullptr;  // UVs the copy does not hold
   mesh->triangles.clear();
   mesh->triangles.reserve(indices.size() / 3u);
   for (size_t i = 0; i + 2u < indices.size(); i += 3u) {
@@ -3706,7 +4038,7 @@ inline const char* DecodePoolMeshVertices(
         mesh->positions.push_back({position[0], position[1], position[2]});
         if (uv_info != nullptr) {
           float uv[4] = {};
-          const uint8_t* uv_vertex = bytes + static_cast<uint64_t>(absolute - min_vertex) * stride + uv_offset;
+          const uint8_t* uv_vertex = uv_bytes + static_cast<uint64_t>(absolute - min_vertex) * uv_stride + uv_offset;
           if (scene::DecodeAttribute(uv_vertex, *uv_info, uv) && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
             mesh->uvs.push_back({uv[0], uv[1]});
           }
@@ -3762,8 +4094,9 @@ inline void ComparePoolMeshes(
   const size_t triangles = (std::min)(previous.triangles.size(), current.triangles.size());
   for (size_t t = 0; t < triangles; ++t) {
     for (int k = 0; k < 3; ++k) {
-      const bool uv_differs = previous.uvs.size() != current.uvs.size()
-                              || (!previous.uvs.empty() && previous.uvs[previous.triangles[t][k]] != current.uvs[current.triangles[t][k]]);
+      // UVs are compared only when both captures have them: a capture without UVs is not a difference.
+      const bool uv_differs = !previous.uvs.empty() && !current.uvs.empty()
+                              && previous.uvs[previous.triangles[t][k]] != current.uvs[current.triangles[t][k]];
       if (previous.positions[previous.triangles[t][k]] != current.positions[current.triangles[t][k]] || uv_differs) {
         if (*first == SIZE_MAX) *first = t;
         *differing += 1u;
@@ -3927,6 +4260,7 @@ inline const char* ApplyOrVerifyPoolMesh(
   queued.has_previous = true;
   queued.phase = PoolMeshPhase::Indices;
   queued.indices.clear();
+  queued.vertex_bytes.clear();
   queued.in_flight = false;
   queued.last_frame = frame;
   AddPoolMeshWaiting(queued);
@@ -3954,6 +4288,8 @@ struct PoolMeshJob {
   reshade::api::format pos_format = reshade::api::format::unknown;
   int32_t uv_offset = -1;
   reshade::api::format uv_format = reshade::api::format::unknown;
+  PoolUvStream uv;                    // uv read: the stream (buffer 0: none)
+  std::vector<uint8_t> vertex_bytes;  // uv read: the vertex read, moved from the request
   std::vector<uint32_t> indices;  // index read: output; vertex read: moved from the request
   uint32_t min_vertex = 0u;
   uint32_t max_vertex = 0u;
@@ -4030,6 +4366,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   PoolStageScope stage("present: resolve (take)");
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
+  std::vector<PoolIndirectAlpha> indirect_alpha;
   std::vector<PoolMeshJob> jobs;
   reshade::api::resource buffer = {0u};
   reshade::api::resource mesh_buffer = {0u};
@@ -4043,10 +4380,12 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       slot.follow_used = 0u;
       slot.mesh_used = 0u;
       slot.indirect_draws.clear();
+      slot.indirect_alpha.clear();
       return;
     }
     copies.swap(slot.copies);
     indirect_draws.swap(slot.indirect_draws);
+    indirect_alpha.swap(slot.indirect_alpha);
     jobs.reserve(slot.mesh_copies.size());
     for (const PoolMeshCopy& copy : slot.mesh_copies) {
       PoolMeshJob job;
@@ -4065,9 +4404,11 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         job.pos_format = queued.pos_format;
         job.uv_offset = g_pool.alpha_keys.count(queued.mesh_key) != 0u ? queued.uv_offset : -1;
         job.uv_format = queued.uv_format;
+        job.uv = queued.uv;
         job.min_vertex = queued.min_vertex;
         job.max_vertex = queued.max_vertex;
-        if (copy.phase == PoolMeshPhase::Vertices) job.indices = std::move(queued.indices);
+        if (copy.phase != PoolMeshPhase::Indices) job.indices = std::move(queued.indices);
+        if (copy.phase == PoolMeshPhase::Uvs) job.vertex_bytes = std::move(queued.vertex_bytes);
       }
       jobs.push_back(std::move(job));
     }
@@ -4172,6 +4513,13 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         job.error = DecodePoolMeshIndices(data, job.copy.size, job.index_size, job.index_count, job.vertex_offset,
                                           job.stride, &job.indices, &job.min_vertex, &job.max_vertex,
                                           &job.raw_index_min, &job.raw_index_max, job.first_raw);
+      } else if (job.copy.phase == PoolMeshPhase::Vertices && job.uv.buffer.handle != 0u) {
+        // The UVs are a stream of their own: the vertex bytes wait for the uv read.
+        job.vertex_bytes.assign(data, data + job.copy.size);
+      } else if (job.copy.phase == PoolMeshPhase::Uvs) {
+        job.error = DecodePoolMeshVertices(job.vertex_bytes.data(), job.vertex_bytes.size(), job.stride, job.pos_offset, job.pos_format,
+                                           static_cast<int32_t>(job.uv.element_offset), job.uv.format, job.indices, job.min_vertex,
+                                           job.max_vertex, &job.mesh, data, job.copy.size, job.uv.stride);
       } else {
         job.error = DecodePoolMeshVertices(data, job.copy.size, job.stride, job.pos_offset, job.pos_format, job.uv_offset,
                                            job.uv_format, job.indices, job.min_vertex, job.max_vertex, &job.mesh);
@@ -4223,7 +4571,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
           read.raw_index_max = job.raw_index_max;
           std::memcpy(read.first_raw, job.first_raw, sizeof(read.first_raw));
           read.indices_raw_hash = job.raw_hash;
-        } else {
+        } else if (job.copy.phase == PoolMeshPhase::Vertices) {  // the uv read keeps the vertex hash
           read.vertices_raw_hash = job.raw_hash;
         }
       }
@@ -4233,7 +4581,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       } else if (!meshes_ok) {
         // Staging not readable: back in line for another copy.
         PoolMeshRequest& queued = request->second;
-        if (job.copy.phase == PoolMeshPhase::Vertices) queued.indices = std::move(job.indices);
+        if (job.copy.phase != PoolMeshPhase::Indices) queued.indices = std::move(job.indices);
+        if (job.copy.phase == PoolMeshPhase::Uvs) queued.vertex_bytes = std::move(job.vertex_bytes);
         queued.in_flight = false;
         AddPoolMeshWaiting(queued);
         outcome = "staging not readable, copy again";
@@ -4250,6 +4599,22 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         queued.last_frame = frame;
         AddPoolMeshWaiting(queued);
         outcome = "read, vertex copy next";
+      } else if (job.copy.phase == PoolMeshPhase::Vertices && job.uv.buffer.handle != 0u) {
+        uint64_t held = job.vertex_bytes.size();  // vertex bytes held by the requests in the Uvs phase
+        for (const auto& entry : g_pool.mesh_requests) held += entry.second.vertex_bytes.size();
+        if (held > g_pool.alpha_held_bytes_max) {
+          outcome = "held vertex bytes over the cap";
+          FailPoolMesh(request, outcome);
+        } else {
+          PoolMeshRequest& queued = request->second;
+          queued.indices = std::move(job.indices);
+          queued.vertex_bytes = std::move(job.vertex_bytes);
+          queued.phase = PoolMeshPhase::Uvs;
+          queued.in_flight = false;
+          queued.last_frame = frame;
+          AddPoolMeshWaiting(queued);
+          outcome = "read, uv copy next";
+        }
       } else {
         outcome = ApplyOrVerifyPoolMesh(request, job.mesh, PoolIndexSignature(job.indices), frame, &warning_lines);
       }
@@ -4374,8 +4739,11 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         record.vertex_offset = static_cast<int32_t>(result.args[3]);
         record.first_instance = result.args[4];
         mesh_key = PoolMeshKey(record);
-        if ((copy.pass & kPoolPassAlpha) != 0u) NotePoolAlphaMaterial(mesh_key, copy.alpha);
-        QueuePoolMesh(mesh_key, copy.vs_hash, record, true);
+        const PoolIndirectAlpha* alpha_side = copy.alpha_index != UINT32_MAX ? &indirect_alpha[copy.alpha_index] : nullptr;
+        if ((copy.pass & kPoolPassAlpha) != 0u) {
+          NotePoolAlphaMaterial(mesh_key, copy.alpha, alpha_side != nullptr && alpha_side->vbs_known ? &alpha_side->vbs : nullptr);
+        }
+        QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{});
       }
 
       const PoolSighting sighting{copy.pass, copy.ps_hash};
@@ -4686,6 +5054,7 @@ inline void ResetWorldPool() {
       for (const DrawRecord& draw : slot.indirect_draws) ReleasePoolIndirectRefs(draw);
       slot.copies.clear();
       slot.indirect_draws.clear();
+      slot.indirect_alpha.clear();
       slot.used = 0u;
       slot.follow_used = 0u;
       slot.mesh_copies.clear();
@@ -5127,6 +5496,56 @@ inline std::string PoolJsonEscape(const std::string& text) {
   return escaped;
 }
 
+struct PoolAlphaKeyDump {
+  uint64_t key = 0u;
+  int64_t mesh_id = -1;  // -1: no mesh yet
+  PoolAlphaState state;
+};
+
+inline const char* PoolUvVerdictName(PoolUvVerdict verdict) {
+  switch (verdict) {
+    case PoolUvVerdict::NotEvaluated:              return "not_evaluated";
+    case PoolUvVerdict::Ok:                        return "ok";
+    case PoolUvVerdict::NoTexcoord:                return "no_texcoord";
+    case PoolUvVerdict::TexcoordOtherSlot:         return "texcoord_other_slot";
+    case PoolUvVerdict::TexcoordUnsupportedFormat: return "texcoord_unsupported_format";
+    case PoolUvVerdict::TexcoordBeyondStride:      return "texcoord_beyond_stride";
+  }
+  return "unknown";
+}
+
+inline void WritePoolAlphaMaterial(std::ostream& out, const PoolAlphaMaterial& material) {
+  out << "{\"view\": \"" << renodx::utils::log::AsHex(material.view) << "\", \"resource\": \""
+      << renodx::utils::log::AsHex(material.resource) << "\", \"threshold\": " << PoolJsonFloat{material.threshold}
+      << ", \"scroll\": [" << PoolJsonFloat{material.scroll[0]} << ", " << PoolJsonFloat{material.scroll[1]}
+      << "], \"swizzle\": " << material.swizzle << "}";
+}
+
+// The alpha evidence of a key or a mesh, as fields of its object (leading comma each).
+inline void WritePoolAlphaEvidence(std::ostream& out, const PoolAlphaMaterialState& state, const PoolAlphaLayout& layout) {
+  const uint32_t element_count = (std::min)(layout.element_total, kPoolLayoutElementsMax);
+  out << ", \"uv_verdict\": \"" << PoolUvVerdictName(layout.verdict) << "\""
+      << ", \"uv\": {\"exists\": " << (layout.uv_exists ? "true" : "false") << ", \"slot\": " << layout.uv_slot
+      << ", \"offset\": " << layout.uv_offset << ", \"format\": " << layout.uv_format << "}"
+      << ", \"vertex_stride\": " << layout.vertex_stride << ", \"layout_element_total\": " << layout.element_total
+      << ", \"layout_elements\": [";
+  for (uint32_t i = 0; i < element_count; ++i) {
+    const PoolLayoutElement& element = layout.elements[i];
+    out << (i != 0u ? ", " : "") << "{\"semantic\": \"" << element.semantic << "\", \"index\": " << element.index
+        << ", \"slot\": " << element.slot << ", \"offset\": " << element.offset << ", \"format\": " << element.format << "}";
+  }
+  out << "], \"vbs_known\": " << (layout.vbs_known ? "true" : "false") << ", \"vertex_buffer_slots\": [";
+  for (uint32_t i = 0; i < layout.vbs.count; ++i) {
+    const PoolVertexBufferSlot& slot = layout.vbs.slots[i];
+    out << (i != 0u ? ", " : "") << "{\"slot\": " << slot.slot << ", \"handle\": \"" << renodx::utils::log::AsHex(slot.handle)
+        << "\", \"stride\": " << slot.stride << ", \"offset\": " << slot.offset << "}";
+  }
+  out << "], \"conflict_fields\": " << static_cast<uint32_t>(state.conflict_fields) << ", \"conflict_first\": ";
+  WritePoolAlphaMaterial(out, state.material);
+  out << ", \"conflict_incoming\": ";
+  WritePoolAlphaMaterial(out, state.conflict_incoming);
+}
+
 inline void DumpWorldPool() {
   std::vector<WorldMesh> meshes;
   std::vector<WorldInstance> instances;
@@ -5134,7 +5553,9 @@ inline void DumpWorldPool() {
   std::unordered_map<uint32_t, PoolFamilyStats> families;
   PoolStats stats;
   uint64_t alpha_key_count = 0u;
+  uint64_t alpha_held_vertex_bytes = 0u;  // vertex bytes held by requests in the Uvs phase
   PoolAlphaGpuStats alpha_gpu;
+  std::vector<PoolAlphaKeyDump> alpha_keys;
   PoolMotionDetail motion_detail;
   std::vector<PoolDynamicDumpEntry> dynamic;
   std::unordered_map<uint64_t, PoolMeshFailure> failed_meshes;
@@ -5168,7 +5589,12 @@ inline void DumpWorldPool() {
     families = g_pool.families;
     stats = g_pool.stats;
     alpha_key_count = g_pool.alpha_keys.size();
+    for (const auto& entry : g_pool.mesh_requests) alpha_held_vertex_bytes += entry.second.vertex_bytes.size();
     alpha_gpu = g_pool.alpha_gpu;
+    for (const auto& [key, state] : g_pool.alpha_keys) {
+      const auto mesh_it = g_pool.mesh_by_key.find(key);
+      alpha_keys.push_back({key, mesh_it == g_pool.mesh_by_key.end() ? -1 : static_cast<int64_t>(mesh_it->second), state});
+    }
     failed_meshes = g_pool.failed_meshes;
     mismatch_meshes = g_pool.mismatch_meshes;
     mesh_retry = g_pool.mesh_retry;
@@ -5177,6 +5603,25 @@ inline void DumpWorldPool() {
     region = CurrentPoolRegion();
     inspect = g_pool.inspect;
   }
+
+  std::sort(alpha_keys.begin(), alpha_keys.end(), [](const PoolAlphaKeyDump& a, const PoolAlphaKeyDump& b) { return a.key < b.key; });
+  size_t diag_ok = 0u, diag_no_texcoord = 0u, diag_other_slot = 0u, diag_conflict_view = 0u, diag_conflict_threshold = 0u;
+  size_t diag_conflict_swizzle = 0u, diag_conflict_scroll = 0u, diag_conflict_any = 0u;
+  for (const PoolAlphaKeyDump& entry : alpha_keys) {
+    const PoolUvVerdict verdict = entry.state.layout.verdict;
+    diag_ok += verdict == PoolUvVerdict::Ok ? 1u : 0u;
+    diag_no_texcoord += verdict == PoolUvVerdict::NoTexcoord ? 1u : 0u;
+    diag_other_slot += verdict == PoolUvVerdict::TexcoordOtherSlot ? 1u : 0u;
+    diag_conflict_view += (entry.state.conflict_fields & kPoolAlphaDiffView) != 0u ? 1u : 0u;
+    diag_conflict_threshold += (entry.state.conflict_fields & kPoolAlphaDiffThreshold) != 0u ? 1u : 0u;
+    diag_conflict_swizzle += (entry.state.conflict_fields & kPoolAlphaDiffSwizzle) != 0u ? 1u : 0u;
+    diag_conflict_scroll += (entry.state.conflict_fields & kPoolAlphaDiffScroll) != 0u ? 1u : 0u;
+    diag_conflict_any += entry.state.conflict ? 1u : 0u;
+  }
+  renodx::utils::log::i("[world-bvh] alpha diag: keys=", alpha_keys.size(), " ok=", diag_ok, " no_texcoord=", diag_no_texcoord,
+                        " other_slot=", diag_other_slot, " conflict_view=", diag_conflict_view,
+                        " conflict_threshold=", diag_conflict_threshold, " conflict_swizzle=", diag_conflict_swizzle,
+                        " conflict_scroll=", diag_conflict_scroll, " conflict_any=", diag_conflict_any);
 
   struct FamilyBounds {
     uint32_t meshes = 0u;
@@ -5214,7 +5659,8 @@ inline void DumpWorldPool() {
       << ", \"cb_unavailable\": " << stats.alpha_cb_unavailable << ", \"conflicts\": " << stats.alpha_conflicts
       << ", \"meshes_conflicted\": " << stats.alpha_meshes_conflicted
       << ", \"refused_off\": " << stats.alpha_refused_off << ", \"conflict_refused\": " << stats.alpha_conflict_refused
-      << ", \"no_uv\": " << stats.alpha_no_uv
+      << ", \"no_uv\": " << stats.alpha_no_uv << ", \"uv_stream_mismatch\": " << stats.alpha_uv_stream_mismatch
+      << ", \"held_vertex_bytes\": " << alpha_held_vertex_bytes << ", \"held_vertex_bytes_max\": " << g_pool.alpha_held_bytes_max
       << ", \"removed\": " << stats.alpha_removed
       << ", \"keys\": " << alpha_key_count
       << ", \"billboard_draws\": " << stats.draws_by_vs_class[static_cast<size_t>(contract::VsClass::Billboard)]
@@ -5225,11 +5671,20 @@ inline void DumpWorldPool() {
       << ", \"copies\": " << stats.alpha_source_copies << ", \"source_refused\": " << stats.alpha_source_refused
       << ", \"source_refused_bytes\": " << stats.alpha_source_refused_bytes
       << ", \"source_refused_format\": " << stats.alpha_source_refused_format
+      << ", \"source_refused_view\": " << stats.alpha_source_refused_view
       << ", \"uv_requeues\": " << stats.alpha_uv_requeues
       << ", \"cap_refused\": " << alpha_gpu.cap_refused << ", \"tlas_alpha_instances\": " << alpha_gpu.tlas_instances
       << ", \"alpha_waiting\": " << alpha_gpu.waiting << ", \"alpha_tests\": " << alpha_gpu.tests
       << ", \"alpha_cut\": " << alpha_gpu.cut << ", \"blit_ms\": " << PoolJsonFloat{alpha_gpu.blit_ms}
       << ", \"trace_ms\": " << PoolJsonFloat{alpha_gpu.trace_ms} << "},\n";
+  out << "  \"alpha_keys_total\": " << alpha_keys.size() << ", \"alpha_keys\": [";
+  for (size_t i = 0; i < alpha_keys.size() && i < kPoolDumpMaxAlphaKeys; ++i) {
+    const PoolAlphaKeyDump& entry = alpha_keys[i];
+    out << (i != 0u ? "," : "") << "\n    {\"key\": \"" << renodx::utils::log::AsHex(entry.key) << "\", \"mesh_id\": " << entry.mesh_id;
+    WritePoolAlphaEvidence(out, entry.state, entry.state.layout);
+    out << "}";
+  }
+  out << "\n  ],\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
       << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";
@@ -5372,8 +5827,13 @@ inline void DumpWorldPool() {
     if (i != 0u) out << ",";
     out << "\n    {\"hash\": \"" << PoolHashText(registry_entries.pixel[i].hash) << "\", \"class\": \""
         << contract::PsClassName(static_cast<contract::PsClass>(registry_entries.pixel[i].cls)) << "\""
-        << ", \"near_fade\": " << ((registry_entries.pixel[i].flags & contract::kTraitNearFade) != 0u ? "true" : "false")
-        << "}";
+        << ", \"near_fade\": " << ((registry_entries.pixel[i].flags & contract::kTraitNearFade) != 0u ? "true" : "false");
+    if (registry_entries.pixel[i].cls == static_cast<uint8_t>(contract::PsClass::AlphaTested)) {
+      out << ", \"alpha_reason\": \""
+          << contract::AlphaMaterialReasonName(static_cast<contract::AlphaMaterialReason>(registry_entries.pixel[i].alpha_reason))
+          << "\", \"alpha_threshold_offset\": " << registry_entries.pixel[i].alpha_offset;
+    }
+    out << "}";
   }
   out << "\n  ],\n";
 
@@ -5497,7 +5957,18 @@ inline void DumpWorldPool() {
         << ", \"key\": \"" << renodx::utils::log::AsHex(mesh.mesh_key) << "\""
         << ", \"source_vb\": \"" << renodx::utils::log::AsHex(mesh.source_vb) << "\""
         << ", \"source_ib\": \"" << renodx::utils::log::AsHex(mesh.source_ib) << "\""
-        << ", \"signature\": \"" << renodx::utils::log::AsHex(mesh.signature) << "\"}";
+        << ", \"signature\": \"" << renodx::utils::log::AsHex(mesh.signature) << "\"";
+    if (mesh.alpha) {
+      // The mesh's layout is its first key's layout (the layout lives with the keys, not the mesh).
+      PoolAlphaLayout mesh_layout;
+      for (const PoolAlphaKeyDump& entry : alpha_keys) {
+        if (entry.mesh_id != static_cast<int64_t>(mesh.mesh_id) || !entry.state.layout.valid) continue;
+        mesh_layout = entry.state.layout;
+        break;
+      }
+      WritePoolAlphaEvidence(meshes_out, mesh.alpha_state, mesh_layout);
+    }
+    meshes_out << "}";
   }
   meshes_out << "\n  ]\n}\n";
 

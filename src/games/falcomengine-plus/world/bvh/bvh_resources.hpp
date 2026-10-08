@@ -239,8 +239,9 @@ struct AlphaGpu {
   GpuTimer timer;
   uint64_t blits = 0u;       // slices filled since the atlas was created
   uint32_t blits_frame = 0u;  // slices filled at the last present
-  uint64_t cap_refused = 0u;  // admissions without a slice (the atlas is full)
-  bool failure_logged = false;  // EnsureAlphaGpu logs its failure once
+  uint64_t cap_refused = 0u;  // meshes refused a slice (the atlas is full), counted once per mesh
+  std::unordered_set<uint64_t> cap_refused_uids;  // meshes counted in cap_refused (cleared with the GPU objects)
+  bool failure_logged = false;  // EnsureAlphaGpu logs its failure once (re-armed with the GPU objects)
 };
 
 struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
@@ -413,6 +414,8 @@ inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
   alpha.slices = {};
   alpha.slot_of_uid.clear();
   alpha.quarantine.clear();
+  alpha.cap_refused_uids.clear();
+  alpha.failure_logged = false;
   alpha.blits_frame = 0u;
 }
 
