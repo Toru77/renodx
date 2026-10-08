@@ -124,6 +124,8 @@ inline constexpr uint32_t kPoolMaxIndirectSubDraws = 64u;
 inline constexpr uint32_t kPoolMaxRejectSamples = 2u;       // per family, for the dump
 inline constexpr size_t kPoolMaxNearIndex = 500000u;
 inline constexpr uint64_t kPoolMeshSlotBytes = 4ull * 1024ull * 1024ull;  // mesh copies per slot (frame)
+inline constexpr uint32_t kPoolPoisonWord = 0xFFC0DEADu;  // poison_staging: what a read leaves in the mesh staging
+inline constexpr uint64_t kPoolResidueCycles = 2u;        // poison_staging: cycles of heads kept per slot
 inline constexpr uint32_t kPoolMeshCopiesPerFrame = 64u;
 inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
@@ -317,6 +319,7 @@ struct WorldMesh {
   uint32_t writes_after_capture = 0u;  // game writes to its VB/IB seen since (the mesh may be stale)
   uint32_t captures = 0u;              // captures it took
   bool verified = false;               // the last two captures decoded to the same mesh
+  bool admitted_by_retry = false;      // admitted after a retry round (kPoolMeshRetryRounds)
   uint32_t source_vb_usage = 0u;       // reshade::api::resource_usage / resource_flags bits of its VB and IB
   uint32_t source_vb_flags = 0u;
   uint32_t source_ib_usage = 0u;
@@ -418,6 +421,31 @@ struct PoolMeshRetry {
   uint32_t rounds = 0u;  // rounds given so far
 };
 
+// poison_staging: what a mesh copy's first bytes were when it was read.
+struct PoolStagingDiag {
+  bool poisoned = false;         // filled in (the switch was on for this read)
+  uint32_t slot = 0u;
+  uint32_t ordinal = 0u;         // the copy's place in its slot's read list
+  uint64_t staging_offset = 0u;
+  uint64_t copied = 0u;
+  uint32_t begin_mod16 = 0u;     // wanted bytes start at (staging offset + skip) % 16
+  uint32_t sentinel_words = 0u;  // poison words in [staging_offset, + copied)
+  uint32_t sentinel_head = 0u;   // poison words among the first head_words
+  uint32_t head_words = 0u;      // words of the first 64 B that the copy covers
+  uint32_t head_bytes = 0u;      // first raw bytes kept (48 at most)
+  uint8_t head[48] = {};
+  uint64_t head_hash = 0u;       // FNV of head
+  const char* head_class = "";   // ClassifyPoolStagingHead
+};
+
+// poison_staging: a head read from a slot (per slot, the last kPoolResidueCycles cycles).
+struct PoolResidue {
+  uint64_t offset = 0u;
+  uint64_t head_hash = 0u;
+  uint64_t mesh_key = 0u;
+  uint64_t cycle = 0u;
+};
+
 // One complete capture of a queued mesh (diagnostic: mesh_failed and mesh_mismatches history).
 struct PoolCaptureRecord {
   uint32_t frame = 0u;
@@ -440,6 +468,7 @@ struct PoolCaptureRecord {
   size_t differing_triangles = 0u;
   float before[9] = {};  // corners of the first differing triangle, previous capture
   float after[9] = {};   // and this capture
+  PoolStagingDiag staging;
 };
 
 // A mesh whose captures disagreed (world_pool.json mesh_mismatches): its draw and capture history.
@@ -451,6 +480,7 @@ struct PoolMeshMismatch {
 
 // A failed mesh and what its draw showed (world_pool.json mesh_failed).
 struct PoolMeshFailure {
+  PoolStagingDiag staging;  // the last read of the mesh (poison_staging)
   const char* reason = "";
   uint32_t vs_hash = 0u;
   uint32_t frame = 0u;
@@ -494,6 +524,7 @@ struct PoolMeshRequest {
   uint64_t buffer_key = 0u;  // the VB/IB bindings a draw must have to serve its copies
   uint32_t vs_hash = 0u;
   uint32_t last_frame = 0u;  // queued, last sighting, or last copy issued or read
+  PoolStagingDiag staging;   // the last read (poison_staging)
   DrawRecord draw;
   int32_t pos_offset = 0;
   reshade::api::format pos_format = reshade::api::format::unknown;
@@ -799,6 +830,7 @@ struct PoolStats {
   uint32_t mesh_capture_mismatches = 0u;  // a capture that differed from the previous one
   uint32_t mesh_unstable = 0u;            // rejected: kPoolMeshMaxCaptures without two identical in a row
   uint32_t mesh_retries = 0u;             // unstable meshes given another round (kPoolMeshRetryRounds)
+  uint32_t meshes_admitted_by_retry = 0u;  // admitted after a retry round
   uint32_t last_mass_retire_frame = 0u;
   uint32_t last_mass_retire_meshes = 0u;
   // Changes of what GetPoolCameraVisibility decides for admitted instances
@@ -889,6 +921,16 @@ struct PoolCpuTimer {
   }
 };
 
+// The last inspect result (middle-click in a trace view), written to world_pool.json.
+struct PoolInspectRecord {
+  bool set = false;
+  uint32_t frame = 0u;
+  bool hit = false;
+  uint64_t instance_id = 0u;  // PoolState instance id of the hit (0: none, or a moving instance)
+  uint64_t mesh_uid = 0u;     // WorldMesh::uid of the hit (0: none, or a moving instance)
+  std::vector<std::string> lines;
+};
+
 struct PoolState {
   std::atomic_bool scan_active{false};
   bool scan_continuous = false;  // the scan has been on every frame since scan_since
@@ -898,9 +940,15 @@ struct PoolState {
   std::atomic_bool scan_indirect{true};
   std::atomic_bool log_captures{false};
   std::atomic_bool verify_meshes{true};   // admit a mesh only after two identical captures
+  std::atomic_bool retry_unstable{false};  // diagnostic: unstable captures get kPoolMeshRetryRounds more rounds
   std::atomic_bool legacy_scale{false};   // instance scale limits of round 6 (0.05 .. 50)
   std::atomic_bool exclude_moving{false};  // meshes seen moving in a camera view stay out of the static pool
   std::atomic_bool follow_moving{true};    // moving meshes keep their instances, which follow the pose
+  PoolInspectRecord inspect;               // last inspect result (bvh_debug.hpp), written by DumpWorldPool
+  std::atomic_bool poison_staging{false};  // diagnostic: mesh staging cpu-visible, poisoned after each read
+  bool staging_poisoned = false;           // how the staging ring was created (EnsurePoolStaging)
+  std::array<std::vector<PoolResidue>, kPoolStagingSlots> residue;  // ClassifyPoolStagingHead
+  std::array<uint64_t, kPoolStagingSlots> residue_cycle{};          // resolves with mesh copies, per slot
   uint32_t mismatch_lines_logged = 0u;
   uint32_t mesh_fail_lines_logged = 0u;  // since the last pool reset
   uint32_t orphan_lines_logged = 0u;     // per session
@@ -1475,18 +1523,28 @@ inline void DestroyPoolStagingBuffers(reshade::api::device* device, const std::v
 // Slots have a fixed size: copies already recorded into a slot must never see
 // it reallocated.
 inline void EnsurePoolStaging(reshade::api::device* device) {
+  const bool poison = g_pool.poison_staging.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if (g_pool.staging_device == device) return;
+    if (g_pool.staging_device == device && g_pool.staging_poisoned == poison) return;
   }
   // Per slot: the instance buffer, then the mesh buffer.
   std::vector<reshade::api::resource> created;
   for (uint32_t i = 0; i < 2u * kPoolStagingSlots; ++i) {
     const reshade::api::resource_desc desc(
-        (i % 2u) == 0u ? kPoolStagingSlotBytes : kPoolMeshSlotBytes, reshade::api::memory_heap::gpu_to_cpu,
+        (i % 2u) == 0u ? kPoolStagingSlotBytes : kPoolMeshSlotBytes,
+        (i % 2u) == 0u || !poison ? reshade::api::memory_heap::gpu_to_cpu : reshade::api::memory_heap::cpu_only,
         reshade::api::resource_usage::copy_dest);
     reshade::api::resource buffer = {0u};
     if (!device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &buffer)) break;
+    // Poisoned mesh staging starts as the poison word, not zero: a copy that never writes its range shows it.
+    void* fill = nullptr;
+    if (poison && (i % 2u) == 1u && device->map_buffer_region(buffer, 0u, kPoolMeshSlotBytes,
+                                                              reshade::api::map_access::write_only, &fill)
+        && fill != nullptr) {
+      std::fill_n(static_cast<uint32_t*>(fill), kPoolMeshSlotBytes / sizeof(uint32_t), kPoolPoisonWord);
+      device->unmap_buffer_region(buffer);
+    }
     created.push_back(buffer);
   }
   if (created.size() != 2u * kPoolStagingSlots) {
@@ -1505,6 +1563,7 @@ inline void EnsurePoolStaging(reshade::api::device* device) {
       g_pool.slots[i].mesh_buffer = created[2u * i + 1u];
     }
     g_pool.staging_device = device;
+    g_pool.staging_poisoned = poison;
   }
   DestroyPoolStagingBuffers(previous_device, previous);
 }
@@ -2402,6 +2461,7 @@ inline void RecordPoolMeshFailure(const PoolMeshRequest& request, const char* re
   failure.ib_usage = request.draw.ib_usage;
   failure.ib_flags = request.draw.ib_flags;
   failure.written = request.written;
+  failure.staging = request.staging;
   failure.logged = false;
   failure.history = request.records;
   failure.phase = request.phase;
@@ -3120,6 +3180,7 @@ inline const char* ApplyPoolMesh(
       world_mesh.writes_after_capture = origin->written ? 1u : 0u;
       world_mesh.captures = origin->captures;
       world_mesh.verified = origin->verified;
+      world_mesh.admitted_by_retry = g_pool.mesh_retry.count(mesh_key) != 0u;
       world_mesh.source_vb_usage = origin->draw.vb_usage;
       world_mesh.source_vb_flags = origin->draw.vb_flags;
       world_mesh.source_ib_usage = origin->draw.ib_usage;
@@ -3136,6 +3197,7 @@ inline const char* ApplyPoolMesh(
     }
     mesh_id = world_mesh.mesh_id;
     g_pool.meshes.push_back(std::move(world_mesh));
+    if (g_pool.meshes.back().admitted_by_retry) g_pool.stats.meshes_admitted_by_retry += 1u;
     g_pool.mesh_by_signature.emplace(signature, mesh_id);
     g_pool.revision += 1u;
   }
@@ -3266,7 +3328,7 @@ inline void LogPoolSwitches() {
                         ", capture meshes ", on(g_pool.capture_meshes), ", scan indirect draws ", on(g_pool.scan_indirect),
                         ", verify mesh captures ", on(g_pool.verify_meshes), ", legacy scale limits ",
                         on(g_pool.legacy_scale), ", keep moving objects out ", on(g_pool.exclude_moving),
-                        ", follow moving objects ", on(g_pool.follow_moving));
+                        ", follow moving objects ", on(g_pool.follow_moving), ", retry unstable meshes ", on(g_pool.retry_unstable));
 }
 
 // Short text for how a VB/IB was created (reshade::api resource_usage /
@@ -3335,6 +3397,13 @@ inline std::string DescribePoolMeshMismatch(
         current.positions[b[1]][2], ") (", current.positions[b[2]][0], ", ", current.positions[b[2]][1], ", ",
         current.positions[b[2]][2], ")");
   }
+  if (request.staging.poisoned) {
+    line += log_utils::BuildString(" | staging: slot ", request.staging.slot, " copy ", request.staging.ordinal,
+                                   " at offset ", request.staging.staging_offset, " copied ", request.staging.copied,
+                                   " (begin mod 16 ", request.staging.begin_mod16, "), poison words ",
+                                   request.staging.sentinel_words, " (head ", request.staging.sentinel_head, " of ",
+                                   request.staging.head_words, "), head ", request.staging.head_class);
+  }
   return line;
 }
 
@@ -3377,6 +3446,7 @@ inline const char* ApplyOrVerifyPoolMesh(
     record.signature = signature;
     record.index_signature = index_signature;
     record.written = queued.written;
+    record.staging = queued.staging;
     record.vertices = static_cast<uint32_t>(mesh.positions.size());
     record.triangles = static_cast<uint32_t>(mesh.triangles.size());
     record.first_diff_triangle = first == SIZE_MAX ? -1 : static_cast<int64_t>(first);
@@ -3415,7 +3485,7 @@ inline const char* ApplyOrVerifyPoolMesh(
       warning_lines->push_back(DescribePoolMeshMismatch(queued, mesh, index_signature, frame, first, differing));
     }
   }
-  if (queued.captures >= kPoolMeshMaxCaptures) {
+  if (queued.captures >= kPoolMeshMaxCaptures && g_pool.retry_unstable.load(std::memory_order_relaxed)) {
     PoolMeshRetry& retry = g_pool.mesh_retry[queued.mesh_key];
     if (retry.rounds < kPoolMeshRetryRounds) {
       // Another round: the request leaves the queue until next_frame.
@@ -3426,6 +3496,8 @@ inline const char* ApplyOrVerifyPoolMesh(
       g_pool.mesh_requests.erase(request);
       return "unstable: captured again after 180 frames";
     }
+  }
+  if (queued.captures >= kPoolMeshMaxCaptures) {
     g_pool.stats.mesh_unstable += 1u;
     g_pool.families[queued.vs_hash].mesh_unstable += 1u;
     FailPoolMesh(request, "unstable: no two captures in a row decode to the same mesh");
@@ -3474,9 +3546,39 @@ struct PoolMeshJob {
   uint32_t raw_index_max = 0u;
   uint32_t first_raw[8] = {};
   uint64_t raw_hash = 0u;  // FNV of the first 4 KiB of the bytes read
+  PoolStagingDiag staging;
   const char* error = nullptr;
   PoolDecodedMesh mesh;
 };
+
+// Caller holds g_pool.mutex. Says where a copy's head bytes came from (poison_staging):
+// the poison word (the copy did not write them), or a head read from this slot in an
+// earlier cycle at the same or another offset, or in this cycle. Then remembers the head.
+inline void ClassifyPoolStagingHead(PoolStagingDiag& diag, uint64_t mesh_key, uint64_t cycle) {
+  std::vector<PoolResidue>& table = g_pool.residue[diag.slot];
+  if (diag.head_words != 0u && diag.sentinel_head == diag.head_words) {
+    diag.head_class = "sentinel";
+  } else {
+    // 5: this mesh's own head (expected: the mesh is copied again); 4: another mesh's head at the same
+    // offset in the previous cycle; 3: another offset, previous cycle; 2: same cycle. Other meshes' heads are
+    // only called stale when the mesh itself is not the match.
+    uint32_t best = 0u;
+    for (const PoolResidue& entry : table) {
+      if (entry.head_hash != diag.head_hash) continue;
+      uint32_t rank = 0u;
+      if (entry.mesh_key == mesh_key) rank = 5u;
+      else if (entry.cycle + 1u == cycle) rank = entry.offset == diag.staging_offset ? 4u : 3u;
+      else if (entry.cycle == cycle) rank = 2u;
+      best = (std::max)(best, rank);
+    }
+    diag.head_class = best == 5u ? "same mesh (expected)" : best == 4u ? "same offset previous cycle"
+                      : best == 3u ? "other offset previous cycle" : best == 2u ? "same cycle" : "none";
+  }
+  table.push_back(PoolResidue{.offset = diag.staging_offset, .head_hash = diag.head_hash, .mesh_key = mesh_key, .cycle = cycle});
+  table.erase(std::remove_if(table.begin(), table.end(),
+                             [cycle](const PoolResidue& entry) { return entry.cycle + kPoolResidueCycles <= cycle; }),
+              table.end());
+}
 
 // Caller holds g_pool.mutex.
 inline void CountPoolMatrixReject(PoolFamilyStats& family, PoolMatrixReject reject, const float* world) {
@@ -3534,6 +3636,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     for (const PoolMeshCopy& copy : slot.mesh_copies) {
       PoolMeshJob job;
       job.copy = copy;
+      job.staging.slot = slot_index;
+      job.staging.ordinal = static_cast<uint32_t>(jobs.size());
       const auto request = g_pool.mesh_requests.find(copy.mesh_key);
       if (request != g_pool.mesh_requests.end() && request->second.serial == copy.serial) {
         PoolMeshRequest& queued = request->second;
@@ -3611,6 +3715,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
 
   // Mesh copies are decoded straight from the mapped staging.
   stage.Set("present: resolve (decode meshes)");
+  const bool poison = g_pool.poison_staging.load(std::memory_order_relaxed);
   void* mesh_mapped = nullptr;
   const bool meshes_ok = jobs.empty()
                          || (mesh_buffer.handle != 0u && mesh_used != 0u
@@ -3626,6 +3731,26 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       for (uint64_t b = 0u; b < (std::min)(job.copy.size, uint64_t{4096}); ++b) {
         job.raw_hash = (job.raw_hash ^ data[b]) * 1099511628211ull;
       }
+      if (poison) {
+        const uint8_t* raw = bytes + job.copy.staging_offset;
+        PoolStagingDiag& diag = job.staging;
+        diag.poisoned = true;
+        diag.staging_offset = job.copy.staging_offset;
+        diag.copied = job.copy.copied;
+        diag.begin_mod16 = static_cast<uint32_t>((job.copy.staging_offset + job.copy.skip) % 16u);
+        diag.head_bytes = static_cast<uint32_t>((std::min)(job.copy.copied, uint64_t{48}));
+        std::memcpy(diag.head, raw, diag.head_bytes);
+        diag.head_hash = 1469598103934665603ull;
+        for (uint32_t b = 0u; b < diag.head_bytes; ++b) diag.head_hash = (diag.head_hash ^ diag.head[b]) * 1099511628211ull;
+        diag.head_words = static_cast<uint32_t>((std::min)(job.copy.copied, uint64_t{64}) / 4u);
+        for (uint64_t w = 0u; w < job.copy.copied / 4u; ++w) {
+          uint32_t word = 0u;
+          std::memcpy(&word, raw + 4u * w, sizeof(word));
+          if (word != kPoolPoisonWord) continue;
+          diag.sentinel_words += 1u;
+          if (w < diag.head_words) diag.sentinel_head += 1u;
+        }
+      }
       if (job.copy.phase == PoolMeshPhase::Indices) {
         job.error = DecodePoolMeshIndices(data, job.copy.size, job.index_size, job.index_count, job.vertex_offset,
                                           job.stride, &job.indices, &job.min_vertex, &job.max_vertex,
@@ -3636,6 +3761,13 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       }
     }
     device->unmap_buffer_region(mesh_buffer);
+    void* poison_mapped = nullptr;
+    if (poison && device->map_buffer_region(mesh_buffer, 0u, kPoolMeshSlotBytes, reshade::api::map_access::write_only,
+                                            &poison_mapped)
+        && poison_mapped != nullptr) {
+      std::fill_n(static_cast<uint32_t*>(poison_mapped), kPoolMeshSlotBytes / sizeof(uint32_t), kPoolPoisonWord);
+      device->unmap_buffer_region(mesh_buffer);
+    }
   }
 
   stage.Set("present: resolve (apply)");
@@ -3648,6 +3780,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolStagingSlot& slot = g_pool.slots[slot_index];
     slot.resolving = false;
+    const uint64_t cycle = ++g_pool.residue_cycle[slot_index];
     slot.used = 0u;
     slot.follow_used = 0u;
     slot.mesh_used = 0u;
@@ -3662,8 +3795,10 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       const bool current = job.queued && request != g_pool.mesh_requests.end()
                            && request->second.serial == job.copy.serial;
       const char* outcome = nullptr;
+      if (job.staging.poisoned) ClassifyPoolStagingHead(job.staging, job.copy.mesh_key, cycle);
       if (current && meshes_ok) {
         PoolMeshRequest& read = request->second;
+        read.staging = job.staging;
         if (job.copy.phase == PoolMeshPhase::Indices) {
           read.min_vertex = job.min_vertex;
           read.max_vertex = job.max_vertex;
@@ -4512,6 +4647,18 @@ inline void WritePoolVisibilitySummary(
   out << "\n  ]},\n";
 }
 
+// poison_staging diagnostics of one read (world_pool.json "staging").
+inline void WritePoolStagingDiag(std::ostream& out, const PoolStagingDiag& diag) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  out << "{\"slot\": " << diag.slot << ", \"ordinal\": " << diag.ordinal << ", \"staging_offset\": " << diag.staging_offset
+      << ", \"copied\": " << diag.copied << ", \"begin_mod16\": " << diag.begin_mod16
+      << ", \"sentinel_words\": " << diag.sentinel_words << ", \"sentinel_head\": " << diag.sentinel_head
+      << ", \"head_words\": " << diag.head_words << ", \"head_hash\": \"" << renodx::utils::log::AsHex(diag.head_hash)
+      << "\", \"head_class\": \"" << diag.head_class << "\", \"head\": \"";
+  for (uint32_t k = 0; k < diag.head_bytes; ++k) out << kHex[diag.head[k] >> 4] << kHex[diag.head[k] & 15u];
+  out << "\"}";
+}
+
 // world_pool.json: the captures of a mesh, oldest first.
 inline void WritePoolCaptureRecords(std::ostream& out, const std::vector<PoolCaptureRecord>& records) {
   out << "[";
@@ -4537,9 +4684,24 @@ inline void WritePoolCaptureRecords(std::ostream& out, const std::vector<PoolCap
     for (size_t k = 0; k < 9u; ++k) out << (k != 0u ? ", " : "") << record.before[k];
     out << "], \"after\": [";
     for (size_t k = 0; k < 9u; ++k) out << (k != 0u ? ", " : "") << record.after[k];
-    out << "]}";
+    out << "]";
+    if (record.staging.poisoned) {
+      out << ", \"staging\": ";
+      WritePoolStagingDiag(out, record.staging);
+    }
+    out << "}";
   }
   out << "]";
+}
+
+// Quotes and backslashes escaped, control characters dropped (JSON string body).
+inline std::string PoolJsonEscape(const std::string& text) {
+  std::string escaped;
+  for (const char c : text) {
+    if (c == '"' || c == '\\') escaped.push_back('\\');
+    if (static_cast<unsigned char>(c) >= 0x20u) escaped.push_back(c);
+  }
+  return escaped;
 }
 
 inline void DumpWorldPool() {
@@ -4555,6 +4717,7 @@ inline void DumpWorldPool() {
   std::vector<uint32_t> last_seen;  // per instance (PoolInstanceLastSeen)
   std::unordered_map<uint64_t, PoolMeshRetry> mesh_retry;
   PoolRegion region;
+  PoolInspectRecord inspect;
   const PoolCameraInfo camera = GetPoolCameraInfo();
   bool scene_fade = false;
   float near_fade_floor = 0.f;
@@ -4585,6 +4748,7 @@ inline void DumpWorldPool() {
     motion_detail = g_pool.motion_detail;
     dynamic = SnapshotPoolDynamic();
     region = CurrentPoolRegion();
+    inspect = g_pool.inspect;
   }
 
   struct FamilyBounds {
@@ -4610,10 +4774,14 @@ inline void DumpWorldPool() {
     }
   }
 
+  const uint32_t frame = g_state.frame.load();
   std::ostringstream out;
   out << "{\n";
-  out << "  \"schema\": 13,\n";
-  out << "  \"generated_frame\": " << g_state.frame.load() << ",\n";
+  out << "  \"schema\": 14,\n";
+  out << "  \"generated_frame\": " << frame << ",\n";
+  out << "  \"files\": {\"summary\": \"world_pool.json\", \"meshes\": \"world_pool_meshes.json\", \"instances\": \"world_pool_instances.json\"},\n";
+  out << "  \"meshes_total\": " << meshes.size() << ", \"instances_total\": " << instances.size()
+      << ", \"instances_written\": " << (std::min)(instances.size(), kPoolDumpMaxInstances) << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
@@ -4623,7 +4791,8 @@ inline void DumpWorldPool() {
       << ", \"verify_meshes\": " << (g_pool.verify_meshes.load() ? "true" : "false")
       << ", \"legacy_scale\": " << (g_pool.legacy_scale.load() ? "true" : "false")
       << ", \"exclude_moving\": " << (g_pool.exclude_moving.load() ? "true" : "false")
-      << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false") << "},\n";
+      << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false")
+      << ", \"retry_unstable\": " << (g_pool.retry_unstable.load() ? "true" : "false") << "},\n";
   out << "  \"follow\": {\"hits\": " << g_pool.stats.follow_hits << ", \"admits\": " << g_pool.stats.follow_admits
       << ", \"misses_skipped\": " << g_pool.stats.follow_misses_skipped
       << ", \"rejected_bounds\": " << g_pool.stats.follow_rejected_bounds
@@ -4713,6 +4882,7 @@ inline void DumpWorldPool() {
       << ", \"mesh_capture_mismatches\": " << stats.mesh_capture_mismatches
       << ", \"mesh_unstable\": " << stats.mesh_unstable
       << ", \"mesh_retries\": " << stats.mesh_retries
+      << ", \"meshes_admitted_by_retry\": " << stats.meshes_admitted_by_retry
       << ", \"tracked_buffer_writes\": " << stats.tracked_buffer_writes
       << ", \"write_events\": {\"update\": " << g_pool.write_events.update.load(std::memory_order_relaxed)
       << ", \"update_cmd\": " << g_pool.write_events.update_cmd.load(std::memory_order_relaxed)
@@ -4735,14 +4905,7 @@ inline void DumpWorldPool() {
       << ", \"scan_first_frame\": " << stats.scan_first_frame
       << ", \"scan_last_frame\": " << stats.scan_last_frame
       << ", \"indirect_dropped_calls\": " << IndirectDroppedCalls() << "},\n";
-  {
-    std::string escaped;
-    for (const char c : stats.last_mesh_error) {
-      if (c == '"' || c == '\\') escaped.push_back('\\');
-      if (static_cast<unsigned char>(c) >= 0x20u) escaped.push_back(c);
-    }
-    out << "  \"last_mesh_error\": \"" << escaped << "\",\n";
-  }
+  out << "  \"last_mesh_error\": \"" << PoolJsonEscape(stats.last_mesh_error) << "\",\n";
 
   out << "  \"vertex_shaders\": [";
   for (size_t i = 0; i < registry_entries.vertex.size(); ++i) {
@@ -4856,12 +5019,13 @@ inline void DumpWorldPool() {
   WritePoolVisibilitySummary(out, instances, visibility, meshes, camera, region, scene_fade ? near_fade_floor : 0.f,
                              stats.visibility_changes);
 
-  out << "  \"meshes\": [";
+  std::ostringstream meshes_out;
+  meshes_out << "{\n  \"schema\": 14,\n  \"generated_frame\": " << frame << ",\n  \"meshes\": [";
   first = true;
   for (const auto& mesh : meshes) {
-    if (!first) out << ",";
+    if (!first) meshes_out << ",";
     first = false;
-    out << "\n    {\"mesh_id\": " << mesh.mesh_id
+    meshes_out << "\n    {\"mesh_id\": " << mesh.mesh_id
         << ", \"vs_hash\": \"" << PoolHashText(mesh.source_vs_hash) << "\""
         << ", \"vertices\": " << mesh.positions.size()
         << ", \"triangles\": " << mesh.triangle_count
@@ -4886,15 +5050,20 @@ inline void DumpWorldPool() {
         << ", \"source_ib\": \"" << renodx::utils::log::AsHex(mesh.source_ib) << "\""
         << ", \"signature\": \"" << renodx::utils::log::AsHex(mesh.signature) << "\"}";
   }
-  out << "\n  ],\n";
+  meshes_out << "\n  ]\n}\n";
 
-  out << "  \"instances\": [";
+  std::ostringstream instances_out;
+  instances_out << "{\n  \"schema\": 14,\n  \"generated_frame\": " << frame << ",\n  \"instances\": [";
   first = true;
   for (size_t i = 0; i < instances.size() && i < kPoolDumpMaxInstances; ++i) {
     const WorldInstance& instance = instances[i];
-    if (!first) out << ",";
+    const PoolCameraVisibility& seen = visibility[i];
+    const float* m = instance.matrix;
+    float scale[3] = {};
+    for (int k = 0; k < 3; ++k) scale[k] = std::sqrt(m[k] * m[k] + m[4 + k] * m[4 + k] + m[8 + k] * m[8 + k]);
+    if (!first) instances_out << ",";
     first = false;
-    out << "\n    {\"id\": " << instance.id << ", \"mesh_id\": " << instance.mesh_id
+    instances_out << "\n    {\"id\": " << instance.id << ", \"mesh_id\": " << instance.mesh_id
         << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(instance.mesh_key) << "\""
         << ", \"vs_hash\": \"" << PoolHashText(instance.source_vs_hash) << "\""
         << ", \"admit_frame\": " << instance.admit_frame
@@ -4903,9 +5072,14 @@ inline void DumpWorldPool() {
         << ", \"last_follow_frame\": " << instance.last_follow_frame
         << ", \"origin\": [" << instance.matrix[3] << ", " << instance.matrix[7] << ", " << instance.matrix[11] << "]"
         << ", \"bounds_min\": [" << instance.bounds_min[0] << ", " << instance.bounds_min[1] << ", " << instance.bounds_min[2] << "]"
-        << ", \"bounds_max\": [" << instance.bounds_max[0] << ", " << instance.bounds_max[1] << ", " << instance.bounds_max[2] << "]}";
+        << ", \"bounds_max\": [" << instance.bounds_max[0] << ", " << instance.bounds_max[1] << ", " << instance.bounds_max[2] << "]"
+        << ", \"mesh_uid\": " << (instance.mesh_id < meshes.size() ? meshes[instance.mesh_id].uid : 0u)
+        << ", \"camera_seen\": " << (seen.camera_seen ? "true" : "false")
+        << ", \"light_seen\": " << (seen.light_seen ? "true" : "false")
+        << ", \"near_fade\": " << (seen.near_fade ? "true" : "false")
+        << ", \"scale\": [" << scale[0] << ", " << scale[1] << ", " << scale[2] << "]}";
   }
-  out << "\n  ],\n";
+  instances_out << "\n  ]\n}\n";
 
   out << "  \"mesh_failed\": [";
   first = true;
@@ -4942,6 +5116,10 @@ inline void DumpWorldPool() {
     out << "], \"raw_hash\": \"" << renodx::utils::log::AsHex(failure.raw_hash) << "\""
         << ", \"history\": ";
     WritePoolCaptureRecords(out, failure.history);
+    if (failure.staging.poisoned) {
+      out << ", \"staging\": ";
+      WritePoolStagingDiag(out, failure.staging);
+    }
     out << "}";
   }
   out << "\n  ],\n";
@@ -4975,11 +5153,24 @@ inline void DumpWorldPool() {
   for (const auto& [key, retry] : mesh_retry) {
     if (!first) out << ",";
     first = false;
-    out << "\n    {\"key\": " << key << ", \"rounds\": " << retry.rounds << ", \"next_frame\": " << retry.next_frame << "}";
+    out << "\n    {\"key\": \"" << renodx::utils::log::AsHex(key) << "\", \"rounds\": " << retry.rounds
+        << ", \"next_frame\": " << retry.next_frame << "}";
   }
-  out << "\n  ]\n}\n";
+  out << "\n  ],\n";
+  out << "  \"inspect\": {\"set\": " << (inspect.set ? "true" : "false") << ", \"frame\": " << inspect.frame
+      << ", \"hit\": " << (inspect.hit ? "true" : "false") << ", \"instance_id\": " << inspect.instance_id
+      << ", \"mesh_uid\": " << inspect.mesh_uid << ", \"lines\": [";
+  for (size_t i = 0; i < inspect.lines.size(); ++i) {
+    out << (i != 0u ? ", " : "") << "\"" << PoolJsonEscape(inspect.lines[i]) << "\"";
+  }
+  out << "]}\n}\n";
 
+  // Detail files first, the summary last: a summary read finds its detail files written.
+  std::string meshes_text = meshes_out.str();
+  std::string instances_text = instances_out.str();
   std::string text = out.str();
+  renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool_meshes.json", meshes_text);
+  renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool_instances.json", instances_text);
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool.json", text);
 }
 

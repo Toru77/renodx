@@ -149,6 +149,14 @@ inline void RunBvhDebugPass(
     } else {
       DescribeLiveInspect(data);
     }
+    // Kept for world_pool.json ("inspect"); the hit's ids are known for static instances only.
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    const bool known = data->inspect.valid && data->inspect.hit && (data->inspect.instance & kDynamicInstanceFlag) == 0u
+                       && data->inspect.instance < data->tlas_info.size();
+    g_pool.inspect = PoolInspectRecord{.set = true, .frame = g_state.frame.load(), .hit = data->inspect.valid && data->inspect.hit,
+                                       .instance_id = known ? data->tlas_info[data->inspect.instance].id : 0u,
+                                       .mesh_uid = known ? data->tlas_info[data->inspect.instance].uid : 0u,
+                                       .lines = data->inspect.lines};
   }
 
   renodx::utils::render::RenderPass pass;

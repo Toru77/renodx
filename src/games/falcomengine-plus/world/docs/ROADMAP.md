@@ -191,3 +191,11 @@ Pool admission no longer uses Auto Research verdicts, recipes or hash lists.
 - Dump schema 9: `motion.rule_stale`, `rule_stale_samples`; `dynamic.moving_keys`, `dynamic.released`; per key `moving_now`, `released`. Panel: "Moving objects" line shows keys moving now; the rule line is informational.
 - Harness test_motion: expectations moved to `rule_stale` / `rule_stale_samples`; test 9 now expects the release and the stopped pose admitted after the hold; test 10 expects a released key not re-flagged by the switch; new tests 15-18 (identity over 150 frames, two instances under one key, shared mesh held by a moving key, release then re-arm and second release, ApplyPoolDynamicKey guard, dump fields).
 - Not verified in this round: the harness run and the Windows addon compile (see the round report).
+
+## Round: diagnostics (2026-10-08)
+
+- M0: `retry_unstable` switch (default OFF) decides whether unstable mesh captures get the c86553b5 retry rounds. Test: test_verify cases 5 (on), 5b (on, admitted after a retry), 5c (off, rejected on the first round).
+- M1: dump split into `world_pool.json` / `world_pool_meshes.json` / `world_pool_instances.json`, schema 14, same `generated_frame`; the inspect result is in the summary.
+- M2: `poison_staging` switch (default OFF): poisoned, cpu-visible mesh staging with per-read head forensics and a 2-cycle residue table per slot.
+- M3: `world_deform_live.json` (identity gaps, presence counters, 64-event dropout ring).
+- M4/M5 not started (they need the in-game data from this round).

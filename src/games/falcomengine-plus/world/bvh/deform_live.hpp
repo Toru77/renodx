@@ -62,6 +62,8 @@ inline constexpr uint32_t kDynamicTopologySlots = 3u;  // read back two presents
 inline constexpr uint64_t kDynamicTopologySlotBytes = 4ull * 1024ull * 1024ull;
 inline constexpr uint32_t kDynamicMaxDepth = 64u;      // trace stack size and refit levels
 inline constexpr uint32_t kDynamicRetireFrames = 600u;
+inline constexpr uint32_t kDynamicWarmupFrames = 600u;  // identities created later than this after the first count as new (diagnostic)
+inline constexpr size_t kDynamicDropoutRing = 64u;      // dropout events kept (world_deform_live.json)
 inline constexpr uint64_t kDynamicResetGarbageBytes = 8ull * 1024ull * 1024ull;
 inline constexpr uint64_t kDynamicArenaMinBytes = 256ull * 1024ull;  // first size of a BLAS arena
 inline constexpr uint32_t kDynamicRefitGroupSize = 64u;  // world_bvh_refit numthreads
@@ -278,6 +280,10 @@ struct DynamicIdentity {
   uint32_t index_count = 0u;
   uint32_t instance_count = 0u;
   uint32_t first_instance = 0u;
+  // Presence (diagnostic): gaps between captures, frames captured but not traced.
+  uint32_t gaps = 0u;
+  uint32_t max_gap = 0u;  // frames
+  uint32_t pending_frames = 0u;
 };
 
 struct DynamicCapture {
@@ -325,6 +331,15 @@ struct DynamicObjectInfo {
   float bbox_max[3] = {};
 };
 
+// An identity traced at the previous present and not traced at this one (world_deform_live.json).
+struct DynamicDropout {
+  uint32_t frame = 0u;
+  uint64_t key = 0u;
+  uint32_t vs_hash = 0u;
+  uint32_t triangles = 0u;
+  std::array<uint64_t, static_cast<size_t>(DynamicSkip::Count)> skips = {};  // skips since the previous present
+};
+
 struct DeformLiveStats {
   uint32_t frame_captures = 0u;   // last present
   uint32_t frame_objects = 0u;    // traced at the last present
@@ -346,6 +361,12 @@ struct DeformLiveStats {
   uint64_t garbage_bytes = 0u;
   uint64_t used_bytes = 0u;
   std::array<uint64_t, static_cast<size_t>(DynamicSkip::Count)> skips = {};
+  uint32_t presents_no_objects = 0u;  // presents without a traced object after one with objects
+  uint32_t calls_max_per_frame = 0u;  // UpdateDeformLive calls in one game frame (largest)
+  uint32_t new_identities = 0u;
+  uint32_t new_after_warmup = 0u;     // created more than kDynamicWarmupFrames after the first
+  uint32_t resets_with_objects = 0u;
+  uint64_t reset_objects_dropped = 0u;  // traced objects dropped by BLAS store resets
   std::string last_failure;
 };
 
@@ -386,6 +407,12 @@ struct DeformLiveState {
   std::atomic_uint64_t cpu_us{0u};  // CPU time of OnDeformCaptureDraw and UpdateDeformLive (PoolCpuTimer)
   std::atomic_uint64_t cpu_frame_us{0u};  // cpu_us of the last frame (moved by UpdateDeformLive)
   uint32_t log_lines = 0u;          // identity and store reset lines written (kPoolLifecycleLogLines)
+  uint32_t warm_frame = 0u;   // frame of the first identity
+  bool last_objects = false;  // the previous present traced objects
+  std::array<uint64_t, static_cast<size_t>(DynamicSkip::Count)> skips_last = {};  // stats.skips at the previous present
+  uint32_t calls_frame = 0u;  // game frame of the last UpdateDeformLive call
+  uint32_t calls_in_frame = 0u;
+  std::vector<DynamicDropout> dropouts;  // last kDynamicDropoutRing
   DeformLiveStats stats;
 };
 
@@ -982,6 +1009,12 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   if (cmd_list == nullptr) return;
   PoolStageScope stage("present: deform live");
   const uint32_t frame = g_state.frame.load();
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    g_deform_live.calls_in_frame = frame == g_deform_live.calls_frame ? g_deform_live.calls_in_frame + 1u : 1u;
+    g_deform_live.calls_frame = frame;
+    g_deform_live.stats.calls_max_per_frame = (std::max)(g_deform_live.stats.calls_max_per_frame, g_deform_live.calls_in_frame);
+  }
 
   std::vector<uint64_t> retired;
   bool need_resources = false;
@@ -1054,6 +1087,9 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
         DynamicIdentity& identity = state.identities[capture.key];
         if (identity.captures == 0u) {
           if (state.retired_keys.erase(capture.key) != 0u) state.stats.recreated += 1u;
+          if (state.stats.new_identities == 0u) state.warm_frame = frame;
+          state.stats.new_identities += 1u;
+          if (frame - state.warm_frame > kDynamicWarmupFrames) state.stats.new_after_warmup += 1u;
           identity.vs_pipeline = capture.vs_pipeline;
           identity.vs_hash = capture.vs_hash;
           identity.triangles = capture.triangles;
@@ -1075,6 +1111,10 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
                 capture.ib_offset, ", ", capture.index_count, " indices, ", capture.instance_count,
                 " instances from ", capture.first_instance));
           }
+        }
+        if (identity.captures != 0u && frame - identity.last_frame > 1u) {
+          identity.gaps += 1u;
+          identity.max_gap = (std::max)(identity.max_gap, frame - identity.last_frame - 1u);
         }
         identity.captures += 1u;
         identity.last_frame = frame;
@@ -1104,6 +1144,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
           info.push_back(entry);
           continue;
         }
+        identity.pending_frames += 1u;
         if (identity.failed || identity.topology_pending) continue;
         const uint64_t size = static_cast<uint64_t>(capture.triangles) * 3u * kDynamicVertexBytes;
         const uint64_t dest = (slot.used + 15u) & ~uint64_t{15};
@@ -1150,9 +1191,29 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
                                                                  ": BLAS store reset, ", state.identities.size(),
                                                                  " identities rebuilt"));
       }
+      if (!objects.empty()) state.stats.resets_with_objects += 1u;
+      state.stats.reset_objects_dropped += objects.size();
       objects.clear();
       info.clear();
     }
+    // Presence (diagnostic): presents without objects after presents with objects, and identities that dropped out.
+    const bool traced = !info.empty();
+    if (!traced && state.last_objects) state.stats.presents_no_objects += 1u;
+    state.last_objects = traced;
+    for (const DynamicObjectInfo& previous : state.object_info) {
+      const bool still = std::any_of(info.begin(), info.end(),
+                                     [&previous](const DynamicObjectInfo& now) { return now.key == previous.key; });
+      if (still) continue;
+      DynamicDropout dropout;
+      dropout.frame = frame;
+      dropout.key = previous.key;
+      dropout.vs_hash = previous.vs_hash;
+      dropout.triangles = previous.triangles;
+      for (size_t k = 0; k < dropout.skips.size(); ++k) dropout.skips[k] = state.stats.skips[k] - state.skips_last[k];
+      state.dropouts.push_back(dropout);
+      if (state.dropouts.size() > kDynamicDropoutRing) state.dropouts.erase(state.dropouts.begin());
+    }
+    state.skips_last = state.stats.skips;
     uint32_t resident = 0u;
     uint32_t failed = 0u;
     for (const auto& [key, identity] : state.identities) {
@@ -1192,6 +1253,67 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   std::lock_guard<std::mutex> lock(g_deform_live.mutex);
   g_deform_live.object_count = g_deform_live.refit_pipeline.handle != 0u ? object_count : 0u;
   g_deform_live.object_info = std::move(info);
+}
+
+// Presence diagnostics of the deforming meshes (world_deform_live.json, written with world_pool.json).
+inline void DumpDeformLive() {
+  std::vector<std::pair<uint64_t, DynamicIdentity>> identities;
+  std::vector<DynamicDropout> dropouts;
+  DeformLiveStats stats;
+  uint32_t warm_frame = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    identities.assign(g_deform_live.identities.begin(), g_deform_live.identities.end());
+    dropouts = g_deform_live.dropouts;
+    stats = g_deform_live.stats;
+    warm_frame = g_deform_live.warm_frame;
+  }
+  std::ostringstream out;
+  out << "{\n  \"schema\": 1,\n  \"generated_frame\": " << g_state.frame.load() << ",\n";
+  out << "  \"stats\": {\"captures\": " << stats.captures << ", \"identities\": " << stats.identities
+      << ", \"resident\": " << stats.resident << ", \"failed\": " << stats.failed << ", \"retired\": " << stats.retired
+      << ", \"recreated\": " << stats.recreated << ", \"resets\": " << stats.resets
+      << ", \"resets_with_objects\": " << stats.resets_with_objects
+      << ", \"reset_objects_dropped\": " << stats.reset_objects_dropped
+      << ", \"presents_no_objects\": " << stats.presents_no_objects
+      << ", \"calls_max_per_frame\": " << stats.calls_max_per_frame << ", \"new_identities\": " << stats.new_identities
+      << ", \"new_after_warmup\": " << stats.new_after_warmup << ", \"warm_frame\": " << warm_frame
+      << ", \"warmup_frames\": " << kDynamicWarmupFrames << ", \"skips\": {";
+  bool first = true;
+  for (size_t i = 1; i < stats.skips.size(); ++i) {
+    if (stats.skips[i] == 0u) continue;
+    out << (first ? "" : ", ") << "\"" << DynamicSkipName(static_cast<DynamicSkip>(i)) << "\": " << stats.skips[i];
+    first = false;
+  }
+  out << "}},\n  \"identities\": [";
+  first = true;
+  for (const auto& [key, identity] : identities) {
+    out << (first ? "" : ",") << "\n    {\"key\": \"" << renodx::utils::log::AsHex(key) << "\", \"vs_hash\": \""
+        << PoolHashText(identity.vs_hash) << "\", \"triangles\": " << identity.triangles
+        << ", \"first_frame\": " << identity.first_frame << ", \"last_frame\": " << identity.last_frame
+        << ", \"captures\": " << identity.captures << ", \"resident\": " << (identity.resident ? "true" : "false")
+        << ", \"failed\": " << (identity.failed ? "true" : "false") << ", \"gaps\": " << identity.gaps
+        << ", \"max_gap\": " << identity.max_gap << ", \"pending_frames\": " << identity.pending_frames << "}";
+    first = false;
+  }
+  out << "\n  ],\n  \"dropouts\": [";
+  first = true;
+  for (const DynamicDropout& dropout : dropouts) {
+    out << (first ? "" : ",") << "\n    {\"frame\": " << dropout.frame << ", \"key\": \""
+        << renodx::utils::log::AsHex(dropout.key) << "\", \"vs_hash\": \"" << PoolHashText(dropout.vs_hash)
+        << "\", \"triangles\": " << dropout.triangles << ", \"skips\": {";
+    bool first_skip = true;
+    for (size_t i = 1; i < dropout.skips.size(); ++i) {
+      if (dropout.skips[i] == 0u) continue;
+      out << (first_skip ? "" : ", ") << "\"" << DynamicSkipName(static_cast<DynamicSkip>(i)) << "\": " << dropout.skips[i];
+      first_skip = false;
+    }
+    out << "}}";
+    first = false;
+  }
+  out << "\n  ]\n}\n";
+  std::string text = out.str();
+  renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_deform_live.json", text);
 }
 
 // Inspect lines for a hit on a dynamic object (trace hit.instance with kDynamicInstanceFlag).

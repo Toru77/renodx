@@ -335,14 +335,16 @@ int main() {
   {
     std::ifstream f(bvh::PoolOutputDir() / "world_pool.json");
     const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
+    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
     CHECK(text.find("\"scene\": {\"fade_constants\": true") != std::string::npos, "scene constants");
     CHECK(text.find("\"visibility\": {\"instances\": 7, \"camera_visible\": 5, \"shadow_only\": 2") != std::string::npos
               && text.find("\"with_inputs\": 7") != std::string::npos, "visibility summary");
     CHECK(text.find("\"view\": \"light\"") != std::string::npos && text.find("\"view\": \"camera\"") != std::string::npos, "VS views in the dump");
     CHECK(text.find("\"visibility_changes\": ") != std::string::npos && text.find("nan") == std::string::npos, "visibility changes, no nan");
     CHECK(text.find("\"near_fade\": true") != std::string::npos, "pixel shader near_fade flag");
-    CHECK(text.find("\"near_fade_draws\"") != std::string::npos, "mesh near-fade draws");
+    std::ifstream meshes_f(bvh::PoolOutputDir() / "world_pool_meshes.json");
+    const std::string meshes_text((std::istreambuf_iterator<char>(meshes_f)), std::istreambuf_iterator<char>());
+    CHECK(meshes_text.find("\"near_fade_draws\"") != std::string::npos, "mesh near-fade draws");
     CHECK(text.find("\"changed_since_admission\": 1") != std::string::npos, "changed since admission");
     CHECK(text.find("\"hidden_at_camera\": 1") != std::string::npos, "A hidden from a camera 8 m away");
     CHECK(text.find("\"reason\": \"shadow-only\"") != std::string::npos && text.find("\"reason\": \"near fade\"") != std::string::npos, "samples");

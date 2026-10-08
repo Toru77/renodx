@@ -480,6 +480,26 @@ int main() {
   present();
   check_frame("after retirement");
 
+  HStage("8. World deform presence dump: identities with gaps, the stats and the dropout ring.");
+  // 8. World deform presence dump: identities with gaps, the stats and the dropout ring.
+  bvh::DumpDeformLive();
+  {
+    size_t identities = 0u;
+    {
+      std::lock_guard<std::mutex> lock(bvh::g_deform_live.mutex);
+      identities = bvh::g_deform_live.identities.size();
+    }
+    CHECK(identities > 0u, "identities exist for the dump (%zu)", identities);
+    std::ifstream f(bvh::PoolOutputDir() / "world_deform_live.json");
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    CHECK(text.find("\"schema\": 1") != std::string::npos && text.find("\"presents_no_objects\": ") != std::string::npos
+              && text.find("\"new_after_warmup\": ") != std::string::npos && text.find("\"dropouts\": [") != std::string::npos,
+          "deform presence dump has schema, stats and dropouts");
+    CHECK(text.find("\"identities\": [\n    {\"key\": ") != std::string::npos && text.find("\"gaps\": ") != std::string::npos
+              && text.find("\"max_gap\": ") != std::string::npos && text.find("\"pending_frames\": ") != std::string::npos,
+          "deform presence dump: identities with gaps, max_gap and pending_frames");
+  }
+
   HStage("7. Shader destroyed; off releases everything.");
   // 7. Shader destroyed; off releases everything.
   bvh::OnDestroyPipelineDeformLive(&dev, pipeline{kSkinB});

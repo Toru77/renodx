@@ -324,7 +324,7 @@ int main() {
     CHECK(m.moved > 0u && m.repeat > 0u && m.moved_repeat == 0u, "moved and stopped");
     CHECK(s.admitted == 2u, "admitted at both stops (%zu)", s.admitted);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
+    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
     CHECK(text.find("\"admitted_of_moved_meshes\": 2") != std::string::npos, "ghost count in dump");
     CHECK(text.find("\"vs_hash\": \"0x00001000\", \"admitted\": 2}") != std::string::npos
               || text.find("\"admitted\": 2}") != std::string::npos, "moved mesh listed with 2 admitted");
@@ -640,7 +640,7 @@ int main() {
       for (const auto& mesh : bvh::g_pool.meshes) CHECK(!mesh.dynamic, "ApplyPoolDynamicKey does not flag a released key");
     }
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
+    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
     CHECK(text.find("\"rule_stale\": ") != std::string::npos && text.find("\"rule_stale_samples\": ") != std::string::npos,
           "rule_stale fields");
     CHECK(text.find("\"moving_keys\": 0, \"released\": 2") != std::string::npos
@@ -1113,7 +1113,7 @@ int main() {
     }});
     run(120);
     const std::string text = read_dump();
-    CHECK(text.find("\"schema\": 13") != std::string::npos, "dump: schema 13");
+    CHECK(text.find("\"schema\": 14") != std::string::npos, "dump: schema 14");
     CHECK(text.find("\"follow_moving\": true") != std::string::npos && text.find("\"follow\": {\"hits\"") != std::string::npos,
           "dump: follow object and switch");
     CHECK(text.find("\"follows\": ") != std::string::npos, "dump: per key follows");

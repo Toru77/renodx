@@ -195,6 +195,26 @@ inline void DrawBvhPanel() {
                         "draw-time capture rework) instead of 0.001-10000. For an A/B test: reset the pool\n"
                         "after changing.");
     }
+    bool poison_staging = g_pool.poison_staging.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Poison mesh staging (diagnostic)", &poison_staging)) {
+      g_pool.poison_staging.store(poison_staging, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Mesh staging is cpu-visible and filled with a poison word after each read; each mesh\n"
+                        "copy then records its head bytes and where they came from (ReShade.log \"staging:\" and\n"
+                        "world_pool.json). Diagnostic only: reset the pool after changing.");
+    }
+    bool retry_unstable = g_pool.retry_unstable.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Retry unstable meshes (diagnostic)", &retry_unstable)) {
+      g_pool.retry_unstable.store(retry_unstable, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Off (default): a mesh whose captures never repeat is rejected at once.\n"
+                        "On: it is captured again up to 3 times, 180 frames apart. Applies to captures\n"
+                        "from now on: reset the pool after changing.");
+    }
     bool exclude_moving = g_pool.exclude_moving.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Keep moving objects out of the static BVH", &exclude_moving)) {
       g_pool.exclude_moving.store(exclude_moving, std::memory_order_relaxed);
@@ -266,7 +286,10 @@ inline void DrawBvhPanel() {
     }
   }
   if (switches_changed) LogPoolSwitches();
-  if (do_dump) DumpWorldPool();
+  if (do_dump) {
+    DumpWorldPool();
+    DumpDeformLive();
+  }
   if (do_dump_obj) DumpWorldPoolObj();
   if (do_reset) ResetWorldPool();
 
@@ -287,8 +310,9 @@ inline void DrawBvhPanel() {
   }
 
   if (stats.mesh_failures != 0u) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.4f, 0.4f, 1.f));
-  ImGui::Text("Meshes: %llu ok, %llu failed (%u unstable), %llu waiting, %llu retrying",
-              static_cast<unsigned long long>(stats.meshes), static_cast<unsigned long long>(stats.mesh_failures),
+  ImGui::Text("Meshes: %llu ok (%u admitted after a retry), %llu failed (%u unstable), %llu waiting, %llu retrying",
+              static_cast<unsigned long long>(stats.meshes), stats.meshes_admitted_by_retry,
+              static_cast<unsigned long long>(stats.mesh_failures),
               stats.mesh_unstable, static_cast<unsigned long long>(stats.mesh_queue), static_cast<unsigned long long>(stats.mesh_retry));
   if (stats.mesh_failures != 0u) ImGui::PopStyleColor();
   ImGui::Text("Instances: %llu admitted, %llu in region, following %llu, orphans retired %llu",

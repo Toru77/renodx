@@ -1,8 +1,9 @@
-﻿// Native harness: mesh capture verification (round 12) and the legacy
+// Native harness: mesh capture verification (round 12) and the legacy
 // instance scale switch. A mesh enters the pool only after two captures in a
 // row decode to the same mesh; buffer contents the pool cannot see change
 // (GPU writes) are simulated by editing the mock buffers between frames.
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -198,6 +199,7 @@ int main() {
   HStage("1. Defaults.");
   // 1. Defaults.
   CHECK(bvh::g_pool.verify_meshes.load() && !bvh::g_pool.legacy_scale.load(), "defaults: verify on, legacy scale off");
+  CHECK(!bvh::g_pool.retry_unstable.load(), "defaults: retry off");
 
   HStage("2. A stable mesh takes two identical captures: two index and two vertex");
   // 2. A stable mesh takes two identical captures: two index and two vertex
@@ -285,6 +287,7 @@ int main() {
   // frames apart; the last round rejects the mesh and its instances never admit.
   {
     fresh();
+    bvh::g_pool.retry_unstable.store(true);
     const resource vb = make_vb(4.f);
     objects.push_back({vb.handle, 2});
     float sx = 4.f;
@@ -316,6 +319,7 @@ int main() {
   // 5b. Contents change during the first round only: the next round is stable and admits.
   {
     fresh();
+    bvh::g_pool.retry_unstable.store(true);
     const resource vb = make_vb(4.f);
     objects.push_back({vb.handle, 2});
     float sx = 4.f;
@@ -328,6 +332,30 @@ int main() {
     const auto s = snapshot();
     CHECK(s.mesh_retries == 1u && s.mesh_unstable == 0u && s.mesh_failures == 0u && s.admitted == 2u,
           "one retry, not rejected (retries %u, unstable %u, admitted %zu)", s.mesh_retries, s.mesh_unstable, s.admitted);
+    CHECK(s.meshes_admitted_by_retry == 1u, "admitted after a retry: %u", s.meshes_admitted_by_retry);
+  }
+
+  HStage("5c. Retry off (default): unstable contents are rejected on the first round.");
+  // 5c. Retry off (default): unstable contents are rejected on the first round.
+  {
+    fresh();
+    bvh::g_pool.retry_unstable.store(false);
+    const resource vb = make_vb(4.f);
+    objects.push_back({vb.handle, 2});
+    float sx = 4.f;
+    for (int i = 0; i < 1500 && snapshot().mesh_unstable == 0u; ++i) {
+      sx += 0.01f;
+      fixture::WriteVertices(dev.res[vb.handle].bytes, fixture::Box(sx));
+      run_frame();
+    }
+    for (int i = 0; i < 80; ++i) run_frame();
+    const auto s = snapshot();
+    CHECK(s.mesh_unstable == 1u && s.mesh_retries == 0u && s.mesh_capture_mismatches == bvh::kPoolMeshMaxCaptures - 1u
+              && s.mesh_failures == 1u && s.meshes == 0u,
+          "rejected on the first round (unstable %u, retries %u, mismatches %u)", s.mesh_unstable, s.mesh_retries,
+          s.mesh_capture_mismatches);
+    CHECK(s.mesh_index_copies == bvh::kPoolMeshMaxCaptures && s.mesh_vertex_copies == bvh::kPoolMeshMaxCaptures,
+          "no retry copies (%llu+%llu)", (unsigned long long)s.mesh_index_copies, (unsigned long long)s.mesh_vertex_copies);
   }
 
   HStage("6. The mismatch log is capped per pool reset; counting goes on.");
@@ -346,7 +374,7 @@ int main() {
       fixture::WriteVertices(dev.res[vb.handle].bytes, fixture::Box(sx));
       run_frame();
     }
-    CHECK(snapshot().mesh_capture_mismatches == bvh::kPoolMeshMaxCaptures - 1u && CountLines("", 'w') == 0u, "capped");
+    CHECK(snapshot().mesh_capture_mismatches == bvh::kPoolMeshMaxCaptures - 1u && CountLines("differs from the previous one", 'w') == 0u, "capped");
     bvh::ResetWorldPool();
     CHECK(bvh::g_pool.mismatch_lines_logged == 0u, "reset clears the cap");
   }
@@ -419,13 +447,57 @@ int main() {
     bvh::DumpWorldPool();
     std::ifstream json(json_path);
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
-    CHECK(text.find("\"schema\": 13") != std::string::npos, "schema 13");
-    CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true}") != std::string::npos, "switches");
+    CHECK(text.find("\"schema\": 14") != std::string::npos, "schema 14");
+    CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true, \"retry_unstable\": false}") != std::string::npos, "switches");
     CHECK(text.find("\"admitted_outside_legacy_scale\": 2") != std::string::npos, "outside legacy count");
     CHECK(text.find("\"outside_legacy_scale\": 1") != std::string::npos, "family count");
     CHECK(text.find("\"mesh_verified\": 2, \"mesh_capture_mismatches\": 0, \"mesh_unstable\": 0") != std::string::npos, "stats");
-    CHECK(text.find("\"captures\": 2, \"verified\": true, \"vb\": \"default\", \"ib\": \"default\"") != std::string::npos,
+    std::ifstream meshes_json(bvh::PoolOutputDir() / "world_pool_meshes.json");
+    const std::string meshes_text((std::istreambuf_iterator<char>(meshes_json)), std::istreambuf_iterator<char>());
+    CHECK(meshes_text.find("\"captures\": 2, \"verified\": true, \"vb\": \"default\", \"ib\": \"default\"") != std::string::npos,
           "mesh entries");
+    // Dump split (schema 14): three files, balanced braces, one frame, counts that agree with the summary.
+    std::ifstream instances_json(bvh::PoolOutputDir() / "world_pool_instances.json");
+    const std::string instances_text((std::istreambuf_iterator<char>(instances_json)), std::istreambuf_iterator<char>());
+    const auto balanced = [](const std::string& t) {
+      int depth = 0;
+      bool in_string = false;
+      for (size_t i = 0; i < t.size(); ++i) {
+        const char c = t[i];
+        if (in_string) {
+          if (c == '\\') ++i;
+          else if (c == '"') in_string = false;
+        } else if (c == '"') {
+          in_string = true;
+        } else if (c == '{' || c == '[') {
+          ++depth;
+        } else if (c == '}' || c == ']') {
+          if (--depth < 0) return false;
+        }
+      }
+      return depth == 0 && !in_string;
+    };
+    const auto number_after = [](const std::string& t, const char* key) {
+      const size_t at = t.find(key);
+      return at == std::string::npos ? -1ll : std::stoll(t.substr(at + std::strlen(key)));
+    };
+    const auto count_of = [](const std::string& t, const char* needle) {
+      size_t n = 0;
+      for (size_t at = t.find(needle); at != std::string::npos; at = t.find(needle, at + 1)) ++n;
+      return n;
+    };
+    CHECK(!meshes_text.empty() && !instances_text.empty(), "three dump files written");
+    CHECK(balanced(text) && balanced(meshes_text) && balanced(instances_text), "dump files: braces balance");
+    CHECK(number_after(text, "\"generated_frame\": ") >= 0
+              && number_after(text, "\"generated_frame\": ") == number_after(meshes_text, "\"generated_frame\": ")
+              && number_after(text, "\"generated_frame\": ") == number_after(instances_text, "\"generated_frame\": "),
+          "dump files: one generated_frame");
+    CHECK(count_of(instances_text, "{\"id\": ") == static_cast<size_t>(number_after(text, "\"instances_written\": "))
+              && count_of(instances_text, "{\"id\": ") == 2u,
+          "dump files: instances written (%zu) match the summary", count_of(instances_text, "{\"id\": "));
+    CHECK(count_of(meshes_text, "{\"mesh_id\": ") == static_cast<size_t>(number_after(text, "\"meshes_total\": "))
+              && count_of(meshes_text, "{\"mesh_id\": ") == 2u,
+          "dump files: meshes match the summary");
     CHECK(text.find("\"mesh_mismatches\": 0, \"mesh_unstable\": 0") != std::string::npos, "family mesh counts");
 
     fresh();
@@ -444,6 +516,44 @@ int main() {
               && bvh::PoolOutsideLegacyScale(std::array<float, 12>{1, 0, 0, 0, 0, 50.f, 0, 0, 0, 0, 1, 0}.data()),
           "legacy bounds [0.05, 50)");
     bvh::g_pool.legacy_scale.store(false);
+  }
+
+  HStage("10b. Poisoned staging: a copy that leaves its range as poison shows sentinel words in its record.");
+  // 10b. Poisoned staging: a copy that leaves its range as poison shows sentinel words in its record.
+  {
+    fresh();
+    bvh::g_pool.poison_staging.store(true);
+    bvh::g_pool.retry_unstable.store(false);
+    const resource vb = make_vb(4.f);
+    objects.push_back({vb.handle, 2});
+    const uint32_t poison_word = bvh::kPoolPoisonWord;
+    bool wiped = false;
+    for (int i = 0; i < 40 && !wiped; ++i) {
+      run_frame();
+      for (auto& slot : bvh::g_pool.slots) {
+        if (wiped || slot.mesh_copies.empty()) continue;
+        // The copy is undone: its range keeps the poison word, as if the copy had not written it.
+        for (const bvh::PoolMeshCopy& copy : slot.mesh_copies) {
+          for (uint64_t at = copy.staging_offset; at + 4u <= copy.staging_offset + copy.copied; at += 4u) {
+            std::memcpy(dev.res[slot.mesh_buffer.handle].bytes.data() + at, &poison_word, sizeof(poison_word));
+          }
+        }
+        wiped = true;
+      }
+    }
+    CHECK(wiped, "a mesh copy was issued");
+    run_until([&] { return snapshot().mesh_failures != 0u || snapshot().meshes != 0u; }, 200);
+    bvh::g_pool.poison_staging.store(false);
+    bvh::DumpWorldPool();
+    std::ifstream json(bvh::PoolOutputDir() / "world_pool.json");
+    const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
+    const char* key = "\"sentinel_words\": ";
+    bool sentinel_nonzero = false;
+    for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + 1)) {
+      if (text[at + std::strlen(key)] != '0') sentinel_nonzero = true;
+    }
+    CHECK(sentinel_nonzero, "poisoned: a staging record has sentinel_words > 0");
+    CHECK(text.find("\"head_class\": \"sentinel\"") != std::string::npos, "poisoned: head class sentinel in the dump");
   }
 
   HStage("11. Switch log line carries the new switches.");
