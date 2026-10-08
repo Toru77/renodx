@@ -1,6 +1,0 @@
-﻿instances 517 meshes 3 indirect copied 12 resolved 12 empty 3 truncated 3 dead 0 near 2
-windows: 3 instances 32, 600 instances 512, empty 16, bad index count 32, avg 269.3
-first-time copies 4, identities 4, copied 12
-dead: indirect_dead 1 mesh copies 32->32 refs 0 dead set 0
-grow: window 32 -> 144, admitted 100
-PASS (0 failures)

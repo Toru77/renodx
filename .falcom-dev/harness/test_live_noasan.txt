@@ -1,6 +1,0 @@
-frame 1: resident 1 pending 4 tlas 2 waiting 33 reason first build
-store: 32.6 MB used 45.3 MB allocated, grows 8, mesh ms max 433.92 tlas ms max 0.31
-streamed: 300 rays, 171 hits, 0 mismatches, invalid 0 overflow 0
-check: match: meshes 5/5 equal, 5 valid trees; descriptors equal; TLAS (35 instances) equal, tree valid
-moved: tlas 4 reason region moved
-moved: 400 rays, 200 hits, 0 mismatches, invalid 0 overflow 0

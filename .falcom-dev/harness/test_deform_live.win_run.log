@@ -1,8 +1,0 @@
-﻿after topology: identities 1 resident 1 built 1 objects 1
-one object: 228 hits of 400, mismatches 0
-two objects: 211 hits of 400, mismatches 0
-  Pixel (0, 0): hit at 0.00 m, point (0.00, 0.00, 0.00).  [depth compare: match]
-  Deforming object 1 (stream output): VS 0x4A037EB5, triangle 5 of 100, captured in 6 frames since frame 7.
-  Identity 0xB2CE298D3B1832FC; topology pose bounds (20.00, 0.71, -20.00) .. (22.04, 1.30, -19.00).
-after retirement: 223 hits of 400, mismatches 0
-PASS (0 failures)

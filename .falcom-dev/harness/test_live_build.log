@@ -1,9 +1,0 @@
-﻿cmd : 'vswhere.exe' is not recognized as an internal or external command,
-At line:1 char:353
-+ ... ev\harness; cmd /c "E:\RenoDX\renodx\.falcom-dev\harness\build_win.ba ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: ('vswhere.exe' i...ternal command,:String) [], RemoteException
-    + FullyQualifiedErrorId : NativeCommandError
- 
-operable program or batch file.
-test_live.cpp

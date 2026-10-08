@@ -1,6 +1,0 @@
-﻿stable: 13 frames, copies 2+2, verified 1, mismatches 0, captures 2
-changed once: 12 frames, mismatches 1, verified 1, captures 3, bbox max x 2.50
-  falcom_world::pool: mesh 0xf7e8a4edcc90aeeb vs 0x00001000 capture 2 differs from the previous one (frames 40 -> 46) | triangles 12 -> 12, vertices 8 -> 8, differing triangles 12, first at 0, indices same, vertex range 0..7 -> 0..7 | queued by direct draw; indices copied at frame 40 by direct draw from offset 0 (mod 16: 0), vertices at frame 43 by direct draw from offset 0 (mod 16: 0) | vb 0x0000000000001a00 default stride 12 offset 0 | ib 0x0000000000001200 default first index 0 count 36 base vertex 0 | triangle 0 was (-2, -1, -1) (2, -1, -1) (-2, 1, -1), now (-2.5, -1, -1) (2.5, -1, -1) (-2.5, 1, -1)
-unstable: mismatches 3 unstable 1 failures 1 meshes 0 admitted 0 error 'unstable: no two captures in a row decode to the same mesh'
-legacy: admitted 0 small 4 large 4 meshes 2
-PASS (0 failures)

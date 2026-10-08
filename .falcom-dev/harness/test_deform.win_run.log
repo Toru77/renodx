@@ -1,3 +1,0 @@
-﻿layout: ok stride 92 candidates 5 (SV_Position0.xyzw NORMAL0.xyz TEXCOORD1.xyzw TEXCOORD2.xyzw TEXCOORD5.xyzw TEXCOORD6.xyzw )
-probe: probes 1 reads 1 matched 1, world TEXCOORD1.xyzw error 0 convention 0 tris 200 bbox (100.0 2.0 -40.0)..(106.0 6.0 159.0)
-PASS (0 failures)
