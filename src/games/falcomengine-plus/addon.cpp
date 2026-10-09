@@ -37,6 +37,7 @@
 #include "./shared.h"
 #include "./fast_noise_ea.h"  // baked-in fast_noise_ea.dds (embed_file.exe output)
 #include "./world/world.hpp"  // Phase 0 world-space research module (DevKit-only)
+#include "./world/rtao/rtao.hpp"  // RTAO round 1 (inline lighting-hook dispatch)
 
 namespace {
 
@@ -395,7 +396,7 @@ ShaderInjectData shader_injection = {
   .mb_halfres_px = 10.f,
   .mb_frame_rate_reference = 60.f,
       .mb_frame_scale = 1.f,
-      .mb_reserved_length = 1.f,
+      .rtao_active = 0.f,
       .mb_camera_sign = 1.f,
         .mb_camera_jitter = 1.f,
         .mb_camera_cut = 1.f,
@@ -3388,6 +3389,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "GTVBAO mode", .section = "GTVBAO",
       .tooltip = "Off = vanilla game AO. On = GTVBAO compute-shader AO.",
       .labels = {"Off (Vanilla AO)", "On (GTVBAO)"},
+      .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
     },
     new renodx::utils::settings::Setting{
       .key = "GTVBAOQuality", .binding = &shader_injection.gtvbao_quality_level,
@@ -3871,7 +3873,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 1.f, .label = "VBGI Enable", .section = "VBGI",
       .tooltip = "Visibility bitmask indirect diffuse GI. Requires GTVBAO mode = On.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested(); },
     },
     new renodx::utils::settings::Setting{
       .key = "SSGIIntensity", .binding = &shader_injection.vbgi_intensity,
@@ -5848,6 +5850,7 @@ static void OnPushDescriptorsCapture(
   // the player walks out of a cutscene would drop the view the deploy still needs.
   const bool wantMotionBlurPush = shader_injection.mb_mode > 0.5f;
   if (shader_injection.gtvbao_mode < 0.5f
+      && !falcom_world::rtao::RtaoRequested()
       && shader_injection.dynCube_enabled < 0.5f
       && !wantTAAMotionPush
       && !wantMotionBlurPush) {
@@ -6144,8 +6147,8 @@ static void OnPushDescriptorsCapture(
       }
     }
   }
-  // -- Per-draw gating (only when GTVBAO or SSGI is on). --
-  if (shader_injection.gtvbao_mode < 0.5f) return;
+  // -- Per-draw gating (only when GTVBAO, SSGI or RTAO is on). --
+  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested()) return;
   if (!(static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel))) return;
 }
 
@@ -6157,8 +6160,8 @@ static void OnBindDescriptorTables(
     reshade::api::pipeline_layout layout,
     uint32_t first, uint32_t count,
     const reshade::api::descriptor_table* tables) {
-  // Fast path: GTVBAO is the only consumer of these captures.
-  if (shader_injection.gtvbao_mode < 0.5f) return;
+  // Fast path: GTVBAO and RTAO are the consumers of these captures (depth, scene CBV).
+  if (shader_injection.gtvbao_mode < 0.5f && !falcom_world::rtao::RtaoRequested()) return;
   if (!cmd_list || !tables || count == 0u) return;
   auto* device = cmd_list->get_device();
   auto* d = device->get_private_data<DeviceData>();
@@ -6535,6 +6538,22 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   // times, but never across a frame boundary.
   d->mb_rtv4_rejects = 0u;
   d->immediate_cmd_list = queue->get_immediate_command_list();
+  // RTAO state for this present (0 off, 1 requested but not producing, 2 producing last frame).
+  // Latched here, read by the SSAO shader and the GTVBAO gates during the frame.
+  {
+    auto& rtao_frame = falcom_world::rtao::g_rtao_frame;
+    if (!falcom_world::rtao::RtaoRequested()) {
+      shader_injection.rtao_active = 0.f;
+    } else {
+      shader_injection.rtao_active = rtao_frame.producing ? 2.f : 1.f;
+      if (!rtao_frame.producing) rtao_frame.frames_without_ao++;
+    }
+    if (rtao_frame.reason != rtao_frame.logged_reason) {
+      rtao_frame.logged_reason = rtao_frame.reason;
+      renodx::utils::log::i("[world-rtao] state: reason=", falcom_world::rtao::ReasonName(rtao_frame.reason),
+                            " rtao_active=", shader_injection.rtao_active);
+    }
+  }
   s_lastPresentMs.store(WatchdogNowMs());
   if (!s_watchdogStarted) {
     s_watchdogStarted = true;
@@ -6845,7 +6864,7 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
   if (cs) prev = *cs;
 
   bool ok = true;
-  if (shader_injection.gtvbao_mode > 0.5f) {
+  if (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
     const std::string liveDepth = d->captured_depth_srv.handle ? d->captured_depth_dims : "none";
     const std::string wantDims = std::to_string(d->working_width) + "x" + std::to_string(d->working_height);
     const bool dimMismatch = (liveDepth != wantDims);
@@ -8996,6 +9015,134 @@ static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list) {
   return KaiSSRReplaceActive(cmd_list) || KaiSSRVanillaActive(cmd_list);
 }
 
+// RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the micro
+// shadows read this frame's AO. A failed guard leaves the frame on vanilla SSAO and
+// records its reason in rtao::g_rtao_frame.
+static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resource_view ao_srv) {
+  cmd_list->push_descriptors(
+      reshade::api::shader_stage::pixel,
+      reshade::api::pipeline_layout{0},
+      0,
+      reshade::api::descriptor_table_update{
+          {}, kLightingGtvbaoRegister, 0, 1,
+          reshade::api::descriptor_type::texture_shader_resource_view, &ao_srv});
+  shader_injection.gtvbao_dedicated_bound = 1.f;
+}
+
+static void RunRtaoInline(reshade::api::command_list* cmd_list) {
+  namespace rtao = falcom_world::rtao;
+  auto& frame = rtao::g_rtao_frame;
+  frame.producing = false;
+  frame.reason = rtao::Reason::Off;
+  frame.note = rtao::Reason::Off;
+  if (!rtao::RtaoRequested()) return;
+
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  if (!dd) {
+    frame.reason = rtao::Reason::NoDepth;
+    return;
+  }
+  auto& rd = rtao::GetRtaoDeviceData(dev);
+  const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
+  if (bvh_data == nullptr) {
+    frame.reason = rtao::Reason::BvhNotReady;
+    return;
+  }
+  if (!falcom_world::bvh::g_live_bvh.enabled.load(std::memory_order_relaxed)) {
+    frame.reason = rtao::Reason::LiveBvhOff;
+    return;
+  }
+  if (!bvh_data->bvh_ready || !bvh_data->tlas_built) {
+    frame.reason = rtao::Reason::BvhNotReady;
+    return;
+  }
+  if (bvh_data->active_count == 0u) {
+    frame.reason = rtao::Reason::BvhEmpty;
+    return;
+  }
+  const auto fade = rtao::RtaoEffectiveFade(
+      bvh_data->tlas_region_size, rtao::g_rtao_ray_max, rtao::g_rtao_fade_start, rtao::g_rtao_fade_end);
+  frame.fade = fade;
+  frame.fade_valid = true;
+  if (fade.coverage < 1.f) {
+    frame.reason = rtao::Reason::RangeTooSmall;
+    return;
+  }
+  // Deferred lists may run after their slots are reused: keep the last AO only if it matches the size.
+  if (cmd_list != dd->immediate_cmd_list) {
+    frame.reason = rtao::Reason::DeferredList;
+    if (rd.ao_srv.handle != 0u && rd.ao_width == dd->captured_depth_w && rd.ao_height == dd->captured_depth_h) {
+      frame.producing = true;
+      PushRtaoAo(cmd_list, rd.ao_srv);
+    }
+    return;
+  }
+  if (frame.dispatched_frame == dd->frame_index) {
+    frame.producing = true;
+    PushRtaoAo(cmd_list, rd.ao_srv);
+    return;
+  }
+  if (!dd->captured_depth_srv.handle || !dd->captured_depth_live.load()
+      || dd->captured_depth_w == 0u || dd->captured_depth_h == 0u) {
+    frame.reason = rtao::Reason::NoDepth;
+    return;
+  }
+  if (!dd->captured_mrt_normal_srv.handle || !dd->captured_mrt_live.load()) {
+    frame.reason = rtao::Reason::NoNormals;
+    return;
+  }
+  if (!dd->captured_scene_cbv_view.handle || !dd->captured_scene_cbv_valid || !dd->captured_cbv_live.load()) {
+    frame.reason = rtao::Reason::NoSceneCbv;
+    return;
+  }
+  if (dd->frame_index < kGTVBAOStartupGuardFrames || dd->frame_index < dd->resize_guard_until_frame) {
+    frame.reason = rtao::Reason::StartupOrResizeGuard;
+    return;
+  }
+
+  // IS-FAST blue noise is used when its texture is loaded and the IS-FAST master is on; otherwise IGN.
+  if (rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, dd);
+  const bool isfast_on = g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
+  const bool isfast_used = isfast_on && rtao::g_rtao_isfast > 0.5f;
+  if (rtao::g_rtao_isfast > 0.5f && !isfast_used) frame.note = rtao::Reason::IsfastUnavailable;
+
+  const float spp = (std::max)(rtao::g_rtao_samples, 1.f);
+  rtao::RtaoDispatchInputs in = {};
+  in.depth_view = dd->captured_depth_srv;
+  in.mrt_normal_view = dd->captured_mrt_normal_srv;
+  in.isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u};
+  in.scene_cbv_view = dd->captured_scene_cbv_view;
+  in.width = dd->captured_depth_w;
+  in.height = dd->captured_depth_h;
+  in.push = {
+      {rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_normal_bias},
+      {spp, isfast_used ? 1.f : 0.f,
+       static_cast<float>((dd->frame_index * static_cast<uint64_t>(spp)) % 32u),
+       static_cast<float>(dd->frame_index % 1024u)},
+      {fade.start, fade.end, 0.f, 0.f},
+      {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
+       bvh_data->tlas_region_size},
+      {0.f, 0.f, 0.f, 0.f},
+  };
+
+  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+  renodx::utils::state::CommandListState prev = {};
+  if (cs) prev = *cs;
+  const bool ok = rtao::Dispatch(dev, cmd_list, in);
+  ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
+  if (!ok) {
+    frame.reason = rtao::Reason::PipelineFailed;
+    return;
+  }
+  frame.dispatched_frame = dd->frame_index;
+  frame.producing = true;
+  frame.gpu_ms = rd.timer.last_ms;
+  frame.texture_bytes = static_cast<uint64_t>(rd.ao_width) * rd.ao_height * 4u
+                        + sizeof(uint32_t) * rtao::kRtaoStatsCount;
+  PushRtaoAo(cmd_list, rd.ao_srv);
+}
+
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   shader_injection.gtvbao_dedicated_bound = 0.f;
@@ -9031,6 +9178,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_debug_mode = shader_injection.gtvbao_debug_view;
   shader_injection.foliage_debug_mode = shader_injection.debug_show_env_sss;
 
+  // RTAO runs before the shadows so micro shadows read this frame's AO.
+  RunRtaoInline(cmd_list);
+
   // Contact / Micro Shadows. Placed here, before the GTVBAO/DynCube early-out
   // below, because those two are entirely independent of the shadow passes: on a
   // frame where only the shadows are enabled this hook must still run them.
@@ -9038,7 +9188,13 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // Dynamic Cubemaps � standalone, must run even when GTVBAO/SSR off (any Falcom title)
   const bool dyncube_active = shader_injection.dynCube_enabled > 0.5f;
-  const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f;
+  const bool gtvbao_active = shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested();
+  // RTAO on: GTVBAO's t23 block is skipped (and the early-out below may return), so its flags are cleared here.
+  if (falcom_world::rtao::RtaoRequested()) {
+    shader_injection.gtvbao_vbgi_bound = 0.f;
+    shader_injection.gtvbao_vbgi_debug = 0.f;
+    shader_injection.gtvbao_mrt_normal_debug = 0.f;
+  }
   // Rising/falling-edge latch (runs before the early-out so it also happens when every
   // feature is off): rising edge schedules an immediate refresh cycle WITHOUT wiping
   // history (toggle off/on preserves the cache; first boot still clears via Create).
@@ -9062,7 +9218,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // -- Deferred dispatch path: capture snapshots for OnPresent (kai-style). --
   // Plain copies only (no queries): resource pairs + live flags travel with the views.
   // GTVBAO-only: with the mode off there is nothing to defer to.
-  if (g_cpuopt_deferred_dispatch > 0.5f && shader_injection.gtvbao_mode > 0.5f) {
+  if (g_cpuopt_deferred_dispatch > 0.5f && shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
     dd->deferred_depth_srv = dd->captured_depth_srv;
     dd->deferred_depth_res = dd->captured_depth_res;
     dd->defDepthLive = dd->captured_depth_live.load();
@@ -9903,7 +10059,9 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   // AO the pass reads and the AO a user can compare against are guaranteed to be
   // the same buffer, in Full and in Half mode alike.
   reshade::api::resource_view ao_gtvbao = {};
-  if (shader_injection.gtvbao_mode > 0.5f) {
+  if (falcom_world::rtao::g_rtao_frame.producing) {
+    ao_gtvbao = falcom_world::rtao::GetRtaoDeviceData(dev).ao_srv;
+  } else if (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
     const bool half_active = shader_injection.gtvbao_resolution > 0.5f
                           && d->upscale_ao_srv.handle;
     ao_gtvbao = half_active

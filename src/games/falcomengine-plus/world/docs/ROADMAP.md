@@ -22,6 +22,8 @@ Alpha-tested foliage (path 3): GPU stage built and reviewed, not validated in ga
 - Harness after the default change: see the result line under "Native test harness" below.
 - In-game steps and what to send back: Reference: Path 3.
 
+RTAO round 1 (2026-10-09, implemented, awaiting in-game validation): inline ray-traced AO in the lighting hook, Ray Tracing tab section RTAO. When on it overrides GTVBAO and VBGI (their controls are greyed, stored values kept). Temporal and spatial rows exist but do nothing yet. Reference: RTAO (round 1).
+
 Agreed plan, in order (owner's words in "Plan agreed 2026-10-07" below):
 1. Deforming meshes (stream-out): done for characters and water. Wind foliage and billboards moved into path 3.
 2. Moving rigid objects (doors, carts, the fork an NPC holds): in progress (P2a deployed, P2b next).
@@ -32,7 +34,7 @@ Agreed plan, in order (owner's words in "Plan agreed 2026-10-07" below):
 Next steps:
 - Owner in-game validation: Path 2 (P2a, P2a-rev) and the alpha steps below. Send back the listed panel lines and dumps.
 - P2b (per-frame path for flagged moving meshes): design under Reference: Path 2. Not started.
-- Then RTAO (step 4).
+- RTAO round 1 is awaiting in-game validation (see Reference: RTAO). Next: round 2 (temporal accumulation) and round 3 (spatial denoising, dynamic objects).
 
 GPU cost note (owner asked): the BVH debug trace (~17-22 ms) is a validation tracer. See "GPU cost of the BVH debug views (2026-10-07)" in the history. RT effects will use any-hit short rays at reduced resolution with accumulation; tracer optimization is milestone M8/M13, after BVH contents are steady.
 
@@ -158,6 +160,18 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 5. One screenshot of a fence or leaf cutout, ON against OFF.
 6. Switch the main toggle OFF: "Alpha TLAS" instances go to 0 on the next present (read the panel one present later).
 7. Send back: `world_pool.json` (`alpha`, `alpha_gpu`), `world_pool_meshes.json`, `world_pool_instances.json` as listed above, the ReShade.log lines, the panel lines.
+
+### RTAO (round 1): reference
+
+- Code: `world/rtao/` (`rtao_state.hpp` settings, reason codes, `RtaoEffectiveFade`; `rtao_resources.hpp` pipeline, AO target, stats; `rtao.hpp` dispatch and stats readback; `rtao_panel.hpp` panel). Shader: `world/shaders/world_rtao.cs_5_0.hlsl`. Hook wrapper: `RunRtaoInline` in `addon.cpp`, called from `OnBeforeLightingShaderDraw` before `DeployShadows`.
+- Placement: inline in the lighting hook (zero latency). Micro shadows read this frame's RTAO AO when it is produced. The shader reads the game scene CBV (b0), not `g_state.camera`.
+- Gate: `shader_injection.rtao_active` is latched once per present in `OnPresent`: 0 off, 1 requested but not producing (vanilla SSAO), 2 producing (neutral SSAO, RTAO AO at t22). When RTAO is on, GTVBAO and VBGI do not run, their modes are greyed, and `gtvbao_vbgi_bound` and `gtvbao_vbgi_debug` are 0. Their stored values are untouched.
+- Range rule: only the built BVH region counts (`tlas_region_size`, `tlas_region_min`). Coverage = region size * 0.25 - Ray Max Distance. Fade End = min(End, coverage); Fade Start = min(Start, Fade End). Not ready below 1 m (`range_too_small`). Stored settings are never rewritten; the panel shows the effective values. A pixel closer than Ray Max Distance to any region face is neutral. The slider maximum is `kPoolRegionMaxSize * 0.25` (128 m).
+- Dynamic objects are not traced in round 1: characters and water do not occlude RTAO (dynamic count 0, t10-t13 null). Round 3 adds them.
+- Auto-enable: turning RTAO on enables Live BVH and Deforming meshes (`RtaoEnableBvhInputs`); Pool Scan is not enabled (the panel shows `bvh_empty` instead). Turning RTAO off leaves them alone. A persisted ON is applied at the first present.
+- Sampling: IS-FAST blue noise (t18, Load only) when the texture is loaded, else IGN (`isfast_unavailable`). Scaled-resolution frames (`resolutionScaling_g != (1,1)`) are neutral and counted by the shader.
+- Diagnostics: panel row "RTAO status" (state and reason code, GPU ms, fade, texture bytes, stats after "Read RTAO Stats"), `[world-rtao]` lines in ReShade.log, `world_rtao.json` on each stats read.
+- Harness: `test_rtao` (gate table, fade rule, region margin, b12 layout, ray rules against a wall reference, pixel classes, mock device lifecycle). Not covered: GPU execution of the shader, FXC runtime, in-game behaviour.
 
 ## History
 

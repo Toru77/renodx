@@ -528,15 +528,10 @@ struct ShaderInjectData {
                                   // change with framerate. Applying it once,
                                   // in MBGameMotionToUV, puts all of them into
                                   // reference-frame units together. 1.0 = no-op.
-  // ---- camera term (appended last) ----
-  // The object channel is gone; the streak LENGTH is now the camera's share of
-  // the total magnitude, and that ratio is a compile-time constant in
-  // motion_blur_resolve (gain = camLen / (camLen + objLen)). It used to arrive
-  // here as two weights and
-  //     out = game * (camLen*w_cam + objLen*w_obj) / (camLen + objLen)
-  // with the sum evaluated per pixel. RETIRED, unread by any shader and now
-  // written by nothing. Kept so later packoffsets do not move.
-  float mb_reserved_length;
+  // RTAO state for this present (rtao.hpp): 0 off, 1 requested but not producing
+  // (vanilla SSAO), 2 producing (RTAO AO at t22, SSAO neutral). Takes the slot of
+  // the retired motion-blur field, so later packoffsets do not move.
+  float rtao_active;
   // ---- convention probe (appended last) ----
   // The game's motion encoding is documented inconsistently in this repo:
   // motion_blur_common.hlsli says prevPixel - curPixel, while the decompiled

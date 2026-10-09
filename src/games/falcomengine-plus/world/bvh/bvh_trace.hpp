@@ -178,6 +178,32 @@ inline bool EnsureBvhTraceResources(reshade::api::device* device, BvhDeviceData*
 #endif
 }
 
+// t0-t16 of the BVH scene (shared by the trace pass and RTAO). Writes the
+// first kTraceSrvCount entries of srvs.
+inline void FillBvhSceneSrvs(
+    const BvhDeviceData& data,
+    reshade::api::resource_view depth_view,
+    const DynamicTraceInputs& dynamic,
+    reshade::api::resource_view* srvs) {
+  srvs[0] = data.vertices.srv;
+  srvs[1] = data.indices.srv;
+  srvs[2] = data.mesh_srv;
+  srvs[3] = data.instance_srv;
+  srvs[4] = data.active_srv;
+  srvs[5] = data.blas_nodes.srv;
+  srvs[6] = data.blas_leaves.srv;
+  srvs[7] = data.tlas_node_srv;
+  srvs[8] = data.tlas_leaf_srv;
+  srvs[9] = depth_view;
+  srvs[10] = dynamic.vertices;
+  srvs[11] = dynamic.objects;
+  srvs[12] = dynamic.nodes;
+  srvs[13] = dynamic.leaves;
+  srvs[14] = data.uvs.srv;
+  srvs[15] = data.alpha.atlas_srv;
+  srvs[16] = data.alpha.materials_srv;
+}
+
 inline void DispatchBvhTrace(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -199,12 +225,9 @@ inline void DispatchBvhTrace(
   // may no longer exist, so it is null unless Depth Compare passes this
   // frame's view.
   const DynamicTraceInputs dynamic = GetDynamicTraceInputs(device);
-  reshade::api::resource_view srvs[kTraceSrvCount] = {
-      data->vertices.srv, data->indices.srv, data->mesh_srv, data->instance_srv, data->active_srv,
-      data->blas_nodes.srv, data->blas_leaves.srv, data->tlas_node_srv, data->tlas_leaf_srv,
-      depth.view, dynamic.vertices, dynamic.objects, dynamic.nodes, dynamic.leaves,
-      data->uvs.srv, data->alpha.atlas_srv, data->alpha.materials_srv};
+  reshade::api::resource_view srvs[kTraceSrvCount] = {};
   static_assert(sizeof(srvs) / sizeof(srvs[0]) == kTraceSrvCount, "trace SRV table must have exactly 17 entries");
+  FillBvhSceneSrvs(*data, depth.view, dynamic, srvs);
   reshade::api::descriptor_table_update srv_update = {
       data->trace_srv_table, 0, 0, kTraceSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs};
   device->update_descriptor_tables(1, &srv_update);

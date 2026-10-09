@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../../../../utils/render.hpp"
+#include "../rtao/rtao.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
 #include "deform_probe.hpp"
@@ -184,6 +185,15 @@ inline void RefreshPoolCaptureRequest() {
   g_state.pool_capture_requested.store(requested, std::memory_order_relaxed);
 }
 
+// RTAO needs the live BVH and deforming meshes. Turning RTAO on enables them;
+// turning it off leaves them alone. Pool Scan is not enabled here.
+inline void RtaoEnableBvhInputs() {
+  g_live_bvh.enabled.store(true, std::memory_order_relaxed);
+  g_deform.enabled.store(true, std::memory_order_relaxed);
+  g_deform_live.enabled.store(true, std::memory_order_relaxed);
+  RefreshPoolCaptureRequest();
+}
+
 inline void OnWorldPresentBvh(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -200,9 +210,15 @@ inline void OnWorldPresentBvh(
   if (device == nullptr) return;
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
+  static const bool rtao_startup_enable = [] {
+    if (rtao::RtaoRequested()) RtaoEnableBvhInputs();
+    return true;
+  }();
+  (void)rtao_startup_enable;
 
   UpdateLiveBvh(device, queue);
   UpdateDeformLive(device, queue);
+  rtao::MaybeCaptureRtaoStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
 }
 

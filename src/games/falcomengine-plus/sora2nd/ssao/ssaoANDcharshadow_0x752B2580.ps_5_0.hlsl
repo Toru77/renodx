@@ -545,7 +545,8 @@ void main(
   } else {
     // When GTVBAO is active, skip the vanilla map AO loop for performance.
     // Character screen-space shadows are preserved (they run in the char pixel path above).
-    if (shader_injection_data.gtvbao_mode > 0.5f || shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
+    if ((shader_injection_data.gtvbao_mode > 0.5f && shader_injection_data.rtao_active < 0.5f)
+        || shader_injection_data.gtvbao_vbgi_bound > 0.5f || shader_injection_data.rtao_active > 1.5f) {
       r1.x = 0.0;  // Neutral AO (no darkening from vanilla path)
       r2.w = 0.0;  // Neutral intensity (temporal blend stays neutral)
     } else if (mapAOSampleCount_g != 0) {
@@ -681,7 +682,8 @@ void main(
                                 shader_injection_data.char_cam_response_scale,
                                 charCamDbgColour);
   // When GTVBAO is active, skip temporal blend — preserve character shadow in z.
-  if (shader_injection_data.gtvbao_mode > 0.5f) {
+  if ((shader_injection_data.gtvbao_mode > 0.5f && shader_injection_data.rtao_active < 0.5f)
+      || shader_injection_data.rtao_active > 1.5f) {
     o0 = float4(1, 1, r4.z, r3.x ? 1 : 0);
     if (charCamDbgActive) o0.rgb = charCamDbgColour;
     return;

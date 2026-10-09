@@ -11,7 +11,7 @@ param(
 )
 $h = "E:\RenoDX\renodx\.falcom-dev\harness"
 Set-Location $h
-$everyTest = @("test_live", "test_motion", "test_pool", "test_switches", "test_visibility", "test_verify", "test_build", "test_indirect", "test_deform", "test_deform_live", "test_alpha")
+$everyTest = @("test_live", "test_motion", "test_pool", "test_switches", "test_visibility", "test_verify", "test_build", "test_indirect", "test_deform", "test_deform_live", "test_alpha", "test_rtao")
 if ($All) { $Tests = $everyTest }
 $Tests = @($Tests | Where-Object { $_ -eq "test_live" }) + @($Tests | Where-Object { $_ -ne "test_live" })
 

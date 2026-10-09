@@ -23,6 +23,7 @@ namespace falcom_world::bvh {
 
 inline void OnDestroyDeviceBvh(reshade::api::device* device) {
   DestroyBvhDebugResources(device);
+  rtao::DestroyRtaoDeviceData(device);
   DestroyBvhDeviceData(device);
 }
 
