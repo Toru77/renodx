@@ -242,6 +242,22 @@ Send back for each case: the RTAO panel lines and world_rtao.json.
 
 Limit: the stats are 32-bit sums of values x1000 and overflow above about 4.29 million traced pixels (4K is above that; 1080p is below it).
 
+#### D5 owner steps (spatial filter)
+
+Settings: History Clamp 0, Debug Off, Temporal on (unless a step says otherwise), Two-Sided discovery off, test rows off. The defaults are Spatial Filter off, Filter Type Separable bilateral, Radius 2, Quality Medium.
+
+1. Spatial Filter on with the defaults and Temporal on; then Temporal off. Compare each with Spatial Filter off on the same still frame (screenshots).
+2. Filter Type separable bilateral against a-trous 5x5, at Radius 2 and Radius 6, all three qualities (Low, Medium, High). Check edges (walls, foliage, thin objects) for halos or leaks.
+3. Radius 1, 4 and 8 (separable, Medium).
+4. Debug mode 8 "Filter change" with the filter on: a screenshot (shows where the filter changes the AO; scale x8).
+5. Read "Filter GPU" and "Mean change" in the Denoising block for each case above.
+6. Spatial Filter off again: the image must equal the one from before the feature (the "off" screenshot of step 1). With the filter off, debug mode 8 shows the unfiltered AO as a gray image; that is expected.
+7. Send the RTAO panel lines (Denoising block), world_rtao.json (key spatial_filter) and the screenshots for each case.
+
+Expected cost: a fraction of a millisecond to about 1 ms at 720p; the panel shows the measured value. The constants (plane sigma 0.02, normal power 16) are initial values to be tuned from the A/B captures.
+
+Known limits: (a) the filter targets (about 16.6 MB at 1080p) stay allocated while Spatial Filter is off, until a resize or device destroy. (b) Debug mode 8 with Spatial Filter off shows the unfiltered AO as a gray image. (c) The filter statistics are 32-bit sums of values x1000, like the other sums: they overflow above about 4.29 million filtered pixels (4K is above that; 1080p is below it).
+
 ## History
 
 ### Early status (through 2026-10-06, round 1)

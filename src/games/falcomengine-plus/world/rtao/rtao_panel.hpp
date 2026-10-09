@@ -176,6 +176,27 @@ inline void DrawRtaoPanel() {
     ImGui::Text("Skipped pixels: sky %u, normal %u, scaled %u (shader), region %u",
                 v[kRtaoStatSky], v[kRtaoStatNormal], v[kRtaoStatScaled], v[kRtaoStatRegion]);
   }
+  if (frame.filter_requested) {
+    const uint32_t* v = g_rtao_stats.values;
+    ImGui::SeparatorText("Denoising");
+    ImGui::Text("Spatial filter: on, %s, radius %d, quality %s (iterations %u, passes %u, taps per pass %u)",
+                frame.filter_type == 0 ? "separable bilateral" : "a-trous 5x5", frame.filter_radius,
+                frame.filter_quality == 0 ? "Low" : (frame.filter_quality == 1 ? "Medium" : "High"),
+                frame.filter_iterations, frame.filter_passes, frame.filter_taps);
+    if (frame.filter_gpu_ms < 0.f) {
+      ImGui::Text("Filter GPU: no measurement yet");
+    } else {
+      ImGui::Text("Filter GPU: %.3f ms", frame.filter_gpu_ms);
+    }
+    const uint32_t pixels = v[kRtaoStatFilterBase];
+    ImGui::Text("Mean change: %.4f (share of pixels changed by more than 1 LSB: %.1f%%) over %u pixels",
+                MeanFromSum(v[kRtaoStatFilterBase + 1u], pixels),
+                pixels > 0u ? 100.0 * v[kRtaoStatFilterBase + 2u] / pixels : 0.0, pixels);
+    ImGui::TextDisabled("Debug modes 1 to 7 bypass the spatial filter; mode 8 shows the filter change.");
+    if (frame.filter_failed) {
+      ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "filter_failed: using the unfiltered AO");
+    }
+  }
   ImGui::SeparatorText("Two-Sided discovery (diagnostic, no culling)");
   bool any_cpu = false;
   for (uint32_t cull = 0u; cull < 4u; ++cull) {

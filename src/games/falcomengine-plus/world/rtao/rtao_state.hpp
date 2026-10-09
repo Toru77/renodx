@@ -27,6 +27,7 @@ inline float g_rtao_isfast = 1.f;
 inline float g_rtao_spatial_enabled = 0.f;
 inline float g_rtao_filter_radius = 2.f;
 inline float g_rtao_filter_quality = 1.f;
+inline float g_rtao_filter_type = 0.f;  // Filter Type: 0 separable bilateral, 1 a-trous 5x5
 inline float g_rtao_fade_start = 40.f;
 inline float g_rtao_fade_end = 80.f;
 inline float g_rtao_debug = 0.f;       // RTAO Debug (advanced): 0 off, 1 raw AO, 2 accumulated AO, 3 history confidence
@@ -52,6 +53,7 @@ enum class Reason : uint8_t {
   ScaledResolution,
   NoMotion,        // Temporal on but no usable motion: round-1 AO, history invalid (note)
   HistoryReset,    // Temporal history reset for one frame (note)
+  FilterFailed,    // Spatial filter could not run: the unfiltered AO is used (note)
 };
 
 inline const char* ReasonName(Reason reason) {
@@ -71,6 +73,7 @@ inline const char* ReasonName(Reason reason) {
     case Reason::ScaledResolution: return "scaled_resolution";
     case Reason::NoMotion: return "no_motion";
     case Reason::HistoryReset: return "history_reset";
+    case Reason::FilterFailed: return "filter_failed";
   }
   return "unknown";
 }
@@ -150,6 +153,56 @@ inline double MeanFromSum(uint32_t sum_x1000, uint32_t count) {
 
 // Width of the soft normal weight ramp (HLSL kNormalRampWidth in world_rtao_temporal.cs_5_0.hlsl): full at T, zero at T - width.
 inline constexpr float kNormalRampWidth = 0.4f;
+
+// Spatial filter (denoises the final AO only). Edge stops are shared by both kernels; see the filter shader.
+inline constexpr float kFilterPlaneSigma = 0.02f;  // plane distance, relative to the view distance
+inline constexpr float kFilterNormalPower = 16.f;  // normal weight = saturate(dot)^power
+inline constexpr float kFilterMinSigma = 0.5f;     // separable Gaussian sigma floor (pixels)
+inline constexpr float kFilterChangeScale = 8.f;   // debug mode 8: saturate(|filtered - AO| * scale)
+
+enum class FilterKind : uint8_t { Separable, ATrous };
+enum class FilterSlot : uint8_t { A, F0, F1, B };  // A: AO (uint), F0/F1: intermediates (float), B: filtered AO (uint)
+enum class FilterDirection : uint8_t { Horizontal, Vertical, Both };  // Both: 2D a-trous pass
+
+struct FilterPass {
+  FilterSlot input;
+  FilterSlot output;
+  FilterDirection direction;
+  uint32_t step;       // offset spacing in pixels (separable: stride, a-trous: step)
+  uint32_t taps;       // separable: taps along the pass; a-trous: taps of the 2D pass
+  uint32_t footprint;  // reach in pixels on each side
+};
+
+struct FilterPlan {
+  FilterKind kind;
+  uint32_t iterations;
+  uint32_t pass_count;
+  float sigma;  // separable spatial Gaussian sigma (pixels); 0 for a-trous
+  FilterPass passes[4];
+};
+
+// Pass chain for a Filter Type (0 separable bilateral, 1 a-trous 5x5), radius 1..8 and quality 0 Low, 1 Medium, 2 High.
+// Separable: per iteration a horizontal then a vertical pass; a-trous: one 2D pass per iteration.
+inline FilterPlan MakeFilterPlan(int type, int radius, int quality) {
+  FilterPlan plan{};
+  const bool separable = type != 1;
+  plan.kind = separable ? FilterKind::Separable : FilterKind::ATrous;
+  plan.iterations = quality == 2 ? 2u : 1u;
+  plan.pass_count = separable ? 2u * plan.iterations : plan.iterations;
+  plan.sigma = separable ? (radius * 0.5f > kFilterMinSigma ? radius * 0.5f : kFilterMinSigma) : 0.f;
+  const uint32_t r = static_cast<uint32_t>(radius);
+  const uint32_t step = separable ? (quality == 0 ? 2u : 1u) : (r / 2u > 1u ? r / 2u : 1u);
+  for (uint32_t i = 0; i < plan.pass_count; ++i) {
+    FilterPass& pass = plan.passes[i];
+    pass.output = i + 1u == plan.pass_count ? FilterSlot::B : (separable && i % 2u == 1u ? FilterSlot::F1 : FilterSlot::F0);
+    pass.input = i == 0u ? FilterSlot::A : plan.passes[i - 1u].output;
+    pass.direction = !separable ? FilterDirection::Both : (i % 2u == 0u ? FilterDirection::Horizontal : FilterDirection::Vertical);
+    pass.step = step;
+    pass.taps = separable ? 2u * (r / step) + 1u : (quality == 0 ? 9u : 25u);
+    pass.footprint = separable ? (r / step) * step : 2u * step;
+  }
+  return plan;
+}
 
 // Histogram bin of a motion vs camera-matrix difference in pixels: 0 below 0.1, 1 below 0.25, 2 below 0.5,
 // 3 below 1, 4 otherwise. Negative values count as 0; NaN counts as 4 (never in the first bin). The HLSL does the same.

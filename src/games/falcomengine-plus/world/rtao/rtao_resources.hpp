@@ -23,7 +23,7 @@ inline constexpr uint32_t kRtaoUavCount = 3u;
 inline constexpr uint32_t kRtaoPushRegister = 12u;
 inline constexpr uint32_t kRtaoPushConstantCount = 20u;
 // Stats buffer: pass A indices 0..9 (RTAO_STAT_COUNT in world_rtao.cs_5_0.hlsl), pass B 10..15 (RTAO_TSTAT_*), discovery 16..23, pass B diagnostics 24..31 (RTAO_FSTAT_* in world_rtao_temporal.cs_5_0.hlsl).
-inline constexpr uint32_t kRtaoStatsCount = 68u;
+inline constexpr uint32_t kRtaoStatsCount = 71u;
 // P0-B2 frame-to-frame raw difference, indices 52..54: sum |raw - previous raw| (x1000), pair count, count below 0.01.
 inline constexpr uint32_t kRtaoStatRawBase = 52u;
 inline constexpr uint32_t kRtaoStatRawCount = 3u;
@@ -33,6 +33,9 @@ inline constexpr uint32_t kRtaoStatQualityCount = 7u;
 // P0-C normal-dot histogram of the highest-weight tap (valid history, in bounds), indices 62..67: dot <0, <0.5, <0.7, <0.9, <0.97, >=0.97.
 inline constexpr uint32_t kRtaoStatNormalBase = 62u;
 inline constexpr uint32_t kRtaoStatNormalCount = 6u;
+// P0-D1 spatial filter, indices 68..70 (RTAO_FILTER_STAT_* in world_rtao_filter.cs_5_0.hlsl): filtered pixels, sum |out - AO| x1000 (0..1), pixels changed by more than 1 LSB.
+inline constexpr uint32_t kRtaoStatFilterBase = 68u;
+inline constexpr uint32_t kRtaoStatFilterCount = 3u;
 // P0-B depth-ratio histogram of the highest-weight history tap, indices 45..51 (invalid, <0.1%, <0.5%, <1%, <2%, <5%, >=5%).
 inline constexpr uint32_t kRtaoStatDepthBase = 45u;
 inline constexpr uint32_t kRtaoStatDepthCount = 7u;
@@ -53,6 +56,9 @@ inline constexpr uint32_t kRtaoStatDiscoveryCount = 8u;
 inline constexpr uint32_t kRtaoStatTemporalBase = 10u;
 inline constexpr uint32_t kRtaoTemporalSrvCount = 6u;      // t0 raw AO, t1 depth, t2 MRT normal, t3 motion, t4 history, t5 previous raw AO
 inline constexpr uint32_t kRtaoTemporalUavCount = 3u;      // u0 AO, u1 stats, u2 history write
+inline constexpr uint32_t kRtaoFilterSrvCount = 5u;   // t0 depth, t1 MRT normal, t2 input AO uint, t3 input AO float, t4 unfiltered AO
+inline constexpr uint32_t kRtaoFilterUavCount = 3u;   // u0 output AO uint, u1 output float, u2 stats
+inline constexpr uint32_t kRtaoFilterPushCount = 12u; // b12 c0..c2
 inline constexpr uint32_t kRtaoTemporalSamplerCount = 2u;  // s0 point clamp, s1 linear clamp
 // Stats buffer indices, matching RTAO_STAT_* in world_rtao.cs_5_0.hlsl.
 inline constexpr uint32_t kRtaoStatRays = 0u;
@@ -92,6 +98,14 @@ static_assert(sizeof(RtaoTemporalPushConstants) == kRtaoPushConstantCount * size
 static_assert(offsetof(RtaoTemporalPushConstants, texel) == 4 * sizeof(float), "pass B c1 offset");
 static_assert(offsetof(RtaoTemporalPushConstants, size) == 8 * sizeof(float), "pass B c2 offset");
 
+// b12 for the spatial filter, matching cbuffer cb_rtao_filter in world_rtao_filter.cs_5_0.hlsl.
+struct RtaoFilterPushConstants {
+  float size[4];   // c0: width, height, radius, kind (0 separable, 1 a-trous)
+  float pass[4];   // c1: direction (0 horizontal, 1 vertical, 2 2D), step, quality, last pass
+  float flags[4];  // c2: input is uint, output is uint, debug mode, unused
+};
+static_assert(sizeof(RtaoFilterPushConstants) == kRtaoFilterPushCount * sizeof(float), "filter b12 must be 12 floats");
+
 struct RtaoDeviceData {
   reshade::api::pipeline_layout layout = {0u};
   reshade::api::descriptor_table cbv_table = {0u};
@@ -127,6 +141,21 @@ struct RtaoDeviceData {
   uint32_t temporal_width = 0u;
   uint32_t temporal_height = 0u;
   uint32_t history_index = 0u;  // history[history_index] is read by pass B; the other one is written
+  // Spatial filter: F0, F1 (r16_float, 0..1 intermediates) and B (r32_uint, filtered AO); created only while Spatial Filter is on.
+  reshade::api::pipeline_layout filter_layout = {0u};
+  reshade::api::descriptor_table filter_cbv_table = {0u};
+  reshade::api::descriptor_table filter_srv_table = {0u};
+  reshade::api::descriptor_table filter_uav_table = {0u};
+  reshade::api::pipeline filter_pipeline = {0u};
+  reshade::api::resource filter_texture[3] = {};  // 0 F0, 1 F1, 2 B
+  reshade::api::resource_view filter_srv[3] = {};
+  reshade::api::resource_view filter_uav[3] = {};
+  uint32_t filter_width = 0u;
+  uint32_t filter_height = 0u;
+  bool filter_failed = false;  // pipeline or targets could not be created: the unfiltered AO is used (note filter_failed)
+  bvh::GpuTimer filter_timer = {};
+  bool filter_ran = false;     // this frame the output is the filtered AO (OutputSrv returns filter_srv[2])
+  bool filter_was_on = false;  // Spatial Filter in the last Dispatch: off -> on clears filter_failed once
 };
 
 // One entry per device (destroyed with the device).
@@ -370,12 +399,102 @@ inline bool EnsureRtaoTemporalPipeline(reshade::api::device* device, RtaoDeviceD
 #endif
 }
 
+inline void DestroyRtaoFilterTargets(reshade::api::device* device, RtaoDeviceData* data) {
+  for (int i = 0; i < 3; ++i) {
+    bvh::DestroyBuffer(device, &data->filter_srv[i], &data->filter_texture[i]);
+    bvh::DestroyBuffer(device, &data->filter_uav[i], nullptr);
+  }
+  data->filter_width = 0u;
+  data->filter_height = 0u;
+}
+
+// F0 and F1 (r16_float) and B (r32_uint). A size change replaces them. Created only while Spatial Filter is on;
+// the caller holds no lock. A failure sets filter_failed (the unfiltered AO is used from then on).
+inline bool EnsureRtaoFilterTargets(reshade::api::device* device, RtaoDeviceData* data, uint32_t width, uint32_t height) {
+  if (data->filter_failed) return false;
+  if (data->filter_texture[0].handle != 0u && data->filter_width == width && data->filter_height == height) return true;
+  DestroyRtaoFilterTargets(device, data);
+  const bool created = CreateRtaoTexture(device, reshade::api::format::r16_float, width, height, 2u,
+                                         &data->filter_texture[0], &data->filter_srv[0], &data->filter_uav[0])
+      && CreateRtaoTexture(device, reshade::api::format::r16_float, width, height, 2u,
+                           &data->filter_texture[1], &data->filter_srv[1], &data->filter_uav[1])
+      && CreateRtaoTexture(device, reshade::api::format::r32_uint, width, height, 4u,
+                           &data->filter_texture[2], &data->filter_srv[2], &data->filter_uav[2]);
+  if (!created) {
+    DestroyRtaoFilterTargets(device, data);
+    data->filter_failed = true;
+    renodx::utils::log::w("[world-rtao] filter target creation failed");
+    return false;
+  }
+  data->filter_width = width;
+  data->filter_height = height;
+  return true;
+}
+
+inline bool EnsureRtaoFilterPipeline(reshade::api::device* device, RtaoDeviceData* data) {
+  if (data->filter_pipeline.handle != 0u) return true;
+  if (data->filter_failed) return false;
+
+#if defined(__world_rtao_filter_EMBED_FILE)
+  using DR = reshade::api::descriptor_range;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using P = reshade::api::pipeline_layout_param;
+
+  DR cbv_range = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};
+  DR srv_range = {0, 0, 0, kRtaoFilterSrvCount, DS::all_compute, 1, DT::shader_resource_view};
+  DR uav_range = {0, 0, 0, kRtaoFilterUavCount, DS::all_compute, 1, DT::unordered_access_view};
+  reshade::api::constant_range push_range = {};
+  push_range.binding = 0;
+  push_range.dx_register_index = kRtaoPushRegister;
+  push_range.dx_register_space = 0;
+  push_range.count = kRtaoFilterPushCount;
+  push_range.visibility = DS::all_compute;
+  P params[4] = {};
+  params[0].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[0].descriptor_table.count = 1;
+  params[0].descriptor_table.ranges = &cbv_range;
+  params[1].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[1].descriptor_table.count = 1;
+  params[1].descriptor_table.ranges = &srv_range;
+  params[2].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[2].descriptor_table.count = 1;
+  params[2].descriptor_table.ranges = &uav_range;
+  params[3].type = reshade::api::pipeline_layout_param_type::push_constants;
+  params[3].push_constants = push_range;
+  const auto fail = [&](const char* stage) {
+    renodx::utils::log::w("[world-rtao] filter pipeline creation failed: ", stage);
+    data->filter_failed = true;
+    return false;
+  };
+  if (data->filter_layout.handle == 0u && !device->create_pipeline_layout(4, params, &data->filter_layout)) return fail("pipeline layout");
+  if (data->filter_cbv_table.handle == 0u && !device->allocate_descriptor_table(data->filter_layout, 0, &data->filter_cbv_table)) return fail("cbv table");
+  if (data->filter_srv_table.handle == 0u && !device->allocate_descriptor_table(data->filter_layout, 1, &data->filter_srv_table)) return fail("srv table");
+  if (data->filter_uav_table.handle == 0u && !device->allocate_descriptor_table(data->filter_layout, 2, &data->filter_uav_table)) return fail("uav table");
+
+  reshade::api::shader_desc shader = {};
+  shader.code = __world_rtao_filter.data();
+  shader.code_size = __world_rtao_filter.size();
+  shader.entry_point = "main";
+  reshade::api::pipeline_subobject subobject = {
+      reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
+  if (!device->create_pipeline(data->filter_layout, 1, &subobject, &data->filter_pipeline)) return fail("compute pipeline");
+  renodx::utils::log::i("[world-rtao] filter pipeline ready");
+  return true;
+#else
+  data->filter_failed = true;
+  renodx::utils::log::w("[world-rtao] filter pipeline creation failed: shader not embedded");
+  return false;
+#endif
+}
+
 inline void DestroyRtaoDeviceData(reshade::api::device* device) {
   const auto found = g_rtao_devices.find(device);
   if (found == g_rtao_devices.end()) return;
   RtaoDeviceData& data = found->second;
   DestroyRtaoTarget(device, &data);
   DestroyRtaoTemporalTargets(device, &data);
+  DestroyRtaoFilterTargets(device, &data);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
   bvh::DestroyGpuTimer(&data.timer);
   if (data.pipeline.handle != 0u) device->destroy_pipeline(data.pipeline);
@@ -391,6 +510,12 @@ inline void DestroyRtaoDeviceData(reshade::api::device* device) {
   if (data.temporal_layout.handle != 0u) device->destroy_pipeline_layout(data.temporal_layout);
   if (data.point_sampler.handle != 0u) device->destroy_sampler(data.point_sampler);
   if (data.linear_sampler.handle != 0u) device->destroy_sampler(data.linear_sampler);
+  if (data.filter_pipeline.handle != 0u) device->destroy_pipeline(data.filter_pipeline);
+  if (data.filter_srv_table.handle != 0u) device->free_descriptor_table(data.filter_srv_table);
+  if (data.filter_uav_table.handle != 0u) device->free_descriptor_table(data.filter_uav_table);
+  if (data.filter_cbv_table.handle != 0u) device->free_descriptor_table(data.filter_cbv_table);
+  if (data.filter_layout.handle != 0u) device->destroy_pipeline_layout(data.filter_layout);
+  bvh::DestroyGpuTimer(&data.filter_timer);
   g_rtao_devices.erase(found);
 }
 

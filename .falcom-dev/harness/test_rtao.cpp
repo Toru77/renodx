@@ -46,6 +46,9 @@ inline constexpr std::span<const std::uint8_t> __world_rtao{__world_rtao_base};
 #define __world_rtao_temporal_EMBED_FILE
 inline constexpr std::uint8_t __world_rtao_temporal_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtao_temporal{__world_rtao_temporal_base};
+#define __world_rtao_filter_EMBED_FILE
+inline constexpr std::uint8_t __world_rtao_filter_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_rtao_filter{__world_rtao_filter_base};
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
 #include "src/games/falcomengine-plus/world/rtao/rtao.hpp"
@@ -165,7 +168,7 @@ static void TestPushLayout() {
   CHECK(offsetof(rtao::RtaoPushConstants, fade) == 32u, "c2 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, region) == 48u, "c3 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, size) == 64u, "c4 offset");
-  CHECK(rtao::kRtaoStatsCount == 68u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
+  CHECK(rtao::kRtaoStatsCount == 71u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
   CHECK(rtao::kRtaoSrvCount == 19u && rtao::kRtaoUavCount == 3u && rtao::kRtaoPushRegister == 12u, "table sizes");
   CHECK(sizeof(rtao::RtaoTemporalPushConstants) == 20u * sizeof(float), "pass B b12 size");
   CHECK(offsetof(rtao::RtaoTemporalPushConstants, texel) == 16u && offsetof(rtao::RtaoTemporalPushConstants, size) == 32u, "pass B offsets");
@@ -297,6 +300,7 @@ struct Device : mock::DeviceBase {
   std::map<uint64_t, std::vector<resource_view>> views_of_table;  // SRV and UAV descriptors per table
   uint64_t next = 0x1000;
   int texture_creates = 0;
+  bool fail_texture_2d = false;  // S3: forced creation failure for texture_2d (the filter targets)
   device_api get_api() const override { return device_api::d3d11; }
   void update_descriptor_tables(uint32_t count, const descriptor_table_update *updates) override {
     for (uint32_t i = 0; i < count; ++i) {
@@ -317,6 +321,7 @@ struct Device : mock::DeviceBase {
   int sampler_creates = 0;
   std::map<uint64_t, std::vector<sampler>> samplers_of_table;
   bool create_resource(const resource_desc &desc, const subresource_data *, resource_usage, resource *out, void ** = nullptr) override {
+    if (desc.type == resource_type::texture_2d && fail_texture_2d) return false;
     if (desc.type == resource_type::texture_2d) texture_creates += 1;
     Res r; r.desc = desc;
     out->handle = next; next += 0x100; res[out->handle] = r;
@@ -573,7 +578,7 @@ static void TestParameterSnapshot() {
 
 // ---- Two-Sided discovery index (rtao_state.hpp TwoSidedDiscoveryIndex; shader: back*4 + toward*2 + alpha) ----
 static void TestTwoSidedIndex() {
-  CHECK(rtao::kRtaoStatsCount == 68u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
+  CHECK(rtao::kRtaoStatsCount == 71u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
   CHECK(rtao::kRtaoStatTemporalFBase == 24u && rtao::kRtaoStatTemporalFCount == 16u, "pass B diagnostics layout");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, false) == 0u, "front away opaque is 0");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, true) == 1u, "front away alpha is 1");
@@ -774,7 +779,7 @@ static void TestNoiseSample() {
 
 // REAL: the layout constants (the stat index is FBase + 8 = 32, and the name table).
 static void TestTexelDiffersLayout() {
-  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 68u, "texel_differs at index 32 of 33");
+  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 71u, "texel_differs at index 32 of 33");
   CHECK(std::string(rtao::kTemporalDiagnosticNames[8]) == "texel_differs", "texel_differs name");
   std::printf("texel_differs layout (real constants)\n");
 }
@@ -834,10 +839,13 @@ static bool FindDefine(const std::vector<HlslDefine>& defs, const char* name, lo
 static void TestHlslSources() {
   const std::string pass_a = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao.cs_5_0.hlsl");
   const std::string pass_b = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao_temporal.cs_5_0.hlsl");
-  CHECK(!pass_a.empty() && !pass_b.empty(), "RTAO shader sources readable (run refresh_world first)");
+  const std::string pass_f = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao_filter.cs_5_0.hlsl");
+  CHECK(!pass_a.empty() && !pass_b.empty() && !pass_f.empty(), "RTAO shader sources readable (run refresh_world first)");
   std::vector<HlslDefine> defs = ParseDefines(pass_a);
   const std::vector<HlslDefine> defs_b = ParseDefines(pass_b);
   defs.insert(defs.end(), defs_b.begin(), defs_b.end());
+  const std::vector<HlslDefine> defs_f = ParseDefines(pass_f);
+  defs.insert(defs.end(), defs_f.begin(), defs_f.end());
   CHECK(CountDuplicates(defs) == 0, "no #define name appears twice in the two RTAO shaders");
   CHECK(CountDuplicates(ParseDefines("#define X_TEST 1u\n#define X_TEST 2u\n")) == 1, "guard self-test: a duplicate is found");
   struct Pair { const char* name; uint32_t expected; };
@@ -865,6 +873,8 @@ static void TestHlslSources() {
       {"RTAO_QSTAT_ROUGH_RAW_SUM", 3}, {"RTAO_QSTAT_ROUGH_PREV_SUM", 4}, {"RTAO_QSTAT_CHANGE_PAIRS", 5},
       {"RTAO_QSTAT_CHANGE_SUM", 6},
       {"RTAO_NSTAT_BASE", rtao::kRtaoStatNormalBase}, {"RTAO_NSTAT_COUNT", rtao::kRtaoStatNormalCount},
+      {"RTAO_FILTER_STAT_BASE", rtao::kRtaoStatFilterBase}, {"RTAO_FILTER_STAT_COUNT", rtao::kRtaoStatFilterCount},
+      {"RTAO_FILTER_STAT_PIXELS", 0}, {"RTAO_FILTER_STAT_CHANGE_SUM", 1}, {"RTAO_FILTER_STAT_CHANGED_GT1LSB", 2},
   };
   for (const Pair& pr : pairs) {
     long value = -1;
@@ -1388,8 +1398,8 @@ static SoftBlend SoftTemporalBlend(float raw, const Tap taps[4], float dist_cur,
 static void TestNormalRamp() {
   // Real constants and layout.
   CHECK(rtao::kNormalRampWidth == 0.4f, "soft normal ramp width is 0.4");
-  CHECK(rtao::kRtaoStatNormalBase == 62u && rtao::kRtaoStatNormalCount == 6u && rtao::kRtaoStatsCount == 68u,
-        "normal-dot histogram at 62..67, stats count 68");
+  CHECK(rtao::kRtaoStatNormalBase == 62u && rtao::kRtaoStatNormalCount == 6u && rtao::kRtaoStatsCount == 71u,
+        "normal-dot histogram at 62..67, stats count 71");
   CHECK(rtao::kRtaoStatNormalBase == rtao::kRtaoStatQualityBase + rtao::kRtaoStatQualityCount, "normal-dot histogram follows the quality block");
   // Ramp values at several thresholds (transcription).
   CHECK(std::fabs(NormalRampT(1.0f, 0.9f) - 1.f) < 1e-6f && std::fabs(NormalRampT(0.9f, 0.9f) - 1.f) < 1e-6f, "ramp T=0.9: full at 1.0 and 0.9");
@@ -1460,6 +1470,362 @@ static void TestNormalRamp() {
   std::printf("normal ramp: ramp values, bookkeeping (hand-computed), property, regression (transcriptions); layout and guard real\n");
 }
 
+// ---- S1 spatial filter plan (REAL: rtao::MakeFilterPlan, constants, Reason, snapshot size) ----
+static void TestSpatialPlan() {
+  CHECK(rtao::kFilterPlaneSigma == 0.02f && rtao::kFilterNormalPower == 16.f && rtao::kFilterMinSigma == 0.5f && rtao::kFilterChangeScale == 8.f,
+        "filter constants equal the spec (plane 0.02, normal power 16, min sigma 0.5, change scale 8)");
+  CHECK(static_cast<size_t>(rtao::Reason::FilterFailed) < rtao::kReasonCount && std::strcmp(rtao::ReasonName(rtao::Reason::FilterFailed), "filter_failed") == 0,
+        "FilterFailed: a reason code inside kReasonCount, named filter_failed");
+  CHECK(sizeof(rtao::ParameterSnapshot) == 18u * sizeof(float), "ParameterSnapshot unchanged: 18 floats, no filter field (size %zu)", sizeof(rtao::ParameterSnapshot));
+  // Explicit chains from the spec.
+  const rtao::FilterPlan sep_high = rtao::MakeFilterPlan(0, 4, 2);
+  CHECK(sep_high.pass_count == 4 && sep_high.passes[0].output == rtao::FilterSlot::F0 && sep_high.passes[1].output == rtao::FilterSlot::F1 &&
+        sep_high.passes[2].output == rtao::FilterSlot::F0 && sep_high.passes[3].output == rtao::FilterSlot::B &&
+        sep_high.passes[0].direction == rtao::FilterDirection::Horizontal && sep_high.passes[1].direction == rtao::FilterDirection::Vertical,
+        "separable High: A->F0 (H), F0->F1 (V), F1->F0 (H), F0->B (V)");
+  const rtao::FilterPlan atrous_high = rtao::MakeFilterPlan(1, 4, 2);
+  CHECK(atrous_high.pass_count == 2 && atrous_high.passes[0].input == rtao::FilterSlot::A && atrous_high.passes[0].output == rtao::FilterSlot::F0 &&
+        atrous_high.passes[1].output == rtao::FilterSlot::B && atrous_high.passes[0].direction == rtao::FilterDirection::Both,
+        "a-trous High: A->F0, F0->B, both 2D");
+  // Every type x radius 1..8 x quality 0..2.
+  int bad_chain = 0, bad_taps = 0, bad_footprint = 0, bad_direction = 0, combinations = 0;
+  for (int type = 0; type <= 1; ++type) {
+    for (int radius = 1; radius <= 8; ++radius) {
+      for (int quality = 0; quality <= 2; ++quality) {
+        ++combinations;
+        const rtao::FilterPlan plan = rtao::MakeFilterPlan(type, radius, quality);
+        const bool separable = type == 0;
+        const uint32_t iterations = quality == 2 ? 2u : 1u;
+        const uint32_t expected_passes = separable ? 2u * iterations : iterations;
+        if (plan.iterations != iterations || plan.pass_count != expected_passes) ++bad_chain;
+        if (plan.kind != (separable ? rtao::FilterKind::Separable : rtao::FilterKind::ATrous)) ++bad_chain;
+        if (plan.passes[0].input != rtao::FilterSlot::A || plan.passes[plan.pass_count - 1u].output != rtao::FilterSlot::B) ++bad_chain;
+        const uint32_t r = static_cast<uint32_t>(radius);
+        for (uint32_t i = 0; i < plan.pass_count; ++i) {
+          const rtao::FilterPass& pass = plan.passes[i];
+          if (pass.input == pass.output) ++bad_chain;  // never read and write one texture
+          if (i > 0u && pass.input != plan.passes[i - 1u].output) ++bad_chain;
+          const bool last = i + 1u == plan.pass_count;
+          if (last ? pass.output != rtao::FilterSlot::B : pass.output == rtao::FilterSlot::B) ++bad_chain;
+          if (separable) {
+            if (pass.direction != (i % 2u == 0u ? rtao::FilterDirection::Horizontal : rtao::FilterDirection::Vertical)) ++bad_direction;
+            const uint32_t step = quality == 0 ? 2u : 1u;
+            if (pass.step != step || pass.taps != 2u * (r / step) + 1u) ++bad_taps;
+            if (pass.footprint != (r / step) * step || pass.footprint > r) ++bad_footprint;
+          } else {
+            const uint32_t step = r / 2u > 1u ? r / 2u : 1u;
+            if (pass.direction != rtao::FilterDirection::Both) ++bad_direction;
+            if (pass.step != step || pass.taps != (quality == 0 ? 9u : 25u)) ++bad_taps;
+            if (pass.footprint != 2u * step) ++bad_footprint;
+            // Planner rule: +-R for even R, +-(R-1) for odd R (holds for R >= 3; R = 1 clamps the step to 1, so reach 2).
+            if (r >= 2u && r % 2u == 0u && pass.footprint != r) ++bad_footprint;
+            if (r >= 3u && r % 2u == 1u && pass.footprint != r - 1u) ++bad_footprint;
+          }
+        }
+      }
+    }
+  }
+  CHECK(bad_chain == 0, "filter chains: %d bad passes over %d type x radius x quality combinations", bad_chain, combinations);
+  CHECK(bad_direction == 0, "separable passes alternate H, V; a-trous passes are 2D (%d bad)", bad_direction);
+  CHECK(bad_taps == 0, "taps per pass: separable 2*floor(R/stride)+1, a-trous 9 (Low) or 25 (Med/High) (%d bad)", bad_taps);
+  CHECK(bad_footprint == 0, "footprint: separable floor(R/stride)*stride, a-trous 2*max(1,floor(R/2)) (%d bad)", bad_footprint);
+  std::printf("spatial filter plan: %d combinations (chain, slots, directions, taps, footprint), constants, reason, snapshot size (real)\n", combinations);
+}
+
+// ---- S2 spatial filter resources (REAL: lazy creation, size change, pipeline, destroy, on the mock device) ----
+static void TestFilterResources() {
+  CHECK(rtao::kRtaoStatsCount == 71u && rtao::kRtaoStatFilterBase == 68u && rtao::kRtaoStatFilterCount == 3u,
+        "filter stats at 68..70, stats count 71");
+  CHECK(rtao::kRtaoFilterPushCount == 12u && sizeof(rtao::RtaoFilterPushConstants) == 12u * sizeof(float), "filter b12 is 12 floats");
+  Device dev;
+  rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
+  CHECK(dev.res.empty() && data.filter_texture[0].handle == 0u && data.filter_pipeline.handle == 0u,
+        "spatial filter off: nothing created");
+  CHECK(rtao::EnsureRtaoFilterTargets(&dev, &data, 64u, 32u), "filter targets created on first use");
+  CHECK(data.filter_texture[0].handle != 0u && data.filter_texture[1].handle != 0u && data.filter_texture[2].handle != 0u,
+        "F0, F1 and B exist");
+  int textures = 0;
+  for (const auto& entry : dev.res) textures += entry.second.desc.type == resource_type::texture_2d ? 1 : 0;
+  CHECK(textures == 3, "three filter textures (%d)", textures);
+  const int creates = dev.texture_creates;
+  CHECK(rtao::EnsureRtaoFilterTargets(&dev, &data, 64u, 32u) && dev.texture_creates == creates, "same size: no new targets");
+  CHECK(rtao::EnsureRtaoFilterTargets(&dev, &data, 32u, 16u) && dev.texture_creates == creates + 3, "size change replaces the three targets");
+  textures = 0;
+  for (const auto& entry : dev.res) textures += entry.second.desc.type == resource_type::texture_2d ? 1 : 0;
+  CHECK(textures == 3, "after the size change: three filter textures (%d)", textures);
+  CHECK(rtao::EnsureRtaoFilterPipeline(&dev, &data) && data.filter_pipeline.handle != 0u && !data.filter_failed, "filter pipeline created");
+  rtao::DestroyRtaoDeviceData(&dev);
+  CHECK(dev.res.empty(), "destroy leaves nothing (%zu left)", dev.res.size());
+  std::printf("spatial filter resources: lazy targets, size change, pipeline, destroy (mock)\n");
+}
+
+// ---- S3 spatial filter dispatch (REAL: rtao::Dispatch on the mock; the mock records dispatches, null pushes, the
+// slots bound at the last dispatch and the device objects). ----
+static void SpatialFrame(Device* dev, CmdList* cl, rtao::RtaoDispatchInputs* in, bool spatial, int type, int quality, int debug_mode) {
+  in->spatial = spatial;
+  in->filter_type = type;
+  in->filter_quality = quality;
+  in->debug_mode = debug_mode;
+  (void)dev;
+  (void)cl;
+}
+static rtao::RtaoDispatchInputs SpatialInputs(CmdList* cl, Device* dev) {
+  rtao::RtaoDispatchInputs in = {};
+  cl->dev = dev;
+  in.width = 64u;
+  in.height = 32u;
+  in.depth_view = {0x9000u};
+  in.mrt_normal_view = {0x9200u};
+  in.isfast_view = {0x9300u};
+  in.scene_cbv_view = {0x9100u};
+  return in;
+}
+static void TestSpatialDispatch() {
+  // Filter passes per configuration: separable Low/Medium 2, High 4; a-trous Low/Medium 1, High 2.
+  const int cases[6][3] = {{0, 0, 2}, {0, 1, 2}, {0, 2, 4}, {1, 0, 1}, {1, 1, 1}, {1, 2, 2}};
+  for (const auto& c : cases) {
+    Device dev;
+    CmdList cl;
+    rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
+    SpatialFrame(&dev, &cl, &in, true, c[0], c[1], 0);
+    const rtao::RtaoDispatchResult r = rtao::Dispatch(&dev, &cl, in);
+    rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
+    const int expected = 1 + c[2];  // pass A + the filter passes
+    CHECK(r.ok && data.filter_ran && cl.dispatches == expected, "filter type %d quality %d: %d dispatches, expected %d (ran %d)",
+          c[0], c[1], cl.dispatches, expected, data.filter_ran ? 1 : 0);
+    CHECK(cl.null_srv_pushes == cl.dispatches && cl.null_uav_pushes == cl.dispatches,
+          "type %d quality %d: every dispatch is followed by the srv and uav nulls (%d, %d of %d)", c[0], c[1],
+          cl.null_srv_pushes, cl.null_uav_pushes, cl.dispatches);
+    int srv_left = 0, uav_left = 0;
+    for (uint32_t i = 0; i < rtao::kRtaoSrvCount; ++i) srv_left += cl.cs_srv[i].handle != 0u ? 1 : 0;
+    for (uint32_t i = 0; i < rtao::kRtaoUavCount; ++i) uav_left += cl.cs_uav[i].handle != 0u ? 1 : 0;
+    CHECK(srv_left == 0 && uav_left == 0, "type %d quality %d: no slot left bound after the frame", c[0], c[1]);
+    CHECK(rtao::OutputSrv(data).handle == data.filter_srv[2].handle && data.filter_srv[2].handle != 0u, "output view is B");
+    CHECK(cl.snaps.back().uav[0].handle == data.filter_uav[2].handle, "type %d quality %d: the last pass writes B (u0)", c[0], c[1]);
+    CHECK(cl.snaps.back().srv[4].handle == data.ao_srv.handle, "type %d quality %d: the last pass binds the unfiltered AO at t4", c[0], c[1]);
+    CHECK(data.timer.open == -1 && data.filter_timer.open == -1, "main and filter timers closed after the frame (order not observable in the mock)");
+  }
+  // Debug modes 1..7 bypass the filter (one dispatch, the AO view); mode 8 runs it.
+  for (int mode = 1; mode <= 7; ++mode) {
+    Device dev;
+    CmdList cl;
+    rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
+    SpatialFrame(&dev, &cl, &in, true, 0, 1, mode);
+    rtao::Dispatch(&dev, &cl, in);
+    rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
+    CHECK(cl.dispatches == 1 && !data.filter_ran && rtao::OutputSrv(data).handle == data.ao_srv.handle,
+          "debug mode %d bypasses the filter (%d dispatches)", mode, cl.dispatches);
+  }
+  {
+    Device dev;
+    CmdList cl;
+    rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
+    SpatialFrame(&dev, &cl, &in, true, 0, 1, 8);
+    rtao::Dispatch(&dev, &cl, in);
+    rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
+    CHECK(cl.dispatches == 3 && data.filter_ran, "debug mode 8 runs the filter (%d dispatches)", cl.dispatches);
+  }
+  // Spatial Filter off: no filter dispatch, no filter objects, the AO view; mode 8 behaves like mode 0.
+  {
+    Device dev;
+    CmdList cl;
+    rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
+    SpatialFrame(&dev, &cl, &in, false, 0, 1, 8);
+    const rtao::RtaoDispatchResult r = rtao::Dispatch(&dev, &cl, in);
+    rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
+    CHECK(r.ok && cl.dispatches == 1 && cl.null_srv_pushes == 1 && cl.null_uav_pushes == 1,
+          "spatial off: one dispatch with its nulls (%d dispatches)", cl.dispatches);
+    CHECK(data.filter_texture[0].handle == 0u && data.filter_texture[1].handle == 0u && data.filter_texture[2].handle == 0u
+              && data.filter_pipeline.handle == 0u && data.filter_layout.handle == 0u && data.filter_cbv_table.handle == 0u
+              && data.filter_srv_table.handle == 0u && data.filter_uav_table.handle == 0u && data.filter_width == 0u,
+          "spatial off: no filter pipeline, layout, tables or targets created");
+    CHECK(data.filter_timer.created == false && !data.filter_ran && rtao::OutputSrv(data).handle == data.ao_srv.handle,
+          "spatial off: the timer is untouched and the output view is the AO");
+    CHECK(dev.texture_creates == 1, "spatial off: only the AO texture was created (%d)", dev.texture_creates);
+  }
+  // Forced creation failure, then the off -> on retry: sticky while on; cleared once by off -> on.
+  {
+    Device dev;
+    rtao::RtaoDeviceData* data_ptr = nullptr;
+    auto frame = [&](bool spatial, bool fail) {
+      CmdList cl;
+      rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
+      SpatialFrame(&dev, &cl, &in, spatial, 0, 1, 0);
+      dev.fail_texture_2d = fail;
+      rtao::Dispatch(&dev, &cl, in);
+      data_ptr = &rtao::GetRtaoDeviceData(&dev);
+      return cl.dispatches;
+    };
+    frame(false, false);  // AO objects exist, filter off
+    const int f1 = frame(true, true);
+    CHECK(f1 == 1 && !data_ptr->filter_ran && data_ptr->filter_failed && rtao::OutputSrv(*data_ptr).handle == data_ptr->ao_srv.handle,
+          "forced failure: AO only, filter_failed set, output is A (%d dispatches)", f1);
+    const int f2 = frame(true, false);
+    CHECK(f2 == 1 && !data_ptr->filter_ran && data_ptr->filter_failed, "failure stays sticky while Spatial Filter stays on");
+    frame(false, false);
+    CHECK(data_ptr->filter_failed, "off keeps the failure flag");
+    const int f4 = frame(true, false);
+    CHECK(f4 == 3 && data_ptr->filter_ran && !data_ptr->filter_failed,
+          "off -> on clears the failure once: the filter runs again (%d dispatches)", f4);
+  }
+  std::printf("spatial dispatch: pass counts per type x quality, debug 1..7 bypass, mode 8, off path, failure and retry (mock)\n");
+}
+
+// ---- S3 filter math. TRANSCRIPTION of world_rtao_filter.cs_5_0.hlsl (edge stops, separable kernel, copy-through,
+// rounding, stats). Labelled: these are not the GPU code. ----
+struct FV3 { float x, y, z; };
+static FV3 FSub(FV3 a, FV3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static float FDot(FV3 a, FV3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+struct FPix { FV3 P; FV3 N; float value; bool sky; };
+static const FV3 kFilterCamera = {0.f, 0.f, -1000.f};
+static float EdgeWeightT(const FPix& c, const FPix& t) {
+  if (t.sky) return 0.f;
+  const float dist_c = std::sqrt(FDot(FSub(c.P, kFilterCamera), FSub(c.P, kFilterCamera)));
+  const float plane = FDot(c.N, FSub(t.P, c.P)) / (0.02f * dist_c);
+  const float nd = std::fmin(std::fmax(FDot(c.N, t.N), 0.f), 1.f);
+  return std::exp(-0.5f * plane * plane) * std::pow(nd, 16.f);
+}
+// Separable 1D pass around index c with stride 1: Gaussian in the offset, sigma = max(radius / 2, 0.5).
+static float SeparableT(const std::vector<FPix>& px, int c, int radius) {
+  const float sigma = std::fmax(radius * 0.5f, 0.5f);
+  float sum_w = 0.f, sum_v = 0.f;
+  for (int k = -radius; k <= radius; ++k) {
+    const int idx = c + k;
+    if (idx < 0 || idx >= static_cast<int>(px.size())) continue;
+    const float d = static_cast<float>(k) / sigma;
+    const float w = std::exp(-0.5f * d * d) * (k == 0 ? 1.f : EdgeWeightT(px[c], px[idx]));
+    sum_w += w;
+    sum_v += w * px[idx].value;
+  }
+  return sum_v / sum_w;
+}
+static FPix FlatPix(float x, float value) {
+  FPix p;
+  p.P = {x, 0.f, 0.f};
+  p.N = {0.f, 0.f, 1.f};
+  p.value = value;
+  p.sky = false;
+  return p;
+}
+static uint32_t QuantT(float v) {
+  const float s = std::fmin(std::fmax(v, 0.f), 1.f);
+  const uint32_t q = static_cast<uint32_t>(std::round(s * 255.f));
+  return q < 255u ? q : 255u;
+}
+static void TestFilterMath() {
+  std::vector<FPix> flat;
+  for (int i = 0; i < 9; ++i) flat.push_back(FlatPix(static_cast<float>(i), 0.5f));
+  CHECK(std::fabs(SeparableT(flat, 4, 2) - 0.5f) < 1e-6f, "filter math (transcription): flat region is unchanged");
+  std::vector<FPix> step = flat;
+  step[6].P.z = 100.f;  // depth step: the plane distance is 100 at view distance ~1000
+  std::vector<FPix> step_hi = step;
+  step_hi[6].value = 1.f;
+  CHECK(std::fabs(SeparableT(step, 4, 2) - SeparableT(step_hi, 4, 2)) < 1e-4f,
+        "filter math (transcription): a depth step isolates the far side (weight ~0)");
+  std::vector<FPix> normal = flat;
+  normal[5].N = {1.f, 0.f, 0.f};  // normal edge: dot 0 with the centre, weight 0
+  std::vector<FPix> normal_hi = normal;
+  normal_hi[5].value = 1.f;
+  CHECK(std::fabs(SeparableT(normal, 4, 2) - SeparableT(normal_hi, 4, 2)) < 1e-6f,
+        "filter math (transcription): a normal edge isolates the other side");
+  std::vector<FPix> outlier = flat;
+  outlier[4].value = 1.f;  // centre is an outlier on a flat neighbourhood: smoothed, not kept
+  const float smoothed = SeparableT(outlier, 4, 2);
+  CHECK(smoothed > 0.5f && smoothed < 1.f, "filter math (transcription): a single outlier is smoothed (%f)", smoothed);
+  std::vector<FPix> hot = flat;
+  hot[5].value = 1.f;  // neighbour outlier pulls the centre up, less than fully
+  const float pulled = SeparableT(hot, 4, 2);
+  CHECK(pulled > 0.5f && pulled < 1.f, "filter math (transcription): a neighbour outlier pulls the centre part way (%f)", pulled);
+  std::vector<FPix> ones = flat;
+  for (auto& p : ones) p.value = 1.f;
+  CHECK(std::fabs(SeparableT(ones, 4, 3) - 1.f) < 1e-6f, "filter math (transcription): weights are normalised (flat 1 stays 1)");
+  const float sigma = std::fmax(3 * 0.5f, 0.5f);
+  CHECK(std::fabs(std::exp(-0.5f * (1.f / sigma) * (1.f / sigma)) - std::exp(-0.5f * (-1.f / sigma) * (-1.f / sigma))) < 1e-9f,
+        "filter math (transcription): kernel weights are symmetric");
+  // Tilted plane: neighbours on the same plane keep full weight.
+  const float inv = 1.f / std::sqrt(1.25f);
+  FPix tilt_c = {{0.f, 0.f, 0.f}, {-0.5f * inv, 0.f, inv}, 0.5f, false};
+  FPix tilt_n = {{1.f, 0.f, 0.5f}, {-0.5f * inv, 0.f, inv}, 0.5f, false};
+  CHECK(std::fabs(EdgeWeightT(tilt_c, tilt_n) - 1.f) < 1e-5f, "filter math (transcription): a tilted plane keeps full weight along it (%f)", EdgeWeightT(tilt_c, tilt_n));
+  // Sky or invalid-normal tap: weight 0; sky centre: copied through.
+  FPix sky_n = flat[5];
+  sky_n.sky = true;
+  CHECK(EdgeWeightT(flat[4], sky_n) == 0.f, "filter math (transcription): a sky tap has weight 0");
+  // Rounding and the 255 cap.
+  CHECK(QuantT(1.0f) == 255u && QuantT(1.7f) == 255u && QuantT(0.f) == 0u, "filter math (transcription): saturate and cap at 255");
+  CHECK(QuantT(0.501f) == 128u && QuantT(0.499f) == 127u, "filter math (transcription): round to the nearest 1/255");
+  // Stats: |out - AO| x1000 and the count above one LSB (1/255).
+  const float change = std::fabs(0.5f - 0.25f);
+  CHECK(static_cast<uint32_t>(change * 1000.f) == 250u && change > 1.f / 255.f, "filter math (transcription): change sum 250 and counted above 1 LSB");
+  std::printf("filter math: transcriptions of the edge stops, separable kernel, rounding and stats (labelled)\n");
+}
+
+// Source guard: the pass A and pass B shaders are byte-identical to HEAD (recorded now; git diff empty for both).
+static void TestPassShadersUnchanged() {
+  const std::string pass_a = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao.cs_5_0.hlsl");
+  const std::string pass_b = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao_temporal.cs_5_0.hlsl");
+  auto fnv = [](const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+  };
+  CHECK(fnv(pass_a) == 0x5e7d000039ab22cfull, "pass A harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
+  CHECK(fnv(pass_b) == 0xba6fc5c95a80cf38ull, "pass B harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
+}
+
+// ---- S4 spatial_filter JSON (REAL: rtao::BuildRtaoJson; filter on/off and both types, the twelve keys in order) ----
+static std::string SpatialJson(bool on, int type, int quality) {
+  static rtao::RtaoFrameState f;
+  f = rtao::RtaoFrameState{};
+  static uint32_t values[rtao::kRtaoStatsCount];
+  std::memset(values, 0, sizeof(values));
+  const rtao::FilterPlan plan = rtao::MakeFilterPlan(type, 2, quality);
+  f.filter_requested = on;
+  f.filter_ran = on;
+  f.filter_type = type;
+  f.filter_radius = 2;
+  f.filter_quality = quality;
+  f.filter_iterations = plan.iterations;
+  f.filter_passes = plan.pass_count;
+  f.filter_taps = plan.passes[0].taps;
+  f.filter_gpu_ms = 0.25f;
+  values[rtao::kRtaoStatFilterBase] = 4u;
+  values[rtao::kRtaoStatFilterBase + 1u] = 2000u;
+  values[rtao::kRtaoStatFilterBase + 2u] = 1u;
+  rtao::RtaoJsonInput in = {};
+  in.frame = &f;
+  in.values = values;
+  in.generated_frame = 1u;
+  return rtao::BuildRtaoJson(in);
+}
+static void TestSpatialJson() {
+  struct Case { bool on; int type; int quality; int passes; int taps; };
+  const Case cases[] = {{false, 0, 1, 2, 5}, {true, 0, 1, 2, 5}, {true, 1, 1, 1, 25}, {true, 0, 2, 4, 5}, {true, 1, 0, 1, 9}};
+  for (const Case& c : cases) {
+    const std::string text = SpatialJson(c.on, c.type, c.quality);
+    JNode root;
+    JsonParser parser(text);
+    CHECK(parser.Parse(&root), "spatial json: parses (on %d, type %d, quality %d)", c.on ? 1 : 0, c.type, c.quality);
+    const JNode* sf = Member(root, "spatial_filter");
+    CHECK(sf && sf->kind == JNode::Kind::Object && sf->keys.size() == 12u, "spatial json: spatial_filter is top level with 12 keys");
+    static const char* const keys[] = {"on", "type", "radius", "quality", "iterations", "passes", "taps_per_pass", "gpu_ms",
+                                       "pixels", "mean_change", "changed_gt_1lsb_pct", "failed"};
+    bool order_ok = sf != nullptr && sf->keys.size() == 12u;
+    for (size_t i = 0; order_ok && i < 12u; ++i) order_ok = sf->keys[i] == keys[i];
+    CHECK(order_ok, "spatial json: keys in order (on %d, type %d)", c.on ? 1 : 0, c.type);
+    const JNode* on = sf ? Member(*sf, "on") : nullptr;
+    CHECK(on && on->text == (c.on ? "true" : "false"), "spatial json: on = %s", c.on ? "true" : "false");
+    if (c.on && sf) {
+      CHECK(Member(*sf, "passes")->text == std::to_string(c.passes) && Member(*sf, "taps_per_pass")->text == std::to_string(c.taps),
+            "spatial json: passes %d, taps per pass %d (type %d, quality %d)", c.passes, c.taps, c.type, c.quality);
+      CHECK(Member(*sf, "mean_change")->text == "0.5" && Member(*sf, "changed_gt_1lsb_pct")->text == "25" && Member(*sf, "pixels")->text == "4",
+            "spatial json: mean change 0.5 (MeanFromSum), 25%% above 1 LSB, 4 pixels");
+      CHECK(Member(*sf, "failed")->text == "false", "spatial json: not failed");
+    }
+  }
+  std::printf("spatial json: filter off and on for both types and three qualities, twelve keys in order (real builder, text parser)\n");
+}
+
 int main() {
   HStage("gate table");
   TestGateTable();
@@ -1499,6 +1865,12 @@ int main() {
   TestWorldJson();
   TestOutputQuality();
   TestNormalRamp();
+  TestSpatialPlan();
+  TestFilterResources();
+  TestSpatialDispatch();
+  TestFilterMath();
+  TestPassShadersUnchanged();
+  TestSpatialJson();
   HStage("temporal dispatch (mock)");
   TestTemporalDispatch();
   HStage("device lifecycle (mock)");

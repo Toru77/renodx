@@ -24,6 +24,16 @@ struct RtaoFrameState {
   uint64_t dispatched_frame = UINT64_MAX;
   uint64_t frames_without_ao = 0u;   // RTAO requested but no AO this frame
   float gpu_ms = -1.f;               // newest completed RTAO dispatch (negative: none yet)
+  float filter_gpu_ms = -1.f;        // newest completed spatial filter chain (negative: none yet)
+  bool filter_requested = false;     // Spatial Filter on at the newest dispatch
+  bool filter_ran = false;           // the filter ran: the output is the filtered AO
+  bool filter_failed = false;        // filter targets or pipeline could not be created
+  int filter_type = 0;               // configuration used at the newest dispatch
+  int filter_radius = 2;
+  int filter_quality = 1;
+  uint32_t filter_iterations = 0u;
+  uint32_t filter_passes = 0u;
+  uint32_t filter_taps = 0u;         // taps per pass (first pass)
   uint64_t texture_bytes = 0u;       // AO target, stats buffer, and (Temporal) raw AO and history
   bool fade_valid = false;           // fade is computed from the built region
   Fade fade = {};
@@ -77,6 +87,12 @@ struct RtaoDispatchInputs {
   bool temporal = false;
   reshade::api::resource_view motion_view = {0u};
   RtaoTemporalPushConstants temporal_push = {};  // params, debug mode and history valid set by the caller
+  // Spatial filter (S3): runs on the final AO after pass B (or pass A). Debug modes 1..7 bypass it; mode 8 runs it.
+  bool spatial = false;
+  int filter_type = 0;     // 0 separable bilateral, 1 a-trous 5x5
+  int filter_radius = 2;
+  int filter_quality = 1;  // 0 Low, 1 Medium, 2 High
+  int debug_mode = 0;
 };
 
 struct RtaoDispatchResult {
@@ -105,6 +121,72 @@ inline void NullComputeSlots(reshade::api::command_list* cmd_list, uint32_t srv_
           {}, 0, 0, sampler_count, reshade::api::descriptor_type::sampler, null_samplers});
 }
 
+// Spatial filter (S3): the MakeFilterPlan chain, one dispatch per pass, slots nulled after each one. The first pass
+// reads the AO texel (A); the last pass writes B. Returns false when a target or the pipeline cannot be created
+// (the caller then uses A). The filter timer wraps the whole chain.
+inline bool DispatchSpatialFilter(reshade::api::device* device, reshade::api::command_list* cmd_list,
+                                  const RtaoDispatchInputs& in, RtaoDeviceData* data) {
+  if (!EnsureRtaoFilterTargets(device, data, in.width, in.height) || !EnsureRtaoFilterPipeline(device, data)) return false;
+  const FilterPlan plan = MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_quality);
+  bvh::BeginGpuTimer(device, cmd_list, &data->filter_timer);
+  cmd_list->barrier(data->ao_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, data->filter_pipeline);
+  for (uint32_t i = 0u; i < plan.pass_count; ++i) {
+    const FilterPass& pass = plan.passes[i];
+    // Intermediate and B slots index the filter arrays as F0 = 0, F1 = 1, B = 2 (FilterSlot values 1..3).
+    const uint32_t out_index = static_cast<uint32_t>(pass.output) - 1u;
+    const uint32_t in_index = static_cast<uint32_t>(pass.input) - 1u;
+    const bool input_is_ao = pass.input == FilterSlot::A;
+    const bool output_is_uint = pass.output == FilterSlot::B;
+    const reshade::api::resource_view srvs[kRtaoFilterSrvCount] = {
+        in.depth_view, in.mrt_normal_view, input_is_ao ? data->ao_srv : reshade::api::resource_view{0u},
+        input_is_ao ? reshade::api::resource_view{0u} : data->filter_srv[in_index], data->ao_srv};
+    const reshade::api::resource_view uavs[kRtaoFilterUavCount] = {
+        output_is_uint ? data->filter_uav[out_index] : reshade::api::resource_view{0u},
+        output_is_uint ? reshade::api::resource_view{0u} : data->filter_uav[out_index], data->stats_uav};
+    RtaoFilterPushConstants push = {};
+    push.size[0] = static_cast<float>(in.width);
+    push.size[1] = static_cast<float>(in.height);
+    push.size[2] = static_cast<float>(in.filter_radius);
+    push.size[3] = plan.kind == FilterKind::Separable ? 0.f : 1.f;
+    push.pass[0] = static_cast<float>(pass.direction);
+    push.pass[1] = static_cast<float>(pass.step);
+    push.pass[2] = static_cast<float>(in.filter_quality);
+    push.pass[3] = i + 1u == plan.pass_count ? 1.f : 0.f;
+    push.flags[0] = input_is_ao ? 1.f : 0.f;
+    push.flags[1] = output_is_uint ? 1.f : 0.f;
+    push.flags[2] = static_cast<float>(in.debug_mode);
+    reshade::api::descriptor_table_update updates[3] = {
+        {data->filter_cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &in.scene_cbv_view},
+        {data->filter_srv_table, 0, 0, kRtaoFilterSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs},
+        {data->filter_uav_table, 0, 0, kRtaoFilterUavCount, reshade::api::descriptor_type::unordered_access_view, uavs},
+    };
+    device->update_descriptor_tables(3, updates);
+    const reshade::api::descriptor_table tables[3] = {data->filter_cbv_table, data->filter_srv_table, data->filter_uav_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, data->filter_layout, 0, 3, tables);
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, data->filter_layout, 3, 0, kRtaoFilterPushCount, &push);
+    cmd_list->dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+    NullComputeSlots(cmd_list, kRtaoFilterSrvCount, kRtaoFilterUavCount, 0u);
+    cmd_list->barrier(data->filter_texture[out_index], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+  }
+  // App-side tables: null contents (ReShade keeps descriptors in the table object).
+  const reshade::api::resource_view null_srvs[kRtaoFilterSrvCount] = {};
+  const reshade::api::resource_view null_uavs[kRtaoFilterUavCount] = {};
+  reshade::api::descriptor_table_update nulls[2] = {
+      {data->filter_srv_table, 0, 0, kRtaoFilterSrvCount, reshade::api::descriptor_type::shader_resource_view, null_srvs},
+      {data->filter_uav_table, 0, 0, kRtaoFilterUavCount, reshade::api::descriptor_type::unordered_access_view, null_uavs},
+  };
+  device->update_descriptor_tables(2, nulls);
+  bvh::EndGpuTimer(cmd_list, &data->filter_timer);
+  return true;
+}
+
+// The AO view the lighting shader (t22), the micro shadows and the deferred list read: the filtered AO when the
+// filter ran this frame, otherwise the AO texel itself (A).
+inline reshade::api::resource_view OutputSrv(const RtaoDeviceData& rd) {
+  return rd.filter_ran ? rd.filter_srv[2] : rd.ao_srv;
+}
+
 // Binds, dispatches and unbinds. The AO and the history are written only by a pass that succeeded.
 inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtaoDispatchInputs& in) {
   auto* bvh_data = bvh::GetBvhDeviceData(device);
@@ -114,6 +196,9 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       || !EnsureRtaoStats(device, &data)) {
     return {};
   }
+  data.filter_ran = false;
+  if (in.spatial && !data.filter_was_on) data.filter_failed = false;  // off -> on: one retry after a failure
+  data.filter_was_on = in.spatial;
   // Pass B only when its pipeline, targets and motion are available; otherwise pass A writes the round-1 AO.
   const bool temporal_run = in.temporal && in.motion_view.handle != 0u
       && EnsureRtaoTemporalPipeline(device, &data)
@@ -190,6 +275,10 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     data.raw_index ^= 1u;        // and this raw AO is the previous frame for the next pass B
   }
   bvh::EndGpuTimer(cmd_list, &data.timer);
+  // Spatial filter after the AO is final, outside the main timer span. Debug modes 1..7 write AO-free texels, so the filter does not run for them.
+  if (in.spatial && (in.debug_mode < 1 || in.debug_mode > 7)) {
+    data.filter_ran = DispatchSpatialFilter(device, cmd_list, in, &data);
+  }
 
   // App-side tables: null contents (ReShade keeps descriptors in the table object).
   const reshade::api::resource_view table_null_srvs[kRtaoSrvCount] = {};
@@ -358,6 +447,14 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
   }
   out << "}}"
       << ",\n  \"temporal_diagnostics\": " << diag.str()
+      << ",\n  \"spatial_filter\": {\"on\": " << (f.filter_requested ? "true" : "false")
+      << ", \"type\": " << f.filter_type << ", \"radius\": " << f.filter_radius << ", \"quality\": " << f.filter_quality
+      << ", \"iterations\": " << f.filter_iterations << ", \"passes\": " << f.filter_passes
+      << ", \"taps_per_pass\": " << f.filter_taps << ", \"gpu_ms\": " << f.filter_gpu_ms
+      << ", \"pixels\": " << v[kRtaoStatFilterBase]
+      << ", \"mean_change\": " << MeanFromSum(v[kRtaoStatFilterBase + 1u], v[kRtaoStatFilterBase])
+      << ", \"changed_gt_1lsb_pct\": " << (v[kRtaoStatFilterBase] > 0u ? 100.0 * v[kRtaoStatFilterBase + 2u] / v[kRtaoStatFilterBase] : 0.0)
+      << ", \"failed\": " << (f.filter_failed ? "true" : "false") << "}"
       << ",\n  \"test_modes\": {\"zero_motion\": " << (in.zero_motion ? "true" : "false")
       << ", \"camera_matrix\": " << (in.camera_matrix ? "true" : "false")
       << ", \"freeze_noise\": " << (in.freeze_noise ? "true" : "false") << "}"

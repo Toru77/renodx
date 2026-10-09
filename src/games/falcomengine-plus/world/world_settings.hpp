@@ -76,7 +76,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
 
-  const auto not_implemented_spatial = "Round 3 (spatial denoising). Not implemented yet: this setting does nothing.";
   settings->push_back(new Setting{
       .key = "RtaoEnabled",
       .binding = &rtao::g_rtao_enabled,
@@ -110,8 +109,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTAO Debug",
       .section = "RTAO",
-      .tooltip = "Modes are shown directly on screen while RTAO produces AO (grayscale, scale 0.3, as the GTVBAO raw view); no GTVBAO Debug View needed. Modes apply with Temporal on (pass B writes them); with Temporal off only mode 0 has an effect. Off = normal AO. 1 raw AO. 2 accumulated AO = unclamped reprojected history (raw where no tap is valid). 3 history confidence = valid tap fraction. 4 motion = saturate(px / 4), white at 4 px. 5 blend alpha = 0 to History Weight. 6 |raw - AO| = saturate(diff * 2). 7 motion vs camera matrix = saturate(px / 2) (static geometry only). A full white image in mode 3 or 5 means 1.0.",
-      .labels = {"Off", "Raw AO", "Accumulated AO", "History confidence", "Motion (px)", "Blend alpha", "|raw - AO|", "Motion vs matrix (px)"},
+      .tooltip = "Modes are shown directly on screen while RTAO produces AO (grayscale, scale 0.3, as the GTVBAO raw view); no GTVBAO Debug View needed. Modes 1 to 7 apply with Temporal on (pass B writes them); mode 8 needs Spatial Filter on and works with Temporal off too. Off = normal AO. 1 raw AO. 2 accumulated AO = unclamped reprojected history (raw where no tap is valid). 3 history confidence = valid tap fraction. 4 motion = saturate(px / 4), white at 4 px. 5 blend alpha = 0 to History Weight. 6 |raw - AO| = saturate(diff * 2). 7 motion vs camera matrix = saturate(px / 2) (static geometry only). A full white image in mode 3 or 5 means 1.0. 8 filter change = saturate(|filtered - AO| x 8), needs Spatial Filter on; modes 1 to 7 bypass the filter.",
+      .labels = {"Off", "Raw AO", "Accumulated AO", "History confidence", "Motion (px)", "Blend alpha", "|raw - AO|", "Motion vs matrix (px)", "Filter change"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -318,10 +317,21 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_spatial_enabled,
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 0.f,
-      .label = "Spatial Filter (not implemented yet)",
+      .label = "Spatial Filter",
       .section = "Denoising",
-      .tooltip = not_implemented_spatial,
+      .tooltip = "Denoises the final RTAO output with edge-aware weights (depth plane and normal). The history keeps the unfiltered AO. Off = no filter, unchanged output.",
       .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtaoFilterType",
+      .binding = &rtao::g_rtao_filter_type,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "Filter Type",
+      .section = "Denoising",
+      .tooltip = "Both use the same depth and normal edge stops. Separable bilateral = the exact radius, smoother, more taps. A-trous 5x5 = classic 5x5 kernel with holes at larger radius.",
+      .labels = {"Separable bilateral", "A-trous 5x5"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -329,9 +339,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_filter_radius,
       .value_type = SettingValueType::INTEGER,
       .default_value = 2.f,
-      .label = "Filter Radius (not implemented yet)",
+      .label = "Filter Radius",
       .section = "Denoising",
-      .tooltip = not_implemented_spatial,
+      .tooltip = "Pixel radius (1 to 8). Reach on each side: separable = the radius (rounded down to the stride); a-trous = 2 x max(1, radius / 2) pixels.",
       .min = 1.f,
       .max = 8.f,
       .format = "%d",
@@ -342,9 +352,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_filter_quality,
       .value_type = SettingValueType::INTEGER,
       .default_value = 1.f,
-      .label = "Filter Quality (not implemented yet)",
+      .label = "Filter Quality",
       .section = "Denoising",
-      .tooltip = not_implemented_spatial,
+      .tooltip = "Low: separable stride 2, one iteration; a-trous 9 taps. Medium: separable every pixel, one iteration; a-trous 25 taps. High: two iterations (separable 4 passes; a-trous 2 passes). Separable Low at radius 1 has one tap per pass and changes nothing.",
       .labels = {"Low", "Medium", "High"},
       .is_visible = visible,
   });

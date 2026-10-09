@@ -9077,15 +9077,15 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   // Deferred lists may run after their slots are reused: keep the last AO only if it matches the size.
   if (cmd_list != dd->immediate_cmd_list) {
     frame.reason = rtao::Reason::DeferredList;
-    if (rd.ao_srv.handle != 0u && rd.ao_width == dd->captured_depth_w && rd.ao_height == dd->captured_depth_h) {
+    if (rtao::OutputSrv(rd).handle != 0u && rd.ao_width == dd->captured_depth_w && rd.ao_height == dd->captured_depth_h) {
       frame.producing = true;
-      PushRtaoAo(cmd_list, rd.ao_srv);
+      PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
     }
     return;
   }
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
-    PushRtaoAo(cmd_list, rd.ao_srv);
+    PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
     return;
   }
   if (!dd->captured_depth_srv.handle || !dd->captured_depth_live.load()
@@ -9221,6 +9221,11 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     rf.reset_counts[static_cast<size_t>(reset)] += 1u;
   }
   in.temporal = temporal_on;
+  in.spatial = rtao::g_rtao_spatial_enabled > 0.5f;
+  in.filter_type = static_cast<int>(rtao::g_rtao_filter_type);
+  in.filter_radius = static_cast<int>(rtao::g_rtao_filter_radius);
+  in.filter_quality = static_cast<int>(rtao::g_rtao_filter_quality);
+  in.debug_mode = static_cast<int>(rtao::g_rtao_debug);
   in.motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u};
   in.temporal_push = {
       {rtao::g_rtao_history_weight, rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection,
@@ -9247,12 +9252,24 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   frame.dispatched_frame = dd->frame_index;
   frame.producing = true;
   frame.gpu_ms = rd.timer.last_ms;
+  frame.filter_gpu_ms = rd.filter_timer.last_ms;
+  frame.filter_requested = in.spatial;
+  frame.filter_ran = rd.filter_ran;
+  frame.filter_failed = rd.filter_failed;
+  frame.filter_type = in.filter_type;
+  frame.filter_radius = in.filter_radius;
+  frame.filter_quality = in.filter_quality;
+  const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_quality);
+  frame.filter_iterations = filter_plan.iterations;
+  frame.filter_passes = filter_plan.pass_count;
+  frame.filter_taps = filter_plan.passes[0].taps;
+  if (rd.filter_failed && frame.note == rtao::Reason::Off) frame.note = rtao::Reason::FilterFailed;
   frame.captured = params;
   frame.captured_isfast_used = isfast_used;
   const uint64_t pixels = static_cast<uint64_t>(rd.ao_width) * rd.ao_height;
   rf.temporal_bytes = rd.raw_texture[0].handle != 0u ? pixels * (2u * 2u + 2u * 8u) : 0u;
   frame.texture_bytes = pixels * 4u + sizeof(uint32_t) * rtao::kRtaoStatsCount + rf.temporal_bytes;
-  PushRtaoAo(cmd_list, rd.ao_srv);
+  PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
@@ -10172,7 +10189,7 @@ static bool RunShadows(reshade::api::command_list* cl, DeviceData* d, int fromHo
   // the same buffer, in Full and in Half mode alike.
   reshade::api::resource_view ao_gtvbao = {};
   if (falcom_world::rtao::g_rtao_frame.producing) {
-    ao_gtvbao = falcom_world::rtao::GetRtaoDeviceData(dev).ao_srv;
+    ao_gtvbao = falcom_world::rtao::OutputSrv(falcom_world::rtao::GetRtaoDeviceData(dev));
   } else if (shader_injection.gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested()) {
     const bool half_active = shader_injection.gtvbao_resolution > 0.5f
                           && d->upscale_ao_srv.handle;
