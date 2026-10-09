@@ -25,10 +25,23 @@ inline void DrawRtaoPanel() {
   if (frame.note == Reason::IsfastUnavailable) {
     ImGui::TextDisabled("IS-FAST not loaded: IGN noise (isfast_unavailable)");
   }
+  const char* passes = frame.temporal_ran ? "RTAO pass A + B" : "RTAO pass A";
   if (frame.gpu_ms < 0.f) {
-    ImGui::Text("GPU: no measurement yet");
+    ImGui::Text("%s: no measurement yet", passes);
   } else {
-    ImGui::Text("GPU: %.3f ms (pass A%s)", frame.gpu_ms, frame.temporal_ran ? " + pass B" : " only");
+    ImGui::Text("%s: %.3f ms", passes, frame.gpu_ms);
+  }
+  if (frame.filter_requested) {
+    if (!frame.filter_ran) {
+      ImGui::Text("Spatial filter: not run (%s)", frame.filter_failed ? "filter_failed" : "debug modes 1 to 7 bypass it");
+    } else if (frame.filter_gpu_ms < 0.f) {
+      ImGui::Text("Spatial filter: no measurement yet");
+    } else {
+      ImGui::Text("Spatial filter: %.3f ms", frame.filter_gpu_ms);
+    }
+    if (frame.filter_ran && frame.gpu_ms >= 0.f && frame.filter_gpu_ms >= 0.f) {
+      ImGui::Text("Total: %.3f ms", frame.gpu_ms + frame.filter_gpu_ms);
+    }
   }
   ImGui::Text("Frames without AO: %llu", static_cast<unsigned long long>(frame.frames_without_ao));
   if (frame.fade_valid) {
@@ -179,14 +192,17 @@ inline void DrawRtaoPanel() {
   if (frame.filter_requested) {
     const uint32_t* v = g_rtao_stats.values;
     ImGui::SeparatorText("Denoising");
-    ImGui::Text("Spatial filter: on, %s, radius %d, quality %s (iterations %u, passes %u, taps per pass %u)",
-                frame.filter_type == 0 ? "separable bilateral" : "a-trous 5x5", frame.filter_radius,
-                frame.filter_quality == 0 ? "Low" : (frame.filter_quality == 1 ? "Medium" : "High"),
-                frame.filter_iterations, frame.filter_passes, frame.filter_taps);
-    if (frame.filter_gpu_ms < 0.f) {
-      ImGui::Text("Filter GPU: no measurement yet");
-    } else {
-      ImGui::Text("Filter GPU: %.3f ms", frame.filter_gpu_ms);
+    ImGui::Text("Spatial filter: on, %s, radius %d, passes %u (dispatches %u), taps %d (effective %u, %u samples per dispatch)",
+                frame.filter_type == 0 ? "separable bilateral" : "a-trous", frame.filter_radius,
+                frame.filter_iterations, frame.filter_passes, frame.filter_taps_requested, frame.filter_tap_count, frame.filter_taps);
+    if (frame.filter_type == 1) {
+      const FilterPlan plan = MakeFilterPlan(frame.filter_type, frame.filter_radius, frame.filter_iterations, frame.filter_taps_requested);
+      std::string steps;
+      for (uint32_t i = 0u; i < plan.pass_count; ++i) {
+        if (i > 0u) steps += ", ";
+        steps += std::to_string(plan.passes[i].step);
+      }
+      ImGui::Text("A-trous steps: %s", steps.c_str());
     }
     const uint32_t pixels = v[kRtaoStatFilterBase];
     ImGui::Text("Mean change: %.4f (share of pixels changed by more than 1 LSB: %.1f%%) over %u pixels",

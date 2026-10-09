@@ -9224,7 +9224,8 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   in.spatial = rtao::g_rtao_spatial_enabled > 0.5f;
   in.filter_type = static_cast<int>(rtao::g_rtao_filter_type);
   in.filter_radius = static_cast<int>(rtao::g_rtao_filter_radius);
-  in.filter_quality = static_cast<int>(rtao::g_rtao_filter_quality);
+  in.filter_passes = static_cast<int>(rtao::g_rtao_filter_passes);
+  in.filter_taps = static_cast<int>(in.filter_type == 1 ? rtao::g_rtao_filter_taps_atrous : rtao::g_rtao_filter_taps_separable);
   in.debug_mode = static_cast<int>(rtao::g_rtao_debug);
   in.motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u};
   in.temporal_push = {
@@ -9258,11 +9259,12 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   frame.filter_failed = rd.filter_failed;
   frame.filter_type = in.filter_type;
   frame.filter_radius = in.filter_radius;
-  frame.filter_quality = in.filter_quality;
-  const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_quality);
+  frame.filter_taps_requested = in.filter_taps;
+  const rtao::FilterPlan filter_plan = rtao::MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_passes, in.filter_taps);
   frame.filter_iterations = filter_plan.iterations;
   frame.filter_passes = filter_plan.pass_count;
   frame.filter_taps = filter_plan.passes[0].taps;
+  frame.filter_tap_count = filter_plan.taps_side;
   if (rd.filter_failed && frame.note == rtao::Reason::Off) frame.note = rtao::Reason::FilterFailed;
   frame.captured = params;
   frame.captured_isfast_used = isfast_used;

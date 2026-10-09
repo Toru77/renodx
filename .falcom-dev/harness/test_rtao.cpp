@@ -347,6 +347,7 @@ struct Device : mock::DeviceBase {
 struct CmdList : mock::CommandListBase {
   Device* dev = nullptr;
   int dispatches = 0;
+  std::vector<std::vector<float>> filter_pushes;  // B: 12-float pushes (filter layout), in order
   uint32_t groups_x = 0u, groups_y = 0u;
   int null_srv_pushes = 0, null_uav_pushes = 0;   // push_descriptors with pipeline_layout{0} that null all views
   uint32_t null_srv_count = 0u, null_uav_count = 0u;
@@ -375,7 +376,12 @@ struct CmdList : mock::CommandListBase {
       }
     }
   }
-  void push_constants(shader_stage, pipeline_layout, uint32_t, uint32_t, uint32_t, const void *) override {}
+  void push_constants(shader_stage, pipeline_layout, uint32_t, uint32_t, uint32_t count, const void* values) override {
+    if (count == rtao::kRtaoFilterPushCount) {
+      const float* f = static_cast<const float *>(values);
+      filter_pushes.emplace_back(f, f + count);
+    }
+  }
   void push_descriptors(shader_stage, pipeline_layout layout, uint32_t, const descriptor_table_update &update) override {
     const auto* views = static_cast<const resource_view *>(update.descriptors);
     if (layout.handle == 0u) {
@@ -1477,59 +1483,88 @@ static void TestSpatialPlan() {
   CHECK(static_cast<size_t>(rtao::Reason::FilterFailed) < rtao::kReasonCount && std::strcmp(rtao::ReasonName(rtao::Reason::FilterFailed), "filter_failed") == 0,
         "FilterFailed: a reason code inside kReasonCount, named filter_failed");
   CHECK(sizeof(rtao::ParameterSnapshot) == 18u * sizeof(float), "ParameterSnapshot unchanged: 18 floats, no filter field (size %zu)", sizeof(rtao::ParameterSnapshot));
-  // Explicit chains from the spec.
-  const rtao::FilterPlan sep_high = rtao::MakeFilterPlan(0, 4, 2);
-  CHECK(sep_high.pass_count == 4 && sep_high.passes[0].output == rtao::FilterSlot::F0 && sep_high.passes[1].output == rtao::FilterSlot::F1 &&
-        sep_high.passes[2].output == rtao::FilterSlot::F0 && sep_high.passes[3].output == rtao::FilterSlot::B &&
-        sep_high.passes[0].direction == rtao::FilterDirection::Horizontal && sep_high.passes[1].direction == rtao::FilterDirection::Vertical,
-        "separable High: A->F0 (H), F0->F1 (V), F1->F0 (H), F0->B (V)");
-  const rtao::FilterPlan atrous_high = rtao::MakeFilterPlan(1, 4, 2);
-  CHECK(atrous_high.pass_count == 2 && atrous_high.passes[0].input == rtao::FilterSlot::A && atrous_high.passes[0].output == rtao::FilterSlot::F0 &&
-        atrous_high.passes[1].output == rtao::FilterSlot::B && atrous_high.passes[0].direction == rtao::FilterDirection::Both,
-        "a-trous High: A->F0, F0->B, both 2D");
-  // Every type x radius 1..8 x quality 0..2.
-  int bad_chain = 0, bad_taps = 0, bad_footprint = 0, bad_direction = 0, combinations = 0;
+  // Explicit chains at radius 4, taps 5 (slots: A 0, F0 1, F1 2, B 3; directions: H 0, V 1, Both 2).
+  struct Link { int in; int out; int dir; };
+  static const Link a1[] = {{0, 3, 2}};
+  static const Link a2[] = {{0, 1, 2}, {1, 3, 2}};
+  static const Link a3[] = {{0, 1, 2}, {1, 2, 2}, {2, 3, 2}};
+  static const Link a4[] = {{0, 1, 2}, {1, 2, 2}, {2, 1, 2}, {1, 3, 2}};
+  static const Link s1[] = {{0, 1, 0}, {1, 3, 1}};
+  static const Link s2[] = {{0, 1, 0}, {1, 2, 1}, {2, 1, 0}, {1, 3, 1}};
+  static const Link s3[] = {{0, 1, 0}, {1, 2, 1}, {2, 1, 0}, {1, 2, 1}, {2, 1, 0}, {1, 3, 1}};
+  static const Link s4[] = {{0, 1, 0}, {1, 2, 1}, {2, 1, 0}, {1, 2, 1}, {2, 1, 0}, {1, 2, 1}, {2, 1, 0}, {1, 3, 1}};
+  auto links_match = [](const rtao::FilterPlan& p, const Link* links, uint32_t n) {
+    if (p.pass_count != n) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (static_cast<int>(p.passes[i].input) != links[i].in || static_cast<int>(p.passes[i].output) != links[i].out
+          || static_cast<int>(p.passes[i].direction) != links[i].dir) return false;
+    }
+    return true;
+  };
+  CHECK(links_match(rtao::MakeFilterPlan(1, 4, 1, 5), a1, 1), "a-trous 1 pass: A->B");
+  CHECK(links_match(rtao::MakeFilterPlan(1, 4, 2, 5), a2, 2), "a-trous 2 passes: A->F0, F0->B");
+  CHECK(links_match(rtao::MakeFilterPlan(1, 4, 3, 5), a3, 3), "a-trous 3 passes: A->F0, F0->F1, F1->B");
+  CHECK(links_match(rtao::MakeFilterPlan(1, 4, 4, 5), a4, 4), "a-trous 4 passes: A->F0, F0->F1, F1->F0, F0->B");
+  CHECK(links_match(rtao::MakeFilterPlan(0, 4, 1, 5), s1, 2), "separable 1 pass: A->F0 (H), F0->B (V)");
+  CHECK(links_match(rtao::MakeFilterPlan(0, 4, 2, 5), s2, 4), "separable 2 passes: A->F0, F0->F1, F1->F0, F0->B");
+  CHECK(links_match(rtao::MakeFilterPlan(0, 4, 3, 5), s3, 6), "separable 3 passes: six dispatches alternating F0/F1, last F0->B");
+  CHECK(links_match(rtao::MakeFilterPlan(0, 4, 4, 5), s4, 8), "separable 4 passes: eight dispatches alternating F0/F1, last F0->B");
+  // Effective taps (odd side, clamped) and the a-trous step table.
+  const int tap_inputs[] = {3, 4, 5, 6, 17, 18, 99, 0, -5};
+  const uint32_t sep_taps[] = {3, 5, 5, 7, 17, 17, 17, 3, 3};
+  const uint32_t at_taps[] = {3, 5, 5, 7, 9, 9, 9, 3, 3};
+  bool taps_ok = true;
+  for (size_t i = 0; i < 9; ++i) {
+    taps_ok = taps_ok && rtao::MakeFilterPlan(0, 2, 1, tap_inputs[i]).taps_side == sep_taps[i]
+        && rtao::MakeFilterPlan(1, 2, 1, tap_inputs[i]).taps_side == at_taps[i];
+  }
+  CHECK(taps_ok, "effective taps: separable 3,5,5,7,17,17,17,3,3 and a-trous 3,5,5,7,9,9,9,3,3 for the inputs 3,4,5,6,17,18,99,0,-5");
+  const uint32_t step_table[8][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 2, 2, 2},
+                                     {1, 2, 2, 2}, {1, 2, 3, 3}, {1, 2, 3, 3}, {1, 2, 4, 4}};
+  bool steps_ok = true;
+  for (int radius = 1; radius <= 8; ++radius) {
+    const rtao::FilterPlan p = rtao::MakeFilterPlan(1, radius, 4, 5);
+    for (uint32_t i = 0; i < 4; ++i) steps_ok = steps_ok && p.passes[i].step == step_table[radius - 1][i];
+  }
+  CHECK(steps_ok, "a-trous steps at 4 passes: R1-3 1,1,1,1; R4-5 1,2,2,2; R6-7 1,2,3,3; R8 1,2,4,4");
+  // Grid: every type x radius x passes x taps. Expectations are re-derived here from the rules, not from MakeFilterPlan.
+  const int grid_taps[] = {3, 4, 5, 6, 7, 8, 9, 10, 16, 17, 18, 99, 0, -5};
+  int combos = 0, mismatches = 0;
   for (int type = 0; type <= 1; ++type) {
+    const bool sep = type == 0;
     for (int radius = 1; radius <= 8; ++radius) {
-      for (int quality = 0; quality <= 2; ++quality) {
-        ++combinations;
-        const rtao::FilterPlan plan = rtao::MakeFilterPlan(type, radius, quality);
-        const bool separable = type == 0;
-        const uint32_t iterations = quality == 2 ? 2u : 1u;
-        const uint32_t expected_passes = separable ? 2u * iterations : iterations;
-        if (plan.iterations != iterations || plan.pass_count != expected_passes) ++bad_chain;
-        if (plan.kind != (separable ? rtao::FilterKind::Separable : rtao::FilterKind::ATrous)) ++bad_chain;
-        if (plan.passes[0].input != rtao::FilterSlot::A || plan.passes[plan.pass_count - 1u].output != rtao::FilterSlot::B) ++bad_chain;
-        const uint32_t r = static_cast<uint32_t>(radius);
-        for (uint32_t i = 0; i < plan.pass_count; ++i) {
-          const rtao::FilterPass& pass = plan.passes[i];
-          if (pass.input == pass.output) ++bad_chain;  // never read and write one texture
-          if (i > 0u && pass.input != plan.passes[i - 1u].output) ++bad_chain;
-          const bool last = i + 1u == plan.pass_count;
-          if (last ? pass.output != rtao::FilterSlot::B : pass.output == rtao::FilterSlot::B) ++bad_chain;
-          if (separable) {
-            if (pass.direction != (i % 2u == 0u ? rtao::FilterDirection::Horizontal : rtao::FilterDirection::Vertical)) ++bad_direction;
-            const uint32_t step = quality == 0 ? 2u : 1u;
-            if (pass.step != step || pass.taps != 2u * (r / step) + 1u) ++bad_taps;
-            if (pass.footprint != (r / step) * step || pass.footprint > r) ++bad_footprint;
-          } else {
-            const uint32_t step = r / 2u > 1u ? r / 2u : 1u;
-            if (pass.direction != rtao::FilterDirection::Both) ++bad_direction;
-            if (pass.step != step || pass.taps != (quality == 0 ? 9u : 25u)) ++bad_taps;
-            if (pass.footprint != 2u * step) ++bad_footprint;
-            // Planner rule: +-R for even R, +-(R-1) for odd R (holds for R >= 3; R = 1 clamps the step to 1, so reach 2).
-            if (r >= 2u && r % 2u == 0u && pass.footprint != r) ++bad_footprint;
-            if (r >= 3u && r % 2u == 1u && pass.footprint != r - 1u) ++bad_footprint;
+      for (int passes = 1; passes <= 4; ++passes) {
+        for (int taps : grid_taps) {
+          ++combos;
+          const int lo = 3, hi = sep ? 17 : 9;
+          const int clamped = taps < lo ? lo : (taps > hi ? hi : taps);
+          const uint32_t side = static_cast<uint32_t>(clamped | 1);
+          const uint32_t h = (side - 1u) / 2u;
+          const uint32_t disp = sep ? 2u * static_cast<uint32_t>(passes) : static_cast<uint32_t>(passes);
+          const rtao::FilterPlan p = rtao::MakeFilterPlan(type, radius, passes, taps);
+          bool ok = p.pass_count == disp && p.iterations == static_cast<uint32_t>(passes) && p.taps_side == side
+              && p.kind == (sep ? rtao::FilterKind::Separable : rtao::FilterKind::ATrous)
+              && std::fabs(p.sigma - (sep ? std::fmax(radius * 0.5f, 0.5f) : 0.f)) < 1e-6f;
+          for (uint32_t i = 0; ok && i < disp; ++i) {
+            const int exp_out = i + 1u == disp ? 3 : (i % 2u == 0u ? 1 : 2);
+            const int exp_in = i == 0u ? 0 : ((i - 1u) % 2u == 0u ? 1 : 2);
+            const int exp_dir = sep ? (i % 2u == 0u ? 0 : 1) : 2;
+            const uint32_t exp_step = sep ? 1u : std::min(1u << i, std::max(1u, static_cast<uint32_t>(radius) / 2u));
+            const uint32_t exp_taps = sep ? side : side * side;
+            const uint32_t exp_foot = sep ? h : h * exp_step;
+            const auto& q = p.passes[i];
+            ok = static_cast<int>(q.input) == exp_in && static_cast<int>(q.output) == exp_out && static_cast<int>(q.direction) == exp_dir
+                && q.step == exp_step && q.taps == exp_taps && q.footprint == exp_foot
+                && q.input != q.output && q.input != rtao::FilterSlot::B && q.output != rtao::FilterSlot::A
+                && (i + 1u == disp) == (q.output == rtao::FilterSlot::B);
           }
+          mismatches += ok ? 0 : 1;
         }
       }
     }
   }
-  CHECK(bad_chain == 0, "filter chains: %d bad passes over %d type x radius x quality combinations", bad_chain, combinations);
-  CHECK(bad_direction == 0, "separable passes alternate H, V; a-trous passes are 2D (%d bad)", bad_direction);
-  CHECK(bad_taps == 0, "taps per pass: separable 2*floor(R/stride)+1, a-trous 9 (Low) or 25 (Med/High) (%d bad)", bad_taps);
-  CHECK(bad_footprint == 0, "footprint: separable floor(R/stride)*stride, a-trous 2*max(1,floor(R/2)) (%d bad)", bad_footprint);
-  std::printf("spatial filter plan: %d combinations (chain, slots, directions, taps, footprint), constants, reason, snapshot size (real)\n", combinations);
+  CHECK(mismatches == 0, "plan grid: %d combinations (type x radius x passes x taps), %d mismatches", combos, mismatches);
+  std::printf("spatial plan: 8 explicit chains, taps and step tables, %d grid combinations re-derived (mismatches %d)\n", combos, mismatches);
 }
 
 // ---- S2 spatial filter resources (REAL: lazy creation, size change, pipeline, destroy, on the mock device) ----
@@ -1561,13 +1596,12 @@ static void TestFilterResources() {
 
 // ---- S3 spatial filter dispatch (REAL: rtao::Dispatch on the mock; the mock records dispatches, null pushes, the
 // slots bound at the last dispatch and the device objects). ----
-static void SpatialFrame(Device* dev, CmdList* cl, rtao::RtaoDispatchInputs* in, bool spatial, int type, int quality, int debug_mode) {
+static void SpatialFrame(rtao::RtaoDispatchInputs* in, bool spatial, int type, int passes, int taps, int debug_mode) {
   in->spatial = spatial;
   in->filter_type = type;
-  in->filter_quality = quality;
+  in->filter_passes = passes;
+  in->filter_taps = taps;
   in->debug_mode = debug_mode;
-  (void)dev;
-  (void)cl;
 }
 static rtao::RtaoDispatchInputs SpatialInputs(CmdList* cl, Device* dev) {
   rtao::RtaoDispatchInputs in = {};
@@ -1581,36 +1615,76 @@ static rtao::RtaoDispatchInputs SpatialInputs(CmdList* cl, Device* dev) {
   return in;
 }
 static void TestSpatialDispatch() {
-  // Filter passes per configuration: separable Low/Medium 2, High 4; a-trous Low/Medium 1, High 2.
-  const int cases[6][3] = {{0, 0, 2}, {0, 1, 2}, {0, 2, 4}, {1, 0, 1}, {1, 1, 1}, {1, 2, 2}};
-  for (const auto& c : cases) {
+  struct Case { int type; int passes; int taps; int radius; };
+  const Case cases[] = {{0, 1, 5, 2}, {0, 2, 5, 2}, {0, 3, 5, 2}, {0, 4, 5, 2}, {1, 1, 5, 2}, {1, 2, 5, 2}, {1, 3, 5, 2},
+                        {1, 4, 5, 2}, {0, 2, 3, 2}, {0, 1, 17, 2}, {1, 3, 3, 2}, {1, 4, 9, 2}, {0, 1, 4, 2}, {1, 2, 8, 2},
+                        {0, 3, 5, 6}};
+  for (const Case& c : cases) {
     Device dev;
     CmdList cl;
     rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
-    SpatialFrame(&dev, &cl, &in, true, c[0], c[1], 0);
+    SpatialFrame(&in, true, c.type, c.passes, c.taps, 0);
+    in.filter_radius = c.radius;
     const rtao::RtaoDispatchResult r = rtao::Dispatch(&dev, &cl, in);
     rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
-    const int expected = 1 + c[2];  // pass A + the filter passes
-    CHECK(r.ok && data.filter_ran && cl.dispatches == expected, "filter type %d quality %d: %d dispatches, expected %d (ran %d)",
-          c[0], c[1], cl.dispatches, expected, data.filter_ran ? 1 : 0);
+    const int filter_dispatches = c.type == 0 ? 2 * c.passes : c.passes;
+    const int expected = 1 + filter_dispatches;  // pass A + the filter passes
+    CHECK(r.ok && data.filter_ran && cl.dispatches == expected, "type %d passes %d taps %d radius %d: %d dispatches, expected %d (ran %d)",
+          c.type, c.passes, c.taps, c.radius, cl.dispatches, expected, data.filter_ran ? 1 : 0);
     CHECK(cl.null_srv_pushes == cl.dispatches && cl.null_uav_pushes == cl.dispatches,
-          "type %d quality %d: every dispatch is followed by the srv and uav nulls (%d, %d of %d)", c[0], c[1],
+          "type %d passes %d taps %d: every dispatch is followed by the srv and uav nulls (%d, %d of %d)", c.type, c.passes, c.taps,
           cl.null_srv_pushes, cl.null_uav_pushes, cl.dispatches);
     int srv_left = 0, uav_left = 0;
     for (uint32_t i = 0; i < rtao::kRtaoSrvCount; ++i) srv_left += cl.cs_srv[i].handle != 0u ? 1 : 0;
     for (uint32_t i = 0; i < rtao::kRtaoUavCount; ++i) uav_left += cl.cs_uav[i].handle != 0u ? 1 : 0;
-    CHECK(srv_left == 0 && uav_left == 0, "type %d quality %d: no slot left bound after the frame", c[0], c[1]);
+    CHECK(srv_left == 0 && uav_left == 0, "type %d passes %d taps %d: no slot left bound after the frame", c.type, c.passes, c.taps);
     CHECK(rtao::OutputSrv(data).handle == data.filter_srv[2].handle && data.filter_srv[2].handle != 0u, "output view is B");
-    CHECK(cl.snaps.back().uav[0].handle == data.filter_uav[2].handle, "type %d quality %d: the last pass writes B (u0)", c[0], c[1]);
-    CHECK(cl.snaps.back().srv[4].handle == data.ao_srv.handle, "type %d quality %d: the last pass binds the unfiltered AO at t4", c[0], c[1]);
+    CHECK(cl.snaps.size() == static_cast<size_t>(expected), "one snapshot per dispatch (%zu)", cl.snaps.size());
+    CHECK(cl.snaps.back().uav[0].handle == data.filter_uav[2].handle, "type %d passes %d taps %d: the last pass writes B (u0)", c.type, c.passes, c.taps);
+    CHECK(cl.snaps.back().srv[4].handle == data.ao_srv.handle, "type %d passes %d taps %d: the last pass binds the unfiltered AO at t4", c.type, c.passes, c.taps);
     CHECK(data.timer.open == -1 && data.filter_timer.open == -1, "main and filter timers closed after the frame (order not observable in the mock)");
+    // (a) every filter dispatch reads one texture and writes another; B is never read, A is never written.
+    // Read codes: 0 F0, 1 F1, 2 B (must not happen), 3 the AO (t2, first dispatch only). Write codes: 0 F0, 1 F1, 2 B.
+    bool identity_ok = cl.snaps.size() == static_cast<size_t>(expected);
+    for (size_t k = 1; identity_ok && k < cl.snaps.size(); ++k) {
+      const auto& sn = cl.snaps[k];
+      int read = -1, write = -1;
+      if (sn.srv[2].handle == data.ao_srv.handle) read = 3;
+      for (int idx = 0; idx < 3; ++idx) {
+        if (sn.srv[3].handle == data.filter_srv[idx].handle) read = idx;
+      }
+      if (sn.uav[0].handle == data.filter_uav[2].handle) write = 2;
+      if (sn.uav[1].handle == data.filter_uav[0].handle) write = 0;
+      if (sn.uav[1].handle == data.filter_uav[1].handle) write = 1;
+      bool aoWritten = false;
+      for (int u = 0; u < 3; ++u) aoWritten = aoWritten || sn.uav[u].handle == data.ao_uav.handle;
+      const bool first_ok = k == 1 ? read == 3 : (read == 0 || read == 1);
+      identity_ok = write >= 0 && first_ok && read != 2 && read != write && !aoWritten;
+    }
+    CHECK(identity_ok, "type %d passes %d taps %d radius %d: every filter dispatch reads one texture and writes another (B never read, A never written)",
+          c.type, c.passes, c.taps, c.radius);
+    // (b) the 12-float pushes equal the REAL MakeFilterPlan for each dispatch.
+    CHECK(static_cast<int>(cl.filter_pushes.size()) == filter_dispatches, "type %d passes %d taps %d: %zu filter pushes, expected %d",
+          c.type, c.passes, c.taps, cl.filter_pushes.size(), filter_dispatches);
+    const rtao::FilterPlan plan = rtao::MakeFilterPlan(c.type, c.radius, c.passes, c.taps);
+    int push_bad = 0;
+    for (int i = 0; i < filter_dispatches && i < static_cast<int>(cl.filter_pushes.size()); ++i) {
+      const bool last = i + 1 == filter_dispatches;
+      const float e[12] = {static_cast<float>(in.width), static_cast<float>(in.height), static_cast<float>(c.radius),
+                           c.type == 0 ? 0.f : 1.f,
+                           static_cast<float>(static_cast<int>(plan.passes[i].direction)), static_cast<float>(plan.passes[i].step),
+                           static_cast<float>(plan.taps_side), last ? 1.f : 0.f,
+                           i == 0 ? 1.f : 0.f, last ? 1.f : 0.f, 0.f, 0.f};
+      for (int j = 0; j < 12; ++j) push_bad += cl.filter_pushes[i][j] == e[j] ? 0 : 1;
+    }
+    CHECK(push_bad == 0, "type %d passes %d taps %d radius %d: filter pushes match the real plan (%d floats differ)", c.type, c.passes, c.taps, c.radius, push_bad);
   }
   // Debug modes 1..7 bypass the filter (one dispatch, the AO view); mode 8 runs it.
   for (int mode = 1; mode <= 7; ++mode) {
     Device dev;
     CmdList cl;
     rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
-    SpatialFrame(&dev, &cl, &in, true, 0, 1, mode);
+    SpatialFrame(&in, true, 0, 1, 5, mode);
     rtao::Dispatch(&dev, &cl, in);
     rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
     CHECK(cl.dispatches == 1 && !data.filter_ran && rtao::OutputSrv(data).handle == data.ao_srv.handle,
@@ -1620,7 +1694,7 @@ static void TestSpatialDispatch() {
     Device dev;
     CmdList cl;
     rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
-    SpatialFrame(&dev, &cl, &in, true, 0, 1, 8);
+    SpatialFrame(&in, true, 0, 1, 5, 8);
     rtao::Dispatch(&dev, &cl, in);
     rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
     CHECK(cl.dispatches == 3 && data.filter_ran, "debug mode 8 runs the filter (%d dispatches)", cl.dispatches);
@@ -1630,7 +1704,7 @@ static void TestSpatialDispatch() {
     Device dev;
     CmdList cl;
     rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
-    SpatialFrame(&dev, &cl, &in, false, 0, 1, 8);
+    SpatialFrame(&in, false, 0, 1, 5, 8);
     const rtao::RtaoDispatchResult r = rtao::Dispatch(&dev, &cl, in);
     rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
     CHECK(r.ok && cl.dispatches == 1 && cl.null_srv_pushes == 1 && cl.null_uav_pushes == 1,
@@ -1650,7 +1724,7 @@ static void TestSpatialDispatch() {
     auto frame = [&](bool spatial, bool fail) {
       CmdList cl;
       rtao::RtaoDispatchInputs in = SpatialInputs(&cl, &dev);
-      SpatialFrame(&dev, &cl, &in, spatial, 0, 1, 0);
+      SpatialFrame(&in, spatial, 0, 1, 5, 0);
       dev.fail_texture_2d = fail;
       rtao::Dispatch(&dev, &cl, in);
       data_ptr = &rtao::GetRtaoDeviceData(&dev);
@@ -1668,7 +1742,7 @@ static void TestSpatialDispatch() {
     CHECK(f4 == 3 && data_ptr->filter_ran && !data_ptr->filter_failed,
           "off -> on clears the failure once: the filter runs again (%d dispatches)", f4);
   }
-  std::printf("spatial dispatch: pass counts per type x quality, debug 1..7 bypass, mode 8, off path, failure and retry (mock)\n");
+  std::printf("spatial dispatch: 15 type x passes x taps x radius cases, per-dispatch identity, real-plan pushes, debug 1..7 bypass, mode 8, off path, failure and retry (mock)\n");
 }
 
 // ---- S3 filter math. TRANSCRIPTION of world_rtao_filter.cs_5_0.hlsl (edge stops, separable kernel, copy-through,
@@ -1686,10 +1760,11 @@ static float EdgeWeightT(const FPix& c, const FPix& t) {
   return std::exp(-0.5f * plane * plane) * std::pow(nd, 16.f);
 }
 // Separable 1D pass around index c with stride 1: Gaussian in the offset, sigma = max(radius / 2, 0.5).
-static float SeparableT(const std::vector<FPix>& px, int c, int radius) {
+static float SeparableT(const std::vector<FPix>& px, int c, int taps, int radius) {
   const float sigma = std::fmax(radius * 0.5f, 0.5f);
   float sum_w = 0.f, sum_v = 0.f;
-  for (int k = -radius; k <= radius; ++k) {
+  const int half = (taps - 1) / 2;
+  for (int k = -half; k <= half; ++k) {
     const int idx = c + k;
     if (idx < 0 || idx >= static_cast<int>(px.size())) continue;
     const float d = static_cast<float>(k) / sigma;
@@ -1715,30 +1790,30 @@ static uint32_t QuantT(float v) {
 static void TestFilterMath() {
   std::vector<FPix> flat;
   for (int i = 0; i < 9; ++i) flat.push_back(FlatPix(static_cast<float>(i), 0.5f));
-  CHECK(std::fabs(SeparableT(flat, 4, 2) - 0.5f) < 1e-6f, "filter math (transcription): flat region is unchanged");
+  CHECK(std::fabs(SeparableT(flat, 4, 5, 2) - 0.5f) < 1e-6f, "filter math (transcription): flat region is unchanged");
   std::vector<FPix> step = flat;
   step[6].P.z = 100.f;  // depth step: the plane distance is 100 at view distance ~1000
   std::vector<FPix> step_hi = step;
   step_hi[6].value = 1.f;
-  CHECK(std::fabs(SeparableT(step, 4, 2) - SeparableT(step_hi, 4, 2)) < 1e-4f,
+  CHECK(std::fabs(SeparableT(step, 4, 5, 2) - SeparableT(step_hi, 4, 5, 2)) < 1e-4f,
         "filter math (transcription): a depth step isolates the far side (weight ~0)");
   std::vector<FPix> normal = flat;
   normal[5].N = {1.f, 0.f, 0.f};  // normal edge: dot 0 with the centre, weight 0
   std::vector<FPix> normal_hi = normal;
   normal_hi[5].value = 1.f;
-  CHECK(std::fabs(SeparableT(normal, 4, 2) - SeparableT(normal_hi, 4, 2)) < 1e-6f,
+  CHECK(std::fabs(SeparableT(normal, 4, 5, 2) - SeparableT(normal_hi, 4, 5, 2)) < 1e-6f,
         "filter math (transcription): a normal edge isolates the other side");
   std::vector<FPix> outlier = flat;
   outlier[4].value = 1.f;  // centre is an outlier on a flat neighbourhood: smoothed, not kept
-  const float smoothed = SeparableT(outlier, 4, 2);
+  const float smoothed = SeparableT(outlier, 4, 5, 2);
   CHECK(smoothed > 0.5f && smoothed < 1.f, "filter math (transcription): a single outlier is smoothed (%f)", smoothed);
   std::vector<FPix> hot = flat;
   hot[5].value = 1.f;  // neighbour outlier pulls the centre up, less than fully
-  const float pulled = SeparableT(hot, 4, 2);
+  const float pulled = SeparableT(hot, 4, 5, 2);
   CHECK(pulled > 0.5f && pulled < 1.f, "filter math (transcription): a neighbour outlier pulls the centre part way (%f)", pulled);
   std::vector<FPix> ones = flat;
   for (auto& p : ones) p.value = 1.f;
-  CHECK(std::fabs(SeparableT(ones, 4, 3) - 1.f) < 1e-6f, "filter math (transcription): weights are normalised (flat 1 stays 1)");
+  CHECK(std::fabs(SeparableT(ones, 4, 7, 3) - 1.f) < 1e-6f, "filter math (transcription): weights are normalised (flat 1 stays 1)");
   const float sigma = std::fmax(3 * 0.5f, 0.5f);
   CHECK(std::fabs(std::exp(-0.5f * (1.f / sigma) * (1.f / sigma)) - std::exp(-0.5f * (-1.f / sigma) * (-1.f / sigma))) < 1e-9f,
         "filter math (transcription): kernel weights are symmetric");
@@ -1773,18 +1848,19 @@ static void TestPassShadersUnchanged() {
   CHECK(fnv(pass_b) == 0xba6fc5c95a80cf38ull, "pass B harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
 }
 
-// ---- S4 spatial_filter JSON (REAL: rtao::BuildRtaoJson; filter on/off and both types, the twelve keys in order) ----
-static std::string SpatialJson(bool on, int type, int quality) {
+// ---- S4 spatial_filter JSON (REAL: rtao::BuildRtaoJson; filter on/off and several type, passes, taps cases) ----
+static std::string SpatialJson(bool on, int type, int passes, int taps) {
   static rtao::RtaoFrameState f;
   f = rtao::RtaoFrameState{};
   static uint32_t values[rtao::kRtaoStatsCount];
   std::memset(values, 0, sizeof(values));
-  const rtao::FilterPlan plan = rtao::MakeFilterPlan(type, 2, quality);
+  const rtao::FilterPlan plan = rtao::MakeFilterPlan(type, 2, passes, taps);
   f.filter_requested = on;
   f.filter_ran = on;
   f.filter_type = type;
   f.filter_radius = 2;
-  f.filter_quality = quality;
+  f.filter_taps_requested = taps;
+  f.filter_tap_count = plan.taps_side;
   f.filter_iterations = plan.iterations;
   f.filter_passes = plan.pass_count;
   f.filter_taps = plan.passes[0].taps;
@@ -1799,16 +1875,17 @@ static std::string SpatialJson(bool on, int type, int quality) {
   return rtao::BuildRtaoJson(in);
 }
 static void TestSpatialJson() {
-  struct Case { bool on; int type; int quality; int passes; int taps; };
-  const Case cases[] = {{false, 0, 1, 2, 5}, {true, 0, 1, 2, 5}, {true, 1, 1, 1, 25}, {true, 0, 2, 4, 5}, {true, 1, 0, 1, 9}};
+  struct Case { bool on; int type; int passes; int taps; int dispatches; int taps_per_pass; int tap_count; };
+  const Case cases[] = {{false, 0, 1, 5, 2, 5, 5}, {true, 0, 1, 5, 2, 5, 5}, {true, 1, 1, 5, 1, 25, 5}, {true, 0, 2, 5, 4, 5, 5},
+                        {true, 1, 3, 7, 3, 49, 7}, {true, 0, 4, 17, 8, 17, 17}, {true, 1, 2, 4, 2, 25, 5}};
   for (const Case& c : cases) {
-    const std::string text = SpatialJson(c.on, c.type, c.quality);
+    const std::string text = SpatialJson(c.on, c.type, c.passes, c.taps);
     JNode root;
     JsonParser parser(text);
-    CHECK(parser.Parse(&root), "spatial json: parses (on %d, type %d, quality %d)", c.on ? 1 : 0, c.type, c.quality);
+    CHECK(parser.Parse(&root), "spatial json: parses (on %d, type %d, passes %d, taps %d)", c.on ? 1 : 0, c.type, c.passes, c.taps);
     const JNode* sf = Member(root, "spatial_filter");
     CHECK(sf && sf->kind == JNode::Kind::Object && sf->keys.size() == 12u, "spatial json: spatial_filter is top level with 12 keys");
-    static const char* const keys[] = {"on", "type", "radius", "quality", "iterations", "passes", "taps_per_pass", "gpu_ms",
+    static const char* const keys[] = {"on", "type", "radius", "tap_count", "iterations", "passes", "taps_per_pass", "gpu_ms",
                                        "pixels", "mean_change", "changed_gt_1lsb_pct", "failed"};
     bool order_ok = sf != nullptr && sf->keys.size() == 12u;
     for (size_t i = 0; order_ok && i < 12u; ++i) order_ok = sf->keys[i] == keys[i];
@@ -1816,14 +1893,214 @@ static void TestSpatialJson() {
     const JNode* on = sf ? Member(*sf, "on") : nullptr;
     CHECK(on && on->text == (c.on ? "true" : "false"), "spatial json: on = %s", c.on ? "true" : "false");
     if (c.on && sf) {
-      CHECK(Member(*sf, "passes")->text == std::to_string(c.passes) && Member(*sf, "taps_per_pass")->text == std::to_string(c.taps),
-            "spatial json: passes %d, taps per pass %d (type %d, quality %d)", c.passes, c.taps, c.type, c.quality);
+      CHECK(Member(*sf, "tap_count")->text == std::to_string(c.tap_count), "spatial json: tap_count %d (type %d, taps %d)", c.tap_count, c.type, c.taps);
+      CHECK(Member(*sf, "passes")->text == std::to_string(c.dispatches) && Member(*sf, "taps_per_pass")->text == std::to_string(c.taps_per_pass),
+            "spatial json: passes (dispatches) %d and taps per dispatch %d (type %d, passes %d)", c.dispatches, c.taps_per_pass, c.type, c.passes);
       CHECK(Member(*sf, "mean_change")->text == "0.5" && Member(*sf, "changed_gt_1lsb_pct")->text == "25" && Member(*sf, "pixels")->text == "4",
             "spatial json: mean change 0.5 (MeanFromSum), 25%% above 1 LSB, 4 pixels");
       CHECK(Member(*sf, "failed")->text == "false", "spatial json: not failed");
     }
   }
-  std::printf("spatial json: filter off and on for both types and three qualities, twelve keys in order (real builder, text parser)\n");
+  std::printf("spatial json: 7 cases, the first one with the filter off, twelve keys in order (real builder, text parser)\n");
+}
+
+// ---- G1 TRANSCRIPTION of world_rtao_filter.cs_5_0.hlsl: the integer binomial recurrence and the row properties. ----
+static void TestSpatialKernelWeights() {
+  bool rows_ok = true, sum_ok = true, sym_ok = true;
+  const double expected_rows[4][9] = {
+      {1, 2, 1, 0, 0, 0, 0, 0, 0}, {1, 4, 6, 4, 1, 0, 0, 0, 0}, {1, 6, 15, 20, 15, 6, 1, 0, 0}, {1, 8, 28, 56, 70, 56, 28, 8, 1}};
+  const int taps_list[4] = {3, 5, 7, 9};
+  for (int row = 0; row < 4; ++row) {
+    const int taps = taps_list[row];
+    float wk[9] = {};
+    int c = 1;  // TRANSCRIPTION: int c = 1; wk[0] = (float)c; c = c * (taps - 1 - t) / (t + 1); wk[t + 1] = (float)c;
+    wk[0] = static_cast<float>(c);
+    for (int t = 0; t < taps - 1; ++t) {
+      c = c * (taps - 1 - t) / (t + 1);
+      wk[t + 1] = static_cast<float>(c);
+    }
+    double sum = 0.0;
+    for (int j = 0; j < taps; ++j) {
+      rows_ok = rows_ok && static_cast<double>(wk[j]) == expected_rows[row][j];
+      sum += wk[j];
+      sym_ok = sym_ok && wk[j] == wk[taps - 1 - j];
+    }
+    sum_ok = sum_ok && sum == static_cast<double>(1 << (taps - 1));
+  }
+  CHECK(rows_ok, "kernel weights (transcription): rows 1 2 1 / 1 4 6 4 1 / 1 6 15 20 15 6 1 / 1 8 28 56 70 56 28 8 1");
+  CHECK(sum_ok, "kernel weights (transcription): each row sums to 2^(taps - 1)");
+  CHECK(sym_ok, "kernel weights (transcription): each row is symmetric");
+  const float b3[5] = {1.0f / 16.0f, 4.0f / 16.0f, 6.0f / 16.0f, 4.0f / 16.0f, 1.0f / 16.0f};
+  const float row5[5] = {1.0f, 4.0f, 6.0f, 4.0f, 1.0f};
+  float scaled[5] = {};
+  for (int j = 0; j < 5; ++j) scaled[j] = row5[j] / 16.0f;
+  CHECK(std::memcmp(scaled, b3, sizeof(b3)) == 0, "kernel weights (transcription): taps 5 divided by 16 equals the old b3 table bitwise");
+  std::printf("kernel weights: transcription of the integer recurrence, rows 3,5,7,9, bitwise b3 (labelled)\n");
+}
+
+// ---- G2 frequency response (REAL: MakeFilterPlan gives the steps and sides; the response is a transcription:
+// H(w) = sum_j w_j cos(w s (j - h)) / 2^(T-1), w_j binomial). The product over passes is the total response. ----
+static double BinomResponse(int taps, double w, double step) {
+  const int h = (taps - 1) / 2;
+  long long c = 1;
+  double sum = 0.0;
+  for (int j = 0; j < taps; ++j) {
+    sum += static_cast<double>(c) * std::cos(w * step * (j - h));
+    if (j < taps - 1) c = c * (taps - 1 - j) / (j + 1);
+  }
+  return sum / static_cast<double>(1LL << (taps - 1));
+}
+static double TotalResponse(const rtao::FilterPlan& plan, double w) {
+  double total = 1.0;
+  for (uint32_t i = 0; i < plan.pass_count; ++i) total *= BinomResponse(static_cast<int>(plan.taps_side), w, plan.passes[i].step);
+  return total;
+}
+static double MaxAbove(const rtao::FilterPlan& plan, double from) {
+  double best = 0.0;
+  for (int k = 1; k <= 4096; ++k) {
+    const double w = 3.14159265358979323846 * k / 4096.0;
+    if (w >= from) best = std::fmax(best, std::fabs(TotalResponse(plan, w)));
+  }
+  return best;
+}
+static void TestSpatialGridFree() {
+  const double pi = 3.14159265358979323846;
+  int bound_violations = 0, power2_violations = 0, configs = 0;
+  double worst_power2 = 0.0;
+  for (int taps : {3, 5, 7, 9}) {
+    for (int radius = 1; radius <= 8; ++radius) {
+      for (int passes = 1; passes <= 4; ++passes) {
+        const rtao::FilterPlan plan = rtao::MakeFilterPlan(1, radius, passes, taps);
+        ++configs;
+        for (int k = 1; k <= 4096; ++k) {
+          const double w = pi * k / 4096.0;
+          if (std::fabs(TotalResponse(plan, w)) > BinomResponse(taps, w, 1.0) + 1e-12) { ++bound_violations; break; }
+        }
+        bool all_pow2 = true;
+        for (uint32_t i = 0; i < plan.pass_count; ++i) {
+          const uint32_t s = plan.passes[i].step;
+          all_pow2 = all_pow2 && (s == 1u || s == 2u || s == 4u);
+        }
+        if (!all_pow2) continue;
+        for (uint32_t i = 0; i < plan.pass_count; ++i) {
+          const uint32_t s = plan.passes[i].step;
+          if (s < 2u) continue;
+          const double v = std::fabs(TotalResponse(plan, 2.0 * pi / s));
+          worst_power2 = std::fmax(worst_power2, v);
+          if (v >= 1e-9) ++power2_violations;
+        }
+      }
+    }
+  }
+  CHECK(bound_violations == 0, "grid-free (a): |H_total| <= the dense single pass for every radius, passes and taps (%d configs, %d violations)", configs, bound_violations);
+  CHECK(power2_violations == 0, "grid-free (b): with power-of-two steps |H_total(2 pi / s)| < 1e-9 for every used s >= 2 (worst %.3g)", worst_power2);
+  // (c) the residual at the step 3 lattice (steps 1, 2, 3, 3) for radius 6 and 7.
+  double c5 = 0.0;
+  for (int radius : {6, 7}) {
+    for (int passes : {3, 4}) {
+      const rtao::FilterPlan plan = rtao::MakeFilterPlan(1, radius, passes, 5);
+      const double v = std::fabs(TotalResponse(plan, 2.0 * pi / 3.0));
+      CHECK(v < 0.005, "grid-free (c): taps 5, radius %d, passes %d: |H_total(2 pi / 3)| = %.6g < 0.005", radius, passes, v);
+      c5 = std::fmax(c5, v);
+    }
+  }
+  for (int taps : {3, 7, 9}) {
+    const rtao::FilterPlan plan = rtao::MakeFilterPlan(1, 6, 4, taps);
+    std::printf("grid-free (c) residual, taps %d, radius 6, passes 4: |H_total(2 pi / 3)| = %.6g (printed, not asserted)\n",
+                taps, std::fabs(TotalResponse(plan, 2.0 * pi / 3.0)));
+  }
+  // (d) the legacy equal-step schedule (every pass at step s) reproduces the grid.
+  for (int s : {2, 3, 4}) {
+    double total = 1.0;
+    for (int i = 0; i < 4; ++i) total *= BinomResponse(5, 2.0 * pi / s, static_cast<double>(s));
+    CHECK(std::fabs(total) >= 0.999, "grid-free (d): legacy equal step %d over 4 passes: |H(2 pi / %d)| = %.6g >= 0.999", s, s, std::fabs(total));
+  }
+  for (const int radius : {4, 6, 8}) {
+    const rtao::FilterPlan plan = rtao::MakeFilterPlan(1, radius, 4, 5);
+    std::printf("max |H_total| over w >= pi/2, taps 5, radius %d, passes 4: %.6g\n", radius, MaxAbove(plan, pi / 2.0));
+  }
+  std::printf("grid-free: (a) bound, (b) power-of-two kills, (c) step-3 residual, (d) legacy equal-step grid (c worst %.6g)\n", c5);
+}
+
+// ---- G3 LEGACY TRANSCRIPTION: the HEAD (f3d2c3bc) MakeFilterPlan, renamed Legacy*. Used only for the equality checks. ----
+// Legacy transcription (git show HEAD:world/rtao/rtao_state.hpp, MakeFilterPlan with quality).
+enum class LegacyFilterKind : uint8_t { Separable, ATrous };
+enum class LegacyFilterSlot : uint8_t { A, F0, F1, B };  // A: AO (uint), F0/F1: intermediates (float), B: filtered AO (uint)
+enum class LegacyFilterDirection : uint8_t { Horizontal, Vertical, Both };  // Both: 2D a-trous pass
+
+struct LegacyFilterPass {
+  LegacyFilterSlot input;
+  LegacyFilterSlot output;
+  LegacyFilterDirection direction;
+  uint32_t step;       // offset spacing in pixels (separable: stride, a-trous: step)
+  uint32_t taps;       // separable: taps along the pass; a-trous: taps of the 2D pass
+  uint32_t footprint;  // reach in pixels on each side
+};
+
+struct LegacyFilterPlan {
+  LegacyFilterKind kind;
+  uint32_t iterations;
+  uint32_t pass_count;
+  float sigma;  // separable spatial Gaussian sigma (pixels); 0 for a-trous
+  LegacyFilterPass passes[4];
+};
+
+// Pass chain for a Filter Type (0 separable bilateral, 1 a-trous 5x5), radius 1..8 and quality 0 Low, 1 Medium, 2 High.
+// Separable: per iteration a horizontal then a vertical pass; a-trous: one 2D pass per iteration.
+inline LegacyFilterPlan LegacyMakeFilterPlan(int type, int radius, int quality) {
+  LegacyFilterPlan plan{};
+  const bool separable = type != 1;
+  plan.kind = separable ? LegacyFilterKind::Separable : LegacyFilterKind::ATrous;
+  plan.iterations = quality == 2 ? 2u : 1u;
+  plan.pass_count = separable ? 2u * plan.iterations : plan.iterations;
+  plan.sigma = separable ? (radius * 0.5f > rtao::kFilterMinSigma ? radius * 0.5f : rtao::kFilterMinSigma) : 0.f;
+  const uint32_t r = static_cast<uint32_t>(radius);
+  const uint32_t step = separable ? (quality == 0 ? 2u : 1u) : (r / 2u > 1u ? r / 2u : 1u);
+  for (uint32_t i = 0; i < plan.pass_count; ++i) {
+    LegacyFilterPass& pass = plan.passes[i];
+    pass.output = i + 1u == plan.pass_count ? LegacyFilterSlot::B : (separable && i % 2u == 1u ? LegacyFilterSlot::F1 : LegacyFilterSlot::F0);
+    pass.input = i == 0u ? LegacyFilterSlot::A : plan.passes[i - 1u].output;
+    pass.direction = !separable ? LegacyFilterDirection::Both : (i % 2u == 0u ? LegacyFilterDirection::Horizontal : LegacyFilterDirection::Vertical);
+    pass.step = step;
+    pass.taps = separable ? 2u * (r / step) + 1u : (quality == 0 ? 9u : 25u);
+    pass.footprint = separable ? (r / step) * step : 2u * step;
+  }
+  return plan;
+}
+
+
+static bool LegacyEqual(const rtao::FilterPlan& n, const LegacyFilterPlan& o) {
+  if (static_cast<int>(n.kind) != static_cast<int>(o.kind) || n.iterations != o.iterations || n.pass_count != o.pass_count || n.sigma != o.sigma) return false;
+  for (uint32_t i = 0; i < n.pass_count; ++i) {
+    const auto& a = n.passes[i];
+    const auto& b = o.passes[i];
+    if (static_cast<int>(a.input) != static_cast<int>(b.input) || static_cast<int>(a.output) != static_cast<int>(b.output)
+        || static_cast<int>(a.direction) != static_cast<int>(b.direction) || a.step != b.step || a.taps != b.taps || a.footprint != b.footprint) {
+      return false;
+    }
+  }
+  return true;
+}
+static void TestSpatialLegacyEquality() {
+  int sep1 = 0, sep2 = 0, at1 = 0;
+  for (int r = 1; r <= 8; ++r) {
+    sep1 += LegacyEqual(rtao::MakeFilterPlan(0, r, 1, 2 * r + 1), LegacyMakeFilterPlan(0, r, 1)) ? 1 : 0;
+    sep2 += LegacyEqual(rtao::MakeFilterPlan(0, r, 2, 2 * r + 1), LegacyMakeFilterPlan(0, r, 2)) ? 1 : 0;
+  }
+  for (int r = 1; r <= 3; ++r) at1 += LegacyEqual(rtao::MakeFilterPlan(1, r, 1, 5), LegacyMakeFilterPlan(1, r, 1)) ? 1 : 0;
+  CHECK(sep1 == 8, "legacy equality: separable quality 1 == passes 1, taps 2R+1, R 1..8 (%d of 8)", sep1);
+  CHECK(sep2 == 8, "legacy equality: separable quality 2 == passes 2, taps 2R+1, R 1..8 (%d of 8)", sep2);
+  CHECK(at1 == 3, "legacy equality: a-trous quality 1 == passes 1, taps 5, R 1..3 (%d of 3)", at1);
+  // Intended change (documented): legacy a-trous quality 1 at R 4..8 used step max(1, R/2) >= 2 on its only pass;
+  // the new first pass is always dense (step 1).
+  int changed = 0;
+  for (int r = 4; r <= 8; ++r) {
+    const LegacyFilterPlan old_plan = LegacyMakeFilterPlan(1, r, 1);
+    const rtao::FilterPlan new_plan = rtao::MakeFilterPlan(1, r, 1, 5);
+    changed += (old_plan.passes[0].step >= 2u && new_plan.passes[0].step == 1u) ? 1 : 0;
+  }
+  CHECK(changed == 5, "legacy change (intended): a-trous quality 1 at R 4..8 had step >= 2; the new first pass is step 1 (%d of 5)", changed);
+  std::printf("legacy equality: separable quality 1 and 2 (R 1..8), a-trous quality 1 (R 1..3) equal; intended a-trous change documented\n");
 }
 
 int main() {
@@ -1871,6 +2148,9 @@ int main() {
   TestFilterMath();
   TestPassShadersUnchanged();
   TestSpatialJson();
+  TestSpatialKernelWeights();
+  TestSpatialGridFree();
+  TestSpatialLegacyEquality();
   HStage("temporal dispatch (mock)");
   TestTemporalDispatch();
   HStage("device lifecycle (mock)");

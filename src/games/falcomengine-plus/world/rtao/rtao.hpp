@@ -30,7 +30,8 @@ struct RtaoFrameState {
   bool filter_failed = false;        // filter targets or pipeline could not be created
   int filter_type = 0;               // configuration used at the newest dispatch
   int filter_radius = 2;
-  int filter_quality = 1;
+  int filter_taps_requested = 5;     // Filter Taps row value (samples per direction, or a-trous side)
+  uint32_t filter_tap_count = 0u;    // effective odd taps N_eff
   uint32_t filter_iterations = 0u;
   uint32_t filter_passes = 0u;
   uint32_t filter_taps = 0u;         // taps per pass (first pass)
@@ -89,9 +90,10 @@ struct RtaoDispatchInputs {
   RtaoTemporalPushConstants temporal_push = {};  // params, debug mode and history valid set by the caller
   // Spatial filter (S3): runs on the final AO after pass B (or pass A). Debug modes 1..7 bypass it; mode 8 runs it.
   bool spatial = false;
-  int filter_type = 0;     // 0 separable bilateral, 1 a-trous 5x5
+  int filter_type = 0;     // 0 separable bilateral, 1 a-trous
   int filter_radius = 2;
-  int filter_quality = 1;  // 0 Low, 1 Medium, 2 High
+  int filter_passes = 1;   // Filter Passes: 1..4
+  int filter_taps = 5;     // Filter Taps: samples per direction (separable) or kernel side (a-trous)
   int debug_mode = 0;
 };
 
@@ -127,7 +129,7 @@ inline void NullComputeSlots(reshade::api::command_list* cmd_list, uint32_t srv_
 inline bool DispatchSpatialFilter(reshade::api::device* device, reshade::api::command_list* cmd_list,
                                   const RtaoDispatchInputs& in, RtaoDeviceData* data) {
   if (!EnsureRtaoFilterTargets(device, data, in.width, in.height) || !EnsureRtaoFilterPipeline(device, data)) return false;
-  const FilterPlan plan = MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_quality);
+  const FilterPlan plan = MakeFilterPlan(in.filter_type, in.filter_radius, in.filter_passes, in.filter_taps);
   bvh::BeginGpuTimer(device, cmd_list, &data->filter_timer);
   cmd_list->barrier(data->ao_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, data->filter_pipeline);
@@ -151,7 +153,7 @@ inline bool DispatchSpatialFilter(reshade::api::device* device, reshade::api::co
     push.size[3] = plan.kind == FilterKind::Separable ? 0.f : 1.f;
     push.pass[0] = static_cast<float>(pass.direction);
     push.pass[1] = static_cast<float>(pass.step);
-    push.pass[2] = static_cast<float>(in.filter_quality);
+    push.pass[2] = static_cast<float>(plan.taps_side);
     push.pass[3] = i + 1u == plan.pass_count ? 1.f : 0.f;
     push.flags[0] = input_is_ao ? 1.f : 0.f;
     push.flags[1] = output_is_uint ? 1.f : 0.f;
@@ -448,7 +450,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
   out << "}}"
       << ",\n  \"temporal_diagnostics\": " << diag.str()
       << ",\n  \"spatial_filter\": {\"on\": " << (f.filter_requested ? "true" : "false")
-      << ", \"type\": " << f.filter_type << ", \"radius\": " << f.filter_radius << ", \"quality\": " << f.filter_quality
+      << ", \"type\": " << f.filter_type << ", \"radius\": " << f.filter_radius << ", \"tap_count\": " << f.filter_tap_count
       << ", \"iterations\": " << f.filter_iterations << ", \"passes\": " << f.filter_passes
       << ", \"taps_per_pass\": " << f.filter_taps << ", \"gpu_ms\": " << f.filter_gpu_ms
       << ", \"pixels\": " << v[kRtaoStatFilterBase]

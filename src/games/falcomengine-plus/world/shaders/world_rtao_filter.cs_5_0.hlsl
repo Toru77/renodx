@@ -2,7 +2,9 @@
 //
 // Denoises the final AO texel (AO = texel / 255, 0..1): the r32_uint texel that pass A (Temporal off) or pass B
 // (Temporal on) wrote. One dispatch per pass; the chain comes from MakeFilterPlan (rtao_state.hpp).
-// Separable (f_size.w = 0): one horizontal (f_pass.x = 0) or vertical (1) 1D pass. A-trous (f_size.w = 1): one 2D pass.
+// Separable (f_size.w = 0): one horizontal (f_pass.x = 0) or vertical (1) 1D pass with f_pass.z taps at stride 1
+// (Gaussian, sigma = radius / 2). A-trous (f_size.w = 1): one 2D pass of f_pass.z x f_pass.z taps at spacing f_pass.y,
+// binomial weights (1 2 1, 1 4 6 4 1, ...). The plan guarantees f_pass.z is odd: 3..17 separable, 3..9 a-trous.
 // Edge stops shared by both kernels: the depth plane distance (game depth through viewProjInv_g, as pass B) and the
 // MRT normal dot. Load only, no samplers. The last pass (f_pass.w = 1) writes the uint output (u0) and accumulates
 // the stats; in debug mode 8 it writes the filter change instead of the AO.
@@ -40,7 +42,7 @@ cbuffer cb_scene : register(b0)
 cbuffer cb_rtao_filter : register(b12)
 {
     float4 f_size : packoffset(c0);   // width, height, radius, kind (0 separable, 1 a-trous)
-    float4 f_pass : packoffset(c1);   // direction (0 horizontal, 1 vertical, 2 2D), step, quality (0 Low, 1 Medium, 2 High), last pass
+    float4 f_pass : packoffset(c1);   // direction (0 horizontal, 1 vertical, 2 2D), step (a-trous; 1 separable), taps (odd), last pass
     float4 f_flags : packoffset(c2);  // input is uint, output is uint, debug mode (8 = filter change), unused
 };
 
@@ -75,15 +77,6 @@ void FilterTap(int2 q, float kernel_w, bool centre, float3 Pc, float3 Nc, float 
     sum_v += w * FilterInput(q);
 }
 
-// A-trous 1D weight at offset k (in steps): Medium and High B3 spline (1, 4, 6, 4, 1) / 16 for k = -2..2;
-// Low (1, 6, 1) / 8 at k = -2, 0, 2 (only even k are visited).
-float FilterAtrousAxis(int k, int quality)
-{
-    if (quality == 0) return k == 0 ? 0.75 : 0.125;
-    static const float b3[5] = {1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0};
-    return b3[k + 2];
-}
-
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -93,7 +86,8 @@ void main(uint3 id : SV_DispatchThreadID)
     const bool last = f_pass.w > 0.5;
     const int radius = (int)f_size.z;
     const int step = (int)f_pass.y;
-    const int quality = (int)f_pass.z;
+    const int taps = (int)f_pass.z;  // odd: 3..17 separable, 3..9 a-trous (the plan clamps and rounds up)
+    const int half_taps = (taps - 1) / 2;
     const int direction = (int)f_pass.x;
 
     const float depth = g_game_depth.Load(int3(px, 0)).x;
@@ -110,25 +104,33 @@ void main(uint3 id : SV_DispatchThreadID)
         float sum_v = 0.0;
         if ((int)f_size.w == 0)
         {
-            // Separable: Gaussian in the offset (pixels), sigma = max(radius / 2, kFilterMinSigma), taps at k * stride.
-            const int half_taps = radius / step;
+            // Separable: Gaussian in the offset (pixels), sigma = max(radius / 2, kFilterMinSigma), stride 1.
             const float sigma = radius * 0.5 > kFilterMinSigma ? radius * 0.5 : kFilterMinSigma;
             for (int k = -half_taps; k <= half_taps; ++k)
             {
-                const float d = (float)(k * step) / sigma;
-                const int2 offset = direction == 0 ? int2(k * step, 0) : int2(0, k * step);
+                const float d = (float)k / sigma;
+                const int2 offset = direction == 0 ? int2(k, 0) : int2(0, k);
                 FilterTap(px + offset, exp(-0.5 * d * d), k == 0, Pc, Nc, dist_c, sum_w, sum_v);
             }
         }
         else
         {
-            // A-trous: one 2D pass, offsets k * step per axis.
-            for (int j = -2; j <= 2; ++j)
+            // A-trous: one 2D pass, offsets k * step per axis. The binomial row (1 2 1, 1 4 6 4 1, ...) is built once per
+            // pixel with an integer recurrence (exact up to 70 for taps 9). The row is not normalised: the overall scale
+            // cancels in the sum_v / sum_w normalisation below.
+            float wk[9];
+            int c = 1;
+            wk[0] = (float)c;
+            for (int t = 0; t < taps - 1; ++t)
             {
-                for (int i = -2; i <= 2; ++i)
+                c = c * (taps - 1 - t) / (t + 1);
+                wk[t + 1] = (float)c;
+            }
+            for (int j = -half_taps; j <= half_taps; ++j)
+            {
+                for (int i = -half_taps; i <= half_taps; ++i)
                 {
-                    if (quality == 0 && (i % 2 != 0 || j % 2 != 0)) continue;
-                    const float kernel_w = FilterAtrousAxis(i, quality) * FilterAtrousAxis(j, quality);
+                    const float kernel_w = wk[i + half_taps] * wk[j + half_taps];
                     FilterTap(px + int2(i, j) * step, kernel_w, i == 0 && j == 0, Pc, Nc, dist_c, sum_w, sum_v);
                 }
             }

@@ -26,8 +26,10 @@ inline float g_rtao_history_clamp = 1.f;
 inline float g_rtao_isfast = 1.f;
 inline float g_rtao_spatial_enabled = 0.f;
 inline float g_rtao_filter_radius = 2.f;
-inline float g_rtao_filter_quality = 1.f;
-inline float g_rtao_filter_type = 0.f;  // Filter Type: 0 separable bilateral, 1 a-trous 5x5
+inline float g_rtao_filter_type = 0.f;  // Filter Type: 0 separable bilateral, 1 a-trous
+inline float g_rtao_filter_passes = 1.f;          // Filter Passes: 1..4
+inline float g_rtao_filter_taps_separable = 5.f;  // Filter Taps (separable): 3..17
+inline float g_rtao_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
 inline float g_rtao_fade_start = 40.f;
 inline float g_rtao_fade_end = 80.f;
 inline float g_rtao_debug = 0.f;       // RTAO Debug (advanced): 0 off, 1 raw AO, 2 accumulated AO, 3 history confidence
@@ -159,6 +161,10 @@ inline constexpr float kFilterPlaneSigma = 0.02f;  // plane distance, relative t
 inline constexpr float kFilterNormalPower = 16.f;  // normal weight = saturate(dot)^power
 inline constexpr float kFilterMinSigma = 0.5f;     // separable Gaussian sigma floor (pixels)
 inline constexpr float kFilterChangeScale = 8.f;   // debug mode 8: saturate(|filtered - AO| * scale)
+inline constexpr uint32_t kFilterMaxPasses = 4u;      // Filter Passes upper bound
+inline constexpr int kFilterTapsMin = 3;              // Filter Taps lower bound (odd side)
+inline constexpr int kFilterSeparableTapsMax = 17;    // separable taps per pass (odd side)
+inline constexpr int kFilterAtrousTapsMax = 9;        // a-trous taps per axis (odd side)
 
 enum class FilterKind : uint8_t { Separable, ATrous };
 enum class FilterSlot : uint8_t { A, F0, F1, B };  // A: AO (uint), F0/F1: intermediates (float), B: filtered AO (uint)
@@ -168,38 +174,47 @@ struct FilterPass {
   FilterSlot input;
   FilterSlot output;
   FilterDirection direction;
-  uint32_t step;       // offset spacing in pixels (separable: stride, a-trous: step)
-  uint32_t taps;       // separable: taps along the pass; a-trous: taps of the 2D pass
-  uint32_t footprint;  // reach in pixels on each side
+  uint32_t step;       // tap spacing in pixels (separable: always 1; a-trous: this pass's step)
+  uint32_t taps;       // samples per dispatch (separable: N_eff; a-trous: N_eff^2)
+  uint32_t footprint;  // reach in pixels per side (separable: h; a-trous: h * step), h = (N_eff - 1) / 2
 };
 
 struct FilterPlan {
   FilterKind kind;
-  uint32_t iterations;
-  uint32_t pass_count;
-  float sigma;  // separable spatial Gaussian sigma (pixels); 0 for a-trous
-  FilterPass passes[4];
+  uint32_t iterations;  // the Filter Passes setting
+  uint32_t pass_count;  // dispatches
+  uint32_t taps_side;   // effective odd taps per axis, N_eff
+  float sigma;          // separable spatial Gaussian sigma (pixels); 0 for a-trous
+  FilterPass passes[2 * kFilterMaxPasses];
 };
 
-// Pass chain for a Filter Type (0 separable bilateral, 1 a-trous 5x5), radius 1..8 and quality 0 Low, 1 Medium, 2 High.
-// Separable: per iteration a horizontal then a vertical pass; a-trous: one 2D pass per iteration.
-inline FilterPlan MakeFilterPlan(int type, int radius, int quality) {
+// Pass schedule for a Filter Type (0 separable bilateral, 1 a-trous), Radius 1..8, Filter Passes 1..4 and Filter
+// Taps (N_eff odd; an even value rounds up, clamped to 3..17 separable, 3..9 a-trous). Separable: each pass is one
+// horizontal or vertical 1D pass with N_eff taps at spacing 1; the passes alternate H, V (two dispatches per pass).
+// A-trous: one 2D pass per Filter Pass with N_eff^2 taps; the step doubles per pass up to max(1, R / 2) (the first
+// pass is dense). Intermediates alternate F0 and F1; the last dispatch writes B.
+inline FilterPlan MakeFilterPlan(int type, int radius, int passes, int taps) {
   FilterPlan plan{};
   const bool separable = type != 1;
+  const int r = radius < 1 ? 1 : (radius > 8 ? 8 : radius);
+  const uint32_t n = static_cast<uint32_t>(passes < 1 ? 1 : (passes > static_cast<int>(kFilterMaxPasses) ? static_cast<int>(kFilterMaxPasses) : passes));
+  const int taps_max = separable ? kFilterSeparableTapsMax : kFilterAtrousTapsMax;
+  const uint32_t side = static_cast<uint32_t>((taps < kFilterTapsMin ? kFilterTapsMin : (taps > taps_max ? taps_max : taps)) | 1);
+  const uint32_t h = (side - 1u) / 2u;
+  const uint32_t s_max = static_cast<uint32_t>(r) / 2u > 1u ? static_cast<uint32_t>(r) / 2u : 1u;
   plan.kind = separable ? FilterKind::Separable : FilterKind::ATrous;
-  plan.iterations = quality == 2 ? 2u : 1u;
-  plan.pass_count = separable ? 2u * plan.iterations : plan.iterations;
-  plan.sigma = separable ? (radius * 0.5f > kFilterMinSigma ? radius * 0.5f : kFilterMinSigma) : 0.f;
-  const uint32_t r = static_cast<uint32_t>(radius);
-  const uint32_t step = separable ? (quality == 0 ? 2u : 1u) : (r / 2u > 1u ? r / 2u : 1u);
+  plan.iterations = n;
+  plan.pass_count = separable ? 2u * n : n;
+  plan.taps_side = side;
+  plan.sigma = separable ? (r * 0.5f > kFilterMinSigma ? r * 0.5f : kFilterMinSigma) : 0.f;
   for (uint32_t i = 0; i < plan.pass_count; ++i) {
     FilterPass& pass = plan.passes[i];
-    pass.output = i + 1u == plan.pass_count ? FilterSlot::B : (separable && i % 2u == 1u ? FilterSlot::F1 : FilterSlot::F0);
+    pass.output = i + 1u == plan.pass_count ? FilterSlot::B : (i % 2u == 0u ? FilterSlot::F0 : FilterSlot::F1);
     pass.input = i == 0u ? FilterSlot::A : plan.passes[i - 1u].output;
     pass.direction = !separable ? FilterDirection::Both : (i % 2u == 0u ? FilterDirection::Horizontal : FilterDirection::Vertical);
-    pass.step = step;
-    pass.taps = separable ? 2u * (r / step) + 1u : (quality == 0 ? 9u : 25u);
-    pass.footprint = separable ? (r / step) * step : 2u * step;
+    pass.step = separable ? 1u : (1u << i < s_max ? 1u << i : s_max);
+    pass.taps = separable ? side : side * side;
+    pass.footprint = separable ? h : h * pass.step;
   }
   return plan;
 }
