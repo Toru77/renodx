@@ -193,6 +193,12 @@ inline ShaderTraits LookupVertexTraits(uint64_t pipeline) {
   return it != registry.vertex.end() ? it->second : traits;
 }
 
+// Camera view vertex shader (projects with cb_scene.viewProj_g). The same bit the pool and the deform
+// paths test; a shadow pass draws with a light-view VS and is not a camera draw.
+inline bool IsCameraViewVertex(uint64_t pipeline) {
+  return (LookupVertexTraits(pipeline).flags & kTraitCameraView) != 0u;
+}
+
 inline ShaderTraits LookupPixelTraits(uint64_t pipeline) {
   ShaderTraits traits;
   traits.cls = static_cast<uint8_t>(pipeline == 0u ? PsClass::Opaque : PsClass::Unclassified);

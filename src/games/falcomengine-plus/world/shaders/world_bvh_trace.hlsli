@@ -62,6 +62,8 @@ struct WorldTraceHit
     float3 position;
     float3 normal;
     uint hidden;           // 1: the game camera does not show the hit surface (only when view.hide is off)
+    float facing;          // Round 2 discovery: dot(local normal, local direction) of the winning triangle; 0 for dynamic objects
+    uint material;         // Round 2 discovery: instance.header.z of the winning instance (alpha-tested material when != 0); 0 for dynamic objects
 };
 
 struct WorldTraceCounters
@@ -466,6 +468,8 @@ WorldTraceHit TraceWorldRay(
     hit.position = float3(0.0, 0.0, 0.0);
     hit.normal = float3(0.0, 0.0, 0.0);
     hit.hidden = 0u;
+    hit.facing = 0.0;
+    hit.material = 0u;
 
     uint tlas_leaf_count = 0u;
     uint tlas_stride = 0u;
@@ -493,6 +497,8 @@ WorldTraceHit TraceWorldRay(
     uint best_prim = 0xFFFFFFFFu;
     float3 best_normal = float3(0.0, 0.0, 0.0);
     uint best_hidden = 0u;
+    float best_facing = 0.0;
+    uint best_material = 0u;
     float hidden_t = CAMERA_FADE_NEVER;  // nearest skipped hidden hit (view.hide)
 
     uint stack[TRACE_STACK_SIZE];
@@ -580,6 +586,8 @@ WorldTraceHit TraceWorldRay(
                                         best_mesh = mesh_id;
                                         best_prim = local_prim;
                                         best_hidden = local_hidden;
+                                        best_facing = dot(local_normal, local_direction);
+                                        best_material = (uint)instance.header.z;
                                         const float4 normal_h = float4(local_normal, 0.0);
                                         best_normal = normalize(float3(
                                             dot(normal_h, instance.world[0]),
@@ -596,6 +604,8 @@ WorldTraceHit TraceWorldRay(
                                             hit.position = origin + direction * best_t;
                                             hit.normal = best_normal;
                                             hit.hidden = best_hidden;
+                                            hit.facing = best_facing;
+                                            hit.material = best_material;
                                             return hit;
                                         }
                                     }
@@ -652,6 +662,8 @@ WorldTraceHit TraceWorldRay(
             best_prim = object_prim;
             best_normal = object_normal;
             best_hidden = 0u;
+            best_facing = 0.0;
+            best_material = 0u;
             if (any_hit) break;
         }
     }
@@ -672,6 +684,8 @@ WorldTraceHit TraceWorldRay(
     hit.position = origin + direction * best_t;
     hit.normal = best_normal;
     hit.hidden = best_hidden;
+    hit.facing = best_facing;
+    hit.material = best_material;
     return hit;
 }
 

@@ -101,6 +101,7 @@ struct DrawRecord {
   bool depth_enable = false;
   bool depth_write = false;
   uint32_t cull_mode = 0u;
+  bool front_counter_clockwise = false;  // rasterizer front face (Two-Sided discovery, round 2)
   bool has_skin_inputs = false;
   bool is_candidate = false;
   uint32_t vs_cb_mask = 0u;

@@ -18,6 +18,8 @@ Texture3D<float2> g_isfast_noise : register(t18);
 
 RWTexture2D<uint> g_rtao_ao : register(u0);
 RWStructuredBuffer<uint> g_rtao_stats : register(u1);
+// Raw AO for the temporal pass (round 2): valid pixels hold the trace AO, neutral-invalid pixels hold -1.
+RWTexture2D<float> g_rtao_raw : register(u2);
 
 cbuffer cb_scene : register(b0)
 {
@@ -33,7 +35,7 @@ cbuffer cb_rtao : register(b12)
     float4 g_rtao_sampling : packoffset(c1);  // spp, isfast flag (1 loaded), slice base, seed
     float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, 0, 0
     float4 g_rtao_region : packoffset(c3);    // region min xyz, region size
-    float4 g_rtao_size : packoffset(c4);      // width, height, dynamic count (0), reserved
+    float4 g_rtao_size : packoffset(c4);      // width, height, dynamic count (0), output_raw (1 = write u2, not u0)
 };
 
 #define RTAO_STAT_RAYS 0u
@@ -48,7 +50,11 @@ cbuffer cb_rtao : register(b12)
 #define RTAO_STAT_SCALED 9u
 #define RTAO_STAT_COUNT 10u
 
+#define RTAO_DISC_BASE 16u
+#define RTAO_DISC_COUNT 8u
+
 groupshared uint gs_stats[RTAO_STAT_COUNT];
+groupshared uint gs_disc[RTAO_DISC_COUNT];
 
 void TracePixel(uint2 px)
 {
@@ -59,6 +65,7 @@ void TracePixel(uint2 px)
     const float region_size = g_rtao_region.w;
 
     float ao = 1.0;
+    bool traced = false;
     const float depth = g_game_depth.Load(int3(px, 0)).x;
     const float3 N = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
 
@@ -87,8 +94,25 @@ void TracePixel(uint2 px)
         }
         else
         {
+            traced = true;
             const float3 camera = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
             const float distance_to_camera = length(P - camera);
+            // Two-Sided discovery (diagnostic, g_rtao_fade.z = 1): one primary ray camera -> P. Only a hit at the
+            // G-buffer distance (2% or 5 cm) counts: winding back x normal toward camera x alpha-tested.
+            if (g_rtao_fade.z > 0.5)
+            {
+                const float3 view_dir = (P - camera) / distance_to_camera;
+                WorldCameraView disc_view = {true, 1.0};
+                WorldTraceCounters disc_counters;
+                const WorldTraceHit disc_hit = TraceWorldClosest(camera, view_dir, 1e-3, 1.05 * distance_to_camera, disc_view, disc_counters);
+                if (disc_hit.prim != 0xFFFFFFFFu && abs(disc_hit.t - distance_to_camera) <= max(0.02 * distance_to_camera, 0.05))
+                {
+                    const uint back = disc_hit.facing > 0.0 ? 1u : 0u;
+                    const uint toward = dot(N, -view_dir) > 0.0 ? 1u : 0u;
+                    const uint alpha = disc_hit.material != 0u ? 1u : 0u;
+                    InterlockedAdd(gs_disc[back * 4u + toward * 2u + alpha], 1u);
+                }
+            }
             const float3 origin = P + N * g_rtao_params.w;
             const float3 up = abs(N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
             const float3 T = normalize(cross(up, N));
@@ -145,7 +169,8 @@ void TracePixel(uint2 px)
     const uint texel = min(255u, (uint)round(saturate(ao) * 255.0));
     InterlockedAdd(gs_stats[RTAO_STAT_PIXELS], 1u);
     InterlockedAdd(gs_stats[RTAO_STAT_AO_SUM], texel);
-    g_rtao_ao[px] = texel;
+    if (g_rtao_size.w > 0.5) g_rtao_raw[px] = traced ? ao : -1.0;
+    else g_rtao_ao[px] = texel;
 }
 
 [numthreads(8, 8, 1)]
@@ -155,10 +180,12 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     g_trace_dynamic_count = (uint)g_rtao_size.z;
     const uint group_index = gid.y * 8u + gid.x;
     if (group_index < RTAO_STAT_COUNT) gs_stats[group_index] = 0u;
+    if (group_index < RTAO_DISC_COUNT) gs_disc[group_index] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
     if (id.x < (uint)g_rtao_size.x && id.y < (uint)g_rtao_size.y) TracePixel(id.xy);
 
     GroupMemoryBarrierWithGroupSync();
     if (group_index < RTAO_STAT_COUNT) InterlockedAdd(g_rtao_stats[group_index], gs_stats[group_index]);
+    if (g_rtao_fade.z > 0.5 && group_index < RTAO_DISC_COUNT) InterlockedAdd(g_rtao_stats[RTAO_DISC_BASE + group_index], gs_disc[group_index]);
 }

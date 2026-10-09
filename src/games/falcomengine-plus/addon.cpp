@@ -9120,26 +9120,86 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       {spp, isfast_used ? 1.f : 0.f,
        static_cast<float>((dd->frame_index * static_cast<uint64_t>(spp)) % 32u),
        static_cast<float>(dd->frame_index % 1024u)},
-      {fade.start, fade.end, 0.f, 0.f},
+      {fade.start, fade.end, rtao::g_rtao_discovery > 0.5f ? 1.f : 0.f, 0.f},
       {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
        bvh_data->tlas_region_size},
+      {0.f, 0.f, 0.f, 0.f},
+  };
+
+  // Temporal (round 2). The motion view is the G-buffer RTV4 owned SRV only. TAA t3 (rcas_motion) is bound
+  // after lighting, so it is not used: there is no proof it is written before this hook.
+  auto& rf = rtao::g_rtao_frame;
+  const bool temporal_on = rtao::g_rtao_temporal_enabled > 0.5f;
+  if (temporal_on) MBMotionRtv4Ensure(dev, dd);
+  // Motion source (round 2). TAA t3 and RTV4 are different resources: t3 is not proven to be written before
+  // lighting, so Temporal stops for the session. Unknown on either side: no decision yet.
+  const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, dd->mb_rtv4_res);
+  rf.rcas_res = dd->rcas_motion_res;
+  rf.rtv4_res = dd->mb_rtv4_res;
+  if (motion_check == rtao::MotionCheck::Conflict && !rf.motion_conflict) {
+    rf.motion_conflict = true;
+    renodx::utils::log::w("[world-rtao] motion CONFLICT: rcas_motion_res=", dd->rcas_motion_res,
+                          " mb_rtv4_res=", dd->mb_rtv4_res,
+                          " differ. TAA t3 is not proven written before lighting; Temporal is off for this session (no_motion, round-1 AO).");
+  }
+  static bool motion_logged = false;
+  if (!motion_logged && motion_check == rtao::MotionCheck::Ok && dd->rcas_motion_res != 0u && dd->mb_rtv4_res != 0u) {
+    motion_logged = true;
+    renodx::utils::log::i("[world-rtao] motion: rcas_motion_res=", dd->rcas_motion_res,
+                          " mb_rtv4_res=", dd->mb_rtv4_res, " same resource: RTV4 owned SRV used");
+  }
+  const rtao::ParameterSnapshot params = {
+      rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_samples,
+      rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start,
+      rtao::g_rtao_fade_end, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
+      rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
+      rtao::g_rtao_debug};
+  const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
+  rf.prev_params = params;
+  rf.prev_params_valid = true;
+  const bool resized = rd.ao_texture.handle != 0u && (rd.ao_width != in.width || rd.ao_height != in.height);
+  const bool motion_ok = dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict;
+  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+      temporal_on, rf.temporal_last, resized, dd->frame_index, rf.dispatched_frame,
+      dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
+      false, params_changed, motion_ok});
+  rf.reset = reset;
+  rf.motion_source = rf.motion_conflict ? rtao::MotionSource::Conflict
+      : (motion_ok ? rtao::MotionSource::Rtv4 : rtao::MotionSource::None);
+  if (temporal_on && reset != rtao::ResetReason::None) {
+    rf.last_reset = reset;
+    rf.reset_counts[static_cast<size_t>(reset)] += 1u;
+  }
+  in.temporal = temporal_on;
+  in.motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u};
+  in.temporal_push = {
+      {rtao::g_rtao_history_weight, rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection,
+       rtao::g_rtao_history_clamp},
+      {0.f, 0.f, 0.f, 0.f},
+      {0.f, 0.f, rtao::g_rtao_debug, reset == rtao::ResetReason::None ? 1.f : 0.f},
+      {0.f, 0.f, 0.f, 0.f},
       {0.f, 0.f, 0.f, 0.f},
   };
 
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs) prev = *cs;
-  const bool ok = rtao::Dispatch(dev, cmd_list, in);
+  const rtao::RtaoDispatchResult result = rtao::Dispatch(dev, cmd_list, in);
   ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
-  if (!ok) {
+  rf.temporal_ran = result.temporal_ran;
+  rf.temporal_last = temporal_on && result.temporal_ran;
+  if (!result.ok) {
     frame.reason = rtao::Reason::PipelineFailed;
     return;
   }
+  // Temporal requested but pass B did not run: round-1 AO this frame, history invalid next frame.
+  if (temporal_on && !result.temporal_ran) frame.note = motion_ok ? rtao::Reason::PipelineFailed : rtao::Reason::NoMotion;
   frame.dispatched_frame = dd->frame_index;
   frame.producing = true;
   frame.gpu_ms = rd.timer.last_ms;
-  frame.texture_bytes = static_cast<uint64_t>(rd.ao_width) * rd.ao_height * 4u
-                        + sizeof(uint32_t) * rtao::kRtaoStatsCount;
+  const uint64_t pixels = static_cast<uint64_t>(rd.ao_width) * rd.ao_height;
+  rf.temporal_bytes = rd.raw_texture.handle != 0u ? pixels * (2u + 2u * 8u) : 0u;
+  frame.texture_bytes = pixels * 4u + sizeof(uint32_t) * rtao::kRtaoStatsCount + rf.temporal_bytes;
   PushRtaoAo(cmd_list, rd.ao_srv);
 }
 
@@ -12726,7 +12786,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
-    falcom_world::AddSettings(&settings, IsSora2nd());
+    falcom_world::AddSettings(&settings, IsSora2nd(), IsAdvancedSettingsMode);
   }
   falcom_world::Use(fdw_reason, IsSora2nd());
   falcom_ui::Use(fdw_reason, &settings);

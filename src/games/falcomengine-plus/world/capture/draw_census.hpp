@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "../world_state.hpp"
+#include "../rtao/rtao_state.hpp"
 #include "../bvh/bvh_pool.hpp"
 #include "../bvh/deform_live.hpp"
 #include "../bvh/deform_probe.hpp"
@@ -120,7 +121,10 @@ inline void FillCommonDrawRecord(
     const auto rs_it = render_state->pipelines.find(reshade::api::pipeline_stage::rasterizer);
     if (rs_it != render_state->pipelines.end()) {
       reshade::api::rasterizer_desc desc = {};
-      if (GetRasterizerDesc(rs_it->second.handle, &desc)) record->cull_mode = static_cast<uint32_t>(desc.cull_mode);
+      if (GetRasterizerDesc(rs_it->second.handle, &desc)) {
+        record->cull_mode = static_cast<uint32_t>(desc.cull_mode);
+        record->front_counter_clockwise = desc.front_counter_clockwise;
+      }
     }
   }
 
@@ -192,6 +196,11 @@ inline void CommitDrawRecord(
     const DrawRecord& record,
     reshade::api::device* device,
     WorldCommandListData* cl_data) {
+  // Two-Sided discovery (diagnostic): camera-view opaque candidate draws by (cull mode, front face). Only while on.
+  if (rtao::g_rtao_discovery > 0.5f && record.is_candidate && !record.blend_enable
+      && contract::IsCameraViewVertex(record.vs_pipeline)) {
+    rtao::g_rtao_cull_hist[std::min(record.cull_mode, 3u)][record.front_counter_clockwise ? 1 : 0].fetch_add(1u, std::memory_order_relaxed);
+  }
   const bool census = CensusEnabled();
   if (census) {
     std::lock_guard<std::mutex> lock(g_state.mutex);

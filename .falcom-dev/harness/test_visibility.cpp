@@ -130,6 +130,8 @@ int main() {
       CHECK((f & kTraitLightView) != 0u && (f & kTraitCameraView) == 0u, "vs %llx light view", (unsigned long long)vs);
     }
   }
+  CHECK(contract::IsCameraViewVertex(kRigid) && contract::IsCameraViewVertex(kMeshVs), "Two-Sided discovery counts camera-view VS draws");
+  CHECK(!contract::IsCameraViewVertex(kShadowVs) && !contract::IsCameraViewVertex(0u), "light-view VS and no VS are not camera draws");
   CHECK((contract::LookupPixelTraits(kOpaque).flags & kTraitNearFade) == 0u, "0x2162672F has no near fade");
   CHECK((contract::LookupPixelTraits(kAlpha).flags & kTraitNearFade) != 0u, "0x049B0385 near-fades");
   CHECK((contract::LookupPixelTraits(kNearFadePs).flags & kTraitNearFade) != 0u, "0x050F5192 near-fades");

@@ -22,7 +22,9 @@ Alpha-tested foliage (path 3): GPU stage built and reviewed, not validated in ga
 - Harness after the default change: see the result line under "Native test harness" below.
 - In-game steps and what to send back: Reference: Path 3.
 
-RTAO round 1 (2026-10-09, implemented, awaiting in-game validation): inline ray-traced AO in the lighting hook, Ray Tracing tab section RTAO. When on it overrides GTVBAO and VBGI (their controls are greyed, stored values kept). Temporal and spatial rows exist but do nothing yet. Reference: RTAO (round 1).
+RTAO round 1 (2026-10-09, implemented, awaiting in-game validation): inline ray-traced AO in the lighting hook, Ray Tracing tab section RTAO. When on it overrides GTVBAO and VBGI (their controls are greyed, stored values kept). Spatial and filter rows do nothing yet. Reference: RTAO (round 1).
+
+RTAO round 2 and D1 (2026-10-09, implemented, awaiting in-game validation): temporal accumulation (pass B, reprojection with CustomTAA_Reproject, RTV4 motion only, reset rules, Temporal on by default for new configs), debug modes, and the Two-Sided discovery diagnostic (no culling). Reference: RTAO round 2 and D1; the in-game steps are there.
 
 Agreed plan, in order (owner's words in "Plan agreed 2026-10-07" below):
 1. Deforming meshes (stream-out): done for characters and water. Wind foliage and billboards moved into path 3.
@@ -34,7 +36,7 @@ Agreed plan, in order (owner's words in "Plan agreed 2026-10-07" below):
 Next steps:
 - Owner in-game validation: Path 2 (P2a, P2a-rev) and the alpha steps below. Send back the listed panel lines and dumps.
 - P2b (per-frame path for flagged moving meshes): design under Reference: Path 2. Not started.
-- RTAO round 1 is awaiting in-game validation (see Reference: RTAO). Next: round 2 (temporal accumulation) and round 3 (spatial denoising, dynamic objects).
+- RTAO round 1 and round 2 (temporal, D1 discovery) are awaiting in-game validation (see Reference: RTAO and RTAO round 2). Next: round 3 (spatial denoising, dynamic objects) after the owner reports; D2 (culling) is planned only after the D1 counters.
 
 GPU cost note (owner asked): the BVH debug trace (~17-22 ms) is a validation tracer. See "GPU cost of the BVH debug views (2026-10-07)" in the history. RT effects will use any-hit short rays at reduced resolution with accumulation; tracer optimization is milestone M8/M13, after BVH contents are steady.
 
@@ -172,6 +174,31 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 - Sampling: IS-FAST blue noise (t18, Load only) when the texture is loaded, else IGN (`isfast_unavailable`). Scaled-resolution frames (`resolutionScaling_g != (1,1)`) are neutral and counted by the shader.
 - Diagnostics: panel row "RTAO status" (state and reason code, GPU ms, fade, texture bytes, stats after "Read RTAO Stats"), `[world-rtao]` lines in ReShade.log, `world_rtao.json` on each stats read.
 - Harness: `test_rtao` (gate table, fade rule, region margin, b12 layout, ray rules against a wall reference, pixel classes, mock device lifecycle). Not covered: GPU execution of the shader, FXC runtime, in-game behaviour.
+
+### RTAO round 2 (temporal) and D1 (Two-Sided discovery): reference
+
+- Pass B (`world/shaders/world_rtao_temporal.cs_5_0.hlsl`) runs after pass A when Temporal is on and the motion and resources are available. Pass A writes the raw AO (r16_float) instead of the texel. Pass B reprojects with `CustomTAA_Reproject` (`taa/taa_common.hlsli`, prevResolutionScale 1), gathers 2x2 bilinear history taps with depth and normal accept flags, renormalises, clamps to the 3x3 raw neighbourhood (History Clamp sigma, 0 = off), blends `ao = lerp(raw, history, History Weight * valid fraction)`, writes the history and the AO texel.
+- History: two rgba16f targets used ping-pong (R accumulated AO, G distance from camera, BA octahedral normal), zero-initialised (distance 0 = invalid). Created only while Temporal is on. Raw AO r16_float. Memory is about 18 bytes per pixel (37 MB at 1080p).
+- Motion: the G-buffer RTV4 owned SRV only (`MBMotionRtv4Ensure`). TAA t3 is not used (it is bound after lighting and is not shown to be written before the hook). If TAA t3 and RTV4 are different resources in the session, Temporal stops for the session (`no_motion`, round-1 AO).
+- Reset rule (`TemporalResetReason`, rtao_state.hpp, priority): off; off to on; AO size change; frame gap (no RTAO output in the previous frame); loading wipe or resize guard; parameter change (ParameterSnapshot); no motion. A reset means one frame of raw AO. Counts per reason are in the panel and json.
+- Pass failure: pass B's pipeline, targets and motion are checked before pass A. If any is missing, pass A writes the round-1 texel and the history is not swapped.
+- Unbinding: after each pass the compute slots are nulled with push_descriptors (`NullComputeSlots`), so no UAV stays bound at u0..u2 and the raw texture is free as a shader resource (a barrier between the passes).
+- Debug modes (RtaoDebug, advanced): 1 raw AO, 2 accumulated AO (white where there is no valid history), 3 history confidence. They apply with Temporal on and are written by pass B. View full screen through the GTVBAO Debug View "GTVBAO raw .a".
+- Two-Sided discovery D1 (advanced, diagnostic, no culling; the row stays locked on): CPU histogram of camera-view opaque candidate draws by (cull mode, front CCW), counted only while the discovery setting is on. GPU counters (stats 16..23): index = 16 + back winding * 4 + G-buffer normal toward camera * 2 + alpha-tested * 1, where back winding means the hit facing is positive, toward means dot(N, -view) > 0, alpha means the instance material is non-zero. Names: 16 front_away_opaque, 17 front_away_alpha, 18 front_toward_opaque, 19 front_toward_alpha, 20 back_away_opaque, 21 back_away_alpha, 22 back_toward_opaque, 23 back_toward_alpha. Only hits within max(2%, 5 cm) of the G-buffer distance count.
+- Persistence: RtaoDebug and RtaoTwoSidedDiscovery are saved with the other settings (owner decision pending whether they should be session-only).
+- Known limits: a game that alternates two motion buffers can look like a conflict (the CONFLICT line prints both handles); the GPU time is one timer around both passes.
+
+#### In-game steps for round 2 (owner)
+
+1. Temporal Accumulation is on by default for new configs. A saved config may keep it off: switch it on by hand in the RTAO section.
+2. Off gives the round-1 image. On should show less noise. Check standing still, a moving camera, and a character walking through: look for lag, smear, silhouette flicker and halos at disocclusions. Compare with TAA on and off.
+3. Debug: set RTAO Debug (advanced) to 1, 2 or 3 with Temporal on, and view with the GTVBAO Debug View set to "GTVBAO raw .a".
+4. Motion: check the log for `[world-rtao] motion: ... same resource: RTV4 owned SRV used` (good) or `[world-rtao] motion CONFLICT: ...` (Temporal is off for the session; send both handles).
+5. D1: enable Two-Sided discovery (advanced), stand in a street, an indoor scene and a foliage scene, press Read RTAO Stats, and send the CPU lines ("Camera opaque candidate draws: cull N, front CW/CCW: count"), the eight GPU counters, and `world_rtao.json`.
+6. CS Dispatch Fix: set "CS Dispatch Fix" to 0, then 1, and confirm the RTAO AO still appears (not black).
+
+What to send back after a session: the RTAO status panel lines, `world_rtao.json`, the `[world-rtao]` log lines, the D1 counters, the GPU ms, and screenshots with Temporal on and off.
+
 
 ## History
 

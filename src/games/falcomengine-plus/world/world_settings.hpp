@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 
 #include <Windows.h>
 
@@ -42,7 +43,7 @@ inline bool IsDevkitPresent() {
   return file_present;
 }
 
-inline void AddSettings(renodx::utils::settings::Settings* settings, bool supported) {
+inline void AddSettings(renodx::utils::settings::Settings* settings, bool supported, std::function<bool()> advanced_visible = nullptr) {
   if (settings == nullptr) return;
   g_state.supported = supported && IsDevkitPresent();
   if (!g_state.supported) return;
@@ -50,6 +51,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   using Setting = renodx::utils::settings::Setting;
   using SettingValueType = renodx::utils::settings::SettingValueType;
   const auto visible = []() { return g_state.supported; };
+  const std::function<bool()> advanced = advanced_visible ? advanced_visible : std::function<bool()>(visible);
 
   settings->push_back(new Setting{
       .key = "WorldResearchEnabled",
@@ -74,7 +76,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
 
-  const auto not_implemented_temporal = "Round 2 (temporal accumulation). Not implemented yet: this setting does nothing.";
   const auto not_implemented_spatial = "Round 3 (spatial denoising). Not implemented yet: this setting does nothing.";
   settings->push_back(new Setting{
       .key = "RtaoEnabled",
@@ -101,6 +102,28 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
         return false;
       },
       .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtaoDebug",
+      .binding = &rtao::g_rtao_debug,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "RTAO Debug",
+      .section = "RTAO",
+      .tooltip = "Modes apply with Temporal on (the temporal pass writes them). Modes write the chosen value as the AO texel. To see it full screen, set the GTVBAO Debug View to \"GTVBAO raw .a\". Accumulated AO = reprojected history before the blend (white where there is no valid history). History confidence = fraction of valid history taps (dark = rejected).",
+      .labels = {"Off", "Raw AO", "Accumulated AO", "History confidence"},
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "RtaoTwoSidedDiscovery",
+      .binding = &rtao::g_rtao_discovery,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Two-Sided discovery (diagnostic)",
+      .section = "RTAO",
+      .tooltip = "Diagnostic only: counts facing and winding of the traced surfaces. Does not cull anything.",
+      .labels = {"Off", "On"},
+      .is_visible = advanced,
   });
   settings->push_back(new Setting{
       .key = "RtaoRadius",
@@ -138,6 +161,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Cosine-hemisphere rays per pixel per frame.",
       .min = 1.f,
       .max = 8.f,
+      .format = "%d",
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -163,8 +187,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = "Ray origin offset along the surface normal, in metres.",
       .min = 0.f,
       .max = 0.5f,
-      .format = "%.2f",
+      .format = "%.4f",
       .is_visible = visible,
+      .is_logarithmic = true,
   });
   settings->push_back(new Setting{
       .key = "RtaoTwoSided",
@@ -183,10 +208,10 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .key = "RtaoTemporalEnabled",
       .binding = &rtao::g_rtao_temporal_enabled,
       .value_type = SettingValueType::BOOLEAN,
-      .default_value = 0.f,
-      .label = "Temporal Accumulation (not implemented yet)",
+      .default_value = 1.f,
+      .label = "Temporal Accumulation",
       .section = "Temporal Accumulation",
-      .tooltip = not_implemented_temporal,
+      .tooltip = "Reprojects the previous frame AO with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
@@ -195,9 +220,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_history_weight,
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.9f,
-      .label = "History Weight (not implemented yet)",
+      .label = "History Weight",
       .section = "Temporal Accumulation",
-      .tooltip = not_implemented_temporal,
+      .tooltip = "Maximum blend toward the reprojected history after validation (0 to 0.99).",
       .min = 0.f,
       .max = 0.99f,
       .format = "%.2f",
@@ -208,22 +233,23 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_depth_rejection,
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.05f,
-      .label = "Depth Rejection (not implemented yet)",
+      .label = "Depth Rejection",
       .section = "Temporal Accumulation",
-      .tooltip = not_implemented_temporal,
+      .tooltip = "Relative distance difference allowed between history and current (0.001 to 0.2).",
       .min = 0.001f,
       .max = 0.2f,
       .format = "%.3f",
       .is_visible = visible,
+      .is_logarithmic = true,
   });
   settings->push_back(new Setting{
       .key = "RtaoNormalRejection",
       .binding = &rtao::g_rtao_normal_rejection,
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.9f,
-      .label = "Normal Rejection (not implemented yet)",
+      .label = "Normal Rejection",
       .section = "Temporal Accumulation",
-      .tooltip = not_implemented_temporal,
+      .tooltip = "Minimum dot product between history and current normals (0 to 1).",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
@@ -234,9 +260,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_history_clamp,
       .value_type = SettingValueType::FLOAT,
       .default_value = 1.f,
-      .label = "History Clamp (not implemented yet)",
+      .label = "History Clamp",
       .section = "Temporal Accumulation",
-      .tooltip = not_implemented_temporal,
+      .tooltip = "History is clamped to the 3x3 neighbourhood mean plus or minus k sigma (0 = off, 0 to 4).",
       .min = 0.f,
       .max = 4.f,
       .format = "%.2f",
@@ -274,6 +300,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .tooltip = not_implemented_spatial,
       .min = 1.f,
       .max = 8.f,
+      .format = "%d",
       .is_visible = visible,
   });
   settings->push_back(new Setting{
