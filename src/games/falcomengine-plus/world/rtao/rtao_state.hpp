@@ -175,6 +175,19 @@ inline MatrixSelfCheck CheckSceneMatrices(const float vp[16], const float vp_inv
   return result;
 }
 
+// Depth-ratio bin of the highest-weight history tap (P0-B), the same edges as the pass B shader. 0 invalid history
+// (distance <= 0 or NaN); 1 below 0.1%; 2 below 0.5%; 3 below 1%; 4 below 2%; 5 below 5%; 6 otherwise (and NaN).
+inline uint32_t DepthRatioBin(float history_dist, float ratio) {
+  if (!(history_dist > 0.f)) return 0u;
+  if (ratio != ratio) return 6u;
+  if (ratio < 0.001f) return 1u;
+  if (ratio < 0.005f) return 2u;
+  if (ratio < 0.01f) return 3u;
+  if (ratio < 0.02f) return 4u;
+  if (ratio < 0.05f) return 5u;
+  return 6u;
+}
+
 // Pass A sampling slice and seed (b12 c1.z and c1.w). Freeze noise gives 0 and 0 for every frame; otherwise the
 // values are the ones the round-1 dispatch always used.
 struct NoiseSample {

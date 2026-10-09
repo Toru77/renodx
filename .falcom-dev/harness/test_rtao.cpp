@@ -46,6 +46,7 @@ inline constexpr std::span<const std::uint8_t> __world_rtao_temporal{__world_rta
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
 #include "src/games/falcomengine-plus/world/rtao/rtao.hpp"
+#include "../../src/games/falcomengine-plus/shared.h"  // REAL: compiled; ShaderInjectData.rtao_debug_show must exist
 
 
 using namespace reshade::api;
@@ -161,11 +162,11 @@ static void TestPushLayout() {
   CHECK(offsetof(rtao::RtaoPushConstants, fade) == 32u, "c2 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, region) == 48u, "c3 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, size) == 64u, "c4 offset");
-  CHECK(rtao::kRtaoStatsCount == 42u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
+  CHECK(rtao::kRtaoStatsCount == 55u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
   CHECK(rtao::kRtaoSrvCount == 19u && rtao::kRtaoUavCount == 3u && rtao::kRtaoPushRegister == 12u, "table sizes");
   CHECK(sizeof(rtao::RtaoTemporalPushConstants) == 20u * sizeof(float), "pass B b12 size");
   CHECK(offsetof(rtao::RtaoTemporalPushConstants, texel) == 16u && offsetof(rtao::RtaoTemporalPushConstants, size) == 32u, "pass B offsets");
-  CHECK(rtao::kRtaoTemporalSrvCount == 5u && rtao::kRtaoTemporalUavCount == 3u && rtao::kRtaoTemporalSamplerCount == 2u, "pass B table sizes");
+  CHECK(rtao::kRtaoTemporalSrvCount == 6u && rtao::kRtaoTemporalUavCount == 3u && rtao::kRtaoTemporalSamplerCount == 2u, "pass B table sizes");
 }
 
 // ---- Ray generation, falloff, fade and strength: transcription of world_rtao.cs_5_0.hlsl TracePixel ----
@@ -569,7 +570,7 @@ static void TestParameterSnapshot() {
 
 // ---- Two-Sided discovery index (rtao_state.hpp TwoSidedDiscoveryIndex; shader: back*4 + toward*2 + alpha) ----
 static void TestTwoSidedIndex() {
-  CHECK(rtao::kRtaoStatsCount == 42u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
+  CHECK(rtao::kRtaoStatsCount == 55u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
   CHECK(rtao::kRtaoStatTemporalFBase == 24u && rtao::kRtaoStatTemporalFCount == 16u, "pass B diagnostics layout");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, false) == 0u, "front away opaque is 0");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, true) == 1u, "front away alpha is 1");
@@ -681,7 +682,7 @@ static void TestTemporalDispatch() {
   const rtao::RtaoDispatchResult off = rtao::Dispatch(&dev, &cl, in);
   rtao::RtaoDeviceData& data = rtao::GetRtaoDeviceData(&dev);
   CHECK(off.ok && !off.temporal_ran, "temporal off: pass A only");
-  CHECK(data.raw_texture.handle == 0u && data.history_texture[0].handle == 0u && data.history_texture[1].handle == 0u,
+  CHECK(data.raw_texture[0].handle == 0u && data.raw_texture[1].handle == 0u && data.history_texture[0].handle == 0u && data.history_texture[1].handle == 0u,
         "temporal off: no raw or history objects");
   CHECK(cl.dispatches == 1 && dev.sampler_creates == 0, "temporal off: one dispatch, no samplers (%d dispatches)", cl.dispatches);
 
@@ -690,12 +691,14 @@ static void TestTemporalDispatch() {
   const rtao::RtaoDispatchResult on = rtao::Dispatch(&dev, &cl, in);
   CHECK(on.ok && on.temporal_ran, "temporal on: both passes ran");
   CHECK(cl.dispatches == 3 && data.history_index == 1u, "two dispatches more, history index 1 (%d dispatches, index %u)", cl.dispatches, data.history_index);
+  CHECK(data.raw_index == 1u, "raw index flips with the history after both passes");
   CHECK(dev.sampler_creates == 2, "samplers created once (%d)", dev.sampler_creates);
   CHECK(cl.snaps.size() == 3u, "snapshots per pass (%zu)", cl.snaps.size());
   const auto& pass_a = cl.snaps[1];
   const auto& pass_b = cl.snaps[2];
-  CHECK(pass_a.uav[2].handle == data.raw_uav.handle && data.raw_uav.handle != 0u, "pass A binds the raw AO UAV at u2");
-  CHECK(pass_b.srv[0].handle == data.raw_srv.handle && data.raw_srv.handle != 0u, "pass B reads the raw AO at t0");
+  CHECK(pass_a.uav[2].handle == data.raw_uav[0].handle && data.raw_uav[0].handle != 0u, "pass A binds the raw AO UAV at u2");
+  CHECK(pass_b.srv[0].handle == data.raw_srv[0].handle && data.raw_srv[0].handle != 0u, "pass B reads the raw AO at t0");
+  CHECK(pass_b.srv[5].handle == data.raw_srv[1].handle && data.raw_srv[1].handle != 0u, "pass B reads the previous raw AO at t5");
   CHECK(pass_b.srv[1].handle == 0x9000u, "pass B depth at t1");
   CHECK(pass_b.srv[3].handle == 0x9400u, "pass B motion at t3");
   CHECK(pass_b.srv[4].handle == data.history_srv[0].handle && data.history_srv[0].handle != 0u, "pass B reads history 0 at t4");
@@ -711,6 +714,7 @@ static void TestTemporalDispatch() {
   // Second run: reads history 1 and writes history 0; the index goes back to 0.
   const rtao::RtaoDispatchResult again = rtao::Dispatch(&dev, &cl, in);
   CHECK(again.temporal_ran && data.history_index == 0u, "second run swaps back to index 0");
+  CHECK(data.raw_index == 0u, "second run flips the raw index back");
   const auto& pass_b2 = cl.snaps.back();
   CHECK(pass_b2.srv[4].handle == data.history_srv[1].handle, "second run reads history 1");
   CHECK(pass_b2.uav[2].handle == data.history_uav[0].handle, "second run writes history 0");
@@ -719,6 +723,7 @@ static void TestTemporalDispatch() {
   in.motion_view = {0u};
   const rtao::RtaoDispatchResult nomo = rtao::Dispatch(&dev, &cl, in);
   CHECK(nomo.ok && !nomo.temporal_ran && data.history_index == 0u, "no motion: pass B does not run, index unchanged");
+  CHECK(data.raw_index == 0u, "no motion: the raw index does not flip");
 
   // Destroy: every RTAO object (AO, stats, raw, history) is released.
   rtao::DestroyRtaoDeviceData(&dev);
@@ -766,7 +771,7 @@ static void TestNoiseSample() {
 
 // REAL: the layout constants (the stat index is FBase + 8 = 32, and the name table).
 static void TestTexelDiffersLayout() {
-  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 42u, "texel_differs at index 32 of 33");
+  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 55u, "texel_differs at index 32 of 33");
   CHECK(std::string(rtao::kTemporalDiagnosticNames[8]) == "texel_differs", "texel_differs name");
   std::printf("texel_differs layout (real constants)\n");
 }
@@ -849,6 +854,9 @@ static void TestHlslSources() {
       {"RTAO_FSTAT_ABS_DIFF_SUM", 6}, {"RTAO_FSTAT_NO_HISTORY", 7}, {"RTAO_FSTAT_TEXEL_DIFFERS", 8},
       {"RTAO_FSTAT_MATRIX_DIFF_BIN", 9}, {"RTAO_FSTAT_MATRIX_DIFF_SUM", 14}, {"RTAO_FSTAT_MATRIX_DIFF_MAX", 15},
       {"RTAO_STAT_JITTER_X", rtao::kRtaoStatJitterX}, {"RTAO_STAT_JITTER_Y", rtao::kRtaoStatJitterY},
+      {"RTAO_WSTAT_BASE", rtao::kRtaoStatWeightBase}, {"RTAO_WSTAT_COUNT", rtao::kRtaoStatWeightCount},
+      {"RTAO_DSTAT_BASE", rtao::kRtaoStatDepthBase}, {"RTAO_DSTAT_COUNT", rtao::kRtaoStatDepthCount},
+      {"RTAO_RSTAT_BASE", rtao::kRtaoStatRawBase}, {"RTAO_RSTAT_COUNT", rtao::kRtaoStatRawCount},
   };
   for (const Pair& pr : pairs) {
     long value = -1;
@@ -927,6 +935,10 @@ static void TestMatrixSelfCheck() {
 // REAL: names and the new test row in the snapshot.
 static void TestD1bLayout() {
   CHECK(rtao::kRtaoStatJitterX == 40u && rtao::kRtaoStatJitterY == 41u, "jitter stats at 40 and 41");
+  CHECK(rtao::kRtaoStatWeightBase == 42u && rtao::kRtaoStatWeightCount == 3u, "weighted tap stats at 42..44");
+  CHECK(rtao::kRtaoStatDepthBase == 45u && rtao::kRtaoStatDepthCount == 7u, "depth-ratio stats at 45..51");
+  CHECK(rtao::kRtaoStatRawBase == 52u && rtao::kRtaoStatRawCount == 3u, "frame-to-frame raw stats at 52..54");
+  CHECK(rtao::kRtaoTemporalSrvCount == 6u, "pass B has six SRVs (t0..t5)");
   CHECK(std::string(rtao::kTemporalDiagnosticNames[9]) == "matrix_lt_0.1" && std::string(rtao::kTemporalDiagnosticNames[15]) == "matrix_diff_max", "matrix difference names 9..15");
   rtao::ParameterSnapshot a = {};
   rtao::ParameterSnapshot b = a;
@@ -942,6 +954,74 @@ static void TestDebugScale7() {
   bool ok = true;
   for (int i = 0; i < 4; ++i) ok = ok && std::fabs(std::fmin(std::fmax(d[i] / 2.f, 0.f), 1.f) - want[i]) < 1e-6f;
   CHECK(ok, "debug mode 7: saturate(px / 2)");
+}
+
+// ---- P3: the debug field (REAL compile check of shared.h) and source-text checks of the lighting shader ----
+// REAL: the field is compiled (a missing name fails the build). TEXT: the old name is gone from shared.h.
+// TEXT: the lighting shader is read from the repo (refresh_world does not copy sora2nd, so this reads the repo file).
+static int CountOccurrences(const std::string& text, const std::string& needle) {
+  int n = 0;
+  for (size_t p = text.find(needle); p != std::string::npos; p = text.find(needle, p + needle.size())) ++n;
+  return n;
+}
+static void TestDebugShowField() {
+  ShaderInjectData injection = {};
+  injection.rtao_debug_show = 1.f;
+  CHECK(injection.rtao_debug_show == 1.f, "ShaderInjectData.rtao_debug_show compiles and holds its value");
+  const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
+  CHECK(!header.empty(), "shared.h readable from the harness directory");
+  CHECK(CountOccurrences(header, "rtao_debug_show") == 1, "shared.h declares rtao_debug_show exactly once (text)");
+  CHECK(CountOccurrences(header, "char_shadow_surface_thickness") == 0, "the retired name is gone from shared.h (text)");
+  const std::string lighting = ReadText("../../src/games/falcomengine-plus/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl");
+  CHECK(!lighting.empty(), "lighting shader readable from the repo (text)");
+  CHECK(CountOccurrences(lighting, "shader_injection_data.gtvbao_debug_view > 0.5f || shader_injection_data.rtao_debug_show > 0.5f") == 1,
+        "debug block condition includes rtao_debug_show (text)");
+  CHECK(CountOccurrences(lighting, "int mode = shader_injection_data.rtao_debug_show > 0.5f ? 2 :") == 1,
+        "mode selection line exists once and picks mode 2 for RTAO (text)");
+  CHECK(CountOccurrences(lighting, "gtvbaoTexture.Load") == 4, "gtvbaoTexture.Load count is still 4 (text)");
+  std::printf("P3 debug field: compiled field, 6 text checks (shared.h and the lighting shader)\n");
+}
+
+// ---- P0-B: depth-ratio bin (REAL rtao::DepthRatioBin; the shader copy is a transcription of the same edges) ----
+static void TestDepthRatioBin() {
+  CHECK(rtao::DepthRatioBin(0.f, 0.f) == 0u && rtao::DepthRatioBin(-1.f, 0.01f) == 0u, "history distance 0 or negative: invalid bin");
+  CHECK(rtao::DepthRatioBin(std::nanf(""), 0.01f) == 0u, "NaN history distance: invalid bin");
+  CHECK(rtao::DepthRatioBin(5.f, 0.f) == 1u && rtao::DepthRatioBin(5.f, 0.0005f) == 1u, "below 0.1%: bin 1");
+  CHECK(rtao::DepthRatioBin(5.f, 0.001f) == 2u && rtao::DepthRatioBin(5.f, 0.004f) == 2u, "0.1% to 0.5%: bin 2");
+  CHECK(rtao::DepthRatioBin(5.f, 0.005f) == 3u && rtao::DepthRatioBin(5.f, 0.009f) == 3u, "0.5% to 1%: bin 3");
+  CHECK(rtao::DepthRatioBin(5.f, 0.01f) == 4u && rtao::DepthRatioBin(5.f, 0.019f) == 4u, "1% to 2%: bin 4");
+  CHECK(rtao::DepthRatioBin(5.f, 0.02f) == 5u && rtao::DepthRatioBin(5.f, 0.049f) == 5u, "2% to 5%: bin 5");
+  CHECK(rtao::DepthRatioBin(5.f, 0.05f) == 6u && rtao::DepthRatioBin(5.f, 0.5f) == 6u, "5% and above: bin 6");
+  CHECK(rtao::DepthRatioBin(5.f, std::nanf("")) == 6u, "NaN ratio: bin 6");
+  std::printf("depth-ratio bins: 13 values (real function)\n");
+}
+
+// ---- P0-B2: frame-to-frame raw difference. TRANSCRIPTION of the statistic (world_rtao_temporal.cs_5_0.hlsl):
+// sum |raw - previous raw| over pixels where both are traced and the history is valid. With two independent binary raws
+// of probability p, E|X - Y| = 2p(1-p); identical raws give 0 (and every pair is below 0.01). ----
+static void TestRawDifference() {
+  unsigned seed = 2024u;
+  auto next = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) * (1.f / 16777216.f); };
+  const double p = 0.217;
+  double sum_independent = 0.0;
+  const int n = 200000;
+  for (int i = 0; i < n; ++i) {
+    const int x = next() < static_cast<float>(p) ? 1 : 0;
+    const int y = next() < static_cast<float>(p) ? 1 : 0;
+    sum_independent += std::abs(x - y);
+  }
+  const double mean_independent = sum_independent / n;
+  CHECK(std::fabs(mean_independent - 2.0 * p * (1.0 - p)) < 0.005, "independent binary raw: mean |diff| %.4f, expected 2p(1-p) = %.4f", mean_independent, 2.0 * p * (1.0 - p));
+  double sum_identical = 0.0;
+  int below = 0;
+  for (int i = 0; i < n; ++i) {
+    const int x = next() < static_cast<float>(p) ? 1 : 0;
+    const double diff = std::abs(x - x);
+    sum_identical += diff;
+    below += diff < 0.01 ? 1 : 0;
+  }
+  CHECK(sum_identical == 0.0 && below == n, "identical raw: mean |diff| 0, every pair below 0.01");
+  std::printf("raw difference: %d pairs, independent mean %.4f (transcription)\n", n, mean_independent);
 }
 
 int main() {
@@ -973,10 +1053,13 @@ int main() {
   TestDebugScales();
   TestMatrixDifference();
   TestHlslSources();
+  TestDebugShowField();
   TestDiffBin();
   TestMatrixSelfCheck();
   TestD1bLayout();
   TestDebugScale7();
+  TestDepthRatioBin();
+  TestRawDifference();
   HStage("temporal dispatch (mock)");
   TestTemporalDispatch();
   HStage("device lifecycle (mock)");

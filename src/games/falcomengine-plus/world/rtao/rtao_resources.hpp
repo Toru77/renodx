@@ -23,7 +23,16 @@ inline constexpr uint32_t kRtaoUavCount = 3u;
 inline constexpr uint32_t kRtaoPushRegister = 12u;
 inline constexpr uint32_t kRtaoPushConstantCount = 20u;
 // Stats buffer: pass A indices 0..9 (RTAO_STAT_COUNT in world_rtao.cs_5_0.hlsl), pass B 10..15 (RTAO_TSTAT_*), discovery 16..23, pass B diagnostics 24..31 (RTAO_FSTAT_* in world_rtao_temporal.cs_5_0.hlsl).
-inline constexpr uint32_t kRtaoStatsCount = 42u;
+inline constexpr uint32_t kRtaoStatsCount = 55u;
+// P0-B2 frame-to-frame raw difference, indices 52..54: sum |raw - previous raw| (x1000), pair count, count below 0.01.
+inline constexpr uint32_t kRtaoStatRawBase = 52u;
+inline constexpr uint32_t kRtaoStatRawCount = 3u;
+// P0-B depth-ratio histogram of the highest-weight history tap, indices 45..51 (invalid, <0.1%, <0.5%, <1%, <2%, <5%, >=5%).
+inline constexpr uint32_t kRtaoStatDepthBase = 45u;
+inline constexpr uint32_t kRtaoStatDepthCount = 7u;
+// P0 weighted taps, indices 42..44: accepted, rejected by depth, rejected by normal (bilinear weight x1000 per traced pixel).
+inline constexpr uint32_t kRtaoStatWeightBase = 42u;
+inline constexpr uint32_t kRtaoStatWeightCount = 3u;
 // D1b: motion vs camera-matrix difference, indices 33..39 (bins, sum, max; see RTAO_FSTAT_* in the pass B shader);
 // jitterDiff_g.x and .y as bit patterns at 40 and 41.
 inline constexpr uint32_t kRtaoStatJitterX = 40u;
@@ -36,7 +45,7 @@ inline constexpr uint32_t kRtaoStatTemporalFCount = 16u;  // 32: texel_differs (
 inline constexpr uint32_t kRtaoStatDiscoveryBase = 16u;
 inline constexpr uint32_t kRtaoStatDiscoveryCount = 8u;
 inline constexpr uint32_t kRtaoStatTemporalBase = 10u;
-inline constexpr uint32_t kRtaoTemporalSrvCount = 5u;      // t0 raw AO, t1 depth, t2 MRT normal, t3 motion, t4 history
+inline constexpr uint32_t kRtaoTemporalSrvCount = 6u;      // t0 raw AO, t1 depth, t2 MRT normal, t3 motion, t4 history, t5 previous raw AO
 inline constexpr uint32_t kRtaoTemporalUavCount = 3u;      // u0 AO, u1 stats, u2 history write
 inline constexpr uint32_t kRtaoTemporalSamplerCount = 2u;  // s0 point clamp, s1 linear clamp
 // Stats buffer indices, matching RTAO_STAT_* in world_rtao.cs_5_0.hlsl.
@@ -102,9 +111,10 @@ struct RtaoDeviceData {
   bool temporal_pipeline_failed = false;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
-  reshade::api::resource raw_texture = {0u};
-  reshade::api::resource_view raw_srv = {0u};
-  reshade::api::resource_view raw_uav = {0u};
+  reshade::api::resource raw_texture[2] = {};
+  reshade::api::resource_view raw_srv[2] = {};
+  reshade::api::resource_view raw_uav[2] = {};
+  uint32_t raw_index = 0u;  // raw_texture[raw_index] is written by pass A; the other one holds the previous frame
   reshade::api::resource history_texture[2] = {};
   reshade::api::resource_view history_srv[2] = {};
   reshade::api::resource_view history_uav[2] = {};
@@ -244,8 +254,11 @@ inline bool CreateRtaoTexture(
 }
 
 inline void DestroyRtaoTemporalTargets(reshade::api::device* device, RtaoDeviceData* data) {
-  bvh::DestroyBuffer(device, &data->raw_srv, &data->raw_texture);
-  bvh::DestroyBuffer(device, &data->raw_uav, nullptr);
+  for (int i = 0; i < 2; ++i) {
+    bvh::DestroyBuffer(device, &data->raw_srv[i], &data->raw_texture[i]);
+    bvh::DestroyBuffer(device, &data->raw_uav[i], nullptr);
+  }
+  data->raw_index = 0u;
   for (int i = 0; i < 2; ++i) {
     bvh::DestroyBuffer(device, &data->history_srv[i], &data->history_texture[i]);
     bvh::DestroyBuffer(device, &data->history_uav[i], nullptr);
@@ -257,10 +270,12 @@ inline void DestroyRtaoTemporalTargets(reshade::api::device* device, RtaoDeviceD
 // Raw AO (r16_float) and two history targets (rgba16f: R accumulated AO, G distance, BA octahedral normal).
 // A size change replaces them. Created only while Temporal is on; the caller holds no lock.
 inline bool EnsureRtaoTemporalTargets(reshade::api::device* device, RtaoDeviceData* data, uint32_t width, uint32_t height) {
-  if (data->raw_texture.handle != 0u && data->temporal_width == width && data->temporal_height == height) return true;
+  if (data->raw_texture[0].handle != 0u && data->temporal_width == width && data->temporal_height == height) return true;
   DestroyRtaoTemporalTargets(device, data);
   const bool created = CreateRtaoTexture(device, reshade::api::format::r16_float, width, height, 2u,
-                                         &data->raw_texture, &data->raw_srv, &data->raw_uav)
+                                         &data->raw_texture[0], &data->raw_srv[0], &data->raw_uav[0])
+      && CreateRtaoTexture(device, reshade::api::format::r16_float, width, height, 2u,
+                           &data->raw_texture[1], &data->raw_srv[1], &data->raw_uav[1])
       && CreateRtaoTexture(device, reshade::api::format::r16g16b16a16_float, width, height, 8u,
                            &data->history_texture[0], &data->history_srv[0], &data->history_uav[0])
       && CreateRtaoTexture(device, reshade::api::format::r16g16b16a16_float, width, height, 8u,

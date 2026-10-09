@@ -49,6 +49,8 @@ struct RtaoFrameState {
   bool matrix_valid = false;         // CPU matrix self-check ran (D1b; indicative, may be one frame old)
   float matrix_identity_err = 0.f;
   float matrix_prev_diff = 0.f;
+  ParameterSnapshot captured = {};   // parameters of the last successful dispatch (P0)
+  bool captured_isfast_used = false;
 };
 
 inline RtaoFrameState g_rtao_frame;
@@ -134,7 +136,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, bvh::DynamicTraceInputs{}, srvs);
   srvs[17] = in.mrt_normal_view;
   srvs[18] = in.isfast_view;
-  const reshade::api::resource_view uavs[kRtaoUavCount] = {data.ao_uav, data.stats_uav, data.raw_uav};
+  const reshade::api::resource_view uavs[kRtaoUavCount] = {data.ao_uav, data.stats_uav, data.raw_uav[data.raw_index]};
   reshade::api::descriptor_table_update updates[3] = {
       {data.cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &in.scene_cbv_view},
       {data.srv_table, 0, 0, kRtaoSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs},
@@ -151,13 +153,14 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
 
   if (temporal_run) {
     // Pass A wrote the raw AO through u2; pass B reads it through t0.
-    cmd_list->barrier(data.raw_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.raw_texture[data.raw_index], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
 
     // Pass B. History: read the current index, write the other one.
     const uint32_t read = data.history_index;
     const uint32_t write = data.history_index ^ 1u;
     const reshade::api::resource_view temporal_srvs[kRtaoTemporalSrvCount] = {
-        data.raw_srv, in.depth_view, in.mrt_normal_view, in.motion_view, data.history_srv[read]};
+        data.raw_srv[data.raw_index], in.depth_view, in.mrt_normal_view, in.motion_view, data.history_srv[read],
+        data.raw_srv[data.raw_index ^ 1u]};
     const reshade::api::resource_view temporal_uavs[kRtaoTemporalUavCount] = {
         data.ao_uav, data.stats_uav, data.history_uav[write]};
     const reshade::api::sampler samplers[kRtaoTemporalSamplerCount] = {data.point_sampler, data.linear_sampler};
@@ -184,6 +187,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     cmd_list->dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
     NullComputeSlots(cmd_list, kRtaoTemporalSrvCount, kRtaoTemporalUavCount, kRtaoTemporalSamplerCount);
     data.history_index = write;  // both passes succeeded: this history is now the one to read
+    data.raw_index ^= 1u;        // and this raw AO is the previous frame for the next pass B
   }
   bvh::EndGpuTimer(cmd_list, &data.timer);
 
@@ -227,6 +231,10 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
   const TracedDenominators den = ComputeTracedDenominators(tv[kRtaoStatPixels], tv[kRtaoStatSky], tv[kRtaoStatNormal],
                                                           tv[kRtaoStatRegion], tv[kRtaoStatScaled], tv[kRtaoStatTemporalBase + 5u]);
   const double tpx = den.traced > 0u ? static_cast<double>(den.traced) : 1.0;
+  const double wbase = den.traced > 0u ? 1000.0 * den.traced : 1.0;
+  const double w_acc = den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase] / wbase : 0.0;
+  const double w_dep = den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 1u] / wbase : 0.0;
+  const double w_nor = den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 2u] / wbase : 0.0;
   std::ostringstream diag;
   diag << "{\"traced_pixels\": " << den.traced << ", \"taps_traced\": " << den.taps
        << ", \"reset_traced\": " << den.reset_traced << ", \"pass_b_pixels\": " << tv[kRtaoStatTemporalBase]
@@ -236,6 +244,32 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
        << ", \"mean_alpha\": " << fv[5] / 1000.0 / tpx << ", \"mean_abs_raw_minus_ao\": " << fv[6] / 1000.0 / tpx
        << ", \"share_no_history\": " << fv[7] / tpx
        << ", \"texel_differs\": " << fv[8] << ", \"share_texel_differs\": " << fv[8] / tpx
+       << ", \"weighted_shares\": {\"accepted\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase] / (1000.0 * den.traced) : 0.0)
+       << ", \"rejected_depth\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 1u] / (1000.0 * den.traced) : 0.0)
+       << ", \"rejected_normal\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 2u] / (1000.0 * den.traced) : 0.0) << "}"
+       << ", \"weighted_other_pct\": " << (100.0 - w_acc - w_dep - w_nor)
+       << ", \"weighted_note\": \"not counted on reset frames; other = no history, out of bounds or reset\""
+       << ", \"depth_ratio_pct\": {\"invalid\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase] / den.traced : 0.0)
+       << ", \"lt_0_1\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 1u] / den.traced : 0.0)
+       << ", \"lt_0_5\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 2u] / den.traced : 0.0)
+       << ", \"lt_1\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 3u] / den.traced : 0.0)
+       << ", \"lt_2\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 4u] / den.traced : 0.0)
+       << ", \"lt_5\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 5u] / den.traced : 0.0)
+       << ", \"ge_5\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 6u] / den.traced : 0.0) << "}"
+       << ", \"raw_difference\": {\"count\": " << g_rtao_stats.values[kRtaoStatRawBase + 1u]
+       << ", \"mean_abs\": " << (g_rtao_stats.values[kRtaoStatRawBase + 1u] > 0u
+            ? g_rtao_stats.values[kRtaoStatRawBase] / 1000.0 / g_rtao_stats.values[kRtaoStatRawBase + 1u] : 0.0)
+       << ", \"identical_share_pct\": " << (g_rtao_stats.values[kRtaoStatRawBase + 1u] > 0u
+            ? 100.0 * g_rtao_stats.values[kRtaoStatRawBase + 2u] / g_rtao_stats.values[kRtaoStatRawBase + 1u] : 0.0) << "}"
+       << ", \"captured_parameters\": {\"spp\": " << g_rtao_frame.captured.samples
+       << ", \"history_weight\": " << g_rtao_frame.captured.history_weight
+       << ", \"depth_rejection\": " << g_rtao_frame.captured.depth_rejection
+       << ", \"normal_rejection\": " << g_rtao_frame.captured.normal_rejection
+       << ", \"history_clamp\": " << g_rtao_frame.captured.history_clamp
+       << ", \"isfast_used\": " << (g_rtao_frame.captured_isfast_used ? "true" : "false")
+       << ", \"radius\": " << g_rtao_frame.captured.radius << ", \"ray_max\": " << g_rtao_frame.captured.ray_max
+       << ", \"strength\": " << g_rtao_frame.captured.strength << ", \"normal_bias\": " << g_rtao_frame.captured.normal_bias
+       << ", \"debug\": " << g_rtao_frame.captured.debug << "}"
        << ", \"frames_without_ao_by_reason\": {";
   bool first_reason = true;
   for (size_t r = 0; r < kReasonCount; ++r) {
@@ -283,7 +317,7 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
       << ", \"last_reset\": \"" << ResetReasonName(g_rtao_frame.last_reset) << "\""
       << ", \"motion\": \"" << (g_rtao_frame.motion_source == MotionSource::Rtv4 ? "rtv4" : g_rtao_frame.motion_source == MotionSource::Conflict ? "conflict" : "none") << "\""
       << ", \"rcas_motion_res\": " << g_rtao_frame.rcas_res << ", \"mb_rtv4_res\": " << g_rtao_frame.rtv4_res
-      << ", \"temporal_bytes\": " << g_rtao_frame.temporal_bytes << ", \"history_bytes_per_pixel\": 18"
+      << ", \"temporal_bytes\": " << g_rtao_frame.temporal_bytes << ", \"history_bytes_per_pixel\": 20"
       << ", \"temporal_pixels\": " << v[kRtaoStatTemporalBase + 0u]
       << ", \"valid_taps\": " << v[kRtaoStatTemporalBase + 1u]
       << ", \"rejected_depth\": " << v[kRtaoStatTemporalBase + 2u]

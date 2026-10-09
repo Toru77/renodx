@@ -73,10 +73,29 @@ inline void DrawRtaoPanel() {
         v[kRtaoStatTemporalBase + 5u]);
     ImGui::Text("Traced pixels: %u of %u (sky, normal, region and scaled are not traced)",
                 den.traced, v[kRtaoStatPixels]);
-    ImGui::Text("Temporal taps: valid %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
+    ImGui::Text("Temporal taps (unweighted): valid %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
                 SharePercent(v[kRtaoStatTemporalBase + 1u], den.taps),
                 SharePercent(v[kRtaoStatTemporalBase + 2u], den.taps),
                 SharePercent(v[kRtaoStatTemporalBase + 3u], den.taps));
+    if (den.traced > 0u) {
+      const double wden = 1000.0 * den.traced;
+      const double w_acc = 100.0 * v[kRtaoStatWeightBase] / wden;
+      const double w_dep = 100.0 * v[kRtaoStatWeightBase + 1u] / wden;
+      const double w_nor = 100.0 * v[kRtaoStatWeightBase + 2u] / wden;
+      ImGui::Text("Weighted taps (bilinear weights; share of traced pixels; not counted on reset frames): accepted %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
+                  w_acc, w_dep, w_nor);
+      ImGui::Text("Weighted other (no history, out of bounds or reset): %.1f%%", 100.0 - w_acc - w_dep - w_nor);
+      const double dn = static_cast<double>(den.traced);
+      ImGui::Text("Depth ratio of the highest-weight tap (valid history, in bounds): invalid %.1f%%, <0.1%% %.1f%%, <0.5%% %.1f%%, <1%% %.1f%%, <2%% %.1f%%, <5%% %.1f%%, >=5%% %.1f%%",
+                  100.0 * v[kRtaoStatDepthBase] / dn, 100.0 * v[kRtaoStatDepthBase + 1u] / dn, 100.0 * v[kRtaoStatDepthBase + 2u] / dn,
+                  100.0 * v[kRtaoStatDepthBase + 3u] / dn, 100.0 * v[kRtaoStatDepthBase + 4u] / dn, 100.0 * v[kRtaoStatDepthBase + 5u] / dn,
+                  100.0 * v[kRtaoStatDepthBase + 6u] / dn);
+      if (v[kRtaoStatRawBase + 1u] > 0u) {
+        const double rn = static_cast<double>(v[kRtaoStatRawBase + 1u]);
+        ImGui::Text("Frame-to-frame raw AO (history valid): mean |raw - previous raw| %.3f, identical %.1f%% (independent binary raw at p 0.217 gives about 0.34)",
+                    v[kRtaoStatRawBase] / 1000.0 / rn, 100.0 * v[kRtaoStatRawBase + 2u] / rn);
+      }
+    }
     ImGui::Text("Per traced pixel: out of bounds %.1f%%, reset %.1f%% (neutral pixels removed)",
                 SharePercent(v[kRtaoStatTemporalBase + 4u], den.traced),
                 SharePercent(den.reset_traced, den.traced));
@@ -105,6 +124,15 @@ inline void DrawRtaoPanel() {
     }
   } else {
     ImGui::TextDisabled("Temporal percentages: press Read RTAO Stats");
+  }
+  if (frame.dispatched_frame != UINT64_MAX) {
+    const ParameterSnapshot& c = frame.captured;
+    ImGui::Text("Last dispatch: spp %.0f, history weight %.2f, depth rejection %.3f, normal rejection %.2f, history clamp %.2f, IS-FAST %s",
+                c.samples, c.history_weight, c.depth_rejection, c.normal_rejection, c.history_clamp,
+                frame.captured_isfast_used ? "used" : "off");
+    ImGui::Text("Last dispatch: radius %.2f, ray max %.2f, strength %.2f, normal bias %.4f, debug %.0f, tests zero motion %s, freeze noise %s, camera matrix %s",
+                c.radius, c.ray_max, c.strength, c.normal_bias, c.debug,
+                c.zero_motion > 0.5f ? "on" : "off", c.freeze_noise > 0.5f ? "on" : "off", c.camera_matrix > 0.5f ? "on" : "off");
   }
   if (frame.temporal_ran || frame.motion_dims_ok == false) {
     ImGui::Text("Motion dims: RTV4 %ux%u, depth %ux%u (%s)", frame.motion_w, frame.motion_h,

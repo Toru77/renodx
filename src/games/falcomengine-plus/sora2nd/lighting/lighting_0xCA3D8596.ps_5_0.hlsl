@@ -328,8 +328,9 @@ void main(
 
   // —— GTVBAO Debug View ——
   // Scaled for HDR: raw 0-1 AO values would be blinding without scaling.
-  if (shader_injection_data.gtvbao_debug_view > 0.5f) {
-    int mode = (int)shader_injection_data.gtvbao_debug_view;
+  // rtao_debug_show: RTAO texel (t22) shown through the mode-2 branch below.
+  if (shader_injection_data.gtvbao_debug_view > 0.5f || shader_injection_data.rtao_debug_show > 0.5f) {
+    int mode = shader_injection_data.rtao_debug_show > 0.5f ? 2 : (int)shader_injection_data.gtvbao_debug_view;
     float hdr_scale = 0.3;
     if (mode == 1) {
       // AO Only: red tint for visibility

@@ -62,7 +62,7 @@ ShaderInjectData shader_injection = {
   .char_shadow_sample_count = 32.f,
   .char_shadow_hard_shadow_samples = 4.f,
   .char_shadow_fade_out_samples = 16.f,
-  .char_shadow_surface_thickness = 0.09f,
+  .rtao_debug_show = 0.f,
   .char_shadow_contrast = 9.f,
   .char_shadow_light_screen_fade_start = 0.f,
   .char_shadow_light_screen_fade_end = 0.f,
@@ -9022,6 +9022,7 @@ static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list) {
 // shadows read this frame's AO. A failed guard leaves the frame on vanilla SSAO and
 // records its reason in rtao::g_rtao_frame.
 static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resource_view ao_srv) {
+  shader_injection.rtao_debug_show = falcom_world::rtao::g_rtao_debug > 0.5f ? 1.f : 0.f;
   cmd_list->push_descriptors(
       reshade::api::shader_stage::pixel,
       reshade::api::pipeline_layout{0},
@@ -9034,6 +9035,7 @@ static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resou
 
 static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   namespace rtao = falcom_world::rtao;
+  shader_injection.rtao_debug_show = 0.f;  // set again by PushRtaoAo when RTAO produces this frame
   auto& frame = rtao::g_rtao_frame;
   frame.producing = false;
   frame.reason = rtao::Reason::Off;
@@ -9226,7 +9228,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       {0.f, 0.f, 0.f, 0.f},
       {0.f, 0.f, rtao::g_rtao_debug, reset == rtao::ResetReason::None ? 1.f : 0.f},
       {rtao::g_test_zero_motion > 0.5f ? 1.f : 0.f, rtao::g_test_camera_matrix > 0.5f ? 1.f : 0.f, 0.f, 0.f},
-      {0.f, 0.f, 0.f, 0.f},
+      {rf.temporal_last ? 1.f : 0.f, 0.f, 0.f, 0.f},
   };
 
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
@@ -9245,8 +9247,10 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   frame.dispatched_frame = dd->frame_index;
   frame.producing = true;
   frame.gpu_ms = rd.timer.last_ms;
+  frame.captured = params;
+  frame.captured_isfast_used = isfast_used;
   const uint64_t pixels = static_cast<uint64_t>(rd.ao_width) * rd.ao_height;
-  rf.temporal_bytes = rd.raw_texture.handle != 0u ? pixels * (2u + 2u * 8u) : 0u;
+  rf.temporal_bytes = rd.raw_texture[0].handle != 0u ? pixels * (2u * 2u + 2u * 8u) : 0u;
   frame.texture_bytes = pixels * 4u + sizeof(uint32_t) * rtao::kRtaoStatsCount + rf.temporal_bytes;
   PushRtaoAo(cmd_list, rd.ao_srv);
 }

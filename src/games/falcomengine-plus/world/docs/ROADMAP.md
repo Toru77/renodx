@@ -216,6 +216,18 @@ Settings: History Clamp 0, Debug Off, Temporal on, Two-Sided discovery off. The 
 9. texel_differs is valid with Debug Off only (debug modes change the written texel).
 Send back for each case: the RTAO status panel lines, world_rtao.json, and the screenshots or video of modes 4 to 6.
 
+#### D3 owner steps (temporal diagnostics, P0)
+
+Settings: History Clamp 0, Debug Off, Temporal on, Two-Sided discovery off, test rows off unless a step says otherwise.
+
+1. Still camera, scene still, SPP 2: capture the RTAO panel and world_rtao.json. Read: the "Last dispatch" lines (captured parameters), traced pixels, the weighted shares and "other", the depth-ratio histogram, the frame-to-frame raw difference (mean and identical share; for an independent binary raw at p 0.217 the mean is about 0.34), the unweighted tap lines.
+2. Moving camera, same settings: the same capture.
+3. Still camera, Freeze noise on: the same capture (frozen ray directions; the raw difference should fall if the noise is the source of the frame-to-frame change).
+4. Still camera, Force zero motion on: the same capture.
+5. Still camera, SPP 4: the same capture (the captured parameters line shows SPP 4).
+
+Send back for each case: the RTAO panel lines and world_rtao.json.
+
 ## History
 
 ### Early status (through 2026-10-06, round 1)

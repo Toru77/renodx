@@ -41,7 +41,7 @@ struct ShaderInjectData {
   float char_shadow_sample_count;   // RETIRED: Bend_SSS, unread
   float char_shadow_hard_shadow_samples;   // RETIRED: Bend_SSS, unread
   float char_shadow_fade_out_samples;       // RETIRED: Bend_SSS, unread
-  float char_shadow_surface_thickness;      // RETIRED: Bend_SSS, unread
+  float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
   float char_shadow_contrast;               // RETIRED: Bend_SSS, unread
   float char_shadow_light_screen_fade_start; // RETIRED: Bend_SSS, unread
   float char_shadow_light_screen_fade_end;   // RETIRED: Bend_SSS, unread
