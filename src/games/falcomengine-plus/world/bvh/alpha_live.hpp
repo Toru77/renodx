@@ -98,11 +98,12 @@ inline bool EnsureAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
 }
 
 struct AlphaBlitJob {
-  uint64_t source = 0u;  // source texture handle of the copy (alpha_sources)
+  uint64_t source = 0u;  // source id of the copy (alpha_sources)
   uint64_t uid = 0u;     // mesh uid that gets the slice
   reshade::api::resource proxy = {0u};
   reshade::api::format format = reshade::api::format::unknown;
   PoolAlphaMaterial material;
+  bool indirect = false;  // the key is an indirect key (alpha_indirect_keys): the slice is dropped with the switch OFF
 };
 
 // Fills the atlas for the alpha meshes of the store and keeps slot_of_uid (the TLAS reads it). Runs on the
@@ -110,16 +111,26 @@ struct AlphaBlitJob {
 inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data, uint32_t frame) {
   AlphaGpu& alpha = data->alpha;
   const bool on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+  const bool indirect_on = g_pool.alpha_indirect_source.load(std::memory_order_relaxed);
   {
     // The numbers of the previous present: the blit timer resolves a frame late.
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (!on) {
       g_pool.alpha_sync_logged = false;
+      g_pool.alpha_maps = PoolAlphaDumpMaps{};  // alpha OFF: the dump shows no atlas slices
     } else if (!g_pool.alpha_sync_logged) {
       g_pool.alpha_sync_logged = true;
       renodx::utils::log::i("[world-bvh] alpha stage: first SyncLiveAlpha since alpha foliage was switched on");
     }
     PoolAlphaGpuStats& gpu = g_pool.alpha_gpu;
+    PoolAlphaDumpMaps& maps = g_pool.alpha_maps;
+    if (on && maps.store_version != data->store_version) {  // the dump's copies of the atlas maps: at each store change, alpha on
+      maps.store_version = data->store_version;
+      maps.slice_of_uid = alpha.slot_of_uid;
+      maps.indirect_uids = alpha.indirect_uids;
+      maps.resident_uids.clear();
+      for (const auto& slot : data->slot_by_uid) maps.resident_uids.insert(slot.first);
+    }
     gpu.slices_used = alpha.slices.used;
     gpu.blits = alpha.blits;
     gpu.blits_frame = alpha.blits_frame;
@@ -155,12 +166,20 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
         wanted = wanted || g_pool.mesh_by_key.count(key) != 0u || g_pool.mesh_queued.count(key) != 0u
                  || g_pool.mesh_requests.count(key) != 0u;
       }
+      if (!wanted && source.keys.empty() && source.hold_until != 0u) {  // keyless: held for its indirect draw's resolve
+        if (frame <= source.hold_until) {
+          ++it;
+          continue;
+        }
+        g_pool.stats.alpha_orphans_expired += 1u;
+      }
       if (!wanted) {  // no key uses the copy: freed; an unblitted copy is not copied again until its key is drawn again
         stale.push_back(source.proxy);
         for (const uint64_t key : source.keys) {
           g_pool.alpha_key_source.erase(key);
           if (!source.blitted) g_pool.alpha_source_done.insert(key);
         }
+        UnlinkPoolAlphaTexture(it->first, source);
         it = g_pool.alpha_sources.erase(it);
         continue;
       }
@@ -173,17 +192,21 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
         for (const AlphaBlitJob& job : jobs) chosen = chosen || job.uid == mesh.uid;
         // Blit only into a mesh resident in the live store (slot_by_uid); the copy stays in the map until then.
         if (chosen || data->slot_by_uid.count(mesh.uid) == 0u || jobs.size() >= kAlphaBlitsPerFrame) continue;
-        jobs.push_back({it->first, mesh.uid, source.proxy, source.format, mesh.alpha_state.material});
+        jobs.push_back({it->first, mesh.uid, source.proxy, source.format, mesh.alpha_state.material,
+                        g_pool.alpha_indirect_keys.count(key) != 0u});
       }
       ++it;
     }
   }
   for (auto it = alpha.slot_of_uid.begin(); it != alpha.slot_of_uid.end();) {
-    if (ready_uids.count(it->first) != 0u) {
+    // With the indirect source switch OFF, a slice filled from an indirect key is dropped (the mesh waits again).
+    const bool dropped = !indirect_on && alpha.indirect_uids.count(it->first) != 0u;
+    if (ready_uids.count(it->first) != 0u && !dropped) {
       ++it;
       continue;
     }
     alpha.quarantine.emplace_back(it->second, frame);
+    alpha.indirect_uids.erase(it->first);
     it = alpha.slot_of_uid.erase(it);
     data->store_version += 1u;
   }
@@ -249,6 +272,7 @@ inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_li
       }
     }
     alpha.slot_of_uid[job.uid] = slice;
+    if (job.indirect) alpha.indirect_uids.insert(job.uid);
     if (alpha.blits == 0u && blits == 0u) {
       renodx::utils::log::i("[world-bvh] alpha atlas: first slice filled (mesh uid ", job.uid, ", slice ", slice, ")");
     }

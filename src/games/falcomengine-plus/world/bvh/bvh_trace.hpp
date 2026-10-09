@@ -89,7 +89,7 @@ struct BvhTraceState {
   std::atomic<float> inspect_v{0.f};
   // Hide what the game camera does not show: instances no camera VS drew
   // (shadow-only casters) and near-faded surfaces (A/B against the game's depth).
-  std::atomic_bool hide_camera_hidden{false};
+  std::atomic_bool hide_camera_hidden{true};
 };
 
 inline BvhTraceState g_bvh_trace;

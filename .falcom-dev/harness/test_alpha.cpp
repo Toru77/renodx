@@ -53,7 +53,9 @@ struct Device : mock::DeviceBase {
     }
   }
   device_api get_api() const override { return device_api::d3d11; }
+  bool fail_texture_create = false;  // create_resource fails for 2D textures (the copy-failed refusal)
   bool create_resource(const resource_desc &desc, const subresource_data *initial_data, resource_usage, resource *out, void ** = nullptr) override {
+    if (fail_texture_create && desc.type == resource_type::texture_2d) return false;
     Res r; r.desc = desc;
     if (desc.type == resource_type::buffer) {
       r.bytes.assign(desc.buffer.size, 0);
@@ -410,6 +412,7 @@ static void TestGate(Device& dev) {
   };
   for (const bool on : {false, true}) {
     pool::g_pool.alpha_foliage.store(on);
+    pool::g_pool.alpha_wind_opaque.store(false);  // the WindOpaque refusal is the d2 OFF case (on by default)
     const auto wind_alpha = gate(kWindVs, kAlphaPs);
     const auto wind_opaque = gate(kWindVs, kOpaquePs);
     const auto billboard_alpha = gate(kBillboardVs, kAlphaPs);
@@ -430,6 +433,18 @@ static void TestGate(Device& dev) {
   pool::g_pool.alpha_foliage.store(true);
   const uint64_t kUnknownPs = 0xD7;  // never classified
   CHECK(gate(kRigidVs, kUnknownPs).skip == pool::PoolSkip::PixelUnknown, "unclassified pixel shader: PixelUnknown");
+
+  // S5 (decision 2): wind with an opaque pixel shader is WindOpaque unless alpha_wind_opaque and alpha_foliage are on.
+  pool::g_pool.alpha_wind_opaque.store(false);
+  CHECK(gate(kWindVs, kOpaquePs).skip == pool::PoolSkip::WindOpaque, "wind + opaque, d2 OFF: WindOpaque");
+  pool::g_pool.alpha_wind_opaque.store(true);
+  const auto wind_rest = gate(kWindVs, kOpaquePs);
+  CHECK(wind_rest.skip == pool::PoolSkip::None && wind_rest.wind_rest && (wind_rest.pass & pool::kPoolPassWind) != 0u,
+        "wind + opaque, d2 ON: admitted as rest pose");
+  pool::g_pool.alpha_foliage.store(false);
+  CHECK(gate(kWindVs, kOpaquePs).skip == pool::PoolSkip::NotRigid, "main OFF: wind NotRigid whatever d2 says");
+  pool::g_pool.alpha_foliage.store(true);
+  pool::g_pool.alpha_wind_opaque.store(false);
 }
 
 // A PixelUnknown draw logs its (vs, ps) pair once, from the locked scan block, with the draw's hashes.
@@ -756,6 +771,7 @@ static void TestScanPath(Device& dev, CmdList& cl, Queue& queue) {
 // instance, first index 0, vertex offset 0), so the key the copy resolves to is PoolMeshKey of it.
 static void TestIndirectAlpha(Device& dev, CmdList& cl, Queue& queue) {
   auto& p = pool::g_pool;
+  p.alpha_indirect_source.store(false);  // (a), (b) and (d) are the d1 OFF cases (on by default); Tests 1 and 2 set it ON
   RegisterUvLayout();
   const uint64_t kRigid = 0xF1, kAlpha = 0xF3;
   Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
@@ -882,6 +898,131 @@ static void TestIndirectAlpha(Device& dev, CmdList& cl, Queue& queue) {
   pool::ResetWorldPool();
   p.alpha_foliage.store(true);
   pool::UpdateLiveBvh(&dev, &queue);  // empties the live store (the mesh above was resident)
+
+  // (d) Indirect source copy (S3, CPU side). OFF (default): no keyless copy, no source for the indirect key.
+  reset(true);
+  record();
+  frames(40);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_sources.empty() && p.alpha_indirect_keys.empty() && p.stats.alpha_indirect_copies == 0u,
+          "indirect source OFF: no source, no keyless copy");
+  }
+  // Test 1: ON. One copy over one texture; the copy is attached to the key at resolve; a slice after 3 presents.
+  reset(true);
+  p.alpha_indirect_source.store(true);
+  frames(40);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.stats.alpha_indirect_copies == 1u && p.alpha_sources.size() == 1u, "indirect ON: one copy over one texture (%llu)",
+          static_cast<unsigned long long>(p.stats.alpha_indirect_copies));
+    CHECK(p.alpha_indirect_keys.count(real_key) == 1u && p.alpha_key_source.count(real_key) == 1u, "indirect ON: the key has the source");
+  }
+  for (int i = 0; i < 3; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  CHECK(data->live.tlas_alpha_instances == 1u && data->live.tlas_alpha_waiting == 0u,
+        "indirect ON: alpha instance in the TLAS after 3 presents (instances %u, waiting %u)", data->live.tlas_alpha_instances,
+        data->live.tlas_alpha_waiting);
+
+  // Test 5: three sub-draws over one texture make one copy; a sub-draw refused by the cooldown makes none.
+  reset(true);
+  p.alpha_indirect_source.store(true);
+  falcom_world::g_state.frame.fetch_add(1u);
+  pool::UpdateLiveBvh(&dev, &queue);
+  pool::OnPoolScanIndirectDraw(&dev, &cl, make_draw(kAlpha), &cl_data, args, 0, 3u, 20u);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.stats.alpha_indirect_copies == 1u && p.alpha_sources.size() == 1u, "three sub-draws, one texture: one copy (%llu)",
+          static_cast<unsigned long long>(p.stats.alpha_indirect_copies));
+  }
+  pool::OnPoolScanIndirectDraw(&dev, &cl, make_draw(kAlpha), &cl_data, args, 0, 1u, 20u);  // cooldown-refused in this frame
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.stats.alpha_indirect_copies == 1u && p.stats.alpha_source_copies == 1u, "a cooldown-refused sub-draw makes no copy");
+  }
+
+  // Test 3: a keyless copy with no resolve is held for kAlphaOrphanFrames presents, then freed and counted.
+  reset(true);
+  p.alpha_indirect_source.store(true);
+  falcom_world::g_state.frame.fetch_add(1u);
+  pool::UpdateLiveBvh(&dev, &queue);
+  record();  // no DrainPoolScan: no resolve
+  for (uint32_t i = 0; i < bvh::kAlphaOrphanFrames; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_sources.size() == 1u && p.stats.alpha_orphans_expired == 0u, "orphan held at kAlphaOrphanFrames presents");
+  }
+  falcom_world::g_state.frame.fetch_add(1u);
+  pool::UpdateLiveBvh(&dev, &queue);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_sources.empty() && p.stats.alpha_orphans_expired == 1u, "orphan freed after 601 presents (expired %llu)",
+          static_cast<unsigned long long>(p.stats.alpha_orphans_expired));
+  }
+  // Test 2 (S4): indirect switch ON, then OFF. The copy is freed at the next present, the indirect slice goes, and the
+  // TLAS has no instance on that present (the mesh waits again).
+  reset(true);
+  p.alpha_indirect_source.store(true);
+  frames(40);
+  for (int i = 0; i < 3; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  uint64_t real_uid = 0u;
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    real_uid = p.meshes[p.mesh_by_key.at(real_key)].uid;
+  }
+  CHECK(data->live.tlas_alpha_instances == 1u, "indirect ON before the switch-off: one alpha instance (%u)", data->live.tlas_alpha_instances);
+  p.alpha_indirect_source.store(false);
+  falcom_world::g_state.frame.fetch_add(1u);
+  pool::DrainPoolScan(&dev, &queue);
+  pool::UpdateLiveBvh(&dev, &queue);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_sources.empty() && p.alpha_indirect_keys.empty(), "indirect OFF: the orphan source is freed at the next present (sources %zu)",
+          p.alpha_sources.size());
+  }
+  CHECK(data->alpha.slot_of_uid.count(real_uid) == 0u && data->tlas_instances_cpu.empty() && data->live.tlas_alpha_waiting == 1u,
+        "indirect OFF: slice gone, no instance on the next present (slots %zu, instances %zu, waiting %u)",
+        data->alpha.slot_of_uid.size(), data->tlas_instances_cpu.size(), data->live.tlas_alpha_waiting);
+
+  // Test 4 (S4): the source texture is destroyed between the indirect draw and its resolve. The copy made before the
+  // destroy still blits the mesh; the destroyed texture has no link, and later draws through its view make no copy.
+  reset(true);
+  p.alpha_indirect_source.store(true);
+  record();
+  dev.destroy_resource(alpha_tex);
+  pool::OnDestroyResourcePool(&dev, alpha_tex);
+  frames(40);
+  for (int i = 0; i < 10; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_source_by_texture.count(alpha_tex.handle) == 0u, "destroyed texture: no link left");
+    CHECK(p.stats.alpha_indirect_copies == 1u, "destroyed texture: no copy of the dead texture (%llu)",
+          static_cast<unsigned long long>(p.stats.alpha_indirect_copies));
+    real_uid = p.meshes[p.mesh_by_key.at(real_key)].uid;  // the reset mesh has a new uid
+  }
+  CHECK(data->alpha.slot_of_uid.count(real_uid) == 1u && data->live.tlas_alpha_instances == 1u,
+        "texture destroyed before resolve: the mesh still blits (slots %zu, instances %u)", data->alpha.slot_of_uid.size(),
+        data->live.tlas_alpha_instances);
+
+  // Teardown: OFF destroys the atlas and frees the copies; the indirect switch goes back to its default.
+  pool::ResetWorldPool();
+  p.alpha_indirect_source.store(false);
+  p.alpha_foliage.store(false);
+  pool::UpdateLiveBvh(&dev, &queue);
+  p.alpha_foliage.store(true);
+  pool::UpdateLiveBvh(&dev, &queue);
+  cl.dispatches = 0;  // the blits above are not counted by TestAtlas
 }
 
 
@@ -1117,6 +1258,10 @@ static void TestSourceGuards(Device& dev, CmdList& cl, Queue& queue) {
     std::lock_guard<std::mutex> lock(p.mutex);
     CHECK(p.alpha_key_source.count(0x7611) == 0u && p.alpha_source_done.count(0x7611) == 1u && p.stats.alpha_source_refused_format == 1u,
           "unknown view format: refused and counted (%llu)", (unsigned long long)p.stats.alpha_source_refused_format);
+    const auto& s = p.stats;
+    const uint64_t split = s.alpha_source_refused_cap + s.alpha_source_refused_deferred + s.alpha_source_refused_type + s.alpha_source_refused_failed;
+    CHECK(s.alpha_source_refused_type == 1u && split == s.alpha_source_refused, "format refusal is a type refusal; reasons sum to the total (%llu of %llu)",
+          (unsigned long long)split, (unsigned long long)s.alpha_source_refused);
   }
   drain();
 
@@ -1364,6 +1509,24 @@ static renodx::utils::scene::InputLayoutInfo DiagLayout(const std::vector<renodx
   renodx::utils::scene::InputLayoutInfo layout;
   for (const auto& element : elements) layout.elements.push_back(element);
   return layout;
+}
+
+// The real 0x9FF8E4BE input signature (.falcom-dev/bytecode): POSITION0, NORMAL0, TEXCOORD0, COLOR1 (float4), SV_InstanceID.
+// COLOR1 in slot 0 (interleaved) or in slot 1 must not move POSITION, NORMAL or TEXCOORD0: BuildMeshLayout reads each by its
+// own offset, skips the other slots and ignores COLOR.
+static void TestColor1Layout() {
+  for (uint32_t color_slot = 0u; color_slot < 2u; ++color_slot) {
+    const bool interleaved = color_slot == 0u;
+    const auto color = DiagElement("COLOR", 1u, color_slot, interleaved ? 32u : 0u, format::r32g32b32a32_float);
+    const auto info = DiagLayout({DiagElement("POSITION", 0u, 0u, 0u, format::r32g32b32_float),
+                                  DiagElement("NORMAL", 0u, 0u, 12u, format::r32g32b32_float),
+                                  DiagElement("TEXCOORD", 0u, 0u, 24u, format::r32g32_float), color});
+    renodx::utils::scene::MeshLayout mesh_layout;
+    const bool built = renodx::utils::scene::BuildMeshLayout(info, interleaved ? 48u : 32u, 2u, &mesh_layout);
+    CHECK(built && mesh_layout.pos_off == 0 && mesh_layout.norm_off == 12 && mesh_layout.uv_off == 24 && !mesh_layout.heuristic,
+          "COLOR1 in slot %u: pos %d normal %d uv %d (heuristic %d)", color_slot, mesh_layout.pos_off, mesh_layout.norm_off,
+          mesh_layout.uv_off, mesh_layout.heuristic ? 1 : 0);
+  }
 }
 
 static void TestUvLayoutDiag() {
@@ -1673,6 +1836,538 @@ static void TestDumpEvidence() {
         "summary: alpha_tested pixel_shaders carry alpha_reason and alpha_threshold_offset");
 }
 
+// Two textures get two source ids and two texture links; destroying one removes only its link.
+static void TestSourceLinks(Device& dev, CmdList& cl) {
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  p.alpha_foliage.store(true);
+  resource tex_a = {0};
+  resource tex_b = {0};
+  const uint64_t view_a = SourceView(dev, &tex_a);
+  const uint64_t view_b = SourceView(dev, &tex_b);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0x7801, view_a, true);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0x7802, view_b, true);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    const uint64_t id_a = p.alpha_key_source.at(0x7801);
+    const uint64_t id_b = p.alpha_key_source.at(0x7802);
+    CHECK(id_a != id_b && p.alpha_sources.size() == 2u, "two textures, two source ids (%llu, %llu)", (unsigned long long)id_a, (unsigned long long)id_b);
+    CHECK(p.alpha_source_by_texture.at(tex_a.handle) == id_a && p.alpha_source_by_texture.at(tex_b.handle) == id_b,
+          "each texture links to its own id");
+  }
+  dev.destroy_resource(tex_a);
+  pool::OnDestroyResourcePool(&dev, tex_a);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_source_by_texture.count(tex_a.handle) == 0u, "destroyed texture: link removed");
+    CHECK(p.alpha_source_by_texture.count(tex_b.handle) == 1u && p.alpha_sources.size() == 1u, "other texture keeps its link and copy");
+  }
+  pool::ResetWorldPool();
+}
+
+// Wind rest pose (opaque PS, alpha_wind_opaque and alpha_foliage on): the wind draw is admitted. Switching alpha_wind_opaque
+// off retires its instances at the next present (ApplyPoolWindSwitch) and no wind draw is copied or admitted again. The rigid
+// draw keeps its instance: it has its own vertex buffer, so its mesh key differs from the wind mesh.
+static void TestWindScanPath(Device& dev, CmdList& cl, Queue& queue) {
+  RegisterUvLayout();
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  p.scan_active.store(true);
+  p.exclude_moving.store(false);
+  p.follow_moving.store(false);
+  p.alpha_foliage.store(true);
+  p.alpha_wind_opaque.store(true);
+
+  const uint64_t kWind = 0xC8, kRigid = 0xC9, kOpaque = 0xCA;
+  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
+  Classify(&dev, kOpaque, "0x2162672F.ps.cso", false);
+
+  resource t15, b1, vb_wind, vb_rigid, ib;
+  dev.create_resource(resource_desc(4096 * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_wind);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_rigid);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  // The rigid geometry differs from the wind geometry: identical content shares one mesh (signature dedup), and retiring
+  // the wind mesh would then retire the rigid instance too.
+  const auto fill = [&](uint64_t handle, const fixture::TestMesh& mesh) {
+    for (size_t i = 0; i < mesh.positions.size(); ++i) {
+      const float vertex[5] = {mesh.positions[i][0], mesh.positions[i][1], mesh.positions[i][2],
+                               mesh.positions[i][1] * 0.5f + 0.5f, mesh.positions[i][2] * 0.5f + 0.5f};
+      std::memcpy(dev.res[handle].bytes.data() + i * kUvStride, vertex, sizeof(vertex));
+    }
+  };
+  fill(vb_wind.handle, fixture::Box(1.f));
+  fill(vb_rigid.handle, fixture::Box(2.f));
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[1] = b1;
+  const auto make_draw = [&](const resource& vb, uint64_t vs) {
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb.handle}; draw.vb_stride = kUvStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kUvLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0; draw.instance_count = 1;
+    draw.depth_enable = true; draw.depth_write = true; draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = vs; draw.ps_pipeline = kOpaque; draw.vs_hash = static_cast<uint32_t>(vs);
+    return draw;
+  };
+  uint64_t cursor = 0;
+  const auto draw_once = [&](const resource& vb, uint64_t vs) {
+    if (cursor + 1 >= 4096) cursor = 0;
+    const float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 48, world, 48);
+    const int32_t base = static_cast<int32_t>(cursor);
+    const int32_t cb[4] = {base, 0, 0, 0};
+    std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+    auto draw = make_draw(vb, vs);
+    pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+    cursor += 8;
+  };
+  const auto frames = [&](int count) {
+    for (int i = 0; i < count; ++i) {
+      draw_once(vb_rigid, kRigid);
+      draw_once(vb_wind, kWind);
+      falcom_world::g_state.frame.fetch_add(1u);
+      pool::DrainPoolScan(&dev, &queue);
+    }
+  };
+  const uint64_t rigid_key = pool::PoolMeshKey(make_draw(vb_rigid, kRigid));
+  const uint64_t wind_key = pool::PoolMeshKey(make_draw(vb_wind, kWind));
+  const auto instances_of = [&](uint64_t key) {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    size_t count = 0;
+    const auto it = p.mesh_by_key.find(key);
+    if (it == p.mesh_by_key.end()) return count;
+    for (const auto& instance : p.instances) {
+      if (instance.mesh_id == it->second) ++count;
+    }
+    return count;
+  };
+
+  frames(40);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.wind_keys.count(wind_key) == 1u && p.wind_keys.count(rigid_key) == 0u, "d2 ON: only the wind key is a wind rest pose (%zu keys)",
+          p.wind_keys.size());
+  }
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.stats.wind_rest_draws > 0u, "d2 ON: wind rest draws counted (%llu)", static_cast<unsigned long long>(p.stats.wind_rest_draws));
+  }
+  const size_t wind_on = instances_of(wind_key);
+  const size_t rigid_on = instances_of(rigid_key);
+  CHECK(wind_on >= 1u && rigid_on >= 1u, "d2 ON: wind rest pose and rigid admitted (wind %zu, rigid %zu)", wind_on, rigid_on);
+
+  // d2 OFF: the next present retires the wind instance; the rigid instance stays.
+  p.alpha_wind_opaque.store(false);
+  const uint64_t removed_before = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.stats.alpha_removed; }();
+  frames(1);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    // The key stays while OFF (AdmitPoolInstance keeps refusing it); only the instance is removed.
+  CHECK(p.wind_keys.count(wind_key) == 1u && p.stats.alpha_removed > removed_before, "d2 OFF: wind key kept, instance removed (alpha_removed %llu)",
+          static_cast<unsigned long long>(p.stats.alpha_removed));
+  }
+  CHECK(instances_of(wind_key) == 0u, "d2 OFF: wind instance gone at the next present (%zu)", instances_of(wind_key));
+  CHECK(instances_of(rigid_key) >= 1u, "d2 OFF: rigid instance kept (%zu)", instances_of(rigid_key));
+  frames(10);
+  CHECK(instances_of(wind_key) == 0u, "d2 OFF, 10 more presents: no wind instance admitted (%zu)", instances_of(wind_key));
+  CHECK(instances_of(rigid_key) >= 1u, "d2 OFF, 10 more presents: rigid instance still admitted (%zu)", instances_of(rigid_key));
+
+  // B1: a wind copy recorded with d2 ON resolves after d2 (or the main switch) goes OFF. It is refused: no wind instance
+  // appears in the 10 presents after the switch.
+  for (const bool main_off : {false, true}) {
+    pool::ResetWorldPool();
+    p.scan_active.store(true);
+    p.exclude_moving.store(false);
+    p.follow_moving.store(false);
+    p.alpha_foliage.store(true);
+    p.alpha_wind_opaque.store(true);
+    frames(31);  // the wind key is not admitted yet: its copies are still counting observations
+    {
+      std::lock_guard<std::mutex> lock(p.mutex);
+      CHECK(p.wind_keys.count(wind_key) == 1u, "%s: wind key recorded before the switch", main_off ? "main OFF" : "d2 OFF");
+    }
+    draw_once(vb_wind, kWind);  // the copy in flight: recorded while ON
+    if (main_off) {
+      p.alpha_foliage.store(false);
+    } else {
+      p.alpha_wind_opaque.store(false);
+    }
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::DrainPoolScan(&dev, &queue);
+    size_t admitted = 0u;
+    for (int i = 0; i < 10; ++i) {
+      frames(1);
+      admitted += instances_of(wind_key);
+    }
+    CHECK(admitted == 0u, "%s: copy in flight at the switch, wind instance never admitted in 10 presents (%zu)",
+          main_off ? "main OFF" : "d2 OFF", admitted);
+    p.alpha_foliage.store(true);
+  }
+
+  pool::ResetWorldPool();
+  p.alpha_wind_opaque.store(false);
+}
+
+// COLOR1 in a wind draw's input layout (the 0x9FF8E4BE signature): interleaved in slot 0 (stride 48, offset 32) or in slot 1
+// (slot 0 stride 32). The wind draw with an alpha PS and alpha_foliage on captures the slot-0 POSITION and TEXCOORD0 streams:
+// the mesh is admitted with the box positions and one UV per vertex.
+static void TestColor1ScanPath(Device& dev, CmdList& cl, Queue& queue, bool interleaved) {
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  p.scan_active.store(true);
+  p.exclude_moving.store(false);
+  p.follow_moving.store(false);
+  p.alpha_foliage.store(true);
+  p.alpha_wind_opaque.store(true);
+
+  const uint64_t kWind = 0xCB, kAlpha = 0xCC, kColorLayout = 0x5201u;
+  const uint32_t stride = interleaved ? 48u : 32u;
+  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
+  renodx::utils::scene::InputLayoutInfo layout;
+  layout.elements.push_back(DiagElement("POSITION", 0u, 0u, 0u, format::r32g32b32_float));
+  layout.elements.push_back(DiagElement("NORMAL", 0u, 0u, 12u, format::r32g32b32_float));
+  layout.elements.push_back(DiagElement("TEXCOORD", 0u, 0u, 24u, format::r32g32_float));
+  layout.elements.push_back(interleaved ? DiagElement("COLOR", 1u, 0u, 32u, format::r32g32b32a32_float)
+                                        : DiagElement("COLOR", 1u, 1u, 0u, format::r32g32b32a32_float));
+  renodx::utils::scene::shared.data->input_layouts[kColorLayout] = layout;
+
+  resource t15, b1, vb, ib, material;
+  dev.create_resource(resource_desc(4096 * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  const fixture::TestMesh box = fixture::Box(1.f);
+  for (size_t i = 0; i < box.positions.size(); ++i) {
+    const float slot0[8] = {box.positions[i][0], box.positions[i][1], box.positions[i][2], 0.f, 1.f, 0.f,
+                            box.positions[i][1] * 0.5f + 0.5f, box.positions[i][2] * 0.5f + 0.5f};
+    std::memcpy(dev.res[vb.handle].bytes.data() + i * stride, slot0, sizeof(slot0));
+    if (interleaved) {
+      const float color[4] = {0.1f, 0.2f, 0.3f, 1.f};
+      std::memcpy(dev.res[vb.handle].bytes.data() + i * stride + 32, color, sizeof(color));
+    }
+  }
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+  std::array<uint8_t, 160> material_bytes = {};
+  const float threshold = 0.5f;
+  std::memcpy(material_bytes.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
+  material = TrackedCb(dev, material_bytes.data(), 160);
+
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[1] = b1;
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = material;
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
+
+  const auto make_draw = [&]() {
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb.handle}; draw.vb_stride = stride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kColorLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0; draw.instance_count = 1;
+    draw.depth_enable = true; draw.depth_write = true; draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = kWind; draw.ps_pipeline = kAlpha; draw.vs_hash = static_cast<uint32_t>(kWind);
+    return draw;
+  };
+  uint64_t cursor = 0;
+  for (int i = 0; i < 40; ++i) {
+    if (cursor + 1 >= 4096) cursor = 0;
+    const float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 48, world, 48);
+    const int32_t base = static_cast<int32_t>(cursor);
+    const int32_t cb[4] = {base, 0, 0, 0};
+    std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+    auto draw = make_draw();
+    pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+    cursor += 8;
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::DrainPoolScan(&dev, &queue);
+  }
+
+  const uint64_t key = pool::PoolMeshKey(make_draw());
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    const auto it = p.mesh_by_key.find(key);
+    CHECK(it != p.mesh_by_key.end(), "COLOR1 %s: mesh captured", interleaved ? "interleaved in slot 0" : "in slot 1");
+    if (it != p.mesh_by_key.end()) {
+      const auto& mesh = p.meshes[it->second];
+      // The pool compacts vertices in index order, so each captured position is matched to a box vertex and its UV checked.
+      bool positions_ok = mesh.positions.size() == box.positions.size() && mesh.uvs.size() == box.positions.size();
+      for (size_t i = 0; positions_ok && i < mesh.positions.size(); ++i) {
+        const auto& position = mesh.positions[i];
+        const std::array<float, 2> uv = {position[1] * 0.5f + 0.5f, position[2] * 0.5f + 0.5f};
+        positions_ok = std::find(box.positions.begin(), box.positions.end(), position) != box.positions.end() && mesh.uvs[i] == uv;
+      }
+      size_t instances = 0;
+      for (const auto& instance : p.instances) {
+        if (instance.mesh_id == it->second) ++instances;
+      }
+      CHECK(positions_ok, "COLOR1 %s: positions and one UV per vertex (%zu) match the box (%zu vertices)",
+            interleaved ? "interleaved in slot 0" : "in slot 1", mesh.uvs.size(), box.positions.size());
+      CHECK(mesh.alpha && instances >= 1u, "COLOR1 %s: alpha mesh admitted (alpha %d, %zu instances)",
+            interleaved ? "interleaved in slot 0" : "in slot 1", mesh.alpha ? 1 : 0, instances);
+    }
+  }
+  pool::ResetWorldPool();
+  p.alpha_wind_opaque.store(false);
+}
+
+// B item 3: with alpha_foliage off, a store change makes no copy of the atlas maps (the dump's copies are taken with it on).
+static void TestAlphaMapGate(Device& dev, Queue& queue) {
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  pool::BvhDeviceData* data = pool::GetBvhDeviceData(&dev);
+  p.alpha_foliage.store(false);
+  data->store_version += 5u;
+  pool::UpdateLiveBvh(&dev, &queue);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_maps.store_version != data->store_version, "main OFF: store change copies no atlas maps (copy %llu, store %llu)",
+          static_cast<unsigned long long>(p.alpha_maps.store_version), static_cast<unsigned long long>(data->store_version));
+  }
+  p.alpha_foliage.store(true);
+  data->store_version += 5u;
+  pool::UpdateLiveBvh(&dev, &queue);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_maps.store_version == data->store_version, "main ON: store change copies the atlas maps");
+  }
+  pool::ResetWorldPool();
+}
+
+// B item 2: the panel copies PoolAlphaGpuStats every UI frame, so it holds scalars only (the maps are dump-only).
+static void TestPanelCopyScalars() {
+  CHECK(sizeof(pool::PoolAlphaGpuStats) <= 96u, "PoolAlphaGpuStats holds scalars only (%zu bytes, 96 max)", sizeof(pool::PoolAlphaGpuStats));
+}
+
+// B item 4: a keyless (indirect, unresolved) source expires even when its shared path is captured every present, and
+// keyless sources are capped at kAlphaKeylessSourcesMax so keyed sources still get copies.
+static void TestKeylessSources(Device& dev, CmdList& cl, Queue& queue) {
+  auto& p = pool::g_pool;
+  auto sources = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.alpha_sources.size(); };
+  pool::ResetWorldPool();
+  p.alpha_foliage.store(true);
+  p.live_on.store(true);
+
+  resource tex_a;
+  const uint64_t view_a = SourceView(dev, &tex_a);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0u, view_a, true);  // the keyless copy
+  uint64_t first_source = 0u;
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    const auto link = p.alpha_source_by_texture.find(tex_a.handle);
+    first_source = link == p.alpha_source_by_texture.end() ? 0u : link->second;
+  }
+  CHECK(first_source != 0u, "first keyless capture made a copy (source %llu)", static_cast<unsigned long long>(first_source));
+  for (uint32_t i = 0; i <= bvh::kAlphaOrphanFrames + 5u; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::CapturePoolAlphaSource(&dev, &cl, 0u, view_a, true);  // the same texture again: the shared path, no key
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_sources.count(first_source) == 0u && p.stats.alpha_orphans_expired >= 1u,
+          "keyless copy captured on the shared path every present still expires (expired %llu)",
+          static_cast<unsigned long long>(p.stats.alpha_orphans_expired));
+  }
+
+  pool::ResetWorldPool();
+  p.alpha_foliage.store(true);
+  p.live_on.store(true);
+  for (uint32_t i = 0; i < bvh::kAlphaKeylessSourcesMax; ++i) {
+    if (i % 4u == 0u) falcom_world::g_state.frame.fetch_add(1u);  // kAlphaCopiesPerFrame
+    resource tex;
+    const uint64_t view = SourceView(dev, &tex);
+    pool::CapturePoolAlphaSource(&dev, &cl, 0u, view, true);
+  }
+  CHECK(sources() == bvh::kAlphaKeylessSourcesMax, "%u keyless copies are made (sources %zu)", bvh::kAlphaKeylessSourcesMax, sources());
+  falcom_world::g_state.frame.fetch_add(1u);
+  resource tex_over;
+  const uint64_t view_over = SourceView(dev, &tex_over);
+  const uint64_t cap_before = [&] { std::lock_guard<std::mutex> lock(p.mutex); return p.stats.alpha_source_refused_cap; }();
+  pool::CapturePoolAlphaSource(&dev, &cl, 0u, view_over, true);
+  const size_t live = sources();
+  uint64_t cap_after = 0u;
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    cap_after = p.stats.alpha_source_refused_cap;
+  }
+  CHECK(live == bvh::kAlphaKeylessSourcesMax && cap_after == cap_before + 1u,
+        "keyless copy number %u refused and counted as cap (sources %zu, cap %llu)", bvh::kAlphaKeylessSourcesMax + 1u, live,
+        static_cast<unsigned long long>(cap_after));
+  resource tex_key;
+  const uint64_t view_key = SourceView(dev, &tex_key);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0xA1u, view_key, true);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_key_source.count(0xA1u) == 1u, "keyed copy still made while %u keyless copies are live", bvh::kAlphaKeylessSourcesMax);
+  }
+  pool::ResetWorldPool();
+}
+
+// Refusal reasons (B item 6): each reason is produced by a real refusal, and the four sum to the total.
+static void TestRefusalReasons(Device& dev, CmdList& cl) {
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  p.alpha_foliage.store(true);
+  p.live_on.store(true);
+  resource tex_deferred;
+  const uint64_t view_deferred = SourceView(dev, &tex_deferred);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0xB1u, view_deferred, false);  // deferred: no copy on a deferred list
+  resource tex_type;
+  const uint64_t view_type = SourceView(dev, &tex_type);
+  resource_view unknown = {0u};
+  dev.create_resource_view(tex_type, resource_usage::shader_resource, resource_view_desc(format::unknown), &unknown);
+  falcom_world::g_state.frame.fetch_add(1u);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0xB2u, unknown.handle, true);  // type: the view format is unknown
+  (void)view_type;
+  falcom_world::g_state.frame.fetch_add(1u);
+  for (uint64_t k = 0; k < 5u; ++k) {  // kAlphaCopiesPerFrame is 4: the fifth copy of the frame is refused as cap
+    resource tex;
+    const uint64_t view = SourceView(dev, &tex);
+    pool::CapturePoolAlphaSource(&dev, &cl, 0xB3u + k, view, true);
+  }
+  resource tex_failed;
+  const uint64_t view_failed = SourceView(dev, &tex_failed);
+  const int texture_creates_before = dev.texture_creates;
+  dev.fail_texture_create = true;
+  falcom_world::g_state.frame.fetch_add(1u);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0xC0u, view_failed, true);  // failed: the copy cannot be created
+  dev.fail_texture_create = false;
+
+  std::lock_guard<std::mutex> lock(p.mutex);
+  const auto& s = p.stats;
+  const uint64_t split = s.alpha_source_refused_cap + s.alpha_source_refused_deferred + s.alpha_source_refused_type + s.alpha_source_refused_failed;
+  std::printf("refusal reasons: total %llu = cap %llu + deferred %llu + type %llu + failed %llu\n",
+              static_cast<unsigned long long>(s.alpha_source_refused), static_cast<unsigned long long>(s.alpha_source_refused_cap),
+              static_cast<unsigned long long>(s.alpha_source_refused_deferred), static_cast<unsigned long long>(s.alpha_source_refused_type),
+              static_cast<unsigned long long>(s.alpha_source_refused_failed));
+  CHECK(s.alpha_source_refused_deferred == 1u && s.alpha_source_refused_type == 1u && s.alpha_source_refused_cap == 1u
+            && s.alpha_source_refused_failed == 1u,
+        "each reason produced once (deferred %llu, type %llu, cap %llu, failed %llu)",
+        static_cast<unsigned long long>(s.alpha_source_refused_deferred), static_cast<unsigned long long>(s.alpha_source_refused_type),
+        static_cast<unsigned long long>(s.alpha_source_refused_cap), static_cast<unsigned long long>(s.alpha_source_refused_failed));
+  CHECK(split == s.alpha_source_refused && s.alpha_source_refused == 4u, "reasons sum to the total (%llu of %llu)",
+        static_cast<unsigned long long>(split), static_cast<unsigned long long>(s.alpha_source_refused));
+  bool texture_linked = p.alpha_source_by_texture.count(tex_failed.handle) != 0u;
+  for (const auto& entry : p.alpha_sources) texture_linked = texture_linked || entry.second.texture == tex_failed.handle;
+  CHECK(!texture_linked && p.alpha_source_done.count(0xC0u) == 1u && p.alpha_key_source.count(0xC0u) == 0u,
+        "failed copy leaves no source, link or key for its texture");
+  CHECK(dev.texture_creates == texture_creates_before, "failed copy created no proxy texture (%d before, %d after)", texture_creates_before,
+        dev.texture_creates);
+}
+
+// Atlas maps are cleared with alpha OFF and by ResetWorldPool; a keyed share clears the orphan hold of the copy it shares.
+static void TestMapsAndSharedHold(Device& dev, CmdList& cl, Queue& queue) {
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  p.alpha_foliage.store(true);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    p.alpha_maps.slice_of_uid[5] = 3u;
+    p.alpha_maps.resident_uids.insert(5u);
+  }
+  p.alpha_foliage.store(false);
+  pool::UpdateLiveBvh(&dev, &queue);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_maps.slice_of_uid.empty() && p.alpha_maps.resident_uids.empty(), "alpha OFF: atlas maps cleared (%zu slices)",
+          p.alpha_maps.slice_of_uid.size());
+  }
+  p.alpha_foliage.store(true);
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    p.alpha_maps.slice_of_uid[6] = 1u;
+  }
+  pool::ResetWorldPool();
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.alpha_maps.slice_of_uid.empty(), "ResetWorldPool: atlas maps cleared (%zu slices)", p.alpha_maps.slice_of_uid.size());
+  }
+
+  p.alpha_foliage.store(true);
+  p.live_on.store(true);
+  resource tex;
+  const uint64_t view = SourceView(dev, &tex);
+  pool::CapturePoolAlphaSource(&dev, &cl, 0u, view, true);  // keyless copy: held for its resolve
+  uint64_t source_id = 0u;
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    const auto link = p.alpha_source_by_texture.find(tex.handle);
+    source_id = link == p.alpha_source_by_texture.end() ? 0u : link->second;
+  }
+  pool::CapturePoolAlphaSource(&dev, &cl, 0xD1u, view, true);  // a keyed draw shares the copy
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    const auto it = p.alpha_sources.find(source_id);
+    if (it != p.alpha_sources.end()) it->second.keys.erase(0xD1u);  // the key goes away, as an invalidation would
+  }
+  uint64_t expired_before = 0u;
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    expired_before = p.stats.alpha_orphans_expired;
+  }
+  for (uint32_t i = 0; i <= bvh::kAlphaOrphanFrames + 5u; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    CHECK(p.stats.alpha_orphans_expired == expired_before, "keyed share: the copy is not counted as an orphan (expired %llu, was %llu)",
+          static_cast<unsigned long long>(p.stats.alpha_orphans_expired), static_cast<unsigned long long>(expired_before));
+  }
+  pool::ResetWorldPool();
+}
+
+// Test 10 (S6 diagnostics): the dump order puts the alpha and wind rest-pose instances first beyond the instance cap, and
+// the parallel vectors (visibility, last_seen) move with their instances.
+static void TestDiagnosticsRound() {
+  const size_t count = pool::kPoolDumpMaxInstances + 50u;
+  std::vector<uint8_t> first(count, 0u);
+  for (size_t i = count - 5u; i < count; ++i) first[i] = 1u;  // the last five instances are alpha or wind rest pose
+  const std::vector<size_t> order = pool::PoolDumpOrder(first);
+  bool flagged_first = order.size() == count;
+  for (size_t i = 0; i < 5u; ++i) flagged_first = flagged_first && order[i] == count - 5u + i;
+  CHECK(flagged_first && order[5] == 0u, "alpha instances first beyond the instance cap (order %zu, %zu, first unflagged %zu)", order[0],
+        order[4], order[5]);
+
+  const size_t n = 12;
+  std::vector<uint8_t> flags(n, 0u);
+  flags[7] = 1u;
+  flags[10] = 1u;
+  std::vector<uint32_t> ids(n), visibility(n), last_seen(n);
+  for (size_t i = 0; i < n; ++i) {
+    ids[i] = static_cast<uint32_t>(i);
+    visibility[i] = static_cast<uint32_t>(i) * 10u + 1u;
+    last_seen[i] = static_cast<uint32_t>(i) * 100u;
+  }
+  const std::vector<size_t> sorted = pool::PoolDumpOrder(flags);
+  const auto ids2 = pool::PoolReorder(ids, sorted);
+  const auto visibility2 = pool::PoolReorder(visibility, sorted);
+  const auto last2 = pool::PoolReorder(last_seen, sorted);
+  bool moved_together = true;
+  for (size_t i = 0; i < n; ++i) {
+    moved_together = moved_together && visibility2[i] == ids2[i] * 10u + 1u && last2[i] == ids2[i] * 100u;
+  }
+  CHECK(moved_together && ids2[0] == 7u && ids2[1] == 10u && ids2[2] == 0u,
+        "visibility and last_seen move with their instances; flagged first (%u %u %u)", ids2[0], ids2[1], ids2[2]);
+}
+
 int main() {
   // Atlas (CPU bookkeeping for the GPU array).
   {
@@ -1721,6 +2416,7 @@ int main() {
   TestMeshConflict();
   HStage("uv layout diagnostics");
   TestUvLayoutDiag();
+  TestColor1Layout();
   TestConflictMasks();
   TestDumpEvidence();
   HStage("requeue");
@@ -1733,6 +2429,11 @@ int main() {
   TestTwoStreamUv(dev, cl, queue);
   HStage("uv stream mismatch");
   TestUvStreamMismatch();
+  HStage("wind scan path");
+  TestWindScanPath(dev, cl, queue);
+  HStage("color1 scan path");
+  TestColor1ScanPath(dev, cl, queue, true);
+  TestColor1ScanPath(dev, cl, queue, false);
   std::printf("sizeof PoolPendingCopy=%zu WorldMesh=%zu PoolAlphaState=%zu PoolAlphaMaterialState=%zu PoolIndirectAlpha=%zu\n",
               sizeof(pool::PoolPendingCopy), sizeof(pool::WorldMesh), sizeof(pool::PoolAlphaState),
               sizeof(pool::PoolAlphaMaterialState), sizeof(pool::PoolIndirectAlpha));
@@ -1743,6 +2444,7 @@ int main() {
   TestIndirectAlpha(dev, cl, queue);
   HStage("atlas (GPU stage, mock)");
   TestAtlas(dev, cl, queue);
+  TestSourceLinks(dev, cl);
   TestSharedCopies(dev, cl, queue);
   TestDrawCopies(dev, cl, queue);
   TestCompare();
@@ -1750,6 +2452,17 @@ int main() {
   TestSourceGuards(dev, cl, queue);
   HStage("end to end (mock)");
   TestEndToEnd(dev, cl, queue);
+  HStage("keyless sources");
+  TestKeylessSources(dev, cl, queue);
+  HStage("alpha map gate");
+  TestAlphaMapGate(dev, queue);
+  TestPanelCopyScalars();
+  HStage("diagnostics round");
+  TestDiagnosticsRound();
+  HStage("refusal reasons");
+  TestRefusalReasons(dev, cl);
+  HStage("maps and shared hold");
+  TestMapsAndSharedHold(dev, cl, queue);
 
   CHECK(g_bad_view_calls == 0, "%d view lookups on non-view handles", g_bad_view_calls);
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);

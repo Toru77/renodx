@@ -232,9 +232,29 @@ inline void DrawBvhPanel() {
       switches_changed = true;
     }
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Experimental, session only, default off. Off: alpha-tested meshes are not traced and their "
+      ImGui::SetTooltip("Experimental, session only, default on. Off: alpha-tested meshes are not traced and their "
                         "instances leave the BVH at once. On: their cutouts are traced through a 256-slice atlas, filled "
                         "at the next present (copies of the source textures are made when drawn).");
+    }
+    bool alpha_indirect = g_pool.alpha_indirect_source.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Indirect foliage source copy (experimental)", &alpha_indirect)) {
+      g_pool.alpha_indirect_source.store(alpha_indirect, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: indirect "
+                        "alpha draws (wind and other indirect foliage) get a source copy and can enter the BVH. Off: they "
+                        "leave the BVH at the next present.");
+    }
+    bool alpha_wind = g_pool.alpha_wind_opaque.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Admit wind with opaque pixel shader (experimental)", &alpha_wind)) {
+      g_pool.alpha_wind_opaque.store(alpha_wind, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: wind "
+                        "vertex shaders with an opaque pixel shader are admitted as a rigid rest pose instead of WindOpaque. "
+                        "Off: their instances leave the BVH at the next present.");
     }
     bool log_crashes = CrashLogEnabled();
     if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
@@ -347,6 +367,9 @@ inline void DrawBvhPanel() {
   ImGui::Text("Alpha TLAS: instances %u, waiting %u; trace tests %llu, cut %llu; blit %.3f ms, trace %.3f ms",
               gpu.tlas_instances, gpu.waiting, static_cast<unsigned long long>(gpu.tests), static_cast<unsigned long long>(gpu.cut),
               gpu.blit_ms, gpu.trace_ms);
+  ImGui::Text("Indirect/wind: indirect copies %llu, orphans expired %llu, wind rest draws %llu, wind refused off %llu",
+              static_cast<unsigned long long>(stats.alpha_indirect_copies), static_cast<unsigned long long>(stats.alpha_orphans_expired),
+              static_cast<unsigned long long>(stats.wind_rest_draws), static_cast<unsigned long long>(stats.wind_refused_off));
   DrawDeformLivePanel(deform, deform_traced);
 
   ImGui::SeparatorText("GPU BVH (live)");
@@ -379,7 +402,8 @@ inline void DrawBvhPanel() {
                       "(shadow-only casters), and the game near-fades map objects very close to the camera.\n"
                       "Both stay in the BVH (shadow casters are wanted for ray-traced shadows).\n"
                       "On: the trace views skip them the way the game camera does.\n"
-                      "Off: they stay visible and are counted as hidden-from-camera pixels.");
+                      "Off: they stay visible and are counted as hidden-from-camera pixels.\n"
+                      "Default on.");
   }
   if (mode == static_cast<int>(BvhView::DepthCompare)) {
     ImGui::TextDisabled("green match  blue missing (game surface in front / no BVH hit)  red extra (BVH in front)  orange BVH on game sky  grey beyond range");

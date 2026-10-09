@@ -17,8 +17,10 @@ inline constexpr uint32_t kAlphaSliceTexelsY = 256u;
 inline constexpr uint32_t kAlphaBlitsPerFrame = 4u;      // slices filled per present
 inline constexpr uint32_t kAlphaCopiesPerFrame = 4u;     // source copies made per frame (pool, at draw time)
 inline constexpr uint32_t kAlphaSourcesMax = 64u;        // live source copies
+inline constexpr uint32_t kAlphaKeylessSourcesMax = 16u;  // live keyless copies (indirect draws awaiting their resolve)
 inline constexpr uint64_t kAlphaSourceBytesMax = 256ull << 20;  // bytes of live source copies (mip 0)
 inline constexpr uint32_t kAlphaSliceQuarantineFrames = 16u;  // a released slice is reused after this many frames
+inline constexpr uint32_t kAlphaOrphanFrames = 600u;  // a keyless copy (indirect draw) is held this many presents for its resolve
 
 // One per slice, read by the trace (material slot = slice). 32 bytes.
 struct AlphaMaterialGPU {

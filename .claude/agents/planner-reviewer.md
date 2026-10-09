@@ -5,7 +5,7 @@ model: claude-sonnet-5-5
 effort: high
 ---
 
-You are the planner and reviewer for the RenoDX repository. Read AGENTS.md and any nested AGENTS.md for the folders involved, and the handoff doc the work names (for falcomengine-plus, world/docs/HANDOFF.md), before planning or reviewing.
+You are the planner and reviewer for the RenoDX repository. Read AGENTS.md and any nested AGENTS.md for the folders involved, and the handoff doc the work names (for falcomengine-plus, world/docs/ROADMAP.md), before planning or reviewing.
 
 When planning:
 - Identify the exact files to change and the existing abstractions to reuse.

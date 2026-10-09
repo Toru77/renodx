@@ -492,7 +492,7 @@ inline const char* LiveTlasChange(const BvhDeviceData& data, uint64_t revision, 
       || data.tlas_region_min[1] != region.min[1] || data.tlas_region_min[2] != region.min[2]) {
     return "region moved";
   }
-  if (data.tlas_alpha_on != g_pool.alpha_foliage.load(std::memory_order_relaxed)) return "alpha switch";
+  if (data.tlas_alpha_mode != AlphaMode()) return "alpha switch";
   return nullptr;
 }
 
@@ -590,7 +590,7 @@ inline void RebuildLiveTlas(
   }
   std::stable_partition(snapshot.begin(), snapshot.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; });
   // The switch is read once: the TLAS reflects it (commit), so a later switch is seen as a change.
-  const bool alpha_on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+  const uint8_t alpha_mode = AlphaMode();
   // What this TLAS reflects; recorded only once it is in place, so a failed
   // build is retried (after kLiveRetryFrames).
   const uint64_t store_version = data->store_version;
@@ -599,7 +599,7 @@ inline void RebuildLiveTlas(
     data->tlas_visibility_revision = visibility_revision;
     data->tlas_dynamic_revision = dynamic_revision;
     data->tlas_store_version = store_version;
-    data->tlas_alpha_on = alpha_on;
+    data->tlas_alpha_mode = alpha_mode;
     data->tlas_region_size = region.size;
     std::memcpy(data->tlas_region_min, region.min, sizeof(data->tlas_region_min));
     data->tlas_refit_failed = false;
@@ -621,7 +621,7 @@ inline void RebuildLiveTlas(
   uint32_t alpha_instances = 0u;
   uint32_t alpha_waiting = 0u;
   for (LiveTlasInstance& instance : snapshot) {
-    if (instance.alpha && !alpha_on) continue;  // alpha_foliage off: alpha-tested meshes are not traced
+    if (instance.alpha && alpha_mode == 0u) continue;  // alpha_foliage off: alpha-tested meshes are not traced
     const auto slot_it = data->slot_by_uid.find(instance.uid);
     if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->descriptor_count) {
       if (data->failed_uids.count(instance.uid) != 0u) {
@@ -1267,7 +1267,7 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     const PoolRegion region = CurrentPoolRegion();
     const char* change = LiveTlasChange(*data, revision, visibility_revision, region);
     // OFF drops the alpha instances at once, whatever else changed (the reason is not the test).
-    const bool alpha_off_now = data->tlas_alpha_on && !g_pool.alpha_foliage.load(std::memory_order_relaxed);
+    const bool alpha_off_now = (data->tlas_alpha_mode & ~AlphaMode()) != 0u;
     if (change != nullptr && frame >= data->tlas_retry_frame
         && (data->live.tlas_rebuilds == 0u || frame - data->live.tlas_frame >= kLiveTlasInterval || frame < data->live.tlas_frame
             || alpha_off_now)) {

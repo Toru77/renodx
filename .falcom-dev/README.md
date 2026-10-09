@@ -5,4 +5,4 @@ If you don't want it in git, add `.falcom-dev/` to `.git/info/exclude` (local on
 
 - `harness/`: native test harness for the world module (mock ReShade device, stub utils, CPU transcriptions of the GPU shaders). See `harness/README.md`.
 - `bytecode/`: real game shader bytecode (`0x????????.vs.cso` / `.ps.cso`) used by the classifier tests.
-- `transcript/`: the raw transcript (JSON lines, gzip) of the claude.ai session that built path 1 and started path 2, for reference only. The distilled state is in `src/games/falcomengine-plus/world/docs/HANDOFF.md`.
+- `transcript/`: the raw transcript (JSON lines, gzip) of the claude.ai session that built path 1 and started path 2, for reference only. The distilled state is in `src/games/falcomengine-plus/world/docs/ROADMAP.md`.

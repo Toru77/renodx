@@ -174,6 +174,7 @@ int main() {
   // with A/B/C, which the mesh-level P2a flag would take out (test_motion).
   bvh::g_pool.exclude_moving.store(false);
   bvh::g_pool.follow_moving.store(false);
+  bvh::g_pool.alpha_foliage.store(false);  // this check predates alpha-tested foliage (on by default)
   int frame = 1;
   for (; frame <= 40; ++frame) run_frame(frame, false);
   {

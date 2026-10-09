@@ -2,7 +2,7 @@
 
 Scope: `src/games/falcomengine-plus/`. Long-lived graphics project: ray tracing for Trails in the Sky 2nd Chapter (D3D11) on RenoDX. Correctness, maintainability and compatibility come before quick local fixes.
 
-**Before any work on `world/` (BVH, ray tracing, pool, deforming/moving meshes), read `world/docs/HANDOFF.md`.** It holds the current state, what is deployed and awaiting in-game validation, the next steps, the invariants and the test harness. `world/docs/ROADMAP.md` is the full round-by-round history with the evidence behind each decision.
+**Before any work on `world/` (BVH, ray tracing, pool, deforming/moving meshes), read `world/docs/ROADMAP.md`.** Its "Current state" section holds what is deployed and awaiting in-game validation and the next steps; "Reference" holds the code map, invariants, test harness, owner preferences and the per-path design notes. The rounds after those sections are the full history with the evidence behind each decision. `world/docs/ROADMAP.md` is the only handoff document.
 
 ## Standing instructions from the project owner
 
@@ -21,7 +21,7 @@ Scope: `src/games/falcomengine-plus/`. Long-lived graphics project: ray tracing 
 7. Diagnostics are part of the implementation: counts, sizes, offsets, strides, HRESULTs, reason codes, checksums; never a bare "failed". Panel lines + JSON dumps (`world_pool.json`, `world_deform.json`).
 8. Treat validated subsystems as foundations; when changing them, list preserved invariants, changed behavior and required re-tests.
 
-## Hard rules learned the hard way (details in HANDOFF.md)
+## Hard rules learned the hard way (details in ROADMAP.md, Reference)
 
 - Lock rule: never make a graphics/ReShade API call while holding a module mutex (D3D11 deferred destruction fires destroy events that relock; MSVC `std::mutex` throws on same-thread relock -> CRT fast fail). Reserve under the lock, record after it.
 - ReShade quirks: `update_buffer_region` at offset 0 writes the whole buffer (use `WriteBufferRange`); `get_resource_desc` reports buffer stride 0; D3D11 `create_pipeline` rejects stream-output state (create the SO geometry shader natively); ReShade 6.8 (API 20) changed `get_query_heap_results` (use native D3D11 queries, see `DeformBackend`).

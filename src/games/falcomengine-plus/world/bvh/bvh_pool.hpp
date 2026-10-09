@@ -299,6 +299,7 @@ inline constexpr uint8_t kPoolPassVisibility = 2u;  // the VS instance element h
 inline constexpr uint8_t kPoolPassNearFadePs = 4u;  // the PS applies the map-object near fade
 inline constexpr uint8_t kPoolPassLight = 8u;       // VS projects with the light (shadow maps)
 inline constexpr uint8_t kPoolPassAlpha = 16u;       // PS alpha-tests (cutout material), admitted only with alpha_foliage on
+inline constexpr uint8_t kPoolPassWind = 32u;        // wind VS admitted as its rest pose with an opaque PS (alpha_wind_opaque on)
 
 struct PoolSighting {
   uint8_t pass = 0u;     // kPoolPass* bits
@@ -403,6 +404,9 @@ struct PoolAlphaState : PoolAlphaMaterialState {
 // (keys). It is freed when no key is left (their invalidation) or alpha_foliage goes off; a blitted copy
 // freed this way is copied again on demand.
 struct PoolAlphaSource {
+  uint64_t texture = 0u;                // source texture handle (alpha_source_by_texture)
+  bool texture_dead = false;            // the game destroyed the texture: the copy is kept until its keys go
+  uint64_t hold_until = 0u;             // keyless copy (no key yet): kept until this frame, 0 = none
   reshade::api::resource proxy = {0u};  // empty while its copy is being made
   reshade::api::format format = reshade::api::format::unknown;  // the format of the view the game bound
   uint64_t bytes = 0u;                  // mip 0 bytes (kAlphaSourceBytesMax)
@@ -424,6 +428,15 @@ struct PoolAlphaGpuStats {
   uint64_t cut = 0u;               // trace: of those, cut
   float blit_ms = -1.f;            // GPU ms of the blits (-1: not measured)
   float trace_ms = -1.f;           // GPU ms of the last trace dispatch (-1: not measured)
+};
+
+// The atlas maps, for the dump only (the panel copies PoolAlphaGpuStats every UI frame and must not copy them). Copied
+// under the pool lock by SyncLiveAlpha at each store change, with alpha_foliage on.
+struct PoolAlphaDumpMaps {
+  uint64_t store_version = ~uint64_t{0};  // data->store_version the maps were copied at
+  std::unordered_map<uint64_t, uint32_t> slice_of_uid;  // copy of AlphaGpu::slot_of_uid
+  std::unordered_set<uint64_t> indirect_uids;           // copy of AlphaGpu::indirect_uids
+  std::unordered_set<uint64_t> resident_uids;           // mesh uids in the live store (slot_by_uid)
 };
 
 struct WorldMesh {
@@ -745,6 +758,7 @@ struct PoolIndirectAlpha {
   PoolUvStream uv;
   PoolVertexBuffers vbs;
   bool vbs_known = false;
+  uint64_t source = 0u;  // alpha source id of the keyless copy (CapturePoolAlphaSource), 0 = none
 };
 
 struct PoolStagingSlot {
@@ -956,6 +970,17 @@ struct PoolStats {
   uint64_t alpha_source_refused_bytes = 0u;   // of those: the byte cap (kAlphaSourceBytesMax) was reached
   uint64_t alpha_source_refused_format = 0u;  // of those: the bound view's format is unknown or typeless
   uint64_t alpha_source_refused_view = 0u;  // of those: the bound view does not belong to the bound t0 resource
+  uint64_t alpha_source_refused_cap = 0u;       // of those: the copy cap (per frame, sources) or the byte cap was reached
+  uint64_t alpha_source_refused_deferred = 0u;  // of those: drawn on a deferred context (no copy there)
+  uint64_t alpha_source_refused_type = 0u;      // of those: texture kind, view format, or the bound view is not the t0 texture
+  uint64_t alpha_source_refused_failed = 0u;    // of those: the copy could not be made (the keys are refused)
+  uint64_t alpha_indirect_copies = 0u;   // keyless copies made for indirect alpha draws (mesh_key 0)
+  uint64_t alpha_orphans_attached = 0u;  // keyless copies attached to their key at resolve
+  uint64_t alpha_orphans_expired = 0u;   // keyless copies freed when their hold ran out (no resolve)
+  uint64_t alpha_orphan_missed = 0u;     // resolves whose keyless copy was already gone
+  uint64_t alpha_indirect_source_changed = 0u;  // resolves of a key already attached to another copy (the first is kept)
+  uint64_t wind_refused_off = 0u;  // wind rest-pose admissions refused: alpha_wind_opaque (with alpha_foliage) off
+  uint64_t wind_rest_draws = 0u;  // wind rest-pose draws gated in (alpha_wind_opaque with alpha_foliage on)
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -1107,7 +1132,9 @@ struct PoolState {
   std::atomic_bool retry_unstable{false};  // diagnostic: unstable captures get kPoolMeshRetryRounds more rounds
   std::atomic_bool legacy_scale{false};   // instance scale limits of round 6 (0.05 .. 50)
   std::atomic_bool exclude_moving{false};  // meshes seen moving in a camera view stay out of the static pool
-  std::atomic_bool alpha_foliage{false};   // alpha-tested foliage (rigid, wind rest pose); session only, off by default
+  std::atomic_bool alpha_foliage{true};   // alpha-tested foliage (rigid, wind rest pose); session only, on by default
+  std::atomic_bool alpha_indirect_source{true};  // indirect alpha draws get a source copy (alpha_foliage on only); on by default
+  std::atomic_bool alpha_wind_opaque{true};      // wind with an opaque pixel shader admitted as rest pose (alpha_foliage on only)
   std::atomic_bool follow_moving{true};    // moving meshes keep their instances, which follow the pose
   PoolInspectRecord inspect;               // last inspect result (bvh_debug.hpp), written by DumpWorldPool
   std::atomic_bool poison_staging{false};  // diagnostic: mesh staging cpu-visible, poisoned after each read
@@ -1194,14 +1221,21 @@ struct PoolState {
   bool dynamic_applied = false;
   std::unordered_map<uint64_t, PoolAlphaState> alpha_keys;  // by draw key; flags its mesh alpha-tested
   bool alpha_off_applied = false;  // the switch-off removal ran (re-armed by switching on)
+  bool alpha_indirect_off_applied = false;  // the indirect-source switch-off detach ran (re-armed by switching on)
   std::unordered_set<uint64_t> alpha_uv_requeued;  // keys whose mesh was requeued for its UVs
   std::set<std::pair<uint64_t, uint64_t>> pixel_unknown_logged;  // (vs, ps) pipelines logged as PixelUnknown once
   uint64_t alpha_held_bytes_max = uint64_t{64} << 20;  // vertex bytes held by requests in the Uvs phase (ON): refused above
-  std::unordered_map<uint64_t, PoolAlphaSource> alpha_sources;  // by source texture handle; no proxy while its copy is made
-  std::unordered_map<uint64_t, uint64_t> alpha_key_source;  // draw key -> its source texture handle (alpha_sources)
+  std::unordered_map<uint64_t, PoolAlphaSource> alpha_sources;  // by source id; no proxy while its copy is made
+  std::unordered_map<uint64_t, uint64_t> alpha_source_by_texture;  // live source texture handle -> source id
+  uint64_t alpha_next_source = 1u;  // source id, never reused
+  std::unordered_map<uint64_t, uint64_t> alpha_key_source;  // draw key -> its source id (alpha_sources)
   bool alpha_capture_logged = false;  // the first capture after alpha_foliage was switched on is logged
   bool alpha_sync_logged = false;     // the first SyncLiveAlpha after alpha_foliage was switched on is logged
   std::unordered_set<uint64_t> alpha_source_done;  // draw keys needing no further copy (refused)
+  std::unordered_set<uint64_t> alpha_indirect_keys;  // keys of indirect alpha draws attached to their source (resolve)
+  PoolAlphaDumpMaps alpha_maps;  // dump-only copies of the atlas maps (SyncLiveAlpha)
+  std::unordered_set<uint64_t> wind_keys;  // draw keys admitted as wind rest poses (cleared when alpha_wind_opaque goes off)
+  bool wind_off_applied = false;  // the wind switch-off removal ran (re-armed by switching on)
   std::unordered_set<uint64_t> alpha_format_logged;  // texture handles whose refused format was logged
   std::atomic_bool live_on{true};  // the live BVH is enabled (UpdateLiveBvh): no source copies while it is off
   std::vector<reshade::api::resource> alpha_dead_proxies;  // proxies to free at the next present (never in a destroy event)
@@ -1766,6 +1800,11 @@ inline void OnDestroyDevicePool(reshade::api::device* device) {
 // Caller holds g_pool.mutex.
 inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uint32_t mesh_id, bool follow = false) {
   if (mesh_id >= g_pool.meshes.size()) return false;
+  if (g_pool.wind_keys.count(mesh_key) != 0u
+      && !(g_pool.alpha_foliage.load(std::memory_order_relaxed) && g_pool.alpha_wind_opaque.load(std::memory_order_relaxed))) {
+    g_pool.stats.wind_refused_off += 1u;
+    return false;
+  }
   if (g_pool.meshes[mesh_id].alpha) {
     // Alpha-tested foliage: refused with alpha_foliage off, in a conflict, or without UVs. Otherwise admitted;
     // the TLAS takes it once its material has an atlas slice (alpha_waiting, alpha_live.hpp).
@@ -2650,6 +2689,7 @@ struct PoolDrawGate {
   PoolDrawState state = PoolDrawState::Ok;
   uint8_t pass = 0u;  // kPoolPass* bits, set when the draw passes the gate
   bool alpha_material = false;  // alpha-tested pixel shader on a rigid or wind vertex shader (recorded even when skipped)
+  bool wind_rest = false;  // wind VS with an opaque PS admitted as its rest pose (alpha_wind_opaque with alpha_foliage on)
   uint32_t alpha_threshold_offset = 0u;  // the pixel shader's threshold offset in b5 (alpha_material only)
   const char* unknown_reason = nullptr;  // PixelUnknown only: logged once per pipeline pair (NotePoolPixelUnknown)
 };
@@ -2661,6 +2701,7 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
   gate.vs_class = static_cast<contract::VsClass>(vs_traits.cls);
   // Wind foliage is captured as its rest pose (instance world, no sway) only while alpha_foliage is on.
   const bool alpha_on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
+  const bool wind_admit = alpha_on && g_pool.alpha_wind_opaque.load(std::memory_order_relaxed);
   if (gate.vs_class != contract::VsClass::Rigid && (gate.vs_class != contract::VsClass::Wind || !alpha_on)) {
     gate.skip = PoolSkip::NotRigid;
     return gate;
@@ -2684,7 +2725,11 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
   } else if (!alpha_class && ps_class != contract::PsClass::Opaque) {
     gate.skip = PoolSkip::PixelUnknown;
   } else if (gate.vs_class == contract::VsClass::Wind && !alpha) {
-    gate.skip = PoolSkip::WindOpaque;
+    if (wind_admit) {
+      gate.wind_rest = true;
+    } else {
+      gate.skip = PoolSkip::WindOpaque;
+    }
   }
   if (gate.skip == PoolSkip::PixelUnknown) {
     gate.unknown_reason = alpha_class ? contract::AlphaMaterialReasonName(static_cast<contract::AlphaMaterialReason>(ps_traits.alpha_reason))
@@ -2695,7 +2740,7 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
                                      | ((vs_traits.flags & contract::kTraitLightView) != 0u ? kPoolPassLight : 0u)
                                      | ((vs_traits.flags & contract::kTraitVisibilityLayout) != 0u ? kPoolPassVisibility : 0u)
                                      | ((ps_traits.flags & contract::kTraitNearFade) != 0u ? kPoolPassNearFadePs : 0u)
-                                     | (alpha ? kPoolPassAlpha : 0u));
+                                     | (alpha ? kPoolPassAlpha : 0u) | (gate.wind_rest ? kPoolPassWind : 0u));
   }
   return gate;
 }
@@ -3230,13 +3275,52 @@ inline bool IsPoolDeferredList(const reshade::api::command_list* cmd_list) {
   return immediate != 0u && reinterpret_cast<uint64_t>(cmd_list) != immediate;
 }
 
+// Caller holds g_pool.mutex. Removes the texture -> source link of source `id` (a no-op when the handle already
+// names another copy).
+inline void UnlinkPoolAlphaTexture(uint64_t id, const PoolAlphaSource& source) {
+  const auto link = g_pool.alpha_source_by_texture.find(source.texture);
+  if (link != g_pool.alpha_source_by_texture.end() && link->second == id) g_pool.alpha_source_by_texture.erase(link);
+}
+
+// Caller holds g_pool.mutex. The indirect source switch OFF, once per switch (re-armed by switching on): detaches the
+// indirect keys from their copies, drops the holds, and moves the copies left without a key to the dead list (freed at
+// the next present, outside the lock). Nothing here touches the device.
+inline void ApplyPoolIndirectAlphaSwitch() {
+  if (g_pool.alpha_indirect_source.load(std::memory_order_relaxed)) {
+    g_pool.alpha_indirect_off_applied = false;
+    return;
+  }
+  if (g_pool.alpha_indirect_off_applied) return;
+  g_pool.alpha_indirect_off_applied = true;
+  for (const uint64_t key : g_pool.alpha_indirect_keys) {
+    const auto key_source = g_pool.alpha_key_source.find(key);
+    if (key_source == g_pool.alpha_key_source.end()) continue;
+    const auto source = g_pool.alpha_sources.find(key_source->second);
+    if (source != g_pool.alpha_sources.end()) source->second.keys.erase(key);
+    g_pool.alpha_key_source.erase(key_source);
+  }
+  g_pool.alpha_indirect_keys.clear();
+  for (auto it = g_pool.alpha_sources.begin(); it != g_pool.alpha_sources.end();) {
+    it->second.hold_until = 0u;
+    if (!it->second.keys.empty()) {
+      ++it;
+      continue;
+    }
+    if (it->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(it->second.proxy);
+    UnlinkPoolAlphaTexture(it->first, it->second);
+    it = g_pool.alpha_sources.erase(it);
+  }
+}
+
 // Caller holds g_pool.mutex. Moves every source copy to the dead list (freed at a present).
 inline void DrainPoolAlphaSources() {
   for (const auto& source : g_pool.alpha_sources) {
     if (source.second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source.second.proxy);
   }
   g_pool.alpha_sources.clear();
+  g_pool.alpha_source_by_texture.clear();
   g_pool.alpha_key_source.clear();
+  g_pool.alpha_indirect_keys.clear();
   g_pool.alpha_source_done.clear();
 }
 
@@ -3250,6 +3334,29 @@ inline std::vector<reshade::api::resource> TakePoolAlphaProxies(bool all) {
   return proxies;
 }
 
+// The alpha switches as one mode byte (0 = alpha_foliage off): bit 0 alpha_foliage, bit 1 indirect source, bit 2 wind opaque.
+inline uint8_t AlphaMode() {
+  if (!g_pool.alpha_foliage.load(std::memory_order_relaxed)) return 0u;
+  return static_cast<uint8_t>(1u | (g_pool.alpha_indirect_source.load(std::memory_order_relaxed) ? 2u : 0u)
+                              | (g_pool.alpha_wind_opaque.load(std::memory_order_relaxed) ? 4u : 0u));
+}
+
+// Caller holds g_pool.mutex. The wind rest-pose switch OFF (AlphaMode bit 2 clear), once per switch, re-armed by switching
+// on: retires the instances of the wind rest-pose keys. The keys stay in wind_keys, so AdmitPoolInstance keeps refusing them
+// while off (also a copy recorded while on and resolved after the switch); InvalidatePoolMeshKey and ResetWorldPool forget them.
+inline void ApplyPoolWindSwitch() {
+  if ((AlphaMode() & 4u) != 0u) {
+    g_pool.wind_off_applied = false;
+    return;
+  }
+  if (g_pool.wind_off_applied) return;
+  g_pool.wind_off_applied = true;
+  for (const uint64_t key : g_pool.wind_keys) {
+    const auto mesh_it = g_pool.mesh_by_key.find(key);
+    if (mesh_it != g_pool.mesh_by_key.end()) RetirePoolMeshAlpha(mesh_it->second);
+  }
+}
+
 // Caller holds g_pool.mutex. Bytes of the live source copies (the byte cap, the dump and the panel).
 inline uint64_t PoolAlphaProxyBytes() {
   uint64_t bytes = 0u;
@@ -3257,22 +3364,25 @@ inline uint64_t PoolAlphaProxyBytes() {
   return bytes;
 }
 
-// Copies the source texture of an alpha-tested direct draw (mip 0 of a single-layer, non-multisampled 2D
-// texture) into an owned proxy, once per source texture: draw keys that sample the same texture share the copy
-// (PoolAlphaSource::keys). Called only for a draw that is queued (skip None), outside g_pool.mutex. The proxy has
-// the format of the view the game bound (not the texture's). At most kAlphaCopiesPerFrame copies a frame,
-// kAlphaSourcesMax live and kAlphaSourceBytesMax bytes; other sources are refused and counted. No copy while the
-// live BVH is off. Graphics calls run outside g_pool.mutex. The texture is registered with its draw keys, so
-// destroying it invalidates them (the proxy is freed at the next present).
-inline void CapturePoolAlphaSource(
+// Copies the source texture of an alpha-tested draw (mip 0 of a single-layer, non-multisampled 2D texture) into an
+// owned proxy, once per source texture: draw keys that sample the same texture share the copy (PoolAlphaSource::keys).
+// Called only for a draw that is queued (skip None), outside g_pool.mutex. The proxy has the format of the view the
+// game bound (not the texture's). At most kAlphaCopiesPerFrame copies a frame, kAlphaSourcesMax live and
+// kAlphaSourceBytesMax bytes; other sources are refused and counted. No copy while the live BVH is off. Graphics calls
+// run outside g_pool.mutex. The texture is registered with its draw keys, so destroying it invalidates them (the proxy
+// is freed at the next present). mesh_key 0 is an indirect draw whose args are not read yet: no key is recorded, the
+// copy is held for kAlphaOrphanFrames presents, and its id is returned for AttachPoolAlphaSource at resolve. The keyed
+// path returns 0.
+inline uint64_t CapturePoolAlphaSource(
     reshade::api::device* device, reshade::api::command_list* cmd_list, uint64_t mesh_key, uint64_t view, bool immediate) {
+  const bool keyless = mesh_key == 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     const bool enabled = g_pool.alpha_foliage.load(std::memory_order_relaxed);
     if (!enabled) g_pool.alpha_capture_logged = false;
     if (!enabled || !g_pool.live_on.load(std::memory_order_relaxed)
-        || g_pool.alpha_source_done.count(mesh_key) != 0u || g_pool.alpha_key_source.count(mesh_key) != 0u) {
-      return;
+        || (!keyless && (g_pool.alpha_source_done.count(mesh_key) != 0u || g_pool.alpha_key_source.count(mesh_key) != 0u))) {
+      return 0u;
     }
     if (!g_pool.alpha_capture_logged) {
       g_pool.alpha_capture_logged = true;
@@ -3283,24 +3393,27 @@ inline void CapturePoolAlphaSource(
   if (!immediate) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.alpha_source_refused += 1u;
-    return;
+    g_pool.stats.alpha_source_refused_deferred += 1u;
+    return 0u;
   }
   const reshade::api::resource texture = device->get_resource_from_view({view});
   const reshade::api::resource_desc desc =
       texture.handle != 0u ? device->get_resource_desc(texture) : reshade::api::resource_desc{};
   if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.depth_or_layers != 1u || desc.texture.samples != 1u) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    g_pool.alpha_source_done.insert(mesh_key);
+    if (!keyless) g_pool.alpha_source_done.insert(mesh_key);
     g_pool.stats.alpha_source_refused += 1u;
-    return;
+    g_pool.stats.alpha_source_refused_type += 1u;
+    return 0u;
   }
   const reshade::api::format format = device->get_resource_view_desc({view}).format;
   if (format == reshade::api::format::unknown || reshade::api::format_is_typeless(format)) {
     bool first = false;
     {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
-      g_pool.alpha_source_done.insert(mesh_key);
+      if (!keyless) g_pool.alpha_source_done.insert(mesh_key);
       g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_format += 1u;
       first = g_pool.alpha_format_logged.insert(texture.handle).second;
     }
@@ -3308,38 +3421,58 @@ inline void CapturePoolAlphaSource(
       renodx::utils::log::w("[world-bvh] alpha source: bound view format unknown or typeless (texture ", texture.handle,
                             "), draw key not copied");
     }
-    return;
+    return 0u;
   }
   const uint64_t bytes = reshade::api::format_slice_pitch(
       format, reshade::api::format_row_pitch(format, desc.texture.width), desc.texture.height);
+  uint64_t source_id = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    const auto source_it = g_pool.alpha_sources.find(texture.handle);
-    if (source_it != g_pool.alpha_sources.end()) {  // the texture has its copy: this key shares it
-      source_it->second.keys.insert(mesh_key);
-      g_pool.alpha_key_source[mesh_key] = texture.handle;
+    const auto link = g_pool.alpha_source_by_texture.find(texture.handle);
+    if (link != g_pool.alpha_source_by_texture.end()) {  // the texture has its copy: this key shares it
+      const auto shared_it = g_pool.alpha_sources.find(link->second);
+      if (shared_it == g_pool.alpha_sources.end()) return 0u;
+      PoolAlphaSource& shared = shared_it->second;
+      if (keyless) return link->second;  // no refresh of hold_until: an orphan expires kAlphaOrphanFrames after its copy
+      shared.keys.insert(mesh_key);
+      shared.hold_until = 0u;  // a key uses the copy: it is no orphan any more
+      g_pool.alpha_key_source[mesh_key] = link->second;
       AddPoolResourceKey(texture.handle, mesh_key);
-      return;
+      return 0u;
     }
     const uint32_t frame = g_state.frame.load();
     if (g_pool.alpha_copy_frame != frame) {
       g_pool.alpha_copy_frame = frame;
       g_pool.alpha_copies_frame = 0u;
     }
-    if (g_pool.alpha_copies_frame >= kAlphaCopiesPerFrame || g_pool.alpha_sources.size() >= kAlphaSourcesMax) {
+    size_t keyless_sources = 0u;  // keyless copies cap, so they cannot starve the keyed sources
+    if (keyless) {
+      for (const auto& entry : g_pool.alpha_sources) keyless_sources += entry.second.keys.empty() ? 1u : 0u;
+    }
+    if (g_pool.alpha_copies_frame >= kAlphaCopiesPerFrame || g_pool.alpha_sources.size() >= kAlphaSourcesMax
+        || keyless_sources >= kAlphaKeylessSourcesMax) {
       g_pool.stats.alpha_source_refused += 1u;
-      return;
+      g_pool.stats.alpha_source_refused_cap += 1u;
+      return 0u;
     }
     if (PoolAlphaProxyBytes() + bytes > kAlphaSourceBytesMax) {
       g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_cap += 1u;
       g_pool.stats.alpha_source_refused_bytes += 1u;
-      return;
+      return 0u;
     }
     g_pool.alpha_copies_frame += 1u;
-    PoolAlphaSource& source = g_pool.alpha_sources[texture.handle];  // reserved while its copy is made
+    source_id = g_pool.alpha_next_source++;
+    PoolAlphaSource& source = g_pool.alpha_sources[source_id];  // reserved while its copy is made
+    source.texture = texture.handle;
     source.bytes = bytes;
-    source.keys.insert(mesh_key);
-    g_pool.alpha_key_source[mesh_key] = texture.handle;
+    if (keyless) {
+      source.hold_until = frame + kAlphaOrphanFrames;
+    } else {
+      source.keys.insert(mesh_key);
+      g_pool.alpha_key_source[mesh_key] = source_id;
+    }
+    g_pool.alpha_source_by_texture[texture.handle] = source_id;
   }
   const reshade::api::resource_desc proxy_desc(
       reshade::api::resource_type::texture_2d, desc.texture.width, desc.texture.height, 1, 1, format, 1,
@@ -3350,12 +3483,13 @@ inline void CapturePoolAlphaSource(
   bool kept = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    const auto it = g_pool.alpha_sources.find(texture.handle);
+    const auto it = g_pool.alpha_sources.find(source_id);
     if (made && it != g_pool.alpha_sources.end()) {
       it->second.proxy = proxy;
       it->second.format = format;
       for (const uint64_t key : it->second.keys) AddPoolResourceKey(texture.handle, key);
       g_pool.stats.alpha_source_copies += 1u;
+      if (keyless) g_pool.stats.alpha_indirect_copies += 1u;
       kept = true;
     } else {
       if (it != g_pool.alpha_sources.end()) {  // the copy failed: its keys are refused
@@ -3363,13 +3497,39 @@ inline void CapturePoolAlphaSource(
           g_pool.alpha_key_source.erase(key);
           g_pool.alpha_source_done.insert(key);
         }
+        UnlinkPoolAlphaTexture(source_id, it->second);
         g_pool.alpha_sources.erase(it);
       }
       g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_failed += 1u;
     }
   }
   if (made && !kept) device->destroy_resource(proxy);
+  return keyless && kept ? source_id : 0u;
 }
+
+// Caller holds g_pool.mutex (resolve). Attaches the keyless copy of an indirect alpha draw to the mesh key its args
+// resolved to (alpha_foliage and the indirect switch on). The copy then belongs to its key (hold cleared) and is freed
+// with it. A key that already has a source keeps it. A missing copy is counted (alpha_orphan_missed).
+inline void AttachPoolAlphaSource(uint64_t mesh_key, uint64_t source_id) {
+  const auto source = g_pool.alpha_sources.find(source_id);
+  if (source == g_pool.alpha_sources.end()) {
+    g_pool.stats.alpha_orphan_missed += 1u;
+    return;
+  }
+  const auto attached = g_pool.alpha_key_source.find(mesh_key);
+  if (attached != g_pool.alpha_key_source.end()) {  // the key keeps its first copy; a copy of another texture is counted
+    if (attached->second != source_id) g_pool.stats.alpha_indirect_source_changed += 1u;
+    return;
+  }
+  source->second.keys.insert(mesh_key);
+  source->second.hold_until = 0u;
+  g_pool.alpha_key_source[mesh_key] = source_id;
+  g_pool.alpha_indirect_keys.insert(mesh_key);
+  g_pool.stats.alpha_orphans_attached += 1u;
+  if (!source->second.texture_dead) AddPoolResourceKey(source->second.texture, mesh_key);
+}
+
 inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -3382,6 +3542,10 @@ inline void OnPoolScanDraw(
   const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, true);
+  if (gate.wind_rest) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.wind_rest_draws += 1u;
+  }
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
   PoolVertexBuffers vbs;
@@ -3456,6 +3620,7 @@ inline void OnPoolScanDraw(
         copy.ps_hash = draw.ps_hash;
         copy.pass = gate.pass;
         copy.mesh_key = mesh_key;
+        if ((gate.pass & kPoolPassWind) != 0u) g_pool.wind_keys.insert(mesh_key);
         copy.schedule_key = schedule_key;
         copy.follow = follow;
         copy.trace_only = trace_only;
@@ -3489,6 +3654,7 @@ inline void OnPoolScanDraw(
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       g_pool.alpha_source_done.insert(mesh_key);
       g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_type += 1u;
       g_pool.stats.alpha_source_refused_view += 1u;
     } else {
       CapturePoolAlphaSource(device, cmd_list, mesh_key, alpha_material.view, !deferred);
@@ -3518,6 +3684,10 @@ inline void OnPoolScanIndirectDraw(
   const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, false);
+  if (gate.wind_rest) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.wind_rest_draws += 1u;
+  }
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
   PoolVertexBuffers vbs;
@@ -3544,6 +3714,8 @@ inline void OnPoolScanIndirectDraw(
   stage.Set("indirect draw: reserve");
   std::array<PoolCopyCommand, 3u * kPoolMaxIndirectSubDraws + kPoolMeshCopiesPerDraw> commands;
   std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
+  std::array<std::pair<uint32_t, uint32_t>, kPoolMaxIndirectSubDraws> alpha_refs;  // (slot, indirect_alpha entry) per reserved alpha copy
+  uint32_t alpha_ref_count = 0u;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
   {
@@ -3601,6 +3773,7 @@ inline void OnPoolScanIndirectDraw(
       if (gate.alpha_material) {
         copy.alpha_index = static_cast<uint32_t>(slot.indirect_alpha.size());
         slot.indirect_alpha.push_back({uv, vbs, vbs_known});
+        alpha_refs[alpha_ref_count++] = {g_pool.write_slot, copy.alpha_index};
       }
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
       copy.schedule_key = schedule_key;
@@ -3628,6 +3801,26 @@ inline void OnPoolScanIndirectDraw(
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
   }
+  if (alpha_ref_count != 0u && (AlphaMode() & 2u) != 0u && alpha_material.view != 0u) {
+    // The same view guard as the direct path: the bound view must be the t0 resource.
+    const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
+    uint64_t source_id = 0u;
+    if (source.handle != cl_data->ps_srv[contract::kAlphaTexSlot].handle) {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      g_pool.stats.alpha_source_refused += 1u;
+      g_pool.stats.alpha_source_refused_type += 1u;
+      g_pool.stats.alpha_source_refused_view += 1u;
+    } else {
+      source_id = CapturePoolAlphaSource(device, cmd_list, 0u, alpha_material.view, !deferred);
+    }
+    if (source_id != 0u) {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      for (uint32_t i = 0u; i < alpha_ref_count; ++i) {
+        PoolStagingSlot& alpha_slot = g_pool.slots[alpha_refs[i].first];
+        if (alpha_refs[i].second < alpha_slot.indirect_alpha.size()) alpha_slot.indirect_alpha[alpha_refs[i].second].source = source_id;
+      }
+    }
+  }
   stage.Set("indirect draw: copy");
   IssuePoolCopies(cmd_list, commands.data(), command_count);
   LogPoolMeshCopies(mesh_copies.data(), mesh_count, frame);
@@ -3645,13 +3838,18 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.alpha_keys.erase(mesh_key);
   g_pool.alpha_uv_requeued.erase(mesh_key);
   g_pool.alpha_source_done.erase(mesh_key);
+  g_pool.alpha_indirect_keys.erase(mesh_key);
+  g_pool.wind_keys.erase(mesh_key);
   const auto key_source = g_pool.alpha_key_source.find(mesh_key);
   if (key_source != g_pool.alpha_key_source.end()) {
     const auto source = g_pool.alpha_sources.find(key_source->second);
     if (source != g_pool.alpha_sources.end()) {
       source->second.keys.erase(mesh_key);
-      if (source->second.keys.empty()) {  // no key uses the copy any more
+      // No key uses the copy any more; a keyless copy (indirect draw) is held until its hold runs out.
+      if (source->second.keys.empty()
+          && (source->second.hold_until == 0u || g_state.frame.load() > source->second.hold_until)) {
         if (source->second.proxy.handle != 0u) g_pool.alpha_dead_proxies.push_back(source->second.proxy);
+        UnlinkPoolAlphaTexture(key_source->second, source->second);
         g_pool.alpha_sources.erase(source);
       }
     }
@@ -3728,6 +3926,18 @@ inline void OnDestroyResourcePool(reshade::api::device* device, reshade::api::re
   std::lock_guard<std::mutex> lock(g_pool.mutex);
   if (!g_pool.indirect_refs.empty() && g_pool.indirect_refs.count(resource.handle) != 0u) {
     g_pool.indirect_dead.insert(resource.handle);
+  }
+  if (!g_pool.alpha_sources.empty()) {  // the destroyed texture's copy is no longer linked to it
+    const auto link = g_pool.alpha_source_by_texture.find(resource.handle);
+    if (link != g_pool.alpha_source_by_texture.end()) {
+      const auto source_it = g_pool.alpha_sources.find(link->second);
+      if (source_it != g_pool.alpha_sources.end()) {
+        source_it->second.texture_dead = true;
+        UnlinkPoolAlphaTexture(link->second, source_it->second);
+      } else {
+        g_pool.alpha_source_by_texture.erase(link);  // a stale link (no copy): nothing to free, and no throw in a destroy event
+      }
+    }
   }
   const auto it = g_pool.keys_by_resource.find(resource.handle);
   if (it == g_pool.keys_by_resource.end()) return;
@@ -4071,7 +4281,8 @@ inline void LogPoolSwitches() {
                         ", capture meshes ", on(g_pool.capture_meshes), ", scan indirect draws ", on(g_pool.scan_indirect),
                         ", verify mesh captures ", on(g_pool.verify_meshes), ", legacy scale limits ",
                         on(g_pool.legacy_scale), ", keep moving objects out ", on(g_pool.exclude_moving),
-                        ", follow moving objects ", on(g_pool.follow_moving), ", retry unstable meshes ", on(g_pool.retry_unstable), ", alpha foliage ", on(g_pool.alpha_foliage));
+                        ", follow moving objects ", on(g_pool.follow_moving), ", retry unstable meshes ", on(g_pool.retry_unstable), ", alpha foliage ", on(g_pool.alpha_foliage),
+                        ", alpha indirect source ", on(g_pool.alpha_indirect_source), ", alpha wind opaque ", on(g_pool.alpha_wind_opaque));
 }
 
 // Short text for how a VB/IB was created (reshade::api resource_usage /
@@ -4743,7 +4954,11 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         if ((copy.pass & kPoolPassAlpha) != 0u) {
           NotePoolAlphaMaterial(mesh_key, copy.alpha, alpha_side != nullptr && alpha_side->vbs_known ? &alpha_side->vbs : nullptr);
         }
+        if ((copy.pass & kPoolPassWind) != 0u) g_pool.wind_keys.insert(mesh_key);
         QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{});
+        if (alpha_side != nullptr && alpha_side->source != 0u && (AlphaMode() & 2u) != 0u) {
+          AttachPoolAlphaSource(mesh_key, alpha_side->source);
+        }
       }
 
       const PoolSighting sighting{copy.pass, copy.ps_hash};
@@ -4863,6 +5078,8 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     CompactPool();
     ApplyPoolDynamicSwitch();
     ApplyPoolAlphaSwitch();
+    ApplyPoolIndirectAlphaSwitch();
+    ApplyPoolWindSwitch();
     if (scanning) {
       if (g_pool.stats.scan_first_frame == 0u) g_pool.stats.scan_first_frame = frame;
       g_pool.stats.scan_last_frame = frame;
@@ -5048,6 +5265,8 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
 
 inline void ResetWorldPool() {
   std::lock_guard<std::mutex> lock(g_pool.mutex);
+  g_pool.wind_keys.clear();
+  g_pool.alpha_maps = PoolAlphaDumpMaps{};
   for (auto& slot : g_pool.slots) {
     // Copies already recorded into a slot still land there; only forget them.
     if (!slot.resolving) {
@@ -5514,6 +5733,22 @@ inline const char* PoolUvVerdictName(PoolUvVerdict verdict) {
   return "unknown";
 }
 
+// Dump order: the flagged entries (alpha or wind rest pose) first, the rest after; each group keeps its order.
+inline std::vector<size_t> PoolDumpOrder(const std::vector<uint8_t>& first) {
+  std::vector<size_t> order(first.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_partition(order.begin(), order.end(), [&first](size_t i) { return first[i] != 0u; });
+  return order;
+}
+
+template <typename T>
+inline std::vector<T> PoolReorder(const std::vector<T>& values, const std::vector<size_t>& order) {
+  std::vector<T> out;
+  out.reserve(order.size());
+  for (const size_t i : order) out.push_back(values[i]);
+  return out;
+}
+
 inline void WritePoolAlphaMaterial(std::ostream& out, const PoolAlphaMaterial& material) {
   out << "{\"view\": \"" << renodx::utils::log::AsHex(material.view) << "\", \"resource\": \""
       << renodx::utils::log::AsHex(material.resource) << "\", \"threshold\": " << PoolJsonFloat{material.threshold}
@@ -5556,6 +5791,11 @@ inline void DumpWorldPool() {
   uint64_t alpha_held_vertex_bytes = 0u;  // vertex bytes held by requests in the Uvs phase
   PoolAlphaGpuStats alpha_gpu;
   std::vector<PoolAlphaKeyDump> alpha_keys;
+  std::vector<std::pair<uint64_t, int64_t>> wind_keys_dump;  // wind rest-pose keys with their mesh ids (-1: no mesh)
+  PoolAlphaDumpMaps alpha_maps;
+  size_t wind_alpha_overlap = 0u;  // wind rest-pose keys that are also alpha keys
+  std::unordered_set<uint64_t> sourced_uids;                 // mesh uids with a source copy
+  std::vector<uint8_t> instance_alpha, instance_wind;        // per instance (the instance order of the dump)
   PoolMotionDetail motion_detail;
   std::vector<PoolDynamicDumpEntry> dynamic;
   std::unordered_map<uint64_t, PoolMeshFailure> failed_meshes;
@@ -5585,12 +5825,23 @@ inline void DumpWorldPool() {
     for (const WorldInstance& instance : instances) {
       visibility.push_back(GetPoolCameraVisibility(instance));
       last_seen.push_back(PoolInstanceLastSeen(instance));
+      instance_alpha.push_back(instance.mesh_id < g_pool.meshes.size() && g_pool.meshes[instance.mesh_id].alpha ? 1u : 0u);
+      instance_wind.push_back(g_pool.wind_keys.count(instance.mesh_key) != 0u ? 1u : 0u);
     }
     families = g_pool.families;
     stats = g_pool.stats;
     alpha_key_count = g_pool.alpha_keys.size();
     for (const auto& entry : g_pool.mesh_requests) alpha_held_vertex_bytes += entry.second.vertex_bytes.size();
     alpha_gpu = g_pool.alpha_gpu;
+    alpha_maps = g_pool.alpha_maps;
+    for (const WorldMesh& mesh : g_pool.meshes) {
+      if (g_pool.alpha_key_source.count(mesh.mesh_key) != 0u) sourced_uids.insert(mesh.uid);
+    }
+    for (const uint64_t key : g_pool.wind_keys) {
+      const auto mesh_it = g_pool.mesh_by_key.find(key);
+      wind_keys_dump.emplace_back(key, mesh_it == g_pool.mesh_by_key.end() ? int64_t{-1} : static_cast<int64_t>(mesh_it->second));
+      if (g_pool.alpha_keys.count(key) != 0u) wind_alpha_overlap += 1u;
+    }
     for (const auto& [key, state] : g_pool.alpha_keys) {
       const auto mesh_it = g_pool.mesh_by_key.find(key);
       alpha_keys.push_back({key, mesh_it == g_pool.mesh_by_key.end() ? -1 : static_cast<int64_t>(mesh_it->second), state});
@@ -5603,6 +5854,16 @@ inline void DumpWorldPool() {
     region = CurrentPoolRegion();
     inspect = g_pool.inspect;
   }
+
+  // The instance dump lists the alpha and wind rest-pose instances first (visibility, last_seen and flags move together).
+  std::vector<uint8_t> instance_first(instances.size());
+  for (size_t i = 0; i < instance_first.size(); ++i) instance_first[i] = instance_alpha[i] | instance_wind[i];
+  const std::vector<size_t> instance_order = PoolDumpOrder(instance_first);
+  instances = PoolReorder(instances, instance_order);
+  visibility = PoolReorder(visibility, instance_order);
+  last_seen = PoolReorder(last_seen, instance_order);
+  instance_alpha = PoolReorder(instance_alpha, instance_order);
+  instance_wind = PoolReorder(instance_wind, instance_order);
 
   std::sort(alpha_keys.begin(), alpha_keys.end(), [](const PoolAlphaKeyDump& a, const PoolAlphaKeyDump& b) { return a.key < b.key; });
   size_t diag_ok = 0u, diag_no_texcoord = 0u, diag_other_slot = 0u, diag_conflict_view = 0u, diag_conflict_threshold = 0u;
@@ -5672,17 +5933,32 @@ inline void DumpWorldPool() {
       << ", \"source_refused_bytes\": " << stats.alpha_source_refused_bytes
       << ", \"source_refused_format\": " << stats.alpha_source_refused_format
       << ", \"source_refused_view\": " << stats.alpha_source_refused_view
+      << ", \"source_refused_cap\": " << stats.alpha_source_refused_cap
+      << ", \"source_refused_deferred\": " << stats.alpha_source_refused_deferred
+      << ", \"source_refused_type\": " << stats.alpha_source_refused_type
+      << ", \"source_refused_failed\": " << stats.alpha_source_refused_failed
       << ", \"uv_requeues\": " << stats.alpha_uv_requeues
       << ", \"cap_refused\": " << alpha_gpu.cap_refused << ", \"tlas_alpha_instances\": " << alpha_gpu.tlas_instances
       << ", \"alpha_waiting\": " << alpha_gpu.waiting << ", \"alpha_tests\": " << alpha_gpu.tests
       << ", \"alpha_cut\": " << alpha_gpu.cut << ", \"blit_ms\": " << PoolJsonFloat{alpha_gpu.blit_ms}
-      << ", \"trace_ms\": " << PoolJsonFloat{alpha_gpu.trace_ms} << "},\n";
+      << ", \"trace_ms\": " << PoolJsonFloat{alpha_gpu.trace_ms}
+      << ", \"indirect_copies\": " << stats.alpha_indirect_copies << ", \"orphans_attached\": " << stats.alpha_orphans_attached
+      << ", \"orphans_expired\": " << stats.alpha_orphans_expired << ", \"orphan_missed\": " << stats.alpha_orphan_missed
+      << ", \"indirect_source_changed\": " << stats.alpha_indirect_source_changed
+      << ", \"wind_refused_off\": " << stats.wind_refused_off << ", \"wind_rest_draws\": " << stats.wind_rest_draws << "},\n";
   out << "  \"alpha_keys_total\": " << alpha_keys.size() << ", \"alpha_keys\": [";
   for (size_t i = 0; i < alpha_keys.size() && i < kPoolDumpMaxAlphaKeys; ++i) {
     const PoolAlphaKeyDump& entry = alpha_keys[i];
     out << (i != 0u ? "," : "") << "\n    {\"key\": \"" << renodx::utils::log::AsHex(entry.key) << "\", \"mesh_id\": " << entry.mesh_id;
     WritePoolAlphaEvidence(out, entry.state, entry.state.layout);
     out << "}";
+  }
+  out << "\n  ],\n";
+  out << "  \"wind_keys_total\": " << wind_keys_dump.size() << ", \"wind_keys_and_alpha_keys\": " << wind_alpha_overlap
+      << ", \"wind_keys\": [";
+  for (size_t i = 0; i < wind_keys_dump.size() && i < kPoolDumpMaxAlphaKeys; ++i) {
+    out << (i != 0u ? "," : "") << "\n    {\"key\": \"" << renodx::utils::log::AsHex(wind_keys_dump[i].first)
+        << "\", \"mesh_id\": " << wind_keys_dump[i].second << "}";
   }
   out << "\n  ],\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
@@ -5694,7 +5970,9 @@ inline void DumpWorldPool() {
       << ", \"legacy_scale\": " << (g_pool.legacy_scale.load() ? "true" : "false")
       << ", \"exclude_moving\": " << (g_pool.exclude_moving.load() ? "true" : "false")
       << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false")
-      << ", \"retry_unstable\": " << (g_pool.retry_unstable.load() ? "true" : "false") << "},\n";
+      << ", \"retry_unstable\": " << (g_pool.retry_unstable.load() ? "true" : "false")
+      << ", \"alpha_indirect_source\": " << (g_pool.alpha_indirect_source.load() ? "true" : "false")
+      << ", \"alpha_wind_opaque\": " << (g_pool.alpha_wind_opaque.load() ? "true" : "false") << "},\n";
   out << "  \"follow\": {\"hits\": " << g_pool.stats.follow_hits << ", \"admits\": " << g_pool.stats.follow_admits
       << ", \"misses_skipped\": " << g_pool.stats.follow_misses_skipped
       << ", \"rejected_bounds\": " << g_pool.stats.follow_rejected_bounds
@@ -5932,6 +6210,8 @@ inline void DumpWorldPool() {
   for (const auto& mesh : meshes) {
     if (!first) meshes_out << ",";
     first = false;
+    const auto slice_it = alpha_maps.slice_of_uid.find(mesh.uid);
+    const bool resident = alpha_maps.resident_uids.count(mesh.uid) != 0u;
     meshes_out << "\n    {\"mesh_id\": " << mesh.mesh_id
         << ", \"vs_hash\": \"" << PoolHashText(mesh.source_vs_hash) << "\""
         << ", \"vertices\": " << mesh.positions.size()
@@ -5957,7 +6237,12 @@ inline void DumpWorldPool() {
         << ", \"key\": \"" << renodx::utils::log::AsHex(mesh.mesh_key) << "\""
         << ", \"source_vb\": \"" << renodx::utils::log::AsHex(mesh.source_vb) << "\""
         << ", \"source_ib\": \"" << renodx::utils::log::AsHex(mesh.source_ib) << "\""
-        << ", \"signature\": \"" << renodx::utils::log::AsHex(mesh.signature) << "\"";
+        << ", \"signature\": \"" << renodx::utils::log::AsHex(mesh.signature) << "\""
+        << ", \"has_source\": " << (sourced_uids.count(mesh.uid) != 0u ? "true" : "false")
+        << ", \"slice\": " << (slice_it != alpha_maps.slice_of_uid.end() ? static_cast<int64_t>(slice_it->second) : int64_t{-1})
+        << ", \"resident\": " << (resident ? "true" : "false")
+        << ", \"tlas_waiting\": " << (mesh.alpha && resident && slice_it == alpha_maps.slice_of_uid.end() ? "true" : "false")
+        << ", \"indirect_sourced\": " << (alpha_maps.indirect_uids.count(mesh.uid) != 0u ? "true" : "false");
     if (mesh.alpha) {
       // The mesh's layout is its first key's layout (the layout lives with the keys, not the mesh).
       PoolAlphaLayout mesh_layout;
@@ -5981,6 +6266,8 @@ inline void DumpWorldPool() {
     const float* m = instance.matrix;
     float scale[3] = {};
     for (int k = 0; k < 3; ++k) scale[k] = std::sqrt(m[k] * m[k] + m[4 + k] * m[4 + k] + m[8 + k] * m[8 + k]);
+    const uint64_t uid = instance.mesh_id < meshes.size() ? meshes[instance.mesh_id].uid : 0u;
+    const auto slice_it = alpha_maps.slice_of_uid.find(uid);
     if (!first) instances_out << ",";
     first = false;
     instances_out << "\n    {\"id\": " << instance.id << ", \"mesh_id\": " << instance.mesh_id
@@ -5993,7 +6280,10 @@ inline void DumpWorldPool() {
         << ", \"origin\": [" << instance.matrix[3] << ", " << instance.matrix[7] << ", " << instance.matrix[11] << "]"
         << ", \"bounds_min\": [" << instance.bounds_min[0] << ", " << instance.bounds_min[1] << ", " << instance.bounds_min[2] << "]"
         << ", \"bounds_max\": [" << instance.bounds_max[0] << ", " << instance.bounds_max[1] << ", " << instance.bounds_max[2] << "]"
-        << ", \"mesh_uid\": " << (instance.mesh_id < meshes.size() ? meshes[instance.mesh_id].uid : 0u)
+        << ", \"mesh_uid\": " << uid
+        << ", \"alpha\": " << (instance_alpha[i] ? "true" : "false")
+        << ", \"wind_rest\": " << (instance_wind[i] ? "true" : "false")
+        << ", \"slice\": " << (slice_it != alpha_maps.slice_of_uid.end() ? static_cast<int64_t>(slice_it->second) : int64_t{-1})
         << ", \"camera_seen\": " << (seen.camera_seen ? "true" : "false")
         << ", \"light_seen\": " << (seen.light_seen ? "true" : "false")
         << ", \"near_fade\": " << (seen.near_fade ? "true" : "false")

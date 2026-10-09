@@ -448,7 +448,7 @@ int main() {
     std::ifstream json(json_path);
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
     CHECK(text.find("\"schema\": 15") != std::string::npos, "schema 15");
-    CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true, \"retry_unstable\": false}") != std::string::npos, "switches");
+    CHECK(text.find("\"verify_meshes\": true, \"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true, \"retry_unstable\": false, \"alpha_indirect_source\": true, \"alpha_wind_opaque\": true}") != std::string::npos, "switches");
     CHECK(text.find("\"admitted_outside_legacy_scale\": 2") != std::string::npos, "outside legacy count");
     CHECK(text.find("\"outside_legacy_scale\": 1") != std::string::npos, "family count");
     CHECK(text.find("\"mesh_verified\": 2, \"mesh_capture_mismatches\": 0, \"mesh_unstable\": 0") != std::string::npos, "stats");

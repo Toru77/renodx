@@ -235,6 +235,7 @@ struct AlphaGpu {
   reshade::api::pipeline blit_pipeline = {0u};
   AlphaSliceTable slices;
   std::unordered_map<uint64_t, uint32_t> slot_of_uid;     // mesh uid -> slice of its material (read by the TLAS)
+  std::unordered_set<uint64_t> indirect_uids;  // mesh uids whose slice was filled from an indirect key (dropped with the switch OFF)
   std::vector<std::pair<uint32_t, uint32_t>> quarantine;  // (slice, frame released), reused after kAlphaSliceQuarantineFrames
   GpuTimer timer;
   uint64_t blits = 0u;       // slices filled since the atlas was created
@@ -291,7 +292,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   uint64_t tlas_visibility_revision = 0u;  // g_pool.visibility_revision the TLAS reflects
   uint64_t tlas_dynamic_revision = 0u;     // g_pool.dynamic_revision the TLAS reflects
   uint64_t tlas_store_version = 0u;
-  bool tlas_alpha_on = false;  // alpha_foliage at the last TLAS build (LiveTlasChange: a switch rebuilds it)
+  uint8_t tlas_alpha_mode = 0u;  // AlphaMode() at the last TLAS build (LiveTlasChange: a change rebuilds it)
   float tlas_region_min[3] = {1e30f, 1e30f, 1e30f};
   float tlas_region_size = 0.f;
   bool tlas_built = false;
@@ -413,6 +414,7 @@ inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
   alpha.sampler = {0u};
   alpha.slices = {};
   alpha.slot_of_uid.clear();
+  alpha.indirect_uids.clear();
   alpha.quarantine.clear();
   alpha.cap_refused_uids.clear();
   alpha.failure_logged = false;

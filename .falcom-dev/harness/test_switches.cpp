@@ -353,7 +353,7 @@ int main() {
     std::ifstream json(bvh::PoolOutputDir() / "world_pool.json");
     const std::string text((std::istreambuf_iterator<char>(json)), std::istreambuf_iterator<char>());
     CHECK(text.find("\"switches\": {\"capture_meshes\": false, \"scan_indirect\": true, \"verify_meshes\": false, "
-                    "\"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true, \"retry_unstable\": false}") != std::string::npos, "switches in dump");
+                    "\"legacy_scale\": false, \"exclude_moving\": false, \"follow_moving\": true, \"retry_unstable\": false, \"alpha_indirect_source\": true, \"alpha_wind_opaque\": true}") != std::string::npos, "switches in dump");
     CHECK(text.find("\"mesh_dropped\": 1") != std::string::npos, "dropped in dump");
     CHECK(text.find("\"mesh_index_copies\": 5, \"mesh_vertex_copies\": 4") != std::string::npos, "copies in dump");
     bvh::g_pool.capture_meshes.store(true);
