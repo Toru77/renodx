@@ -202,6 +202,169 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   return {true, temporal_run};
 }
 
+// World RTAO json, as a pure function of the values it prints (no device, no globals). The temporal object is
+// closed before the root keys, so test_modes, two_sided_discovery, temporal_diagnostics and note are top-level keys.
+struct RtaoJsonInput {
+  const RtaoFrameState* frame;
+  const uint32_t* values;  // kRtaoStatsCount entries
+  uint64_t generated_frame;
+  bool temporal_on;
+  bool zero_motion;
+  bool camera_matrix;
+  bool freeze_noise;
+  uint32_t cpu_draws[4][2];  // camera opaque candidate draws by cull mode and front face
+};
+
+inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
+  const RtaoFrameState& f = *in.frame;
+  const uint32_t* v = in.values;
+  // Pass B diagnostics (F1) and the per-reason frame counts, as one json object.
+  const uint32_t* tv = v;
+  const uint32_t* fv = &v[kRtaoStatTemporalFBase];
+  const TracedDenominators den = ComputeTracedDenominators(tv[kRtaoStatPixels], tv[kRtaoStatSky], tv[kRtaoStatNormal],
+                                                          tv[kRtaoStatRegion], tv[kRtaoStatScaled], tv[kRtaoStatTemporalBase + 5u]);
+  const double tpx = den.traced > 0u ? static_cast<double>(den.traced) : 1.0;
+  const double wbase = den.traced > 0u ? 1000.0 * den.traced : 1.0;
+  const double w_acc = den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase] / wbase : 0.0;
+  const double w_dep = den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 1u] / wbase : 0.0;
+  const double w_nor = den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 2u] / wbase : 0.0;
+  const uint32_t* qv = &v[kRtaoStatQualityBase];
+  std::ostringstream diag;
+  diag << "{\"traced_pixels\": " << den.traced << ", \"taps_traced\": " << den.taps
+       << ", \"reset_traced\": " << den.reset_traced << ", \"pass_b_pixels\": " << tv[kRtaoStatTemporalBase]
+       << ", \"moving_pixels\": " << fv[0] << ", \"motion_max_px\": " << fv[1] / 100.0
+       << ", \"mean_motion_px\": " << fv[2] / 100.0 / tpx << ", \"share_moving\": " << fv[0] / tpx
+       << ", \"share_clamp_active\": " << fv[3] / tpx << ", \"mean_clamp_shift\": " << fv[4] / 1000.0 / tpx
+       << ", \"mean_alpha\": " << fv[5] / 1000.0 / tpx << ", \"mean_abs_raw_minus_ao\": " << fv[6] / 1000.0 / tpx
+       << ", \"share_no_history\": " << fv[7] / tpx
+       << ", \"texel_differs\": " << fv[8] << ", \"share_texel_differs\": " << fv[8] / tpx
+       << ", \"weighted_shares\": {\"accepted\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase] / (1000.0 * den.traced) : 0.0)
+       << ", \"rejected_depth\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 1u] / (1000.0 * den.traced) : 0.0)
+       << ", \"rejected_normal\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 2u] / (1000.0 * den.traced) : 0.0) << "}"
+       << ", \"weighted_other_pct\": " << (100.0 - w_acc - w_dep - w_nor)
+       << ", \"weighted_note\": \"not counted on reset frames; other = no history, out of bounds or reset\""
+       << ", \"depth_ratio_pct\": {\"invalid\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase] / den.traced : 0.0)
+       << ", \"lt_0_1\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase + 1u] / den.traced : 0.0)
+       << ", \"lt_0_5\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase + 2u] / den.traced : 0.0)
+       << ", \"lt_1\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase + 3u] / den.traced : 0.0)
+       << ", \"lt_2\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase + 4u] / den.traced : 0.0)
+       << ", \"lt_5\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase + 5u] / den.traced : 0.0)
+       << ", \"ge_5\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatDepthBase + 6u] / den.traced : 0.0) << "}"
+       << ", \"normal_dot_pct\": {\"lt_0\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatNormalBase] / den.traced : 0.0)
+       << ", \"lt_0_5\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatNormalBase + 1u] / den.traced : 0.0)
+       << ", \"lt_0_7\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatNormalBase + 2u] / den.traced : 0.0)
+       << ", \"lt_0_9\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatNormalBase + 3u] / den.traced : 0.0)
+       << ", \"lt_0_97\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatNormalBase + 4u] / den.traced : 0.0)
+       << ", \"ge_0_97\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatNormalBase + 5u] / den.traced : 0.0) << "}"
+       << ", \"raw_difference\": {\"count\": " << v[kRtaoStatRawBase + 1u]
+       << ", \"mean_abs\": " << (v[kRtaoStatRawBase + 1u] > 0u
+            ? v[kRtaoStatRawBase] / 1000.0 / v[kRtaoStatRawBase + 1u] : 0.0)
+       << ", \"identical_share_pct\": " << (v[kRtaoStatRawBase + 1u] > 0u
+            ? 100.0 * v[kRtaoStatRawBase + 2u] / v[kRtaoStatRawBase + 1u] : 0.0) << "}"
+       << ", \"quality\": {\"mean_raw\": " << MeanFromSum(qv[1], den.traced)
+       << ", \"mean_output\": " << MeanFromSum(qv[0], den.traced)
+       << ", \"raw_minus_output\": " << (MeanFromSum(qv[1], den.traced) - MeanFromSum(qv[0], den.traced))
+       << ", \"roughness_raw\": " << MeanFromSum(qv[3], qv[2])
+       << ", \"roughness_previous_output\": " << MeanFromSum(qv[4], qv[2])
+       << ", \"roughness_ratio\": " << (MeanFromSum(qv[3], qv[2]) > 0.0 ? MeanFromSum(qv[4], qv[2]) / MeanFromSum(qv[3], qv[2]) : 0.0)
+       << ", \"roughness_pixels\": " << qv[2]
+       << ", \"output_change_mean\": " << MeanFromSum(qv[6], qv[5])
+       << ", \"output_change_pixels\": " << qv[5]
+       << ", \"note\": \"still camera only; compares with the previous output at the same pixel\"}"
+       << ", \"captured_parameters\": {\"spp\": " << f.captured.samples
+       << ", \"history_weight\": " << f.captured.history_weight
+       << ", \"depth_rejection\": " << f.captured.depth_rejection
+       << ", \"normal_rejection\": " << f.captured.normal_rejection
+       << ", \"history_clamp\": " << f.captured.history_clamp
+       << ", \"isfast_used\": " << (f.captured_isfast_used ? "true" : "false")
+       << ", \"radius\": " << f.captured.radius << ", \"ray_max\": " << f.captured.ray_max
+       << ", \"strength\": " << f.captured.strength << ", \"normal_bias\": " << f.captured.normal_bias
+       << ", \"debug\": " << f.captured.debug << "}"
+       << ", \"frames_without_ao_by_reason\": {";
+  bool first_reason = true;
+  for (size_t r = 0; r < kReasonCount; ++r) {
+    if (f.frames_without_ao_by_reason[r] == 0u) continue;
+    diag << (first_reason ? "" : ", ") << "\"" << ReasonName(static_cast<Reason>(r)) << "\": " << f.frames_without_ao_by_reason[r];
+    first_reason = false;
+  }
+  // D1b: motion vs camera-matrix difference (static geometry only), over the traced pixels.
+  const uint32_t* dv = &v[kRtaoStatTemporalFBase + 9u];
+  const uint32_t dtraced = den.traced;
+  float jitter_x = 0.f, jitter_y = 0.f;
+  std::memcpy(&jitter_x, &v[kRtaoStatJitterX], sizeof(float));
+  std::memcpy(&jitter_y, &v[kRtaoStatJitterY], sizeof(float));
+  diag << "}, \"camera_matrix_diff\": {\"note\": \"valid for static geometry only; moving objects show real motion here, not a jitter error\""
+       << ", \"bins\": [" << dv[0] << ", " << dv[1] << ", " << dv[2] << ", " << dv[3] << ", " << dv[4] << "]"
+       << ", \"share_within_0_25_px\": " << (dtraced > 0u ? static_cast<double>(dv[0] + dv[1]) / dtraced : 0.0)
+       << ", \"mean_px\": " << (dtraced > 0u ? static_cast<double>(dv[5]) / 100.0 / dtraced : 0.0)
+       << ", \"max_px\": " << dv[6] / 100.0
+       << ", \"jitter_diff_px\": [" << jitter_x << ", " << jitter_y << "]"
+       << ", \"matrix_self_check\": {\"valid\": " << (f.matrix_valid ? "true" : "false")
+       << ", \"identity_err\": " << f.matrix_identity_err
+       << ", \"prev_diff\": " << f.matrix_prev_diff << "}}"
+       << ", \"last_parameter_change\": \"" << f.last_parameter_change << "\""
+       << ", \"motion_dims\": {\"ok\": " << (f.motion_dims_ok ? "true" : "false")
+       << ", \"motion_w\": " << f.motion_w << ", \"motion_h\": " << f.motion_h
+       << ", \"depth_w\": " << f.depth_w << ", \"depth_h\": " << f.depth_h << "}}";
+  std::ostringstream out;
+  out << "{\n  \"schema\": 2,\n  \"generated_frame\": " << in.generated_frame
+      << ",\n  \"reason\": \"" << ReasonName(f.reason) << "\""
+      << ",\n  \"producing\": " << (f.producing ? "true" : "false")
+      << ",\n  \"gpu_ms\": " << f.gpu_ms
+      << ",\n  \"texture_bytes\": " << f.texture_bytes
+      << ",\n  \"frames_without_ao\": " << f.frames_without_ao
+      << ",\n  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
+      << ", \"coverage\": " << f.fade.coverage << "}"
+      << ",\n  \"stats\": {\"rays\": " << v[kRtaoStatRays] << ", \"hits\": " << v[kRtaoStatHits]
+      << ", \"pixels\": " << v[kRtaoStatPixels] << ", \"ao_sum\": " << v[kRtaoStatAoSum]
+      << ", \"sky\": " << v[kRtaoStatSky] << ", \"normal\": " << v[kRtaoStatNormal]
+      << ", \"region\": " << v[kRtaoStatRegion] << ", \"scaled\": " << v[kRtaoStatScaled]
+      << ", \"invalid_refs\": " << v[kRtaoStatInvalidRefs]
+      << ", \"stack_overflow\": " << v[kRtaoStatStackOverflow] << "}"
+      << ",\n  \"temporal\": {\"on\": " << (in.temporal_on ? "true" : "false")
+      << ", \"ran\": " << (f.temporal_ran ? "true" : "false")
+      << ", \"reset\": \"" << ResetReasonName(f.reset) << "\""
+      << ", \"last_reset\": \"" << ResetReasonName(f.last_reset) << "\""
+      << ", \"motion\": \"" << (f.motion_source == MotionSource::Rtv4 ? "rtv4" : f.motion_source == MotionSource::Conflict ? "conflict" : "none") << "\""
+      << ", \"rcas_motion_res\": " << f.rcas_res << ", \"mb_rtv4_res\": " << f.rtv4_res
+      << ", \"temporal_bytes\": " << f.temporal_bytes << ", \"history_bytes_per_pixel\": 20"
+      << ", \"temporal_pixels\": " << v[kRtaoStatTemporalBase + 0u]
+      << ", \"valid_taps\": " << v[kRtaoStatTemporalBase + 1u]
+      << ", \"rejected_depth\": " << v[kRtaoStatTemporalBase + 2u]
+      << ", \"rejected_normal\": " << v[kRtaoStatTemporalBase + 3u]
+      << ", \"out_of_bounds\": " << v[kRtaoStatTemporalBase + 4u]
+      << ", \"reset_pixels\": " << v[kRtaoStatTemporalBase + 5u]
+      << ", \"reset_counts\": [";
+  for (size_t r = 0; r < static_cast<size_t>(ResetReason::Count); ++r) {
+    out << (r == 0u ? "" : ", ") << f.reset_counts[r];
+  }
+  out << "]}"
+      << ",\n  \"two_sided_discovery\": {\"cpu\": [";
+  bool first_cpu = true;
+  for (uint32_t cull = 0u; cull < 4u; ++cull) {
+    for (uint32_t ccw = 0u; ccw < 2u; ++ccw) {
+      const uint32_t draws = in.cpu_draws[cull][ccw];
+      if (draws == 0u) continue;
+      out << (first_cpu ? "" : ", ") << "{\"cull\": " << cull << ", \"front_ccw\": " << ccw << ", \"draws\": " << draws << "}";
+      first_cpu = false;
+    }
+  }
+  static const char* const kDiscoveryNames[kRtaoStatDiscoveryCount] = {
+      "front_away_opaque", "front_away_alpha", "front_toward_opaque", "front_toward_alpha",
+      "back_away_opaque", "back_away_alpha", "back_toward_opaque", "back_toward_alpha"};
+  out << "], \"gpu\": {";
+  for (uint32_t i = 0u; i < kRtaoStatDiscoveryCount; ++i) {
+    out << (i == 0u ? "" : ", ") << "\"" << kDiscoveryNames[i] << "\": " << v[kRtaoStatDiscoveryBase + i];
+  }
+  out << "}}"
+      << ",\n  \"temporal_diagnostics\": " << diag.str()
+      << ",\n  \"test_modes\": {\"zero_motion\": " << (in.zero_motion ? "true" : "false")
+      << ", \"camera_matrix\": " << (in.camera_matrix ? "true" : "false")
+      << ", \"freeze_noise\": " << (in.freeze_noise ? "true" : "false") << "}"
+      << ",\n  \"note\": \"dynamic objects not traced (round 3); scaled pixels are counted by the shader\"\n}\n";
+  return out.str();
+}
+
 // Reads the stats buffer and writes world_rtao.json. Called once per present; no lock held.
 inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::command_queue* queue) {
   if (!g_rtao_stats.requested.exchange(false, std::memory_order_relaxed)) return;
@@ -225,134 +388,20 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
                         " scaled=", v[kRtaoStatScaled], " invalid_refs=", v[kRtaoStatInvalidRefs],
                         " stack_overflow=", v[kRtaoStatStackOverflow], " gpu_ms=", g_rtao_frame.gpu_ms);
 
-  // Pass B diagnostics (F1) and the per-reason frame counts, as one json object.
-  const uint32_t* tv = g_rtao_stats.values;
-  const uint32_t* fv = &g_rtao_stats.values[kRtaoStatTemporalFBase];
-  const TracedDenominators den = ComputeTracedDenominators(tv[kRtaoStatPixels], tv[kRtaoStatSky], tv[kRtaoStatNormal],
-                                                          tv[kRtaoStatRegion], tv[kRtaoStatScaled], tv[kRtaoStatTemporalBase + 5u]);
-  const double tpx = den.traced > 0u ? static_cast<double>(den.traced) : 1.0;
-  const double wbase = den.traced > 0u ? 1000.0 * den.traced : 1.0;
-  const double w_acc = den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase] / wbase : 0.0;
-  const double w_dep = den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 1u] / wbase : 0.0;
-  const double w_nor = den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 2u] / wbase : 0.0;
-  std::ostringstream diag;
-  diag << "{\"traced_pixels\": " << den.traced << ", \"taps_traced\": " << den.taps
-       << ", \"reset_traced\": " << den.reset_traced << ", \"pass_b_pixels\": " << tv[kRtaoStatTemporalBase]
-       << ", \"moving_pixels\": " << fv[0] << ", \"motion_max_px\": " << fv[1] / 100.0
-       << ", \"mean_motion_px\": " << fv[2] / 100.0 / tpx << ", \"share_moving\": " << fv[0] / tpx
-       << ", \"share_clamp_active\": " << fv[3] / tpx << ", \"mean_clamp_shift\": " << fv[4] / 1000.0 / tpx
-       << ", \"mean_alpha\": " << fv[5] / 1000.0 / tpx << ", \"mean_abs_raw_minus_ao\": " << fv[6] / 1000.0 / tpx
-       << ", \"share_no_history\": " << fv[7] / tpx
-       << ", \"texel_differs\": " << fv[8] << ", \"share_texel_differs\": " << fv[8] / tpx
-       << ", \"weighted_shares\": {\"accepted\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase] / (1000.0 * den.traced) : 0.0)
-       << ", \"rejected_depth\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 1u] / (1000.0 * den.traced) : 0.0)
-       << ", \"rejected_normal\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatWeightBase + 2u] / (1000.0 * den.traced) : 0.0) << "}"
-       << ", \"weighted_other_pct\": " << (100.0 - w_acc - w_dep - w_nor)
-       << ", \"weighted_note\": \"not counted on reset frames; other = no history, out of bounds or reset\""
-       << ", \"depth_ratio_pct\": {\"invalid\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase] / den.traced : 0.0)
-       << ", \"lt_0_1\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 1u] / den.traced : 0.0)
-       << ", \"lt_0_5\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 2u] / den.traced : 0.0)
-       << ", \"lt_1\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 3u] / den.traced : 0.0)
-       << ", \"lt_2\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 4u] / den.traced : 0.0)
-       << ", \"lt_5\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 5u] / den.traced : 0.0)
-       << ", \"ge_5\": " << (den.traced > 0u ? 100.0 * g_rtao_stats.values[kRtaoStatDepthBase + 6u] / den.traced : 0.0) << "}"
-       << ", \"raw_difference\": {\"count\": " << g_rtao_stats.values[kRtaoStatRawBase + 1u]
-       << ", \"mean_abs\": " << (g_rtao_stats.values[kRtaoStatRawBase + 1u] > 0u
-            ? g_rtao_stats.values[kRtaoStatRawBase] / 1000.0 / g_rtao_stats.values[kRtaoStatRawBase + 1u] : 0.0)
-       << ", \"identical_share_pct\": " << (g_rtao_stats.values[kRtaoStatRawBase + 1u] > 0u
-            ? 100.0 * g_rtao_stats.values[kRtaoStatRawBase + 2u] / g_rtao_stats.values[kRtaoStatRawBase + 1u] : 0.0) << "}"
-       << ", \"captured_parameters\": {\"spp\": " << g_rtao_frame.captured.samples
-       << ", \"history_weight\": " << g_rtao_frame.captured.history_weight
-       << ", \"depth_rejection\": " << g_rtao_frame.captured.depth_rejection
-       << ", \"normal_rejection\": " << g_rtao_frame.captured.normal_rejection
-       << ", \"history_clamp\": " << g_rtao_frame.captured.history_clamp
-       << ", \"isfast_used\": " << (g_rtao_frame.captured_isfast_used ? "true" : "false")
-       << ", \"radius\": " << g_rtao_frame.captured.radius << ", \"ray_max\": " << g_rtao_frame.captured.ray_max
-       << ", \"strength\": " << g_rtao_frame.captured.strength << ", \"normal_bias\": " << g_rtao_frame.captured.normal_bias
-       << ", \"debug\": " << g_rtao_frame.captured.debug << "}"
-       << ", \"frames_without_ao_by_reason\": {";
-  bool first_reason = true;
-  for (size_t r = 0; r < kReasonCount; ++r) {
-    if (g_rtao_frame.frames_without_ao_by_reason[r] == 0u) continue;
-    diag << (first_reason ? "" : ", ") << "\"" << ReasonName(static_cast<Reason>(r)) << "\": " << g_rtao_frame.frames_without_ao_by_reason[r];
-    first_reason = false;
-  }
-  // D1b: motion vs camera-matrix difference (static geometry only), over the traced pixels.
-  const uint32_t* dv = &g_rtao_stats.values[kRtaoStatTemporalFBase + 9u];
-  const uint32_t dtraced = den.traced;
-  float jitter_x = 0.f, jitter_y = 0.f;
-  std::memcpy(&jitter_x, &g_rtao_stats.values[kRtaoStatJitterX], sizeof(float));
-  std::memcpy(&jitter_y, &g_rtao_stats.values[kRtaoStatJitterY], sizeof(float));
-  diag << "}, \"camera_matrix_diff\": {\"note\": \"valid for static geometry only; moving objects show real motion here, not a jitter error\""
-       << ", \"bins\": [" << dv[0] << ", " << dv[1] << ", " << dv[2] << ", " << dv[3] << ", " << dv[4] << "]"
-       << ", \"share_within_0_25_px\": " << (dtraced > 0u ? static_cast<double>(dv[0] + dv[1]) / dtraced : 0.0)
-       << ", \"mean_px\": " << (dtraced > 0u ? static_cast<double>(dv[5]) / 100.0 / dtraced : 0.0)
-       << ", \"max_px\": " << dv[6] / 100.0
-       << ", \"jitter_diff_px\": [" << jitter_x << ", " << jitter_y << "]"
-       << ", \"matrix_self_check\": {\"valid\": " << (g_rtao_frame.matrix_valid ? "true" : "false")
-       << ", \"identity_err\": " << g_rtao_frame.matrix_identity_err
-       << ", \"prev_diff\": " << g_rtao_frame.matrix_prev_diff << "}}"
-       << ", \"last_parameter_change\": \"" << g_rtao_frame.last_parameter_change << "\""
-       << ", \"motion_dims\": {\"ok\": " << (g_rtao_frame.motion_dims_ok ? "true" : "false")
-       << ", \"motion_w\": " << g_rtao_frame.motion_w << ", \"motion_h\": " << g_rtao_frame.motion_h
-       << ", \"depth_w\": " << g_rtao_frame.depth_w << ", \"depth_h\": " << g_rtao_frame.depth_h << "}}";
-  std::ostringstream out;
-  out << "{\n  \"schema\": 2,\n  \"generated_frame\": " << g_state.frame.load()
-      << ",\n  \"reason\": \"" << ReasonName(g_rtao_frame.reason) << "\""
-      << ",\n  \"producing\": " << (g_rtao_frame.producing ? "true" : "false")
-      << ",\n  \"gpu_ms\": " << g_rtao_frame.gpu_ms
-      << ",\n  \"texture_bytes\": " << g_rtao_frame.texture_bytes
-      << ",\n  \"frames_without_ao\": " << g_rtao_frame.frames_without_ao
-      << ",\n  \"fade\": {\"start_eff\": " << g_rtao_frame.fade.start << ", \"end_eff\": " << g_rtao_frame.fade.end
-      << ", \"coverage\": " << g_rtao_frame.fade.coverage << "}"
-      << ",\n  \"stats\": {\"rays\": " << v[kRtaoStatRays] << ", \"hits\": " << v[kRtaoStatHits]
-      << ", \"pixels\": " << v[kRtaoStatPixels] << ", \"ao_sum\": " << v[kRtaoStatAoSum]
-      << ", \"sky\": " << v[kRtaoStatSky] << ", \"normal\": " << v[kRtaoStatNormal]
-      << ", \"region\": " << v[kRtaoStatRegion] << ", \"scaled\": " << v[kRtaoStatScaled]
-      << ", \"invalid_refs\": " << v[kRtaoStatInvalidRefs]
-      << ", \"stack_overflow\": " << v[kRtaoStatStackOverflow] << "}"
-      << ",\n  \"temporal\": {\"on\": " << (g_rtao_temporal_enabled > 0.5f ? "true" : "false")
-      << ", \"ran\": " << (g_rtao_frame.temporal_ran ? "true" : "false")
-      << ", \"reset\": \"" << ResetReasonName(g_rtao_frame.reset) << "\""
-      << ", \"last_reset\": \"" << ResetReasonName(g_rtao_frame.last_reset) << "\""
-      << ", \"motion\": \"" << (g_rtao_frame.motion_source == MotionSource::Rtv4 ? "rtv4" : g_rtao_frame.motion_source == MotionSource::Conflict ? "conflict" : "none") << "\""
-      << ", \"rcas_motion_res\": " << g_rtao_frame.rcas_res << ", \"mb_rtv4_res\": " << g_rtao_frame.rtv4_res
-      << ", \"temporal_bytes\": " << g_rtao_frame.temporal_bytes << ", \"history_bytes_per_pixel\": 20"
-      << ", \"temporal_pixels\": " << v[kRtaoStatTemporalBase + 0u]
-      << ", \"valid_taps\": " << v[kRtaoStatTemporalBase + 1u]
-      << ", \"rejected_depth\": " << v[kRtaoStatTemporalBase + 2u]
-      << ", \"rejected_normal\": " << v[kRtaoStatTemporalBase + 3u]
-      << ", \"out_of_bounds\": " << v[kRtaoStatTemporalBase + 4u]
-      << ", \"reset_pixels\": " << v[kRtaoStatTemporalBase + 5u]
-      << ", \"reset_counts\": [";
-  for (size_t r = 0; r < static_cast<size_t>(ResetReason::Count); ++r) {
-    out << (r == 0u ? "" : ", ") << g_rtao_frame.reset_counts[r];
-  }
-  out << "]"
-      << ",\n  \"two_sided_discovery\": {\"cpu\": [";
-  bool first_cpu = true;
+  RtaoJsonInput in = {};
+  in.frame = &g_rtao_frame;
+  in.values = g_rtao_stats.values;
+  in.generated_frame = g_state.frame.load();
+  in.temporal_on = g_rtao_temporal_enabled > 0.5f;
+  in.zero_motion = g_test_zero_motion > 0.5f;
+  in.camera_matrix = g_test_camera_matrix > 0.5f;
+  in.freeze_noise = g_test_freeze_noise > 0.5f;
   for (uint32_t cull = 0u; cull < 4u; ++cull) {
     for (uint32_t ccw = 0u; ccw < 2u; ++ccw) {
-      const uint32_t draws = g_rtao_cull_hist[cull][ccw].load(std::memory_order_relaxed);
-      if (draws == 0u) continue;
-      out << (first_cpu ? "" : ", ") << "{\"cull\": " << cull << ", \"front_ccw\": " << ccw << ", \"draws\": " << draws << "}";
-      first_cpu = false;
+      in.cpu_draws[cull][ccw] = g_rtao_cull_hist[cull][ccw].load(std::memory_order_relaxed);
     }
   }
-  static const char* const kDiscoveryNames[kRtaoStatDiscoveryCount] = {
-      "front_away_opaque", "front_away_alpha", "front_toward_opaque", "front_toward_alpha",
-      "back_away_opaque", "back_away_alpha", "back_toward_opaque", "back_toward_alpha"};
-  out << "], \"gpu\": {";
-  for (uint32_t i = 0u; i < kRtaoStatDiscoveryCount; ++i) {
-    out << (i == 0u ? "" : ", ") << "\"" << kDiscoveryNames[i] << "\": " << v[kRtaoStatDiscoveryBase + i];
-  }
-  out << "}}"
-      << ",\n  \"temporal_diagnostics\": " << diag.str()
-      << ",\n  \"test_modes\": {\"zero_motion\": " << (g_test_zero_motion > 0.5f ? "true" : "false")
-      << ", \"camera_matrix\": " << (g_test_camera_matrix > 0.5f ? "true" : "false")
-      << ", \"freeze_noise\": " << (g_test_freeze_noise > 0.5f ? "true" : "false") << "}"
-      << ",\n  \"note\": \"dynamic objects not traced (round 3); scaled pixels are counted by the shader\"\n}\n";
-  std::string text = out.str();
+  std::string text = BuildRtaoJson(in);
   renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtao.json", text);
 }
 

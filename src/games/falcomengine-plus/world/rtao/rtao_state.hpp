@@ -139,6 +139,18 @@ inline constexpr const char* kTemporalDiagnosticNames[16] = {
     "clamp_shift_sum", "alpha_sum", "abs_raw_ao_sum", "no_history", "texel_differs",
     "matrix_lt_0.1", "matrix_lt_0.25", "matrix_lt_0.5", "matrix_lt_1", "matrix_ge_1", "matrix_diff_sum", "matrix_diff_max"};
 
+// Names of the output quality statistics, in index order (stats index = kRtaoStatQualityBase + i).
+inline constexpr const char* kQualityStatNames[7] = {
+    "ao_sum", "raw_sum", "rough_pairs", "rough_raw_sum", "rough_prev_out_sum", "change_pairs", "change_sum"};
+
+// Mean of a per-pixel sum kept x1000 over count pixels; 0 when count is 0.
+inline double MeanFromSum(uint32_t sum_x1000, uint32_t count) {
+  return count > 0u ? sum_x1000 / 1000.0 / count : 0.0;
+}
+
+// Width of the soft normal weight ramp (HLSL kNormalRampWidth in world_rtao_temporal.cs_5_0.hlsl): full at T, zero at T - width.
+inline constexpr float kNormalRampWidth = 0.4f;
+
 // Histogram bin of a motion vs camera-matrix difference in pixels: 0 below 0.1, 1 below 0.25, 2 below 0.5,
 // 3 below 1, 4 otherwise. Negative values count as 0; NaN counts as 4 (never in the first bin). The HLSL does the same.
 inline uint32_t DiffBin(float diff_px) {

@@ -90,10 +90,31 @@ inline void DrawRtaoPanel() {
                   100.0 * v[kRtaoStatDepthBase] / dn, 100.0 * v[kRtaoStatDepthBase + 1u] / dn, 100.0 * v[kRtaoStatDepthBase + 2u] / dn,
                   100.0 * v[kRtaoStatDepthBase + 3u] / dn, 100.0 * v[kRtaoStatDepthBase + 4u] / dn, 100.0 * v[kRtaoStatDepthBase + 5u] / dn,
                   100.0 * v[kRtaoStatDepthBase + 6u] / dn);
+      ImGui::Text("Normal dot of the highest-weight tap (valid history, in bounds): <0 %.1f%%, <0.5 %.1f%%, <0.7 %.1f%%, <0.9 %.1f%%, <0.97 %.1f%%, >=0.97 %.1f%%",
+                  100.0 * v[kRtaoStatNormalBase] / dn, 100.0 * v[kRtaoStatNormalBase + 1u] / dn, 100.0 * v[kRtaoStatNormalBase + 2u] / dn,
+                  100.0 * v[kRtaoStatNormalBase + 3u] / dn, 100.0 * v[kRtaoStatNormalBase + 4u] / dn, 100.0 * v[kRtaoStatNormalBase + 5u] / dn);
       if (v[kRtaoStatRawBase + 1u] > 0u) {
         const double rn = static_cast<double>(v[kRtaoStatRawBase + 1u]);
         ImGui::Text("Frame-to-frame raw AO (history valid): mean |raw - previous raw| %.3f, identical %.1f%% (independent binary raw at p 0.217 gives about 0.34)",
                     v[kRtaoStatRawBase] / 1000.0 / rn, 100.0 * v[kRtaoStatRawBase + 2u] / rn);
+      }
+      const uint32_t* qv = &v[kRtaoStatQualityBase];
+      ImGui::SeparatorText("Output quality (still camera only)");
+      ImGui::SameLine();
+      ImGui::TextDisabled("(?)");
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("These numbers compare this frame with the previous one at the same pixel. They are meaningful only when the camera and the scene are still (motion 0). With motion, the previous output is not aligned to the pixels and the roughness and change values include real movement.");
+      }
+      ImGui::Text("Mean AO: raw %.4f, output %.4f, raw - output %+.4f (positive = the temporal output is darker than raw)",
+                  MeanFromSum(qv[1], den.traced), MeanFromSum(qv[0], den.traced), MeanFromSum(qv[1], den.traced) - MeanFromSum(qv[0], den.traced));
+      if (qv[2] > 0u) {
+        ImGui::Text("Spatial roughness (mean |pixel - mean of its 4 neighbours|, lower = smoother): raw %.4f, previous output %.4f, ratio %.2f",
+                    MeanFromSum(qv[3], qv[2]), MeanFromSum(qv[4], qv[2]),
+                    MeanFromSum(qv[3], qv[2]) > 0.0 ? MeanFromSum(qv[4], qv[2]) / MeanFromSum(qv[3], qv[2]) : 0.0);
+      }
+      if (qv[5] > 0u) {
+        ImGui::Text("Output change per frame (mean |output - previous output|): %.4f over %u pixels; raw changes by %.4f (see the raw difference above)",
+                    MeanFromSum(qv[6], qv[5]), qv[5], MeanFromSum(v[kRtaoStatRawBase], v[kRtaoStatRawBase + 1u]));
       }
     }
     ImGui::Text("Per traced pixel: out of bounds %.1f%%, reset %.1f%% (neutral pixels removed)",

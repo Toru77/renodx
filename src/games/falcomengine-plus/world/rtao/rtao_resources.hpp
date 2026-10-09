@@ -23,10 +23,16 @@ inline constexpr uint32_t kRtaoUavCount = 3u;
 inline constexpr uint32_t kRtaoPushRegister = 12u;
 inline constexpr uint32_t kRtaoPushConstantCount = 20u;
 // Stats buffer: pass A indices 0..9 (RTAO_STAT_COUNT in world_rtao.cs_5_0.hlsl), pass B 10..15 (RTAO_TSTAT_*), discovery 16..23, pass B diagnostics 24..31 (RTAO_FSTAT_* in world_rtao_temporal.cs_5_0.hlsl).
-inline constexpr uint32_t kRtaoStatsCount = 55u;
+inline constexpr uint32_t kRtaoStatsCount = 68u;
 // P0-B2 frame-to-frame raw difference, indices 52..54: sum |raw - previous raw| (x1000), pair count, count below 0.01.
 inline constexpr uint32_t kRtaoStatRawBase = 52u;
 inline constexpr uint32_t kRtaoStatRawCount = 3u;
+// P0-B output quality (diagnostic, valid on a still camera only), indices 55..61: sums x1000, pair counts (see RTAO_QSTAT_* in the pass B shader).
+inline constexpr uint32_t kRtaoStatQualityBase = 55u;
+inline constexpr uint32_t kRtaoStatQualityCount = 7u;
+// P0-C normal-dot histogram of the highest-weight tap (valid history, in bounds), indices 62..67: dot <0, <0.5, <0.7, <0.9, <0.97, >=0.97.
+inline constexpr uint32_t kRtaoStatNormalBase = 62u;
+inline constexpr uint32_t kRtaoStatNormalCount = 6u;
 // P0-B depth-ratio histogram of the highest-weight history tap, indices 45..51 (invalid, <0.1%, <0.5%, <1%, <2%, <5%, >=5%).
 inline constexpr uint32_t kRtaoStatDepthBase = 45u;
 inline constexpr uint32_t kRtaoStatDepthCount = 7u;

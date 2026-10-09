@@ -283,7 +283,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.9f,
       .label = "Normal Rejection",
       .section = "Temporal Accumulation",
-      .tooltip = "Minimum dot product between history and current normals (0 to 1).",
+      .tooltip = "History taps whose normal agrees with the current pixel (dot product) at or above this value count fully; below it their weight falls linearly to zero over a 0.4 range (default 0.9: full at 0.9, zero at 0.5). 0 accepts everything facing the same way.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",

@@ -26,6 +26,8 @@
 //   - the barrier and the push nulls on a real D3D11 device (the mock models the slots only).
 //
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <sstream>
 #include <cstdlib>
 #include <array>
@@ -35,6 +37,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <random>
 #include <vector>
 
 #define __world_rtao_EMBED_FILE
@@ -162,7 +165,7 @@ static void TestPushLayout() {
   CHECK(offsetof(rtao::RtaoPushConstants, fade) == 32u, "c2 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, region) == 48u, "c3 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, size) == 64u, "c4 offset");
-  CHECK(rtao::kRtaoStatsCount == 55u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
+  CHECK(rtao::kRtaoStatsCount == 68u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
   CHECK(rtao::kRtaoSrvCount == 19u && rtao::kRtaoUavCount == 3u && rtao::kRtaoPushRegister == 12u, "table sizes");
   CHECK(sizeof(rtao::RtaoTemporalPushConstants) == 20u * sizeof(float), "pass B b12 size");
   CHECK(offsetof(rtao::RtaoTemporalPushConstants, texel) == 16u && offsetof(rtao::RtaoTemporalPushConstants, size) == 32u, "pass B offsets");
@@ -570,7 +573,7 @@ static void TestParameterSnapshot() {
 
 // ---- Two-Sided discovery index (rtao_state.hpp TwoSidedDiscoveryIndex; shader: back*4 + toward*2 + alpha) ----
 static void TestTwoSidedIndex() {
-  CHECK(rtao::kRtaoStatsCount == 55u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
+  CHECK(rtao::kRtaoStatsCount == 68u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
   CHECK(rtao::kRtaoStatTemporalFBase == 24u && rtao::kRtaoStatTemporalFCount == 16u, "pass B diagnostics layout");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, false) == 0u, "front away opaque is 0");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, true) == 1u, "front away alpha is 1");
@@ -771,7 +774,7 @@ static void TestNoiseSample() {
 
 // REAL: the layout constants (the stat index is FBase + 8 = 32, and the name table).
 static void TestTexelDiffersLayout() {
-  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 55u, "texel_differs at index 32 of 33");
+  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 68u, "texel_differs at index 32 of 33");
   CHECK(std::string(rtao::kTemporalDiagnosticNames[8]) == "texel_differs", "texel_differs name");
   std::printf("texel_differs layout (real constants)\n");
 }
@@ -857,6 +860,11 @@ static void TestHlslSources() {
       {"RTAO_WSTAT_BASE", rtao::kRtaoStatWeightBase}, {"RTAO_WSTAT_COUNT", rtao::kRtaoStatWeightCount},
       {"RTAO_DSTAT_BASE", rtao::kRtaoStatDepthBase}, {"RTAO_DSTAT_COUNT", rtao::kRtaoStatDepthCount},
       {"RTAO_RSTAT_BASE", rtao::kRtaoStatRawBase}, {"RTAO_RSTAT_COUNT", rtao::kRtaoStatRawCount},
+      {"RTAO_QSTAT_BASE", rtao::kRtaoStatQualityBase}, {"RTAO_QSTAT_COUNT", rtao::kRtaoStatQualityCount},
+      {"RTAO_QSTAT_AO_SUM", 0}, {"RTAO_QSTAT_RAW_SUM", 1}, {"RTAO_QSTAT_ROUGH_PAIRS", 2},
+      {"RTAO_QSTAT_ROUGH_RAW_SUM", 3}, {"RTAO_QSTAT_ROUGH_PREV_SUM", 4}, {"RTAO_QSTAT_CHANGE_PAIRS", 5},
+      {"RTAO_QSTAT_CHANGE_SUM", 6},
+      {"RTAO_NSTAT_BASE", rtao::kRtaoStatNormalBase}, {"RTAO_NSTAT_COUNT", rtao::kRtaoStatNormalCount},
   };
   for (const Pair& pr : pairs) {
     long value = -1;
@@ -1024,6 +1032,434 @@ static void TestRawDifference() {
   std::printf("raw difference: %d pairs, independent mean %.4f (transcription)\n", n, mean_independent);
 }
 
+// ---- Step A: world_rtao.json is valid JSON and the root keys are top level. REAL: rtao::BuildRtaoJson. The JSON
+// validator below is a recursive-descent parser written for this test (objects, arrays, strings with escapes,
+// numbers with sign, fraction and exponent, true, false, null; any malformed or trailing content fails). ----
+struct JNode {
+  enum class Kind { Null, Bool, Number, String, Array, Object };
+  Kind kind = Kind::Null;
+  std::string text;
+  std::vector<std::string> keys;  // object keys, in order
+  std::vector<JNode> items;       // array items, or object values in key order
+};
+struct JsonParser {
+  const std::string& s;
+  size_t i = 0;
+  explicit JsonParser(const std::string& text) : s(text) {}
+  void Ws() {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+  }
+  bool Lit(const char* w) {
+    const size_t n = std::strlen(w);
+    if (s.compare(i, n, w) == 0) { i += n; return true; }
+    return false;
+  }
+  bool Str(std::string* out) {
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    while (i < s.size()) {
+      const char c = s[i++];
+      if (c == '"') return true;
+      if (static_cast<unsigned char>(c) < 0x20) return false;
+      if (c == '\\') {
+        if (i >= s.size()) return false;
+        const char e = s[i++];
+        if (e == 'u') {
+          for (int k = 0; k < 4; ++k) {
+            if (i >= s.size() || !std::isxdigit(static_cast<unsigned char>(s[i]))) return false;
+            ++i;
+          }
+        } else if (e == '\0' || std::strchr("\"\\/bfnrt", e) == nullptr) {
+          return false;
+        }
+        if (out) out->push_back('?');
+      } else if (out) {
+        out->push_back(c);
+      }
+    }
+    return false;
+  }
+  bool Digits() {
+    const size_t st = i;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+    return i > st;
+  }
+  bool Num() {
+    if (i < s.size() && s[i] == '-') ++i;
+    if (i < s.size() && s[i] == '0') ++i;
+    else if (!Digits()) return false;
+    if (i < s.size() && s[i] == '.') { ++i; if (!Digits()) return false; }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+      ++i;
+      if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+      if (!Digits()) return false;
+    }
+    return true;
+  }
+  bool Value(JNode* n) {
+    Ws();
+    if (i >= s.size()) return false;
+    const char c = s[i];
+    if (c == '{') {
+      ++i;
+      n->kind = JNode::Kind::Object;
+      Ws();
+      if (i < s.size() && s[i] == '}') { ++i; return true; }
+      while (true) {
+        Ws();
+        std::string key;
+        if (!Str(&key)) return false;
+        Ws();
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i;
+        JNode child;
+        if (!Value(&child)) return false;
+        n->keys.push_back(key);
+        n->items.push_back(child);
+        Ws();
+        if (i < s.size() && s[i] == ',') { ++i; continue; }
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        return false;
+      }
+    }
+    if (c == '[') {
+      ++i;
+      n->kind = JNode::Kind::Array;
+      Ws();
+      if (i < s.size() && s[i] == ']') { ++i; return true; }
+      while (true) {
+        JNode child;
+        if (!Value(&child)) return false;
+        n->items.push_back(child);
+        Ws();
+        if (i < s.size() && s[i] == ',') { ++i; continue; }
+        if (i < s.size() && s[i] == ']') { ++i; return true; }
+        return false;
+      }
+    }
+    if (c == '"') {
+      n->kind = JNode::Kind::String;
+      return Str(&n->text);
+    }
+    if (Lit("true")) { n->kind = JNode::Kind::Bool; n->text = "true"; return true; }
+    if (Lit("false")) { n->kind = JNode::Kind::Bool; n->text = "false"; return true; }
+    if (Lit("null")) { n->kind = JNode::Kind::Null; return true; }
+    n->kind = JNode::Kind::Number;
+    const size_t st = i;
+    if (!Num()) return false;
+    n->text = s.substr(st, i - st);
+    return true;
+  }
+  bool Parse(JNode* root) {
+    if (!Value(root)) return false;
+    Ws();
+    return i == s.size();
+  }
+};
+static const JNode* Member(const JNode& obj, const char* key) {
+  if (obj.kind != JNode::Kind::Object) return nullptr;
+  for (size_t k = 0; k < obj.keys.size(); ++k) {
+    if (obj.keys[k] == key) return &obj.items[k];
+  }
+  return nullptr;
+}
+static std::string WorldJsonForState(int which) {
+  static rtao::RtaoFrameState f;
+  f = rtao::RtaoFrameState{};
+  static uint32_t values[rtao::kRtaoStatsCount];
+  std::memset(values, 0, sizeof(values));
+  rtao::RtaoJsonInput in = {};
+  in.frame = &f;
+  in.values = values;
+  in.generated_frame = 42u;
+  if (which >= 1) {
+    f.temporal_ran = true;
+    f.reset = rtao::ResetReason::Parameters;
+    f.last_reset = rtao::ResetReason::FrameGap;
+    f.dispatched_frame = 40u;
+    f.captured.samples = 2.f;
+    f.captured.history_weight = 0.9f;
+    values[rtao::kRtaoStatTemporalBase] = 1000u;
+    values[rtao::kRtaoStatTemporalFBase] = 7u;
+    in.temporal_on = true;
+    in.zero_motion = true;
+    in.camera_matrix = true;
+    in.freeze_noise = true;
+  }
+  if (which == 2) {
+    for (size_t r = 0; r < rtao::kReasonCount; ++r) f.frames_without_ao_by_reason[r] = static_cast<uint64_t>(r + 1u);
+    for (size_t r = 0; r < static_cast<size_t>(rtao::ResetReason::Count); ++r) f.reset_counts[r] = static_cast<uint64_t>(r + 1u);
+    for (uint32_t cull = 0u; cull < 4u; ++cull) for (uint32_t ccw = 0u; ccw < 2u; ++ccw) in.cpu_draws[cull][ccw] = 3u;
+  }
+  return rtao::BuildRtaoJson(in);
+}
+static void CheckWorldJson(const char* name, const std::string& text) {
+  JNode root;
+  JsonParser parser(text);
+  CHECK(parser.Parse(&root), "%s: world_rtao.json parses as JSON (recursive-descent check)", name);
+  CHECK(root.kind == JNode::Kind::Object, "%s: root is an object", name);
+  static const char* const root_keys[] = {"schema", "generated_frame", "reason", "producing", "gpu_ms", "texture_bytes",
+                                          "frames_without_ao", "fade", "stats", "temporal", "two_sided_discovery",
+                                          "temporal_diagnostics", "test_modes", "note"};
+  for (const char* key : root_keys) CHECK(Member(root, key) != nullptr, "%s: root key %s is top level", name, key);
+  const JNode* schema = Member(root, "schema");
+  CHECK(schema && schema->text == "2", "%s: schema is 2", name);
+  const JNode* temporal = Member(root, "temporal");
+  CHECK(temporal && temporal->kind == JNode::Kind::Object && !temporal->keys.empty() && temporal->keys.back() == "reset_counts",
+        "%s: temporal is an object whose last key is reset_counts", name);
+  for (const char* key : {"test_modes", "two_sided_discovery", "temporal_diagnostics", "note"}) {
+    CHECK(temporal && Member(*temporal, key) == nullptr, "%s: %s is not inside temporal", name, key);
+  }
+}
+static void TestWorldJson() {
+  CheckWorldJson("default state", WorldJsonForState(0));
+  CheckWorldJson("temporal on, test rows on", WorldJsonForState(1));
+  CheckWorldJson("every reason count non-zero", WorldJsonForState(2));
+  // The validator rejects malformed text (self-test).
+  JNode bad;
+  JsonParser trailing("{\"a\": 1} x");
+  CHECK(!trailing.Parse(&bad), "validator self-test: trailing content fails");
+  JNode nan_node;
+  JsonParser nan_text("{\"a\": nan}");
+  CHECK(!nan_text.Parse(&nan_node), "validator self-test: nan is not a JSON number");
+  std::printf("world_rtao.json: 3 states, root keys, temporal closed, validator self-test (real builder, text parser)\n");
+}
+
+// ---- Step B: output quality. TRANSCRIPTION: the roughness operator and the sums (same neighbours, validity and
+// conditions as the HLSL, on small arrays). REAL: rtao::MeanFromSum, rtao::kQualityStatNames, the "quality" JSON key. ----
+struct QualityField {
+  int w = 0;
+  int h = 0;
+  std::vector<float> v;
+  std::vector<bool> valid;
+};
+static QualityField MakeQualityField(int w, int h, const std::vector<float>& v) {
+  QualityField f;
+  f.w = w;
+  f.h = h;
+  f.v = v;
+  f.valid.assign(v.size(), true);
+  return f;
+}
+static float QualityRoughT(const QualityField& f, int x, int y, float centre, bool* defined) {
+  const int dx[4] = {-1, 1, 0, 0};
+  const int dy[4] = {0, 0, -1, 1};
+  float sum = 0.f;
+  float n = 0.f;
+  for (int k = 0; k < 4; ++k) {
+    const int qx = x + dx[k];
+    const int qy = y + dy[k];
+    if (qx < 0 || qy < 0 || qx >= f.w || qy >= f.h) continue;
+    const size_t i = static_cast<size_t>(qy * f.w + qx);
+    if (!f.valid[i]) continue;
+    sum += f.v[i];
+    n += 1.f;
+  }
+  *defined = n > 0.f;
+  return *defined ? std::fabs(centre - sum / n) : 0.f;
+}
+static void TestOutputQuality() {
+  bool defined = false;
+  // Constant field: roughness 0 everywhere.
+  const QualityField flat = MakeQualityField(4, 4, std::vector<float>(16, 0.5f));
+  bool flat_ok = true;
+  for (int y = 0; y < 4; ++y) {
+    for (int x = 0; x < 4; ++x) {
+      const float r = QualityRoughT(flat, x, y, 0.5f, &defined);
+      if (!defined || r != 0.f) flat_ok = false;
+    }
+  }
+  CHECK(flat_ok, "output quality (transcription): a constant field has roughness 0");
+  // Checkerboard 0 and 1 on 4x4: every interior pixel differs from all four neighbours, roughness 1.
+  std::vector<float> cb(16, 0.f);
+  for (int y = 0; y < 4; ++y) {
+    for (int x = 0; x < 4; ++x) cb[static_cast<size_t>(y * 4 + x)] = ((x + y) & 1) ? 1.f : 0.f;
+  }
+  const QualityField board = MakeQualityField(4, 4, cb);
+  bool board_ok = true;
+  for (int y = 1; y <= 2; ++y) {
+    for (int x = 1; x <= 2; ++x) {
+      const float r = QualityRoughT(board, x, y, cb[static_cast<size_t>(y * 4 + x)], &defined);
+      if (!defined || r != 1.f) board_ok = false;
+    }
+  }
+  CHECK(board_ok, "output quality (transcription): checkerboard interior roughness is 1");
+  // One outlier: 3x3 zeros with a 1 in the centre. Centre roughness 1; pixel (0,1) has neighbours 1, 0, 0 (right, up, down): 1/3.
+  const QualityField outlier = MakeQualityField(3, 3, {0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f});
+  const float r_centre = QualityRoughT(outlier, 1, 1, 1.f, &defined);
+  CHECK(defined && r_centre == 1.f, "output quality (transcription): outlier centre roughness is 1 (got %f)", r_centre);
+  const float r_side = QualityRoughT(outlier, 0, 1, 0.f, &defined);
+  CHECK(defined && std::fabs(r_side - 1.f / 3.f) < 1e-6f, "output quality (transcription): pixel beside the outlier is 1/3 (got %f)", r_side);
+  // Border: the corner of a 2x2 field uses only its right and down neighbours: |0.2 - (0.6 + 0.4) / 2| = 0.3.
+  const QualityField corner = MakeQualityField(2, 2, {0.2f, 0.6f, 0.4f, 0.9f});
+  const float r_corner = QualityRoughT(corner, 0, 0, 0.2f, &defined);
+  CHECK(defined && std::fabs(r_corner - 0.3f) < 1e-6f, "output quality (transcription): corner uses only valid neighbours (got %f)", r_corner);
+  // Undefined: no neighbour at all (1x1), and both neighbours invalid.
+  const QualityField lone = MakeQualityField(1, 1, {0.5f});
+  QualityRoughT(lone, 0, 0, 0.5f, &defined);
+  CHECK(!defined, "output quality (transcription): a pixel with no neighbour is not defined");
+  QualityField gap = MakeQualityField(3, 1, {0.f, 0.5f, 1.f});
+  gap.valid[0] = false;
+  gap.valid[2] = false;
+  QualityRoughT(gap, 1, 0, 0.5f, &defined);
+  CHECK(!defined, "output quality (transcription): a pixel with only invalid neighbours is not defined");
+  // Sums on a 2-pixel frame (binary-exact values). px0: raw 0.75, ao 0.5, previous output 0.25 (valid).
+  // px1: raw 0.25, ao 0.5, previous output invalid. Expected: ao 1000, raw 1000, change pairs 1, change sum 250, rough pairs 0.
+  const QualityField raw_f = MakeQualityField(2, 1, {0.75f, 0.25f});
+  QualityField prev_f = MakeQualityField(2, 1, {0.25f, 0.f});
+  prev_f.valid[1] = false;
+  const float ao_px[2] = {0.5f, 0.5f};
+  uint32_t ao_sum = 0u, raw_sum = 0u, change_pairs = 0u, change_sum = 0u, rough_pairs = 0u;
+  for (int i = 0; i < 2; ++i) {
+    ao_sum += static_cast<uint32_t>(ao_px[i] * 1000.f);
+    raw_sum += static_cast<uint32_t>(raw_f.v[i] * 1000.f);
+    if (prev_f.valid[i]) {
+      change_pairs += 1u;
+      change_sum += static_cast<uint32_t>(std::fabs(ao_px[i] - prev_f.v[i]) * 1000.f);
+      bool raw_def = false;
+      bool prev_def = false;
+      QualityRoughT(raw_f, i, 0, raw_f.v[i], &raw_def);
+      QualityRoughT(prev_f, i, 0, prev_f.v[i], &prev_def);
+      if (raw_def && prev_def) rough_pairs += 1u;
+    }
+  }
+  CHECK(ao_sum == 1000u && raw_sum == 1000u && change_pairs == 1u && change_sum == 250u && rough_pairs == 0u,
+        "output quality (transcription): sums ao %u raw %u change %u/%u rough %u", ao_sum, raw_sum, change_pairs, change_sum, rough_pairs);
+  // Real: MeanFromSum (zero guard, x1000 scale).
+  CHECK(rtao::MeanFromSum(0u, 0u) == 0.0, "MeanFromSum: count 0 gives 0");
+  CHECK(rtao::MeanFromSum(3000u, 3u) == 1.0 && rtao::MeanFromSum(1000u, 4u) == 0.25, "MeanFromSum: sum x1000 over count");
+  // Real: name table order.
+  static const char* const names[7] = {"ao_sum", "raw_sum", "rough_pairs", "rough_raw_sum", "rough_prev_out_sum", "change_pairs", "change_sum"};
+  bool names_ok = true;
+  for (size_t i = 0; i < 7u; ++i) names_ok = names_ok && std::strcmp(rtao::kQualityStatNames[i], names[i]) == 0;
+  CHECK(names_ok, "quality name table is in index order");
+  // Real: the JSON "quality" key inside temporal_diagnostics, at depth 2.
+  JNode root;
+  const std::string quality_text = WorldJsonForState(1);
+  JsonParser parser(quality_text);
+  CHECK(parser.Parse(&root), "quality: world_rtao.json parses");
+  const JNode* diag = Member(root, "temporal_diagnostics");
+  const JNode* quality = diag ? Member(*diag, "quality") : nullptr;
+  static const char* const quality_keys[] = {"mean_raw", "mean_output", "raw_minus_output", "roughness_raw",
+                                             "roughness_previous_output", "roughness_ratio", "roughness_pixels",
+                                             "output_change_mean", "output_change_pixels", "note"};
+  bool keys_ok = quality && quality->kind == JNode::Kind::Object && quality->keys.size() == 10u;
+  for (size_t i = 0; keys_ok && i < 10u; ++i) keys_ok = quality->keys[i] == quality_keys[i];
+  CHECK(keys_ok, "quality: temporal_diagnostics.quality has the ten keys in order");
+  std::printf("output quality: roughness and sums are transcriptions; MeanFromSum, names and the JSON key are real\n");
+}
+
+// ---- Step C: soft normal weight. TRANSCRIPTION: the ramp and the tap bookkeeping (same arithmetic as the HLSL, with
+// the depth test kept hard). REAL: rtao::kNormalRampWidth, the layout and the guard pairs of the new stats. ----
+static float NormalRampT(float dot, float threshold) {
+  return std::fmin(std::fmax((dot - (threshold - rtao::kNormalRampWidth)) / rtao::kNormalRampWidth, 0.f), 1.f);
+}
+struct SoftBlend {
+  float ao;
+  float valid_fraction;
+  float accepted;          // sum of w * wn
+  float rejected_normal;   // sum of w * (1 - wn)
+  uint32_t unweighted_rejected;  // taps with wn == 0
+  uint32_t valid_taps;     // taps with wn > 0
+};
+// hard = true replaces the ramp with the old step function (dot >= T gives 1, otherwise 0).
+static SoftBlend SoftTemporalBlend(float raw, const Tap taps[4], float dist_cur, float history_weight, float depth_rejection,
+                                   float normal_rejection, bool hard) {
+  float weight_total = 0.f, weight_accepted = 0.f, history_sum = 0.f, rejected_normal = 0.f;
+  uint32_t unweighted_rejected = 0u, valid_taps = 0u;
+  for (int i = 0; i < 4; ++i) {
+    weight_total += taps[i].w;
+    if (!taps[i].has_history) continue;
+    const bool depth_ok = std::fabs(taps[i].dist - dist_cur) / std::fmax(dist_cur, 1e-4f) <= depth_rejection;
+    if (!depth_ok) continue;
+    const float wn = hard ? (taps[i].dot >= normal_rejection ? 1.f : 0.f) : NormalRampT(taps[i].dot, normal_rejection);
+    if (wn == 0.f) unweighted_rejected += 1u;
+    else valid_taps += 1u;
+    rejected_normal += taps[i].w * (1.f - wn);
+    weight_accepted += taps[i].w * wn;
+    history_sum += taps[i].w * wn * taps[i].ao;
+  }
+  const float valid_fraction = (weight_total > 0.f && weight_accepted > 1e-4f)
+      ? std::fmin(std::fmax(weight_accepted / weight_total, 0.f), 1.f) : 0.f;
+  const float history_ao = valid_fraction > 0.f ? history_sum / weight_accepted : raw;
+  const float alpha = history_weight * valid_fraction;
+  return {raw + (history_ao - raw) * alpha, valid_fraction, weight_accepted, rejected_normal, unweighted_rejected, valid_taps};
+}
+static void TestNormalRamp() {
+  // Real constants and layout.
+  CHECK(rtao::kNormalRampWidth == 0.4f, "soft normal ramp width is 0.4");
+  CHECK(rtao::kRtaoStatNormalBase == 62u && rtao::kRtaoStatNormalCount == 6u && rtao::kRtaoStatsCount == 68u,
+        "normal-dot histogram at 62..67, stats count 68");
+  CHECK(rtao::kRtaoStatNormalBase == rtao::kRtaoStatQualityBase + rtao::kRtaoStatQualityCount, "normal-dot histogram follows the quality block");
+  // Ramp values at several thresholds (transcription).
+  CHECK(std::fabs(NormalRampT(1.0f, 0.9f) - 1.f) < 1e-6f && std::fabs(NormalRampT(0.9f, 0.9f) - 1.f) < 1e-6f, "ramp T=0.9: full at 1.0 and 0.9");
+  CHECK(std::fabs(NormalRampT(0.7f, 0.9f) - 0.5f) < 1e-5f, "ramp T=0.9: 0.5 at 0.7");
+  CHECK(NormalRampT(0.5f, 0.9f) < 1e-5f && NormalRampT(0.3f, 0.9f) == 0.f, "ramp T=0.9: zero at 0.5 and below");
+  CHECK(NormalRampT(0.5f, 0.5f) == 1.f && std::fabs(NormalRampT(0.3f, 0.5f) - 0.5f) < 1e-5f && NormalRampT(0.1f, 0.5f) < 1e-5f,
+        "ramp T=0.5: 1 at 0.5, 0.5 at 0.3, 0 at 0.1");
+  CHECK(NormalRampT(0.f, 0.f) == 1.f && std::fabs(NormalRampT(-0.2f, 0.f) - 0.5f) < 1e-5f && NormalRampT(-0.4f, 0.f) == 0.f,
+        "ramp T=0: 1 at 0, 0.5 at -0.2, 0 at -0.4");
+  bool monotonic = true;
+  float previous = -1.f;
+  for (int i = -20; i <= 20; ++i) {
+    const float wn = NormalRampT(static_cast<float>(i) / 20.f, 0.9f);
+    if (wn < previous) monotonic = false;
+    previous = wn;
+  }
+  CHECK(monotonic, "ramp is monotonic in the dot product");
+  // Tap bookkeeping, hand-computed: T 0.9, four taps with equal weight 0.25 and depth accepted.
+  // Taps: dot 1.0 (wn 1, ao 0.8), dot 0.7 (wn 0.5, ao 0.4), dot 0.3 (wn 0, ao 0.2), dot 0.45 (wn 0, ao 0.6).
+  // accepted = 0.25 + 0.125 = 0.375; history = 0.2 + 0.05 = 0.25; valid fraction 0.375; history ao = 0.25 / 0.375.
+  // rejected by normal = 0.125 + 0.25 + 0.25 = 0.625; accepted + rejected = total weight (other 0%); unweighted rejected 2, valid taps 2.
+  const Tap book[4] = {{0.25f, true, 0.8f, 5.f, 1.f}, {0.25f, true, 0.4f, 5.f, 0.7f}, {0.25f, true, 0.2f, 5.f, 0.3f}, {0.25f, true, 0.6f, 5.f, 0.45f}};
+  const SoftBlend sb = SoftTemporalBlend(0.5f, book, 5.f, 0.9f, 0.1f, 0.9f, false);
+  CHECK(std::fabs(sb.accepted - 0.375f) < 1e-5f && std::fabs(sb.valid_fraction - 0.375f) < 1e-5f,
+        "bookkeeping: accepted and valid fraction 0.375 (got %f, %f)", sb.accepted, sb.valid_fraction);
+  CHECK(std::fabs(sb.rejected_normal - 0.625f) < 1e-5f && std::fabs(sb.accepted + sb.rejected_normal - 1.f) < 1e-5f,
+        "bookkeeping: rejected by normal 0.625, shares sum to 100%% (got %f)", sb.rejected_normal);
+  CHECK(sb.unweighted_rejected == 2u && sb.valid_taps == 2u, "bookkeeping: 2 taps with wn 0, 2 valid taps (got %u, %u)", sb.unweighted_rejected, sb.valid_taps);
+  const float expected_ao = 0.5f + (0.25f / 0.375f - 0.5f) * (0.9f * 0.375f);
+  CHECK(std::fabs(sb.ao - expected_ao) < 1e-5f, "bookkeeping: blended AO %f (expected %f)", sb.ao, expected_ao);
+  // Property: for one centre tap, the soft no-history share (wn == 0, dot <= T - 0.4) is never above the hard one (dot < T).
+  std::mt19937 rng(1234u);
+  std::uniform_real_distribution<float> dot_dist(-1.f, 1.f);
+  bool property_ok = true;
+  int soft_none = 0, hard_none = 0;
+  for (int threshold_index = 0; threshold_index < 2; ++threshold_index) {
+    const float threshold = threshold_index == 0 ? 0.5f : 0.9f;
+    soft_none = 0;
+    hard_none = 0;
+    for (int i = 0; i < 10000; ++i) {
+      const float d = dot_dist(rng);
+      if (NormalRampT(d, threshold) == 0.f) soft_none += 1;
+      if (d < threshold) hard_none += 1;
+    }
+    if (soft_none > hard_none) property_ok = false;
+    std::printf("soft normal property T=%.1f: no-history soft %d, hard %d of 10000 (uniform dots)\n", threshold, soft_none, hard_none);
+  }
+  CHECK(property_ok, "property: soft no-history share is not above the hard share");
+  // Regression: with the ramp replaced by the old step, the bookkeeping reproduces the old hard blend (no clamp).
+  std::mt19937 rng2(777u);
+  std::uniform_real_distribution<float> unit(0.f, 1.f);
+  const float flat[9] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  bool regression_ok = true;
+  for (int trial = 0; trial < 500; ++trial) {
+    Tap random_taps[4];
+    for (int i = 0; i < 4; ++i) {
+      random_taps[i] = {unit(rng2), unit(rng2) > 0.2f, unit(rng2), 5.f, unit(rng2) * 2.f - 1.f};
+    }
+    const float raw = unit(rng2);
+    const float threshold = unit(rng2);
+    const BlendResult old_result = TemporalBlend(raw, random_taps, 5.f, 0.9f, 0.1f, threshold, 0.f, flat, true);
+    const SoftBlend hard_result = SoftTemporalBlend(raw, random_taps, 5.f, 0.9f, 0.1f, threshold, true);
+    if (std::fabs(old_result.ao - hard_result.ao) > 1e-5f || std::fabs(old_result.valid_fraction - hard_result.valid_fraction) > 1e-6f) {
+      regression_ok = false;
+    }
+  }
+  CHECK(regression_ok, "regression: the step-function bookkeeping reproduces the old hard blend in 500 random cases");
+  std::printf("normal ramp: ramp values, bookkeeping (hand-computed), property, regression (transcriptions); layout and guard real\n");
+}
+
 int main() {
   HStage("gate table");
   TestGateTable();
@@ -1060,6 +1496,9 @@ int main() {
   TestDebugScale7();
   TestDepthRatioBin();
   TestRawDifference();
+  TestWorldJson();
+  TestOutputQuality();
+  TestNormalRamp();
   HStage("temporal dispatch (mock)");
   TestTemporalDispatch();
   HStage("device lifecycle (mock)");

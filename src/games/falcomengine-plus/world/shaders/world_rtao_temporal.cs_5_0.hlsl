@@ -58,6 +58,19 @@ cbuffer cb_rtao_temporal : register(b12)
 // P0-B2 frame-to-frame raw difference: sum |raw - previous raw| (x1000), pair count, count below 0.01.
 #define RTAO_RSTAT_BASE 52u
 #define RTAO_RSTAT_COUNT 3u
+#define RTAO_QSTAT_BASE 55u
+#define RTAO_QSTAT_COUNT 7u
+#define RTAO_QSTAT_AO_SUM 0u
+#define RTAO_QSTAT_RAW_SUM 1u
+#define RTAO_QSTAT_ROUGH_PAIRS 2u
+#define RTAO_QSTAT_ROUGH_RAW_SUM 3u
+#define RTAO_QSTAT_ROUGH_PREV_SUM 4u
+#define RTAO_QSTAT_CHANGE_PAIRS 5u
+#define RTAO_QSTAT_CHANGE_SUM 6u
+#define RTAO_NSTAT_BASE 62u
+#define RTAO_NSTAT_COUNT 6u
+// Soft normal weight: a history tap counts fully at dot >= the Normal Rejection value and falls linearly to 0 over this width.
+static const float kNormalRampWidth = 0.4;
 
 // Round 2 diagnostics (F1), no effect on the output. Sums are scaled: motion in 1/100 px, shifts and alpha and
 // differences in 1/1000.
@@ -85,6 +98,8 @@ groupshared uint gs_fstats[RTAO_FSTAT_COUNT];
 groupshared uint gs_wstats[RTAO_WSTAT_COUNT];
 groupshared uint gs_dstats[RTAO_DSTAT_COUNT];
 groupshared uint gs_rstats[RTAO_RSTAT_COUNT];
+groupshared uint gs_qstats[RTAO_QSTAT_COUNT];
+groupshared uint gs_nstats[RTAO_NSTAT_COUNT];
 
 // Octahedral normal encoding for the history (BA channels).
 float2 OctEncode(float3 n)
@@ -99,6 +114,42 @@ float3 OctDecode(float2 e)
     float3 v = float3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
     if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * sign(v.xy);
     return normalize(v);
+}
+
+// Output quality (diagnostic): one field at q. Raw AO is valid when traced (>= 0); the previous output when its history is valid (.g > 0).
+float QualityValue(int2 q, bool prev, out bool valid)
+{
+    if (prev)
+    {
+        const float4 h = g_history_read.Load(int3(q, 0));
+        valid = h.g > 0.0;
+        return h.r;
+    }
+    const float v = g_raw_ao[q];
+    valid = v >= 0.0;
+    return v;
+}
+
+// |centre - mean of the valid left, right, up and down neighbours| (no diagonals, no edge clamp). defined is false when none is valid.
+float QualityRoughness(int2 px, float centre, bool prev, out bool defined)
+{
+    static const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    const int2 limit = int2(g_t_size.xy);
+    float sum = 0.0;
+    float n = 0.0;
+    [unroll]
+    for (int k = 0; k < 4; ++k)
+    {
+        const int2 q = px + offsets[k];
+        if (any(q < 0) || any(q >= limit)) continue;
+        bool valid = false;
+        const float v = QualityValue(q, prev, valid);
+        if (!valid) continue;
+        sum += v;
+        n += 1.0;
+    }
+    defined = n > 0.0;
+    return defined ? abs(centre - sum / n) : 0.0;
 }
 
 void TemporalPixel(uint2 px)
@@ -178,6 +229,7 @@ void TemporalPixel(uint2 px)
     float weight_rejected_normal = 0.0;
     float best_w = -1.0;
     float best_dist = 0.0;
+    float best_dot = 0.0;
     [unroll]
     for (int t = 0; t < 4; ++t)
     {
@@ -187,10 +239,12 @@ void TemporalPixel(uint2 px)
         weight_total += w;
         if (!in_bounds) continue;
         const float4 h = g_history_read.Load(int3(tap, 0));
+        const float tap_dot = dot(OctDecode(h.ba), N);
         if (w > best_w)
         {
             best_w = w;  // highest-weight tap (the first one on a tie)
             best_dist = h.g;
+            best_dot = tap_dot;
         }
         if (h.g <= 0.0) continue;  // invalid history (never written or reset)
         const bool depth_ok = abs(h.g - dist_cur) / max(dist_cur, 1e-4) <= depth_rejection;
@@ -200,16 +254,13 @@ void TemporalPixel(uint2 px)
             weight_rejected_depth += w;
             continue;
         }
-        const bool normal_ok = dot(OctDecode(h.ba), N) >= normal_rejection;
-        if (!normal_ok)
-        {
-            InterlockedAdd(gs_tstats[RTAO_TSTAT_REJECTED_NORMAL], 1u);
-            weight_rejected_normal += w;
-            continue;
-        }
-        weight_accepted += w;
-        history_sum += w * h.r;
-        accepted_taps += 1u;
+        // Soft normal weight (replaces the hard Normal Rejection): wn = saturate((dot - (T - width)) / width); tap weight w * wn.
+        const float wn = saturate((tap_dot - (normal_rejection - kNormalRampWidth)) / kNormalRampWidth);
+        if (wn == 0.0) InterlockedAdd(gs_tstats[RTAO_TSTAT_REJECTED_NORMAL], 1u);
+        else accepted_taps += 1u;
+        weight_rejected_normal += w * (1.0 - wn);
+        weight_accepted += w * wn;
+        history_sum += w * wn * h.r;
     }
     InterlockedAdd(gs_tstats[RTAO_TSTAT_VALID_TAPS], accepted_taps);
     // Weighted shares are counted only on frames where the history is used (reset frames are ignored by the blend).
@@ -226,6 +277,12 @@ void TemporalPixel(uint2 px)
         const uint dbin = !(best_dist > 0.0) ? 0u : (best_ratio < 0.001 ? 1u : (best_ratio < 0.005 ? 2u : (best_ratio < 0.01 ? 3u
             : (best_ratio < 0.02 ? 4u : (best_ratio < 0.05 ? 5u : 6u)))));
         InterlockedAdd(gs_dstats[dbin], 1u);
+    }
+    // Normal-dot bin of the highest-weight tap: the same selection as the depth-ratio bin, valid history only.
+    if (history_valid_frame && in_bounds && best_dist > 0.0)
+    {
+        const uint nbin = best_dot < 0.0 ? 0u : (best_dot < 0.5 ? 1u : (best_dot < 0.7 ? 2u : (best_dot < 0.9 ? 3u : (best_dot < 0.97 ? 4u : 5u))));
+        InterlockedAdd(gs_nstats[nbin], 1u);
     }
 
     // Renormalise; below epsilon the history counts as rejected.
@@ -266,6 +323,26 @@ void TemporalPixel(uint2 px)
     const float ao = lerp(raw, history_ao, alpha);
     InterlockedAdd(gs_fstats[RTAO_FSTAT_ALPHA_SUM], (uint)(alpha * 1000.0));
     InterlockedAdd(gs_fstats[RTAO_FSTAT_ABS_DIFF_SUM], (uint)(abs(raw - ao) * 1000.0));
+    // Output quality (diagnostic; the blend does not use these). Traced pixels: blended AO and raw AO sums.
+    const float4 h_p = g_history_read.Load(int3(px, 0));
+    const bool prev_valid = h_p.g > 0.0;
+    InterlockedAdd(gs_qstats[RTAO_QSTAT_AO_SUM], (uint)(ao * 1000.0));
+    InterlockedAdd(gs_qstats[RTAO_QSTAT_RAW_SUM], (uint)(raw * 1000.0));
+    if (history_valid_frame && prev_valid)
+    {
+        InterlockedAdd(gs_qstats[RTAO_QSTAT_CHANGE_PAIRS], 1u);
+        InterlockedAdd(gs_qstats[RTAO_QSTAT_CHANGE_SUM], (uint)(abs(ao - h_p.r) * 1000.0));
+        bool raw_defined = false;
+        bool prev_defined = false;
+        const float rough_raw = QualityRoughness(px, raw, false, raw_defined);
+        const float rough_prev = QualityRoughness(px, h_p.r, true, prev_defined);
+        if (raw_defined && prev_defined)
+        {
+            InterlockedAdd(gs_qstats[RTAO_QSTAT_ROUGH_PAIRS], 1u);
+            InterlockedAdd(gs_qstats[RTAO_QSTAT_ROUGH_RAW_SUM], (uint)(rough_raw * 1000.0));
+            InterlockedAdd(gs_qstats[RTAO_QSTAT_ROUGH_PREV_SUM], (uint)(rough_prev * 1000.0));
+        }
+    }
     g_history_write[px] = float4(ao, dist_cur, OctEncode(N));
 
     // Debug modes write the chosen value as the texel (history is written normally above).
@@ -292,6 +369,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     if (group_index < RTAO_WSTAT_COUNT) gs_wstats[group_index] = 0u;
     if (group_index < RTAO_DSTAT_COUNT) gs_dstats[group_index] = 0u;
     if (group_index < RTAO_RSTAT_COUNT) gs_rstats[group_index] = 0u;
+    if (group_index < RTAO_QSTAT_COUNT) gs_qstats[group_index] = 0u;
+    if (group_index < RTAO_NSTAT_COUNT) gs_nstats[group_index] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
     if (id.x < (uint)g_t_size.x && id.y < (uint)g_t_size.y) TemporalPixel(id.xy);
@@ -307,6 +386,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     if (group_index < RTAO_WSTAT_COUNT) InterlockedAdd(g_rtao_stats[RTAO_WSTAT_BASE + group_index], gs_wstats[group_index]);
     if (group_index < RTAO_DSTAT_COUNT) InterlockedAdd(g_rtao_stats[RTAO_DSTAT_BASE + group_index], gs_dstats[group_index]);
     if (group_index < RTAO_RSTAT_COUNT) InterlockedAdd(g_rtao_stats[RTAO_RSTAT_BASE + group_index], gs_rstats[group_index]);
+    if (group_index < RTAO_QSTAT_COUNT) InterlockedAdd(g_rtao_stats[RTAO_QSTAT_BASE + group_index], gs_qstats[group_index]);
+    if (group_index < RTAO_NSTAT_COUNT) InterlockedAdd(g_rtao_stats[RTAO_NSTAT_BASE + group_index], gs_nstats[group_index]);
     if (id.x == 0u && id.y == 0u) {
       g_rtao_stats[RTAO_STAT_JITTER_X] = asuint(jitterDiff_g.x);
       g_rtao_stats[RTAO_STAT_JITTER_Y] = asuint(jitterDiff_g.y);

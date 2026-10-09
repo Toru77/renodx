@@ -228,6 +228,20 @@ Settings: History Clamp 0, Debug Off, Temporal on, Two-Sided discovery off, test
 
 Send back for each case: the RTAO panel lines and world_rtao.json.
 
+#### D4 owner steps (soft normal weight, normal-dot histogram)
+
+Settings: History Clamp 0, Debug Off, Temporal on, Two-Sided discovery off, test rows off. Normal Rejection 0.9 unless a step says otherwise.
+
+1. Still camera, scene still, SPP 1: capture the RTAO panel and world_rtao.json. Read: "no-history" share (the criterion below), weighted accepted, rejected by normal and other, and the normal-dot histogram (share of pixels whose highest-weight tap has dot <0, <0.5, <0.7, <0.9, <0.97, >=0.97).
+2. Moving camera (slow pan), same settings: the same capture. Roughness and change lines are not valid here.
+3. Still camera, Normal Rejection 0: the same capture. Every facing tap is accepted, so this is the reference for what the ramp costs.
+
+Criterion: on the still camera (step 1) the no-history share should be below 2%. Fallback: if it stays at or above 2%, the normal-dot histogram from step 1 decides a wider ramp (for example 0.6) and the three captures are repeated.
+
+Send back for each case: the RTAO panel lines and world_rtao.json.
+
+Limit: the stats are 32-bit sums of values x1000 and overflow above about 4.29 million traced pixels (4K is above that; 1080p is below it).
+
 ## History
 
 ### Early status (through 2026-10-06, round 1)
