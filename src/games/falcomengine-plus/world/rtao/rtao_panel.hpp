@@ -7,6 +7,13 @@ namespace falcom_world::rtao {
 
 inline void DrawRtaoPanel() {
   const RtaoFrameState& frame = g_rtao_frame;
+  if (g_test_zero_motion > 0.5f || g_test_freeze_noise > 0.5f || g_test_camera_matrix > 0.5f) {
+    std::string modes;
+    if (g_test_zero_motion > 0.5f) modes += "zero motion";
+    if (g_test_camera_matrix > 0.5f) modes += modes.empty() ? "camera matrix" : " / camera matrix";
+    if (g_test_freeze_noise > 0.5f) modes += modes.empty() ? "frozen noise" : " / frozen noise";
+    ImGui::TextColored(ImVec4(1.f, 0.3f, 0.3f, 1.f), "TEST MODE ACTIVE: %s", modes.c_str());
+  }
   if (!RtaoRequested()) {
     ImGui::TextDisabled("RTAO: off (GTVBAO and VBGI under their own toggles)");
   } else if (frame.producing) {
@@ -61,19 +68,53 @@ inline void DrawRtaoPanel() {
   }
   if (g_rtao_stats.valid) {
     const uint32_t* v = g_rtao_stats.values;
-    const float pixels = static_cast<float>(v[kRtaoStatTemporalBase + 0u]);
-    if (pixels > 0.f) {
-      const float taps = 4.f * pixels;
-      ImGui::Text("Temporal taps: valid %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
-                  100.f * v[kRtaoStatTemporalBase + 1u] / taps,
-                  100.f * v[kRtaoStatTemporalBase + 2u] / taps,
-                  100.f * v[kRtaoStatTemporalBase + 3u] / taps);
-      ImGui::Text("Per pixel: out of bounds %.1f%%, reset %.1f%%",
-                  100.f * v[kRtaoStatTemporalBase + 4u] / pixels,
-                  100.f * v[kRtaoStatTemporalBase + 5u] / pixels);
+    const TracedDenominators den = ComputeTracedDenominators(
+        v[kRtaoStatPixels], v[kRtaoStatSky], v[kRtaoStatNormal], v[kRtaoStatRegion], v[kRtaoStatScaled],
+        v[kRtaoStatTemporalBase + 5u]);
+    ImGui::Text("Traced pixels: %u of %u (sky, normal, region and scaled are not traced)",
+                den.traced, v[kRtaoStatPixels]);
+    ImGui::Text("Temporal taps: valid %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
+                SharePercent(v[kRtaoStatTemporalBase + 1u], den.taps),
+                SharePercent(v[kRtaoStatTemporalBase + 2u], den.taps),
+                SharePercent(v[kRtaoStatTemporalBase + 3u], den.taps));
+    ImGui::Text("Per traced pixel: out of bounds %.1f%%, reset %.1f%% (neutral pixels removed)",
+                SharePercent(v[kRtaoStatTemporalBase + 4u], den.traced),
+                SharePercent(den.reset_traced, den.traced));
+    const uint32_t* f = &v[kRtaoStatTemporalFBase];
+    if (den.traced > 0u) {
+      const float px = static_cast<float>(den.traced);
+      ImGui::Text("Motion: mean |motion| %.3f px, moving %.1f%%, max %.2f px",
+                  f[2] / 100.f / px, 100.f * f[0] / px, f[1] / 100.f);
+      ImGui::Text("Clamp: active %.1f%% of traced pixels, mean shift %.4f", 100.f * f[3] / px, f[4] / 1000.f / px);
+      ImGui::Text("Blend: mean alpha %.3f, mean |raw - AO| %.4f, no history %.1f%%",
+                  f[5] / 1000.f / px, f[6] / 1000.f / px, 100.f * f[7] / px);
+    }
+    ImGui::Text("Output differs from raw by more than 1 LSB: %.1f%% of traced pixels (valid with Debug Off only)",
+                SharePercent(f[8], den.traced));
+    const uint32_t* dv = &v[kRtaoStatTemporalFBase + 9u];
+    ImGui::Text("Motion vs camera-matrix difference (valid for static geometry only: moving objects show real motion here, not a jitter error)");
+    ImGui::Text("Within 0.25 px: %.1f%%, mean %.3f px, max %.2f px", SharePercent(dv[0] + dv[1], den.traced),
+                den.traced > 0u ? dv[5] / 100.f / den.traced : 0.f, dv[6] / 100.f);
+    float jitter_x = 0.f, jitter_y = 0.f;
+    std::memcpy(&jitter_x, &v[kRtaoStatJitterX], sizeof(float));
+    std::memcpy(&jitter_y, &v[kRtaoStatJitterY], sizeof(float));
+    ImGui::Text("jitterDiff_g: (%.3f, %.3f) px", jitter_x, jitter_y);
+    if (frame.matrix_valid) {
+      ImGui::Text("Matrix self-check (indicative): |VP*VPinv-I| %.2e, |VP-prevVP| %.4f",
+                  frame.matrix_identity_err, frame.matrix_prev_diff);
     }
   } else {
     ImGui::TextDisabled("Temporal percentages: press Read RTAO Stats");
+  }
+  if (frame.temporal_ran || frame.motion_dims_ok == false) {
+    ImGui::Text("Motion dims: RTV4 %ux%u, depth %ux%u (%s)", frame.motion_w, frame.motion_h,
+                frame.depth_w, frame.depth_h, frame.motion_dims_ok ? "match" : "MISMATCH: no_motion");
+  }
+  if (frame.last_parameter_change[0] != '\0') ImGui::Text("Last parameter change: %s", frame.last_parameter_change);
+  for (size_t r = 0; r < kReasonCount; ++r) {
+    if (frame.frames_without_ao_by_reason[r] == 0u) continue;
+    ImGui::Text("Frames without AO, %s: %llu", ReasonName(static_cast<Reason>(r)),
+                static_cast<unsigned long long>(frame.frames_without_ao_by_reason[r]));
   }
 
   if (ImGui::Button("Read RTAO Stats")) g_rtao_stats.requested.store(true, std::memory_order_relaxed);

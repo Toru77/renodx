@@ -22,8 +22,16 @@ inline constexpr uint32_t kRtaoSrvCount = 19u;
 inline constexpr uint32_t kRtaoUavCount = 3u;
 inline constexpr uint32_t kRtaoPushRegister = 12u;
 inline constexpr uint32_t kRtaoPushConstantCount = 20u;
-// Stats buffer: pass A indices 0..9 (RTAO_STAT_COUNT in world_rtao.cs_5_0.hlsl), pass B 10..15 (RTAO_TSTAT_* in world_rtao_temporal.cs_5_0.hlsl), discovery 16..23.
-inline constexpr uint32_t kRtaoStatsCount = 24u;
+// Stats buffer: pass A indices 0..9 (RTAO_STAT_COUNT in world_rtao.cs_5_0.hlsl), pass B 10..15 (RTAO_TSTAT_*), discovery 16..23, pass B diagnostics 24..31 (RTAO_FSTAT_* in world_rtao_temporal.cs_5_0.hlsl).
+inline constexpr uint32_t kRtaoStatsCount = 42u;
+// D1b: motion vs camera-matrix difference, indices 33..39 (bins, sum, max; see RTAO_FSTAT_* in the pass B shader);
+// jitterDiff_g.x and .y as bit patterns at 40 and 41.
+inline constexpr uint32_t kRtaoStatJitterX = 40u;
+inline constexpr uint32_t kRtaoStatJitterY = 41u;
+// Pass B diagnostics (F1), indices 24..31: moving pixels, motion max (1/100 px), motion sum (1/100 px),
+// clamp active, clamp shift sum (1/1000), alpha sum (1/1000), |raw - AO| sum (1/1000), no-history pixels.
+inline constexpr uint32_t kRtaoStatTemporalFBase = 24u;
+inline constexpr uint32_t kRtaoStatTemporalFCount = 16u;  // 32: texel_differs (D1); 33..39: D1b
 // Two-Sided discovery (pass A, diagnostic): indices 16..23, see TwoSidedDiscoveryIndex in rtao_state.hpp.
 inline constexpr uint32_t kRtaoStatDiscoveryBase = 16u;
 inline constexpr uint32_t kRtaoStatDiscoveryCount = 8u;
@@ -62,7 +70,7 @@ struct RtaoTemporalPushConstants {
   float params[4];     // c0: history weight, depth rejection, normal rejection, history clamp (sigma)
   float texel[4];      // c1: texel size xy, prevResolutionScale xy
   float size[4];       // c2: width, height, debug mode, history valid (0 = reset)
-  float reserved0[4];  // c3
+  float reserved0[4];  // c3: x = test, force zero motion (1 = history looked up at the same pixel)
   float reserved1[4];  // c4
 };
 static_assert(sizeof(RtaoTemporalPushConstants) == kRtaoPushConstantCount * sizeof(float), "pass B b12 must be 20 floats");

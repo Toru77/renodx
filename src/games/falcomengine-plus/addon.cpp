@@ -6546,7 +6546,10 @@ static void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchai
       shader_injection.rtao_active = 0.f;
     } else {
       shader_injection.rtao_active = rtao_frame.producing ? 2.f : 1.f;
-      if (!rtao_frame.producing) rtao_frame.frames_without_ao++;
+      if (!rtao_frame.producing) {
+      rtao_frame.frames_without_ao++;
+      rtao_frame.frames_without_ao_by_reason[static_cast<size_t>(rtao_frame.reason)]++;
+    }
     }
     if (rtao_frame.reason != rtao_frame.logged_reason) {
       rtao_frame.logged_reason = rtao_frame.reason;
@@ -9115,11 +9118,11 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   in.scene_cbv_view = dd->captured_scene_cbv_view;
   in.width = dd->captured_depth_w;
   in.height = dd->captured_depth_h;
+  const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp),
+                                                         rtao::g_test_freeze_noise > 0.5f);
   in.push = {
       {rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_normal_bias},
-      {spp, isfast_used ? 1.f : 0.f,
-       static_cast<float>((dd->frame_index * static_cast<uint64_t>(spp)) % 32u),
-       static_cast<float>(dd->frame_index % 1024u)},
+      {spp, isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed},
       {fade.start, fade.end, rtao::g_rtao_discovery > 0.5f ? 1.f : 0.f, 0.f},
       {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
        bvh_data->tlas_region_size},
@@ -9130,12 +9133,56 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   // after lighting, so it is not used: there is no proof it is written before this hook.
   auto& rf = rtao::g_rtao_frame;
   const bool temporal_on = rtao::g_rtao_temporal_enabled > 0.5f;
+  if (temporal_on) rf.temporal_on_frames += 1u;
+  // CPU matrix self-check (D1b): one copy of the camera matrices under the world state mutex, no graphics call.
+  // Indicative only: g_state.camera may be one frame old at this point.
+  if (temporal_on && !rf.matrix_valid) {
+    float vp[16] = {}, vp_inv[16] = {}, prev_vp[16] = {};
+    bool has_prev = false;
+    {
+      std::lock_guard<std::mutex> lock(falcom_world::g_state.mutex);
+      std::memcpy(vp, falcom_world::g_state.camera.view_proj, sizeof(vp));
+      std::memcpy(vp_inv, falcom_world::g_state.camera.view_proj_inv, sizeof(vp_inv));
+      std::memcpy(prev_vp, falcom_world::g_state.camera.prev_view_proj, sizeof(prev_vp));
+      has_prev = falcom_world::g_state.camera.has_prev;
+    }
+    if (has_prev) {
+      const rtao::MatrixSelfCheck check = rtao::CheckSceneMatrices(vp, vp_inv, prev_vp);
+      rf.matrix_valid = true;
+      rf.matrix_identity_err = check.identity_err;
+      rf.matrix_prev_diff = check.prev_diff;
+      renodx::utils::log::i("[world-rtao] scene matrices: |VP*VPinv-I|=", check.identity_err,
+                            " |VP-prevVP|=", check.prev_diff);
+    }
+  }
+  static bool taa_never_logged = false;
+  if (!taa_never_logged && rf.temporal_on_frames >= 600u && dd->rcas_motion_res == 0u) {
+    taa_never_logged = true;
+    renodx::utils::log::w("[world-rtao] TAA t3 never captured (rcas_motion_res=0): RTV4 motion convention not verified against TAA");
+  }
   if (temporal_on) MBMotionRtv4Ensure(dev, dd);
   // Motion source (round 2). TAA t3 and RTV4 are different resources: t3 is not proven to be written before
   // lighting, so Temporal stops for the session. Unknown on either side: no decision yet.
   const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, dd->mb_rtv4_res);
   rf.rcas_res = dd->rcas_motion_res;
   rf.rtv4_res = dd->mb_rtv4_res;
+  rf.depth_w = dd->captured_depth_w;
+  rf.depth_h = dd->captured_depth_h;
+  if (temporal_on && dd->mb_rtv4_owned_srv.handle != 0u) {
+    const auto motion_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->mb_rtv4_owned_srv));
+    if (motion_desc.type == reshade::api::resource_type::texture_2d) {
+      rf.motion_w = motion_desc.texture.width;
+      rf.motion_h = motion_desc.texture.height;
+      rf.motion_dims_ok = rf.motion_w == dd->captured_depth_w && rf.motion_h == dd->captured_depth_h;
+      static bool dims_logged = false;
+      if (!dims_logged) {
+        dims_logged = true;
+        renodx::utils::log::i("[world-rtao] motion dims ", rf.motion_w, "x", rf.motion_h, ", depth ",
+                              dd->captured_depth_w, "x", dd->captured_depth_h,
+                              rf.motion_dims_ok ? " (match)" : " (MISMATCH: motion treated as unavailable, no_motion)");
+      }
+    }
+  }
   if (motion_check == rtao::MotionCheck::Conflict && !rf.motion_conflict) {
     rf.motion_conflict = true;
     renodx::utils::log::w("[world-rtao] motion CONFLICT: rcas_motion_res=", dd->rcas_motion_res,
@@ -9153,12 +9200,13 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start,
       rtao::g_rtao_fade_end, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
       rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
-      rtao::g_rtao_debug};
+      rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
+  if (params_changed) rf.last_parameter_change = rtao::ParameterFieldName(params, rf.prev_params);
   rf.prev_params = params;
   rf.prev_params_valid = true;
   const bool resized = rd.ao_texture.handle != 0u && (rd.ao_width != in.width || rd.ao_height != in.height);
-  const bool motion_ok = dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict;
+  const bool motion_ok = dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict && rf.motion_dims_ok;
   const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
       temporal_on, rf.temporal_last, resized, dd->frame_index, rf.dispatched_frame,
       dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -9177,7 +9225,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
        rtao::g_rtao_history_clamp},
       {0.f, 0.f, 0.f, 0.f},
       {0.f, 0.f, rtao::g_rtao_debug, reset == rtao::ResetReason::None ? 1.f : 0.f},
-      {0.f, 0.f, 0.f, 0.f},
+      {rtao::g_test_zero_motion > 0.5f ? 1.f : 0.f, rtao::g_test_camera_matrix > 0.5f ? 1.f : 0.f, 0.f, 0.f},
       {0.f, 0.f, 0.f, 0.f},
   };
 

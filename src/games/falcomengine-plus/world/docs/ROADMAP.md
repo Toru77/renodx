@@ -200,6 +200,22 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 What to send back after a session: the RTAO status panel lines, `world_rtao.json`, the `[world-rtao]` log lines, the D1 counters, the GPU ms, and screenshots with Temporal on and off.
 
 
+#### D2 owner steps (temporal diagnostics, D0 and D1)
+
+Settings: History Clamp 0, Debug Off, Temporal on, Two-Sided discovery off. The test rows are session only: after a restart they are off.
+
+1. Still camera, scene still. Record the panel: mean |motion|, share moving, clamp active, mean alpha, mean |raw - AO|, no-history share, "Output differs from raw by more than 1 LSB" (texel_differs share). Send the panel and world_rtao.json.
+2. Moving camera (same settings). Record the same panel lines and send the json.
+3. Temporal test "force zero motion" on (still scene and camera). Record the panel and json, then turn it off.
+4. "Temporal test: freeze noise" and "force zero motion" both on, still camera, still scene. Expected: the output equals the raw AO, so texel_differs should be near 0 %. Record the panel and json. A small share at depth and normal edges is expected: the TAA jitter still moves the reconstructed positions.
+5. "Freeze noise" alone (motion applied). A larger texel_differs share is expected here. Record the panel and json.
+6. Debug modes 4 (motion px), 5 (blend alpha) and 6 (|raw - AO|) with Temporal on: view through the GTVBAO Debug View "GTVBAO raw .a". Take a screenshot or a short video of each.
+
+7. D1b (still camera, scene still, Debug Off, History Clamp 0): panel "Motion vs camera-matrix difference". Expected for a static scene: most traced pixels within 0.25 px and jitterDiff_g small. A large share above 1 px on a static scene means the camera matrix and the motion disagree (report it). Then Debug 7 ("Motion vs matrix (px)") viewed through GTVBAO raw .a: dark = agreement, bright = difference.
+8. Test row "camera-matrix reprojection" on (still scene): the history uses the matrix, so the panel share within 0.25 px and the output should not change much from step 1. Then turn it off. "Force zero motion" wins if both are on.
+9. texel_differs is valid with Debug Off only (debug modes change the written texel).
+Send back for each case: the RTAO status panel lines, world_rtao.json, and the screenshots or video of modes 4 to 6.
+
 ## History
 
 ### Early status (through 2026-10-06, round 1)

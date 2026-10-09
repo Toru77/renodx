@@ -40,6 +40,15 @@ struct RtaoFrameState {
   uint64_t rcas_res = 0u;            // TAA t3 resource handle (0 = not captured)
   uint64_t rtv4_res = 0u;            // RTV4 motion resource handle (0 = not captured)
   uint64_t temporal_bytes = 0u;      // raw AO and two history targets
+  uint64_t frames_without_ao_by_reason[kReasonCount] = {};  // frames without AO, per Reason code (F1)
+  const char* last_parameter_change = "";  // first field that changed on the last Parameters reset (F1)
+  bool motion_dims_ok = true;        // RTV4 size equals the depth size (texel units)
+  uint32_t motion_w = 0u, motion_h = 0u;
+  uint32_t depth_w = 0u, depth_h = 0u;
+  uint64_t temporal_on_frames = 0u;  // frames with Temporal on (TAA t3 never-captured check)
+  bool matrix_valid = false;         // CPU matrix self-check ran (D1b; indicative, may be one frame old)
+  float matrix_identity_err = 0.f;
+  float matrix_prev_diff = 0.f;
 };
 
 inline RtaoFrameState g_rtao_frame;
@@ -212,6 +221,47 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
                         " scaled=", v[kRtaoStatScaled], " invalid_refs=", v[kRtaoStatInvalidRefs],
                         " stack_overflow=", v[kRtaoStatStackOverflow], " gpu_ms=", g_rtao_frame.gpu_ms);
 
+  // Pass B diagnostics (F1) and the per-reason frame counts, as one json object.
+  const uint32_t* tv = g_rtao_stats.values;
+  const uint32_t* fv = &g_rtao_stats.values[kRtaoStatTemporalFBase];
+  const TracedDenominators den = ComputeTracedDenominators(tv[kRtaoStatPixels], tv[kRtaoStatSky], tv[kRtaoStatNormal],
+                                                          tv[kRtaoStatRegion], tv[kRtaoStatScaled], tv[kRtaoStatTemporalBase + 5u]);
+  const double tpx = den.traced > 0u ? static_cast<double>(den.traced) : 1.0;
+  std::ostringstream diag;
+  diag << "{\"traced_pixels\": " << den.traced << ", \"taps_traced\": " << den.taps
+       << ", \"reset_traced\": " << den.reset_traced << ", \"pass_b_pixels\": " << tv[kRtaoStatTemporalBase]
+       << ", \"moving_pixels\": " << fv[0] << ", \"motion_max_px\": " << fv[1] / 100.0
+       << ", \"mean_motion_px\": " << fv[2] / 100.0 / tpx << ", \"share_moving\": " << fv[0] / tpx
+       << ", \"share_clamp_active\": " << fv[3] / tpx << ", \"mean_clamp_shift\": " << fv[4] / 1000.0 / tpx
+       << ", \"mean_alpha\": " << fv[5] / 1000.0 / tpx << ", \"mean_abs_raw_minus_ao\": " << fv[6] / 1000.0 / tpx
+       << ", \"share_no_history\": " << fv[7] / tpx
+       << ", \"texel_differs\": " << fv[8] << ", \"share_texel_differs\": " << fv[8] / tpx
+       << ", \"frames_without_ao_by_reason\": {";
+  bool first_reason = true;
+  for (size_t r = 0; r < kReasonCount; ++r) {
+    if (g_rtao_frame.frames_without_ao_by_reason[r] == 0u) continue;
+    diag << (first_reason ? "" : ", ") << "\"" << ReasonName(static_cast<Reason>(r)) << "\": " << g_rtao_frame.frames_without_ao_by_reason[r];
+    first_reason = false;
+  }
+  // D1b: motion vs camera-matrix difference (static geometry only), over the traced pixels.
+  const uint32_t* dv = &g_rtao_stats.values[kRtaoStatTemporalFBase + 9u];
+  const uint32_t dtraced = den.traced;
+  float jitter_x = 0.f, jitter_y = 0.f;
+  std::memcpy(&jitter_x, &g_rtao_stats.values[kRtaoStatJitterX], sizeof(float));
+  std::memcpy(&jitter_y, &g_rtao_stats.values[kRtaoStatJitterY], sizeof(float));
+  diag << "}, \"camera_matrix_diff\": {\"note\": \"valid for static geometry only; moving objects show real motion here, not a jitter error\""
+       << ", \"bins\": [" << dv[0] << ", " << dv[1] << ", " << dv[2] << ", " << dv[3] << ", " << dv[4] << "]"
+       << ", \"share_within_0_25_px\": " << (dtraced > 0u ? static_cast<double>(dv[0] + dv[1]) / dtraced : 0.0)
+       << ", \"mean_px\": " << (dtraced > 0u ? static_cast<double>(dv[5]) / 100.0 / dtraced : 0.0)
+       << ", \"max_px\": " << dv[6] / 100.0
+       << ", \"jitter_diff_px\": [" << jitter_x << ", " << jitter_y << "]"
+       << ", \"matrix_self_check\": {\"valid\": " << (g_rtao_frame.matrix_valid ? "true" : "false")
+       << ", \"identity_err\": " << g_rtao_frame.matrix_identity_err
+       << ", \"prev_diff\": " << g_rtao_frame.matrix_prev_diff << "}}"
+       << ", \"last_parameter_change\": \"" << g_rtao_frame.last_parameter_change << "\""
+       << ", \"motion_dims\": {\"ok\": " << (g_rtao_frame.motion_dims_ok ? "true" : "false")
+       << ", \"motion_w\": " << g_rtao_frame.motion_w << ", \"motion_h\": " << g_rtao_frame.motion_h
+       << ", \"depth_w\": " << g_rtao_frame.depth_w << ", \"depth_h\": " << g_rtao_frame.depth_h << "}}";
   std::ostringstream out;
   out << "{\n  \"schema\": 2,\n  \"generated_frame\": " << g_state.frame.load()
       << ",\n  \"reason\": \"" << ReasonName(g_rtao_frame.reason) << "\""
@@ -263,6 +313,10 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
     out << (i == 0u ? "" : ", ") << "\"" << kDiscoveryNames[i] << "\": " << v[kRtaoStatDiscoveryBase + i];
   }
   out << "}}"
+      << ",\n  \"temporal_diagnostics\": " << diag.str()
+      << ",\n  \"test_modes\": {\"zero_motion\": " << (g_test_zero_motion > 0.5f ? "true" : "false")
+      << ", \"camera_matrix\": " << (g_test_camera_matrix > 0.5f ? "true" : "false")
+      << ", \"freeze_noise\": " << (g_test_freeze_noise > 0.5f ? "true" : "false") << "}"
       << ",\n  \"note\": \"dynamic objects not traced (round 3); scaled pixels are counted by the shader\"\n}\n";
   std::string text = out.str();
   renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtao.json", text);

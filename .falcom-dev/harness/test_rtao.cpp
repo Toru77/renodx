@@ -26,6 +26,8 @@
 //   - the barrier and the push nulls on a real D3D11 device (the mock models the slots only).
 //
 #include <algorithm>
+#include <sstream>
+#include <cstdlib>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -159,7 +161,7 @@ static void TestPushLayout() {
   CHECK(offsetof(rtao::RtaoPushConstants, fade) == 32u, "c2 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, region) == 48u, "c3 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, size) == 64u, "c4 offset");
-  CHECK(rtao::kRtaoStatsCount == 24u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
+  CHECK(rtao::kRtaoStatsCount == 42u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
   CHECK(rtao::kRtaoSrvCount == 19u && rtao::kRtaoUavCount == 3u && rtao::kRtaoPushRegister == 12u, "table sizes");
   CHECK(sizeof(rtao::RtaoTemporalPushConstants) == 20u * sizeof(float), "pass B b12 size");
   CHECK(offsetof(rtao::RtaoTemporalPushConstants, texel) == 16u && offsetof(rtao::RtaoTemporalPushConstants, size) == 32u, "pass B offsets");
@@ -567,7 +569,8 @@ static void TestParameterSnapshot() {
 
 // ---- Two-Sided discovery index (rtao_state.hpp TwoSidedDiscoveryIndex; shader: back*4 + toward*2 + alpha) ----
 static void TestTwoSidedIndex() {
-  CHECK(rtao::kRtaoStatsCount == 24u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
+  CHECK(rtao::kRtaoStatsCount == 42u && rtao::kRtaoStatDiscoveryBase == 16u && rtao::kRtaoStatDiscoveryCount == 8u, "discovery stats layout");
+  CHECK(rtao::kRtaoStatTemporalFBase == 24u && rtao::kRtaoStatTemporalFCount == 16u, "pass B diagnostics layout");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, false) == 0u, "front away opaque is 0");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, false, true) == 1u, "front away alpha is 1");
   CHECK(rtao::TwoSidedDiscoveryIndex(false, true, false) == 2u, "front toward opaque is 2");
@@ -577,6 +580,40 @@ static void TestTwoSidedIndex() {
   CHECK(rtao::TwoSidedDiscoveryIndex(true, true, false) == 6u, "back toward opaque is 6");
   CHECK(rtao::TwoSidedDiscoveryIndex(true, true, true) == 7u, "back toward alpha is 7");
   std::printf("two-sided index: 8 cases\n");
+}
+
+// ---- D0: traced-pixel denominators (rtao_state.hpp ComputeTracedDenominators, SharePercent): real code ----
+static void TestTracedDenominators() {
+  rtao::TracedDenominators none = rtao::ComputeTracedDenominators(100u, 0u, 0u, 0u, 0u, 7u);
+  CHECK(none.traced == 100u && none.taps == 400u && none.reset_traced == 7u, "no neutral pixels: traced 100, taps 400, reset 7");
+  rtao::TracedDenominators all = rtao::ComputeTracedDenominators(50u, 50u, 0u, 0u, 0u, 50u);
+  CHECK(all.traced == 0u && all.taps == 0u && all.reset_traced == 0u, "all neutral: traced 0, nothing to divide by");
+  CHECK(rtao::SharePercent(3u, all.traced) == 0.f && rtao::SharePercent(3u, all.taps) == 0.f, "share with zero denominator is 0");
+  rtao::TracedDenominators mixed = rtao::ComputeTracedDenominators(100u, 10u, 5u, 3u, 2u, 30u);
+  CHECK(mixed.traced == 80u && mixed.taps == 320u && mixed.reset_traced == 10u, "mixed: traced 80, taps 320, reset 30 - 20 neutral = 10");
+  CHECK(rtao::SharePercent(20u, mixed.traced) == 25.f, "share 20 of 80 is 25 percent");
+  rtao::TracedDenominators under = rtao::ComputeTracedDenominators(5u, 10u, 0u, 0u, 0u, 3u);
+  CHECK(under.traced == 0u && under.reset_traced == 0u, "neutral above pixels: no underflow");
+  std::printf("traced denominators: 5 cases (real code)\n");
+}
+
+// ---- F1 diagnostics: index table, first changed parameter, reason count ----
+static void TestDiagnosticsLayout() {
+  static const char* const expected[16] = {"moving_pixels", "motion_max", "motion_sum", "clamp_active",
+                                           "clamp_shift_sum", "alpha_sum", "abs_raw_ao_sum", "no_history", "texel_differs",
+                                           "matrix_lt_0.1", "matrix_lt_0.25", "matrix_lt_0.5", "matrix_lt_1", "matrix_ge_1", "matrix_diff_sum", "matrix_diff_max"};
+  for (uint32_t i = 0; i < 16u; ++i) {
+    CHECK(std::string(rtao::kTemporalDiagnosticNames[i]) == expected[i], "diagnostic name %u is %s", i, rtao::kTemporalDiagnosticNames[i]);
+  }
+  rtao::ParameterSnapshot a = {1.f, 2.f, 1.f, 2.f, 0.05f, 1.f, 1.f, 40.f, 80.f, 1.f, 0.9f, 0.05f, 0.9f, 1.f, 0.f};
+  rtao::ParameterSnapshot b = a;
+  CHECK(std::string(rtao::ParameterFieldName(a, b)).empty(), "equal snapshots: no field");
+  b.radius = 1.5f; CHECK(std::string(rtao::ParameterFieldName(a, b)) == "radius", "radius named");
+  b = a; b.history_clamp = 2.f; CHECK(std::string(rtao::ParameterFieldName(a, b)) == "history_clamp", "history clamp named");
+  b = a; b.debug = 1.f; CHECK(std::string(rtao::ParameterFieldName(a, b)) == "debug", "debug named");
+  b = a; b.radius = 1.5f; b.debug = 1.f; CHECK(std::string(rtao::ParameterFieldName(a, b)) == "radius", "first changed field wins");
+  CHECK(static_cast<size_t>(rtao::Reason::ScaledResolution) < rtao::kReasonCount, "reason histogram covers every code");
+  std::printf("diagnostics layout: 8 names, 5 parameter cases, reason count\n");
 }
 
 // ---- Motion source check (rtao_state.hpp CheckMotionResources): equal, different, unknown ----
@@ -690,6 +727,223 @@ static void TestTemporalDispatch() {
   std::printf("temporal dispatch: 2 passes, history swap, slot nulls, no-motion path, destroy\n");
 }
 
+// ---- D1 (transcriptions unless marked real): pass-through, noise sample, texel_differs layout, debug scales ----
+// TRANSCRIPTION: the pass B blend (TemporalBlend above) with zero motion and frozen noise (constant raw, no clamp).
+static void TestPassThrough() {
+  const float raw = 0.3f;
+  const float flat9[9] = {0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f};
+  const float weights[2] = {0.5f, 0.9f};
+  bool within = true;
+  for (float hw : weights) {
+    float ao = raw;
+    for (int frame = 0; frame < 20; ++frame) {
+      const bool no_history = frame == 0 || frame == 10;  // first frame, and a reset in the middle
+      Tap taps[4];
+      for (auto& t : taps) t = {0.25f, !no_history, ao, 5.f, 1.f};
+      const BlendResult b = TemporalBlend(raw, taps, 5.f, hw, 0.05f, 0.9f, 0.f, flat9, !no_history);
+      ao = b.ao;
+      within = within && std::fabs(ao - raw) * 255.f <= 1.f;
+    }
+  }
+  CHECK(within, "zero motion + frozen noise: output equals raw within 1 LSB over 20 frames (weights 0.5, 0.9; reset at 10)");
+  std::printf("pass-through: 2 history weights x 20 frames (transcription)\n");
+}
+
+// REAL: rtao::RtaoNoiseSample. The reference is the round-1 expressions written out again (transcription).
+static void TestNoiseSample() {
+  bool same = true;
+  for (uint32_t spp = 1u; spp <= 8u; ++spp) {
+    for (uint64_t frame = 0u; frame < 2100u; frame += 7u) {
+      const rtao::NoiseSample n = rtao::RtaoNoiseSample(frame, spp, false);
+      same = same && n.slice_base == static_cast<float>((frame * spp) % 32u) && n.seed == static_cast<float>(frame % 1024u);
+      const rtao::NoiseSample f = rtao::RtaoNoiseSample(frame, spp, true);
+      same = same && f.slice_base == 0.f && f.seed == 0.f;
+    }
+  }
+  CHECK(same, "freeze off: slice and seed equal the round-1 formulas; freeze on: 0 and 0");
+  std::printf("noise sample: spp 1..8, frames 0..2100 (real function)\n");
+}
+
+// REAL: the layout constants (the stat index is FBase + 8 = 32, and the name table).
+static void TestTexelDiffersLayout() {
+  CHECK(rtao::kRtaoStatTemporalFBase + 8u == 32u && rtao::kRtaoStatsCount == 42u, "texel_differs at index 32 of 33");
+  CHECK(std::string(rtao::kTemporalDiagnosticNames[8]) == "texel_differs", "texel_differs name");
+  std::printf("texel_differs layout (real constants)\n");
+}
+
+// TRANSCRIPTION: the debug value scales of modes 4 to 6 (world_rtao_temporal.cs_5_0.hlsl).
+static void TestDebugScales() {
+  const float motion_px[4] = {0.f, 2.f, 4.f, 8.f};
+  const float want_motion[4] = {0.f, 0.5f, 1.f, 1.f};
+  const float alpha[2] = {0.f, 0.9f};
+  const float diff[4] = {0.f, 0.25f, 0.5f, 1.f};
+  const float want_diff[4] = {0.f, 0.5f, 1.f, 1.f};
+  bool ok = true;
+  for (int i = 0; i < 4; ++i) {
+    ok = ok && std::fabs(std::fmin(std::fmax(motion_px[i] / 4.f, 0.f), 1.f) - want_motion[i]) < 1e-6f;
+    ok = ok && std::fabs(std::fmin(std::fmax(diff[i] * 2.f, 0.f), 1.f) - want_diff[i]) < 1e-6f;
+  }
+  for (int i = 0; i < 2; ++i) ok = ok && std::fabs(alpha[i] - alpha[i]) == 0.f;  // mode 5 writes alpha as it is
+  CHECK(ok, "debug scales: motion saturate(px/4), alpha as is, diff saturate(diff*2)");
+  std::printf("debug scales: 4 motion, 4 diff, 2 alpha values (transcription)\n");
+}
+
+// ---- Source-text guard for the RTAO shaders (NOT a shader compile): #define names, duplicates, and the index values
+// against the C++ constants. Reads the harness copy of the shaders (refresh_world.ps1 copies world/*.hlsl there, CR
+// bytes stripped), so run refresh_world first. ----
+static std::string ReadText(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+struct HlslDefine { std::string name; long value; };
+// Parses "#define NAME <digits>[u]" lines; other #define forms are skipped.
+static std::vector<HlslDefine> ParseDefines(const std::string& text) {
+  std::vector<HlslDefine> out;
+  std::istringstream in(text);
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t p = line.find_first_not_of(" \t");
+    if (p == std::string::npos || line.compare(p, 8, "#define ") != 0) continue;
+    std::istringstream toks(line.substr(p + 8));
+    std::string name, value;
+    toks >> name >> value;
+    if (!value.empty() && value.back() == 'u') value.pop_back();
+    if (name.empty() || value.empty() || value.find_first_not_of("0123456789") != std::string::npos) continue;
+    out.push_back({name, std::strtol(value.c_str(), nullptr, 10)});
+  }
+  return out;
+}
+static int CountDuplicates(const std::vector<HlslDefine>& defs) {
+  std::map<std::string, int> seen;
+  int dups = 0;
+  for (const auto& d : defs) if (++seen[d.name] == 2) ++dups;
+  return dups;
+}
+static bool FindDefine(const std::vector<HlslDefine>& defs, const char* name, long* value) {
+  for (const auto& d : defs) if (d.name == name) { *value = d.value; return true; }
+  return false;
+}
+static void TestHlslSources() {
+  const std::string pass_a = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao.cs_5_0.hlsl");
+  const std::string pass_b = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao_temporal.cs_5_0.hlsl");
+  CHECK(!pass_a.empty() && !pass_b.empty(), "RTAO shader sources readable (run refresh_world first)");
+  std::vector<HlslDefine> defs = ParseDefines(pass_a);
+  const std::vector<HlslDefine> defs_b = ParseDefines(pass_b);
+  defs.insert(defs.end(), defs_b.begin(), defs_b.end());
+  CHECK(CountDuplicates(defs) == 0, "no #define name appears twice in the two RTAO shaders");
+  CHECK(CountDuplicates(ParseDefines("#define X_TEST 1u\n#define X_TEST 2u\n")) == 1, "guard self-test: a duplicate is found");
+  struct Pair { const char* name; uint32_t expected; };
+  static const Pair pairs[] = {
+      {"RTAO_STAT_RAYS", rtao::kRtaoStatRays}, {"RTAO_STAT_HITS", rtao::kRtaoStatHits},
+      {"RTAO_STAT_PIXELS", rtao::kRtaoStatPixels}, {"RTAO_STAT_AO_SUM", rtao::kRtaoStatAoSum},
+      {"RTAO_STAT_SKY", rtao::kRtaoStatSky}, {"RTAO_STAT_NORMAL", rtao::kRtaoStatNormal},
+      {"RTAO_STAT_REGION", rtao::kRtaoStatRegion}, {"RTAO_STAT_INVALID_REFS", rtao::kRtaoStatInvalidRefs},
+      {"RTAO_STAT_STACK_OVERFLOW", rtao::kRtaoStatStackOverflow}, {"RTAO_STAT_SCALED", rtao::kRtaoStatScaled},
+      {"RTAO_DISC_BASE", rtao::kRtaoStatDiscoveryBase}, {"RTAO_DISC_COUNT", rtao::kRtaoStatDiscoveryCount},
+      {"RTAO_TSTAT_BASE", rtao::kRtaoStatTemporalBase},
+      {"RTAO_TSTAT_PIXELS", 0}, {"RTAO_TSTAT_VALID_TAPS", 1}, {"RTAO_TSTAT_REJECTED_DEPTH", 2},
+      {"RTAO_TSTAT_REJECTED_NORMAL", 3}, {"RTAO_TSTAT_OUT_OF_BOUNDS", 4}, {"RTAO_TSTAT_RESET_PIXELS", 5},
+      {"RTAO_FSTAT_BASE", rtao::kRtaoStatTemporalFBase}, {"RTAO_FSTAT_COUNT", rtao::kRtaoStatTemporalFCount},
+      {"RTAO_FSTAT_MOVING_PIXELS", 0}, {"RTAO_FSTAT_MOTION_MAX", 1}, {"RTAO_FSTAT_MOTION_SUM", 2},
+      {"RTAO_FSTAT_CLAMP_ACTIVE", 3}, {"RTAO_FSTAT_CLAMP_SHIFT_SUM", 4}, {"RTAO_FSTAT_ALPHA_SUM", 5},
+      {"RTAO_FSTAT_ABS_DIFF_SUM", 6}, {"RTAO_FSTAT_NO_HISTORY", 7}, {"RTAO_FSTAT_TEXEL_DIFFERS", 8},
+      {"RTAO_FSTAT_MATRIX_DIFF_BIN", 9}, {"RTAO_FSTAT_MATRIX_DIFF_SUM", 14}, {"RTAO_FSTAT_MATRIX_DIFF_MAX", 15},
+      {"RTAO_STAT_JITTER_X", rtao::kRtaoStatJitterX}, {"RTAO_STAT_JITTER_Y", rtao::kRtaoStatJitterY},
+  };
+  for (const Pair& pr : pairs) {
+    long value = -1;
+    const bool found = FindDefine(defs, pr.name, &value);
+    CHECK(found && value == static_cast<long>(pr.expected), "%s = %ld in the HLSL, %u in C++ (found %d)",
+          pr.name, value, pr.expected, found ? 1 : 0);
+  }
+  // Every stat index the shaders name lies inside the buffer.
+  long jitter_y = 0;
+  FindDefine(defs, "RTAO_STAT_JITTER_Y", &jitter_y);
+  CHECK(jitter_y < static_cast<long>(rtao::kRtaoStatsCount), "jitter index inside the stats buffer");
+  std::printf("HLSL source guard: %zu defines, %zu index pairs (source text, not a shader compile)\n", defs.size(), sizeof(pairs) / sizeof(pairs[0]));
+}
+
+// ---- D1b (transcriptions marked; the rest real) ----
+// TRANSCRIPTION: a static world point with a per-frame jitter. The game motion (texels) is (prev - cur) + jitterDiff,
+// the motion lookup is cur + motion, the camera-matrix lookup is the previous position. diff_px must equal |jitterDiff|.
+// The uv conversion (ndc to uv and back) is checked on random points.
+static void TestMatrixDifference() {
+  unsigned seed = 7u;
+  auto next = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) * (1.f / 16777216.f); };
+  bool exact = true, roundtrip = true;
+  const float base_px[2] = {20.3f, 31.7f};
+  for (int f = 0; f < 200; ++f) {
+    const float cur_j[2] = {next() - 0.5f, next() - 0.5f};
+    const float prev_j[2] = {next() - 0.5f, next() - 0.5f};
+    const float cur_px[2] = {base_px[0] + cur_j[0], base_px[1] + cur_j[1]};
+    const float prev_px[2] = {base_px[0] + prev_j[0], base_px[1] + prev_j[1]};
+    const float jitter_diff[2] = {cur_j[0] - prev_j[0], cur_j[1] - prev_j[1]};
+    const float motion[2] = {(prev_px[0] - cur_px[0]) + jitter_diff[0], (prev_px[1] - cur_px[1]) + jitter_diff[1]};
+    const float hist_motion[2] = {cur_px[0] + motion[0], cur_px[1] + motion[1]};
+    const float d[2] = {hist_motion[0] - prev_px[0], hist_motion[1] - prev_px[1]};
+    exact = exact && std::fabs(std::sqrt(d[0] * d[0] + d[1] * d[1]) - std::sqrt(jitter_diff[0] * jitter_diff[0] + jitter_diff[1] * jitter_diff[1])) < 1e-4f;
+    const float ndc_x = next() * 2.f - 1.f, ndc_y = next() * 2.f - 1.f;
+    const float uv_x = ndc_x * 0.5f + 0.5f, uv_y = 0.5f - ndc_y * 0.5f;
+    roundtrip = roundtrip && std::fabs(uv_x * 2.f - 1.f - ndc_x) < 1e-5f && std::fabs(1.f - 2.f * uv_y - ndc_y) < 1e-5f;
+  }
+  CHECK(exact, "diff_px equals |jitterDiff| when the game motion includes the jitter (200 frames)");
+  CHECK(roundtrip, "ndc to uv (x*0.5+0.5, 0.5-y*0.5) round-trips");
+  std::printf("matrix difference: 200 frames, ndc round trip (transcription)\n");
+}
+
+// REAL: rtao::DiffBin bin edges, negative and NaN.
+static void TestDiffBin() {
+  CHECK(rtao::DiffBin(-1.f) == 0u && rtao::DiffBin(0.f) == 0u && rtao::DiffBin(0.05f) == 0u, "negative and small: bin 0");
+  CHECK(rtao::DiffBin(0.1f) == 1u && rtao::DiffBin(0.24f) == 1u, "0.1 to 0.25: bin 1");
+  CHECK(rtao::DiffBin(0.25f) == 2u && rtao::DiffBin(0.49f) == 2u, "0.25 to 0.5: bin 2");
+  CHECK(rtao::DiffBin(0.5f) == 3u && rtao::DiffBin(0.99f) == 3u, "0.5 to 1: bin 3");
+  CHECK(rtao::DiffBin(1.0f) == 4u && rtao::DiffBin(7.f) == 4u, "1 and above: bin 4");
+  CHECK(rtao::DiffBin(std::nanf("")) == 4u, "NaN: bin 4, never bin 0");
+  std::printf("diff bins: 11 values (real function)\n");
+}
+
+// REAL: rtao::CheckSceneMatrices on identity, a true inverse pair, and a perturbed pair.
+static void TestMatrixSelfCheck() {
+  const float I[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  rtao::MatrixSelfCheck id = rtao::CheckSceneMatrices(I, I, I);
+  CHECK(id.identity_err == 0.f && id.prev_diff == 0.f, "identity: no error");
+  const float M[16] = {2, 0, 0, 1, 0, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  const float Minv[16] = {0.5f, 0, 0, -0.5f, 0, 0.5f, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  rtao::MatrixSelfCheck pair = rtao::CheckSceneMatrices(M, Minv, M);
+  CHECK(pair.identity_err < 1e-6f && pair.prev_diff == 0.f, "true inverse pair: identity error %.2e", pair.identity_err);
+  float bad[16];
+  std::memcpy(bad, Minv, sizeof(bad));
+  bad[1] += 0.1f;
+  rtao::MatrixSelfCheck perturbed = rtao::CheckSceneMatrices(M, bad, M);
+  CHECK(perturbed.identity_err > 0.05f, "perturbed inverse: identity error %.4f", perturbed.identity_err);
+  float prev[16];
+  std::memcpy(prev, M, sizeof(prev));
+  prev[5] += 0.25f;
+  rtao::MatrixSelfCheck moved = rtao::CheckSceneMatrices(M, Minv, prev);
+  CHECK(std::fabs(moved.prev_diff - 0.25f) < 1e-6f, "previous matrix differs by 0.25: prev_diff %.4f", moved.prev_diff);
+  std::printf("matrix self-check: identity, inverse pair, perturbed, moved previous (real)\n");
+}
+
+// REAL: names and the new test row in the snapshot.
+static void TestD1bLayout() {
+  CHECK(rtao::kRtaoStatJitterX == 40u && rtao::kRtaoStatJitterY == 41u, "jitter stats at 40 and 41");
+  CHECK(std::string(rtao::kTemporalDiagnosticNames[9]) == "matrix_lt_0.1" && std::string(rtao::kTemporalDiagnosticNames[15]) == "matrix_diff_max", "matrix difference names 9..15");
+  rtao::ParameterSnapshot a = {};
+  rtao::ParameterSnapshot b = a;
+  b.camera_matrix = 1.f;
+  CHECK(std::string(rtao::ParameterFieldName(a, b)) == "test_camera_matrix", "camera matrix test row resets the history");
+  std::printf("D1b layout (real constants and snapshot)\n");
+}
+
+// TRANSCRIPTION: debug mode 7 scale saturate(diff_px / 2).
+static void TestDebugScale7() {
+  const float d[4] = {0.f, 1.f, 2.f, 4.f};
+  const float want[4] = {0.f, 0.5f, 1.f, 1.f};
+  bool ok = true;
+  for (int i = 0; i < 4; ++i) ok = ok && std::fabs(std::fmin(std::fmax(d[i] / 2.f, 0.f), 1.f) - want[i]) < 1e-6f;
+  CHECK(ok, "debug mode 7: saturate(px / 2)");
+}
+
 int main() {
   HStage("gate table");
   TestGateTable();
@@ -711,6 +965,18 @@ int main() {
   TestResetRule();
   TestMotionCheck();
   TestTwoSidedIndex();
+  TestDiagnosticsLayout();
+  TestTracedDenominators();
+  TestPassThrough();
+  TestNoiseSample();
+  TestTexelDiffersLayout();
+  TestDebugScales();
+  TestMatrixDifference();
+  TestHlslSources();
+  TestDiffBin();
+  TestMatrixSelfCheck();
+  TestD1bLayout();
+  TestDebugScale7();
   HStage("temporal dispatch (mock)");
   TestTemporalDispatch();
   HStage("device lifecycle (mock)");

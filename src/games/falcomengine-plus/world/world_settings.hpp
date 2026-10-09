@@ -110,8 +110,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTAO Debug",
       .section = "RTAO",
-      .tooltip = "Modes apply with Temporal on (the temporal pass writes them). Modes write the chosen value as the AO texel. To see it full screen, set the GTVBAO Debug View to \"GTVBAO raw .a\". Accumulated AO = reprojected history before the blend (white where there is no valid history). History confidence = fraction of valid history taps (dark = rejected).",
-      .labels = {"Off", "Raw AO", "Accumulated AO", "History confidence"},
+      .tooltip = "Modes apply with Temporal on (pass B writes them); the history is written as usual. Off = normal AO. 1 raw AO. 2 accumulated AO = unclamped reprojected history (raw where no tap is valid). 3 history confidence = valid tap fraction (dark = rejected). 4 motion = saturate(px / 4), white at 4 px. 5 blend alpha = 0 to History Weight. 6 |raw - AO| = saturate(diff * 2). 7 motion vs camera matrix = saturate(px / 2) (static geometry only). To view full screen set the GTVBAO Debug View to \"GTVBAO raw .a\".",
+      .labels = {"Off", "Raw AO", "Accumulated AO", "History confidence", "Motion (px)", "Blend alpha", "|raw - AO|", "Motion vs matrix (px)"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -122,6 +122,40 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "Two-Sided discovery (diagnostic)",
       .section = "RTAO",
       .tooltip = "Diagnostic only: counts facing and winding of the traced surfaces. Does not cull anything.",
+      .labels = {"Off", "On"},
+      .is_visible = advanced,
+  });
+  // Session-only test rows: the empty key makes SaveSettings and SaveGlobalSettings skip them (settings.hpp).
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtao::g_test_zero_motion,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Temporal test: force zero motion",
+      .section = "RTAO",
+      .tooltip = "Test, session only (not saved). Pass B looks up the history at the same pixel. The motion is still measured. Toggling it resets the history for one frame.",
+      .labels = {"Off", "On"},
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtao::g_test_freeze_noise,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Temporal test: freeze noise",
+      .section = "RTAO",
+      .tooltip = "Test, session only (not saved). The ray directions use a fixed slice and seed, so the noise does not change from frame to frame. Toggling it resets the history for one frame.",
+      .labels = {"Off", "On"},
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtao::g_test_camera_matrix,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Temporal test: camera-matrix reprojection",
+      .section = "RTAO",
+      .tooltip = "Test, session only (not saved). The history is looked up with the previous camera view-projection instead of the motion. Valid for static geometry only. Force zero motion wins if both are on. Toggling it resets the history for one frame.",
       .labels = {"Off", "On"},
       .is_visible = advanced,
   });
