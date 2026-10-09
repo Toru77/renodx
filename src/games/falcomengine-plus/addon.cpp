@@ -384,7 +384,6 @@ ShaderInjectData shader_injection = {
   .mb_tiles_x = 1.f,
   .mb_tiles_y = 1.f,
   .mb_tile_uv = 0.f,
-  .mb_pass = 0.f,
   .mb_frame_index = 0.f,
   .mb_motion_valid = 0.f,
   .mb_debug_chain = 0.f,
@@ -558,8 +557,8 @@ constexpr uint32_t kShadowsUavPerPass[kShadowsPassCount] = {1u, 1u};
 // DeviceData so the stages cannot drift out of sync. Declared here because
 // DeviceData sizes its arrays with it.
 //
-// Four dispatches, three shaders: TileMax is compiled once and dispatched twice
-// (mb_pass selects the axis). There is deliberately no full-resolution
+// Prep is TileMax and NeighborMax, then Gather, with optional Resolve, Downsample and
+// Composite. There is deliberately no full-resolution
 // intermediate for velocity or for linear depth � the gather and the tile
 // stages read the game's own motion and depth textures and convert at the point
 // of use. Those intermediates cost 44 MB of writes per frame at 1440p, enough
@@ -1322,12 +1321,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   uint32_t fxaa_layout_version = 0u;
   std::array<reshade::api::descriptor_table, 2> fxaa_tables = {};  // [0]=srv t0+t1, [1]=uav u0
   // -- Motion Blur (Guertin 2013), Sora 2nd --
-  // Four owned resources: the two TileMax intermediates, NeighborMax, and the
-  // gather output. There is no velocity or linear-depth surface � both are read
-  // straight from the game's textures and converted in the consuming shader.
-  reshade::api::resource mb_tilemax_h_texture = {};
-  reshade::api::resource_view mb_tilemax_h_srv = {};
-  reshade::api::resource_view mb_tilemax_h_uav = {};
+  // Three owned resources: TileMax, NeighborMax, and the gather output. There is no
+  // velocity or linear-depth surface � both are read straight from the game's
+  // textures and converted in the consuming shader.
   reshade::api::resource mb_tilemax_texture = {};
   reshade::api::resource_view mb_tilemax_srv = {};
   reshade::api::resource_view mb_tilemax_uav = {};
@@ -1368,9 +1364,9 @@ struct __declspec(uuid("b1a2c3d4-e5f6-7890-abcd-ef1234567890")) DeviceData {
   std::array<reshade::api::pipeline, kMotionBlurPassCount> mb_pipelines = {};
   std::array<GTVBAODescriptorTableSet, kMotionBlurPassCount> mb_tables = {};
   uint32_t mb_working_w = 0u, mb_working_h = 0u;
-  uint32_t mb_motion_w = 0u, mb_motion_h = 0u;  // motion_h sizes tilemax_h; motion_w
-                                                // sizes the camera/object resolve
-                                                // output, which is full motion res
+  uint32_t mb_motion_w = 0u, mb_motion_h = 0u;  // motion_w and motion_h size the
+                                                // camera/object resolve output,
+                                                // which is full motion res
   uint32_t mb_tiles_x = 0u, mb_tiles_y = 0u;
   uint32_t mb_radius_px = 0u;
   // Last framerate-normalisation factor written to the log, so only real changes
@@ -7983,10 +7979,10 @@ static void OnBindRenderTargetsRCAS(reshade::api::command_list* cmd_list, uint32
 
 // ----------- Motion Blur (Guertin et al. 2013) -----------
 //
-// Six dispatches, run inline on the deploy draw's own command list so ordering
+// Run inline on the deploy draw's own command list so ordering
 // against the game's own work is strict and no frame of latency is added:
 //
-//   linearize depth -> velocity -> tilemax X -> tilemax Y -> neighbormax -> gather
+//   tilemax -> neighbormax -> gather
 //
 // Two modes, ONE deploy point. The chain runs inline on the tonemap draw's own
 // command list, so ordering against the game's own work is strict and no frame of
@@ -8011,7 +8007,6 @@ static void DestroyMotionBlurSet(reshade::api::device* dev, DeviceData* d) {
   if (!dev || !d) return;
   auto dv = [&](reshade::api::resource_view& v) { if (v.handle) { dev->destroy_resource_view(v); v = {}; } };
   auto dr = [&](reshade::api::resource& r) { if (r.handle) { dev->destroy_resource(r); r = {}; } };
-  dv(d->mb_tilemax_h_srv); dv(d->mb_tilemax_h_uav); dr(d->mb_tilemax_h_texture);
   dv(d->mb_tilemax_srv); dv(d->mb_tilemax_uav); dr(d->mb_tilemax_texture);
   dv(d->mb_neighbormax_srv); dv(d->mb_neighbormax_uav); dr(d->mb_neighbormax_texture);
   dv(d->mb_half_color_srv); dv(d->mb_half_color_uav); dr(d->mb_half_color_texture);
@@ -8211,16 +8206,14 @@ static void CreateMotionBlurSet(reshade::api::device* dev, DeviceData* d,
   // neighbormax zeroed, so vmax is zero, the early-out always fires, and the
   // filter is a silent passthrough with no error anywhere.
   //
-  // The tile set is tiny (tiles*tileH + 2*tiles*tiles texels, ~40k at 1440p), so
+  // The tile set is tiny (2*tiles*tiles texels), so
   // its extra bytes are irrelevant and it stays RGBA16F unconditionally. The
   // resolve surface is the opposite case: the gather fetches it once per tap, so
   // it is allocated RG16F -- the filter reads only .xy -- whenever the device
   // accepts the UAV. See the allocation below.
   const auto tileFmt = reshade::api::format::r16g16b16a16_float;
   bool ok =
-     mk(tilesX, std::max(motionH, 1u), tileFmt,
-        &d->mb_tilemax_h_texture, &d->mb_tilemax_h_srv, &d->mb_tilemax_h_uav)
-   && mk(tilesX, tilesY, tileFmt,
+     mk(tilesX, tilesY, tileFmt,
         &d->mb_tilemax_texture, &d->mb_tilemax_srv, &d->mb_tilemax_uav)
    && mk(tilesX, tilesY, tileFmt,
         &d->mb_neighbormax_texture, &d->mb_neighbormax_srv, &d->mb_neighbormax_uav)
@@ -8436,9 +8429,6 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   // Two tiles of headroom keeps the whole 0..2 Intensity range meaningful: the
   // domain is (|v|max + jitter) * intensity <= (40 + 1.3) px at 1080p reference,
   // so a 2*40 px tile leaves ~1.94 before the gather's one-tile clamp engages.
-  // Total tilemax loads are unchanged by this (tilesX * motionH * tileW is
-  // invariant), so prep should neither improve nor regress -- the win is
-  // correctness, not speed.
   const uint32_t tilePx = std::max(1u, radiusPx * 2u);
   const uint32_t tilesX = std::max(1u, (workingW + tilePx - 1u) / tilePx);
   const uint32_t tilesY = std::max(1u, (workingH + tilePx - 1u) / tilePx);
@@ -8455,8 +8445,7 @@ static bool PrepareMotionBlur(reshade::api::device* dev, DeviceData* d,
   const bool wantNarrow = !d->mb_resolve_narrow_failed && (debugView != 8 && debugView != 9);
   // Depth and motion dimensions are no longer resource-sizing inputs for the
   // gather: it samples the game's textures directly and the conversion scale is a
-  // per-frame push. motionH still matters because it is the height of the
-  // tilemax_h intermediate, and motionW now also sizes the camera/object resolve
+  // per-frame push. motionW and motionH now size the camera/object resolve
   // output, which is full motion resolution.
   const bool needRecreate =
       !d->mb_resources_ready
@@ -8593,7 +8582,7 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   // -- Diagnostic chain isolation (mb_debug_chain) --
   // 0 Full, 1 Prep Only, 2 Gather Only. Branched here rather than in a shader
   // because every gate in this chain is already a CPU decision (including the
-  // TileMax axis), and because "Gather Only" must not touch passes 1-5 at all.
+  // TileMax dispatch), and because "Gather Only" must not touch passes 1-5 at all.
   //
   //   chain | prep valid | runPrep | runGather | half-res downsample
   //   ------+------------+---------+-----------+---------------------
@@ -8689,23 +8678,14 @@ static reshade::api::resource_view RunMotionBlur(reshade::api::command_list* cl,
   const reshade::api::resource_view motionForChain = runResolve ? d->mb_resolve_srv : motionSrc;
 
   if (runPrep) {
-  {  // P1: TileMax, horizontal (separable, paper Section 3) over the blended motion
+  {  // P1: TileMax over the blended motion, one thread group per tile (paper Section 3)
     cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
-    shader_injection.mb_pass = 0.f;
     reshade::api::resource_view srvs[1] = {motionForChain};
-    apply(kMbTileMax, srvs, 1, d->mb_tilemax_h_uav);
-    cl->dispatch((TX + 7u) / 8u, (MH + 7u) / 8u, 1u);
-    bar(d->mb_tilemax_h_texture, UA, SR);
-  }
-  {  // P2: TileMax, vertical
-    cl->bind_pipeline(AC, d->mb_pipelines[kMbTileMax]);
-    shader_injection.mb_pass = 1.f;
-    reshade::api::resource_view srvs[1] = {d->mb_tilemax_h_srv};
     apply(kMbTileMax, srvs, 1, d->mb_tilemax_uav);
-    cl->dispatch((TX + 7u) / 8u, (TY + 7u) / 8u, 1u);
+    cl->dispatch(TX, TY, 1u);
     bar(d->mb_tilemax_texture, UA, SR);
   }
-  {  // P3: NeighborMax, 3x3 one-ring with Section 4.4 diagonal culling
+  {  // P2: NeighborMax, 3x3 one-ring with Section 4.4 diagonal culling
     cl->bind_pipeline(AC, d->mb_pipelines[kMbNeighborMax]);
     reshade::api::resource_view srvs[1] = {d->mb_tilemax_srv};
     apply(kMbNeighborMax, srvs, 1, d->mb_neighbormax_uav);

@@ -260,6 +260,8 @@ int MBSampleBucket(float vmaxUV) {
 // saving is bounded by divergence rather than by the mean. Rungs are tile-coherent
 // and 8x8 groups sit well inside a tile, so that is expected to be mild, but the
 // ladder's payoff is not strictly linear in the average tap count.
+// The gather pair-unrolls its taps, so the result must be even. Every rung here is
+// even and the caller clamps maxSamples to an even value.
 uint MBSampleCount(int bucket, uint maxSamples) {
   uint n = 4u;
   if (bucket == 2) n = 6u;

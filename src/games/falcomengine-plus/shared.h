@@ -474,12 +474,11 @@ struct ShaderInjectData {
   float mb_motion_w, mb_motion_h;   // game motion texture dims
   float mb_tiles_x, mb_tiles_y;     // tile grid dims
   float mb_tile_uv;                 // paper r in UV = mb_max_radius_px / 1080
-  float mb_pass;                    // TileMax axis selector: 0=X, 1=Y
   float mb_frame_index;             // IS-FAST volume slice
   float mb_motion_valid;            // 0/1 — 0 when the motion buffer is unavailable
   // Diagnostic chain selector, branched on the CPU (not read by any shader):
-  // 0 = Full (everything), 1 = Prep Only (the three prep dispatches, no gather),
-  // 2 = Gather Only (gather alone, reusing the previous frame's prep). Isolate
+  // 0 = Full (everything), 1 = Prep Only (TileMax, NeighborMax and the optional resolve, no
+  // gather), 2 = Gather Only (gather alone, reusing the previous frame's prep). Isolate
   // per-stage GPU cost. Gather Only reads a FROZEN tile grid, so it is not a
   // valid cost measurement while the scene is moving.
   float mb_debug_chain;
