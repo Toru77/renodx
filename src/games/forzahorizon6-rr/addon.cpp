@@ -219,6 +219,13 @@ bool DrawStatusPanel() {
   } else {
     ImGui::TextUnformatted("Redirect: off — the game's DLSS SR runs unchanged");
   }
+  if (d.guides.created) {
+    ImGui::Text(
+        "guides: placeholder %ux%u (recreates %u)", d.guides.width, d.guides.height,
+        d.guides.recreates);
+  } else if (!d.guides.last_error.empty()) {
+    ImGui::TextColored(kColorWarn, "guides: %s", d.guides.last_error.c_str());
+  }
   return false;
 }
 
@@ -557,9 +564,9 @@ bool DrawRrProbePanel() {
 bool DrawSlLogPanel() {
   const sl_rr::Diagnostics d = sl_rr::CaptureDiagnostics();
   ImGui::Text(
-      "callback: %s, verbose: %s, messages: %llu (warn/error: %llu)",
-      d.sl_log_callback_installed ? "installed by mod" : "game-provided",
-      d.sl_log_verbose ? "requested" : "default",
+      "callback: %s (game chained: %s), verbose: %s, messages: %llu (warn/error: %llu)",
+      d.sl_log_callback_installed ? "installed by mod" : "not installed",
+      d.sl_log_game_chained ? "yes" : "no", d.sl_log_verbose ? "requested" : "default",
       static_cast<unsigned long long>(d.sl_log_total),
       static_cast<unsigned long long>(d.sl_log_warn_errors));
   if (d.sl_log_last_problems.empty() && d.sl_log_last.empty()) {

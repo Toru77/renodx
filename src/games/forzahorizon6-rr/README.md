@@ -4,13 +4,13 @@ Ray Reconstruction mod for FH6 via the game's own Streamline instance
 (`sl.interposer.dll`): intercept the DLSS-SR evaluation, answer it with
 `kFeatureDLSS_RR`, and supply the guide buffers the game does not provide.
 
-**Status: M2 implemented** — the game's `slEvaluateFeature(DLSS)` is redirected to
+**Status: M2c implemented** — the game's `slEvaluateFeature(DLSS)` is redirected to
 `kFeatureDLSS_RR` with `DLSSDOptions` mirrored from the game's own settings
-(internal resolution stays game-controlled) and the world/view matrices derived
-per frame from `sl::Constants`, strict per-frame fallback to SR on any failure,
-and a live A/B toggle. Streamline's own log messages are captured for
-diagnostics. No guide buffers yet — RR runs on the tags the game already
-provides.
+(internal resolution stays game-controlled), the world/view matrices derived
+per frame from `sl::Constants`, and the guide tags DLSS-RR **requires**
+(Albedo, SpecularAlbedo, NormalRoughness) supplied as placeholder textures
+until the M3 rrg pass provides real content. Strict per-frame fallback to SR
+on any failure, live A/B toggle, and full Streamline log capture.
 
 ## Goal roadmap
 
@@ -20,10 +20,13 @@ provides.
 4. ~~M1.5: DLSS-RR load path (slInit injection + runtime fallback) + full
    option/requirement capture in the report.~~
 5. ~~M2: SR → RR redirect + strict fallback (prove the swap, live A/B).~~
-6. **M3:** NormalRoughness guide from G-buffer T3 (gloss → roughness).
-7. M4: Specular motion vectors + hit distance from the DXR trace outputs.
-8. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
-9. Later: muting SSR layering on RT reflections; denoiser bypass.
+6. ~~M2c: guide provisioning (RR refuses to evaluate without Albedo,
+   SpecularAlbedo, NormalRoughness) with placeholder content.~~
+7. **M3:** Real guides — NormalRoughness from G-buffer T3 (gloss → roughness),
+   Albedo from T0, SpecularAlbedo approximation.
+8. M4: Specular motion vectors + hit distance from the DXR trace outputs.
+9. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
+10. Later: muting SSR layering on RT reflections; denoiser bypass.
 
 FH6 ships DLSS Super Resolution only — RR does not exist in-game, so it has to
 be injected. Streamline provides the RR plugin (`sl.dlss_d.dll`) and runtime
@@ -127,41 +130,69 @@ no log reading required:
 Buttons: **Probe DLSS-RR** / **Probe all features** (runs at the next in-game
 Streamline call), **Copy report** / **Write report to log**, **Reset capture**.
 
-## M2 redirect behavior
+## M2c redirect behavior
 
 Per frame, when the game evaluates `kFeatureDLSS` with the toggle on:
 
 1. Captured SR options are mirrored into `DLSSDOptions` (mode, output size,
-   HDR flag, exposures, presets), and `worldToCameraView` /
-   `cameraViewToWorld` are rebuilt from the game's `sl::Constants` camera
-   basis using Streamline's own convention (`sl_matrix_helpers.h`). The game's
-   in-game DLSS settings therefore keep controlling internal resolution.
-2. `slDLSSDSetOptions` is called for the game's viewport, then
+   HDR flag, exposures, presets), `worldToCameraView` / `cameraViewToWorld`
+   are rebuilt from the game's `sl::Constants` camera basis using Streamline's
+   own convention (`sl_matrix_helpers.h`), and `normalRoughnessMode` is set to
+   packed. The game's in-game DLSS settings therefore keep controlling
+   internal resolution.
+2. Guide textures (render-sized, created once per resolution via the game's
+   D3D12 device) are ensured: `NormalRoughness` RGBA16F (flat view normal +
+   roughness 1), `Albedo` RGBA8 gray, `SpecularAlbedo` RGBA8 black. DLSS-RR's
+   plugin refuses to evaluate without these three tags — they are **required
+   inputs**, not quality options.
+3. `slDLSSDSetOptions` is called for the game's viewport, then
    `slEvaluateFeature(kFeatureDLSS_RR, ...)` runs with the game's own frame
-   token, inputs and command list — the game's tags/constants for that frame
-   are already in place.
-3. Any failure (functions unavailable, no captured options/constants,
-   SetOptions or evaluate error) falls back to the untouched SR evaluate for
-   that frame, counted with a reason in the report; redirect stays on and
-   retries next frame.
+   token and command list, extended with local `ResourceTag` entries for the
+   three guides (sl.common checks local tags before the frame's global tag
+   store). The game's own tags/constants for that frame are already in place.
+4. Any failure (functions, options, constants, guides, SetOptions or evaluate
+   error) falls back to the untouched SR evaluate for that frame, counted with
+   a reason in the report; redirect stays on and retries next frame.
 
-Expected visual result at M2: RR denoises/upscales the game's already
-composited color with no guide buffers yet — a modest change vs SR, not full
-RR quality. The real gains land with M3/M4 (guides) and the later SSR-mute.
+Expected visual result at M2c: RR evaluates end-to-end and replaces DLSS-SR,
+but since the guides are constants the image will be soft/mushy — this step
+proves the full RR pipeline. The real gains land with M3 (rrg pass decoding
+G-buffer T3 into the same NormalRoughness/Albedo textures) and M4.
 
 ## Streamline log capture
 
-At `slInit` the mod installs its own `logMessageCallback` (only when the game
-provides none) and can raise SL's log level to verbose (setting, restart
-required, default on). Streamline's warnings/errors are always delivered
-regardless of level. The last messages (plus a warn/error-only ring and
-repeat counts) appear in the **SL log (captured)** overlay panel and the
-`[SL log]` report section — this is how evaluate failures get their exact
-reason (e.g. missing tag names). The `[DLSS-RR probe]` report block also lists
-every loaded dlss/nvngx/NGX-store module, which identifies OTA plugin files
-whose names are hashes (e.g. `190_E658703.dll`).
+At `slInit` the mod installs its own `logMessageCallback` and chains the
+game's callback (if any) behind it, so the engine's logging stays intact. It
+can also raise SL's log level to verbose (setting, restart required, default
+on); Streamline's warnings/errors are always delivered regardless of level.
+The last messages (plus a warn/error-only ring and repeat counts) appear in
+the **SL log (captured)** overlay panel and the `[SL log]` report section —
+this is how evaluate failures get their exact reason (e.g. missing tag names).
+The `[DLSS-RR probe]` report block also lists every loaded dlss/nvngx/NGX-store
+module, which identifies OTA plugin files whose names are hashes
+(e.g. `190_E658703.dll`).
 
-## Build & verify (M2)
+## Guide textures (M2c)
+
+Streamline's RR plugin (`sl.dlss_d`) treats these tags as mandatory on every
+evaluate: `Albedo`, `SpecularAlbedo`, and `NormalRoughness` (packed mode) or
+`Normals`+`Roughness` (unpacked). Missing any returns
+`eErrorMissingInputParameter` ("Failed to find global tag '%s'" in the SL
+log). M2c therefore creates three render-sized textures once per resolution
+via the game's D3D12 device (upload staging + copy + barrier on the game's
+command list) and passes them as local `ResourceTag` entries in the evaluate
+inputs:
+
+| Tag | Format | Placeholder content | M3 replaces with |
+|---|---|---|---|
+| `NormalRoughness` | RGBA16F | flat view normal (0,0,1), roughness 1.0 | rrg decode of G-buffer T3 |
+| `Albedo` | RGBA8 | gray (0.5) | G-buffer T0 |
+| `SpecularAlbedo` | RGBA8 | black | material approximation |
+
+Old resources are retained for the session (Streamline may still hold raw
+pointers from earlier frames); they are recreated on resolution change.
+
+## Build & verify (M2c)
 
 - Build target: `forzahorizon6-rr` → `build/<config>/renodx-forzahorizon6-rr.addon64`.
 - Deploy next to ReShade (`dxgi.dll` slot) as an add-on DLL; keep the game's
@@ -173,13 +204,15 @@ whose names are hashes (e.g. `190_E658703.dll`).
     module list that shows the serving plugin (driver-store OTA files have
     hash names like `190_E658703.dll`).
   - `[RR redirect]` with `setting: on`, `redirected frames` growing at ~1 per
-    frame, `fallbacks` staying flat, and the `worldToCameraView row0/row3`
-    line filled from constants.
+    frame, `fallbacks` staying flat, `guides (placeholder)` with the render
+    size, and the `worldToCameraView row0/row3` line filled from constants.
   - `[evaluates]` DLSS-RR row counting evals with `lastResult=Result::eOk`.
-  - `[SL log]` warn/error ring free of `slEvaluateFeature` failures (if
-    anything still fails, it names the exact input).
+  - `[SL log]` with the mod's callback installed (game callback chained) and a
+    warn/error ring free of `slEvaluateFeature` failures (if anything still
+    fails, it names the exact input).
   - An A/B toggle check: turning the switch off restores the previous DLSS-SR
-    image; turning it on changes it again.
+    image; turning it on changes it again (expect the RR image to look
+    softer/mushier than SR — the guides are constants for now).
   - Optional visual confirmation: NVIDIA's DLSS indicator overlay shows the
     RR feature while redirect is on
     (`ShowDlssIndicator=1024` under `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore`).

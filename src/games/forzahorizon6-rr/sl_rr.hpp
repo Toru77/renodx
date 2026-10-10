@@ -548,6 +548,16 @@ struct SlLogEntry {
   uint32_t repeats = 0;  // consecutive duplicates collapsed
 };
 
+// M2c: the placeholder guide textures RR requires on every evaluate. The M3
+// rrg pass will write real content into the same resources.
+struct GuideInfo {
+  bool created = false;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t recreates = 0;
+  std::string last_error;
+};
+
 // M2: the game's DLSS-SR evaluate redirected to DLSS-RR, with strict
 // per-frame fallback to the untouched SR call on any failure.
 struct RrRedirectState {
@@ -636,9 +646,11 @@ struct Diagnostics {
   DlssOptionsCapture dlss_options;
   RrProbeState rr_probe;
   RrRedirectState rr_redirect;
+  GuideInfo guides;
 
   // Streamline's own log messages (captured via Preferences::logMessageCallback)
   bool sl_log_callback_installed = false;
+  bool sl_log_game_chained = false;
   bool sl_log_verbose = false;
   uint64_t sl_log_total = 0;
   uint64_t sl_log_warn_errors = 0;
@@ -709,30 +721,39 @@ inline void RecordEvaluateLocked(
   }
 }
 
+// The game's own log callback (if any), forwarded to after our capture so the
+// engine's logging stays intact.
+inline sl::PFun_LogMessageCallback* chained_log_callback = nullptr;
+
 // Streamline delivers its own log messages here (installed into Preferences
-// during slInit when the game has no callback of its own). Bounded capture:
+// during slInit, chaining the game's callback if present). Bounded capture:
 // a ring of the last messages plus a ring of the last warn/error messages,
 // with consecutive duplicates collapsed.
 inline void SlLogMessageCallback(sl::LogType type, const char* message) {
   if (message == nullptr) return;
-  const std::lock_guard lock(diagnostics_mutex);
-  ++diagnostics.sl_log_total;
-  const int type_int = static_cast<int>(type);
-  const auto push = [&](std::vector<SlLogEntry>& ring, size_t capacity) {
-    if (!ring.empty() && ring.back().type == type_int && ring.back().message == message) {
-      ++ring.back().repeats;
-      return;
+  {
+    const std::lock_guard lock(diagnostics_mutex);
+    ++diagnostics.sl_log_total;
+    const int type_int = static_cast<int>(type);
+    const auto push = [&](std::vector<SlLogEntry>& ring, size_t capacity) {
+      if (!ring.empty() && ring.back().type == type_int && ring.back().message == message) {
+        ++ring.back().repeats;
+        return;
+      }
+      if (ring.size() >= capacity) ring.erase(ring.begin());
+      SlLogEntry entry{};
+      entry.type = type_int;
+      entry.message = message;
+      ring.push_back(std::move(entry));
+    };
+    push(diagnostics.sl_log_last, 12);
+    if (type != sl::LogType::eInfo) {
+      ++diagnostics.sl_log_warn_errors;
+      push(diagnostics.sl_log_last_problems, 8);
     }
-    if (ring.size() >= capacity) ring.erase(ring.begin());
-    SlLogEntry entry{};
-    entry.type = type_int;
-    entry.message = message;
-    ring.push_back(std::move(entry));
-  };
-  push(diagnostics.sl_log_last, 12);
-  if (type != sl::LogType::eInfo) {
-    ++diagnostics.sl_log_warn_errors;
-    push(diagnostics.sl_log_last_problems, 8);
+  }
+  if (chained_log_callback != nullptr) {
+    chained_log_callback(type, message);
   }
 }
 
@@ -1250,6 +1271,194 @@ inline sl::Result WrappedDlssGetOptimalSettings(
 }
 
 // ---------------------------------------------------------------------------
+// M2c: placeholder guide resources. DLSS-RR refuses to evaluate without
+// Albedo, SpecularAlbedo and NormalRoughness tags, so the redirect supplies
+// render-sized constant-filled textures through the evaluate inputs. The M3
+// rrg pass will write real data into these same resources.
+// ---------------------------------------------------------------------------
+
+struct GuideResources {
+  bool created = false;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  ID3D12Resource* normal_roughness = nullptr;
+  ID3D12Resource* normal_roughness_upload = nullptr;
+  ID3D12Resource* albedo = nullptr;
+  ID3D12Resource* albedo_upload = nullptr;
+  ID3D12Resource* specular_albedo = nullptr;
+  ID3D12Resource* specular_albedo_upload = nullptr;
+};
+
+inline GuideResources guide_resources;
+inline uint32_t guide_recreates = 0;
+inline std::string guide_last_error;
+// Retired resources are never released mid-session: Streamline may still hold
+// raw pointers to tagged resources from earlier frames.
+inline std::vector<ID3D12Resource*> retired_guide_resources;
+
+inline void RetireGuideResources() {
+  const auto retire = [](ID3D12Resource*& texture, ID3D12Resource*& upload) {
+    if (texture != nullptr) {
+      retired_guide_resources.push_back(texture);
+      texture = nullptr;
+    }
+    if (upload != nullptr) {
+      retired_guide_resources.push_back(upload);
+      upload = nullptr;
+    }
+  };
+  retire(guide_resources.normal_roughness, guide_resources.normal_roughness_upload);
+  retire(guide_resources.albedo, guide_resources.albedo_upload);
+  retire(guide_resources.specular_albedo, guide_resources.specular_albedo_upload);
+  guide_resources.created = false;
+  guide_resources.width = 0;
+  guide_resources.height = 0;
+}
+
+// Creates one DEFAULT-heap texture, fills it from a single-pixel pattern via
+// an UPLOAD staging texture, records the copy + barrier on the game's command
+// list, and leaves it in a shader-readable state.
+inline bool CreateGuideTexture(
+    ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height,
+    DXGI_FORMAT format, const void* pixel, uint32_t pixel_bytes, const char* name,
+    ID3D12Resource** out_texture, ID3D12Resource** out_upload) {
+  const auto fail = [&](const char* stage) {
+    guide_last_error = std::string(name) + ": " + stage;
+    return false;
+  };
+
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc = {1, 0};
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+  D3D12_HEAP_PROPERTIES upload_heap{};
+  upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  upload_heap.CreationNodeMask = 1;
+  upload_heap.VisibleNodeMask = 1;
+
+  ID3D12Resource* upload = nullptr;
+  HRESULT hr = device->CreateCommittedResource(
+      &upload_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+      IID_PPV_ARGS(&upload));
+  if (FAILED(hr)) return fail("upload CreateCommittedResource failed");
+
+  const uint32_t row_bytes = width * pixel_bytes;
+  const uint32_t row_pitch =
+      (row_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+      * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+
+  void* mapped = nullptr;
+  const D3D12_RANGE read_range{0, 0};
+  hr = upload->Map(0, &read_range, &mapped);
+  if (FAILED(hr) || mapped == nullptr) {
+    upload->Release();
+    return fail("upload Map failed");
+  }
+  for (uint32_t y = 0; y < height; ++y) {
+    auto* row = static_cast<uint8_t*>(mapped) + static_cast<size_t>(row_pitch) * y;
+    for (uint32_t x = 0; x < width; ++x) {
+      memcpy(row + static_cast<size_t>(x) * pixel_bytes, pixel, pixel_bytes);
+    }
+  }
+  upload->Unmap(0, nullptr);
+
+  D3D12_HEAP_PROPERTIES default_heap{};
+  default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  default_heap.CreationNodeMask = 1;
+  default_heap.VisibleNodeMask = 1;
+
+  ID3D12Resource* texture = nullptr;
+  hr = device->CreateCommittedResource(
+      &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+      IID_PPV_ARGS(&texture));
+  if (FAILED(hr)) {
+    upload->Release();
+    return fail("CreateCommittedResource failed");
+  }
+
+  D3D12_TEXTURE_COPY_LOCATION source{};
+  source.pResource = upload;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source.PlacedFootprint.Footprint.Format = format;
+  source.PlacedFootprint.Footprint.Width = width;
+  source.PlacedFootprint.Footprint.Height = height;
+  source.PlacedFootprint.Footprint.Depth = 1;
+  source.PlacedFootprint.Footprint.RowPitch = row_pitch;
+
+  D3D12_TEXTURE_COPY_LOCATION destination{};
+  destination.pResource = texture;
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  destination.SubresourceIndex = 0;
+  cmd->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+  D3D12_RESOURCE_BARRIER barrier{};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = texture;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                  | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  cmd->ResourceBarrier(1, &barrier);
+
+  *out_texture = texture;
+  *out_upload = upload;
+  return true;
+}
+
+inline bool EnsureGuideResources(
+    ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height) {
+  if (guide_resources.created && guide_resources.width == width
+      && guide_resources.height == height) {
+    return true;
+  }
+  if (device == nullptr) {
+    guide_last_error = "no D3D12 device captured";
+    return false;
+  }
+  if (cmd == nullptr) {
+    guide_last_error = "no command list on evaluate";
+    return false;
+  }
+
+  RetireGuideResources();
+  guide_last_error.clear();
+
+  // Flat view-space normal (0, 0, 1) in RGB, roughness 1.0 in alpha (RGBA16F).
+  const uint16_t nr_pixel[4] = {0x0000, 0x0000, 0x3C00, 0x3C00};
+  // Neutral gray albedo, black specular albedo (RGBA8, linear).
+  const uint8_t albedo_pixel[4] = {128, 128, 128, 255};
+  const uint8_t specular_pixel[4] = {0, 0, 0, 255};
+
+  if (!CreateGuideTexture(
+          device, cmd, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, nr_pixel, sizeof(nr_pixel),
+          "NormalRoughness", &guide_resources.normal_roughness,
+          &guide_resources.normal_roughness_upload)
+      || !CreateGuideTexture(
+          device, cmd, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, albedo_pixel,
+          sizeof(albedo_pixel), "Albedo", &guide_resources.albedo,
+          &guide_resources.albedo_upload)
+      || !CreateGuideTexture(
+          device, cmd, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, specular_pixel,
+          sizeof(specular_pixel), "SpecularAlbedo", &guide_resources.specular_albedo,
+          &guide_resources.specular_albedo_upload)) {
+    RetireGuideResources();
+    return false;
+  }
+
+  guide_resources.created = true;
+  guide_resources.width = width;
+  guide_resources.height = height;
+  ++guide_recreates;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // hooks — observe and forward, nothing else
 // ---------------------------------------------------------------------------
 
@@ -1287,7 +1496,9 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   // (optionally) the log callback/level are touched, so everything else (paths,
   // callbacks, version) stays exactly as the game wrote it. Restored right
   // after the call.
-  const bool install_log_callback = pref.logMessageCallback == nullptr;
+  const bool game_had_log_callback =
+      pref.logMessageCallback != nullptr && pref.logMessageCallback != SlLogMessageCallback;
+  const bool install_log_callback = pref.logMessageCallback != SlLogMessageCallback;
   const bool raise_log_level = GetSlLogVerbose() && pref.logLevel != sl::LogLevel::eVerbose;
   sl::Preferences& mutable_pref = const_cast<sl::Preferences&>(pref);
   const sl::Feature* const original_features = pref.featuresToLoad;
@@ -1299,6 +1510,7 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
     mutable_pref.numFeaturesToLoad = patched_count;
   }
   if (install_log_callback) {
+    chained_log_callback = pref.logMessageCallback;
     mutable_pref.logMessageCallback = SlLogMessageCallback;
   }
   if (raise_log_level) {
@@ -1331,6 +1543,7 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   diagnostics.init_render_api = static_cast<int>(pref.renderAPI);
   diagnostics.init_pref_version = static_cast<uint32_t>(pref.structVersion);
   diagnostics.sl_log_callback_installed = install_log_callback;
+  diagnostics.sl_log_game_chained = game_had_log_callback;
   diagnostics.sl_log_verbose = raise_log_level;
   diagnostics.init_show_console = pref.showConsole;
   diagnostics.init_num_plugin_paths = pref.numPathsToPlugins;
@@ -1478,11 +1691,21 @@ inline sl::Result HookedSlEvaluateFeature(
     DlssOptionsCapture captured;
     sl::Constants constants{};
     bool constants_ready = false;
+    void* d3d_device = nullptr;
+    uint32_t input_width = 0;
+    uint32_t input_height = 0;
     {
       const std::lock_guard lock(diagnostics_mutex);
       captured = diagnostics.dlss_options;
       constants_ready = diagnostics.constants_seen;
       constants = diagnostics.constants;
+      d3d_device = reinterpret_cast<void*>(diagnostics.device);
+      for (const auto& tag : diagnostics.tags) {
+        if (tag.type != sl::kBufferTypeScalingInputColor) continue;
+        input_width = tag.extent_w;
+        input_height = tag.extent_h;
+        break;
+      }
     }
 
     if (real_dlssd_set_options == nullptr) {
@@ -1512,6 +1735,28 @@ inline sl::Result HookedSlEvaluateFeature(
     if (!BuildCameraMatricesFromConstants(constants, world_to_view, view_to_world)) {
       return fallback("camera basis missing in slSetConstants", kNever, kNever);
     }
+    if (input_width == 0 || input_height == 0) {
+      return fallback("ScalingInputColor extent not seen yet", kNever, kNever);
+    }
+
+    // RR refuses to evaluate without Albedo, SpecularAlbedo and
+    // NormalRoughness; placeholder textures carry constant content until the
+    // M3 rrg pass writes real data.
+    const auto publish_guides = [&]() {
+      const std::lock_guard lock(diagnostics_mutex);
+      diagnostics.guides.created = guide_resources.created;
+      diagnostics.guides.width = guide_resources.width;
+      diagnostics.guides.height = guide_resources.height;
+      diagnostics.guides.recreates = guide_recreates;
+      diagnostics.guides.last_error = guide_last_error;
+    };
+    if (!EnsureGuideResources(
+            reinterpret_cast<ID3D12Device*>(d3d_device),
+            reinterpret_cast<ID3D12GraphicsCommandList*>(cmd), input_width, input_height)) {
+      publish_guides();
+      return fallback("guides: " + guide_last_error, kNever, kNever);
+    }
+    publish_guides();
 
     sl::ViewportHandle viewport(0u);
     if (inputs != nullptr) {
@@ -1536,6 +1781,9 @@ inline sl::Result HookedSlEvaluateFeature(
     }
     options.worldToCameraView = world_to_view;
     options.cameraViewToWorld = view_to_world;
+    // The placeholder guide carries roughness in the alpha channel of the
+    // normal texture (single packed NR tag), matching the M3 rrg plan.
+    options.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
     // DLSSD presets share the DLSS preset letter ordering.
     options.dlaaPreset = static_cast<sl::DLSSDPreset>(captured.presets[0]);
     options.qualityPreset = static_cast<sl::DLSSDPreset>(captured.presets[1]);
@@ -1550,8 +1798,50 @@ inline sl::Result HookedSlEvaluateFeature(
           "slDLSSDSetOptions " + ResultName(static_cast<int>(set_result)),
           static_cast<int>(set_result), kNever);
     }
-    const auto rr_result =
-        real_sl_evaluate_feature(sl::kFeatureDLSS_RR, frame, inputs, num_inputs, cmd);
+    // The guide tags ride in the evaluate inputs array — sl.common checks
+    // those before the frame's global tag store.
+    const uint32_t srv_state =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    sl::Resource normal_roughness_resource(
+        sl::ResourceType::eTex2d, guide_resources.normal_roughness, srv_state);
+    normal_roughness_resource.width = input_width;
+    normal_roughness_resource.height = input_height;
+    normal_roughness_resource.nativeFormat =
+        static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT);
+    sl::Resource albedo_resource(sl::ResourceType::eTex2d, guide_resources.albedo, srv_state);
+    albedo_resource.width = input_width;
+    albedo_resource.height = input_height;
+    albedo_resource.nativeFormat = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+    sl::Resource specular_albedo_resource(
+        sl::ResourceType::eTex2d, guide_resources.specular_albedo, srv_state);
+    specular_albedo_resource.width = input_width;
+    specular_albedo_resource.height = input_height;
+    specular_albedo_resource.nativeFormat = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+
+    sl::Extent guide_extent{0, 0, input_width, input_height};
+    sl::ResourceTag tag_normal_roughness(
+        &normal_roughness_resource, sl::kBufferTypeNormalRoughness,
+        sl::ResourceLifecycle::eValidUntilPresent, &guide_extent);
+    sl::ResourceTag tag_albedo(
+        &albedo_resource, sl::kBufferTypeAlbedo, sl::ResourceLifecycle::eValidUntilPresent,
+        &guide_extent);
+    sl::ResourceTag tag_specular_albedo(
+        &specular_albedo_resource, sl::kBufferTypeSpecularAlbedo,
+        sl::ResourceLifecycle::eValidUntilPresent, &guide_extent);
+
+    const sl::BaseStructure* extended_inputs[8] = {};
+    uint32_t extended_count = 0;
+    if (inputs != nullptr) {
+      for (uint32_t i = 0; i < num_inputs && extended_count < 5; ++i) {
+        extended_inputs[extended_count++] = inputs[i];
+      }
+    }
+    extended_inputs[extended_count++] = &tag_normal_roughness;
+    extended_inputs[extended_count++] = &tag_albedo;
+    extended_inputs[extended_count++] = &tag_specular_albedo;
+
+    const auto rr_result = real_sl_evaluate_feature(
+        sl::kFeatureDLSS_RR, frame, extended_inputs, extended_count, cmd);
     if (rr_result != sl::Result::eOk) {
       return fallback(
           "RR evaluate " + ResultName(static_cast<int>(rr_result)),
@@ -2416,11 +2706,18 @@ inline std::string BuildReport() {
         << m[0].w << ") row3=(" << m[3].x << ", " << m[3].y << ", " << m[3].z << ", " << m[3].w
         << ")\n";
     }
+    if (d.guides.created) {
+      s << "  guides (placeholder): " << d.guides.width << "x" << d.guides.height
+        << " recreates=" << d.guides.recreates
+        << "  NR=RGBA16F(flat normal, roughness 1) Albedo=RGBA8(gray) SpecAlbedo=RGBA8(black)\n";
+    } else if (!d.guides.last_error.empty()) {
+      s << "  guides: not created (" << d.guides.last_error << ")\n";
+    }
   }
 
   s << "\n[SL log]\n";
-  s << "  callback installed by mod: "
-    << (d.sl_log_callback_installed ? "yes" : "no (game provided one)")
+  s << "  callback installed by mod: " << (d.sl_log_callback_installed ? "yes" : "no")
+    << " (game callback chained: " << (d.sl_log_game_chained ? "yes" : "no") << ")"
     << "  verbose requested: " << (d.sl_log_verbose ? "yes" : "no") << "\n";
   s << "  messages: " << d.sl_log_total << " (warn/error: " << d.sl_log_warn_errors << ")\n";
   if (!d.sl_log_last_problems.empty()) {
