@@ -140,6 +140,16 @@ inline std::mutex pipeline_mutex;
 inline std::unordered_map<uint64_t, uint32_t> pipeline_hashes;  // pipeline.handle -> hash
 inline uint64_t pipelines_tracked = 0;
 
+// Returns true when the given shader hash has been observed at least once this
+// session. Runtime shader replacements compile to a new payload whose CRC32 is
+// not any game hash; if that payload CRC shows up here, the replaced pipeline
+// is provably the one the game dispatches. Used by the report to verify that a
+// toggle actually engaged instead of assuming it did.
+inline bool WasSeen(uint32_t hash) {
+  const std::lock_guard lock(state_mutex);
+  return cumulative_counts.find(hash) != cumulative_counts.end();
+}
+
 inline void OnInitPipeline(
     reshade::api::device*, reshade::api::pipeline_layout, uint32_t subobject_count,
     const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline) {

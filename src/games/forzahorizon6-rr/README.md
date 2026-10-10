@@ -215,16 +215,17 @@ which also primes the runtime shader-replacement path the denoise bypass uses.
 ## RT denoise bypass (M4)
 
 Live, togglable replacement of the confirmed-live resolve shaders with
-minimal single-sample variants that skip the game's neighborhood filtering
+minimal per-frame variants that skip the game's neighborhood filtering
 (`denoise.hpp` plus the root shader files `0x*.cs_6_6.hlsl`):
 
 | Hash | RT tier | Live role (from the dump) | Bypass |
 |---|---|---|---|
-| `0x209AB6A4` | all | resolve-4tap: four-pixel stochastic reprojected gather with weight normalize | passes the pixel's own history samples through, with the original's hash-jittered depth guard and all-taps-rejected fallbacks |
-| `0x596D3E8F` | medium | resolve-spatial: large shared-memory spatial filter with per-material paths and counters | skips all accumulation and reproduces the original's own per-pixel material path (instance/material decode, YCoCg + normal-lobe transform, NaN guards); shared body in `resolve_spatial_bypass.hlsli` |
+| `0x209AB6A4` | all | resolve-4tap: four-pixel stochastic reprojected gather with weight normalize | passes the pixel's own samples straight through (no gather, no reprojection weighting), with the original's hash-jittered depth guard and invalid-depth fallbacks |
+| `0x596D3E8F` | medium | resolve-spatial: large shared-memory spatial filter with per-material paths and counters | faithful current-frame port of the original's per-pixel paths (material decode, 3x3 normal/depth-weighted reconstruction, YCoCg + normal-lobe output, confidence gates, NaN guards) with the history blend, world-cache blend and wave smoothing removed; shared body in `resolve_spatial_raw.hlsli` |
 | `0x4DAF8A48` | high | same spatial filter stage, recompiled permutation (identical bindings and per-pixel path) | same shared body |
-| `0x0B33C6D8` | medium | resolve-bilateral: nine-tap bilateral gather with Co/Cg + normal-lobe reconstruction | bilinear reconstruction of the half-res pair (no bilateral weighting, no nearest blocks) |
-| `0x14FA42AB` | high | reconstruct stage, recompiled permutation: nearest `px / m[20]` sampling | bilinear reconstruction of the half-res pair |
+| `0x0B33C6D8` | medium | resolve-bilateral: nine-tap bilateral gather with Co/Cg + normal-lobe reconstruction | raw nearest sample of the half-res pair at the original's center-tap coordinate (no bilateral weighting, no averaging) |
+| `0x14FA42AB` | high | reconstruct stage, recompiled permutation: nearest `px / m[20]` sampling | raw nearest sample at the original's own `px / m[20]` coordinate |
+| `0xD9CDA0AC` | all | probe accumulation blend: `out = A + w·B`, six SH coefficients per probe, runs in budgeted slices (~5x/s) — the multi-second GI refinement ramp | full-weight integration (`out = A + B`) per A/B toggle "Bypass probe smoothing"; revert if the brightness balance shifts |
 
 RT quality tiers compile different permutations of the spatial/reconstruct
 stages, so each switch replaces every known permutation hash; whichever
@@ -243,10 +244,11 @@ show each switch, its applied state and the covered hashes.
 
 These bypasses are structure-preserving: each keeps the original shader's
 bindings, register spaces, guards, energy clamps and output semantics, and
-removes only the filtering. The 4-tap bypass still reads the half-res pair
-nearest, so 2x2 blockier resolve output is expected from that switch alone;
-the bilateral switch replaces the game's nearest/bilateral reconstruction with
-a bilinear one, which removes those blocks.
+removes only the filtering. The 4-tap bypass passes the pixel's own samples
+straight through; the bilateral switch takes a raw nearest sample of the
+half-res pair at the original's own tap coordinate (medium `px >> 1`, high
+`px / m[20]`), so the resolve feed keeps the rawest per-frame noise at the
+cost of 2x2 half-res block structure.
 
 Bypass verify (A/B): in gameplay with RR on, flip one switch at a time and
 watch the resolve feed change (filtering off → rawer/noisier reflection+GI
@@ -267,7 +269,7 @@ signature instead):
 | Guide | Source | Notes |
 |---|---|---|
 | NormalRoughness (RGBA16F, packed mode) | our compute pass decodes the packed-normal target (RT3, `r32_uint`) and packs a roughness candidate from material bits (RT2, `r8g8b8a8_uint`) | normal packing is the same 12+12-bit layout the game's own resolve chain decodes; dump the generated texture to inspect |
-| DiffuseAlbedo | captured albedo target (RT4, `r8g8b8a8_srgb`) directly | image-confirmed car paint; hardware sRGB decode applies on read |
+| DiffuseAlbedo | linearized copy of the captured albedo target (RT4, `r8g8b8a8_srgb`) written by the same pass (RGBA16F) | DLSS-RR requires linear albedo and rejects sRGB; the sRGB G-buffer target is decoded by hardware on read and stored linear |
 | SpecularAlbedo | generated in the same pass from albedo: `0.04 + albedo²·0.5` | approximation — no first-class live specular target confirmed yet; RT5 is the paint/clearcoat layer, RT1 is flat |
 
 Mechanics: both `bind_render_targets_and_depth_stencil` and `begin_render_pass`
@@ -302,7 +304,7 @@ inputs:
 | Tag | Format | Placeholder content | M3 replaces with |
 |---|---|---|---|
 | `NormalRoughness` | RGBA16F | flat view normal (0,0,1), roughness 1.0 | rrg decode of G-buffer T3 |
-| `Albedo` | RGBA8 | gray (0.5) | G-buffer T0 |
+| `Albedo` | RGBA8 | gray (0.5) | linearized G-buffer T0 (RGBA16F) |
 | `SpecularAlbedo` | RGBA8 | black | material approximation |
 
 Old resources are retained for the session (Streamline may still hold raw

@@ -27,6 +27,7 @@
 #include "./pass_map.hpp"
 #include "./denoise.hpp"
 #include "./guides.hpp"
+#include "./dataflow.hpp"
 
 namespace {
 
@@ -45,14 +46,29 @@ float rr_redirect_setting = 1.f;
 // M4 experiment: live per-pipeline swaps of the three RT resolve shaders,
 // one switch each so the bypasses can be A/B-tested in isolation.
 float rr_denoise_gather_setting = 0.f;
-float rr_denoise_filter_setting = 0.f;
+// Spatial filter selector: 0 = original, 1 = raw current-frame port.
+// Applied through denoise::SetSpatialVariant so the two tiers' payloads
+// can never be registered together (single control, no cross-writes).
+float rr_spatial_mode_setting = 0.f;
 float rr_denoise_bilateral_setting = 0.f;
+float rr_denoise_probe_setting = 0.f;
+// GI temporal resolve bypass (0x087EDF0D/0xAD556EBA): replaces the
+// reprojected previous-frame history with the current-frame probe estimate.
+float rr_denoise_gi_setting = 0.f;
+// Tile-refresh bypass (0x7A3FD6D7/0x9BFFD1F7): expands the full 160x90 tile
+// grid every frame instead of the sparse dirty-tile worklist.
+float rr_force_tile_refresh_setting = 0.f;
+// Diagnostics: per-dispatch dataflow capture for the report. Off by default
+// (the per-frame registry queries were the suspected source of the repeated
+// ReShade access-violation crashes); enable for one report round, then off.
+float rr_dataflow_capture_setting = 0.f;
 // M3a experiment: real RR guide buffers captured from the game's G-buffer.
 float rr_real_guides_setting = 0.f;
 float rr_guide_view_normals_setting = 1.f;
 float rr_guide_roughness_source_setting = 0.f;
 // Raises Streamline's own log level while the mod captures its messages.
-float rr_sl_log_verbose_setting = 1.f;
+// Off by default now (log-volume reduction); warnings/errors are always kept.
+float rr_sl_log_verbose_setting = 0.f;
 // DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
 // current RR 4.5 default preset). Indices match the slider labels.
 constexpr uint32_t kRrPresetValues[6] = {1, 2, 3, 4, 5, 6};
@@ -696,7 +712,7 @@ bool DrawPassMapPanel() {
 // The one-click report: SL diagnostics plus the RT pass map.
 std::string FullReport() {
   return sl_rr::BuildReport() + pass_map::BuildReportSection() + denoise::BuildReportSection()
-         + guides::BuildReportSection();
+         + guides::BuildReportSection() + dataflow::BuildReportSection();
 }
 
 renodx::utils::settings::Settings settings = {
@@ -765,20 +781,29 @@ renodx::utils::settings::Settings settings = {
         },
     },
     new renodx::utils::settings::Setting{
-        .key = "RrDenoiseFilter",
-        .binding = &rr_denoise_filter_setting,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .key = "RrSpatialMode",
+        .binding = &rr_spatial_mode_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
-        .label = "Bypass spatial filter (0x596D3E8F / 0x4DAF8A48)",
+        .label = "Spatial filter variant",
         .section = "Ray Reconstruction",
-        .tooltip = "Replaces the large shared-memory spatial filter with the original's"
-                   " own single-sample material path (instance/material decode, energy"
-                   " clamp and NaN guards kept): no neighborhood accumulation. Covers"
-                   " both known RT-quality permutations (medium 0x596D3E8F, high"
-                   " 0x4DAF8A48); the game's dispatched variant is swapped. Applies"
-                   " within a frame.",
+        .tooltip = "off: original filter. raw (current-frame): replaces the"
+                   " original's shared-memory filter with a faithful port of"
+                   " its own per-pixel paths (material decode, 3x3"
+                   " normal/depth-weighted sample reconstruction, YCoCg +"
+                   " normal-lobe output, confidence gates, NaN guards) with"
+                   " all cross-frame state removed: no history blend, no"
+                   " world-cache blend, no wave smoothing. GI brightness is"
+                   " preserved; the resolve feeds DLSS-RR a raw per-frame"
+                   " signal (expect visible sparkle where the game's temporal"
+                   " accumulation used to smooth it). Applies live; covers"
+                   " both RT-quality tiers.",
+        .labels = {"off", "raw (current-frame)"},
         .on_change_value = [](float, float value) {
-          denoise::SetEnabled(denoise::kSpatialHash, value != 0.f);
+          int variant = static_cast<int>(value);
+          if (variant < 0) variant = 0;
+          if (variant > 1) variant = 1;
+          denoise::SetSpatialVariant(variant);
         },
     },
     new renodx::utils::settings::Setting{
@@ -789,11 +814,70 @@ renodx::utils::settings::Settings settings = {
         .label = "Bypass bilateral gather (0x0B33C6D8 / 0x14FA42AB)",
         .section = "Ray Reconstruction",
         .tooltip = "Replaces the reconstruction/apply stage (medium: nine-tap bilateral"
-                   " 0x0B33C6D8, high: nearest 0x14FA42AB) with a bilinear reconstruction"
-                   " of the same resolve pair: no bilateral weighting and no 2x2-block"
-                   " nearest upsampling. Applies within a frame.",
+                   " 0x0B33C6D8, high: nearest 0x14FA42AB) with a raw nearest sample of"
+                   " the same resolve pair: no bilateral weighting and no averaging, so"
+                   " the resolve feed keeps the rawest per-frame noise (2x2 half-res"
+                   " blocks return). Applies within a frame.",
         .on_change_value = [](float, float value) {
           denoise::SetEnabled(denoise::kBilateralHash, value != 0.f);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDenoiseProbe",
+        .binding = &rr_denoise_probe_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bypass probe smoothing (0xD9CDA0AC)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the probe blend with the new contribution only (out = B),"
+                   " dropping the A-side state term entirely. Strictest no-accumulation"
+                   " variant of the DDGI probe path; if the probe chain is in the visible"
+                   " GI path the image shifts immediately (better or worse)."
+                   " Experimental A/B: revert if the A/B shows a regression.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kProbeBlendHash, value != 0.f);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDenoiseTemporal",
+        .binding = &rr_denoise_gi_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bypass GI temporal history (0x087EDF0D / 0xAD556EBA)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the two live GI resolve shaders (one per ray-signal"
+                   " ping-pong member). The originals reproject the previous"
+                   " frame's downsampled upscaled output using motion vectors and"
+                   " blend it into the current probe/signal estimate after"
+                   " material-ID validation. The replacements sample the current"
+                   " frame's probe estimate in place of the reprojected history,"
+                   " so the GI path stops accumulating across frames (raw"
+                   " per-frame GI for RR). Experimental A/B. Applies within a"
+                   " frame.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kGiResolveHashA, value != 0.f);
+          denoise::SetEnabled(denoise::kGiResolveHashB, value != 0.f);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrForceTileRefresh",
+        .binding = &rr_force_tile_refresh_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Force full-screen RT refresh (0x7A3FD6D7 / 0x9BFFD1F7)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the tile-refresh scheduler: the tile classifier"
+                   " normally expands only the dirty-tile worklist into the"
+                   " per-pixel ray queues, which lets a standing-still view"
+                   " converge over several frames. The replacements expand a"
+                   " rotating quarter (3600 tiles) of the full grid every frame"
+                   " instead - the largest window that fits the per-queue record"
+                   " capacity - with the engine's per-pixel sub-sampling and"
+                   " queue routing kept. Experimental A/B. Applies within a"
+                   " frame.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kTileExpandHash, value != 0.f);
+          denoise::SetEnabled(denoise::kTileArgsHash, value != 0.f);
         },
     },
     new renodx::utils::settings::Setting{
@@ -848,13 +932,30 @@ renodx::utils::settings::Settings settings = {
         .key = "RrSlLogVerbose",
         .binding = &rr_sl_log_verbose_setting,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
+        .default_value = 0.f,
         .label = "SL verbose log capture (diagnostics, restart required)",
         .section = "Ray Reconstruction",
         .tooltip = "Raises Streamline's log level to verbose while the mod captures its"
                    " messages (bounded, shown in the report). Warnings/errors are always"
                    " captured regardless of this switch.",
         .on_change_value = [](float, float value) { sl_rr::SetSlLogVerbose(value != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDataflowCapture",
+        .binding = &rr_dataflow_capture_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Dataflow capture (heavy diagnostics)",
+        .section = "Diagnostics",
+        .tooltip = "Captures every compute dispatch's descriptor-table bindings for"
+                   " the report (one sample per hash per frame). Off by default: the"
+                   " capture resolves thousands of descriptor slots per second"
+                   " through ReShade's registries and was the suspected source of"
+                   " recent crashes. Enable only for a report round, then disable"
+                   " again.",
+        .on_change_value = [](float, float value) {
+          dataflow::enabled.store(value != 0.f);
+        },
     },
     new renodx::utils::settings::Setting{
         .key = "RrPreset",
@@ -1059,6 +1160,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   pass_map::Use(fdw_reason);
   denoise::Use(fdw_reason);
   guides::Use(fdw_reason);
+  dataflow::Use(fdw_reason);
 
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     // Keep the boot values for the "restart required" hint and push the loaded
@@ -1070,8 +1172,17 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetRrRedirect(rr_redirect_setting != 0.f);
     sl_rr::SetSlLogVerbose(rr_sl_log_verbose_setting != 0.f);
     denoise::SetEnabled(denoise::kGatherHash, rr_denoise_gather_setting != 0.f);
-    denoise::SetEnabled(denoise::kSpatialHash, rr_denoise_filter_setting != 0.f);
+    int spatial_mode = static_cast<int>(rr_spatial_mode_setting);
+    if (spatial_mode < 0) spatial_mode = 0;
+    if (spatial_mode > 1) spatial_mode = 1;
+    denoise::SetSpatialVariant(spatial_mode);
     denoise::SetEnabled(denoise::kBilateralHash, rr_denoise_bilateral_setting != 0.f);
+    denoise::SetEnabled(denoise::kProbeBlendHash, rr_denoise_probe_setting != 0.f);
+    denoise::SetEnabled(denoise::kGiResolveHashA, rr_denoise_gi_setting != 0.f);
+    denoise::SetEnabled(denoise::kGiResolveHashB, rr_denoise_gi_setting != 0.f);
+    denoise::SetEnabled(denoise::kTileExpandHash, rr_force_tile_refresh_setting != 0.f);
+    denoise::SetEnabled(denoise::kTileArgsHash, rr_force_tile_refresh_setting != 0.f);
+    dataflow::enabled.store(rr_dataflow_capture_setting != 0.f);
     guides::enabled.store(rr_real_guides_setting != 0.f);
     guides::normals_view_space.store(rr_guide_view_normals_setting != 0.f);
     guides::roughness_source.store(static_cast<int32_t>(rr_guide_roughness_source_setting));

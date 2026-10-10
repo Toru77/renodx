@@ -6,8 +6,9 @@
 // (R32_UINT target, 12+12-bit packing at bits 8..19 / 20..31, as decoded by
 // the game's own resolve chain) and packs it with a roughness value the way
 // DLSS-RR wants it (ePacked: normal xyz + roughness in alpha). It also writes
-// an approximate SpecularAlbedo guide from the captured albedo (no
-// first-class live specular target has been identified yet).
+// a linear-albedo copy (DLSS-RR rejects sRGB albedo) and an approximate
+// SpecularAlbedo guide from the captured albedo (no first-class live specular
+// target identified yet).
 //
 // Root signature (created in guides.hpp), 6 root parameters:
 //   b0: 16 root constants: uint4 p + float4 m0/m1/m2
@@ -25,12 +26,14 @@
 //   t2: root SRV = albedo (r8g8b8a8_srgb G-buffer target, linearized on read)
 //   u0: root UAV = RGBA16F NormalRoughness output
 //   u1: root UAV = RGBA8 specular albedo output
+//   u2: root UAV = RGBA16F linear diffuse albedo output
 
 Texture2D<uint> g_normal_bits : register(t0);
 Texture2D<uint4> g_material_bits : register(t1);
 Texture2D<float4> g_albedo : register(t2);
 RWTexture2D<float4> g_out : register(u0);
 RWTexture2D<float4> g_spec : register(u1);
+RWTexture2D<float4> g_albedo_out : register(u2);
 
 cbuffer Params : register(b0)
 {
@@ -83,10 +86,15 @@ void main(uint3 id : SV_DispatchThreadID)
 
     g_out[id.xy] = float4(n, roughness);
 
+    // Linear diffuse albedo copy: DLSS-RR requires linear albedo and rejects
+    // sRGB textures; the sample is already linear (hardware sRGB decode on the
+    // t2 SRV read).
+    const float3 albedo = saturate(g_albedo.Load(int3(int2(id.xy), 0)).rgb);
+    g_albedo_out[id.xy] = float4(albedo, 1.0f);
+
     // Approximate specular albedo from the linearized sRGB albedo: dielectric
     // floor plus a squared-albedo term (the game's own F0 estimate used the
     // same albedo^2 shape against a 0.04 base).
-    const float3 albedo = saturate(g_albedo.Load(int3(int2(id.xy), 0)).rgb);
     const float3 specular = saturate(0.04f + albedo * albedo * 0.5f);
     g_spec[id.xy] = float4(specular, 1.0f);
 }

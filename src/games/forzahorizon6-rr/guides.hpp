@@ -11,8 +11,8 @@
  *     roughness candidate from the material target, by our own compute pass
  *     (fh6_guide_nr.cs_6_6.hlsl) dispatched on the game's command list right
  *     before the RR evaluate.
- *   - Albedo: fed straight from the captured sRGB albedo target (no copy;
- *     hardware sRGB decode applies on read).
+ *   - Albedo: linearized copy written by the same pass (DLSS-RR requires
+ *     linear albedo; the captured G-buffer target is sRGB and unsupported).
  *   - SpecularAlbedo: generated in the same pass from albedo (approximation;
  *     no first-class specular target has been confirmed live yet).
  *
@@ -200,20 +200,23 @@ struct GuidePass {
   D3D12_RESOURCE_STATES normal_roughness_state = D3D12_RESOURCE_STATE_COMMON;
   ID3D12Resource* specular = nullptr;
   D3D12_RESOURCE_STATES specular_state = D3D12_RESOURCE_STATE_COMMON;
+  ID3D12Resource* albedo_linear = nullptr;
+  D3D12_RESOURCE_STATES albedo_linear_state = D3D12_RESOURCE_STATE_COMMON;
   uint32_t width = 0;
   uint32_t height = 0;
   ID3D12RootSignature* root_signature = nullptr;
   ID3D12PipelineState* pso = nullptr;
-  // Typed texture access is not allowed through root descriptors, so all five
+  // Typed texture access is not allowed through root descriptors, so all six
   // bindings live in a shader-visible descriptor heap (validated offline on
   // WARP: only descriptor tables satisfy these resource declarations).
   // Because the game double-buffers its G-buffer, descriptors are written
-  // once per distinct resource set into 5-slot groups and never rewritten,
+  // once per distinct resource set into 6-slot groups and never rewritten,
   // which keeps in-flight frames safe.
   ID3D12DescriptorHeap* heap = nullptr;
   UINT heap_increment = 0;
   uint32_t next_group = 0;
-  std::map<std::array<uint64_t, 5>, uint32_t> groups;  // (normal, material, albedo, nr, spec) -> group index
+  // (normal, material, albedo, nr, spec, albedo_linear) -> group index
+  std::map<std::array<uint64_t, 6>, uint32_t> groups;
   bool init_failed = false;
 };
 
@@ -235,6 +238,11 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
     guide_pass.specular->Release();
     guide_pass.specular = nullptr;
     guide_pass.specular_state = D3D12_RESOURCE_STATE_COMMON;
+  }
+  if (guide_pass.albedo_linear != nullptr) {
+    guide_pass.albedo_linear->Release();
+    guide_pass.albedo_linear = nullptr;
+    guide_pass.albedo_linear_state = D3D12_RESOURCE_STATE_COMMON;
   }
 
   D3D12_HEAP_PROPERTIES heap{};
@@ -278,15 +286,38 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
     return false;
   }
 
+  D3D12_RESOURCE_DESC alb_desc{};
+  alb_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  alb_desc.Width = width;
+  alb_desc.Height = height;
+  alb_desc.DepthOrArraySize = 1;
+  alb_desc.MipLevels = 1;
+  alb_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  alb_desc.SampleDesc.Count = 1;
+  alb_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  const HRESULT alb_hr = device->CreateCommittedResource(
+      &heap, D3D12_HEAP_FLAG_NONE, &alb_desc, D3D12_RESOURCE_STATE_COMMON,
+      nullptr, IID_PPV_ARGS(&guide_pass.albedo_linear));
+  if (FAILED(alb_hr) || guide_pass.albedo_linear == nullptr) {
+    last_texture_hr.store(alb_hr);
+    guide_pass.normal_roughness->Release();
+    guide_pass.normal_roughness = nullptr;
+    guide_pass.specular->Release();
+    guide_pass.specular = nullptr;
+    guide_pass.albedo_linear = nullptr;
+    return false;
+  }
+
   guide_pass.width = width;
   guide_pass.height = height;
   guide_pass.normal_roughness_state = D3D12_RESOURCE_STATE_COMMON;
   guide_pass.specular_state = D3D12_RESOURCE_STATE_COMMON;
+  guide_pass.albedo_linear_state = D3D12_RESOURCE_STATE_COMMON;
 
   if (guide_pass.heap == nullptr) {
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = 64;  // 12 groups of 5 descriptors
+    heap_desc.NumDescriptors = 64;  // 10 groups of 6 descriptors
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     const HRESULT heap_hr = device->CreateDescriptorHeap(
         &heap_desc, IID_PPV_ARGS(&guide_pass.heap));
@@ -314,7 +345,7 @@ inline bool EnsureGuidePipeline(ID3D12Device* device) {
   ranges[0].RegisterSpace = 0;
   ranges[0].OffsetInDescriptorsFromTableStart = 0;
   ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  ranges[1].NumDescriptors = 2;  // u0..u1
+  ranges[1].NumDescriptors = 3;  // u0..u2
   ranges[1].BaseShaderRegister = 0;
   ranges[1].RegisterSpace = 0;
   ranges[1].OffsetInDescriptorsFromTableStart = 3;
@@ -440,7 +471,7 @@ inline ReadyGuides PrepareEvaluate(
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
       | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-  D3D12_RESOURCE_BARRIER barriers[2] = {};
+  D3D12_RESOURCE_BARRIER barriers[3] = {};
   uint32_t barrier_count = 0;
   if (guide_pass.normal_roughness_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
     barriers[barrier_count++] = TransitionBarrier(
@@ -452,17 +483,23 @@ inline ReadyGuides PrepareEvaluate(
         guide_pass.specular, guide_pass.specular_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
+  if (guide_pass.albedo_linear_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    barriers[barrier_count++] = TransitionBarrier(
+        guide_pass.albedo_linear, guide_pass.albedo_linear_state,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
   cmd_list->ResourceBarrier(barrier_count, barriers);
 
-  // Descriptor group: (normal, material, albedo, NR, spec) -> 5 consecutive
-  // heap slots. Groups are written once and never rewritten, so double-
-  // buffered G-buffer sets simply get their own groups.
-  const std::array<uint64_t, 5> group_key = {
+  // Descriptor group: (normal, material, albedo, NR, spec, albedo_linear) -> 6
+  // consecutive heap slots. Groups are written once and never rewritten, so
+  // double-buffered G-buffer sets simply get their own groups.
+  const std::array<uint64_t, 6> group_key = {
       normal,
       material,
       albedo,
       reinterpret_cast<uint64_t>(guide_pass.normal_roughness),
       reinterpret_cast<uint64_t>(guide_pass.specular),
+      reinterpret_cast<uint64_t>(guide_pass.albedo_linear),
   };
   uint32_t group = 0;
   const auto existing = guide_pass.groups.find(group_key);
@@ -470,13 +507,13 @@ inline ReadyGuides PrepareEvaluate(
     group = existing->second;
   } else {
     group = guide_pass.next_group;
-    guide_pass.next_group = (guide_pass.next_group + 1u) % 12u;  // 64/5 slots
+    guide_pass.next_group = (guide_pass.next_group + 1u) % 10u;  // 64/6 slots
     guide_pass.groups[group_key] = group;
     const D3D12_CPU_DESCRIPTOR_HANDLE heap_base =
         guide_pass.heap->GetCPUDescriptorHandleForHeapStart();
     const auto slot = [&](uint32_t index) {
       D3D12_CPU_DESCRIPTOR_HANDLE handle = heap_base;
-      handle.ptr += static_cast<SIZE_T>(guide_pass.heap_increment) * (group * 5u + index);
+      handle.ptr += static_cast<SIZE_T>(guide_pass.heap_increment) * (group * 6u + index);
       return handle;
     };
     device->CreateShaderResourceView(gbuffer_normal, nullptr, slot(0));
@@ -492,6 +529,10 @@ inline ReadyGuides PrepareEvaluate(
     spec_uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     spec_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device->CreateUnorderedAccessView(guide_pass.specular, nullptr, &spec_uav, slot(4));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC alb_uav{};
+    alb_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    alb_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(guide_pass.albedo_linear, nullptr, &alb_uav, slot(5));
   }
 
   cmd_list->SetComputeRootSignature(guide_pass.root_signature);
@@ -505,28 +546,33 @@ inline ReadyGuides PrepareEvaluate(
   cmd_list->SetDescriptorHeaps(1, heaps);
   D3D12_GPU_DESCRIPTOR_HANDLE table =
       guide_pass.heap->GetGPUDescriptorHandleForHeapStart();
-  table.ptr += static_cast<UINT64>(guide_pass.heap_increment) * (group * 5u);
+  table.ptr += static_cast<UINT64>(guide_pass.heap_increment) * (group * 6u);
   cmd_list->SetComputeRootDescriptorTable(1, table);
   cmd_list->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
 
-  D3D12_RESOURCE_BARRIER after[4] = {};
+  D3D12_RESOURCE_BARRIER after[6] = {};
   after[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   after[0].UAV.pResource = guide_pass.normal_roughness;
   after[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   after[1].UAV.pResource = guide_pass.specular;
-  after[2] = TransitionBarrier(
-      guide_pass.normal_roughness, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv_state);
+  after[2].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  after[2].UAV.pResource = guide_pass.albedo_linear;
   after[3] = TransitionBarrier(
+      guide_pass.normal_roughness, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv_state);
+  after[4] = TransitionBarrier(
       guide_pass.specular, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv_state);
-  cmd_list->ResourceBarrier(4, after);
+  after[5] = TransitionBarrier(
+      guide_pass.albedo_linear, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, srv_state);
+  cmd_list->ResourceBarrier(6, after);
   guide_pass.normal_roughness_state = srv_state;
   guide_pass.specular_state = srv_state;
+  guide_pass.albedo_linear_state = srv_state;
 
   nr_dispatches.fetch_add(1);
   ready.real = true;
   ready.normal_roughness = guide_pass.normal_roughness;
-  ready.albedo = reinterpret_cast<void*>(albedo);
-  ready.albedo_format = captured_albedo.format.load();
+  ready.albedo = guide_pass.albedo_linear;
+  ready.albedo_format = static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT);
   ready.specular = guide_pass.specular;
   ready.specular_format = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
   last_ready.store(true);
@@ -586,6 +632,7 @@ inline std::string BuildReportSection() {
   s << "  guide pass: " << (nr_pipeline_ready.load() ? "ready" : "not ready");
   if (guide_pass.width != 0) s << " (" << guide_pass.width << "x" << guide_pass.height << ")";
   s << ", dispatches " << nr_dispatches.load() << "\n";
+  s << "  textures: NR=RGBA16F albedo=RGBA16F(linear) spec=RGBA8\n";
   s << "  stage: " << StageName(last_stage.load());
   if (last_hr.load() != 0) {
     char buffer[48] = {};

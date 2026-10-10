@@ -1,11 +1,11 @@
 // forzahorizon6-rr: bilateral resolve gather bypass — high RT-quality variant.
 //
 // Original (0x14FA42AB): the cheap apply stage of the same reconstruction
-// family as 0x0B33C6D8 — reads the half-res resolve pair (t22/t23) at
-// integer div (px / m[20]) i.e. nearest sampling, and reconstructs the
-// full-res output through the same Co/Cg + normal lobe transform.
-// Replaced with a bilinear reconstruction at the exact fractional position
-// (pixel centers), so the raw resolve feed does not show 2x2 blocks.
+// family as 0x0B33C6D8 — reads the half-res resolve pair (t22/t23) at integer
+// div (px / m[20]) i.e. nearest sampling, and reconstructs the full-res output
+// through the same Co/Cg + normal-lobe transform. This replacement keeps that
+// exact nearest sampling and output transform — no averaging of any kind — so
+// the resolve feed stays as raw as the original's own path.
 // Depth guard and normal decode are exact copies of the original's path.
 
 cbuffer cb : register(b0, space36)
@@ -44,29 +44,15 @@ void main(uint3 global_id : SV_DispatchThreadID)
     const float nlen = rsqrt(dot(float3(nxn, nyn, nz0), float3(nxn, nyn, nz0)));
     const float3 n = float3(nxn, nyn, nz0) * nlen;
 
-    // Bilinear read of the half-res resolve pair at pixel centers.
-    // Original mapping: nearest at integer div px / m[20].xy.
+    // Original nearest sampling: input = px / m[20] (integer division).
     uint in_w, in_h;
     g_rad_a.GetDimensions(in_w, in_h);
-    const float2 scale = max(float2(asuint(m[20]).xy), 1.0f.xx);
-    const float2 in_max = float2(in_w, in_h) - 1.0f.xx;
-    const float2 h = clamp((float2(px) + 0.5f) / scale - 0.5f, 0.0f.xx, in_max);
-    const uint2 i0 = uint2(floor(h));
-    const uint2 i1 = min(i0 + 1u, uint2(in_w - 1u, in_h - 1u));
-    const float2 f = h - float2(i0);
+    const uint2 scale = max(asuint(m[20]).xy, uint2(1u, 1u));
+    const uint2 in_px = min(px / scale, uint2(in_w - 1u, in_h - 1u));
+    const float4 rad_a = g_rad_a.Load(int3(in_px, 0));
+    const float4 rad_b = g_rad_b.Load(int3(in_px, 0));
 
-    const float4 a00 = g_rad_a.Load(int3(i0, 0));
-    const float4 a10 = g_rad_a.Load(int3(uint2(i1.x, i0.y), 0));
-    const float4 a01 = g_rad_a.Load(int3(uint2(i0.x, i1.y), 0));
-    const float4 a11 = g_rad_a.Load(int3(i1, 0));
-    const float4 b00 = g_rad_b.Load(int3(i0, 0));
-    const float4 b10 = g_rad_b.Load(int3(uint2(i1.x, i0.y), 0));
-    const float4 b01 = g_rad_b.Load(int3(uint2(i0.x, i1.y), 0));
-    const float4 b11 = g_rad_b.Load(int3(i1, 0));
-    const float4 rad_a = lerp(lerp(a00, a10, f.x), lerp(a01, a11, f.x), f.y);
-    const float4 rad_b = lerp(lerp(b00, b10, f.x), lerp(b01, b11, f.x), f.y);
-
-    // Original output transform with the reconstructed tap.
+    // Original output transform with the sampled tap.
     const float base = rad_b.w + dot(rad_b.xyz, n);
     g_out[px] = float4(
         rad_a.x - rad_a.y + base,

@@ -3,11 +3,11 @@
 // Original (0x0B33C6D8): 6x10 shared-memory bilateral gather that blends nine
 // taps of the half-res resolve pair (t22/t23) with per-tap normal/depth
 // weights, then reconstructs the full-res output through the Co/Cg + normal
-// lobe math. Replaced with a plain bilinear reconstruction of the same pair
-// (no bilateral weighting, no tap rejection): smooth 2x upsample instead of
-// the nearest tap, so the raw resolve feed does not show 2x2 blocks.
-// Bounds, depth guard and normal decode are exact copies of the original's
-// per-pixel path.
+// lobe math. This replacement takes a raw nearest point sample of the pair at
+// the original's own center-tap coordinate (input = px >> 1, derived from the
+// tile geometry) - no bilateral weighting, no tap mixing, so the resolve feed
+// stays as raw as the dispatch allows. Bounds, depth guard and normal decode
+// are exact copies of the original's per-pixel path.
 
 cbuffer cb : register(b0, space36)
 {
@@ -46,27 +46,15 @@ void main(uint3 global_id : SV_DispatchThreadID)
     const float nlen = rsqrt(dot(float3(nxn, nyn, nz0), float3(nxn, nyn, nz0)));
     const float3 n = float3(nxn, nyn, nz0) * nlen;
 
-    // Bilinear read of the half-res resolve pair (2x upsample, pixel centers).
+    // Raw nearest sample of the half-res resolve pair: the original's center
+    // tap is exactly the input texel at (px >> 1, py >> 1).
     uint in_w, in_h;
     g_rad_a.GetDimensions(in_w, in_h);
-    const float2 in_max = float2(in_w, in_h) - 1.0f.xx;
-    const float2 h = clamp((float2(px) + 0.5f) * 0.5f - 0.5f, 0.0f.xx, in_max);
-    const uint2 i0 = uint2(floor(h));
-    const uint2 i1 = min(i0 + 1u, uint2(in_w - 1u, in_h - 1u));
-    const float2 f = h - float2(i0);
+    const uint2 in_px = min(px >> 1u, uint2(in_w - 1u, in_h - 1u));
+    const float4 rad_a = g_rad_a.Load(int3(in_px, 0));
+    const float4 rad_b = g_rad_b.Load(int3(in_px, 0));
 
-    const float4 a00 = g_rad_a.Load(int3(i0, 0));
-    const float4 a10 = g_rad_a.Load(int3(uint2(i1.x, i0.y), 0));
-    const float4 a01 = g_rad_a.Load(int3(uint2(i0.x, i1.y), 0));
-    const float4 a11 = g_rad_a.Load(int3(i1, 0));
-    const float4 b00 = g_rad_b.Load(int3(i0, 0));
-    const float4 b10 = g_rad_b.Load(int3(uint2(i1.x, i0.y), 0));
-    const float4 b01 = g_rad_b.Load(int3(uint2(i0.x, i1.y), 0));
-    const float4 b11 = g_rad_b.Load(int3(i1, 0));
-    const float4 rad_a = lerp(lerp(a00, a10, f.x), lerp(a01, a11, f.x), f.y);
-    const float4 rad_b = lerp(lerp(b00, b10, f.x), lerp(b01, b11, f.x), f.y);
-
-    // Original output transform with the reconstructed tap.
+    // Original output transform with the sampled tap.
     const float base = rad_b.w + dot(rad_b.xyz, n);
     g_out[px] = float4(
         rad_a.x - rad_a.y + base,
