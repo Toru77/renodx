@@ -1,0 +1,21 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "forzahorizon6-rr",
+  "title": "Forza Horizon 6",
+  "mod_name": "Forza Horizon 6 Ray Reconstruction",
+  "summary": "DLSS Ray Reconstruction via Streamline interception (diagnostics build).",
+  "status": "in-dev",
+  "tags": ["dlss", "ray-reconstruction", "streamline"],
+  "notes": [
+    "Diagnostics build: hooks Streamline entry points and reports state in the ReShade overlay. No rendering behavior is changed yet.",
+    "Requires DirectX 12, an NVIDIA RTX GPU, and ReShade with full add-on support."
+  ],
+  "deploy": {
+    "game_exe": "forzahorizon6.exe",
+    "process_name": "forzahorizon6",
+    "api": "d3d12",
+    "steam_appid": 2483190,
+    "architecture": ["x64"],
+    "platform": "steam"
+  }
+}
