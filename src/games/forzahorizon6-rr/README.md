@@ -194,15 +194,52 @@ filenames (`shaders/README.md`). The **RT pass map** overlay panel and the
 `[RT pass map]` report section (included in **Copy report**) show:
 
 - candidate passes that ran (the 16 traces, `resolve-denoise`, `gi-probes`,
-  `infra`, `ssgi`) with per-frame counts and in-frame order — this is how the
-  resolve/denoise chain gets identified for the planned bypass "mute set",
-- the top dispatches of the last frame (catches passes outside the candidate
-  list),
-- cumulative totals.
+  `infra`, `ssgi`) with per-frame counts, direct/indirect split, and
+  **cumulative counts** (cumulative catches intermittent passes like the
+  reflection traces),
+- the top indirect dispatches that are not curated (work-list passes),
+- unresolved dispatches (shader hash 0, untracked pipeline) for both the last
+  frame and the session — resolved through two fallbacks: an **independent
+  pipeline→shader-hash tracker** (CRC32 computed from the compute-shader
+  subobject at pipeline creation) and, for pipelines whose creation never
+  reached the hooks, **PSO-blob identification** (the cached blob is scanned
+  for DXBC containers and CRC32-ed with the dump convention). Report shows the
+  fallback/blob-identified counts, the tracked-pipeline total, and any
+  remaining unresolved pipeline handles,
+- the first-seen order of the last frame (up to 96 distinct shaders) and the
+  top dispatches, plus cumulative totals.
 
 Shader-utils pipeline tracking is activated for this (`renodx::utils::shader`),
-which also primes the runtime shader-replacement path the denoise bypass will
-use.
+which also primes the runtime shader-replacement path the denoise bypass uses.
+
+## RT denoise bypass (M4)
+
+Live, togglable replacement of the three confirmed-live resolve shaders with
+minimal single-sample variants that skip the game's neighborhood filtering
+(`denoise.hpp` plus the root shader files `0x*.cs_6_6.hlsl`):
+
+| Hash | Live role (from the dump) | Bypass |
+|---|---|---|
+| `0x209AB6A4` | resolve-4tap: four-pixel stochastic reprojected gather with weight normalize | passes the pixel's own history samples through, with the original's hash-jittered depth guard and all-taps-rejected fallbacks |
+| `0x596D3E8F` | resolve-spatial: large shared-memory spatial filter with per-material paths and counters | skips all accumulation and reproduces the original's own per-pixel material path (instance/material decode, YCoCg + normal-lobe transform, NaN guards) for every pixel |
+| `0x0B33C6D8` | resolve-bilateral: nine-tap bilateral gather with Co/Cg + normal-lobe reconstruction | evaluates one nearest tap (`px >> 1`, the gather's highest-weight center tap) |
+
+Mechanics: the overlay's **RT denoise bypass (A/B experiment)** switch (default
+off) calls `AddRuntimeReplacement`/`RemoveRuntimeReplacements` for the three
+hashes on the ReShade device. The swap is a bind-time pipeline clone
+(`use_replace_async`), so it applies within a frame and never modifies the
+game's own PSOs; switching off restores the originals on the next bind. The
+status panel and the report's `[RT denoise bypass]` section show the setting,
+applied state and the three replacement roles.
+
+These bypasses are structure-preserving: each keeps the original shader's
+bindings, register spaces, guards, energy clamps and output semantics, and
+removes only the filtering.
+
+Bypass verify (A/B): in gameplay with RR on, flip the switch and watch the
+resolve feed change (filtering off → rawer/noisier reflection+GI resolve);
+the report should show `[RT denoise bypass] applied: yes`; flip it back and
+the next binds return to the game's originals (`applied: no`).
 
 ## Guide textures (M2c)
 

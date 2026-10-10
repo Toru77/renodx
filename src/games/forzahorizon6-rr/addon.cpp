@@ -25,6 +25,7 @@
 
 #include "./sl_rr.hpp"
 #include "./pass_map.hpp"
+#include "./denoise.hpp"
 
 namespace {
 
@@ -40,6 +41,8 @@ float rr_runtime_load_setting = 1.f;
 float rr_runtime_load_boot_value = 1.f;
 // M2: live toggle, applies on the next evaluate.
 float rr_redirect_setting = 1.f;
+// M4 experiment: live per-pipeline swap of the three RT resolve shaders.
+float rr_denoise_bypass_setting = 0.f;
 // Raises Streamline's own log level while the mod captures its messages.
 float rr_sl_log_verbose_setting = 1.f;
 // DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
@@ -234,6 +237,9 @@ bool DrawStatusPanel() {
   } else if (!d.guides.last_error.empty()) {
     ImGui::TextColored(kColorWarn, "guides: %s", d.guides.last_error.c_str());
   }
+  ImGui::TextColored(
+      denoise::bypass_enabled.load() ? kColorWarn : kColorOk, "%s",
+      denoise::StatusLine().c_str());
   return false;
 }
 
@@ -608,19 +614,51 @@ bool DrawPassMapPanel() {
     return false;
   }
   ImGui::Text(
-      "frame %llu of %llu: %llu dispatch(es), %llu indirect; cumulative %llu",
+      "frame %llu of %llu: %llu dispatch(es), %llu indirect; unresolved %llu (cumulative %llu); "
+      "fallback %llu (cumulative %llu; blob %llu, pipelines %llu)",
       static_cast<unsigned long long>(snap.frame_index),
       static_cast<unsigned long long>(snap.frames_total),
       static_cast<unsigned long long>(snap.dispatches),
       static_cast<unsigned long long>(snap.indirect),
-      static_cast<unsigned long long>(pass_map::CumulativeDispatches()));
+      static_cast<unsigned long long>(snap.zero_hash),
+      static_cast<unsigned long long>(pass_map::CumulativeZeroHash()),
+      static_cast<unsigned long long>(snap.fallback),
+      static_cast<unsigned long long>(pass_map::CumulativeFallback()),
+      static_cast<unsigned long long>(pass_map::CumulativeBlobIdentified()),
+      static_cast<unsigned long long>(pass_map::PipelinesTracked()));
+  if (!snap.unresolved_handles.empty()) {
+    std::stringstream handles;
+    handles << "unresolved handles:";
+    for (const auto& [handle, count] : snap.unresolved_handles) {
+      handles << " 0x" << std::hex << handle << std::dec << " x" << count;
+    }
+    ImGui::TextWrapped("%s", handles.str().c_str());
+  }
   if (!snap.candidates.empty()) {
     std::stringstream candidates;
     candidates << "candidates:";
-    for (const auto& [hash, count] : snap.candidates) {
-      candidates << " " << pass_map::KnownName(hash) << "x" << count;
+    for (const auto& candidate : snap.candidates) {
+      candidates << " " << pass_map::KnownName(candidate.hash) << "x" << candidate.total;
+      if (candidate.indirect > 0) candidates << "(i" << candidate.indirect << ")";
     }
     ImGui::TextWrapped("%s", candidates.str().c_str());
+  }
+  const auto cumulative_candidates = pass_map::CumulativeCandidates();
+  if (!cumulative_candidates.empty()) {
+    std::stringstream cumulative;
+    cumulative << "candidates cumulative:";
+    for (const auto& [hash, count] : cumulative_candidates) {
+      cumulative << " " << pass_map::KnownName(hash) << "x" << count;
+    }
+    ImGui::TextWrapped("%s", cumulative.str().c_str());
+  }
+  if (!snap.top_indirect_unknown.empty()) {
+    std::stringstream indirect;
+    indirect << "top indirect (uncurated):";
+    for (const auto& [hash, count] : snap.top_indirect_unknown) {
+      indirect << " " << pass_map::ShaderLabel(hash) << "x" << count;
+    }
+    ImGui::TextWrapped("%s", indirect.str().c_str());
   }
   if (!snap.top.empty()) {
     std::vector<std::vector<std::string>> rows;
@@ -648,7 +686,7 @@ bool DrawPassMapPanel() {
 
 // The one-click report: SL diagnostics plus the RT pass map.
 std::string FullReport() {
-  return sl_rr::BuildReport() + pass_map::BuildReportSection();
+  return sl_rr::BuildReport() + pass_map::BuildReportSection() + denoise::BuildReportSection();
 }
 
 renodx::utils::settings::Settings settings = {
@@ -700,6 +738,19 @@ renodx::utils::settings::Settings settings = {
                    " game-controlled). Any frame where the redirect fails runs on DLSS SR"
                    " instead.",
         .on_change_value = [](float, float value) { sl_rr::SetRrRedirect(value != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDenoiseBypass",
+        .binding = &rr_denoise_bypass_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "RT denoise bypass (A/B experiment)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Swaps the three live RT resolve shaders (0x209AB6A4 gather, 0x596D3E8F"
+                   " spatial filter, 0x0B33C6D8 bilateral gather) for single-sample bypass"
+                   " variants that skip neighborhood filtering, to A/B the raw ray signal."
+                   " Off = the game's originals. Applies within a frame.",
+        .on_change_value = [](float, float value) { denoise::SetEnabled(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
         .key = "RrSlLogVerbose",
@@ -900,6 +951,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       PinModule();
       sl_rr::InstallLoaderHooks();
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      // Required for the live RT-denoise bypass (denoise.hpp): Add/Remove
+      // RuntimeReplacements only take effect on the async bind-time path.
+      // Must be set before the first utils::shader::Use call below.
+      renodx::utils::shader::use_replace_async = true;
       break;
     case DLL_PROCESS_DETACH:
       sl_rr::UninstallHooks();
@@ -910,6 +965,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::utils::settings::use_presets = false;  // diagnostics mod: no presets
   renodx::utils::settings::Use(fdw_reason, &settings);
   pass_map::Use(fdw_reason);
+  denoise::Use(fdw_reason);
 
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     // Keep the boot values for the "restart required" hint and push the loaded
@@ -920,6 +976,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetRuntimeLoad(rr_runtime_load_setting != 0.f);
     sl_rr::SetRrRedirect(rr_redirect_setting != 0.f);
     sl_rr::SetSlLogVerbose(rr_sl_log_verbose_setting != 0.f);
+    denoise::SetEnabled(rr_denoise_bypass_setting != 0.f);
     int preset_index = static_cast<int>(rr_preset_setting);
     if (preset_index < 0) preset_index = 0;
     if (preset_index > 5) preset_index = 5;
