@@ -223,7 +223,9 @@ bool DrawStatusPanel() {
   } else {
     ImGui::TextUnformatted("Redirect: off — the game's DLSS SR runs unchanged");
   }
-  ImGui::Text("RR preset: %s (all modes)", sl_rr::PresetName(sl_rr::GetRrPreset()));
+  ImGui::Text(
+      "RR preset: %s (%u) on all hints", sl_rr::PresetName(sl_rr::GetRrPreset()),
+      sl_rr::GetRrPreset());
   if (d.guides.created) {
     ImGui::Text(
         "guides: placeholder %ux%u (recreates %u)", d.guides.width, d.guides.height,

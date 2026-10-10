@@ -1890,7 +1890,10 @@ inline sl::Result HookedSlEvaluateFeature(
       redirect.matrices_filled = true;
       redirect.world_to_camera_view = world_to_view;
       redirect.camera_view_to_world = view_to_world;
-      RecordEvaluateLocked(sl::kFeatureDLSS_RR, frame_index, inputs, num_inputs, rr_result, caller);
+      // Record the extended call (viewport + the three guide tags) so the
+      // report shows exactly what RR received.
+      RecordEvaluateLocked(
+          sl::kFeatureDLSS_RR, frame_index, extended_inputs, extended_count, rr_result, caller);
       // With RR actually initialized, look for the serving modules once more.
       if (!diagnostics.rr_probe.module_recheck_done) {
         diagnostics.rr_probe.module_recheck_done = true;
@@ -2559,7 +2562,7 @@ inline std::string BuildReport() {
       s << "\n";
       static const char* const kPresetLabels[6] = {
           "DLAA", "Quality", "Balanced", "Performance", "UltraPerf", "UltraQuality"};
-      s << "  presets:";
+      s << "  game SR presets (captured):";
       for (int i = 0; i < 6; ++i) {
         s << " " << kPresetLabels[i] << "=" << PresetName(opts.presets[static_cast<size_t>(i)]);
       }
@@ -2716,7 +2719,8 @@ inline std::string BuildReport() {
 
   s << "\n[RR redirect]\n";
   s << "setting: " << (GetRrRedirect() ? "on" : "off") << "\n";
-  s << "  preset override: " << PresetName(GetRrPreset()) << " (all modes)\n";
+  s << "  preset override: " << PresetName(GetRrPreset()) << " (" << GetRrPreset()
+    << ") applied to all six DLSSD preset hints\n";
   {
     const auto& redirect = d.rr_redirect;
     s << "  game DLSS evaluates (redirect on): " << (redirect.redirected + redirect.fallbacks)
