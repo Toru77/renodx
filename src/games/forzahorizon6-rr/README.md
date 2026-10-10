@@ -254,6 +254,40 @@ resolve); the report should show the corresponding line as
 `on, applied: yes` with the covered hashes; flip it back and the next binds
 return to the game's original for that pass (`off, applied: no`).
 
+## Real guide buffers (M3a, experimental)
+
+Captures the game's G-buffer and feeds DLSS-RR real guides instead of the M2c
+placeholders (`guides.hpp` + `fh6_guide_nr.cs_6_6.hlsl`; overlay switch
+**Real guide buffers (experimental)**, default off).
+
+Sources (live-verified via DevKit on a garage snapshot — the writer shader
+hashes drift per game build, so capture keys on the render-target format
+signature instead):
+
+| Guide | Source | Notes |
+|---|---|---|
+| NormalRoughness (RGBA16F, packed mode) | our compute pass decodes the packed-normal target (RT3, `r32_uint`) and packs a roughness candidate from material bits (RT2, `r8g8b8a8_uint`) | normal packing is the same 12+12-bit layout the game's own resolve chain decodes; dump the generated texture to inspect |
+| DiffuseAlbedo | captured albedo target (RT4, `r8g8b8a8_srgb`) directly | image-confirmed car paint; hardware sRGB decode applies on read |
+| SpecularAlbedo | generated in the same pass from albedo: `0.04 + albedo²·0.5` | approximation — no first-class live specular target confirmed yet; RT5 is the paint/clearcoat layer, RT1 is flat |
+
+Mechanics: both `bind_render_targets_and_depth_stencil` and `begin_render_pass`
+are watched; a bound target list matching the format signature (albedo
+`r8g8b8a8_srgb`, material `r8g8b8a8_uint`, normal `r32_uint`, same render
+resolution) is captured. The guide pass is dispatched on the game's command
+list inside the SL evaluate redirect, right before the RR evaluate (control-rr
+`rrg` pattern: root constants + root SRVs/UAVs, no descriptor heaps). Every
+step fails closed — placeholders stay in charge whenever a capture, format or
+pipeline is unavailable.
+
+Live-verification checklist (with DevKit MCP):
+- `[RT guides]` report section: signature seen, captures, captured handles /
+  formats / sizes, guide pass ready, last evaluate used real vs placeholders.
+- Dump any of the handles (captured G-buffer targets or the generated guides)
+  through DevKit to inspect content; the generated NormalRoughness texture is
+  RGBA16F and readback-friendly.
+- Live toggles: **Guide normals: world -> view transform** (default on) and
+  **Guide roughness source** (material.y / material.z / constant 0.5).
+
 ## Guide textures (M2c)
 
 Streamline's RR plugin (`sl.dlss_d`) treats these tags as mandatory on every

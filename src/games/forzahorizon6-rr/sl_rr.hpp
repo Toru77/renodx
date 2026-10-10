@@ -46,6 +46,8 @@
 #include "../../utils/date.hpp"
 #include "../../utils/platform.hpp"
 
+#include "./guides.hpp"
+
 namespace sl_rr {
 
 // ---------------------------------------------------------------------------
@@ -1786,6 +1788,22 @@ inline sl::Result HookedSlEvaluateFeature(
     }
     publish_guides();
 
+    // M3a: real guides (experimental). Captures happen during the frame's
+    // G-buffer writes (guides.hpp); the NormalRoughness decode pass is
+    // dispatched here on the game's command list right before the evaluate.
+    // Any failure keeps the placeholders in charge for this frame.
+    float world_to_view_rows[3][4] = {};
+    for (int row = 0; row < 3; ++row) {
+      world_to_view_rows[row][0] = world_to_view[row].x;
+      world_to_view_rows[row][1] = world_to_view[row].y;
+      world_to_view_rows[row][2] = world_to_view[row].z;
+      world_to_view_rows[row][3] = world_to_view[row].w;
+    }
+    const guides::ReadyGuides real_guides = guides::PrepareEvaluate(
+        reinterpret_cast<ID3D12Device*>(d3d_device),
+        reinterpret_cast<ID3D12GraphicsCommandList*>(cmd), input_width,
+        input_height, world_to_view_rows);
+
     sl::ViewportHandle viewport(0u);
     if (inputs != nullptr) {
       for (uint32_t i = 0; i < num_inputs; ++i) {
@@ -1828,24 +1846,37 @@ inline sl::Result HookedSlEvaluateFeature(
           static_cast<int>(set_result), kNever);
     }
     // The guide tags ride in the evaluate inputs array — sl.common checks
-    // those before the frame's global tag store.
+    // those before the frame's global tag store. Real (captured) guides when
+    // ready, placeholders otherwise.
     const uint32_t srv_state =
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    void* nr_texture = guide_resources.normal_roughness;
+    uint32_t nr_format = static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT);
+    void* albedo_texture = guide_resources.albedo;
+    uint32_t albedo_format = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+    void* specular_texture = guide_resources.specular_albedo;
+    uint32_t specular_format = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+    if (real_guides.real) {
+      nr_texture = real_guides.normal_roughness;
+      albedo_texture = real_guides.albedo;
+      albedo_format = real_guides.albedo_format;
+      specular_texture = real_guides.specular;
+      specular_format = real_guides.specular_format;
+    }
     sl::Resource normal_roughness_resource(
-        sl::ResourceType::eTex2d, guide_resources.normal_roughness, srv_state);
+        sl::ResourceType::eTex2d, nr_texture, srv_state);
     normal_roughness_resource.width = input_width;
     normal_roughness_resource.height = input_height;
-    normal_roughness_resource.nativeFormat =
-        static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT);
-    sl::Resource albedo_resource(sl::ResourceType::eTex2d, guide_resources.albedo, srv_state);
+    normal_roughness_resource.nativeFormat = nr_format;
+    sl::Resource albedo_resource(sl::ResourceType::eTex2d, albedo_texture, srv_state);
     albedo_resource.width = input_width;
     albedo_resource.height = input_height;
-    albedo_resource.nativeFormat = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+    albedo_resource.nativeFormat = albedo_format;
     sl::Resource specular_albedo_resource(
-        sl::ResourceType::eTex2d, guide_resources.specular_albedo, srv_state);
+        sl::ResourceType::eTex2d, specular_texture, srv_state);
     specular_albedo_resource.width = input_width;
     specular_albedo_resource.height = input_height;
-    specular_albedo_resource.nativeFormat = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
+    specular_albedo_resource.nativeFormat = specular_format;
 
     sl::Extent guide_extent{0, 0, input_width, input_height};
     sl::ResourceTag tag_normal_roughness(

@@ -26,6 +26,7 @@
 #include "./sl_rr.hpp"
 #include "./pass_map.hpp"
 #include "./denoise.hpp"
+#include "./guides.hpp"
 
 namespace {
 
@@ -46,6 +47,10 @@ float rr_redirect_setting = 1.f;
 float rr_denoise_gather_setting = 0.f;
 float rr_denoise_filter_setting = 0.f;
 float rr_denoise_bilateral_setting = 0.f;
+// M3a experiment: real RR guide buffers captured from the game's G-buffer.
+float rr_real_guides_setting = 0.f;
+float rr_guide_view_normals_setting = 1.f;
+float rr_guide_roughness_source_setting = 0.f;
 // Raises Streamline's own log level while the mod captures its messages.
 float rr_sl_log_verbose_setting = 1.f;
 // DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
@@ -243,6 +248,7 @@ bool DrawStatusPanel() {
   ImGui::TextColored(
       denoise::AnyEnabled() ? kColorWarn : kColorOk, "%s",
       denoise::StatusLine().c_str());
+  ImGui::TextUnformatted(guides::StatusLine().c_str());
   return false;
 }
 
@@ -689,7 +695,8 @@ bool DrawPassMapPanel() {
 
 // The one-click report: SL diagnostics plus the RT pass map.
 std::string FullReport() {
-  return sl_rr::BuildReport() + pass_map::BuildReportSection() + denoise::BuildReportSection();
+  return sl_rr::BuildReport() + pass_map::BuildReportSection() + denoise::BuildReportSection()
+         + guides::BuildReportSection();
 }
 
 renodx::utils::settings::Settings settings = {
@@ -788,6 +795,54 @@ renodx::utils::settings::Settings settings = {
         .on_change_value = [](float, float value) {
           denoise::SetEnabled(denoise::kBilateralHash, value != 0.f);
         },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrRealGuides",
+        .binding = &rr_real_guides_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Real guide buffers (experimental)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Captures the game's G-buffer (albedo, packed normals, material"
+                   " bits, specular color) at the G-buffer writer passes and"
+                   " generates the RR NormalRoughness guide from it; albedo and"
+                   " specular color feed RR directly. Falls back to placeholders"
+                   " whenever capture or the guide pass is unavailable.",
+        .on_change_value = [](float, float value) {
+          guides::enabled.store(value != 0.f);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrGuideViewNormals",
+        .binding = &rr_guide_view_normals_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Guide normals: world -> view transform",
+        .section = "Ray Reconstruction",
+        .tooltip = "Transforms the captured world-space G-buffer normals with the"
+                   " game's world->view matrix before handing them to RR. Off ="
+                   " feed world-space normals unchanged. Verify by dumping the"
+                   " guide textures via DevKit (handles are in the report).",
+        .on_change_value = [](float, float value) {
+          guides::normals_view_space.store(value != 0.f);
+        },
+        .is_visible = []() { return rr_real_guides_setting != 0.f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrGuideRoughness",
+        .binding = &rr_guide_roughness_source_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Guide roughness source",
+        .section = "Ray Reconstruction",
+        .tooltip = "Which material G-buffer field feeds the guide roughness"
+                   " (candidates from the writer analysis; verified by dumping"
+                   " the generated guide textures via DevKit). Constant = fixed 0.5.",
+        .labels = {"material.y", "material.z", "constant"},
+        .on_change_value = [](float, float value) {
+          guides::roughness_source.store(static_cast<int32_t>(value));
+        },
+        .is_visible = []() { return rr_real_guides_setting != 0.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "RrSlLogVerbose",
@@ -1003,6 +1058,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::utils::settings::Use(fdw_reason, &settings);
   pass_map::Use(fdw_reason);
   denoise::Use(fdw_reason);
+  guides::Use(fdw_reason);
 
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     // Keep the boot values for the "restart required" hint and push the loaded
@@ -1016,6 +1072,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     denoise::SetEnabled(denoise::kGatherHash, rr_denoise_gather_setting != 0.f);
     denoise::SetEnabled(denoise::kSpatialHash, rr_denoise_filter_setting != 0.f);
     denoise::SetEnabled(denoise::kBilateralHash, rr_denoise_bilateral_setting != 0.f);
+    guides::enabled.store(rr_real_guides_setting != 0.f);
+    guides::normals_view_space.store(rr_guide_view_normals_setting != 0.f);
+    guides::roughness_source.store(static_cast<int32_t>(rr_guide_roughness_source_setting));
     int preset_index = static_cast<int>(rr_preset_setting);
     if (preset_index < 0) preset_index = 0;
     if (preset_index > 5) preset_index = 5;
