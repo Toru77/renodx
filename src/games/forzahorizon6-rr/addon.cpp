@@ -39,6 +39,8 @@ float rr_runtime_load_setting = 1.f;
 float rr_runtime_load_boot_value = 1.f;
 // M2: live toggle, applies on the next evaluate.
 float rr_redirect_setting = 1.f;
+// Raises Streamline's own log level while the mod captures its messages.
+float rr_sl_log_verbose_setting = 1.f;
 
 std::string Hex64(uint64_t value) {
   char buffer[32] = {};
@@ -541,6 +543,46 @@ bool DrawRrProbePanel() {
           kColorWarn, "trial state: %s", sl_rr::ResultName(probe.trial_state_result).c_str());
     }
   }
+  if (!probe.dlss_modules.empty()) {
+    if (ImGui::TreeNode("dlss modules in process")) {
+      for (const auto& module : probe.dlss_modules) {
+        ImGui::TextWrapped("%s", module.c_str());
+      }
+      ImGui::TreePop();
+    }
+  }
+  return false;
+}
+
+bool DrawSlLogPanel() {
+  const sl_rr::Diagnostics d = sl_rr::CaptureDiagnostics();
+  ImGui::Text(
+      "callback: %s, verbose: %s, messages: %llu (warn/error: %llu)",
+      d.sl_log_callback_installed ? "installed by mod" : "game-provided",
+      d.sl_log_verbose ? "requested" : "default",
+      static_cast<unsigned long long>(d.sl_log_total),
+      static_cast<unsigned long long>(d.sl_log_warn_errors));
+  if (d.sl_log_last_problems.empty() && d.sl_log_last.empty()) {
+    ImGui::TextColored(kColorWarn, "No Streamline log messages captured yet.");
+    return false;
+  }
+  if (!d.sl_log_last_problems.empty()) {
+    ImGui::SeparatorText("Last warn/error");
+    for (const auto& entry : d.sl_log_last_problems) {
+      std::string suffix;
+      if (entry.repeats > 0) suffix = " (x" + std::to_string(entry.repeats + 1) + ")";
+      ImGui::TextColored(
+          entry.type == 2 ? kColorBad : kColorWarn, "[%s]%s", sl_rr::SlLogTypeName(entry.type),
+          suffix.c_str());
+      ImGui::TextWrapped("%s", entry.message.c_str());
+    }
+  }
+  if (!d.sl_log_last.empty()) {
+    ImGui::SeparatorText("Last messages");
+    for (const auto& entry : d.sl_log_last) {
+      ImGui::TextWrapped("[%s] %s", sl_rr::SlLogTypeName(entry.type), entry.message.c_str());
+    }
+  }
   return false;
 }
 
@@ -595,6 +637,18 @@ renodx::utils::settings::Settings settings = {
                    " game-controlled). Any frame where the redirect fails runs on DLSS SR"
                    " instead.",
         .on_change_value = [](float, float value) { sl_rr::SetRrRedirect(value != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrSlLogVerbose",
+        .binding = &rr_sl_log_verbose_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "SL verbose log capture (diagnostics, restart required)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Raises Streamline's log level to verbose while the mod captures its"
+                   " messages (bounded, shown in the report). Warnings/errors are always"
+                   " captured regardless of this switch.",
+        .on_change_value = [](float, float value) { sl_rr::SetSlLogVerbose(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -653,6 +707,14 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Load status, serving plugin, requirements and trial calls for DLSS Ray"
                    " Reconstruction.",
         .on_draw = [] { return DrawRrProbePanel(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .label = "SL log (captured)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Streamline's own log messages, captured through the logMessageCallback"
+                   " installed at slInit.",
+        .on_draw = [] { return DrawSlLogPanel(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
@@ -767,6 +829,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetInitInjection(rr_init_inject_setting != 0.f);
     sl_rr::SetRuntimeLoad(rr_runtime_load_setting != 0.f);
     sl_rr::SetRrRedirect(rr_redirect_setting != 0.f);
+    sl_rr::SetSlLogVerbose(rr_sl_log_verbose_setting != 0.f);
   }
 
   if (fdw_reason == DLL_PROCESS_DETACH) {

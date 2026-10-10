@@ -6,9 +6,11 @@ Ray Reconstruction mod for FH6 via the game's own Streamline instance
 
 **Status: M2 implemented** — the game's `slEvaluateFeature(DLSS)` is redirected to
 `kFeatureDLSS_RR` with `DLSSDOptions` mirrored from the game's own settings
-(internal resolution stays game-controlled), strict per-frame fallback to SR on
-any failure, and a live A/B toggle. No guide buffers yet — RR runs on the tags
-the game already provides.
+(internal resolution stays game-controlled) and the world/view matrices derived
+per frame from `sl::Constants`, strict per-frame fallback to SR on any failure,
+and a live A/B toggle. Streamline's own log messages are captured for
+diagnostics. No guide buffers yet — RR runs on the tags the game already
+provides.
 
 ## Goal roadmap
 
@@ -109,8 +111,11 @@ no log reading required:
   captured values are what the redirect mirrors into `DLSSDOptions`.
 - **DLSS-RR probe** — RR requirements (`slGetFeatureRequirements`: flags,
   required tags, driver), `slDLSSDSetOptions` / `GetOptimalSettings` /
-  `GetState` availability, and a trial `slDLSSDGetOptimalSettings` call
-  mirroring the game's own DLSS mode.
+  `GetState` availability, a trial `slDLSSDGetOptimalSettings` call mirroring
+  the game's own DLSS mode, and the list of loaded dlss/nvngx/NGX-store
+  modules (identifies OTA plugin file names).
+- **SL log (captured)** — Streamline's own log messages (last ring, plus a
+  warn/error-only ring with repeat counts).
 - **Features** — per-feature evaluate/query results (DLSS, DLSS-G, DLSS-RR…).
   With the redirect on, the DLSS row counts only fallback frames; the DLSS-RR
   row counts the redirected frames.
@@ -127,21 +132,34 @@ Streamline call), **Copy report** / **Write report to log**, **Reset capture**.
 Per frame, when the game evaluates `kFeatureDLSS` with the toggle on:
 
 1. Captured SR options are mirrored into `DLSSDOptions` (mode, output size,
-   HDR flag, exposures, presets); world matrices stay default until M4. The
-   game's in-game DLSS settings therefore keep controlling internal
-   resolution.
+   HDR flag, exposures, presets), and `worldToCameraView` /
+   `cameraViewToWorld` are rebuilt from the game's `sl::Constants` camera
+   basis using Streamline's own convention (`sl_matrix_helpers.h`). The game's
+   in-game DLSS settings therefore keep controlling internal resolution.
 2. `slDLSSDSetOptions` is called for the game's viewport, then
    `slEvaluateFeature(kFeatureDLSS_RR, ...)` runs with the game's own frame
    token, inputs and command list — the game's tags/constants for that frame
    are already in place.
-3. Any failure (functions unavailable, no captured options, SetOptions or
-   evaluate error) falls back to the untouched SR evaluate for that frame,
-   counted with a reason in the report; redirect stays on and retries next
-   frame.
+3. Any failure (functions unavailable, no captured options/constants,
+   SetOptions or evaluate error) falls back to the untouched SR evaluate for
+   that frame, counted with a reason in the report; redirect stays on and
+   retries next frame.
 
 Expected visual result at M2: RR denoises/upscales the game's already
 composited color with no guide buffers yet — a modest change vs SR, not full
 RR quality. The real gains land with M3/M4 (guides) and the later SSR-mute.
+
+## Streamline log capture
+
+At `slInit` the mod installs its own `logMessageCallback` (only when the game
+provides none) and can raise SL's log level to verbose (setting, restart
+required, default on). Streamline's warnings/errors are always delivered
+regardless of level. The last messages (plus a warn/error-only ring and
+repeat counts) appear in the **SL log (captured)** overlay panel and the
+`[SL log]` report section — this is how evaluate failures get their exact
+reason (e.g. missing tag names). The `[DLSS-RR probe]` report block also lists
+every loaded dlss/nvngx/NGX-store module, which identifies OTA plugin files
+whose names are hashes (e.g. `190_E658703.dll`).
 
 ## Build & verify (M2)
 
@@ -151,10 +169,15 @@ RR quality. The real gains land with M3/M4 (guides) and the later SSR-mute.
 - Verification: start the game with DLSS on and ray tracing enabled, reach
   gameplay (~10 s), open the overlay's Ray Reconstruction section, press
   **Copy report**. Expect:
-  - Streamline hooked (15/15), slInit injected, RR probe `loaded=yes`.
+  - Streamline hooked (15/15), slInit injected, RR probe `loaded=yes` and a
+    module list that shows the serving plugin (driver-store OTA files have
+    hash names like `190_E658703.dll`).
   - `[RR redirect]` with `setting: on`, `redirected frames` growing at ~1 per
-    frame and `fallbacks: 0` (or a listed reason).
+    frame, `fallbacks` staying flat, and the `worldToCameraView row0/row3`
+    line filled from constants.
   - `[evaluates]` DLSS-RR row counting evals with `lastResult=Result::eOk`.
+  - `[SL log]` warn/error ring free of `slEvaluateFeature` failures (if
+    anything still fails, it names the exact input).
   - An A/B toggle check: turning the switch off restores the previous DLSS-SR
     image; turning it on changes it again.
   - Optional visual confirmation: NVIDIA's DLSS indicator overlay shows the

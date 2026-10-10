@@ -19,6 +19,7 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d12.h>
 
 #include <detours.h>
@@ -38,6 +39,7 @@
 
 #include <sl.h>
 #include <sl_helpers.h>
+#include <sl_matrix_helpers.h>
 
 #include <include/reshade.hpp>
 
@@ -199,6 +201,72 @@ inline std::string WideToNarrow(const wchar_t* text) {
   std::vector<char> buffer(static_cast<size_t>(needed));
   WideCharToMultiByte(CP_UTF8, 0, text, -1, buffer.data(), needed, nullptr, nullptr);
   return std::string(buffer.data(), buffer.size() - 1);
+}
+
+inline std::string ToLowerAscii(std::string text) {
+  for (char& c : text) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+  }
+  return text;
+}
+
+// Builds the camera matrices DLSS-RR expects in DLSSDOptions from the camera
+// basis the game provides via sl::Constants. Convention follows Streamline's
+// own sl_matrix_helpers.h (cameraViewToWorld rows = right/up/fwd/pos,
+// worldToCameraView = ortho-normal inverse).
+inline bool BuildCameraMatricesFromConstants(
+    const sl::Constants& values, sl::float4x4& world_to_camera_view,
+    sl::float4x4& camera_view_to_world) {
+  const auto length_sq = [](const sl::float3& v) {
+    return (v.x * v.x) + (v.y * v.y) + (v.z * v.z);
+  };
+  sl::float3 right = values.cameraRight;
+  sl::float3 forward = values.cameraFwd;
+  if (length_sq(right) < 1e-12f || length_sq(forward) < 1e-12f) return false;
+  sl::vectorNormalize(right);
+  sl::vectorNormalize(forward);
+  sl::float3 up;
+  sl::vectorCrossProduct(up, forward, right);
+  sl::vectorNormalize(up);
+  camera_view_to_world[0] = sl::float4(right.x, right.y, right.z, 0.f);
+  camera_view_to_world[1] = sl::float4(up.x, up.y, up.z, 0.f);
+  camera_view_to_world[2] = sl::float4(forward.x, forward.y, forward.z, 0.f);
+  camera_view_to_world[3] =
+      sl::float4(values.cameraPos.x, values.cameraPos.y, values.cameraPos.z, 1.f);
+  sl::matrixOrthoNormalInvert(world_to_camera_view, camera_view_to_world);
+  return true;
+}
+
+// Loaded modules that could serve DLSS work: plugins, NGX runtimes, and
+// anything mapped from the driver-store NGX cache (OTA plugin file names are
+// hashes like 190_E658703.dll, so matching by path matters).
+inline void ScanDlssModules(std::vector<std::string>& out) {
+  out.clear();
+  const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snapshot == INVALID_HANDLE_VALUE) return;
+  MODULEENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Module32FirstW(snapshot, &entry)) {
+    do {
+      const std::string name = ToLowerAscii(WideToNarrow(entry.szModule));
+      const std::string path = ToLowerAscii(WideToNarrow(entry.szExePath));
+      const bool interesting = name.find("dlss") != std::string::npos
+                               || name.find("nvngx") != std::string::npos
+                               || path.find("nvidia\\ngx") != std::string::npos;
+      if (!interesting) continue;
+      out.push_back(WideToNarrow(entry.szModule) + " @ " + WideToNarrow(entry.szExePath));
+    } while (Module32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+}
+
+inline const char* SlLogTypeName(int type) {
+  switch (type) {
+    case 0: return "info";
+    case 1: return "warn";
+    case 2: return "error";
+    default: return "?";
+  }
 }
 
 // Base fields every slEvaluateFeature input starts with (all SL structs are
@@ -469,6 +537,15 @@ struct RrProbeState {
   bool ngx_module_loaded = false;
   std::string ngx_module_path;
   bool module_recheck_done = false;
+  // Loaded dlss/nvngx/NGX-store modules (identifies OTA plugin file names)
+  std::vector<std::string> dlss_modules;
+};
+
+// One captured message from Streamline's own logger (logMessageCallback).
+struct SlLogEntry {
+  int type = 0;  // sl::LogType as int (0 info, 1 warn, 2 error)
+  std::string message;
+  uint32_t repeats = 0;  // consecutive duplicates collapsed
 };
 
 // M2: the game's DLSS-SR evaluate redirected to DLSS-RR, with strict
@@ -481,6 +558,10 @@ struct RrRedirectState {
   int last_eval_result = kNever;      // RR evaluate result of the last attempt
   int last_fallback_result = kNever;  // SR evaluate result of the last fallback
   std::string last_reason;            // set on a fallback, cleared on success
+  // Matrices sent with the last DLSSDOptions (derived from sl::Constants)
+  bool matrices_filled = false;
+  sl::float4x4 world_to_camera_view{};
+  sl::float4x4 camera_view_to_world{};
 };
 
 struct Diagnostics {
@@ -555,6 +636,14 @@ struct Diagnostics {
   DlssOptionsCapture dlss_options;
   RrProbeState rr_probe;
   RrRedirectState rr_redirect;
+
+  // Streamline's own log messages (captured via Preferences::logMessageCallback)
+  bool sl_log_callback_installed = false;
+  bool sl_log_verbose = false;
+  uint64_t sl_log_total = 0;
+  uint64_t sl_log_warn_errors = 0;
+  std::vector<SlLogEntry> sl_log_last;           // ring: last messages, any type
+  std::vector<SlLogEntry> sl_log_last_problems;  // ring: last warn/error messages
 };
 
 inline Diagnostics diagnostics;
@@ -617,6 +706,33 @@ inline void RecordEvaluateLocked(
     diagnostics.auto_probe_done = true;
     diagnostics.probe_pending = true;
     diagnostics.probe_scope = 0;
+  }
+}
+
+// Streamline delivers its own log messages here (installed into Preferences
+// during slInit when the game has no callback of its own). Bounded capture:
+// a ring of the last messages plus a ring of the last warn/error messages,
+// with consecutive duplicates collapsed.
+inline void SlLogMessageCallback(sl::LogType type, const char* message) {
+  if (message == nullptr) return;
+  const std::lock_guard lock(diagnostics_mutex);
+  ++diagnostics.sl_log_total;
+  const int type_int = static_cast<int>(type);
+  const auto push = [&](std::vector<SlLogEntry>& ring, size_t capacity) {
+    if (!ring.empty() && ring.back().type == type_int && ring.back().message == message) {
+      ++ring.back().repeats;
+      return;
+    }
+    if (ring.size() >= capacity) ring.erase(ring.begin());
+    SlLogEntry entry{};
+    entry.type = type_int;
+    entry.message = message;
+    ring.push_back(std::move(entry));
+  };
+  push(diagnostics.sl_log_last, 12);
+  if (type != sl::LogType::eInfo) {
+    ++diagnostics.sl_log_warn_errors;
+    push(diagnostics.sl_log_last_problems, 8);
   }
 }
 
@@ -770,6 +886,11 @@ inline std::atomic<bool> rr_redirect_enabled{true};
 inline void SetRrRedirect(bool enabled) { rr_redirect_enabled.store(enabled); }
 inline bool GetRrRedirect() { return rr_redirect_enabled.load(); }
 
+// Ask Streamline for verbose logging while our capture callback is attached.
+inline std::atomic<bool> rr_sl_log_verbose_enabled{true};
+inline void SetSlLogVerbose(bool enabled) { rr_sl_log_verbose_enabled.store(enabled); }
+inline bool GetSlLogVerbose() { return rr_sl_log_verbose_enabled.load(); }
+
 // ---------------------------------------------------------------------------
 // probes — run at a game Streamline call boundary (same thread the game uses
 // for SL), never while holding the diagnostics lock.
@@ -812,6 +933,8 @@ inline void ProbeRrPlugin(RrProbeState& probe) {
     probe.plugin_file_path = WideToNarrow(path.c_str());
     probe.plugin_file_present = true;
   }
+
+  ScanDlssModules(probe.dlss_modules);
 }
 
 inline void RunProbe(int scope) {
@@ -1057,6 +1180,10 @@ inline void ResetCapture() {
   diagnostics.shutdown_seen = false;
   diagnostics.rr_probe = {};
   diagnostics.rr_redirect = {};
+  diagnostics.sl_log_total = 0;
+  diagnostics.sl_log_warn_errors = 0;
+  diagnostics.sl_log_last.clear();
+  diagnostics.sl_log_last_problems.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,15 +1283,26 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
     }
   }
 
-  // Patch the caller's Preferences in place — only the two feature-list fields
-  // are touched, so every other field (paths, callbacks, version) stays
-  // exactly as the game wrote it. Restored right after the call.
+  // Patch the caller's Preferences in place — only the feature-list fields and
+  // (optionally) the log callback/level are touched, so everything else (paths,
+  // callbacks, version) stays exactly as the game wrote it. Restored right
+  // after the call.
+  const bool install_log_callback = pref.logMessageCallback == nullptr;
+  const bool raise_log_level = GetSlLogVerbose() && pref.logLevel != sl::LogLevel::eVerbose;
   sl::Preferences& mutable_pref = const_cast<sl::Preferences&>(pref);
   const sl::Feature* const original_features = pref.featuresToLoad;
   const uint32_t original_count = pref.numFeaturesToLoad;
+  const auto original_log_callback = pref.logMessageCallback;
+  const auto original_log_level = pref.logLevel;
   if (appended_rr) {
     mutable_pref.featuresToLoad = init_features_patched_storage;
     mutable_pref.numFeaturesToLoad = patched_count;
+  }
+  if (install_log_callback) {
+    mutable_pref.logMessageCallback = SlLogMessageCallback;
+  }
+  if (raise_log_level) {
+    mutable_pref.logLevel = sl::LogLevel::eVerbose;
   }
 
   const auto result = real_sl_init(pref, sdk_version);
@@ -1172,6 +1310,12 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   if (appended_rr) {
     mutable_pref.featuresToLoad = original_features;
     mutable_pref.numFeaturesToLoad = original_count;
+  }
+  if (install_log_callback) {
+    mutable_pref.logMessageCallback = original_log_callback;
+  }
+  if (raise_log_level) {
+    mutable_pref.logLevel = original_log_level;
   }
 
   const std::lock_guard lock(diagnostics_mutex);
@@ -1186,6 +1330,8 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   diagnostics.init_app_id = pref.applicationId;
   diagnostics.init_render_api = static_cast<int>(pref.renderAPI);
   diagnostics.init_pref_version = static_cast<uint32_t>(pref.structVersion);
+  diagnostics.sl_log_callback_installed = install_log_callback;
+  diagnostics.sl_log_verbose = raise_log_level;
   diagnostics.init_show_console = pref.showConsole;
   diagnostics.init_num_plugin_paths = pref.numPathsToPlugins;
   if (pref.pathsToPlugins != nullptr) {
@@ -1330,9 +1476,13 @@ inline sl::Result HookedSlEvaluateFeature(
     };
 
     DlssOptionsCapture captured;
+    sl::Constants constants{};
+    bool constants_ready = false;
     {
       const std::lock_guard lock(diagnostics_mutex);
       captured = diagnostics.dlss_options;
+      constants_ready = diagnostics.constants_seen;
+      constants = diagnostics.constants;
     }
 
     if (real_dlssd_set_options == nullptr) {
@@ -1351,6 +1501,16 @@ inline sl::Result HookedSlEvaluateFeature(
                          && captured.output_height != 0xFFFFFFFFu;
     if (!dims_ok) {
       return fallback("captured options have no output size", kNever, kNever);
+    }
+    if (!constants_ready) {
+      return fallback("slSetConstants not seen yet", kNever, kNever);
+    }
+    // DLSS-RR needs the world/view matrices; sl::Constants only carries the
+    // camera basis, so build them the way Streamline's own helpers expect.
+    sl::float4x4 world_to_view{};
+    sl::float4x4 view_to_world{};
+    if (!BuildCameraMatricesFromConstants(constants, world_to_view, view_to_world)) {
+      return fallback("camera basis missing in slSetConstants", kNever, kNever);
     }
 
     sl::ViewportHandle viewport(0u);
@@ -1374,8 +1534,9 @@ inline sl::Result HookedSlEvaluateFeature(
     if (captured.alpha_upscaling >= 0) {
       options.alphaUpscalingEnabled = static_cast<sl::Boolean>(captured.alpha_upscaling);
     }
-    // DLSSD presets share the DLSS preset letter ordering; world matrices stay
-    // at defaults until the M4 spec-MV work.
+    options.worldToCameraView = world_to_view;
+    options.cameraViewToWorld = view_to_world;
+    // DLSSD presets share the DLSS preset letter ordering.
     options.dlaaPreset = static_cast<sl::DLSSDPreset>(captured.presets[0]);
     options.qualityPreset = static_cast<sl::DLSSDPreset>(captured.presets[1]);
     options.balancedPreset = static_cast<sl::DLSSDPreset>(captured.presets[2]);
@@ -1407,6 +1568,9 @@ inline sl::Result HookedSlEvaluateFeature(
       redirect.last_eval_result = static_cast<int>(rr_result);
       redirect.last_fallback_result = kNever;
       redirect.last_reason.clear();
+      redirect.matrices_filled = true;
+      redirect.world_to_camera_view = world_to_view;
+      redirect.camera_view_to_world = view_to_world;
       RecordEvaluateLocked(sl::kFeatureDLSS_RR, frame_index, inputs, num_inputs, rr_result, caller);
       // With RR actually initialized, look for the serving modules once more.
       if (!diagnostics.rr_probe.module_recheck_done) {
@@ -2165,6 +2329,14 @@ inline std::string BuildReport() {
       } else {
         s << "  ngx module (nvngx_dlssd.dll): not loaded\n";
       }
+      if (probe.dlss_modules.empty()) {
+        s << "  dlss modules in process: none found\n";
+      } else {
+        s << "  dlss modules in process (" << probe.dlss_modules.size() << "):\n";
+        for (const auto& module : probe.dlss_modules) {
+          s << "    - " << module << "\n";
+        }
+      }
       if (probe.requirements_attempted) {
         const bool requirements_ok =
             static_cast<sl::Result>(probe.requirements_result) == sl::Result::eOk;
@@ -2237,6 +2409,34 @@ inline std::string BuildReport() {
         s << "  last fallback: SR evaluate=" << ResultName(redirect.last_fallback_result)
           << " reason: " << redirect.last_reason << "\n";
       }
+    }
+    if (redirect.matrices_filled) {
+      const auto& m = redirect.world_to_camera_view;
+      s << "  worldToCameraView row0=(" << m[0].x << ", " << m[0].y << ", " << m[0].z << ", "
+        << m[0].w << ") row3=(" << m[3].x << ", " << m[3].y << ", " << m[3].z << ", " << m[3].w
+        << ")\n";
+    }
+  }
+
+  s << "\n[SL log]\n";
+  s << "  callback installed by mod: "
+    << (d.sl_log_callback_installed ? "yes" : "no (game provided one)")
+    << "  verbose requested: " << (d.sl_log_verbose ? "yes" : "no") << "\n";
+  s << "  messages: " << d.sl_log_total << " (warn/error: " << d.sl_log_warn_errors << ")\n";
+  if (!d.sl_log_last_problems.empty()) {
+    s << "  last warn/error:\n";
+    for (const auto& entry : d.sl_log_last_problems) {
+      s << "    [" << SlLogTypeName(entry.type) << "] " << entry.message;
+      if (entry.repeats > 0) s << "  (x" << (entry.repeats + 1) << ")";
+      s << "\n";
+    }
+  }
+  if (!d.sl_log_last.empty()) {
+    s << "  last messages:\n";
+    for (const auto& entry : d.sl_log_last) {
+      s << "    [" << SlLogTypeName(entry.type) << "] " << entry.message;
+      if (entry.repeats > 0) s << "  (x" << (entry.repeats + 1) << ")";
+      s << "\n";
     }
   }
 
