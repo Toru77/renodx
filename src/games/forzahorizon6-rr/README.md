@@ -214,32 +214,45 @@ which also primes the runtime shader-replacement path the denoise bypass uses.
 
 ## RT denoise bypass (M4)
 
-Live, togglable replacement of the three confirmed-live resolve shaders with
+Live, togglable replacement of the confirmed-live resolve shaders with
 minimal single-sample variants that skip the game's neighborhood filtering
 (`denoise.hpp` plus the root shader files `0x*.cs_6_6.hlsl`):
 
-| Hash | Live role (from the dump) | Bypass |
-|---|---|---|
-| `0x209AB6A4` | resolve-4tap: four-pixel stochastic reprojected gather with weight normalize | passes the pixel's own history samples through, with the original's hash-jittered depth guard and all-taps-rejected fallbacks |
-| `0x596D3E8F` | resolve-spatial: large shared-memory spatial filter with per-material paths and counters | skips all accumulation and reproduces the original's own per-pixel material path (instance/material decode, YCoCg + normal-lobe transform, NaN guards) for every pixel |
-| `0x0B33C6D8` | resolve-bilateral: nine-tap bilateral gather with Co/Cg + normal-lobe reconstruction | evaluates one nearest tap (`px >> 1`, the gather's highest-weight center tap) |
+| Hash | RT tier | Live role (from the dump) | Bypass |
+|---|---|---|---|
+| `0x209AB6A4` | all | resolve-4tap: four-pixel stochastic reprojected gather with weight normalize | passes the pixel's own history samples through, with the original's hash-jittered depth guard and all-taps-rejected fallbacks |
+| `0x596D3E8F` | medium | resolve-spatial: large shared-memory spatial filter with per-material paths and counters | skips all accumulation and reproduces the original's own per-pixel material path (instance/material decode, YCoCg + normal-lobe transform, NaN guards); shared body in `resolve_spatial_bypass.hlsli` |
+| `0x4DAF8A48` | high | same spatial filter stage, recompiled permutation (identical bindings and per-pixel path) | same shared body |
+| `0x0B33C6D8` | medium | resolve-bilateral: nine-tap bilateral gather with Co/Cg + normal-lobe reconstruction | bilinear reconstruction of the half-res pair (no bilateral weighting, no nearest blocks) |
+| `0x14FA42AB` | high | reconstruct stage, recompiled permutation: nearest `px / m[20]` sampling | bilinear reconstruction of the half-res pair |
 
-Mechanics: the overlay's **RT denoise bypass (A/B experiment)** switch (default
-off) calls `AddRuntimeReplacement`/`RemoveRuntimeReplacements` for the three
-hashes on the ReShade device. The swap is a bind-time pipeline clone
-(`use_replace_async`), so it applies within a frame and never modifies the
-game's own PSOs; switching off restores the originals on the next bind. The
-status panel and the report's `[RT denoise bypass]` section show the setting,
-applied state and the three replacement roles.
+RT quality tiers compile different permutations of the spatial/reconstruct
+stages, so each switch replaces every known permutation hash; whichever
+variant the game actually dispatches is the one that swaps (the other Add
+entries are inert until that pipeline exists).
+
+Mechanics: three overlay switches — **Bypass 4-tap gather (0x209AB6A4)**,
+**Bypass spatial filter (0x596D3E8F / 0x4DAF8A48)**, **Bypass bilateral
+gather (0x0B33C6D8 / 0x14FA42AB)**, all default off — each call
+`AddRuntimeReplacement`/`RemoveRuntimeReplacements` for its hashes on the
+ReShade device, so every stage can be A/B-tested in isolation. The swap is a
+bind-time pipeline clone (`use_replace_async`), so it applies within a frame
+and never modifies the game's own PSOs; switching off restores the original on
+the next bind. The status panel and the report's `[RT denoise bypass]` section
+show each switch, its applied state and the covered hashes.
 
 These bypasses are structure-preserving: each keeps the original shader's
 bindings, register spaces, guards, energy clamps and output semantics, and
-removes only the filtering.
+removes only the filtering. The 4-tap bypass still reads the half-res pair
+nearest, so 2x2 blockier resolve output is expected from that switch alone;
+the bilateral switch replaces the game's nearest/bilateral reconstruction with
+a bilinear one, which removes those blocks.
 
-Bypass verify (A/B): in gameplay with RR on, flip the switch and watch the
-resolve feed change (filtering off → rawer/noisier reflection+GI resolve);
-the report should show `[RT denoise bypass] applied: yes`; flip it back and
-the next binds return to the game's originals (`applied: no`).
+Bypass verify (A/B): in gameplay with RR on, flip one switch at a time and
+watch the resolve feed change (filtering off → rawer/noisier reflection+GI
+resolve); the report should show the corresponding line as
+`on, applied: yes` with the covered hashes; flip it back and the next binds
+return to the game's original for that pass (`off, applied: no`).
 
 ## Guide textures (M2c)
 

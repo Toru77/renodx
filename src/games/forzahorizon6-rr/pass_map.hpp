@@ -47,10 +47,13 @@ inline const KnownShader kKnownShaders[] = {
     {0x5408243D, "trace-B3"}, {0x7BD3C79E, "trace-B4"}, {0xD844655D, "trace-B5"},
     {0x490914DC, "trace-C0"}, {0x5CF02E66, "trace-C1"},
     {0xBA7D5A3F, "trace-D0"}, {0xBF9D9135, "trace-D1"},
-    // resolve-denoise/
+    // resolve-denoise/ (the two lower entries are RT-quality permutations of
+    // the spatial filter and the reconstruction stage; see denoise.hpp)
     {0x209AB6A4, "resolve-4tap"},
     {0x596D3E8F, "resolve-spatial"},
     {0x0B33C6D8, "resolve-bilateral"},
+    {0x4DAF8A48, "resolve-spatial-hi"},
+    {0x14FA42AB, "resolve-apply-hi"},
     // gbuffer-prep/
     {0xBF794558, "gbuffer-prep"},
     // ssgi/

@@ -41,8 +41,11 @@ float rr_runtime_load_setting = 1.f;
 float rr_runtime_load_boot_value = 1.f;
 // M2: live toggle, applies on the next evaluate.
 float rr_redirect_setting = 1.f;
-// M4 experiment: live per-pipeline swap of the three RT resolve shaders.
-float rr_denoise_bypass_setting = 0.f;
+// M4 experiment: live per-pipeline swaps of the three RT resolve shaders,
+// one switch each so the bypasses can be A/B-tested in isolation.
+float rr_denoise_gather_setting = 0.f;
+float rr_denoise_filter_setting = 0.f;
+float rr_denoise_bilateral_setting = 0.f;
 // Raises Streamline's own log level while the mod captures its messages.
 float rr_sl_log_verbose_setting = 1.f;
 // DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
@@ -238,7 +241,7 @@ bool DrawStatusPanel() {
     ImGui::TextColored(kColorWarn, "guides: %s", d.guides.last_error.c_str());
   }
   ImGui::TextColored(
-      denoise::bypass_enabled.load() ? kColorWarn : kColorOk, "%s",
+      denoise::AnyEnabled() ? kColorWarn : kColorOk, "%s",
       denoise::StatusLine().c_str());
   return false;
 }
@@ -740,17 +743,51 @@ renodx::utils::settings::Settings settings = {
         .on_change_value = [](float, float value) { sl_rr::SetRrRedirect(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
-        .key = "RrDenoiseBypass",
-        .binding = &rr_denoise_bypass_setting,
+        .key = "RrDenoiseGather",
+        .binding = &rr_denoise_gather_setting,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
         .default_value = 0.f,
-        .label = "RT denoise bypass (A/B experiment)",
+        .label = "Bypass 4-tap gather (0x209AB6A4)",
         .section = "Ray Reconstruction",
-        .tooltip = "Swaps the three live RT resolve shaders (0x209AB6A4 gather, 0x596D3E8F"
-                   " spatial filter, 0x0B33C6D8 bilateral gather) for single-sample bypass"
-                   " variants that skip neighborhood filtering, to A/B the raw ray signal."
-                   " Off = the game's originals. Applies within a frame.",
-        .on_change_value = [](float, float value) { denoise::SetEnabled(value != 0.f); },
+        .tooltip = "Replaces the resolve-4tap stochastic reprojected gather (reflection"
+                   " resolve) with a per-pixel passthrough of the radiance pair: the"
+                   " original depth guard is kept, the 4-tap blending is removed."
+                   " Applies within a frame.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kGatherHash, value != 0.f);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDenoiseFilter",
+        .binding = &rr_denoise_filter_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bypass spatial filter (0x596D3E8F / 0x4DAF8A48)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the large shared-memory spatial filter with the original's"
+                   " own single-sample material path (instance/material decode, energy"
+                   " clamp and NaN guards kept): no neighborhood accumulation. Covers"
+                   " both known RT-quality permutations (medium 0x596D3E8F, high"
+                   " 0x4DAF8A48); the game's dispatched variant is swapped. Applies"
+                   " within a frame.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kSpatialHash, value != 0.f);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDenoiseBilateral",
+        .binding = &rr_denoise_bilateral_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bypass bilateral gather (0x0B33C6D8 / 0x14FA42AB)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the reconstruction/apply stage (medium: nine-tap bilateral"
+                   " 0x0B33C6D8, high: nearest 0x14FA42AB) with a bilinear reconstruction"
+                   " of the same resolve pair: no bilateral weighting and no 2x2-block"
+                   " nearest upsampling. Applies within a frame.",
+        .on_change_value = [](float, float value) {
+          denoise::SetEnabled(denoise::kBilateralHash, value != 0.f);
+        },
     },
     new renodx::utils::settings::Setting{
         .key = "RrSlLogVerbose",
@@ -976,7 +1013,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetRuntimeLoad(rr_runtime_load_setting != 0.f);
     sl_rr::SetRrRedirect(rr_redirect_setting != 0.f);
     sl_rr::SetSlLogVerbose(rr_sl_log_verbose_setting != 0.f);
-    denoise::SetEnabled(rr_denoise_bypass_setting != 0.f);
+    denoise::SetEnabled(denoise::kGatherHash, rr_denoise_gather_setting != 0.f);
+    denoise::SetEnabled(denoise::kSpatialHash, rr_denoise_filter_setting != 0.f);
+    denoise::SetEnabled(denoise::kBilateralHash, rr_denoise_bilateral_setting != 0.f);
     int preset_index = static_cast<int>(rr_preset_setting);
     if (preset_index < 0) preset_index = 0;
     if (preset_index > 5) preset_index = 5;
