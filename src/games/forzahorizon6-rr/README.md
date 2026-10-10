@@ -4,10 +4,11 @@ Ray Reconstruction mod for FH6 via the game's own Streamline instance
 (`sl.interposer.dll`): intercept the DLSS-SR evaluation, answer it with
 `kFeatureDLSS_RR`, and supply the guide buffers the game does not provide.
 
-**Status: M1.5 implemented** — hooks observe and forward; on top of M1, the mod
-appends `kFeatureDLSS_RR` to the game's `slInit` feature list (with a runtime
-`slSetFeatureLoaded` fallback) and reports the full DLSS-RR load path. No
-rendering behavior is changed yet.
+**Status: M2 implemented** — the game's `slEvaluateFeature(DLSS)` is redirected to
+`kFeatureDLSS_RR` with `DLSSDOptions` mirrored from the game's own settings
+(internal resolution stays game-controlled), strict per-frame fallback to SR on
+any failure, and a live A/B toggle. No guide buffers yet — RR runs on the tags
+the game already provides.
 
 ## Goal roadmap
 
@@ -16,8 +17,8 @@ rendering behavior is changed yet.
 3. ~~M1: Streamline interception with UI-first diagnostics.~~
 4. ~~M1.5: DLSS-RR load path (slInit injection + runtime fallback) + full
    option/requirement capture in the report.~~
-5. **M2:** SR → RR redirect skeleton + fallback (prove the swap, live A/B).
-6. M3: NormalRoughness guide from G-buffer T3 (gloss → roughness).
+5. ~~M2: SR → RR redirect + strict fallback (prove the swap, live A/B).~~
+6. **M3:** NormalRoughness guide from G-buffer T3 (gloss → roughness).
 7. M4: Specular motion vectors + hit distance from the DXR trace outputs.
 8. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
 9. Later: muting SSR layering on RT reflections; denoiser bypass.
@@ -80,7 +81,7 @@ src/games/forzahorizon6-rr/
 
 Each category folder holds its raw decompiled dumps in a `.dumps` subfolder.
 
-## Diagnostics UI (M1.5)
+## Diagnostics UI (M2)
 
 Everything is reported in the ReShade overlay under "Ray Reconstruction" —
 no log reading required:
@@ -88,7 +89,10 @@ no log reading required:
 - **Status** — Streamline found/armed, slInit result + requested/effective
   features (`+DLSS-RR, mod` when injected), device/LUID, frame token count,
   buffer tag counts, RR load line (slInit injected / runtime load attempts +
-  result) and the serving plugin path.
+  result), serving plugin/NGX module paths, and the redirect line
+  (`N RR frames, M fallbacks` + last attempt results or last fallback reason).
+- **Replace DLSS SR with Ray Reconstruction** — live A/B toggle (default on).
+  Off: the game's DLSS SR runs unchanged.
 - **Request DLSS-RR at slInit** — appends `kFeatureDLSS_RR` to the game's
   `featuresToLoad` in the `slInit` hook (default on; restart required).
 - **Auto-load DLSS-RR at runtime** — if the feature is still not loaded when
@@ -101,12 +105,15 @@ no log reading required:
   matrices, depth/MV convention flags).
 - **DLSS options (captured)** — mode, output size, HDR flag, exposures,
   presets, and the optimal-settings answer, captured through forward-only
-  wrappers around `slDLSSSetOptions` / `slDLSSGetOptimalSettings`.
+  wrappers around `slDLSSSetOptions` / `slDLSSGetOptimalSettings`. These
+  captured values are what the redirect mirrors into `DLSSDOptions`.
 - **DLSS-RR probe** — RR requirements (`slGetFeatureRequirements`: flags,
   required tags, driver), `slDLSSDSetOptions` / `GetOptimalSettings` /
   `GetState` availability, and a trial `slDLSSDGetOptimalSettings` call
   mirroring the game's own DLSS mode.
 - **Features** — per-feature evaluate/query results (DLSS, DLSS-G, DLSS-RR…).
+  With the redirect on, the DLSS row counts only fallback frames; the DLSS-RR
+  row counts the redirected frames.
 - **Feature functions** — which `slGetFeatureFunction` requests the game makes.
 - **Recent evaluates** — last `slEvaluateFeature` calls (inputs resolved to
   struct names + versions) + caller module.
@@ -115,20 +122,44 @@ no log reading required:
 Buttons: **Probe DLSS-RR** / **Probe all features** (runs at the next in-game
 Streamline call), **Copy report** / **Write report to log**, **Reset capture**.
 
-## Build & verify (M1.5)
+## M2 redirect behavior
+
+Per frame, when the game evaluates `kFeatureDLSS` with the toggle on:
+
+1. Captured SR options are mirrored into `DLSSDOptions` (mode, output size,
+   HDR flag, exposures, presets); world matrices stay default until M4. The
+   game's in-game DLSS settings therefore keep controlling internal
+   resolution.
+2. `slDLSSDSetOptions` is called for the game's viewport, then
+   `slEvaluateFeature(kFeatureDLSS_RR, ...)` runs with the game's own frame
+   token, inputs and command list — the game's tags/constants for that frame
+   are already in place.
+3. Any failure (functions unavailable, no captured options, SetOptions or
+   evaluate error) falls back to the untouched SR evaluate for that frame,
+   counted with a reason in the report; redirect stays on and retries next
+   frame.
+
+Expected visual result at M2: RR denoises/upscales the game's already
+composited color with no guide buffers yet — a modest change vs SR, not full
+RR quality. The real gains land with M3/M4 (guides) and the later SSR-mute.
+
+## Build & verify (M2)
 
 - Build target: `forzahorizon6-rr` → `build/<config>/renodx-forzahorizon6-rr.addon64`.
 - Deploy next to ReShade (`dxgi.dll` slot) as an add-on DLL; keep the game's
   Streamline files untouched.
 - Verification: start the game with DLSS on and ray tracing enabled, reach
   gameplay (~10 s), open the overlay's Ray Reconstruction section, press
-  **Copy report**. Expect Streamline hooked (15/15), slInit seen with
-  `featuresToLoad (effective)` ending in `DLSS_RR [DLSS-RR appended by mod]`,
-  the RR probe reporting `supported/loaded = eOk/yes` for DLSS-RR, the
-  `sl.dlss_d.dll` module path, RR requirements with the required tag list, and
-  a successful trial `slDLSSDGetOptimalSettings`. The game must run unchanged
-  (hooks still forward everything; the only behavior change is requesting the
-  RR plugin at init/load).
+  **Copy report**. Expect:
+  - Streamline hooked (15/15), slInit injected, RR probe `loaded=yes`.
+  - `[RR redirect]` with `setting: on`, `redirected frames` growing at ~1 per
+    frame and `fallbacks: 0` (or a listed reason).
+  - `[evaluates]` DLSS-RR row counting evals with `lastResult=Result::eOk`.
+  - An A/B toggle check: turning the switch off restores the previous DLSS-SR
+    image; turning it on changes it again.
+  - Optional visual confirmation: NVIDIA's DLSS indicator overlay shows the
+    RR feature while redirect is on
+    (`ShowDlssIndicator=1024` under `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore`).
 
 ## Build-safety / conventions
 

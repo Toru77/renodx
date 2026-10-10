@@ -465,6 +465,22 @@ struct RrProbeState {
   bool trial_state_attempted = false;
   int trial_state_result = kNever;
   uint64_t trial_vram_bytes = 0;
+  // Serving NGX library (nvngx_dlssd.dll), refreshed by the M2 module recheck
+  bool ngx_module_loaded = false;
+  std::string ngx_module_path;
+  bool module_recheck_done = false;
+};
+
+// M2: the game's DLSS-SR evaluate redirected to DLSS-RR, with strict
+// per-frame fallback to the untouched SR call on any failure.
+struct RrRedirectState {
+  uint64_t redirected = 0;  // game DLSS evals that ran as RR
+  uint64_t fallbacks = 0;   // redirect attempts that ran as SR instead
+  uint32_t last_frame = 0;
+  int last_set_options_result = kNever;
+  int last_eval_result = kNever;      // RR evaluate result of the last attempt
+  int last_fallback_result = kNever;  // SR evaluate result of the last fallback
+  std::string last_reason;            // set on a fallback, cleared on success
 };
 
 struct Diagnostics {
@@ -538,6 +554,7 @@ struct Diagnostics {
   // captured DLSS (SR) options + DLSS-RR probe extras
   DlssOptionsCapture dlss_options;
   RrProbeState rr_probe;
+  RrRedirectState rr_redirect;
 };
 
 inline Diagnostics diagnostics;
@@ -559,6 +576,48 @@ inline void NoteCallLocked(HookIndex index, void* caller) {
   auto& row = diagnostics.hooks[i];
   ++row.calls;
   row.last_caller = caller;
+}
+
+// Records one slEvaluateFeature (game or mod-issued) — call under the lock.
+inline void RecordEvaluateLocked(
+    uint32_t feature, uint32_t frame, const sl::BaseStructure** inputs, uint32_t num_inputs,
+    sl::Result result, void* caller) {
+  ++diagnostics.evaluates_total;
+  auto& row = FeatureForLocked(feature);
+  ++row.evaluates;
+  row.last_eval_frame = frame;
+  row.last_eval_result = static_cast<int>(result);
+  row.last_eval_inputs = num_inputs;
+  row.last_eval_caller = caller;
+  row.last_eval_input_info = {};
+  if (inputs != nullptr) {
+    const uint32_t captured =
+        num_inputs < row.last_eval_input_info.size()
+            ? num_inputs
+            : static_cast<uint32_t>(row.last_eval_input_info.size());
+    for (uint32_t i = 0; i < captured; ++i) {
+      if (inputs[i] == nullptr) continue;
+      row.last_eval_input_info[i].data1 = inputs[i]->structType.data1;
+      row.last_eval_input_info[i].version = static_cast<uint32_t>(inputs[i]->structVersion);
+    }
+  }
+  EvaluateCall call{};
+  call.frame = frame;
+  call.feature = feature;
+  call.num_inputs = num_inputs;
+  call.input_info = row.last_eval_input_info;
+  call.result = static_cast<int>(result);
+  call.caller = caller;
+  diagnostics.evaluate_recent.insert(diagnostics.evaluate_recent.begin(), call);
+  while (diagnostics.evaluate_recent.size() > 12) {
+    diagnostics.evaluate_recent.pop_back();
+  }
+  // One-shot automatic probe once the game is clearly running DLSS.
+  if (!diagnostics.auto_probe_done) {
+    diagnostics.auto_probe_done = true;
+    diagnostics.probe_pending = true;
+    diagnostics.probe_scope = 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +765,11 @@ inline bool GetInitInjection() { return rr_init_injection_enabled.load(); }
 inline void SetRuntimeLoad(bool enabled) { rr_runtime_load_enabled.store(enabled); }
 inline bool GetRuntimeLoad() { return rr_runtime_load_enabled.load(); }
 
+// M2: redirect the game's DLSS-SR evaluation to DLSS-RR (default on).
+inline std::atomic<bool> rr_redirect_enabled{true};
+inline void SetRrRedirect(bool enabled) { rr_redirect_enabled.store(enabled); }
+inline bool GetRrRedirect() { return rr_redirect_enabled.load(); }
+
 // ---------------------------------------------------------------------------
 // probes — run at a game Streamline call boundary (same thread the game uses
 // for SL), never while holding the diagnostics lock.
@@ -721,17 +785,21 @@ inline void* FetchRrFunction(const char* name, int& result_out) {
   return fn;
 }
 
-// Where the DLSS-RR plugin lives: the loaded module (game folder or driver
-// store, whichever Streamline picked) and/or the game-folder copy on disk.
+// Where DLSS-RR is served from: the loaded plugin module (game folder or
+// driver store, whichever Streamline picked), the NGX library it uses, and the
+// game-folder copy on disk.
 inline void ProbeRrPlugin(RrProbeState& probe) {
-  HMODULE plugin = GetModuleHandleW(L"sl.dlss_d.dll");
-  if (plugin != nullptr) {
+  const auto resolve_module = [](const wchar_t* name, std::string& out_path) {
+    const HMODULE module = GetModuleHandleW(name);
+    if (module == nullptr) return false;
     wchar_t buffer[MAX_PATH] = {};
-    if (GetModuleFileNameW(plugin, buffer, MAX_PATH) != 0) {
-      probe.plugin_module_path = WideToNarrow(buffer);
-      probe.plugin_module_loaded = true;
-    }
-  }
+    if (GetModuleFileNameW(module, buffer, MAX_PATH) == 0) return false;
+    out_path = WideToNarrow(buffer);
+    return true;
+  };
+  probe.plugin_module_loaded = resolve_module(L"sl.dlss_d.dll", probe.plugin_module_path);
+  probe.ngx_module_loaded = resolve_module(L"nvngx_dlssd.dll", probe.ngx_module_path);
+
   wchar_t executable[MAX_PATH] = {};
   if (GetModuleFileNameW(nullptr, executable, MAX_PATH) == 0) return;
   std::wstring path = executable;
@@ -988,6 +1056,7 @@ inline void ResetCapture() {
   diagnostics.auto_probe_done = false;
   diagnostics.shutdown_seen = false;
   diagnostics.rr_probe = {};
+  diagnostics.rr_redirect = {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,47 +1304,123 @@ inline sl::Result HookedSlEvaluateFeature(
     sl::Feature feature, const sl::FrameToken& frame, const sl::BaseStructure** inputs,
     uint32_t num_inputs, sl::CommandBuffer* cmd) {
   ServiceProbeIfPending();
-  const auto result = real_sl_evaluate_feature(feature, frame, inputs, num_inputs, cmd);
   void* const caller = _ReturnAddress();
   const uint32_t frame_index = static_cast<uint32_t>(frame);
+
+  // M2: answer the game's DLSS-SR evaluation with DLSS-RR. Options are mirrored
+  // from the game's own slDLSSSetOptions capture, so the game's in-game
+  // settings keep controlling internal resolution. Any failure for a frame
+  // falls back to the untouched SR call (strict fallback) and is counted for
+  // the report.
+  if (feature == sl::kFeatureDLSS && GetRrRedirect()) {
+    const auto fallback = [&](const std::string& reason, int set_options_result,
+                              int eval_result) {
+      const auto sr_result = real_sl_evaluate_feature(feature, frame, inputs, num_inputs, cmd);
+      const std::lock_guard lock(diagnostics_mutex);
+      NoteCallLocked(kHookEvaluateFeature, caller);
+      auto& redirect = diagnostics.rr_redirect;
+      ++redirect.fallbacks;
+      redirect.last_frame = frame_index;
+      redirect.last_set_options_result = set_options_result;
+      redirect.last_eval_result = eval_result;
+      redirect.last_fallback_result = static_cast<int>(sr_result);
+      redirect.last_reason = reason;
+      RecordEvaluateLocked(feature, frame_index, inputs, num_inputs, sr_result, caller);
+      return sr_result;
+    };
+
+    DlssOptionsCapture captured;
+    {
+      const std::lock_guard lock(diagnostics_mutex);
+      captured = diagnostics.dlss_options;
+    }
+
+    if (real_dlssd_set_options == nullptr) {
+      int fetch_result = kNever;
+      const auto fn = FetchRrFunction("slDLSSDSetOptions", fetch_result);
+      real_dlssd_set_options = reinterpret_cast<PFun_slDLSSDSetOptions*>(fn);
+      if (real_dlssd_set_options == nullptr) {
+        return fallback("slDLSSDSetOptions unavailable", kNever, kNever);
+      }
+    }
+    if (!captured.captured) {
+      return fallback("no captured slDLSSOptions yet", kNever, kNever);
+    }
+    const bool dims_ok = captured.output_width != 0 && captured.output_width != 0xFFFFFFFFu
+                         && captured.output_height != 0
+                         && captured.output_height != 0xFFFFFFFFu;
+    if (!dims_ok) {
+      return fallback("captured options have no output size", kNever, kNever);
+    }
+
+    sl::ViewportHandle viewport(0u);
+    if (inputs != nullptr) {
+      for (uint32_t i = 0; i < num_inputs; ++i) {
+        if (inputs[i] == nullptr || inputs[i]->structType.data1 != 0x171b6435) continue;
+        viewport = *static_cast<const sl::ViewportHandle*>(inputs[i]);
+        break;
+      }
+    }
+
+    sl::DLSSDOptions options{};
+    options.mode = static_cast<sl::DLSSMode>(captured.mode);
+    options.outputWidth = captured.output_width;
+    options.outputHeight = captured.output_height;
+    options.preExposure = captured.pre_exposure;
+    options.exposureScale = captured.exposure_scale;
+    if (captured.color_buffers_hdr >= 0) {
+      options.colorBuffersHDR = static_cast<sl::Boolean>(captured.color_buffers_hdr);
+    }
+    if (captured.alpha_upscaling >= 0) {
+      options.alphaUpscalingEnabled = static_cast<sl::Boolean>(captured.alpha_upscaling);
+    }
+    // DLSSD presets share the DLSS preset letter ordering; world matrices stay
+    // at defaults until the M4 spec-MV work.
+    options.dlaaPreset = static_cast<sl::DLSSDPreset>(captured.presets[0]);
+    options.qualityPreset = static_cast<sl::DLSSDPreset>(captured.presets[1]);
+    options.balancedPreset = static_cast<sl::DLSSDPreset>(captured.presets[2]);
+    options.performancePreset = static_cast<sl::DLSSDPreset>(captured.presets[3]);
+    options.ultraPerformancePreset = static_cast<sl::DLSSDPreset>(captured.presets[4]);
+    options.ultraQualityPreset = static_cast<sl::DLSSDPreset>(captured.presets[5]);
+
+    const auto set_result = real_dlssd_set_options(viewport, options);
+    if (set_result != sl::Result::eOk) {
+      return fallback(
+          "slDLSSDSetOptions " + ResultName(static_cast<int>(set_result)),
+          static_cast<int>(set_result), kNever);
+    }
+    const auto rr_result =
+        real_sl_evaluate_feature(sl::kFeatureDLSS_RR, frame, inputs, num_inputs, cmd);
+    if (rr_result != sl::Result::eOk) {
+      return fallback(
+          "RR evaluate " + ResultName(static_cast<int>(rr_result)),
+          static_cast<int>(set_result), static_cast<int>(rr_result));
+    }
+
+    {
+      const std::lock_guard lock(diagnostics_mutex);
+      NoteCallLocked(kHookEvaluateFeature, caller);
+      auto& redirect = diagnostics.rr_redirect;
+      ++redirect.redirected;
+      redirect.last_frame = frame_index;
+      redirect.last_set_options_result = static_cast<int>(set_result);
+      redirect.last_eval_result = static_cast<int>(rr_result);
+      redirect.last_fallback_result = kNever;
+      redirect.last_reason.clear();
+      RecordEvaluateLocked(sl::kFeatureDLSS_RR, frame_index, inputs, num_inputs, rr_result, caller);
+      // With RR actually initialized, look for the serving modules once more.
+      if (!diagnostics.rr_probe.module_recheck_done) {
+        diagnostics.rr_probe.module_recheck_done = true;
+        ProbeRrPlugin(diagnostics.rr_probe);
+      }
+    }
+    return rr_result;
+  }
+
+  const auto result = real_sl_evaluate_feature(feature, frame, inputs, num_inputs, cmd);
   const std::lock_guard lock(diagnostics_mutex);
   NoteCallLocked(kHookEvaluateFeature, caller);
-  ++diagnostics.evaluates_total;
-  auto& row = FeatureForLocked(feature);
-  ++row.evaluates;
-  row.last_eval_frame = frame_index;
-  row.last_eval_result = static_cast<int>(result);
-  row.last_eval_inputs = num_inputs;
-  row.last_eval_caller = caller;
-  row.last_eval_input_info = {};
-  if (inputs != nullptr) {
-    const uint32_t captured_inputs =
-        num_inputs < row.last_eval_input_info.size()
-            ? num_inputs
-            : static_cast<uint32_t>(row.last_eval_input_info.size());
-    for (uint32_t i = 0; i < captured_inputs; ++i) {
-      if (inputs[i] == nullptr) continue;
-      row.last_eval_input_info[i].data1 = inputs[i]->structType.data1;
-      row.last_eval_input_info[i].version = static_cast<uint32_t>(inputs[i]->structVersion);
-    }
-  }
-  EvaluateCall call{};
-  call.frame = frame_index;
-  call.feature = feature;
-  call.num_inputs = num_inputs;
-  call.input_info = row.last_eval_input_info;
-  call.result = static_cast<int>(result);
-  call.caller = caller;
-  diagnostics.evaluate_recent.insert(diagnostics.evaluate_recent.begin(), call);
-  while (diagnostics.evaluate_recent.size() > 12) {
-    diagnostics.evaluate_recent.pop_back();
-  }
-  // One-shot automatic probe once the game is clearly running DLSS.
-  if (!diagnostics.auto_probe_done) {
-    diagnostics.auto_probe_done = true;
-    diagnostics.probe_pending = true;
-    diagnostics.probe_scope = 0;
-  }
+  RecordEvaluateLocked(feature, frame_index, inputs, num_inputs, result, caller);
   return result;
 }
 
@@ -2015,6 +2160,11 @@ inline std::string BuildReport() {
         }
         s << "\n";
       }
+      if (probe.ngx_module_loaded) {
+        s << "  ngx module: loaded at " << probe.ngx_module_path << "\n";
+      } else {
+        s << "  ngx module (nvngx_dlssd.dll): not loaded\n";
+      }
       if (probe.requirements_attempted) {
         const bool requirements_ok =
             static_cast<sl::Result>(probe.requirements_result) == sl::Result::eOk;
@@ -2070,6 +2220,23 @@ inline std::string BuildReport() {
         }
       }
       s << "\n";
+    }
+  }
+
+  s << "\n[RR redirect]\n";
+  s << "setting: " << (GetRrRedirect() ? "on" : "off") << "\n";
+  {
+    const auto& redirect = d.rr_redirect;
+    s << "  game DLSS evaluates (redirect on): " << (redirect.redirected + redirect.fallbacks)
+      << "  redirected frames: " << redirect.redirected << "  fallbacks: " << redirect.fallbacks
+      << "  lastFrame: " << redirect.last_frame << "\n";
+    if (redirect.redirected > 0 || redirect.fallbacks > 0) {
+      s << "  last attempt: slDLSSDSetOptions=" << ResultName(redirect.last_set_options_result)
+        << " RR evaluate=" << ResultName(redirect.last_eval_result) << "\n";
+      if (!redirect.last_reason.empty()) {
+        s << "  last fallback: SR evaluate=" << ResultName(redirect.last_fallback_result)
+          << " reason: " << redirect.last_reason << "\n";
+      }
     }
   }
 

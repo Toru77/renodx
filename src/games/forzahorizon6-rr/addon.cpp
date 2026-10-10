@@ -37,6 +37,8 @@ float rr_init_inject_setting = 1.f;
 float rr_init_inject_boot_value = 1.f;
 float rr_runtime_load_setting = 1.f;
 float rr_runtime_load_boot_value = 1.f;
+// M2: live toggle, applies on the next evaluate.
+float rr_redirect_setting = 1.f;
 
 std::string Hex64(uint64_t value) {
   char buffer[32] = {};
@@ -188,6 +190,32 @@ bool DrawStatusPanel() {
         kColorWarn, "plugin: not loaded%s",
         probe.plugin_file_present ? " (sl.dlss_d.dll present on disk)"
                                   : " (sl.dlss_d.dll not found)");
+  }
+  if (probe.ngx_module_loaded) {
+    ImGui::TextWrapped("ngx module: %s", probe.ngx_module_path.c_str());
+  }
+  const auto& redirect = d.rr_redirect;
+  if (sl_rr::GetRrRedirect()) {
+    if (redirect.redirected > 0 || redirect.fallbacks > 0) {
+      const bool healthy = redirect.redirected > 0 && redirect.last_reason.empty();
+      ImGui::TextColored(
+          healthy ? kColorOk : kColorWarn,
+          "Redirect: %llu RR frames, %llu fallbacks (frame %u)",
+          static_cast<unsigned long long>(redirect.redirected),
+          static_cast<unsigned long long>(redirect.fallbacks), redirect.last_frame);
+      if (!redirect.last_reason.empty()) {
+        ImGui::TextColored(kColorBad, "last fallback: %s", redirect.last_reason.c_str());
+      } else {
+        ImGui::Text(
+            "last: slDLSSDSetOptions %s, RR evaluate %s",
+            sl_rr::ResultName(redirect.last_set_options_result).c_str(),
+            sl_rr::ResultName(redirect.last_eval_result).c_str());
+      }
+    } else {
+      ImGui::TextUnformatted("Redirect: on — waiting for the next DLSS evaluate");
+    }
+  } else {
+    ImGui::TextUnformatted("Redirect: off — the game's DLSS SR runs unchanged");
   }
   return false;
 }
@@ -463,6 +491,11 @@ bool DrawRrProbePanel() {
   } else {
     ImGui::TextColored(kColorWarn, "plugin: sl.dlss_d.dll not found");
   }
+  if (probe.ngx_module_loaded) {
+    ImGui::TextWrapped("ngx module: %s", probe.ngx_module_path.c_str());
+  } else {
+    ImGui::TextUnformatted("ngx module (nvngx_dlssd.dll): not loaded");
+  }
   if (probe.requirements_attempted) {
     ImGui::Text(
         "requirements: %s flags 0x%X [%s]", sl_rr::ResultName(probe.requirements_result).c_str(),
@@ -549,6 +582,19 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "If the slInit request did not load DLSS-RR, the probe calls"
                    " slSetFeatureLoaded(DLSS-RR, true) and reports the result.",
         .on_change_value = [](float, float value) { sl_rr::SetRuntimeLoad(value != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrRedirect",
+        .binding = &rr_redirect_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Replace DLSS SR with Ray Reconstruction",
+        .section = "Ray Reconstruction",
+        .tooltip = "Redirects the game's slEvaluateFeature(DLSS) to DLSS-RR with options"
+                   " mirrored from the game's own settings (internal resolution stays"
+                   " game-controlled). Any frame where the redirect fails runs on DLSS SR"
+                   " instead.",
+        .on_change_value = [](float, float value) { sl_rr::SetRrRedirect(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -720,6 +766,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     rr_runtime_load_boot_value = rr_runtime_load_setting;
     sl_rr::SetInitInjection(rr_init_inject_setting != 0.f);
     sl_rr::SetRuntimeLoad(rr_runtime_load_setting != 0.f);
+    sl_rr::SetRrRedirect(rr_redirect_setting != 0.f);
   }
 
   if (fdw_reason == DLL_PROCESS_DETACH) {
