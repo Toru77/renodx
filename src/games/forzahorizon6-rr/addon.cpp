@@ -31,6 +31,13 @@ const ImVec4 kColorOk = {0.40f, 0.90f, 0.40f, 1.0f};
 const ImVec4 kColorWarn = {1.00f, 0.80f, 0.30f, 1.0f};
 const ImVec4 kColorBad = {1.00f, 0.40f, 0.40f, 1.0f};
 
+// The value the session booted with is kept so the overlay can say "restart"
+// when the saved one differs (both are read by sl_rr at slInit time only).
+float rr_init_inject_setting = 1.f;
+float rr_init_inject_boot_value = 1.f;
+float rr_runtime_load_setting = 1.f;
+float rr_runtime_load_boot_value = 1.f;
+
 std::string Hex64(uint64_t value) {
   char buffer[32] = {};
   snprintf(buffer, sizeof buffer, "0x%llX", static_cast<unsigned long long>(value));
@@ -96,14 +103,19 @@ bool DrawStatusPanel() {
         "flags 0x%llX, log %d, engine %d, appId %u, API %d",
         static_cast<unsigned long long>(d.init_flags), d.init_log_level, d.init_engine,
         d.init_app_id, d.init_render_api);
-    if (d.init_feature_count > 0) {
+    ImGui::Text(
+        "pref v%u, showConsole %s, plugin paths %u",
+        d.init_pref_version, d.init_show_console ? "yes" : "no", d.init_num_plugin_paths);
+    if (d.init_feature_count > 0 || d.init_effective_count > 0) {
       std::stringstream features;
       features << "featuresToLoad:";
-      for (uint32_t i = 0; i < d.init_feature_count
-                           && i < static_cast<uint32_t>(d.init_features.size());
+      for (uint32_t i = 0;
+           i < d.init_effective_count
+           && i < static_cast<uint32_t>(d.init_features_effective.size());
            ++i) {
-        features << ' ' << sl_rr::FeatureName(d.init_features[i]);
+        features << ' ' << sl_rr::FeatureName(d.init_features_effective[i]);
       }
+      if (d.init_rr_injected) features << "  (+DLSS-RR, mod)";
       ImGui::TextUnformatted(features.str().c_str());
     }
   }
@@ -160,6 +172,23 @@ bool DrawStatusPanel() {
       ImGui::Text("version: %s (%s)", version.str().c_str(), sl_rr::ResultName(rr.version_result).c_str());
     }
   }
+  const auto& probe = d.rr_probe;
+  if (probe.load_attempts > 0) {
+    ImGui::TextColored(
+        probe.loaded_after_load ? kColorOk : kColorBad,
+        "runtime load attempts: %u, last %s (loaded after: %s)", probe.load_attempts,
+        sl_rr::ResultName(probe.load_result).c_str(), probe.loaded_after_load ? "yes" : "no");
+  } else if (d.init_rr_injected) {
+    ImGui::TextUnformatted("load: requested at slInit (featuresToLoad + DLSS-RR)");
+  }
+  if (probe.plugin_module_loaded) {
+    ImGui::TextWrapped("plugin: %s", probe.plugin_module_path.c_str());
+  } else if (probe.ran) {
+    ImGui::TextColored(
+        kColorWarn, "plugin: not loaded%s",
+        probe.plugin_file_present ? " (sl.dlss_d.dll present on disk)"
+                                  : " (sl.dlss_d.dll not found)");
+  }
   return false;
 }
 
@@ -187,15 +216,24 @@ bool DrawTagsPanel() {
           tag.desc_height);
       size = buffer;
       if (tag.desc_layers > 1) size += " x" + std::to_string(tag.desc_layers);
+      if (tag.desc_mips > 1) size += " m" + std::to_string(tag.desc_mips);
     } else if (tag.sl_width != 0 || tag.sl_height != 0) {
       char buffer[64] = {};
       snprintf(buffer, sizeof buffer, "%ux%u", tag.sl_width, tag.sl_height);
       size = buffer;
+      if (tag.sl_layers > 1) size += " x" + std::to_string(tag.sl_layers);
+      if (tag.sl_mips > 1) size += " m" + std::to_string(tag.sl_mips);
     }
     std::string extent = "-";
-    if (tag.extent_w != 0 || tag.extent_h != 0) {
+    if (tag.extent_w != 0 || tag.extent_h != 0 || tag.extent_left != 0 || tag.extent_top != 0) {
       char buffer[64] = {};
-      snprintf(buffer, sizeof buffer, "%ux%u", tag.extent_w, tag.extent_h);
+      if (tag.extent_left != 0 || tag.extent_top != 0) {
+        snprintf(
+            buffer, sizeof buffer, "l%u t%u %ux%u", tag.extent_left, tag.extent_top,
+            tag.extent_w, tag.extent_h);
+      } else {
+        snprintf(buffer, sizeof buffer, "%ux%u", tag.extent_w, tag.extent_h);
+      }
       extent = buffer;
     }
     std::string state = "-";
@@ -330,7 +368,7 @@ bool DrawEvaluatesPanel() {
         std::to_string(call.frame),
         sl_rr::FeatureName(call.feature),
         std::to_string(call.num_inputs),
-        call.primary_input_type != 0 ? Hex64(call.primary_input_type) : "-",
+        sl_rr::EvalInputLabel(call.input_info[0]),
         sl_rr::ResultName(call.result),
         sl_rr::ModuleNameOf(call.caller),
     });
@@ -355,6 +393,124 @@ bool DrawHooksPanel() {
   return DrawRowTable("##sl_rr_hooks", {"Hook", "Armed", "Calls", "Last caller"}, rows);
 }
 
+bool DrawDlssOptionsPanel() {
+  const sl_rr::Diagnostics d = sl_rr::CaptureDiagnostics();
+  const auto& opts = d.dlss_options;
+  if (!opts.captured && !opts.optimal_captured) {
+    ImGui::TextColored(kColorWarn, "slDLSSSetOptions / slDLSSGetOptimalSettings not seen yet.");
+    ImGui::TextUnformatted("Captured through forward-only wrappers; no behavior is changed.");
+    return false;
+  }
+  ImGui::Text(
+      "setOptions calls %u, optimal queries %u, last frame %u", opts.set_options_calls,
+      opts.get_optimal_calls, opts.last_frame);
+  ImGui::Text(
+      "mode %s  output %ux%u", sl::getDLSSModeAsStr(static_cast<sl::DLSSMode>(opts.mode)),
+      opts.output_width, opts.output_height);
+  const std::string hdr = opts.color_buffers_hdr >= 0
+                              ? sl_rr::BooleanName(static_cast<sl::Boolean>(opts.color_buffers_hdr))
+                              : "?";
+  const std::string auto_exposure =
+      opts.use_auto_exposure >= 0
+          ? sl_rr::BooleanName(static_cast<sl::Boolean>(opts.use_auto_exposure))
+          : "?";
+  const std::string alpha =
+      opts.alpha_upscaling >= 0
+          ? sl_rr::BooleanName(static_cast<sl::Boolean>(opts.alpha_upscaling))
+          : "?";
+  ImGui::Text(
+      "preExposure %.4f  exposureScale %.4f  HDR %s  autoExposure %s  alphaUpscale %s",
+      opts.pre_exposure, opts.exposure_scale, hdr.c_str(), auto_exposure.c_str(), alpha.c_str());
+  static const char* const kPresetLabels[6] = {
+      "DLAA", "Quality", "Balanced", "Performance", "UltraPerf", "UltraQuality"};
+  std::stringstream presets;
+  presets << "presets:";
+  for (int i = 0; i < 6; ++i) {
+    presets << ' ' << kPresetLabels[i] << '=' << sl_rr::PresetName(opts.presets[static_cast<size_t>(i)]);
+  }
+  ImGui::TextUnformatted(presets.str().c_str());
+  if (opts.optimal_captured) {
+    ImGui::Text(
+        "game optimal query: mode %s, %s render %ux%u sharpness %.3f (min %ux%u, max %ux%u)",
+        sl::getDLSSModeAsStr(static_cast<sl::DLSSMode>(opts.optimal_mode)),
+        sl_rr::ResultName(opts.optimal_result).c_str(), opts.optimal_render_width,
+        opts.optimal_render_height, opts.optimal_sharpness, opts.render_width_min,
+        opts.render_height_min, opts.render_width_max, opts.render_height_max);
+  }
+  return false;
+}
+
+bool DrawRrProbePanel() {
+  const sl_rr::Diagnostics d = sl_rr::CaptureDiagnostics();
+  const auto& probe = d.rr_probe;
+  if (!probe.ran) {
+    ImGui::TextColored(
+        kColorWarn, "Probe has not run yet (automatic at the first DLSS evaluate).");
+    return false;
+  }
+  ImGui::Text("frame %u  load attempts %u", probe.frame, probe.load_attempts);
+  if (probe.load_attempts > 0) {
+    ImGui::Text(
+        "last load: %s -> loaded after: %s", sl_rr::ResultName(probe.load_result).c_str(),
+        probe.loaded_after_load ? "yes" : "no");
+  } else {
+    ImGui::TextUnformatted("load: requested via slInit (no runtime attempt needed)");
+  }
+  if (probe.plugin_module_loaded) {
+    ImGui::TextWrapped("plugin module: %s", probe.plugin_module_path.c_str());
+  } else if (probe.plugin_file_present) {
+    ImGui::TextWrapped("plugin: not loaded; sl.dlss_d.dll present at %s", probe.plugin_file_path.c_str());
+  } else {
+    ImGui::TextColored(kColorWarn, "plugin: sl.dlss_d.dll not found");
+  }
+  if (probe.requirements_attempted) {
+    ImGui::Text(
+        "requirements: %s flags 0x%X [%s]", sl_rr::ResultName(probe.requirements_result).c_str(),
+        probe.requirement_flags, sl_rr::RequirementFlagsText(probe.requirement_flags).c_str());
+    ImGui::Text(
+        "max viewports %u, max CPU threads %u", probe.max_viewports, probe.max_cpu_threads);
+    if (!probe.required_tags.empty()) {
+      std::stringstream tags;
+      tags << "required tags:";
+      for (uint32_t tag : probe.required_tags) tags << ' ' << sl_rr::BufferName(tag);
+      ImGui::TextWrapped("%s", tags.str().c_str());
+    }
+    if (!probe.driver_version_required.empty() && probe.driver_version_required != "0.0.0") {
+      ImGui::Text("driver required: %s", probe.driver_version_required.c_str());
+    }
+  }
+  ImGui::Text(
+      "functions: SetOptions %s, GetOptimalSettings %s, GetState %s",
+      sl_rr::ResultName(probe.fn_set_options_result).c_str(),
+      sl_rr::ResultName(probe.fn_get_optimal_result).c_str(),
+      sl_rr::ResultName(probe.fn_get_state_result).c_str());
+  if (probe.trial_optimal_attempted) {
+    if (static_cast<sl::Result>(probe.trial_optimal_result) == sl::Result::eOk) {
+      ImGui::Text(
+          "trial optimal: render %ux%u sharpness %.3f (min %ux%u, max %ux%u)",
+          probe.trial_render_width, probe.trial_render_height, probe.trial_sharpness,
+          probe.trial_render_width_min, probe.trial_render_height_min,
+          probe.trial_render_width_max, probe.trial_render_height_max);
+    } else {
+      ImGui::TextColored(
+          kColorWarn, "trial optimal: %s", sl_rr::ResultName(probe.trial_optimal_result).c_str());
+    }
+  } else {
+    ImGui::TextUnformatted("trial optimal: skipped (no captured DLSS options yet)");
+  }
+  if (probe.trial_state_attempted) {
+    if (static_cast<sl::Result>(probe.trial_state_result) == sl::Result::eOk) {
+      ImGui::Text(
+          "trial state: %.1f MB estimated VRAM",
+          static_cast<double>(probe.trial_vram_bytes) / (1024.0 * 1024.0));
+    } else {
+      ImGui::TextColored(
+          kColorWarn, "trial state: %s", sl_rr::ResultName(probe.trial_state_result).c_str());
+    }
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 
 renodx::utils::settings::Settings settings = {
@@ -364,6 +520,35 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .tooltip = "Live Streamline state. Diagnostics only: hooks observe and forward.",
         .on_draw = [] { return DrawStatusPanel(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrInitInject",
+        .binding = &rr_init_inject_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Request DLSS-RR at slInit (restart required)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Appends DLSS Ray Reconstruction to the game's slInit featuresToLoad so the"
+                   " sl.dlss_d plugin loads with the game. Takes effect on the next launch.",
+        .on_change_value = [](float, float value) { sl_rr::SetInitInjection(value != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Restart required.",
+        .section = "Ray Reconstruction",
+        .tint = 0xFF0000,
+        .is_visible = []() { return rr_init_inject_setting != rr_init_inject_boot_value; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrAutoLoad",
+        .binding = &rr_runtime_load_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Auto-load DLSS-RR at runtime",
+        .section = "Ray Reconstruction",
+        .tooltip = "If the slInit request did not load DLSS-RR, the probe calls"
+                   " slSetFeatureLoaded(DLSS-RR, true) and reports the result.",
+        .on_change_value = [](float, float value) { sl_rr::SetRuntimeLoad(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -406,6 +591,22 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Clears captured counters, tags, constants and features. slInit and device "
                    "snapshots are kept.",
         .on_change = []() { sl_rr::ResetCapture(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .label = "DLSS options (captured)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Options the game passed to slDLSSSetOptions / slDLSSGetOptimalSettings,"
+                   " captured through forward-only wrappers.",
+        .on_draw = [] { return DrawDlssOptionsPanel(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .label = "DLSS-RR probe",
+        .section = "Ray Reconstruction",
+        .tooltip = "Load status, serving plugin, requirements and trial calls for DLSS Ray"
+                   " Reconstruction.",
+        .on_draw = [] { return DrawRrProbePanel(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
@@ -511,6 +712,15 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   renodx::utils::settings::use_presets = false;  // diagnostics mod: no presets
   renodx::utils::settings::Use(fdw_reason, &settings);
+
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    // Keep the boot values for the "restart required" hint and push the loaded
+    // settings into sl_rr before the game reaches slInit.
+    rr_init_inject_boot_value = rr_init_inject_setting;
+    rr_runtime_load_boot_value = rr_runtime_load_setting;
+    sl_rr::SetInitInjection(rr_init_inject_setting != 0.f);
+    sl_rr::SetRuntimeLoad(rr_runtime_load_setting != 0.f);
+  }
 
   if (fdw_reason == DLL_PROCESS_DETACH) {
     reshade::unregister_addon(h_module);

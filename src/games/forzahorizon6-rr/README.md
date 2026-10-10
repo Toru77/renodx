@@ -4,20 +4,23 @@ Ray Reconstruction mod for FH6 via the game's own Streamline instance
 (`sl.interposer.dll`): intercept the DLSS-SR evaluation, answer it with
 `kFeatureDLSS_RR`, and supply the guide buffers the game does not provide.
 
-**Status: M1 diagnostics implemented** — hooks observe and forward, and all
-state is reported in the ReShade overlay (see "Diagnostics UI" below). No
+**Status: M1.5 implemented** — hooks observe and forward; on top of M1, the mod
+appends `kFeatureDLSS_RR` to the game's `slInit` feature list (with a runtime
+`slSetFeatureLoaded` fallback) and reports the full DLSS-RR load path. No
 rendering behavior is changed yet.
 
 ## Goal roadmap
 
 1. ~~Organize dumped RT/SSR/SSGI shaders~~ (see `shaders/README.md`).
 2. ~~Find the remaining pieces: G-buffer writers, NGX/Streamline call path.~~
-3. **M1 (this):** Streamline interception with UI-first diagnostics.
-4. M2: SR → RR redirect skeleton + fallback (prove the swap, live A/B).
-5. M3: NormalRoughness guide from G-buffer T3 (gloss → roughness).
-6. M4: Specular motion vectors + hit distance from the DXR trace outputs.
-7. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
-8. Later: muting SSR layering on RT reflections; denoiser bypass.
+3. ~~M1: Streamline interception with UI-first diagnostics.~~
+4. ~~M1.5: DLSS-RR load path (slInit injection + runtime fallback) + full
+   option/requirement capture in the report.~~
+5. **M2:** SR → RR redirect skeleton + fallback (prove the swap, live A/B).
+6. M3: NormalRoughness guide from G-buffer T3 (gloss → roughness).
+7. M4: Specular motion vectors + hit distance from the DXR trace outputs.
+8. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
+9. Later: muting SSR layering on RT reflections; denoiser bypass.
 
 FH6 ships DLSS Super Resolution only — RR does not exist in-game, so it has to
 be injected. Streamline provides the RR plugin (`sl.dlss_d.dll`) and runtime
@@ -77,36 +80,55 @@ src/games/forzahorizon6-rr/
 
 Each category folder holds its raw decompiled dumps in a `.dumps` subfolder.
 
-## Diagnostics UI (M1)
+## Diagnostics UI (M1.5)
 
 Everything is reported in the ReShade overlay under "Ray Reconstruction" —
 no log reading required:
 
-- **Status** — Streamline found/armed, slInit result + requested features,
-  device/LUID, frame token count, buffer tag counts, and the DLSS-RR probe
-  result line.
+- **Status** — Streamline found/armed, slInit result + requested/effective
+  features (`+DLSS-RR, mod` when injected), device/LUID, frame token count,
+  buffer tag counts, RR load line (slInit injected / runtime load attempts +
+  result) and the serving plugin path.
+- **Request DLSS-RR at slInit** — appends `kFeatureDLSS_RR` to the game's
+  `featuresToLoad` in the `slInit` hook (default on; restart required).
+- **Auto-load DLSS-RR at runtime** — if the feature is still not loaded when
+  the probe runs, calls `slSetFeatureLoaded(kFeatureDLSS_RR, true)` and reports
+  the result (default on).
 - **Game buffers (tags)** — every buffer the game hands Streamline, with
-  format, size, D3D12 state, lifecycle, extent and last frame seen.
+  format, size (mips/layers), D3D12 state, lifecycle, full extent (left/top)
+  and last frame seen; cleared tags keep their last set resource.
 - **Frame constants** — latest `slSetConstants` (jitter, mvec scale, camera,
   matrices, depth/MV convention flags).
+- **DLSS options (captured)** — mode, output size, HDR flag, exposures,
+  presets, and the optimal-settings answer, captured through forward-only
+  wrappers around `slDLSSSetOptions` / `slDLSSGetOptimalSettings`.
+- **DLSS-RR probe** — RR requirements (`slGetFeatureRequirements`: flags,
+  required tags, driver), `slDLSSDSetOptions` / `GetOptimalSettings` /
+  `GetState` availability, and a trial `slDLSSDGetOptimalSettings` call
+  mirroring the game's own DLSS mode.
 - **Features** — per-feature evaluate/query results (DLSS, DLSS-G, DLSS-RR…).
 - **Feature functions** — which `slGetFeatureFunction` requests the game makes.
-- **Recent evaluates** — last `slEvaluateFeature` calls + caller module.
+- **Recent evaluates** — last `slEvaluateFeature` calls (inputs resolved to
+  struct names + versions) + caller module.
 - **Hook activity** — call counts per hooked entry point.
 
 Buttons: **Probe DLSS-RR** / **Probe all features** (runs at the next in-game
 Streamline call), **Copy report** / **Write report to log**, **Reset capture**.
 
-## Build & verify (M1)
+## Build & verify (M1.5)
 
 - Build target: `forzahorizon6-rr` → `build/<config>/renodx-forzahorizon6-rr.addon64`.
 - Deploy next to ReShade (`dxgi.dll` slot) as an add-on DLL; keep the game's
   Streamline files untouched.
-- Verification: start the game with DLSS on, open the overlay's Ray
-  Reconstruction section — expect Streamline hooked (15/15), slInit seen, tags
-  populated (Depth, MotionVectors, ScalingInput/OutputColor, …), and the
-  DLSS-RR probe reporting supported/loaded/version. The game must run
-  unchanged (hooks observe and forward only).
+- Verification: start the game with DLSS on and ray tracing enabled, reach
+  gameplay (~10 s), open the overlay's Ray Reconstruction section, press
+  **Copy report**. Expect Streamline hooked (15/15), slInit seen with
+  `featuresToLoad (effective)` ending in `DLSS_RR [DLSS-RR appended by mod]`,
+  the RR probe reporting `supported/loaded = eOk/yes` for DLSS-RR, the
+  `sl.dlss_d.dll` module path, RR requirements with the required tag list, and
+  a successful trial `slDLSSDGetOptimalSettings`. The game must run unchanged
+  (hooks still forward everything; the only behavior change is requesting the
+  RR plugin at init/load).
 
 ## Build-safety / conventions
 

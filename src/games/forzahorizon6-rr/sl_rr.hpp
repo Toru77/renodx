@@ -28,6 +28,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -191,6 +192,94 @@ inline std::string SdkVersionLabel(uint64_t sdk_version) {
   return s.str();
 }
 
+inline std::string WideToNarrow(const wchar_t* text) {
+  if (text == nullptr || *text == L'\0') return {};
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+  if (needed <= 1) return {};
+  std::vector<char> buffer(static_cast<size_t>(needed));
+  WideCharToMultiByte(CP_UTF8, 0, text, -1, buffer.data(), needed, nullptr, nullptr);
+  return std::string(buffer.data(), buffer.size() - 1);
+}
+
+// Base fields every slEvaluateFeature input starts with (all SL structs are
+// BaseStructure-derived, so this layout is fixed).
+struct EvalInputInfo {
+  uint32_t data1 = 0;
+  uint32_t version = 0;
+};
+
+// Struct GUID first word -> friendly name, for reporting evaluate inputs.
+inline const char* StructTypeName(uint32_t data1) {
+  switch (data1) {
+    case 0x171b6435: return "ViewportHandle";
+    case 0x1ca10965: return "Preferences";
+    case 0x3a9d70cf: return "Resource";
+    case 0x4c6a5aad: return "ResourceTag";
+    case 0x66714097: return "FeatureRequirements";
+    case 0x6ac826e4: return "DLSSOptions";
+    case 0x0ad87504: return "DLSSDOptions";
+    case 0x6d5b51f0: return "FeatureVersion";
+    case 0x71873c14: return "DLSSDState";
+    case 0x830a0f35: return "FrameToken";
+    case 0x9366b056: return "DLSSState";
+    case 0xdcd35ad7: return "Constants";
+    case 0xef1d0957: return "DLSSOptimalSettings";
+    case 0xfbd0c637: return "DLSSDOptimalSettings";
+    default: return nullptr;
+  }
+}
+
+inline std::string EvalInputLabel(const EvalInputInfo& input) {
+  if (input.data1 == 0) return "-";
+  char buffer[32] = {};
+  snprintf(buffer, sizeof buffer, "0x%08X", input.data1);
+  std::string out = buffer;
+  const char* name = StructTypeName(input.data1);
+  if (name != nullptr) out += std::string(" (") + name + ")";
+  out += " v" + std::to_string(input.version);
+  return out;
+}
+
+// DLSSPreset / DLSSDPreset share the same letter ordering (0 = default).
+inline const char* PresetName(uint32_t preset) {
+  switch (preset) {
+    case 0: return "Default";
+    case 1: return "A";
+    case 2: return "B";
+    case 3: return "C";
+    case 4: return "D";
+    case 5: return "E";
+    case 6: return "F";
+    case 7: return "G";
+    case 8: return "H";
+    case 9: return "I";
+    case 10: return "J";
+    case 11: return "K";
+    case 12: return "L";
+    case 13: return "M";
+    case 14: return "N";
+    case 15: return "O";
+    case 16: return "Count";
+    default: return "?";
+  }
+}
+
+inline std::string RequirementFlagsText(uint32_t flags) {
+  std::string out;
+  const auto add = [&](uint32_t bit, const char* name) {
+    if ((flags & bit) == 0) return;
+    if (!out.empty()) out += "|";
+    out += name;
+  };
+  add(1u << 0, "D3D11Supported");
+  add(1u << 1, "D3D12Supported");
+  add(1u << 2, "VulkanSupported");
+  add(1u << 3, "VSyncOffRequired");
+  add(1u << 4, "HardwareSchedulingRequired");
+  if (out.empty()) out = "-";
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // hook bookkeeping
 // ---------------------------------------------------------------------------
@@ -246,7 +335,11 @@ struct TagRow {
   uint32_t sl_format = 0;
   uint32_t sl_width = 0;
   uint32_t sl_height = 0;
+  uint32_t sl_mips = 0;
+  uint32_t sl_layers = 0;
   uint32_t sl_state = 0xFFFFFFFF;
+  uint32_t extent_left = 0;
+  uint32_t extent_top = 0;
   uint32_t extent_w = 0;
   uint32_t extent_h = 0;
   // Native D3D12 resource description (queried from the resource itself)
@@ -255,6 +348,11 @@ struct TagRow {
   uint64_t desc_width = 0;
   uint32_t desc_height = 0;
   uint32_t desc_layers = 1;
+  uint32_t desc_mips = 1;
+  // Set/clear history (HUD/UI/Exposure tags are set then cleared each frame)
+  void* last_set_native = nullptr;
+  uint32_t last_set_frame = 0;
+  uint32_t cleared_frame = 0;
 };
 
 struct FeatureRow {
@@ -264,8 +362,7 @@ struct FeatureRow {
   uint32_t last_eval_frame = 0;
   int last_eval_result = kNever;
   uint32_t last_eval_inputs = 0;
-  uint32_t last_eval_input_type = 0;
-  uint32_t last_eval_input_version = 0;
+  std::array<EvalInputInfo, 4> last_eval_input_info{};
   void* last_eval_caller = nullptr;
   // Last known answers to the standard queries (from game calls or our probe)
   int supported_result = kNever;
@@ -283,7 +380,7 @@ struct EvaluateCall {
   uint32_t frame = 0;
   uint32_t feature = 0;
   uint32_t num_inputs = 0;
-  uint32_t primary_input_type = 0;
+  std::array<EvalInputInfo, 4> input_info{};
   int result = 0;
   void* caller = nullptr;
 };
@@ -296,6 +393,80 @@ struct FeatureFunctionRow {
   uint32_t last_frame = 0;
 };
 
+// Options the game hands DLSS (SR), captured by forward-only wrappers so the
+// report can mirror them into the DLSS-RR side.
+struct DlssOptionsCapture {
+  bool captured = false;
+  uint32_t last_frame = 0;
+  uint32_t set_options_calls = 0;
+  uint32_t get_optimal_calls = 0;
+  // Last slDLSSSetOptions request
+  uint32_t mode = 0;  // sl::DLSSMode
+  uint32_t output_width = 0;
+  uint32_t output_height = 0;
+  float pre_exposure = 1.f;
+  float exposure_scale = 1.f;
+  int color_buffers_hdr = -1;  // sl::Boolean as int, -1 = not captured
+  int use_auto_exposure = -1;
+  int alpha_upscaling = -1;
+  std::array<uint32_t, 6> presets{};  // DLAA, Quality, Balanced, Performance, UltraPerf, UltraQuality
+  // Last slDLSSGetOptimalSettings result (the game's own query)
+  bool optimal_captured = false;
+  int optimal_result = kNever;
+  uint32_t optimal_mode = 0;
+  uint32_t optimal_render_width = 0;
+  uint32_t optimal_render_height = 0;
+  float optimal_sharpness = 0.f;
+  uint32_t render_width_min = 0;
+  uint32_t render_height_min = 0;
+  uint32_t render_width_max = 0;
+  uint32_t render_height_max = 0;
+};
+
+// Everything the DLSS-RR probe learns beyond the generic supported/loaded/
+// version answers (which live in the RR FeatureRow).
+struct RrProbeState {
+  bool ran = false;
+  uint32_t frame = 0;
+  uint32_t load_attempts = 0;
+  int load_result = kNever;
+  bool loaded_after_load = false;
+  // Serving plugin module / game-folder file
+  bool plugin_module_loaded = false;
+  std::string plugin_module_path;
+  bool plugin_file_present = false;
+  std::string plugin_file_path;
+  // slGetFeatureRequirements
+  bool requirements_attempted = false;
+  int requirements_result = kNever;
+  uint32_t requirement_flags = 0;
+  uint32_t max_cpu_threads = 0;
+  uint32_t max_viewports = 0;
+  std::vector<uint32_t> required_tags;
+  std::string os_version_required;
+  std::string driver_version_required;
+  // slGetFeatureFunction availability
+  int fn_set_options_result = kNever;
+  bool fn_set_options_ok = false;
+  int fn_get_optimal_result = kNever;
+  bool fn_get_optimal_ok = false;
+  int fn_get_state_result = kNever;
+  bool fn_get_state_ok = false;
+  // Trial calls mirroring the game's own DLSS options
+  bool trial_optimal_attempted = false;
+  int trial_optimal_result = kNever;
+  uint32_t trial_render_width = 0;
+  uint32_t trial_render_height = 0;
+  float trial_sharpness = 0.f;
+  uint32_t trial_render_width_min = 0;
+  uint32_t trial_render_height_min = 0;
+  uint32_t trial_render_width_max = 0;
+  uint32_t trial_render_height_max = 0;
+  bool trial_state_attempted = false;
+  int trial_state_result = kNever;
+  uint64_t trial_vram_bytes = 0;
+};
+
 struct Diagnostics {
   // module
   bool module_found = false;
@@ -306,6 +477,7 @@ struct Diagnostics {
 
   // init
   bool init_seen = false;
+  uint32_t init_calls = 0;
   int init_result = kNever;
   uint64_t init_sdk_version = 0;
   uint64_t init_flags = 0;
@@ -313,8 +485,20 @@ struct Diagnostics {
   int init_engine = 0;
   uint32_t init_app_id = 0;
   int init_render_api = 0;
+  uint32_t init_pref_version = 0;
+  bool init_show_console = false;
+  uint32_t init_num_plugin_paths = 0;
+  std::array<std::string, 4> init_plugin_paths{};
+  bool init_has_log_path = false;
+  std::string init_log_path;
+  bool init_has_engine_version = false;
+  std::string init_engine_version;
   uint32_t init_feature_count = 0;
-  std::array<uint32_t, 8> init_features{};
+  std::array<uint32_t, 16> init_features_original{};
+  uint32_t init_effective_count = 0;
+  std::array<uint32_t, 16> init_features_effective{};
+  bool init_rr_injected = false;
+  std::string init_injection_note;
 
   bool shutdown_seen = false;
 
@@ -350,6 +534,10 @@ struct Diagnostics {
   bool probe_pending = false;
   int probe_scope = 0;  // 0 = DLSS-RR only, 1 = all known features
   bool auto_probe_done = false;
+
+  // captured DLSS (SR) options + DLSS-RR probe extras
+  DlssOptionsCapture dlss_options;
+  RrProbeState rr_probe;
 };
 
 inline Diagnostics diagnostics;
@@ -383,6 +571,7 @@ struct NativeResourceDesc {
   uint64_t width = 0;
   uint32_t height = 0;
   uint32_t layers = 1;
+  uint32_t mips = 1;
 };
 
 inline NativeResourceDesc QueryNativeDesc(void* native) {
@@ -395,6 +584,7 @@ inline NativeResourceDesc QueryNativeDesc(void* native) {
     out.width = desc.Width;
     out.height = desc.Height;
     out.layers = desc.DepthOrArraySize;
+    out.mips = desc.MipLevels;
     out.ok = true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     out.ok = false;
@@ -449,14 +639,21 @@ inline void RecordTagListLocked(
     if (tag.resource == nullptr) {
       row->cleared = true;
       row->native = nullptr;
+      row->cleared_frame = frame;
       continue;
     }
     row->cleared = false;
     row->native = tag.resource->native;
+    row->last_set_native = tag.resource->native;
+    row->last_set_frame = frame;
     row->sl_format = tag.resource->nativeFormat;
     row->sl_width = tag.resource->width;
     row->sl_height = tag.resource->height;
+    row->sl_mips = tag.resource->mipLevels;
+    row->sl_layers = tag.resource->arrayLayers;
     row->sl_state = tag.resource->state;
+    row->extent_left = tag.extent.left;
+    row->extent_top = tag.extent.top;
     row->extent_w = tag.extent.width;
     row->extent_h = tag.extent.height;
     const auto desc = QueryNativeDesc(tag.resource->native);
@@ -465,6 +662,7 @@ inline void RecordTagListLocked(
     row->desc_width = desc.width;
     row->desc_height = desc.height;
     row->desc_layers = desc.layers;
+    row->desc_mips = desc.mips;
   }
 }
 
@@ -488,10 +686,65 @@ inline PFun_slGetFeatureVersion* real_sl_get_feature_version = nullptr;
 inline PFun_slAllocateResources* real_sl_allocate_resources = nullptr;
 inline PFun_slFreeResources* real_sl_free_resources = nullptr;
 
+// Resolved but not detoured: the probe calls it to read RR's requirements.
+inline PFun_slGetFeatureRequirements* real_sl_get_feature_requirements = nullptr;
+
+// DLSS-RR feature functions resolved by the probe (kept for M2).
+inline PFun_slDLSSDSetOptions* real_dlssd_set_options = nullptr;
+inline PFun_slDLSSDGetOptimalSettings* real_dlssd_get_optimal_settings = nullptr;
+inline PFun_slDLSSDGetState* real_dlssd_get_state = nullptr;
+
+// slInit feature-list injection. Static storage because Streamline may keep
+// the pointer past the slInit call.
+constexpr uint32_t kMaxInitFeatures = 16;
+inline sl::Feature init_features_patched_storage[kMaxInitFeatures + 1] = {};
+inline std::atomic<bool> rr_init_injection_enabled{true};
+inline std::atomic<bool> rr_runtime_load_enabled{true};
+
+inline void SetInitInjection(bool enabled) { rr_init_injection_enabled.store(enabled); }
+inline bool GetInitInjection() { return rr_init_injection_enabled.load(); }
+inline void SetRuntimeLoad(bool enabled) { rr_runtime_load_enabled.store(enabled); }
+inline bool GetRuntimeLoad() { return rr_runtime_load_enabled.load(); }
+
 // ---------------------------------------------------------------------------
 // probes — run at a game Streamline call boundary (same thread the game uses
 // for SL), never while holding the diagnostics lock.
 // ---------------------------------------------------------------------------
+
+inline void* FetchRrFunction(const char* name, int& result_out) {
+  void* fn = nullptr;
+  if (real_sl_get_feature_function == nullptr) {
+    result_out = kNever;
+    return nullptr;
+  }
+  result_out = static_cast<int>(real_sl_get_feature_function(sl::kFeatureDLSS_RR, name, fn));
+  return fn;
+}
+
+// Where the DLSS-RR plugin lives: the loaded module (game folder or driver
+// store, whichever Streamline picked) and/or the game-folder copy on disk.
+inline void ProbeRrPlugin(RrProbeState& probe) {
+  HMODULE plugin = GetModuleHandleW(L"sl.dlss_d.dll");
+  if (plugin != nullptr) {
+    wchar_t buffer[MAX_PATH] = {};
+    if (GetModuleFileNameW(plugin, buffer, MAX_PATH) != 0) {
+      probe.plugin_module_path = WideToNarrow(buffer);
+      probe.plugin_module_loaded = true;
+    }
+  }
+  wchar_t executable[MAX_PATH] = {};
+  if (GetModuleFileNameW(nullptr, executable, MAX_PATH) == 0) return;
+  std::wstring path = executable;
+  const size_t slash = path.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return;
+  path.resize(slash + 1);
+  path += L"sl.dlss_d.dll";
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    probe.plugin_file_path = WideToNarrow(path.c_str());
+    probe.plugin_file_present = true;
+  }
+}
 
 inline void RunProbe(int scope) {
   static const uint32_t kAllFeatures[] = {
@@ -503,10 +756,36 @@ inline void RunProbe(int scope) {
 
   std::array<uint8_t, 8> luid{};
   bool luid_valid = false;
+  DlssOptionsCapture options_snapshot;
   {
     const std::lock_guard lock(diagnostics_mutex);
     luid = diagnostics.luid;
     luid_valid = diagnostics.luid_valid;
+    options_snapshot = diagnostics.dlss_options;
+  }
+
+  // (a) runtime load fallback: only reaches the plugin when the slInit request
+  // did not stick (the game never asks for RR itself). Runs on the game's own
+  // SL thread at a call boundary.
+  RrProbeState probe{};
+  {
+    const std::lock_guard lock(diagnostics_mutex);
+    probe.load_attempts = diagnostics.rr_probe.load_attempts;
+    probe.load_result = diagnostics.rr_probe.load_result;
+    probe.loaded_after_load = diagnostics.rr_probe.loaded_after_load;
+    probe.frame = diagnostics.last_frame_index;
+  }
+  if (GetRuntimeLoad() && real_sl_is_feature_loaded != nullptr
+      && real_sl_set_feature_loaded != nullptr) {
+    bool loaded = false;
+    if (real_sl_is_feature_loaded(sl::kFeatureDLSS_RR, loaded) == sl::Result::eOk && !loaded) {
+      const auto load_result = real_sl_set_feature_loaded(sl::kFeatureDLSS_RR, true);
+      bool loaded_after = false;
+      real_sl_is_feature_loaded(sl::kFeatureDLSS_RR, loaded_after);
+      ++probe.load_attempts;
+      probe.load_result = static_cast<int>(load_result);
+      probe.loaded_after_load = loaded_after;
+    }
   }
 
   sl::AdapterInfo adapter{};
@@ -567,6 +846,78 @@ inline void RunProbe(int scope) {
     results.push_back(r);
   }
 
+  // (c) DLSS-RR extras: serving plugin, requirements, feature functions, and
+  // trial calls mirroring the game's own DLSS options. Queries only — nothing
+  // here changes rendering behavior.
+  probe.ran = true;
+  ProbeRrPlugin(probe);
+
+  if (real_sl_get_feature_requirements != nullptr) {
+    sl::FeatureRequirements requirements{};
+    probe.requirements_attempted = true;
+    probe.requirements_result =
+        static_cast<int>(real_sl_get_feature_requirements(sl::kFeatureDLSS_RR, requirements));
+    if (static_cast<sl::Result>(probe.requirements_result) == sl::Result::eOk) {
+      probe.requirement_flags = static_cast<uint32_t>(requirements.flags);
+      probe.max_cpu_threads = requirements.maxNumCPUThreads;
+      probe.max_viewports = requirements.maxNumViewports;
+      probe.os_version_required = requirements.osVersionRequired.toStr();
+      probe.driver_version_required = requirements.driverVersionRequired.toStr();
+      if (requirements.requiredTags != nullptr) {
+        const uint32_t tag_count =
+            requirements.numRequiredTags < 32 ? requirements.numRequiredTags : 32;
+        for (uint32_t i = 0; i < tag_count; ++i) {
+          probe.required_tags.push_back(static_cast<uint32_t>(requirements.requiredTags[i]));
+        }
+      }
+    }
+  }
+
+  void* rr_function = nullptr;
+  rr_function = FetchRrFunction("slDLSSDSetOptions", probe.fn_set_options_result);
+  probe.fn_set_options_ok = rr_function != nullptr;
+  real_dlssd_set_options = reinterpret_cast<PFun_slDLSSDSetOptions*>(rr_function);
+  rr_function = FetchRrFunction("slDLSSDGetOptimalSettings", probe.fn_get_optimal_result);
+  probe.fn_get_optimal_ok = rr_function != nullptr;
+  real_dlssd_get_optimal_settings = reinterpret_cast<PFun_slDLSSDGetOptimalSettings*>(rr_function);
+  rr_function = FetchRrFunction("slDLSSDGetState", probe.fn_get_state_result);
+  probe.fn_get_state_ok = rr_function != nullptr;
+  real_dlssd_get_state = reinterpret_cast<PFun_slDLSSDGetState*>(rr_function);
+
+  if (probe.fn_get_optimal_ok && real_dlssd_get_optimal_settings != nullptr
+      && options_snapshot.captured) {
+    sl::DLSSDOptions options{};
+    options.mode = static_cast<sl::DLSSMode>(options_snapshot.mode);
+    if (options_snapshot.output_width > 0) options.outputWidth = options_snapshot.output_width;
+    if (options_snapshot.output_height > 0) options.outputHeight = options_snapshot.output_height;
+    if (options_snapshot.color_buffers_hdr >= 0) {
+      options.colorBuffersHDR = static_cast<sl::Boolean>(options_snapshot.color_buffers_hdr);
+    }
+    sl::DLSSDOptimalSettings settings{};
+    probe.trial_optimal_attempted = true;
+    probe.trial_optimal_result =
+        static_cast<int>(real_dlssd_get_optimal_settings(options, settings));
+    if (static_cast<sl::Result>(probe.trial_optimal_result) == sl::Result::eOk) {
+      probe.trial_render_width = settings.optimalRenderWidth;
+      probe.trial_render_height = settings.optimalRenderHeight;
+      probe.trial_sharpness = settings.optimalSharpness;
+      probe.trial_render_width_min = settings.renderWidthMin;
+      probe.trial_render_height_min = settings.renderHeightMin;
+      probe.trial_render_width_max = settings.renderWidthMax;
+      probe.trial_render_height_max = settings.renderHeightMax;
+    }
+  }
+
+  if (probe.fn_get_state_ok && real_dlssd_get_state != nullptr) {
+    sl::DLSSDState state{};
+    probe.trial_state_attempted = true;
+    probe.trial_state_result =
+        static_cast<int>(real_dlssd_get_state(sl::ViewportHandle(0u), state));
+    if (static_cast<sl::Result>(probe.trial_state_result) == sl::Result::eOk) {
+      probe.trial_vram_bytes = state.estimatedVRAMUsageInBytes;
+    }
+  }
+
   const std::lock_guard lock(diagnostics_mutex);
   for (const auto& r : results) {
     auto& row = FeatureForLocked(r.feature);
@@ -588,6 +939,7 @@ inline void RunProbe(int scope) {
       }
     }
   }
+  diagnostics.rr_probe = std::move(probe);
 }
 
 // Called at the top of hooks that the game invokes every frame, before
@@ -610,8 +962,9 @@ inline void RequestProbe(int scope) {
   diagnostics.probe_scope = scope;
 }
 
-// Clears captured activity but keeps module state, the slInit snapshot and
-// the device/LUID (one-shot observations that never repeat).
+// Clears captured activity but keeps module state, the slInit snapshot, the
+// device/LUID and the captured DLSS options (one-shot observations that never
+// repeat in a session).
 inline void ResetCapture() {
   const std::lock_guard lock(diagnostics_mutex);
   for (auto& hook : diagnostics.hooks) {
@@ -634,6 +987,70 @@ inline void ResetCapture() {
   diagnostics.probe_pending = false;
   diagnostics.auto_probe_done = false;
   diagnostics.shutdown_seen = false;
+  diagnostics.rr_probe = {};
+}
+
+// ---------------------------------------------------------------------------
+// M1.5: DLSS-RR load path + DLSS option capture (still forward-only)
+// ---------------------------------------------------------------------------
+
+// Forward-only wrappers: the game fetches these pointers once at startup via
+// slGetFeatureFunction, so every later call is captured here and still lands
+// on the real plugin function unchanged.
+inline PFun_slDLSSSetOptions* real_dlss_set_options = nullptr;
+inline PFun_slDLSSGetOptimalSettings* real_dlss_get_optimal_settings = nullptr;
+
+inline sl::Result WrappedDlssSetOptions(
+    const sl::ViewportHandle& viewport, const sl::DLSSOptions& options) {
+  if (real_dlss_set_options == nullptr) return sl::Result::eErrorInvalidState;
+  {
+    const std::lock_guard lock(diagnostics_mutex);
+    auto& capture = diagnostics.dlss_options;
+    capture.captured = true;
+    capture.last_frame = diagnostics.last_frame_index;
+    ++capture.set_options_calls;
+    capture.mode = static_cast<uint32_t>(options.mode);
+    capture.output_width = options.outputWidth;
+    capture.output_height = options.outputHeight;
+    capture.pre_exposure = options.preExposure;
+    capture.exposure_scale = options.exposureScale;
+    capture.color_buffers_hdr = static_cast<int>(options.colorBuffersHDR);
+    capture.use_auto_exposure = static_cast<int>(options.useAutoExposure);
+    capture.alpha_upscaling = static_cast<int>(options.alphaUpscalingEnabled);
+    capture.presets = {
+        static_cast<uint32_t>(options.dlaaPreset),
+        static_cast<uint32_t>(options.qualityPreset),
+        static_cast<uint32_t>(options.balancedPreset),
+        static_cast<uint32_t>(options.performancePreset),
+        static_cast<uint32_t>(options.ultraPerformancePreset),
+        static_cast<uint32_t>(options.ultraQualityPreset),
+    };
+  }
+  return real_dlss_set_options(viewport, options);
+}
+
+inline sl::Result WrappedDlssGetOptimalSettings(
+    const sl::DLSSOptions& options, sl::DLSSOptimalSettings& settings) {
+  if (real_dlss_get_optimal_settings == nullptr) return sl::Result::eErrorInvalidState;
+  const auto result = real_dlss_get_optimal_settings(options, settings);
+  {
+    const std::lock_guard lock(diagnostics_mutex);
+    auto& capture = diagnostics.dlss_options;
+    ++capture.get_optimal_calls;
+    capture.optimal_captured = true;
+    capture.optimal_result = static_cast<int>(result);
+    capture.optimal_mode = static_cast<uint32_t>(options.mode);
+    if (result == sl::Result::eOk) {
+      capture.optimal_render_width = settings.optimalRenderWidth;
+      capture.optimal_render_height = settings.optimalRenderHeight;
+      capture.optimal_sharpness = settings.optimalSharpness;
+      capture.render_width_min = settings.renderWidthMin;
+      capture.render_height_min = settings.renderHeightMin;
+      capture.render_width_max = settings.renderWidthMax;
+      capture.render_height_max = settings.renderHeightMax;
+    }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -641,9 +1058,56 @@ inline void ResetCapture() {
 // ---------------------------------------------------------------------------
 
 inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version) {
+  // Snapshot what the game asked for before touching anything.
+  const uint32_t requested_count = pref.featuresToLoad != nullptr ? pref.numFeaturesToLoad : 0;
+
+  // Build the effective feature list with DLSS-RR appended, unless the game
+  // already asked for it, injection is disabled, or the list is a shape we do
+  // not touch.
+  uint32_t patched_count = 0;
+  bool appended_rr = false;
+  std::string injection_note;
+  if (pref.featuresToLoad == nullptr) {
+    injection_note = "featuresToLoad is null";
+  } else if (requested_count > kMaxInitFeatures) {
+    injection_note = "feature list too large to patch";
+  } else {
+    bool rr_requested = false;
+    for (uint32_t i = 0; i < requested_count; ++i) {
+      init_features_patched_storage[patched_count++] = pref.featuresToLoad[i];
+      if (pref.featuresToLoad[i] == sl::kFeatureDLSS_RR) rr_requested = true;
+    }
+    if (rr_requested) {
+      injection_note = "DLSS-RR already requested by the game";
+    } else if (!GetInitInjection()) {
+      injection_note = "disabled by setting";
+    } else {
+      init_features_patched_storage[patched_count++] = sl::kFeatureDLSS_RR;
+      appended_rr = true;
+    }
+  }
+
+  // Patch the caller's Preferences in place — only the two feature-list fields
+  // are touched, so every other field (paths, callbacks, version) stays
+  // exactly as the game wrote it. Restored right after the call.
+  sl::Preferences& mutable_pref = const_cast<sl::Preferences&>(pref);
+  const sl::Feature* const original_features = pref.featuresToLoad;
+  const uint32_t original_count = pref.numFeaturesToLoad;
+  if (appended_rr) {
+    mutable_pref.featuresToLoad = init_features_patched_storage;
+    mutable_pref.numFeaturesToLoad = patched_count;
+  }
+
   const auto result = real_sl_init(pref, sdk_version);
+
+  if (appended_rr) {
+    mutable_pref.featuresToLoad = original_features;
+    mutable_pref.numFeaturesToLoad = original_count;
+  }
+
   const std::lock_guard lock(diagnostics_mutex);
   NoteCallLocked(kHookInit, _ReturnAddress());
+  ++diagnostics.init_calls;
   diagnostics.init_seen = true;
   diagnostics.init_result = static_cast<int>(result);
   diagnostics.init_sdk_version = sdk_version;
@@ -652,11 +1116,42 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   diagnostics.init_engine = static_cast<int>(pref.engine);
   diagnostics.init_app_id = pref.applicationId;
   diagnostics.init_render_api = static_cast<int>(pref.renderAPI);
-  diagnostics.init_feature_count = pref.numFeaturesToLoad;
-  if (pref.featuresToLoad != nullptr) {
-    for (size_t i = 0; i < diagnostics.init_features.size() && i < pref.numFeaturesToLoad; ++i) {
-      diagnostics.init_features[i] = pref.featuresToLoad[i];
+  diagnostics.init_pref_version = static_cast<uint32_t>(pref.structVersion);
+  diagnostics.init_show_console = pref.showConsole;
+  diagnostics.init_num_plugin_paths = pref.numPathsToPlugins;
+  if (pref.pathsToPlugins != nullptr) {
+    const uint32_t path_count =
+        pref.numPathsToPlugins < diagnostics.init_plugin_paths.size()
+            ? pref.numPathsToPlugins
+            : static_cast<uint32_t>(diagnostics.init_plugin_paths.size());
+    for (uint32_t i = 0; i < path_count; ++i) {
+      diagnostics.init_plugin_paths[i] = WideToNarrow(pref.pathsToPlugins[i]);
     }
+  }
+  diagnostics.init_has_log_path = pref.pathToLogsAndData != nullptr;
+  if (pref.pathToLogsAndData != nullptr) {
+    diagnostics.init_log_path = WideToNarrow(pref.pathToLogsAndData);
+  }
+  diagnostics.init_has_engine_version = pref.engineVersion != nullptr;
+  if (pref.engineVersion != nullptr) {
+    diagnostics.init_engine_version = pref.engineVersion;
+  }
+  diagnostics.init_feature_count = requested_count;
+  for (uint32_t i = 0; i < diagnostics.init_features_original.size() && i < requested_count;
+       ++i) {
+    diagnostics.init_features_original[i] = pref.featuresToLoad[i];
+  }
+  diagnostics.init_rr_injected = appended_rr;
+  diagnostics.init_injection_note = std::move(injection_note);
+  if (appended_rr) {
+    diagnostics.init_effective_count = patched_count;
+    for (uint32_t i = 0;
+         i < diagnostics.init_features_effective.size() && i < patched_count; ++i) {
+      diagnostics.init_features_effective[i] = init_features_patched_storage[i];
+    }
+  } else {
+    diagnostics.init_effective_count = requested_count;
+    diagnostics.init_features_effective = diagnostics.init_features_original;
   }
   return result;
 }
@@ -752,17 +1247,23 @@ inline sl::Result HookedSlEvaluateFeature(
   row.last_eval_result = static_cast<int>(result);
   row.last_eval_inputs = num_inputs;
   row.last_eval_caller = caller;
-  row.last_eval_input_type = 0;
-  row.last_eval_input_version = 0;
-  if (inputs != nullptr && num_inputs > 0 && inputs[0] != nullptr) {
-    row.last_eval_input_type = inputs[0]->structType.data1;
-    row.last_eval_input_version = static_cast<uint32_t>(inputs[0]->structVersion);
+  row.last_eval_input_info = {};
+  if (inputs != nullptr) {
+    const uint32_t captured_inputs =
+        num_inputs < row.last_eval_input_info.size()
+            ? num_inputs
+            : static_cast<uint32_t>(row.last_eval_input_info.size());
+    for (uint32_t i = 0; i < captured_inputs; ++i) {
+      if (inputs[i] == nullptr) continue;
+      row.last_eval_input_info[i].data1 = inputs[i]->structType.data1;
+      row.last_eval_input_info[i].version = static_cast<uint32_t>(inputs[i]->structVersion);
+    }
   }
   EvaluateCall call{};
   call.frame = frame_index;
   call.feature = feature;
   call.num_inputs = num_inputs;
-  call.primary_input_type = row.last_eval_input_type;
+  call.input_info = row.last_eval_input_info;
   call.result = static_cast<int>(result);
   call.caller = caller;
   diagnostics.evaluate_recent.insert(diagnostics.evaluate_recent.begin(), call);
@@ -781,24 +1282,42 @@ inline sl::Result HookedSlEvaluateFeature(
 inline sl::Result HookedSlGetFeatureFunction(
     sl::Feature feature, const char* function_name, void*& function) {
   const auto result = real_sl_get_feature_function(feature, function_name, function);
-  const std::lock_guard lock(diagnostics_mutex);
-  NoteCallLocked(kHookGetFeatureFunction, _ReturnAddress());
-  const std::string name = function_name != nullptr ? function_name : "?";
-  for (auto& row : diagnostics.feature_functions) {
-    if (row.feature == feature && row.name == name) {
-      ++row.calls;
+  {
+    const std::lock_guard lock(diagnostics_mutex);
+    NoteCallLocked(kHookGetFeatureFunction, _ReturnAddress());
+    const std::string name = function_name != nullptr ? function_name : "?";
+    bool found = false;
+    for (auto& row : diagnostics.feature_functions) {
+      if (row.feature == feature && row.name == name) {
+        ++row.calls;
+        row.last_result = static_cast<int>(result);
+        row.last_frame = diagnostics.last_frame_index;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      FeatureFunctionRow row{};
+      row.feature = feature;
+      row.name = name;
+      row.calls = 1;
       row.last_result = static_cast<int>(result);
       row.last_frame = diagnostics.last_frame_index;
-      return result;
+      diagnostics.feature_functions.push_back(std::move(row));
     }
   }
-  FeatureFunctionRow row{};
-  row.feature = feature;
-  row.name = name;
-  row.calls = 1;
-  row.last_result = static_cast<int>(result);
-  row.last_frame = diagnostics.last_frame_index;
-  diagnostics.feature_functions.push_back(std::move(row));
+  // Forward-only wrapping: hand the game our capture wrapper for the DLSS
+  // option calls; the wrapper forwards to the real function unchanged.
+  if (result == sl::Result::eOk && function != nullptr && function_name != nullptr
+      && feature == sl::kFeatureDLSS) {
+    if (std::strcmp(function_name, "slDLSSSetOptions") == 0) {
+      real_dlss_set_options = reinterpret_cast<PFun_slDLSSSetOptions*>(function);
+      function = reinterpret_cast<void*>(WrappedDlssSetOptions);
+    } else if (std::strcmp(function_name, "slDLSSGetOptimalSettings") == 0) {
+      real_dlss_get_optimal_settings = reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(function);
+      function = reinterpret_cast<void*>(WrappedDlssGetOptimalSettings);
+    }
+  }
   return result;
 }
 
@@ -906,6 +1425,9 @@ inline bool ArmStreamlineHooks(HMODULE interposer) {
       GetProcAddress(interposer, "slAllocateResources"));
   auto* p_free =
       reinterpret_cast<PFun_slFreeResources*>(GetProcAddress(interposer, "slFreeResources"));
+  // Not detoured: only called by our probe.
+  auto* p_requirements = reinterpret_cast<PFun_slGetFeatureRequirements*>(
+      GetProcAddress(interposer, "slGetFeatureRequirements"));
 
   if (p_init == nullptr || p_evaluate == nullptr || p_constants == nullptr
       || p_frame_token == nullptr || p_set_tag_frame == nullptr) {
@@ -928,6 +1450,7 @@ inline bool ArmStreamlineHooks(HMODULE interposer) {
   real_sl_get_feature_version = p_version;
   real_sl_allocate_resources = p_allocate;
   real_sl_free_resources = p_free;
+  real_sl_get_feature_requirements = p_requirements;
 
   bool present[kHookCount] = {
       p_init != nullptr,
@@ -1027,6 +1550,7 @@ inline bool ArmStreamlineHooks(HMODULE interposer) {
     real_sl_get_feature_version = nullptr;
     real_sl_allocate_resources = nullptr;
     real_sl_free_resources = nullptr;
+    real_sl_get_feature_requirements = nullptr;
     return false;
   }
 
@@ -1280,8 +1804,10 @@ inline std::string BuildReport() {
     s << "path: " << d.module_path << "\n";
     s << "hooks: " << d.hooks_installed << "/" << kHookCount << " (" << (d.armed ? "armed" : "not armed") << ")\n";
   }
+  s << "RR settings: slInit injection " << (GetInitInjection() ? "enabled" : "disabled")
+    << ", runtime load " << (GetRuntimeLoad() ? "enabled" : "disabled") << "\n";
 
-  s << "\n[slInit]\n";
+  s << "\n[slInit] calls: " << d.init_calls << "\n";
   if (!d.init_seen) {
     s << "not seen\n";
   } else {
@@ -1290,9 +1816,28 @@ inline std::string BuildReport() {
     s << "flags: 0x" << std::hex << d.init_flags << std::dec << "\n";
     s << "logLevel: " << d.init_log_level << "  engine: " << d.init_engine
       << "  appId: " << d.init_app_id << "  renderAPI: " << d.init_render_api << "\n";
-    s << "featuresToLoad:";
-    for (uint32_t i = 0; i < d.init_feature_count && i < d.init_features.size(); ++i) {
-      s << " " << FeatureName(d.init_features[i]);
+    s << "pref: structVersion=" << d.init_pref_version
+      << " showConsole=" << (d.init_show_console ? "yes" : "no")
+      << " pluginPaths=" << d.init_num_plugin_paths << "\n";
+    for (size_t i = 0; i < d.init_plugin_paths.size(); ++i) {
+      if (d.init_plugin_paths[i].empty()) continue;
+      s << "  plugin path[" << i << "]: " << d.init_plugin_paths[i] << "\n";
+    }
+    if (d.init_has_log_path) s << "logPath: " << d.init_log_path << "\n";
+    if (d.init_has_engine_version) s << "engineVersion: " << d.init_engine_version << "\n";
+    s << "featuresToLoad (requested):";
+    for (uint32_t i = 0; i < d.init_feature_count && i < d.init_features_original.size(); ++i) {
+      s << " " << FeatureName(d.init_features_original[i]);
+    }
+    s << "\n";
+    s << "featuresToLoad (effective):";
+    for (uint32_t i = 0; i < d.init_effective_count && i < d.init_features_effective.size(); ++i) {
+      s << " " << FeatureName(d.init_features_effective[i]);
+    }
+    if (d.init_rr_injected) {
+      s << "   [DLSS-RR appended by mod]";
+    } else if (!d.init_injection_note.empty()) {
+      s << "   [" << d.init_injection_note << "]";
     }
     s << "\n";
   }
@@ -1313,25 +1858,35 @@ inline std::string BuildReport() {
   s << "\n[tags] setTag calls: " << d.tag_calls << "  setTagForFrame calls: " << d.tag_for_frame_calls << "\n";
   for (const auto& tag : d.tags) {
     s << "  - " << BufferName(tag.type) << " via " << (tag.via_frame_api ? "slSetTagForFrame" : "slSetTag")
-      << " calls=" << tag.calls;
+      << " calls=" << tag.calls << " lifecycle=" << LifecycleName(tag.lifecycle)
+      << " frame=" << tag.last_frame << "\n";
+    s << "      ";
     if (tag.cleared) {
-      s << " [cleared]";
+      s << "[cleared at frame " << tag.cleared_frame << "]";
+      if (tag.last_set_native != nullptr) {
+        s << " lastSet=0x" << std::hex << reinterpret_cast<uint64_t>(tag.last_set_native) << std::dec
+          << " at frame " << tag.last_set_frame;
+      }
     } else {
-      s << " res=0x" << std::hex << reinterpret_cast<uint64_t>(tag.native) << std::dec;
-      if (tag.desc_ok) {
-        s << " fmt=" << FormatLabel(tag.desc_format) << "(" << tag.desc_format << ") " << tag.desc_width << "x"
-          << tag.desc_height;
-        if (tag.desc_layers > 1) s << "x" << tag.desc_layers;
-      } else if (tag.sl_format != 0) {
-        s << " fmt=" << FormatLabel(tag.sl_format) << "(" << tag.sl_format << ")";
-      }
-      s << " state=0x" << std::hex << tag.sl_state << std::dec;
-      s << " lifecycle=" << LifecycleName(tag.lifecycle);
-      if (tag.extent_w != 0 || tag.extent_h != 0) {
-        s << " extent=" << tag.extent_w << "x" << tag.extent_h;
-      }
+      s << "res=0x" << std::hex << reinterpret_cast<uint64_t>(tag.native) << std::dec;
     }
-    s << " frame=" << tag.last_frame << "\n";
+    if (tag.desc_ok) {
+      s << " desc=" << FormatLabel(tag.desc_format) << "(" << tag.desc_format << ")"
+        << " " << tag.desc_width << "x" << tag.desc_height << " mips=" << tag.desc_mips
+        << " layers=" << tag.desc_layers;
+    }
+    if (tag.sl_format != 0 || tag.sl_width != 0 || tag.sl_height != 0) {
+      s << " raw: fmt(" << tag.sl_format << ") " << tag.sl_width << "x" << tag.sl_height
+        << " mips=" << tag.sl_mips << " layers=" << tag.sl_layers;
+    }
+    if (tag.sl_state != 0xFFFFFFFFu) {
+      s << " state=0x" << std::hex << tag.sl_state << std::dec;
+    }
+    if (tag.extent_w != 0 || tag.extent_h != 0 || tag.extent_left != 0 || tag.extent_top != 0) {
+      s << " extent: left=" << tag.extent_left << " top=" << tag.extent_top
+        << " " << tag.extent_w << "x" << tag.extent_h;
+    }
+    s << "\n";
   }
 
   s << "\n[constants] calls: " << d.constants_calls << " frame: " << d.constants_last_frame
@@ -1352,12 +1907,59 @@ inline std::string BuildReport() {
       << " orthographic=" << BooleanName(c.orthographicProjection) << "\n";
   }
 
+  s << "\n[DLSS (SR) options]\n";
+  {
+    const auto& opts = d.dlss_options;
+    if (!opts.captured && !opts.optimal_captured) {
+      s << "not captured (no slDLSSSetOptions / slDLSSGetOptimalSettings calls seen)\n";
+    } else {
+      s << "setOptions calls=" << opts.set_options_calls
+        << "  optimal queries=" << opts.get_optimal_calls
+        << "  lastFrame=" << opts.last_frame << "\n";
+      s << "  mode=" << sl::getDLSSModeAsStr(static_cast<sl::DLSSMode>(opts.mode))
+        << " output=" << opts.output_width << "x" << opts.output_height
+        << " preExposure=" << opts.pre_exposure << " exposureScale=" << opts.exposure_scale;
+      if (opts.color_buffers_hdr >= 0) {
+        s << " HDR=" << BooleanName(static_cast<sl::Boolean>(opts.color_buffers_hdr));
+      }
+      if (opts.use_auto_exposure >= 0) {
+        s << " autoExposure=" << BooleanName(static_cast<sl::Boolean>(opts.use_auto_exposure));
+      }
+      if (opts.alpha_upscaling >= 0) {
+        s << " alphaUpscale=" << BooleanName(static_cast<sl::Boolean>(opts.alpha_upscaling));
+      }
+      s << "\n";
+      static const char* const kPresetLabels[6] = {
+          "DLAA", "Quality", "Balanced", "Performance", "UltraPerf", "UltraQuality"};
+      s << "  presets:";
+      for (int i = 0; i < 6; ++i) {
+        s << " " << kPresetLabels[i] << "=" << PresetName(opts.presets[static_cast<size_t>(i)]);
+      }
+      s << "\n";
+      if (opts.optimal_captured) {
+        s << "  game optimal query: mode="
+          << sl::getDLSSModeAsStr(static_cast<sl::DLSSMode>(opts.optimal_mode))
+          << " result=" << ResultName(opts.optimal_result)
+          << " render=" << opts.optimal_render_width << "x" << opts.optimal_render_height
+          << " sharpness=" << opts.optimal_sharpness
+          << " min=" << opts.render_width_min << "x" << opts.render_height_min
+          << " max=" << opts.render_width_max << "x" << opts.render_height_max << "\n";
+      }
+    }
+  }
+
   s << "\n[evaluates] total: " << d.evaluates_total << "\n";
   for (const auto& [feature, row] : d.features) {
     if (row.evaluates == 0 && row.queries == 0 && !row.probed) continue;
     s << "  - " << FeatureName(feature) << " evals=" << row.evaluates
       << " lastResult=" << ResultName(row.last_eval_result) << " lastFrame=" << row.last_eval_frame
-      << " inputs=" << row.last_eval_inputs << " caller=" << ModuleNameOf(row.last_eval_caller) << "\n";
+      << " caller=" << ModuleNameOf(row.last_eval_caller) << "\n";
+    s << "      inputs=" << row.last_eval_inputs;
+    for (uint32_t i = 0; i < row.last_eval_input_info.size() && i < row.last_eval_inputs; ++i) {
+      if (row.last_eval_input_info[i].data1 == 0) continue;
+      s << " in[" << i << "]=" << EvalInputLabel(row.last_eval_input_info[i]);
+    }
+    s << "\n";
     s << "      supported=" << ResultName(row.supported_result)
       << " loaded=" << (row.loaded_result == kNever ? "-" : (row.loaded ? "yes" : "no"))
       << " loadedResult=" << ResultName(row.loaded_result)
@@ -1369,8 +1971,106 @@ inline std::string BuildReport() {
   s << "  recent:\n";
   for (const auto& call : d.evaluate_recent) {
     s << "    [frame " << call.frame << "] " << FeatureName(call.feature)
-      << " inputs=" << call.num_inputs << " result=" << ResultName(call.result)
+      << " inputs=" << call.num_inputs;
+    for (uint32_t i = 0; i < call.input_info.size() && i < call.num_inputs; ++i) {
+      if (call.input_info[i].data1 == 0) continue;
+      s << " in[" << i << "]=" << EvalInputLabel(call.input_info[i]);
+    }
+    s << " result=" << ResultName(call.result)
       << " caller=" << ModuleNameOf(call.caller) << "\n";
+  }
+
+  s << "\n[DLSS-RR probe]\n";
+  {
+    const auto& probe = d.rr_probe;
+    const auto rr_it = d.features.find(sl::kFeatureDLSS_RR);
+    if (!probe.ran && (rr_it == d.features.end() || !rr_it->second.probed)) {
+      s << "not run (automatic probe fires at the first DLSS evaluate; the button re-runs it)\n";
+    } else {
+      if (rr_it != d.features.end()) {
+        const auto& rr = rr_it->second;
+        s << "  state: supported=" << ResultName(rr.supported_result)
+          << " loaded=" << (rr.loaded_result == kNever ? "-" : (rr.loaded ? "yes" : "no"))
+          << " loadedResult=" << ResultName(rr.loaded_result)
+          << " versionResult=" << ResultName(rr.version_result)
+          << " SL=" << rr.sl_major << "." << rr.sl_minor << "." << rr.sl_build
+          << " NGX=" << rr.ngx_major << "." << rr.ngx_minor << "." << rr.ngx_build << "\n";
+      }
+      s << "  frame=" << probe.frame << " loadAttempts=" << probe.load_attempts;
+      if (probe.load_attempts > 0) {
+        s << " lastLoadResult=" << ResultName(probe.load_result)
+          << " loadedAfterLoad=" << (probe.loaded_after_load ? "yes" : "no");
+      } else {
+        s << " (no runtime attempt: RR was requested at slInit or is disabled)";
+      }
+      s << "\n";
+      if (probe.plugin_module_loaded) {
+        s << "  plugin module: loaded at " << probe.plugin_module_path << "\n";
+      } else {
+        s << "  plugin module: not loaded";
+        if (probe.plugin_file_present) {
+          s << "; sl.dlss_d.dll present at " << probe.plugin_file_path;
+        } else {
+          s << "; sl.dlss_d.dll not found in the game folder";
+        }
+        s << "\n";
+      }
+      if (probe.requirements_attempted) {
+        const bool requirements_ok =
+            static_cast<sl::Result>(probe.requirements_result) == sl::Result::eOk;
+        s << "  requirements: " << ResultName(probe.requirements_result);
+        if (requirements_ok) {
+          s << " flags=0x" << std::hex << probe.requirement_flags << std::dec
+            << " [" << RequirementFlagsText(probe.requirement_flags) << "]"
+            << " maxViewports=" << probe.max_viewports
+            << " maxCPUThreads=" << probe.max_cpu_threads;
+        }
+        s << "\n";
+        if (requirements_ok) {
+          s << "    required tags:";
+          if (probe.required_tags.empty()) {
+            s << " (none)";
+          } else {
+            for (uint32_t tag : probe.required_tags) s << " " << BufferName(tag);
+          }
+          s << "\n";
+          if (!probe.driver_version_required.empty() && probe.driver_version_required != "0.0.0") {
+            s << "    driver required: " << probe.driver_version_required << "\n";
+          }
+          if (!probe.os_version_required.empty() && probe.os_version_required != "0.0.0") {
+            s << "    OS required: " << probe.os_version_required << "\n";
+          }
+        }
+      } else {
+        s << "  requirements: unavailable (slGetFeatureRequirements not resolved)\n";
+      }
+      s << "  functions: slDLSSDSetOptions=" << ResultName(probe.fn_set_options_result)
+        << " slDLSSDGetOptimalSettings=" << ResultName(probe.fn_get_optimal_result)
+        << " slDLSSDGetState=" << ResultName(probe.fn_get_state_result) << "\n";
+      s << "  trial optimal (mirrors the game's DLSS mode): ";
+      if (!probe.trial_optimal_attempted) {
+        s << "skipped (no captured slDLSSSetOptions yet)";
+      } else {
+        s << ResultName(probe.trial_optimal_result);
+        if (static_cast<sl::Result>(probe.trial_optimal_result) == sl::Result::eOk) {
+          s << " render=" << probe.trial_render_width << "x" << probe.trial_render_height
+            << " sharpness=" << probe.trial_sharpness
+            << " min=" << probe.trial_render_width_min << "x" << probe.trial_render_height_min
+            << " max=" << probe.trial_render_width_max << "x" << probe.trial_render_height_max;
+        }
+      }
+      s << "\n";
+      s << "  trial state (viewport 0): ";
+      if (!probe.trial_state_attempted) {
+        s << "skipped";
+      } else {
+        s << ResultName(probe.trial_state_result);
+        if (static_cast<sl::Result>(probe.trial_state_result) == sl::Result::eOk) {
+          s << " estimatedVRAM=" << probe.trial_vram_bytes << " bytes";
+        }
+      }
+      s << "\n";
+    }
   }
 
   s << "\n[feature functions]\n";
