@@ -24,6 +24,7 @@
 #include "../../utils/settings.hpp"
 
 #include "./sl_rr.hpp"
+#include "./pass_map.hpp"
 
 namespace {
 
@@ -600,7 +601,55 @@ bool DrawSlLogPanel() {
   return false;
 }
 
+bool DrawPassMapPanel() {
+  const pass_map::FrameSnapshot snap = pass_map::Capture();
+  if (snap.frames_total == 0) {
+    ImGui::TextColored(kColorWarn, "No presents captured yet (the map fills per frame).");
+    return false;
+  }
+  ImGui::Text(
+      "frame %llu of %llu: %llu dispatch(es), %llu indirect; cumulative %llu",
+      static_cast<unsigned long long>(snap.frame_index),
+      static_cast<unsigned long long>(snap.frames_total),
+      static_cast<unsigned long long>(snap.dispatches),
+      static_cast<unsigned long long>(snap.indirect),
+      static_cast<unsigned long long>(pass_map::CumulativeDispatches()));
+  if (!snap.candidates.empty()) {
+    std::stringstream candidates;
+    candidates << "candidates:";
+    for (const auto& [hash, count] : snap.candidates) {
+      candidates << " " << pass_map::KnownName(hash) << "x" << count;
+    }
+    ImGui::TextWrapped("%s", candidates.str().c_str());
+  }
+  if (!snap.top.empty()) {
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(snap.top.size());
+    for (const auto& [hash, count] : snap.top) {
+      const char* name = pass_map::KnownName(hash);
+      char buffer[16] = {};
+      snprintf(buffer, sizeof buffer, "0x%08X", hash);
+      rows.push_back({buffer, name != nullptr ? name : "-", std::to_string(count)});
+    }
+    DrawRowTable("##pass_map_top", {"Hash", "Name", "Count"}, rows);
+  }
+  if (!snap.order.empty()) {
+    if (ImGui::TreeNode("First-seen order")) {
+      for (uint32_t hash : snap.order) {
+        ImGui::TextUnformatted(pass_map::ShaderLabel(hash).c_str());
+      }
+      ImGui::TreePop();
+    }
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
+
+// The one-click report: SL diagnostics plus the RT pass map.
+std::string FullReport() {
+  return sl_rr::BuildReport() + pass_map::BuildReportSection();
+}
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
@@ -702,7 +751,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .group = "button-line-report",
         .tooltip = "Copies the full diagnostics report (all panels as text) to the clipboard.",
-        .on_change = []() { ImGui::SetClipboardText(sl_rr::BuildReport().c_str()); },
+        .on_change = []() { ImGui::SetClipboardText(FullReport().c_str()); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -710,7 +759,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .group = "button-line-report",
         .tooltip = "Writes the full diagnostics report to reshade.log.",
-        .on_change = []() { sl_rr::LogReport(sl_rr::BuildReport()); },
+        .on_change = []() { sl_rr::LogReport(FullReport()); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -719,7 +768,10 @@ renodx::utils::settings::Settings settings = {
         .group = "button-line-report",
         .tooltip = "Clears captured counters, tags, constants and features. slInit and device "
                    "snapshots are kept.",
-        .on_change = []() { sl_rr::ResetCapture(); },
+        .on_change = []() {
+          sl_rr::ResetCapture();
+          pass_map::Reset();
+        },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
@@ -744,6 +796,14 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Streamline's own log messages, captured through the logMessageCallback"
                    " installed at slInit.",
         .on_draw = [] { return DrawSlLogPanel(); },
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .label = "RT pass map",
+        .section = "Ray Reconstruction",
+        .tooltip = "Compute dispatches per frame with shader hashes: identifies FH6's RT"
+                   " resolve/denoise chain live.",
+        .on_draw = [] { return DrawPassMapPanel(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
@@ -849,6 +909,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   renodx::utils::settings::use_presets = false;  // diagnostics mod: no presets
   renodx::utils::settings::Use(fdw_reason, &settings);
+  pass_map::Use(fdw_reason);
 
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     // Keep the boot values for the "restart required" hint and push the loaded

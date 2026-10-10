@@ -4,13 +4,15 @@ Ray Reconstruction mod for FH6 via the game's own Streamline instance
 (`sl.interposer.dll`): intercept the DLSS-SR evaluation, answer it with
 `kFeatureDLSS_RR`, and supply the guide buffers the game does not provide.
 
-**Status: M2c implemented** — the game's `slEvaluateFeature(DLSS)` is redirected to
-`kFeatureDLSS_RR` with `DLSSDOptions` mirrored from the game's own settings
-(internal resolution stays game-controlled), the world/view matrices derived
-per frame from `sl::Constants`, and the guide tags DLSS-RR **requires**
-(Albedo, SpecularAlbedo, NormalRoughness) supplied as placeholder textures
-until the M3 rrg pass provides real content. Strict per-frame fallback to SR
-on any failure, live A/B toggle, and full Streamline log capture.
+**Status: M2c + RT pass map implemented** — the game's `slEvaluateFeature(DLSS)` is
+redirected to `kFeatureDLSS_RR` with `DLSSDOptions` mirrored from the game's
+own settings (internal resolution stays game-controlled), the world/view
+matrices derived per frame from `sl::Constants`, and the guide tags DLSS-RR
+**requires** (Albedo, SpecularAlbedo, NormalRoughness) supplied as placeholder
+textures until the M3 rrg pass provides real content. Strict per-frame
+fallback to SR on any failure, live A/B toggle, full Streamline log capture,
+and an RT pass map (per-frame compute dispatch/hash inventory) that identifies
+FH6's resolve/denoise chain for the planned bypass.
 
 ## Goal roadmap
 
@@ -22,11 +24,14 @@ on any failure, live A/B toggle, and full Streamline log capture.
 5. ~~M2: SR → RR redirect + strict fallback (prove the swap, live A/B).~~
 6. ~~M2c: guide provisioning (RR refuses to evaluate without Albedo,
    SpecularAlbedo, NormalRoughness) with placeholder content.~~
-7. **M3:** Real guides — NormalRoughness from G-buffer T3 (gloss → roughness),
+7. ~~M2d (phase 1): RT pass map diagnostics — per-frame dispatch/hash
+   inventory to identify the resolve/denoise chain (denoise-bypass evidence).~~
+8. **M3:** Real guides — NormalRoughness from G-buffer T3 (gloss → roughness),
    Albedo from T0, SpecularAlbedo approximation.
-8. M4: Specular motion vectors + hit distance from the DXR trace outputs.
-9. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
-10. Later: muting SSR layering on RT reflections; denoiser bypass.
+9. M4: Specular motion vectors + hit distance from the DXR trace outputs.
+10. M5: Albedo/specular-albedo refinement, dev dumps, verification matrix.
+11. M2d (phase 2, after M3/M4): RT denoise bypass ("mute set", shader
+    replacement keyed by the pass-map hashes).
 
 FH6 ships DLSS Super Resolution only — RR does not exist in-game, so it has to
 be injected. Streamline provides the RR plugin (`sl.dlss_d.dll`) and runtime
@@ -122,6 +127,10 @@ no log reading required:
   modules (identifies OTA plugin file names).
 - **SL log (captured)** — Streamline's own log messages (last ring, plus a
   warn/error-only ring with repeat counts).
+- **RT pass map** — compute dispatches per frame (direct + indirect) with
+  shader hashes: candidate RT passes with counts/order, top dispatches of the
+  last frame, and cumulative totals. This is the evidence for choosing the
+  RT denoise bypass ("mute set").
 - **Features** — per-feature evaluate/query results (DLSS, DLSS-G, DLSS-RR…).
   With the redirect on, the DLSS row counts only fallback frames; the DLSS-RR
   row counts the redirected frames.
@@ -176,6 +185,24 @@ this is how evaluate failures get their exact reason (e.g. missing tag names).
 The `[DLSS-RR probe]` report block also lists every loaded dlss/nvngx/NGX-store
 module, which identifies OTA plugin files whose names are hashes
 (e.g. `190_E658703.dll`).
+
+## RT pass map (M2d)
+
+Counts every compute dispatch per frame (direct and indirect) and records the
+first-seen shader-hash order, using the same CRC32 hashes as the dump
+filenames (`shaders/README.md`). The **RT pass map** overlay panel and the
+`[RT pass map]` report section (included in **Copy report**) show:
+
+- candidate passes that ran (the 16 traces, `resolve-denoise`, `gi-probes`,
+  `infra`, `ssgi`) with per-frame counts and in-frame order — this is how the
+  resolve/denoise chain gets identified for the planned bypass "mute set",
+- the top dispatches of the last frame (catches passes outside the candidate
+  list),
+- cumulative totals.
+
+Shader-utils pipeline tracking is activated for this (`renodx::utils::shader`),
+which also primes the runtime shader-replacement path the denoise bypass will
+use.
 
 ## Guide textures (M2c)
 
