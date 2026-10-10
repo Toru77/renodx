@@ -210,6 +210,12 @@ inline std::string ToLowerAscii(std::string text) {
   return text;
 }
 
+inline std::string HresultLabel(HRESULT hr) {
+  char buffer[16] = {};
+  snprintf(buffer, sizeof buffer, "0x%08X", static_cast<unsigned>(hr));
+  return buffer;
+}
+
 // Builds the camera matrices DLSS-RR expects in DLSSDOptions from the camera
 // basis the game provides via sl::Constants. Convention follows Streamline's
 // own sl_matrix_helpers.h (cameraViewToWorld rows = right/up/fwd/pos,
@@ -731,19 +737,23 @@ inline sl::PFun_LogMessageCallback* chained_log_callback = nullptr;
 // with consecutive duplicates collapsed.
 inline void SlLogMessageCallback(sl::LogType type, const char* message) {
   if (message == nullptr) return;
+  std::string text(message);
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+    text.pop_back();
+  }
   {
     const std::lock_guard lock(diagnostics_mutex);
     ++diagnostics.sl_log_total;
     const int type_int = static_cast<int>(type);
     const auto push = [&](std::vector<SlLogEntry>& ring, size_t capacity) {
-      if (!ring.empty() && ring.back().type == type_int && ring.back().message == message) {
+      if (!ring.empty() && ring.back().type == type_int && ring.back().message == text) {
         ++ring.back().repeats;
         return;
       }
       if (ring.size() >= capacity) ring.erase(ring.begin());
       SlLogEntry entry{};
       entry.type = type_int;
-      entry.message = message;
+      entry.message = text;
       ring.push_back(std::move(entry));
     };
     push(diagnostics.sl_log_last, 12);
@@ -906,6 +916,13 @@ inline bool GetRuntimeLoad() { return rr_runtime_load_enabled.load(); }
 inline std::atomic<bool> rr_redirect_enabled{true};
 inline void SetRrRedirect(bool enabled) { rr_redirect_enabled.store(enabled); }
 inline bool GetRrRedirect() { return rr_redirect_enabled.load(); }
+
+// User-selected DLSSD preset applied to every mode (A..F; F is the current
+// RR 4.5 default preset, D/E are the transformer models).
+inline std::atomic<uint32_t> rr_preset_override{
+    static_cast<uint32_t>(sl::DLSSDPreset::ePresetF)};
+inline void SetRrPreset(uint32_t preset) { rr_preset_override.store(preset); }
+inline uint32_t GetRrPreset() { return rr_preset_override.load(); }
 
 // Ask Streamline for verbose logging while our capture callback is attached.
 inline std::atomic<bool> rr_sl_log_verbose_enabled{true};
@@ -1315,50 +1332,52 @@ inline void RetireGuideResources() {
   guide_resources.height = 0;
 }
 
-// Creates one DEFAULT-heap texture, fills it from a single-pixel pattern via
-// an UPLOAD staging texture, records the copy + barrier on the game's command
-// list, and leaves it in a shader-readable state.
+// Creates one DEFAULT-heap texture, fills it from a single-pixel pattern via a
+// row-major UPLOAD staging buffer, records the copy + barrier on the game's
+// command list, and leaves it in a shader-readable state. (UPLOAD-heap
+// textures would require ROW_MAJOR layout; a staging buffer is the robust
+// pattern, also used by control-rr.)
 inline bool CreateGuideTexture(
     ID3D12Device* device, ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height,
     DXGI_FORMAT format, const void* pixel, uint32_t pixel_bytes, const char* name,
     ID3D12Resource** out_texture, ID3D12Resource** out_upload) {
-  const auto fail = [&](const char* stage) {
+  const auto fail = [&](const std::string& stage) {
     guide_last_error = std::string(name) + ": " + stage;
     return false;
   };
-
-  D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = width;
-  desc.Height = height;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
-  desc.Format = format;
-  desc.SampleDesc = {1, 0};
-  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-
-  D3D12_HEAP_PROPERTIES upload_heap{};
-  upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-  upload_heap.CreationNodeMask = 1;
-  upload_heap.VisibleNodeMask = 1;
-
-  ID3D12Resource* upload = nullptr;
-  HRESULT hr = device->CreateCommittedResource(
-      &upload_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-      IID_PPV_ARGS(&upload));
-  if (FAILED(hr)) return fail("upload CreateCommittedResource failed");
 
   const uint32_t row_bytes = width * pixel_bytes;
   const uint32_t row_pitch =
       (row_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
       * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 
+  D3D12_HEAP_PROPERTIES upload_heap{};
+  upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+  D3D12_RESOURCE_DESC buffer_desc{};
+  buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer_desc.Width = static_cast<uint64_t>(row_pitch) * height;
+  buffer_desc.Height = 1;
+  buffer_desc.DepthOrArraySize = 1;
+  buffer_desc.MipLevels = 1;
+  buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+  buffer_desc.SampleDesc = {1, 0};
+  buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+  ID3D12Resource* upload = nullptr;
+  HRESULT hr = device->CreateCommittedResource(
+      &upload_heap, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+      nullptr, IID_PPV_ARGS(&upload));
+  if (FAILED(hr)) {
+    return fail("staging CreateCommittedResource failed (" + HresultLabel(hr) + ")");
+  }
+
   void* mapped = nullptr;
   const D3D12_RANGE read_range{0, 0};
   hr = upload->Map(0, &read_range, &mapped);
   if (FAILED(hr) || mapped == nullptr) {
     upload->Release();
-    return fail("upload Map failed");
+    return fail("staging Map failed (" + HresultLabel(hr) + ")");
   }
   for (uint32_t y = 0; y < height; ++y) {
     auto* row = static_cast<uint8_t*>(mapped) + static_cast<size_t>(row_pitch) * y;
@@ -1370,21 +1389,30 @@ inline bool CreateGuideTexture(
 
   D3D12_HEAP_PROPERTIES default_heap{};
   default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  default_heap.CreationNodeMask = 1;
-  default_heap.VisibleNodeMask = 1;
+
+  D3D12_RESOURCE_DESC texture_desc{};
+  texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture_desc.Width = width;
+  texture_desc.Height = height;
+  texture_desc.DepthOrArraySize = 1;
+  texture_desc.MipLevels = 1;
+  texture_desc.Format = format;
+  texture_desc.SampleDesc = {1, 0};
+  texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
   ID3D12Resource* texture = nullptr;
   hr = device->CreateCommittedResource(
-      &default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-      IID_PPV_ARGS(&texture));
+      &default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+      nullptr, IID_PPV_ARGS(&texture));
   if (FAILED(hr)) {
     upload->Release();
-    return fail("CreateCommittedResource failed");
+    return fail("CreateCommittedResource failed (" + HresultLabel(hr) + ")");
   }
 
   D3D12_TEXTURE_COPY_LOCATION source{};
   source.pResource = upload;
   source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source.PlacedFootprint.Offset = 0;
   source.PlacedFootprint.Footprint.Format = format;
   source.PlacedFootprint.Footprint.Width = width;
   source.PlacedFootprint.Footprint.Height = height;
@@ -1784,13 +1812,14 @@ inline sl::Result HookedSlEvaluateFeature(
     // The placeholder guide carries roughness in the alpha channel of the
     // normal texture (single packed NR tag), matching the M3 rrg plan.
     options.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
-    // DLSSD presets share the DLSS preset letter ordering.
-    options.dlaaPreset = static_cast<sl::DLSSDPreset>(captured.presets[0]);
-    options.qualityPreset = static_cast<sl::DLSSDPreset>(captured.presets[1]);
-    options.balancedPreset = static_cast<sl::DLSSDPreset>(captured.presets[2]);
-    options.performancePreset = static_cast<sl::DLSSDPreset>(captured.presets[3]);
-    options.ultraPerformancePreset = static_cast<sl::DLSSDPreset>(captured.presets[4]);
-    options.ultraQualityPreset = static_cast<sl::DLSSDPreset>(captured.presets[5]);
+    // User-selected preset applied to every mode (F = RR 4.5 default preset).
+    const auto preset_override = static_cast<sl::DLSSDPreset>(GetRrPreset());
+    options.dlaaPreset = preset_override;
+    options.qualityPreset = preset_override;
+    options.balancedPreset = preset_override;
+    options.performancePreset = preset_override;
+    options.ultraPerformancePreset = preset_override;
+    options.ultraQualityPreset = preset_override;
 
     const auto set_result = real_dlssd_set_options(viewport, options);
     if (set_result != sl::Result::eOk) {
@@ -2687,6 +2716,7 @@ inline std::string BuildReport() {
 
   s << "\n[RR redirect]\n";
   s << "setting: " << (GetRrRedirect() ? "on" : "off") << "\n";
+  s << "  preset override: " << PresetName(GetRrPreset()) << " (all modes)\n";
   {
     const auto& redirect = d.rr_redirect;
     s << "  game DLSS evaluates (redirect on): " << (redirect.redirected + redirect.fallbacks)

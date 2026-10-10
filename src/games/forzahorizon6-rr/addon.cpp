@@ -41,6 +41,10 @@ float rr_runtime_load_boot_value = 1.f;
 float rr_redirect_setting = 1.f;
 // Raises Streamline's own log level while the mod captures its messages.
 float rr_sl_log_verbose_setting = 1.f;
+// DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
+// current RR 4.5 default preset). Indices match the slider labels.
+constexpr uint32_t kRrPresetValues[6] = {1, 2, 3, 4, 5, 6};
+float rr_preset_setting = 5.f;  // index into kRrPresetValues; F by default
 
 std::string Hex64(uint64_t value) {
   char buffer[32] = {};
@@ -219,6 +223,7 @@ bool DrawStatusPanel() {
   } else {
     ImGui::TextUnformatted("Redirect: off — the game's DLSS SR runs unchanged");
   }
+  ImGui::Text("RR preset: %s (all modes)", sl_rr::PresetName(sl_rr::GetRrPreset()));
   if (d.guides.created) {
     ImGui::Text(
         "guides: placeholder %ux%u (recreates %u)", d.guides.width, d.guides.height,
@@ -658,6 +663,21 @@ renodx::utils::settings::Settings settings = {
         .on_change_value = [](float, float value) { sl_rr::SetSlLogVerbose(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
+        .key = "RrPreset",
+        .binding = &rr_preset_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 5.f,
+        .label = "RR preset",
+        .section = "Ray Reconstruction",
+        .tooltip = "DLSS Ray Reconstruction render preset, applied to every mode. F is the"
+                   " current RR 4.5 default preset; D/E are the transformer models; A-C are"
+                   " NVIDIA-deprecated. Changes apply on the next frame.",
+        .labels = {"A", "B", "C", "D", "E", "F"},
+        .on_change_value = [](float, float value) {
+          sl_rr::SetRrPreset(kRrPresetValues[static_cast<int>(value)]);
+        },
+    },
+    new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Probe DLSS-RR",
         .section = "Ray Reconstruction",
@@ -837,6 +857,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetRuntimeLoad(rr_runtime_load_setting != 0.f);
     sl_rr::SetRrRedirect(rr_redirect_setting != 0.f);
     sl_rr::SetSlLogVerbose(rr_sl_log_verbose_setting != 0.f);
+    int preset_index = static_cast<int>(rr_preset_setting);
+    if (preset_index < 0) preset_index = 0;
+    if (preset_index > 5) preset_index = 5;
+    sl_rr::SetRrPreset(kRrPresetValues[preset_index]);
   }
 
   if (fdw_reason == DLL_PROCESS_DETACH) {

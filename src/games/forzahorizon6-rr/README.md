@@ -98,6 +98,9 @@ no log reading required:
   (`N RR frames, M fallbacks` + last attempt results or last fallback reason).
 - **Replace DLSS SR with Ray Reconstruction** — live A/B toggle (default on).
   Off: the game's DLSS SR runs unchanged.
+- **RR preset** — slider A–F applied to every DLSSD mode (default F, the
+  current RR 4.5 preset; D/E are the transformer models). Changes apply on
+  the next frame.
 - **Request DLSS-RR at slInit** — appends `kFeatureDLSS_RR` to the game's
   `featuresToLoad` in the `slInit` hook (default on; restart required).
 - **Auto-load DLSS-RR at runtime** — if the feature is still not loaded when
@@ -135,11 +138,13 @@ Streamline call), **Copy report** / **Write report to log**, **Reset capture**.
 Per frame, when the game evaluates `kFeatureDLSS` with the toggle on:
 
 1. Captured SR options are mirrored into `DLSSDOptions` (mode, output size,
-   HDR flag, exposures, presets), `worldToCameraView` / `cameraViewToWorld`
-   are rebuilt from the game's `sl::Constants` camera basis using Streamline's
-   own convention (`sl_matrix_helpers.h`), and `normalRoughnessMode` is set to
-   packed. The game's in-game DLSS settings therefore keep controlling
-   internal resolution.
+   HDR flag, exposures), the render preset comes from the **RR preset**
+   slider (A–F, default F — the RR 4.5 preset — applied to every mode),
+   `worldToCameraView` / `cameraViewToWorld` are rebuilt from the game's
+   `sl::Constants` camera basis using Streamline's own convention
+   (`sl_matrix_helpers.h`), and `normalRoughnessMode` is set to packed. The
+   game's in-game DLSS settings therefore keep controlling internal
+   resolution.
 2. Guide textures (render-sized, created once per resolution via the game's
    D3D12 device) are ensured: `NormalRoughness` RGBA16F (flat view normal +
    roughness 1), `Albedo` RGBA8 gray, `SpecularAlbedo` RGBA8 black. DLSS-RR's
