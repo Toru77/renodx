@@ -31,9 +31,8 @@
 namespace {
 
 // The single user control. Enabling RR applies the runtime load, the SR->RR
-// redirect and the High-RTGI resolve bypasses, but only while High RTGI is
-// detected (below). The stored value is kept so RR resumes on its own when the
-// player switches RTGI back to High.
+// redirect and the resolve bypasses. RR runs at any RTGI tier; only the
+// raw-signal bypasses require High RTGI (see below).
 float rr_enable_setting = 1.f;
 
 // DLSSD preset values for the D/E/F slider. Streamline marks A-C deprecated
@@ -58,21 +57,25 @@ uint32_t presents_without_high = 0;
 // Guards a silent detection failure: warns once High RTGI has been absent long.
 bool warned_no_high = false;
 
-// RR is active only when the player asked for it and High RTGI is running.
+// RR runs whenever the switch is on. The raw-signal resolve bypasses are a
+// separate concern: they apply only on High RTGI, because that is the only tier
+// where RR is fed the raw ray signal instead of the game's filtered resolve.
 bool RrActive() {
-  return rr_enable_setting != 0.f && high_gi_active;
+  return rr_enable_setting != 0.f;
 }
 
 // Applies the whole "RR on/off" bundle. On High RTGI the spatial filter (world
 // cache, history and neighbourhood) and the gather (reprojection) are bypassed,
-// so RR receives the raw ray signal.
+// so RR receives the raw ray signal; on Medium and Low the game's own resolve
+// feeds RR and the bypasses stay off.
 void ApplyRrState() {
   const bool active = RrActive();
   sl_rr::SetRuntimeLoad(active);
   sl_rr::SetRrRedirect(active);
   guides::enabled.store(active);
-  denoise::SetEnabled(denoise::kSpatialHighHash, active);
-  denoise::SetEnabled(denoise::kGatherHash, active);
+  const bool bypass = active && high_gi_active;
+  denoise::SetEnabled(denoise::kSpatialHighHash, bypass);
+  denoise::SetEnabled(denoise::kGatherHash, bypass);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -87,9 +90,9 @@ renodx::utils::settings::Settings settings = {
                    " to load), auto-loads it at runtime, replaces the game's"
                    " DLSS SR with RR and feeds RR the real G-buffer guides. On"
                    " High RTGI the temporal and gather denoisers are bypassed so"
-                   " RR gets the raw ray signal. Requires Ray Traced Global"
-                   " Illumination at High; without it the switch behaves as off."
-                   " Off = the game's own DLSS SR and denoisers run unchanged.",
+                   " RR gets the raw ray signal; on Medium and Low the game's"
+                   " own resolve feeds RR instead. Off = the game's own DLSS SR"
+                   " and denoisers run unchanged.",
         .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
@@ -251,7 +254,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     // Request RR at slInit unconditionally: the restart-required part cannot
     // be toggled live, and the merged switch below covers the live parts.
     sl_rr::SetInitInjection(true);
-    // Nothing runs yet: RR waits for High RTGI to be detected at runtime.
+    // RR loads immediately; the resolve bypasses wait for High RTGI detection.
     ApplyRrState();
     int preset_index = static_cast<int>(rr_preset_setting);
     if (preset_index < 0) preset_index = 0;

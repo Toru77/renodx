@@ -24,7 +24,8 @@ The game loads Streamline's DLSS SR. This add-on:
    signal: the 4-tap reprojected gather and the spatial filter (world cache,
    history and neighbourhood) are replaced with raw centre-sample variants (see
    `denoise.hpp` and the `0x*.cs_6_6.hlsl` files). The High RTGI tier is detected
-   from the spatial filter the game binds; without it the switch behaves as off.
+   from the spatial filter the game binds; without it the bypasses stay off and a
+   red notice is shown, but RR still runs on the game's own resolve.
 
 All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 
@@ -32,7 +33,7 @@ All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 
 | Control | Effect |
 |---|---|
-| **Enable DLSS Ray Reconstruction** | The whole feature: runtime load, SR->RR redirect, real guides, and the High-RTGI resolve bypasses. Requires Ray Traced Global Illumination at High; without it the switch behaves as off and a red notice is shown. Off = the game runs its own DLSS SR and denoisers unchanged. |
+| **Enable DLSS Ray Reconstruction** | The whole feature: runtime load, SR->RR redirect, real guides, and the High-RTGI resolve bypasses. RR runs at any RTGI tier; without Ray Traced Global Illumination at High a red notice is shown and RR receives the game's own filtered resolve. Off = the game runs its own DLSS SR and denoisers unchanged. |
 | **RR preset** (D-F) | DLSS-RR render preset applied to every DLSSD preset hint. `D` is the default transformer model, `E` the latest transformer model, `F` the current RR 4.5 default. |
 
 ## Instructions
@@ -74,5 +75,6 @@ In gameplay with DLSS on and Ray Traced Global Illumination at High:
 - The red "Turn on Ray Traced Global Illumination at High." notice is gone.
 - The image is denoised by RR (compare against the switch off - the game's own
   DLSS SR).
-- Switching RTGI to Medium or Low brings the red notice back and stops RR.
+- Switching RTGI to Medium or Low brings the red notice back; RR keeps running
+  but no longer receives the raw signal.
 - `ReShade.log` shows `sl-rr: Streamline entry points hooked`.
