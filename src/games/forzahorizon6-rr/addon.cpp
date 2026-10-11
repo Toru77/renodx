@@ -86,7 +86,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Enable DLSS Ray Reconstruction",
         .section = "Ray Reconstruction",
-        .tooltip = "Replaces the game's DLSS SR with RR.",
+        .tooltip = "Intercepts the game's DLSS SR then replaces with RR.",
         .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
