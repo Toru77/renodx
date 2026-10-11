@@ -7,6 +7,20 @@
 // NaN guards); the world-cache blend (u30/u31), the previous-frame history
 // blend (t26/t27/t28) and the wave average are dropped. Every pixel resolves
 // from the current frame's radiance samples only; the meta counter writes 1.
+//
+// Two compile variants share this body:
+//   - raw (default, FH6_SPATIAL_BOTH = 0): the current-frame 3x3
+//     reconstruction - the "bypass temporal only" option.
+//   - centre-only (FH6_SPATIAL_BOTH = 1): the 3x3 reconstruction is skipped and
+//     each pixel resolves from its own sample alone - the "bypass both" option
+//     (no spatial neighbourhood and no cross-frame state).
+//
+// The "bypass spatial only" option keeps the cross-frame state and is a
+// separate decompiled replacement (0x596D3E8F_spatial / 0x4DAF8A48_spatial).
+
+#ifndef FH6_SPATIAL_BOTH
+#define FH6_SPATIAL_BOTH 0
+#endif
 
 cbuffer cb : register(b0, space36)
 {
@@ -100,20 +114,58 @@ void main(uint3 global_id : SV_DispatchThreadID)
     const float3 normal = DecodePackedNormal(own.x);
     const float depth = own.y;
 
+    // Gather the 3x3 neighbourhood once: samples and the original
+    // reconstruction weights.
+    const float facing = clamp(-dot(m[6].xyz, normal), 0.0f, 1.0f);
+    float4 samples[9];
+    float sample_weights[9];
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    {
+        [unroll] for (int dx = -1; dx <= 1; ++dx)
+        {
+            const int index = (dy + 1) * 3 + (dx + 1);
+            const uint2 sample_px = uint2(clamp(int2(px) + int2(dx, dy), int2(0, 0), int2(bounds) - 1));
+            const float4 sample_normal_depth = g_normal.Load(int3(sample_px, 0));
+            samples[index] = g_radiance.Load(int3(sample_px, 0));
+            float sample_weight;
+            if (index == 4)
+            {
+                sample_weight = 1.0f;
+            }
+            else
+            {
+                sample_weight = 0.0f;
+                if (sample_normal_depth.y > 0.0f)
+                {
+                    const float axis = ((dx == 0) || (dy == 0)) ? 0.5f : 0.33333334f;
+                    const float depth_ratio = clamp(
+                        exp2((abs(depth - sample_normal_depth.y) * (-facing)) / max(0.001f, sample_normal_depth.y + depth)),
+                        0.0f, 1.0f);
+                    sample_weight = clamp(dot(normal, DecodePackedNormal(sample_normal_depth.x)), 0.0f, 1.0f) * axis * depth_ratio;
+                }
+            }
+            sample_weights[index] = sample_weight;
+        }
+    }
+
     float co;
     float cg;
     float yv;
     float varc;
     float weight;
 
+#if FH6_SPATIAL_BOTH
+    if (true)
+#else
     if (((flags & 32770u) == 32768u) && (asuint(m[49].x) != 0u))
+#endif
     {
         // Original material single-sample path.
-        const float4 sample = g_radiance.Load(int3(px, 0));
-        weight = ConfidenceGate(sample.w, confidence_threshold, wave_mode);
-        const float sum = dot(sample.xyz, 1.0f.xxx);
+        const float3 sample = samples[4].xyz;
+        weight = ConfidenceGate(samples[4].w, confidence_threshold, wave_mode);
+        const float sum = dot(sample, 1.0f.xxx);
         const float clamped_sum = clamp(sum * 0.03125f, 0.0f, 1.0f) * 32.0f;
-        const float3 v = (sum > 0.0f) ? (clamped_sum * sample.xyz / sum) : 0.0f.xxx;
+        const float3 v = (sum > 0.0f) ? (clamped_sum * sample / sum) : 0.0f.xxx;
         co = dot(float3(0.5f, 0.0f, -0.5f), v);
         cg = dot(float3(-0.25f, 0.5f, -0.25f), v);
         yv = dot(float3(0.25f, 0.5f, 0.25f), v) * 0.5f;
@@ -122,38 +174,16 @@ void main(uint3 global_id : SV_DispatchThreadID)
     else
     {
         // Original 3x3 normal/depth-weighted reconstruction, current frame only.
-        const float facing = clamp(-dot(m[6].xyz, normal), 0.0f, 1.0f);
         float3 radiance_sum = 0.0f.xxx;
         float weight_sum = 0.0f;
         float gate_sum = 0.0f;
-        [unroll] for (int dy = -1; dy <= 1; ++dy)
+        [unroll] for (int index = 0; index < 9; ++index)
         {
-            [unroll] for (int dx = -1; dx <= 1; ++dx)
-            {
-                const uint2 sample_px = uint2(clamp(int2(px) + int2(dx, dy), int2(0, 0), int2(bounds) - 1));
-                const float4 sample_normal_depth = g_normal.Load(int3(sample_px, 0));
-                const float4 sample = g_radiance.Load(int3(sample_px, 0));
-                float sample_weight;
-                if ((dx == 0) && (dy == 0))
-                {
-                    sample_weight = 1.0f;
-                }
-                else
-                {
-                    sample_weight = 0.0f;
-                    if (sample_normal_depth.y > 0.0f)
-                    {
-                        const float axis = ((dx == 0) || (dy == 0)) ? 0.5f : 0.33333334f;
-                        const float depth_ratio = clamp(
-                            exp2((abs(depth - sample_normal_depth.y) * (-facing)) / max(0.001f, sample_normal_depth.y + depth)),
-                            0.0f, 1.0f);
-                        sample_weight = clamp(dot(normal, DecodePackedNormal(sample_normal_depth.x)), 0.0f, 1.0f) * axis * depth_ratio;
-                    }
-                }
-                radiance_sum += sample.xyz * sample_weight;
-                weight_sum += sample_weight;
-                gate_sum += ConfidenceGate(sample.w, confidence_threshold, wave_mode) * sample_weight;
-            }
+            const float3 sample = samples[index].xyz;
+            const float sample_weight = sample_weights[index];
+            radiance_sum += sample * sample_weight;
+            weight_sum += sample_weight;
+            gate_sum += ConfidenceGate(samples[index].w, confidence_threshold, wave_mode) * sample_weight;
         }
         float3 radiance;
         if (weight_sum > 0.0f)

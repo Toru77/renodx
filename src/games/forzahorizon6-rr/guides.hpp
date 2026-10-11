@@ -51,78 +51,27 @@
 
 namespace guides {
 
-// Live switches (settings-driven, read every evaluate).
-inline std::atomic<bool> enabled = false;             // real guides on/off
-inline std::atomic<bool> normals_view_space = true;   // world -> view transform
-inline std::atomic<int32_t> roughness_source = 0;     // 0 = material.y, 1 = material.z, 2 = constant
-
-// Diagnostics for the report.
-inline std::atomic<uint32_t> captures = 0;
-inline std::atomic<bool> signature_seen = false;
-inline std::atomic<bool> nr_pipeline_ready = false;
-inline std::atomic<uint32_t> nr_dispatches = 0;
-inline std::atomic<bool> last_ready = false;
-
-// Stage reporting: 0 = off, 1 = waiting capture, 2 = texture failed,
-// 3 = pipeline failed, 4 = dispatching.
-inline std::atomic<int32_t> last_stage = 0;
-inline std::atomic<long> last_hr = 0;
-
-inline const char* StageName(int32_t stage) {
-  switch (stage) {
-    case 0: return "off";
-    case 1: return "waiting for G-buffer capture";
-    case 2: return "guide texture creation failed";
-    case 3: return "guide pipeline creation failed";
-    case 4: return "dispatching";
-    default: return "unknown";
-  }
-}
-
-inline void SetStage(int32_t stage, long hr) {
-  const int32_t previous = last_stage.exchange(stage);
-  last_hr.store(hr);
-  if (previous == stage) return;
-  std::stringstream s;
-  s << "guides: " << StageName(stage);
-  if (hr != 0) {
-    char buffer[64] = {};
-    snprintf(buffer, sizeof buffer, " (hr=0x%08lX)", static_cast<unsigned long>(hr));
-    s << buffer;
-  }
-  reshade::log::message(reshade::log::level::info, s.str().c_str());
-}
+// Real guides are generated from the game's live G-buffer every evaluate; the
+// placeholder guides stay as the fail-closed fallback. `enabled` is driven by
+// the mod's single RR switch.
+inline std::atomic<bool> enabled = false;
 
 struct CapturedTexture {
   std::atomic<uint64_t> handle{0};
   std::atomic<uint32_t> format{0};
   std::atomic<uint32_t> width{0};
   std::atomic<uint32_t> height{0};
-  std::atomic<uint32_t> changes{0};
 };
 
 inline CapturedTexture captured_albedo;    // RT4 r8g8b8a8_srgb
 inline CapturedTexture captured_material;  // RT2 r8g8b8a8_uint
 inline CapturedTexture captured_normal;    // RT3 r32_uint
 
-inline void StoreCapture(
-    reshade::api::device* device, reshade::api::resource resource,
-    CapturedTexture& out, const char* name) {
+inline void StoreCapture(reshade::api::resource resource, CapturedTexture& out) {
   auto* native = reinterpret_cast<ID3D12Resource*>(resource.handle);
   if (native == nullptr) return;
   const D3D12_RESOURCE_DESC native_desc = native->GetDesc();
-  if (out.handle.exchange(resource.handle) != resource.handle) {
-    // Per-frame double-buffered G-buffer sets make the handle flip often;
-    // only the first few changes are log-worthy.
-    if (out.changes.fetch_add(1) < 4) {
-      std::stringstream s;
-      s << "guides: captured " << name << " 0x" << std::hex
-        << static_cast<unsigned long long>(resource.handle) << std::dec
-        << " fmt=" << static_cast<uint32_t>(native_desc.Format) << " "
-        << native_desc.Width << "x" << native_desc.Height;
-      reshade::log::message(reshade::log::level::info, s.str().c_str());
-    }
-  }
+  out.handle.store(resource.handle);
   out.format.store(static_cast<uint32_t>(native_desc.Format));
   out.width.store(static_cast<uint32_t>(native_desc.Width));
   out.height.store(native_desc.Height);
@@ -167,11 +116,9 @@ inline void CaptureFromViews(
     return;
   }
 
-  signature_seen.store(true);
-  StoreCapture(device, albedo, captured_albedo, "albedo(rt4)");
-  StoreCapture(device, material, captured_material, "material(rt2)");
-  StoreCapture(device, normal, captured_normal, "normal(rt3)");
-  captures.fetch_add(1);
+  StoreCapture(albedo, captured_albedo);
+  StoreCapture(material, captured_material);
+  StoreCapture(normal, captured_normal);
 }
 
 inline void OnBindRenderTargetsAndDepthStencil(
@@ -221,8 +168,6 @@ struct GuidePass {
 };
 
 inline GuidePass guide_pass;
-inline std::atomic<long> last_texture_hr{0};
-inline std::atomic<long> last_pipeline_hr{0};
 
 inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t height) {
   if (guide_pass.normal_roughness != nullptr && guide_pass.width == width
@@ -262,7 +207,6 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
       nullptr, IID_PPV_ARGS(&guide_pass.normal_roughness));
   if (FAILED(nr_hr) || guide_pass.normal_roughness == nullptr) {
     guide_pass.normal_roughness = nullptr;
-    last_texture_hr.store(nr_hr);
     return false;
   }
 
@@ -279,7 +223,6 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
       &heap, D3D12_HEAP_FLAG_NONE, &spec_desc, D3D12_RESOURCE_STATE_COMMON,
       nullptr, IID_PPV_ARGS(&guide_pass.specular));
   if (FAILED(spec_hr) || guide_pass.specular == nullptr) {
-    last_texture_hr.store(spec_hr);
     guide_pass.normal_roughness->Release();
     guide_pass.normal_roughness = nullptr;
     guide_pass.specular = nullptr;
@@ -299,7 +242,6 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
       &heap, D3D12_HEAP_FLAG_NONE, &alb_desc, D3D12_RESOURCE_STATE_COMMON,
       nullptr, IID_PPV_ARGS(&guide_pass.albedo_linear));
   if (FAILED(alb_hr) || guide_pass.albedo_linear == nullptr) {
-    last_texture_hr.store(alb_hr);
     guide_pass.normal_roughness->Release();
     guide_pass.normal_roughness = nullptr;
     guide_pass.specular->Release();
@@ -323,7 +265,6 @@ inline bool EnsureGuideTextures(ID3D12Device* device, uint32_t width, uint32_t h
         &heap_desc, IID_PPV_ARGS(&guide_pass.heap));
     if (FAILED(heap_hr) || guide_pass.heap == nullptr) {
       guide_pass.heap = nullptr;
-      last_texture_hr.store(heap_hr);
       return false;
     }
     guide_pass.heap_increment = device->GetDescriptorHandleIncrementSize(
@@ -373,7 +314,6 @@ inline bool EnsureGuidePipeline(ID3D12Device* device) {
   if (error != nullptr) error->Release();
   if (FAILED(serialize) || signature == nullptr) {
     guide_pass.init_failed = true;
-    last_pipeline_hr.store(serialize);
     return false;
   }
   const HRESULT created = device->CreateRootSignature(
@@ -382,7 +322,6 @@ inline bool EnsureGuidePipeline(ID3D12Device* device) {
   signature->Release();
   if (FAILED(created) || guide_pass.root_signature == nullptr) {
     guide_pass.init_failed = true;
-    last_pipeline_hr.store(created);
     return false;
   }
 
@@ -394,10 +333,8 @@ inline bool EnsureGuidePipeline(ID3D12Device* device) {
       &pso_desc, IID_PPV_ARGS(&guide_pass.pso));
   if (FAILED(pso_created) || guide_pass.pso == nullptr) {
     guide_pass.init_failed = true;
-    last_pipeline_hr.store(pso_created);
     return false;
   }
-  nr_pipeline_ready.store(true);
   return true;
 }
 
@@ -429,10 +366,8 @@ inline ReadyGuides PrepareEvaluate(
     ID3D12Device* device, ID3D12GraphicsCommandList* cmd_list, uint32_t width,
     uint32_t height, const float world_to_view_rows[3][4]) {
   ReadyGuides ready{};
-  last_ready.store(false);
   if (!enabled.load() || device == nullptr || cmd_list == nullptr || width == 0
       || height == 0) {
-    SetStage(0, 0);
     return ready;
   }
 
@@ -440,32 +375,22 @@ inline ReadyGuides PrepareEvaluate(
   const uint64_t material = captured_material.handle.load();
   const uint64_t normal = captured_normal.handle.load();
   if (normal == 0 || albedo == 0) {
-    SetStage(1, 0);
     return ready;  // G-buffer targets not captured yet
   }
 
-  if (!EnsureGuideTextures(device, width, height)) {
-    SetStage(2, last_texture_hr.load());
-    return ready;
-  }
-  if (!EnsureGuidePipeline(device)) {
-    SetStage(3, last_pipeline_hr.load());
-    return ready;
-  }
-  SetStage(4, 0);
+  if (!EnsureGuideTextures(device, width, height)) return ready;
+  if (!EnsureGuidePipeline(device)) return ready;
 
   auto* gbuffer_albedo = reinterpret_cast<ID3D12Resource*>(albedo);
   auto* gbuffer_material = reinterpret_cast<ID3D12Resource*>(material);
   auto* gbuffer_normal = reinterpret_cast<ID3D12Resource*>(normal);
 
-  uint32_t flags = 0;
-  if (normals_view_space.load()) flags |= 1u;
-  const int32_t source = roughness_source.load();
-  if ((source == 0 || source == 1) && material != 0) {
-    flags |= 2u;
-    if (source == 1) flags |= 4u;
-  }
-  flags |= 16u;  // roughness = 1 - field/127 (writer fields are gloss-like)
+  // Fixed guide configuration: view-space normals (bit0) and material.z as the
+  // roughness field (bits1+2), with roughness = 1 - field/127 (bit4; the writer
+  // fields are gloss-like).
+  uint32_t flags = 1u;
+  if (material != 0) flags |= 2u | 4u;
+  flags |= 16u;
 
   const D3D12_RESOURCE_STATES srv_state = static_cast<D3D12_RESOURCE_STATES>(
       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
@@ -568,14 +493,12 @@ inline ReadyGuides PrepareEvaluate(
   guide_pass.specular_state = srv_state;
   guide_pass.albedo_linear_state = srv_state;
 
-  nr_dispatches.fetch_add(1);
   ready.real = true;
   ready.normal_roughness = guide_pass.normal_roughness;
   ready.albedo = guide_pass.albedo_linear;
   ready.albedo_format = static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT);
   ready.specular = guide_pass.specular;
   ready.specular_format = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
-  last_ready.store(true);
   return ready;
 }
 
@@ -593,57 +516,6 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::begin_render_pass>(OnBeginRenderPass);
       break;
   }
-}
-
-inline std::string StatusLine() {
-  std::stringstream s;
-  s << "RR guides: " << (enabled.load() ? "real" : "placeholder");
-  if (enabled.load()) {
-    s << (last_ready.load() ? " (active)" : " (waiting for G-buffer capture)");
-    s << " captures " << captures.load();
-  }
-  return s.str();
-}
-
-inline void AppendCaptured(std::stringstream& s, const char* name, const CapturedTexture& texture) {
-  char buffer[160] = {};
-  const uint64_t handle = texture.handle.load();
-  if (handle == 0) {
-    snprintf(buffer, sizeof buffer, "  %s: not captured\n", name);
-    s << buffer;
-    return;
-  }
-  snprintf(
-      buffer, sizeof buffer, "  %s: 0x%llX fmt=%u %ux%u (changes %u)\n", name,
-      static_cast<unsigned long long>(handle), texture.format.load(),
-      texture.width.load(), texture.height.load(), texture.changes.load());
-  s << buffer;
-}
-
-inline std::string BuildReportSection() {
-  std::stringstream s;
-  s << "\n[RT guides]\n";
-  s << "  setting: " << (enabled.load() ? "real (experimental)" : "placeholder") << "\n";
-  s << "  G-buffer signature seen: " << (signature_seen.load() ? "yes" : "no")
-    << " (captures " << captures.load() << ")\n";
-  AppendCaptured(s, "albedo  (rt4)", captured_albedo);
-  AppendCaptured(s, "material(rt2)", captured_material);
-  AppendCaptured(s, "normal  (rt3)", captured_normal);
-  s << "  guide pass: " << (nr_pipeline_ready.load() ? "ready" : "not ready");
-  if (guide_pass.width != 0) s << " (" << guide_pass.width << "x" << guide_pass.height << ")";
-  s << ", dispatches " << nr_dispatches.load() << "\n";
-  s << "  textures: NR=RGBA16F albedo=RGBA16F(linear) spec=RGBA8\n";
-  s << "  stage: " << StageName(last_stage.load());
-  if (last_hr.load() != 0) {
-    char buffer[48] = {};
-    snprintf(buffer, sizeof buffer, " (hr=0x%08lX)", static_cast<unsigned long>(last_hr.load()));
-    s << buffer;
-  }
-  s << "\n";
-  s << "  last evaluate: " << (last_ready.load() ? "real guides" : "placeholders") << "\n";
-  s << "  flags: view normals " << (normals_view_space.load() ? "on" : "off")
-    << ", roughness source " << roughness_source.load() << "\n";
-  return s.str();
 }
 
 }  // namespace guides
