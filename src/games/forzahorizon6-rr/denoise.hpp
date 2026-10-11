@@ -39,6 +39,7 @@ inline constexpr uint32_t kSpatialHash = 0x596D3E8F;       // spatial filter, me
 inline constexpr uint32_t kSpatialHighHash = 0x4DAF8A48;   // spatial filter, high RT tier
 inline constexpr uint32_t kBilateralHash = 0x0B33C6D8;     // 9-tap bilateral reconstruct, medium RT tier
 inline constexpr uint32_t kBilateralHighHash = 0x14FA42AB; // nearest reconstruct, high RT tier
+inline constexpr uint32_t kBilateralLowHash = 0xE08B5474;  // 3x3 bilateral reconstruct, low RT tier
 
 struct Replacement {
   uint32_t hash;
@@ -87,6 +88,7 @@ inline const std::span<const Replacement> kSpatialPayloads[] = {
 inline const Replacement kBilateralReplacements[] = {
     {kBilateralHash, __0x0B33C6D8},
     {kBilateralHighHash, __0x14FA42AB},
+    {kBilateralLowHash, __0xE08B5474},
 };
 
 // Payload selectors (declared before `bypasses`, which stores their address).
