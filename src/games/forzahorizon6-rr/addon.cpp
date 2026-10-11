@@ -28,22 +28,33 @@
 namespace {
 
 // The single user control. Enabling RR applies the runtime load, the SR->RR
-// redirect, the raw-signal resolve bypasses and the real guide buffers.
+// redirect and the raw-signal resolve bypasses (per stage, below).
 float rr_enable_setting = 1.f;
+
+// Per-stage resolve bypasses, exposed so the raw-signal set can be A/B-tested
+// in isolation. Defaults: spatial filter + 4-tap gather on, reconstruct OFF —
+// the reconstruct is a pure spatial upsample (no cross-frame state), not a
+// denoiser, so bypassing it only removes the required upsample.
+float rr_bypass_spatial_setting = 1.f;
+float rr_bypass_gather_setting = 1.f;
+float rr_bypass_reconstruct_setting = 0.f;
 
 // DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
 // current RR 4.5 default preset). Indices match the slider labels.
 constexpr uint32_t kRrPresetValues[6] = {1, 2, 3, 4, 5, 6};
 float rr_preset_setting = 5.f;  // index into kRrPresetValues; F by default
 
-// Applies the whole "RR on/off" bundle.
+// Applies the whole "RR on/off" bundle plus the per-stage bypass selection.
 void ApplyRrEnabled(bool enabled) {
   sl_rr::SetRuntimeLoad(enabled);
   sl_rr::SetRrRedirect(enabled);
-  denoise::SetEnabled(denoise::kGatherHash, enabled);
-  denoise::SetSpatialVariant(enabled ? 2 : 0);  // 2 = bypass both
-  denoise::SetEnabled(denoise::kBilateralHash, enabled);
   guides::enabled.store(enabled);
+  const bool spatial = enabled && rr_bypass_spatial_setting != 0.f;
+  const bool gather = enabled && rr_bypass_gather_setting != 0.f;
+  const bool reconstruct = enabled && rr_bypass_reconstruct_setting != 0.f;
+  denoise::SetSpatialVariant(spatial ? 2 : 0);  // 2 = bypass both
+  denoise::SetEnabled(denoise::kGatherHash, gather);
+  denoise::SetEnabled(denoise::kBilateralHash, reconstruct);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -61,6 +72,45 @@ renodx::utils::settings::Settings settings = {
                    " filter and bilateral reconstruct bypassed). Off = the"
                    " game's own DLSS SR and denoisers run unchanged.",
         .on_change_value = [](float, float value) { ApplyRrEnabled(value != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrBypassSpatial",
+        .binding = &rr_bypass_spatial_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Bypass spatial filter (0x596D3E8F / 0x4DAF8A48)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the spatial filter with the current-frame 3x3"
+                   " reconstruction (no history blend, world-cache blend or wave"
+                   " smoothing). Diagnostic A/B: off leaves the game's spatial"
+                   " filter intact. Applies live.",
+        .on_change_value = [](float, float value) { ApplyRrEnabled(rr_enable_setting != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrBypassGather",
+        .binding = &rr_bypass_gather_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Bypass 4-tap gather (0x209AB6A4)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Replaces the resolve-4tap stochastic reprojected gather with a"
+                   " per-pixel passthrough. Diagnostic A/B: off leaves the game's"
+                   " gather intact. Applies live.",
+        .on_change_value = [](float, float value) { ApplyRrEnabled(rr_enable_setting != 0.f); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrBypassReconstruct",
+        .binding = &rr_bypass_reconstruct_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bypass reconstruct (0x0B33C6D8 / 0xE08B5474 / 0x14FA42AB)",
+        .section = "Ray Reconstruction",
+        .tooltip = "Off (default): the game's own reconstruct upsample runs — it is"
+                   " a pure spatial upsample with no cross-frame state, not a"
+                   " denoiser. On: replaces it with a raw current-frame variant"
+                   " (diagnostic; introduces block artifacts at Medium/Low)."
+                   " Applies live.",
+        .on_change_value = [](float, float value) { ApplyRrEnabled(rr_enable_setting != 0.f); },
     },
     new renodx::utils::settings::Setting{
         .key = "RrPreset",
