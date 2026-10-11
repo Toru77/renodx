@@ -86,13 +86,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Enable DLSS Ray Reconstruction",
         .section = "Ray Reconstruction",
-        .tooltip = "Requests DLSS-RR at slInit (restart required for the plugin"
-                   " to load), auto-loads it at runtime, replaces the game's"
-                   " DLSS SR with RR and feeds RR the real G-buffer guides. On"
-                   " High RTGI the temporal and gather denoisers are bypassed so"
-                   " RR gets the raw ray signal; on Medium and Low the game's"
-                   " own resolve feeds RR instead. Off = the game's own DLSS SR"
-                   " and denoisers run unchanged.",
+        .tooltip = "Replaces the game's DLSS SR with RR.",
         .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
