@@ -6,18 +6,21 @@
  *
  * Requests DLSS Ray Reconstruction at slInit (restart required for the plugin
  * to load), loads it at runtime if needed, and replaces the game's DLSS SR with
- * DLSS-RR. RR receives the game's real G-buffer guides and the raw RT resolve
- * signal (the game's neighbourhood denoisers are bypassed). One switch drives
- * the whole feature; off leaves the game untouched.
+ * DLSS-RR. RR receives the game's real G-buffer guides. On High RTGI the game's
+ * temporal and gather denoisers are bypassed so RR gets the raw ray signal.
+ * RR requires High RTGI: without it the switch behaves as off. One switch
+ * drives the whole feature.
  */
 
 #define ImTextureID ImU64
 
+#include <atomic>
 #include <cstdio>
 
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
+#include "../../utils/bitwise.hpp"
 #include "../../utils/date.hpp"
 #include "../../utils/settings.hpp"
 
@@ -28,33 +31,48 @@
 namespace {
 
 // The single user control. Enabling RR applies the runtime load, the SR->RR
-// redirect and the raw-signal resolve bypasses (per stage, below).
+// redirect and the High-RTGI resolve bypasses, but only while High RTGI is
+// detected (below). The stored value is kept so RR resumes on its own when the
+// player switches RTGI back to High.
 float rr_enable_setting = 1.f;
 
-// Per-stage resolve bypasses, exposed so the raw-signal set can be A/B-tested
-// in isolation. Defaults: spatial filter + 4-tap gather on, reconstruct OFF —
-// the reconstruct is a pure spatial upsample (no cross-frame state), not a
-// denoiser, so bypassing it only removes the required upsample.
-float rr_bypass_spatial_setting = 1.f;
-float rr_bypass_gather_setting = 1.f;
-float rr_bypass_reconstruct_setting = 0.f;
+// DLSSD preset values for the D/E/F slider. Streamline marks A-C deprecated
+// and documents F onwards as "reverts to default", so only D (default
+// transformer), E (latest transformer) and F (RR 4.5 default) are offered.
+constexpr uint32_t kRrPresetValues[3] = {
+    static_cast<uint32_t>(sl::DLSSDPreset::ePresetD),
+    static_cast<uint32_t>(sl::DLSSDPreset::ePresetE),
+    static_cast<uint32_t>(sl::DLSSDPreset::ePresetF),
+};
+float rr_preset_setting = 2.f;  // index into kRrPresetValues; F by default
 
-// DLSSD preset values for the A..F slider (ePresetA..ePresetF; F is the
-// current RR 4.5 default preset). Indices match the slider labels.
-constexpr uint32_t kRrPresetValues[6] = {1, 2, 3, 4, 5, 6};
-float rr_preset_setting = 5.f;  // index into kRrPresetValues; F by default
+// High RTGI detection. The bind hook arms high_gi_bound whenever the game binds
+// the High-tier spatial filter; each present consumes it. Frame generation
+// presents frames the game never rendered, so a single miss must not drop RR:
+// detection only falls back after kHighGiMissLimit consecutive missed presents,
+// which still reacts quickly when the player leaves High RTGI.
+constexpr uint32_t kHighGiMissLimit = 8;
+std::atomic<bool> high_gi_bound{false};
+bool high_gi_active = false;
+uint32_t presents_without_high = 0;
+// Guards a silent detection failure: warns once High RTGI has been absent long.
+bool warned_no_high = false;
 
-// Applies the whole "RR on/off" bundle plus the per-stage bypass selection.
-void ApplyRrEnabled(bool enabled) {
-  sl_rr::SetRuntimeLoad(enabled);
-  sl_rr::SetRrRedirect(enabled);
-  guides::enabled.store(enabled);
-  const bool spatial = enabled && rr_bypass_spatial_setting != 0.f;
-  const bool gather = enabled && rr_bypass_gather_setting != 0.f;
-  const bool reconstruct = enabled && rr_bypass_reconstruct_setting != 0.f;
-  denoise::SetSpatialVariant(spatial ? 2 : 0);  // 2 = bypass both
-  denoise::SetEnabled(denoise::kGatherHash, gather);
-  denoise::SetEnabled(denoise::kBilateralHash, reconstruct);
+// RR is active only when the player asked for it and High RTGI is running.
+bool RrActive() {
+  return rr_enable_setting != 0.f && high_gi_active;
+}
+
+// Applies the whole "RR on/off" bundle. On High RTGI the spatial filter (world
+// cache, history and neighbourhood) and the gather (reprojection) are bypassed,
+// so RR receives the raw ray signal.
+void ApplyRrState() {
+  const bool active = RrActive();
+  sl_rr::SetRuntimeLoad(active);
+  sl_rr::SetRrRedirect(active);
+  guides::enabled.store(active);
+  denoise::SetEnabled(denoise::kSpatialHighHash, active);
+  denoise::SetEnabled(denoise::kGatherHash, active);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -67,69 +85,54 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .tooltip = "Requests DLSS-RR at slInit (restart required for the plugin"
                    " to load), auto-loads it at runtime, replaces the game's"
-                   " DLSS SR with RR, feeds RR the real G-buffer guides, and"
-                   " hands RR the raw resolve signal (4-tap gather, spatial"
-                   " filter and bilateral reconstruct bypassed). Off = the"
-                   " game's own DLSS SR and denoisers run unchanged.",
-        .on_change_value = [](float, float value) { ApplyRrEnabled(value != 0.f); },
+                   " DLSS SR with RR and feeds RR the real G-buffer guides. On"
+                   " High RTGI the temporal and gather denoisers are bypassed so"
+                   " RR gets the raw ray signal. Requires Ray Traced Global"
+                   " Illumination at High; without it the switch behaves as off."
+                   " Off = the game's own DLSS SR and denoisers run unchanged.",
+        .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
-        .key = "RrBypassSpatial",
-        .binding = &rr_bypass_spatial_setting,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
-        .label = "Bypass spatial filter (0x596D3E8F / 0x4DAF8A48)",
+        .key = "RrHighGiNotice",
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Turn on Ray Traced Global Illumination at High.",
         .section = "Ray Reconstruction",
-        .tooltip = "Replaces the spatial filter with the current-frame 3x3"
-                   " reconstruction (no history blend, world-cache blend or wave"
-                   " smoothing). Diagnostic A/B: off leaves the game's spatial"
-                   " filter intact. Applies live.",
-        .on_change_value = [](float, float value) { ApplyRrEnabled(rr_enable_setting != 0.f); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "RrBypassGather",
-        .binding = &rr_bypass_gather_setting,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 1.f,
-        .label = "Bypass 4-tap gather (0x209AB6A4)",
-        .section = "Ray Reconstruction",
-        .tooltip = "Replaces the resolve-4tap stochastic reprojected gather with a"
-                   " per-pixel passthrough. Diagnostic A/B: off leaves the game's"
-                   " gather intact. Applies live.",
-        .on_change_value = [](float, float value) { ApplyRrEnabled(rr_enable_setting != 0.f); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "RrBypassReconstruct",
-        .binding = &rr_bypass_reconstruct_setting,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
-        .label = "Bypass reconstruct (0x0B33C6D8 / 0xE08B5474 / 0x14FA42AB)",
-        .section = "Ray Reconstruction",
-        .tooltip = "Off (default): the game's own reconstruct upsample runs — it is"
-                   " a pure spatial upsample with no cross-frame state, not a"
-                   " denoiser. On: replaces it with a raw current-frame variant"
-                   " (diagnostic; introduces block artifacts at Medium/Low)."
-                   " Applies live.",
-        .on_change_value = [](float, float value) { ApplyRrEnabled(rr_enable_setting != 0.f); },
+        .tint = 0xE0484C,
+        .is_visible = [] { return !high_gi_active; },
     },
     new renodx::utils::settings::Setting{
         .key = "RrPreset",
         .binding = &rr_preset_setting,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 5.f,
+        .default_value = 2.f,
         .label = "RR preset",
         .section = "Ray Reconstruction",
-        .tooltip = "DLSS Ray Reconstruction render preset, applied to every mode. F is the"
-                   " current RR 4.5 default preset; D/E are the transformer models; A-C are"
-                   " NVIDIA-deprecated. Changes apply on the next frame.",
-        .labels = {"A", "B", "C", "D", "E", "F"},
+        .tooltip = "DLSS Ray Reconstruction render preset, applied to every mode. D is the"
+                   " default transformer model, E the latest transformer model, and F the"
+                   " current RR 4.5 default. Changes apply on the next frame.",
+        .labels = {"D", "E", "F"},
         .on_change_value = [](float, float value) {
           sl_rr::SetRrPreset(kRrPresetValues[static_cast<int>(value)]);
         },
     },
     new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BULLET,
+        .label = "Turn DLSS on",
+        .section = "Instructions",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BULLET,
+        .label = "Turn Ray Traced Global Illumination at High",
+        .section = "Instructions",
+    },
+    new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
         .label = std::string("Build: ") + renodx::utils::date::ISO_DATE_TIME,
+        .section = "About",
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Addon built by Toru",
         .section = "About",
     },
     new renodx::utils::settings::Setting{
@@ -141,7 +144,31 @@ renodx::utils::settings::Settings settings = {
           renodx::utils::platform::LaunchURL("https://discord.gg/", "Ce9bQHQrSV");
         },
     },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Patreon",
+        .section = "About",
+        .on_change = []() {
+          renodx::utils::platform::LaunchURL("https://www.patreon.com/c/Toru77");
+        },
+    },
 };
+
+// Arms High-RTGI detection when the game binds the High-tier spatial filter.
+// Only the flag is set here; RR state changes on the next present, outside the
+// command-recording thread.
+void OnBindPipeline(
+    reshade::api::command_list* cmd_list,
+    reshade::api::pipeline_stage stage,
+    reshade::api::pipeline pipeline) {
+  (void)cmd_list;
+  if (!renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::compute_shader)) return;
+  renodx::utils::shader::GetPipelineShaderDetails(pipeline, [](const auto& details) {
+    if (details.shader_hashes.count(denoise::kSpatialHighHash) != 0) {
+      high_gi_bound.store(true);
+    }
+  });
+}
 
 void OnPresent(
     reshade::api::command_queue* queue, reshade::api::swapchain* swapchain,
@@ -154,6 +181,26 @@ void OnPresent(
   (void)dirty_rect_count;
   (void)dirty_rects;
   sl_rr::Poll();
+  // The bind hook arms the flag during this frame's dispatches. A miss is only
+  // a frame-generation gap or a transition, so require a run of them before
+  // letting go of RR.
+  if (high_gi_bound.exchange(false)) {
+    presents_without_high = 0;
+    if (!high_gi_active) {
+      high_gi_active = true;
+      ApplyRrState();
+    }
+  } else if (++presents_without_high >= kHighGiMissLimit) {
+    if (high_gi_active) {
+      high_gi_active = false;
+      ApplyRrState();
+    }
+    if (!warned_no_high) {
+      warned_no_high = true;
+      sl_rr::LogWarn("no High-RTGI spatial pipeline bound; DLSS Ray"
+                     " Reconstruction stays inactive");
+    }
+  }
 }
 
 // Keep the addon loaded for the process lifetime so installed hooks cannot
@@ -182,6 +229,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       PinModule();
       sl_rr::InstallLoaderHooks();
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       // Required for the live RT-denoise bypass (denoise.hpp): Add/Remove
       // RuntimeReplacements only take effect on the async bind-time path.
       // Must be set before the first utils::shader::Use call below.
@@ -190,6 +238,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_DETACH:
       sl_rr::UninstallHooks();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       break;
   }
 
@@ -202,10 +251,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     // Request RR at slInit unconditionally: the restart-required part cannot
     // be toggled live, and the merged switch below covers the live parts.
     sl_rr::SetInitInjection(true);
-    ApplyRrEnabled(rr_enable_setting != 0.f);
+    // Nothing runs yet: RR waits for High RTGI to be detected at runtime.
+    ApplyRrState();
     int preset_index = static_cast<int>(rr_preset_setting);
     if (preset_index < 0) preset_index = 0;
-    if (preset_index > 5) preset_index = 5;
+    if (preset_index > 2) preset_index = 2;
     sl_rr::SetRrPreset(kRrPresetValues[preset_index]);
   }
   return TRUE;

@@ -20,10 +20,11 @@ The game loads Streamline's DLSS SR. This add-on:
    (albedo, packed normals, material roughness). A small compute pass builds the
    NormalRoughness/Albedo/SpecularAlbedo guides right before the evaluate; if
    capture is unavailable it falls back to constant placeholder guides.
-5. **Bypasses the game's resolve denoisers** so RR receives the raw signal: the
-   4-tap reprojected gather, the spatial filter and the bilateral reconstruct
-   are replaced with raw per-pixel variants (see `denoise.hpp` and the
-   `0x*.cs_6_6.hlsl` files).
+5. **Bypasses the game's resolve denoisers on High RTGI** so RR receives the raw
+   signal: the 4-tap reprojected gather and the spatial filter (world cache,
+   history and neighbourhood) are replaced with raw centre-sample variants (see
+   `denoise.hpp` and the `0x*.cs_6_6.hlsl` files). The High RTGI tier is detected
+   from the spatial filter the game binds; without it the switch behaves as off.
 
 All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 
@@ -31,8 +32,13 @@ All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 
 | Control | Effect |
 |---|---|
-| **Enable DLSS Ray Reconstruction** | The whole feature: runtime load, SR->RR redirect, real guides, and the raw-signal resolve bypasses. Off = the game runs its own DLSS SR and denoisers unchanged. |
-| **RR preset** (A-F) | DLSS-RR render preset applied to every DLSSD preset hint. `F` is the current RR 4.5 default; `D`/`E` are the transformer models. |
+| **Enable DLSS Ray Reconstruction** | The whole feature: runtime load, SR->RR redirect, real guides, and the High-RTGI resolve bypasses. Requires Ray Traced Global Illumination at High; without it the switch behaves as off and a red notice is shown. Off = the game runs its own DLSS SR and denoisers unchanged. |
+| **RR preset** (D-F) | DLSS-RR render preset applied to every DLSSD preset hint. `D` is the default transformer model, `E` the latest transformer model, `F` the current RR 4.5 default. |
+
+## Instructions
+
+1. Turn DLSS on.
+2. Turn Ray Traced Global Illumination at High.
 
 ## Files
 
@@ -41,8 +47,9 @@ All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
   resources, the DLSS option capture.
 - `guides.hpp` + `fh6_guide_nr.cs_6_6.hlsl` - real RR guide buffers from the
   game's G-buffer.
-- `denoise.hpp` + `0x*.cs_6_6.hlsl` + `resolve_spatial_raw.hlsli` - live
-  per-pipeline replacement of the RT resolve/denoise stages.
+- `denoise.hpp` + `0x209AB6A4.cs_6_6.hlsl` + `0x4DAF8A48_both.cs_6_6.hlsl` +
+  `resolve_spatial_raw.hlsli` - live per-pipeline replacement of the High-RTGI
+  resolve/denoise stages.
 
 ## Requirements
 
@@ -61,9 +68,11 @@ next to the ReShade DLL.
 
 ## Verify
 
-In gameplay with RR enabled:
+In gameplay with DLSS on and Ray Traced Global Illumination at High:
 
 - The overlay shows **Enable DLSS Ray Reconstruction** on and the RR preset.
+- The red "Turn on Ray Traced Global Illumination at High." notice is gone.
 - The image is denoised by RR (compare against the switch off - the game's own
   DLSS SR).
+- Switching RTGI to Medium or Low brings the red notice back and stops RR.
 - `ReShade.log` shows `sl-rr: Streamline entry points hooked`.

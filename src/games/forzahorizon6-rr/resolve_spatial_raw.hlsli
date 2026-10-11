@@ -9,14 +9,11 @@
 // from the current frame's radiance samples only; the meta counter writes 1.
 //
 // Two compile variants share this body:
-//   - raw (default, FH6_SPATIAL_BOTH = 0): the current-frame 3x3
-//     reconstruction - the "bypass temporal only" option.
-//   - centre-only (FH6_SPATIAL_BOTH = 1): the 3x3 reconstruction is skipped and
-//     each pixel resolves from its own sample alone - the "bypass both" option
-//     (no spatial neighbourhood and no cross-frame state).
-//
-// The "bypass spatial only" option keeps the cross-frame state and is a
-// separate decompiled replacement (0x596D3E8F_spatial / 0x4DAF8A48_spatial).
+//   - raw (FH6_SPATIAL_BOTH = 0): the current-frame 3x3 reconstruction. No
+//     wrapper uses it at present.
+//   - centre-only (FH6_SPATIAL_BOTH = 1, used by 0x596D3E8F_both and
+//     0x4DAF8A48_both): each pixel resolves from its own sample alone, with no
+//     spatial neighbourhood and no cross-frame state.
 
 #ifndef FH6_SPATIAL_BOTH
 #define FH6_SPATIAL_BOTH 0

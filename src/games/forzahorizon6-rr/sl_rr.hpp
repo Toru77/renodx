@@ -9,7 +9,7 @@
  * DLSS-RR. The DLSS options are mirrored from the game's own slDLSSSetOptions
  * capture, so the in-game settings keep controlling internal resolution. RR
  * receives the game's real G-buffer guides (guides.hpp) plus the raw resolve
- * signal (the game's neighbourhood denoisers are bypassed in denoise.hpp).
+ * signal (on High RTGI the game's denoisers are bypassed in denoise.hpp).
  * Any failure for a frame falls back to the untouched SR call.
  */
 
@@ -142,8 +142,8 @@ inline std::atomic<bool> rr_init_injection_enabled{true};
 inline std::atomic<bool> rr_runtime_load_enabled{true};
 inline std::atomic<bool> rr_redirect_enabled{true};
 
-// User-selected DLSSD preset applied to every mode (A..F; F is the current
-// RR 4.5 default preset, D/E are the transformer models).
+// User-selected DLSSD preset applied to every mode (D/E/F; D is the default
+// transformer model, E the latest, F reverts to the RR 4.5 default).
 inline std::atomic<uint32_t> rr_preset_override{
     static_cast<uint32_t>(sl::DLSSDPreset::ePresetF)};
 
