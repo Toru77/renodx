@@ -45,6 +45,9 @@ constexpr uint32_t kRrPresetValues[3] = {
 };
 float rr_preset_setting = 2.f;  // index into kRrPresetValues; F by default
 
+// Diagnostic logging for the RR and guide paths; off by default.
+float rr_debug_log_setting = 0.f;
+
 // High RTGI detection. The bind hook arms high_gi_bound whenever the game binds
 // the High-tier spatial filter; each present consumes it. Frame generation
 // presents frames the game never rendered, so a single miss must not drop RR:
@@ -70,6 +73,17 @@ bool RrActive() {
 // feeds RR and the bypasses stay off.
 void ApplyRrState() {
   const bool active = RrActive();
+  if (guides::DiagGuidesEnabled()) {
+    guides::LogEvent(
+        "RR state -> " + std::string(active ? "ON" : "OFF") + " (high GI "
+        + std::string(high_gi_active ? "detected" : "absent") + ", bypasses "
+        + std::string((active && high_gi_active) ? "ON" : "OFF") + ")");
+  }
+  // A latched failure parks RR until the game restarts. It is deliberately NOT
+  // cleared by the toggle: the reporter's log shows the latch holding for two
+  // minutes of clean play, then dying the instant an off>on toggle re-armed RR
+  // into the evaluate that had just thrown. Retrying must be a restart, which
+  // re-creates the Streamline state the failure came from.
   sl_rr::SetRuntimeLoad(active);
   sl_rr::SetRrRedirect(active);
   guides::enabled.store(active);
@@ -96,6 +110,58 @@ renodx::utils::settings::Settings settings = {
         .section = "Ray Reconstruction",
         .tint = 0xE0484C,
         .is_visible = [] { return !high_gi_active; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrVramNotice",
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Ray Reconstruction is rendering, but DLSS is over the VRAM"
+                 " budget. Expect stutter. Turning Frame Generation off frees the"
+                 " most VRAM.",
+        .section = "Ray Reconstruction",
+        .tint = 0xE0484C,
+        .is_visible = [] { return sl_rr::GetVramWarned(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrOldDllNotice",
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Ray Reconstruction could not start because the DLSS library"
+                 " next to the game is out of date. Update DLSS or your GPU"
+                 " driver so nvngx_dlssd.dll is current, then restart the game."
+                 " See ReShade.log for the version found.",
+        .section = "Ray Reconstruction",
+        .tint = 0xE0484C,
+        .is_visible = [] {
+          return sl_rr::GetRrTrip()
+              && sl_rr::GetRrTripResult()
+                     == static_cast<uint32_t>(sl::Result::eErrorExceptionHandler);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrTrippedNotice",
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Ray Reconstruction stopped for this session after a failed"
+                 " evaluate. DLSS SR is running normally. Restart the game to"
+                 " retry.",
+        .section = "Ray Reconstruction",
+        .tint = 0xE0484C,
+        .is_visible = [] { return sl_rr::GetRrTrip(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrDebugLog",
+        .binding = &rr_debug_log_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Debug logging",
+        .section = "Debug",
+        .tooltip = "Enables debug logging for sending bug reports: one line per distinct"
+                   " outcome in ReShade.log (capture gates, guide HRESULTs, RR state,"
+                   " redirect fallbacks). Also raises Streamline's verbosity and routes"
+                   " its own log plus DLSS-RR's internal text into ReShade.log, which"
+                   " is the only place that output exists at all. Both parts only"
+                   " apply if this is on before the game starts, so restart the game"
+                   " after turning it on. Expect a large log; turn it off and restart"
+                   " for normal play.",
+        .on_change_value = [](float, float value) { guides::SetDiagnostics(value != 0.f); },
     },
     new renodx::utils::settings::Setting{
         .key = "RrPreset",
@@ -185,11 +251,17 @@ void OnPresent(
     presents_without_high = 0;
     if (!high_gi_active) {
       high_gi_active = true;
+      if (guides::DiagGuidesEnabled()) {
+        guides::LogEvent("High-RTGI spatial filter 0x4DAF8A48 detected");
+      }
       ApplyRrState();
     }
   } else if (++presents_without_high >= kHighGiMissLimit) {
     if (high_gi_active) {
       high_gi_active = false;
+      if (guides::DiagGuidesEnabled()) {
+        guides::LogEvent("High-RTGI no longer bound; bypasses released");
+      }
       ApplyRrState();
     }
     if (!warned_no_high) {
@@ -250,6 +322,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     sl_rr::SetInitInjection(true);
     // RR loads immediately; the resolve bypasses wait for High RTGI detection.
     ApplyRrState();
+    // Apply the saved debug-logging state; on_change_value only fires on edits.
+    guides::SetDiagnostics(rr_debug_log_setting != 0.f);
     int preset_index = static_cast<int>(rr_preset_setting);
     if (preset_index < 0) preset_index = 0;
     if (preset_index > 2) preset_index = 2;

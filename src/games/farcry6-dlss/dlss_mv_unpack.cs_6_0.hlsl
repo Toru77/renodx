@@ -13,6 +13,12 @@
 // writes standard pixel-unit motion vectors (RG16F) for DLSS:
 //   mv_px = decode(t0) * 0.1 * resolution * scale.
 //
+// The game renders its motion vectors at HALF the input resolution (640x360
+// for a 1280x720 input), so the packed buffer has to be indexed at its own
+// resolution. A Load() at input-resolution coordinates runs off the end of the
+// texture, D3D returns 0 there, and decode(0) decodes to roughly -0.99 - a
+// ~-126px motion vector across three quarters of the frame.
+//
 // Sign convention matches NGX: offset from the current pixel to the previous
 // frame position (the game adds it to the current UV to fetch history).
 //
@@ -24,11 +30,15 @@ Texture2D<float2> t_packed_mv : register(t0);
 RWTexture2D<float2> u_out_mv : register(u0);
 
 cbuffer UnpackParams : register(b0) {
-  float g_width;   // input width in pixels
-  float g_height;  // input height in pixels
-  float g_scale;   // calibration multiplier (1.0 = nominal)
+  float g_width;      // DLSS input size in pixels: MV scale and output size
+  float g_height;
+  float g_scale;      // calibration multiplier (1.0 = nominal)
   float g_unused;
-}
+  float g_src_width;  // packed MV buffer size (half the input resolution)
+  float g_src_height;
+  float g_pad0;
+  float g_pad1;
+};
 
 float DecodeChannel(float v) {
   float m = v - 0.49803921580314636f;
@@ -48,8 +58,14 @@ float DecodeChannel(float v) {
 
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
-  if (dispatch_id.x >= (uint)g_width || dispatch_id.y >= (uint)g_height) return;
-  float2 packed = t_packed_mv.Load(int3(int2(dispatch_id.xy), 0));
+  const int2 dst = int2(dispatch_id.xy);
+  if (dst.x >= (int)g_width || dst.y >= (int)g_height) return;
+
+  const int2 out_dim = max(int2(1, 1), int2(int(g_width), int(g_height)));
+  const int2 src_dim = max(int2(1, 1), int2(int(g_src_width), int(g_src_height)));
+  const int2 src = min(dst * src_dim / out_dim, src_dim - 1);
+
+  float2 packed = t_packed_mv.Load(int3(src, 0));
   float2 decoded = float2(DecodeChannel(packed.x), DecodeChannel(packed.y));
-  u_out_mv[dispatch_id.xy] = decoded * 0.1f * float2(g_width, g_height) * g_scale;
+  u_out_mv[dst] = decoded * 0.1f * float2(g_width, g_height) * g_scale;
 }

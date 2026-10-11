@@ -23,13 +23,19 @@
  *   b0 c011     — TAA blend knobs. The full b0 range is also scanned for a
  *                 per-frame varying small-magnitude float pair to recover the
  *                 game's render jitter for NGX (falls back to zero).
+ *
+ * Input resolution: the engine assembles its per-frame descriptor tables with
+ * CopyDescriptors, so the descriptors a TAA draw binds are never written by
+ * an update event. We therefore mirror the contents of the heaps the TAA
+ * tables live in (both update and copy write paths) and read the descriptor at
+ * the bound index at draw time — the same read DevKit's resolver does.
  */
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -49,6 +55,7 @@
 #include <wrl/client.h>
 
 #include "../../utils/bitwise.hpp"
+#include "../../utils/build_info.hpp"
 #include "../../utils/pipeline_layout.hpp"
 #include "../../utils/resource.hpp"
 #include "../../utils/shader.hpp"
@@ -260,39 +267,31 @@ inline const char* FailCodeText(int code) {
 inline std::atomic<uint64_t> stat_taa_draws{0};
 inline std::atomic<uint64_t> stat_dlss_ok{0};
 inline std::atomic<int> stat_fail_code{kFailNone};
-inline std::atomic<int> stat_resolve_fail_streak{0};
-inline std::atomic<bool> resolved_once{false};
-inline std::atomic<int> full_capture_frames{0};
-inline std::atomic<uint64_t> stat_presents{0};
-inline std::atomic<uint64_t> last_arm_present{0};
-static constexpr uint64_t kRearmCooldownPresents = 600u;
 
 inline void NoteFail(int code) { stat_fail_code.store(code); }
 inline void NoteSuccess() {
   ++stat_dlss_ok;
-  stat_resolve_fail_streak.store(0);
   stat_fail_code.store(kFailNone);
-  // First success switches the journal from attach-time record-all to
-  // targeted (learned-table) recording. Boot entries are KEPT (heap writes
-  // may be one-time); the interest gate only limits what gets added.
-  resolved_once.store(true);
 }
 
-// ── Scoped TAA descriptor capture ──
-// The game binds TAA inputs through descriptor tables. Instead of the global
-// descriptor-table mirror (known FPS killer), we enumerate every layout
-// (table, binding) candidate for each slot of interest at TAA draws and copy
-// ONLY overlapping updates. Layout ranges carry no descriptor types, so
-// b0/t0-style (register 0, space 0) collisions are disambiguated by the
-// recorded update type. Push-bound slots need no capture at all.
+// ── Scoped TAA descriptor mirror ──
+// The engine assembles its per-frame descriptor tables with CopyDescriptors:
+// measured over minutes of gameplay, update_descriptor_tables traffic froze at
+// ~24k writes while the TAA views stayed bound and swapped slots every frame.
+// Reconstructing that traffic cost 117M copy events and ~930k mirrored
+// descriptors per session and still left the SRV slots empty, because a
+// partial mirror cannot follow the copy chain. So we do not mirror at all: a
+// descriptor heap bound to a root descriptor table is shader-visible, which
+// means its CPU-side memory holds exactly the bytes the GPU reads. We read the
+// descriptor the draw binds, directly, once per TAA draw. No write-event
+// subscription, no state to keep in sync, no cost when nothing is drawn.
 static constexpr uint32_t kLearnedSlots = 5u;  // b0, t0, t2, t5, t6
 static constexpr uint32_t kMaxCandidates = 3u;
 // Last-TAA-draw per-slot resolve results, for the Status readout only.
-// 0=miss, 1=real journal/push entry, 2=fallback dummy. Written by the
+// 0=miss, 1=real descriptor read, 2=fallback dummy. Written by the
 // resolvers / EvaluateDLSS, read by the overlay.
 inline std::atomic<int> slot_hit[kLearnedSlots];
 inline bool logged_fallback = false;
-static constexpr uint32_t kMaxInterestTables = 32u;
 
 inline uint32_t LearnIndexForSlot(uint32_t slot, bool is_cbv) {
   if (is_cbv) return (slot == 0u) ? 0u : UINT32_MAX;
@@ -305,95 +304,77 @@ inline uint32_t LearnIndexForSlot(uint32_t slot, bool is_cbv) {
   }
 }
 
-struct LearnedCandidates {
-  uint64_t heaps[kMaxCandidates] = {};
-  uint32_t offsets[kMaxCandidates] = {};
-  uint32_t count = 0u;
-  bool is_push = false;
-};
-inline LearnedCandidates learned[kLearnedSlots];
-// Lock-free interest set for the update/copy hooks (rebuilt after each
-// learn): decomposed (heap, offset) pairs so range overlap is O(interest)
-// with zero hashing on the hot path.
-inline std::atomic<uint64_t> interest_heaps[kMaxInterestTables];
-inline std::atomic<uint32_t> interest_offs[kMaxInterestTables];
-inline std::atomic<uint32_t> interest_count{0u};
+// GPU virtual address -> resource, so a descriptor's Location/BufferLocation
+// can be turned back into the resource it points at. Fed by init_resource /
+// destroy_resource: rare events, so the cost is irrelevant next to what the
+// descriptor copy firehose used to cost.
+inline std::mutex resource_address_mutex;
+inline std::unordered_map<uint64_t, reshade::api::resource> resources_by_address;
+inline std::atomic<uint64_t> stat_resources{0};
 
-// Raw-handle -> (heap, base-offset) cache (declared early: ClearCapture
-// below resets it). See RawCacheLookup for the consistency protocol.
-static constexpr uint32_t kRawCacheSize = 128u;
-inline std::atomic<uint64_t> raw_cache_raw[kRawCacheSize];
-inline std::atomic<uint64_t> raw_cache_heap[kRawCacheSize];
-inline std::atomic<uint32_t> raw_cache_base[kRawCacheSize];
+inline void OnInitResource(
+    reshade::api::device* device,
+    const reshade::api::resource_desc&,
+    const reshade::api::subresource_data*,
+    reshade::api::resource_usage,
+    reshade::api::resource resource) {
+  if (device == nullptr || resource.handle == 0u) return;
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
+  const uint64_t address = reinterpret_cast<ID3D12Resource*>(resource.handle)->GetGPUVirtualAddress();
+  if (address == 0u) return;
+  const std::lock_guard<std::mutex> lock(resource_address_mutex);
+  if (resources_by_address.emplace(address, resource).second) {
+    stat_resources.store(resources_by_address.size());
+  }
+}
 
-struct RecordedDesc {
-  reshade::api::descriptor_type type = static_cast<reshade::api::descriptor_type>(0);
-  bool has_type = false;
-  reshade::api::resource_view view = {};
-  reshade::api::buffer_range cbv = {};
-  bool has_view = false;
-  bool has_cbv = false;
+inline void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
+  if (device == nullptr || resource.handle == 0u) return;
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
+  const uint64_t address = reinterpret_cast<ID3D12Resource*>(resource.handle)->GetGPUVirtualAddress();
+  if (address == 0u) return;
+  const std::lock_guard<std::mutex> lock(resource_address_mutex);
+  if (resources_by_address.erase(address) > 0u) {
+    stat_resources.store(resources_by_address.size());
+  }
+}
+
+inline reshade::api::resource ResourceFromAddress(uint64_t address) {
+  if (address == 0u) return {};
+  const std::lock_guard<std::mutex> lock(resource_address_mutex);
+  const auto it = resources_by_address.find(address);
+  return it != resources_by_address.end() ? it->second : reshade::api::resource{};
+}
+// Last deployment snapshot, written by the deploy path and read by the Status
+// readout and the Copy Report. Guarded so the overlay never sees a torn frame.
+struct DeployReport {
+  uint32_t input_width = 0u;
+  uint32_t input_height = 0u;
+  uint32_t target_width = 0u;
+  uint32_t target_height = 0u;
+  uint32_t mv_width = 0u;
+  uint32_t mv_height = 0u;
+  uint32_t depth_width = 0u;
+  uint32_t depth_height = 0u;
+  int quality = -1;
+  int preset = -1;
+  int flags = 0;
+  float jitter_x = 0.f;
+  float jitter_y = 0.f;
+  uint64_t evals = 0u;
+  uint64_t resets = 0u;
+  bool used_mv_dummy = false;
+  bool used_depth_dummy = false;
 };
-// Attach-time descriptor journal. Records from process attach (so boot-time
-// heap writes are captured), pre-reserved and hard-capped: no ReShade calls,
-// no vector resizes, tiny mutex critical sections on the hot path. After the
-// first successful TAA resolve the journal is cleared and only targeted
-// (learned-table) updates are recorded.
-static constexpr size_t kSeenReserve = 262144u;
-static constexpr size_t kSeenCap = 262144u;
-inline std::mutex capture_mutex;
-inline std::unordered_map<uint64_t, RecordedDesc> seen;
-inline bool seen_reserved = false;
-inline std::atomic<size_t> seen_count{0};
-inline bool logged_seen_cap = false;
-// Native device owning the journaled heaps (0 = unset). Set on first insert;
-// a *different* native at init time means fresh heap objects, so the journal
-// is wiped. Same-native re-init (wrapper churn) keeps it.
-inline std::atomic<uint64_t> capture_device_native{0};
-inline std::atomic<uint64_t> last_evict_present{0};
-// Last input/output native handles: any change forces an NGX history reset
-// (kills history poisoning when heap slots recycle across resources).
-inline uint64_t last_in_color = 0u;
-inline uint64_t last_in_mv = 0u;
-inline uint64_t last_in_depth = 0u;
-inline uint64_t last_in_output = 0u;
+inline std::mutex report_mutex;
+inline DeployReport deploy_report;
+// Packed input/output dimensions; a change is the only thing that legitimately
+// invalidates DLSS history now that slots are read rather than reconstructed.
+inline uint64_t last_dims = 0u;
 inline bool logged_size_guard = false;
 
 // Known NVIDIA device natives for lock-free draw gating (≤4 devices).
 inline std::atomic<uint64_t> nvidia_devs[4];
-
-// Every device ReShade initializes (any vendor), for fail-open journal
-// filtering. Heap handles are native-unique, so foreign heaps can never
-// collide with TAA keys — while a strict NVIDIA-only filter here would
-// silently discard writes on any unexpected wrapper (total blindness). Draws
-// themselves stay strictly NVIDIA-gated.
-inline std::atomic<uint64_t> seen_devs[8];
-
-inline void NoteSeenDevice(uint64_t native) {
-  if (native == 0u) return;
-  for (uint32_t i = 0u; i < 8u; ++i) {
-    if (seen_devs[i].load() == native) return;
-  }
-  for (uint32_t i = 0u; i < 8u; ++i) {
-    uint64_t empty = 0u;
-    if (seen_devs[i].compare_exchange_strong(empty, native)) return;
-  }
-}
-
-inline void ForgetSeenDevice(uint64_t native) {
-  if (native == 0u) return;
-  for (uint32_t i = 0u; i < 8u; ++i) {
-    if (seen_devs[i].load() == native) seen_devs[i].store(0u);
-  }
-}
-
-inline bool IsSeenDevice(uint64_t native) {
-  if (native == 0u) return false;
-  for (uint32_t i = 0u; i < 8u; ++i) {
-    if (seen_devs[i].load() == native) return true;
-  }
-  return false;
-}
 
 inline bool IsKnownNvidiaNative(uint64_t native) {
   if (native == 0u) return false;
@@ -418,30 +399,16 @@ inline void RemoveNvidiaNative(uint64_t native) {
   }
 }
 
-inline void ClearCapture() {
-  for (auto& l : learned) l = {};
-  for (uint32_t i = 0u; i < kMaxInterestTables; ++i) {
-    interest_heaps[i].store(0u);
-    interest_offs[i].store(0u);
-  }
-  interest_count.store(0u);
-  seen.clear();
-  seen_reserved = false;
-  capture_device_native.store(0u);
-  for (uint32_t i = 0u; i < kRawCacheSize; ++i) raw_cache_raw[i].store(0u);
-  full_capture_frames.store(0);
-  resolved_once.store(false);
-}
-
-inline uint64_t HeapKey(uint64_t heap, uint32_t offset) {
-  return heap ^ (static_cast<uint64_t>(offset) * 0x9E3779B97F4A7C15ull);
-}
-
 // Canonicalizes a (table, binding) pair to the backing (heap, offset).
 // Required because ReShade reports native view-creation writes as
 // {0xF000..|CPUptr}/binding 0 while binds use raw GPU handles: the two forms
 // only meet in (heap, offset) space (see get_descriptor_heap_offset, which
 // handles both). Returns false for unbound/unknown tables (skip gracefully).
+// No memoization on purpose: the engine uses tens of thousands of distinct
+// descriptor handles per frame, so any handle-keyed cache thrashes and turns
+// every miss into a locked ReShade query — that cost is what regressed FPS in
+// an earlier build. For the CPU-form handles D3D12 always hands us here the
+// query is a lock-free decode.
 inline bool CanonicalBinding(
     reshade::api::device* device,
     reshade::api::descriptor_table table,
@@ -460,81 +427,89 @@ inline bool CanonicalBinding(
   return true;
 }
 
-// Raw-handle -> (heap, base-offset) cache. Steady-state updates hit here
-// with a few atomic loads and zero ReShade calls; a miss costs exactly one
-// canonical query and then populates the slot. Slots are validated by raw
-// match (hash collisions overwrite and self-heal via re-query). The writer
-// zeroes raw first so torn triples can only read as misses, never corrupt.
-inline uint32_t RawSlot(uint64_t raw) {
-  uint64_t h = raw ^ (raw >> 33);
-  h *= 0x9E3779B97F4A7C15ull;
-  return static_cast<uint32_t>((h ^ (h >> 29)) % kRawCacheSize);
-}
+// Releases the unpack input views. Declared here because device teardown runs
+// before the cache's own definition further down.
+inline void ReleaseViewCache(reshade::api::device* device);
 
-inline bool RawCacheLookup(uint64_t raw, uint64_t& heap, uint32_t& base) {
-  if (raw == 0u) return false;
-  const uint32_t i = RawSlot(raw);
-  const uint64_t r1 = raw_cache_raw[i].load();
-  if (r1 != raw) return false;
-  heap = raw_cache_heap[i].load();
-  base = raw_cache_base[i].load();
-  return raw_cache_raw[i].load() == r1 && heap != 0u;
-}
+// Reads the descriptor a draw actually binds, straight out of heap memory.
+// Returns the resource it points at plus, for constant buffers, the byte range
+// inside it. Layout ranges carry no descriptor types, so the caller says which
+// shape it expects (b0 is a CBV, t0/t2/t5/t6 are SRVs) and a mismatched slot
+// simply fails to validate.
+struct BoundDescriptor {
+  reshade::api::resource resource = {};
+  uint64_t buffer_offset = 0u;
+  uint32_t buffer_size = 0u;
+  uint32_t format = 0u;
+};
 
-inline void RawCacheStore(uint64_t raw, uint64_t heap, uint32_t base) {
-  if (raw == 0u || heap == 0u) return;
-  const uint32_t i = RawSlot(raw);
-  raw_cache_raw[i].store(0u);
-  raw_cache_heap[i].store(heap);
-  raw_cache_base[i].store(base);
-  raw_cache_raw[i].store(raw);
-}
-
-// Cached canonicalization: hot path is lock-free and call-free.
-inline bool CanonicalBindingCached(
+inline bool ReadBoundDescriptor(
     reshade::api::device* device,
     reshade::api::descriptor_table table,
     uint32_t binding,
-    uint64_t& heap,
-    uint32_t& offset) {
-  heap = 0u;
-  offset = 0u;
-  if (table.handle == 0u) return false;
-  uint64_t h = 0u;
-  uint32_t b = 0u;
-  if (RawCacheLookup(table.handle, h, b)) {
-    heap = h;
-    offset = b + binding;
+    bool expect_buffer_range,
+    BoundDescriptor& out) {
+  out = {};
+  if (device == nullptr || table.handle == 0u) return false;
+  if (device->get_api() != reshade::api::device_api::d3d12) return false;
+
+  uint32_t offset = 0u;
+  uint64_t heap = 0u;
+  if (!CanonicalBinding(device, table, binding, heap, offset)) return false;
+  auto* native_heap = reinterpret_cast<ID3D12DescriptorHeap*>(heap);
+  auto* native_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+  if (native_heap == nullptr || native_device == nullptr) return false;
+
+  // A heap bound to a root descriptor table must be shader-visible, and only
+  // shader-visible heaps have CPU-addressable memory. Anything else means the
+  // assumption is wrong for this heap: refuse rather than read wild memory.
+  const D3D12_DESCRIPTOR_HEAP_DESC heap_desc = native_heap->GetDesc();
+  if ((heap_desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) return false;
+  if (heap_desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) return false;
+  if (offset >= heap_desc.NumDescriptors) return false;
+
+  const D3D12_CPU_DESCRIPTOR_HANDLE base = native_heap->GetCPUDescriptorHandleForHeapStart();
+  if (base.ptr == 0) return false;
+  // The driver may pad descriptors past sizeof(D3D12_SRV); the increment is
+  // authoritative, never the struct size.
+  const UINT stride = native_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  if (stride < sizeof(D3D12_CONSTANT_BUFFER_VIEW_DESC)
+      || stride < sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
+    return false;
+  }
+  const auto* slot = reinterpret_cast<const uint8_t*>(base.ptr) + static_cast<size_t>(offset) * stride;
+
+  if (expect_buffer_range) {
+    const auto* cbv = reinterpret_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(slot);
+    if (cbv->SizeInBytes == 0u || cbv->BufferLocation == 0u) return false;
+    const reshade::api::resource buffer = ResourceFromAddress(cbv->BufferLocation);
+    if (buffer.handle == 0u) return false;
+    // BufferLocation points inside the buffer for a ranged view.
+    const uint64_t buffer_base =
+        reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress();
+    if (cbv->BufferLocation < buffer_base) return false;
+    out.resource = buffer;
+    out.buffer_offset = cbv->BufferLocation - buffer_base;
+    out.buffer_size = cbv->SizeInBytes;
     return true;
   }
-  if (!CanonicalBinding(device, table, 0u, h, b)) return false;
-  RawCacheStore(table.handle, h, b);
-  heap = h;
-  offset = b + binding;
-  return true;
-}
 
-inline void RebuildInterest() {
-  uint32_t n = 0u;
-  for (uint32_t i = 0u; i < kLearnedSlots && n < kMaxInterestTables; ++i) {
-    for (uint32_t k = 0u; k < learned[i].count && n < kMaxInterestTables; ++k) {
-      const uint64_t h = learned[i].heaps[k];
-      const uint32_t o = learned[i].offsets[k];
-      if (h == 0u) continue;
-      bool dup = false;
-      for (uint32_t j = 0u; j < n; ++j) {
-        if (interest_heaps[j].load() == h && interest_offs[j].load() == o) {
-          dup = true;
-          break;
-        }
-      }
-      if (dup) continue;
-      interest_heaps[n].store(h);
-      interest_offs[n].store(o);
-      ++n;
-    }
+  const auto* srv = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(slot);
+  // A null descriptor is all zeroes. Format and dimension reject a constant
+  // buffer slot read as an SRV. The first eight bytes of any SRV descriptor
+  // are the resource's GPU virtual address for every view dimension (the SDK
+  // structs model it as D3D12_BUFFER_SRV::FirstElement), so read it as the
+  // raw address rather than through a union member.
+  const uint64_t location = *reinterpret_cast<const uint64_t*>(slot);
+  if (location == 0u || srv->Format == 0u
+      || srv->ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) {
+    return false;
   }
-  interest_count.store(n);
+  const reshade::api::resource resource = ResourceFromAddress(location);
+  if (resource.handle == 0u) return false;
+  out.resource = resource;
+  out.format = srv->Format;
+  return true;
 }
 
 inline bool logged_taa_draw_detected = false;
@@ -542,7 +517,6 @@ inline bool logged_missing_constants = false;
 inline bool logged_missing_resources = false;
 inline bool logged_unsupported_output = false;
 inline bool logged_b0_map_failed = false;
-inline std::chrono::steady_clock::time_point last_present_time{};
 
 inline CommandListData* Get(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return nullptr;
@@ -653,7 +627,12 @@ inline void ReleaseNgx() {
   ngx.supported = false;
   ngx.init_failed = false;
   jitter_state = {};
-  stat_resolve_fail_streak.store(0);
+  if (unpack_device != nullptr) ReleaseViewCache(unpack_device);
+  {
+    const std::lock_guard<std::mutex> lock(resource_address_mutex);
+    resources_by_address.clear();
+    stat_resources.store(0);
+  }
   logged_taa_draw_detected = false;
   logged_missing_constants = false;
   logged_missing_resources = false;
@@ -931,7 +910,7 @@ inline bool EnsureUnpackLayout(reshade::api::device* device) {
   pc_range.binding = 0;
   pc_range.dx_register_index = 0;
   pc_range.dx_register_space = 0;
-  pc_range.count = 4;  // float4: width, height, mv_scale, unused
+  pc_range.count = 8;  // float4 + float4: output size, scale, source size
   pc_range.visibility = DS::all_compute;
 
   P params[3];
@@ -1019,9 +998,13 @@ inline bool DispatchUnpack(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
     reshade::api::resource_view packed_mv_srv,
-    uint32_t width, uint32_t height) {
+    uint32_t width, uint32_t height, uint32_t src_width, uint32_t src_height) {
   if (!EnsureUnpackResources(device, width, height)) return false;
   if (packed_mv_srv.handle == 0u || unpack.srv.handle == 0u || unpack.uav.handle == 0u) return false;
+  // The packed buffer is rendered at half the input resolution; the output is
+  // input-resolution so NGX gets MVs matching the color buffer.
+  if (src_width == 0u) src_width = width;
+  if (src_height == 0u) src_height = height;
 
   const auto AC = reshade::api::pipeline_stage::all_compute;
   const auto CS = reshade::api::shader_stage::all_compute;
@@ -1034,8 +1017,9 @@ inline bool DispatchUnpack(
   device->update_descriptor_tables(2, updates);
   cmd_list->bind_descriptor_tables(CS, unpack.layout, 0, 2, unpack.tables);
 
-  const float pc[4] = {static_cast<float>(width), static_cast<float>(height), dlss_mv_scale, 0.f};
-  cmd_list->push_constants(CS, unpack.layout, 2, 0, 4, pc);
+  const float pc[8] = {static_cast<float>(width), static_cast<float>(height), dlss_mv_scale, 0.f,
+                       static_cast<float>(src_width), static_cast<float>(src_height), 0.f, 0.f};
+  cmd_list->push_constants(CS, unpack.layout, 2, 0, 8, pc);
   cmd_list->dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
   cmd_list->barrier(unpack.texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   return true;
@@ -1122,95 +1106,108 @@ inline bool CurrentPixelLayout(reshade::api::command_list* cmd_list, reshade::ap
   return layout.handle != 0u;
 }
 
-// Records the current (table, binding) candidates of every slot of interest
-// at a TAA draw so the update hook knows what to listen for. Push-bound
-// slots are marked push (no capture needed). Cheap: a few layout scans 1-2x
-// per frame.
-inline void LearnTaaBindings(reshade::api::command_list* cmd_list, const CommandListData* data) {
-  if (cmd_list == nullptr || data == nullptr) return;
-  reshade::api::pipeline_layout layout = {};
-  if (!CurrentPixelLayout(cmd_list, layout)) return;
-
-  const uint32_t slots[kLearnedSlots] = {0u, 0u, 2u, 5u, 6u};
-  const bool is_cbv[kLearnedSlots] = {true, false, false, false, false};
-  for (uint32_t i = 0u; i < kLearnedSlots; ++i) {
-    const uint32_t slot = slots[i];
-    learned[i].is_push = false;
-    if (!is_cbv[i] && slot < kTrackedSrvCount && data->push_srvs[slot].handle != 0u) {
-      learned[i].is_push = true;
-      learned[i].count = 0u;
-      continue;
-    }
-    if (is_cbv[i] && data->constant_buffers[slot].buffer.handle != 0u) {
-      learned[i].is_push = true;
-      learned[i].count = 0u;
-      continue;
-    }
-    uint32_t params[kMaxCandidates] = {};
-    uint32_t bindings[kMaxCandidates] = {};
-    const uint32_t n = FindAllTablesForRegister(layout, slot, 0u, params, bindings, kMaxCandidates);
-    uint32_t kept = 0u;
-    for (uint32_t k = 0u; k < n && kept < kMaxCandidates; ++k) {
-      if (params[k] >= data->descriptor_tables.size()) continue;
-      const auto table = data->descriptor_tables[params[k]];
-      if (table.handle == 0u) continue;
-      uint64_t heap = 0u;
-      uint32_t offset = 0u;
-      if (!CanonicalBindingCached(cmd_list->get_device(), table, bindings[k], heap, offset)) continue;
-      learned[i].heaps[kept] = heap;
-      learned[i].offsets[kept] = offset;
-      ++kept;
-    }
-    learned[i].count = kept;
-  }
-  RebuildInterest();
-}
-
 inline bool IsSrvType(reshade::api::descriptor_type type) {
   return type == reshade::api::descriptor_type::texture_shader_resource_view
       || type == reshade::api::descriptor_type::buffer_shader_resource_view;
 }
 
-inline reshade::api::resource_view ResolveSlotSrv(
+// One resolved TAA input. Either read from a bound descriptor (resource +
+// format) or pushed by ReShade directly (a ready-made view).
+struct SlotInput {
+  reshade::api::resource resource = {};
+  uint32_t format = 0u;
+  reshade::api::resource_view push_view = {};
+};
+
+// ReShade views are allocated objects, so the unpack pass's input view must be
+// reused rather than recreated every draw. The TAA inputs ping-pong between a
+// couple of textures, so a tiny cache keyed by (resource, format) covers the
+// working set; a miss allocates, an eviction destroys.
+static constexpr uint32_t kViewCacheSize = 8u;
+inline std::mutex view_cache_mutex;
+inline reshade::api::resource_view view_cache[kViewCacheSize] = {};
+inline reshade::api::resource view_cache_resource[kViewCacheSize] = {};
+inline uint32_t view_cache_format[kViewCacheSize] = {};
+
+inline void ReleaseViewCache(reshade::api::device* device) {
+  const std::lock_guard<std::mutex> lock(view_cache_mutex);
+  for (uint32_t i = 0u; i < kViewCacheSize; ++i) {
+    if (view_cache[i].handle == 0u) continue;
+    device->destroy_resource_view(view_cache[i]);
+    view_cache[i] = {};
+    view_cache_resource[i] = {};
+    view_cache_format[i] = 0u;
+  }
+}
+
+inline reshade::api::resource_view GetOrCreateTextureView(
+    reshade::api::device* device, reshade::api::resource resource, uint32_t format) {
+  const std::lock_guard<std::mutex> lock(view_cache_mutex);
+  uint32_t empty = kViewCacheSize;
+  for (uint32_t i = 0u; i < kViewCacheSize; ++i) {
+    if (view_cache[i].handle == 0u) {
+      if (empty == kViewCacheSize) empty = i;
+      continue;
+    }
+    if (view_cache_resource[i].handle == resource.handle && view_cache_format[i] == format) {
+      return view_cache[i];
+    }
+  }
+  if (empty == kViewCacheSize) empty = 0u;  // cache full: recycle slot 0
+  if (view_cache[empty].handle != 0u) {
+    device->destroy_resource_view(view_cache[empty]);
+  }
+  reshade::api::resource_view_desc view_desc(reshade::api::resource_view_type::texture_2d,
+                                              static_cast<reshade::api::format>(format), 0, 1, 0, 1);
+  reshade::api::resource_view view = {};
+  if (!device->create_resource_view(resource, reshade::api::resource_usage::shader_resource,
+                                    view_desc, &view) || view.handle == 0u) {
+    return {};
+  }
+  view_cache[empty] = view;
+  view_cache_resource[empty] = resource;
+  view_cache_format[empty] = format;
+  return view;
+}
+
+// Reads the descriptor the draw binds for the given register. Push-bound slots
+// are already resolved; otherwise the layout gives the (table, binding) pair
+// covering the register and the heap is read in place.
+inline bool ResolveSlotSrv(
     reshade::api::command_list* cmd_list,
     const CommandListData* data,
-    uint32_t slot) {
-  if (cmd_list == nullptr || data == nullptr || slot >= kTrackedSrvCount) return {0};
+    uint32_t slot,
+    SlotInput& out) {
+  out = {};
+  if (cmd_list == nullptr || data == nullptr || slot >= kTrackedSrvCount) return false;
   const uint32_t li = LearnIndexForSlot(slot, false);
-  if (li != UINT32_MAX && data->push_srvs[slot].handle != 0u) {
+  if (li == UINT32_MAX) return false;
+  if (data->push_srvs[slot].handle != 0u) {
     slot_hit[li].store(1);
-    return data->push_srvs[slot];
+    out.push_view = data->push_srvs[slot];
+    return true;
   }
-  if (li == UINT32_MAX) return {0};
 
-  // Journal lookup (boot-time writes included), type-checked. Candidates are
-  // canonicalized so native-creation writes and GPU binds meet.
   reshade::api::pipeline_layout layout = {};
   if (CurrentPixelLayout(cmd_list, layout)) {
     uint32_t params[kMaxCandidates] = {};
     uint32_t bindings[kMaxCandidates] = {};
     const uint32_t n = FindAllTablesForRegister(layout, slot, 0u, params, bindings, kMaxCandidates);
     auto* device = cmd_list->get_device();
-    std::lock_guard<std::mutex> lock(capture_mutex);
     for (uint32_t k = 0u; k < n; ++k) {
       if (params[k] >= data->descriptor_tables.size()) continue;
       const auto table = data->descriptor_tables[params[k]];
       if (table.handle == 0u) continue;
-      uint64_t heap = 0u;
-      uint32_t offset = 0u;
-      if (!CanonicalBindingCached(device, table, bindings[k], heap, offset)) continue;
-      const auto rit = seen.find(HeapKey(heap, offset));
-      if (rit != seen.end() && rit->second.has_view && rit->second.has_type && IsSrvType(rit->second.type)) {
-        slot_hit[li].store(1);
-        return rit->second.view;
-      }
+      BoundDescriptor bound;
+      if (!ReadBoundDescriptor(device, table, bindings[k], false, bound)) continue;
+      out.resource = bound.resource;
+      out.format = bound.format;
+      slot_hit[li].store(1);
+      return true;
     }
   }
-  // Miss: (re-)learn from the current bindings so the update hook is armed
-  // for the next frame. This frame falls back to vanilla TAA.
   slot_hit[li].store(0);
-  LearnTaaBindings(cmd_list, data);
-  return {0};
+  return false;
 }
 
 inline bool ResolveB0(
@@ -1231,165 +1228,20 @@ inline bool ResolveB0(
     uint32_t bindings[kMaxCandidates] = {};
     const uint32_t n = FindAllTablesForRegister(layout, 0u, 0u, params, bindings, kMaxCandidates);
     auto* device = cmd_list->get_device();
-    std::lock_guard<std::mutex> lock(capture_mutex);
     for (uint32_t k = 0u; k < n; ++k) {
       if (params[k] >= data->descriptor_tables.size()) continue;
       const auto table = data->descriptor_tables[params[k]];
       if (table.handle == 0u) continue;
-      uint64_t heap = 0u;
-      uint32_t offset = 0u;
-      if (!CanonicalBindingCached(device, table, bindings[k], heap, offset)) continue;
-      const auto rit = seen.find(HeapKey(heap, offset));
-      if (rit != seen.end() && rit->second.has_cbv
-          && rit->second.has_type
-          && rit->second.type == reshade::api::descriptor_type::constant_buffer) {
-        out = rit->second.cbv;
-        slot_hit[0].store(1);
-        return true;
-      }
+      BoundDescriptor bound;
+      if (!ReadBoundDescriptor(device, table, bindings[k], true, bound)) continue;
+      out.buffer = bound.resource;
+      out.offset = bound.buffer_offset;
+      out.size = bound.buffer_size;
+      slot_hit[0].store(1);
+      return true;
     }
   }
   slot_hit[0].store(0);
-  LearnTaaBindings(cmd_list, data);
-  return false;
-}
-
-// Evicts non-learned journal entries to make room for learned traffic.
-// Caller must hold capture_mutex. Throttled to one pass per 300 presents so
-// effect-churn refills cannot turn it into a per-frame O(n) scan.
-inline void EvictNonLearnedLocked() {
-  if (stat_presents.load() - last_evict_present.load() < 300u) return;
-  last_evict_present.store(stat_presents.load());
-  uint64_t keep[kMaxInterestTables] = {};
-  uint32_t n = interest_count.load();
-  if (n > kMaxInterestTables) n = kMaxInterestTables;
-  for (uint32_t j = 0u; j < n; ++j) {
-    keep[j] = HeapKey(interest_heaps[j].load(), interest_offs[j].load());
-  }
-  for (auto it = seen.begin(); it != seen.end();) {
-    bool learned = false;
-    for (uint32_t j = 0u; j < n; ++j) {
-      if (it->first == keep[j]) {
-        learned = true;
-        break;
-      }
-    }
-    if (learned) {
-      ++it;
-    } else {
-      it = seen.erase(it);
-    }
-  }
-  seen_count.store(seen.size());
-}
-
-// Own update hook: from attach until the first resolve, records every SRV /
-// CBV write into the capped journal (captures boot-time heap writes). After
-// the first resolve, only updates overlapping learned TAA heap ranges are
-// recorded. Each update is canonicalized once to (heap, offset) so native
-// view-creation writes ({CPUptr}/binding 0) and GPU binds meet in one key
-// space. No vector resizes, tiny mutex critical sections only on record.
-inline bool OnUpdateDescriptorTables(
-    reshade::api::device* device,
-    uint32_t count,
-    const reshade::api::descriptor_table_update* updates) {
-  if (device == nullptr || count == 0u || updates == nullptr) return false;
-  // Fail-open journal filter: accept writes from any initialized device.
-  // Heap handles are native-unique so foreign heaps cannot collide; a strict
-  // NVIDIA-only filter here risks silently discarding the writes we need.
-  if (!IsSeenDevice(device->get_native())) return false;
-  const bool full = full_capture_frames.load() > 0;
-  const bool targeted = resolved_once.load() && !full;
-  if (targeted && interest_count.load() == 0u) return false;
-
-  for (uint32_t u = 0u; u < count; ++u) {
-    const auto& update = updates[u];
-    if (update.table.handle == 0u || update.count == 0u) continue;
-    const bool is_cbv = update.type == reshade::api::descriptor_type::constant_buffer;
-    const bool is_srv = IsSrvType(update.type);
-    const bool is_sampler_srv = update.type == reshade::api::descriptor_type::sampler_with_resource_view;
-    if (!is_cbv && !is_srv && !is_sampler_srv) continue;
-
-    uint64_t heap = 0u;
-    uint32_t base = 0u;
-    // Cached canonicalization: steady-state hits cost a few atomic loads.
-    // array_offset folds into the base (ReShade asserts it 0 for queries).
-    bool have_base = RawCacheLookup(update.table.handle, heap, base);
-    if (!have_base) {
-      // Unknown raw handle: exactly one canonical query classifies it (then
-      // cached). This is the only per-update query.
-      if (!CanonicalBinding(device, update.table, 0u, heap, base)) continue;
-      RawCacheStore(update.table.handle, heap, base);
-    }
-    base += update.array_offset + update.binding;
-
-    uint32_t overlap_ks[kMaxInterestTables] = {};
-    uint32_t overlap_n = 0u;
-    if (targeted) {
-      // O(interest) range gate: each interest entry yields at most one k.
-      // No lock is taken when nothing overlaps.
-      const uint32_t n = interest_count.load();
-      for (uint32_t j = 0u; j < n && j < kMaxInterestTables && overlap_n < kMaxInterestTables; ++j) {
-        if (interest_heaps[j].load() != heap) continue;
-        const uint32_t o = interest_offs[j].load();
-        if (o < base || o >= base + update.count) continue;
-        overlap_ks[overlap_n++] = o - base;
-      }
-      if (overlap_n == 0u) continue;
-    } else if (seen_count.load() >= kSeenCap) {
-      continue;  // journal full; re-arm path clears it if resolve keeps failing
-    }
-
-    std::lock_guard<std::mutex> lock(capture_mutex);
-    if (!seen_reserved) {
-      seen.reserve(kSeenReserve);
-      seen_reserved = true;
-    }
-    if (capture_device_native.load() == 0u) capture_device_native.store(device->get_native());
-    // Targeted mode records only overlapping ks (learned traffic bypasses
-    // caps unconditionally); otherwise every descriptor in the update.
-    const uint32_t iters = targeted ? overlap_n : update.count;
-    for (uint32_t ii = 0u; ii < iters; ++ii) {
-      const uint32_t k = targeted ? overlap_ks[ii] : ii;
-      const uint32_t off = base + k;
-      const uint64_t key = HeapKey(heap, off);
-      if (seen.size() >= kSeenCap && seen.find(key) == seen.end()) {
-        if (targeted) {
-          // Learned traffic always lands: evict non-learned entries to make
-          // room (throttled; see EvictNonLearnedLocked). Cap-full blindness
-          // for TAA inputs is structurally impossible after this point.
-          EvictNonLearnedLocked();
-          if (seen.size() >= kSeenCap && seen.find(key) == seen.end()) continue;
-        } else {
-          if (full) {
-            // Full-window re-arm bypasses the cap (bounded to 5 frames).
-          } else {
-            if (!logged_seen_cap) {
-              logged_seen_cap = true;
-              reshade::log::message(reshade::log::level::warning,
-                                    "Far Cry 6 DLSS: descriptor journal full before first resolve; "
-                                    "TAA inputs may need a re-arm (see log)");
-            }
-            continue;
-          }
-        }
-      }
-      auto& rec = seen[key];
-      rec.type = update.type;
-      rec.has_type = true;
-      if (is_cbv) {
-        rec.cbv = static_cast<const reshade::api::buffer_range*>(update.descriptors)[k];
-        rec.has_cbv = rec.cbv.buffer.handle != 0u;
-      } else if (is_srv) {
-        rec.view = static_cast<const reshade::api::resource_view*>(update.descriptors)[k];
-        rec.has_view = rec.view.handle != 0u;
-      } else {
-        rec.view = static_cast<const reshade::api::sampler_with_resource_view*>(update.descriptors)[k].view;
-        rec.has_view = rec.view.handle != 0u;
-      }
-    }
-    seen_count.store(seen.size());
-  }
   return false;
 }
 
@@ -1401,6 +1253,8 @@ inline ID3D12Resource* GetNativeResource(reshade::api::device* device, reshade::
 }
 
 // Reads up to max_floats of the b0 constant buffer (for jitter auto-detect).
+// The engine rebinds a different 512-byte slot of one large buffer every frame,
+// so the offset from the descriptor is what must be honoured here.
 inline bool ReadB0Floats(const reshade::api::buffer_range& buffer_range, std::vector<float>& out, uint32_t max_floats) {
   out.clear();
   if (buffer_range.buffer.handle == 0u || max_floats == 0u) return false;
@@ -1510,50 +1364,74 @@ inline bool CheckTaaDraw(reshade::api::command_list* cmd_list, CommandListData*&
   return data->rtvs[0].handle != 0u;
 }
 
-// Shared resolve-failure path: streak accounting, duty-cycle-limited
-// re-arm, one-shot log. Returns false (vanilla TAA) always.
+// Shared resolve-failure path. The descriptor read needs no warm-up and no
+// recovery state. Returns false (vanilla TAA) always.
 inline bool FailResolveResources(ID3D12Resource* color, ID3D12Resource* packed_motion, ID3D12Resource* depth,
                                  ID3D12Resource* output_target) {
   NoteFail(kFailResolve);
-  // Resolve misses are expected while learning (first frames, heap churn).
-  // After a sustained streak, arm the time-boxed full-record fallback for a
-  // few frames. Re-arms are duty-cycle limited (600 presents) and logged, so
-  // a pathological table-churn case cannot become a permanent hitch cycle.
-  // If the journal hit its cap while still unresolved, drop it first: the
-  // re-arm window then re-observes the live heap state.
-  const int streak = stat_resolve_fail_streak.fetch_add(1) + 1;
-  const uint64_t presents = stat_presents.load();
-  if (streak % 30 == 0 && full_capture_frames.load() == 0
-      && presents - last_arm_present.load() > kRearmCooldownPresents) {
-    last_arm_present.store(presents);
-    {
-      std::lock_guard<std::mutex> lock(capture_mutex);
-      if (seen.size() >= kSeenCap) {
-        seen.clear();
-        seen_count.store(0);
-      }
-    }
-    full_capture_frames.store(5);
-    {
-      std::lock_guard<std::mutex> lock(capture_mutex);
-      char buf[192];
-      snprintf(buf, sizeof(buf),
-               "Far Cry 6 DLSS: arming 5-frame full descriptor record to locate TAA inputs (journal=%llu)",
-               static_cast<unsigned long long>(seen.size()));
-      reshade::log::message(reshade::log::level::info, buf);
-    }
-  }
   if (!logged_missing_resources) {
     logged_missing_resources = true;
     std::stringstream s;
-    s << "Far Cry 6 DLSS: TAA draw found, but resources failed to resolve"
+    s << "Far Cry 6 DLSS: TAA draw found, but inputs did not resolve"
       << " color=" << reinterpret_cast<void*>(color)
       << " packed_mv=" << reinterpret_cast<void*>(packed_motion)
       << " depth=" << reinterpret_cast<void*>(depth)
-      << " rtv0=" << reinterpret_cast<void*>(output_target);
+      << " rtv0=" << reinterpret_cast<void*>(output_target)
+      << " (tracked resources=" << stat_resources.load() << ")";
     reshade::log::message(reshade::log::level::warning, s.str().c_str());
   }
   return false;
+}
+
+// Everything needed to diagnose a bad frame or a missed resolve, as one block
+// of plain text. Read-only: takes no locks the draw path cannot afford.
+inline std::string BuildDebugReport() {
+  const DeployReport report = [&] {
+    const std::lock_guard<std::mutex> lock(report_mutex);
+    return deploy_report;
+  }();
+  char buf[2048];
+  snprintf(buf, sizeof(buf),
+      "Far Cry 6 DLSS report\n"
+      "  addon version     : %s\n"
+      "  devices          : %s\n"
+      "  draws / replaced : %llu / %llu\n"
+      "  state            : %s\n"
+      "  tracked resources: %llu\n"
+      "  slots b0/t0/t2/t5/t6 : %d/%d/%d/%d/%d  (- miss, hit real, 2 dummy)\n"
+      "  evals / resets   : %llu / %llu\n"
+      "  input            : %ux%u   target: %ux%u\n"
+      "  packed MV source : %ux%u%s\n"
+      "  depth source     : %ux%u%s\n"
+      "  quality / preset : %s / %s   flags=0x%X\n"
+      "  jitter source    : %s\n"
+      "  jitter ngx px    : (%.4f, %.4f)  adopted=%d candidate=%d streak=%d\n"
+      "  mv scale         : %.3f   mv jittered=%s   depth inverted=%s\n"
+      "  dlss mode        : %d   fallback=%s   debug log=%s\n",
+      std::string(renodx::build_info::kBuildVersion).c_str(),
+      DeviceSummary().c_str(),
+      static_cast<unsigned long long>(stat_taa_draws.load()),
+      static_cast<unsigned long long>(stat_dlss_ok.load()),
+      FailCodeText(stat_fail_code.load()),
+      static_cast<unsigned long long>(stat_resources.load()),
+      slot_hit[0].load(), slot_hit[1].load(), slot_hit[2].load(), slot_hit[3].load(), slot_hit[4].load(),
+      static_cast<unsigned long long>(report.evals),
+      static_cast<unsigned long long>(report.resets),
+      report.input_width, report.input_height, report.target_width, report.target_height,
+      report.mv_width, report.mv_height, report.used_mv_dummy ? " (dummy)" : "",
+      report.depth_width, report.depth_height, report.used_depth_dummy ? " (dummy)" : "",
+      GetPerfQualityName(report.quality), GetRenderPresetName(report.preset),
+      static_cast<unsigned>(report.flags),
+      dlss_jitter_source > 0.5f ? "auto (scan b0)" : "zero",
+      static_cast<double>(report.jitter_x), static_cast<double>(report.jitter_y),
+      jitter_state.adopted ? 1 : 0, jitter_state.candidate, jitter_state.streak,
+      static_cast<double>(dlss_mv_scale),
+      dlss_motion_vectors_jittered != 0.f ? "on" : "off",
+      dlss_depth_inverted != 0.f ? "on" : "off",
+      static_cast<int>(dlss_mode),
+      dlss_allow_fallback != 0.f ? "ON" : "off",
+      dlss_debug_logging != 0.f ? "on" : "off");
+  return std::string(buf);
 }
 
 inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandListData* data, uint32_t hash) {
@@ -1590,22 +1468,28 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
 
   const uint32_t depth_slot = (dlss_depth_source > 0.5f) ? 6u : 5u;
-  const auto color_view = ResolveSlotSrv(cmd_list, data, kSlotColor);
-  const auto motion_view = ResolveSlotSrv(cmd_list, data, kSlotPackedMv);
-  const auto depth_view = ResolveSlotSrv(cmd_list, data, depth_slot);
-  auto* color = GetNativeResource(device, color_view);
-  auto* packed_motion = GetNativeResource(device, motion_view);
-  auto* depth = GetNativeResource(device, depth_view);
+  SlotInput color_in;
+  SlotInput mv_in;
+  SlotInput depth_in;
+  const bool color_ok = ResolveSlotSrv(cmd_list, data, kSlotColor, color_in);
+  const bool mv_ok = ResolveSlotSrv(cmd_list, data, kSlotPackedMv, mv_in);
+  const bool depth_ok = ResolveSlotSrv(cmd_list, data, depth_slot, depth_in);
+  auto* color = color_in.push_view.handle != 0u
+      ? GetNativeResource(device, color_in.push_view)
+      : reinterpret_cast<ID3D12Resource*>(color_in.resource.handle);
+  auto* depth = depth_in.push_view.handle != 0u
+      ? GetNativeResource(device, depth_in.push_view)
+      : reinterpret_cast<ID3D12Resource*>(depth_in.resource.handle);
   auto* output_target = GetNativeResource(device, data->rtvs[0]);
   // Color and the output target are mandatory: DLSS cannot run without them,
   // in any mode.
-  if (color == nullptr || output_target == nullptr) {
-    return FailResolveResources(color, packed_motion, depth, output_target);
+  if (!color_ok || color == nullptr || output_target == nullptr) {
+    return FailResolveResources(color, nullptr, depth, output_target);
   }
-  const bool mv_real = packed_motion != nullptr;
+  const bool mv_real = mv_ok && (mv_in.push_view.handle != 0u || mv_in.resource.handle != 0u);
   const bool depth_real = depth != nullptr;
   if ((!mv_real || !depth_real) && dlss_allow_fallback == 0.f) {
-    return FailResolveResources(color, packed_motion, depth, output_target);
+    return FailResolveResources(color, nullptr, depth, output_target);
   }
 
   const D3D12_RESOURCE_DESC color_desc = color->GetDesc();
@@ -1704,16 +1588,37 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   if (!EnsureOutputTexture(ngx.device.Get(), target_width, target_height, output_format)) return false;
 
-  // Effective MV/depth: real journal entries, or fallback stand-ins.
+  // Effective MV/depth: real descriptors, or fallback stand-ins.
   // Zeroed MVs are not jittered: report that honestly to NGX.
   ID3D12Resource* motion_vectors = nullptr;
   ID3D12Resource* depth_res = depth;
   int feature_flags = GetFeatureFlags();
+  uint32_t mv_src_width = 0u;
+  uint32_t mv_src_height = 0u;
   if (use_mv_dummy) {
     motion_vectors = reinterpret_cast<ID3D12Resource*>(fallback.mv_texture.handle);
     feature_flags &= ~NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
   } else {
-    if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height)) {
+    // The packed buffer is half the input resolution; read its real size so the
+    // unpack pass indexes it correctly instead of sampling past its end.
+    ID3D12Resource* packed_motion = mv_in.push_view.handle != 0u
+        ? GetNativeResource(device, mv_in.push_view)
+        : reinterpret_cast<ID3D12Resource*>(mv_in.resource.handle);
+    reshade::api::resource_view motion_view = mv_in.push_view;
+    if (motion_view.handle == 0u && packed_motion != nullptr) {
+      motion_view = GetOrCreateTextureView(device, mv_in.resource, mv_in.format);
+    }
+    if (packed_motion != nullptr) {
+      const D3D12_RESOURCE_DESC mv_desc = packed_motion->GetDesc();
+      mv_src_width = static_cast<uint32_t>(mv_desc.Width);
+      mv_src_height = static_cast<uint32_t>(mv_desc.Height);
+    }
+    if (motion_view.handle == 0u) {
+      NoteFail(kFailUnpack);
+      return false;
+    }
+    if (!DispatchUnpack(device, cmd_list, motion_view, input_width, input_height,
+                       mv_src_width, mv_src_height)) {
       NoteFail(kFailUnpack);
       return false;
     }
@@ -1726,19 +1631,19 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   if (motion_vectors == nullptr || depth_res == nullptr) return false;
 
-  // Any input/output swap (heap-slot recycling, resizes) invalidates DLSS
-  // history: force a reset instead of poisoning it with a stale frame.
+  // Reset DLSS history only on a structural change. The engine ping-pongs its
+  // color/history textures every frame, so resetting on handle changes would
+  // restart DLSS every frame and destroy the temporal accumulation — the
+  // mirror reads the descriptor the draw actually binds, so a recycled slot
+  // can no longer feed a stale view.
   {
-    const uint64_t handles[4] = {
-        reinterpret_cast<uint64_t>(color), reinterpret_cast<uint64_t>(motion_vectors),
-        reinterpret_cast<uint64_t>(depth_res), reinterpret_cast<uint64_t>(output_target)};
-    if (handles[0] != last_in_color || handles[1] != last_in_mv || handles[2] != last_in_depth
-        || handles[3] != last_in_output) {
+    const uint64_t dims = (static_cast<uint64_t>(input_width) << 48)
+                        | (static_cast<uint64_t>(input_height) << 32)
+                        | (static_cast<uint64_t>(target_width) << 16)
+                        | static_cast<uint64_t>(target_height);
+    if (dims != last_dims) {
+      last_dims = dims;
       ngx.reset = true;
-      last_in_color = handles[0];
-      last_in_mv = handles[1];
-      last_in_depth = handles[2];
-      last_in_output = handles[3];
     }
   }
 
@@ -1811,6 +1716,26 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   ngx.reset = false;
   NoteSuccess();
+  {
+    const std::lock_guard<std::mutex> lock(report_mutex);
+    deploy_report.input_width = input_width;
+    deploy_report.input_height = input_height;
+    deploy_report.target_width = target_width;
+    deploy_report.target_height = target_height;
+    deploy_report.mv_width = use_mv_dummy ? input_width : mv_src_width;
+    deploy_report.mv_height = use_mv_dummy ? input_height : mv_src_height;
+    deploy_report.depth_width = depth != nullptr ? static_cast<uint32_t>(depth->GetDesc().Width) : 0u;
+    deploy_report.depth_height = depth != nullptr ? static_cast<uint32_t>(depth->GetDesc().Height) : 0u;
+    deploy_report.quality = ngx.perf_quality;
+    deploy_report.preset = ngx.render_preset;
+    deploy_report.flags = feature_flags;
+    deploy_report.jitter_x = jitter_x;
+    deploy_report.jitter_y = jitter_y;
+    deploy_report.used_mv_dummy = use_mv_dummy;
+    deploy_report.used_depth_dummy = use_depth_dummy;
+    ++deploy_report.evals;
+    if (eval.InReset != 0) ++deploy_report.resets;
+  }
 
   D3D12_RESOURCE_BARRIER barriers[2] = {};
   barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1951,22 +1876,6 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
 
 inline void OnInitDevice(reshade::api::device* device) {
   if (device == nullptr) return;
-  NoteSeenDevice(device->get_native());
-  {
-    // Fresh heap objects deserve a fresh journal — but only on a genuinely
-    // different native device. Same-native re-init (wrapper churn) keeps it.
-    const uint64_t native = device->get_native();
-    const uint64_t owner = capture_device_native.load();
-    if (owner != 0u && owner != native) {
-      std::lock_guard<std::mutex> lock(capture_mutex);
-      ClearCapture();
-      char buf[192];
-      snprintf(buf, sizeof(buf),
-               "Far Cry 6 DLSS: capture switched devices (0x%llX -> 0x%llX), journal reset",
-               static_cast<unsigned long long>(owner), static_cast<unsigned long long>(native));
-      reshade::log::message(reshade::log::level::info, buf);
-    }
-  }
   int vendor_id = 0;
   const bool is_nvidia = device->get_property(reshade::api::device_properties::vendor_id, &vendor_id) && vendor_id == 0x10de;
   {
@@ -2007,32 +1916,15 @@ inline void OnDestroyDevice(reshade::api::device* device) {
     }
     if (was_ours) ReleaseNgx();
     RemoveNvidiaNative(device->get_native());
-    ForgetSeenDevice(device->get_native());
-    // Rare by definition. The journal is intentionally NOT wiped here: if the
-    // same native re-initializes (wrapper churn) its heaps are still alive.
-    // A genuinely different native wipes on its init (see OnInitDevice).
     reshade::log::message(reshade::log::level::info, "Far Cry 6 DLSS: device destroyed");
   }
 }
 
-inline void OnPresent(
-    reshade::api::command_queue*, reshade::api::swapchain*,
-    const reshade::api::rect*, const reshade::api::rect*,
-    uint32_t, const reshade::api::rect*) {
-  // Present boundary timestamp (frame pacing bookkeeping for future use).
-  last_present_time = std::chrono::steady_clock::now();
-  ++stat_presents;
-  // Tick down the time-boxed full-record fallback. The journal itself is NOT
-  // cleared here: boot-time writes must persist until (and after) resolve.
-  int frames = full_capture_frames.load();
-  if (frames > 0) full_capture_frames.store(frames - 1);
-}
-
 inline void Use(DWORD fdw_reason) {
-  // NOTE on copy_descriptor_tables: deliberately UNSUBSCRIBED (measured).
-  // A prior build subscribed with an overlap-gated handler; FPS regressed
-  // and no copy-fed heap ever converted to a deployment, so the subscription
-  // bought cost without value. The update journal is the sole capture path.
+  // Input resolution reads the bound descriptor out of the (shader-visible)
+  // descriptor heap at the TAA draw. No descriptor write event is subscribed:
+  // the engine issues ~117M CopyDescriptors per session and capturing them was
+  // both the CPU cost and, being incomplete, the reason slots stayed empty.
   // utils::shader::Use attaches the pipeline/state tracking our draw
   // identification and layout resolution read (GetCurrentState,
   // GetCurrentPixelShaderHash, PopulateStageState). No replacements are
@@ -2047,37 +1939,36 @@ inline void Use(DWORD fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (attached) return;
       attached = true;
-      last_present_time = std::chrono::steady_clock::now();
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
-      reshade::register_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-      reshade::register_event<reshade::addon_event::present>(OnPresent);
       break;
     case DLL_PROCESS_DETACH:
       if (!attached) return;
       attached = false;
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
-      reshade::unregister_event<reshade::addon_event::update_descriptor_tables>(OnUpdateDescriptorTables);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
-      reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       ReleaseNgx();
       break;
   }

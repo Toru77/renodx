@@ -51,17 +51,37 @@ static bool DlssStatusDraw() {
   } else {
     ImGui::TextUnformatted("Jitter: scanning b0 (zero until adopted)");
   }
-  int learned_count = 0;
-  for (const auto& s : learned) {
-    if (s.count > 0u || s.is_push) ++learned_count;
-  }
-  ImGui::Text("Inputs: %d/5 slots learned", learned_count);
   ImGui::Text("Slots: b0:%s t0:%s t2:%s t5:%s t6:%s", SlotState(0), SlotState(1), SlotState(2),
               SlotState(3), SlotState(4));
+  ImGui::Text("Tracked resources: %llu", static_cast<unsigned long long>(stat_resources.load()));
+  {
+    const std::lock_guard<std::mutex> lock(report_mutex);
+    ImGui::Text(
+        "Last eval: in=%ux%u target=%ux%u mv=%ux%u jitter=(%.3f, %.3f) %s",
+        deploy_report.input_width, deploy_report.input_height,
+        deploy_report.target_width, deploy_report.target_height,
+        deploy_report.mv_width, deploy_report.mv_height,
+        static_cast<double>(deploy_report.jitter_x), static_cast<double>(deploy_report.jitter_y),
+        GetPerfQualityName(deploy_report.quality));
+  }
   return false;
 }
 
 renodx::utils::settings::Settings settings = {
+    new renodx::utils::settings::Setting{
+        .key = "DLSSCopyReport",
+        .binding = nullptr,
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .default_value = 0.f,
+        .label = "Copy Report",
+        .section = "Antialiasing",
+        .group = "Debug",
+        .tooltip = "Copies the live DLSS pipeline state (inputs, sizes, jitter, mirror counters, settings) to the clipboard.",
+        .on_click = [] {
+          ImGui::SetClipboardText(farcry6_dlss::dlss::BuildDebugReport().c_str());
+          return true;
+        },
+    },
     new renodx::utils::settings::Setting{
         .key = "DLSSStatus",
         .binding = nullptr,

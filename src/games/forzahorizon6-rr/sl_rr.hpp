@@ -153,6 +153,42 @@ inline void SetRuntimeLoad(bool enabled) { rr_runtime_load_enabled.store(enabled
 inline bool GetRuntimeLoad() { return rr_runtime_load_enabled.load(); }
 inline void SetRrRedirect(bool enabled) { rr_redirect_enabled.store(enabled); }
 inline bool GetRrRedirect() { return rr_redirect_enabled.load(); }
+
+// Latched the first time a failure happens after our guide pass has already
+// been recorded onto the game's command list. Once set, the redirect steps
+// aside entirely and every later frame takes the untouched DLSS-SR path, which
+// is the state a machine that never trips this latch runs in all the time.
+// Cleared only by an explicit user toggle, so one failure costs one bad frame
+// rather than the rest of the session.
+inline std::atomic<bool> rr_trip_latched{false};
+inline void ClearRrTrip() { rr_trip_latched.store(false); }
+inline bool GetRrTrip() { return rr_trip_latched.load(); }
+
+// The sl::Result that latched RR off. The overlay uses it to tell the Streamline
+// exception case apart from the ordinary failure paths, because that one has a
+// known environmental cause worth naming.
+inline std::atomic<uint32_t> rr_trip_result{0};
+inline uint32_t GetRrTripResult() { return rr_trip_result.load(); }
+
+// Version of the nvngx_dlssd.dll sitting next to the game executable, or empty
+// when it cannot be read. An outdated copy there is the known cause of the
+// exception below: NGX resolves RR's preset hint onto a deprecated preset and
+// throws out of CreateDlssInstance, surfacing as eErrorExceptionHandler.
+// Replacing the DLL fixes it. Read once, since the file cannot change while the
+// game is running.
+inline const std::string& DlssdDllVersion() {
+  static const std::string version = [] {
+    const auto directory =
+        renodx::utils::platform::GetCurrentProcessPath().parent_path();
+    return renodx::utils::platform::GetFileVersion(directory / "nvngx_dlssd.dll");
+  }();
+  return version;
+}
+
+// Set once RR has rendered a frame that Streamline flagged eWarnOutOfVRAM.
+// The frame is valid; this is a performance warning, not a failure.
+inline std::atomic<bool> rr_vram_warned{false};
+inline bool GetVramWarned() { return rr_vram_warned.load(); }
 inline void SetRrPreset(uint32_t preset) { rr_preset_override.store(preset); }
 inline uint32_t GetRrPreset() { return rr_preset_override.load(); }
 
@@ -447,7 +483,73 @@ inline void CaptureScalingInput(const sl::ResourceTag* tags, uint32_t num_tags) 
   }
 }
 
+// Streamline's logger never writes to ReShade's log: its three sinks are a
+// console (only if one is active), OutputDebugStringA (only when no callback is
+// set), and a file (only when pathToLogsAndData is set). See
+// sl.log/log.cpp:197-222. So routing logLevel up alone produced nothing in
+// ReShade.log; this callback is what actually puts SL and NGX text there.
+// It is a plain function pointer because sl::Preferences stores one, so it
+// cannot be a lambda and has to be a free function. Streamline calls it from
+// its own log worker thread, so it must be thread-safe; reshade::log::message
+// is, and ReShade stamps the line with its own timestamp.
+// Streamline stamps every line with a wall clock and a free-running elapsed
+// counter: `[17-12-24][streamline][info][tid:23708][234s:289ms:021us]body`. The
+// elapsed field advances on every single call, so without stripping it no two
+// lines ever compare equal and nothing downstream can deduplicate them. ReShade
+// already supplies both a timestamp and the thread id, so the wall clock, the
+// `streamline` tag and the elapsed counter are all redundant here. Removing them
+// is what makes the rate limit in ForwardSlLog lossless rather than merely lossy.
+inline std::string NormalizeSlLog(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  size_t i = 0;
+  while (i < in.size() && in[i] == '[') {
+    const size_t close = in.find(']', i);
+    if (close == std::string::npos) break;
+    const std::string field = in.substr(i + 1, close - i - 1);
+    const bool wall_clock = field.size() == 8 && field[2] == '-' && field[5] == '-';
+    const bool is_elapsed = field.find(':') != std::string::npos
+                         && field.find('s') != std::string::npos
+                         && field.find("ms") != std::string::npos;
+    if (!wall_clock && field != "streamline" && !is_elapsed) {
+      // A level, a tid, or already the source body: keep it verbatim.
+      out.append(in, i, close - i + 1);
+    }
+    i = close + 1;
+    if (i < in.size() && in[i] == ' ') ++i;
+  }
+  out.append(in, i, std::string::npos);
+  return out;
+}
+
+inline void ForwardSlLog(sl::LogType type, const char* msg) {
+  if (!guides::DiagGuidesEnabled() || msg == nullptr) return;
+  const char* tag = type == sl::LogType::eError   ? "SL error"
+                 : type == sl::LogType::eWarn    ? "SL warn"
+                                                  : "SL";
+  std::string trimmed(msg);
+  while (!trimmed.empty()
+         && (trimmed.back() == '\n' || trimmed.back() == '\r' || trimmed.back() == ' ')) {
+    trimmed.pop_back();
+  }
+  if (trimmed.empty()) return;
+  // Streamline loggers cap their own dedup when the level is verbose
+  // (log.cpp:372), so at eVerbose this fires for every message, including NGX's.
+  // Unthrottled that was ~3.6k lines in minutes, nearly all of it identical
+  // per-frame VRAM and telemetry spam. Rate limiting by message text keeps every
+  // distinct line and reports how many repeats were folded in, so no distinct
+  // information is lost.
+  const std::string line = NormalizeSlLog(trimmed);
+  guides::LogThrottled("sl:" + line, std::string("[") + tag + "] " + line,
+                       std::chrono::milliseconds(5000));
+}
+
 inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version) {
+  // Reached only if the interposer hook was armed before the game called
+  // slInit. The log line below proves which path we took.
+  if (guides::DiagGuidesEnabled()) {
+    guides::LogOnce("slinit:entered", "HookedSlInit reached (Streamline hook is live)");
+  }
   // Build the effective feature list with DLSS-RR appended, unless the game
   // already asked for it or the list is a shape we do not touch. Only the
   // feature-list fields are patched; everything else stays as the game wrote
@@ -470,9 +572,30 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   sl::Preferences& mutable_pref = const_cast<sl::Preferences&>(pref);
   const sl::Feature* const original_features = pref.featuresToLoad;
   const uint32_t original_count = pref.numFeaturesToLoad;
+  const sl::LogLevel original_log_level = pref.logLevel;
+  // Plain auto: writing the type out would put the const inside the function
+// type and trip C4180.
+  const auto original_log_callback = pref.logMessageCallback;
   if (appended_rr) {
     mutable_pref.featuresToLoad = init_features_patched_storage;
     mutable_pref.numFeaturesToLoad = patched_count;
+  }
+  // Debug-logging toggle also raises Streamline's own verbosity, so NGX prints
+  // its internal error text instead of only surfacing a sl::Result code. NGX
+  // logging level inherits from this (logLevelNGX defaults to it).
+  const bool want_verbose = guides::DiagGuidesEnabled();
+  if (want_verbose) {
+    mutable_pref.logLevel = sl::LogLevel::eVerbose;
+    mutable_pref.showConsole = false;  // the callback is the sink, not a console
+    mutable_pref.logMessageCallback = &ForwardSlLog;
+  }
+  if (guides::DiagGuidesEnabled()) {
+    guides::LogEvent(
+        "slInit hook reached; debug logging is active in this build, raising"
+        " Streamline log level to verbose and routing its log into ReShade.log"
+        + std::string(want_verbose ? "" : " (NOT applied: toggle off at this point)")
+        + "; requested features " + std::to_string(requested_count) + ", appended RR "
+        + std::to_string(appended_rr ? 1 : 0));
   }
 
   const auto result = real_sl_init(pref, sdk_version);
@@ -480,6 +603,10 @@ inline sl::Result HookedSlInit(const sl::Preferences& pref, uint64_t sdk_version
   if (appended_rr) {
     mutable_pref.featuresToLoad = original_features;
     mutable_pref.numFeaturesToLoad = original_count;
+  }
+  if (want_verbose) {
+    mutable_pref.logLevel = original_log_level;
+    mutable_pref.logMessageCallback = original_log_callback;
   }
   return result;
 }
@@ -528,11 +655,47 @@ inline sl::Result HookedSlEvaluateFeature(
 
   // Answer the game's DLSS-SR evaluation with DLSS-RR. Options are mirrored
   // from the game's own slDLSSSetOptions capture, so the in-game settings keep
-  // controlling internal resolution. Any failure for a frame falls back to the
-  // untouched SR call.
-  if (feature == sl::kFeatureDLSS && GetRrRedirect()) {
-    const auto fallback = [&](const char*) {
+  // controlling internal resolution.
+  //
+  // Failures split in two. Anything detected before our guide pass is recorded
+  // hands the frame to the untouched SR call, which is safe because the command
+  // list is still exactly as the game left it. Anything detected after that
+  // point hands the frame back with its own error code and latches RR off for
+  // the session instead — see the bail lambda below.
+  if (feature == sl::kFeatureDLSS && GetRrRedirect() && !GetRrTrip()) {
+    // Every early-out below hands the frame back to the untouched SR call. Log
+    // each distinct reason once so a machine that never reaches RR says why.
+    const auto fallback = [&](const char* reason) {
+      if (guides::DiagGuidesEnabled()) {
+        guides::LogOnce(std::string("fallback:") + reason,
+                        std::string("falling back to SR: ") + reason);
+      }
       return real_sl_evaluate_feature(feature, frame, inputs, num_inputs, cmd);
+    };
+
+    // Once our guide pass has been recorded onto the game's command list, the
+    // list is no longer in the shape Streamline's own evaluate expects, and if
+    // the RR evaluate below unwinds through an exception there is no way to put
+    // it back. Issuing the untouched SR call on that same list is the one thing
+    // we must not do, so from that point on a failure hands the frame back with
+    // its own error code and latches RR off for the session. The game loses this
+    // one upscale, not the frame: colorOut still holds the previous contents,
+    // and every later frame takes the untouched SR path.
+    const auto bail = [&](const char* reason, sl::Result code) {
+      rr_trip_latched.store(true);
+      rr_trip_result.store(static_cast<uint32_t>(code));
+      guides::LogEvent(
+          std::string("RR latched off for this session after ") + reason
+          + ", result=" + std::to_string(static_cast<uint32_t>(code))
+          + ". Not calling SR on this command list; the game keeps rendering and"
+            " DLSS-SR handles every frame from here.");
+      if (code == sl::Result::eErrorExceptionHandler) {
+        guides::LogEvent(
+            "that result is a Streamline exception; the usual cause is an outdated"
+            " nvngx_dlssd.dll next to the game executable. Found version '"
+            + DlssdDllVersion() + "'. Update DLSS or the GPU driver and restart.");
+      }
+      return code;
     };
 
     DlssOptionsSnapshot captured;
@@ -621,6 +784,23 @@ inline sl::Result HookedSlEvaluateFeature(
     options.worldToCameraView = world_to_view;
     options.cameraViewToWorld = view_to_world;
     options.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
+    // What NGX's create is about to be handed. The reporter's crash lands inside
+    // NGXDLAA::CreateDlssInstance right after Denoise_Mode is logged, so record
+    // the exact geometry and mode that produced it; Streamline does not log the
+    // guide formats, and it compares every guide extent against colorIn
+    // internally (dlss_dEntry.cpp:460,611) and drops mismatches silently.
+    if (guides::DiagGuidesEnabled()) {
+      guides::LogThrottled(
+          "create:params",
+          std::string("RR create: mode=") + std::to_string(static_cast<uint32_t>(captured.mode))
+              + " render=" + std::to_string(input_width) + "x" + std::to_string(input_height)
+              + " out=" + std::to_string(captured.output_width) + "x"
+              + std::to_string(captured.output_height) + " nrMode=ePacked preset="
+              + std::to_string(static_cast<uint32_t>(GetRrPreset())) + " hdr="
+              + std::to_string(captured.color_buffers_hdr) + " alpha="
+              + std::to_string(captured.alpha_upscaling),
+          std::chrono::milliseconds(10000));
+    }
     // User-selected preset applied to every mode (F = RR 4.5 default preset).
     const auto preset_override = static_cast<sl::DLSSDPreset>(GetRrPreset());
     options.dlaaPreset = preset_override;
@@ -630,9 +810,11 @@ inline sl::Result HookedSlEvaluateFeature(
     options.ultraPerformancePreset = preset_override;
     options.ultraQualityPreset = preset_override;
 
+    // Past this point the guide pass is already on the command list, so both
+    // remaining failure paths bail rather than fall back.
     const auto set_result = real_dlssd_set_options(viewport, options);
     if (set_result != sl::Result::eOk) {
-      return fallback("slDLSSDSetOptions failed");
+      return bail("slDLSSDSetOptions failed", set_result);
     }
 
     // The guide tags ride in the evaluate inputs array — sl.common checks
@@ -667,6 +849,19 @@ inline sl::Result HookedSlEvaluateFeature(
     specular_albedo_resource.nativeFormat = specular_format;
 
     sl::Extent guide_extent{0, 0, input_width, input_height};
+    // Guide formats are never logged by Streamline, and all three guides carry
+    // the render extent, so a mismatch here is invisible from the outside.
+    if (guides::DiagGuidesEnabled()) {
+      guides::LogThrottled(
+          "create:guides",
+          std::string("RR guides: source=") + (real_guides.real ? "captured" : "placeholder")
+              + " extent=" + std::to_string(guide_extent.width) + "x"
+              + std::to_string(guide_extent.height) + " nrFormat=0x"
+              + std::to_string(nr_format) + " albedoFormat=0x"
+              + std::to_string(albedo_format) + " specularFormat=0x"
+              + std::to_string(specular_format),
+          std::chrono::milliseconds(10000));
+    }
     sl::ResourceTag tag_normal_roughness(
         &normal_roughness_resource, sl::kBufferTypeNormalRoughness,
         sl::ResourceLifecycle::eValidUntilPresent, &guide_extent);
@@ -690,8 +885,20 @@ inline sl::Result HookedSlEvaluateFeature(
 
     const auto rr_result = real_sl_evaluate_feature(
         sl::kFeatureDLSS_RR, frame, extended_inputs, extended_count, cmd);
-    if (rr_result != sl::Result::eOk) {
-      return fallback("RR evaluate failed");
+    // eWarnOutOfVRAM is a rendered frame, not a failure. Streamline only
+    // downgrades to it from eOk, when the VRAM budget is exhausted
+    // (commonInterface.cpp:542-553), and logs "Exceeded VRAM budget, various
+    // performance issues including stuttering can be expected". Treating it as
+    // an error latched RR off and discarded working frames at 4K output.
+    if (rr_result != sl::Result::eOk && rr_result != sl::Result::eWarnOutOfVRAM) {
+      return bail("RR evaluate failed", rr_result);
+    }
+    if (rr_result == sl::Result::eWarnOutOfVRAM) {
+      rr_vram_warned.store(true);
+      guides::LogOnce(
+          "rr:vram",
+          "RR over the VRAM budget: evaluate rendered, but Streamline reports"
+          " eWarnOutOfVRAM and warns of stutter. RR stays enabled.");
     }
     return rr_result;
   }
