@@ -64,9 +64,25 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
 
   const int2 out_dim = max(int2(1, 1), int2(int(g_width), int(g_height)));
   const int2 src_dim = max(int2(1, 1), int2(int(g_src_width), int(g_src_height)));
-  const int2 src = min(dst * src_dim / out_dim, src_dim - 1);
 
-  float2 packed = t_packed_mv.Load(int3(src, 0));
+  // The game's own TAA samples this packed buffer with a linear filter. A nearest
+  // mapping quantises motion to 2x2 blocks at input resolution, and DLSS reprojects
+  // from it - at a 2x upscale that is whole output pixels of error, which reads as
+  // softness with edges in the wrong place. Four loads and a lerp over the packed
+  // values reproduce what the game's TAA sees; decoding after the blend matches
+  // filtering the encoded buffer, which is what the game does.
+  const float2 src_pos = (float2(dst) + 0.5f) * float2(src_dim) / float2(out_dim) - 0.5f;
+  const int2 base = int2(floor(src_pos));
+  const float2 frac = src_pos - float2(base);
+  float2 packed = float2(0.0f, 0.0f);
+  [unroll] for (int j = 0; j < 2; ++j) {
+    [unroll] for (int i = 0; i < 2; ++i) {
+      const int2 s = clamp(base + int2(i, j), int2(0, 0), src_dim - 1);
+      const float w = ((i == 0) ? (1.0f - frac.x) : frac.x)
+                    * ((j == 0) ? (1.0f - frac.y) : frac.y);
+      packed += t_packed_mv.Load(int3(s, 0)) * w;
+    }
+  }
   float2 decoded = float2(DecodeChannel(packed.x), DecodeChannel(packed.y));
   u_out_mv[dst] = decoded * 0.1f * float2(g_width, g_height) * g_scale;
 }

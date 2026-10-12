@@ -54,12 +54,13 @@ static bool DlssStatusDraw() {
         dlss_depth_source >= 2.5f ? "placeholder"
             : (dlss_depth_source > 1.5f ? "t6" : (dlss_depth_source > 0.5f ? "t5" : "scene")));
   }
-  ImGui::TextUnformatted("Jitter: zero (game's own value not wired yet)");
+  ImGui::TextUnformatted("Jitter: read from the engine's projection when stable");
   ImGui::Text(
-      "NGX log: %llu lines   hdr=%s   restore bindings=%s",
+      "NGX log: %llu lines   hdr=%s   restore bindings=%s   depth transition=%s",
       static_cast<unsigned long long>(ngx_log.seen.load()),
       dlss_flag_is_hdr != 0.f ? "on" : "off",
-      dlss_restore_state != 0.f ? "on" : "off");
+      dlss_restore_state != 0.f ? "on" : "off",
+      dlss_transition_depth != 0.f ? "on" : "off");
   {
     const std::lock_guard<std::mutex> lock(report_mutex);
     ImGui::Text(
@@ -121,18 +122,6 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLSSMode",
-        .binding = &farcry6_dlss::dlss::dlss_mode,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "DLSS Mode",
-        .section = "Antialiasing",
-        .tooltip = "Auto runs DLAA at native resolution and Quality upscaling when the engine renders below display resolution. The TAA pass is 1:1, so it can only host DLAA; upscaling needs the upscale pass as a target.",
-        .labels = {"Auto", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"},
-        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
-        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
-    },
-    new renodx::utils::settings::Setting{
         .key = "DLSSPreset",
         .binding = &farcry6_dlss::dlss::dlss_render_preset,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -147,11 +136,11 @@ renodx::utils::settings::Settings settings = {
         .key = "DLSSJitterSource",
         .binding = &farcry6_dlss::dlss::dlss_jitter_source,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 1.f,
         .label = "Jitter Source",
         .section = "Antialiasing",
-        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Game value reads the jitter the game applies to its scene passes - not wired yet, so it currently passes zero as well and the report says so. Nothing is inferred.",
-        .labels = {"Zero", "Game value"},
+        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Projection reads it from the engine's own projection matrix, where a renderer has to apply a sub-pixel shift in normalised device coordinates - the value is read from the matrix, never inferred from a number's size or movement, and zero is passed whenever no projection with a stable shape is in hand.",
+        .labels = {"Zero", "Projection matrix"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
@@ -232,6 +221,17 @@ renodx::utils::settings::Settings settings = {
         .label = "Restore Bindings After DLSS",
         .section = "Antialiasing",
         .tooltip = "Re-applies the game's descriptor heaps and root signature after every DLSS evaluation. NGX dispatches on the command list directly, behind ReShade's hooks, and the descriptor heap binding is shared between compute and graphics, so the game's following draws would otherwise read their descriptors out of NGX's heap. Turn this off only to A/B whether it is the difference.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSTransitionDepth",
+        .binding = &farcry6_dlss::dlss::dlss_transition_depth,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Transition Depth For DLSS",
+        .section = "Antialiasing",
+        .tooltip = "Moves the scene depth into a shader-readable state for the DLSS read and restores the state the engine had it in. The engine leaves it in a depth-stencil state, where a shader read returns zeros - a depth view that is black in DLSS's debug overlay. Turn this off to see exactly that.",
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },

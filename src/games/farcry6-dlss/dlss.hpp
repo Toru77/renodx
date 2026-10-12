@@ -140,6 +140,10 @@ inline float dlss_flag_is_hdr = 0.f;
 // and the descriptor heap binding is the piece of state it cannot avoid
 // disturbing that graphics and compute share.
 inline float dlss_restore_state = 1.f;
+// Transitions the scene depth into a shader-readable state for the read and back
+// afterwards. The engine leaves it in a depth-stencil state, in which a shader
+// resource read returns zeros.
+inline float dlss_transition_depth = 1.f;
 // Calibration multiplier for the decoded motion vectors.
 inline float dlss_mv_scale = 1.f;
 inline float dlss_debug_logging = 0.f;
@@ -439,11 +443,190 @@ inline FingerprintCollision GetFingerprintCollision() {
   return fingerprint_collision;
 }
 
+// ── Scene depth read state ──
+// The scene depth is what the scene renders *into*: the engine leaves it in a
+// depth-stencil state, and a shader resource read of a resource in a depth state
+// is invalid and returns zeros — which is what a black depth view in DLSS's own
+// debug overlay looks like. NGX reads it as a shader resource, so it has to be
+// transitioned for the read and put back into the state the engine's own tracking
+// believes it is in: the engine writes its next barrier against that belief.
+//
+// Only the handful of resources we ever feed NGX as depth are tracked, so the
+// cost is a fixed number of compares per barrier the engine issues, plus one
+// store when it is one of ours.
+static constexpr uint32_t kTrackedDepthSlots = 4u;
+inline std::atomic<uint64_t> tracked_depth_resources[kTrackedDepthSlots];
+inline std::atomic<uint32_t> tracked_depth_states[kTrackedDepthSlots];
+inline std::atomic<uint32_t> tracked_depth_next{0u};
+inline std::atomic<uint64_t> stat_depth_transitions{0u};
+
+inline void OnBarrier(
+    reshade::api::command_list*, uint32_t count,
+    const reshade::api::resource* resources,
+    const reshade::api::resource_usage*,
+    const reshade::api::resource_usage* new_states) {
+  if (count == 0u || resources == nullptr || new_states == nullptr) return;
+  bool any_known = false;
+  for (uint32_t slot = 0u; slot < kTrackedDepthSlots && !any_known; ++slot) {
+    if (tracked_depth_resources[slot].load(std::memory_order_relaxed) != 0u) any_known = true;
+  }
+  if (!any_known) return;
+  for (uint32_t i = 0u; i < count; ++i) {
+    if (resources[i].handle == 0u) continue;
+    for (uint32_t slot = 0u; slot < kTrackedDepthSlots; ++slot) {
+      if (tracked_depth_resources[slot].load(std::memory_order_relaxed) != resources[i].handle) continue;
+      tracked_depth_states[slot].store(
+          static_cast<uint32_t>(new_states[i]), std::memory_order_relaxed);
+    }
+  }
+}
+
+// Registers a resource whose state we care about. A depth buffer the engine
+// ping-pongs still keeps its state this way, instead of being unknown every frame.
+// A resource is created in a state the engine chooses, and a texture it only ever
+// uses as a UAV may never be transitioned afterwards - so creation is the only
+// place its state is ever stated. That is still the engine's own answer.
+inline std::mutex initial_state_mutex;
+inline std::unordered_map<uint64_t, uint32_t> initial_states;
+
+inline void OnInitResource(
+    reshade::api::device*, const reshade::api::resource_desc&, const reshade::api::subresource_data*,
+    reshade::api::resource_usage initial_state, reshade::api::resource resource) {
+  if (resource.handle == 0u) return;
+  const std::lock_guard<std::mutex> lock(initial_state_mutex);
+  if (initial_states.size() > 8192u) initial_states.clear();
+  initial_states[resource.handle] = static_cast<uint32_t>(initial_state);
+}
+
+inline void TrackDepthResource(uint64_t resource) {
+  if (resource == 0u) return;
+  for (uint32_t slot = 0u; slot < kTrackedDepthSlots; ++slot) {
+    if (tracked_depth_resources[slot].load(std::memory_order_relaxed) == resource) return;
+  }
+  uint32_t initial = static_cast<uint32_t>(reshade::api::resource_usage::undefined);
+  {
+    const std::lock_guard<std::mutex> lock(initial_state_mutex);
+    const auto it = initial_states.find(resource);
+    if (it != initial_states.end()) initial = it->second;
+  }
+  const uint32_t slot = tracked_depth_next.fetch_add(1u, std::memory_order_relaxed) % kTrackedDepthSlots;
+  tracked_depth_resources[slot].store(resource, std::memory_order_relaxed);
+  tracked_depth_states[slot].store(initial, std::memory_order_relaxed);
+}
+
+// The state the engine last put a tracked depth in. Unknown means it has not been
+// transitioned since it was selected; it is bound as a depth-stencil view, so a
+// write state is what it will be.
+inline reshade::api::resource_usage TrackedDepthState(uint64_t resource) {
+  for (uint32_t slot = 0u; slot < kTrackedDepthSlots; ++slot) {
+    if (tracked_depth_resources[slot].load(std::memory_order_relaxed) != resource) continue;
+    return static_cast<reshade::api::resource_usage>(
+        tracked_depth_states[slot].load(std::memory_order_relaxed));
+  }
+  return reshade::api::resource_usage::undefined;
+}
+
+// Names every usage bit that is set, since the states that matter here are
+// combinations: an engine keeping a depth buffer readable in compute while it is
+// still the depth target reports depth-write|shader-resource-non-pixel, and a
+// single-name switch would call that "other".
+inline std::string ResourceStateName(reshade::api::resource_usage state) {
+  struct Bit {
+    uint32_t value;
+    const char* name;
+  };
+  static const Bit kBits[] = {
+      {static_cast<uint32_t>(reshade::api::resource_usage::depth_stencil_write), "depth-write"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::depth_stencil_read), "depth-read"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::shader_resource_pixel), "shader-resource-pixel"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::shader_resource_non_pixel), "shader-resource-non-pixel"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::render_target), "render-target"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::unordered_access), "unordered-access"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::copy_source), "copy-source"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::copy_dest), "copy-dest"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::vertex_buffer), "vertex-buffer"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::index_buffer), "index-buffer"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::constant_buffer), "constant-buffer"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::indirect_argument), "indirect-argument"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::stream_output), "stream-output"},
+      {static_cast<uint32_t>(reshade::api::resource_usage::acceleration_structure), "acceleration-structure"},
+  };
+  const uint32_t bits = static_cast<uint32_t>(state);
+  if (bits == 0u) return "undefined";
+  std::string out;
+  uint32_t remaining = bits;
+  for (const Bit& bit : kBits) {
+    if ((bits & bit.value) == 0u) continue;
+    if (!out.empty()) out += '|';
+    out += bit.name;
+    remaining &= ~bit.value;
+  }
+  if (remaining != 0u) {
+    char tail[32];
+    snprintf(tail, sizeof(tail), "%s0x%X", out.empty() ? "" : "|", remaining);
+    out += tail;
+  }
+  return out;
+}
+
 // A destroyed resource takes every fingerprint that named it with it. Without
 // this, a renderer rebuild leaves fingerprints pointing at freed resources and
 // NGX reads them.
+// The constant ring is an upload buffer, so it can be read directly. Mapping it once
+// and reading from the pointer turns a probe into a memcpy instead of a Map/Unmap
+// pair, which is what makes it affordable to probe *every* write rather than a
+// capped few. The cap was the whole problem: the camera's buffer is one of hundreds
+// written per frame, so it was reached on about two percent of frames, and the
+// jitter was therefore almost always zero.
+struct MappedRing {
+  uint64_t handle = 0u;
+  ID3D12Resource* resource = nullptr;
+  const uint8_t* data = nullptr;
+  uint64_t size = 0u;
+};
+
+inline MappedRing mapped_ring;
+inline std::mutex mapped_ring_mutex;
+
+inline const uint8_t* MappedRingData(uint64_t handle) {
+  // Fast path without the lock: the ring is one long-lived buffer, so this hits
+  // almost always, and a mutex per constant-buffer write was measurable.
+  if (handle != 0u && mapped_ring.handle == handle && mapped_ring.data != nullptr) return mapped_ring.data;
+  const std::lock_guard<std::mutex> lock(mapped_ring_mutex);
+  if (handle == 0u) return nullptr;
+  if (mapped_ring.handle == handle && mapped_ring.data != nullptr) return mapped_ring.data;
+  // A different buffer: drop the old mapping without unmapping it, since that
+  // resource is on its way out (the engine owns it) and Unmap on a destroyed
+  // resource is not something to do.
+  if (mapped_ring.resource != nullptr) mapped_ring = {};
+  auto* resource = reinterpret_cast<ID3D12Resource*>(handle);
+  if (resource == nullptr) return nullptr;
+  void* mapped = nullptr;
+  // A null range declares that the whole resource may be read, which is the case.
+  if (FAILED(resource->Map(0u, nullptr, &mapped)) || mapped == nullptr) return nullptr;
+  mapped_ring.handle = handle;
+  mapped_ring.resource = resource;
+  mapped_ring.data = static_cast<const uint8_t*>(mapped);
+  mapped_ring.size = resource->GetDesc().Width;
+  return mapped_ring.data;
+}
+
+
 inline void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
   if (device == nullptr || resource.handle == 0u) return;
+  {
+    const std::lock_guard<std::mutex> lock(initial_state_mutex);
+    initial_states.erase(resource.handle);
+  }
+  if (mapped_ring.handle == resource.handle) mapped_ring = {};
+  // A recycled handle must not inherit the state of the resource that used to
+  // live at that address.
+  for (uint32_t slot = 0u; slot < kTrackedDepthSlots; ++slot) {
+    if (tracked_depth_resources[slot].load(std::memory_order_relaxed) != resource.handle) continue;
+    tracked_depth_resources[slot].store(0u, std::memory_order_relaxed);
+    tracked_depth_states[slot].store(
+        static_cast<uint32_t>(reshade::api::resource_usage::undefined), std::memory_order_relaxed);
+  }
   const std::lock_guard<std::mutex> lock(fingerprint_mutex);
   const auto range = fingerprints_by_resource.equal_range(resource.handle);
   uint64_t removed = 0u;
@@ -460,6 +643,263 @@ inline void OnDestroyResource(reshade::api::device* device, reshade::api::resour
 // Descriptor writes. CreateShaderResourceView / CreateConstantBufferView /
 // CreateUnorderedAccessView are the only D3D12 entry points ReShade turns into
 // update_descriptor_tables, and they are the moment the view is known.
+// ── Jitter, read from the engine's own projection ──
+// A renderer jitters by shifting normalised-device coordinates, and a shift in NDC
+// has to be proportional to view depth: with clip.x = m00*x + m02*z and
+// clip.w = m32*z, the shift is m02/m32. A perspective projection leaves m02 at
+// zero unless something deliberately put a value there, which makes (m02, m12) the
+// one place in the frame where the jitter exists as data. The value is therefore
+// read, never guessed from its size or movement, and the buffer it was read from
+// has to keep the same shape before the value is used.
+//
+// Buffers are read when the engine writes their descriptor, while the data is
+// fresh, and the one that matched is re-read once per frame afterwards. Probing is
+// capped per frame and stops entirely once a projection is in hand.
+struct ProjectionJitter {
+  bool valid = false;
+  bool transposed = false;   // storage order of the matching matrix
+  uint64_t buffer = 0u;
+  uint64_t offset = 0u;
+  uint32_t size = 0u;
+  float base_xx = 0.f;       // [0][0]
+  float base_yy = 0.f;       // [1][1]
+  float base_zz = 0.f;       // [2][2]
+  float base_zw = 0.f;       // [2][3]
+  float ndc_x = 0.f;
+  float ndc_y = 0.f;
+  float pixels_x = 0.f;
+  float pixels_y = 0.f;
+  float last_pixels_x = 0.f;  // to notice a buffer that stopped changing: stale
+  float last_pixels_y = 0.f;
+  uint32_t frozen_frames = 0u;
+  bool matched_this_frame = false;  // probing found it in this frame
+  uint32_t hint_size = 0u;          // its constant buffer's declared size
+  uint64_t relative_offset = 0u;    // where the matrix sits inside that buffer
+  uint64_t probes = 0u;
+  uint64_t adoptions = 0u;
+  uint64_t losses = 0u;
+};
+
+inline ProjectionJitter projection_jitter;
+static constexpr uint32_t kProjectionProbesPerFrame = 48u;
+static constexpr uint32_t kProjectionMaxBytes = 65536u;
+inline uint32_t projection_probes_left = kProjectionProbesPerFrame;
+// A full scan reads and walks a whole constant buffer; when it finds nothing it is
+// not worth repeating every frame, so attempts are spaced out.
+inline uint32_t projection_scan_cooldown = 0u;
+// Aspect ratio of the render extent, set once per frame from the evaluation. Zero
+// disables the aspect test rather than accepting every matrix.
+inline float projection_aspect_xx = 0.f;
+
+// Tests sixteen consecutive floats as a perspective projection in either storage
+// order and, if the shape matches, returns the two entries that can only be a
+// deliberate NDC shift.
+inline bool MatchProjection(
+    const float* m, bool transposed, float& out_ndc_x, float& out_ndc_y,
+    float& out_base_xx, float& out_base_yy, float& out_base_zz, float& out_base_zw) {  const auto at = [&](uint32_t row, uint32_t column) {
+    return m[transposed ? (column * 4u + row) : (row * 4u + column)];
+  };
+  const auto near_zero = [](float value, float epsilon) { return fabsf(value) <= epsilon; };
+
+  // The w row of a perspective projection: nothing, the depth sign, nothing.
+  // Every test below is a rejection, and every comparison against NaN is false, so
+  // a buffer of NaNs would pass all of them. Finiteness comes first.
+  for (uint32_t i = 0u; i < 16u; ++i) {
+    if (!std::isfinite(m[i])) return false;
+  }
+  if (!near_zero(at(3u, 0u), 1e-5f) || !near_zero(at(3u, 1u), 1e-5f) || !near_zero(at(3u, 3u), 1e-5f)) return false;
+  if (fabsf(fabsf(at(3u, 2u)) - 1.0f) > 1e-3f) return false;
+  // The x and y rows carry their focal scale and, apart from the jitter, nothing.
+  if (!near_zero(at(0u, 1u), 1e-5f) || !near_zero(at(0u, 3u), 1e-5f)) return false;
+  if (!near_zero(at(1u, 0u), 1e-5f) || !near_zero(at(1u, 3u), 1e-5f)) return false;
+
+  const float xx = at(0u, 0u);
+  const float yy = at(1u, 1u);
+  const float zz = at(2u, 2u);
+  const float zw = at(2u, 3u);
+  if (fabsf(xx) < 0.01f || fabsf(yy) < 0.01f) return false;
+  // [2][2] is deliberately not required: an infinite-far projection leaves it at
+  // zero, and that is what a modern renderer uses. The near/far term below is the
+  // part every projection has.
+  (void)zz;
+  // A projection maps depth onto something: without a near/far term at [2][3] this
+  // is a rotation or an identity with a translation - both of which share the
+  // (0, 0, +/-1, 0) pattern above and are common in the same buffers (the minimap's
+  // own transform matched here before this test existed).
+  if (fabsf(zw) < 1e-4f) return false;
+
+  // The focal scales are in proportion to the aspect ratio, which is what makes
+  // this a projection of this frame's viewport rather than any other matrix.
+  if (projection_aspect_xx > 0.01f) {
+    const float ratio = fabsf(yy / xx);
+    if (fabsf(ratio - projection_aspect_xx) > 0.05f) return false;
+  }
+
+  const float w = at(3u, 2u);
+  const float nx = at(0u, 2u) / w;
+  const float ny = at(1u, 2u) / w;
+  // A jitter is sub-pixel; anything larger is not one.
+  if (fabsf(nx) > 0.002f || fabsf(ny) > 0.002f) return false;
+
+  out_ndc_x = nx;
+  out_ndc_y = ny;
+  out_base_xx = xx;
+  out_base_yy = yy;
+  out_base_zz = zz;
+  out_base_zw = zw;
+  return true;
+}
+
+// Reads one constant buffer and reports whether it holds a perspective projection.
+inline bool ReadProjectionFromBuffer(const reshade::api::buffer_range& range, ProjectionJitter& out) {
+  out = {};
+  if (range.buffer.handle == 0u) return false;
+  // Read from the mapping rather than mapping again: a second Map on a resource
+  // this code already holds open fails, which is what silently stopped the
+  // discovery from ever finding anything.
+  const uint8_t* mapped = MappedRingData(range.buffer.handle);
+  if (mapped == nullptr) return false;
+  uint64_t begin = range.offset == UINT64_MAX ? 0u : range.offset;
+  if (begin >= mapped_ring.size) return false;
+  uint64_t bytes = range.size == UINT64_MAX ? 0u : range.size;
+  if (bytes == 0u || bytes > kProjectionMaxBytes) bytes = kProjectionMaxBytes;
+  if (begin + bytes > mapped_ring.size) bytes = mapped_ring.size - begin;
+  if (bytes < 16u * sizeof(float)) return false;
+  const auto* floats = reinterpret_cast<const float*>(mapped + begin);
+  const uint32_t count = static_cast<uint32_t>(bytes / sizeof(float));
+
+  for (uint32_t block = 0u; block + 16u <= count; ++block) {
+    const float* m = floats + static_cast<size_t>(block) * 4u;
+    for (uint32_t order = 0u; order < 2u; ++order) {
+      float nx = 0.f, ny = 0.f, xx = 0.f, yy = 0.f, zz = 0.f, zw = 0.f;
+      if (!MatchProjection(m, order != 0u, nx, ny, xx, yy, zz, zw)) continue;
+      out.valid = true;
+      out.transposed = order != 0u;
+      out.buffer = range.buffer.handle;
+      out.offset = begin + static_cast<uint64_t>(block) * 4u * sizeof(float);
+      out.relative_offset = out.offset - begin;
+      out.size = static_cast<uint32_t>(bytes);
+      out.base_xx = xx;
+      out.base_yy = yy;
+      out.base_zz = zz;
+      out.base_zw = zw;
+      out.ndc_x = nx;
+      out.ndc_y = ny;
+      resource->Unmap(0u, &written_range);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Called when the engine writes a constant buffer descriptor: the projection is
+// recognised while its data is fresh, instead of scanning the ring for something
+// that looks like a matrix.
+inline void ProbeConstantBufferForProjection(const reshade::api::buffer_range& range) {
+  if (range.buffer.handle == 0u || range.size == UINT64_MAX) return;
+  // Without an aspect to compare against, an orthographic projection - a shadow
+  // matrix, say - matches the shape test and would be adopted as the camera.
+  if (projection_aspect_xx <= 0.01f) return;
+  if (range.size < 16u * sizeof(float) || range.size > kProjectionMaxBytes) return;
+
+  if (projection_jitter.hint_size != 0u && !projection_jitter.matched_this_frame) {
+    // Its size is known but this frame has not found it yet: only writes of that
+    // size are candidates, and of those only the sixteen floats the matrix occupies
+    // are read - which is what makes it affordable to check every one of them.
+    // The base is deliberately not required to match here. It legitimately moves
+    // when the field of view changes - a scope, sights - and requiring it froze the
+    // record at the first FOV captured, rejecting every frame afterwards. What is
+    // required is the shape, the aspect, and later the sub-pixel magnitude; a wrong
+    // match is almost always a static projection, whose jitter is zero anyway.
+    if (range.size == projection_jitter.hint_size) {
+      const uint8_t* data = MappedRingData(range.buffer.handle);
+      if (data != nullptr && range.offset != UINT64_MAX) {
+        const uint64_t at = range.offset + projection_jitter.relative_offset;
+        if (at + 16u * sizeof(float) <= mapped_ring.size) {
+          float m[16] = {};
+          std::memcpy(m, data + at, sizeof(m));
+          float nx = 0.f, ny = 0.f, xx = 0.f, yy = 0.f, zz = 0.f, zw = 0.f;
+          if (MatchProjection(m, projection_jitter.transposed, nx, ny, xx, yy, zz, zw)) {
+            projection_jitter.ndc_x = nx;
+            projection_jitter.ndc_y = ny;
+            projection_jitter.base_xx = xx;
+            projection_jitter.base_yy = yy;
+            projection_jitter.matched_this_frame = true;
+            ++projection_jitter.probes;
+            return;
+          }
+        }
+      }
+    }
+    // Nothing matched at the known place, so the record is re-found from scratch.
+  }
+
+  if (projection_jitter.matched_this_frame || projection_probes_left == 0u) return;
+  if (projection_scan_cooldown > 0u) {
+    --projection_scan_cooldown;
+    return;
+  }
+  projection_scan_cooldown = 60u;
+  --projection_probes_left;
+  ProjectionJitter found;
+  if (!ReadProjectionFromBuffer(range, found)) return;
+  found.adoptions = projection_jitter.adoptions + 1u;
+  found.losses = projection_jitter.losses;
+  found.probes = projection_jitter.probes;
+  found.hint_size = projection_jitter.hint_size != 0u
+      ? projection_jitter.hint_size
+      : static_cast<uint32_t>(range.size);
+  found.matched_this_frame = true;
+  projection_jitter = found;
+}
+
+// Re-reads the buffer the projection was found in. The engine rewrites it every
+// frame, so this is what keeps the value current; a buffer that no longer has the
+// same shape, or that stops changing at all (a stale slot), is dropped and found
+// again from the descriptors the engine writes next.
+inline void RefreshProjectionJitter(uint32_t render_width, uint32_t render_height) {
+  projection_probes_left = kProjectionProbesPerFrame;
+  projection_aspect_xx = render_height != 0u
+      ? static_cast<float>(render_width) / static_cast<float>(render_height)
+      : 0.f;
+  auto& js = projection_jitter;
+  if (!js.valid) return;
+  // The jitter changes every frame, so a value from an earlier frame is not a
+  // stale-but-close answer, it is a wrong one: it counts only when probing found
+  // the projection during this frame. No address is remembered, so there is
+  // nothing to go stale when the constant ring moves.
+  if (!js.matched_this_frame) {
+    js.valid = false;
+    ++js.losses;
+    return;
+  }
+  // NDC is [-1, 1] over the render extent, and the y axis flips between NDC (up)
+  // and pixel space (down), which is the space DLSS takes its offsets in.
+  const float pixels_x = js.ndc_x * static_cast<float>(render_width) * 0.5f;
+  const float pixels_y = -js.ndc_y * static_cast<float>(render_height) * 0.5f;
+  if (!std::isfinite(pixels_x) || !std::isfinite(pixels_y)
+      || fabsf(pixels_x) > 0.5f || fabsf(pixels_y) > 0.5f) {
+    js.valid = false;
+    ++js.losses;
+    return;
+  }
+  if (pixels_x == js.last_pixels_x && pixels_y == js.last_pixels_y) {
+    if (++js.frozen_frames > 30u) {
+      js.valid = false;
+      ++js.losses;
+      return;
+    }
+  } else {
+    js.frozen_frames = 0u;
+  }
+  js.last_pixels_x = pixels_x;
+  js.last_pixels_y = pixels_y;
+  js.pixels_x = pixels_x;
+  js.pixels_y = pixels_y;
+  ++js.probes;
+}
+
+
 inline bool OnUpdateDescriptorTables(
     reshade::api::device* device,
     uint32_t count,
@@ -486,6 +926,7 @@ inline bool OnUpdateDescriptorTables(
         record.range = static_cast<const reshade::api::buffer_range*>(update.descriptors)[k];
         record.has_range = record.range.buffer.handle != 0u;
         if (!record.has_range) continue;
+        ProbeConstantBufferForProjection(record.range);
       } else {
         const reshade::api::resource_view view =
             update.type == reshade::api::descriptor_type::sampler_with_resource_view
@@ -901,6 +1342,7 @@ inline reshade::api::format scene_depth_format = reshade::api::format::unknown;
 inline std::atomic<uint32_t> last_render_width{0u};
 inline std::atomic<uint32_t> last_render_height{0u};
 
+
 inline void FlushDepthDraws(reshade::api::device* device, CommandListData* data) {
   if (data == nullptr || data->dsv.handle == 0u) return;
   if (data->dsv_draws == 0u) return;
@@ -948,6 +1390,10 @@ inline void SelectSceneDepth(reshade::api::device* device) {
   scene_depth_width = desc.texture.width;
   scene_depth_height = desc.texture.height;
   scene_depth_format = desc.texture.format;
+  // Its state has to be known to read it as a shader resource. Registering it
+  // here, at the frame boundary, means the engine's transitions during the next
+  // frame are recorded before NGX needs them.
+  TrackDepthResource(best);
 }
 
 
@@ -1337,11 +1783,33 @@ inline int GetPerfQualityValue(uint32_t input_width, uint32_t input_height, uint
   if (mode == 3) return static_cast<int>(NVSDK_NGX_PerfQuality_Value_Balanced);
   if (mode == 4) return static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxPerf);
   if (mode == 5) return static_cast<int>(NVSDK_NGX_PerfQuality_Value_UltraPerformance);
-  // Auto: native-size inputs run DLAA, smaller inputs run Quality upscaling.
-  if (input_width == target_width && input_height == target_height) {
+  if (input_width == 0u || input_height == 0u || input_width == target_width) {
     return static_cast<int>(NVSDK_NGX_PerfQuality_Value_DLAA);
   }
-  return static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality);
+  // Each quality name is one fixed ratio, and DLSS derives the extent it works at
+  // from it: asking for the wrong one makes it compute and write at a different
+  // size than the resource it has been given. The closest ratio wins, measured in
+  // log space so 1.5x and 2x are equidistant from 1.7x rather than 1.7x being nearer.
+  const float ratio = static_cast<float>(target_width) / static_cast<float>(input_width);
+  struct QualityRatio {
+    float factor;
+    NVSDK_NGX_PerfQuality_Value value;
+  };
+  static const QualityRatio kRatios[] = {
+      {1.5f, NVSDK_NGX_PerfQuality_Value_MaxQuality},
+      {1.7f, NVSDK_NGX_PerfQuality_Value_Balanced},
+      {2.0f, NVSDK_NGX_PerfQuality_Value_MaxPerf},
+      {3.0f, NVSDK_NGX_PerfQuality_Value_UltraPerformance},
+  };
+  float best_delta = 1e9f;
+  int best = static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality);
+  for (const QualityRatio& candidate : kRatios) {
+    const float delta = fabsf(logf(ratio) - logf(candidate.factor));
+    if (delta >= best_delta) continue;
+    best_delta = delta;
+    best = static_cast<int>(candidate.value);
+  }
+  return best;
 }
 
 inline void SetRenderPresetParameters(NVSDK_NGX_Parameter* parameters, int render_preset) {
@@ -1622,6 +2090,8 @@ struct DeployReport {
   int flags = 0;
   float jitter_x = 0.f;
   float jitter_y = 0.f;
+  uint32_t depth_state_before = 0u;
+  bool depth_transitioned = false;
   uint64_t evals = 0u;
   uint64_t resets = 0u;
   uint64_t bypass = 0u;
@@ -1734,6 +2204,137 @@ inline void RestoreGameDescriptorState(reshade::api::command_list* cmd_list) {
       reshade::api::shader_stage::all_graphics, layout, 0u, 0u, nullptr);
 }
 
+// ── FSR1 as the upscaler ──
+// With FSR1 on, the game upscales in its own pass: a compute dispatch that reads
+// the internal-resolution image and writes the display-resolution one, with the
+// minimap and UI composited afterwards instead of inside it. That is the place for
+// DLSS to upscale - the input is still the scene's own aliased colour, and the
+// game's later stages keep reading exactly what they expect.
+inline constexpr uint32_t kFsr1EasuHash = 0x4E927DB0u;
+inline std::atomic<bool> fsr1_active{false};   // seen last frame, so this one too
+inline bool fsr1_seen_this_frame = false;
+inline std::atomic<uint32_t> fsr1_target_width{0u};
+inline std::atomic<uint32_t> fsr1_target_height{0u};
+inline std::atomic<uint32_t> fsr1_target_format{0u};
+inline std::atomic<uint64_t> fsr1_output_resource{0u};
+inline std::atomic<uint64_t> stat_fsr1_replaced{0u};
+inline std::atomic<uint64_t> stat_fsr1_misses{0u};
+// Set when the evaluation wrote the game's upscale resource this frame, which is
+// the only case in which the game's own dispatch may be taken out.
+inline std::atomic<bool> fsr1_wrote_this_frame{false};
+
+// The upscaler's output is the display-resolution UAV it dispatches to. Which slot
+// it sits in is not assumed: the bindings are walked and the largest target wins,
+// which is the display-resolution image rather than any scratch buffer.
+inline bool ResolveDispatchOutput(
+    reshade::api::command_list* cmd_list,
+    const CommandListData* data,
+    uint32_t expected_width, uint32_t expected_height,
+    reshade::api::resource& out_resource,
+    uint32_t& out_width, uint32_t& out_height, uint32_t& out_format) {
+  out_resource = {};
+  out_width = 0u;
+  out_height = 0u;
+  out_format = 0u;
+  auto* device = cmd_list != nullptr ? cmd_list->get_device() : nullptr;
+  if (device == nullptr || data == nullptr) return false;
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr) return false;
+  auto* compute_state = renodx::utils::shader::GetCurrentComputeState(shader_state);
+  if (compute_state == nullptr) return false;
+  renodx::utils::shader::PopulateStageState(compute_state);
+  if (compute_state->pipeline_details == nullptr) return false;
+  const reshade::api::pipeline_layout layout = compute_state->pipeline_details->layout;
+  if (layout.handle == 0u) return false;
+
+  uint32_t params[8] = {};
+  uint32_t bindings[8] = {};
+  const uint32_t count = FindTablesForRegister(
+      layout, 0u, 0u, reshade::api::descriptor_type::texture_unordered_access_view, params, bindings, 8u);
+  uint64_t best_area = 0u;
+  for (uint32_t i = 0u; i < count; ++i) {
+    if (params[i] >= data->descriptor_tables.size()) continue;
+    const auto table = data->descriptor_tables[params[i]];
+    if (table.handle == 0u) continue;
+    DescriptorFingerprint key;
+    if (!ReadSlotFingerprint(device, table, bindings[i], key)) continue;
+    RecordedDescriptor record;
+    if (!LookupFingerprint(key, record)) continue;
+    if (!record.has_resource) continue;
+    const reshade::api::resource_desc desc = device->get_resource_desc(record.resource);
+    if (desc.type != reshade::api::resource_type::texture_2d) continue;
+    // The target has to be exactly the image DLSS produced. A descriptor slot is
+    // recycled and its bytes can name a different resource entirely, and copying
+    // into a 16x16 one is an invalid call that takes the device with it - so the
+    // size is the test, not being the largest binding here.
+    // Identifying the upscaler's output must not depend on the size this frame is
+    // currently writing, or the two can never meet: the target is recognised by
+    // being a plain 2D texture larger than the render extent, in the render's own
+    // aspect, in a format that can be written.
+    if (desc.texture.width <= expected_width || desc.texture.height <= expected_height) continue;
+    if (desc.texture.levels != 1u || desc.texture.depth_or_layers != 1u || desc.texture.samples != 1u) continue;
+    if (static_cast<uint64_t>(desc.texture.width) * expected_height
+        != static_cast<uint64_t>(desc.texture.height) * expected_width) {
+      continue;
+    }
+    const auto candidate_format = static_cast<DXGI_FORMAT>(desc.texture.format);
+    if (candidate_format != DXGI_FORMAT_R8G8B8A8_UNORM
+        && candidate_format != DXGI_FORMAT_R16G16B16A16_FLOAT
+        && candidate_format != DXGI_FORMAT_R11G11B10_FLOAT) {
+      continue;
+    }
+    const uint64_t area = static_cast<uint64_t>(desc.texture.width) * desc.texture.height;
+    if (area < best_area) continue;
+    best_area = area;
+    out_resource = record.resource;
+    out_width = desc.texture.width;
+    out_height = desc.texture.height;
+    out_format = static_cast<uint32_t>(desc.texture.format);
+  }
+  return out_resource.handle != 0u;
+}
+
+// Replaces the upscaler dispatch: DLSS has already produced the display-resolution
+// image this frame, so it is moved into the resource the dispatch would have
+// written and the dispatch itself is prevented.
+inline bool OnDispatch(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
+  if (dlss_enabled == 0.f || !any_nvidia.load()) return false;
+  if (cmd_list == nullptr) return false;
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr) return false;
+  if (renodx::utils::shader::GetCurrentComputeShaderHash(shader_state) != kFsr1EasuHash) return false;
+  // Seeing the dispatch is what tells the frame that the game has an upscaler to
+  // hand over - without this the evaluation never targets the display resolution
+  // and the dispatch is never prevented, each waiting on the other.
+  fsr1_seen_this_frame = true;
+  auto* data = Get(cmd_list);
+  if (data == nullptr) return false;
+
+  const uint32_t render_width = last_render_width.load();
+  const uint32_t render_height = last_render_height.load();
+  reshade::api::resource output = {};
+  uint32_t width = 0u, height = 0u, format = 0u;
+  if (render_width == 0u || render_height == 0u
+      || !ResolveDispatchOutput(cmd_list, data, render_width, render_height, output, width, height, format)) {
+    stat_fsr1_misses.fetch_add(1u, std::memory_order_relaxed);
+    return false;
+  }
+  TrackDepthResource(output.handle);
+  // What the upscaler writes is what the next frame's evaluation targets: the size
+  // can only be learned from here, and it must not be matched against this frame's
+  // output size or the two can never meet.
+  fsr1_target_width.store(width);
+  fsr1_target_height.store(height);
+  fsr1_target_format.store(format);
+  fsr1_output_resource.store(output.handle);
+  // NGX writes into this resource directly, at the evaluation point, so there is
+  // nothing to copy: this only takes the game's dispatch out of the way once that
+  // write has actually happened. A frame where it did not keeps the game's upscale.
+  if (!fsr1_wrote_this_frame.load()) return false;
+  stat_fsr1_replaced.fetch_add(1u, std::memory_order_relaxed);
+  return true;
+}
+
 inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandListData* data, uint32_t hash) {
   if (cmd_list == nullptr || data == nullptr || dlss_enabled == 0.f || !IsSupported()) return false;
   auto* device = cmd_list->get_device();
@@ -1844,8 +2445,24 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // colour resolution is caught below instead of silently becoming the input.
   const uint32_t input_width = static_cast<uint32_t>(output_desc.Width);
   const uint32_t input_height = output_desc.Height;
-  const uint32_t target_width = input_width;
-  const uint32_t target_height = input_height;
+  // With the game's own upscaler running, DLSS *is* the upscaler: its output is the
+  // display-resolution image the upscaler would have written, at the size the last
+  // replaced dispatch reported.
+  const uint64_t fsr1_target_handle = fsr1_output_resource.load();
+  // The resource is written by NGX directly, so it may only be used once the
+  // engine has stated a state for it: an unknown state means no write this frame.
+  const reshade::api::resource_usage fsr1_target_state = fsr1_target_handle != 0u
+      ? TrackedDepthState(fsr1_target_handle)
+      : reshade::api::resource_usage::undefined;
+  const bool fsr1_mode = fsr1_active.load() && fsr1_target_width.load() != 0u
+      && fsr1_target_handle != 0u
+      && fsr1_target_state != reshade::api::resource_usage::undefined;
+  const reshade::api::resource fsr1_target_resource{fsr1_target_handle};
+  const bool fsr1_needs_write_transition = fsr1_mode
+      && (static_cast<uint32_t>(fsr1_target_state)
+          & static_cast<uint32_t>(reshade::api::resource_usage::unordered_access)) == 0u;
+  const uint32_t target_width = fsr1_mode ? fsr1_target_width.load() : input_width;
+  const uint32_t target_height = fsr1_mode ? fsr1_target_height.load() : input_height;
   if (input_width == 0u || input_height == 0u) {
     NoteFail(kFailSize);
     return false;
@@ -1927,9 +2544,23 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     }
   }
 
-  // NGX output format follows the TAA target. Anything else keeps vanilla TAA.
+  // Published before anything can return early: the depth selection filters its
+  // candidates by this size, and the projection test needs the aspect. Leaving them
+  // to the evaluation meant that when the evaluation stopped running, the depth
+  // selection fell back to ranking by draw count and picked a shadow cascade.
+  last_render_width.store(input_width);
+  last_render_height.store(input_height);
+  projection_aspect_xx = input_height != 0u
+      ? static_cast<float>(input_width) / static_cast<float>(input_height)
+      : 0.f;
+
+  // NGX output format follows whatever the output resource will be: the TAA target
+  // normally, the upscaler's target when DLSS is doing the upscaling.
+  const DXGI_FORMAT wanted_format = (fsr1_mode && fsr1_target_format.load() != 0u)
+      ? static_cast<DXGI_FORMAT>(fsr1_target_format.load())
+      : output_desc.Format;
   DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
-  switch (output_desc.Format) {
+  switch (wanted_format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
       output_format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1995,10 +2626,15 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     command_list->CopyResource(ngx.output_texture.Get(), grey);
     cmd_list->barrier(2u, fill_resources, fill_after, fill_before);
 
-    if (!CopyThroughTaaTarget(cmd_list, command_list, output_target, ngx.output_texture.Get(),
-                              reshade::api::resource_usage::unordered_access)) {
-      NoteFail(kFailPlaceholder);
-      return false;
+    // With the game's upscaler active, DLSS's texture is display-resolution and the
+    // TAA target is not, so there is no correct destination here: the image is left
+    // to the game's own upscaler in that configuration rather than copied wrongly.
+    if (!fsr1_active.load()) {
+      if (!CopyThroughTaaTarget(cmd_list, command_list, output_target, ngx.output_texture.Get(),
+                                reshade::api::resource_usage::unordered_access)) {
+        NoteFail(kFailPlaceholder);
+        return false;
+      }
     }
     {
       const std::lock_guard<std::mutex> lock(report_mutex);
@@ -2020,6 +2656,16 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
   if (!EnsureOutputTexture(ngx.device.Get(), target_width, target_height, output_format)) return false;
+
+  // Without the game's upscaler there is nowhere for the evaluation's output to go:
+  // it writes a display-resolution target, and the internal-resolution TAA target
+  // is about to be written by the draw itself - which now runs. The inputs are
+  // resolved above, so the report keeps reporting them either way, and nothing is
+  // dispatched to the GPU for a result the game would immediately overwrite.
+  if (!use_bypass && (!fsr1_active.load() || fsr1_target_width.load() == 0u)) {
+    stat_fail_code.store(kFailNone);
+    return false;
+  }
 
   const uint32_t motion_src_width = use_motion_placeholder
       ? placeholders.width
@@ -2076,18 +2722,32 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
 
-  // Jitter stays zero: the game's own jitter lives in its scene passes' constant
-  // buffers, and nothing identifies it from here yet, so passing zero is the only
-  // honest option. Inventing a value from a heuristic is what broke the image in
-  // earlier builds.
+  // Jitter: read from the engine's own projection, where a renderer has to apply
+  // it. Nothing is inferred from a value's size or movement, and zero is passed
+  // whenever no projection with a stable shape is in hand.
   last_render_width.store(input_width);
   last_render_height.store(input_height);
-  const float jitter_x = 0.f;
-  const float jitter_y = 0.f;
+  RefreshProjectionJitter(input_width, input_height);
+  float jitter_x = 0.f;
+  float jitter_y = 0.f;
+  if (dlss_jitter_source > 0.5f && projection_jitter.valid) {
+    jitter_x = projection_jitter.pixels_x;
+    jitter_y = projection_jitter.pixels_y;
+  }
+  // Nothing that is not a finite number reaches NGX, and nothing outside
+  // sub-pixel range either: a jitter is a sub-pixel offset, so a larger value can
+  // only be a read error.
+  if (!std::isfinite(jitter_x) || !std::isfinite(jitter_y)
+      || fabsf(jitter_x) > 0.5f || fabsf(jitter_y) > 0.5f) {
+    jitter_x = 0.f;
+    jitter_y = 0.f;
+  }
 
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
   eval.Feature.pInColor = color;
-  eval.Feature.pInOutput = ngx.output_texture.Get();
+  eval.Feature.pInOutput = fsr1_mode
+      ? reinterpret_cast<ID3D12Resource*>(fsr1_target_handle)
+      : ngx.output_texture.Get();
   eval.pInDepth = depth;
   eval.pInMotionVectors = motion_vectors;
   eval.InJitterOffsetX = jitter_x;
@@ -2114,7 +2774,43 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     }
   }
 
+  // NGX reads the depth as a shader resource in a compute dispatch, so the depth
+  // has to be in a non-pixel shader-readable state for that read to return data.
+  // The engine leaves it in a depth-stencil state, where the read returns zeros —
+  // a black depth view in DLSS's own debug overlay. It is put back into the state
+  // the engine's tracking believes it is in afterwards, because the engine writes
+  // its next barrier against that belief and not against what actually happened.
+  const reshade::api::resource depth_resource{scene_depth_resource};
+  reshade::api::resource_usage depth_state = reshade::api::resource_usage::undefined;
+  if (!use_depth_mask && !use_depth_placeholder && scene_depth != nullptr) {
+    depth_state = TrackedDepthState(scene_depth_resource);
+    // Bound as a depth-stencil view, so that is what it is while the tracker has
+    // not seen a barrier for it yet.
+    if (depth_state == reshade::api::resource_usage::undefined) {
+      depth_state = reshade::api::resource_usage::depth_stencil_write;
+    }
+  }
+  const bool depth_needs_read_transition = dlss_transition_depth != 0.f
+      && depth_state != reshade::api::resource_usage::undefined
+      && (static_cast<uint32_t>(depth_state)
+          & static_cast<uint32_t>(reshade::api::resource_usage::shader_resource_non_pixel)) == 0u;
+  if (depth_needs_read_transition) {
+    cmd_list->barrier(depth_resource, depth_state, reshade::api::resource_usage::shader_resource_non_pixel);
+    stat_depth_transitions.fetch_add(1u, std::memory_order_relaxed);
+  }
+  // NGX writes the upscaler's own resource, which it can only do while that
+  // resource is writable.
+  if (fsr1_needs_write_transition) {
+    cmd_list->barrier(fsr1_target_resource, fsr1_target_state, reshade::api::resource_usage::unordered_access);
+  }
+
   const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(command_list, ngx.feature, ngx.runtime_parameters, &eval);
+  if (depth_needs_read_transition) {
+    cmd_list->barrier(depth_resource, reshade::api::resource_usage::shader_resource_non_pixel, depth_state);
+  }
+  if (fsr1_needs_write_transition) {
+    cmd_list->barrier(fsr1_target_resource, reshade::api::resource_usage::unordered_access, fsr1_target_state);
+  }
   // Restored before anything else: the evaluation dispatched on the native
   // command list, and the game's own commands follow ours on this same list.
   if (dlss_restore_state != 0.f) RestoreGameDescriptorState(cmd_list);
@@ -2129,6 +2825,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
   ngx.reset = false;
   NoteSuccess();
+  // The game's dispatch is only taken out for frames DLSS actually wrote.
+  if (fsr1_mode) fsr1_wrote_this_frame.store(true);
 
   {
     const std::lock_guard<std::mutex> lock(report_mutex);
@@ -2145,6 +2843,8 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     deploy_report.flags = feature_flags;
     deploy_report.jitter_x = jitter_x;
     deploy_report.jitter_y = jitter_y;
+    deploy_report.depth_state_before = static_cast<uint32_t>(depth_state);
+    deploy_report.depth_transitioned = depth_needs_read_transition;
     ++deploy_report.evals;
     if (eval.InReset != 0) ++deploy_report.resets;
   }
@@ -2156,9 +2856,13 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   }
 
   // DLSS wrote the target; move it into the TAA output so the game keeps
-  // running its own pipeline on top. The bypass above uses the same call.
-  CopyThroughTaaTarget(cmd_list, command_list, output_target, ngx.output_texture.Get(),
-                       reshade::api::resource_usage::unordered_access);
+  // running its own pipeline on top. With the game's upscaler doing that step,
+  // the dispatch moves DLSS's output into the resource it would have written
+  // instead, so nothing is copied here.
+  if (!fsr1_mode) {
+    CopyThroughTaaTarget(cmd_list, command_list, output_target, ngx.output_texture.Get(),
+                         reshade::api::resource_usage::unordered_access);
+  }
 
   if (!ngx.logged_success) {
     ngx.logged_success = true;
@@ -2206,9 +2910,11 @@ inline std::string BuildDebugReport() {
       "  last eval        : in=%ux%u target=%ux%u mv=%ux%u depth=%ux%u\n"
       "  quality / preset : %s / %s   flags=0x%X\n"
       "  evals/resets/bypass : %llu / %llu / %llu\n"
-      "  jitter ngx px    : (%.4f, %.4f)   game value not wired, zero is passed\n"
+      "  jitter ngx px    : (%.4f, %.4f)\n"
       "  mv scale         : %.3f   mv jittered=%s   depth inverted=%s\n"
-      "  hdr / restore    : %s / %s\n",
+      "  hdr / restore    : %s / %s\n"
+      "  depth transition : %s\n"
+      "  upscaler         : %s   replaced=%llu misses=%llu target=%ux%u fmt=%u res=0x%llX\n",
       std::string(renodx::build_info::kBuildVersion).c_str(),
       DeviceSummary().c_str(),
       static_cast<unsigned long long>(stat_taa_draws.load()),
@@ -2239,7 +2945,13 @@ inline std::string BuildDebugReport() {
       dlss_motion_vectors_jittered != 0.f ? "on" : "off",
       dlss_depth_inverted != 0.f ? "on" : "off",
       dlss_flag_is_hdr != 0.f ? "on" : "off",
-      dlss_restore_state != 0.f ? "on" : "off");
+      dlss_restore_state != 0.f ? "on" : "off",
+      dlss_transition_depth != 0.f ? "on" : "off",
+      fsr1_active.load() ? "game upscaler (DLSS upscales there)" : "game (DLSS at the TAA, internal res)",
+      static_cast<unsigned long long>(stat_fsr1_replaced.load()),
+      static_cast<unsigned long long>(stat_fsr1_misses.load()),
+      fsr1_target_width.load(), fsr1_target_height.load(), fsr1_target_format.load(),
+      static_cast<unsigned long long>(fsr1_output_resource.load()));
   std::string out(buf);
   // What actually feeds NGX as depth, and how it was found: the scene depth is
   // identified by usage, so its resource, size, format and bind count are the
@@ -2264,12 +2976,56 @@ inline std::string BuildDebugReport() {
              static_cast<unsigned long long>(last_b0_offset.load()));
     out += line;
   }
-  // Jitter: reported as what is actually passed, never as a guess. The game's own
-  // value is not read yet, so this says so rather than implying it was found.
+  // What state the depth was in when NGX read it, and whether that needed a
+  // transition. A depth buffer in a depth-stencil state reads as zeros, which is
+  // silent everywhere except DLSS's own debug overlay.
+  {
+    char line[320];
+    const auto before = static_cast<reshade::api::resource_usage>(report.depth_state_before);
+    if (report.depth_state_before == 0u) {
+      snprintf(line, sizeof(line), "  depth read state : n/a (placeholder or mask depth)\n");
+    } else if (report.depth_transitioned) {
+      snprintf(line, sizeof(line), "  depth read state : %s -> shader-resource-non-pixel (restored)\n",
+               ResourceStateName(before).c_str());
+    } else {
+      snprintf(line, sizeof(line), "  depth read state : readable as-is (%s)\n",
+               ResourceStateName(before).c_str());
+    }
+    out += line;
+  }
+  {
+    char line[160];
+    snprintf(line, sizeof(line), "  depth transitions: %llu\n",
+             static_cast<unsigned long long>(stat_depth_transitions.load()));
+    out += line;
+  }
+  // Jitter: what the projection read produced, and why it did or did not produce
+  // anything. The value DLSS was handed is on the line above.
+  {
+    char line[320];
+    const auto& js = projection_jitter;
+    if (dlss_jitter_source <= 0.5f) {
+      snprintf(line, sizeof(line), "  jitter source    : zero (manual)\n");
+    } else if (!js.valid) {
+      snprintf(line, sizeof(line),
+               "  jitter source    : projection, none in hand (%llu adopted, %llu lost)\n",
+               static_cast<unsigned long long>(js.adoptions), static_cast<unsigned long long>(js.losses));
+    } else {
+      snprintf(line, sizeof(line),
+               "  jitter source    : projection at %llu+%u%s, ndc=(%.6f, %.6f) -> px=(%.4f, %.4f), reads=%llu\n",
+               static_cast<unsigned long long>(js.offset), js.size, js.transposed ? " (transposed)" : "",
+               static_cast<double>(js.ndc_x), static_cast<double>(js.ndc_y),
+               static_cast<double>(js.pixels_x), static_cast<double>(js.pixels_y),
+               static_cast<unsigned long long>(js.probes));
+    }
+    out += line;
+  }
   {
     char line[256];
-    snprintf(line, sizeof(line),
-             "  jitter           : zero (game's own value not wired yet)\n");
+    const auto& js = projection_jitter;
+    snprintf(line, sizeof(line), "  projection base  : [0][0]=%.6f [1][1]=%.6f [2][2]=%.6f [2][3]=%.6f\n",
+             static_cast<double>(js.base_xx), static_cast<double>(js.base_yy),
+             static_cast<double>(js.base_zz), static_cast<double>(js.base_zw));
     out += line;
   }
   // NGX's own words, oldest first. It is the component we cannot see into, and it
@@ -2340,7 +3096,10 @@ inline void OnBindDescriptorTables(
     reshade::api::pipeline_layout, uint32_t first, uint32_t count,
     const reshade::api::descriptor_table* tables) {
   if (dlss_enabled == 0.f || !any_nvidia.load()) return;
-  if (!renodx::utils::bitwise::HasFlag(stages, reshade::api::shader_stage::pixel)) return;
+  // Tables are recorded for every stage, not just the pixel stage: the compute
+  // dispatch that upscales binds its output through one, and a table left
+  // unrecorded is indistinguishable from a table that resolved to nothing.
+  (void)stages;
   if (cmd_list == nullptr || tables == nullptr) return;
   auto* data = Get(cmd_list);
   if (data == nullptr) return;
@@ -2388,7 +3147,12 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
     s << "Far Cry 6 DLSS: detected TAA draw 0x" << std::hex << hash;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  return EvaluateDLSS(cmd_list, data, hash);
+  // The game's TAA is left to run - DLSS no longer replaces it, only the game's
+  // upscaler. The evaluation happens at this draw because this is where the
+  // scene's colour, depth and motion vectors are bound; the draw itself is not
+  // taken out, so the game's pipeline is complete whether or not DLSS deploys.
+  EvaluateDLSS(cmd_list, data, hash);
+  return false;
 }
 
 inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
@@ -2404,7 +3168,12 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
     s << "Far Cry 6 DLSS: detected TAA draw 0x" << std::hex << hash;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  return EvaluateDLSS(cmd_list, data, hash);
+  // The game's TAA is left to run - DLSS no longer replaces it, only the game's
+  // upscaler. The evaluation happens at this draw because this is where the
+  // scene's colour, depth and motion vectors are bound; the draw itself is not
+  // taken out, so the game's pipeline is complete whether or not DLSS deploys.
+  EvaluateDLSS(cmd_list, data, hash);
+  return false;
 }
 
 inline void OnPresent(
@@ -2413,6 +3182,12 @@ inline void OnPresent(
     uint32_t, const reshade::api::rect*) {
   ++stat_presents;
   if (queue != nullptr) SelectSceneDepth(queue->get_device());
+  // Whether the game's own upscaler runs is decided by what the last frame showed:
+  // with it, DLSS deploys at the upscaler; without it, at the TAA draw.
+  fsr1_active.store(fsr1_seen_this_frame);
+  fsr1_seen_this_frame = false;
+  fsr1_wrote_this_frame.store(false);
+  projection_jitter.matched_this_frame = false;
 }
 
 inline void OnInitDevice(reshade::api::device* device) {
@@ -2491,18 +3266,24 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
+      reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       break;
     case DLL_PROCESS_DETACH:
       if (!attached) return;
       attached = false;
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(OnBindDescriptorTables);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
