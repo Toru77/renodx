@@ -2,13 +2,13 @@
  * Copyright (C) 2026
  * SPDX-License-Identifier: MIT
  *
- * Far Cry 6 DLSS — replaces the game's TAA passes (0xFF0AF25B / 0x4AD8172A)
- * with NVIDIA DLSS Super Resolution via the D3D12 NGX path.
+ * Far Cry 6 DLSS — replaces the game's TAA pass with NVIDIA DLSS Super
+ * Resolution via the D3D12 NGX path.
  *
  * NOTE: the HLSL files under antialiasing/ and uishaders/ are reference
  * decompilations only. They are intentionally NOT registered as custom
- * shaders; the TAA draw is intercepted at the draw event, DLSS evaluates
- * into the TAA output target, and the original draw is skipped.
+ * shaders; the TAA draw is intercepted at the draw event, DLSS evaluates into
+ * the TAA output target, and the original draw is skipped.
  */
 
 #define ImTextureID ImU64
@@ -26,11 +26,7 @@
 namespace {
 
 inline const char* SlotState(int i) {
-  switch (farcry6_dlss::dlss::slot_hit[i].load()) {
-    case 1: return "hit";
-    case 2: return "dummy";
-    default: return "-";
-  }
+  return farcry6_dlss::dlss::slot_hit[i].load() == 1 ? "ok" : "-";
 }
 
 static bool DlssStatusDraw() {
@@ -42,28 +38,39 @@ static bool DlssStatusDraw() {
       static_cast<unsigned long long>(stat_taa_draws.load()),
       static_cast<unsigned long long>(stat_dlss_ok.load()));
   ImGui::Text("State: %s", FailCodeText(stat_fail_code.load()));
-  if (jitter_state.adopted) {
-    ImGui::Text(
-        "Jitter: game b0[%d]=(%.5f, %.5f)", jitter_state.candidate,
-        static_cast<double>(jitter_state.x), static_cast<double>(jitter_state.y));
-  } else if (dlss_jitter_source == 0.f) {
-    ImGui::TextUnformatted("Jitter: zero (manual)");
+  ImGui::Text(
+      "Slots: b0:%s t0:%s t2:%s t5:%s t6:%s", SlotState(0), SlotState(1), SlotState(2),
+      SlotState(3), SlotState(4));
+  ImGui::Text(
+      "Descriptor fingerprints: %llu",
+      static_cast<unsigned long long>(CountFingerprints()));
+  if (dlss_bypass_ngx != 0.f) {
+    ImGui::TextUnformatted("Inputs: bypass (known-good grey through the output path)");
   } else {
-    ImGui::TextUnformatted("Jitter: scanning b0 (zero until adopted)");
+    ImGui::Text(
+        "Inputs: colour=%s motion=%s depth=%s",
+        dlss_color_source >= 0.5f ? "placeholder" : "game",
+        dlss_motion_source >= 0.5f ? "placeholder" : "game",
+        dlss_depth_source >= 2.5f ? "placeholder"
+            : (dlss_depth_source > 1.5f ? "t6" : (dlss_depth_source > 0.5f ? "t5" : "scene")));
   }
-  ImGui::Text("Slots: b0:%s t0:%s t2:%s t5:%s t6:%s", SlotState(0), SlotState(1), SlotState(2),
-              SlotState(3), SlotState(4));
-  ImGui::Text("Tracked resources: %llu", static_cast<unsigned long long>(stat_resources.load()));
+  ImGui::TextUnformatted("Jitter: zero (game's own value not wired yet)");
+  ImGui::Text(
+      "NGX log: %llu lines   hdr=%s   restore bindings=%s",
+      static_cast<unsigned long long>(ngx_log.seen.load()),
+      dlss_flag_is_hdr != 0.f ? "on" : "off",
+      dlss_restore_state != 0.f ? "on" : "off");
   {
     const std::lock_guard<std::mutex> lock(report_mutex);
     ImGui::Text(
-        "Last eval: in=%ux%u target=%ux%u mv=%ux%u jitter=(%.3f, %.3f) %s",
+        "Last eval: in=%ux%u target=%ux%u mv=%ux%u depth=%ux%u %s",
         deploy_report.input_width, deploy_report.input_height,
         deploy_report.target_width, deploy_report.target_height,
         deploy_report.mv_width, deploy_report.mv_height,
-        static_cast<double>(deploy_report.jitter_x), static_cast<double>(deploy_report.jitter_y),
+        deploy_report.depth_width, deploy_report.depth_height,
         GetPerfQualityName(deploy_report.quality));
   }
+  ImGui::TextWrapped("Probe: %s", BuildProbeReport().c_str());
   return false;
 }
 
@@ -75,8 +82,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Copy Report",
         .section = "Antialiasing",
-        .group = "Debug",
-        .tooltip = "Copies the live DLSS pipeline state (inputs, sizes, jitter, mirror counters, settings) to the clipboard.",
+        .tooltip = "Copies the live DLSS pipeline state (inputs, sizes, jitter, counters) to the clipboard.",
         .on_click = [] {
           ImGui::SetClipboardText(farcry6_dlss::dlss::BuildDebugReport().c_str());
           return true;
@@ -99,17 +105,18 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "DLSS Replacement",
         .section = "Antialiasing",
-        .tooltip = "Runs NVIDIA DLSS in place of Far Cry 6's TAA passes when the TAA resources can be resolved. Requires nvngx_dlss.dll next to the game executable. When off (or when resources cannot be resolved), the game's own TAA runs unchanged.",
+        .tooltip = "Runs NVIDIA DLSS in place of Far Cry 6's TAA pass when all of its inputs resolve. Requires nvngx_dlss.dll next to the game executable. When off, the game's own TAA runs unchanged.",
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
     new renodx::utils::settings::Setting{
-        .key = "DLSSAllowFallback",
-        .binding = &farcry6_dlss::dlss::dlss_allow_fallback,
-        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .key = "DLSSOutputMode",
+        .binding = &farcry6_dlss::dlss::dlss_output_mode,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
-        .label = "Experimental Fallback",
+        .label = "DLSS Output",
         .section = "Antialiasing",
-        .tooltip = "Run DLSS even when some TAA inputs do not resolve, using zero-motion / far-plane stand-ins. The image will be softer than TAA. Pipeline testing only; off keeps vanilla TAA whenever inputs are missing.",
+        .tooltip = "What DLSS is allowed to replace, for isolating a rendering fault. Replace skips the TAA draw and puts DLSS output in its target. Evaluate only runs the whole chain but keeps the game's own TAA output. Resolve only resolves and reports the inputs without running DLSS at all.",
+        .labels = {"Replace", "Evaluate only", "Resolve only"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
@@ -120,7 +127,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "DLSS Mode",
         .section = "Antialiasing",
-        .tooltip = "Auto runs DLAA at native resolution and Quality upscaling when the engine renders below display resolution. Manual modes force the NGX quality level.",
+        .tooltip = "Auto runs DLAA at native resolution and Quality upscaling when the engine renders below display resolution. The TAA pass is 1:1, so it can only host DLAA; upscaling needs the upscale pass as a target.",
         .labels = {"Auto", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
@@ -140,11 +147,11 @@ renodx::utils::settings::Settings settings = {
         .key = "DLSSJitterSource",
         .binding = &farcry6_dlss::dlss::dlss_jitter_source,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 0.f,
         .label = "Jitter Source",
         .section = "Antialiasing",
-        .tooltip = "Auto scans the TAA constant buffer for the game's render jitter and falls back to zero until it is confidently found (see ReShade.log). Zero is the safe option.",
-        .labels = {"Zero", "Auto (game jitter)"},
+        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Game value reads the jitter the game applies to its scene passes - not wired yet, so it currently passes zero as well and the report says so. Nothing is inferred.",
+        .labels = {"Zero", "Game value"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
@@ -155,8 +162,43 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Depth Source",
         .section = "Antialiasing",
-        .tooltip = "Which single-channel TAA input is fed to DLSS as depth: t5 (sampled at the current pixel) or t6 (sampled at the reprojected pixel).",
-        .labels = {"t5 (current UV)", "t6 (reprojected UV)"},
+        .tooltip = "What feeds DLSS as depth. Scene depth is the game's own depth buffer, identified by how the engine binds it. t5/t6 are the TAA anti-ghosting masks, which are not depth. Placeholder feeds a far plane, so nothing occludes anything: a valid input with neutral content, for isolating a rendering fault.",
+        .labels = {"Scene depth", "t5 (mask)", "t6 (mask)", "Placeholder (far plane)"},
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSColourSource",
+        .binding = &farcry6_dlss::dlss::dlss_color_source,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Colour Source",
+        .section = "Antialiasing",
+        .tooltip = "What feeds DLSS as colour. Placeholder substitutes a flat mid grey of the input size, so DLSS runs normally on input that cannot contain scene content. If artifacts disappear with it, the game's colour is implicated; if they survive, they are not coming from the colour.",
+        .labels = {"Game (t2)", "Placeholder (grey)"},
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSMotionSource",
+        .binding = &farcry6_dlss::dlss::dlss_motion_source,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 0.f,
+        .label = "Motion Source",
+        .section = "Antialiasing",
+        .tooltip = "What feeds DLSS as motion vectors. Placeholder substitutes zero motion at the input size, with the jittered-motion flag dropped to match. If artifacts disappear with it, the decoded game motion is implicated.",
+        .labels = {"Game (decoded)", "Placeholder (zero motion)"},
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSBypassNgx",
+        .binding = &farcry6_dlss::dlss::dlss_bypass_ngx,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Bypass NGX",
+        .section = "Antialiasing",
+        .tooltip = "Writes a known-good flat grey through the same transitions and copy the DLSS path uses, with NGX not involved at all, and skips the game's TAA draw. If the artifacts survive this, they are ours rather than DLSS's. Overrides DLSS Output and all input sources.",
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },
@@ -179,6 +221,28 @@ renodx::utils::settings::Settings settings = {
         .label = "Depth Inverted",
         .section = "Antialiasing",
         .tooltip = "Tell DLSS the depth buffer is reverse-Z. Toggle for A/B testing if disocclusion handling looks wrong.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSRestoreState",
+        .binding = &farcry6_dlss::dlss::dlss_restore_state,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 1.f,
+        .label = "Restore Bindings After DLSS",
+        .section = "Antialiasing",
+        .tooltip = "Re-applies the game's descriptor heaps and root signature after every DLSS evaluation. NGX dispatches on the command list directly, behind ReShade's hooks, and the descriptor heap binding is shared between compute and graphics, so the game's following draws would otherwise read their descriptors out of NGX's heap. Turn this off only to A/B whether it is the difference.",
+        .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
+        .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "DLSSFlagIsHdr",
+        .binding = &farcry6_dlss::dlss::dlss_flag_is_hdr,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Input Is HDR",
+        .section = "Antialiasing",
+        .tooltip = "Declares the colour input as HDR, meaning values above 1.0. Far Cry 6's TAA target is 16-bit float linear, which suggests it is, but every previous build ran with this off, so A/B it rather than assume.",
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
     },

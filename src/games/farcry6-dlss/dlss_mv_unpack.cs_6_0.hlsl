@@ -14,10 +14,11 @@
 //   mv_px = decode(t0) * 0.1 * resolution * scale.
 //
 // The game renders its motion vectors at HALF the input resolution (640x360
-// for a 1280x720 input), so the packed buffer has to be indexed at its own
-// resolution. A Load() at input-resolution coordinates runs off the end of the
-// texture, D3D returns 0 there, and decode(0) decodes to roughly -0.99 - a
-// ~-126px motion vector across three quarters of the frame.
+// for a 1280x720 input), so the packed buffer is indexed at its own size. A
+// Load() at input-resolution coordinates runs off the end of the texture, D3D
+// returns 0 there, and decode(0) decodes to roughly -0.99 - a ~126px motion
+// vector across three quarters of the frame. The output stays at input
+// resolution so the motion vectors match the color buffer NGX is handed.
 //
 // Sign convention matches NGX: offset from the current pixel to the previous
 // frame position (the game adds it to the current UV to fetch history).
