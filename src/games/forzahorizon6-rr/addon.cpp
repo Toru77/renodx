@@ -207,10 +207,10 @@ renodx::utils::settings::Settings settings = {
         .key = "RrResponsivityAuto",
         .binding = &rr_responsivity_auto_setting,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-        .default_value = 0.f,
+        .default_value = 1.f,
         .label = "Speed-relative responsivity",
         .section = "Ray Reconstruction",
-        .tooltip = "More stable when you are not moving. More responsive at higher speeds.",
+        .tooltip = "Stable when you are not moving. Responsive at higher speeds.",
         .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
