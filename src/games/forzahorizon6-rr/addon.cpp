@@ -210,8 +210,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 0.f,
         .label = "Speed-relative responsivity",
         .section = "Ray Reconstruction",
-        .tooltip = "Denoises harder when you are not moving, and reacts faster"
-                   " when you are.",
+        .tooltip = "More stable when you are not moving. More responsive at higher speeds.",
         .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
