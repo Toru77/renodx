@@ -6,10 +6,9 @@
  *
  * Requests DLSS Ray Reconstruction at slInit (restart required for the plugin
  * to load), loads it at runtime if needed, and replaces the game's DLSS SR with
- * DLSS-RR. RR receives the game's real G-buffer guides. On High RTGI the game's
- * temporal and gather denoisers are bypassed so RR gets the raw ray signal.
- * RR requires High RTGI: without it the switch behaves as off. One switch
- * drives the whole feature.
+ * DLSS-RR. RR receives the game's real G-buffer guides. On Medium and High
+ * RTGI the game's resolve denoisers are bypassed so RR gets the raw ray signal;
+ * on Low the game's own resolve feeds RR. One switch drives the whole feature.
  */
 
 #define ImTextureID ImU64
@@ -32,7 +31,7 @@ namespace {
 
 // The single user control. Enabling RR applies the runtime load, the SR->RR
 // redirect and the resolve bypasses. RR runs at any RTGI tier; only the
-// raw-signal bypasses require High RTGI (see below).
+// raw-signal bypasses require Medium or High RTGI (see below).
 float rr_enable_setting = 1.f;
 
 // DLSSD preset values for the D/E/F slider. Streamline marks A-C deprecated
@@ -48,36 +47,44 @@ float rr_preset_setting = 2.f;  // index into kRrPresetValues; F by default
 // Diagnostic logging for the RR and guide paths; off by default.
 float rr_debug_log_setting = 0.f;
 
-// High RTGI detection. The bind hook arms high_gi_bound whenever the game binds
-// the High-tier spatial filter; each present consumes it. Frame generation
-// presents frames the game never rendered, so a single miss must not drop RR:
-// detection only falls back after kHighGiMissLimit consecutive missed presents,
-// which still reacts quickly when the player leaves High RTGI.
-constexpr uint32_t kHighGiMissLimit = 8;
-std::atomic<bool> high_gi_bound{false};
-bool high_gi_active = false;
-uint32_t presents_without_high = 0;
-// Guards a silent detection failure: warns once High RTGI has been absent long.
-bool warned_no_high = false;
+// RTGI tier detection. The bind hook arms the tier's bound flag whenever the
+// game binds that tier's spatial filter; each present consumes it. Frame
+// generation presents frames the game never rendered, so a single miss must
+// not drop the tier: detection only falls back after kGiMissLimit consecutive
+// missed presents, which still reacts quickly when the player leaves the tier.
+constexpr uint32_t kGiMissLimit = 8;
+struct TierDetection {
+  std::atomic<bool> bound{false};
+  bool active = false;
+  uint32_t presents_without = 0;
+};
+TierDetection high_gi;
+TierDetection medium_gi;
+// Guards a silent detection failure: warns once no supported tier has been
+// seen for long.
+bool warned_no_gi = false;
 
 // RR runs whenever the switch is on. The raw-signal resolve bypasses are a
-// separate concern: they apply only on High RTGI, because that is the only tier
-// where RR is fed the raw ray signal instead of the game's filtered resolve.
+// separate concern: they apply only on Medium and High RTGI, the tiers where RR
+// is fed the raw ray signal instead of the game's filtered resolve.
 bool RrActive() {
   return rr_enable_setting != 0.f;
 }
 
-// Applies the whole "RR on/off" bundle. On High RTGI the spatial filter (world
-// cache, history and neighbourhood) and the gather (reprojection) are bypassed,
-// so RR receives the raw ray signal; on Medium and Low the game's own resolve
-// feeds RR and the bypasses stay off.
+// Applies the whole "RR on/off" bundle. On Medium and High RTGI the game's
+// resolve denoisers are bypassed so RR receives the raw ray signal; on Low the
+// game's own resolve feeds RR and the bypasses stay off. The stochastic gather
+// is shared by both raw tiers.
 void ApplyRrState() {
   const bool active = RrActive();
+  const bool bypass_high = active && high_gi.active;
+  const bool bypass_medium = active && medium_gi.active;
   if (guides::DiagGuidesEnabled()) {
+    const char* tier = high_gi.active ? "High" : (medium_gi.active ? "Medium" : "none");
     guides::LogEvent(
-        "RR state -> " + std::string(active ? "ON" : "OFF") + " (high GI "
-        + std::string(high_gi_active ? "detected" : "absent") + ", bypasses "
-        + std::string((active && high_gi_active) ? "ON" : "OFF") + ")");
+        "RR state -> " + std::string(active ? "ON" : "OFF") + " (RTGI tier "
+        + tier + ", bypasses "
+        + std::string((bypass_high || bypass_medium) ? "ON" : "OFF") + ")");
   }
   // A latched failure parks RR until the game restarts. It is deliberately NOT
   // cleared by the toggle: the reporter's log shows the latch holding for two
@@ -87,9 +94,10 @@ void ApplyRrState() {
   sl_rr::SetRuntimeLoad(active);
   sl_rr::SetRrRedirect(active);
   guides::enabled.store(active);
-  const bool bypass = active && high_gi_active;
-  denoise::SetEnabled(denoise::kSpatialHighHash, bypass);
-  denoise::SetEnabled(denoise::kGatherHash, bypass);
+  denoise::SetEnabled(denoise::kSpatialHighHash, bypass_high);
+  denoise::SetEnabled(denoise::kSpatialMediumHash, bypass_medium);
+  denoise::SetEnabled(denoise::kReconMediumHash, bypass_medium);
+  denoise::SetEnabled(denoise::kGatherHash, bypass_high || bypass_medium);
 }
 
 renodx::utils::settings::Settings settings = {
@@ -106,10 +114,10 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "RrHighGiNotice",
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "Turn on Ray Traced Global Illumination at High.",
+        .label = "Turn on Ray Traced Global Illumination at Medium or High.",
         .section = "Ray Reconstruction",
         .tint = 0xE0484C,
-        .is_visible = [] { return !high_gi_active; },
+        .is_visible = [] { return !high_gi.active && !medium_gi.active; },
     },
     new renodx::utils::settings::Setting{
         .key = "RrVramNotice",
@@ -185,7 +193,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BULLET,
-        .label = "Turn Ray Traced Global Illumination at High",
+        .label = "Turn Ray Traced Global Illumination at Medium or High",
         .section = "Instructions",
     },
     new renodx::utils::settings::Setting{
@@ -217,8 +225,8 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
-// Arms High-RTGI detection when the game binds the High-tier spatial filter.
-// Only the flag is set here; RR state changes on the next present, outside the
+// Arms tier detection when the game binds a tier's spatial filter. Only the
+// flags are set here; RR state changes on the next present, outside the
 // command-recording thread.
 void OnBindPipeline(
     reshade::api::command_list* cmd_list,
@@ -228,9 +236,36 @@ void OnBindPipeline(
   if (!renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::compute_shader)) return;
   renodx::utils::shader::GetPipelineShaderDetails(pipeline, [](const auto& details) {
     if (details.shader_hashes.count(denoise::kSpatialHighHash) != 0) {
-      high_gi_bound.store(true);
+      high_gi.bound.store(true);
+    }
+    if (details.shader_hashes.count(denoise::kSpatialMediumHash) != 0) {
+      medium_gi.bound.store(true);
     }
   });
+}
+
+// Consumes one present for a tier: a bind this frame keeps it alive, otherwise
+// it drops after kGiMissLimit consecutive missed presents. The tiers track
+// independently, so a tier switch flips through each tracker's own miss streak.
+void PollTier(TierDetection& tier, const char* name, const char* hash) {
+  if (tier.bound.exchange(false)) {
+    tier.presents_without = 0;
+    if (!tier.active) {
+      tier.active = true;
+      if (guides::DiagGuidesEnabled()) {
+        guides::LogEvent(std::string(name) + " spatial filter " + hash + " detected");
+      }
+      ApplyRrState();
+    }
+  } else if (++tier.presents_without >= kGiMissLimit) {
+    if (tier.active) {
+      tier.active = false;
+      if (guides::DiagGuidesEnabled()) {
+        guides::LogEvent(std::string(name) + " no longer bound; bypasses released");
+      }
+      ApplyRrState();
+    }
+  }
 }
 
 void OnPresent(
@@ -244,31 +279,16 @@ void OnPresent(
   (void)dirty_rect_count;
   (void)dirty_rects;
   sl_rr::Poll();
-  // The bind hook arms the flag during this frame's dispatches. A miss is only
+  // The bind hook arms the flags during this frame's dispatches. A miss is only
   // a frame-generation gap or a transition, so require a run of them before
-  // letting go of RR.
-  if (high_gi_bound.exchange(false)) {
-    presents_without_high = 0;
-    if (!high_gi_active) {
-      high_gi_active = true;
-      if (guides::DiagGuidesEnabled()) {
-        guides::LogEvent("High-RTGI spatial filter 0x4DAF8A48 detected");
-      }
-      ApplyRrState();
-    }
-  } else if (++presents_without_high >= kHighGiMissLimit) {
-    if (high_gi_active) {
-      high_gi_active = false;
-      if (guides::DiagGuidesEnabled()) {
-        guides::LogEvent("High-RTGI no longer bound; bypasses released");
-      }
-      ApplyRrState();
-    }
-    if (!warned_no_high) {
-      warned_no_high = true;
-      sl_rr::LogWarn("no High-RTGI spatial pipeline bound; DLSS Ray"
-                     " Reconstruction stays inactive");
-    }
+  // letting go of a tier.
+  PollTier(high_gi, "High-RTGI", "0x4DAF8A48");
+  PollTier(medium_gi, "Medium-RTGI", "0x596D3E8F");
+  if (!high_gi.active && !medium_gi.active
+      && high_gi.presents_without >= kGiMissLimit && !warned_no_gi) {
+    warned_no_gi = true;
+    sl_rr::LogWarn("no Medium/High-RTGI spatial pipeline bound; resolve"
+                   " bypasses stay off");
   }
 }
 

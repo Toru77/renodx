@@ -4,10 +4,10 @@
  *
  * forzahorizon6-rr: RT resolve/denoise bypass.
  *
- * On High RTGI, replaces the resolve shaders with minimal per-frame variants
- * (see the 0x*.cs_6_6.hlsl files in this folder) so DLSS-RR receives the raw
- * ray signal instead of the game's neighbourhood-filtered one. Medium and Low
- * keep the game's own resolve; the add-on detects the tier and gates the whole
+ * On Medium and High RTGI, replaces the resolve shaders with minimal per-frame
+ * variants (see the 0x*.cs_6_6.hlsl files in this folder) so DLSS-RR receives
+ * the raw ray signal instead of the game's neighbourhood-filtered one. Low
+ * keeps the game's own resolve; the add-on detects the tier and gates the whole
  * feature (addon.cpp).
  *
  * The swap is a live, per-device runtime replacement on the bind-time
@@ -30,9 +30,13 @@
 
 namespace denoise {
 
-// Live High-RTGI resolve shader hashes (CRC32 of the original DXIL).
-inline constexpr uint32_t kGatherHash = 0x209AB6A4;      // 4-tap stochastic reprojected gather
-inline constexpr uint32_t kSpatialHighHash = 0x4DAF8A48;  // spatial filter, high RT tier
+// Live resolve shader hashes (CRC32 of the original DXIL). The stochastic
+// gather is shared by the Medium and High tiers; the spatial filter and the
+// resolve reconstruct are compiled once per tier.
+inline constexpr uint32_t kGatherHash = 0x209AB6A4;         // 4-tap stochastic reprojected gather
+inline constexpr uint32_t kSpatialHighHash = 0x4DAF8A48;    // spatial filter, high RT tier
+inline constexpr uint32_t kSpatialMediumHash = 0x596D3E8F;  // spatial filter, medium RT tier
+inline constexpr uint32_t kReconMediumHash = 0x0B33C6D8;    // resolve reconstruct + bilateral denoise, medium RT tier
 
 struct Replacement {
   uint32_t hash;
@@ -50,15 +54,29 @@ inline const Replacement kGatherReplacements[] = {
     {kGatherHash, __0x209AB6A4},
 };
 
-// Centre-sample spatial payload for the High tier: no spatial neighbourhood
-// and no cross-frame state.
-inline const Replacement kSpatialReplacements[] = {
+// Centre-sample spatial payloads: no spatial neighbourhood and no cross-frame
+// state. The game compiles the pass once per tier; the medium tier runs it at
+// half resolution.
+inline const Replacement kSpatialHighReplacements[] = {
     {kSpatialHighHash, __0x4DAF8A48_both},
 };
 
-inline BypassEntry bypasses[2] = {
+inline const Replacement kSpatialMediumReplacements[] = {
+    {kSpatialMediumHash, __0x596D3E8F_both},
+};
+
+// Medium's reconstruct both denoises (nine-tap bilateral weighting) and
+// upsamples the half-res pair to the full-res feed; the replacement keeps the
+// bilinear 2x upscale but drops the weighting.
+inline const Replacement kReconMediumReplacements[] = {
+    {kReconMediumHash, __0x0B33C6D8},
+};
+
+inline BypassEntry bypasses[4] = {
     {kGatherReplacements},
-    {kSpatialReplacements},
+    {kSpatialHighReplacements},
+    {kSpatialMediumReplacements},
+    {kReconMediumReplacements},
 };
 
 inline std::atomic<reshade::api::device*> current_device = nullptr;

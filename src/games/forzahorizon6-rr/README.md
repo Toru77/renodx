@@ -41,12 +41,15 @@ The game loads Streamline's DLSS SR. This add-on:
    capture is unavailable it falls back to constant placeholder guides.
    The G-buffer capture runs on every recording thread every frame, so its log
    line is rate-limited rather than per-event (`guides::LogThrottled`).
-5. **Bypasses the game's resolve denoisers on High RTGI** so RR receives the raw
-   signal: the 4-tap reprojected gather and the spatial filter (world cache,
-   history and neighbourhood) are replaced with raw centre-sample variants (see
-   `denoise.hpp` and the `0x*.cs_6_6.hlsl` files). The High RTGI tier is detected
-   from the spatial filter the game binds; without it the bypasses stay off and a
-   red notice is shown, but RR still runs on the game's own resolve.
+5. **Bypasses the game's resolve denoisers on Medium and High RTGI** so RR
+   receives the raw signal: the 4-tap reprojected gather, the tier's spatial
+   filter (world cache, history and neighbourhood), and — on Medium, whose
+   chain runs at half resolution — the nine-tap bilateral reconstruct that also
+   upsamples the half-res pair to the full-res feed (kept as a plain bilinear 2x
+   upsample) are replaced with raw per-frame variants (see `denoise.hpp` and the
+   `0x*.cs_6_6.hlsl` files). The tier is detected from the spatial filter the
+   game binds; without Medium or High the bypasses stay off and a red notice is
+   shown, but RR still runs on the game's own resolve.
 
 All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 
@@ -54,14 +57,14 @@ All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 
 | Control | Effect |
 |---|---|
-| **Enable DLSS Ray Reconstruction** | The whole feature: runtime load, SR->RR redirect, real guides, and the High-RTGI resolve bypasses. RR runs at any RTGI tier and at any output resolution; without Ray Traced Global Illumination at High a red notice is shown and RR receives the game's own filtered resolve. Off = the game runs its own DLSS SR and denoisers unchanged. |
+| **Enable DLSS Ray Reconstruction** | The whole feature: runtime load, SR->RR redirect, real guides, and the Medium/High-RTGI resolve bypasses. RR runs at any RTGI tier and at any output resolution; without Ray Traced Global Illumination at Medium or High a red notice is shown and RR receives the game's own filtered resolve. Off = the game runs its own DLSS SR and denoisers unchanged. |
 | **RR preset** (D-F) | DLSS-RR render preset applied to every DLSSD preset hint. `D` is the default transformer model, `E` the latest transformer model, `F` the current RR 4.5 default. |
 | **Debug logging** | Bug reports only. One line per distinct outcome in `ReShade.log`, plus Streamline's and DLSS-RR's own text routed in through `Preferences::logMessageCallback`. Streamline never writes to ReShade's log on its own (`sl.log/log.cpp:197-222`: console, `OutputDebugStringA`, or a separate file), so the callback is the only way its text reaches `ReShade.log`. Must be on **before** launch, since `slInit` runs at startup. Verbose also disables Streamline's own message dedup (`log.cpp:372`), so nothing is dropped at the source. Lines are instead rate limited on our side by message text, 5 s apart, folding repeats into a `(+N more)` count. Measured on a real log: 138,330 Streamline lines collapse to 5,311 distinct, a 96% reduction with every distinct line preserved. Streamline stamps each line with a free-running elapsed counter (`[234s:289ms:021us]`), which is stripped before keying because it advances on every call and would make every line unique. |
 
 ## Instructions
 
 1. Turn DLSS on.
-2. Turn Ray Traced Global Illumination at High.
+2. Turn Ray Traced Global Illumination at Medium or High.
 
 ## Files
 
@@ -71,8 +74,9 @@ All of this is driven by one switch, **Enable DLSS Ray Reconstruction**.
 - `guides.hpp` + `fh6_guide_nr.cs_6_6.hlsl` - real RR guide buffers from the
   game's G-buffer.
 - `denoise.hpp` + `0x209AB6A4.cs_6_6.hlsl` + `0x4DAF8A48_both.cs_6_6.hlsl` +
-  `resolve_spatial_raw.hlsli` - live per-pipeline replacement of the High-RTGI
-  resolve/denoise stages.
+  `0x596D3E8F_both.cs_6_6.hlsl` + `0x0B33C6D8.cs_6_6.hlsl` +
+  `resolve_spatial_raw.hlsli` - live per-pipeline replacement of the
+  Medium/High-RTGI resolve/denoise stages.
 
 ## Requirements
 
@@ -91,12 +95,15 @@ next to the ReShade DLL.
 
 ## Verify
 
-In gameplay with DLSS on and Ray Traced Global Illumination at High:
+In gameplay with DLSS on and Ray Traced Global Illumination at Medium or High:
 
 - The overlay shows **Enable DLSS Ray Reconstruction** on and the RR preset.
-- The red "Turn on Ray Traced Global Illumination at High." notice is gone.
+- The red "Turn on Ray Traced Global Illumination at Medium or High." notice is
+  gone.
 - The image is denoised by RR (compare against the switch off - the game's own
   DLSS SR).
-- Switching RTGI to Medium or Low brings the red notice back; RR keeps running
+- At Medium RTGI the half-res resolve chain is bypassed the same way; the
+  full-res feed keeps coming from its bilinear 2x upsample, not a 1:1 copy.
+- Switching RTGI to Low brings the red notice back; RR keeps running
   but no longer receives the raw signal.
 - `ReShade.log` shows `sl-rr: Streamline entry points hooked`.
