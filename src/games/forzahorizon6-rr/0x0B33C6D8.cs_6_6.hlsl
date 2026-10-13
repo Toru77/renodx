@@ -32,7 +32,7 @@ RWTexture2D<float4> g_out : register(u0, space36);
 // reaches zero (its falloff is 1 - saturate(20 * ratio)).
 static const float kGuideDepthRatio = 0.05f;
 // A tap above this multiple of its accepted neighbours' luminance is clamped.
-static const float kSpikeLimit = 3.0f;
+static const float kSpikeLimit = 16.0f;
 
 float3 DecodePackedNormal(uint bits)
 {
