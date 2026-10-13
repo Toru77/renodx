@@ -41,8 +41,31 @@ static const float kGuideDepthRatio = 0.05f;
 // kFireflyRatio: luminance multiple of the reference at which the cap lands.
 // kFireflyRadius: half-width of the reference window in half-res texels.
 static const float kFireflyStrength = 1.0f;
-static const float kFireflyRatio = 20.0f;
-static const int kFireflyRadius = 12;
+static const float kFireflyRatio = 60.0f;
+static const int kFireflyRadius = 1;
+
+// Stochastic pool pick. Instead of smearing one half-res sample across its 2x2
+// magnification block, every output pixel takes one gated half-res sample from
+// its neighbourhood at random. Neighbouring pixels then carry independent draws
+// - the input character DLSS-RR's denoiser is trained on, and the reason the
+// full-res tier denoises cleanly - while nothing is averaged and nothing is
+// scaled, so each output pixel is a real sample and the energy is exact.
+//
+// kPickRadius: half-res texels of pool around this pixel's own texel.
+//              0 = plain bilinear upscale (the previous behaviour).
+// kPickStep: texel stride inside that pool. 1 = every texel (dense). The pool
+//              mean estimates the same local level either way, so the stride
+//              trades sample count for cost while keeping the area - and so the
+//              look - the radius was chosen for. The centre texel is always
+//              included, whatever the stride.
+// kPickFrameShift: 0 = the pattern is fixed in screen space; 1 = reshuffled
+//              every frame. It is a switch, not a magnitude: the value is only
+//              tested for > 0. The selector must never be seeded from the
+//              radiance: that correlates the pick with what it selects, which
+//              reads as structure rather than noise.
+static const int kPickRadius = 12;
+static const int kPickStep = 3;
+static const float kPickFrameShift = 1.0f;
 
 float3 DecodePackedNormal(uint bits)
 {
@@ -111,6 +134,128 @@ void main(uint3 global_id : SV_DispatchThreadID)
             kGuideDepthRatio);
         tap_weight[t] = (normal_gate * depth_gate) * bilinear_w[t];
         weight_sum += tap_weight[t];
+    }
+
+    // Stochastic pool pick. Every output pixel takes one gated half-res sample
+    // from its neighbourhood at random, so neighbouring pixels are independent
+    // draws instead of one sample smeared over four. Nothing is averaged and
+    // nothing is scaled: each output pixel is a real sample, so the energy is
+    // exact and the feed carries the noise character the denoiser expects.
+    if (kPickRadius > 0)
+    {
+        const uint2 pool_centre = min(px >> 1u, in_max);
+        // Strided pool: kPickCount texels per axis, symmetric about the centre
+        // so the pixel's own texel is always a member whatever the stride.
+        static const int kPickCount = 2 * (kPickRadius / kPickStep) + 1;
+        static const int kPickHalf = kPickCount / 2;
+
+        // Pass 1: the gated pool's mean luminance (the firefly reference) and
+        // its member count (the pick's uniform denominator).
+        float pool_luma_sum = 0.0f;
+        float pool_count = 0.0f;
+        [unroll]
+        for (int pool_iy = 0; pool_iy < kPickCount; ++pool_iy)
+        {
+            const int pool_y = (pool_iy - kPickHalf) * kPickStep;
+            [unroll]
+            for (int pool_ix = 0; pool_ix < kPickCount; ++pool_ix)
+            {
+                const int pool_x = (pool_ix - kPickHalf) * kPickStep;
+                const uint2 pool_px = uint2(clamp(
+                    int2(pool_centre) + int2(pool_x, pool_y), int2(0, 0), int2(in_max)));
+                const float2 pool_guide = g_guide.Load(int3(pool_px, 0));
+                const float pool_normal_gate =
+                    step(0.0f, dot(n, DecodePackedNormal(asuint(pool_guide.x))));
+                const float pool_depth_gate = step(
+                    abs(linear_depth - pool_guide.y) / (pool_guide.y + linear_depth),
+                    kGuideDepthRatio);
+                if ((pool_normal_gate * pool_depth_gate) <= 0.0f) continue;
+                const float4 pool_b = g_rad_b.Load(int3(pool_px, 0));
+                pool_luma_sum += pool_b.w + dot(pool_b.xyz, n);
+                pool_count += 1.0f;
+            }
+        }
+
+        if (pool_count <= 0.0f)
+        {
+            // Nothing in the pool passed the gate: the raw centre sample.
+            const float4 a = g_rad_a.Load(int3(pool_centre, 0));
+            const float4 b = g_rad_b.Load(int3(pool_centre, 0));
+            const float base = b.w + dot(b.xyz, n);
+            g_out[px] = float4(a.x - a.y + base, base + a.y, -a.x - a.y + base, a.w);
+            return;
+        }
+
+        // Selector. The frame-varying term comes from geometry - the depth this
+        // pixel resolves - never from the radiance, so the pattern cannot
+        // correlate with the sample it picks.
+        uint pick_hash = (px.x * 73856093u) ^ (px.y * 19349663u);
+        if (kPickFrameShift > 0.0f)
+        {
+            pick_hash ^= asuint(depth) * 2654435761u;
+        }
+        pick_hash ^= pick_hash >> 13u;
+        pick_hash *= 1274126177u;
+        pick_hash ^= pick_hash >> 16u;
+        const float pick_target =
+            float(pick_hash & 0x00FFFFFFu) * 5.9604645e-08f * pool_count;
+
+        // Pass 2: take the gated member the selector lands on.
+        float4 a_selected = g_rad_a.Load(int3(pool_centre, 0));
+        float4 b_selected = g_rad_b.Load(int3(pool_centre, 0));
+        {
+            float cumulative = 0.0f;
+            bool found = false;
+            [unroll]
+            for (int pool_iy = 0; pool_iy < kPickCount; ++pool_iy)
+            {
+                const int pool_y = (pool_iy - kPickHalf) * kPickStep;
+                [unroll]
+                for (int pool_ix = 0; pool_ix < kPickCount; ++pool_ix)
+                {
+                    if (found) continue;
+                    const int pool_x = (pool_ix - kPickHalf) * kPickStep;
+                    const uint2 pool_px = uint2(clamp(
+                        int2(pool_centre) + int2(pool_x, pool_y), int2(0, 0), int2(in_max)));
+                    const float2 pool_guide = g_guide.Load(int3(pool_px, 0));
+                    const float pool_normal_gate =
+                        step(0.0f, dot(n, DecodePackedNormal(asuint(pool_guide.x))));
+                    const float pool_depth_gate = step(
+                        abs(linear_depth - pool_guide.y) / (pool_guide.y + linear_depth),
+                        kGuideDepthRatio);
+                    if ((pool_normal_gate * pool_depth_gate) <= 0.0f) continue;
+                    cumulative += 1.0f;
+                    if (pick_target < cumulative)
+                    {
+                        a_selected = g_rad_a.Load(int3(pool_px, 0));
+                        b_selected = g_rad_b.Load(int3(pool_px, 0));
+                        found = true;
+                    }
+                }
+            }
+        }
+
+        // Firefly clamp on the selected sample, against the pool's own mean.
+        if (kFireflyStrength > 0.0f)
+        {
+            const float reference_luma = pool_luma_sum / pool_count;
+            const float cap = reference_luma * kFireflyRatio;
+            const float selected_luma = b_selected.w + dot(b_selected.xyz, n);
+            if ((reference_luma > 0.0f) && (selected_luma > cap))
+            {
+                const float scale = exp2(-kFireflyStrength * log2(selected_luma / cap));
+                a_selected.xy *= scale;
+                b_selected *= scale;
+            }
+        }
+
+        const float picked_base = b_selected.w + dot(b_selected.xyz, n);
+        g_out[px] = float4(
+            a_selected.x - a_selected.y + picked_base,
+            picked_base + a_selected.y,
+            -a_selected.x - a_selected.y + picked_base,
+            a_selected.w);
+        return;
     }
 
     // Firefly reference: a wide, gated mean of the half-res neighbourhood
