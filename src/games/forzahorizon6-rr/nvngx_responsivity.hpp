@@ -50,6 +50,32 @@ inline std::atomic<bool> armed{false};
 inline std::atomic<bool> enabled{true};
 // 0 = omit the mask entirely (RR's own default). Negative = more stable.
 inline std::atomic<float> value{0.f};
+
+// Speed-relative mode. When on, the value above is driven by measured camera
+// motion instead of the manual slider: still means maximum stability (more
+// history, which is where the fireflies are worst) and movement means
+// responsiveness (which is where ghosting would otherwise appear). The two
+// requirements never conflict, so the mask can serve both.
+inline std::atomic<bool> auto_enabled{false};
+inline constexpr float kAutoStill = -0.5f;
+inline constexpr float kAutoMoving = 0.5f;
+
+inline void SetAuto(bool on) { auto_enabled.store(on); }
+inline bool GetAuto() { return auto_enabled.load(); }
+
+// Live values for the on-screen readout.
+inline std::atomic<float> last_motion{0.f};
+inline float GetValue() { return value.load(); }
+inline float GetMotion() { return last_motion.load(); }
+
+// Motion is normalised by the caller so 1.0 is "fully moving". Called once per
+// frame with the camera's motion for that frame.
+inline void UpdateMotion(float motion) {
+  last_motion.store(motion);
+  if (!auto_enabled.load()) return;
+  const float t = std::clamp(motion, 0.f, 1.f);
+  value.store(kAutoStill + (kAutoMoving - kAutoStill) * (t * t * (3.f - 2.f * t)));
+}
 inline PFN_NGX_EvaluateFeature real_evaluate_feature = nullptr;
 
 // One constant-value R8_SNORM mask, refilled only when the value moves.
@@ -136,10 +162,15 @@ inline bool EnsureMask(
     Log("mask created " + std::to_string(width) + "x" + std::to_string(height));
   }
 
-  if (mask_filled && mask_filled_value == target) return true;
-
   // SNORM8: value * 127. -1 encodes as -127 (and -128 also reads as -1).
+  // Compare on the quantised value, not the raw one: in speed-relative mode the
+  // value moves every frame, and re-filling on sub-step changes would copy and
+  // barrier the mask on every frame for no visible difference.
   const int snorm = static_cast<int>(std::lround(std::clamp(target, -1.f, 1.f) * 127.f));
+  if (mask_filled && static_cast<int>(std::lround(mask_filled_value * 127.f)) == snorm) {
+    mask_filled_value = target;
+    return true;
+  }
   void* mapped = nullptr;
   const D3D12_RANGE read_range{0, 0};
   if (FAILED(mask_upload->Map(0, &read_range, &mapped)) || mapped == nullptr) {

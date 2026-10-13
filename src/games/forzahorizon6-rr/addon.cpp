@@ -55,6 +55,12 @@ float rr_debug_log_setting = 0.f;
 // clamping or filtering the signal.
 float rr_responsivity_setting = 0.f;
 
+// Speed-relative responsivity. Off = the slider above owns the value (today's
+// behaviour). On = camera motion drives it: still means maximum stability, where
+// the half-res fireflies are worst and history is most affordable; movement
+// means responsiveness, where ghosting would otherwise appear.
+float rr_responsivity_auto_setting = 0.f;
+
 // RTGI tier detection. The bind hook arms the tier's bound flag whenever the
 // game binds that tier's spatial filter; each present consumes it. Frame
 // generation presents frames the game never rendered, so a single miss must
@@ -102,7 +108,10 @@ void ApplyRrState() {
   sl_rr::SetRuntimeLoad(active);
   sl_rr::SetRrRedirect(active);
   responsivity::enabled.store(active);
-  responsivity::value.store(rr_responsivity_setting);
+  responsivity::SetAuto(active && rr_responsivity_auto_setting != 0.f);
+  if (!responsivity::GetAuto()) {
+    responsivity::value.store(rr_responsivity_setting);
+  }
   guides::enabled.store(active);
   denoise::SetEnabled(denoise::kSpatialHighHash, bypass_high);
   denoise::SetEnabled(denoise::kSpatialMediumHash, bypass_medium);
@@ -186,10 +195,23 @@ renodx::utils::settings::Settings settings = {
         .default_value = -0.2f,
         .label = "RR responsivity",
         .section = "Ray Reconstruction",
-        .tooltip = "Preset F only. Lower more stable, higher more responsive.",
+        .tooltip = "Preset F only. Lower more stable, higher more responsive."
+                   " Ignored while speed-relative responsivity is on.",
         .min = -1.f,
         .max = 1.f,
         .format = "%.2f",
+        .is_enabled = [] { return rr_responsivity_auto_setting == 0.f; },
+        .on_change_value = [](float, float) { ApplyRrState(); },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RrResponsivityAuto",
+        .binding = &rr_responsivity_auto_setting,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Speed-relative responsivity",
+        .section = "Ray Reconstruction",
+        .tooltip = "Denoises harder when you are not moving, and reacts faster"
+                   " when you are.",
         .on_change_value = [](float, float) { ApplyRrState(); },
     },
     new renodx::utils::settings::Setting{
@@ -303,6 +325,8 @@ void OnPresent(
   (void)dirty_rects;
   sl_rr::Poll();
   responsivity::Poll();
+  // Camera motion for this frame drives the mask when speed-relative mode is on.
+  responsivity::UpdateMotion(sl_rr::GetCameraMotion());
   // The bind hook arms the flags during this frame's dispatches. A miss is only
   // a frame-generation gap or a transition, so require a run of them before
   // letting go of a tier.

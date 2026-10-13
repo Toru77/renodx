@@ -22,8 +22,10 @@
 #include <intrin.h>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -659,6 +661,61 @@ inline sl::Result HookedSlSetTagForFrame(
   return result;
 }
 
+// Camera motion between the last two slSetConstants calls, normalised so that
+// roughly 1.0 is "fully moving". Translation and rotation are each divided by
+// their own scale and the larger wins, so a pan registers even when the camera
+// is not translating. Measured per frame, not per second: reprojection error -
+// and therefore ghosting - is a per-frame quantity.
+static const float kMotionTranslationScale = 0.5f;  // world units per frame
+static const float kMotionRotationScale = 0.01f;    // radians per frame
+inline std::atomic<float> camera_motion{0.f};
+inline sl::float3 last_camera_position{};
+inline sl::float3 last_camera_forward{};
+inline sl::float3 last_camera_up{};
+inline bool camera_motion_valid = false;
+
+inline float GetCameraMotion() { return camera_motion.load(); }
+
+// Length and normalised dot, written out rather than relying on helper naming.
+inline float VectorLength(const sl::float3& v) {
+  return sqrtf((v.x * v.x) + (v.y * v.y) + (v.z * v.z));
+}
+
+// Must be called with state_mutex held, from the slSetConstants hook.
+inline void UpdateCameraMotion(const sl::Constants& values) {
+  if (!camera_motion_valid) {
+    last_camera_position = values.cameraPos;
+    last_camera_forward = values.cameraFwd;
+    last_camera_up = values.cameraUp;
+    camera_motion_valid = true;
+    camera_motion.store(0.f);
+    return;
+  }
+
+  const float translation = VectorLength(sl::float3{
+      values.cameraPos.x - last_camera_position.x,
+      values.cameraPos.y - last_camera_position.y,
+      values.cameraPos.z - last_camera_position.z});
+
+  const auto angle_between = [](const sl::float3& a, const sl::float3& b) {
+    const float la = VectorLength(a);
+    const float lb = VectorLength(b);
+    if (la <= 0.f || lb <= 0.f) return 0.f;
+    const float cosine = ((a.x * b.x) + (a.y * b.y) + (a.z * b.z)) / (la * lb);
+    return acosf(std::clamp(cosine, -1.f, 1.f));
+  };
+  const float rotation = std::max(
+      angle_between(values.cameraFwd, last_camera_forward),
+      angle_between(values.cameraUp, last_camera_up));
+
+  last_camera_position = values.cameraPos;
+  last_camera_forward = values.cameraFwd;
+  last_camera_up = values.cameraUp;
+
+  camera_motion.store(std::max(
+      translation / kMotionTranslationScale, rotation / kMotionRotationScale));
+}
+
 inline sl::Result HookedSlSetConstants(
     const sl::Constants& values, const sl::FrameToken& frame, const sl::ViewportHandle& viewport) {
   ServiceRuntimeLoad();
@@ -666,6 +723,7 @@ inline sl::Result HookedSlSetConstants(
   const std::lock_guard lock(state_mutex);
   last_constants = values;
   constants_seen = true;
+  UpdateCameraMotion(values);
   return result;
 }
 
