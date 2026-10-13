@@ -42,7 +42,7 @@ static const float kGuideDepthRatio = 0.05f;
 // kFireflyRadius: half-width of the reference window in half-res texels.
 static const float kFireflyStrength = 1.0f;
 static const float kFireflyRatio = 20.0f;
-static const int kFireflyRadius = 24;
+static const int kFireflyRadius = 12;
 
 float3 DecodePackedNormal(uint bits)
 {
