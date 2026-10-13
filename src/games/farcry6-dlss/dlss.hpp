@@ -146,6 +146,17 @@ inline float dlss_restore_state = 1.f;
 inline float dlss_transition_depth = 1.f;
 // Calibration multiplier for the decoded motion vectors.
 inline float dlss_mv_scale = 1.f;
+// Motion vector sign: a flipped sign misreprojects exactly as badly as a wrong
+// scale, and there was no way to test it - the scale range has no negatives.
+inline float dlss_mv_flip = 0.f;
+// Reset the history on every evaluation. If the image is identical with this on, the
+// history was already being discarded every frame; if it gets worse, history is
+// accumulating and the fault is in what it accumulates from.
+inline float dlss_reset_every_frame = 0.f;
+// Engines commonly store the offset to undo rather than the one applied - the same
+// trap the motion vectors had. A wrong sign doubles the reprojection error instead
+// of correcting it, which is a visible failure rather than a subtle one.
+inline float dlss_jitter_flip = 0.f;
 inline float dlss_debug_logging = 0.f;
 // What DLSS is allowed to replace, for isolating a rendering fault:
 //   0 = Replace         skip the TAA draw and copy DLSS output into its target
@@ -681,7 +692,7 @@ struct ProjectionJitter {
 };
 
 inline ProjectionJitter projection_jitter;
-static constexpr uint32_t kProjectionProbesPerFrame = 48u;
+static constexpr uint32_t kProjectionProbesPerFrame = 4u;
 static constexpr uint32_t kProjectionMaxBytes = 65536u;
 inline uint32_t projection_probes_left = kProjectionProbesPerFrame;
 // A full scan reads and walks a whole constant buffer; when it finds nothing it is
@@ -785,7 +796,6 @@ inline bool ReadProjectionFromBuffer(const reshade::api::buffer_range& range, Pr
       out.base_zw = zw;
       out.ndc_x = nx;
       out.ndc_y = ny;
-      resource->Unmap(0u, &written_range);
       return true;
     }
   }
@@ -835,11 +845,16 @@ inline void ProbeConstantBufferForProjection(const reshade::api::buffer_range& r
   }
 
   if (projection_jitter.matched_this_frame || projection_probes_left == 0u) return;
-  if (projection_scan_cooldown > 0u) {
-    --projection_scan_cooldown;
-    return;
+  // Spacing out scans only makes sense once there is an identity to keep: while the
+  // camera's buffer has never been found, every frame is used to look for it, and
+  // only after a find is lost is the expensive path throttled.
+  if (projection_jitter.hint_size != 0u) {
+    if (projection_scan_cooldown > 0u) {
+      --projection_scan_cooldown;
+      return;
+    }
+    projection_scan_cooldown = 60u;
   }
-  projection_scan_cooldown = 60u;
   --projection_probes_left;
   ProjectionJitter found;
   if (!ReadProjectionFromBuffer(range, found)) return;
@@ -857,48 +872,250 @@ inline void ProbeConstantBufferForProjection(const reshade::api::buffer_range& r
 // frame, so this is what keeps the value current; a buffer that no longer has the
 // same shape, or that stops changing at all (a stale slot), is dropped and found
 // again from the descriptors the engine writes next.
-inline void RefreshProjectionJitter(uint32_t render_width, uint32_t render_height) {
-  projection_probes_left = kProjectionProbesPerFrame;
-  projection_aspect_xx = render_height != 0u
-      ? static_cast<float>(render_width) / static_cast<float>(render_height)
-      : 0.f;
-  auto& js = projection_jitter;
-  if (!js.valid) return;
-  // The jitter changes every frame, so a value from an earlier frame is not a
-  // stale-but-close answer, it is a wrong one: it counts only when probing found
-  // the projection during this frame. No address is remembered, so there is
-  // nothing to go stale when the constant ring moves.
-  if (!js.matched_this_frame) {
-    js.valid = false;
-    ++js.losses;
-    return;
+// ── Jitter: read the camera's projection every frame ──
+// The constant ring relocates its contents every frame, so nothing that remembers
+// *where* the matrix was can be trusted - that assumption has failed in four
+// different forms now (offset, size hint, probe budget, scan cooldown). What is
+// stable is the *search*: one comparison per float4 over a bounded window costs
+// tens of microseconds, which is affordable every single frame and removes the
+// entire class of scheduling failures. It is also the design that first produced a
+// real jitter value - (-0.2134, 0.1706) pixels - before the gates were added.
+// ── Jitter: the engine's own value, wherever it keeps it ──
+// The projection matrix was proven not to carry it: with a non-zero requirement in
+// place, not one projection in the window matched. That leaves a per-frame uniform
+// consumed by the scene shaders - a float2 that is sub-pixel in magnitude and
+// *changes every frame*. Constants do not move, and this does, so the test is not
+// the value's size but its behaviour and its reach: the same tiny pair, appearing in
+// more than one constant buffer of the same frame, and different the next frame.
+struct JitterCandidate {
+  float a = 0.f;
+  float b = 0.f;
+  uint32_t slots = 0u;      // distinct buffers it appeared in this frame
+  uint32_t reach = 0u;      // how many buffers the winner reached
+  uint64_t slot_mask = 0u;  // which ones, so repeats in one buffer do not count twice
+};
+inline JitterCandidate jitter_candidates[32];
+inline uint32_t jitter_candidate_count = 0u;
+inline float jitter_last_adopted_a = 0.f;
+inline float jitter_last_adopted_b = 0.f;
+inline uint32_t jitter_adopted_age = 0u;
+// The last few adopted values, so that one report shows whether both components of
+// the pair actually move over time or whether only one of them does.
+inline float jitter_history[4][2] = {};
+inline uint32_t jitter_history_next = 0u;
+// Values adopted recently. A jitter never repeats a value, so a candidate whose value
+// has just been used is skipped. That kills a two-buffer alternation, which otherwise
+// wins simply by being first in the ring, and leaves whichever candidate keeps
+// producing values the engine has never used before.
+inline float jitter_recent[128][2] = {};
+inline uint32_t jitter_recent_next = 0u;
+inline uint32_t jitter_recent_count = 0u;
+
+// A van der Corput value in [0,1): the basis of a Halton pair, which is what renderers
+// jitter with. The synthetic option feeds one on purpose, so the image can be seen with
+// a correct-shaped sequence and compared against whatever the search finds.
+inline float HaltonValue(uint32_t index, uint32_t base) {
+  float result = 0.0f;
+  float fraction = 1.0f / static_cast<float>(base);
+  uint32_t i = index;
+  while (i > 0u) {
+    result += fraction * static_cast<float>(i % base);
+    i /= base;
+    fraction /= static_cast<float>(base);
   }
-  // NDC is [-1, 1] over the render extent, and the y axis flips between NDC (up)
-  // and pixel space (down), which is the space DLSS takes its offsets in.
-  const float pixels_x = js.ndc_x * static_cast<float>(render_width) * 0.5f;
-  const float pixels_y = -js.ndc_y * static_cast<float>(render_height) * 0.5f;
-  if (!std::isfinite(pixels_x) || !std::isfinite(pixels_y)
-      || fabsf(pixels_x) > 0.5f || fabsf(pixels_y) > 0.5f) {
-    js.valid = false;
-    ++js.losses;
-    return;
-  }
-  if (pixels_x == js.last_pixels_x && pixels_y == js.last_pixels_y) {
-    if (++js.frozen_frames > 30u) {
-      js.valid = false;
-      ++js.losses;
-      return;
-    }
-  } else {
-    js.frozen_frames = 0u;
-  }
-  js.last_pixels_x = pixels_x;
-  js.last_pixels_y = pixels_y;
-  js.pixels_x = pixels_x;
-  js.pixels_y = pixels_y;
-  ++js.probes;
+  return result;
 }
 
+// ── Jitter: the engine's cycled table ──
+// The projection matrix was proven not to carry it, and a Halton-like search never
+// could: the engine's jitter is a finite table of offsets, cycled. That changes what is
+// being looked for and what qualifies.
+//
+// Collection is hashed by the pair's bits, quantised so that the same value written by
+// two different shaders groups together. Exact bits do not, and that alone kept the
+// two-buffer test from ever being satisfied.
+static constexpr uint32_t kCandidateSlots = 1024u;
+
+struct CandidateSlot {
+  uint64_t key = 0u;
+  uint64_t mask = 0u;
+  uint32_t slots = 0u;
+  bool used = false;
+};
+
+inline CandidateSlot candidate_slots[kCandidateSlots];
+
+inline CandidateSlot* FindCandidateSlot(uint64_t key) {
+  uint32_t index = static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ull) >> 40u) & (kCandidateSlots - 1u);
+  for (uint32_t probe = 0u; probe < 24u; ++probe) {
+    CandidateSlot& slot = candidate_slots[(index + probe) & (kCandidateSlots - 1u)];
+    if (!slot.used) return &slot;
+    if (slot.key == key) return &slot;
+  }
+  return nullptr;
+}
+
+// Once a handful of table entries are known in order, the sequence is *predicted*
+// rather than searched for. Searching walks four megabytes of constant ring - that was
+// the stutter - and yielded a value only on the frames where it saw the current entry.
+// Predicting costs nothing, yields a value every frame, and is what the engine does.
+inline uint32_t jitter_predict_cursor = 0u;
+inline uint32_t jitter_predict_ready = 0u;
+inline uint32_t jitter_scan_cooldown = 0u;
+
+inline void RefreshProjectionJitter(
+    const reshade::api::buffer_range& range, uint32_t render_width, uint32_t render_height) {
+  auto& js = projection_jitter;
+  ++js.probes;
+  js.valid = false;
+
+  // The common path: one entry further along the table.
+  if (jitter_predict_ready != 0u && jitter_recent_count >= 4u && jitter_scan_cooldown > 0u) {
+    jitter_predict_cursor = (jitter_predict_cursor + 1u) % jitter_recent_count;
+    const float px = jitter_recent[jitter_predict_cursor][0];
+    const float py = jitter_recent[jitter_predict_cursor][1];
+    if (std::isfinite(px) && std::isfinite(py) && fabsf(px) <= 0.5f && fabsf(py) <= 0.5f) {
+      js.valid = true;
+      js.pixels_x = px;
+      js.pixels_y = py;
+      js.ndc_x = px;
+      js.ndc_y = py;
+      js.matched_this_frame = true;
+      --jitter_scan_cooldown;
+      return;
+    }
+    jitter_predict_ready = 0u;
+  }
+
+  // Alignment. Before the table is known this runs occasionally rather than every
+  // frame, so a failed search cannot cost frames; afterwards it runs once every 32 to
+  // confirm the sequence or re-find it.
+  if (jitter_scan_cooldown > 0u) {
+    --jitter_scan_cooldown;
+    return;
+  }
+  jitter_scan_cooldown = jitter_predict_ready != 0u ? 32u : 4u;
+
+  if (range.buffer.handle == 0u || range.offset == UINT64_MAX) return;
+  if (render_width == 0u || render_height == 0u) return;
+  const uint8_t* data = MappedRingData(range.buffer.handle);
+  if (data == nullptr) return;
+
+  const uint64_t end = (range.offset + 512u) > mapped_ring.size ? mapped_ring.size : range.offset + 512u;
+  const uint64_t window = 4u * 1024u * 1024u;
+  const uint64_t begin = end > window ? end - window : 0u;
+  if (end <= begin + 16u) return;
+
+  for (uint32_t s = 0u; s < kCandidateSlots; ++s) candidate_slots[s] = CandidateSlot{};
+
+  const float pixel_limit = 0.5f;
+  const float ndc_limit_x = 1.0f / static_cast<float>(render_width);
+  const float ndc_limit_y = 1.0f / static_cast<float>(render_height);
+
+  const float* floats = reinterpret_cast<const float*>(data + begin);
+  const uint32_t floats_count = static_cast<uint32_t>((end - begin) / sizeof(float));
+  for (uint32_t i = 0u; i + 4u <= floats_count; i += 4u) {
+    for (uint32_t pair = 0u; pair < 2u; ++pair) {
+      const uint32_t at = i + pair * 2u;
+      const float a = floats[at];
+      const float b = floats[at + 1u];
+      if (!std::isfinite(a) || !std::isfinite(b)) continue;
+      const bool pixel_like = fabsf(a) <= pixel_limit && fabsf(b) <= pixel_limit;
+      const bool ndc_like = fabsf(a) <= ndc_limit_x && fabsf(b) <= ndc_limit_y;
+      if (!pixel_like && !ndc_like) continue;
+      if (fabsf(a) + fabsf(b) < 0.002f) continue;
+      uint32_t bits_a = 0u, bits_b = 0u;
+      std::memcpy(&bits_a, &a, sizeof(bits_a));
+      std::memcpy(&bits_b, &b, sizeof(bits_b));
+      bits_a &= 0xFFFFF000u;
+      bits_b &= 0xFFFFF000u;
+      CandidateSlot* slot = FindCandidateSlot((static_cast<uint64_t>(bits_a) << 32u) | bits_b);
+      if (slot == nullptr) continue;
+      const uint64_t bit = 1ull << (((begin + static_cast<uint64_t>(at) * sizeof(float)) / 512u) % 64u);
+      if ((slot->mask & bit) == 0u) {
+        slot->mask |= bit;
+        ++slot->slots;
+      }
+    }
+  }
+
+  // A value qualifies by repeating one adopted earlier - the ring is the only window -
+  // and by not matching anything from the last few frames, which rejects a constant and
+  // a two-value alternation. Until the ring has filled once, any shared value is taken.
+  uint32_t best_slot = UINT32_MAX;
+  for (uint32_t s = 0u; s < kCandidateSlots; ++s) {
+    if (!candidate_slots[s].used || candidate_slots[s].slots < 2u) continue;
+    uint32_t bits_a = static_cast<uint32_t>(candidate_slots[s].key >> 32u);
+    uint32_t bits_b = static_cast<uint32_t>(candidate_slots[s].key & 0xFFFFFFFFu);
+    float a = 0.f, b = 0.f;
+    std::memcpy(&a, &bits_a, sizeof(a));
+    std::memcpy(&b, &bits_b, sizeof(b));
+    bool immediate = false;
+    bool returns = false;
+    for (uint32_t r = 0u; r < jitter_recent_count; ++r) {
+      const uint32_t index = (jitter_recent_next + 128u - 1u - r) % 128u;
+      if (fabsf(jitter_recent[index][0] - a) > 1e-4f
+          || fabsf(jitter_recent[index][1] - b) > 1e-4f) {
+        continue;
+      }
+      if (r < 4u) {
+        immediate = true;
+        break;
+      }
+      returns = true;
+      break;
+    }
+    if (immediate) continue;
+    if (jitter_recent_count >= 128u && !returns) continue;
+    best_slot = s;
+    break;
+  }
+  if (best_slot == UINT32_MAX) return;
+
+  uint32_t bits_a = static_cast<uint32_t>(candidate_slots[best_slot].key >> 32u);
+  uint32_t bits_b = static_cast<uint32_t>(candidate_slots[best_slot].key & 0xFFFFFFFFu);
+  float best_a = 0.f, best_b = 0.f;
+  std::memcpy(&best_a, &bits_a, sizeof(best_a));
+  std::memcpy(&best_b, &bits_b, sizeof(best_b));
+  js.size = candidate_slots[best_slot].slots;
+
+  const float pixels_x = fabsf(best_a) <= pixel_limit
+      ? best_a
+      : best_a * static_cast<float>(render_width) * 0.5f;
+  const float pixels_y = fabsf(best_b) <= pixel_limit
+      ? -best_b
+      : -best_b * static_cast<float>(render_height) * 0.5f;
+  if (!std::isfinite(pixels_x) || !std::isfinite(pixels_y)
+      || fabsf(pixels_x) > 0.5f || fabsf(pixels_y) > 0.5f) return;
+
+  ++js.adoptions;
+  jitter_history[jitter_history_next][0] = pixels_x;
+  jitter_history[jitter_history_next][1] = pixels_y;
+  jitter_history_next = (jitter_history_next + 1u) % 4u;
+
+  // Append to the sequence unless it repeats the previous entry, which would put a
+  // duplicate in the table and make every prediction after it wrong.
+  const uint32_t last = jitter_recent_count == 0u ? 0u : (jitter_recent_next + 128u - 1u) % 128u;
+  if (jitter_recent_count == 0u
+      || fabsf(jitter_recent[last][0] - best_a) > 1e-4f
+      || fabsf(jitter_recent[last][1] - best_b) > 1e-4f) {
+    jitter_recent[jitter_recent_next][0] = best_a;
+    jitter_recent[jitter_recent_next][1] = best_b;
+    jitter_predict_cursor = jitter_recent_next;
+    jitter_recent_next = (jitter_recent_next + 1u) % 128u;
+    if (jitter_recent_count < 128u) ++jitter_recent_count;
+    jitter_predict_ready = 1u;
+  }
+
+  js.valid = true;
+  js.base_xx = best_a;
+  js.base_yy = best_b;
+  js.ndc_x = best_a;
+  js.ndc_y = best_b;
+  js.pixels_x = pixels_x;
+  js.pixels_y = pixels_y;
+  js.matched_this_frame = true;
+}
 
 inline bool OnUpdateDescriptorTables(
     reshade::api::device* device,
@@ -2059,7 +2276,8 @@ inline bool DispatchUnpack(
   device->update_descriptor_tables(2, updates);
   cmd_list->bind_descriptor_tables(CS, unpack.layout, 0, 2, unpack.tables);
 
-  const float pc[8] = {static_cast<float>(width), static_cast<float>(height), dlss_mv_scale, 0.f,
+  const float pc[8] = {static_cast<float>(width), static_cast<float>(height),
+                       dlss_mv_scale * (dlss_mv_flip != 0.f ? -1.f : 1.f), 0.f,
                        static_cast<float>(src_width), static_cast<float>(src_height), 0.f, 0.f};
   cmd_list->push_constants(CS, unpack.layout, 2, 0, 8, pc);
   cmd_list->dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
@@ -2727,12 +2945,26 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   // whenever no projection with a stable shape is in hand.
   last_render_width.store(input_width);
   last_render_height.store(input_height);
-  RefreshProjectionJitter(input_width, input_height);
+  RefreshProjectionJitter(b0_range, input_width, input_height);
   float jitter_x = 0.f;
   float jitter_y = 0.f;
-  if (dlss_jitter_source > 0.5f && projection_jitter.valid) {
-    jitter_x = projection_jitter.pixels_x;
-    jitter_y = projection_jitter.pixels_y;
+  // A sub-pixel offset that cycles through a handful of phases: if feeding this
+  // changes the image, DLSS is consuming the jitter and the real value is worth
+  // wiring; if it changes nothing, the jitter is not reaching its reprojection at
+  // all and neither is the history.
+  if (dlss_jitter_source >= 1.5f) {
+    // A finite cycled pattern: the first 21 values of a Halton(2,3) sequence, wrapped.
+    // That is the shape a renderer's own jitter table has - a fixed set of offsets
+    // reused every cycle - so the debug overlay holds a steady set of points instead
+    // of filling the way a never-repeating sequence does.
+    static uint32_t pattern_index = 0u;
+    const uint32_t step = (pattern_index++ % 21u) + 1u;
+    jitter_x = HaltonValue(step, 2u) - 0.5f;
+    jitter_y = HaltonValue(step, 3u) - 0.5f;
+  } else if (dlss_jitter_source > 0.5f && projection_jitter.valid) {
+    const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
+    jitter_x = projection_jitter.pixels_x * jitter_sign;
+    jitter_y = projection_jitter.pixels_y * jitter_sign;
   }
   // Nothing that is not a finite number reaches NGX, and nothing outside
   // sub-pixel range either: a jitter is a sub-pixel offset, so a larger value can
@@ -2754,7 +2986,7 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
   eval.InJitterOffsetY = jitter_y;
   eval.InRenderSubrectDimensions.Width = input_width;
   eval.InRenderSubrectDimensions.Height = input_height;
-  eval.InReset = ngx.reset ? 1 : 0;
+  eval.InReset = (ngx.reset || dlss_reset_every_frame != 0.f) ? 1 : 0;
   eval.InMVScaleX = 1.f;
   eval.InMVScaleY = 1.f;
   eval.InPreExposure = 1.f;
@@ -2908,10 +3140,10 @@ inline std::string BuildDebugReport() {
       "  probe (recorded descriptor lookup)\n"
       "%s"
       "  last eval        : in=%ux%u target=%ux%u mv=%ux%u depth=%ux%u\n"
-      "  quality / preset : %s / %s   flags=0x%X\n"
+      "  quality / preset : %s / %s (hint=%d)   flags=0x%X\n"
       "  evals/resets/bypass : %llu / %llu / %llu\n"
       "  jitter ngx px    : (%.4f, %.4f)\n"
-      "  mv scale         : %.3f   mv jittered=%s   depth inverted=%s\n"
+      "  mv scale / flip  : %.3f / %s   mv jittered=%s   depth inverted=%s   reset-every-frame=%s\n"
       "  hdr / restore    : %s / %s\n"
       "  depth transition : %s\n"
       "  upscaler         : %s   replaced=%llu misses=%llu target=%ux%u fmt=%u res=0x%llX\n",
@@ -2936,14 +3168,17 @@ inline std::string BuildDebugReport() {
       report.input_width, report.input_height, report.target_width, report.target_height,
       report.mv_width, report.mv_height, report.depth_width, report.depth_height,
       GetPerfQualityName(report.quality), GetRenderPresetName(report.preset),
+      GetRenderPresetValue(),
       static_cast<unsigned>(report.flags),
       static_cast<unsigned long long>(report.evals),
       static_cast<unsigned long long>(report.resets),
       static_cast<unsigned long long>(report.bypass),
       static_cast<double>(report.jitter_x), static_cast<double>(report.jitter_y),
       static_cast<double>(dlss_mv_scale),
+      dlss_mv_flip != 0.f ? "flipped" : "normal",
       dlss_motion_vectors_jittered != 0.f ? "on" : "off",
       dlss_depth_inverted != 0.f ? "on" : "off",
+      dlss_reset_every_frame != 0.f ? "on" : "off",
       dlss_flag_is_hdr != 0.f ? "on" : "off",
       dlss_restore_state != 0.f ? "on" : "off",
       dlss_transition_depth != 0.f ? "on" : "off",
@@ -3003,16 +3238,32 @@ inline std::string BuildDebugReport() {
   // anything. The value DLSS was handed is on the line above.
   {
     char line[320];
+  // The last few adopted values: one paste shows whether both components of the
+  // pair move over time, or whether only one of them does.
+  {
+    char line[288];
+    snprintf(line, sizeof(line),
+             "  jitter last      : %.4f,%.4f  %.4f,%.4f  %.4f,%.4f  %.4f,%.4f\n",
+             static_cast<double>(jitter_history[0][0]), static_cast<double>(jitter_history[0][1]),
+             static_cast<double>(jitter_history[1][0]), static_cast<double>(jitter_history[1][1]),
+             static_cast<double>(jitter_history[2][0]), static_cast<double>(jitter_history[2][1]),
+             static_cast<double>(jitter_history[3][0]), static_cast<double>(jitter_history[3][1]));
+    out += line;
+  }
     const auto& js = projection_jitter;
     if (dlss_jitter_source <= 0.5f) {
       snprintf(line, sizeof(line), "  jitter source    : zero (manual)\n");
+    } else if (dlss_jitter_source >= 1.5f) {
+      snprintf(line, sizeof(line),
+               "  jitter source    : synthetic test ramp (px=(%.2f, %.2f))\n",
+               static_cast<double>(js.pixels_x), static_cast<double>(js.pixels_y));
     } else if (!js.valid) {
       snprintf(line, sizeof(line),
-               "  jitter source    : projection, none in hand (%llu adopted, %llu lost)\n",
+               "  jitter source    : shared sub-pixel pair, none in hand (%llu adopted, %llu lost)\n",
                static_cast<unsigned long long>(js.adoptions), static_cast<unsigned long long>(js.losses));
     } else {
       snprintf(line, sizeof(line),
-               "  jitter source    : projection at %llu+%u%s, ndc=(%.6f, %.6f) -> px=(%.4f, %.4f), reads=%llu\n",
+               "  jitter source    : pair at %llu+%u%s, raw=(%.6f, %.6f) -> px=(%.4f, %.4f), scans=%llu\n",
                static_cast<unsigned long long>(js.offset), js.size, js.transposed ? " (transposed)" : "",
                static_cast<double>(js.ndc_x), static_cast<double>(js.ndc_y),
                static_cast<double>(js.pixels_x), static_cast<double>(js.pixels_y),
@@ -3188,6 +3439,12 @@ inline void OnPresent(
   fsr1_seen_this_frame = false;
   fsr1_wrote_this_frame.store(false);
   projection_jitter.matched_this_frame = false;
+  // The probe budget belongs to the frame, not to the evaluation: resetting it at the
+  // TAA draw meant every batch was spent on constant buffers written after that draw,
+  // and the camera's own buffer - written in the frame setup, before it - was never
+  // inside one. From here the budget is spent on the frame's first writes, which is
+  // where per-view data lives.
+  projection_probes_left = kProjectionProbesPerFrame;
 }
 
 inline void OnInitDevice(reshade::api::device* device) {
