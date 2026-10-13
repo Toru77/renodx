@@ -618,11 +618,31 @@ inline sl::Result HookedSlSetD3DDevice(void* device) {
   return result;
 }
 
+// Diagnostic: what the game actually tags, one line per distinct type/format.
+inline void LogGameTags(const char* source, const sl::ResourceTag* tags, uint32_t num_tags) {
+  if (!guides::DiagGuidesEnabled() || tags == nullptr) return;
+  for (uint32_t i = 0; i < num_tags; ++i) {
+    const auto& tag = tags[i];
+    if (tag.resource == nullptr) continue;
+    const uint32_t format = static_cast<uint32_t>(tag.resource->nativeFormat);
+    const uint32_t width = tag.extent.width;
+    const uint32_t height = tag.extent.height;
+    guides::LogOnce(
+        std::string("gametag:") + source + ":" + std::to_string(static_cast<uint32_t>(tag.type))
+            + ":" + std::to_string(format),
+        std::string("game tag via ") + source + ": type="
+            + std::to_string(static_cast<uint32_t>(tag.type)) + " format=0x"
+            + HresultLabel(static_cast<HRESULT>(format)) + " extent="
+            + std::to_string(width) + "x" + std::to_string(height));
+  }
+}
+
 inline sl::Result HookedSlSetTag(
     const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t num_tags,
     sl::CommandBuffer* cmd) {
   ServiceRuntimeLoad();
   const auto result = real_sl_set_tag(viewport, tags, num_tags, cmd);
+  LogGameTags("slSetTag", tags, num_tags);
   const std::lock_guard lock(state_mutex);
   CaptureScalingInput(tags, num_tags);
   return result;
@@ -633,6 +653,7 @@ inline sl::Result HookedSlSetTagForFrame(
     uint32_t num_tags, sl::CommandBuffer* cmd) {
   ServiceRuntimeLoad();
   const auto result = real_sl_set_tag_for_frame(frame, viewport, tags, num_tags, cmd);
+  LogGameTags("slSetTagForFrame", tags, num_tags);
   const std::lock_guard lock(state_mutex);
   CaptureScalingInput(tags, num_tags);
   return result;
@@ -872,16 +893,33 @@ inline sl::Result HookedSlEvaluateFeature(
         &specular_albedo_resource, sl::kBufferTypeSpecularAlbedo,
         sl::ResourceLifecycle::eValidUntilPresent, &guide_extent);
 
-    const sl::BaseStructure* extended_inputs[8] = {};
+    // The game hands the evaluate its own inputs (viewport handle and its
+    // tags) and our three guides ride at the end of the same array. The copy
+    // cap must leave room for them: the game passes few inputs, but a cap that
+    // fills the array first would silently drop every guide.
+    constexpr uint32_t kMaxGameInputs = 12;
+    const sl::BaseStructure* extended_inputs[kMaxGameInputs + 3] = {};
     uint32_t extended_count = 0;
-    if (inputs != nullptr) {
-      for (uint32_t i = 0; i < num_inputs && extended_count < 5; ++i) {
-        extended_inputs[extended_count++] = inputs[i];
-      }
+    const uint32_t game_inputs_copied =
+        (inputs != nullptr && num_inputs < kMaxGameInputs) ? num_inputs : kMaxGameInputs;
+    for (uint32_t i = 0; i < game_inputs_copied; ++i) {
+      extended_inputs[extended_count++] = inputs[i];
     }
     extended_inputs[extended_count++] = &tag_normal_roughness;
     extended_inputs[extended_count++] = &tag_albedo;
     extended_inputs[extended_count++] = &tag_specular_albedo;
+
+    // Diagnostic: exactly what we hand RR, so a dropped tag shows up here as a
+    // total smaller than game + 3.
+    if (guides::DiagGuidesEnabled()) {
+      guides::LogThrottled(
+          "rr:tags",
+          "RR evaluate inputs: game=" + std::to_string(num_inputs)
+              + " copied=" + std::to_string(game_inputs_copied)
+              + " total=" + std::to_string(extended_count) + " (nr+albedo+specular)"
+              + " rr_active=" + std::to_string(GetRrRedirect() ? 1 : 0),
+          std::chrono::milliseconds(2000));
+    }
 
     const auto rr_result = real_sl_evaluate_feature(
         sl::kFeatureDLSS_RR, frame, extended_inputs, extended_count, cmd);

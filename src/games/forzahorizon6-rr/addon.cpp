@@ -26,6 +26,7 @@
 #include "./sl_rr.hpp"
 #include "./denoise.hpp"
 #include "./guides.hpp"
+#include "./nvngx_responsivity.hpp"
 
 namespace {
 
@@ -46,6 +47,13 @@ float rr_preset_setting = 2.f;  // index into kRrPresetValues; F by default
 
 // Diagnostic logging for the RR and guide paths; off by default.
 float rr_debug_log_setting = 0.f;
+
+// DLSSD.ResponsivityMask, the one temporal-response control RR has. Negative
+// favours stability (more history), positive favours responsiveness, and 0
+// omits the mask entirely - RR's own default, so nothing changes until it is
+// moved. This is the knob that can average the half-res fireflies out without
+// clamping or filtering the signal.
+float rr_responsivity_setting = 0.f;
 
 // RTGI tier detection. The bind hook arms the tier's bound flag whenever the
 // game binds that tier's spatial filter; each present consumes it. Frame
@@ -93,6 +101,8 @@ void ApplyRrState() {
   // re-creates the Streamline state the failure came from.
   sl_rr::SetRuntimeLoad(active);
   sl_rr::SetRrRedirect(active);
+  responsivity::enabled.store(active);
+  responsivity::value.store(rr_responsivity_setting);
   guides::enabled.store(active);
   denoise::SetEnabled(denoise::kSpatialHighHash, bypass_high);
   denoise::SetEnabled(denoise::kSpatialMediumHash, bypass_medium);
@@ -155,6 +165,34 @@ renodx::utils::settings::Settings settings = {
         .is_visible = [] { return sl_rr::GetRrTrip(); },
     },
     new renodx::utils::settings::Setting{
+        .key = "RrPreset",
+        .binding = &rr_preset_setting,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 2.f,
+        .label = "RR preset",
+        .section = "Ray Reconstruction",
+        .tooltip = "DLSS Ray Reconstruction render preset, applied to every mode. D is the"
+                   " default transformer model, E the latest transformer model, and F the"
+                   " current RR 4.5 default. Changes apply on the next frame.",
+        .labels = {"D", "E", "F"},
+        .on_change_value = [](float, float value) {
+          sl_rr::SetRrPreset(kRrPresetValues[static_cast<int>(value)]);
+        },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "RRResponsivity",
+        .binding = &rr_responsivity_setting,
+        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
+        .default_value = -0.2f,
+        .label = "RR responsivity",
+        .section = "Ray Reconstruction",
+        .tooltip = "Preset F only. Lower more stable, higher more responsive.",
+        .min = -1.f,
+        .max = 1.f,
+        .format = "%.2f",
+        .on_change_value = [](float, float) { ApplyRrState(); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "RrDebugLog",
         .binding = &rr_debug_log_setting,
         .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -170,21 +208,6 @@ renodx::utils::settings::Settings settings = {
                    " after turning it on. Expect a large log; turn it off and restart"
                    " for normal play.",
         .on_change_value = [](float, float value) { guides::SetDiagnostics(value != 0.f); },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "RrPreset",
-        .binding = &rr_preset_setting,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f,
-        .label = "RR preset",
-        .section = "Ray Reconstruction",
-        .tooltip = "DLSS Ray Reconstruction render preset, applied to every mode. D is the"
-                   " default transformer model, E the latest transformer model, and F the"
-                   " current RR 4.5 default. Changes apply on the next frame.",
-        .labels = {"D", "E", "F"},
-        .on_change_value = [](float, float value) {
-          sl_rr::SetRrPreset(kRrPresetValues[static_cast<int>(value)]);
-        },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BULLET,
@@ -279,6 +302,7 @@ void OnPresent(
   (void)dirty_rect_count;
   (void)dirty_rects;
   sl_rr::Poll();
+  responsivity::Poll();
   // The bind hook arms the flags during this frame's dispatches. A miss is only
   // a frame-generation gap or a transition, so require a run of them before
   // letting go of a tier.
@@ -326,6 +350,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       sl_rr::UninstallHooks();
+      responsivity::Disarm();
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       break;

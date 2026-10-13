@@ -5,14 +5,9 @@
 // nine taps with per-tap normal alignment and depth similarity (half-res
 // guide t38), then reconstructing through the Co/Cg + normal-lobe transform.
 // This replacement keeps the raw bilinear 2x upscale (within a surface the
-// pair is passed through, no averaging) but adds two anomaly controls:
-//   - a per-tap guide gate matching the original's own weight zero-crossings:
-//     a tap contributes only while its half-res guide normal agrees with this
-//     pixel and its linear depth is within 5% of it, so the blend never mixes
-//     across a surface edge;
-//   - a bright-spike clamp: a tap whose luminance estimate dominates its
-//     accepted neighbours (kSpikeLimit x) is scaled down before the blend, so
-//     a single stray sample is not upscaled at full strength.
+// pair is passed through, no averaging) but gates each tap: a tap contributes
+// only while its half-res guide normal agrees with this pixel and its linear
+// depth is within 5% of it, so the blend never mixes across a surface edge.
 // If every tap fails the gate, the raw centre sample is used. Bounds, depth
 // guard and normal decode are exact copies of the original's per-pixel path.
 
@@ -31,8 +26,23 @@ RWTexture2D<float4> g_out : register(u0, space36);
 // Relative linear-depth difference at which the original's depth weight
 // reaches zero (its falloff is 1 - saturate(20 * ratio)).
 static const float kGuideDepthRatio = 0.05f;
-// A tap above this multiple of its accepted neighbours' luminance is clamped.
-static const float kSpikeLimit = 16.0f;
+
+// Firefly clamp. A single 1 spp sample can sit orders of magnitude above the
+// local level, and DLSS-RR has no input that bounds it - it denoises what it is
+// given. Production renderers clamp fireflies before the denoiser for exactly
+// this reason, and the game's own chain does too. The reference is a wide,
+// gated mean of the half-res neighbourhood, so the clamp only fires on a
+// genuine outlier and removes almost no energy; it is applied in the log domain
+// so a partial strength removes a fraction of the excess stops rather than
+// cutting to a hard value.
+//
+// kFireflyStrength: 0 = off (raw), 1 = cap the tap at kFireflyRatio x the local
+// reference, in between = that fraction of the excess stops.
+// kFireflyRatio: luminance multiple of the reference at which the cap lands.
+// kFireflyRadius: half-width of the reference window in half-res texels.
+static const float kFireflyStrength = 1.0f;
+static const float kFireflyRatio = 20.0f;
+static const int kFireflyRadius = 24;
 
 float3 DecodePackedNormal(uint bits)
 {
@@ -84,7 +94,6 @@ void main(uint3 global_id : SV_DispatchThreadID)
 
     float4 a_tap[4];
     float4 b_tap[4];
-    float l_tap[4];
     float tap_weight[4];
     float weight_sum = 0.0f;
     [unroll]
@@ -92,7 +101,6 @@ void main(uint3 global_id : SV_DispatchThreadID)
     {
         a_tap[t] = g_rad_a.Load(int3(tap_px[t], 0));
         b_tap[t] = g_rad_b.Load(int3(tap_px[t], 0));
-        l_tap[t] = b_tap[t].w + dot(b_tap[t].xyz, n);
 
         const float2 guide = g_guide.Load(int3(tap_px[t], 0));
         const float3 tile_n = DecodePackedNormal(asuint(guide.x));
@@ -103,6 +111,41 @@ void main(uint3 global_id : SV_DispatchThreadID)
             kGuideDepthRatio);
         tap_weight[t] = (normal_gate * depth_gate) * bilinear_w[t];
         weight_sum += tap_weight[t];
+    }
+
+    // Firefly reference: a wide, gated mean of the half-res neighbourhood
+    // around this pixel's own texel, excluding the centre so the sample being
+    // judged never contributes to its own reference. At half resolution a 3x3
+    // window already spans six full-res pixels, which is wider than the
+    // mip-blurred reference a production renderer would clamp against.
+    float firefly_reference = 0.0f;
+    if (kFireflyStrength > 0.0f)
+    {
+        float reference_sum = 0.0f;
+        float reference_weight = 0.0f;
+        const uint2 reference_centre = min(px >> 1u, in_max);
+        [unroll]
+        for (int ry = -kFireflyRadius; ry <= kFireflyRadius; ++ry)
+        {
+            [unroll]
+            for (int rx = -kFireflyRadius; rx <= kFireflyRadius; ++rx)
+            {
+                if ((rx == 0) && (ry == 0)) continue;
+                const uint2 reference_px = uint2(clamp(
+                    int2(reference_centre) + int2(rx, ry), int2(0, 0), int2(in_max)));
+                const float2 reference_guide = g_guide.Load(int3(reference_px, 0));
+                const float reference_normal_gate =
+                    step(0.0f, dot(n, DecodePackedNormal(asuint(reference_guide.x))));
+                const float reference_depth_gate = step(
+                    abs(linear_depth - reference_guide.y) / (reference_guide.y + linear_depth),
+                    kGuideDepthRatio);
+                if ((reference_normal_gate * reference_depth_gate) <= 0.0f) continue;
+                const float4 reference_b = g_rad_b.Load(int3(reference_px, 0));
+                reference_sum += reference_b.w + dot(reference_b.xyz, n);
+                reference_weight += 1.0f;
+            }
+        }
+        if (reference_weight > 0.0f) firefly_reference = reference_sum / reference_weight;
     }
 
     if (weight_sum <= 0.0f)
@@ -116,36 +159,35 @@ void main(uint3 global_id : SV_DispatchThreadID)
         return;
     }
 
-    float4 a_sum = 0.0f.xxxx;
-    float4 b_sum = 0.0f.xxxx;
-    float weight_used = 0.0f;
-    [unroll]
-    for (int t = 0; t < 4; ++t)
+    // Firefly clamp: scale any tap whose luminance sits above the cap. The
+    // chroma and the normal-lobe terms scale with it, so hue is preserved and
+    // the encoded pair stays consistent; the weight channel is left alone.
+    if (firefly_reference > 0.0f)
     {
-        float w = tap_weight[t];
-        if (w > 0.0f)
+        const float cap = firefly_reference * kFireflyRatio;
+        [unroll]
+        for (int t = 0; t < 4; ++t)
         {
-            // Clamp an isolated bright spike against the other accepted taps.
-            float others_max = 0.0f;
-            [unroll]
-            for (int o = 0; o < 4; ++o)
-            {
-                if ((o != t) && (tap_weight[o] > 0.0f))
-                {
-                    others_max = max(others_max, l_tap[o]);
-                }
-            }
-            if ((others_max > 0.0f) && (l_tap[t] > kSpikeLimit * others_max))
-            {
-                w *= (kSpikeLimit * others_max) / l_tap[t];
-            }
-            a_sum += w * a_tap[t];
-            b_sum += w * b_tap[t];
-            weight_used += w;
+            const float tap_luma = b_tap[t].w + dot(b_tap[t].xyz, n);
+            if (tap_luma <= cap) continue;
+            const float scale = exp2(-kFireflyStrength * log2(tap_luma / cap));
+            a_tap[t].xy *= scale;
+            b_tap[t] *= scale;
         }
     }
 
-    const float inv_weight = 1.0f / weight_used;
+    float4 a_sum = 0.0f.xxxx;
+    float4 b_sum = 0.0f.xxxx;
+    [unroll]
+    for (int t = 0; t < 4; ++t)
+    {
+        const float w = tap_weight[t];
+        if (w <= 0.0f) continue;
+        a_sum += w * a_tap[t];
+        b_sum += w * b_tap[t];
+    }
+
+    const float inv_weight = 1.0f / weight_sum;
     const float4 a = a_sum * inv_weight;
     const float4 b = b_sum * inv_weight;
 
