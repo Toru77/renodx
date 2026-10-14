@@ -962,6 +962,12 @@ inline CandidateSlot* FindCandidateSlot(uint64_t key) {
 inline uint32_t jitter_predict_cursor = 0u;
 inline uint32_t jitter_predict_ready = 0u;
 inline uint32_t jitter_scan_cooldown = 0u;
+// Where the sliced walk of the window has reached, in absolute bytes, and whether the
+// candidate table has been cleared for this pass. The table is cleared once per full
+// pass, not once per frame: the reach test needs to see the whole ring's buffers, and
+// clearing per frame is what forced the entire window to be walked every frame.
+inline uint64_t jitter_slice_cursor = 0u;
+inline bool jitter_slice_started = false;
 
 inline void RefreshProjectionJitter(
     const reshade::api::buffer_range& range, uint32_t render_width, uint32_t render_height) {
@@ -1006,14 +1012,25 @@ inline void RefreshProjectionJitter(
   const uint64_t begin = end > window ? end - window : 0u;
   if (end <= begin + 16u) return;
 
-  for (uint32_t s = 0u; s < kCandidateSlots; ++s) candidate_slots[s] = CandidateSlot{};
+  if (!jitter_slice_started || jitter_slice_cursor < begin || jitter_slice_cursor >= end) {
+    jitter_slice_cursor = begin;
+    jitter_slice_started = true;
+    for (uint32_t s = 0u; s < kCandidateSlots; ++s) candidate_slots[s] = CandidateSlot{};
+  }
+  // A slice per frame rather than the whole window: 512 KB is a fraction of a
+  // millisecond, where the full walk was one to two.
+  const uint64_t slice_bytes = 512u * 1024u;
+  uint64_t slice_begin = jitter_slice_cursor;
+  uint64_t slice_end = slice_begin + slice_bytes;
+  if (slice_end > end) slice_end = end;
+  jitter_slice_cursor = (slice_end >= end) ? begin : slice_end;
 
   const float pixel_limit = 0.5f;
   const float ndc_limit_x = 1.0f / static_cast<float>(render_width);
   const float ndc_limit_y = 1.0f / static_cast<float>(render_height);
 
-  const float* floats = reinterpret_cast<const float*>(data + begin);
-  const uint32_t floats_count = static_cast<uint32_t>((end - begin) / sizeof(float));
+  const float* floats = reinterpret_cast<const float*>(data + slice_begin);
+  const uint32_t floats_count = static_cast<uint32_t>((slice_end - slice_begin) / sizeof(float));
   for (uint32_t i = 0u; i + 4u <= floats_count; i += 4u) {
     for (uint32_t pair = 0u; pair < 2u; ++pair) {
       const uint32_t at = i + pair * 2u;
@@ -1031,7 +1048,7 @@ inline void RefreshProjectionJitter(
       bits_b &= 0xFFFFF000u;
       CandidateSlot* slot = FindCandidateSlot((static_cast<uint64_t>(bits_a) << 32u) | bits_b);
       if (slot == nullptr) continue;
-      const uint64_t bit = 1ull << (((begin + static_cast<uint64_t>(at) * sizeof(float)) / 512u) % 64u);
+      const uint64_t bit = 1ull << (((slice_begin + static_cast<uint64_t>(at) * sizeof(float)) / 512u) % 64u);
       if ((slot->mask & bit) == 0u) {
         slot->mask |= bit;
         ++slot->slots;
@@ -1237,6 +1254,11 @@ struct __declspec(uuid("7f3e2a1c-9b4d-4e8f-a6c2-d5f1b0e98341")) CommandListData 
   uint32_t cached_ps_hash = 0u;
   bool ps_hash_valid = false;
   bool ps_dirty = true;
+  // Same for the scene probe: its hashes are read once per bind, not per draw, so
+  // the probe costs two comparisons on the draws it does not care about.
+  uint32_t cached_scene_vs_hash = 0u;
+  uint32_t cached_scene_ps_hash = 0u;
+  bool scene_hash_valid = false;
 };
 
 inline CommandListData* Get(reshade::api::command_list* cmd_list) {
@@ -1613,6 +1635,321 @@ inline void SelectSceneDepth(reshade::api::device* device) {
   TrackDepthResource(best);
 }
 
+// ── Jitter: read from the pass that applies it ──
+// The projection test above is triggered by constant-buffer writes — a frame has
+// hundreds — with a budget of four per frame. Measured over sessions, that reached
+// the scene's own view constants on almost no frame, which is why every version of
+// a search for the value either missed it, cost frames, or both.
+//
+// The pass that cannot avoid the jitter is the one that rasterises the scene: every
+// vertex of the frame is offset by it, so the value is in that pass's view constants
+// by construction rather than by chance. Those passes are known by identity — the
+// hashes below came from a live capture, and each draws four render targets at the
+// render resolution with the camera's constant buffer at b0 — so the read happens at
+// the draws that must carry the jitter, not wherever a scan happens to land.
+inline constexpr uint32_t kSceneShaders[] = {
+    0xA38182D8u, 0xD632E3BDu,  // terrain
+    0x949755FAu, 0x4D19C52Du,  // props
+    0x459A3A3Eu, 0xF61BFFFFu,  // packed scene geometry
+    0x2CF40AE1u, 0xF78435B7u,  // scene materials
+    0xABDFA78Eu, 0xE15F674Au,
+    0x1BC1D314u, 0x48D5181Cu,
+};
+static constexpr uint32_t kSceneShaderCount = sizeof(kSceneShaders) / sizeof(kSceneShaders[0]);
+// A handful of draws per frame: one is enough once the pass is known, and the budget
+// is what keeps a frame whose first candidates are shadow passes from costing
+// anything.
+static constexpr uint32_t kSceneProbeAttemptsPerFrame = 6u;
+static constexpr uint64_t kSceneProbeMaxBytes = 8192u;
+inline uint32_t scene_probe_attempts_left = 0u;
+inline uint32_t scene_attempts_made = 0u;
+inline bool scene_projected_this_frame = false;
+
+// One reading, plus the previous one, so movement can be told from a constant: the
+// jitter changes every frame, a static offset never does.
+struct SceneJitter {
+  bool valid = false;
+  bool from_projection = false;
+  uint32_t shader = 0u;
+  uint32_t stage = 0u;   // 0 = vertex, 1 = pixel
+  uint32_t cb = 0u;
+  uint32_t offset = 0u;  // byte offset of the value inside the buffer view
+  uint32_t order = 0u;   // storage order of the matching matrix
+  float raw_a = 0.f;
+  float raw_b = 0.f;
+  float pixels_x = 0.f;
+  float pixels_y = 0.f;
+  // The matrix's own previous reading, so movement is measured against the matrix
+  // and never against whatever value the source currently holds.
+  float previous_a = 0.f;
+  float previous_b = 0.f;
+  uint64_t reads = 0u;
+  uint64_t moved = 0u;
+  // The frame it was last read on. A reading that stops being refreshed must not
+  // stay in hand: a stale jitter is a wrong jitter.
+  uint64_t updated_frame = 0u;
+};
+inline SceneJitter scene_jitter;
+inline uint64_t frame_counter = 0u;
+
+// Where the matrix was found inside the buffer, relative to the buffer's start. The
+// ring relocates the contents every frame, so only the relative position is stable
+// — and it is stable enough to read one block instead of scanning the buffer.
+inline uint32_t scene_latch_cb = UINT32_MAX;
+inline uint32_t scene_latch_offset = 0u;
+inline uint32_t scene_latch_order = 0u;
+
+// Sub-pixel pairs in the same buffers, kept per (buffer, offset). They are the
+// fallback when no projection carries the offset, and their counters are the
+// evidence that decides which pair is the jitter: it moves every frame, a constant
+// never does.
+static constexpr uint32_t kScenePairCount = 12u;
+
+struct ScenePair {
+  bool used = false;
+  uint32_t cb = 0u;
+  uint32_t offset = 0u;
+  float a = 0.f;
+  float b = 0.f;
+  uint32_t reads = 0u;
+  uint32_t moved = 0u;
+};
+inline ScenePair scene_pairs[kScenePairCount];
+
+inline void NoteScenePair(uint32_t cb, uint32_t offset, float a, float b) {
+  ScenePair* slot = nullptr;
+  for (ScenePair& pair : scene_pairs) {
+    if (pair.used && pair.cb == cb && pair.offset == offset) {
+      slot = &pair;
+      break;
+    }
+    if (!pair.used && slot == nullptr) slot = &pair;
+  }
+  if (slot == nullptr) return;
+  if (!slot->used) {
+    *slot = ScenePair{};
+    slot->used = true;
+    slot->cb = cb;
+    slot->offset = offset;
+  }
+  if (slot->reads != 0u
+      && (fabsf(slot->a - a) > 1e-6f || fabsf(slot->b - b) > 1e-6f)) {
+    ++slot->moved;
+  }
+  slot->a = a;
+  slot->b = b;
+  ++slot->reads;
+}
+
+// A pair's units are not labelled in the buffer. A value that cannot be NDC is read
+// as pixels; one that can only be NDC is converted the same way the projection is.
+inline void PairToPixels(
+    float a, float b, uint32_t width, uint32_t height, float& out_x, float& out_y) {
+  out_x = 0.f;
+  out_y = 0.f;
+  if (width == 0u || height == 0u) return;
+  // One pixel of NDC is 2/width, so anything inside that on its axis is NDC.
+  if (fabsf(a) <= 2.0f / static_cast<float>(width)
+      && fabsf(b) <= 2.0f / static_cast<float>(height)) {
+    out_x = a * static_cast<float>(width) * 0.5f;
+    out_y = -b * static_cast<float>(height) * 0.5f;
+    return;
+  }
+  out_x = a;
+  out_y = -b;
+}
+
+// Reads one constant buffer of a scene draw: the projection that carries the offset
+// first, and the sub-pixel pairs only while no projection has been found.
+inline void ProbeSceneConstantBuffer(
+    const reshade::api::buffer_range& range, uint32_t cb, uint32_t shader, uint32_t stage) {
+  if (range.buffer.handle == 0u || range.offset == UINT64_MAX) return;
+  const uint8_t* mapped = MappedRingData(range.buffer.handle);
+  if (mapped == nullptr) return;
+  const uint64_t begin = range.offset;
+  if (begin >= mapped_ring.size) return;
+  uint64_t bytes = range.size == UINT64_MAX ? 0u : range.size;
+  if (bytes == 0u || bytes > kSceneProbeMaxBytes) bytes = kSceneProbeMaxBytes;
+  if (begin + bytes > mapped_ring.size) bytes = mapped_ring.size - begin;
+  if (bytes < 16u * sizeof(float)) return;
+  const auto* floats = reinterpret_cast<const float*>(mapped + begin);
+  const uint32_t count = static_cast<uint32_t>(bytes / sizeof(float));
+
+  uint32_t block = UINT32_MAX;
+  uint32_t order = 0u;
+  float ndc_x = 0.f;
+  float ndc_y = 0.f;
+  if (scene_latch_cb == cb && scene_latch_offset + 16u * sizeof(float) <= bytes) {
+    // Latched: one block, sixteen floats, read instead of scanned.
+    const float* m = reinterpret_cast<const float*>(mapped + begin + scene_latch_offset);
+    float xx = 0.f, yy = 0.f, zz = 0.f, zw = 0.f;
+    if (MatchProjection(m, scene_latch_order != 0u, ndc_x, ndc_y, xx, yy, zz, zw)) {
+      block = static_cast<uint32_t>(scene_latch_offset / (4u * sizeof(float)));
+      order = scene_latch_order;
+    } else {
+      scene_latch_cb = UINT32_MAX;  // the layout moved: find it again
+    }
+  }
+  if (block == UINT32_MAX && scene_latch_cb == UINT32_MAX) {
+    // A scan only happens while nothing is latched, and it prefers the projection
+    // that carries an offset: an unjittered one proves nothing about the jitter, and
+    // a frame's constants hold several matrices.
+    float best = -1.0f;
+    for (uint32_t candidate = 0u; candidate + 16u <= count; ++candidate) {
+      const float* m = floats + static_cast<size_t>(candidate) * 4u;
+      for (uint32_t candidate_order = 0u; candidate_order < 2u; ++candidate_order) {
+        float nx = 0.f, ny = 0.f, xx = 0.f, yy = 0.f, zz = 0.f, zw = 0.f;
+        if (!MatchProjection(m, candidate_order != 0u, nx, ny, xx, yy, zz, zw)) continue;
+        const float magnitude = fabsf(nx) + fabsf(ny);
+        if (magnitude <= best) continue;
+        best = magnitude;
+        block = candidate;
+        order = candidate_order;
+        ndc_x = nx;
+        ndc_y = ny;
+      }
+    }
+    if (block != UINT32_MAX) {
+      scene_latch_cb = cb;
+      scene_latch_offset = block * 4u * sizeof(float);
+      scene_latch_order = order;
+    }
+  }
+  if (block == UINT32_MAX) {
+    // Pairs are recorded while no matrix is latched — that is the fallback — and
+    // beside the latched matrix itself, because a projection that never carries an
+    // offset is exactly the case that needs one.
+    if (scene_attempts_made > 1u) return;
+    if (scene_latch_cb != UINT32_MAX && scene_latch_cb != cb) return;
+    for (uint32_t i = 0u; i + 1u < count; ++i) {
+      const float a = floats[i];
+      const float b = floats[i + 1u];
+      if (!std::isfinite(a) || !std::isfinite(b)) continue;
+      if (fabsf(a) > 0.5f || fabsf(b) > 0.5f) continue;
+      if (fabsf(a) + fabsf(b) < 2e-4f) continue;
+      NoteScenePair(cb, static_cast<uint32_t>(i * sizeof(float)), a, b);
+    }
+    return;
+  }
+
+  // The matrix's own NDC offset, and the two entries it is stored in, so the report
+  // carries what the buffer says and not only what was derived from it.
+  const float* m = floats + static_cast<size_t>(block) * 4u;
+  const float raw_a = m[order != 0u ? 8u : 2u];
+  const float raw_b = m[order != 0u ? 9u : 6u];
+  const uint32_t width = last_render_width.load();
+  const uint32_t height = last_render_height.load();
+  const bool moved = scene_jitter.reads != 0u
+      && (fabsf(scene_jitter.previous_a - raw_a) > 1e-7f
+          || fabsf(scene_jitter.previous_b - raw_b) > 1e-7f);
+  scene_jitter.previous_a = raw_a;
+  scene_jitter.previous_b = raw_b;
+  scene_jitter.valid = true;
+  scene_jitter.from_projection = true;
+  scene_jitter.shader = shader;
+  scene_jitter.stage = stage;
+  scene_jitter.cb = cb;
+  scene_jitter.offset = block * 4u * sizeof(float);
+  scene_jitter.order = order;
+  scene_jitter.raw_a = raw_a;
+  scene_jitter.raw_b = raw_b;
+  scene_jitter.pixels_x = ndc_x * static_cast<float>(width) * 0.5f;
+  scene_jitter.pixels_y = -ndc_y * static_cast<float>(height) * 0.5f;
+  scene_jitter.updated_frame = frame_counter;
+  ++scene_jitter.reads;
+  if (moved) ++scene_jitter.moved;
+  scene_projected_this_frame = true;
+}
+
+// The entry point from the draw hooks: identifies the scene passes and reads their
+// constant buffers, at a handful of draws per frame.
+inline void ProbeSceneDraw(reshade::api::command_list* cmd_list) {
+  if (scene_probe_attempts_left == 0u || scene_projected_this_frame) return;
+  if (cmd_list == nullptr) return;
+  auto* data = Get(cmd_list);
+  if (data == nullptr) return;
+  if (!data->scene_hash_valid) {
+    auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+    if (shader_state == nullptr) return;
+    data->cached_scene_vs_hash = renodx::utils::shader::GetCurrentVertexShaderHash(shader_state);
+    data->cached_scene_ps_hash = renodx::utils::shader::GetCurrentPixelShaderHash(shader_state);
+    data->scene_hash_valid = true;
+  }
+  const uint32_t vertex_hash = data->cached_scene_vs_hash;
+  const uint32_t pixel_hash = data->cached_scene_ps_hash;
+  uint32_t shader = 0u;
+  uint32_t stage = 0u;
+  for (uint32_t i = 0u; i + 1u < kSceneShaderCount; i += 2u) {
+    const uint32_t first = kSceneShaders[i];
+    const uint32_t second = kSceneShaders[i + 1u];
+    if (vertex_hash != 0u && (vertex_hash == first || vertex_hash == second)) {
+      shader = vertex_hash;
+      stage = 0u;
+      break;
+    }
+    if (pixel_hash != 0u && (pixel_hash == first || pixel_hash == second)) {
+      shader = pixel_hash;
+      stage = 1u;
+      break;
+    }
+  }
+  if (shader == 0u) return;
+  --scene_probe_attempts_left;
+  ++scene_attempts_made;
+  reshade::api::pipeline_layout layout = {};
+  if (!CurrentPixelLayout(cmd_list, layout)) return;
+  auto* device = cmd_list->get_device();
+  if (device == nullptr) return;
+  // The camera's constants sit at b0 in every scene pass measured; the registers
+  // after it are per-material, and they are checked too so a pass that moves the
+  // camera's block is still read. One camera buffer per frame is enough.
+  for (uint32_t reg = 0u; reg < 4u && !scene_projected_this_frame; ++reg) {
+    uint32_t params[2] = {};
+    uint32_t bindings[2] = {};
+    const uint32_t n = FindTablesForRegister(
+        layout, reg, 0u, reshade::api::descriptor_type::constant_buffer, params, bindings, 2u);
+    for (uint32_t k = 0u; k < n; ++k) {
+      if (params[k] >= data->descriptor_tables.size()) continue;
+      const auto table = data->descriptor_tables[params[k]];
+      if (table.handle == 0u) continue;
+      DescriptorFingerprint key;
+      if (!ReadSlotFingerprint(device, table, bindings[k], key)) continue;
+      RecordedDescriptor record;
+      if (!LookupFingerprint(key, record)) continue;
+      if (!record.has_range || record.type != reshade::api::descriptor_type::constant_buffer) continue;
+      ProbeSceneConstantBuffer(record.range, reg, shader, stage);
+      if (scene_projected_this_frame) break;
+    }
+  }
+  // A matrix that never moves is not the jitter: after thirty readings with no
+  // change, the offset is being applied elsewhere and the sub-pixel pair that does
+  // move is the source. If the matrix starts moving, it takes the source back.
+  const bool want_pair = !scene_jitter.from_projection
+      || (scene_jitter.moved == 0u && scene_jitter.reads >= 30u);
+  if (!want_pair) return;
+  const ScenePair* best = nullptr;
+  for (const ScenePair& pair : scene_pairs) {
+    if (!pair.used || pair.moved == 0u) continue;
+    if (best == nullptr
+        || static_cast<uint64_t>(pair.moved) * best->reads
+            > static_cast<uint64_t>(best->moved) * pair.reads) {
+      best = &pair;
+    }
+  }
+  if (best == nullptr) return;
+  scene_jitter.valid = true;
+  scene_jitter.from_projection = false;
+  scene_jitter.shader = shader;
+  scene_jitter.stage = stage;
+  scene_jitter.cb = best->cb;
+  scene_jitter.offset = best->offset;
+  scene_jitter.order = 0u;
+  scene_jitter.raw_a = best->a;
+  scene_jitter.raw_b = best->b;
+  PairToPixels(best->a, best->b, last_render_width.load(), last_render_height.load(),
+               scene_jitter.pixels_x, scene_jitter.pixels_y);
+  scene_jitter.updated_frame = frame_counter;
+}
 
 // ── Resolvers ──
 struct SlotInput {
@@ -2940,12 +3277,17 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     return false;
   }
 
-  // Jitter: read from the engine's own projection, where a renderer has to apply
-  // it. Nothing is inferred from a value's size or movement, and zero is passed
-  // whenever no projection with a stable shape is in hand.
+  // Jitter: read from the scene's own view constants, at the draws that apply it.
+  // The ring-wide fallback only runs when that produced nothing and the value is
+  // actually being consumed: it is the expensive path, and it is a fallback.
   last_render_width.store(input_width);
   last_render_height.store(input_height);
-  RefreshProjectionJitter(b0_range, input_width, input_height);
+  // A reading counts only while the scene probe refreshed it this frame: a stale
+  // offset is a wrong offset, and zero is the safe value.
+  const bool scene_fresh = scene_jitter.valid && scene_jitter.updated_frame == frame_counter;
+  if (!scene_fresh && dlss_jitter_source > 0.5f && dlss_jitter_source < 1.5f) {
+    RefreshProjectionJitter(b0_range, input_width, input_height);
+  }
   float jitter_x = 0.f;
   float jitter_y = 0.f;
   // A sub-pixel offset that cycles through a handful of phases: if feeding this
@@ -2961,6 +3303,10 @@ inline bool EvaluateDLSS(reshade::api::command_list* cmd_list, const CommandList
     const uint32_t step = (pattern_index++ % 21u) + 1u;
     jitter_x = HaltonValue(step, 2u) - 0.5f;
     jitter_y = HaltonValue(step, 3u) - 0.5f;
+  } else if (dlss_jitter_source > 0.5f && scene_fresh) {
+    const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
+    jitter_x = scene_jitter.pixels_x * jitter_sign;
+    jitter_y = scene_jitter.pixels_y * jitter_sign;
   } else if (dlss_jitter_source > 0.5f && projection_jitter.valid) {
     const float jitter_sign = dlss_jitter_flip != 0.f ? -1.f : 1.f;
     jitter_x = projection_jitter.pixels_x * jitter_sign;
@@ -3257,6 +3603,11 @@ inline std::string BuildDebugReport() {
       snprintf(line, sizeof(line),
                "  jitter source    : synthetic test ramp (px=(%.2f, %.2f))\n",
                static_cast<double>(js.pixels_x), static_cast<double>(js.pixels_y));
+    } else if (scene_jitter.valid) {
+      snprintf(line, sizeof(line),
+               "  jitter source    : scene view constants (%s cb%u+0x%X)\n",
+               scene_jitter.from_projection ? "projection" : "pair",
+               scene_jitter.cb, scene_jitter.offset);
     } else if (!js.valid) {
       snprintf(line, sizeof(line),
                "  jitter source    : shared sub-pixel pair, none in hand (%llu adopted, %llu lost)\n",
@@ -3278,6 +3629,57 @@ inline std::string BuildDebugReport() {
              static_cast<double>(js.base_xx), static_cast<double>(js.base_yy),
              static_cast<double>(js.base_zz), static_cast<double>(js.base_zw));
     out += line;
+  }
+  // Where the scene's own view constants were read. This is the source the
+  // extraction uses, and the movement counters are the evidence that the value
+  // found moves — a jitter changes every frame and a constant never does.
+  {
+    char line[512];
+    if (!scene_jitter.valid) {
+      snprintf(line, sizeof(line),
+               "  scene jitter     : none read (probes left=%u, latch=%s)\n",
+               scene_probe_attempts_left,
+               scene_latch_cb == UINT32_MAX ? "none" : "held");
+    } else {
+      uint64_t moved = scene_jitter.moved;
+      uint64_t reads = scene_jitter.reads;
+      if (!scene_jitter.from_projection) {
+        for (const ScenePair& pair : scene_pairs) {
+          if (!pair.used || pair.cb != scene_jitter.cb || pair.offset != scene_jitter.offset) continue;
+          moved = pair.moved;
+          reads = pair.reads;
+          break;
+        }
+      }
+      snprintf(line, sizeof(line),
+               "  scene jitter     : hash=0x%08X %s cb%u+0x%X %s raw=(%.6f, %.6f) -> px=(%.4f, %.4f) moved=%llu/%llu%s\n",
+               scene_jitter.shader,
+               scene_jitter.stage == 0u ? "vs" : "ps",
+               scene_jitter.cb, scene_jitter.offset,
+               scene_jitter.from_projection
+                   ? (scene_jitter.order != 0u ? "proj(transposed)" : "proj")
+                   : "pair",
+               static_cast<double>(scene_jitter.raw_a), static_cast<double>(scene_jitter.raw_b),
+               static_cast<double>(scene_jitter.pixels_x), static_cast<double>(scene_jitter.pixels_y),
+               static_cast<unsigned long long>(moved),
+               static_cast<unsigned long long>(reads),
+               scene_jitter.updated_frame == frame_counter ? "" : "  STALE");
+    }
+    out += line;
+    std::string pairs;
+    for (const ScenePair& pair : scene_pairs) {
+      if (!pair.used || pair.reads == 0u) continue;
+      if (pairs.size() > 260u) break;  // the report is not a dump: six is plenty
+      char part[96];
+      snprintf(part, sizeof(part), "%scb%u+0x%X=(%.5f,%.5f) moved=%u/%u",
+               pairs.empty() ? "" : "  ", pair.cb, pair.offset,
+               static_cast<double>(pair.a), static_cast<double>(pair.b),
+               pair.moved, pair.reads);
+      pairs += part;
+    }
+    out += "  scene pairs      : ";
+    out += pairs.empty() ? "none" : pairs;
+    out += "\n";
   }
   // NGX's own words, oldest first. It is the component we cannot see into, and it
   // is the one that knows the runtime version and whether it disliked anything.
@@ -3339,7 +3741,10 @@ inline void OnDestroyCommandList(reshade::api::command_list* cmd_list) { cmd_lis
 inline void OnBindPipeline(
     reshade::api::command_list* cmd_list, reshade::api::pipeline_stage, reshade::api::pipeline) {
   if (cmd_list == nullptr) return;
-  if (auto* data = cmd_list->get_private_data<CommandListData>()) data->ps_dirty = true;
+  if (auto* data = cmd_list->get_private_data<CommandListData>()) {
+    data->ps_dirty = true;
+    data->scene_hash_valid = false;
+  }
 }
 
 inline void OnBindDescriptorTables(
@@ -3390,7 +3795,12 @@ inline bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uin
   NoteDrawForDepth(cmd_list);
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
-  if (!CheckTaaDraw(cmd_list, data, hash)) return false;
+  if (!CheckTaaDraw(cmd_list, data, hash)) {
+    // The scene's own view constants are read at its geometry draws, which is where
+    // the jitter is applied and therefore where it exists as data.
+    ProbeSceneDraw(cmd_list);
+    return false;
+  }
   ++stat_taa_draws;
   if (!logged_taa_draw_detected) {
     logged_taa_draw_detected = true;
@@ -3411,7 +3821,12 @@ inline bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32
   NoteDrawForDepth(cmd_list);
   CommandListData* data = nullptr;
   uint32_t hash = 0u;
-  if (!CheckTaaDraw(cmd_list, data, hash)) return false;
+  if (!CheckTaaDraw(cmd_list, data, hash)) {
+    // The scene's own view constants are read at its geometry draws, which is where
+    // the jitter is applied and therefore where it exists as data.
+    ProbeSceneDraw(cmd_list);
+    return false;
+  }
   ++stat_taa_draws;
   if (!logged_taa_draw_detected) {
     logged_taa_draw_detected = true;
@@ -3439,6 +3854,11 @@ inline void OnPresent(
   fsr1_seen_this_frame = false;
   fsr1_wrote_this_frame.store(false);
   projection_jitter.matched_this_frame = false;
+  // The scene probe budget belongs to the frame, like the write probes'.
+  scene_probe_attempts_left = kSceneProbeAttemptsPerFrame;
+  scene_attempts_made = 0u;
+  scene_projected_this_frame = false;
+  ++frame_counter;
   // The probe budget belongs to the frame, not to the evaluation: resetting it at the
   // TAA draw meant every batch was spent on constant buffers written after that draw,
   // and the camera's own buffer - written in the frame setup, before it - was never

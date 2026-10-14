@@ -54,7 +54,18 @@ static bool DlssStatusDraw() {
         dlss_depth_source >= 2.5f ? "placeholder"
             : (dlss_depth_source > 1.5f ? "t6" : (dlss_depth_source > 0.5f ? "t5" : "scene")));
   }
-  ImGui::TextUnformatted("Jitter: read from the engine's projection when stable");
+  if (scene_jitter.valid) {
+    ImGui::Text(
+        "Jitter: scene view constants (%s cb%u+0x%X) raw=(%.6f,%.6f) px=(%.4f,%.4f) moved=%llu/%llu",
+        scene_jitter.from_projection ? "projection" : "pair",
+        scene_jitter.cb, scene_jitter.offset,
+        static_cast<double>(scene_jitter.raw_a), static_cast<double>(scene_jitter.raw_b),
+        static_cast<double>(scene_jitter.pixels_x), static_cast<double>(scene_jitter.pixels_y),
+        static_cast<unsigned long long>(scene_jitter.moved),
+        static_cast<unsigned long long>(scene_jitter.reads));
+  } else {
+    ImGui::TextUnformatted("Jitter: no scene view constants read yet");
+  }
   ImGui::Text(
       "NGX log: %llu lines   hdr=%s   restore bindings=%s   depth transition=%s",
       static_cast<unsigned long long>(ngx_log.seen.load()),
@@ -139,7 +150,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Jitter Source",
         .section = "Antialiasing",
-        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Projection reads it from the engine's own projection matrix - read, never inferred from a number's size or movement, and zero whenever no projection with a stable shape is in hand. Synthetic test cycles eight fixed sub-pixel phases: if feeding that changes the image, DLSS is consuming the jitter; if it does nothing, the jitter is not reaching its reprojection.",
+        .tooltip = "What DLSS is told about the game's render jitter. Zero passes none. Extracted reads the scene geometry passes' own view constants - the draws that apply the jitter - preferring the projection that carries an offset and falling back to the sub-pixel pair that moves between frames; it is read, never inferred from a value's size. Cycled pattern feeds a synthetic never-repeating sequence for A/B testing.",
         .labels = {"Zero", "Extracted", "Cycled pattern (synthetic)"},
         .is_enabled = []() { return farcry6_dlss::dlss::dlss_enabled != 0.f; },
         .is_visible = []() { return farcry6_dlss::dlss::IsSupported(); },
