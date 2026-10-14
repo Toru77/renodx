@@ -24,8 +24,8 @@
 
 namespace falcom_world {
 
-inline constexpr uint64_t kTrackedCbMaxBytes = 256u;
-inline constexpr uint32_t kTrackedCbBytes = 160u;
+inline constexpr uint64_t kTrackedCbMaxBytes = 1536u;
+inline constexpr uint32_t kTrackedCbBytes = 768u;  // wind sway reads cb_scene up to byte 752 (windForce_g)
 
 struct TrackedCb {
   std::array<uint8_t, kTrackedCbBytes> bytes = {};

@@ -105,6 +105,11 @@ enum class InstanceSource : uint8_t {
 
 inline constexpr uint32_t kPoolInstanceSlot = contract::kInstanceSlot;
 inline constexpr uint32_t kPoolInstanceCbSlot = contract::kInstanceCbSlot;
+inline constexpr uint32_t kPoolSceneCbSlot = 0u;         // cb_scene (b0): wind values of the sway approximation
+inline constexpr uint32_t kPoolWindMaterialCbSlot = 5u;  // cb_local (b5): shake values of the sway approximation
+inline constexpr uint64_t kWindSceneBytes = 752u;        // cb_scene up to windForce_g (c46.w)
+inline constexpr uint64_t kWindMaterialBytes = 136u;     // cb_local up to shakeWindScale_g (c8.y)
+inline constexpr uint32_t kPoolParam2Offset = 148u;      // InstanceParam.param2 (InstanceParam @148)
 inline constexpr uint32_t kPoolInstanceStride = contract::kInstanceStride;
 inline constexpr uint32_t kPoolWorldFloats = contract::kWorldFloats;
 inline constexpr uint32_t kPoolPrevWorldOffset = contract::kPrevWorldOffset;
@@ -140,9 +145,15 @@ inline constexpr uint32_t kPoolMassRetireMeshes = 32u;  // one compaction retiri
 // decode to the same mesh; after this many captures without that it is
 // rejected as unstable (its buffers change between frames).
 inline constexpr uint32_t kPoolMeshMaxCaptures = 4u;
-inline constexpr size_t kPoolMismatchMaxMeshes = 64u;  // mesh mismatch histories kept (diagnostic)
-inline constexpr size_t kPoolDumpMaxInstances = 20000u;  // instances[] in world_pool.json
+inline constexpr size_t kPoolMismatchMaxMeshes = 256u;  // mesh mismatch histories kept (diagnostic)
 inline constexpr size_t kPoolDumpMaxAlphaKeys = 256u;   // alpha_keys[] in world_pool.json
+inline constexpr size_t kPoolDumpMaxAlphaRefusals = 32u;  // alpha_refusals_by_vs[] in world_pool.json
+inline constexpr size_t kPoolDumpMaxMeshDetail = 256u;  // mesh_failed[], failed_meshes_detail[], mesh_mismatches[], mismatch_meshes_detail[]
+inline constexpr size_t kPoolDumpMaxNoMeshKeys = 32u;  // alpha_no_mesh_keys[] in world_pool.json
+inline constexpr size_t kPoolDumpMaxStaleDynamic = 256u;  // stale_dynamic[] in world_pool.json
+inline constexpr uint32_t kPoolDumpStaleFrames = 30u;     // stale_dynamic: camera-visible, not followed for more frames than this
+inline constexpr size_t kPoolNoMeshKeysMax = 4096u;  // alpha keys with no mesh tracked by frame and count (diagnostic)
+inline constexpr size_t kPoolFirstRawCount = 16u;  // raw index values kept per read (first_raw)
 inline constexpr uint32_t kPoolMeshRetryRounds = 3u;      // unstable meshes captured again this many times
 inline constexpr uint32_t kPoolMeshRetryFrames = 180u;    // frames before each new round
 inline constexpr uint32_t kPoolLifecycleLogLines = 200u;  // orphan, moving and identity log lines per session (each its own)
@@ -190,6 +201,9 @@ inline constexpr float kPoolTraceSwayBasis = 0.1f;
 inline constexpr uint32_t kPoolTraceStillSightings = 4u;
 inline constexpr size_t kPoolTraceMaxRecords = 1500u;
 inline constexpr size_t kPoolMaxDynamicKeys = 4096u;
+inline constexpr size_t kPoolMaxDynamicDraws = 4096u;  // P2b: draws of flagged meshes recorded per present
+inline constexpr uint64_t kPoolDynamicArenaBytes = uint64_t{8} << 20;  // P2b: copied instance slices and args per present
+inline constexpr uint32_t kPoolDynamicInstances = 32768u;             // P2b: expanded instance records per present
 inline constexpr size_t kPoolMotionRuleSamples = 16u;
 inline constexpr float kPoolRegionMinSize = 64.f;
 inline constexpr float kPoolRegionMaxSize = 512.f;
@@ -490,6 +504,7 @@ struct WorldInstance {
   float inverse_world[16] = {};  // inverse of the affine matrix (ComputeMatrixInverse), at admission
   float bounds_min[3] = {};
   float bounds_max[3] = {};
+  float param2[3] = {};  // InstanceParam.param2 at admission (wind sway)
   // Provenance (diagnostic).
   uint32_t first_frame = 0u;  // first sighting of this (mesh, matrix)
   uint32_t admit_frame = 0u;
@@ -525,6 +540,7 @@ struct ObservedInstance {
   bool admitted = false;
   bool rejected = false;
   float matrix[kPoolWorldFloats] = {};
+  float param2[3] = {};
   // Per view (kept after admission): frames seen, and the latest inputs.
   uint32_t camera_frames = 0u;  // drawn by a camera VS
   uint32_t light_frames = 0u;   // drawn by a light VS (shadow maps)
@@ -658,7 +674,7 @@ struct PoolMeshFailure {
   uint64_t buffer_key = 0u;
   uint32_t raw_index_min = 0u;  // raw index values, before the base vertex
   uint32_t raw_index_max = 0u;
-  uint32_t first_raw[8] = {};
+  uint32_t first_raw[kPoolFirstRawCount] = {};
   uint64_t raw_hash = 0u;  // FNV of the first 4 KiB of the bytes read
 };
 
@@ -710,7 +726,7 @@ struct PoolMeshRequest {
   uint64_t vertices_raw_hash = 0u;
   uint32_t raw_index_min = 0u;  // raw index values, before the base vertex
   uint32_t raw_index_max = 0u;
-  uint32_t first_raw[8] = {};
+  uint32_t first_raw[kPoolFirstRawCount] = {};
   std::vector<PoolCaptureRecord> records;  // one per complete capture, at most kPoolMeshMaxCaptures
 };
 
@@ -868,6 +884,22 @@ struct PoolMotionDetail {
   std::vector<PoolMotionSample> rule_stale_samples;  // rule_stale cases
 };
 
+// P2b: one draw of a flagged (mesh.dynamic) mesh, recorded at draw time for the present. Fields only: the
+// world matrix is read by the GPU expansion from the copied instance slice.
+struct PoolDynamicDraw {
+  uint64_t mesh_key = 0u;
+  uint32_t vs_hash = 0u;
+  uint8_t pass = 0u;          // kPoolPassCamera / kPoolPassLight bits (gate.pass)
+  bool indirect = false;
+  int32_t base = 0;           // instance slice base (CPU b1 base)
+  uint32_t count = 0u;        // direct: instance count; indirect: window (the args hold the real count)
+  uint64_t args_offset = 0u;  // indirect: offset of the args in their buffer
+  uint64_t arena = 0u;        // P2b: byte offset of the copied slice in the arena
+  uint64_t args = 0u;         // P2b: byte offset of the copied args in the arena (indirect)
+  uint32_t out = 0u;          // P2b: first expanded record of this present
+  reshade::api::resource buffer = {0u};  // P2b: the arena (copy destination)
+};
+
 // A draw key seen moving in a camera view (path 2, P2a), with its evidence.
 struct PoolDynamicMesh {
   uint32_t vs_hash = 0u;
@@ -914,6 +946,22 @@ struct PoolFamilyStats {
   std::array<uint32_t, static_cast<size_t>(PoolMatrixReject::Count)> matrix_rejects = {};
   std::vector<PoolMatrixSample> reject_samples;
   std::vector<PoolMatrixSample> near_miss_samples;  // pairs: first sighting, then the near miss
+};
+
+struct PoolRefusalCounts {
+  uint64_t refused_off = 0u;  // alpha admissions refused: alpha_foliage off
+  uint64_t conflict = 0u;     // alpha admissions refused: mesh conflict
+  uint64_t no_uv = 0u;        // alpha admissions refused: mesh has no UVs
+  uint64_t admitted = 0u;     // alpha admissions taken
+  uint64_t no_mesh = 0u;      // alpha sightings whose draw key has no mesh yet
+};
+
+// An alpha draw key with no mesh: its sightings (alpha_no_mesh_keys in world_pool.json).
+struct PoolNoMeshKey {
+  uint32_t vs_hash = 0u;
+  uint32_t first_frame = 0u;
+  uint32_t last_frame = 0u;
+  uint64_t count = 0u;
 };
 
 struct PoolStats {
@@ -981,6 +1029,10 @@ struct PoolStats {
   uint64_t alpha_indirect_source_changed = 0u;  // resolves of a key already attached to another copy (the first is kept)
   uint64_t wind_refused_off = 0u;  // wind rest-pose admissions refused: alpha_wind_opaque (with alpha_foliage) off
   uint64_t wind_rest_draws = 0u;  // wind rest-pose draws gated in (alpha_wind_opaque with alpha_foliage on)
+  uint64_t wind_sway_unread = 0u;  // wind rest-pose draws whose cb_scene or cb_local mirror could not be read (no sway for the key)
+  uint32_t wind_sway_instances = 0u;  // instances swayed in the last TLAS pass (rebuild or refit)
+  float wind_sway_max_m = 0.f;        // largest sway displacement of the last TLAS pass (metres)
+  float wind_sway_bound_m = 0.f;      // largest amplitude bound applied to a leaf in the last TLAS pass (metres)
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -1007,6 +1059,7 @@ struct PoolStats {
   uint32_t mesh_failures = 0u;
   uint32_t mesh_dedup = 0u;
   uint32_t mesh_cap_drops = 0u;
+  uint32_t alpha_identity_meshes = 0u;  // meshes added with an alpha material in their signature
   // Game writes to VB/IB that captured or queued meshes come from (diagnostic:
   // a written buffer may no longer hold the captured geometry).
   uint64_t tracked_buffer_writes = 0u;
@@ -1014,6 +1067,10 @@ struct PoolStats {
   size_t meshes_written = 0u;  // refreshed by UpdatePoolStats
   // Compactions that retired at least kPoolMassRetireMeshes meshes (map changes).
   uint32_t mass_retirements = 0u;
+  uint32_t map_instances_retired = 0u;  // static instances dropped by a map change (not seen within kPoolRecaptureFrames)
+  // Follow lag of camera-seen moving instances (RefitLiveTlas): frames since each was followed, last refit and max.
+  uint32_t on_screen_lag_last = 0u;
+  uint32_t on_screen_lag_max = 0u;
   // Mesh capture verification.
   uint32_t mesh_verified = 0u;            // admitted after two identical captures
   uint32_t mesh_capture_mismatches = 0u;  // a capture that differed from the previous one
@@ -1040,6 +1097,15 @@ struct PoolStats {
   size_t region = 0u;
   size_t dynamic_live_keys = 0u;  // draw keys seen moving, still mapped
   size_t dynamic_meshes = 0u;     // meshes flagged dynamic now
+  size_t dynamic_draws = 0u;      // P2b: flagged draws recorded in the last present
+  uint64_t dynamic_copied = 0u;       // P2b: flagged draws copied at the draw (total)
+  uint64_t dynamic_refused = 0u;      // P2b: flagged draws not recorded: caps or no arena (total)
+  uint64_t dynamic_deferred = 0u;     // P2b: flagged draws on a deferred list, not copied (total)
+  uint64_t dynamic_arena_bytes = 0u;  // P2b: arena bytes reserved in the last present
+  uint32_t dynamic_records = 0u;      // P2b: expanded records of the last present (reserved; validity is not read back)
+  uint32_t dynamic_not_resident = 0u;  // P2b: draws of the last present whose mesh is not resident in the live store
+  float dynamic_expand_cpu_ms = 0.f;  // P2b: CPU time of the last expansion table
+  float dynamic_expand_gpu_ms = 0.f;  // P2b: GPU time of the last expansion (resolved a present late)
   size_t following = 0u;          // dynamic instances (following their object) now
   uint64_t scan_first_frame = 0u;
   uint64_t scan_last_frame = 0u;
@@ -1110,6 +1176,18 @@ struct PoolCpuTimer {
   }
 };
 
+// One pool instance whose bounds the inspect pixel's ray crosses (DescribeLiveCandidates), nearest first.
+struct PoolInspectCandidate {
+  uint64_t instance_id = 0u;
+  uint64_t mesh_key = 0u;
+  uint64_t mesh_uid = 0u;
+  uint32_t vs_hash = 0u;
+  const char* status = "";  // token: failed_mesh, conflicted, hidden, dynamic, in_tlas, not_uploaded, alpha_foliage_off, alpha_waiting, outside_region
+  std::string reason;       // the status as text (the inspect line)
+  int64_t tlas_index = -1;  // TLAS index when in the TLAS, else -1
+  float entry = 0.f;        // ray distance where it enters the bounds
+};
+
 // The last inspect result (middle-click in a trace view), written to world_pool.json.
 struct PoolInspectRecord {
   bool set = false;
@@ -1118,6 +1196,11 @@ struct PoolInspectRecord {
   uint64_t instance_id = 0u;  // PoolState instance id of the hit (0: none, or a moving instance)
   uint64_t mesh_uid = 0u;     // WorldMesh::uid of the hit (0: none, or a moving instance)
   std::vector<std::string> lines;
+  bool ray_valid = false;
+  std::array<float, 3> ray_origin = {};
+  std::array<float, 3> ray_direction = {};
+  uint64_t crossing_instances = 0u;
+  std::vector<PoolInspectCandidate> candidates;
 };
 
 struct PoolState {
@@ -1135,7 +1218,9 @@ struct PoolState {
   std::atomic_bool alpha_foliage{true};   // alpha-tested foliage (rigid, wind rest pose); session only, on by default
   std::atomic_bool alpha_indirect_source{true};  // indirect alpha draws get a source copy (alpha_foliage on only); on by default
   std::atomic_bool alpha_wind_opaque{true};      // wind with an opaque pixel shader admitted as rest pose (alpha_foliage on only)
+  std::atomic_bool alpha_wind_sway{true};        // wind rest poses swayed in the TLAS (approximate, alpha_wind_opaque on only); session only
   std::atomic_bool follow_moving{true};    // moving meshes keep their instances, which follow the pose
+  std::atomic_bool dynamic_per_frame{true};  // P2b: flagged meshes are expanded per frame (draw copies), kept out of the TLAS; session only
   PoolInspectRecord inspect;               // last inspect result (bvh_debug.hpp), written by DumpWorldPool
   std::atomic_bool poison_staging{false};  // diagnostic: mesh staging cpu-visible, poisoned after each read
   bool staging_poisoned = false;           // how the staging ring was created (EnsurePoolStaging)
@@ -1210,6 +1295,9 @@ struct PoolState {
 
   std::unordered_map<uint64_t, PoolSchedule> schedule;
   std::unordered_map<uint32_t, PoolFamilyStats> families;  // by VS hash, display only
+  std::unordered_map<uint32_t, PoolRefusalCounts> alpha_refusals_by_vs;  // by VS hash, display only
+  std::unordered_map<uint64_t, PoolNoMeshKey> no_mesh_keys;  // by draw key, capped at kPoolNoMeshKeysMax
+  uint64_t no_mesh_keys_dropped = 0u;                        // no-mesh sightings of keys past the cap
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;  // bumped when an admitted instance's camera visibility changes
   PoolStats stats;
@@ -1219,6 +1307,13 @@ struct PoolState {
   // when the switch changes).
   std::unordered_map<uint64_t, PoolDynamicMesh> dynamic_keys;
   bool dynamic_applied = false;
+  std::vector<PoolDynamicDraw> dynamic_draws;    // P2b: flagged draws of this present, recorded at draw time
+  std::vector<PoolDynamicDraw> dynamic_present;  // P2b: the last present's draws (moved by DrainPoolScan, expanded by ExpandLiveDynamic)
+  std::unordered_map<uint64_t, uint64_t> dynamic_indirect;  // P2b: indirect draw identity (PoolMeshKey at the draw) -> its mesh key (learned at resolve)
+  reshade::api::resource dynamic_arena = {0u};   // P2b: copy destination of the draws (created by ExpandLiveDynamic)
+  uint64_t dynamic_arena_used = 0u;              // bytes reserved in the arena this present
+  uint32_t dynamic_out_used = 0u;                // expanded records reserved this present
+  uint64_t dynamic_flag_revision = 0u;           // bumped when a mesh's dynamic flag changes (the TLAS leaves flagged meshes out, P2b)
   std::unordered_map<uint64_t, PoolAlphaState> alpha_keys;  // by draw key; flags its mesh alpha-tested
   bool alpha_off_applied = false;  // the switch-off removal ran (re-armed by switching on)
   bool alpha_indirect_off_applied = false;  // the indirect-source switch-off detach ran (re-armed by switching on)
@@ -1235,6 +1330,7 @@ struct PoolState {
   std::unordered_set<uint64_t> alpha_indirect_keys;  // keys of indirect alpha draws attached to their source (resolve)
   PoolAlphaDumpMaps alpha_maps;  // dump-only copies of the atlas maps (SyncLiveAlpha)
   std::unordered_set<uint64_t> wind_keys;  // draw keys admitted as wind rest poses (cleared when alpha_wind_opaque goes off)
+  std::unordered_map<uint64_t, WindSwayParams> wind_sway;  // wind draw key -> sway inputs of its latest draw (draw time)
   bool wind_off_applied = false;  // the wind switch-off removal ran (re-armed by switching on)
   std::unordered_set<uint64_t> alpha_format_logged;  // texture handles whose refused format was logged
   std::atomic_bool live_on{true};  // the live BVH is enabled (UpdateLiveBvh): no source copies while it is off
@@ -1427,6 +1523,15 @@ inline bool PoolCameraPosition(float* out) {
   out[1] = info.position[1];
   out[2] = info.position[2];
   return true;
+}
+
+// Camera position the trace rays start from: the pool camera, else the view matrix translation.
+inline void TraceCameraPosition(float* out) {
+  if (PoolCameraPosition(out)) return;
+  std::lock_guard<std::mutex> lock(g_state.mutex);
+  out[0] = g_state.camera.view_inv[3];
+  out[1] = g_state.camera.view_inv[7];
+  out[2] = g_state.camera.view_inv[11];
 }
 
 struct PoolRegion {
@@ -1810,14 +1915,17 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
     // the TLAS takes it once its material has an atlas slice (alpha_waiting, alpha_live.hpp).
     if (!g_pool.alpha_foliage.load(std::memory_order_relaxed)) {
       g_pool.stats.alpha_refused_off += 1u;
+      g_pool.alpha_refusals_by_vs[observed.vs_hash].refused_off += 1u;
       return false;
     }
     if (g_pool.meshes[mesh_id].alpha_state.conflict) {
       g_pool.stats.alpha_conflict_refused += 1u;
+      g_pool.alpha_refusals_by_vs[observed.vs_hash].conflict += 1u;
       return false;
     }
     if (g_pool.meshes[mesh_id].uvs.empty()) {
       g_pool.stats.alpha_no_uv += 1u;
+      g_pool.alpha_refusals_by_vs[observed.vs_hash].no_uv += 1u;
       return false;
     }
   }
@@ -1864,6 +1972,7 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
   instance.dynamic = follow;
   std::memcpy(instance.matrix, observed.matrix, sizeof(float) * kPoolWorldFloats);
   ComputeMatrixInverse(instance.matrix, instance.inverse_world);
+  std::memcpy(instance.param2, observed.param2, sizeof(instance.param2));
   instance.first_frame = observed.first_frame;
   instance.admit_frame = g_state.frame.load();
   instance.last_follow_frame = instance.admit_frame;
@@ -1873,6 +1982,7 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
   g_pool.instances.push_back(instance);
   g_pool.admitted_keys.insert(admitted_key);
   g_pool.families[observed.vs_hash].admitted += 1u;
+  if (g_pool.meshes[mesh_id].alpha) g_pool.alpha_refusals_by_vs[observed.vs_hash].admitted += 1u;
   g_pool.revision += 1u;
   return true;
 }
@@ -1974,7 +2084,8 @@ inline void NotePoolMeshPass(uint64_t mesh_key, const PoolSighting& sighting) {
 // Caller holds g_pool.mutex. `sighting` and `visibility` (both optional) are
 // what the draw tells about the pass and the instance's camera visibility.
 inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float* world, uint32_t frame,
-                                const PoolSighting* sighting = nullptr, const PoolVisibility* visibility = nullptr) {
+                                const PoolSighting* sighting = nullptr, const PoolVisibility* visibility = nullptr,
+                                const float* param2 = nullptr) {
   const InstanceKey key{mesh_key, MatrixHash(world, kPoolWorldFloats)};
   ObservedInstance& observed = g_pool.observations[key];
   if (observed.rejected) return;
@@ -2025,9 +2136,23 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
   }
   observed.vs_hash = vs_hash;
   std::memcpy(observed.matrix, world, sizeof(float) * kPoolWorldFloats);
+  if (param2 != nullptr) std::memcpy(observed.param2, param2, sizeof(observed.param2));
   if (observed.count < kPoolStableObservations) return;
   const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
-  if (mesh_it != g_pool.mesh_by_key.end()) AdmitPoolInstance(observed, mesh_key, mesh_it->second);
+  if (mesh_it != g_pool.mesh_by_key.end()) {
+    AdmitPoolInstance(observed, mesh_key, mesh_it->second);
+  } else if (g_pool.alpha_keys.count(mesh_key) != 0u) {
+    g_pool.alpha_refusals_by_vs[vs_hash].no_mesh += 1u;
+    if (g_pool.no_mesh_keys.size() < kPoolNoMeshKeysMax || g_pool.no_mesh_keys.count(mesh_key) != 0u) {
+      PoolNoMeshKey& seen = g_pool.no_mesh_keys[mesh_key];
+      if (seen.count == 0u) seen.first_frame = frame;
+      seen.vs_hash = vs_hash;
+      seen.last_frame = frame;
+      seen.count += 1u;
+    } else {
+      g_pool.no_mesh_keys_dropped += 1u;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2169,6 +2294,7 @@ inline void ClearPoolMeshAdmitted(uint32_t mesh_id) {
 inline uint32_t MarkPoolMeshDynamic(uint32_t mesh_id) {
   if (mesh_id >= g_pool.meshes.size() || g_pool.meshes[mesh_id].dynamic) return 0u;
   g_pool.meshes[mesh_id].dynamic = true;
+  g_pool.dynamic_flag_revision += 1u;
   g_pool.stats.dynamic_meshes_marked += 1u;
   const uint32_t removed = RemovePoolInstances([mesh_id](const WorldInstance& instance) { return instance.mesh_id == mesh_id; });
   ClearPoolMeshAdmitted(mesh_id);
@@ -2203,6 +2329,7 @@ inline void ApplyPoolDynamicSwitch() {
     for (auto& [key, entry] : g_pool.dynamic_keys) ApplyPoolDynamicKey(key, entry);
   } else {
     for (WorldMesh& mesh : g_pool.meshes) mesh.dynamic = false;
+    g_pool.dynamic_flag_revision += 1u;
   }
 }
 
@@ -2370,6 +2497,7 @@ inline void NotePoolCameraMotion(uint64_t mesh_key, uint32_t vs_hash, const floa
       }
       if (!shared) {
         g_pool.meshes[mesh_it->second].dynamic = false;
+        g_pool.dynamic_flag_revision += 1u;
         g_pool.stats.dynamic_released += 1u;
       }
     }
@@ -2797,6 +2925,46 @@ inline void CountPoolSkip(PoolFamilyStats& family, PoolSkip skip, PoolDrawState 
     g_pool.stats.draw_state[static_cast<size_t>(state)] += 1u;
     family.draw_state[static_cast<size_t>(state)] += 1u;
   }
+}
+
+// Caller holds g_pool.mutex. P2b: reserves this present's record of a draw of a flagged mesh and its arena space.
+// The caller copies the slice (and args) after the lock, on the immediate list: a deferred list is not copied.
+// False when not recorded.
+inline bool RecordPoolDynamicDraw(uint64_t mesh_key, const DrawRecord& draw, uint8_t pass, bool indirect, bool deferred,
+                                  int32_t base, uint32_t count, uint64_t args_offset, PoolDynamicDraw* out) {
+  const auto mesh = g_pool.mesh_by_key.find(mesh_key);
+  if (mesh == g_pool.mesh_by_key.end() || !g_pool.meshes[mesh->second].dynamic) return false;
+  if (!g_pool.live_on.load(std::memory_order_relaxed) || !g_pool.dynamic_per_frame.load(std::memory_order_relaxed)) return false;
+  if (deferred) {
+    g_pool.stats.dynamic_deferred += 1u;
+    return false;
+  }
+  const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
+  const uint64_t args_bytes = indirect ? kPoolIndirectArgsBytes : 0u;
+  if (g_pool.dynamic_arena.handle == 0u || g_pool.dynamic_draws.size() >= kPoolMaxDynamicDraws
+      || g_pool.dynamic_arena_used + slice_bytes + args_bytes > kPoolDynamicArenaBytes
+      || g_pool.dynamic_out_used + count > kPoolDynamicInstances) {
+    g_pool.stats.dynamic_refused += 1u;
+    return false;
+  }
+  PoolDynamicDraw record;
+  record.mesh_key = mesh_key;
+  record.vs_hash = draw.vs_hash;
+  record.pass = pass;
+  record.indirect = indirect;
+  record.base = base;
+  record.count = count;
+  record.args_offset = args_offset;
+  record.arena = g_pool.dynamic_arena_used;
+  record.args = g_pool.dynamic_arena_used + slice_bytes;
+  record.out = g_pool.dynamic_out_used;
+  record.buffer = g_pool.dynamic_arena;
+  g_pool.dynamic_arena_used += slice_bytes + args_bytes;
+  g_pool.dynamic_out_used += count;
+  g_pool.dynamic_draws.push_back(record);
+  g_pool.stats.dynamic_copied += 1u;
+  *out = record;
+  return true;
 }
 
 // Caller holds g_pool.mutex. Normal copies apply the per-identity cooldown; all
@@ -3565,6 +3733,24 @@ inline void OnPoolScanDraw(
     }
   }
 
+  // Wind sway inputs as this draw reads them (CPU mirrors, no GPU work).
+  std::array<uint8_t, kWindSceneBytes> scene = {};
+  std::array<uint8_t, kWindMaterialBytes> material = {};
+  WindSwayParams wind;
+  const bool wind_read = gate.wind_rest && skip == PoolSkip::None
+                         && ReadTrackedCbBytes(cmd_list, cl_data->vs_cb[kPoolSceneCbSlot], scene.data(), kWindSceneBytes)
+                         && ReadTrackedCbBytes(cmd_list, cl_data->vs_cb[kPoolWindMaterialCbSlot], material.data(), kWindMaterialBytes);
+  if (wind_read) {
+    std::memcpy(&wind.game_time, scene.data() + 428, sizeof(float));
+    std::memcpy(wind.wind_dir, scene.data() + 448, sizeof(wind.wind_dir));
+    std::memcpy(&wind.wave_time, scene.data() + 504, sizeof(float));
+    std::memcpy(&wind.wave_frequency, scene.data() + 508, sizeof(float));
+    std::memcpy(&wind.wind_force, scene.data() + 748, sizeof(float));
+    std::memcpy(&wind.shake_scale, material.data() + 116, sizeof(float));
+    std::memcpy(&wind.shake_speed, material.data() + 120, sizeof(float));
+    std::memcpy(&wind.shake_freq, material.data() + 128, sizeof(float));
+    std::memcpy(&wind.shake_wind_scale, material.data() + 132, sizeof(float));
+  }
   const uint32_t frame = g_state.frame.load();
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
@@ -3575,9 +3761,13 @@ inline void OnPoolScanDraw(
   uint32_t mesh_count = 0u;
   bool trace_declined = false;
   bool queued = false;  // this draw is queued for a copy (ReservePoolCopy None, QueuePoolMesh ran)
+  PoolDynamicDraw dynamic_copy;  // P2b: the slice copy of this draw, reserved under the lock
+  bool dynamic_ok = false;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
+    if (wind_read) g_pool.wind_sway[mesh_key] = wind;
+    if (gate.wind_rest && skip == PoolSkip::None && !wind_read) g_pool.stats.wind_sway_unread += 1u;
     g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
     if (deferred) g_pool.stats.draws_on_deferred += 1u;
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
@@ -3590,6 +3780,7 @@ inline void OnPoolScanDraw(
       const bool follow = (gate.pass & kPoolPassCamera) != 0u && known_schedule != g_pool.schedule.end()
                           && known_schedule->second.follow;
       const uint64_t copy_bytes = kPoolCbCopyBytes + static_cast<uint64_t>(count) * kPoolInstanceStride;
+      dynamic_ok = RecordPoolDynamicDraw(mesh_key, draw, gate.pass, false, deferred, slice.base, count, 0u, &dynamic_copy);
       bool traced = false;  // a key in trace state: its copy may bypass the cooldown
       if ((gate.pass & kPoolPassCamera) != 0u) {
         for (const auto& key : g_pool.prev_trace.keys) {
@@ -3647,6 +3838,10 @@ inline void OnPoolScanDraw(
     mesh_count = ReservePoolMeshCopies(device, draw, uv, false, deferred, frame, commands.data() + command_count,
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
+  }
+  if (dynamic_ok) {
+    cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dynamic_copy.base) * kPoolInstanceStride,
+                                 dynamic_copy.buffer, dynamic_copy.arena, static_cast<uint64_t>(dynamic_copy.count) * kPoolInstanceStride);
   }
   if (queued && gate.alpha_material && alpha_material.view != 0u) {
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
@@ -3716,6 +3911,8 @@ inline void OnPoolScanIndirectDraw(
   std::array<PoolMeshCopy, kPoolMeshCopiesPerDraw> mesh_copies;
   std::array<std::pair<uint32_t, uint32_t>, kPoolMaxIndirectSubDraws> alpha_refs;  // (slot, indirect_alpha entry) per reserved alpha copy
   uint32_t alpha_ref_count = 0u;
+  std::array<PoolDynamicDraw, kPoolMaxIndirectSubDraws> dynamic_copies;  // P2b: slice copies of the sub-draws, reserved under the lock
+  uint32_t dynamic_count = 0u;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
   {
@@ -3723,6 +3920,9 @@ inline void OnPoolScanIndirectDraw(
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
     family.vs_class = static_cast<uint8_t>(gate.vs_class);
     if (gate.skip == PoolSkip::PixelUnknown) NotePoolPixelUnknown(draw, gate.unknown_reason);
+    // The args decide the mesh key only at resolve: a draw identity learned there leads to its mesh (P2b).
+    const auto learned = g_pool.dynamic_indirect.find(PoolMeshKey(draw));
+    const uint64_t dynamic_key = learned != g_pool.dynamic_indirect.end() ? learned->second : 0u;
     for (uint32_t i = 0; i < sub_draws; ++i) {
       g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
       g_pool.stats.indirect_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
@@ -3748,6 +3948,11 @@ inline void OnPoolScanIndirectDraw(
       if (learned) window = (std::min)(known->second.indirect_window, max_window);
       const uint64_t bytes =
           kPoolCbCopyBytes + kPoolIndirectArgsBytes + static_cast<uint64_t>(window) * kPoolInstanceStride;
+      if (sub_skip == PoolSkip::None
+          && RecordPoolDynamicDraw(dynamic_key, draw, gate.pass, true, deferred, slice.base, window, sub_args_offset,
+                                   &dynamic_copies[dynamic_count])) {
+        dynamic_count += 1u;
+      }
       PoolSchedule* schedule = nullptr;
       if (sub_skip == PoolSkip::None) {
         sub_skip = ReservePoolCopy(device, schedule_key, frame, bytes, &schedule,
@@ -3801,6 +4006,12 @@ inline void OnPoolScanIndirectDraw(
                                        mesh_copies.data(), kPoolMeshCopiesPerDraw);
     command_count += mesh_count;
   }
+  for (uint32_t i = 0u; i < dynamic_count; ++i) {
+    const PoolDynamicDraw& dyn = dynamic_copies[i];
+    cmd_list->copy_buffer_region(slice.instance_buffer, static_cast<uint64_t>(dyn.base) * kPoolInstanceStride, dyn.buffer,
+                                 dyn.arena, static_cast<uint64_t>(dyn.count) * kPoolInstanceStride);
+    cmd_list->copy_buffer_region(args_buffer, dyn.args_offset, dyn.buffer, dyn.args, kPoolIndirectArgsCopyBytes);
+  }
   if (alpha_ref_count != 0u && (AlphaMode() & 2u) != 0u && alpha_material.view != 0u) {
     // The same view guard as the direct path: the bound view must be the t0 resource.
     const reshade::api::resource source = device->get_resource_from_view({alpha_material.view});
@@ -3840,6 +4051,7 @@ inline void InvalidatePoolMeshKey(uint64_t mesh_key) {
   g_pool.alpha_source_done.erase(mesh_key);
   g_pool.alpha_indirect_keys.erase(mesh_key);
   g_pool.wind_keys.erase(mesh_key);
+  g_pool.wind_sway.erase(mesh_key);
   const auto key_source = g_pool.alpha_key_source.find(mesh_key);
   if (key_source != g_pool.alpha_key_source.end()) {
     const auto source = g_pool.alpha_sources.find(key_source->second);
@@ -3978,9 +4190,11 @@ inline void CompactPool() {
     meshes.push_back(std::move(mesh));
   }
   g_pool.meshes = std::move(meshes);
-  if (retired_now >= kPoolMassRetireMeshes) {
+  const bool map_change = retired_now >= kPoolMassRetireMeshes;
+  const uint32_t frame = g_state.frame.load();
+  if (map_change) {
     g_pool.stats.mass_retirements += 1u;
-    g_pool.stats.last_mass_retire_frame = g_state.frame.load();
+    g_pool.stats.last_mass_retire_frame = frame;
     g_pool.stats.last_mass_retire_meshes = retired_now;
   }
 
@@ -3991,6 +4205,10 @@ inline void CompactPool() {
     const uint32_t mesh_id = instance.mesh_id < remap.size() ? remap[instance.mesh_id] : UINT32_MAX;
     if (mesh_id == UINT32_MAX || invalidated.count(instance.mesh_key) != 0u) {
       g_pool.stats.instances_retired += 1u;
+      continue;
+    }
+    if (map_change && !instance.dynamic && PoolInstanceLastSeen(instance) + kPoolRecaptureFrames < frame) {
+      g_pool.stats.map_instances_retired += 1u;
       continue;
     }
     instance.mesh_id = mesh_id;
@@ -4036,7 +4254,10 @@ inline void CompactPool() {
       if (entry.moving_now && mesh_it != g_pool.mesh_by_key.end() && mesh_it->second < held.size()) held[mesh_it->second] = true;
     }
     for (WorldMesh& mesh : g_pool.meshes) {
-      if (mesh.dynamic && !held[mesh.mesh_id]) mesh.dynamic = false;
+      if (mesh.dynamic && !held[mesh.mesh_id]) {
+        mesh.dynamic = false;
+        g_pool.dynamic_flag_revision += 1u;
+      }
     }
   }
   g_pool.invalidated_keys.clear();
@@ -4080,13 +4301,27 @@ inline const char* ApplyPoolMesh(
 
   const char* outcome = "added";
   uint32_t mesh_id = 0u;
-  const uint64_t signature = PoolMeshSignature(mesh);
+  const uint64_t geometry_signature = PoolMeshSignature(mesh);
+  uint64_t signature = geometry_signature;
+  const auto alpha_key = g_pool.alpha_keys.find(mesh_key);
+  const bool alpha_identity = alpha_key != g_pool.alpha_keys.end() && alpha_key->second.material.view != 0u;
+  if (alpha_identity) {  // keys with different alpha materials are different meshes
+    const PoolAlphaMaterial& material = alpha_key->second.material;
+    signature = PoolMix(signature, material.view);
+    for (const float value : {material.threshold, material.scroll[0], material.scroll[1]}) {
+      uint32_t bits = 0u;
+      std::memcpy(&bits, &value, sizeof(bits));
+      signature = PoolMix(signature, bits);
+    }
+    signature = PoolMix(signature, material.swizzle);
+  }
   const auto signature_it = g_pool.mesh_by_signature.find(signature);
   if (signature_it != g_pool.mesh_by_signature.end()) {
     mesh_id = signature_it->second;
     g_pool.stats.mesh_dedup += 1u;
     outcome = "merged (same content)";
   } else {
+    if (alpha_identity) g_pool.stats.alpha_identity_meshes += 1u;
     if (g_pool.meshes.size() >= kPoolMaxMeshes) {
       g_pool.stats.mesh_cap_drops += 1u;
       g_pool.failed_meshes[mesh_key] = PoolMeshFailure{.reason = "dropped (mesh cap)", .vs_hash = vs_hash,
@@ -4134,7 +4369,6 @@ inline const char* ApplyPoolMesh(
   g_pool.mesh_by_key[mesh_key] = mesh_id;
   const auto dynamic = g_pool.dynamic_keys.find(mesh_key);
   if (dynamic != g_pool.dynamic_keys.end()) ApplyPoolDynamicKey(mesh_key, dynamic->second);  // seen moving before its capture
-  const auto alpha_key = g_pool.alpha_keys.find(mesh_key);
   if (alpha_key != g_pool.alpha_keys.end()) MarkPoolMeshAlpha(mesh_id, alpha_key->second);  // alpha before its capture
   AdmitPendingInstancesForMesh(mesh_key, mesh_id);
   return outcome;
@@ -4174,7 +4408,7 @@ inline const char* DecodePoolMeshIndices(
       std::memcpy(&raw, bytes + static_cast<size_t>(i) * 4u, sizeof(raw));
     }
     const int64_t absolute = static_cast<int64_t>(raw) + vertex_offset;
-    if (i < 8u) first_raw[i] = raw;
+    if (i < kPoolFirstRawCount) first_raw[i] = raw;
     raw_lowest = (std::min)(raw_lowest, raw);
     raw_highest = (std::max)(raw_highest, raw);
     if (absolute < 0 || absolute > static_cast<int64_t>(UINT32_MAX - 1u)) return "index outside the vertex buffer";
@@ -4506,7 +4740,7 @@ struct PoolMeshJob {
   uint32_t max_vertex = 0u;
   uint32_t raw_index_min = 0u;  // raw index values, before the base vertex (index read)
   uint32_t raw_index_max = 0u;
-  uint32_t first_raw[8] = {};
+  uint32_t first_raw[kPoolFirstRawCount] = {};
   uint64_t raw_hash = 0u;  // FNV of the first 4 KiB of the bytes read
   PoolStagingDiag staging;
   const char* error = nullptr;
@@ -4639,6 +4873,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   stage.Set("present: resolve (map)");
   std::vector<PoolResolvedCopy> resolved(copies.size());
   std::vector<float> worlds;       // kPoolWorldFloats per instance of verified copies
+  std::vector<std::array<float, 3>> param2s;  // InstanceParam.param2 per element of worlds
   std::vector<float> prev_worlds;  // their prevWorld, like worlds (motion probe)
   std::vector<uint8_t> moving;
   std::vector<PoolVisibility> visibility;  // per instance, like worlds
@@ -4668,6 +4903,8 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         std::memcpy(worlds.data() + offset, instance, sizeof(float) * kPoolWorldFloats);
         prev_worlds.resize(offset + kPoolWorldFloats);
         std::memcpy(prev_worlds.data() + offset, instance + kPoolPrevWorldOffset, sizeof(float) * kPoolWorldFloats);
+        param2s.emplace_back();
+        std::memcpy(param2s.back().data(), instance + kPoolParam2Offset, sizeof(float) * 3u);
         moving.push_back(std::memcmp(instance, instance + kPoolPrevWorldOffset, sizeof(float) * kPoolWorldFloats) != 0
                              ? 1u
                              : 0u);
@@ -4950,6 +5187,9 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         record.vertex_offset = static_cast<int32_t>(result.args[3]);
         record.first_instance = result.args[4];
         mesh_key = PoolMeshKey(record);
+        if (g_pool.dynamic_indirect.size() < kPoolMaxDynamicKeys) {
+          g_pool.dynamic_indirect[PoolMeshKey(indirect_draws[copy.indirect_index])] = mesh_key;
+        }
         const PoolIndirectAlpha* alpha_side = copy.alpha_index != UINT32_MAX ? &indirect_alpha[copy.alpha_index] : nullptr;
         if ((copy.pass & kPoolPassAlpha) != 0u) {
           NotePoolAlphaMaterial(mesh_key, copy.alpha, alpha_side != nullptr && alpha_side->vbs_known ? &alpha_side->vbs : nullptr);
@@ -5008,7 +5248,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         if ((copy.pass & kPoolPassCamera) != 0u) {
           FollowPoolMovingInstance(mesh_key, copy.vs_hash, world, prev_world, copy.follow, copy.frame, verdict);
         }
-        ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame, &sighting, &visibility[index]);
+        ObservePoolInstance(mesh_key, copy.vs_hash, world, copy.frame, &sighting, &visibility[index], param2s[index].data());
       }
       const auto schedule = g_pool.schedule.find(copy.schedule_key);
       if (schedule != g_pool.schedule.end()) {
@@ -5132,6 +5372,12 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     failure_lines.insert(failure_lines.end(), g_pool.pending_lines.begin(), g_pool.pending_lines.end());
     g_pool.pending_lines.clear();
     UpdatePoolStats(newest);
+    g_pool.stats.dynamic_draws = g_pool.dynamic_draws.size();
+    g_pool.stats.dynamic_arena_bytes = g_pool.dynamic_arena_used;
+    g_pool.dynamic_present = std::move(g_pool.dynamic_draws);
+    g_pool.dynamic_draws.clear();
+    g_pool.dynamic_arena_used = 0u;
+    g_pool.dynamic_out_used = 0u;
     const uint32_t invalidations = g_pool.stats.resource_invalidations;
     released = invalidations >= g_pool.logged_invalidations ? invalidations - g_pool.logged_invalidations : invalidations;
     g_pool.logged_invalidations = invalidations;
@@ -5266,6 +5512,7 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
 inline void ResetWorldPool() {
   std::lock_guard<std::mutex> lock(g_pool.mutex);
   g_pool.wind_keys.clear();
+  g_pool.wind_sway.clear();
   g_pool.alpha_maps = PoolAlphaDumpMaps{};
   for (auto& slot : g_pool.slots) {
     // Copies already recorded into a slot still land there; only forget them.
@@ -5299,6 +5546,9 @@ inline void ResetWorldPool() {
   g_pool.near_index.clear();
   g_pool.schedule.clear();
   g_pool.families.clear();
+  g_pool.alpha_refusals_by_vs.clear();
+  g_pool.no_mesh_keys.clear();
+  g_pool.no_mesh_keys_dropped = 0u;
   g_pool.revision += 1u;
   g_pool.stats = {};
   g_pool.motion_detail = {};
@@ -5436,16 +5686,22 @@ struct PoolDynamicDumpEntry {
   uint32_t triangles = 0u;
   float bbox_min[3] = {};
   float bbox_max[3] = {};
+  uint32_t camera_visible_instances = 0u;  // dynamic instances of its mesh key that a camera VS drew
 };
 
 // Caller holds g_pool.mutex.
 inline std::vector<PoolDynamicDumpEntry> SnapshotPoolDynamic() {
   std::vector<PoolDynamicDumpEntry> entries;
   entries.reserve(g_pool.dynamic_keys.size());
+  std::unordered_map<uint64_t, uint32_t> camera_visible;
+  for (const WorldInstance& instance : g_pool.instances) {
+    if (instance.dynamic && GetPoolCameraVisibility(instance).camera_seen) camera_visible[instance.mesh_key] += 1u;
+  }
   for (const auto& [key, entry] : g_pool.dynamic_keys) {
     PoolDynamicDumpEntry& out = entries.emplace_back();
     out.mesh_key = key;
     out.entry = entry;
+    out.camera_visible_instances = camera_visible[key];
     const auto mesh_it = g_pool.mesh_by_key.find(key);
     if (mesh_it != g_pool.mesh_by_key.end() && mesh_it->second < g_pool.meshes.size()) {
       const WorldMesh& mesh = g_pool.meshes[mesh_it->second];
@@ -5465,13 +5721,27 @@ inline std::vector<PoolDynamicDumpEntry> SnapshotPoolDynamic() {
   return entries;
 }
 
+// P2b: the per-frame path of moving meshes. The record counts are reserved slots (validity is not read back).
+inline void WritePoolP2b(std::ostringstream& out, const PoolStats& stats) {
+  out << "  \"p2b\": {\"per_frame\": " << (g_pool.dynamic_per_frame.load() ? "true" : "false")
+      << ", \"draws_last_present\": " << stats.dynamic_draws << ", \"copied_total\": " << stats.dynamic_copied
+      << ", \"refused_total\": " << stats.dynamic_refused << ", \"deferred_total\": " << stats.dynamic_deferred
+      << ", \"records_last_present\": " << stats.dynamic_records
+      << ", \"not_resident_last_present\": " << stats.dynamic_not_resident
+      << ", \"arena_bytes_last_present\": " << stats.dynamic_arena_bytes
+      << ", \"arena_capacity_bytes\": " << kPoolDynamicArenaBytes << ", \"records_capacity\": " << kPoolDynamicInstances
+      << ", \"expand_cpu_ms\": " << PoolJsonFloat{stats.dynamic_expand_cpu_ms}
+      << ", \"expand_gpu_ms\": " << PoolJsonFloat{stats.dynamic_expand_gpu_ms} << "},\n";
+}
+
 inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDynamicDumpEntry>& entries,
                              const PoolStats& stats) {
   out << "  \"dynamic\": {\"keys\": " << entries.size() << ", \"keys_seen\": " << stats.dynamic_keys
       << ", \"moving_keys\": " << stats.dynamic_moving_keys << ", \"released\": " << stats.dynamic_released
       << ", \"meshes_flagged\": " << stats.dynamic_meshes << ", \"marked\": " << stats.dynamic_meshes_marked
       << ", \"retired\": " << stats.dynamic_retired << ", \"blocked\": " << stats.dynamic_blocked
-      << ", \"cap_drops\": " << stats.dynamic_cap_drops << ", \"entries\": [";
+      << ", \"cap_drops\": " << stats.dynamic_cap_drops << ", \"on_screen_lag_last\": " << stats.on_screen_lag_last << ", \"on_screen_lag_max\": " << stats.on_screen_lag_max
+      << ", \"entries\": [";
   for (size_t i = 0; i < entries.size(); ++i) {
     const PoolDynamicDumpEntry& item = entries[i];
     const PoolDynamicMesh& entry = item.entry;
@@ -5482,7 +5752,8 @@ inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDyna
         << ", \"max_meters\": " << PoolJsonFloat{entry.max_meters} << ", \"max_basis\": " << PoolJsonFloat{entry.max_basis}
         << ", \"retired_instances\": " << entry.retired_instances << ", \"retired_orphans\": " << entry.retired_orphans
         << ", \"blocked\": " << entry.blocked << ", \"follows\": " << entry.follows
-        << ", \"moving_now\": " << (entry.moving_now ? "true" : "false") << ", \"released\": " << entry.released;
+        << ", \"moving_now\": " << (entry.moving_now ? "true" : "false") << ", \"released\": " << entry.released
+        << ", \"camera_visible_instances\": " << item.camera_visible_instances;
     if (item.has_mesh) {
       out << ", \"mesh_id\": " << item.mesh_id << ", \"mesh_uid\": " << item.mesh_uid
           << ", \"mesh_flagged\": " << (item.mesh_dynamic ? "true" : "false") << ", \"triangles\": " << item.triangles
@@ -5721,6 +5992,14 @@ struct PoolAlphaKeyDump {
   PoolAlphaState state;
 };
 
+// An alpha draw key with no mesh and its state (alpha_no_mesh_keys in world_pool.json).
+struct PoolNoMeshDump {
+  uint64_t key = 0u;
+  PoolNoMeshKey seen;
+  const char* state = "none";
+  const char* reason = "";
+};
+
 inline const char* PoolUvVerdictName(PoolUvVerdict verdict) {
   switch (verdict) {
     case PoolUvVerdict::NotEvaluated:              return "not_evaluated";
@@ -5781,11 +6060,90 @@ inline void WritePoolAlphaEvidence(std::ostream& out, const PoolAlphaMaterialSta
   WritePoolAlphaMaterial(out, state.conflict_incoming);
 }
 
-inline void DumpWorldPool() {
+// world_pool.json: one failed mesh (mesh_failed and failed_meshes_detail): its draw, reads and capture history.
+inline void WritePoolFailedMesh(std::ostream& out, uint64_t key, const PoolMeshFailure& failure,
+                                const std::unordered_map<uint32_t, PoolFamilyStats>& families) {
+  const auto family = families.find(failure.vs_hash);
+  out << "\n    {\"key\": \"" << renodx::utils::log::AsHex(key) << "\", \"reason\": \"" << failure.reason << "\""
+      << ", \"vs_hash\": \"" << PoolHashText(failure.vs_hash) << "\""
+      << ", \"class\": \""
+      << contract::VsClassName(family != families.end() ? static_cast<contract::VsClass>(family->second.vs_class) : contract::VsClass::Unclassified)
+      << "\""
+      << ", \"frame\": " << failure.frame
+      << ", \"captures\": " << failure.captures
+      << ", \"index_count\": " << failure.index_count
+      << ", \"first_index\": " << failure.first_index
+      << ", \"base_vertex\": " << failure.base_vertex
+      << ", \"vertex_stride\": " << failure.vertex_stride
+      << ", \"min_vertex\": " << failure.min_vertex
+      << ", \"max_vertex\": " << failure.max_vertex
+      << ", \"vb_size\": " << failure.vb_size
+      << ", \"ib_size\": " << failure.ib_size
+      << ", \"from_indirect\": " << (failure.from_indirect ? "true" : "false")
+      << ", \"pos_offset\": " << failure.pos_offset
+      << ", \"vb_usage\": " << failure.vb_usage << ", \"vb_flags\": " << failure.vb_flags
+      << ", \"ib_usage\": " << failure.ib_usage << ", \"ib_flags\": " << failure.ib_flags
+      << ", \"written\": " << (failure.written ? "true" : "false")
+      << ", \"phase\": \"" << PoolMeshPhaseName(failure.phase) << "\""
+      << ", \"index_size\": " << failure.index_size
+      << ", \"instance_count\": " << failure.instance_count
+      << ", \"vb_handle\": \"" << renodx::utils::log::AsHex(failure.vb_handle) << "\""
+      << ", \"ib_handle\": \"" << renodx::utils::log::AsHex(failure.ib_handle) << "\""
+      << ", \"vb_offset\": " << failure.vb_offset << ", \"ib_offset\": " << failure.ib_offset
+      << ", \"buffer_key\": \"" << renodx::utils::log::AsHex(failure.buffer_key) << "\""
+      << ", \"raw_index_min\": " << failure.raw_index_min << ", \"raw_index_max\": " << failure.raw_index_max
+      << ", \"first_raw\": [";
+  for (size_t k = 0; k < kPoolFirstRawCount; ++k) out << (k != 0u ? ", " : "") << failure.first_raw[k];
+  out << "], \"raw_hash\": \"" << renodx::utils::log::AsHex(failure.raw_hash) << "\""
+      << ", \"history\": ";
+  WritePoolCaptureRecords(out, failure.history);
+  if (failure.staging.poisoned) {
+    out << ", \"staging\": ";
+    WritePoolStagingDiag(out, failure.staging);
+  }
+  out << "}";
+}
+
+// world_pool.json: one mesh whose captures disagreed (mesh_mismatches and mismatch_meshes_detail): its draw and history.
+inline void WritePoolMismatchMesh(std::ostream& out, uint64_t key, const PoolMeshMismatch& mismatch,
+                                  const std::unordered_map<uint64_t, PoolMeshFailure>& failed_meshes,
+                                  const std::vector<WorldMesh>& meshes) {
+  const auto failed = failed_meshes.find(key);
+  bool admitted = false;
+  for (const WorldMesh& mesh : meshes) admitted = admitted || mesh.mesh_key == key;
+  out << "\n    {\"key\": \"" << renodx::utils::log::AsHex(key) << "\", \"draw_frame\": " << mismatch.draw_frame
+      << ", \"draw_serial\": " << mismatch.draw_serial << ", \"outcome\": \"";
+  if (failed != failed_meshes.end()) {
+    out << failed->second.reason;
+  } else if (admitted) {
+    out << "admitted after " << mismatch.history.size() << " captures";
+  } else {
+    out << "pending";
+  }
+  out << "\", \"history\": ";
+  WritePoolCaptureRecords(out, mismatch.history);
+  out << "}";
+}
+
+// A camera-visible dynamic instance not followed for more than kPoolDumpStaleFrames frames (world_pool.json "stale_dynamic").
+struct PoolStaleDynamicDump {
+  uint64_t id = 0u;
+  uint64_t mesh_key = 0u;
+  uint64_t mesh_uid = 0u;
+  uint32_t last_follow_frame = 0u;
+  uint32_t last_seen = 0u;
+  uint32_t since_follow = 0u;
+  uint64_t follows = 0u;
+  bool orphan = false;
+};
+
+inline void DumpWorldPool(bool hide_camera_hidden = true) {
+  const uint32_t frame = g_state.frame.load();
   std::vector<WorldMesh> meshes;
   std::vector<WorldInstance> instances;
   std::vector<PoolCameraVisibility> visibility;  // per instance
   std::unordered_map<uint32_t, PoolFamilyStats> families;
+  std::unordered_map<uint32_t, PoolRefusalCounts> alpha_refusals;
   PoolStats stats;
   uint64_t alpha_key_count = 0u;
   uint64_t alpha_held_vertex_bytes = 0u;  // vertex bytes held by requests in the Uvs phase
@@ -5798,10 +6156,13 @@ inline void DumpWorldPool() {
   std::vector<uint8_t> instance_alpha, instance_wind;        // per instance (the instance order of the dump)
   PoolMotionDetail motion_detail;
   std::vector<PoolDynamicDumpEntry> dynamic;
+  std::vector<PoolStaleDynamicDump> stale_dynamic;
   std::unordered_map<uint64_t, PoolMeshFailure> failed_meshes;
   std::unordered_map<uint64_t, PoolMeshMismatch> mismatch_meshes;
   std::vector<uint32_t> last_seen;  // per instance (PoolInstanceLastSeen)
   std::unordered_map<uint64_t, PoolMeshRetry> mesh_retry;
+  std::vector<PoolNoMeshDump> no_mesh;
+  uint64_t no_mesh_dropped = 0u;
   PoolRegion region;
   PoolInspectRecord inspect;
   const PoolCameraInfo camera = GetPoolCameraInfo();
@@ -5818,7 +6179,8 @@ inline void DumpWorldPool() {
   const contract::RegistryEntries registry_entries = contract::SnapshotRegistryEntries();
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    UpdatePoolStats(PoolNewestSeenByKey());
+    const std::unordered_map<uint64_t, uint32_t> newest = PoolNewestSeenByKey();
+    UpdatePoolStats(newest);
     meshes = g_pool.meshes;
     instances = g_pool.instances;
     visibility.reserve(instances.size());
@@ -5828,7 +6190,21 @@ inline void DumpWorldPool() {
       instance_alpha.push_back(instance.mesh_id < g_pool.meshes.size() && g_pool.meshes[instance.mesh_id].alpha ? 1u : 0u);
       instance_wind.push_back(g_pool.wind_keys.count(instance.mesh_key) != 0u ? 1u : 0u);
     }
+    for (size_t i = 0; i < instances.size(); ++i) {
+      const WorldInstance& instance = instances[i];
+      if (!instance.dynamic || !visibility[i].camera_seen || instance.last_follow_frame + kPoolDumpStaleFrames >= frame) continue;
+      PoolStaleDynamicDump& stale = stale_dynamic.emplace_back();
+      stale.id = instance.id;
+      stale.mesh_key = instance.mesh_key;
+      stale.mesh_uid = instance.mesh_id < meshes.size() ? meshes[instance.mesh_id].uid : 0u;
+      stale.last_follow_frame = instance.last_follow_frame;
+      stale.last_seen = last_seen[i];
+      stale.since_follow = frame - instance.last_follow_frame;
+      stale.follows = instance.follows;
+      stale.orphan = PoolInstanceIsOrphan(instance, frame, newest);
+    }
     families = g_pool.families;
+    alpha_refusals = g_pool.alpha_refusals_by_vs;
     stats = g_pool.stats;
     alpha_key_count = g_pool.alpha_keys.size();
     for (const auto& entry : g_pool.mesh_requests) alpha_held_vertex_bytes += entry.second.vertex_bytes.size();
@@ -5849,6 +6225,22 @@ inline void DumpWorldPool() {
     failed_meshes = g_pool.failed_meshes;
     mismatch_meshes = g_pool.mismatch_meshes;
     mesh_retry = g_pool.mesh_retry;
+    no_mesh_dropped = g_pool.no_mesh_keys_dropped;
+    for (const auto& [key, seen] : g_pool.no_mesh_keys) {
+      if (g_pool.mesh_by_key.count(key) != 0u || g_pool.alpha_keys.count(key) == 0u) continue;
+      PoolNoMeshDump row{key, seen};
+      const auto request = g_pool.mesh_requests.find(key);
+      const auto failed = g_pool.failed_meshes.find(key);
+      if (request != g_pool.mesh_requests.end()) {
+        row.state = request->second.in_flight ? "in_flight" : "queued";
+      } else if (g_pool.mesh_retry.count(key) != 0u) {
+        row.state = "retry";
+      } else if (failed != g_pool.failed_meshes.end()) {
+        row.state = "failed";
+        row.reason = failed->second.reason;
+      }
+      no_mesh.push_back(row);
+    }
     motion_detail = g_pool.motion_detail;
     dynamic = SnapshotPoolDynamic();
     region = CurrentPoolRegion();
@@ -5866,6 +6258,9 @@ inline void DumpWorldPool() {
   instance_wind = PoolReorder(instance_wind, instance_order);
 
   std::sort(alpha_keys.begin(), alpha_keys.end(), [](const PoolAlphaKeyDump& a, const PoolAlphaKeyDump& b) { return a.key < b.key; });
+  std::sort(no_mesh.begin(), no_mesh.end(), [](const PoolNoMeshDump& a, const PoolNoMeshDump& b) {
+    return a.seen.count != b.seen.count ? a.seen.count > b.seen.count : a.key < b.key;
+  });
   size_t diag_ok = 0u, diag_no_texcoord = 0u, diag_other_slot = 0u, diag_conflict_view = 0u, diag_conflict_threshold = 0u;
   size_t diag_conflict_swizzle = 0u, diag_conflict_scroll = 0u, diag_conflict_any = 0u;
   for (const PoolAlphaKeyDump& entry : alpha_keys) {
@@ -5907,14 +6302,13 @@ inline void DumpWorldPool() {
     }
   }
 
-  const uint32_t frame = g_state.frame.load();
   std::ostringstream out;
   out << "{\n";
   out << "  \"schema\": 15,\n";
   out << "  \"generated_frame\": " << frame << ",\n";
   out << "  \"files\": {\"summary\": \"world_pool.json\", \"meshes\": \"world_pool_meshes.json\", \"instances\": \"world_pool_instances.json\"},\n";
   out << "  \"meshes_total\": " << meshes.size() << ", \"instances_total\": " << instances.size()
-      << ", \"instances_written\": " << (std::min)(instances.size(), kPoolDumpMaxInstances) << ",\n";
+      << ", \"instances_written\": " << instances.size() << ", \"truncated\": false,\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"alpha\": {\"alpha_foliage\": " << (g_pool.alpha_foliage.load() ? "true" : "false") << ", \"draws\": " << stats.alpha_draws
       << ", \"cb_unavailable\": " << stats.alpha_cb_unavailable << ", \"conflicts\": " << stats.alpha_conflicts
@@ -5926,6 +6320,19 @@ inline void DumpWorldPool() {
       << ", \"keys\": " << alpha_key_count
       << ", \"billboard_draws\": " << stats.draws_by_vs_class[static_cast<size_t>(contract::VsClass::Billboard)]
       << ", \"wind_opaque_skips\": " << stats.skips[static_cast<size_t>(PoolSkip::WindOpaque)] << "},\n";
+  {
+    std::vector<std::pair<uint32_t, PoolRefusalCounts>> rows(alpha_refusals.begin(), alpha_refusals.end());
+    const auto refusals = [](const PoolRefusalCounts& c) { return c.refused_off + c.conflict + c.no_uv; };
+    std::sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) { return refusals(a.second) > refusals(b.second); });
+    out << "  \"alpha_refusals_by_vs\": [";
+    for (size_t i = 0; i < rows.size() && i < kPoolDumpMaxAlphaRefusals; ++i) {
+      const PoolRefusalCounts& c = rows[i].second;
+      out << (i == 0u ? "" : ",") << "\n    {\"vs_hash\": \"" << PoolHashText(rows[i].first) << "\""
+          << ", \"refused_off\": " << c.refused_off << ", \"conflict\": " << c.conflict << ", \"no_uv\": " << c.no_uv
+          << ", \"admitted\": " << c.admitted << ", \"no_mesh\": " << c.no_mesh << "}";
+    }
+    out << "],\n";
+  }
   out << "  \"alpha_gpu\": {\"slices_used\": " << alpha_gpu.slices_used << ", \"slices_total\": " << kAlphaAtlasSlices
       << ", \"blits\": " << alpha_gpu.blits << ", \"blits_frame\": " << alpha_gpu.blits_frame
       << ", \"proxies\": " << alpha_gpu.proxies << ", \"proxy_bytes\": " << alpha_gpu.proxy_bytes
@@ -5961,6 +6368,12 @@ inline void DumpWorldPool() {
         << "\", \"mesh_id\": " << wind_keys_dump[i].second << "}";
   }
   out << "\n  ],\n";
+  out << "  \"wind_sway\": {\"switch\": " << (g_pool.alpha_wind_sway.load() ? "true" : "false")
+      << ", \"keys_with_inputs\": " << g_pool.wind_sway.size() << ", \"unread_draws\": " << stats.wind_sway_unread
+      << ", \"instances_last_pass\": " << stats.wind_sway_instances
+      << ", \"max_displacement_m\": " << PoolJsonFloat{stats.wind_sway_max_m}
+      << ", \"amplitude_bound_m\": " << PoolJsonFloat{stats.wind_sway_bound_m}
+      << ", \"flexibility\": 1, \"origin\": \"instance translation\"},\n";
   out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
       << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";
@@ -6058,6 +6471,7 @@ inline void DumpWorldPool() {
       << ", \"mesh_failures\": " << stats.mesh_failures
       << ", \"mesh_dedup\": " << stats.mesh_dedup
       << ", \"mesh_cap_drops\": " << stats.mesh_cap_drops
+      << ", \"alpha_identity_meshes\": " << stats.alpha_identity_meshes
       << ", \"mesh_verified\": " << stats.mesh_verified
       << ", \"mesh_capture_mismatches\": " << stats.mesh_capture_mismatches
       << ", \"mesh_unstable\": " << stats.mesh_unstable
@@ -6073,6 +6487,7 @@ inline void DumpWorldPool() {
       << ", \"requests_written\": " << stats.requests_written
       << ", \"meshes_written\": " << stats.meshes_written
       << ", \"mass_retirements\": " << stats.mass_retirements
+      << ", \"map_instances_retired\": " << stats.map_instances_retired
       << ", \"last_mass_retire_frame\": " << stats.last_mass_retire_frame
       << ", \"last_mass_retire_meshes\": " << stats.last_mass_retire_meshes
       << ", \"meshes_retired\": " << stats.meshes_retired
@@ -6117,6 +6532,18 @@ inline void DumpWorldPool() {
 
   WritePoolMotion(out, stats.motion, motion_detail, instances);
   WritePoolDynamic(out, dynamic, stats);
+  WritePoolP2b(out, stats);
+  out << "  \"stale_dynamic_count\": " << stale_dynamic.size() << ", \"stale_dynamic_dropped\": "
+      << (stale_dynamic.size() > kPoolDumpMaxStaleDynamic ? stale_dynamic.size() - kPoolDumpMaxStaleDynamic : 0u) << ",\n";
+  out << "  \"stale_dynamic\": [";
+  for (size_t i = 0; i < stale_dynamic.size() && i < kPoolDumpMaxStaleDynamic; ++i) {
+    const PoolStaleDynamicDump& row = stale_dynamic[i];
+    out << (i == 0u ? "" : ",") << "\n    {\"pool_id\": " << row.id << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(row.mesh_key)
+        << "\", \"mesh_uid\": " << row.mesh_uid << ", \"last_follow_frame\": " << row.last_follow_frame
+        << ", \"last_seen\": " << row.last_seen << ", \"frames_since_follow\": " << row.since_follow
+        << ", \"follows\": " << row.follows << ", \"orphan\": " << (row.orphan ? "true" : "false") << "}";
+  }
+  out << "\n  ],\n";
 
   out << "  \"families\": [";
   bool first = true;
@@ -6260,7 +6687,7 @@ inline void DumpWorldPool() {
   std::ostringstream instances_out;
   instances_out << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"instances\": [";
   first = true;
-  for (size_t i = 0; i < instances.size() && i < kPoolDumpMaxInstances; ++i) {
+  for (size_t i = 0; i < instances.size(); ++i) {
     const WorldInstance& instance = instances[i];
     const PoolCameraVisibility& seen = visibility[i];
     const float* m = instance.matrix;
@@ -6277,9 +6704,9 @@ inline void DumpWorldPool() {
         << ", \"last_seen\": " << last_seen[i]
         << ", \"dynamic\": " << (instance.dynamic ? "true" : "false")
         << ", \"last_follow_frame\": " << instance.last_follow_frame
-        << ", \"origin\": [" << instance.matrix[3] << ", " << instance.matrix[7] << ", " << instance.matrix[11] << "]"
-        << ", \"bounds_min\": [" << instance.bounds_min[0] << ", " << instance.bounds_min[1] << ", " << instance.bounds_min[2] << "]"
-        << ", \"bounds_max\": [" << instance.bounds_max[0] << ", " << instance.bounds_max[1] << ", " << instance.bounds_max[2] << "]"
+        << ", \"origin\": [" << PoolJsonFloat{instance.matrix[3]} << ", " << PoolJsonFloat{instance.matrix[7]} << ", " << PoolJsonFloat{instance.matrix[11]} << "]"
+        << ", \"bounds_min\": [" << PoolJsonFloat{instance.bounds_min[0]} << ", " << PoolJsonFloat{instance.bounds_min[1]} << ", " << PoolJsonFloat{instance.bounds_min[2]} << "]"
+        << ", \"bounds_max\": [" << PoolJsonFloat{instance.bounds_max[0]} << ", " << PoolJsonFloat{instance.bounds_max[1]} << ", " << PoolJsonFloat{instance.bounds_max[2]} << "]"
         << ", \"mesh_uid\": " << uid
         << ", \"alpha\": " << (instance_alpha[i] ? "true" : "false")
         << ", \"wind_rest\": " << (instance_wind[i] ? "true" : "false")
@@ -6287,77 +6714,33 @@ inline void DumpWorldPool() {
         << ", \"camera_seen\": " << (seen.camera_seen ? "true" : "false")
         << ", \"light_seen\": " << (seen.light_seen ? "true" : "false")
         << ", \"near_fade\": " << (seen.near_fade ? "true" : "false")
-        << ", \"scale\": [" << scale[0] << ", " << scale[1] << ", " << scale[2] << "]}";
+        << ", \"scale\": [" << PoolJsonFloat{scale[0]} << ", " << PoolJsonFloat{scale[1]} << ", " << PoolJsonFloat{scale[2]} << "]}";
   }
   instances_out << "\n  ]\n}\n";
 
-  out << "  \"mesh_failed\": [";
-  first = true;
-  for (const auto& [key, failure] : failed_meshes) {
-    if (!first) out << ",";
-    first = false;
-    out << "\n    {\"key\": \"" << renodx::utils::log::AsHex(key) << "\", \"reason\": \"" << failure.reason << "\""
-        << ", \"vs_hash\": \"" << PoolHashText(failure.vs_hash) << "\""
-        << ", \"frame\": " << failure.frame
-        << ", \"captures\": " << failure.captures
-        << ", \"index_count\": " << failure.index_count
-        << ", \"first_index\": " << failure.first_index
-        << ", \"base_vertex\": " << failure.base_vertex
-        << ", \"vertex_stride\": " << failure.vertex_stride
-        << ", \"min_vertex\": " << failure.min_vertex
-        << ", \"max_vertex\": " << failure.max_vertex
-        << ", \"vb_size\": " << failure.vb_size
-        << ", \"ib_size\": " << failure.ib_size
-        << ", \"from_indirect\": " << (failure.from_indirect ? "true" : "false")
-        << ", \"pos_offset\": " << failure.pos_offset
-        << ", \"vb_usage\": " << failure.vb_usage << ", \"vb_flags\": " << failure.vb_flags
-        << ", \"ib_usage\": " << failure.ib_usage << ", \"ib_flags\": " << failure.ib_flags
-        << ", \"written\": " << (failure.written ? "true" : "false")
-        << ", \"phase\": \"" << PoolMeshPhaseName(failure.phase) << "\""
-        << ", \"index_size\": " << failure.index_size
-        << ", \"instance_count\": " << failure.instance_count
-        << ", \"vb_handle\": \"" << renodx::utils::log::AsHex(failure.vb_handle) << "\""
-        << ", \"ib_handle\": \"" << renodx::utils::log::AsHex(failure.ib_handle) << "\""
-        << ", \"vb_offset\": " << failure.vb_offset << ", \"ib_offset\": " << failure.ib_offset
-        << ", \"buffer_key\": \"" << renodx::utils::log::AsHex(failure.buffer_key) << "\""
-        << ", \"raw_index_min\": " << failure.raw_index_min << ", \"raw_index_max\": " << failure.raw_index_max
-        << ", \"first_raw\": [";
-    for (size_t k = 0; k < 8u; ++k) out << (k != 0u ? ", " : "") << failure.first_raw[k];
-    out << "], \"raw_hash\": \"" << renodx::utils::log::AsHex(failure.raw_hash) << "\""
-        << ", \"history\": ";
-    WritePoolCaptureRecords(out, failure.history);
-    if (failure.staging.poisoned) {
-      out << ", \"staging\": ";
-      WritePoolStagingDiag(out, failure.staging);
+  const size_t failed_dropped = failed_meshes.size() > kPoolDumpMaxMeshDetail ? failed_meshes.size() - kPoolDumpMaxMeshDetail : 0u;
+  const size_t mismatch_dropped = mismatch_meshes.size() > kPoolDumpMaxMeshDetail ? mismatch_meshes.size() - kPoolDumpMaxMeshDetail : 0u;
+  out << "  \"failed_count\": " << failed_meshes.size() << ", \"failed_dropped\": " << failed_dropped
+      << ", \"mismatch_count\": " << mismatch_meshes.size() << ", \"mismatch_dropped\": " << mismatch_dropped << ",\n";
+  // Each list holds at most kPoolDumpMaxMeshDetail records; the counts above say what was left out.
+  const auto write_list = [&out](const char* name, const auto& records, const auto& write_one) {
+    out << "  \"" << name << "\": [";
+    size_t written = 0u;
+    for (const auto& [key, record] : records) {
+      if (written++ == kPoolDumpMaxMeshDetail) break;
+      out << (written == 1u ? "" : ",");
+      write_one(key, record);
     }
-    out << "}";
-  }
-  out << "\n  ],\n";
-
-  out << "  \"mesh_mismatches\": [";
-  first = true;
-  for (const auto& [key, mismatch] : mismatch_meshes) {
-    if (!first) out << ",";
-    first = false;
-    const auto failed = failed_meshes.find(key);
-    bool admitted = false;
-    for (const WorldMesh& mesh : meshes) admitted = admitted || mesh.mesh_key == key;
-    out << "\n    {\"key\": \"" << renodx::utils::log::AsHex(key) << "\", \"draw_frame\": " << mismatch.draw_frame
-        << ", \"draw_serial\": " << mismatch.draw_serial << ", \"outcome\": \"";
-    if (failed != failed_meshes.end()) {
-      out << failed->second.reason;
-    } else if (admitted) {
-      out << "admitted after " << mismatch.history.size() << " captures";
-    } else {
-      out << "pending";
-    }
-    out << "\", \"history\": ";
-    WritePoolCaptureRecords(out, mismatch.history);
-    out << "}";
-  }
-  out << "\n  ],\n";
-
-
+    out << "\n  ],\n";
+  };
+  const auto write_failed = [&](uint64_t key, const PoolMeshFailure& failure) { WritePoolFailedMesh(out, key, failure, families); };
+  const auto write_mismatch = [&](uint64_t key, const PoolMeshMismatch& mismatch) {
+    WritePoolMismatchMesh(out, key, mismatch, failed_meshes, meshes);
+  };
+  write_list("mesh_failed", failed_meshes, write_failed);
+  write_list("failed_meshes_detail", failed_meshes, write_failed);
+  write_list("mesh_mismatches", mismatch_meshes, write_mismatch);
+  write_list("mismatch_meshes_detail", mismatch_meshes, write_mismatch);
   out << "  \"mesh_retrying\": [";
   first = true;
   for (const auto& [key, retry] : mesh_retry) {
@@ -6367,9 +6750,36 @@ inline void DumpWorldPool() {
         << ", \"next_frame\": " << retry.next_frame << "}";
   }
   out << "\n  ],\n";
+  out << "  \"alpha_no_mesh_count\": " << no_mesh.size() << ", \"alpha_no_mesh_dropped\": " << no_mesh_dropped << ",\n";
+  out << "  \"alpha_no_mesh_keys\": [";
+  for (size_t i = 0; i < no_mesh.size() && i < kPoolDumpMaxNoMeshKeys; ++i) {
+    const PoolNoMeshDump& row = no_mesh[i];
+    out << (i == 0u ? "" : ",") << "\n    {\"key\": \"" << renodx::utils::log::AsHex(row.key) << "\", \"vs_hash\": \""
+        << PoolHashText(row.seen.vs_hash) << "\", \"draw_count\": " << row.seen.count << ", \"first_frame\": " << row.seen.first_frame
+        << ", \"last_frame\": " << row.seen.last_frame << ", \"state\": \"" << row.state << "\", \"reason\": \"" << row.reason << "\"}";
+  }
+  out << "\n  ],\n";
   out << "  \"inspect\": {\"set\": " << (inspect.set ? "true" : "false") << ", \"frame\": " << inspect.frame
       << ", \"hit\": " << (inspect.hit ? "true" : "false") << ", \"instance_id\": " << inspect.instance_id
-      << ", \"mesh_uid\": " << inspect.mesh_uid << ", \"lines\": [";
+      << ", \"mesh_uid\": " << inspect.mesh_uid << ", \"camera_ray\": ";
+  if (inspect.ray_valid) {
+    out << "{\"origin\": [" << PoolJsonFloat{inspect.ray_origin[0]} << ", " << PoolJsonFloat{inspect.ray_origin[1]} << ", "
+        << PoolJsonFloat{inspect.ray_origin[2]} << "], \"direction\": [" << PoolJsonFloat{inspect.ray_direction[0]} << ", "
+        << PoolJsonFloat{inspect.ray_direction[1]} << ", " << PoolJsonFloat{inspect.ray_direction[2]} << "]}";
+  } else {
+    out << "null";
+  }
+  out << ", \"game_depth_point\": null, \"game_depth_reason\": \"the depth compare keeps no depth value and the game depth point is not read back from the GPU; camera_ray is the only geometry\""
+      << ", \"crossing_instances\": " << inspect.crossing_instances << ", \"candidate_count\": " << inspect.candidates.size()
+      << ", \"candidates_dropped\": " << inspect.crossing_instances - inspect.candidates.size() << ", \"candidates\": [";
+  for (size_t i = 0; i < inspect.candidates.size(); ++i) {
+    const PoolInspectCandidate& candidate = inspect.candidates[i];
+    out << (i != 0u ? ", " : "") << "{\"pool_id\": " << candidate.instance_id << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(candidate.mesh_key)
+        << "\", \"mesh_uid\": " << candidate.mesh_uid << ", \"vs_hash\": \"" << PoolHashText(candidate.vs_hash) << "\", \"status\": \""
+        << candidate.status << "\", \"reason\": \"" << PoolJsonEscape(candidate.reason) << "\", \"tlas_index\": " << candidate.tlas_index
+        << ", \"entry_distance\": " << PoolJsonFloat{candidate.entry} << "}";
+  }
+  out << "], \"lines\": [";
   for (size_t i = 0; i < inspect.lines.size(); ++i) {
     out << (i != 0u ? ", " : "") << "\"" << PoolJsonEscape(inspect.lines[i]) << "\"";
   }
@@ -6382,6 +6792,29 @@ inline void DumpWorldPool() {
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool_meshes.json", meshes_text);
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool_instances.json", instances_text);
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool.json", text);
+
+  // Written last so the sizes are the bytes on disk. Build id: none exists in the addon.
+  const std::pair<const char*, size_t> written_files[] = {
+      {"world_pool_meshes.json", meshes.size()}, {"world_pool_instances.json", instances.size()}, {"world_pool.json", 1u}};
+  std::ostringstream manifest;
+  manifest << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"build\": \"unknown\",\n"
+           << "  \"switches\": {\"alpha_foliage\": " << (g_pool.alpha_foliage.load() ? "true" : "false")
+           << ", \"alpha_indirect_source\": " << (g_pool.alpha_indirect_source.load() ? "true" : "false")
+           << ", \"alpha_wind_opaque\": " << (g_pool.alpha_wind_opaque.load() ? "true" : "false")
+           << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false")
+           << ", \"hide_camera_hidden\": " << (hide_camera_hidden ? "true" : "false")
+           << ", \"dynamic_applied\": " << (g_pool.dynamic_applied ? "true" : "false") << "},\n"
+           << "  \"files\": [";
+  bool first_file = true;
+  for (const auto& [name, records] : written_files) {
+    const std::filesystem::path file = PoolOutputDir() / name;
+    manifest << (first_file ? "" : ",") << "\n    {\"name\": \"" << name << "\", \"bytes\": " << std::filesystem::file_size(file)
+             << ", \"records\": " << records << ", \"truncated\": false, \"dropped\": 0, \"schema\": 15}";
+    first_file = false;
+  }
+  manifest << "\n  ]\n}\n";
+  std::string manifest_text = manifest.str();
+  renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool_manifest.json", manifest_text);
 }
 
 // The prevWorld trace (see PoolPrevTrace): each key's state and evidence, the

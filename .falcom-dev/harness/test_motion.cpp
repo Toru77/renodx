@@ -160,6 +160,7 @@ int main() {
             "instance key present (id %llu)", (unsigned long long)inst.id);
     }
   };
+  std::vector<bvh::PoolDynamicDraw> dynamic_frame;  // P2b: the last present's flagged draws
   auto run_frame = [&]() {
     const uint32_t frame = falcom_world::g_state.frame.load();
     for (size_t index = 0; index < objects.size(); ++index) {
@@ -192,7 +193,12 @@ int main() {
       bvh::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
     }
     falcom_world::g_state.frame.fetch_add(1u);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      dynamic_frame = bvh::g_pool.dynamic_draws;  // P2b: this present's flagged draws, before the drain clears them
+    }
     bvh::DrainPoolScan(&dev, &queue);
+    CHECK(bvh::g_pool.dynamic_draws.empty(), "P2b list cleared by the present");
     if (check_every_frame) check_invariants();
   };
   auto run = [&](int frames) { for (int i = 0; i < frames; ++i) run_frame(); };
@@ -394,6 +400,14 @@ int main() {
 
   // ---- P2a: moving rigid objects ----
   bvh::g_pool.exclude_moving.store(true);
+  // P2b: the arena the draws copy into (EnsureDynamicExpand creates it in the live stage, not run here).
+  resource dynamic_arena = {0u};
+  dev.create_resource(resource_desc(bvh::kPoolDynamicArenaBytes, memory_heap::gpu_only, resource_usage::shader_resource | resource_usage::copy_dest),
+                      nullptr, resource_usage::general, &dynamic_arena);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.dynamic_arena = dynamic_arena;
+  }
 
   HStage("8. The rule.");
   // 8. The rule.
@@ -425,6 +439,114 @@ int main() {
     CHECK(!bvh::PoolSightingMoves(w, p), "non-finite prevWorld");
   }
 
+  HStage("P2b. Expansion math: transcribed record vs CheckPoolWorld, ComputeMatrixInverse, brute force bounds.");
+  {
+    // Transcription of world_dynamic_expand.cs_5_0.hlsl (one record): validity, closed-form inverse, bounds.
+    struct Record {
+      bool valid = false;
+      float inverse[12] = {};
+      float lo[3] = {};
+      float hi[3] = {};
+    };
+    auto expand = [](const float* m, float min_scale, float max_scale, const float* bmin, const float* bmax) {
+      Record e;
+      for (int i = 0; i < 12; ++i) {
+        if (!std::isfinite(m[i])) return e;
+      }
+      const float t[3] = {m[3], m[7], m[11]};
+      for (int k = 0; k < 3; ++k) {
+        if (!(std::fabs(t[k]) <= bvh::kPoolMaxPosition)) return e;
+      }
+      float len[3];
+      for (int k = 0; k < 3; ++k) {
+        len[k] = std::sqrt(m[4 * k] * m[4 * k] + m[4 * k + 1] * m[4 * k + 1] + m[4 * k + 2] * m[4 * k + 2]);
+        if (!(len[k] >= 1e-6f) || !(len[k] >= min_scale) || !(len[k] < max_scale)) return e;
+      }
+      for (int a = 0; a < 3; ++a) {
+        for (int b = a + 1; b < 3; ++b) {
+          const float d = (m[4 * a] * m[4 * b] + m[4 * a + 1] * m[4 * b + 1] + m[4 * a + 2] * m[4 * b + 2]) / (len[a] * len[b]);
+          if (!(std::fabs(d) < 0.995f)) return e;
+        }
+      }
+      const float a0[3] = {m[0], m[1], m[2]}, a1[3] = {m[4], m[5], m[6]}, a2[3] = {m[8], m[9], m[10]};
+      const float c0[3] = {a1[1] * a2[2] - a1[2] * a2[1], a1[2] * a2[0] - a1[0] * a2[2], a1[0] * a2[1] - a1[1] * a2[0]};
+      const float c1[3] = {a2[1] * a0[2] - a2[2] * a0[1], a2[2] * a0[0] - a2[0] * a0[2], a2[0] * a0[1] - a2[1] * a0[0]};
+      const float c2[3] = {a0[1] * a1[2] - a0[2] * a1[1], a0[2] * a1[0] - a0[0] * a1[2], a0[0] * a1[1] - a0[1] * a1[0]};
+      const float det = a0[0] * c0[0] + a0[1] * c0[1] + a0[2] * c0[2];
+      if (!(std::fabs(det) >= 1e-12f)) return e;
+      for (int k = 0; k < 3; ++k) {
+        for (int j = 0; j < 3; ++j) {
+          const float c = j == 0 ? c0[k] : j == 1 ? c1[k] : c2[k];
+          e.inverse[4 * k + j] = c / det;
+        }
+        e.inverse[4 * k + 3] = -(e.inverse[4 * k] * t[0] + e.inverse[4 * k + 1] * t[1] + e.inverse[4 * k + 2] * t[2]);
+      }
+      for (int k = 0; k < 3; ++k) {
+        e.lo[k] = t[k];
+        e.hi[k] = t[k];
+        for (int j = 0; j < 3; ++j) {
+          const float p = m[4 * k + j] * bmin[j], q = m[4 * k + j] * bmax[j];
+          e.lo[k] += std::min(p, q);
+          e.hi[k] += std::max(p, q);
+        }
+      }
+      e.valid = true;
+      return e;
+    };
+    uint32_t rng = 12345u;
+    auto next = [&rng]() {
+      rng = rng * 1664525u + 1013904223u;
+      return static_cast<float>(rng >> 8) / static_cast<float>(1u << 24);
+    };
+    const float bmin[3] = {-1.f, -2.f, -0.5f}, bmax[3] = {1.f, 2.f, 0.5f};
+    uint32_t total = 0u, valid_count = 0u, validity_mismatch = 0u, inverse_bad = 0u, bounds_bad = 0u;
+    float worst_inverse = 0.f;
+    for (uint32_t n = 0u; n < 20000u; ++n) {
+      float m[12];
+      for (float& v : m) v = (next() * 2.f - 1.f) * 3.f;
+      for (int k = 0; k < 3; ++k) m[4 * k + 3] = (next() * 2.f - 1.f) * 100.f;
+      const uint32_t kind = n % 10u;
+      if (kind == 1u) m[4] = m[5] = m[6] = 0.f;                 // zero row
+      if (kind == 2u) m[0] = NAN;                               // non-finite
+      if (kind == 3u) m[11] = 60000.f;                          // far away
+      if (kind == 4u) { for (int j = 0; j < 4; ++j) m[4 + j] = 2.f * m[j]; }  // collinear rows
+      if (kind == 5u) { for (int j = 0; j < 3; ++j) m[j] *= 1e-6f; }          // tiny scale
+      if (kind == 6u) { for (int j = 0; j < 3; ++j) m[8 + j] *= 1e4f; }       // large scale
+      if (kind == 7u) { m[0] = 1.f; m[1] = m[2] = m[4] = m[6] = m[8] = m[9] = 0.f; m[5] = m[10] = 1.f; }  // identity basis
+      const Record e = expand(m, bvh::kPoolMinScale, bvh::kPoolMaxScale, bmin, bmax);
+      const bool cpu_valid = bvh::CheckPoolWorld(m) == bvh::PoolMatrixReject::None;
+      total += 1u;
+      if (e.valid) valid_count += 1u;
+      if (e.valid != cpu_valid) validity_mismatch += 1u;
+      if (!cpu_valid) continue;
+      float inv16[16] = {};
+      falcom_world::ComputeMatrixInverse(m, inv16);
+      for (int k = 0; k < 3; ++k) {
+        for (int j = 0; j < 4; ++j) {
+          const float diff = std::fabs(e.inverse[4 * k + j] - inv16[4 * k + j]);
+          worst_inverse = std::max(worst_inverse, diff / std::max(1.f, std::fabs(inv16[4 * k + j])));
+          if (diff > 1e-3f * std::max(1.f, std::fabs(inv16[4 * k + j]))) inverse_bad += 1u;
+        }
+      }
+      // Brute force: the eight corners of the local box, transformed.
+      for (int k = 0; k < 3; ++k) {
+        float lo = 1e30f, hi = -1e30f;
+        for (int corner = 0; corner < 8; ++corner) {
+          const float local[3] = {(corner & 1) ? bmax[0] : bmin[0], (corner & 2) ? bmax[1] : bmin[1], (corner & 4) ? bmax[2] : bmin[2]};
+          const float p = m[4 * k] * local[0] + m[4 * k + 1] * local[1] + m[4 * k + 2] * local[2] + m[4 * k + 3];
+          lo = std::min(lo, p);
+          hi = std::max(hi, p);
+        }
+        if (std::fabs(lo - e.lo[k]) > 1e-5f * std::max(1.f, std::fabs(lo)) || std::fabs(hi - e.hi[k]) > 1e-5f * std::max(1.f, std::fabs(hi))) bounds_bad += 1u;
+      }
+    }
+    std::printf("p2b expand: %u matrices, %u valid, validity mismatches %u, inverse mismatches %u (worst rel %.2e), bounds mismatches %u\n",
+                total, valid_count, validity_mismatch, inverse_bad, static_cast<double>(worst_inverse), bounds_bad);
+    CHECK(validity_mismatch == 0u, "P2b: validity equals CheckPoolWorld (%u)", validity_mismatch);
+    CHECK(inverse_bad == 0u && valid_count > 1000u, "P2b: inverse equals ComputeMatrixInverse (%u bad, %u valid)", inverse_bad, valid_count);
+    CHECK(bounds_bad == 0u, "P2b: bounds equal the brute-force corners (%u)", bounds_bad);
+  }
+
   HStage("9. Static, then moves, then stops: the static instance is removed when it");
   // 9. Static, then moves, then stops: the static instance is removed when it
   // is seen moving and no pose is admitted afterwards; a static neighbor is
@@ -449,11 +571,27 @@ int main() {
     CHECK(s.dynamic_live_keys == 1u && s.dynamic_meshes == 1u && s.dynamic_retired == 1u, "flagged, static pose removed");
     CHECK(s.admitted == 1u, "neighbor stays (%zu)", s.admitted);
     CHECK(s.dynamic_moving_keys == 1u && s.dynamic_released == 0u, "still moving within the hold");
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const uint64_t flagged = bvh::g_pool.dynamic_keys.begin()->first;
+      CHECK(dynamic_frame.size() == 1u, "P2b: one record for the flagged mesh per present (%zu)", dynamic_frame.size());
+      if (dynamic_frame.size() == 1u) {
+        const bvh::PoolDynamicDraw& d = dynamic_frame[0];
+        CHECK(d.mesh_key == flagged && d.vs_hash == 0x1000u && !d.indirect && d.count == 1u, "P2b record: key, VS, direct, count");
+        CHECK(d.pass != 0u, "P2b record: gate pass");
+        CHECK(d.buffer.handle == dynamic_arena.handle && d.arena == 0u && d.out == 0u, "P2b record: arena and record offsets");
+        const auto& arena_bytes = dev.res[dynamic_arena.handle].bytes;
+        const auto& ring_bytes = dev.res[t15.handle].bytes;
+        CHECK(std::memcmp(arena_bytes.data() + d.arena, ring_bytes.data() + static_cast<size_t>(d.base) * 160u, d.count * 160u) == 0,
+              "P2b copy: arena holds the drawn slice");
+      }
+    }
     run(200);  // stopped at x = 6 since frame 210: released after the hold, the pose is admitted
     s = snapshot();
     CHECK(s.dynamic_released == 1u && s.dynamic_meshes == 0u && s.dynamic_moving_keys == 0u,
           "released after the hold (released %u, flagged %zu, moving %zu)", s.dynamic_released, s.dynamic_meshes, s.dynamic_moving_keys);
     CHECK(s.admitted == 2u, "stopped pose admitted after release (%zu)", s.admitted);
+    CHECK(dynamic_frame.empty(), "P2b: no record once released (%zu)", dynamic_frame.size());
     CHECK(s.motion.rule_moving > 0u && s.motion.rule_stale == 0u, "rule never fires stale on unmoved sightings");
     {
       std::lock_guard lock(bvh::g_pool.mutex);
@@ -465,6 +603,9 @@ int main() {
     }
     const std::string text = read_dump();
     CHECK(text.find("\"exclude_moving\": true") != std::string::npos, "switch in dump");
+    CHECK(text.find("\"p2b\": {\"per_frame\": true") != std::string::npos, "p2b block with the switch");
+    CHECK(text.find("\"copied_total\": 0,") == std::string::npos && text.find("\"refused_total\": 0, \"deferred_total\": 0,") != std::string::npos,
+          "p2b block: copies recorded, none refused or deferred");
     CHECK(text.find("\"dynamic\": {\"keys\": 1") != std::string::npos, "dynamic section");
     CHECK(text.find("\"retired_instances\": 1") != std::string::npos && text.find("\"mesh_flagged\": false") != std::string::npos,
           "entry evidence");

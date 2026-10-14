@@ -145,6 +145,9 @@ inline void RunBvhDebugPass(
   MaybeCaptureBvhTraceStats(device, queue, data);
   if (data->inspect.fresh) {
     data->inspect.fresh = false;
+    data->inspect.candidates.clear();
+    data->inspect.crossing_instances = 0u;
+    data->inspect.ray_valid = false;
     if (data->inspect.valid && data->inspect.hit && (data->inspect.instance & kDynamicInstanceFlag) != 0u) {
       DescribeDynamicInspect(data->inspect, LiveCompareClassName(data->inspect.compare_class));
     } else {
@@ -157,7 +160,12 @@ inline void RunBvhDebugPass(
     g_pool.inspect = PoolInspectRecord{.set = true, .frame = g_state.frame.load(), .hit = data->inspect.valid && data->inspect.hit,
                                        .instance_id = known ? data->tlas_info[data->inspect.instance].id : 0u,
                                        .mesh_uid = known ? data->tlas_info[data->inspect.instance].uid : 0u,
-                                       .lines = data->inspect.lines};
+                                       .lines = data->inspect.lines,
+                                       .ray_valid = data->inspect.ray_valid,
+                                       .ray_origin = data->inspect.ray_origin,
+                                       .ray_direction = data->inspect.ray_direction,
+                                       .crossing_instances = data->inspect.crossing_instances,
+                                       .candidates = data->inspect.candidates};
   }
 
   renodx::utils::render::RenderPass pass;

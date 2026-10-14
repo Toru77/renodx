@@ -50,8 +50,15 @@ StructuredBuffer<BVHLeafGPU> g_trace_dynamic_leaves : register(t13);
 StructuredBuffer<float2> g_trace_uvs : register(t14);
 Texture2DArray<uint> g_alpha_atlas : register(t15);
 StructuredBuffer<AlphaMaterialGPU> g_alpha_materials : register(t16);
+#ifdef WORLD_TRACE_DYNAMIC_INSTANCES
+// Flagged draws of this present (P2b, world_dynamic_expand.cs_5_0.hlsl): expanded instances, traced after the TLAS.
+// Only the trace pass binds them: RTAO uses t17 for its own input.
+StructuredBuffer<WorldInstanceGPU> g_trace_dynamic_instances : register(t17);
+#endif
 // Objects in g_trace_dynamic_objects; set by the including shader before tracing.
 static uint g_trace_dynamic_count = 0u;
+// Records in g_trace_dynamic_instances to trace; set by the including shader before tracing.
+static uint g_trace_dynamic_instance_count = 0u;
 
 struct WorldTraceHit
 {
@@ -449,6 +456,68 @@ bool TraceDynamicBlas(
     return found;
 }
 
+// One instance of the TLAS or of the P2b records, traced in its local space: the static traversal (TraceBlas)
+// with the instance's camera interval. Updates `best` when the instance is hit nearer than best.t.
+bool TraceWorldInstance(
+    WorldInstanceGPU instance,
+    uint instance_id,
+    float3 origin,
+    float3 direction,
+    float t_min,
+    WorldCameraView view,
+    inout float hidden_t,
+    inout WorldTraceCounters counters,
+    inout WorldTraceHit best)
+{
+    const uint mesh_id = (uint)instance.header.x;
+    const float4 origin_h = float4(origin, 1.0);
+    const float4 direction_h = float4(direction, 0.0);
+    const float3 local_origin = float3(
+        dot(origin_h, instance.inverse_world[0]),
+        dot(origin_h, instance.inverse_world[1]),
+        dot(origin_h, instance.inverse_world[2]));
+    const float3 local_direction = float3(
+        dot(direction_h, instance.inverse_world[0]),
+        dot(direction_h, instance.inverse_world[1]),
+        dot(direction_h, instance.inverse_world[2]));
+    // Where the game camera shows this instance's surfaces.
+    const uint visibility_flags = (uint)(instance.visibility.z + 0.5);
+    float shown_min = 0.0;
+    float shown_max = CAMERA_FADE_NEVER;
+    if ((visibility_flags & INSTANCE_CAMERA_VISIBLE) == 0u)
+    {
+        shown_min = CAMERA_FADE_NEVER;
+        shown_max = -1.0;
+    }
+    else if ((visibility_flags & INSTANCE_NEAR_FADE) != 0u)
+    {
+        CameraFadeInterval(instance.visibility.x, instance.visibility.y, view.floor_value, shown_min, shown_max);
+    }
+    float local_best_t = best.t;
+    uint local_prim = 0xFFFFFFFFu;
+    float3 local_normal = float3(0.0, 0.0, 0.0);
+    uint local_hidden = 0u;
+    if (!TraceBlas(mesh_id, (uint)instance.header.z, local_origin, local_direction, t_min, local_best_t,
+                   shown_min, shown_max, view.hide, hidden_t,
+                   counters, local_prim, local_normal, local_hidden))
+    {
+        return false;
+    }
+    best.t = local_best_t;
+    best.instance = instance_id;
+    best.mesh = mesh_id;
+    best.prim = local_prim;
+    best.hidden = local_hidden;
+    best.facing = dot(local_normal, local_direction);
+    best.material = (uint)instance.header.z;
+    const float4 normal_h = float4(local_normal, 0.0);
+    best.normal = normalize(float3(
+        dot(normal_h, instance.world[0]),
+        dot(normal_h, instance.world[1]),
+        dot(normal_h, instance.world[2])));
+    return true;
+}
+
 WorldTraceHit TraceWorldRay(
     float3 origin,
     float3 direction,
@@ -491,14 +560,7 @@ WorldTraceHit TraceWorldRay(
     uint mesh_stride = 0u;
     g_trace_meshes.GetDimensions(mesh_count, mesh_stride);
 
-    float best_t = t_max;
-    uint best_instance = 0xFFFFFFFFu;
-    uint best_mesh = 0xFFFFFFFFu;
-    uint best_prim = 0xFFFFFFFFu;
-    float3 best_normal = float3(0.0, 0.0, 0.0);
-    uint best_hidden = 0u;
-    float best_facing = 0.0;
-    uint best_material = 0u;
+    WorldTraceHit best = hit;
     float hidden_t = CAMERA_FADE_NEVER;  // nearest skipped hidden hit (view.hide)
 
     uint stack[TRACE_STACK_SIZE];
@@ -516,7 +578,7 @@ WorldTraceHit TraceWorldRay(
             const BVHNodeGPU node = g_trace_tlas_nodes[node_index];
             float t_near;
             float t_far;
-            if (AabbIntersect(origin, direction, node.bounds_min, node.bounds_max, t_min, best_t, t_near, t_far))
+            if (AabbIntersect(origin, direction, node.bounds_min, node.bounds_max, t_min, best.t, t_near, t_far))
             {
                 if ((node.child_or_leaf & BVH_LEAF_FLAG) != 0u)
                 {
@@ -548,67 +610,13 @@ WorldTraceHit TraceWorldRay(
                                 {
                                     counters.invalid_refs++;
                                 }
-                                else
+                                else if (TraceWorldInstance(instance, resolved, origin, direction, t_min, view, hidden_t, counters, best)
+                                         && any_hit)
                                 {
-                                    const float4 origin_h = float4(origin, 1.0);
-                                    const float4 direction_h = float4(direction, 0.0);
-                                    const float3 local_origin = float3(
-                                        dot(origin_h, instance.inverse_world[0]),
-                                        dot(origin_h, instance.inverse_world[1]),
-                                        dot(origin_h, instance.inverse_world[2]));
-                                    const float3 local_direction = float3(
-                                        dot(direction_h, instance.inverse_world[0]),
-                                        dot(direction_h, instance.inverse_world[1]),
-                                        dot(direction_h, instance.inverse_world[2]));
-                                    // Where the game camera shows this instance's surfaces.
-                                    const uint visibility_flags = (uint)(instance.visibility.z + 0.5);
-                                    float shown_min = 0.0;
-                                    float shown_max = CAMERA_FADE_NEVER;
-                                    if ((visibility_flags & INSTANCE_CAMERA_VISIBLE) == 0u)
-                                    {
-                                        shown_min = CAMERA_FADE_NEVER;
-                                        shown_max = -1.0;
-                                    }
-                                    else if ((visibility_flags & INSTANCE_NEAR_FADE) != 0u)
-                                    {
-                                        CameraFadeInterval(instance.visibility.x, instance.visibility.y, view.floor_value, shown_min, shown_max);
-                                    }
-                                    float local_best_t = best_t;
-                                    uint local_prim = 0xFFFFFFFFu;
-                                    float3 local_normal = float3(0.0, 0.0, 0.0);
-                                    uint local_hidden = 0u;
-                                    if (TraceBlas(mesh_id, (uint)instance.header.z, local_origin, local_direction, t_min, local_best_t,
-                                                  shown_min, shown_max, view.hide, hidden_t,
-                                                  counters, local_prim, local_normal, local_hidden))
-                                    {
-                                        best_t = local_best_t;
-                                        best_instance = resolved;
-                                        best_mesh = mesh_id;
-                                        best_prim = local_prim;
-                                        best_hidden = local_hidden;
-                                        best_facing = dot(local_normal, local_direction);
-                                        best_material = (uint)instance.header.z;
-                                        const float4 normal_h = float4(local_normal, 0.0);
-                                        best_normal = normalize(float3(
-                                            dot(normal_h, instance.world[0]),
-                                            dot(normal_h, instance.world[1]),
-                                            dot(normal_h, instance.world[2])));
-                                        if (any_hit)
-                                        {
-                                            counters.hits = 1u;
-                                            counters.camera_hidden = (best_hidden != 0u || hidden_t < best_t) ? 1u : 0u;
-                                            hit.t = best_t;
-                                            hit.instance = best_instance;
-                                            hit.mesh = best_mesh;
-                                            hit.prim = best_prim;
-                                            hit.position = origin + direction * best_t;
-                                            hit.normal = best_normal;
-                                            hit.hidden = best_hidden;
-                                            hit.facing = best_facing;
-                                            hit.material = best_material;
-                                            return hit;
-                                        }
-                                    }
+                                    counters.hits = 1u;
+                                    best.position = origin + direction * best.t;
+                                    counters.camera_hidden = (best.hidden != 0u || hidden_t < best.t) ? 1u : 0u;
+                                    return best;
                                 }
                             }
                         }
@@ -642,6 +650,26 @@ WorldTraceHit TraceWorldRay(
         node_index = stack[stack_size];
     }
 
+#ifdef WORLD_TRACE_DYNAMIC_INSTANCES
+    // Flagged draws of this present (P2b, world_dynamic_expand.cs_5_0.hlsl): the same static traversal.
+    for (uint record_index = 0u; record_index < g_trace_dynamic_instance_count; ++record_index)
+    {
+        const WorldInstanceGPU instance = g_trace_dynamic_instances[record_index];
+        if (instance.header.w < 0.5) continue;
+        const uint mesh_id = (uint)instance.header.x;
+        if (mesh_id >= mesh_count)
+        {
+            counters.invalid_refs++;
+            continue;
+        }
+        if (TraceWorldInstance(instance, DYNAMIC_DRAW_FLAG | record_index, origin, direction, t_min, view, hidden_t, counters, best)
+            && any_hit)
+        {
+            break;
+        }
+    }
+#endif
+
     // Deforming meshes of this frame.
     for (uint object_index = 0u; object_index < g_trace_dynamic_count; ++object_index)
     {
@@ -650,43 +678,35 @@ WorldTraceHit TraceWorldRay(
         const BVHNodeGPU root = g_trace_dynamic_nodes[object.node_offset];
         float root_near;
         float root_far;
-        if (!AabbIntersect(origin, direction, root.bounds_min, root.bounds_max, t_min, best_t, root_near, root_far)) continue;
-        float object_t = best_t;
+        if (!AabbIntersect(origin, direction, root.bounds_min, root.bounds_max, t_min, best.t, root_near, root_far)) continue;
+        float object_t = best.t;
         uint object_prim = 0xFFFFFFFFu;
         float3 object_normal = float3(0.0, 0.0, 0.0);
         if (TraceDynamicBlas(object, origin, direction, t_min, object_t, counters, object_prim, object_normal))
         {
-            best_t = object_t;
-            best_instance = DYNAMIC_INSTANCE_FLAG | object_index;
-            best_mesh = DYNAMIC_MESH_MARKER;
-            best_prim = object_prim;
-            best_normal = object_normal;
-            best_hidden = 0u;
-            best_facing = 0.0;
-            best_material = 0u;
+            best.t = object_t;
+            best.instance = DYNAMIC_INSTANCE_FLAG | object_index;
+            best.mesh = DYNAMIC_MESH_MARKER;
+            best.prim = object_prim;
+            best.normal = object_normal;
+            best.hidden = 0u;
+            best.facing = 0.0;
+            best.material = 0u;
             if (any_hit) break;
         }
     }
 
     // A skipped hidden hit closer than the result (or than nothing) means the
     // game camera does not show the nearest BVH surface.
-    counters.camera_hidden = (best_hidden != 0u || hidden_t < best_t) ? 1u : 0u;
-    if (best_prim == 0xFFFFFFFFu)
+    counters.camera_hidden = (best.hidden != 0u || hidden_t < best.t) ? 1u : 0u;
+    if (best.prim == 0xFFFFFFFFu)
     {
         counters.misses = 1u;
         return hit;
     }
     counters.hits = 1u;
-    hit.t = best_t;
-    hit.instance = best_instance;
-    hit.mesh = best_mesh;
-    hit.prim = best_prim;
-    hit.position = origin + direction * best_t;
-    hit.normal = best_normal;
-    hit.hidden = best_hidden;
-    hit.facing = best_facing;
-    hit.material = best_material;
-    return hit;
+    best.position = origin + direction * best.t;
+    return best;
 }
 
 WorldTraceHit TraceWorldClosest(float3 origin, float3 direction, float t_min, float t_max, WorldCameraView view, out WorldTraceCounters counters)

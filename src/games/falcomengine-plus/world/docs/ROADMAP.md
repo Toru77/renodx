@@ -4,6 +4,62 @@ Canonical, editable version: the "Falcom Engine+ Ray Tracing Roadmap" doc (https
 
 This is the only handoff document for `world/`. Read "Current state" and "Reference" before working. The round-by-round history follows them. Project rules are in `../../AGENTS.md`.
 
+## Open problems (owner reports, 2026-10-14)
+
+Tick a box only after the owner confirms the fix in game. The harness is not enough. Evidence: `renodx-dev\falcomengine-plus\world\<folder>\` (`world_pool.json`, `world_pool_meshes.json`, `world_pool_instances.json`, `world_deform_live.json`).
+
+- [ ] P-1 `foliage_animate`: wind foliage is in the BVH but does not move. Cause: wind is admitted at its rest pose by design (`GatePoolDraw`, `bvh/bvh_pool.hpp`). Fix needs a design decision (Step 5).
+- [ ] P-2 `missing_random`: a mesh that should be in the BVH is missing. After a rebuild, a different object drops out instead. Cause (logs, confirmed): an alpha-texture conflict retires every instance of a mesh (`ApplyPoolMesh` dedup, `AbsorbPoolAlphaMaterial`, `MarkPoolMeshAlpha`). Fix: Step 2.
+- [ ] P-3 `dynamic_object_slow`: a sign moving in the wind updates slowly and leaves red/blue ghosts in the debug view, so RTAO over-darkens. Cause (likely): about 4 presents of pose latency (staging ring, resolve at F+2, BVH update at F+3), plus orphan ghosts kept for 60 frames. Fix: Steps 3 and 4.
+- [ ] P-4 `tree_leaves_missing`: tree leaves are not in the BVH. Cause (logs): the same alpha conflicts as P-2 (leaf meshes conflicted, `slice: -1`, `tlas_waiting`). The missing pixel is not yet identified. Fix: Step 2, then Step 3 to identify the pixel.
+- [x] P-5 `random_plane`: a plane/wall in interiors sits at the wrong position and shows red in the debug view. Cause (likely, inspect shows it 1207 frames stale): static instances are never retired on map change (`CompactPool`, mass-retirement branch only counts). Fix: Step 1.
+
+Also found (not owner reports, unchecked):
+- [ ] A-1 `world_pool.json` is invalid JSON in most dumps: `bvh_pool.hpp` writes `samples[s].matrix[k]` raw, so NaN prints as `nan`. Use `PoolJsonFloat`.
+- [ ] A-2 About 14 meshes fail capture in every log (9 with "vertex range larger than the mesh staging", indices that decode as float positions).
+- [ ] A-3 Follow-moving mode (`follow_moving`, commit d79c656e) is not described above. ROADMAP "Path 2" still says moving objects are absent until P2b. Update when Step 4 lands.
+
+## Work plan (2026-10-14)
+
+Order is set by the investigation. Each step has its own harness test and an in-game check. Steps touch `bvh_pool.hpp`, so they run one after another.
+
+Status (2026-10-14, implemented; harness green (12 programs PASS, full run); addon build exit 0; NOT yet validated in game, so no box is ticked):
+- Step 1 done: mass-retirement compaction drops static instances not seen in the last kPoolRecaptureFrames (counter `map_instances_retired`). Harness: test_pool.
+- Step 2 done: alpha-tested keys mix their material (view, threshold, scroll, swizzle) into the mesh signature, so different textures become separate meshes (counter `alpha_identity_meshes`; it counts alpha meshes created, not true splits). Harness: test_alpha TestAlphaSplit. One existing harness expectation changed: "note first" now expects two meshes, not a conflict (the conflict path is still covered by the capture-first and key-level cases). Slice and source counts will rise; watch `alpha_gpu.slices_used` against 256.
+- Step 3 done (diagnostics): per-VS alpha refusals and no-mesh sightings (`alpha_refusals_by_vs`), on-screen follow lag (`on_screen_lag_*`, panel "Follow lag"), missing-pixel candidate list in the inspect output. Harness: test_alpha TestRefusalsByVs. The candidate list has no nearest-instance fallback; the ray convention is verified by reading only.
+- Step 4 part (a) done: `RefitLiveTlasAfterDrain` runs after `DrainPoolScan` in the same present (saves one present on the TLAS). Not covered by a harness test yet.
+- Step 4 part (b) NOT implemented, deliberately: retiring a "superseded" dynamic instance at admission is not provable, because one mesh key can cover several real objects. The 60-frame hold stays. Revisit only with evidence from the on-screen lag and orphan counters.
+- Step 5: not decided; see Step 5 below.
+
+- [ ] Step 1: map-change retirement in `CompactPool`. When a mass retirement happens, remove instances not seen since the map change; their observations are cleared and they re-admit after fresh sightings. Harness: a `test_pool` case. Fixes: P-5 (and clears stale instances that pollute the other dumps).
+- [ ] Step 2: alpha material dedup. Mix the alpha texture identity into `PoolMeshSignature`, so the same geometry with different textures becomes separate meshes. Harness: `test_alpha` with two textures on identical geometry. Fixes: P-2, P-4.
+- [ ] Step 3: diagnostics. (a) per-VS alpha refusal counters and sightings with no mesh; (b) an inspect mode for "why is this pixel missing" (lists each pool instance along the ray with its status: in TLAS, conflicted, alpha waiting, hidden, failed mesh); (c) an on-screen follow-lag readout (frames since last follow, camera-seen instances only). Settles the wind-VS families and the missing pixel for P-4 and gives a measurement for P-3.
+- [ ] Step 4: sign latency. (a) dynamic-only refit in the same present after `DrainPoolScan`; (b) shorter orphan retirement: retire the old pose when a fresher instance of the same key is admitted. Harness: `test_deform_live`/`test_pool` case. Fixes: P-3 (partly). Full zero-latency path (P2b) is a separate milestone.
+- [ ] Step 5: foliage sway approach for P-1. Decision after Steps 1 to 4. Options: (a) keep rest pose and say so; (b) per-instance CPU sway approximation through `RefitLiveTlas`; (c) P2b-style draw-time copy. Owner decides.
+
+## Owner decisions and dump findings (2026-10-14, after first in-game round)
+
+In game: P-5 random_plane fixed (confirmed). P-2 missing_random not fixed. P-4 leaves are back in the BVH but do not animate. P-3 sign still lags, ghosts remain. P-1 foliage does not animate.
+
+Decisions:
+- Foliage/leaf animation (P-1, P-4): option (b), CPU approximation (rigid per-instance sway from the wind VS formula). Revisit later if the look is not good enough.
+- Sign lag and ghosts (P-3): P2b (draw-time copy path, zero latency) is the next milestone.
+
+Dumps analysed (folders under renodx-dev\falcomengine-plus\world\): foliage_animate, dynamic_object_slow, tree_leaves_not_animating, missing_random visible, missing_random not visible.
+
+Findings:
+- P-2 (missing_random): alpha conflicts are 0 in both dumps (`conflicts`, `meshes_conflicted`, `conflict_refused` all 0). The conflict hypothesis is ruled out as the cause. The missing mesh is not identified yet. Candidate causes from the failed mesh records:
+  - Index and vertex buffers that the game rewrites between captures. Several failures are "unstable: no two captures in a row decode to the same mesh" (vertex contents change every capture, e.g. VS 0x418A82E3, from_indirect true). This suggests dynamic or ring-buffer geometry.
+  - Index buffers that decode as float bit patterns ("vertex range larger than the mesh staging", raw indices like 1069547520, 3222274048; VS 0xE35C18B9 and 0xB7107E0D). The index read or buffer binding is wrong for these draws.
+  - The "not visible" pixel hit a 12-triangle mesh (uid 422, VS 0xE35C18B9) at 8.14 m while the game depth compare reads "missing". The candidate list shows 8 nearest instances, all in TLAS except one hidden. The object the owner expects is not among them yet.
+- The "not visible" dump has 20,506 admitted instances and writes 20,000 (dump cap). The cap can hide instances; 506 are missing from the file.
+- The `no_mesh` count is high for VS 0xB7107E0D (3,465 sightings in the "not visible" dump) and for 0x66A8F433 (12) etc. Only 1 alpha key has no mesh in that dump, so the count comes from sightings of few keys, probably ones waiting on a capture (mesh_queue 4). Not yet explained.
+- P-3 (sign): on_screen_lag_last 250 frames and on_screen_lag_max 608 in dynamic_object_slow. The sign's own instance (pool id 14226) was followed 3 frames ago, so the high lag comes from other camera-visible dynamic instances that stopped being followed. These stale camera-visible instances are the ghosts. They survive until the orphan hold (60 frames) and the orphan rule (fresher instance of the same key) release them.
+- P-4 (leaves): tree_leaves_not_animating has 47 alpha keys, 4 without a mesh, 1 wind key, and 1880 TLAS alpha instances. Leaves are admitted at their rest pose, as expected before the CPU sway (P-1).
+- P-1 (foliage): foliage_animate has 16 failed mesh captures (8 unstable, 8 vertex range). Foliage animation is the rest pose today; the CPU approximation (decision (b)) is next.
+
+Not yet done: the CPU sway approximation (decision (b)) and P2b. Both need a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
+
 ## Current state (2026-10-09)
 
 Goal: hardware-free (compute) ray tracing in Trails in the Sky 2nd Chapter (D3D11) on RenoDX, DevKit-gated (`falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`). All code is in `src/games/falcomengine-plus/world/`.

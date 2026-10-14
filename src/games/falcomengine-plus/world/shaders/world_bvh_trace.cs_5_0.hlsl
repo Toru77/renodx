@@ -26,6 +26,7 @@
 // surfaces (the ray continues behind them). alpha_tests and alpha_cut count
 // the cutout tests of alpha-tested foliage (world_bvh_trace.hlsli AlphaCutHit).
 
+#define WORLD_TRACE_DYNAMIC_INSTANCES
 #include "world_bvh_trace.hlsli"
 
 Texture2D<float4> g_game_depth : register(t9);
@@ -44,7 +45,7 @@ cbuffer cb_trace : register(b13)
     float4 g_depth_rect;  // valid game depth area in texels: x, y, width, height
     float4 g_inspect;     // x, y: pixel whose hit is reported; z > 0.5: report on
     float4 g_camera_view; // x > 0.5: hide what the game camera does not show; y: disableMapObjNearFade_g
-    uint4 g_dynamic;      // x: deforming objects bound at t11 (deform_live.hpp)
+    uint4 g_dynamic;      // x: deforming objects bound at t11 (deform_live.hpp); y: P2b records at t17 (dynamic_expand)
 };
 
 #define TRACE_STATS_COUNT 17u
@@ -181,6 +182,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         const float3 direction = normalize(far_point - origin);
 
         g_trace_dynamic_count = g_dynamic.x;
+        g_trace_dynamic_instance_count = g_dynamic.y;
         WorldCameraView view;
         view.hide = g_camera_view.x > 0.5;
         view.floor_value = g_camera_view.y;

@@ -14,6 +14,7 @@
 #include "../world_state.hpp"
 #include "../rtao/rtao_state.hpp"
 #include "../bvh/bvh_pool.hpp"
+#include "../bvh/bvh_live.hpp"
 #include "../bvh/deform_live.hpp"
 #include "../bvh/deform_probe.hpp"
 #include "../capture/buffer_readback.hpp"
@@ -470,6 +471,8 @@ inline void OnWorldPresent(
   if (queue == nullptr) return;
   ResolveIndirectDraws(queue);
   bvh::DrainPoolScan(queue->get_device(), queue);
+  bvh::ExpandLiveDynamic(queue->get_device(), queue);
+  bvh::RefitLiveTlasAfterDrain(queue->get_device(), queue);
   bvh::DrainDeformProbe(queue->get_device(), queue);
 }
 

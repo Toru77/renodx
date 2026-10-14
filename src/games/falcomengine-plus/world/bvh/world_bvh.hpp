@@ -227,6 +227,15 @@ inline void DrawBvhPanel() {
                         "leaves no copy behind where it stopped. Until the per-frame path exists, moving\n"
                         "objects are absent from the BVH. Off: admitted as before (applies at once).");
     }
+    bool dynamic_per_frame = g_pool.dynamic_per_frame.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Moving objects: per-frame (P2b)", &dynamic_per_frame)) {
+      g_pool.dynamic_per_frame.store(dynamic_per_frame, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Session only, default on. A moving mesh is copied at each draw and traced from the instances\n"
+                        "of this frame (zero latency). Off: the previous path, moving objects absent from the BVH.");
+    }
     bool alpha_foliage = g_pool.alpha_foliage.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Alpha-tested foliage (experimental)", &alpha_foliage)) {
       g_pool.alpha_foliage.store(alpha_foliage, std::memory_order_relaxed);
@@ -256,6 +265,16 @@ inline void DrawBvhPanel() {
       ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: wind "
                         "vertex shaders with an opaque pixel shader are admitted as a rigid rest pose instead of WindOpaque. "
                         "Off: their instances leave the BVH at the next present.");
+    }
+    bool wind_sway = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Wind sway (approximate, experimental)", &wind_sway)) {
+      g_pool.alpha_wind_sway.store(wind_sway, std::memory_order_relaxed);
+      switches_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Experimental, session only, default on. Approximation: wind rest poses are moved in the BVH by the "
+                        "wind vertex shader's sway at the instance origin (rigid, full amplitude). Off: they stay at their "
+                        "rest pose.");
     }
     bool log_crashes = CrashLogEnabled();
     if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
@@ -318,7 +337,7 @@ inline void DrawBvhPanel() {
   }
   if (switches_changed) LogPoolSwitches();
   if (do_dump) {
-    DumpWorldPool();
+    DumpWorldPool(g_bvh_trace.hide_camera_hidden.load(std::memory_order_relaxed));
     DumpDeformLive();
   }
   if (do_dump_obj) DumpWorldPoolObj();
@@ -371,6 +390,16 @@ inline void DrawBvhPanel() {
   ImGui::Text("Indirect/wind: indirect copies %llu, orphans expired %llu, wind rest draws %llu, wind refused off %llu",
               static_cast<unsigned long long>(stats.alpha_indirect_copies), static_cast<unsigned long long>(stats.alpha_orphans_expired),
               static_cast<unsigned long long>(stats.wind_rest_draws), static_cast<unsigned long long>(stats.wind_refused_off));
+  ImGui::Text("Wind sway: %s, swayed %u (last TLAS pass), max displacement %.3f m, amplitude bound %.3f m, unread draws %llu",
+              g_pool.alpha_wind_sway.load(std::memory_order_relaxed) ? "on" : "off", stats.wind_sway_instances,
+              stats.wind_sway_max_m, stats.wind_sway_bound_m, static_cast<unsigned long long>(stats.wind_sway_unread));
+  ImGui::Text("Moving objects (P2b): %s, copied %llu (this present %zu), refused %llu, deferred %llu, records %u (not resident %u), "
+              "arena %.1f KB, expand %.3f ms cpu, %.3f ms gpu",
+              g_pool.dynamic_per_frame.load(std::memory_order_relaxed) ? "per-frame" : "off",
+              static_cast<unsigned long long>(stats.dynamic_copied), stats.dynamic_draws,
+              static_cast<unsigned long long>(stats.dynamic_refused), static_cast<unsigned long long>(stats.dynamic_deferred),
+              stats.dynamic_records, stats.dynamic_not_resident, stats.dynamic_arena_bytes / 1024.0,
+              stats.dynamic_expand_cpu_ms, stats.dynamic_expand_gpu_ms);
   DrawDeformLivePanel(deform, deform_traced);
 
   ImGui::SeparatorText("GPU BVH (live)");
@@ -445,6 +474,8 @@ inline void DrawBvhPanel() {
   }
   ImGui::Text("CPU: meshes %.2f ms, TLAS %.2f ms (refit %.2f ms)",
               live_stats.mesh_ms_last, live_stats.tlas_ms_last, live_stats.refit_ms_last);
+  ImGui::Text("Follow lag (frames): on screen %u (max %u), all dynamic %u (max %u)", stats.on_screen_lag_last,
+              stats.on_screen_lag_max, live_stats.refit_lag_last, live_stats.refit_lag_max);
   ImGui::Text("GPU: deform refit %.3f ms, trace %.2f ms", deform_refit_ms, data->trace_timer.last_ms);
   ImGui::Text("Pool CPU per frame: hooks %.2f ms, drain %.2f ms, deform %.2f ms",
               static_cast<double>(g_pool.cpu_hook_frame_us.load(std::memory_order_relaxed)) / 1000.0,

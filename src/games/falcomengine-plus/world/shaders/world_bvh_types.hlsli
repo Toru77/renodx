@@ -9,6 +9,7 @@
 //   BVHNodeGPU       32 bytes
 //   BVHLeafGPU       48 bytes
 //   AlphaMaterialGPU 32 bytes
+//   DynamicDrawGPU   64 bytes
 
 struct WorldMeshGPU
 {
@@ -78,5 +79,18 @@ struct DynamicObjectGPU
     uint level_count;
 };
 
+// One flagged draw of this present (P2b, bvh_live.hpp ExpandLiveDynamic). info: x = float4 index of its copied
+// instance slice in the arena, y = instances to expand (indirect: the window), z = first output record, w = valid
+// (bit 0) | INSTANCE_* flags (camera visible 2, shadow caster 4). extra: x = indirect, y = float4 index of its
+// copied args, z = mesh id (live store slot). bbox: the mesh's local box.
+struct DynamicDrawGPU
+{
+    uint4 info;
+    uint4 extra;
+    float4 bbox_min;
+    float4 bbox_max;
+};
+
 #define DYNAMIC_INSTANCE_FLAG 0x80000000u  // hit.instance of a dynamic object
+#define DYNAMIC_DRAW_FLAG 0x40000000u      // hit.instance of a P2b record: | its output record index
 #define DYNAMIC_MESH_MARKER 0xFFFFFFFEu    // hit.mesh of a dynamic object

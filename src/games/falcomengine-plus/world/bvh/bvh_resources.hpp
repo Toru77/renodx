@@ -61,6 +61,17 @@ struct WorldInstanceGPU {
 static_assert(sizeof(WorldMeshGPU) == 64u, "WorldMeshGPU layout must match world_bvh_types.hlsli");
 static_assert(sizeof(WorldInstanceGPU) == 192u, "WorldInstanceGPU layout must match world_bvh_types.hlsli");
 
+// P2b (bvh_live.hpp ExpandLiveDynamic): one flagged draw of the present, as DynamicDrawGPU in world_bvh_types.hlsli.
+// info: x = float4 index of its arena slice, y = instances, z = first record, w = valid (bit 0) | kInstance* flags.
+// extra: x = indirect, y = float4 index of its args, z = mesh slot. bbox: the mesh's local box.
+struct DynamicDrawGPU {
+  uint32_t info[4];
+  uint32_t extra[4];
+  float bbox_min[4];
+  float bbox_max[4];
+};
+static_assert(sizeof(DynamicDrawGPU) == 64u, "DynamicDrawGPU layout must match world_bvh_types.hlsli");
+
 struct BvhTraceStats {
   uint32_t rays = 0u;
   uint32_t hits = 0u;
@@ -194,6 +205,8 @@ struct LiveTlasInstance {
   float inverse_world[16] = {};
   float bounds_min[3] = {};
   float bounds_max[3] = {};
+  float param2[3] = {};  // InstanceParam.param2 (wind sway)
+  bool wind = false;     // wind rest pose: matrix and bounds are its sway trace pose (ApplyPoolWindSway)
   uint32_t first_frame = 0u;
   uint32_t admit_frame = 0u;
   float admit_camera[3] = {};
@@ -219,6 +232,11 @@ struct BvhInspect {
   bool camera_hidden = false;  // the nearest surface is one the game camera does not show (shown, or skipped when hiding)
   bool hiding = false;         // the dispatch hid such surfaces
   std::vector<std::string> lines;
+  bool ray_valid = false;  // camera_ray: the trace camera and the pixel direction (DescribeLiveCandidates)
+  std::array<float, 3> ray_origin = {};
+  std::array<float, 3> ray_direction = {};
+  uint64_t crossing_instances = 0u;               // pool instances whose bounds the ray crosses
+  std::vector<PoolInspectCandidate> candidates;  // the nearest of them (kCandidateLines)
 };
 
 // GPU side of the atlas, owned by BvhDeviceData::alpha. Everything is null until the first
@@ -245,6 +263,25 @@ struct AlphaGpu {
   bool failure_logged = false;  // EnsureAlphaGpu logs its failure once (re-armed with the GPU objects)
 };
 
+// P2b (bvh_live.hpp ExpandLiveDynamic): the flagged draws of a present. The arena takes their instance slices and args
+// at the draw (copy_buffer_region, bvh_pool.hpp); the expansion writes the records the trace reads (t17).
+struct DynamicExpandGpu {
+  reshade::api::resource arena = {0u};  // raw float4 elements, kPoolDynamicArenaBytes
+  reshade::api::resource_view arena_srv = {0u};
+  reshade::api::resource draws = {0u};  // DynamicDrawGPU per draw of the present (uploaded each present)
+  reshade::api::resource_view draws_srv = {0u};
+  reshade::api::resource instances = {0u};  // WorldInstanceGPU records, kPoolDynamicInstances
+  reshade::api::resource_view instances_srv = {0u};
+  reshade::api::resource_view instances_uav = {0u};
+  reshade::api::pipeline_layout layout = {0u};
+  reshade::api::descriptor_table srv_table = {0u};  // t0 arena, t1 draws
+  reshade::api::descriptor_table uav_table = {0u};  // u0 instances
+  reshade::api::pipeline pipeline = {0u};
+  uint32_t instance_count = 0u;  // records of the last present (the trace reads them)
+  GpuTimer timer;                // the expansion pass (bvh_live.hpp ExpandLiveDynamic)
+  bool failure_logged = false;   // EnsureDynamicExpand logs its failure once
+};
+
 struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   // Live store (bvh_live.hpp).
   LiveArena vertices = MakeLiveArena(sizeof(float) * 4u);  // float4, w = 1
@@ -253,6 +290,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   LiveArena blas_nodes = MakeLiveArena(sizeof(BVHNodeGPU));
   LiveArena uvs = MakeLiveArena(sizeof(float) * 2u);  // float2, only meshes with UVs (alpha foliage)
   AlphaGpu alpha;  // atlas, materials and blit (alpha_live.hpp); empty while alpha_foliage is off
+  DynamicExpandGpu dynamic;  // P2b: flagged draws of the present, expanded (bvh_live.hpp)
   std::vector<LiveMeshSlot> slots;
   std::unordered_map<uint64_t, uint32_t> slot_by_uid;
   std::unordered_set<uint64_t> failed_uids;
@@ -287,6 +325,10 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   std::vector<uint32_t> tlas_leaf_of_instance;  // TLAS instance -> its leaf (sorted leaves)
   uint32_t tlas_dynamic_first = 0u;             // instances [first, end) are dynamic
   uint32_t tlas_refits_since_rebuild = 0u;
+  uint32_t tlas_wind_count = 0u;                // swayed wind instances in the TLAS (refit every present while > 0)
+  bool tlas_sway_on = false;                    // wind sway switch as the TLAS was built
+  bool tlas_per_frame = false;                  // P2b switch as the TLAS was built (flagged meshes left out when on)
+  uint64_t tlas_flag_revision = 0u;             // g_pool.dynamic_flag_revision the TLAS reflects
   bool tlas_refit_failed = false;               // the next TLAS update is a full rebuild
   uint64_t tlas_pool_revision = 0u;
   uint64_t tlas_visibility_revision = 0u;  // g_pool.visibility_revision the TLAS reflects
@@ -366,6 +408,7 @@ inline void DestroyLiveTlas(reshade::api::device* device, BvhDeviceData* data) {
   data->tlas_leaf_of_instance.clear();
   data->tlas_dynamic_first = 0u;
   data->tlas_refits_since_rebuild = 0u;
+  data->tlas_wind_count = 0u;
   data->tlas_built = false;
   data->active_count = 0u;
   data->bvh_ready = false;
@@ -421,11 +464,35 @@ inline void DestroyAlphaGpu(reshade::api::device* device, BvhDeviceData* data) {
   alpha.blits_frame = 0u;
 }
 
+// P2b GPU objects. The pool stops copying into the arena first (under its lock), then the objects go.
+inline void DestroyDynamicExpand(reshade::api::device* device, BvhDeviceData* data) {
+  DynamicExpandGpu& dynamic = data->dynamic;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.dynamic_arena = {0u};
+    g_pool.dynamic_draws.clear();
+    g_pool.dynamic_present.clear();
+    g_pool.dynamic_arena_used = 0u;
+    g_pool.dynamic_out_used = 0u;
+  }
+  if (dynamic.srv_table.handle != 0u) device->free_descriptor_table(dynamic.srv_table);
+  if (dynamic.uav_table.handle != 0u) device->free_descriptor_table(dynamic.uav_table);
+  if (dynamic.pipeline.handle != 0u) device->destroy_pipeline(dynamic.pipeline);
+  if (dynamic.layout.handle != 0u) device->destroy_pipeline_layout(dynamic.layout);
+  DestroyBuffer(device, &dynamic.arena_srv, &dynamic.arena);
+  DestroyBuffer(device, &dynamic.draws_srv, &dynamic.draws);
+  DestroyBuffer(device, &dynamic.instances_srv, nullptr);
+  DestroyBuffer(device, &dynamic.instances_uav, &dynamic.instances);
+  if (dynamic.timer.created) DestroyGpuTimer(&dynamic.timer);
+  dynamic = {};
+}
+
 inline void DestroyBvhDeviceData(reshade::api::device* device) {
   for (const reshade::api::resource proxy : TakePoolAlphaProxies(true)) device->destroy_resource(proxy);
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr) return;
   DestroyAlphaGpu(device, data);
+  DestroyDynamicExpand(device, data);
   DestroyLiveStore(device, data);
   if (data->trace_pipeline.handle != 0u) {
     device->destroy_pipeline(data->trace_pipeline);

@@ -302,6 +302,47 @@ int main() {
     CHECK(bvh::g_pool.indirect_refs.empty(), "refs released on reset (%zu)", bvh::g_pool.indirect_refs.size());
   }
 
+  HStage("P2b: a flagged indirect draw is recorded, its args copied to the arena");
+  // "indirect 3" (vb_a, args at offset 0) is flagged moving; its next indirect draw is recorded (no matrix) and the
+  // args bytes are copied into the arena at the draw.
+  {
+    resource dynamic_arena = {0u};
+    dev.create_resource(resource_desc(bvh::kPoolDynamicArenaBytes, memory_heap::gpu_only, resource_usage::shader_resource | resource_usage::copy_dest),
+                        nullptr, resource_usage::general, &dynamic_arena);
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb_a.handle}; draw.vb_stride = fixture::kStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {fixture::kLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.depth_enable = true; draw.depth_write = true;
+    draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = kRigid; draw.ps_pipeline = kOpaque; draw.vs_hash = 0x1000u;
+    const uint64_t identity = bvh::PoolMeshKey(draw);  // the draw's identity at the draw (its args are not known then)
+    std::vector<Object> only;
+    { Object o{"indirect 3", vb_a.handle, 3}; o.indirect = true; o.args_instances = 3; o.x = 100; o.args_offset = 0; only.push_back(o); }
+    for (int i = 0; i < 40; ++i) run_frame(frame + i + 1, only);  // the earlier stages reset the pool: admit it again
+    uint64_t mesh_key = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.dynamic_arena = dynamic_arena;
+      const auto learned = bvh::g_pool.dynamic_indirect.find(identity);
+      CHECK(learned != bvh::g_pool.dynamic_indirect.end(), "P2b: the indirect identity is learned at resolve");
+      if (learned != bvh::g_pool.dynamic_indirect.end()) mesh_key = learned->second;
+      CHECK(bvh::g_pool.mesh_by_key.count(mesh_key) != 0u, "P2b: the indirect object's mesh is in the pool");
+      if (bvh::g_pool.mesh_by_key.count(mesh_key) != 0u) bvh::MarkPoolMeshDynamic(bvh::g_pool.mesh_by_key.at(mesh_key));
+    }
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 0u, 1u, 20u);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.dynamic_draws.size() == 1u, "P2b: one record for the flagged indirect draw (%zu)", bvh::g_pool.dynamic_draws.size());
+      if (bvh::g_pool.dynamic_draws.size() == 1u) {
+        const bvh::PoolDynamicDraw& d = bvh::g_pool.dynamic_draws[0];
+        CHECK(d.mesh_key == mesh_key && d.indirect && d.args_offset == 0u && d.count >= 1u, "P2b indirect record: key, indirect, args offset");
+        CHECK(std::memcmp(dev.res[dynamic_arena.handle].bytes.data() + d.args, dev.res[args.handle].bytes.data(), 20) == 0,
+              "P2b indirect copy: args bytes in the arena");
+      }
+    }
+    bvh::DrainPoolScan(&dev, &queue);
+  }
+
   bvh::DumpWorldPool();
   bvh::OnDestroyDevicePool(&dev);
   std::printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAILED", g_failures);

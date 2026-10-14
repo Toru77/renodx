@@ -1527,6 +1527,8 @@ int main() {
   Stage("8g static instance flips to dynamic");
   // 8g. A static instance that turns dynamic through the follow path: the flip bumps
   // the revision, so the next rebuild partitions it and its TLAS entry follows its pose.
+  // The P2a path (per-frame switch off): with it on, flagged meshes are left out of the TLAS (8h).
+  bvh::g_pool.dynamic_per_frame.store(false);
   {
     const uint64_t kF = 0xF7;
     AddMesh(kF, Grid(8, 8, 4.f, 0.6f));
@@ -1546,11 +1548,44 @@ int main() {
     present();
     CHECK(data->live.gpu_ok, "GPU check after the flip: %s", data->live.gpu_result.c_str());
   }
+  bvh::g_pool.dynamic_per_frame.store(true);
+
+  Stage("8h per-frame: a flagged mesh is left out of the TLAS; the switch off puts it back");
+  // 8h. P2b (default on): a flagged mesh's instances are drawn per frame, not traced from the TLAS.
+  {
+    const uint64_t kG = 0xFA;
+    AddMesh(kG, Grid(7, 9, 4.f, 0.6f));  // distinct content: identical meshes share one slot
+    AddInstance(kG, 5.f, 0.f, 5.f);
+    AddInstance(kG, -4.f, 0.f, 3.f);
+    uint64_t uid = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const uint32_t mesh_id = bvh::g_pool.mesh_by_key.at(kG);
+      bvh::g_pool.meshes[mesh_id].dynamic = true;
+      bvh::g_pool.dynamic_flag_revision += 1u;
+      uid = bvh::g_pool.meshes[mesh_id].uid;
+    }
+    const auto in_tlas = [&]() {
+      size_t count = 0u;
+      for (const auto& info : data->tlas_info) count += info.uid == uid ? 1u : 0u;
+      return count;
+    };
+    for (int i = 0; i < 3; ++i) present();
+    CHECK(in_tlas() == 0u, "P2b: flagged mesh left out of the TLAS (%zu)", in_tlas());
+    bvh::g_pool.dynamic_per_frame.store(false);
+    present();
+    CHECK(in_tlas() == 2u, "switch off at once: P2a path keeps its instances (%zu)", in_tlas());
+    bvh::g_pool.dynamic_per_frame.store(true);
+    present();
+    CHECK(in_tlas() == 0u, "switch on at once: left out again (%zu)", in_tlas());
+    CHECK(CompareTraces(dev, *data, "per-frame", 40, 22) == 0, "trace agrees with the per-frame switch");
+  }
 
   RetireMesh(0xF6);
   RetireMesh(0xF7);
   RetireMesh(0xF8);
   RetireMesh(0xF9);
+  RetireMesh(0xFA);
   for (int i = 0; i < 9; ++i) present();
 
   Stage("9 requested reset");

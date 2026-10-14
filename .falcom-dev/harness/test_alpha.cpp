@@ -4,6 +4,7 @@
 // OFF) through OnPoolScanDraw. The GPU stage (source copies, atlas, blit, freeing) runs on the mock
 // device through UpdateLiveBvh. The trace is not exercised here.
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -542,7 +543,7 @@ static void TestMeshConflict() {
   Capture(0x2001, 12.f, true);
   CHECK(p.meshes[MeshOf(0x2001)].alpha && !p.meshes[MeshOf(0x2001)].alpha_state.conflict, "note first: flagged at capture, no conflict yet");
   Capture(0x2002, 12.f, true);
-  CHECK(p.meshes[MeshOf(0x2001)].alpha_state.conflict, "note first: mesh conflict at the second capture");
+  CHECK(MeshOf(0x2002) != MeshOf(0x2001) && !p.meshes[MeshOf(0x2002)].alpha_state.conflict, "note first: different materials split, no conflict");
 
   // Same material on both keys: no conflict.
   Capture(0x3001, 13.f, true);
@@ -571,6 +572,37 @@ static void TestMeshConflict() {
   pool::CompactPool();
   CHECK(!p.meshes[MeshOf(0x5003)].alpha && !p.meshes[MeshOf(0x5003)].alpha_state.conflict, "CompactPool clears when no alpha key maps to it");
 
+  pool::g_pool.alpha_foliage.store(true);
+}
+
+// Equal geometry with different alpha materials gives two meshes (no conflict, both admitted);
+// an equal material still merges.
+static void TestAlphaSplit() {
+  pool::ResetWorldPool();
+  pool::g_pool.alpha_foliage.store(true);
+  std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+  auto& p = pool::g_pool;
+  auto admit = [&](uint64_t key) {
+    pool::ObservedInstance observed;
+    observed.matrix[0] = observed.matrix[5] = observed.matrix[10] = 1.f;
+    observed.matrix[3] = 5.f;
+    return pool::AdmitPoolInstance(observed, key, MeshOf(key));
+  };
+
+  pool::NotePoolAlphaMaterial(0x6001, Mat(0x100, 0.5f));
+  Capture(0x6001, 17.f, true);
+  pool::NotePoolAlphaMaterial(0x6002, Mat(0x101, 0.5f));
+  Capture(0x6002, 17.f, true);
+  CHECK(MeshOf(0x6001) != MeshOf(0x6002), "different textures, same geometry: two meshes (%u, %u)", MeshOf(0x6001), MeshOf(0x6002));
+  CHECK(p.meshes[MeshOf(0x6001)].uid != p.meshes[MeshOf(0x6002)].uid, "distinct uids");
+  CHECK(!p.meshes[MeshOf(0x6001)].alpha_state.conflict && !p.meshes[MeshOf(0x6002)].alpha_state.conflict, "no mesh conflict");
+  CHECK(admit(0x6001) && admit(0x6002) && p.instances.size() == 2u, "both admitted");
+  CHECK(p.stats.alpha_identity_meshes == 2u, "two meshes with alpha identity: %u", p.stats.alpha_identity_meshes);
+
+  pool::NotePoolAlphaMaterial(0x6003, Mat(0x101, 0.5f));
+  Capture(0x6003, 17.f, true);
+  CHECK(MeshOf(0x6003) == MeshOf(0x6002), "same material: merged into the mesh of 0x6002");
+  CHECK(p.stats.alpha_identity_meshes == 2u, "merge adds no mesh: %u", p.stats.alpha_identity_meshes);
   pool::g_pool.alpha_foliage.store(true);
 }
 
@@ -2337,7 +2369,7 @@ static void TestMapsAndSharedHold(Device& dev, CmdList& cl, Queue& queue) {
 // Test 10 (S6 diagnostics): the dump order puts the alpha and wind rest-pose instances first beyond the instance cap, and
 // the parallel vectors (visibility, last_seen) move with their instances.
 static void TestDiagnosticsRound() {
-  const size_t count = pool::kPoolDumpMaxInstances + 50u;
+  const size_t count = 20000u + 50u;  // beyond the former instance cap
   std::vector<uint8_t> first(count, 0u);
   for (size_t i = count - 5u; i < count; ++i) first[i] = 1u;  // the last five instances are alpha or wind rest pose
   const std::vector<size_t> order = pool::PoolDumpOrder(first);
@@ -2366,6 +2398,362 @@ static void TestDiagnosticsRound() {
   }
   CHECK(moved_together && ids2[0] == 7u && ids2[1] == 10u && ids2[2] == 0u,
         "visibility and last_seen move with their instances; flagged first (%u %u %u)", ids2[0], ids2[1], ids2[2]);
+}
+
+// Per-VS alpha refusals and no-mesh sightings (alpha_refusals_by_vs in world_pool.json).
+static void TestRefusalsByVs() {
+  pool::ResetWorldPool();
+  pool::g_pool.alpha_foliage.store(false);
+  const uint32_t vs = 0x1234u;
+  float world[16] = {};
+  world[0] = world[5] = world[10] = world[15] = 1.f;
+  world[3] = 5.f;
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    Capture(0xE701, 7.f, true);
+    pool::NotePoolAlphaMaterial(0xE701, Mat(0x100, 0.5f));
+    pool::NotePoolAlphaMaterial(0xE702, Mat(0x100, 0.5f));  // alpha key with no mesh
+    for (uint32_t frame = 1u; frame <= pool::kPoolStableObservations; ++frame) {
+      pool::ObservePoolInstance(0xE701, vs, world, frame);
+      pool::ObservePoolInstance(0xE702, vs, world, frame);
+    }
+    const auto it = pool::g_pool.alpha_refusals_by_vs.find(vs);
+    CHECK(it != pool::g_pool.alpha_refusals_by_vs.end() && it->second.refused_off == 1u && it->second.no_mesh == 1u,
+          "per-VS: refused_off and no_mesh counted for the VS hash");
+  }
+  pool::DumpWorldPool();
+  std::ifstream summary(pool::PoolOutputDir() / "world_pool.json");
+  const std::string summary_text((std::istreambuf_iterator<char>(summary)), std::istreambuf_iterator<char>());
+  CHECK(summary_text.find("\"alpha_refusals_by_vs\": [\n    {\"vs_hash\": \"" + pool::PoolHashText(vs)
+                          + "\", \"refused_off\": 1, \"conflict\": 0, \"no_uv\": 0, \"admitted\": 0, \"no_mesh\": 1}")
+            != std::string::npos,
+        "summary: alpha_refusals_by_vs carries the per-VS counts");
+  pool::ResetWorldPool();
+  CHECK(pool::g_pool.alpha_refusals_by_vs.empty(), "ResetWorldPool clears the per-VS counts");
+}
+
+// A nan or inf number token anywhere in the dump (JSON numbers are finite or null).
+static bool HasNonFiniteToken(const std::string& text) {
+  for (const std::string token : {"nan", "inf"}) {
+    for (size_t at = text.find(token); at != std::string::npos; at = text.find(token, at + 1)) {
+      const bool before = at == 0u || !std::isalnum(static_cast<unsigned char>(text[at - 1]));
+      const size_t end = at + token.size();
+      const bool after = end >= text.size() || !std::isalnum(static_cast<unsigned char>(text[end]));
+      if (before && after) return true;
+    }
+  }
+  return false;
+}
+
+// failed_meshes_detail and alpha_no_mesh_keys (world_pool.json): a failed mesh with its reason and history, and the no-mesh state of its alpha key.
+static void TestFailureDetail() {
+  pool::ResetWorldPool();
+  const uint32_t vs = 0x5678u;
+  float world[16] = {};
+  world[0] = world[5] = world[10] = world[15] = 1.f;
+  const std::string failed_key = "\"key\": \"" + renodx::utils::log::AsHex(uint64_t{0xF001u}) + "\"";
+  const std::string idle_key = "\"key\": \"" + renodx::utils::log::AsHex(uint64_t{0xF002u}) + "\"";
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    pool::NotePoolAlphaMaterial(0xF001, Mat(0x100, 0.5f));  // alpha key with no mesh, and the failed mesh
+    pool::NotePoolAlphaMaterial(0xF002, Mat(0x100, 0.5f));  // alpha key with no mesh, no failure
+    pool::PoolMeshRequest request;
+    request.mesh_key = 0xF001;
+    request.vs_hash = vs;
+    request.captures = 2u;
+    request.records.emplace_back().frame = 7u;
+    pool::RecordPoolMeshFailure(request, "test failure");
+    for (uint32_t frame = 1u; frame <= pool::kPoolStableObservations; ++frame) {
+      pool::ObservePoolInstance(0xF001, vs, world, frame);
+      pool::ObservePoolInstance(0xF002, vs, world, frame);
+    }
+  }
+  pool::DumpWorldPool();
+  std::ifstream summary(pool::PoolOutputDir() / "world_pool.json");
+  const std::string text((std::istreambuf_iterator<char>(summary)), std::istreambuf_iterator<char>());
+  const size_t detail = text.find("\"failed_meshes_detail\": [");
+  CHECK(detail != std::string::npos && text.find(failed_key, detail) != std::string::npos
+            && text.find("\"reason\": \"test failure\"", detail) != std::string::npos
+            && text.find("\"history\": [{\"frame\": 7", detail) != std::string::npos,
+        "failed_meshes_detail: key, reason and a history entry");
+  const size_t no_mesh = text.find("\"alpha_no_mesh_keys\": [");
+  const size_t failed_entry = text.find(failed_key, no_mesh);
+  const size_t idle_entry = text.find(idle_key, no_mesh);
+  CHECK(no_mesh != std::string::npos && failed_entry != std::string::npos && idle_entry != std::string::npos
+            && text.substr(failed_entry, text.find('}', failed_entry) - failed_entry).find("\"state\": \"failed\"") != std::string::npos
+            && text.substr(idle_entry, text.find('}', idle_entry) - idle_entry).find("\"state\": \"none\"") != std::string::npos,
+        "alpha_no_mesh_keys: failed key state failed, idle key state none");
+  CHECK(!HasNonFiniteToken(text), "world_pool.json has no nan or inf token");
+  pool::ResetWorldPool();
+  CHECK(pool::g_pool.no_mesh_keys.empty() && pool::g_pool.no_mesh_keys_dropped == 0u, "ResetWorldPool clears the no-mesh keys");
+}
+
+// stale_dynamic and dynamic camera_visible_instances (world_pool.json): a camera-visible dynamic instance not followed for more
+// than kPoolDumpStaleFrames frames is listed, a fresh one and a camera-hidden one are not, and every dynamic key is written.
+static void TestStaleDynamic() {
+  pool::ResetWorldPool();
+  pool::g_pool.alpha_foliage.store(false);
+  const uint32_t frame = 100u;
+  falcom_world::g_state.frame.store(frame);
+  const uint64_t stale_key = 0xF101u, fresh_key = 0xF102u, hidden_key = 0xF103u;
+  uint64_t stale_id = 0u;
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    const auto add = [&](uint64_t key, uint32_t last_follow, bool camera_seen) {
+      Capture(key, 6.f, false);
+      pool::WorldInstance instance;
+      instance.mesh_id = MeshOf(key);
+      instance.mesh_key = key;
+      instance.dynamic = true;
+      instance.admit_frame = last_follow;
+      instance.last_follow_frame = last_follow;
+      instance.follows = 3u;
+      instance.id = pool::g_pool.next_instance_id++;
+      pool::g_pool.instances.push_back(instance);
+      pool::g_pool.dynamic_keys[key] = pool::PoolDynamicMesh{};
+      if (camera_seen) {
+        pool::ObservedInstance& observed =
+            pool::g_pool.observations[pool::InstanceKey{key, falcom_world::MatrixHash(instance.matrix, pool::kPoolWorldFloats)}];
+        observed.camera_sightings = 1u;
+        observed.last_camera_frame = last_follow;
+        observed.last_frame = last_follow;
+      }
+      return instance.id;
+    };
+    stale_id = add(stale_key, 10u, true);
+    add(fresh_key, 95u, true);
+    add(hidden_key, 10u, false);
+  }
+  pool::DumpWorldPool();
+  std::ifstream summary(pool::PoolOutputDir() / "world_pool.json");
+  const std::string text((std::istreambuf_iterator<char>(summary)), std::istreambuf_iterator<char>());
+  bool orphan = false;
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    const auto newest = pool::PoolNewestSeenByKey();
+    for (const auto& instance : pool::g_pool.instances) {
+      if (instance.id == stale_id) orphan = pool::PoolInstanceIsOrphan(instance, frame, newest);
+    }
+  }
+  const size_t section = text.find("\"stale_dynamic\": [");
+  const size_t section_end = section == std::string::npos ? std::string::npos : text.find("\n  ],", section);
+  const std::string stale_text = section_end == std::string::npos ? std::string() : text.substr(section, section_end - section);
+  CHECK(text.find("\"stale_dynamic_count\": 1, \"stale_dynamic_dropped\": 0,") != std::string::npos,
+        "stale_dynamic: one stale instance, none dropped");
+  CHECK(stale_text.find("\"pool_id\": " + std::to_string(stale_id) + ",") != std::string::npos
+            && stale_text.find("\"pool_id\": ", stale_text.find("\"pool_id\": ") + 1) == std::string::npos,
+        "stale_dynamic holds exactly the stale instance");
+  CHECK(stale_text.find("\"frames_since_follow\": 90, \"follows\": 3, \"orphan\": " + std::string(orphan ? "true" : "false")) != std::string::npos,
+        "stale_dynamic entry: frames since follow, follows and orphan as computed");
+  const size_t dynamic = text.find("\"dynamic\": {\"keys\": 3,");
+  CHECK(dynamic != std::string::npos, "dynamic: all three keys written");
+  const auto segment = [&](uint64_t key) {
+    const size_t at = text.find("\"mesh_key\": \"" + renodx::utils::log::AsHex(key) + "\"", dynamic);
+    return at == std::string::npos ? std::string() : text.substr(at, text.find("\"world\"", at) - at);
+  };
+  CHECK(segment(stale_key).find("\"camera_visible_instances\": 1,") != std::string::npos, "dynamic: stale key counts 1 camera-visible instance");
+  CHECK(segment(fresh_key).find("\"camera_visible_instances\": 1,") != std::string::npos, "dynamic: fresh key counts 1 camera-visible instance");
+  CHECK(segment(hidden_key).find("\"camera_visible_instances\": 0,") != std::string::npos, "dynamic: hidden key counts 0 camera-visible instances");
+  CHECK(!HasNonFiniteToken(text), "world_pool.json has no nan or inf token (stale_dynamic)");
+  pool::ResetWorldPool();
+}
+
+// Wind sway (approximate, experimental). The expected offset is written here from the reference VS
+// (reference/.dumps/foliage_0xA77D908A.vs_5_0.hlsl, lines 153-196, flexibility 1), independently of pool_transform.hpp.
+struct SwayInputs {
+  float time, wave_time, freq, force, dir[3], scale, speed, shake_freq, wind_scale;
+};
+
+static void ReferenceWindSway(const SwayInputs& w, const float origin[3], const float param2[3], float out[3]) {
+  const float along = origin[0] * w.dir[0] + origin[1] * w.dir[1] + origin[2] * w.dir[2];
+  const float gust = 1.f - std::pow(std::sin(w.wave_time - w.freq * along) * 0.5f + 0.5f, 7.f);
+  for (int k = 0; k < 3; ++k) {
+    const float wave = std::sin(origin[k] * w.shake_freq + w.time * w.speed + gust * w.force);
+    const float gravity = k == 1 ? -0.0098f : 0.f;
+    out[k] = w.force * gust * (w.scale * w.dir[k] * wave + w.dir[k] * w.wind_scale) + gravity + param2[k];
+  }
+}
+
+static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
+  RegisterUvLayout();
+  auto& p = pool::g_pool;
+  pool::BvhDeviceData* data = pool::GetBvhDeviceData(&dev);
+  pool::ResetWorldPool();
+  p.scan_active.store(true);
+  p.exclude_moving.store(false);
+  p.follow_moving.store(false);
+  p.alpha_foliage.store(true);
+  p.alpha_wind_opaque.store(true);
+  p.alpha_wind_sway.store(true);
+
+  const uint64_t kWind = 0xE1, kOpaque = 0xE2;
+  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kOpaque, "0x2162672F.ps.cso", false);
+
+  resource t15, b0, b1, b5, vb, ib;
+  dev.create_resource(resource_desc(4096 * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc scene_desc(1296, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc material_desc(160, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(scene_desc, nullptr, resource_usage::general, &b0);
+  dev.create_resource(material_desc, nullptr, resource_usage::general, &b5);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, scene_desc, nullptr, resource_usage::general, b0);
+  falcom_world::OnInitResourceCbTracker(&dev, material_desc, nullptr, resource_usage::general, b5);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  const auto box = fixture::Box(1.f);
+  for (size_t i = 0; i < box.positions.size(); ++i) {
+    const auto& position = box.positions[i];
+    const float vertex[5] = {position[0], position[1], position[2], position[1] * 0.5f + 0.5f, position[2] * 0.5f + 0.5f};
+    std::memcpy(dev.res[vb.handle].bytes.data() + i * kUvStride, vertex, sizeof(vertex));
+  }
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+
+  // cb_scene wind values and cb_local shake values, written as the game would and mirrored by the tracker.
+  SwayInputs sway{3.0f, 1.2f, 0.8f, 0.5f, {0.6f, 0.f, 0.8f}, 0.3f, 2.0f, 0.7f, 0.2f};
+  const auto write_cbs = [&](const SwayInputs& w) {
+    std::vector<uint8_t> scene(1296u, 0u);
+    std::vector<uint8_t> material(160u, 0u);
+    std::memcpy(scene.data() + 428, &w.time, sizeof(float));
+    std::memcpy(scene.data() + 448, w.dir, sizeof(w.dir));
+    std::memcpy(scene.data() + 504, &w.wave_time, sizeof(float));
+    std::memcpy(scene.data() + 508, &w.freq, sizeof(float));
+    std::memcpy(scene.data() + 748, &w.force, sizeof(float));
+    std::memcpy(material.data() + 116, &w.scale, sizeof(float));
+    std::memcpy(material.data() + 120, &w.speed, sizeof(float));
+    std::memcpy(material.data() + 128, &w.shake_freq, sizeof(float));
+    std::memcpy(material.data() + 132, &w.wind_scale, sizeof(float));
+    std::memcpy(dev.res[b0.handle].bytes.data(), scene.data(), scene.size());
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, scene.data(), b0, 0, UINT64_MAX);
+    std::memcpy(dev.res[b5.handle].bytes.data(), material.data(), material.size());
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, material.data(), b5, 0, UINT64_MAX);
+  };
+  write_cbs(sway);
+
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[0] = b0;
+  cl_data.vs_cb[1] = b1;
+  cl_data.vs_cb[5] = b5;
+  const auto make_draw = [&]() {
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb.handle}; draw.vb_stride = kUvStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kUvLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0; draw.instance_count = 1;
+    draw.depth_enable = true; draw.depth_write = true; draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = kWind; draw.ps_pipeline = kOpaque; draw.vs_hash = static_cast<uint32_t>(kWind);
+    return draw;
+  };
+  const float kOrigin[3] = {10.f, 0.f, 0.f};
+  const float kParam2[3] = {0.1f, 0.f, 0.2f};
+  uint64_t cursor = 0;
+  const auto draw_once = [&]() {
+    if (cursor + 1 >= 4096) cursor = 0;
+    const float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 48, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 148, kParam2, sizeof(kParam2));
+    const int32_t cb[4] = {static_cast<int32_t>(cursor), 0, 0, 0};
+    std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+    auto draw = make_draw();
+    pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+    cursor += 8;
+  };
+  const auto present = [&](int count) {
+    for (int i = 0; i < count; ++i) {
+      draw_once();
+      falcom_world::g_state.frame.fetch_add(1u);
+      pool::DrainPoolScan(&dev, &queue);
+      pool::UpdateLiveBvh(&dev, &queue);
+    }
+  };
+  const uint64_t wind_key = pool::PoolMeshKey(make_draw());
+  // Admission and the mesh upload need several presents; the wind instance then enters the TLAS (swayed).
+  present(60);
+  const auto wind_index = [&]() -> int {
+    for (size_t i = 0; i < data->tlas_info.size(); ++i) {
+      if (data->tlas_info[i].mesh_key == wind_key) return static_cast<int>(i);
+    }
+    return -1;
+  };
+  CHECK(p.wind_keys.count(wind_key) == 1u && p.wind_sway.count(wind_key) == 1u, "wind sway: wind key with sway inputs");
+  CHECK(data->tlas_sway_on && data->tlas_wind_count == 1u, "wind sway: one swayed wind instance in the TLAS (sway %d, wind %u)",
+        data->tlas_sway_on ? 1 : 0, data->tlas_wind_count);
+  int idx = wind_index();
+  CHECK(idx >= 0 && static_cast<size_t>(idx) < data->tlas_instances_cpu.size(), "wind sway: wind instance in the TLAS (index %d)", idx);
+  if (idx < 0) return;
+
+  // Two times: the TLAS translation equals the rest translation plus the reference offset, refitted each present.
+  const auto check_time = [&](const char* label, const SwayInputs& w) {
+    float expect[3] = {};
+    ReferenceWindSway(w, kOrigin, kParam2, expect);
+    const float* world = data->tlas_instances_cpu[idx].world;
+    const float got[3] = {world[3], world[7], world[11]};
+    float magnitude = 0.f;
+    for (int k = 0; k < 3; ++k) magnitude += expect[k] * expect[k];
+    CHECK(std::fabs(got[0] - kOrigin[0] - expect[0]) < 1e-4f && std::fabs(got[1] - kOrigin[1] - expect[1]) < 1e-4f
+              && std::fabs(got[2] - kOrigin[2] - expect[2]) < 1e-4f,
+          "%s: TLAS translation (%f %f %f) = rest + reference offset (%f %f %f)", label, got[0], got[1], got[2], expect[0], expect[1],
+          expect[2]);
+    CHECK(std::sqrt(magnitude) > 0.01f, "%s: the offset is not trivial (%f m)", label, std::sqrt(magnitude));
+    // Leaf and descriptor bounds contain the swayed rest bounds.
+    const pool::WorldInstance* rest = nullptr;
+    for (const pool::WorldInstance& instance : p.instances) {
+      if (instance.mesh_key == wind_key) rest = &instance;
+    }
+    CHECK(rest != nullptr, "%s: rest instance found", label);
+    if (rest == nullptr) return;
+    const auto& leaf = data->tlas_leaves_cpu[data->tlas_leaf_of_instance[idx]];
+    bool contained = true;
+    for (int k = 0; k < 3; ++k) {
+      const float lo = rest->bounds_min[k] + expect[k];
+      const float hi = rest->bounds_max[k] + expect[k];
+      contained = contained && data->tlas_instances_cpu[idx].bounds_min[k] <= lo && data->tlas_instances_cpu[idx].bounds_max[k] >= hi
+                  && leaf.bounds_min[k] <= lo && leaf.bounds_max[k] >= hi;
+    }
+    CHECK(contained, "%s: descriptor and leaf bounds contain the swayed bounds", label);
+    CHECK(std::fabs(p.stats.wind_sway_max_m - std::sqrt(magnitude)) < 1e-4f, "%s: max displacement stat %f = %f", label,
+          p.stats.wind_sway_max_m, std::sqrt(magnitude));
+    float bound_expect = 0.f;
+    for (int k = 0; k < 3; ++k) {
+      const float gravity = k == 1 ? 0.0098f : 0.f;
+      bound_expect = (std::max)(bound_expect, std::fabs(w.force) * (std::fabs(w.scale) + std::fabs(w.wind_scale)) * std::fabs(w.dir[k])
+                                                  + gravity + std::fabs(kParam2[k]));
+    }
+    CHECK(std::fabs(p.stats.wind_sway_bound_m - bound_expect) < 1e-4f && p.stats.wind_sway_instances == 1u,
+          "%s: amplitude bound stat %f = %f, one instance swayed", label, p.stats.wind_sway_bound_m, bound_expect);
+  };
+  check_time("t1", sway);
+
+  SwayInputs later = sway;
+  later.time = sway.time + 0.5f;
+  write_cbs(later);
+  present(1);
+  idx = wind_index();
+  check_time("t2 (refit)", later);
+
+  // Switch OFF: the rest pose exactly, and the TLAS rebuilt at once without the sway.
+  p.alpha_wind_sway.store(false);
+  present(1);
+  idx = wind_index();
+  CHECK(idx >= 0 && !data->tlas_sway_on && data->tlas_wind_count == 0u, "switch off: no swayed instance (sway %d, wind %u)",
+        data->tlas_sway_on ? 1 : 0, data->tlas_wind_count);
+  if (idx >= 0) {
+    const float* world = data->tlas_instances_cpu[idx].world;
+    CHECK(world[3] == kOrigin[0] && world[7] == kOrigin[1] && world[11] == kOrigin[2], "switch off: rest translation (%f %f %f)",
+          world[3], world[7], world[11]);
+    CHECK(p.stats.wind_sway_instances == 0u && p.stats.wind_sway_max_m == 0.f, "switch off: no sway counted");
+  }
+
+  // Switch back ON: the sway returns at once.
+  p.alpha_wind_sway.store(true);
+  present(1);
+  idx = wind_index();
+  check_time("switch on", later);
+  pool::ResetWorldPool();
 }
 
 int main() {
@@ -2412,8 +2800,12 @@ int main() {
   TestPixelUnknownLog(dev, cl);
   HStage("admission");
   TestAdmit();
+  TestRefusalsByVs();
+  TestFailureDetail();
+  TestStaleDynamic();
   HStage("mesh conflict");
   TestMeshConflict();
+  TestAlphaSplit();
   HStage("uv layout diagnostics");
   TestUvLayoutDiag();
   TestColor1Layout();
@@ -2431,6 +2823,8 @@ int main() {
   TestUvStreamMismatch();
   HStage("wind scan path");
   TestWindScanPath(dev, cl, queue);
+  HStage("wind sway");
+  TestWindSway(dev, cl, queue);
   HStage("color1 scan path");
   TestColor1ScanPath(dev, cl, queue, true);
   TestColor1ScanPath(dev, cl, queue, false);

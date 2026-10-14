@@ -482,6 +482,9 @@ inline void SyncLiveMeshes(
 // ---------------------------------------------------------------------------
 // TLAS.
 
+// Refit every present while swayed wind instances are in the TLAS (the sway moves them every frame).
+inline bool WindSwayPending(const BvhDeviceData& data) { return data.tlas_sway_on && data.tlas_wind_count != 0u; }
+
 inline const char* LiveTlasChange(const BvhDeviceData& data, uint64_t revision, uint64_t visibility_revision,
                                   const PoolRegion& region) {
   if (data.live.tlas_rebuilds == 0u && !data.tlas_built && data.tlas_pool_revision == 0u) return "first build";
@@ -493,6 +496,7 @@ inline const char* LiveTlasChange(const BvhDeviceData& data, uint64_t revision, 
     return "region moved";
   }
   if (data.tlas_alpha_mode != AlphaMode()) return "alpha switch";
+  if (data.tlas_sway_on != g_pool.alpha_wind_sway.load(std::memory_order_relaxed)) return "sway switch";
   return nullptr;
 }
 
@@ -522,6 +526,34 @@ inline void FillInstanceVisibility(const PoolCameraVisibility& visibility, float
 
 inline uint32_t InstanceVisibilityFlags(const WorldInstanceGPU& instance) {
   return static_cast<uint32_t>(instance.visibility[2] + 0.5f);
+}
+
+// Caller holds g_pool.mutex. The trace pose of a wind rest-pose instance: its rest pose (copy already holds it)
+// with the translation moved by the sway at its origin (WindSwayDisplacement, flexibility 1), and the leaf
+// bounds inflated by the amplitude bound (WindSwayBound). The rest pose stays in WorldInstance (the observation
+// key). Rest pose when the switch is off or its key has no sway inputs.
+inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& instance) {
+  copy->wind = false;
+  if (!g_pool.alpha_wind_sway.load(std::memory_order_relaxed)) return;
+  const auto sway = g_pool.wind_sway.find(instance.mesh_key);
+  if (sway == g_pool.wind_sway.end() || g_pool.wind_keys.count(instance.mesh_key) == 0u) return;
+  copy->wind = true;
+  const float origin[3] = {instance.matrix[3], instance.matrix[7], instance.matrix[11]};
+  float displacement[3] = {};
+  float bound[3] = {};
+  WindSwayDisplacement(sway->second, origin, instance.param2, displacement);
+  WindSwayBound(sway->second, instance.param2, bound);
+  for (int k = 0; k < 3; ++k) {
+    copy->matrix[3 + 4 * k] = origin[k] + displacement[k];
+    copy->bounds_min[k] -= bound[k];
+    copy->bounds_max[k] += bound[k];
+  }
+  ComputeMatrixInverse(copy->matrix, copy->inverse_world);
+  g_pool.stats.wind_sway_instances += 1u;
+  g_pool.stats.wind_sway_max_m = (std::max)(g_pool.stats.wind_sway_max_m,
+                                            std::sqrt(displacement[0] * displacement[0] + displacement[1] * displacement[1]
+                                                      + displacement[2] * displacement[2]));
+  for (int k = 0; k < 3; ++k) g_pool.stats.wind_sway_bound_m = (std::max)(g_pool.stats.wind_sway_bound_m, bound[k]);
 }
 
 // The TLAS descriptor of one instance, for the mesh slot its uid resolves to.
@@ -561,18 +593,24 @@ inline void RebuildLiveTlas(
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;
   uint64_t dynamic_revision = 0u;
+  uint64_t flag_revision = 0u;
+  const bool per_frame = g_pool.dynamic_per_frame.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     revision = g_pool.revision;
     visibility_revision = g_pool.visibility_revision;
     dynamic_revision = g_pool.dynamic_revision;
+    flag_revision = g_pool.dynamic_flag_revision;
+    g_pool.stats.wind_sway_instances = 0u;
+    g_pool.stats.wind_sway_max_m = 0.f;
+    g_pool.stats.wind_sway_bound_m = 0.f;
     for (const WorldInstance& instance : g_pool.instances) {
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
+      if (per_frame && g_pool.meshes[instance.mesh_id].dynamic) continue;  // P2b: drawn per frame, not in the TLAS
       LiveTlasInstance& copy = snapshot.emplace_back();
       copy.uid = g_pool.meshes[instance.mesh_id].uid;
       copy.alpha = g_pool.meshes[instance.mesh_id].alpha;
       copy.id = instance.id;
-      copy.dynamic = instance.dynamic;
       copy.mesh_key = instance.mesh_key;
       copy.vs_hash = instance.source_vs_hash;
       copy.first_frame = instance.first_frame;
@@ -586,11 +624,16 @@ inline void RebuildLiveTlas(
       std::memcpy(copy.bounds_min, instance.bounds_min, sizeof(copy.bounds_min));
       std::memcpy(copy.bounds_max, instance.bounds_max, sizeof(copy.bounds_max));
       copy.visibility = GetPoolCameraVisibility(instance);
+      std::memcpy(copy.param2, instance.param2, sizeof(copy.param2));
+      ApplyPoolWindSway(&copy, instance);
+      copy.dynamic = instance.dynamic || copy.wind;  // swayed wind instances are refitted every present
     }
   }
   std::stable_partition(snapshot.begin(), snapshot.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; });
   // The switch is read once: the TLAS reflects it (commit), so a later switch is seen as a change.
   const uint8_t alpha_mode = AlphaMode();
+  const bool sway_on = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
+  uint32_t wind_count = 0u;
   // What this TLAS reflects; recorded only once it is in place, so a failed
   // build is retried (after kLiveRetryFrames).
   const uint64_t store_version = data->store_version;
@@ -598,8 +641,12 @@ inline void RebuildLiveTlas(
     data->tlas_pool_revision = revision;
     data->tlas_visibility_revision = visibility_revision;
     data->tlas_dynamic_revision = dynamic_revision;
+    data->tlas_per_frame = per_frame;
+    data->tlas_flag_revision = flag_revision;
     data->tlas_store_version = store_version;
     data->tlas_alpha_mode = alpha_mode;
+    data->tlas_sway_on = sway_on;
+    data->tlas_wind_count = wind_count;
     data->tlas_region_size = region.size;
     std::memcpy(data->tlas_region_min, region.min, sizeof(data->tlas_region_min));
     data->tlas_refit_failed = false;
@@ -648,6 +695,7 @@ inline void RebuildLiveTlas(
     leaves.push_back(MakeLeaf(instance.bounds_min, instance.bounds_max, static_cast<uint32_t>(instances.size())));
     instances.push_back(descriptor);
     info.push_back(instance);
+    if (instance.wind) wind_count += 1u;
   }
   stats.tlas_waiting = waiting;
   stats.tlas_unusable = unusable;
@@ -760,9 +808,13 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   uint64_t dynamic_revision = 0u;
   uint32_t missing = 0u;
   uint32_t lag = 0u;
+  uint32_t on_screen_lag = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     dynamic_revision = g_pool.dynamic_revision;
+    g_pool.stats.wind_sway_instances = 0u;
+    g_pool.stats.wind_sway_max_m = 0.f;
+    g_pool.stats.wind_sway_bound_m = 0.f;
     for (uint32_t i = data->tlas_dynamic_first; i < updated.size(); ++i) {
       LiveTlasInstance& copy = updated[i];
       // Pool instances are kept sorted by ascending id (test_motion checks it).
@@ -778,7 +830,11 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
       std::memcpy(copy.bounds_min, instance.bounds_min, sizeof(copy.bounds_min));
       std::memcpy(copy.bounds_max, instance.bounds_max, sizeof(copy.bounds_max));
       copy.visibility = GetPoolCameraVisibility(instance);
-      if (frame > instance.last_follow_frame) lag = (std::max)(lag, frame - instance.last_follow_frame);
+      ApplyPoolWindSway(&copy, instance);
+      if (frame > instance.last_follow_frame) {
+        lag = (std::max)(lag, frame - instance.last_follow_frame);
+        if (copy.visibility.camera_seen) on_screen_lag = (std::max)(on_screen_lag, frame - instance.last_follow_frame);
+      }
     }
   }
   const auto finish = [&]() {
@@ -861,6 +917,11 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   stats.refit_instances = changed;
   stats.refit_lag_last = lag;
   stats.refit_lag_max = (std::max)(stats.refit_lag_max, lag);
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.on_screen_lag_last = on_screen_lag;
+    g_pool.stats.on_screen_lag_max = (std::max)(g_pool.stats.on_screen_lag_max, on_screen_lag);
+  }
   finish();
 }
 
@@ -1090,6 +1151,119 @@ inline void DescribeLiveCameraView(const LiveTlasInstance& info, BvhInspect& ins
   }
 }
 
+// Inspect lines for a pixel with no BVH hit, or whose hit the depth compare calls missing or extra: the pool instances
+// whose bounds the pixel's primary ray crosses (nearest first, up to 8), each with its state. The game depth point is
+// not read back, so the ray (trace camera position and the trace shader's pixel direction) is the only geometry.
+inline void DescribeLiveCandidates(BvhDeviceData* data) {
+  constexpr size_t kCandidateLines = 8u;
+  BvhInspect& inspect = data->inspect;
+  const bool compare_differs = inspect.compare_class == 8u || inspect.compare_class == 9u;  // missing, extra
+  if (!inspect.valid || data->debug_width == 0u || data->debug_height == 0u) return;
+  float origin[3] = {};
+  TraceCameraPosition(origin);
+  const float ndc_x = (static_cast<float>(inspect.x) + 0.5f) / static_cast<float>(data->debug_width) * 2.f - 1.f;
+  const float ndc_y = 1.f - (static_cast<float>(inspect.y) + 0.5f) / static_cast<float>(data->debug_height) * 2.f;
+  float far_h[4] = {};
+  {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    const float* m = g_state.camera.view_proj_inv;  // mul(float4(ndc, 0, 1), view_proj_inv) as the trace shader does it
+    for (uint32_t j = 0u; j < 4u; ++j) far_h[j] = ndc_x * m[j * 4u] + ndc_y * m[j * 4u + 1u] + m[j * 4u + 3u];
+  }
+  float direction[3] = {far_h[0] / far_h[3] - origin[0], far_h[1] / far_h[3] - origin[1], far_h[2] / far_h[3] - origin[2]};
+  const float length = std::sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]);
+  for (float& d : direction) d /= length;
+  inspect.ray_valid = true;
+  std::copy(std::begin(origin), std::end(origin), inspect.ray_origin.begin());
+  std::copy(std::begin(direction), std::end(direction), inspect.ray_direction.begin());
+  if (inspect.hit && !compare_differs) return;
+
+  struct Crossing {
+    float entry;
+    size_t index;
+  };
+  std::vector<Crossing> crossings;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    for (size_t i = 0u; i < g_pool.instances.size(); ++i) {
+      const WorldInstance& instance = g_pool.instances[i];
+      float t_min = 0.f;
+      float t_max = 1e30f;
+      bool crosses = true;
+      for (int k = 0; k < 3 && crosses; ++k) {
+        const float inv = 1.f / direction[k];
+        float a = (instance.bounds_min[k] - origin[k]) * inv;
+        float b = (instance.bounds_max[k] - origin[k]) * inv;
+        if (a > b) std::swap(a, b);
+        t_min = (std::max)(t_min, a);
+        t_max = (std::min)(t_max, b);
+        crosses = t_min <= t_max;
+      }
+      if (crosses) crossings.push_back({t_min, i});
+    }
+  }
+  std::sort(crossings.begin(), crossings.end(), [](const Crossing& a, const Crossing& b) { return a.entry < b.entry; });
+  inspect.crossing_instances = crossings.size();
+  if (crossings.empty()) {
+    inspect.lines.push_back("No pool instance's bounds lie along this pixel's ray.");
+    return;
+  }
+  inspect.lines.push_back(LiveFormat("Pool instances whose bounds this pixel's ray crosses: %u (nearest %u listed).",
+                                     static_cast<uint32_t>(crossings.size()),
+                                     static_cast<uint32_t>((std::min)(crossings.size(), kCandidateLines))));
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    for (size_t n = 0u; n < crossings.size() && n < kCandidateLines; ++n) {
+      const WorldInstance& instance = g_pool.instances[crossings[n].index];
+      if (instance.mesh_id >= g_pool.meshes.size()) continue;
+      const WorldMesh& mesh = g_pool.meshes[instance.mesh_id];
+      const bool camera_seen = GetPoolCameraVisibility(instance).camera_seen;
+      const auto tlas = std::find_if(data->tlas_info.begin(), data->tlas_info.end(),
+                                     [&](const LiveTlasInstance& entry) { return entry.id == instance.id; });
+      PoolInspectCandidate& candidate = inspect.candidates.emplace_back();
+      candidate.instance_id = instance.id;
+      candidate.mesh_key = instance.mesh_key;
+      candidate.mesh_uid = mesh.uid;
+      candidate.vs_hash = instance.source_vs_hash;
+      candidate.entry = crossings[n].entry;
+      candidate.tlas_index = tlas != data->tlas_info.end() ? static_cast<int64_t>(tlas - data->tlas_info.begin()) : -1;
+      if (g_pool.failed_meshes.count(instance.mesh_key) != 0u) {
+        candidate.status = "failed_mesh";
+        candidate.reason = "failed mesh";
+      } else if (mesh.alpha && mesh.alpha_state.conflict) {
+        candidate.status = "conflicted";
+        candidate.reason = "conflicted";
+      } else if (!camera_seen && inspect.hiding) {
+        candidate.status = "hidden";
+        candidate.reason = "hidden (the game camera does not show it)";
+      } else if (instance.dynamic) {
+        candidate.status = "dynamic";
+        candidate.reason = "dynamic";
+      } else if (tlas != data->tlas_info.end()) {
+        candidate.status = "in_tlas";
+        candidate.reason = LiveFormat("in TLAS (index %u)", static_cast<uint32_t>(candidate.tlas_index));
+      } else if (data->slot_by_uid.count(mesh.uid) == 0u) {
+        candidate.status = "not_uploaded";
+        candidate.reason = "not in TLAS (mesh not uploaded)";
+      } else if (mesh.alpha && !g_pool.alpha_foliage.load(std::memory_order_relaxed)) {
+        candidate.status = "alpha_foliage_off";
+        candidate.reason = "not in TLAS (alpha_foliage off)";
+      } else if (mesh.alpha && data->alpha.slot_of_uid.count(mesh.uid) == 0u) {
+        candidate.status = "alpha_waiting";
+        candidate.reason = "alpha waiting (no slice, tlas_waiting)";
+      } else {
+        candidate.status = "outside_region";
+        candidate.reason = "not in TLAS (outside the region)";
+      }
+    }
+  }
+  for (const PoolInspectCandidate& candidate : inspect.candidates) {
+    inspect.lines.push_back(LiveFormat("Candidate pool id %llu, mesh uid %llu, VS 0x%08X: %s.",
+                                       static_cast<unsigned long long>(candidate.instance_id),
+                                       static_cast<unsigned long long>(candidate.mesh_uid), candidate.vs_hash,
+                                       candidate.reason.c_str()));
+  }
+}
+
 inline void DescribeLiveInspect(BvhDeviceData* data) {
   BvhInspect& inspect = data->inspect;
   inspect.lines.clear();
@@ -1223,11 +1397,181 @@ inline void DescribeLiveInspect(BvhDeviceData* data) {
       inspect.lines.push_back("No map change seen since the pool started.");
     }
   }
+  DescribeLiveCandidates(data);
   for (const std::string& line : inspect.lines) renodx::utils::log::i("[world-bvh] inspect: ", line);
 }
 
 // ---------------------------------------------------------------------------
 // Per present.
+
+// P2b GPU objects: the arena (the copy destination of the flagged draws, bvh_pool.hpp), the draw table, the records
+// and the expansion pass. Created once; the pool gets the arena handle under its lock.
+inline bool EnsureDynamicExpand(reshade::api::device* device, BvhDeviceData* data) {
+  DynamicExpandGpu& dynamic = data->dynamic;
+  using RU = reshade::api::resource_usage;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using DR = reshade::api::descriptor_range;
+  using P = reshade::api::pipeline_layout_param;
+  DR srv_range = {0, 0, 0, 2, DS::all_compute, 1, DT::shader_resource_view};
+  DR uav_range = {0, 0, 0, 1, DS::all_compute, 1, DT::unordered_access_view};
+  reshade::api::constant_range push_range = {};
+  push_range.binding = 0;
+  push_range.dx_register_index = 0;
+  push_range.dx_register_space = 0;
+  push_range.count = 4;
+  push_range.visibility = DS::all_compute;
+  P params[3] = {};
+  params[0].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[0].descriptor_table.count = 1;
+  params[0].descriptor_table.ranges = &srv_range;
+  params[1].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[1].descriptor_table.count = 1;
+  params[1].descriptor_table.ranges = &uav_range;
+  params[2].type = reshade::api::pipeline_layout_param_type::push_constants;
+  params[2].push_constants = push_range;
+
+  bool ready =
+      (dynamic.arena.handle != 0u
+       || CreatePoolBuffer(device, nullptr, kPoolDynamicArenaBytes, 16u, &dynamic.arena, &dynamic.arena_srv,
+                           RU::shader_resource | RU::copy_dest))
+      && (dynamic.draws.handle != 0u
+          || CreatePoolBuffer(device, nullptr, kPoolMaxDynamicDraws * sizeof(DynamicDrawGPU), sizeof(DynamicDrawGPU),
+                              &dynamic.draws, &dynamic.draws_srv, RU::shader_resource | RU::copy_dest))
+      && (dynamic.instances.handle != 0u
+          || CreatePoolBuffer(device, nullptr, kPoolDynamicInstances * sizeof(WorldInstanceGPU), sizeof(WorldInstanceGPU),
+                              &dynamic.instances, &dynamic.instances_uav, RU::shader_resource | RU::unordered_access))
+      && (dynamic.instances_srv.handle != 0u
+          || device->create_resource_view(
+                 dynamic.instances, RU::shader_resource,
+                 reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::unknown, 0,
+                                                  kPoolDynamicInstances),
+                 &dynamic.instances_srv))
+      && (dynamic.layout.handle != 0u || device->create_pipeline_layout(3, params, &dynamic.layout));
+  ready = ready && (dynamic.srv_table.handle != 0u || device->allocate_descriptor_table(dynamic.layout, 0, &dynamic.srv_table));
+  ready = ready && (dynamic.uav_table.handle != 0u || device->allocate_descriptor_table(dynamic.layout, 1, &dynamic.uav_table));
+#if defined(__world_dynamic_expand_EMBED_FILE)
+  if (ready && dynamic.pipeline.handle == 0u) {
+    reshade::api::shader_desc shader = {};
+    shader.code = __world_dynamic_expand.data();
+    shader.code_size = __world_dynamic_expand.size();
+    shader.entry_point = "main";
+    reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
+    ready = device->create_pipeline(dynamic.layout, 1, &subobject, &dynamic.pipeline);
+  }
+#else
+  ready = false;
+#endif
+  if (!ready) {
+    if (!dynamic.failure_logged) {  // retried every present: logged once
+      dynamic.failure_logged = true;
+      renodx::utils::log::w("[world-bvh] P2b: GPU objects not created (arena ", dynamic.arena.handle != 0u, ", pipeline ",
+                            dynamic.pipeline.handle != 0u, ")");
+    }
+    return false;
+  }
+  const reshade::api::resource_view srvs[2] = {dynamic.arena_srv, dynamic.draws_srv};
+  const reshade::api::descriptor_table_update srv_update = {dynamic.srv_table, 0, 0, 2, DT::shader_resource_view, srvs};
+  const reshade::api::descriptor_table_update uav_update = {dynamic.uav_table, 0, 0, 1, DT::unordered_access_view,
+                                                            &dynamic.instances_uav};
+  device->update_descriptor_tables(1, &srv_update);
+  device->update_descriptor_tables(1, &uav_update);
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.dynamic_arena = dynamic.arena;
+  }
+  return true;
+}
+
+// P2b, per present (OnWorldPresent, after DrainPoolScan): expands the flagged draws of the present into the records the
+// trace reads (t17; their count goes in g_dynamic.y). Their slices and args were copied at the draws (bvh_pool.hpp). A
+// draw whose mesh is not resident in the live store gets an invalid entry, so its records are skipped by the trace.
+inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::command_queue* queue) {
+  if (device == nullptr || queue == nullptr) return;
+  BvhDeviceData* data = GetBvhDeviceData(device);
+  if (data == nullptr) return;
+  DynamicExpandGpu& dynamic = data->dynamic;
+  dynamic.instance_count = 0u;
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<DynamicDrawGPU> table;
+  uint32_t records = 0u;
+  uint32_t not_resident = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    std::vector<PoolDynamicDraw> draws;
+    draws.swap(g_pool.dynamic_present);
+    for (const PoolDynamicDraw& draw : draws) {
+      DynamicDrawGPU entry = {};
+      uint32_t slot = 0u;
+      bool resident = false;
+      const auto mesh = g_pool.mesh_by_key.find(draw.mesh_key);
+      if (mesh != g_pool.mesh_by_key.end() && mesh->second < g_pool.meshes.size()) {
+        const auto slot_it = data->slot_by_uid.find(g_pool.meshes[mesh->second].uid);
+        resident = slot_it != data->slot_by_uid.end() && slot_it->second < data->descriptor_count
+                   && slot_it->second < data->slots.size() && data->slots[slot_it->second].live;
+        if (resident) slot = slot_it->second;
+      }
+      if (!resident) not_resident += 1u;
+      entry.info[0] = static_cast<uint32_t>(draw.arena / 16u);
+      entry.info[1] = draw.count;
+      entry.info[2] = draw.out;
+      entry.info[3] = (resident ? 1u : 0u)
+                      | ((draw.pass & kPoolPassCamera) != 0u ? kInstanceCameraVisible : 0u)
+                      | ((draw.pass & kPoolPassLight) != 0u ? kInstanceShadowCaster : 0u);
+      entry.extra[0] = draw.indirect ? 1u : 0u;
+      entry.extra[1] = static_cast<uint32_t>(draw.args / 16u);
+      entry.extra[2] = slot;
+      if (resident) {
+        for (int k = 0; k < 3; ++k) {
+          entry.bbox_min[k] = data->slots[slot].bbox_min[k];
+          entry.bbox_max[k] = data->slots[slot].bbox_max[k];
+        }
+      }
+      table.push_back(entry);
+      records = draw.out + draw.count;  // records are reserved in draw order
+    }
+    g_pool.stats.dynamic_records = records;
+    g_pool.stats.dynamic_not_resident = not_resident;
+    g_pool.stats.dynamic_expand_cpu_ms = LiveElapsedMs(start);
+    g_pool.stats.dynamic_expand_gpu_ms = dynamic.timer.last_ms;
+  }
+  if (!g_live_bvh.enabled.load(std::memory_order_relaxed) || !EnsureDynamicExpand(device, data)) return;
+  auto* cmd_list = queue->get_immediate_command_list();
+  if (cmd_list == nullptr || table.empty()) return;
+
+  using RU = reshade::api::resource_usage;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  std::string error;
+  if (!WriteBufferRange(device, cmd_list, dynamic.draws, sizeof(DynamicDrawGPU), 0u, table.data(),
+                        table.size() * sizeof(DynamicDrawGPU), &error)) {
+    renodx::utils::log::w("[world-bvh] P2b: draw table not written: ", error);
+    return;
+  }
+  BeginGpuTimer(device, cmd_list, &dynamic.timer);
+  cmd_list->barrier(dynamic.arena, RU::copy_dest, RU::shader_resource);
+  cmd_list->barrier(dynamic.draws, RU::copy_dest, RU::shader_resource);
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, dynamic.pipeline);
+  const reshade::api::descriptor_table tables[2] = {dynamic.srv_table, dynamic.uav_table};
+  cmd_list->bind_descriptor_tables(DS::all_compute, dynamic.layout, 0, 2, tables);
+  const uint32_t draw_count = static_cast<uint32_t>(table.size());
+  const bool legacy = g_pool.legacy_scale.load(std::memory_order_relaxed);
+  float constants[4] = {};
+  std::memcpy(&constants[0], &draw_count, sizeof(uint32_t));
+  constants[1] = legacy ? kPoolLegacyMinScale : kPoolMinScale;
+  constants[2] = legacy ? kPoolLegacyMaxScale : kPoolMaxScale;
+  constants[3] = kPoolMaxPosition;
+  cmd_list->push_constants(DS::all_compute, dynamic.layout, 2, 0, 4, constants);
+  cmd_list->dispatch(draw_count, 1u, 1u);
+  // Unbind the records' UAV: the trace binds them as SRV t17.
+  const reshade::api::resource_view null_uav = {0u};
+  const reshade::api::descriptor_table_update unbind = {dynamic.uav_table, 0, 0, 1, DT::unordered_access_view, &null_uav};
+  device->update_descriptor_tables(1, &unbind);
+  cmd_list->bind_descriptor_tables(DS::all_compute, dynamic.layout, 1, 1, &dynamic.uav_table);
+  cmd_list->barrier(dynamic.instances, RU::unordered_access, RU::shader_resource);
+  EndGpuTimer(cmd_list, &dynamic.timer);
+  dynamic.instance_count = records;
+}
 
 inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_queue* queue) {
   if (device == nullptr || queue == nullptr) return;
@@ -1249,11 +1593,14 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     uint64_t revision = 0u;
     uint64_t visibility_revision = 0u;
     uint64_t dynamic_revision = 0u;
+    uint64_t flag_revision = 0u;
+    const bool per_frame = g_pool.dynamic_per_frame.load(std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       revision = g_pool.revision;
       visibility_revision = g_pool.visibility_revision;
       dynamic_revision = g_pool.dynamic_revision;
+      flag_revision = g_pool.dynamic_flag_revision;
     }
     stage.Set("live bvh: meshes");
     // Pool changes (retirements) are handled at once; pending uploads wait
@@ -1266,16 +1613,22 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     stage.Set("live bvh: tlas");
     const PoolRegion region = CurrentPoolRegion();
     const char* change = LiveTlasChange(*data, revision, visibility_revision, region);
+    // P2b: the switch and a change of the flagged meshes change what the TLAS holds: applied at once, like alpha OFF.
+    const bool per_frame_switched = data->tlas_per_frame != per_frame;
+    const bool flags_changed = per_frame && data->tlas_flag_revision != flag_revision;
+    if (change == nullptr && (per_frame_switched || flags_changed)) change = per_frame_switched ? "per-frame switch" : "flagged meshes";
     // OFF drops the alpha instances at once, whatever else changed (the reason is not the test).
     const bool alpha_off_now = (data->tlas_alpha_mode & ~AlphaMode()) != 0u;
+    // The sway switch moves wind instances between their rest and sway poses (and partitions): applied at once, like alpha OFF.
+    const bool sway_switched = data->tlas_sway_on != g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
     if (change != nullptr && frame >= data->tlas_retry_frame
         && (data->live.tlas_rebuilds == 0u || frame - data->live.tlas_frame >= kLiveTlasInterval || frame < data->live.tlas_frame
-            || alpha_off_now)) {
+            || alpha_off_now || sway_switched || per_frame_switched || flags_changed)) {
       RebuildLiveTlas(device, data, region, frame, change);
     } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
       RebuildLiveTlas(device, data, region, frame, "refit failed");
     } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_store_version == data->store_version
-               && data->tlas_dynamic_revision != dynamic_revision) {
+               && (data->tlas_dynamic_revision != dynamic_revision || WindSwayPending(*data))) {
       if (data->tlas_refits_since_rebuild >= kLiveTlasRefitsPerRebuild) {
         RebuildLiveTlas(device, data, region, frame, "refit quality");
       } else {
@@ -1290,4 +1643,26 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
   }
 }
 
+// Per present, after DrainPoolScan (OnWorldPresent): the dynamic-only refit, so the poses
+// resolved by the drain reach the TLAS in this present. Same gates as the refit branch of
+// UpdateLiveBvh; it never rebuilds (UpdateLiveBvh does, in the next present, when one is due).
+inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::command_queue* queue) {
+  if (device == nullptr || queue == nullptr) return;
+  BvhDeviceData* data = GetBvhDeviceData(device);
+  if (data == nullptr || !g_live_bvh.enabled.load(std::memory_order_relaxed)) return;
+  auto* cmd_list = queue->get_immediate_command_list();
+  if (cmd_list == nullptr) return;
+  const uint32_t frame = g_state.frame.load();
+  uint64_t dynamic_revision = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    dynamic_revision = g_pool.dynamic_revision;
+  }
+  if (data->tlas_built && frame >= data->tlas_retry_frame && !data->tlas_refit_failed
+      && data->tlas_store_version == data->store_version && data->tlas_dynamic_revision != dynamic_revision
+      && (data->tlas_dynamic_revision != dynamic_revision || WindSwayPending(*data))
+      && data->tlas_refits_since_rebuild < kLiveTlasRefitsPerRebuild && (data->tlas_alpha_mode & ~AlphaMode()) == 0u) {
+    RefitLiveTlas(device, cmd_list, data, frame);
+  }
+}
 }  // namespace falcom_world::bvh

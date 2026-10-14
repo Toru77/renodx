@@ -268,6 +268,54 @@ int main() {
     }
   }
 
+  HStage("map change retires stale static instances");
+  // "S stale" is admitted, then no longer drawn; "C" and "J" keep being drawn.
+  dev.next = 0x10000000000ull;  // fresh handles: the reuse test above rewinds next onto live pool buffers
+  resource vb_s;
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_s);
+  fixture::WriteVertices(dev.res[vb_s.handle].bytes, fixture::Box(7.f));
+  objects.push_back({"S stale", vb_s.handle, 0, kRigid, kOpaque, {{300, 0, 0}}});
+  for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s.handle; }), objects.end());
+  for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+  // 32 more meshes, then released in one compaction (a map change).
+  std::vector<resource> mass(32);
+  for (size_t i = 0; i < mass.size(); ++i) {
+    dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &mass[i]);
+    fixture::WriteVertices(dev.res[mass[i].handle].bytes, fixture::Box(20.f + static_cast<float>(i)));
+    objects.push_back({"M map", mass[i].handle, 0, kRigid, kOpaque, {{400.f + static_cast<float>(i), 0, 0}}});
+  }
+  for (int i = 0; i < 100; ++i) run_frame(frame++, false);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    std::printf("before map change: meshes %zu instances %zu\n", bvh::g_pool.meshes.size(), bvh::g_pool.instances.size());
+    CHECK(bvh::g_pool.stats.mass_retirements == 0u, "no map change yet (%u)", bvh::g_pool.stats.mass_retirements);
+  }
+  for (resource& r : mass) bvh::OnDestroyResourcePool(&dev, r);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.name == std::string("M map"); }), objects.end());
+  for (resource& r : mass) dev.destroy_resource(r);
+  run_frame(frame++, false);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    std::printf("after map change: mass_retirements %u map_instances_retired %u meshes %zu instances %zu\n",
+                p.stats.mass_retirements, p.stats.map_instances_retired, p.meshes.size(), p.instances.size());
+    CHECK(p.stats.mass_retirements == 1u, "one map change (%u)", p.stats.mass_retirements);
+    CHECK(p.stats.map_instances_retired == 1u, "one stale instance dropped (%u)", p.stats.map_instances_retired);
+    CHECK(p.instances.size() == 2, "instances %zu", p.instances.size());
+    bool stale_present = false, recent_c = false, recent_j = false;
+    for (auto& inst : p.instances) {
+      stale_present |= inst.matrix[3] == 300.f;
+      recent_c |= inst.matrix[3] == 30.f;
+      recent_j |= inst.matrix[3] == 90.f;
+    }
+    CHECK(!stale_present, "stale instance gone");
+    CHECK(recent_c && recent_j, "recent instances survive");
+    for (auto& [key, observed] : p.observations) {
+      if (observed.matrix[3] == 300.f) CHECK(!observed.admitted, "stale observation not admitted");
+    }
+  }
+
   {  // CB mirror: device update, deferred update, map/unmap, reset
     CmdList deferred; deferred.dev = &dev;
     int32_t v7[4] = {7}, v9[4] = {9}, v11[4] = {11};
