@@ -315,7 +315,7 @@ int main() {
     draw.index_size = 2; draw.dsv = {0x77}; draw.depth_enable = true; draw.depth_write = true;
     draw.topology = primitive_topology::triangle_list;
     draw.vs_pipeline = kRigid; draw.ps_pipeline = kOpaque; draw.vs_hash = 0x1000u;
-    const uint64_t identity = bvh::PoolMeshKey(draw);  // the draw's identity at the draw (its args are not known then)
+    const uint64_t identity = bvh::PoolIndirectScheduleKey(draw, args, 0u);  // the draw's schedule identity (args buffer and offset)
     std::vector<Object> only;
     { Object o{"indirect 3", vb_a.handle, 3}; o.indirect = true; o.args_instances = 3; o.x = 100; o.args_offset = 0; only.push_back(o); }
     for (int i = 0; i < 40; ++i) run_frame(frame + i + 1, only);  // the earlier stages reset the pool: admit it again
@@ -341,6 +341,78 @@ int main() {
       }
     }
     bvh::DrainPoolScan(&dev, &queue);
+  }
+
+  HStage("P2b: two indirect draws sharing a VB and IB keep their own mesh");
+  // "indirect 3" (args offset 0, first_index 0) and "indirect truncated" (args offset 64, first_index 36) share vb_a
+  // and ib. Their mesh keys differ only by args, so each schedule identity must learn its own mesh and record its own draw.
+  {
+    resource dynamic_arena = {0u};
+    dev.create_resource(resource_desc(bvh::kPoolDynamicArenaBytes, memory_heap::gpu_only, resource_usage::shader_resource | resource_usage::copy_dest),
+                        nullptr, resource_usage::general, &dynamic_arena);
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb_a.handle}; draw.vb_stride = fixture::kStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {fixture::kLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.depth_enable = true; draw.depth_write = true;
+    draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = kRigid; draw.ps_pipeline = kOpaque; draw.vs_hash = 0x1000u;
+    const uint64_t identity_a = bvh::PoolIndirectScheduleKey(draw, args, 0u);
+    const uint64_t identity_b = bvh::PoolIndirectScheduleKey(draw, args, 64u);
+    CHECK(identity_a != identity_b, "P2b pair: schedule identities differ by args offset");
+    std::vector<Object> pair;
+    { Object o{"indirect 3", vb_a.handle, 3}; o.indirect = true; o.args_instances = 3; o.x = 100; o.args_offset = 0; pair.push_back(o); }
+    { Object o{"indirect truncated", vb_a.handle, 3}; o.indirect = true; o.args_instances = 3; o.x = 1000; o.args_offset = 64; pair.push_back(o); }
+    for (int i = 0; i < 40; ++i) run_frame(frame + i + 1, pair);
+    frame += 41;
+    uint64_t mesh_a = 0u, mesh_b = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.dynamic_arena = dynamic_arena;
+      const auto learned_a = bvh::g_pool.dynamic_indirect.find(identity_a);
+      const auto learned_b = bvh::g_pool.dynamic_indirect.find(identity_b);
+      CHECK(learned_a != bvh::g_pool.dynamic_indirect.end() && learned_b != bvh::g_pool.dynamic_indirect.end(),
+            "P2b pair: both indirect identities learned");
+      if (learned_a != bvh::g_pool.dynamic_indirect.end()) mesh_a = learned_a->second;
+      if (learned_b != bvh::g_pool.dynamic_indirect.end()) mesh_b = learned_b->second;
+      CHECK(mesh_a != 0u && mesh_b != 0u && mesh_a != mesh_b, "P2b pair: two distinct meshes (%llx, %llx)",
+            (unsigned long long)mesh_a, (unsigned long long)mesh_b);
+      CHECK(bvh::g_pool.mesh_by_key.count(mesh_a) != 0u && bvh::g_pool.mesh_by_key.count(mesh_b) != 0u, "P2b pair: both meshes in the pool");
+      if (bvh::g_pool.mesh_by_key.count(mesh_a) != 0u) bvh::MarkPoolMeshDynamic(bvh::g_pool.mesh_by_key.at(mesh_a));
+      if (bvh::g_pool.mesh_by_key.count(mesh_b) != 0u) bvh::MarkPoolMeshDynamic(bvh::g_pool.mesh_by_key.at(mesh_b));
+    }
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 0u, 1u, 20u);
+    bvh::OnPoolScanIndirectDraw(&dev, &cl, draw, &cl_data, args, 64u, 1u, 20u);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.dynamic_draws.size() == 2u, "P2b pair: two records (%zu)", bvh::g_pool.dynamic_draws.size());
+      if (bvh::g_pool.dynamic_draws.size() == 2u) {
+        const bvh::PoolDynamicDraw& d0 = bvh::g_pool.dynamic_draws[0];
+        const bvh::PoolDynamicDraw& d1 = bvh::g_pool.dynamic_draws[1];
+        CHECK(d0.mesh_key != d1.mesh_key, "P2b pair: records have different meshes");
+        CHECK(d0.mesh_key == mesh_a && d0.args_offset == 0u, "P2b pair: draw A records its own mesh and args offset");
+        CHECK(d1.mesh_key == mesh_b && d1.args_offset == 64u, "P2b pair: draw B records its own mesh and args offset");
+      }
+    }
+    bvh::DrainPoolScan(&dev, &queue);
+  }
+
+  HStage("ResetWorldPool and PrunePool own the indirect map");
+  {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(!bvh::g_pool.dynamic_indirect.empty(), "indirect map populated before reset");
+    }
+    bvh::ResetWorldPool();
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.dynamic_indirect.empty(), "ResetWorldPool clears the indirect map (%zu)", bvh::g_pool.dynamic_indirect.size());
+      const uint64_t aged_key = 0xDEADBEEFull;
+      bvh::g_pool.schedule[aged_key].next_frame = 1u;
+      bvh::g_pool.dynamic_indirect[aged_key] = 0x1234u;
+      bvh::PrunePool(1000000u);
+      CHECK(bvh::g_pool.schedule.count(aged_key) == 0u, "PrunePool removes the aged schedule entry");
+      CHECK(bvh::g_pool.dynamic_indirect.count(aged_key) == 0u, "PrunePool removes the aged indirect entry");
+    }
   }
 
   bvh::DumpWorldPool();

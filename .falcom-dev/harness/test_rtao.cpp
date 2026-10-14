@@ -169,7 +169,7 @@ static void TestPushLayout() {
   CHECK(offsetof(rtao::RtaoPushConstants, region) == 48u, "c3 offset");
   CHECK(offsetof(rtao::RtaoPushConstants, size) == 64u, "c4 offset");
   CHECK(rtao::kRtaoStatsCount == 71u && rtao::kRtaoStatScaled == 9u && rtao::kRtaoStatTemporalBase == 10u, "stats count");
-  CHECK(rtao::kRtaoSrvCount == 19u && rtao::kRtaoUavCount == 3u && rtao::kRtaoPushRegister == 12u, "table sizes");
+  CHECK(rtao::kRtaoSrvCount == 20u && rtao::kRtaoUavCount == 3u && rtao::kRtaoPushRegister == 12u, "table sizes");
   CHECK(sizeof(rtao::RtaoTemporalPushConstants) == 20u * sizeof(float), "pass B b12 size");
   CHECK(offsetof(rtao::RtaoTemporalPushConstants, texel) == 16u && offsetof(rtao::RtaoTemporalPushConstants, size) == 32u, "pass B offsets");
   CHECK(rtao::kRtaoTemporalSrvCount == 6u && rtao::kRtaoTemporalUavCount == 3u && rtao::kRtaoTemporalSamplerCount == 2u, "pass B table sizes");
@@ -355,8 +355,9 @@ struct CmdList : mock::CommandListBase {
   // Model of the compute slots on the context (set by binds and pushes, not by update_descriptor_tables).
   resource_view cs_srv[32] = {};
   resource_view cs_uav[8] = {};
+  std::vector<float> rtao_push;  // the first 20-float push (pass A b12): fade[3] carries the P2b record count
   int dispatch_srv_bound = 0, dispatch_uav_bound = 0;  // non-null slots at the moment of the dispatch
-  bool dispatch_t9 = false, dispatch_t17 = false, dispatch_t18 = false, dispatch_u0 = false, dispatch_u1 = false;
+  bool dispatch_t9 = false, dispatch_t17 = false, dispatch_t18 = false, dispatch_t19 = false, dispatch_u0 = false, dispatch_u1 = false;
   sampler cs_sampler[4] = {};
   // The slots as they were at each dispatch (one entry per pass: A, then B when it ran).
   struct Snap { resource_view srv[32]; resource_view uav[8]; sampler smp[4]; };
@@ -377,6 +378,10 @@ struct CmdList : mock::CommandListBase {
     }
   }
   void push_constants(shader_stage, pipeline_layout, uint32_t, uint32_t, uint32_t count, const void* values) override {
+    if (count == rtao::kRtaoPushConstantCount && rtao_push.empty()) {
+      const float* f = static_cast<const float *>(values);
+      rtao_push.assign(f, f + count);
+    }
     if (count == rtao::kRtaoFilterPushCount) {
       const float* f = static_cast<const float *>(values);
       filter_pushes.emplace_back(f, f + count);
@@ -412,6 +417,7 @@ struct CmdList : mock::CommandListBase {
     dispatch_t9 = cs_srv[9].handle != 0u;
     dispatch_t17 = cs_srv[17].handle != 0u;
     dispatch_t18 = cs_srv[18].handle != 0u;
+    dispatch_t19 = cs_srv[19].handle != 0u;
     dispatch_u0 = cs_uav[0].handle != 0u;
     dispatch_u1 = cs_uav[1].handle != 0u;
     Snap snap = {};
@@ -452,14 +458,22 @@ static void TestDeviceLifecycle() {
   in.mrt_normal_view = {0x9200u};
   in.isfast_view = {0x9300u};
   in.scene_cbv_view = {0x9100u};
+  // P2b: the records view (t19) and the record count (fade[3] bits, the same way the trace sets its count).
+  falcom_world::bvh::BvhDeviceData* bvh_data = falcom_world::bvh::GetBvhDeviceData(&dev);
+  bvh_data->dynamic.instances_srv = {0x9400u};
+  bvh_data->dynamic.instance_count = 3u;
   const bool dispatched = rtao::Dispatch(&dev, &cl, in).ok;
   CHECK(dispatched && cl.dispatches == 1, "dispatch issued (ok %d, dispatches %d)", dispatched, cl.dispatches);
   CHECK(data.ao_width == 200u && data.ao_height == 100u, "AO target sized from the depth input (%u x %u)", data.ao_width, data.ao_height);
   CHECK(cl.groups_x == 25u && cl.groups_y == 13u, "8x8 groups over 200x100: %u x %u", cl.groups_x, cl.groups_y);
-  CHECK(cl.null_srv_pushes == 1 && cl.null_srv_count == rtao::kRtaoSrvCount, "all 19 SRVs nulled on the context (pushes %d count %u)", cl.null_srv_pushes, cl.null_srv_count);
+  CHECK(cl.null_srv_pushes == 1 && cl.null_srv_count == rtao::kRtaoSrvCount, "all 20 SRVs nulled on the context (pushes %d count %u)", cl.null_srv_pushes, cl.null_srv_count);
+  CHECK(cl.dispatch_t19 && cl.snaps[0].srv[19].handle == 0x9400u, "t19 is the P2b records view at the dispatch (t19 %d handle %llx)", cl.dispatch_t19, (unsigned long long)cl.snaps[0].srv[19].handle);
+  uint32_t fade_records = 0u;
+  if (cl.rtao_push.size() == rtao::kRtaoPushConstantCount) std::memcpy(&fade_records, &cl.rtao_push[11], sizeof(uint32_t));
+  CHECK(fade_records == 3u, "fade[3] bits are the P2b record count (%u)", fade_records);
   CHECK(cl.null_uav_pushes == 1 && cl.null_uav_count == rtao::kRtaoUavCount && !cl.pushed_nonnull_uav, "u0 and u1 nulled on the context, no UAV left bound");
   // The RTAO views were bound at dispatch (the model works), and every RTAO SRV/UAV slot is null afterwards.
-  CHECK(cl.dispatch_t9 && cl.dispatch_t17 && cl.dispatch_t18 && cl.dispatch_u0 && cl.dispatch_u1,
+  CHECK(cl.dispatch_t9 && cl.dispatch_t17 && cl.dispatch_t18 && cl.dispatch_t19 && cl.dispatch_u0 && cl.dispatch_u1,
         "RTAO views were bound during the dispatch (t9 %d t17 %d t18 %d u0 %d u1 %d)",
         cl.dispatch_t9, cl.dispatch_t17, cl.dispatch_t18, cl.dispatch_u0, cl.dispatch_u1);
   int srv_left = 0, uav_left = 0;
@@ -1835,7 +1849,8 @@ static void TestFilterMath() {
   std::printf("filter math: transcriptions of the edge stops, separable kernel, rounding and stats (labelled)\n");
 }
 
-// Source guard: the pass A and pass B shaders are byte-identical to HEAD (recorded now; git diff empty for both).
+// Source guard: the pass A and pass B shaders are byte-identical to the recorded hashes (pass A recorded again after the
+// P2b record slot t19 change: world_rtao.cs_5_0.hlsl; pass B unchanged).
 static void TestPassShadersUnchanged() {
   const std::string pass_a = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao.cs_5_0.hlsl");
   const std::string pass_b = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao_temporal.cs_5_0.hlsl");
@@ -1844,7 +1859,7 @@ static void TestPassShadersUnchanged() {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;
   };
-  CHECK(fnv(pass_a) == 0x5e7d000039ab22cfull, "pass A harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
+  CHECK(fnv(pass_a) == 0x557dcf62a545696cull, "pass A harness copy equals the recorded P2b t19 version (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
   CHECK(fnv(pass_b) == 0xba6fc5c95a80cf38ull, "pass B harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
 }
 

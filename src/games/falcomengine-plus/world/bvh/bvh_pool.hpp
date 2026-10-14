@@ -1033,6 +1033,8 @@ struct PoolStats {
   uint32_t wind_sway_instances = 0u;  // instances swayed in the last TLAS pass (rebuild or refit)
   float wind_sway_max_m = 0.f;        // largest sway displacement of the last TLAS pass (metres)
   float wind_sway_bound_m = 0.f;      // largest amplitude bound applied to a leaf in the last TLAS pass (metres)
+  uint64_t wind_sway_skipped_nonfinite = 0u;  // cumulative: sways skipped (rest pose kept) on a non-finite input or output
+  uint64_t wind_sway_skipped_range = 0u;      // cumulative: sways skipped (rest pose kept) beyond kPoolMaxPosition
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -1100,6 +1102,7 @@ struct PoolStats {
   size_t dynamic_draws = 0u;      // P2b: flagged draws recorded in the last present
   uint64_t dynamic_copied = 0u;       // P2b: flagged draws copied at the draw (total)
   uint64_t dynamic_refused = 0u;      // P2b: flagged draws not recorded: caps or no arena (total)
+  uint64_t dynamic_alpha_skipped = 0u;  // P2b: flagged alpha-tested draws not recorded (they stay in the TLAS) (total)
   uint64_t dynamic_deferred = 0u;     // P2b: flagged draws on a deferred list, not copied (total)
   uint64_t dynamic_arena_bytes = 0u;  // P2b: arena bytes reserved in the last present
   uint32_t dynamic_records = 0u;      // P2b: expanded records of the last present (reserved; validity is not read back)
@@ -1203,6 +1206,26 @@ struct PoolInspectRecord {
   std::vector<PoolInspectCandidate> candidates;
 };
 
+// TLAS update timing (CPU ms per call), written under g_pool.mutex by bvh_live.hpp; world_pool.json "tlas_timing".
+struct PoolTlasTiming {
+  uint64_t rebuilds = 0u;  // RebuildLiveTlas calls (a failed build too); equals LiveBvhStats::tlas_rebuilds
+  uint64_t rebuilds_refit_quality = 0u;
+  uint64_t rebuilds_refit_failed = 0u;
+  float rebuild_ms_last = 0.f;
+  float rebuild_ms_max = 0.f;
+  float rebuild_ms_sum = 0.f;
+  uint64_t refits = 0u;  // refits that changed the TLAS; equals LiveBvhStats::tlas_refits
+  float refit_ms_last = 0.f;  // every RefitLiveTlas call that ran (no-change and failed ones too)
+  float refit_ms_max = 0.f;
+  float refit_ms_sum = 0.f;
+  uint64_t refits_after_drain = 0u;         // RefitLiveTlasAfterDrain calls that ran the refit
+  uint64_t refit_after_drain_skipped = 0u;  // calls finding the TLAS already at the current dynamic_revision
+  float after_drain_ms_last = 0.f;
+  float after_drain_ms_max = 0.f;
+  float after_drain_ms_sum = 0.f;
+  uint32_t refits_since_rebuild = 0u;  // mirrors BvhDeviceData::tlas_refits_since_rebuild
+};
+
 struct PoolState {
   std::atomic_bool scan_active{false};
   bool scan_continuous = false;  // the scan has been on every frame since scan_since
@@ -1301,6 +1324,7 @@ struct PoolState {
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;  // bumped when an admitted instance's camera visibility changes
   PoolStats stats;
+  PoolTlasTiming tlas_timing;
   PoolMotionDetail motion_detail;
   // Moving rigid objects (P2a): draw keys seen moving. `dynamic_applied` is
   // the exclude_moving value the mesh flags follow (re-applied under the lock
@@ -1309,7 +1333,7 @@ struct PoolState {
   bool dynamic_applied = false;
   std::vector<PoolDynamicDraw> dynamic_draws;    // P2b: flagged draws of this present, recorded at draw time
   std::vector<PoolDynamicDraw> dynamic_present;  // P2b: the last present's draws (moved by DrainPoolScan, expanded by ExpandLiveDynamic)
-  std::unordered_map<uint64_t, uint64_t> dynamic_indirect;  // P2b: indirect draw identity (PoolMeshKey at the draw) -> its mesh key (learned at resolve)
+  std::unordered_map<uint64_t, uint64_t> dynamic_indirect;  // P2b: indirect schedule key (PoolIndirectScheduleKey at the draw) -> its mesh key (learned at resolve)
   reshade::api::resource dynamic_arena = {0u};   // P2b: copy destination of the draws (created by ExpandLiveDynamic)
   uint64_t dynamic_arena_used = 0u;              // bytes reserved in the arena this present
   uint32_t dynamic_out_used = 0u;                // expanded records reserved this present
@@ -2939,6 +2963,12 @@ inline bool RecordPoolDynamicDraw(uint64_t mesh_key, const DrawRecord& draw, uin
     g_pool.stats.dynamic_deferred += 1u;
     return false;
   }
+  // With exclude_moving on, AdmitPoolInstance refuses flagged meshes, so an alpha dynamic mesh is in neither the TLAS
+  // nor the records in that mode (the same as before P2b); the default follow path is unaffected.
+  if (g_pool.meshes[mesh->second].alpha) {
+    g_pool.stats.dynamic_alpha_skipped += 1u;  // alpha-tested: not traced as solid (header.z = 0), stays in the TLAS
+    return false;
+  }
   const uint64_t slice_bytes = static_cast<uint64_t>(count) * kPoolInstanceStride;
   const uint64_t args_bytes = indirect ? kPoolIndirectArgsBytes : 0u;
   if (g_pool.dynamic_arena.handle == 0u || g_pool.dynamic_draws.size() >= kPoolMaxDynamicDraws
@@ -3920,9 +3950,6 @@ inline void OnPoolScanIndirectDraw(
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
     family.vs_class = static_cast<uint8_t>(gate.vs_class);
     if (gate.skip == PoolSkip::PixelUnknown) NotePoolPixelUnknown(draw, gate.unknown_reason);
-    // The args decide the mesh key only at resolve: a draw identity learned there leads to its mesh (P2b).
-    const auto learned = g_pool.dynamic_indirect.find(PoolMeshKey(draw));
-    const uint64_t dynamic_key = learned != g_pool.dynamic_indirect.end() ? learned->second : 0u;
     for (uint32_t i = 0; i < sub_draws; ++i) {
       g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
       g_pool.stats.indirect_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
@@ -3941,6 +3968,9 @@ inline void OnPoolScanIndirectDraw(
       // The window this identity needs: decided by its last args (see
       // NextPoolIndirectWindow), the full window until they were read once.
       const uint64_t schedule_key = PoolIndirectScheduleKey(draw, args_buffer, sub_args_offset);
+      // The args decide the mesh key only at resolve: a schedule identity learned there leads to its mesh (P2b).
+      const auto learned_mesh = g_pool.dynamic_indirect.find(schedule_key);
+      const uint64_t dynamic_key = learned_mesh != g_pool.dynamic_indirect.end() ? learned_mesh->second : 0u;
       uint32_t window = max_window;
       const auto known = g_pool.schedule.find(schedule_key);
       const bool learned = known != g_pool.schedule.end() && known->second.indirect_window != 0u;
@@ -5187,8 +5217,9 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
         record.vertex_offset = static_cast<int32_t>(result.args[3]);
         record.first_instance = result.args[4];
         mesh_key = PoolMeshKey(record);
-        if (g_pool.dynamic_indirect.size() < kPoolMaxDynamicKeys) {
-          g_pool.dynamic_indirect[PoolMeshKey(indirect_draws[copy.indirect_index])] = mesh_key;
+        // At the cap, only an identity already learned may still change its mesh; new identities are dropped.
+        if (g_pool.dynamic_indirect.size() < kPoolMaxDynamicKeys || g_pool.dynamic_indirect.count(copy.schedule_key) != 0u) {
+          g_pool.dynamic_indirect[copy.schedule_key] = mesh_key;
         }
         const PoolIndirectAlpha* alpha_side = copy.alpha_index != UINT32_MAX ? &indirect_alpha[copy.alpha_index] : nullptr;
         if ((copy.pass & kPoolPassAlpha) != 0u) {
@@ -5273,6 +5304,7 @@ inline void PrunePool(uint32_t frame) {
   }
   for (auto it = g_pool.schedule.begin(); it != g_pool.schedule.end();) {
     if (frame > it->second.next_frame + kPoolPruneAge) {
+      g_pool.dynamic_indirect.erase(it->first);
       it = g_pool.schedule.erase(it);
     } else {
       ++it;
@@ -5513,6 +5545,7 @@ inline void ResetWorldPool() {
   std::lock_guard<std::mutex> lock(g_pool.mutex);
   g_pool.wind_keys.clear();
   g_pool.wind_sway.clear();
+  g_pool.dynamic_indirect.clear();
   g_pool.alpha_maps = PoolAlphaDumpMaps{};
   for (auto& slot : g_pool.slots) {
     // Copies already recorded into a slot still land there; only forget them.
@@ -5726,6 +5759,7 @@ inline void WritePoolP2b(std::ostringstream& out, const PoolStats& stats) {
   out << "  \"p2b\": {\"per_frame\": " << (g_pool.dynamic_per_frame.load() ? "true" : "false")
       << ", \"draws_last_present\": " << stats.dynamic_draws << ", \"copied_total\": " << stats.dynamic_copied
       << ", \"refused_total\": " << stats.dynamic_refused << ", \"deferred_total\": " << stats.dynamic_deferred
+      << ", \"alpha_skipped_total\": " << stats.dynamic_alpha_skipped
       << ", \"records_last_present\": " << stats.dynamic_records
       << ", \"not_resident_last_present\": " << stats.dynamic_not_resident
       << ", \"arena_bytes_last_present\": " << stats.dynamic_arena_bytes
@@ -5869,7 +5903,12 @@ inline void WritePoolVisibilitySummary(
     if (fade < kCameraFadeShown) hidden_at_camera += 1u;
     if (fade < 1.f) samples.push_back({i, distance, fade, "near fade"});
   }
-  std::sort(samples.begin(), samples.end(), [](const Sample& a, const Sample& b) { return a.distance < b.distance; });
+  // NaN distances sort last (as +infinity) so the comparator stays a strict weak ordering.
+  std::sort(samples.begin(), samples.end(), [](const Sample& a, const Sample& b) {
+    const float da = std::isnan(a.distance) ? std::numeric_limits<float>::infinity() : a.distance;
+    const float db = std::isnan(b.distance) ? std::numeric_limits<float>::infinity() : b.distance;
+    return da < db;
+  });
   if (samples.size() > 24u) samples.resize(24u);
   std::vector<std::pair<uint32_t, uint32_t>> by_vs(shadow_only_by_vs.begin(), shadow_only_by_vs.end());
   std::sort(by_vs.begin(), by_vs.end(), [](const auto& a, const auto& b) { return a.second != b.second ? a.second > b.second : a.first < b.first; });
@@ -5910,9 +5949,9 @@ inline void WritePoolVisibilitySummary(
     out << "\n    {\"reason\": \"" << samples[s].reason << "\""
         << ", \"mesh_uid\": " << (mesh != nullptr ? mesh->uid : 0u)
         << ", \"vs_hash\": \"" << PoolHashText(instance.source_vs_hash) << "\""
-        << ", \"position\": [" << instance.matrix[3] << ", " << instance.matrix[7] << ", " << instance.matrix[11] << "]"
-        << ", \"bounds_min\": [" << instance.bounds_min[0] << ", " << instance.bounds_min[1] << ", " << instance.bounds_min[2] << "]"
-        << ", \"bounds_max\": [" << instance.bounds_max[0] << ", " << instance.bounds_max[1] << ", " << instance.bounds_max[2] << "]"
+        << ", \"position\": [" << PoolJsonFloat{instance.matrix[3]} << ", " << PoolJsonFloat{instance.matrix[7]} << ", " << PoolJsonFloat{instance.matrix[11]} << "]"
+        << ", \"bounds_min\": [" << PoolJsonFloat{instance.bounds_min[0]} << ", " << PoolJsonFloat{instance.bounds_min[1]} << ", " << PoolJsonFloat{instance.bounds_min[2]} << "]"
+        << ", \"bounds_max\": [" << PoolJsonFloat{instance.bounds_max[0]} << ", " << PoolJsonFloat{instance.bounds_max[1]} << ", " << PoolJsonFloat{instance.bounds_max[2]} << "]"
         << ", \"triangles\": " << (mesh != nullptr ? mesh->triangle_count : 0u)
         << ", \"closest_distance\": " << PoolJsonFloat{samples[s].distance}
         << ", \"fade_at_closest\": " << PoolJsonFloat{samples[s].fade}
@@ -5963,9 +6002,9 @@ inline void WritePoolCaptureRecords(std::ostream& out, const std::vector<PoolCap
         << ", \"vertices\": " << record.vertices << ", \"triangles\": " << record.triangles
         << ", \"first_diff_triangle\": " << record.first_diff_triangle
         << ", \"differing_triangles\": " << record.differing_triangles << ", \"before\": [";
-    for (size_t k = 0; k < 9u; ++k) out << (k != 0u ? ", " : "") << record.before[k];
+    for (size_t k = 0; k < 9u; ++k) out << (k != 0u ? ", " : "") << PoolJsonFloat{record.before[k]};
     out << "], \"after\": [";
-    for (size_t k = 0; k < 9u; ++k) out << (k != 0u ? ", " : "") << record.after[k];
+    for (size_t k = 0; k < 9u; ++k) out << (k != 0u ? ", " : "") << PoolJsonFloat{record.after[k]};
     out << "]";
     if (record.staging.poisoned) {
       out << ", \"staging\": ";
@@ -6045,7 +6084,7 @@ inline void WritePoolAlphaEvidence(std::ostream& out, const PoolAlphaMaterialSta
       << ", \"layout_elements\": [";
   for (uint32_t i = 0; i < element_count; ++i) {
     const PoolLayoutElement& element = layout.elements[i];
-    out << (i != 0u ? ", " : "") << "{\"semantic\": \"" << element.semantic << "\", \"index\": " << element.index
+    out << (i != 0u ? ", " : "") << "{\"semantic\": \"" << PoolJsonEscape(element.semantic) << "\", \"index\": " << element.index
         << ", \"slot\": " << element.slot << ", \"offset\": " << element.offset << ", \"format\": " << element.format << "}";
   }
   out << "], \"vbs_known\": " << (layout.vbs_known ? "true" : "false") << ", \"vertex_buffer_slots\": [";
@@ -6145,6 +6184,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   std::unordered_map<uint32_t, PoolFamilyStats> families;
   std::unordered_map<uint32_t, PoolRefusalCounts> alpha_refusals;
   PoolStats stats;
+  PoolTlasTiming tlas_timing;
   uint64_t alpha_key_count = 0u;
   uint64_t alpha_held_vertex_bytes = 0u;  // vertex bytes held by requests in the Uvs phase
   PoolAlphaGpuStats alpha_gpu;
@@ -6169,6 +6209,9 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   bool scene_fade = false;
   float near_fade_floor = 0.f;
   float map_alpha = 1.f;
+  bool dynamic_applied = false;
+  size_t wind_sway_keys = 0u;
+  uint64_t alpha_held_bytes_max = 0u;
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     scene_fade = g_state.camera.has_fade;
@@ -6206,6 +6249,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     families = g_pool.families;
     alpha_refusals = g_pool.alpha_refusals_by_vs;
     stats = g_pool.stats;
+    tlas_timing = g_pool.tlas_timing;
     alpha_key_count = g_pool.alpha_keys.size();
     for (const auto& entry : g_pool.mesh_requests) alpha_held_vertex_bytes += entry.second.vertex_bytes.size();
     alpha_gpu = g_pool.alpha_gpu;
@@ -6245,6 +6289,9 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     dynamic = SnapshotPoolDynamic();
     region = CurrentPoolRegion();
     inspect = g_pool.inspect;
+    dynamic_applied = g_pool.dynamic_applied;
+    wind_sway_keys = g_pool.wind_sway.size();
+    alpha_held_bytes_max = g_pool.alpha_held_bytes_max;
   }
 
   // The instance dump lists the alpha and wind rest-pose instances first (visibility, last_seen and flags move together).
@@ -6302,20 +6349,34 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     }
   }
 
+  // Each *_dropped below counts units (records, not bytes) that a capped list leaves out: the list caps (kPoolDumpMax* constants),
+  // plus no_mesh_dropped (cumulative no-mesh sightings) and candidates_dropped (inspect candidates).
+  // world_pool.json "truncated" is true when any of them is non-zero.
+  const size_t alpha_keys_dropped = alpha_keys.size() > kPoolDumpMaxAlphaKeys ? alpha_keys.size() - kPoolDumpMaxAlphaKeys : 0u;
+  const size_t wind_keys_dropped = wind_keys_dump.size() > kPoolDumpMaxAlphaKeys ? wind_keys_dump.size() - kPoolDumpMaxAlphaKeys : 0u;
+  const size_t refusals_dropped = alpha_refusals.size() > kPoolDumpMaxAlphaRefusals ? alpha_refusals.size() - kPoolDumpMaxAlphaRefusals : 0u;
+  const size_t no_mesh_capped = no_mesh.size() > kPoolDumpMaxNoMeshKeys ? no_mesh.size() - kPoolDumpMaxNoMeshKeys : 0u;
+  const size_t stale_dropped = stale_dynamic.size() > kPoolDumpMaxStaleDynamic ? stale_dynamic.size() - kPoolDumpMaxStaleDynamic : 0u;
+  const size_t failed_dropped = failed_meshes.size() > kPoolDumpMaxMeshDetail ? failed_meshes.size() - kPoolDumpMaxMeshDetail : 0u;
+  const size_t mismatch_dropped = mismatch_meshes.size() > kPoolDumpMaxMeshDetail ? mismatch_meshes.size() - kPoolDumpMaxMeshDetail : 0u;
+  const size_t candidates_dropped = inspect.crossing_instances > inspect.candidates.size() ? inspect.crossing_instances - inspect.candidates.size() : 0u;
+  const size_t world_pool_dropped = alpha_keys_dropped + wind_keys_dropped + refusals_dropped + no_mesh_dropped + no_mesh_capped
+                                    + stale_dropped + failed_dropped + mismatch_dropped + candidates_dropped;
+
   std::ostringstream out;
   out << "{\n";
   out << "  \"schema\": 15,\n";
   out << "  \"generated_frame\": " << frame << ",\n";
   out << "  \"files\": {\"summary\": \"world_pool.json\", \"meshes\": \"world_pool_meshes.json\", \"instances\": \"world_pool_instances.json\"},\n";
   out << "  \"meshes_total\": " << meshes.size() << ", \"instances_total\": " << instances.size()
-      << ", \"instances_written\": " << instances.size() << ", \"truncated\": false,\n";
+      << ", \"instances_written\": " << instances.size() << ", \"truncated\": " << (world_pool_dropped != 0u ? "true" : "false") << ",\n";
   out << "  \"camera_valid\": " << (camera.valid ? "true" : "false") << ",\n";
   out << "  \"alpha\": {\"alpha_foliage\": " << (g_pool.alpha_foliage.load() ? "true" : "false") << ", \"draws\": " << stats.alpha_draws
       << ", \"cb_unavailable\": " << stats.alpha_cb_unavailable << ", \"conflicts\": " << stats.alpha_conflicts
       << ", \"meshes_conflicted\": " << stats.alpha_meshes_conflicted
       << ", \"refused_off\": " << stats.alpha_refused_off << ", \"conflict_refused\": " << stats.alpha_conflict_refused
       << ", \"no_uv\": " << stats.alpha_no_uv << ", \"uv_stream_mismatch\": " << stats.alpha_uv_stream_mismatch
-      << ", \"held_vertex_bytes\": " << alpha_held_vertex_bytes << ", \"held_vertex_bytes_max\": " << g_pool.alpha_held_bytes_max
+      << ", \"held_vertex_bytes\": " << alpha_held_vertex_bytes << ", \"held_vertex_bytes_max\": " << alpha_held_bytes_max
       << ", \"removed\": " << stats.alpha_removed
       << ", \"keys\": " << alpha_key_count
       << ", \"billboard_draws\": " << stats.draws_by_vs_class[static_cast<size_t>(contract::VsClass::Billboard)]
@@ -6369,12 +6430,13 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   }
   out << "\n  ],\n";
   out << "  \"wind_sway\": {\"switch\": " << (g_pool.alpha_wind_sway.load() ? "true" : "false")
-      << ", \"keys_with_inputs\": " << g_pool.wind_sway.size() << ", \"unread_draws\": " << stats.wind_sway_unread
+      << ", \"keys_with_inputs\": " << wind_sway_keys << ", \"unread_draws\": " << stats.wind_sway_unread
       << ", \"instances_last_pass\": " << stats.wind_sway_instances
       << ", \"max_displacement_m\": " << PoolJsonFloat{stats.wind_sway_max_m}
       << ", \"amplitude_bound_m\": " << PoolJsonFloat{stats.wind_sway_bound_m}
+      << ", \"skipped_nonfinite\": " << stats.wind_sway_skipped_nonfinite << ", \"skipped_range\": " << stats.wind_sway_skipped_range
       << ", \"flexibility\": 1, \"origin\": \"instance translation\"},\n";
-  out << "  \"camera_position\": [" << camera.position[0] << ", " << camera.position[1] << ", " << camera.position[2] << "],\n";
+  out << "  \"camera_position\": [" << PoolJsonFloat{camera.position[0]} << ", " << PoolJsonFloat{camera.position[1]} << ", " << PoolJsonFloat{camera.position[2]} << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
       << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";
   out << "  \"switches\": {\"capture_meshes\": " << (g_pool.capture_meshes.load() ? "true" : "false")
@@ -6386,15 +6448,15 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"retry_unstable\": " << (g_pool.retry_unstable.load() ? "true" : "false")
       << ", \"alpha_indirect_source\": " << (g_pool.alpha_indirect_source.load() ? "true" : "false")
       << ", \"alpha_wind_opaque\": " << (g_pool.alpha_wind_opaque.load() ? "true" : "false") << "},\n";
-  out << "  \"follow\": {\"hits\": " << g_pool.stats.follow_hits << ", \"admits\": " << g_pool.stats.follow_admits
-      << ", \"misses_skipped\": " << g_pool.stats.follow_misses_skipped
-      << ", \"rejected_bounds\": " << g_pool.stats.follow_rejected_bounds
-      << ", \"budget_skips\": " << g_pool.stats.follow_budget_skips << ", \"orphans\": " << g_pool.stats.orphans
-      << ", \"relinks\": " << g_pool.stats.follow_relinks << ", \"orphans_retired\": " << g_pool.stats.orphans_retired
-      << ", \"max_slot_used\": " << g_pool.stats.max_slot_used << ", \"max_follow_used\": " << g_pool.stats.max_follow_used << "},\n";
-  out << "  \"region\": {\"size\": " << region.size
-      << ", \"min\": [" << region.min[0] << ", " << region.min[1] << ", " << region.min[2]
-      << "], \"max\": [" << region.max[0] << ", " << region.max[1] << ", " << region.max[2] << "]},\n";
+  out << "  \"follow\": {\"hits\": " << stats.follow_hits << ", \"admits\": " << stats.follow_admits
+      << ", \"misses_skipped\": " << stats.follow_misses_skipped
+      << ", \"rejected_bounds\": " << stats.follow_rejected_bounds
+      << ", \"budget_skips\": " << stats.follow_budget_skips << ", \"orphans\": " << stats.orphans
+      << ", \"relinks\": " << stats.follow_relinks << ", \"orphans_retired\": " << stats.orphans_retired
+      << ", \"max_slot_used\": " << stats.max_slot_used << ", \"max_follow_used\": " << stats.max_follow_used << "},\n";
+  out << "  \"region\": {\"size\": " << PoolJsonFloat{region.size}
+      << ", \"min\": [" << PoolJsonFloat{region.min[0]} << ", " << PoolJsonFloat{region.min[1]} << ", " << PoolJsonFloat{region.min[2]}
+      << "], \"max\": [" << PoolJsonFloat{region.max[0]} << ", " << PoolJsonFloat{region.max[1]} << ", " << PoolJsonFloat{region.max[2]} << "]},\n";
 
   out << "  \"classifier\": {\"vertex\": {";
   for (size_t i = 0; i < registry_counts.vertex.size(); ++i) {
@@ -6533,8 +6595,21 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   WritePoolMotion(out, stats.motion, motion_detail, instances);
   WritePoolDynamic(out, dynamic, stats);
   WritePoolP2b(out, stats);
+  out << "  \"tlas_timing\": {\"rebuilds\": " << tlas_timing.rebuilds
+      << ", \"rebuilds_refit_quality\": " << tlas_timing.rebuilds_refit_quality
+      << ", \"rebuilds_refit_failed\": " << tlas_timing.rebuilds_refit_failed
+      << ", \"rebuild_ms\": {\"last\": " << PoolJsonFloat{tlas_timing.rebuild_ms_last}
+      << ", \"max\": " << PoolJsonFloat{tlas_timing.rebuild_ms_max} << ", \"sum\": " << PoolJsonFloat{tlas_timing.rebuild_ms_sum} << "}"
+      << ", \"refits\": " << tlas_timing.refits
+      << ", \"refit_ms\": {\"last\": " << PoolJsonFloat{tlas_timing.refit_ms_last}
+      << ", \"max\": " << PoolJsonFloat{tlas_timing.refit_ms_max} << ", \"sum\": " << PoolJsonFloat{tlas_timing.refit_ms_sum} << "}"
+      << ", \"refits_after_drain\": " << tlas_timing.refits_after_drain
+      << ", \"after_drain_ms\": {\"last\": " << PoolJsonFloat{tlas_timing.after_drain_ms_last}
+      << ", \"max\": " << PoolJsonFloat{tlas_timing.after_drain_ms_max} << ", \"sum\": " << PoolJsonFloat{tlas_timing.after_drain_ms_sum} << "}"
+      << ", \"refit_after_drain_skipped\": " << tlas_timing.refit_after_drain_skipped
+      << ", \"refits_since_rebuild\": " << tlas_timing.refits_since_rebuild << "},\n";
   out << "  \"stale_dynamic_count\": " << stale_dynamic.size() << ", \"stale_dynamic_dropped\": "
-      << (stale_dynamic.size() > kPoolDumpMaxStaleDynamic ? stale_dynamic.size() - kPoolDumpMaxStaleDynamic : 0u) << ",\n";
+      << stale_dropped << ",\n";
   out << "  \"stale_dynamic\": [";
   for (size_t i = 0; i < stale_dynamic.size() && i < kPoolDumpMaxStaleDynamic; ++i) {
     const PoolStaleDynamicDump& row = stale_dynamic[i];
@@ -6610,7 +6685,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
         out << "\"world\": [";
         for (uint32_t k = 0; k < kPoolWorldFloats; ++k) {
           if (k != 0u) out << ", ";
-          out << samples[s].matrix[k];
+          out << PoolJsonFloat{samples[s].matrix[k]};
         }
         out << "]}";
       }
@@ -6619,8 +6694,8 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     write_samples("reject_samples", family.reject_samples, true);
     write_samples("near_miss_samples", family.near_miss_samples, false);
     if (family.admitted != 0u) {
-      out << ", \"bounds_min\": [" << entry.bounds_min[0] << ", " << entry.bounds_min[1] << ", " << entry.bounds_min[2] << "]"
-          << ", \"bounds_max\": [" << entry.bounds_max[0] << ", " << entry.bounds_max[1] << ", " << entry.bounds_max[2] << "]";
+      out << ", \"bounds_min\": [" << PoolJsonFloat{entry.bounds_min[0]} << ", " << PoolJsonFloat{entry.bounds_min[1]} << ", " << PoolJsonFloat{entry.bounds_min[2]} << "]"
+          << ", \"bounds_max\": [" << PoolJsonFloat{entry.bounds_max[0]} << ", " << PoolJsonFloat{entry.bounds_max[1]} << ", " << PoolJsonFloat{entry.bounds_max[2]} << "]";
     }
     out << "}";
   }
@@ -6631,12 +6706,14 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   WritePoolVisibilitySummary(out, instances, visibility, meshes, camera, region, scene_fade ? near_fade_floor : 0.f,
                              stats.visibility_changes);
 
+  size_t meshes_written = 0u;  // invariant check: equals meshes.size() (every mesh is written, none skipped)
   std::ostringstream meshes_out;
   meshes_out << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"meshes\": [";
   first = true;
   for (const auto& mesh : meshes) {
     if (!first) meshes_out << ",";
     first = false;
+    meshes_written += 1u;
     const auto slice_it = alpha_maps.slice_of_uid.find(mesh.uid);
     const bool resident = alpha_maps.resident_uids.count(mesh.uid) != 0u;
     meshes_out << "\n    {\"mesh_id\": " << mesh.mesh_id
@@ -6658,8 +6735,8 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
         << ", \"near_fade_draws\": " << mesh.camera_near_fade_draws
         << ", \"light_draws\": " << mesh.light_draws
         << ", \"camera_ps\": \"" << PoolHashText(mesh.camera_ps_hash) << "\""
-        << ", \"bbox_min\": [" << mesh.bbox_min[0] << ", " << mesh.bbox_min[1] << ", " << mesh.bbox_min[2] << "]"
-        << ", \"bbox_max\": [" << mesh.bbox_max[0] << ", " << mesh.bbox_max[1] << ", " << mesh.bbox_max[2] << "]"
+        << ", \"bbox_min\": [" << PoolJsonFloat{mesh.bbox_min[0]} << ", " << PoolJsonFloat{mesh.bbox_min[1]} << ", " << PoolJsonFloat{mesh.bbox_min[2]} << "]"
+        << ", \"bbox_max\": [" << PoolJsonFloat{mesh.bbox_max[0]} << ", " << PoolJsonFloat{mesh.bbox_max[1]} << ", " << PoolJsonFloat{mesh.bbox_max[2]} << "]"
         << ", \"dynamic\": " << (mesh.dynamic ? "true" : "false")
         << ", \"key\": \"" << renodx::utils::log::AsHex(mesh.mesh_key) << "\""
         << ", \"source_vb\": \"" << renodx::utils::log::AsHex(mesh.source_vb) << "\""
@@ -6684,6 +6761,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   }
   meshes_out << "\n  ]\n}\n";
 
+  size_t instances_written = 0u;  // invariant check: equals instances.size() (every instance is written, none skipped)
   std::ostringstream instances_out;
   instances_out << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"instances\": [";
   first = true;
@@ -6697,6 +6775,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     const auto slice_it = alpha_maps.slice_of_uid.find(uid);
     if (!first) instances_out << ",";
     first = false;
+    instances_written += 1u;
     instances_out << "\n    {\"id\": " << instance.id << ", \"mesh_id\": " << instance.mesh_id
         << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(instance.mesh_key) << "\""
         << ", \"vs_hash\": \"" << PoolHashText(instance.source_vs_hash) << "\""
@@ -6718,8 +6797,6 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   }
   instances_out << "\n  ]\n}\n";
 
-  const size_t failed_dropped = failed_meshes.size() > kPoolDumpMaxMeshDetail ? failed_meshes.size() - kPoolDumpMaxMeshDetail : 0u;
-  const size_t mismatch_dropped = mismatch_meshes.size() > kPoolDumpMaxMeshDetail ? mismatch_meshes.size() - kPoolDumpMaxMeshDetail : 0u;
   out << "  \"failed_count\": " << failed_meshes.size() << ", \"failed_dropped\": " << failed_dropped
       << ", \"mismatch_count\": " << mismatch_meshes.size() << ", \"mismatch_dropped\": " << mismatch_dropped << ",\n";
   // Each list holds at most kPoolDumpMaxMeshDetail records; the counts above say what was left out.
@@ -6771,7 +6848,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   }
   out << ", \"game_depth_point\": null, \"game_depth_reason\": \"the depth compare keeps no depth value and the game depth point is not read back from the GPU; camera_ray is the only geometry\""
       << ", \"crossing_instances\": " << inspect.crossing_instances << ", \"candidate_count\": " << inspect.candidates.size()
-      << ", \"candidates_dropped\": " << inspect.crossing_instances - inspect.candidates.size() << ", \"candidates\": [";
+      << ", \"candidates_dropped\": " << candidates_dropped << ", \"candidates\": [";
   for (size_t i = 0; i < inspect.candidates.size(); ++i) {
     const PoolInspectCandidate& candidate = inspect.candidates[i];
     out << (i != 0u ? ", " : "") << "{\"pool_id\": " << candidate.instance_id << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(candidate.mesh_key)
@@ -6794,8 +6871,15 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool.json", text);
 
   // Written last so the sizes are the bytes on disk. Build id: none exists in the addon.
-  const std::pair<const char*, size_t> written_files[] = {
-      {"world_pool_meshes.json", meshes.size()}, {"world_pool_instances.json", instances.size()}, {"world_pool.json", 1u}};
+  struct WrittenFile {
+    const char* name;
+    size_t records;
+    size_t dropped;
+  };
+  const WrittenFile written_files[] = {
+      {"world_pool_meshes.json", meshes_written, meshes.size() > meshes_written ? meshes.size() - meshes_written : 0u},
+      {"world_pool_instances.json", instances_written, instances.size() > instances_written ? instances.size() - instances_written : 0u},
+      {"world_pool.json", 1u, world_pool_dropped}};
   std::ostringstream manifest;
   manifest << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"build\": \"unknown\",\n"
            << "  \"switches\": {\"alpha_foliage\": " << (g_pool.alpha_foliage.load() ? "true" : "false")
@@ -6803,13 +6887,17 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
            << ", \"alpha_wind_opaque\": " << (g_pool.alpha_wind_opaque.load() ? "true" : "false")
            << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false")
            << ", \"hide_camera_hidden\": " << (hide_camera_hidden ? "true" : "false")
-           << ", \"dynamic_applied\": " << (g_pool.dynamic_applied ? "true" : "false") << "},\n"
+           << ", \"dynamic_applied\": " << (dynamic_applied ? "true" : "false") << "},\n"
            << "  \"files\": [";
   bool first_file = true;
-  for (const auto& [name, records] : written_files) {
-    const std::filesystem::path file = PoolOutputDir() / name;
-    manifest << (first_file ? "" : ",") << "\n    {\"name\": \"" << name << "\", \"bytes\": " << std::filesystem::file_size(file)
-             << ", \"records\": " << records << ", \"truncated\": false, \"dropped\": 0, \"schema\": 15}";
+  for (const WrittenFile& written : written_files) {
+    const std::filesystem::path file = PoolOutputDir() / written.name;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(file, ec);
+    manifest << (first_file ? "" : ",") << "\n    {\"name\": \"" << written.name << "\", \"bytes\": "
+             << (ec ? std::string("null") : std::to_string(size)) << ", \"records\": " << written.records
+             << ", \"truncated\": " << (written.dropped != 0u ? "true" : "false") << ", \"dropped\": " << written.dropped
+             << ", \"schema\": 15}";
     first_file = false;
   }
   manifest << "\n  ]\n}\n";

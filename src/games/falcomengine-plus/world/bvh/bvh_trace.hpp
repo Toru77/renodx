@@ -26,7 +26,7 @@
 namespace falcom_world::bvh {
 
 // t0..t9 static BVH and game depth, t10..t13 deforming meshes, t14..t16 alpha-tested foliage (UVs, atlas, materials),
-// t17 P2b expanded instances (bvh_live.hpp ExpandLiveDynamic).
+// t17 P2b expanded instances (bvh_live.hpp ExpandLiveDynamic; RTAO binds them at t19).
 inline constexpr uint32_t kTraceSrvCount = 18u;
 inline constexpr uint32_t kTraceUavCount = 2u;
 inline constexpr uint32_t kTracePushConstantCount = 40u;

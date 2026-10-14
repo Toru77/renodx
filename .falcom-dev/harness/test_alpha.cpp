@@ -17,6 +17,7 @@
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
+#include "json_check.hpp"
 #include "src/games/falcomengine-plus/world/bvh/alpha_atlas.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 #define __world_alpha_blit_EMBED_FILE
@@ -2432,19 +2433,6 @@ static void TestRefusalsByVs() {
   CHECK(pool::g_pool.alpha_refusals_by_vs.empty(), "ResetWorldPool clears the per-VS counts");
 }
 
-// A nan or inf number token anywhere in the dump (JSON numbers are finite or null).
-static bool HasNonFiniteToken(const std::string& text) {
-  for (const std::string token : {"nan", "inf"}) {
-    for (size_t at = text.find(token); at != std::string::npos; at = text.find(token, at + 1)) {
-      const bool before = at == 0u || !std::isalnum(static_cast<unsigned char>(text[at - 1]));
-      const size_t end = at + token.size();
-      const bool after = end >= text.size() || !std::isalnum(static_cast<unsigned char>(text[end]));
-      if (before && after) return true;
-    }
-  }
-  return false;
-}
-
 // failed_meshes_detail and alpha_no_mesh_keys (world_pool.json): a failed mesh with its reason and history, and the no-mesh state of its alpha key.
 static void TestFailureDetail() {
   pool::ResetWorldPool();
@@ -2753,6 +2741,49 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   present(1);
   idx = wind_index();
   check_time("switch on", later);
+
+  // Non-finite or out-of-range sway inputs: the TLAS still builds, the wind instance stays at its rest pose, the sway is
+  // skipped and counted once per pass. Switching the sway off and on rebuilds the TLAS; the next present refits it.
+  const auto check_skipped = [&](const char* label, const SwayInputs& w, bool nonfinite) {
+    const uint32_t invalid_before = data->live.tlas_invalid;
+    write_cbs(w);
+    p.alpha_wind_sway.store(false);
+    present(1);
+    p.alpha_wind_sway.store(true);
+    for (int pass = 0; pass < 2; ++pass) {
+      const uint64_t nonfinite_before = p.stats.wind_sway_skipped_nonfinite;
+      const uint64_t range_before = p.stats.wind_sway_skipped_range;
+      present(1);
+      idx = wind_index();
+      CHECK(data->tlas_built && data->live.tlas_invalid == invalid_before && data->tlas_retry_frame == 0u,
+            "%s: TLAS builds (built %d, invalid %u -> %u, retry frame %u)", label, data->tlas_built ? 1 : 0, invalid_before,
+            data->live.tlas_invalid, data->tlas_retry_frame);
+      CHECK(p.stats.wind_sway_instances == 0u && data->tlas_wind_count == 1u,
+            "%s: wind instance kept, none swayed (swayed %u, wind %u)", label, p.stats.wind_sway_instances, data->tlas_wind_count);
+      CHECK(p.stats.wind_sway_skipped_nonfinite == nonfinite_before + (nonfinite ? 1u : 0u)
+                && p.stats.wind_sway_skipped_range == range_before + (nonfinite ? 0u : 1u),
+            "%s: skip counted once (nonfinite %llu, range %llu)", label,
+            static_cast<unsigned long long>(p.stats.wind_sway_skipped_nonfinite), static_cast<unsigned long long>(p.stats.wind_sway_skipped_range));
+      CHECK(idx >= 0 && data->tlas_instances_cpu[idx].world[3] == kOrigin[0] && data->tlas_instances_cpu[idx].world[7] == kOrigin[1]
+                && data->tlas_instances_cpu[idx].world[11] == kOrigin[2],
+            "%s: rest pose kept", label);
+    }
+  };
+  SwayInputs nan_inputs = sway;
+  nan_inputs.force = std::numeric_limits<float>::quiet_NaN();
+  check_skipped("nan", nan_inputs, true);
+  SwayInputs inf_inputs = sway;
+  inf_inputs.force = std::numeric_limits<float>::infinity();
+  check_skipped("inf", inf_inputs, true);
+  SwayInputs far_inputs = sway;
+  far_inputs.force = 1e30f;
+  check_skipped("range 1e30", far_inputs, false);
+
+  // Finite inputs again: the sway returns.
+  write_cbs(later);
+  present(1);
+  idx = wind_index();
+  check_time("restored", later);
   pool::ResetWorldPool();
 }
 

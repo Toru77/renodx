@@ -1,4 +1,4 @@
-﻿// Native harness: instance motion probe (path 2 discovery). Each object's
+// Native harness: instance motion probe (path 2 discovery). Each object's
 // pose function writes world and prevWorld per frame; the test checks the
 // repeat/first split, the ULP and meter histograms, moved counts per draw,
 // samples, the ghost listing in the dump, and that admission is unchanged.
@@ -11,6 +11,7 @@
 #include <map>
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
+#include "json_check.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
 
@@ -393,7 +394,8 @@ int main() {
     CHECK(m.rule_stale == contradiction.motion_repeat, "the contradiction is stale on every repeat");
     CHECK(found, "contradiction sampled");
     const std::string text = read_dump();
-    for (const char* bad : {"nan,", "nan]", "nan}", "inf,", "inf]", "inf}"}) CHECK(text.find(bad) == std::string::npos, "no %s in JSON", bad);
+    CHECK(JsonError(text).empty(), "world_pool.json is valid JSON: %s", JsonError(text).c_str());
+    CHECK(!HasNonFiniteToken(text), "world_pool.json has no nan or inf token");
     std::ofstream("motion_dump.json") << text;
   }
 
@@ -627,6 +629,52 @@ int main() {
     run(1);
     s = snapshot();
     CHECK(s.admitted == 2u && s.dynamic_meshes == 0u, "on again: released key not re-flagged (%zu)", s.admitted);
+  }
+
+  HStage("P2b alpha: a flagged alpha-tested mesh is not recorded (counted in dynamic_alpha_skipped).");
+  {
+    fresh();
+    const uint32_t start = falcom_world::g_state.frame.load();
+    objects.push_back({make_vb(1.f).handle, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      auto x = [](uint32_t t) { return t < 150u ? 0.f : t < 210u ? 0.1f * (t - 150u) : 6.f; };
+      Place(w, x(f)); Place(p, x(f == 0u ? 0u : f - 1u));
+    }});
+    run(220);
+    uint64_t skipped_before = 0u;
+    uint64_t arena_before = 0u;
+    uint64_t out_before = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.dynamic_keys.size() == 1u, "alpha stage: the object is flagged moving (%zu)", bvh::g_pool.dynamic_keys.size());
+      const uint64_t key = bvh::g_pool.dynamic_keys.begin()->first;
+      bvh::MarkPoolMeshAlpha(bvh::g_pool.mesh_by_key.at(key), bvh::g_pool.alpha_keys[key]);
+      skipped_before = bvh::g_pool.stats.dynamic_alpha_skipped;
+      arena_before = bvh::g_pool.dynamic_arena_used;
+      out_before = bvh::g_pool.dynamic_out_used;
+    }
+    run(1);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(dynamic_frame.empty(), "P2b alpha: no record for the alpha-tested mesh (%zu)", dynamic_frame.size());
+      CHECK(bvh::g_pool.dynamic_arena_used == arena_before && bvh::g_pool.dynamic_out_used == out_before,
+            "P2b alpha: arena not reserved (%llu, %llu)", (unsigned long long)bvh::g_pool.dynamic_arena_used,
+            (unsigned long long)bvh::g_pool.dynamic_out_used);
+      CHECK(bvh::g_pool.stats.dynamic_alpha_skipped == skipped_before + 1u, "P2b alpha: counted once (%llu)",
+            (unsigned long long)bvh::g_pool.stats.dynamic_alpha_skipped);
+    }
+    bvh::g_pool.dynamic_per_frame.store(false);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      skipped_before = bvh::g_pool.stats.dynamic_alpha_skipped;
+    }
+    run(1);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.stats.dynamic_alpha_skipped == skipped_before, "P2b alpha: switch off, not counted (%llu)",
+            (unsigned long long)bvh::g_pool.stats.dynamic_alpha_skipped);
+    }
+    bvh::g_pool.dynamic_per_frame.store(true);
   }
 
   HStage("11. Same mesh content through another draw key: the static copy goes");
@@ -1372,6 +1420,113 @@ int main() {
     CHECK(snapshot().orphans_retired == 1u, "scan back on: lone hidden instance retired after 600 frames (%llu)", (unsigned long long)snapshot().orphans_retired);
   }
   check_every_frame = false;
+
+  HStage("32. Non-finite values in the dump; manifest sizes; capped lists count what they drop.");
+  // 32. A NaN and an inf world matrix (rejected samples), a NaN mesh bbox, instance bounds and region size, then 300 failed meshes.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(false);
+    objects.push_back({make_vb(21.f).handle, 1, [](uint32_t, uint32_t, float* w, float* p) {
+      Place(w, 70.f); Place(p, 70.f); w[0] = NAN;
+    }});
+    objects.push_back({make_vb(22.f).handle, 1, [](uint32_t, uint32_t, float* w, float* p) {
+      Place(w, 72.f); Place(p, 72.f); w[3] = INFINITY;
+    }});
+    objects.push_back({make_vb(23.f).handle, 1, [](uint32_t, uint32_t, float* w, float* p) {
+      Place(w, 74.f); Place(p, 74.f);
+    }});
+    run(150);
+    float saved_region = 0.f, saved_bbox = 0.f, saved_bounds = 0.f;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(!bvh::g_pool.meshes.empty() && !bvh::g_pool.instances.empty(), "meshes and instances admitted");
+      saved_region = bvh::g_pool.region_size;
+      saved_bbox = bvh::g_pool.meshes[0].bbox_min[0];
+      saved_bounds = bvh::g_pool.instances[0].bounds_min[0];
+      bvh::g_pool.region_size = NAN;
+      bvh::g_pool.meshes[0].bbox_min[0] = NAN;
+      bvh::g_pool.instances[0].bounds_min[0] = NAN;
+    }
+    const std::filesystem::path dir = bvh::PoolOutputDir();
+    const auto read_file = [](const std::filesystem::path& path) {
+      std::ifstream f(path, std::ios::binary);
+      return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    // Value of "field" in the manifest entry named `name` ("" when absent).
+    const auto manifest_value = [](const std::string& manifest, const std::string& name, const std::string& field) {
+      const size_t entry = manifest.find("\"name\": \"" + name + "\"");
+      const size_t at = entry == std::string::npos ? std::string::npos : manifest.find("\"" + field + "\": ", entry);
+      if (at == std::string::npos) return std::string();
+      const size_t begin = at + field.size() + 4u;
+      return manifest.substr(begin, manifest.find_first_of(",}", begin) - begin);
+    };
+    const std::string world_text = read_dump();
+    const std::string meshes_text = read_file(dir / "world_pool_meshes.json");
+    const std::string instances_text = read_file(dir / "world_pool_instances.json");
+    const std::string manifest_text = read_file(dir / "world_pool_manifest.json");
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.region_size = saved_region;
+      bvh::g_pool.meshes[0].bbox_min[0] = saved_bbox;
+      bvh::g_pool.instances[0].bounds_min[0] = saved_bounds;
+    }
+    const std::pair<const char*, const std::string*> dumps[] = {
+        {"world_pool.json", &world_text}, {"world_pool_meshes.json", &meshes_text},
+        {"world_pool_instances.json", &instances_text}, {"world_pool_manifest.json", &manifest_text}};
+    for (const auto& [name, text] : dumps) {
+      CHECK(JsonError(*text).empty(), "%s is valid JSON: %s", name, JsonError(*text).c_str());
+      CHECK(!HasNonFiniteToken(*text), "%s has no nan or inf token", name);
+    }
+    for (const char* name : {"world_pool.json", "world_pool_meshes.json", "world_pool_instances.json"}) {
+      CHECK(manifest_value(manifest_text, name, "bytes") == std::to_string(std::filesystem::file_size(dir / name)),
+            "%s manifest bytes %s", name, manifest_value(manifest_text, name, "bytes").c_str());
+    }
+    CHECK(meshes_text.find("\"bbox_min\": [null") != std::string::npos, "NaN mesh bbox written as null");
+    CHECK(instances_text.find("\"bounds_min\": [null") != std::string::npos, "NaN instance bounds written as null");
+    CHECK(world_text.find("\"region\": {\"size\": null") != std::string::npos, "NaN region size written as null");
+    const size_t reject_at = world_text.find("\"reject_samples\": [");
+    CHECK(reject_at != std::string::npos && world_text.find("\"world\": [null", reject_at) != std::string::npos,
+          "NaN matrix written as a null reject sample");
+    CHECK(manifest_value(manifest_text, "world_pool.json", "dropped") == "0", "no drops before the flood");
+    CHECK(world_text.find("\"truncated\": false,\n") != std::string::npos, "header not truncated before the flood");
+
+    // A NaN capture record (failed mesh history) is written as null, not as a nan token.
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::PoolMeshFailure& failure = bvh::g_pool.failed_meshes[0xFB00u];
+      failure.history.emplace_back();
+      failure.history[0].before[0] = NAN;
+      failure.history[0].after[0] = NAN;
+    }
+    const std::string history_text = read_dump();
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.failed_meshes.erase(0xFB00u);
+    }
+    CHECK(JsonError(history_text).empty(), "NaN capture record dump is valid JSON: %s", JsonError(history_text).c_str());
+    CHECK(!HasNonFiniteToken(history_text), "NaN capture record dump has no nan or inf token");
+    CHECK(history_text.find("\"before\": [null") != std::string::npos, "NaN capture record before[0] written as null");
+
+    // Camera position: GetPoolCameraInfo rejects a non-finite camera, so it is covered by reading the code only.
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (uint64_t k = 0; k < 300u; ++k) bvh::g_pool.failed_meshes[0xFA00u + k] = bvh::PoolMeshFailure{};
+    }
+    const std::string flood_text = read_dump();
+    const std::string flood_manifest = read_file(dir / "world_pool_manifest.json");
+    CHECK(JsonError(flood_text).empty() && JsonError(flood_manifest).empty(), "flood dump is valid JSON");
+    CHECK(std::atoll(manifest_value(flood_manifest, "world_pool.json", "dropped").c_str()) >= 44, "failed_meshes drops counted (%s)",
+          manifest_value(flood_manifest, "world_pool.json", "dropped").c_str());
+    CHECK(manifest_value(flood_manifest, "world_pool.json", "truncated") == "true", "manifest truncated");
+    CHECK(flood_text.find("\"truncated\": true,\n") != std::string::npos, "header truncated");
+    CHECK(manifest_value(flood_manifest, "world_pool.json", "bytes") == std::to_string(std::filesystem::file_size(dir / "world_pool.json")),
+          "world_pool.json manifest bytes after the flood");
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (uint64_t k = 0; k < 300u; ++k) bvh::g_pool.failed_meshes.erase(0xFA00u + k);
+    }
+  }
 
   HStage("7. Reset clears the probe and the moving keys.");
   // 7. Reset clears the probe and the moving keys.

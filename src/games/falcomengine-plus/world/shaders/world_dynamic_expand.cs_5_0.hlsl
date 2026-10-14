@@ -79,6 +79,7 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
         const bool valid = live && abs(det) >= 1e-12 && DynamicWorldPlausible(rows[0], rows[1], rows[2]);
         const float3 translation = float3(rows[0].w, rows[1].w, rows[2].w);
 
+        // header.z = 0: alpha-tested meshes are never recorded (RecordPoolDynamicDraw), so every record is not alpha-tested.
         WorldInstanceGPU record;
         record.header = float4((float)draw.extra.z, 0.0, 0.0, valid ? 1.0 : 0.0);
         record.world[0] = rows[0];

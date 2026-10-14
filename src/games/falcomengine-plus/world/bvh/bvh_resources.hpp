@@ -280,6 +280,8 @@ struct DynamicExpandGpu {
   uint32_t instance_count = 0u;  // records of the last present (the trace reads them)
   GpuTimer timer;                // the expansion pass (bvh_live.hpp ExpandLiveDynamic)
   bool failure_logged = false;   // EnsureDynamicExpand logs its failure once
+  bool ready = false;            // GPU objects created: flagged meshes leave the TLAS (LiveDynamicActive)
+  bool not_ready_logged = false; // UpdateLiveBvh logs a switch on without GPU objects once
 };
 
 struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {

@@ -52,8 +52,11 @@ Texture2DArray<uint> g_alpha_atlas : register(t15);
 StructuredBuffer<AlphaMaterialGPU> g_alpha_materials : register(t16);
 #ifdef WORLD_TRACE_DYNAMIC_INSTANCES
 // Flagged draws of this present (P2b, world_dynamic_expand.cs_5_0.hlsl): expanded instances, traced after the TLAS.
-// Only the trace pass binds them: RTAO uses t17 for its own input.
-StructuredBuffer<WorldInstanceGPU> g_trace_dynamic_instances : register(t17);
+// The including shader picks the slot: the trace pass keeps t17, RTAO binds them at t19 (its t17 is the MRT normal).
+#ifndef WORLD_TRACE_DYNAMIC_SLOT
+#define WORLD_TRACE_DYNAMIC_SLOT t17
+#endif
+StructuredBuffer<WorldInstanceGPU> g_trace_dynamic_instances : register(WORLD_TRACE_DYNAMIC_SLOT);
 #endif
 // Objects in g_trace_dynamic_objects; set by the including shader before tracing.
 static uint g_trace_dynamic_count = 0u;
@@ -662,6 +665,14 @@ WorldTraceHit TraceWorldRay(
             counters.invalid_refs++;
             continue;
         }
+#ifdef WORLD_TRACE_DYNAMIC_SKIP_HIDDEN
+        // The same rule as TraceBlas with view.hide: a record the game camera does not show is never hit.
+        if (view.hide && ((uint)(instance.visibility.z + 0.5) & INSTANCE_CAMERA_VISIBLE) == 0u) continue;
+#endif
+        // Conservative world-space box of the record (WorldInstanceGPU bounds): a miss within best.t is no hit.
+        float box_near;
+        float box_far;
+        if (!AabbIntersect(origin, direction, instance.bounds_min.xyz, instance.bounds_max.xyz, t_min, best.t, box_near, box_far)) continue;
         if (TraceWorldInstance(instance, DYNAMIC_DRAW_FLAG | record_index, origin, direction, t_min, view, hidden_t, counters, best)
             && any_hit)
         {

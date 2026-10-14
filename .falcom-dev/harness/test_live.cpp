@@ -228,6 +228,8 @@ struct TraceInputs {
   View<F4> vertices; View<uint32_t> indices; View<bvh::WorldMeshGPU> meshes; View<bvh::WorldInstanceGPU> instances;
   View<uint32_t> active; View<bvh::BVHNodeGPU> blas_nodes; View<bvh::BVHLeafGPU> blas_leaves;
   View<bvh::BVHNodeGPU> tlas_nodes; View<bvh::BVHLeafGPU> tlas_leaves;
+  View<bvh::WorldInstanceGPU> dynamic;  // P2b records (world_bvh_trace.hlsli g_trace_dynamic_instances)
+  bool dynamic_skip_hidden = false;     // WORLD_TRACE_DYNAMIC_SKIP_HIDDEN (RTAO): records the camera does not show are skipped
 };
 struct Counters { uint32_t invalid = 0, overflow = 0; };
 
@@ -317,6 +319,24 @@ static bool TraceBlas(const TraceInputs& in, uint32_t mesh_id, F3 o, F3 d, float
   }
   return found;
 }
+// One instance (a TLAS leaf or a P2b record) in its local space: TraceBlas with the instance's camera interval
+// (world_bvh_trace.hlsli TraceWorldInstance). Updates best when it is hit nearer.
+static bool TraceInstance(const TraceInputs& in, const bvh::WorldInstanceGPU& inst, uint32_t mesh_id, F3 o, F3 d, Fade fade,
+                          Counters& c, float* best, float* faded_t, uint32_t* best_faded) {
+  const float* iw = inst.inverse_world;
+  const F3 lo = {o.x * iw[0] + o.y * iw[1] + o.z * iw[2] + iw[3], o.x * iw[4] + o.y * iw[5] + o.z * iw[6] + iw[7], o.x * iw[8] + o.y * iw[9] + o.z * iw[10] + iw[11]};
+  const F3 ld = {d.x * iw[0] + d.y * iw[1] + d.z * iw[2], d.x * iw[4] + d.y * iw[5] + d.z * iw[6], d.x * iw[8] + d.y * iw[9] + d.z * iw[10]};
+  float shown_min = 0.f, shown_max = 3.0e38f;
+  const uint32_t visibility_flags = static_cast<uint32_t>(inst.visibility[2] + 0.5f);
+  if ((visibility_flags & 2u) == 0u) { shown_min = 3.0e38f; shown_max = -1.0f; }
+  else if ((visibility_flags & 1u) != 0u) HlslCameraFadeInterval(inst.visibility[0], inst.visibility[1], fade.floor_value, &shown_min, &shown_max);
+  float local_best = *best;
+  uint32_t local_faded = 0u;
+  if (!TraceBlas(in, mesh_id, lo, ld, 0.001f, &local_best, c, shown_min, shown_max, fade.hide, faded_t, &local_faded)) return false;
+  *best = local_best;
+  *best_faded = local_faded;
+  return true;
+}
 static float TraceWorld(const TraceInputs& in, F3 o, F3 d, Counters& c, uint32_t* hit_instance, Fade fade = {},
                         uint32_t* camera_faded = nullptr) {
   *hit_instance = 0xFFFFFFFFu;
@@ -324,7 +344,7 @@ static float TraceWorld(const TraceInputs& in, F3 o, F3 d, Counters& c, uint32_t
   float faded_t = 3.0e38f;
   if (camera_faded) *camera_faded = 0u;
   const uint32_t tl = in.tlas_leaves.count;
-  if (tl == 0) return -1.f;
+  if (tl == 0) return -1.f;  // the TLAS is never empty in the stages that trace P2b records
   const uint32_t tn = 2u * tl - 1u;
   float best = 1e30f; bool any = false;
   uint32_t stack[64]; uint32_t sp = 0, node = 0;
@@ -346,19 +366,8 @@ static float TraceWorld(const TraceInputs& in, F3 o, F3 d, Counters& c, uint32_t
                 const bvh::WorldInstanceGPU inst = in.instances[resolved];
                 const uint32_t mesh_id = (uint32_t)inst.header[0];
                 if (mesh_id >= in.meshes.count) c.invalid++;
-                else {
-                  const float* iw = inst.inverse_world;
-                  const F3 lo = {o.x * iw[0] + o.y * iw[1] + o.z * iw[2] + iw[3], o.x * iw[4] + o.y * iw[5] + o.z * iw[6] + iw[7], o.x * iw[8] + o.y * iw[9] + o.z * iw[10] + iw[11]};
-                  const F3 ld = {d.x * iw[0] + d.y * iw[1] + d.z * iw[2], d.x * iw[4] + d.y * iw[5] + d.z * iw[6], d.x * iw[8] + d.y * iw[9] + d.z * iw[10]};
-                  float shown_min = 0.f, shown_max = 3.0e38f;
-                  const uint32_t visibility_flags = static_cast<uint32_t>(inst.visibility[2] + 0.5f);
-                  if ((visibility_flags & 2u) == 0u) { shown_min = 3.0e38f; shown_max = -1.0f; }
-                  else if ((visibility_flags & 1u) != 0u) HlslCameraFadeInterval(inst.visibility[0], inst.visibility[1], fade.floor_value, &shown_min, &shown_max);
-                  float local_best = best;
-                  uint32_t local_faded = 0u;
-                  if (TraceBlas(in, mesh_id, lo, ld, 0.001f, &local_best, c, shown_min, shown_max, fade.hide, &faded_t, &local_faded)) {
-                    best = local_best; any = true; *hit_instance = resolved; best_faded = local_faded;
-                  }
+                else if (TraceInstance(in, inst, mesh_id, o, d, fade, c, &best, &faded_t, &best_faded)) {
+                  any = true; *hit_instance = resolved;
                 }
               }
             }
@@ -373,6 +382,19 @@ static float TraceWorld(const TraceInputs& in, F3 o, F3 d, Counters& c, uint32_t
     }
     if (sp == 0) break;
     node = stack[--sp];
+  }
+  // P2b records after the TLAS (world_bvh_trace.hlsli): the same instance trace, the record's world box as the
+  // prefilter within best, and the hidden skip when the trace hides what the camera does not show.
+  for (uint32_t r = 0; r < in.dynamic.count; ++r) {
+    const bvh::WorldInstanceGPU inst = in.dynamic[r];
+    if (inst.header[3] < 0.5f) continue;
+    const uint32_t mesh_id = (uint32_t)inst.header[0];
+    if (mesh_id >= in.meshes.count) { c.invalid++; continue; }
+    if (fade.hide && in.dynamic_skip_hidden && (static_cast<uint32_t>(inst.visibility[2] + 0.5f) & 2u) == 0u) continue;
+    if (!Aabb(o, d, inst.bounds_min, inst.bounds_max, 0.001f, best)) continue;
+    if (TraceInstance(in, inst, mesh_id, o, d, fade, c, &best, &faded_t, &best_faded)) {
+      any = true; *hit_instance = 0x40000000u | r;
+    }
   }
   if (camera_faded) *camera_faded = (best_faded != 0u || faded_t < best) ? 1u : 0u;
   return any ? best : -1.f;
@@ -390,6 +412,45 @@ static TraceInputs Inputs(const Device& dev, const bvh::BvhDeviceData& data) {
   in.tlas_nodes = MakeView<bvh::BVHNodeGPU>(dev, data.tlas_node_srv);
   in.tlas_leaves = MakeView<bvh::BVHLeafGPU>(dev, data.tlas_leaf_srv);
   return in;
+}
+
+// The P2b records of every flagged, non-alpha mesh in the region, as world_dynamic_expand.cs_5_0.hlsl writes them: live
+// slot, world rows, closed-form inverse, world box of the local box, draw flags (the shader writes no near fade).
+static std::vector<bvh::WorldInstanceGPU> BuildDynamicRecords(const bvh::BvhDeviceData& data, const bvh::PoolRegion& region) {
+  std::vector<bvh::WorldInstanceGPU> records;
+  std::lock_guard lock(bvh::g_pool.mutex);
+  for (const auto& inst : bvh::g_pool.instances) {
+    if (!bvh::PoolInstanceInRegion(inst, region)) continue;
+    const auto& mesh = bvh::g_pool.meshes[inst.mesh_id];
+    const auto slot = data.slot_by_uid.find(mesh.uid);
+    if (!mesh.dynamic || mesh.alpha || slot == data.slot_by_uid.end()) continue;
+    const auto& local = data.slots[slot->second];
+    bvh::WorldInstanceGPU r = {};
+    r.header[0] = static_cast<float>(slot->second);
+    r.header[3] = 1.f;
+    std::memcpy(r.world, inst.matrix, sizeof(float) * 12u);
+    r.world[15] = 1.f;
+    falcom_world::ComputeMatrixInverse(inst.matrix, r.inverse_world);
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (int corner = 0; corner < 8; ++corner) {
+      const float p[3] = {(corner & 1) ? local.bbox_max[0] : local.bbox_min[0], (corner & 2) ? local.bbox_max[1] : local.bbox_min[1],
+                          (corner & 4) ? local.bbox_max[2] : local.bbox_min[2]};
+      float w[3];
+      falcom_world::TransformInst4x3RowDot(inst.matrix, p[0], p[1], p[2], w);
+      for (int k = 0; k < 3; ++k) {
+        lo[k] = std::min(lo[k], w[k]);
+        hi[k] = std::max(hi[k], w[k]);
+      }
+    }
+    for (int k = 0; k < 3; ++k) {
+      r.bounds_min[k] = lo[k];
+      r.bounds_max[k] = hi[k];
+    }
+    const bvh::PoolCameraVisibility vis = bvh::GetPoolCameraVisibility(inst);
+    r.visibility[2] = static_cast<float>((vis.camera_seen ? bvh::kInstanceCameraVisible : 0u) | (vis.light_seen ? bvh::kInstanceShadowCaster : 0u));
+    records.push_back(r);
+  }
+  return records;
 }
 
 // Brute force over the pool's instances in the region whose mesh is on the GPU.
@@ -552,10 +613,16 @@ static std::vector<RefResult> RefResults(const std::vector<F3>& dirs, F3 origin,
 }
 
 // Rays at triangle centroids of random region instances, plus random rays.
-static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, const char* label, int rays, uint32_t seed) {
+static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, const char* label, int rays, uint32_t seed,
+                         const std::vector<bvh::WorldInstanceGPU>* records = nullptr, Fade fade = {}, bool skip_hidden = false) {
   if (g_quick) rays /= 5;
   const bvh::PoolRegion region = bvh::CurrentPoolRegion();
-  const TraceInputs in = Inputs(dev, data);
+  TraceInputs in = Inputs(dev, data);
+  if (records != nullptr) {
+    in.dynamic.bytes = reinterpret_cast<const uint8_t*>(records->data());
+    in.dynamic.count = static_cast<uint32_t>(records->size());
+  }
+  in.dynamic_skip_hidden = skip_hidden;
   std::mt19937 rng(seed);
   std::uniform_real_distribution<float> uni(-1.f, 1.f);
   float cam[3]; bvh::PoolCameraPosition(cam);
@@ -599,11 +666,11 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
   }
   const std::vector<RefInstance> refs = BuildRefInstances(data, region);
   Stage("%s: start, %d rays", label, rays);
-  const std::vector<RefResult> ref = RefResults(dirs, origin, seed, refs, nullptr);
+  const std::vector<RefResult> ref = RefResults(dirs, origin, seed, refs, fade.hide ? &fade : nullptr);
   for (size_t i = 0; i < dirs.size(); ++i) {
     if (i % 50 == 0) HProgress("  %s: ray %zu/%zu", label, i, dirs.size());
     uint32_t instance;
-    const float t_bvh = TraceWorld(in, origin, dirs[i], c, &instance);
+    const float t_bvh = TraceWorld(in, origin, dirs[i], c, &instance, fade);
     const float t_ref = ref[i].t;
     const bool agree = (t_bvh < 0.f && t_ref < 0.f)
                        || (t_bvh >= 0.f && t_ref >= 0.f && std::fabs(t_bvh - t_ref) <= 1e-3f * std::max(1.f, t_ref));
@@ -1522,6 +1589,86 @@ int main() {
     CHECK(stale_frames == 0u, "TLAS pose follows each frame under structural changes (%u stale frames)", stale_frames);
     CHECK(data->live.tlas_refits - refits >= 12u, "refits between structural changes (%u)", data->live.tlas_refits - refits);
     CHECK(CompareTraces(dev, *data, "structural changes", 60, 26) == 0, "trace agrees after structural changes");
+
+    {
+      // No dynamic instance in the TLAS: a revision bump takes the revision over without copying tlas_info.
+      std::vector<bool> dynamic_flags;
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+          dynamic_flags.push_back(inst.dynamic);
+          inst.dynamic = false;
+        }
+        bvh::g_pool.revision += 1u;
+      }
+      for (int i = 0; i < 10; ++i) present();
+      CHECK(!data->tlas_info.empty() && data->tlas_dynamic_first == data->tlas_info.size(),
+            "no dynamic instance in the TLAS (%u of %zu)", data->tlas_dynamic_first, data->tlas_info.size());
+      const bvh::LiveTlasInstance* info_before = data->tlas_info.data();
+      const uint32_t refits_before = data->live.tlas_refits;
+      uint64_t dynamic_revision = 0u;
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        bvh::g_pool.dynamic_revision += 1u;
+        dynamic_revision = bvh::g_pool.dynamic_revision;
+      }
+      present();
+      CHECK(data->tlas_info.data() == info_before, "revision bump with no dynamic instance: tlas_info not copied");
+      CHECK(data->live.tlas_refits == refits_before, "revision bump with no dynamic instance: no refit (%u -> %u)", refits_before,
+            data->live.tlas_refits);
+      CHECK(data->tlas_dynamic_revision == dynamic_revision, "TLAS revision synced without a refit (%llu)",
+            static_cast<unsigned long long>(data->tlas_dynamic_revision));
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        size_t k = 0u;
+        for (bvh::WorldInstance& inst : bvh::g_pool.instances) inst.dynamic = dynamic_flags[k++];
+        bvh::g_pool.revision += 1u;
+      }
+      for (int i = 0; i < 10; ++i) present();
+
+      // Two drains per revision: the first refits, the second finds the revision already in the TLAS (skipped).
+      uint64_t skipped_before = 0u;
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        skipped_before = bvh::g_pool.tlas_timing.refit_after_drain_skipped;
+      }
+      const uint32_t refits_drain = data->live.tlas_refits;
+      for (int i = 0; i < 2; ++i) {
+        MoveDynamicInstance(kS, 5.9f + 0.1f * static_cast<float>(i), 5.f, frame.load());
+        bvh::RefitLiveTlasAfterDrain(&dev, &queue);
+        bvh::RefitLiveTlasAfterDrain(&dev, &queue);
+        present();
+      }
+      uint64_t skipped_after = 0u;
+      uint64_t after_drain_runs = 0u;
+      uint64_t pool_refits = 0u;
+      uint64_t timing_rebuilds = 0u;
+      uint32_t since_rebuild = 0u;
+      double timing_sums = 0.0;
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        const bvh::PoolTlasTiming& timing = bvh::g_pool.tlas_timing;
+        skipped_after = timing.refit_after_drain_skipped;
+        after_drain_runs = timing.refits_after_drain;
+        pool_refits = timing.refits;
+        timing_rebuilds = timing.rebuilds;
+        since_rebuild = timing.refits_since_rebuild;
+        timing_sums = static_cast<double>(timing.rebuild_ms_sum) + timing.refit_ms_sum + timing.after_drain_ms_sum;
+      }
+      CHECK(data->live.tlas_refits - refits_drain == 2u, "one refit per revision after drains (%u)", data->live.tlas_refits - refits_drain);
+      CHECK(skipped_after - skipped_before == 2u, "covered revision counted as skipped (%llu)",
+            static_cast<unsigned long long>(skipped_after - skipped_before));
+      CHECK(after_drain_runs >= 2u && pool_refits == data->live.tlas_refits, "timing refit count matches live.tlas_refits (%llu, %u)",
+            static_cast<unsigned long long>(pool_refits), data->live.tlas_refits);
+      CHECK(timing_rebuilds == data->live.tlas_rebuilds && since_rebuild == data->tlas_refits_since_rebuild,
+            "timing rebuild count and refits since rebuild match (%llu, %u)", static_cast<unsigned long long>(timing_rebuilds),
+            since_rebuild);
+      CHECK(timing_sums >= 0.0 && data->live.tlas_ms_last >= 0.f && data->live.refit_ms_last >= 0.f,
+            "tlas timing non-negative (sums %.3f ms)", timing_sums);
+      std::printf("tlas_timing: rebuilds %llu, refits %llu, after drain %llu (skipped %llu), since rebuild %u, sums %.3f ms\n",
+                  static_cast<unsigned long long>(timing_rebuilds), static_cast<unsigned long long>(pool_refits),
+                  static_cast<unsigned long long>(after_drain_runs), static_cast<unsigned long long>(skipped_after), since_rebuild, timing_sums);
+    }
   }
 
   Stage("8g static instance flips to dynamic");
@@ -1557,28 +1704,112 @@ int main() {
     AddMesh(kG, Grid(7, 9, 4.f, 0.6f));  // distinct content: identical meshes share one slot
     AddInstance(kG, 5.f, 0.f, 5.f);
     AddInstance(kG, -4.f, 0.f, 3.f);
+    // kH: an alpha-tested flagged mesh with a slice (ready). Its draws are never recorded, so it stays in the TLAS.
+    const uint64_t kH = 0xFB;
+    bvh::PoolDecodedMesh alpha_mesh = Grid(6, 6, 4.f, 0.5f);
+    alpha_mesh.uvs.assign(alpha_mesh.positions.size(), {0.f, 0.f});
+    AddMesh(kH, alpha_mesh);
     uint64_t uid = 0u;
+    uint64_t alpha_uid = 0u;
     {
       std::lock_guard lock(bvh::g_pool.mutex);
       const uint32_t mesh_id = bvh::g_pool.mesh_by_key.at(kG);
       bvh::g_pool.meshes[mesh_id].dynamic = true;
       bvh::g_pool.dynamic_flag_revision += 1u;
       uid = bvh::g_pool.meshes[mesh_id].uid;
+      const uint32_t alpha_id = bvh::g_pool.mesh_by_key.at(kH);
+      bvh::MarkPoolMeshAlpha(alpha_id, bvh::g_pool.alpha_keys[kH]);
+      bvh::g_pool.meshes[alpha_id].dynamic = true;
+      bvh::g_pool.dynamic_flag_revision += 1u;
+      alpha_uid = bvh::g_pool.meshes[alpha_id].uid;
     }
-    const auto in_tlas = [&]() {
+    AddInstance(kH, 2.f, 0.f, -6.f);
+    AddInstance(kH, -6.f, 0.f, -2.f);
+    const int32_t slice = data->alpha.slices.Acquire(alpha_uid);
+    CHECK(slice >= 0, "alpha stage: a slice for the flagged alpha mesh");
+    data->alpha.slot_of_uid[alpha_uid] = static_cast<uint32_t>(slice);
+    const auto in_tlas = [&](uint64_t mesh_uid) {
       size_t count = 0u;
-      for (const auto& info : data->tlas_info) count += info.uid == uid ? 1u : 0u;
+      for (const auto& info : data->tlas_info) count += info.uid == mesh_uid ? 1u : 0u;
       return count;
     };
+    const auto not_ready_logs = [&]() {
+      std::lock_guard lock(renodx::utils::log::g_lines_mutex);
+      size_t count = 0u;
+      for (const auto& line : renodx::utils::log::g_lines) count += line.second.find("GPU objects not ready") != std::string::npos ? 1u : 0u;
+      return count;
+    };
+    // Not ready (no GPU objects, as the harness never runs the expansion): the switch on keeps the flagged mesh in the TLAS.
+    data->dynamic.not_ready_logged = false;
+    const size_t logs_before = not_ready_logs();
     for (int i = 0; i < 3; ++i) present();
-    CHECK(in_tlas() == 0u, "P2b: flagged mesh left out of the TLAS (%zu)", in_tlas());
+    CHECK(in_tlas(uid) == 2u, "P2b not ready: flagged mesh stays in the TLAS (%zu)", in_tlas(uid));
+    CHECK(not_ready_logs() == logs_before + 1u, "P2b not ready: logged once over 3 presents (%zu)", not_ready_logs() - logs_before);
+    data->dynamic.ready = true;
+    present();
+    CHECK(in_tlas(uid) == 0u, "P2b ready: flagged mesh left out of the TLAS (%zu)", in_tlas(uid));
+    CHECK(in_tlas(alpha_uid) == 2u, "P2b ready: flagged alpha mesh stays in the TLAS (%zu)", in_tlas(alpha_uid));
+    present();
+    CHECK(not_ready_logs() == logs_before + 1u, "P2b ready: no further not-ready log (%zu)", not_ready_logs() - logs_before);
     bvh::g_pool.dynamic_per_frame.store(false);
     present();
-    CHECK(in_tlas() == 2u, "switch off at once: P2a path keeps its instances (%zu)", in_tlas());
+    CHECK(in_tlas(uid) == 2u, "switch off at once: P2a path keeps its instances (%zu)", in_tlas(uid));
     bvh::g_pool.dynamic_per_frame.store(true);
     present();
-    CHECK(in_tlas() == 0u, "switch on at once: left out again (%zu)", in_tlas());
+    CHECK(in_tlas(uid) == 0u, "switch on at once: left out again (%zu)", in_tlas(uid));
+    CHECK(in_tlas(alpha_uid) == 2u, "switch on at once: alpha mesh still in the TLAS (%zu)", in_tlas(alpha_uid));
     CHECK(CompareTraces(dev, *data, "per-frame", 40, 22) == 0, "trace agrees with the per-frame switch");
+    // P2b records of the flagged mesh (left out of the TLAS): with them the trace agrees with brute force, without them it does not.
+    const std::vector<bvh::WorldInstanceGPU> records = BuildDynamicRecords(*data, bvh::CurrentPoolRegion());
+    CHECK(records.size() >= 2u, "P2b records: one per flagged instance (%zu)", records.size());
+    CHECK(CompareTraces(dev, *data, "P2b records", 300, 23, &records) == 0, "trace with the P2b records agrees with brute force");
+    CHECK(CompareTraces(dev, *data, "no P2b records", 300, 23) > 0, "without the P2b records the flagged mesh is missing from the trace");
+    // alpha_foliage OFF drops the alpha instances at once, whatever the per-frame rule says.
+    bvh::g_pool.alpha_foliage.store(false);
+    present();
+    CHECK(in_tlas(alpha_uid) == 0u, "alpha_foliage off: the flagged alpha mesh is dropped (%zu)", in_tlas(alpha_uid));
+    bvh::g_pool.alpha_foliage.store(true);
+    // Destroy clears ready: the flagged mesh goes back into the TLAS, and the not-ready log is armed again.
+    bvh::DestroyDynamicExpand(&dev, data);
+    present();
+    CHECK(in_tlas(uid) == 2u, "P2b destroy: instances return to the TLAS (%zu)", in_tlas(uid));
+    CHECK(not_ready_logs() == logs_before + 2u, "P2b destroy: not-ready logged again after re-arm (%zu)", not_ready_logs() - logs_before);
+  }
+
+  Stage("8i flag flips coalesce to the rebuild interval; the switch stays immediate");
+  {
+    // A flag that flips every present rebuilds the TLAS once per kLiveTlasInterval presents, not once per present.
+    const uint64_t kF = 0xFC;
+    AddMesh(kF, Grid(5, 5, 4.f, 0.7f));
+    AddInstance(kF, 1.f, 0.f, 8.f);
+    uint32_t mesh_id = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      mesh_id = bvh::g_pool.mesh_by_key.at(kF);
+    }
+    data->dynamic.ready = true;
+    present();  // the readiness switch is applied at once
+    const uint32_t settled = data->live.tlas_rebuilds;
+    for (int i = 0; i < 24; ++i) {
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        bvh::g_pool.meshes[mesh_id].dynamic = (i % 2) == 0;
+        bvh::g_pool.dynamic_flag_revision += 1u;
+      }
+      present();
+    }
+    const uint32_t flips = data->live.tlas_rebuilds - settled;
+    CHECK(flips <= 24u / bvh::kLiveTlasInterval + 1u, "flag flips: %u rebuilds over 24 presents (limit %u)", flips, 24u / bvh::kLiveTlasInterval + 1u);
+    const uint32_t before_off = data->live.tlas_rebuilds;
+    bvh::g_pool.dynamic_per_frame.store(false);
+    present();
+    CHECK(data->live.tlas_rebuilds == before_off + 1u, "switch off: rebuilt on the next present (%u)", data->live.tlas_rebuilds - before_off);
+    const uint32_t before_on = data->live.tlas_rebuilds;
+    bvh::g_pool.dynamic_per_frame.store(true);
+    present();
+    CHECK(data->live.tlas_rebuilds == before_on + 1u, "switch on: rebuilt on the next present (%u)", data->live.tlas_rebuilds - before_on);
+    bvh::DestroyDynamicExpand(&dev, data);
+    RetireMesh(0xFC);
   }
 
   RetireMesh(0xF6);
@@ -1586,6 +1817,7 @@ int main() {
   RetireMesh(0xF8);
   RetireMesh(0xF9);
   RetireMesh(0xFA);
+  RetireMesh(0xFB);
   for (int i = 0; i < 9; ++i) present();
 
   Stage("9 requested reset");

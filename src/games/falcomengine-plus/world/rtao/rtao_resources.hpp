@@ -16,8 +16,8 @@
 namespace falcom_world::rtao {
 
 // t0..t8 BVH, t9 game depth, t10..t13 deforming (null in round 1), t14..t16 alpha,
-// t17 MRT normal, t18 IS-FAST noise.
-inline constexpr uint32_t kRtaoSrvCount = 19u;
+// t17 MRT normal, t18 IS-FAST noise, t19 P2b records (bvh_resources.hpp DynamicExpandGpu; the trace reads them at t17).
+inline constexpr uint32_t kRtaoSrvCount = 20u;
 // Pass A: u0 AO, u1 stats, u2 raw AO (used only with output_raw). Pass B: u0 AO, u1 stats, u2 history write.
 inline constexpr uint32_t kRtaoUavCount = 3u;
 inline constexpr uint32_t kRtaoPushRegister = 12u;
@@ -76,7 +76,7 @@ inline constexpr uint32_t kRtaoStatScaled = 9u;
 struct RtaoPushConstants {
   float params[4];    // c0: radius, ray_max, strength, normal_bias
   float sampling[4];  // c1: spp, isfast flag (1 loaded), slice base, seed
-  float fade[4];      // c2: fade start_eff, fade end_eff, 0, 0
+  float fade[4];      // c2: fade start_eff, fade end_eff, discovery (z), P2b record count (w, uint bits)
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: width, height, dynamic count (0), output_raw (1 = write u2 raw AO, not u0)
 };

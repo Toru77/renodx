@@ -62,6 +62,7 @@ struct RtaoFrameState {
   float matrix_prev_diff = 0.f;
   ParameterSnapshot captured = {};   // parameters of the last successful dispatch (P0)
   bool captured_isfast_used = false;
+  uint32_t p2b_records = 0u;         // P2b records the newest dispatch traced (fade.w)
 };
 
 inline RtaoFrameState g_rtao_frame;
@@ -211,6 +212,8 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   push.size[1] = static_cast<float>(in.height);
   push.size[2] = 0.f;  // round 1: deforming objects are not traced (t10-t13 null)
   push.size[3] = temporal_run ? 1.f : 0.f;  // output_raw: pass A writes u2 for pass B
+  std::memcpy(&push.fade[3], &bvh_data->dynamic.instance_count, sizeof(uint32_t));  // P2b records (t19)
+  g_rtao_frame.p2b_records = bvh_data->dynamic.instance_count;
 
   // Whole-buffer write (offset 0, full size): see WriteBufferRange in bvh_resources.hpp.
   const uint32_t zeros[kRtaoStatsCount] = {};
@@ -223,6 +226,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, bvh::DynamicTraceInputs{}, srvs);
   srvs[17] = in.mrt_normal_view;
   srvs[18] = in.isfast_view;
+  srvs[19] = bvh_data->dynamic.instances_srv;
   const reshade::api::resource_view uavs[kRtaoUavCount] = {data.ao_uav, data.stats_uav, data.raw_uav[data.raw_index]};
   reshade::api::descriptor_table_update updates[3] = {
       {data.cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &in.scene_cbv_view},
@@ -403,6 +407,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
       << ",\n  \"producing\": " << (f.producing ? "true" : "false")
       << ",\n  \"gpu_ms\": " << f.gpu_ms
       << ",\n  \"texture_bytes\": " << f.texture_bytes
+      << ",\n  \"p2b_records\": " << f.p2b_records
       << ",\n  \"frames_without_ao\": " << f.frames_without_ao
       << ",\n  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
       << ", \"coverage\": " << f.fade.coverage << "}"

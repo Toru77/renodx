@@ -485,6 +485,11 @@ inline void SyncLiveMeshes(
 // Refit every present while swayed wind instances are in the TLAS (the sway moves them every frame).
 inline bool WindSwayPending(const BvhDeviceData& data) { return data.tlas_sway_on && data.tlas_wind_count != 0u; }
 
+// P2b: flagged meshes leave the TLAS only with the switch on and their GPU objects created (draws record from then on).
+inline bool LiveDynamicActive(const BvhDeviceData& data) {
+  return g_pool.dynamic_per_frame.load(std::memory_order_relaxed) && data.dynamic.ready;
+}
+
 inline const char* LiveTlasChange(const BvhDeviceData& data, uint64_t revision, uint64_t visibility_revision,
                                   const PoolRegion& region) {
   if (data.live.tlas_rebuilds == 0u && !data.tlas_built && data.tlas_pool_revision == 0u) return "first build";
@@ -544,6 +549,16 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
   WindSwayDisplacement(sway->second, origin, instance.param2, displacement);
   WindSwayBound(sway->second, instance.param2, bound);
   for (int k = 0; k < 3; ++k) {
+    if (!std::isfinite(displacement[k]) || !std::isfinite(bound[k]) || !std::isfinite(origin[k] + displacement[k])) {
+      g_pool.stats.wind_sway_skipped_nonfinite += 1u;
+      return;  // rest pose kept (the instance stays in the wind partition)
+    }
+    if (std::fabs(origin[k] + displacement[k]) > kPoolMaxPosition || bound[k] > kPoolMaxPosition) {
+      g_pool.stats.wind_sway_skipped_range += 1u;
+      return;
+    }
+  }
+  for (int k = 0; k < 3; ++k) {
     copy->matrix[3 + 4 * k] = origin[k] + displacement[k];
     copy->bounds_min[k] -= bound[k];
     copy->bounds_max[k] += bound[k];
@@ -594,7 +609,7 @@ inline void RebuildLiveTlas(
   uint64_t visibility_revision = 0u;
   uint64_t dynamic_revision = 0u;
   uint64_t flag_revision = 0u;
-  const bool per_frame = g_pool.dynamic_per_frame.load(std::memory_order_relaxed);
+  const bool per_frame = LiveDynamicActive(*data);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     revision = g_pool.revision;
@@ -606,7 +621,7 @@ inline void RebuildLiveTlas(
     g_pool.stats.wind_sway_bound_m = 0.f;
     for (const WorldInstance& instance : g_pool.instances) {
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
-      if (per_frame && g_pool.meshes[instance.mesh_id].dynamic) continue;  // P2b: drawn per frame, not in the TLAS
+      if (per_frame && g_pool.meshes[instance.mesh_id].dynamic && !g_pool.meshes[instance.mesh_id].alpha) continue;  // P2b: drawn per frame, not in the TLAS (alpha: never recorded)
       LiveTlasInstance& copy = snapshot.emplace_back();
       copy.uid = g_pool.meshes[instance.mesh_id].uid;
       copy.alpha = g_pool.meshes[instance.mesh_id].alpha;
@@ -705,6 +720,15 @@ inline void RebuildLiveTlas(
   const auto finish = [&]() {
     stats.tlas_ms_last = LiveElapsedMs(start);
     stats.tlas_ms_max = (std::max)(stats.tlas_ms_max, stats.tlas_ms_last);
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    PoolTlasTiming& timing = g_pool.tlas_timing;
+    timing.rebuilds += 1u;
+    timing.rebuilds_refit_quality += std::strcmp(reason, "refit quality") == 0 ? 1u : 0u;
+    timing.rebuilds_refit_failed += std::strcmp(reason, "refit failed") == 0 ? 1u : 0u;
+    timing.rebuild_ms_last = stats.tlas_ms_last;
+    timing.rebuild_ms_max = stats.tlas_ms_max;
+    timing.rebuild_ms_sum += stats.tlas_ms_last;
+    timing.refits_since_rebuild = data->tlas_refits_since_rebuild;
   };
   if (instances.empty()) {
     DestroyLiveTlas(device, data);
@@ -804,7 +828,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
                           uint32_t frame) {
   const auto start = std::chrono::steady_clock::now();
   LiveBvhStats& stats = data->live;
-  std::vector<LiveTlasInstance> updated = data->tlas_info;
+  std::vector<LiveTlasInstance> updated;
   uint64_t dynamic_revision = 0u;
   uint32_t missing = 0u;
   uint32_t lag = 0u;
@@ -815,6 +839,12 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     g_pool.stats.wind_sway_instances = 0u;
     g_pool.stats.wind_sway_max_m = 0.f;
     g_pool.stats.wind_sway_bound_m = 0.f;
+    // No dynamic instance in the TLAS: nothing to follow. Only the revision is taken over (no copy, no refit, no count).
+    if (data->tlas_dynamic_first >= data->tlas_info.size() && !WindSwayPending(*data)) {
+      data->tlas_dynamic_revision = dynamic_revision;
+      return;
+    }
+    updated = data->tlas_info;
     for (uint32_t i = data->tlas_dynamic_first; i < updated.size(); ++i) {
       LiveTlasInstance& copy = updated[i];
       // Pool instances are kept sorted by ascending id (test_motion checks it).
@@ -840,6 +870,10 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   const auto finish = [&]() {
     stats.refit_ms_last = LiveElapsedMs(start);
     stats.refit_ms_max = (std::max)(stats.refit_ms_max, stats.refit_ms_last);
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.tlas_timing.refit_ms_last = stats.refit_ms_last;
+    g_pool.tlas_timing.refit_ms_max = stats.refit_ms_max;
+    g_pool.tlas_timing.refit_ms_sum += stats.refit_ms_last;
   };
   const auto fail = [&](const std::string& why) {
     stats.refit_failures += 1u;
@@ -921,6 +955,8 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.on_screen_lag_last = on_screen_lag;
     g_pool.stats.on_screen_lag_max = (std::max)(g_pool.stats.on_screen_lag_max, on_screen_lag);
+    g_pool.tlas_timing.refits += 1u;
+    g_pool.tlas_timing.refits_since_rebuild = data->tlas_refits_since_rebuild;
   }
   finish();
 }
@@ -1480,6 +1516,14 @@ inline bool EnsureDynamicExpand(reshade::api::device* device, BvhDeviceData* dat
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.dynamic_arena = dynamic.arena;
   }
+  if (!dynamic.ready) {
+    // The arena is published above, so draws record from now on. The flagged meshes leave the TLAS at the next TLAS
+    // rebuild, while their records come from the next expansion: a window of one present can have them in neither
+    // (not avoided: the expansion runs in ExpandLiveDynamic, the rebuild in UpdateLiveBvh).
+    dynamic.ready = true;
+    dynamic.not_ready_logged = false;
+    renodx::utils::log::i("[world-bvh] P2b: GPU objects ready (arena ", kPoolDynamicArenaBytes / 1024u, " KB, records ", kPoolDynamicInstances, ")");
+  }
   return true;
 }
 
@@ -1594,7 +1638,11 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     uint64_t visibility_revision = 0u;
     uint64_t dynamic_revision = 0u;
     uint64_t flag_revision = 0u;
-    const bool per_frame = g_pool.dynamic_per_frame.load(std::memory_order_relaxed);
+    const bool per_frame = LiveDynamicActive(*data);
+    if (g_pool.dynamic_per_frame.load(std::memory_order_relaxed) && !data->dynamic.ready && !data->dynamic.not_ready_logged) {
+      data->dynamic.not_ready_logged = true;
+      renodx::utils::log::w("[world-bvh] P2b: flagged meshes stay in the TLAS (GPU objects not ready)");
+    }
     {
       std::lock_guard<std::mutex> lock(g_pool.mutex);
       revision = g_pool.revision;
@@ -1621,9 +1669,10 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     const bool alpha_off_now = (data->tlas_alpha_mode & ~AlphaMode()) != 0u;
     // The sway switch moves wind instances between their rest and sway poses (and partitions): applied at once, like alpha OFF.
     const bool sway_switched = data->tlas_sway_on != g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
+    // Flag changes wait for the rebuild interval (up to 8 presents of latency: a short ghost or duplicate in the debug view and RTAO for a flag set); switch changes are immediate.
     if (change != nullptr && frame >= data->tlas_retry_frame
         && (data->live.tlas_rebuilds == 0u || frame - data->live.tlas_frame >= kLiveTlasInterval || frame < data->live.tlas_frame
-            || alpha_off_now || sway_switched || per_frame_switched || flags_changed)) {
+            || alpha_off_now || sway_switched || per_frame_switched)) {
       RebuildLiveTlas(device, data, region, frame, change);
     } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
       RebuildLiveTlas(device, data, region, frame, "refit failed");
@@ -1658,11 +1707,22 @@ inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     dynamic_revision = g_pool.dynamic_revision;
   }
+  // A WindSwayPending clause here would be dead: it sits under the revision check above, so it is always true.
   if (data->tlas_built && frame >= data->tlas_retry_frame && !data->tlas_refit_failed
       && data->tlas_store_version == data->store_version && data->tlas_dynamic_revision != dynamic_revision
-      && (data->tlas_dynamic_revision != dynamic_revision || WindSwayPending(*data))
       && data->tlas_refits_since_rebuild < kLiveTlasRefitsPerRebuild && (data->tlas_alpha_mode & ~AlphaMode()) == 0u) {
+    const auto start = std::chrono::steady_clock::now();
     RefitLiveTlas(device, cmd_list, data, frame);
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    PoolTlasTiming& timing = g_pool.tlas_timing;
+    timing.refits_after_drain += 1u;
+    timing.after_drain_ms_last = LiveElapsedMs(start);
+    timing.after_drain_ms_max = (std::max)(timing.after_drain_ms_max, timing.after_drain_ms_last);
+    timing.after_drain_ms_sum += timing.after_drain_ms_last;
+  } else if (data->tlas_built && data->tlas_store_version == data->store_version
+             && data->tlas_dynamic_revision == dynamic_revision) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.tlas_timing.refit_after_drain_skipped += 1u;
   }
 }
 }  // namespace falcom_world::bvh

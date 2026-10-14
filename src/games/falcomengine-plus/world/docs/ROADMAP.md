@@ -34,7 +34,7 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
 - [ ] Step 1: map-change retirement in `CompactPool`. When a mass retirement happens, remove instances not seen since the map change; their observations are cleared and they re-admit after fresh sightings. Harness: a `test_pool` case. Fixes: P-5 (and clears stale instances that pollute the other dumps).
 - [ ] Step 2: alpha material dedup. Mix the alpha texture identity into `PoolMeshSignature`, so the same geometry with different textures becomes separate meshes. Harness: `test_alpha` with two textures on identical geometry. Fixes: P-2, P-4.
 - [ ] Step 3: diagnostics. (a) per-VS alpha refusal counters and sightings with no mesh; (b) an inspect mode for "why is this pixel missing" (lists each pool instance along the ray with its status: in TLAS, conflicted, alpha waiting, hidden, failed mesh); (c) an on-screen follow-lag readout (frames since last follow, camera-seen instances only). Settles the wind-VS families and the missing pixel for P-4 and gives a measurement for P-3.
-- [ ] Step 4: sign latency. (a) dynamic-only refit in the same present after `DrainPoolScan`; (b) shorter orphan retirement: retire the old pose when a fresher instance of the same key is admitted. Harness: `test_deform_live`/`test_pool` case. Fixes: P-3 (partly). Full zero-latency path (P2b) is a separate milestone.
+- [ ] Step 4: sign latency. (a) dynamic-only refit in the same present after `DrainPoolScan`; (b) shorter orphan retirement: retire the old pose when a fresher instance of the same key is admitted. Harness: `test_deform_live`/`test_pool` case. Fixes: P-3 (partly). Full per-frame path (P2b) is a separate milestone.
 - [ ] Step 5: foliage sway approach for P-1. Decision after Steps 1 to 4. Options: (a) keep rest pose and say so; (b) per-instance CPU sway approximation through `RefitLiveTlas`; (c) P2b-style draw-time copy. Owner decides.
 
 ## Owner decisions and dump findings (2026-10-14, after first in-game round)
@@ -43,7 +43,7 @@ In game: P-5 random_plane fixed (confirmed). P-2 missing_random not fixed. P-4 l
 
 Decisions:
 - Foliage/leaf animation (P-1, P-4): option (b), CPU approximation (rigid per-instance sway from the wind VS formula). Revisit later if the look is not good enough.
-- Sign lag and ghosts (P-3): P2b (draw-time copy path, zero latency) is the next milestone.
+- Sign lag and ghosts (P-3): P2b (draw-time copy path, one frame behind) is implemented in the working tree, not validated in game.
 
 Dumps analysed (folders under renodx-dev\falcomengine-plus\world\): foliage_animate, dynamic_object_slow, tree_leaves_not_animating, missing_random visible, missing_random not visible.
 
@@ -58,7 +58,7 @@ Findings:
 - P-4 (leaves): tree_leaves_not_animating has 47 alpha keys, 4 without a mesh, 1 wind key, and 1880 TLAS alpha instances. Leaves are admitted at their rest pose, as expected before the CPU sway (P-1).
 - P-1 (foliage): foliage_animate has 16 failed mesh captures (8 unstable, 8 vertex range). Foliage animation is the rest pose today; the CPU approximation (decision (b)) is next.
 
-Not yet done: the CPU sway approximation (decision (b)) and P2b. Both need a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
+P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
 ## Current state (2026-10-09)
 
@@ -84,14 +84,14 @@ RTAO round 2 and D1 (2026-10-09, implemented, awaiting in-game validation): temp
 
 Agreed plan, in order (owner's words in "Plan agreed 2026-10-07" below):
 1. Deforming meshes (stream-out): done for characters and water. Wind foliage and billboards moved into path 3.
-2. Moving rigid objects (doors, carts, the fork an NPC holds): in progress (P2a deployed, P2b next).
+2. Moving rigid objects (doors, carts, the fork an NPC holds): in progress (P2a deployed, P2b implemented in the working tree, not validated in game).
 3. Alpha-tested geometry (foliage, leaves, fences, plus wind foliage as its rigid rest pose; billboards refused, `not_rigid`): in progress, see above.
 4. First RT effect: RTAO. Options exactly: Radius, Strength, Samples Per Pixel, Ray Max Distance, Normal Bias, Two-Sided Geometry, Temporal Accumulation {History Weight, Depth Rejection, Normal Rejection, History Clamp}, Denoising {Spatial Filter, Filter Radius, Filter Quality}, Distance Fade {Fade Start, Fade End}. Temporal Accumulation and Denoising are not implemented yet but their UI must exist (dead code OK). Use IS-FAST blue noise (already used by the custom DOF, motion blur and GTVBAO in this addon; see `fast_noise_ea.h`, `gtvbao/`). When RTAO is on it overrides GTVBAO even if GTVBAO is toggled on, and the GTVBAO control is greyed out; when RTAO is off, GTVBAO is back under its own control.
 5. M8/M13 (tracer optimization): after BVH contents are steady.
 
 Next steps:
 - Owner in-game validation: Path 2 (P2a, P2a-rev) and the alpha steps below. Send back the listed panel lines and dumps.
-- P2b (per-frame path for flagged moving meshes): design under Reference: Path 2. Not started.
+- P2b (per-frame path for flagged moving meshes): design under Reference: Path 2. Implemented in the working tree, not validated in game.
 - RTAO round 1 and round 2 (temporal, D1 discovery) are awaiting in-game validation (see Reference: RTAO and RTAO round 2). Next: round 3 (spatial denoising, dynamic objects) after the owner reports; D2 (culling) is planned only after the D1 counters.
 
 GPU cost note (owner asked): the BVH debug trace (~17-22 ms) is a validation tracer. See "GPU cost of the BVH debug views (2026-10-07)" in the history. RT effects will use any-hit short rays at reduced resolution with accumulation; tracer optimization is milestone M8/M13, after BVH contents are steady.
@@ -159,11 +159,11 @@ Owner checks for P2a (not yet done):
 3. Depth Compare: moving objects now "missing" is expected; nothing static should newly go missing (if it does: inspect it, check `dynamic` entries with large `retired_instances`, the mesh-level flag may be too broad for shared assets).
 4. `world_pool.json` -> review `dynamic` entries.
 
-P2b (next, not started), proposed design:
+P2b (implemented in the working tree, not validated in game), proposed design:
 - For flagged meshes, every frame copy the instance slices of their draws (camera and shadow, direct and indirect; slice math from the pool's `ResolvePoolSlice`/`ReservePoolCopy`, b1 base from the CB mirror, indirect counts from the args) GPU-to-GPU into a per-frame arena, plus a small per-draw table (mesh descriptor in the live store, slice offset, count or args offset).
 - A compute pass expands them into instance records with the same GPU layout as static instances (`WorldInstanceGPU`: world, inverse, bounds, mesh index, visibility flags), skipping zero-scale/parked matrices like `CheckPoolWorld`; inverse must match `ComputeMatrixInverse` (transcribe + test). Camera-drawn instances get the camera-visible flag; shadow-only ones the shadow-caster flag.
 - The trace walks them as a small list next to the TLAS (like the S2 dynamic loop), reusing the static instance/BLAS traversal (one implementation). Requires the mesh to be resident in the live store even with no static instance (check `bvh_live.hpp` mesh streaming selection).
-- Zero latency (copied at draw time, traced at present). Trade-off of the mesh-level policy: a flagged mesh exists in the BVH only where the game draws it that frame (camera or shadow cascades).
+- One frame of latency: the slices are copied at the draw of frame N and expanded at present N, after that present's trace, so the trace of present N+1 and RTAO in frame N+1 read the poses of frame N. There is no staging-ring delay (the static follow path is about 3 to 4 presents behind). Trade-off of the mesh-level policy: a flagged mesh exists in the BVH only where the game draws it that frame (camera or shadow cascades).
 - Diagnostics: per-frame dynamic instance count, draws copied, skipped with reasons, arena use, GPU time; inspect lines for dynamic instances.
 - Tests: extend the harness like test_deform_live (emulate the expansion + trace vs brute force).
 

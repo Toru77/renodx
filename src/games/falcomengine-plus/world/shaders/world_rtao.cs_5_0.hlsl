@@ -2,13 +2,17 @@
 //
 // One thread per pixel over the game depth size, dispatched inline in the lighting
 // hook. Cosine-hemisphere rays are traced through the live BVH (world_bvh_trace.hlsli
-// with dynamic count 0: characters and water do not occlude in round 1). The AO is
+// with dynamic count 0: characters and water do not occlude yet; the P2b records at t19 do). The AO is
 // written to u0 as a 0..255 texel (255 = neutral). Per-group counters are reduced in
 // groupshared memory and added to u1 (RTAO_STAT_*).
 //
 // Camera: the game scene CBV bound as b0 (viewInv_g, viewProjInv_g), not g_state.camera.
 // Sampling: IS-FAST blue noise (t18, Load only, 128x128x32), or IGN when it is not loaded.
 
+// P2b records at t19 (t17 is the MRT normal here); camera-hidden records are skipped (RTAO views hide them).
+#define WORLD_TRACE_DYNAMIC_INSTANCES
+#define WORLD_TRACE_DYNAMIC_SLOT t19
+#define WORLD_TRACE_DYNAMIC_SKIP_HIDDEN
 #include "world_bvh_trace.hlsli"
 #include "../../include/mrt_normal.hlsli"
 
@@ -33,7 +37,7 @@ cbuffer cb_rtao : register(b12)
 {
     float4 g_rtao_params : packoffset(c0);    // radius, ray_max, strength, normal_bias
     float4 g_rtao_sampling : packoffset(c1);  // spp, isfast flag (1 loaded), slice base, seed
-    float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, 0, 0
+    float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, discovery (z), P2b record count (w, uint bits)
     float4 g_rtao_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtao_size : packoffset(c4);      // width, height, dynamic count (0), output_raw (1 = write u2, not u0)
 };
@@ -178,6 +182,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
     // Round 1: no deforming objects in the RTAO trace (t10-t13 are null).
     g_trace_dynamic_count = (uint)g_rtao_size.z;
+    g_trace_dynamic_instance_count = asuint(g_rtao_fade.w);
     const uint group_index = gid.y * 8u + gid.x;
     if (group_index < RTAO_STAT_COUNT) gs_stats[group_index] = 0u;
     if (group_index < RTAO_DISC_COUNT) gs_disc[group_index] = 0u;
