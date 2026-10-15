@@ -817,7 +817,11 @@ int main() {
     s = snapshot();
     CHECK(s.dynamic_moving_keys == 1u && s.dynamic_meshes == 1u && s.dynamic_released == 1u,
           "re-armed: moving %zu flagged %zu released %u", s.dynamic_moving_keys, s.dynamic_meshes, s.dynamic_released);
-    run(120);  // frame 500: stopped again and released again
+    run(120);  // frame 500: stopped at frame 390, released before: still inside the 300-frame hot hold
+    s = snapshot();
+    CHECK(s.dynamic_moving_keys == 1u && s.dynamic_meshes == 1u && s.dynamic_released == 1u,
+          "held after the second stop (moving %zu flagged %zu released %u)", s.dynamic_moving_keys, s.dynamic_meshes, s.dynamic_released);
+    run(200);  // frame 700: released after the hot hold
     s = snapshot();
     CHECK(s.dynamic_moving_keys == 0u && s.dynamic_meshes == 0u && s.dynamic_released == 2u,
           "second release (moving %zu flagged %zu released %u)", s.dynamic_moving_keys, s.dynamic_meshes, s.dynamic_released);
@@ -906,6 +910,96 @@ int main() {
     run(70);
     s = snapshot();
     CHECK(s.admitted == 1u && s.dynamic_meshes == 0u, "static admitted (admitted %zu, flagged %zu)", s.admitted, s.dynamic_meshes);
+  }
+
+  HStage("20b. Door: moves A -> B, stops, releases; moves back to A within the hot hold;");
+  // 20b. A door moves A -> B and stops; released after the hold. It moves back
+  // to A within kPoolHotHoldFrames of that release and stops. Sightings are
+  // taken once per kPoolRecaptureFrames per draw identity, so the re-flag and
+  // the release come within one capture interval of their trigger. The door has
+  // a TLAS representation (flagged record or admitted instance) on every frame
+  // from the move's first flag on; the handover gap is counted and printed.
+  // Idle past the hot hold: released, admitted at A.
+  {
+    fresh();
+    const uint32_t start = falcom_world::g_state.frame.load();
+    auto door_x = [](uint32_t t) {
+      return t < 150u ? 1.f : t < 210u ? 1.f + 0.1f * (t - 150u) : t < 300u ? 7.f : t < 386u ? 7.f - 0.07f * (t - 300u) : 1.f;
+    };
+    objects.push_back({make_vb(1.f).handle, 1, [start, door_x](uint32_t f, uint32_t, float* w, float* p) {
+      f -= start;
+      Place(w, door_x(f)); Place(p, door_x(f == 0u ? 0u : f - 1u));
+    }});
+    auto admitted_at = [&](float x) {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (const auto& instance : bvh::g_pool.instances) {
+        if (instance.matrix[3] == x) return true;
+      }
+      return false;
+    };
+    auto represented = [&]() {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      return !dynamic_frame.empty() || !bvh::g_pool.instances.empty();
+    };
+    auto rel = [&]() { return falcom_world::g_state.frame.load() - start; };
+    auto step = [&]() {
+      run(1);
+      return represented();
+    };
+    run(140);
+    CHECK(admitted_at(1.f), "door static at A before the move");
+    uint32_t gaps = 0u, static_at_b_stop = 0u, move_lag = 0u, move_gaps = 0u;
+    while (rel() < 290u) {  // move A -> B, stop at B, released after the hold
+      const bool represented_now = step();
+      if (rel() > 210u) {
+        if (!represented_now) gaps += 1u;
+        if (admitted_at(1.f)) static_at_b_stop += 1u;
+      } else {
+        if (!represented_now) move_gaps += 1u;
+        if (admitted_at(1.f)) move_lag += 1u;
+      }
+    }
+    auto s = snapshot();
+    CHECK(s.dynamic_released == 1u && s.dynamic_meshes == 0u && admitted_at(7.f), "stopped at B and released (released %u, flagged %zu)",
+          s.dynamic_released, s.dynamic_meshes);
+    CHECK(static_at_b_stop == 0u, "no static instance at A during the stop at B (%u)", static_at_b_stop);
+    std::printf("20b move A->B: %u frames with the old static pose at A before the flag, %u frames with no TLAS representation\n", move_lag, move_gaps);
+    CHECK(gaps == 0u, "20b: the door has a representation every frame of the stop at B (%u gaps)", gaps);
+    while (rel() < 301u) step();  // stopped at B, released
+    uint32_t reflag = 0u;
+    while (snapshot().dynamic_meshes == 0u && rel() < 360u) {  // move back: flagged on its first capture
+      step();
+      reflag += 1u;
+    }
+    s = snapshot();
+    std::printf("20b re-flag after the move back: %u frames after the first moved frame\n", reflag);
+    CHECK(s.dynamic_moving_keys == 1u && s.dynamic_meshes == 1u && reflag <= bvh::kPoolRecaptureFrames,
+          "re-flagged within one capture interval (moving %zu, flagged %zu, lag %u)", s.dynamic_moving_keys, s.dynamic_meshes, reflag);
+    uint32_t records_missing = 0u, gaps_back = 0u, static_at_a = 0u;
+    while (rel() < 386u) {  // move B -> A, stop at A
+      if (!step()) gaps_back += 1u;
+      if (dynamic_frame.size() != 1u) records_missing += 1u;
+      if (admitted_at(1.f)) static_at_a += 1u;
+    }
+    CHECK(records_missing == 0u, "a flagged record every frame from the flag to the stop at A (%u missing)", records_missing);
+    CHECK(gaps_back == 0u && static_at_a == 0u, "no gap and no static at A from the flag to the stop (gaps %u, static %u)", gaps_back, static_at_a);
+    uint32_t idle_gaps = 0u, first_admitted = 0u;
+    while (rel() < 780u) {  // stopped at A: flagged until the hot hold passes, then released and admitted
+      if (!step() && rel() > 386u) idle_gaps += 1u;
+      if (first_admitted == 0u && admitted_at(1.f)) first_admitted = rel();
+    }
+    s = snapshot();
+    uint32_t last_moving = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      last_moving = bvh::g_pool.dynamic_keys.begin()->second.last_frame - start;
+    }
+    std::printf("20b idle at A: last moving sighting %u, admitted at A at frame %u, %u frames with no TLAS representation\n",
+                last_moving, first_admitted, idle_gaps);
+    CHECK(first_admitted >= last_moving + 300u && first_admitted <= last_moving + 300u + bvh::kPoolRecaptureFrames,
+          "20b: admitted at A one capture interval after the hot hold (admitted %u, last moving %u)", first_admitted, last_moving);
+    CHECK(s.dynamic_released == 2u && s.dynamic_meshes == 0u && admitted_at(1.f), "second release, admitted at A (released %u, admitted %zu)",
+          s.dynamic_released, s.admitted);
   }
 
   HStage("21. prevWorld trace: A (far flip), B (sway 2 cm per frame), C (static) are");

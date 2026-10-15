@@ -192,6 +192,7 @@ inline constexpr size_t kPoolMotionMaxMeshKeys = 4096u;
 inline constexpr float kPoolMovingMeters = 1e-5f;  // translation; also at least 4 ULP of the coordinate
 inline constexpr float kPoolMovingBasis = 1e-5f;   // basis element, times the largest basis element (>= 1)
 inline constexpr uint32_t kPoolMovingHoldFrames = 2u * kPoolRecaptureFrames;
+inline constexpr uint32_t kPoolHotHoldFrames = 300u;  // release hold for keys released or orphan-retired before (per-frame path kept through repeated operations)
 inline constexpr uint32_t kPoolGhostHoldFrames = 40u;  // one 30-frame sample interval plus margin, for the overlap rule only
 inline constexpr uint32_t kPoolFollowRelinkFrames = 8u;     // unseen frames a moving instance may be relinked across
 // prevWorld trace (diagnostic, read-only): three draw keys, kPoolTraceFrames
@@ -1283,6 +1284,9 @@ struct PoolInspectRecord {
   std::vector<PoolInspectCandidate> candidates;
 };
 
+// Why g_pool.revision moved; each bump sets its bit in PoolState::revision_sources_pending.
+enum class PoolRevisionSource { Retire, Admit, Promote, Compact, NewMesh, Reset, Count };
+
 // TLAS update timing (CPU ms per call), written under g_pool.mutex by bvh_live.hpp; world_pool.json "tlas_timing".
 struct PoolTlasTiming {
   uint64_t rebuilds = 0u;  // RebuildLiveTlas calls (a failed build too); equals LiveBvhStats::tlas_rebuilds
@@ -1301,6 +1305,11 @@ struct PoolTlasTiming {
   float after_drain_ms_max = 0.f;
   float after_drain_ms_sum = 0.f;
   uint32_t refits_since_rebuild = 0u;  // mirrors BvhDeviceData::tlas_refits_since_rebuild
+  uint64_t revision_bumps[static_cast<size_t>(PoolRevisionSource::Count)] = {};
+  uint64_t rebuilds_by_cause[3] = {};  // retire, admit, other
+  float rebuild_ms_by_cause[3] = {};
+  uint64_t rebuilds_mixed = 0u;  // rebuilds whose sources include both retire and admit
+  float refit_phase_ms[4] = {};  // last refit: lock+copy, descriptors, nodes+validate, upload
 };
 
 struct PoolState {
@@ -1403,6 +1412,7 @@ struct PoolState {
   uint64_t no_mesh_keys_dropped = 0u;                        // no-mesh sightings of keys past the cap
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;  // bumped when an admitted instance's camera visibility changes
+  uint32_t revision_sources_pending = 0u;  // bit per PoolRevisionSource bumped since the last TLAS rebuild
   PoolStats stats;
   PoolTlasTiming tlas_timing;
   PoolMotionDetail motion_detail;
@@ -1447,6 +1457,13 @@ struct PoolState {
 };
 
 inline PoolState g_pool;
+
+// Caller holds g_pool.mutex.
+inline void BumpPoolRevision(PoolRevisionSource src) {
+  g_pool.revision += 1u;
+  g_pool.tlas_timing.revision_bumps[static_cast<size_t>(src)] += 1u;
+  g_pool.revision_sources_pending |= 1u << static_cast<uint32_t>(src);
+}
 
 inline uint64_t PoolMix(uint64_t hash, uint64_t value) {
   hash ^= value;
@@ -1776,7 +1793,7 @@ inline uint32_t RemovePoolInstances(Remove remove) {
     write += 1u;
   }
   g_pool.instances.resize(write);
-  if (removed != 0u) g_pool.revision += 1u;
+  if (removed != 0u) BumpPoolRevision(PoolRevisionSource::Retire);
   return removed;
 }
 
@@ -2133,7 +2150,7 @@ inline bool AdmitPoolInstance(ObservedInstance& observed, uint64_t mesh_key, uin
   g_pool.admitted_keys.insert(admitted_key);
   g_pool.families[observed.vs_hash].admitted += 1u;
   if (g_pool.meshes[mesh_id].alpha) g_pool.alpha_refusals_by_vs[observed.vs_hash].admitted += 1u;
-  g_pool.revision += 1u;
+  BumpPoolRevision(PoolRevisionSource::Admit);
   return true;
 }
 
@@ -2625,15 +2642,15 @@ enum class PoolSightingVerdict : uint8_t { Unknown, Still, Moving };
 
 // Caller holds g_pool.mutex. Acts on a camera sighting's verdict: a moving
 // sighting marks its key moving; a still one releases a moving key once
-// kPoolMovingHoldFrames passed since its last moving sighting, and unflags
-// its mesh when no other moving key maps to it.
+// kPoolMovingHoldFrames passed since its last moving sighting (kPoolHotHoldFrames for a key
+// released or orphan-retired before), and unflags its mesh when no other moving key maps to it.
 inline void NotePoolCameraMotion(uint64_t mesh_key, uint32_t vs_hash, const float* world, const float* prev_world,
                                  bool indirect, uint32_t frame, PoolSightingVerdict verdict) {
   auto it = g_pool.dynamic_keys.find(mesh_key);
   if (verdict == PoolSightingVerdict::Still) {
     if (it == g_pool.dynamic_keys.end()) return;
     PoolDynamicMesh& entry = it->second;
-    if (!entry.moving_now || frame < entry.last_frame + kPoolMovingHoldFrames) return;
+    if (!entry.moving_now || frame < entry.last_frame + (entry.released + entry.retired_orphans != 0u ? kPoolHotHoldFrames : kPoolMovingHoldFrames)) return;
     entry.moving_now = false;
     entry.released += 1u;
     const auto mesh_it = g_pool.mesh_by_key.find(mesh_key);
@@ -2756,7 +2773,7 @@ inline void FollowPoolMovingInstance(uint64_t mesh_key, uint32_t vs_hash, const 
       ComputeMatrixInverse(instance.matrix, instance.inverse_world);
       std::memcpy(instance.bounds_min, bounds_min, sizeof(bounds_min));
       std::memcpy(instance.bounds_max, bounds_max, sizeof(bounds_max));
-      if (!instance.dynamic) g_pool.revision += 1u;  // a new dynamic instance is re-partitioned by a rebuild
+      if (!instance.dynamic) BumpPoolRevision(PoolRevisionSource::Promote);  // a new dynamic instance is re-partitioned by a rebuild
       instance.dynamic = true;
       instance.last_follow_frame = frame;
       instance.follows += 1u;
@@ -4504,7 +4521,7 @@ inline void CompactPool() {
   }
   g_pool.invalidated_keys.clear();
   g_pool.retire_pending = false;
-  g_pool.revision += 1u;
+  BumpPoolRevision(PoolRevisionSource::Compact);
 }
 
 // ---------------------------------------------------------------------------
@@ -4605,7 +4622,7 @@ inline const char* ApplyPoolMesh(
     g_pool.meshes.push_back(std::move(world_mesh));
     if (g_pool.meshes.back().admitted_by_retry) g_pool.stats.meshes_admitted_by_retry += 1u;
     g_pool.mesh_by_signature.emplace(signature, mesh_id);
-    g_pool.revision += 1u;
+    BumpPoolRevision(PoolRevisionSource::NewMesh);
   }
   g_pool.meshes[mesh_id].live_keys += 1u;
   g_pool.mesh_by_key[mesh_key] = mesh_id;
@@ -5817,7 +5834,7 @@ inline void ResetWorldPool() {
   g_pool.alpha_refusals_by_vs.clear();
   g_pool.no_mesh_keys.clear();
   g_pool.no_mesh_keys_dropped = 0u;
-  g_pool.revision += 1u;
+  BumpPoolRevision(PoolRevisionSource::Reset);
   g_pool.stats = {};
   g_pool.motion_detail = {};
   g_pool.dynamic_keys.clear();
@@ -6916,7 +6933,16 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"after_drain_ms\": {\"last\": " << PoolJsonFloat{tlas_timing.after_drain_ms_last}
       << ", \"max\": " << PoolJsonFloat{tlas_timing.after_drain_ms_max} << ", \"sum\": " << PoolJsonFloat{tlas_timing.after_drain_ms_sum} << "}"
       << ", \"refit_after_drain_skipped\": " << tlas_timing.refit_after_drain_skipped
-      << ", \"refits_since_rebuild\": " << tlas_timing.refits_since_rebuild << "},\n";
+      << ", \"refits_since_rebuild\": " << tlas_timing.refits_since_rebuild
+      << ", \"rebuild_cause\": {\"retire\": " << tlas_timing.rebuilds_by_cause[0] << ", \"admit\": " << tlas_timing.rebuilds_by_cause[1]
+      << ", \"other\": " << tlas_timing.rebuilds_by_cause[2] << ", \"mixed\": " << tlas_timing.rebuilds_mixed
+      << ", \"ms\": [" << PoolJsonFloat{tlas_timing.rebuild_ms_by_cause[0]} << ", " << PoolJsonFloat{tlas_timing.rebuild_ms_by_cause[1]}
+      << ", " << PoolJsonFloat{tlas_timing.rebuild_ms_by_cause[2]} << "]}"
+      << ", \"revision_bumps\": [";
+  for (size_t i = 0; i < static_cast<size_t>(PoolRevisionSource::Count); ++i) out << (i != 0 ? ", " : "") << tlas_timing.revision_bumps[i];
+  out << "]"
+      << ", \"refit_phase_ms\": [" << PoolJsonFloat{tlas_timing.refit_phase_ms[0]} << ", " << PoolJsonFloat{tlas_timing.refit_phase_ms[1]}
+      << ", " << PoolJsonFloat{tlas_timing.refit_phase_ms[2]} << ", " << PoolJsonFloat{tlas_timing.refit_phase_ms[3]} << "]},\n";
   out << "  \"stale_dynamic_count\": " << stale_dynamic.size() << ", \"stale_dynamic_dropped\": "
       << stale_dropped << ",\n";
   out << "  \"stale_dynamic\": [";

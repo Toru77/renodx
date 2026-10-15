@@ -649,6 +649,7 @@ inline void RebuildLiveTlas(
   uint64_t visibility_revision = 0u;
   uint64_t dynamic_revision = 0u;
   uint64_t flag_revision = 0u;
+  uint32_t sources = 0u;
   uint32_t p2b_skipped = 0u;
   const bool per_frame = LiveDynamicActive(*data);
   {
@@ -657,6 +658,7 @@ inline void RebuildLiveTlas(
     visibility_revision = g_pool.visibility_revision;
     dynamic_revision = g_pool.dynamic_revision;
     flag_revision = g_pool.dynamic_flag_revision;
+    sources = g_pool.revision_sources_pending;
     g_pool.stats.wind_sway_instances = 0u;
     g_pool.stats.wind_sway_max_m = 0.f;
     g_pool.stats.wind_sway_bound_m = 0.f;
@@ -700,6 +702,10 @@ inline void RebuildLiveTlas(
   // build is retried (after kLiveRetryFrames).
   const uint64_t store_version = data->store_version;
   const auto commit = [&]() {
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      g_pool.revision_sources_pending &= ~sources;  // cleared only once this TLAS is in place; a failed build keeps them for the retry
+    }
     data->tlas_pool_revision = revision;
     data->tlas_visibility_revision = visibility_revision;
     data->tlas_dynamic_revision = dynamic_revision;
@@ -778,6 +784,12 @@ inline void RebuildLiveTlas(
     timing.rebuild_ms_last = stats.tlas_ms_last;
     timing.rebuild_ms_max = stats.tlas_ms_max;
     timing.rebuild_ms_sum += stats.tlas_ms_last;
+    const uint32_t retire_bits = (1u << static_cast<uint32_t>(PoolRevisionSource::Retire)) | (1u << static_cast<uint32_t>(PoolRevisionSource::Compact));
+    const uint32_t admit_bits = (1u << static_cast<uint32_t>(PoolRevisionSource::Admit)) | (1u << static_cast<uint32_t>(PoolRevisionSource::NewMesh));
+    const uint32_t cause = (sources & retire_bits) != 0u ? 0u : (sources & admit_bits) != 0u ? 1u : 2u;
+    timing.rebuilds_by_cause[cause] += 1u;
+    timing.rebuild_ms_by_cause[cause] += stats.tlas_ms_last;
+    if ((sources & retire_bits) != 0u && (sources & admit_bits) != 0u) timing.rebuilds_mixed += 1u;
     timing.refits_since_rebuild = data->tlas_refits_since_rebuild;
     g_pool.stats.dynamic_tlas_per_frame = data->tlas_per_frame ? 1u : 0u;
     g_pool.stats.dynamic_tlas_partition = data->tlas_dynamic_first;
@@ -888,6 +900,13 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   uint32_t missing = 0u;
   uint32_t lag = 0u;
   uint32_t on_screen_lag = 0u;
+  const uint32_t df = data->tlas_dynamic_first;
+  float phase_ms[4] = {};
+  auto phase_start = start;
+  const auto lap = [&](float* ms) {
+    *ms = LiveElapsedMs(phase_start);
+    phase_start = std::chrono::steady_clock::now();
+  };
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     dynamic_revision = g_pool.dynamic_revision;
@@ -905,9 +924,9 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
       data->tlas_dynamic_revision = dynamic_revision;
       return;
     }
-    updated = data->tlas_info;
-    for (uint32_t i = data->tlas_dynamic_first; i < updated.size(); ++i) {
-      LiveTlasInstance& copy = updated[i];
+    updated.assign(data->tlas_info.begin() + df, data->tlas_info.end());
+    for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
+      LiveTlasInstance& copy = updated[i - df];
       // Pool instances are kept sorted by ascending id (test_motion checks it).
       const auto it = std::lower_bound(g_pool.instances.begin(), g_pool.instances.end(), copy.id,
                                        [](const WorldInstance& instance, uint64_t id) { return instance.id < id; });
@@ -928,6 +947,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
       }
     }
   }
+  lap(&phase_ms[0]);
   const auto finish = [&]() {
     stats.refit_ms_last = LiveElapsedMs(start);
     stats.refit_ms_max = (std::max)(stats.refit_ms_max, stats.refit_ms_last);
@@ -935,6 +955,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     g_pool.tlas_timing.refit_ms_last = stats.refit_ms_last;
     g_pool.tlas_timing.refit_ms_max = stats.refit_ms_max;
     g_pool.tlas_timing.refit_ms_sum += stats.refit_ms_last;
+    std::memcpy(g_pool.tlas_timing.refit_phase_ms, phase_ms, sizeof(phase_ms));
     g_pool.stats.tlas_wind_count = data->tlas_wind_count;
     g_pool.stats.tlas_sway_on = data->tlas_sway_on;
   };
@@ -950,31 +971,32 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     return;
   }
 
-  std::vector<WorldInstanceGPU> instances = data->tlas_instances_cpu;
+  std::vector<WorldInstanceGPU> instances(data->tlas_instances_cpu.begin() + df, data->tlas_instances_cpu.end());
   std::vector<BVHLeafGPU> leaves = data->tlas_leaves_cpu;
   uint32_t first = UINT32_MAX;
   uint32_t last = 0u;
   uint32_t changed = 0u;
-  for (uint32_t i = data->tlas_dynamic_first; i < updated.size(); ++i) {
-    const auto slot_it = data->slot_by_uid.find(updated[i].uid);
+  for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
+    const auto slot_it = data->slot_by_uid.find(updated[i - df].uid);
     if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->descriptor_count) {
       fail("mesh slot no longer resident");
       return;
     }
-    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(updated[i], slot_it->second);
-    if (std::memcmp(&descriptor, &instances[i], sizeof(descriptor)) == 0) continue;
-    instances[i] = descriptor;
+    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(updated[i - df], slot_it->second);
+    if (std::memcmp(&descriptor, &instances[i - df], sizeof(descriptor)) == 0) continue;
+    instances[i - df] = descriptor;
     BVHLeafGPU& leaf = leaves[data->tlas_leaf_of_instance[i]];
     for (int k = 0; k < 3; ++k) {
-      leaf.bounds_min[k] = updated[i].bounds_min[k];
-      leaf.bounds_max[k] = updated[i].bounds_max[k];
+      leaf.bounds_min[k] = updated[i - df].bounds_min[k];
+      leaf.bounds_max[k] = updated[i - df].bounds_max[k];
     }
     first = (std::min)(first, i);
     last = i;
     changed += 1u;
   }
+  lap(&phase_ms[1]);
   if (changed == 0u) {
-    data->tlas_info = std::move(updated);
+    std::move(updated.begin(), updated.end(), data->tlas_info.begin() + df);
     data->tlas_dynamic_revision = dynamic_revision;
     finish();
     return;
@@ -983,6 +1005,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   std::vector<BVHNodeGPU> nodes = data->tlas_nodes_cpu;
   RefitBvhNodes(leaves, &nodes);
   const char* invalid = DescribeBvhValidation(ValidateBvh(nodes, leaves));
+  lap(&phase_ms[2]);
   if (invalid != nullptr) {
     stats.tlas_invalid += 1u;
     fail(invalid);
@@ -992,7 +1015,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   std::string error;
   const bool written =
       WriteBufferRange(device, cmd_list, data->instance_buffer, sizeof(WorldInstanceGPU), first * sizeof(WorldInstanceGPU),
-                       &instances[first], (last - first + 1u) * sizeof(WorldInstanceGPU), &error)
+                       &instances[first - df], (last - first + 1u) * sizeof(WorldInstanceGPU), &error)
       && WriteBufferRange(device, cmd_list, data->tlas_leaf_buffer, sizeof(BVHLeafGPU), 0u, leaves.data(),
                           leaves.size() * sizeof(BVHLeafGPU), &error)
       && WriteBufferRange(device, cmd_list, data->tlas_node_buffer, sizeof(BVHNodeGPU), 0u, nodes.data(),
@@ -1002,10 +1025,11 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     fail("upload: " + error);
     return;
   }
+  lap(&phase_ms[3]);
 
   // Swapped only after every write succeeded.
-  data->tlas_instances_cpu = std::move(instances);
-  data->tlas_info = std::move(updated);
+  std::move(instances.begin(), instances.end(), data->tlas_instances_cpu.begin() + df);
+  std::move(updated.begin(), updated.end(), data->tlas_info.begin() + df);
   data->tlas_leaves_cpu = std::move(leaves);
   data->tlas_nodes_cpu = std::move(nodes);
   data->tlas_dynamic_revision = dynamic_revision;

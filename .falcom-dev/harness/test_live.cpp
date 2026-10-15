@@ -183,6 +183,11 @@ static void AddInstance(uint64_t key, float x, float y, float z, float scale = 1
   bvh::ObservePoolInstance(key, 0x1000u, w, g_obs_frame++);
 }
 
+static uint64_t BumpCount(bvh::PoolRevisionSource src) {
+  std::lock_guard lock(bvh::g_pool.mutex);
+  return bvh::g_pool.tlas_timing.revision_bumps[static_cast<size_t>(src)];
+}
+
 static void RetireMesh(uint64_t key) {
   std::lock_guard lock(bvh::g_pool.mutex);
   bvh::InvalidatePoolMeshKey(key);
@@ -1488,9 +1493,11 @@ int main() {
     present();
     CHECK(data->live.gpu_checked && data->live.gpu_ok, "GPU check with visibility (%s)", data->live.gpu_result.c_str());
     Stage("8e retire F,G");
+    const uint64_t retires = BumpCount(bvh::PoolRevisionSource::Compact);
     RetireMesh(kF);
     RetireMesh(kG);
     for (int i = 0; i < 9; ++i) present();
+    CHECK(BumpCount(bvh::PoolRevisionSource::Compact) > retires, "retired mesh bumps the Compact revision source");
     CHECK(data->live.tlas_near_fade == 0u, "near-fade instances gone with their meshes (%u)", data->live.tlas_near_fade);
   }
 
@@ -1513,14 +1520,58 @@ int main() {
     for (int i = 0; i < 10; ++i) present();
     const uint32_t rebuilds = data->live.tlas_rebuilds;
     const uint32_t refits = data->live.tlas_refits;
+    const uint32_t df = data->tlas_dynamic_first;
+    const std::vector<bvh::WorldInstanceGPU> prefix_instances(data->tlas_instances_cpu.begin(), data->tlas_instances_cpu.begin() + df);
+    const std::vector<bvh::LiveTlasInstance> prefix_info(data->tlas_info.begin(), data->tlas_info.begin() + df);
     MoveDynamicInstance(kR, 5.4f, 5.f, frame.load());
     for (int i = 0; i < 10; ++i) present();
     CHECK(data->live.tlas_refits > refits, "moved instance refitted (%u)", data->live.tlas_refits);
     CHECK(data->live.tlas_rebuilds == rebuilds, "pose change: no rebuild (%u -> %u)", rebuilds, data->live.tlas_rebuilds);
+    CHECK(df > 0u && df < data->tlas_info.size(), "dynamic tail follows the static prefix (%u of %zu)", df, data->tlas_info.size());
+    {
+      // The tail copies (tlas_info, instance buffer CPU copy) must sit at the pool pose, not just agree with each other.
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+        if (inst.mesh_key != kR) continue;
+        CHECK(std::fabs(data->tlas_info[df].matrix[3] - 5.4f) < 1e-4f && std::fabs(inst.matrix[3] - 5.4f) < 1e-4f,
+              "dynamic tail matrix at the pool pose x=5.4 (tlas %.3f, pool %.3f)", data->tlas_info[df].matrix[3], inst.matrix[3]);
+        CHECK(std::memcmp(data->tlas_info[df].bounds_min, inst.bounds_min, sizeof(inst.bounds_min)) == 0
+                  && std::memcmp(data->tlas_info[df].bounds_max, inst.bounds_max, sizeof(inst.bounds_max)) == 0,
+              "dynamic tail bounds match the pool instance");
+      }
+    }
     CHECK(CompareTraces(dev, *data, "refit", 60, 21) == 0, "trace agrees after refit");
     bvh::g_live_bvh.check_requested.store(true);
     present();
     CHECK(data->live.gpu_ok, "GPU check after refit: %s", data->live.gpu_result.c_str());
+    CHECK(std::memcmp(prefix_instances.data(), data->tlas_instances_cpu.data(), prefix_instances.size() * sizeof(bvh::WorldInstanceGPU)) == 0,
+          "static prefix of the instance copy unchanged by the refit");
+    CHECK(std::memcmp(prefix_info.data(), data->tlas_info.data(), prefix_info.size() * sizeof(bvh::LiveTlasInstance)) == 0,
+          "static prefix of tlas_info unchanged by the refit");
+    {
+      // Brute force: every descriptor, leaf bound and node recomputed from tlas_info.
+      std::vector<bvh::WorldInstanceGPU> ref_instances;
+      std::vector<bvh::BVHLeafGPU> ref_leaves = data->tlas_leaves_cpu;
+      for (size_t i = 0; i < data->tlas_info.size(); ++i) {
+        ref_instances.push_back(bvh::MakeLiveInstanceGPU(data->tlas_info[i], data->slot_by_uid.at(data->tlas_info[i].uid)));
+        bvh::BVHLeafGPU& leaf = ref_leaves[data->tlas_leaf_of_instance[i]];
+        for (int k = 0; k < 3; ++k) {
+          leaf.bounds_min[k] = data->tlas_info[i].bounds_min[k];
+          leaf.bounds_max[k] = data->tlas_info[i].bounds_max[k];
+        }
+      }
+      std::vector<bvh::BVHNodeGPU> ref_nodes = data->tlas_nodes_cpu;
+      bvh::RefitBvhNodes(ref_leaves, &ref_nodes);
+      CHECK(ref_instances.size() == data->tlas_instances_cpu.size()
+                && std::memcmp(ref_instances.data(), data->tlas_instances_cpu.data(), ref_instances.size() * sizeof(bvh::WorldInstanceGPU)) == 0,
+            "instances agree with the brute-force recompute");
+      CHECK(ref_leaves.size() == data->tlas_leaves_cpu.size()
+                && std::memcmp(ref_leaves.data(), data->tlas_leaves_cpu.data(), ref_leaves.size() * sizeof(bvh::BVHLeafGPU)) == 0,
+            "leaves agree with the brute-force recompute");
+      CHECK(ref_nodes.size() == data->tlas_nodes_cpu.size()
+                && std::memcmp(ref_nodes.data(), data->tlas_nodes_cpu.data(), ref_nodes.size() * sizeof(bvh::BVHNodeGPU)) == 0,
+            "nodes agree with the brute-force recompute");
+    }
 
     // Every instance dynamic: a rebuild puts the dynamic part first, from 0.
     {
@@ -1557,8 +1608,10 @@ int main() {
 
     // 120 refits since a rebuild: the next one is a rebuild for quality.
     AddMesh(0xF9, Grid(10, 10, 4.f, 0.6f));
+    const uint64_t admits = BumpCount(bvh::PoolRevisionSource::Admit);
     AddInstance(0xF9, 5.f, 0.f, 5.f);
     for (int i = 0; i < 12; ++i) present();
+    CHECK(BumpCount(bvh::PoolRevisionSource::Admit) > admits, "admit bumps the Admit revision source");
     MoveDynamicInstance(0xF9, 5.f, 5.f, frame.load());
     for (int i = 0; i < 130; ++i) {
       MoveDynamicInstance(0xF9, 5.f + 0.01f * static_cast<float>(i % 2), 5.f, frame.load());
@@ -1566,6 +1619,15 @@ int main() {
     }
     CHECK(std::string(data->live.tlas_reason) == "refit quality", "refit quality rebuild (%s; refits %u, failures %u: %s)",
           data->live.tlas_reason, data->live.tlas_refits, data->live.refit_failures, data->live.last_failure.c_str());
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const bvh::PoolTlasTiming& timing = bvh::g_pool.tlas_timing;
+      CHECK(timing.rebuilds_by_cause[0] + timing.rebuilds_by_cause[1] + timing.rebuilds_by_cause[2] == timing.rebuilds,
+            "rebuild causes sum to rebuilds (%llu)", static_cast<unsigned long long>(timing.rebuilds));
+      const float cause_ms = timing.rebuild_ms_by_cause[0] + timing.rebuild_ms_by_cause[1] + timing.rebuild_ms_by_cause[2];
+      CHECK(std::fabs(cause_ms - timing.rebuild_ms_sum) < 1e-3f, "rebuild ms by cause sum to rebuild_ms_sum (%.4f vs %.4f)", cause_ms,
+            timing.rebuild_ms_sum);
+    }
   }
 
   Stage("8f2 refit between structural changes");

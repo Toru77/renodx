@@ -513,6 +513,19 @@ inline void DrawBvhPanel() {
               static_cast<unsigned long long>(tlas_timing.refits_after_drain),
               tlas_timing.refits_after_drain != 0u ? tlas_timing.after_drain_ms_sum / static_cast<float>(tlas_timing.refits_after_drain) : 0.f,
               static_cast<unsigned long long>(tlas_timing.refit_after_drain_skipped));
+  ImGui::Text("TLAS rebuild cause: retire %llu (%.2f ms) admit %llu (%.2f ms) other %llu (%.2f ms) mixed %llu | bumps: retire %llu admit %llu promote %llu compact %llu new mesh %llu reset %llu",
+              static_cast<unsigned long long>(tlas_timing.rebuilds_by_cause[0]), tlas_timing.rebuild_ms_by_cause[0],
+              static_cast<unsigned long long>(tlas_timing.rebuilds_by_cause[1]), tlas_timing.rebuild_ms_by_cause[1],
+              static_cast<unsigned long long>(tlas_timing.rebuilds_by_cause[2]), tlas_timing.rebuild_ms_by_cause[2],
+              static_cast<unsigned long long>(tlas_timing.rebuilds_mixed),
+              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Retire)]),
+              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Admit)]),
+              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Promote)]),
+              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Compact)]),
+              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::NewMesh)]),
+              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Reset)]));
+  ImGui::Text("Refit phases (ms): copy %.3f / desc %.3f / nodes+validate %.3f / upload %.3f", tlas_timing.refit_phase_ms[0],
+              tlas_timing.refit_phase_ms[1], tlas_timing.refit_phase_ms[2], tlas_timing.refit_phase_ms[3]);
   ImGui::Text("Follow lag (frames): on screen %u (max %u), all dynamic %u (max %u)", stats.on_screen_lag_last,
               stats.on_screen_lag_max, live_stats.refit_lag_last, live_stats.refit_lag_max);
   ImGui::Text("GPU: deform refit %.3f ms, trace %.2f ms", deform_refit_ms, data->trace_timer.last_ms);
