@@ -1499,10 +1499,20 @@ inline bool EnsureDynamicExpand(reshade::api::device* device, BvhDeviceData* dat
   params[2].type = reshade::api::pipeline_layout_param_type::push_constants;
   params[2].push_constants = push_range;
 
+  reshade::api::resource_desc arena_desc = {};
+  arena_desc.type = reshade::api::resource_type::buffer;
+  arena_desc.buffer.size = kPoolDynamicArenaBytes;  // no stride: a raw buffer (CreatePoolBuffer rejects stride 0)
+  arena_desc.heap = reshade::api::memory_heap::gpu_only;
+  arena_desc.usage = RU::shader_resource | RU::copy_dest | RU::copy_source;
   bool ready =
       (dynamic.arena.handle != 0u
-       || CreatePoolBuffer(device, nullptr, kPoolDynamicArenaBytes, 16u, &dynamic.arena, &dynamic.arena_srv,
-                           RU::shader_resource | RU::copy_dest))
+       || device->create_resource(arena_desc, nullptr, RU::shader_resource, &dynamic.arena))
+      && (dynamic.arena_srv.handle != 0u
+          || device->create_resource_view(
+                 dynamic.arena, RU::shader_resource,
+                 reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer, reshade::api::format::r32_typeless, 0,
+                                                  kPoolDynamicArenaBytes / 4u),
+                 &dynamic.arena_srv))
       && (dynamic.draws.handle != 0u
           || CreatePoolBuffer(device, nullptr, kPoolMaxDynamicDraws * sizeof(DynamicDrawGPU), sizeof(DynamicDrawGPU),
                               &dynamic.draws, &dynamic.draws_srv, RU::shader_resource | RU::copy_dest))

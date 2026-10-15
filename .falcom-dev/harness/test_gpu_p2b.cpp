@@ -1,6 +1,6 @@
 ﻿// Native harness: P2b on a real D3D11 WARP device (no game, no ReShade).
-// (1) The arena copy: CopySubresourceRegion of a stride-160 structured slice into structured stride-16, raw and
-//     structured stride-160 buffers (the arena kinds). (2) The real world_dynamic_expand.cs_5_0.hlsl over a draw
+// (1) Arena copy: CopySubresourceRegion of a stride-160 structured slice and of 20 indirect-args bytes into the
+//     raw arena. (2) The real world_dynamic_expand.cs_5_0.hlsl over a draw
 //     table, checked against the CPU reference (CheckPoolWorld, ComputeMatrixInverse, TransformInst4x3RowDot).
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -180,214 +180,216 @@ int main() {
 
   const UINT kArenaBytes = kArenaElements * kElementFloat4 * 16u;
   const std::vector<uint8_t> filler(kArenaBytes, 0xEEu);
-  struct Target {
-    const char* label;
-    UINT stride;
-    UINT misc;
-    ID3D11Buffer* buffer;
-    bool landed;
-  };
-  Target targets[3] = {
-      {"s16", 16u, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, nullptr, false},
-      {"raw", 0u, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, nullptr, false},
-      {"s160", bvh::kPoolInstanceStride, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, nullptr, false},
-  };
   const D3D11_BOX box = {160u, 0u, 0u, 800u, 1u, 1u};  // bytes [160, 800) = elements 1..4 of the source
-  for (Target& target : targets) {
-    target.buffer = MakeBuffer(device, kArenaBytes, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, target.misc, target.stride, filler.data());
-    CHECK(target.buffer != nullptr, "destination %s", target.label);
-    if (target.buffer == nullptr) continue;
-    if (queue != nullptr) queue->ClearStoredMessages();
-    context->CopySubresourceRegion(target.buffer, 0u, 0u, 0u, 0u, source, 0u, &box);
-    const std::vector<uint8_t> got = Readback(device, context, target.buffer, kArenaBytes);
-    target.landed = std::memcmp(got.data(), source_bytes + 160u, 640u) == 0;
-    std::printf("COPY s160->%s %s\n", target.label, target.landed ? "LANDED" : "NOOP");
-    PrintMessages(queue, target.label);
-  }
-  const bool landed_b = targets[1].landed;
-  const bool landed_c = targets[2].landed;
-  CHECK(landed_b || landed_c, "the copy into the raw or the structured stride-160 arena must land");
-
-  // (2) T2: the real expansion shader on the arena copy destination that landed (structured stride 16 when it did,
-  // else stride 160; the raw buffer cannot be bound as the shader's StructuredBuffer).
-  ID3D11Buffer* arena = targets[0].landed ? targets[0].buffer : (landed_c ? targets[2].buffer : nullptr);
+  ID3D11Buffer* arena = MakeBuffer(device, kArenaBytes, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+                                   D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0u, filler.data());
   if (arena == nullptr) {
-    std::printf("T2 SKIP: no structured destination landed (the raw buffer is not bound as the shader's StructuredBuffer)\n");
+    std::printf("FAIL raw arena\n");
+    return 1;
+  }
+  if (queue != nullptr) queue->ClearStoredMessages();
+  context->CopySubresourceRegion(arena, 0u, 0u, 0u, 0u, source, 0u, &box);
+  const std::vector<uint8_t> got = Readback(device, context, arena, kArenaBytes);
+  const bool landed = std::memcmp(got.data(), source_bytes + 160u, 640u) == 0;
+  std::printf("COPY s160->raw %s\n", landed ? "LANDED" : "NOOP");
+  PrintMessages(queue, "raw");
+  CHECK(landed, "the copy from the stride-160 source into the raw arena must land");
+
+  // The indirect args (20 bytes from a DRAWINDIRECT_ARGS buffer) copied to byte 320 of the same arena.
+  const uint32_t args[5] = {36u, 3u, 0u, 0u, 0u};
+  ID3D11Buffer* args_buffer = MakeBuffer(device, 20u, 0u, D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS, 0u, args);
+  if (args_buffer == nullptr) {
+    std::printf("FAIL indirect args buffer\n");
+    return 1;
+  }
+  if (queue != nullptr) queue->ClearStoredMessages();
+  context->CopySubresourceRegion(arena, 0u, 320u, 0u, 0u, args_buffer, 0u, nullptr);
+  const std::vector<uint8_t> got_args = Readback(device, context, arena, kArenaBytes);
+  const bool args_landed = std::memcmp(got_args.data() + 320u, args, 20u) == 0;
+  std::printf("COPY indirect-args->raw %s\n", args_landed ? "LANDED" : "NOOP");
+  PrintMessages(queue, "args");
+  CHECK(args_landed, "the 20-byte indirect-args copy into the raw arena must land");
+
+  // (2) T2: the real expansion shader over the raw arena (ByteAddressBuffer).
+  // The arena content: element i holds the slice of the draw (kDraws) that starts there.
+  std::vector<float> arena_floats(kArenaElements * kElementFloat4 * 4u, 0.f);
+  auto element_at = [&](uint32_t element) { return arena_floats.data() + element * kElementFloat4 * 4u; };
+  for (const TestDraw& draw : kDraws) {
+    for (uint32_t i = 0; i < draw.count; ++i) {
+      const MatrixCase& mc = kCases[(draw.first_case + i) % kCaseCount];
+      float* slice = element_at(draw.slice_element + i);
+      std::memcpy(slice, mc.m, sizeof(mc.m));  // rows 0..2 of the 3x4 (xyz, translation in w) are float4 0..2
+    }
+    if (draw.indirect) {
+      float* args = element_at(draw.args_element);
+      args[1] = std::bit_cast<float>(draw.args_count);  // InstanceCount
+    }
+  }
+  if (queue != nullptr) queue->ClearStoredMessages();
+  context->UpdateSubresource(arena, 0u, nullptr, arena_floats.data(), 0u, 0u);
+
+  FolderInclude include;
+  std::string text;
+  {
+    std::ifstream file(std::string(kShaderDir) + "world_dynamic_expand.cs_5_0.hlsl", std::ios::binary);
+    text.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  }
+  ID3DBlob* code = nullptr;
+  ID3DBlob* errors = nullptr;
+  hr = D3DCompile(text.data(), text.size(), "world_dynamic_expand.cs_5_0.hlsl", nullptr, &include, "main", "cs_5_0", 0u, 0u, &code, &errors);
+  if (FAILED(hr)) {
+    std::printf("T2 FAIL: compile world_dynamic_expand.cs_5_0.hlsl hr=0x%08lx %s\n", static_cast<unsigned long>(hr),
+                errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+    ++g_failures;
   } else {
-    // The arena content: element i holds the slice of the draw (kDraws) that starts there.
-    std::vector<float> arena_floats(kArenaElements * kElementFloat4 * 4u, 0.f);
-    auto element_at = [&](uint32_t element) { return arena_floats.data() + element * kElementFloat4 * 4u; };
-    for (const TestDraw& draw : kDraws) {
-      for (uint32_t i = 0; i < draw.count; ++i) {
-        const MatrixCase& mc = kCases[(draw.first_case + i) % kCaseCount];
-        float* slice = element_at(draw.slice_element + i);
-        std::memcpy(slice, mc.m, sizeof(mc.m));  // rows 0..2 of the 3x4 (xyz, translation in w) are float4 0..2
-      }
-      if (draw.indirect) {
-        float* args = element_at(draw.args_element);
-        args[1] = std::bit_cast<float>(draw.args_count);  // InstanceCount
-      }
-    }
-    if (queue != nullptr) queue->ClearStoredMessages();
-    context->UpdateSubresource(arena, 0u, nullptr, arena_floats.data(), 0u, 0u);
+    ID3D11ComputeShader* shader = nullptr;
+    device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader);
 
-    FolderInclude include;
-    std::string text;
+    std::vector<bvh::DynamicDrawGPU> table(kDrawCount);
+    for (size_t d = 0; d < kDrawCount; ++d) {
+      const TestDraw& draw = kDraws[d];
+      bvh::DynamicDrawGPU& entry = table[d];
+      entry.info[0] = draw.slice_element * kElementFloat4;
+      entry.info[1] = draw.count;
+      entry.info[2] = draw.out;
+      entry.info[3] = draw.flags;
+      entry.extra[0] = draw.indirect ? 1u : 0u;
+      entry.extra[1] = draw.args_element * kElementFloat4;
+      entry.extra[2] = static_cast<uint32_t>(3u + d);  // mesh id
+      entry.extra[3] = 0u;
+      for (int k = 0; k < 3; ++k) {
+        entry.bbox_min[k] = -1.f * (k + 1);
+        entry.bbox_max[k] = 1.f * (k + 1);
+      }
+      entry.bbox_min[3] = 0.f;
+      entry.bbox_max[3] = 0.f;
+    }
+    ID3D11Buffer* draws = MakeBuffer(device, static_cast<UINT>(kDrawCount * sizeof(bvh::DynamicDrawGPU)),
+                                     D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+                                     sizeof(bvh::DynamicDrawGPU), table.data());
+    const std::vector<uint8_t> zero_records(kRecords * sizeof(bvh::WorldInstanceGPU), 0u);
+    ID3D11Buffer* records = MakeBuffer(device, static_cast<UINT>(zero_records.size()), D3D11_BIND_UNORDERED_ACCESS,
+                                       D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, sizeof(bvh::WorldInstanceGPU), zero_records.data());
+    struct Constants { uint32_t draw_count; float min_scale; float max_scale; float max_position; };
+    const Constants constants = {static_cast<uint32_t>(kDrawCount), bvh::kPoolMinScale, bvh::kPoolMaxScale, bvh::kPoolMaxPosition};
+    ID3D11Buffer* cb = nullptr;
     {
-      std::ifstream file(std::string(kShaderDir) + "world_dynamic_expand.cs_5_0.hlsl", std::ios::binary);
-      text.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+      D3D11_BUFFER_DESC desc = {};
+      desc.ByteWidth = sizeof(Constants);
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+      D3D11_SUBRESOURCE_DATA data = {&constants, 0u, 0u};
+      device->CreateBuffer(&desc, &data, &cb);
     }
-    ID3DBlob* code = nullptr;
-    ID3DBlob* errors = nullptr;
-    hr = D3DCompile(text.data(), text.size(), "world_dynamic_expand.cs_5_0.hlsl", nullptr, &include, "main", "cs_5_0", 0u, 0u, &code, &errors);
-    if (FAILED(hr)) {
-      std::printf("T2 FAIL: compile world_dynamic_expand.cs_5_0.hlsl hr=0x%08lx %s\n", static_cast<unsigned long>(hr),
-                  errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer()) : "");
-      ++g_failures;
-    } else {
-      ID3D11ComputeShader* shader = nullptr;
-      device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader);
+    D3D11_SHADER_RESOURCE_VIEW_DESC arena_desc = {};
+    arena_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    arena_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+    arena_desc.BufferEx.NumElements = kArenaBytes / 4u;
+    arena_desc.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    ID3D11ShaderResourceView* arena_srv = nullptr;
+    device->CreateShaderResourceView(arena, &arena_desc, &arena_srv);
+    ID3D11ShaderResourceView* draws_srv = MakeSrv(device, draws, static_cast<UINT>(kDrawCount));
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+    uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+    uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.NumElements = kRecords;
+    ID3D11UnorderedAccessView* records_uav = nullptr;
+    device->CreateUnorderedAccessView(records, &uav_desc, &records_uav);
+    CHECK(shader != nullptr && cb != nullptr && arena_srv != nullptr && draws_srv != nullptr && records_uav != nullptr,
+          "expansion objects");
 
-      std::vector<bvh::DynamicDrawGPU> table(kDrawCount);
+    if (shader != nullptr && records_uav != nullptr && arena_srv != nullptr && draws_srv != nullptr && cb != nullptr) {
+      ID3D11ShaderResourceView* srvs[2] = {arena_srv, draws_srv};
+      UINT initial_counts = 0u;
+      context->CSSetShader(shader, nullptr, 0u);
+      context->CSSetShaderResources(0u, 2u, srvs);
+      context->CSSetUnorderedAccessViews(0u, 1u, &records_uav, &initial_counts);
+      context->CSSetConstantBuffers(0u, 1u, &cb);
+      if (queue != nullptr) queue->ClearStoredMessages();
+      context->Dispatch(static_cast<UINT>(kDrawCount), 1u, 1u);
+      ID3D11ShaderResourceView* nulls[2] = {nullptr, nullptr};
+      ID3D11UnorderedAccessView* null_uav = nullptr;
+      context->CSSetShaderResources(0u, 2u, nulls);
+      context->CSSetUnorderedAccessViews(0u, 1u, &null_uav, &initial_counts);
+      PrintMessages(queue, "expand");
+
+      const std::vector<uint8_t> out_bytes = Readback(device, context, records, static_cast<UINT>(zero_records.size()));
+      const auto* gpu = reinterpret_cast<const bvh::WorldInstanceGPU*>(out_bytes.data());
+
+      // Reference per record: the draw that writes it (info.z + i for i < info.y), with CheckPoolWorld and the matrix.
+      const auto* arena_f4 = reinterpret_cast<const float*>(arena_floats.data());
+      uint32_t expected_valid_total = 0u, gpu_valid_total = 0u, valid_match = 0u, inverse_ok = 0u, bounds_ok = 0u, flags_ok = 0u;
+      uint32_t checked = 0u, mismatch_total = 0u;
       for (size_t d = 0; d < kDrawCount; ++d) {
         const TestDraw& draw = kDraws[d];
-        bvh::DynamicDrawGPU& entry = table[d];
-        entry.info[0] = draw.slice_element * kElementFloat4;
-        entry.info[1] = draw.count;
-        entry.info[2] = draw.out;
-        entry.info[3] = draw.flags;
-        entry.extra[0] = draw.indirect ? 1u : 0u;
-        entry.extra[1] = draw.args_element * kElementFloat4;
-        entry.extra[2] = static_cast<uint32_t>(3u + d);  // mesh id
-        entry.extra[3] = 0u;
-        for (int k = 0; k < 3; ++k) {
-          entry.bbox_min[k] = -1.f * (k + 1);
-          entry.bbox_max[k] = 1.f * (k + 1);
-        }
-        entry.bbox_min[3] = 0.f;
-        entry.bbox_max[3] = 0.f;
-      }
-      ID3D11Buffer* draws = MakeBuffer(device, static_cast<UINT>(kDrawCount * sizeof(bvh::DynamicDrawGPU)),
-                                       D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
-                                       sizeof(bvh::DynamicDrawGPU), table.data());
-      const std::vector<uint8_t> zero_records(kRecords * sizeof(bvh::WorldInstanceGPU), 0u);
-      ID3D11Buffer* records = MakeBuffer(device, static_cast<UINT>(zero_records.size()), D3D11_BIND_UNORDERED_ACCESS,
-                                         D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, sizeof(bvh::WorldInstanceGPU), zero_records.data());
-      struct Constants { uint32_t draw_count; float min_scale; float max_scale; float max_position; };
-      const Constants constants = {static_cast<uint32_t>(kDrawCount), bvh::kPoolMinScale, bvh::kPoolMaxScale, bvh::kPoolMaxPosition};
-      ID3D11Buffer* cb = nullptr;
-      {
-        D3D11_BUFFER_DESC desc = {};
-        desc.ByteWidth = sizeof(Constants);
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        D3D11_SUBRESOURCE_DATA data = {&constants, 0u, 0u};
-        device->CreateBuffer(&desc, &data, &cb);
-      }
-      ID3D11ShaderResourceView* arena_srv = MakeSrv(device, arena, arena == targets[0].buffer ? kArenaBytes / 16u : kArenaElements);
-      ID3D11ShaderResourceView* draws_srv = MakeSrv(device, draws, static_cast<UINT>(kDrawCount));
-      D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-      uav_desc.Format = DXGI_FORMAT_UNKNOWN;
-      uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-      uav_desc.Buffer.NumElements = kRecords;
-      ID3D11UnorderedAccessView* records_uav = nullptr;
-      device->CreateUnorderedAccessView(records, &uav_desc, &records_uav);
-      CHECK(shader != nullptr && cb != nullptr && arena_srv != nullptr && draws_srv != nullptr && records_uav != nullptr,
-            "expansion objects");
-
-      if (shader != nullptr && records_uav != nullptr && arena_srv != nullptr && draws_srv != nullptr && cb != nullptr) {
-        ID3D11ShaderResourceView* srvs[2] = {arena_srv, draws_srv};
-        UINT initial_counts = 0u;
-        context->CSSetShader(shader, nullptr, 0u);
-        context->CSSetShaderResources(0u, 2u, srvs);
-        context->CSSetUnorderedAccessViews(0u, 1u, &records_uav, &initial_counts);
-        context->CSSetConstantBuffers(0u, 1u, &cb);
-        if (queue != nullptr) queue->ClearStoredMessages();
-        context->Dispatch(static_cast<UINT>(kDrawCount), 1u, 1u);
-        ID3D11ShaderResourceView* nulls[2] = {nullptr, nullptr};
-        ID3D11UnorderedAccessView* null_uav = nullptr;
-        context->CSSetShaderResources(0u, 2u, nulls);
-        context->CSSetUnorderedAccessViews(0u, 1u, &null_uav, &initial_counts);
-        PrintMessages(queue, "expand");
-
-        const std::vector<uint8_t> out_bytes = Readback(device, context, records, static_cast<UINT>(zero_records.size()));
-        const auto* gpu = reinterpret_cast<const bvh::WorldInstanceGPU*>(out_bytes.data());
-
-        // Reference per record: the draw that writes it (info.z + i for i < info.y), with CheckPoolWorld and the matrix.
-        const auto* arena_f4 = reinterpret_cast<const float*>(arena_floats.data());
-        uint32_t expected_valid_total = 0u, gpu_valid_total = 0u, valid_match = 0u, inverse_ok = 0u, bounds_ok = 0u, flags_ok = 0u;
-        uint32_t checked = 0u, mismatch_total = 0u;
-        for (size_t d = 0; d < kDrawCount; ++d) {
-          const TestDraw& draw = kDraws[d];
-          const bvh::DynamicDrawGPU& entry = table[d];
-          uint32_t draw_expected = 0u, draw_gpu = 0u;
-          uint32_t count = draw.count;
-          if (draw.indirect) count = std::min(draw.count, draw.args_count);
-          for (uint32_t i = 0; i < draw.count; ++i) {
-            const uint32_t r = draw.out + i;
-            const float* slice = arena_f4 + (draw.slice_element + i) * kElementFloat4 * 4u;
-            const bool resident = (draw.flags & 1u) != 0u;
-            const bool live = resident && i < count;
-            float matrix[12] = {};
-            if (live) std::memcpy(matrix, slice, sizeof(matrix));
-            const float a0[3] = {matrix[0], matrix[1], matrix[2]};
-            const float a1[3] = {matrix[4], matrix[5], matrix[6]};
-            const float a2[3] = {matrix[8], matrix[9], matrix[10]};
-            const float c0[3] = {a1[1] * a2[2] - a1[2] * a2[1], a1[2] * a2[0] - a1[0] * a2[2], a1[0] * a2[1] - a1[1] * a2[0]};
-            const float det = a0[0] * c0[0] + a0[1] * c0[1] + a0[2] * c0[2];
-            const bool expect_valid = live && std::fabs(det) >= 1e-12f && bvh::CheckPoolWorld(matrix) == bvh::PoolMatrixReject::None;
-            const bvh::WorldInstanceGPU& g = gpu[r];
-            const bool gpu_valid = g.header[3] > 0.5f;
-            ++checked;
-            draw_expected += expect_valid ? 1u : 0u;
-            draw_gpu += gpu_valid ? 1u : 0u;
-            if (gpu_valid == expect_valid) ++valid_match; else ++mismatch_total;
-            if (g.header[0] != static_cast<float>(entry.extra[2]) || g.visibility[2] != static_cast<float>(draw.flags & 6u)) ++mismatch_total;
-            else ++flags_ok;
-            if (expect_valid) {
-              float inv[16] = {};
-              falcom_world::ComputeMatrixInverse(matrix, inv);
-              bool inv_match = true;
-              for (int row = 0; row < 3; ++row) {
-                for (int col = 0; col < 4; ++col) {
-                  const float want = inv[row * 4 + col];
-                  const float got = g.inverse_world[row * 4 + col];
-                  if (!(std::fabs(got - want) <= 1e-4f * std::max(1.f, std::fabs(want)))) inv_match = false;
-                }
+        const bvh::DynamicDrawGPU& entry = table[d];
+        uint32_t draw_expected = 0u, draw_gpu = 0u;
+        uint32_t count = draw.count;
+        if (draw.indirect) count = std::min(draw.count, draw.args_count);
+        for (uint32_t i = 0; i < draw.count; ++i) {
+          const uint32_t r = draw.out + i;
+          const float* slice = arena_f4 + (draw.slice_element + i) * kElementFloat4 * 4u;
+          const bool resident = (draw.flags & 1u) != 0u;
+          const bool live = resident && i < count;
+          float matrix[12] = {};
+          if (live) std::memcpy(matrix, slice, sizeof(matrix));
+          const float a0[3] = {matrix[0], matrix[1], matrix[2]};
+          const float a1[3] = {matrix[4], matrix[5], matrix[6]};
+          const float a2[3] = {matrix[8], matrix[9], matrix[10]};
+          const float c0[3] = {a1[1] * a2[2] - a1[2] * a2[1], a1[2] * a2[0] - a1[0] * a2[2], a1[0] * a2[1] - a1[1] * a2[0]};
+          const float det = a0[0] * c0[0] + a0[1] * c0[1] + a0[2] * c0[2];
+          const bool expect_valid = live && std::fabs(det) >= 1e-12f && bvh::CheckPoolWorld(matrix) == bvh::PoolMatrixReject::None;
+          const bvh::WorldInstanceGPU& g = gpu[r];
+          const bool gpu_valid = g.header[3] > 0.5f;
+          ++checked;
+          draw_expected += expect_valid ? 1u : 0u;
+          draw_gpu += gpu_valid ? 1u : 0u;
+          if (gpu_valid == expect_valid) ++valid_match; else ++mismatch_total;
+          if (g.header[0] != static_cast<float>(entry.extra[2]) || g.visibility[2] != static_cast<float>(draw.flags & 6u)) ++mismatch_total;
+          else ++flags_ok;
+          if (expect_valid) {
+            float inv[16] = {};
+            falcom_world::ComputeMatrixInverse(matrix, inv);
+            bool inv_match = true;
+            for (int row = 0; row < 3; ++row) {
+              for (int col = 0; col < 4; ++col) {
+                const float want = inv[row * 4 + col];
+                const float got = g.inverse_world[row * 4 + col];
+                if (!(std::fabs(got - want) <= 1e-4f * std::max(1.f, std::fabs(want)))) inv_match = false;
               }
-              inverse_ok += inv_match ? 1u : 0u;
-              if (!inv_match) ++mismatch_total;
-              float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
-              for (int corner = 0; corner < 8; ++corner) {
-                const float p[3] = {(corner & 1) ? entry.bbox_max[0] : entry.bbox_min[0], (corner & 2) ? entry.bbox_max[1] : entry.bbox_min[1],
-                                    (corner & 4) ? entry.bbox_max[2] : entry.bbox_min[2]};
-                float w[3];
-                falcom_world::TransformInst4x3RowDot(matrix, p[0], p[1], p[2], w);
-                for (int k = 0; k < 3; ++k) {
-                  lo[k] = std::min(lo[k], w[k]);
-                  hi[k] = std::max(hi[k], w[k]);
-                }
-              }
-              bool bounds_match = true;
-              for (int k = 0; k < 3; ++k) {
-                // 1e-3 m plus the float rounding of the translation (about 2^-22 of its magnitude).
-                const float tol_lo = 1e-3f + 2.4e-7f * std::fabs(lo[k]);
-                const float tol_hi = 1e-3f + 2.4e-7f * std::fabs(hi[k]);
-                if (!(std::fabs(g.bounds_min[k] - lo[k]) <= tol_lo) || !(std::fabs(g.bounds_max[k] - hi[k]) <= tol_hi)) bounds_match = false;
-              }
-              bounds_ok += bounds_match ? 1u : 0u;
-              if (!bounds_match) ++mismatch_total;
             }
+            inverse_ok += inv_match ? 1u : 0u;
+            if (!inv_match) ++mismatch_total;
+            float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+            for (int corner = 0; corner < 8; ++corner) {
+              const float p[3] = {(corner & 1) ? entry.bbox_max[0] : entry.bbox_min[0], (corner & 2) ? entry.bbox_max[1] : entry.bbox_min[1],
+                                  (corner & 4) ? entry.bbox_max[2] : entry.bbox_min[2]};
+              float w[3];
+              falcom_world::TransformInst4x3RowDot(matrix, p[0], p[1], p[2], w);
+              for (int k = 0; k < 3; ++k) {
+                lo[k] = std::min(lo[k], w[k]);
+                hi[k] = std::max(hi[k], w[k]);
+              }
+            }
+            bool bounds_match = true;
+            for (int k = 0; k < 3; ++k) {
+              // 1e-3 m plus the float rounding of the translation (about 2^-22 of its magnitude).
+              const float tol_lo = 1e-3f + 2.4e-7f * std::fabs(lo[k]);
+              const float tol_hi = 1e-3f + 2.4e-7f * std::fabs(hi[k]);
+              if (!(std::fabs(g.bounds_min[k] - lo[k]) <= tol_lo) || !(std::fabs(g.bounds_max[k] - hi[k]) <= tol_hi)) bounds_match = false;
+            }
+            bounds_ok += bounds_match ? 1u : 0u;
+            if (!bounds_match) ++mismatch_total;
           }
-          expected_valid_total += draw_expected;
-          gpu_valid_total += draw_gpu;
-          std::printf("T2 draw %-18s out %2u count %u expected_valid %u gpu_valid %u\n", draw.name, draw.out, count, draw_expected, draw_gpu);
         }
-        std::printf("T2 records checked %u | valid exact %u/%u (expected %u, gpu %u) | inverse ok %u | bounds ok %u | flags ok %u\n",
-                    checked, valid_match, checked, expected_valid_total, gpu_valid_total, inverse_ok, bounds_ok, flags_ok);
-        CHECK(mismatch_total == 0u, "T2: %u mismatches (valid, inverse, bounds or flags)", mismatch_total);
-        CHECK(expected_valid_total >= 9u, "T2: enough valid reference records (%u)", expected_valid_total);
+        expected_valid_total += draw_expected;
+        gpu_valid_total += draw_gpu;
+        std::printf("T2 draw %-18s out %2u count %u expected_valid %u gpu_valid %u\n", draw.name, draw.out, count, draw_expected, draw_gpu);
       }
+      std::printf("T2 records checked %u | valid exact %u/%u (expected %u, gpu %u) | inverse ok %u | bounds ok %u | flags ok %u\n",
+                  checked, valid_match, checked, expected_valid_total, gpu_valid_total, inverse_ok, bounds_ok, flags_ok);
+      CHECK(mismatch_total == 0u, "T2: %u mismatches (valid, inverse, bounds or flags)", mismatch_total);
+      CHECK(expected_valid_total >= 9u, "T2: enough valid reference records (%u)", expected_valid_total);
     }
   }
   if (queue != nullptr) queue->Release();

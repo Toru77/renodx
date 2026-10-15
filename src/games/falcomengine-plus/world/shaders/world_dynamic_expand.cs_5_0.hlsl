@@ -10,7 +10,7 @@
 
 #include "world_bvh_types.hlsli"
 
-StructuredBuffer<float4> g_dyn_arena : register(t0);
+ByteAddressBuffer g_dyn_arena : register(t0);
 StructuredBuffer<DynamicDrawGPU> g_dyn_draws : register(t1);
 RWStructuredBuffer<WorldInstanceGPU> g_dyn_instances : register(u0);
 
@@ -56,7 +56,7 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
     const DynamicDrawGPU draw = g_dyn_draws[group.x];
     const bool draw_valid = (draw.info.w & 1u) != 0u;
     uint count = draw.info.y;
-    if (draw.extra.x != 0u) count = min(count, asuint(g_dyn_arena[draw.extra.y].y));  // indirect: InstanceCount
+    if (draw.extra.x != 0u) count = min(count, g_dyn_arena.Load(draw.extra.y * 16u + 4u));  // indirect: InstanceCount
     for (uint i = thread; i < draw.info.y; i += DYNAMIC_THREADS)
     {
         float4 rows[3] = {float4(0.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0)};
@@ -64,9 +64,9 @@ void main(uint3 group : SV_GroupID, uint thread : SV_GroupIndex)
         if (live)
         {
             const uint element = draw.info.x + i * DYNAMIC_ELEMENT_FLOAT4;
-            rows[0] = g_dyn_arena[element];
-            rows[1] = g_dyn_arena[element + 1u];
-            rows[2] = g_dyn_arena[element + 2u];
+            rows[0] = asfloat(g_dyn_arena.Load4(element * 16u));
+            rows[1] = asfloat(g_dyn_arena.Load4((element + 1u) * 16u));
+            rows[2] = asfloat(g_dyn_arena.Load4((element + 2u) * 16u));
         }
         const float3 a0 = rows[0].xyz;
         const float3 a1 = rows[1].xyz;
