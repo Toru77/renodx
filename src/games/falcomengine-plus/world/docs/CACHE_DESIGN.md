@@ -93,7 +93,7 @@ Step 0b (diagnostic only, no behaviour change; before any cache code):
 - Size ratio histogram (extent / distance) per tier in `ComputeCacheTiers`.
 - Per episode: summed BLAS ms and TLAS rebuild ms next to t80 ms.
 - Harness: `test_pool` (retire, recreate same content, count), `test_live` (histogram sums equal tier totals, `Self-check`). Panel: three lines in "Cache diagnostics". Build id `cache-diag-1`.
-- In game: Reset diag counters, play two map changes and walk away and back across a street, Dump. Send `world_cache_diag.json` and the new lines.
+- In game: Reset diag counters, play two map changes and walk away and back across a street, Dump. Send the `diag/cache_diag_*.json` file and the new lines.
 
 Step 0b as built: a retired mesh is remembered by its signature (`PoolResightTracker`, `bvh_pool.hpp`), capped at `2 * kPoolMaxMeshes` entries with a 7200-present horizon for the sweep; a retirement over the cap is counted as dropped. A new mesh with a remembered signature is a re-sighting; its gap is the presents since retirement, bucketed at 120, 600, 1800 and 3600. A near miss is a new mesh whose signature is not remembered but whose shape (triangle and vertex counts, and bounds rounded to 0.01 m) matches a remembered one: the split separates same-count content from content that only drifts in bounds. Extent is the largest object-space bbox side; the ratio is the largest side of the instance world bounds over `max(Chebyshev distance, 1 m)`, bucketed at 0.0025, 0.005, 0.01 and 0.02. Capture CPU (decode and apply) is timed separately from the queue-to-applied wait in presents, which includes the GPU read-back that is not CPU time. The diagnostics are collected only while "Collect cache diagnostics" is on; the tracker is off with it.
 

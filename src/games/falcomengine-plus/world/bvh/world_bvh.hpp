@@ -507,44 +507,24 @@ inline void DrawBvhPanel() {
   ImGui::Text("TLAS: %u instances, last rebuild %s (%u frames ago)", live_stats.tlas_instances,
               live_stats.tlas_rebuilds != 0u ? live_stats.tlas_reason : "none",
               live_stats.tlas_rebuilds != 0u && frame >= live_stats.tlas_frame ? frame - live_stats.tlas_frame : 0u);
-  {
-    const uint64_t readback_errors = stats.map_failures + stats.staging_failures + stats.base_mismatch;
-    const uint64_t bvh_errors = live_stats.blas_invalid + live_stats.tlas_invalid + live_stats.upload_failures
-                                + live_stats.refit_failures + data->trace_stats.invalid_refs + data->trace_stats.stack_overflow;
-    const uint64_t deform_errors = deform.failed + deform.resource_failures + deform.map_failures;
-    if (stats.mesh_failures + readback_errors + bvh_errors + deform_errors != 0u) {
-      ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Errors: meshes %llu  readback %llu  BVH %llu  deform %llu",
-                         static_cast<unsigned long long>(stats.mesh_failures),
-                         static_cast<unsigned long long>(readback_errors), static_cast<unsigned long long>(bvh_errors),
-                         static_cast<unsigned long long>(deform_errors));
-    }
-  }
+  if (CollectCacheErrors(data).total != 0u) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Errors recorded: see the dump (errors block)");
   ImGui::Text("CPU: meshes %.2f ms, TLAS %.2f ms (refit %.2f ms)",
               live_stats.mesh_ms_last, live_stats.tlas_ms_last, live_stats.refit_ms_last);
-  ImGui::Text("TLAS skips (no-op rebuilds): %llu (avg %.3f ms, max %.3f ms)", static_cast<unsigned long long>(live_stats.tlas_skips),
-              live_stats.tlas_skips != 0u ? live_stats.tlas_skip_ms_sum / static_cast<float>(live_stats.tlas_skips) : 0.f, live_stats.tlas_skip_ms_max);
-  ImGui::Text("Slack: applies %u (added %u, removed %u, changed %u), exhausted %u, structural %u, maintenance %u, free holes %u; diff/ops/refit/upload %.3f/%.3f/%.3f/%.3f ms",
-              live_stats.slack_applies, live_stats.slack_added, live_stats.slack_removed, live_stats.slack_changed, live_stats.slack_exhausted,
-              live_stats.slack_structural, live_stats.slack_maintenance, live_stats.slack_free_holes, live_stats.slack_phase_ms[0],
-              live_stats.slack_phase_ms[1], live_stats.slack_phase_ms[2], live_stats.slack_phase_ms[3]);
-  ImGui::Text("TLAS timing: rebuilds %llu (avg %.2f ms), refits %llu (last %.3f, max %.3f ms), after drain %llu (avg %.3f ms, skipped %llu)",
-              static_cast<unsigned long long>(tlas_timing.rebuilds),
-              tlas_timing.rebuilds != 0u ? tlas_timing.rebuild_ms_sum / static_cast<float>(tlas_timing.rebuilds) : 0.f,
-              static_cast<unsigned long long>(tlas_timing.refits), tlas_timing.refit_ms_last, tlas_timing.refit_ms_max,
-              static_cast<unsigned long long>(tlas_timing.refits_after_drain),
-              tlas_timing.refits_after_drain != 0u ? tlas_timing.after_drain_ms_sum / static_cast<float>(tlas_timing.refits_after_drain) : 0.f,
-              static_cast<unsigned long long>(tlas_timing.refit_after_drain_skipped));
-  ImGui::Text("TLAS rebuild cause: retire %llu (%.2f ms) admit %llu (%.2f ms) other %llu (%.2f ms) mixed %llu | bumps: retire %llu admit %llu promote %llu compact %llu new mesh %llu reset %llu",
-              static_cast<unsigned long long>(tlas_timing.rebuilds_by_cause[0]), tlas_timing.rebuild_ms_by_cause[0],
-              static_cast<unsigned long long>(tlas_timing.rebuilds_by_cause[1]), tlas_timing.rebuild_ms_by_cause[1],
-              static_cast<unsigned long long>(tlas_timing.rebuilds_by_cause[2]), tlas_timing.rebuild_ms_by_cause[2],
-              static_cast<unsigned long long>(tlas_timing.rebuilds_mixed),
-              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Retire)]),
-              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Admit)]),
-              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Promote)]),
-              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Compact)]),
-              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::NewMesh)]),
-              static_cast<unsigned long long>(tlas_timing.revision_bumps[static_cast<size_t>(PoolRevisionSource::Reset)]));
+  CacheDiagData diag;
+  {
+    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+    diag = g_cache_diag.data;
+  }
+  ImGui::Text("TLAS CPU ms: rebuild avg %.2f / max %.2f, skip avg %.3f / max %.3f, apply avg %.3f / max %.3f, refit last %.3f / max %.3f",
+              tlas_timing.rebuilds != 0u ? tlas_timing.rebuild_ms_sum / static_cast<float>(tlas_timing.rebuilds) : 0.f, tlas_timing.rebuild_ms_max,
+              live_stats.tlas_skips != 0u ? live_stats.tlas_skip_ms_sum / static_cast<float>(live_stats.tlas_skips) : 0.f, live_stats.tlas_skip_ms_max,
+              live_stats.slack_applies != 0u ? live_stats.slack_apply_ms_sum / static_cast<float>(live_stats.slack_applies) : 0.f,
+              live_stats.slack_apply_ms_max, tlas_timing.refit_ms_last, tlas_timing.refit_ms_max);
+  ImGui::Text("Build/capture CPU ms: BLAS avg %.2f / max %.2f (since reset), capture total %.2f",
+              live_stats.blas_builds != 0u ? live_stats.blas_build_ms_sum / static_cast<float>(live_stats.blas_builds) : 0.f,
+              live_stats.blas_build_ms_max, diag.work.capture_ms);
+  ImGui::Text("Rebuild cost by cause (ms): retire %.2f, admit %.2f, other %.2f", tlas_timing.rebuild_ms_by_cause[0],
+              tlas_timing.rebuild_ms_by_cause[1], tlas_timing.rebuild_ms_by_cause[2]);
   ImGui::Text("Refit phases (ms): copy %.3f / desc %.3f / nodes+validate %.3f / upload %.3f", tlas_timing.refit_phase_ms[0],
               tlas_timing.refit_phase_ms[1], tlas_timing.refit_phase_ms[2], tlas_timing.refit_phase_ms[3]);
   ImGui::Text("Follow lag (frames): on screen %u (max %u), all dynamic %u (max %u)", stats.on_screen_lag_last,
@@ -556,7 +536,7 @@ inline void DrawBvhPanel() {
               static_cast<double>(g_deform_live.cpu_frame_us.load(std::memory_order_relaxed)) / 1000.0);
   if (live_stats.gpu_checked) {
     const ImVec4 color = live_stats.gpu_ok ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
-    ImGui::TextColored(color, "GPU contents: %s", live_stats.gpu_result.c_str());
+    ImGui::TextColored(color, "GPU contents: %s", live_stats.gpu_ok ? "match" : "MISMATCH");
   }
   if (mode != static_cast<int>(BvhView::Off)) {
     ImGui::TextDisabled("Inspect: middle-click a pixel of the trace view to see what the BVH hit there (also written to ReShade.log).");
@@ -564,12 +544,29 @@ inline void DrawBvhPanel() {
   for (const std::string& line : data->inspect.lines) ImGui::TextUnformatted(line.c_str());
   if (data->trace_stats.valid) DrawDepthCompareStats(data->trace_stats);
 
-  // Phase 0 cache diagnostics (diagnostic only: no rendering change). Every result is shown here, copied to the
-  // clipboard and written to the pool folder.
+  // Phase 0 cache diagnostics (diagnostic only: no rendering change). The panel shows the ms costs; every count is in the
+  // dump. Each dump and each performance test writes its own file in the diag folder.
   ImGui::SeparatorText("Cache diagnostics (Phase 0 and 0b, diagnostic only: no rendering change)");
   bool collect = g_cache_diag.enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Collect cache diagnostics", &collect)) g_cache_diag.enabled.store(collect, std::memory_order_relaxed);
-  for (const std::string& line : CacheDiagLines(data)) ImGui::TextUnformatted(line.c_str());
+  ImGui::Text("Frame: last %.2f ms, avg %.2f ms (since reset)", static_cast<double>(diag.frame_ms_last),
+              diag.frame_intervals != 0u ? diag.frame_ms_sum / static_cast<double>(diag.frame_intervals) : 0.0);
+  ImGui::TextUnformatted(CacheTlasPhaseLine(diag).c_str());
+  bool perf_running = false;
+  double perf_elapsed_s = 0.0;
+  std::string perf_label;
+  {
+    std::lock_guard<std::mutex> lock(g_perf.mutex);
+    perf_running = g_perf.active.load();
+    perf_elapsed_s = g_perf.run.elapsed_s;
+    perf_label = g_perf.run.label;
+  }
+  if (perf_running) {
+    ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Performance test running: %.1f / %.1f s [%s]", perf_elapsed_s, kPerfWindowSeconds,
+                       perf_label.c_str());
+  }
+  static char diag_label[64] = {};
+  ImGui::InputText("Label", diag_label, sizeof(diag_label));
   if (ImGui::Button("Dump cache diagnostics")) {
     // The first press asks the next present to compute the tiers; the press after that (once a present has run) writes the file.
     bool ready = false;
@@ -584,7 +581,7 @@ inline void DrawBvhPanel() {
     }
     if (ready) {
       const uint32_t dump_frame = g_state.frame.load();
-      const std::filesystem::path path = WriteCacheDiagFile(data, dump_frame);
+      const std::filesystem::path path = WriteCacheDiagFile(data, dump_frame, diag_label, ReadCacheSwitches());
       std::error_code ec;
       const uintmax_t bytes = std::filesystem::file_size(path, ec);
       const bool written = !ec && bytes != 0u;
@@ -604,6 +601,12 @@ inline void DrawBvhPanel() {
         g_cache_diag.data.last_bytes = bytes;
       }
     }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(diag_label);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Averages of frame time and every cost over 30 s of presents, written to its own perf file. Start it\n"
+                      "after the map has settled (not during the refill after a map change). Label: optional, file name only.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Reset diag counters")) {

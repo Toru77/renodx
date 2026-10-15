@@ -10,6 +10,7 @@
 // involved. Other APIs (and the native harness) get a timer that never
 // measures.
 
+#include <algorithm>
 #include <cstdint>
 
 #if defined(_WIN32)
@@ -41,6 +42,8 @@ struct GpuTimer {
 #endif
   float last_ms = -1.f;  // newest completed measurement; negative: none yet
   uint32_t samples = 0u;
+  double ms_sum = 0.0;  // cumulative over all samples (consumers take deltas)
+  float ms_max = 0.f;
   uint32_t skipped = 0u;  // frames not measured (every set in flight, or a disjoint interval)
 };
 
@@ -108,6 +111,8 @@ inline void PollGpuTimer(ID3D11DeviceContext* context, GpuTimer* timer) {
     timer->last_serial = slot.serial;
     timer->last_ms = static_cast<float>(static_cast<double>(end - begin) * 1000.0 / static_cast<double>(disjoint.Frequency));
     timer->samples += 1u;
+    timer->ms_sum += timer->last_ms;
+    timer->ms_max = std::max(timer->ms_max, timer->last_ms);
   }
 }
 

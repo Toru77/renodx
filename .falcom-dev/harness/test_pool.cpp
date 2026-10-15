@@ -326,6 +326,7 @@ int main() {
     CHECK(p.episode_fresh_from == p.map_change_frame + 1u, "map change: fresh from the frame after the change (%u)", p.episode_fresh_from);
     CHECK(std::strcmp(p.episode_reason, "map change") == 0, "map change reason (%s)", p.episode_reason);
     CHECK(p.map_change_frame == falcom_world::g_state.frame.load(), "map change frame (%u)", p.map_change_frame);
+    CHECK(p.episode_start_frame == p.map_change_frame, "episode starts at the map change (%u)", p.episode_start_frame);
     CHECK(p.stats.map_instances_retired == 0u, "no sweep in change frame (%u)", p.stats.map_instances_retired);
     CHECK(p.instances.size() == 4, "instances %zu", p.instances.size());
     CHECK(pre_release_next > p.map_change_frame, "cooldown before the release (%u > %u)", pre_release_next, p.map_change_frame);
@@ -341,6 +342,7 @@ int main() {
     std::printf("before settle: map_change_frame %u frame %u map_instances_retired %u instances %zu\n",
                 p.map_change_frame, falcom_world::g_state.frame.load(), p.stats.map_instances_retired, p.instances.size());
     CHECK(p.map_change_frame == falcom_world::g_state.frame.load() - bvh::kPoolMapSettleFrames + 1u, "sweep pending (%u)", p.map_change_frame);
+    CHECK(p.map_change_frame != 0u && p.episode_start_frame == p.map_change_frame, "map change pending until the sweep (%u, episode %u)", p.map_change_frame, p.episode_start_frame);
     CHECK(p.stats.map_instances_retired == 0u, "no sweep before settle (%u)", p.stats.map_instances_retired);
     CHECK(p.instances.size() == 4, "instances before settle %zu", p.instances.size());
     int live = 0;

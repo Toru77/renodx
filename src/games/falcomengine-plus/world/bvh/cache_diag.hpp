@@ -7,7 +7,7 @@
 // the instance set, the BLAS build cost, the lighting gap, and how long a map
 // change or a pool reset takes to refill the TLAS with fresh instances (an
 // episode). Every result is shown in the panel, copied to the clipboard and
-// written to world_cache_diag.json.
+// written to a new file in the diag folder (cache_diag_<time>[_<label>].json).
 //
 // Lock rule: g_cache_diag.mutex is a leaf lock. Nothing else is taken under it;
 // the pool and camera are read before it is taken, and file I/O happens outside.
@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <iterator>
 #include <limits>
@@ -32,6 +33,7 @@
 
 #include "bvh_pool.hpp"
 #include "bvh_resources.hpp"
+#include "deform_live.hpp"
 
 namespace falcom_world::bvh {
 
@@ -50,6 +52,7 @@ inline constexpr float kCacheRatioEdges[4] = {0.0025f, 0.005f, 0.01f, 0.02f};
 inline constexpr size_t kCacheRatioBuckets = 5u;
 inline constexpr const char* kCacheRatioLabels[kCacheRatioBuckets] = {"<0.0025", "0.0025-0.005", "0.005-0.01", "0.01-0.02", ">=0.02"};
 inline constexpr const char* kCacheGapLabels[kPoolResightGapBuckets] = {"<120", "120-600", "600-1800", "1800-3600", ">=3600"};
+inline constexpr size_t kCacheLabelMax = 40u;           // file name label: bytes kept after sanitising
 inline constexpr uint32_t kCacheSampleInterval = 30u;   // presents between tier computations
 inline constexpr uint32_t kCacheSettlePresents = 300u;  // presents without a TLAS rebuild that settle an episode
 inline constexpr size_t kCacheMaxSamples = 256u;        // TLAS rebuild samples kept per episode
@@ -390,6 +393,10 @@ struct CacheDiagData {
   uint64_t last_bytes = 0u;
   std::string last_result;  // the last panel action's result line
   bool dump_armed = false;  // Dump was pressed once: the next press writes the file (after a present computed the tiers)
+  std::chrono::steady_clock::time_point last_present{};  // kept across a reset: the frame interval continues
+  float frame_ms_last = 0.f;  // interval between the last two presents
+  double frame_ms_sum = 0.0;  // since reset
+  uint64_t frame_intervals = 0u;
 };
 
 struct CacheDiagState {
@@ -413,6 +420,7 @@ inline void ResetCacheDiagCounters() {
   fresh.last_path = g_cache_diag.data.last_path;
   fresh.last_bytes = g_cache_diag.data.last_bytes;
   fresh.last_result = g_cache_diag.data.last_result;
+  fresh.last_present = g_cache_diag.data.last_present;
   g_cache_diag.data = std::move(fresh);
 }
 
@@ -551,7 +559,20 @@ inline std::string CacheFormat(const char* format, Args... args) {
   return text;
 }
 
-// The report: panel lines, clipboard text and the "lines" key of world_cache_diag.json.
+// TLAS rebuild phases (ms): average, max and last per phase.
+inline std::string CacheTlasPhaseLine(const CacheDiagData& d) {
+  const CacheTlasStats& t = d.tlas;
+  const CacheWork& w = d.work;
+  std::string phases = "TLAS rebuild phases (ms) avg/max/last: ";
+  for (size_t p = 0; p < kCachePhaseCount; ++p) {
+    phases += CacheFormat("%s%s %.3f/%.3f/%.3f", p != 0u ? ", " : "", kCachePhaseNames[p],
+                          w.tlas_rebuilds != 0u ? static_cast<double>(t.phase_sum[p]) / static_cast<double>(w.tlas_rebuilds) : 0.0,
+                          static_cast<double>(t.phase_max[p]), static_cast<double>(t.phase_last[p]));
+  }
+  return phases;
+}
+
+// The report: clipboard text and the "lines" key of the cache diagnostics file.
 inline std::vector<std::string> CacheDiagLines(const BvhDeviceData* data) {
   CacheDiagData d;
   {
@@ -592,13 +613,8 @@ inline std::vector<std::string> CacheDiagLines(const BvhDeviceData* data) {
       t.nearest_add_remove_m < 0.f ? "-" : CacheFormat("%.1f m", t.nearest_add_remove_m).c_str(), t.by_tier[0],
       t.by_tier[1], t.by_tier[2], t.by_tier[kCacheTlasTierNone]));
   const CacheWork& w = d.work;
-  std::string phases = "TLAS rebuild phases (ms) avg/max/last: ";
-  for (size_t p = 0; p < kCachePhaseCount; ++p) {
-    phases += CacheFormat("%s%s %.3f/%.3f/%.3f", p != 0u ? ", " : "", kCachePhaseNames[p],
-                          w.tlas_rebuilds != 0u ? static_cast<double>(t.phase_sum[p]) / static_cast<double>(w.tlas_rebuilds) : 0.0,
-                          static_cast<double>(t.phase_max[p]), static_cast<double>(t.phase_last[p]));
-  }
-  lines.push_back(phases);
+  lines.push_back(CacheTlasPhaseLine(d));
+
   lines.push_back(CacheFormat(
       "TLAS no-op rebuilds: full %llu, static %llu (%.1f %% of rebuilds), by cause retire %llu, admit %llu, other %llu, %.2f ms spent; skipped %llu (%.2f ms; by cause retire %llu, admit %llu, other %llu); in-place applies %llu",
       t.noop_full, t.noop_static, w.tlas_rebuilds != 0u ? 100.0 * static_cast<double>(t.noop_static) / static_cast<double>(w.tlas_rebuilds) : 0.0,
@@ -694,18 +710,133 @@ inline std::vector<std::string> CacheDiagLines(const BvhDeviceData* data) {
   return lines;
 }
 
-// world_cache_diag.json in the pool folder. Returns its path; the caller confirms the size.
-inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint32_t frame) {
+// Switches of the diagnostics as they were when a file was written or a perf run started.
+struct CacheSwitches {
+  bool collect = false;
+  bool skip_noop = false;
+  bool slack = false;
+  bool live_bvh = false;
+  bool operator==(const CacheSwitches& other) const {
+    return collect == other.collect && skip_noop == other.skip_noop && slack == other.slack && live_bvh == other.live_bvh;
+  }
+};
+
+inline void WriteSwitchesJson(std::ostringstream* out, const CacheSwitches& s) {
+  *out << "{\"collect_cache_diagnostics\": " << (s.collect ? "true" : "false") << ", \"skip_noop_tlas\": " << (s.skip_noop ? "true" : "false")
+       << ", \"slack_tlas\": " << (s.slack ? "true" : "false") << ", \"live_bvh\": " << (s.live_bvh ? "true" : "false") << "}";
+}
+
+// Every error counter of the report (the panel's Errors line and the dump's errors block). Locks: g_pool.mutex and
+// g_deform_live.mutex are taken one after the other, never nested; the caller holds no lock.
+struct CacheErrors {
+  uint64_t meshes = 0u;
+  uint64_t total = 0u;
+  struct Readback {
+    uint64_t map_failures = 0u;
+    uint64_t staging_failures = 0u;
+    uint64_t base_mismatch = 0u;
+  } readback;
+  struct Bvh {
+    uint64_t blas_invalid = 0u;
+    uint64_t tlas_invalid = 0u;
+    uint64_t upload_failures = 0u;
+    uint64_t refit_failures = 0u;
+    uint64_t invalid_refs = 0u;
+    uint64_t stack_overflow = 0u;
+  } bvh;
+  struct Deform {
+    uint64_t failed = 0u;
+    uint64_t resource_failures = 0u;
+    uint64_t map_failures = 0u;
+  } deform;
+};
+
+inline CacheErrors CollectCacheErrors(const BvhDeviceData* data) {
+  CacheErrors e;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    UpdatePoolStats();
+    e.meshes = g_pool.stats.mesh_failures;
+    e.readback.map_failures = g_pool.stats.map_failures;
+    e.readback.staging_failures = g_pool.stats.staging_failures;
+    e.readback.base_mismatch = g_pool.stats.base_mismatch;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    e.deform.failed = g_deform_live.stats.failed;
+    e.deform.resource_failures = g_deform_live.stats.resource_failures;
+    e.deform.map_failures = g_deform_live.stats.map_failures;
+  }
+  e.bvh.blas_invalid = data->live.blas_invalid;
+  e.bvh.tlas_invalid = data->live.tlas_invalid;
+  e.bvh.upload_failures = data->live.upload_failures;
+  e.bvh.refit_failures = data->live.refit_failures;
+  e.bvh.invalid_refs = data->trace_stats.invalid_refs;
+  e.bvh.stack_overflow = data->trace_stats.stack_overflow;
+  e.total = e.meshes + e.readback.map_failures + e.readback.staging_failures + e.readback.base_mismatch + e.bvh.blas_invalid
+            + e.bvh.tlas_invalid + e.bvh.upload_failures + e.bvh.refit_failures + e.bvh.invalid_refs + e.bvh.stack_overflow
+            + e.deform.failed + e.deform.resource_failures + e.deform.map_failures;
+  return e;
+}
+
+// File name label: [A-Za-z0-9._-] kept, every other byte becomes '_', runs collapsed, trimmed of "_.-" at both ends, at most kCacheLabelMax bytes.
+inline std::string SanitizeDiagLabel(const std::string& raw) {
+  std::string text;
+  for (const char c : raw) {
+    const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+    const char mapped = keep ? c : '_';
+    if (mapped == '_' && !text.empty() && text.back() == '_') continue;
+    text += mapped;
+  }
+  const size_t first = text.find_first_not_of("_.-");
+  text = first == std::string::npos ? std::string() : text.substr(first, text.find_last_not_of("_.-") - first + 1);
+  if (text.size() > kCacheLabelMax) text.resize(kCacheLabelMax);
+  return text;
+}
+
+inline std::string DiagTimestamp(std::chrono::system_clock::time_point when) {
+  const std::time_t time = std::chrono::system_clock::to_time_t(when);
+  std::tm local{};
+  localtime_s(&local, &time);
+  char text[32] = {};
+  std::strftime(text, sizeof(text), "%Y%m%d-%H%M%S", &local);
+  return text;
+}
+
+// A new file in PoolOutputDir()/diag: <prefix>_<timestamp>[_<label>].json, with -2, -3, ... when the name is taken. Never overwrites.
+inline std::filesystem::path DiagFilePath(const char* prefix, const std::string& label, std::chrono::system_clock::time_point when) {
+  const std::filesystem::path folder = PoolOutputDir() / "diag";
+  std::error_code ec;
+  std::filesystem::create_directories(folder, ec);
+  const std::string stem = std::string(prefix) + "_" + DiagTimestamp(when) + (label.empty() ? std::string() : "_" + label);
+  std::filesystem::path path = folder / (stem + ".json");
+  for (int n = 2; std::filesystem::exists(path, ec); ++n) path = folder / (stem + "-" + std::to_string(n) + ".json");
+  return path;
+}
+
+// A new cache diagnostics file (a separate file per dump). Returns its path; the caller confirms the size.
+inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint32_t frame, const std::string& raw_label,
+                                                const CacheSwitches& switches) {
   const std::vector<std::string> lines = CacheDiagLines(data);
+  const CacheErrors errors = CollectCacheErrors(data);
   CacheDiagData d;
   {
     std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
     d = g_cache_diag.data;
   }
+  const std::string label = SanitizeDiagLabel(raw_label);
+  const auto when = std::chrono::system_clock::now();
+  const std::filesystem::path path = DiagFilePath("cache_diag", label, when);
   std::ostringstream out;
-  out << "{\n  \"schema\": 3,\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n  \"frame\": " << frame << ",\n";
-  out << "  \"lines\": [";
+  out << "{\n  \"schema\": 4,\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n  \"frame\": " << frame << ",\n";
+  out << "  \"label\": \"" << PoolJsonEscape(label) << "\",\n  \"label_raw\": \"" << PoolJsonEscape(raw_label) << "\",\n";
+  out << "  \"timestamp\": \"" << DiagTimestamp(when) << "\",\n  \"presents\": " << d.presents << ",\n";
+  out << "  \"tiers_valid\": " << (d.tiers_valid ? "true" : "false") << ", \"tiers_frame\": " << d.tiers_frame << ",\n";
+  out << "  \"switches\": ";
+  WriteSwitchesJson(&out, switches);
+  out << ",\n  \"lines\": [";
   for (size_t i = 0; i < lines.size(); ++i) out << (i != 0u ? ", " : "") << "\"" << PoolJsonEscape(lines[i]) << "\"";
+
   const auto uint_array = [&out](const uint64_t* values, size_t count) {
     out << "[";
     for (size_t i = 0; i < count; ++i) out << (i != 0u ? ", " : "") << values[i];
@@ -810,13 +941,34 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
   uint_array(t.seen_latency, kCacheLatencyBuckets);
   out << "},\n  \"lighting\": {\"presents\": " << light.presents << ", \"dark_presents\": " << light.dark_presents
       << ", \"dark_runs\": " << light.dark_runs << ", \"longest_dark\": " << light.longest_dark << ", \"longest_lit\": " << light.longest_lit
-      << "}\n}\n";
-  const std::filesystem::path path = PoolOutputDir() / "world_cache_diag.json";
+      << "}";
+  const GpuTimer& trace = data->trace_timer;
+  const LiveBvhStats& live = data->live;
+  out << ",\n  \"slack\": {\"applies\": " << live.slack_applies << ", \"apply_ms_sum\": " << PoolJsonFloat{live.slack_apply_ms_sum}
+      << ", \"apply_ms_max\": " << PoolJsonFloat{live.slack_apply_ms_max} << ", \"added\": " << live.slack_added
+      << ", \"removed\": " << live.slack_removed << ", \"changed\": " << live.slack_changed << ", \"exhausted\": " << live.slack_exhausted
+      << ", \"structural\": " << live.slack_structural << ", \"maintenance\": " << live.slack_maintenance
+      << ", \"free_holes\": " << live.slack_free_holes << ", \"phase_ms\": [" << PoolJsonFloat{live.slack_phase_ms[0]} << ", "
+      << PoolJsonFloat{live.slack_phase_ms[1]} << ", " << PoolJsonFloat{live.slack_phase_ms[2]} << ", " << PoolJsonFloat{live.slack_phase_ms[3]} << "]}";
+  out << ",\n  \"gpu\": {\"trace\": {\"last_ms\": " << PoolJsonFloat{trace.last_ms} << ", \"avg_ms\": "
+      << PoolJsonFloat{trace.samples != 0u ? static_cast<float>(trace.ms_sum / trace.samples) : -1.f} << ", \"max_ms\": " << PoolJsonFloat{trace.ms_max}
+      << ", \"samples\": " << trace.samples << ", \"skipped\": " << trace.skipped << "}}";
+  out << ",\n  \"gpu_check\": {\"checked\": " << (live.gpu_checked ? "true" : "false") << ", \"ok\": " << (live.gpu_ok ? "true" : "false")
+      << ", \"frame\": " << live.gpu_check_frame << ", \"result\": \"" << PoolJsonEscape(live.gpu_result) << "\"}";
+  out << ",\n  \"errors\": {\"total\": " << errors.total << ", \"meshes\": " << errors.meshes << ", \"readback\": {\"map_failures\": "
+      << errors.readback.map_failures << ", \"staging_failures\": " << errors.readback.staging_failures << ", \"base_mismatch\": "
+      << errors.readback.base_mismatch << "}, \"bvh\": {\"blas_invalid\": " << errors.bvh.blas_invalid << ", \"tlas_invalid\": " << errors.bvh.tlas_invalid
+      << ", \"upload_failures\": " << errors.bvh.upload_failures << ", \"refit_failures\": " << errors.bvh.refit_failures
+      << ", \"invalid_refs\": " << errors.bvh.invalid_refs << ", \"stack_overflow\": " << errors.bvh.stack_overflow
+      << "}, \"deform\": {\"failed\": " << errors.deform.failed << ", \"resource_failures\": " << errors.deform.resource_failures
+      << ", \"map_failures\": " << errors.deform.map_failures << "}}";
+  out << ",\n  \"work\": ";
+  work_json(d.work);
+  out << "\n}\n";
   std::string text = out.str();
-  std::error_code ec;
-  std::filesystem::remove(path, ec);  // a failed write must not leave the previous file behind
   renodx::utils::path::WriteTextFile(path, text);
   return path;
+
 }
 
 }  // namespace falcom_world::bvh

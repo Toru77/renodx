@@ -65,6 +65,7 @@
 #include "alpha_live.hpp"
 #include "bvh_resources.hpp"
 #include "cache_diag.hpp"
+#include "perf_run.hpp"
 #include "deform_live.hpp"
 
 namespace falcom_world::bvh {
@@ -1038,12 +1039,15 @@ inline void RebuildLiveTlas(
     if ((change_now == nullptr || std::strcmp(change_now, "store changed") == 0)
         && TryApplyLiveTlasSlack(device, cmd_list, data, frame, instances, info, &reason, &ops)) {
       commit(true);
+      const float apply_ms = LiveElapsedMs(start);
+      stats.slack_apply_ms_sum += apply_ms;
+      stats.slack_apply_ms_max = (std::max)(stats.slack_apply_ms_max, apply_ms);
       if (ops == 0u) {
         count_skip();
       } else {
         CacheRebuildExtra applied;
         applied.applied = true;
-        RecordCacheTlasRebuild(applied_before, data->tlas_info, true, frame, LiveElapsedMs(start), applied);
+        RecordCacheTlasRebuild(applied_before, data->tlas_info, true, frame, apply_ms, applied);
       }
       return;
     }
@@ -1413,6 +1417,7 @@ inline std::vector<T> LiveBytesAs(const std::vector<uint8_t>& bytes, uint64_t fi
 inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::command_queue* queue, BvhDeviceData* data) {
   LiveBvhStats& stats = data->live;
   stats.gpu_checked = true;
+  stats.gpu_check_frame = g_state.frame.load();
   stats.gpu_ok = false;
   std::vector<uint8_t> vertices;
   std::vector<uint8_t> indices;
@@ -2212,20 +2217,35 @@ inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::
 // are computed every kCacheSampleInterval presents, or on the present after a Dump request, and read under g_pool.mutex.
 // The lighting gap is a present that is dark: the lighting depth is not the depth of this frame's camera, or the
 // lighting depth or the camera stamp is more than one frame old (no lighting pass ran).
+// The switches as the panel and the dumps report them.
+inline CacheSwitches ReadCacheSwitches() {
+  CacheSwitches s;
+  s.collect = g_cache_diag.enabled.load(std::memory_order_relaxed);
+  s.skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
+  s.slack = g_live_bvh.slack.load(std::memory_order_relaxed);
+  s.live_bvh = g_live_bvh.enabled.load(std::memory_order_relaxed);
+  return s;
+}
+
 inline void UpdateCacheDiag(reshade::api::device* device) {
   BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
   if (data == nullptr) return;
   if (g_cache_diag.reset_requested.exchange(false, std::memory_order_relaxed)) {
-    data->live.blas_builds = 0u;
-    data->live.blas_built_triangles = 0u;
-    data->live.blas_build_ms_sum = 0.f;
-    data->live.blas_build_ms_max = 0.f;
-    ResetCacheDiagCounters();
-    std::lock_guard<std::mutex> pool_lock(g_pool.mutex);
-    g_pool.resight.counters = PoolResightCounters{};
-    g_pool.resight.by_signature.clear();
-    g_pool.resight.shape_count.clear();
-    g_pool.resight.sweep_frame = 0u;
+    if (g_perf.active.load(std::memory_order_relaxed)) {
+      std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+      g_cache_diag.data.last_result = "Reset ignored: a performance test is running (the BLAS counters must not change mid-window)";
+    } else {
+      data->live.blas_builds = 0u;
+      data->live.blas_built_triangles = 0u;
+      data->live.blas_build_ms_sum = 0.f;
+      data->live.blas_build_ms_max = 0.f;
+      ResetCacheDiagCounters();
+      std::lock_guard<std::mutex> pool_lock(g_pool.mutex);
+      g_pool.resight.counters = PoolResightCounters{};
+      g_pool.resight.by_signature.clear();
+      g_pool.resight.shape_count.clear();
+      g_pool.resight.sweep_frame = 0u;
+    }
   }
   PoolStageScope stage("cache diag");
   const uint32_t frame = g_state.frame.load();
@@ -2275,8 +2295,17 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
     if (sample) ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
   }
   const uint64_t capture_us = g_pool.cpu_capture_us.exchange(0u, std::memory_order_relaxed);
+  const auto present_time = std::chrono::steady_clock::now();
+  UpdatePerfRun(data, frame, capture_us, present_time, ReadCacheSwitches());
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
+  if (d.last_present != std::chrono::steady_clock::time_point{}) {
+    d.frame_ms_last = std::chrono::duration<float, std::milli>(present_time - d.last_present).count();
+    d.frame_ms_sum += d.frame_ms_last;
+    d.frame_intervals += 1u;
+  }
+  d.last_present = present_time;
+
   const uint32_t previous_serial = d.serial_seen;
   d.serial_seen = serial;
   if (sample) {

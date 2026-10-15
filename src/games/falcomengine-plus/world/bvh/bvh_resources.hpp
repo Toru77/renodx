@@ -175,6 +175,11 @@ struct LiveBvhStats {
   uint32_t slack_maintenance = 0u;
   uint32_t slack_free_holes = 0u;
   float slack_phase_ms[4] = {};  // diff, ops, refit + validate, upload (last apply)
+  float slack_apply_ms_sum = 0.f;  // CPU ms of every successful apply (zero-op applies included)
+
+  float slack_apply_ms_max = 0.f;
+  uint32_t gpu_check_frame = 0u;  // frame of the last Check GPU Contents
+
   uint32_t tlas_instances = 0u;   // in the TLAS
   uint32_t tlas_waiting = 0u;     // in the region, mesh not uploaded yet
   uint32_t tlas_unusable = 0u;    // in the region, mesh failed (no BLAS)

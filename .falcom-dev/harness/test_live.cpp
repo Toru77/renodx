@@ -1381,20 +1381,360 @@ static void TestCacheCaptureTime(Device* dev) {
   bvh::ResetCacheDiagCounters();
 }
 
+// Reads a dump file back as text.
+static std::string ReadDumpText(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
 static void TestCacheDiagJson(Device* dev) {
   bvh::ResetCacheDiagCounters();
-  const std::filesystem::path path = bvh::WriteCacheDiagFile(bvh::GetBvhDeviceData(dev), 1234u);
-  std::ifstream in(path, std::ios::binary);
-  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  CHECK(JsonError(text).empty(), "world_cache_diag.json is valid JSON: %s", JsonError(text).c_str());
-  const char* keys[] = {"\"schema\": 3", "\"resight\": {", "\"gap\": [", "\"capture\": {", "\"extent_buckets\": [",
+  const std::filesystem::path path = bvh::WriteCacheDiagFile(bvh::GetBvhDeviceData(dev), 1234u, "", bvh::CacheSwitches{});
+  const std::string text = ReadDumpText(path);
+  CHECK(JsonError(text).empty(), "cache_diag file is valid JSON: %s", JsonError(text).c_str());
+  const char* keys[] = {"\"schema\": 4", "\"resight\": {", "\"gap\": [", "\"capture\": {", "\"extent_buckets\": [",
                         "\"ratio_buckets\": [", "\"ratio_tris\": [", "\"hist_check\": ", "\"ms_sum\": ", "\"t80_work\": ", "\"work\": ",
-                        "\"phase_ms\": {", "\"noop\": {", "\"reasons\": {", "\"entry_latency\": {"};
+                        "\"phase_ms\": {", "\"noop\": {", "\"reasons\": {", "\"entry_latency\": {", "\"label\": \"\"", "\"label_raw\": \"\"",
+                        "\"timestamp\": \"", "\"presents\": ", "\"tiers_valid\": ", "\"tiers_frame\": ", "\"switches\": {", "\"slack\": {",
+                        "\"gpu\": {", "\"gpu_check\": {", "\"errors\": {"};
+
   for (const char* key : keys) CHECK(text.find(key) != std::string::npos, "json has %s", key);
   bvh::ResetCacheDiagCounters();
 }
 
+static void TestDiagLabel() {
+  CHECK(bvh::SanitizeDiagLabel("a b/c") == "a_b_c", "space and slash become _ (%s)", bvh::SanitizeDiagLabel("a b/c").c_str());
+  CHECK(bvh::SanitizeDiagLabel("..\\x:*?") == "x", "path characters removed (%s)", bvh::SanitizeDiagLabel("..\\x:*?").c_str());
+  CHECK(bvh::SanitizeDiagLabel("").empty(), "empty label stays empty");
+  CHECK(bvh::SanitizeDiagLabel(std::string(100, 'a')).size() == 40u, "label truncated to 40 bytes (%zu)", bvh::SanitizeDiagLabel(std::string(100, 'a')).size());
+  CHECK(bvh::SanitizeDiagLabel("a\xC3\xA9" "b") == "a_b", "non-ASCII bytes collapse to one _ (%s)", bvh::SanitizeDiagLabel("a\xC3\xA9" "b").c_str());
+  CHECK(bvh::SanitizeDiagLabel("__x--") == "x", "leading and trailing _ . - trimmed (%s)", bvh::SanitizeDiagLabel("__x--").c_str());
+  CHECK(bvh::SanitizeDiagLabel("A-b.c_9") == "A-b.c_9", "allowed set kept");
+}
+
+// Two dumps in the same second with the same label: two distinct files, each keeping its own frame; no fixed-name file.
+static void TestDiagSeparateFiles(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  const bvh::CacheSwitches off{};
+  std::error_code ec;
+  std::filesystem::remove(bvh::PoolOutputDir() / "world_cache_diag.json", ec);  // a file left by an older build
+  const std::filesystem::path first = bvh::WriteCacheDiagFile(data, 1u, "same", off);
+  const std::filesystem::path second = bvh::WriteCacheDiagFile(data, 2u, "same", off);
+  const std::filesystem::path other = bvh::WriteCacheDiagFile(data, 3u, "other", off);
+  CHECK(first != second && first != other && second != other, "dumps get distinct paths (%s / %s / %s)", first.filename().string().c_str(),
+        second.filename().string().c_str(), other.filename().string().c_str());
+  CHECK(std::filesystem::exists(first) && std::filesystem::exists(second) && std::filesystem::exists(other), "every dump file exists");
+  CHECK(ReadDumpText(first).find("\"frame\": 1,") != std::string::npos, "first dump keeps frame 1");
+  CHECK(ReadDumpText(second).find("\"frame\": 2,") != std::string::npos, "second dump keeps frame 2");
+  CHECK(first.parent_path().filename() == "diag", "dumps are written in the diag folder");
+  CHECK(!std::filesystem::exists(bvh::PoolOutputDir() / "world_cache_diag.json"), "no world_cache_diag.json is written");
+  CHECK(bvh::DiagFilePath("perf", "same", std::chrono::system_clock::now()).filename().string().rfind("perf_", 0) == 0,
+        "perf files use their own prefix");
+  bvh::ResetCacheDiagCounters();
+}
+
+// The four switches are written exactly as they were passed in.
+static void TestDiagSwitches(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  const bvh::CacheSwitches a{true, false, true, false};
+  const bvh::CacheSwitches b{false, true, false, true};
+  const std::string text_a = ReadDumpText(bvh::WriteCacheDiagFile(data, 5u, "", a));
+  const std::string text_b = ReadDumpText(bvh::WriteCacheDiagFile(data, 6u, "", b));
+  CHECK(text_a.find("\"switches\": {\"collect_cache_diagnostics\": true, \"skip_noop_tlas\": false, \"slack_tlas\": true, \"live_bvh\": false}") != std::string::npos,
+        "switch combination A written exactly");
+  CHECK(text_b.find("\"switches\": {\"collect_cache_diagnostics\": false, \"skip_noop_tlas\": true, \"slack_tlas\": false, \"live_bvh\": true}") != std::string::npos,
+        "switch combination B written exactly");
+  bvh::ResetCacheDiagCounters();
+}
+
+// GPU check, trace timer, error counters: each field reaches the dump; errors.total is the sum of the groups.
+static void TestDiagGpuAndErrors(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.stats.staging_failures = 3u;
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_deform_live.mutex);
+    bvh::g_deform_live.stats.failed = 1u;
+  }
+  data->live.blas_invalid = 2u;
+  data->live.tlas_invalid = 0u;
+  data->trace_stats.invalid_refs = 4u;
+  data->live.gpu_checked = true;
+  data->live.gpu_ok = false;
+  data->live.gpu_result = "MISMATCH test";
+  data->live.gpu_check_frame = 77u;
+  data->trace_timer.samples = 2u;
+  data->trace_timer.ms_sum = 5.0;
+  data->trace_timer.ms_max = 3.f;
+  data->trace_timer.last_ms = 2.f;
+  const std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 9u, "", bvh::CacheSwitches{}));
+  const bvh::CacheErrors e = bvh::CollectCacheErrors(data);
+  const uint64_t sum = e.meshes + e.readback.map_failures + e.readback.staging_failures + e.readback.base_mismatch + e.bvh.blas_invalid
+                       + e.bvh.tlas_invalid + e.bvh.upload_failures + e.bvh.refit_failures + e.bvh.invalid_refs + e.bvh.stack_overflow
+                       + e.deform.failed + e.deform.resource_failures + e.deform.map_failures;
+  CHECK(e.total == sum && e.total >= 10u, "errors.total is the sum of its groups (%llu vs %llu)", (unsigned long long)e.total, (unsigned long long)sum);
+  const std::string total = "\"errors\": {\"total\": " + std::to_string(e.total) + ",";
+  CHECK(text.find(total) != std::string::npos, "dump errors.total equals the live sum (%llu)", (unsigned long long)e.total);
+  CHECK(text.find("\"staging_failures\": 3") != std::string::npos && text.find("\"invalid_refs\": 4") != std::string::npos
+            && text.find("\"failed\": 1,") != std::string::npos,
+        "error fields reach the dump");
+  CHECK(text.find("\"avg_ms\": 2.5") != std::string::npos && text.find("\"samples\": 2") != std::string::npos
+            && text.find("\"last_ms\": 2") != std::string::npos,
+        "trace average is sum / samples");
+  CHECK(text.find("\"gpu_check\": {\"checked\": true, \"ok\": false, \"frame\": 77, \"result\": \"MISMATCH test\"}") != std::string::npos,
+        "gpu check fields reach the dump");
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.stats.staging_failures = 0u;
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_deform_live.mutex);
+    bvh::g_deform_live.stats.failed = 0u;
+  }
+  data->live.blas_invalid = 0u;
+  data->trace_stats.invalid_refs = 0u;
+  data->live.gpu_checked = false;
+  data->trace_timer = bvh::GpuTimer{};
+  bvh::ResetCacheDiagCounters();
+}
+
+// Performance test helpers. The window test drives UpdatePerfRun with a synthetic 16 ms clock.
+static std::string PerfResult() {
+  std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+  return bvh::g_cache_diag.data.last_result;
+}
+
+static std::string WrittenPath(const std::string& result) {
+  const size_t begin = result.find("wrote ");
+  if (begin == std::string::npos) return "";
+  const size_t end = result.find(" (", begin);
+  return result.substr(begin + 6u, end - begin - 6u);
+}
+
+static size_t CountOf(const std::string& text, const char* needle) {
+  size_t count = 0u;
+  for (size_t p = text.find(needle); p != std::string::npos; p = text.find(needle, p + 1u)) ++count;
+  return count;
+}
+
+// The counters one present adds: rebuild 0.5 ms, refit 0.25, skip 0.125, apply 0.25, BLAS 0.5, GPU trace 2.0 ms per sample, hooks 0.25 ms.
+static void PerfPresentCosts(bvh::BvhDeviceData* data) {
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.tlas_timing.rebuild_ms_sum += 0.5f;
+    bvh::g_pool.tlas_timing.rebuilds += 1u;
+    bvh::g_pool.tlas_timing.refit_ms_sum += 0.25f;
+    bvh::g_pool.tlas_timing.refits += 1u;
+  }
+  data->live.tlas_skip_ms_sum += 0.125f;
+  data->live.tlas_skips += 1u;
+  data->live.slack_apply_ms_sum += 0.25f;
+  data->live.slack_applies += 1u;
+  data->live.blas_build_ms_sum += 0.5f;
+  data->live.blas_builds += 1u;
+  data->trace_timer.ms_sum += 2.0;
+  data->trace_timer.samples += 1u;
+  bvh::g_pool.cpu_hook_frame_us = 250u;
+}
+
+// Refused while active, while a map change is swept, and during the refill; allowed 400 presents after the episode start.
+static void TestPerfRefusals(Device* dev) {
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  const bvh::CacheSwitches sw{};
+  const auto base = std::chrono::steady_clock::now();
+  uint32_t saved_start = 0u;
+  uint32_t saved_map = 0u;
+  uint32_t saved_serial = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    saved_map = bvh::g_pool.map_change_frame;
+    saved_serial = bvh::g_pool.episode_serial;
+  }
+  bvh::g_pool.episode_start_frame = 4990u;  // 10 presents after the episode start
+  bvh::g_pool.map_change_frame = 0u;
+  bvh::RequestPerfRun("a");
+  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  CHECK(!bvh::g_perf.active.load() && PerfResult().find("refused: the pool is refilling") != std::string::npos,
+        "refused during the refill (%s)", PerfResult().c_str());
+  bvh::g_pool.episode_start_frame = 0u;
+  bvh::g_pool.map_change_frame = 4000u;
+  bvh::RequestPerfRun("b");
+  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  CHECK(!bvh::g_perf.active.load() && PerfResult().find("refused: a map change is being swept") != std::string::npos,
+        "refused while a map change is swept (%s)", PerfResult().c_str());
+  bvh::g_pool.episode_start_frame = 4600u;  // 400 presents after the episode start
+  bvh::g_pool.map_change_frame = 0u;
+  bvh::RequestPerfRun("c");
+  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  CHECK(bvh::g_perf.active.load() && PerfResult().find("started") != std::string::npos, "allowed 400 presents after the episode start");
+  const uint32_t start_frame = bvh::g_perf.run.start_frame;
+  bvh::RequestPerfRun("d");
+  bvh::UpdatePerfRun(data, 5001u, 0u, base + std::chrono::milliseconds(16), sw);
+  CHECK(bvh::g_perf.active.load() && bvh::g_perf.run.start_frame == start_frame && PerfResult().find("already active") != std::string::npos,
+        "refused while active, the run is unchanged (%s)", PerfResult().c_str());
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_serial += 1u;
+  }
+  bvh::UpdatePerfRun(data, 5002u, 0u, base + std::chrono::milliseconds(32), sw);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_serial = saved_serial;
+    bvh::g_pool.episode_start_frame = saved_start;
+    bvh::g_pool.map_change_frame = saved_map;
+  }
+  CHECK(!bvh::g_perf.active.load(), "the run ended");
+  bvh::ResetCacheDiagCounters();
+}
+
+// 30 s of presents at 16 ms: the window ends at the first present with elapsed >= 30 s (1875 intervals).
+static std::string RunPerfWindow(bvh::BvhDeviceData* data, uint32_t first_frame, bool collect, int* presents) {
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{collect, false, false, true};
+  bvh::g_cache_diag.enabled.store(collect);
+  bvh::RequestPerfRun("window");
+  bvh::UpdatePerfRun(data, first_frame, 0u, base, sw);
+  int k = 0;
+  while (bvh::g_perf.active.load() && k < 5000) {
+    ++k;
+    PerfPresentCosts(data);
+    bvh::UpdatePerfRun(data, first_frame + static_cast<uint32_t>(k), 0u, base + std::chrono::milliseconds(16 * k), sw);
+  }
+  *presents = k;
+  bvh::g_cache_diag.enabled.store(true);
+  return PerfResult();
+}
+
+static void TestPerfWindow(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  int presents_off = 0;
+  const std::string off = RunPerfWindow(data, 5000u, false, &presents_off);
+  const std::string path_off = WrittenPath(off);
+  int presents_on = 0;
+  const std::string on = RunPerfWindow(data, 9000u, true, &presents_on);
+  const std::string path_on = WrittenPath(on);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  CHECK(presents_off == 1875 && presents_on == 1875, "window ends at the first present with elapsed >= 30 s (%d and %d presents)", presents_off, presents_on);
+  CHECK(!path_off.empty() && !path_on.empty(), "a perf file is written (%s)", off.c_str());
+  for (const std::string& path : {path_off, path_on}) {
+    const std::string text = ReadDumpText(path);
+    CHECK(JsonError(text).empty(), "perf file is valid JSON: %s", JsonError(text).c_str());
+    CHECK(text.find("\"status\": \"complete\"") != std::string::npos, "perf file status complete");
+    CHECK(text.find("\"frame_time\": {\"avg\": {\"value\": 16,") != std::string::npos, "frame time average is 16 ms");
+    CHECK(text.find("\"actual_s\": {\"value\": 30,") != std::string::npos && text.find("\"presents\": {\"value\": 1875,") != std::string::npos,
+          "window and present count written");
+    CHECK(text.find("\"tlas_rebuild\": {\"avg_per_present\": {\"value\": 0.5,") != std::string::npos, "rebuild average per present 0.5 ms");
+    CHECK(text.find("\"tlas_skip\": {\"avg_per_present\": {\"value\": 0.125,") != std::string::npos, "skip average per present 0.125 ms");
+    CHECK(text.find("\"tlas_apply\": {\"avg_per_present\": {\"value\": 0.25,") != std::string::npos, "apply average per present 0.25 ms");
+    CHECK(text.find("\"tlas_refit\": {\"avg_per_present\": {\"value\": 0.25,") != std::string::npos, "refit average per present 0.25 ms");
+    CHECK(text.find("\"blas_build\": {\"avg_per_present\": {\"value\": 0.5,") != std::string::npos, "BLAS average per present 0.5 ms");
+    CHECK(text.find("\"pool_hooks\": {\"avg_per_present\": {\"value\": 0.25,") != std::string::npos, "hooks average per present 0.25 ms");
+    CHECK(text.find("\"gpu_trace\": {\"basis\": \"measured\", \"avg_per_measured_frame\": {\"value\": 2,") != std::string::npos,
+          "GPU trace average per measured frame 2 ms");
+    CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit");
+  }
+  CHECK(path_off != path_on, "the two runs write two files");
+  bvh::ResetCacheDiagCounters();
+}
+
+// Aborted by a map change or pool reset during the run: the file is written with the partial averages.
+static void TestPerfAbort(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{};
+  uint32_t saved_start = 0u;
+  uint32_t saved_serial = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    saved_serial = bvh::g_pool.episode_serial;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  bvh::RequestPerfRun("abort");
+  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  for (int k = 1; k <= 3; ++k) {
+    PerfPresentCosts(data);
+    bvh::UpdatePerfRun(data, 5000u + static_cast<uint32_t>(k), 0u, base + std::chrono::milliseconds(16 * k), sw);
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_serial += 1u;
+  }
+  bvh::UpdatePerfRun(data, 5004u, 0u, base + std::chrono::milliseconds(64), sw);
+  const std::string result = PerfResult();
+  const std::string text = ReadDumpText(WrittenPath(result));
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_serial = saved_serial;
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  CHECK(!bvh::g_perf.active.load() && result.find("aborted (map change or pool reset at f5004)") != std::string::npos, "abort ends the run (%s)", result.c_str());
+  CHECK(text.find("\"status\": \"aborted\"") != std::string::npos && text.find("\"abort_reason\": \"map change or pool reset at f5004\"") != std::string::npos,
+        "aborted file carries the reason");
+  CHECK(text.find("\"presents\": {\"value\": 3,") != std::string::npos, "partial averages: 3 presents");
+  bvh::ResetCacheDiagCounters();
+}
+
+// A switch changed during the run: stable false. A reset request while the run is active does not touch the BLAS counters.
+static void TestPerfSwitchesStable(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  const auto base = std::chrono::steady_clock::now();
+  uint32_t saved_start = 0u;
+  uint32_t saved_serial = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    saved_serial = bvh::g_pool.episode_serial;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  const bvh::CacheSwitches off{};
+  const bvh::CacheSwitches slack{false, false, true, false};
+  bvh::RequestPerfRun("switch");
+  bvh::UpdatePerfRun(data, 5000u, 0u, base, off);
+  PerfPresentCosts(data);
+  bvh::UpdatePerfRun(data, 5001u, 0u, base + std::chrono::milliseconds(16), slack);
+  PerfPresentCosts(data);
+  data->live.blas_builds = 7u;
+  bvh::g_cache_diag.reset_requested.store(true);
+  bvh::UpdateCacheDiag(dev);
+  CHECK(data->live.blas_builds == 7u, "reset ignored while a run is active (builds %llu)", (unsigned long long)data->live.blas_builds);
+  CHECK(PerfResult().find("Reset ignored") != std::string::npos, "reset ignored: result line says so");
+  bvh::UpdatePerfRun(data, 5002u, 0u, base + std::chrono::milliseconds(32), off);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_serial += 1u;
+  }
+  bvh::UpdatePerfRun(data, 5003u, 0u, base + std::chrono::milliseconds(48), off);
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_serial = saved_serial;
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  CHECK(text.find("\"stable\": false") != std::string::npos, "a switch changed during the run: stable false");
+  bvh::ResetCacheDiagCounters();
+}
+
 static void TestCacheBlasWhileOff(Device* dev) {
+
   bvh::ResetCacheDiagCounters();
   bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
   bvh::g_cache_diag.enabled.store(false);
@@ -1415,7 +1755,7 @@ static void TestCacheBlasWhileOff(Device* dev) {
 static void TestCacheLines() {
   bvh::ResetCacheDiagCounters();
   std::vector<std::string> lines = bvh::CacheDiagLines(nullptr);
-  CHECK(lines.size() == 12u && lines[0].rfind("Cache diagnostics (cache-diag-2 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
+  CHECK(lines.size() == 12u && lines[0].rfind("Cache diagnostics (perf-panel-1 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
         "header line (%zu lines)", lines.size());
   CHECK(HasLine(lines, "TLAS changes: rebuilds 0 (empty 0), added 0, removed 0, moved 0, nearest changed -, nearest add/remove -; by tier of nearest add/remove: T0 0, T1 0, T2 0, none 0"),
         "TLAS line");
@@ -1576,18 +1916,35 @@ static uint64_t CacheRunFingerprint(const CacheRun& run) {
   return h;
 }
 
+static void CheckPerfLeg(const char* label) {
+  CHECK(bvh::g_perf.run.label == label && bvh::g_perf.run.presents > 0u,
+        "perf run %s counted presents in its leg (label %s, presents %llu; %s)", label, bvh::g_perf.run.label.c_str(),
+        (unsigned long long)bvh::g_perf.run.presents, PerfResult().c_str());
+}
+
 static void TestCacheOnOff() {
+  bvh::RequestPerfRun("pin_on_collect");
   const CacheRun on = RunCacheScenario(true);
+  CHECK(CacheRunFingerprint(on) == 0x55593b70e070e7feull, "cache fingerprint ON equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(on));
+  CheckPerfLeg("pin_on_collect");
+  bvh::RequestPerfRun("pin_off_collect");
   const CacheRun off = RunCacheScenario(false);
   bvh::g_cache_diag.enabled.store(true);
-  CHECK(CacheRunFingerprint(on) == 0x55593b70e070e7feull, "cache fingerprint ON equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(on));
   CHECK(CacheRunFingerprint(off) == 0x55593b70e070e7feull, "cache fingerprint OFF equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(off));
+  CheckPerfLeg("pin_off_collect");
   bvh::g_live_bvh.skip_noop.store(true);
+  bvh::RequestPerfRun("pin_on_skip");
   const CacheRun on_skip = RunCacheScenario(true);
+  CHECK(CacheRunFingerprint(on_skip) == 0x55593b70e070e7feull, "cache fingerprint diag ON, skip ON equals pin (%016llx)", (unsigned long long)CacheRunFingerprint(on_skip));
+  CheckPerfLeg("pin_on_skip");
+  bvh::RequestPerfRun("pin_off_skip");
   const CacheRun off_skip = RunCacheScenario(false);
   bvh::g_live_bvh.skip_noop.store(false);
-  CHECK(CacheRunFingerprint(on_skip) == 0x55593b70e070e7feull, "cache fingerprint diag ON, skip ON equals pin (%016llx)", (unsigned long long)CacheRunFingerprint(on_skip));
+  bvh::g_cache_diag.enabled.store(true);
   CHECK(CacheRunFingerprint(off_skip) == 0x55593b70e070e7feull, "cache fingerprint diag OFF, skip ON equals pin (%016llx)", (unsigned long long)CacheRunFingerprint(off_skip));
+  CheckPerfLeg("pin_off_skip");
+  bvh::g_perf.start_requested.store(false);
+  bvh::g_perf.active.store(false);
   CHECK(on.tlas_skips == 0u, "switch-OFF scenario has no skip (%u)", on.tlas_skips);
   const CacheRun on_resight = RunCacheScenario(true, true);
   const CacheRun off_resight = RunCacheScenario(false, true);
@@ -2142,6 +2499,12 @@ static void TestSlackAppliesDiag() {
   CHECK(after[1] == before[1] && after[2] == before[2] && after[3] == before[3],
         "applies leave rebuilds, work rebuilds and reasons unchanged (%llu, %llu, %llu)", (unsigned long long)(after[1] - before[1]),
         (unsigned long long)(after[2] - before[2]), (unsigned long long)(after[3] - before[3]));
+  // Apply cost (every successful apply, zero-op applies included; the count equals slack_applies by construction in RebuildLiveTlas).
+  CHECK(data->live.slack_apply_ms_sum > 0.f && data->live.slack_apply_ms_max > 0.f, "apply ms recorded after an apply (sum %.4f, max %.4f)", data->live.slack_apply_ms_sum, data->live.slack_apply_ms_max);
+  CHECK(data->live.slack_apply_ms_max <= data->live.slack_apply_ms_sum, "apply ms: max %.4f <= sum %.4f", data->live.slack_apply_ms_max, data->live.slack_apply_ms_sum);
+  const std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
+  const std::string slack = "\"slack\": {\"applies\": " + std::to_string(data->live.slack_applies) + ", \"apply_ms_sum\": ";
+  CHECK(text.find(slack) != std::string::npos, "JSON slack block equals the live applies (%u)", data->live.slack_applies);
 }
 
 int main() {
@@ -3148,7 +3511,12 @@ int main() {
   TestCacheEpisodeWork();
   TestCacheCaptureTime(&dev);
   TestCacheDiagJson(&dev);
+  TestDiagLabel();
+  TestDiagSeparateFiles(&dev);
+  TestDiagSwitches(&dev);
+  TestDiagGpuAndErrors(&dev);
   TestCacheBlasWhileOff(&dev);
+
   TestCacheOnOff();
   TestCacheEnteredIds();
   TestCacheLatencyBuckets();
@@ -3168,6 +3536,10 @@ int main() {
   TestSlackMaintenance();
   TestSlackSwitchSkip();
   TestSlackAppliesDiag();
+  TestPerfRefusals(&dev);
+  TestPerfWindow(&dev);
+  TestPerfAbort(&dev);
+  TestPerfSwitchesStable(&dev);
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);
