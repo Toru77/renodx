@@ -270,13 +270,19 @@ int main() {
 
   HStage("map change retires stale static instances");
   // "S stale" is admitted, then no longer drawn; "C" and "J" keep being drawn.
+  // Draws 30/90 are C/J: they are drawn every frame, so their copies cool down and must be released by the change.
   dev.next = 0x10000000000ull;  // fresh handles: the reuse test above rewinds next onto live pool buffers
   resource vb_s;
   dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_s);
   fixture::WriteVertices(dev.res[vb_s.handle].bytes, fixture::Box(7.f));
   objects.push_back({"S stale", vb_s.handle, 0, kRigid, kOpaque, {{300, 0, 0}}});
   for (int i = 0; i < 40; ++i) run_frame(frame++, false);
-  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s.handle; }), objects.end());
+  resource vb_s2;
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_s2);
+  fixture::WriteVertices(dev.res[vb_s2.handle].bytes, fixture::Box(8.f));
+  objects.push_back({"S2 stale", vb_s2.handle, 0, kRigid, kOpaque, {{310, 0, 0}}});
+  for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s.handle || o.vb == vb_s2.handle; }), objects.end());
   for (int i = 0; i < 40; ++i) run_frame(frame++, false);
   // 32 more meshes, then released in one compaction (a map change).
   std::vector<resource> mass(32);
@@ -286,34 +292,199 @@ int main() {
     objects.push_back({"M map", mass[i].handle, 0, kRigid, kOpaque, {{400.f + static_cast<float>(i), 0, 0}}});
   }
   for (int i = 0; i < 100; ++i) run_frame(frame++, false);
+  uint32_t pre_release_next = 0u;
+  size_t schedules_before = 0u;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
     std::printf("before map change: meshes %zu instances %zu\n", bvh::g_pool.meshes.size(), bvh::g_pool.instances.size());
     CHECK(bvh::g_pool.stats.mass_retirements == 0u, "no map change yet (%u)", bvh::g_pool.stats.mass_retirements);
+    for (auto& [key, schedule] : bvh::g_pool.schedule) pre_release_next = (std::max)(pre_release_next, schedule.next_frame);
+    schedules_before = bvh::g_pool.schedule.size();
   }
+  // Pad so the sweep (change frame + settle) lands on a frame that is not a multiple of 60.
+  while ((falcom_world::g_state.frame.load() + 1u + bvh::kPoolMapSettleFrames) % 60u == 0u) run_frame(frame++, false);
   for (resource& r : mass) bvh::OnDestroyResourcePool(&dev, r);
   objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.name == std::string("M map"); }), objects.end());
   for (resource& r : mass) dev.destroy_resource(r);
+  // Race: S2 is drawn in the change frame only, so its last seen frame is the change frame; erased right after.
+  objects.push_back({"S2 stale", vb_s2.handle, 0, kRigid, kOpaque, {{310, 0, 0}}});
+  run_frame(frame++, false);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s2.handle; }), objects.end());
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    std::printf("after map change: mass_retirements %u map_change_frame %u map_instances_retired %u meshes %zu instances %zu\n",
+                p.stats.mass_retirements, p.map_change_frame, p.stats.map_instances_retired, p.meshes.size(), p.instances.size());
+    CHECK(p.stats.mass_retirements == 1u, "one map change (%u)", p.stats.mass_retirements);
+    CHECK(p.map_change_frame == falcom_world::g_state.frame.load(), "map change frame (%u)", p.map_change_frame);
+    CHECK(p.stats.map_instances_retired == 0u, "no sweep in change frame (%u)", p.stats.map_instances_retired);
+    CHECK(p.instances.size() == 4, "instances %zu", p.instances.size());
+    CHECK(pre_release_next > p.map_change_frame, "cooldown before the release (%u > %u)", pre_release_next, p.map_change_frame);
+    size_t cooled = 0;
+    for (auto& [key, schedule] : p.schedule) cooled += schedule.next_frame > p.map_change_frame + 1u ? 1u : 0u;
+    CHECK(cooled == 0, "schedules released by the change (%zu cooled)", cooled);
+    CHECK(p.schedule.size() == schedules_before, "schedules kept (%zu of %zu)", p.schedule.size(), schedules_before);
+  }
+  for (uint32_t i = 1; i < bvh::kPoolMapSettleFrames; ++i) run_frame(frame++, false);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    std::printf("before settle: map_change_frame %u frame %u map_instances_retired %u instances %zu\n",
+                p.map_change_frame, falcom_world::g_state.frame.load(), p.stats.map_instances_retired, p.instances.size());
+    CHECK(p.map_change_frame == falcom_world::g_state.frame.load() - bvh::kPoolMapSettleFrames + 1u, "sweep pending (%u)", p.map_change_frame);
+    CHECK(p.stats.map_instances_retired == 0u, "no sweep before settle (%u)", p.stats.map_instances_retired);
+    CHECK(p.instances.size() == 4, "instances before settle %zu", p.instances.size());
+    int live = 0;
+    for (auto& inst : p.instances) {
+      if (inst.matrix[3] != 30.f && inst.matrix[3] != 90.f) continue;
+      live += 1;
+      CHECK(bvh::PoolInstanceLastSeen(inst) > p.map_change_frame, "live instance seen after change (%.0f)", inst.matrix[3]);
+    }
+    CHECK(live == 2, "C and J present before settle (%d)", live);
+  }
   run_frame(frame++, false);
   {
     std::lock_guard lock(bvh::g_pool.mutex);
     auto& p = bvh::g_pool;
-    std::printf("after map change: mass_retirements %u map_instances_retired %u meshes %zu instances %zu\n",
-                p.stats.mass_retirements, p.stats.map_instances_retired, p.meshes.size(), p.instances.size());
-    CHECK(p.stats.mass_retirements == 1u, "one map change (%u)", p.stats.mass_retirements);
-    CHECK(p.stats.map_instances_retired == 1u, "one stale instance dropped (%u)", p.stats.map_instances_retired);
+    std::printf("after settle: frame %u map_change_frame %u map_instances_retired %u meshes %zu instances %zu\n",
+                falcom_world::g_state.frame.load(), p.map_change_frame, p.stats.map_instances_retired, p.meshes.size(), p.instances.size());
+    CHECK(falcom_world::g_state.frame.load() % 60u != 0u, "sweep frame is not a prune frame (%u)", falcom_world::g_state.frame.load());
+    CHECK(p.map_change_frame == 0u, "sweep done (%u)", p.map_change_frame);
+    CHECK(p.stats.map_instances_retired == 2u, "stale and change-frame instances dropped (%u)", p.stats.map_instances_retired);
     CHECK(p.instances.size() == 2, "instances %zu", p.instances.size());
-    bool stale_present = false, recent_c = false, recent_j = false;
+    bool stale_present = false, recent_s2 = false, recent_c = false, recent_j = false;
     for (auto& inst : p.instances) {
       stale_present |= inst.matrix[3] == 300.f;
+      recent_s2 |= inst.matrix[3] == 310.f;
       recent_c |= inst.matrix[3] == 30.f;
       recent_j |= inst.matrix[3] == 90.f;
     }
     CHECK(!stale_present, "stale instance gone");
+    CHECK(!recent_s2, "S2 (last seen in the change frame) removed");
     CHECK(recent_c && recent_j, "recent instances survive");
     for (auto& [key, observed] : p.observations) {
       if (observed.matrix[3] == 300.f) CHECK(!observed.admitted, "stale observation not admitted");
     }
+  }
+  objects.push_back({"S stale", vb_s.handle, 0, kRigid, kOpaque, {{300, 0, 0}}});
+  for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    bool readmitted = false;
+    for (auto& [key, observed] : p.observations) {
+      if (observed.matrix[3] == 300.f) readmitted |= observed.admitted;
+    }
+    std::printf("after re-add: instances %zu readmitted %d\n", p.instances.size(), readmitted ? 1 : 0);
+    CHECK(p.instances.size() == 3, "re-admitted instances %zu", p.instances.size());
+    CHECK(readmitted, "stale object re-admitted");
+  }
+
+  HStage("map change sweep waits while BudgetFull skips change");
+  // "S3 stale" is drawn for 40 frames, then no longer drawn; the next map change must drop it.
+  resource vb_s3;
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_s3);
+  fixture::WriteVertices(dev.res[vb_s3.handle].bytes, fixture::Box(9.f));
+  objects.push_back({"S3 stale", vb_s3.handle, 0, kRigid, kOpaque, {{600, 0, 0}}});
+  for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s3.handle; }), objects.end());
+  std::vector<resource> mass2(32);
+  for (size_t i = 0; i < mass2.size(); ++i) {
+    dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &mass2[i]);
+    fixture::WriteVertices(dev.res[mass2[i].handle].bytes, fixture::Box(20.f + static_cast<float>(i)));
+    objects.push_back({"M map2", mass2[i].handle, 0, kRigid, kOpaque, {{500.f + static_cast<float>(i), 0, 0}}});
+  }
+  for (int i = 0; i < 100; ++i) run_frame(frame++, false);
+  for (resource& r : mass2) bvh::OnDestroyResourcePool(&dev, r);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.name == std::string("M map2"); }), objects.end());
+  for (resource& r : mass2) dev.destroy_resource(r);
+  run_frame(frame++, false);
+  uint64_t retired_before = 0u;
+  uint32_t change_frame = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    CHECK(p.map_change_frame == falcom_world::g_state.frame.load(), "second map change frame (%u)", p.map_change_frame);
+    retired_before = p.stats.map_instances_retired;
+    change_frame = p.map_change_frame;
+  }
+  auto add_budget_skip = [&] {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    ++bvh::g_pool.stats.skips[static_cast<size_t>(bvh::PoolSkip::BudgetFull)];
+  };
+
+  // Case A: BudgetFull skips grow every frame: the sweep stays deferred until the forced sweep at change + kPoolRecaptureFrames.
+  for (uint32_t i = 1; i < bvh::kPoolRecaptureFrames; ++i) {
+    add_budget_skip();
+    run_frame(frame++, false);
+  }
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    int live = 0;
+    for (auto& inst : p.instances) live += (inst.matrix[3] == 30.f || inst.matrix[3] == 90.f) ? 1 : 0;
+    std::printf("budget deferred: map_change_frame %u frame %u map_instances_retired %llu live %d\n",
+                p.map_change_frame, falcom_world::g_state.frame.load(), static_cast<unsigned long long>(p.stats.map_instances_retired), live);
+    CHECK(p.map_change_frame == change_frame, "sweep deferred while skips change (%u)", p.map_change_frame);
+    CHECK(p.stats.map_instances_retired == retired_before, "no sweep while deferred (%llu)", static_cast<unsigned long long>(p.stats.map_instances_retired));
+    CHECK(live == 2, "C and J remain while deferred (%d)", live);
+  }
+  add_budget_skip();
+  run_frame(frame++, false);  // change + kPoolRecaptureFrames: forced
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    std::printf("budget forced: frame %u map_instances_retired %llu instances %zu\n",
+                falcom_world::g_state.frame.load(), static_cast<unsigned long long>(p.stats.map_instances_retired), p.instances.size());
+    CHECK(falcom_world::g_state.frame.load() == change_frame + bvh::kPoolRecaptureFrames, "forced sweep frame (%u)", falcom_world::g_state.frame.load());
+    CHECK(p.map_change_frame == 0u, "sweep done at the forced frame (%u)", p.map_change_frame);
+    CHECK(p.stats.map_instances_retired == retired_before + 1u, "stale S3 dropped by the forced sweep (%llu)", static_cast<unsigned long long>(p.stats.map_instances_retired));
+    CHECK(p.stats.mass_retirements == 2u, "second map change counted (%u)", p.stats.mass_retirements);
+  }
+
+  // Case B: one BudgetFull skip at change + settle - 1: the sweep waits kPoolStagingSlots after that skip.
+  resource vb_s4;
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb_s4);
+  fixture::WriteVertices(dev.res[vb_s4.handle].bytes, fixture::Box(10.f));
+  objects.push_back({"S4 stale", vb_s4.handle, 0, kRigid, kOpaque, {{700, 0, 0}}});
+  for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s4.handle; }), objects.end());
+  std::vector<resource> mass3(32);
+  for (size_t i = 0; i < mass3.size(); ++i) {
+    dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &mass3[i]);
+    fixture::WriteVertices(dev.res[mass3[i].handle].bytes, fixture::Box(40.f + static_cast<float>(i)));
+    objects.push_back({"M map3", mass3[i].handle, 0, kRigid, kOpaque, {{800.f + static_cast<float>(i), 0, 0}}});
+  }
+  for (int i = 0; i < 100; ++i) run_frame(frame++, false);
+  for (resource& r : mass3) bvh::OnDestroyResourcePool(&dev, r);
+  objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.name == std::string("M map3"); }), objects.end());
+  for (resource& r : mass3) dev.destroy_resource(r);
+  run_frame(frame++, false);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    CHECK(p.map_change_frame == falcom_world::g_state.frame.load(), "third map change frame (%u)", p.map_change_frame);
+    retired_before = p.stats.map_instances_retired;
+    change_frame = p.map_change_frame;
+  }
+  for (uint32_t i = 1; i < bvh::kPoolMapSettleFrames - 1u; ++i) run_frame(frame++, false);  // change + 1 .. settle - 2
+  add_budget_skip();
+  run_frame(frame++, false);  // change + settle - 1: the skip
+  for (uint32_t i = 0; i < bvh::kPoolStagingSlots; ++i) {  // change + settle .. skip + slots: deferred
+    run_frame(frame++, false);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    CHECK(bvh::g_pool.map_change_frame == change_frame, "sweep waits kPoolStagingSlots after the skip (%u)", falcom_world::g_state.frame.load());
+    CHECK(bvh::g_pool.stats.map_instances_retired == retired_before, "no sweep within the staging window (%llu)", static_cast<unsigned long long>(bvh::g_pool.stats.map_instances_retired));
+  }
+  run_frame(frame++, false);  // skip + slots + 1: sweep
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    auto& p = bvh::g_pool;
+    std::printf("budget settled: frame %u map_change_frame %u map_instances_retired %llu instances %zu\n",
+                falcom_world::g_state.frame.load(), p.map_change_frame, static_cast<unsigned long long>(p.stats.map_instances_retired), p.instances.size());
+    CHECK(p.map_change_frame == 0u, "sweep done once the skips settled (%u)", p.map_change_frame);
+    CHECK(p.stats.map_instances_retired == retired_before + 1u, "stale S4 dropped after the staging window (%llu)", static_cast<unsigned long long>(p.stats.map_instances_retired));
+    CHECK(p.stats.mass_retirements == 3u, "third map change counted (%u)", p.stats.mass_retirements);
   }
 
   {  // CB mirror: device update, deferred update, map/unmap, reset

@@ -142,6 +142,9 @@ inline constexpr const char* kWorldBuildId = "p2b-diag-2 " __DATE__ " " __TIME__
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr size_t kPoolMaxMeshes = 8192u;
 inline constexpr uint32_t kPoolMassRetireMeshes = 32u;  // one compaction retiring this many: a map change (diagnostic)
+// A map change sweeps static instances not seen since it, from this many frames after it: copies resume at
+// F+1 and are resolved at the present of F+3; settle = slots + 2 leaves a margin for one retry.
+inline constexpr uint32_t kPoolMapSettleFrames = kPoolStagingSlots + 2u;
 // Mesh capture verification: a mesh is admitted once two captures in a row
 // decode to the same mesh; after this many captures without that it is
 // rejected as unstable (its buffers change between frames).
@@ -1128,7 +1131,7 @@ struct PoolStats {
   size_t meshes_written = 0u;  // refreshed by UpdatePoolStats
   // Compactions that retired at least kPoolMassRetireMeshes meshes (map changes).
   uint32_t mass_retirements = 0u;
-  uint32_t map_instances_retired = 0u;  // static instances dropped by a map change (not seen within kPoolRecaptureFrames)
+  uint32_t map_instances_retired = 0u;  // static instances dropped by a map change (not seen since it, swept kPoolMapSettleFrames frames after)
   // Follow lag of camera-seen moving instances (RefitLiveTlas): frames since each was followed, last refit and max.
   uint32_t on_screen_lag_last = 0u;
   uint32_t on_screen_lag_max = 0u;
@@ -1374,6 +1377,9 @@ struct PoolState {
   std::unordered_map<uint64_t, std::vector<uint64_t>> keys_by_resource;  // VB/IB handle -> draw keys
   std::unordered_set<uint64_t> invalidated_keys;  // pending observation cleanup
   bool retire_pending = false;
+  uint32_t map_change_frame = 0u;  // frame of the last mass retire awaiting its sweep; 0 = none
+  uint64_t map_sweep_budget_skips = 0u;  // BudgetFull skips seen at the last present while a sweep is pending
+  uint32_t map_sweep_skip_frame = 0u;  // frame those skips last changed; the sweep waits kPoolStagingSlots after it
   std::vector<WorldMesh> meshes;
 
   // Instances.
@@ -4378,12 +4384,15 @@ inline void CompactPool() {
     meshes.push_back(std::move(mesh));
   }
   g_pool.meshes = std::move(meshes);
-  const bool map_change = retired_now >= kPoolMassRetireMeshes;
   const uint32_t frame = g_state.frame.load();
-  if (map_change) {
+  if (retired_now >= kPoolMassRetireMeshes) {
     g_pool.stats.mass_retirements += 1u;
     g_pool.stats.last_mass_retire_frame = frame;
     g_pool.stats.last_mass_retire_meshes = retired_now;
+    g_pool.map_change_frame = frame;
+    g_pool.map_sweep_budget_skips = g_pool.stats.skips[static_cast<size_t>(PoolSkip::BudgetFull)];
+    g_pool.map_sweep_skip_frame = frame;
+    for (auto& [key, schedule] : g_pool.schedule) schedule.next_frame = frame + 1u;
   }
 
   std::vector<WorldInstance> instances;
@@ -4393,10 +4402,6 @@ inline void CompactPool() {
     const uint32_t mesh_id = instance.mesh_id < remap.size() ? remap[instance.mesh_id] : UINT32_MAX;
     if (mesh_id == UINT32_MAX || invalidated.count(instance.mesh_key) != 0u) {
       g_pool.stats.instances_retired += 1u;
-      continue;
-    }
-    if (map_change && !instance.dynamic && PoolInstanceLastSeen(instance) + kPoolRecaptureFrames < frame) {
-      g_pool.stats.map_instances_retired += 1u;
       continue;
     }
     instance.mesh_id = mesh_id;
@@ -5509,6 +5514,22 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   stage.Set("present: compact");
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    if (g_pool.map_change_frame != 0u) {
+      const uint64_t budget_skips = g_pool.stats.skips[static_cast<size_t>(PoolSkip::BudgetFull)];
+      if (budget_skips != g_pool.map_sweep_budget_skips) {
+        g_pool.map_sweep_budget_skips = budget_skips;
+        g_pool.map_sweep_skip_frame = frame;
+      }
+      if (frame >= g_pool.map_change_frame + kPoolMapSettleFrames &&
+          (frame > g_pool.map_sweep_skip_frame + kPoolStagingSlots || frame >= g_pool.map_change_frame + kPoolRecaptureFrames)) {
+        const uint32_t removed = RemovePoolInstances([](const WorldInstance& instance) {
+          return !instance.dynamic && PoolInstanceLastSeen(instance) <= g_pool.map_change_frame;
+        });
+        g_pool.stats.map_instances_retired += removed;
+        if (removed != 0u) g_pool.retire_pending = true;
+        g_pool.map_change_frame = 0u;
+      }
+    }
     CompactPool();
     ApplyPoolDynamicSwitch();
     ApplyPoolAlphaSwitch();
@@ -5735,6 +5756,9 @@ inline void ResetWorldPool() {
   g_pool.keys_by_resource.clear();
   g_pool.invalidated_keys.clear();
   g_pool.retire_pending = false;
+  g_pool.map_change_frame = 0u;
+  g_pool.map_sweep_budget_skips = 0u;
+  g_pool.map_sweep_skip_frame = 0u;
   g_pool.meshes.clear();
   g_pool.observations.clear();
   g_pool.admitted_keys.clear();
