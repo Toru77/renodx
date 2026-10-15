@@ -11,6 +11,7 @@
 // nodes). Shader register order: world_bvh_trace.hlsli t0..t8.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -161,6 +162,19 @@ struct LiveBvhStats {
   std::string last_failure;
   // TLAS.
   uint32_t tlas_rebuilds = 0u;
+  uint32_t tlas_skips = 0u;  // rebuilds skipped: the snapshot equals the TLAS (session switch skip_noop)
+  float tlas_skip_ms_sum = 0.f;
+  float tlas_skip_ms_max = 0.f;
+  // Slack TLAS (session switch slack): changes applied in place instead of a rebuild.
+  uint32_t slack_applies = 0u;
+  uint32_t slack_added = 0u;
+  uint32_t slack_removed = 0u;
+  uint32_t slack_changed = 0u;
+  uint32_t slack_exhausted = 0u;
+  uint32_t slack_structural = 0u;
+  uint32_t slack_maintenance = 0u;
+  uint32_t slack_free_holes = 0u;
+  float slack_phase_ms[4] = {};  // diff, ops, refit + validate, upload (last apply)
   uint32_t tlas_instances = 0u;   // in the TLAS
   uint32_t tlas_waiting = 0u;     // in the region, mesh not uploaded yet
   uint32_t tlas_unusable = 0u;    // in the region, mesh failed (no BLAS)
@@ -316,6 +330,11 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   bool descriptors_dirty = false;  // slots changed since the descriptor buffer was uploaded
   uint32_t upload_retry_frame = 0u;  // uploads wait until then after a GPU buffer failure
   uint32_t tlas_retry_frame = 0u;    // TLAS rebuilds wait until then after a failure
+  uint32_t tlas_check_frame = 0u;    // last TLAS check that skipped its rebuild or was applied in place (the rebuild gate counts from it)
+  bool tlas_slack = false;           // built with spare slots (holes) in its static block (session switch slack)
+  std::unordered_map<uint64_t, uint32_t> tlas_slot_of_id;  // slack: static instance id -> its TLAS slot
+  std::vector<uint32_t> tlas_free_slots;                   // slack: holes (id 0, parked leaf, sentinel in the active buffer)
+  std::vector<std::array<float, 3>> tlas_hole_anchor;      // slack: by slot, where a hole's parked leaf sits
 
   // Mesh descriptors (one per slot, retired slots zeroed), exact size.
   // descriptor_count: slots the uploaded buffer covers (the TLAS only uses those).
@@ -423,6 +442,10 @@ inline void DestroyLiveTlas(reshade::api::device* device, BvhDeviceData* data) {
   data->tlas_leaves_cpu.clear();
   data->tlas_nodes_cpu.clear();
   data->tlas_leaf_of_instance.clear();
+  data->tlas_slack = false;
+  data->tlas_slot_of_id.clear();
+  data->tlas_free_slots.clear();
+  data->tlas_hole_anchor.clear();
   data->tlas_dynamic_first = 0u;
   data->tlas_refits_since_rebuild = 0u;
   data->tlas_wind_count = 0u;
@@ -536,6 +559,7 @@ inline void DestroyBvhDeviceData(reshade::api::device* device) {
   data->tlas_pool_revision = 0u;
   data->tlas_visibility_revision = 0u;
   data->tlas_store_version = 0u;
+  data->tlas_check_frame = 0u;
   data->live = {};
 }
 

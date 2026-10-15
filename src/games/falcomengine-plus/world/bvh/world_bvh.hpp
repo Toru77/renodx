@@ -448,6 +448,19 @@ inline void DrawBvhPanel() {
   ImGui::SameLine();
   if (ImGui::Button("Rebuild BVH")) g_live_bvh.reset_requested.store(true, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drops every GPU mesh and streams the pool in again.");
+  bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("A TLAS rebuild whose instances equal the TLAS already in place is skipped (no sort, build or buffer\n"
+                      "creation). Default OFF until the in-game A/B; off: every rebuild runs, as before. Session only, not saved.");
+  }
+  bool slack = g_live_bvh.slack.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Slack TLAS (experimental, session only)", &slack)) g_live_bvh.slack.store(slack, std::memory_order_relaxed);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Keeps spare slots in the TLAS so most changes are written in place (no sort, build or buffer creation).\n"
+                      "Trade: tree quality drifts until the next full rebuild (at most every 120 frames or when the slots run out).\n"
+                      "Off by default. Session only, not saved.");
+  }
 
   int mode = g_bvh_debug.mode.load(std::memory_order_relaxed);
   const char* modes = "Off\0BVH Trace (Shaded)\0BVH Trace (Instance ID)\0Depth Compare\0";
@@ -508,6 +521,12 @@ inline void DrawBvhPanel() {
   }
   ImGui::Text("CPU: meshes %.2f ms, TLAS %.2f ms (refit %.2f ms)",
               live_stats.mesh_ms_last, live_stats.tlas_ms_last, live_stats.refit_ms_last);
+  ImGui::Text("TLAS skips (no-op rebuilds): %llu (avg %.3f ms, max %.3f ms)", static_cast<unsigned long long>(live_stats.tlas_skips),
+              live_stats.tlas_skips != 0u ? live_stats.tlas_skip_ms_sum / static_cast<float>(live_stats.tlas_skips) : 0.f, live_stats.tlas_skip_ms_max);
+  ImGui::Text("Slack: applies %u (added %u, removed %u, changed %u), exhausted %u, structural %u, maintenance %u, free holes %u; diff/ops/refit/upload %.3f/%.3f/%.3f/%.3f ms",
+              live_stats.slack_applies, live_stats.slack_added, live_stats.slack_removed, live_stats.slack_changed, live_stats.slack_exhausted,
+              live_stats.slack_structural, live_stats.slack_maintenance, live_stats.slack_free_holes, live_stats.slack_phase_ms[0],
+              live_stats.slack_phase_ms[1], live_stats.slack_phase_ms[2], live_stats.slack_phase_ms[3]);
   ImGui::Text("TLAS timing: rebuilds %llu (avg %.2f ms), refits %llu (last %.3f, max %.3f ms), after drain %llu (avg %.3f ms, skipped %llu)",
               static_cast<unsigned long long>(tlas_timing.rebuilds),
               tlas_timing.rebuilds != 0u ? tlas_timing.rebuild_ms_sum / static_cast<float>(tlas_timing.rebuilds) : 0.f,

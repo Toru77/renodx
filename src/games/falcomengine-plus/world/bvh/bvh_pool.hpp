@@ -138,7 +138,7 @@ inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
 inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
-inline constexpr const char* kWorldBuildId = "cache-diag-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
+inline constexpr const char* kWorldBuildId = "cache-diag-2 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
 inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
@@ -523,6 +523,7 @@ struct WorldInstance {
   uint32_t last_follow_frame = 0u;
   uint32_t follows = 0u;  // pose updates
   uint64_t id = 0u;       // PoolState::next_instance_id, never reused
+  uint32_t tlas_entry_frame = 0u;  // cache diagnostics: frame of the first TLAS rebuild that held it (0 = never)
   PoolVisibility visibility;  // camera-visibility inputs at admission
 };
 

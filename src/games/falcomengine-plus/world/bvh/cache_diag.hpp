@@ -61,6 +61,17 @@ inline constexpr const char* kCacheTierNames[kCacheTierCount] = {
     "T0 <128 m", "T1 <256 m", "T2 >=256 m (in region)", "outside region", "no instance"};
 inline constexpr size_t kCacheTlasTierNone = 3u;  // TLAS rebuild tiers: T0, T1, T2, none
 inline constexpr size_t kCacheTlasTierCount = 4u;
+inline constexpr float kCacheLatencyEdges[4] = {3.f, 9.f, 31.f, 121.f};  // presents: 0-2, 3-8, 9-30, 31-120, >120
+inline constexpr size_t kCacheLatencyBuckets = 5u;
+inline constexpr const char* kCacheLatencyLabels[kCacheLatencyBuckets] = {"0-2", "3-8", "9-30", "31-120", ">120"};
+inline constexpr size_t kCachePhaseCount = 5u;
+inline constexpr const char* kCachePhaseNames[kCachePhaseCount] = {
+    "snapshot+lock", "filter+descriptors", "sort+build+validate", "buffer create", "buffer destroy"};
+inline constexpr const char* kCacheReasonNames[] = {
+    "first build", "store changed", "pool changed", "visibility changed", "region moved", "alpha switch", "sway switch",
+    "per-frame switch", "flagged meshes", "refit quality", "refit failed", "slack switch", "slack maintenance", "slack structural",
+    "slack exhausted", "slack invalid", "slack upload"};
+inline constexpr size_t kCacheReasonCount = std::size(kCacheReasonNames);  // one more counter: other
 
 // Tier of an instance by its Chebyshev distance to the camera.
 inline size_t CacheInstanceTier(float distance, bool in_region) {
@@ -183,16 +194,24 @@ struct CacheTlasDiff {
   float nearest_add_remove = -1.f;
 };
 
+// Index of a rebuild reason in kCacheReasonNames; kCacheReasonCount for any other reason.
+inline size_t CacheReasonIndex(const char* reason) {
+  for (size_t r = 0; r < kCacheReasonCount; ++r) {
+    if (std::strcmp(reason, kCacheReasonNames[r]) == 0) return r;
+  }
+  return kCacheReasonCount;
+}
+
 // Pure: `before` and `after` are TLAS snapshots (any order).
 inline CacheTlasDiff DiffTlasInstances(const std::vector<LiveTlasInstance>& before,
                                        const std::vector<LiveTlasInstance>& after, const float* camera) {
   std::vector<const LiveTlasInstance*> old_list;
   std::vector<const LiveTlasInstance*> new_list;
   for (const LiveTlasInstance& instance : before) {
-    if (!instance.wind) old_list.push_back(&instance);
+    if (!instance.wind && instance.id != 0u) old_list.push_back(&instance);  // id 0: a slack hole
   }
   for (const LiveTlasInstance& instance : after) {
-    if (!instance.wind) new_list.push_back(&instance);
+    if (!instance.wind && instance.id != 0u) new_list.push_back(&instance);
   }
   const auto by_id = [](const LiveTlasInstance* a, const LiveTlasInstance* b) { return a->id < b->id; };
   std::sort(old_list.begin(), old_list.end(), by_id);
@@ -225,6 +244,21 @@ inline CacheTlasDiff DiffTlasInstances(const std::vector<LiveTlasInstance>& befo
   return diff;
 }
 
+// Pure: ids of the non-zero instances of `after` that `before` does not hold (wind included), ascending.
+inline std::vector<uint64_t> CacheEnteredIds(const std::vector<LiveTlasInstance>& before, const std::vector<LiveTlasInstance>& after) {
+  std::vector<uint64_t> old_ids;
+  for (const LiveTlasInstance& instance : before) {
+    if (instance.id != 0u) old_ids.push_back(instance.id);
+  }
+  std::sort(old_ids.begin(), old_ids.end());
+  std::vector<uint64_t> entered;
+  for (const LiveTlasInstance& instance : after) {
+    if (instance.id != 0u && !std::binary_search(old_ids.begin(), old_ids.end(), instance.id)) entered.push_back(instance.id);
+  }
+  std::sort(entered.begin(), entered.end());
+  return entered;
+}
+
 struct CacheTlasStats {
   uint64_t rebuilds = 0u;  // rebuilds diffed (a TLAS that is not empty)
   uint64_t empty = 0u;     // rebuilds that left the TLAS empty (not diffed)
@@ -236,6 +270,21 @@ struct CacheTlasStats {
   uint64_t by_tier[kCacheTlasTierCount] = {};  // rebuilds by tier of the nearest add or remove
   float ms_sum = 0.f;  // TLAS rebuild CPU time (since reset)
   float ms_max = 0.f;
+  float phase_last[kCachePhaseCount] = {};  // TLAS rebuild phases (ms)
+  float phase_sum[kCachePhaseCount] = {};
+  float phase_max[kCachePhaseCount] = {};
+  uint64_t noop_full = 0u;         // rebuilds whose snapshot equals the TLAS (descriptors and dynamic poses)
+  uint64_t noop_static = 0u;       // rebuilds whose static prefix equals the TLAS
+  uint64_t noop_by_cause[3] = {};  // full no-ops by cause: retire, admit, other
+  float noop_ms = 0.f;             // TLAS rebuild CPU time of the full no-ops
+  uint64_t skips = 0u;             // rebuilds skipped: the snapshot equals the TLAS (skip_noop)
+  float skip_ms = 0.f;
+  uint64_t skips_by_cause[3] = {};
+  uint64_t by_reason[kCacheReasonCount + 1u] = {};
+  uint64_t applies = 0u;  // in-place slack updates (not rebuilds)
+  uint64_t entered = 0u;                              // first TLAS entries (instances stamped)
+  uint64_t admit_latency[kCacheLatencyBuckets] = {};  // presents from admission to the first TLAS entry
+  uint64_t seen_latency[kCacheLatencyBuckets] = {};   // presents from the first sighting to the first TLAS entry
 };
 
 // Cost of the work done while an episode (or the session since reset) runs: BLAS builds, TLAS rebuilds and mesh capture CPU.
@@ -367,14 +416,39 @@ inline void ResetCacheDiagCounters() {
   g_cache_diag.data = std::move(fresh);
 }
 
+// Diagnostics of one TLAS rebuild, filled by RebuildLiveTlas: phases, no-op test, cause (retire, admit, other) and reason.
+struct CacheRebuildExtra {
+  float phase_ms[kCachePhaseCount] = {};
+  bool noop_full = false;
+  bool noop_static = false;
+  bool applied = false;  // an in-place slack update: counted as an apply, not a rebuild
+  uint32_t cause = 2u;
+  const char* reason = "";
+};
+
 // Caller holds no lock. `before` is the TLAS this build replaces (moved out before the replacement);
 // `after` is the TLAS in place now. `replaced` is false for a failed build, which counts nothing.
 inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, const std::vector<LiveTlasInstance>& after,
-                                   bool replaced, uint32_t frame, float ms) {
+                                   bool replaced, uint32_t frame, float ms, const CacheRebuildExtra& extra = {}) {
   if (!replaced || !g_cache_diag.enabled.load(std::memory_order_relaxed)) return;
   float camera[3] = {};
   PoolCameraPosition(camera);
   const CacheTlasDiff diff = after.empty() ? CacheTlasDiff{} : DiffTlasInstances(before, after, camera);
+  // Entry latency: the first entry of each instance is stamped under the pool lock (a re-entry after a region move is not counted).
+  std::vector<size_t> admit_bucket;
+  std::vector<size_t> seen_bucket;
+  {
+    const std::vector<uint64_t> entered = CacheEnteredIds(before, after);
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    for (const uint64_t id : entered) {
+      const auto it = std::lower_bound(g_pool.instances.begin(), g_pool.instances.end(), id,
+                                       [](const WorldInstance& instance, uint64_t value) { return instance.id < value; });
+      if (it == g_pool.instances.end() || it->id != id || it->tlas_entry_frame != 0u) continue;
+      it->tlas_entry_frame = frame;
+      admit_bucket.push_back(CacheBucket(static_cast<float>(frame >= it->admit_frame ? frame - it->admit_frame : 0u), kCacheLatencyEdges, std::size(kCacheLatencyEdges)));
+      seen_bucket.push_back(CacheBucket(static_cast<float>(frame >= it->first_frame ? frame - it->first_frame : 0u), kCacheLatencyEdges, std::size(kCacheLatencyEdges)));
+    }
+  }
   bool open = false;
   uint32_t fresh_from = 0u;
   {
@@ -399,10 +473,34 @@ inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, 
   }
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
+  for (size_t k = 0; k < admit_bucket.size(); ++k) {
+    d.tlas.entered += 1u;
+    d.tlas.admit_latency[admit_bucket[k]] += 1u;
+    d.tlas.seen_latency[seen_bucket[k]] += 1u;
+  }
+  if (extra.applied) {
+    d.tlas.applies += 1u;
+    d.tlas.added += diff.added;
+    d.tlas.removed += diff.removed;
+    d.tlas.moved += diff.moved;
+    return;
+  }
   d.tlas.ms_sum += ms;
   d.tlas.ms_max = std::max(d.tlas.ms_max, ms);
   d.work.tlas_ms += ms;
   d.work.tlas_rebuilds += 1u;
+  for (size_t p = 0; p < kCachePhaseCount; ++p) {
+    d.tlas.phase_last[p] = extra.phase_ms[p];
+    d.tlas.phase_sum[p] += extra.phase_ms[p];
+    d.tlas.phase_max[p] = std::max(d.tlas.phase_max[p], extra.phase_ms[p]);
+  }
+  d.tlas.by_reason[CacheReasonIndex(extra.reason)] += 1u;
+  if (extra.noop_full) {
+    d.tlas.noop_full += 1u;
+    d.tlas.noop_by_cause[extra.cause] += 1u;
+    d.tlas.noop_ms += ms;
+  }
+  if (extra.noop_static) d.tlas.noop_static += 1u;
   if (after.empty()) {
     d.tlas.empty += 1u;
   } else {
@@ -433,6 +531,16 @@ inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, 
   sample.tlas_fresh = fresh;
   sample.pool_admitted = admitted;
   sample.work = d.episode.work;
+}
+
+// Caller holds no lock. A rebuild skipped because its snapshot equals the TLAS (nothing built, uploaded or destroyed).
+inline void RecordCacheTlasSkip(float ms, uint32_t cause) {
+  if (!g_cache_diag.enabled.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+  CacheTlasStats& t = g_cache_diag.data.tlas;
+  t.skips += 1u;
+  t.skip_ms += ms;
+  t.skips_by_cause[cause] += 1u;
 }
 
 template <typename... Args>
@@ -483,8 +591,32 @@ inline std::vector<std::string> CacheDiagLines(const BvhDeviceData* data) {
       t.nearest_changed_m < 0.f ? "-" : CacheFormat("%.1f m", t.nearest_changed_m).c_str(),
       t.nearest_add_remove_m < 0.f ? "-" : CacheFormat("%.1f m", t.nearest_add_remove_m).c_str(), t.by_tier[0],
       t.by_tier[1], t.by_tier[2], t.by_tier[kCacheTlasTierNone]));
-  const PoolResightCounters& r = d.resight;
   const CacheWork& w = d.work;
+  std::string phases = "TLAS rebuild phases (ms) avg/max/last: ";
+  for (size_t p = 0; p < kCachePhaseCount; ++p) {
+    phases += CacheFormat("%s%s %.3f/%.3f/%.3f", p != 0u ? ", " : "", kCachePhaseNames[p],
+                          w.tlas_rebuilds != 0u ? static_cast<double>(t.phase_sum[p]) / static_cast<double>(w.tlas_rebuilds) : 0.0,
+                          static_cast<double>(t.phase_max[p]), static_cast<double>(t.phase_last[p]));
+  }
+  lines.push_back(phases);
+  lines.push_back(CacheFormat(
+      "TLAS no-op rebuilds: full %llu, static %llu (%.1f %% of rebuilds), by cause retire %llu, admit %llu, other %llu, %.2f ms spent; skipped %llu (%.2f ms; by cause retire %llu, admit %llu, other %llu); in-place applies %llu",
+      t.noop_full, t.noop_static, w.tlas_rebuilds != 0u ? 100.0 * static_cast<double>(t.noop_static) / static_cast<double>(w.tlas_rebuilds) : 0.0,
+      t.noop_by_cause[0], t.noop_by_cause[1], t.noop_by_cause[2], static_cast<double>(t.noop_ms), t.skips, static_cast<double>(t.skip_ms),
+      t.skips_by_cause[0], t.skips_by_cause[1], t.skips_by_cause[2], t.applies));
+  std::string latency = "TLAS entry latency (presents) admit->TLAS ";
+  std::string seen = "; first seen->TLAS ";
+  for (size_t b = 0; b < kCacheLatencyBuckets; ++b) {
+    latency += CacheFormat("%s%s %llu", b != 0u ? ", " : "", kCacheLatencyLabels[b], t.admit_latency[b]);
+    seen += CacheFormat("%s%s %llu", b != 0u ? ", " : "", kCacheLatencyLabels[b], t.seen_latency[b]);
+  }
+  lines.push_back(latency + seen + CacheFormat("; entered %llu", t.entered));
+  std::string reasons = "TLAS rebuild reasons: ";
+  for (size_t r = 0; r <= kCacheReasonCount; ++r) {
+    reasons += CacheFormat("%s%s %llu", r != 0u ? ", " : "", r < kCacheReasonCount ? kCacheReasonNames[r] : "other", t.by_reason[r]);
+  }
+  lines.push_back(reasons);
+  const PoolResightCounters& r = d.resight;
   lines.push_back(CacheFormat(
       "Re-sightings: retired %llu (retainable %llu, %llu tris), new meshes %llu, re-sighted %llu (%.1f %%), retainable %llu; near misses: count mismatch %llu (%.1f %%), drift %llu; tracked %llu (dropped %llu, expired %llu)",
       r.retired, r.retired_retainable, r.retired_tris, r.new_meshes, r.resights,
@@ -571,7 +703,7 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
     d = g_cache_diag.data;
   }
   std::ostringstream out;
-  out << "{\n  \"schema\": 2,\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n  \"frame\": " << frame << ",\n";
+  out << "{\n  \"schema\": 3,\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n  \"frame\": " << frame << ",\n";
   out << "  \"lines\": [";
   for (size_t i = 0; i < lines.size(); ++i) out << (i != 0u ? ", " : "") << "\"" << PoolJsonEscape(lines[i]) << "\"";
   const auto uint_array = [&out](const uint64_t* values, size_t count) {
@@ -628,11 +760,31 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
         << ", \"ms_sum\": " << PoolJsonFloat{data->live.blas_build_ms_sum} << ", \"ms_max\": " << PoolJsonFloat{data->live.blas_build_ms_max};
   }
   const CacheTlasStats& t = d.tlas;
+  const auto float_array = [&out](const float* values, size_t count) {
+    out << "[";
+    for (size_t i = 0; i < count; ++i) out << (i != 0u ? ", " : "") << PoolJsonFloat{values[i]};
+    out << "]";
+  };
   out << "},\n  \"tlas\": {\"rebuilds\": " << t.rebuilds << ", \"empty\": " << t.empty << ", \"added\": " << t.added
       << ", \"removed\": " << t.removed << ", \"moved\": " << t.moved << ", \"nearest_changed_m\": " << PoolJsonFloat{t.nearest_changed_m}
       << ", \"nearest_add_remove_m\": " << PoolJsonFloat{t.nearest_add_remove_m} << ", \"by_tier\": [" << t.by_tier[0] << ", "
       << t.by_tier[1] << ", " << t.by_tier[2] << ", " << t.by_tier[kCacheTlasTierNone] << "], \"ms_sum\": " << PoolJsonFloat{t.ms_sum}
-      << ", \"ms_max\": " << PoolJsonFloat{t.ms_max} << "},\n";
+      << ", \"ms_max\": " << PoolJsonFloat{t.ms_max} << ",\n    \"phase_ms\": {\"names\": [";
+  for (size_t p = 0; p < kCachePhaseCount; ++p) out << (p != 0u ? ", " : "") << "\"" << kCachePhaseNames[p] << "\"";
+  out << "], \"last\": ";
+  float_array(t.phase_last, kCachePhaseCount);
+  out << ", \"sum\": ";
+  float_array(t.phase_sum, kCachePhaseCount);
+  out << ", \"max\": ";
+  float_array(t.phase_max, kCachePhaseCount);
+  out << "},\n    \"noop\": {\"full\": " << t.noop_full << ", \"static\": " << t.noop_static << ", \"by_cause\": [" << t.noop_by_cause[0]
+      << ", " << t.noop_by_cause[1] << ", " << t.noop_by_cause[2] << "], \"ms\": " << PoolJsonFloat{t.noop_ms} << ", \"skips\": " << t.skips << ", \"skip_ms\": " << PoolJsonFloat{t.skip_ms}
+      << ", \"skips_by_cause\": [" << t.skips_by_cause[0] << ", " << t.skips_by_cause[1] << ", " << t.skips_by_cause[2]
+      << "], \"applies\": " << t.applies << "},\n    \"reasons\": {";
+  for (size_t r = 0; r <= kCacheReasonCount; ++r) {
+    out << (r != 0u ? ", " : "") << "\"" << (r < kCacheReasonCount ? kCacheReasonNames[r] : "other") << "\": " << t.by_reason[r];
+  }
+  out << "}},\n";
   const CacheEpisode& e = d.episode;
   out << "  \"episode\": {\"state\": \"" << e.state << "\", \"reason\": \"" << e.reason << "\", \"serial\": " << e.serial
       << ", \"start_frame\": " << e.start_frame << ", \"fresh_from\": " << e.fresh_from << ", \"t80_valid\": " << (e.t80_valid ? "true" : "false")
@@ -650,7 +802,13 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
     out << "}";
   }
   const CacheLighting& light = d.lighting;
-  out << "]},\n  \"lighting\": {\"presents\": " << light.presents << ", \"dark_presents\": " << light.dark_presents
+  out << "]},\n  \"entry_latency\": {\"entered\": " << t.entered << ", \"buckets\": [";
+  for (size_t b = 0; b < kCacheLatencyBuckets; ++b) out << (b != 0u ? ", " : "") << "\"" << kCacheLatencyLabels[b] << "\"";
+  out << "], \"admit\": ";
+  uint_array(t.admit_latency, kCacheLatencyBuckets);
+  out << ", \"seen\": ";
+  uint_array(t.seen_latency, kCacheLatencyBuckets);
+  out << "},\n  \"lighting\": {\"presents\": " << light.presents << ", \"dark_presents\": " << light.dark_presents
       << ", \"dark_runs\": " << light.dark_runs << ", \"longest_dark\": " << light.longest_dark << ", \"longest_lit\": " << light.longest_lit
       << "}\n}\n";
   const std::filesystem::path path = PoolOutputDir() / "world_cache_diag.json";

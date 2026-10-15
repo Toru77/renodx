@@ -122,6 +122,49 @@ int main() {
     for (int k = 0; k < 3; ++k) covers = covers && refit[0].bounds_min[k] == mn[k] && refit[0].bounds_max[k] == mx[k];
     CHECK(covers, "refit: root covers the union (n=%u)", n);
   }
+  // Slack: real boxes plus degenerate holes in one tree: 2n-1 nodes, valid, depth <= 40; a hole moved onto a box keeps the refit valid.
+  HStage("slack leaves");
+  {
+    const uint32_t real = 300u;
+    const uint32_t holes = 40u;
+    std::mt19937 r(7);
+    std::uniform_real_distribution<float> u(-20.f, 20.f);
+    std::vector<bvh::BVHLeafGPU> leaves;
+    for (uint32_t i = 0; i < real + holes; ++i) {
+      const float c[3] = {u(r), u(r), u(r)};
+      const float half = i < real ? 0.5f : 0.f;
+      const float mn[3] = {c[0] - half, c[1] - half, c[2] - half}, mx[3] = {c[0] + half, c[1] + half, c[2] + half};
+      leaves.push_back(bvh::MakeLeaf(mn, mx, i));
+    }
+    bvh::SortBvhLeaves(&leaves);
+    std::vector<bvh::BVHNodeGPU> nodes;
+    CHECK(bvh::BuildBvhTree(leaves, &nodes), "slack: built");
+    CHECK(nodes.size() == 2u * (real + holes) - 1u, "slack: 2n-1 nodes (%zu)", nodes.size());
+    CHECK(bvh::ValidateBvh(nodes, leaves).ok, "slack: valid");
+    uint32_t depth = 0u;
+    std::vector<std::pair<uint32_t, uint32_t>> stack = {{0u, 1u}};
+    while (!stack.empty()) {
+      const std::pair<uint32_t, uint32_t> top = stack.back();
+      stack.pop_back();
+      depth = (std::max)(depth, top.second);
+      const bvh::BVHNodeGPU& node = nodes[top.first];
+      if ((node.child_or_leaf & bvh::kBvhLeafFlag) == 0u) {
+        stack.push_back({node.child_or_leaf, top.second + 1u});
+        stack.push_back({node.sibling_or_right, top.second + 1u});
+      }
+    }
+    CHECK(depth <= 40u, "slack: depth %u", depth);
+    for (bvh::BVHLeafGPU& leaf : leaves) {
+      if (leaf.prim < real) continue;
+      for (int k = 0; k < 3; ++k) {
+        leaf.bounds_min[k] = -0.5f;
+        leaf.bounds_max[k] = 0.5f;
+      }
+      break;
+    }
+    bvh::RefitBvhNodes(leaves, &nodes);
+    CHECK(bvh::ValidateBvh(nodes, leaves).ok, "slack: refit valid after a hole takes a box");
+  }
   std::printf("%d trees identical to the GPU builder\n", trees);
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;

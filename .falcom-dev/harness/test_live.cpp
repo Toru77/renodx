@@ -1387,8 +1387,9 @@ static void TestCacheDiagJson(Device* dev) {
   std::ifstream in(path, std::ios::binary);
   const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   CHECK(JsonError(text).empty(), "world_cache_diag.json is valid JSON: %s", JsonError(text).c_str());
-  const char* keys[] = {"\"schema\": 2", "\"resight\": {", "\"gap\": [", "\"capture\": {", "\"extent_buckets\": [",
-                        "\"ratio_buckets\": [", "\"ratio_tris\": [", "\"hist_check\": ", "\"ms_sum\": ", "\"t80_work\": ", "\"work\": "};
+  const char* keys[] = {"\"schema\": 3", "\"resight\": {", "\"gap\": [", "\"capture\": {", "\"extent_buckets\": [",
+                        "\"ratio_buckets\": [", "\"ratio_tris\": [", "\"hist_check\": ", "\"ms_sum\": ", "\"t80_work\": ", "\"work\": ",
+                        "\"phase_ms\": {", "\"noop\": {", "\"reasons\": {", "\"entry_latency\": {"};
   for (const char* key : keys) CHECK(text.find(key) != std::string::npos, "json has %s", key);
   bvh::ResetCacheDiagCounters();
 }
@@ -1414,7 +1415,7 @@ static void TestCacheBlasWhileOff(Device* dev) {
 static void TestCacheLines() {
   bvh::ResetCacheDiagCounters();
   std::vector<std::string> lines = bvh::CacheDiagLines(nullptr);
-  CHECK(lines.size() == 8u && lines[0].rfind("Cache diagnostics (cache-diag-1 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
+  CHECK(lines.size() == 12u && lines[0].rfind("Cache diagnostics (cache-diag-2 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
         "header line (%zu lines)", lines.size());
   CHECK(HasLine(lines, "TLAS changes: rebuilds 0 (empty 0), added 0, removed 0, moved 0, nearest changed -, nearest add/remove -; by tier of nearest add/remove: T0 0, T1 0, T2 0, none 0"),
         "TLAS line");
@@ -1486,6 +1487,7 @@ static void TestCacheLines() {
 // One fixed scenario (two meshes, instances, a retirement) with the diagnostics on or off. Returns what the TLAS,
 // the mesh descriptors and the pool revision hold, plus the BLAS counters.
 struct CacheRun {
+  uint32_t tlas_skips = 0u;
   std::vector<bvh::WorldInstanceGPU> tlas_instances;
   std::vector<bvh::BVHNodeGPU> tlas_nodes;
   std::vector<bvh::WorldMeshGPU> mesh_descriptors;
@@ -1541,6 +1543,7 @@ static CacheRun RunCacheScenario(bool enabled, bool resight = false) {
   run.tlas_nodes = data->tlas_nodes_cpu;
   run.mesh_descriptors = data->mesh_descriptors;
   run.tlas_rebuilds = data->live.tlas_rebuilds;
+  run.tlas_skips = data->live.tlas_skips;
   run.resident = data->live.resident_meshes;
   run.meshes_uploaded = data->live.meshes_uploaded;
   run.triangles_uploaded = data->live.triangles_uploaded;
@@ -1564,7 +1567,8 @@ static uint64_t CacheRunFingerprint(const CacheRun& run) {
   HashBytes(&h, run.tlas_instances.data(), run.tlas_instances.size() * sizeof(bvh::WorldInstanceGPU));
   HashBytes(&h, run.tlas_nodes.data(), run.tlas_nodes.size() * sizeof(bvh::BVHNodeGPU));
   HashBytes(&h, run.mesh_descriptors.data(), run.mesh_descriptors.size() * sizeof(bvh::WorldMeshGPU));
-  HashBytes(&h, &run.tlas_rebuilds, sizeof run.tlas_rebuilds);
+  const uint32_t rebuilds_and_skips = run.tlas_rebuilds + run.tlas_skips;  // a skip is a rebuild that was not needed
+  HashBytes(&h, &rebuilds_and_skips, sizeof rebuilds_and_skips);
   HashBytes(&h, &run.resident, sizeof run.resident);
   HashBytes(&h, &run.meshes_uploaded, sizeof run.meshes_uploaded);
   HashBytes(&h, &run.revision_delta, sizeof run.revision_delta);
@@ -1578,6 +1582,13 @@ static void TestCacheOnOff() {
   bvh::g_cache_diag.enabled.store(true);
   CHECK(CacheRunFingerprint(on) == 0x55593b70e070e7feull, "cache fingerprint ON equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(on));
   CHECK(CacheRunFingerprint(off) == 0x55593b70e070e7feull, "cache fingerprint OFF equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(off));
+  bvh::g_live_bvh.skip_noop.store(true);
+  const CacheRun on_skip = RunCacheScenario(true);
+  const CacheRun off_skip = RunCacheScenario(false);
+  bvh::g_live_bvh.skip_noop.store(false);
+  CHECK(CacheRunFingerprint(on_skip) == 0x55593b70e070e7feull, "cache fingerprint diag ON, skip ON equals pin (%016llx)", (unsigned long long)CacheRunFingerprint(on_skip));
+  CHECK(CacheRunFingerprint(off_skip) == 0x55593b70e070e7feull, "cache fingerprint diag OFF, skip ON equals pin (%016llx)", (unsigned long long)CacheRunFingerprint(off_skip));
+  CHECK(on.tlas_skips == 0u, "switch-OFF scenario has no skip (%u)", on.tlas_skips);
   const CacheRun on_resight = RunCacheScenario(true, true);
   const CacheRun off_resight = RunCacheScenario(false, true);
   bvh::g_cache_diag.enabled.store(true);
@@ -1600,6 +1611,537 @@ static void TestCacheOnOff() {
         (unsigned long long)on.blas_built_triangles, (unsigned long long)on.triangles_uploaded);
   std::printf("cache diag on/off: TLAS %zu instances, %u rebuilds, BLAS %llu builds / %llu triangles\n", on.tlas_instances.size(),
               on.tlas_rebuilds, (unsigned long long)on.blas_builds, (unsigned long long)on.blas_built_triangles);
+}
+
+static void TestCacheEnteredIds() {
+  const std::vector<bvh::LiveTlasInstance> before = {TlasAt(1u, 1.f), TlasAt(2u, 2.f), TlasAt(3u, 3.f, true)};
+  const std::vector<bvh::LiveTlasInstance> after = {TlasAt(5u, 5.f), TlasAt(2u, 2.f), TlasAt(0u, 0.f), TlasAt(4u, 4.f, true)};
+  const std::vector<uint64_t> entered = bvh::CacheEnteredIds(before, after);
+  CHECK(entered == std::vector<uint64_t>({4u, 5u}), "entered ids: wind included, id 0 skipped, ascending (%zu)", entered.size());
+  CHECK(bvh::CacheEnteredIds(after, before) == std::vector<uint64_t>({1u, 3u}), "left ids are not entered");
+}
+
+static void TestCacheLatencyBuckets() {
+  const float frames[9] = {0.f, 2.f, 3.f, 8.f, 9.f, 30.f, 31.f, 120.f, 121.f};
+  const size_t expected[9] = {0u, 0u, 1u, 1u, 2u, 2u, 3u, 3u, 4u};
+  for (size_t i = 0; i < 9; ++i) {
+    const size_t bucket = bvh::CacheBucket(frames[i], bvh::kCacheLatencyEdges, std::size(bvh::kCacheLatencyEdges));
+    CHECK(bucket == expected[i], "latency %.0f presents in bucket %zu (expected %zu)", (double)frames[i], bucket, expected[i]);
+  }
+}
+
+// Synthetic TLAS: instance 2 is dynamic (the suffix), so a pose change there is not a rebuild.
+static void TestLiveSnapshotMatches() {
+  bvh::BvhDeviceData data;
+  std::vector<bvh::WorldInstanceGPU> gpu(3);
+  std::vector<bvh::LiveTlasInstance> info(3);
+  for (size_t i = 0; i < 3; ++i) {
+    gpu[i].header[0] = static_cast<float>(i + 1);
+    gpu[i].world[12] = static_cast<float>(i);
+    info[i].id = 10u + i;
+  }
+  info[2].dynamic = true;
+  data.tlas_built = true;
+  data.tlas_dynamic_first = 2u;
+  data.tlas_instances_cpu = gpu;
+  data.tlas_info = info;
+  const auto matches = [&data](const std::vector<bvh::WorldInstanceGPU>& g, const std::vector<bvh::LiveTlasInstance>& i, bool dynamic_poses) {
+    return bvh::LiveSnapshotMatchesTlas(data, g, i, dynamic_poses);
+  };
+  CHECK(matches(gpu, info, true) && matches(gpu, info, false), "identical snapshot matches");
+  std::vector<bvh::WorldInstanceGPU> moved = gpu;
+  moved[0].world[3] += 1.f;
+  CHECK(!matches(moved, info, false), "static matrix change is not a no-op");
+  std::vector<bvh::WorldInstanceGPU> visible = gpu;
+  visible[1].visibility[0] += 1.f;
+  CHECK(!matches(visible, info, false), "static visibility change is not a no-op");
+  std::vector<bvh::WorldInstanceGPU> slot = gpu;
+  slot[0].header[0] += 1.f;
+  CHECK(!matches(slot, info, false), "static slot change is not a no-op");
+  std::vector<bvh::WorldInstanceGPU> pose = gpu;
+  pose[2].world[3] += 1.f;
+  CHECK(!matches(pose, info, true) && matches(pose, info, false), "dynamic pose change: full differs, static equal");
+  std::vector<bvh::LiveTlasInstance> renamed = info;
+  renamed[0].id = 99u;
+  CHECK(!matches(gpu, renamed, false), "same descriptor with another id is not a no-op");
+  std::vector<bvh::LiveTlasInstance> winded = info;
+  winded[2].wind = true;
+  CHECK(!matches(gpu, winded, false), "dynamic instance with another wind flag is not a no-op");
+  std::vector<bvh::WorldInstanceGPU> seen = gpu;
+  seen[2].visibility[0] += 1.f;
+  CHECK(!matches(seen, info, false), "dynamic instance with another visibility is not a no-op");
+}
+
+// Live: a no-op rebuild (admit bump, no content change) is counted; an instance admitted later enters at its own latency bucket.
+static void TestCacheRebuildDiag() {
+  bvh::g_cache_diag.enabled.store(true);
+  bvh::g_live_bvh.skip_noop.store(false);  // Step 0 rebuild path: a no-op is rebuilt and counted as one
+  bvh::ResetWorldPool();
+  bvh::ResetCacheDiagCounters();
+  g_obs_frame = 200000u;
+  Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
+  auto& frame = falcom_world::g_state.frame;
+  frame.store(7000u);
+  SetCamera(10.f, 5.f, 10.f);
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(&dev);
+  const auto present = [&]() {
+    frame.fetch_add(1u);
+    bvh::UpdateLiveBvh(&dev, &queue);
+    bvh::UpdateCacheDiag(&dev);
+  };
+  AddMesh(0x71, BoxMesh(1.f));
+  for (int i = 0; i < 3; ++i) AddInstance(0x71, 2.f * static_cast<float>(i), 0.f, 20.f);
+  for (int i = 0; i < 5 && data->live.tlas_rebuilds == 0u; ++i) present();
+  CHECK(data->live.tlas_rebuilds == 1u, "first TLAS (%u rebuilds)", data->live.tlas_rebuilds);
+  {
+    std::lock_guard lock(bvh::g_cache_diag.mutex);
+    const bvh::CacheTlasStats& t = bvh::g_cache_diag.data.tlas;
+    float sum = 0.f;
+    bool finite = true;
+    for (size_t p = 0; p < bvh::kCachePhaseCount; ++p) {
+      finite = finite && std::isfinite(t.phase_last[p]);
+      sum += t.phase_last[p];
+    }
+    CHECK(finite && sum <= data->live.tlas_ms_last + 0.3f, "rebuild phases finite, sum %.3f ms within TLAS %.3f ms", (double)sum, (double)data->live.tlas_ms_last);
+    CHECK(t.by_reason[0] == 1u, "first build counted under its reason");
+  }
+
+  const uint32_t rebuilds_before = data->live.tlas_rebuilds;
+  uint64_t noop_before = 0u;
+  {
+    std::lock_guard lock(bvh::g_cache_diag.mutex);
+    noop_before = bvh::g_cache_diag.data.tlas.noop_full;
+  }
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::BumpPoolRevision(bvh::PoolRevisionSource::Admit);
+  }
+  for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds_before; ++i) present();
+  CHECK(data->live.tlas_rebuilds == rebuilds_before + 1u, "admit bump rebuilds the TLAS (%u)", data->live.tlas_rebuilds - rebuilds_before);
+  {
+    std::lock_guard lock(bvh::g_cache_diag.mutex);
+    const bvh::CacheTlasStats& t = bvh::g_cache_diag.data.tlas;
+    CHECK(t.noop_full == noop_before + 1u && t.noop_static == t.noop_full, "no-op rebuild counted (full %llu, static %llu)",
+          (unsigned long long)t.noop_full, (unsigned long long)t.noop_static);
+  }
+
+  size_t latency_bucket = 0u;
+  uint64_t entered_before = 0u;
+  {
+    std::lock_guard lock(bvh::g_cache_diag.mutex);
+    entered_before = bvh::g_cache_diag.data.tlas.entered;
+  }
+  AddInstance(0x71, 40.f, 0.f, 20.f);
+  uint64_t new_id = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    new_id = bvh::g_pool.instances.back().id;
+  }
+  for (int i = 0; i < 20; ++i) {
+    present();
+    std::lock_guard lock(bvh::g_pool.mutex);
+    const bvh::WorldInstance& instance = bvh::g_pool.instances.back();
+    if (instance.tlas_entry_frame == 0u) continue;
+    latency_bucket = bvh::CacheBucket(static_cast<float>(instance.tlas_entry_frame - instance.admit_frame), bvh::kCacheLatencyEdges, std::size(bvh::kCacheLatencyEdges));
+    break;
+  }
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    CHECK(bvh::g_pool.instances.back().id == new_id && bvh::g_pool.instances.back().tlas_entry_frame != 0u, "new instance entered the TLAS");
+  }
+  {
+    std::lock_guard lock(bvh::g_cache_diag.mutex);
+    const bvh::CacheTlasStats& t = bvh::g_cache_diag.data.tlas;
+    CHECK(t.entered == entered_before + 1u && t.admit_latency[latency_bucket] >= 1u, "entry counted in its latency bucket (%zu)", latency_bucket);
+  }
+  bvh::DestroyBvhDeviceData(&dev);
+  bvh::ResetWorldPool();
+  bvh::ResetCacheDiagCounters();
+  bvh::g_live_bvh.skip_noop.store(false);
+}
+
+// One mesh and a TLAS over it, for the skip tests (own device; the pool is reset).
+struct SkipRig {
+  Device dev;
+  CmdList cl;
+  Queue queue;
+  SkipRig() {
+    cl.dev = &dev;
+    queue.dev = &dev;
+    queue.cl = &cl;
+    bvh::g_cache_diag.enabled.store(true);
+    bvh::g_live_bvh.skip_noop.store(true);
+    bvh::ResetWorldPool();
+    bvh::ResetCacheDiagCounters();
+    g_obs_frame += 1000u;
+    falcom_world::g_state.frame.store(9000u);
+    SetCamera(10.f, 5.f, 10.f);
+    AddMesh(0x81, BoxMesh(1.f));
+    AddMesh(0x82, BoxMesh(2.f));
+  }
+  ~SkipRig() {
+    bvh::g_live_bvh.skip_noop.store(false);
+    bvh::DestroyBvhDeviceData(&dev);
+    bvh::ResetWorldPool();
+    bvh::ResetCacheDiagCounters();
+  }
+  bvh::BvhDeviceData* data() { return bvh::GetBvhDeviceData(&dev); }
+  void present() {
+    falcom_world::g_state.frame.fetch_add(1u);
+    bvh::UpdateLiveBvh(&dev, &queue);
+    bvh::UpdateCacheDiag(&dev);
+  }
+};
+
+static void BumpAdmit() {
+  std::lock_guard lock(bvh::g_pool.mutex);
+  bvh::BumpPoolRevision(bvh::PoolRevisionSource::Admit);
+}
+
+// A bump with no content change is skipped: no build, no buffer, the TLAS bytes stay, the pending sources are taken.
+static void TestSkipNoop() {
+  SkipRig rig;
+  AddInstance(0x81, 0.f, 0.f, 20.f);
+  AddInstance(0x81, 3.f, 0.f, 20.f);
+  AddInstance(0x82, -3.f, 0.f, 20.f);
+  for (int i = 0; i < 3 && rig.data()->live.tlas_rebuilds == 0u; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_rebuilds == 1u && rig.data()->tlas_built, "first TLAS before the skip test");
+  for (int i = 0; i < 10; ++i) rig.present();
+  const uint32_t rebuilds = rig.data()->live.tlas_rebuilds;
+  const std::vector<bvh::WorldInstanceGPU> instances = rig.data()->tlas_instances_cpu;
+  const std::vector<bvh::BVHNodeGPU> nodes = rig.data()->tlas_nodes_cpu;
+  const std::vector<bvh::BVHLeafGPU> leaves = rig.data()->tlas_leaves_cpu;
+  const size_t resources = rig.dev.res.size();
+  BumpAdmit();
+  for (int i = 0; i < 12 && rig.data()->live.tlas_skips == 0u; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_skips == 1u && rig.data()->live.tlas_rebuilds == rebuilds, "admit bump with no content change is skipped (skips %u, rebuilds %u -> %u)",
+        rig.data()->live.tlas_skips, rebuilds, rig.data()->live.tlas_rebuilds);
+  CHECK(SameBytes(instances, rig.data()->tlas_instances_cpu) && SameBytes(nodes, rig.data()->tlas_nodes_cpu)
+            && SameBytes(leaves, rig.data()->tlas_leaves_cpu),
+        "TLAS instances, nodes and leaves unchanged by the skip");
+  CHECK(rig.dev.res.size() == resources, "skip creates and destroys no buffer (%zu -> %zu)", resources, rig.dev.res.size());
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    CHECK(bvh::g_pool.revision_sources_pending == 0u && rig.data()->tlas_pool_revision == bvh::g_pool.revision,
+          "sources taken and revision reflected by the skip");
+  }
+  for (int i = 0; i < 6; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_skips == 1u && rig.data()->live.tlas_rebuilds == rebuilds, "no further snapshot before the next gate");
+}
+
+// Real changes (add, retire) are never skipped; the result equals a run with the switch off.
+static void SkipSequence(bool skip, std::vector<bvh::WorldInstanceGPU>* out, uint32_t* rebuilds, uint32_t* skips) {
+  SkipRig rig;
+  bvh::g_live_bvh.skip_noop.store(skip);
+  AddInstance(0x81, 0.f, 0.f, 20.f);
+  AddInstance(0x82, -3.f, 0.f, 20.f);
+  for (int i = 0; i < 10; ++i) rig.present();
+  AddInstance(0x81, 6.f, 0.f, 20.f);
+  for (int i = 0; i < 10; ++i) rig.present();
+  RetireMesh(0x82);
+  for (int i = 0; i < 10; ++i) rig.present();
+  *out = rig.data()->tlas_instances_cpu;
+  *rebuilds = rig.data()->live.tlas_rebuilds;
+  *skips = rig.data()->live.tlas_skips;
+  bvh::g_live_bvh.skip_noop.store(true);
+}
+
+static void TestSkipDifferent() {
+  std::vector<bvh::WorldInstanceGPU> on;
+  std::vector<bvh::WorldInstanceGPU> off;
+  uint32_t on_rebuilds = 0u, on_skips = 0u, off_rebuilds = 0u, off_skips = 0u;
+  SkipSequence(true, &on, &on_rebuilds, &on_skips);
+  SkipSequence(false, &off, &off_rebuilds, &off_skips);
+  CHECK(on_rebuilds == off_rebuilds && on_rebuilds >= 3u, "add and retire rebuild with skip on (%u, off %u)", on_rebuilds, off_rebuilds);
+  CHECK(on_skips == 0u && off_skips == 0u, "no skip for real changes (on %u, off %u)", on_skips, off_skips);
+  CHECK(SameBytes(on, off), "TLAS with skip on equals the switch-off run");
+}
+
+// A moved dynamic instance with a bump: the snapshot is skipped, the dynamic revision stays behind so the refit still runs.
+static void TestSkipDynamicPose() {
+  SkipRig rig;
+  AddInstance(0x81, 5.f, 0.f, 5.f);
+  AddInstance(0x82, -5.f, 0.f, 5.f);
+  for (int i = 0; i < 12; ++i) rig.present();
+  MoveDynamicInstance(0x81, 5.f, 5.f, falcom_world::g_state.frame.load());
+  for (int i = 0; i < 10; ++i) rig.present();
+  const uint32_t skips = rig.data()->live.tlas_skips;
+  const uint32_t rebuilds = rig.data()->live.tlas_rebuilds;
+  const uint32_t refits = rig.data()->live.tlas_refits;
+  MoveDynamicInstance(0x81, 5.4f, 5.f, falcom_world::g_state.frame.load());
+  BumpAdmit();
+  for (int i = 0; i < 12 && rig.data()->live.tlas_skips == skips; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_skips == skips + 1u && rig.data()->live.tlas_rebuilds == rebuilds, "dynamic pose with a bump: skipped");
+  uint64_t pool_dynamic_revision = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    pool_dynamic_revision = bvh::g_pool.dynamic_revision;
+  }
+  CHECK(rig.data()->live.tlas_refits > refits && rig.data()->tlas_dynamic_revision == pool_dynamic_revision,
+        "refit in the skipped present: the pose follows this frame (%u refits)", rig.data()->live.tlas_refits - refits);
+  CHECK(CompareTraces(rig.dev, *rig.data(), "skip dynamic", 200, 3) == 0, "trace agrees after a skipped snapshot and a refit");
+}
+
+// 120 refits force a full rebuild for tree quality, a skip never hides it.
+static void TestSkipQuality() {
+  SkipRig rig;
+  AddInstance(0x81, 5.f, 0.f, 5.f);
+  AddInstance(0x82, -5.f, 0.f, 5.f);
+  for (int i = 0; i < 12; ++i) rig.present();
+  MoveDynamicInstance(0x81, 5.4f, 5.f, falcom_world::g_state.frame.load());
+  for (int i = 0; i < 10; ++i) rig.present();
+  MoveDynamicInstance(0x81, 5.f, 5.f, falcom_world::g_state.frame.load());
+  rig.data()->tlas_refits_since_rebuild = bvh::kLiveTlasRefitsPerRebuild;
+  const uint32_t skips = rig.data()->live.tlas_skips;
+  const uint32_t rebuilds = rig.data()->live.tlas_rebuilds;
+  for (int i = 0; i < 12 && rig.data()->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_rebuilds == rebuilds + 1u && std::string(rig.data()->live.tlas_reason) == "refit quality" && rig.data()->live.tlas_skips == skips,
+        "refit quality rebuilds (reason %s, skips %u)", rig.data()->live.tlas_reason, rig.data()->live.tlas_skips);
+}
+
+// A skip at F moves no gate: a change right after it rebuilds at F + kLiveTlasInterval, as HEAD does.
+static void TestSkipCadence() {
+  SkipRig rig;
+  AddInstance(0x81, 0.f, 0.f, 20.f);
+  for (int i = 0; i < 12 && rig.data()->live.tlas_rebuilds == 0u; ++i) rig.present();
+  for (int i = 0; i < 9; ++i) rig.present();
+  BumpAdmit();
+  for (int i = 0; i < 12 && rig.data()->live.tlas_skips == 0u; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_skips == 1u, "bump skipped");
+  const uint32_t check = rig.data()->tlas_check_frame;
+  const uint32_t rebuilds = rig.data()->live.tlas_rebuilds;
+  AddInstance(0x82, 3.f, 0.f, 20.f);
+  for (int i = 0; i < 12 && rig.data()->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(rig.data()->live.tlas_rebuilds == rebuilds + 1u && rig.data()->live.tlas_frame == check + bvh::kLiveTlasInterval,
+        "change after a skip rebuilds at +%u (check f%u)", rig.data()->live.tlas_frame - check, check);
+}
+
+// Slack TLAS (session switch): a skip rig with the switch on; the static block gets holes at the first full build.
+struct SlackRig : SkipRig {
+  SlackRig() { bvh::g_live_bvh.slack.store(true); }
+  ~SlackRig() { bvh::g_live_bvh.slack.store(false); }
+};
+
+static uint64_t SlackKey(uint32_t mesh) { return 0x300u + mesh; }
+
+// 36 meshes of 30 instances (1080 static instances): above kLiveSlackMinStatic, so the first build has 256 holes.
+static void SlackFill(SlackRig* rig) {
+  for (uint32_t m = 0; m < 36u; ++m) {
+    AddMesh(SlackKey(m), BoxMesh(0.5f + 0.001f * static_cast<float>(m)));  // 1 m boxes, 4 m apart: no overlaps (ties would differ from brute force)
+    for (uint32_t i = 0; i < 30u; ++i) {
+      const float x = -60.f + 4.f * static_cast<float>(i % 15u);
+      const float z = 20.f + 4.f * static_cast<float>(m) + 60.f * static_cast<float>(i / 15u);
+      AddInstance(SlackKey(m), x, 0.f, z);
+    }
+  }
+  for (int i = 0; i < 3 && rig->data()->live.tlas_rebuilds == 0u; ++i) rig->present();
+}
+
+// Moves every instance admitted through `key` by dx in x: a static change (no dynamic flag), with a pool revision.
+static void MoveStaticInstances(uint64_t key, float dx) {
+  std::lock_guard lock(bvh::g_pool.mutex);
+  for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+    if (inst.mesh_key != key) continue;
+    float mn[3], mx[3];
+    bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
+    inst.matrix[3] += dx;
+    falcom_world::ComputeMatrixInverse(inst.matrix, inst.inverse_world);
+    bvh::ComputePoolInstanceBounds(bvh::g_pool.meshes[inst.mesh_id], inst.matrix, mn, mx);
+    std::memcpy(inst.bounds_min, mn, sizeof(mn));
+    std::memcpy(inst.bounds_max, mx, sizeof(mx));
+    bvh::g_pool.admitted_keys.insert(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
+  }
+  bvh::g_pool.revision += 1u;
+}
+
+static void TestSlackLayout() {
+  SlackRig rig;
+  SlackFill(&rig);
+  const bvh::BvhDeviceData* data = rig.data();
+  CHECK(data->tlas_slack && data->tlas_free_slots.size() == 256u && data->tlas_instances_cpu.size() == 1080u + 256u,
+        "slack layout: %zu free holes, %zu slots", data->tlas_free_slots.size(), data->tlas_instances_cpu.size());
+  CHECK(data->active_count == 1080u && data->tlas_dynamic_first == 1080u + 256u && data->tlas_slot_of_id.size() == 1080u,
+        "live count %u, dynamic first %u, ids mapped %zu", data->active_count, data->tlas_dynamic_first, data->tlas_slot_of_id.size());
+  bool holes_zero = true;
+  for (uint32_t s = 1080u; s < 1080u + 256u; ++s) holes_zero = holes_zero && data->tlas_info[s].id == 0u && data->tlas_leaves_cpu.size() > s;
+  CHECK(holes_zero, "holes have no id");
+  bvh::g_live_bvh.check_requested.store(true);
+  rig.present();
+  CHECK(data->live.gpu_checked && data->live.gpu_ok, "GPU check with holes: %s", data->live.gpu_result.c_str());
+}
+
+// Random static changes (add, retire, move) applied in place; each result traces like brute force, the GPU contents match.
+static void TestSlackApply() {
+  SlackRig rig;
+  SlackFill(&rig);
+  const bvh::BvhDeviceData* data = rig.data();
+  Device& dev = rig.dev;
+  uint32_t seed = 12345u;
+  for (uint32_t step = 0; step < 24u; ++step) {
+    seed = seed * 1664525u + 1013904223u;
+    const uint32_t action = (seed >> 8) % 3u;
+    const uint32_t mesh = (seed >> 16) % 36u;
+    if (action == 0u) {
+      const uint64_t key = 0x400u + step;
+      AddMesh(key, BoxMesh(0.6f + 0.001f * static_cast<float>(step)));
+      for (uint32_t i = 0; i < 3u; ++i) AddInstance(key, 100.f + 3.f * static_cast<float>(i), 0.f, 100.f + 3.f * static_cast<float>(step));
+    } else if (action == 1u) {
+      RetireMesh(SlackKey(mesh));
+    } else {
+      MoveStaticInstances(SlackKey(mesh), 0.5f + 0.1f * static_cast<float>(step));
+    }
+    for (int i = 0; i < 9; ++i) rig.present();
+    CHECK(CompareTraces(dev, *data, "slack step", 120, 40 + step) == 0, "slack step %u traces like brute force (action %u, applies %u)", step, action,
+        data->live.slack_applies);
+  }
+  CHECK(data->live.slack_applies >= 5u, "in-place applies (%u, added %u, removed %u, changed %u, free %u)", data->live.slack_applies,
+        data->live.slack_added, data->live.slack_removed, data->live.slack_changed, data->live.slack_free_holes);
+  bvh::g_live_bvh.check_requested.store(true);
+  rig.present();
+  CHECK(data->live.gpu_checked && data->live.gpu_ok, "GPU check after applies: %s", data->live.gpu_result.c_str());
+}
+
+// More changes in one step than kLiveSlackMaxOps: a full rebuild, with the reason "slack exhausted"; the rebuilt TLAS has its holes again.
+static void TestSlackExhaustion() {
+  SlackRig rig;
+  SlackFill(&rig);
+  bvh::BvhDeviceData* data = rig.data();
+  for (uint32_t m = 0; m < 20u; ++m) MoveStaticInstances(SlackKey(m), 0.2f);  // 600 moved instances
+  const uint32_t rebuilds = data->live.tlas_rebuilds;
+  for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == rebuilds + 1u && std::string(data->live.tlas_reason) == "slack exhausted" && data->live.slack_exhausted >= 1u,
+        "exhausted: rebuild with reason %s (%u)", data->live.tlas_reason, data->live.slack_exhausted);
+  CHECK(data->tlas_slack && data->tlas_free_slots.size() == 256u && data->active_count == 1080u, "holes restored (%zu free, %u live)",
+        data->tlas_free_slots.size(), data->active_count);
+  CHECK(CompareTraces(rig.dev, *data, "exhausted", 120, 77) == 0, "trace agrees after the exhaustion rebuild");
+}
+
+// A change of the dynamic set (a promotion) is structural: a full rebuild, never an in-place update.
+static void TestSlackStructural() {
+  SlackRig rig;
+  SlackFill(&rig);
+  bvh::BvhDeviceData* data = rig.data();
+  const uint32_t rebuilds = data->live.tlas_rebuilds;
+  const uint32_t structural = data->live.slack_structural;
+  MoveDynamicInstance(SlackKey(0u), 0.f, 0.f, falcom_world::g_state.frame.load());
+  for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == rebuilds + 1u && data->live.slack_structural == structural + 1u
+            && std::string(data->live.tlas_reason) == "slack structural",
+        "promotion is structural (reason %s, structural %u)", data->live.tlas_reason, data->live.slack_structural);
+}
+
+// A pool change and a region move in the same present: a full rebuild, not an in-place update.
+static void TestSlackRegionMasked() {
+  SlackRig rig;
+  SlackFill(&rig);
+  bvh::BvhDeviceData* data = rig.data();
+  const uint32_t applies = data->live.slack_applies;
+  const uint32_t rebuilds = data->live.tlas_rebuilds;
+  AddInstance(SlackKey(1u), 0.f, 0.f, 500.f);
+  SetCamera(400.f, 5.f, 10.f);  // the region leaves most of the static block: the snapshot changes too
+  for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == rebuilds + 1u && data->live.slack_applies == applies,
+        "pool change and region move: rebuilt, not applied (reason %s; rebuilds %u, skips %u, applies %u, frame %u, tlas_frame %u, check %u, waiting %u, instances %u)",
+        data->live.tlas_reason, data->live.tlas_rebuilds, data->live.tlas_skips, data->live.slack_applies, falcom_world::g_state.frame.load(),
+        data->live.tlas_frame, data->tlas_check_frame, data->live.tlas_waiting, data->live.tlas_instances);
+}
+
+// Switch off: the next rebuild is the plain one (no holes, reason "slack switch"); the traces still agree.
+static void TestSlackToggle() {
+  SlackRig rig;
+  SlackFill(&rig);
+  bvh::BvhDeviceData* data = rig.data();
+  AddInstance(SlackKey(2u), 0.f, 0.f, 300.f);
+  for (int i = 0; i < 12 && data->live.slack_applies == 0u; ++i) rig.present();
+  CHECK(data->live.slack_applies >= 1u, "an in-place apply before the switch");
+  bvh::g_live_bvh.slack.store(false);
+  const uint32_t rebuilds = data->live.tlas_rebuilds;
+  for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == rebuilds + 1u && std::string(data->live.tlas_reason) == "slack switch", "switch off rebuilds (reason %s)",
+        data->live.tlas_reason);
+  CHECK(!data->tlas_slack && data->tlas_free_slots.empty() && data->active_count == data->tlas_instances_cpu.size(),
+        "no holes after the switch (%u live of %zu)", data->active_count, data->tlas_instances_cpu.size());
+  CHECK(CompareTraces(rig.dev, *data, "switch off", 120, 88) == 0, "trace agrees after the switch");
+}
+
+// 120 frames without a full rebuild: the next change is a full rebuild for tree quality.
+static void TestSlackMaintenance() {
+  SlackRig rig;
+  SlackFill(&rig);
+  bvh::BvhDeviceData* data = rig.data();
+  const uint32_t maintenance = data->live.slack_maintenance;
+  for (uint32_t step = 0; step < 16u; ++step) {
+    AddInstance(SlackKey(3u), 0.f, 0.f, 400.f + static_cast<float>(step));
+    for (int i = 0; i < 9; ++i) rig.present();
+  }
+  CHECK(data->live.slack_maintenance > maintenance, "maintenance rebuild after 120 frames (%u)", data->live.slack_maintenance);
+}
+
+// Slack switch: ticking it on an unchanged scene rebuilds (with holes, once), it is not skipped; unticking rebuilds without holes.
+static void TestSlackSwitchSkip() {
+  {
+    SlackRig rig;
+    bvh::g_live_bvh.slack.store(false);
+    SlackFill(&rig);
+    bvh::BvhDeviceData* data = rig.data();
+    uint32_t rebuilds = data->live.tlas_rebuilds;
+    const uint32_t skips = data->live.tlas_skips;
+    bvh::g_live_bvh.slack.store(true);
+    for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+    CHECK(data->live.tlas_rebuilds == rebuilds + 1u && std::string(data->live.tlas_reason) == "slack switch", "slack on: rebuilt, not skipped (%s)",
+          data->live.tlas_reason);
+    CHECK(data->tlas_slack && data->tlas_free_slots.size() == 256u, "slack on: holes built (%zu)", data->tlas_free_slots.size());
+    for (int i = 0; i < 12; ++i) rig.present();
+    CHECK(data->live.tlas_skips == skips, "slack on, unchanged scene: no repeated skips (%u -> %u)", skips, data->live.tlas_skips);
+    rebuilds = data->live.tlas_rebuilds;
+    bvh::g_live_bvh.slack.store(false);
+    for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+    CHECK(data->live.tlas_rebuilds == rebuilds + 1u && std::string(data->live.tlas_reason) == "slack switch" && !data->tlas_slack
+              && data->tlas_free_slots.empty(),
+          "slack off: rebuilt without holes (%s)", data->live.tlas_reason);
+  }
+  {
+    SkipRig rig;
+    AddInstance(0x81, 0.f, 0.f, 20.f);
+    AddInstance(0x81, 3.f, 0.f, 20.f);
+    for (int i = 0; i < 12 && rig.data()->live.tlas_rebuilds == 0u; ++i) rig.present();
+    uint32_t rebuilds = rig.data()->live.tlas_rebuilds;
+    bvh::g_live_bvh.slack.store(true);  // a small TLAS: no holes, the switch still rebuilds
+    for (int i = 0; i < 12 && rig.data()->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+    CHECK(rig.data()->live.tlas_rebuilds == rebuilds + 1u && std::string(rig.data()->live.tlas_reason) == "slack switch",
+          "small scene, slack on: rebuilt (%s)", rig.data()->live.tlas_reason);
+    rebuilds = rig.data()->live.tlas_rebuilds;
+    bvh::g_live_bvh.slack.store(false);
+    for (int i = 0; i < 12 && rig.data()->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+    CHECK(rig.data()->live.tlas_rebuilds == rebuilds + 1u && std::string(rig.data()->live.tlas_reason) == "slack switch" && !rig.data()->tlas_slack,
+          "small scene, slack off: rebuilt (%s)", rig.data()->live.tlas_reason);
+  }
+}
+
+// Diagnostics: an in-place apply is counted as an apply and does not move the rebuild counters or the reasons.
+static void TestSlackAppliesDiag() {
+  SlackRig rig;
+  SlackFill(&rig);
+  bvh::BvhDeviceData* data = rig.data();
+  AddMesh(0x600u, BoxMesh(0.8f));
+  AddInstance(0x600u, 150.f, 0.f, 150.f);
+  const auto counts = []() {
+    std::lock_guard lock(bvh::g_cache_diag.mutex);
+    const bvh::CacheTlasStats& t = bvh::g_cache_diag.data.tlas;
+    uint64_t reasons = 0u;
+    for (const uint64_t count : t.by_reason) reasons += count;
+    return std::vector<uint64_t>{t.applies, t.rebuilds, bvh::g_cache_diag.data.work.tlas_rebuilds, reasons};
+  };
+  const std::vector<uint64_t> before = counts();
+  const uint32_t live_before = data->live.slack_applies;
+  for (int i = 0; i < 20 && data->live.slack_applies == live_before; ++i) rig.present();
+  const std::vector<uint64_t> after = counts();
+  CHECK(data->live.slack_applies > live_before, "an in-place apply happened (%u)", data->live.slack_applies);
+  CHECK(after[0] - before[0] == data->live.slack_applies - live_before && after[0] - before[0] >= 1u,
+        "tlas.applies moved with the applies (%llu vs %u)", (unsigned long long)(after[0] - before[0]), data->live.slack_applies - live_before);
+  CHECK(after[1] == before[1] && after[2] == before[2] && after[3] == before[3],
+        "applies leave rebuilds, work rebuilds and reasons unchanged (%llu, %llu, %llu)", (unsigned long long)(after[1] - before[1]),
+        (unsigned long long)(after[2] - before[2]), (unsigned long long)(after[3] - before[3]));
 }
 
 int main() {
@@ -2608,6 +3150,24 @@ int main() {
   TestCacheDiagJson(&dev);
   TestCacheBlasWhileOff(&dev);
   TestCacheOnOff();
+  TestCacheEnteredIds();
+  TestCacheLatencyBuckets();
+  TestLiveSnapshotMatches();
+  TestCacheRebuildDiag();
+  TestSkipNoop();
+  TestSkipDifferent();
+  TestSkipDynamicPose();
+  TestSkipQuality();
+  TestSkipCadence();
+  TestSlackLayout();
+  TestSlackApply();
+  TestSlackExhaustion();
+  TestSlackStructural();
+  TestSlackRegionMasked();
+  TestSlackToggle();
+  TestSlackMaintenance();
+  TestSlackSwitchSkip();
+  TestSlackAppliesDiag();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

@@ -60,6 +60,18 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## TLAS rebuild reduction (cache-diag-2): implemented, not validated in game
+
+Plan: `world/docs/TLAS_PLAN.md`. Build id `cache-diag-2` (schema 3 of `world_cache_diag.json`, additive keys: `tlas.phase_ms`, `tlas.noop` (with the skip counts), `tlas.reasons`, `entry_latency`). Status: implemented in three steps, none validated in game, no box ticked.
+
+- Step 0 (diagnostic, no behaviour change): per-phase rebuild times (snapshot+lock, filter+descriptors, sort+build+validate, buffer create, buffer destroy), exact no-op rebuilds (`LiveSnapshotMatchesTlas`: full, and static prefix only) by cause, rebuild reasons, and TLAS entry latency per instance (admit and first sighting to first TLAS entry, `WorldInstance::tlas_entry_frame`). Panel lines: four new lines in "Cache diagnostics".
+- Step 1: session switch "Skip no-op TLAS rebuilds" (`g_live_bvh.skip_noop`), **default OFF until the in-game A/B** (tests that need it set it on explicitly). Turning the slack switch on or off always rebuilds (never skipped). A rebuild whose snapshot equals the TLAS is skipped (no sort, build, buffer create or destroy). The gate counts from the skip (`tlas_check_frame`), so the next real rebuild keeps HEAD's cadence. Skipped counts: `tlas_skips`, panel line "TLAS skips (no-op rebuilds)".
+- Step 2: session switch "Slack TLAS (experimental, session only)" (`g_live_bvh.slack`), **default OFF**; not saved. With it on, a full build keeps spare slots (holes: id 0, parked leaf, sentinel in the active buffer) in the static block, and static changes are written in place (`TryApplyLiveTlasSlack`). Rebuilds still happen for structural changes, region moves, switches, more than 512 changes or no free slot ("slack exhausted"), an invalid tree, and every 120 frames ("slack maintenance"). Panel line "Slack: applies ...". In-place applies are counted apart from rebuilds in the cache diagnostics (`tlas` no-op line, "in-place applies"; entry latency and diff recorded for them).
+
+Harness: `test_live` (new: TestCacheEnteredIds, TestCacheLatencyBuckets, TestLiveSnapshotMatches, TestCacheRebuildDiag, TestSkipNoop, TestSkipDifferent, TestSkipDynamicPose, TestSkipQuality, TestSkipCadence, TestSlackLayout, TestSlackApply, TestSlackExhaustion, TestSlackStructural, TestSlackRegionMasked, TestSlackToggle, TestSlackMaintenance, TestSlackSwitchSkip, TestSlackAppliesDiag; TestCacheOnOff pins `0x55593b70e070e7fe` with diagnostics on/off, skip on/off, slack off), `test_build` (TestSlackLeaves in main).
+
+Owner test steps (in game, not done): see the plan, section C. Step 2 stays OFF unless the owner ticks "Slack TLAS" for a test session.
+
 ## Phase 0 cache diagnostics (2026-10-15): implemented, not validated in game
 
 Status: implemented, not validated in game. Diagnostic only: no rendering or TLAS behaviour change. Build id `cache-diag-0`. Code: `world/bvh/cache_diag.hpp` (distance tiers, histogram, self-check, TLAS change diff, episodes, lighting gap, report lines, `world_cache_diag.json`), `world/bvh/placement_probe.hpp` (placement snapshot, compare, text files), `bvh_live.hpp` (`UpdateCacheDiag`, TLAS record hook, BLAS counters), `world_bvh.hpp` (panel section "Cache diagnostics"). Harness: `test_pool` (placement, episode serial), `test_live` (tiers, TLAS diff, episodes, lighting, report lines, diagnostics on/off give identical TLAS, descriptors and revision).
