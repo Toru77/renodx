@@ -397,6 +397,11 @@ int main() {
   objects.push_back({"S3 stale", vb_s3.handle, 0, kRigid, kOpaque, {{600, 0, 0}}});
   for (int i = 0; i < 40; ++i) run_frame(frame++, false);
   objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb_s3.handle; }), objects.end());
+  const auto resight_count = [&]() {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    return bvh::g_pool.resight.counters.resights;
+  };
+  const uint64_t resights_before_mass2 = resight_count();
   std::vector<resource> mass2(32);
   for (size_t i = 0; i < mass2.size(); ++i) {
     dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &mass2[i]);
@@ -404,6 +409,10 @@ int main() {
     objects.push_back({"M map2", mass2[i].handle, 0, kRigid, kOpaque, {{500.f + static_cast<float>(i), 0, 0}}});
   }
   for (int i = 0; i < 100; ++i) run_frame(frame++, false);
+  // Derived: the 32 mass2 meshes are Box(20+i), the same geometry as the 32 meshes of the first map change (retired
+  // then, tracked within the horizon). They are the only new meshes in this window, so each one re-sights once.
+  CHECK(resight_count() - resights_before_mass2 == 32u, "mass2 re-sights the 32 retired mass meshes (%llu)",
+        static_cast<unsigned long long>(resight_count() - resights_before_mass2));
   for (resource& r : mass2) bvh::OnDestroyResourcePool(&dev, r);
   objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.name == std::string("M map2"); }), objects.end());
   for (resource& r : mass2) dev.destroy_resource(r);
@@ -728,6 +737,56 @@ int main() {
                 snapshot.truncated ? 1 : 0, same.verdict.c_str(), jitter.verdict.c_str(), rebase.verdict.c_str(), budget.verdict.c_str());
     std::filesystem::remove(round);
     std::filesystem::remove(again);
+  }
+
+  // Single object cycle: admit, destroy, recreate identical content -> one re-sighting.
+  const auto counters = []() {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    return bvh::g_pool.resight.counters;
+  };
+  const auto make = [&](float size) {
+    resource vb;
+    dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb);
+    fixture::WriteVertices(dev.res[vb.handle].bytes, fixture::Box(size));
+    objects.push_back({"R cycle", vb.handle, 0, kRigid, kOpaque, {{950, 0, 0}}});
+    for (int i = 0; i < 40; ++i) run_frame(frame++, false);
+    return vb;
+  };
+  const auto drop = [&](resource& vb) {
+    bvh::OnDestroyResourcePool(&dev, vb);
+    objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.vb == vb.handle; }), objects.end());
+    dev.destroy_resource(vb);
+    run_frame(frame++, false);
+  };
+  resource cycle = make(30.f);
+  drop(cycle);
+  const bvh::PoolResightCounters before_recreate = counters();
+  cycle = make(30.f);
+  CHECK(counters().resights - before_recreate.resights == 1u, "single object recreated with identical content re-sights once (%llu)",
+        static_cast<unsigned long long>(counters().resights - before_recreate.resights));
+  drop(cycle);
+  bvh::g_pool.resight.enabled.store(false);
+  const bvh::PoolResightCounters off_before = counters();
+  cycle = make(31.f);
+  drop(cycle);
+  const bvh::PoolResightCounters off_after = counters();
+  bvh::g_pool.resight.enabled.store(true);
+  CHECK(off_after.retired == off_before.retired && off_after.new_meshes == off_before.new_meshes && off_after.resights == off_before.resights,
+        "tracker disabled: counters unchanged (retired %llu, new %llu, resights %llu)", static_cast<unsigned long long>(off_after.retired),
+        static_cast<unsigned long long>(off_after.new_meshes), static_cast<unsigned long long>(off_after.resights));
+
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    const bvh::PoolResightCounters& r = bvh::g_pool.resight.counters;
+    uint64_t gap_sum = 0u;
+    for (const uint64_t count : r.gap) gap_sum += count;
+    std::printf("resight: retired %llu, new meshes %llu, resights %llu, count mismatch %llu, drift %llu, gap sum %llu\n",
+                static_cast<unsigned long long>(r.retired), static_cast<unsigned long long>(r.new_meshes), static_cast<unsigned long long>(r.resights),
+                static_cast<unsigned long long>(r.count_mismatch), static_cast<unsigned long long>(r.drift_near_misses),
+                static_cast<unsigned long long>(gap_sum));
+    CHECK(r.retired >= 32u && r.count_mismatch == 0u && r.drift_near_misses == 0u && gap_sum == r.resights,
+          "resight counters after the mass retirements (retired %llu, resights %llu)", static_cast<unsigned long long>(r.retired),
+          static_cast<unsigned long long>(r.resights));
   }
 
   bvh::DumpWorldPool();

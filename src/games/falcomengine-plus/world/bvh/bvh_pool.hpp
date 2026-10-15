@@ -138,7 +138,7 @@ inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
 inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
-inline constexpr const char* kWorldBuildId = "cache-diag-0 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
+inline constexpr const char* kWorldBuildId = "cache-diag-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
 inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
@@ -694,6 +694,7 @@ struct PoolMeshRequest {
   uint64_t buffer_key = 0u;  // the VB/IB bindings a draw must have to serve its copies
   uint32_t vs_hash = 0u;
   uint32_t last_frame = 0u;  // queued, last sighting, or last copy issued or read
+  uint32_t queued_frame = 0u;  // frame the request was queued (capture wait for the diagnostics)
   PoolStagingDiag staging;   // the last read (poison_staging)
   DrawRecord draw;
   int32_t pos_offset = 0;
@@ -1312,6 +1313,49 @@ struct PoolTlasTiming {
   float refit_phase_ms[4] = {};  // last refit: lock+copy, descriptors, nodes+validate, upload
 };
 
+inline constexpr uint32_t kPoolResightGapEdges[4] = {120u, 600u, 1800u, 3600u};  // presents since retirement; an edge value goes to the upper bucket
+inline constexpr size_t kPoolResightGapBuckets = 5u;
+inline constexpr uint32_t kPoolResightHorizon = 7200u;  // presents; older retirements are swept when the tracker is full
+inline constexpr size_t kPoolResightMax = 2u * kPoolMaxMeshes;
+
+// Diagnostic: meshes retired by CompactPool and meshes captured again later with the same signature (re-sightings).
+struct PoolResightCounters {
+  uint64_t retired = 0u;
+  uint64_t retired_retainable = 0u;
+  uint64_t retired_tris = 0u;
+  uint64_t retired_dropped = 0u;  // retirements not tracked (tracker full)
+  uint64_t expired = 0u;          // tracked retirements swept by the horizon
+  uint64_t new_meshes = 0u;       // meshes added to g_pool.meshes (merged captures excluded)
+  uint64_t new_tris = 0u;
+  uint64_t resights = 0u;
+  uint64_t resights_retainable = 0u;
+  uint64_t count_mismatch = 0u;     // same signature, other vertex or triangle count
+  uint64_t revivable_tris = 0u;     // triangles of re-sightings with equal counts
+  uint64_t drift_near_misses = 0u;  // same shape (rounded bounds and counts), other signature
+  uint64_t gap[kPoolResightGapBuckets] = {};
+  uint64_t capture_meshes = 0u;     // captured meshes that were added
+  uint64_t capture_wait_sum = 0u;   // presents from queue to applied
+  uint64_t capture_wait_max = 0u;
+};
+
+// Guarded by g_pool.mutex. Retire and Sight are defined after PoolMix.
+struct PoolResightTracker {
+  struct Entry {
+    uint32_t retire_frame = 0u;
+    uint32_t vertex_count = 0u;
+    uint32_t triangle_count = 0u;
+    uint64_t shape = 0u;
+    bool retainable = false;
+  };
+  std::atomic_bool enabled{true};
+  PoolResightCounters counters;
+  std::unordered_map<uint64_t, Entry> by_signature;
+  std::unordered_map<uint64_t, uint32_t> shape_count;
+  uint32_t sweep_frame = 0u;
+  void Retire(const WorldMesh& mesh, uint32_t frame);
+  void Sight(const WorldMesh& mesh, uint32_t frame, uint32_t wait_frames);
+};
+
 struct PoolState {
   std::atomic_bool scan_active{false};
   bool scan_continuous = false;  // the scan has been on every frame since scan_since
@@ -1344,6 +1388,8 @@ struct PoolState {
   // moved to the *_frame_us values (last frame) by DrainPoolScan.
   std::atomic_uint64_t cpu_hook_us{0u};
   std::atomic_uint64_t cpu_drain_us{0u};
+  std::atomic_uint64_t cpu_capture_us{0u};  // CPU time of the mesh capture (decode and apply), not the GPU read-back wait
+  PoolResightTracker resight;
   std::atomic_uint64_t cpu_hook_frame_us{0u};
   std::atomic_uint64_t cpu_drain_frame_us{0u};
   // The immediate command list (set at present), to tell deferred-context draws apart.
@@ -1692,6 +1738,79 @@ inline bool PoolInstanceInRegion(const WorldInstance& instance, const PoolRegion
     if (instance.bounds_max[i] < region.min[i] || instance.bounds_min[i] > region.max[i]) return false;
   }
   return true;
+}
+
+// Shape of a mesh for the drift near-miss count: triangle and vertex counts and bounds rounded to 0.01 m.
+inline uint64_t PoolResightShape(const WorldMesh& mesh) {
+  uint64_t shape = PoolMix(1469598103934665603ull, mesh.triangle_count);
+  shape = PoolMix(shape, mesh.positions.size());
+  for (int i = 0; i < 3; ++i) {
+    shape = PoolMix(shape, static_cast<uint64_t>(std::llround(mesh.bbox_min[i] * 100.0)));
+    shape = PoolMix(shape, static_cast<uint64_t>(std::llround(mesh.bbox_max[i] * 100.0)));
+  }
+  return shape;
+}
+
+inline void PoolResightTracker::Retire(const WorldMesh& mesh, uint32_t frame) {
+  if (!enabled.load(std::memory_order_relaxed)) return;
+  const bool retainable = !mesh.alpha && mesh.verified && mesh.writes_after_capture == 0u;
+  counters.retired += 1u;
+  counters.retired_tris += mesh.triangle_count;
+  if (retainable) counters.retired_retainable += 1u;
+  if (by_signature.size() >= kPoolResightMax) {
+    if (sweep_frame != frame) {
+      sweep_frame = frame;
+      for (auto it = by_signature.begin(); it != by_signature.end();) {
+        if (it->second.retire_frame <= frame && frame - it->second.retire_frame > kPoolResightHorizon) {
+          counters.expired += 1u;
+          const auto shape_it = shape_count.find(it->second.shape);
+          if (--shape_it->second == 0u) shape_count.erase(shape_it);
+          it = by_signature.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    if (by_signature.size() >= kPoolResightMax) {
+      counters.retired_dropped += 1u;
+      return;
+    }
+  }
+  const uint64_t shape = PoolResightShape(mesh);
+  const Entry entry{frame, static_cast<uint32_t>(mesh.positions.size()), mesh.triangle_count, shape, retainable};
+  if (by_signature.insert_or_assign(mesh.signature, entry).second) shape_count[shape] += 1u;
+}
+
+inline void PoolResightTracker::Sight(const WorldMesh& mesh, uint32_t frame, uint32_t wait_frames) {
+  if (!enabled.load(std::memory_order_relaxed)) return;
+  const uint64_t shape = PoolResightShape(mesh);
+  counters.new_meshes += 1u;
+  counters.new_tris += mesh.triangle_count;
+  counters.capture_meshes += 1u;
+  counters.capture_wait_sum += wait_frames;
+  counters.capture_wait_max = std::max<uint64_t>(counters.capture_wait_max, wait_frames);
+  const auto found = by_signature.find(mesh.signature);
+  if (found != by_signature.end()) {
+    const Entry entry = found->second;
+    counters.resights += 1u;
+    const uint32_t gap = frame >= entry.retire_frame ? frame - entry.retire_frame : 0u;
+    size_t bucket = 0u;
+    for (const uint32_t edge : kPoolResightGapEdges) {
+      if (gap >= edge) bucket += 1u;
+    }
+    counters.gap[bucket] += 1u;
+    if (entry.retainable) counters.resights_retainable += 1u;
+    if (entry.vertex_count != mesh.positions.size() || entry.triangle_count != mesh.triangle_count) {
+      counters.count_mismatch += 1u;
+    } else {
+      counters.revivable_tris += mesh.triangle_count;
+    }
+    by_signature.erase(found);
+    const auto shape_it = shape_count.find(entry.shape);
+    if (--shape_it->second == 0u) shape_count.erase(shape_it);
+  } else if (shape_count.count(shape) != 0u) {
+    counters.drift_near_misses += 1u;
+  }
 }
 
 // Chebyshev distance (largest per-axis gap) from a point to an axis-aligned box; 0 inside.
@@ -3465,6 +3584,7 @@ inline void QueuePoolMesh(uint64_t mesh_key, uint32_t vs_hash, const DrawRecord&
   request.mesh_key = mesh_key;
   request.vs_hash = vs_hash;
   request.last_frame = g_state.frame.load();
+  request.queued_frame = g_state.frame.load();
   request.draw = draw;
   request.from_indirect = from_indirect;
   const char* error = ResolvePoolMeshLayout(draw, &request.pos_offset, &request.pos_format, &request.uv_offset, &request.uv_format);
@@ -4457,6 +4577,7 @@ inline void CompactPool() {
     if (mesh.live_keys == 0u) {
       g_pool.stats.meshes_retired += 1u;
       retired_now += 1u;
+      g_pool.resight.Retire(mesh, g_state.frame.load());
       continue;
     }
     remap[mesh.mesh_id] = static_cast<uint32_t>(meshes.size());
@@ -4638,6 +4759,7 @@ inline const char* ApplyPoolMesh(
     }
     mesh_id = world_mesh.mesh_id;
     g_pool.meshes.push_back(std::move(world_mesh));
+    g_pool.resight.Sight(g_pool.meshes.back(), g_state.frame.load(), origin != nullptr ? g_state.frame.load() - origin->queued_frame : 0u);
     if (g_pool.meshes.back().admitted_by_retry) g_pool.stats.meshes_admitted_by_retry += 1u;
     g_pool.mesh_by_signature.emplace(signature, mesh_id);
     BumpPoolRevision(PoolRevisionSource::NewMesh);
@@ -5209,6 +5331,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
                                                           &mesh_mapped)
                              && mesh_mapped != nullptr);
   if (meshes_ok && !jobs.empty()) {
+    const PoolCpuTimer cpu_timer{&g_pool.cpu_capture_us};
     const auto* bytes = static_cast<const uint8_t*>(mesh_mapped);
     for (PoolMeshJob& job : jobs) {
       if (!job.queued) continue;
@@ -5344,6 +5467,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
           outcome = "read, uv copy next";
         }
       } else {
+        const PoolCpuTimer cpu_timer{&g_pool.cpu_capture_us};
         outcome = ApplyOrVerifyPoolMesh(request, job.mesh, PoolIndexSignature(job.indices), frame, &warning_lines);
       }
       if (log) {

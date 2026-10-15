@@ -18,6 +18,7 @@
 #include <thread>
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
+#include "json_check.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_live.hpp"
 
 using namespace reshade::api;
@@ -1145,13 +1146,18 @@ static void TestCacheEpisodes(Device* dev) {
     bvh::g_cache_diag.data.episode.start_time = now;
   }
   const std::vector<bvh::LiveTlasInstance> tlas = {TlasAt(1u, 10.f)};
-  bvh::RecordCacheTlasRebuild({}, tlas, true, 50u);
-  bvh::RecordCacheTlasRebuild({}, tlas, false, 120u);
-  bvh::RecordCacheTlasRebuild({}, tlas, true, 120u);
+  bvh::RecordCacheTlasRebuild({}, tlas, true, 50u, 1.f);
+  bvh::RecordCacheTlasRebuild({}, tlas, false, 120u, 2.f);
+  bvh::RecordCacheTlasRebuild({}, tlas, true, 120u, 4.f);
   {
     std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
     CHECK(bvh::g_cache_diag.data.episode.samples.size() == 1u && bvh::g_cache_diag.data.episode.samples[0].frame == 120u,
           "stale rebuild not credited, failed build not counted (%zu samples)", bvh::g_cache_diag.data.episode.samples.size());
+    CHECK(bvh::g_cache_diag.data.work.tlas_ms == 5.f && bvh::g_cache_diag.data.work.tlas_rebuilds == 2u
+              && bvh::g_cache_diag.data.episode.work.tlas_ms == 4.f && bvh::g_cache_diag.data.episode.work.tlas_rebuilds == 1u,
+          "TLAS ms since reset (%.2f, %llu) and episode (%.2f, %llu) count only replaced builds, the stale one at its time",
+          (double)bvh::g_cache_diag.data.work.tlas_ms, (unsigned long long)bvh::g_cache_diag.data.work.tlas_rebuilds,
+          (double)bvh::g_cache_diag.data.episode.work.tlas_ms, (unsigned long long)bvh::g_cache_diag.data.episode.work.tlas_rebuilds);
     CHECK(bvh::g_cache_diag.data.tlas.rebuilds == 2u && bvh::g_cache_diag.data.tlas.added == 2u, "two replaced TLAS builds counted, the failed one not");
     CHECK(bvh::g_cache_diag.data.episode.quiet_presents == 0u, "a rebuild restarts the settle count");
   }
@@ -1219,13 +1225,205 @@ static void TestCacheForcedDump(Device* dev) {
   bvh::ResetCacheDiagCounters();
 }
 
+static void TestCacheBucket() {
+  const float edges[3] = {1.f, 2.f, 4.f};
+  CHECK(bvh::CacheBucket(0.f, edges, 3u) == 0u, "value 0 goes to bucket 0");
+  CHECK(bvh::CacheBucket(1.f, edges, 3u) == 1u, "an edge value goes to the upper bucket");
+  CHECK(bvh::CacheBucket(std::nextafter(1.f, 0.f), edges, 3u) == 0u, "a value just below an edge stays in the lower bucket");
+  CHECK(bvh::CacheBucket(1e30f, edges, 3u) == 3u, "a huge value goes to the last bucket");
+}
+
+static bvh::WorldMesh ResightMesh(uint64_t signature, uint32_t triangles, float size) {
+  bvh::WorldMesh mesh;
+  mesh.signature = signature;
+  mesh.triangle_count = triangles;
+  mesh.positions.resize(8u);
+  mesh.verified = true;
+  for (int k = 0; k < 3; ++k) {
+    mesh.bbox_min[k] = -size;
+    mesh.bbox_max[k] = size;
+  }
+  return mesh;
+}
+
+static void ResetResight(bvh::PoolResightTracker* tracker) {
+  tracker->counters = bvh::PoolResightCounters{};
+  tracker->by_signature.clear();
+  tracker->shape_count.clear();
+  tracker->sweep_frame = 0u;
+  tracker->enabled.store(true);
+}
+
+static void TestPoolResightTracker() {
+  std::lock_guard lock(bvh::g_pool.mutex);
+  bvh::PoolResightTracker& tracker = bvh::g_pool.resight;
+  ResetResight(&tracker);
+  tracker.Retire(ResightMesh(0x7001u, 12u, 1.f), 10u);
+  tracker.Sight(ResightMesh(0x7001u, 13u, 1.f), 20u, 0u);
+  CHECK(tracker.counters.resights == 1u && tracker.counters.count_mismatch == 1u, "same signature, other triangle count: count mismatch");
+  ResetResight(&tracker);
+  tracker.Retire(ResightMesh(0x7002u, 12u, 1.f), 10u);
+  tracker.Sight(ResightMesh(0x7003u, 12u, 1.004f), 20u, 0u);
+  CHECK(tracker.counters.drift_near_misses == 1u && tracker.counters.resights == 0u, "bounds 1.000 vs 1.004, equal counts: drift near miss");
+  ResetResight(&tracker);
+  tracker.Retire(ResightMesh(0x7004u, 12u, 1.f), 10u);
+  tracker.Sight(ResightMesh(0x7005u, 12u, 1.02f), 20u, 0u);
+  CHECK(tracker.counters.drift_near_misses == 0u, "bounds 1.00 vs 1.02 are not a drift near miss");
+  ResetResight(&tracker);
+  tracker.enabled.store(false);
+  tracker.Retire(ResightMesh(0x7006u, 12u, 1.f), 10u);
+  tracker.Sight(ResightMesh(0x7006u, 12u, 1.f), 20u, 0u);
+  CHECK(tracker.counters.retired == 0u && tracker.counters.resights == 0u && tracker.counters.new_meshes == 0u, "disabled tracker counts nothing");
+  ResetResight(&tracker);
+  for (size_t k = 0; k < bvh::kPoolResightMax; ++k) tracker.Retire(ResightMesh(0x100000u + k, 12u, 1.f), 1000u);
+  tracker.Retire(ResightMesh(0x9000u, 12u, 1.f), 1000u);
+  CHECK(tracker.counters.retired_dropped == 1u, "a retirement at the cap is dropped (%llu)", (unsigned long long)tracker.counters.retired_dropped);
+  tracker.Retire(ResightMesh(0x9000u, 12u, 1.f), 1000u + bvh::kPoolResightHorizon + 1u);
+  CHECK(tracker.counters.expired == bvh::kPoolResightMax && tracker.by_signature.size() == 1u,
+        "retirements older than the horizon expire and the insert succeeds (%llu expired)", (unsigned long long)tracker.counters.expired);
+  ResetResight(&tracker);
+  const uint32_t gaps[10] = {0u, 119u, 120u, 599u, 600u, 1799u, 1800u, 3599u, 3600u, 100000u};
+  for (size_t k = 0; k < 10; ++k) {
+    tracker.Retire(ResightMesh(0x8000u + k, 12u, 1.f), 1000u);
+    tracker.Sight(ResightMesh(0x8000u + k, 12u, 1.f), 1000u + gaps[k], 0u);
+  }
+  const auto& g = tracker.counters.gap;
+  CHECK(g[0] == 2u && g[1] == 2u && g[2] == 2u && g[3] == 2u && g[4] == 2u && tracker.counters.resights == 10u,
+        "gap buckets {0,0,1,1,2,2,3,3,4,4} (%llu %llu %llu %llu %llu)", (unsigned long long)g[0], (unsigned long long)g[1],
+        (unsigned long long)g[2], (unsigned long long)g[3], (unsigned long long)g[4]);
+  ResetResight(&tracker);
+}
+
+static void TestCacheResight() {
+  bvh::ResetWorldPool();
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    ResetResight(&bvh::g_pool.resight);
+  }
+  auto& frame = falcom_world::g_state.frame;
+  frame.store(30000u);
+  AddMesh(0x61, BoxMesh(1.f));
+  RetireMesh(0x61);
+  frame.fetch_add(50u);
+  AddMesh(0x62, BoxMesh(1.f));
+  std::lock_guard lock(bvh::g_pool.mutex);
+  const bvh::PoolResightCounters& c = bvh::g_pool.resight.counters;
+  CHECK(c.retired == 1u && c.resights == 1u && c.revivable_tris == 12u && c.count_mismatch == 0u,
+        "re-sighting after retirement: retired %llu, resights %llu, revivable tris %llu, count mismatch %llu", (unsigned long long)c.retired,
+        (unsigned long long)c.resights, (unsigned long long)c.revivable_tris, (unsigned long long)c.count_mismatch);
+  CHECK(c.gap[0] == 1u && c.new_meshes == 2u && bvh::g_pool.resight.by_signature.empty(),
+        "gap of 50 presents in bucket 0, two new meshes, the re-sighted entry erased");
+}
+
+static void TestCacheTierBuckets() {
+  // TierGolden: meshes have no bbox (extent 0 -> bucket 0). Instance sides are 2 m; ratio = 2 / max(distance, 1).
+  // Distances: 49 (T0), 119 (T0), 199 (T1), 239 (T1), 299 (outside). Ratios 0.0408, 0.0168, 0.01005, 0.00837, 0.00669.
+  const bvh::CacheTiers t = TierGolden();
+  const bvh::CacheTier& t0 = t.tiers[0];
+  CHECK(t0.extent[0] == 2u && t0.ratio[3] == 1u && t0.ratio[4] == 1u && t0.ratio_tris[3] == 50u && t0.ratio_tris[4] == 100u,
+        "T0 extent and ratio buckets (%llu, %llu, %llu, %llu, %llu)", (unsigned long long)t0.extent[0], (unsigned long long)t0.ratio[3],
+        (unsigned long long)t0.ratio[4], (unsigned long long)t0.ratio_tris[3], (unsigned long long)t0.ratio_tris[4]);
+  const bvh::CacheTier& t1 = t.tiers[1];
+  CHECK(t1.ratio[2] == 1u && t1.ratio[3] == 1u && t1.ratio_tris[2] == 100u && t1.ratio_tris[3] == 100u, "T1 ratio buckets");
+  CHECK(t.tiers[3].ratio[2] == 1u && t.tiers[3].ratio_tris[2] == 50u, "outside tier ratio bucket");
+  CHECK(t.tiers[4].extent[0] == 1u, "no-instance tier: its mesh counted once in extent");
+  bool histogram_ok = true;
+  for (const bool check : t.hist_check) histogram_ok = histogram_ok && check;
+  CHECK(histogram_ok, "hist_check: extent sums = meshes, ratio sums = instances, ratio_tris sums = instance tris, every tier");
+  // Ratio exactly 0.005 at 200 m (side 1 m): an edge value goes to the upper bucket, bucket 2.
+  std::vector<bvh::WorldMesh> meshes(1);
+  meshes[0].triangle_count = 1u;
+  bvh::WorldInstance edge;
+  edge.mesh_id = 0u;
+  edge.bounds_min[0] = 200.f;
+  edge.bounds_max[0] = 201.f;
+  edge.bounds_min[1] = edge.bounds_min[2] = -0.5f;
+  edge.bounds_max[1] = edge.bounds_max[2] = 0.5f;
+  bvh::PoolRegion region;
+  for (int k = 0; k < 3; ++k) {
+    region.min[k] = -256.f;
+    region.max[k] = 256.f;
+  }
+  const float camera[3] = {};
+  bvh::CacheTiers at_edge;
+  bvh::ComputeCacheTiers({edge}, meshes, camera, region, {}, &at_edge);
+  CHECK(at_edge.tiers[1].ratio[2] == 1u && at_edge.tiers[1].ratio_tris[2] == 1u && at_edge.hist_check[1],
+        "ratio 1/200 = 0.005 at 200 m goes to bucket 2");
+}
+
+static void TestCacheEpisodeWork() {
+  bvh::CacheEpisode e;
+  e.open = true;
+  e.start_frame = 100u;
+  const uint32_t frames[3] = {105u, 110u, 120u};
+  const uint64_t fresh[3] = {0u, 8u, 10u};
+  for (int i = 0; i < 3; ++i) {
+    bvh::CacheSample& s = e.samples.emplace_back();
+    s.frame = frames[i];
+    s.tlas_fresh = fresh[i];
+    s.work.blas_ms = static_cast<float>(i + 1);
+  }
+  bvh::FinishCacheEpisode(&e, "settled");
+  CHECK(e.t80_valid && e.t80_frames == 10u && e.t80_work.blas_ms == 2.f,
+        "t80 work is the work of the t80 sample (frames %u, blas %.1f)", e.t80_frames, (double)e.t80_work.blas_ms);
+}
+
+static void TestCacheCaptureTime(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::g_cache_diag.enabled.store(true);
+  bvh::g_pool.cpu_capture_us.store(2500u);
+  bvh::UpdateCacheDiag(dev);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    CHECK(bvh::g_cache_diag.data.work.capture_ms == 2.5f && bvh::g_pool.cpu_capture_us.load() == 0u,
+          "2500 us of capture CPU gives 2.5 ms and clears the counter (%.3f ms)", (double)bvh::g_cache_diag.data.work.capture_ms);
+  }
+  bvh::ResetCacheDiagCounters();
+}
+
+static void TestCacheDiagJson(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  const std::filesystem::path path = bvh::WriteCacheDiagFile(bvh::GetBvhDeviceData(dev), 1234u);
+  std::ifstream in(path, std::ios::binary);
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  CHECK(JsonError(text).empty(), "world_cache_diag.json is valid JSON: %s", JsonError(text).c_str());
+  const char* keys[] = {"\"schema\": 2", "\"resight\": {", "\"gap\": [", "\"capture\": {", "\"extent_buckets\": [",
+                        "\"ratio_buckets\": [", "\"ratio_tris\": [", "\"hist_check\": ", "\"ms_sum\": ", "\"t80_work\": ", "\"work\": "};
+  for (const char* key : keys) CHECK(text.find(key) != std::string::npos, "json has %s", key);
+  bvh::ResetCacheDiagCounters();
+}
+
+static void TestCacheBlasWhileOff(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  bvh::g_cache_diag.enabled.store(false);
+  data->live.blas_builds += 5u;  // BLAS builds while the diagnostics are off
+  data->live.blas_build_ms_sum += 3.f;
+  bvh::UpdateCacheDiag(dev);  // off: the counters are refreshed, nothing is attributed
+  bvh::g_cache_diag.enabled.store(true);
+  bvh::UpdateCacheDiag(dev);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    CHECK(bvh::g_cache_diag.data.work.blas_builds == 0u && bvh::g_cache_diag.data.work.blas_ms == 0.f,
+          "BLAS built while off is not attributed to the first enabled present (%llu builds, %.2f ms)",
+          (unsigned long long)bvh::g_cache_diag.data.work.blas_builds, (double)bvh::g_cache_diag.data.work.blas_ms);
+  }
+  bvh::ResetCacheDiagCounters();
+}
+
 static void TestCacheLines() {
   bvh::ResetCacheDiagCounters();
   std::vector<std::string> lines = bvh::CacheDiagLines(nullptr);
-  CHECK(lines.size() == 5u && lines[0].rfind("Cache diagnostics (cache-diag-0 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
+  CHECK(lines.size() == 8u && lines[0].rfind("Cache diagnostics (cache-diag-1 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
         "header line (%zu lines)", lines.size());
   CHECK(HasLine(lines, "TLAS changes: rebuilds 0 (empty 0), added 0, removed 0, moved 0, nearest changed -, nearest add/remove -; by tier of nearest add/remove: T0 0, T1 0, T2 0, none 0"),
         "TLAS line");
+  CHECK(HasLine(lines, "Re-sightings: retired 0 (retainable 0, 0 tris), new meshes 0, re-sighted 0 (0.0 %), retainable 0; near misses: count mismatch 0 (0.0 %), drift 0; tracked 0 (dropped 0, expired 0)"),
+        "re-sighting line");
+  CHECK(HasLine(lines, "Re-sighting gap (presents since retirement): <120 0, 120-600 0, 600-1800 0, 1800-3600 0, >=3600 0; within hold (<1800) 0 (0.0 % of new meshes); triangles not rebuilt (counts equal) 0"),
+        "re-sighting gap line");
+  CHECK(HasLine(lines, "Time since reset: TLAS rebuilds 0, avg 0.00 ms, max 0.00 ms; mesh capture CPU 0.00 ms over 0 meshes (decode + apply; GPU read-back wait not CPU), queue-to-applied wait avg 0.0, max 0 presents"),
+        "time since reset line");
   CHECK(HasLine(lines, "Episode: none yet (starts at a map change, a pool reset or the first admitted instance)"), "episode line before any episode");
   CHECK(HasLine(lines, "Lighting gap: no data now; dark 0 of 0 presents, dark runs 0, longest dark 0, longest lit 0 presents"), "lighting line");
   CHECK(HasLine(lines, "Last file: none written in this session"), "last file line");
@@ -1298,11 +1496,17 @@ struct CacheRun {
   uint64_t triangles_uploaded = 0u;
   uint64_t blas_builds = 0u;
   uint64_t blas_built_triangles = 0u;
+  uint64_t resights = 0u;
 };
 
-static CacheRun RunCacheScenario(bool enabled) {
+static CacheRun RunCacheScenario(bool enabled, bool resight = false) {
   bvh::g_cache_diag.enabled.store(enabled);
   bvh::ResetWorldPool();
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    ResetResight(&bvh::g_pool.resight);
+    bvh::g_pool.resight.enabled.store(enabled);
+  }
   g_obs_frame = 100000u;
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   auto& frame = falcom_world::g_state.frame;
@@ -1328,6 +1532,10 @@ static CacheRun RunCacheScenario(bool enabled) {
   for (int i = 0; i < 20; ++i) present();
   RetireMesh(0x52);
   for (int i = 0; i < 20; ++i) present();
+  if (resight) {
+    AddMesh(0x53, BoxMesh(1.f));  // same content as 0x52: a re-sighting
+    for (int i = 0; i < 30; ++i) present();
+  }
   CacheRun run;
   run.tlas_instances = data->tlas_instances_cpu;
   run.tlas_nodes = data->tlas_nodes_cpu;
@@ -1340,6 +1548,10 @@ static CacheRun RunCacheScenario(bool enabled) {
   run.blas_built_triangles = data->live.blas_built_triangles;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
+    run.resights = bvh::g_pool.resight.counters.resights;
+  }
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
     run.revision_delta = bvh::g_pool.revision - revision_start;
   }
   bvh::DestroyBvhDeviceData(&dev);
@@ -1347,10 +1559,34 @@ static CacheRun RunCacheScenario(bool enabled) {
   return run;
 }
 
+static uint64_t CacheRunFingerprint(const CacheRun& run) {
+  uint64_t h = 14695981039346656037ull;
+  HashBytes(&h, run.tlas_instances.data(), run.tlas_instances.size() * sizeof(bvh::WorldInstanceGPU));
+  HashBytes(&h, run.tlas_nodes.data(), run.tlas_nodes.size() * sizeof(bvh::BVHNodeGPU));
+  HashBytes(&h, run.mesh_descriptors.data(), run.mesh_descriptors.size() * sizeof(bvh::WorldMeshGPU));
+  HashBytes(&h, &run.tlas_rebuilds, sizeof run.tlas_rebuilds);
+  HashBytes(&h, &run.resident, sizeof run.resident);
+  HashBytes(&h, &run.meshes_uploaded, sizeof run.meshes_uploaded);
+  HashBytes(&h, &run.revision_delta, sizeof run.revision_delta);
+  HashBytes(&h, &run.blas_builds, sizeof run.blas_builds);
+  return h;
+}
+
 static void TestCacheOnOff() {
   const CacheRun on = RunCacheScenario(true);
   const CacheRun off = RunCacheScenario(false);
   bvh::g_cache_diag.enabled.store(true);
+  CHECK(CacheRunFingerprint(on) == 0x55593b70e070e7feull, "cache fingerprint ON equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(on));
+  CHECK(CacheRunFingerprint(off) == 0x55593b70e070e7feull, "cache fingerprint OFF equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(off));
+  const CacheRun on_resight = RunCacheScenario(true, true);
+  const CacheRun off_resight = RunCacheScenario(false, true);
+  bvh::g_cache_diag.enabled.store(true);
+  CHECK(on_resight.resights >= 1u && off_resight.resights == 0u, "resight scenario: ON re-sights (%llu), OFF does not (%llu)",
+        (unsigned long long)on_resight.resights, (unsigned long long)off_resight.resights);
+  CHECK(SameBytes(on_resight.tlas_instances, off_resight.tlas_instances) && SameBytes(on_resight.tlas_nodes, off_resight.tlas_nodes)
+            && SameBytes(on_resight.mesh_descriptors, off_resight.mesh_descriptors) && on_resight.revision_delta == off_resight.revision_delta
+            && on_resight.blas_builds == off_resight.blas_builds,
+        "resight scenario: TLAS, descriptors, revision and BLAS builds identical with diagnostics on/off");
   CHECK(on.tlas_instances.size() > 0u, "scenario builds a TLAS (%zu instances)", on.tlas_instances.size());
   CHECK(SameBytes(on.tlas_instances, off.tlas_instances), "TLAS instances byte-identical with diagnostics on/off");
   CHECK(SameBytes(on.tlas_nodes, off.tlas_nodes), "TLAS nodes byte-identical with diagnostics on/off");
@@ -2363,6 +2599,14 @@ int main() {
   TestCacheEpisodes(&dev);
   TestCacheForcedDump(&dev);
   TestCacheLines();
+  TestCacheBucket();
+  TestPoolResightTracker();
+  TestCacheResight();
+  TestCacheTierBuckets();
+  TestCacheEpisodeWork();
+  TestCacheCaptureTime(&dev);
+  TestCacheDiagJson(&dev);
+  TestCacheBlasWhileOff(&dev);
   TestCacheOnOff();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);

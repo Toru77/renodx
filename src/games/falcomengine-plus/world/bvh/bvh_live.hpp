@@ -787,7 +787,7 @@ inline void RebuildLiveTlas(
     // counted, a failed build (not replaced) counts nothing.
     stats.tlas_ms_last = LiveElapsedMs(start);
     stats.tlas_ms_max = (std::max)(stats.tlas_ms_max, stats.tlas_ms_last);
-    RecordCacheTlasRebuild(previous_info, data->tlas_info, replaced, frame);  // after the timing: its cost is not TLAS time
+    RecordCacheTlasRebuild(previous_info, data->tlas_info, replaced, frame, stats.tlas_ms_last);  // after the timing: its cost is not TLAS time
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolTlasTiming& timing = g_pool.tlas_timing;
     timing.rebuilds += 1u;
@@ -1900,10 +1900,16 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
     data->live.blas_build_ms_sum = 0.f;
     data->live.blas_build_ms_max = 0.f;
     ResetCacheDiagCounters();
+    std::lock_guard<std::mutex> pool_lock(g_pool.mutex);
+    g_pool.resight.counters = PoolResightCounters{};
+    g_pool.resight.by_signature.clear();
+    g_pool.resight.shape_count.clear();
+    g_pool.resight.sweep_frame = 0u;
   }
   PoolStageScope stage("cache diag");
   const uint32_t frame = g_state.frame.load();
   const bool enabled = g_cache_diag.enabled.load(std::memory_order_relaxed);
+  g_pool.resight.enabled.store(enabled);
   const bool force_tiers = g_cache_diag.force_tiers_requested.exchange(false, std::memory_order_relaxed);
   // Camera and region take g_state.mutex: read before the pool lock.
   float camera[3] = {};
@@ -1934,6 +1940,8 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
   uint32_t pool_fresh_from = 0u;
   const char* pool_reason = "";
   uint64_t admitted = 0u;
+  PoolResightCounters resight;
+  size_t resight_tracked = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     serial = g_pool.episode_serial;
@@ -1941,8 +1949,11 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
     pool_fresh_from = g_pool.episode_fresh_from;
     pool_reason = g_pool.episode_reason;
     admitted = g_pool.instances.size();
+    resight = g_pool.resight.counters;
+    resight_tracked = g_pool.resight.by_signature.size();
     if (sample) ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
   }
+  const uint64_t capture_us = g_pool.cpu_capture_us.exchange(0u, std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
   const uint32_t previous_serial = d.serial_seen;
@@ -1954,6 +1965,10 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
   }
   if (!enabled) {
     d.lighting = CacheLighting{};  // capture off: the lighting gap starts again when it is switched on
+    d.prev.blas_builds = data->live.blas_builds;  // builds while off are not attributed to the first present on
+    d.prev.blas_ms = data->live.blas_build_ms_sum;
+    d.prev.capture_meshes = resight.capture_meshes;
+    d.prev.capture_wait_sum = resight.capture_wait_sum;
     return;
   }
   d.presents += 1u;
@@ -1976,6 +1991,29 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
     d.episode.quiet_presents += 1u;
     if (d.episode.quiet_presents >= kCacheSettlePresents) FinishCacheEpisode(&d.episode, "settled");
   }
+  d.resight = resight;
+  d.resight_tracked = resight_tracked;
+  const uint64_t blas_builds = data->live.blas_builds;
+  const float blas_ms = data->live.blas_build_ms_sum;
+  CacheWork delta;  // BLAS counters are cleared by a device destroy (now < previous: the delta is now)
+  delta.blas_builds = blas_builds < d.prev.blas_builds ? blas_builds : blas_builds - d.prev.blas_builds;
+  delta.blas_ms = blas_ms < d.prev.blas_ms ? blas_ms : blas_ms - d.prev.blas_ms;
+  delta.capture_ms = static_cast<float>(capture_us) / 1000.f;
+  delta.capture_meshes = resight.capture_meshes - d.prev.capture_meshes;
+  delta.capture_wait_sum = resight.capture_wait_sum - d.prev.capture_wait_sum;
+  d.prev.blas_builds = blas_builds;
+  d.prev.blas_ms = blas_ms;
+  d.prev.capture_meshes = resight.capture_meshes;
+  d.prev.capture_wait_sum = resight.capture_wait_sum;
+  const auto add = [&delta](CacheWork* work) {
+    work->blas_ms += delta.blas_ms;
+    work->capture_ms += delta.capture_ms;
+    work->blas_builds += delta.blas_builds;
+    work->capture_meshes += delta.capture_meshes;
+    work->capture_wait_sum += delta.capture_wait_sum;
+  };
+  add(&d.work);
+  if (d.episode.open) add(&d.episode.work);
 }
 
 }  // namespace falcom_world::bvh

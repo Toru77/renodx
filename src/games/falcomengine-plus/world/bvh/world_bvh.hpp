@@ -547,7 +547,7 @@ inline void DrawBvhPanel() {
 
   // Phase 0 cache diagnostics (diagnostic only: no rendering change). Every result is shown here, copied to the
   // clipboard and written to the pool folder.
-  ImGui::SeparatorText("Cache diagnostics (Phase 0, diagnostic only: no rendering change)");
+  ImGui::SeparatorText("Cache diagnostics (Phase 0 and 0b, diagnostic only: no rendering change)");
   bool collect = g_cache_diag.enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Collect cache diagnostics", &collect)) g_cache_diag.enabled.store(collect, std::memory_order_relaxed);
   for (const std::string& line : CacheDiagLines(data)) ImGui::TextUnformatted(line.c_str());

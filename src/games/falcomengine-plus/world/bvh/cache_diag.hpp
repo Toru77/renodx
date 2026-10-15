@@ -20,7 +20,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <limits>
+#include <numeric>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -39,6 +41,15 @@ inline constexpr float kCacheHistogramEdges[9] = {16.f, 32.f, 64.f, 96.f, 128.f,
 inline constexpr size_t kCacheHistogramBuckets = 10u;  // the last bucket is open (>= 512 m)
 inline constexpr const char* kCacheHistogramLabels[kCacheHistogramBuckets] = {
     "<16", "16-32", "32-64", "64-96", "96-128", "128-192", "192-256", "256-384", "384-512", ">=512"};
+// Object-space extent (largest bbox side, m) of a mesh and its ratio to the distance (largest instance side / max(distance, 1 m)).
+inline constexpr float kCacheExtentEdges[8] = {0.25f, 0.5f, 1.f, 2.f, 4.f, 8.f, 16.f, 32.f};
+inline constexpr size_t kCacheExtentBuckets = 9u;
+inline constexpr const char* kCacheExtentLabels[kCacheExtentBuckets] = {
+    "<0.25", "0.25-0.5", "0.5-1", "1-2", "2-4", "4-8", "8-16", "16-32", ">=32"};
+inline constexpr float kCacheRatioEdges[4] = {0.0025f, 0.005f, 0.01f, 0.02f};
+inline constexpr size_t kCacheRatioBuckets = 5u;
+inline constexpr const char* kCacheRatioLabels[kCacheRatioBuckets] = {"<0.0025", "0.0025-0.005", "0.005-0.01", "0.01-0.02", ">=0.02"};
+inline constexpr const char* kCacheGapLabels[kPoolResightGapBuckets] = {"<120", "120-600", "600-1800", "1800-3600", ">=3600"};
 inline constexpr uint32_t kCacheSampleInterval = 30u;   // presents between tier computations
 inline constexpr uint32_t kCacheSettlePresents = 300u;  // presents without a TLAS rebuild that settle an episode
 inline constexpr size_t kCacheMaxSamples = 256u;        // TLAS rebuild samples kept per episode
@@ -58,9 +69,10 @@ inline size_t CacheInstanceTier(float distance, bool in_region) {
   return distance < kCacheTierEdges[1] ? 1u : 2u;
 }
 
-inline size_t CacheHistogramBucket(float distance) {
+// Bucket of a value: the number of edges <= value (an edge value goes to the upper bucket); edge_count + 1 buckets.
+inline size_t CacheBucket(float value, const float* edges, size_t edge_count) {
   size_t bucket = 0u;
-  while (bucket + 1u < kCacheHistogramBuckets && distance >= kCacheHistogramEdges[bucket]) ++bucket;
+  while (bucket < edge_count && value >= edges[bucket]) ++bucket;
   return bucket;
 }
 
@@ -74,6 +86,9 @@ struct CacheTier {
   uint64_t resident_meshes = 0u;
   uint64_t resident_tris = 0u;   // BLAS leaves of the live slot
   uint64_t resident_bytes = 0u;  // LiveSlotBytes of the live slot
+  uint64_t extent[kCacheExtentBuckets] = {};    // meshes, in the tier of their nearest instance
+  uint64_t ratio[kCacheRatioBuckets] = {};      // instances
+  uint64_t ratio_tris[kCacheRatioBuckets] = {};  // instance triangles
 };
 
 // A resident mesh (live slot), by uid, built outside the pool lock.
@@ -94,6 +109,7 @@ struct CacheTiers {
   uint64_t sum_tris = 0u;
   uint64_t sum_bytes = 0u;
   bool self_check = false;  // tier sums equal the pool totals
+  bool hist_check[kCacheTierCount] = {};  // per tier: extent sum = meshes, ratio sums = instances and instance tris
 };
 
 // Caller holds g_pool.mutex. `camera` is the pool camera (zeros when unknown); `resident` by mesh uid.
@@ -110,7 +126,12 @@ inline void ComputeCacheTiers(const std::vector<WorldInstance>& instances, const
     const size_t tier = CacheInstanceTier(distance, PoolInstanceInRegion(instance, region));
     out->tiers[tier].instances += 1u;
     out->tiers[tier].instance_tris += mesh.triangle_count;
-    out->histogram[CacheHistogramBucket(distance)] += 1u;
+    out->histogram[CacheBucket(distance, kCacheHistogramEdges, std::size(kCacheHistogramEdges))] += 1u;
+    float side = 0.f;
+    for (int i = 0; i < 3; ++i) side = std::max(side, instance.bounds_max[i] - instance.bounds_min[i]);
+    const size_t ratio = CacheBucket(side / std::max(distance, 1.f), kCacheRatioEdges, std::size(kCacheRatioEdges));
+    out->tiers[tier].ratio[ratio] += 1u;
+    out->tiers[tier].ratio_tris[ratio] += mesh.triangle_count;
     if (distance < nearest[instance.mesh_id]) {
       nearest[instance.mesh_id] = distance;
       nearest_tier[instance.mesh_id] = tier;
@@ -123,6 +144,9 @@ inline void ComputeCacheTiers(const std::vector<WorldInstance>& instances, const
     row.meshes += 1u;
     row.pool_tris += mesh.triangle_count;
     row.pool_bytes += bytes;
+    float extent = 0.f;
+    for (int i = 0; i < 3; ++i) extent = std::max(extent, mesh.bbox_max[i] - mesh.bbox_min[i]);
+    row.extent[CacheBucket(extent, kCacheExtentEdges, std::size(kCacheExtentEdges))] += 1u;
     const auto found = resident.find(mesh.uid);
     if (found != resident.end()) {
       row.resident_meshes += 1u;
@@ -142,6 +166,12 @@ inline void ComputeCacheTiers(const std::vector<WorldInstance>& instances, const
   }
   out->self_check = out->sum_instances == out->instances && out->sum_meshes == out->meshes
                     && out->sum_tris == out->pool_tris && out->sum_bytes == out->pool_bytes;
+  for (size_t k = 0; k < kCacheTierCount; ++k) {
+    const CacheTier& row = out->tiers[k];
+    out->hist_check[k] = std::accumulate(std::begin(row.extent), std::end(row.extent), uint64_t{0}) == row.meshes
+                         && std::accumulate(std::begin(row.ratio), std::end(row.ratio), uint64_t{0}) == row.instances
+                         && std::accumulate(std::begin(row.ratio_tris), std::end(row.ratio_tris), uint64_t{0}) == row.instance_tris;
+  }
 }
 
 // What one TLAS rebuild changed, by instance id. Wind instances are left out (their pose is swayed every present).
@@ -204,6 +234,19 @@ struct CacheTlasStats {
   float nearest_changed_m = -1.f;     // over the session, -1 = none
   float nearest_add_remove_m = -1.f;
   uint64_t by_tier[kCacheTlasTierCount] = {};  // rebuilds by tier of the nearest add or remove
+  float ms_sum = 0.f;  // TLAS rebuild CPU time (since reset)
+  float ms_max = 0.f;
+};
+
+// Cost of the work done while an episode (or the session since reset) runs: BLAS builds, TLAS rebuilds and mesh capture CPU.
+struct CacheWork {
+  float blas_ms = 0.f;
+  float tlas_ms = 0.f;
+  float capture_ms = 0.f;
+  uint64_t blas_builds = 0u;
+  uint64_t tlas_rebuilds = 0u;
+  uint64_t capture_meshes = 0u;
+  uint64_t capture_wait_sum = 0u;  // presents from queue to applied
 };
 
 struct CacheSample {
@@ -212,6 +255,7 @@ struct CacheSample {
   uint64_t tlas_instances = 0u;
   uint64_t tlas_fresh = 0u;    // TLAS instances last seen at or after the episode's fresh frame
   uint64_t pool_admitted = 0u;
+  CacheWork work;  // episode work at this sample
 };
 
 struct CacheEpisode {
@@ -229,6 +273,8 @@ struct CacheEpisode {
   uint32_t t80_frames = 0u;
   float t80_ms = 0.f;
   uint64_t final_fresh = 0u;
+  CacheWork work;      // episode work so far
+  CacheWork t80_work;  // episode work at t80 (valid with t80_valid)
 };
 
 // Ends an episode. t80 = the first sample whose fresh count reaches kCacheT80Fraction of the final one (the last sample).
@@ -244,6 +290,7 @@ inline void FinishCacheEpisode(CacheEpisode* episode, const char* state) {
     episode->t80_valid = true;
     episode->t80_frames = sample.frame - episode->start_frame;
     episode->t80_ms = sample.ms;
+    episode->t80_work = sample.work;
     return;
   }
 }
@@ -286,6 +333,10 @@ struct CacheDiagData {
   CacheTlasStats tlas;
   CacheEpisode episode;
   CacheLighting lighting;
+  PoolResightCounters resight;  // pool re-sightings, copied at each present
+  uint64_t resight_tracked = 0u;  // retirements held by the tracker
+  CacheWork work;                 // since reset
+  CacheWork prev;                 // cumulative BLAS and capture counters at the last present (cleared by reset)
   std::string last_path;
   uint64_t last_bytes = 0u;
   std::string last_result;  // the last panel action's result line
@@ -319,7 +370,7 @@ inline void ResetCacheDiagCounters() {
 // Caller holds no lock. `before` is the TLAS this build replaces (moved out before the replacement);
 // `after` is the TLAS in place now. `replaced` is false for a failed build, which counts nothing.
 inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, const std::vector<LiveTlasInstance>& after,
-                                   bool replaced, uint32_t frame) {
+                                   bool replaced, uint32_t frame, float ms) {
   if (!replaced || !g_cache_diag.enabled.load(std::memory_order_relaxed)) return;
   float camera[3] = {};
   PoolCameraPosition(camera);
@@ -348,6 +399,10 @@ inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, 
   }
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
+  d.tlas.ms_sum += ms;
+  d.tlas.ms_max = std::max(d.tlas.ms_max, ms);
+  d.work.tlas_ms += ms;
+  d.work.tlas_rebuilds += 1u;
   if (after.empty()) {
     d.tlas.empty += 1u;
   } else {
@@ -367,13 +422,17 @@ inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, 
   }
   if (!d.episode.open) return;
   d.episode.quiet_presents = 0u;
-  if (frame < d.episode.start_frame || d.episode.samples.size() >= kCacheMaxSamples) return;
+  if (frame < d.episode.start_frame) return;
+  d.episode.work.tlas_ms += ms;
+  d.episode.work.tlas_rebuilds += 1u;
+  if (d.episode.samples.size() >= kCacheMaxSamples) return;
   CacheSample& sample = d.episode.samples.emplace_back();
   sample.frame = frame;
   sample.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - d.episode.start_time).count();
   sample.tlas_instances = after.size();
   sample.tlas_fresh = fresh;
   sample.pool_admitted = admitted;
+  sample.work = d.episode.work;
 }
 
 template <typename... Args>
@@ -424,6 +483,52 @@ inline std::vector<std::string> CacheDiagLines(const BvhDeviceData* data) {
       t.nearest_changed_m < 0.f ? "-" : CacheFormat("%.1f m", t.nearest_changed_m).c_str(),
       t.nearest_add_remove_m < 0.f ? "-" : CacheFormat("%.1f m", t.nearest_add_remove_m).c_str(), t.by_tier[0],
       t.by_tier[1], t.by_tier[2], t.by_tier[kCacheTlasTierNone]));
+  const PoolResightCounters& r = d.resight;
+  const CacheWork& w = d.work;
+  lines.push_back(CacheFormat(
+      "Re-sightings: retired %llu (retainable %llu, %llu tris), new meshes %llu, re-sighted %llu (%.1f %%), retainable %llu; near misses: count mismatch %llu (%.1f %%), drift %llu; tracked %llu (dropped %llu, expired %llu)",
+      r.retired, r.retired_retainable, r.retired_tris, r.new_meshes, r.resights,
+      r.new_meshes != 0u ? 100.0 * r.resights / r.new_meshes : 0.0, r.resights_retainable, r.count_mismatch,
+      r.resights != 0u ? 100.0 * r.count_mismatch / r.resights : 0.0, r.drift_near_misses, d.resight_tracked, r.retired_dropped, r.expired));
+  std::string gap = "Re-sighting gap (presents since retirement): ";
+  for (size_t b = 0; b < kPoolResightGapBuckets; ++b) gap += CacheFormat("%s%s %llu", b != 0u ? ", " : "", kCacheGapLabels[b], r.gap[b]);
+  lines.push_back(gap + CacheFormat("; within hold (<1800) %llu (%.1f %% of new meshes); triangles not rebuilt (counts equal) %llu",
+                                    r.gap[0] + r.gap[1] + r.gap[2], r.new_meshes != 0u ? 100.0 * (r.gap[0] + r.gap[1] + r.gap[2]) / r.new_meshes : 0.0,
+                                    r.revivable_tris));
+  lines.push_back(CacheFormat(
+      "Time since reset: TLAS rebuilds %llu, avg %.2f ms, max %.2f ms; mesh capture CPU %.2f ms over %llu meshes (decode + apply; GPU read-back wait not CPU), queue-to-applied wait avg %.1f, max %llu presents",
+      w.tlas_rebuilds, w.tlas_rebuilds != 0u ? static_cast<double>(t.ms_sum) / static_cast<double>(w.tlas_rebuilds) : 0.0,
+      static_cast<double>(t.ms_max), static_cast<double>(w.capture_ms), r.capture_meshes,
+      r.capture_meshes != 0u ? static_cast<double>(r.capture_wait_sum) / static_cast<double>(r.capture_meshes) : 0.0, r.capture_wait_max));
+  if (d.tiers_valid) {
+    for (size_t k = 0; k < kCacheTlasTierNone; ++k) {
+      const CacheTier& row = d.tiers.tiers[k];
+      std::string size = CacheFormat("T%zu size: mesh extent (m) ", k);
+      for (size_t b = 0; b < kCacheExtentBuckets; ++b) size += CacheFormat("%s%s %llu", b != 0u ? ", " : "", kCacheExtentLabels[b], row.extent[b]);
+      size += "; extent/distance ";
+      for (size_t b = 0; b < kCacheRatioBuckets; ++b) size += CacheFormat("%s%s %llu", b != 0u ? ", " : "", kCacheRatioLabels[b], row.ratio[b]);
+      size += " (tris ";
+      for (size_t b = 0; b < kCacheRatioBuckets; ++b) size += CacheFormat("%s%llu", b != 0u ? ", " : "", row.ratio_tris[b]);
+      lines.push_back(size + ")");
+    }
+    const bool hist_pass = std::all_of(std::begin(d.tiers.hist_check), std::end(d.tiers.hist_check), [](bool pass) { return pass; });
+    lines.push_back(std::string("Histogram self-check: ") + (hist_pass ? "PASS" : "FAIL"));
+  }
+  if (std::strcmp(d.episode.state, "none") != 0) {
+    const CacheWork& ew = d.episode.work;
+    const double t80_ms = static_cast<double>(d.episode.t80_ms);
+    const CacheWork& tw = d.episode.t80_work;
+    const std::string at_t80 = d.episode.t80_valid
+        ? CacheFormat("at t80 (+%u frames / %.1f ms): BLAS %.2f ms (%.1f %%), TLAS %.2f ms (%.1f %%), capture %.2f ms (%.1f %%)",
+                      d.episode.t80_frames, t80_ms, static_cast<double>(tw.blas_ms), 100.0 * tw.blas_ms / t80_ms, static_cast<double>(tw.tlas_ms),
+                      100.0 * tw.tlas_ms / t80_ms, static_cast<double>(tw.capture_ms), 100.0 * tw.capture_ms / t80_ms)
+        : std::string("at t80 not reached");
+    lines.push_back(CacheFormat(
+        "Episode work (so far): BLAS %.2f ms (%llu builds), TLAS %.2f ms (%llu rebuilds), capture CPU %.2f ms (%llu meshes, wait avg %.1f presents); %s",
+        static_cast<double>(ew.blas_ms), ew.blas_builds, static_cast<double>(ew.tlas_ms), ew.tlas_rebuilds, static_cast<double>(ew.capture_ms),
+        ew.capture_meshes, ew.capture_meshes != 0u ? static_cast<double>(ew.capture_wait_sum) / static_cast<double>(ew.capture_meshes) : 0.0,
+        at_t80.c_str()));
+  }
   if (data != nullptr) {
     const LiveBvhStats& live = data->live;
     lines.push_back(CacheFormat("BLAS builds %llu (%llu triangles built), %.2f ms avg, %.2f ms max (since reset)", live.blas_builds,
@@ -466,16 +571,52 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
     d = g_cache_diag.data;
   }
   std::ostringstream out;
-  out << "{\n  \"schema\": 1,\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n  \"frame\": " << frame << ",\n";
+  out << "{\n  \"schema\": 2,\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n  \"frame\": " << frame << ",\n";
   out << "  \"lines\": [";
   for (size_t i = 0; i < lines.size(); ++i) out << (i != 0u ? ", " : "") << "\"" << PoolJsonEscape(lines[i]) << "\"";
-  out << "],\n  \"tiers\": [";
+  const auto uint_array = [&out](const uint64_t* values, size_t count) {
+    out << "[";
+    for (size_t i = 0; i < count; ++i) out << (i != 0u ? ", " : "") << values[i];
+    out << "]";
+  };
+  const auto label_array = [&out](const char* const* labels, size_t count) {
+    out << "[";
+    for (size_t i = 0; i < count; ++i) out << (i != 0u ? ", " : "") << "\"" << labels[i] << "\"";
+    out << "]";
+  };
+  const auto work_json = [&out](const CacheWork& w) {
+    out << "{\"blas_ms\": " << PoolJsonFloat{w.blas_ms} << ", \"blas_builds\": " << w.blas_builds << ", \"tlas_ms\": " << PoolJsonFloat{w.tlas_ms}
+        << ", \"tlas_rebuilds\": " << w.tlas_rebuilds << ", \"capture_ms\": " << PoolJsonFloat{w.capture_ms}
+        << ", \"capture_meshes\": " << w.capture_meshes << ", \"capture_wait_sum\": " << w.capture_wait_sum << "}";
+  };
+  const PoolResightCounters& r = d.resight;
+  out << "],\n  \"resight\": {\"retired\": " << r.retired << ", \"retired_retainable\": " << r.retired_retainable
+      << ", \"retired_tris\": " << r.retired_tris << ", \"retired_dropped\": " << r.retired_dropped << ", \"expired\": " << r.expired
+      << ", \"new_meshes\": " << r.new_meshes << ", \"new_tris\": " << r.new_tris << ", \"resights\": " << r.resights
+      << ", \"resights_retainable\": " << r.resights_retainable << ", \"count_mismatch\": " << r.count_mismatch
+      << ", \"revivable_tris\": " << r.revivable_tris << ", \"drift_near_misses\": " << r.drift_near_misses << ", \"tracked\": " << d.resight_tracked
+      << ", \"gap\": [";
+  for (size_t b = 0; b < kPoolResightGapBuckets; ++b) {
+    out << (b != 0u ? ", " : "") << "{\"bucket\": \"" << kCacheGapLabels[b] << "\", \"count\": " << r.gap[b] << "}";
+  }
+  out << "]},\n  \"capture\": {\"cpu_ms\": " << PoolJsonFloat{d.work.capture_ms} << ", \"meshes\": " << r.capture_meshes
+      << ", \"wait_sum\": " << r.capture_wait_sum << ", \"wait_max\": " << r.capture_wait_max << "},\n  \"extent_buckets\": ";
+  label_array(kCacheExtentLabels, kCacheExtentBuckets);
+  out << ",\n  \"ratio_buckets\": ";
+  label_array(kCacheRatioLabels, kCacheRatioBuckets);
+  out << ",\n  \"tiers\": [";
   for (size_t t = 0; t < kCacheTierCount; ++t) {
     const CacheTier& row = d.tiers.tiers[t];
     out << (t != 0u ? ", " : "") << "{\"tier\": \"" << PoolJsonEscape(kCacheTierNames[t]) << "\", \"instances\": " << row.instances
         << ", \"instance_tris\": " << row.instance_tris << ", \"meshes\": " << row.meshes << ", \"pool_tris\": " << row.pool_tris
         << ", \"pool_bytes\": " << row.pool_bytes << ", \"resident_meshes\": " << row.resident_meshes
-        << ", \"resident_tris\": " << row.resident_tris << ", \"resident_bytes\": " << row.resident_bytes << "}";
+        << ", \"resident_tris\": " << row.resident_tris << ", \"resident_bytes\": " << row.resident_bytes << ", \"extent\": ";
+    uint_array(row.extent, kCacheExtentBuckets);
+    out << ", \"ratio\": ";
+    uint_array(row.ratio, kCacheRatioBuckets);
+    out << ", \"ratio_tris\": ";
+    uint_array(row.ratio_tris, kCacheRatioBuckets);
+    out << ", \"hist_check\": " << (d.tiers.hist_check[t] ? "true" : "false") << "}";
   }
   out << "],\n  \"self_check\": " << (d.tiers.self_check ? "true" : "false") << ",\n  \"histogram\": [";
   for (size_t b = 0; b < kCacheHistogramBuckets; ++b) {
@@ -490,17 +631,23 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
   out << "},\n  \"tlas\": {\"rebuilds\": " << t.rebuilds << ", \"empty\": " << t.empty << ", \"added\": " << t.added
       << ", \"removed\": " << t.removed << ", \"moved\": " << t.moved << ", \"nearest_changed_m\": " << PoolJsonFloat{t.nearest_changed_m}
       << ", \"nearest_add_remove_m\": " << PoolJsonFloat{t.nearest_add_remove_m} << ", \"by_tier\": [" << t.by_tier[0] << ", "
-      << t.by_tier[1] << ", " << t.by_tier[2] << ", " << t.by_tier[kCacheTlasTierNone] << "]},\n";
+      << t.by_tier[1] << ", " << t.by_tier[2] << ", " << t.by_tier[kCacheTlasTierNone] << "], \"ms_sum\": " << PoolJsonFloat{t.ms_sum}
+      << ", \"ms_max\": " << PoolJsonFloat{t.ms_max} << "},\n";
   const CacheEpisode& e = d.episode;
   out << "  \"episode\": {\"state\": \"" << e.state << "\", \"reason\": \"" << e.reason << "\", \"serial\": " << e.serial
       << ", \"start_frame\": " << e.start_frame << ", \"fresh_from\": " << e.fresh_from << ", \"t80_valid\": " << (e.t80_valid ? "true" : "false")
-      << ", \"t80_frames\": " << e.t80_frames << ", \"t80_ms\": " << PoolJsonFloat{e.t80_ms} << ", \"final_fresh\": " << e.final_fresh
-      << ", \"samples\": [";
+      << ", \"t80_frames\": " << e.t80_frames << ", \"t80_ms\": " << PoolJsonFloat{e.t80_ms} << ", \"final_fresh\": " << e.final_fresh << ", \"work\": ";
+  work_json(e.work);
+  out << ", \"t80_work\": ";
+  work_json(e.t80_work);
+  out << ", \"samples\": [";
   for (size_t s = 0; s < e.samples.size(); ++s) {
     const CacheSample& sample = e.samples[s];
     out << (s != 0u ? ", " : "") << "{\"frame_offset\": " << (sample.frame - e.start_frame) << ", \"ms_offset\": " << PoolJsonFloat{sample.ms}
         << ", \"tlas_instances\": " << sample.tlas_instances << ", \"tlas_fresh\": " << sample.tlas_fresh
-        << ", \"pool_admitted\": " << sample.pool_admitted << "}";
+        << ", \"pool_admitted\": " << sample.pool_admitted << ", \"work\": ";
+    work_json(sample.work);
+    out << "}";
   }
   const CacheLighting& light = d.lighting;
   out << "]},\n  \"lighting\": {\"presents\": " << light.presents << ", \"dark_presents\": " << light.dark_presents

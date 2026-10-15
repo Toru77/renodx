@@ -74,6 +74,20 @@ Definitions: episodes start at a map change, a pool reset or the first admitted 
 
 Known failure (pre-existing, not yet proven at HEAD): `test_motion` at `test_motion.cpp:977`, re-flag lag 32 against `kPoolRecaptureFrames` 30.
 
+## Step 0b (cache-diag-1): implemented, not validated in game
+
+Status: implemented, not validated in game. Diagnostic only: no rendering, TLAS, pool revision, retention or tier thinning change. Build id `cache-diag-1`; manifest schema 15 and `world_pool.json` unchanged. Code: `world/bvh/bvh_pool.hpp` (`PoolResightTracker`: retired signatures, re-sightings at the new-mesh branch, capture CPU timer), `cache_diag.hpp` (extent and ratio buckets, TLAS ms, episode and time-since-reset work, `world_cache_diag.json` schema 2), `bvh_live.hpp` (`UpdateCacheDiag` deltas). Harness: `test_live` (`TestPoolResightTracker`, `TestCacheResight`, `TestCacheBucket`, pinned HEAD fingerprint), `test_pool` (resight counters after the mass retirements).
+
+Measured, in the BVH panel section "Cache diagnostics (Phase 0 and 0b, ...)":
+- Re-sightings: meshes retired by CompactPool and captured again with the same signature, with the presents between retirement and re-sighting (buckets under 120, 120-600, 600-1800, 1800-3600, 3600 and more). Count mismatch: a re-sighting whose vertex or triangle count differs from the retired mesh (percent of re-sightings). Drift: a new mesh whose signature was not retired but whose shape (triangle and vertex counts, bounds rounded to 0.01 m) matches a retired one; a raw count, not a re-sighting. Tracker cap `2 * kPoolMaxMeshes`, horizon 7200 presents.
+- Triangles that a revive would not rebuild (equal vertex and triangle counts).
+- Extent (largest object-space bbox side, per tier by nearest instance) and extent/distance ratio (largest instance world side over max(distance, 1 m), per tier).
+- TLAS rebuild ms (sum, max), BLAS ms per episode, mesh capture CPU ms (decode and apply; the GPU read-back wait is not CPU) and the queue-to-applied wait in presents.
+
+Harness (cache-diag-1): `test_live`: TestPoolResightTracker, TestCacheResight, TestCacheBucket, TestCacheTierBuckets (hand-derived extent and ratio buckets, ratio 0.005 at 200 m), TestCacheEpisodeWork (t80 work), TestCacheCaptureTime (2500 us gives 2.5 ms), TestCacheDiagJson (schema 2 keys), TestCacheBlasWhileOff, TestCacheOnOff (pinned fingerprint and the resight on/off scenario). `test_pool`: resight counters after the mass retirements, mass2 re-sights 32, single object cycle re-sights 1, disabled counters unchanged.
+
+Owner steps: as Phase 0 (Reset diag counters, play two map changes, walk away and back, Dump), then send `world_cache_diag.json` and the new "Re-sightings", "Re-sighting gap", "Time since reset", tier size lines and "Episode work" lines. Read "Histogram self-check: PASS". Not measured: GPU time of the capture read-back, and whether re-sighted content is identical beyond the signature.
+
 ## Current state (2026-10-09)
 
 Goal: hardware-free (compute) ray tracing in Trails in the Sky 2nd Chapter (D3D11) on RenoDX, DevKit-gated (`falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`). All code is in `src/games/falcomengine-plus/world/`.
