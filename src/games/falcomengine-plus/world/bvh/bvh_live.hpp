@@ -541,8 +541,15 @@ inline uint32_t InstanceVisibilityFlags(const WorldInstanceGPU& instance) {
 inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& instance) {
   copy->wind = false;
   if (!g_pool.alpha_wind_sway.load(std::memory_order_relaxed)) return;
+  const bool wind_key = g_pool.wind_keys.count(instance.mesh_key) != 0u;
+  PoolWindPass& pass = g_pool.stats.wind_pass;
+  if (wind_key) pass.wind_key_instances += 1u;
   const auto sway = g_pool.wind_sway.find(instance.mesh_key);
-  if (sway == g_pool.wind_sway.end() || g_pool.wind_keys.count(instance.mesh_key) == 0u) return;
+  if (wind_key && sway == g_pool.wind_sway.end()) {
+    if (pass.no_inputs == 0u) pass.no_input_first_key = instance.mesh_key;
+    pass.no_inputs += 1u;
+  }
+  if (sway == g_pool.wind_sway.end() || !wind_key) return;
   copy->wind = true;
   const float origin[3] = {instance.matrix[3], instance.matrix[7], instance.matrix[11]};
   float displacement[3] = {};
@@ -552,10 +559,12 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
   for (int k = 0; k < 3; ++k) {
     if (!std::isfinite(displacement[k]) || !std::isfinite(bound[k]) || !std::isfinite(origin[k] + displacement[k])) {
       g_pool.stats.wind_sway_skipped_nonfinite += 1u;
+      pass.skipped_nonfinite += 1u;
       return;  // rest pose kept (the instance stays in the wind partition)
     }
     if (std::fabs(origin[k] + displacement[k]) > kPoolMaxPosition || bound[k] > kPoolMaxPosition) {
       g_pool.stats.wind_sway_skipped_range += 1u;
+      pass.skipped_range += 1u;
       return;
     }
   }
@@ -565,10 +574,22 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
     copy->bounds_max[k] += bound[k];
   }
   ComputeMatrixInverse(copy->matrix, copy->inverse_world);
+  const float magnitude = std::sqrt(displacement[0] * displacement[0] + displacement[1] * displacement[1] + displacement[2] * displacement[2]);
   g_pool.stats.wind_sway_instances += 1u;
-  g_pool.stats.wind_sway_max_m = (std::max)(g_pool.stats.wind_sway_max_m,
-                                            std::sqrt(displacement[0] * displacement[0] + displacement[1] * displacement[1]
-                                                      + displacement[2] * displacement[2]));
+  g_pool.stats.wind_sway_max_m = (std::max)(g_pool.stats.wind_sway_max_m, magnitude);
+  pass.applied += 1u;
+  if (magnitude < 1e-4f) pass.zero_disp += 1u;
+  if (pass.applied <= std::size(pass.samples)) {
+    PoolWindSample& sample = pass.samples[pass.applied - 1u];
+    sample.id = instance.id;
+    sample.mesh_key = instance.mesh_key;
+    std::memcpy(sample.origin, origin, sizeof(origin));
+    sample.params = sway->second;
+    std::memcpy(sample.param2, instance.param2, sizeof(sample.param2));
+    std::memcpy(sample.displacement, displacement, sizeof(displacement));
+    sample.magnitude = magnitude;
+    std::memcpy(sample.bound, bound, sizeof(bound));
+  }
   for (int k = 0; k < 3; ++k) g_pool.stats.wind_sway_bound_m = (std::max)(g_pool.stats.wind_sway_bound_m, bound[k]);
 }
 
@@ -621,6 +642,9 @@ inline void RebuildLiveTlas(
     g_pool.stats.wind_sway_instances = 0u;
     g_pool.stats.wind_sway_max_m = 0.f;
     g_pool.stats.wind_sway_bound_m = 0.f;
+    g_pool.stats.wind_pass = {};
+    g_pool.stats.wind_pass.frame = frame;
+    g_pool.stats.wind_pass.switch_on = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
     for (const WorldInstance& instance : g_pool.instances) {
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
       if (per_frame && g_pool.meshes[instance.mesh_id].dynamic && !g_pool.meshes[instance.mesh_id].alpha) {  // P2b: drawn per frame, not in the TLAS (alpha: never recorded)
@@ -671,6 +695,8 @@ inline void RebuildLiveTlas(
     data->tlas_region_size = region.size;
     std::memcpy(data->tlas_region_min, region.min, sizeof(data->tlas_region_min));
     data->tlas_refit_failed = false;
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.tlas_wind_frame = frame;
   };
   stats.tlas_frame = frame;
   stats.tlas_reason = reason;
@@ -738,6 +764,8 @@ inline void RebuildLiveTlas(
     g_pool.stats.dynamic_tlas_per_frame = data->tlas_per_frame ? 1u : 0u;
     g_pool.stats.dynamic_tlas_partition = data->tlas_dynamic_first;
     g_pool.stats.dynamic_tlas_p2b_skipped = data->tlas_p2b_skipped;
+    g_pool.stats.tlas_wind_count = data->tlas_wind_count;
+    g_pool.stats.tlas_sway_on = data->tlas_sway_on;
   };
   if (instances.empty()) {
     DestroyLiveTlas(device, data);
@@ -848,6 +876,12 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     g_pool.stats.wind_sway_instances = 0u;
     g_pool.stats.wind_sway_max_m = 0.f;
     g_pool.stats.wind_sway_bound_m = 0.f;
+    if (WindSwayPending(*data)) {
+      g_pool.stats.wind_pass = {};
+      g_pool.stats.wind_pass.frame = frame;
+      g_pool.stats.wind_pass.refit = true;
+      g_pool.stats.wind_pass.switch_on = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
+    }
     // No dynamic instance in the TLAS: nothing to follow. Only the revision is taken over (no copy, no refit, no count).
     if (data->tlas_dynamic_first >= data->tlas_info.size() && !WindSwayPending(*data)) {
       data->tlas_dynamic_revision = dynamic_revision;
@@ -883,6 +917,8 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     g_pool.tlas_timing.refit_ms_last = stats.refit_ms_last;
     g_pool.tlas_timing.refit_ms_max = stats.refit_ms_max;
     g_pool.tlas_timing.refit_ms_sum += stats.refit_ms_last;
+    g_pool.stats.tlas_wind_count = data->tlas_wind_count;
+    g_pool.stats.tlas_sway_on = data->tlas_sway_on;
   };
   const auto fail = [&](const std::string& why) {
     stats.refit_failures += 1u;

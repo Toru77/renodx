@@ -965,6 +965,47 @@ struct PoolNoMeshKey {
   uint64_t count = 0u;
 };
 
+// Wind VS draws of one scan path (direct: per draw; indirect: per call, its sub-draws are not expanded).
+struct PoolWindDraws {
+  uint64_t draws = 0u;
+  uint64_t rest = 0u;          // admitted as the wind rest pose
+  uint64_t alpha = 0u;         // alpha-tested pixel shader on the wind VS
+  uint64_t gate_skipped = 0u;  // refused by the gate
+  // Sway inputs read per attempted draw, [0] cb_scene (b0), [1] cb_local (b5). Codes: 0 ok, 1 slot unbound,
+  // 2 buffer untracked, 3 mirror short. last_fail_*: size and mirrored bytes of the last failed read of each slot.
+  uint64_t cb_read[2][4] = {};
+  uint64_t last_fail_size[2] = {};
+  uint64_t last_fail_valid[2] = {};
+};
+
+// One sway of the last TLAS pass: the inputs and the displacement it applied (the first kPoolWindSamples applied).
+struct PoolWindSample {
+  uint64_t id = 0u;
+  uint64_t mesh_key = 0u;
+  float origin[3] = {};
+  WindSwayParams params;
+  float param2[3] = {};
+  float displacement[3] = {};
+  float magnitude = 0.f;
+  float bound[3] = {};
+  uint8_t outcome = 0u;  // 0 applied (samples are recorded at the applied point only)
+};
+
+// Sway accounting of the last TLAS pass (rebuild or refit).
+struct PoolWindPass {
+  uint64_t frame = 0u;
+  bool refit = false;
+  bool switch_on = false;
+  uint32_t wind_key_instances = 0u;  // instances of wind rest-pose keys in the pass
+  uint32_t no_inputs = 0u;           // of those: no sway inputs for the key
+  uint64_t no_input_first_key = 0u;  // the first key without inputs
+  uint32_t applied = 0u;
+  uint32_t skipped_nonfinite = 0u;
+  uint32_t skipped_range = 0u;
+  uint32_t zero_disp = 0u;  // applied with |displacement| < 1e-4
+  PoolWindSample samples[8];
+};
+
 struct PoolStats {
   // Draw admission (counted per scanned draw).
   std::array<uint64_t, static_cast<size_t>(contract::VsClass::Count)> draws_by_vs_class = {};
@@ -1036,6 +1077,12 @@ struct PoolStats {
   float wind_sway_bound_m = 0.f;      // largest amplitude bound applied to a leaf in the last TLAS pass (metres)
   uint64_t wind_sway_skipped_nonfinite = 0u;  // cumulative: sways skipped (rest pose kept) on a non-finite input or output
   uint64_t wind_sway_skipped_range = 0u;      // cumulative: sways skipped (rest pose kept) beyond kPoolMaxPosition
+  PoolWindDraws wind_direct;    // wind VS draws, direct scan
+  PoolWindDraws wind_indirect;  // wind VS draws, indirect scan
+  PoolWindPass wind_pass;       // sway accounting of the last TLAS pass
+  uint32_t tlas_wind_count = 0u;  // swayed wind instances in the TLAS as committed
+  bool tlas_sway_on = false;      // sway switch as the TLAS was committed
+  uint32_t tlas_wind_frame = 0u;  // frame of the rebuild that committed the TLAS
   uint64_t follow_hits = 0u;             // moving instances moved to their new pose
   uint64_t follow_admits = 0u;           // moving poses admitted without the stable count
   uint64_t follow_misses_skipped = 0u;   // moving sightings with no copy to follow (not admitted)
@@ -1368,6 +1415,7 @@ struct PoolState {
   PoolAlphaDumpMaps alpha_maps;  // dump-only copies of the atlas maps (SyncLiveAlpha)
   std::unordered_set<uint64_t> wind_keys;  // draw keys admitted as wind rest poses (cleared when alpha_wind_opaque goes off)
   std::unordered_map<uint64_t, WindSwayParams> wind_sway;  // wind draw key -> sway inputs of its latest draw (draw time)
+  WindSwayParams wind_indirect_last;  // sway inputs of the last indirect wind draw read ok (diagnostic only, not swayed)
   bool wind_off_applied = false;  // the wind switch-off removal ran (re-armed by switching on)
   std::unordered_set<uint64_t> alpha_format_logged;  // texture handles whose refused format was logged
   std::atomic_bool live_on{true};  // the live BVH is enabled (UpdateLiveBvh): no source copies while it is off
@@ -3741,6 +3789,40 @@ inline void AttachPoolAlphaSource(uint64_t mesh_key, uint64_t source_id) {
   if (!source->second.texture_dead) AddPoolResourceKey(source->second.texture, mesh_key);
 }
 
+// Sway inputs of a wind rest-pose draw as the draw reads them (CPU mirrors). Both slots are always read; fail[slot]
+// is the read code (0 ok, 1 slot unbound, 2 buffer untracked, 3 mirror short) and info[slot] the tracker's view of a
+// failed slot. Returns true when both slots were read.
+inline bool ReadPoolWindInputs(reshade::api::device* device, reshade::api::command_list* cmd_list, const WorldCommandListData& cl_data, WindSwayParams* out,
+                               uint8_t fail[2], TrackedCbInfo info[2]) {
+  std::array<uint8_t, kWindSceneBytes> scene = {};
+  std::array<uint8_t, kWindMaterialBytes> material = {};
+  const reshade::api::resource slots[2] = {cl_data.vs_cb[kPoolSceneCbSlot], cl_data.vs_cb[kPoolWindMaterialCbSlot]};
+  uint8_t* bytes[2] = {scene.data(), material.data()};
+  const uint64_t sizes[2] = {kWindSceneBytes, kWindMaterialBytes};
+  bool ok = true;
+  for (uint32_t s = 0u; s < 2u; ++s) {
+    if (ReadTrackedCbBytes(cmd_list, slots[s], bytes[s], sizes[s])) {
+      fail[s] = 0u;
+      continue;
+    }
+    DescribeTrackedCb(slots[s], &info[s]);
+    fail[s] = slots[s].handle == 0u ? 1u : (!info[s].tracked ? 2u : 3u);
+    if (!info[s].tracked && slots[s].handle != 0u) info[s].size = device->get_resource_desc(slots[s]).buffer.size;
+    ok = false;
+  }
+  if (!ok) return false;
+  std::memcpy(&out->game_time, scene.data() + 428, sizeof(float));
+  std::memcpy(out->wind_dir, scene.data() + 448, sizeof(out->wind_dir));
+  std::memcpy(&out->wave_time, scene.data() + 504, sizeof(float));
+  std::memcpy(&out->wave_frequency, scene.data() + 508, sizeof(float));
+  std::memcpy(&out->wind_force, scene.data() + 748, sizeof(float));
+  std::memcpy(&out->shake_scale, material.data() + 116, sizeof(float));
+  std::memcpy(&out->shake_speed, material.data() + 120, sizeof(float));
+  std::memcpy(&out->shake_freq, material.data() + 128, sizeof(float));
+  std::memcpy(&out->shake_wind_scale, material.data() + 132, sizeof(float));
+  return true;
+}
+
 inline void OnPoolScanDraw(
     reshade::api::device* device,
     reshade::api::command_list* cmd_list,
@@ -3777,23 +3859,11 @@ inline void OnPoolScanDraw(
   }
 
   // Wind sway inputs as this draw reads them (CPU mirrors, no GPU work).
-  std::array<uint8_t, kWindSceneBytes> scene = {};
-  std::array<uint8_t, kWindMaterialBytes> material = {};
+  const bool wind_attempt = gate.wind_rest && skip == PoolSkip::None;
   WindSwayParams wind;
-  const bool wind_read = gate.wind_rest && skip == PoolSkip::None
-                         && ReadTrackedCbBytes(cmd_list, cl_data->vs_cb[kPoolSceneCbSlot], scene.data(), kWindSceneBytes)
-                         && ReadTrackedCbBytes(cmd_list, cl_data->vs_cb[kPoolWindMaterialCbSlot], material.data(), kWindMaterialBytes);
-  if (wind_read) {
-    std::memcpy(&wind.game_time, scene.data() + 428, sizeof(float));
-    std::memcpy(wind.wind_dir, scene.data() + 448, sizeof(wind.wind_dir));
-    std::memcpy(&wind.wave_time, scene.data() + 504, sizeof(float));
-    std::memcpy(&wind.wave_frequency, scene.data() + 508, sizeof(float));
-    std::memcpy(&wind.wind_force, scene.data() + 748, sizeof(float));
-    std::memcpy(&wind.shake_scale, material.data() + 116, sizeof(float));
-    std::memcpy(&wind.shake_speed, material.data() + 120, sizeof(float));
-    std::memcpy(&wind.shake_freq, material.data() + 128, sizeof(float));
-    std::memcpy(&wind.shake_wind_scale, material.data() + 132, sizeof(float));
-  }
+  uint8_t wind_fail[2] = {};
+  TrackedCbInfo wind_info[2];
+  const bool wind_read = wind_attempt && ReadPoolWindInputs(device, cmd_list, *cl_data, &wind, wind_fail, wind_info);
   const uint32_t frame = g_state.frame.load();
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
@@ -3811,6 +3881,22 @@ inline void OnPoolScanDraw(
     if (gate.alpha_material) NotePoolAlphaMaterial(PoolMeshKey(draw), alpha_material, vbs_known ? &vbs : nullptr);
     if (wind_read) g_pool.wind_sway[mesh_key] = wind;
     if (gate.wind_rest && skip == PoolSkip::None && !wind_read) g_pool.stats.wind_sway_unread += 1u;
+    if (gate.vs_class == contract::VsClass::Wind) {
+      PoolWindDraws& tally = g_pool.stats.wind_direct;
+      tally.draws += 1u;
+      if (gate.wind_rest) tally.rest += 1u;
+      if (gate.alpha_material) tally.alpha += 1u;
+      if (gate.skip != PoolSkip::None) tally.gate_skipped += 1u;
+      if (wind_attempt) {
+        for (uint32_t s = 0u; s < 2u; ++s) {
+          tally.cb_read[s][wind_fail[s]] += 1u;
+          if (wind_fail[s] != 0u) {
+            tally.last_fail_size[s] = wind_info[s].size;
+            tally.last_fail_valid[s] = wind_info[s].valid_bytes;
+          }
+        }
+      }
+    }
     g_pool.stats.draws_by_vs_class[static_cast<size_t>(gate.vs_class)] += 1u;
     if (deferred) g_pool.stats.draws_on_deferred += 1u;
     PoolFamilyStats& family = g_pool.families[draw.vs_hash];
@@ -3922,9 +4008,30 @@ inline void OnPoolScanIndirectDraw(
   const bool deferred = IsPoolDeferredList(cmd_list);
 
   const PoolDrawGate gate = GatePoolDraw(draw, false);
-  if (gate.wind_rest) {
+  WindSwayParams wind;
+  uint8_t wind_fail[2] = {};
+  TrackedCbInfo wind_info[2];
+  const bool wind_read = gate.wind_rest && ReadPoolWindInputs(device, cmd_list, *cl_data, &wind, wind_fail, wind_info);
+  {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    g_pool.stats.wind_rest_draws += 1u;
+    if (gate.wind_rest) g_pool.stats.wind_rest_draws += 1u;
+    if (gate.vs_class == contract::VsClass::Wind) {
+      PoolWindDraws& tally = g_pool.stats.wind_indirect;
+      tally.draws += 1u;
+      if (gate.wind_rest) tally.rest += 1u;
+      if (gate.alpha_material) tally.alpha += 1u;
+      if (gate.skip != PoolSkip::None) tally.gate_skipped += 1u;
+      if (gate.wind_rest) {
+        for (uint32_t s = 0u; s < 2u; ++s) {
+          tally.cb_read[s][wind_fail[s]] += 1u;
+          if (wind_fail[s] != 0u) {
+            tally.last_fail_size[s] = wind_info[s].size;
+            tally.last_fail_valid[s] = wind_info[s].valid_bytes;
+          }
+        }
+      }
+    }
+    if (wind_read) g_pool.wind_indirect_last = wind;
   }
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
@@ -6232,6 +6339,11 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   float map_alpha = 1.f;
   bool dynamic_applied = false;
   size_t wind_sway_keys = 0u;
+  size_t wind_vs_instances = 0u;      // instances of wind-class families
+  size_t wind_vs_alpha = 0u;          // of those: alpha-tested mesh
+  size_t wind_vs_in_keys = 0u;        // of those: admitted as wind rest pose
+  size_t wind_vs_with_inputs = 0u;    // of those: sway inputs read for the key
+  size_t alpha_wind_not_swayed = 0u;  // alpha wind instances not in wind_keys (kPoolPassWind is set only for opaque PS)
   uint64_t alpha_held_bytes_max = 0u;
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -6251,8 +6363,18 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
     for (const WorldInstance& instance : instances) {
       visibility.push_back(GetPoolCameraVisibility(instance));
       last_seen.push_back(PoolInstanceLastSeen(instance));
-      instance_alpha.push_back(instance.mesh_id < g_pool.meshes.size() && g_pool.meshes[instance.mesh_id].alpha ? 1u : 0u);
-      instance_wind.push_back(g_pool.wind_keys.count(instance.mesh_key) != 0u ? 1u : 0u);
+      const bool alpha = instance.mesh_id < g_pool.meshes.size() && g_pool.meshes[instance.mesh_id].alpha;
+      const bool in_wind_keys = g_pool.wind_keys.count(instance.mesh_key) != 0u;
+      instance_alpha.push_back(alpha ? 1u : 0u);
+      instance_wind.push_back(in_wind_keys ? 1u : 0u);
+      const auto family = g_pool.families.find(instance.source_vs_hash);
+      if (family != g_pool.families.end() && family->second.vs_class == static_cast<uint8_t>(contract::VsClass::Wind)) {
+        wind_vs_instances += 1u;
+        if (alpha) wind_vs_alpha += 1u;
+        if (in_wind_keys) wind_vs_in_keys += 1u;
+        if (g_pool.wind_sway.count(instance.mesh_key) != 0u) wind_vs_with_inputs += 1u;
+        if (alpha && !in_wind_keys) alpha_wind_not_swayed += 1u;  // kPoolPassWind is set only for opaque PS
+      }
     }
     for (size_t i = 0; i < instances.size(); ++i) {
       const WorldInstance& instance = instances[i];
@@ -6456,7 +6578,52 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"max_displacement_m\": " << PoolJsonFloat{stats.wind_sway_max_m}
       << ", \"amplitude_bound_m\": " << PoolJsonFloat{stats.wind_sway_bound_m}
       << ", \"skipped_nonfinite\": " << stats.wind_sway_skipped_nonfinite << ", \"skipped_range\": " << stats.wind_sway_skipped_range
-      << ", \"flexibility\": 1, \"origin\": \"instance translation\"},\n";
+      << ", \"flexibility\": 1, \"origin\": \"instance translation\"";
+  const char* scan_names[2] = {"direct", "indirect"};
+  const PoolWindDraws* scans[2] = {&stats.wind_direct, &stats.wind_indirect};
+  out << ",\n    \"draws\": {";
+  for (size_t s = 0; s < 2; ++s) {
+    const PoolWindDraws& scan = *scans[s];
+    out << (s != 0u ? ", " : "") << "\"" << scan_names[s] << "\": {\"draws\": " << scan.draws << ", \"rest\": " << scan.rest
+        << ", \"alpha\": " << scan.alpha << ", \"gate_skipped\": " << scan.gate_skipped << ", \"cb_read\": {";
+    for (size_t slot = 0; slot < 2; ++slot) {
+      out << (slot != 0u ? ", " : "") << "\"" << (slot == 0u ? "b0" : "b5") << "\": [";
+      for (size_t code = 0; code < 4; ++code) out << (code != 0u ? ", " : "") << scan.cb_read[slot][code];
+      out << "]";
+    }
+    out << "}, \"last_fail_size\": [" << scan.last_fail_size[0] << ", " << scan.last_fail_size[1] << "], \"last_fail_valid\": ["
+        << scan.last_fail_valid[0] << ", " << scan.last_fail_valid[1] << "]}";
+  }
+  out << "},\n    \"census\": {\"wind_vs_instances\": " << wind_vs_instances << ", \"alpha\": " << wind_vs_alpha
+      << ", \"in_wind_keys\": " << wind_vs_in_keys << ", \"with_sway_inputs\": " << wind_vs_with_inputs
+      << ", \"alpha_wind_not_swayed\": " << alpha_wind_not_swayed
+      << ", \"alpha_wind_not_swayed_reason\": \"kPoolPassWind is set only for opaque PS\"},\n";
+  out << "    \"tlas\": {\"wind_count\": " << stats.tlas_wind_count << ", \"sway_on\": " << (stats.tlas_sway_on ? "true" : "false")
+      << ", \"frame\": " << stats.tlas_wind_frame << "},\n";
+  const PoolWindPass& pass = stats.wind_pass;
+  out << "    \"pass\": {\"frame\": " << pass.frame << ", \"refit\": " << (pass.refit ? "true" : "false")
+      << ", \"switch_on\": " << (pass.switch_on ? "true" : "false") << ", \"wind_key_instances\": " << pass.wind_key_instances
+      << ", \"no_inputs\": " << pass.no_inputs << ", \"no_input_first_key\": \"" << renodx::utils::log::AsHex(pass.no_input_first_key)
+      << "\", \"applied\": " << pass.applied << ", \"skipped_nonfinite\": " << pass.skipped_nonfinite
+      << ", \"skipped_range\": " << pass.skipped_range << ", \"zero_disp\": " << pass.zero_disp << "},\n";
+  out << "    \"samples\": [";
+  for (size_t i = 0; i < pass.applied && i < std::size(pass.samples); ++i) {
+    const PoolWindSample& sample = pass.samples[i];
+    const WindSwayParams& w = sample.params;
+    out << (i != 0u ? "," : "") << "\n      {\"id\": " << sample.id << ", \"mesh_key\": \"" << renodx::utils::log::AsHex(sample.mesh_key)
+        << "\", \"origin\": [" << PoolJsonFloat{sample.origin[0]} << ", " << PoolJsonFloat{sample.origin[1]} << ", "
+        << PoolJsonFloat{sample.origin[2]} << "], \"params\": [" << PoolJsonFloat{w.game_time} << ", " << PoolJsonFloat{w.wave_time}
+        << ", " << PoolJsonFloat{w.wave_frequency} << ", " << PoolJsonFloat{w.wind_force} << ", " << PoolJsonFloat{w.wind_dir[0]} << ", "
+        << PoolJsonFloat{w.wind_dir[1]} << ", " << PoolJsonFloat{w.wind_dir[2]} << ", " << PoolJsonFloat{w.shake_scale} << ", "
+        << PoolJsonFloat{w.shake_speed} << ", " << PoolJsonFloat{w.shake_freq} << ", " << PoolJsonFloat{w.shake_wind_scale}
+        << "], \"param2\": [" << PoolJsonFloat{sample.param2[0]} << ", " << PoolJsonFloat{sample.param2[1]} << ", "
+        << PoolJsonFloat{sample.param2[2]} << "], \"displacement\": [" << PoolJsonFloat{sample.displacement[0]} << ", "
+        << PoolJsonFloat{sample.displacement[1]} << ", " << PoolJsonFloat{sample.displacement[2]} << "], \"magnitude\": "
+        << PoolJsonFloat{sample.magnitude} << ", \"bound\": [" << PoolJsonFloat{sample.bound[0]} << ", "
+        << PoolJsonFloat{sample.bound[1]} << ", " << PoolJsonFloat{sample.bound[2]} << "], \"outcome\": " << static_cast<int>(sample.outcome)
+        << "}";
+  }
+  out << "\n    ]},\n";
   out << "  \"camera_position\": [" << PoolJsonFloat{camera.position[0]} << ", " << PoolJsonFloat{camera.position[1]} << ", " << PoolJsonFloat{camera.position[2]} << "],\n";
   out << "  \"scene\": {\"fade_constants\": " << (scene_fade ? "true" : "false") << ", \"near_fade_floor\": "
       << PoolJsonFloat{near_fade_floor} << ", \"map_alpha\": " << PoolJsonFloat{map_alpha} << "},\n";

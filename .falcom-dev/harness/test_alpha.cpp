@@ -2670,6 +2670,14 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   CHECK(p.wind_keys.count(wind_key) == 1u && p.wind_sway.count(wind_key) == 1u, "wind sway: wind key with sway inputs");
   CHECK(data->tlas_sway_on && data->tlas_wind_count == 1u, "wind sway: one swayed wind instance in the TLAS (sway %d, wind %u)",
         data->tlas_sway_on ? 1 : 0, data->tlas_wind_count);
+  const pool::PoolWindDraws& direct = p.stats.wind_direct;
+  CHECK(direct.rest > 0u && direct.cb_read[0][0] == direct.draws && direct.cb_read[1][0] == direct.draws,
+        "wind direct: %llu draws, %llu rest, b0 and b5 read ok (%llu, %llu)", static_cast<unsigned long long>(direct.draws),
+        static_cast<unsigned long long>(direct.rest), static_cast<unsigned long long>(direct.cb_read[0][0]),
+        static_cast<unsigned long long>(direct.cb_read[1][0]));
+  CHECK(p.stats.tlas_wind_count == 1u && p.stats.wind_pass.switch_on, "wind pass: TLAS wind count 1, switch on (%u)",
+        p.stats.tlas_wind_count);
+  CHECK(p.stats.wind_pass.applied == 1u, "wind pass: one sway applied (%u)", p.stats.wind_pass.applied);
   int idx = wind_index();
   CHECK(idx >= 0 && static_cast<size_t>(idx) < data->tlas_instances_cpu.size(), "wind sway: wind instance in the TLAS (index %d)", idx);
   if (idx < 0) return;
@@ -2713,6 +2721,11 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
     }
     CHECK(std::fabs(p.stats.wind_sway_bound_m - bound_expect) < 1e-4f && p.stats.wind_sway_instances == 1u,
           "%s: amplitude bound stat %f = %f, one instance swayed", label, p.stats.wind_sway_bound_m, bound_expect);
+    const pool::PoolWindSample& sample = p.stats.wind_pass.samples[0];
+    bool sample_ok = sample.mesh_key == wind_key;
+    for (int k = 0; k < 3; ++k) sample_ok = sample_ok && std::fabs(sample.displacement[k] - expect[k]) < 1e-4f;
+    CHECK(sample_ok, "%s: sample 0 displacement (%f %f %f) matches the reference (%f %f %f)", label, sample.displacement[0],
+          sample.displacement[1], sample.displacement[2], expect[0], expect[1], expect[2]);
   };
   check_time("t1", sway);
 
@@ -2787,6 +2800,153 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   pool::ResetWorldPool();
 }
 
+// Indirect wind draws: the sub-draw tally, the sway inputs read per call (not stored as sway), the failure codes and the dump.
+static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
+  RegisterUvLayout();
+  auto& p = pool::g_pool;
+  pool::ResetWorldPool();
+  p.scan_active.store(true);
+  p.scan_indirect.store(true);
+  p.exclude_moving.store(false);
+  p.follow_moving.store(false);
+  p.alpha_foliage.store(true);
+  p.alpha_wind_opaque.store(true);
+  p.alpha_wind_sway.store(true);
+
+  const uint64_t kWind = 0xE3, kOpaque = 0xE4, kAlpha = 0xE5;
+  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kOpaque, "0x2162672F.ps.cso", false);
+  Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
+
+  resource t15, b0, b1, b5, args, vb, ib;
+  dev.create_resource(resource_desc(4096 * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc scene_desc(1296, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc material_desc(160, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(scene_desc, nullptr, resource_usage::general, &b0);
+  dev.create_resource(material_desc, nullptr, resource_usage::general, &b5);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, scene_desc, nullptr, resource_usage::general, b0);
+  falcom_world::OnInitResourceCbTracker(&dev, material_desc, nullptr, resource_usage::general, b5);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::indirect_argument), nullptr, resource_usage::general, &args);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  const auto box = fixture::Box(1.f);
+  for (size_t i = 0; i < box.positions.size(); ++i) {
+    const auto& position = box.positions[i];
+    const float vertex[5] = {position[0], position[1], position[2], position[1] * 0.5f + 0.5f, position[2] * 0.5f + 0.5f};
+    std::memcpy(dev.res[vb.handle].bytes.data() + i * kUvStride, vertex, sizeof(vertex));
+  }
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+  const uint32_t args_values[5] = {36u, 1u, 0u, 0u, 0u};
+  std::memcpy(dev.res[args.handle].bytes.data(), args_values, sizeof(args_values));
+
+  const SwayInputs sway{3.0f, 1.2f, 0.8f, 0.5f, {0.6f, 0.f, 0.8f}, 0.3f, 2.0f, 0.7f, 0.2f};
+  std::vector<uint8_t> scene(1296u, 0u);
+  std::vector<uint8_t> material(160u, 0u);
+  std::memcpy(scene.data() + 428, &sway.time, sizeof(float));
+  std::memcpy(scene.data() + 448, sway.dir, sizeof(sway.dir));
+  std::memcpy(scene.data() + 504, &sway.wave_time, sizeof(float));
+  std::memcpy(scene.data() + 508, &sway.freq, sizeof(float));
+  std::memcpy(scene.data() + 748, &sway.force, sizeof(float));
+  std::memcpy(material.data() + 116, &sway.scale, sizeof(float));
+  std::memcpy(material.data() + 120, &sway.speed, sizeof(float));
+  std::memcpy(material.data() + 128, &sway.shake_freq, sizeof(float));
+  std::memcpy(material.data() + 132, &sway.wind_scale, sizeof(float));
+  std::memcpy(dev.res[b0.handle].bytes.data(), scene.data(), scene.size());
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, scene.data(), b0, 0, UINT64_MAX);
+  std::memcpy(dev.res[b5.handle].bytes.data(), material.data(), material.size());
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, material.data(), b5, 0, UINT64_MAX);
+  const float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+  std::memcpy(dev.res[t15.handle].bytes.data(), world, 48);
+  std::memcpy(dev.res[t15.handle].bytes.data() + 48, world, 48);
+  const int32_t cb[4] = {0, 0, 0, 0};
+  std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[0] = b0;
+  cl_data.vs_cb[1] = b1;
+  cl_data.vs_cb[5] = b5;
+  const auto make_draw = [&](uint64_t ps) {
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {vb.handle}; draw.vb_stride = kUvStride; draw.ib = ib;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kUvLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.depth_enable = true; draw.depth_write = true;
+    draw.topology = primitive_topology::triangle_list; draw.vs_pipeline = kWind; draw.ps_pipeline = ps;
+    draw.vs_hash = static_cast<uint32_t>(kWind);
+    return draw;
+  };
+  const auto record = [&](uint64_t ps) { pool::OnPoolScanIndirectDraw(&dev, &cl, make_draw(ps), &cl_data, args, 0, 1u, 20u); };
+  const auto present = [&](int count) {
+    for (int i = 0; i < count; ++i) {
+      record(kOpaque);
+      falcom_world::g_state.frame.fetch_add(1u);
+      pool::DrainPoolScan(&dev, &queue);
+      pool::UpdateLiveBvh(&dev, &queue);
+    }
+  };
+  present(60);
+  const pool::PoolWindDraws& indirect = p.stats.wind_indirect;
+  CHECK(indirect.rest > 0u && indirect.cb_read[0][0] == indirect.rest && indirect.cb_read[1][0] == indirect.rest,
+        "wind indirect: %llu rest calls, b0 and b5 read ok (%llu, %llu)", static_cast<unsigned long long>(indirect.rest),
+        static_cast<unsigned long long>(indirect.cb_read[0][0]), static_cast<unsigned long long>(indirect.cb_read[1][0]));
+  CHECK(p.stats.wind_direct.draws == 0u && p.wind_sway.empty(), "wind indirect: no direct wind draw, no sway inputs stored (%zu)",
+        p.wind_sway.size());
+  CHECK(p.wind_indirect_last.wind_force == sway.force, "wind indirect: last good inputs kept (force %f)", p.wind_indirect_last.wind_force);
+  CHECK(p.stats.wind_pass.no_inputs >= 1u, "wind indirect: wind key without inputs in the pass (%u)", p.stats.wind_pass.no_inputs);
+
+  // Untracked b0 (larger than the tracker's limit): code 2 and its size.
+  resource big;
+  dev.create_resource(resource_desc(2048, memory_heap::gpu_only, resource_usage::constant_buffer), nullptr, resource_usage::general, &big);
+  const uint64_t untracked_before = p.stats.wind_indirect.cb_read[0][2];
+  cl_data.vs_cb[0] = big;
+  record(kOpaque);
+  CHECK(p.stats.wind_indirect.cb_read[0][2] == untracked_before + 1u && p.stats.wind_indirect.last_fail_size[0] == 2048u,
+        "wind indirect: untracked b0 code 2 (last_fail_size %llu)", static_cast<unsigned long long>(p.stats.wind_indirect.last_fail_size[0]));
+  cl_data.vs_cb[0] = b0;
+
+  // Unbound b5: code 1.
+  const uint64_t unbound_before = p.stats.wind_indirect.cb_read[1][1];
+  cl_data.vs_cb[5] = resource{0u};
+  record(kOpaque);
+  CHECK(p.stats.wind_indirect.cb_read[1][1] == unbound_before + 1u, "wind indirect: unbound b5 code 1");
+  cl_data.vs_cb[5] = b5;
+
+  // Tracked b5 that never received bytes (mirror short): code 3.
+  resource short_b5;
+  dev.create_resource(material_desc, nullptr, resource_usage::general, &short_b5);
+  falcom_world::OnInitResourceCbTracker(&dev, material_desc, nullptr, resource_usage::general, short_b5);
+  const uint64_t short_before = p.stats.wind_indirect.cb_read[1][3];
+  cl_data.vs_cb[5] = short_b5;
+  record(kOpaque);
+  CHECK(p.stats.wind_indirect.cb_read[1][3] == short_before + 1u && p.stats.wind_indirect.last_fail_valid[1] == 0u,
+        "wind indirect: short b5 mirror code 3");
+  cl_data.vs_cb[5] = b5;
+
+  // Alpha-tested pixel shader on the wind VS: counted as alpha (not a rest pose).
+  const uint64_t alpha_before = p.stats.wind_indirect.alpha;
+  record(kAlpha);
+  CHECK(p.stats.wind_indirect.alpha == alpha_before + 1u, "wind indirect: alpha pixel shader on the wind VS counted (%llu)",
+        static_cast<unsigned long long>(p.stats.wind_indirect.alpha));
+
+  // The dump carries the wind diagnostics and no non-finite token.
+  pool::DumpWorldPool();
+  std::ifstream summary(pool::PoolOutputDir() / "world_pool.json");
+  const std::string text((std::istreambuf_iterator<char>(summary)), std::istreambuf_iterator<char>());
+  CHECK(text.find("\"draws\": {\"direct\": {") != std::string::npos && text.find("\"indirect\": {\"draws\": ") != std::string::npos,
+        "dump: wind draws written");
+  CHECK(text.find("\"census\": {\"wind_vs_instances\": ") != std::string::npos && text.find("\"alpha_wind_not_swayed_reason\"") != std::string::npos,
+        "dump: wind census written");
+  CHECK(text.find("\"tlas\": {\"wind_count\": ") != std::string::npos && text.find("\"pass\": {\"frame\": ") != std::string::npos
+            && text.find("\"samples\": [") != std::string::npos,
+        "dump: wind tlas, pass and samples written");
+  CHECK(!HasNonFiniteToken(text), "world_pool.json has no nan or inf token (wind indirect)");
+  pool::ResetWorldPool();
+}
+
 int main() {
   // Atlas (CPU bookkeeping for the GPU array).
   {
@@ -2856,6 +3016,8 @@ int main() {
   TestWindScanPath(dev, cl, queue);
   HStage("wind sway");
   TestWindSway(dev, cl, queue);
+  HStage("wind indirect diag");
+  TestWindIndirectDiag(dev, cl, queue);
   HStage("color1 scan path");
   TestColor1ScanPath(dev, cl, queue, true);
   TestColor1ScanPath(dev, cl, queue, false);

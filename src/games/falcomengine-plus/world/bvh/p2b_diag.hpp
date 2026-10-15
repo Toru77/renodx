@@ -103,7 +103,7 @@ struct P2bDiagInput {
   std::vector<DynamicDrawGPU> table_readback;
   bool probe_ran = false;
   bool probe_tail_read = false;   // the arena-tail readback succeeded
-  bool probe_plain_read = false;  // the plain (stride-0 control) readback succeeded
+  bool probe_plain_read = false;  // the raw control buffer (same stride-0 layout as the arena) readback succeeded
   bool probe_arena_tail_landed = false;
   bool probe_plain_landed = false;
   std::string probe_reason;
@@ -317,7 +317,7 @@ inline std::string BuildP2bDiagJson(const P2bDiagInput& in, std::string* verdict
   const bool probe_read = in.probe_tail_read && in.probe_plain_read;
   const char* verdict = in.fresh_trace ? "open" : "open (no fresh trace)";
   if (probe_read && !in.probe_arena_tail_landed && in.probe_plain_landed) {
-    verdict = "H1b: structured-160 to structured-16 copy dropped";
+    verdict = "H1b: structured-160 to structured-16 copy dropped";  // pre-fix signature (the old structured arena), not expected now
   } else if (probe_read && in.probe_arena_tail_landed && arena_zero_all && !in.table.empty()) {
     verdict = "H1c: wrong source or offset";
   } else if (arena_bad) {
@@ -582,8 +582,8 @@ inline void RunP2bDiagnostics(reshade::api::device* device, reshade::api::comman
     in.table_matches = std::memcmp(in.table_readback.data(), in.table.data(), table_bytes) == 0;
   }
 
-  // The probe: the only GPU write of this path. Pattern copies into the arena tail (stride-16 structured, as the
-  // arena is) and into a stride-0 buffer, both from a stride-160 source; read back and compared.
+  // The probe: the only GPU write of this path. Pattern copies into the arena tail (the arena is a raw stride-0 buffer, as the
+  // control is) and into a stride-0 control buffer, both from a stride-160 source; read back and compared.
   if (arena.handle != 0u) {
     in.probe_ran = true;
     std::vector<uint8_t> pattern(kP2bDiagProbeBytes);

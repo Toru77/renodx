@@ -189,6 +189,24 @@ inline bool ReadTrackedCbBytes(reshade::api::command_list* cmd_list, reshade::ap
   return true;
 }
 
+struct TrackedCbInfo {
+  bool tracked = false;
+  uint64_t size = 0u;
+  uint64_t valid_bytes = 0u;
+};
+
+// What the tracker holds for a buffer (no bytes): tracked, its size and the mirrored prefix.
+inline void DescribeTrackedCb(reshade::api::resource resource, TrackedCbInfo* out) {
+  *out = TrackedCbInfo{};
+  auto& tracker = CbTracker();
+  std::lock_guard lock(tracker.mutex);
+  const auto it = tracker.buffers.find(resource.handle);
+  if (it == tracker.buffers.end()) return;
+  out->tracked = true;
+  out->size = it->second.size;
+  out->valid_bytes = it->second.valid_bytes;
+}
+
 // First int of a tracked constant buffer (instanceOffset_g for b1).
 inline bool ReadTrackedCbInt(reshade::api::command_list* cmd_list, reshade::api::resource resource, int32_t* out) {
   return ReadTrackedCbBytes(cmd_list, resource, out, sizeof(int32_t));

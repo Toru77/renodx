@@ -409,6 +409,11 @@ inline void DrawBvhPanel() {
               g_pool.alpha_wind_sway.load(std::memory_order_relaxed) ? "on" : "off", stats.wind_sway_instances,
               stats.wind_sway_max_m, stats.wind_sway_bound_m, static_cast<unsigned long long>(stats.wind_sway_unread),
               static_cast<unsigned long long>(stats.wind_sway_skipped_nonfinite), static_cast<unsigned long long>(stats.wind_sway_skipped_range));
+  ImGui::Text("Wind draws: direct %llu (rest %llu, inputs read %llu), indirect %llu (rest %llu, inputs read %llu)",
+              static_cast<unsigned long long>(stats.wind_direct.draws), static_cast<unsigned long long>(stats.wind_direct.rest),
+              static_cast<unsigned long long>(stats.wind_direct.cb_read[0][0]),
+              static_cast<unsigned long long>(stats.wind_indirect.draws), static_cast<unsigned long long>(stats.wind_indirect.rest),
+              static_cast<unsigned long long>(stats.wind_indirect.cb_read[0][0]));
   ImGui::Text("Moving objects (P2b): %s, copied %llu (this present %zu), refused %llu, deferred %llu, records %u (not resident %u), "
               "arena %.1f KB, expand %.3f ms cpu, %.3f ms gpu",
               g_pool.dynamic_per_frame.load(std::memory_order_relaxed) ? "per-frame" : "off",
