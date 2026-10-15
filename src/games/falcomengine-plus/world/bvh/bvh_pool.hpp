@@ -314,7 +314,7 @@ inline constexpr uint8_t kPoolPassVisibility = 2u;  // the VS instance element h
 inline constexpr uint8_t kPoolPassNearFadePs = 4u;  // the PS applies the map-object near fade
 inline constexpr uint8_t kPoolPassLight = 8u;       // VS projects with the light (shadow maps)
 inline constexpr uint8_t kPoolPassAlpha = 16u;       // PS alpha-tests (cutout material), admitted only with alpha_foliage on
-inline constexpr uint8_t kPoolPassWind = 32u;        // wind VS admitted as its rest pose with an opaque PS (alpha_wind_opaque on)
+inline constexpr uint8_t kPoolPassWind = 32u;        // wind VS admitted as its rest pose with an opaque or alpha-tested PS (alpha_wind_opaque on)
 
 struct PoolSighting {
   uint8_t pass = 0u;     // kPoolPass* bits
@@ -764,6 +764,7 @@ struct PoolPendingCopy {
   bool follow = false;      // moving key in follow mode: the copy bypassed the cooldown
   PoolAlphaMaterial alpha;  // indirect alpha draws: material read at the draw, flagged at resolve
   uint32_t alpha_index = UINT32_MAX;  // indirect alpha draws only: PoolStagingSlot::indirect_alpha entry
+  uint32_t wind_index = UINT32_MAX;  // indirect wind rest draws only: PoolStagingSlot::indirect_wind entry
 };
 
 // Normal copies keep the per-identity cooldown. Follow and Trace bypass it.
@@ -786,6 +787,7 @@ struct PoolStagingSlot {
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
   std::vector<PoolIndirectAlpha> indirect_alpha;  // parallel to the alpha copies' alpha_index
+  std::vector<WindSwayParams> indirect_wind;  // parallel to the wind copies' wind_index
   // Mesh copies of the same frame, in their own buffer.
   reshade::api::resource mesh_buffer = {0u};
   uint64_t mesh_used = 0u;
@@ -1071,7 +1073,7 @@ struct PoolStats {
   uint64_t alpha_indirect_source_changed = 0u;  // resolves of a key already attached to another copy (the first is kept)
   uint64_t wind_refused_off = 0u;  // wind rest-pose admissions refused: alpha_wind_opaque (with alpha_foliage) off
   uint64_t wind_rest_draws = 0u;  // wind rest-pose draws gated in (alpha_wind_opaque with alpha_foliage on)
-  uint64_t wind_sway_unread = 0u;  // wind rest-pose draws whose cb_scene or cb_local mirror could not be read (no sway for the key)
+  uint64_t wind_sway_unread = 0u;  // wind rest-pose draws (direct) or calls (indirect) whose cb_scene or cb_local mirror could not be read (no sway for the key)
   uint32_t wind_sway_instances = 0u;  // instances swayed in the last TLAS pass (rebuild or refit)
   float wind_sway_max_m = 0.f;        // largest sway displacement of the last TLAS pass (metres)
   float wind_sway_bound_m = 0.f;      // largest amplitude bound applied to a leaf in the last TLAS pass (metres)
@@ -1415,7 +1417,6 @@ struct PoolState {
   PoolAlphaDumpMaps alpha_maps;  // dump-only copies of the atlas maps (SyncLiveAlpha)
   std::unordered_set<uint64_t> wind_keys;  // draw keys admitted as wind rest poses (cleared when alpha_wind_opaque goes off)
   std::unordered_map<uint64_t, WindSwayParams> wind_sway;  // wind draw key -> sway inputs of its latest draw (draw time)
-  WindSwayParams wind_indirect_last;  // sway inputs of the last indirect wind draw read ok (diagnostic only, not swayed)
   bool wind_off_applied = false;  // the wind switch-off removal ran (re-armed by switching on)
   std::unordered_set<uint64_t> alpha_format_logged;  // texture handles whose refused format was logged
   std::atomic_bool live_on{true};  // the live BVH is enabled (UpdateLiveBvh): no source copies while it is off
@@ -2902,7 +2903,7 @@ struct PoolDrawGate {
   PoolDrawState state = PoolDrawState::Ok;
   uint8_t pass = 0u;  // kPoolPass* bits, set when the draw passes the gate
   bool alpha_material = false;  // alpha-tested pixel shader on a rigid or wind vertex shader (recorded even when skipped)
-  bool wind_rest = false;  // wind VS with an opaque PS admitted as its rest pose (alpha_wind_opaque with alpha_foliage on)
+  bool wind_rest = false;  // wind VS with an opaque or alpha-tested PS admitted as its rest pose (alpha_wind_opaque with alpha_foliage on)
   uint32_t alpha_threshold_offset = 0u;  // the pixel shader's threshold offset in b5 (alpha_material only)
   const char* unknown_reason = nullptr;  // PixelUnknown only: logged once per pipeline pair (NotePoolPixelUnknown)
 };
@@ -2937,12 +2938,10 @@ inline PoolDrawGate GatePoolDraw(const DrawRecord& draw, bool check_index_count)
     gate.skip = PoolSkip::PixelUnknown;
   } else if (!alpha_class && ps_class != contract::PsClass::Opaque) {
     gate.skip = PoolSkip::PixelUnknown;
+  } else if (gate.vs_class == contract::VsClass::Wind && wind_admit) {
+    gate.wind_rest = true;
   } else if (gate.vs_class == contract::VsClass::Wind && !alpha) {
-    if (wind_admit) {
-      gate.wind_rest = true;
-    } else {
-      gate.skip = PoolSkip::WindOpaque;
-    }
+    gate.skip = PoolSkip::WindOpaque;
   }
   if (gate.skip == PoolSkip::PixelUnknown) {
     gate.unknown_reason = alpha_class ? contract::AlphaMaterialReasonName(static_cast<contract::AlphaMaterialReason>(ps_traits.alpha_reason))
@@ -4031,7 +4030,7 @@ inline void OnPoolScanIndirectDraw(
         }
       }
     }
-    if (wind_read) g_pool.wind_indirect_last = wind;
+    if (gate.wind_rest && !wind_read) g_pool.stats.wind_sway_unread += 1u;
   }
   PoolAlphaMaterial alpha_material;
   if (gate.alpha_material) ReadPoolAlphaDraw(cmd_list, *cl_data, gate.alpha_threshold_offset, &alpha_material);
@@ -4063,6 +4062,7 @@ inline void OnPoolScanIndirectDraw(
   uint32_t alpha_ref_count = 0u;
   std::array<PoolDynamicDraw, kPoolMaxIndirectSubDraws> dynamic_copies;  // P2b: slice copies of the sub-draws, reserved under the lock
   uint32_t dynamic_count = 0u;
+  uint32_t wind_index = UINT32_MAX;
   uint32_t command_count = 0u;
   uint32_t mesh_count = 0u;
   {
@@ -4091,6 +4091,7 @@ inline void OnPoolScanIndirectDraw(
       // The args decide the mesh key only at resolve: a schedule identity learned there leads to its mesh (P2b).
       const auto learned_mesh = g_pool.dynamic_indirect.find(schedule_key);
       const uint64_t dynamic_key = learned_mesh != g_pool.dynamic_indirect.end() ? learned_mesh->second : 0u;
+      if (wind_read && dynamic_key != 0u && g_pool.wind_keys.count(dynamic_key) != 0u) g_pool.wind_sway[dynamic_key] = wind;
       uint32_t window = max_window;
       const auto known = g_pool.schedule.find(schedule_key);
       const bool learned = known != g_pool.schedule.end() && known->second.indirect_window != 0u;
@@ -4129,6 +4130,13 @@ inline void OnPoolScanIndirectDraw(
         copy.alpha_index = static_cast<uint32_t>(slot.indirect_alpha.size());
         slot.indirect_alpha.push_back({uv, vbs, vbs_known});
         alpha_refs[alpha_ref_count++] = {g_pool.write_slot, copy.alpha_index};
+      }
+      if (wind_read && (gate.pass & kPoolPassWind) != 0u) {
+        if (wind_index == UINT32_MAX) {
+          wind_index = static_cast<uint32_t>(slot.indirect_wind.size());
+          slot.indirect_wind.push_back(wind);
+        }
+        copy.wind_index = wind_index;
       }
       copy.indirect_index = static_cast<uint32_t>(slot.indirect_draws.size());
       copy.schedule_key = schedule_key;
@@ -4962,6 +4970,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
   std::vector<PoolPendingCopy> copies;
   std::vector<DrawRecord> indirect_draws;
   std::vector<PoolIndirectAlpha> indirect_alpha;
+  std::vector<WindSwayParams> indirect_wind;
   std::vector<PoolMeshJob> jobs;
   reshade::api::resource buffer = {0u};
   reshade::api::resource mesh_buffer = {0u};
@@ -4976,11 +4985,13 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
       slot.mesh_used = 0u;
       slot.indirect_draws.clear();
       slot.indirect_alpha.clear();
+      slot.indirect_wind.clear();
       return;
     }
     copies.swap(slot.copies);
     indirect_draws.swap(slot.indirect_draws);
     indirect_alpha.swap(slot.indirect_alpha);
+    indirect_wind.swap(slot.indirect_wind);
     jobs.reserve(slot.mesh_copies.size());
     for (const PoolMeshCopy& copy : slot.mesh_copies) {
       PoolMeshJob job;
@@ -5346,6 +5357,7 @@ inline void ResolvePoolSlot(reshade::api::device* device, uint32_t slot_index) {
           NotePoolAlphaMaterial(mesh_key, copy.alpha, alpha_side != nullptr && alpha_side->vbs_known ? &alpha_side->vbs : nullptr);
         }
         if ((copy.pass & kPoolPassWind) != 0u) g_pool.wind_keys.insert(mesh_key);
+        if (copy.wind_index != UINT32_MAX) g_pool.wind_sway.try_emplace(mesh_key, indirect_wind[copy.wind_index]);
         QueuePoolMesh(mesh_key, copy.vs_hash, record, true, alpha_side != nullptr ? alpha_side->uv : PoolUvStream{});
         if (alpha_side != nullptr && alpha_side->source != 0u && (AlphaMode() & 2u) != 0u) {
           AttachPoolAlphaSource(mesh_key, alpha_side->source);
@@ -5674,6 +5686,7 @@ inline void ResetWorldPool() {
       slot.copies.clear();
       slot.indirect_draws.clear();
       slot.indirect_alpha.clear();
+      slot.indirect_wind.clear();
       slot.used = 0u;
       slot.follow_used = 0u;
       slot.mesh_copies.clear();
@@ -6343,7 +6356,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   size_t wind_vs_alpha = 0u;          // of those: alpha-tested mesh
   size_t wind_vs_in_keys = 0u;        // of those: admitted as wind rest pose
   size_t wind_vs_with_inputs = 0u;    // of those: sway inputs read for the key
-  size_t alpha_wind_not_swayed = 0u;  // alpha wind instances not in wind_keys (kPoolPassWind is set only for opaque PS)
+  size_t alpha_wind_not_swayed = 0u;  // alpha wind instances not in wind_keys
   uint64_t alpha_held_bytes_max = 0u;
   {
     std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -6373,7 +6386,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
         if (alpha) wind_vs_alpha += 1u;
         if (in_wind_keys) wind_vs_in_keys += 1u;
         if (g_pool.wind_sway.count(instance.mesh_key) != 0u) wind_vs_with_inputs += 1u;
-        if (alpha && !in_wind_keys) alpha_wind_not_swayed += 1u;  // kPoolPassWind is set only for opaque PS
+        if (alpha && !in_wind_keys) alpha_wind_not_swayed += 1u;  // alpha wind instance whose key is not in wind_keys
       }
     }
     for (size_t i = 0; i < instances.size(); ++i) {
@@ -6597,7 +6610,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   out << "},\n    \"census\": {\"wind_vs_instances\": " << wind_vs_instances << ", \"alpha\": " << wind_vs_alpha
       << ", \"in_wind_keys\": " << wind_vs_in_keys << ", \"with_sway_inputs\": " << wind_vs_with_inputs
       << ", \"alpha_wind_not_swayed\": " << alpha_wind_not_swayed
-      << ", \"alpha_wind_not_swayed_reason\": \"kPoolPassWind is set only for opaque PS\"},\n";
+      << ", \"alpha_wind_not_swayed_reason\": \"alpha wind instance whose key is not a wind rest pose (alpha_wind_opaque off, or its wind draw not resolved yet)\"},\n";
   out << "    \"tlas\": {\"wind_count\": " << stats.tlas_wind_count << ", \"sway_on\": " << (stats.tlas_sway_on ? "true" : "false")
       << ", \"frame\": " << stats.tlas_wind_frame << "},\n";
   const PoolWindPass& pass = stats.wind_pass;

@@ -8,10 +8,10 @@ This is the only handoff document for `world/`. Read "Current state" and "Refere
 
 Tick a box only after the owner confirms the fix in game. The harness is not enough. Evidence: `renodx-dev\falcomengine-plus\world\<folder>\` (`world_pool.json`, `world_pool_meshes.json`, `world_pool_instances.json`, `world_deform_live.json`).
 
-- [ ] P-1 `foliage_animate`: wind foliage is in the BVH but does not move. Cause: wind is admitted at its rest pose by design (`GatePoolDraw`, `bvh/bvh_pool.hpp`). Fix needs a design decision (Step 5).
+- [ ] P-1 `foliage_animate`: wind foliage is in the BVH but does not move. Cause: wind is admitted at its rest pose by design (`GatePoolDraw`, `bvh/bvh_pool.hpp`). Fix needs a design decision (Step 5). Status: alpha-tested wind leaves are now swayed too (same CPU sway path); not validated in game; trunks may sway at full amplitude (flexibility fixed at 1).
 - [ ] P-2 `missing_random`: a mesh that should be in the BVH is missing. After a rebuild, a different object drops out instead. Cause (logs, confirmed): an alpha-texture conflict retires every instance of a mesh (`ApplyPoolMesh` dedup, `AbsorbPoolAlphaMaterial`, `MarkPoolMeshAlpha`). Fix: Step 2.
 - [ ] P-3 `dynamic_object_slow`: a sign moving in the wind updates slowly and leaves red/blue ghosts in the debug view, so RTAO over-darkens. Cause (likely): about 4 presents of pose latency (staging ring, resolve at F+2, BVH update at F+3), plus orphan ghosts kept for 60 frames. Fix: Steps 3 and 4.
-- [ ] P-4 `tree_leaves_missing`: tree leaves are not in the BVH. Cause (logs): the same alpha conflicts as P-2 (leaf meshes conflicted, `slice: -1`, `tlas_waiting`). The missing pixel is not yet identified. Fix: Step 2, then Step 3 to identify the pixel.
+- [ ] P-4 `tree_leaves_missing`: tree leaves are not in the BVH. Cause (logs): the same alpha conflicts as P-2 (leaf meshes conflicted, `slice: -1`, `tlas_waiting`). The missing pixel is not yet identified. Fix: Step 2, then Step 3 to identify the pixel. Status: alpha-tested wind leaves are now swayed too (see P-1); not validated in game.
 - [x] P-5 `random_plane`: a plane/wall in interiors sits at the wrong position and shows red in the debug view. Cause (likely, inspect shows it 1207 frames stale): static instances are never retired on map change (`CompactPool`, mass-retirement branch only counts). Fix: Step 1.
 
 Also found (not owner reports, unchecked):
@@ -76,6 +76,7 @@ Alpha-tested foliage (path 3): GPU stage built and reviewed, not validated in ga
 - Committed: CPU stage 241c0fde, GPU stage ce9dda74. The review fixes, A3c-toggles, the S6 and alpha diagnostics and the later review rounds are uncommitted in the working tree.
 - Default change (2026-10-09, owner request): "Alpha-tested foliage (experimental)", "Indirect foliage source copy (experimental)", "Admit wind with opaque pixel shader (experimental)" and "Hide what the game camera does not show" now start ON. Before this they started OFF. All four are session only (not saved). To get the old baseline, untick them in the panel.
 - Harness after the default change: see the result line under "Native test harness" below.
+- Indirect wind inputs (2026-10-15): indirect wind rest draws read their sway inputs like direct ones; they now flow to `wind_sway` (seeded at resolve, refreshed at each draw, forgotten with the key). Harness: `TestWindIndirectDiag` in test_alpha. Not validated in game.
 - In-game steps and what to send back: Reference: Path 3.
 
 RTAO round 1 (2026-10-09, implemented, awaiting in-game validation): inline ray-traced AO in the lighting hook, Ray Tracing tab section RTAO. When on it overrides GTVBAO and VBGI (their controls are greyed, stored values kept). Spatial and filter rows do nothing yet. Reference: RTAO (round 1).

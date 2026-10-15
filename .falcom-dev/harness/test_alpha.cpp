@@ -443,6 +443,16 @@ static void TestGate(Device& dev) {
   const auto wind_rest = gate(kWindVs, kOpaquePs);
   CHECK(wind_rest.skip == pool::PoolSkip::None && wind_rest.wind_rest && (wind_rest.pass & pool::kPoolPassWind) != 0u,
         "wind + opaque, d2 ON: admitted as rest pose");
+  const auto wind_alpha_on = gate(kWindVs, kAlphaPs);
+  CHECK(wind_alpha_on.skip == pool::PoolSkip::None && wind_alpha_on.wind_rest && (wind_alpha_on.pass & pool::kPoolPassWind) != 0u
+            && (wind_alpha_on.pass & pool::kPoolPassAlpha) != 0u,
+        "wind + alpha, d2 ON: rest pose with wind and alpha bits");
+  pool::g_pool.alpha_wind_opaque.store(false);
+  const auto wind_alpha_off = gate(kWindVs, kAlphaPs);
+  CHECK(wind_alpha_off.skip == pool::PoolSkip::None && !wind_alpha_off.wind_rest && (wind_alpha_off.pass & pool::kPoolPassWind) == 0u
+            && (wind_alpha_off.pass & pool::kPoolPassAlpha) != 0u,
+        "wind + alpha, d2 OFF: alpha only, not a rest pose");
+  pool::g_pool.alpha_wind_opaque.store(true);
   pool::g_pool.alpha_foliage.store(false);
   CHECK(gate(kWindVs, kOpaquePs).skip == pool::PoolSkip::NotRigid, "main OFF: wind NotRigid whatever d2 says");
   pool::g_pool.alpha_foliage.store(true);
@@ -2800,6 +2810,164 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   pool::ResetWorldPool();
 }
 
+// Alpha-tested wind leaves: the wind draw with an alpha pixel shader is a wind rest pose with sway inputs, like an opaque one.
+// A rigid alpha draw is not a wind key. With alpha_wind_opaque off the alpha wind draw is admitted at rest.
+static void TestWindAlpha(Device& dev, CmdList& cl, Queue& queue) {
+  RegisterUvLayout();
+  auto& p = pool::g_pool;
+  pool::BvhDeviceData* data = pool::GetBvhDeviceData(&dev);
+  const uint64_t kWind = 0xE6, kAlpha = 0xE7, kRigid = 0xE8;
+  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
+  Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
+
+  resource t15, b0, b1, b5, vb, vb2, ib, ib2;
+  dev.create_resource(resource_desc(4096 * 160, memory_heap::gpu_only, resource_usage::shader_resource), nullptr, resource_usage::general, &t15);
+  const resource_desc scene_desc(1296, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc material_desc(160, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc cb_desc(16, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(scene_desc, nullptr, resource_usage::general, &b0);
+  dev.create_resource(material_desc, nullptr, resource_usage::general, &b5);
+  dev.create_resource(cb_desc, nullptr, resource_usage::general, &b1);
+  falcom_world::OnInitResourceCbTracker(&dev, scene_desc, nullptr, resource_usage::general, b0);
+  falcom_world::OnInitResourceCbTracker(&dev, material_desc, nullptr, resource_usage::general, b5);
+  falcom_world::OnInitResourceCbTracker(&dev, cb_desc, nullptr, resource_usage::general, b1);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::vertex_buffer), nullptr, resource_usage::general, &vb2);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib);
+  dev.create_resource(resource_desc(4096, memory_heap::gpu_only, resource_usage::index_buffer), nullptr, resource_usage::general, &ib2);
+  const auto box = fixture::Box(1.f);
+  for (size_t i = 0; i < box.positions.size(); ++i) {
+    const auto& position = box.positions[i];
+    const float vertex[5] = {position[0], position[1], position[2], position[1] * 0.5f + 0.5f, position[2] * 0.5f + 0.5f};
+    std::memcpy(dev.res[vb.handle].bytes.data() + i * kUvStride, vertex, sizeof(vertex));
+    const float shifted[5] = {position[0] + 0.5f, position[1], position[2], position[1] * 0.5f + 0.5f, position[2] * 0.5f + 0.5f};
+    std::memcpy(dev.res[vb2.handle].bytes.data() + i * kUvStride, shifted, sizeof(shifted));
+  }
+  fixture::WriteIndices(dev.res[ib.handle].bytes);
+  fixture::WriteIndices(dev.res[ib2.handle].bytes);
+
+  const SwayInputs sway{3.0f, 1.2f, 0.8f, 0.5f, {0.6f, 0.f, 0.8f}, 0.3f, 2.0f, 0.7f, 0.2f};
+  std::vector<uint8_t> scene(1296u, 0u);
+  std::vector<uint8_t> material(160u, 0u);
+  std::memcpy(scene.data() + 428, &sway.time, sizeof(float));
+  std::memcpy(scene.data() + 448, sway.dir, sizeof(sway.dir));
+  std::memcpy(scene.data() + 504, &sway.wave_time, sizeof(float));
+  std::memcpy(scene.data() + 508, &sway.freq, sizeof(float));
+  std::memcpy(scene.data() + 748, &sway.force, sizeof(float));
+  std::memcpy(material.data() + 116, &sway.scale, sizeof(float));
+  std::memcpy(material.data() + 120, &sway.speed, sizeof(float));
+  std::memcpy(material.data() + 128, &sway.shake_freq, sizeof(float));
+  std::memcpy(material.data() + 132, &sway.wind_scale, sizeof(float));
+  std::memcpy(dev.res[b0.handle].bytes.data(), scene.data(), scene.size());
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, scene.data(), b0, 0, UINT64_MAX);
+  std::memcpy(dev.res[b5.handle].bytes.data(), material.data(), material.size());
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, material.data(), b5, 0, UINT64_MAX);
+
+  std::array<uint8_t, 160> alpha_material = {};
+  const float threshold = 0.5f;
+  std::memcpy(alpha_material.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_srv[15] = t15;
+  cl_data.vs_cb[0] = b0;
+  cl_data.vs_cb[1] = b1;
+  cl_data.vs_cb[5] = b5;
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = TrackedCb(dev, alpha_material.data(), 160);
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
+
+  const auto make_draw = [&](uint64_t vs, const resource& v, const resource& i) {
+    falcom_world::DrawRecord draw;
+    draw.method = 1; draw.has_index_buffer = true; draw.vb = {v.handle}; draw.vb_stride = kUvStride; draw.ib = i;
+    draw.vb_size = 4096; draw.ib_size = 4096; draw.input_layout = {kUvLayout};
+    draw.index_size = 2; draw.dsv = {0x77}; draw.index_count = 36; draw.first_index = 0; draw.instance_count = 1;
+    draw.depth_enable = true; draw.depth_write = true; draw.topology = primitive_topology::triangle_list;
+    draw.vs_pipeline = vs; draw.ps_pipeline = kAlpha; draw.vs_hash = static_cast<uint32_t>(vs);
+    return draw;
+  };
+  const float kOrigin[3] = {10.f, 0.f, 0.f};
+  const float kParam2[3] = {0.1f, 0.f, 0.2f};
+  uint64_t cursor = 0;
+  const auto draw_once = [&](uint64_t vs, const resource& v, const resource& i) {
+    if (cursor + 1 >= 4096) cursor = 0;
+    const float world[12] = {1, 0, 0, 10, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 48, world, 48);
+    std::memcpy(dev.res[t15.handle].bytes.data() + cursor * 160 + 148, kParam2, sizeof(kParam2));
+    const int32_t cb[4] = {static_cast<int32_t>(cursor), 0, 0, 0};
+    std::memcpy(dev.res[b1.handle].bytes.data(), cb, 16);
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, cb, b1, 0, UINT64_MAX);
+    auto draw = make_draw(vs, v, i);
+    pool::OnPoolScanDraw(&dev, &cl, draw, &cl_data);
+    cursor += 8;
+  };
+  const auto present = [&](int count) {
+    for (int i = 0; i < count; ++i) {
+      draw_once(kWind, vb, ib);
+      draw_once(kRigid, vb2, ib2);
+      falcom_world::g_state.frame.fetch_add(1u);
+      pool::DrainPoolScan(&dev, &queue);
+      pool::UpdateLiveBvh(&dev, &queue);
+    }
+  };
+  const auto tlas_index = [&](uint64_t key) -> int {
+    for (size_t i = 0; i < data->tlas_info.size(); ++i) {
+      if (data->tlas_info[i].mesh_key == key) return static_cast<int>(i);
+    }
+    return -1;
+  };
+  const auto setup = [&](bool d2) {
+    pool::ResetWorldPool();
+    p.scan_active.store(true);
+    p.exclude_moving.store(false);
+    p.follow_moving.store(false);
+    p.alpha_foliage.store(true);
+    p.alpha_wind_opaque.store(d2);
+    p.alpha_wind_sway.store(true);
+  };
+  const uint64_t wind_key = pool::PoolMeshKey(make_draw(kWind, vb, ib));
+  const uint64_t rigid_key = pool::PoolMeshKey(make_draw(kRigid, vb2, ib2));
+
+  setup(true);
+  present(60);
+  CHECK(p.wind_keys.count(wind_key) == 1u && p.wind_sway.count(wind_key) == 1u, "wind alpha: wind key with sway inputs");
+  CHECK(p.wind_keys.count(rigid_key) == 0u && p.wind_sway.count(rigid_key) == 0u, "rigid alpha: not a wind key");
+  const int idx = tlas_index(wind_key);
+  CHECK(idx >= 0 && data->tlas_info[idx].material != 0u, "wind alpha: alpha instance in the TLAS with a material (index %d)", idx);
+  CHECK(data->tlas_wind_count == 1u && p.stats.wind_pass.applied == 1u, "wind alpha: one wind instance, one sway applied (wind %u, applied %u)",
+        data->tlas_wind_count, p.stats.wind_pass.applied);
+  if (idx < 0) return;
+  float expect[3] = {};
+  ReferenceWindSway(sway, kOrigin, kParam2, expect);
+  const float* world = data->tlas_instances_cpu[idx].world;
+  CHECK(std::fabs(world[3] - kOrigin[0] - expect[0]) < 1e-4f && std::fabs(world[7] - kOrigin[1] - expect[1]) < 1e-4f
+            && std::fabs(world[11] - kOrigin[2] - expect[2]) < 1e-4f,
+        "wind alpha: TLAS translation (%f %f %f) = rest + reference offset (%f %f %f)", world[3], world[7], world[11], expect[0], expect[1], expect[2]);
+  const pool::WorldInstance* rest = nullptr;
+  for (const pool::WorldInstance& instance : p.instances) {
+    if (instance.mesh_key == wind_key) rest = &instance;
+  }
+  CHECK(rest != nullptr && p.meshes[rest->mesh_id].alpha && data->live.tlas_alpha_instances == 2u,
+        "wind alpha: alpha mask instance admitted, with the rigid alpha instance (tlas alpha %u)", data->live.tlas_alpha_instances);
+  pool::DumpWorldPool();
+  std::ifstream summary_on(pool::PoolOutputDir() / "world_pool.json");
+  const std::string text_on((std::istreambuf_iterator<char>(summary_on)), std::istreambuf_iterator<char>());
+  CHECK(text_on.find("\"alpha_wind_not_swayed\": 0") != std::string::npos, "dump: no alpha wind instance outside wind_keys");
+
+  // d2 OFF: no wind key, the alpha wind draw is admitted at its rest pose.
+  setup(false);
+  present(60);
+  CHECK(p.wind_keys.count(wind_key) == 0u && p.wind_sway.count(wind_key) == 0u, "wind alpha, d2 OFF: no wind key");
+  const int off_idx = tlas_index(wind_key);
+  CHECK(off_idx >= 0 && data->tlas_info[off_idx].material != 0u && data->tlas_wind_count == 0u,
+        "wind alpha, d2 OFF: alpha instance admitted (index %d, wind %u)", off_idx, data->tlas_wind_count);
+  CHECK(off_idx < 0 || (data->tlas_instances_cpu[off_idx].world[3] == kOrigin[0] && data->tlas_instances_cpu[off_idx].world[11] == kOrigin[2]),
+        "wind alpha, d2 OFF: rest translation kept");
+  pool::ResetWorldPool();
+}
+
 // Indirect wind draws: the sub-draw tally, the sway inputs read per call (not stored as sway), the failure codes and the dump.
 static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
   RegisterUvLayout();
@@ -2893,26 +3061,39 @@ static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
   CHECK(indirect.rest > 0u && indirect.cb_read[0][0] == indirect.rest && indirect.cb_read[1][0] == indirect.rest,
         "wind indirect: %llu rest calls, b0 and b5 read ok (%llu, %llu)", static_cast<unsigned long long>(indirect.rest),
         static_cast<unsigned long long>(indirect.cb_read[0][0]), static_cast<unsigned long long>(indirect.cb_read[1][0]));
-  CHECK(p.stats.wind_direct.draws == 0u && p.wind_sway.empty(), "wind indirect: no direct wind draw, no sway inputs stored (%zu)",
-        p.wind_sway.size());
-  CHECK(p.wind_indirect_last.wind_force == sway.force, "wind indirect: last good inputs kept (force %f)", p.wind_indirect_last.wind_force);
-  CHECK(p.stats.wind_pass.no_inputs >= 1u, "wind indirect: wind key without inputs in the pass (%u)", p.stats.wind_pass.no_inputs);
+  auto indirect_draw = make_draw(kOpaque);
+  indirect_draw.index_count = 36u;
+  const uint64_t key = pool::PoolMeshKey(indirect_draw);
+  CHECK(p.stats.wind_direct.draws == 0u, "wind indirect: no direct wind draw (%llu)", static_cast<unsigned long long>(p.stats.wind_direct.draws));
+  CHECK(p.wind_keys.count(key) == 1u && p.wind_sway.size() == 1u && p.wind_sway.count(key) == 1u
+            && p.wind_sway.at(key).wind_force == sway.force,
+        "wind indirect: key admitted with its inputs (force %f)", p.wind_sway.count(key) != 0u ? p.wind_sway.at(key).wind_force : -1.f);
+  CHECK(p.stats.wind_pass.no_inputs == 0u && p.stats.wind_pass.wind_key_instances >= 1u && p.stats.wind_pass.applied >= 1u
+            && p.stats.wind_sway_instances >= 1u,
+        "wind indirect: pass swayed the key (no_inputs %u, instances %u, applied %u, swayed %u)", p.stats.wind_pass.no_inputs,
+        p.stats.wind_pass.wind_key_instances, p.stats.wind_pass.applied, p.stats.wind_sway_instances);
 
   // Untracked b0 (larger than the tracker's limit): code 2 and its size.
   resource big;
   dev.create_resource(resource_desc(2048, memory_heap::gpu_only, resource_usage::constant_buffer), nullptr, resource_usage::general, &big);
   const uint64_t untracked_before = p.stats.wind_indirect.cb_read[0][2];
+  const uint64_t unread_untracked = p.stats.wind_sway_unread;
   cl_data.vs_cb[0] = big;
   record(kOpaque);
   CHECK(p.stats.wind_indirect.cb_read[0][2] == untracked_before + 1u && p.stats.wind_indirect.last_fail_size[0] == 2048u,
         "wind indirect: untracked b0 code 2 (last_fail_size %llu)", static_cast<unsigned long long>(p.stats.wind_indirect.last_fail_size[0]));
+  CHECK(p.stats.wind_sway_unread == unread_untracked + 1u && p.wind_sway.count(key) != 0u && p.wind_sway.at(key).wind_force == sway.force,
+        "wind indirect: untracked b0 counted unread, inputs kept");
   cl_data.vs_cb[0] = b0;
 
   // Unbound b5: code 1.
   const uint64_t unbound_before = p.stats.wind_indirect.cb_read[1][1];
+  const uint64_t unread_unbound = p.stats.wind_sway_unread;
   cl_data.vs_cb[5] = resource{0u};
   record(kOpaque);
   CHECK(p.stats.wind_indirect.cb_read[1][1] == unbound_before + 1u, "wind indirect: unbound b5 code 1");
+  CHECK(p.stats.wind_sway_unread == unread_unbound + 1u && p.wind_sway.count(key) != 0u && p.wind_sway.at(key).wind_force == sway.force,
+        "wind indirect: unbound b5 counted unread, inputs kept");
   cl_data.vs_cb[5] = b5;
 
   // Tracked b5 that never received bytes (mirror short): code 3.
@@ -2920,17 +3101,22 @@ static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
   dev.create_resource(material_desc, nullptr, resource_usage::general, &short_b5);
   falcom_world::OnInitResourceCbTracker(&dev, material_desc, nullptr, resource_usage::general, short_b5);
   const uint64_t short_before = p.stats.wind_indirect.cb_read[1][3];
+  const uint64_t unread_short = p.stats.wind_sway_unread;
   cl_data.vs_cb[5] = short_b5;
   record(kOpaque);
   CHECK(p.stats.wind_indirect.cb_read[1][3] == short_before + 1u && p.stats.wind_indirect.last_fail_valid[1] == 0u,
         "wind indirect: short b5 mirror code 3");
+  CHECK(p.stats.wind_sway_unread == unread_short + 1u && p.wind_sway.count(key) != 0u && p.wind_sway.at(key).wind_force == sway.force,
+        "wind indirect: short b5 counted unread, inputs kept");
   cl_data.vs_cb[5] = b5;
 
-  // Alpha-tested pixel shader on the wind VS: counted as alpha (not a rest pose).
+  // Alpha-tested pixel shader on the wind VS: counted as alpha (a rest pose too while alpha_wind_opaque is on).
   const uint64_t alpha_before = p.stats.wind_indirect.alpha;
+  const uint64_t unread_alpha = p.stats.wind_sway_unread;
   record(kAlpha);
   CHECK(p.stats.wind_indirect.alpha == alpha_before + 1u, "wind indirect: alpha pixel shader on the wind VS counted (%llu)",
         static_cast<unsigned long long>(p.stats.wind_indirect.alpha));
+  CHECK(p.stats.wind_sway_unread == unread_alpha, "wind indirect: alpha pixel shader record not unread");
 
   // The dump carries the wind diagnostics and no non-finite token.
   pool::DumpWorldPool();
@@ -2943,7 +3129,62 @@ static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
   CHECK(text.find("\"tlas\": {\"wind_count\": ") != std::string::npos && text.find("\"pass\": {\"frame\": ") != std::string::npos
             && text.find("\"samples\": [") != std::string::npos,
         "dump: wind tlas, pass and samples written");
+  CHECK(text.find("\"keys_with_inputs\": 1") != std::string::npos, "dump: wind keys_with_inputs written");
   CHECK(!HasNonFiniteToken(text), "world_pool.json has no nan or inf token (wind indirect)");
+
+  // The alpha wind draw resolves as a wind rest pose with sway inputs (its alpha material and texture bound).
+  std::array<uint8_t, 160> alpha_material = {};
+  const float threshold = 0.5f;
+  std::memcpy(alpha_material.data() + kReferenceThresholdOffset, &threshold, sizeof(float));
+  cl_data.ps_cb[contract::kAlphaMaterialSlot] = TrackedCb(dev, alpha_material.data(), 160);
+  resource alpha_tex = {0};
+  const uint64_t alpha_view = SourceView(dev, &alpha_tex);
+  cl_data.ps_srv[contract::kAlphaTexSlot].handle = alpha_tex.handle;
+  cl_data.ps_srv_view[contract::kAlphaTexSlot].handle = alpha_view;
+  for (int i = 0; i < 60; ++i) {
+    record(kAlpha);
+    present(1);
+  }
+  auto alpha_draw = make_draw(kAlpha);
+  alpha_draw.index_count = 36u;
+  const uint64_t alpha_key = pool::PoolMeshKey(alpha_draw);
+  CHECK(p.wind_keys.count(alpha_key) == 1u && p.wind_sway.count(alpha_key) == 1u,
+        "wind indirect: alpha wind key in wind_keys with sway inputs");
+
+  // Refresh: a new cb_scene force reaches the key at draw time, before any resolve.
+  const float new_force = sway.force + 1.0f;
+  std::memcpy(scene.data() + 748, &new_force, sizeof(float));
+  std::memcpy(dev.res[b0.handle].bytes.data(), scene.data(), scene.size());
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, scene.data(), b0, 0, UINT64_MAX);
+  cl_data.vs_cb[0] = b0;
+  record(kOpaque);
+  CHECK(p.wind_sway.count(key) != 0u && p.wind_sway.at(key).wind_force == new_force, "wind indirect: draw refreshes the key's inputs (force %f)",
+        p.wind_sway.count(key) != 0u ? p.wind_sway.at(key).wind_force : -1.f);
+
+  // Retire: invalidating the key forgets its inputs and its wind membership.
+  {
+    std::lock_guard<std::mutex> lock(p.mutex);
+    pool::InvalidatePoolMeshKey(key);
+  }
+  CHECK(p.wind_sway.empty() && p.wind_keys.empty(), "wind indirect: invalidated key forgets its inputs and wind membership");
+
+  // Dropped before resolve: a copy reset before its slot resolves leaves no inputs behind.
+  pool::ResetWorldPool();
+  record(kOpaque);
+  bool recorded_wind = false;
+  for (const auto& slot : p.slots) {
+    recorded_wind = recorded_wind || (slot.indirect_wind.size() == 1u && !slot.copies.empty() && slot.copies.back().wind_index != UINT32_MAX);
+  }
+  CHECK(recorded_wind, "wind indirect: pending copy recorded one staging entry before the reset");
+  pool::ResetWorldPool();
+  for (int i = 0; i < 3; ++i) {
+    falcom_world::g_state.frame.fetch_add(1u);
+    pool::DrainPoolScan(&dev, &queue);
+    pool::UpdateLiveBvh(&dev, &queue);
+  }
+  bool slot_wind_empty = true;
+  for (const auto& slot : p.slots) slot_wind_empty = slot_wind_empty && slot.indirect_wind.empty();
+  CHECK(p.wind_sway.empty() && p.wind_keys.empty() && slot_wind_empty, "wind indirect: dropped copy leaves no inputs or staging entries");
   pool::ResetWorldPool();
 }
 
@@ -3018,6 +3259,8 @@ int main() {
   TestWindSway(dev, cl, queue);
   HStage("wind indirect diag");
   TestWindIndirectDiag(dev, cl, queue);
+  HStage("wind alpha");
+  TestWindAlpha(dev, cl, queue);
   HStage("color1 scan path");
   TestColor1ScanPath(dev, cl, queue, true);
   TestColor1ScanPath(dev, cl, queue, false);

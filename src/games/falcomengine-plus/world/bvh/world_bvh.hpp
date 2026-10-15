@@ -275,7 +275,7 @@ inline void DrawBvhPanel() {
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: wind "
-                        "vertex shaders with an opaque pixel shader are admitted as a rigid rest pose instead of WindOpaque. "
+                        "vertex shaders (opaque or alpha-tested pixel shader) are admitted as a rigid rest pose instead of WindOpaque. "
                         "Off: their instances leave the BVH at the next present.");
     }
     bool wind_sway = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
