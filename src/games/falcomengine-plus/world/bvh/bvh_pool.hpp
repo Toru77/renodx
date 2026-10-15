@@ -138,6 +138,7 @@ inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
 inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
+inline constexpr const char* kWorldBuildId = "p2b-diag-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr size_t kPoolMaxMeshes = 8192u;
 inline constexpr uint32_t kPoolMassRetireMeshes = 32u;  // one compaction retiring this many: a map change (diagnostic)
@@ -1109,6 +1110,18 @@ struct PoolStats {
   uint32_t dynamic_not_resident = 0u;  // P2b: draws of the last present whose mesh is not resident in the live store
   float dynamic_expand_cpu_ms = 0.f;  // P2b: CPU time of the last expansion table
   float dynamic_expand_gpu_ms = 0.f;  // P2b: GPU time of the last expansion (resolved a present late)
+  bool dynamic_ready = false;             // P2b: GPU objects ready (the expansion runs)
+  uint32_t dynamic_instance_count = 0u;   // P2b: records of the last expansion (the trace reads them)
+  uint32_t dynamic_trace_count = 0u;      // P2b: records bound to the last trace dispatch
+  uint32_t dynamic_trace_frame = 0u;      // P2b: frame of the last trace dispatch
+  uint32_t dynamic_tlas_per_frame = 0u;   // P2b: 1 when the TLAS was built with the per-frame switch on
+  uint32_t dynamic_tlas_partition = 0u;   // P2b: TLAS instances [partition, end) are the dynamic ones
+  uint32_t dynamic_tlas_p2b_skipped = 0u;  // P2b: flagged instances left out of the TLAS by the last build
+  uint64_t dynamic_expand_presents = 0u;  // P2b: expansion passes (ExpandLiveDynamic calls, total)
+  uint64_t dynamic_expand_empty = 0u;     // P2b: passes with no flagged draw in the present (total)
+  uint64_t dynamic_expand_failed = 0u;    // P2b: passes that failed to set up or upload (total)
+  uint64_t dynamic_flagged_total = 0u;    // P2b: meshes flagged dynamic now
+  uint64_t dynamic_flagged_resident = 0u;  // P2b: flagged meshes resident in the live store now
   size_t following = 0u;          // dynamic instances (following their object) now
   uint64_t scan_first_frame = 0u;
   uint64_t scan_last_frame = 0u;
@@ -5765,7 +5778,15 @@ inline void WritePoolP2b(std::ostringstream& out, const PoolStats& stats) {
       << ", \"arena_bytes_last_present\": " << stats.dynamic_arena_bytes
       << ", \"arena_capacity_bytes\": " << kPoolDynamicArenaBytes << ", \"records_capacity\": " << kPoolDynamicInstances
       << ", \"expand_cpu_ms\": " << PoolJsonFloat{stats.dynamic_expand_cpu_ms}
-      << ", \"expand_gpu_ms\": " << PoolJsonFloat{stats.dynamic_expand_gpu_ms} << "},\n";
+      << ", \"expand_gpu_ms\": " << PoolJsonFloat{stats.dynamic_expand_gpu_ms}
+      << ", \"ready\": " << (stats.dynamic_ready ? "true" : "false")
+      << ", \"expand_presents\": " << stats.dynamic_expand_presents << ", \"expand_empty_presents\": " << stats.dynamic_expand_empty
+      << ", \"expand_failed_presents\": " << stats.dynamic_expand_failed
+      << ", \"instance_count\": " << stats.dynamic_instance_count << ", \"trace_instance_count\": " << stats.dynamic_trace_count
+      << ", \"trace_frame\": " << stats.dynamic_trace_frame << ", \"tlas_per_frame\": " << stats.dynamic_tlas_per_frame
+      << ", \"tlas_dynamic_partition\": " << stats.dynamic_tlas_partition
+      << ", \"tlas_flagged_skipped\": " << stats.dynamic_tlas_p2b_skipped
+      << ", \"flagged_meshes_total\": " << stats.dynamic_flagged_total << ", \"flagged_meshes_resident\": " << stats.dynamic_flagged_resident << "},\n";
 }
 
 inline void WritePoolDynamic(std::ostringstream& out, const std::vector<PoolDynamicDumpEntry>& entries,
@@ -6870,7 +6891,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool_instances.json", instances_text);
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_pool.json", text);
 
-  // Written last so the sizes are the bytes on disk. Build id: none exists in the addon.
+  // Written last so the sizes are the bytes on disk.
   struct WrittenFile {
     const char* name;
     size_t records;
@@ -6879,13 +6900,20 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   const WrittenFile written_files[] = {
       {"world_pool_meshes.json", meshes_written, meshes.size() > meshes_written ? meshes.size() - meshes_written : 0u},
       {"world_pool_instances.json", instances_written, instances.size() > instances_written ? instances.size() - instances_written : 0u},
-      {"world_pool.json", 1u, world_pool_dropped}};
+      {"world_pool.json", 1u, world_pool_dropped},
+      {"world_deform_live.json", 1u, 0u},
+      {"world_p2b_diag.json", 1u, 0u}};
   std::ostringstream manifest;
-  manifest << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"build\": \"unknown\",\n"
+  manifest << "{\n  \"schema\": 15,\n  \"generated_frame\": " << frame << ",\n  \"build\": \"" << kWorldBuildId << "\",\n"
            << "  \"switches\": {\"alpha_foliage\": " << (g_pool.alpha_foliage.load() ? "true" : "false")
            << ", \"alpha_indirect_source\": " << (g_pool.alpha_indirect_source.load() ? "true" : "false")
            << ", \"alpha_wind_opaque\": " << (g_pool.alpha_wind_opaque.load() ? "true" : "false")
+           << ", \"alpha_wind_sway\": " << (g_pool.alpha_wind_sway.load() ? "true" : "false")
            << ", \"follow_moving\": " << (g_pool.follow_moving.load() ? "true" : "false")
+           << ", \"exclude_moving\": " << (g_pool.exclude_moving.load() ? "true" : "false")
+           << ", \"dynamic_per_frame\": " << (g_pool.dynamic_per_frame.load() ? "true" : "false")
+           << ", \"live_on\": " << (g_pool.live_on.load() ? "true" : "false")
+           << ", \"legacy_scale\": " << (g_pool.legacy_scale.load() ? "true" : "false")
            << ", \"hide_camera_hidden\": " << (hide_camera_hidden ? "true" : "false")
            << ", \"dynamic_applied\": " << (dynamic_applied ? "true" : "false") << "},\n"
            << "  \"files\": [";

@@ -14,6 +14,7 @@
 #include "json_check.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
+#include "src/games/falcomengine-plus/world/bvh/p2b_diag.hpp"
 
 using namespace reshade::api;
 namespace bvh = falcom_world::bvh;
@@ -1490,6 +1491,17 @@ int main() {
           "NaN matrix written as a null reject sample");
     CHECK(manifest_value(manifest_text, "world_pool.json", "dropped") == "0", "no drops before the flood");
     CHECK(world_text.find("\"truncated\": false,\n") != std::string::npos, "header not truncated before the flood");
+    // P2b fields (WritePoolP2b) and the manifest's build id and switch states.
+    for (const char* field : {"ready", "expand_presents", "expand_empty_presents", "expand_failed_presents", "instance_count",
+                              "trace_instance_count", "trace_frame", "tlas_per_frame", "tlas_dynamic_partition", "tlas_flagged_skipped",
+                              "flagged_meshes_total", "flagged_meshes_resident"}) {
+      CHECK(world_text.find(std::string("\"") + field + "\": ") != std::string::npos, "world_pool.json p2b field %s", field);
+    }
+    CHECK(manifest_text.find("\"build\": \"unknown\"") == std::string::npos && manifest_text.find(bvh::kWorldBuildId) != std::string::npos,
+          "manifest carries the build id");
+    for (const char* field : {"dynamic_per_frame", "alpha_wind_sway", "exclude_moving", "live_on", "legacy_scale"}) {
+      CHECK(manifest_text.find(std::string("\"") + field + "\": ") != std::string::npos, "manifest switch %s", field);
+    }
 
     // A NaN capture record (failed mesh history) is written as null, not as a nan token.
     {
@@ -1538,6 +1550,229 @@ int main() {
               && d.moved_samples.empty() && d.repeat_samples.empty() && d.moved_mesh_keys.empty()
               && d.rule_stale_samples.empty() && s.dynamic_live_keys == 0u && s.dynamic_retired == 0u, "reset");
   }
+
+  HStage("33. P2b diagnostics: the verdict of each synthetic snapshot (BuildP2bDiagJson), valid JSON, field names.");
+  const int failures_before_33 = g_failures;
+  {
+    const auto check_case = [](const char* name, const bvh::P2bDiagInput& in, const char* want) {
+      std::string verdict;
+      const std::string text = bvh::BuildP2bDiagJson(in, &verdict, nullptr);
+      CHECK(JsonError(text).empty(), "%s: valid JSON: %s", name, JsonError(text).c_str());
+      CHECK(!HasNonFiniteToken(text), "%s: no nan or inf token", name);
+      CHECK(verdict == want, "%s: verdict '%s' (want '%s')", name, verdict.c_str(), want);
+      for (const char* field : {"\"build\"", "\"switches\"", "\"expand\"", "\"trace\"", "\"tlas\"", "\"flagged_meshes\"", "\"readback\"",
+                                "\"probe\"", "\"draws\"", "\"records\"", "\"summary\"", "\"verdict_hint\""}) {
+        CHECK(text.find(field) != std::string::npos, "%s: field %s", name, field);
+      }
+    };
+    const auto make_record = [](bool valid) {
+      bvh::WorldInstanceGPU r = {};
+      const float identity[12] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+      r.header[3] = valid ? 1.f : 0.f;
+      std::memcpy(r.world, identity, sizeof(identity));
+      r.world[15] = 1.f;
+      falcom_world::ComputeMatrixInverse(identity, r.inverse_world);
+      for (int k = 0; k < 3; ++k) {
+        r.bounds_min[k] = -1.f;
+        r.bounds_max[k] = 1.f;
+      }
+      r.visibility[2] = 2.f;
+      return r;
+    };
+    // One resident camera draw of one identity instance; arena and readbacks as a healthy present.
+    const auto base = [] {
+      bvh::P2bDiagInput in;
+      in.build = bvh::kWorldBuildId;
+      in.generated_frame = 100u;
+      in.armed_frame = 90u;
+      in.arena.assign(64u * 40u, 0.f);
+      in.arena[0] = 1.f;
+      in.arena[5] = 1.f;
+      in.arena[10] = 1.f;
+      bvh::DynamicDrawGPU draw = {};
+      draw.info[1] = 1u;
+      draw.info[3] = 3u;
+      for (int k = 0; k < 3; ++k) {
+        draw.bbox_min[k] = -1.f;
+        draw.bbox_max[k] = 1.f;
+      }
+      in.table.push_back(draw);
+      in.table_readback_ok = true;
+      in.table_matches = true;
+      in.readback_ok = true;
+      in.probe_ran = true;
+      in.probe_tail_read = true;
+      in.probe_plain_read = true;
+      in.probe_arena_tail_landed = true;
+      in.probe_plain_landed = true;
+      in.counters.ready = true;
+      in.counters.expand_presents = 5u;
+      in.counters.instance_count = 1u;
+      in.counters.trace_count = 1u;
+      in.counters.trace_valid = true;
+      in.fresh_trace = true;
+      in.switches = {{"dynamic_per_frame", true}, {"live_on", true}};
+      return in;
+    };
+    {  // (a) the arena is zero and the arena-tail copy did not land while the plain copy did
+      bvh::P2bDiagInput in = base();
+      std::fill(in.arena.begin(), in.arena.end(), 0.f);
+      in.probe_arena_tail_landed = false;
+      check_case("(a) zero arena, tail not landed", in, "H1b: structured-160 to structured-16 copy dropped");
+    }
+    {  // (a2) the arena-tail readback failed while the plain one succeeded: not H1b, the reason names the tail readback
+      bvh::P2bDiagInput in = base();
+      std::fill(in.arena.begin(), in.arena.end(), 0.f);
+      in.probe_tail_read = false;
+      in.probe_arena_tail_landed = false;
+      in.probe_reason = "tail readback failed";
+      const std::string text = bvh::BuildP2bDiagJson(in, nullptr, nullptr);
+      check_case("(a2) tail readback failed, plain ok", in, "open");
+      CHECK(text.find("\"reason\": \"tail readback failed\"") != std::string::npos, "(a2) probe reason names the tail readback");
+    }
+    {  // (a3) the plain readback failed while the tail one succeeded: not H1b
+      bvh::P2bDiagInput in = base();
+      std::fill(in.arena.begin(), in.arena.end(), 0.f);
+      in.probe_plain_read = false;
+      in.probe_plain_landed = false;
+      in.probe_reason = "plain readback failed";
+      check_case("(a3) plain readback failed, tail ok", in, "open");
+    }
+    {  // (b) the arena is zero although the probe landed
+      bvh::P2bDiagInput in = base();
+      std::fill(in.arena.begin(), in.arena.end(), 0.f);
+      check_case("(b) zero arena, probe landed", in, "H1c: wrong source or offset");
+    }
+    {  // (b2) the arena is zero, the probe tail landed, but the plain readback failed: H1c needs both readbacks
+      bvh::P2bDiagInput in = base();
+      std::fill(in.arena.begin(), in.arena.end(), 0.f);
+      in.probe_plain_read = false;
+      in.probe_plain_landed = false;
+      check_case("(b2) zero arena, plain readback failed", in, "open");
+    }
+    {  // (c) the GPU rejects a record the CPU accepts
+      bvh::P2bDiagInput in = base();
+      in.records.push_back(make_record(false));
+      check_case("(c) GPU invalid, CPU valid", in, "H2: expansion shader or constants");
+    }
+    {  // (c2) the same GPU rejection with the trace not fresh: H2 is not gated by the trace
+      bvh::P2bDiagInput in = base();
+      in.records.push_back(make_record(false));
+      in.fresh_trace = false;
+      in.timed_out = true;
+      check_case("(c2) GPU invalid, trace not fresh", in, "H2: expansion shader or constants");
+    }
+    {  // (c3) the draw table does not read back equal to the uploaded table
+      bvh::P2bDiagInput in = base();
+      in.table_matches = false;
+      check_case("(c3) draw table differs", in, "H2: draw upload");
+    }
+    {  // (d) a valid record whose box the ray enters; the trace counted nothing
+      bvh::P2bDiagInput in = base();
+      in.records.push_back(make_record(true));
+      in.ray_valid = true;
+      in.ray_origin[2] = -10.f;
+      in.ray_direction[2] = 1.f;
+      in.counters.trace_count = 1u;
+      in.counters.p2b_tested = 0u;
+      check_case("(d) box crossed, trace counters 0", in, "H3a: count path or loop not reached");
+    }
+    {  // (d2) a draw whose arena instance count is zero: the arena is wrong
+      bvh::P2bDiagInput in = base();
+      in.table[0].extra[0] = 1u;
+      in.table[0].extra[1] = 0u;
+      check_case("(d2) indirect draw with zero instances", in, "H1d: wrong base or stride or stale buffer");
+    }
+    {  // (d3) a box the ray enters, the trace tested records, none hit the box
+      bvh::P2bDiagInput in = base();
+      in.records.push_back(make_record(true));
+      in.ray_valid = true;
+      in.ray_origin[2] = -10.f;
+      in.ray_direction[2] = 1.f;
+      in.counters.p2b_tested = 5u;
+      in.counters.p2b_skipped = 0u;
+      in.counters.p2b_box_hits = 0u;
+      check_case("(d3) box crossed, no P2b box hit", in, "H3c: bounds or ray convention");
+    }
+    {  // (d4) the trace hit the P2b boxes but no ray won on a P2b record
+      bvh::P2bDiagInput in = base();
+      in.counters.p2b_tested = 5u;
+      in.counters.p2b_skipped = 0u;
+      in.counters.p2b_box_hits = 2u;
+      in.counters.p2b_wins = 0u;
+      check_case("(d4) box hits, no P2b win", in, "H3d: BLAS, slot or visibility");
+    }
+    {  // (e) the trace bound fewer records than the expansion wrote
+      bvh::P2bDiagInput in = base();
+      in.counters.instance_count = 3u;
+      in.counters.trace_count = 2u;
+      check_case("(e) instance count mismatch", in, "H4: second present or timing");
+    }
+    {  // (e2) the trace-count term is gated by a fresh trace: not fresh, no H4
+      bvh::P2bDiagInput in = base();
+      in.counters.instance_count = 3u;
+      in.counters.trace_count = 2u;
+      in.fresh_trace = false;
+      check_case("(e2) instance count mismatch, trace not fresh", in, "open (no fresh trace)");
+    }
+    {  // (e3) the empty-present term is not gated by the trace: H4 with a stale trace
+      bvh::P2bDiagInput in = base();
+      in.counters.expand_presents = 5u;
+      in.counters.expand_empty = 3u;
+      in.fresh_trace = false;
+      in.timed_out = true;
+      check_case("(e3) empty presents, trace not fresh", in, "H4: second present or timing");
+    }
+    {  // (e4) nothing fires on a healthy fresh present
+      bvh::P2bDiagInput in = base();
+      check_case("(e4) healthy present", in, "open");
+    }
+    {  // (f) the arena read was skipped (zero bytes this present): the reason is in the readback block
+      bvh::P2bDiagInput in = base();
+      in.arena.clear();
+      in.arena_reason = "skipped: arena bytes 0 this present";
+      const std::string text = bvh::BuildP2bDiagJson(in, nullptr, nullptr);
+      CHECK(text.find("\"arena_reason\": \"skipped: arena bytes 0 this present\"") != std::string::npos, "(f) arena_reason in readback");
+      CHECK(text.find("\"records_reason\": \"ok\"") != std::string::npos, "(f) records_reason ok by default");
+    }
+    {  // (g) a box the ray enters, but the trace stats are stale (timed out): no trace row, verdict says so
+      bvh::P2bDiagInput in = base();
+      in.records.push_back(make_record(true));
+      in.ray_valid = true;
+      in.ray_origin[2] = -10.f;
+      in.ray_direction[2] = 1.f;
+      in.counters.p2b_tested = 0u;
+      in.fresh_trace = false;
+      in.timed_out = true;
+      std::string verdict;
+      const std::string text = bvh::BuildP2bDiagJson(in, &verdict, nullptr);
+      CHECK(verdict == "open (no fresh trace)", "(g) stale trace verdict '%s'", verdict.c_str());
+      CHECK(text.find("\"fresh\": false") != std::string::npos, "(g) trace fresh false");
+      CHECK(text.find("\"timed_out\": true") != std::string::npos, "(g) trace timed_out true");
+      CHECK(text.find("\"armed_frame\": 90") != std::string::npos, "(g) trace armed_frame");
+    }
+    {  // (h) almost every record skipped (1 tested, 4e9 skipped): the 9/10 ratio needs 64-bit math to be seen
+      bvh::P2bDiagInput in = base();
+      in.counters.p2b_tested = 1u;
+      in.counters.p2b_skipped = 4000000000u;
+      check_case("(h) skipped above 9/10 (no 32-bit wrap)", in, "H3b: t17 reads zeros or mesh_id out of range");
+    }
+    {  // (h2) the same counts without a fresh trace: the H3b row is gated
+      bvh::P2bDiagInput in = base();
+      in.counters.p2b_tested = 1u;
+      in.counters.p2b_skipped = 4000000000u;
+      in.fresh_trace = false;
+      in.timed_out = true;
+      check_case("(h2) skipped above 9/10, trace not fresh", in, "open (no fresh trace)");
+    }
+    {  // (h3) tested + skipped = 6e9 overflows 32 bits; the ratio is 1/2, so the decision is not H3b
+      bvh::P2bDiagInput in = base();
+      in.counters.p2b_tested = 3000000000u;
+      in.counters.p2b_skipped = 3000000000u;
+      check_case("(h3) tested 3e9 skipped 3e9 (sum overflows 32 bits)", in, "open");
+    }
+  }
+  std::printf("33 P2b: exact-verdict cases run, %d failed\n", g_failures - failures_before_33);
 
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures == 0 ? 0 : 1;

@@ -64,6 +64,7 @@
 #include "bvh_pool.hpp"
 #include "alpha_live.hpp"
 #include "bvh_resources.hpp"
+#include "deform_live.hpp"
 
 namespace falcom_world::bvh {
 
@@ -609,6 +610,7 @@ inline void RebuildLiveTlas(
   uint64_t visibility_revision = 0u;
   uint64_t dynamic_revision = 0u;
   uint64_t flag_revision = 0u;
+  uint32_t p2b_skipped = 0u;
   const bool per_frame = LiveDynamicActive(*data);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -621,7 +623,10 @@ inline void RebuildLiveTlas(
     g_pool.stats.wind_sway_bound_m = 0.f;
     for (const WorldInstance& instance : g_pool.instances) {
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
-      if (per_frame && g_pool.meshes[instance.mesh_id].dynamic && !g_pool.meshes[instance.mesh_id].alpha) continue;  // P2b: drawn per frame, not in the TLAS (alpha: never recorded)
+      if (per_frame && g_pool.meshes[instance.mesh_id].dynamic && !g_pool.meshes[instance.mesh_id].alpha) {  // P2b: drawn per frame, not in the TLAS (alpha: never recorded)
+        p2b_skipped += 1u;
+        continue;
+      }
       LiveTlasInstance& copy = snapshot.emplace_back();
       copy.uid = g_pool.meshes[instance.mesh_id].uid;
       copy.alpha = g_pool.meshes[instance.mesh_id].alpha;
@@ -657,6 +662,7 @@ inline void RebuildLiveTlas(
     data->tlas_visibility_revision = visibility_revision;
     data->tlas_dynamic_revision = dynamic_revision;
     data->tlas_per_frame = per_frame;
+    data->tlas_p2b_skipped = p2b_skipped;
     data->tlas_flag_revision = flag_revision;
     data->tlas_store_version = store_version;
     data->tlas_alpha_mode = alpha_mode;
@@ -729,6 +735,9 @@ inline void RebuildLiveTlas(
     timing.rebuild_ms_max = stats.tlas_ms_max;
     timing.rebuild_ms_sum += stats.tlas_ms_last;
     timing.refits_since_rebuild = data->tlas_refits_since_rebuild;
+    g_pool.stats.dynamic_tlas_per_frame = data->tlas_per_frame ? 1u : 0u;
+    g_pool.stats.dynamic_tlas_partition = data->tlas_dynamic_first;
+    g_pool.stats.dynamic_tlas_p2b_skipped = data->tlas_p2b_skipped;
   };
   if (instances.empty()) {
     DestroyLiveTlas(device, data);
@@ -1187,6 +1196,23 @@ inline void DescribeLiveCameraView(const LiveTlasInstance& info, BvhInspect& ins
   }
 }
 
+// Slab test of a ray against a box: true with the entry distance (>= 0) when the ray crosses the box.
+inline bool RayBoxEntry(const float* origin, const float* direction, const float* bounds_min, const float* bounds_max, float* entry) {
+  float t_min = 0.f;
+  float t_max = 1e30f;
+  for (int k = 0; k < 3; ++k) {
+    const float inv = 1.f / direction[k];
+    float a = (bounds_min[k] - origin[k]) * inv;
+    float b = (bounds_max[k] - origin[k]) * inv;
+    if (a > b) std::swap(a, b);
+    t_min = (std::max)(t_min, a);
+    t_max = (std::min)(t_max, b);
+    if (!(t_min <= t_max)) return false;
+  }
+  *entry = t_min;
+  return true;
+}
+
 // Inspect lines for a pixel with no BVH hit, or whose hit the depth compare calls missing or extra: the pool instances
 // whose bounds the pixel's primary ray crosses (nearest first, up to 8), each with its state. The game depth point is
 // not read back, so the ray (trace camera position and the trace shader's pixel direction) is the only geometry.
@@ -1222,19 +1248,8 @@ inline void DescribeLiveCandidates(BvhDeviceData* data) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     for (size_t i = 0u; i < g_pool.instances.size(); ++i) {
       const WorldInstance& instance = g_pool.instances[i];
-      float t_min = 0.f;
-      float t_max = 1e30f;
-      bool crosses = true;
-      for (int k = 0; k < 3 && crosses; ++k) {
-        const float inv = 1.f / direction[k];
-        float a = (instance.bounds_min[k] - origin[k]) * inv;
-        float b = (instance.bounds_max[k] - origin[k]) * inv;
-        if (a > b) std::swap(a, b);
-        t_min = (std::max)(t_min, a);
-        t_max = (std::min)(t_max, b);
-        crosses = t_min <= t_max;
-      }
-      if (crosses) crossings.push_back({t_min, i});
+      float entry = 0.f;
+      if (RayBoxEntry(origin, direction, instance.bounds_min, instance.bounds_max, &entry)) crossings.push_back({entry, i});
     }
   }
   std::sort(crossings.begin(), crossings.end(), [](const Crossing& a, const Crossing& b) { return a.entry < b.entry; });
@@ -1271,6 +1286,9 @@ inline void DescribeLiveCandidates(BvhDeviceData* data) {
       } else if (!camera_seen && inspect.hiding) {
         candidate.status = "hidden";
         candidate.reason = "hidden (the game camera does not show it)";
+      } else if (LiveDynamicActive(*data) && mesh.dynamic && !mesh.alpha) {
+        candidate.status = "p2b_record";
+        candidate.reason = "per-frame record (P2b, not in the TLAS)";
       } else if (instance.dynamic) {
         candidate.status = "dynamic";
         candidate.reason = "dynamic";
@@ -1313,6 +1331,20 @@ inline void DescribeLiveInspect(BvhDeviceData* data) {
     if (inspect.camera_hidden) {
       inspect.lines.push_back("Trace: a surface the game camera does not show was skipped along this ray (hiding is on); turn hiding off and click again to inspect it.");
     }
+  } else if ((inspect.instance & kDynamicFlagsMask) == kDynamicDrawFlag) {
+    const uint32_t record = inspect.instance & ~kDynamicFlagsMask;
+    uint32_t slot = 0u;
+    uint32_t flags = 0u;
+    for (const DynamicDrawGPU& draw : data->dynamic.last_table) {
+      if (record >= draw.info[2] && record < draw.info[2] + draw.info[1]) {
+        slot = draw.extra[2];
+        flags = draw.info[3];
+        break;
+      }
+    }
+    inspect.lines.push_back(LiveFormat("Pixel (%u, %u): hit per-frame record %u (mesh slot %u, flags %u).", inspect.x, inspect.y,
+                                       record, slot, flags)
+                            + compare_text);
   } else if (inspect.instance >= data->tlas_info.size() || inspect.instance >= data->tlas_instances_cpu.size()) {
     inspect.lines.push_back(LiveFormat("Pixel (%u, %u): hit TLAS instance %u, which the current TLAS no longer has (rebuilt since).",
                                        inspect.x, inspect.y, inspect.instance));
@@ -1578,8 +1610,30 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
     g_pool.stats.dynamic_not_resident = not_resident;
     g_pool.stats.dynamic_expand_cpu_ms = LiveElapsedMs(start);
     g_pool.stats.dynamic_expand_gpu_ms = dynamic.timer.last_ms;
+    g_pool.stats.dynamic_expand_presents += 1u;
+    g_pool.stats.dynamic_expand_empty += table.empty() ? 1u : 0u;
+    g_pool.stats.dynamic_ready = dynamic.ready;
+    g_pool.stats.dynamic_instance_count = 0u;
+    g_pool.stats.dynamic_flagged_total = 0u;
+    g_pool.stats.dynamic_flagged_resident = 0u;
+    for (const auto& mesh : g_pool.meshes) {
+      if (!mesh.dynamic) continue;
+      g_pool.stats.dynamic_flagged_total += 1u;
+      const auto slot_it = data->slot_by_uid.find(mesh.uid);
+      if (slot_it != data->slot_by_uid.end() && slot_it->second < data->slots.size() && data->slots[slot_it->second].live) {
+        g_pool.stats.dynamic_flagged_resident += 1u;
+      }
+    }
+    dynamic.last_draws = draws;
+    dynamic.last_table = table;
+    dynamic.last_frame = g_state.frame.load();
   }
-  if (!g_live_bvh.enabled.load(std::memory_order_relaxed) || !EnsureDynamicExpand(device, data)) return;
+  if (!g_live_bvh.enabled.load(std::memory_order_relaxed)) return;
+  if (!EnsureDynamicExpand(device, data)) {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.dynamic_expand_failed += 1u;
+    return;
+  }
   auto* cmd_list = queue->get_immediate_command_list();
   if (cmd_list == nullptr || table.empty()) return;
 
@@ -1590,6 +1644,8 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
   if (!WriteBufferRange(device, cmd_list, dynamic.draws, sizeof(DynamicDrawGPU), 0u, table.data(),
                         table.size() * sizeof(DynamicDrawGPU), &error)) {
     renodx::utils::log::w("[world-bvh] P2b: draw table not written: ", error);
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.dynamic_expand_failed += 1u;
     return;
   }
   BeginGpuTimer(device, cmd_list, &dynamic.timer);
@@ -1615,6 +1671,8 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
   cmd_list->barrier(dynamic.instances, RU::unordered_access, RU::shader_resource);
   EndGpuTimer(cmd_list, &dynamic.timer);
   dynamic.instance_count = records;
+  std::lock_guard<std::mutex> lock(g_pool.mutex);
+  g_pool.stats.dynamic_instance_count = records;
 }
 
 inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_queue* queue) {

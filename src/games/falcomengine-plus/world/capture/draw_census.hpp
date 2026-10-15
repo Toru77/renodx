@@ -17,6 +17,7 @@
 #include "../bvh/bvh_live.hpp"
 #include "../bvh/deform_live.hpp"
 #include "../bvh/deform_probe.hpp"
+#include "../bvh/p2b_diag.hpp"
 #include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
 #include "../capture/camera_capture.hpp"
@@ -473,6 +474,7 @@ inline void OnWorldPresent(
   bvh::DrainPoolScan(queue->get_device(), queue);
   bvh::ExpandLiveDynamic(queue->get_device(), queue);
   bvh::RefitLiveTlasAfterDrain(queue->get_device(), queue);
+  bvh::RunP2bDiagnostics(queue->get_device(), queue);
   bvh::DrainDeformProbe(queue->get_device(), queue);
 }
 

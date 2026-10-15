@@ -231,7 +231,7 @@ struct TraceInputs {
   View<bvh::WorldInstanceGPU> dynamic;  // P2b records (world_bvh_trace.hlsli g_trace_dynamic_instances)
   bool dynamic_skip_hidden = false;     // WORLD_TRACE_DYNAMIC_SKIP_HIDDEN (RTAO): records the camera does not show are skipped
 };
-struct Counters { uint32_t invalid = 0, overflow = 0; };
+struct Counters { uint32_t invalid = 0, overflow = 0; uint32_t p2b_tested = 0, p2b_skipped = 0, p2b_box_hits = 0; };
 
 static bool Aabb(F3 o, F3 d, const float* mn, const float* mx, float t_min, float t_max) {
   const F3 inv = {1.f / d.x, 1.f / d.y, 1.f / d.z};
@@ -387,11 +387,13 @@ static float TraceWorld(const TraceInputs& in, F3 o, F3 d, Counters& c, uint32_t
   // prefilter within best, and the hidden skip when the trace hides what the camera does not show.
   for (uint32_t r = 0; r < in.dynamic.count; ++r) {
     const bvh::WorldInstanceGPU inst = in.dynamic[r];
-    if (inst.header[3] < 0.5f) continue;
+    if (inst.header[3] < 0.5f) { c.p2b_skipped++; continue; }
     const uint32_t mesh_id = (uint32_t)inst.header[0];
-    if (mesh_id >= in.meshes.count) { c.invalid++; continue; }
+    if (mesh_id >= in.meshes.count) { c.invalid++; c.p2b_skipped++; continue; }
     if (fade.hide && in.dynamic_skip_hidden && (static_cast<uint32_t>(inst.visibility[2] + 0.5f) & 2u) == 0u) continue;
+    c.p2b_tested++;
     if (!Aabb(o, d, inst.bounds_min, inst.bounds_max, 0.001f, best)) continue;
+    c.p2b_box_hits++;
     if (TraceInstance(in, inst, mesh_id, o, d, fade, c, &best, &faded_t, &best_faded)) {
       any = true; *hit_instance = 0x40000000u | r;
     }
@@ -627,7 +629,7 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
   std::uniform_real_distribution<float> uni(-1.f, 1.f);
   float cam[3]; bvh::PoolCameraPosition(cam);
   const F3 origin = {cam[0], cam[1] + 30.f, cam[2]};
-  int mismatches = 0, hits = 0;
+  int mismatches = 0, hits = 0, p2b_wins = 0;
   Counters c;
   std::vector<F3> targets;
   {
@@ -672,6 +674,7 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
     uint32_t instance;
     const float t_bvh = TraceWorld(in, origin, dirs[i], c, &instance, fade);
     const float t_ref = ref[i].t;
+    if (t_bvh >= 0.f && (instance & 0xC0000000u) == 0x40000000u) ++p2b_wins;
     const bool agree = (t_bvh < 0.f && t_ref < 0.f)
                        || (t_bvh >= 0.f && t_ref >= 0.f && std::fabs(t_bvh - t_ref) <= 1e-3f * std::max(1.f, t_ref));
     if (t_ref >= 0.f) ++hits;
@@ -683,6 +686,13 @@ static int CompareTraces(const Device& dev, const bvh::BvhDeviceData& data, cons
   std::printf("%s: %d rays, %d hits, %d mismatches, invalid %u overflow %u\n", label, rays, hits, mismatches, c.invalid, c.overflow);
   CHECK(c.invalid == 0 && c.overflow == 0, "%s trace counters", label);
   CHECK(hits > rays / 4, "%s enough hits (%d)", label, hits);
+  if (records != nullptr) {
+    // Every ray tests or skips every record (no hidden skip here), boxes are a subset of the tests, wins are rays.
+    CHECK(c.p2b_tested + c.p2b_skipped == dirs.size() * records->size(), "%s P2b tested %u + skipped %u != rays %zu * records %zu",
+          label, c.p2b_tested, c.p2b_skipped, dirs.size(), records->size());
+    CHECK(c.p2b_box_hits <= c.p2b_tested, "%s P2b box hits %u > tested %u", label, c.p2b_box_hits, c.p2b_tested);
+    CHECK(static_cast<size_t>(p2b_wins) <= dirs.size(), "%s P2b wins %d > rays %zu", label, p2b_wins, dirs.size());
+  }
   return mismatches;
 }
 
@@ -1749,6 +1759,19 @@ int main() {
     present();
     CHECK(in_tlas(uid) == 0u, "P2b ready: flagged mesh left out of the TLAS (%zu)", in_tlas(uid));
     CHECK(in_tlas(alpha_uid) == 2u, "P2b ready: flagged alpha mesh stays in the TLAS (%zu)", in_tlas(alpha_uid));
+    {
+      // The flagged, non-alpha instances of the region (earlier stages may leave more than kG's two).
+      std::lock_guard lock(bvh::g_pool.mutex);
+      uint32_t flagged = 0u;
+      for (const auto& inst : bvh::g_pool.instances) {
+        if (!bvh::PoolInstanceInRegion(inst, bvh::CurrentPoolRegion())) continue;
+        const auto& mesh = bvh::g_pool.meshes[inst.mesh_id];
+        flagged += (mesh.dynamic && !mesh.alpha) ? 1u : 0u;
+      }
+      CHECK(bvh::g_pool.stats.dynamic_tlas_p2b_skipped == flagged && flagged >= 2u,
+            "P2b: the TLAS build left out the %u flagged instances (stats %u)", flagged, bvh::g_pool.stats.dynamic_tlas_p2b_skipped);
+      CHECK(bvh::g_pool.stats.dynamic_tlas_per_frame == 1u, "P2b: stats report the per-frame TLAS");
+    }
     present();
     CHECK(not_ready_logs() == logs_before + 1u, "P2b ready: no further not-ready log (%zu)", not_ready_logs() - logs_before);
     bvh::g_pool.dynamic_per_frame.store(false);
@@ -1760,10 +1783,34 @@ int main() {
     CHECK(in_tlas(alpha_uid) == 2u, "switch on at once: alpha mesh still in the TLAS (%zu)", in_tlas(alpha_uid));
     CHECK(CompareTraces(dev, *data, "per-frame", 40, 22) == 0, "trace agrees with the per-frame switch");
     // P2b records of the flagged mesh (left out of the TLAS): with them the trace agrees with brute force, without them it does not.
-    const std::vector<bvh::WorldInstanceGPU> records = BuildDynamicRecords(*data, bvh::CurrentPoolRegion());
+    std::vector<bvh::WorldInstanceGPU> records = BuildDynamicRecords(*data, bvh::CurrentPoolRegion());
     CHECK(records.size() >= 2u, "P2b records: one per flagged instance (%zu)", records.size());
+    // A record the GPU marked invalid (header.w 0) is skipped by the trace: it changes no hit.
+    bvh::WorldInstanceGPU dead = records.front();
+    dead.header[3] = 0.f;
+    records.push_back(dead);
     CHECK(CompareTraces(dev, *data, "P2b records", 300, 23, &records) == 0, "trace with the P2b records agrees with brute force");
     CHECK(CompareTraces(dev, *data, "no P2b records", 300, 23) > 0, "without the P2b records the flagged mesh is missing from the trace");
+    // Inspect of a P2b record hit: the per-frame line (the pool id stays unknown), not the "no longer has" text.
+    {
+      bvh::BvhInspect& inspect = data->inspect;
+      inspect.valid = true;
+      inspect.hit = true;
+      inspect.x = 1u;
+      inspect.y = 1u;
+      inspect.instance = 0x40000005u;
+      bvh::DescribeLiveInspect(data);
+      std::string text;
+      for (const auto& line : inspect.lines) text += line + "\n";
+      CHECK(text.find("per-frame record 5") != std::string::npos && text.find("no longer has") == std::string::npos,
+            "P2b record inspect line: %s", text.c_str());
+      inspect.instance = 0x80000001u;
+      bvh::DescribeLiveInspect(data);
+      CHECK(inspect.lines.size() > 0 && inspect.lines.back().find("no longer has") != std::string::npos,
+            "dynamic-object inspect instance keeps its text");
+      inspect.valid = false;
+      inspect.hit = false;
+    }
     // alpha_foliage OFF drops the alpha instances at once, whatever the per-frame rule says.
     bvh::g_pool.alpha_foliage.store(false);
     present();

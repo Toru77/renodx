@@ -68,6 +68,8 @@ inline constexpr uint64_t kDynamicResetGarbageBytes = 8ull * 1024ull * 1024ull;
 inline constexpr uint64_t kDynamicArenaMinBytes = 256ull * 1024ull;  // first size of a BLAS arena
 inline constexpr uint32_t kDynamicRefitGroupSize = 64u;  // world_bvh_refit numthreads
 inline constexpr uint32_t kDynamicInstanceFlag = 0x80000000u;  // trace hit.instance of a dynamic object
+inline constexpr uint32_t kDynamicDrawFlag = 0x40000000u;      // trace hit.instance of a P2b record: | its record index
+inline constexpr uint32_t kDynamicFlagsMask = kDynamicInstanceFlag | kDynamicDrawFlag;  // the flag bits of trace hit.instance
 inline constexpr uint32_t kDynamicMeshMarker = 0xFFFFFFFEu;    // trace hit.mesh of a dynamic object
 
 // Must match DynamicObjectGPU in world_bvh_types.hlsli.

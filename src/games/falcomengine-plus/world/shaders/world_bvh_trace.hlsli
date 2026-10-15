@@ -87,6 +87,9 @@ struct WorldTraceCounters
     uint camera_hidden;    // 1: the game camera does not show the nearest BVH surface along the ray
     uint alpha_tests;      // triangle hits of alpha-tested materials tested against the atlas
     uint alpha_cut;        // of those, the ones cut (alpha below the threshold)
+    uint p2b_tested;       // P2b records tested against the ray (diagnostic, STAT_P2B_TESTED)
+    uint p2b_skipped;      // P2b records skipped: header.w 0 or mesh id out of range (STAT_P2B_SKIPPED)
+    uint p2b_box_hits;     // P2b records whose box the ray enters (STAT_P2B_BOX_HITS)
 };
 
 // Ray-wide game camera settings (rays from the camera only).
@@ -107,6 +110,9 @@ void TraceResetCounters(out WorldTraceCounters counters)
     counters.camera_hidden = 0u;
     counters.alpha_tests = 0u;
     counters.alpha_cut = 0u;
+    counters.p2b_tested = 0u;
+    counters.p2b_skipped = 0u;
+    counters.p2b_box_hits = 0u;
 }
 
 // Mirrors camera_fade.hpp CameraFadeInterval: the distances [lo, hi] at which
@@ -658,21 +664,28 @@ WorldTraceHit TraceWorldRay(
     for (uint record_index = 0u; record_index < g_trace_dynamic_instance_count; ++record_index)
     {
         const WorldInstanceGPU instance = g_trace_dynamic_instances[record_index];
-        if (instance.header.w < 0.5) continue;
+        if (instance.header.w < 0.5)
+        {
+            counters.p2b_skipped++;
+            continue;
+        }
         const uint mesh_id = (uint)instance.header.x;
         if (mesh_id >= mesh_count)
         {
             counters.invalid_refs++;
+            counters.p2b_skipped++;
             continue;
         }
 #ifdef WORLD_TRACE_DYNAMIC_SKIP_HIDDEN
         // The same rule as TraceBlas with view.hide: a record the game camera does not show is never hit.
         if (view.hide && ((uint)(instance.visibility.z + 0.5) & INSTANCE_CAMERA_VISIBLE) == 0u) continue;
 #endif
+        counters.p2b_tested++;
         // Conservative world-space box of the record (WorldInstanceGPU bounds): a miss within best.t is no hit.
         float box_near;
         float box_far;
         if (!AabbIntersect(origin, direction, instance.bounds_min.xyz, instance.bounds_max.xyz, t_min, best.t, box_near, box_far)) continue;
+        counters.p2b_box_hits++;
         if (TraceWorldInstance(instance, DYNAMIC_DRAW_FLAG | record_index, origin, direction, t_min, view, hidden_t, counters, best)
             && any_hit)
         {

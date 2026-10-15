@@ -91,11 +91,16 @@ struct BvhTraceStats {
   // Alpha-tested foliage: triangle hits tested against the atlas, and those cut (invalid reads count as invalid_refs).
   uint32_t alpha_tests = 0u;
   uint32_t alpha_cut = 0u;
+  uint32_t p2b_tested = 0u;    // P2b records tested by the trace (kTraceStatP2bTested)
+  uint32_t p2b_skipped = 0u;   // P2b records skipped (kTraceStatP2bSkipped)
+  uint32_t p2b_box_hits = 0u;  // P2b records whose box the ray entered (kTraceStatP2bBoxHits)
+  uint32_t p2b_wins = 0u;      // rays whose final hit is a P2b record (kTraceStatP2bWins)
   // Rays whose nearest BVH surface the game camera does not show: an instance
   // no camera VS drew, or a near-faded surface (shown in the view when hiding
   // is off; skipped when it is on).
   uint32_t camera_hidden = 0u;
   bool hiding = false;  // the dispatch hid them
+  uint32_t frame = 0u;  // g_state.frame at the readback that filled these values
   bool valid = false;
   bool invariant_ok = false;
 };
@@ -282,6 +287,9 @@ struct DynamicExpandGpu {
   bool failure_logged = false;   // EnsureDynamicExpand logs its failure once
   bool ready = false;            // GPU objects created: flagged meshes leave the TLAS (LiveDynamicActive)
   bool not_ready_logged = false; // UpdateLiveBvh logs a switch on without GPU objects once
+  std::vector<PoolDynamicDraw> last_draws;  // P2b diagnostics: the draws of the last present (CPU copy)
+  std::vector<DynamicDrawGPU> last_table;   // the draw table uploaded for the last present
+  uint32_t last_frame = 0u;                 // g_state.frame of the last expansion pass
 };
 
 struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
@@ -330,6 +338,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   uint32_t tlas_wind_count = 0u;                // swayed wind instances in the TLAS (refit every present while > 0)
   bool tlas_sway_on = false;                    // wind sway switch as the TLAS was built
   bool tlas_per_frame = false;                  // P2b switch as the TLAS was built (flagged meshes left out when on)
+  uint32_t tlas_p2b_skipped = 0u;               // P2b: flagged instances left out of the TLAS by the last build
   uint64_t tlas_flag_revision = 0u;             // g_pool.dynamic_flag_revision the TLAS reflects
   bool tlas_refit_failed = false;               // the next TLAS update is a full rebuild
   uint64_t tlas_pool_revision = 0u;
@@ -358,6 +367,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   BvhTraceStats trace_stats;
   bool trace_hiding = false;  // camera-view hiding setting of the last dispatch
   uint32_t trace_dynamic_count = 0u;  // deforming objects bound to the last dispatch
+  uint32_t trace_dynamic_instance_count = 0u;  // P2b records bound to the last dispatch
   BvhInspect inspect;
   bool trace_ready = false;
   GpuTimer trace_timer;

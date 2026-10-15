@@ -48,7 +48,7 @@ cbuffer cb_trace : register(b13)
     uint4 g_dynamic;      // x: deforming objects bound at t11 (deform_live.hpp); y: P2b records at t17 (dynamic_expand)
 };
 
-#define TRACE_STATS_COUNT 17u
+#define TRACE_STATS_COUNT 21u
 #define STAT_RAYS 0u
 #define STAT_HITS 1u
 #define STAT_MISSES 2u
@@ -66,9 +66,13 @@ cbuffer cb_trace : register(b13)
 #define STAT_CAMERA_HIDDEN 14u
 #define STAT_ALPHA_TESTS 15u
 #define STAT_ALPHA_CUT 16u
+#define STAT_P2B_TESTED 17u   // P2b records tested (diagnostic)
+#define STAT_P2B_SKIPPED 18u  // P2b records skipped (header.w 0 or mesh id out of range)
+#define STAT_P2B_BOX_HITS 19u // P2b records whose box the ray enters
+#define STAT_P2B_WINS 20u     // rays whose final hit is a P2b record
 // One pixel reports its hit after the counters:
 // flags (1 traced, 2 hit, 4 hidden from the game camera), instance, mesh, prim, t, position xyz, compare class.
-#define TRACE_INSPECT_BASE 17u
+#define TRACE_INSPECT_BASE 21u
 
 #define TRACE_MODE_SHADED 7u
 #define TRACE_MODE_INSTANCE 8u
@@ -235,6 +239,10 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         InterlockedAdd(gs_stats[STAT_CAMERA_HIDDEN], counters.camera_hidden);
         InterlockedAdd(gs_stats[STAT_ALPHA_TESTS], counters.alpha_tests);
         InterlockedAdd(gs_stats[STAT_ALPHA_CUT], counters.alpha_cut);
+        InterlockedAdd(gs_stats[STAT_P2B_TESTED], counters.p2b_tested);
+        InterlockedAdd(gs_stats[STAT_P2B_SKIPPED], counters.p2b_skipped);
+        InterlockedAdd(gs_stats[STAT_P2B_BOX_HITS], counters.p2b_box_hits);
+        if ((hit.instance & 0xC0000000u) == DYNAMIC_DRAW_FLAG && hit.prim != 0xFFFFFFFFu) InterlockedAdd(gs_stats[STAT_P2B_WINS], 1u);
     }
 
     GroupMemoryBarrierWithGroupSync();

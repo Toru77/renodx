@@ -18,6 +18,7 @@
 #include "../debug/crash_log.hpp"
 #include "bvh_debug.hpp"
 #include "bvh_pool.hpp"
+#include "p2b_diag.hpp"
 
 namespace falcom_world::bvh {
 
@@ -133,6 +134,17 @@ inline void DrawBvhPanel() {
   bool do_dump = false;
   bool do_reset = false;
   if (ImGui::Button("Dump Pool JSON")) do_dump = true;
+  ImGui::SameLine();
+  if (ImGui::Button("Diagnostics (all)")) {
+    g_p2b_diag.armed_frame.store(g_state.frame.load());
+    g_bvh_trace.stats_requested.store(true);
+    g_p2b_diag.state.store(1u);
+    g_p2b_diag.requested.store(true);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Writes world_p2b_diag.json, world_p2b_summary.txt, world_pool*.json, world_deform_live.json and the manifest to the pool folder. Waits for the GPU once.\n"
+                      "Needs a trace view on (Trace Shaded or Trace Instance) and one middle-click on the moving object first; without them the trace verdicts say 'no fresh trace'.");
+  }
   ImGui::SameLine();
   if (ImGui::Button("Reset Pool")) do_reset = true;
   ImGui::SameLine();
@@ -404,6 +416,17 @@ inline void DrawBvhPanel() {
               static_cast<unsigned long long>(stats.dynamic_refused), static_cast<unsigned long long>(stats.dynamic_deferred),
               stats.dynamic_records, stats.dynamic_not_resident, stats.dynamic_arena_bytes / 1024.0,
               stats.dynamic_expand_cpu_ms, stats.dynamic_expand_gpu_ms);
+  {
+    std::string diag_verdict;
+    {
+      std::lock_guard<std::mutex> lock(g_p2b_diag.mutex);
+      diag_verdict = g_p2b_diag.verdict_hint;
+    }
+    const uint32_t diag_state = g_p2b_diag.state.load();
+    const char* diag_state_text = diag_state == 1u ? "armed" : diag_state == 2u ? "written" : diag_state == 3u ? "failed" : "idle";
+    ImGui::Text("Diagnostics: %s | armed since f%u | written f%u: %s", diag_state_text, g_p2b_diag.armed_frame.load(),
+                g_p2b_diag.written_frame.load(), diag_verdict.empty() ? "-" : diag_verdict.c_str());
+  }
   DrawDeformLivePanel(deform, deform_traced);
 
   ImGui::SeparatorText("GPU BVH (live)");

@@ -30,14 +30,18 @@ namespace falcom_world::bvh {
 inline constexpr uint32_t kTraceSrvCount = 18u;
 inline constexpr uint32_t kTraceUavCount = 2u;
 inline constexpr uint32_t kTracePushConstantCount = 40u;
-inline constexpr uint32_t kTraceStatsCount = 17u;
+inline constexpr uint32_t kTraceStatsCount = 21u;
 inline constexpr uint32_t kTraceStatCameraHidden = 14u;
 inline constexpr uint32_t kTraceStatAlphaTests = 15u;
 inline constexpr uint32_t kTraceStatAlphaCut = 16u;
+inline constexpr uint32_t kTraceStatP2bTested = 17u;   // P2b records tested (header.w, mesh id checked)
+inline constexpr uint32_t kTraceStatP2bSkipped = 18u;  // P2b records skipped (not valid, or mesh id out of range)
+inline constexpr uint32_t kTraceStatP2bBoxHits = 19u;  // P2b records whose box the ray enters
+inline constexpr uint32_t kTraceStatP2bWins = 20u;     // rays whose final hit is a P2b record
 // Inspect results follow the counters (world_bvh_trace.cs_5_0.hlsl
 // TRACE_INSPECT_BASE): flags (1 traced, 2 hit, 4 hidden from the game camera), instance, mesh,
 // prim, t, position xyz, depth compare class.
-inline constexpr uint32_t kTraceInspectBase = 17u;
+inline constexpr uint32_t kTraceInspectBase = 21u;
 inline constexpr uint32_t kTraceInspectCount = 9u;
 inline constexpr uint32_t kTraceStatsBufferCount = kTraceInspectBase + kTraceInspectCount;
 static_assert(kTraceInspectBase >= kTraceStatsCount, "trace inspect slots overlap the counters");
@@ -289,6 +293,12 @@ inline void DispatchBvhTrace(
   }
   cmd_list->push_constants(
       reshade::api::shader_stage::all_compute, data->trace_layout, 2, 0, kTracePushConstantCount, constants);
+  data->trace_dynamic_instance_count = data->dynamic.instance_count;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    g_pool.stats.dynamic_trace_count = data->dynamic.instance_count;
+    g_pool.stats.dynamic_trace_frame = g_state.frame.load();
+  }
   BeginGpuTimer(device, cmd_list, &data->trace_timer);
   cmd_list->dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
   EndGpuTimer(cmd_list, &data->trace_timer);
@@ -341,6 +351,10 @@ inline bool ReadbackBvhTraceStats(
   data->trace_stats.camera_hidden = values[kTraceStatCameraHidden];
   data->trace_stats.alpha_tests = values[kTraceStatAlphaTests];
   data->trace_stats.alpha_cut = values[kTraceStatAlphaCut];
+  data->trace_stats.p2b_tested = values[kTraceStatP2bTested];
+  data->trace_stats.p2b_skipped = values[kTraceStatP2bSkipped];
+  data->trace_stats.p2b_box_hits = values[kTraceStatP2bBoxHits];
+  data->trace_stats.p2b_wins = values[kTraceStatP2bWins];
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.alpha_gpu.tests = values[kTraceStatAlphaTests];
@@ -348,6 +362,7 @@ inline bool ReadbackBvhTraceStats(
     g_pool.alpha_gpu.trace_ms = data->trace_timer.last_ms;
   }
   data->trace_stats.hiding = data->trace_hiding;
+  data->trace_stats.frame = g_state.frame.load();
   data->trace_stats.valid = true;
   data->trace_stats.invariant_ok = data->trace_stats.rays == data->trace_stats.hits + data->trace_stats.misses;
   renodx::utils::log::i(
@@ -361,7 +376,11 @@ inline bool ReadbackBvhTraceStats(
       " camera_hidden=", data->trace_stats.camera_hidden,
       " alpha_tests=", data->trace_stats.alpha_tests,
       " alpha_cut=", data->trace_stats.alpha_cut,
-      " invariant=", data->trace_stats.invariant_ok ? "ok" : "FAIL");
+      " p2b_tested=", data->trace_stats.p2b_tested,
+      " p2b_skipped=", data->trace_stats.p2b_skipped,
+      " p2b_box_hits=", data->trace_stats.p2b_box_hits,
+      " p2b_wins=", data->trace_stats.p2b_wins,
+      " invariant=",data->trace_stats.invariant_ok ? "ok" : "FAIL");
   const BvhTraceStats& stats = data->trace_stats;
   if (stats.compare_match + stats.compare_missing + stats.compare_extra + stats.compare_extra_sky
           + stats.compare_far + stats.compare_sky + stats.compare_no_depth
