@@ -1399,14 +1399,52 @@ int main() {
     CHECK(d.size() == 2u, "(d) boxes touching on a face only: both kept (%zu left)", d.size());
     const auto e = retire({make(0x95u, false, 100u, 0.f), make(0x95u, false, 160u, 0.5f)}, 200u);
     CHECK(e.size() == 2u, "(e) fresher by exactly kPoolMovingHoldFrames: both kept (%zu left)", e.size());
-    const auto f = retire({make(0x96u, false, 100u, 0.f), make(0x96u, false, 170u, 0.9f)}, 200u);
-    CHECK(f.size() == 2u, "(f) static off-screen sibling, 10%% overlap of the smaller box: both kept (%zu left)", f.size());
+    const auto f = retire({make(0x96u, false, 100u, 0.f), make(0x96u, false, 170u, 0.97f)}, 200u);
+    CHECK(f.size() == 2u, "(f) static off-screen sibling, 3%% overlap of the smaller box: both kept (%zu left)", f.size());
     const auto g = retire({make(0x97u, false, 100u, 0.f), make(0x97u, false, 170u, 0.1f)}, 200u);
     CHECK(g.size() == 1u && g[0].admit_frame == 170u, "(g) static ghost, 90%% overlap with a fresher pose: retired (%zu left)", g.size());
     const auto h = retire({make(0x98u, false, 100u, 0.f), make(0x98u, false, 150u, 0.f)}, 300u);
     CHECK(h.size() == 2u, "(h) pose only 50 newer than instance (within hold), overlapping: kept (%zu left)", h.size());
     const auto i = retire({make(0x99u, false, 100u, 0.f), make(0x99u, false, 170u, 0.5f)}, 200u);
-    CHECK(i.size() == 2u, "(i) static, 50%% overlap of the smaller box, below 0.75: kept (%zu left)", i.size());
+    CHECK(i.size() == 1u && i[0].admit_frame == 170u, "(i) static, 50%% overlap of the smaller box, at least 0.05: retired (%zu left)", i.size());
+    bvh::WorldInstance slab_a = make(0x9Au, false, 100u, 0.f);
+    slab_a.bounds_max[1] = 2.f;
+    slab_a.bounds_max[2] = 0.1f;
+    bvh::WorldInstance slab_b = make(0x9Au, false, 170u, 0.f);
+    slab_b.bounds_max[0] = 0.1f;
+    slab_b.bounds_max[1] = 2.f;
+    const auto hinge = retire({slab_a, slab_b}, 200u);
+    CHECK(hinge.size() == 1u && hinge[0].admit_frame == 170u, "(j) slab hinge, 10%% overlap of the smaller box: older slab retired (%zu left)", hinge.size());
+    const auto k = retire({make(0x9Bu, false, 100u, 0.f), make(0x9Bu, false, 170u, 0.97f)}, 200u);
+    CHECK(k.size() == 2u, "(k) two props, 3%% overlap of the smaller box: both kept (%zu left)", k.size());
+  }
+
+  HStage("29e. Stutter cap: 10,000 same-key statics, some fresher by more than kPoolMovingHoldFrames; no overlap retirement for the key.");
+  {
+    fresh();
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.meshes.resize(1);
+    for (uint32_t n = 0u; n < 10000u; ++n) {
+      bvh::WorldInstance instance;
+      instance.mesh_key = 0xA0u;
+      instance.admit_frame = n % 2u ? 100u : 170u;
+      for (size_t k = 0; k < 3; ++k) {
+        instance.bounds_min[k] = 0.f;
+        instance.bounds_max[k] = 1.f;
+      }
+      instance.bounds_min[0] = 2.f * static_cast<float>(n);
+      instance.bounds_max[0] = instance.bounds_min[0] + 1.f;
+      bvh::g_pool.instances.push_back(instance);
+    }
+    std::vector<std::string> cap_lines;
+    const auto t0 = std::chrono::steady_clock::now();
+    bvh::RetirePoolOrphans(200u, bvh::PoolNewestSeenByKey(), &cap_lines);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(bvh::g_pool.instances.size() == 10000u, "10k same-key statics: none retired (%zu left)", bvh::g_pool.instances.size());
+    std::printf("10k same-key RetirePoolOrphans: %.2f ms\n", ms);
+#if !defined(__SANITIZE_ADDRESS__)
+    if (std::getenv("FALCOM_QUICK")) CHECK(ms <= 20.0, "10k same-key RetirePoolOrphans took %.2f ms (limit 20)", ms);
+#endif
   }
 
   HStage("29d. Static object moved to an overlapping pose with prevWorld == world: only the new pose remains.");

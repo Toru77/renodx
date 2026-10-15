@@ -140,6 +140,8 @@ inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
 inline constexpr const char* kWorldBuildId = "p2b-diag-2 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
+inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
+inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
 inline constexpr size_t kPoolMaxMeshes = 8192u;
 inline constexpr uint32_t kPoolMassRetireMeshes = 32u;  // one compaction retiring this many: a map change (diagnostic)
 // A map change sweeps static instances not seen since it, from this many frames after it: copies resume at
@@ -1695,6 +1697,7 @@ struct PoolPose {
 // Per mesh key: the newest last-seen frame of its dynamic instances, and a pose of every instance (static included).
 struct PoolKeySeen {
   uint32_t newest = 0u;
+  uint32_t count = 0u;
   std::vector<PoolPose> poses;
 };
 
@@ -1708,7 +1711,8 @@ inline std::unordered_map<uint64_t, PoolKeySeen> PoolNewestSeenByKey() {
     PoolPose pose{seen, {}, {}};
     std::memcpy(pose.bounds_min, instance.bounds_min, sizeof(pose.bounds_min));
     std::memcpy(pose.bounds_max, instance.bounds_max, sizeof(pose.bounds_max));
-    key.poses.push_back(pose);
+    if (++key.count <= kPoolGhostKeyMax) key.poses.push_back(pose);
+    else key.poses.clear();
   }
   return newest;
 }
@@ -1722,7 +1726,8 @@ inline bool PoolInstanceAlpha(const WorldInstance& instance) {
 // retirement) when a fresher dynamic instance of its mesh key exists (the
 // pose it was superseded by), or when it was not seen for kPoolPruneAge frames.
 // Any instance (static included) is also an orphan when a fresher instance of
-// its key overlaps at least 0.75 of the volume of the smaller of the two boxes.
+// its key overlaps at least kPoolGhostOverlap of the volume of the smaller of the two boxes.
+// Keys with more than kPoolGhostKeyMax instances keep no poses, so they get no overlap rule.
 // Alpha-tested meshes and wind rest-pose keys are exempt from that rule.
 inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t frame,
                                  const std::unordered_map<uint64_t, PoolKeySeen>& newest) {
@@ -1744,7 +1749,7 @@ inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t frame,
       own_volume *= instance.bounds_max[k] - instance.bounds_min[k];
       pose_volume *= pose.bounds_max[k] - pose.bounds_min[k];
     }
-    if (overlap > 0.f && overlap >= 0.75f * (std::min)(own_volume, pose_volume)) {
+    if (overlap > 0.f && overlap >= kPoolGhostOverlap * (std::min)(own_volume, pose_volume)) {
       return !PoolInstanceAlpha(instance) && g_pool.wind_keys.count(instance.mesh_key) == 0u;
     }
   }
