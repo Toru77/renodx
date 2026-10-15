@@ -955,6 +955,9 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
       << ", \"samples\": " << trace.samples << ", \"skipped\": " << trace.skipped << "}}";
   out << ",\n  \"gpu_check\": {\"checked\": " << (live.gpu_checked ? "true" : "false") << ", \"ok\": " << (live.gpu_ok ? "true" : "false")
       << ", \"frame\": " << live.gpu_check_frame << ", \"result\": \"" << PoolJsonEscape(live.gpu_result) << "\"}";
+  out << ",\n  \"live\": {\"tlas_instances\": " << live.tlas_instances << ", \"tlas_rebuilds\": " << live.tlas_rebuilds
+      << ", \"tlas_reason\": \"" << PoolJsonEscape(live.tlas_reason) << "\", \"tlas_frame\": " << live.tlas_frame
+      << ", \"refit_lag_last\": " << live.refit_lag_last << ", \"refit_lag_max\": " << live.refit_lag_max << "}";
   out << ",\n  \"errors\": {\"total\": " << errors.total << ", \"meshes\": " << errors.meshes << ", \"readback\": {\"map_failures\": "
       << errors.readback.map_failures << ", \"staging_failures\": " << errors.readback.staging_failures << ", \"base_mismatch\": "
       << errors.readback.base_mismatch << "}, \"bvh\": {\"blas_invalid\": " << errors.bvh.blas_invalid << ", \"tlas_invalid\": " << errors.bvh.tlas_invalid

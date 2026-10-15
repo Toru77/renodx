@@ -1396,9 +1396,15 @@ static void TestCacheDiagJson(Device* dev) {
                         "\"ratio_buckets\": [", "\"ratio_tris\": [", "\"hist_check\": ", "\"ms_sum\": ", "\"t80_work\": ", "\"work\": ",
                         "\"phase_ms\": {", "\"noop\": {", "\"reasons\": {", "\"entry_latency\": {", "\"label\": \"\"", "\"label_raw\": \"\"",
                         "\"timestamp\": \"", "\"presents\": ", "\"tiers_valid\": ", "\"tiers_frame\": ", "\"switches\": {", "\"slack\": {",
-                        "\"gpu\": {", "\"gpu_check\": {", "\"errors\": {"};
+                        "\"gpu\": {", "\"gpu_check\": {", "\"live\": {", "\"errors\": {"};
 
   for (const char* key : keys) CHECK(text.find(key) != std::string::npos, "json has %s", key);
+  const bvh::LiveBvhStats& live = bvh::GetBvhDeviceData(dev)->live;
+  CHECK(text.find("\"live\": {\"tlas_instances\": " + std::to_string(live.tlas_instances) + ", \"tlas_rebuilds\": " + std::to_string(live.tlas_rebuilds)) != std::string::npos,
+        "live block equals data->live");
+  CHECK(text.find("\"tlas_frame\": " + std::to_string(live.tlas_frame) + ", \"refit_lag_last\": " + std::to_string(live.refit_lag_last)
+                  + ", \"refit_lag_max\": " + std::to_string(live.refit_lag_max) + "}") != std::string::npos,
+        "live block has tlas_frame and refit lag");
   bvh::ResetCacheDiagCounters();
 }
 
@@ -1755,7 +1761,7 @@ static void TestCacheBlasWhileOff(Device* dev) {
 static void TestCacheLines() {
   bvh::ResetCacheDiagCounters();
   std::vector<std::string> lines = bvh::CacheDiagLines(nullptr);
-  CHECK(lines.size() == 12u && lines[0].rfind("Cache diagnostics (perf-panel-1 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
+  CHECK(lines.size() == 12u && lines[0].rfind(std::string("Cache diagnostics (") + bvh::kWorldBuildId + "): ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
         "header line (%zu lines)", lines.size());
   CHECK(HasLine(lines, "TLAS changes: rebuilds 0 (empty 0), added 0, removed 0, moved 0, nearest changed -, nearest add/remove -; by tier of nearest add/remove: T0 0, T1 0, T2 0, none 0"),
         "TLAS line");

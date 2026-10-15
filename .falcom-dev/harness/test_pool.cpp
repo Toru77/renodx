@@ -792,6 +792,17 @@ int main() {
   }
 
   bvh::DumpWorldPool();
+  {
+    size_t dynamic = 0u;
+    {
+      std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+      for (const auto& instance : bvh::g_pool.instances) dynamic += instance.dynamic ? 1u : 0u;
+    }
+    const std::vector<uint8_t> bytes = ReadFile((bvh::PoolOutputDir() / "world_pool.json").string());
+    const std::string text(bytes.begin(), bytes.end());
+    CHECK(text.find("\"following_instances\": " + std::to_string(dynamic) + ",") != std::string::npos, "world_pool.json following_instances equals dynamic instances (%zu)",
+          dynamic);
+  }
   bvh::OnDestroyDevicePool(&dev);
   std::printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAILED", g_failures);
   return g_failures == 0 ? 0 : 1;

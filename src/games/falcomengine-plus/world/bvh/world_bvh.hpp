@@ -89,8 +89,8 @@ inline void DrawDepthCompareStats(const BvhTraceStats& stats) {
               PoolPercent(stats.compare_extra_sky, judged));
 }
 
-// Deforming meshes in the BVH (deform_live.hpp): the checkbox and one status line.
-inline void DrawDeformLivePanel(const DeformLiveStats& stats, uint32_t traced) {
+// Deforming meshes in the BVH (deform_live.hpp): the checkbox.
+inline void DrawDeformLivePanel() {
   bool enabled = g_deform_live.enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Deforming meshes in the BVH (characters, water)", &enabled)) {
     g_deform_live.enabled.store(enabled, std::memory_order_relaxed);
@@ -103,9 +103,6 @@ inline void DrawDeformLivePanel(const DeformLiveStats& stats, uint32_t traced) {
                       "tree is built once from its first capture and refit every frame; the trace walks them\n"
                       "beside the static BVH. The probe (it confirms new shaders) is on while this is on.");
   }
-  if (!enabled) return;
-  ImGui::Text("Deforming: traced %u of %u draws, %u waiting for tree, %u failed",
-              traced, stats.frame_captures, stats.frame_pending, stats.failed);
 }
 
 inline void DrawBvhPanel() {
@@ -140,7 +137,6 @@ inline void DrawBvhPanel() {
   if (ImGui::Button("Diagnostics (all)")) {
     g_p2b_diag.armed_frame.store(g_state.frame.load());
     g_bvh_trace.stats_requested.store(true);
-    g_p2b_diag.state.store(1u);
     g_p2b_diag.requested.store(true);
   }
   if (ImGui::IsItemHovered()) {
@@ -359,82 +355,21 @@ inline void DrawBvhPanel() {
 
   PoolStats stats;
   PoolTlasTiming tlas_timing;
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    UpdatePoolStats();
-    stats = g_pool.stats;
-    tlas_timing = g_pool.tlas_timing;
-  }
-  DeformLiveStats deform;
-  uint32_t deform_traced = 0u;
-  float deform_refit_ms = -1.f;
-  {
-    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
-    deform = g_deform_live.stats;
-    deform_traced = g_deform_live.object_count;
-    deform_refit_ms = g_deform_live.refit_timer.last_ms;
-  }
-
-  if (stats.mesh_failures != 0u) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.4f, 0.4f, 1.f));
-  ImGui::Text("Meshes: %llu ok (%u admitted after a retry), %llu failed (%u unstable), %llu waiting, %llu retrying",
-              static_cast<unsigned long long>(stats.meshes), stats.meshes_admitted_by_retry,
-              static_cast<unsigned long long>(stats.mesh_failures),
-              stats.mesh_unstable, static_cast<unsigned long long>(stats.mesh_queue), static_cast<unsigned long long>(stats.mesh_retry));
-  if (stats.mesh_failures != 0u) ImGui::PopStyleColor();
-  ImGui::Text("Instances: %llu admitted, %llu in region, following %llu, orphans retired %llu",
-              static_cast<unsigned long long>(stats.admitted), static_cast<unsigned long long>(stats.region),
-              static_cast<unsigned long long>(stats.following), static_cast<unsigned long long>(stats.orphans_retired));
-  ImGui::Text("Alpha foliage %s: draws %llu, conflicts %llu, meshes conflicted %llu, refused off %llu, conflict refused %llu, no UVs %llu, removed %llu",
-              g_pool.alpha_foliage.load(std::memory_order_relaxed) ? "on" : "off", static_cast<unsigned long long>(stats.alpha_draws),
-              static_cast<unsigned long long>(stats.alpha_conflicts), static_cast<unsigned long long>(stats.alpha_meshes_conflicted),
-              static_cast<unsigned long long>(stats.alpha_refused_off), static_cast<unsigned long long>(stats.alpha_conflict_refused),
-              static_cast<unsigned long long>(stats.alpha_no_uv), static_cast<unsigned long long>(stats.alpha_removed));
   PoolAlphaGpuStats gpu;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    stats = g_pool.stats;
+    tlas_timing = g_pool.tlas_timing;
     gpu = g_pool.alpha_gpu;
   }
-  ImGui::Text("Alpha GPU: slices %u/%u, blits %llu (%u this present), copies %llu, proxies %u (%.1f MB), source refused %llu (bytes %llu, format %llu), requeues %llu, cap refused %llu",
-              gpu.slices_used, kAlphaAtlasSlices, static_cast<unsigned long long>(gpu.blits), gpu.blits_frame,
-              static_cast<unsigned long long>(stats.alpha_source_copies), gpu.proxies, gpu.proxy_bytes / (1024.0 * 1024.0),
-              static_cast<unsigned long long>(stats.alpha_source_refused), static_cast<unsigned long long>(stats.alpha_source_refused_bytes),
-              static_cast<unsigned long long>(stats.alpha_source_refused_format), static_cast<unsigned long long>(stats.alpha_uv_requeues),
-              static_cast<unsigned long long>(gpu.cap_refused));
-  ImGui::Text("Alpha TLAS: instances %u, waiting %u; trace tests %llu, cut %llu; blit %.3f ms, trace %.3f ms",
-              gpu.tlas_instances, gpu.waiting, static_cast<unsigned long long>(gpu.tests), static_cast<unsigned long long>(gpu.cut),
-              gpu.blit_ms, gpu.trace_ms);
-  ImGui::Text("Indirect/wind: indirect copies %llu, orphans expired %llu, wind rest draws %llu, wind refused off %llu",
-              static_cast<unsigned long long>(stats.alpha_indirect_copies), static_cast<unsigned long long>(stats.alpha_orphans_expired),
-              static_cast<unsigned long long>(stats.wind_rest_draws), static_cast<unsigned long long>(stats.wind_refused_off));
-  ImGui::Text("Wind sway: %s, swayed %u (last TLAS pass, capped %u), max displacement %.3f m, amplitude bound %.3f m, unread draws %llu, "
-              "skipped (non-finite %llu, out of range %llu)",
-              g_pool.alpha_wind_sway.load(std::memory_order_relaxed) ? "on" : "off", stats.wind_sway_instances, stats.wind_pass.clamped,
-              stats.wind_sway_max_m, stats.wind_sway_bound_m, static_cast<unsigned long long>(stats.wind_sway_unread),
-              static_cast<unsigned long long>(stats.wind_sway_skipped_nonfinite), static_cast<unsigned long long>(stats.wind_sway_skipped_range));
-  ImGui::Text("Wind draws: direct %llu (rest %llu, inputs read %llu), indirect %llu (rest %llu, inputs read %llu)",
-              static_cast<unsigned long long>(stats.wind_direct.draws), static_cast<unsigned long long>(stats.wind_direct.rest),
-              static_cast<unsigned long long>(stats.wind_direct.cb_read[0][0]),
-              static_cast<unsigned long long>(stats.wind_indirect.draws), static_cast<unsigned long long>(stats.wind_indirect.rest),
-              static_cast<unsigned long long>(stats.wind_indirect.cb_read[0][0]));
-  ImGui::Text("Moving objects (P2b): %s, copied %llu (this present %zu), refused %llu, deferred %llu, records %u (not resident %u), "
-              "arena %.1f KB, expand %.3f ms cpu, %.3f ms gpu",
-              g_pool.dynamic_per_frame.load(std::memory_order_relaxed) ? "per-frame" : "off",
-              static_cast<unsigned long long>(stats.dynamic_copied), stats.dynamic_draws,
-              static_cast<unsigned long long>(stats.dynamic_refused), static_cast<unsigned long long>(stats.dynamic_deferred),
-              stats.dynamic_records, stats.dynamic_not_resident, stats.dynamic_arena_bytes / 1024.0,
-              stats.dynamic_expand_cpu_ms, stats.dynamic_expand_gpu_ms);
+  float deform_refit_ms = -1.f;
   {
-    std::string diag_verdict;
-    {
-      std::lock_guard<std::mutex> lock(g_p2b_diag.mutex);
-      diag_verdict = g_p2b_diag.verdict_hint;
-    }
-    const uint32_t diag_state = g_p2b_diag.state.load();
-    const char* diag_state_text = diag_state == 1u ? "armed" : diag_state == 2u ? "written" : diag_state == 3u ? "failed" : "idle";
-    ImGui::Text("Diagnostics: %s | armed since f%u | written f%u: %s", diag_state_text, g_p2b_diag.armed_frame.load(),
-                g_p2b_diag.written_frame.load(), diag_verdict.empty() ? "-" : diag_verdict.c_str());
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    deform_refit_ms = g_deform_live.refit_timer.last_ms;
   }
-  DrawDeformLivePanel(deform, deform_traced);
+  ImGui::Text("Alpha and moving-object ms: alpha blit %.3f, alpha trace %.3f, expand cpu %.3f, expand gpu %.3f", gpu.blit_ms, gpu.trace_ms,
+              stats.dynamic_expand_cpu_ms, stats.dynamic_expand_gpu_ms);
+  DrawDeformLivePanel();
 
   ImGui::SeparatorText("GPU BVH (live)");
   bool live = g_live_bvh.enabled.load(std::memory_order_relaxed);
@@ -503,10 +438,6 @@ inline void DrawBvhPanel() {
     return;
   }
   const LiveBvhStats& live_stats = data->live;
-  const uint32_t frame = g_state.frame.load();
-  ImGui::Text("TLAS: %u instances, last rebuild %s (%u frames ago)", live_stats.tlas_instances,
-              live_stats.tlas_rebuilds != 0u ? live_stats.tlas_reason : "none",
-              live_stats.tlas_rebuilds != 0u && frame >= live_stats.tlas_frame ? frame - live_stats.tlas_frame : 0u);
   if (CollectCacheErrors(data).total != 0u) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Errors recorded: see the dump (errors block)");
   ImGui::Text("CPU: meshes %.2f ms, TLAS %.2f ms (refit %.2f ms)",
               live_stats.mesh_ms_last, live_stats.tlas_ms_last, live_stats.refit_ms_last);
@@ -527,8 +458,6 @@ inline void DrawBvhPanel() {
               tlas_timing.rebuild_ms_by_cause[1], tlas_timing.rebuild_ms_by_cause[2]);
   ImGui::Text("Refit phases (ms): copy %.3f / desc %.3f / nodes+validate %.3f / upload %.3f", tlas_timing.refit_phase_ms[0],
               tlas_timing.refit_phase_ms[1], tlas_timing.refit_phase_ms[2], tlas_timing.refit_phase_ms[3]);
-  ImGui::Text("Follow lag (frames): on screen %u (max %u), all dynamic %u (max %u)", stats.on_screen_lag_last,
-              stats.on_screen_lag_max, live_stats.refit_lag_last, live_stats.refit_lag_max);
   ImGui::Text("GPU: deform refit %.3f ms, trace %.2f ms", deform_refit_ms, data->trace_timer.last_ms);
   ImGui::Text("Pool CPU per frame: hooks %.2f ms, drain %.2f ms, deform %.2f ms",
               static_cast<double>(g_pool.cpu_hook_frame_us.load(std::memory_order_relaxed)) / 1000.0,

@@ -25,6 +25,7 @@
 #include "../world_state.hpp"
 #include "bvh_live.hpp"
 #include "bvh_trace.hpp"
+#include "cache_diag.hpp"
 #include "deform_live.hpp"
 
 namespace falcom_world::bvh {
@@ -38,10 +39,6 @@ inline constexpr uint64_t kP2bDiagProbeBytes = 2u * kPoolInstanceStride;  // two
 struct P2bDiagState {
   std::atomic_bool requested{false};
   std::atomic<uint32_t> armed_frame{0u};
-  std::atomic<uint32_t> written_frame{0u};
-  std::atomic<uint32_t> state{0u};  // 0 idle, 1 armed, 2 written, 3 failed
-  std::mutex mutex;
-  std::string verdict_hint;         // guarded by mutex
 };
 
 inline P2bDiagState g_p2b_diag;
@@ -642,11 +639,11 @@ inline void RunP2bDiagnostics(reshade::api::device* device, reshade::api::comman
   renodx::utils::path::WriteTextFile(PoolOutputDir() / "world_p2b_summary.txt", summary);
   for (const std::string& line : lines) renodx::utils::log::i("[world-bvh] p2b diag: ", line);
   {
-    std::lock_guard<std::mutex> lock(g_p2b_diag.mutex);
-    g_p2b_diag.verdict_hint = verdict;
+    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+    g_cache_diag.data.last_result = in.readback_ok
+        ? "Diagnostics (all): wrote world_p2b_diag.json at f" + std::to_string(frame) + ", verdict " + verdict
+        : "Diagnostics (all): FAILED readback at f" + std::to_string(frame) + ": " + in.readback_reason;
   }
-  g_p2b_diag.written_frame.store(frame);
-  g_p2b_diag.state.store(in.readback_ok ? 2u : 3u);
   g_p2b_diag.requested.store(false);
   DumpDeformLive();
   DumpWorldPool(g_bvh_trace.hide_camera_hidden.load(std::memory_order_relaxed));

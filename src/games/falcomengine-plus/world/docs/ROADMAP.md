@@ -60,9 +60,21 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## Panel cleanup (panel-cleanup-1): implemented, not validated in game
+
+Plan: `world/docs/PANEL_CLEANUP_PLAN.md`. Build id `panel-cleanup-1`. Diagnostic only: no rendering, TLAS, pool or revision change; the pinned fingerprint `0x55593b70e070e7fe` holds. The BVH panel shows ms costs (CPU and GPU), the switches, the buttons and the result lines; the one ms line is `Alpha and moving-object ms`.
+
+- Removed panel lines and where their numbers live now:
+  - Meshes, Instances, Alpha foliage, Alpha GPU, Alpha TLAS, Indirect/wind, Wind sway, Wind draws, Moving objects (P2b): the counts are in `world_pool.json` (see `PANEL_CLEANUP_PLAN.md` section 3); the ms values stay on the one ms line.
+  - Instances "following": `world_pool.json` `stats.following_instances` (new).
+  - Diagnostics status line: the shared result line reads `Diagnostics (all): wrote world_p2b_diag.json at f<N>, verdict <verdict>` or `FAILED readback at f<N>: <reason>`; the verdict is in `world_p2b_diag.json`.
+  - Deforming traced text: `world_deform_live.json` `stats.frame_captures`, `frame_objects`, `frame_pending` (new). `frame_objects` is `objects.size()` before the upload, so it can differ from the old uploaded count in a failure case; `frame_objects + frame_pending == frame_captures`.
+  - TLAS instance header: new top-level `live` block in `cache_diag_*.json` (`tlas_instances`, `tlas_rebuilds`, `tlas_reason`, `tlas_frame`, `refit_lag_last`, `refit_lag_max`). "Frames ago" = dump frame minus `tlas_frame`.
+  - Follow lag: on screen in `world_pool.json` `dynamic.on_screen_lag_last/max`; all dynamic in the `live` block (`refit_lag_last/max`).
+
 ## Performance test and separate dumps (perf-panel-1): implemented, not validated in game
 
-Plan: `world/docs/PERF_PANEL_PLAN.md`. Build id `perf-panel-1`. Diagnostic only: no rendering, TLAS, pool or revision change; the pinned fingerprint `0x55593b70e070e7fe` holds with a perf run active (Collect on and off, skip on and off).
+Plan: `world/docs/PERF_PANEL_PLAN.md`. Build id `panel-cleanup-1` (this section: `perf-panel-1`). Diagnostic only: no rendering, TLAS, pool or revision change; the pinned fingerprint `0x55593b70e070e7fe` holds with a perf run active (Collect on and off, skip on and off).
 
 - Every dump is a new file in `PoolOutputDir()/diag/`: `cache_diag_<YYYYMMDD-HHMMSS>[_<label>].json` (schema 4; `world_cache_diag.json` is no longer written). Names never overwrite (`-2`, `-3` ... suffix). The label box (63 characters, shared by Dump and Performance test) is sanitised for the file name; the raw text is kept in `label_raw`.
 - Cache dump schema 4 adds: `label`, `timestamp`, `presents`, `tiers_valid`, `tiers_frame`, `switches` (the four switches), `slack` (applies, apply ms sum and max, phases), `gpu` (trace timer last, average, max, samples, skipped), `gpu_check` (checked, ok, frame, result), `errors` (total and every error group; the panel shows only "Errors recorded"), `work`.

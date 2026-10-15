@@ -498,6 +498,12 @@ int main() {
     CHECK(text.find("\"identities\": [\n    {\"key\": ") != std::string::npos && text.find("\"gaps\": ") != std::string::npos
               && text.find("\"max_gap\": ") != std::string::npos && text.find("\"pending_frames\": ") != std::string::npos,
           "deform presence dump: identities with gaps, max_gap and pending_frames");
+    const auto s = stats();
+    CHECK(s.frame_objects + s.frame_pending == s.frame_captures, "frame_objects + frame_pending equals frame_captures (%u + %u vs %u)", s.frame_objects,
+          s.frame_pending, s.frame_captures);
+    CHECK(text.find("\"frame_captures\": " + std::to_string(s.frame_captures) + ", \"frame_objects\": " + std::to_string(s.frame_objects)
+                    + ", \"frame_pending\": " + std::to_string(s.frame_pending)) != std::string::npos,
+          "deform dump writes frame_captures, frame_objects, frame_pending");
   }
 
   HStage("7. Shader destroyed; off releases everything.");

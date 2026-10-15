@@ -1279,7 +1279,8 @@ inline void DumpDeformLive() {
       << ", \"reset_objects_dropped\": " << stats.reset_objects_dropped
       << ", \"presents_no_objects\": " << stats.presents_no_objects
       << ", \"calls_max_per_frame\": " << stats.calls_max_per_frame << ", \"new_identities\": " << stats.new_identities
-      << ", \"new_after_warmup\": " << stats.new_after_warmup << ", \"warm_frame\": " << warm_frame
+      << ", \"new_after_warmup\": " << stats.new_after_warmup << ", \"frame_captures\": " << stats.frame_captures << ", \"frame_objects\": " << stats.frame_objects
+      << ", \"frame_pending\": " << stats.frame_pending << ", \"warm_frame\": " << warm_frame
       << ", \"warmup_frames\": " << kDynamicWarmupFrames << ", \"skips\": {";
   bool first = true;
   for (size_t i = 1; i < stats.skips.size(); ++i) {

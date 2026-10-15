@@ -138,7 +138,7 @@ inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
 inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
-inline constexpr const char* kWorldBuildId = "perf-panel-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
+inline constexpr const char* kWorldBuildId = "panel-cleanup-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
 inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
@@ -7031,7 +7031,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"observed_instances\": " << stats.observed
       << ", \"admitted_instances\": " << stats.admitted
       << ", \"admitted_outside_legacy_scale\": " << outside_legacy_scale
-      << ", \"region_instances\": " << stats.region
+      << ", \"region_instances\": " << stats.region << ", \"following_instances\": " << stats.following
       << ", \"scan_first_frame\": " << stats.scan_first_frame
       << ", \"scan_last_frame\": " << stats.scan_last_frame
       << ", \"indirect_dropped_calls\": " << IndirectDroppedCalls() << "},\n";
