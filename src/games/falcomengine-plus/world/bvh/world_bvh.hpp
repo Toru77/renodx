@@ -404,9 +404,9 @@ inline void DrawBvhPanel() {
   ImGui::Text("Indirect/wind: indirect copies %llu, orphans expired %llu, wind rest draws %llu, wind refused off %llu",
               static_cast<unsigned long long>(stats.alpha_indirect_copies), static_cast<unsigned long long>(stats.alpha_orphans_expired),
               static_cast<unsigned long long>(stats.wind_rest_draws), static_cast<unsigned long long>(stats.wind_refused_off));
-  ImGui::Text("Wind sway: %s, swayed %u (last TLAS pass), max displacement %.3f m, amplitude bound %.3f m, unread draws %llu, "
+  ImGui::Text("Wind sway: %s, swayed %u (last TLAS pass, capped %u), max displacement %.3f m, amplitude bound %.3f m, unread draws %llu, "
               "skipped (non-finite %llu, out of range %llu)",
-              g_pool.alpha_wind_sway.load(std::memory_order_relaxed) ? "on" : "off", stats.wind_sway_instances,
+              g_pool.alpha_wind_sway.load(std::memory_order_relaxed) ? "on" : "off", stats.wind_sway_instances, stats.wind_pass.clamped,
               stats.wind_sway_max_m, stats.wind_sway_bound_m, static_cast<unsigned long long>(stats.wind_sway_unread),
               static_cast<unsigned long long>(stats.wind_sway_skipped_nonfinite), static_cast<unsigned long long>(stats.wind_sway_skipped_range));
   ImGui::Text("Wind draws: direct %llu (rest %llu, inputs read %llu), indirect %llu (rest %llu, inputs read %llu)",

@@ -7,6 +7,7 @@
 // Sora 2nd instanced vertex shaders (t15, stride 160, b1 offset). The other
 // forms stay for CandidateKind values other layouts may use.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -112,8 +113,8 @@ inline void ComputeMatrixInverse(const float* matrix, float* out) {
 
 // Wind sway approximation (CPU, rigid per instance). Transcribed from the wind
 // vertex shader reference/.dumps/foliage_0xA77D908A.vs_5_0.hlsl (lines 153-196 of
-// the decompile) with the vertex flexibility fixed to 1 (the instance origin
-// moves with the full amplitude): cb_scene wind values, the b5 shake values
+// the decompile) with the instance origin moved by the mean vertex weight
+// 1/(flexibility+1) (option A, not validated in game): cb_scene wind values, the b5 shake values
 // (cb_local), and the instance param2 (InstanceParam @148).
 struct WindSwayParams {
   float game_time = 0.f;         // gameTime_g
@@ -125,7 +126,16 @@ struct WindSwayParams {
   float shake_speed = 0.f;       // shakeSpeed_g
   float shake_freq = 0.f;        // shakeFreq_g
   float shake_wind_scale = 0.f;  // shakeWindScale_g
+  float shake_flexibility = 0.f; // shakeFlexibility_g (mean vertex weight 1/(flexibility+1))
+  const char* layout = "";       // cb_local layout the shake values were read with (diagnostics)
 };
+
+inline constexpr float kWindSwayMaxFraction = 0.10f;  // sway cap as a fraction of the instance AABB extent
+inline constexpr float kWindSwayMaxMeters = 0.75f;    // and at most this many meters
+
+inline float WindSwayWeight(const WindSwayParams& w) {
+  return 1.f / (1.f + (std::max)(w.shake_flexibility, 0.f));
+}
 
 // Displacement of an instance whose origin (rest translation) is `origin`.
 inline void WindSwayDisplacement(const WindSwayParams& w, const float* origin, const float* param2, float* out) {
@@ -136,7 +146,7 @@ inline void WindSwayDisplacement(const WindSwayParams& w, const float* origin, c
   constexpr float kGravity[3] = {0.f, -0.00980000012f, 0.f};
   for (int k = 0; k < 3; ++k) {
     const float sway = std::sin(origin[k] * w.shake_freq + time);
-    out[k] = force * (w.shake_scale * w.wind_dir[k] * sway + w.wind_dir[k] * w.shake_wind_scale) + kGravity[k] + param2[k];
+    out[k] = (force * (w.shake_scale * w.wind_dir[k] * sway + w.wind_dir[k] * w.shake_wind_scale) + kGravity[k] + param2[k]) * WindSwayWeight(w);
   }
 }
 
@@ -144,8 +154,8 @@ inline void WindSwayDisplacement(const WindSwayParams& w, const float* origin, c
 inline void WindSwayBound(const WindSwayParams& w, const float* param2, float* out) {
   constexpr float kGravity[3] = {0.f, -0.00980000012f, 0.f};
   for (int k = 0; k < 3; ++k) {
-    out[k] = std::fabs(w.wind_force) * (std::fabs(w.shake_scale) + std::fabs(w.shake_wind_scale)) * std::fabs(w.wind_dir[k])
-             + std::fabs(kGravity[k]) + std::fabs(param2[k]);
+    out[k] = (std::fabs(w.wind_force) * (std::fabs(w.shake_scale) + std::fabs(w.shake_wind_scale)) * std::fabs(w.wind_dir[k])
+              + std::fabs(kGravity[k]) + std::fabs(param2[k])) * WindSwayWeight(w);
   }
 }
 

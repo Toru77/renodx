@@ -35,7 +35,7 @@ inline constexpr uint8_t kTraitAlphaMaterial = 16u;   // pixel: alpha-tested wit
 struct ShaderTraits {
   uint8_t cls = 0u;    // VsClass or PsClass, by the map it lives in
   uint8_t flags = 0u;  // kTrait* bits
-  uint32_t hash = 0u;  // CRC32 of the bytecode seen at creation (display only)
+  uint32_t hash = 0u;  // CRC32 of the bytecode seen at creation; keys the wind layout table (ReadPoolWindInputs)
   uint8_t alpha_reason = 0u;      // AlphaMaterialReason, AlphaTested pixel shaders only (dumps)
   int16_t alpha_offset = -1;      // threshold variable offset, -1 when not found (dumps)
 };

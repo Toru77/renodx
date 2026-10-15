@@ -2557,18 +2557,26 @@ static void TestStaleDynamic() {
 }
 
 // Wind sway (approximate, experimental). The expected offset is written here from the reference VS
-// (reference/.dumps/foliage_0xA77D908A.vs_5_0.hlsl, lines 153-196, flexibility 1), independently of pool_transform.hpp.
+// (reference/.dumps/foliage_0xA77D908A.vs_5_0.hlsl, lines 153-196), independently of pool_transform.hpp: scaled by
+// 1/(flex+1), then capped at min(0.1 * extent, 0.75 m) (option A).
 struct SwayInputs {
-  float time, wave_time, freq, force, dir[3], scale, speed, shake_freq, wind_scale;
+  float time, wave_time, freq, force, dir[3], scale, speed, shake_freq, wind_scale, flex;
 };
 
-static void ReferenceWindSway(const SwayInputs& w, const float origin[3], const float param2[3], float out[3]) {
+static void ReferenceWindSway(const SwayInputs& w, const float origin[3], const float param2[3], float extent, float out[3]) {
   const float along = origin[0] * w.dir[0] + origin[1] * w.dir[1] + origin[2] * w.dir[2];
   const float gust = 1.f - std::pow(std::sin(w.wave_time - w.freq * along) * 0.5f + 0.5f, 7.f);
   for (int k = 0; k < 3; ++k) {
     const float wave = std::sin(origin[k] * w.shake_freq + w.time * w.speed + gust * w.force);
     const float gravity = k == 1 ? -0.0098f : 0.f;
     out[k] = w.force * gust * (w.scale * w.dir[k] * wave + w.dir[k] * w.wind_scale) + gravity + param2[k];
+  }
+  const float weight = 1.f / (1.f + w.flex);
+  for (int k = 0; k < 3; ++k) out[k] *= weight;
+  const float cap = (std::min)(0.1f * extent, 0.75f);
+  const float magnitude = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+  if (magnitude > cap) {
+    for (int k = 0; k < 3; ++k) out[k] *= cap / magnitude;
   }
 }
 
@@ -2585,7 +2593,7 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   p.alpha_wind_sway.store(true);
 
   const uint64_t kWind = 0xE1, kOpaque = 0xE2;
-  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kWind, "0xA77D908A.vs.cso", true);
   Classify(&dev, kOpaque, "0x2162672F.ps.cso", false);
 
   resource t15, b0, b1, b5, vb, ib;
@@ -2623,6 +2631,7 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
     std::memcpy(material.data() + 120, &w.speed, sizeof(float));
     std::memcpy(material.data() + 128, &w.shake_freq, sizeof(float));
     std::memcpy(material.data() + 132, &w.wind_scale, sizeof(float));
+    std::memcpy(material.data() + 124, &w.flex, sizeof(float));
     std::memcpy(dev.res[b0.handle].bytes.data(), scene.data(), scene.size());
     falcom_world::OnUpdateBufferRegionCbTracker(&dev, scene.data(), b0, 0, UINT64_MAX);
     std::memcpy(dev.res[b5.handle].bytes.data(), material.data(), material.size());
@@ -2646,6 +2655,10 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   };
   const float kOrigin[3] = {10.f, 0.f, 0.f};
   const float kParam2[3] = {0.1f, 0.f, 0.2f};
+  float raw_sway[3] = {};
+  ReferenceWindSway(sway, kOrigin, kParam2, 1000.f, raw_sway);
+  CHECK(std::sqrt(raw_sway[0] * raw_sway[0] + raw_sway[1] * raw_sway[1] + raw_sway[2] * raw_sway[2]) > 0.2f,
+        "sway: raw |displacement| %f exceeds the cap 0.2", std::sqrt(raw_sway[0] * raw_sway[0] + raw_sway[1] * raw_sway[1] + raw_sway[2] * raw_sway[2]));
   uint64_t cursor = 0;
   const auto draw_once = [&]() {
     if (cursor + 1 >= 4096) cursor = 0;
@@ -2694,8 +2707,10 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
 
   // Two times: the TLAS translation equals the rest translation plus the reference offset, refitted each present.
   const auto check_time = [&](const char* label, const SwayInputs& w) {
+    const float weight = 1.f / (1.f + w.flex);
+    const float cap = (std::min)(0.1f * 2.f, 0.75f);
     float expect[3] = {};
-    ReferenceWindSway(w, kOrigin, kParam2, expect);
+    ReferenceWindSway(w, kOrigin, kParam2, 2.f, expect);
     const float* world = data->tlas_instances_cpu[idx].world;
     const float got[3] = {world[3], world[7], world[11]};
     float magnitude = 0.f;
@@ -2729,13 +2744,26 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
       bound_expect = (std::max)(bound_expect, std::fabs(w.force) * (std::fabs(w.scale) + std::fabs(w.wind_scale)) * std::fabs(w.dir[k])
                                                   + gravity + std::fabs(kParam2[k]));
     }
+    bound_expect = (std::min)(bound_expect * weight, cap);
     CHECK(std::fabs(p.stats.wind_sway_bound_m - bound_expect) < 1e-4f && p.stats.wind_sway_instances == 1u,
           "%s: amplitude bound stat %f = %f, one instance swayed", label, p.stats.wind_sway_bound_m, bound_expect);
     const pool::PoolWindSample& sample = p.stats.wind_pass.samples[0];
-    bool sample_ok = sample.mesh_key == wind_key;
+    bool sample_ok = sample.mesh_key == wind_key && std::strcmp(sample.params.layout, "foliage") == 0;
     for (int k = 0; k < 3; ++k) sample_ok = sample_ok && std::fabs(sample.displacement[k] - expect[k]) < 1e-4f;
-    CHECK(sample_ok, "%s: sample 0 displacement (%f %f %f) matches the reference (%f %f %f)", label, sample.displacement[0],
-          sample.displacement[1], sample.displacement[2], expect[0], expect[1], expect[2]);
+    CHECK(sample_ok, "%s: sample 0 layout %s, displacement (%f %f %f) matches the reference (%f %f %f)", label, sample.params.layout,
+          sample.displacement[0], sample.displacement[1], sample.displacement[2], expect[0], expect[1], expect[2]);
+    SwayInputs unweighted = w;
+    unweighted.flex = 0.f;
+    float raw[3] = {};
+    ReferenceWindSway(unweighted, kOrigin, kParam2, 1000.f, raw);
+    const float raw_magnitude = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]) * weight;
+    const bool clamped = raw_magnitude > cap;
+    CHECK(p.stats.wind_pass.clamped == (clamped ? 1u : 0u), "%s: clamped %u (raw %f, cap %f)", label, p.stats.wind_pass.clamped, raw_magnitude, cap);
+    CHECK(std::fabs(sample.raw_magnitude - raw_magnitude) < 1e-4f && sample.cap == cap && sample.extent == 2.f && sample.weight == weight,
+          "%s: sample weight %f, cap %f, raw %f, extent %f", label, sample.weight, sample.cap, sample.raw_magnitude, sample.extent);
+    CHECK(!clamped || std::fabs(std::sqrt(magnitude) - cap) < 1e-5f, "%s: clamped offset %f = cap %f", label, std::sqrt(magnitude), cap);
+    CHECK(std::fabs(p.stats.wind_pass.weight_min - weight) < 1e-6f && std::fabs(p.stats.wind_pass.weight_max - weight) < 1e-6f,
+          "%s: pass weight min %f max %f = 1/(flex+1) %f", label, p.stats.wind_pass.weight_min, p.stats.wind_pass.weight_max, weight);
   };
   check_time("t1", sway);
 
@@ -2801,23 +2829,138 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
   SwayInputs far_inputs = sway;
   far_inputs.force = 1e30f;
   check_skipped("range 1e30", far_inputs, false);
+  SwayInputs nan_flex = sway;
+  nan_flex.flex = std::numeric_limits<float>::quiet_NaN();
+  check_skipped("nan flex", nan_flex, true);
 
   // Finite inputs again: the sway returns.
   write_cbs(later);
   present(1);
   idx = wind_index();
   check_time("restored", later);
+
+  // Weighted and small sways: the offset is the unweighted reference times 1/(flex+1), below the cap.
+  const auto weighted_case = [&](const char* label, const SwayInputs& w) {
+    write_cbs(w);
+    present(1);
+    idx = wind_index();
+    check_time(label, w);
+    SwayInputs unweighted = w;
+    unweighted.flex = 0.f;
+    float base[3] = {};
+    float expect[3] = {};
+    ReferenceWindSway(unweighted, kOrigin, kParam2, 1000.f, base);
+    ReferenceWindSway(w, kOrigin, kParam2, 2.f, expect);
+    const float weight = 1.f / (1.f + w.flex);
+    bool scaled = true;
+    for (int k = 0; k < 3; ++k) scaled = scaled && std::fabs(expect[k] - weight * base[k]) < 1e-6f;
+    CHECK(scaled && std::sqrt(expect[0] * expect[0] + expect[1] * expect[1] + expect[2] * expect[2]) < 0.2f,
+          "%s: offset (%f %f %f) = unweighted (%f %f %f) / (flex+1), below the cap", label, expect[0], expect[1], expect[2], base[0], base[1], base[2]);
+  };
+  SwayInputs weighted = sway;
+  weighted.flex = 1.f;
+  weighted.force = 0.1f;
+  weighted_case("flex 1, force 0.1", weighted);
+  SwayInputs tiny = sway;
+  tiny.flex = 3.f;
+  tiny.force = 0.02f;
+  weighted_case("flex 3, tiny force", tiny);
   pool::ResetWorldPool();
 }
 
 // Alpha-tested wind leaves: the wind draw with an alpha pixel shader is a wind rest pose with sway inputs, like an opaque one.
 // A rigid alpha draw is not a wind key. With alpha_wind_opaque off the alpha wind draw is admitted at rest.
+// Shake values per wind VS layout (pool::kWindShakeLayouts): known values at each layout's cb_local offsets are read back,
+// and a VS hash outside the table reads the foliage offsets.
+static void TestWindLayouts(Device& dev, CmdList& cl) {
+  resource b0;
+  const resource_desc scene_desc(1296, memory_heap::gpu_only, resource_usage::constant_buffer);
+  const resource_desc material_desc(160, memory_heap::gpu_only, resource_usage::constant_buffer);
+  dev.create_resource(scene_desc, nullptr, resource_usage::general, &b0);
+  falcom_world::OnInitResourceCbTracker(&dev, scene_desc, nullptr, resource_usage::general, b0);
+  const std::vector<uint8_t> scene(1296u, 0u);
+  std::memcpy(dev.res[b0.handle].bytes.data(), scene.data(), scene.size());
+  falcom_world::OnUpdateBufferRegionCbTracker(&dev, scene.data(), b0, 0, UINT64_MAX);
+  falcom_world::WorldCommandListData cl_data;
+  cl_data.vs_cb[0] = b0;
+  struct Case {
+    uint32_t hash;
+    const char* file;     // VS bytecode the trait lookup runs on; null for a hash outside the table
+    uint32_t offsets[5];  // scale, speed, flexibility, freq, wind scale
+    uint32_t mirror;      // bytes of b5 the tracker mirrors
+    bool read;            // the read succeeds (false: mirror short)
+  };
+  const Case cases[] = {
+      {0x9FF8E4BEu, "0x9FF8E4BE.vs.cso", {112u, 116u, 120u, 124u, 128u}, 160u, true},
+      {0xA77D908Au, "0xA77D908A.vs.cso", {116u, 120u, 124u, 128u, 132u}, 160u, true},
+      {0xAB5283FBu, "0xAB5283FB.vs.cso", {132u, 136u, 140u, 144u, 148u}, 160u, true},
+      {0xD373BBEDu, "0xD373BBED.vs.cso", {132u, 136u, 140u, 144u, 148u}, 160u, true},
+      {0x12345678u, nullptr, {116u, 120u, 124u, 128u, 132u}, 160u, true},
+      {0xA77D908Au, "0xA77D908A.vs.cso", {116u, 120u, 124u, 128u, 132u}, 144u, true},   // foliage needs 136 B
+      {0xAB5283FBu, "0xAB5283FB.vs.cso", {132u, 136u, 140u, 144u, 148u}, 144u, false},  // treeleaves needs 152 B
+  };
+  const float values[5] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f};
+  for (const Case& c : cases) {
+    uint32_t vs_hash = c.hash;
+    if (c.file != nullptr) {
+      Classify(&dev, c.hash, c.file, true);
+      vs_hash = contract::LookupVertexTraits(c.hash).hash;
+      CHECK(vs_hash == c.hash, "wind layout %s: trait lookup hash %08X", c.file, vs_hash);
+    }
+    resource b5;
+    dev.create_resource(material_desc, nullptr, resource_usage::general, &b5);
+    falcom_world::OnInitResourceCbTracker(&dev, material_desc, nullptr, resource_usage::general, b5);
+    cl_data.vs_cb[5] = b5;
+    std::vector<uint8_t> material(160u, 0u);
+    for (int k = 0; k < 5; ++k) std::memcpy(material.data() + c.offsets[k], &values[k], sizeof(float));
+    std::memcpy(dev.res[b5.handle].bytes.data(), material.data(), material.size());
+    falcom_world::OnUpdateBufferRegionCbTracker(&dev, material.data(), b5, 0, c.mirror);
+    falcom_world::WindSwayParams out;
+    uint8_t fail[2] = {};
+    falcom_world::TrackedCbInfo info[2];
+    const bool ok = pool::ReadPoolWindInputs(&dev, &cl, cl_data, vs_hash, &out, fail, info);
+    if (!c.read) {
+      CHECK(!ok && fail[1] == 3u, "wind layout %08X: mirror %u B fails as short (ok %d, code %d)", c.hash, c.mirror, ok ? 1 : 0,
+            static_cast<int>(fail[1]));
+      continue;
+    }
+    CHECK(ok && out.shake_scale == values[0] && out.shake_speed == values[1] && out.shake_flexibility == values[2]
+              && out.shake_freq == values[3] && out.shake_wind_scale == values[4],
+          "wind layout %08X: mirror %u B scale %f speed %f flexibility %f freq %f wind scale %f (read ok %d)", c.hash, c.mirror,
+          out.shake_scale, out.shake_speed, out.shake_flexibility, out.shake_freq, out.shake_wind_scale, ok ? 1 : 0);
+  }
+  falcom_world::WindSwayParams flexed;
+  flexed.wind_force = 0.5f;
+  flexed.wind_dir[0] = 0.6f;
+  flexed.wind_dir[2] = 0.8f;
+  flexed.shake_scale = 0.3f;
+  flexed.shake_wind_scale = 0.2f;
+  flexed.game_time = 3.f;
+  flexed.wave_time = 1.2f;
+  flexed.wave_frequency = 0.8f;
+  flexed.shake_speed = 2.f;
+  flexed.shake_freq = 0.7f;
+  flexed.shake_flexibility = 0.3f;
+  falcom_world::WindSwayParams rigid = flexed;
+  rigid.shake_flexibility = 0.f;
+  const float flex_origin[3] = {10.f, 0.f, 0.f};
+  const float flex_param2[3] = {0.1f, 0.f, 0.2f};
+  float d_flex[3] = {};
+  float d_rigid[3] = {};
+  falcom_world::WindSwayDisplacement(flexed, flex_origin, flex_param2, d_flex);
+  falcom_world::WindSwayDisplacement(rigid, flex_origin, flex_param2, d_rigid);
+  bool flex_ok = true;
+  for (int k = 0; k < 3; ++k) flex_ok = flex_ok && std::fabs(d_flex[k] - d_rigid[k] / 1.3f) < 1e-6f;
+  CHECK(flex_ok, "wind flex: flexibility 0.3 displacement (%f %f %f) = flexibility 0 / 1.3 (%f %f %f)", d_flex[0], d_flex[1], d_flex[2],
+        d_rigid[0] / 1.3f, d_rigid[1] / 1.3f, d_rigid[2] / 1.3f);
+}
+
 static void TestWindAlpha(Device& dev, CmdList& cl, Queue& queue) {
   RegisterUvLayout();
   auto& p = pool::g_pool;
   pool::BvhDeviceData* data = pool::GetBvhDeviceData(&dev);
   const uint64_t kWind = 0xE6, kAlpha = 0xE7, kRigid = 0xE8;
-  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kWind, "0xA77D908A.vs.cso", true);
   Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
   Classify(&dev, kRigid, "0x095017A3.vs.cso", true);
 
@@ -2940,7 +3083,7 @@ static void TestWindAlpha(Device& dev, CmdList& cl, Queue& queue) {
         data->tlas_wind_count, p.stats.wind_pass.applied);
   if (idx < 0) return;
   float expect[3] = {};
-  ReferenceWindSway(sway, kOrigin, kParam2, expect);
+  ReferenceWindSway(sway, kOrigin, kParam2, 2.f, expect);
   const float* world = data->tlas_instances_cpu[idx].world;
   CHECK(std::fabs(world[3] - kOrigin[0] - expect[0]) < 1e-4f && std::fabs(world[7] - kOrigin[1] - expect[1]) < 1e-4f
             && std::fabs(world[11] - kOrigin[2] - expect[2]) < 1e-4f,
@@ -2951,6 +3094,8 @@ static void TestWindAlpha(Device& dev, CmdList& cl, Queue& queue) {
   }
   CHECK(rest != nullptr && p.meshes[rest->mesh_id].alpha && data->live.tlas_alpha_instances == 2u,
         "wind alpha: alpha mask instance admitted, with the rigid alpha instance (tlas alpha %u)", data->live.tlas_alpha_instances);
+  CHECK(std::strcmp(p.stats.wind_pass.samples[0].params.layout, "foliage") == 0,
+        "wind alpha: sample 0 layout %s", p.stats.wind_pass.samples[0].params.layout);
   pool::DumpWorldPool();
   std::ifstream summary_on(pool::PoolOutputDir() / "world_pool.json");
   const std::string text_on((std::istreambuf_iterator<char>(summary_on)), std::istreambuf_iterator<char>());
@@ -2982,7 +3127,7 @@ static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
   p.alpha_wind_sway.store(true);
 
   const uint64_t kWind = 0xE3, kOpaque = 0xE4, kAlpha = 0xE5;
-  Classify(&dev, kWind, "0x9FF8E4BE.vs.cso", true);
+  Classify(&dev, kWind, "0xA77D908A.vs.cso", true);
   Classify(&dev, kOpaque, "0x2162672F.ps.cso", false);
   Classify(&dev, kAlpha, "0x137F316A.ps.cso", false);
 
@@ -3257,6 +3402,8 @@ int main() {
   TestWindScanPath(dev, cl, queue);
   HStage("wind sway");
   TestWindSway(dev, cl, queue);
+  HStage("wind layouts");
+  TestWindLayouts(dev, cl);
   HStage("wind indirect diag");
   TestWindIndirectDiag(dev, cl, queue);
   HStage("wind alpha");

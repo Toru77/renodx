@@ -108,7 +108,7 @@ inline constexpr uint32_t kPoolInstanceCbSlot = contract::kInstanceCbSlot;
 inline constexpr uint32_t kPoolSceneCbSlot = 0u;         // cb_scene (b0): wind values of the sway approximation
 inline constexpr uint32_t kPoolWindMaterialCbSlot = 5u;  // cb_local (b5): shake values of the sway approximation
 inline constexpr uint64_t kWindSceneBytes = 752u;        // cb_scene up to windForce_g (c46.w)
-inline constexpr uint64_t kWindMaterialBytes = 136u;     // cb_local up to shakeWindScale_g (c8.y)
+inline constexpr uint64_t kWindMaterialBytes = 152u;     // cb_local up to the last shake value of any wind layout (c9.y)
 inline constexpr uint32_t kPoolParam2Offset = 148u;      // InstanceParam.param2 (InstanceParam @148)
 inline constexpr uint32_t kPoolInstanceStride = contract::kInstanceStride;
 inline constexpr uint32_t kPoolWorldFloats = contract::kWorldFloats;
@@ -990,6 +990,10 @@ struct PoolWindSample {
   float displacement[3] = {};
   float magnitude = 0.f;
   float bound[3] = {};
+  float weight = 1.f;
+  float cap = 0.f;
+  float raw_magnitude = 0.f;
+  float extent = 0.f;
   uint8_t outcome = 0u;  // 0 applied (samples are recorded at the applied point only)
 };
 
@@ -1005,6 +1009,11 @@ struct PoolWindPass {
   uint32_t skipped_nonfinite = 0u;
   uint32_t skipped_range = 0u;
   uint32_t zero_disp = 0u;  // applied with |displacement| < 1e-4
+  uint32_t clamped = 0u;    // applied with the raw displacement above the cap
+  float weight_min = 1.f;   // of the applied: min and max of 1/(flexibility+1)
+  float weight_max = 0.f;
+  float clamp_ratio_max = 0.f;  // max of raw |displacement| / cap
+  float raw_max_m = 0.f;        // max of the raw (uncapped) |displacement|
   PoolWindSample samples[8];
 };
 
@@ -3788,16 +3797,35 @@ inline void AttachPoolAlphaSource(uint64_t mesh_key, uint64_t source_id) {
   if (!source->second.texture_dead) AddPoolResourceKey(source->second.texture, mesh_key);
 }
 
+// Byte offsets of the shake values in cb_local (b5) per wind vertex shader, from the cb_local declarations of
+// reference/.dumps (byte = register * 16 + 4 * component). Row 0 is the fallback for an unknown VS (foliage offsets).
+struct WindShakeLayout {
+  uint32_t vs_hash;
+  const char* name;
+  uint32_t scale, speed, flexibility, freq, wind_scale;
+};
+inline constexpr WindShakeLayout kWindShakeLayouts[] = {
+    {0u, "unknown (foliage offsets)", 116u, 120u, 124u, 128u, 132u},
+    {0x9FF8E4BEu, "movingfoliage", 112u, 116u, 120u, 124u, 128u},  // shakeScale_g c7, shakeSpeed_g c7.y, flexibility c7.z, freq c7.w, wind c8
+    {0xA77D908Au, "foliage", 116u, 120u, 124u, 128u, 132u},        // c7.y, c7.z, c7.w, c8, c8.y
+    {0xAB5283FBu, "treeleaves", 132u, 136u, 140u, 144u, 148u},     // c8.y, c8.z, c8.w, c9, c9.y
+    {0xD373BBEDu, "foliage_D373", 132u, 136u, 140u, 144u, 148u},   // c8.y, c8.z, c8.w, c9, c9.y
+};
+
 // Sway inputs of a wind rest-pose draw as the draw reads them (CPU mirrors). Both slots are always read; fail[slot]
 // is the read code (0 ok, 1 slot unbound, 2 buffer untracked, 3 mirror short) and info[slot] the tracker's view of a
 // failed slot. Returns true when both slots were read.
-inline bool ReadPoolWindInputs(reshade::api::device* device, reshade::api::command_list* cmd_list, const WorldCommandListData& cl_data, WindSwayParams* out,
-                               uint8_t fail[2], TrackedCbInfo info[2]) {
+inline bool ReadPoolWindInputs(reshade::api::device* device, reshade::api::command_list* cmd_list, const WorldCommandListData& cl_data, uint32_t vs_hash,
+                               WindSwayParams* out, uint8_t fail[2], TrackedCbInfo info[2]) {
   std::array<uint8_t, kWindSceneBytes> scene = {};
   std::array<uint8_t, kWindMaterialBytes> material = {};
+  const WindShakeLayout* layout = &kWindShakeLayouts[0];
+  for (const WindShakeLayout& row : kWindShakeLayouts) {
+    if (row.vs_hash == vs_hash) layout = &row;
+  }
   const reshade::api::resource slots[2] = {cl_data.vs_cb[kPoolSceneCbSlot], cl_data.vs_cb[kPoolWindMaterialCbSlot]};
   uint8_t* bytes[2] = {scene.data(), material.data()};
-  const uint64_t sizes[2] = {kWindSceneBytes, kWindMaterialBytes};
+  const uint64_t sizes[2] = {kWindSceneBytes, layout->wind_scale + sizeof(float)};
   bool ok = true;
   for (uint32_t s = 0u; s < 2u; ++s) {
     if (ReadTrackedCbBytes(cmd_list, slots[s], bytes[s], sizes[s])) {
@@ -3815,10 +3843,12 @@ inline bool ReadPoolWindInputs(reshade::api::device* device, reshade::api::comma
   std::memcpy(&out->wave_time, scene.data() + 504, sizeof(float));
   std::memcpy(&out->wave_frequency, scene.data() + 508, sizeof(float));
   std::memcpy(&out->wind_force, scene.data() + 748, sizeof(float));
-  std::memcpy(&out->shake_scale, material.data() + 116, sizeof(float));
-  std::memcpy(&out->shake_speed, material.data() + 120, sizeof(float));
-  std::memcpy(&out->shake_freq, material.data() + 128, sizeof(float));
-  std::memcpy(&out->shake_wind_scale, material.data() + 132, sizeof(float));
+  std::memcpy(&out->shake_scale, material.data() + layout->scale, sizeof(float));
+  std::memcpy(&out->shake_speed, material.data() + layout->speed, sizeof(float));
+  std::memcpy(&out->shake_flexibility, material.data() + layout->flexibility, sizeof(float));
+  std::memcpy(&out->shake_freq, material.data() + layout->freq, sizeof(float));
+  std::memcpy(&out->shake_wind_scale, material.data() + layout->wind_scale, sizeof(float));
+  out->layout = layout->name;
   return true;
 }
 
@@ -3862,7 +3892,7 @@ inline void OnPoolScanDraw(
   WindSwayParams wind;
   uint8_t wind_fail[2] = {};
   TrackedCbInfo wind_info[2];
-  const bool wind_read = wind_attempt && ReadPoolWindInputs(device, cmd_list, *cl_data, &wind, wind_fail, wind_info);
+  const bool wind_read = wind_attempt && ReadPoolWindInputs(device, cmd_list, *cl_data, contract::LookupVertexTraits(draw.vs_pipeline).hash, &wind, wind_fail, wind_info);
   const uint32_t frame = g_state.frame.load();
   const uint64_t mesh_key = skip == PoolSkip::None ? PoolMeshKey(draw) : 0u;
 
@@ -4010,7 +4040,7 @@ inline void OnPoolScanIndirectDraw(
   WindSwayParams wind;
   uint8_t wind_fail[2] = {};
   TrackedCbInfo wind_info[2];
-  const bool wind_read = gate.wind_rest && ReadPoolWindInputs(device, cmd_list, *cl_data, &wind, wind_fail, wind_info);
+  const bool wind_read = gate.wind_rest && ReadPoolWindInputs(device, cmd_list, *cl_data, contract::LookupVertexTraits(draw.vs_pipeline).hash, &wind, wind_fail, wind_info);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if (gate.wind_rest) g_pool.stats.wind_rest_draws += 1u;
@@ -6591,7 +6621,8 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"max_displacement_m\": " << PoolJsonFloat{stats.wind_sway_max_m}
       << ", \"amplitude_bound_m\": " << PoolJsonFloat{stats.wind_sway_bound_m}
       << ", \"skipped_nonfinite\": " << stats.wind_sway_skipped_nonfinite << ", \"skipped_range\": " << stats.wind_sway_skipped_range
-      << ", \"flexibility\": 1, \"origin\": \"instance translation\"";
+      << ", \"weight\": \"1/(flexibility+1)\", \"clamp_fraction\": " << PoolJsonFloat{kWindSwayMaxFraction}
+      << ", \"clamp_cap_m\": " << PoolJsonFloat{kWindSwayMaxMeters} << ", \"origin\": \"instance translation\"";
   const char* scan_names[2] = {"direct", "indirect"};
   const PoolWindDraws* scans[2] = {&stats.wind_direct, &stats.wind_indirect};
   out << ",\n    \"draws\": {";
@@ -6618,7 +6649,10 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"switch_on\": " << (pass.switch_on ? "true" : "false") << ", \"wind_key_instances\": " << pass.wind_key_instances
       << ", \"no_inputs\": " << pass.no_inputs << ", \"no_input_first_key\": \"" << renodx::utils::log::AsHex(pass.no_input_first_key)
       << "\", \"applied\": " << pass.applied << ", \"skipped_nonfinite\": " << pass.skipped_nonfinite
-      << ", \"skipped_range\": " << pass.skipped_range << ", \"zero_disp\": " << pass.zero_disp << "},\n";
+      << ", \"skipped_range\": " << pass.skipped_range << ", \"zero_disp\": " << pass.zero_disp << ", \"clamped\": " << pass.clamped
+      << ", \"clamp_ratio\": " << PoolJsonFloat{pass.applied != 0u ? static_cast<float>(pass.clamped) / static_cast<float>(pass.applied) : 0.f}
+      << ", \"weight_min\": " << PoolJsonFloat{pass.weight_min} << ", \"weight_max\": " << PoolJsonFloat{pass.weight_max}
+      << ", \"clamp_ratio_max\": " << PoolJsonFloat{pass.clamp_ratio_max} << ", \"raw_max_m\": " << PoolJsonFloat{pass.raw_max_m} << "},\n";
   out << "    \"samples\": [";
   for (size_t i = 0; i < pass.applied && i < std::size(pass.samples); ++i) {
     const PoolWindSample& sample = pass.samples[i];
@@ -6629,11 +6663,13 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
         << ", " << PoolJsonFloat{w.wave_frequency} << ", " << PoolJsonFloat{w.wind_force} << ", " << PoolJsonFloat{w.wind_dir[0]} << ", "
         << PoolJsonFloat{w.wind_dir[1]} << ", " << PoolJsonFloat{w.wind_dir[2]} << ", " << PoolJsonFloat{w.shake_scale} << ", "
         << PoolJsonFloat{w.shake_speed} << ", " << PoolJsonFloat{w.shake_freq} << ", " << PoolJsonFloat{w.shake_wind_scale}
-        << "], \"param2\": [" << PoolJsonFloat{sample.param2[0]} << ", " << PoolJsonFloat{sample.param2[1]} << ", "
+        << "], \"flexibility\": " << PoolJsonFloat{w.shake_flexibility} << ", \"layout\": \"" << w.layout << "\", \"param2\": [" << PoolJsonFloat{sample.param2[0]} << ", " << PoolJsonFloat{sample.param2[1]} << ", "
         << PoolJsonFloat{sample.param2[2]} << "], \"displacement\": [" << PoolJsonFloat{sample.displacement[0]} << ", "
         << PoolJsonFloat{sample.displacement[1]} << ", " << PoolJsonFloat{sample.displacement[2]} << "], \"magnitude\": "
         << PoolJsonFloat{sample.magnitude} << ", \"bound\": [" << PoolJsonFloat{sample.bound[0]} << ", "
-        << PoolJsonFloat{sample.bound[1]} << ", " << PoolJsonFloat{sample.bound[2]} << "], \"outcome\": " << static_cast<int>(sample.outcome)
+        << PoolJsonFloat{sample.bound[1]} << ", " << PoolJsonFloat{sample.bound[2]} << "], \"weight\": " << PoolJsonFloat{sample.weight}
+        << ", \"cap\": " << PoolJsonFloat{sample.cap} << ", \"raw_magnitude\": " << PoolJsonFloat{sample.raw_magnitude}
+        << ", \"extent\": " << PoolJsonFloat{sample.extent} << ", \"outcome\": " << static_cast<int>(sample.outcome)
         << "}";
   }
   out << "\n    ]},\n";

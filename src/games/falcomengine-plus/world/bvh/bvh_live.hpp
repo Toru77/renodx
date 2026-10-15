@@ -535,9 +535,10 @@ inline uint32_t InstanceVisibilityFlags(const WorldInstanceGPU& instance) {
 }
 
 // Caller holds g_pool.mutex. The trace pose of a wind rest-pose instance: its rest pose (copy already holds it)
-// with the translation moved by the sway at its origin (WindSwayDisplacement, flexibility 1), and the leaf
-// bounds inflated by the amplitude bound (WindSwayBound). The rest pose stays in WorldInstance (the observation
-// key). Rest pose when the switch is off or its key has no sway inputs.
+// with the translation moved by the sway at its origin (WindSwayDisplacement, weighted 1/(flexibility+1)), capped at
+// kWindSwayMaxFraction of the leaf extent or kWindSwayMaxMeters, and the leaf bounds inflated by the capped amplitude
+// bound (WindSwayBound). The rest pose stays in WorldInstance (the observation key). Rest pose when the switch is off
+// or its key has no sway inputs.
 inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& instance) {
   copy->wind = false;
   if (!g_pool.alpha_wind_sway.load(std::memory_order_relaxed)) return;
@@ -552,10 +553,14 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
   if (sway == g_pool.wind_sway.end() || !wind_key) return;
   copy->wind = true;
   const float origin[3] = {instance.matrix[3], instance.matrix[7], instance.matrix[11]};
+  float extent = 0.f;
+  for (int k = 0; k < 3; ++k) extent = (std::max)(extent, copy->bounds_max[k] - copy->bounds_min[k]);
+  const float cap = (std::min)(kWindSwayMaxFraction * extent, kWindSwayMaxMeters);
   float displacement[3] = {};
   float bound[3] = {};
   WindSwayDisplacement(sway->second, origin, instance.param2, displacement);
   WindSwayBound(sway->second, instance.param2, bound);
+  const float raw_magnitude = std::sqrt(displacement[0] * displacement[0] + displacement[1] * displacement[1] + displacement[2] * displacement[2]);
   for (int k = 0; k < 3; ++k) {
     if (!std::isfinite(displacement[k]) || !std::isfinite(bound[k]) || !std::isfinite(origin[k] + displacement[k])) {
       g_pool.stats.wind_sway_skipped_nonfinite += 1u;
@@ -568,7 +573,10 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
       return;
     }
   }
+  const float scale = raw_magnitude > cap ? cap / raw_magnitude : 1.f;
   for (int k = 0; k < 3; ++k) {
+    displacement[k] *= scale;
+    bound[k] = (std::min)(bound[k], cap);
     copy->matrix[3 + 4 * k] = origin[k] + displacement[k];
     copy->bounds_min[k] -= bound[k];
     copy->bounds_max[k] += bound[k];
@@ -577,8 +585,14 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
   const float magnitude = std::sqrt(displacement[0] * displacement[0] + displacement[1] * displacement[1] + displacement[2] * displacement[2]);
   g_pool.stats.wind_sway_instances += 1u;
   g_pool.stats.wind_sway_max_m = (std::max)(g_pool.stats.wind_sway_max_m, magnitude);
+  const float weight = WindSwayWeight(sway->second);
   pass.applied += 1u;
   if (magnitude < 1e-4f) pass.zero_disp += 1u;
+  if (raw_magnitude > cap) pass.clamped += 1u;
+  if (cap > 0.f) pass.clamp_ratio_max = (std::max)(pass.clamp_ratio_max, raw_magnitude / cap);
+  pass.weight_min = (std::min)(pass.weight_min, weight);
+  pass.weight_max = (std::max)(pass.weight_max, weight);
+  pass.raw_max_m = (std::max)(pass.raw_max_m, raw_magnitude);
   if (pass.applied <= std::size(pass.samples)) {
     PoolWindSample& sample = pass.samples[pass.applied - 1u];
     sample.id = instance.id;
@@ -589,6 +603,10 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
     std::memcpy(sample.displacement, displacement, sizeof(displacement));
     sample.magnitude = magnitude;
     std::memcpy(sample.bound, bound, sizeof(bound));
+    sample.weight = weight;
+    sample.cap = cap;
+    sample.raw_magnitude = raw_magnitude;
+    sample.extent = extent;
   }
   for (int k = 0; k < 3; ++k) g_pool.stats.wind_sway_bound_m = (std::max)(g_pool.stats.wind_sway_bound_m, bound[k]);
 }
