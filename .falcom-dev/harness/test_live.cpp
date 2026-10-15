@@ -1275,7 +1275,7 @@ int main() {
     bvh::OnMapBufferRegionPool(&dev, {0x7770u}, 0, 16, map_access::write_discard, nullptr);
     {
       std::lock_guard lock(bvh::g_pool.mutex);
-      bvh::UpdatePoolStats(bvh::PoolNewestSeenByKey());
+      bvh::UpdatePoolStats();
       const auto& s = bvh::g_pool.stats;
       const auto it = bvh::g_pool.mesh_by_key.find(kC);
       const uint32_t writes = it == bvh::g_pool.mesh_by_key.end() ? 0u : bvh::g_pool.meshes[it->second].writes_after_capture;

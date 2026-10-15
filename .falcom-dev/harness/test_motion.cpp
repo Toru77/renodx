@@ -206,7 +206,7 @@ int main() {
   auto run = [&](int frames) { for (int i = 0; i < frames; ++i) run_frame(); };
   auto snapshot = [&]() {
     std::lock_guard lock(bvh::g_pool.mutex);
-    bvh::UpdatePoolStats(bvh::PoolNewestSeenByKey());
+    bvh::UpdatePoolStats();
     return bvh::g_pool.stats;
   };
   auto detail = [&]() {
@@ -1362,6 +1362,74 @@ int main() {
     CHECK(bvh::g_pool.instances.size() == 1u && bvh::g_pool.stats.orphans_retired == 2u,
           "lone one retired after 600 unseen frames (%zu left, retired %llu)", bvh::g_pool.instances.size(),
           (unsigned long long)bvh::g_pool.stats.orphans_retired);
+  }
+
+  HStage("29c. Orphan bounds: a static or dynamic instance is retired only by a fresher same-key pose with overlapping bounds.");
+  // 29c. Static orphans (overlap, same key, fresher by more than kPoolMovingHoldFrames); touching faces and an exact hold are kept.
+  {
+    fresh();
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.meshes.resize(1);
+    const auto make = [](uint64_t key, bool dynamic, uint32_t seen, float min_x) {
+      bvh::WorldInstance instance;
+      instance.mesh_key = key;
+      instance.dynamic = dynamic;
+      instance.admit_frame = seen;
+      instance.bounds_min[0] = min_x;
+      instance.bounds_max[0] = min_x + 1.f;
+      for (size_t k = 1; k < 3; ++k) {
+        instance.bounds_min[k] = 0.f;
+        instance.bounds_max[k] = 1.f;
+      }
+      return instance;
+    };
+    const auto retire = [](std::vector<bvh::WorldInstance> instances, uint32_t frame) {
+      bvh::g_pool.instances = std::move(instances);
+      std::vector<std::string> orphan_lines;
+      bvh::RetirePoolOrphans(frame, bvh::PoolNewestSeenByKey(), &orphan_lines);
+      return bvh::g_pool.instances;
+    };
+    const auto a = retire({make(0x91u, false, 100u, 0.f), make(0x91u, false, 170u, 0.1f)}, 200u);
+    CHECK(a.size() == 1u && a[0].admit_frame == 170u, "(a) overlapping fresher static: static ghost retired (%zu left)", a.size());
+    const auto b = retire({make(0x92u, true, 100u, 0.f), make(0x92u, false, 170u, 0.1f)}, 200u);
+    CHECK(b.size() == 1u && !b[0].dynamic && b[0].admit_frame == 170u, "(b) overlapping fresher static: dynamic ghost retired (%zu left)", b.size());
+    const auto c = retire({make(0x93u, false, 100u, 0.f), make(0x93u, true, 190u, 5.f)}, 200u);
+    CHECK(c.size() == 2u, "(c) disjoint live dynamic sibling: static kept and dynamic kept (%zu left)", c.size());
+    const auto d = retire({make(0x94u, false, 100u, 0.f), make(0x94u, false, 170u, 1.f)}, 200u);
+    CHECK(d.size() == 2u, "(d) boxes touching on a face only: both kept (%zu left)", d.size());
+    const auto e = retire({make(0x95u, false, 100u, 0.f), make(0x95u, false, 160u, 0.5f)}, 200u);
+    CHECK(e.size() == 2u, "(e) fresher by exactly kPoolMovingHoldFrames: both kept (%zu left)", e.size());
+    const auto f = retire({make(0x96u, false, 100u, 0.f), make(0x96u, false, 170u, 0.9f)}, 200u);
+    CHECK(f.size() == 2u, "(f) static off-screen sibling, 10%% overlap of the smaller box: both kept (%zu left)", f.size());
+    const auto g = retire({make(0x97u, false, 100u, 0.f), make(0x97u, false, 170u, 0.1f)}, 200u);
+    CHECK(g.size() == 1u && g[0].admit_frame == 170u, "(g) static ghost, 90%% overlap with a fresher pose: retired (%zu left)", g.size());
+    const auto h = retire({make(0x98u, false, 100u, 0.f), make(0x98u, false, 150u, 0.f)}, 300u);
+    CHECK(h.size() == 2u, "(h) pose only 50 newer than instance (within hold), overlapping: kept (%zu left)", h.size());
+    const auto i = retire({make(0x99u, false, 100u, 0.f), make(0x99u, false, 170u, 0.5f)}, 200u);
+    CHECK(i.size() == 2u, "(i) static, 50%% overlap of the smaller box, below 0.75: kept (%zu left)", i.size());
+  }
+
+  HStage("29d. Static object moved to an overlapping pose with prevWorld == world: only the new pose remains.");
+  // 29d. The old pose is superseded by the new one (overlapping), so it retires once the hold runs out.
+  {
+    fresh();
+    bvh::g_pool.exclude_moving.store(false);
+    bvh::g_pool.follow_moving.store(true);
+    const uint32_t start = falcom_world::g_state.frame.load();
+    const uint32_t vb = make_vb(1.f).handle;
+    objects.push_back({vb, 1, [start](uint32_t f, uint32_t, float* w, float* p) {
+      const float x = f - start < 40u ? 0.f : 0.5f;
+      Place(w, x); Place(p, x);
+    }});
+    run(240);
+    const auto s = snapshot();
+    float x = -1.f;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      if (!bvh::g_pool.instances.empty()) x = bvh::g_pool.instances[0].matrix[3];
+    }
+    CHECK(s.admitted == 1u && std::fabs(x - 0.5f) < 1e-4f, "moved static: only the new pose remains (admitted %zu, x %g, retired %llu)",
+          s.admitted, x, (unsigned long long)s.orphans_retired);
   }
 
   HStage("30. Retire, then destroy the VB, CompactPool and MarkPoolMeshDynamic: no second removal.");

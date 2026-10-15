@@ -1104,7 +1104,7 @@ struct PoolStats {
   uint64_t follow_budget_skips = 0u;     // follow copies refused by the slot share
   uint64_t max_slot_used = 0u;           // largest staging slot fill at resolve (bytes)
   uint64_t max_follow_used = 0u;         // largest follow part of a staging slot at resolve (bytes)
-  uint64_t orphans = 0u;                 // dynamic instances not seen for kPoolMovingHoldFrames (pending retirement)
+  uint64_t orphans = 0u;                 // orphans found by the last RetirePoolOrphans pass (refreshed every 10 frames)
   uint64_t orphans_retired = 0u;         // orphans removed by RetirePoolOrphans
   uint64_t follow_relinks = 0u;          // moving instances relinked across a gap (FollowPoolMovingInstance)
   uint32_t dynamic_released = 0u;      // meshes unflagged when their moving keys were released
@@ -1685,28 +1685,70 @@ inline uint32_t PoolInstanceLastSeen(const WorldInstance& instance) {
   return seen;
 }
 
-// Caller holds g_pool.mutex. The newest last-seen frame of the dynamic instances, by mesh key.
-inline std::unordered_map<uint64_t, uint32_t> PoolNewestSeenByKey() {
-  std::unordered_map<uint64_t, uint32_t> newest;
+// Bounds and last-seen frame of one instance of a mesh key.
+struct PoolPose {
+  uint32_t seen;
+  float bounds_min[3];
+  float bounds_max[3];
+};
+
+// Per mesh key: the newest last-seen frame of its dynamic instances, and a pose of every instance (static included).
+struct PoolKeySeen {
+  uint32_t newest = 0u;
+  std::vector<PoolPose> poses;
+};
+
+// Caller holds g_pool.mutex.
+inline std::unordered_map<uint64_t, PoolKeySeen> PoolNewestSeenByKey() {
+  std::unordered_map<uint64_t, PoolKeySeen> newest;
   for (const auto& instance : g_pool.instances) {
-    if (!instance.dynamic) continue;
-    uint32_t& seen = newest[instance.mesh_key];
-    seen = (std::max)(seen, PoolInstanceLastSeen(instance));
+    PoolKeySeen& key = newest[instance.mesh_key];
+    const uint32_t seen = PoolInstanceLastSeen(instance);
+    if (instance.dynamic) key.newest = (std::max)(key.newest, seen);
+    PoolPose pose{seen, {}, {}};
+    std::memcpy(pose.bounds_min, instance.bounds_min, sizeof(pose.bounds_min));
+    std::memcpy(pose.bounds_max, instance.bounds_max, sizeof(pose.bounds_max));
+    key.poses.push_back(pose);
   }
   return newest;
+}
+
+// Alpha-tested mesh of an instance (false while its mesh is not tracked).
+inline bool PoolInstanceAlpha(const WorldInstance& instance) {
+  return instance.mesh_id < g_pool.meshes.size() && g_pool.meshes[instance.mesh_id].alpha;
 }
 
 // A dynamic instance not seen for kPoolMovingHoldFrames is an orphan (pending
 // retirement) when a fresher dynamic instance of its mesh key exists (the
 // pose it was superseded by), or when it was not seen for kPoolPruneAge frames.
+// Any instance (static included) is also an orphan when a fresher instance of
+// its key overlaps at least 0.75 of the volume of the smaller of the two boxes.
+// Alpha-tested meshes and wind rest-pose keys are exempt from that rule.
 inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t frame,
-                                 const std::unordered_map<uint64_t, uint32_t>& newest) {
-  if (!instance.dynamic) return false;
+                                 const std::unordered_map<uint64_t, PoolKeySeen>& newest) {
   const uint32_t seen = PoolInstanceLastSeen(instance);
   if (frame <= seen + kPoolMovingHoldFrames) return false;
-  if (frame > seen + kPoolPruneAge) return true;
+  if (instance.dynamic && frame > seen + kPoolPruneAge) return true;
   const auto it = newest.find(instance.mesh_key);
-  return it != newest.end() && it->second > seen;
+  if (it == newest.end()) return false;
+  if (instance.dynamic && it->second.newest > seen) return true;
+  for (const auto& pose : it->second.poses) {
+    if (pose.seen <= seen + kPoolMovingHoldFrames) continue;
+    float overlap = 1.f;
+    float own_volume = 1.f;
+    float pose_volume = 1.f;
+    for (size_t k = 0u; k < 3u; ++k) {
+      const float lo = (std::max)(pose.bounds_min[k], instance.bounds_min[k]);
+      const float hi = (std::min)(pose.bounds_max[k], instance.bounds_max[k]);
+      overlap *= (std::max)(0.f, hi - lo);
+      own_volume *= instance.bounds_max[k] - instance.bounds_min[k];
+      pose_volume *= pose.bounds_max[k] - pose.bounds_min[k];
+    }
+    if (overlap > 0.f && overlap >= 0.75f * (std::min)(own_volume, pose_volume)) {
+      return !PoolInstanceAlpha(instance) && g_pool.wind_keys.count(instance.mesh_key) == 0u;
+    }
+  }
+  return false;
 }
 
 // Caller holds g_pool.mutex. Removes the instances `remove` selects (order kept),
@@ -1732,11 +1774,13 @@ inline uint32_t RemovePoolInstances(Remove remove) {
 
 // Caller holds g_pool.mutex. Retires the orphans: their exact-key observation no
 // longer counts as admitted, and the instance is removed. No graphics calls.
-inline void RetirePoolOrphans(uint32_t frame, const std::unordered_map<uint64_t, uint32_t>& newest, std::vector<std::string>* lines) {
+inline void RetirePoolOrphans(uint32_t frame, const std::unordered_map<uint64_t, PoolKeySeen>& newest, std::vector<std::string>* lines) {
   uint64_t first_key = 0u;
   uint32_t first_unseen = 0u;
+  uint32_t statics = 0u;
   const uint32_t removed = RemovePoolInstances([&](const WorldInstance& instance) {
     if (!PoolInstanceIsOrphan(instance, frame, newest)) return false;
+    if (!instance.dynamic) statics += 1u;
     if (first_unseen == 0u) {
       first_key = instance.mesh_key;
       first_unseen = frame - PoolInstanceLastSeen(instance);
@@ -1748,15 +1792,16 @@ inline void RetirePoolOrphans(uint32_t frame, const std::unordered_map<uint64_t,
     return true;
   });
   g_pool.stats.orphans_retired += removed;
+  g_pool.stats.orphans = removed;
   if (removed != 0u && g_pool.orphan_lines_logged < kPoolLifecycleLogLines) {
     g_pool.orphan_lines_logged += 1u;
     lines->push_back(renodx::utils::log::BuildString("falcom_world::pool: frame ", frame, ": retired ", removed,
-                                                     " orphan instances, first mesh ", renodx::utils::log::AsHex(first_key),
+                                                     " orphan instances, ", statics, " static, first mesh ", renodx::utils::log::AsHex(first_key),
                                                      " unseen ", first_unseen, " frames"));
   }
 }
 
-inline void UpdatePoolStats(const std::unordered_map<uint64_t, uint32_t>& newest) {
+inline void UpdatePoolStats() {
   size_t queued = 0u;
   for (const auto& slot : g_pool.slots) {
     for (const auto& copy : slot.copies) {
@@ -1777,15 +1822,11 @@ inline void UpdatePoolStats(const std::unordered_map<uint64_t, uint32_t>& newest
   g_pool.stats.admitted = g_pool.instances.size();
   const PoolRegion region = CurrentPoolRegion();
   size_t in_region = 0u;
-  uint64_t orphans = 0u;
-  const uint32_t frame = g_state.frame.load();
   size_t following = 0u;
   for (const auto& instance : g_pool.instances) {
     if (PoolInstanceInRegion(instance, region)) in_region += 1u;
-    if (PoolInstanceIsOrphan(instance, frame, newest)) orphans += 1u;
     if (instance.dynamic) following += 1u;
   }
-  g_pool.stats.orphans = orphans;
   g_pool.stats.following = following;
   g_pool.stats.region = in_region;
   size_t written = 0u;
@@ -5580,13 +5621,12 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
             s.follow_admits, "; map failures ", s.map_failures, " staging failures ", s.staging_failures);
       }
     }
-    const auto newest = PoolNewestSeenByKey();
     if ((frame % 10u) == 0u && g_pool.scan_continuous && frame >= g_pool.scan_since + kPoolMovingHoldFrames) {
-      RetirePoolOrphans(frame, newest, &failure_lines);
+      RetirePoolOrphans(frame, PoolNewestSeenByKey(), &failure_lines);
     }
     failure_lines.insert(failure_lines.end(), g_pool.pending_lines.begin(), g_pool.pending_lines.end());
     g_pool.pending_lines.clear();
-    UpdatePoolStats(newest);
+    UpdatePoolStats();
     g_pool.stats.dynamic_draws = g_pool.dynamic_draws.size();
     g_pool.stats.dynamic_arena_bytes = g_pool.dynamic_arena_used;
     g_pool.dynamic_present = std::move(g_pool.dynamic_draws);
@@ -6422,15 +6462,14 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   const contract::RegistryEntries registry_entries = contract::SnapshotRegistryEntries();
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    const std::unordered_map<uint64_t, uint32_t> newest = PoolNewestSeenByKey();
-    UpdatePoolStats(newest);
+    UpdatePoolStats();
     meshes = g_pool.meshes;
     instances = g_pool.instances;
     visibility.reserve(instances.size());
     for (const WorldInstance& instance : instances) {
       visibility.push_back(GetPoolCameraVisibility(instance));
       last_seen.push_back(PoolInstanceLastSeen(instance));
-      const bool alpha = instance.mesh_id < g_pool.meshes.size() && g_pool.meshes[instance.mesh_id].alpha;
+      const bool alpha = PoolInstanceAlpha(instance);
       const bool in_wind_keys = g_pool.wind_keys.count(instance.mesh_key) != 0u;
       instance_alpha.push_back(alpha ? 1u : 0u);
       instance_wind.push_back(in_wind_keys ? 1u : 0u);
@@ -6443,6 +6482,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
         if (alpha && !in_wind_keys) alpha_wind_not_swayed += 1u;  // alpha wind instance whose key is not in wind_keys
       }
     }
+    const auto newest = PoolNewestSeenByKey();
     for (size_t i = 0; i < instances.size(); ++i) {
       const WorldInstance& instance = instances[i];
       if (!instance.dynamic || !visibility[i].camera_seen || instance.last_follow_frame + kPoolDumpStaleFrames >= frame) continue;

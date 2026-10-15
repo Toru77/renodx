@@ -2556,6 +2556,38 @@ static void TestStaleDynamic() {
   pool::ResetWorldPool();
 }
 
+// An alpha-tested mesh's superseded static instance is not retired by the static overlap rule (the control, not alpha, is).
+static void TestAlphaStaticNotRetired() {
+  pool::ResetWorldPool();
+  const uint64_t key = 0xF201u;
+  Capture(key, 6.f, true);
+  const uint32_t mesh_id = MeshOf(key);
+  const auto make = [&](uint32_t seen, float min_x) {
+    pool::WorldInstance instance;
+    instance.mesh_id = mesh_id;
+    instance.mesh_key = key;
+    instance.admit_frame = seen;
+    instance.id = pool::g_pool.next_instance_id++;
+    instance.bounds_min[0] = min_x;
+    instance.bounds_max[0] = min_x + 1.f;
+    for (size_t k = 1; k < 3; ++k) {
+      instance.bounds_min[k] = 0.f;
+      instance.bounds_max[k] = 1.f;
+    }
+    return instance;
+  };
+  {
+    std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
+    pool::g_pool.meshes[mesh_id].alpha = true;
+    pool::g_pool.instances = {make(100u, 0.f), make(170u, 0.1f)};
+    const auto newest = pool::PoolNewestSeenByKey();
+    CHECK(!pool::PoolInstanceIsOrphan(pool::g_pool.instances[0], 200u, newest), "alpha mesh: superseded static not retired by the static rule");
+    pool::g_pool.meshes[mesh_id].alpha = false;
+    CHECK(pool::PoolInstanceIsOrphan(pool::g_pool.instances[0], 200u, newest), "control: same static on a non-alpha mesh retired");
+  }
+  pool::ResetWorldPool();
+}
+
 // Wind sway (approximate, experimental). The expected offset is written here from the reference VS
 // (reference/.dumps/foliage_0xA77D908A.vs_5_0.hlsl, lines 153-196), independently of pool_transform.hpp: scaled by
 // 1/(flex+1), then capped at min(0.1 * extent, 0.75 m) (option A).
@@ -3380,6 +3412,7 @@ int main() {
   TestRefusalsByVs();
   TestFailureDetail();
   TestStaleDynamic();
+  TestAlphaStaticNotRetired();
   HStage("mesh conflict");
   TestMeshConflict();
   TestAlphaSplit();

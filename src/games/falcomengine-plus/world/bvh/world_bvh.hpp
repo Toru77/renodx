@@ -359,7 +359,7 @@ inline void DrawBvhPanel() {
   PoolTlasTiming tlas_timing;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    UpdatePoolStats(PoolNewestSeenByKey());
+    UpdatePoolStats();
     stats = g_pool.stats;
     tlas_timing = g_pool.tlas_timing;
   }
