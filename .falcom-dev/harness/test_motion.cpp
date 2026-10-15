@@ -1365,7 +1365,7 @@ int main() {
   }
 
   HStage("29c. Orphan bounds: a static or dynamic instance is retired only by a fresher same-key pose with overlapping bounds.");
-  // 29c. Static orphans (overlap, same key, fresher by more than kPoolMovingHoldFrames); touching faces and an exact hold are kept.
+  // 29c. Static orphans (overlap, same key, fresher by more than kPoolGhostHoldFrames); touching faces and an exact hold are kept.
   {
     fresh();
     std::lock_guard lock(bvh::g_pool.mutex);
@@ -1397,14 +1397,14 @@ int main() {
     CHECK(c.size() == 2u, "(c) disjoint live dynamic sibling: static kept and dynamic kept (%zu left)", c.size());
     const auto d = retire({make(0x94u, false, 100u, 0.f), make(0x94u, false, 170u, 1.f)}, 200u);
     CHECK(d.size() == 2u, "(d) boxes touching on a face only: both kept (%zu left)", d.size());
-    const auto e = retire({make(0x95u, false, 100u, 0.f), make(0x95u, false, 160u, 0.5f)}, 200u);
-    CHECK(e.size() == 2u, "(e) fresher by exactly kPoolMovingHoldFrames: both kept (%zu left)", e.size());
+    const auto e = retire({make(0x95u, false, 100u, 0.f), make(0x95u, false, 140u, 0.5f)}, 200u);
+    CHECK(e.size() == 2u, "(e) fresher by exactly kPoolGhostHoldFrames: both kept (%zu left)", e.size());
     const auto f = retire({make(0x96u, false, 100u, 0.f), make(0x96u, false, 170u, 0.97f)}, 200u);
     CHECK(f.size() == 2u, "(f) static off-screen sibling, 3%% overlap of the smaller box: both kept (%zu left)", f.size());
     const auto g = retire({make(0x97u, false, 100u, 0.f), make(0x97u, false, 170u, 0.1f)}, 200u);
     CHECK(g.size() == 1u && g[0].admit_frame == 170u, "(g) static ghost, 90%% overlap with a fresher pose: retired (%zu left)", g.size());
-    const auto h = retire({make(0x98u, false, 100u, 0.f), make(0x98u, false, 150u, 0.f)}, 300u);
-    CHECK(h.size() == 2u, "(h) pose only 50 newer than instance (within hold), overlapping: kept (%zu left)", h.size());
+    const auto h = retire({make(0x98u, false, 100u, 0.f), make(0x98u, false, 140u, 0.f)}, 300u);
+    CHECK(h.size() == 2u, "(h) pose only 40 newer than instance (within hold), overlapping: kept (%zu left)", h.size());
     const auto i = retire({make(0x99u, false, 100u, 0.f), make(0x99u, false, 170u, 0.5f)}, 200u);
     CHECK(i.size() == 1u && i[0].admit_frame == 170u, "(i) static, 50%% overlap of the smaller box, at least 0.05: retired (%zu left)", i.size());
     bvh::WorldInstance slab_a = make(0x9Au, false, 100u, 0.f);
@@ -1417,6 +1417,29 @@ int main() {
     CHECK(hinge.size() == 1u && hinge[0].admit_frame == 170u, "(j) slab hinge, 10%% overlap of the smaller box: older slab retired (%zu left)", hinge.size());
     const auto k = retire({make(0x9Bu, false, 100u, 0.f), make(0x9Bu, false, 170u, 0.97f)}, 200u);
     CHECK(k.size() == 2u, "(k) two props, 3%% overlap of the smaller box: both kept (%zu left)", k.size());
+    bvh::WorldInstance hinge_pose = slab_b;
+    hinge_pose.admit_frame = 145u;
+    bvh::g_pool.instances = {slab_a, hinge_pose};
+    std::vector<std::string> hinge_lines;
+    uint32_t hinge_retired_at = 0u;
+    for (uint32_t frame = 110u; frame <= 150u && hinge_retired_at == 0u; frame += 10u) {
+      if (frame >= 145u) bvh::g_pool.instances.back().admit_frame = frame;
+      bvh::RetirePoolOrphans(frame, bvh::PoolNewestSeenByKey(), &hinge_lines);
+      if (bvh::g_pool.instances.size() == 1u) hinge_retired_at = frame;
+    }
+    CHECK(hinge_retired_at == 150u, "(l) door-like hinge ghost seen at 100, hinge pose seen from 145: retired by 150 (at %u)", hinge_retired_at);
+    bvh::g_pool.instances = {make(0x9Du, false, 0u, 0.f), make(0x9Du, false, 0u, 0.5f)};
+    std::vector<std::string> live_lines;
+    for (uint32_t frame = 10u; frame <= 300u; frame += 10u) {
+      bvh::g_pool.instances[0].admit_frame = frame - frame % 30u;
+      bvh::g_pool.instances[1].admit_frame = frame >= 15u ? (frame - 15u) / 30u * 30u + 15u : 0u;
+      bvh::RetirePoolOrphans(frame, bvh::PoolNewestSeenByKey(), &live_lines);
+    }
+    CHECK(bvh::g_pool.instances.size() == 2u, "(m) live same-key neighbour, 50%% overlap, refreshed every 30 frames offset by 15: none retired over 300 frames (%zu left)", bvh::g_pool.instances.size());
+    const auto n = retire({make(0x9Eu, true, 100u, 0.f), make(0x9Eu, true, 150u, 0.1f)}, 141u);
+    CHECK(n.size() == 2u, "(n) dynamic ghost 50 frames older, overlapping fresher pose, 41 unseen frames: kept (%zu left)", n.size());
+    const auto o = retire({make(0x9Fu, true, 100u, 0.f), make(0x9Fu, true, 170u, 0.1f)}, 171u);
+    CHECK(o.size() == 1u && o[0].admit_frame == 170u, "(o) dynamic ghost 70 frames older, overlapping fresher pose: retired (%zu left)", o.size());
   }
 
   HStage("29e. Stutter cap: 10,000 same-key statics, some fresher by more than kPoolMovingHoldFrames; no overlap retirement for the key.");

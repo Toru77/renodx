@@ -192,6 +192,7 @@ inline constexpr size_t kPoolMotionMaxMeshKeys = 4096u;
 inline constexpr float kPoolMovingMeters = 1e-5f;  // translation; also at least 4 ULP of the coordinate
 inline constexpr float kPoolMovingBasis = 1e-5f;   // basis element, times the largest basis element (>= 1)
 inline constexpr uint32_t kPoolMovingHoldFrames = 2u * kPoolRecaptureFrames;
+inline constexpr uint32_t kPoolGhostHoldFrames = 40u;  // one 30-frame sample interval plus margin, for the overlap rule only
 inline constexpr uint32_t kPoolFollowRelinkFrames = 8u;     // unseen frames a moving instance may be relinked across
 // prevWorld trace (diagnostic, read-only): three draw keys, kPoolTraceFrames
 // camera copies each (see PoolPrevTrace).
@@ -1725,20 +1726,22 @@ inline bool PoolInstanceAlpha(const WorldInstance& instance) {
 // A dynamic instance not seen for kPoolMovingHoldFrames is an orphan (pending
 // retirement) when a fresher dynamic instance of its mesh key exists (the
 // pose it was superseded by), or when it was not seen for kPoolPruneAge frames.
-// Any instance (static included) is also an orphan when a fresher instance of
-// its key overlaps at least kPoolGhostOverlap of the volume of the smaller of the two boxes.
+// Any instance not seen for 40 frames (static, kPoolGhostHoldFrames) or 60 frames (dynamic, kPoolMovingHoldFrames)
+// is also an orphan when a fresher instance of its key overlaps at least kPoolGhostOverlap of the volume of the
+// smaller of the two boxes.
 // Keys with more than kPoolGhostKeyMax instances keep no poses, so they get no overlap rule.
 // Alpha-tested meshes and wind rest-pose keys are exempt from that rule.
 inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t frame,
                                  const std::unordered_map<uint64_t, PoolKeySeen>& newest) {
   const uint32_t seen = PoolInstanceLastSeen(instance);
-  if (frame <= seen + kPoolMovingHoldFrames) return false;
+  const uint32_t hold = instance.dynamic ? kPoolMovingHoldFrames : kPoolGhostHoldFrames;
+  if (frame <= seen + hold) return false;
   if (instance.dynamic && frame > seen + kPoolPruneAge) return true;
   const auto it = newest.find(instance.mesh_key);
   if (it == newest.end()) return false;
-  if (instance.dynamic && it->second.newest > seen) return true;
+  if (instance.dynamic && it->second.newest > seen && frame > seen + kPoolMovingHoldFrames) return true;
   for (const auto& pose : it->second.poses) {
-    if (pose.seen <= seen + kPoolMovingHoldFrames) continue;
+    if (pose.seen <= seen + hold) continue;
     float overlap = 1.f;
     float own_volume = 1.f;
     float pose_volume = 1.f;
