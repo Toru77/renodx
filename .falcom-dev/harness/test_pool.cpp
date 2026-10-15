@@ -677,6 +677,12 @@ int main() {
     }
     const bvh::PlacementCompare budget = bvh::ComparePlacementSnapshots(make(wide_a), make(wide_b));
     CHECK(budget.verdict == "INCONCLUSIVE (budget)", "budget: %s", budget.verdict.c_str());
+    // Two disjoint scenes (different signatures, no partners): only B above 50%, no exact or near matches.
+    std::vector<bvh::PlacementRecord> other_scene;
+    for (uint32_t i = 0u; i < 300u; ++i) other_scene.push_back(rec(0x43u, static_cast<float>(i % 40u) * 2.f, static_cast<float>(i / 40u) * 2.f, 0.f));
+    const bvh::PlacementCompare disjoint = bvh::ComparePlacementSnapshots(make(grid), make(other_scene));
+    CHECK(disjoint.verdict == "INCONCLUSIVE different scene (only A 100.0%, only B 100.0%): not comparable, retake A in the same map and spot",
+          "disjoint scenes: %s", disjoint.verdict.c_str());
     std::vector<bvh::PlacementRecord> collide;
     for (const bvh::PlacementRecord& r : grid) collide.push_back(rec(0x42u, r.matrix[3] + 1e-4f, r.matrix[7], r.matrix[11], grid_a.records[0].matrix_hash));
     std::vector<bvh::PlacementRecord> collide_a;

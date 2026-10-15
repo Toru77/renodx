@@ -603,6 +603,7 @@ inline void DrawBvhPanel() {
 
   ImGui::TextDisabled("Placement probe: static instances within %.0f m of the camera (Chebyshev), nearest first, up to %u records.",
                       static_cast<double>(kPlacementRadius), static_cast<unsigned>(kPlacementCap));
+  ImGui::TextDisabled("Compare needs the same map and spot: after a reload, return to the same map and spot before Compare to A.");
   if (ImGui::Button("Placement: snapshot now")) {
     PlacementSnapshot snapshot;
     TakePlacementSnapshot(&snapshot);

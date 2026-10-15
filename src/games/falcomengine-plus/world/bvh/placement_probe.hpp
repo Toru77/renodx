@@ -504,6 +504,8 @@ inline PlacementCompare ComparePlacementSnapshots(const PlacementSnapshot& a, co
   } else if (static_cast<float>(exact + near_matches) >= kPlacementPassFraction * static_cast<float>(n)) {
     verdict << "WARN not PASS: exact " << percent(exact, n) << " (" << exact << " of " << n << "), near " << near_matches << ", "
             << only;
+  } else if (exact + near_matches == 0u && (static_cast<float>(only_a) > 0.5f * static_cast<float>(ca) || static_cast<float>(only_b) > 0.5f * static_cast<float>(cb))) {
+    verdict << "INCONCLUSIVE different scene (" << only << "): not comparable, retake A in the same map and spot";
   } else {
     verdict << "FAIL mismatch: exact " << percent(exact, n) << " (" << exact << " of " << n << "), moved " << moved
             << " (median " << median << " m, max " << max_gap << " m), only A " << percent(only_a, ca) << ", only B "
@@ -528,9 +530,13 @@ inline PlacementCompare ComparePlacementSnapshots(const PlacementSnapshot& a, co
        << " m), only A " << only_a << ", only B " << only_b << "; pair budget " << (over_budget ? "exceeded" : "ok");
   out.lines.push_back(text.str());
   text.str("");
-  text << "Rebase detector: equal-basis leftover pairs " << rebase_pairs << ", P " << rebase_p << ", S " << rebase_s << ", d* ("
-       << delta_star[0] << ", " << delta_star[1] << ", " << delta_star[2] << ") m, "
-       << (rebase_due ? (rebase_fires ? "fired" : "not fired") : "skipped (exact share at PASS)");
+  text << "Rebase detector: equal-basis leftover pairs " << rebase_pairs << ", P " << rebase_p << ", S " << rebase_s;
+  if (rebase_p == 0u) {
+    text << ", no equal-basis pairs";
+  } else {
+    text << ", d* (" << delta_star[0] << ", " << delta_star[1] << ", " << delta_star[2] << ") m, "
+         << (rebase_due ? (rebase_fires ? "fired" : "not fired") : "skipped (exact share at PASS)");
+  }
   out.lines.push_back(text.str());
   out.lines.push_back("Verdict: " + out.verdict);
   return out;
