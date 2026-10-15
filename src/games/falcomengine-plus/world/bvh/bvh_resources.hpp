@@ -179,6 +179,11 @@ struct LiveBvhStats {
   float mesh_ms_max = 0.f;
   float tlas_ms_last = 0.f;
   float tlas_ms_max = 0.f;
+  // BLAS builds (UploadLiveMeshes; every BuildMeshBlas call, CPU ms on the present thread).
+  uint64_t blas_builds = 0u;
+  uint64_t blas_built_triangles = 0u;  // triangles of the builds that succeeded
+  float blas_build_ms_sum = 0.f;
+  float blas_build_ms_max = 0.f;
   // TLAS refits (RefitLiveTlas): moved dynamic instances without a rebuild.
   uint32_t tlas_refits = 0u;
   uint32_t refit_instances = 0u;  // descriptors that changed in the last refit

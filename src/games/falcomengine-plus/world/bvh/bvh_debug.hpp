@@ -225,6 +225,7 @@ inline void OnWorldPresentBvh(
   (void)rtao_startup_enable;
 
   UpdateLiveBvh(device, queue);
+  UpdateCacheDiag(device);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
   RunBvhDebugPass(queue, swapchain);

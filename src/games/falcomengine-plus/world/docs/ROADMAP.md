@@ -60,6 +60,20 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## Phase 0 cache diagnostics (2026-10-15): implemented, not validated in game
+
+Status: implemented, not validated in game. Diagnostic only: no rendering or TLAS behaviour change. Build id `cache-diag-0`. Code: `world/bvh/cache_diag.hpp` (distance tiers, histogram, self-check, TLAS change diff, episodes, lighting gap, report lines, `world_cache_diag.json`), `world/bvh/placement_probe.hpp` (placement snapshot, compare, text files), `bvh_live.hpp` (`UpdateCacheDiag`, TLAS record hook, BLAS counters), `world_bvh.hpp` (panel section "Cache diagnostics"). Harness: `test_pool` (placement, episode serial), `test_live` (tiers, TLAS diff, episodes, lighting, report lines, diagnostics on/off give identical TLAS, descriptors and revision).
+
+Owner test steps (DevKit build, BVH panel, section "Cache diagnostics", at the bottom):
+1. Click "Reset diag counters". Play one map for a minute with "Collect cache diagnostics" on (default). Click "Dump cache diagnostics" once (the panel says pending), wait one frame, click it again. The panel shows the file path and byte count; the same report is on the clipboard. Send `world_cache_diag.json` and the panel text.
+2. In the tier block, check "Self-check: PASS". FAIL means the tier sums and the pool totals disagree; send that line.
+3. Placement: stand where the problem shows, click "Save snapshot A". Move or wait for the scene to change, click "Compare to A". The panel shows the verdict (PASS, WARN, FAIL or INCONCLUSIVE) and the file paths. Send `world_placement_compare.txt`, `world_placement_A.txt` and `world_placement_B.txt`. "Snapshot now" writes `world_placement_now.txt` alone.
+4. After a map change, read the episode line: t80 (frames and ms until 80% of the final fresh instances are in the TLAS), and whether it settled or was interrupted.
+
+Definitions: episodes start at a map change, a pool reset or the first admitted instance. t80 uses the last TLAS sample of the episode as its final count (no sample means no TLAS rebuild happened in it); an open episode shows "t80 pending, fresh now X" with the latest sample. Lighting gap: a present is dark when the lighting depth frame is not the camera frame, or when the lighting depth stamp or the camera stamp is more than one frame older than the present (no lighting pass ran). Placement compare: a record counts only when it lies within the smaller of the two radii of both cameras (each distance from its own snapshot's camera); PASS needs exact >= 99% of the common set and only-A and only-B each <= 1% of their side; the rebase detector runs only below 99% exact. The TLAS rebuild timing excludes the diagnostics.
+
+Known failure (pre-existing, not yet proven at HEAD): `test_motion` at `test_motion.cpp:977`, re-flag lag 32 against `kPoolRecaptureFrames` 30.
+
 ## Current state (2026-10-09)
 
 Goal: hardware-free (compute) ray tracing in Trails in the Sky 2nd Chapter (D3D11) on RenoDX, DevKit-gated (`falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`). All code is in `src/games/falcomengine-plus/world/`.

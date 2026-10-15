@@ -1011,6 +1011,361 @@ static void TestBlitPacking() {
   CHECK(bvh::MakeLiveInstanceGPU(plain, 1u).header[2] == 0.f, "no material: header.z 0");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 0 cache diagnostics (diagnostic only): tier golden case, TLAS diff, episodes, lighting gap, report
+// lines, and the on/off check (the diagnostics change no TLAS, descriptor or revision).
+
+static bvh::LiveTlasInstance TlasAt(uint64_t id, float x, bool wind = false) {
+  bvh::LiveTlasInstance t;
+  t.id = id;
+  t.wind = wind;
+  t.matrix[0] = t.matrix[5] = t.matrix[10] = 1.f;
+  t.matrix[3] = x;
+  t.bounds_min[0] = x - 1.f;
+  t.bounds_max[0] = x + 1.f;
+  t.bounds_min[1] = t.bounds_min[2] = -1.f;
+  t.bounds_max[1] = t.bounds_max[2] = 1.f;
+  return t;
+}
+
+static bool HasLine(const std::vector<std::string>& lines, const std::string& text) {
+  return std::find(lines.begin(), lines.end(), text) != lines.end();
+}
+
+template <typename T>
+static bool SameBytes(const std::vector<T>& a, const std::vector<T>& b) {
+  return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+}
+
+// Tier table of a fixed pool: region [-256, 256], camera at the origin.
+static bvh::CacheTiers TierGolden() {
+  std::vector<bvh::WorldMesh> meshes(3);
+  meshes[0].uid = 10u;
+  meshes[0].triangle_count = 100u;
+  meshes[0].positions.resize(4);
+  meshes[0].indices.resize(6);
+  meshes[1].uid = 11u;
+  meshes[1].triangle_count = 50u;
+  meshes[1].positions.resize(3);
+  meshes[1].indices.resize(3);
+  meshes[1].uvs.resize(3);
+  meshes[2].uid = 12u;
+  meshes[2].triangle_count = 7u;
+  const auto instance = [](uint32_t mesh, float x) {
+    bvh::WorldInstance i;
+    i.mesh_id = mesh;
+    i.matrix[3] = x;
+    i.bounds_min[0] = x - 1.f;
+    i.bounds_max[0] = x + 1.f;
+    i.bounds_min[1] = i.bounds_min[2] = -1.f;
+    i.bounds_max[1] = i.bounds_max[2] = 1.f;
+    return i;
+  };
+  const std::vector<bvh::WorldInstance> instances = {instance(0u, 50.f), instance(0u, 200.f), instance(1u, 300.f),
+                                                     instance(1u, -120.f), instance(0u, -240.f)};
+  bvh::PoolRegion region;
+  for (int k = 0; k < 3; ++k) {
+    region.min[k] = -256.f;
+    region.max[k] = 256.f;
+  }
+  const float camera[3] = {};
+  std::unordered_map<uint64_t, bvh::CacheResident> resident;
+  resident[10u] = bvh::CacheResident{9u, 1000u};
+  bvh::CacheTiers tiers;
+  bvh::ComputeCacheTiers(instances, meshes, camera, region, resident, &tiers);
+  return tiers;
+}
+
+static void TestCacheTiers() {
+  const bvh::CacheTiers t = TierGolden();
+  CHECK(t.self_check, "tier sums equal the pool totals");
+  const bvh::CacheTier& t0 = t.tiers[0];
+  CHECK(t0.instances == 2u && t0.instance_tris == 150u && t0.meshes == 2u && t0.pool_tris == 150u && t0.pool_bytes == 144u
+            && t0.resident_meshes == 1u && t0.resident_tris == 9u && t0.resident_bytes == 1000u,
+        "tier T0 (%llu, %llu, %llu)", (unsigned long long)t0.instances, (unsigned long long)t0.instance_tris, (unsigned long long)t0.meshes);
+  const bvh::CacheTier& t1 = t.tiers[1];
+  CHECK(t1.instances == 2u && t1.instance_tris == 200u && t1.meshes == 0u, "tier T1");
+  const bvh::CacheTier& t2 = t.tiers[2];
+  CHECK(t2.instances == 0u && t2.meshes == 0u, "tier T2 empty");
+  const bvh::CacheTier& outside = t.tiers[3];
+  CHECK(outside.instances == 1u && outside.instance_tris == 50u && outside.meshes == 0u, "outside region tier");
+  const bvh::CacheTier& none = t.tiers[4];
+  CHECK(none.instances == 0u && none.meshes == 1u && none.pool_tris == 7u && none.pool_bytes == 0u, "no instance tier (mesh once)");
+  CHECK(t.instances == 5u && t.meshes == 3u && t.pool_tris == 157u && t.pool_bytes == 144u, "pool totals");
+  CHECK(t.histogram[2] == 1u && t.histogram[4] == 1u && t.histogram[6] == 2u && t.histogram[7] == 1u, "histogram buckets");
+  uint64_t histogram_total = 0u;
+  for (const uint64_t count : t.histogram) histogram_total += count;
+  CHECK(histogram_total == 5u, "histogram counts every instance (%llu)", (unsigned long long)histogram_total);
+}
+
+static void TestCacheDiff() {
+  const std::vector<bvh::LiveTlasInstance> before = {TlasAt(1u, 10.f), TlasAt(2u, 20.f), TlasAt(3u, 300.f), TlasAt(4u, 50.f, true)};
+  const std::vector<bvh::LiveTlasInstance> after = {TlasAt(5u, 100.f), TlasAt(3u, 301.f), TlasAt(2u, 20.f)};
+  const float camera[3] = {};
+  const bvh::CacheTlasDiff d = bvh::DiffTlasInstances(before, after, camera);
+  CHECK(d.added == 1u && d.removed == 1u && d.moved == 1u, "diff: added %llu removed %llu moved %llu", (unsigned long long)d.added,
+        (unsigned long long)d.removed, (unsigned long long)d.moved);
+  CHECK(std::fabs(d.nearest_add_remove - 9.f) < 1e-4f, "nearest add/remove (%.3f)", (double)d.nearest_add_remove);
+  CHECK(std::fabs(d.nearest_changed - 300.f) < 1e-4f, "nearest changed (%.3f)", (double)d.nearest_changed);
+  const bvh::CacheTlasDiff none = bvh::DiffTlasInstances({}, {}, camera);
+  CHECK(none.added == 0u && none.removed == 0u && none.moved == 0u && none.nearest_add_remove < 0.f && none.nearest_changed < 0.f, "empty diff");
+  const bvh::CacheTlasDiff wind = bvh::DiffTlasInstances({TlasAt(7u, 5.f, true)}, {}, camera);
+  CHECK(wind.removed == 0u && wind.nearest_add_remove < 0.f, "wind instance excluded from the diff");
+}
+
+static void TestCacheEpisodes(Device* dev) {
+  const auto now = std::chrono::steady_clock::now();
+  bvh::CacheEpisode e;
+  e.open = true;
+  e.start_frame = 100u;
+  e.start_time = now;
+  const uint32_t frames[6] = {105u, 110u, 120u, 130u, 140u, 150u};
+  const uint64_t fresh[6] = {0u, 2u, 5u, 9u, 10u, 10u};
+  for (int i = 0; i < 6; ++i) {
+    bvh::CacheSample& s = e.samples.emplace_back();
+    s.frame = frames[i];
+    s.ms = static_cast<float>(i);
+    s.tlas_fresh = fresh[i];
+  }
+  bvh::FinishCacheEpisode(&e, "settled");
+  CHECK(!e.open && std::strcmp(e.state, "settled") == 0, "episode settled");
+  CHECK(e.t80_valid && e.t80_frames == 30u && e.final_fresh == 10u, "t80 at +30 frames (%u, final %llu)", e.t80_frames, (unsigned long long)e.final_fresh);
+  CHECK(e.t80_ms == 3.f, "t80 ms from the sample (%.1f)", (double)e.t80_ms);
+  bvh::CacheEpisode interrupted;
+  interrupted.open = true;
+  bvh::FinishCacheEpisode(&interrupted, "interrupted");
+  CHECK(!interrupted.open && std::strcmp(interrupted.state, "interrupted") == 0 && !interrupted.t80_valid, "interrupted episode has no t80");
+
+  // Stale start: a rebuild before the episode start is not sampled; one at or after it is.
+  bvh::ResetCacheDiagCounters();
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.episode.open = true;
+    bvh::g_cache_diag.data.episode.start_frame = 100u;
+    bvh::g_cache_diag.data.episode.start_time = now;
+  }
+  const std::vector<bvh::LiveTlasInstance> tlas = {TlasAt(1u, 10.f)};
+  bvh::RecordCacheTlasRebuild({}, tlas, true, 50u);
+  bvh::RecordCacheTlasRebuild({}, tlas, false, 120u);
+  bvh::RecordCacheTlasRebuild({}, tlas, true, 120u);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    CHECK(bvh::g_cache_diag.data.episode.samples.size() == 1u && bvh::g_cache_diag.data.episode.samples[0].frame == 120u,
+          "stale rebuild not credited, failed build not counted (%zu samples)", bvh::g_cache_diag.data.episode.samples.size());
+    CHECK(bvh::g_cache_diag.data.tlas.rebuilds == 2u && bvh::g_cache_diag.data.tlas.added == 2u, "two replaced TLAS builds counted, the failed one not");
+    CHECK(bvh::g_cache_diag.data.episode.quiet_presents == 0u, "a rebuild restarts the settle count");
+  }
+  bvh::ResetCacheDiagCounters();
+
+  // Lighting gap and capture-off reset (UpdateCacheDiag with the switch off).
+  bvh::CacheLighting lighting;
+  const bool seq[7] = {false, true, true, false, false, false, true};
+  for (const bool dark : seq) bvh::AddCacheLightingSample(&lighting, dark);
+  CHECK(lighting.presents == 7u && lighting.dark_presents == 3u && lighting.dark_runs == 2u && lighting.longest_dark == 2u
+            && lighting.longest_lit == 3u && lighting.dark,
+        "lighting runs (dark %llu of %llu, runs %llu, longest dark %llu, lit %llu)", (unsigned long long)lighting.dark_presents,
+        (unsigned long long)lighting.presents, (unsigned long long)lighting.dark_runs, (unsigned long long)lighting.longest_dark,
+        (unsigned long long)lighting.longest_lit);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.lighting = lighting;
+  }
+  bvh::g_cache_diag.enabled.store(false);
+  bvh::UpdateCacheDiag(dev);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    CHECK(bvh::g_cache_diag.data.lighting.presents == 0u, "capture off resets the lighting gap (%llu)", (unsigned long long)bvh::g_cache_diag.data.lighting.presents);
+  }
+  bvh::g_cache_diag.enabled.store(true);
+  // Dark rule: equal recent stamps are lit, stamps 5 frames old are dark, stamps 1 frame ahead of frame are lit (no unsigned wrap).
+  {
+    auto& frame = falcom_world::g_state.frame;
+    falcom_world::g_state.depth_source.valid = true;
+    falcom_world::g_state.camera.valid = true;
+    frame.store(7000u);
+    falcom_world::g_state.depth_source.frame = 6999u;
+    falcom_world::g_state.camera.frame = 6999u;
+    bvh::UpdateCacheDiag(dev);
+    CHECK(!bvh::g_cache_diag.data.lighting.dark, "equal recent stamps are lit");
+    falcom_world::g_state.depth_source.frame = 6995u;
+    falcom_world::g_state.camera.frame = 6995u;
+    bvh::UpdateCacheDiag(dev);
+    CHECK(bvh::g_cache_diag.data.lighting.dark, "stamps 5 frames old are dark");
+    falcom_world::g_state.depth_source.frame = 7001u;
+    falcom_world::g_state.camera.frame = 7001u;
+    bvh::UpdateCacheDiag(dev);
+    CHECK(!bvh::g_cache_diag.data.lighting.dark, "stamps 1 frame ahead are lit, not wrapped to dark");
+    {
+      std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+      bvh::g_cache_diag.data.presents = 0u;
+    }
+  }
+  bvh::ResetCacheDiagCounters();
+}
+
+// A Dump request with collection off: the present computes the tiers, counts no present, and clears the request.
+static void TestCacheForcedDump(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::g_cache_diag.enabled.store(false);
+  bvh::g_cache_diag.force_tiers_requested.store(true);
+  bvh::UpdateCacheDiag(dev);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    CHECK(bvh::g_cache_diag.data.tiers_valid, "forced dump with collection off keeps the tiers");
+    CHECK(bvh::g_cache_diag.data.presents == 0u, "collection off: no present counted (%llu)", (unsigned long long)bvh::g_cache_diag.data.presents);
+  }
+  CHECK(!bvh::g_cache_diag.force_tiers_requested.load(), "dump request consumed by the present");
+  bvh::g_cache_diag.enabled.store(true);
+  bvh::ResetCacheDiagCounters();
+}
+
+static void TestCacheLines() {
+  bvh::ResetCacheDiagCounters();
+  std::vector<std::string> lines = bvh::CacheDiagLines(nullptr);
+  CHECK(lines.size() == 5u && lines[0].rfind("Cache diagnostics (cache-diag-0 ", 0) == 0 && lines[0].find(": 0 presents, tiers not computed yet") != std::string::npos,
+        "header line (%zu lines)", lines.size());
+  CHECK(HasLine(lines, "TLAS changes: rebuilds 0 (empty 0), added 0, removed 0, moved 0, nearest changed -, nearest add/remove -; by tier of nearest add/remove: T0 0, T1 0, T2 0, none 0"),
+        "TLAS line");
+  CHECK(HasLine(lines, "Episode: none yet (starts at a map change, a pool reset or the first admitted instance)"), "episode line before any episode");
+  CHECK(HasLine(lines, "Lighting gap: no data now; dark 0 of 0 presents, dark runs 0, longest dark 0, longest lit 0 presents"), "lighting line");
+  CHECK(HasLine(lines, "Last file: none written in this session"), "last file line");
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.tiers = TierGolden();
+    bvh::g_cache_diag.data.tiers_valid = true;
+    bvh::g_cache_diag.data.tlas.rebuilds = 3u;
+    bvh::g_cache_diag.data.tlas.empty = 1u;
+    bvh::g_cache_diag.data.tlas.added = 2u;
+    bvh::g_cache_diag.data.tlas.removed = 1u;
+    bvh::g_cache_diag.data.tlas.nearest_add_remove_m = 9.f;
+    bvh::g_cache_diag.data.tlas.by_tier[0] = 1u;
+    bvh::g_cache_diag.data.tlas.by_tier[2] = 2u;
+    bvh::g_cache_diag.data.lighting.presents = 7u;
+    bvh::g_cache_diag.data.lighting.dark_presents = 3u;
+    bvh::g_cache_diag.data.lighting.dark_runs = 2u;
+    bvh::g_cache_diag.data.lighting.longest_dark = 2u;
+    bvh::g_cache_diag.data.lighting.longest_lit = 3u;
+    bvh::g_cache_diag.data.lighting.dark = true;
+    bvh::g_cache_diag.data.lighting.known = true;
+  }
+  lines = bvh::CacheDiagLines(nullptr);
+  CHECK(HasLine(lines, "T0 <128 m: instances 2 (150 tris), meshes 2 (150 tris, 0.00 MB), resident 1 meshes (9 tris, 0.00 MB)"), "T0 row");
+  CHECK(HasLine(lines, "Self-check: PASS (tier sums = pool totals: 5 instances, 3 meshes, 157 tris, 144 bytes)"), "self-check PASS line");
+  CHECK(HasLine(lines, "Instance distance (m): <16 0, 16-32 0, 32-64 1, 64-96 0, 96-128 1, 128-192 0, 192-256 2, 256-384 1, 384-512 0, >=512 0"),
+        "histogram line");
+  CHECK(HasLine(lines, "TLAS changes: rebuilds 3 (empty 1), added 2, removed 1, moved 0, nearest changed -, nearest add/remove 9.0 m; by tier of nearest add/remove: T0 1, T1 0, T2 2, none 0"),
+        "TLAS line with changes");
+  CHECK(HasLine(lines, "Lighting gap: DARK now; dark 3 of 7 presents, dark runs 2, longest dark 2, longest lit 3 presents"), "lighting line with runs");
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.tiers.self_check = false;
+    bvh::g_cache_diag.data.tiers.sum_instances = 4u;
+  }
+  lines = bvh::CacheDiagLines(nullptr);
+  CHECK(HasLine(lines, "Self-check: FAIL (tier sums 4 instances, 3 meshes, 157 tris, 144 bytes; pool totals 5, 3, 157, 144)"), "self-check FAIL line names both sums");
+  {
+    // An open episode shows the latest sample's fresh count; t80 is pending until the episode ends.
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.episode = bvh::CacheEpisode{};
+    bvh::g_cache_diag.data.episode.ever = true;
+    bvh::g_cache_diag.data.episode.open = true;
+    bvh::g_cache_diag.data.episode.state = "open";
+    bvh::g_cache_diag.data.episode.reason = "pool reset";
+    bvh::g_cache_diag.data.episode.serial = 2u;
+    bvh::g_cache_diag.data.episode.start_frame = 100u;
+    bvh::g_cache_diag.data.episode.fresh_from = 100u;
+    bvh::g_cache_diag.data.episode.samples.emplace_back().tlas_fresh = 7u;
+  }
+  lines = bvh::CacheDiagLines(nullptr);
+  CHECK(HasLine(lines, "Episode: open (pool reset, serial 2, start f100, fresh from f100): open: t80 pending, fresh now 7; 1 TLAS samples"),
+        "open episode line");
+  bvh::ResetCacheDiagCounters();
+  lines = bvh::CacheDiagLines(nullptr);
+  CHECK(HasLine(lines, "Episode: none since reset"), "episode line after reset");
+  bvh::g_cache_diag.data = bvh::CacheDiagData{};
+}
+
+// One fixed scenario (two meshes, instances, a retirement) with the diagnostics on or off. Returns what the TLAS,
+// the mesh descriptors and the pool revision hold, plus the BLAS counters.
+struct CacheRun {
+  std::vector<bvh::WorldInstanceGPU> tlas_instances;
+  std::vector<bvh::BVHNodeGPU> tlas_nodes;
+  std::vector<bvh::WorldMeshGPU> mesh_descriptors;
+  uint64_t revision_delta = 0u;
+  uint32_t tlas_rebuilds = 0u;
+  uint32_t resident = 0u;
+  uint64_t meshes_uploaded = 0u;
+  uint64_t triangles_uploaded = 0u;
+  uint64_t blas_builds = 0u;
+  uint64_t blas_built_triangles = 0u;
+};
+
+static CacheRun RunCacheScenario(bool enabled) {
+  bvh::g_cache_diag.enabled.store(enabled);
+  bvh::ResetWorldPool();
+  g_obs_frame = 100000u;
+  Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
+  auto& frame = falcom_world::g_state.frame;
+  frame.store(5000u);
+  SetCamera(10.f, 5.f, 10.f);
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(&dev);
+  uint64_t revision_start = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    revision_start = bvh::g_pool.revision;
+  }
+  const auto present = [&]() {
+    frame.fetch_add(1u);
+    bvh::UpdateLiveBvh(&dev, &queue);
+    bvh::UpdateCacheDiag(&dev);
+  };
+  AddMesh(0x51, Grid(40, 40, 10.f, 1.f));
+  AddMesh(0x52, BoxMesh(1.f));
+  for (int i = 0; i < 6; ++i) AddInstance(0x51, -20.f + 7.f * static_cast<float>(i), 0.f, 30.f, 1.f, 0.2f * static_cast<float>(i));
+  for (int i = 0; i < 4; ++i) AddInstance(0x52, -10.f + 6.f * static_cast<float>(i), 2.f, -15.f);
+  for (int i = 0; i < 30; ++i) present();
+  AddInstance(0x52, 25.f, 2.f, 25.f);
+  for (int i = 0; i < 20; ++i) present();
+  RetireMesh(0x52);
+  for (int i = 0; i < 20; ++i) present();
+  CacheRun run;
+  run.tlas_instances = data->tlas_instances_cpu;
+  run.tlas_nodes = data->tlas_nodes_cpu;
+  run.mesh_descriptors = data->mesh_descriptors;
+  run.tlas_rebuilds = data->live.tlas_rebuilds;
+  run.resident = data->live.resident_meshes;
+  run.meshes_uploaded = data->live.meshes_uploaded;
+  run.triangles_uploaded = data->live.triangles_uploaded;
+  run.blas_builds = data->live.blas_builds;
+  run.blas_built_triangles = data->live.blas_built_triangles;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    run.revision_delta = bvh::g_pool.revision - revision_start;
+  }
+  bvh::DestroyBvhDeviceData(&dev);
+  bvh::ResetWorldPool();
+  return run;
+}
+
+static void TestCacheOnOff() {
+  const CacheRun on = RunCacheScenario(true);
+  const CacheRun off = RunCacheScenario(false);
+  bvh::g_cache_diag.enabled.store(true);
+  CHECK(on.tlas_instances.size() > 0u, "scenario builds a TLAS (%zu instances)", on.tlas_instances.size());
+  CHECK(SameBytes(on.tlas_instances, off.tlas_instances), "TLAS instances byte-identical with diagnostics on/off");
+  CHECK(SameBytes(on.tlas_nodes, off.tlas_nodes), "TLAS nodes byte-identical with diagnostics on/off");
+  CHECK(SameBytes(on.mesh_descriptors, off.mesh_descriptors), "mesh descriptors byte-identical with diagnostics on/off");
+  CHECK(on.revision_delta == off.revision_delta, "pool revision delta equal (%llu, %llu)", (unsigned long long)on.revision_delta, (unsigned long long)off.revision_delta);
+  CHECK(on.tlas_rebuilds == off.tlas_rebuilds && on.resident == off.resident && on.meshes_uploaded == off.meshes_uploaded,
+        "rebuilds, resident and uploads equal (%u/%u, %u/%u)", on.tlas_rebuilds, off.tlas_rebuilds, on.resident, off.resident);
+  CHECK(on.blas_builds == off.blas_builds && on.blas_builds >= on.meshes_uploaded, "BLAS counters always on (%llu, %llu)", (unsigned long long)on.blas_builds,
+        (unsigned long long)off.blas_builds);
+  CHECK(on.blas_built_triangles == on.triangles_uploaded, "BLAS triangles equal triangles uploaded (%llu, %llu)",
+        (unsigned long long)on.blas_built_triangles, (unsigned long long)on.triangles_uploaded);
+  std::printf("cache diag on/off: TLAS %zu instances, %u rebuilds, BLAS %llu builds / %llu triangles\n", on.tlas_instances.size(),
+              on.tlas_rebuilds, (unsigned long long)on.blas_builds, (unsigned long long)on.blas_built_triangles);
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Stage("main start");
@@ -2002,6 +2357,13 @@ int main() {
   Stage("11c alpha cut and blit (CPU)");
   TestAlphaCut();
   TestBlitPacking();
+  Stage("11d cache diagnostics");
+  TestCacheTiers();
+  TestCacheDiff();
+  TestCacheEpisodes(&dev);
+  TestCacheForcedDump(&dev);
+  TestCacheLines();
+  TestCacheOnOff();
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

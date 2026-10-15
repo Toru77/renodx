@@ -138,7 +138,7 @@ inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
 inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
-inline constexpr const char* kWorldBuildId = "p2b-diag-2 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
+inline constexpr const char* kWorldBuildId = "cache-diag-0 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
 inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
@@ -1390,6 +1390,11 @@ struct PoolState {
   std::unordered_set<uint64_t> invalidated_keys;  // pending observation cleanup
   bool retire_pending = false;
   uint32_t map_change_frame = 0u;  // frame of the last mass retire awaiting its sweep; 0 = none
+  // Episode of the instance set (cache diagnostics): bumped by a map change and by a pool reset.
+  uint32_t episode_serial = 0u;
+  uint32_t episode_start_frame = 0u;
+  uint32_t episode_fresh_from = 0u;  // an instance last seen at or after this frame is fresh
+  const char* episode_reason = "";
   uint64_t map_sweep_budget_skips = 0u;  // BudgetFull skips seen at the last present while a sweep is pending
   uint32_t map_sweep_skip_frame = 0u;  // frame those skips last changed; the sweep waits kPoolStagingSlots after it
   std::vector<WorldMesh> meshes;
@@ -1687,6 +1692,15 @@ inline bool PoolInstanceInRegion(const WorldInstance& instance, const PoolRegion
     if (instance.bounds_max[i] < region.min[i] || instance.bounds_min[i] > region.max[i]) return false;
   }
   return true;
+}
+
+// Chebyshev distance (largest per-axis gap) from a point to an axis-aligned box; 0 inside.
+inline float PoolChebyshevDistance(const float* point, const float* bmin, const float* bmax) {
+  float distance = 0.f;
+  for (int i = 0; i < 3; ++i) {
+    distance = (std::max)(distance, (std::max)(bmin[i] - point[i], point[i] - bmax[i]));
+  }
+  return (std::max)(distance, 0.f);
 }
 
 // Caller holds g_pool.mutex.
@@ -4456,6 +4470,10 @@ inline void CompactPool() {
     g_pool.stats.last_mass_retire_frame = frame;
     g_pool.stats.last_mass_retire_meshes = retired_now;
     g_pool.map_change_frame = frame;
+    g_pool.episode_serial += 1u;
+    g_pool.episode_start_frame = frame;
+    g_pool.episode_fresh_from = frame + 1u;
+    g_pool.episode_reason = "map change";
     g_pool.map_sweep_budget_skips = g_pool.stats.skips[static_cast<size_t>(PoolSkip::BudgetFull)];
     g_pool.map_sweep_skip_frame = frame;
     for (auto& [key, schedule] : g_pool.schedule) schedule.next_frame = frame + 1u;
@@ -5823,6 +5841,10 @@ inline void ResetWorldPool() {
   g_pool.retire_pending = false;
   g_pool.map_change_frame = 0u;
   g_pool.map_sweep_budget_skips = 0u;
+  g_pool.episode_serial += 1u;
+  g_pool.episode_start_frame = g_state.frame.load();
+  g_pool.episode_fresh_from = 0u;
+  g_pool.episode_reason = "pool reset";
   g_pool.map_sweep_skip_frame = 0u;
   g_pool.meshes.clear();
   g_pool.observations.clear();

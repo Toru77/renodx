@@ -18,7 +18,9 @@
 #include "../debug/crash_log.hpp"
 #include "bvh_debug.hpp"
 #include "bvh_pool.hpp"
+#include "cache_diag.hpp"
 #include "p2b_diag.hpp"
+#include "placement_probe.hpp"
 
 namespace falcom_world::bvh {
 
@@ -542,6 +544,175 @@ inline void DrawBvhPanel() {
   }
   for (const std::string& line : data->inspect.lines) ImGui::TextUnformatted(line.c_str());
   if (data->trace_stats.valid) DrawDepthCompareStats(data->trace_stats);
+
+  // Phase 0 cache diagnostics (diagnostic only: no rendering change). Every result is shown here, copied to the
+  // clipboard and written to the pool folder.
+  ImGui::SeparatorText("Cache diagnostics (Phase 0, diagnostic only: no rendering change)");
+  bool collect = g_cache_diag.enabled.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Collect cache diagnostics", &collect)) g_cache_diag.enabled.store(collect, std::memory_order_relaxed);
+  for (const std::string& line : CacheDiagLines(data)) ImGui::TextUnformatted(line.c_str());
+  if (ImGui::Button("Dump cache diagnostics")) {
+    // The first press asks the next present to compute the tiers; the press after that (once a present has run) writes the file.
+    bool ready = false;
+    {
+      std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+      ready = g_cache_diag.data.dump_armed && !g_cache_diag.force_tiers_requested.load(std::memory_order_relaxed);
+      g_cache_diag.data.dump_armed = !ready;
+      if (!ready) {
+        g_cache_diag.force_tiers_requested.store(true, std::memory_order_relaxed);
+        g_cache_diag.data.last_result = "Dump pending: the tiers are recomputed on the next present; press Dump again after one frame";
+      }
+    }
+    if (ready) {
+      const uint32_t dump_frame = g_state.frame.load();
+      const std::filesystem::path path = WriteCacheDiagFile(data, dump_frame);
+      std::error_code ec;
+      const uintmax_t bytes = std::filesystem::file_size(path, ec);
+      const bool written = !ec && bytes != 0u;
+      std::string result = "Cache diagnostics: FAILED to write " + path.string();
+      if (written) {
+        const std::vector<std::string> report = CacheDiagLines(data);
+        std::string text;
+        for (const std::string& line : report) text += line + "\n";
+        ImGui::SetClipboardText(text.c_str());
+        result = "Cache diagnostics: wrote " + path.string() + " (" + std::to_string(bytes) + " bytes) at f" + std::to_string(dump_frame)
+                 + "; report copied to clipboard (" + std::to_string(report.size()) + " lines)";
+      }
+      std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+      g_cache_diag.data.last_result = result;
+      if (written) {
+        g_cache_diag.data.last_path = path.string();
+        g_cache_diag.data.last_bytes = bytes;
+      }
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Reset diag counters")) {
+    g_cache_diag.reset_requested.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+    g_cache_diag.data.last_result = "Diag counters reset at f" + std::to_string(g_state.frame.load());
+  }
+  {
+    std::string result;
+    {
+      std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+      result = g_cache_diag.data.last_result;
+    }
+    if (!result.empty()) ImGui::TextUnformatted(result.c_str());
+  }
+
+  ImGui::TextDisabled("Placement probe: static instances within %.0f m of the camera (Chebyshev), nearest first, up to %u records.",
+                      static_cast<double>(kPlacementRadius), static_cast<unsigned>(kPlacementCap));
+  if (ImGui::Button("Placement: snapshot now")) {
+    PlacementSnapshot snapshot;
+    TakePlacementSnapshot(&snapshot);
+    const std::filesystem::path path = PoolOutputDir() / "world_placement_now.txt";
+    std::string message = "Placement snapshot now: FAILED to write " + path.string();
+    if (WritePlacementFile(path, snapshot)) {
+      std::error_code ec;
+      const uintmax_t bytes = std::filesystem::file_size(path, ec);
+      message = "Placement snapshot now: " + std::to_string(snapshot.records.size()) + " records at f" + std::to_string(snapshot.frame)
+                + (snapshot.truncated ? " (truncated)" : "") + ", wrote " + path.string() + " (" + std::to_string(ec ? 0u : bytes) + " bytes)";
+    }
+    std::lock_guard<std::mutex> lock(g_placement.mutex);
+    g_placement.lines = {message};
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Save snapshot A")) {
+    PlacementSnapshot snapshot;
+    TakePlacementSnapshot(&snapshot);
+    const std::filesystem::path path = PoolOutputDir() / "world_placement_A.txt";
+    std::string message = "Snapshot A (memory): " + std::to_string(snapshot.records.size()) + " records at f" + std::to_string(snapshot.frame);
+    if (WritePlacementFile(path, snapshot)) {
+      std::error_code ec;
+      const uintmax_t bytes = std::filesystem::file_size(path, ec);
+      message += ", wrote " + path.string() + " (" + std::to_string(ec ? 0u : bytes) + " bytes)";
+    } else {
+      message += ", FAILED to write " + path.string();
+    }
+    std::lock_guard<std::mutex> lock(g_placement.mutex);
+    g_placement.a = std::move(snapshot);
+    g_placement.a_valid = true;
+    g_placement.lines = {message};
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Compare to A")) {
+    std::vector<std::string> report;
+    PlacementSnapshot a;
+    bool have_a = false;
+    {
+      std::lock_guard<std::mutex> lock(g_placement.mutex);
+      if (g_placement.a_valid) {
+        a = g_placement.a;
+        have_a = true;
+      }
+    }
+    const std::filesystem::path a_path = PoolOutputDir() / "world_placement_A.txt";
+    if (!have_a) {
+      std::error_code ec;
+      std::string error;
+      if (std::filesystem::exists(a_path, ec)) {
+        if (ReadPlacementFile(a_path, &a, &error)) {
+          have_a = true;
+          report.push_back("A: loaded from file " + a_path.string());
+          std::lock_guard<std::mutex> lock(g_placement.mutex);
+          g_placement.a = a;
+          g_placement.a_valid = true;
+        } else {
+          report.push_back("A: could not read " + a_path.string() + ": " + error);
+        }
+      }
+    }
+    if (!have_a) {
+      report.push_back("NO SNAPSHOT A: press \"Save snapshot A\" first");
+    } else {
+      PlacementSnapshot b;
+      TakePlacementSnapshot(&b);
+      const PlacementCompare compare = ComparePlacementSnapshots(a, b);
+      const std::filesystem::path b_path = PoolOutputDir() / "world_placement_B.txt";
+      const std::filesystem::path c_path = PoolOutputDir() / "world_placement_compare.txt";
+      std::string text;
+      for (const std::string& line : compare.lines) text += line + "\n";
+      std::error_code ec_stale;
+      std::filesystem::remove(b_path, ec_stale);  // a failed write must not leave the previous compare behind
+      std::filesystem::remove(c_path, ec_stale);
+      const bool wrote_b = WritePlacementFile(b_path, b);
+      renodx::utils::path::WriteTextFile(c_path, text);
+      std::error_code ec_b;
+      std::error_code ec_c;
+      const uintmax_t bytes_b = wrote_b ? std::filesystem::file_size(b_path, ec_b) : 0u;
+      const uintmax_t bytes_c = std::filesystem::file_size(c_path, ec_c);
+      report.insert(report.end(), compare.lines.begin(), compare.lines.end());
+      ImGui::SetClipboardText(text.c_str());
+      report.push_back("Wrote " + b_path.string() + " (" + std::to_string(wrote_b && !ec_b ? bytes_b : 0u) + " bytes) and " + c_path.string()
+                       + " (" + std::to_string(ec_c ? 0u : bytes_c) + " bytes); report copied to clipboard");
+    }
+    std::lock_guard<std::mutex> lock(g_placement.mutex);
+    g_placement.lines = report;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Clear snapshots")) {
+    std::lock_guard<std::mutex> lock(g_placement.mutex);
+    g_placement.a = PlacementSnapshot{};
+    g_placement.a_valid = false;
+    g_placement.lines.clear();
+  }
+  std::vector<std::string> placement_lines;
+  {
+    std::lock_guard<std::mutex> lock(g_placement.mutex);
+    placement_lines = g_placement.lines;
+  }
+  for (const std::string& line : placement_lines) {
+    if (line.rfind("Verdict: PASS", 0) == 0) {
+      ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "%s", line.c_str());
+    } else if (line.rfind("Verdict: WARN", 0) == 0) {
+      ImGui::TextColored(ImVec4(1.f, 0.75f, 0.2f, 1.f), "%s", line.c_str());
+    } else if (line.rfind("Verdict: FAIL", 0) == 0 || line.rfind("Verdict: INCONCLUSIVE", 0) == 0) {
+      ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", line.c_str());
+    } else {
+      ImGui::TextUnformatted(line.c_str());
+    }
+  }
 }
 
 }  // namespace falcom_world::bvh

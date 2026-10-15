@@ -64,6 +64,7 @@
 #include "bvh_pool.hpp"
 #include "alpha_live.hpp"
 #include "bvh_resources.hpp"
+#include "cache_diag.hpp"
 #include "deform_live.hpp"
 
 namespace falcom_world::bvh {
@@ -277,7 +278,13 @@ inline LiveUploadResult UploadLiveMeshes(
   for (LiveMeshUpload& upload : *uploads) {
     LiveBuiltMesh mesh;
     mesh.upload = &upload;
+    const auto blas_start = std::chrono::steady_clock::now();
     const char* error = BuildMeshBlas(upload.positions, upload.indices, &mesh.blas);
+    const float blas_ms = LiveElapsedMs(blas_start);
+    stats.blas_builds += 1u;
+    stats.blas_build_ms_sum += blas_ms;
+    stats.blas_build_ms_max = (std::max)(stats.blas_build_ms_max, blas_ms);
+    if (error == nullptr) stats.blas_built_triangles += upload.indices.size() / 3u;
     if (error != nullptr) {
       data->failed_uids.insert(upload.uid);
       result.failed += 1u;
@@ -773,9 +780,14 @@ inline void RebuildLiveTlas(
   stats.tlas_alpha_instances = alpha_instances;
   stats.tlas_alpha_waiting = alpha_waiting;
 
+  std::vector<LiveTlasInstance> previous_info;  // cache diagnostics: the TLAS this build replaces
+  bool replaced = false;
   const auto finish = [&]() {
+    // Cache diagnostics (Phase 0). The empty-TLAS and failed-build returns also come through here: an empty TLAS is
+    // counted, a failed build (not replaced) counts nothing.
     stats.tlas_ms_last = LiveElapsedMs(start);
     stats.tlas_ms_max = (std::max)(stats.tlas_ms_max, stats.tlas_ms_last);
+    RecordCacheTlasRebuild(previous_info, data->tlas_info, replaced, frame);  // after the timing: its cost is not TLAS time
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolTlasTiming& timing = g_pool.tlas_timing;
     timing.rebuilds += 1u;
@@ -798,6 +810,8 @@ inline void RebuildLiveTlas(
     g_pool.stats.tlas_sway_on = data->tlas_sway_on;
   };
   if (instances.empty()) {
+    previous_info = std::move(data->tlas_info);
+    replaced = true;
     DestroyLiveTlas(device, data);
     commit();
     stats.tlas_instances = 0u;
@@ -859,6 +873,8 @@ inline void RebuildLiveTlas(
     finish();
     return;
   }
+  previous_info = std::move(data->tlas_info);
+  replaced = true;
   DestroyLiveTlas(device, data);
   data->instance_buffer = instance_buffer.buffer;
   data->instance_srv = instance_buffer.view;
@@ -1871,4 +1887,95 @@ inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::
     g_pool.tlas_timing.refit_after_drain_skipped += 1u;
   }
 }
+// Phase 0 cache diagnostics, once per present (bvh_debug.hpp). Diagnostic only: the tiers, histogram and self-check
+// are computed every kCacheSampleInterval presents, or on the present after a Dump request, and read under g_pool.mutex.
+// The lighting gap is a present that is dark: the lighting depth is not the depth of this frame's camera, or the
+// lighting depth or the camera stamp is more than one frame old (no lighting pass ran).
+inline void UpdateCacheDiag(reshade::api::device* device) {
+  BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
+  if (data == nullptr) return;
+  if (g_cache_diag.reset_requested.exchange(false, std::memory_order_relaxed)) {
+    data->live.blas_builds = 0u;
+    data->live.blas_built_triangles = 0u;
+    data->live.blas_build_ms_sum = 0.f;
+    data->live.blas_build_ms_max = 0.f;
+    ResetCacheDiagCounters();
+  }
+  PoolStageScope stage("cache diag");
+  const uint32_t frame = g_state.frame.load();
+  const bool enabled = g_cache_diag.enabled.load(std::memory_order_relaxed);
+  const bool force_tiers = g_cache_diag.force_tiers_requested.exchange(false, std::memory_order_relaxed);
+  // Camera and region take g_state.mutex: read before the pool lock.
+  float camera[3] = {};
+  PoolCameraPosition(camera);
+  const PoolRegion region = CurrentPoolRegion();
+  bool dark = false;
+  {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    dark = !(g_state.camera.valid && g_state.depth_source.valid && g_state.depth_source.frame == g_state.camera.frame)
+           || g_state.depth_source.frame + 1u < frame || g_state.camera.frame + 1u < frame;
+  }
+  bool sample = force_tiers;
+  if (enabled) {
+    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+    sample = sample || (g_cache_diag.data.presents + 1u) % kCacheSampleInterval == 0u;
+  }
+  // Resident store (live slots by uid): built outside the pool lock.
+  std::unordered_map<uint64_t, CacheResident> resident;
+  if (sample) {
+    for (const auto& [uid, index] : data->slot_by_uid) {
+      if (index >= data->slots.size() || !data->slots[index].live) continue;
+      resident[uid] = CacheResident{data->slots[index].leaf_count, LiveSlotBytes(*data, data->slots[index])};
+    }
+  }
+  CacheTiers tiers;
+  uint32_t serial = 0u;
+  uint32_t pool_start = 0u;
+  uint32_t pool_fresh_from = 0u;
+  const char* pool_reason = "";
+  uint64_t admitted = 0u;
+  {
+    std::lock_guard<std::mutex> lock(g_pool.mutex);
+    serial = g_pool.episode_serial;
+    pool_start = g_pool.episode_start_frame;
+    pool_fresh_from = g_pool.episode_fresh_from;
+    pool_reason = g_pool.episode_reason;
+    admitted = g_pool.instances.size();
+    if (sample) ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
+  }
+  std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+  CacheDiagData& d = g_cache_diag.data;
+  const uint32_t previous_serial = d.serial_seen;
+  d.serial_seen = serial;
+  if (sample) {
+    d.tiers = std::move(tiers);
+    d.tiers_valid = true;
+    d.tiers_frame = frame;
+  }
+  if (!enabled) {
+    d.lighting = CacheLighting{};  // capture off: the lighting gap starts again when it is switched on
+    return;
+  }
+  d.presents += 1u;
+  AddCacheLightingSample(&d.lighting, dark);
+  // An episode starts at a map change or pool reset (serial changed), or at the first admitted instance.
+  const bool triggered = serial != previous_serial;
+  if (triggered || (!d.episode.ever && admitted != 0u)) {
+    if (d.episode.open) FinishCacheEpisode(&d.episode, "interrupted");
+    CacheEpisode next;
+    next.ever = true;
+    next.open = true;
+    next.state = "open";
+    next.reason = triggered ? pool_reason : "first admission";
+    next.serial = serial;
+    next.start_frame = triggered ? pool_start : frame;
+    next.fresh_from = triggered ? pool_fresh_from : 0u;
+    next.start_time = std::chrono::steady_clock::now();
+    d.episode = std::move(next);
+  } else if (d.episode.open) {
+    d.episode.quiet_presents += 1u;
+    if (d.episode.quiet_presents >= kCacheSettlePresents) FinishCacheEpisode(&d.episode, "settled");
+  }
+}
+
 }  // namespace falcom_world::bvh

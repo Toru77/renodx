@@ -1,6 +1,9 @@
 // Native harness for the pool: mock device/command list execute copies
 // immediately (as the GPU would at that point of the stream).
 #include <cassert>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -9,6 +12,7 @@
 #include "harness_timer.hpp"
 #include "mesh_fixture.hpp"
 #include "src/games/falcomengine-plus/world/bvh/bvh_pool.hpp"
+#include "src/games/falcomengine-plus/world/bvh/placement_probe.hpp"
 
 using namespace reshade::api;
 namespace bvh = falcom_world::bvh;
@@ -293,6 +297,7 @@ int main() {
   }
   for (int i = 0; i < 100; ++i) run_frame(frame++, false);
   uint32_t pre_release_next = 0u;
+  uint32_t pre_release_serial = 0u;
   size_t schedules_before = 0u;
   {
     std::lock_guard lock(bvh::g_pool.mutex);
@@ -300,6 +305,7 @@ int main() {
     CHECK(bvh::g_pool.stats.mass_retirements == 0u, "no map change yet (%u)", bvh::g_pool.stats.mass_retirements);
     for (auto& [key, schedule] : bvh::g_pool.schedule) pre_release_next = (std::max)(pre_release_next, schedule.next_frame);
     schedules_before = bvh::g_pool.schedule.size();
+    pre_release_serial = bvh::g_pool.episode_serial;
   }
   // Pad so the sweep (change frame + settle) lands on a frame that is not a multiple of 60.
   while ((falcom_world::g_state.frame.load() + 1u + bvh::kPoolMapSettleFrames) % 60u == 0u) run_frame(frame++, false);
@@ -316,6 +322,9 @@ int main() {
     std::printf("after map change: mass_retirements %u map_change_frame %u map_instances_retired %u meshes %zu instances %zu\n",
                 p.stats.mass_retirements, p.map_change_frame, p.stats.map_instances_retired, p.meshes.size(), p.instances.size());
     CHECK(p.stats.mass_retirements == 1u, "one map change (%u)", p.stats.mass_retirements);
+    CHECK(p.episode_serial == pre_release_serial + 1u, "map change bumps the episode serial (%u)", p.episode_serial);
+    CHECK(p.episode_fresh_from == p.map_change_frame + 1u, "map change: fresh from the frame after the change (%u)", p.episode_fresh_from);
+    CHECK(std::strcmp(p.episode_reason, "map change") == 0, "map change reason (%s)", p.episode_reason);
     CHECK(p.map_change_frame == falcom_world::g_state.frame.load(), "map change frame (%u)", p.map_change_frame);
     CHECK(p.stats.map_instances_retired == 0u, "no sweep in change frame (%u)", p.stats.map_instances_retired);
     CHECK(p.instances.size() == 4, "instances %zu", p.instances.size());
@@ -506,6 +515,213 @@ int main() {
     int32_t partial = 5;
     falcom_world::OnUpdateBufferRegionCbTracker(&dev, &partial, b1, 4, 4);
     CHECK(falcom_world::ReadTrackedCbInt(&cl, b1, &out) && out == 11, "write past offset 0 keeps offset (%d)", out);
+  }
+
+  {  // Phase 0 cache diagnostics: episode serial and fields, placement probe (read-only snapshot, compare, files)
+    uint32_t serial_before = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      serial_before = bvh::g_pool.episode_serial;
+    }
+    bvh::ResetWorldPool();
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      auto& p = bvh::g_pool;
+      CHECK(p.episode_serial == serial_before + 1u, "reset bumps the episode serial (%u -> %u)", serial_before, p.episode_serial);
+      CHECK(p.episode_fresh_from == 0u, "reset: any instance is fresh (%u)", p.episode_fresh_from);
+      CHECK(std::strcmp(p.episode_reason, "pool reset") == 0, "reset reason (%s)", p.episode_reason);
+      CHECK(p.episode_start_frame == falcom_world::g_state.frame.load(), "reset start frame (%u)", p.episode_start_frame);
+    }
+    // Placement fixtures: a camera at (1, 2, 3); static, dynamic, far and alpha instances; 6100 static near ones.
+    float view[16] = {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.f, 2.f, 0.f, 0.f, 1.f, 3.f, 0.f, 0.f, 0.f, 1.f};
+    falcom_world::g_state.camera.valid = true;
+    std::memcpy(falcom_world::g_state.camera.view_inv, view, sizeof(view));
+    constexpr uint32_t kVsStatic = 0xBEEFu;
+    constexpr uint32_t kVsDynamic = 0xDEADu;
+    uint64_t revision_before = 0u;
+    size_t instances_before = 0u;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      auto& p = bvh::g_pool;
+      p.meshes.clear();
+      p.instances.clear();
+      bvh::WorldMesh solid;
+      solid.uid = 1u;
+      solid.signature = 0x1111u;
+      solid.triangle_count = 1u;
+      p.meshes.push_back(solid);
+      bvh::WorldMesh alpha = solid;
+      alpha.uid = 2u;
+      alpha.mesh_id = 1u;
+      alpha.signature = 0x2222u;
+      alpha.alpha = true;
+      p.meshes.push_back(alpha);
+      uint64_t next_id = 1u;
+      const auto add = [&](uint32_t mesh_id, float x, float y, float z, uint32_t vs, bool dynamic) {
+        bvh::WorldInstance instance;
+        instance.mesh_id = mesh_id;
+        instance.source_vs_hash = vs;
+        instance.dynamic = dynamic;
+        instance.id = next_id++;
+        instance.matrix[0] = instance.matrix[5] = instance.matrix[10] = 1.f;
+        instance.matrix[3] = x;
+        instance.matrix[7] = y;
+        instance.matrix[11] = z;
+        instance.bounds_min[0] = x - 0.5f;
+        instance.bounds_min[1] = y - 0.5f;
+        instance.bounds_min[2] = z - 0.5f;
+        instance.bounds_max[0] = x + 0.5f;
+        instance.bounds_max[1] = y + 0.5f;
+        instance.bounds_max[2] = z + 0.5f;
+        p.instances.push_back(instance);
+      };
+      for (uint32_t i = 0u; i < 6100u; ++i) {
+        add(0u, static_cast<float>(i % 61u) * 0.5f - 15.f, static_cast<float>((i / 61u) % 61u) * 0.5f - 15.f, 0.f, kVsStatic, false);
+      }
+      for (uint32_t i = 0u; i < 20u; ++i) add(0u, 3.f + static_cast<float>(i), 0.f, 0.f, kVsDynamic, true);
+      add(0u, 200.f, 0.f, 0.f, kVsStatic, false);
+      add(1u, 5.f, 5.f, 0.f, kVsStatic, false);
+      revision_before = p.revision;
+      instances_before = p.instances.size();
+    }
+    bvh::PlacementSnapshot snapshot;
+    bvh::TakePlacementSnapshot(&snapshot);
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      CHECK(bvh::g_pool.revision == revision_before, "snapshot changes nothing: revision (%llu -> %llu)",
+            static_cast<unsigned long long>(revision_before), static_cast<unsigned long long>(bvh::g_pool.revision));
+      CHECK(bvh::g_pool.instances.size() == instances_before, "snapshot changes nothing: instances (%zu -> %zu)", instances_before, bvh::g_pool.instances.size());
+    }
+    size_t dynamic_records = 0u;
+    size_t far_records = 0u;
+    size_t alpha_records = 0u;
+    for (const bvh::PlacementRecord& record : snapshot.records) {
+      dynamic_records += record.vs_hash == kVsDynamic ? 1u : 0u;
+      far_records += record.distance > bvh::kPlacementRadius ? 1u : 0u;
+      alpha_records += record.alpha ? 1u : 0u;
+    }
+    CHECK(dynamic_records == 0u, "placement: dynamic instances left out (%zu)", dynamic_records);
+    CHECK(far_records == 0u, "placement: instances beyond %.0f m left out (%zu)", static_cast<double>(bvh::kPlacementRadius), far_records);
+    CHECK(alpha_records == 1u, "placement: alpha record kept and flagged (%zu)", alpha_records);
+    CHECK(snapshot.records.size() == bvh::kPlacementCap, "placement: cap of %zu records (%zu)", bvh::kPlacementCap, snapshot.records.size());
+    CHECK(snapshot.truncated, "placement: truncated flag set");
+    CHECK(snapshot.radius == snapshot.records.back().distance, "placement: effective radius is the last kept distance (%.3f)", static_cast<double>(snapshot.radius));
+    bool ordered = true;
+    for (size_t i = 1u; i < snapshot.records.size(); ++i) ordered &= snapshot.records[i - 1u].distance <= snapshot.records[i].distance;
+    CHECK(ordered, "placement: nearest first");
+    CHECK(snapshot.frame == falcom_world::g_state.frame.load(), "placement: header frame (%u)", snapshot.frame);
+
+    // Compare: identical, jitter, rebase by offset, outside-radius labels, too few, budget, hash guard.
+    const auto rec = [](uint64_t sig, float x, float y, float z, uint64_t hash = 0u) {
+      bvh::PlacementRecord r;
+      r.signature = sig;
+      const float m[12] = {1.f, 0.f, 0.f, x, 0.f, 1.f, 0.f, y, 0.f, 0.f, 1.f, z};
+      std::memcpy(r.matrix, m, sizeof(m));
+      r.matrix_hash = hash != 0u ? hash : falcom_world::MatrixHash(r.matrix, bvh::kPoolWorldFloats);
+      r.distance = (std::max)(std::fabs(x), (std::max)(std::fabs(y), std::fabs(z)));
+      const float bounds[6] = {x, y, z, x, y, z};
+      std::memcpy(r.bounds, bounds, sizeof(bounds));
+      return r;
+    };
+    const auto make = [](std::vector<bvh::PlacementRecord> records) {
+      bvh::PlacementSnapshot s;
+      s.records = std::move(records);
+      s.build = "test";
+      return s;
+    };
+    std::vector<bvh::PlacementRecord> grid;
+    for (uint32_t i = 0u; i < 100u; ++i) grid.push_back(rec(0x42u, static_cast<float>(i % 10u) * 2.f, static_cast<float>(i / 10u) * 2.f, 0.f));
+    const bvh::PlacementSnapshot grid_a = make(grid);
+    const bvh::PlacementCompare same = bvh::ComparePlacementSnapshots(grid_a, grid_a);
+    CHECK(same.verdict == "PASS exact-match 100.0% (100 of 100), only A 0.0%, only B 0.0%", "identical: %s", same.verdict.c_str());
+    std::vector<bvh::PlacementRecord> jittered;
+    for (const bvh::PlacementRecord& r : grid) jittered.push_back(rec(0x42u, r.matrix[3] + 5e-4f, r.matrix[7], r.matrix[11]));
+    const bvh::PlacementCompare jitter = bvh::ComparePlacementSnapshots(grid_a, make(jittered));
+    CHECK(jitter.verdict.rfind("WARN not PASS", 0) == 0, "jitter 5e-4: %s", jitter.verdict.c_str());
+    std::vector<bvh::PlacementRecord> offset;
+    for (const bvh::PlacementRecord& r : grid) offset.push_back(rec(0x42u, r.matrix[3] + 37.5f, r.matrix[7], r.matrix[11] - 12.f));
+    const bvh::PlacementCompare rebase = bvh::ComparePlacementSnapshots(grid_a, make(offset));
+    CHECK(rebase.verdict == "FAIL rebase-by-delta (37.5, 0, -12) m", "rebase by delta: %s", rebase.verdict.c_str());
+    bvh::PlacementSnapshot short_b = make(grid);
+    short_b.radius = 50.f;
+    std::vector<bvh::PlacementRecord> far_a = grid;
+    far_a.push_back(rec(0x42u, 60.f, 0.f, 0.f));
+    const bvh::PlacementCompare outside = bvh::ComparePlacementSnapshots(make(far_a), short_b);
+    CHECK(outside.lines[1].find("outside other radius, expected: A 1, B 0") != std::string::npos, "outside label: %s", outside.lines[1].c_str());
+    // Moved camera with equal overlap: A's extra record is 90 m from A and 100 m from B (beyond 96 m): outside, not a mismatch.
+    bvh::PlacementSnapshot moved_a = make(grid);
+    moved_a.records.push_back(rec(0x42u, -90.f, 0.f, 0.f));
+    bvh::PlacementSnapshot moved_b = make(grid);
+    moved_b.camera[0] = 10.f;
+    const bvh::PlacementCompare moved = bvh::ComparePlacementSnapshots(moved_a, moved_b);
+    CHECK(moved.verdict == "PASS exact-match 100.0% (100 of 100), only A 0.0%, only B 0.0%", "moved camera, equal overlap: %s", moved.verdict.c_str());
+    CHECK(moved.lines[0].find("camera A to B 10 m") != std::string::npos, "camera gap in the report: %s", moved.lines[0].c_str());
+    // B much smaller than A: 100 of 1000 exact is not PASS (only A 90%).
+    std::vector<bvh::PlacementRecord> big;
+    for (uint32_t i = 0u; i < 1000u; ++i) big.push_back(rec(0x42u, static_cast<float>(i % 40u) * 2.f, static_cast<float>(i / 40u) * 2.f, 0.f));
+    const bvh::PlacementCompare shrunk = bvh::ComparePlacementSnapshots(make(big), make(std::vector<bvh::PlacementRecord>(big.begin(), big.begin() + 100)));
+    CHECK(shrunk.verdict.rfind("PASS", 0) != 0 && shrunk.verdict.find("only A 90.0%") != std::string::npos, "B much smaller is not PASS: %s", shrunk.verdict.c_str());
+    std::vector<bvh::PlacementRecord> ten(grid.begin(), grid.begin() + 10);
+    const bvh::PlacementCompare few = bvh::ComparePlacementSnapshots(make(ten), make(ten));
+    CHECK(few.verdict == "INCONCLUSIVE 10 comparable instances (need 20)", "10 comparable: %s", few.verdict.c_str());
+    std::vector<bvh::PlacementRecord> wide_a;
+    std::vector<bvh::PlacementRecord> wide_b;
+    uint32_t seed = 12345u;
+    const auto next = [&seed]() {
+      seed = seed * 1664525u + 1013904223u;
+      return static_cast<float>(seed >> 8) / 16777216.f * 180.f - 90.f;
+    };
+    for (uint32_t i = 0u; i < 1200u; ++i) {
+      wide_a.push_back(rec(0x42u, next(), next(), next()));
+      wide_b.push_back(rec(0x42u, next(), next(), next()));
+    }
+    const bvh::PlacementCompare budget = bvh::ComparePlacementSnapshots(make(wide_a), make(wide_b));
+    CHECK(budget.verdict == "INCONCLUSIVE (budget)", "budget: %s", budget.verdict.c_str());
+    std::vector<bvh::PlacementRecord> collide;
+    for (const bvh::PlacementRecord& r : grid) collide.push_back(rec(0x42u, r.matrix[3] + 1e-4f, r.matrix[7], r.matrix[11], grid_a.records[0].matrix_hash));
+    std::vector<bvh::PlacementRecord> collide_a;
+    for (const bvh::PlacementRecord& r : grid) collide_a.push_back(rec(0x42u, r.matrix[3], r.matrix[7], r.matrix[11], grid_a.records[0].matrix_hash));
+    const bvh::PlacementCompare guard = bvh::ComparePlacementSnapshots(make(collide_a), make(collide));
+    CHECK(guard.lines[2].rfind("Exact 0,", 0) == 0, "hash guard: same hash, other floats is not exact (%s)", guard.lines[2].c_str());
+
+    // File round trip (bit-equal) and a corrupt line named in the error.
+    const std::filesystem::path round = std::filesystem::temp_directory_path() / "falcom_placement_roundtrip.txt";
+    CHECK(bvh::WritePlacementFile(round, snapshot), "write placement file");
+    bvh::PlacementSnapshot back;
+    std::string error;
+    CHECK(bvh::ReadPlacementFile(round, &back, &error), "read placement file: %s", error.c_str());
+    bool bit_equal = back.records.size() == snapshot.records.size() && back.build == snapshot.build && back.frame == snapshot.frame
+                     && back.truncated == snapshot.truncated && std::memcmp(back.camera, snapshot.camera, sizeof(back.camera)) == 0
+                     && std::memcmp(&back.radius, &snapshot.radius, sizeof(float)) == 0 && back.switches == snapshot.switches;
+    for (size_t i = 0u; bit_equal && i < snapshot.records.size(); ++i) {
+      const bvh::PlacementRecord& x = snapshot.records[i];
+      const bvh::PlacementRecord& y = back.records[i];
+      bit_equal = x.signature == y.signature && x.matrix_hash == y.matrix_hash && x.vs_hash == y.vs_hash && x.alpha == y.alpha
+                  && std::memcmp(x.matrix, y.matrix, sizeof(x.matrix)) == 0 && std::memcmp(x.bounds, y.bounds, sizeof(x.bounds)) == 0
+                  && std::memcmp(&x.distance, &y.distance, sizeof(float)) == 0;
+    }
+    CHECK(bit_equal, "file round trip is bit-equal (%zu records)", back.records.size());
+    const std::filesystem::path again = std::filesystem::temp_directory_path() / "falcom_placement_roundtrip_2.txt";
+    bvh::WritePlacementFile(again, back);
+    CHECK(ReadFile(round.string()) == ReadFile(again.string()), "rewritten file is byte-equal");
+    std::vector<std::string> text_lines;
+    {
+      std::ifstream in(round, std::ios::binary);
+      for (std::string line; std::getline(in, line);) text_lines.push_back(line);
+    }
+    const size_t bad_line = 12u;
+    text_lines[bad_line - 1u] = "rec zz 0 0 0 0 0";
+    {
+      std::ofstream out(round, std::ios::binary | std::ios::trunc);
+      for (const std::string& line : text_lines) out << line << "\n";
+    }
+    bvh::PlacementSnapshot corrupt;
+    CHECK(!bvh::ReadPlacementFile(round, &corrupt, &error), "corrupt line refused");
+    CHECK(error == "line 12: bad record head", "corrupt line named (%s)", error.c_str());
+    std::printf("cache diag placement: %zu records (truncated %d); identical: %s | jitter: %s | rebase: %s | budget: %s\n", snapshot.records.size(),
+                snapshot.truncated ? 1 : 0, same.verdict.c_str(), jitter.verdict.c_str(), rebase.verdict.c_str(), budget.verdict.c_str());
+    std::filesystem::remove(round);
+    std::filesystem::remove(again);
   }
 
   bvh::DumpWorldPool();
