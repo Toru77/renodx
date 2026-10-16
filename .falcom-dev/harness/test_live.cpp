@@ -1404,8 +1404,9 @@ static void TestCacheDiagJson(Device* dev) {
   CHECK(text.find("\"live\": {\"tlas_instances\": " + std::to_string(live.tlas_instances) + ", \"tlas_rebuilds\": " + std::to_string(live.tlas_rebuilds)) != std::string::npos,
         "live block equals data->live");
   CHECK(text.find("\"tlas_frame\": " + std::to_string(live.tlas_frame) + ", \"refit_lag_last\": " + std::to_string(live.refit_lag_last)
-                  + ", \"refit_lag_max\": " + std::to_string(live.refit_lag_max)) != std::string::npos,
-        "live block has tlas_frame and refit lag");
+                  + ", \"refit_lag_max\": " + std::to_string(live.refit_lag_max)
+                  + ", \"refit_rest_fast\": " + std::to_string(live.refit_rest_fast) + ", \"refit_rest_slow\": " + std::to_string(live.refit_rest_slow)) != std::string::npos,
+        "live block has tlas_frame, refit lag and the rest counts");
   bvh::ResetCacheDiagCounters();
 }
 
@@ -2620,6 +2621,22 @@ static void TestRefitCursorMiss() {
   CHECK(g == 0x969d56d0bdf3e0c6ull, "refit cursor miss pin (%016llx)", (unsigned long long)g);
 }
 
+static falcom_world::WindSwayParams RestWindSway(int p) {
+  falcom_world::WindSwayParams wind;
+  wind.wave_frequency = 1.f;
+  wind.wind_force = 2.f + 0.01f * static_cast<float>(p);
+  wind.wind_dir[0] = 1.f;
+  wind.shake_scale = 0.5f;
+  wind.shake_speed = 1.f;
+  wind.shake_freq = 1.f;
+  wind.shake_wind_scale = 1.f;
+  wind.shake_flexibility = 3.f;
+  wind.layout = "test";
+  wind.wave_time = 0.1f * static_cast<float>(p);
+  wind.game_time = 0.1f * static_cast<float>(p);
+  return wind;
+}
+
 // Golden for the wind sway refit at the default range: eight wind instances at 15 to 200 m (Chebyshev from the camera
 // at (10,5,10)) are swayed every present, and a near and a far non-wind dynamic instance follow their poses. At the
 // default (maximum) range nothing is gated, so this pin holds across the wind range change.
@@ -2640,17 +2657,7 @@ static void TestWindRangeGolden() {
       if (inst.mesh_key == kD) dyn.push_back(inst.id);
     }
     bvh::g_pool.wind_keys.insert(kW);
-    falcom_world::WindSwayParams wind;
-    wind.wave_frequency = 1.f;
-    wind.wind_force = 2.f;
-    wind.wind_dir[0] = 1.f;
-    wind.shake_scale = 0.5f;
-    wind.shake_speed = 1.f;
-    wind.shake_freq = 1.f;
-    wind.shake_wind_scale = 1.f;
-    wind.shake_flexibility = 3.f;
-    wind.layout = "test";
-    bvh::g_pool.wind_sway[kW] = wind;
+    bvh::g_pool.wind_sway[kW] = RestWindSway(0);
   }
   CHECK(dyn.size() == 2u, "two non-wind dynamic candidates (%zu)", dyn.size());
   uint64_t g = 14695981039346656037ull;
@@ -2701,17 +2708,7 @@ static WindRangeRun RunWindRange(const std::vector<float>& range_at) {
       if (inst.mesh_key == kD) run.dyn_ids.push_back(inst.id);
     }
     bvh::g_pool.wind_keys.insert(kW);
-    falcom_world::WindSwayParams wind;
-    wind.wave_frequency = 1.f;
-    wind.wind_force = 2.f;
-    wind.wind_dir[0] = 1.f;
-    wind.shake_scale = 0.5f;
-    wind.shake_speed = 1.f;
-    wind.shake_freq = 1.f;
-    wind.shake_wind_scale = 1.f;
-    wind.shake_flexibility = 3.f;
-    wind.layout = "test";
-    bvh::g_pool.wind_sway[kW] = wind;
+    bvh::g_pool.wind_sway[kW] = RestWindSway(0);
   }
   const auto frame = [] { return falcom_world::g_state.frame.load(); };
   const auto record = [&]() {
@@ -2793,6 +2790,429 @@ static void TestWindRangeGate() {
   bool wide_same = wide.poses.size() == full.poses.size();
   for (size_t p = 0; wide_same && p < wide.poses.size(); ++p) wide_same = wide.poses[p] == full.poses[p] && wide.far_skipped[p] == 0u;
   CHECK(wide_same, "range 1043: poses equal the max-range run and far_skipped is 0 every present");
+}
+
+// Rest-pose wind refit. Pool: 12 rest wind instances on two wind keys (15-200 m from the camera at (10,5,10)), 3 followed
+// wind instances, 3 non-wind dynamic, 6 static. The sway params change every present; the sway switch is off for presents
+// 12-17, one key is erased for presents 14-21, one wave_time is NaN at present 20, the range is 50 from present 30.
+// force_dynamic marks the rest instances dynamic in the pool (the live path): the TLAS bytes must not depend on it.
+struct RestWindRun {
+  uint64_t golden = 14695981039346656037ull;
+  std::vector<std::vector<uint8_t>> tlas;  // per present: poses, inverses, bounds, descriptors
+  size_t rest_mismatch = 0u;               // rest entries that disagree with their pool instance
+  bool gpu_ok = false;
+};
+
+static const bvh::WorldInstance* PoolInstance(uint64_t id) {  // caller holds g_pool.mutex
+  for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+    if (inst.id == id) return &inst;
+  }
+  return nullptr;
+}
+
+static void FlipCameraSighting(uint64_t id) {  // caller holds g_pool.mutex: the instance's camera view changes
+  const bvh::WorldInstance* inst = PoolInstance(id);
+  const auto observed = bvh::g_pool.observations.find(bvh::InstanceKey{inst->mesh_key, falcom_world::MatrixHash(inst->matrix, 12)});
+  observed->second.camera_sightings = observed->second.camera_sightings == 0u ? 1u : 0u;
+  bvh::NotePoolVisibilityChange();
+}
+
+static RestWindRun RunRestWind(bool force_dynamic) {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW1 = 0xE1u, kW2 = 0xE2u, kD = 0xE3u, kS = 0xE4u;
+  AddMesh(kW1, BoxMesh(1.3f));
+  AddMesh(kW2, Grid(5, 5, 2.f, 0.4f));
+  AddMesh(kD, BoxMesh(0.8f));
+  AddMesh(kS, BoxMesh(0.5f));
+  const float rest_d[12] = {15.f, 20.f, 30.f, 45.f, 60.f, 75.f, 90.f, 110.f, 130.f, 150.f, 175.f, 200.f};
+  for (int i = 0; i < 12; ++i) AddInstance(i % 2 == 0 ? kW1 : kW2, 10.f + rest_d[i], 0.f, 10.f + 0.5f * static_cast<float>(i));
+  for (int i = 0; i < 3; ++i) AddInstance(kW1, 12.f + static_cast<float>(i), 0.f, 25.f + static_cast<float>(i));
+  for (int i = 0; i < 3; ++i) AddInstance(kD, 14.f + static_cast<float>(i), 0.f, 12.f);
+  for (int i = 0; i < 6; ++i) AddInstance(kS, 2.f * static_cast<float>(i), 0.f, 40.f);
+  std::vector<uint64_t> rest, followed, dyn;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    std::vector<uint64_t> wind;  // ascending id: the 12 rest instances, then the 3 followed ones
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kW1 || inst.mesh_key == kW2) wind.push_back(inst.id);
+      if (inst.mesh_key == kD) dyn.push_back(inst.id);
+    }
+    rest.assign(wind.begin(), wind.begin() + 12);
+    followed.assign(wind.begin() + 12, wind.end());
+    bvh::g_pool.wind_keys.insert(kW1);
+    bvh::g_pool.wind_keys.insert(kW2);
+  }
+  CHECK(rest.size() == 12u && followed.size() == 3u && dyn.size() == 3u, "pool split %zu/%zu/%zu", rest.size(), followed.size(), dyn.size());
+  RestWindRun run;
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  const int kPresents = 40;
+  for (int p = 0; p < kPresents; ++p) {
+    const bool kw2_out = p >= 14 && p < 22;
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const bool sway_on = p < 12 || p >= 18;
+      bvh::g_pool.alpha_wind_sway.store(sway_on);
+      bvh::g_pool.wind_sway[kW1] = RestWindSway(p);
+      if (kw2_out) {
+        bvh::g_pool.wind_sway.erase(kW2);
+      } else {
+        bvh::g_pool.wind_sway[kW2] = RestWindSway(p);
+      }
+      // Forced rest instances (key kW1, swayed while the switch is on) are pool-dynamic: the live path. Their TLAS
+      // partition is then the same as the rest path's, so the bytes compare.
+      for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+        if (inst.mesh_key == kW1 && std::find(rest.begin(), rest.end(), inst.id) != rest.end()) inst.dynamic = force_dynamic && sway_on;
+      }
+      if (p == 20) bvh::g_pool.wind_sway[kW1].wave_time = std::nanf("");
+      if (p == 30) bvh::g_pool.wind_sway_range = 50.f;
+      if (p == 10) FlipCameraSighting(rest[0]);
+      if (p == 25) FlipCameraSighting(rest[1]);
+    }
+    for (size_t i = 0; i < followed.size(); ++i) {
+      MoveRefitInstance(followed[i], 12.f + static_cast<float>(i) + 0.02f * static_cast<float>(p), 25.f + static_cast<float>(i), frame());
+    }
+    for (size_t i = 0; i < dyn.size(); ++i) MoveRefitInstance(dyn[i], 14.f + static_cast<float>(i) + 0.05f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+    run.golden = RefitStateHash(data, run.golden);
+    const bvh::PoolWindPass& pass = bvh::g_pool.stats.wind_pass;
+    HashBytes(&run.golden, &pass.applied, sizeof pass.applied);
+    HashBytes(&run.golden, &pass.zero_disp, sizeof pass.zero_disp);
+    HashBytes(&run.golden, &pass.clamped, sizeof pass.clamped);
+    HashBytes(&run.golden, &pass.skipped_nonfinite, sizeof pass.skipped_nonfinite);
+    HashBytes(&run.golden, &pass.skipped_range, sizeof pass.skipped_range);
+    HashBytes(&run.golden, &pass.no_inputs, sizeof pass.no_inputs);
+    HashBytes(&run.golden, &pass.far_skipped, sizeof pass.far_skipped);
+    HashBytes(&run.golden, &bvh::g_pool.stats.wind_sway_instances, sizeof bvh::g_pool.stats.wind_sway_instances);
+    std::vector<uint8_t>& bytes = run.tlas.emplace_back();
+    const auto append = [&bytes](const void* p, size_t n) {
+      const uint8_t* b = static_cast<const uint8_t*>(p);
+      bytes.insert(bytes.end(), b, b + n);
+    };
+    for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+      append(t.matrix, sizeof t.matrix);
+      append(t.inverse_world, sizeof t.inverse_world);
+      append(t.bounds_min, sizeof t.bounds_min);
+      append(t.bounds_max, sizeof t.bounds_max);
+    }
+    append(data->tlas_instances_cpu.data(), data->tlas_instances_cpu.size() * sizeof(bvh::WorldInstanceGPU));
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+        if (std::find(rest.begin(), rest.end(), t.id) == rest.end()) continue;
+        const bvh::WorldInstance* inst = PoolInstance(t.id);
+        if (inst == nullptr) {
+          run.rest_mismatch += 1u;
+        } else if (t.wind) {  // swayed: the sway only widens the bounds around the rest pose
+          for (int k = 0; k < 3; ++k) {
+            if (t.bounds_min[k] > inst->bounds_min[k] || t.bounds_max[k] < inst->bounds_max[k]) run.rest_mismatch += 1u;
+          }
+        } else if (std::memcmp(t.matrix, inst->matrix, sizeof t.matrix) != 0 || std::memcmp(t.inverse_world, inst->inverse_world, sizeof t.inverse_world) != 0
+                   || std::memcmp(t.bounds_min, inst->bounds_min, sizeof t.bounds_min) != 0 || std::memcmp(t.bounds_max, inst->bounds_max, sizeof t.bounds_max) != 0) {
+          run.rest_mismatch += 1u;
+        }
+      }
+    }
+  }
+  bvh::g_live_bvh.check_requested.store(true);
+  rig.present();
+  run.golden = RefitStateHash(data, run.golden);
+  run.gpu_ok = data->live.gpu_ok;
+  return run;
+}
+
+static void TestRestWindGolden() {
+  const RestWindRun run = RunRestWind(false);
+  std::printf("rest wind golden %016llx\n", (unsigned long long)run.golden);
+  CHECK(run.rest_mismatch == 0u, "rest entries equal their pool instances (sway-widened bounds aside): %zu mismatches", run.rest_mismatch);
+  CHECK(run.gpu_ok, "GPU check passes after the rest wind run");
+  CHECK(run.golden == 0x427521e3761f0d08ull, "rest wind golden equals HEAD pin (%016llx)", (unsigned long long)run.golden);
+}
+
+static void TestRestWindFastSlowEqual() {
+  const RestWindRun fast = RunRestWind(false);
+  const RestWindRun slow = RunRestWind(true);
+  CHECK(fast.tlas.size() == 40u && slow.tlas.size() == fast.tlas.size(), "same present count (%zu, %zu)", fast.tlas.size(), slow.tlas.size());
+  size_t differ = 0u;
+  for (size_t p = 0; p < fast.tlas.size() && p < slow.tlas.size(); ++p) differ += fast.tlas[p] != slow.tlas[p] ? 1u : 0u;
+  CHECK(differ == 0u, "rest instances forced pool-dynamic: TLAS poses, inverses, bounds and descriptors equal every present (%zu differ)", differ);
+  CHECK(slow.rest_mismatch == 0u && slow.gpu_ok, "forced run: rest entries match the pool and the GPU check passes");
+}
+
+// Followed wind instance crossing the range both ways: at range 50 it is moved beyond the range for presents 12-19 and back
+// inside from present 20. From the return on, its pose equals the max-range run every present.
+static std::vector<std::array<float, 16>> RunFollowedCrossing(float range, std::vector<uint32_t>* far_skipped) {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xE9u;
+  AddMesh(kW, BoxMesh(1.3f));
+  AddInstance(kW, 14.f, 0.f, 12.f);
+  uint64_t id = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    id = bvh::g_pool.instances.back().id;
+    bvh::g_pool.wind_keys.insert(kW);
+    bvh::g_pool.wind_sway[kW] = RestWindSway(0);
+    bvh::g_pool.wind_sway_range = range;
+  }
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  std::vector<std::array<float, 16>> poses;
+  for (int p = 0; p < 30; ++p) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.wind_sway[kW] = RestWindSway(p);
+    }
+    const float x = p >= 12 && p < 20 ? 210.f : 14.f + 0.02f * static_cast<float>(p);
+    MoveRefitInstance(id, x, 12.f, frame());
+    rig.present();
+    std::array<float, 16> pose = {};
+    for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+      if (t.id == id) std::memcpy(pose.data(), t.matrix, sizeof(t.matrix));
+    }
+    poses.push_back(pose);
+    far_skipped->push_back(bvh::g_pool.stats.wind_pass.far_skipped);
+  }
+  return poses;
+}
+
+static void TestFollowedWindCrossing() {
+  std::vector<uint32_t> gated_far, full_far;
+  const auto gated = RunFollowedCrossing(50.f, &gated_far);
+  const auto full = RunFollowedCrossing(1044.f, &full_far);
+  size_t resume_mismatch = 0u;
+  for (size_t p = 20; p < gated.size(); ++p) resume_mismatch += gated[p] != full[p] ? 1u : 0u;
+  CHECK(gated_far[15] == 1u, "far leg: the followed instance is skipped beyond 50 m (%u)", gated_far[15]);
+  CHECK(resume_mismatch == 0u, "followed instance back inside 50 m resumes: its pose matches the max-range run (%zu presents differ)", resume_mismatch);
+}
+
+// Lag counts followed instances only: a scene of rest wind instances alone has no lag.
+static void TestRestWindLag() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xEAu;
+  AddMesh(kW, BoxMesh(1.3f));
+  for (int i = 0; i < 4; ++i) AddInstance(kW, 12.f + static_cast<float>(i), 0.f, 12.f);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.wind_keys.insert(kW);
+    bvh::g_pool.wind_sway[kW] = RestWindSway(0);
+  }
+  for (int p = 0; p < 20; ++p) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.wind_sway[kW] = RestWindSway(p);
+      bvh::g_pool.dynamic_revision += 1u;
+    }
+    rig.present();
+  }
+  CHECK(data->live.tlas_refits > 0u, "refits ran (%u)", data->live.tlas_refits);
+  CHECK(data->live.refit_lag_max == 0u, "rest wind only: refit lag stays 0 (%u)", data->live.refit_lag_max);
+}
+
+// A far rest instance removed from the pool leaves the TLAS by the next rebuild, with no missing count or failure. A far
+// followed instance removed from the pool is counted missing.
+static void TestRemoveFarWind() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xEBu, kD = 0xECu;
+  AddMesh(kW, BoxMesh(1.3f));
+  AddMesh(kD, BoxMesh(0.8f));
+  AddInstance(kW, 210.f, 0.f, 10.f);  // rest, far
+  AddInstance(kW, 212.f, 0.f, 10.f);  // followed, far
+  AddInstance(kD, 14.f, 0.f, 12.f);   // non-wind dynamic, near (keeps the refit running)
+  uint64_t rest_id = 0u, followed_id = 0u, dyn_id = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    rest_id = bvh::g_pool.instances[bvh::g_pool.instances.size() - 3u].id;
+    followed_id = bvh::g_pool.instances[bvh::g_pool.instances.size() - 2u].id;
+    dyn_id = bvh::g_pool.instances.back().id;
+    bvh::g_pool.wind_keys.insert(kW);
+    bvh::g_pool.wind_sway[kW] = RestWindSway(0);
+    bvh::g_pool.wind_sway_range = 50.f;
+  }
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  const auto erase = [](uint64_t id) {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (auto it = bvh::g_pool.instances.begin(); it != bvh::g_pool.instances.end(); ++it) {
+      if (it->id != id) continue;
+      bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(it->mesh_id, falcom_world::MatrixHash(it->matrix, 12)));
+      bvh::g_pool.instances.erase(it);
+      break;
+    }
+    bvh::BumpPoolRevision(bvh::PoolRevisionSource::Retire);
+  };
+  for (int p = 0; p < 3; ++p) {
+    MoveRefitInstance(followed_id, 212.f + 0.02f * static_cast<float>(p), 10.f, frame());
+    MoveRefitInstance(dyn_id, 14.f + 0.05f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+  }
+  const uint32_t missing_before = data->live.refit_missing, failures_before = data->live.refit_failures;
+  erase(rest_id);
+  for (uint32_t p = 0; p < bvh::kLiveTlasInterval; ++p) {
+    MoveRefitInstance(dyn_id, 14.f + 0.05f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+  }
+  bool rest_in_tlas = false;
+  for (const bvh::LiveTlasInstance& t : data->tlas_info) rest_in_tlas = rest_in_tlas || t.id == rest_id;
+  CHECK(!rest_in_tlas, "far rest instance removed: gone from the TLAS within kLiveTlasInterval presents");
+  CHECK(data->live.refit_missing == missing_before && data->live.refit_failures == failures_before,
+        "far rest instance removed: no missing count or refit failure (%u, %u)", data->live.refit_missing - missing_before,
+        data->live.refit_failures - failures_before);
+  erase(followed_id);
+  MoveRefitInstance(dyn_id, 14.f, 12.f, frame());
+  rig.present();
+  CHECK(data->live.refit_missing == missing_before + 1u, "far followed instance removed: counted missing (%u)", data->live.refit_missing - missing_before);
+}
+
+// The GPU check compares TLAS leaves by prim only: stale leaf bounds after a refit pass, a wrong prim fails.
+static void TestRefitGpuLeaves() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kA = 0xEDu;
+  AddMesh(kA, BoxMesh(0.8f));
+  for (int i = 0; i < 4; ++i) AddInstance(kA, 2.f * static_cast<float>(i), 0.f, 12.f);
+  std::vector<uint64_t> dyn;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) dyn.push_back(inst.id);
+  }
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  for (int p = 0; p < 4; ++p) {
+    for (size_t i = 0; i < dyn.size(); ++i) MoveRefitInstance(dyn[i], 2.f * static_cast<float>(i) + 0.3f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+  }
+  const auto gpu = [&]() {
+    bvh::g_live_bvh.check_requested.store(true);
+    rig.present();
+    return data->live.gpu_ok;
+  };
+  CHECK(gpu(), "GPU check after refits with stale leaf bounds: %s", data->live.gpu_result.c_str());
+  Res& leaves = rig.dev.res[data->tlas_leaf_buffer.handle];
+  bvh::BVHLeafGPU leaf;
+  std::memcpy(&leaf, leaves.bytes.data(), sizeof leaf);
+  bvh::BVHLeafGPU corrupted = leaf;
+  corrupted.bounds_max[0] += 50.f;
+  std::memcpy(leaves.bytes.data(), &corrupted, sizeof corrupted);
+  CHECK(gpu(), "GPU check ignores leaf bounds: %s", data->live.gpu_result.c_str());
+  corrupted.prim = leaf.prim + 1u;
+  std::memcpy(leaves.bytes.data(), &corrupted, sizeof corrupted);
+  CHECK(!gpu(), "GPU check fails a leaf with a wrong prim");
+  std::memcpy(leaves.bytes.data(), &leaf, sizeof leaf);
+}
+
+// A rest wind instance promoted to followed (it moves in the pool): the refit that follows reads its live pose (the TLAS
+// bounds contain its new pool bounds), and the TLAS is rebuilt later without a skip at the promotion. With `slack` the
+// static block has holes (the slack apply is tried first).
+static bool TlasContainsPool(bvh::BvhDeviceData* data, uint64_t id) {  // caller does not hold the pool lock
+  std::lock_guard lock(bvh::g_pool.mutex);
+  const bvh::WorldInstance* inst = PoolInstance(id);
+  for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+    if (t.id != id || inst == nullptr) continue;
+    for (int k = 0; k < 3; ++k) {
+      if (t.bounds_min[k] > inst->bounds_min[k] || t.bounds_max[k] < inst->bounds_max[k]) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+static bool TlasEntryRest(bvh::BvhDeviceData* data, uint64_t id) {
+  for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+    if (t.id == id) return t.rest;
+  }
+  return false;
+}
+
+// Steady state: with no pool or visibility change, the refit reads no pool entry for its rest wind instances.
+static void TestRestSteadyReads() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xF6u, kD = 0xF7u;
+  AddMesh(kW, BoxMesh(1.3f));
+  AddMesh(kD, BoxMesh(0.8f));
+  for (int i = 0; i < 3; ++i) AddInstance(kW, 20.f + 3.f * static_cast<float>(i), 0.f, 12.f);
+  AddInstance(kD, 14.f, 0.f, 12.f);
+  uint64_t dyn_id = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kD) dyn_id = inst.id;
+    }
+    bvh::g_pool.wind_keys.insert(kW);
+  }
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  for (int p = 0; p < 3; ++p) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.wind_sway[kW] = RestWindSway(p);
+    }
+    MoveRefitInstance(dyn_id, 14.f + 0.05f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+  }
+  for (int p = 3; p < 8; ++p) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.wind_sway[kW] = RestWindSway(p);
+      bvh::g_pool.dynamic_revision += 1u;
+    }
+    rig.present();
+    CHECK(data->live.refit_rest_slow == 0u, "steady present %d: no pool read for the rest entries (%u)", p, data->live.refit_rest_slow);
+  }
+  CHECK(data->live.refit_rest_fast == 3u, "steady state: the 3 rest entries come from rest_pose (%u)", data->live.refit_rest_fast);
+}
+
+static void RunRestPromotion(bool slack, const char* label) {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xEEu, kD = 0xEFu, kS = 0xF5u;
+  AddMesh(kW, BoxMesh(1.3f));
+  AddMesh(kD, BoxMesh(0.8f));
+  AddMesh(kS, BoxMesh(0.5f));
+  AddInstance(kW, 25.f, 0.f, 10.f);
+  AddInstance(kD, 14.f, 0.f, 12.f);
+  if (slack) {
+    for (int i = 0; i < 1100; ++i) AddInstance(kS, 100.f + 2.f * static_cast<float>(i % 50), 0.f, 100.f + 2.f * static_cast<float>(i / 50));
+  }
+  uint64_t rest_id = 0u, dyn_id = 0u;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kW) rest_id = inst.id;
+      if (inst.mesh_key == kD) dyn_id = inst.id;
+    }
+    bvh::g_pool.wind_keys.insert(kW);
+  }
+  bvh::g_live_bvh.slack.store(slack);
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  for (int p = 0; p < 4; ++p) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.wind_sway[kW] = RestWindSway(p);
+    }
+    MoveRefitInstance(dyn_id, 14.f + 0.05f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+  }
+  CHECK(data->tlas_wind_count == 1u, "%s: the rest wind instance is in the TLAS (%u)", label, data->tlas_wind_count);
+  CHECK(TlasEntryRest(data, rest_id), "%s: the wind instance is a rest entry before its promotion", label);
+  const uint32_t skips = data->live.tlas_skips;
+  const uint32_t attempts = data->live.tlas_rebuilds + data->live.tlas_skips;  // a skip or a full build (slack applies not counted)
+  MoveRefitInstance(rest_id, 30.f, 10.f, frame());
+  rig.present();
+  CHECK(TlasContainsPool(data, rest_id), "%s: the next refit uses the promoted instance's live pose", label);
+  CHECK(data->live.tlas_skips == skips, "%s: the promotion is not skipped (%u skips)", label, data->live.tlas_skips - skips);
+  for (uint32_t p = 0; p <= bvh::kLiveTlasInterval; ++p) {
+    MoveRefitInstance(dyn_id, 14.f + 0.05f * static_cast<float>(p), 12.f, frame());
+    rig.present();
+  }
+  CHECK(data->live.tlas_rebuilds + data->live.tlas_skips > attempts, "%s: a rebuild follows the promotion", label);
+  CHECK(TlasContainsPool(data, rest_id), "%s: the TLAS holds the promoted instance's live pose after the rebuild", label);
+  CHECK(!TlasEntryRest(data, rest_id), "%s: after the rebuild the promoted entry is not a rest entry", label);
+  bvh::g_live_bvh.slack.store(false);
+}
+
+static void TestRestPromotion() {
+  RunRestPromotion(false, "promotion");
+  RunRestPromotion(true, "promotion with slack");
 }
 
 static uint64_t SlackKey(uint32_t mesh) { return 0x300u + mesh; }
@@ -4911,6 +5331,14 @@ int main() {
   TestRefitCursorMiss();
   TestWindRangeGolden();
   TestWindRangeGate();
+  TestRestWindGolden();
+  TestRestWindFastSlowEqual();
+  TestFollowedWindCrossing();
+  TestRestWindLag();
+  TestRemoveFarWind();
+  TestRefitGpuLeaves();
+  TestRestPromotion();
+  TestRestSteadyReads();
   TestSlackLayout();
   TestSlackApply();
   TestSlackExhaustion();

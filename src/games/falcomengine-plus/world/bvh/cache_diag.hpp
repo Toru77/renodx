@@ -964,6 +964,7 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
   out << ",\n  \"live\": {\"tlas_instances\": " << live.tlas_instances << ", \"tlas_rebuilds\": " << live.tlas_rebuilds
       << ", \"tlas_reason\": \"" << PoolJsonEscape(live.tlas_reason) << "\", \"tlas_frame\": " << live.tlas_frame
       << ", \"refit_lag_last\": " << live.refit_lag_last << ", \"refit_lag_max\": " << live.refit_lag_max
+      << ", \"refit_rest_fast\": " << live.refit_rest_fast << ", \"refit_rest_slow\": " << live.refit_rest_slow
       << ", \"mesh_ms\": {\"last\": " << PoolJsonFloat{live.mesh_ms_last} << ", \"max\": " << PoolJsonFloat{live.mesh_ms_max}
       << "}, \"tlas_skips\": " << live.tlas_skips << ", \"skip_ms\": {\"sum\": " << PoolJsonFloat{live.tlas_skip_ms_sum}
       << ", \"max\": " << PoolJsonFloat{live.tlas_skip_ms_max} << "}}";

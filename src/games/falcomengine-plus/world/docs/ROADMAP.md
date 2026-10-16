@@ -170,6 +170,13 @@ Owner steps: as Phase 0 (Reset diag counters, play two map changes, walk away an
 - Harness: `TestWindRangeGolden` pins the default-range refit and `TestWindRangeGate` checks the 50 m, raised and 1043 m cases (test_live); the dump keys are checked in `TestWindIndirectDiag` (test_alpha).
 - Not validated in game: owner steps and dumps to send back are pending.
 
+## Refit diet, rest wind (refit-diet-A): implemented, not validated in game
+
+- The refit reads a wind rest-pose entry from its cached rest pose (`LiveWindRest`) while the pool and visibility revisions match the TLAS; any change reads the pool for every entry. Followed and non-wind dynamic entries read the pool as before.
+- Refit writes the CPU leaves and nodes in place; the GPU leaf buffer is no longer written (the trace reads only a leaf's slot). `CheckLiveBvhOnGpu` compares TLAS leaves by prim and validates the nodes against the CPU leaves.
+- Counters: `refit_rest_fast` and `refit_rest_slow` (last refit) in the cache JSON `live` block.
+- Harness: `TestRestWindGolden` (pin `0x427521e3761f0d08`), `TestRestWindFastSlowEqual`, `TestFollowedWindCrossing`, `TestRestWindLag`, `TestRemoveFarWind`, `TestRefitGpuLeaves`, `TestRestPromotion`, `TestRestSteadyReads`.
+
 ## Current state (2026-10-09)
 
 Goal: hardware-free (compute) ray tracing in Trails in the Sky 2nd Chapter (D3D11) on RenoDX, DevKit-gated (`falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`). All code is in `src/games/falcomengine-plus/world/`.

@@ -557,28 +557,28 @@ inline uint32_t InstanceVisibilityFlags(const WorldInstanceGPU& instance) {
 // kWindSwayMaxFraction of the leaf extent or kWindSwayMaxMeters, and the leaf bounds inflated by the capped amplitude
 // bound (WindSwayBound). The rest pose stays in WorldInstance (the observation key). Rest pose when the switch is off
 // or its key has no sway inputs.
-inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& instance) {
+inline void ApplyPoolWindSway(LiveTlasInstance* copy) {
   copy->wind = false;
   if (!g_pool.alpha_wind_sway.load(std::memory_order_relaxed)) return;
-  const bool wind_key = g_pool.wind_keys.count(instance.mesh_key) != 0u;
+  const bool wind_key = g_pool.wind_keys.count(copy->mesh_key) != 0u;
   if (!wind_key) return;
   PoolWindPass& pass = g_pool.stats.wind_pass;
   pass.wind_key_instances += 1u;
-  const auto sway = g_pool.wind_sway.find(instance.mesh_key);
+  const auto sway = g_pool.wind_sway.find(copy->mesh_key);
   if (sway == g_pool.wind_sway.end()) {
-    if (pass.no_inputs == 0u) pass.no_input_first_key = instance.mesh_key;
+    if (pass.no_inputs == 0u) pass.no_input_first_key = copy->mesh_key;
     pass.no_inputs += 1u;
     return;
   }
   copy->wind = true;
-  const float origin[3] = {instance.matrix[3], instance.matrix[7], instance.matrix[11]};
+  const float origin[3] = {copy->matrix[3], copy->matrix[7], copy->matrix[11]};
   float extent = 0.f;
   for (int k = 0; k < 3; ++k) extent = (std::max)(extent, copy->bounds_max[k] - copy->bounds_min[k]);
   const float cap = (std::min)(kWindSwayMaxFraction * extent, kWindSwayMaxMeters);
   float displacement[3] = {};
   float bound[3] = {};
-  WindSwayDisplacement(sway->second, origin, instance.param2, displacement);
-  WindSwayBound(sway->second, instance.param2, bound);
+  WindSwayDisplacement(sway->second, origin, copy->param2, displacement);
+  WindSwayBound(sway->second, copy->param2, bound);
   const float raw_magnitude = std::sqrt(displacement[0] * displacement[0] + displacement[1] * displacement[1] + displacement[2] * displacement[2]);
   for (int k = 0; k < 3; ++k) {
     if (!std::isfinite(displacement[k]) || !std::isfinite(bound[k]) || !std::isfinite(origin[k] + displacement[k])) {
@@ -614,11 +614,11 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
   pass.raw_max_m = (std::max)(pass.raw_max_m, raw_magnitude);
   if (pass.applied <= std::size(pass.samples)) {
     PoolWindSample& sample = pass.samples[pass.applied - 1u];
-    sample.id = instance.id;
-    sample.mesh_key = instance.mesh_key;
+    sample.id = copy->id;
+    sample.mesh_key = copy->mesh_key;
     std::memcpy(sample.origin, origin, sizeof(origin));
     sample.params = sway->second;
-    std::memcpy(sample.param2, instance.param2, sizeof(sample.param2));
+    std::memcpy(sample.param2, copy->param2, sizeof(sample.param2));
     std::memcpy(sample.displacement, displacement, sizeof(displacement));
     sample.magnitude = magnitude;
     std::memcpy(sample.bound, bound, sizeof(bound));
@@ -628,6 +628,14 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
     sample.extent = extent;
   }
   for (int k = 0; k < 3; ++k) g_pool.stats.wind_sway_bound_m = (std::max)(g_pool.stats.wind_sway_bound_m, bound[k]);
+}
+
+// The rest pose of a wind instance from its pool pose (unswayed: the pool holds the rest pose).
+inline void FillWindRest(LiveWindRest* rest, const WorldInstance& instance) {
+  std::memcpy(rest->matrix, instance.matrix, sizeof(rest->matrix));
+  std::memcpy(rest->inverse_world, instance.inverse_world, sizeof(rest->inverse_world));
+  std::memcpy(rest->bounds_min, instance.bounds_min, sizeof(rest->bounds_min));
+  std::memcpy(rest->bounds_max, instance.bounds_max, sizeof(rest->bounds_max));
 }
 
 // The TLAS descriptor of one instance, for the mesh slot its uid resolves to.
@@ -665,7 +673,7 @@ inline bool LiveSnapshotMatchesTlas(const BvhDeviceData& data, const std::vector
       static_cast<uint32_t>(std::count_if(info.begin(), info.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; }));
   if (df != data.tlas_dynamic_first) return false;
   for (size_t i = 0; i < info.size(); ++i) {
-    if (info[i].id != data.tlas_info[i].id) return false;
+    if (info[i].id != data.tlas_info[i].id || info[i].rest != data.tlas_info[i].rest) return false;
     if (i < df || dynamic_poses) {
       if (std::memcmp(&instances[i], &data.tlas_instances_cpu[i], sizeof(WorldInstanceGPU)) != 0) return false;
     } else if (std::memcmp(instances[i].header, data.tlas_instances_cpu[i].header, 3u * sizeof(float)) != 0
@@ -711,7 +719,7 @@ inline bool TryApplyLiveTlasSlack(reshade::api::device* device, reshade::api::co
   for (size_t i = 0; i < suffix; ++i) {
     const LiveTlasInstance& now = info[static_count + i];
     const LiveTlasInstance& was = data->tlas_info[df + i];
-    if (now.id != was.id || now.dynamic != was.dynamic || now.wind != was.wind
+    if (now.id != was.id || now.dynamic != was.dynamic || now.wind != was.wind || now.rest != was.rest
         || std::memcmp(instances[static_count + i].header, data->tlas_instances_cpu[df + i].header, 3u * sizeof(float)) != 0
         || std::memcmp(instances[static_count + i].visibility, data->tlas_instances_cpu[df + i].visibility,
                        sizeof(instances[static_count + i].visibility)) != 0) {
@@ -934,8 +942,10 @@ inline void RebuildLiveTlas(
       std::memcpy(copy.bounds_max, instance.bounds_max, sizeof(copy.bounds_max));
       copy.visibility = GetPoolCameraVisibility(instance);
       std::memcpy(copy.param2, instance.param2, sizeof(copy.param2));
-      ApplyPoolWindSway(&copy, instance);
+      ApplyPoolWindSway(&copy);
       copy.dynamic = instance.dynamic || copy.wind;  // swayed wind instances are refitted every present
+      copy.rest = copy.wind && !instance.dynamic;
+      if (copy.rest) FillWindRest(&copy.rest_pose, instance);
       if (copy.dynamic) {  // static entries first, then the dynamic ones, each in pool order
         dynamic.push_back(copy);
         info.pop_back();
@@ -1254,8 +1264,11 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   uint32_t missing = 0u;
   uint32_t lag = 0u;
   uint32_t on_screen_lag = 0u;
+  uint32_t rest_fast = 0u;
+  uint32_t rest_slow = 0u;
   const uint32_t df = data->tlas_dynamic_first;
   std::vector<LiveTlasInstance>& updated = data->tlas_dynamic_scratch;
+  std::vector<uint8_t>& touched = data->tlas_refit_touched;
   float phase_ms[4] = {};
   auto phase_start = start;
   const auto lap = [&](float* ms) {
@@ -1265,6 +1278,9 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   float camera[3] = {};
   const float range = g_pool.wind_sway_range;
   const bool gate = range < kPoolWindSwayRangeMax && PoolCameraPosition(camera);
+  const auto beyond = [&](const float* matrix) {
+    return (std::max)({std::fabs(matrix[3] - camera[0]), std::fabs(matrix[7] - camera[1]), std::fabs(matrix[11] - camera[2])}) > range;
+  };
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     dynamic_revision = g_pool.dynamic_revision;
@@ -1283,14 +1299,28 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
       return;
     }
     updated.assign(data->tlas_info.begin() + df, data->tlas_info.end());
+    // A rest entry keeps its rest_pose while the pool and the visibility are as the TLAS was built; otherwise every entry is read
+    // from the pool. A rest entry is never counted missing: it leaves the TLAS at the next rebuild.
+    const bool pool_moved = g_pool.revision != data->tlas_pool_revision || g_pool.visibility_revision != data->tlas_visibility_revision;
+    touched.assign(updated.size(), 0u);
     // Pool instances are kept sorted by ascending id (test_motion checks it). The dynamic suffix is ascending too:
     // each search gallops forward from the previous hit, and a miss falls back to the full search.
     const auto by_id = [](const WorldInstance& instance, uint64_t id) { return instance.id < id; };
     auto cursor = g_pool.instances.begin();
     for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
       LiveTlasInstance& copy = updated[i - df];
-      if (gate && copy.wind && (std::max)({std::fabs(copy.matrix[3] - camera[0]), std::fabs(copy.matrix[7] - camera[1]), std::fabs(copy.matrix[11] - camera[2])}) > range) {
-        g_pool.stats.wind_pass.far_skipped += 1u;
+      if (copy.rest && !pool_moved) {
+        if (gate && copy.wind && beyond(copy.rest_pose.matrix)) {
+          g_pool.stats.wind_pass.far_skipped += 1u;
+          continue;
+        }
+        std::memcpy(copy.matrix, copy.rest_pose.matrix, sizeof(copy.matrix));
+        std::memcpy(copy.inverse_world, copy.rest_pose.inverse_world, sizeof(copy.inverse_world));
+        std::memcpy(copy.bounds_min, copy.rest_pose.bounds_min, sizeof(copy.bounds_min));
+        std::memcpy(copy.bounds_max, copy.rest_pose.bounds_max, sizeof(copy.bounds_max));
+        ApplyPoolWindSway(&copy);
+        touched[i - df] = 1u;
+        rest_fast += 1u;
         continue;
       }
       auto lo = cursor;
@@ -1304,21 +1334,30 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
         it = std::lower_bound(g_pool.instances.begin(), g_pool.instances.end(), copy.id, by_id);
       }
       if (it == g_pool.instances.end() || it->id != copy.id) {
-        missing += 1u;
+        if (!copy.rest) missing += 1u;
         continue;
       }
       cursor = it;
       const WorldInstance& instance = *it;
+      if (gate && copy.wind && beyond(instance.matrix)) {
+        g_pool.stats.wind_pass.far_skipped += 1u;
+        continue;
+      }
       std::memcpy(copy.matrix, instance.matrix, sizeof(copy.matrix));
       std::memcpy(copy.inverse_world, instance.inverse_world, sizeof(copy.inverse_world));
       std::memcpy(copy.bounds_min, instance.bounds_min, sizeof(copy.bounds_min));
       std::memcpy(copy.bounds_max, instance.bounds_max, sizeof(copy.bounds_max));
       copy.visibility = GetPoolCameraVisibility(instance);
-      ApplyPoolWindSway(&copy, instance);
-      if (frame > instance.last_follow_frame) {
+      ApplyPoolWindSway(&copy);
+      copy.rest = copy.wind && !instance.dynamic;
+      if (copy.rest) {
+        FillWindRest(&copy.rest_pose, instance);
+        rest_slow += 1u;
+      } else if (frame > instance.last_follow_frame) {  // lag: followed instances only
         lag = (std::max)(lag, frame - instance.last_follow_frame);
         if (copy.visibility.camera_seen) on_screen_lag = (std::max)(on_screen_lag, frame - instance.last_follow_frame);
       }
+      touched[i - df] = 1u;
     }
   }
   lap(&phase_ms[0]);
@@ -1340,6 +1379,8 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     data->tlas_refit_failed = true;
     finish();
   };
+  stats.refit_rest_fast = rest_fast;
+  stats.refit_rest_slow = rest_slow;
   stats.refit_missing += missing;
   if (missing != 0u) {
     fail("instance no longer in the pool");
@@ -1348,16 +1389,17 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
 
   std::vector<WorldInstanceGPU>& instances = data->tlas_refit_instances;
   instances.assign(data->tlas_instances_cpu.begin() + df, data->tlas_instances_cpu.end());
-  std::vector<BVHLeafGPU>& leaves = data->tlas_refit_leaves;
-  leaves = data->tlas_leaves_cpu;
+  std::vector<uint32_t>& changed_index = data->tlas_refit_changed;
+  changed_index.clear();
   uint32_t first = UINT32_MAX;
   uint32_t last = 0u;
-  uint32_t changed = 0u;
   bool bad_bounds = false;
   for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
+    if (touched[i - df] == 0u) continue;
+    const LiveTlasInstance& entry = updated[i - df];
     uint32_t slot = static_cast<uint32_t>(instances[i - df].header[0]);
-    if (slot >= data->slots.size() || !data->slots[slot].live || data->slots[slot].uid != updated[i - df].uid) {
-      const auto slot_it = data->slot_by_uid.find(updated[i - df].uid);
+    if (slot >= data->slots.size() || !data->slots[slot].live || data->slots[slot].uid != entry.uid) {
+      const auto slot_it = data->slot_by_uid.find(entry.uid);
       if (slot_it == data->slot_by_uid.end()) {
         fail("mesh slot no longer resident");
         return;
@@ -1368,46 +1410,49 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
       fail("mesh slot no longer resident");
       return;
     }
-    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(updated[i - df], slot);
+    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(entry, slot);
     if (std::memcmp(&descriptor, &instances[i - df], sizeof(descriptor)) == 0) continue;
     instances[i - df] = descriptor;
-    BVHLeafGPU& leaf = leaves[data->tlas_leaf_of_instance[i]];
     for (int k = 0; k < 3; ++k) {
-      leaf.bounds_min[k] = updated[i - df].bounds_min[k];
-      leaf.bounds_max[k] = updated[i - df].bounds_max[k];
-      bad_bounds = bad_bounds || !std::isfinite(leaf.bounds_min[k]) || !std::isfinite(leaf.bounds_max[k]) || leaf.bounds_max[k] < leaf.bounds_min[k];
+      bad_bounds = bad_bounds || !std::isfinite(entry.bounds_min[k]) || !std::isfinite(entry.bounds_max[k]) || entry.bounds_max[k] < entry.bounds_min[k];
     }
     first = (std::min)(first, i);
     last = i;
-    changed += 1u;
+    changed_index.push_back(i);
   }
   lap(&phase_ms[1]);
-  if (changed == 0u) {
+  if (changed_index.empty()) {
     std::move(updated.begin(), updated.end(), data->tlas_info.begin() + df);
     data->tlas_dynamic_revision = dynamic_revision;
     finish();
     return;
   }
-
-  std::vector<BVHNodeGPU>& nodes = data->tlas_refit_nodes;
-  nodes = data->tlas_nodes_cpu;
-  RefitBvhNodes(leaves, &nodes);
   const char* invalid = bad_bounds ? DescribeBvhValidation({.ok = false, .bad_bounds = 1u}) : nullptr;
-  lap(&phase_ms[2]);
   if (invalid != nullptr) {
     stats.tlas_invalid += 1u;
     fail(invalid);
     return;
   }
 
+  // In place on the CPU copies (validated above). The GPU leaf buffer is not written: the trace reads only a leaf's slot,
+  // and the node bounds (refitted here) carry the poses.
+  for (const uint32_t i : changed_index) {
+    const LiveTlasInstance& entry = updated[i - df];
+    BVHLeafGPU& leaf = data->tlas_leaves_cpu[data->tlas_leaf_of_instance[i]];
+    for (int k = 0; k < 3; ++k) {
+      leaf.bounds_min[k] = entry.bounds_min[k];
+      leaf.bounds_max[k] = entry.bounds_max[k];
+    }
+  }
+  RefitBvhNodes(data->tlas_leaves_cpu, &data->tlas_nodes_cpu);
+  lap(&phase_ms[2]);
+
   std::string error;
   const bool written =
       WriteBufferRange(device, cmd_list, data->instance_buffer, sizeof(WorldInstanceGPU), first * sizeof(WorldInstanceGPU),
                        &instances[first - df], (last - first + 1u) * sizeof(WorldInstanceGPU), &error)
-      && WriteBufferRange(device, cmd_list, data->tlas_leaf_buffer, sizeof(BVHLeafGPU), 0u, leaves.data(),
-                          leaves.size() * sizeof(BVHLeafGPU), &error)
-      && WriteBufferRange(device, cmd_list, data->tlas_node_buffer, sizeof(BVHNodeGPU), 0u, nodes.data(),
-                          nodes.size() * sizeof(BVHNodeGPU), &error);
+      && WriteBufferRange(device, cmd_list, data->tlas_node_buffer, sizeof(BVHNodeGPU), 0u, data->tlas_nodes_cpu.data(),
+                          data->tlas_nodes_cpu.size() * sizeof(BVHNodeGPU), &error);
   if (!written) {
     stats.upload_failures += 1u;
     fail("upload: " + error);
@@ -1418,12 +1463,10 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   // Swapped only after every write succeeded.
   std::move(instances.begin(), instances.end(), data->tlas_instances_cpu.begin() + df);
   std::move(updated.begin(), updated.end(), data->tlas_info.begin() + df);
-  data->tlas_leaves_cpu.swap(leaves);
-  data->tlas_nodes_cpu.swap(nodes);
   data->tlas_dynamic_revision = dynamic_revision;
   data->tlas_refits_since_rebuild += 1u;
   stats.tlas_refits += 1u;
-  stats.refit_instances = changed;
+  stats.refit_instances = static_cast<uint32_t>(changed_index.size());
   stats.refit_lag_last = lag;
   stats.refit_lag_max = (std::max)(stats.refit_lag_max, lag);
   {
@@ -1573,15 +1616,20 @@ inline void CheckLiveBvhOnGpu(reshade::api::device* device, reshade::api::comman
     std::memcpy(&value, active.data() + static_cast<size_t>(i) * sizeof(uint32_t), sizeof(value));
     active_ok = value == (data->tlas_info[i].id != 0u ? i : kLiveSlackSentinel);
   }
+  // Leaf bounds are not compared: a refit moves the CPU leaves and nodes and leaves the GPU leaf buffer as it was (the trace reads
+  // only the leaf's instance slot); the node bounds, refitted from the CPU leaves, are compared through the nodes.
+  bool leaf_prims_ok = tlas_leaves.size() == data->tlas_leaves_cpu.size() * sizeof(BVHLeafGPU);
+  for (size_t i = 0; leaf_prims_ok && i < data->tlas_leaves_cpu.size(); ++i) {
+    uint32_t prim = 0u;
+    std::memcpy(&prim, tlas_leaves.data() + i * sizeof(BVHLeafGPU) + offsetof(BVHLeafGPU, prim), sizeof(prim));
+    leaf_prims_ok = prim == data->tlas_leaves_cpu[i].prim;
+  }
   const bool tlas_ok =
       active_ok
       && range_equal(instances, 0u, data->tlas_instances_cpu.data(), data->tlas_instances_cpu.size() * sizeof(WorldInstanceGPU))
-      && range_equal(tlas_leaves, 0u, data->tlas_leaves_cpu.data(), data->tlas_leaves_cpu.size() * sizeof(BVHLeafGPU))
+      && leaf_prims_ok
       && range_equal(tlas_nodes, 0u, data->tlas_nodes_cpu.data(), data->tlas_nodes_cpu.size() * sizeof(BVHNodeGPU));
-  const bool tlas_tree_ok =
-      ValidateBvh(LiveBytesAs<BVHNodeGPU>(tlas_nodes, 0u, tlas_nodes.size() / sizeof(BVHNodeGPU)),
-                  LiveBytesAs<BVHLeafGPU>(tlas_leaves, 0u, tlas_leaves.size() / sizeof(BVHLeafGPU)))
-          .ok;
+  const bool tlas_tree_ok = ValidateBvh(LiveBytesAs<BVHNodeGPU>(tlas_nodes, 0u, tlas_nodes.size() / sizeof(BVHNodeGPU)), data->tlas_leaves_cpu).ok;
   stats.gpu_ok = meshes_bad == 0u && trees_bad == 0u && descriptors_ok && tlas_ok && tlas_tree_ok;
   stats.gpu_result = std::string(stats.gpu_ok ? "match" : "MISMATCH") + ": meshes " + std::to_string(meshes_checked - meshes_bad)
                      + "/" + std::to_string(meshes_checked) + " equal, " + std::to_string(meshes_checked - trees_bad)

@@ -213,11 +213,21 @@ struct LiveBvhStats {
   uint32_t refit_lag_last = 0u;   // frames since the oldest refit instance was followed
   uint32_t refit_lag_max = 0u;
   uint32_t refit_missing = 0u;    // refit instances no longer in the pool
+  uint32_t refit_rest_fast = 0u;  // rest wind entries of the last refit: from rest_pose
+  uint32_t refit_rest_slow = 0u;  // rest wind entries of the last refit: read from the pool
   uint32_t refit_failures = 0u;
   // GPU contents check (on request; waits for the GPU).
   bool gpu_checked = false;
   bool gpu_ok = false;
   std::string gpu_result;
+};
+
+// The unswayed pose of a wind rest-pose entry (its pool pose at the snapshot or the last slow refit).
+struct LiveWindRest {
+  float matrix[16] = {};
+  float inverse_world[16] = {};
+  float bounds_min[3] = {};
+  float bounds_max[3] = {};
 };
 
 // One region instance as copied for a TLAS build, with its pool provenance
@@ -238,6 +248,8 @@ struct LiveTlasInstance {
   float bounds_max[3] = {};
   float param2[3] = {};  // InstanceParam.param2 (wind sway)
   bool wind = false;     // wind rest pose: matrix and bounds are its sway trace pose (ApplyPoolWindSway)
+  bool rest = false;     // wind rest-pose entry (RefitLiveTlas reads rest_pose while the pool and visibility are unchanged)
+  LiveWindRest rest_pose;
   uint32_t first_frame = 0u;
   uint32_t admit_frame = 0u;
   float admit_camera[3] = {};
@@ -364,8 +376,8 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   std::vector<LiveTlasInstance> tlas_info_spare;     // session scratch: the next rebuild's snapshot (capacity kept; the old tlas_info rotates here)
   std::vector<LiveTlasInstance> tlas_dynamic_scratch;  // session scratch: the dynamic instances of the rebuild snapshot, appended after the static ones; the refit's updated copy
   std::vector<WorldInstanceGPU> tlas_refit_instances;  // session scratch: the refit's dynamic descriptors (moved into tlas_instances_cpu on success)
-  std::vector<BVHLeafGPU> tlas_refit_leaves;           // session scratch: the refit's leaves (swapped into tlas_leaves_cpu on success)
-  std::vector<BVHNodeGPU> tlas_refit_nodes;            // session scratch: the refit's nodes (swapped into tlas_nodes_cpu on success)
+  std::vector<uint8_t> tlas_refit_touched;             // session scratch: per dynamic entry, 1 when the refit rebuilt its copy (far-skipped entries stay 0)
+  std::vector<uint32_t> tlas_refit_changed;            // session scratch: the TLAS instances whose descriptor changed in the refit
   std::vector<BVHLeafGPU> tlas_leaves_cpu;
   std::vector<BVHNodeGPU> tlas_nodes_cpu;
   std::vector<uint32_t> tlas_leaf_of_instance;  // TLAS instance -> its leaf (sorted leaves)
