@@ -71,6 +71,7 @@ inline void TakePlacementSnapshot(PlacementSnapshot* out) {
   std::vector<std::pair<float, size_t>> candidates;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
+    UpdatePoolStats();
     for (size_t i = 0; i < g_pool.instances.size(); ++i) {
       const WorldInstance& instance = g_pool.instances[i];
       if (instance.dynamic || instance.mesh_id >= g_pool.meshes.size()) continue;

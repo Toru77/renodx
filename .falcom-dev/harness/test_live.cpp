@@ -2395,6 +2395,147 @@ struct SlackRig : SkipRig {
   ~SlackRig() { bvh::g_live_bvh.slack.store(false); }
 };
 
+// Golden for the TLAS refit path: a scripted run over 12 dynamic and 6 static instances on 3 meshes.
+// After every present the TLAS copies, the leaf map, tlas_info and the refit counters are hashed and
+// folded into one value. The pin is the HEAD value; any change in refit output moves it.
+static void MoveRefitInstance(uint64_t id, float x, float z, uint32_t frame) {
+  float w[12];
+  World(x, 0.f, z, 1.f, 0.f, w);
+  std::lock_guard lock(bvh::g_pool.mutex);
+  for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+    if (inst.id != id) continue;
+    float mn[3], mx[3];
+    bvh::ComputePoolInstanceBounds(bvh::g_pool.meshes[inst.mesh_id], w, mn, mx);
+    bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
+    std::memcpy(inst.matrix, w, sizeof(w));
+    falcom_world::ComputeMatrixInverse(inst.matrix, inst.inverse_world);
+    std::memcpy(inst.bounds_min, mn, sizeof(mn));
+    std::memcpy(inst.bounds_max, mx, sizeof(mx));
+    bvh::g_pool.admitted_keys.insert(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
+    if (!inst.dynamic) bvh::g_pool.revision += 1u;
+    inst.dynamic = true;
+    inst.last_follow_frame = frame;
+    bvh::g_pool.dynamic_revision += 1u;
+    return;
+  }
+}
+
+static uint64_t RefitStateHash(bvh::BvhDeviceData* data, uint64_t h) {
+  HashBytes(&h, data->tlas_instances_cpu.data(), data->tlas_instances_cpu.size() * sizeof(bvh::WorldInstanceGPU));
+  HashBytes(&h, data->tlas_leaves_cpu.data(), data->tlas_leaves_cpu.size() * sizeof(bvh::BVHLeafGPU));
+  HashBytes(&h, data->tlas_nodes_cpu.data(), data->tlas_nodes_cpu.size() * sizeof(bvh::BVHNodeGPU));
+  HashBytes(&h, data->tlas_leaf_of_instance.data(), data->tlas_leaf_of_instance.size() * sizeof(uint32_t));
+  for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+    HashBytes(&h, &t.id, sizeof t.id);
+    HashBytes(&h, &t.uid, sizeof t.uid);
+    HashBytes(&h, t.matrix, sizeof t.matrix);
+    HashBytes(&h, t.bounds_min, sizeof t.bounds_min);
+    HashBytes(&h, t.bounds_max, sizeof t.bounds_max);
+    HashBytes(&h, &t.visibility.inputs.valid, sizeof t.visibility.inputs.valid);
+    HashBytes(&h, t.visibility.inputs.color, sizeof t.visibility.inputs.color);
+    HashBytes(&h, t.visibility.inputs.param, sizeof t.visibility.inputs.param);
+  }
+  const bvh::LiveBvhStats& s = data->live;
+  HashBytes(&h, &s.tlas_refits, sizeof s.tlas_refits);
+  HashBytes(&h, &s.refit_instances, sizeof s.refit_instances);
+  HashBytes(&h, &s.refit_missing, sizeof s.refit_missing);
+  HashBytes(&h, &s.refit_failures, sizeof s.refit_failures);
+  HashBytes(&h, &s.tlas_invalid, sizeof s.tlas_invalid);
+  HashBytes(&h, &s.tlas_rebuilds, sizeof s.tlas_rebuilds);
+  const uint8_t failed = data->tlas_refit_failed ? 1u : 0u;
+  HashBytes(&h, &failed, sizeof failed);
+  HashBytes(&h, s.last_failure.data(), s.last_failure.size());
+  return h;
+}
+
+static void TestRefitGolden() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kA = 0xA1u, kB = 0xB2u, kC = 0xC3u, kS = 0xD4u;
+  AddMesh(kA, BoxMesh(0.8f));
+  AddMesh(kB, Grid(9, 9, 4.f, 0.7f));
+  AddMesh(kC, BoxMesh(1.2f));
+  AddMesh(kS, BoxMesh(0.5f));
+  const uint64_t dyn_keys[3] = {kA, kB, kC};
+  for (int i = 0; i < 12; ++i) {
+    AddInstance(dyn_keys[i % 3], 2.f * static_cast<float>(i), 0.f, 12.f);
+    if (i % 2 == 0) AddInstance(kS, 2.f * static_cast<float>(i) + 1.f, 0.f, 20.f);
+  }
+  std::vector<uint64_t> dyn;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key != kS) dyn.push_back(inst.id);
+    }
+  }
+  CHECK(dyn.size() == 12u, "12 dynamic candidates (%zu)", dyn.size());
+  uint64_t g = 14695981039346656037ull;
+  const auto step = [&](int presents) {
+    for (int i = 0; i < presents; ++i) {
+      rig.present();
+      g = RefitStateHash(data, g);
+    }
+  };
+  const auto gpu = [&]() {
+    bvh::g_live_bvh.check_requested.store(true);
+    rig.present();
+    g = RefitStateHash(data, g);
+    CHECK(data->live.gpu_ok, "GPU check: %s", data->live.gpu_result.c_str());
+  };
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  step(12);
+  for (size_t i = 0; i < dyn.size(); ++i) MoveRefitInstance(dyn[i], 2.f * static_cast<float>(i) + 0.4f, 12.f, frame());
+  step(10);
+  gpu();
+  MoveRefitInstance(dyn[0], 0.9f, 12.f, frame());
+  MoveRefitInstance(dyn[3], 6.9f, 12.f, frame());
+  MoveRefitInstance(dyn[6], 12.9f, 12.f, frame());
+  step(10);
+  step(5);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.id == dyn[1]) inst.bounds_min[0] = std::nanf("");
+    }
+    bvh::g_pool.dynamic_revision += 1u;
+  }
+  step(3);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.id == dyn[4]) inst.bounds_min[1] = inst.bounds_max[1] + 1.f;
+    }
+    bvh::g_pool.dynamic_revision += 1u;
+  }
+  step(3);
+  MoveRefitInstance(dyn[1], 2.f + 0.4f, 12.f, frame());
+  MoveRefitInstance(dyn[4], 8.f + 0.4f, 12.f, frame());
+  step(5);
+  gpu();
+  RetireMesh(kB);
+  step(5);
+  gpu();
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (auto it = bvh::g_pool.instances.begin(); it != bvh::g_pool.instances.end(); ++it) {
+      if (it->id != dyn[0]) continue;
+      bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(it->mesh_id, falcom_world::MatrixHash(it->matrix, 12)));
+      const auto observed = bvh::g_pool.observations.find(bvh::InstanceKey{kA, falcom_world::MatrixHash(it->matrix, 12)});
+      if (observed != bvh::g_pool.observations.end()) observed->second.admitted = false;
+      bvh::g_pool.instances.erase(it);
+      break;
+    }
+    bvh::g_pool.dynamic_revision += 1u;
+  }
+  step(3);
+  bvh::g_pool.alpha_wind_sway.store(false);
+  step(3);
+  bvh::g_pool.alpha_wind_sway.store(true);
+  step(5);
+  gpu();
+  CHECK(g == 0x2bf515dfb5956c83ull, "refit golden equals HEAD pin (%016llx)", (unsigned long long)g);
+}
+
 static uint64_t SlackKey(uint32_t mesh) { return 0x300u + mesh; }
 
 // 36 meshes of 30 instances (1080 static instances): above kLiveSlackMinStatic, so the first build has 256 holes.
@@ -4506,6 +4647,7 @@ int main() {
   TestSkipDynamicPose();
   TestSkipQuality();
   TestSkipCadence();
+  TestRefitGolden();
   TestSlackLayout();
   TestSlackApply();
   TestSlackExhaustion();

@@ -85,6 +85,109 @@ static void Place(float* m, float x, float y = 0.f, float z = 0.f, float rot = 0
   std::memcpy(m, values, sizeof(values));
 }
 
+// Golden for RetirePoolOrphans: a seeded pool of about 2000 instances over 150 keys (dynamic and static,
+// alpha and wind keys), observations at varied last-seen frames, and mutations between passes at frames
+// 100..900. Each pass hashes the instance ids, the stats, the admitted flags, the per-key retired counts
+// and the log lines. The pin is the HEAD value.
+static uint32_t OrphanRand(uint64_t* state) {
+  *state = *state * 6364136223846793005ull + 1442695040888963407ull;
+  return static_cast<uint32_t>(*state >> 33);
+}
+
+static void OrphanHash(uint64_t* h, const void* data, size_t n) {
+  const auto* p = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < n; ++i) { *h ^= p[i]; *h *= 1099511628211ull; }
+}
+
+static void RunRetire(uint32_t frame, std::vector<std::string>* lines) {
+  std::lock_guard lock(bvh::g_pool.mutex);
+  bvh::RetirePoolOrphans(frame, lines);
+}
+
+static void TestOrphanGolden() {
+  uint64_t seed = 0x5EEDu;
+  uint64_t g = 14695981039346656037ull;
+  const auto spawn = [&](uint32_t admit) {
+    const uint32_t k = OrphanRand(&seed) % 150u;
+    bvh::WorldInstance inst;
+    inst.id = bvh::g_pool.next_instance_id++;
+    inst.mesh_key = 0x1000u + k;
+    inst.mesh_id = k % 8u;
+    inst.dynamic = OrphanRand(&seed) % 3u == 0u;
+    inst.admit_frame = admit;
+    inst.last_follow_frame = inst.dynamic ? admit + OrphanRand(&seed) % 50u : 0u;
+    const float x = static_cast<float>(OrphanRand(&seed) % 200u);
+    const float z = static_cast<float>(OrphanRand(&seed) % 200u);
+    const float s = 0.5f + static_cast<float>(OrphanRand(&seed) % 16u) * 0.1f;
+    const float m[12] = {1.f, 0.f, 0.f, x, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, z};
+    std::memcpy(inst.matrix, m, sizeof(m));
+    inst.bounds_min[0] = x - s; inst.bounds_max[0] = x + s;
+    inst.bounds_min[1] = 0.f; inst.bounds_max[1] = 1.f;
+    inst.bounds_min[2] = z - s; inst.bounds_max[2] = z + s;
+    bvh::g_pool.instances.push_back(inst);
+    if (OrphanRand(&seed) % 2u != 0u) return;
+    bvh::ObservedInstance obs;
+    obs.last_frame = admit + OrphanRand(&seed) % 200u;
+    obs.last_camera_frame = OrphanRand(&seed) % 2u != 0u ? obs.last_frame : 0u;
+    obs.last_light_frame = OrphanRand(&seed) % 3u == 0u ? admit + 5u : 0u;
+    obs.admitted = OrphanRand(&seed) % 2u == 0u;
+    bvh::g_pool.observations[bvh::InstanceKey{inst.mesh_key, falcom_world::MatrixHash(inst.matrix, 12)}] = obs;
+  };
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.instances.clear();
+    bvh::g_pool.observations.clear();
+    bvh::g_pool.admitted_keys.clear();
+    bvh::g_pool.dynamic_keys.clear();
+    bvh::g_pool.wind_keys.clear();
+    bvh::g_pool.meshes.assign(8, bvh::WorldMesh{});
+    bvh::g_pool.meshes[0].alpha = true;
+    bvh::g_pool.meshes[1].alpha = true;
+    for (uint64_t k = 0u; k < 150u; k += 13u) bvh::g_pool.wind_keys.insert(0x1000u + k);
+    bvh::g_pool.stats.orphans = 0u;
+    bvh::g_pool.stats.orphans_retired = 0u;
+    bvh::g_pool.orphan_lines_logged = 0u;
+    for (int i = 0; i < 2000; ++i) spawn(100u + OrphanRand(&seed) % 800u);
+  }
+  for (uint32_t frame = 100u; frame <= 900u; frame += 10u) {
+    if (frame > 100u) {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      for (int j = 0; j < 40; ++j) {
+        bvh::WorldInstance& inst = bvh::g_pool.instances[OrphanRand(&seed) % bvh::g_pool.instances.size()];
+        switch (OrphanRand(&seed) % 4u) {
+          case 0u: inst.last_follow_frame = frame; break;
+          case 1u: inst.dynamic = !inst.dynamic; break;
+          case 2u: {
+            const auto obs = bvh::g_pool.observations.find(bvh::InstanceKey{inst.mesh_key, falcom_world::MatrixHash(inst.matrix, 12)});
+            if (obs != bvh::g_pool.observations.end()) obs->second.last_camera_frame = frame - OrphanRand(&seed) % 20u;
+            break;
+          }
+          default: inst.admit_frame = frame - OrphanRand(&seed) % 30u; break;
+        }
+      }
+      for (int j = 0; j < 4; ++j) spawn(frame);
+    }
+    std::vector<std::string> lines;
+    RunRetire(frame, &lines);
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      OrphanHash(&g, &inst.id, sizeof(inst.id));
+      const auto obs = bvh::g_pool.observations.find(bvh::InstanceKey{inst.mesh_key, falcom_world::MatrixHash(inst.matrix, 12)});
+      const uint8_t admitted = obs != bvh::g_pool.observations.end() && obs->second.admitted ? 1u : 0u;
+      OrphanHash(&g, &admitted, sizeof(admitted));
+    }
+    OrphanHash(&g, &bvh::g_pool.stats.orphans, sizeof(bvh::g_pool.stats.orphans));
+    OrphanHash(&g, &bvh::g_pool.stats.orphans_retired, sizeof(bvh::g_pool.stats.orphans_retired));
+    for (uint64_t k = 0x1000u; k < 0x1000u + 150u; ++k) {
+      const auto dynamic = bvh::g_pool.dynamic_keys.find(k);
+      const uint32_t retired = dynamic == bvh::g_pool.dynamic_keys.end() ? 0u : dynamic->second.retired_orphans;
+      OrphanHash(&g, &retired, sizeof(retired));
+    }
+    for (const std::string& line : lines) OrphanHash(&g, line.data(), line.size());
+  }
+  CHECK(g == 0x41df77d2deefffcdull, "orphan golden equals HEAD pin (%016llx)", (unsigned long long)g);
+}
+
 int main() {
   HStage("0. ULP distance and buckets.");
   // 0. ULP distance and buckets.
@@ -1429,6 +1532,7 @@ int main() {
           snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
   }
 
+  TestOrphanGolden();
   HStage("29b. Orphans: a superseded dynamic instance retires at 60 frames; a lone one is kept to 600.");
   // 29b. Orphans: a superseded dynamic instance retires at 60 frames; a lone one is kept to 600.
   {
@@ -1445,14 +1549,14 @@ int main() {
     lone.mesh_key = 0x88u;
     bvh::g_pool.instances = {old_pose, new_pose, lone};
     std::vector<std::string> orphan_lines;
-    bvh::RetirePoolOrphans(160u, bvh::PoolNewestSeenByKey(), &orphan_lines);
+    bvh::RetirePoolOrphans(160u, &orphan_lines);
     CHECK(bvh::g_pool.instances.size() == 3u && bvh::g_pool.stats.orphans_retired == 0u, "60 frames: nothing retired yet");
-    bvh::RetirePoolOrphans(161u, bvh::PoolNewestSeenByKey(), &orphan_lines);
+    bvh::RetirePoolOrphans(161u, &orphan_lines);
     CHECK(bvh::g_pool.instances.size() == 2u && bvh::g_pool.stats.orphans_retired == 1u
               && bvh::g_pool.instances[0].admit_frame == 200u,
           "superseded at 61 unseen frames: retired, the lone one kept (%zu left, retired %llu)", bvh::g_pool.instances.size(),
           (unsigned long long)bvh::g_pool.stats.orphans_retired);
-    bvh::RetirePoolOrphans(701u, bvh::PoolNewestSeenByKey(), &orphan_lines);
+    bvh::RetirePoolOrphans(701u, &orphan_lines);
     CHECK(bvh::g_pool.instances.size() == 1u && bvh::g_pool.stats.orphans_retired == 2u,
           "lone one retired after 600 unseen frames (%zu left, retired %llu)", bvh::g_pool.instances.size(),
           (unsigned long long)bvh::g_pool.stats.orphans_retired);
@@ -1480,7 +1584,7 @@ int main() {
     const auto retire = [](std::vector<bvh::WorldInstance> instances, uint32_t frame) {
       bvh::g_pool.instances = std::move(instances);
       std::vector<std::string> orphan_lines;
-      bvh::RetirePoolOrphans(frame, bvh::PoolNewestSeenByKey(), &orphan_lines);
+      bvh::RetirePoolOrphans(frame, &orphan_lines);
       return bvh::g_pool.instances;
     };
     const auto a = retire({make(0x91u, false, 100u, 0.f), make(0x91u, false, 170u, 0.1f)}, 200u);
@@ -1518,7 +1622,7 @@ int main() {
     uint32_t hinge_retired_at = 0u;
     for (uint32_t frame = 110u; frame <= 150u && hinge_retired_at == 0u; frame += 10u) {
       if (frame >= 145u) bvh::g_pool.instances.back().admit_frame = frame;
-      bvh::RetirePoolOrphans(frame, bvh::PoolNewestSeenByKey(), &hinge_lines);
+      bvh::RetirePoolOrphans(frame, &hinge_lines);
       if (bvh::g_pool.instances.size() == 1u) hinge_retired_at = frame;
     }
     CHECK(hinge_retired_at == 150u, "(l) door-like hinge ghost seen at 100, hinge pose seen from 145: retired by 150 (at %u)", hinge_retired_at);
@@ -1527,7 +1631,7 @@ int main() {
     for (uint32_t frame = 10u; frame <= 300u; frame += 10u) {
       bvh::g_pool.instances[0].admit_frame = frame - frame % 30u;
       bvh::g_pool.instances[1].admit_frame = frame >= 15u ? (frame - 15u) / 30u * 30u + 15u : 0u;
-      bvh::RetirePoolOrphans(frame, bvh::PoolNewestSeenByKey(), &live_lines);
+      bvh::RetirePoolOrphans(frame, &live_lines);
     }
     CHECK(bvh::g_pool.instances.size() == 2u, "(m) live same-key neighbour, 50%% overlap, refreshed every 30 frames offset by 15: none retired over 300 frames (%zu left)", bvh::g_pool.instances.size());
     const auto n = retire({make(0x9Eu, true, 100u, 0.f), make(0x9Eu, true, 150u, 0.1f)}, 141u);
@@ -1555,7 +1659,7 @@ int main() {
     }
     std::vector<std::string> cap_lines;
     const auto t0 = std::chrono::steady_clock::now();
-    bvh::RetirePoolOrphans(200u, bvh::PoolNewestSeenByKey(), &cap_lines);
+    bvh::RetirePoolOrphans(200u, &cap_lines);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     CHECK(bvh::g_pool.instances.size() == 10000u, "10k same-key statics: none retired (%zu left)", bvh::g_pool.instances.size());
     std::printf("10k same-key RetirePoolOrphans: %.2f ms\n", ms);

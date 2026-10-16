@@ -60,6 +60,15 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## Refit and drain cleanup (refit-drain-1): implemented, not validated in game
+
+- Golden pins on HEAD c942e239 (harness, before any production edit): `test_live` `TestRefitGolden` = 0x2bf515dfb5956c83 (TLAS copies, leaf map, tlas_info and refit counters after every present); `test_motion` `TestOrphanGolden` = 0x41df77d2deefffcd (RetirePoolOrphans per pass). Sensitivity: a leaf-bounds perturbation breaks the refit pin and an overlap-orphan mutation breaks the orphan pin; both reverted.
+- A1: the refit reuses session scratch (`tlas_refit_instances/leaves/nodes`, and `tlas_dynamic_scratch` for `updated`); leaves and nodes swap in only after every write succeeds. A3: the refit checks the changed leaf bounds (finite, ordered) and reports them as invalid; the full ValidateBvh stays at the rebuild. A4: the refit reads the mesh slot from the descriptor header and falls back to `slot_by_uid`.
+- B1: the per-present drain calls UpdatePoolStats only when an invalidation was released; the 600-frame summary and TakePlacementSnapshot refresh it first (test_pool asserts the queue count with no drain).
+- B2: RetirePoolOrphans is one pass over instances (PoolInstanceLastSeen once each); the per-key newest map is built only when a candidate exists. Signature is now `RetirePoolOrphans(frame, lines)`.
+- Not done: A2 (cursor lower_bound), deferred. RTAO, rebuild interval and pool caps unchanged.
+- Known, pre-existing on HEAD: `test_motion.cpp` "re-flagged within one capture interval" (line 1080 now, 977 before the harness insertions).
+
 ## CPU spike step 1 (round 1, diagnostic only): Max 30 column, perf-file maxima, series (implemented, not validated in game)
 
 - Source: `world/docs/CPU_SPIKE_PLAN.md` section 4 (plan of 2026-10-16). No default, rendering, TLAS or pool change; fingerprint 0x55593b70e070e7fe unchanged; switches stay OFF by default.

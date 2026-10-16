@@ -1249,12 +1249,12 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
                           uint32_t frame) {
   const auto start = PerfNow();
   LiveBvhStats& stats = data->live;
-  std::vector<LiveTlasInstance> updated;
   uint64_t dynamic_revision = 0u;
   uint32_t missing = 0u;
   uint32_t lag = 0u;
   uint32_t on_screen_lag = 0u;
   const uint32_t df = data->tlas_dynamic_first;
+  std::vector<LiveTlasInstance>& updated = data->tlas_dynamic_scratch;
   float phase_ms[4] = {};
   auto phase_start = start;
   const auto lap = [&](float* ms) {
@@ -1326,24 +1326,36 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     return;
   }
 
-  std::vector<WorldInstanceGPU> instances(data->tlas_instances_cpu.begin() + df, data->tlas_instances_cpu.end());
-  std::vector<BVHLeafGPU> leaves = data->tlas_leaves_cpu;
+  std::vector<WorldInstanceGPU>& instances = data->tlas_refit_instances;
+  instances.assign(data->tlas_instances_cpu.begin() + df, data->tlas_instances_cpu.end());
+  std::vector<BVHLeafGPU>& leaves = data->tlas_refit_leaves;
+  leaves = data->tlas_leaves_cpu;
   uint32_t first = UINT32_MAX;
   uint32_t last = 0u;
   uint32_t changed = 0u;
+  bool bad_bounds = false;
   for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
-    const auto slot_it = data->slot_by_uid.find(updated[i - df].uid);
-    if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->descriptor_count) {
+    uint32_t slot = static_cast<uint32_t>(instances[i - df].header[0]);
+    if (slot >= data->slots.size() || !data->slots[slot].live || data->slots[slot].uid != updated[i - df].uid) {
+      const auto slot_it = data->slot_by_uid.find(updated[i - df].uid);
+      if (slot_it == data->slot_by_uid.end()) {
+        fail("mesh slot no longer resident");
+        return;
+      }
+      slot = slot_it->second;
+    }
+    if (slot >= data->descriptor_count) {
       fail("mesh slot no longer resident");
       return;
     }
-    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(updated[i - df], slot_it->second);
+    const WorldInstanceGPU descriptor = MakeLiveInstanceGPU(updated[i - df], slot);
     if (std::memcmp(&descriptor, &instances[i - df], sizeof(descriptor)) == 0) continue;
     instances[i - df] = descriptor;
     BVHLeafGPU& leaf = leaves[data->tlas_leaf_of_instance[i]];
     for (int k = 0; k < 3; ++k) {
       leaf.bounds_min[k] = updated[i - df].bounds_min[k];
       leaf.bounds_max[k] = updated[i - df].bounds_max[k];
+      bad_bounds = bad_bounds || !std::isfinite(leaf.bounds_min[k]) || !std::isfinite(leaf.bounds_max[k]) || leaf.bounds_max[k] < leaf.bounds_min[k];
     }
     first = (std::min)(first, i);
     last = i;
@@ -1357,9 +1369,10 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     return;
   }
 
-  std::vector<BVHNodeGPU> nodes = data->tlas_nodes_cpu;
+  std::vector<BVHNodeGPU>& nodes = data->tlas_refit_nodes;
+  nodes = data->tlas_nodes_cpu;
   RefitBvhNodes(leaves, &nodes);
-  const char* invalid = DescribeBvhValidation(ValidateBvh(nodes, leaves));
+  const char* invalid = bad_bounds ? DescribeBvhValidation({.ok = false, .bad_bounds = 1u}) : nullptr;
   lap(&phase_ms[2]);
   if (invalid != nullptr) {
     stats.tlas_invalid += 1u;
@@ -1385,8 +1398,8 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   // Swapped only after every write succeeded.
   std::move(instances.begin(), instances.end(), data->tlas_instances_cpu.begin() + df);
   std::move(updated.begin(), updated.end(), data->tlas_info.begin() + df);
-  data->tlas_leaves_cpu = std::move(leaves);
-  data->tlas_nodes_cpu = std::move(nodes);
+  data->tlas_leaves_cpu.swap(leaves);
+  data->tlas_nodes_cpu.swap(nodes);
   data->tlas_dynamic_revision = dynamic_revision;
   data->tlas_refits_since_rebuild += 1u;
   stats.tlas_refits += 1u;

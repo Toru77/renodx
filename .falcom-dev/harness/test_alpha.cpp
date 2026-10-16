@@ -2528,9 +2528,12 @@ static void TestStaleDynamic() {
   bool orphan = false;
   {
     std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
-    const auto newest = pool::PoolNewestSeenByKey();
-    for (const auto& instance : pool::g_pool.instances) {
-      if (instance.id == stale_id) orphan = pool::PoolInstanceIsOrphan(instance, frame, newest);
+    std::vector<uint32_t> seen;
+    for (const auto& instance : pool::g_pool.instances) seen.push_back(pool::PoolInstanceLastSeen(instance));
+    const auto newest = pool::PoolNewestSeenByKey(seen);
+    for (size_t i = 0; i < pool::g_pool.instances.size(); ++i) {
+      const auto& instance = pool::g_pool.instances[i];
+      if (instance.id == stale_id) orphan = pool::PoolInstanceIsOrphan(instance, seen[i], frame, newest);
     }
   }
   const size_t section = text.find("\"stale_dynamic\": [");
@@ -2580,10 +2583,12 @@ static void TestAlphaStaticNotRetired() {
     std::lock_guard<std::mutex> lock(pool::g_pool.mutex);
     pool::g_pool.meshes[mesh_id].alpha = true;
     pool::g_pool.instances = {make(100u, 0.f), make(170u, 0.1f)};
-    const auto newest = pool::PoolNewestSeenByKey();
-    CHECK(!pool::PoolInstanceIsOrphan(pool::g_pool.instances[0], 200u, newest), "alpha mesh: superseded static not retired by the static rule");
+    std::vector<uint32_t> seen;
+    for (const auto& instance : pool::g_pool.instances) seen.push_back(pool::PoolInstanceLastSeen(instance));
+    const auto newest = pool::PoolNewestSeenByKey(seen);
+    CHECK(!pool::PoolInstanceIsOrphan(pool::g_pool.instances[0], seen[0], 200u, newest), "alpha mesh: superseded static not retired by the static rule");
     pool::g_pool.meshes[mesh_id].alpha = false;
-    CHECK(pool::PoolInstanceIsOrphan(pool::g_pool.instances[0], 200u, newest), "control: same static on a non-alpha mesh retired");
+    CHECK(pool::PoolInstanceIsOrphan(pool::g_pool.instances[0], seen[0], 200u, newest), "control: same static on a non-alpha mesh retired");
   }
   pool::ResetWorldPool();
 }

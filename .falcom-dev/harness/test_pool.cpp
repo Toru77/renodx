@@ -603,6 +603,25 @@ int main() {
             static_cast<unsigned long long>(revision_before), static_cast<unsigned long long>(bvh::g_pool.revision));
       CHECK(bvh::g_pool.instances.size() == instances_before, "snapshot changes nothing: instances (%zu -> %zu)", instances_before, bvh::g_pool.instances.size());
     }
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.mesh_requests.clear();
+      for (uint64_t key = 1u; key <= 3u; ++key) {
+        bvh::PoolMeshRequest request;
+        request.mesh_key = key;
+        bvh::g_pool.mesh_requests[key] = request;
+      }
+      bvh::g_pool.mesh_requests[1].in_flight = true;
+    }
+    bvh::PlacementSnapshot queued;
+    bvh::TakePlacementSnapshot(&queued);
+    CHECK(queued.mesh_queue == 2u && queued.mesh_in_flight == 1u,
+          "snapshot counts the queue with no drain: queued %llu (want 2), in flight %llu (want 1)",
+          static_cast<unsigned long long>(queued.mesh_queue), static_cast<unsigned long long>(queued.mesh_in_flight));
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.mesh_requests.clear();
+    }
     size_t dynamic_records = 0u;
     size_t far_records = 0u;
     size_t alpha_records = 0u;

@@ -362,7 +362,10 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   std::vector<WorldInstanceGPU> tlas_instances_cpu;  // as uploaded (GPU check)
   std::vector<LiveTlasInstance> tlas_info;           // pool provenance per TLAS instance (inspect)
   std::vector<LiveTlasInstance> tlas_info_spare;     // session scratch: the next rebuild's snapshot (capacity kept; the old tlas_info rotates here)
-  std::vector<LiveTlasInstance> tlas_dynamic_scratch;  // session scratch: the dynamic instances of the rebuild snapshot, appended after the static ones
+  std::vector<LiveTlasInstance> tlas_dynamic_scratch;  // session scratch: the dynamic instances of the rebuild snapshot, appended after the static ones; the refit's updated copy
+  std::vector<WorldInstanceGPU> tlas_refit_instances;  // session scratch: the refit's dynamic descriptors (moved into tlas_instances_cpu on success)
+  std::vector<BVHLeafGPU> tlas_refit_leaves;           // session scratch: the refit's leaves (swapped into tlas_leaves_cpu on success)
+  std::vector<BVHNodeGPU> tlas_refit_nodes;            // session scratch: the refit's nodes (swapped into tlas_nodes_cpu on success)
   std::vector<BVHLeafGPU> tlas_leaves_cpu;
   std::vector<BVHNodeGPU> tlas_nodes_cpu;
   std::vector<uint32_t> tlas_leaf_of_instance;  // TLAS instance -> its leaf (sorted leaves)
