@@ -215,7 +215,7 @@ inline void DrawPerformanceTab() {
     ImGui::TableSetColumnIndex(3);
     cell(avg);
     if (clamped && ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Raw value before the clamp at zero: now %.3f ms, avg %.3f ms (the rows are not frame-aligned; see ROADMAP).",
+      ImGui::SetTooltip("Raw value before the clamp at zero: now %.3f ms, avg %.3f ms (the rows and the frame interval are one sample window; see ROADMAP).",
                         view.unattr_raw_now, view.unattr_raw_avg);
     }
     ImGui::TableSetColumnIndex(4);
@@ -255,11 +255,53 @@ inline void DrawPerformanceTab() {
       ImGui::EndTable();
     }
   }
-  if (ImGui::CollapsingHeader("BVH phases (subsets of the rows above; not in the totals)")) {
+  if (ImGui::CollapsingHeader("Subsets (parts of the rows above; not in the totals)")) {
     if (ImGui::BeginTable("perf_phases", 5, ImGuiTableFlags_Borders)) {
       header();
       for (size_t i = 0; i < kPerfCostCount; ++i) {
         if (kPerfCostInfo[i].role == kPerfSubset) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i], view.max.row[i], false);
+      }
+      ImGui::EndTable();
+    }
+  }
+  if (ImGui::CollapsingHeader("Largest frame spike of the last 30 presents")) {
+    const PerfSpike& spike = view.spike;
+    if (!spike.valid) {
+      ImGui::TextDisabled("no present in the window");
+    } else {
+      size_t order[kPerfBlockRebuildCall];
+      for (size_t j = 0; j < kPerfBlockRebuildCall; ++j) order[j] = j;
+      std::partial_sort(order, order + 3, order + kPerfBlockRebuildCall, [&spike](size_t a, size_t b) {
+        return spike.value[kPerfBlockRow + a] > spike.value[kPerfBlockRow + b];
+      });
+      std::string top;
+      for (size_t j = 0; j < 3 && spike.value[kPerfBlockRow + order[j]] > 0.05; ++j) {
+        char part[96];
+        std::snprintf(part, sizeof part, "%s%s %.1f", j != 0u ? ", " : "", kPerfCostInfo[kPerfBlockRow + order[j]].name,
+                      spike.value[kPerfBlockRow + order[j]]);
+        top += part;
+      }
+      char line[512];
+      std::snprintf(line, sizeof line, "frame %.1f ms, %zu presents ago; CPU %.1f ms (unattributed %.1f, handlers %.1f). Top blocks: %s", spike.frame_ms,
+                    view.spike_age, spike.cpu_total, spike.unattr, spike.bracket, top.empty() ? "no block over 0.05 ms: the spike is outside the timed blocks" : top.c_str());
+      ImGui::TextWrapped("%s", line);
+    }
+  }
+  if (ImGui::CollapsingHeader("Ray Tracing setting costs (live parts; A/B parts in the file)")) {
+    if (ImGui::BeginTable("perf_settings", 3, ImGuiTableFlags_Borders)) {
+      ImGui::TableSetupColumn("Setting");
+      ImGui::TableSetupColumn("CPU avg 30 (ms/present)");
+      ImGui::TableSetupColumn("GPU avg 30 (ms/measured frame)");
+      ImGui::TableHeadersRow();
+      for (const PerfSetting& setting : kPerfSettings) {
+        const PerfSettingValue sums = PerfSettingSums(view.avg, setting);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(setting.key);
+        ImGui::TableSetColumnIndex(1);
+        cell(sums.cpu);
+        ImGui::TableSetColumnIndex(2);
+        cell(sums.gpu);
       }
       ImGui::EndTable();
     }

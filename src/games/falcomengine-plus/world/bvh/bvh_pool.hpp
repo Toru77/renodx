@@ -1393,7 +1393,7 @@ struct PoolState {
   uint32_t lifecycle_lines_logged = 0u;  // per session
   std::vector<std::string> pending_lines;  // flagged-moving lines, logged by the present block
   // CPU time of the pool hooks and of DrainPoolScan (PoolCpuTimer): accumulated during a frame,
-  // moved to the *_frame_us values (last frame) by DrainPoolScan.
+  // moved to the *_frame_us values (last frame) by SamplePerfPresent.
   std::atomic_uint64_t cpu_hook_us{0u};
   std::atomic_uint64_t cpu_drain_us{0u};
   std::atomic_uint64_t cpu_capture_us{0u};  // CPU time of the mesh capture (decode and apply), not the GPU read-back wait
@@ -2881,20 +2881,23 @@ inline void FollowPoolMovingInstance(uint64_t mesh_key, uint32_t vs_hash, const 
     float relink_distance = 3.0e38f;
     const float step = PoolTranslationDistance(world, prev_world);
     const bool world_finite = std::isfinite(world[3]) && std::isfinite(world[7]) && std::isfinite(world[11]);
-    for (WorldInstance& instance : g_pool.instances) {
-      if (instance.mesh_id != mesh_id) continue;
-      if (std::memcmp(instance.matrix, prev_world, sizeof(float) * kPoolWorldFloats) == 0) {
-        target = &instance;
-        break;
-      }
-      if (!world_finite || verdict != PoolSightingVerdict::Moving || !instance.dynamic || instance.mesh_key != mesh_key) continue;
-      if (instance.last_follow_frame >= frame || frame - instance.last_follow_frame > kPoolFollowRelinkFrames) continue;
-      const float gap = static_cast<float>(frame - instance.last_follow_frame);
-      const float limit = (gap + 1.f) * (std::max)(step, 0.02f) * 1.5f + 0.1f;
-      const float distance = PoolTranslationDistance(instance.matrix, world);
-      if (distance <= limit && distance < relink_distance) {
-        relink = &instance;
-        relink_distance = distance;
+    {
+      const PoolCpuTimer scan_timer{&g_perf_gate.block_us[kPerfBlockFollowScan]};
+      for (WorldInstance& instance : g_pool.instances) {
+        if (instance.mesh_id != mesh_id) continue;
+        if (std::memcmp(instance.matrix, prev_world, sizeof(float) * kPoolWorldFloats) == 0) {
+          target = &instance;
+          break;
+        }
+        if (!world_finite || verdict != PoolSightingVerdict::Moving || !instance.dynamic || instance.mesh_key != mesh_key) continue;
+        if (instance.last_follow_frame >= frame || frame - instance.last_follow_frame > kPoolFollowRelinkFrames) continue;
+        const float gap = static_cast<float>(frame - instance.last_follow_frame);
+        const float limit = (gap + 1.f) * (std::max)(step, 0.02f) * 1.5f + 0.1f;
+        const float distance = PoolTranslationDistance(instance.matrix, world);
+        if (distance <= limit && distance < relink_distance) {
+          relink = &instance;
+          relink_distance = distance;
+        }
       }
     }
     WorldInstance* picked = target != nullptr ? target : relink;
@@ -5715,11 +5718,6 @@ inline void WritePoolPrevTrace(const PoolPrevTrace& trace);
 // keeps geometry whose buffers are gone.
 inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_queue* queue) {
   const PoolCpuTimer cpu_timer{&g_pool.cpu_drain_us};
-  if (g_perf_gate.gather.load(std::memory_order_relaxed)) {
-    g_pool.cpu_hook_frame_us = g_pool.cpu_hook_us.exchange(0u);
-    g_pool.cpu_drain_frame_us = g_pool.cpu_drain_us.exchange(0u);
-    g_pool.cpu_capture_frame_us = g_pool.cpu_capture_us.exchange(0u);
-  }
   if (device == nullptr || queue == nullptr) return;
   const bool scanning = g_pool.scan_active.load(std::memory_order_relaxed);
   const uint32_t frame = g_state.frame.load();
@@ -5749,11 +5747,14 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
         g_pool.map_change_frame = 0u;
       }
     }
-    CompactPool();
-    ApplyPoolDynamicSwitch();
-    ApplyPoolAlphaSwitch();
-    ApplyPoolIndirectAlphaSwitch();
-    ApplyPoolWindSwitch();
+    {
+      const PoolCpuTimer compact_timer{&g_perf_gate.block_us[kPerfBlockDrainCompact]};
+      CompactPool();
+      ApplyPoolDynamicSwitch();
+      ApplyPoolAlphaSwitch();
+      ApplyPoolIndirectAlphaSwitch();
+      ApplyPoolWindSwitch();
+    }
     if (scanning) {
       if (g_pool.stats.scan_first_frame == 0u) g_pool.stats.scan_first_frame = frame;
       g_pool.stats.scan_last_frame = frame;
@@ -5770,7 +5771,10 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
     }
   }
   stage.Set("present: resolve");
-  if (resolve_slot != UINT32_MAX) ResolvePoolSlot(device, resolve_slot);
+  if (resolve_slot != UINT32_MAX) {
+    const PoolCpuTimer resolve_timer{&g_perf_gate.block_us[kPerfBlockDrainResolve]};
+    ResolvePoolSlot(device, resolve_slot);
+  }
 
   stage.Set("present: prune");
   uint32_t released = 0u;
@@ -5782,7 +5786,10 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     if ((frame % 60u) == 0u) {
-      PrunePool(frame);
+      {
+        const PoolCpuTimer prune_timer{&g_perf_gate.block_us[kPerfBlockDrainPrune]};
+        PrunePool(frame);
+      }
       if (scanning && (frame % 600u) == 0u && g_pool.log_captures.load(std::memory_order_relaxed)) {
         const PoolStats& s = g_pool.stats;
         summary = renodx::utils::log::BuildString(
@@ -5800,11 +5807,15 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
       }
     }
     if ((frame % 10u) == 0u && g_pool.scan_continuous && frame >= g_pool.scan_since + kPoolMovingHoldFrames) {
+      const PoolCpuTimer retire_timer{&g_perf_gate.block_us[kPerfBlockDrainRetireOrphans]};
       RetirePoolOrphans(frame, PoolNewestSeenByKey(), &failure_lines);
     }
     failure_lines.insert(failure_lines.end(), g_pool.pending_lines.begin(), g_pool.pending_lines.end());
     g_pool.pending_lines.clear();
-    UpdatePoolStats();
+    {
+      const PoolCpuTimer stats_timer{&g_perf_gate.block_us[kPerfBlockDrainPoolStats]};
+      UpdatePoolStats();
+    }
     g_pool.stats.dynamic_draws = g_pool.dynamic_draws.size();
     g_pool.stats.dynamic_arena_bytes = g_pool.dynamic_arena_used;
     g_pool.dynamic_present = std::move(g_pool.dynamic_draws);

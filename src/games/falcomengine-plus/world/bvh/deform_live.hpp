@@ -407,7 +407,7 @@ struct DeformLiveState {
   bool refit_failed = false;
   GpuTimer refit_timer;
   std::atomic_uint64_t cpu_us{0u};  // CPU time of OnDeformCaptureDraw, the draw hook (PoolCpuTimer)
-  std::atomic_uint64_t cpu_frame_us{0u};  // cpu_us of the last frame (moved by UpdateDeformLive)
+  std::atomic_uint64_t cpu_frame_us{0u};  // cpu_us of the last frame (moved by SamplePerfPresent)
   uint32_t log_lines = 0u;          // identity and store reset lines written (kPoolLifecycleLogLines)
   uint32_t warm_frame = 0u;   // frame of the first identity
   bool last_objects = false;  // the previous present traced objects
@@ -1001,7 +1001,6 @@ inline void ResolveDynamicTopology(reshade::api::device* device, reshade::api::c
 // into traced objects and refits their BLAS on the GPU.
 inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command_queue* queue) {
   const PoolCpuTimer cpu_timer{&g_perf_gate.deform_update_us};
-  if (g_perf_gate.gather.load(std::memory_order_relaxed)) g_deform_live.cpu_frame_us = g_deform_live.cpu_us.exchange(0u);
   if (device == nullptr || queue == nullptr) return;
   if (!g_deform_live.enabled.load(std::memory_order_relaxed)) {
     if (g_deform_live.device != nullptr) ReleaseDeformLive(nullptr);

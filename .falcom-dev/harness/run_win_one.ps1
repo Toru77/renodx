@@ -35,7 +35,7 @@ if ($stale -or $Force) {
   }
 }
 
-$env:FALCOM_TEST_OUT = $Test
+$env:FALCOM_TEST_OUT = "$Test-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
 if ($Quick) { $env:FALCOM_QUICK = "1" } else { Remove-Item Env:FALCOM_QUICK -ErrorAction SilentlyContinue }
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $run = & $exePath 2>&1

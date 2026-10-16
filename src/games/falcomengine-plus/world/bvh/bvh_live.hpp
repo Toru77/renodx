@@ -874,6 +874,7 @@ inline void RebuildLiveTlas(
     uint32_t frame,
     const char* reason,
     bool allow_slack) {
+  const PoolCpuTimer rebuild_timer{&g_perf_gate.block_us[kPerfBlockRebuildCall]};
   auto start = PerfNow();
   LiveBvhStats& stats = data->live;
   CacheRebuildExtra diag;  // cache diagnostics: phase times (laps), no-op test, cause and reason
@@ -1016,6 +1017,7 @@ inline void RebuildLiveTlas(
   const uint32_t retire_bits = (1u << static_cast<uint32_t>(PoolRevisionSource::Retire)) | (1u << static_cast<uint32_t>(PoolRevisionSource::Compact));
   const uint32_t admit_bits = (1u << static_cast<uint32_t>(PoolRevisionSource::Admit)) | (1u << static_cast<uint32_t>(PoolRevisionSource::NewMesh));
   diag.cause = (sources & retire_bits) != 0u ? 0u : (sources & admit_bits) != 0u ? 1u : 2u;
+  // The skip is counted here; its time is measured above (skip_ms). The record (RecordCacheTlasSkip) is not timed.
   const auto count_skip = [&]() {
     const float skip_ms = LiveElapsedMs(start);
     stats.tlas_skips += 1u;
@@ -1147,6 +1149,7 @@ inline void RebuildLiveTlas(
     diag.noop_full = LiveSnapshotMatchesTlas(*data, instances, info, true);
     diag.noop_static = LiveSnapshotMatchesTlas(*data, instances, info, false);
     const auto diag_time = std::chrono::steady_clock::now() - diag_start;
+    AddPerfBlockMs(kPerfBlockRebuildNoop, std::chrono::duration<double, std::milli>(diag_time).count());
     if (start != std::chrono::steady_clock::time_point{}) {  // gathering on (PerfNow): the laps exclude the diagnostics
       start += diag_time;
       phase_start += diag_time;
@@ -2060,6 +2063,7 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
     dynamic.last_frame = g_state.frame.load();
   }
   if (!g_live_bvh.enabled.load(std::memory_order_relaxed)) return;
+  const PoolCpuTimer record_timer{&g_perf_gate.block_us[kPerfBlockP2bRecord]};
   if (!EnsureDynamicExpand(device, data)) {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.dynamic_expand_failed += 1u;
@@ -2143,7 +2147,10 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
     // Pool changes (retirements) are handled at once; pending uploads wait
     // out a GPU buffer failure.
     if (revision != data->mesh_revision || (data->mesh_scan_needed && frame >= data->upload_retry_frame)) {
+      const auto sync_start = PerfNow();
+      const float blas_before = data->live.blas_build_ms_sum;
       SyncLiveMeshes(device, cmd_list, data, frame);
+      AddPerfBlockMs(kPerfBlockSyncMeshes, LiveElapsedMs(sync_start) - (data->live.blas_build_ms_sum - blas_before));
     }
     stage.Set("live bvh: alpha");
     SyncLiveAlpha(device, cmd_list, data, frame);
@@ -2187,6 +2194,7 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
 
   if (g_live_bvh.check_requested.exchange(false, std::memory_order_relaxed)) {
     stage.Set("live bvh: gpu check");
+    const PoolCpuTimer gpu_check_timer{&g_perf_gate.block_us[kPerfBlockGpuCheck]};
     CheckLiveBvhOnGpu(device, queue, data);
   }
 }
@@ -2238,9 +2246,42 @@ inline CacheSwitches ReadCacheSwitches() {
   return s;
 }
 
-inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& extra = {}) {
+// Present, before UpdateLiveBvh (OnWorldPresentBvh). Samples the performance rows of the previous present. Its brackets and
+// InPresent rows are final by now, so every row of one sample is work of present N, sampled at the start of N+1, over one
+// window (the frame interval ends here). The frame-value exchanges happen here too (gather only). Returns the present time
+// for UpdateCacheDiag. Side effects: cache-diag capture_ms is one present fresher (it holds the previous drain), and perf start_frame is one present later.
+inline std::chrono::steady_clock::time_point SamplePerfPresent(reshade::api::device* device, const PerfExtraGpu& extra = {}) {
+  BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
+  if (data == nullptr) return {};
+  const PoolCpuTimer sample_timer{&g_perf_gate.block_us[kPerfBlockPerfSample]};
+  const auto present_time = PerfNow();
+  if (g_perf_gate.gather.load(std::memory_order_relaxed)) {
+    g_pool.cpu_hook_frame_us = g_pool.cpu_hook_us.exchange(0u);
+    g_pool.cpu_drain_frame_us = g_pool.cpu_drain_us.exchange(0u);
+    g_pool.cpu_capture_frame_us = g_pool.cpu_capture_us.exchange(0u);
+    g_deform_live.cpu_frame_us = g_deform_live.cpu_us.exchange(0u);
+    PerfCounters counters;
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      counters = ReadPerfCounters(data, extra);
+    }
+    double frame_ms = std::numeric_limits<double>::quiet_NaN();
+    {
+      std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+      if (g_cache_diag.data.last_present != std::chrono::steady_clock::time_point{}) {
+        frame_ms = std::chrono::duration<double, std::milli>(present_time - g_cache_diag.data.last_present).count();
+      }
+    }
+    UpdatePerfTab(counters, frame_ms);
+  }
+  UpdatePerfRun(data, g_state.frame.load(), present_time, ReadCacheSwitches(), extra);
+  return present_time;
+}
+
+inline void UpdateCacheDiag(reshade::api::device* device, std::chrono::steady_clock::time_point present_time = PerfNow()) {
   BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
   if (data == nullptr) return;
+  const PoolCpuTimer diag_timer{&g_perf_gate.block_us[kPerfBlockCacheDiag]};
   if (g_cache_diag.reset_requested.exchange(false, std::memory_order_relaxed)) {
     if (g_perf.active.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
@@ -2287,8 +2328,6 @@ inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& ex
     }
   }
   CacheTiers tiers;
-  const bool gather = g_perf_gate.gather.load(std::memory_order_relaxed);
-  PerfCounters counters;
   uint32_t serial = 0u;
   uint32_t pool_start = 0u;
   uint32_t pool_fresh_from = 0u;
@@ -2305,19 +2344,11 @@ inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& ex
     admitted = g_pool.instances.size();
     resight = g_pool.resight.counters;
     resight_tracked = g_pool.resight.by_signature.size();
-    if (sample) ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
-    if (gather) counters = ReadPerfCounters(data, extra);
-  }
-  const auto present_time = PerfNow();
-  double frame_ms = std::numeric_limits<double>::quiet_NaN();
-  if (gather) {
-    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
-    if (g_cache_diag.data.last_present != std::chrono::steady_clock::time_point{}) {
-      frame_ms = std::chrono::duration<double, std::milli>(present_time - g_cache_diag.data.last_present).count();
+    if (sample) {
+      const PoolCpuTimer tiers_timer{&g_perf_gate.block_us[kPerfBlockCacheTiers]};
+      ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
     }
   }
-  if (gather) UpdatePerfTab(counters, frame_ms);
-  UpdatePerfRun(data, frame, present_time, ReadCacheSwitches(), extra);
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
   if (d.last_present != std::chrono::steady_clock::time_point{}) {

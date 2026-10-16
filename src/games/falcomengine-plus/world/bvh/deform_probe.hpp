@@ -976,6 +976,7 @@ inline void DrainDeformProbe(reshade::api::device* device, reshade::api::command
     if (g_deform.device != nullptr) ReleaseDeformProbe(nullptr);
     return;
   }
+  const PoolCpuTimer probe_timer{&g_perf_gate.block_us[kPerfBlockDeformProbe]};
   PoolStageScope stage("present: deform probe");
   std::vector<uint64_t> retired;
   bool need_resources = false;

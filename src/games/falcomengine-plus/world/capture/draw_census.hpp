@@ -396,6 +396,7 @@ inline void ResolveIndirectDraws(reshade::api::command_queue* queue) {
   if (queue == nullptr) return;
   auto& pending = PendingIndirectDraws();
   if (pending.empty()) return;
+  const bvh::PoolCpuTimer resolve_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockResolveIndirect]};
   auto* device = queue->get_device();
   if (device == nullptr) {
     pending.clear();

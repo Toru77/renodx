@@ -476,6 +476,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
 // Reads the stats buffer and writes world_rtao.json. Called once per present; no lock held.
 inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::command_queue* queue) {
   if (!g_rtao_stats.requested.exchange(false, std::memory_order_relaxed)) return;
+  const bvh::PoolCpuTimer stats_timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockRtaoStats]};
   const auto found = g_rtao_devices.find(device);
   if (found == g_rtao_devices.end() || found->second.stats_buffer.handle == 0u) return;
   const RtaoDeviceData& data = found->second;

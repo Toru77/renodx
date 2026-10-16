@@ -439,6 +439,7 @@ struct CacheRebuildExtra {
 inline void RecordCacheTlasRebuild(const std::vector<LiveTlasInstance>& before, const std::vector<LiveTlasInstance>& after,
                                    bool replaced, uint32_t frame, float ms, const CacheRebuildExtra& extra = {}) {
   if (!replaced || !g_cache_diag.enabled.load(std::memory_order_relaxed)) return;
+  const PoolCpuTimer record_timer{&g_perf_gate.block_us[kPerfBlockRecordTlas]};
   float camera[3] = {};
   PoolCameraPosition(camera);
   const CacheTlasDiff diff = after.empty() ? CacheTlasDiff{} : DiffTlasInstances(before, after, camera);

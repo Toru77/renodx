@@ -116,6 +116,7 @@ inline void RunBvhDebugPass(
   if (queue == nullptr || swapchain == nullptr) return;
   const auto view = static_cast<BvhView>(g_bvh_debug.mode.load(std::memory_order_relaxed));
   if (view != BvhView::TraceShaded && view != BvhView::TraceInstance && view != BvhView::DepthCompare) return;
+  const PoolCpuTimer debug_timer{&g_perf_gate.block_us[kPerfBlockDebugPass]};
   auto* device = queue->get_device();
   if (device == nullptr) return;
   BvhDeviceData* data = GetBvhDeviceData(device);
@@ -229,7 +230,6 @@ inline void OnWorldPresentBvh(
   }();
   (void)rtao_startup_enable;
 
-  UpdateLiveBvh(device, queue);
   PerfExtraGpu extra;
   if (g_perf_gate.gather.load(std::memory_order_relaxed)) {
     {
@@ -242,7 +242,9 @@ inline void OnWorldPresentBvh(
       extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
     }
   }
-  UpdateCacheDiag(device, extra);
+  const auto present_time = SamplePerfPresent(device, extra);
+  UpdateLiveBvh(device, queue);
+  UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
   RunBvhDebugPass(queue, swapchain);

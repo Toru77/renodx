@@ -1617,6 +1617,7 @@ static double ValueAt(const std::string& text, const char* anchor, const char* k
 // spike_at >= 0: present spike_at takes a 24 ms stall (40 ms interval, then 16 ms again) and a 9.5 ms rebuild.
 // step_ms: the interval of each present (16 by default; 3 gives about 10000 presents in 30 s).
 static std::string RunPerfWindow(bvh::BvhDeviceData* data, uint32_t first_frame, bool collect, int* presents, int spike_at = -1, int step_ms = 16) {
+  bvh::ClearPerfGathered(data);  // the sums (rebuild, BLAS, skip, apply, blocks) start at zero, whatever ran before
   const auto base = std::chrono::steady_clock::now();
   const bvh::CacheSwitches sw{collect, false, false, true};
   bvh::g_cache_diag.enabled.store(collect);
@@ -1682,7 +1683,8 @@ static void TestPerfWindow(Device* dev) {
               && text.find("\"max\": {\"value\": 16,") != std::string::npos && text.find("\"p99\": {\"value\": 16,") != std::string::npos
               && text.find("\"hitches_over_25ms\": {\"value\": 0,") != std::string::npos && text.find("\"hitches_over_33_3ms\": {\"value\": 0,") != std::string::npos,
           "frame time max and p99 are 16 ms, no hitch");
-    CHECK(FindAfter(text, "\"tlas_rebuild\"", "\"max_per_present\": {\"value\": 0.5, ") != std::string::npos, "rebuild maximum per present 0.5 ms");
+    CHECK(FindAfter(text, "\"tlas_rebuild\"", "\"max_per_present\": {\"value\": 0.5, ") != std::string::npos, "rebuild maximum per present 0.5 ms (observed: %s)",
+          text.substr(text.find("\"tlas_rebuild\""), 140).c_str());
     CHECK(std::fabs(ValueAt(text, "\"cpu_total\"", "\"max_per_present\"") - 1.875) <= 0.005, "CPU total maximum per present 1.875 ms (+-0.005)");
     CHECK(text.find("\"cpu_total\": {\"avg_per_present\": {\"value\": 1.875, \"unit\": \"ms/present\"}, \"max_per_present\": {\"value\": 1.87") != std::string::npos,
           "CPU total maximum per present about 1.875 ms (real timers add a few us)");
@@ -1969,6 +1971,7 @@ static CacheRun RunCacheScenario(bool enabled, bool resight = false) {
   }
   const auto present = [&]() {
     frame.fetch_add(1u);
+    bvh::SamplePerfPresent(&dev);
     bvh::UpdateLiveBvh(&dev, &queue);
     bvh::UpdateCacheDiag(&dev);
   };
@@ -2154,6 +2157,7 @@ static void TestCacheRebuildDiag() {
   bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(&dev);
   const auto present = [&]() {
     frame.fetch_add(1u);
+    bvh::SamplePerfPresent(&dev);
     bvh::UpdateLiveBvh(&dev, &queue);
     bvh::UpdateCacheDiag(&dev);
   };
@@ -2256,6 +2260,7 @@ struct SkipRig {
   bvh::BvhDeviceData* data() { return bvh::GetBvhDeviceData(&dev); }
   void present() {
     falcom_world::g_state.frame.fetch_add(1u);
+    bvh::SamplePerfPresent(&dev);
     bvh::UpdateLiveBvh(&dev, &queue);
     bvh::UpdateCacheDiag(&dev);
   }
@@ -2835,13 +2840,13 @@ static void TestPerfTab(Device* dev) {
         "GPU maximum over the measured presents (trace %.4f, total %.4f)", v.max.row[bvh::kPerfGpuTrace], v.max.gpu);
   CHECK(std::isnan(v.max.row[bvh::kPerfGpuRtaoFilter]) && std::isnan(v.max.row[bvh::kPerfGpuAlphaBlit]), "a Gpu row never measured is --");
 
-  // The live path feeds the tab at every present (UpdateCacheDiag), with the pool lock released by the caller.
+  // The live path feeds the tab at every present (SamplePerfPresent), with the pool lock released by the caller.
   ResetPerfTab();
-  bvh::UpdateCacheDiag(dev);
-  bvh::UpdateCacheDiag(dev);
+  bvh::SamplePerfPresent(dev);
+  bvh::SamplePerfPresent(dev);
   {
     std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
-    CHECK(bvh::g_perf.tab.count == 1u, "UpdateCacheDiag feeds the window (count %zu)", bvh::g_perf.tab.count);
+    CHECK(bvh::g_perf.tab.count == 1u, "SamplePerfPresent feeds the window (count %zu)", bvh::g_perf.tab.count);
   }
   CHECK(g_under_lock == 0, "the tab takes no lock the caller holds (%d)", g_under_lock);
   ResetPerfTab();
@@ -2926,6 +2931,356 @@ static void TestPerfCaptureInDrain(Device* dev) {
   ResetPerfTab();
 }
 
+// A block added during present N lands in present N's sample: the sample at the start of N+1 holds it, the one after does not.
+static void TestPerfSampleAlignment(Device* dev) {
+  bvh::g_perf_gate.gather.store(true);
+  ResetPerfTab();
+  bvh::SamplePerfPresent(dev);  // primes
+  bvh::g_perf_gate.present_world_us.fetch_add(10000u);  // 10 ms inside present N
+  bvh::SamplePerfPresent(dev);  // start of N+1: the sample of N
+  CHECK(Near(static_cast<float>(PerfTabNow().now[bvh::kPerfPresentWorldCpu]), 10.f, 1e-4f),
+        "a 10 ms block in present N is in N's sample (%.4f)", PerfTabNow().now[bvh::kPerfPresentWorldCpu]);
+  bvh::SamplePerfPresent(dev);  // present N+1 adds nothing
+  CHECK(Near(static_cast<float>(PerfTabNow().now[bvh::kPerfPresentWorldCpu]), 0.f, 1e-4f),
+        "the next sample does not carry it (%.4f)", PerfTabNow().now[bvh::kPerfPresentWorldCpu]);
+  ResetPerfTab();
+}
+
+// A block adds time only while gathering is ON: AddPerfBlockMs and the timer add nothing with the gate OFF.
+static void TestPerfBlockGate() {
+  bvh::g_perf_gate.gather.store(false);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockSyncMeshes, 2.0);
+  {
+    const bvh::PoolCpuTimer timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCacheDiag]};
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  uint64_t off_total = 0u;
+  for (const std::atomic_uint64_t& us : bvh::g_perf_gate.block_us) off_total += us.load();
+  CHECK(off_total == 0u, "gathering off: no block time is added (%llu us)", (unsigned long long)off_total);
+  bvh::g_perf_gate.gather.store(true);
+  bvh::AddPerfBlockMs(bvh::kPerfBlockSyncMeshes, 2.0);
+  {
+    const bvh::PoolCpuTimer timer{&bvh::g_perf_gate.block_us[bvh::kPerfBlockCacheDiag]};
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  const uint64_t sync = bvh::g_perf_gate.block_us[bvh::kPerfBlockSyncMeshes].load();
+  const uint64_t diag = bvh::g_perf_gate.block_us[bvh::kPerfBlockCacheDiag].load();
+  CHECK(sync == 2000u && diag >= 1000u, "gathering on: AddPerfBlockMs adds 2 ms and the scope adds its time (%llu, %llu us)",
+        (unsigned long long)sync, (unsigned long long)diag);
+  for (auto& us : bvh::g_perf_gate.block_us) us.store(0u);
+}
+
+// Each block key lands in its own sample: one block at a time, the sample of that present holds only that row.
+static void TestPerfBlockSample(Device* dev) {
+  bvh::g_perf_gate.gather.store(true);
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  for (auto& us : bvh::g_perf_gate.block_us) us.store(0u);
+  ResetPerfTab();
+  bvh::PerfCounters c;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    c = bvh::ReadPerfCounters(data);
+  }
+  bvh::UpdatePerfTab(c);  // primes
+  bool all_own = true;
+  for (size_t k = 0; k < bvh::kPerfBlockCount; ++k) {
+    bvh::AddPerfBlockMs(static_cast<bvh::PerfBlock>(k), 1.0);
+    {
+      std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+      c = bvh::ReadPerfCounters(data);
+    }
+    bvh::UpdatePerfTab(c);
+    const bvh::PerfTabView v = PerfTabNow();
+    for (size_t row = bvh::kPerfBlockRow; row < bvh::kPerfCostCount; ++row) {
+      const double want = row == bvh::kPerfBlockRow + k ? 1.0 : 0.0;
+      if (!Near(static_cast<float>(v.now[row]), static_cast<float>(want), 1e-4f)) all_own = false;
+    }
+  }
+  CHECK(all_own, "each block row holds only its own 1 ms in its own sample");
+  for (auto& us : bvh::g_perf_gate.block_us) us.store(0u);
+  ResetPerfTab();
+}
+
+// Disjoint blocks (InPresent) reduce the unattributed CPU; subset blocks are not summed.
+static void TestPerfDisjointBlocks() {
+  double values[bvh::kPerfCostCount] = {};
+  values[bvh::kPerfPresentBvhCpu] = 10.0;
+  values[bvh::kPerfBlockRow + bvh::kPerfBlockCacheDiag] = 4.0;
+  const bvh::PerfTotalsValue before = bvh::PerfTotals(values);
+  values[bvh::kPerfBlockRow + bvh::kPerfBlockRebuildCall] = 6.0;  // subset: not in the totals
+  const bvh::PerfTotalsValue after = bvh::PerfTotals(values);
+  CHECK(Near(static_cast<float>(before.unattr), 6.f, 1e-4f) && Near(static_cast<float>(before.cpu), 10.f, 1e-4f),
+        "bracket 10 ms, disjoint block 4 ms: unattributed 6, CPU total 10 (%.4f, %.4f)", before.unattr, before.cpu);
+  CHECK(Near(static_cast<float>(after.unattr), 6.f, 1e-4f) && Near(static_cast<float>(after.cpu), 10.f, 1e-4f),
+        "a subset block of 6 ms changes neither the unattributed value nor the CPU total (%.4f, %.4f)", after.unattr, after.cpu);
+}
+
+// A 10 ms block in one present is the largest block of the attribution (a 3 ms block is over 2 ms, the largest is not).
+static void TestPerfBlockAttribution(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  bvh::g_perf_gate.gather.store(true);
+  for (auto& us : bvh::g_perf_gate.block_us) us.store(0u);
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{true, false, false, true};
+  bvh::RequestPerfRun("attribution");
+  bvh::UpdatePerfRun(data, 9000u, base, sw);
+  int k = 0;
+  while (bvh::g_perf.active.load() && k < 12000) {
+    ++k;
+    if (k == 100) bvh::AddPerfBlockMs(bvh::kPerfBlockSyncMeshes, 10.0);
+    if (k == 200) bvh::AddPerfBlockMs(bvh::kPerfBlockDeformProbe, 3.0);
+    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw);
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  CHECK(JsonError(text).empty(), "attribution perf file is valid JSON: %s", JsonError(text).c_str());
+  const size_t attr = text.find("\"attribution\": {");
+  CHECK(attr != std::string::npos, "perf file has the attribution object");
+  const std::string tail = text.substr(attr);
+  CHECK(std::fabs(ValueAt(tail, "\"sync_live_meshes\"", "\"max_per_present\"") - 10.0) <= 1e-4, "the 10 ms block is the sync block maximum");
+  CHECK(std::fabs(ValueAt(tail, "\"deform_probe\"", "\"max_per_present\"") - 3.0) <= 1e-4, "the 3 ms block is the deform probe maximum");
+  CHECK(ValueAt(tail, "\"sync_live_meshes\"", "\"presents_over_2ms\"") == 1.0, "one present over 2 ms for the sync block");
+  CHECK(ValueAt(tail, "\"deform_probe\"", "\"presents_over_2ms\"") == 1.0, "one present over 2 ms for the deform probe block");
+  CHECK(ValueAt(tail, "\"rebuild_call\"", "\"presents_over_2ms\"") == 0.0, "an idle block is never over 2 ms");
+  CHECK(text.find("\"sync_live_meshes\": {\"max_per_present\": {\"value\": 10, \"unit\": \"ms/present\"}") != std::string::npos,
+        "the stats row shows the same 10 ms maximum");
+  bvh::ResetCacheDiagCounters();
+}
+
+// The i-th number of a series array (after the anchor and key); NaN when absent or null.
+static double SeriesAt(const std::string& text, const char* anchor, const char* key, size_t i) {
+  const size_t at = FindAfter(text, anchor, key);
+  if (at == std::string::npos) return std::numeric_limits<double>::quiet_NaN();
+  size_t p = text.find('[', at) + 1u;
+  for (size_t n = 0; n < i; ++n) p = text.find(',', p) + 1u;
+  if (text.compare(p, 4, "null") == 0) return std::numeric_limits<double>::quiet_NaN();
+  return std::strtod(text.c_str() + p, nullptr);
+}
+
+// The worst frame interval (60 ms at present 200) and the worst raw unattributed present (present 100: 14 ms bracket, 10 ms block).
+static void TestPerfWorstPresent(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  bvh::g_perf_gate.gather.store(true);
+  bvh::ClearPerfGathered(data);
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{true, false, false, true};
+  bvh::RequestPerfRun("worst");
+  bvh::UpdatePerfRun(data, 9000u, base, sw);
+  int k = 0;
+  while (bvh::g_perf.active.load() && k < 12000) {
+    ++k;
+    if (k == 100) {
+      bvh::AddPerfBlockMs(bvh::kPerfBlockResolveIndirect, 10.0);
+      bvh::g_perf_gate.present_world_us.fetch_add(14000u);
+    }
+    if (k == 200) {
+      bvh::AddPerfBlockMs(bvh::kPerfBlockSyncMeshes, 2.5);
+      bvh::AddPerfBlockMs(bvh::kPerfBlockDeformProbe, 1.5);
+    }
+    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k + (k >= 200 ? 44 : 0)), sw);
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  CHECK(JsonError(text).empty(), "worst present perf file is valid JSON: %s", JsonError(text).c_str());
+  const char* frame_anchor = "\"worst_present\": {";
+  const char* unattr_anchor = "\"worst_unattributed_present\": {";
+  CHECK(text.find(frame_anchor) != std::string::npos && text.find(unattr_anchor) != std::string::npos, "both worst presents are written");
+  CHECK(ValueAt(text, frame_anchor, "\"index\"") == 199.0, "worst frame is series index 199 (%.0f)", ValueAt(text, frame_anchor, "\"index\""));
+  CHECK(ValueAt(text, frame_anchor, "\"frame\"") == 9200.0, "worst frame is frame 9200");
+  CHECK(std::fabs(ValueAt(text, frame_anchor, "\"frame_ms\"") - 60.0) <= 1e-4, "worst frame interval 60 ms");
+  CHECK(std::fabs(ValueAt(text, frame_anchor, "\"sync_live_meshes\"") - 2.5) <= 1e-4, "worst frame block sync 2.5 ms");
+  CHECK(std::fabs(ValueAt(text, frame_anchor, "\"deform_probe\"") - 1.5) <= 1e-4, "worst frame block deform probe 1.5 ms");
+  CHECK(std::fabs(ValueAt(text, frame_anchor, "\"blocks_in_present_ms\"") - 4.0) <= 1e-4, "blocks in present 4 ms");
+  CHECK(FindAfter(text, frame_anchor, "\"in_series\": true") != std::string::npos, "the worst frame is in the series");
+  CHECK(ValueAt(text, unattr_anchor, "\"index\"") == 99.0, "worst unattributed present is series index 99");
+  CHECK(std::fabs(ValueAt(text, unattr_anchor, "\"unattributed_raw_ms\"") - 4.0) <= 1e-4, "its raw unattributed is 14 - 10 = 4 ms");
+  CHECK(std::fabs(ValueAt(text, unattr_anchor, "\"resolve_indirect\"") - 10.0) <= 1e-4, "its resolve_indirect block is 10 ms");
+  CHECK(SeriesAt(text, "\"blocks_unit\"", "\"resolve_indirect\": ", 99) == 10.0, "series block resolve_indirect[99] is 10 ms");
+  CHECK(SeriesAt(text, "\"blocks_unit\"", "\"resolve_indirect\": ", 100) == 0.0, "series block resolve_indirect[100] is 0 (a delta)");
+  CHECK(SeriesAt(text, "\"blocks_unit\"", "\"sync_live_meshes\": ", 199) == 2.5, "series block sync_live_meshes[199] is 2.5 ms");
+  CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit (worst present)");
+  bvh::ResetCacheDiagCounters();
+}
+
+// The tab keeps the largest frame interval of its 30 presents, with its blocks, until 30 newer presents push it out.
+static void TestPerfSpikeTab() {
+  ResetPerfTab();
+  bvh::PerfCounters c;
+  bvh::UpdatePerfTab(c, 16.0);
+  for (int i = 0; i < 30; ++i) {
+    if (i == 10) c.cost[bvh::kPerfBlockRow + bvh::kPerfBlockResolveIndirect] += 6.0;
+    bvh::UpdatePerfTab(c, i == 10 ? 50.0 : 16.0);
+  }
+  bvh::PerfTabView v = PerfTabNow();
+  CHECK(v.spike.valid && std::fabs(v.spike.frame_ms - 50.0) <= 1e-9, "tab spike is the 50 ms present (%.3f)", v.spike.frame_ms);
+  CHECK(v.spike_age == 19u, "tab spike is 19 presents ago (%zu)", v.spike_age);
+  CHECK(std::fabs(v.spike.value[bvh::kPerfBlockRow + bvh::kPerfBlockResolveIndirect] - 6.0) <= 1e-9, "tab spike block is 6 ms");
+  CHECK(std::fabs(v.spike.cpu_total - 6.0) <= 1e-9, "tab spike CPU total is its block (%.4f)", v.spike.cpu_total);
+  for (int i = 0; i < 30; ++i) bvh::UpdatePerfTab(c, 16.0);
+  v = PerfTabNow();
+  CHECK(v.spike.valid && std::fabs(v.spike.frame_ms - 16.0) <= 1e-9, "the 50 ms present left the window (%.3f)", v.spike.frame_ms);
+  ResetPerfTab();
+}
+
+// Settings: the live parts of each setting are the sums of its rows per present; the maximum is the largest sum of one present.
+static void TestPerfSettingsCost(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  bvh::g_perf_gate.gather.store(true);
+  bvh::ClearPerfGathered(data);
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{true, false, false, true};
+  bvh::RequestPerfRun("settings");
+  bvh::UpdatePerfRun(data, 9000u, base, sw);
+  int k = 0;
+  while (bvh::g_perf.active.load() && k < 12000) {
+    ++k;
+    bvh::g_perf_gate.alpha_sync_us.fetch_add(1000u);
+    data->alpha.timer.ms_sum += 0.5;
+    data->alpha.timer.samples += 1u;
+    if (k == 100) bvh::AddPerfBlockMs(bvh::kPerfBlockP2bRecord, 4.0);
+    if (k == 200) {
+      std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+      bvh::g_pool.stats.dynamic_expand_cpu_ms_sum += 3.f;
+    }
+    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw);
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  CHECK(JsonError(text).empty(), "settings perf file is valid JSON: %s", JsonError(text).c_str());
+  const double presents = ValueAt(text, "\"window\": {", "\"presents\"");
+  const char* alpha = "\"alpha_foliage\": {\"switch_keys\"";
+  const char* follow = "\"follow_moving\": {\"switch_keys\"";
+  CHECK(std::fabs(ValueAt(text, alpha, "\"avg_per_present\"") - ValueAt(text, "\"alpha_sync_cpu\": {", "\"avg_per_present\"")) <= 1e-6,
+        "alpha foliage live CPU average is the alpha sync row");
+  CHECK(std::fabs(ValueAt(text, alpha, "\"avg_per_present\"") - 1.0) <= 1e-4, "alpha foliage live CPU average is 1 ms per present");
+  CHECK(std::fabs(ValueAt(text, alpha, "\"avg_per_measured_frame\"") - 0.5) <= 1e-4, "alpha foliage live GPU average is 0.5 ms");
+  CHECK(std::fabs(ValueAt(text, follow, "\"max_per_present\"") - 4.0) <= 1e-4, "follow moving maximum is 4 ms (the largest present, not 4 + 3)");
+  CHECK(std::fabs(ValueAt(text, follow, "\"avg_per_present\"") - 7.0 / presents) <= 1e-6, "follow moving average is (4 + 3) / presents");
+  CHECK(std::fabs(ValueAt(text, follow, "\"avg_per_present\"")
+                  - (ValueAt(text, "\"follow_scan\": {", "\"avg_per_present\"") + ValueAt(text, "\"p2b_expand_cpu\": {", "\"avg_per_present\"")
+                     + ValueAt(text, "\"p2b_record\": {", "\"avg_per_present\"")))
+            <= 1e-6,
+        "follow moving average is the sum of its rows");
+  CHECK(text.find("\"stable\": true}, \"settings\"") != std::string::npos, "unchanged switches: the inclusion switches are stable");
+  CHECK(CountOf(text, "\"needs_ab\": \"") == bvh::kPerfSettingCount, "every setting names its A/B run");
+  bvh::ResetCacheDiagCounters();
+}
+
+// Foliage motion has no live part: its cost is in the context rows and the A/B run.
+static void TestPerfFoliageMotion() {
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  const char* motion = "\"foliage_motion\": {\"switch_keys\"";
+  CHECK(FindAfter(text, motion, "\"live_parts\": []") != std::string::npos, "foliage motion has no live part");
+  CHECK(FindAfter(text, motion, "\"live_cpu\": {\"avg_per_present\": {\"value\": null") != std::string::npos, "foliage motion live CPU is null");
+  CHECK(FindAfter(text, motion, "\"context_rows\": {\"tlas_refit\"") != std::string::npos, "foliage motion lists tlas_refit as context");
+}
+
+// A switch changed in the middle of the run: stable false, with the start and end values of that switch only.
+static void TestPerfInclusionFlip(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  bvh::g_perf_gate.gather.store(true);
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{true, false, false, true};
+  bvh::RequestPerfRun("flip");
+  bvh::UpdatePerfRun(data, 9000u, base, sw);
+  int k = 0;
+  while (bvh::g_perf.active.load() && k < 12000) {
+    ++k;
+    if (k == 50) bvh::g_pool.scan_indirect.store(false);
+    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw);
+  }
+  bvh::g_pool.scan_indirect.store(true);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  CHECK(JsonError(text).empty(), "flip perf file is valid JSON: %s", JsonError(text).c_str());
+  CHECK(text.find("\"stable\": false}, \"settings\"") != std::string::npos, "a switch changed mid-run: not stable");
+  const size_t start = text.find("\"start\": {", text.find("\"inclusion_switches\""));
+  const size_t end = text.find("\"end\": {", start);
+  const size_t stop = text.find("}, \"stable\"", end);
+  const std::string start_part = text.substr(start, end - start);
+  const std::string end_part = text.substr(end, stop - end);
+  for (size_t i = 0; i < bvh::kPerfInclusionCount; ++i) {
+    const std::string key = std::string("\"") + bvh::kPerfInclusionNames[i] + "\": ";
+    const bool at_start = start_part.compare(start_part.find(key) + key.size(), 4, "true") == 0;
+    const bool at_end = end_part.compare(end_part.find(key) + key.size(), 4, "true") == 0;
+    if (std::string(bvh::kPerfInclusionNames[i]) == "scan_indirect") {
+      CHECK(at_start && !at_end, "scan indirect is on at the start and off at the end");
+    } else {
+      CHECK(at_start == at_end, "switch %s is the same at both ends", bvh::kPerfInclusionNames[i]);
+    }
+  }
+  bvh::ResetCacheDiagCounters();
+}
+
+// The frame values are exchanged by the sample (gather ON): each *_frame_us holds the cumulative value of the present
+// that ended, the cumulative value restarts at 0. A deform update after the sample does not lose a fresh value.
+static void TestPerfFrameExchange(Device* dev, Queue* queue) {
+  bvh::g_perf_gate.gather.store(true);
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  bvh::g_pool.cpu_drain_us.store(5000u);
+  bvh::g_pool.cpu_capture_us.store(2000u);
+  bvh::g_pool.cpu_hook_us.store(300u);
+  bvh::g_deform_live.cpu_us.store(400u);
+  bvh::SamplePerfPresent(dev);
+  CHECK(bvh::g_pool.cpu_drain_frame_us.load() == 5000u && bvh::g_pool.cpu_capture_frame_us.load() == 2000u
+            && bvh::g_pool.cpu_hook_frame_us.load() == 300u && bvh::g_deform_live.cpu_frame_us.load() == 400u,
+        "the sample holds the frame values (drain %llu capture %llu hook %llu deform %llu)",
+        (unsigned long long)bvh::g_pool.cpu_drain_frame_us.load(), (unsigned long long)bvh::g_pool.cpu_capture_frame_us.load(),
+        (unsigned long long)bvh::g_pool.cpu_hook_frame_us.load(), (unsigned long long)bvh::g_deform_live.cpu_frame_us.load());
+  CHECK(bvh::g_pool.cpu_drain_us.load() == 0u && bvh::g_pool.cpu_capture_us.load() == 0u && bvh::g_pool.cpu_hook_us.load() == 0u
+            && bvh::g_deform_live.cpu_us.load() == 0u,
+        "the cumulative values restart at 0 after the sample");
+  const bool deform_was_on = bvh::g_deform_live.enabled.load();
+  bvh::g_deform_live.enabled.store(false);  // off: no deform resources are made by this check
+  bvh::g_deform_live.cpu_us.store(567u);
+  bvh::UpdateDeformLive(dev, queue);
+  bvh::g_deform_live.enabled.store(deform_was_on);
+  CHECK(bvh::g_deform_live.cpu_us.load() == 567u && bvh::g_deform_live.cpu_frame_us.load() == 400u,
+        "UpdateDeformLive leaves a fresh cumulative value alone (cpu_us %llu, frame %llu)",
+        (unsigned long long)bvh::g_deform_live.cpu_us.load(), (unsigned long long)bvh::g_deform_live.cpu_frame_us.load());
+  bvh::ClearPerfGathered(data);
+}
+
 // Gathering OFF gathers nothing: no tab sample, no sum, no stopwatch value, no frame value is exchanged. The switch's clear
 // zeroes what was gathered and the dump says perf_gather false. The same sequence with gathering ON does gather.
 static bool PerfSumsZero(bvh::BvhDeviceData* data) {
@@ -2952,11 +3307,16 @@ static void TestPerfGateOff(Device* dev, Queue* queue) {
   bvh::g_deform_live.cpu_frame_us.store(777u);
   const uint64_t builds_before = data->live.blas_builds;
   for (int i = 0; i < 4; ++i) {
-    RegionPresent(dev, queue);
+    falcom_world::g_state.frame.fetch_add(1u);
+    bvh::SamplePerfPresent(dev);
+    bvh::UpdateLiveBvh(dev, queue);
     bvh::UpdateCacheDiag(dev);
   }
   CHECK(data->live.blas_builds > builds_before, "event counts still advance while off (builds %llu)", (unsigned long long)data->live.blas_builds);
   CHECK(PerfSumsZero(data), "gathering off: no sum or last value is written");
+  for (size_t k = 0; k < bvh::kPerfBlockCount; ++k) {
+    CHECK(bvh::g_perf_gate.block_us[k].load() == 0u, "gathering off: block %zu adds nothing", k);
+  }
   CHECK(bvh::g_pool.cpu_hook_frame_us.load() == 777u && bvh::g_pool.cpu_drain_frame_us.load() == 777u
             && bvh::g_pool.cpu_capture_frame_us.load() == 777u && bvh::g_deform_live.cpu_frame_us.load() == 777u,
         "gathering off: frame values are not exchanged");
@@ -2970,6 +3330,7 @@ static void TestPerfGateOff(Device* dev, Queue* queue) {
   }
   CHECK(std::isnan(PerfTabNow().max.frame) && std::isnan(PerfTabNow().max.cpu) && std::isnan(PerfTabNow().max.row[bvh::kPerfTlasRebuild]),
         "gathering off: the tab maxima are --");
+  CHECK(!PerfTabNow().spike.valid, "gathering off: the tab has no spike");
   {
     std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
     CHECK(bvh::g_cache_diag.data.frame_intervals == 0u, "gathering off: no frame interval");
@@ -2979,13 +3340,18 @@ static void TestPerfGateOff(Device* dev, Queue* queue) {
   AddMesh(0x701u, BoxMesh(0.9f));
   AddInstance(0x701u, 130.f, 0.f, 130.f);
   for (int i = 0; i < 12; ++i) {  // a TLAS rebuild comes every kLiveTlasInterval (8) presents
-    RegionPresent(dev, queue);
+    falcom_world::g_state.frame.fetch_add(1u);
+    bvh::SamplePerfPresent(dev);
+    bvh::UpdateLiveBvh(dev, queue);
     bvh::UpdateCacheDiag(dev);
   }
   {
     std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
     CHECK(bvh::g_pool.tlas_timing.rebuild_ms_sum > 0.f && data->live.blas_build_ms_sum > 0.f && bvh::g_pool.tlas_timing.rebuild_phase_ms_sum[2] > 0.f,
           "gathering on: rebuild, BLAS and phase sums are written (%.4f, %.4f)", bvh::g_pool.tlas_timing.rebuild_ms_sum, data->live.blas_build_ms_sum);
+    CHECK(bvh::g_perf_gate.block_us[bvh::kPerfBlockPerfSample].load() > 0u && bvh::g_perf_gate.block_us[bvh::kPerfBlockCacheDiag].load() > 0u
+              && bvh::g_perf_gate.block_us[bvh::kPerfBlockRebuildCall].load() > 0u,
+          "gathering on: perf_sample, cache_diag and rebuild_call blocks are timed");
   }
   {
     std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
@@ -3002,6 +3368,26 @@ static void TestPerfGateOff(Device* dev, Queue* queue) {
   const std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
   CHECK(JsonError(text).empty(), "cache dump after off is valid JSON: %s", JsonError(text).c_str());
   CHECK(text.find("\"perf_gather\": false") != std::string::npos, "the dump after off says perf_gather false");
+  // A run aborted by switching OFF: five presents are in the series and the OFF present adds nothing to it or to the spike.
+  bvh::g_perf_gate.gather.store(true);
+  ResetPerfTab();
+  bvh::ResetCacheDiagCounters();
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{true, false, false, true};
+  bvh::RequestPerfRun("off");
+  bvh::UpdatePerfRun(data, 9000u, base, sw);
+  for (int i = 1; i <= 5; ++i) bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(i), base + std::chrono::milliseconds(16 * i), sw);
+  bvh::g_perf_gate.gather.store(false);
+  bvh::UpdatePerfRun(data, 9006u, base + std::chrono::milliseconds(16 * 6 + 500), sw);
+  const std::string off_run = ReadDumpText(WrittenPath(PerfResult()));
+  CHECK(JsonError(off_run).empty(), "aborted run file is valid JSON: %s", JsonError(off_run).c_str());
+  CHECK(off_run.find("\"status\": \"aborted\"") != std::string::npos && off_run.find("\"length\": 5,") != std::string::npos,
+        "switching off aborts the run with five presents in the series");
+  CHECK(ValueAt(off_run, "\"worst_present\": {", "\"index\"") < 5.0, "no spike from the OFF present");
   bvh::g_perf_gate.gather.store(true);
   ResetPerfTab();
   bvh::ResetCacheDiagCounters();
@@ -3051,8 +3437,9 @@ static void TestPerfJsonKeys(Device* dev) {
   bvh::PerfRunState empty;
   const std::string perf = ReadDumpText(bvh::WritePerfFile(empty));
   CHECK(JsonError(perf).empty(), "empty perf file is valid JSON: %s", JsonError(perf).c_str());
-  for (const char* key : {"\"max_per_present\"", "\"max_per_measured_frame\"", "\"p99\"", "\"hitches_over_25ms\"", "\"hitches_over_33_3ms\"",
-                          "\"series\"", "\"tlas_dynamic_instances\""}) {
+  for (const char* key : {"\"sample_alignment\"", "\"max_per_present\"", "\"max_per_measured_frame\"", "\"p99\"", "\"hitches_over_25ms\"", "\"hitches_over_33_3ms\"",
+                          "\"series\"", "\"tlas_dynamic_instances\"", "\"attribution\"", "\"presents_over_2ms\"", "\"threshold_ms\"", "\"schema\": 1",
+                          "\"worst_present\"", "\"worst_unattributed_present\"", "\"settings_cost\"", "\"inclusion_switches\"", "\"blocks_unit\""}) {
     CHECK(perf.find(key) != std::string::npos, "perf file has the key %s", key);
   }
   bvh::ResetCacheDiagCounters();
@@ -4141,6 +4528,17 @@ int main() {
   TestPerfJsonKeys(&dev);
   TestPerfTimerGate();
   TestPerfCaptureInDrain(&dev);
+  TestPerfSampleAlignment(&dev);
+  TestPerfFrameExchange(&dev, &queue);
+  TestPerfBlockGate();
+  TestPerfBlockSample(&dev);
+  TestPerfDisjointBlocks();
+  TestPerfBlockAttribution(&dev);
+  TestPerfWorstPresent(&dev);
+  TestPerfSpikeTab();
+  TestPerfSettingsCost(&dev);
+  TestPerfFoliageMotion();
+  TestPerfInclusionFlip(&dev);
   Stage("11e BVH range coverage");
   TestRegionCoverage(&dev, &queue);
   Stage("end checks");

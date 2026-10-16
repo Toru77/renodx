@@ -453,6 +453,7 @@ inline std::string BuildP2bDiagJson(const P2bDiagInput& in, std::string* verdict
 // a flagged draw and a trace stats readback, or kP2bDiagWaitFrames presents, then writes the diagnostics.
 inline void RunP2bDiagnostics(reshade::api::device* device, reshade::api::command_queue* queue) {
   if (device == nullptr || queue == nullptr || !g_p2b_diag.requested.load(std::memory_order_relaxed)) return;
+  const PoolCpuTimer diag_timer{&g_perf_gate.block_us[kPerfBlockP2bDiag]};
   const uint32_t frame = g_state.frame.load();
   const uint32_t armed = g_p2b_diag.armed_frame.load();
   BvhDeviceData* data = GetBvhDeviceData(device);
