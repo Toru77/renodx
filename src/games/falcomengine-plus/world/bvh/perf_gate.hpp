@@ -11,7 +11,7 @@
 namespace falcom_world::bvh {
 
 // Stopwatch blocks (the block rows of perf_run.hpp, same order). Blocks 0 to 11 run inside a present bracket and are disjoint
-// from each other and from the InPresent rows (they reduce the unattributed CPU). Blocks 12 to 19 are subsets of the rows
+// from each other and from the InPresent rows (they reduce the unattributed CPU). Blocks 12 and up are subsets of the rows
 // above (parts of a row or of a block, never summed).
 enum PerfBlock : size_t {
   kPerfBlockPerfSample,         // SamplePerfPresent (counted in the next sample)
@@ -34,6 +34,11 @@ enum PerfBlock : size_t {
   kPerfBlockDrainRetireOrphans, // RetirePoolOrphans
   kPerfBlockDrainPoolStats,     // UpdatePoolStats
   kPerfBlockFollowScan,         // the follow scan of FollowPoolMovingInstance (per moving sighting)
+  kPerfBlockCompactObservations,  // CompactPool: observations of invalidated keys
+  kPerfBlockCompactInstances,     // CompactPool: instance removal and admitted keys
+  kPerfBlockCompactRearm,         // CompactPool: re-arm of observations removed through another key
+  kPerfBlockOrphanScan,           // RetirePoolOrphans: candidate scan
+  kPerfBlockOrphanNewest,         // PoolNewestSeenByKey (RetirePoolOrphans)
   kPerfBlockCount
 };
 

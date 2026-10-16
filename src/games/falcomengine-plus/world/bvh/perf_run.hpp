@@ -80,7 +80,7 @@ enum PerfCost : size_t {
   kPerfSlackPhase1,
   kPerfSlackPhase2,
   kPerfSlackPhase3,
-  kPerfBlockRow,  // the block rows (PerfBlock order, perf_gate.hpp) follow: the first 12 are InPresent (disjoint), the other 8 Subset
+  kPerfBlockRow,  // the block rows (PerfBlock order, perf_gate.hpp) follow: the first 12 are InPresent (disjoint), the rest Subset
   kPerfCostCount = kPerfBlockRow + kPerfBlockCount
 };
 inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
@@ -140,6 +140,11 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"drain_retire_orphans", true, kPerfSubset, false, nullptr},
     {"drain_pool_stats", true, kPerfSubset, false, nullptr},
     {"follow_scan", true, kPerfSubset, false, nullptr},
+    {"compact_observations", true, kPerfSubset, false, nullptr},
+    {"compact_instances", true, kPerfSubset, false, nullptr},
+    {"compact_rearm", true, kPerfSubset, false, nullptr},
+    {"orphan_scan", true, kPerfSubset, false, nullptr},
+    {"orphan_newest", true, kPerfSubset, false, nullptr},
 };
 inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;

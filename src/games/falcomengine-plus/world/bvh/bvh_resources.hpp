@@ -216,6 +216,8 @@ struct LiveBvhStats {
   uint32_t refit_rest_fast = 0u;  // rest wind entries of the last refit: from rest_pose
   uint32_t refit_rest_slow = 0u;  // rest wind entries of the last refit: read from the pool
   uint32_t refit_failures = 0u;
+  uint32_t snapshot_reused = 0u;  // instances of the last rebuild snapshot whose visibility was carried over from the TLAS
+  uint32_t snapshot_fresh = 0u;   // ... and read from the pool
   // GPU contents check (on request; waits for the GPU).
   bool gpu_checked = false;
   bool gpu_ok = false;
@@ -255,6 +257,7 @@ struct LiveTlasInstance {
   float admit_camera[3] = {};
   bool admit_camera_valid = false;
   PoolCameraVisibility visibility;  // at the TLAS build (GetPoolCameraVisibility)
+  uint64_t observation_hash = 0u;  // MatrixHash of matrix: the key of its visibility_dirty bit (set on fresh builds, carried over with visibility)
 };
 
 // What the trace hit at one pixel (middle-click in a trace view), read back
@@ -381,6 +384,13 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   std::vector<BVHLeafGPU> tlas_leaves_cpu;
   std::vector<BVHNodeGPU> tlas_nodes_cpu;
   std::vector<uint32_t> tlas_leaf_of_instance;  // TLAS instance -> its leaf (sorted leaves)
+  // Session scratch for the next rebuild (capacity kept): the arrays it builds in are swapped in at install, so the replaced ones become these.
+  std::vector<WorldInstanceGPU> tlas_instances_spare;
+  std::vector<BVHLeafGPU> tlas_leaves_spare;
+  std::vector<BVHNodeGPU> tlas_nodes_spare;
+  std::vector<uint32_t> tlas_leaf_of_spare;
+  std::vector<uint32_t> tlas_active_spare;  // uploaded by copy, so not swapped
+  std::vector<BVHLeafGPU> tlas_sort_scratch;  // SortBvhLeaves radix buffer
   uint32_t tlas_dynamic_first = 0u;             // instances [first, end) are dynamic
   uint32_t tlas_refits_since_rebuild = 0u;
   uint32_t tlas_wind_count = 0u;                // swayed wind instances in the TLAS (refit every present while > 0)

@@ -86,7 +86,7 @@ inline BVHLeafGPU MakeLeaf(const float* bounds_min, const float* bounds_max, uin
 // Assigns Morton codes relative to the leaves' common bounds and sorts the
 // leaves by (code, prim). Prims are unique within a tree, so the order is
 // total and deterministic.
-inline void SortBvhLeaves(std::vector<BVHLeafGPU>* leaves) {
+inline void SortBvhLeaves(std::vector<BVHLeafGPU>* leaves, std::vector<BVHLeafGPU>* scratch = nullptr) {
   if (leaves->empty()) return;
   float bounds_min[3] = {1e30f, 1e30f, 1e30f};
   float bounds_max[3] = {-1e30f, -1e30f, -1e30f};
@@ -115,7 +115,23 @@ inline void SortBvhLeaves(std::vector<BVHLeafGPU>* leaves) {
         (cy - bounds_min[1]) / extent[1],
         (cz - bounds_min[2]) / extent[2]);
   }
-  // Sort 16-byte keys instead of 48-byte leaves, then gather.
+  bool prim_ascending = true;
+  for (size_t i = 1; i < leaves->size(); ++i) prim_ascending &= (*leaves)[i].prim > (*leaves)[i - 1].prim;
+  if (prim_ascending) {
+    // Stable LSD radix on the code: equal codes keep prim order, which is the (code, prim) order.
+    std::vector<BVHLeafGPU> local;
+    std::vector<BVHLeafGPU>& tmp = scratch != nullptr ? *scratch : local;
+    tmp.resize(leaves->size());
+    for (uint32_t shift = 0; shift < 32u; shift += 8u) {
+      uint32_t count[257] = {};
+      for (const BVHLeafGPU& leaf : *leaves) count[((leaf.code >> shift) & 0xFFu) + 1u] += 1u;
+      for (uint32_t b = 0; b < 256u; ++b) count[b + 1u] += count[b];
+      for (const BVHLeafGPU& leaf : *leaves) tmp[count[(leaf.code >> shift) & 0xFFu]++] = leaf;
+      leaves->swap(tmp);
+    }
+    return;
+  }
+  // Fallback when prims are not ascending: sort 16-byte keys instead of 48-byte leaves, then gather.
   struct Key {
     uint64_t order;
     uint32_t index;

@@ -80,6 +80,75 @@ static void World(const float t[3], float out[12]) {
   std::memcpy(out, m, sizeof(m));
 }
 
+// State golden of the pool (CompactPool, PrunePool): instances in order, admitted keys, observations, meshes, maps, counters.
+static void Golden(const char* label) {
+  std::lock_guard lock(bvh::g_pool.mutex);
+  const auto& p = bvh::g_pool;
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  for (const auto& inst : p.instances) { mix(inst.id); mix(inst.mesh_id); }
+  std::vector<uint64_t> keys(p.admitted_keys.begin(), p.admitted_keys.end());
+  std::sort(keys.begin(), keys.end());
+  for (uint64_t k : keys) mix(k);
+  std::map<std::pair<uint64_t, uint64_t>, uint32_t> observed;
+  for (const auto& [key, o] : p.observations) observed[{key.mesh_key, key.matrix_hash}] = (o.admitted ? 1u : 0u) | (o.merged_mesh_key != 0u ? 2u : 0u);
+  for (const auto& [key, flags] : observed) { mix(key.first); mix(key.second); mix(flags); }
+  for (const auto& mesh : p.meshes) { mix(mesh.uid); mix(mesh.mesh_id); mix(mesh.live_keys); }
+  const std::map<uint64_t, uint32_t> by_key(p.mesh_by_key.begin(), p.mesh_by_key.end());
+  const std::map<uint64_t, uint32_t> by_signature(p.mesh_by_signature.begin(), p.mesh_by_signature.end());
+  for (const auto& [key, id] : by_key) { mix(key); mix(id); }
+  for (const auto& [sig, id] : by_signature) { mix(sig); mix(id); }
+  std::vector<uint64_t> dynamic;
+  for (const auto& [key, entry] : p.dynamic_keys) dynamic.push_back(key);
+  std::sort(dynamic.begin(), dynamic.end());
+  for (uint64_t k : dynamic) mix(k);
+  mix(p.stats.meshes_retired);
+  mix(p.stats.instances_retired);
+  mix(p.stats.mass_retirements);
+  mix(p.map_change_frame);
+  mix(p.episode_serial);
+  std::printf("GOLDEN %s %016llx instances %zu meshes %zu\n", label, (unsigned long long)h, p.instances.size(), p.meshes.size());
+}
+
+// PrunePool at a fixed frame on seeded state: stale and fresh observations, schedules and mesh requests.
+static void PruneGolden() {
+  const uint32_t frame = 1000u;
+  std::lock_guard lock(bvh::g_pool.mutex);
+  auto& p = bvh::g_pool;
+  p.observations.clear();
+  p.schedule.clear();
+  p.dynamic_indirect.clear();
+  p.mesh_requests.clear();
+  p.mesh_queued.clear();
+  const uint32_t stale = frame - bvh::kPoolPruneAge - 1u;
+  const uint32_t fresh = frame - bvh::kPoolPruneAge + 1u;
+  struct Seed { uint64_t mesh_key; uint64_t matrix_hash; bool admitted; uint32_t last; };
+  for (const Seed& s : {Seed{1u, 1u, false, stale}, Seed{2u, 1u, false, fresh}, Seed{3u, 1u, true, stale}}) {
+    bvh::ObservedInstance& o = p.observations[bvh::InstanceKey{s.mesh_key, s.matrix_hash}];
+    o.admitted = s.admitted;
+    o.last_frame = s.last;
+  }
+  p.schedule[10u].next_frame = stale;
+  p.schedule[11u].next_frame = fresh;
+  p.dynamic_indirect[10u] = 77u;
+  p.mesh_requests[20u].last_frame = stale;
+  p.mesh_requests[20u].buffer_key = 5u;
+  p.mesh_requests[21u].last_frame = fresh;
+  p.mesh_queued.insert(20u);
+  p.mesh_queued.insert(21u);
+  bvh::PrunePool(frame);
+  uint64_t h = 1469598103934665603ull;
+  uint64_t acc = 0u;
+  for (const auto& [key, o] : p.observations) acc += (key.mesh_key * 1099511628211ull) ^ (key.matrix_hash + (o.admitted ? 1u : 0u));
+  for (const auto& [key, s] : p.schedule) acc += key * 31u + s.next_frame;
+  for (const auto& [key, v] : p.dynamic_indirect) acc += key * 37u + v;
+  for (const auto& [key, r] : p.mesh_requests) acc += key * 41u + r.last_frame;
+  for (uint64_t k : p.mesh_queued) acc += k * 43u;
+  h = (h ^ acc) * 1099511628211ull;
+  h = (h ^ p.stats.mesh_expired) * 1099511628211ull;
+  std::printf("GOLDEN prune %016llx observations %zu schedule %zu dynamic_indirect %zu mesh_requests %zu mesh_queued %zu\n", (unsigned long long)h, p.observations.size(), p.schedule.size(), p.dynamic_indirect.size(), p.mesh_requests.size(), p.mesh_queued.size());
+}
+
 int main() {
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   fixture::RegisterLayout();
@@ -224,6 +293,7 @@ int main() {
     CHECK(bvh::g_pool.instances.size() == 8, "instances unchanged %zu", bvh::g_pool.instances.size());
   }
 
+  Golden("admission");
   HStage("release and retire");
   // Releasing vb3 retires D's mesh and its three instances; vb1/vb2 remain.
   bvh::OnDestroyResourcePool(&dev, vb3);
@@ -252,6 +322,7 @@ int main() {
     CHECK(p.instances.size() == 1 && p.instances[0].matrix[3] == 30.f, "only C remains (%zu)", p.instances.size());
   }
 
+  Golden("release");
   HStage("reused VB handle");
   // A reused VB handle with new content starts from scratch.
   resource vb4;
@@ -272,6 +343,14 @@ int main() {
     }
   }
 
+  Golden("reuse");
+  HStage("no-op compaction");
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.invalidated_keys.insert(0x5E5Eu);  // a draw key with no instance and no mesh
+  }
+  run_frame(frame++, false);
+  Golden("no-op");
   HStage("map change retires stale static instances");
   // "S stale" is admitted, then no longer drawn; "C" and "J" keep being drawn.
   // Draws 30/90 are C/J: they are drawn every frame, so their copies cool down and must be released by the change.
@@ -307,8 +386,8 @@ int main() {
     schedules_before = bvh::g_pool.schedule.size();
     pre_release_serial = bvh::g_pool.episode_serial;
   }
-  // Pad so the sweep (change frame + settle) lands on a frame that is not a multiple of 60.
-  while ((falcom_world::g_state.frame.load() + 1u + bvh::kPoolMapSettleFrames) % 60u == 0u) run_frame(frame++, false);
+  // Pad so the sweep (change frame + settle) lands on a frame that is not a prune frame.
+  while ((falcom_world::g_state.frame.load() + 1u + bvh::kPoolMapSettleFrames) % 60u == bvh::kPoolPrunePhase) run_frame(frame++, false);
   for (resource& r : mass) bvh::OnDestroyResourcePool(&dev, r);
   objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const Object& o) { return o.name == std::string("M map"); }), objects.end());
   for (resource& r : mass) dev.destroy_resource(r);
@@ -359,7 +438,7 @@ int main() {
     auto& p = bvh::g_pool;
     std::printf("after settle: frame %u map_change_frame %u map_instances_retired %u meshes %zu instances %zu\n",
                 falcom_world::g_state.frame.load(), p.map_change_frame, p.stats.map_instances_retired, p.meshes.size(), p.instances.size());
-    CHECK(falcom_world::g_state.frame.load() % 60u != 0u, "sweep frame is not a prune frame (%u)", falcom_world::g_state.frame.load());
+    CHECK(falcom_world::g_state.frame.load() % 60u != bvh::kPoolPrunePhase, "sweep frame is not a prune frame (%u)", falcom_world::g_state.frame.load());
     CHECK(p.map_change_frame == 0u, "sweep done (%u)", p.map_change_frame);
     CHECK(p.stats.map_instances_retired == 2u, "stale and change-frame instances dropped (%u)", p.stats.map_instances_retired);
     CHECK(p.instances.size() == 2, "instances %zu", p.instances.size());
@@ -391,6 +470,7 @@ int main() {
     CHECK(readmitted, "stale object re-admitted");
   }
 
+  Golden("map change");
   HStage("map change sweep waits while BudgetFull skips change");
   // "S3 stale" is drawn for 40 frames, then no longer drawn; the next map change must drop it.
   resource vb_s3;
@@ -824,5 +904,49 @@ int main() {
   }
   bvh::OnDestroyDevicePool(&dev);
   std::printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAILED", g_failures);
+  Golden("end");
+  PruneGolden();
+
+  HStage("housekeeping schedule");
+  {
+    // PrunePool runs only at frame % 60 == kPoolPrunePhase (off the orphan grid, frame % 10 == 0).
+    bvh::g_pool.scan_active.store(true);
+    int prune_mismatch = 0;
+    int pruned_count = 0;
+    for (uint32_t f = 1200u; f < 1320u; ++f) {
+      const bvh::InstanceKey key{99u, f};
+      {
+        std::lock_guard lock(bvh::g_pool.mutex);
+        bvh::g_pool.observations[key].last_frame = 0u;  // stale: the next prune removes it
+      }
+      falcom_world::g_state.frame.store(f);
+      bvh::DrainPoolScan(&dev, &queue);
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const bool pruned = bvh::g_pool.observations.count(key) == 0u;
+      const bool on_phase = f % 60u == bvh::kPoolPrunePhase;
+      pruned_count += pruned ? 1 : 0;
+      prune_mismatch += pruned != on_phase ? 1 : 0;
+    }
+    CHECK(prune_mismatch == 0, "prune runs exactly at frame %% 60 == %u (%d mismatches)", bvh::kPoolPrunePhase, prune_mismatch);
+    CHECK(pruned_count == 2, "two prune frames in 120 presents (%d)", pruned_count);
+
+    // A TLAS rebuild in a present defers the orphan pass by at most kPoolOrphanDeferFrames presents, then it runs.
+    const auto present = [&](uint32_t f, bool rebuild) {
+      falcom_world::g_state.frame.store(f);
+      bvh::g_pool.rebuild_this_present.store(rebuild);
+      bvh::DrainPoolScan(&dev, &queue);
+      std::lock_guard lock(bvh::g_pool.mutex);
+      return bvh::g_pool.orphan_deferred;
+    };
+    CHECK(present(1300u, false) == 0u, "grid frame without a rebuild: the pass runs");
+    CHECK(present(1310u, true) == 1u, "grid frame with a rebuild: deferred (1)");
+    CHECK(present(1311u, true) == 2u, "deferred again (2)");
+    CHECK(present(1312u, true) == 3u, "deferred again (3)");
+    CHECK(present(1313u, true) == 0u, "after 3 deferred presents the pass runs");
+    CHECK(present(1314u, false) == 0u, "no rebuild: nothing pending");
+    CHECK(present(1315u, true) == 0u, "a rebuild off the grid defers nothing");
+    CHECK(present(1320u, true) == 1u, "grid frame 1320 with a rebuild: deferred (1)");
+    CHECK(present(1321u, false) == 0u, "the pending pass runs on the next present without a rebuild");
+  }
   return g_failures == 0 ? 0 : 1;
 }

@@ -170,12 +170,29 @@ Owner steps: as Phase 0 (Reset diag counters, play two map changes, walk away an
 - Harness: `TestWindRangeGolden` pins the default-range refit and `TestWindRangeGate` checks the 50 m, raised and 1043 m cases (test_live); the dump keys are checked in `TestWindIndirectDiag` (test_alpha).
 - Not validated in game: owner steps and dumps to send back are pending.
 
+## Rebuild diet (round B): implemented, not validated in game
+
+- The TLAS rebuild builds into session arrays that are swapped in at install (instances, leaves, nodes, leaf-of, active, sort scratch; `bvh_resources.hpp`). Leaf order is an LSD radix sort on the Morton code (`SortBvhLeaves`), exact against the old (code, prim) sort (`TestSortExact`).
+- Visibility carry-over in the rebuild snapshot: an entry keeps its visibility when its observation did not change (`PoolState::visibility_dirty`, `PoolVisibilityBit`). Dynamic and wind-key instances are always read; off with slack, before the first build and after a failed refit. Counters `snapshot_reused` and `snapshot_fresh` (cache JSON `live`); inspect draw counts and latest PS are as of the observation's last visibility change.
+- The two diagnostic no-op tests are one pass (`LiveSnapshotMatchesTlas`, optional full result).
+- Harness: `TestRebuildGolden` pin unchanged (`0x2c41a4dfd6f640d4`). Not validated in game.
+
 ## Refit diet, rest wind (refit-diet-A): implemented, not validated in game
 
 - The refit reads a wind rest-pose entry from its cached rest pose (`LiveWindRest`) while the pool and visibility revisions match the TLAS; any change reads the pool for every entry. Followed and non-wind dynamic entries read the pool as before.
 - Refit writes the CPU leaves and nodes in place; the GPU leaf buffer is no longer written (the trace reads only a leaf's slot). `CheckLiveBvhOnGpu` compares TLAS leaves by prim and validates the nodes against the CPU leaves.
 - Counters: `refit_rest_fast` and `refit_rest_slow` (last refit) in the cache JSON `live` block.
 - Harness: `TestRestWindGolden` (pin `0x427521e3761f0d08`), `TestRestWindFastSlowEqual`, `TestFollowedWindCrossing`, `TestRestWindLag`, `TestRemoveFarWind`, `TestRefitGpuLeaves`, `TestRestPromotion`, `TestRestSteadyReads`.
+
+## Housekeeping (round D): implemented, not validated in game
+
+- CompactPool fast path: meshes are renumbered and `mesh_by_key`/`mesh_by_signature` rebuilt only when a mesh retires. Instances with an invalidated key are removed in place; admitted keys are erased for them unless the set has to be rebuilt. Observation pass 1 runs only with invalidated keys, and the re-arm pass (3) runs only when instances were removed in the call or `rearm_pending` is set (`RemovePoolInstances` sets it on any removal).
+- Orphan pass: `PoolNewestSeenByKey` builds entries only for keys with a candidate instance (the diagnostic dump passes no filter).
+- Scheduling: PrunePool runs at frame % 60 == 5 (`kPoolPrunePhase`), off the orphan grid (frame % 10 == 0). The orphan pass waits at most 3 presents when `RebuildLiveTlas` ran in the same present (`rebuild_this_present`, `orphan_deferred`). The 600-frame summary keeps its own condition.
+- Subset blocks `compact_observations`, `compact_instances`, `compact_rearm`, `orphan_scan`, `orphan_newest` (perf file rows). No timing has been measured yet.
+- Harness: test_pool `Golden` checkpoints and `PruneGolden` are unchanged by the change; `TestHousekeepSchedule` (the housekeeping schedule stage of test_pool) checks the prune phase and the deferral. Not covered by the golden: follow re-key, alpha release, dynamic-flag release and a dedup re-arm after an orphan removal (planned, not added). A TLAS skip without a rebuild does not defer the orphan pass.
+- Pins unchanged: `TestOrphanGolden`, `TestCacheOnOff`, refit, `TestRebuildGolden`, wind range and rest wind.
+- Not validated in game.
 
 ## Current state (2026-10-09)
 

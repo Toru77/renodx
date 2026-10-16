@@ -68,6 +68,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -193,6 +194,10 @@ inline constexpr size_t kPoolMotionMaxMeshKeys = 4096u;
 inline constexpr float kPoolMovingMeters = 1e-5f;  // translation; also at least 4 ULP of the coordinate
 inline constexpr float kPoolMovingBasis = 1e-5f;   // basis element, times the largest basis element (>= 1)
 inline constexpr uint32_t kPoolMovingHoldFrames = 2u * kPoolRecaptureFrames;
+// PrunePool runs at frame % 60 == kPoolPrunePhase, off the orphan grid (frame % 10 == 0).
+inline constexpr uint32_t kPoolPrunePhase = 5u;
+// A TLAS rebuild in a present delays the orphan pass by at most this many presents.
+inline constexpr uint32_t kPoolOrphanDeferFrames = 3u;
 inline constexpr uint32_t kPoolHotHoldFrames = 300u;  // release hold for keys released or orphan-retired before (per-frame path kept through repeated operations)
 inline constexpr uint32_t kPoolGhostHoldFrames = 40u;  // one 30-frame sample interval plus margin, for the overlap rule only
 inline constexpr uint32_t kPoolFollowRelinkFrames = 8u;     // unseen frames a moving instance may be relinked across
@@ -1449,6 +1454,9 @@ struct PoolState {
   std::unordered_map<uint64_t, std::vector<uint64_t>> keys_by_resource;  // VB/IB handle -> draw keys
   std::unordered_set<uint64_t> invalidated_keys;  // pending observation cleanup
   bool retire_pending = false;
+  bool rearm_pending = false;  // instances were removed since CompactPool last re-armed the admitted observations
+  std::atomic_bool rebuild_this_present{false};  // RebuildLiveTlas ran in this present (DrainPoolScan consumes it)
+  uint32_t orphan_deferred = 0u;  // presents the orphan pass has waited for a TLAS rebuild (at most kPoolOrphanDeferFrames)
   uint32_t map_change_frame = 0u;  // frame of the last mass retire awaiting its sweep; 0 = none
   // Episode of the instance set (cache diagnostics): bumped by a map change and by a pool reset.
   uint32_t episode_serial = 0u;
@@ -1477,6 +1485,8 @@ struct PoolState {
   uint64_t no_mesh_keys_dropped = 0u;                        // no-mesh sightings of keys past the cap
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;  // bumped when an admitted instance's camera visibility changes
+  // Observations (PoolVisibilityBit) whose view or inputs changed since the last TLAS snapshot: their visibility is not carried over.
+  std::bitset<65536> visibility_dirty;
   uint32_t revision_sources_pending = 0u;  // bit per PoolRevisionSource bumped since the last TLAS rebuild
   PoolStats stats;
   PoolTlasTiming tlas_timing;
@@ -1871,12 +1881,14 @@ struct PoolKeySeen {
   std::vector<PoolPose> poses;
 };
 
-// Caller holds g_pool.mutex. seen[i] is PoolInstanceLastSeen of instance i.
-inline std::unordered_map<uint64_t, PoolKeySeen> PoolNewestSeenByKey(const std::vector<uint32_t>& seen) {
+// Caller holds g_pool.mutex. seen[i] is PoolInstanceLastSeen of instance i. Entries only for the keys in `only` (all keys when null).
+inline std::unordered_map<uint64_t, PoolKeySeen> PoolNewestSeenByKey(const std::vector<uint32_t>& seen,
+                                                                     const std::unordered_set<uint64_t>* only = nullptr) {
   std::unordered_map<uint64_t, PoolKeySeen> newest;
   newest.reserve(g_pool.meshes.size());
   for (size_t i = 0; i < g_pool.instances.size(); ++i) {
     const WorldInstance& instance = g_pool.instances[i];
+    if (only != nullptr && only->count(instance.mesh_key) == 0u) continue;
     const auto [it, inserted] = newest.try_emplace(instance.mesh_key);
     PoolKeySeen& key = it->second;
     if (inserted) key.wind = g_pool.wind_keys.count(instance.mesh_key) != 0u;
@@ -1951,7 +1963,10 @@ inline uint32_t RemovePoolInstances(Remove remove) {
     write += 1u;
   }
   g_pool.instances.resize(write);
-  if (removed != 0u) BumpPoolRevision(PoolRevisionSource::Retire);
+  if (removed != 0u) {
+    g_pool.rearm_pending = true;
+    BumpPoolRevision(PoolRevisionSource::Retire);
+  }
   return removed;
 }
 
@@ -1959,18 +1974,25 @@ inline uint32_t RemovePoolInstances(Remove remove) {
 // longer counts as admitted, and the instance is removed. No graphics calls.
 inline void RetirePoolOrphans(uint32_t frame, std::vector<std::string>* lines) {
   std::vector<uint32_t>& seen = g_pool.orphan_seen;
-  seen.resize(g_pool.instances.size());
-  bool candidate = false;
-  for (size_t i = 0; i < g_pool.instances.size(); ++i) {
-    const WorldInstance& instance = g_pool.instances[i];
-    seen[i] = PoolInstanceLastSeen(instance);
-    candidate = candidate || frame > seen[i] + PoolOrphanHoldFrames(instance);
+  std::unordered_set<uint64_t> candidate_keys;  // keys with an instance that may be an orphan (only they need newest entries)
+  {
+    const PoolCpuTimer scan_timer{&g_perf_gate.block_us[kPerfBlockOrphanScan]};
+    seen.resize(g_pool.instances.size());
+    for (size_t i = 0; i < g_pool.instances.size(); ++i) {
+      const WorldInstance& instance = g_pool.instances[i];
+      seen[i] = PoolInstanceLastSeen(instance);
+      if (frame > seen[i] + PoolOrphanHoldFrames(instance)) candidate_keys.insert(instance.mesh_key);
+    }
   }
-  if (!candidate) {
+  if (candidate_keys.empty()) {
     g_pool.stats.orphans = 0u;
     return;
   }
-  const auto newest = PoolNewestSeenByKey(seen);
+  std::unordered_map<uint64_t, PoolKeySeen> newest;
+  {
+    const PoolCpuTimer newest_timer{&g_perf_gate.block_us[kPerfBlockOrphanNewest]};
+    newest = PoolNewestSeenByKey(seen, &candidate_keys);
+  }
   size_t index = 0u;
   uint64_t first_key = 0u;
   uint32_t first_unseen = 0u;
@@ -2397,13 +2419,28 @@ inline void NotePoolVisibilityChange() {
   g_pool.stats.visibility_changes += 1u;
 }
 
+// The visibility_dirty bit of an observation (writer: NotePoolSightingTracked, reader: the TLAS snapshot). Bits may collide; a
+// collision only costs a fresh read. High bits of a multiply, because the low 16 bits of an FNV hash ignore the high mantissa bits of round-valued floats.
+inline size_t PoolVisibilityBit(uint64_t mesh_key, uint64_t matrix_hash) {
+  return static_cast<size_t>(((mesh_key * 1099511628211ull ^ matrix_hash) * 0x9E3779B97F4A7C15ull) >> 48);
+}
+
 // Caller holds g_pool.mutex. NotePoolSighting, plus a visibility change when
-// it alters what an admitted instance's TLAS entry would get.
-inline void NotePoolSightingTracked(ObservedInstance& observed, const PoolSighting& sighting, const PoolVisibility* visibility,
-                                    uint32_t frame) {
+// it alters what an admitted instance's TLAS entry would get, and the dirty
+// bit of the observation when its view or its inputs change.
+inline void NotePoolSightingTracked(ObservedInstance& observed, const InstanceKey& key, const PoolSighting& sighting,
+                                    const PoolVisibility* visibility, uint32_t frame) {
   const PoolViewDecision before = PoolObservationView(observed);
+  const PoolVisibility camera_before = observed.camera_visibility;
+  const PoolVisibility light_before = observed.light_visibility;
   NotePoolSighting(observed, sighting, visibility, frame);
-  if (observed.admitted && !SamePoolView(before, PoolObservationView(observed))) NotePoolVisibilityChange();
+  if (!observed.admitted) return;
+  const bool view_changed = !SamePoolView(before, PoolObservationView(observed));
+  if (view_changed) NotePoolVisibilityChange();
+  if (view_changed || std::memcmp(&camera_before, &observed.camera_visibility, sizeof(PoolVisibility)) != 0
+      || std::memcmp(&light_before, &observed.light_visibility, sizeof(PoolVisibility)) != 0) {
+    g_pool.visibility_dirty.set(PoolVisibilityBit(key.mesh_key, key.matrix_hash));
+  }
 }
 
 // Caller holds g_pool.mutex. The view one sampled draw of a mesh ran in
@@ -2430,10 +2467,12 @@ inline void ObservePoolInstance(uint64_t mesh_key, uint32_t vs_hash, const float
   ObservedInstance& observed = g_pool.observations[key];
   if (observed.rejected) return;
   if (sighting != nullptr) {
-    NotePoolSightingTracked(observed, *sighting, visibility, frame);
+    NotePoolSightingTracked(observed, key, *sighting, visibility, frame);
     if (observed.merged_mesh_key != 0u) {
       const auto merged = g_pool.observations.find(InstanceKey{observed.merged_mesh_key, key.matrix_hash});
-      if (merged != g_pool.observations.end()) NotePoolSightingTracked(merged->second, *sighting, visibility, frame);
+      if (merged != g_pool.observations.end()) {
+        NotePoolSightingTracked(merged->second, InstanceKey{observed.merged_mesh_key, key.matrix_hash}, *sighting, visibility, frame);
+      }
     }
   }
   if (observed.admitted) {
@@ -4604,30 +4643,39 @@ inline void CompactPool() {
   if (g_pool.invalidated_keys.empty() && !g_pool.retire_pending) return;
   const std::unordered_set<uint64_t>& invalidated = g_pool.invalidated_keys;
 
-  for (auto it = g_pool.observations.begin(); it != g_pool.observations.end();) {
-    if (invalidated.count(it->first.mesh_key) != 0u) {
-      it = g_pool.observations.erase(it);
-    } else {
-      ++it;
+  if (!invalidated.empty()) {
+    const PoolCpuTimer observations_timer{&g_perf_gate.block_us[kPerfBlockCompactObservations]};
+    for (auto it = g_pool.observations.begin(); it != g_pool.observations.end();) {
+      if (invalidated.count(it->first.mesh_key) != 0u) {
+        it = g_pool.observations.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 
-  std::vector<uint32_t> remap(g_pool.meshes.size(), UINT32_MAX);
-  std::vector<WorldMesh> meshes;
-  meshes.reserve(g_pool.meshes.size());
+  // Mesh ids change only when a mesh retires; then instances and mesh_by_key are remapped too.
+  bool any_retired = false;
+  for (const WorldMesh& mesh : g_pool.meshes) any_retired = any_retired || mesh.live_keys == 0u;
+  std::vector<uint32_t> remap;
   uint32_t retired_now = 0u;
-  for (auto& mesh : g_pool.meshes) {
-    if (mesh.live_keys == 0u) {
-      g_pool.stats.meshes_retired += 1u;
-      retired_now += 1u;
-      g_pool.resight.Retire(mesh, g_state.frame.load());
-      continue;
+  if (any_retired) {
+    remap.assign(g_pool.meshes.size(), UINT32_MAX);
+    std::vector<WorldMesh> meshes;
+    meshes.reserve(g_pool.meshes.size());
+    for (auto& mesh : g_pool.meshes) {
+      if (mesh.live_keys == 0u) {
+        g_pool.stats.meshes_retired += 1u;
+        retired_now += 1u;
+        g_pool.resight.Retire(mesh, g_state.frame.load());
+        continue;
+      }
+      remap[mesh.mesh_id] = static_cast<uint32_t>(meshes.size());
+      mesh.mesh_id = static_cast<uint32_t>(meshes.size());
+      meshes.push_back(std::move(mesh));
     }
-    remap[mesh.mesh_id] = static_cast<uint32_t>(meshes.size());
-    mesh.mesh_id = static_cast<uint32_t>(meshes.size());
-    meshes.push_back(std::move(mesh));
+    g_pool.meshes = std::move(meshes);
   }
-  g_pool.meshes = std::move(meshes);
   const uint32_t frame = g_state.frame.load();
   if (retired_now >= kPoolMassRetireMeshes) {
     g_pool.stats.mass_retirements += 1u;
@@ -4643,36 +4691,52 @@ inline void CompactPool() {
     for (auto& [key, schedule] : g_pool.schedule) schedule.next_frame = frame + 1u;
   }
 
-  std::vector<WorldInstance> instances;
-  instances.reserve(g_pool.instances.size());
-  g_pool.admitted_keys.clear();
-  for (auto& instance : g_pool.instances) {
-    const uint32_t mesh_id = instance.mesh_id < remap.size() ? remap[instance.mesh_id] : UINT32_MAX;
-    if (mesh_id == UINT32_MAX || invalidated.count(instance.mesh_key) != 0u) {
-      g_pool.stats.instances_retired += 1u;
-      continue;
+  // Admitted keys are rebuilt when mesh ids changed or do not match the instances; otherwise the removed
+  // instances' keys are erased in place (their mesh ids did not change).
+  uint32_t removed = 0u;
+  {
+    const PoolCpuTimer instances_timer{&g_perf_gate.block_us[kPerfBlockCompactInstances]};
+    const bool rebuild_keys = any_retired || g_pool.admitted_keys.size() != g_pool.instances.size();
+    if (rebuild_keys) g_pool.admitted_keys.clear();
+    size_t write = 0u;
+    for (size_t read = 0u; read < g_pool.instances.size(); ++read) {
+      WorldInstance& instance = g_pool.instances[read];
+      uint32_t mesh_id = instance.mesh_id;
+      if (any_retired) mesh_id = mesh_id < remap.size() ? remap[mesh_id] : UINT32_MAX;
+      if (mesh_id == UINT32_MAX || invalidated.count(instance.mesh_key) != 0u) {
+        g_pool.stats.instances_retired += 1u;
+        removed += 1u;
+        if (!rebuild_keys) g_pool.admitted_keys.erase(PoolAdmittedKey(instance.mesh_id, MatrixHash(instance.matrix, kPoolWorldFloats)));
+        continue;
+      }
+      instance.mesh_id = mesh_id;
+      if (rebuild_keys) g_pool.admitted_keys.insert(PoolAdmittedKey(mesh_id, MatrixHash(instance.matrix, kPoolWorldFloats)));
+      if (write != read) g_pool.instances[write] = std::move(instance);
+      write += 1u;
     }
-    instance.mesh_id = mesh_id;
-    g_pool.admitted_keys.insert(PoolAdmittedKey(mesh_id, MatrixHash(instance.matrix, kPoolWorldFloats)));
-    instances.push_back(instance);
+    g_pool.instances.resize(write);
   }
-  g_pool.instances = std::move(instances);
 
-  for (auto& [key, mesh_id] : g_pool.mesh_by_key) {
-    (void)key;
-    mesh_id = remap[mesh_id];
+  if (any_retired) {
+    for (auto& [key, mesh_id] : g_pool.mesh_by_key) {
+      (void)key;
+      mesh_id = remap[mesh_id];
+    }
+    g_pool.mesh_by_signature.clear();
+    for (const auto& mesh : g_pool.meshes) g_pool.mesh_by_signature.emplace(mesh.signature, mesh.mesh_id);
   }
-  g_pool.mesh_by_signature.clear();
-  for (const auto& mesh : g_pool.meshes) g_pool.mesh_by_signature.emplace(mesh.signature, mesh.mesh_id);
 
-  for (auto& [key, observed] : g_pool.observations) {
-    if (!observed.admitted) continue;
-    const auto mesh_it = g_pool.mesh_by_key.find(key.mesh_key);
-    if (mesh_it == g_pool.mesh_by_key.end()
-        || g_pool.admitted_keys.count(PoolAdmittedKey(mesh_it->second, MatrixHash(observed.matrix, kPoolWorldFloats))) == 0u) {
-      observed.admitted = false;
+  if (removed != 0u || g_pool.rearm_pending) {
+    const PoolCpuTimer rearm_timer{&g_perf_gate.block_us[kPerfBlockCompactRearm]};
+    for (auto& [key, observed] : g_pool.observations) {
+      if (!observed.admitted) continue;
+      const auto mesh_it = g_pool.mesh_by_key.find(key.mesh_key);
+      if (mesh_it == g_pool.mesh_by_key.end() || g_pool.admitted_keys.count(PoolAdmittedKey(mesh_it->second, key.matrix_hash)) == 0u) {
+        observed.admitted = false;
+      }
     }
   }
+  g_pool.rearm_pending = false;
 
   for (const uint64_t key : invalidated) g_pool.dynamic_keys.erase(key);
   // An alpha mesh keeps its flag and conflict only while an alpha key still maps to it.
@@ -5817,8 +5881,8 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
   std::vector<std::string> failure_lines;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
-    if ((frame % 60u) == 0u) {
-      {
+    if ((frame % 60u) == kPoolPrunePhase || (frame % 600u) == 0u) {
+      if ((frame % 60u) == kPoolPrunePhase) {
         const PoolCpuTimer prune_timer{&g_perf_gate.block_us[kPerfBlockDrainPrune]};
         PrunePool(frame);
       }
@@ -5839,10 +5903,18 @@ inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_qu
             s.follow_admits, "; map failures ", s.map_failures, " staging failures ", s.staging_failures);
       }
     }
-    if ((frame % 10u) == 0u && g_pool.scan_continuous && frame >= g_pool.scan_since + kPoolMovingHoldFrames) {
-      const PoolCpuTimer retire_timer{&g_perf_gate.block_us[kPerfBlockDrainRetireOrphans]};
-      RetirePoolOrphans(frame, &failure_lines);
+    if (g_pool.scan_continuous && frame >= g_pool.scan_since + kPoolMovingHoldFrames
+        && ((frame % 10u) == 0u || g_pool.orphan_deferred != 0u)) {
+      // A TLAS rebuild in this present defers the pass by up to kPoolOrphanDeferFrames presents.
+      if (g_pool.rebuild_this_present.load(std::memory_order_relaxed) && g_pool.orphan_deferred < kPoolOrphanDeferFrames) {
+        g_pool.orphan_deferred += 1u;
+      } else {
+        g_pool.orphan_deferred = 0u;
+        const PoolCpuTimer retire_timer{&g_perf_gate.block_us[kPerfBlockDrainRetireOrphans]};
+        RetirePoolOrphans(frame, &failure_lines);
+      }
     }
+    g_pool.rebuild_this_present.store(false, std::memory_order_relaxed);
     failure_lines.insert(failure_lines.end(), g_pool.pending_lines.begin(), g_pool.pending_lines.end());
     g_pool.pending_lines.clear();
     g_pool.stats.dynamic_draws = g_pool.dynamic_draws.size();

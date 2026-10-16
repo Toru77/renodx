@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -1663,6 +1664,9 @@ static void TestPerfWindow(Device* dev) {
   for (const std::string& path : {path_off, path_on}) {
     const std::string text = ReadDumpText(path);
     CHECK(JsonError(text).empty(), "perf file is valid JSON: %s", JsonError(text).c_str());
+    for (const char* row : {"\"compact_observations\"", "\"compact_instances\"", "\"compact_rearm\"", "\"orphan_scan\"", "\"orphan_newest\""}) {
+      CHECK(text.find(row) != std::string::npos, "perf file has the subset row %s", row);
+    }
     CHECK(text.find("\"status\": \"complete\"") != std::string::npos, "perf file status complete");
     CHECK(text.find("\"frame_time\": {\"avg\": {\"value\": 16,") != std::string::npos, "frame time average is 16 ms");
     CHECK(text.find("\"actual_s\": {\"value\": 30,") != std::string::npos && text.find("\"presents\": {\"value\": 1875,") != std::string::npos,
@@ -2118,7 +2122,9 @@ static void TestLiveSnapshotMatches() {
   data.tlas_instances_cpu = gpu;
   data.tlas_info = info;
   const auto matches = [&data](const std::vector<bvh::WorldInstanceGPU>& g, const std::vector<bvh::LiveTlasInstance>& i, bool dynamic_poses) {
-    return bvh::LiveSnapshotMatchesTlas(data, g, i, dynamic_poses);
+    bool full = false;
+    const bool static_match = bvh::LiveSnapshotMatchesTlas(data, g, i, &full);
+    return dynamic_poses ? full : static_match;
   };
   CHECK(matches(gpu, info, true) && matches(gpu, info, false), "identical snapshot matches");
   std::vector<bvh::WorldInstanceGPU> moved = gpu;
@@ -2447,6 +2453,80 @@ static uint64_t RefitStateHash(bvh::BvhDeviceData* data, uint64_t h) {
   HashBytes(&h, &failed, sizeof failed);
   HashBytes(&h, s.last_failure.data(), s.last_failure.size());
   return h;
+}
+
+// Copy of the HEAD SortBvhLeaves (Morton codes, then std::sort on (code, prim) keys): the reference for TestSortExact.
+static void HeadSortLeaves(std::vector<bvh::BVHLeafGPU>* leaves) {
+  if (leaves->empty()) return;
+  float bounds_min[3] = {1e30f, 1e30f, 1e30f};
+  float bounds_max[3] = {-1e30f, -1e30f, -1e30f};
+  for (const bvh::BVHLeafGPU& leaf : *leaves) {
+    for (int k = 0; k < 3; ++k) {
+      bounds_min[k] = (std::min)(bounds_min[k], leaf.bounds_min[k]);
+      bounds_max[k] = (std::max)(bounds_max[k], leaf.bounds_max[k]);
+    }
+  }
+  for (int k = 0; k < 3; ++k) {
+    if (!(bounds_max[k] > bounds_min[k])) {
+      bounds_min[k] -= 1e-3f;
+      bounds_max[k] += 1e-3f;
+    }
+  }
+  const float extent[3] = {
+      bounds_max[0] - bounds_min[0],
+      bounds_max[1] - bounds_min[1],
+      bounds_max[2] - bounds_min[2]};
+  for (bvh::BVHLeafGPU& leaf : *leaves) {
+    const float cx = (leaf.bounds_min[0] + leaf.bounds_max[0]) * 0.5f;
+    const float cy = (leaf.bounds_min[1] + leaf.bounds_max[1]) * 0.5f;
+    const float cz = (leaf.bounds_min[2] + leaf.bounds_max[2]) * 0.5f;
+    leaf.code = bvh::Morton3D(
+        (cx - bounds_min[0]) / extent[0],
+        (cy - bounds_min[1]) / extent[1],
+        (cz - bounds_min[2]) / extent[2]);
+  }
+  // Sort 16-byte keys instead of 48-byte leaves, then gather.
+  struct Key {
+    uint64_t order;
+    uint32_t index;
+  };
+  std::vector<Key> keys(leaves->size());
+  for (uint32_t i = 0; i < keys.size(); ++i) {
+    keys[i].order = (static_cast<uint64_t>((*leaves)[i].code) << 32u) | (*leaves)[i].prim;
+    keys[i].index = i;
+  }
+  std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.order < b.order; });
+  std::vector<bvh::BVHLeafGPU> sorted(leaves->size());
+  for (size_t i = 0; i < keys.size(); ++i) sorted[i] = (*leaves)[keys[i].index];
+  leaves->swap(sorted);
+}
+
+static void TestSortExact() {
+  std::mt19937 rng(7u);
+  const size_t sizes[5] = {0, 1, 2, 5, 25000};
+  int cases = 0;
+  for (int variant = 0; variant < 4; ++variant) {
+    for (size_t n : sizes) {
+      std::vector<bvh::BVHLeafGPU> input(n);
+      std::vector<uint32_t> prims(n);
+      for (uint32_t i = 0; i < n; ++i) prims[i] = i;
+      if (variant == 2) std::shuffle(prims.begin(), prims.end(), rng);  // non-ascending prims: fallback path
+      for (size_t i = 0; i < n; ++i) {
+        const float c = (variant == 1) ? static_cast<float>(i % 7u) : (variant == 3) ? 0.5f : static_cast<float>(rng() % 1000u) * 0.01f;
+        const float lo[3] = {c, c * 0.5f, -c};
+        const float hi[3] = {c + 0.3f, c * 0.5f + 0.2f, -c + 0.1f};
+        input[i] = bvh::MakeLeaf(lo, hi, prims[i]);
+      }
+      std::vector<bvh::BVHLeafGPU> head = input;
+      std::vector<bvh::BVHLeafGPU> fresh = input;
+      HeadSortLeaves(&head);
+      bvh::SortBvhLeaves(&fresh);
+      CHECK(head.size() == fresh.size() && (n == 0 || std::memcmp(head.data(), fresh.data(), n * sizeof(bvh::BVHLeafGPU)) == 0),
+            "sort variant %d size %zu equals HEAD bytewise", variant, n);
+      ++cases;
+    }
+  }
+  std::printf("TestSortExact: %d cases\n", cases);
 }
 
 static void TestRefitGolden() {
@@ -3245,6 +3325,225 @@ static void MoveStaticInstances(uint64_t key, float dx) {
     bvh::g_pool.admitted_keys.insert(bvh::PoolAdmittedKey(inst.mesh_id, falcom_world::MatrixHash(inst.matrix, 12)));
   }
   bvh::g_pool.revision += 1u;
+}
+
+// Pin of the rebuild path: a scripted scenario, with a forced rebuild after each step. Hashed after every rebuild.
+// Pinned from HEAD behaviour; not re-pinned.
+static uint64_t RebuildStateHash(bvh::BvhDeviceData* data, uint64_t h) {
+  h = RefitStateHash(data, h);
+  for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+    HashBytes(&h, &t.alpha, sizeof t.alpha);
+    HashBytes(&h, &t.material, sizeof t.material);
+    HashBytes(&h, &t.dynamic, sizeof t.dynamic);
+    HashBytes(&h, &t.wind, sizeof t.wind);
+    HashBytes(&h, &t.source, sizeof t.source);
+    HashBytes(&h, t.inverse_world, sizeof t.inverse_world);
+    HashBytes(&h, &t.visibility.camera_seen, sizeof t.visibility.camera_seen);
+    HashBytes(&h, &t.visibility.light_seen, sizeof t.visibility.light_seen);
+    HashBytes(&h, &t.visibility.near_fade, sizeof t.visibility.near_fade);
+  }
+  HashBytes(&h, &data->tlas_dynamic_first, sizeof data->tlas_dynamic_first);
+  const bvh::LiveBvhStats& s = data->live;
+  const uint32_t counters[] = {s.tlas_waiting, s.tlas_unusable, s.tlas_alpha_instances, s.tlas_alpha_waiting, s.tlas_near_fade,
+                               s.tlas_camera_hidden, s.refit_rest_fast, s.refit_rest_slow, bvh::g_pool.stats.wind_sway_instances};
+  HashBytes(&h, counters, sizeof counters);
+  return h;
+}
+
+static void TestRebuildGolden() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  bvh::g_live_bvh.skip_noop.store(false);  // every forced rebuild is built, none skipped as a no-op
+  const uint64_t kA = 0xF1u, kS = 0xF2u, kW = 0xF3u, kR = 0xF4u;
+  AddMesh(kA, BoxMesh(0.8f));
+  AddMesh(kS, BoxMesh(0.5f));
+  AddMesh(kW, Grid(5, 5, 2.f, 0.4f));
+  AddMesh(kR, BoxMesh(1.1f));
+  for (int i = 0; i < 6; ++i) {
+    AddInstance(kA, 2.f * static_cast<float>(i), 0.f, 12.f);
+    AddInstance(kS, 2.f * static_cast<float>(i) + 1.f, 0.f, 20.f);
+    AddInstance(kW, 2.f * static_cast<float>(i), 0.f, 30.f);
+    AddInstance(kR, 2.f * static_cast<float>(i), 0.f, 40.f);
+  }
+  uint64_t g = 14695981039346656037ull;
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  const auto ids_of = [](uint64_t key) {
+    std::vector<uint64_t> ids;
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == key) ids.push_back(inst.id);
+    }
+    return ids;
+  };
+  const auto rebuild = [&](const char* step) {  // the next TLAS update is a full rebuild ("refit failed"), no change needed
+    const uint32_t before = data->live.tlas_rebuilds;
+    data->tlas_refit_failed = true;
+    rig.present();
+    CHECK(data->live.tlas_rebuilds == before + 1u, "step %s: forced rebuild (reason %s)", step, data->live.tlas_reason);
+    g = RebuildStateHash(data, g);
+    std::printf("rebuild golden %s: %016llx\n", step, (unsigned long long)g);
+  };
+  const auto refit = [&](int presents) {
+    for (int i = 0; i < presents; ++i) rig.present();
+  };
+
+  rig.present();
+  rebuild("admits");
+
+  RetireMesh(kR);
+  refit(2);
+  rebuild("retire and compact");
+
+  const std::vector<uint64_t> a_ids = ids_of(kA);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    const bvh::WorldInstance* inst = PoolInstance(a_ids[0]);
+    const auto observed = bvh::g_pool.observations.find(bvh::InstanceKey{inst->mesh_key, falcom_world::MatrixHash(inst->matrix, 12)});
+    observed->second.light_frames = observed->second.light_frames == 0u ? 1u : 0u;
+    bvh::NotePoolVisibilityChange();
+    FlipCameraSighting(a_ids[1]);
+  }
+  refit(2);
+  rebuild("camera and light visibility flips");
+
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    const bvh::WorldInstance* inst = PoolInstance(a_ids[2]);
+    const auto observed = bvh::g_pool.observations.find(bvh::InstanceKey{inst->mesh_key, falcom_world::MatrixHash(inst->matrix, 12)});
+    observed->second.camera_visibility.valid = true;
+    observed->second.camera_visibility.color[0] = 0.25f;
+    bvh::NotePoolVisibilityChange();
+  }
+  refit(2);
+  rebuild("color-only input change");
+
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::MarkPoolMeshAlpha(bvh::g_pool.mesh_by_key.at(kA), bvh::g_pool.alpha_keys[kA]);
+    bvh::g_pool.dynamic_flag_revision += 1u;
+  }
+  refit(2);
+  rebuild("alpha flag flip");
+
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.wind_keys.insert(kW);
+    bvh::g_pool.wind_sway[kW] = RestWindSway(0);
+  }
+  refit(3);
+  rebuild("wind key and sway added");
+
+  const std::vector<uint64_t> s_ids = ids_of(kS);
+  MoveRefitInstance(s_ids[0], 1.f, 20.f, frame());
+  refit(3);
+  rebuild("follow promotion");
+
+  SetCamera(40.f, 5.f, 40.f);
+  refit(2);
+  rebuild("camera move changes the region");
+
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.alpha_wind_sway.store(false);
+  }
+  refit(3);
+  rebuild("sway switch off");
+  bvh::g_pool.alpha_wind_sway.store(true);
+  refit(3);
+  rebuild("sway switch on");
+
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.id == s_ids[0]) inst.bounds_min[0] = std::nanf("");
+    }
+    bvh::g_pool.dynamic_revision += 1u;
+  }
+  refit(1);
+  CHECK(data->tlas_refit_failed && data->live.refit_failures == 1u, "refit failure recorded (failures %u)", data->live.refit_failures);
+  MoveRefitInstance(s_ids[0], 1.f, 20.f, frame());
+  rebuild("failed refit");
+
+  MoveStaticInstances(kS, 0.5f);
+  rebuild("static pose edit");
+
+  CHECK(g == 0x2c41a4dfd6f640d4ull, "rebuild golden equals HEAD pin (%016llx)", (unsigned long long)g);
+}
+
+// B3 carry-over: an organic rebuild keeps the visibility of the TLAS entries whose observation did not change and
+// reads the touched ones from the pool. The changes go through ObservePoolInstance, as the draws make them.
+static void TestVisibilityCarry() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  bvh::g_live_bvh.skip_noop.store(false);  // every organic rebuild is built
+  const uint64_t kA = 0x81u, kB = 0x82u;
+  for (int i = 0; i < 4; ++i) {
+    AddInstance(kA, 2.f * static_cast<float>(i), 0.f, 20.f);
+    AddInstance(kB, 2.f * static_cast<float>(i), 0.f, 30.f);
+  }
+  std::vector<uint64_t> ids;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) ids.push_back(inst.id);
+  }
+  const uint64_t a = ids[0], b = ids[1], c = ids[2];
+  const auto observe = [](uint64_t id, const bvh::PoolSighting& sighting, const bvh::PoolVisibility* vis) {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.id == id) bvh::ObservePoolInstance(inst.mesh_key, 0x1000u, inst.matrix, g_obs_frame++, &sighting, vis);
+    }
+  };
+  const bvh::PoolSighting camera{static_cast<uint8_t>(bvh::kPoolPassCamera | bvh::kPoolPassVisibility), 0x5150u};
+  const bvh::PoolSighting none{0u, 0u};
+  bvh::PoolVisibility vis;
+  vis.valid = true;
+  vis.color[0] = 0.5f;
+  vis.color[3] = 1.f;
+  observe(b, camera, &vis);  // b has a camera view before the first build
+  for (int i = 0; i < 3 && data->live.tlas_rebuilds == 0u; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == 1u && data->tlas_built, "first TLAS before the carry test (%u rebuilds)", data->live.tlas_rebuilds);
+
+  const auto compare_all = [&](const char* label) {
+    int compared = 0;
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::LiveTlasInstance& t : data->tlas_info) {
+      for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+        if (inst.id != t.id) continue;
+        const bvh::PoolCameraVisibility fresh = bvh::GetPoolCameraVisibility(inst);
+        const bvh::PoolCameraVisibility& got = t.visibility;
+        CHECK(got.camera_seen == fresh.camera_seen, "%s instance %llu camera_seen %d vs fresh %d", label, (unsigned long long)t.id, got.camera_seen, fresh.camera_seen);
+        CHECK(got.light_seen == fresh.light_seen, "%s instance %llu light_seen %d vs fresh %d", label, (unsigned long long)t.id, got.light_seen, fresh.light_seen);
+        CHECK(got.near_fade == fresh.near_fade, "%s instance %llu near_fade %d vs fresh %d", label, (unsigned long long)t.id, got.near_fade, fresh.near_fade);
+        CHECK(got.inputs.valid == fresh.inputs.valid, "%s instance %llu inputs.valid %d vs fresh %d", label, (unsigned long long)t.id, got.inputs.valid, fresh.inputs.valid);
+        CHECK(std::memcmp(got.inputs.color, fresh.inputs.color, sizeof got.inputs.color) == 0, "%s instance %llu inputs.color %.3f vs fresh %.3f", label,
+              (unsigned long long)t.id, (double)got.inputs.color[0], (double)fresh.inputs.color[0]);
+        CHECK(std::memcmp(got.inputs.param, fresh.inputs.param, sizeof got.inputs.param) == 0, "%s instance %llu inputs.param", label, (unsigned long long)t.id);
+        ++compared;
+      }
+    }
+    CHECK(compared == static_cast<int>(data->tlas_info.size()), "%s every TLAS entry found in the pool (%d of %zu)", label, compared, data->tlas_info.size());
+  };
+
+  observe(a, camera, &vis);  // (a) camera-seen flips
+  vis.color[0] = 0.25f;
+  observe(b, camera, &vis);  // (b) only the color of the view changes
+  observe(c, none, nullptr);  // (c) a sighting that changes nothing
+  const uint32_t rebuilds = data->live.tlas_rebuilds;
+  for (int i = 0; i < 16 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == rebuilds + 1u && std::string(data->live.tlas_reason) == "visibility changed", "organic rebuild after the visibility changes (reason %s)", data->live.tlas_reason);
+  compare_all("touched");
+  CHECK(data->live.snapshot_reused > 0u, "untouched static instances are carried over (reused %u)", data->live.snapshot_reused);
+  CHECK(data->live.snapshot_fresh > 0u, "touched instances are read fresh (fresh %u)", data->live.snapshot_fresh);
+  std::printf("TestVisibilityCarry: rebuild 1 reused %u fresh %u\n", data->live.snapshot_reused, data->live.snapshot_fresh);
+
+  BumpAdmit();  // no change to any observation: an organic rebuild of the same static set
+  const uint32_t before = data->live.tlas_rebuilds;
+  for (int i = 0; i < 16 && data->live.tlas_rebuilds == before; ++i) rig.present();
+  CHECK(data->live.tlas_rebuilds == before + 1u && std::string(data->live.tlas_reason) == "pool changed", "second organic rebuild (reason %s)", data->live.tlas_reason);
+  compare_all("unchanged");
+  CHECK(data->live.snapshot_fresh == 0u, "no change: every static instance carried over (fresh %u)", data->live.snapshot_fresh);
+  CHECK(data->live.snapshot_reused == data->tlas_info.size(), "no change: all %zu entries reused (reused %u)", data->tlas_info.size(), data->live.snapshot_reused);
+  std::printf("TestVisibilityCarry: rebuild 2 reused %u fresh %u\n", data->live.snapshot_reused, data->live.snapshot_fresh);
 }
 
 static void TestSlackLayout() {
@@ -5326,12 +5625,15 @@ int main() {
   TestSkipDynamicPose();
   TestSkipQuality();
   TestSkipCadence();
+  TestSortExact();
   TestRefitGolden();
   TestRefitCursorInterleaved();
   TestRefitCursorMiss();
   TestWindRangeGolden();
   TestWindRangeGate();
   TestRestWindGolden();
+  TestRebuildGolden();
+  TestVisibilityCarry();
   TestRestWindFastSlowEqual();
   TestFollowedWindCrossing();
   TestRestWindLag();

@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -664,25 +665,40 @@ inline WorldInstanceGPU MakeLiveInstanceGPU(const LiveTlasInstance& instance, ui
 }
 
 // Pure: true iff the TLAS in `data` holds `instances` (with `info`) as a rebuild would build it now: the same ids in the same order
-// and the same descriptors. The static prefix is compared exactly; the dynamic suffix by its header and flags, or exactly when
-// `dynamic_poses` (their poses are refitted every present, so a pose change alone is not a rebuild).
+// and the same descriptors. The static prefix is compared exactly; the dynamic suffix by its header and flags. The return value is
+// that static match (the skip path). With `full_out` the full match is written in the same pass: the dynamic poses compared exactly
+// too (their poses are refitted every present, so a pose change alone is not a rebuild).
 inline bool LiveSnapshotMatchesTlas(const BvhDeviceData& data, const std::vector<WorldInstanceGPU>& instances,
-                                    const std::vector<LiveTlasInstance>& info, bool dynamic_poses) {
-  if (!data.tlas_built || data.tlas_instances_cpu.size() != instances.size() || data.tlas_info.size() != info.size()) return false;
-  const uint32_t df =
-      static_cast<uint32_t>(std::count_if(info.begin(), info.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; }));
-  if (df != data.tlas_dynamic_first) return false;
-  for (size_t i = 0; i < info.size(); ++i) {
-    if (info[i].id != data.tlas_info[i].id || info[i].rest != data.tlas_info[i].rest) return false;
-    if (i < df || dynamic_poses) {
-      if (std::memcmp(&instances[i], &data.tlas_instances_cpu[i], sizeof(WorldInstanceGPU)) != 0) return false;
-    } else if (std::memcmp(instances[i].header, data.tlas_instances_cpu[i].header, 3u * sizeof(float)) != 0
-               || std::memcmp(instances[i].visibility, data.tlas_instances_cpu[i].visibility, sizeof(instances[i].visibility)) != 0
-               || info[i].dynamic != data.tlas_info[i].dynamic || info[i].wind != data.tlas_info[i].wind) {
-      return false;
+                                    const std::vector<LiveTlasInstance>& info, bool* full_out = nullptr) {
+  bool static_match = false;
+  bool full_match = false;
+  if (data.tlas_built && data.tlas_instances_cpu.size() == instances.size() && data.tlas_info.size() == info.size()) {
+    const uint32_t df =
+        static_cast<uint32_t>(std::count_if(info.begin(), info.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; }));
+    if (df == data.tlas_dynamic_first) {
+      static_match = true;
+      full_match = true;
+      for (size_t i = 0; i < info.size(); ++i) {
+        if (info[i].id != data.tlas_info[i].id || info[i].rest != data.tlas_info[i].rest) {
+          static_match = false;
+          full_match = false;
+          break;
+        }
+        const bool same = std::memcmp(&instances[i], &data.tlas_instances_cpu[i], sizeof(WorldInstanceGPU)) == 0;
+        full_match &= same;
+        if (i < df) {
+          static_match &= same;
+        } else {
+          static_match &= std::memcmp(instances[i].header, data.tlas_instances_cpu[i].header, 3u * sizeof(float)) == 0
+                           && std::memcmp(instances[i].visibility, data.tlas_instances_cpu[i].visibility, sizeof(instances[i].visibility)) == 0
+                           && info[i].dynamic == data.tlas_info[i].dynamic && info[i].wind == data.tlas_info[i].wind;
+        }
+        if (!static_match && !full_match) break;
+      }
     }
   }
-  return true;
+  if (full_out != nullptr) *full_out = full_match;
+  return static_match;
 }
 
 // Slack (session switch): the static block of a slack TLAS has holes. A change of the static instances is written in place: a
@@ -884,6 +900,7 @@ inline void RebuildLiveTlas(
     const char* reason,
     bool allow_slack) {
   const PoolCpuTimer rebuild_timer{&g_perf_gate.block_us[kPerfBlockRebuildCall]};
+  g_pool.rebuild_this_present.store(true, std::memory_order_relaxed);
   auto start = PerfNow();
   LiveBvhStats& stats = data->live;
   CacheRebuildExtra diag;  // cache diagnostics: phase times (laps), no-op test, cause and reason
@@ -903,7 +920,14 @@ inline void RebuildLiveTlas(
   uint64_t flag_revision = 0u;
   uint32_t sources = 0u;
   uint32_t p2b_skipped = 0u;
+  std::bitset<65536> dirty;  // the visibility_dirty bits this snapshot took (ORed back when the build fails)
   const bool per_frame = LiveDynamicActive(*data);
+  // Visibility carry-over: an entry of the TLAS keeps its visibility when nothing about its observation changed.
+  // Off with slack, before the first build, and after a failed refit (the next update is a full rebuild).
+  const bool carry = !data->tlas_slack && !g_live_bvh.slack.load(std::memory_order_relaxed) && data->tlas_built && !data->tlas_refit_failed;
+  size_t previous = 0u;  // the TLAS static prefix, in id order like the pool (merge walk)
+  uint32_t reused = 0u;
+  uint32_t fresh = 0u;
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     revision = g_pool.revision;
@@ -911,6 +935,8 @@ inline void RebuildLiveTlas(
     dynamic_revision = g_pool.dynamic_revision;
     flag_revision = g_pool.dynamic_flag_revision;
     sources = g_pool.revision_sources_pending;
+    dirty = g_pool.visibility_dirty;
+    g_pool.visibility_dirty.reset();
     g_pool.stats.wind_sway_instances = 0u;
     g_pool.stats.wind_sway_max_m = 0.f;
     g_pool.stats.wind_sway_bound_m = 0.f;
@@ -940,7 +966,27 @@ inline void RebuildLiveTlas(
       std::memcpy(copy.inverse_world, instance.inverse_world, sizeof(copy.inverse_world));
       std::memcpy(copy.bounds_min, instance.bounds_min, sizeof(copy.bounds_min));
       std::memcpy(copy.bounds_max, instance.bounds_max, sizeof(copy.bounds_max));
-      copy.visibility = GetPoolCameraVisibility(instance);
+      const LiveTlasInstance* carried = nullptr;  // the TLAS entry of this instance, when its visibility is carried over
+      if (carry && !instance.dynamic && g_pool.wind_keys.count(instance.mesh_key) == 0u) {
+        // Instance ids are never reused: an instance erased and admitted again gets a new id, so its entry is a fresh read.
+        while (previous < data->tlas_dynamic_first && data->tlas_info[previous].id < instance.id) previous += 1u;
+        if (previous < data->tlas_dynamic_first && data->tlas_info[previous].id == instance.id) {
+          const LiveTlasInstance& entry = data->tlas_info[previous];
+          if (entry.mesh_key == instance.mesh_key && std::memcmp(entry.matrix, instance.matrix, sizeof(entry.matrix)) == 0
+              && !dirty.test(PoolVisibilityBit(instance.mesh_key, entry.observation_hash))) {
+            carried = &entry;
+          }
+        }
+      }
+      if (carried != nullptr) {
+        copy.visibility = carried->visibility;
+        copy.observation_hash = carried->observation_hash;
+        reused += 1u;
+      } else {
+        copy.visibility = GetPoolCameraVisibility(instance);
+        copy.observation_hash = MatrixHash(instance.matrix, kPoolWorldFloats);
+        fresh += 1u;
+      }
       std::memcpy(copy.param2, instance.param2, sizeof(copy.param2));
       ApplyPoolWindSway(&copy);
       copy.dynamic = instance.dynamic || copy.wind;  // swayed wind instances are refitted every present
@@ -953,6 +999,8 @@ inline void RebuildLiveTlas(
     }
     info.insert(info.end(), dynamic.begin(), dynamic.end());
   }
+  stats.snapshot_reused = reused;
+  stats.snapshot_fresh = fresh;
   lap(&diag.phase_ms[0]);
   // The switch is read once: the TLAS reflects it (commit), so a later switch is seen as a change.
   const uint8_t alpha_mode = AlphaMode();
@@ -983,8 +1031,10 @@ inline void RebuildLiveTlas(
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     g_pool.stats.tlas_wind_frame = frame;
   };
-  std::vector<WorldInstanceGPU> instances;
-  std::vector<BVHLeafGPU> leaves;
+  std::vector<WorldInstanceGPU>& instances = data->tlas_instances_spare;
+  std::vector<BVHLeafGPU>& leaves = data->tlas_leaves_spare;
+  instances.clear();
+  leaves.clear();
   instances.reserve(info.size());
   leaves.reserve(info.size());
   uint32_t waiting = 0u;
@@ -1049,7 +1099,7 @@ inline void RebuildLiveTlas(
   if (g_live_bvh.skip_noop.load(std::memory_order_relaxed) && !instances.empty() && !data->tlas_refit_failed
       && std::strcmp(reason, "first build") != 0 && std::strcmp(reason, "refit quality") != 0 && std::strcmp(reason, "refit failed") != 0
       && data->tlas_slack == g_live_bvh.slack.load(std::memory_order_relaxed)  // a switch change rebuilds (the layout changes)
-      && LiveSnapshotMatchesTlas(*data, instances, info, false)) {
+      && LiveSnapshotMatchesTlas(*data, instances, info)) {
     // The TLAS already holds these instances: nothing is built, uploaded or destroyed. The static prefix takes the new
     // provenance; the dynamic suffix is left to the refit, and its revision is not taken over (the refit still runs).
     data->tlas_check_frame = frame;
@@ -1147,12 +1197,13 @@ inline void RebuildLiveTlas(
   }
   if (slack_layout) hole_anchor.resize(instances.size(), std::array<float, 3>{});  // a removal parks a slot even with no holes yet
 
-  SortBvhLeaves(&leaves);
-  std::vector<uint32_t> leaf_of(leaves.size());
+  SortBvhLeaves(&leaves, &data->tlas_sort_scratch);
+  std::vector<uint32_t>& leaf_of = data->tlas_leaf_of_spare;
+  leaf_of.assign(leaves.size(), 0u);
   for (uint32_t l = 0; l < leaves.size(); ++l) leaf_of[leaves[l].prim] = l;
   const uint32_t dynamic_first =
       static_cast<uint32_t>(std::count_if(info.begin(), info.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; }));
-  std::vector<BVHNodeGPU> nodes;
+  std::vector<BVHNodeGPU>& nodes = data->tlas_nodes_spare;
   const bool built = BuildBvhTree(leaves, &nodes);
   const char* invalid = built ? DescribeBvhValidation(ValidateBvh(nodes, leaves)) : "tree construction failed";
   lap(&diag.phase_ms[2]);
@@ -1161,14 +1212,17 @@ inline void RebuildLiveTlas(
     stats.last_failure = std::string("TLAS: ") + invalid + " (previous TLAS kept)";
     renodx::utils::log::w("[world-bvh] TLAS over ", leaves.size(), " instances not uploaded: ", invalid);
     data->tlas_retry_frame = frame + kLiveRetryFrames;
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      g_pool.visibility_dirty |= dirty;
+    }
     finish();
     return;
   }
 
   if (g_cache_diag.enabled.load(std::memory_order_relaxed)) {  // diagnostics stay out of the TLAS time (the laps shift with it)
     const auto diag_start = std::chrono::steady_clock::now();
-    diag.noop_full = LiveSnapshotMatchesTlas(*data, instances, info, true);
-    diag.noop_static = LiveSnapshotMatchesTlas(*data, instances, info, false);
+    diag.noop_static = LiveSnapshotMatchesTlas(*data, instances, info, &diag.noop_full);
     const auto diag_time = std::chrono::steady_clock::now() - diag_start;
     AddPerfBlockMs(kPerfBlockRebuildNoop, std::chrono::duration<double, std::milli>(diag_time).count());
     if (start != std::chrono::steady_clock::time_point{}) {  // gathering on (PerfNow): the laps exclude the diagnostics
@@ -1176,7 +1230,8 @@ inline void RebuildLiveTlas(
       phase_start += diag_time;
     }
   }
-  std::vector<uint32_t> active(instances.size());
+  std::vector<uint32_t>& active = data->tlas_active_spare;
+  active.resize(instances.size());
   for (uint32_t i = 0; i < active.size(); ++i) active[i] = info[i].id != 0u ? i : kLiveSlackSentinel;
   const auto usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source
                      | reshade::api::resource_usage::copy_dest;
@@ -1208,6 +1263,10 @@ inline void RebuildLiveTlas(
     stats.last_failure = "TLAS buffer creation failed: " + error + " (previous TLAS kept)";
     renodx::utils::log::w("[world-bvh] ", stats.last_failure);
     data->tlas_retry_frame = frame + kLiveRetryFrames;
+    {
+      std::lock_guard<std::mutex> lock(g_pool.mutex);
+      g_pool.visibility_dirty |= dirty;
+    }
     finish();
     return;
   }
@@ -1224,7 +1283,7 @@ inline void RebuildLiveTlas(
   data->tlas_node_buffer = node_buffer.buffer;
   data->tlas_node_srv = node_buffer.view;
   data->active_count = static_cast<uint32_t>(instances.size() - spares);
-  data->tlas_instances_cpu = std::move(instances);
+  data->tlas_instances_cpu.swap(instances);
   data->tlas_slot_of_id.clear();
   if (slack_layout) {
     for (uint32_t i = 0; i < static_count; ++i) data->tlas_slot_of_id[info[i].id] = i;
@@ -1234,9 +1293,9 @@ inline void RebuildLiveTlas(
   data->tlas_hole_anchor = std::move(hole_anchor);
   data->tlas_slack = slack_layout;
   data->tlas_info = std::move(info);
-  data->tlas_leaves_cpu = std::move(leaves);
-  data->tlas_nodes_cpu = std::move(nodes);
-  data->tlas_leaf_of_instance = std::move(leaf_of);
+  data->tlas_leaves_cpu.swap(leaves);
+  data->tlas_nodes_cpu.swap(nodes);
+  data->tlas_leaf_of_instance.swap(leaf_of);
   data->tlas_dynamic_first = dynamic_first;
   data->tlas_built = true;
   lap(&diag.phase_ms[4]);
