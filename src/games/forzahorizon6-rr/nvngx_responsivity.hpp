@@ -107,6 +107,24 @@ inline void LogWarn(const std::string& message) {
   reshade::log::message(reshade::log::level::warning, ("responsivity: " + message).c_str());
 }
 
+// Frees the mask and its staging buffer. The upload buffer is persistently
+// mapped, so it is unmapped before release. Caller must hold mask_mutex.
+inline void ReleaseMaskResources() {
+  if (mask_upload_mapped != nullptr) {
+    mask_upload->Unmap(0, nullptr);
+    mask_upload_mapped = nullptr;
+  }
+  if (mask_texture != nullptr) {
+    mask_texture->Release();
+    mask_texture = nullptr;
+  }
+  if (mask_upload != nullptr) {
+    mask_upload->Release();
+    mask_upload = nullptr;
+  }
+  mask_filled = false;
+}
+
 // Creates (or resizes) the mask and fills it with one SNORM8 value. The fill is
 // a CopyTextureRegion from a memset upload buffer: no descriptors, no shader.
 // Caller must hold mask_mutex.
@@ -116,13 +134,7 @@ inline bool EnsureMask(
   if (device == nullptr || cmd_list == nullptr || width == 0u || height == 0u) return false;
 
   if (mask_texture != nullptr && (mask_width != width || mask_height != height)) {
-    mask_texture->Release();
-    mask_texture = nullptr;
-    if (mask_upload != nullptr) {
-      mask_upload->Release();
-      mask_upload = nullptr;
-    }
-    mask_filled = false;
+    ReleaseMaskResources();
   }
 
   if (mask_texture == nullptr) {
@@ -168,29 +180,35 @@ inline bool EnsureMask(
       return false;
     }
 
+    // Persistently mapped: every refill rewrites the whole buffer, so mapping it
+    // once keeps Map/Unmap off the per-refill path.
+    const D3D12_RANGE read_range{0, 0};
+    if (FAILED(mask_upload->Map(0, &read_range, &mask_upload_mapped))
+        || mask_upload_mapped == nullptr) {
+      mask_upload->Release();
+      mask_upload = nullptr;
+      mask_texture->Release();
+      mask_texture = nullptr;
+      LogWarn("mask upload map failed");
+      return false;
+    }
+
     mask_width = width;
     mask_height = height;
     mask_filled = false;
     Log("mask created " + std::to_string(width) + "x" + std::to_string(height));
   }
 
-  // SNORM8: value * 127. -1 encodes as -127 (and -128 also reads as -1).
-  // Compare on the quantised value, not the raw one: in speed-relative mode the
-  // value moves every frame, and re-filling on sub-step changes would copy and
-  // barrier the mask on every frame for no visible difference.
+  // SNORM8: value * 127. -1 encodes as -127 (and -128 also reads as -1). The
+  // value stays continuous; only the rebuild is quantised, by the deadband
+  // against the last filled value, and the buffer is already mapped.
   const int snorm = static_cast<int>(std::lround(std::clamp(target, -1.f, 1.f) * 127.f));
-  if (mask_filled && static_cast<int>(std::lround(mask_filled_value * 127.f)) == snorm) {
-    mask_filled_value = target;
+  const int delta = snorm - static_cast<int>(std::lround(mask_filled_value * 127.f));
+  if (mask_filled && delta <= kRebuildDeadbandSnorm && delta >= -kRebuildDeadbandSnorm) {
     return true;
   }
-  void* mapped = nullptr;
-  const D3D12_RANGE read_range{0, 0};
-  if (FAILED(mask_upload->Map(0, &read_range, &mapped)) || mapped == nullptr) {
-    LogWarn("mask upload map failed");
-    return false;
-  }
-  memset(mapped, static_cast<uint8_t>(static_cast<int8_t>(snorm)), static_cast<size_t>(mask_upload->GetDesc().Width));
-  mask_upload->Unmap(0, nullptr);
+  memset(mask_upload_mapped, static_cast<uint8_t>(static_cast<int8_t>(snorm)),
+         static_cast<size_t>(mask_upload->GetDesc().Width));
 
   D3D12_TEXTURE_COPY_LOCATION source{};
   source.pResource = mask_upload;
@@ -226,7 +244,6 @@ inline bool EnsureMask(
 
   mask_filled = true;
   mask_filled_value = target;
-  Log("mask filled with " + std::to_string(target) + " (snorm " + std::to_string(snorm) + ")");
   return true;
 }
 
@@ -322,15 +339,7 @@ inline void Disarm() {
   DetourTransactionCommit();
   armed.store(false);
   const std::lock_guard mask_lock(mask_mutex);
-  if (mask_texture != nullptr) {
-    mask_texture->Release();
-    mask_texture = nullptr;
-  }
-  if (mask_upload != nullptr) {
-    mask_upload->Release();
-    mask_upload = nullptr;
-  }
-  mask_filled = false;
+  ReleaseMaskResources();
 }
 
 }  // namespace responsivity
