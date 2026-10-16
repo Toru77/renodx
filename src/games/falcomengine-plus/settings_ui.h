@@ -43,6 +43,7 @@ static constexpr std::string_view kCategories[] = {
     "Anti-Aliasing",
     "Post Processing",
     "Ray Tracing",
+    "Performance",
 };
 
 // Section -> category for rows visible in Basic mode.
@@ -67,6 +68,8 @@ static const std::unordered_map<std::string_view, std::string_view> kSectionCate
     {"Depth of Field", "Post Processing"},
     {"Motion Blur", "Post Processing"},
     {"Ray Tracing", "Ray Tracing"},
+    {"BVH Diagnostics", "Ray Tracing"},
+    {"Performance", "Performance"},
     {"RTAO", "Ray Tracing"},
     {"Temporal Accumulation", "Ray Tracing"},
     {"Denoising", "Ray Tracing"},
@@ -480,20 +483,6 @@ static bool DrawPlainRow(Setting* setting) {
   return changed;
 }
 
-// Small-valued sliders also show the current value as a text readout beside the slider (key -> format).
-static const std::unordered_map<std::string_view, const char*> kSliderReadouts = {
-    {"RtaoNormalBias", "%.4f m"},
-    {"RtaoDepthRejection", "%.3f"},
-    {"RtaoRadius", "%.2f m"},
-    {"RtaoRayMax", "%.2f m"},
-    {"RtaoStrength", "%.2f"},
-    {"RtaoHistoryWeight", "%.2f"},
-    {"RtaoNormalRejection", "%.2f"},
-    {"RtaoHistoryClamp", "%.2f"},
-    {"RtaoFadeStart", "%.0f m"},
-    {"RtaoFadeEnd", "%.0f m"},
-};
-
 static bool DrawSettingRow(Setting* setting) {
   bool changed = false;
   const std::string identifier = setting->key.empty() ? setting->label : setting->key;
@@ -518,21 +507,8 @@ static bool DrawSettingRow(Setting* setting) {
   ImGuiSliderFlags slider_flags = ImGuiSliderFlags_None;
   if (setting->is_logarithmic) slider_flags |= ImGuiSliderFlags_Logarithmic;
 
-  // Readout rows: the tooltip is shown when the slider or the readout is hovered (SetItemTooltip
-  // would attach to the readout, the last item drawn).
-  bool has_readout = false;
-  bool row_hovered = false;
   switch (setting->value_type) {
-    case SettingValueType::FLOAT: {
-      const auto readout = kSliderReadouts.find(setting->key);
-      char text[64] = {};
-      has_readout = readout != kSliderReadouts.end();
-      if (readout != kSliderReadouts.end()) {
-        // Reserve room for the widest readout (the maximum), so the text is never cut off.
-        std::snprintf(text, sizeof(text), readout->second, setting->max);
-        const float reserve = ImGui::CalcTextSize(text).x + ImGui::GetStyle().ItemSpacing.x;
-        ImGui::SetNextItemWidth(-reserve);
-      }
+    case SettingValueType::FLOAT:
       changed |= ImGui::SliderFloat(
           "##Value",
           &setting->value,
@@ -540,15 +516,7 @@ static bool DrawSettingRow(Setting* setting) {
           setting->max,
           setting->format.c_str(),
           slider_flags);
-      if (readout != kSliderReadouts.end()) {
-        row_hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
-        std::snprintf(text, sizeof(text), readout->second, setting->value);
-        ImGui::SameLine();
-        ImGui::TextColored(kAccent, "%s", text);
-        row_hovered = row_hovered || ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
-      }
       break;
-    }
     case SettingValueType::INTEGER:
       if (!setting->labels.empty()) {
         std::string items;
@@ -587,13 +555,7 @@ static bool DrawSettingRow(Setting* setting) {
   }
 
   ImGui::PopID();
-  if (!setting->tooltip.empty()) {
-    if (has_readout) {
-      if (row_hovered) ImGui::SetTooltip("%s", setting->tooltip.c_str());
-    } else {
-      ImGui::SetItemTooltip("%s", setting->tooltip.c_str());
-    }
-  }
+  if (!setting->tooltip.empty()) ImGui::SetItemTooltip("%s", setting->tooltip.c_str());
 
   ImGui::TableSetColumnIndex(2);
   if (can_reset) {

@@ -114,30 +114,33 @@ static void TestGateTable() {
 }
 
 // ---- Fade range (rtao_state.hpp RtaoEffectiveFade) ----
-struct FadeCase { float size, ray_max, start, end; float end_eff, start_eff; };
+struct FadeCase { float built, slider, start_pct, end_pct, start_req, end_req, start_eff, end_eff; };
 
+// Percents of the slider range (RtaoFadeStartPct / RtaoFadeEndPct, defaults 15.625 / 31.25).
 static void TestFade() {
   const FadeCase cases[] = {
-      {64.f, 2.f, 40.f, 80.f, 14.f, 14.f},     // coverage 14: end capped
-      {128.f, 2.f, 40.f, 80.f, 30.f, 30.f},    // coverage 30: end capped, start follows
-      {256.f, 2.f, 40.f, 80.f, 62.f, 40.f},    // coverage 62: end capped only by the region
-      {512.f, 2.f, 40.f, 80.f, 80.f, 40.f},    // coverage 126: stored values reach
-      {512.f, 2.f, 90.f, 50.f, 50.f, 50.f},    // start > end: start capped to end
-      {512.f, 10.f, 40.f, 128.f, 118.f, 40.f}, // ray max 10: coverage 118
+      {256.f, 256.f, 15.625f, 31.25f, 40.f, 80.f, 40.f, 80.f},        // default range: today's 40 / 80 m
+      {512.f, 512.f, 15.625f, 31.25f, 80.f, 160.f, 80.f, 160.f},      // default fade at the maximum range
+      {256.f, 256.f, 100.f, 100.f, 256.f, 256.f, 256.f, 256.f},       // full range
+      {512.f, 512.f, 100.f, 100.f, 512.f, 512.f, 512.f, 512.f},       // full range at the maximum
+      {256.f, 256.f, 50.f, 100.f, 128.f, 256.f, 128.f, 256.f},
+      {256.f, 512.f, 60.f, 100.f, 307.2f, 512.f, 256.f, 256.f},       // TLAS lags the slider: caps apply
+      {512.f, 256.f, 100.f, 100.f, 256.f, 256.f, 256.f, 256.f},       // slider shrunk: built range is larger
+      {256.f, 256.f, 90.f, 50.f, 230.4f, 128.f, 128.f, 128.f},        // start above end: start capped to end
   };
   for (const auto& c : cases) {
-    const rtao::Fade f = rtao::RtaoEffectiveFade(c.size, c.ray_max, c.start, c.end);
-    CHECK(Near(f.end, c.end_eff, 1e-4f), "size %.0f ray %.1f end_eff %.2f want %.2f", c.size, c.ray_max, f.end, c.end_eff);
-    CHECK(Near(f.start, c.start_eff, 1e-4f), "size %.0f start_eff %.2f want %.2f", c.size, f.start, c.start_eff);
-    CHECK(f.end <= f.coverage + 1e-4f && f.start <= f.end + 1e-4f, "size %.0f ordering", c.size);
-    CHECK(Near(f.coverage, c.size * 0.25f - c.ray_max, 1e-4f), "coverage formula");
+    const rtao::Fade f = rtao::RtaoEffectiveFade(c.built, c.slider, c.start_pct, c.end_pct);
+    CHECK(Near(f.start_req, c.start_req, 1e-3f), "built %.0f slider %.0f start req %.3f want %.3f", c.built, c.slider, f.start_req, c.start_req);
+    CHECK(Near(f.end_req, c.end_req, 1e-3f), "built %.0f slider %.0f end req %.3f want %.3f", c.built, c.slider, f.end_req, c.end_req);
+    CHECK(Near(f.end, c.end_eff, 1e-3f), "built %.0f slider %.0f end_eff %.3f want %.3f", c.built, c.slider, f.end, c.end_eff);
+    CHECK(Near(f.start, c.start_eff, 1e-3f), "built %.0f slider %.0f start_eff %.3f want %.3f", c.built, c.slider, f.start, c.start_eff);
+    CHECK(Near(f.coverage, c.built, 1e-3f), "coverage is the built range");
+    CHECK(f.end <= f.coverage + 1e-4f && f.start <= f.end + 1e-4f, "built %.0f ordering", c.built);
   }
-  // Not ready: coverage below 1 m (the caller reports range_too_small).
-  CHECK(rtao::RtaoEffectiveFade(4.f, 3.5f, 40.f, 80.f).coverage < 1.f, "small region is not ready");
-  // The slider maximum is kPoolRegionMaxSize * 0.25 = 128 m; a 512 m region gives coverage 126 m, so the
-  // stored End (up to 128) is capped there and never rewritten.
-  const rtao::Fade big = rtao::RtaoEffectiveFade(512.f, 2.f, 128.f, 128.f);
-  CHECK(Near(big.end, 126.f, 1e-4f) && Near(big.start, 126.f, 1e-4f), "max slider capped by coverage");
+  // No TLAS built yet: coverage below 1 m (the caller reports range_too_small).
+  CHECK(rtao::RtaoEffectiveFade(0.f, 256.f, 15.625f, 31.25f).coverage < 1.f, "no built range is not ready");
+  // Maximum slider and maximum percent: 100% of 512 m, and the 10 m ray length the slider allows is not a term here.
+  CHECK(Near(rtao::RtaoEffectiveFade(512.f, 512.f, 100.f, 100.f).end, 512.f, 1e-3f), "max range end");
   std::printf("fade: %zu cases checked\n", sizeof(cases) / sizeof(cases[0]));
 }
 

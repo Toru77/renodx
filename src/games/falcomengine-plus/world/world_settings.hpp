@@ -54,12 +54,24 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   const std::function<bool()> advanced = advanced_visible ? advanced_visible : std::function<bool()>(visible);
 
   settings->push_back(new Setting{
+      .key = "WorldRayTracingRows",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "What enters the BVH",
+      .section = "Ray Tracing",
+      .on_draw = []() {
+        bvh::DrawRayTracingRows();
+        return false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "WorldResearchEnabled",
       .binding = &g_state.setting_enabled,
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 0.f,
       .label = "Draw Census",
-      .section = "Ray Tracing",
+      .section = "BVH Diagnostics",
       .tooltip = "Enable the Sora 2nd draw census (draws per VS family).",
       .is_visible = visible,
   });
@@ -68,9 +80,21 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .value_type = SettingValueType::CUSTOM,
       .can_reset = false,
       .label = "Phase 1 World BVH",
-      .section = "Ray Tracing",
+      .section = "BVH Diagnostics",
       .on_draw = []() {
         bvh::DrawBvhPanel();
+        return false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPerformance",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "Performance",
+      .section = "Performance",
+      .on_draw = []() {
+        bvh::DrawPerformanceTab();
         return false;
       },
       .is_visible = visible,
@@ -206,7 +230,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTAO",
       .tooltip = "Rays longer than this are ignored. Pixels closer than this to a region face return neutral AO.",
       .min = 0.1f,
-      .max = 10.f,
+      .max = bvh::kPoolRegionRayMargin,
       .format = "%.2f",
       .is_visible = visible,
   });
@@ -387,29 +411,29 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = [visible]() { return visible() && rtao::g_rtao_filter_type > 0.5f; },
   });
   settings->push_back(new Setting{
-      .key = "RtaoFadeStart",
-      .binding = &rtao::g_rtao_fade_start,
+      .key = "RtaoFadeStartPct",
+      .binding = &rtao::g_rtao_fade_start_pct,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 40.f,
+      .default_value = 15.625f,
       .label = "Fade Start",
       .section = "Distance Fade",
-      .tooltip = "Distance from the camera (metres) where RTAO starts fading out. Capped by the built BVH region at use; the panel shows the effective value.",
+      .tooltip = "Where RTAO starts fading out, as a percent of the BVH range (Region). Capped by the built BVH range at use; the panel shows the effective metres.",
       .min = 0.f,
-      .max = bvh::kPoolRegionMaxSize * 0.25f,
-      .format = "%.0f",
+      .max = 100.f,
+      .format = "%.1f%%",
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = "RtaoFadeEnd",
-      .binding = &rtao::g_rtao_fade_end,
+      .key = "RtaoFadeEndPct",
+      .binding = &rtao::g_rtao_fade_end_pct,
       .value_type = SettingValueType::FLOAT,
-      .default_value = 80.f,
+      .default_value = 31.25f,
       .label = "Fade End",
       .section = "Distance Fade",
-      .tooltip = "Distance from the camera (metres) where RTAO is fully faded out. Capped by the built BVH region at use; the panel shows the effective value.",
+      .tooltip = "Where RTAO is fully faded out, as a percent of the BVH range (Region). Capped by the built BVH range at use; the panel shows the effective metres.",
       .min = 0.f,
-      .max = bvh::kPoolRegionMaxSize * 0.25f,
-      .format = "%.0f",
+      .max = 100.f,
+      .format = "%.1f%%",
       .is_visible = visible,
   });
 }

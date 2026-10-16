@@ -2401,7 +2401,7 @@ static void TestSlackRegionMasked() {
   const uint32_t applies = data->live.slack_applies;
   const uint32_t rebuilds = data->live.tlas_rebuilds;
   AddInstance(SlackKey(1u), 0.f, 0.f, 500.f);
-  SetCamera(400.f, 5.f, 10.f);  // the region leaves most of the static block: the snapshot changes too
+  SetCamera(1200.f, 5.f, 10.f);  // the region (range 256 or 512) leaves most of the static block: the snapshot changes too
   for (int i = 0; i < 12 && data->live.tlas_rebuilds == rebuilds; ++i) rig.present();
   CHECK(data->live.tlas_rebuilds == rebuilds + 1u && data->live.slack_applies == applies,
         "pool change and region move: rebuilt, not applied (reason %s; rebuilds %u, skips %u, applies %u, frame %u, tlas_frame %u, check %u, waiting %u, instances %u)",
@@ -2511,6 +2511,230 @@ static void TestSlackAppliesDiag() {
   const std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
   const std::string slack = "\"slack\": {\"applies\": " + std::to_string(data->live.slack_applies) + ", \"apply_ms_sum\": ";
   CHECK(text.find(slack) != std::string::npos, "JSON slack block equals the live applies (%u)", data->live.slack_applies);
+}
+
+// ---------------------------------------------------------------------------
+// BVH range: every pooled instance within R of the camera (plus the ray margin) is in the region.
+
+static void RegionPresent(Device* dev, Queue* queue) {
+  falcom_world::g_state.frame.fetch_add(1u);
+  bvh::UpdateLiveBvh(dev, queue);
+}
+
+static void TestRegionCoverage(Device* dev, Queue* queue) {
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  const float margin = bvh::kPoolRegionRayMargin;
+  CHECK(margin == 10.f, "ray margin is the RtaoRayMax maximum (%.2f)", margin);
+  const float ranges[3] = {64.f, 256.f, 512.f};
+  const float cams[5][3] = {{10.f, 5.f, 10.f}, {255.99f, 0.f, -255.99f}, {256.f, 0.f, -256.f}, {-0.01f, 0.f, 0.01f}, {511.99f, 1000.f, 3.f}};
+  for (float range : ranges) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.region_size = range;
+    }
+    for (const auto& c : cams) {
+      SetCamera(c[0], c[1], c[2]);
+      const bvh::PoolRegion region = bvh::CurrentPoolRegion();
+      CHECK(region.range == range && std::fabs(region.size - (3.f * range + 2.f * margin)) < 1e-3f, "R %.0f: box edge %.3f", range, region.size);
+      for (int k = 0; k < 3; ++k) {
+        CHECK(c[k] - region.min[k] >= range + margin - 1e-3f && region.max[k] - c[k] >= range + margin - 1e-3f,
+              "R %.0f cam (%.2f %.2f %.2f) axis %d: gaps %.3f %.3f", range, c[0], c[1], c[2], k, c[k] - region.min[k], region.max[k] - c[k]);
+      }
+      auto probe = [&](const float* p) {
+        bvh::WorldInstance point;
+        for (int k = 0; k < 3; ++k) point.bounds_min[k] = point.bounds_max[k] = p[k];
+        return bvh::PoolInstanceInRegion(point, region);
+      };
+      for (int axis = 0; axis < 3; ++axis) {
+        for (float s : {-1.f, 1.f}) {
+          float p[3] = {c[0], c[1], c[2]};
+          p[axis] = c[axis] + s * range;
+          CHECK(probe(p), "R %.0f: point at +-R on axis %d (%.2f)", range, axis, s);
+          p[axis] = c[axis] + s * (range + margin);
+          CHECK(probe(p), "R %.0f: point at +-(R+M) on axis %d (%.2f)", range, axis, s);
+        }
+      }
+      for (int m = 0; m < 8; ++m) {
+        const float p[3] = {c[0] + ((m & 1) ? range : -range), c[1] + ((m & 2) ? range : -range), c[2] + ((m & 4) ? range : -range)};
+        CHECK(probe(p), "R %.0f: corner %d", range, m);
+      }
+      const float past[3] = {region.max[0] + 1.f, c[1], c[2]};
+      CHECK(!probe(past), "R %.0f: one metre past the far face is outside", range);
+      // Shader skip (world_rtao.cs_5_0.hlsl region_lo / region_hi), on the sphere of radius R and the cube corners.
+      // Directions: 26 unit directions (points at distance R) and the 8 cube corners (per-axis R).
+      int shader_outside = 0;
+      for (int m = 0; m < 27; ++m) {
+        if (m == 13) continue;
+        const float dir[3] = {(m % 3 - 1) * 1.f, ((m / 3) % 3 - 1) * 1.f, ((m / 9) % 3 - 1) * 1.f};
+        const float len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        for (int k = 0; k < 3; ++k) {
+          const float p = c[k] + range * dir[k] / len;
+          if (p < region.min[k] + margin || p > region.min[k] + region.size - margin) ++shader_outside;
+        }
+      }
+      CHECK(shader_outside == 0, "R %.0f: shader skip never reaches a sphere point (%d)", range, shader_outside);
+    }
+  }
+
+  // Pool: six instances at +-R on each axis stay in the TLAS, and across a cell edge crossing.
+  bvh::ResetWorldPool();
+  RegionPresent(dev, queue);
+  for (float range : ranges) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.region_size = range;
+    }
+    const uint64_t key = 0x100u + static_cast<uint64_t>(range);
+    AddMesh(key, BoxMesh(1.f));
+    const float x0 = range - 0.01f, y0 = 5.f, z0 = 10.f;
+    SetCamera(x0, y0, z0);
+    AddInstance(key, x0 + range, y0, z0);
+    AddInstance(key, x0 - range, y0, z0);
+    AddInstance(key, x0, y0 + range, z0);
+    AddInstance(key, x0, y0 - range, z0);
+    AddInstance(key, x0, y0, z0 + range);
+    AddInstance(key, x0, y0, z0 - range);
+    for (int i = 0; i < 40 && data->live.tlas_instances != 6u; ++i) RegionPresent(dev, queue);
+    CHECK(data->live.tlas_instances == 6u, "R %.0f: six axis instances in the TLAS (%u)", range, data->live.tlas_instances);
+    CHECK(data->live.tlas_instances == BuildRefInstances(*data, bvh::CurrentPoolRegion()).size(), "R %.0f: matches brute-force set (tlas %u refs %zu waiting %u reason %s)", range, data->live.tlas_instances, BuildRefInstances(*data, bvh::CurrentPoolRegion()).size(), data->live.tlas_waiting, data->live.tlas_reason);
+    SetCamera(range + 0.01f, y0, z0);
+    bool moved = false, all_kept = true;
+    for (int i = 0; i < 10; ++i) {
+      RegionPresent(dev, queue);
+      moved = moved || std::string(data->live.tlas_reason) == "region moved";
+      all_kept = all_kept && data->live.tlas_instances == 6u;
+    }
+    CHECK(moved, "R %.0f: the cell crossing rebuilt the TLAS (reason %s, tlas %u)", range, data->live.tlas_reason, data->live.tlas_instances);
+    CHECK(all_kept && data->live.tlas_instances == 6u, "R %.0f: six instances kept across the crossing (%u)", range, data->live.tlas_instances);
+    RetireMesh(key);
+    for (int i = 0; i < 40 && data->live.tlas_instances != 0u; ++i) RegionPresent(dev, queue);
+    CHECK(data->live.tlas_instances == 0u, "R %.0f: retired instances leave the TLAS (%u)", range, data->live.tlas_instances);
+  }
+  bvh::ResetWorldPool();
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    bvh::g_pool.region_size = 512.f;
+  }
+}
+
+static bool Near(float a, float b, float tol) { return std::fabs(a - b) <= tol; }
+
+// Performance tab window (perf_run.hpp UpdatePerfTab): CPU and GPU per present over the last kPerfTabWindow presents.
+static void ResetPerfTab() {
+  std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+  bvh::g_perf.tab = bvh::PerfTabState{};
+}
+
+static bvh::PerfTabView PerfTabNow() {
+  std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+  return bvh::g_perf.tab.view;
+}
+
+static void TestPerfTab(Device* dev) {
+  ResetPerfTab();
+  bvh::PerfCounters c;
+  bvh::UpdatePerfTab(c);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+    CHECK(bvh::g_perf.tab.count == 0u && std::isnan(bvh::g_perf.tab.view.cpu_now), "the first present only primes (count %zu)", bvh::g_perf.tab.count);
+  }
+  // CPU: rebuild +0.5 ms per present (cumulative) and hooks 0.3 ms per present (per present): 0.8 ms each present.
+  for (int i = 0; i < 40; ++i) {
+    c.cost[bvh::kPerfTlasRebuild] += 0.5;
+    c.cost[bvh::kPerfPoolHooks] = 0.3;
+    bvh::UpdatePerfTab(c);
+  }
+  bvh::PerfTabView v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.cpu_now), 0.8f, 1e-4f) && Near(static_cast<float>(v.cpu_avg), 0.8f, 1e-4f), "40 presents at 0.8 ms (now %.4f avg %.4f)", v.cpu_now, v.cpu_avg);
+  CHECK(std::isnan(v.gpu_now) && std::isnan(v.gpu_avg), "no GPU sample in the window is --");
+  // Ten presents at 1.8 ms: the window of 30 holds 20 at 0.8 and 10 at 1.8.
+  for (int i = 0; i < 10; ++i) {
+    c.cost[bvh::kPerfTlasRebuild] += 1.5;
+    c.cost[bvh::kPerfPoolHooks] = 0.3;
+    bvh::UpdatePerfTab(c);
+  }
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.cpu_now), 1.8f, 1e-4f) && Near(static_cast<float>(v.cpu_avg), (20.f * 0.8f + 10.f * 1.8f) / 30.f, 1e-4f),
+        "ring wraps: now %.4f avg %.4f (want 1.8 and %.4f)", v.cpu_now, v.cpu_avg, (20.f * 0.8f + 10.f * 1.8f) / 30.f);
+  // A cumulative counter below its previous value (reset) counts its new value: 0.2 + 0.3.
+  c.cost[bvh::kPerfTlasRebuild] = 0.2;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.cpu_now), 0.5f, 1e-4f), "counter reset takes the new value (%.4f)", v.cpu_now);
+
+  // GPU: trace +2.0 and RTAO +1.0 (one sample each) in one present: 3.0 ms.
+  ResetPerfTab();
+  c = bvh::PerfCounters{};
+  bvh::UpdatePerfTab(c);
+  c.cost[bvh::kPerfGpuTrace] += 2.0;
+  c.events[bvh::kPerfGpuTrace] += 1u;
+  c.cost[bvh::kPerfGpuRtao] += 1.0;
+  c.events[bvh::kPerfGpuRtao] += 1u;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.gpu_now), 3.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 3.f, 1e-4f), "trace 2 + RTAO 1 in one present = 3 (%.4f)", v.gpu_now);
+  // One timer with 2 samples and 4.0 ms: 2.0 ms per sample; the average is over measured presents (3 and 2).
+  c.cost[bvh::kPerfGpuAlphaBlit] += 4.0;
+  c.events[bvh::kPerfGpuAlphaBlit] += 2u;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.gpu_now), 2.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 2.5f, 1e-4f), "2 samples of 4 ms = 2 per sample (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
+  bvh::UpdatePerfTab(c);  // no sample: not measured, the current value stays the newest measured one
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.gpu_now), 2.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 2.5f, 1e-4f), "a present without samples is not averaged (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
+  for (int i = 0; i < 30; ++i) bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(std::isnan(v.gpu_now) && std::isnan(v.gpu_avg), "30 presents without samples: -- (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
+
+  // The live path feeds the tab at every present (UpdateCacheDiag), with the pool lock released by the caller.
+  ResetPerfTab();
+  bvh::UpdateCacheDiag(dev);
+  bvh::UpdateCacheDiag(dev);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+    CHECK(bvh::g_perf.tab.count == 1u, "UpdateCacheDiag feeds the window (count %zu)", bvh::g_perf.tab.count);
+  }
+  CHECK(g_under_lock == 0, "the tab takes no lock the caller holds (%d)", g_under_lock);
+  ResetPerfTab();
+}
+
+// The perf file keeps the RTAO and alpha timers when they are passed in (UpdatePerfRun extra).
+static void TestPerfExtraGpu(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  const auto base = std::chrono::steady_clock::now();
+  const bvh::CacheSwitches sw{true, false, false, true};
+  bvh::g_cache_diag.enabled.store(true);
+  bvh::RequestPerfRun("extra");
+  bvh::PerfExtraGpu extra;
+  bvh::UpdatePerfRun(data, 9000u, 0u, base, sw, extra);
+  int k = 0;
+  while (bvh::g_perf.active.load() && k < 5000) {
+    ++k;
+    PerfPresentCosts(data);
+    extra.rtao.ms_sum += 1.0;
+    extra.rtao.samples += 1u;
+    data->alpha.timer.ms_sum += 0.5;
+    data->alpha.timer.samples += 1u;
+    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), 0u, base + std::chrono::milliseconds(16 * k), sw, extra);
+  }
+  const std::string text = ReadDumpText(WrittenPath(PerfResult()));
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  CHECK(JsonError(text).empty(), "perf file with extras is valid JSON: %s", JsonError(text).c_str());
+  CHECK(text.find("\"gpu_rtao\": {\"basis\": \"measured\", \"avg_per_measured_frame\": {\"value\": 1,") != std::string::npos, "RTAO timer averages 1 ms per measured frame");
+  CHECK(text.find("\"gpu_alpha_blit\": {\"basis\": \"measured\", \"avg_per_measured_frame\": {\"value\": 0.5,") != std::string::npos, "alpha blit timer averages 0.5 ms");
+  CHECK(text.find("\"gpu_rtao_filter\": {\"basis\": \"not measured\"") != std::string::npos, "RTAO filter without samples is not measured");
+  CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit (extras)");
+  bvh::ResetCacheDiagCounters();
 }
 
 int main() {
@@ -3546,6 +3770,10 @@ int main() {
   TestPerfWindow(&dev);
   TestPerfAbort(&dev);
   TestPerfSwitchesStable(&dev);
+  TestPerfTab(&dev);
+  TestPerfExtraGpu(&dev);
+  Stage("11e BVH range coverage");
+  TestRegionCoverage(&dev, &queue);
   Stage("end checks");
   CHECK(g_under_lock == 0, "graphics calls under the pool lock: %d", g_under_lock);
   std::printf("whole-buffer updates %d, copies between different strides %d\n", dev.whole_buffer_updates, dev.structured_mismatch_copies);

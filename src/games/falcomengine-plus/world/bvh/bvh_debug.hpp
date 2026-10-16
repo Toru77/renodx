@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "../../../../utils/render.hpp"
@@ -104,9 +105,8 @@ inline BvhTraceDepthInput GetBvhTraceDepthInput(BvhView view) {
   }
   if (input.rect[2] <= 0.f || input.rect[3] <= 0.f) return input;
   input.view = depth.view;
-  // Inside a quarter of the region size the TLAS always holds every admitted
-  // instance (the region keeps the camera that far from its border).
-  input.compare_range = g_pool.region_size * 0.25f;
+  // Inside the region range the TLAS always holds every admitted instance.
+  input.compare_range = g_pool.region_size;
   return input;
 }
 
@@ -225,7 +225,17 @@ inline void OnWorldPresentBvh(
   (void)rtao_startup_enable;
 
   UpdateLiveBvh(device, queue);
-  UpdateCacheDiag(device);
+  PerfExtraGpu extra;
+  {
+    const rtao::RtaoDeviceData& rtao_data = rtao::GetRtaoDeviceData(device);
+    extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
+    extra.rtao_filter = {rtao_data.filter_timer.ms_sum, rtao_data.filter_timer.samples};
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
+  }
+  UpdateCacheDiag(device, extra);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
   RunBvhDebugPass(queue, swapchain);

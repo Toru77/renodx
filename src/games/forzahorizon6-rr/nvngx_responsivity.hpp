@@ -78,14 +78,26 @@ inline void UpdateMotion(float motion) {
 }
 inline PFN_NGX_EvaluateFeature real_evaluate_feature = nullptr;
 
-// One constant-value R8_SNORM mask, refilled only when the value moves.
+// One constant-value R8_SNORM mask. The upload buffer is created once and left
+// persistently mapped, so a refill costs a memset plus the copy, with no
+// per-refill Map/Unmap.
 inline std::mutex mask_mutex;
 inline ID3D12Resource* mask_texture = nullptr;
 inline ID3D12Resource* mask_upload = nullptr;
+inline void* mask_upload_mapped = nullptr;
 inline uint32_t mask_width = 0;
 inline uint32_t mask_height = 0;
 inline bool mask_filled = false;
+// The value the texture actually holds, not the live value: the rebuild test
+// below compares against this, so a slow drift accumulates and eventually lands.
 inline float mask_filled_value = 0.f;
+
+// A refill lands only once the value has moved this many SNORM8 steps from what
+// the texture holds (254 steps span the full -1..1 range). In speed-relative
+// mode the value is recomputed every frame, so without a deadband a
+// whole-texture memset, copy and barrier pair would run almost every frame; a
+// few steps of lag is below what the control can express.
+inline constexpr int kRebuildDeadbandSnorm = 8;
 
 inline void Log(const std::string& message) {
   reshade::log::message(reshade::log::level::info, ("responsivity: " + message).c_str());

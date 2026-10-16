@@ -9047,7 +9047,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     return;
   }
   const auto fade = rtao::RtaoEffectiveFade(
-      bvh_data->tlas_region_size, rtao::g_rtao_ray_max, rtao::g_rtao_fade_start, rtao::g_rtao_fade_end);
+      bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size, rtao::g_rtao_fade_start_pct, rtao::g_rtao_fade_end_pct);
   frame.fade = fade;
   frame.fade_valid = true;
   if (fade.coverage < 1.f) {
@@ -9179,8 +9179,8 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   }
   const rtao::ParameterSnapshot params = {
       rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_samples,
-      rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start,
-      rtao::g_rtao_fade_end, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
+      rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start_pct,
+      rtao::g_rtao_fade_end_pct, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
       rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
       rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);

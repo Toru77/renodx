@@ -12,7 +12,10 @@
 #include <Windows.h>
 #include <shellapi.h>
 
+#include <cmath>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "../contract/shader_registry.hpp"
 #include "../debug/crash_log.hpp"
@@ -82,27 +85,141 @@ inline void DrawDepthCompareStats(const BvhTraceStats& stats) {
     return;
   }
   ImGui::Text("Depth compare (within %.0f m): match %.1f%%  missing %.1f%%  extra %.1f%%  extra on sky %.1f%%",
-              g_pool.region_size * 0.25f,
+              g_pool.region_size,
               PoolPercent(stats.compare_match, judged),
               PoolPercent(stats.compare_missing, judged),
               PoolPercent(stats.compare_extra, judged),
               PoolPercent(stats.compare_extra_sky, judged));
 }
 
-// Deforming meshes in the BVH (deform_live.hpp): the checkbox.
-inline void DrawDeformLivePanel() {
-  bool enabled = g_deform_live.enabled.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Deforming meshes in the BVH (characters, water)", &enabled)) {
-    g_deform_live.enabled.store(enabled, std::memory_order_relaxed);
-    g_deform.enabled.store(enabled, std::memory_order_relaxed);  // confirms each shader's world position
+// Ray Tracing tab (world_settings.hpp): the switches that decide what enters the BVH. Session only, defaults as before.
+struct RayTracingRow {
+  const char* label;
+  const char* description;
+  const char* tooltip;
+  std::vector<std::atomic_bool*> flags;  // written together; the first one shows the state
+};
+
+inline void DrawRayTracingRows() {
+  ImGui::SetNextItemWidth(150.f);
+  ImGui::SliderFloat("Region (m)", &g_pool.region_size, kPoolRegionMinSize, kPoolRegionMaxSize, "%.0f");
+  ImGui::TextDisabled("BVH range: every pooled object within this distance of the camera is in the BVH; RTAO reaches it at 100% fade.");
+  static const std::vector<RayTracingRow> rows = {
+      {"Alpha foliage (leaves, grass, fences)",
+       "Adds alpha-tested foliage, including foliage drawn by indirect (GPU driven) calls.",
+       "Experimental, session only, default on. Off: alpha-tested meshes are not traced and their "
+       "instances leave the BVH at once. On: their cutouts are traced through a 256-slice atlas, filled "
+       "at the next present (copies of the source textures are made when drawn).",
+       {&g_pool.alpha_foliage, &g_pool.alpha_indirect_source}},
+      {"Foliage motion (wind and sway)",
+       "Sways wind foliage. Off: it stays in its rest pose. Needs Alpha foliage.",
+       "Experimental, session only, default on. Approximation: wind rest poses are moved in the BVH by the "
+       "wind vertex shader's sway at the instance origin (rigid, full amplitude). Off: they stay at their "
+       "rest pose.",
+       {&g_pool.alpha_wind_sway}},
+      {"Deforming meshes (characters, water)",
+       "Adds skinned and animated meshes.",
+       "Every frame, re-runs each camera draw of a skinned or animated vertex shader whose world\n"
+       "position the probe confirmed, capturing its world-space triangles on the GPU. Each draw's\n"
+       "tree is built once from its first capture and refit every frame; the trace walks them\n"
+       "beside the static BVH. The probe (it confirms new shaders) is on while this is on.",
+       {&g_deform_live.enabled, &g_deform.enabled}},
+      {"Moving objects follow their pose",
+       "Keeps moving objects in the BVH at their current pose.",
+       "Moving objects keep their instances and each one moves to the pose the object\n"
+       "has now (a copy of a moving object is taken every frame). Off: the old behaviour.\n"
+       "Ignored while \"Keep moving objects out\" is on.",
+       {&g_pool.follow_moving}},
+      {"Moving objects: per-frame (P2b)",
+       "Adds moving objects at the pose of the previous frame.",
+       "Session only, default on. A moving mesh is copied at each draw and traced from the instances\n"
+       "of the previous frame (one frame behind, no staging delay). Off: the follow path (a few presents behind), or absent when Follow moving is off.",
+       {&g_pool.dynamic_per_frame}},
+      {"Keep moving objects out of the static BVH",
+       "Removes moving objects from the static BVH.",
+       "A mesh seen moving in a camera view (its prevWorld differs from world) gets no\n"
+       "static instances: those it had are removed and new ones refused, so a door or cart\n"
+       "leaves no copy behind where it stopped. Without the per-frame path (P2b) or Follow moving, moving\n"
+       "objects are absent from the BVH. Off: admitted as before (applies at once).",
+       {&g_pool.exclude_moving}},
+      {"Scan indirect draws",
+       "Lets indirect (GPU driven) draws, opaque or alpha, enter the BVH.",
+       "Off: indirect draws (counts kept on the GPU) are ignored by the pool.",
+       {&g_pool.scan_indirect}},
+  };
+  bool changed = false;
+  for (const RayTracingRow& row : rows) {
+    bool on = row.flags.front()->load(std::memory_order_relaxed);
+    if (ImGui::Checkbox(row.label, &on)) {
+      for (std::atomic_bool* flag : row.flags) flag->store(on, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", row.tooltip);
+    ImGui::TextDisabled("%s", row.description);
+  }
+  if (changed) {
+    LogPoolSwitches();
     RefreshPoolCaptureRequest();
   }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Every frame, re-runs each camera draw of a skinned or animated vertex shader whose world\n"
-                      "position the probe confirmed, capturing its world-space triangles on the GPU. Each draw's\n"
-                      "tree is built once from its first capture and refit every frame; the trace walks them\n"
-                      "beside the static BVH. The probe (it confirms new shaders) is on while this is on.");
+}
+
+// Label of the cache diagnostics dump and of the Performance test (file name only).
+inline char g_diag_label[64] = {};
+
+// Performance tab (world_settings.hpp): CPU and GPU ms over the last presents (UpdatePerfTab). NaN shows "--".
+inline void PerfMsText(const char* prefix, double ms) {
+  if (std::isnan(ms)) {
+    ImGui::Text("%s--", prefix);
+  } else {
+    ImGui::Text("%s%.2f ms", prefix, ms);
   }
+}
+
+inline void DrawPerformanceTab() {
+  PerfTabView view;
+  bool running = false;
+  double elapsed_s = 0.0;
+  std::string perf_label;
+  {
+    std::lock_guard<std::mutex> lock(g_perf.mutex);
+    view = g_perf.tab.view;
+    running = g_perf.active.load();
+    elapsed_s = g_perf.run.elapsed_s;
+    perf_label = g_perf.run.label;
+  }
+  if (ImGui::BeginTable("perf_window", 2, ImGuiTableFlags_Borders)) {
+    ImGui::TableSetupColumn("CPU");
+    ImGui::TableSetupColumn("GPU");
+    ImGui::TableHeadersRow();
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    PerfMsText("", view.cpu_now);
+    PerfMsText("avg ", view.cpu_avg);
+    ImGui::TableSetColumnIndex(1);
+    PerfMsText("", view.gpu_now);
+    PerfMsText("avg ", view.gpu_avg);
+    ImGui::EndTable();
+  }
+  ImGui::TextDisabled("Last %u presents. CPU: non-GPU costs per present (RTAO command recording not included). GPU: sum of the six GPU timers that had samples (trace, alpha blit, P2b expand, deform refit, RTAO trace, RTAO filter).",
+                      static_cast<unsigned>(kPerfTabWindow));
+  if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(g_diag_label);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Averages over 30 s of presents, written to its own perf file. Keys: tlas_rebuild, tlas_skip, tlas_apply,\n"
+                      "tlas_refit, blas_build, mesh_capture, pool_hooks, pool_drain, deform_cpu (CPU ms per present); gpu_trace\n"
+                      "(BVH debug view trace), gpu_alpha_blit, gpu_p2b_expand, gpu_deform_refit, gpu_rtao, gpu_rtao_filter (GPU ms\n"
+                      "per measured frame). Start it after the map has settled (not during the refill after a map change).\n"
+                      "Label: optional, file name only.");
+  }
+  if (running) {
+    ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Performance test running: %.1f / %.1f s [%s]", elapsed_s, kPerfWindowSeconds,
+                       perf_label.c_str());
+  }
+  std::string result;
+  {
+    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+    result = g_cache_diag.data.last_result;
+  }
+  if (!result.empty()) ImGui::TextUnformatted(result.c_str());
 }
 
 inline void DrawBvhPanel() {
@@ -114,21 +231,7 @@ inline void DrawBvhPanel() {
     RefreshPoolCaptureRequest();
     LogPoolSwitches();
   }
-  ImGui::SameLine();
-  ImGui::SetNextItemWidth(150.f);
-  ImGui::SliderFloat("Region (m)", &g_pool.region_size, kPoolRegionMinSize, kPoolRegionMaxSize, "%.0f");
-
   bool switches_changed = false;
-  bool follow_moving = g_pool.follow_moving.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Moving objects follow their pose", &follow_moving)) {
-    g_pool.follow_moving.store(follow_moving, std::memory_order_relaxed);
-    switches_changed = true;
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Moving objects keep their instances and each one moves to the pose the object\n"
-                      "has now (a copy of a moving object is taken every frame). Off: the old behaviour.\n"
-                      "Ignored while \"Keep moving objects out\" is on.");
-  }
 
   bool do_dump = false;
   bool do_reset = false;
@@ -157,7 +260,6 @@ inline void DrawBvhPanel() {
     // Diagnostic switches: turn one pool stage off at a time to find which one
     // a crash needs. Logging only happens while "Log mesh captures" is on.
     bool capture_meshes = g_pool.capture_meshes.load(std::memory_order_relaxed);
-    bool scan_indirect = g_pool.scan_indirect.load(std::memory_order_relaxed);
     bool log_captures = g_pool.log_captures.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Capture meshes", &capture_meshes)) {
       g_pool.capture_meshes.store(capture_meshes, std::memory_order_relaxed);
@@ -167,14 +269,6 @@ inline void DrawBvhPanel() {
       ImGui::SetTooltip("Copies the index, then the vertex range of each new mesh at its draws and reads them\n"
                         "two frames later (no GPU wait). Off: no new mesh is read; instances of meshes\n"
                         "not read yet wait unadmitted.");
-    }
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Scan indirect draws", &scan_indirect)) {
-      g_pool.scan_indirect.store(scan_indirect, std::memory_order_relaxed);
-      switches_changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Off: indirect draws (counts kept on the GPU) are ignored by the pool.");
     }
     ImGui::SameLine();
     if (ImGui::Checkbox("Log mesh captures", &log_captures)) {
@@ -226,36 +320,6 @@ inline void DrawBvhPanel() {
                         "On: it is captured again up to 3 times, 180 frames apart. Applies to captures\n"
                         "from now on: reset the pool after changing.");
     }
-    bool exclude_moving = g_pool.exclude_moving.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Keep moving objects out of the static BVH", &exclude_moving)) {
-      g_pool.exclude_moving.store(exclude_moving, std::memory_order_relaxed);
-      switches_changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("A mesh seen moving in a camera view (its prevWorld differs from world) gets no\n"
-                        "static instances: those it had are removed and new ones refused, so a door or cart\n"
-                        "leaves no copy behind where it stopped. Without the per-frame path (P2b) or Follow moving, moving\n"
-                        "objects are absent from the BVH. Off: admitted as before (applies at once).");
-    }
-    bool dynamic_per_frame = g_pool.dynamic_per_frame.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Moving objects: per-frame (P2b)", &dynamic_per_frame)) {
-      g_pool.dynamic_per_frame.store(dynamic_per_frame, std::memory_order_relaxed);
-      switches_changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Session only, default on. A moving mesh is copied at each draw and traced from the instances\n"
-                        "of the previous frame (one frame behind, no staging delay). Off: the follow path (a few presents behind), or absent when Follow moving is off.");
-    }
-    bool alpha_foliage = g_pool.alpha_foliage.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Alpha-tested foliage (experimental)", &alpha_foliage)) {
-      g_pool.alpha_foliage.store(alpha_foliage, std::memory_order_relaxed);
-      switches_changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Experimental, session only, default on. Off: alpha-tested meshes are not traced and their "
-                        "instances leave the BVH at once. On: their cutouts are traced through a 256-slice atlas, filled "
-                        "at the next present (copies of the source textures are made when drawn).");
-    }
     bool alpha_indirect = g_pool.alpha_indirect_source.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Indirect foliage source copy (experimental)", &alpha_indirect)) {
       g_pool.alpha_indirect_source.store(alpha_indirect, std::memory_order_relaxed);
@@ -275,16 +339,6 @@ inline void DrawBvhPanel() {
       ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: wind "
                         "vertex shaders (opaque or alpha-tested pixel shader) are admitted as a rigid rest pose instead of WindOpaque. "
                         "Off: their instances leave the BVH at the next present.");
-    }
-    bool wind_sway = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Wind sway (approximate, experimental)", &wind_sway)) {
-      g_pool.alpha_wind_sway.store(wind_sway, std::memory_order_relaxed);
-      switches_changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Experimental, session only, default on. Approximation: wind rest poses are moved in the BVH by the "
-                        "wind vertex shader's sway at the instance origin (rigid, full amplitude). Off: they stay at their "
-                        "rest pose.");
     }
     bool log_crashes = CrashLogEnabled();
     if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
@@ -369,7 +423,6 @@ inline void DrawBvhPanel() {
   }
   ImGui::Text("Alpha and moving-object ms: alpha blit %.3f, alpha trace %.3f, expand cpu %.3f, expand gpu %.3f", gpu.blit_ms, gpu.trace_ms,
               stats.dynamic_expand_cpu_ms, stats.dynamic_expand_gpu_ms);
-  DrawDeformLivePanel();
 
   ImGui::SeparatorText("GPU BVH (live)");
   bool live = g_live_bvh.enabled.load(std::memory_order_relaxed);
@@ -481,21 +534,7 @@ inline void DrawBvhPanel() {
   ImGui::Text("Frame: last %.2f ms, avg %.2f ms (since reset)", static_cast<double>(diag.frame_ms_last),
               diag.frame_intervals != 0u ? diag.frame_ms_sum / static_cast<double>(diag.frame_intervals) : 0.0);
   ImGui::TextUnformatted(CacheTlasPhaseLine(diag).c_str());
-  bool perf_running = false;
-  double perf_elapsed_s = 0.0;
-  std::string perf_label;
-  {
-    std::lock_guard<std::mutex> lock(g_perf.mutex);
-    perf_running = g_perf.active.load();
-    perf_elapsed_s = g_perf.run.elapsed_s;
-    perf_label = g_perf.run.label;
-  }
-  if (perf_running) {
-    ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "Performance test running: %.1f / %.1f s [%s]", perf_elapsed_s, kPerfWindowSeconds,
-                       perf_label.c_str());
-  }
-  static char diag_label[64] = {};
-  ImGui::InputText("Label", diag_label, sizeof(diag_label));
+  ImGui::InputText("Label", g_diag_label, sizeof(g_diag_label));
   if (ImGui::Button("Dump cache diagnostics")) {
     // The first press asks the next present to compute the tiers; the press after that (once a present has run) writes the file.
     bool ready = false;
@@ -510,7 +549,7 @@ inline void DrawBvhPanel() {
     }
     if (ready) {
       const uint32_t dump_frame = g_state.frame.load();
-      const std::filesystem::path path = WriteCacheDiagFile(data, dump_frame, diag_label, ReadCacheSwitches());
+      const std::filesystem::path path = WriteCacheDiagFile(data, dump_frame, g_diag_label, ReadCacheSwitches());
       std::error_code ec;
       const uintmax_t bytes = std::filesystem::file_size(path, ec);
       const bool written = !ec && bytes != 0u;
@@ -530,12 +569,6 @@ inline void DrawBvhPanel() {
         g_cache_diag.data.last_bytes = bytes;
       }
     }
-  }
-  ImGui::SameLine();
-  if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(diag_label);
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Averages of frame time and every cost over 30 s of presents, written to its own perf file. Start it\n"
-                      "after the map has settled (not during the refill after a map change). Label: optional, file name only.");
   }
   ImGui::SameLine();
   if (ImGui::Button("Reset diag counters")) {

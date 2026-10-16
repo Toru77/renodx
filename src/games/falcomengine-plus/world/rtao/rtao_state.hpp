@@ -30,8 +30,8 @@ inline float g_rtao_filter_type = 0.f;  // Filter Type: 0 separable bilateral, 1
 inline float g_rtao_filter_passes = 1.f;          // Filter Passes: 1..4
 inline float g_rtao_filter_taps_separable = 5.f;  // Filter Taps (separable): 3..17
 inline float g_rtao_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
-inline float g_rtao_fade_start = 40.f;
-inline float g_rtao_fade_end = 80.f;
+inline float g_rtao_fade_start_pct = 15.625f;  // Fade Start: percent of the BVH range (Region)
+inline float g_rtao_fade_end_pct = 31.25f;    // Fade End: percent of the BVH range (Region)
 inline float g_rtao_debug = 0.f;       // RTAO Debug (advanced): 0 off, 1 raw AO, 2 accumulated AO, 3 history confidence
 inline float g_rtao_discovery = 0.f;   // Two-Sided discovery (advanced, diagnostic): GPU facing test when 1
 // Test rows (advanced, session only: their key is empty, so settings.hpp never saves them).
@@ -83,12 +83,14 @@ inline const char* ReasonName(Reason reason) {
 struct Fade {
   float start;
   float end;
-  float coverage;
+  float coverage;  // built BVH range (m); the caps apply until the TLAS catches up
+  float start_req;  // requested metres, before the caps
+  float end_req;
 };
 
 // Settings that shape the AO. A change resets the temporal history for one frame (R2-S4).
 struct ParameterSnapshot {
-  float radius, ray_max, strength, samples, normal_bias, two_sided, isfast, fade_start, fade_end;
+  float radius, ray_max, strength, samples, normal_bias, two_sided, isfast, fade_start, fade_end;  // fade: percent of the range
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
   float zero_motion, freeze_noise, camera_matrix;
   bool operator==(const ParameterSnapshot&) const = default;
@@ -372,12 +374,13 @@ inline ResetReason TemporalResetReason(const TemporalFrame& f) {
 
 inline bool RtaoRequested() { return g_rtao_enabled > 0.5f; }
 
-// Fade End is capped by the built region's coverage (tlas_region_size * 0.25 - ray_max);
+// Fade percents are of the slider range (Region). Fade End is capped by the built BVH range (coverage);
 // Fade Start is capped by the effective End. Stored settings are never rewritten.
-inline Fade RtaoEffectiveFade(float tlas_region_size, float ray_max, float start, float end) {
-  const float coverage = tlas_region_size * 0.25f - ray_max;
-  const float end_eff = std::min(end, coverage);
-  return {std::min(start, end_eff), end_eff, coverage};
+inline Fade RtaoEffectiveFade(float built_range, float slider_range, float start_pct, float end_pct) {
+  const float start_req = start_pct * slider_range / 100.f;
+  const float end_req = end_pct * slider_range / 100.f;
+  const float end_eff = std::min(end_req, built_range);
+  return {std::min(start_req, end_eff), end_eff, built_range, start_req, end_req};
 }
 
 }  // namespace falcom_world::rtao

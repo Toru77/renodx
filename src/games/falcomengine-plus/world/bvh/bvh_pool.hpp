@@ -138,7 +138,7 @@ inline constexpr uint32_t kPoolMeshCopiesPerDraw = 4u;
 inline constexpr float kPoolMinScale = 0.001f;     // shorter axes: collapsed or hidden instances
 inline constexpr float kPoolMaxScale = 10000.f;
 inline constexpr float kPoolMaxPosition = 50000.f;  // farther translations: parked or horizon pieces
-inline constexpr const char* kWorldBuildId = "panel-cleanup-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
+inline constexpr const char* kWorldBuildId = "rt-panel-1 " __DATE__ " " __TIME__;  // every world_*.json and the manifest
 inline constexpr uint32_t kPoolPruneAge = 600u;
 inline constexpr uint32_t kPoolGhostKeyMax = 64u;  // instances per mesh key kept as overlap-retirement poses
 inline constexpr float kPoolGhostOverlap = 0.05f;  // fraction of the smaller box a fresher pose must overlap
@@ -215,6 +215,7 @@ inline constexpr uint32_t kPoolDynamicInstances = 32768u;             // P2b: ex
 inline constexpr size_t kPoolMotionRuleSamples = 16u;
 inline constexpr float kPoolRegionMinSize = 64.f;
 inline constexpr float kPoolRegionMaxSize = 512.f;
+inline constexpr float kPoolRegionRayMargin = 10.f;  // = RtaoRayMax maximum (world_settings.hpp); AO rays reach this far past the range
 
 // Why a scanned draw did not produce an instance copy. Non-rigid vertex
 // shaders are counted per class in PoolStats::draws_by_vs_class instead.
@@ -1395,7 +1396,7 @@ struct PoolState {
   std::atomic_uint64_t cpu_drain_frame_us{0u};
   // The immediate command list (set at present), to tell deferred-context draws apart.
   std::atomic_uint64_t immediate_cmd_list{0u};
-  float region_size = 512.f;
+  float region_size = 256.f;  // BVH range R (m): pooled instances within R of the camera are in the TLAS
   std::mutex mutex;
 
   uint32_t logged_invalidations = 0u;  // stats.resource_invalidations at the last present
@@ -1708,26 +1709,25 @@ inline void TraceCameraPosition(float* out) {
 }
 
 struct PoolRegion {
-  float size = 128.f;
+  float range = 0.f;
+  float size = 128.f;  // box edge
   float min[3] = {};
   float max[3] = {};
 };
 
 inline PoolRegion CurrentPoolRegion() {
   PoolRegion region;
-  region.size = g_pool.region_size;
+  region.range = g_pool.region_size;
   float camera[3] = {};
   if (!PoolCameraPosition(camera)) {
     camera[0] = camera[1] = camera[2] = 0.f;
   }
-  // Snap the region center to half-size cells offset by a quarter: the camera
-  // is then always at least size/4 away from every boundary (instead of being
-  // able to sit right on one), while rebuilds still only happen when the
-  // camera crosses a half-size cell.
-  const float half = region.size * 0.5f;
-  const float quarter = region.size * 0.25f;
+  // Cells of one range; the camera is within half a cell of the centre, so it
+  // is at least range + margin from every face. Rebuilds happen per cell crossing.
+  const float half = 1.5f * region.range + kPoolRegionRayMargin;
+  region.size = 2.f * half;
   for (int i = 0; i < 3; ++i) {
-    const float center = std::floor(camera[i] / half) * half + quarter;
+    const float center = std::floor(camera[i] / region.range) * region.range + region.range * 0.5f;
     region.min[i] = center - half;
     region.max[i] = center + half;
   }
@@ -6928,6 +6928,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"relinks\": " << stats.follow_relinks << ", \"orphans_retired\": " << stats.orphans_retired
       << ", \"max_slot_used\": " << stats.max_slot_used << ", \"max_follow_used\": " << stats.max_follow_used << "},\n";
   out << "  \"region\": {\"size\": " << PoolJsonFloat{region.size}
+      << ", \"range\": " << PoolJsonFloat{region.range}
       << ", \"min\": [" << PoolJsonFloat{region.min[0]} << ", " << PoolJsonFloat{region.min[1]} << ", " << PoolJsonFloat{region.min[2]}
       << "], \"max\": [" << PoolJsonFloat{region.max[0]} << ", " << PoolJsonFloat{region.max[1]} << ", " << PoolJsonFloat{region.max[2]} << "]},\n";
 

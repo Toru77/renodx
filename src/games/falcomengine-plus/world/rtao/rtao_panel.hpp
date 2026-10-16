@@ -45,8 +45,9 @@ inline void DrawRtaoPanel() {
   }
   ImGui::Text("Frames without AO: %llu", static_cast<unsigned long long>(frame.frames_without_ao));
   if (frame.fade_valid) {
-    ImGui::Text("Fade: effective start %.0f m, end %.0f m (coverage %.0f m; stored %.0f / %.0f m)",
-                frame.fade.start, frame.fade.end, frame.fade.coverage, g_rtao_fade_start, g_rtao_fade_end);
+    ImGui::Text("Fade: effective start %.0f m, end %.0f m (requested %.0f / %.0f m, BVH range %.0f m; stored %.1f%% / %.1f%%)",
+                frame.fade.start, frame.fade.end, frame.fade.start_req, frame.fade.end_req, frame.fade.coverage,
+                g_rtao_fade_start_pct, g_rtao_fade_end_pct);
   } else {
     ImGui::TextDisabled("Fade: no built BVH region yet");
   }

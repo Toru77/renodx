@@ -377,6 +377,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   uint8_t tlas_alpha_mode = 0u;  // AlphaMode() at the last TLAS build (LiveTlasChange: a change rebuilds it)
   float tlas_region_min[3] = {1e30f, 1e30f, 1e30f};
   float tlas_region_size = 0.f;
+  float tlas_region_range = 0.f;
   bool tlas_built = false;
   uint32_t active_count = 0u;  // instances in the uploaded TLAS
   bool bvh_ready = false;      // store and TLAS can be traced

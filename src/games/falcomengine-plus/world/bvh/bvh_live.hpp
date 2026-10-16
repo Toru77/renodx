@@ -953,6 +953,7 @@ inline void RebuildLiveTlas(
     data->tlas_sway_on = sway_on;
     data->tlas_wind_count = wind_count;
     data->tlas_region_size = region.size;
+    data->tlas_region_range = region.range;
     std::memcpy(data->tlas_region_min, region.min, sizeof(data->tlas_region_min));
     data->tlas_refit_failed = false;
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -2227,7 +2228,7 @@ inline CacheSwitches ReadCacheSwitches() {
   return s;
 }
 
-inline void UpdateCacheDiag(reshade::api::device* device) {
+inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& extra = {}) {
   BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
   if (data == nullptr) return;
   if (g_cache_diag.reset_requested.exchange(false, std::memory_order_relaxed)) {
@@ -2276,6 +2277,8 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
     }
   }
   CacheTiers tiers;
+  const uint64_t capture_us = g_pool.cpu_capture_us.exchange(0u, std::memory_order_relaxed);
+  PerfCounters counters;
   uint32_t serial = 0u;
   uint32_t pool_start = 0u;
   uint32_t pool_fresh_from = 0u;
@@ -2293,10 +2296,11 @@ inline void UpdateCacheDiag(reshade::api::device* device) {
     resight = g_pool.resight.counters;
     resight_tracked = g_pool.resight.by_signature.size();
     if (sample) ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
+    counters = ReadPerfCounters(data, capture_us, extra);
   }
-  const uint64_t capture_us = g_pool.cpu_capture_us.exchange(0u, std::memory_order_relaxed);
+  UpdatePerfTab(counters);
   const auto present_time = std::chrono::steady_clock::now();
-  UpdatePerfRun(data, frame, capture_us, present_time, ReadCacheSwitches());
+  UpdatePerfRun(data, frame, capture_us, present_time, ReadCacheSwitches(), extra);
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
   if (d.last_present != std::chrono::steady_clock::time_point{}) {

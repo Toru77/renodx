@@ -8,6 +8,8 @@
 // lock is taken (briefly, for the counters) only while a run is active or a start is pending. File I/O and the result
 // line are written after every lock is released.
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -31,15 +33,25 @@ enum PerfCost : size_t {
   kPerfTlasRefit,
   kPerfBlasBuild,
   kPerfGpuTrace,
+  kPerfGpuAlphaBlit,
+  kPerfGpuP2bExpand,
+  kPerfGpuDeformRefit,
+  kPerfGpuRtao,
+  kPerfGpuRtaoFilter,
   kPerfMeshCapture,
   kPerfPoolHooks,
   kPerfPoolDrain,
   kPerfDeformCpu,
   kPerfCostCount
 };
-inline constexpr const char* kPerfCostNames[kPerfCostCount] = {"tlas_rebuild", "tlas_skip", "tlas_apply", "tlas_refit", "blas_build",
-                                                               "gpu_trace",   "mesh_capture", "pool_hooks", "pool_drain", "deform_cpu"};
-inline constexpr bool kPerfCostCumulative[kPerfCostCount] = {true, true, true, true, true, true, false, false, false, false};
+inline constexpr const char* kPerfCostNames[kPerfCostCount] = {
+    "tlas_rebuild", "tlas_skip", "tlas_apply", "tlas_refit", "blas_build", "gpu_trace", "gpu_alpha_blit", "gpu_p2b_expand",
+    "gpu_deform_refit", "gpu_rtao", "gpu_rtao_filter", "mesh_capture", "pool_hooks", "pool_drain", "deform_cpu"};
+inline constexpr bool kPerfCostCumulative[kPerfCostCount] = {true, true, true, true, true, true, true, true,
+                                                             true, true, true, false, false, false, false};
+// GPU entries: ms per sample (delta cost / delta samples). The others are CPU ms.
+inline constexpr bool kPerfCostGpu[kPerfCostCount] = {false, false, false, false, false, true, true, true,
+                                                      true, true, true, false, false, false, false};
 
 enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeCount };
 inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "pool_instances", "pool_meshes", "slack_free_holes"};
@@ -68,18 +80,50 @@ struct PerfRunState {
   std::string abort_reason;  // empty: the window completed
 };
 
+// GPU timers the Performance tab sums: cumulative ms and samples read at each present (UpdateCacheDiag).
+struct PerfTimerSample {
+  double ms_sum = 0.0;
+  uint32_t samples = 0u;
+};
+struct PerfExtraGpu {
+  PerfTimerSample rtao, rtao_filter, deform_refit;
+};
+
+// Performance tab: the last kPerfTabWindow presents. NaN means "--" (no sample in the window).
+inline constexpr size_t kPerfTabWindow = 30;
+struct PerfTabSample {
+  double cpu_ms = 0.0;
+  double gpu_ms = 0.0;
+  bool gpu_measured = false;
+};
+struct PerfTabView {
+  double cpu_now = std::numeric_limits<double>::quiet_NaN();
+  double cpu_avg = std::numeric_limits<double>::quiet_NaN();
+  double gpu_now = std::numeric_limits<double>::quiet_NaN();
+  double gpu_avg = std::numeric_limits<double>::quiet_NaN();
+};
+struct PerfTabState {
+  std::array<PerfTabSample, kPerfTabWindow> ring{};
+  size_t next = 0u;     // slot of the next sample
+  size_t count = 0u;    // samples in the window
+  bool primed = false;  // the first present only records prev
+  PerfCounters prev;
+  PerfTabView view;
+};
+
 struct PerfState {
   std::atomic_bool start_requested{false};  // set by the button, taken by the next present
   std::atomic_bool active{false};           // read by the panel and by Reset
-  std::mutex mutex;
+  std::mutex mutex;                         // leaf lock: the run, the tab window and its view
   std::string pending_label;  // label typed when the start was requested
   PerfRunState run;           // the current or the last run
+  PerfTabState tab;
 };
 
 inline PerfState g_perf;
 
 // Counters at one present. Caller holds g_pool.mutex (tlas_timing and the admitted count).
-inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, uint64_t capture_us) {
+inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, uint64_t capture_us, const PerfExtraGpu& extra = {}) {
   const LiveBvhStats& live = data->live;
   const PoolTlasTiming& timing = g_pool.tlas_timing;
   PerfCounters c;
@@ -95,6 +139,16 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, uint64_t capture
   c.events[kPerfBlasBuild] = live.blas_builds;
   c.cost[kPerfGpuTrace] = data->trace_timer.ms_sum;
   c.events[kPerfGpuTrace] = data->trace_timer.samples;
+  c.cost[kPerfGpuAlphaBlit] = data->alpha.timer.ms_sum;
+  c.events[kPerfGpuAlphaBlit] = data->alpha.timer.samples;
+  c.cost[kPerfGpuP2bExpand] = data->dynamic.timer.ms_sum;
+  c.events[kPerfGpuP2bExpand] = data->dynamic.timer.samples;
+  c.cost[kPerfGpuDeformRefit] = extra.deform_refit.ms_sum;
+  c.events[kPerfGpuDeformRefit] = extra.deform_refit.samples;
+  c.cost[kPerfGpuRtao] = extra.rtao.ms_sum;
+  c.events[kPerfGpuRtao] = extra.rtao.samples;
+  c.cost[kPerfGpuRtaoFilter] = extra.rtao_filter.ms_sum;
+  c.events[kPerfGpuRtaoFilter] = extra.rtao_filter.samples;
   c.cost[kPerfMeshCapture] = static_cast<double>(capture_us) / 1000.0;
   c.cost[kPerfPoolHooks] = static_cast<double>(g_pool.cpu_hook_frame_us.load(std::memory_order_relaxed)) / 1000.0;
   c.cost[kPerfPoolDrain] = static_cast<double>(g_pool.cpu_drain_frame_us.load(std::memory_order_relaxed)) / 1000.0;
@@ -155,7 +209,7 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
     const double total = run.total.cost[i];
     const double events = static_cast<double>(run.total.events[i]);
     out << (i != 0u ? ", " : "") << "\"" << kPerfCostNames[i] << "\": {";
-    if (i == kPerfGpuTrace) {
+    if (kPerfCostGpu[i]) {
       out << "\"basis\": \"" << (run.total.events[i] != 0u ? "measured" : "not measured") << "\", \"avg_per_measured_frame\": ";
       WritePerfValue(&out, events != 0.0 ? total / events : nan, "ms/measured frame");
       out << ", \"total\": ";
@@ -194,7 +248,7 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
 // Refuses a start (result line says why) while a run is active, while a map change is swept, or during the refill
 // after a map change, pool reset or boot (kCacheSettlePresents). A map change or pool reset during a run aborts it.
 inline void UpdatePerfRun(const BvhDeviceData* data, uint32_t frame, uint64_t capture_us, std::chrono::steady_clock::time_point now,
-                          const CacheSwitches& switches) {
+                          const CacheSwitches& switches, const PerfExtraGpu& extra = {}) {
   const bool requested = g_perf.start_requested.exchange(false, std::memory_order_relaxed);
   bool running = g_perf.active.load(std::memory_order_relaxed);
   if (!requested && !running) return;
@@ -207,7 +261,7 @@ inline void UpdatePerfRun(const BvhDeviceData* data, uint32_t frame, uint64_t ca
     serial = g_pool.episode_serial;
     episode_start = g_pool.episode_start_frame;
     map_change = g_pool.map_change_frame;
-    counters = ReadPerfCounters(data, capture_us);
+    counters = ReadPerfCounters(data, capture_us, extra);
   }
   std::string result;
   bool finished = false;
@@ -282,6 +336,50 @@ inline void UpdatePerfRun(const BvhDeviceData* data, uint32_t frame, uint64_t ca
     std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
     g_cache_diag.data.last_result = result;
   }
+}
+
+// Every present (UpdateCacheDiag): CPU per present is the sum of the non-GPU costs (cumulative ones as deltas); GPU per
+// present is the sum over the GPU timers that gained samples of delta cost / delta samples. The first present primes prev.
+inline void UpdatePerfTab(const PerfCounters& now) {
+  std::lock_guard<std::mutex> lock(g_perf.mutex);
+  PerfTabState& tab = g_perf.tab;
+  if (!tab.primed) {
+    tab.prev = now;
+    tab.primed = true;
+    return;
+  }
+  PerfTabSample sample;
+  for (size_t i = 0; i < kPerfCostCount; ++i) {
+    const double cost = kPerfCostCumulative[i] && now.cost[i] >= tab.prev.cost[i] ? now.cost[i] - tab.prev.cost[i] : now.cost[i];
+    if (!kPerfCostGpu[i]) {
+      sample.cpu_ms += cost;
+      continue;
+    }
+    const uint64_t gained = now.events[i] >= tab.prev.events[i] ? now.events[i] - tab.prev.events[i] : now.events[i];
+    if (gained != 0u) {
+      sample.gpu_ms += cost / static_cast<double>(gained);
+      sample.gpu_measured = true;
+    }
+  }
+  tab.prev = now;
+  tab.ring[tab.next] = sample;
+  tab.next = (tab.next + 1u) % kPerfTabWindow;
+  tab.count = std::min(tab.count + 1u, kPerfTabWindow);
+
+  double cpu_sum = 0.0, gpu_sum = 0.0;
+  size_t gpu_count = 0u;
+  tab.view.gpu_now = std::numeric_limits<double>::quiet_NaN();
+  for (size_t k = 0; k < tab.count; ++k) {  // newest first
+    const PerfTabSample& s = tab.ring[(tab.next + kPerfTabWindow - 1u - k) % kPerfTabWindow];
+    cpu_sum += s.cpu_ms;
+    if (!s.gpu_measured) continue;
+    if (gpu_count == 0u) tab.view.gpu_now = s.gpu_ms;
+    gpu_sum += s.gpu_ms;
+    gpu_count += 1u;
+  }
+  tab.view.cpu_now = sample.cpu_ms;
+  tab.view.cpu_avg = cpu_sum / static_cast<double>(tab.count);
+  tab.view.gpu_avg = gpu_count != 0u ? gpu_sum / static_cast<double>(gpu_count) : std::numeric_limits<double>::quiet_NaN();
 }
 
 // The panel asks for a run; the next present decides (see UpdatePerfRun).

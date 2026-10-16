@@ -410,7 +410,8 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
       << ",\n  \"p2b_records\": " << f.p2b_records
       << ",\n  \"frames_without_ao\": " << f.frames_without_ao
       << ",\n  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
-      << ", \"coverage\": " << f.fade.coverage << "}"
+      << ", \"coverage\": " << f.fade.coverage << ", \"requested_start\": " << f.fade.start_req
+      << ", \"requested_end\": " << f.fade.end_req << ", \"range\": " << f.fade.coverage << "}"
       << ",\n  \"stats\": {\"rays\": " << v[kRtaoStatRays] << ", \"hits\": " << v[kRtaoStatHits]
       << ", \"pixels\": " << v[kRtaoStatPixels] << ", \"ao_sum\": " << v[kRtaoStatAoSum]
       << ", \"sky\": " << v[kRtaoStatSky] << ", \"normal\": " << v[kRtaoStatNormal]
