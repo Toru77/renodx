@@ -361,6 +361,8 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   reshade::api::resource_view tlas_node_srv = {0u};
   std::vector<WorldInstanceGPU> tlas_instances_cpu;  // as uploaded (GPU check)
   std::vector<LiveTlasInstance> tlas_info;           // pool provenance per TLAS instance (inspect)
+  std::vector<LiveTlasInstance> tlas_info_spare;     // session scratch: the next rebuild's snapshot (capacity kept; the old tlas_info rotates here)
+  std::vector<LiveTlasInstance> tlas_dynamic_scratch;  // session scratch: the dynamic instances of the rebuild snapshot, appended after the static ones
   std::vector<BVHLeafGPU> tlas_leaves_cpu;
   std::vector<BVHNodeGPU> tlas_nodes_cpu;
   std::vector<uint32_t> tlas_leaf_of_instance;  // TLAS instance -> its leaf (sorted leaves)
@@ -375,6 +377,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   uint64_t tlas_pool_revision = 0u;
   uint64_t tlas_visibility_revision = 0u;  // g_pool.visibility_revision the TLAS reflects
   uint64_t tlas_dynamic_revision = 0u;     // g_pool.dynamic_revision the TLAS reflects
+  bool tlas_sway_deferred = false;         // UpdateLiveBvh left a sway-only refit to RefitLiveTlasAfterDrain (same present)
   uint64_t tlas_store_version = 0u;
   uint8_t tlas_alpha_mode = 0u;  // AlphaMode() at the last TLAS build (LiveTlasChange: a change rebuilds it)
   float tlas_region_min[3] = {1e30f, 1e30f, 1e30f};
@@ -456,6 +459,7 @@ inline void DestroyLiveTlas(reshade::api::device* device, BvhDeviceData* data) {
   data->tlas_hole_anchor.clear();
   data->tlas_dynamic_first = 0u;
   data->tlas_refits_since_rebuild = 0u;
+  data->tlas_sway_deferred = false;
   data->tlas_wind_count = 0u;
   data->tlas_built = false;
   data->active_count = 0u;

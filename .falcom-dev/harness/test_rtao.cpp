@@ -1878,7 +1878,7 @@ static void TestPassShadersUnchanged() {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;
   };
-  CHECK(fnv(pass_a) == 0x557dcf62a545696cull, "pass A harness copy equals the recorded P2b t19 version (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
+  CHECK(fnv(pass_a) == 0xbcf4d7beeb61f2b6ull, "pass A harness copy equals the recorded P2b t19 version (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
   CHECK(fnv(pass_b) == 0xba6fc5c95a80cf38ull, "pass B harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
 }
 

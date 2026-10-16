@@ -128,7 +128,8 @@ void TracePixel(uint2 px)
             uint hits = 0u;
             uint invalid_refs = 0u;
             uint stack_overflow = 0u;
-            for (uint i = 0u; i < spp; ++i)
+            // Beyond Fade End the fade is 0 and ao is exactly 1.0: no ray is traced (rays/hits count only the faded range).
+            for (uint i = 0u; i < spp && distance_to_camera < g_rtao_fade.y; ++i)
             {
                 float2 u;
                 if (g_rtao_sampling.y > 0.5)

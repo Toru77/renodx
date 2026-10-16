@@ -884,7 +884,10 @@ inline void RebuildLiveTlas(
     *ms = LiveElapsedMs(phase_start);
     phase_start = PerfNow();
   };
-  std::vector<LiveTlasInstance> snapshot;
+  std::vector<LiveTlasInstance>& info = data->tlas_info_spare;  // the snapshot, then the filtered TLAS info
+  std::vector<LiveTlasInstance>& dynamic = data->tlas_dynamic_scratch;
+  info.clear();
+  dynamic.clear();
   uint64_t revision = 0u;
   uint64_t visibility_revision = 0u;
   uint64_t dynamic_revision = 0u;
@@ -905,13 +908,14 @@ inline void RebuildLiveTlas(
     g_pool.stats.wind_pass = {};
     g_pool.stats.wind_pass.frame = frame;
     g_pool.stats.wind_pass.switch_on = g_pool.alpha_wind_sway.load(std::memory_order_relaxed);
+    info.reserve(g_pool.instances.size());
     for (const WorldInstance& instance : g_pool.instances) {
       if (!PoolInstanceInRegion(instance, region) || instance.mesh_id >= g_pool.meshes.size()) continue;
       if (per_frame && g_pool.meshes[instance.mesh_id].dynamic && !g_pool.meshes[instance.mesh_id].alpha) {  // P2b: drawn per frame, not in the TLAS (alpha: never recorded)
         p2b_skipped += 1u;
         continue;
       }
-      LiveTlasInstance& copy = snapshot.emplace_back();
+      LiveTlasInstance& copy = info.emplace_back();
       copy.uid = g_pool.meshes[instance.mesh_id].uid;
       copy.alpha = g_pool.meshes[instance.mesh_id].alpha;
       copy.id = instance.id;
@@ -931,9 +935,13 @@ inline void RebuildLiveTlas(
       std::memcpy(copy.param2, instance.param2, sizeof(copy.param2));
       ApplyPoolWindSway(&copy, instance);
       copy.dynamic = instance.dynamic || copy.wind;  // swayed wind instances are refitted every present
+      if (copy.dynamic) {  // static entries first, then the dynamic ones, each in pool order
+        dynamic.push_back(copy);
+        info.pop_back();
+      }
     }
+    info.insert(info.end(), dynamic.begin(), dynamic.end());
   }
-  std::stable_partition(snapshot.begin(), snapshot.end(), [](const LiveTlasInstance& instance) { return !instance.dynamic; });
   lap(&diag.phase_ms[0]);
   // The switch is read once: the TLAS reflects it (commit), so a later switch is seen as a change.
   const uint8_t alpha_mode = AlphaMode();
@@ -965,18 +973,18 @@ inline void RebuildLiveTlas(
     g_pool.stats.tlas_wind_frame = frame;
   };
   std::vector<WorldInstanceGPU> instances;
-  std::vector<LiveTlasInstance> info;
   std::vector<BVHLeafGPU> leaves;
-  instances.reserve(snapshot.size());
-  info.reserve(snapshot.size());
-  leaves.reserve(snapshot.size());
+  instances.reserve(info.size());
+  leaves.reserve(info.size());
   uint32_t waiting = 0u;
   uint32_t unusable = 0u;
   uint32_t near_fade = 0u;
   uint32_t camera_hidden = 0u;
   uint32_t alpha_instances = 0u;
   uint32_t alpha_waiting = 0u;
-  for (LiveTlasInstance& instance : snapshot) {
+  size_t kept = 0u;  // in-place compaction: info[kept] takes each kept entry
+  for (size_t read = 0u; read < info.size(); ++read) {
+    LiveTlasInstance& instance = info[read];
     if (instance.alpha && alpha_mode == 0u) continue;  // alpha_foliage off: alpha-tested meshes are not traced
     const auto slot_it = data->slot_by_uid.find(instance.uid);
     if (slot_it == data->slot_by_uid.end() || slot_it->second >= data->descriptor_count) {
@@ -1003,9 +1011,11 @@ inline void RebuildLiveTlas(
     if ((flags & kInstanceCameraVisible) == 0u) camera_hidden += 1u;
     leaves.push_back(MakeLeaf(instance.bounds_min, instance.bounds_max, static_cast<uint32_t>(instances.size())));
     instances.push_back(descriptor);
-    info.push_back(instance);
     if (instance.wind) wind_count += 1u;
+    if (kept != read) info[kept] = instance;
+    kept += 1u;
   }
+  info.resize(kept);
   lap(&diag.phase_ms[1]);
   stats.tlas_waiting = waiting;
   stats.tlas_unusable = unusable;
@@ -1227,6 +1237,7 @@ inline void RebuildLiveTlas(
   stats.tlas_camera_hidden = camera_hidden;
   stats.tlas_nodes = static_cast<uint32_t>(data->tlas_nodes_cpu.size());
   finish();
+  data->tlas_info_spare = std::move(previous_info);  // the replaced TLAS info is the next rebuild's buffer
 }
 
 // Moves the dynamic instances of the TLAS to their pool poses without a rebuild:
@@ -2176,9 +2187,12 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
       RebuildLiveTlas(device, cmd_list, data, region, frame, change, allow_slack);
       // A skipped rebuild (same instances) leaves the dynamic poses to the refit: it runs in this present, as after a rebuild.
       if (data->tlas_check_frame == frame && data->tlas_store_version == data->store_version
-          && data->tlas_refits_since_rebuild < kLiveTlasRefitsPerRebuild
-          && (data->tlas_dynamic_revision != dynamic_revision || WindSwayPending(*data))) {
-        RefitLiveTlas(device, cmd_list, data, frame);
+          && data->tlas_refits_since_rebuild < kLiveTlasRefitsPerRebuild) {
+        if (data->tlas_dynamic_revision != dynamic_revision) {
+          RefitLiveTlas(device, cmd_list, data, frame);
+        } else if (WindSwayPending(*data)) {
+          data->tlas_sway_deferred = true;
+        }
       }
     } else if (data->tlas_built && frame >= data->tlas_retry_frame && data->tlas_refit_failed) {
       RebuildLiveTlas(device, cmd_list, data, region, frame, "refit failed", false);
@@ -2186,8 +2200,10 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
                && (data->tlas_dynamic_revision != dynamic_revision || WindSwayPending(*data))) {
       if (data->tlas_refits_since_rebuild >= kLiveTlasRefitsPerRebuild) {
         RebuildLiveTlas(device, cmd_list, data, region, frame, "refit quality", false);
-      } else {
+      } else if (data->tlas_dynamic_revision != dynamic_revision) {
         RefitLiveTlas(device, cmd_list, data, frame);
+      } else {
+        data->tlas_sway_deferred = true;
       }
     }
   }
@@ -2205,7 +2221,11 @@ inline void UpdateLiveBvh(reshade::api::device* device, reshade::api::command_qu
 inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::command_queue* queue) {
   if (device == nullptr || queue == nullptr) return;
   BvhDeviceData* data = GetBvhDeviceData(device);
-  if (data == nullptr || !g_live_bvh.enabled.load(std::memory_order_relaxed)) return;
+  if (data == nullptr) return;
+  // Read and cleared on every path: the flag is set by UpdateLiveBvh in this present only.
+  const bool sway_deferred = data->tlas_sway_deferred;
+  data->tlas_sway_deferred = false;
+  if (!g_live_bvh.enabled.load(std::memory_order_relaxed)) return;
   auto* cmd_list = queue->get_immediate_command_list();
   if (cmd_list == nullptr) return;
   const uint32_t frame = g_state.frame.load();
@@ -2214,9 +2234,9 @@ inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     dynamic_revision = g_pool.dynamic_revision;
   }
-  // A WindSwayPending clause here would be dead: it sits under the revision check above, so it is always true.
+  // The sway-only case comes from the flag (no revision move): UpdateLiveBvh left that refit to this call.
   if (data->tlas_built && frame >= data->tlas_retry_frame && !data->tlas_refit_failed
-      && data->tlas_store_version == data->store_version && data->tlas_dynamic_revision != dynamic_revision
+      && data->tlas_store_version == data->store_version && (data->tlas_dynamic_revision != dynamic_revision || sway_deferred)
       && data->tlas_refits_since_rebuild < kLiveTlasRefitsPerRebuild && (data->tlas_alpha_mode & ~AlphaMode()) == 0u) {
     const auto start = PerfNow();
     RefitLiveTlas(device, cmd_list, data, frame);

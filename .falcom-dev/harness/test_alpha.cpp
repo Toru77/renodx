@@ -2711,6 +2711,7 @@ static void TestWindSway(Device& dev, CmdList& cl, Queue& queue) {
       falcom_world::g_state.frame.fetch_add(1u);
       pool::DrainPoolScan(&dev, &queue);
       pool::UpdateLiveBvh(&dev, &queue);
+      pool::RefitLiveTlasAfterDrain(&dev, &queue);
     }
   };
   const uint64_t wind_key = pool::PoolMeshKey(make_draw());
