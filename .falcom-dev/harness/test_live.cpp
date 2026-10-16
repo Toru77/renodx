@@ -1600,18 +1600,37 @@ static void TestPerfRefusals(Device* dev) {
   bvh::ResetCacheDiagCounters();
 }
 
+// Position of `needle` at or after the first `anchor` in the text (npos when either is absent).
+static size_t FindAfter(const std::string& text, const char* anchor, const std::string& needle) {
+  const size_t from = text.find(anchor);
+  return from == std::string::npos ? std::string::npos : text.find(needle, from);
+}
+
+// The "value" of the first `key` at or after `anchor` (NaN when absent).
+static double ValueAt(const std::string& text, const char* anchor, const char* key) {
+  const size_t at = FindAfter(text, anchor, key);
+  if (at == std::string::npos) return std::numeric_limits<double>::quiet_NaN();
+  return std::strtod(text.c_str() + text.find("\"value\": ", at) + 9, nullptr);
+}
+
 // 30 s of presents at 16 ms: the window ends at the first present with elapsed >= 30 s (1875 intervals).
-static std::string RunPerfWindow(bvh::BvhDeviceData* data, uint32_t first_frame, bool collect, int* presents) {
+// spike_at >= 0: present spike_at takes a 24 ms stall (40 ms interval, then 16 ms again) and a 9.5 ms rebuild.
+// step_ms: the interval of each present (16 by default; 3 gives about 10000 presents in 30 s).
+static std::string RunPerfWindow(bvh::BvhDeviceData* data, uint32_t first_frame, bool collect, int* presents, int spike_at = -1, int step_ms = 16) {
   const auto base = std::chrono::steady_clock::now();
   const bvh::CacheSwitches sw{collect, false, false, true};
   bvh::g_cache_diag.enabled.store(collect);
   bvh::RequestPerfRun("window");
   bvh::UpdatePerfRun(data, first_frame, base, sw);
   int k = 0;
-  while (bvh::g_perf.active.load() && k < 5000) {
+  while (bvh::g_perf.active.load() && k < 12000) {
     ++k;
     PerfPresentCosts(data);
-    bvh::UpdatePerfRun(data, first_frame + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw);
+    if (k == spike_at) {
+      std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+      bvh::g_pool.tlas_timing.rebuild_ms_sum += 9.5f;
+    }
+    bvh::UpdatePerfRun(data, first_frame + static_cast<uint32_t>(k), base + std::chrono::milliseconds(step_ms * k + (spike_at >= 0 && k >= spike_at ? 24 : 0)), sw);
   }
   *presents = k;
   bvh::g_cache_diag.enabled.store(true);
@@ -1659,8 +1678,85 @@ static void TestPerfWindow(Device* dev) {
     CHECK(text.find("\"unattributed_cpu\": {\"avg_per_present\": {\"value\": 0,") != std::string::npos, "no bracket time: unattributed clamps to 0");
     CHECK(text.find("\"gpu_total\": {\"avg_per_measured_frame\": {\"value\": 2,") != std::string::npos, "GPU total is the trace average (2 ms)");
     CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit");
+    CHECK(text.find("\"frame_time\": {\"avg\": {\"value\": 16, \"unit\": \"ms\"}, \"avg_fps\": {\"value\": 62.5,") != std::string::npos
+              && text.find("\"max\": {\"value\": 16,") != std::string::npos && text.find("\"p99\": {\"value\": 16,") != std::string::npos
+              && text.find("\"hitches_over_25ms\": {\"value\": 0,") != std::string::npos && text.find("\"hitches_over_33_3ms\": {\"value\": 0,") != std::string::npos,
+          "frame time max and p99 are 16 ms, no hitch");
+    CHECK(FindAfter(text, "\"tlas_rebuild\"", "\"max_per_present\": {\"value\": 0.5, ") != std::string::npos, "rebuild maximum per present 0.5 ms");
+    CHECK(std::fabs(ValueAt(text, "\"cpu_total\"", "\"max_per_present\"") - 1.875) <= 0.005, "CPU total maximum per present 1.875 ms (+-0.005)");
+    CHECK(text.find("\"cpu_total\": {\"avg_per_present\": {\"value\": 1.875, \"unit\": \"ms/present\"}, \"max_per_present\": {\"value\": 1.87") != std::string::npos,
+          "CPU total maximum per present about 1.875 ms (real timers add a few us)");
+    CHECK(text.find("\"gpu_total\": {\"avg_per_measured_frame\": {\"value\": 2, \"unit\": \"ms/measured frame\"}, \"max_per_measured_frame\": {\"value\": 2,")
+              != std::string::npos, "GPU total maximum per measured frame 2 ms");
+    CHECK(text.find("\"series\": {\"capacity\": 8192, \"length\": 1875,") != std::string::npos, "series length equals the presents (1875)");
+    CHECK(text.find("\"tlas_dynamic_instances\": {\"avg\"") != std::string::npos, "dynamic instance gauge written");
   }
   CHECK(path_off != path_on, "the two runs write two files");
+  bvh::ResetCacheDiagCounters();
+}
+
+// One 40 ms present: the frame maximum is 40 ms, one hitch over 25 ms and one over 33.3 ms, the rebuild maximum is that present's
+// 10 ms (0.5 + 9.5), CPU total maximum 11.375 ms, and the series has one value per present (1874: the window ends at the first
+// present past 30 s, 16 ms x k + 24 ms stall).
+static void TestPerfSpike(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  int presents = 0;
+  const std::string result = RunPerfWindow(data, 9000u, true, &presents, 500);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  const std::string text = ReadDumpText(WrittenPath(result));
+  CHECK(JsonError(text).empty(), "spike perf file is valid JSON: %s", JsonError(text).c_str());
+  CHECK(presents == 1874 && text.find("\"series\": {\"capacity\": 8192, \"length\": 1874,") != std::string::npos,
+        "series has one value per present (%d presents)", presents);
+  CHECK(text.find("\"frame_time\": {\"avg\"") != std::string::npos && text.find("\"max\": {\"value\": 40,") != std::string::npos,
+        "frame time maximum is the 40 ms present");
+  CHECK(text.find("\"hitches_over_25ms\": {\"value\": 1,") != std::string::npos && text.find("\"hitches_over_33_3ms\": {\"value\": 1,") != std::string::npos,
+        "one hitch over 25 ms and one over 33.3 ms");
+  CHECK(text.find("\"p99\": {\"value\": 16,") != std::string::npos, "p99 is 16 ms (one present of 40 ms in 1874)");
+  CHECK(FindAfter(text, "\"tlas_rebuild\"", "\"max_per_present\": {\"value\": 10, ") != std::string::npos, "rebuild maximum per present is the 10 ms present");
+  CHECK(std::fabs(ValueAt(text, "\"cpu_total\"", "\"max_per_present\"") - 11.375) <= 0.005, "CPU total maximum is the spike present total (11.375 ms, +-0.005)");
+  CHECK(text.find("\"unattributed_cpu\": {\"avg_per_present\": {\"value\": 0, \"unit\": \"ms/present\"}, \"max_per_present\": {\"value\": 0,") != std::string::npos,
+        "unattributed maximum is the clamped 0");
+  CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit (spike)");
+  bvh::ResetCacheDiagCounters();
+}
+
+// Whole window past the series cap: 3 ms presents (about 10000 in 30 s), a 24 ms stall and a 9.5 ms rebuild at present 9000.
+// The series keeps the first 8192 presents (so its p99 is the 3 ms of those), the frame maximum is the 27 ms present, one hitch
+// over 25 ms, and the rebuild maximum is the spike present's 10 ms (over the whole window).
+static void TestPerfSeriesCap(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  uint32_t saved_start = 0u;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    saved_start = bvh::g_pool.episode_start_frame;
+    bvh::g_pool.episode_start_frame = 0u;
+  }
+  int presents = 0;
+  const std::string result = RunPerfWindow(data, 9000u, true, &presents, 9000, 3);
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    bvh::g_pool.episode_start_frame = saved_start;
+  }
+  const std::string text = ReadDumpText(WrittenPath(result));
+  CHECK(JsonError(text).empty(), "series cap perf file is valid JSON: %s", JsonError(text).c_str());
+  CHECK(presents == 9992, "window ends past the series cap (%d presents)", presents);
+  CHECK(text.find("\"series\": {\"capacity\": 8192, \"length\": 8192,") != std::string::npos, "series keeps the first 8192 presents");
+  CHECK(text.find("\"p99\": {\"value\": 3,") != std::string::npos, "p99 over the series is 3 ms (the stall is after the cap)");
+  CHECK(text.find("\"max\": {\"value\": 27,") != std::string::npos, "frame maximum is the 27 ms present (3 ms + 24 ms stall)");
+  CHECK(text.find("\"hitches_over_25ms\": {\"value\": 1,") != std::string::npos, "one hitch over 25 ms");
+  CHECK(FindAfter(text, "\"tlas_rebuild\"", "\"max_per_present\": {\"value\": 10, ") != std::string::npos, "rebuild maximum is the spike present's 10 ms");
+  CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit (series cap)");
   bvh::ResetCacheDiagCounters();
 }
 
@@ -2696,6 +2792,49 @@ static void TestPerfTab(Device* dev) {
   v = PerfTabNow();
   CHECK(std::isnan(v.gpu_now) && std::isnan(v.gpu_avg), "30 presents without samples: -- (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
 
+  // Maxima: rebuild +6.0 ms at present 20 and hooks 9.3 ms at present 35 (the rest 0.5 and 0.3); a 40 ms frame at 35 and a NaN
+  // frame at 36. Present 15 has a 2.0 ms bracket against 0.5 ms of InPresent rows: unattributed 1.5. The presents after it have
+  // negative raw values (clamped to 0), which must not lower the unattributed maximum. The CPU total maximum is the largest
+  // per-sample total (9.8), not the sum of the row maxima (15.3).
+  ResetPerfTab();
+  c = bvh::PerfCounters{};
+  bvh::UpdatePerfTab(c);
+  for (int i = 0; i < 40; ++i) {
+    c.cost[bvh::kPerfTlasRebuild] += i == 20 ? 6.0 : 0.5;
+    c.cost[bvh::kPerfPoolHooks] = i == 35 ? 9.3 : 0.3;
+    if (i == 15) c.cost[bvh::kPerfPresentWorldCpu] += 2.0;
+    bvh::UpdatePerfTab(c, i == 35 ? 40.0 : i == 36 ? std::numeric_limits<double>::quiet_NaN() : 16.0);
+  }
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.max.row[bvh::kPerfPoolHooks]), 9.3f, 1e-4f) && Near(static_cast<float>(v.max.row[bvh::kPerfTlasRebuild]), 6.0f, 1e-4f),
+        "row maxima (hooks %.4f, rebuild %.4f)", v.max.row[bvh::kPerfPoolHooks], v.max.row[bvh::kPerfTlasRebuild]);
+  CHECK(Near(static_cast<float>(v.max.cpu), 9.8f, 1e-4f) && Near(static_cast<float>(v.max.frame), 40.f, 1e-4f) && Near(static_cast<float>(v.max.unattr), 1.5f, 1e-4f),
+        "CPU total maximum 9.8 (not 15.3), frame maximum 40 (NaN skipped), unattributed maximum 1.5 kept (cpu %.4f frame %.4f unattr %.4f)", v.max.cpu, v.max.frame, v.max.unattr);
+  for (int i = 0; i < 30; ++i) {
+    c.cost[bvh::kPerfTlasRebuild] += 0.5;
+    c.cost[bvh::kPerfPoolHooks] = 0.3;
+    bvh::UpdatePerfTab(c, 16.0);
+  }
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.max.cpu), 0.8f, 1e-4f) && Near(static_cast<float>(v.max.row[bvh::kPerfPoolHooks]), 0.3f, 1e-4f) && Near(static_cast<float>(v.max.frame), 16.f, 1e-4f),
+        "after 30 more presents the spike is gone (cpu %.4f hooks %.4f frame %.4f)", v.max.cpu, v.max.row[bvh::kPerfPoolHooks], v.max.frame);
+
+  // A Gpu row maximum is over the presents with a sample: trace 2 ms (one sample), none, then 5 ms (one sample).
+  ResetPerfTab();
+  c = bvh::PerfCounters{};
+  bvh::UpdatePerfTab(c);
+  c.cost[bvh::kPerfGpuTrace] += 2.0;
+  c.events[bvh::kPerfGpuTrace] += 1u;
+  bvh::UpdatePerfTab(c);
+  bvh::UpdatePerfTab(c);
+  c.cost[bvh::kPerfGpuTrace] += 5.0;
+  c.events[bvh::kPerfGpuTrace] += 1u;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.max.row[bvh::kPerfGpuTrace]), 5.f, 1e-4f) && Near(static_cast<float>(v.max.gpu), 5.f, 1e-4f),
+        "GPU maximum over the measured presents (trace %.4f, total %.4f)", v.max.row[bvh::kPerfGpuTrace], v.max.gpu);
+  CHECK(std::isnan(v.max.row[bvh::kPerfGpuRtaoFilter]) && std::isnan(v.max.row[bvh::kPerfGpuAlphaBlit]), "a Gpu row never measured is --");
+
   // The live path feeds the tab at every present (UpdateCacheDiag), with the pool lock released by the caller.
   ResetPerfTab();
   bvh::UpdateCacheDiag(dev);
@@ -2829,6 +2968,8 @@ static void TestPerfGateOff(Device* dev, Queue* queue) {
     std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
     CHECK(bvh::g_perf.tab.count == 0u && !bvh::g_perf.tab.primed, "gathering off: the tab takes no sample");
   }
+  CHECK(std::isnan(PerfTabNow().max.frame) && std::isnan(PerfTabNow().max.cpu) && std::isnan(PerfTabNow().max.row[bvh::kPerfTlasRebuild]),
+        "gathering off: the tab maxima are --");
   {
     std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
     CHECK(bvh::g_cache_diag.data.frame_intervals == 0u, "gathering off: no frame interval");
@@ -2906,6 +3047,14 @@ static void TestPerfJsonKeys(Device* dev) {
   data->live.tlas_skip_ms_max = 0.f;
   const std::vector<std::string> lines = bvh::CacheDiagLines(data);
   CHECK(lines[0].find("OFF") == std::string::npos, "header line has no OFF suffix with gathering on");
+  // The perf file keys added for the maxima, the hitches, the series and the dynamic gauge (an empty run: the values are null).
+  bvh::PerfRunState empty;
+  const std::string perf = ReadDumpText(bvh::WritePerfFile(empty));
+  CHECK(JsonError(perf).empty(), "empty perf file is valid JSON: %s", JsonError(perf).c_str());
+  for (const char* key : {"\"max_per_present\"", "\"max_per_measured_frame\"", "\"p99\"", "\"hitches_over_25ms\"", "\"hitches_over_33_3ms\"",
+                          "\"series\"", "\"tlas_dynamic_instances\""}) {
+    CHECK(perf.find(key) != std::string::npos, "perf file has the key %s", key);
+  }
   bvh::ResetCacheDiagCounters();
 }
 
@@ -3981,6 +4130,8 @@ int main() {
   TestSlackAppliesDiag();
   TestPerfRefusals(&dev);
   TestPerfWindow(&dev);
+  TestPerfSpike(&dev);
+  TestPerfSeriesCap(&dev);
   TestPerfAbort(&dev);
   TestPerfSwitchesStable(&dev);
   TestPerfTab(&dev);

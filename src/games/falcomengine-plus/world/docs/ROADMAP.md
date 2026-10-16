@@ -60,6 +60,20 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## CPU spike step 1 (round 1, diagnostic only): Max 30 column, perf-file maxima, series (implemented, not validated in game)
+
+- Source: `world/docs/CPU_SPIKE_PLAN.md` section 4 (plan of 2026-10-16). No default, rendering, TLAS or pool change; fingerprint 0x55593b70e070e7fe unchanged; switches stay OFF by default.
+- Performance tab: a "Max 30" column after "Avg 30" in every table (rows, brackets, phases). Largest value of the window per row; "--" when no value. Gpu rows and gpu_total use only the presents that had a sample.
+- Perf file (schema 1, additive): `max_per_present` (CPU rows, subsets, brackets, unattributed_cpu, cpu_total), `max_per_measured_frame` (Gpu rows, gpu_total); `frame_time` gets `max`, `p99` (nearest rank over the series), `hitches_over_25ms`, `hitches_over_33_3ms`; new `series` block (per present: frame_ms, cpu_total, tlas_rebuild, tlas_refit; first 8192 presents, `capacity` and `length` written); gauge `tlas_dynamic_instances` (dynamic suffix of the TLAS).
+- Tab maxima are per-sample: the CPU total maximum is the largest per-sample total, not a sum of row maxima. Unattributed maximum is the largest per-sample clamped value.
+- Caveats for reading the numbers:
+  - Per-sample clamp versus file aggregate clamp: the file's unattributed and cpu_total averages clamp the window total once; the maxima and the series clamp each present. So Max is never below Avg in the tab, but the series mean can exceed the file's average.
+  - gpu_total Max covers only the Gpu rows measured in that present (about 99.5% of presents in the spike runs), so a present without a GPU sample contributes nothing to it.
+  - Float cumulative timers add a few microseconds of noise to maxima (for example cpu 1.87506 where the rows sum to 1.875).
+  - p99 and the series cover the first 8192 presents of a run; hitch counts and maxima cover the whole window.
+- Tests (harness `test_live`): TestPerfTab (row maxima over a spike, unattributed maximum kept against later negative raw values, GPU maximum over measured presents only, never-measured Gpu row --, NaN frame skipped, maxima age out of the window), TestPerfWindow, TestPerfSpike (one 40 ms present), TestPerfSeriesCap (3 ms presents past the cap: series 8192, frame max 27, p99 3), TestPerfJsonKeys (keys), TestPerfGateOff (tab maxima --).
+- Not validated in game. Owner check: Performance tab with gathering ON, Max 30 column on the first south turn (read which row spikes), then "Performance test (30 s)" during repeated north/south runs, and send the perf file.
+
 ## Performance tab rows and the gather switch (perf-rows-1): implemented, not validated in game
 - Timings appear only on the Performance tab. Every other timing readout of the BVH panel and the RTAO status row is removed; the same timings stay in the JSON dumps.
 - "Gather performance metrics" (first widget of the tab) is OFF by default (session only). OFF: no clock read for performance, no atomic write, no sum, no ring sample. Switching it OFF clears everything gathered (pool and live sums, maxima, last values, phase sums, GPU timer statistics, RTAO frame times, cache-diag timings, the tab window) on the next present. Dumps written while OFF carry `perf_gather: false` and zeros for the timings.

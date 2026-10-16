@@ -3,7 +3,8 @@
 // Performance tab and performance test (diagnostic only). The tab shows the cost of each present (now and the mean of
 // the last kPerfTabWindow presents); the test is a 30 s wall-clock window whose costs are written to perf_*.json. Frame
 // time is the interval between two successive presents (UpdateCacheDiag). Every cost is an average per present, so two
-// runs with different present counts compare fairly. Nothing is gathered while "Gather performance metrics" is off
+// runs with different present counts compare fairly. The window also keeps the largest value per row (PerfMaxima)
+// and, for the perf file, a per-present series; both are gather-only. Nothing is gathered while "Gather performance metrics" is off
 // (perf_gate.hpp): no counter is read and no sample is written.
 //
 // Lock rule: g_perf.mutex is a leaf lock. It is never held together with g_cache_diag.mutex or g_pool.mutex. The pool
@@ -21,6 +22,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "cache_diag.hpp"
 
@@ -120,13 +122,34 @@ inline constexpr bool PerfInTotal(const PerfCostInfo& info) {
   return info.role == kPerfInPresent || info.role == kPerfDrawTime || info.role == kPerfGpu;
 }
 
-enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeCount };
-inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "pool_instances", "pool_meshes", "slack_free_holes"};
+enum PerfGauge : size_t { kPerfGaugeTlasInstances, kPerfGaugeTlasDynamic, kPerfGaugePoolInstances, kPerfGaugePoolMeshes, kPerfGaugeSlackHoles, kPerfGaugeCount };
+inline constexpr const char* kPerfGaugeNames[kPerfGaugeCount] = {"tlas_instances", "tlas_dynamic_instances", "pool_instances", "pool_meshes", "slack_free_holes"};
 
 struct PerfCounters {
   double cost[kPerfCostCount] = {};
   uint64_t events[kPerfCostCount] = {};  // counted costs and GPU rows: rebuilds, skips, applies, refits, builds, GPU samples
   double gauge[kPerfGaugeCount] = {};
+};
+
+// Largest value of each row, of the frame interval and of the totals (NaN: no value). Row maxima are per present (Gpu rows:
+// per measured frame). The totals are the largest per-sample totals (PerfTotals), not sums of row maxima.
+struct PerfMaxima {
+  double row[kPerfCostCount];
+  double frame = std::numeric_limits<double>::quiet_NaN();
+  double unattr = std::numeric_limits<double>::quiet_NaN();
+  double cpu = std::numeric_limits<double>::quiet_NaN();
+  double gpu = std::numeric_limits<double>::quiet_NaN();
+  PerfMaxima() { std::fill(std::begin(row), std::end(row), std::numeric_limits<double>::quiet_NaN()); }
+};
+
+// Per-present series of a run (ms; frame_ms is the interval to the previous present). Only the first kPerfSeriesCapacity
+// presents are kept (the perf file's p99 is over the same presents); the counts and maxima cover the whole window.
+inline constexpr size_t kPerfSeriesCapacity = 8192;
+struct PerfSeries {
+  std::vector<double> frame_ms;
+  std::vector<double> cpu_total;
+  std::vector<double> tlas_rebuild;
+  std::vector<double> tlas_refit;
 };
 
 struct PerfRunState {
@@ -138,12 +161,16 @@ struct PerfRunState {
   uint32_t serial = 0u;  // PoolState::episode_serial at the start: a change aborts the run
   uint64_t presents = 0u;  // presents after the start present
   double frame_ms_sum = 0.0;
+  uint64_t hitches_over_25ms = 0u;    // frame intervals over 25 ms
+  uint64_t hitches_over_33_3ms = 0u;  // frame intervals over 33.3 ms
   double elapsed_s = 0.0;  // for the panel status line
   CacheSwitches start_switches;
   CacheSwitches end_switches;
   bool stable = true;  // no switch changed during the window
   PerfCounters prev;   // counters at the last present
   PerfCounters total;  // sums over the window
+  PerfMaxima max;      // largest per present over the window
+  PerfSeries series;
   std::string abort_reason;  // empty: the window completed
 };
 
@@ -176,6 +203,7 @@ struct PerfTabView {
   double gpu_avg = std::numeric_limits<double>::quiet_NaN();
   double frame_now = std::numeric_limits<double>::quiet_NaN();  // frame time: newest interval, and the mean over the window
   double frame_avg = std::numeric_limits<double>::quiet_NaN();
+  PerfMaxima max;  // largest over the window (Gpu rows: over the measured presents)
   PerfTabView() {
     std::fill(std::begin(now), std::end(now), std::numeric_limits<double>::quiet_NaN());
     std::fill(std::begin(avg), std::end(avg), std::numeric_limits<double>::quiet_NaN());
@@ -198,6 +226,62 @@ struct PerfState {
   PerfRunState run;           // the current or the last run
   PerfTabState tab;
 };
+
+// The totals of one row array (NaN: no value for a Gpu row). Unattributed CPU is the two present brackets minus the InPresent
+// rows (raw, then clamped at zero). CPU is the DrawTime and InPresent rows plus the clamped unattributed CPU. GPU is the sum
+// of the Gpu rows that have a value.
+struct PerfTotalsValue {
+  double unattr_raw = std::numeric_limits<double>::quiet_NaN();
+  double unattr = std::numeric_limits<double>::quiet_NaN();
+  double cpu = std::numeric_limits<double>::quiet_NaN();
+  double gpu = std::numeric_limits<double>::quiet_NaN();
+};
+inline PerfTotalsValue PerfTotals(const double* values) {
+  double in = 0.0, bracket = 0.0, draw = 0.0, gpu = 0.0;
+  bool gpu_any = false;
+  for (size_t i = 0; i < kPerfCostCount; ++i) {
+    const PerfRole role = kPerfCostInfo[i].role;
+    if (role == kPerfInPresent) {
+      in += values[i];
+    } else if (role == kPerfDrawTime) {
+      draw += values[i];
+    } else if (role == kPerfBracket) {
+      bracket += values[i];
+    } else if (role == kPerfGpu && !std::isnan(values[i])) {
+      gpu += values[i];
+      gpu_any = true;
+    }
+  }
+  PerfTotalsValue totals;
+  totals.unattr_raw = bracket - in;
+  totals.unattr = std::max(0.0, totals.unattr_raw);
+  totals.cpu = draw + in + totals.unattr;
+  totals.gpu = gpu_any ? gpu : std::numeric_limits<double>::quiet_NaN();
+  return totals;
+}
+
+// One present's values: a cumulative cost is its delta from prev, the others are this present's value; a Gpu row without a
+// sample in this present is NaN (not measured).
+inline PerfTabSample MakePerfSample(const PerfCounters& now, const PerfCounters& prev, double frame_ms) {
+  PerfTabSample sample;
+  sample.frame_ms = frame_ms;
+  for (size_t i = 0; i < kPerfCostCount; ++i) {
+    const double cost = kPerfCostInfo[i].cumulative && now.cost[i] >= prev.cost[i] ? now.cost[i] - prev.cost[i] : now.cost[i];
+    if (kPerfCostInfo[i].role != kPerfGpu) {
+      sample.value[i] = cost;
+      continue;
+    }
+    const uint64_t gained = now.events[i] >= prev.events[i] ? now.events[i] - prev.events[i] : now.events[i];
+    sample.measured[i] = gained != 0u;
+    sample.value[i] = gained != 0u ? cost / static_cast<double>(gained) : std::numeric_limits<double>::quiet_NaN();
+  }
+  return sample;
+}
+
+// Keeps the largest value that is not NaN (NaN: none yet).
+inline void MaxInto(double* max, double value) {
+  if (!std::isnan(value) && (std::isnan(*max) || value > *max)) *max = value;
+}
 
 inline PerfState g_perf;
 
@@ -244,6 +328,7 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfRefitPhase0 + p] = timing.refit_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfSlackPhase0 + p] = live.slack_phase_ms_sum[p];
   c.gauge[kPerfGaugeTlasInstances] = live.tlas_instances;
+  c.gauge[kPerfGaugeTlasDynamic] = static_cast<double>(data->tlas_info.size() - data->tlas_dynamic_first);  // the dynamic suffix
   c.gauge[kPerfGaugePoolInstances] = static_cast<double>(g_pool.instances.size());
   c.gauge[kPerfGaugePoolMeshes] = live.pool_meshes;
   c.gauge[kPerfGaugeSlackHoles] = live.slack_free_holes;
@@ -261,6 +346,20 @@ inline void WritePerfValue(std::ostringstream* out, double value, const char* un
   *out << ", \"unit\": \"" << unit << "\"}";
 }
 
+// A series: an array of numbers, NaN or infinite values written as null.
+inline void WritePerfArray(std::ostringstream* out, const std::vector<double>& values) {
+  *out << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0u) *out << ", ";
+    if (std::isfinite(values[i])) {
+      *out << values[i];
+    } else {
+      *out << "null";
+    }
+  }
+  *out << "]";
+}
+
 // Writes the perf file in PoolOutputDir()/diag and returns its path.
 inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -270,6 +369,13 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   const double presents = static_cast<double>(run.presents);
   const double actual_s = std::chrono::duration<double>(run.last - run.t0).count();
   const double avg_ms = run.presents != 0u ? run.frame_ms_sum / presents : nan;
+  std::vector<double> sorted = run.series.frame_ms;  // p99 (nearest rank) over the series
+  double p99 = nan;
+  if (!sorted.empty()) {
+    const size_t rank = (sorted.size() * 99u + 99u) / 100u;
+    std::sort(sorted.begin(), sorted.end());
+    p99 = sorted[rank - 1u];
+  }
   std::ostringstream out;
   out << "{\n  \"schema\": 1,\n  \"kind\": \"performance_test\",\n  \"build\": \"" << PoolJsonEscape(kWorldBuildId) << "\",\n";
   out << "  \"label\": \"" << PoolJsonEscape(label) << "\",\n  \"label_raw\": \"" << PoolJsonEscape(run.label) << "\",\n";
@@ -291,12 +397,20 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   WritePerfValue(&out, avg_ms, "ms");
   out << ", \"avg_fps\": ";
   WritePerfValue(&out, 1000.0 / avg_ms, "fps");
+  out << ", \"max\": ";
+  WritePerfValue(&out, run.max.frame, "ms");
+  out << ", \"p99\": ";
+  WritePerfValue(&out, p99, "ms");
+  out << ", \"hitches_over_25ms\": ";
+  WritePerfValue(&out, static_cast<double>(run.hitches_over_25ms), "count");
+  out << ", \"hitches_over_33_3ms\": ";
+  WritePerfValue(&out, static_cast<double>(run.hitches_over_33_3ms), "count");
   out << "},\n  \"switches\": {\"start\": ";
   WriteSwitchesJson(&out, run.start_switches);
   out << ", \"end\": ";
   WriteSwitchesJson(&out, run.end_switches);
   out << ", \"stable\": " << (run.stable ? "true" : "false") << "},\n  \"stats\": {";
-  double in_total = 0.0, bracket_total = 0.0, draw_total = 0.0, gpu_avg_sum = 0.0;
+  double gpu_avg_sum = 0.0;
   bool gpu_measured = false;
   for (size_t i = 0; i < kPerfCostCount; ++i) {
     const PerfCostInfo& info = kPerfCostInfo[i];
@@ -306,6 +420,8 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
     if (info.role == kPerfGpu) {
       out << "\"basis\": \"" << (run.total.events[i] != 0u ? "measured" : "not measured") << "\", \"avg_per_measured_frame\": ";
       WritePerfValue(&out, events != 0.0 ? total / events : nan, "ms/measured frame");
+      out << ", \"max_per_measured_frame\": ";
+      WritePerfValue(&out, run.max.row[i], "ms/measured frame");
       out << ", \"total\": ";
       WritePerfValue(&out, total, "ms");
       out << ", \"samples\": ";
@@ -317,6 +433,8 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
     } else {
       out << "\"avg_per_present\": ";
       WritePerfValue(&out, run.presents != 0u ? total / presents : nan, "ms/present");
+      out << ", \"max_per_present\": ";
+      WritePerfValue(&out, run.max.row[i], "ms/present");
       out << ", \"total\": ";
       WritePerfValue(&out, total, "ms");
       if (info.counted) {
@@ -327,9 +445,6 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
         out << ", \"rate\": ";
         WritePerfValue(&out, actual_s > 0.0 ? events / actual_s : nan, "count/s");
       }
-      if (info.role == kPerfInPresent) in_total += total;
-      if (info.role == kPerfDrawTime) draw_total += total;
-      if (info.role == kPerfBracket) bracket_total += total;
     }
     out << ", \"in_total\": " << (PerfInTotal(info) ? "true" : "false");
     if (info.phase != nullptr) out << ", \"phase\": \"" << info.phase << "\"";
@@ -349,23 +464,28 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
   WritePerfValue(&out, deform_cpu, "ms");
   out << ", \"in_total\": false}";
   // Unattributed CPU: the two present brackets minus the rows that run inside them, clamped at zero.
-  const double unattr_raw = bracket_total - in_total;
-  const double unattr_total = std::max(0.0, unattr_raw);
+  const PerfTotalsValue totals = PerfTotals(run.total.cost);
   out << ", \"unattributed_cpu\": {\"avg_per_present\": ";
-  WritePerfValue(&out, run.presents != 0u ? unattr_total / presents : nan, "ms/present");
+  WritePerfValue(&out, run.presents != 0u ? totals.unattr / presents : nan, "ms/present");
+  out << ", \"max_per_present\": ";
+  WritePerfValue(&out, run.max.unattr, "ms/present");
   out << ", \"total\": ";
-  WritePerfValue(&out, unattr_total, "ms");
-  out << ", \"clamped\": " << (unattr_raw < -0.01 * presents ? "true" : "false") << ", \"raw_total\": ";
-  WritePerfValue(&out, unattr_raw, "ms");
+  WritePerfValue(&out, totals.unattr, "ms");
+  out << ", \"clamped\": " << (totals.unattr_raw < -0.01 * presents ? "true" : "false") << ", \"raw_total\": ";
+  WritePerfValue(&out, totals.unattr_raw, "ms");
   out << ", \"in_total\": true}";
-  const double cpu_total = draw_total + in_total + unattr_total;
+  const double cpu_total = totals.cpu;
   out << ", \"cpu_total\": {\"avg_per_present\": ";
   WritePerfValue(&out, run.presents != 0u ? cpu_total / presents : nan, "ms/present");
+  out << ", \"max_per_present\": ";
+  WritePerfValue(&out, run.max.cpu, "ms/present");
   out << ", \"total\": ";
   WritePerfValue(&out, cpu_total, "ms");
   out << ", \"in_total\": false}";
   out << ", \"gpu_total\": {\"avg_per_measured_frame\": ";
   WritePerfValue(&out, gpu_measured ? gpu_avg_sum : nan, "ms/measured frame");
+  out << ", \"max_per_measured_frame\": ";
+  WritePerfValue(&out, run.max.gpu, "ms/measured frame");
   out << ", \"in_total\": false}";
   out << "},\n  \"gauges\": {";
   for (size_t i = 0; i < kPerfGaugeCount; ++i) {
@@ -373,6 +493,15 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
     WritePerfValue(&out, run.presents != 0u ? run.total.gauge[i] / presents : nan, "count");
     out << "}";
   }
+  // Per present, in ms (the frame interval for frame_ms); null where no value.
+  out << "},\n  \"series\": {\"capacity\": " << kPerfSeriesCapacity << ", \"length\": " << run.series.frame_ms.size() << ", \"frame_ms\": ";
+  WritePerfArray(&out, run.series.frame_ms);
+  out << ", \"cpu_total\": ";
+  WritePerfArray(&out, run.series.cpu_total);
+  out << ", \"tlas_rebuild\": ";
+  WritePerfArray(&out, run.series.tlas_rebuild);
+  out << ", \"tlas_refit\": ";
+  WritePerfArray(&out, run.series.tlas_refit);
   out << "}\n}\n";
   std::string text = out.str();
   renodx::utils::path::WriteTextFile(path, text);
@@ -515,7 +644,9 @@ inline void UpdatePerfRun(const BvhDeviceData* data, uint32_t frame, std::chrono
         running = false;  // a start in this present is judged on its own
       } else {
         run.presents += 1u;
-        run.frame_ms_sum += std::chrono::duration<double, std::milli>(now - run.last).count();
+        const double interval_ms = std::chrono::duration<double, std::milli>(now - run.last).count();
+        const PerfTabSample sample = MakePerfSample(counters, run.prev, interval_ms);
+        run.frame_ms_sum += interval_ms;
         run.last = now;
         run.elapsed_s = std::chrono::duration<double>(now - run.t0).count();
         run.end_switches = switches;
@@ -529,6 +660,20 @@ inline void UpdatePerfRun(const BvhDeviceData* data, uint32_t frame, std::chrono
           }
         }
         for (size_t i = 0; i < kPerfGaugeCount; ++i) run.total.gauge[i] += counters.gauge[i];
+        const PerfTotalsValue totals = PerfTotals(sample.value);
+        for (size_t i = 0; i < kPerfCostCount; ++i) MaxInto(&run.max.row[i], sample.value[i]);
+        MaxInto(&run.max.frame, interval_ms);
+        MaxInto(&run.max.unattr, totals.unattr);
+        MaxInto(&run.max.cpu, totals.cpu);
+        MaxInto(&run.max.gpu, totals.gpu);
+        if (interval_ms > 25.0) run.hitches_over_25ms += 1u;
+        if (interval_ms > 33.3) run.hitches_over_33_3ms += 1u;
+        if (run.series.frame_ms.size() < kPerfSeriesCapacity) {
+          run.series.frame_ms.push_back(interval_ms);
+          run.series.cpu_total.push_back(totals.cpu);
+          run.series.tlas_rebuild.push_back(sample.value[kPerfTlasRebuild]);
+          run.series.tlas_refit.push_back(sample.value[kPerfTlasRefit]);
+        }
         run.prev = counters;
         finished = run.elapsed_s >= kPerfWindowSeconds;
       }
@@ -552,6 +697,10 @@ inline void UpdatePerfRun(const BvhDeviceData* data, uint32_t frame, std::chrono
                  + std::to_string(episode_start) + "); press again from f" + std::to_string(settle_end);
       } else {
         run = PerfRunState{};
+        run.series.frame_ms.reserve(kPerfSeriesCapacity);
+        run.series.cpu_total.reserve(kPerfSeriesCapacity);
+        run.series.tlas_rebuild.reserve(kPerfSeriesCapacity);
+        run.series.tlas_refit.reserve(kPerfSeriesCapacity);
         run.label = g_perf.pending_label;
         run.t0 = now;
         run.last = now;
@@ -591,22 +740,8 @@ inline void UpdatePerfTab(const PerfCounters& now, double frame_ms = std::numeri
     tab.primed = true;
     return;
   }
-  PerfTabSample sample;
-  sample.frame_ms = frame_ms;
-  for (size_t i = 0; i < kPerfCostCount; ++i) {
-    const double cost = kPerfCostInfo[i].cumulative && now.cost[i] >= tab.prev.cost[i] ? now.cost[i] - tab.prev.cost[i] : now.cost[i];
-    if (kPerfCostInfo[i].role != kPerfGpu) {
-      sample.value[i] = cost;
-      continue;
-    }
-    const uint64_t gained = now.events[i] >= tab.prev.events[i] ? now.events[i] - tab.prev.events[i] : now.events[i];
-    if (gained != 0u) {
-      sample.value[i] = cost / static_cast<double>(gained);
-      sample.measured[i] = true;
-    }
-  }
+  tab.ring[tab.next] = MakePerfSample(now, tab.prev, frame_ms);
   tab.prev = now;
-  tab.ring[tab.next] = sample;
   tab.next = (tab.next + 1u) % kPerfTabWindow;
   tab.count = std::min(tab.count + 1u, kPerfTabWindow);
 
@@ -615,6 +750,7 @@ inline void UpdatePerfTab(const PerfCounters& now, double frame_ms = std::numeri
   size_t counts[kPerfCostCount] = {};
   for (size_t i = 0; i < kPerfCostCount; ++i) view.now[i] = std::numeric_limits<double>::quiet_NaN();
   view.frame_now = std::numeric_limits<double>::quiet_NaN();
+  view.max = PerfMaxima{};
   double frame_sum = 0.0;
   size_t frame_count = 0u;
   for (size_t k = 0; k < tab.count; ++k) {  // newest first
@@ -623,52 +759,34 @@ inline void UpdatePerfTab(const PerfCounters& now, double frame_ms = std::numeri
       if (frame_count == 0u) view.frame_now = s.frame_ms;
       frame_sum += s.frame_ms;
       frame_count += 1u;
+      MaxInto(&view.max.frame, s.frame_ms);
     }
     for (size_t i = 0; i < kPerfCostCount; ++i) {
       if (kPerfCostInfo[i].role == kPerfGpu && !s.measured[i]) continue;
       if (counts[i] == 0u) view.now[i] = s.value[i];
       sums[i] += s.value[i];
       counts[i] += 1u;
+      MaxInto(&view.max.row[i], s.value[i]);
     }
+    const PerfTotalsValue totals = PerfTotals(s.value);
+    MaxInto(&view.max.unattr, totals.unattr);
+    MaxInto(&view.max.cpu, totals.cpu);
+    MaxInto(&view.max.gpu, totals.gpu);
   }
   for (size_t i = 0; i < kPerfCostCount; ++i) {
     view.avg[i] = counts[i] != 0u ? sums[i] / static_cast<double>(counts[i]) : std::numeric_limits<double>::quiet_NaN();
   }
   view.frame_avg = frame_count != 0u ? frame_sum / static_cast<double>(frame_count) : std::numeric_limits<double>::quiet_NaN();
-  double in_now = 0.0, in_avg = 0.0, bracket_now = 0.0, bracket_avg = 0.0, cpu_now = 0.0, cpu_avg = 0.0;
-  double gpu_now = 0.0, gpu_avg = 0.0;
-  bool gpu_now_any = false, gpu_avg_any = false;
-  for (size_t i = 0; i < kPerfCostCount; ++i) {
-    const PerfRole role = kPerfCostInfo[i].role;
-    if (role == kPerfInPresent) {
-      in_now += view.now[i];
-      in_avg += view.avg[i];
-    } else if (role == kPerfBracket) {
-      bracket_now += view.now[i];
-      bracket_avg += view.avg[i];
-    } else if (role == kPerfGpu) {
-      if (!std::isnan(view.now[i])) {
-        gpu_now += view.now[i];
-        gpu_now_any = true;
-      }
-      if (!std::isnan(view.avg[i])) {
-        gpu_avg += view.avg[i];
-        gpu_avg_any = true;
-      }
-    }
-    if (PerfInTotal(kPerfCostInfo[i]) && role != kPerfGpu) {
-      cpu_now += view.now[i];
-      cpu_avg += view.avg[i];
-    }
-  }
-  view.unattr_raw_now = bracket_now - in_now;
-  view.unattr_raw_avg = bracket_avg - in_avg;
-  view.unattr_now = std::max(0.0, view.unattr_raw_now);
-  view.unattr_avg = std::max(0.0, view.unattr_raw_avg);
-  view.cpu_now = cpu_now + view.unattr_now;
-  view.cpu_avg = cpu_avg + view.unattr_avg;
-  view.gpu_now = gpu_now_any ? gpu_now : std::numeric_limits<double>::quiet_NaN();
-  view.gpu_avg = gpu_avg_any ? gpu_avg : std::numeric_limits<double>::quiet_NaN();
+  const PerfTotalsValue now_totals = PerfTotals(view.now);
+  const PerfTotalsValue avg_totals = PerfTotals(view.avg);
+  view.unattr_raw_now = now_totals.unattr_raw;
+  view.unattr_now = now_totals.unattr;
+  view.cpu_now = now_totals.cpu;
+  view.gpu_now = now_totals.gpu;
+  view.unattr_raw_avg = avg_totals.unattr_raw;
+  view.unattr_avg = avg_totals.unattr;
+  view.cpu_avg = avg_totals.cpu;
+  view.gpu_avg = avg_totals.gpu;
 }
 
 // The panel asks for a run; the next present decides (see UpdatePerfRun).

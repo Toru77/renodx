@@ -197,71 +197,74 @@ inline void DrawPerformanceTab() {
     ImGui::TextDisabled("Metrics are off. Switch on to measure. Dumps written while off carry no timings (see perf_gather in the file).");
     return;
   }
-  const auto row = [](const char* name, const char* unit, double now, double avg) {
+  const auto cell = [](double value) {
+    if (std::isnan(value)) {
+      ImGui::TextUnformatted("--");
+    } else {
+      ImGui::Text("%.3f", value);
+    }
+  };
+  const auto row = [&view, &cell](const char* name, const char* unit, double now, double avg, double max, bool clamped) {
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::TextUnformatted(name);
     ImGui::TableSetColumnIndex(1);
     ImGui::TextUnformatted(unit);
     ImGui::TableSetColumnIndex(2);
-    if (std::isnan(now)) {
-      ImGui::TextUnformatted("--");
-    } else {
-      ImGui::Text("%.3f", now);
-    }
+    cell(now);
     ImGui::TableSetColumnIndex(3);
-    if (std::isnan(avg)) {
-      ImGui::TextUnformatted("--");
-    } else {
-      ImGui::Text("%.3f", avg);
+    cell(avg);
+    if (clamped && ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Raw value before the clamp at zero: now %.3f ms, avg %.3f ms (the rows are not frame-aligned; see ROADMAP).",
+                        view.unattr_raw_now, view.unattr_raw_avg);
     }
+    ImGui::TableSetColumnIndex(4);
+    cell(max);
   };
   const auto header = [] {
     ImGui::TableSetupColumn("Cost");
     ImGui::TableSetupColumn("Unit");
     ImGui::TableSetupColumn("Now");
     ImGui::TableSetupColumn("Avg 30");
+    ImGui::TableSetupColumn("Max 30");
     ImGui::TableHeadersRow();
   };
-  if (ImGui::BeginTable("perf_rows", 4, ImGuiTableFlags_Borders)) {
+  if (ImGui::BeginTable("perf_rows", 5, ImGuiTableFlags_Borders)) {
     header();
-    row("frame_time", "ms/frame", view.frame_now, view.frame_avg);
+    row("frame_time", "ms/frame", view.frame_now, view.frame_avg, view.max.frame, false);
     for (size_t i = 0; i < kPerfCostCount; ++i) {
       const PerfRole role = kPerfCostInfo[i].role;
-      if (role == kPerfInPresent || role == kPerfDrawTime) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i]);
+      if (role == kPerfInPresent || role == kPerfDrawTime) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i], view.max.row[i], false);
     }
     const bool clamped = view.unattr_raw_now < -0.01 || view.unattr_raw_avg < -0.01;
-    row(clamped ? "unattributed_cpu (clamped)" : "unattributed_cpu", "ms/present", view.unattr_now, view.unattr_avg);
-    if (clamped && ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Raw value before the clamp at zero: now %.3f ms, avg %.3f ms (the rows are not frame-aligned; see ROADMAP).",
-                        view.unattr_raw_now, view.unattr_raw_avg);
-    }
+    // Dont change the name longer than unattributed_cpu (c)
+    row(clamped ? "unattributed_cpu (c)" : "unattributed_cpu", "ms/present", view.unattr_now, view.unattr_avg, view.max.unattr, clamped);
     for (size_t i = 0; i < kPerfCostCount; ++i) {
-      if (kPerfCostInfo[i].role == kPerfGpu) row(kPerfCostInfo[i].name, "ms/measured frame", view.now[i], view.avg[i]);
+      if (kPerfCostInfo[i].role == kPerfGpu) row(kPerfCostInfo[i].name, "ms/measured frame", view.now[i], view.avg[i], view.max.row[i], false);
     }
-    row("cpu_total", "ms/present", view.cpu_now, view.cpu_avg);
-    row("gpu_total", "ms/measured frame", view.gpu_now, view.gpu_avg);
+    row("cpu_total", "ms/present", view.cpu_now, view.cpu_avg, view.max.cpu, false);
+    row("gpu_total", "ms/measured frame", view.gpu_now, view.gpu_avg, view.max.gpu, false);
     ImGui::EndTable();
   }
   if (ImGui::CollapsingHeader("Present handlers (brackets; not in the totals)")) {
-    if (ImGui::BeginTable("perf_brackets", 4, ImGuiTableFlags_Borders)) {
+    if (ImGui::BeginTable("perf_brackets", 5, ImGuiTableFlags_Borders)) {
       header();
       for (size_t i = 0; i < kPerfCostCount; ++i) {
-        if (kPerfCostInfo[i].role == kPerfBracket) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i]);
+        if (kPerfCostInfo[i].role == kPerfBracket) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i], view.max.row[i], false);
       }
       ImGui::EndTable();
     }
   }
   if (ImGui::CollapsingHeader("BVH phases (subsets of the rows above; not in the totals)")) {
-    if (ImGui::BeginTable("perf_phases", 4, ImGuiTableFlags_Borders)) {
+    if (ImGui::BeginTable("perf_phases", 5, ImGuiTableFlags_Borders)) {
       header();
       for (size_t i = 0; i < kPerfCostCount; ++i) {
-        if (kPerfCostInfo[i].role == kPerfSubset) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i]);
+        if (kPerfCostInfo[i].role == kPerfSubset) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i], view.max.row[i], false);
       }
       ImGui::EndTable();
     }
   }
-  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window. CPU rows are per present; GPU rows are per measured frame (trace, alpha blit, P2b expand, deform refit, RTAO trace, RTAO filter). Unattributed CPU = the two present handlers minus the rows inside them.",
+  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window, max = largest of the window (per row; the totals are the largest per-sample totals, so they need not equal the sum of the row maxima). CPU rows are per present; GPU rows are per measured frame (trace, alpha blit, P2b expand, deform refit, RTAO trace, RTAO filter). Unattributed CPU = the two present handlers minus the rows inside them.",
                       static_cast<unsigned>(kPerfTabWindow));
   if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(g_diag_label);
   if (ImGui::IsItemHovered()) {
