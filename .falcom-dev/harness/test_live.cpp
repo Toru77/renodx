@@ -2536,6 +2536,90 @@ static void TestRefitGolden() {
   CHECK(g == 0x2bf515dfb5956c83ull, "refit golden equals HEAD pin (%016llx)", (unsigned long long)g);
 }
 
+// Cursor path (RefitLiveTlas galloping search): the dynamic suffix is ascending by id but interleaved with static
+// instances in the pool.
+static void TestRefitCursorInterleaved() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kA = 0xE1u, kS = 0xE2u;
+  AddMesh(kA, BoxMesh(0.8f));
+  AddMesh(kS, BoxMesh(0.5f));
+  for (int i = 0; i < 8; ++i) {
+    AddInstance(kA, 2.f * static_cast<float>(i), 0.f, 12.f);
+    AddInstance(kS, 2.f * static_cast<float>(i) + 1.f, 0.f, 20.f);
+  }
+  std::vector<uint64_t> dyn;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kA) dyn.push_back(inst.id);
+    }
+  }
+  uint64_t g = 14695981039346656037ull;
+  const auto step = [&](int presents) {
+    for (int i = 0; i < presents; ++i) {
+      rig.present();
+      g = RefitStateHash(data, g);
+    }
+  };
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  step(12);
+  for (size_t i = 0; i < dyn.size(); ++i) MoveRefitInstance(dyn[i], 2.f * static_cast<float>(i) + 0.4f, 12.f, frame());
+  step(10);
+  MoveRefitInstance(dyn[2], 4.9f, 12.f, frame());
+  MoveRefitInstance(dyn[6], 12.9f, 12.f, frame());
+  step(5);
+  std::printf("refit cursor interleaved: missing %u, instances %u\n", data->live.refit_missing, data->live.refit_instances);
+  CHECK(g == 0xcd7b1032cf8bae98ull, "refit cursor interleaved pin (%016llx)", (unsigned long long)g);
+}
+
+// Cursor miss (fallback path): dynamic instances removed from the pool in the middle of the suffix. The galloping
+// search cannot find them, so the full lower_bound decides and each one is counted as missing.
+static void TestRefitCursorMiss() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kA = 0xE3u, kS = 0xE4u;
+  AddMesh(kA, BoxMesh(0.8f));
+  AddMesh(kS, BoxMesh(0.5f));
+  for (int i = 0; i < 8; ++i) {
+    AddInstance(kA, 2.f * static_cast<float>(i), 0.f, 12.f);
+    AddInstance(kS, 2.f * static_cast<float>(i) + 1.f, 0.f, 20.f);
+  }
+  std::vector<uint64_t> dyn;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kA) dyn.push_back(inst.id);
+    }
+  }
+  uint64_t g = 14695981039346656037ull;
+  const auto step = [&](int presents) {
+    for (int i = 0; i < presents; ++i) {
+      rig.present();
+      g = RefitStateHash(data, g);
+    }
+  };
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  step(12);
+  for (size_t i = 0; i < dyn.size(); ++i) MoveRefitInstance(dyn[i], 2.f * static_cast<float>(i) + 0.4f, 12.f, frame());
+  step(10);
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const uint64_t id : {dyn[2], dyn[5]}) {
+      for (auto it = bvh::g_pool.instances.begin(); it != bvh::g_pool.instances.end(); ++it) {
+        if (it->id != id) continue;
+        bvh::g_pool.admitted_keys.erase(bvh::PoolAdmittedKey(it->mesh_id, falcom_world::MatrixHash(it->matrix, 12)));
+        bvh::g_pool.instances.erase(it);
+        break;
+      }
+    }
+    bvh::g_pool.dynamic_revision += 1u;
+  }
+  step(5);
+  std::printf("refit cursor miss: missing %u, instances %u\n", data->live.refit_missing, data->live.refit_instances);
+  CHECK(g == 0x969d56d0bdf3e0c6ull, "refit cursor miss pin (%016llx)", (unsigned long long)g);
+}
+
 static uint64_t SlackKey(uint32_t mesh) { return 0x300u + mesh; }
 
 // 36 meshes of 30 instances (1080 static instances): above kLiveSlackMinStatic, so the first build has 256 holes.
@@ -4648,6 +4732,8 @@ int main() {
   TestSkipQuality();
   TestSkipCadence();
   TestRefitGolden();
+  TestRefitCursorInterleaved();
+  TestRefitCursorMiss();
   TestSlackLayout();
   TestSlackApply();
   TestSlackExhaustion();

@@ -85,10 +85,11 @@ static void Place(float* m, float x, float y = 0.f, float z = 0.f, float rot = 0
   std::memcpy(m, values, sizeof(values));
 }
 
-// Golden for RetirePoolOrphans: a seeded pool of about 2000 instances over 150 keys (dynamic and static,
-// alpha and wind keys), observations at varied last-seen frames, and mutations between passes at frames
+// Golden for RetirePoolOrphans: a seeded pool of about 2000 instances over 150 keys (sparse), or 30 keys of
+// 80-150 (10 keys) and 10-60 (20 keys) instances with overlapping poses (dense); both have dynamic and static,
+// alpha and wind keys, observations at varied last-seen frames, and mutations between passes at frames
 // 100..900. Each pass hashes the instance ids, the stats, the admitted flags, the per-key retired counts
-// and the log lines. The pin is the HEAD value.
+// and the log lines. The pins are the HEAD values.
 static uint32_t OrphanRand(uint64_t* state) {
   *state = *state * 6364136223846793005ull + 1442695040888963407ull;
   return static_cast<uint32_t>(*state >> 33);
@@ -104,11 +105,11 @@ static void RunRetire(uint32_t frame, std::vector<std::string>* lines) {
   bvh::RetirePoolOrphans(frame, lines);
 }
 
-static void TestOrphanGolden() {
-  uint64_t seed = 0x5EEDu;
+static void TestOrphanGolden(bool dense, uint64_t pin) {
+  uint64_t seed = dense ? 0xD3A5Eu : 0x5EEDu;
   uint64_t g = 14695981039346656037ull;
-  const auto spawn = [&](uint32_t admit) {
-    const uint32_t k = OrphanRand(&seed) % 150u;
+  const uint32_t span = dense ? 40u : 200u;
+  const auto spawn = [&](uint32_t admit, uint32_t k) {
     bvh::WorldInstance inst;
     inst.id = bvh::g_pool.next_instance_id++;
     inst.mesh_key = 0x1000u + k;
@@ -116,8 +117,8 @@ static void TestOrphanGolden() {
     inst.dynamic = OrphanRand(&seed) % 3u == 0u;
     inst.admit_frame = admit;
     inst.last_follow_frame = inst.dynamic ? admit + OrphanRand(&seed) % 50u : 0u;
-    const float x = static_cast<float>(OrphanRand(&seed) % 200u);
-    const float z = static_cast<float>(OrphanRand(&seed) % 200u);
+    const float x = static_cast<float>(OrphanRand(&seed) % span);
+    const float z = static_cast<float>(OrphanRand(&seed) % span);
     const float s = 0.5f + static_cast<float>(OrphanRand(&seed) % 16u) * 0.1f;
     const float m[12] = {1.f, 0.f, 0.f, x, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, z};
     std::memcpy(inst.matrix, m, sizeof(m));
@@ -143,11 +144,21 @@ static void TestOrphanGolden() {
     bvh::g_pool.meshes.assign(8, bvh::WorldMesh{});
     bvh::g_pool.meshes[0].alpha = true;
     bvh::g_pool.meshes[1].alpha = true;
-    for (uint64_t k = 0u; k < 150u; k += 13u) bvh::g_pool.wind_keys.insert(0x1000u + k);
+    for (uint64_t k = 0u; k < 150u; k += dense ? 7u : 13u) bvh::g_pool.wind_keys.insert(0x1000u + k);
     bvh::g_pool.stats.orphans = 0u;
     bvh::g_pool.stats.orphans_retired = 0u;
     bvh::g_pool.orphan_lines_logged = 0u;
-    for (int i = 0; i < 2000; ++i) spawn(100u + OrphanRand(&seed) % 800u);
+    if (dense) {
+      for (uint32_t k = 0u; k < 30u; ++k) {
+        const uint32_t count = k < 10u ? 80u + OrphanRand(&seed) % 71u : 10u + OrphanRand(&seed) % 51u;
+        for (uint32_t i = 0u; i < count; ++i) spawn(100u + OrphanRand(&seed) % 800u, k);
+      }
+    } else {
+      for (int i = 0; i < 2000; ++i) {
+        const uint32_t admit = 100u + OrphanRand(&seed) % 800u;
+        spawn(admit, OrphanRand(&seed) % 150u);
+      }
+    }
   }
   for (uint32_t frame = 100u; frame <= 900u; frame += 10u) {
     if (frame > 100u) {
@@ -165,7 +176,7 @@ static void TestOrphanGolden() {
           default: inst.admit_frame = frame - OrphanRand(&seed) % 30u; break;
         }
       }
-      for (int j = 0; j < 4; ++j) spawn(frame);
+      for (int j = 0; j < 4; ++j) spawn(frame, OrphanRand(&seed) % (dense ? 30u : 150u));
     }
     std::vector<std::string> lines;
     RunRetire(frame, &lines);
@@ -185,7 +196,7 @@ static void TestOrphanGolden() {
     }
     for (const std::string& line : lines) OrphanHash(&g, line.data(), line.size());
   }
-  CHECK(g == 0x41df77d2deefffcdull, "orphan golden equals HEAD pin (%016llx)", (unsigned long long)g);
+  CHECK(g == pin, "orphan golden (%s) equals HEAD pin (%016llx)", dense ? "dense" : "sparse", (unsigned long long)g);
 }
 
 int main() {
@@ -1532,7 +1543,8 @@ int main() {
           snapshot().admitted, (unsigned long long)snapshot().orphans_retired);
   }
 
-  TestOrphanGolden();
+  TestOrphanGolden(false, 0x41df77d2deefffcdull);
+  TestOrphanGolden(true, 0x7b47699d2e25c765ull);
   HStage("29b. Orphans: a superseded dynamic instance retires at 60 frames; a lone one is kept to 600.");
   // 29b. Orphans: a superseded dynamic instance retires at 60 frames; a lone one is kept to 600.
   {

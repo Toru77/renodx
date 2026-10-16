@@ -561,14 +561,15 @@ inline void ApplyPoolWindSway(LiveTlasInstance* copy, const WorldInstance& insta
   copy->wind = false;
   if (!g_pool.alpha_wind_sway.load(std::memory_order_relaxed)) return;
   const bool wind_key = g_pool.wind_keys.count(instance.mesh_key) != 0u;
+  if (!wind_key) return;
   PoolWindPass& pass = g_pool.stats.wind_pass;
-  if (wind_key) pass.wind_key_instances += 1u;
+  pass.wind_key_instances += 1u;
   const auto sway = g_pool.wind_sway.find(instance.mesh_key);
-  if (wind_key && sway == g_pool.wind_sway.end()) {
+  if (sway == g_pool.wind_sway.end()) {
     if (pass.no_inputs == 0u) pass.no_input_first_key = instance.mesh_key;
     pass.no_inputs += 1u;
+    return;
   }
-  if (sway == g_pool.wind_sway.end() || !wind_key) return;
   copy->wind = true;
   const float origin[3] = {instance.matrix[3], instance.matrix[7], instance.matrix[11]};
   float extent = 0.f;
@@ -1279,15 +1280,27 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
       return;
     }
     updated.assign(data->tlas_info.begin() + df, data->tlas_info.end());
+    // Pool instances are kept sorted by ascending id (test_motion checks it). The dynamic suffix is ascending too:
+    // each search gallops forward from the previous hit, and a miss falls back to the full search.
+    const auto by_id = [](const WorldInstance& instance, uint64_t id) { return instance.id < id; };
+    auto cursor = g_pool.instances.begin();
     for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
       LiveTlasInstance& copy = updated[i - df];
-      // Pool instances are kept sorted by ascending id (test_motion checks it).
-      const auto it = std::lower_bound(g_pool.instances.begin(), g_pool.instances.end(), copy.id,
-                                       [](const WorldInstance& instance, uint64_t id) { return instance.id < id; });
+      auto lo = cursor;
+      auto hi = cursor;
+      for (std::ptrdiff_t step = 1; hi != g_pool.instances.end() && hi->id < copy.id; step *= 2) {
+        lo = hi + 1;
+        hi += (std::min)(step, g_pool.instances.end() - hi);
+      }
+      auto it = std::lower_bound(lo, hi, copy.id, by_id);
+      if (it == g_pool.instances.end() || it->id != copy.id) {
+        it = std::lower_bound(g_pool.instances.begin(), g_pool.instances.end(), copy.id, by_id);
+      }
       if (it == g_pool.instances.end() || it->id != copy.id) {
         missing += 1u;
         continue;
       }
+      cursor = it;
       const WorldInstance& instance = *it;
       std::memcpy(copy.matrix, instance.matrix, sizeof(copy.matrix));
       std::memcpy(copy.inverse_world, instance.inverse_world, sizeof(copy.inverse_world));

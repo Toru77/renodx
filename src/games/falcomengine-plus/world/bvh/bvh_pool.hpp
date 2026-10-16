@@ -1863,21 +1863,27 @@ struct PoolPose {
 struct PoolKeySeen {
   uint32_t newest = 0u;
   uint32_t count = 0u;
+  bool wind = false;
   std::vector<PoolPose> poses;
 };
 
 // Caller holds g_pool.mutex. seen[i] is PoolInstanceLastSeen of instance i.
 inline std::unordered_map<uint64_t, PoolKeySeen> PoolNewestSeenByKey(const std::vector<uint32_t>& seen) {
   std::unordered_map<uint64_t, PoolKeySeen> newest;
+  newest.reserve(g_pool.meshes.size());
   for (size_t i = 0; i < g_pool.instances.size(); ++i) {
     const WorldInstance& instance = g_pool.instances[i];
-    PoolKeySeen& key = newest[instance.mesh_key];
+    const auto [it, inserted] = newest.try_emplace(instance.mesh_key);
+    PoolKeySeen& key = it->second;
+    if (inserted) key.wind = g_pool.wind_keys.count(instance.mesh_key) != 0u;
     const uint32_t last_seen = seen[i];
     if (instance.dynamic) key.newest = (std::max)(key.newest, last_seen);
+    key.count += 1u;
+    if (key.wind) continue;
     PoolPose pose{last_seen, {}, {}};
     std::memcpy(pose.bounds_min, instance.bounds_min, sizeof(pose.bounds_min));
     std::memcpy(pose.bounds_max, instance.bounds_max, sizeof(pose.bounds_max));
-    if (++key.count <= kPoolGhostKeyMax) key.poses.push_back(pose);
+    if (key.count <= kPoolGhostKeyMax) key.poses.push_back(pose);
     else key.poses.clear();
   }
   return newest;
@@ -1904,6 +1910,7 @@ inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t seen, u
   const auto it = newest.find(instance.mesh_key);
   if (it == newest.end()) return false;
   if (instance.dynamic && it->second.newest > seen && frame > seen + kPoolMovingHoldFrames) return true;
+  if (PoolInstanceAlpha(instance) || it->second.wind) return false;
   for (const auto& pose : it->second.poses) {
     if (pose.seen <= seen + hold) continue;
     float overlap = 1.f;
@@ -1917,7 +1924,7 @@ inline bool PoolInstanceIsOrphan(const WorldInstance& instance, uint32_t seen, u
       pose_volume *= pose.bounds_max[k] - pose.bounds_min[k];
     }
     if (overlap > 0.f && overlap >= kPoolGhostOverlap * (std::min)(own_volume, pose_volume)) {
-      return !PoolInstanceAlpha(instance) && g_pool.wind_keys.count(instance.mesh_key) == 0u;
+      return true;
     }
   }
   return false;
@@ -1955,7 +1962,11 @@ inline void RetirePoolOrphans(uint32_t frame, std::vector<std::string>* lines) {
     seen[i] = PoolInstanceLastSeen(instance);
     candidate = candidate || frame > seen[i] + PoolOrphanHoldFrames(instance);
   }
-  const auto newest = candidate ? PoolNewestSeenByKey(seen) : std::unordered_map<uint64_t, PoolKeySeen>{};
+  if (!candidate) {
+    g_pool.stats.orphans = 0u;
+    return;
+  }
+  const auto newest = PoolNewestSeenByKey(seen);
   size_t index = 0u;
   uint64_t first_key = 0u;
   uint32_t first_unseen = 0u;
