@@ -1262,6 +1262,9 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     *ms = LiveElapsedMs(phase_start);
     phase_start = PerfNow();
   };
+  float camera[3] = {};
+  const float range = g_pool.wind_sway_range;
+  const bool gate = range < kPoolWindSwayRangeMax && PoolCameraPosition(camera);
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     dynamic_revision = g_pool.dynamic_revision;
@@ -1286,6 +1289,10 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     auto cursor = g_pool.instances.begin();
     for (uint32_t i = df; i < data->tlas_info.size(); ++i) {
       LiveTlasInstance& copy = updated[i - df];
+      if (gate && copy.wind && (std::max)({std::fabs(copy.matrix[3] - camera[0]), std::fabs(copy.matrix[7] - camera[1]), std::fabs(copy.matrix[11] - camera[2])}) > range) {
+        g_pool.stats.wind_pass.far_skipped += 1u;
+        continue;
+      }
       auto lo = cursor;
       auto hi = cursor;
       for (std::ptrdiff_t step = 1; hi != g_pool.instances.end() && hi->id < copy.id; step *= 2) {

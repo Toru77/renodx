@@ -3313,6 +3313,8 @@ static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
             && text.find("\"samples\": [") != std::string::npos,
         "dump: wind tlas, pass and samples written");
   CHECK(text.find("\"keys_with_inputs\": 1") != std::string::npos, "dump: wind keys_with_inputs written");
+  CHECK(text.find("\"wind_sway_range\": ") != std::string::npos && text.find("\"far_skipped\": ") != std::string::npos,
+        "dump: wind sway range and far_skipped written");
   CHECK(!HasNonFiniteToken(text), "world_pool.json has no nan or inf token (wind indirect)");
 
   // The alpha wind draw resolves as a wind rest pose with sway inputs (its alpha material and texture bound).

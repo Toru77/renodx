@@ -216,6 +216,8 @@ inline constexpr uint32_t kPoolDynamicInstances = 32768u;             // P2b: ex
 inline constexpr size_t kPoolMotionRuleSamples = 16u;
 inline constexpr float kPoolRegionMinSize = 64.f;
 inline constexpr float kPoolRegionMaxSize = 512.f;
+inline constexpr float kPoolWindSwayRangeMin = 25.f;
+inline constexpr float kPoolWindSwayRangeMax = 1044.f;
 inline constexpr float kPoolRegionRayMargin = 10.f;  // = RtaoRayMax maximum (world_settings.hpp); AO rays reach this far past the range
 
 // Why a scanned draw did not produce an instance copy. Non-rigid vertex
@@ -1019,6 +1021,7 @@ struct PoolWindPass {
   uint32_t applied = 0u;
   uint32_t skipped_nonfinite = 0u;
   uint32_t skipped_range = 0u;
+  uint32_t far_skipped = 0u;
   uint32_t zero_disp = 0u;  // applied with |displacement| < 1e-4
   uint32_t clamped = 0u;    // applied with the raw displacement above the cap
   float weight_min = 1.f;   // of the applied: min and max of 1/(flexibility+1)
@@ -1405,6 +1408,7 @@ struct PoolState {
   // The immediate command list (set at present), to tell deferred-context draws apart.
   std::atomic_uint64_t immediate_cmd_list{0u};
   float region_size = 256.f;  // BVH range R (m): pooled instances within R of the camera are in the TLAS
+  float wind_sway_range = kPoolWindSwayRangeMax;  // wind instances farther than this (Chebyshev, from the camera) keep their last pose in the refit; max = no limit. Session only, not saved
   std::mutex mutex;
 
   uint32_t logged_invalidations = 0u;  // stats.resource_invalidations at the last present
@@ -6903,6 +6907,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   }
   out << "\n  ],\n";
   out << "  \"wind_sway\": {\"switch\": " << (g_pool.alpha_wind_sway.load() ? "true" : "false")
+      << ", \"wind_sway_range\": " << PoolJsonFloat{g_pool.wind_sway_range}
       << ", \"keys_with_inputs\": " << wind_sway_keys << ", \"unread_draws\": " << stats.wind_sway_unread
       << ", \"instances_last_pass\": " << stats.wind_sway_instances
       << ", \"max_displacement_m\": " << PoolJsonFloat{stats.wind_sway_max_m}
@@ -6936,7 +6941,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
       << ", \"switch_on\": " << (pass.switch_on ? "true" : "false") << ", \"wind_key_instances\": " << pass.wind_key_instances
       << ", \"no_inputs\": " << pass.no_inputs << ", \"no_input_first_key\": \"" << renodx::utils::log::AsHex(pass.no_input_first_key)
       << "\", \"applied\": " << pass.applied << ", \"skipped_nonfinite\": " << pass.skipped_nonfinite
-      << ", \"skipped_range\": " << pass.skipped_range << ", \"zero_disp\": " << pass.zero_disp << ", \"clamped\": " << pass.clamped
+      << ", \"skipped_range\": " << pass.skipped_range << ", \"far_skipped\": " << pass.far_skipped << ", \"zero_disp\": " << pass.zero_disp << ", \"clamped\": " << pass.clamped
       << ", \"clamp_ratio\": " << PoolJsonFloat{pass.applied != 0u ? static_cast<float>(pass.clamped) / static_cast<float>(pass.applied) : 0.f}
       << ", \"weight_min\": " << PoolJsonFloat{pass.weight_min} << ", \"weight_max\": " << PoolJsonFloat{pass.weight_max}
       << ", \"clamp_ratio_max\": " << PoolJsonFloat{pass.clamp_ratio_max} << ", \"raw_max_m\": " << PoolJsonFloat{pass.raw_max_m} << "},\n";

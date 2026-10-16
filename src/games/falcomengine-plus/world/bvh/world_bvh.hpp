@@ -156,6 +156,13 @@ inline void DrawRayTracingRows() {
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", row.tooltip);
     ImGui::TextDisabled("%s", row.description);
+    if (row.flags.front() == &g_pool.alpha_wind_sway) {
+      ImGui::BeginDisabled(!on);
+      ImGui::SetNextItemWidth(150.f);
+      ImGui::SliderFloat("Wind sway range (m)", &g_pool.wind_sway_range, kPoolWindSwayRangeMin, kPoolWindSwayRangeMax, "%.0f");
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Wind foliage farther than this from the camera keeps its last pose during refits (saves CPU). Rebuilds still sway every instance. Maximum = no limit. Not saved; resets on restart.");
+      ImGui::EndDisabled();
+    }
   }
   if (changed) {
     LogPoolSwitches();

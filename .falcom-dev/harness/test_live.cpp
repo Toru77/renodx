@@ -2620,6 +2620,181 @@ static void TestRefitCursorMiss() {
   CHECK(g == 0x969d56d0bdf3e0c6ull, "refit cursor miss pin (%016llx)", (unsigned long long)g);
 }
 
+// Golden for the wind sway refit at the default range: eight wind instances at 15 to 200 m (Chebyshev from the camera
+// at (10,5,10)) are swayed every present, and a near and a far non-wind dynamic instance follow their poses. At the
+// default (maximum) range nothing is gated, so this pin holds across the wind range change.
+static void TestWindRangeGolden() {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xF1u, kD = 0xF2u;
+  AddMesh(kW, BoxMesh(1.3f));
+  AddMesh(kD, BoxMesh(0.8f));
+  const float wind_d[8] = {15.f, 15.f, 40.f, 40.f, 70.f, 70.f, 120.f, 200.f};
+  for (int i = 0; i < 8; ++i) AddInstance(kW, 10.f + wind_d[i], 0.f, 10.f + 0.5f * static_cast<float>(i));
+  AddInstance(kD, 14.f, 0.f, 12.f);
+  AddInstance(kD, 210.f, 0.f, 10.f);
+  std::vector<uint64_t> dyn;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kD) dyn.push_back(inst.id);
+    }
+    bvh::g_pool.wind_keys.insert(kW);
+    falcom_world::WindSwayParams wind;
+    wind.wave_frequency = 1.f;
+    wind.wind_force = 2.f;
+    wind.wind_dir[0] = 1.f;
+    wind.shake_scale = 0.5f;
+    wind.shake_speed = 1.f;
+    wind.shake_freq = 1.f;
+    wind.shake_wind_scale = 1.f;
+    wind.shake_flexibility = 3.f;
+    wind.layout = "test";
+    bvh::g_pool.wind_sway[kW] = wind;
+  }
+  CHECK(dyn.size() == 2u, "two non-wind dynamic candidates (%zu)", dyn.size());
+  uint64_t g = 14695981039346656037ull;
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  for (int i = 0; i < 40; ++i) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      bvh::g_pool.wind_sway[kW].wave_time = 0.1f * static_cast<float>(i);
+      bvh::g_pool.wind_sway[kW].game_time = 0.1f * static_cast<float>(i);
+    }
+    MoveRefitInstance(dyn[0], 14.f + 0.05f * static_cast<float>(i), 12.f, frame());
+    MoveRefitInstance(dyn[1], 210.f, 10.f + 0.05f * static_cast<float>(i), frame());
+    rig.present();
+    g = RefitStateHash(data, g);
+  }
+  CHECK(data->tlas_wind_count == 8u, "eight wind instances in the TLAS (%u)", data->tlas_wind_count);
+  std::printf("wind range golden %016llx\n", (unsigned long long)g);
+  CHECK(g == 0x1fd318de2089b679ull, "wind range golden equals HEAD pin (%016llx)", (unsigned long long)g);
+}
+
+// Wind range gate (refit only). Fresh rig per run: eight wind instances at kWindRangeDistance (Chebyshev from the camera
+// at (10,5,10)) and two non-wind dynamic instances (one near, one at 210 m). range_at[p] is the wind sway range set before
+// present p. The TLAS pose of every instance is recorded after each present.
+using WindPoses = std::vector<std::array<float, 16>>;  // the 8 wind instances, then the 2 non-wind dynamic ones
+struct WindRangeRun {
+  std::vector<WindPoses> poses;
+  std::vector<uint32_t> far_skipped;
+  std::vector<uint64_t> wind_ids;  // ascending id: wind_ids[i] is at kWindRangeDistance[i]
+  std::vector<uint64_t> dyn_ids;   // [0] near, [1] far
+  bool gpu_ok = false;
+};
+static const float kWindRangeDistance[8] = {15.f, 15.f, 40.f, 40.f, 70.f, 70.f, 120.f, 200.f};
+
+static WindRangeRun RunWindRange(const std::vector<float>& range_at) {
+  SkipRig rig;
+  bvh::BvhDeviceData* data = rig.data();
+  const uint64_t kW = 0xF3u, kD = 0xF4u;
+  AddMesh(kW, BoxMesh(1.3f));
+  AddMesh(kD, BoxMesh(0.8f));
+  for (int i = 0; i < 8; ++i) AddInstance(kW, 10.f + kWindRangeDistance[i], 0.f, 10.f + 0.5f * static_cast<float>(i));
+  AddInstance(kD, 14.f, 0.f, 12.f);
+  AddInstance(kD, 210.f, 0.f, 10.f);
+  WindRangeRun run;
+  {
+    std::lock_guard lock(bvh::g_pool.mutex);
+    for (const bvh::WorldInstance& inst : bvh::g_pool.instances) {
+      if (inst.mesh_key == kW) run.wind_ids.push_back(inst.id);
+      if (inst.mesh_key == kD) run.dyn_ids.push_back(inst.id);
+    }
+    bvh::g_pool.wind_keys.insert(kW);
+    falcom_world::WindSwayParams wind;
+    wind.wave_frequency = 1.f;
+    wind.wind_force = 2.f;
+    wind.wind_dir[0] = 1.f;
+    wind.shake_scale = 0.5f;
+    wind.shake_speed = 1.f;
+    wind.shake_freq = 1.f;
+    wind.shake_wind_scale = 1.f;
+    wind.shake_flexibility = 3.f;
+    wind.layout = "test";
+    bvh::g_pool.wind_sway[kW] = wind;
+  }
+  const auto frame = [] { return falcom_world::g_state.frame.load(); };
+  const auto record = [&]() {
+    std::map<uint64_t, std::array<float, 16>> by_id;  // ids are global across runs: compare by index
+    for (const bvh::LiveTlasInstance& t : data->tlas_info) std::memcpy(by_id[t.id].data(), t.matrix, sizeof(t.matrix));
+    WindPoses poses;
+    for (const uint64_t id : run.wind_ids) poses.push_back(by_id[id]);
+    for (const uint64_t id : run.dyn_ids) poses.push_back(by_id[id]);
+    run.poses.push_back(poses);
+    run.far_skipped.push_back(bvh::g_pool.stats.wind_pass.far_skipped);
+  };
+  for (size_t p = 0; p < range_at.size(); ++p) {
+    {
+      std::lock_guard lock(bvh::g_pool.mutex);
+      const float wave = 0.1f * static_cast<float>(p);
+      bvh::g_pool.wind_sway[kW].wave_time = wave;
+      bvh::g_pool.wind_sway[kW].game_time = wave;
+      bvh::g_pool.wind_sway_range = range_at[p];
+    }
+    MoveRefitInstance(run.dyn_ids[0], 14.f + 0.05f * static_cast<float>(p), 12.f, frame());
+    MoveRefitInstance(run.dyn_ids[1], 210.f, 10.f + 0.05f * static_cast<float>(p), frame());
+    rig.present();
+    record();
+  }
+  bvh::g_live_bvh.check_requested.store(true);
+  rig.present();
+  run.gpu_ok = data->live.gpu_ok;
+  return run;
+}
+
+static void TestWindRangeGate() {
+  const int kPresents = 30;
+  const std::vector<float> all_max(kPresents, 1044.f);
+  const WindRangeRun full = RunWindRange(all_max);
+  std::vector<float> near_only(kPresents, 50.f);
+  const WindRangeRun gated = RunWindRange(near_only);
+  std::vector<float> raised(kPresents, 50.f);
+  for (int p = 15; p < kPresents; ++p) raised[p] = 1044.f;
+  const WindRangeRun resumed = RunWindRange(raised);
+  const WindRangeRun wide(RunWindRange(std::vector<float>(kPresents, 1043.f)));
+
+  // Part 2: inside 50 m the refit matches the max-range run every present; beyond it the pose is frozen.
+  size_t near_mismatch = 0, far_moving = 0, follow_mismatch = 0;
+  size_t first_gated = kPresents;
+  for (size_t p = 0; p < gated.poses.size(); ++p) {
+    if (gated.far_skipped[p] != 0u && first_gated == kPresents) first_gated = p;
+  }
+  CHECK(first_gated > 0u && first_gated < static_cast<size_t>(kPresents), "gate engaged on a refit present (%zu)", first_gated);
+  const size_t frozen = first_gated - 1u;  // the pose the far instances keep: the TLAS before the first gated refit
+  for (size_t p = 0; p < gated.poses.size(); ++p) {
+    for (size_t i = 0; i < 4; ++i) {
+      if (gated.poses[p][i] != full.poses[p][i]) ++near_mismatch;
+    }
+    for (size_t i = 4; i < 8; ++i) {
+      if (p >= first_gated && gated.poses[p][i] != gated.poses[frozen][i]) ++far_moving;
+    }
+    for (size_t d = 0; d < 2; ++d) {
+      if (gated.poses[p][8 + d] != full.poses[p][8 + d]) ++follow_mismatch;
+    }
+  }
+  CHECK(near_mismatch == 0u, "range 50: instances within 50 m match the max-range run every present (%zu mismatches)", near_mismatch);
+  CHECK(far_moving == 0u, "range 50: instances beyond 50 m stay at their first gated pose (%zu changes)", far_moving);
+  CHECK(follow_mismatch == 0u, "range 50: the non-wind dynamic instances follow as at max (%zu mismatches)", follow_mismatch);
+  CHECK(full.poses[kPresents - 1][7] != full.poses[frozen][7], "max range: the far instance moves (sanity)");
+  bool far_count_ok = true;
+  for (size_t p = first_gated; p < gated.far_skipped.size(); ++p) far_count_ok = far_count_ok && gated.far_skipped[p] == 4u;
+  CHECK(far_count_ok, "range 50: far_skipped equals the 4 instances beyond 50 m every refit present");
+  CHECK(gated.gpu_ok && full.gpu_ok, "GPU check passes at range 50 and at max");
+
+  // Part 3: raised back to max at present 15: everything matches the max-range run from then on.
+  size_t resumed_mismatch = 0;
+  for (size_t p = 15; p < resumed.poses.size(); ++p) {
+    if (resumed.poses[p] != full.poses[p]) ++resumed_mismatch;
+  }
+  CHECK(resumed_mismatch == 0u, "range raised to max: far instances resume and match the max-range run (%zu presents differ)", resumed_mismatch);
+  CHECK(resumed.far_skipped[15] == 0u, "range raised to max: no skip at the raise (%u)", resumed.far_skipped[15]);
+
+  // Part 4: 1043 m: the gate runs, nothing is beyond it.
+  bool wide_same = wide.poses.size() == full.poses.size();
+  for (size_t p = 0; wide_same && p < wide.poses.size(); ++p) wide_same = wide.poses[p] == full.poses[p] && wide.far_skipped[p] == 0u;
+  CHECK(wide_same, "range 1043: poses equal the max-range run and far_skipped is 0 every present");
+}
+
 static uint64_t SlackKey(uint32_t mesh) { return 0x300u + mesh; }
 
 // 36 meshes of 30 instances (1080 static instances): above kLiveSlackMinStatic, so the first build has 256 holes.
@@ -4734,6 +4909,8 @@ int main() {
   TestRefitGolden();
   TestRefitCursorInterleaved();
   TestRefitCursorMiss();
+  TestWindRangeGolden();
+  TestWindRangeGate();
   TestSlackLayout();
   TestSlackApply();
   TestSlackExhaustion();

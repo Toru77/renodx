@@ -162,6 +162,14 @@ Harness (cache-diag-1): `test_live`: TestPoolResightTracker, TestCacheResight, T
 
 Owner steps: as Phase 0 (Reset diag counters, play two map changes, walk away and back, Dump), then send the `diag/cache_diag_*.json` file and the new "Re-sightings", "Re-sighting gap", "Time since reset", tier size lines and "Episode work" lines. Read "Histogram self-check: PASS". Not measured: GPU time of the capture read-back, and whether re-sighted content is identical beyond the signature.
 
+## Wind sway range slider (item A): implemented, not validated in game
+
+- Panel: "Wind sway range (m)" under "Foliage motion (wind and sway)" (25 to 1044 m, default 1044 = no limit; greyed while the sway switch is off). Session only, not saved. JSON: `wind_sway.wind_sway_range`, `wind_sway.pass.far_skipped`.
+- Effect: in a TLAS refit, a wind instance whose TLAS pose is farther than the range (Chebyshev, from the pool camera) keeps its last pose; it resumes when it is back in range or the range is raised. Only the refit is gated; the rebuild still sways every instance.
+- Not gated: the phase 1 descriptor compare and the rebuild snapshot. At the maximum the camera is not read (the gate is off), so normal output is unchanged.
+- Harness: `TestWindRangeGolden` pins the default-range refit and `TestWindRangeGate` checks the 50 m, raised and 1043 m cases (test_live); the dump keys are checked in `TestWindIndirectDiag` (test_alpha).
+- Not validated in game: owner steps and dumps to send back are pending.
+
 ## Current state (2026-10-09)
 
 Goal: hardware-free (compute) ray tracing in Trails in the Sky 2nd Chapter (D3D11) on RenoDX, DevKit-gated (`falcom_world::Use`/`AddSettings` do nothing unless `IsSora2nd() && IsDevkitPresent()`). All code is in `src/games/falcomengine-plus/world/`.
