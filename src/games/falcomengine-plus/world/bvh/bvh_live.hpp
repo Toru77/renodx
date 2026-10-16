@@ -97,6 +97,7 @@ struct LiveBvhSwitches {
 inline LiveBvhSwitches g_live_bvh;
 
 inline float LiveElapsedMs(std::chrono::steady_clock::time_point start) {
+  if (start == std::chrono::steady_clock::time_point{}) return 0.f;  // gather off (PerfNow)
   return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
@@ -287,7 +288,7 @@ inline LiveUploadResult UploadLiveMeshes(
   for (LiveMeshUpload& upload : *uploads) {
     LiveBuiltMesh mesh;
     mesh.upload = &upload;
-    const auto blas_start = std::chrono::steady_clock::now();
+    const auto blas_start = PerfNow();
     const char* error = BuildMeshBlas(upload.positions, upload.indices, &mesh.blas);
     const float blas_ms = LiveElapsedMs(blas_start);
     stats.blas_builds += 1u;
@@ -462,7 +463,7 @@ inline void SyncLiveMeshes(
     reshade::api::command_list* cmd_list,
     BvhDeviceData* data,
     uint32_t frame) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = PerfNow();
   const bool can_upload = frame >= data->upload_retry_frame;
   LiveMeshScan scan = ScanLiveMeshes(*data, can_upload);
   const uint32_t retired = RetireLiveSlots(data, scan.live_uids);
@@ -683,13 +684,13 @@ inline bool LiveSnapshotMatchesTlas(const BvhDeviceData& data, const std::vector
 inline bool TryApplyLiveTlasSlack(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data, uint32_t frame,
                                   const std::vector<WorldInstanceGPU>& instances, const std::vector<LiveTlasInstance>& info,
                                   const char** why, uint32_t* ops_out) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = PerfNow();
   LiveBvhStats& stats = data->live;
   float phase_ms[4] = {};
   auto phase_start = start;
   const auto lap = [&](float* ms) {
     *ms = LiveElapsedMs(phase_start);
-    phase_start = std::chrono::steady_clock::now();
+    phase_start = PerfNow();
   };
   const auto refuse = [&](const char* reason, uint32_t* counter) {
     *counter += 1u;
@@ -858,6 +859,9 @@ inline bool TryApplyLiveTlasSlack(reshade::api::device* device, reshade::api::co
   stats.slack_changed += static_cast<uint32_t>(changed.size());
   stats.slack_free_holes = static_cast<uint32_t>(data->tlas_free_slots.size());
   std::memcpy(stats.slack_phase_ms, phase_ms, sizeof(phase_ms));
+  if (ops != 0u) {
+    for (size_t p = 0; p < 4u; ++p) stats.slack_phase_ms_sum[p] += phase_ms[p];
+  }
   *ops_out = static_cast<uint32_t>(ops);
   return true;
 }
@@ -870,14 +874,14 @@ inline void RebuildLiveTlas(
     uint32_t frame,
     const char* reason,
     bool allow_slack) {
-  auto start = std::chrono::steady_clock::now();
+  auto start = PerfNow();
   LiveBvhStats& stats = data->live;
   CacheRebuildExtra diag;  // cache diagnostics: phase times (laps), no-op test, cause and reason
   diag.reason = reason;
   auto phase_start = start;
   const auto lap = [&](float* ms) {
     *ms = LiveElapsedMs(phase_start);
-    phase_start = std::chrono::steady_clock::now();
+    phase_start = PerfNow();
   };
   std::vector<LiveTlasInstance> snapshot;
   uint64_t revision = 0u;
@@ -1041,11 +1045,12 @@ inline void RebuildLiveTlas(
         && TryApplyLiveTlasSlack(device, cmd_list, data, frame, instances, info, &reason, &ops)) {
       commit(true);
       const float apply_ms = LiveElapsedMs(start);
-      stats.slack_apply_ms_sum += apply_ms;
-      stats.slack_apply_ms_max = (std::max)(stats.slack_apply_ms_max, apply_ms);
       if (ops == 0u) {
+        stats.slack_zero_op_applies += 1u;
         count_skip();
       } else {
+        stats.slack_apply_ms_sum += apply_ms;
+        stats.slack_apply_ms_max = (std::max)(stats.slack_apply_ms_max, apply_ms);
         CacheRebuildExtra applied;
         applied.applied = true;
         RecordCacheTlasRebuild(applied_before, data->tlas_info, true, frame, apply_ms, applied);
@@ -1073,6 +1078,7 @@ inline void RebuildLiveTlas(
     timing.rebuild_ms_sum += stats.tlas_ms_last;
     timing.rebuilds_by_cause[diag.cause] += 1u;
     timing.rebuild_ms_by_cause[diag.cause] += stats.tlas_ms_last;
+    for (size_t p = 0; p < 5u; ++p) timing.rebuild_phase_ms_sum[p] += diag.phase_ms[p];
     if ((sources & retire_bits) != 0u && (sources & admit_bits) != 0u) timing.rebuilds_mixed += 1u;
     timing.refits_since_rebuild = data->tlas_refits_since_rebuild;
     g_pool.stats.dynamic_tlas_per_frame = data->tlas_per_frame ? 1u : 0u;
@@ -1141,8 +1147,10 @@ inline void RebuildLiveTlas(
     diag.noop_full = LiveSnapshotMatchesTlas(*data, instances, info, true);
     diag.noop_static = LiveSnapshotMatchesTlas(*data, instances, info, false);
     const auto diag_time = std::chrono::steady_clock::now() - diag_start;
-    start += diag_time;
-    phase_start += diag_time;
+    if (start != std::chrono::steady_clock::time_point{}) {  // gathering on (PerfNow): the laps exclude the diagnostics
+      start += diag_time;
+      phase_start += diag_time;
+    }
   }
   std::vector<uint32_t> active(instances.size());
   for (uint32_t i = 0; i < active.size(); ++i) active[i] = info[i].id != 0u ? i : kLiveSlackSentinel;
@@ -1225,7 +1233,7 @@ inline void RebuildLiveTlas(
 // full rebuild ("refit failed").
 inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data,
                           uint32_t frame) {
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = PerfNow();
   LiveBvhStats& stats = data->live;
   std::vector<LiveTlasInstance> updated;
   uint64_t dynamic_revision = 0u;
@@ -1237,7 +1245,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
   auto phase_start = start;
   const auto lap = [&](float* ms) {
     *ms = LiveElapsedMs(phase_start);
-    phase_start = std::chrono::steady_clock::now();
+    phase_start = PerfNow();
   };
   {
     std::lock_guard<std::mutex> lock(g_pool.mutex);
@@ -1288,6 +1296,7 @@ inline void RefitLiveTlas(reshade::api::device* device, reshade::api::command_li
     g_pool.tlas_timing.refit_ms_max = stats.refit_ms_max;
     g_pool.tlas_timing.refit_ms_sum += stats.refit_ms_last;
     std::memcpy(g_pool.tlas_timing.refit_phase_ms, phase_ms, sizeof(phase_ms));
+    for (size_t p = 0; p < 4u; ++p) g_pool.tlas_timing.refit_phase_ms_sum[p] += phase_ms[p];
     g_pool.stats.tlas_wind_count = data->tlas_wind_count;
     g_pool.stats.tlas_sway_on = data->tlas_sway_on;
   };
@@ -1989,7 +1998,7 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
   if (data == nullptr) return;
   DynamicExpandGpu& dynamic = data->dynamic;
   dynamic.instance_count = 0u;
-  const auto start = std::chrono::steady_clock::now();
+  const auto start = PerfNow();
   std::vector<DynamicDrawGPU> table;
   uint32_t records = 0u;
   uint32_t not_resident = 0u;
@@ -2030,6 +2039,7 @@ inline void ExpandLiveDynamic(reshade::api::device* device, reshade::api::comman
     g_pool.stats.dynamic_records = records;
     g_pool.stats.dynamic_not_resident = not_resident;
     g_pool.stats.dynamic_expand_cpu_ms = LiveElapsedMs(start);
+    g_pool.stats.dynamic_expand_cpu_ms_sum += g_pool.stats.dynamic_expand_cpu_ms;
     g_pool.stats.dynamic_expand_gpu_ms = dynamic.timer.last_ms;
     g_pool.stats.dynamic_expand_presents += 1u;
     g_pool.stats.dynamic_expand_empty += table.empty() ? 1u : 0u;
@@ -2200,7 +2210,7 @@ inline void RefitLiveTlasAfterDrain(reshade::api::device* device, reshade::api::
   if (data->tlas_built && frame >= data->tlas_retry_frame && !data->tlas_refit_failed
       && data->tlas_store_version == data->store_version && data->tlas_dynamic_revision != dynamic_revision
       && data->tlas_refits_since_rebuild < kLiveTlasRefitsPerRebuild && (data->tlas_alpha_mode & ~AlphaMode()) == 0u) {
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = PerfNow();
     RefitLiveTlas(device, cmd_list, data, frame);
     std::lock_guard<std::mutex> lock(g_pool.mutex);
     PoolTlasTiming& timing = g_pool.tlas_timing;
@@ -2277,7 +2287,7 @@ inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& ex
     }
   }
   CacheTiers tiers;
-  const uint64_t capture_us = g_pool.cpu_capture_us.exchange(0u, std::memory_order_relaxed);
+  const bool gather = g_perf_gate.gather.load(std::memory_order_relaxed);
   PerfCounters counters;
   uint32_t serial = 0u;
   uint32_t pool_start = 0u;
@@ -2296,11 +2306,18 @@ inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& ex
     resight = g_pool.resight.counters;
     resight_tracked = g_pool.resight.by_signature.size();
     if (sample) ComputeCacheTiers(g_pool.instances, g_pool.meshes, camera, region, resident, &tiers);
-    counters = ReadPerfCounters(data, capture_us, extra);
+    if (gather) counters = ReadPerfCounters(data, extra);
   }
-  UpdatePerfTab(counters);
-  const auto present_time = std::chrono::steady_clock::now();
-  UpdatePerfRun(data, frame, capture_us, present_time, ReadCacheSwitches(), extra);
+  const auto present_time = PerfNow();
+  double frame_ms = std::numeric_limits<double>::quiet_NaN();
+  if (gather) {
+    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
+    if (g_cache_diag.data.last_present != std::chrono::steady_clock::time_point{}) {
+      frame_ms = std::chrono::duration<double, std::milli>(present_time - g_cache_diag.data.last_present).count();
+    }
+  }
+  if (gather) UpdatePerfTab(counters, frame_ms);
+  UpdatePerfRun(data, frame, present_time, ReadCacheSwitches(), extra);
   std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
   CacheDiagData& d = g_cache_diag.data;
   if (d.last_present != std::chrono::steady_clock::time_point{}) {
@@ -2352,7 +2369,7 @@ inline void UpdateCacheDiag(reshade::api::device* device, const PerfExtraGpu& ex
   CacheWork delta;  // BLAS counters are cleared by a device destroy (now < previous: the delta is now)
   delta.blas_builds = blas_builds < d.prev.blas_builds ? blas_builds : blas_builds - d.prev.blas_builds;
   delta.blas_ms = blas_ms < d.prev.blas_ms ? blas_ms : blas_ms - d.prev.blas_ms;
-  delta.capture_ms = static_cast<float>(capture_us) / 1000.f;
+  delta.capture_ms = static_cast<float>(g_pool.cpu_capture_frame_us.load(std::memory_order_relaxed)) / 1000.f;
   delta.capture_meshes = resight.capture_meshes - d.prev.capture_meshes;
   delta.capture_wait_sum = resight.capture_wait_sum - d.prev.capture_wait_sum;
   d.prev.blas_builds = blas_builds;

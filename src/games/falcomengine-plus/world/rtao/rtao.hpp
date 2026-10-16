@@ -192,6 +192,7 @@ inline reshade::api::resource_view OutputSrv(const RtaoDeviceData& rd) {
 
 // Binds, dispatches and unbinds. The AO and the history are written only by a pass that succeeded.
 inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtaoDispatchInputs& in) {
+  const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtao_record_us};
   auto* bvh_data = bvh::GetBvhDeviceData(device);
   if (bvh_data == nullptr || in.width == 0u || in.height == 0u) return {};
   RtaoDeviceData& data = GetRtaoDeviceData(device);
@@ -307,6 +308,7 @@ struct RtaoJsonInput {
   bool zero_motion;
   bool camera_matrix;
   bool freeze_noise;
+  bool perf_gather;
   uint32_t cpu_draws[4][2];  // camera opaque candidate draws by cull mode and front face
 };
 
@@ -403,6 +405,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
        << ", \"depth_w\": " << f.depth_w << ", \"depth_h\": " << f.depth_h << "}}";
   std::ostringstream out;
   out << "{\n  \"schema\": 2,\n  \"generated_frame\": " << in.generated_frame
+      << ",\n  \"perf_gather\": " << (in.perf_gather ? "true" : "false")
       << ",\n  \"reason\": \"" << ReasonName(f.reason) << "\""
       << ",\n  \"producing\": " << (f.producing ? "true" : "false")
       << ",\n  \"gpu_ms\": " << f.gpu_ms
@@ -501,6 +504,7 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
   in.zero_motion = g_test_zero_motion > 0.5f;
   in.camera_matrix = g_test_camera_matrix > 0.5f;
   in.freeze_noise = g_test_freeze_noise > 0.5f;
+  in.perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed);
   for (uint32_t cull = 0u; cull < 4u; ++cull) {
     for (uint32_t ccw = 0u; ccw < 2u; ++ccw) {
       in.cpu_draws[cull][ccw] = g_rtao_cull_hist[cull][ccw].load(std::memory_order_relaxed);
@@ -508,6 +512,15 @@ inline void MaybeCaptureRtaoStats(reshade::api::device* device, reshade::api::co
   }
   std::string text = BuildRtaoJson(in);
   renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtao.json", text);
+}
+
+// Gathering was switched OFF: clears the RTAO GPU timers and the newest RTAO frame times (see bvh::ClearPerfGathered).
+inline void ClearRtaoPerfGathered(reshade::api::device* device) {
+  RtaoDeviceData& data = GetRtaoDeviceData(device);
+  bvh::ClearGpuTimerStats(&data.timer);
+  bvh::ClearGpuTimerStats(&data.filter_timer);
+  g_rtao_frame.gpu_ms = -1.f;
+  g_rtao_frame.filter_gpu_ms = -1.f;
 }
 
 }  // namespace falcom_world::rtao

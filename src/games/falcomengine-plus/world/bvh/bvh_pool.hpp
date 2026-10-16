@@ -94,6 +94,7 @@
 #include "../debug/pool_stage.hpp"
 #include "../world_state.hpp"
 #include "camera_fade.hpp"
+#include "perf_gate.hpp"
 #include "pool_transform.hpp"
 
 namespace falcom_world::bvh {
@@ -1177,6 +1178,7 @@ struct PoolStats {
   uint32_t dynamic_records = 0u;      // P2b: expanded records of the last present (reserved; validity is not read back)
   uint32_t dynamic_not_resident = 0u;  // P2b: draws of the last present whose mesh is not resident in the live store
   float dynamic_expand_cpu_ms = 0.f;  // P2b: CPU time of the last expansion table
+  float dynamic_expand_cpu_ms_sum = 0.f;  // P2b: CPU time of every expansion table (gather on)
   float dynamic_expand_gpu_ms = 0.f;  // P2b: GPU time of the last expansion (resolved a present late)
   bool dynamic_ready = false;             // P2b: GPU objects ready (the expansion runs)
   uint32_t dynamic_instance_count = 0u;   // P2b: records of the last expansion (the trace reads them)
@@ -1252,8 +1254,10 @@ struct PoolPrevTrace {
 // Adds the CPU time of its scope to total_us (steady_clock, microseconds).
 struct PoolCpuTimer {
   std::atomic_uint64_t* total_us;
-  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  const bool armed = g_perf_gate.gather.load(std::memory_order_relaxed);
+  std::chrono::steady_clock::time_point start = armed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   ~PoolCpuTimer() {
+    if (!armed) return;
     total_us->fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                   std::chrono::steady_clock::now() - start).count()),
                         std::memory_order_relaxed);
@@ -1313,6 +1317,8 @@ struct PoolTlasTiming {
   float rebuild_ms_by_cause[3] = {};
   uint64_t rebuilds_mixed = 0u;  // rebuilds whose sources include both retire and admit
   float refit_phase_ms[4] = {};  // last refit: lock+copy, descriptors, nodes+validate, upload
+  float rebuild_phase_ms_sum[5] = {};  // cumulative phase CPU ms (kCachePhaseNames), gather on
+  float refit_phase_ms_sum[4] = {};    // cumulative phase CPU ms (names as refit_phase_ms), gather on
 };
 
 inline constexpr uint32_t kPoolResightGapEdges[4] = {120u, 600u, 1800u, 3600u};  // presents since retirement; an edge value goes to the upper bucket
@@ -1394,6 +1400,7 @@ struct PoolState {
   PoolResightTracker resight;
   std::atomic_uint64_t cpu_hook_frame_us{0u};
   std::atomic_uint64_t cpu_drain_frame_us{0u};
+  std::atomic_uint64_t cpu_capture_frame_us{0u};
   // The immediate command list (set at present), to tell deferred-context draws apart.
   std::atomic_uint64_t immediate_cmd_list{0u};
   float region_size = 256.f;  // BVH range R (m): pooled instances within R of the camera are in the TLAS
@@ -5708,8 +5715,11 @@ inline void WritePoolPrevTrace(const PoolPrevTrace& trace);
 // keeps geometry whose buffers are gone.
 inline void DrainPoolScan(reshade::api::device* device, reshade::api::command_queue* queue) {
   const PoolCpuTimer cpu_timer{&g_pool.cpu_drain_us};
-  g_pool.cpu_hook_frame_us = g_pool.cpu_hook_us.exchange(0u);
-  g_pool.cpu_drain_frame_us = g_pool.cpu_drain_us.exchange(0u);
+  if (g_perf_gate.gather.load(std::memory_order_relaxed)) {
+    g_pool.cpu_hook_frame_us = g_pool.cpu_hook_us.exchange(0u);
+    g_pool.cpu_drain_frame_us = g_pool.cpu_drain_us.exchange(0u);
+    g_pool.cpu_capture_frame_us = g_pool.cpu_capture_us.exchange(0u);
+  }
   if (device == nullptr || queue == nullptr) return;
   const bool scanning = g_pool.scan_active.load(std::memory_order_relaxed);
   const uint32_t frame = g_state.frame.load();
@@ -6788,6 +6798,7 @@ inline void DumpWorldPool(bool hide_camera_hidden = true) {
   std::ostringstream out;
   out << "{\n";
   out << "  \"schema\": 15,\n";
+  out << "  \"perf_gather\": " << (g_perf_gate.gather.load(std::memory_order_relaxed) ? "true" : "false") << ",\n";
   out << "  \"generated_frame\": " << frame << ",\n";
   out << "  \"files\": {\"summary\": \"world_pool.json\", \"meshes\": \"world_pool_meshes.json\", \"instances\": \"world_pool_instances.json\"},\n";
   out << "  \"meshes_total\": " << meshes.size() << ", \"instances_total\": " << instances.size()

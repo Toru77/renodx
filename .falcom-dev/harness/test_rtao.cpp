@@ -1196,6 +1196,19 @@ static const JNode* Member(const JNode& obj, const char* key) {
   }
   return nullptr;
 }
+// perf_gather follows the switch the dump was written with (the RTAO timings are only gathered while it is on).
+static std::string WorldJsonWithGather(bool gather) {
+  static rtao::RtaoFrameState f;
+  f = rtao::RtaoFrameState{};
+  static uint32_t values[rtao::kRtaoStatsCount];
+  std::memset(values, 0, sizeof(values));
+  rtao::RtaoJsonInput in = {};
+  in.frame = &f;
+  in.values = values;
+  in.generated_frame = 7u;
+  in.perf_gather = gather;
+  return rtao::BuildRtaoJson(in);
+}
 static std::string WorldJsonForState(int which) {
   static rtao::RtaoFrameState f;
   f = rtao::RtaoFrameState{};
@@ -1231,10 +1244,13 @@ static void CheckWorldJson(const char* name, const std::string& text) {
   JsonParser parser(text);
   CHECK(parser.Parse(&root), "%s: world_rtao.json parses as JSON (recursive-descent check)", name);
   CHECK(root.kind == JNode::Kind::Object, "%s: root is an object", name);
-  static const char* const root_keys[] = {"schema", "generated_frame", "reason", "producing", "gpu_ms", "texture_bytes",
+  static const char* const root_keys[] = {"schema", "generated_frame", "perf_gather", "reason", "producing", "gpu_ms", "texture_bytes",
                                           "frames_without_ao", "fade", "stats", "temporal", "two_sided_discovery",
                                           "temporal_diagnostics", "test_modes", "note"};
   for (const char* key : root_keys) CHECK(Member(root, key) != nullptr, "%s: root key %s is top level", name, key);
+  const JNode* perf_gather = Member(root, "perf_gather");
+  CHECK(perf_gather && perf_gather->kind == JNode::Kind::Bool && perf_gather->text == "false", "%s: perf_gather is false (gathering off)", name);
+  CHECK(WorldJsonWithGather(true).find("\"perf_gather\": true") != std::string::npos, "%s: perf_gather is true when gathering is on", name);
   const JNode* schema = Member(root, "schema");
   CHECK(schema && schema->text == "2", "%s: schema is 2", name);
   const JNode* temporal = Member(root, "temporal");

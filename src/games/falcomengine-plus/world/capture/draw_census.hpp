@@ -464,6 +464,7 @@ inline void OnWorldPresent(
   (void)dest_rect;
   (void)dirty_rect_count;
   (void)dirty_rects;
+  const bvh::PoolCpuTimer present_timer{&bvh::g_perf_gate.present_world_us};
   g_state.frame.fetch_add(1u);
   g_state.draw_counter = 0u;
   if (CaptureActive() && renodx::utils::constants::shared.data != nullptr) {

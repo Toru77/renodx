@@ -209,6 +209,7 @@ inline void OnWorldPresentBvh(
     const reshade::api::rect* dest_rect,
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects) {
+  const PoolCpuTimer present_timer{&g_perf_gate.present_bvh_us};
   (void)source_rect;
   (void)dest_rect;
   (void)dirty_rect_count;
@@ -216,6 +217,10 @@ inline void OnWorldPresentBvh(
   if (queue == nullptr || swapchain == nullptr) return;
   auto* device = queue->get_device();
   if (device == nullptr) return;
+  if (g_perf_gate.clear_pending.exchange(false)) {
+    ClearPerfGathered(GetBvhDeviceData(device));
+    rtao::ClearRtaoPerfGathered(device);
+  }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
   static const bool rtao_startup_enable = [] {
@@ -226,14 +231,16 @@ inline void OnWorldPresentBvh(
 
   UpdateLiveBvh(device, queue);
   PerfExtraGpu extra;
-  {
-    const rtao::RtaoDeviceData& rtao_data = rtao::GetRtaoDeviceData(device);
-    extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
-    extra.rtao_filter = {rtao_data.filter_timer.ms_sum, rtao_data.filter_timer.samples};
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
-    extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
+  if (g_perf_gate.gather.load(std::memory_order_relaxed)) {
+    {
+      const rtao::RtaoDeviceData& rtao_data = rtao::GetRtaoDeviceData(device);
+      extra.rtao = {rtao_data.timer.ms_sum, rtao_data.timer.samples};
+      extra.rtao_filter = {rtao_data.filter_timer.ms_sum, rtao_data.filter_timer.samples};
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+      extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
+    }
   }
   UpdateCacheDiag(device, extra);
   UpdateDeformLive(device, queue);

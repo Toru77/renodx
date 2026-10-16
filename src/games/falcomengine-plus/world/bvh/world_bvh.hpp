@@ -166,15 +166,8 @@ inline void DrawRayTracingRows() {
 // Label of the cache diagnostics dump and of the Performance test (file name only).
 inline char g_diag_label[64] = {};
 
-// Performance tab (world_settings.hpp): CPU and GPU ms over the last presents (UpdatePerfTab). NaN shows "--".
-inline void PerfMsText(const char* prefix, double ms) {
-  if (std::isnan(ms)) {
-    ImGui::Text("%s--", prefix);
-  } else {
-    ImGui::Text("%s%.2f ms", prefix, ms);
-  }
-}
-
+// Performance tab (world_settings.hpp): every timing of the add-on is shown here and nowhere else. Nothing is gathered
+// while "Gather performance metrics" is off (perf_gate.hpp). NaN shows "--".
 inline void DrawPerformanceTab() {
   PerfTabView view;
   bool running = false;
@@ -187,27 +180,93 @@ inline void DrawPerformanceTab() {
     elapsed_s = g_perf.run.elapsed_s;
     perf_label = g_perf.run.label;
   }
-  if (ImGui::BeginTable("perf_window", 2, ImGuiTableFlags_Borders)) {
-    ImGui::TableSetupColumn("CPU");
-    ImGui::TableSetupColumn("GPU");
-    ImGui::TableHeadersRow();
+  bool gather = g_perf_gate.gather.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Gather performance metrics", &gather)) {
+    g_perf_gate.clear_pending.store(!gather, std::memory_order_relaxed);  // OFF: the next present clears what was gathered
+    if (gather) {
+      std::lock_guard<std::mutex> lock(g_perf.mutex);
+      g_perf.tab = PerfTabState{};
+    }
+    g_perf_gate.gather.store(gather, std::memory_order_relaxed);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Costs a few clock reads per present and changes no rendering. Off (default): nothing is measured.\n"
+                      "Switching it off clears everything gathered.");
+  }
+  if (!gather) {
+    ImGui::TextDisabled("Metrics are off. Switch on to measure. Dumps written while off carry no timings (see perf_gather in the file).");
+    return;
+  }
+  const auto row = [](const char* name, const char* unit, double now, double avg) {
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
-    PerfMsText("", view.cpu_now);
-    PerfMsText("avg ", view.cpu_avg);
+    ImGui::TextUnformatted(name);
     ImGui::TableSetColumnIndex(1);
-    PerfMsText("", view.gpu_now);
-    PerfMsText("avg ", view.gpu_avg);
+    ImGui::TextUnformatted(unit);
+    ImGui::TableSetColumnIndex(2);
+    if (std::isnan(now)) {
+      ImGui::TextUnformatted("--");
+    } else {
+      ImGui::Text("%.3f", now);
+    }
+    ImGui::TableSetColumnIndex(3);
+    if (std::isnan(avg)) {
+      ImGui::TextUnformatted("--");
+    } else {
+      ImGui::Text("%.3f", avg);
+    }
+  };
+  const auto header = [] {
+    ImGui::TableSetupColumn("Cost");
+    ImGui::TableSetupColumn("Unit");
+    ImGui::TableSetupColumn("Now");
+    ImGui::TableSetupColumn("Avg 30");
+    ImGui::TableHeadersRow();
+  };
+  if (ImGui::BeginTable("perf_rows", 4, ImGuiTableFlags_Borders)) {
+    header();
+    row("frame_time", "ms/frame", view.frame_now, view.frame_avg);
+    for (size_t i = 0; i < kPerfCostCount; ++i) {
+      const PerfRole role = kPerfCostInfo[i].role;
+      if (role == kPerfInPresent || role == kPerfDrawTime) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i]);
+    }
+    const bool clamped = view.unattr_raw_now < -0.01 || view.unattr_raw_avg < -0.01;
+    row(clamped ? "unattributed_cpu (clamped)" : "unattributed_cpu", "ms/present", view.unattr_now, view.unattr_avg);
+    if (clamped && ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Raw value before the clamp at zero: now %.3f ms, avg %.3f ms (the rows are not frame-aligned; see ROADMAP).",
+                        view.unattr_raw_now, view.unattr_raw_avg);
+    }
+    for (size_t i = 0; i < kPerfCostCount; ++i) {
+      if (kPerfCostInfo[i].role == kPerfGpu) row(kPerfCostInfo[i].name, "ms/measured frame", view.now[i], view.avg[i]);
+    }
+    row("cpu_total", "ms/present", view.cpu_now, view.cpu_avg);
+    row("gpu_total", "ms/measured frame", view.gpu_now, view.gpu_avg);
     ImGui::EndTable();
   }
-  ImGui::TextDisabled("Last %u presents. CPU: non-GPU costs per present (RTAO command recording not included). GPU: sum of the six GPU timers that had samples (trace, alpha blit, P2b expand, deform refit, RTAO trace, RTAO filter).",
+  if (ImGui::CollapsingHeader("Present handlers (brackets; not in the totals)")) {
+    if (ImGui::BeginTable("perf_brackets", 4, ImGuiTableFlags_Borders)) {
+      header();
+      for (size_t i = 0; i < kPerfCostCount; ++i) {
+        if (kPerfCostInfo[i].role == kPerfBracket) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i]);
+      }
+      ImGui::EndTable();
+    }
+  }
+  if (ImGui::CollapsingHeader("BVH phases (subsets of the rows above; not in the totals)")) {
+    if (ImGui::BeginTable("perf_phases", 4, ImGuiTableFlags_Borders)) {
+      header();
+      for (size_t i = 0; i < kPerfCostCount; ++i) {
+        if (kPerfCostInfo[i].role == kPerfSubset) row(kPerfCostInfo[i].name, "ms/present", view.now[i], view.avg[i]);
+      }
+      ImGui::EndTable();
+    }
+  }
+  ImGui::TextDisabled("Last %u presents: now = newest present, avg = mean of the window. CPU rows are per present; GPU rows are per measured frame (trace, alpha blit, P2b expand, deform refit, RTAO trace, RTAO filter). Unattributed CPU = the two present handlers minus the rows inside them.",
                       static_cast<unsigned>(kPerfTabWindow));
   if (ImGui::Button("Performance test (30 s)")) RequestPerfRun(g_diag_label);
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("Averages over 30 s of presents, written to its own perf file. Keys: tlas_rebuild, tlas_skip, tlas_apply,\n"
-                      "tlas_refit, blas_build, mesh_capture, pool_hooks, pool_drain, deform_cpu (CPU ms per present); gpu_trace\n"
-                      "(BVH debug view trace), gpu_alpha_blit, gpu_p2b_expand, gpu_deform_refit, gpu_rtao, gpu_rtao_filter (GPU ms\n"
-                      "per measured frame). Start it after the map has settled (not during the refill after a map change).\n"
+    ImGui::SetTooltip("Averages over 30 s of presents, written to its own perf file (keys as in the table; perf_gather says whether gathering was on).\n"
+                      "Start it after the map has settled (not during the refill after a map change).\n"
                       "Label: optional, file name only.");
   }
   if (running) {
@@ -407,22 +466,6 @@ inline void DrawBvhPanel() {
   if (do_dump_obj) DumpWorldPoolObj();
   if (do_reset) ResetWorldPool();
 
-  PoolStats stats;
-  PoolTlasTiming tlas_timing;
-  PoolAlphaGpuStats gpu;
-  {
-    std::lock_guard<std::mutex> lock(g_pool.mutex);
-    stats = g_pool.stats;
-    tlas_timing = g_pool.tlas_timing;
-    gpu = g_pool.alpha_gpu;
-  }
-  float deform_refit_ms = -1.f;
-  {
-    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
-    deform_refit_ms = g_deform_live.refit_timer.last_ms;
-  }
-  ImGui::Text("Alpha and moving-object ms: alpha blit %.3f, alpha trace %.3f, expand cpu %.3f, expand gpu %.3f", gpu.blit_ms, gpu.trace_ms,
-              stats.dynamic_expand_cpu_ms, stats.dynamic_expand_gpu_ms);
 
   ImGui::SeparatorText("GPU BVH (live)");
   bool live = g_live_bvh.enabled.load(std::memory_order_relaxed);
@@ -492,30 +535,6 @@ inline void DrawBvhPanel() {
   }
   const LiveBvhStats& live_stats = data->live;
   if (CollectCacheErrors(data).total != 0u) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Errors recorded: see the dump (errors block)");
-  ImGui::Text("CPU: meshes %.2f ms, TLAS %.2f ms (refit %.2f ms)",
-              live_stats.mesh_ms_last, live_stats.tlas_ms_last, live_stats.refit_ms_last);
-  CacheDiagData diag;
-  {
-    std::lock_guard<std::mutex> lock(g_cache_diag.mutex);
-    diag = g_cache_diag.data;
-  }
-  ImGui::Text("TLAS CPU ms: rebuild avg %.2f / max %.2f, skip avg %.3f / max %.3f, apply avg %.3f / max %.3f, refit last %.3f / max %.3f",
-              tlas_timing.rebuilds != 0u ? tlas_timing.rebuild_ms_sum / static_cast<float>(tlas_timing.rebuilds) : 0.f, tlas_timing.rebuild_ms_max,
-              live_stats.tlas_skips != 0u ? live_stats.tlas_skip_ms_sum / static_cast<float>(live_stats.tlas_skips) : 0.f, live_stats.tlas_skip_ms_max,
-              live_stats.slack_applies != 0u ? live_stats.slack_apply_ms_sum / static_cast<float>(live_stats.slack_applies) : 0.f,
-              live_stats.slack_apply_ms_max, tlas_timing.refit_ms_last, tlas_timing.refit_ms_max);
-  ImGui::Text("Build/capture CPU ms: BLAS avg %.2f / max %.2f (since reset), capture total %.2f",
-              live_stats.blas_builds != 0u ? live_stats.blas_build_ms_sum / static_cast<float>(live_stats.blas_builds) : 0.f,
-              live_stats.blas_build_ms_max, diag.work.capture_ms);
-  ImGui::Text("Rebuild cost by cause (ms): retire %.2f, admit %.2f, other %.2f", tlas_timing.rebuild_ms_by_cause[0],
-              tlas_timing.rebuild_ms_by_cause[1], tlas_timing.rebuild_ms_by_cause[2]);
-  ImGui::Text("Refit phases (ms): copy %.3f / desc %.3f / nodes+validate %.3f / upload %.3f", tlas_timing.refit_phase_ms[0],
-              tlas_timing.refit_phase_ms[1], tlas_timing.refit_phase_ms[2], tlas_timing.refit_phase_ms[3]);
-  ImGui::Text("GPU: deform refit %.3f ms, trace %.2f ms", deform_refit_ms, data->trace_timer.last_ms);
-  ImGui::Text("Pool CPU per frame: hooks %.2f ms, drain %.2f ms, deform %.2f ms",
-              static_cast<double>(g_pool.cpu_hook_frame_us.load(std::memory_order_relaxed)) / 1000.0,
-              static_cast<double>(g_pool.cpu_drain_frame_us.load(std::memory_order_relaxed)) / 1000.0,
-              static_cast<double>(g_deform_live.cpu_frame_us.load(std::memory_order_relaxed)) / 1000.0);
   if (live_stats.gpu_checked) {
     const ImVec4 color = live_stats.gpu_ok ? ImVec4(0.4f, 1.f, 0.4f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f);
     ImGui::TextColored(color, "GPU contents: %s", live_stats.gpu_ok ? "match" : "MISMATCH");
@@ -526,14 +545,11 @@ inline void DrawBvhPanel() {
   for (const std::string& line : data->inspect.lines) ImGui::TextUnformatted(line.c_str());
   if (data->trace_stats.valid) DrawDepthCompareStats(data->trace_stats);
 
-  // Phase 0 cache diagnostics (diagnostic only: no rendering change). The panel shows the ms costs; every count is in the
-  // dump. Each dump and each performance test writes its own file in the diag folder.
+  // Phase 0 cache diagnostics (diagnostic only: no rendering change). Counts and timings are in the dump (timings when
+  // Gather performance metrics is on); costs are on the Performance tab. Each dump and each performance test writes its own file.
   ImGui::SeparatorText("Cache diagnostics (Phase 0 and 0b, diagnostic only: no rendering change)");
   bool collect = g_cache_diag.enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Collect cache diagnostics", &collect)) g_cache_diag.enabled.store(collect, std::memory_order_relaxed);
-  ImGui::Text("Frame: last %.2f ms, avg %.2f ms (since reset)", static_cast<double>(diag.frame_ms_last),
-              diag.frame_intervals != 0u ? diag.frame_ms_sum / static_cast<double>(diag.frame_intervals) : 0.0);
-  ImGui::TextUnformatted(CacheTlasPhaseLine(diag).c_str());
   ImGui::InputText("Label", g_diag_label, sizeof(g_diag_label));
   if (ImGui::Button("Dump cache diagnostics")) {
     // The first press asks the next present to compute the tiers; the press after that (once a present has run) writes the file.

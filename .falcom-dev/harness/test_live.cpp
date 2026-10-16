@@ -1371,13 +1371,14 @@ static void TestCacheEpisodeWork() {
 static void TestCacheCaptureTime(Device* dev) {
   bvh::ResetCacheDiagCounters();
   bvh::g_cache_diag.enabled.store(true);
-  bvh::g_pool.cpu_capture_us.store(2500u);
+  bvh::g_pool.cpu_capture_frame_us.store(2500u);
   bvh::UpdateCacheDiag(dev);
   {
     std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
-    CHECK(bvh::g_cache_diag.data.work.capture_ms == 2.5f && bvh::g_pool.cpu_capture_us.load() == 0u,
-          "2500 us of capture CPU gives 2.5 ms and clears the counter (%.3f ms)", (double)bvh::g_cache_diag.data.work.capture_ms);
+    CHECK(bvh::g_cache_diag.data.work.capture_ms == 2.5f && bvh::g_pool.cpu_capture_frame_us.load() == 2500u,
+          "2500 us of capture CPU (the drain's frame value) gives 2.5 ms (%.3f ms)", (double)bvh::g_cache_diag.data.work.capture_ms);
   }
+  bvh::g_pool.cpu_capture_frame_us.store(0u);
   bvh::ResetCacheDiagCounters();
 }
 
@@ -1403,7 +1404,7 @@ static void TestCacheDiagJson(Device* dev) {
   CHECK(text.find("\"live\": {\"tlas_instances\": " + std::to_string(live.tlas_instances) + ", \"tlas_rebuilds\": " + std::to_string(live.tlas_rebuilds)) != std::string::npos,
         "live block equals data->live");
   CHECK(text.find("\"tlas_frame\": " + std::to_string(live.tlas_frame) + ", \"refit_lag_last\": " + std::to_string(live.refit_lag_last)
-                  + ", \"refit_lag_max\": " + std::to_string(live.refit_lag_max) + "}") != std::string::npos,
+                  + ", \"refit_lag_max\": " + std::to_string(live.refit_lag_max)) != std::string::npos,
         "live block has tlas_frame and refit lag");
   bvh::ResetCacheDiagCounters();
 }
@@ -1565,30 +1566,30 @@ static void TestPerfRefusals(Device* dev) {
   bvh::g_pool.episode_start_frame = 4990u;  // 10 presents after the episode start
   bvh::g_pool.map_change_frame = 0u;
   bvh::RequestPerfRun("a");
-  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  bvh::UpdatePerfRun(data, 5000u, base, sw);
   CHECK(!bvh::g_perf.active.load() && PerfResult().find("refused: the pool is refilling") != std::string::npos,
         "refused during the refill (%s)", PerfResult().c_str());
   bvh::g_pool.episode_start_frame = 0u;
   bvh::g_pool.map_change_frame = 4000u;
   bvh::RequestPerfRun("b");
-  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  bvh::UpdatePerfRun(data, 5000u, base, sw);
   CHECK(!bvh::g_perf.active.load() && PerfResult().find("refused: a map change is being swept") != std::string::npos,
         "refused while a map change is swept (%s)", PerfResult().c_str());
   bvh::g_pool.episode_start_frame = 4600u;  // 400 presents after the episode start
   bvh::g_pool.map_change_frame = 0u;
   bvh::RequestPerfRun("c");
-  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  bvh::UpdatePerfRun(data, 5000u, base, sw);
   CHECK(bvh::g_perf.active.load() && PerfResult().find("started") != std::string::npos, "allowed 400 presents after the episode start");
   const uint32_t start_frame = bvh::g_perf.run.start_frame;
   bvh::RequestPerfRun("d");
-  bvh::UpdatePerfRun(data, 5001u, 0u, base + std::chrono::milliseconds(16), sw);
+  bvh::UpdatePerfRun(data, 5001u, base + std::chrono::milliseconds(16), sw);
   CHECK(bvh::g_perf.active.load() && bvh::g_perf.run.start_frame == start_frame && PerfResult().find("already active") != std::string::npos,
         "refused while active, the run is unchanged (%s)", PerfResult().c_str());
   {
     std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
     bvh::g_pool.episode_serial += 1u;
   }
-  bvh::UpdatePerfRun(data, 5002u, 0u, base + std::chrono::milliseconds(32), sw);
+  bvh::UpdatePerfRun(data, 5002u, base + std::chrono::milliseconds(32), sw);
   {
     std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
     bvh::g_pool.episode_serial = saved_serial;
@@ -1605,12 +1606,12 @@ static std::string RunPerfWindow(bvh::BvhDeviceData* data, uint32_t first_frame,
   const bvh::CacheSwitches sw{collect, false, false, true};
   bvh::g_cache_diag.enabled.store(collect);
   bvh::RequestPerfRun("window");
-  bvh::UpdatePerfRun(data, first_frame, 0u, base, sw);
+  bvh::UpdatePerfRun(data, first_frame, base, sw);
   int k = 0;
   while (bvh::g_perf.active.load() && k < 5000) {
     ++k;
     PerfPresentCosts(data);
-    bvh::UpdatePerfRun(data, first_frame + static_cast<uint32_t>(k), 0u, base + std::chrono::milliseconds(16 * k), sw);
+    bvh::UpdatePerfRun(data, first_frame + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw);
   }
   *presents = k;
   bvh::g_cache_diag.enabled.store(true);
@@ -1653,6 +1654,10 @@ static void TestPerfWindow(Device* dev) {
     CHECK(text.find("\"pool_hooks\": {\"avg_per_present\": {\"value\": 0.25,") != std::string::npos, "hooks average per present 0.25 ms");
     CHECK(text.find("\"gpu_trace\": {\"basis\": \"measured\", \"avg_per_measured_frame\": {\"value\": 2,") != std::string::npos,
           "GPU trace average per measured frame 2 ms");
+    CHECK(text.find("\"perf_gather\": true") != std::string::npos, "perf file says perf_gather true");
+    CHECK(text.find("\"cpu_total\": {\"avg_per_present\": {\"value\": 1.875,") != std::string::npos, "CPU total is the sum of the rows (1.875 ms)");
+    CHECK(text.find("\"unattributed_cpu\": {\"avg_per_present\": {\"value\": 0,") != std::string::npos, "no bracket time: unattributed clamps to 0");
+    CHECK(text.find("\"gpu_total\": {\"avg_per_measured_frame\": {\"value\": 2,") != std::string::npos, "GPU total is the trace average (2 ms)");
     CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit");
   }
   CHECK(path_off != path_on, "the two runs write two files");
@@ -1674,16 +1679,16 @@ static void TestPerfAbort(Device* dev) {
     bvh::g_pool.episode_start_frame = 0u;
   }
   bvh::RequestPerfRun("abort");
-  bvh::UpdatePerfRun(data, 5000u, 0u, base, sw);
+  bvh::UpdatePerfRun(data, 5000u, base, sw);
   for (int k = 1; k <= 3; ++k) {
     PerfPresentCosts(data);
-    bvh::UpdatePerfRun(data, 5000u + static_cast<uint32_t>(k), 0u, base + std::chrono::milliseconds(16 * k), sw);
+    bvh::UpdatePerfRun(data, 5000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw);
   }
   {
     std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
     bvh::g_pool.episode_serial += 1u;
   }
-  bvh::UpdatePerfRun(data, 5004u, 0u, base + std::chrono::milliseconds(64), sw);
+  bvh::UpdatePerfRun(data, 5004u, base + std::chrono::milliseconds(64), sw);
   const std::string result = PerfResult();
   const std::string text = ReadDumpText(WrittenPath(result));
   {
@@ -1714,21 +1719,21 @@ static void TestPerfSwitchesStable(Device* dev) {
   const bvh::CacheSwitches off{};
   const bvh::CacheSwitches slack{false, false, true, false};
   bvh::RequestPerfRun("switch");
-  bvh::UpdatePerfRun(data, 5000u, 0u, base, off);
+  bvh::UpdatePerfRun(data, 5000u, base, off);
   PerfPresentCosts(data);
-  bvh::UpdatePerfRun(data, 5001u, 0u, base + std::chrono::milliseconds(16), slack);
+  bvh::UpdatePerfRun(data, 5001u, base + std::chrono::milliseconds(16), slack);
   PerfPresentCosts(data);
   data->live.blas_builds = 7u;
   bvh::g_cache_diag.reset_requested.store(true);
   bvh::UpdateCacheDiag(dev);
   CHECK(data->live.blas_builds == 7u, "reset ignored while a run is active (builds %llu)", (unsigned long long)data->live.blas_builds);
   CHECK(PerfResult().find("Reset ignored") != std::string::npos, "reset ignored: result line says so");
-  bvh::UpdatePerfRun(data, 5002u, 0u, base + std::chrono::milliseconds(32), off);
+  bvh::UpdatePerfRun(data, 5002u, base + std::chrono::milliseconds(32), off);
   {
     std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
     bvh::g_pool.episode_serial += 1u;
   }
-  bvh::UpdatePerfRun(data, 5003u, 0u, base + std::chrono::milliseconds(48), off);
+  bvh::UpdatePerfRun(data, 5003u, base + std::chrono::milliseconds(48), off);
   const std::string text = ReadDumpText(WrittenPath(PerfResult()));
   {
     std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
@@ -1938,6 +1943,10 @@ static void TestCacheOnOff() {
   bvh::g_cache_diag.enabled.store(true);
   CHECK(CacheRunFingerprint(off) == 0x55593b70e070e7feull, "cache fingerprint OFF equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(off));
   CheckPerfLeg("pin_off_collect");
+  bvh::g_perf_gate.gather.store(false);
+  const CacheRun gather_off = RunCacheScenario(true);
+  bvh::g_perf_gate.gather.store(true);
+  CHECK(CacheRunFingerprint(gather_off) == 0x55593b70e070e7feull, "cache fingerprint with gathering OFF (the default) equals HEAD pin (%016llx)", (unsigned long long)CacheRunFingerprint(gather_off));
   bvh::g_live_bvh.skip_noop.store(true);
   bvh::RequestPerfRun("pin_on_skip");
   const CacheRun on_skip = RunCacheScenario(true);
@@ -2505,7 +2514,7 @@ static void TestSlackAppliesDiag() {
   CHECK(after[1] == before[1] && after[2] == before[2] && after[3] == before[3],
         "applies leave rebuilds, work rebuilds and reasons unchanged (%llu, %llu, %llu)", (unsigned long long)(after[1] - before[1]),
         (unsigned long long)(after[2] - before[2]), (unsigned long long)(after[3] - before[3]));
-  // Apply cost (every successful apply, zero-op applies included; the count equals slack_applies by construction in RebuildLiveTlas).
+  // Apply cost (applies with ops > 0; a zero-op apply is counted as a skip in tlas.noop/skips, not here).
   CHECK(data->live.slack_apply_ms_sum > 0.f && data->live.slack_apply_ms_max > 0.f, "apply ms recorded after an apply (sum %.4f, max %.4f)", data->live.slack_apply_ms_sum, data->live.slack_apply_ms_max);
   CHECK(data->live.slack_apply_ms_max <= data->live.slack_apply_ms_sum, "apply ms: max %.4f <= sum %.4f", data->live.slack_apply_ms_max, data->live.slack_apply_ms_sum);
   const std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
@@ -2678,10 +2687,11 @@ static void TestPerfTab(Device* dev) {
   c.events[bvh::kPerfGpuAlphaBlit] += 2u;
   bvh::UpdatePerfTab(c);
   v = PerfTabNow();
-  CHECK(Near(static_cast<float>(v.gpu_now), 2.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 2.5f, 1e-4f), "2 samples of 4 ms = 2 per sample (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
-  bvh::UpdatePerfTab(c);  // no sample: not measured, the current value stays the newest measured one
+  CHECK(Near(static_cast<float>(v.now[bvh::kPerfGpuAlphaBlit]), 2.f, 1e-4f) && Near(static_cast<float>(v.gpu_now), 5.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 5.f, 1e-4f),
+        "2 samples of 4 ms = 2 per sample; the GPU total is the sum of the rows (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
+  bvh::UpdatePerfTab(c);  // no sample: not measured, each row keeps its newest measured value
   v = PerfTabNow();
-  CHECK(Near(static_cast<float>(v.gpu_now), 2.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 2.5f, 1e-4f), "a present without samples is not averaged (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
+  CHECK(Near(static_cast<float>(v.gpu_now), 5.f, 1e-4f) && Near(static_cast<float>(v.gpu_avg), 5.f, 1e-4f), "a present without samples is not averaged (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
   for (int i = 0; i < 30; ++i) bvh::UpdatePerfTab(c);
   v = PerfTabNow();
   CHECK(std::isnan(v.gpu_now) && std::isnan(v.gpu_avg), "30 presents without samples: -- (now %.4f avg %.4f)", v.gpu_now, v.gpu_avg);
@@ -2696,6 +2706,207 @@ static void TestPerfTab(Device* dev) {
   }
   CHECK(g_under_lock == 0, "the tab takes no lock the caller holds (%d)", g_under_lock);
   ResetPerfTab();
+}
+
+// The unattributed CPU row: the two present brackets minus the rows inside them, clamped at zero. The CPU total is the sum
+// of the rows shown; the GPU total is the sum of the GPU rows that have a value.
+static void TestPerfUnattributed() {
+  ResetPerfTab();
+  bvh::PerfCounters c;
+  bvh::UpdatePerfTab(c);
+  c.cost[bvh::kPerfPresentWorldCpu] += 10.0;
+  c.cost[bvh::kPerfMeshCapture] = 7.0;
+  bvh::UpdatePerfTab(c);
+  bvh::PerfTabView v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.unattr_now), 3.f, 1e-4f) && Near(static_cast<float>(v.cpu_now), 10.f, 1e-4f),
+        "bracket 10 ms and rows 7 ms: unattributed 3, CPU total 10 (%.4f, %.4f)", v.unattr_now, v.cpu_now);
+  c.cost[bvh::kPerfPresentWorldCpu] += 10.0;
+  c.cost[bvh::kPerfMeshCapture] = 12.0;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(v.unattr_now == 0.0 && v.unattr_raw_now < -0.01 && Near(static_cast<float>(v.cpu_now), 12.f, 1e-4f),
+        "rows over the bracket clamp to 0 and are flagged (raw %.4f, CPU total %.4f)", v.unattr_raw_now, v.cpu_now);
+  c.cost[bvh::kPerfPresentWorldCpu] += 10.0;
+  c.cost[bvh::kPerfMeshCapture] = 10.004;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(v.unattr_now == 0.0 && v.unattr_raw_now < 0.0 && v.unattr_raw_now > -0.01, "a 4 us overrun clamps without the flag (raw %.4f)", v.unattr_raw_now);
+  c.cost[bvh::kPerfGpuTrace] += 2.0;
+  c.events[bvh::kPerfGpuTrace] += 1u;
+  c.cost[bvh::kPerfGpuRtao] += 1.0;
+  c.events[bvh::kPerfGpuRtao] += 1u;
+  bvh::UpdatePerfTab(c);
+  v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.gpu_now), 3.f, 1e-4f) && std::isnan(v.now[bvh::kPerfGpuAlphaBlit]),
+        "GPU total is the sum of the rows with a value (%.4f)", v.gpu_now);
+  ResetPerfTab();
+}
+
+// The timer that feeds every CPU stopwatch adds nothing while gathering is off and the measured time while it is on.
+static void TestPerfTimerGate() {
+  std::atomic_uint64_t total{0u};
+  bvh::g_perf_gate.gather.store(false);
+  {
+    const bvh::PoolCpuTimer timer{&total};
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  CHECK(total.load() == 0u, "PoolCpuTimer with gathering off adds nothing (%llu us)", (unsigned long long)total.load());
+  bvh::g_perf_gate.gather.store(true);
+  {
+    const bvh::PoolCpuTimer timer{&total};
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  CHECK(total.load() >= 1000u, "PoolCpuTimer with gathering on adds the scope time (%llu us)", (unsigned long long)total.load());
+}
+
+// The drain row is the drain minus the capture inside it, so the capture is counted once; the tab total counts it once.
+static void TestPerfCaptureInDrain(Device* dev) {
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  bvh::g_perf_gate.gather.store(true);
+  bvh::g_pool.cpu_drain_frame_us.store(5000u);
+  bvh::g_pool.cpu_capture_frame_us.store(2000u);
+  bvh::g_pool.cpu_hook_frame_us.store(0u);
+  bvh::g_deform_live.cpu_frame_us.store(0u);
+  bvh::PerfCounters c;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    c = bvh::ReadPerfCounters(data);
+  }
+  const double excl = c.cost[bvh::kPerfPoolDrainExclCapture];
+  const double capture = c.cost[bvh::kPerfMeshCapture];
+  CHECK(Near(static_cast<float>(excl), 3.f, 1e-4f) && Near(static_cast<float>(capture), 2.f, 1e-4f) && Near(static_cast<float>(excl + capture), 5.f, 1e-4f),
+        "drain 5 ms with capture 2 ms: excluding row %.4f, capture %.4f", excl, capture);
+  CHECK(excl >= 0.0, "the drain row is never negative (%.4f)", excl);
+  ResetPerfTab();
+  bvh::UpdatePerfTab(c);  // primes
+  bvh::UpdatePerfTab(c);  // same counters: cumulative rows add nothing, the per-present rows are this present
+  const bvh::PerfTabView v = PerfTabNow();
+  CHECK(Near(static_cast<float>(v.cpu_now), 5.f, 1e-4f), "the tab counts the drain once (CPU total %.4f)", v.cpu_now);
+  bvh::g_pool.cpu_drain_frame_us.store(0u);
+  bvh::g_pool.cpu_capture_frame_us.store(0u);
+  ResetPerfTab();
+}
+
+// Gathering OFF gathers nothing: no tab sample, no sum, no stopwatch value, no frame value is exchanged. The switch's clear
+// zeroes what was gathered and the dump says perf_gather false. The same sequence with gathering ON does gather.
+static bool PerfSumsZero(bvh::BvhDeviceData* data) {
+  std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+  const bvh::PoolTlasTiming& t = bvh::g_pool.tlas_timing;
+  const bvh::LiveBvhStats& live = data->live;
+  return t.rebuild_ms_sum == 0.f && t.refit_ms_sum == 0.f && t.after_drain_ms_sum == 0.f && t.rebuild_phase_ms_sum[2] == 0.f
+         && t.refit_phase_ms_sum[2] == 0.f && live.blas_build_ms_sum == 0.f && live.slack_apply_ms_sum == 0.f
+         && live.tlas_skip_ms_sum == 0.f && live.tlas_ms_last == 0.f && live.refit_ms_last == 0.f && live.mesh_ms_last == 0.f
+         && bvh::g_pool.stats.dynamic_expand_cpu_ms_sum == 0.f;
+}
+
+static void TestPerfGateOff(Device* dev, Queue* queue) {
+  bvh::g_perf_gate.gather.store(false);
+  bvh::ClearPerfGathered(bvh::GetBvhDeviceData(dev));
+  bvh::ResetCacheDiagCounters();
+  ResetPerfTab();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  AddMesh(0x700u, BoxMesh(0.8f));
+  AddInstance(0x700u, 120.f, 0.f, 120.f);
+  bvh::g_pool.cpu_hook_frame_us.store(777u);
+  bvh::g_pool.cpu_drain_frame_us.store(777u);
+  bvh::g_pool.cpu_capture_frame_us.store(777u);
+  bvh::g_deform_live.cpu_frame_us.store(777u);
+  const uint64_t builds_before = data->live.blas_builds;
+  for (int i = 0; i < 4; ++i) {
+    RegionPresent(dev, queue);
+    bvh::UpdateCacheDiag(dev);
+  }
+  CHECK(data->live.blas_builds > builds_before, "event counts still advance while off (builds %llu)", (unsigned long long)data->live.blas_builds);
+  CHECK(PerfSumsZero(data), "gathering off: no sum or last value is written");
+  CHECK(bvh::g_pool.cpu_hook_frame_us.load() == 777u && bvh::g_pool.cpu_drain_frame_us.load() == 777u
+            && bvh::g_pool.cpu_capture_frame_us.load() == 777u && bvh::g_deform_live.cpu_frame_us.load() == 777u,
+        "gathering off: frame values are not exchanged");
+  CHECK(bvh::g_perf_gate.present_world_us.load() == 0u && bvh::g_perf_gate.present_bvh_us.load() == 0u
+            && bvh::g_perf_gate.alpha_sync_us.load() == 0u && bvh::g_perf_gate.rtao_record_us.load() == 0u
+            && bvh::g_perf_gate.deform_update_us.load() == 0u,
+        "gathering off: no bracket or stopwatch adds");
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+    CHECK(bvh::g_perf.tab.count == 0u && !bvh::g_perf.tab.primed, "gathering off: the tab takes no sample");
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    CHECK(bvh::g_cache_diag.data.frame_intervals == 0u, "gathering off: no frame interval");
+  }
+  bvh::g_perf_gate.gather.store(true);
+  ResetPerfTab();
+  AddMesh(0x701u, BoxMesh(0.9f));
+  AddInstance(0x701u, 130.f, 0.f, 130.f);
+  for (int i = 0; i < 12; ++i) {  // a TLAS rebuild comes every kLiveTlasInterval (8) presents
+    RegionPresent(dev, queue);
+    bvh::UpdateCacheDiag(dev);
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_pool.mutex);
+    CHECK(bvh::g_pool.tlas_timing.rebuild_ms_sum > 0.f && data->live.blas_build_ms_sum > 0.f && bvh::g_pool.tlas_timing.rebuild_phase_ms_sum[2] > 0.f,
+          "gathering on: rebuild, BLAS and phase sums are written (%.4f, %.4f)", bvh::g_pool.tlas_timing.rebuild_ms_sum, data->live.blas_build_ms_sum);
+  }
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+    CHECK(bvh::g_perf.tab.count == 11u, "gathering on: the first present primes, the next eleven feed the tab (count %zu)", bvh::g_perf.tab.count);
+  }
+  // The switch goes OFF: the clear zeroes what was gathered, and the dump says so.
+  bvh::g_perf_gate.gather.store(false);
+  bvh::ClearPerfGathered(bvh::GetBvhDeviceData(dev));
+  CHECK(PerfSumsZero(data), "the clear on switch-off zeroes the sums and last values");
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_perf.mutex);
+    CHECK(bvh::g_perf.tab.count == 0u, "the clear empties the tab window");
+  }
+  const std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
+  CHECK(JsonError(text).empty(), "cache dump after off is valid JSON: %s", JsonError(text).c_str());
+  CHECK(text.find("\"perf_gather\": false") != std::string::npos, "the dump after off says perf_gather false");
+  bvh::g_perf_gate.gather.store(true);
+  ResetPerfTab();
+  bvh::ResetCacheDiagCounters();
+}
+
+// Dumps and the diagnostics header say whether the timings were gathered; the timing keys added to the cache dump.
+static void TestPerfJsonKeys(Device* dev) {
+  bvh::ResetCacheDiagCounters();
+  bvh::BvhDeviceData* data = bvh::GetBvhDeviceData(dev);
+  data->live.mesh_ms_last = 1.5f;
+  data->live.mesh_ms_max = 2.5f;
+  data->live.tlas_skips = 3u;
+  data->live.tlas_skip_ms_sum = 0.75f;
+  data->live.tlas_skip_ms_max = 0.5f;
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.frame_ms_last = 20.f;
+    bvh::g_cache_diag.data.frame_ms_sum = 60.0;
+    bvh::g_cache_diag.data.frame_intervals = 3u;
+  }
+  bvh::g_perf_gate.gather.store(true);
+  std::string text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
+  CHECK(JsonError(text).empty(), "cache dump is valid JSON: %s", JsonError(text).c_str());
+  CHECK(text.find("\"perf_gather\": true") != std::string::npos, "dump with gathering on says perf_gather true");
+  CHECK(text.find("\"mesh_ms\": {\"last\": 1.5, \"max\": 2.5}") != std::string::npos, "mesh_ms last and max (%s)", "live block");
+  CHECK(text.find("\"tlas_skips\": 3, \"skip_ms\": {\"sum\": 0.75, \"max\": 0.5}") != std::string::npos, "skip_ms sum and max");
+  CHECK(text.find("\"frame_ms\": {\"last\": 20, \"avg\": 20, \"intervals\": 3}") != std::string::npos, "frame_ms avg is sum over intervals");
+  {
+    std::lock_guard<std::mutex> lock(bvh::g_cache_diag.mutex);
+    bvh::g_cache_diag.data.frame_intervals = 0u;
+  }
+  text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
+  CHECK(text.find("\"frame_ms\": {\"last\": 20, \"avg\": -1, \"intervals\": 0}") != std::string::npos, "frame_ms avg is -1 with no interval");
+  bvh::g_perf_gate.gather.store(false);
+  CHECK(bvh::CacheDiagLines(data)[0].find("(performance metrics OFF: timings read 0)") != std::string::npos, "header line says OFF");
+  text = ReadDumpText(bvh::WriteCacheDiagFile(data, 1u, "", bvh::CacheSwitches{}));
+  CHECK(text.find("\"perf_gather\": false") != std::string::npos, "dump with gathering off says perf_gather false");
+  bvh::g_perf_gate.gather.store(true);
+  data->live.mesh_ms_last = 0.f;
+  data->live.mesh_ms_max = 0.f;
+  data->live.tlas_skips = 0u;
+  data->live.tlas_skip_ms_sum = 0.f;
+  data->live.tlas_skip_ms_max = 0.f;
+  const std::vector<std::string> lines = bvh::CacheDiagLines(data);
+  CHECK(lines[0].find("OFF") == std::string::npos, "header line has no OFF suffix with gathering on");
+  bvh::ResetCacheDiagCounters();
 }
 
 // The perf file keeps the RTAO and alpha timers when they are passed in (UpdatePerfRun extra).
@@ -2713,7 +2924,7 @@ static void TestPerfExtraGpu(Device* dev) {
   bvh::g_cache_diag.enabled.store(true);
   bvh::RequestPerfRun("extra");
   bvh::PerfExtraGpu extra;
-  bvh::UpdatePerfRun(data, 9000u, 0u, base, sw, extra);
+  bvh::UpdatePerfRun(data, 9000u, base, sw, extra);
   int k = 0;
   while (bvh::g_perf.active.load() && k < 5000) {
     ++k;
@@ -2722,7 +2933,7 @@ static void TestPerfExtraGpu(Device* dev) {
     extra.rtao.samples += 1u;
     data->alpha.timer.ms_sum += 0.5;
     data->alpha.timer.samples += 1u;
-    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), 0u, base + std::chrono::milliseconds(16 * k), sw, extra);
+    bvh::UpdatePerfRun(data, 9000u + static_cast<uint32_t>(k), base + std::chrono::milliseconds(16 * k), sw, extra);
   }
   const std::string text = ReadDumpText(WrittenPath(PerfResult()));
   {
@@ -2740,6 +2951,8 @@ static void TestPerfExtraGpu(Device* dev) {
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Stage("main start");
+  CHECK(!bvh::g_perf_gate.gather.load(), "performance gathering is OFF by default");
+  bvh::g_perf_gate.gather.store(true);  // the suites run with gathering on; TestPerfGateOff switches it off
   if (g_quick) std::printf("QUICK: not a full verification\n");
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   bvh::g_pool.region_size = 512.f;
@@ -3772,6 +3985,11 @@ int main() {
   TestPerfSwitchesStable(&dev);
   TestPerfTab(&dev);
   TestPerfExtraGpu(&dev);
+  TestPerfUnattributed();
+  TestPerfGateOff(&dev, &queue);
+  TestPerfJsonKeys(&dev);
+  TestPerfTimerGate();
+  TestPerfCaptureInDrain(&dev);
   Stage("11e BVH range coverage");
   TestRegionCoverage(&dev, &queue);
   Stage("end checks");

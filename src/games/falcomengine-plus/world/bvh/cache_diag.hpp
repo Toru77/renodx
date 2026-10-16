@@ -580,9 +580,10 @@ inline std::vector<std::string> CacheDiagLines(const BvhDeviceData* data) {
     d = g_cache_diag.data;
   }
   std::vector<std::string> lines;
-  lines.push_back(CacheFormat("Cache diagnostics (%s): %llu presents, tiers %s", kWorldBuildId, d.presents,
+  lines.push_back(CacheFormat("Cache diagnostics (%s): %llu presents, tiers %s%s", kWorldBuildId, d.presents,
                               d.tiers_valid ? CacheFormat("at f%u (every %u presents or on dump)", d.tiers_frame, kCacheSampleInterval).c_str()
-                                            : "not computed yet"));
+                                            : "not computed yet",
+                              g_perf_gate.gather.load(std::memory_order_relaxed) ? "" : " (performance metrics OFF: timings read 0)"));
   if (d.tiers_valid) {
     for (size_t t = 0; t < kCacheTierCount; ++t) {
       const CacheTier& row = d.tiers.tiers[t];
@@ -832,6 +833,10 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
   out << "  \"label\": \"" << PoolJsonEscape(label) << "\",\n  \"label_raw\": \"" << PoolJsonEscape(raw_label) << "\",\n";
   out << "  \"timestamp\": \"" << DiagTimestamp(when) << "\",\n  \"presents\": " << d.presents << ",\n";
   out << "  \"tiers_valid\": " << (d.tiers_valid ? "true" : "false") << ", \"tiers_frame\": " << d.tiers_frame << ",\n";
+  out << "  \"perf_gather\": " << (g_perf_gate.gather.load(std::memory_order_relaxed) ? "true" : "false") << ",\n";
+  out << "  \"frame_ms\": {\"last\": " << PoolJsonFloat{d.frame_ms_last} << ", \"avg\": "
+      << PoolJsonFloat{d.frame_intervals != 0u ? static_cast<float>(d.frame_ms_sum / static_cast<double>(d.frame_intervals)) : -1.f}
+      << ", \"intervals\": " << d.frame_intervals << "},\n";
   out << "  \"switches\": ";
   WriteSwitchesJson(&out, switches);
   out << ",\n  \"lines\": [";
@@ -957,7 +962,10 @@ inline std::filesystem::path WriteCacheDiagFile(const BvhDeviceData* data, uint3
       << ", \"frame\": " << live.gpu_check_frame << ", \"result\": \"" << PoolJsonEscape(live.gpu_result) << "\"}";
   out << ",\n  \"live\": {\"tlas_instances\": " << live.tlas_instances << ", \"tlas_rebuilds\": " << live.tlas_rebuilds
       << ", \"tlas_reason\": \"" << PoolJsonEscape(live.tlas_reason) << "\", \"tlas_frame\": " << live.tlas_frame
-      << ", \"refit_lag_last\": " << live.refit_lag_last << ", \"refit_lag_max\": " << live.refit_lag_max << "}";
+      << ", \"refit_lag_last\": " << live.refit_lag_last << ", \"refit_lag_max\": " << live.refit_lag_max
+      << ", \"mesh_ms\": {\"last\": " << PoolJsonFloat{live.mesh_ms_last} << ", \"max\": " << PoolJsonFloat{live.mesh_ms_max}
+      << "}, \"tlas_skips\": " << live.tlas_skips << ", \"skip_ms\": {\"sum\": " << PoolJsonFloat{live.tlas_skip_ms_sum}
+      << ", \"max\": " << PoolJsonFloat{live.tlas_skip_ms_max} << "}}";
   out << ",\n  \"errors\": {\"total\": " << errors.total << ", \"meshes\": " << errors.meshes << ", \"readback\": {\"map_failures\": "
       << errors.readback.map_failures << ", \"staging_failures\": " << errors.readback.staging_failures << ", \"base_mismatch\": "
       << errors.readback.base_mismatch << "}, \"bvh\": {\"blas_invalid\": " << errors.bvh.blas_invalid << ", \"tlas_invalid\": " << errors.bvh.tlas_invalid

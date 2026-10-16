@@ -25,23 +25,8 @@ inline void DrawRtaoPanel() {
   if (frame.note == Reason::IsfastUnavailable) {
     ImGui::TextDisabled("IS-FAST not loaded: IGN noise (isfast_unavailable)");
   }
-  const char* passes = frame.temporal_ran ? "RTAO pass A + B" : "RTAO pass A";
-  if (frame.gpu_ms < 0.f) {
-    ImGui::Text("%s: no measurement yet", passes);
-  } else {
-    ImGui::Text("%s: %.3f ms", passes, frame.gpu_ms);
-  }
-  if (frame.filter_requested) {
-    if (!frame.filter_ran) {
-      ImGui::Text("Spatial filter: not run (%s)", frame.filter_failed ? "filter_failed" : "debug modes 1 to 7 bypass it");
-    } else if (frame.filter_gpu_ms < 0.f) {
-      ImGui::Text("Spatial filter: no measurement yet");
-    } else {
-      ImGui::Text("Spatial filter: %.3f ms", frame.filter_gpu_ms);
-    }
-    if (frame.filter_ran && frame.gpu_ms >= 0.f && frame.filter_gpu_ms >= 0.f) {
-      ImGui::Text("Total: %.3f ms", frame.gpu_ms + frame.filter_gpu_ms);
-    }
+  if (frame.filter_requested && !frame.filter_ran) {
+    ImGui::Text("Spatial filter: not run (%s)", frame.filter_failed ? "filter_failed" : "debug modes 1 to 7 bypass it");
   }
   ImGui::Text("Frames without AO: %llu", static_cast<unsigned long long>(frame.frames_without_ao));
   if (frame.fade_valid) {

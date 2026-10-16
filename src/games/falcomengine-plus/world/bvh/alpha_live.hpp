@@ -109,6 +109,7 @@ struct AlphaBlitJob {
 // Fills the atlas for the alpha meshes of the store and keeps slot_of_uid (the TLAS reads it). Runs on the
 // present thread: the pool is read under its lock, and every graphics call runs after the lock is released.
 inline void SyncLiveAlpha(reshade::api::device* device, reshade::api::command_list* cmd_list, BvhDeviceData* data, uint32_t frame) {
+  const PoolCpuTimer cpu_timer{&g_perf_gate.alpha_sync_us};
   AlphaGpu& alpha = data->alpha;
   const bool on = g_pool.alpha_foliage.load(std::memory_order_relaxed);
   const bool indirect_on = g_pool.alpha_indirect_source.load(std::memory_order_relaxed);

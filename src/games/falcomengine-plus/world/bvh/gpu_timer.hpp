@@ -19,6 +19,8 @@
 
 #include <include/reshade.hpp>
 
+#include "perf_gate.hpp"
+
 namespace falcom_world::bvh {
 
 inline constexpr uint32_t kGpuTimerSlots = 4u;
@@ -46,6 +48,15 @@ struct GpuTimer {
   float ms_max = 0.f;
   uint32_t skipped = 0u;  // frames not measured (every set in flight, or a disjoint interval)
 };
+
+// Clears the statistics (not the queries): used when gathering goes OFF.
+inline void ClearGpuTimerStats(GpuTimer* timer) {
+  timer->last_ms = -1.f;
+  timer->samples = 0u;
+  timer->ms_sum = 0.0;
+  timer->ms_max = 0.f;
+  timer->skipped = 0u;
+}
 
 #if defined(_WIN32)
 
@@ -117,6 +128,7 @@ inline void PollGpuTimer(ID3D11DeviceContext* context, GpuTimer* timer) {
 }
 
 inline void BeginGpuTimer(reshade::api::device* device, reshade::api::command_list* cmd_list, GpuTimer* timer) {
+  if (!g_perf_gate.gather.load(std::memory_order_relaxed)) return;
   if (timer == nullptr || timer->open >= 0 || !CreateGpuTimer(device, timer)) return;
   ID3D11DeviceContext* context = GpuTimerContext(cmd_list);
   if (context == nullptr) return;

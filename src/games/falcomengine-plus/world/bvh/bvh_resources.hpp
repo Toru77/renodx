@@ -167,6 +167,7 @@ struct LiveBvhStats {
   float tlas_skip_ms_max = 0.f;
   // Slack TLAS (session switch slack): changes applied in place instead of a rebuild.
   uint32_t slack_applies = 0u;
+  uint32_t slack_zero_op_applies = 0u;  // applies with no op (counted as skips; no apply cost)
   uint32_t slack_added = 0u;
   uint32_t slack_removed = 0u;
   uint32_t slack_changed = 0u;
@@ -175,7 +176,8 @@ struct LiveBvhStats {
   uint32_t slack_maintenance = 0u;
   uint32_t slack_free_holes = 0u;
   float slack_phase_ms[4] = {};  // diff, ops, refit + validate, upload (last apply)
-  float slack_apply_ms_sum = 0.f;  // CPU ms of every successful apply (zero-op applies included)
+  float slack_phase_ms_sum[4] = {};  // the same, summed over applies with ops > 0 (gather on)
+  float slack_apply_ms_sum = 0.f;  // CPU ms of every apply with at least one op (a zero-op apply is a skip)
 
   float slack_apply_ms_max = 0.f;
   uint32_t gpu_check_frame = 0u;  // frame of the last Check GPU Contents
