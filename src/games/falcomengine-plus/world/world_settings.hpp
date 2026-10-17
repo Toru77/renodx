@@ -59,11 +59,97 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .can_reset = false,
       .label = "What enters the BVH",
       .section = "Ray Tracing",
-      .on_draw = []() {
-        bvh::DrawRayTracingRows();
-        return false;
-      },
+      .on_draw = []() { return bvh::DrawRayTracingRows(); },
       .is_visible = visible,
+  });
+  // Ray Tracing tab row values ("What enters the BVH"). Hidden from the UI (drawn
+  // inline by DrawRayTracingRows) but persisted so they survive a restart.
+  settings->push_back(new Setting{
+      .key = "WorldRegionSize",
+      .binding = &bvh::g_pool.region_size,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 256.f,
+      .label = "Region size",
+      .section = "Ray Tracing",
+      .min = bvh::kPoolRegionMinSize,
+      .max = bvh::kPoolRegionMaxSize,
+      .format = "%.0f",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldWindSwayRange",
+      .binding = &bvh::g_pool.wind_sway_range,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = bvh::kPoolWindSwayRangeMax,
+      .label = "Wind sway range",
+      .section = "Ray Tracing",
+      .min = bvh::kPoolWindSwayRangeMin,
+      .max = bvh::kPoolWindSwayRangeMax,
+      .format = "%.0f",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldAlphaFoliage",
+      .binding = &bvh::g_pool.alpha_foliage_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Alpha foliage",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldAlphaWindSway",
+      .binding = &bvh::g_pool.alpha_wind_sway_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Wind sway",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldDeformingMeshes",
+      .binding = &bvh::g_deform_live.enabled_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Deforming meshes",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldFollowMoving",
+      .binding = &bvh::g_pool.follow_moving_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Follow moving",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldDynamicPerFrame",
+      .binding = &bvh::g_pool.dynamic_per_frame_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Moving objects per-frame (P2b)",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldExcludeMoving",
+      .binding = &bvh::g_pool.exclude_moving_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Exclude moving from static BVH",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldScanIndirect",
+      .binding = &bvh::g_pool.scan_indirect_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Scan indirect draws",
+      .section = "Ray Tracing",
+      .is_visible = [] { return false; },
   });
   settings->push_back(new Setting{
       .key = "WorldResearchEnabled",
@@ -81,11 +167,157 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .can_reset = false,
       .label = "Phase 1 World BVH",
       .section = "BVH Diagnostics",
-      .on_draw = []() {
-        bvh::DrawBvhPanel();
-        return false;
-      },
+      .on_draw = []() { return bvh::DrawBvhPanel(); },
       .is_visible = visible,
+  });
+  // BVH Diagnostics switches, persisted so they survive a restart. Hidden from the
+  // UI (drawn inline by DrawBvhPanel) but saved to the ReShade ini.
+  settings->push_back(new Setting{
+      .key = "WorldPoolScan",
+      .binding = &bvh::g_pool.scan_active_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Pool Scan",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolCaptureMeshes",
+      .binding = &bvh::g_pool.capture_meshes_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Capture meshes",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolLogCaptures",
+      .binding = &bvh::g_pool.log_captures_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Log mesh captures",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolVerifyMeshes",
+      .binding = &bvh::g_pool.verify_meshes_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Verify mesh captures",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolRetryUnstable",
+      .binding = &bvh::g_pool.retry_unstable_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Retry unstable meshes",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolLegacyScale",
+      .binding = &bvh::g_pool.legacy_scale_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Legacy instance scale limits",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolPoisonStaging",
+      .binding = &bvh::g_pool.poison_staging_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Poison mesh staging",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolAlphaIndirectSource",
+      .binding = &bvh::g_pool.alpha_indirect_source_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Indirect foliage source copy",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldPoolAlphaWindOpaque",
+      .binding = &bvh::g_pool.alpha_wind_opaque_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Admit wind with opaque pixel shader",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldLiveBvh",
+      .binding = &bvh::g_live_bvh.enabled_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Live BVH",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldLiveBvhSkipNoop",
+      .binding = &bvh::g_live_bvh.skip_noop_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Skip no-op TLAS rebuilds",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldLiveBvhSlack",
+      .binding = &bvh::g_live_bvh.slack_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Slack TLAS",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldGpuDebugMode",
+      .binding = &bvh::g_bvh_debug.mode_setting,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "GPU Debug mode",
+      .section = "BVH Diagnostics",
+      .min = 0.f,
+      .max = 3.f,
+      .format = "%d",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldGpuDebugHideCameraHidden",
+      .binding = &bvh::g_bvh_trace.hide_camera_hidden_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Hide camera-hidden from trace",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldCacheDiag",
+      .binding = &bvh::g_cache_diag.enabled_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Collect cache diagnostics",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
+  });
+  settings->push_back(new Setting{
+      .key = "WorldCrashLog",
+      .binding = &g_crash_log.enabled_setting,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Log crashes",
+      .section = "BVH Diagnostics",
+      .is_visible = [] { return false; },
   });
   settings->push_back(new Setting{
       .key = "WorldPerformance",

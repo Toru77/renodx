@@ -96,6 +96,8 @@ struct BvhTraceState {
   // Hide what the game camera does not show: instances no camera VS drew
   // (shadow-only casters) and near-faded surfaces (A/B against the game's depth).
   std::atomic_bool hide_camera_hidden{true};
+  // Mirror bound to the settings system so the Hide camera-hidden toggle survives a restart.
+  float hide_camera_hidden_setting{1.f};
 };
 
 inline BvhTraceState g_bvh_trace;

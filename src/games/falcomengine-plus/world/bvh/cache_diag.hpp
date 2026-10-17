@@ -403,6 +403,8 @@ struct CacheDiagState {
   std::atomic_bool enabled{true};
   std::atomic_bool reset_requested{false};        // the counters are cleared by the present (UpdateCacheDiag)
   std::atomic_bool force_tiers_requested{false};  // the tiers are computed by the present (UpdateCacheDiag)
+  // Mirror bound to the settings system so Collect cache diagnostics survives a restart.
+  float enabled_setting{1.f};
   std::mutex mutex;
   CacheDiagData data;
 };

@@ -93,6 +93,10 @@ struct LiveBvhSwitches {
   std::atomic_bool check_requested{false};
   std::atomic_bool skip_noop{false};  // session only: a rebuild whose snapshot equals the TLAS is skipped (OFF = HEAD; default OFF until the in-game A/B)
   std::atomic_bool slack{false};     // session only: spare slots in the TLAS, changes written in place (OFF = HEAD)
+  // Mirrors bound to the settings system so the Live BVH switches survive a restart.
+  float enabled_setting{1.f};
+  float skip_noop_setting{0.f};
+  float slack_setting{0.f};
 };
 
 inline LiveBvhSwitches g_live_bvh;

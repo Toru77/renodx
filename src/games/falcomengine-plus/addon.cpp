@@ -12841,6 +12841,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
   falcom_world::Use(fdw_reason, IsSora2nd());
   falcom_ui::Use(fdw_reason, &settings);
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    falcom_world::bvh::SyncBvhSettings();
+  }
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   return TRUE;
 }

@@ -530,6 +530,8 @@ struct DeformStats {
 
 struct DeformProbeState {
   std::atomic_bool enabled{true};
+  // Mirror bound to the settings system so the Ray Tracing deform toggle survives a restart.
+  float enabled_setting{1.f};
   std::mutex mutex;
   DeformBackend backend = DefaultDeformBackend();
   reshade::api::device* device = nullptr;

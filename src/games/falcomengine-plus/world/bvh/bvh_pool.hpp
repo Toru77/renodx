@@ -1390,6 +1390,24 @@ struct PoolState {
   std::atomic_bool alpha_wind_sway{true};        // wind rest poses swayed in the TLAS (approximate, alpha_wind_opaque on only); session only
   std::atomic_bool follow_moving{true};    // moving meshes keep their instances, which follow the pose
   std::atomic_bool dynamic_per_frame{true};  // P2b: flagged meshes are expanded per frame (draw copies), kept out of the TLAS; session only
+  // Mirrors of the atomic_bool switches above, bound to the settings system so the
+  // Ray Tracing toggles survive a restart. Synced back to the atomics by SyncBvhSettings.
+  float alpha_foliage_setting{1.f};
+  float alpha_wind_sway_setting{1.f};
+  float follow_moving_setting{1.f};
+  float dynamic_per_frame_setting{1.f};
+  float exclude_moving_setting{0.f};
+  float scan_indirect_setting{1.f};
+  // Mirrors of the BVH Diagnostics (Phase 1 World BVH) switches below.
+  float scan_active_setting{0.f};
+  float capture_meshes_setting{1.f};
+  float log_captures_setting{0.f};
+  float verify_meshes_setting{1.f};
+  float retry_unstable_setting{0.f};
+  float legacy_scale_setting{0.f};
+  float poison_staging_setting{0.f};
+  float alpha_indirect_source_setting{1.f};
+  float alpha_wind_opaque_setting{1.f};
   PoolInspectRecord inspect;               // last inspect result (bvh_debug.hpp), written by DumpWorldPool
   std::atomic_bool poison_staging{false};  // diagnostic: mesh staging cpu-visible, poisoned after each read
   bool staging_poisoned = false;           // how the staging ring was created (EnsurePoolStaging)

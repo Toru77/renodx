@@ -79,6 +79,8 @@ struct CrashLogState {
   void* handler = nullptr;
   CrashCrtHooks crt;
   std::atomic_bool enabled{false};
+  // Mirror bound to the settings system so Log crashes survives a restart.
+  float enabled_setting{0.f};
   std::atomic_uint32_t reports{0u};
   std::array<std::atomic_uint64_t, kCrashMaxReports> keys = {};  // reported addresses / stack hashes
   std::atomic_uint64_t native_device{0u};                        // ID3D11Device*, set at present

@@ -28,6 +28,8 @@ namespace falcom_world::bvh {
 struct BvhDebugState {
   std::atomic_int mode{0};  // BvhView
   std::atomic<reshade::api::device*> device{nullptr};
+  // Mirror bound to the settings system so the GPU Debug mode survives a restart.
+  float mode_setting{0.f};
 };
 
 inline BvhDebugState g_bvh_debug;

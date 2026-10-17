@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "../../../utils/settings.hpp"
+
 #include "../contract/shader_registry.hpp"
 #include "../debug/crash_log.hpp"
 #include "bvh_debug.hpp"
@@ -98,11 +100,21 @@ struct RayTracingRow {
   const char* description;
   const char* tooltip;
   std::vector<std::atomic_bool*> flags;  // written together; the first one shows the state
+  const char* key;  // settings key for persistence (empty = not persisted)
 };
 
-inline void DrawRayTracingRows() {
+inline bool DrawRayTracingRows() {
+  using renodx::utils::settings::FindSetting;
+  bool changed = false;
+
   ImGui::SetNextItemWidth(150.f);
-  ImGui::SliderFloat("Region (m)", &g_pool.region_size, kPoolRegionMinSize, kPoolRegionMaxSize, "%.0f");
+  if (ImGui::SliderFloat("Region (m)", &g_pool.region_size, kPoolRegionMinSize, kPoolRegionMaxSize, "%.0f")) {
+    if (auto* s = FindSetting("WorldRegionSize")) {
+      s->Set(g_pool.region_size);
+      s->Write();
+    }
+    changed = true;
+  }
   ImGui::TextDisabled("BVH range: every pooled object within this distance of the camera is in the BVH; RTAO reaches it at 100% fade.");
   static const std::vector<RayTracingRow> rows = {
       {"Alpha foliage (leaves, grass, fences)",
@@ -110,48 +122,53 @@ inline void DrawRayTracingRows() {
        "Experimental, session only, default on. Off: alpha-tested meshes are not traced and their "
        "instances leave the BVH at once. On: their cutouts are traced through a 256-slice atlas, filled "
        "at the next present (copies of the source textures are made when drawn).",
-       {&g_pool.alpha_foliage, &g_pool.alpha_indirect_source}},
+       {&g_pool.alpha_foliage, &g_pool.alpha_indirect_source}, "WorldAlphaFoliage"},
       {"Foliage motion (wind and sway)",
        "Sways wind foliage. Off: it stays in its rest pose. Needs Alpha foliage.",
        "Experimental, session only, default on. Approximation: wind rest poses are moved in the BVH by the "
        "wind vertex shader's sway at the instance origin (rigid, full amplitude). Off: they stay at their "
        "rest pose.",
-       {&g_pool.alpha_wind_sway}},
+       {&g_pool.alpha_wind_sway}, "WorldAlphaWindSway"},
       {"Deforming meshes (characters, water)",
        "Adds skinned and animated meshes.",
        "Every frame, re-runs each camera draw of a skinned or animated vertex shader whose world\n"
        "position the probe confirmed, capturing its world-space triangles on the GPU. Each draw's\n"
        "tree is built once from its first capture and refit every frame; the trace walks them\n"
        "beside the static BVH. The probe (it confirms new shaders) is on while this is on.",
-       {&g_deform_live.enabled, &g_deform.enabled}},
+       {&g_deform_live.enabled, &g_deform.enabled}, "WorldDeformingMeshes"},
       {"Moving objects follow their pose",
        "Keeps moving objects in the BVH at their current pose.",
        "Moving objects keep their instances and each one moves to the pose the object\n"
        "has now (a copy of a moving object is taken every frame). Off: the old behaviour.\n"
        "Ignored while \"Keep moving objects out\" is on.",
-       {&g_pool.follow_moving}},
+       {&g_pool.follow_moving}, "WorldFollowMoving"},
       {"Moving objects: per-frame (P2b)",
        "Adds moving objects at the pose of the previous frame.",
        "Session only, default on. A moving mesh is copied at each draw and traced from the instances\n"
        "of the previous frame (one frame behind, no staging delay). Off: the follow path (a few presents behind), or absent when Follow moving is off.",
-       {&g_pool.dynamic_per_frame}},
+       {&g_pool.dynamic_per_frame}, "WorldDynamicPerFrame"},
       {"Keep moving objects out of the static BVH",
        "Removes moving objects from the static BVH.",
        "A mesh seen moving in a camera view (its prevWorld differs from world) gets no\n"
        "static instances: those it had are removed and new ones refused, so a door or cart\n"
        "leaves no copy behind where it stopped. Without the per-frame path (P2b) or Follow moving, moving\n"
        "objects are absent from the BVH. Off: admitted as before (applies at once).",
-       {&g_pool.exclude_moving}},
+       {&g_pool.exclude_moving}, "WorldExcludeMoving"},
       {"Scan indirect draws",
        "Lets indirect (GPU driven) draws, opaque or alpha, enter the BVH.",
        "Off: indirect draws (counts kept on the GPU) are ignored by the pool.",
-       {&g_pool.scan_indirect}},
+       {&g_pool.scan_indirect}, "WorldScanIndirect"},
   };
-  bool changed = false;
   for (const RayTracingRow& row : rows) {
     bool on = row.flags.front()->load(std::memory_order_relaxed);
     if (ImGui::Checkbox(row.label, &on)) {
       for (std::atomic_bool* flag : row.flags) flag->store(on, std::memory_order_relaxed);
+      if (row.key != nullptr && row.key[0] != '\0') {
+        if (auto* s = FindSetting(row.key)) {
+          s->Set(on ? 1.f : 0.f);
+          s->Write();
+        }
+      }
       changed = true;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", row.tooltip);
@@ -159,7 +176,13 @@ inline void DrawRayTracingRows() {
     if (row.flags.front() == &g_pool.alpha_wind_sway) {
       ImGui::BeginDisabled(!on);
       ImGui::SetNextItemWidth(150.f);
-      ImGui::SliderFloat("Wind sway range (m)", &g_pool.wind_sway_range, kPoolWindSwayRangeMin, kPoolWindSwayRangeMax, "%.0f");
+      if (ImGui::SliderFloat("Wind sway range (m)", &g_pool.wind_sway_range, kPoolWindSwayRangeMin, kPoolWindSwayRangeMax, "%.0f")) {
+        if (auto* s = FindSetting("WorldWindSwayRange")) {
+          s->Set(g_pool.wind_sway_range);
+          s->Write();
+        }
+        changed = true;
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Wind foliage farther than this from the camera keeps its last pose during refits (saves CPU). Rebuilds still sway every instance. Maximum = no limit. Not saved; resets on restart.");
       ImGui::EndDisabled();
     }
@@ -168,6 +191,38 @@ inline void DrawRayTracingRows() {
     LogPoolSwitches();
     RefreshPoolCaptureRequest();
   }
+  return changed;
+}
+
+// Copies the persisted setting mirrors back into the atomic switch flags (and any
+// other runtime state) so values loaded from the ReShade ini take effect even when
+// the Ray Tracing tab is never opened in a session. Call once after LoadSettings.
+inline void SyncBvhSettings() {
+  auto apply = [](std::atomic_bool& flag, float mirror) { flag.store(mirror > 0.5f, std::memory_order_relaxed); };
+  apply(g_pool.alpha_foliage, g_pool.alpha_foliage_setting);
+  apply(g_pool.alpha_wind_sway, g_pool.alpha_wind_sway_setting);
+  apply(g_pool.follow_moving, g_pool.follow_moving_setting);
+  apply(g_pool.dynamic_per_frame, g_pool.dynamic_per_frame_setting);
+  apply(g_pool.exclude_moving, g_pool.exclude_moving_setting);
+  apply(g_pool.scan_indirect, g_pool.scan_indirect_setting);
+  apply(g_deform_live.enabled, g_deform_live.enabled_setting);
+  apply(g_deform.enabled, g_deform.enabled_setting);
+  apply(g_pool.scan_active, g_pool.scan_active_setting);
+  apply(g_pool.capture_meshes, g_pool.capture_meshes_setting);
+  apply(g_pool.log_captures, g_pool.log_captures_setting);
+  apply(g_pool.verify_meshes, g_pool.verify_meshes_setting);
+  apply(g_pool.retry_unstable, g_pool.retry_unstable_setting);
+  apply(g_pool.legacy_scale, g_pool.legacy_scale_setting);
+  apply(g_pool.poison_staging, g_pool.poison_staging_setting);
+  apply(g_pool.alpha_indirect_source, g_pool.alpha_indirect_source_setting);
+  apply(g_pool.alpha_wind_opaque, g_pool.alpha_wind_opaque_setting);
+  apply(g_live_bvh.enabled, g_live_bvh.enabled_setting);
+  apply(g_live_bvh.skip_noop, g_live_bvh.skip_noop_setting);
+  apply(g_live_bvh.slack, g_live_bvh.slack_setting);
+  apply(g_bvh_trace.hide_camera_hidden, g_bvh_trace.hide_camera_hidden_setting);
+  apply(g_cache_diag.enabled, g_cache_diag.enabled_setting);
+  apply(g_crash_log.enabled, g_crash_log.enabled_setting);
+  g_bvh_debug.mode.store(static_cast<int>(g_bvh_debug.mode_setting), std::memory_order_relaxed);
 }
 
 // Label of the cache diagnostics dump and of the Performance test (file name only).
@@ -333,14 +388,20 @@ inline void DrawPerformanceTab() {
   if (!result.empty()) ImGui::TextUnformatted(result.c_str());
 }
 
-inline void DrawBvhPanel() {
+inline bool DrawBvhPanel() {
+  using renodx::utils::settings::FindSetting;
+  bool changed = false;
+
   ImGui::TextDisabled("Pool admits draws whose vertex shader the bytecode classifier marks rigid and whose pixel shader does not alpha-test.");
 
   bool scan = g_pool.scan_active.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Pool Scan", &scan)) {
     g_pool.scan_active.store(scan, std::memory_order_relaxed);
+    g_pool.scan_active_setting = scan ? 1.f : 0.f;
+    if (auto* s = FindSetting("WorldPoolScan")) { s->Set(g_pool.scan_active_setting); s->Write(); }
     RefreshPoolCaptureRequest();
     LogPoolSwitches();
+    changed = true;
   }
   bool switches_changed = false;
 
@@ -374,7 +435,10 @@ inline void DrawBvhPanel() {
     bool log_captures = g_pool.log_captures.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Capture meshes", &capture_meshes)) {
       g_pool.capture_meshes.store(capture_meshes, std::memory_order_relaxed);
+      g_pool.capture_meshes_setting = capture_meshes ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolCaptureMeshes")) { s->Set(g_pool.capture_meshes_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Copies the index, then the vertex range of each new mesh at its draws and reads them\n"
@@ -384,7 +448,10 @@ inline void DrawBvhPanel() {
     ImGui::SameLine();
     if (ImGui::Checkbox("Log mesh captures", &log_captures)) {
       g_pool.log_captures.store(log_captures, std::memory_order_relaxed);
+      g_pool.log_captures_setting = log_captures ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolLogCaptures")) { s->Set(g_pool.log_captures_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Writes ReShade.log lines for each mesh copy and read,\n"
@@ -394,7 +461,10 @@ inline void DrawBvhPanel() {
     bool legacy_scale = g_pool.legacy_scale.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Verify mesh captures", &verify_meshes)) {
       g_pool.verify_meshes.store(verify_meshes, std::memory_order_relaxed);
+      g_pool.verify_meshes_setting = verify_meshes ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolVerifyMeshes")) { s->Set(g_pool.verify_meshes_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("A mesh enters the pool only after two separate captures decode to the same mesh.\n"
@@ -404,7 +474,10 @@ inline void DrawBvhPanel() {
     ImGui::SameLine();
     if (ImGui::Checkbox("Legacy instance scale limits (0.05-50)", &legacy_scale)) {
       g_pool.legacy_scale.store(legacy_scale, std::memory_order_relaxed);
+      g_pool.legacy_scale_setting = legacy_scale ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolLegacyScale")) { s->Set(g_pool.legacy_scale_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Rejects instances with an axis scale outside 0.05-50 (the limits before the\n"
@@ -414,7 +487,10 @@ inline void DrawBvhPanel() {
     bool poison_staging = g_pool.poison_staging.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Poison mesh staging (diagnostic)", &poison_staging)) {
       g_pool.poison_staging.store(poison_staging, std::memory_order_relaxed);
+      g_pool.poison_staging_setting = poison_staging ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolPoisonStaging")) { s->Set(g_pool.poison_staging_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Mesh staging is cpu-visible and filled with a poison word after each read; each mesh\n"
@@ -424,7 +500,10 @@ inline void DrawBvhPanel() {
     bool retry_unstable = g_pool.retry_unstable.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Retry unstable meshes (diagnostic)", &retry_unstable)) {
       g_pool.retry_unstable.store(retry_unstable, std::memory_order_relaxed);
+      g_pool.retry_unstable_setting = retry_unstable ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolRetryUnstable")) { s->Set(g_pool.retry_unstable_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Off (default): a mesh whose captures never repeat is rejected at once.\n"
@@ -434,7 +513,10 @@ inline void DrawBvhPanel() {
     bool alpha_indirect = g_pool.alpha_indirect_source.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Indirect foliage source copy (experimental)", &alpha_indirect)) {
       g_pool.alpha_indirect_source.store(alpha_indirect, std::memory_order_relaxed);
+      g_pool.alpha_indirect_source_setting = alpha_indirect ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolAlphaIndirectSource")) { s->Set(g_pool.alpha_indirect_source_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: indirect "
@@ -444,15 +526,23 @@ inline void DrawBvhPanel() {
     bool alpha_wind = g_pool.alpha_wind_opaque.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Admit wind with opaque pixel shader (experimental)", &alpha_wind)) {
       g_pool.alpha_wind_opaque.store(alpha_wind, std::memory_order_relaxed);
+      g_pool.alpha_wind_opaque_setting = alpha_wind ? 1.f : 0.f;
+      if (auto* s = FindSetting("WorldPoolAlphaWindOpaque")) { s->Set(g_pool.alpha_wind_opaque_setting); s->Write(); }
       switches_changed = true;
+      changed = true;
     }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Experimental, session only, default on. Effective only with Alpha-tested foliage on. On: wind "
                         "vertex shaders (opaque or alpha-tested pixel shader) are admitted as a rigid rest pose instead of WindOpaque. "
                         "Off: their instances leave the BVH at the next present.");
     }
-    bool log_crashes = CrashLogEnabled();
-    if (ImGui::Checkbox("Log crashes", &log_crashes)) SetCrashLogEnabled(log_crashes);
+    bool log_crashes = g_crash_log.enabled_setting > 0.5f;
+    if (ImGui::Checkbox("Log crashes", &log_crashes)) {
+      g_crash_log.enabled_setting = log_crashes ? 1.f : 0.f;
+      SetCrashLogEnabled(log_crashes);
+      if (auto* s = FindSetting("WorldCrashLog")) { s->Set(g_crash_log.enabled_setting); s->Write(); }
+      changed = true;
+    }
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("On a crash, writes the error, the pool stage and the call stack to ReShade.log.\n"
                         "The game still crashes as before.");
@@ -521,7 +611,12 @@ inline void DrawBvhPanel() {
 
   ImGui::SeparatorText("GPU BVH (live)");
   bool live = g_live_bvh.enabled.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Live BVH", &live)) g_live_bvh.enabled.store(live, std::memory_order_relaxed);
+  if (ImGui::Checkbox("Live BVH", &live)) {
+    g_live_bvh.enabled.store(live, std::memory_order_relaxed);
+    g_live_bvh.enabled_setting = live ? 1.f : 0.f;
+    if (auto* s = FindSetting("WorldLiveBvh")) { s->Set(g_live_bvh.enabled_setting); s->Write(); }
+    changed = true;
+  }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Keeps the GPU BVH in step with the pool every frame: new meshes stream in with their BLAS\n"
                       "built on the CPU (%llu triangles per frame), and the region TLAS is rebuilt when instances,\n"
@@ -532,13 +627,23 @@ inline void DrawBvhPanel() {
   if (ImGui::Button("Rebuild BVH")) g_live_bvh.reset_requested.store(true, std::memory_order_relaxed);
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drops every GPU mesh and streams the pool in again.");
   bool skip_noop = g_live_bvh.skip_noop.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);
+  if (ImGui::Checkbox("Skip no-op TLAS rebuilds", &skip_noop)) {
+    g_live_bvh.skip_noop.store(skip_noop, std::memory_order_relaxed);
+    g_live_bvh.skip_noop_setting = skip_noop ? 1.f : 0.f;
+    if (auto* s = FindSetting("WorldLiveBvhSkipNoop")) { s->Set(g_live_bvh.skip_noop_setting); s->Write(); }
+    changed = true;
+  }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("A TLAS rebuild whose instances equal the TLAS already in place is skipped (no sort, build or buffer\n"
                       "creation). Default OFF until the in-game A/B; off: every rebuild runs, as before. Session only, not saved.");
   }
   bool slack = g_live_bvh.slack.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Slack TLAS (experimental, session only)", &slack)) g_live_bvh.slack.store(slack, std::memory_order_relaxed);
+  if (ImGui::Checkbox("Slack TLAS (experimental, session only)", &slack)) {
+    g_live_bvh.slack.store(slack, std::memory_order_relaxed);
+    g_live_bvh.slack_setting = slack ? 1.f : 0.f;
+    if (auto* s = FindSetting("WorldLiveBvhSlack")) { s->Set(g_live_bvh.slack_setting); s->Write(); }
+    changed = true;
+  }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Keeps spare slots in the TLAS so most changes are written in place (no sort, build or buffer creation).\n"
                       "Trade: tree quality drifts until the next full rebuild (at most every 120 frames or when the slots run out).\n"
@@ -549,13 +654,19 @@ inline void DrawBvhPanel() {
   const char* modes = "Off\0BVH Trace (Shaded)\0BVH Trace (Instance ID)\0Depth Compare\0";
   if (ImGui::Combo("GPU Debug", &mode, modes)) {
     g_bvh_debug.mode.store(mode, std::memory_order_relaxed);
+    g_bvh_debug.mode_setting = static_cast<float>(mode);
+    if (auto* s = FindSetting("WorldGpuDebugMode")) { s->Set(g_bvh_debug.mode_setting); s->Write(); }
     RefreshPoolCaptureRequest();
     if (mode != static_cast<int>(BvhView::Off)) g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+    changed = true;
   }
   bool hiding = g_bvh_trace.hide_camera_hidden.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Hide what the game camera does not show", &hiding)) {
     g_bvh_trace.hide_camera_hidden.store(hiding, std::memory_order_relaxed);
+    g_bvh_trace.hide_camera_hidden_setting = hiding ? 1.f : 0.f;
+    if (auto* s = FindSetting("WorldGpuDebugHideCameraHidden")) { s->Set(g_bvh_trace.hide_camera_hidden_setting); s->Write(); }
     g_bvh_trace.stats_requested.store(true, std::memory_order_relaxed);
+    changed = true;
   }
   if (ImGui::IsItemHovered()) {
     ImGui::SetTooltip("Some BVH instances are never drawn by a camera vertex shader, only into the shadow maps\n"
@@ -583,7 +694,7 @@ inline void DrawBvhPanel() {
   BvhDeviceData* data = device != nullptr ? GetBvhDeviceData(device) : nullptr;
   if (data == nullptr) {
     ImGui::TextDisabled("No device yet.");
-    return;
+    return changed;
   }
   const LiveBvhStats& live_stats = data->live;
   if (CollectCacheErrors(data).total != 0u) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "Errors recorded: see the dump (errors block)");
@@ -601,7 +712,12 @@ inline void DrawBvhPanel() {
   // Gather performance metrics is on); costs are on the Performance tab. Each dump and each performance test writes its own file.
   ImGui::SeparatorText("Cache diagnostics (Phase 0 and 0b, diagnostic only: no rendering change)");
   bool collect = g_cache_diag.enabled.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Collect cache diagnostics", &collect)) g_cache_diag.enabled.store(collect, std::memory_order_relaxed);
+  if (ImGui::Checkbox("Collect cache diagnostics", &collect)) {
+    g_cache_diag.enabled.store(collect, std::memory_order_relaxed);
+    g_cache_diag.enabled_setting = collect ? 1.f : 0.f;
+    if (auto* s = FindSetting("WorldCacheDiag")) { s->Set(g_cache_diag.enabled_setting); s->Write(); }
+    changed = true;
+  }
   ImGui::InputText("Label", g_diag_label, sizeof(g_diag_label));
   if (ImGui::Button("Dump cache diagnostics")) {
     // The first press asks the next present to compute the tiers; the press after that (once a present has run) writes the file.
@@ -766,6 +882,7 @@ inline void DrawBvhPanel() {
       ImGui::TextUnformatted(line.c_str());
     }
   }
+  return changed;
 }
 
 }  // namespace falcom_world::bvh

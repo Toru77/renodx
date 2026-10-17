@@ -374,6 +374,8 @@ struct DeformLiveStats {
 
 struct DeformLiveState {
   std::atomic_bool enabled{true};
+  // Mirror bound to the settings system so the Ray Tracing deform toggle survives a restart.
+  float enabled_setting{1.f};
   std::mutex mutex;
   reshade::api::device* device = nullptr;
   // Per-frame capture arena (vertices are written by stream output).
