@@ -570,7 +570,7 @@ inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::co
       .generated_frame = g_state.frame.load(),
       .perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed),
   };
-  const std::string text = BuildRtgiJson(in);
+  std::string text = BuildRtgiJson(in);
   renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtgi.json", text);
 }
 

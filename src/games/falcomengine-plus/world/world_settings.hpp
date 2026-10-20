@@ -45,6 +45,39 @@ inline bool IsDevkitPresent() {
   return file_present;
 }
 
+// Temporal Accumulation and Denoising rows: one definition for RTAO and RTGI (same algorithm, separate values).
+struct TemporalRows {
+  const char* prefix;  // key prefix: "Rtao" or "Rtgi"
+  const char* section;
+  const char* enabled_tooltip;
+  float* enabled;
+  float enabled_default;
+  float* history_weight;
+  float history_weight_default;
+  float* depth_rejection;
+  float depth_rejection_default;
+  float* normal_rejection;
+  float normal_rejection_default;
+  float* history_clamp;
+  float history_clamp_default;
+};
+struct SpatialRows {
+  const char* prefix;
+  const char* section;
+  const char* enabled_tooltip;
+  float* enabled;
+  float enabled_default;
+  float* filter_type;
+  float filter_type_default;
+  float* filter_radius;
+  float filter_radius_default;
+  float* filter_passes;
+  float filter_passes_default;
+  float* taps_separable;
+  float taps_separable_default;
+  float* taps_atrous;
+  float taps_atrous_default;
+};
 inline void AddSettings(renodx::utils::settings::Settings* settings, bool supported, std::function<bool()> advanced_visible = nullptr) {
   if (settings == nullptr) return;
   g_state.supported = supported && IsDevkitPresent();
@@ -54,39 +87,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   using SettingValueType = renodx::utils::settings::SettingValueType;
   const auto visible = []() { return g_state.supported; };
   const std::function<bool()> advanced = advanced_visible ? advanced_visible : std::function<bool()>(visible);
-  // Temporal Accumulation and Denoising rows: one definition for RTAO and RTGI (same algorithm, separate values).
-  struct TemporalRows {
-    const char* prefix;  // key prefix: "Rtao" or "Rtgi"
-    const char* section;
-    const char* enabled_tooltip;
-    float* enabled;
-    float enabled_default;
-    float* history_weight;
-    float history_weight_default;
-    float* depth_rejection;
-    float depth_rejection_default;
-    float* normal_rejection;
-    float normal_rejection_default;
-    float* history_clamp;
-    float history_clamp_default;
-  };
-  struct SpatialRows {
-    const char* prefix;
-    const char* section;
-    const char* enabled_tooltip;
-    float* enabled;
-    float enabled_default;
-    float* filter_type;
-    float filter_type_default;
-    float* filter_radius;
-    float filter_radius_default;
-    float* filter_passes;
-    float filter_passes_default;
-    float* taps_separable;
-    float taps_separable_default;
-    float* taps_atrous;
-    float taps_atrous_default;
-  };
   const auto add_temporal_rows = [&](const TemporalRows& rows) {
     const std::string prefix = rows.prefix;
     settings->push_back(new Setting{
