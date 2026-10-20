@@ -85,7 +85,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
 
   using Setting = renodx::utils::settings::Setting;
   using SettingValueType = renodx::utils::settings::SettingValueType;
-  const auto visible = []() { return g_state.supported; };
+  const std::function<bool()> visible = []() { return g_state.supported; };
   const std::function<bool()> advanced = advanced_visible ? advanced_visible : std::function<bool()>(visible);
   const auto add_temporal_rows = [&](const TemporalRows& rows) {
     const std::string prefix = rows.prefix;
