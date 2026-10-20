@@ -232,10 +232,11 @@ inline void CaptureRtgiRadiance(reshade::api::device* device, reshade::api::comm
     radiance_desc.texture = {desc.texture.width, desc.texture.height, 1, 1, format, 1};
     radiance_desc.heap = reshade::api::memory_heap::gpu_only;
     radiance_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
-    const reshade::api::resource_view_desc view(reshade::api::resource_view_type::texture_2d,
-                                                reshade::api::format_to_default_typed(format, 0), 0, 1, 0, 1);
     if (!device->create_resource(radiance_desc, nullptr, reshade::api::resource_usage::shader_resource, &data.radiance_texture)
-        || !device->create_resource_view(data.radiance_texture, reshade::api::resource_usage::shader_resource, view, &data.radiance_srv)) {
+        || !device->create_resource_view(data.radiance_texture, reshade::api::resource_usage::shader_resource,
+                                         reshade::api::resource_view_desc(reshade::api::resource_view_type::texture_2d,
+                                                                          reshade::api::format_to_default_typed(format, 0), 0, 1, 0, 1),
+                                         &data.radiance_srv)) {
       bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
       data.radiance_failed = true;
       renodx::utils::log::w("[world-rtgi] radiance copy target creation failed (format ", static_cast<uint32_t>(format), ")");

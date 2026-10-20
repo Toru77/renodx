@@ -57,8 +57,7 @@ inline void DrawRtgiPanel() {
                 v[kRtgiStatPixels]);
     float luminance_max = 0.f;
     std::memcpy(&luminance_max, &v[kRtgiStatLuminanceMax], sizeof(luminance_max));
-    const uint64_t luminance_sum = (static_cast<uint64_t>(v[kRtgiStatLuminanceSumHi]) << 32) | v[kRtgiStatLuminanceSum];
-    const float mean_luminance = hits > 0u ? static_cast<float>(static_cast<double>(luminance_sum) / 10.0 / hits) : 0.f;
+    const float mean_luminance = hits > 0u ? static_cast<float>(static_cast<double>((static_cast<uint64_t>(v[kRtgiStatLuminanceSumHi]) << 32) | v[kRtgiStatLuminanceSum]) / 10.0 / hits) : 0.f;
     ImGui::Text("Radiance: on-screen lookups %u, sun rays %u (visible %.1f%%), mean sample luminance (capped at 1000 per sample) %.3f, max %.3f, clamped %.1f%%",
                 v[kRtgiStatRadianceLookups], v[kRtgiStatSunRays], rtao::SharePercent(v[kRtgiStatSunVisible], v[kRtgiStatSunRays]),
                 mean_luminance, luminance_max, rtao::SharePercent(v[kRtgiStatClamped], hits));
