@@ -43,6 +43,7 @@ struct AlphaMaterialGPU
 #define INSTANCE_NEAR_FADE 1u       // camera rays apply the near fade
 #define INSTANCE_CAMERA_VISIBLE 2u  // drawn by a camera vertex shader
 #define INSTANCE_SHADOW_CASTER 4u   // drawn by a light vertex shader (shadow maps)
+#define INSTANCE_FOLIAGE 8u         // its draw key is a wind rest pose (VsClass::Wind, from bytecode)
 
 struct BVHLeafGPU
 {

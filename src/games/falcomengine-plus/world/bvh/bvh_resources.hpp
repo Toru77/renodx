@@ -48,6 +48,7 @@ struct WorldMeshGPU {
 inline constexpr uint32_t kInstanceNearFade = 1u;       // camera rays apply the near fade
 inline constexpr uint32_t kInstanceCameraVisible = 2u;  // drawn by a camera VS
 inline constexpr uint32_t kInstanceShadowCaster = 4u;   // drawn by a light VS (shadow maps)
+inline constexpr uint32_t kInstanceFoliage = 8u;        // draw key in g_pool.wind_keys (VsClass::Wind): foliage
 
 struct WorldInstanceGPU {
   float header[4];  // x=mesh_id (live store slot) y=source
@@ -251,6 +252,7 @@ struct LiveTlasInstance {
   float param2[3] = {};  // InstanceParam.param2 (wind sway)
   bool wind = false;     // wind rest pose: matrix and bounds are its sway trace pose (ApplyPoolWindSway)
   bool rest = false;     // wind rest-pose entry (RefitLiveTlas reads rest_pose while the pool and visibility are unchanged)
+  bool foliage = false;  // draw key in g_pool.wind_keys at the TLAS build (descriptor flag kInstanceFoliage)
   LiveWindRest rest_pose;
   uint32_t first_frame = 0u;
   uint32_t admit_frame = 0u;

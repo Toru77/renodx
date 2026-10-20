@@ -9105,7 +9105,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   in.push = {
       {rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_normal_bias},
       {spp, isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed},
-      {fade.start, fade.end, rtao::g_rtao_discovery > 0.5f ? 1.f : 0.f, 0.f},
+      {fade.start, fade.end, static_cast<float>((rtao::g_rtao_discovery > 0.5f ? rtao::kRtaoFlagDiscovery : 0u) | (rtao::g_rtao_foliage_skip > 0.5f ? rtao::kRtaoFlagFoliageSkip : 0u)), 0.f},
       {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
        bvh_data->tlas_region_size},
       {0.f, 0.f, 0.f, 0.f},
@@ -9182,7 +9182,8 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start_pct,
       rtao::g_rtao_fade_end_pct, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
       rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
-      rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix};
+      rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix,
+      rtao::g_rtao_foliage_skip};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
   if (params_changed) rf.last_parameter_change = rtao::ParameterFieldName(params, rf.prev_params);
   rf.prev_params = params;

@@ -60,6 +60,17 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## RTAO Foliage skip (rtao-foliage-1): implemented, not validated in game
+
+- Class rule: an instance is foliage when its draw key is in `g_pool.wind_keys`, i.e. it was admitted through a `VsClass::Wind` vertex shader (bytecode classification, not a hash or a mesh list). Its TLAS descriptor always carries flag 8 (`kInstanceFoliage`, `INSTANCE_FOLIAGE`). The "Foliage skip" toggle (RTAO section, default Off) only sets the RTAO ray skip mask (`WorldCameraView::skip_flags`), so the TLAS does not rebuild when it changes. Toggling it resets the temporal history.
+- Limits: alpha-tested vegetation drawn with a rigid VS (no wind) is not skipped. Fences and other rigid alpha-tested meshes still occlude. P2b records never get the bit. The debug trace and the Two-Sided discovery ray never skip.
+- Pending, harness pins not re-derived (this branch was built and reviewed on Linux, where the harness cannot run; no pin value was changed):
+  - Procedure (Windows, `.falcom-dev/harness`): (a) `powershell -File refresh_world.ps1`, then `powershell -File run_win_all.ps1`, and list the failing checks; (b) temporarily set `kInstanceFoliage = 0u`, refresh and re-run: every pin must equal HEAD; (c) restore `8u`, update only the pins that failed in (a) to the printed values, and record old and new values here.
+  - Candidate pins (from the plan, to confirm in (a)): test_live `TestCacheOnOff` 0x55593b70e070e7fe, `TestRebuildGolden` 0x2c41a4dfd6f640d4, `TestRefitGolden` 0x2bf515dfb5956c83, `TestRestWindGolden` 0x427521e3761f0d08, `TestWindRangeGolden`; test_motion `TestOrphanGolden`.
+  - Size check (not a hash golden, deterministic): test_rtao.cpp `TestSpatialPlan` still expects `sizeof(rtao::ParameterSnapshot) == 18u * sizeof(float)`. It must change to `19u` (message "ParameterSnapshot: 19 floats (foliage_skip appended), no filter field (size %zu)") and it fails until then.
+  - Any failure that is not one of these pins, or a pin that still differs in (b), is a stop: report it before changing anything.
+- Owner, in game: Foliage skip Off matches the image before this change. On, near trees and grass: AO under the foliage drops; `world_pool.json` `wind_keys_total` > 0; "Read RTAO Stats" occluded % drops near trees. Fences still occlude. Send `world_rtao.json` (`foliage_skip`) and the panel line "foliage skip on/off".
+
 ## RTAO on characters, Character Intensity and Max Darkening (rtao-sliders-1): implemented, not validated in game
 
 - While RTAO produces, the character shading pixels (G-buffer bit 3 clear, bit 0 set) are multiplied by `lerp(1, RTAO, Character Intensity)` in the Sora 2nd lighting shader. This happens after pass B and the filter, whatever "Allow GTVBAO" says.

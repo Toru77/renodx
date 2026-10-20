@@ -71,12 +71,14 @@ inline constexpr uint32_t kRtaoStatRegion = 6u;
 inline constexpr uint32_t kRtaoStatInvalidRefs = 7u;
 inline constexpr uint32_t kRtaoStatStackOverflow = 8u;
 inline constexpr uint32_t kRtaoStatScaled = 9u;
+inline constexpr uint32_t kRtaoFlagDiscovery = 1u;    // b12 c2.z bits (RTAO_FLAG_* in world_rtao.cs_5_0.hlsl)
+inline constexpr uint32_t kRtaoFlagFoliageSkip = 2u;
 
 // b12 for pass A, matching cbuffer cb_rtao in world_rtao.cs_5_0.hlsl (five float4 registers).
 struct RtaoPushConstants {
   float params[4];    // c0: radius, ray_max, strength, normal_bias
   float sampling[4];  // c1: spp, isfast flag (1 loaded), slice base, seed
-  float fade[4];      // c2: fade start_eff, fade end_eff, discovery (z), P2b record count (w, uint bits)
+  float fade[4];      // c2: fade start_eff, fade end_eff, flags (z: kRtaoFlag* as a float), P2b record count (w, uint bits)
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: width, height, dynamic count (0), output_raw (1 = write u2 raw AO, not u0)
 };

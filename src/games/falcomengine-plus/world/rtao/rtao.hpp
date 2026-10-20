@@ -376,6 +376,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
        << ", \"isfast_used\": " << (f.captured_isfast_used ? "true" : "false")
        << ", \"radius\": " << f.captured.radius << ", \"ray_max\": " << f.captured.ray_max
        << ", \"strength\": " << f.captured.strength << ", \"normal_bias\": " << f.captured.normal_bias
+       << ", \"foliage_skip\": " << f.captured.foliage_skip
        << ", \"debug\": " << f.captured.debug << "}"
        << ", \"frames_without_ao_by_reason\": {";
   bool first_reason = true;

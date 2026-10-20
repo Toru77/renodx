@@ -37,7 +37,7 @@ cbuffer cb_rtao : register(b12)
 {
     float4 g_rtao_params : packoffset(c0);    // radius, ray_max, strength, normal_bias
     float4 g_rtao_sampling : packoffset(c1);  // spp, isfast flag (1 loaded), slice base, seed
-    float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, discovery (z), P2b record count (w, uint bits)
+    float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, flags (z: RTAO_FLAG_* as a float), P2b record count (w, uint bits)
     float4 g_rtao_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtao_size : packoffset(c4);      // width, height, dynamic count (0), output_raw (1 = write u2, not u0)
 };
@@ -54,6 +54,9 @@ cbuffer cb_rtao : register(b12)
 #define RTAO_STAT_SCALED 9u
 #define RTAO_STAT_COUNT 10u
 
+#define RTAO_FLAG_DISCOVERY 1u
+#define RTAO_FLAG_FOLIAGE_SKIP 2u
+
 #define RTAO_DISC_BASE 16u
 #define RTAO_DISC_COUNT 8u
 
@@ -62,6 +65,7 @@ groupshared uint gs_disc[RTAO_DISC_COUNT];
 
 void TracePixel(uint2 px)
 {
+    const uint rtao_flags = (uint)g_rtao_fade.z;
     const float ray_max = g_rtao_params.y;
     const float radius = min(g_rtao_params.x, ray_max);
     const uint spp = max((uint)g_rtao_sampling.x, 1u);
@@ -103,10 +107,10 @@ void TracePixel(uint2 px)
             const float distance_to_camera = length(P - camera);
             // Two-Sided discovery (diagnostic, g_rtao_fade.z = 1): one primary ray camera -> P. Only a hit at the
             // G-buffer distance (2% or 5 cm) counts: winding back x normal toward camera x alpha-tested.
-            if (g_rtao_fade.z > 0.5)
+            if ((rtao_flags & RTAO_FLAG_DISCOVERY) != 0u)
             {
                 const float3 view_dir = (P - camera) / distance_to_camera;
-                WorldCameraView disc_view = {true, 1.0};
+                WorldCameraView disc_view = {true, 1.0, 0u};
                 WorldTraceCounters disc_counters;
                 const WorldTraceHit disc_hit = TraceWorldClosest(camera, view_dir, 1e-3, 1.05 * distance_to_camera, disc_view, disc_counters);
                 if (disc_hit.prim != 0xFFFFFFFFu && abs(disc_hit.t - distance_to_camera) <= max(0.02 * distance_to_camera, 0.05))
@@ -121,7 +125,7 @@ void TracePixel(uint2 px)
             const float3 up = abs(N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
             const float3 T = normalize(cross(up, N));
             const float3 B = cross(N, T);
-            const WorldCameraView view = {true, 1.0};
+            const WorldCameraView view = {true, 1.0, (rtao_flags & RTAO_FLAG_FOLIAGE_SKIP) != 0u ? INSTANCE_FOLIAGE : 0u};
 
             float occ = 0.0;
             uint rays = 0u;
@@ -193,5 +197,5 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 
     GroupMemoryBarrierWithGroupSync();
     if (group_index < RTAO_STAT_COUNT) InterlockedAdd(g_rtao_stats[group_index], gs_stats[group_index]);
-    if (g_rtao_fade.z > 0.5 && group_index < RTAO_DISC_COUNT) InterlockedAdd(g_rtao_stats[RTAO_DISC_BASE + group_index], gs_disc[group_index]);
+    if (((uint)g_rtao_fade.z & RTAO_FLAG_DISCOVERY) != 0u && group_index < RTAO_DISC_COUNT) InterlockedAdd(g_rtao_stats[RTAO_DISC_BASE + group_index], gs_disc[group_index]);
 }

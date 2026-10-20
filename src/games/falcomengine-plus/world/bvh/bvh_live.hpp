@@ -538,13 +538,16 @@ inline bool CameraFadeApplies(const PoolCameraVisibility& visibility) {
          && CameraFadeInputsUsable(visibility.inputs.param[0], visibility.inputs.param[1]);
 }
 
-inline void FillInstanceVisibility(const PoolCameraVisibility& visibility, float out[4]) {
+inline void FillInstanceVisibility(const PoolCameraVisibility& visibility, bool foliage, float out[4]) {
   out[0] = 0.f;
   out[1] = 0.f;
   out[3] = 0.f;
   uint32_t flags = 0u;
   if (visibility.camera_seen) flags |= kInstanceCameraVisible;
   if (visibility.light_seen) flags |= kInstanceShadowCaster;
+  if (foliage) {
+    flags |= kInstanceFoliage;
+  }
   if (CameraFadeApplies(visibility)) {
     flags |= kInstanceNearFade;
     out[0] = visibility.inputs.param[0];
@@ -664,7 +667,7 @@ inline WorldInstanceGPU MakeLiveInstanceGPU(const LiveTlasInstance& instance, ui
     descriptor.bounds_min[k] = instance.bounds_min[k];
     descriptor.bounds_max[k] = instance.bounds_max[k];
   }
-  FillInstanceVisibility(instance.visibility, descriptor.visibility);
+  FillInstanceVisibility(instance.visibility, instance.foliage, descriptor.visibility);
   return descriptor;
 }
 
@@ -959,6 +962,7 @@ inline void RebuildLiveTlas(
       copy.alpha = g_pool.meshes[instance.mesh_id].alpha;
       copy.id = instance.id;
       copy.mesh_key = instance.mesh_key;
+      copy.foliage = g_pool.wind_keys.count(instance.mesh_key) != 0u;
       copy.vs_hash = instance.source_vs_hash;
       copy.first_frame = instance.first_frame;
       copy.admit_frame = instance.admit_frame;

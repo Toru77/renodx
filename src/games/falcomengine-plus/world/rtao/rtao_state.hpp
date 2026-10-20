@@ -18,6 +18,7 @@ inline float g_rtao_samples = 2.f;
 inline float g_rtao_ray_max = 2.f;
 inline float g_rtao_normal_bias = 0.05f;
 inline float g_rtao_two_sided = 1.f;
+inline float g_rtao_foliage_skip = 0.f;  // Foliage skip: RTAO rays ignore INSTANCE_FOLIAGE instances
 inline float g_rtao_char_intensity = 1.f;  // Character Intensity: RTAO kept on character pixels (lighting shader)
 inline float g_rtao_max_darkening = 1.f;  // Max Darkening: AO is never below 1 - this (lighting shader)
 inline float g_rtao_temporal_enabled = 1.f;
@@ -95,6 +96,7 @@ struct ParameterSnapshot {
   float radius, ray_max, strength, samples, normal_bias, two_sided, isfast, fade_start, fade_end;  // fade: percent of the range
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
   float zero_motion, freeze_noise, camera_matrix;
+  float foliage_skip;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 
@@ -327,6 +329,7 @@ inline const char* ParameterFieldName(const ParameterSnapshot& a, const Paramete
   if (a.zero_motion != b.zero_motion) return "test_zero_motion";
   if (a.freeze_noise != b.freeze_noise) return "test_freeze_noise";
   if (a.camera_matrix != b.camera_matrix) return "test_camera_matrix";
+  if (a.foliage_skip != b.foliage_skip) return "foliage_skip";
   return "";
 }
 

@@ -494,6 +494,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtaoFoliageSkip",
+      .binding = &rtao::g_rtao_foliage_skip,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Foliage skip",
+      .section = "RTAO",
+      .tooltip = "RTAO rays pass through foliage: instances drawn by a wind-sway vertex shader (grass, leaves, branches; recognised from the shader bytecode). Fences and other rigid alpha-tested meshes still occlude. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoCharacterIntensity",
       .binding = &rtao::g_rtao_char_intensity,
       .value_type = SettingValueType::FLOAT,
