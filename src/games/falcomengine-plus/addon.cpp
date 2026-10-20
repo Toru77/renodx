@@ -1528,11 +1528,9 @@ static bool OnBeforeCustomTAADraw(reshade::api::command_list* cmd_list);
 static bool OnReplaceCustomTAADraw(reshade::api::command_list* cmd_list);
 static void EnsureTAAPayload(reshade::api::device* dev, uint32_t hash, std::span<const uint8_t> desired, std::span<const uint8_t> alternate);
 static void OnInitPipelineCapture(
-    reshade::api::device* device,
-    reshade::api::pipeline_layout layout,
+    renodx::utils::pipeline::PipelineInfo* info,
     uint32_t subobject_count,
-    const reshade::api::pipeline_subobject* subobjects,
-    reshade::api::pipeline pipeline);
+    const reshade::api::pipeline_subobject* subobjects);
 static void OnDestroyPipelineCapture(reshade::api::device* device, reshade::api::pipeline pipeline);
 // Forces the draw-time machinery to rebuild the replacement on the next draw
 // for every tracked pipeline whose hashes contain `hash` and for which we
@@ -1541,32 +1539,36 @@ static void OnDestroyPipelineCapture(reshade::api::device* device, reshade::api:
 // use_replace_async/use_shader_cache is set (neither addon sets them), so the
 // per-handle clones captured below are assigned first; without them the
 // rebuild would index an empty array (heap corruption � the startup crash).
-// Two-phase (collect handles under a read lock, then reset per handle) so no
+// Two-phase (collect handles first, then reset per handle) so no pipeline
 // map lock is held across operations. The orphaned replacement pipeline is
-// deliberately NOT destroyed here (it may still be bound on this list);
-// its tracking entry is dropped for handle-reuse safety and the object leaks
-// bounded (~1 per toggle transition) until device/process teardown.
+// deliberately NOT destroyed here (it may still be bound on this list) and
+// leaks bounded (~1 per toggle transition) until device/process teardown.
 static void ResetTAAReplacementPipelines(reshade::api::device* dev, uint32_t hash) {
   if (!dev || hash == 0u) return;
-  if (renodx::utils::shader::shared.data == nullptr) return;
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
   std::vector<uint64_t> stale;
-  renodx::utils::shader::shared.data->pipeline_shader_details.for_each(
-      [&](const auto& pair) {
-        const auto& details = pair.second;
-        if (details.device != dev) return;
-        if (details.shader_hashes.find(hash) == details.shader_hashes.end()) return;
-        stale.push_back(pair.first);
-      });
+  for (const auto& entry : d->taa_subobject_clones) {
+    const uint64_t handle = entry.first;
+    renodx::utils::pipeline::GetPipelineInfo(
+        reshade::api::pipeline{handle},
+        [&](const renodx::utils::pipeline::PipelineInfo& info) {
+          if (info.device != dev) return;
+          for (const auto& shader : info.shader_details) {
+            if (shader.shader_hash == hash) {
+              stale.push_back(handle);
+              break;
+            }
+          }
+        });
+  }
   for (uint64_t handle : stale) {
     auto cit = d->taa_subobject_clones.find(handle);
     if (cit == d->taa_subobject_clones.end()) continue;  // no safe source: leave stale (today's behavior)
     reshade::api::pipeline orphan = {0u};
-    renodx::utils::shader::shared.data->pipeline_shader_details.modify_if(
-        handle,
-        [&](std::pair<const uint64_t, renodx::utils::shader::PipelineShaderDetails>& pair) {
-          auto& details = pair.second;
+    renodx::utils::pipeline::UpdatePipelineShaderDetails(
+        reshade::api::pipeline{handle},
+        [&](renodx::utils::pipeline::PipelineShaderDetails& details) {
           if (details.subobjects.empty()) {
             auto* fresh = renodx::utils::pipeline::ClonePipelineSubObjects(
                 cit->second.first, cit->second.second);
@@ -1594,14 +1596,10 @@ static void ResetTAAReplacementPipelines(reshade::api::device* dev, uint32_t has
           details.replacement_pipeline = {0u};
           details.initialized_replacement = false;
         });
-    // Outside the map lock (erase re-enters the map): drop the orphaned
-    // replacement's tracking entry. The object itself is deliberately not
-    // destroyed (may still be bound); bounded leak until teardown.
+    // The orphaned replacement is deliberately not destroyed (it may still be
+    // bound); its PipelineInfo entry is cleaned up with the device.
     if (orphan.handle != 0u) {
-      renodx::utils::shader::shared.data->pipeline_shader_details.erase_if(
-          orphan.handle, [](const auto&) { return true; });
-      // The orphan may itself have been captured at init (friend-bytecode
-      // rebuilds match the inverse fallback): drop that clone too.
+      // Drop the clone if the orphan was captured at init.
       auto oit = d->taa_subobject_clones.find(orphan.handle);
       if (oit != d->taa_subobject_clones.end()) {
         renodx::utils::pipeline::DestroyPipelineSubobjects(oit->second.first, oit->second.second);
@@ -1614,16 +1612,14 @@ static void ResetTAAReplacementPipelines(reshade::api::device* dev, uint32_t has
 
 // Captures a deep clone of TAA pipeline subobjects at init time (the pipeline
 // handle is known here; original descs die with the event return). Matched on
-// the vanilla TAA hashes, with an inverse-map fallback for pipelines already
-// baked by another addon (load-order robustness).
+// the vanilla TAA hashes; the pipeline tracker's original hashes cover
+// pipelines already baked by another addon (load-order robustness).
 static void OnInitPipelineCapture(
-    reshade::api::device* device,
-    reshade::api::pipeline_layout /*layout*/,
+    renodx::utils::pipeline::PipelineInfo* info,
     uint32_t subobject_count,
-    const reshade::api::pipeline_subobject* subobjects,
-    reshade::api::pipeline pipeline) {
-  if (!device || !subobjects || subobject_count == 0u || pipeline.handle == 0u) return;
-  auto* d = device->get_private_data<DeviceData>();
+    const reshade::api::pipeline_subobject* subobjects) {
+  if (info == nullptr || info->device == nullptr || !subobjects || subobject_count == 0u || info->pipeline.handle == 0u) return;
+  auto* d = info->device->get_private_data<DeviceData>();
   if (!d) return;
   static const uint32_t kTAAHashes[2] = {0xFA37EA04u, 0x9D91FAC3u};
   bool match = false;
@@ -1636,31 +1632,30 @@ static void OnInitPipelineCapture(
     for (uint32_t want : kTAAHashes) {
       if (h == want) { match = true; break; }
     }
-    if (!match && renodx::utils::shader::shared.data != nullptr) {
-      renodx::utils::shader::shared.data->shader_replacements_inverse.if_contains(
-          std::pair<reshade::api::device*, uint32_t>{device, h},
-          [&](const auto& pair) {
-            for (uint32_t want : kTAAHashes) {
-              if (pair.second == want) { match = true; break; }
-            }
-          });
+  }
+  if (!match) {
+    for (const auto& shader : info->shader_details) {
+      for (uint32_t want : kTAAHashes) {
+        if (shader.shader_hash == want) { match = true; break; }
+      }
+      if (match) break;
     }
   }
   if (!match) return;
-  auto it = d->taa_subobject_clones.find(pipeline.handle);
+  auto it = d->taa_subobject_clones.find(info->pipeline.handle);
   if (it != d->taa_subobject_clones.end()) {
     renodx::utils::pipeline::DestroyPipelineSubobjects(it->second.first, it->second.second);
     d->taa_subobject_clones.erase(it);
-    d->taa_subobjects_owned.erase(pipeline.handle);
+    d->taa_subobjects_owned.erase(info->pipeline.handle);
   }
   reshade::api::pipeline_subobject* clone =
       renodx::utils::pipeline::ClonePipelineSubObjects(subobjects, subobject_count);
   if (!clone) return;
-  d->taa_subobject_clones.emplace(pipeline.handle, std::make_pair(clone, subobject_count));
+  d->taa_subobject_clones.emplace(info->pipeline.handle, std::make_pair(clone, subobject_count));
   // If the slot payload is already owned, this pipeline's creation-time build
   // may have used stale bytes: schedule one reset on the next TAA draw.
   if (d->taa_slot_claimed) {
-    d->taa_pending_resets.insert(pipeline.handle);
+    d->taa_pending_resets.insert(info->pipeline.handle);
   }
 }
 
@@ -7242,16 +7237,16 @@ static void EnsureTAAPayload(
   if (!dev || hash == 0u || desired.empty()) return;
   auto* d = dev->get_private_data<DeviceData>();
   if (!d) return;
-  if (renodx::utils::shader::shared.data == nullptr) return;  // shared state unavailable: keep today's behavior
   bool present = false;
   bool matches_desired = false;
   bool matches_alternate = false;
-  renodx::utils::shader::shared.data->runtime_replacements.if_contains(
-      std::pair<reshade::api::device*, uint32_t>{dev, hash},
-      [&](const auto& pair) {
+  renodx::utils::shader::ForEachRuntimeReplacement(
+      dev,
+      [&](uint32_t replacement_hash, std::span<const uint8_t> bytecode) {
+        if (replacement_hash != hash) return;
         present = true;
-        matches_desired = TAASpanEquals(pair.second, desired);
-        matches_alternate = !alternate.empty() && TAASpanEquals(pair.second, alternate);
+        matches_desired = TAASpanEquals(bytecode, desired);
+        matches_alternate = !alternate.empty() && TAASpanEquals(bytecode, alternate);
       });
   // A nonempty payload different from both known payloads means another addon
   // has registered this TAA hash. Remember that so replacement stays forced
@@ -12815,7 +12810,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
-      reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
       break;
     case DLL_PROCESS_DETACH:
@@ -12831,7 +12825,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargetsRCAS);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
-      reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineCapture);
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineCapture);
       reshade::unregister_addon(h_module);
       break;
@@ -12844,7 +12837,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     falcom_world::bvh::SyncBvhSettings();
   }
+  if (fdw_reason == DLL_PROCESS_DETACH) {
+    renodx::utils::pipeline::UnregisterOnInitCallback(OnInitPipelineCapture);
+  }
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    renodx::utils::pipeline::RegisterOnInitCallback(OnInitPipelineCapture);
+  }
   return TRUE;
 }
 
