@@ -23,10 +23,9 @@ jobs:
           submodules: recursive
           lfs: true
 
-      - name: Download Slang binaries
-        run: |
-          curl -L -o slang.zip https://github.com/shader-slang/slang/releases/download/v2025.10.3/slang-2025.10.3-windows-x86_64.zip
-          powershell -Command "Expand-Archive -Path slang.zip -DestinationPath slang_temp -Force; if (!(Test-Path -Path .\bin)) { New-Item -ItemType Directory -Path .\bin }; Copy-Item slang_temp\bin\* .\bin -Force; Remove-Item slang_temp -Recurse -Force"
+      - name: Set up shader tools
+        shell: pwsh
+        run: .\scripts\setup-dev-env.ps1 -Update -Tools dxc,slang,glslang
 
       - name: Set up Clang (x64)
         uses: egor-tensin/setup-clang@v1
@@ -47,35 +46,17 @@ jobs:
 
       - name: Build Trails Beyond Horizon Vanilla Plus
         run: cmake --build --preset clang-x64-release --target kai-vanillaplus --verbose
-      
-      - name: Build YS X Proud Nordics
-        run: cmake --build --preset clang-x64-release --target ys10pn --verbose
 
       - name: Build Sword Art Online Alicization Lycoris
         run: cmake --build --preset clang-x64-release --target sao-alicization --verbose
-      
-      - name: Set up Clang (x86)
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: latest
-          platform: x86
 
-      - name: Configure MSVC (x86)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64_x86
-
-      - name: Configure CMake (x86)
-        run: cmake --preset clang-x86
-
-      - name: Build Trails of Cold Steel II
-        run: cmake --build --preset clang-x86-release --target senkiseki32 --verbose
+      - name: Build Forza Horizon 6 Ray Reconstruction
+        run: cmake --build --preset clang-x64-release --target forzahorizon6-rr --verbose
 
       - name: Prepare Release folder
         run: |
           md githubrelease
           copy build\release\*.addon64 githubrelease\
-          copy build32\release\*.addon32 githubrelease\
           copy build\release\*.pdb githubrelease\
 
       - name: Create a Release
