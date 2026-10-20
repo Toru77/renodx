@@ -78,6 +78,7 @@ P2b is implemented in the working tree, not validated in game. Not yet done: the
 - The GTVBAO character path runs only when RTAO does not produce (if/else), so the two never both apply. "Allow GTVBAO" and "GTVBAO Char Mask" are greyed while RTAO is on.
 - Default image: with RTAO off (the default) the output is unchanged. With RTAO on, character shading pixels darken with full RTAO at Character Intensity 1; at 0 they receive no RTAO multiply. GTVBAO settings do not influence how RTAO looks: while RTAO produces, the lighting shader ignores "Allow GTVBAO", "GTVBAO Char Mask" and "Fix Experimental" (the RTAO texel is read as is), and the menu greys them. The GTVBAO Debug View stays the full-screen viewer for the RTAO debug modes (a diagnostic display, not the shaded image); "CS Dispatch Fix" only restores compute state after the RTAO dispatch.
 - Max Darkening: `ao = max(ao, 1 - Max Darkening)` is applied once to the RTAO texel at the t22 read in the lighting shader (inside the GTVBAO_bound block, after the fix chain). It covers environment and character pixels; "Allow GTVBAO" plays no part. Pixels lighter than the floor are unchanged. Micro shadows, the RTAO debug view and GTVBAO Debug View mode 2 read the uncapped texture; mode 1 ("AO Only") shows the capped AO. Default 1: no change.
+- GTVBAO Debug View is a diagnostic overlay and is not gated by RTAO: with RTAO on, it still replaces the image when a mode is selected. Use RTAO Debug for RTAO views.
 
 ## Refit and drain cleanup (refit-drain-1): implemented, not validated in game
 
@@ -397,7 +398,7 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 - Reset rule (`TemporalResetReason`, rtao_state.hpp, priority): off; off to on; AO size change; frame gap (no RTAO output in the previous frame); loading wipe or resize guard; parameter change (ParameterSnapshot); no motion. A reset means one frame of raw AO. Counts per reason are in the panel and json.
 - Pass failure: pass B's pipeline, targets and motion are checked before pass A. If any is missing, pass A writes the round-1 texel and the history is not swapped.
 - Unbinding: after each pass the compute slots are nulled with push_descriptors (`NullComputeSlots`), so no UAV stays bound at u0..u2 and the raw texture is free as a shader resource (a barrier between the passes).
-- Debug modes (RtaoDebug, advanced): 1 raw AO, 2 accumulated AO (white where there is no valid history), 3 history confidence. They apply with Temporal on and are written by pass B. View full screen through the GTVBAO Debug View "GTVBAO raw .a".
+- Debug modes (RtaoDebug, advanced): 1 raw AO, 2 accumulated AO (white where there is no valid history), 3 history confidence. They apply with Temporal on and are written by pass B. They show full screen while RTAO Debug is set (no GTVBAO Debug View).
 - Two-Sided discovery D1 (advanced, diagnostic, no culling; the row stays locked on): CPU histogram of camera-view opaque candidate draws by (cull mode, front CCW), counted only while the discovery setting is on. GPU counters (stats 16..23): index = 16 + back winding * 4 + G-buffer normal toward camera * 2 + alpha-tested * 1, where back winding means the hit facing is positive, toward means dot(N, -view) > 0, alpha means the instance material is non-zero. Names: 16 front_away_opaque, 17 front_away_alpha, 18 front_toward_opaque, 19 front_toward_alpha, 20 back_away_opaque, 21 back_away_alpha, 22 back_toward_opaque, 23 back_toward_alpha. Only hits within max(2%, 5 cm) of the G-buffer distance count.
 - Persistence: RtaoDebug and RtaoTwoSidedDiscovery are saved with the other settings (owner decision pending whether they should be session-only).
 - Known limits: a game that alternates two motion buffers can look like a conflict (the CONFLICT line prints both handles); the GPU time is one timer around both passes.
@@ -406,7 +407,7 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 
 1. Temporal Accumulation is on by default for new configs. A saved config may keep it off: switch it on by hand in the RTAO section.
 2. Off gives the round-1 image. On should show less noise. Check standing still, a moving camera, and a character walking through: look for lag, smear, silhouette flicker and halos at disocclusions. Compare with TAA on and off.
-3. Debug: set RTAO Debug (advanced) to 1, 2 or 3 with Temporal on, and view with the GTVBAO Debug View set to "GTVBAO raw .a".
+3. Debug: set RTAO Debug (advanced) to 1, 2 or 3 with Temporal on; the mode shows full screen.
 4. Motion: check the log for `[world-rtao] motion: ... same resource: RTV4 owned SRV used` (good) or `[world-rtao] motion CONFLICT: ...` (Temporal is off for the session; send both handles).
 5. D1: enable Two-Sided discovery (advanced), stand in a street, an indoor scene and a foliage scene, press Read RTAO Stats, and send the CPU lines ("Camera opaque candidate draws: cull N, front CW/CCW: count"), the eight GPU counters, and `world_rtao.json`.
 6. CS Dispatch Fix: set "CS Dispatch Fix" to 0, then 1, and confirm the RTAO AO still appears (not black).
@@ -423,9 +424,9 @@ Settings: History Clamp 0, Debug Off, Temporal on, Two-Sided discovery off. The 
 3. Temporal test "force zero motion" on (still scene and camera). Record the panel and json, then turn it off.
 4. "Temporal test: freeze noise" and "force zero motion" both on, still camera, still scene. Expected: the output equals the raw AO, so texel_differs should be near 0 %. Record the panel and json. A small share at depth and normal edges is expected: the TAA jitter still moves the reconstructed positions.
 5. "Freeze noise" alone (motion applied). A larger texel_differs share is expected here. Record the panel and json.
-6. Debug modes 4 (motion px), 5 (blend alpha) and 6 (|raw - AO|) with Temporal on: view through the GTVBAO Debug View "GTVBAO raw .a". Take a screenshot or a short video of each.
+6. Debug modes 4 (motion px), 5 (blend alpha) and 6 (|raw - AO|) with Temporal on: the mode shows full screen. Take a screenshot or a short video of each.
 
-7. D1b (still camera, scene still, Debug Off, History Clamp 0): panel "Motion vs camera-matrix difference". Expected for a static scene: most traced pixels within 0.25 px and jitterDiff_g small. A large share above 1 px on a static scene means the camera matrix and the motion disagree (report it). Then Debug 7 ("Motion vs matrix (px)") viewed through GTVBAO raw .a: dark = agreement, bright = difference.
+7. D1b (still camera, scene still, Debug Off, History Clamp 0): panel "Motion vs camera-matrix difference". Expected for a static scene: most traced pixels within 0.25 px and jitterDiff_g small. A large share above 1 px on a static scene means the camera matrix and the motion disagree (report it). Then Debug 7 ("Motion vs matrix (px)"), shown full screen: dark = agreement, bright = difference.
 8. Test row "camera-matrix reprojection" on (still scene): the history uses the matrix, so the panel share within 0.25 px and the output should not change much from step 1. Then turn it off. "Force zero motion" wins if both are on.
 9. texel_differs is valid with Debug Off only (debug modes change the written texel).
 Send back for each case: the RTAO status panel lines, world_rtao.json, and the screenshots or video of modes 4 to 6.
