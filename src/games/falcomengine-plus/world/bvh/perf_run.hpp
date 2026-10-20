@@ -69,6 +69,7 @@ enum PerfCost : size_t {
   kPerfGpuRtao,
   kPerfGpuRtaoFilter,
   kPerfGpuRtgi,
+  kPerfGpuRtgiDenoise,
   kPerfRebuildPhase0,
   kPerfRebuildPhase1,
   kPerfRebuildPhase2,
@@ -109,6 +110,7 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_rtao", true, kPerfGpu, true, nullptr},
     {"gpu_rtao_filter", true, kPerfGpu, true, nullptr},
     {"gpu_rtgi", true, kPerfGpu, true, nullptr},
+    {"gpu_rtgi_denoise", true, kPerfGpu, true, nullptr},
     {"rebuild_phase_0", true, kPerfSubset, false, kCachePhaseNames[0]},
     {"rebuild_phase_1", true, kPerfSubset, false, kCachePhaseNames[1]},
     {"rebuild_phase_2", true, kPerfSubset, false, kCachePhaseNames[2]},
@@ -302,7 +304,7 @@ struct PerfTimerSample {
   uint32_t samples = 0u;
 };
 struct PerfExtraGpu {
-  PerfTimerSample rtao, rtao_filter, rtgi, deform_refit;
+  PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, deform_refit;
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -467,6 +469,8 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtaoFilter] = extra.rtao_filter.samples;
   c.cost[kPerfGpuRtgi] = extra.rtgi.ms_sum;
   c.events[kPerfGpuRtgi] = extra.rtgi.samples;
+  c.cost[kPerfGpuRtgiDenoise] = extra.rtgi_denoise.ms_sum;
+  c.events[kPerfGpuRtgiDenoise] = extra.rtgi_denoise.samples;
   for (size_t p = 0; p < 5u; ++p) c.cost[kPerfRebuildPhase0 + p] = timing.rebuild_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfRefitPhase0 + p] = timing.refit_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfSlackPhase0 + p] = live.slack_phase_ms_sum[p];

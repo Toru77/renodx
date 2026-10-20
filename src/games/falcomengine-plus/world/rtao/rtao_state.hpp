@@ -159,7 +159,7 @@ inline double MeanFromSum(uint32_t sum_x1000, uint32_t count) {
   return count > 0u ? sum_x1000 / 1000.0 / count : 0.0;
 }
 
-// Width of the soft normal weight ramp (HLSL kNormalRampWidth in world_rtao_temporal.cs_5_0.hlsl): full at T, zero at T - width.
+// Width of the soft normal weight ramp (HLSL kNormalRampWidth in world_rt_denoise.hlsli): full at T, zero at T - width.
 inline constexpr float kNormalRampWidth = 0.4f;
 
 // Spatial filter (denoises the final AO only). Edge stops are shared by both kernels; see the filter shader.

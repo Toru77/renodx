@@ -10,15 +10,13 @@
 // the stats; in debug mode 8 it writes the filter change instead of the AO.
 
 #include "../../include/mrt_normal.hlsli"
+#include "world_rt_denoise.hlsli"
 
 #define RTAO_FILTER_STAT_BASE 68u
 #define RTAO_FILTER_STAT_PIXELS 0u
 #define RTAO_FILTER_STAT_CHANGE_SUM 1u
 #define RTAO_FILTER_STAT_CHANGED_GT1LSB 2u
 #define RTAO_FILTER_STAT_COUNT 3u
-#define kFilterPlaneSigma 0.02
-#define kFilterNormalPower 16.0
-#define kFilterMinSigma 0.5
 #define kFilterChangeScale 8.0
 
 Texture2D<float4> g_game_depth : register(t0);
@@ -59,8 +57,7 @@ float FilterEdgeWeight(int2 q, float3 Pc, float3 Nc, float dist_c)
     const float depth = g_game_depth.Load(int3(q, 0)).x;
     const float3 Nt = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(q, 0)).xy);
     if (depth <= 0.0 || dot(Nt, Nt) < 0.5) return 0.0;
-    const float plane = dot(Nc, FilterPosition(q, depth) - Pc) / (kFilterPlaneSigma * dist_c);
-    return exp(-0.5 * plane * plane) * pow(saturate(dot(Nc, Nt)), kFilterNormalPower);
+    return FilterPlaneNormalWeight(Pc, Nc, dist_c, FilterPosition(q, depth), Nt);
 }
 
 float FilterInput(int2 q)
@@ -105,12 +102,11 @@ void main(uint3 id : SV_DispatchThreadID)
         if ((int)f_size.w == 0)
         {
             // Separable: Gaussian in the offset (pixels), sigma = max(radius / 2, kFilterMinSigma), stride 1.
-            const float sigma = radius * 0.5 > kFilterMinSigma ? radius * 0.5 : kFilterMinSigma;
+            const float sigma = FilterSeparableSigma(radius);
             for (int k = -half_taps; k <= half_taps; ++k)
             {
-                const float d = (float)k / sigma;
                 const int2 offset = direction == 0 ? int2(k, 0) : int2(0, k);
-                FilterTap(px + offset, exp(-0.5 * d * d), k == 0, Pc, Nc, dist_c, sum_w, sum_v);
+                FilterTap(px + offset, FilterGaussianWeight(k, sigma), k == 0, Pc, Nc, dist_c, sum_w, sum_v);
             }
         }
         else

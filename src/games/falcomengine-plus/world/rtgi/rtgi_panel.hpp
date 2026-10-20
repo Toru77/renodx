@@ -18,7 +18,7 @@ inline void DrawRtgiPanel() {
   if (g_rtgi_enabled < 0.5f) {
     ImGui::TextDisabled("RTGI: off");
   } else if (frame.producing) {
-    ImGui::Text("RTGI: active (raw GI traced this frame; the image is unchanged)");
+    ImGui::Text("RTGI: active (GI traced and denoised this frame; the image is unchanged)");
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTGI: requested, not running (%s)", ReasonName(frame.reason));
   }
@@ -39,6 +39,22 @@ inline void DrawRtgiPanel() {
   ImGui::Text("Radiance source: %s, %u x %u, format %u",
               frame.radiance_valid ? "previous frame's lighting output" : "not available (hidden and off-screen shading only)",
               frame.radiance_width, frame.radiance_height, frame.radiance_format);
+  ImGui::SeparatorText("Denoising");
+  if (g_rtgi_temporal_enabled < 0.5f) {
+    ImGui::TextDisabled("Temporal: off");
+  } else if (frame.temporal_ran) {
+    ImGui::Text("Temporal: on, running (this frame reset: %s)", rtao::ResetReasonName(frame.reset));
+  } else {
+    ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "Temporal: on, not running (%s)", rtao::ResetReasonName(frame.reset));
+  }
+  ImGui::Text("Last reset: %s", rtao::ResetReasonName(frame.last_reset));
+  if (g_rtgi_spatial_enabled < 0.5f) {
+    ImGui::TextDisabled("Spatial filter: off");
+  } else if (frame.filter_ran) {
+    ImGui::Text("Spatial filter: on");
+  } else {
+    ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "Spatial filter: on, not run (pipeline or target failed)");
+  }
   if (ImGui::Button("Read RTGI Stats")) {
     g_rtgi_stats.requested.store(true, std::memory_order_relaxed);
   }
@@ -61,6 +77,9 @@ inline void DrawRtgiPanel() {
     ImGui::Text("Radiance: on-screen lookups %u, sun rays %u (visible %.1f%%), mean sample luminance (capped at 1000 per sample) %.3f, max %.3f, clamped %.1f%%",
                 v[kRtgiStatRadianceLookups], v[kRtgiStatSunRays], rtao::SharePercent(v[kRtgiStatSunVisible], v[kRtgiStatSunRays]),
                 mean_luminance, luminance_max, rtao::SharePercent(v[kRtgiStatClamped], hits));
+    ImGui::Text("Temporal pixels %u, no history %.1f%%, reset %.1f%%", v[kRtgiStatTemporalPixels],
+                rtao::SharePercent(v[kRtgiStatNoHistory], v[kRtgiStatTemporalPixels]),
+                rtao::SharePercent(v[kRtgiStatResetPixels], v[kRtgiStatTemporalPixels]));
   }
 }
 

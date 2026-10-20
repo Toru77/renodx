@@ -9311,6 +9311,38 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const bool isfast_used = rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
   auto& rd = rtgi::GetRtgiDeviceData(dev);
+  // RTGI temporal: the same reset rule as RTAO (rtao::TemporalResetReason) over RTGI's own state and parameters.
+  const bool temporal_on = rtgi::g_rtgi_temporal_enabled > 0.5f;
+  if (temporal_on) {
+    MBMotionRtv4Ensure(dev, dd);
+  }
+  const bool motion_ok = dd->mb_rtv4_owned_srv.handle != 0u && !rtao::g_rtao_frame.motion_conflict && rtao::g_rtao_frame.motion_dims_ok;
+  const rtgi::ParameterSnapshot params = {
+      rtgi::g_rtgi_samples, rtgi::g_rtgi_ray_max, rtao::g_rtao_normal_bias, rtgi::g_rtgi_trace_resolution, rtao::g_rtao_isfast,
+      rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
+      rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
+      rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug};
+  const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
+  frame.prev_params = params;
+  frame.prev_params_valid = true;
+  const uint32_t trace_width = rtgi::RtgiTraceExtent(dd->captured_depth_w, divisor);
+  const uint32_t trace_height = rtgi::RtgiTraceExtent(dd->captured_depth_h, divisor);
+  const bool resized = rd.history_color.width != 0u && (rd.history_color.width != trace_width || rd.history_color.height != trace_height);
+  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+      .temporal_on = temporal_on,
+      .was_on = frame.temporal_last,
+      .resized = resized,
+      .frame = dd->frame_index,
+      .last_frame = frame.dispatched_frame,
+      .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
+      .scaled = false,
+      .params_changed = params_changed,
+      .motion_ok = motion_ok});
+  frame.reset = reset;
+  if (temporal_on && reset != rtao::ResetReason::None) {
+    frame.last_reset = reset;
+    frame.reset_counts[static_cast<size_t>(reset)] += 1u;
+  }
   // The copy holds the previous frame's lighting output only when that frame produced it on this list.
   const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX && rd.radiance_frame + 1u == dd->frame_index;
   const rtgi::RtgiDispatchInputs in = {
@@ -9321,8 +9353,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .radiance_view = radiance_valid ? rd.radiance_srv : reshade::api::resource_view{0u},
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
-      .trace_width = rtgi::RtgiTraceExtent(dd->captured_depth_w, divisor),
-      .trace_height = rtgi::RtgiTraceExtent(dd->captured_depth_h, divisor),
+      .trace_width = trace_width,
+      .trace_height = trace_height,
       .push = {
           .params = {ray_max, rtao::g_rtao_normal_bias, spp, static_cast<float>(divisor)},
           .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtgi::g_rtgi_debug},
@@ -9332,6 +9364,18 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
           .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, 0.f, static_cast<float>(prev_view_proj_register)},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
+      .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
+      .temporal = temporal_on,
+      .temporal_push = {
+          .params = {rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
+                     rtgi::g_rtgi_history_clamp},
+          .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f},
+      },
+      .spatial = rtgi::g_rtgi_spatial_enabled > 0.5f,
+      .filter_type = static_cast<int>(rtgi::g_rtgi_filter_type),
+      .filter_radius = static_cast<int>(rtgi::g_rtgi_filter_radius),
+      .filter_passes = static_cast<int>(rtgi::g_rtgi_filter_passes),
+      .filter_taps = static_cast<int>(rtgi::g_rtgi_filter_type > 0.5f ? rtgi::g_rtgi_filter_taps_atrous : rtgi::g_rtgi_filter_taps_separable),
   };
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
@@ -9346,6 +9390,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   }
   frame.producing = true;
   frame.debug_written = result.debug_written;
+  frame.temporal_ran = result.temporal_ran;
+  frame.temporal_last = temporal_on && result.temporal_ran;
+  frame.filter_ran = result.filter_ran;
+  frame.denoise_gpu_ms = rd.denoise_timer.last_ms;
   frame.dispatched_frame = dd->frame_index;
   frame.gpu_ms = rd.timer.last_ms;
   frame.divisor = divisor;
@@ -9367,6 +9415,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
       + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
+      + static_cast<uint64_t>(rd.history_color.width) * rd.history_color.height * 8u * 2u
+      + static_cast<uint64_t>(rd.history_normal.width) * rd.history_normal.height * 4u * 2u
+      + static_cast<uint64_t>(rd.filter.width) * rd.filter.height * 8u * 3u
+      + static_cast<uint64_t>(rd.final_gi.width) * rd.final_gi.height * 4u * 2u
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
              : 0u);

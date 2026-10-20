@@ -20,6 +20,17 @@ inline float g_rtgi_fade_end_pct = 31.25f;     // Fade End: percent of the BVH r
 inline float g_rtgi_debug = 0.f;               // RTGI Debug (advanced), see the RtgiDebug row
 inline float g_rtgi_radiance_clamp = 0.f;  // Radiance Clamp: luminance cap per GI sample (0 = off)
 inline float g_rtgi_ambient = 1.f;         // Ambient Contribution: probe ambient weight at hidden and off-screen hits
+inline float g_rtgi_temporal_enabled = 1.f;
+inline float g_rtgi_history_weight = 0.95f;
+inline float g_rtgi_depth_rejection = 0.05f;
+inline float g_rtgi_normal_rejection = 0.9f;
+inline float g_rtgi_history_clamp = 1.f;
+inline float g_rtgi_spatial_enabled = 1.f;
+inline float g_rtgi_filter_type = 1.f;            // Filter Type: 0 separable bilateral, 1 a-trous
+inline float g_rtgi_filter_radius = 4.f;
+inline float g_rtgi_filter_passes = 2.f;          // Filter Passes: 1..4
+inline float g_rtgi_filter_taps_separable = 5.f;  // Filter Taps (separable): 3..17
+inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
 
 enum class Reason : uint8_t {
   Off = 0,
@@ -77,5 +88,12 @@ inline uint32_t RtgiTraceExtent(uint32_t full, uint32_t divisor) { return (full 
 inline float RtgiEffectiveRayMax(float requested, float built_range, float fade_end_eff, float margin) {
   return std::min(requested, built_range + margin - fade_end_eff);
 }
+
+// RTGI settings that shape the GI; a change resets the RTGI history for one frame. Never part of RTAO's snapshot.
+struct ParameterSnapshot {
+  float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
+  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
+  bool operator==(const ParameterSnapshot&) const = default;
+};
 
 }  // namespace falcom_world::rtgi

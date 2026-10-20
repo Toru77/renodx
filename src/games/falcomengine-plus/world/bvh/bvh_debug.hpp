@@ -279,6 +279,7 @@ inline void OnWorldPresentBvh(
     {
       const rtgi::RtgiDeviceData& rtgi_data = rtgi::GetRtgiDeviceData(device);
       extra.rtgi = {rtgi_data.timer.ms_sum, rtgi_data.timer.samples};
+      extra.rtgi_denoise = {rtgi_data.denoise_timer.ms_sum, rtgi_data.denoise_timer.samples};
     }
     {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);

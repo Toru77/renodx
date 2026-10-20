@@ -1,7 +1,7 @@
-// Native harness: RTGI M1 (world/rtgi), the discovery trace. Pure rules and the JSON text only.
+// Native harness: RTGI (world/rtgi): the trace and the denoise passes. Pure rules and the JSON text only.
 //
 // REAL: rtgi_state.hpp functions (trace divisor and extent, effective ray max), RtgiPushConstants layout,
-//       BuildRtgiJson (the text written to world_rtgi.json).
+//       ParameterSnapshot equality, the M3b push layouts, BuildRtgiJson (the text written to world_rtgi.json).
 // SOURCE GUARD: the RTGI_STAT_* defines in world_rtgi.cs_5_0.hlsl match the kRtgiStat* constants (the harness copy).
 // NOT COVERED: rtgi::Dispatch on a device, RunRtgiInline (addon.cpp), the shader on the GPU, the present blit.
 #include <cstdint>
@@ -24,6 +24,15 @@ inline constexpr std::span<const std::uint8_t> __world_rtao_filter{__world_rtao_
 #define __world_rtgi_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi{__world_rtgi_base};
+#define __world_rtgi_temporal_EMBED_FILE
+inline constexpr std::uint8_t __world_rtgi_temporal_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_rtgi_temporal{__world_rtgi_temporal_base};
+#define __world_rtgi_filter_EMBED_FILE
+inline constexpr std::uint8_t __world_rtgi_filter_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_rtgi_filter{__world_rtgi_filter_base};
+#define __world_rtgi_upsample_EMBED_FILE
+inline constexpr std::uint8_t __world_rtgi_upsample_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_rtgi_upsample{__world_rtgi_upsample_base};
 
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
@@ -67,6 +76,17 @@ static void TestEffectiveRayMax() {
 static void TestPushLayout() {
   CHECK(sizeof(rtgi::RtgiPushConstants) == 24u * sizeof(float), "b12 is 24 floats");
   CHECK(offsetof(rtgi::RtgiPushConstants, shading) == 20u * sizeof(float), "b12 c5 offset");
+  CHECK(sizeof(rtgi::RtgiTemporalPushConstants) == 20u * sizeof(float), "temporal b12 is 20 floats");
+  CHECK(sizeof(rtgi::RtgiFilterPushConstants) == 12u * sizeof(float), "filter b12 is 12 floats");
+  CHECK(sizeof(rtgi::RtgiUpsamplePushConstants) == 12u * sizeof(float), "upsample b12 is 12 floats");
+}
+
+static void TestParameterSnapshot() {
+  rtgi::ParameterSnapshot a = {};
+  rtgi::ParameterSnapshot b = {};
+  CHECK(a == b, "equal snapshots compare equal");
+  b.history_weight = 0.5f;
+  CHECK(!(a == b), "a history weight change is a parameter change");
 }
 
 static void TestShaderDefines() {
@@ -104,6 +124,25 @@ static void TestShaderDefines() {
   }
   CHECK(text.find("#define RTGI_STAT_TRACE_COUNT 20u") != std::string::npos, "trace count 20");
   CHECK(text.find("#define RTGI_SCENE_ROWS_FIRST 50u") != std::string::npos, "scene rows first register 50");
+  const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl");
+  CHECK(!temporal.empty(), "temporal shader copy readable");
+  const struct {
+    const char* name;
+    uint32_t value;
+  } temporal_stats[] = {
+      {"TEMPORAL_PIXELS", rtgi::kRtgiStatTemporalPixels},
+      {"NO_HISTORY", rtgi::kRtgiStatNoHistory},
+      {"RESET_PIXELS", rtgi::kRtgiStatResetPixels},
+  };
+  for (const auto& stat : temporal_stats) {
+    const std::string line = std::string("#define RTGI_STAT_") + stat.name + " " + std::to_string(stat.value) + "u";
+    CHECK(temporal.find(line) != std::string::npos, "%s", line.c_str());
+  }
+  for (const char* path : {"src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl",
+                           "src/games/falcomengine-plus/world/shaders/world_rtgi_filter.cs_5_0.hlsl",
+                           "src/games/falcomengine-plus/world/shaders/world_rtgi_upsample.cs_5_0.hlsl"}) {
+    CHECK(ReadText(path).find("#include \"world_rt_denoise.hlsli\"") != std::string::npos, "%s includes the shared denoise math", path);
+  }
 }
 
 // Lighting shaders are outside world/ (not copied by refresh_world.ps1): read from the repo, two levels up from the
@@ -161,6 +200,10 @@ static void TestJson() {
   CHECK(text.find("\"luminance_sum_x10\": ") != std::string::npos, "luminance_sum_x10 key");
   CHECK(text.find("\"luminance_stat_cap\": ") != std::string::npos, "luminance_stat_cap key");
   CHECK(text.find("\"prev_view_proj_register\": ") != std::string::npos, "prev_view_proj_register key");
+  CHECK(text.find("\"temporal\": {") != std::string::npos, "temporal object");
+  CHECK(text.find("\"spatial_filter\": {") != std::string::npos, "spatial_filter object");
+  CHECK(text.find("\"temporal_pixels\": ") != std::string::npos, "temporal_pixels key");
+  CHECK(text.find("\"denoise_gpu_ms\": ") != std::string::npos, "denoise_gpu_ms key");
 }
 
 int main() {
@@ -172,6 +215,8 @@ int main() {
   TestEffectiveRayMax();
   HStage("push layout");
   TestPushLayout();
+  HStage("parameter snapshot");
+  TestParameterSnapshot();
   HStage("shader defines");
   TestShaderDefines();
   HStage("cb_scene offsets per lighting variant");

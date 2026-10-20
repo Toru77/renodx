@@ -8,6 +8,7 @@
 
 #include "../../taa/taa_common.hlsli"
 #include "../../include/mrt_normal.hlsli"
+#include "world_rt_denoise.hlsli"
 
 Texture2D<float> g_raw_ao : register(t0);
 Texture2D<float> g_raw_prev : register(t5);  // previous frame raw AO (P0-B2)
@@ -69,8 +70,6 @@ cbuffer cb_rtao_temporal : register(b12)
 #define RTAO_QSTAT_CHANGE_SUM 6u
 #define RTAO_NSTAT_BASE 62u
 #define RTAO_NSTAT_COUNT 6u
-// Soft normal weight: a history tap counts fully at dot >= the Normal Rejection value and falls linearly to 0 over this width.
-static const float kNormalRampWidth = 0.4;
 
 // Round 2 diagnostics (F1), no effect on the output. Sums are scaled: motion in 1/100 px, shifts and alpha and
 // differences in 1/1000.
@@ -100,21 +99,6 @@ groupshared uint gs_dstats[RTAO_DSTAT_COUNT];
 groupshared uint gs_rstats[RTAO_RSTAT_COUNT];
 groupshared uint gs_qstats[RTAO_QSTAT_COUNT];
 groupshared uint gs_nstats[RTAO_NSTAT_COUNT];
-
-// Octahedral normal encoding for the history (BA channels).
-float2 OctEncode(float3 n)
-{
-    n /= (abs(n.x) + abs(n.y) + abs(n.z));
-    float2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * sign(n.xy);
-    return e;
-}
-
-float3 OctDecode(float2 e)
-{
-    float3 v = float3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
-    if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * sign(v.xy);
-    return normalize(v);
-}
 
 // Output quality (diagnostic): one field at q. Raw AO is valid when traced (>= 0); the previous output when its history is valid (.g > 0).
 float QualityValue(int2 q, bool prev, out bool valid)
@@ -247,7 +231,7 @@ void TemporalPixel(uint2 px)
             best_dot = tap_dot;
         }
         if (h.g <= 0.0) continue;  // invalid history (never written or reset)
-        const bool depth_ok = abs(h.g - dist_cur) / max(dist_cur, 1e-4) <= depth_rejection;
+        const bool depth_ok = TemporalDepthAccept(h.g, dist_cur, depth_rejection);
         if (!depth_ok)
         {
             InterlockedAdd(gs_tstats[RTAO_TSTAT_REJECTED_DEPTH], 1u);
@@ -255,7 +239,7 @@ void TemporalPixel(uint2 px)
             continue;
         }
         // Soft normal weight (replaces the hard Normal Rejection): wn = saturate((dot - (T - width)) / width); tap weight w * wn.
-        const float wn = saturate((tap_dot - (normal_rejection - kNormalRampWidth)) / kNormalRampWidth);
+        const float wn = TemporalNormalWeight(tap_dot, normal_rejection);
         if (wn == 0.0) InterlockedAdd(gs_tstats[RTAO_TSTAT_REJECTED_NORMAL], 1u);
         else accepted_taps += 1u;
         weight_rejected_normal += w * (1.0 - wn);
@@ -311,9 +295,7 @@ void TemporalPixel(uint2 px)
                 n += 1.0;
             }
         }
-        const float mean = s1 / n;
-        const float sigma = sqrt(max(s2 / n - mean * mean, 0.0));
-        history_ao = clamp(history_ao, mean - clamp_sigma * sigma, mean + clamp_sigma * sigma);
+        history_ao = ClampToNeighbourhood(history_ao, s1, s2, n, clamp_sigma);
     }
     const float clamp_shift = abs(history_ao - history_before_clamp);
     InterlockedAdd(gs_fstats[RTAO_FSTAT_CLAMP_ACTIVE], clamp_shift > 0.01 ? 1u : 0u);

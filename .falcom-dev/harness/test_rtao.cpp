@@ -1868,18 +1868,19 @@ static void TestFilterMath() {
   std::printf("filter math: transcriptions of the edge stops, separable kernel, rounding and stats (labelled)\n");
 }
 
-// Source guard: the pass A and pass B shaders are byte-identical to the recorded hashes (pass A recorded again after the
-// P2b record slot t19 change: world_rtao.cs_5_0.hlsl; pass B unchanged).
+// Source guard: the pass A, pass B and shared denoise include sources are byte-identical to the recorded hashes (pass B and the include recorded at RTGI M3b, when the shared include was introduced).
 static void TestPassShadersUnchanged() {
   const std::string pass_a = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao.cs_5_0.hlsl");
   const std::string pass_b = ReadText("src/games/falcomengine-plus/world/shaders/world_rtao_temporal.cs_5_0.hlsl");
+  const std::string shared = ReadText("src/games/falcomengine-plus/world/shaders/world_rt_denoise.hlsli");
   auto fnv = [](const std::string& s) {
     uint64_t h = 1469598103934665603ull;
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;
   };
   CHECK(fnv(pass_a) == 0xbcf4d7beeb61f2b6ull, "pass A harness copy equals the recorded P2b t19 version (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
-  CHECK(fnv(pass_b) == 0xba6fc5c95a80cf38ull, "pass B harness copy equals the S3 record (repo file: git diff empty) (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
+  CHECK(fnv(pass_b) == 0xa3bd847063a8ce53ull, "pass B harness copy equals the M3b shared-include version (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
+  CHECK(fnv(shared) == 0xc49ca01f813c5510ull, "shared denoise include equals the M3b version (%016llx)", static_cast<unsigned long long>(fnv(shared)));
 }
 
 // ---- S4 spatial_filter JSON (REAL: rtao::BuildRtaoJson; filter on/off and several type, passes, taps cases) ----
