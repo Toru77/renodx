@@ -15,6 +15,7 @@
 #include <mutex>
 #include <vector>
 
+#include "../../../../utils/data.hpp"
 #include "../../../../utils/render.hpp"
 #include "../rtao/rtao.hpp"
 #include "bvh_build.hpp"
@@ -34,9 +35,20 @@ struct BvhDebugState {
 
 inline BvhDebugState g_bvh_debug;
 
+// The blit of the debug texture to the backbuffer, one per device. Kept here, not in BvhDeviceData: bvh_resources.hpp
+// is compiled by the native harness, which has no utils/render.hpp.
+struct __declspec(uuid("3f9c1e52-7a4d-4b8e-9c21-5d6e0a7b8c94")) BvhDebugBlit {
+  renodx::utils::render::RenderPass pass;
+  reshade::api::format format = reshade::api::format::unknown;  // backbuffer format the pass pipeline was built for
+};
+
 inline void DestroyBvhDebugResources(reshade::api::device* device) {
   BvhDeviceData* data = GetBvhDeviceData(device);
   if (data == nullptr) return;
+  if (auto* blit = renodx::utils::data::Get<BvhDebugBlit>(device); blit != nullptr) {
+    blit->pass.DestroyAll(device);
+    renodx::utils::data::Delete(device, blit);
+  }
   if (data->debug_uav.handle != 0u) {
     device->destroy_resource_view(data->debug_uav);
     data->debug_uav = {0u};
@@ -171,12 +183,21 @@ inline void RunBvhDebugPass(
                                        .candidates = data->inspect.candidates};
   }
 
-  renodx::utils::render::RenderPass pass;
+  BvhDebugBlit* blit = nullptr;
+  renodx::utils::data::CreateOrGet<BvhDebugBlit>(device, blit);
+  if (blit->format != backbuffer_desc.texture.format) {
+    blit->pass.DestroyAll(device);
+    blit->pass = {};
+    blit->format = backbuffer_desc.texture.format;
+  }
+  auto& pass = blit->pass;
+  // The swap chain rotates its buffers and RenderPass keeps the first views it generates: rebuild the RTV every present.
+  pass.InvalidateRenderTargets(cmd_list);
   pass.pipeline_subobjects.vertex_shader = __world_bvh_blit_vs;
   pass.pipeline_subobjects.pixel_shader = __world_bvh_blit_ps;
   pass.pipeline_subobjects.compute_shader = {};
   pass.render_target_slots.resources = {backbuffer};
-  pass.shader_resource_slots.resources = {data->debug_texture};
+  pass.shader_resource_slots.views = {data->debug_srv};
   reshade::api::sampler_desc sampler = {};
   sampler.filter = reshade::api::filter_mode::min_mag_mip_point;
   sampler.address_u = reshade::api::texture_address_mode::clamp;
