@@ -44,8 +44,8 @@ jobs:
       - name: Configure CMake (x64)
         run: cmake --preset clang-x64
 
-      - name: Build Trails Beyond Horizon Vanilla Plus
-        run: cmake --build --preset clang-x64-release --target kai-vanillaplus --verbose
+      - name: Build Falcom Engine Plus
+        run: cmake --build --preset clang-x64-release --target falcomengine-plus --verbose
 
       - name: Build Sword Art Online Alicization Lycoris
         run: cmake --build --preset clang-x64-release --target sao-alicization --verbose
@@ -56,8 +56,8 @@ jobs:
       - name: Prepare Release folder
         run: |
           md githubrelease
-          copy build\release\*.addon64 githubrelease\
-          copy build\release\*.pdb githubrelease\
+          copy build\release\renodx-*.addon64 githubrelease\
+          copy build\release\renodx-*.pdb githubrelease\
 
       - name: Create a Release
         uses: "marvinpinto/action-automatic-releases@latest"
