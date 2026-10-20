@@ -9102,10 +9102,12 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   in.height = dd->captured_depth_h;
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp),
                                                          rtao::g_test_freeze_noise > 0.5f);
+  const uint32_t rtao_flags = (rtao::g_rtao_discovery > 0.5f ? rtao::kRtaoFlagDiscovery : 0u)
+                              | (rtao::g_rtao_foliage_skip > 0.5f ? rtao::kRtaoFlagFoliageSkip : 0u);  // RTAO_FLAG_* (c2.z)
   in.push = {
       {rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_normal_bias},
       {spp, isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed},
-      {fade.start, fade.end, static_cast<float>((rtao::g_rtao_discovery > 0.5f ? rtao::kRtaoFlagDiscovery : 0u) | (rtao::g_rtao_foliage_skip > 0.5f ? rtao::kRtaoFlagFoliageSkip : 0u)), 0.f},
+      {fade.start, fade.end, static_cast<float>(rtao_flags), 0.f},
       {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
        bvh_data->tlas_region_size},
       {0.f, 0.f, 0.f, 0.f},

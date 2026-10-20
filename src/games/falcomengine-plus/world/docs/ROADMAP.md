@@ -64,20 +64,20 @@ P2b is implemented in the working tree, not validated in game. Not yet done: the
 
 - Class rule: an instance is foliage when its draw key is in `g_pool.wind_keys`, i.e. it was admitted through a `VsClass::Wind` vertex shader (bytecode classification, not a hash or a mesh list). Its TLAS descriptor always carries flag 8 (`kInstanceFoliage`, `INSTANCE_FOLIAGE`). The "Foliage skip" toggle (RTAO section, default Off) only sets the RTAO ray skip mask (`WorldCameraView::skip_flags`), so the TLAS does not rebuild when it changes. Toggling it resets the temporal history.
 - Limits: alpha-tested vegetation drawn with a rigid VS (no wind) is not skipped. Fences and other rigid alpha-tested meshes still occlude. P2b records never get the bit. The debug trace and the Two-Sided discovery ray never skip.
-- Pending, harness pins not re-derived (this branch was built and reviewed on Linux, where the harness cannot run; no pin value was changed):
+- Pending, harness hash pins not re-derived (this branch was built and reviewed on Linux, where the harness cannot run; no hash pin value was changed):
   - Procedure (Windows, `.falcom-dev/harness`): (a) `powershell -File refresh_world.ps1`, then `powershell -File run_win_all.ps1`, and list the failing checks; (b) temporarily set `kInstanceFoliage = 0u`, refresh and re-run: every pin must equal HEAD; (c) restore `8u`, update only the pins that failed in (a) to the printed values, and record old and new values here.
   - Candidate pins (from the plan, to confirm in (a)): test_live `TestCacheOnOff` 0x55593b70e070e7fe, `TestRebuildGolden` 0x2c41a4dfd6f640d4, `TestRefitGolden` 0x2bf515dfb5956c83, `TestRestWindGolden` 0x427521e3761f0d08, `TestWindRangeGolden`; test_motion `TestOrphanGolden`.
-  - Size check (not a hash golden, deterministic): test_rtao.cpp `TestSpatialPlan` still expects `sizeof(rtao::ParameterSnapshot) == 18u * sizeof(float)`. It must change to `19u` (message "ParameterSnapshot: 19 floats (foliage_skip appended), no filter field (size %zu)") and it fails until then.
+  - Size check (not a hash golden, deterministic): test_rtao.cpp `TestSpatialPlan` expects `sizeof(rtao::ParameterSnapshot) == 19u * sizeof(float)`; updated in the review follow-up commit, so it is not part of the pending procedure.
   - Any failure that is not one of these pins, or a pin that still differs in (b), is a stop: report it before changing anything.
 - Owner, in game: Foliage skip Off matches the image before this change. On, near trees and grass: AO under the foliage drops; `world_pool.json` `wind_keys_total` > 0; "Read RTAO Stats" occluded % drops near trees. Fences still occlude. Send `world_rtao.json` (`foliage_skip`) and the panel line "foliage skip on/off".
 
 ## RTAO on characters, Character Intensity and Max Darkening (rtao-sliders-1): implemented, not validated in game
 
 - While RTAO produces, the character shading pixels (G-buffer bit 3 clear, bit 0 set) are multiplied by `lerp(1, RTAO, Character Intensity)` in the Sora 2nd lighting shader. This happens after pass B and the filter, whatever "Allow GTVBAO" says.
-- The map-AO pixels of the character branch (bit 0 clear) already received RTAO through the game's `mapAOColor_g` tint, and are not multiplied again.
+- The map-AO pixels of the character branch (bit 0 clear) receive RTAO through the game's `mapAOColor_g` tint and are not multiplied again.
 - The GTVBAO character path runs only when RTAO does not produce (if/else), so the two never both apply. "Allow GTVBAO" and "GTVBAO Char Mask" are greyed while RTAO is on.
-- Default image: with RTAO off (the default) the output is unchanged. With RTAO on, character shading pixels now darken with full RTAO (Character Intensity 1). Before, they got nothing with "Allow GTVBAO" Off, or 25% strength with it On.
-- Max Darkening: `ao = max(ao, 1 - Max Darkening)` is applied once to the RTAO texel at the t22 read in the lighting shader (inside the GTVBAO_bound block, after the fix chain). It covers environment and character pixels; "Allow GTVBAO" plays no part. Pixels lighter than the floor are unchanged. Micro shadows and the RTAO debug view read the uncapped texture. Default 1: no change.
+- Default image: with RTAO off (the default) the output is unchanged. With RTAO on, character shading pixels darken with full RTAO at Character Intensity 1; at 0 they receive no RTAO multiply. GTVBAO settings do not influence how RTAO looks.
+- Max Darkening: `ao = max(ao, 1 - Max Darkening)` is applied once to the RTAO texel at the t22 read in the lighting shader (inside the GTVBAO_bound block, after the fix chain). It covers environment and character pixels; "Allow GTVBAO" plays no part. Pixels lighter than the floor are unchanged. Micro shadows, the RTAO debug view and GTVBAO Debug View mode 2 read the uncapped texture; mode 1 ("AO Only") shows the capped AO. Default 1: no change.
 
 ## Refit and drain cleanup (refit-drain-1): implemented, not validated in game
 

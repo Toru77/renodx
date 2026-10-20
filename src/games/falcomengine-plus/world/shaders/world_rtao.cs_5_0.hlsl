@@ -105,7 +105,7 @@ void TracePixel(uint2 px)
             traced = true;
             const float3 camera = float3(viewInv_g._m30, viewInv_g._m31, viewInv_g._m32);
             const float distance_to_camera = length(P - camera);
-            // Two-Sided discovery (diagnostic, g_rtao_fade.z = 1): one primary ray camera -> P. Only a hit at the
+            // Two-Sided discovery (diagnostic, RTAO_FLAG_DISCOVERY in g_rtao_fade.z): one primary ray camera -> P. Only a hit at the
             // G-buffer distance (2% or 5 cm) counts: winding back x normal toward camera x alpha-tested.
             if ((rtao_flags & RTAO_FLAG_DISCOVERY) != 0u)
             {

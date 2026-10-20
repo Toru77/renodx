@@ -1515,7 +1515,7 @@ static void TestSpatialPlan() {
         "filter constants equal the spec (plane 0.02, normal power 16, min sigma 0.5, change scale 8)");
   CHECK(static_cast<size_t>(rtao::Reason::FilterFailed) < rtao::kReasonCount && std::strcmp(rtao::ReasonName(rtao::Reason::FilterFailed), "filter_failed") == 0,
         "FilterFailed: a reason code inside kReasonCount, named filter_failed");
-  CHECK(sizeof(rtao::ParameterSnapshot) == 18u * sizeof(float), "ParameterSnapshot unchanged: 18 floats, no filter field (size %zu)", sizeof(rtao::ParameterSnapshot));
+  CHECK(sizeof(rtao::ParameterSnapshot) == 19u * sizeof(float), "ParameterSnapshot: 19 floats (foliage_skip appended), no filter field (size %zu)", sizeof(rtao::ParameterSnapshot));
   // Explicit chains at radius 4, taps 5 (slots: A 0, F0 1, F1 2, B 3; directions: H 0, V 1, Both 2).
   struct Link { int in; int out; int dir; };
   static const Link a1[] = {{0, 3, 2}};
