@@ -78,6 +78,161 @@ struct SpatialRows {
   float* taps_atrous;
   float taps_atrous_default;
 };
+// Adds the five Temporal Accumulation rows for RTAO or RTGI. A plain function: MSVC rejects (C2326) the Setting
+// aggregate initialisation inside a lambda, because Setting's default member initialisers are lambdas.
+inline void AddTemporalRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
+                            const TemporalRows& rows) {
+  using Setting = renodx::utils::settings::Setting;
+  using SettingValueType = renodx::utils::settings::SettingValueType;
+  const std::string prefix = rows.prefix;
+  settings->push_back(new Setting{
+      .key = prefix + "TemporalEnabled",
+      .binding = rows.enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = rows.enabled_default,
+      .label = "Temporal Accumulation",
+      .section = rows.section,
+      .tooltip = rows.enabled_tooltip,
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "HistoryWeight",
+      .binding = rows.history_weight,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = rows.history_weight_default,
+      .label = "History Weight",
+      .section = rows.section,
+      .tooltip = "Maximum blend toward the reprojected history after validation (0 to 0.99).",
+      .min = 0.f,
+      .max = 0.99f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "DepthRejection",
+      .binding = rows.depth_rejection,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = rows.depth_rejection_default,
+      .label = "Depth Rejection",
+      .section = rows.section,
+      .tooltip = "Relative distance difference allowed between history and current (0.001 to 0.2).",
+      .min = 0.001f,
+      .max = 0.2f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "NormalRejection",
+      .binding = rows.normal_rejection,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = rows.normal_rejection_default,
+      .label = "Normal Rejection",
+      .section = rows.section,
+      .tooltip = "History taps whose normal agrees with the current pixel (dot product) at or above this value count fully; below it their weight falls linearly to zero over a 0.4 range (default 0.9: full at 0.9, zero at 0.5). 0 accepts everything facing the same way.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "HistoryClamp",
+      .binding = rows.history_clamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = rows.history_clamp_default,
+      .label = "History Clamp",
+      .section = rows.section,
+      .tooltip = "History is clamped to the 3x3 neighbourhood mean plus or minus k sigma (0 = off, 0 to 4).",
+      .min = 0.f,
+      .max = 4.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+}
+
+// Adds the six Spatial Filter rows for RTAO or RTGI (a plain function for the reason above).
+inline void AddSpatialRows(renodx::utils::settings::Settings* settings, const std::function<bool()>& visible,
+                           const SpatialRows& rows) {
+  using Setting = renodx::utils::settings::Setting;
+  using SettingValueType = renodx::utils::settings::SettingValueType;
+  const std::string prefix = rows.prefix;
+  settings->push_back(new Setting{
+      .key = prefix + "SpatialEnabled",
+      .binding = rows.enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = rows.enabled_default,
+      .label = "Spatial Filter",
+      .section = rows.section,
+      .tooltip = rows.enabled_tooltip,
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "FilterType",
+      .binding = rows.filter_type,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = rows.filter_type_default,
+      .label = "Filter Type",
+      .section = rows.section,
+      .tooltip = "Both use the same depth and normal edge stops. Separable bilateral = Gaussian on every pixel, one horizontal and one vertical pass. A-trous = square binomial kernel (Taps x Taps) whose step doubles from pass to pass (the first pass is always dense, so no grid pattern).",
+      .labels = {"Separable bilateral", "A-trous"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "FilterRadius",
+      .binding = rows.filter_radius,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = rows.filter_radius_default,
+      .label = "Filter Radius",
+      .section = rows.section,
+      .tooltip = "Pixel radius (1 to 8). Separable: sets the Gaussian width (sigma = radius / 2); Taps set how far it reaches. A-trous: sets the largest step the passes grow to (max(1, radius / 2); steps 1, 2, 4 up to it). With 1 pass the radius has no effect.",
+      .min = 1.f,
+      .max = 8.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "FilterPasses",
+      .binding = rows.filter_passes,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = rows.filter_passes_default,
+      .label = "Filter Passes",
+      .section = rows.section,
+      .tooltip = "Number of filter passes (1 to 4). Separable: each pass is a horizontal and a vertical dispatch. A-trous: each pass is one 2D dispatch; the step doubles per pass up to the Radius ceiling. More passes smooth more and cost more.",
+      .min = 1.f,
+      .max = static_cast<float>(rtao::kFilterMaxPasses),
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "FilterTapsSeparable",
+      .binding = rows.taps_separable,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = rows.taps_separable_default,
+      .label = "Filter Taps (samples per direction)",
+      .section = rows.section,
+      .tooltip = "Samples per direction per pass, 3 to 17, including the centre. Odd values are used as they are; an even value is rounded up to the next odd one. Reach = (taps - 1) / 2 pixels per side. Taps = 2 x radius + 1 covers the whole Gaussian.",
+      .min = static_cast<float>(rtao::kFilterTapsMin),
+      .max = static_cast<float>(rtao::kFilterSeparableTapsMax),
+      .format = "%d",
+      .is_visible = [visible, filter_type = rows.filter_type]() { return visible() && *filter_type < 0.5f; },
+  });
+  settings->push_back(new Setting{
+      .key = prefix + "FilterTapsAtrous",
+      .binding = rows.taps_atrous,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = rows.taps_atrous_default,
+      .label = "Filter Taps (kernel side)",
+      .section = rows.section,
+      .tooltip = "Side length of the square kernel, 3 to 9 (taps x taps samples per pass). Odd values are used as they are; an even value is rounded up. Binomial weights: 3 = 1 2 1, 5 = 1 4 6 4 1, 7 = 1 6 15 20 15 6 1, 9 = 1 8 28 56 70 56 28 8 1.",
+      .min = static_cast<float>(rtao::kFilterTapsMin),
+      .max = static_cast<float>(rtao::kFilterAtrousTapsMax),
+      .format = "%d",
+      .is_visible = [visible, filter_type = rows.filter_type]() { return visible() && *filter_type > 0.5f; },
+  });
+}
+
 inline void AddSettings(renodx::utils::settings::Settings* settings, bool supported, std::function<bool()> advanced_visible = nullptr) {
   if (settings == nullptr) return;
   g_state.supported = supported && IsDevkitPresent();
@@ -87,150 +242,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
   using SettingValueType = renodx::utils::settings::SettingValueType;
   const std::function<bool()> visible = []() { return g_state.supported; };
   const std::function<bool()> advanced = advanced_visible ? advanced_visible : std::function<bool()>(visible);
-  const auto add_temporal_rows = [&](const TemporalRows& rows) {
-    const std::string prefix = rows.prefix;
-    settings->push_back(new Setting{
-        .key = prefix + "TemporalEnabled",
-        .binding = rows.enabled,
-        .value_type = SettingValueType::BOOLEAN,
-        .default_value = rows.enabled_default,
-        .label = "Temporal Accumulation",
-        .section = rows.section,
-        .tooltip = rows.enabled_tooltip,
-        .labels = {"Off", "On"},
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "HistoryWeight",
-        .binding = rows.history_weight,
-        .value_type = SettingValueType::FLOAT,
-        .default_value = rows.history_weight_default,
-        .label = "History Weight",
-        .section = rows.section,
-        .tooltip = "Maximum blend toward the reprojected history after validation (0 to 0.99).",
-        .min = 0.f,
-        .max = 0.99f,
-        .format = "%.2f",
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "DepthRejection",
-        .binding = rows.depth_rejection,
-        .value_type = SettingValueType::FLOAT,
-        .default_value = rows.depth_rejection_default,
-        .label = "Depth Rejection",
-        .section = rows.section,
-        .tooltip = "Relative distance difference allowed between history and current (0.001 to 0.2).",
-        .min = 0.001f,
-        .max = 0.2f,
-        .format = "%.3f",
-        .is_visible = visible,
-        .is_logarithmic = true,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "NormalRejection",
-        .binding = rows.normal_rejection,
-        .value_type = SettingValueType::FLOAT,
-        .default_value = rows.normal_rejection_default,
-        .label = "Normal Rejection",
-        .section = rows.section,
-        .tooltip = "History taps whose normal agrees with the current pixel (dot product) at or above this value count fully; below it their weight falls linearly to zero over a 0.4 range (default 0.9: full at 0.9, zero at 0.5). 0 accepts everything facing the same way.",
-        .min = 0.f,
-        .max = 1.f,
-        .format = "%.2f",
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "HistoryClamp",
-        .binding = rows.history_clamp,
-        .value_type = SettingValueType::FLOAT,
-        .default_value = rows.history_clamp_default,
-        .label = "History Clamp",
-        .section = rows.section,
-        .tooltip = "History is clamped to the 3x3 neighbourhood mean plus or minus k sigma (0 = off, 0 to 4).",
-        .min = 0.f,
-        .max = 4.f,
-        .format = "%.2f",
-        .is_visible = visible,
-    });
-  };
-  const auto add_spatial_rows = [&](const SpatialRows& rows) {
-    const std::string prefix = rows.prefix;
-    settings->push_back(new Setting{
-        .key = prefix + "SpatialEnabled",
-        .binding = rows.enabled,
-        .value_type = SettingValueType::BOOLEAN,
-        .default_value = rows.enabled_default,
-        .label = "Spatial Filter",
-        .section = rows.section,
-        .tooltip = rows.enabled_tooltip,
-        .labels = {"Off", "On"},
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "FilterType",
-        .binding = rows.filter_type,
-        .value_type = SettingValueType::INTEGER,
-        .default_value = rows.filter_type_default,
-        .label = "Filter Type",
-        .section = rows.section,
-        .tooltip = "Both use the same depth and normal edge stops. Separable bilateral = Gaussian on every pixel, one horizontal and one vertical pass. A-trous = square binomial kernel (Taps x Taps) whose step doubles from pass to pass (the first pass is always dense, so no grid pattern).",
-        .labels = {"Separable bilateral", "A-trous"},
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "FilterRadius",
-        .binding = rows.filter_radius,
-        .value_type = SettingValueType::INTEGER,
-        .default_value = rows.filter_radius_default,
-        .label = "Filter Radius",
-        .section = rows.section,
-        .tooltip = "Pixel radius (1 to 8). Separable: sets the Gaussian width (sigma = radius / 2); Taps set how far it reaches. A-trous: sets the largest step the passes grow to (max(1, radius / 2); steps 1, 2, 4 up to it). With 1 pass the radius has no effect.",
-        .min = 1.f,
-        .max = 8.f,
-        .format = "%d",
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "FilterPasses",
-        .binding = rows.filter_passes,
-        .value_type = SettingValueType::INTEGER,
-        .default_value = rows.filter_passes_default,
-        .label = "Filter Passes",
-        .section = rows.section,
-        .tooltip = "Number of filter passes (1 to 4). Separable: each pass is a horizontal and a vertical dispatch. A-trous: each pass is one 2D dispatch; the step doubles per pass up to the Radius ceiling. More passes smooth more and cost more.",
-        .min = 1.f,
-        .max = static_cast<float>(rtao::kFilterMaxPasses),
-        .format = "%d",
-        .is_visible = visible,
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "FilterTapsSeparable",
-        .binding = rows.taps_separable,
-        .value_type = SettingValueType::INTEGER,
-        .default_value = rows.taps_separable_default,
-        .label = "Filter Taps (samples per direction)",
-        .section = rows.section,
-        .tooltip = "Samples per direction per pass, 3 to 17, including the centre. Odd values are used as they are; an even value is rounded up to the next odd one. Reach = (taps - 1) / 2 pixels per side. Taps = 2 x radius + 1 covers the whole Gaussian.",
-        .min = static_cast<float>(rtao::kFilterTapsMin),
-        .max = static_cast<float>(rtao::kFilterSeparableTapsMax),
-        .format = "%d",
-        .is_visible = [visible, filter_type = rows.filter_type]() { return visible() && *filter_type < 0.5f; },
-    });
-    settings->push_back(new Setting{
-        .key = prefix + "FilterTapsAtrous",
-        .binding = rows.taps_atrous,
-        .value_type = SettingValueType::INTEGER,
-        .default_value = rows.taps_atrous_default,
-        .label = "Filter Taps (kernel side)",
-        .section = rows.section,
-        .tooltip = "Side length of the square kernel, 3 to 9 (taps x taps samples per pass). Odd values are used as they are; an even value is rounded up. Binomial weights: 3 = 1 2 1, 5 = 1 4 6 4 1, 7 = 1 6 15 20 15 6 1, 9 = 1 8 28 56 70 56 28 8 1.",
-        .min = static_cast<float>(rtao::kFilterTapsMin),
-        .max = static_cast<float>(rtao::kFilterAtrousTapsMax),
-        .format = "%d",
-        .is_visible = [visible, filter_type = rows.filter_type]() { return visible() && *filter_type > 0.5f; },
-    });
-  };
 
   settings->push_back(new Setting{
       .key = "WorldRayTracingRows",
@@ -709,19 +720,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.2f",
       .is_visible = visible,
   });
-  add_temporal_rows({.prefix = "Rtao",
-                     .section = "Temporal Accumulation",
-                     .enabled_tooltip = "Reprojects the previous frame AO with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
-                     .enabled = &rtao::g_rtao_temporal_enabled,
-                     .enabled_default = 1.f,
-                     .history_weight = &rtao::g_rtao_history_weight,
-                     .history_weight_default = 0.9f,
-                     .depth_rejection = &rtao::g_rtao_depth_rejection,
-                     .depth_rejection_default = 0.200f,
-                     .normal_rejection = &rtao::g_rtao_normal_rejection,
-                     .normal_rejection_default = 0.07f,
-                     .history_clamp = &rtao::g_rtao_history_clamp,
-                     .history_clamp_default = 0.f});
+  AddTemporalRows(settings, visible, {.prefix = "Rtao",
+                                      .section = "Temporal Accumulation",
+                                      .enabled_tooltip = "Reprojects the previous frame AO with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
+                                      .enabled = &rtao::g_rtao_temporal_enabled,
+                                      .enabled_default = 1.f,
+                                      .history_weight = &rtao::g_rtao_history_weight,
+                                      .history_weight_default = 0.9f,
+                                      .depth_rejection = &rtao::g_rtao_depth_rejection,
+                                      .depth_rejection_default = 0.200f,
+                                      .normal_rejection = &rtao::g_rtao_normal_rejection,
+                                      .normal_rejection_default = 0.07f,
+                                      .history_clamp = &rtao::g_rtao_history_clamp,
+                                      .history_clamp_default = 0.f});
   settings->push_back(new Setting{
       .key = "RtaoIsfast",
       .binding = &rtao::g_rtao_isfast,
@@ -733,21 +744,21 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
-  add_spatial_rows({.prefix = "Rtao",
-                    .section = "Denoising",
-                    .enabled_tooltip = "Denoises the final RTAO output with edge-aware weights (depth plane and normal). The history keeps the unfiltered AO. Off = no filter, unchanged output.",
-                    .enabled = &rtao::g_rtao_spatial_enabled,
-                    .enabled_default = 1.f,
-                    .filter_type = &rtao::g_rtao_filter_type,
-                    .filter_type_default = 0.f,
-                    .filter_radius = &rtao::g_rtao_filter_radius,
-                    .filter_radius_default = 8.f,
-                    .filter_passes = &rtao::g_rtao_filter_passes,
-                    .filter_passes_default = 2.f,
-                    .taps_separable = &rtao::g_rtao_filter_taps_separable,
-                    .taps_separable_default = 8.f,
-                    .taps_atrous = &rtao::g_rtao_filter_taps_atrous,
-                    .taps_atrous_default = 8.f});
+  AddSpatialRows(settings, visible, {.prefix = "Rtao",
+                                     .section = "Denoising",
+                                     .enabled_tooltip = "Denoises the final RTAO output with edge-aware weights (depth plane and normal). The history keeps the unfiltered AO. Off = no filter, unchanged output.",
+                                     .enabled = &rtao::g_rtao_spatial_enabled,
+                                     .enabled_default = 1.f,
+                                     .filter_type = &rtao::g_rtao_filter_type,
+                                     .filter_type_default = 0.f,
+                                     .filter_radius = &rtao::g_rtao_filter_radius,
+                                     .filter_radius_default = 8.f,
+                                     .filter_passes = &rtao::g_rtao_filter_passes,
+                                     .filter_passes_default = 2.f,
+                                     .taps_separable = &rtao::g_rtao_filter_taps_separable,
+                                     .taps_separable_default = 8.f,
+                                     .taps_atrous = &rtao::g_rtao_filter_taps_atrous,
+                                     .taps_atrous_default = 8.f});
   settings->push_back(new Setting{
       .key = "RtaoFadeStartPct",
       .binding = &rtao::g_rtao_fade_start_pct,
@@ -898,34 +909,34 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.2f",
       .is_visible = visible,
   });
-  add_temporal_rows({.prefix = "Rtgi",
-                     .section = "RTGI Temporal Accumulation",
-                     .enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
-                     .enabled = &rtgi::g_rtgi_temporal_enabled,
-                     .enabled_default = 1.f,
-                     .history_weight = &rtgi::g_rtgi_history_weight,
-                     .history_weight_default = 0.95f,
-                     .depth_rejection = &rtgi::g_rtgi_depth_rejection,
-                     .depth_rejection_default = 0.05f,
-                     .normal_rejection = &rtgi::g_rtgi_normal_rejection,
-                     .normal_rejection_default = 0.9f,
-                     .history_clamp = &rtgi::g_rtgi_history_clamp,
-                     .history_clamp_default = 1.f});
-  add_spatial_rows({.prefix = "Rtgi",
-                    .section = "RTGI Denoising",
-                    .enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.",
-                    .enabled = &rtgi::g_rtgi_spatial_enabled,
-                    .enabled_default = 1.f,
-                    .filter_type = &rtgi::g_rtgi_filter_type,
-                    .filter_type_default = 1.f,
-                    .filter_radius = &rtgi::g_rtgi_filter_radius,
-                    .filter_radius_default = 4.f,
-                    .filter_passes = &rtgi::g_rtgi_filter_passes,
-                    .filter_passes_default = 2.f,
-                    .taps_separable = &rtgi::g_rtgi_filter_taps_separable,
-                    .taps_separable_default = 5.f,
-                    .taps_atrous = &rtgi::g_rtgi_filter_taps_atrous,
-                    .taps_atrous_default = 5.f});
+  AddTemporalRows(settings, visible, {.prefix = "Rtgi",
+                                      .section = "RTGI Temporal Accumulation",
+                                      .enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
+                                      .enabled = &rtgi::g_rtgi_temporal_enabled,
+                                      .enabled_default = 1.f,
+                                      .history_weight = &rtgi::g_rtgi_history_weight,
+                                      .history_weight_default = 0.95f,
+                                      .depth_rejection = &rtgi::g_rtgi_depth_rejection,
+                                      .depth_rejection_default = 0.05f,
+                                      .normal_rejection = &rtgi::g_rtgi_normal_rejection,
+                                      .normal_rejection_default = 0.9f,
+                                      .history_clamp = &rtgi::g_rtgi_history_clamp,
+                                      .history_clamp_default = 1.f});
+  AddSpatialRows(settings, visible, {.prefix = "Rtgi",
+                                     .section = "RTGI Denoising",
+                                     .enabled_tooltip = "Denoises the RTGI output at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered GI. Off = no filter.",
+                                     .enabled = &rtgi::g_rtgi_spatial_enabled,
+                                     .enabled_default = 1.f,
+                                     .filter_type = &rtgi::g_rtgi_filter_type,
+                                     .filter_type_default = 1.f,
+                                     .filter_radius = &rtgi::g_rtgi_filter_radius,
+                                     .filter_radius_default = 4.f,
+                                     .filter_passes = &rtgi::g_rtgi_filter_passes,
+                                     .filter_passes_default = 2.f,
+                                     .taps_separable = &rtgi::g_rtgi_filter_taps_separable,
+                                     .taps_separable_default = 5.f,
+                                     .taps_atrous = &rtgi::g_rtgi_filter_taps_atrous,
+                                     .taps_atrous_default = 5.f});
   settings->push_back(new Setting{
       .key = "RtgiFadeStartPct",
       .binding = &rtgi::g_rtgi_fade_start_pct,
