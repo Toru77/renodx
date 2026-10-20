@@ -494,6 +494,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtaoCharacterIntensity",
+      .binding = &rtao::g_rtao_char_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Intensity",
+      .section = "RTAO",
+      .tooltip = "RTAO on character pixels: 1 = full RTAO, 0 = none. Applies whatever GTVBAO 'Allow GTVBAO' says (RTAO replaces GTVBAO; the GTVBAO character settings do not apply while RTAO runs). Character parts the game shades with the map AO keep the game's own AO tint at any value.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoTemporalEnabled",
       .binding = &rtao::g_rtao_temporal_enabled,
       .value_type = SettingValueType::BOOLEAN,

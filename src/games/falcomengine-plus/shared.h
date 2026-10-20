@@ -330,9 +330,9 @@ struct ShaderInjectData {
   float dynCube_debug_face;                // 0..5 face for preview when debug=1/2/5/6
   float dynCube_debug_mip;                 // 0..7 mip for GGX filtered preview when debug=8
   float dynCube_force_mip;                 // debug: -1=normal roughness LOD, 0..7=force t17 mip
-  float dynCube_reserved_0;
+  float rtao_char_intensity;  // RTAO Character Intensity [0..1], set by PushRtaoAo; read only while rtao_ao_bound
   float dynCube_reserved_1;
-  float dynCube_reserved_2;
+  float rtao_ao_bound;  // 1 = t22 holds the RTAO output for this lighting draw (PushRtaoAo); 0 = not (RunRtaoInline)
   float dynCube_reserved_3;
   float dynCube_reserved_4;
   float dynCube_reserved_5;

@@ -424,6 +424,9 @@ void main(
     r9.yz = r0.yz;
     r8.xyz = r9.xyz * r8.xyz;
     r3.zw = (int2)r1.zz & int2(1,64);
+    // Bit 0 set: the character shading path below, which never reads the AO (r5.x). Bit 0 clear: the map-AO
+    // path, which applies r5.x itself. RTAO on characters (after charColor) applies only where r5.x is unused.
+    const bool csCharacterShading = r3.z != 0;
     if (r3.z != 0) {
       r9.x = r0.x;
       r9.yz = float2(0.0322580636,0.0322580636);
@@ -689,9 +692,15 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     r5.yzw = r5.yzw + -r9.xyz;
     r5.yzw = combineAlpha_g * r5.yzw + r9.xyz;
     float3 charColor = r3.www ? r9.xyz : r5.yzw;
-    // GTVBAO on characters — apply bitmask AO to character pixels
-    if (shader_injection_data.char_gtvbao_mode > 0.5f
-        && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
+    // RTAO on characters, whatever "Allow GTVBAO" says: RTAO replaces GTVBAO, whose character settings do not
+    // apply while it produces. Character Intensity scales it after the temporal pass and the filter.
+    if (shader_injection_data.rtao_ao_bound > 0.5f) {
+      if (csCharacterShading) {
+        charColor *= lerp(1.0, r5.x, saturate(shader_injection_data.rtao_char_intensity));
+      }
+    } else if (shader_injection_data.char_gtvbao_mode > 0.5f
+               && shader_injection_data.gtvbao_dedicated_bound > 0.5f) {
+      // GTVBAO on characters — apply bitmask AO to character pixels
       float gtvbaoCharMask = saturate(shader_injection_data.char_gtvbao_mask_strength);
       float gtvbaoAO = lerp(r5.x, 1.0, gtvbaoCharMask);
       charColor *= gtvbaoAO;

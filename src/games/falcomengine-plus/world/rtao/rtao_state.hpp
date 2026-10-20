@@ -18,6 +18,7 @@ inline float g_rtao_samples = 2.f;
 inline float g_rtao_ray_max = 2.f;
 inline float g_rtao_normal_bias = 0.05f;
 inline float g_rtao_two_sided = 1.f;
+inline float g_rtao_char_intensity = 1.f;  // Character Intensity: RTAO kept on character pixels (lighting shader)
 inline float g_rtao_temporal_enabled = 1.f;
 inline float g_rtao_history_weight = 0.9f;
 inline float g_rtao_depth_rejection = 0.05f;

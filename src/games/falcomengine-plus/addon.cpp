@@ -3319,13 +3319,14 @@ renodx::utils::settings::Settings settings = {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f, .label = "Allow GTVBAO", .section = "GTVBAO",
       .labels = {"Off", "On", "Combined"},
+      .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "CharGTVBAOMaskStr", .binding = &shader_injection.char_gtvbao_mask_strength,
       .default_value = 75.f, .label = "GTVBAO Char Mask", .section = "GTVBAO",
       .min = 0.f, .max = 100.f,
-      .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f; },
+      .is_enabled = []() { return shader_injection.char_gtvbao_mode > 0.5f && !falcom_world::rtao::RtaoRequested(); },
       .parse = [](float v) { return v * 0.01f; },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
@@ -9005,12 +9006,15 @@ static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resou
       reshade::api::descriptor_table_update{
           {}, kLightingGtvbaoRegister, 0, 1,
           reshade::api::descriptor_type::texture_shader_resource_view, &ao_srv});
+  shader_injection.rtao_char_intensity = falcom_world::rtao::g_rtao_char_intensity;
+  shader_injection.rtao_ao_bound = 1.f;
   shader_injection.gtvbao_dedicated_bound = 1.f;
 }
 
 static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   namespace rtao = falcom_world::rtao;
   shader_injection.rtao_debug_show = 0.f;  // set again by PushRtaoAo when RTAO produces this frame
+  shader_injection.rtao_ao_bound = 0.f;
   auto& frame = rtao::g_rtao_frame;
   frame.producing = false;
   frame.reason = rtao::Reason::Off;

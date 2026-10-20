@@ -60,6 +60,13 @@ Findings:
 
 P2b is implemented in the working tree, not validated in game. Not yet done: the CPU sway approximation (decision (b)), which needs a plan first (planner pass, then harness tests). The P-2 cause needs a decision on how to capture dynamic buffers before a fix is designed.
 
+## RTAO on characters, Character Intensity and Max Darkening (rtao-sliders-1): implemented, not validated in game
+
+- While RTAO produces, the character shading pixels (G-buffer bit 3 clear, bit 0 set) are multiplied by `lerp(1, RTAO, Character Intensity)` in the Sora 2nd lighting shader. This happens after pass B and the filter, whatever "Allow GTVBAO" says.
+- The map-AO pixels of the character branch (bit 0 clear) already received RTAO through the game's `mapAOColor_g` tint, and are not multiplied again.
+- The GTVBAO character path runs only when RTAO does not produce (if/else), so the two never both apply. "Allow GTVBAO" and "GTVBAO Char Mask" are greyed while RTAO is on.
+- Default image: with RTAO off (the default) the output is unchanged. With RTAO on, character shading pixels now darken with full RTAO (Character Intensity 1). Before, they got nothing with "Allow GTVBAO" Off, or 25% strength with it On.
+
 ## Refit and drain cleanup (refit-drain-1): implemented, not validated in game
 
 - Golden pins on HEAD c942e239 (harness, before any production edit): `test_live` `TestRefitGolden` = 0x2bf515dfb5956c83 (TLAS copies, leaf map, tlas_info and refit counters after every present); `test_motion` `TestOrphanGolden` = 0x41df77d2deefffcd (RetirePoolOrphans per pass). Sensitivity: a leaf-bounds perturbation breaks the refit pin and an overlap-orphan mutation breaks the orphan pin; both reverted.
