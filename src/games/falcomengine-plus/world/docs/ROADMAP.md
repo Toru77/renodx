@@ -377,6 +377,8 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 
 ### RTAO (round 1): reference
 
+- Skinned characters in RTAO: dropped by the owner (2026-10-20). Characters as occluders stay out of RTAO. The planned design for the first occlusion effect that needs them (RT shadows) is one per-frame refit of this frame's skinned captures at lighting time, shared by consumers and cached per frame, with RTAO as one consumer switch. Tracked as a future item, not implemented.
+- Known cost to check: with RTAO on, character and water capture and the present refit are switched on (`RtaoEnableBvhInputs`), although RTAO does not trace them. Owner to compare the Performance tab with "Deforming meshes" off.
 - Code: `world/rtao/` (`rtao_state.hpp` settings, reason codes, `RtaoEffectiveFade`; `rtao_resources.hpp` pipeline, AO target, stats; `rtao.hpp` dispatch and stats readback; `rtao_panel.hpp` panel). Shader: `world/shaders/world_rtao.cs_5_0.hlsl`. Hook wrapper: `RunRtaoInline` in `addon.cpp`, called from `OnBeforeLightingShaderDraw` before `DeployShadows`.
 - Placement: inline in the lighting hook (zero latency). Micro shadows read this frame's RTAO AO when it is produced. The shader reads the game scene CBV (b0), not `g_state.camera`.
 - Early-out: the sample loop stops once the pixel's camera distance reaches Fade End (`g_rtao_fade.y`). Beyond Fade End the fade is 0 and ao is exactly 1.0, so no ray is traced there.
