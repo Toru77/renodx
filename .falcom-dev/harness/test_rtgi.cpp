@@ -36,6 +36,11 @@ namespace rtgi = falcom_world::rtgi;
 static int g_failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { ++g_failures; std::printf("FAIL %s:%d %s | ", __FILE__, __LINE__, #cond); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
 
+static std::string ReadText(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
 static void TestTraceDivisor() {
   CHECK(rtgi::RtgiTraceDivisor(-1.f) == 1u, "setting -1 gives 1");
   CHECK(rtgi::RtgiTraceDivisor(0.f) == 1u, "setting 0 (Full) gives 1");
@@ -65,8 +70,7 @@ static void TestPushLayout() {
 }
 
 static void TestShaderDefines() {
-  std::ifstream file("src/games/falcomengine-plus/world/shaders/world_rtgi.cs_5_0.hlsl", std::ios::binary);
-  const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  const std::string text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi.cs_5_0.hlsl");
   CHECK(!text.empty(), "shader copy readable (run refresh_world.ps1 first)");
   const struct {
     const char* name;
@@ -92,12 +96,53 @@ static void TestShaderDefines() {
       {"LUMINANCE_SUM", rtgi::kRtgiStatLuminanceSum},
       {"LUMINANCE_MAX", rtgi::kRtgiStatLuminanceMax},
       {"CLAMPED", rtgi::kRtgiStatClamped},
+      {"LUMINANCE_SUM_HI", rtgi::kRtgiStatLuminanceSumHi},
   };
   for (const auto& stat : stats) {
     const std::string line = std::string("#define RTGI_STAT_") + stat.name + " " + std::to_string(stat.value) + "u";
     CHECK(text.find(line) != std::string::npos, "%s", line.c_str());
   }
   CHECK(text.find("#define RTGI_STAT_TRACE_COUNT 20u") != std::string::npos, "trace count 20");
+  CHECK(text.find("#define RTGI_SCENE_ROWS_FIRST 50u") != std::string::npos, "scene rows first register 50");
+}
+
+// Lighting shaders are outside world/ (not copied by refresh_world.ps1): read from the repo, two levels up from the
+// harness folder, as test_rtao TestDebugShowField.
+struct Variant {
+  const char* path;
+  rtgi::SceneLayout layout;
+};
+static const Variant variants[] = {
+    {"../../src/games/falcomengine-plus/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl", rtgi::SceneLayout::Sora2nd},
+    {"../../src/games/falcomengine-plus/sora1st/lighting/lighting_0xFDAAF80E.ps_5_0.hlsl", rtgi::SceneLayout::Sora1st},
+    {"../../src/games/falcomengine-plus/kai/lighting/lighting_0x430ED091.ps_5_0.hlsl", rtgi::SceneLayout::Kai},
+    {"../../src/games/falcomengine-plus/kai/lighting/lightingsoft_0xF6C55E5F.ps_5_0.hlsl", rtgi::SceneLayout::Kai},
+};
+static const char* const shared_offsets[] = {
+    "viewInv_g : packoffset(c4)", "viewProj_g : packoffset(c16)", "viewProjInv_g : packoffset(c20)",
+    "lightColor_g : packoffset(c25)", "lightDirection_g : packoffset(c26)", "lightProbe_g[9] : packoffset(c37)",
+    "resolutionScaling_g : packoffset(c49)"};
+
+static void TestCbSceneOffsets() {
+  const std::string rtgi_text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi.cs_5_0.hlsl");
+  CHECK(!rtgi_text.empty(), "RTGI shader readable");
+  for (const char* offset : shared_offsets) {
+    CHECK(rtgi_text.find(offset) != std::string::npos, "RTGI cb_scene has %s", offset);
+  }
+  CHECK(rtgi_text.find("g_scene_rows[46] : packoffset(c50)") != std::string::npos, "RTGI scene row window c50..c95");
+  CHECK(rtgi_text.find("prevViewProj_g : packoffset") == std::string::npos, "world_rtgi.cs_5_0.hlsl has no prevViewProj_g cbuffer member (read through g_scene_rows)");
+  for (const Variant& v : variants) {
+    const std::string text = ReadText(v.path);
+    CHECK(!text.empty(), "%s readable", v.path);
+    for (const char* offset : shared_offsets) {
+      CHECK(text.find(offset) != std::string::npos, "%s has %s", v.path, offset);
+    }
+    const std::string prev = "prevViewProj_g : packoffset(c" + std::to_string(rtgi::RtgiPrevViewProjRegister(v.layout)) + ")";
+    CHECK(text.find(prev) != std::string::npos, "%s has %s", v.path, prev.c_str());
+    const uint32_t reg = rtgi::RtgiPrevViewProjRegister(v.layout);
+    CHECK(reg >= 50u && reg <= 92u, "%s register %u in c50..c92", v.path, reg);
+  }
+  CHECK(rtgi::RtgiPrevViewProjRegister(rtgi::SceneLayout::Unknown) == 0u, "unknown layout has no register");
 }
 
 static void TestJson() {
@@ -113,6 +158,9 @@ static void TestJson() {
   CHECK(text.find("\"perf_gather\": false") != std::string::npos, "perf_gather key");
   CHECK(text.find("\"radiance\": {") != std::string::npos, "radiance object");
   CHECK(text.find("\"luminance_max\": ") != std::string::npos, "luminance_max key");
+  CHECK(text.find("\"luminance_sum_x10\": ") != std::string::npos, "luminance_sum_x10 key");
+  CHECK(text.find("\"luminance_stat_cap\": ") != std::string::npos, "luminance_stat_cap key");
+  CHECK(text.find("\"prev_view_proj_register\": ") != std::string::npos, "prev_view_proj_register key");
 }
 
 int main() {
@@ -126,6 +174,8 @@ int main() {
   TestPushLayout();
   HStage("shader defines");
   TestShaderDefines();
+  HStage("cb_scene offsets per lighting variant");
+  TestCbSceneOffsets();
   HStage("json");
   TestJson();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);

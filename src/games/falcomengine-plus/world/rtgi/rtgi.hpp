@@ -39,6 +39,7 @@ struct RtgiFrameState {
   uint32_t radiance_width = 0u;
   uint32_t radiance_height = 0u;
   uint32_t radiance_format = 0u;
+  uint32_t prev_view_proj_register = 0u;
 };
 
 inline RtgiFrameState g_rtgi_frame;
@@ -221,7 +222,31 @@ inline void CaptureRtgiRadiance(reshade::api::device* device, reshade::api::comm
   const auto desc = device->get_resource_desc(source);
   if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples != 1) return;
   RtgiDeviceData& data = GetRtgiDeviceData(device);
-  if (!EnsureRtgiRadianceTarget(device, &data, desc)) return;
+  if (data.radiance_failed) return;
+  const reshade::api::format format = desc.texture.format;
+  if (data.radiance_texture.handle == 0u || data.radiance_width != desc.texture.width
+      || data.radiance_height != desc.texture.height || data.radiance_format != format) {
+    bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
+    reshade::api::resource_desc radiance_desc = {};
+    radiance_desc.type = reshade::api::resource_type::texture_2d;
+    radiance_desc.texture = {desc.texture.width, desc.texture.height, 1, 1, format, 1};
+    radiance_desc.heap = reshade::api::memory_heap::gpu_only;
+    radiance_desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
+    const reshade::api::resource_view_desc view(reshade::api::resource_view_type::texture_2d,
+                                                reshade::api::format_to_default_typed(format, 0), 0, 1, 0, 1);
+    if (!device->create_resource(radiance_desc, nullptr, reshade::api::resource_usage::shader_resource, &data.radiance_texture)
+        || !device->create_resource_view(data.radiance_texture, reshade::api::resource_usage::shader_resource, view, &data.radiance_srv)) {
+      bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
+      data.radiance_failed = true;
+      renodx::utils::log::w("[world-rtgi] radiance copy target creation failed (format ", static_cast<uint32_t>(format), ")");
+      return;
+    }
+    data.radiance_width = desc.texture.width;
+    data.radiance_height = desc.texture.height;
+    data.radiance_format = format;
+    renodx::utils::log::i("[world-rtgi] radiance copy: ", data.radiance_width, "x", data.radiance_height, " format ",
+                          static_cast<uint32_t>(format));
+  }
   cmd_list->barrier(source, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
   cmd_list->barrier(data.radiance_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
   cmd_list->copy_texture_region(source, 0u, nullptr, data.radiance_texture, 0u, nullptr);
@@ -263,6 +288,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
   out << "  \"isfast_used\": " << (f.isfast_used ? "true" : "false") << ",\n";
+  out << "  \"prev_view_proj_register\": " << f.prev_view_proj_register << ",\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << ",\n";
   out << "  \"stats\": {\n";
   out << "    \"rays\": " << v[kRtgiStatRays] << ",\n";
@@ -282,7 +308,8 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "    \"radiance_lookups\": " << v[kRtgiStatRadianceLookups] << ",\n";
   out << "    \"sun_rays\": " << v[kRtgiStatSunRays] << ",\n";
   out << "    \"sun_visible\": " << v[kRtgiStatSunVisible] << ",\n";
-  out << "    \"luminance_sum_x100\": " << v[kRtgiStatLuminanceSum] << ",\n";
+  out << "    \"luminance_sum_x10\": " << ((static_cast<uint64_t>(v[kRtgiStatLuminanceSumHi]) << 32) | v[kRtgiStatLuminanceSum]) << ",\n";
+  out << "    \"luminance_stat_cap\": " << kRtgiLuminanceStatCap << ",\n";
   out << "    \"luminance_max\": " << luminance_max << ",\n";
   out << "    \"clamped\": " << v[kRtgiStatClamped] << "\n";
   out << "  },\n";

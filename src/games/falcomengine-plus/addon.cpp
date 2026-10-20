@@ -9283,6 +9283,20 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtgi::Reason::RtaoNotProducing;
     return;
   }
+  // The game's lighting shaders fix the scene-buffer layout; RTGI reads prevViewProj_g at that variant's register.
+  rtgi::SceneLayout scene_layout = rtgi::SceneLayout::Unknown;
+  if (IsSora2nd()) {
+    scene_layout = rtgi::SceneLayout::Sora2nd;
+  } else if (IsSora1st()) {
+    scene_layout = rtgi::SceneLayout::Sora1st;
+  } else if (IsKai()) {
+    scene_layout = rtgi::SceneLayout::Kai;
+  }
+  const uint32_t prev_view_proj_register = rtgi::RtgiPrevViewProjRegister(scene_layout);
+  if (prev_view_proj_register == 0u) {
+    frame.reason = rtgi::Reason::SceneLayoutUnknown;
+    return;
+  }
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
     return;
@@ -9315,7 +9329,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
           .fade = {fade.start, fade.end, static_cast<float>(radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u), 0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
-          .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, 0.f, 0.f},
+          .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, 0.f, static_cast<float>(prev_view_proj_register)},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
   };
@@ -9345,6 +9359,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.fade = fade;
   frame.samples = spp;
   frame.isfast_used = isfast_used;
+  frame.prev_view_proj_register = prev_view_proj_register;
   frame.radiance_valid = radiance_valid;
   frame.radiance_width = rd.radiance_width;
   frame.radiance_height = rd.radiance_height;

@@ -26,6 +26,7 @@ inline void DrawRtgiPanel() {
     ImGui::Text("Trace: %u x %u (one per %u x %u block of %u x %u)", frame.trace_width, frame.trace_height,
                 frame.divisor, frame.divisor, frame.full_width, frame.full_height);
   }
+  ImGui::Text("Scene layout: prevViewProj_g at c%u", frame.prev_view_proj_register);
   ImGui::Text("Max Ray Distance: requested %.1f m, effective %.1f m", frame.ray_max_requested, frame.ray_max_effective);
   if (frame.fade_valid) {
     ImGui::Text("Fade: effective start %.0f m, end %.0f m (requested %.0f / %.0f m, BVH range %.0f m; stored %.1f%% / %.1f%%)",
@@ -56,8 +57,9 @@ inline void DrawRtgiPanel() {
                 v[kRtgiStatPixels]);
     float luminance_max = 0.f;
     std::memcpy(&luminance_max, &v[kRtgiStatLuminanceMax], sizeof(luminance_max));
-    const float mean_luminance = hits > 0u ? static_cast<float>(v[kRtgiStatLuminanceSum]) / 100.f / static_cast<float>(hits) : 0.f;
-    ImGui::Text("Radiance: on-screen lookups %u, sun rays %u (visible %.1f%%), mean sample luminance %.3f, max %.3f, clamped %.1f%%",
+    const uint64_t luminance_sum = (static_cast<uint64_t>(v[kRtgiStatLuminanceSumHi]) << 32) | v[kRtgiStatLuminanceSum];
+    const float mean_luminance = hits > 0u ? static_cast<float>(static_cast<double>(luminance_sum) / 10.0 / hits) : 0.f;
+    ImGui::Text("Radiance: on-screen lookups %u, sun rays %u (visible %.1f%%), mean sample luminance (capped at 1000 per sample) %.3f, max %.3f, clamped %.1f%%",
                 v[kRtgiStatRadianceLookups], v[kRtgiStatSunRays], rtao::SharePercent(v[kRtgiStatSunVisible], v[kRtgiStatSunRays]),
                 mean_luminance, luminance_max, rtao::SharePercent(v[kRtgiStatClamped], hits));
   }

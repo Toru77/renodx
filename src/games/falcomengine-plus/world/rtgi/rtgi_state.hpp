@@ -26,6 +26,7 @@ enum class Reason : uint8_t {
   RtaoOff,           // RTGI on while RTAO is off: RTGI needs RTAO
   RtaoNotProducing,  // RTAO did not dispatch on this lighting draw (its reason is in the RTAO panel)
   PipelineFailed,
+  SceneLayoutUnknown,  // the running game's scene-buffer layout is not in RtgiPrevViewProjRegister
 };
 
 inline const char* ReasonName(Reason reason) {
@@ -34,8 +35,32 @@ inline const char* ReasonName(Reason reason) {
     case Reason::RtaoOff: return "rtao_off";
     case Reason::RtaoNotProducing: return "rtao_not_producing";
     case Reason::PipelineFailed: return "pipeline_failed";
+    case Reason::SceneLayoutUnknown: return "scene_layout_unknown";
   }
   return "unknown";
+}
+
+// Scene-buffer layout of a lighting variant (cb_scene, b0 of the game's lighting shader). Between the supported
+// layouts only prevViewProj_g moves; viewInv_g c4, viewProj_g c16, viewProjInv_g c20, lightColor_g c25,
+// lightDirection_g c26, lightProbe_g c37 and resolutionScaling_g c49 are shared (world_rtgi.cs_5_0.hlsl cb_scene).
+// To add a game: add an enumerator, its register below, its exe in addon.cpp RunRtgiInline, and its lighting shader
+// to test_rtgi TestCbSceneOffsets. The register must lie in c50..c92 (the shader's g_scene_rows window).
+enum class SceneLayout : uint8_t {
+  Unknown = 0,  // Kyoto and Daybreak 2 also move lightProbe_g and resolutionScaling_g: not supported
+  Sora1st,      // lighting 0xFDAAF80E
+  Sora2nd,      // lighting 0xCA3D8596
+  Kai,          // lighting 0x430ED091 and lightingsoft 0xF6C55E5F
+};
+
+// First register of prevViewProj_g for a layout; 0 = unknown (RTGI does not run).
+inline uint32_t RtgiPrevViewProjRegister(SceneLayout layout) {
+  switch (layout) {
+    case SceneLayout::Sora1st: return 74u;
+    case SceneLayout::Sora2nd: return 75u;
+    case SceneLayout::Kai: return 85u;
+    case SceneLayout::Unknown: break;
+  }
+  return 0u;
 }
 
 // Trace Resolution setting (0 Full, 1 Half, 2 Quarter) to the block side d: one trace pixel per d x d pixels.

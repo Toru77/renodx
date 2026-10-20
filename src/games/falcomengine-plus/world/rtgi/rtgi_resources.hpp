@@ -39,9 +39,11 @@ inline constexpr uint32_t kRtgiStatHitDistanceDm = 13u;
 inline constexpr uint32_t kRtgiStatRadianceLookups = 14u;
 inline constexpr uint32_t kRtgiStatSunRays = 15u;
 inline constexpr uint32_t kRtgiStatSunVisible = 16u;
-inline constexpr uint32_t kRtgiStatLuminanceSum = 17u;
+inline constexpr uint32_t kRtgiStatLuminanceSum = 17u;  // sum of min(luminance, cap) x 10, low word
 inline constexpr uint32_t kRtgiStatLuminanceMax = 18u;
 inline constexpr uint32_t kRtgiStatClamped = 19u;
+inline constexpr uint32_t kRtgiStatLuminanceSumHi = 23u;  // high word of the luminance sum (RTGI_STAT_LUMINANCE_SUM_HI)
+inline constexpr float kRtgiLuminanceStatCap = 1000.f;    // per-sample cap of the luminance statistic (RTGI_LUMINANCE_STAT_CAP)
 inline constexpr uint32_t kRtgiFlagRadianceValid = 1u;  // b12 c2.z bit (RTGI_FLAG_* in the shader)
 
 #if defined(__world_rtgi_EMBED_FILE)
@@ -57,7 +59,7 @@ struct RtgiPushConstants {
   float fade[4];      // c2: fade start_eff, fade end_eff, flags (kRtgiFlag* as a float), P2b record count (w, uint bits)
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
-  float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), unused, unused
+  float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), unused, prevViewProj_g register (RtgiPrevViewProjRegister)
 };
 static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 24 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");
@@ -128,38 +130,6 @@ struct RtgiDeviceData {
 inline std::unordered_map<reshade::api::device*, RtgiDeviceData> g_rtgi_devices;
 
 inline RtgiDeviceData& GetRtgiDeviceData(reshade::api::device* device) { return g_rtgi_devices[device]; }
-
-// Copies the lighting output for the next frame's RTGI trace. The target follows the source's size and format; a
-// creation failure is logged once and disables the copy for the device (radiance_failed).
-inline bool EnsureRtgiRadianceTarget(reshade::api::device* device, RtgiDeviceData* data, const reshade::api::resource_desc& source) {
-  if (data->radiance_failed) return false;
-  const reshade::api::format format = source.texture.format;
-  if (data->radiance_texture.handle != 0u && data->radiance_width == source.texture.width
-      && data->radiance_height == source.texture.height && data->radiance_format == format) {
-    return true;
-  }
-  bvh::DestroyBuffer(device, &data->radiance_srv, &data->radiance_texture);
-  reshade::api::resource_desc desc = {};
-  desc.type = reshade::api::resource_type::texture_2d;
-  desc.texture = {source.texture.width, source.texture.height, 1, 1, format, 1};
-  desc.heap = reshade::api::memory_heap::gpu_only;
-  desc.usage = reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest;
-  const reshade::api::resource_view_desc view(reshade::api::resource_view_type::texture_2d,
-                                              reshade::api::format_to_default_typed(format, 0), 0, 1, 0, 1);
-  if (!device->create_resource(desc, nullptr, reshade::api::resource_usage::shader_resource, &data->radiance_texture)
-      || !device->create_resource_view(data->radiance_texture, reshade::api::resource_usage::shader_resource, view, &data->radiance_srv)) {
-    bvh::DestroyBuffer(device, &data->radiance_srv, &data->radiance_texture);
-    data->radiance_failed = true;
-    renodx::utils::log::w("[world-rtgi] radiance copy target creation failed (format ", static_cast<uint32_t>(format), ")");
-    return false;
-  }
-  data->radiance_width = source.texture.width;
-  data->radiance_height = source.texture.height;
-  data->radiance_format = format;
-  renodx::utils::log::i("[world-rtgi] radiance copy: ", data->radiance_width, "x", data->radiance_height, " format ",
-                        static_cast<uint32_t>(format));
-  return true;
-}
 
 inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   const auto found = g_rtgi_devices.find(device);

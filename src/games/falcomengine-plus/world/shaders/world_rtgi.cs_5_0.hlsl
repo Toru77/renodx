@@ -9,6 +9,10 @@
 // shadow ray + Ambient Contribution * the game's probe ambient). The raw GI (u2) is the mean sample radiance times the
 // distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views 1 to 3 (u0).
 // Camera: the game scene CBV (b0). Noise: IS-FAST (t18, Load only) or IGN, offset by 64 px from RTAO's.
+// cb_scene: the shared offsets are named below; prevViewProj_g moves between lighting variants (Sora 1st c74,
+// Sora 2nd c75, Kai c85; rtgi_state.hpp RtgiPrevViewProjRegister), so its four registers are read from the
+// g_scene_rows window at the register in c5.w. Reads past the end of a smaller scene buffer return 0 (D3D11 rule;
+// the debug layer may warn that the buffer is smaller than declared).
 
 #define WORLD_TRACE_DYNAMIC_INSTANCES
 #define WORLD_TRACE_DYNAMIC_SLOT t19
@@ -34,8 +38,9 @@ cbuffer cb_scene : register(b0)
     float3 lightColor_g : packoffset(c25);
     float3 lightDirection_g : packoffset(c26);
     float4 lightProbe_g[9] : packoffset(c37);
-    float4x4 prevViewProj_g : packoffset(c75);
+    float4 g_scene_rows[46] : packoffset(c50);  // scene registers c50..c95 (per-variant prevViewProj_g)
 };
+#define RTGI_SCENE_ROWS_FIRST 50u
 
 // Push constants (rtgi.hpp fills these; 24 floats).
 cbuffer cb_rtgi : register(b12)
@@ -45,7 +50,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_fade : packoffset(c2);      // fade start_eff, fade end_eff, flags, P2b record count (w, uint bits)
     float4 g_rtgi_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
-    float4 g_rtgi_shading : packoffset(c5);   // reserved for the hit shading (M2)
+    float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), unused, prevViewProj_g register (per variant)
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -65,9 +70,11 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_STAT_RADIANCE_LOOKUPS 14u
 #define RTGI_STAT_SUN_RAYS 15u
 #define RTGI_STAT_SUN_VISIBLE 16u
-#define RTGI_STAT_LUMINANCE_SUM 17u
+#define RTGI_STAT_LUMINANCE_SUM 17u  // sum of min(luminance, RTGI_LUMINANCE_STAT_CAP) x 10, low word
 #define RTGI_STAT_LUMINANCE_MAX 18u
 #define RTGI_STAT_CLAMPED 19u
+#define RTGI_STAT_LUMINANCE_SUM_HI 23u  // high word of the 64-bit luminance sum (carry from index 17)
+#define RTGI_LUMINANCE_STAT_CAP 1000.0  // per-sample cap of the luminance statistic only (not of the GI)
 #define RTGI_STAT_TRACE_COUNT 20u
 #define RTGI_FLAG_RADIANCE_VALID 1u
 #define RTGI_SUN_RAY_MAX 64.0
@@ -128,12 +135,13 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             else if (distance_to_camera >= g_rtgi_fade.y)
             {
                 InterlockedAdd(gs_stats[RTGI_STAT_BEYOND_FADE], 1u);
-                traced = true;
+                traced = true;  // Valid GI (0): no rays beyond Fade End; the debug views keep the not-traced colour.
             }
             else
             {
                 traced = true;
                 const uint flags = (uint)g_rtgi_fade.z;
+                const uint prev_row = (uint)g_rtgi_shading.w - RTGI_SCENE_ROWS_FIRST;
                 uint lookups = 0u;
                 uint sun_rays = 0u;
                 uint sun_visible_count = 0u;
@@ -214,7 +222,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     if (visible && (flags & RTGI_FLAG_RADIANCE_VALID) != 0u)
                     {
                         // The copy is last frame's lighting output: look the hit up where the previous camera saw it.
-                        const float4 prev_clip = mul(float4(hit.position, 1.0), prevViewProj_g);
+                        // = mul(float4(p, 1), prevViewProj_g): cbuffer matrices are column-major, so register r + j is column j.
+                        const float4 hit_h = float4(hit.position, 1.0);
+                        const float4 prev_clip = float4(dot(hit_h, g_scene_rows[prev_row]), dot(hit_h, g_scene_rows[prev_row + 1u]),
+                                                        dot(hit_h, g_scene_rows[prev_row + 2u]), dot(hit_h, g_scene_rows[prev_row + 3u]));
                         const float2 prev_uv = float2(prev_clip.x / prev_clip.w * 0.5 + 0.5, 0.5 - prev_clip.y / prev_clip.w * 0.5);
                         if (prev_clip.w > 1e-6 && all(prev_uv >= 0.0) && all(prev_uv < 1.0))
                         {
@@ -260,7 +271,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     }
                     radiance = max(radiance, 0.0);
                     const float luminance = dot(radiance, float3(0.2126, 0.7152, 0.0722));
-                    luminance_sum += (uint)(min(luminance, 1e6) * 100.0);
+                    luminance_sum += (uint)(min(luminance, RTGI_LUMINANCE_STAT_CAP) * 10.0);
                     luminance_max = max(luminance_max, asuint(luminance));
                     if (g_rtgi_shading.y > 0.0 && luminance > g_rtgi_shading.y)
                     {
@@ -315,6 +326,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 }
             }
         }
+        // a: 1 = GI value valid (traced or beyond Fade End), -1 = no surface or outside the region.
         g_rtgi_raw[tp] = traced ? float4(gi, 1.0) : float4(0.0, 0.0, 0.0, -1.0);
     }
     GroupMemoryBarrierWithGroupSync();
@@ -323,6 +335,16 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         if (group_index == RTGI_STAT_LUMINANCE_MAX)
         {
             InterlockedMax(g_rtgi_stats[group_index], gs_stats[group_index]);
+        }
+        else if (group_index == RTGI_STAT_LUMINANCE_SUM)
+        {
+            // 64-bit sum: carry into the high word when the low word wraps.
+            uint before;
+            InterlockedAdd(g_rtgi_stats[RTGI_STAT_LUMINANCE_SUM], gs_stats[group_index], before);
+            if (before > 0xFFFFFFFFu - gs_stats[group_index])
+            {
+                InterlockedAdd(g_rtgi_stats[RTGI_STAT_LUMINANCE_SUM_HI], 1u);
+            }
         }
         else
         {
