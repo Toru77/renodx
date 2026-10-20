@@ -66,6 +66,7 @@ P2b is implemented in the working tree, not validated in game. Not yet done: the
 - The map-AO pixels of the character branch (bit 0 clear) already received RTAO through the game's `mapAOColor_g` tint, and are not multiplied again.
 - The GTVBAO character path runs only when RTAO does not produce (if/else), so the two never both apply. "Allow GTVBAO" and "GTVBAO Char Mask" are greyed while RTAO is on.
 - Default image: with RTAO off (the default) the output is unchanged. With RTAO on, character shading pixels now darken with full RTAO (Character Intensity 1). Before, they got nothing with "Allow GTVBAO" Off, or 25% strength with it On.
+- Max Darkening: `ao = max(ao, 1 - Max Darkening)` is applied once to the RTAO texel at the t22 read in the lighting shader (inside the GTVBAO_bound block, after the fix chain). It covers environment and character pixels; "Allow GTVBAO" plays no part. Pixels lighter than the floor are unchanged. Micro shadows and the RTAO debug view read the uncapped texture. Default 1: no change.
 
 ## Refit and drain cleanup (refit-drain-1): implemented, not validated in game
 

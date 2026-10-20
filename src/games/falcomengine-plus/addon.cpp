@@ -9008,6 +9008,7 @@ static void PushRtaoAo(reshade::api::command_list* cmd_list, reshade::api::resou
           reshade::api::descriptor_type::texture_shader_resource_view, &ao_srv});
   shader_injection.rtao_char_intensity = falcom_world::rtao::g_rtao_char_intensity;
   shader_injection.rtao_ao_bound = 1.f;
+  shader_injection.rtao_max_darkening = falcom_world::rtao::g_rtao_max_darkening;
   shader_injection.gtvbao_dedicated_bound = 1.f;
 }
 

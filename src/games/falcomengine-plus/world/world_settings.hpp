@@ -507,6 +507,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtaoMaxDarkening",
+      .binding = &rtao::g_rtao_max_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Max Darkening",
+      .section = "RTAO",
+      .tooltip = "Caps the darkest RTAO: no pixel goes below 1 - Max Darkening; lighter pixels are unchanged. 1 = no cap. Micro shadows read the uncapped AO.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoTemporalEnabled",
       .binding = &rtao::g_rtao_temporal_enabled,
       .value_type = SettingValueType::BOOLEAN,

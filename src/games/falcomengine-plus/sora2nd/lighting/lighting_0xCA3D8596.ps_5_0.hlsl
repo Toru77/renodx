@@ -297,6 +297,10 @@ void main(
     } else {
       ao_sample.x = GTVBAO_ao;  // Default current
     }
+    // RTAO Max Darkening: only texels darker than the floor change; skipped at 1 so the default output is unchanged.
+    if (shader_injection_data.rtao_ao_bound > 0.5f && shader_injection_data.rtao_max_darkening < 1.0f) {
+      ao_sample.x = max(ao_sample.x, 1.0 - saturate(shader_injection_data.rtao_max_darkening));
+    }
   }
   r5.xyz = ao_sample;
 
