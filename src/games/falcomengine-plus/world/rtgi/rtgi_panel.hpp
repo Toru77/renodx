@@ -34,7 +34,7 @@ inline void DrawRtgiPanel() {
   ImGui::Text("Composite: GI Intensity %.2f, Character GI Intensity %.2f, %s; one-bounce correction %s", g_rtgi_intensity,
               g_rtgi_char_intensity,
               frame.applied_frame != UINT64_MAX && frame.applied_frame == frame.dispatched_frame
-                  ? (frame.applied_debug ? "shown alone (RTGI Debug 7)" : "added this frame")
+                  ? "added this frame"
                   : "not added (GI Intensity 0, not Sora 2nd, or not running)",
               frame.subtracted ? "on" : "off");
   ImGui::Text("RTAO Max Darkening x1.8 = %.2f on bounce draws (RTAO alone %.2f)",

@@ -4,7 +4,9 @@
 // trace pixels around the pixel's position in trace space, each weighted by its bilinear weight times
 // FilterPlaneNormalWeight (world_rt_denoise.hlsli) between this pixel and the tap's representative pixel
 // min(tq * d + d / 2, size - 1). With d = 1 it is a pass-through. Writes the final GI (u0, r11g11b10_float; 0 where
-// there is no surface or no valid tap) and debug view 6 (u1).
+// there is no surface or no valid tap) and debug views 6 and 7 (u1). View 7 (Applied GI) is what the Sora 2nd composite
+// adds: final GI x the G-buffer colour (t3) x GI Intensity, with Character GI Intensity where MRT0.w has bit 3 clear and
+// bit 0 set (the lighting shader's csIsCharacter and csCharacterShading).
 
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_denoise.hlsli"
@@ -12,6 +14,7 @@
 Texture2D<float4> g_game_depth : register(t0);
 Texture2D<uint4> g_mrt_normal : register(t1);
 Texture2D<float4> g_in : register(t2);
+Texture2D<float4> g_albedo : register(t3);  // the lighting draw's colorTexture (G-buffer colour), for Debug 7
 
 RWTexture2D<float4> g_final : register(u0);
 RWTexture2D<float4> g_rtgi_debug : register(u1);
@@ -27,7 +30,7 @@ cbuffer cb_scene : register(b0)
 cbuffer cb_rtgi_upsample : register(b12)
 {
     float4 u_size : packoffset(c0);      // full width, full height, trace width, trace height
-    float4 u_params : packoffset(c1);    // trace divisor d, debug mode, unused, unused
+    float4 u_params : packoffset(c1);    // trace divisor d, debug mode, GI Intensity, Character GI Intensity (Debug 7)
     float4 u_reserved : packoffset(c2);  // unused
 };
 
@@ -85,5 +88,16 @@ void main(uint3 id : SV_DispatchThreadID)
     {
         // Not traced (no surface): dark purple, as in the other debug views.
         g_rtgi_debug[px] = float4(surface ? gi / (1.0 + gi) : float3(0.25, 0.0, 0.25), 1.0);
+    }
+    else if (debug_mode == 7)
+    {
+        uint aw;
+        uint ah;
+        g_albedo.GetDimensions(aw, ah);
+        const uint flags = g_mrt_normal.Load(int3(px, 0)).w;
+        const float3 applied = gi
+            * g_albedo.Load(int3(min(uint2((float2(px) + 0.5) / float2(full_size) * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
+            * u_params.z * ((flags & 8u) == 0u && (flags & 1u) != 0u ? saturate(u_params.w) : 1.0);
+        g_rtgi_debug[px] = float4(surface ? applied / (1.0 + applied) : float3(0.25, 0.0, 0.25), 1.0);
     }
 }

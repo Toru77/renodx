@@ -202,24 +202,24 @@ static void TestComposite() {
   injection.rtgi_gi_bound = 1.f;
   injection.rtgi_intensity = 2.f;
   injection.rtgi_char_intensity = 0.5f;
-  injection.rtgi_debug_show = 1.f;
-  CHECK(injection.rtgi_gi_bound == 1.f && injection.rtgi_intensity == 2.f && injection.rtgi_char_intensity == 0.5f
-            && injection.rtgi_debug_show == 1.f,
+  CHECK(injection.rtgi_gi_bound == 1.f && injection.rtgi_intensity == 2.f && injection.rtgi_char_intensity == 0.5f,
         "ShaderInjectData RTGI fields compile and hold their values");
   const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
   CHECK(!header.empty(), "shared.h readable from the harness directory");
-  for (const char* field : {"float rtgi_gi_bound;", "float rtgi_intensity;", "float rtgi_char_intensity;", "float rtgi_debug_show;"}) {
+  for (const char* field : {"float rtgi_gi_bound;", "float rtgi_intensity;", "float rtgi_char_intensity;", "float rtgi_reserved;"}) {
     CHECK(header.find(field) != std::string::npos && header.find(field) == header.rfind(field), "shared.h declares %s once", field);
   }
-  for (const char* old_name : {"dynCube_reserved_3", "dynCube_reserved_4", "dynCube_reserved_5", "char_shadow_light_screen_fade_end"}) {
+  for (const char* old_name : {"dynCube_reserved_3", "dynCube_reserved_4", "dynCube_reserved_5", "char_shadow_light_screen_fade_end", "rtgi_debug_show"}) {
     CHECK(header.find(old_name) == std::string::npos, "shared.h no longer has %s", old_name);
   }
   const std::string lighting = ReadText(variants[0].path);
   CHECK(!lighting.empty(), "Sora 2nd lighting shader readable");
   for (const char* line : {"Texture2D<float4> rtgiTexture : register(t37);", "register(t37)", "float3 cachedRTGI = float3(0, 0, 0);",
-                           "o0.xyz += cachedRTGI;", "o0.xyz += rtgiApplied;"}) {
+                           "o0.xyz += cachedRTGI;",
+                           "o0.xyz += cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);"}) {
     CHECK(lighting.find(line) != std::string::npos && lighting.find(line) == lighting.rfind(line), "lighting shader has %s once", line);
   }
+  CHECK(lighting.find("rtgi_debug_show") == std::string::npos, "the lighting shader no longer reads rtgi_debug_show");
 }
 
 static void TestJson() {

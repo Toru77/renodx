@@ -753,14 +753,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
                                     microShadowTex, contactShadowTex);
     // RTGI bounce: Character GI Intensity on the character shading path (csCharacterShading, which RTAO's Character
-    // Intensity also scales above); the map-AO pixels of characters get the full bounce. Debug 7: the bounce alone.
+    // Intensity also scales above); the map-AO pixels of characters get the full bounce.
     if (shader_injection_data.rtgi_gi_bound > 0.5f) {
-      const float3 rtgiApplied = cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);
-      if (shader_injection_data.rtgi_debug_show > 0.5f) {
-        o0.xyz = rtgiApplied;
-      } else {
-        o0.xyz += rtgiApplied;
-      }
+      o0.xyz += cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);
     }
     o0.w = r0.w;
     o1.xyzw = r2.xyzw;
@@ -1734,14 +1729,10 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     o2.x = 0;
     return;
   }
-  // RTGI bounce (see cachedRTGI); no character pixel reaches this site. Debug 7: the bounce alone. The VBGI block below
-  // never runs while RTGI is bound (RTAO on clears gtvbao_vbgi_bound); a selected SSR or cubemap debug view still wins.
+  // RTGI bounce (see cachedRTGI); no character pixel reaches this site. The VBGI block below never runs while RTGI is
+  // bound (RTAO on clears gtvbao_vbgi_bound).
   if (shader_injection_data.rtgi_gi_bound > 0.5f) {
-    if (shader_injection_data.rtgi_debug_show > 0.5f) {
-      o0.xyz = cachedRTGI;
-    } else {
-      o0.xyz += cachedRTGI;
-    }
+    o0.xyz += cachedRTGI;
   }
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     float3 giColor = cachedVBGI;

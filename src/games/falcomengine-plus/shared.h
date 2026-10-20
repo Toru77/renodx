@@ -44,7 +44,7 @@ struct ShaderInjectData {
   float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
   float char_shadow_contrast;               // RETIRED: Bend_SSS, unread
   float char_shadow_light_screen_fade_start; // RETIRED: Bend_SSS, unread
-  float rtgi_debug_show;                    // RTGI: 1 = the lighting shader shows the applied bounce alone (RTGI Debug 7, RunRtgiInline); 0 off
+  float rtgi_reserved;                      // RETIRED (was rtgi_debug_show; RTGI Debug 7 is drawn at present since FB2): unread, kept for the layout
   float char_shadow_min_occluder_depth_scale; // RETIRED: Bend_SSS, unread
   float char_shadow_jitter_enabled;          // RETIRED: Bend_SSS, unread
   // Shadow type: 0 = Camera, 1 = World, 2 = Combined. RETIRED: Bend_SSS, unread.

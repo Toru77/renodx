@@ -52,7 +52,6 @@ struct RtgiFrameState {
   bool filter_ran = false;            // the spatial filter ran this frame
   uint64_t applied_frame = UINT64_MAX;  // last frame whose lighting draw got the bounce (RunRtgiInline push_gi)
   float applied_intensity = 0.f;        // GI Intensity applied in applied_frame
-  bool applied_debug = false;           // applied_frame showed RTGI Debug 7 (the lighting output was the bounce alone)
   bool subtracted = false;              // this frame's trace subtracted last frame's applied bounce (one bounce)
 };
 
@@ -73,7 +72,7 @@ struct RtgiDispatchInputs {
   reshade::api::resource_view scene_cbv_view = {0u};
   reshade::api::resource_view radiance_view = {0u};
   reshade::api::resource_view prev_gi_view = {0u};  // t21: last frame's final GI (one-bounce correction; null: off)
-  reshade::api::resource_view albedo_view = {0u};   // t22: this frame's G-buffer colour (one-bounce correction; null: off)
+  reshade::api::resource_view albedo_view = {0u};   // this frame's G-buffer colour: trace t22 (one-bounce correction) and upsample t3 (Debug 7); null: not captured this frame
   uint32_t full_width = 0u;
   uint32_t full_height = 0u;
   uint32_t trace_width = 0u;
@@ -178,7 +177,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 6) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 7) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
@@ -228,7 +227,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                  .code = kRtgiFilterShader, .name = "filter"})
       && EnsureRtgiTextureSet(device, &data.filter, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height);
   const bool temporal_debug = debug_ready && temporal_run && (in.debug_mode == 4 || in.debug_mode == 5);
-  const bool upsample_debug = debug_ready && in.debug_mode == 6;
+  const bool upsample_debug = debug_ready && (in.debug_mode == 6 || in.debug_mode == 7);
 
   RtgiPushConstants push = in.push;
   push.size[0] = static_cast<float>(in.trace_width);
@@ -365,7 +364,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   // Upsample to the depth size: writes final_gi[final_index ^ 1], which becomes the newest.
   const RtgiPipeline& upsample = data.upsample_pipeline;
   const uint32_t final_write = data.final_index ^ 1u;
-  const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input};
+  const reshade::api::resource_view upsample_srvs[kRtgiUpsampleSrvCount] = {in.depth_view, in.mrt_normal_view, input, in.albedo_view};
   const reshade::api::resource_view upsample_uavs[kRtgiUpsampleUavCount] = {
       data.final_gi.uav[final_write], upsample_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}};
   reshade::api::descriptor_table_update upsample_updates[3] = {
@@ -377,7 +376,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   const RtgiUpsamplePushConstants upush = {
       .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(in.trace_width),
                static_cast<float>(in.trace_height)},
-      .params = {in.push.params[3], static_cast<float>(in.debug_mode), 0.f, 0.f},
+      .params = {in.push.params[3], static_cast<float>(in.debug_mode), g_rtgi_intensity, g_rtgi_char_intensity},
   };
   cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, upsample.pipeline);
   const reshade::api::descriptor_table upsample_tables[3] = {upsample.cbv_table, upsample.srv_table, upsample.uav_table};
@@ -495,7 +494,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
   out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
-      << ", \"applied_intensity\": " << f.applied_intensity << ", \"applied_debug\": " << (f.applied_debug ? "true" : "false")
+      << ", \"applied_intensity\": " << f.applied_intensity
       << ", \"subtract_previous\": " << (f.subtracted ? "true" : "false") << "},\n";
   out << "  \"isfast_used\": " << (f.isfast_used ? "true" : "false") << ",\n";
   out << "  \"prev_view_proj_register\": " << f.prev_view_proj_register << ",\n";

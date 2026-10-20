@@ -2,7 +2,7 @@
 
 // RTGI GPU resources: the four compute pipelines (trace world_rtgi, temporal world_rtgi_temporal, spatial filter
 // world_rtgi_filter, upsample world_rtgi_upsample), the stats buffer, the debug texture (r8g8b8a8_unorm at the depth
-// size, created while RTGI Debug is 1 to 6), the raw GI, the history, the filter targets, the final GI and the radiance
+// size, created while RTGI Debug is 1 to 7), the raw GI, the history, the filter targets, the final GI and the radiance
 // copy. Created lazily from the lighting hook (rtgi.hpp); no module mutex is held around any graphics call here.
 
 #include <cstddef>
@@ -62,8 +62,8 @@ inline constexpr uint32_t kRtgiTemporalPushCount = 20u;
 inline constexpr uint32_t kRtgiFilterSrvCount = 3u;
 inline constexpr uint32_t kRtgiFilterUavCount = 1u;
 inline constexpr uint32_t kRtgiFilterPushCount = 12u;
-// Upsample: t0 depth, t1 MRT normal, t2 input; u0 final GI, u1 debug.
-inline constexpr uint32_t kRtgiUpsampleSrvCount = 3u;
+// Upsample: t0 depth, t1 MRT normal, t2 input, t3 G-buffer colour (Debug 7); u0 final GI, u1 debug.
+inline constexpr uint32_t kRtgiUpsampleSrvCount = 4u;
 inline constexpr uint32_t kRtgiUpsampleUavCount = 2u;
 inline constexpr uint32_t kRtgiUpsamplePushCount = 12u;
 
@@ -125,7 +125,7 @@ static_assert(sizeof(RtgiFilterPushConstants) == kRtgiFilterPushCount * sizeof(f
 // b12 for the RTGI upsample, matching cbuffer cb_rtgi_upsample in world_rtgi_upsample.cs_5_0.hlsl.
 struct RtgiUpsamplePushConstants {
   float size[4];      // c0: full width, full height, trace width, trace height
-  float params[4];    // c1: trace divisor, debug mode, unused, unused
+  float params[4];    // c1: trace divisor, debug mode, GI Intensity, Character GI Intensity (Debug 7)
   float reserved[4];  // c2: unused
 };
 static_assert(sizeof(RtgiUpsamplePushConstants) == kRtgiUpsamplePushCount * sizeof(float), "upsample b12 must be 12 floats");
@@ -197,7 +197,7 @@ struct RtgiDeviceData {
   reshade::api::sampler linear_sampler = {0u};
   reshade::api::resource stats_buffer = {0u};
   reshade::api::resource_view stats_uav = {0u};
-  RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 6
+  RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 7
   RtgiTextureSet<1> raw;    // rgba16f, trace size: rgb GI, a = 1 traced, -1 not traced
   RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated GI, a = distance (0 = invalid)
   RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal

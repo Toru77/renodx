@@ -65,7 +65,7 @@ ShaderInjectData shader_injection = {
   .rtao_debug_show = 0.f,
   .char_shadow_contrast = 9.f,
   .char_shadow_light_screen_fade_start = 0.f,
-  .rtgi_debug_show = 0.f,
+  .rtgi_reserved = 0.f,
   .char_shadow_min_occluder_depth_scale = 0.f,
   .char_shadow_jitter_enabled = 1.f,
   .char_shadow_type = 1.f,
@@ -9272,7 +9272,6 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.producing = false;
   frame.reason = rtgi::Reason::Off;
   shader_injection.rtgi_gi_bound = 0.f;  // set again by push_gi when this lighting draw gets the bounce
-  shader_injection.rtgi_debug_show = 0.f;
   if (rtgi::g_rtgi_enabled < 0.5f) return;
   if (!rtao::RtaoRequested()) {
     frame.reason = rtgi::Reason::RtaoOff;
@@ -9316,12 +9315,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     shader_injection.rtgi_gi_bound = 1.f;
     shader_injection.rtgi_intensity = rtgi::g_rtgi_intensity;
     shader_injection.rtgi_char_intensity = rtgi::g_rtgi_char_intensity;
-    shader_injection.rtgi_debug_show = rtgi::g_rtgi_debug > 6.5f ? 1.f : 0.f;
     // PushRtaoAo wrote RTAO's own value for this draw; the bounce draw gets 1.8x (at most 1).
     shader_injection.rtao_max_darkening = rtgi::RtgiRtaoMaxDarkening(rtao::g_rtao_max_darkening);
     frame.applied_frame = dd->frame_index;
     frame.applied_intensity = rtgi::g_rtgi_intensity;
-    frame.applied_debug = rtgi::g_rtgi_debug > 6.5f;
   };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
@@ -9371,11 +9368,12 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   // The copy holds the previous frame's lighting output only when that frame produced it on this list. When that frame
   // got the bounce (push_gi), the copy contains it: the trace subtracts it (one bounce) with the previous final GI (kept
   // only while the depth size is unchanged) and this frame's G-buffer colour, and does not read the copy when it cannot
-  // (Debug 7 replaced the image, or an input is missing).
+  // (an input is missing). The colour also feeds RTGI Debug 7 in the upsample.
   const bool applied_last = frame.applied_frame != UINT64_MAX && frame.applied_frame + 1u == dd->frame_index;
-  const bool subtract = applied_last && !frame.applied_debug && rd.final_gi.width == dd->captured_depth_w
-      && rd.final_gi.height == dd->captured_depth_h && dd->captured_color_srv.handle != 0u
-      && dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index;
+  const bool color_ok = dd->captured_color_srv.handle != 0u && dd->captured_color_live.load()
+      && dd->captured_color_frame == dd->frame_index;
+  const bool subtract = applied_last && color_ok && rd.final_gi.width == dd->captured_depth_w
+      && rd.final_gi.height == dd->captured_depth_h;
   const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
       && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
   const rtgi::RtgiDispatchInputs in = {
@@ -9385,7 +9383,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .scene_cbv_view = dd->captured_scene_cbv_view,
       .radiance_view = radiance_valid ? rd.radiance_srv : reshade::api::resource_view{0u},
       .prev_gi_view = subtract ? rd.final_gi.srv[rd.final_index] : reshade::api::resource_view{0u},
-      .albedo_view = subtract ? dd->captured_color_srv : reshade::api::resource_view{0u},
+      .albedo_view = color_ok ? dd->captured_color_srv : reshade::api::resource_view{0u},
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
       .trace_width = trace_width,
