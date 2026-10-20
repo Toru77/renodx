@@ -46,7 +46,7 @@ cbuffer cb_scene : register(b0)
 };
 #define RTGI_SCENE_ROWS_FIRST 50u
 
-// Push constants (rtgi.hpp fills these; 24 floats).
+// Push constants (rtgi.hpp fills these; 28 floats).
 cbuffer cb_rtgi : register(b12)
 {
     float4 g_rtgi_params : packoffset(c0);    // effective ray max, normal bias, spp, trace divisor d
@@ -55,6 +55,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
+    float4 g_rtgi_sun : packoffset(c6);       // Sun Shadow Distance (m), unused, unused, unused
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -82,7 +83,6 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_STAT_TRACE_COUNT 20u
 #define RTGI_FLAG_RADIANCE_VALID 1u
 #define RTGI_FLAG_SUBTRACT_PREVIOUS 2u
-#define RTGI_SUN_RAY_MAX 64.0
 #define RTGI_FALLBACK_ALBEDO 0.5
 
 groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
@@ -268,7 +268,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         {
                             const WorldCameraView sun_view = {false, 1.0, 0u};
                             WorldTraceCounters sun_counters;
-                            const WorldTraceHit sun_hit = TraceWorldAny(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, RTGI_SUN_RAY_MAX, sun_view, sun_counters);
+                            const WorldTraceHit sun_hit = TraceWorldAny(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, g_rtgi_sun.x, sun_view, sun_counters);
                             sun_rays += 1u;
                             invalid_refs += sun_counters.invalid_refs;
                             stack_overflow += sun_counters.stack_overflow;

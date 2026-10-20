@@ -13,13 +13,14 @@ namespace falcom_world::rtgi {
 // Settings bindings (Ray Tracing tab, section RTGI and its cards).
 inline float g_rtgi_enabled = 0.f;
 inline float g_rtgi_samples = 1.f;
-inline float g_rtgi_ray_max = 16.f;
+inline float g_rtgi_ray_max = 8.f;
 inline float g_rtgi_trace_resolution = 1.f;    // 0 Full, 1 Half, 2 Quarter
-inline float g_rtgi_fade_start_pct = 15.625f;  // Fade Start: percent of the BVH range (Region)
-inline float g_rtgi_fade_end_pct = 31.25f;     // Fade End: percent of the BVH range (Region)
+inline float g_rtgi_fade_start_pct = 10.f;     // Fade Start: percent of the BVH range (Region)
+inline float g_rtgi_fade_end_pct = 20.f;       // Fade End: percent of the BVH range (Region)
 inline float g_rtgi_debug = 0.f;               // RTGI Debug (advanced), see the RtgiDebug row
 inline float g_rtgi_radiance_clamp = 0.f;  // Radiance Clamp: luminance cap per GI sample (0 = off)
 inline float g_rtgi_ambient = 1.f;         // Ambient Contribution: probe ambient weight at hidden and off-screen hits
+inline float g_rtgi_sun_distance = 64.f;   // Sun Shadow Distance (advanced): length of the fallback sun shadow ray, metres
 inline float g_rtgi_temporal_enabled = 1.f;
 inline float g_rtgi_history_weight = 0.95f;
 inline float g_rtgi_depth_rejection = 0.05f;
@@ -101,7 +102,7 @@ inline float RtgiRtaoMaxDarkening(float rtao_max_darkening) {
 // RTGI settings that shape the GI; a change resets the RTGI history for one frame. Never part of RTAO's snapshot.
 struct ParameterSnapshot {
   float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
-  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
+  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

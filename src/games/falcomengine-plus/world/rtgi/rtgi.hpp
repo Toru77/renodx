@@ -492,6 +492,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"samples\": " << f.samples << ",\n";
   out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
+  out << "  \"sun_shadow_distance\": " << g_rtgi_sun_distance << ",\n";
   out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
       << ", \"applied_intensity\": " << f.applied_intensity

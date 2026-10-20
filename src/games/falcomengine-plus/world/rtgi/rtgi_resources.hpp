@@ -21,7 +21,7 @@ namespace falcom_world::rtgi {
 // read only under kRtgiFlagSubtractPrevious): the one-bounce correction.
 inline constexpr uint32_t kRtgiSrvCount = 23u;
 inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 6), u1 stats, u2 raw GI
-inline constexpr uint32_t kRtgiPushConstantCount = 24u;
+inline constexpr uint32_t kRtgiPushConstantCount = 28u;
 inline constexpr uint32_t kRtgiStatsCount = 24u;
 
 // Matching RTGI_STAT_* in world_rtgi.cs_5_0.hlsl.
@@ -89,7 +89,7 @@ inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = __world_rtg
 inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = {};
 #endif
 
-// b12 for the RTGI trace, matching cbuffer cb_rtgi in world_rtgi.cs_5_0.hlsl (six float4 registers).
+// b12 for the RTGI trace, matching cbuffer cb_rtgi in world_rtgi.cs_5_0.hlsl (seven float4 registers).
 struct RtgiPushConstants {
   float params[4];    // c0: effective ray max, normal bias, spp, trace divisor
   float sampling[4];  // c1: isfast flag (1 loaded), slice base, seed, debug mode
@@ -97,13 +97,15 @@ struct RtgiPushConstants {
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
   float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
+  float sun[4];       // c6: Sun Shadow Distance (m), unused, unused, unused
 };
-static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 24 floats");
+static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 28 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");
 static_assert(offsetof(RtgiPushConstants, fade) == 8 * sizeof(float), "b12 c2 offset");
 static_assert(offsetof(RtgiPushConstants, region) == 12 * sizeof(float), "b12 c3 offset");
 static_assert(offsetof(RtgiPushConstants, size) == 16 * sizeof(float), "b12 c4 offset");
 static_assert(offsetof(RtgiPushConstants, shading) == 20 * sizeof(float), "b12 c5 offset");
+static_assert(offsetof(RtgiPushConstants, sun) == 24 * sizeof(float), "b12 c6 offset");
 
 // b12 for the RTGI temporal pass, matching cbuffer cb_rtgi_temporal in world_rtgi_temporal.cs_5_0.hlsl.
 struct RtgiTemporalPushConstants {

@@ -84,8 +84,9 @@ static void TestRtaoMaxDarkening() {
 }
 
 static void TestPushLayout() {
-  CHECK(sizeof(rtgi::RtgiPushConstants) == 24u * sizeof(float), "b12 is 24 floats");
+  CHECK(sizeof(rtgi::RtgiPushConstants) == 28u * sizeof(float), "b12 is 28 floats");
   CHECK(offsetof(rtgi::RtgiPushConstants, shading) == 20u * sizeof(float), "b12 c5 offset");
+  CHECK(offsetof(rtgi::RtgiPushConstants, sun) == 24u * sizeof(float), "b12 c6 offset");
   CHECK(sizeof(rtgi::RtgiTemporalPushConstants) == 20u * sizeof(float), "temporal b12 is 20 floats");
   CHECK(sizeof(rtgi::RtgiFilterPushConstants) == 12u * sizeof(float), "filter b12 is 12 floats");
   CHECK(sizeof(rtgi::RtgiUpsamplePushConstants) == 12u * sizeof(float), "upsample b12 is 12 floats");
@@ -136,6 +137,8 @@ static void TestShaderDefines() {
   CHECK(text.find("#define RTGI_SCENE_ROWS_FIRST 50u") != std::string::npos, "scene rows first register 50");
   CHECK(text.find("#define RTGI_FLAG_SUBTRACT_PREVIOUS " + std::to_string(rtgi::kRtgiFlagSubtractPrevious) + "u") != std::string::npos,
         "subtract flag define matches kRtgiFlagSubtractPrevious");
+  CHECK(text.find("g_rtgi_sun : packoffset(c6)") != std::string::npos, "trace cb_rtgi has c6 (Sun Shadow Distance)");
+  CHECK(text.find("RTGI_SUN_RAY_MAX") == std::string::npos, "the fixed sun ray length is gone");
   const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl");
   CHECK(!temporal.empty(), "temporal shader copy readable");
   const struct {
@@ -238,6 +241,7 @@ static void TestJson() {
   CHECK(text.find("\"luminance_sum_x10\": ") != std::string::npos, "luminance_sum_x10 key");
   CHECK(text.find("\"luminance_stat_cap\": ") != std::string::npos, "luminance_stat_cap key");
   CHECK(text.find("\"prev_view_proj_register\": ") != std::string::npos, "prev_view_proj_register key");
+  CHECK(text.find("\"sun_shadow_distance\": ") != std::string::npos, "sun_shadow_distance key");
   CHECK(text.find("\"temporal\": {") != std::string::npos, "temporal object");
   CHECK(text.find("\"spatial_filter\": {") != std::string::npos, "spatial_filter object");
   CHECK(text.find("\"temporal_pixels\": ") != std::string::npos, "temporal_pixels key");

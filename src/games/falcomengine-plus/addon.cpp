@@ -9344,7 +9344,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_samples, rtgi::g_rtgi_ray_max, rtao::g_rtao_normal_bias, rtgi::g_rtgi_trace_resolution, rtao::g_rtao_isfast,
       rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
       rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-      rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug};
+      rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9398,6 +9398,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                      bvh_data->tlas_region_size},
           .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, subtract ? frame.applied_intensity : 0.f,
                       static_cast<float>(prev_view_proj_register)},
+          .sun = {rtgi::g_rtgi_sun_distance, 0.f, 0.f, 0.f},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
