@@ -223,6 +223,8 @@ Texture3D<float2> csIsfastNoise : register(t35);
 // at t4; the shadow path takes its own binding to the same resource so the
 // element type can be fixed in the shared helper (see shadows_common.hlsli).
 Texture2D<float4> csDepthTex : register(t36);
+// t37 is the RTGI final GI (r11g11b10_float, depth size; world/rtgi), bound by RunRtgiInline while rtgi_gi_bound.
+Texture2D<float4> rtgiTexture : register(t37);
 
 #include "../../shared.h"
 #include "../../shadows/shadows_common.hlsli"
@@ -324,6 +326,13 @@ void main(
     }
     cachedVBGI = giColor;
     cachedVBGILuma = dot(cachedVBGI, float3(0.333, 0.333, 0.333));
+  }
+
+  // RTGI bounce (world/rtgi): final GI (t37) x the G-buffer colour (r0.xyz, colorTexture above) x GI Intensity. Added
+  // after FalcomApplyShadowTerms at both output sites, so neither RTAO nor the shadow terms darken it.
+  float3 cachedRTGI = float3(0, 0, 0);
+  if (shader_injection_data.rtgi_gi_bound > 0.5f) {
+    cachedRTGI = rtgiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.rtgi_intensity;
   }
 
   // Reduce AO where indirect light exists
@@ -743,6 +752,16 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     // bug that put contact shadows in interiors. Micro still applies.
     o0.xyz = FalcomApplyShadowTerms(charColor, v1.xy, csIsCharacter > 0.5, samPoint_s,
                                     microShadowTex, contactShadowTex);
+    // RTGI bounce: Character GI Intensity on the character shading path (csCharacterShading, which RTAO's Character
+    // Intensity also scales above); the map-AO pixels of characters get the full bounce. Debug 7: the bounce alone.
+    if (shader_injection_data.rtgi_gi_bound > 0.5f) {
+      const float3 rtgiApplied = cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);
+      if (shader_injection_data.rtgi_debug_show > 0.5f) {
+        o0.xyz = rtgiApplied;
+      } else {
+        o0.xyz += rtgiApplied;
+      }
+    }
     o0.w = r0.w;
     o1.xyzw = r2.xyzw;
     o2.xy = r3.xy;
@@ -1714,6 +1733,14 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     o2.y = min(0x0000ffff, (uint)(65.535 * r18.x));                  // native o2.y
     o2.x = 0;
     return;
+  }
+  // RTGI bounce (see cachedRTGI); no character pixel reaches this site. Debug 7: the bounce alone.
+  if (shader_injection_data.rtgi_gi_bound > 0.5f) {
+    if (shader_injection_data.rtgi_debug_show > 0.5f) {
+      o0.xyz = cachedRTGI;
+    } else {
+      o0.xyz += cachedRTGI;
+    }
   }
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     float3 giColor = cachedVBGI;

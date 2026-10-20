@@ -31,6 +31,8 @@ inline float g_rtgi_filter_radius = 4.f;
 inline float g_rtgi_filter_passes = 2.f;          // Filter Passes: 1..4
 inline float g_rtgi_filter_taps_separable = 5.f;  // Filter Taps (separable): 3..17
 inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
+inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
+inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
 
 enum class Reason : uint8_t {
   Off = 0,

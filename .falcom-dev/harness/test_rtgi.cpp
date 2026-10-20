@@ -1,7 +1,9 @@
 // Native harness: RTGI (world/rtgi): the trace and the denoise passes. Pure rules and the JSON text only.
 //
 // REAL: rtgi_state.hpp functions (trace divisor and extent, effective ray max), RtgiPushConstants layout,
-//       ParameterSnapshot equality, the M3b push layouts, BuildRtgiJson (the text written to world_rtgi.json).
+//       ParameterSnapshot equality, the M3b push layouts, the M4 ShaderInjectData fields, BuildRtgiJson (the text
+//       written to world_rtgi.json).
+// TEXT: the M4 composite lines in shared.h and the Sora 2nd lighting shader (read from the repo).
 // SOURCE GUARD: the RTGI_STAT_* defines in world_rtgi.cs_5_0.hlsl match the kRtgiStat* constants (the harness copy).
 // NOT COVERED: rtgi::Dispatch on a device, RunRtgiInline (addon.cpp), the shader on the GPU, the present blit.
 #include <cstdint>
@@ -38,6 +40,7 @@ inline constexpr std::span<const std::uint8_t> __world_rtgi_upsample{__world_rtg
 #include "harness_timer.hpp"
 #include "json_check.hpp"
 #include "src/games/falcomengine-plus/world/rtgi/rtgi.hpp"
+#include "../../src/games/falcomengine-plus/shared.h"  // REAL: compiled; the ShaderInjectData RTGI fields must exist
 
 using namespace reshade::api;
 namespace rtgi = falcom_world::rtgi;
@@ -124,6 +127,8 @@ static void TestShaderDefines() {
   }
   CHECK(text.find("#define RTGI_STAT_TRACE_COUNT 20u") != std::string::npos, "trace count 20");
   CHECK(text.find("#define RTGI_SCENE_ROWS_FIRST 50u") != std::string::npos, "scene rows first register 50");
+  CHECK(text.find("#define RTGI_FLAG_SUBTRACT_PREVIOUS " + std::to_string(rtgi::kRtgiFlagSubtractPrevious) + "u") != std::string::npos,
+        "subtract flag define matches kRtgiFlagSubtractPrevious");
   const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl");
   CHECK(!temporal.empty(), "temporal shader copy readable");
   const struct {
@@ -184,6 +189,32 @@ static void TestCbSceneOffsets() {
   CHECK(rtgi::RtgiPrevViewProjRegister(rtgi::SceneLayout::Unknown) == 0u, "unknown layout has no register");
 }
 
+// M4: the ShaderInjectData fields (REAL compile) and the composite text in shared.h and the Sora 2nd lighting shader.
+static void TestComposite() {
+  ShaderInjectData injection = {};
+  injection.rtgi_gi_bound = 1.f;
+  injection.rtgi_intensity = 2.f;
+  injection.rtgi_char_intensity = 0.5f;
+  injection.rtgi_debug_show = 1.f;
+  CHECK(injection.rtgi_gi_bound == 1.f && injection.rtgi_intensity == 2.f && injection.rtgi_char_intensity == 0.5f
+            && injection.rtgi_debug_show == 1.f,
+        "ShaderInjectData RTGI fields compile and hold their values");
+  const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
+  CHECK(!header.empty(), "shared.h readable from the harness directory");
+  for (const char* field : {"float rtgi_gi_bound;", "float rtgi_intensity;", "float rtgi_char_intensity;", "float rtgi_debug_show;"}) {
+    CHECK(header.find(field) != std::string::npos && header.find(field) == header.rfind(field), "shared.h declares %s once", field);
+  }
+  for (const char* old_name : {"dynCube_reserved_3", "dynCube_reserved_4", "dynCube_reserved_5", "char_shadow_light_screen_fade_end"}) {
+    CHECK(header.find(old_name) == std::string::npos, "shared.h no longer has %s", old_name);
+  }
+  const std::string lighting = ReadText(variants[0].path);
+  CHECK(!lighting.empty(), "Sora 2nd lighting shader readable");
+  for (const char* line : {"Texture2D<float4> rtgiTexture : register(t37);", "register(t37)", "float3 cachedRTGI = float3(0, 0, 0);",
+                           "o0.xyz += cachedRTGI;", "o0.xyz += rtgiApplied;"}) {
+    CHECK(lighting.find(line) != std::string::npos && lighting.find(line) == lighting.rfind(line), "lighting shader has %s once", line);
+  }
+}
+
 static void TestJson() {
   const rtgi::RtgiFrameState frame = {};
   const uint32_t values[rtgi::kRtgiStatsCount] = {};
@@ -204,6 +235,8 @@ static void TestJson() {
   CHECK(text.find("\"spatial_filter\": {") != std::string::npos, "spatial_filter object");
   CHECK(text.find("\"temporal_pixels\": ") != std::string::npos, "temporal_pixels key");
   CHECK(text.find("\"denoise_gpu_ms\": ") != std::string::npos, "denoise_gpu_ms key");
+  CHECK(text.find("\"composite\": {") != std::string::npos, "composite object");
+  CHECK(text.find("\"subtract_previous\": false") != std::string::npos, "subtract_previous key");
 }
 
 int main() {
@@ -221,6 +254,8 @@ int main() {
   TestShaderDefines();
   HStage("cb_scene offsets per lighting variant");
   TestCbSceneOffsets();
+  HStage("composite");
+  TestComposite();
   HStage("json");
   TestJson();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);

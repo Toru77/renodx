@@ -8,6 +8,8 @@
 // output at the hit's previous-frame pixel (t20, prevViewProj_g). Otherwise: RTGI_FALLBACK_ALBEDO * (sun * N.L * a sun
 // shadow ray + Ambient Contribution * the game's probe ambient). The raw GI (u2) is the mean sample radiance times the
 // distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views 1 to 3 (u0).
+// One bounce (M4): the copy holds last frame's applied bounce, so with RTGI_FLAG_SUBTRACT_PREVIOUS each lookup subtracts
+// the previous final GI (t21) x the G-buffer colour at the hit (t22) x last frame's GI Intensity (c5.z), clamped at 0.
 // Camera: the game scene CBV (b0). Noise: IS-FAST (t18, Load only) or IGN, offset by 64 px from RTAO's.
 // cb_scene: the shared offsets are named below; prevViewProj_g moves between lighting variants (Sora 1st c74,
 // Sora 2nd c75, Kai c85; rtgi_state.hpp RtgiPrevViewProjRegister), so its four registers are read from the
@@ -24,6 +26,8 @@ Texture2D<float4> g_game_depth : register(t9);
 Texture2D<uint4> g_mrt_normal : register(t17);
 Texture3D<float2> g_isfast_noise : register(t18);
 Texture2D<float4> g_rtgi_radiance : register(t20);
+Texture2D<float4> g_rtgi_prev_final : register(t21);  // last frame's final GI (one-bounce correction)
+Texture2D<float4> g_rtgi_albedo : register(t22);      // this frame's G-buffer colour, the lighting draw's colorTexture
 
 RWTexture2D<float4> g_rtgi_debug : register(u0);
 RWStructuredBuffer<uint> g_rtgi_stats : register(u1);
@@ -50,7 +54,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_fade : packoffset(c2);      // fade start_eff, fade end_eff, flags, P2b record count (w, uint bits)
     float4 g_rtgi_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
-    float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), unused, prevViewProj_g register (per variant)
+    float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -77,6 +81,7 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_LUMINANCE_STAT_CAP 1000.0  // per-sample cap of the luminance statistic only (not of the GI)
 #define RTGI_STAT_TRACE_COUNT 20u
 #define RTGI_FLAG_RADIANCE_VALID 1u
+#define RTGI_FLAG_SUBTRACT_PREVIOUS 2u
 #define RTGI_SUN_RAY_MAX 64.0
 #define RTGI_FALLBACK_ALBEDO 0.5
 
@@ -233,6 +238,20 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             uint rh;
                             g_rtgi_radiance.GetDimensions(rw, rh);
                             radiance = g_rtgi_radiance.Load(int3(min(uint2(prev_uv * float2(rw, rh)), uint2(rw, rh) - 1u), 0)).rgb;
+                            if ((flags & RTGI_FLAG_SUBTRACT_PREVIOUS) != 0u)
+                            {
+                                // What the composite added here last frame: final GI at the previous pixel x colour at the hit.
+                                uint fw;
+                                uint fh;
+                                g_rtgi_prev_final.GetDimensions(fw, fh);
+                                uint aw;
+                                uint ah;
+                                g_rtgi_albedo.GetDimensions(aw, ah);
+                                radiance = max(radiance
+                                    - g_rtgi_prev_final.Load(int3(min(uint2(prev_uv * float2(fw, fh)), uint2(fw, fh) - 1u), 0)).rgb
+                                    * g_rtgi_albedo.Load(int3(min(uint2(hit_uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
+                                    * g_rtgi_shading.z, 0.0);
+                            }
                             looked_up = true;
                             lookups += 1u;
                         }

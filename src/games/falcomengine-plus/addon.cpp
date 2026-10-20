@@ -65,7 +65,7 @@ ShaderInjectData shader_injection = {
   .rtao_debug_show = 0.f,
   .char_shadow_contrast = 9.f,
   .char_shadow_light_screen_fade_start = 0.f,
-  .char_shadow_light_screen_fade_end = 0.f,
+  .rtgi_debug_show = 0.f,
   .char_shadow_min_occluder_depth_scale = 0.f,
   .char_shadow_jitter_enabled = 1.f,
   .char_shadow_type = 1.f,
@@ -500,6 +500,7 @@ ShaderInjectData shader_injection = {
 
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister   = 23u;  // t23 = vbgiTexture
+constexpr uint32_t kLightingRtgiRegister   = 37u;  // t37 = rtgiTexture (RTGI final GI, world/rtgi)
 constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingDepthRegisterKai = 3u; // t3 = depthTexture (Kai)
 constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture (Sora)
@@ -9270,6 +9271,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   auto& frame = rtgi::g_rtgi_frame;
   frame.producing = false;
   frame.reason = rtgi::Reason::Off;
+  shader_injection.rtgi_gi_bound = 0.f;  // set again by push_gi when this lighting draw gets the bounce
+  shader_injection.rtgi_debug_show = 0.f;
   if (rtgi::g_rtgi_enabled < 0.5f) return;
   if (!rtao::RtaoRequested()) {
     frame.reason = rtgi::Reason::RtaoOff;
@@ -9297,8 +9300,30 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtgi::Reason::SceneLayoutUnknown;
     return;
   }
+  auto& rd = rtgi::GetRtgiDeviceData(dev);
+  // GI Intensity > 0 on Sora 2nd (the only lighting shader with the composite): binds this frame's final GI at t37 for
+  // this lighting draw, also on a second lighting draw of the frame. Otherwise rtgi_gi_bound stays 0 and the lighting
+  // shader takes its pre-RTGI path.
+  const auto push_gi = [&]() {
+    if (rtgi::g_rtgi_intensity <= 0.f || scene_layout != rtgi::SceneLayout::Sora2nd) return;
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0},
+        0,
+        reshade::api::descriptor_table_update{
+            {}, kLightingRtgiRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view, &rd.final_gi.srv[rd.final_index]});
+    shader_injection.rtgi_gi_bound = 1.f;
+    shader_injection.rtgi_intensity = rtgi::g_rtgi_intensity;
+    shader_injection.rtgi_char_intensity = rtgi::g_rtgi_char_intensity;
+    shader_injection.rtgi_debug_show = rtgi::g_rtgi_debug > 6.5f ? 1.f : 0.f;
+    frame.applied_frame = dd->frame_index;
+    frame.applied_intensity = rtgi::g_rtgi_intensity;
+    frame.applied_debug = rtgi::g_rtgi_debug > 6.5f;
+  };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
+    push_gi();
     return;
   }
   const rtao::Fade fade = rtao::RtaoEffectiveFade(bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size,
@@ -9310,7 +9335,6 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   // RTAO loaded the IS-FAST texture this frame when its own row is on; RTGI follows RTAO's IS-FAST row.
   const bool isfast_used = rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
-  auto& rd = rtgi::GetRtgiDeviceData(dev);
   // RTGI temporal: the same reset rule as RTAO (rtao::TemporalResetReason) over RTGI's own state and parameters.
   const bool temporal_on = rtgi::g_rtgi_temporal_enabled > 0.5f;
   if (temporal_on) {
@@ -9342,14 +9366,24 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     frame.last_reset = reset;
     frame.reset_counts[static_cast<size_t>(reset)] += 1u;
   }
-  // The copy holds the previous frame's lighting output only when that frame produced it on this list.
-  const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX && rd.radiance_frame + 1u == dd->frame_index;
+  // The copy holds the previous frame's lighting output only when that frame produced it on this list. When that frame
+  // got the bounce (push_gi), the copy contains it: the trace subtracts it (one bounce) with the previous final GI (kept
+  // only while the depth size is unchanged) and this frame's G-buffer colour, and does not read the copy when it cannot
+  // (Debug 7 replaced the image, or an input is missing).
+  const bool applied_last = frame.applied_frame != UINT64_MAX && frame.applied_frame + 1u == dd->frame_index;
+  const bool subtract = applied_last && !frame.applied_debug && rd.final_gi.width == dd->captured_depth_w
+      && rd.final_gi.height == dd->captured_depth_h && dd->captured_color_srv.handle != 0u
+      && dd->captured_color_live.load() && dd->captured_color_frame == dd->frame_index;
+  const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
+      && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
   const rtgi::RtgiDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
       .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
       .scene_cbv_view = dd->captured_scene_cbv_view,
       .radiance_view = radiance_valid ? rd.radiance_srv : reshade::api::resource_view{0u},
+      .prev_gi_view = subtract ? rd.final_gi.srv[rd.final_index] : reshade::api::resource_view{0u},
+      .albedo_view = subtract ? dd->captured_color_srv : reshade::api::resource_view{0u},
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
       .trace_width = trace_width,
@@ -9357,10 +9391,13 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .push = {
           .params = {ray_max, rtao::g_rtao_normal_bias, spp, static_cast<float>(divisor)},
           .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtgi::g_rtgi_debug},
-          .fade = {fade.start, fade.end, static_cast<float>(radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u), 0.f},
+          .fade = {fade.start, fade.end,
+                   static_cast<float>((radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u) | (subtract ? rtgi::kRtgiFlagSubtractPrevious : 0u)),
+                   0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
-          .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, 0.f, static_cast<float>(prev_view_proj_register)},
+          .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, subtract ? frame.applied_intensity : 0.f,
+                      static_cast<float>(prev_view_proj_register)},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
@@ -9408,6 +9445,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.isfast_used = isfast_used;
   frame.prev_view_proj_register = prev_view_proj_register;
   frame.radiance_valid = radiance_valid;
+  frame.subtracted = subtract && radiance_valid;
   frame.radiance_width = rd.radiance_width;
   frame.radiance_height = rd.radiance_height;
   frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
@@ -9421,6 +9459,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
              : 0u);
+  push_gi();
 }
 
 // RTGI: copies the lighting output after the draw; the next frame's RTGI trace reads it for on-screen hits.

@@ -44,7 +44,7 @@ struct ShaderInjectData {
   float rtao_debug_show;                    // RTAO: 1 = the lighting shader shows the RTAO texel (t22) as an image (RunRtaoInline); 0 off
   float char_shadow_contrast;               // RETIRED: Bend_SSS, unread
   float char_shadow_light_screen_fade_start; // RETIRED: Bend_SSS, unread
-  float char_shadow_light_screen_fade_end;   // RETIRED: Bend_SSS, unread
+  float rtgi_debug_show;                    // RTGI: 1 = the lighting shader shows the applied bounce alone (RTGI Debug 7, RunRtgiInline); 0 off
   float char_shadow_min_occluder_depth_scale; // RETIRED: Bend_SSS, unread
   float char_shadow_jitter_enabled;          // RETIRED: Bend_SSS, unread
   // Shadow type: 0 = Camera, 1 = World, 2 = Combined. RETIRED: Bend_SSS, unread.
@@ -333,9 +333,9 @@ struct ShaderInjectData {
   float rtao_char_intensity;  // RTAO Character Intensity [0..1], set by PushRtaoAo; read only while rtao_ao_bound
   float rtao_max_darkening;  // RTAO Max Darkening [0..1], set by PushRtaoAo; AO floor = 1 - this
   float rtao_ao_bound;  // 1 = t22 holds the RTAO output for this lighting draw (PushRtaoAo); 0 = not (RunRtaoInline)
-  float dynCube_reserved_3;
-  float dynCube_reserved_4;
-  float dynCube_reserved_5;
+  float rtgi_gi_bound;  // RTGI: 1 = t37 holds this frame's final GI for this lighting draw and GI Intensity > 0 (RunRtgiInline); 0 = not
+  float rtgi_intensity;  // RTGI GI Intensity [0..2]; read only while rtgi_gi_bound
+  float rtgi_char_intensity;  // RTGI Character GI Intensity [0..1]; read only while rtgi_gi_bound
   float dynCube_ssr_enabled;                     // 0=off 1=on (simple screen-space SSR)
   float dynCube_ssr_samples;                     // SSR march sample count [4..96], default 16
   float dynCube_ssr_distance;                    // SSR search distance, world units [4..192], default 20

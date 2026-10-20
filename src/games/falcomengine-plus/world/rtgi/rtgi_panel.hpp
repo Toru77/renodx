@@ -18,7 +18,7 @@ inline void DrawRtgiPanel() {
   if (g_rtgi_enabled < 0.5f) {
     ImGui::TextDisabled("RTGI: off");
   } else if (frame.producing) {
-    ImGui::Text("RTGI: active (GI traced and denoised this frame; the image is unchanged)");
+    ImGui::Text("RTGI: active (GI traced and denoised this frame; added to the image on Sora 2nd while GI Intensity > 0)");
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTGI: requested, not running (%s)", ReasonName(frame.reason));
   }
@@ -27,6 +27,12 @@ inline void DrawRtgiPanel() {
                 frame.divisor, frame.divisor, frame.full_width, frame.full_height);
   }
   ImGui::Text("Scene layout: prevViewProj_g at c%u", frame.prev_view_proj_register);
+  ImGui::Text("Composite: GI Intensity %.2f, Character GI Intensity %.2f, %s; one-bounce correction %s", g_rtgi_intensity,
+              g_rtgi_char_intensity,
+              frame.applied_frame != UINT64_MAX && frame.applied_frame == frame.dispatched_frame
+                  ? (frame.applied_debug ? "shown alone (RTGI Debug 7)" : "added this frame")
+                  : "not added (GI Intensity 0, not Sora 2nd, or not running)",
+              frame.subtracted ? "on" : "off");
   ImGui::Text("Max Ray Distance: requested %.1f m, effective %.1f m", frame.ray_max_requested, frame.ray_max_effective);
   if (frame.fade_valid) {
     ImGui::Text("Fade: effective start %.0f m, end %.0f m (requested %.0f / %.0f m, BVH range %.0f m; stored %.1f%% / %.1f%%)",

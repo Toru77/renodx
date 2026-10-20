@@ -50,6 +50,10 @@ struct RtgiFrameState {
   bool prev_params_valid = false;
   ParameterSnapshot prev_params = {};
   bool filter_ran = false;            // the spatial filter ran this frame
+  uint64_t applied_frame = UINT64_MAX;  // last frame whose lighting draw got the bounce (RunRtgiInline push_gi)
+  float applied_intensity = 0.f;        // GI Intensity applied in applied_frame
+  bool applied_debug = false;           // applied_frame showed RTGI Debug 7 (the lighting output was the bounce alone)
+  bool subtracted = false;              // this frame's trace subtracted last frame's applied bounce (one bounce)
 };
 
 inline RtgiFrameState g_rtgi_frame;
@@ -68,6 +72,8 @@ struct RtgiDispatchInputs {
   reshade::api::resource_view isfast_view = {0u};
   reshade::api::resource_view scene_cbv_view = {0u};
   reshade::api::resource_view radiance_view = {0u};
+  reshade::api::resource_view prev_gi_view = {0u};  // t21: last frame's final GI (one-bounce correction; null: off)
+  reshade::api::resource_view albedo_view = {0u};   // t22: this frame's G-buffer colour (one-bounce correction; null: off)
   uint32_t full_width = 0u;
   uint32_t full_height = 0u;
   uint32_t trace_width = 0u;
@@ -250,6 +256,8 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[18] = in.isfast_view;
   srvs[19] = bvh_data->dynamic.instances_srv;
   srvs[20] = in.radiance_view;
+  srvs[21] = in.prev_gi_view;
+  srvs[22] = in.albedo_view;
   const reshade::api::resource_view uavs[kRtgiUavCount] = {
       trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
   reshade::api::descriptor_table_update updates[3] = {
@@ -485,6 +493,10 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"samples\": " << f.samples << ",\n";
   out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
+  out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
+      << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
+      << ", \"applied_intensity\": " << f.applied_intensity << ", \"applied_debug\": " << (f.applied_debug ? "true" : "false")
+      << ", \"subtract_previous\": " << (f.subtracted ? "true" : "false") << "},\n";
   out << "  \"isfast_used\": " << (f.isfast_used ? "true" : "false") << ",\n";
   out << "  \"prev_view_proj_register\": " << f.prev_view_proj_register << ",\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << ",\n";
@@ -527,7 +539,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "    \"no_history\": " << v[kRtgiStatNoHistory] << ",\n";
   out << "    \"reset_pixels\": " << v[kRtgiStatResetPixels] << "\n";
   out << "  },\n";
-  out << "  \"note\": \"M3b diagnostic: the GI is traced and denoised but not added to the image\"\n";
+  out << "  \"note\": \"M4: the final GI is added to the image (Sora 2nd lighting shader) while GI Intensity > 0\"\n";
   out << "}\n";
   return out.str();
 }

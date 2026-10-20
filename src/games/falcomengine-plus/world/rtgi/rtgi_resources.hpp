@@ -16,8 +16,9 @@
 namespace falcom_world::rtgi {
 
 // t0..t8 BVH, t9 game depth, t10..t13 deforming (null: not traced), t14..t16 alpha, t17 MRT normal, t18 IS-FAST noise,
-// t19 P2b records (the RTAO pass A table), t20 radiance: the previous frame's lighting output.
-inline constexpr uint32_t kRtgiSrvCount = 21u;
+// t19 P2b records (the RTAO pass A table), t20 radiance: the previous frame's lighting output, t21 the previous final
+// GI and t22 the G-buffer colour (the one-bounce correction; null unless kRtgiFlagSubtractPrevious).
+inline constexpr uint32_t kRtgiSrvCount = 23u;
 inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 6), u1 stats, u2 raw GI
 inline constexpr uint32_t kRtgiPushConstantCount = 24u;
 inline constexpr uint32_t kRtgiStatsCount = 24u;
@@ -46,6 +47,7 @@ inline constexpr uint32_t kRtgiStatClamped = 19u;
 inline constexpr uint32_t kRtgiStatLuminanceSumHi = 23u;  // high word of the luminance sum (RTGI_STAT_LUMINANCE_SUM_HI)
 inline constexpr float kRtgiLuminanceStatCap = 1000.f;    // per-sample cap of the luminance statistic (RTGI_LUMINANCE_STAT_CAP)
 inline constexpr uint32_t kRtgiFlagRadianceValid = 1u;  // b12 c2.z bit (RTGI_FLAG_* in the shader)
+inline constexpr uint32_t kRtgiFlagSubtractPrevious = 2u;  // b12 c2.z bit: subtract last frame's applied bounce from lookups
 // Temporal pass counters, matching RTGI_STAT_* in world_rtgi_temporal.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
 inline constexpr uint32_t kRtgiStatNoHistory = 21u;
@@ -93,7 +95,7 @@ struct RtgiPushConstants {
   float fade[4];      // c2: fade start_eff, fade end_eff, flags (kRtgiFlag* as a float), P2b record count (w, uint bits)
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
-  float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), unused, prevViewProj_g register (RtgiPrevViewProjRegister)
+  float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
 };
 static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 24 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");
