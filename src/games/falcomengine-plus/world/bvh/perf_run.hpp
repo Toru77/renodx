@@ -59,6 +59,7 @@ enum PerfCost : size_t {
   kPerfPoolHooks,
   kPerfDeformHookCpu,
   kPerfRtaoRecordCpu,
+  kPerfRtgiRecordCpu,
   kPerfPresentWorldCpu,
   kPerfPresentBvhCpu,
   kPerfGpuTrace,
@@ -67,6 +68,7 @@ enum PerfCost : size_t {
   kPerfGpuDeformRefit,
   kPerfGpuRtao,
   kPerfGpuRtaoFilter,
+  kPerfGpuRtgi,
   kPerfRebuildPhase0,
   kPerfRebuildPhase1,
   kPerfRebuildPhase2,
@@ -97,6 +99,7 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"pool_hooks", false, kPerfDrawTime, false, nullptr},
     {"deform_hook_cpu", false, kPerfDrawTime, false, nullptr},
     {"rtao_record_cpu", true, kPerfDrawTime, false, nullptr},
+    {"rtgi_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"present_world_cpu", true, kPerfBracket, false, nullptr},
     {"present_bvh_cpu", true, kPerfBracket, false, nullptr},
     {"gpu_trace", true, kPerfGpu, true, nullptr},
@@ -105,6 +108,7 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_deform_refit", true, kPerfGpu, true, nullptr},
     {"gpu_rtao", true, kPerfGpu, true, nullptr},
     {"gpu_rtao_filter", true, kPerfGpu, true, nullptr},
+    {"gpu_rtgi", true, kPerfGpu, true, nullptr},
     {"rebuild_phase_0", true, kPerfSubset, false, kCachePhaseNames[0]},
     {"rebuild_phase_1", true, kPerfSubset, false, kCachePhaseNames[1]},
     {"rebuild_phase_2", true, kPerfSubset, false, kCachePhaseNames[2]},
@@ -298,7 +302,7 @@ struct PerfTimerSample {
   uint32_t samples = 0u;
 };
 struct PerfExtraGpu {
-  PerfTimerSample rtao, rtao_filter, deform_refit;
+  PerfTimerSample rtao, rtao_filter, rtgi, deform_refit;
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -446,6 +450,7 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfPoolHooks] = PerfMsOf(g_pool.cpu_hook_frame_us);
   c.cost[kPerfDeformHookCpu] = PerfMsOf(g_deform_live.cpu_frame_us);
   c.cost[kPerfRtaoRecordCpu] = PerfMsOf(g_perf_gate.rtao_record_us);
+  c.cost[kPerfRtgiRecordCpu] = PerfMsOf(g_perf_gate.rtgi_record_us);
   c.cost[kPerfPresentWorldCpu] = PerfMsOf(g_perf_gate.present_world_us);
   c.cost[kPerfPresentBvhCpu] = PerfMsOf(g_perf_gate.present_bvh_us);
   c.cost[kPerfGpuTrace] = data->trace_timer.ms_sum;
@@ -460,6 +465,8 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtao] = extra.rtao.samples;
   c.cost[kPerfGpuRtaoFilter] = extra.rtao_filter.ms_sum;
   c.events[kPerfGpuRtaoFilter] = extra.rtao_filter.samples;
+  c.cost[kPerfGpuRtgi] = extra.rtgi.ms_sum;
+  c.events[kPerfGpuRtgi] = extra.rtgi.samples;
   for (size_t p = 0; p < 5u; ++p) c.cost[kPerfRebuildPhase0 + p] = timing.rebuild_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfRefitPhase0 + p] = timing.refit_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfSlackPhase0 + p] = live.slack_phase_ms_sum[p];
@@ -758,7 +765,8 @@ inline std::filesystem::path WritePerfFile(const PerfRunState& run) {
 }
 
 // Gathering was switched OFF: clears what it gathered (CPU sums, maxima, last values, phase sums, GPU timer statistics,
-// cache-diag timings) and the tab window. The RTAO timers are cleared by rtao::ClearRtaoPerfGathered. Runs on the present
+// cache-diag timings) and the tab window. The RTAO and RTGI timers are cleared by rtao::ClearRtaoPerfGathered and
+// rtgi::ClearRtgiPerfGathered. Runs on the present
 // thread, one lock at a time; no graphics call is made under a lock.
 inline void ClearPerfGathered(BvhDeviceData* data) {
   g_pool.cpu_hook_us.store(0u);
@@ -771,6 +779,7 @@ inline void ClearPerfGathered(BvhDeviceData* data) {
   g_perf_gate.present_bvh_us.store(0u);
   g_perf_gate.alpha_sync_us.store(0u);
   g_perf_gate.rtao_record_us.store(0u);
+  g_perf_gate.rtgi_record_us.store(0u);
   g_perf_gate.deform_update_us.store(0u);
   for (std::atomic_uint64_t& us : g_perf_gate.block_us) us.store(0u);
   g_deform_live.cpu_us.store(0u);

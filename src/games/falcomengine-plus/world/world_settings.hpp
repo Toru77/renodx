@@ -16,6 +16,8 @@
 #include "bvh/world_bvh.hpp"
 #include "rtao/rtao.hpp"
 #include "rtao/rtao_panel.hpp"
+#include "rtgi/rtgi.hpp"
+#include "rtgi/rtgi_panel.hpp"
 #include "capture/draw_census.hpp"
 
 namespace falcom_world {
@@ -700,6 +702,104 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "Fade End",
       .section = "Distance Fade",
       .tooltip = "Where RTAO is fully faded out, as a percent of the BVH range (Region). Capped by the built BVH range at use; the panel shows the effective metres.",
+      .min = 0.f,
+      .max = 100.f,
+      .format = "%.1f%%",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiEnabled",
+      .binding = &rtgi::g_rtgi_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "RTGI",
+      .section = "RTGI",
+      .tooltip = "Ray-traced diffuse bounce light (one bounce) from the live BVH. Needs RTAO on (greyed while RTAO is off) and does not change how RTAO looks. This build only traces for diagnostics: the image does not change unless RTGI Debug is set.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return rtao::RtaoRequested(); },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "RTGI status",
+      .section = "RTGI",
+      .on_draw = []() {
+        rtgi::DrawRtgiPanel();
+        return false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiDebug",
+      .binding = &rtgi::g_rtgi_debug,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "RTGI Debug",
+      .section = "RTGI",
+      .tooltip = "Shown over the whole image at present while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End).",
+      .labels = {"Off", "Hit classes", "Hit distance"},
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiSamples",
+      .binding = &rtgi::g_rtgi_samples,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Samples Per Pixel",
+      .section = "RTGI",
+      .tooltip = "Cosine-hemisphere GI rays per traced pixel per frame.",
+      .min = 1.f,
+      .max = 4.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiRayMax",
+      .binding = &rtgi::g_rtgi_ray_max,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 16.f,
+      .label = "Max Ray Distance",
+      .section = "RTGI",
+      .tooltip = "GI ray length in metres. Capped at use so no traced pixel reaches the BVH region edge: effective = min(this, BVH range + 10 m - effective Fade End). The panel shows both.",
+      .min = 1.f,
+      .max = 64.f,
+      .format = "%.1f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiTraceResolution",
+      .binding = &rtgi::g_rtgi_trace_resolution,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Trace Resolution",
+      .section = "RTGI",
+      .tooltip = "Resolution of the GI trace: Full = one trace pixel per pixel, Half = one per 2 x 2 block, Quarter = one per 4 x 4 block.",
+      .labels = {"Full", "Half", "Quarter"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiFadeStartPct",
+      .binding = &rtgi::g_rtgi_fade_start_pct,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 15.625f,
+      .label = "Fade Start",
+      .section = "RTGI Distance Fade",
+      .tooltip = "Where RTGI starts fading out, as a percent of the BVH range (Region). Capped by the built BVH range at use; the panel shows the effective metres.",
+      .min = 0.f,
+      .max = 100.f,
+      .format = "%.1f%%",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiFadeEndPct",
+      .binding = &rtgi::g_rtgi_fade_end_pct,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 31.25f,
+      .label = "Fade End",
+      .section = "RTGI Distance Fade",
+      .tooltip = "Where RTGI is fully faded out (no GI rays beyond it), as a percent of the BVH range (Region). Capped by the built BVH range at use; the panel shows the effective metres.",
       .min = 0.f,
       .max = 100.f,
       .format = "%.1f%%",

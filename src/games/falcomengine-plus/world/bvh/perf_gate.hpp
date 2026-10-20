@@ -49,6 +49,7 @@ struct PerfGate {
   std::atomic_uint64_t present_bvh_us{0u};    // cumulative CPU time of OnWorldPresentBvh (bracket)
   std::atomic_uint64_t alpha_sync_us{0u};     // SyncLiveAlpha CPU time of the last present
   std::atomic_uint64_t rtao_record_us{0u};    // rtao::Dispatch CPU time (command recording)
+  std::atomic_uint64_t rtgi_record_us{0u};    // rtgi::Dispatch CPU time (command recording)
   std::atomic_uint64_t deform_update_us{0u};  // UpdateDeformLive CPU time of the last present
   std::atomic_uint64_t block_us[kPerfBlockCount]{};  // CPU time of each PerfBlock (cumulative; written by PoolCpuTimer or AddPerfBlockMs)
 };

@@ -9258,6 +9258,89 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
 }
 
+// RTGI (world/rtgi, ROADMAP "RTGI"). Runs only on a lighting draw where RTAO dispatched this frame on the immediate
+// list, so RTAO's guards (live BVH, depth, normals, scene CBV, startup and resize guard) hold for it too.
+// Kept as a function: its guard returns must end only the RTGI stage, not the lighting hook.
+static void RunRtgiInline(reshade::api::command_list* cmd_list) {
+  namespace rtao = falcom_world::rtao;
+  namespace rtgi = falcom_world::rtgi;
+  auto& frame = rtgi::g_rtgi_frame;
+  frame.producing = false;
+  frame.reason = rtgi::Reason::Off;
+  if (rtgi::g_rtgi_enabled < 0.5f) return;
+  if (!rtao::RtaoRequested()) {
+    frame.reason = rtgi::Reason::RtaoOff;
+    return;
+  }
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  const auto* bvh_data = dev ? falcom_world::bvh::GetBvhDeviceData(dev) : nullptr;
+  if (dd == nullptr || bvh_data == nullptr || cmd_list != dd->immediate_cmd_list
+      || rtao::g_rtao_frame.dispatched_frame != dd->frame_index) {
+    frame.reason = rtgi::Reason::RtaoNotProducing;
+    return;
+  }
+  if (frame.dispatched_frame == dd->frame_index) {
+    frame.producing = true;
+    return;
+  }
+  const rtao::Fade fade = rtao::RtaoEffectiveFade(bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size,
+                                                  rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct);
+  const float ray_max = rtgi::RtgiEffectiveRayMax(rtgi::g_rtgi_ray_max, fade.coverage, fade.end,
+                                                  falcom_world::bvh::kPoolRegionRayMargin);
+  const uint32_t divisor = rtgi::RtgiTraceDivisor(rtgi::g_rtgi_trace_resolution);
+  const float spp = (std::max)(rtgi::g_rtgi_samples, 1.f);
+  // RTAO loaded the IS-FAST texture this frame when its own row is on; RTGI follows RTAO's IS-FAST row.
+  const bool isfast_used = rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
+  const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
+  const rtgi::RtgiDispatchInputs in = {
+      .depth_view = dd->captured_depth_srv,
+      .mrt_normal_view = dd->captured_mrt_normal_srv,
+      .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
+      .scene_cbv_view = dd->captured_scene_cbv_view,
+      .full_width = dd->captured_depth_w,
+      .full_height = dd->captured_depth_h,
+      .trace_width = rtgi::RtgiTraceExtent(dd->captured_depth_w, divisor),
+      .trace_height = rtgi::RtgiTraceExtent(dd->captured_depth_h, divisor),
+      .push = {
+          .params = {ray_max, rtao::g_rtao_normal_bias, spp, static_cast<float>(divisor)},
+          .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtgi::g_rtgi_debug},
+          .fade = {fade.start, fade.end, 0.f, 0.f},
+          .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
+                     bvh_data->tlas_region_size},
+      },
+      .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
+  };
+  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+  renodx::utils::state::CommandListState prev = {};
+  if (cs != nullptr) {
+    prev = *cs;
+  }
+  const rtgi::RtgiDispatchResult result = rtgi::Dispatch(dev, cmd_list, in);
+  ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
+  if (!result.ok) {
+    frame.reason = rtgi::Reason::PipelineFailed;
+    return;
+  }
+  const auto& rd = rtgi::GetRtgiDeviceData(dev);
+  frame.producing = true;
+  frame.debug_written = result.debug_written;
+  frame.dispatched_frame = dd->frame_index;
+  frame.gpu_ms = rd.timer.last_ms;
+  frame.divisor = divisor;
+  frame.trace_width = in.trace_width;
+  frame.trace_height = in.trace_height;
+  frame.full_width = in.full_width;
+  frame.full_height = in.full_height;
+  frame.ray_max_requested = rtgi::g_rtgi_ray_max;
+  frame.ray_max_effective = ray_max;
+  frame.fade_valid = true;
+  frame.fade = fade;
+  frame.samples = spp;
+  frame.isfast_used = isfast_used;
+  frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount + static_cast<uint64_t>(rd.debug_width) * rd.debug_height * 4u;
+}
+
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // IMPORTANT: returning false would BYPASS the draw (skip it entirely).
   shader_injection.gtvbao_dedicated_bound = 0.f;
@@ -9295,6 +9378,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // RTAO runs before the shadows so micro shadows read this frame's AO.
   RunRtaoInline(cmd_list);
+
+  // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
+  RunRtgiInline(cmd_list);
 
   // Contact / Micro Shadows. Placed here, before the GTVBAO/DynCube early-out
   // below, because those two are entirely independent of the shadow passes: on a

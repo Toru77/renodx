@@ -18,6 +18,7 @@
 #include "../../../../utils/data.hpp"
 #include "../../../../utils/render.hpp"
 #include "../rtao/rtao.hpp"
+#include "../rtgi/rtgi.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
 #include "deform_probe.hpp"
@@ -124,6 +125,34 @@ inline BvhTraceDepthInput GetBvhTraceDepthInput(BvhView view) {
   return input;
 }
 
+// Draws srv over the whole backbuffer (point sampling, stretched) with the per-device debug blit pass.
+inline void BlitDebugTextureToBackbuffer(reshade::api::device* device, reshade::api::command_queue* queue,
+                                         reshade::api::command_list* cmd_list, reshade::api::resource backbuffer,
+                                         reshade::api::format backbuffer_format, reshade::api::resource_view srv) {
+  BvhDebugBlit* blit = nullptr;
+  renodx::utils::data::CreateOrGet<BvhDebugBlit>(device, blit);
+  if (blit->format != backbuffer_format) {
+    blit->pass.DestroyAll(device);
+    blit->pass = {};
+    blit->format = backbuffer_format;
+  }
+  auto& pass = blit->pass;
+  // The swap chain rotates its buffers and RenderPass keeps the first views it generates: rebuild the RTV every present.
+  pass.InvalidateRenderTargets(cmd_list);
+  pass.pipeline_subobjects.vertex_shader = __world_bvh_blit_vs;
+  pass.pipeline_subobjects.pixel_shader = __world_bvh_blit_ps;
+  pass.pipeline_subobjects.compute_shader = {};
+  pass.render_target_slots.resources = {backbuffer};
+  pass.shader_resource_slots.views = {srv};
+  reshade::api::sampler_desc sampler = {};
+  sampler.filter = reshade::api::filter_mode::min_mag_mip_point;
+  sampler.address_u = reshade::api::texture_address_mode::clamp;
+  sampler.address_v = reshade::api::texture_address_mode::clamp;
+  sampler.address_w = reshade::api::texture_address_mode::clamp;
+  pass.sampler_descs = {sampler};
+  pass.Render(cmd_list, queue);
+}
+
 inline void RunBvhDebugPass(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain) {
@@ -190,28 +219,7 @@ inline void RunBvhDebugPass(
                                        .candidates = data->inspect.candidates};
   }
 
-  BvhDebugBlit* blit = nullptr;
-  renodx::utils::data::CreateOrGet<BvhDebugBlit>(device, blit);
-  if (blit->format != backbuffer_desc.texture.format) {
-    blit->pass.DestroyAll(device);
-    blit->pass = {};
-    blit->format = backbuffer_desc.texture.format;
-  }
-  auto& pass = blit->pass;
-  // The swap chain rotates its buffers and RenderPass keeps the first views it generates: rebuild the RTV every present.
-  pass.InvalidateRenderTargets(cmd_list);
-  pass.pipeline_subobjects.vertex_shader = __world_bvh_blit_vs;
-  pass.pipeline_subobjects.pixel_shader = __world_bvh_blit_ps;
-  pass.pipeline_subobjects.compute_shader = {};
-  pass.render_target_slots.resources = {backbuffer};
-  pass.shader_resource_slots.views = {data->debug_srv};
-  reshade::api::sampler_desc sampler = {};
-  sampler.filter = reshade::api::filter_mode::min_mag_mip_point;
-  sampler.address_u = reshade::api::texture_address_mode::clamp;
-  sampler.address_v = reshade::api::texture_address_mode::clamp;
-  sampler.address_w = reshade::api::texture_address_mode::clamp;
-  pass.sampler_descs = {sampler};
-  pass.Render(cmd_list, queue);
+  BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, data->debug_srv);
 }
 
 // Draw observation (pool scan, live camera for the debug views) runs while
@@ -251,6 +259,7 @@ inline void OnWorldPresentBvh(
   if (g_perf_gate.clear_pending.exchange(false)) {
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
+    rtgi::ClearRtgiPerfGathered(device);
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
@@ -268,6 +277,10 @@ inline void OnWorldPresentBvh(
       extra.rtao_filter = {rtao_data.filter_timer.ms_sum, rtao_data.filter_timer.samples};
     }
     {
+      const rtgi::RtgiDeviceData& rtgi_data = rtgi::GetRtgiDeviceData(device);
+      extra.rtgi = {rtgi_data.timer.ms_sum, rtgi_data.timer.samples};
+    }
+    {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);
       extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
     }
@@ -277,7 +290,23 @@ inline void OnWorldPresentBvh(
   UpdateCacheDiag(device, present_time);
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
+  rtgi::MaybeCaptureRtgiStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
+  // RTGI Debug 1 to 6: the RTGI debug texture over the whole backbuffer, when the pass that owns the view wrote it this
+  // frame. Skipped while a BVH GPU debug mode is selected (that view owns the backbuffer). Last in this handler: the
+  // returns below end only the RTGI blit.
+  if (rtgi::g_rtgi_debug < 0.5f || rtgi::g_rtgi_debug > 6.5f) return;
+  if (!rtgi::g_rtgi_frame.producing || !rtgi::g_rtgi_frame.debug_written) return;
+  if (g_bvh_debug.mode.load(std::memory_order_relaxed) != 0) return;
+  const auto found = rtgi::g_rtgi_devices.find(device);
+  if (found == rtgi::g_rtgi_devices.end() || found->second.debug_srv.handle == 0u) return;
+  const auto backbuffer = swapchain->get_current_back_buffer();
+  if (backbuffer.handle == 0u) return;
+  const auto backbuffer_desc = device->get_resource_desc(backbuffer);
+  if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
+  auto* cmd_list = queue->get_immediate_command_list();
+  if (cmd_list == nullptr) return;
+  BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, found->second.debug_srv);
 }
 
 }  // namespace falcom_world::bvh
