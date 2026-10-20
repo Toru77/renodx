@@ -17,7 +17,8 @@ namespace falcom_world::rtgi {
 
 // t0..t8 BVH, t9 game depth, t10..t13 deforming (null: not traced), t14..t16 alpha, t17 MRT normal, t18 IS-FAST noise,
 // t19 P2b records (the RTAO pass A table), t20 radiance: the previous frame's lighting output, t21 the previous final
-// GI and t22 the G-buffer colour (the one-bounce correction; null unless kRtgiFlagSubtractPrevious).
+// GI (null unless kRtgiFlagSubtractPrevious) and t22 the G-buffer colour (bound whenever it was captured this frame,
+// read only under kRtgiFlagSubtractPrevious): the one-bounce correction.
 inline constexpr uint32_t kRtgiSrvCount = 23u;
 inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 6), u1 stats, u2 raw GI
 inline constexpr uint32_t kRtgiPushConstantCount = 24u;

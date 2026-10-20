@@ -209,7 +209,7 @@ static void TestComposite() {
   for (const char* field : {"float rtgi_gi_bound;", "float rtgi_intensity;", "float rtgi_char_intensity;", "float rtgi_reserved;"}) {
     CHECK(header.find(field) != std::string::npos && header.find(field) == header.rfind(field), "shared.h declares %s once", field);
   }
-  for (const char* old_name : {"dynCube_reserved_3", "dynCube_reserved_4", "dynCube_reserved_5", "char_shadow_light_screen_fade_end", "rtgi_debug_show"}) {
+  for (const char* old_name : {"dynCube_reserved_3", "dynCube_reserved_4", "dynCube_reserved_5", "char_shadow_light_screen_fade_end", "float rtgi_debug_show"}) {
     CHECK(header.find(old_name) == std::string::npos, "shared.h no longer has %s", old_name);
   }
   const std::string lighting = ReadText(variants[0].path);

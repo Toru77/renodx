@@ -98,6 +98,7 @@ void main(uint3 id : SV_DispatchThreadID)
         const float3 applied = gi
             * g_albedo.Load(int3(min(uint2((float2(px) + 0.5) / float2(full_size) * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
             * u_params.z * ((flags & 8u) == 0u && (flags & 1u) != 0u ? saturate(u_params.w) : 1.0);
-        g_rtgi_debug[px] = float4(surface ? applied / (1.0 + applied) : float3(0.25, 0.0, 0.25), 1.0);
+        // No surface, or no colour captured this frame (t3 null, width 0): dark purple, as in the other debug views.
+        g_rtgi_debug[px] = float4(surface && aw > 0u ? applied / (1.0 + applied) : float3(0.25, 0.0, 0.25), 1.0);
     }
 }
