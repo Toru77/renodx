@@ -529,10 +529,15 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTAO",
       .section = "RTAO",
-      .tooltip = "Ray-traced ambient occlusion from the live BVH. Overrides GTVBAO and VBGI while on. Turning it on enables Live BVH and Deforming meshes.",
+      .tooltip = "Ray-traced ambient occlusion from the live BVH. Overrides GTVBAO and VBGI while on. Turning it on enables Live BVH and Deforming meshes. Turning it off also turns RTGI off.",
       .labels = {"Off", "On"},
-      .on_change = []() {
-        if (rtao::RtaoRequested()) bvh::RtaoEnableBvhInputs();
+      // on_change_value runs after the new value is written (on_change runs before it, with the old value).
+      .on_change_value = [](float, float current) {
+        if (current > 0.5f) {
+          bvh::RtaoEnableBvhInputs();
+        } else if (rtgi::g_rtgi_enabled > 0.5f) {
+          renodx::utils::settings::UpdateSetting("RtgiEnabled", 0.f);
+        }
       },
       .is_visible = visible,
   });
@@ -661,9 +666,9 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .binding = &rtao::g_rtao_normal_bias,
       .value_type = SettingValueType::FLOAT,
       .default_value = 0.0040f,
-      .label = "Normal Bias",
+      .label = "Normal Bias (RTAO and RTGI)",
       .section = "RTAO",
-      .tooltip = "Ray origin offset along the surface normal, in metres.",
+      .tooltip = "Ray origin offset along the surface normal, in metres. Used by RTAO and RTGI.",
       .min = 0.f,
       .max = 0.5f,
       .format = "%.4f",
@@ -792,10 +797,30 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTGI",
       .section = "RTGI",
-      .tooltip = "Ray-traced diffuse bounce light (one bounce) from the live BVH. Needs RTAO on (greyed while RTAO is off) and does not change how RTAO looks. On Sora 2nd the bounce (final GI x the surface colour x GI Intensity) is added after the shadow terms, so RTAO and the shadow terms never darken it; fog does not apply to it.",
+      .tooltip = "Ray-traced diffuse bounce light (one bounce) from the live BVH. Needs RTAO: turning RTGI on also turns RTAO on, and turning it off puts RTAO back to what it was before. Where the bounce is added, RTAO Max Darkening is 1.8x (at most 1); RTAO is otherwise unchanged. On Sora 2nd the bounce (final GI x the surface colour x GI Intensity) is added after the shadow terms, so RTAO and the shadow terms never darken it; fog does not apply to it.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return rtao::RtaoRequested(); },
+      .on_change_value = [](float, float current) {
+        if (current > 0.5f) {
+          renodx::utils::settings::UpdateSetting("RtgiRtaoRestore", rtao::g_rtao_enabled);
+          if (!rtao::RtaoRequested()) {
+            renodx::utils::settings::UpdateSetting("RtaoEnabled", 1.f);
+            bvh::RtaoEnableBvhInputs();  // UpdateSetting runs no callbacks, so RTAO's own call does not happen
+          }
+        } else {
+          renodx::utils::settings::UpdateSetting("RtaoEnabled", rtgi::g_rtgi_rtao_restore);
+        }
+      },
       .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiRtaoRestore",
+      .binding = &rtgi::g_rtgi_rtao_restore,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .can_reset = false,
+      .label = "RTGI: RTAO value to restore",
+      .section = "RTGI",
+      .is_visible = []() { return false; },
   });
   settings->push_back(new Setting{
       .key = "RtgiStatus",

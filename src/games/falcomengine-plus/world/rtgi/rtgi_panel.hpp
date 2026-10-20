@@ -22,6 +22,10 @@ inline void DrawRtgiPanel() {
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTGI: requested, not running (%s)", ReasonName(frame.reason));
   }
+  if (g_rtgi_enabled > 0.5f && rtao::RtaoRequested()) {
+    ImGui::Text(g_rtgi_rtao_restore > 0.5f ? "RTAO: on (was already on; stays on when RTGI is turned off)"
+                                           : "RTAO: on (turned on by RTGI; back to Off when RTGI is turned off)");
+  }
   if (frame.trace_width != 0u) {
     ImGui::Text("Trace: %u x %u (one per %u x %u block of %u x %u)", frame.trace_width, frame.trace_height,
                 frame.divisor, frame.divisor, frame.full_width, frame.full_height);
@@ -33,6 +37,8 @@ inline void DrawRtgiPanel() {
                   ? (frame.applied_debug ? "shown alone (RTGI Debug 7)" : "added this frame")
                   : "not added (GI Intensity 0, not Sora 2nd, or not running)",
               frame.subtracted ? "on" : "off");
+  ImGui::Text("RTAO Max Darkening x1.8 = %.2f on bounce draws (RTAO alone %.2f)",
+              RtgiRtaoMaxDarkening(rtao::g_rtao_max_darkening), rtao::g_rtao_max_darkening);
   ImGui::Text("Max Ray Distance: requested %.1f m, effective %.1f m", frame.ray_max_requested, frame.ray_max_effective);
   if (frame.fade_valid) {
     ImGui::Text("Fade: effective start %.0f m, end %.0f m (requested %.0f / %.0f m, BVH range %.0f m; stored %.1f%% / %.1f%%)",

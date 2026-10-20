@@ -9317,6 +9317,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     shader_injection.rtgi_intensity = rtgi::g_rtgi_intensity;
     shader_injection.rtgi_char_intensity = rtgi::g_rtgi_char_intensity;
     shader_injection.rtgi_debug_show = rtgi::g_rtgi_debug > 6.5f ? 1.f : 0.f;
+    // PushRtaoAo wrote RTAO's own value for this draw; the bounce draw gets 1.8x (at most 1).
+    shader_injection.rtao_max_darkening = rtgi::RtgiRtaoMaxDarkening(rtao::g_rtao_max_darkening);
     frame.applied_frame = dd->frame_index;
     frame.applied_intensity = rtgi::g_rtgi_intensity;
     frame.applied_debug = rtgi::g_rtgi_debug > 6.5f;

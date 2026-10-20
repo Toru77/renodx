@@ -76,6 +76,13 @@ static void TestEffectiveRayMax() {
   CHECK(rtgi::RtgiEffectiveRayMax(5.f, 100.f, 100.f, 10.f) == 5.f, "short request below the cap");
 }
 
+static void TestRtaoMaxDarkening() {
+  CHECK(rtgi::RtgiRtaoMaxDarkening(0.5f) == 0.9f, "default 0.5 becomes 0.9 on bounce draws");
+  CHECK(rtgi::RtgiRtaoMaxDarkening(0.f) == 0.f, "0 stays 0");
+  CHECK(rtgi::RtgiRtaoMaxDarkening(0.6f) == 1.f, "1.08 is capped at 1");
+  CHECK(rtgi::RtgiRtaoMaxDarkening(1.f) == 1.f, "1 stays 1");
+}
+
 static void TestPushLayout() {
   CHECK(sizeof(rtgi::RtgiPushConstants) == 24u * sizeof(float), "b12 is 24 floats");
   CHECK(offsetof(rtgi::RtgiPushConstants, shading) == 20u * sizeof(float), "b12 c5 offset");
@@ -246,6 +253,8 @@ int main() {
   TestTraceExtent();
   HStage("effective ray max");
   TestEffectiveRayMax();
+  HStage("RTAO max darkening on bounce draws");
+  TestRtaoMaxDarkening();
   HStage("push layout");
   TestPushLayout();
   HStage("parameter snapshot");

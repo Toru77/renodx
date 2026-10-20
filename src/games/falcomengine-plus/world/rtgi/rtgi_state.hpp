@@ -33,6 +33,7 @@ inline float g_rtgi_filter_taps_separable = 5.f;  // Filter Taps (separable): 3.
 inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
 inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
 inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
+inline float g_rtgi_rtao_restore = 0.f;           // RTAO value to put back when RTGI is turned off (hidden row RtgiRtaoRestore)
 
 enum class Reason : uint8_t {
   Off = 0,
@@ -89,6 +90,12 @@ inline uint32_t RtgiTraceExtent(uint32_t full, uint32_t divisor) { return (full 
 // nearest face: rays of at most that length never reach the shader's region guard.
 inline float RtgiEffectiveRayMax(float requested, float built_range, float fade_end_eff, float margin) {
   return std::min(requested, built_range + margin - fade_end_eff);
+}
+
+// RTAO Max Darkening on lighting draws that get the RTGI bounce (addon.cpp push_gi): 1.8x, at most 1. RTAO alone keeps
+// its own value.
+inline float RtgiRtaoMaxDarkening(float rtao_max_darkening) {
+  return std::min(1.f, 1.8f * rtao_max_darkening);
 }
 
 // RTGI settings that shape the GI; a change resets the RTGI history for one frame. Never part of RTAO's snapshot.
