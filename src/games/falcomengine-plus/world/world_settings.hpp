@@ -714,7 +714,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTGI",
       .section = "RTGI",
-      .tooltip = "Ray-traced diffuse bounce light (one bounce) from the live BVH. Needs RTAO on (greyed while RTAO is off) and does not change how RTAO looks. This build only traces for diagnostics: the image does not change unless RTGI Debug is set.",
+      .tooltip = "Ray-traced diffuse bounce light (one bounce) from the live BVH. Needs RTAO on (greyed while RTAO is off) and does not change how RTAO looks. This build computes the GI for diagnostics only: the image does not change unless RTGI Debug is set.",
       .labels = {"Off", "On"},
       .is_enabled = []() { return rtao::RtaoRequested(); },
       .is_visible = visible,
@@ -738,8 +738,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTGI Debug",
       .section = "RTGI",
-      .tooltip = "Shown over the whole image at present while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End).",
-      .labels = {"Off", "Hit classes", "Hit distance"},
+      .tooltip = "Shown over the whole image at present while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End). 3 raw GI: this frame's traced bounce radiance before any denoising, shown as rgb / (1 + rgb).",
+      .labels = {"Off", "Hit classes", "Hit distance", "Raw GI"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -777,6 +777,32 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RTGI",
       .tooltip = "Resolution of the GI trace: Full = one trace pixel per pixel, Half = one per 2 x 2 block, Quarter = one per 4 x 4 block.",
       .labels = {"Full", "Half", "Quarter"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiRadianceClamp",
+      .binding = &rtgi::g_rtgi_radiance_clamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.f,
+      .label = "Radiance Clamp",
+      .section = "RTGI",
+      .tooltip = "Caps the brightness (luminance) of each GI sample before it is averaged; the colour is kept. 0 = off. Removes bright speckles from small light sources.",
+      .min = 0.f,
+      .max = 64.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiAmbientContribution",
+      .binding = &rtgi::g_rtgi_ambient,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Ambient Contribution",
+      .section = "RTGI",
+      .tooltip = "Weight of the game's probe ambient when a GI ray hits a surface that is not visible on screen (that surface is shaded with the sun, a sun shadow ray and the probe ambient). 0 = sun only. It never adds light where a ray misses.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
       .is_visible = visible,
   });
   settings->push_back(new Setting{

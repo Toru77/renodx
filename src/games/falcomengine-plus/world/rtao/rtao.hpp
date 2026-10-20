@@ -103,15 +103,18 @@ struct RtaoDispatchResult {
   bool temporal_ran = false; // pass B ran; history was swapped
 };
 
+// Null-array sizes: the largest compute tables that use this function (RTAO 20 SRVs and 3 UAVs, RTGI up to 23 and 4).
+inline constexpr uint32_t kNullComputeSrvMax = 24u;
+inline constexpr uint32_t kNullComputeUavMax = 8u;
 // NullComputeSlots: nulls the compute slots on the context with push_descriptors (pipeline_layout{0}),
 // which binds directly at the register (table updates do not change the context).
 inline void NullComputeSlots(reshade::api::command_list* cmd_list, uint32_t srv_count, uint32_t uav_count, uint32_t sampler_count) {
-  const reshade::api::resource_view null_srvs[kRtaoSrvCount] = {};
+  const reshade::api::resource_view null_srvs[kNullComputeSrvMax] = {};
   cmd_list->push_descriptors(
       reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{
           {}, 0, 0, srv_count, reshade::api::descriptor_type::texture_shader_resource_view, null_srvs});
-  const reshade::api::resource_view null_uavs[kRtaoUavCount] = {};
+  const reshade::api::resource_view null_uavs[kNullComputeUavMax] = {};
   cmd_list->push_descriptors(
       reshade::api::shader_stage::all_compute, reshade::api::pipeline_layout{0}, 0,
       reshade::api::descriptor_table_update{

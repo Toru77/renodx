@@ -299,14 +299,14 @@ inline void OnWorldPresentBvh(
   if (!rtgi::g_rtgi_frame.producing || !rtgi::g_rtgi_frame.debug_written) return;
   if (g_bvh_debug.mode.load(std::memory_order_relaxed) != 0) return;
   const auto found = rtgi::g_rtgi_devices.find(device);
-  if (found == rtgi::g_rtgi_devices.end() || found->second.debug_srv.handle == 0u) return;
+  if (found == rtgi::g_rtgi_devices.end() || found->second.debug.srv[0].handle == 0u) return;
   const auto backbuffer = swapchain->get_current_back_buffer();
   if (backbuffer.handle == 0u) return;
   const auto backbuffer_desc = device->get_resource_desc(backbuffer);
   if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
   auto* cmd_list = queue->get_immediate_command_list();
   if (cmd_list == nullptr) return;
-  BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, found->second.debug_srv);
+  BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, found->second.debug.srv[0]);
 }
 
 }  // namespace falcom_world::bvh

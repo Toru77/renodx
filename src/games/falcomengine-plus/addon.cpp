@@ -1508,6 +1508,8 @@ static bool RunDynCubeSSR(reshade::api::command_list* cl, DeviceData* d);
 
 // VBGI is now integrated into GTVBAO main pass � no separate RunVBGI needed.
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list);
+// Defined with RunRtgiInline below; the CustomShader table needs it first.
+static void OnDrawnLightingShader(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR1Draw(reshade::api::command_list* cmd_list);
 static bool OnReplaceSoraSSR1Draw(reshade::api::command_list* cmd_list);
 static bool OnBeforeSoraSSR2Draw(reshade::api::command_list* cmd_list);
@@ -2066,6 +2068,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
             .crc32 = 0xCA3D8596u,
             .code = __0xCA3D8596,
             .on_draw = OnBeforeLightingShaderDraw,
+            .on_drawn = OnDrawnLightingShader,
         },
     },
     // -- Sora 2nd SSR (replacement-gated; vanilla when the toggle is off) --
@@ -9293,11 +9296,15 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   // RTAO loaded the IS-FAST texture this frame when its own row is on; RTGI follows RTAO's IS-FAST row.
   const bool isfast_used = rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
+  auto& rd = rtgi::GetRtgiDeviceData(dev);
+  // The copy holds the previous frame's lighting output only when that frame produced it on this list.
+  const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX && rd.radiance_frame + 1u == dd->frame_index;
   const rtgi::RtgiDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
       .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
       .scene_cbv_view = dd->captured_scene_cbv_view,
+      .radiance_view = radiance_valid ? rd.radiance_srv : reshade::api::resource_view{0u},
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
       .trace_width = rtgi::RtgiTraceExtent(dd->captured_depth_w, divisor),
@@ -9305,9 +9312,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .push = {
           .params = {ray_max, rtao::g_rtao_normal_bias, spp, static_cast<float>(divisor)},
           .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtgi::g_rtgi_debug},
-          .fade = {fade.start, fade.end, 0.f, 0.f},
+          .fade = {fade.start, fade.end, static_cast<float>(radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u), 0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
+          .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, 0.f, 0.f},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
   };
@@ -9322,7 +9330,6 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtgi::Reason::PipelineFailed;
     return;
   }
-  const auto& rd = rtgi::GetRtgiDeviceData(dev);
   frame.producing = true;
   frame.debug_written = result.debug_written;
   frame.dispatched_frame = dd->frame_index;
@@ -9338,7 +9345,28 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.fade = fade;
   frame.samples = spp;
   frame.isfast_used = isfast_used;
-  frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount + static_cast<uint64_t>(rd.debug_width) * rd.debug_height * 4u;
+  frame.radiance_valid = radiance_valid;
+  frame.radiance_width = rd.radiance_width;
+  frame.radiance_height = rd.radiance_height;
+  frame.radiance_format = static_cast<uint32_t>(rd.radiance_format);
+  frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
+      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
+      + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
+      + (rd.radiance_texture.handle != 0u
+             ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
+             : 0u);
+}
+
+// RTGI: copies the lighting output after the draw; the next frame's RTGI trace reads it for on-screen hits.
+static void OnDrawnLightingShader(reshade::api::command_list* cmd_list) {
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  if (dd == nullptr || cmd_list != dd->immediate_cmd_list) return;
+  const auto& frame = falcom_world::rtgi::g_rtgi_frame;
+  if (!frame.producing || frame.dispatched_frame != dd->frame_index) return;
+  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+  if (cs == nullptr || cs->render_targets.empty() || cs->render_targets[0].handle == 0u) return;
+  falcom_world::rtgi::CaptureRtgiRadiance(dev, cmd_list, cs->render_targets[0], dd->frame_index);
 }
 
 static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {

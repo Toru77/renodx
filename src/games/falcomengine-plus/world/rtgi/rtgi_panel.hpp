@@ -4,6 +4,7 @@
 // Timings are on the Performance tab only.
 
 #include <cstdint>
+#include <cstring>
 
 #include <deps/imgui/imgui.h>
 
@@ -17,7 +18,7 @@ inline void DrawRtgiPanel() {
   if (g_rtgi_enabled < 0.5f) {
     ImGui::TextDisabled("RTGI: off");
   } else if (frame.producing) {
-    ImGui::Text("RTGI: active (diagnostic trace this frame; the image is unchanged)");
+    ImGui::Text("RTGI: active (raw GI traced this frame; the image is unchanged)");
   } else {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTGI: requested, not running (%s)", ReasonName(frame.reason));
   }
@@ -34,6 +35,9 @@ inline void DrawRtgiPanel() {
     ImGui::TextDisabled("Fade: no built BVH region yet");
   }
   ImGui::Text("Texture: %.2f MB", static_cast<double>(frame.texture_bytes) / (1024.0 * 1024.0));
+  ImGui::Text("Radiance source: %s, %u x %u, format %u",
+              frame.radiance_valid ? "previous frame's lighting output" : "not available (hidden and off-screen shading only)",
+              frame.radiance_width, frame.radiance_height, frame.radiance_format);
   if (ImGui::Button("Read RTGI Stats")) {
     g_rtgi_stats.requested.store(true, std::memory_order_relaxed);
   }
@@ -50,6 +54,12 @@ inline void DrawRtgiPanel() {
     ImGui::Text("Not traced: sky %u, normal %u, scaled %u, region %u, beyond Fade End %u (of %u trace pixels)",
                 v[kRtgiStatSky], v[kRtgiStatNormal], v[kRtgiStatScaled], v[kRtgiStatRegion], v[kRtgiStatBeyondFade],
                 v[kRtgiStatPixels]);
+    float luminance_max = 0.f;
+    std::memcpy(&luminance_max, &v[kRtgiStatLuminanceMax], sizeof(luminance_max));
+    const float mean_luminance = hits > 0u ? static_cast<float>(v[kRtgiStatLuminanceSum]) / 100.f / static_cast<float>(hits) : 0.f;
+    ImGui::Text("Radiance: on-screen lookups %u, sun rays %u (visible %.1f%%), mean sample luminance %.3f, max %.3f, clamped %.1f%%",
+                v[kRtgiStatRadianceLookups], v[kRtgiStatSunRays], rtao::SharePercent(v[kRtgiStatSunVisible], v[kRtgiStatSunRays]),
+                mean_luminance, luminance_max, rtao::SharePercent(v[kRtgiStatClamped], hits));
   }
 }
 

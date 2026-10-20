@@ -86,11 +86,18 @@ static void TestShaderDefines() {
       {"HIT_OCCLUDED", rtgi::kRtgiStatHitOccluded},
       {"HIT_OFF_SCREEN", rtgi::kRtgiStatHitOffScreen},
       {"HIT_DISTANCE_DM", rtgi::kRtgiStatHitDistanceDm},
+      {"RADIANCE_LOOKUPS", rtgi::kRtgiStatRadianceLookups},
+      {"SUN_RAYS", rtgi::kRtgiStatSunRays},
+      {"SUN_VISIBLE", rtgi::kRtgiStatSunVisible},
+      {"LUMINANCE_SUM", rtgi::kRtgiStatLuminanceSum},
+      {"LUMINANCE_MAX", rtgi::kRtgiStatLuminanceMax},
+      {"CLAMPED", rtgi::kRtgiStatClamped},
   };
   for (const auto& stat : stats) {
     const std::string line = std::string("#define RTGI_STAT_") + stat.name + " " + std::to_string(stat.value) + "u";
     CHECK(text.find(line) != std::string::npos, "%s", line.c_str());
   }
+  CHECK(text.find("#define RTGI_STAT_TRACE_COUNT 20u") != std::string::npos, "trace count 20");
 }
 
 static void TestJson() {
@@ -104,6 +111,8 @@ static void TestJson() {
   CHECK(text.find("\"stats\": {") != std::string::npos, "stats object");
   CHECK(text.find("\"hit_off_screen\": ") != std::string::npos, "hit_off_screen key");
   CHECK(text.find("\"perf_gather\": false") != std::string::npos, "perf_gather key");
+  CHECK(text.find("\"radiance\": {") != std::string::npos, "radiance object");
+  CHECK(text.find("\"luminance_max\": ") != std::string::npos, "luminance_max key");
 }
 
 int main() {

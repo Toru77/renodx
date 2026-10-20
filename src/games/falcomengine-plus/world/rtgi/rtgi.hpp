@@ -35,6 +35,10 @@ struct RtgiFrameState {
   float samples = 1.f;
   bool isfast_used = false;
   uint64_t texture_bytes = 0u;
+  bool radiance_valid = false;
+  uint32_t radiance_width = 0u;
+  uint32_t radiance_height = 0u;
+  uint32_t radiance_format = 0u;
 };
 
 inline RtgiFrameState g_rtgi_frame;
@@ -52,6 +56,7 @@ struct RtgiDispatchInputs {
   reshade::api::resource_view mrt_normal_view = {0u};
   reshade::api::resource_view isfast_view = {0u};
   reshade::api::resource_view scene_cbv_view = {0u};
+  reshade::api::resource_view radiance_view = {0u};
   uint32_t full_width = 0u;
   uint32_t full_height = 0u;
   uint32_t trace_width = 0u;
@@ -144,22 +149,17 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   }
   bool debug_ready = false;
   if (in.debug_mode >= 1 && in.debug_mode <= 6) {
-    debug_ready = data.debug_texture.handle != 0u && data.debug_width == in.full_width && data.debug_height == in.full_height;
+    debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
-      DestroyRtgiDebugTarget(device, &data);
-      debug_ready = rtao::CreateRtaoTexture(device, reshade::api::format::r8g8b8a8_unorm, in.full_width, in.full_height, 4u,
-                                            &data.debug_texture, &data.debug_srv, &data.debug_uav);
-      if (debug_ready) {
-        data.debug_width = in.full_width;
-        data.debug_height = in.full_height;
-      } else {
-        DestroyRtgiDebugTarget(device, &data);
-        renodx::utils::log::w("[world-rtgi] debug texture creation failed");
-      }
+      renodx::utils::log::w("[world-rtgi] debug texture creation failed");
     }
   }
-  // Views the trace pass writes (modes 1 and 2); a failed debug texture leaves u0 null and does not fail the dispatch.
-  const bool trace_debug = debug_ready && in.debug_mode <= 2;
+  // Views the trace pass writes (modes 1 to 3); a failed debug texture leaves u0 null and does not fail the dispatch.
+  const bool trace_debug = debug_ready && in.debug_mode <= 3;
+  if (!EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
+    renodx::utils::log::w("[world-rtgi] raw GI texture creation failed");
+    return {};
+  }
 
   RtgiPushConstants push = in.push;
   push.size[0] = static_cast<float>(in.trace_width);
@@ -179,8 +179,9 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[17] = in.mrt_normal_view;
   srvs[18] = in.isfast_view;
   srvs[19] = bvh_data->dynamic.instances_srv;
+  srvs[20] = in.radiance_view;
   const reshade::api::resource_view uavs[kRtgiUavCount] = {
-      trace_debug ? data.debug_uav : reshade::api::resource_view{0u}, data.stats_uav};
+      trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
   reshade::api::descriptor_table_update updates[3] = {
       {data.cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &in.scene_cbv_view},
       {data.srv_table, 0, 0, kRtgiSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs},
@@ -195,8 +196,9 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   rtao::NullComputeSlots(cmd_list, kRtgiSrvCount, kRtgiUavCount, 0u);
 
   if (trace_debug) {
-    cmd_list->barrier(data.debug_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
+    cmd_list->barrier(data.debug.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
+  cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   bvh::EndGpuTimer(cmd_list, &data.timer);
 
   // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV table keeps its view.
@@ -210,6 +212,24 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   return {.ok = true, .debug_written = trace_debug};
 }
 
+// Copies the lighting output (render target 0 of the lighting draw) for the next frame's RTGI trace: the radiance of
+// on-screen hits. Called from the lighting draw's on_drawn hook (addon.cpp OnDrawnLightingShader); no lock is held.
+inline void CaptureRtgiRadiance(reshade::api::device* device, reshade::api::command_list* cmd_list,
+                                reshade::api::resource_view rtv, uint64_t frame_index) {
+  const auto source = device->get_resource_from_view(rtv);
+  if (source.handle == 0u) return;
+  const auto desc = device->get_resource_desc(source);
+  if (desc.type != reshade::api::resource_type::texture_2d || desc.texture.samples != 1) return;
+  RtgiDeviceData& data = GetRtgiDeviceData(device);
+  if (!EnsureRtgiRadianceTarget(device, &data, desc)) return;
+  cmd_list->barrier(source, reshade::api::resource_usage::render_target, reshade::api::resource_usage::copy_source);
+  cmd_list->barrier(data.radiance_texture, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
+  cmd_list->copy_texture_region(source, 0u, nullptr, data.radiance_texture, 0u, nullptr);
+  cmd_list->barrier(data.radiance_texture, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
+  cmd_list->barrier(source, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::render_target);
+  data.radiance_frame = frame_index;
+}
+
 struct RtgiJsonInput {
   const RtgiFrameState* frame;
   const uint32_t* values;
@@ -220,6 +240,8 @@ struct RtgiJsonInput {
 inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   const RtgiFrameState& f = *in.frame;
   const uint32_t* v = in.values;
+  float luminance_max = 0.f;
+  std::memcpy(&luminance_max, &v[kRtgiStatLuminanceMax], sizeof(luminance_max));
   std::ostringstream out;
   out << "{\n";
   out << "  \"schema\": 1,\n";
@@ -235,7 +257,11 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
       << ", \"coverage\": " << f.fade.coverage << ", \"requested_start\": " << f.fade.start_req
       << ", \"requested_end\": " << f.fade.end_req << "},\n";
+  out << "  \"radiance\": {\"valid\": " << (f.radiance_valid ? "true" : "false") << ", \"width\": " << f.radiance_width
+      << ", \"height\": " << f.radiance_height << ", \"format\": " << f.radiance_format << "},\n";
   out << "  \"samples\": " << f.samples << ",\n";
+  out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
+  out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
   out << "  \"isfast_used\": " << (f.isfast_used ? "true" : "false") << ",\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << ",\n";
   out << "  \"stats\": {\n";
@@ -252,9 +278,15 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "    \"hit_on_screen\": " << v[kRtgiStatHitOnScreen] << ",\n";
   out << "    \"hit_occluded\": " << v[kRtgiStatHitOccluded] << ",\n";
   out << "    \"hit_off_screen\": " << v[kRtgiStatHitOffScreen] << ",\n";
-  out << "    \"hit_distance_sum_dm\": " << v[kRtgiStatHitDistanceDm] << "\n";
+  out << "    \"hit_distance_sum_dm\": " << v[kRtgiStatHitDistanceDm] << ",\n";
+  out << "    \"radiance_lookups\": " << v[kRtgiStatRadianceLookups] << ",\n";
+  out << "    \"sun_rays\": " << v[kRtgiStatSunRays] << ",\n";
+  out << "    \"sun_visible\": " << v[kRtgiStatSunVisible] << ",\n";
+  out << "    \"luminance_sum_x100\": " << v[kRtgiStatLuminanceSum] << ",\n";
+  out << "    \"luminance_max\": " << luminance_max << ",\n";
+  out << "    \"clamped\": " << v[kRtgiStatClamped] << "\n";
   out << "  },\n";
-  out << "  \"note\": \"M1 diagnostic: no GI is added to the image\"\n";
+  out << "  \"note\": \"M2 diagnostic: raw GI is computed but not added to the image\"\n";
   out << "}\n";
   return out.str();
 }
@@ -276,7 +308,8 @@ inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::co
   renodx::utils::log::i("[world-rtgi] stats: rays=", v[kRtgiStatRays], " hits=", v[kRtgiStatHits],
                         " on_screen=", v[kRtgiStatHitOnScreen], " occluded=", v[kRtgiStatHitOccluded],
                         " off_screen=", v[kRtgiStatHitOffScreen], " invalid_refs=", v[kRtgiStatInvalidRefs],
-                        " stack_overflow=", v[kRtgiStatStackOverflow], " gpu_ms=", g_rtgi_frame.gpu_ms);
+                        " stack_overflow=", v[kRtgiStatStackOverflow], " lookups=", v[kRtgiStatRadianceLookups],
+                        " sun_rays=", v[kRtgiStatSunRays], " gpu_ms=", g_rtgi_frame.gpu_ms);
 
   const RtgiJsonInput in = {
       .frame = &g_rtgi_frame,

@@ -18,6 +18,8 @@ inline float g_rtgi_trace_resolution = 1.f;    // 0 Full, 1 Half, 2 Quarter
 inline float g_rtgi_fade_start_pct = 15.625f;  // Fade Start: percent of the BVH range (Region)
 inline float g_rtgi_fade_end_pct = 31.25f;     // Fade End: percent of the BVH range (Region)
 inline float g_rtgi_debug = 0.f;               // RTGI Debug (advanced), see the RtgiDebug row
+inline float g_rtgi_radiance_clamp = 0.f;  // Radiance Clamp: luminance cap per GI sample (0 = off)
+inline float g_rtgi_ambient = 1.f;         // Ambient Contribution: probe ambient weight at hidden and off-screen hits
 
 enum class Reason : uint8_t {
   Off = 0,
