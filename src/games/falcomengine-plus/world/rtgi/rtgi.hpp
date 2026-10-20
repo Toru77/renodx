@@ -327,9 +327,9 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       const rtao::FilterPass& pass = plan.passes[i];
       // F0 = 0, F1 = 1, B = 2 (FilterSlot values 1..3), as rtao.hpp DispatchSpatialFilter.
       const uint32_t out_index = static_cast<uint32_t>(pass.output) - 1u;
-      const reshade::api::resource_view pass_input = pass.input == rtao::FilterSlot::A
-          ? input : data.filter.srv[static_cast<uint32_t>(pass.input) - 1u];
-      const reshade::api::resource_view filter_srvs[kRtgiFilterSrvCount] = {in.depth_view, in.mrt_normal_view, pass_input};
+      const reshade::api::resource_view filter_srvs[kRtgiFilterSrvCount] = {
+          in.depth_view, in.mrt_normal_view,
+          pass.input == rtao::FilterSlot::A ? input : data.filter.srv[static_cast<uint32_t>(pass.input) - 1u]};
       const reshade::api::resource_view filter_uavs[kRtgiFilterUavCount] = {data.filter.uav[out_index]};
       reshade::api::descriptor_table_update filter_updates[3] = {
           {filter.cbv_table, 0, 0, 1, kCbv, &in.scene_cbv_view},

@@ -9327,11 +9327,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.prev_params_valid = true;
   const uint32_t trace_width = rtgi::RtgiTraceExtent(dd->captured_depth_w, divisor);
   const uint32_t trace_height = rtgi::RtgiTraceExtent(dd->captured_depth_h, divisor);
-  const bool resized = rd.history_color.width != 0u && (rd.history_color.width != trace_width || rd.history_color.height != trace_height);
   const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
-      .resized = resized,
+      .resized = rd.history_color.width != 0u && (rd.history_color.width != trace_width || rd.history_color.height != trace_height),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
