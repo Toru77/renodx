@@ -1734,7 +1734,8 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     o2.x = 0;
     return;
   }
-  // RTGI bounce (see cachedRTGI); no character pixel reaches this site. Debug 7: the bounce alone.
+  // RTGI bounce (see cachedRTGI); no character pixel reaches this site. Debug 7: the bounce alone. The VBGI block below
+  // never runs while RTGI is bound (RTAO on clears gtvbao_vbgi_bound); a selected SSR or cubemap debug view still wins.
   if (shader_injection_data.rtgi_gi_bound > 0.5f) {
     if (shader_injection_data.rtgi_debug_show > 0.5f) {
       o0.xyz = cachedRTGI;
