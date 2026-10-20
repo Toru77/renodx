@@ -116,7 +116,7 @@ inline bool EnsureBvhTraceResources(reshade::api::device* device, BvhDeviceData*
   if (device == nullptr || data == nullptr || !data->bvh_ready) return false;
   if (data->trace_pipeline.handle != 0u && data->trace_fast_pipeline.handle != 0u && data->trace_ready) return true;
 
-#if defined(__world_bvh_trace_EMBED_FILE)
+#if defined(__world_bvh_trace_EMBED_FILE) && defined(__world_bvh_trace_fast_EMBED_FILE)
   using DR = reshade::api::descriptor_range;
   using DS = reshade::api::shader_stage;
   using DT = reshade::api::descriptor_type;
@@ -235,7 +235,8 @@ inline void DispatchBvhTrace(
     uint32_t width,
     uint32_t height,
     const BvhTraceDepthInput& depth,
-    bool counters) {
+    bool counters,
+    bool inspect_requested) {
   if (device == nullptr || cmd_list == nullptr || data == nullptr) return;
   if (!EnsureBvhTraceResources(device, data)) return;
   if (!data->bvh_ready || data->blas_nodes.srv.handle == 0u || data->tlas_node_srv.handle == 0u) return;
@@ -300,7 +301,7 @@ inline void DispatchBvhTrace(
   static_assert(kTraceCameraViewOffset + 4u <= kTraceDynamicOffset, "trace push constants overlap");
   static_assert(kTraceDynamicOffset + 4u <= kTracePushConstantCount, "trace push constants overflow");
   data->inspect.requested = false;
-  if (g_bvh_trace.inspect_pending.exchange(false, std::memory_order_relaxed) && width != 0u && height != 0u) {
+  if (inspect_requested && width != 0u && height != 0u) {
     const float u = (std::min)((std::max)(g_bvh_trace.inspect_u.load(std::memory_order_relaxed), 0.f), 1.f);
     const float v = (std::min)((std::max)(g_bvh_trace.inspect_v.load(std::memory_order_relaxed), 0.f), 1.f);
     data->inspect.x = (std::min)(static_cast<uint32_t>(u * static_cast<float>(width)), width - 1u);

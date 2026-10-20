@@ -154,9 +154,11 @@ inline void RunBvhDebugPass(
     cmd_list->bind_render_targets_and_depth_stencil(0, nullptr, {0u});
   }
   const bool stats_requested = g_bvh_trace.stats_requested.exchange(false, std::memory_order_relaxed);
-  const bool counters = stats_requested || g_bvh_trace.inspect_pending.load(std::memory_order_relaxed)
+  // One read of the inspect click: the shader choice and the inspect constants must see the same value.
+  const bool inspect_requested = g_bvh_trace.inspect_pending.exchange(false, std::memory_order_relaxed);
+  const bool counters = stats_requested || inspect_requested
                         || g_bvh_trace.counters_every_frame.load(std::memory_order_relaxed);
-  DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth, counters);
+  DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth, counters, inspect_requested);
   cmd_list->barrier(
       data->debug_texture, reshade::api::resource_usage::unordered_access,
       reshade::api::resource_usage::shader_resource);
