@@ -285,7 +285,8 @@ void main(
     uint4 GTVBAO_raw = gtvbaoTexture.Load(int3(texel, 0));
     float GTVBAO_ao = float(GTVBAO_raw.x) / 255.0;
 
-    int fix = (int)shader_injection_data.gtvbao_fix_experimental;
+    // RTAO producing: the texel is RTAO's, so the GTVBAO encoding diagnostic does not apply (default branch).
+    const int fix = (shader_injection_data.rtao_ao_bound > 0.5f ? 0 : (int)shader_injection_data.gtvbao_fix_experimental);
     if (fix == 1) {
       ao_sample.x = 1.0;  // Neutral: test if veil is from AO value
     } else if (fix == 2) {

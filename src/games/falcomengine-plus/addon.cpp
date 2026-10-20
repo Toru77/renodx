@@ -3716,6 +3716,7 @@ renodx::utils::settings::Settings settings = {
       .default_value = 0.f, .label = "Fix Experimental", .section = "GTVBAO",
       .tooltip = "Composite-side AO encoding diagnostic (Sora lighting shaders only). 0=Off (baseline).",
       .labels = {"Off", "1:Neutral 1.0", "2:No 0xFF mask", "3:Inverted", "4:All channels"},
+      .is_enabled = []() { return !falcom_world::rtao::RtaoRequested(); },
     .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     // -- GTVBAO scheduling --
