@@ -21,6 +21,7 @@
 
 #include "../../utils/bitwise.hpp"
 #include "../../utils/date.hpp"
+#include "../../utils/pipeline.hpp"
 #include "../../utils/settings.hpp"
 
 #include "./sl_rr.hpp"
@@ -278,12 +279,14 @@ void OnBindPipeline(
     reshade::api::pipeline pipeline) {
   (void)cmd_list;
   if (!renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::compute_shader)) return;
-  renodx::utils::shader::GetPipelineShaderDetails(pipeline, [](const auto& details) {
-    if (details.shader_hashes.count(denoise::kSpatialHighHash) != 0) {
-      high_gi.bound.store(true);
-    }
-    if (details.shader_hashes.count(denoise::kSpatialMediumHash) != 0) {
-      medium_gi.bound.store(true);
+  renodx::utils::pipeline::GetPipelineInfo(pipeline, [](const renodx::utils::pipeline::PipelineInfo& info) {
+    for (const auto& shader : info.shader_details) {
+      if (shader.shader_hash == denoise::kSpatialHighHash) {
+        high_gi.bound.store(true);
+      }
+      if (shader.shader_hash == denoise::kSpatialMediumHash) {
+        medium_gi.bound.store(true);
+      }
     }
   });
 }
