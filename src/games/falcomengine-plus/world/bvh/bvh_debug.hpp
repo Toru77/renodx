@@ -153,11 +153,16 @@ inline void RunBvhDebugPass(
     // drop the compute SRV. Nothing of the game's frame draws after present.
     cmd_list->bind_render_targets_and_depth_stencil(0, nullptr, {0u});
   }
-  DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth);
+  const bool stats_requested = g_bvh_trace.stats_requested.exchange(false, std::memory_order_relaxed);
+  const bool counters = stats_requested || g_bvh_trace.inspect_pending.load(std::memory_order_relaxed)
+                        || g_bvh_trace.counters_every_frame.load(std::memory_order_relaxed);
+  DispatchBvhTrace(device, cmd_list, data, TraceShaderMode(view), width, height, depth, counters);
   cmd_list->barrier(
       data->debug_texture, reshade::api::resource_usage::unordered_access,
       reshade::api::resource_usage::shader_resource);
-  MaybeCaptureBvhTraceStats(device, queue, data);
+  if (stats_requested) {
+    ReadbackBvhTraceStats(device, queue, data);
+  }
   if (data->inspect.fresh) {
     data->inspect.fresh = false;
     data->inspect.candidates.clear();

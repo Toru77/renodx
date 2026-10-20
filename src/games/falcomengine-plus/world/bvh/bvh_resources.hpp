@@ -422,6 +422,7 @@ struct __declspec(uuid("b7a1c2d3-4e5f-4a6b-8c7d-9e0f1a2b3c4d")) BvhDeviceData {
   reshade::api::descriptor_table trace_srv_table = {0u};
   reshade::api::descriptor_table trace_uav_table = {0u};
   reshade::api::pipeline trace_pipeline = {0u};
+  reshade::api::pipeline trace_fast_pipeline = {0u};  // world_bvh_trace_fast: no counters, no inspect
   reshade::api::resource trace_stats_buffer = {0u};
   reshade::api::resource_view trace_stats_uav = {0u};
   BvhTraceStats trace_stats;
@@ -574,6 +575,10 @@ inline void DestroyBvhDeviceData(reshade::api::device* device) {
   if (data->trace_pipeline.handle != 0u) {
     device->destroy_pipeline(data->trace_pipeline);
     data->trace_pipeline = {0u};
+  }
+  if (data->trace_fast_pipeline.handle != 0u) {
+    device->destroy_pipeline(data->trace_fast_pipeline);
+    data->trace_fast_pipeline = {0u};
   }
   if (data->trace_srv_table.handle != 0u) {
     device->free_descriptor_table(data->trace_srv_table);

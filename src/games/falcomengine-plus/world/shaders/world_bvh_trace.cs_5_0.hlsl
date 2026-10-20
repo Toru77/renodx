@@ -25,6 +25,7 @@
 // surface the game camera does not show, and g_camera_view.x hides those
 // surfaces (the ray continues behind them). alpha_tests and alpha_cut count
 // the cutout tests of alpha-tested foliage (world_bvh_trace.hlsli AlphaCutHit).
+// WORLD_TRACE_NO_COUNTERS (world_bvh_trace_fast.cs_5_0.hlsl): the same image without counters or inspect.
 
 #define WORLD_TRACE_DYNAMIC_INSTANCES
 #include "world_bvh_trace.hlsli"
@@ -78,7 +79,9 @@ cbuffer cb_trace : register(b13)
 #define TRACE_MODE_INSTANCE 8u
 #define TRACE_MODE_DEPTH_COMPARE 9u
 
+#ifndef WORLD_TRACE_NO_COUNTERS
 groupshared uint gs_stats[TRACE_STATS_COUNT];
+#endif
 
 static const float3 kDebugLightDirection = normalize(float3(0.4, 0.8, 0.45));
 
@@ -172,8 +175,10 @@ float3 CompareWithGameDepth(float2 uv, float2 ndc, float3 origin, float3 directi
 [numthreads(8, 8, 1)]
 void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
 {
+#ifndef WORLD_TRACE_NO_COUNTERS
     if (group_index < TRACE_STATS_COUNT) gs_stats[group_index] = 0u;
     GroupMemoryBarrierWithGroupSync();
+#endif
 
     const bool valid = dtid.x < g_width && dtid.y < g_height;
     if (valid)
@@ -194,13 +199,17 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         const WorldTraceHit hit = TraceWorldClosest(origin, direction, 0.001, 1e30, view, counters);
 
         float3 color = float3(0.02, 0.02, 0.03);
+#ifndef WORLD_TRACE_NO_COUNTERS
         uint compare_stat = 0xFFFFFFFFu;
+#endif
         if (g_mode == TRACE_MODE_DEPTH_COMPARE)
         {
             uint stat = STAT_CMP_NO_DEPTH;
             color = CompareWithGameDepth(uv, ndc, origin, direction, hit, stat);
+#ifndef WORLD_TRACE_NO_COUNTERS
             InterlockedAdd(gs_stats[stat], 1u);
             compare_stat = stat;
+#endif
         }
         else if (hit.prim != 0xFFFFFFFFu)
         {
@@ -215,6 +224,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         }
         g_trace_output[dtid.xy] = float4(color, 1.0);
 
+#ifndef WORLD_TRACE_NO_COUNTERS
         // Inspect: a single thread writes these slots, plain stores.
         if (g_inspect.z > 0.5 && dtid.x == (uint)g_inspect.x && dtid.y == (uint)g_inspect.y)
         {
@@ -228,7 +238,9 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
             g_trace_stats[TRACE_INSPECT_BASE + 7u] = asuint(hit.position.z);
             g_trace_stats[TRACE_INSPECT_BASE + 8u] = compare_stat;
         }
+#endif
 
+#ifndef WORLD_TRACE_NO_COUNTERS
         InterlockedAdd(gs_stats[STAT_RAYS], 1u);
         InterlockedAdd(gs_stats[STAT_HITS], counters.hits);
         InterlockedAdd(gs_stats[STAT_MISSES], counters.misses);
@@ -243,8 +255,10 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         InterlockedAdd(gs_stats[STAT_P2B_SKIPPED], counters.p2b_skipped);
         InterlockedAdd(gs_stats[STAT_P2B_BOX_HITS], counters.p2b_box_hits);
         if ((hit.instance & 0xC0000000u) == DYNAMIC_DRAW_FLAG && hit.prim != 0xFFFFFFFFu) InterlockedAdd(gs_stats[STAT_P2B_WINS], 1u);
+#endif
     }
 
+#ifndef WORLD_TRACE_NO_COUNTERS
     GroupMemoryBarrierWithGroupSync();
     if (group_index == 0u)
     {
@@ -255,4 +269,5 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
             else InterlockedAdd(g_trace_stats[i], gs_stats[i]);
         }
     }
+#endif
 }

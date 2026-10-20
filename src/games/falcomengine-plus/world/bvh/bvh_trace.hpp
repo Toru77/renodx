@@ -98,6 +98,8 @@ struct BvhTraceState {
   std::atomic_bool hide_camera_hidden{true};
   // Mirror bound to the settings system so the Hide camera-hidden toggle survives a restart.
   float hide_camera_hidden_setting{1.f};
+  // Diagnostic, session only: run the counting shader every frame (A/B against the counter-free one).
+  std::atomic_bool counters_every_frame{false};
 };
 
 inline BvhTraceState g_bvh_trace;
@@ -112,7 +114,7 @@ inline void LogTraceResourceFailure(const char* stage) {
 
 inline bool EnsureBvhTraceResources(reshade::api::device* device, BvhDeviceData* data) {
   if (device == nullptr || data == nullptr || !data->bvh_ready) return false;
-  if (data->trace_pipeline.handle != 0u && data->trace_ready) return true;
+  if (data->trace_pipeline.handle != 0u && data->trace_fast_pipeline.handle != 0u && data->trace_ready) return true;
 
 #if defined(__world_bvh_trace_EMBED_FILE)
   using DR = reshade::api::descriptor_range;
@@ -161,6 +163,18 @@ inline bool EnsureBvhTraceResources(reshade::api::device* device, BvhDeviceData*
         reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
     if (!device->create_pipeline(data->trace_layout, 1, &subobject, &data->trace_pipeline)) {
       LogTraceResourceFailure("compute pipeline");
+      return false;
+    }
+  }
+  if (data->trace_fast_pipeline.handle == 0u) {
+    reshade::api::shader_desc shader = {};
+    shader.code = __world_bvh_trace_fast.data();
+    shader.code_size = __world_bvh_trace_fast.size();
+    shader.entry_point = "main";
+    reshade::api::pipeline_subobject subobject = {
+        reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
+    if (!device->create_pipeline(data->trace_layout, 1, &subobject, &data->trace_fast_pipeline)) {
+      LogTraceResourceFailure("compute pipeline (no counters)");
       return false;
     }
   }
@@ -220,15 +234,18 @@ inline void DispatchBvhTrace(
     uint32_t mode,
     uint32_t width,
     uint32_t height,
-    const BvhTraceDepthInput& depth) {
+    const BvhTraceDepthInput& depth,
+    bool counters) {
   if (device == nullptr || cmd_list == nullptr || data == nullptr) return;
   if (!EnsureBvhTraceResources(device, data)) return;
   if (!data->bvh_ready || data->blas_nodes.srv.handle == 0u || data->tlas_node_srv.handle == 0u) return;
   if (data->debug_uav.handle == 0u || data->trace_stats_uav.handle == 0u) return;
 
   // The whole buffer (offset 0 and its full size: see WriteBufferRange).
-  const uint32_t zeros[kTraceStatsBufferCount] = {};
-  device->update_buffer_region(zeros, data->trace_stats_buffer, 0u, sizeof(zeros));
+  if (counters) {
+    const uint32_t zeros[kTraceStatsBufferCount] = {};
+    device->update_buffer_region(zeros, data->trace_stats_buffer, 0u, sizeof(zeros));
+  }
 
   // Slot 9 is rewritten on every dispatch: a game view from an earlier frame
   // may no longer exist, so it is null unless Depth Compare passes this
@@ -245,7 +262,8 @@ inline void DispatchBvhTrace(
       data->trace_uav_table, 0, 0, kTraceUavCount, reshade::api::descriptor_type::unordered_access_view, uavs};
   device->update_descriptor_tables(1, &uav_update);
 
-  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, data->trace_pipeline);
+  const reshade::api::pipeline trace_pipeline = (counters ? data->trace_pipeline : data->trace_fast_pipeline);
+  cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, trace_pipeline);
   const reshade::api::descriptor_table tables[2] = {data->trace_srv_table, data->trace_uav_table};
   cmd_list->bind_descriptor_tables(
       reshade::api::shader_stage::all_compute, data->trace_layout, 0, 2, tables);
@@ -397,14 +415,6 @@ inline bool ReadbackBvhTraceStats(
         " no_depth=", stats.compare_no_depth);
   }
   return true;
-}
-
-inline void MaybeCaptureBvhTraceStats(
-    reshade::api::device* device,
-    reshade::api::command_queue* queue,
-    BvhDeviceData* data) {
-  if (!g_bvh_trace.stats_requested.exchange(false, std::memory_order_relaxed)) return;
-  ReadbackBvhTraceStats(device, queue, data);
 }
 
 }  // namespace falcom_world::bvh

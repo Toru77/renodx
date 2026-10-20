@@ -676,6 +676,10 @@ inline bool DrawBvhPanel() {
                       "Off: they stay visible and are counted as hidden-from-camera pixels.\n"
                       "Default on.");
   }
+  bool counters_every_frame = g_bvh_trace.counters_every_frame.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Trace counters every frame (diagnostic, session only)", &counters_every_frame)) {
+    g_bvh_trace.counters_every_frame.store(counters_every_frame, std::memory_order_relaxed);
+  }
   if (mode == static_cast<int>(BvhView::DepthCompare)) {
     ImGui::TextDisabled("green match  blue missing (game surface in front / no BVH hit)  red extra (BVH in front)  orange BVH on game sky  grey beyond range");
   }
