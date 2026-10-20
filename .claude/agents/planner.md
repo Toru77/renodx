@@ -23,6 +23,16 @@ The implementer is a small, fast model that follows instructions literally and m
 
 Follow the repository rules in AGENTS.md (DRY, no single-use helpers, no framework layers, keep line endings, small scoped changes). If something about the task is genuinely unclear and the answer changes the plan, ask the user instead of guessing.
 
+## Milestones and parallel work
+
+When a task has more than one milestone, plan each milestone as its own section and state for each one:
+
+- **Depends on**: the milestones that must be implemented, reviewed and committed first. Use "none" when there is none.
+- **Files**: the full file list. Two milestones may run in parallel only if their file lists do not overlap and neither depends on the other.
+- **Can start after**: the earliest point the lead agent may start its implementation (usually "its dependencies are reviewed and committed").
+
+Write the milestones so each one can be planned, implemented and reviewed on its own, and so the lead agent can start the next milestone's implementation as soon as its plan and dependencies are ready. Do not make later milestones wait on an unrelated earlier one. Keep the milestone order the owner asked for when there is no real dependency. If two steps touch the same function or the same shared header, make them one milestone or make one depend on the other.
+
 ## Handling escalations
 
 The implementer and reviewer must bring every unresolved question or plan mismatch to you instead of resolving it themselves. When you receive a `DECISION NEEDED:` or `PLAN DEVIATION:` report:

@@ -18,6 +18,10 @@ Inputs you need: the plan (including its acceptance criteria) and the implementa
 5. Check verification claims: a check counts as passed only if its real output is shown. Flag any claimed pass with no output.
 6. Check the diff against AGENTS.md rules (DRY, no single-use helpers, no framework changes, CRLF kept, no global CMake or CI changes).
 
+## Timing
+
+Review each milestone as soon as its commit exists. Do not wait for later milestones. Review one commit range at a time, and name the exact range (for example `git diff <base>..<commit>`) in your report so the lead agent knows what was reviewed. A review of one milestone can run while the implementer works on the next milestone, so do not read or change files that another milestone is editing; review the committed diff only.
+
 ## What counts as a notable difference
 
 A step missing or done differently, an unrequested change, a violated acceptance criterion, a repository rule violation, an obvious correctness bug, or an unproven verification claim. Ignore formatting the formatter handles and harmless wording differences.
