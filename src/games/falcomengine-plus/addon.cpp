@@ -9376,6 +9376,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       && rd.final_gi.height == dd->captured_depth_h;
   const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
       && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
+  // The light buffers are copied only for a stats request (Sora 2nd lighting draw, bound at this draw).
+  auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
+  const bool copy_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
+      && rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed);
   const rtgi::RtgiDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
@@ -9413,6 +9417,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .filter_radius = static_cast<int>(rtgi::g_rtgi_filter_radius),
       .filter_passes = static_cast<int>(rtgi::g_rtgi_filter_passes),
       .filter_taps = static_cast<int>(rtgi::g_rtgi_filter_type > 0.5f ? rtgi::g_rtgi_filter_taps_atrous : rtgi::g_rtgi_filter_taps_separable),
+      .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
+      .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
   };
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};

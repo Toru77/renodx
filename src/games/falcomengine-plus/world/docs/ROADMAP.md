@@ -37,6 +37,22 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
 - [ ] Step 4: sign latency. (a) dynamic-only refit in the same present after `DrainPoolScan`; (b) shorter orphan retirement: retire the old pose when a fresher instance of the same key is admitted. Harness: `test_deform_live`/`test_pool` case. Fixes: P-3 (partly). Full per-frame path (P2b) is a separate milestone.
 - [ ] Step 5: foliage sway approach for P-1. Decision after Steps 1 to 4. Options: (a) keep rest pose and say so; (b) per-instance CPU sway approximation through `RefitLiveTlas`; (c) P2b-style draw-time copy. Owner decides.
 
+## RTGI discovery round (rtgi-disc-1): implemented, not validated in game
+
+- A. RTGI Debug 8 "Pixel classes" (diagnostic view, trace pixels): grey = scaled frame, dark blue = sky, magenta = no G-buffer normal, dark green = outside the BVH region, dark purple = beyond Fade End; traced pixels: yellow = the normal faces away from the camera, cyan = a hit within 1 cm, black = traced with neither.
+- B. Game sun readout: the camera snapshot keeps lightColor_g (c25), lightDirection_g (c26), sceneShadowColor_g (c27), shadowmapCascadeCount_g (c27.w) and shadowSplitDistance_g (c57). The RTGI panel prints them and world_rtgi.json has a "game_sun" block.
+- C. Light buffer readout (Sora 2nd, stats request only): copies dynamicLights_g (t11) and lightIndices_g (t12) from the lighting draw and writes world_rtgi_lights.json (per-cell counts, out-of-range indices, the first 64 lights).
+- D. Foliage inspect: the instance line of the BVH pixel inspect shows the foliage flag, alpha-tested flag, atlas material and moving/static.
+- With RTGI Debug Off the image is unchanged.
+- RTGI lives in world/rtgi/ and world/shaders/world_rtgi*.hlsl; its history is in commits fa6bb6b6..915015e1.
+- Owner test list:
+  1. Wall lines: Trace Resolution Full, RTGI Debug "Pixel classes", screenshot the lines and note their colour; Read RTGI Stats; repeat at Half; then Full with "Hit classes".
+  2. Sun indoors: outside in daylight, Read RTGI Stats (world_rtgi_outside.json); inside at Sun Shadow Distance 64 (world_rtgi_inside_64.json) and 4 (world_rtgi_inside_4.json); screenshot the "Game sun" line each time.
+  3. Lamps: face a lamp, Read RTGI Stats (world_rtgi_lights_facing.json); turn the lamp behind, Read again (world_rtgi_lights_behind.json); note Dynamic Cubemaps on or off.
+  4. Foliage: RTAO Foliage skip On; middle-click plants that still shade in a BVH trace view (plant, grass, leaf, bush, fence); screenshot; Dump Pool JSON (world_pool.json).
+  5. Two-sided (optional): Two-Sided discovery On; Read RTAO Stats in a street, inside, and by plants (world_rtao_street.json, world_rtao_inside.json, world_rtao_plants.json).
+- Known failing at HEAD 915015e1 before this round (not caused by it): test_rtao pass A FNV pin (test_rtao.cpp:1881); test_live wind range (2758), rest wind (3009) and rebuild (3470) goldens.
+
 ## Owner decisions and dump findings (2026-10-14, after first in-game round)
 
 In game: P-5 random_plane fixed (confirmed). P-2 missing_random not fixed. P-4 leaves are back in the BVH but do not animate. P-3 sign still lags, ghosts remain. P-1 foliage does not animate.

@@ -4,15 +4,18 @@
 // inline from the lighting hook (addon.cpp RunRtgiInline), which owns the guards. No module mutex is held around any
 // graphics call here.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "../bvh/bvh_trace.hpp"
 #include "../rtao/rtao.hpp"
+#include "../world_state.hpp"
 #include "rtgi_resources.hpp"
 #include "rtgi_state.hpp"
 
@@ -87,6 +90,8 @@ struct RtgiDispatchInputs {
   int filter_radius = 4;
   int filter_passes = 2;
   int filter_taps = 5;    // samples per direction (separable) or kernel side (a-trous)
+  reshade::api::resource lights = {0u};         // Sora 2nd dynamicLights_g (t11); copied for the stats request, null otherwise
+  reshade::api::resource light_indices = {0u};  // Sora 2nd lightIndices_g (t12); copied for the stats request, null otherwise
 };
 
 struct RtgiDispatchResult {
@@ -99,8 +104,9 @@ struct RtgiDispatchResult {
 inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtgiDispatchInputs& in) {
   const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtgi_record_us};
   auto* bvh_data = bvh::GetBvhDeviceData(device);
-  if (bvh_data == nullptr || in.trace_width == 0u || in.trace_height == 0u) return {};
   RtgiDeviceData& data = GetRtgiDeviceData(device);
+  data.lights_copied = false;  // set again only when this dispatch copies both light buffers
+  if (bvh_data == nullptr || in.trace_width == 0u || in.trace_height == 0u) return {};
   // Creates one RTGI compute pipeline on first use (RtgiPipeline layout); a failure is latched and logged once.
   const auto ensure_pipeline = [&](RtgiPipeline* p, const RtgiPipelineDesc& desc) {
     if (p->pipeline.handle != 0u) return true;
@@ -177,14 +183,14 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 7) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 8) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
     }
   }
-  // Views the trace pass writes (modes 1 to 3); a failed debug texture leaves u0 null and does not fail the dispatch.
-  const bool trace_debug = debug_ready && in.debug_mode <= 3;
+  // Views the trace pass writes (modes 1 to 3 and 8); a failed debug texture leaves u0 null and does not fail the dispatch.
+  const bool trace_debug = debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8);
   if (!EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
     renodx::utils::log::w("[world-rtgi] raw GI texture creation failed");
     return {};
@@ -391,6 +397,32 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   data.final_index = final_write;
   bvh::EndGpuTimer(cmd_list, &data.denoise_timer);
 
+  // Light buffers of the game's lighting draw (stats request only): copied now, read back by MaybeCaptureRtgiStats.
+  const auto copy_light_buffer = [&](reshade::api::resource source, reshade::api::resource* copy, uint64_t* copy_bytes) {
+    if (source.handle == 0u) return false;
+    const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
+    if (source_desc.type != reshade::api::resource_type::buffer || source_desc.buffer.size == 0u
+        || source_desc.buffer.size > renodx::utils::scene::CAPTURE_SIZE_LIMIT) {
+      return false;
+    }
+    if (copy->handle == 0u || *copy_bytes != source_desc.buffer.size) {
+      bvh::DestroyBuffer(device, nullptr, copy);
+      reshade::api::resource_desc copy_desc = {};
+      copy_desc.type = reshade::api::resource_type::buffer;
+      copy_desc.buffer.size = source_desc.buffer.size;
+      copy_desc.heap = reshade::api::memory_heap::gpu_only;
+      copy_desc.usage = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source;
+      if (!device->create_resource(copy_desc, nullptr, reshade::api::resource_usage::copy_dest, copy)) return false;
+      *copy_bytes = source_desc.buffer.size;
+    }
+    cmd_list->barrier(source, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
+    cmd_list->copy_buffer_region(source, 0u, *copy, 0u, source_desc.buffer.size);
+    cmd_list->barrier(source, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
+    return true;
+  };
+  data.lights_copied = copy_light_buffer(in.lights, &data.lights_copy, &data.lights_copy_bytes)
+      && copy_light_buffer(in.light_indices, &data.light_indices_copy, &data.light_indices_copy_bytes);
+
   // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV tables keep their view.
   const reshade::api::resource_view table_null_views[kRtgiSrvCount] = {};
   const reshade::api::sampler table_null_samplers[kRtgiTemporalSamplerCount] = {};
@@ -465,7 +497,12 @@ struct RtgiJsonInput {
   const uint32_t* values;
   uint64_t generated_frame;
   bool perf_gather;
+  const CameraSnapshot* camera = nullptr;
 };
+
+inline void WriteVec3Json(std::ostream& out, const float* v) {
+  out << "[" << bvh::PoolJsonFloat{v[0]} << ", " << bvh::PoolJsonFloat{v[1]} << ", " << bvh::PoolJsonFloat{v[2]} << "]";
+}
 
 inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   const RtgiFrameState& f = *in.frame;
@@ -493,6 +530,20 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
   out << "  \"sun_shadow_distance\": " << g_rtgi_sun_distance << ",\n";
+  if (in.camera != nullptr && in.camera->has_sun) {
+    const CameraSnapshot& sun = *in.camera;
+    out << "  \"game_sun\": {\"captured\": true, \"light_color\": ";
+    WriteVec3Json(out, sun.light_color);
+    out << ", \"light_direction\": ";
+    WriteVec3Json(out, sun.light_direction);
+    out << ", \"scene_shadow_color\": ";
+    WriteVec3Json(out, sun.scene_shadow_color);
+    out << ", \"shadow_cascade_count\": " << sun.shadow_cascade_count << ", \"shadow_split_distance\": ";
+    WriteVec3Json(out, sun.shadow_split_distance);
+    out << "},\n";
+  } else {
+    out << "  \"game_sun\": {\"captured\": false},\n";
+  }
   out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
       << ", \"applied_intensity\": " << f.applied_intensity
@@ -548,7 +599,9 @@ inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::co
   if (!g_rtgi_stats.requested.exchange(false, std::memory_order_relaxed)) return;
   const auto found = g_rtgi_devices.find(device);
   if (found == g_rtgi_devices.end() || found->second.stats_buffer.handle == 0u) return;
-  const RtgiDeviceData& data = found->second;
+  RtgiDeviceData& data = found->second;
+  const bool lights_copied = data.lights_copied;
+  data.lights_copied = false;  // consumed by this read, so an old copy is never written with a new frame
   std::vector<uint8_t> bytes;
   if (!renodx::utils::scene::ReadbackBuffer(device, queue, data.stats_buffer, 0u, sizeof(g_rtgi_stats.values), &bytes)
       || bytes.size() < sizeof(g_rtgi_stats.values)) {
@@ -564,14 +617,126 @@ inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::co
                         " stack_overflow=", v[kRtgiStatStackOverflow], " lookups=", v[kRtgiStatRadianceLookups],
                         " sun_rays=", v[kRtgiStatSunRays], " gpu_ms=", g_rtgi_frame.gpu_ms);
 
+  CameraSnapshot camera;
+  {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    camera = g_state.camera;
+  }
   const RtgiJsonInput in = {
       .frame = &g_rtgi_frame,
       .values = g_rtgi_stats.values,
       .generated_frame = g_state.frame.load(),
       .perf_gather = bvh::g_perf_gate.gather.load(std::memory_order_relaxed),
+      .camera = &camera,
   };
   std::string text = BuildRtgiJson(in);
   renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtgi.json", text);
+
+  if (!lights_copied) return;
+  std::vector<uint8_t> light_bytes;
+  std::vector<uint8_t> index_bytes;
+  if (!renodx::utils::scene::ReadbackBuffer(device, queue, data.lights_copy, 0u, data.lights_copy_bytes, &light_bytes)
+      || !renodx::utils::scene::ReadbackBuffer(device, queue, data.light_indices_copy, 0u, data.light_indices_copy_bytes,
+                                               &index_bytes)) {
+    renodx::utils::log::w("[world-rtgi] light buffer readback failed");
+    return;
+  }
+  const size_t light_count = light_bytes.size() / sizeof(LightParamCpu);
+  const size_t cell_count = index_bytes.size() / sizeof(LightIndexDataCpu);
+  const auto* lights = reinterpret_cast<const LightParamCpu*>(light_bytes.data());
+  const auto* cells = reinterpret_cast<const LightIndexDataCpu*>(index_bytes.data());
+  // A light index is an index into dynamicLights_g for both the point and the spot lists.
+  std::vector<uint8_t> in_point(light_count, 0u);
+  std::vector<uint8_t> in_spot(light_count, 0u);
+  uint32_t cells_with_lights = 0u;
+  uint32_t point_refs = 0u;
+  uint32_t spot_refs = 0u;
+  uint32_t max_point_per_cell = 0u;
+  uint32_t max_spot_per_cell = 0u;
+  uint32_t index_out_of_range = 0u;
+  for (size_t c = 0; c < cell_count; ++c) {
+    const LightIndexDataCpu& cell = cells[c];
+    const uint32_t point_n = (std::min)(cell.point_count, 63u);
+    const uint32_t spot_n = (std::min)(cell.spot_count, 63u);
+    if (point_n + spot_n > 0u) {
+      ++cells_with_lights;
+    }
+    point_refs += point_n;
+    spot_refs += spot_n;
+    max_point_per_cell = (std::max)(max_point_per_cell, point_n);
+    max_spot_per_cell = (std::max)(max_spot_per_cell, spot_n);
+    for (uint32_t i = 0u; i < point_n; ++i) {
+      const int32_t index = cell.point_indices[i];
+      if (index < 0 || static_cast<size_t>(index) >= light_count) {
+        ++index_out_of_range;
+        continue;
+      }
+      in_point[index] = 1u;
+    }
+    for (uint32_t i = 0u; i < spot_n; ++i) {
+      const int32_t index = cell.spot_indices[i];
+      if (index < 0 || static_cast<size_t>(index) >= light_count) {
+        ++index_out_of_range;
+        continue;
+      }
+      in_spot[index] = 1u;
+    }
+  }
+  uint32_t lights_radius_positive = 0u;
+  uint32_t point_lights_in_cells = 0u;
+  uint32_t spot_lights_in_cells = 0u;
+  uint32_t radius_positive_in_no_cell = 0u;
+  for (size_t l = 0; l < light_count; ++l) {
+    point_lights_in_cells += in_point[l];
+    spot_lights_in_cells += in_spot[l];
+    if (lights[l].radius > 0.f) {
+      ++lights_radius_positive;
+      if (in_point[l] == 0u && in_spot[l] == 0u) {
+        ++radius_positive_in_no_cell;
+      }
+    }
+  }
+  std::ostringstream lights_out;
+  lights_out << "{\n";
+  lights_out << "  \"schema\": 1,\n";
+  lights_out << "  \"generated_frame\": " << in.generated_frame << ",\n";
+  lights_out << "  \"light_buffer_bytes\": " << light_bytes.size() << ",\n";
+  lights_out << "  \"light_index_buffer_bytes\": " << index_bytes.size() << ",\n";
+  lights_out << "  \"lights\": " << light_count << ",\n";
+  lights_out << "  \"lights_radius_positive\": " << lights_radius_positive << ",\n";
+  lights_out << "  \"cells\": " << cell_count << ",\n";
+  lights_out << "  \"cells_with_lights\": " << cells_with_lights << ",\n";
+  lights_out << "  \"point_refs\": " << point_refs << ",\n";
+  lights_out << "  \"spot_refs\": " << spot_refs << ",\n";
+  lights_out << "  \"max_point_per_cell\": " << max_point_per_cell << ",\n";
+  lights_out << "  \"max_spot_per_cell\": " << max_spot_per_cell << ",\n";
+  lights_out << "  \"point_lights_in_cells\": " << point_lights_in_cells << ",\n";
+  lights_out << "  \"spot_lights_in_cells\": " << spot_lights_in_cells << ",\n";
+  lights_out << "  \"radius_positive_in_no_cell\": " << radius_positive_in_no_cell << ",\n";
+  lights_out << "  \"index_out_of_range\": " << index_out_of_range << ",\n";
+  lights_out << "  \"lights_list\": [\n";
+  const size_t list_count = (std::min)(light_count, size_t{64});
+  for (size_t l = 0; l < list_count; ++l) {
+    const LightParamCpu& light = lights[l];
+    const char* in_cells = in_point[l] != 0u ? (in_spot[l] != 0u ? "both" : "point") : (in_spot[l] != 0u ? "spot" : "none");
+    lights_out << "    {\"index\": " << l << ", \"in_cells\": \"" << in_cells << "\", \"pos\": ";
+    WriteVec3Json(lights_out, light.pos);
+    lights_out << ", \"radius\": " << bvh::PoolJsonFloat{light.radius} << ", \"color\": ";
+    WriteVec3Json(lights_out, light.color);
+    lights_out << ", \"radius_inv\": " << bvh::PoolJsonFloat{light.radius_inv}
+               << ", \"attenuation\": " << bvh::PoolJsonFloat{light.attenuation} << ", \"vec\": ";
+    WriteVec3Json(lights_out, light.vec);
+    lights_out << ", \"spot_angle_inv\": " << bvh::PoolJsonFloat{light.spot_angle_inv}
+               << ", \"attenuation_angle\": " << bvh::PoolJsonFloat{light.attenuation_angle}
+               << ", \"translucency\": " << bvh::PoolJsonFloat{light.translucency}
+               << ", \"shadowmap_index\": " << light.shadowmap_index << "}" << (l + 1u < list_count ? ",\n" : "\n");
+  }
+  lights_out << "  ]\n}\n";
+  renodx::utils::log::i("[world-rtgi] lights: ", light_count, " lights (", lights_radius_positive, " radius > 0), ", cell_count,
+                        " cells (", cells_with_lights, " with lights), point refs ", point_refs, ", spot refs ", spot_refs,
+                        ", out of range ", index_out_of_range);
+  text = lights_out.str();
+  renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtgi_lights.json", text);
 }
 
 // Gathering was switched OFF: clears the RTGI GPU timers and the newest RTGI frame times (see bvh::ClearPerfGathered).

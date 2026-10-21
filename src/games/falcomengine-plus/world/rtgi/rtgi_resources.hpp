@@ -20,7 +20,7 @@ namespace falcom_world::rtgi {
 // GI (null unless kRtgiFlagSubtractPrevious) and t22 the G-buffer colour (bound whenever it was captured this frame,
 // read only under kRtgiFlagSubtractPrevious): the one-bounce correction.
 inline constexpr uint32_t kRtgiSrvCount = 23u;
-inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 6), u1 stats, u2 raw GI
+inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 3 or 8), u1 stats, u2 raw GI
 inline constexpr uint32_t kRtgiPushConstantCount = 28u;
 inline constexpr uint32_t kRtgiStatsCount = 24u;
 
@@ -67,6 +67,12 @@ inline constexpr uint32_t kRtgiFilterPushCount = 12u;
 inline constexpr uint32_t kRtgiUpsampleSrvCount = 4u;
 inline constexpr uint32_t kRtgiUpsampleUavCount = 2u;
 inline constexpr uint32_t kRtgiUpsamplePushCount = 12u;
+// Sora 2nd lighting 0xCA3D8596: t11 dynamicLights_g (LightParam) and t12 lightIndices_g (LightIndexData). Copied for the
+// stats request only (rtgi.hpp Dispatch) and read back into world_rtgi_lights.json.
+inline constexpr uint32_t kLightingLightsRegister = 11u;
+inline constexpr uint32_t kLightingLightIndicesRegister = 12u;
+inline constexpr uint32_t kLightParamBytes = 112u;
+inline constexpr uint32_t kLightIndexDataBytes = 576u;
 
 #if defined(__world_rtgi_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtgiTraceShader = __world_rtgi;
@@ -132,6 +138,41 @@ struct RtgiUpsamplePushConstants {
   float reserved[4];  // c2: unused
 };
 static_assert(sizeof(RtgiUpsamplePushConstants) == kRtgiUpsamplePushCount * sizeof(float), "upsample b12 must be 12 floats");
+
+// Mirrors LightParam in lighting_0xCA3D8596.ps_5_0.hlsl (offsets 0 to 108).
+struct LightParamCpu {
+  float pos[3];
+  float radius;
+  float color[3];
+  float radius_inv;
+  float chara_color[3];
+  float attenuation;
+  float vec[3];
+  float spot_angle_inv;
+  float attenuation_angle;
+  float specular_intensity;
+  float specular_glossiness;
+  float scatter_anisotropy;
+  float scatter_color[3];
+  float scatter_density;
+  float translucency;
+  int32_t shadowmap_index;
+  float scatter_offset;
+  float user_param;
+};
+static_assert(sizeof(LightParamCpu) == kLightParamBytes, "LightParam must be 112 bytes");
+
+// Mirrors LightIndexData in lighting_0xCA3D8596.ps_5_0.hlsl (offsets 0 to 572).
+struct LightIndexDataCpu {
+  int32_t point_indices[63];
+  uint32_t point_count;
+  int32_t spot_indices[63];
+  uint32_t spot_count;
+  int32_t probe_indices[14];
+  uint32_t probe_count;
+  float tile_depth_inv;
+};
+static_assert(sizeof(LightIndexDataCpu) == kLightIndexDataBytes, "LightIndexData must be 576 bytes");
 
 // One RTGI compute pipeline: layout params cbv (0), srv (1), uav (2), an optional sampler table (3), then the push
 // constants at b12 (param 3, or 4 with samplers).
@@ -215,6 +256,11 @@ struct RtgiDeviceData {
   reshade::api::format radiance_format = reshade::api::format::unknown;
   uint64_t radiance_frame = UINT64_MAX;
   bool radiance_failed = false;
+  reshade::api::resource lights_copy = {0u};  // Sora 2nd dynamicLights_g copy (stats request only)
+  uint64_t lights_copy_bytes = 0u;
+  reshade::api::resource light_indices_copy = {0u};  // Sora 2nd lightIndices_g copy (stats request only)
+  uint64_t light_indices_copy_bytes = 0u;
+  bool lights_copied = false;  // the last dispatch copied both light buffers
   bvh::GpuTimer timer = {};
   bvh::GpuTimer denoise_timer = {};  // temporal, filter and upsample
 };
@@ -236,6 +282,8 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   DestroyRtgiTextureSet(device, &data.final_gi);
   bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
+  bvh::DestroyBuffer(device, nullptr, &data.lights_copy);
+  bvh::DestroyBuffer(device, nullptr, &data.light_indices_copy);
   bvh::DestroyGpuTimer(&data.timer);
   bvh::DestroyGpuTimer(&data.denoise_timer);
   if (data.point_sampler.handle != 0u) device->destroy_sampler(data.point_sampler);

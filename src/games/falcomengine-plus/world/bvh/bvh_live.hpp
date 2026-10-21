@@ -1938,9 +1938,11 @@ inline void DescribeLiveInspect(BvhDeviceData* data) {
     inspect.lines.push_back(LiveFormat("Pixel (%u, %u): hit at %.2f m, point (%.2f, %.2f, %.2f).", inspect.x, inspect.y,
                                        inspect.t, inspect.position[0], inspect.position[1], inspect.position[2])
                             + compare_text);
-    inspect.lines.push_back(LiveFormat("Instance %u: VS 0x%08X, position (%.2f, %.2f, %.2f), axis scales (%.3f, %.3f, %.3f)%s.",
+    inspect.lines.push_back(LiveFormat("Instance %u: VS 0x%08X, position (%.2f, %.2f, %.2f), axis scales (%.3f, %.3f, %.3f)%s, foliage flag %s, alpha-tested %s (atlas material %u), %s.",
                                        inspect.instance, info.vs_hash, m[3], m[7], m[11], scale[0], scale[1], scale[2],
-                                       PoolOutsideLegacyScale(m) ? ", outside the legacy scale limits" : ""));
+                                       PoolOutsideLegacyScale(m) ? ", outside the legacy scale limits" : "",
+                                       info.foliage ? "yes" : "no", info.alpha ? "yes" : "no", info.material,
+                                       info.dynamic ? "moving (refitted)" : "static"));
 
     bool scene_fade = false;
     float near_fade_floor = 0.f;

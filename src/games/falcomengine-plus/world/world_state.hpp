@@ -135,6 +135,13 @@ struct CameraSnapshot {
   bool has_fade = false;
   float near_fade_floor = 0.f;  // disableMapObjNearFade_g
   float map_alpha = 1.f;        // mapColor_g.w
+  // Game sun and shadows (cb_scene, lighting pass), when the captured constants reach them.
+  bool has_sun = false;
+  float light_color[3] = {};        // lightColor_g (c25)
+  float light_direction[3] = {};    // lightDirection_g (c26)
+  float scene_shadow_color[3] = {};  // sceneShadowColor_g (c27)
+  int32_t shadow_cascade_count = 0;  // shadowmapCascadeCount_g (c27.w, int bits; on Kai c27.w is chrLightIntensity_g)
+  float shadow_split_distance[3] = {};  // shadowSplitDistance_g (c57)
 };
 
 struct FamilyStats {

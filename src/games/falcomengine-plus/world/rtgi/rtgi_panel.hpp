@@ -5,10 +5,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 
 #include <deps/imgui/imgui.h>
 
 #include "../rtao/rtao_state.hpp"
+#include "../world_state.hpp"
 #include "rtgi.hpp"
 
 namespace falcom_world::rtgi {
@@ -31,6 +33,20 @@ inline void DrawRtgiPanel() {
                 frame.divisor, frame.divisor, frame.full_width, frame.full_height);
   }
   ImGui::Text("Scene layout: prevViewProj_g at c%u", frame.prev_view_proj_register);
+  CameraSnapshot camera;
+  {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    camera = g_state.camera;
+  }
+  if (camera.has_sun) {
+    ImGui::Text("Game sun: colour (%.2f, %.2f, %.2f), direction (%.2f, %.2f, %.2f), shadow cascades %d, splits (%.1f, %.1f, %.1f) m, scene shadow colour (%.2f, %.2f, %.2f)",
+                camera.light_color[0], camera.light_color[1], camera.light_color[2], camera.light_direction[0],
+                camera.light_direction[1], camera.light_direction[2], camera.shadow_cascade_count, camera.shadow_split_distance[0],
+                camera.shadow_split_distance[1], camera.shadow_split_distance[2], camera.scene_shadow_color[0],
+                camera.scene_shadow_color[1], camera.scene_shadow_color[2]);
+  } else {
+    ImGui::TextDisabled("Game sun: not captured");
+  }
   ImGui::Text("Composite: GI Intensity %.2f, Character GI Intensity %.2f, %s; one-bounce correction %s", g_rtgi_intensity,
               g_rtgi_char_intensity,
               frame.applied_frame != UINT64_MAX && frame.applied_frame == frame.dispatched_frame

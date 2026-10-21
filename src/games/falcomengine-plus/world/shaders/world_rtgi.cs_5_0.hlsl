@@ -7,7 +7,7 @@
 // hidden on screen or off screen. Each hit gets a radiance. On screen with a valid copy: the previous frame's lighting
 // output at the hit's previous-frame pixel (t20, prevViewProj_g). Otherwise: RTGI_FALLBACK_ALBEDO * (sun * N.L * a sun
 // shadow ray + Ambient Contribution * the game's probe ambient). The raw GI (u2) is the mean sample radiance times the
-// distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views 1 to 3 (u0).
+// distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views 1 to 3 and 8 (u0).
 // One bounce (M4): the copy holds last frame's applied bounce, so with RTGI_FLAG_SUBTRACT_PREVIOUS each lookup subtracts
 // the previous final GI (t21) x the G-buffer colour at the hit (t22) x last frame's GI Intensity (c5.z), clamped at 0.
 // Camera: the game scene CBV (b0). Noise: IS-FAST (t18, Load only) or IGN, offset by 64 px from RTAO's.
@@ -115,14 +115,26 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         if (any(resolutionScaling_g != float2(1.0, 1.0)))
         {
             InterlockedAdd(gs_stats[RTGI_STAT_SCALED], 1u);
+            if (debug_mode == 8)
+            {
+                debug_color = float3(0.5, 0.5, 0.5);
+            }
         }
         else if (depth <= 0.0)
         {
             InterlockedAdd(gs_stats[RTGI_STAT_SKY], 1u);
+            if (debug_mode == 8)
+            {
+                debug_color = float3(0.0, 0.0, 0.5);
+            }
         }
         else if (dot(N, N) < 0.5)
         {
             InterlockedAdd(gs_stats[RTGI_STAT_NORMAL], 1u);
+            if (debug_mode == 8)
+            {
+                debug_color = float3(1.0, 0.0, 1.0);
+            }
         }
         else
         {
@@ -136,6 +148,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             if (!(all(P >= region_lo) && all(P <= region_hi)))
             {
                 InterlockedAdd(gs_stats[RTGI_STAT_REGION], 1u);
+                if (debug_mode == 8)
+                {
+                    debug_color = float3(0.0, 0.5, 0.0);
+                }
             }
             else if (distance_to_camera >= g_rtgi_fade.y)
             {
@@ -168,6 +184,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint invalid_refs = 0u;
                 uint stack_overflow = 0u;
                 float t_sum = 0.0;
+                float min_t = ray_max;
                 for (uint i = 0u; i < spp; ++i)
                 {
                     float2 u;
@@ -194,6 +211,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     }
                     hits += 1u;
                     t_sum += hit.t;
+                    min_t = min(min_t, hit.t);
                     distance_dm += (uint)(hit.t * 10.0);
                     // On screen: the hit projects inside the image and the game depth there is the hit (2% or 5 cm, the
                     // RTAO discovery tolerance). Hidden on screen: it projects inside but another surface is in front.
@@ -328,10 +346,26 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 {
                     debug_color = gi / (1.0 + gi);
                 }
+                else if (debug_mode == 8)
+                {
+                    // Pixel classes: the normal faces away from the camera; a hit within 1 cm; neither.
+                    if (dot(N, camera - P) < 0.0)
+                    {
+                        debug_color = float3(1.0, 1.0, 0.0);
+                    }
+                    else if (hits > 0u && min_t < 0.01)
+                    {
+                        debug_color = float3(0.0, 1.0, 1.0);
+                    }
+                    else
+                    {
+                        debug_color = float3(0.0, 0.0, 0.0);
+                    }
+                }
             }
         }
         InterlockedAdd(gs_stats[RTGI_STAT_PIXELS], 1u);
-        if (debug_mode >= 1 && debug_mode <= 3)
+        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8)
         {
             for (uint dy = 0u; dy < d; ++dy)
             {
