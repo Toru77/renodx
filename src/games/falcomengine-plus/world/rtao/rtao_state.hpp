@@ -20,6 +20,7 @@ inline float g_rtao_normal_bias = 0.05f;
 inline float g_rtao_two_sided = 1.f;
 inline float g_rtao_foliage_skip = 0.f;  // Foliage skip: RTAO rays ignore INSTANCE_FOLIAGE instances
 inline float g_rtao_trace_characters = 0.f;  // Trace characters: RTAO rays hit this frame's skinned characters
+inline float g_rtao_trace_resolution = 0.f;  // Trace Resolution: RTAO traces at 0 Full, 1 Half, 2 Quarter
 inline float g_rtao_char_intensity = 1.f;  // Character Intensity: RTAO kept on character pixels (lighting shader)
 inline float g_rtao_max_darkening = 1.f;  // Max Darkening: AO is never below 1 - this (lighting shader)
 inline float g_rtao_temporal_enabled = 1.f;
@@ -99,6 +100,7 @@ struct ParameterSnapshot {
   float zero_motion, freeze_noise, camera_matrix;
   float foliage_skip;
   float trace_characters;
+  float trace_resolution;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 
@@ -333,6 +335,7 @@ inline const char* ParameterFieldName(const ParameterSnapshot& a, const Paramete
   if (a.camera_matrix != b.camera_matrix) return "test_camera_matrix";
   if (a.foliage_skip != b.foliage_skip) return "foliage_skip";
   if (a.trace_characters != b.trace_characters) return "trace_characters";
+  if (a.trace_resolution != b.trace_resolution) return "trace_resolution";
   return "";
 }
 
@@ -390,5 +393,13 @@ inline Fade RtaoEffectiveFade(float built_range, float slider_range, float start
   const float end_eff = std::min(end_req, built_range);
   return {std::min(start_req, end_eff), end_eff, built_range, start_req, end_req};
 }
+
+// Trace Resolution setting (0 Full, 1 Half, 2 Quarter) to the block side d: one trace pixel per d x d pixels.
+inline uint32_t RtgiTraceDivisor(float setting) {
+  return 1u << std::clamp(static_cast<int>(setting + 0.5f), 0, 2);
+}
+
+// Trace pixels along one axis of full pixels (the last block may be partial).
+inline uint32_t RtgiTraceExtent(uint32_t full, uint32_t divisor) { return (full + divisor - 1u) / divisor; }
 
 }  // namespace falcom_world::rtao

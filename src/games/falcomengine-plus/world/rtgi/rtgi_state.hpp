@@ -84,14 +84,6 @@ inline uint32_t RtgiPrevViewProjRegister(SceneLayout layout) {
   return 0u;
 }
 
-// Trace Resolution setting (0 Full, 1 Half, 2 Quarter) to the block side d: one trace pixel per d x d pixels.
-inline uint32_t RtgiTraceDivisor(float setting) {
-  return 1u << std::clamp(static_cast<int>(setting + 0.5f), 0, 2);
-}
-
-// Trace pixels along one axis of full pixels (the last block may be partial).
-inline uint32_t RtgiTraceExtent(uint32_t full, uint32_t divisor) { return (full + divisor - 1u) / divisor; }
-
 // Effective GI ray length. The camera is at least built_range + margin from every region face (bvh_pool.hpp
 // kPoolRegionRayMargin), so a pixel inside the effective Fade End keeps built_range + margin - fade_end_eff to the
 // nearest face: rays of at most that length never reach the shader's region guard.

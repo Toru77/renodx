@@ -9105,6 +9105,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   in.scene_cbv_view = dd->captured_scene_cbv_view;
   in.width = dd->captured_depth_w;
   in.height = dd->captured_depth_h;
+  in.trace_divisor = rtao::RtgiTraceDivisor(rtao::g_rtao_trace_resolution);
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp),
                                                          rtao::g_test_freeze_noise > 0.5f);
   const uint32_t rtao_flags = (rtao::g_rtao_discovery > 0.5f ? rtao::kRtaoFlagDiscovery : 0u)
@@ -9190,7 +9191,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       rtao::g_rtao_fade_end_pct, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
       rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
       rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix,
-      rtao::g_rtao_foliage_skip, rtao::g_rtao_trace_characters};
+      rtao::g_rtao_foliage_skip, rtao::g_rtao_trace_characters, rtao::g_rtao_trace_resolution};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
   if (params_changed) rf.last_parameter_change = rtao::ParameterFieldName(params, rf.prev_params);
   rf.prev_params = params;
@@ -9332,7 +9333,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                                                   rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct);
   const float ray_max = rtgi::RtgiEffectiveRayMax(rtgi::g_rtgi_ray_max, fade.coverage, fade.end,
                                                   falcom_world::bvh::kPoolRegionRayMargin);
-  const uint32_t divisor = rtgi::RtgiTraceDivisor(rtgi::g_rtgi_trace_resolution);
+  const uint32_t divisor = rtao::RtgiTraceDivisor(rtgi::g_rtgi_trace_resolution);
   const float spp = (std::max)(rtgi::g_rtgi_samples, 1.f);
   // RTAO loaded the IS-FAST texture this frame when its own row is on; RTGI follows RTAO's IS-FAST row.
   const bool isfast_used = rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
@@ -9353,8 +9354,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
-  const uint32_t trace_width = rtgi::RtgiTraceExtent(dd->captured_depth_w, divisor);
-  const uint32_t trace_height = rtgi::RtgiTraceExtent(dd->captured_depth_h, divisor);
+  const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
+  const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
   const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,

@@ -649,6 +649,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtaoTraceResolution",
+      .binding = &rtao::g_rtao_trace_resolution,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "Trace Resolution",
+      .section = "RTAO",
+      .tooltip = "Traces RTAO at full, half or quarter resolution, then upsamples to full size before the temporal pass. Full = unchanged.",
+      .labels = {"Full", "Half", "Quarter"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoRayMax",
       .binding = &rtao::g_rtao_ray_max,
       .value_type = SettingValueType::FLOAT,
@@ -1011,7 +1022,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "Off-screen Dynamic Lights",
       .section = "RTGI",
-      .tooltip = "Lamps that touch the screen this frame (the ones listed in the game's screen tile lists) add light to hits not read from the screen (hidden and off-screen surfaces). Lamps outside the screen are not used. Off = unchanged.",
+      .tooltip = "Lamps the game has loaded for this view (it loads only lamps that touch the view) add light to hits not read from the screen, such as hidden and off-screen surfaces. Lamps behind the camera are not loaded and are not used. Off = unchanged.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

@@ -72,11 +72,14 @@ inline void DrawRtaoPanel() {
         v[kRtaoStatTemporalBase + 5u]);
     ImGui::Text("Traced pixels: %u of %u (sky, normal, region and scaled are not traced)",
                 den.traced, v[kRtaoStatPixels]);
-    ImGui::Text("Temporal taps (unweighted): valid %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
-                SharePercent(v[kRtaoStatTemporalBase + 1u], den.taps),
-                SharePercent(v[kRtaoStatTemporalBase + 2u], den.taps),
-                SharePercent(v[kRtaoStatTemporalBase + 3u], den.taps));
-    if (den.traced > 0u) {
+    // Pass B shares are valid only at Full (see the counters note in the Last dispatch block).
+    if (frame.trace_divisor == 1u) {
+      ImGui::Text("Temporal taps (unweighted): valid %.1f%%, rejected depth %.1f%%, rejected normal %.1f%%",
+                  SharePercent(v[kRtaoStatTemporalBase + 1u], den.taps),
+                  SharePercent(v[kRtaoStatTemporalBase + 2u], den.taps),
+                  SharePercent(v[kRtaoStatTemporalBase + 3u], den.taps));
+    }
+    if (den.traced > 0u && frame.trace_divisor == 1u) {
       const double wden = 1000.0 * den.traced;
       const double w_acc = 100.0 * v[kRtaoStatWeightBase] / wden;
       const double w_dep = 100.0 * v[kRtaoStatWeightBase + 1u] / wden;
@@ -157,6 +160,11 @@ inline void DrawRtaoPanel() {
                 c.zero_motion > 0.5f ? "on" : "off", c.freeze_noise > 0.5f ? "on" : "off", c.camera_matrix > 0.5f ? "on" : "off",
                 c.foliage_skip > 0.5f ? "on" : "off", c.trace_characters > 0.5f ? "on" : "off",
                 frame.character_objects);
+  }
+  if (frame.trace_divisor > 1u) {
+    ImGui::Text("Trace: %u x %u (one per %u x %u block of %u x %u)", frame.trace_width, frame.trace_height,
+                frame.trace_divisor, frame.trace_divisor, frame.depth_w, frame.depth_h);
+    ImGui::TextDisabled("Counters are per trace pixel at Half and Quarter; Pass B shares are valid only at Full");
   }
   if (frame.temporal_ran || frame.motion_dims_ok == false) {
     ImGui::Text("Motion dims: RTV4 %ux%u, depth %ux%u (%s)", frame.motion_w, frame.motion_h,

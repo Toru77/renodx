@@ -64,6 +64,9 @@ struct RtaoFrameState {
   bool captured_isfast_used = false;
   uint32_t p2b_records = 0u;         // P2b records the newest dispatch traced (fade.w)
   uint32_t character_objects = 0u;   // character objects the newest dispatch traced (size.z)
+  uint32_t trace_divisor = 1u;       // Trace Resolution of the newest dispatch: block side d (1, 2 or 4)
+  uint32_t trace_width = 0u;         // pass A extent of the newest dispatch (ceil(width / d))
+  uint32_t trace_height = 0u;
 };
 
 inline RtaoFrameState g_rtao_frame;
@@ -98,6 +101,7 @@ struct RtaoDispatchInputs {
   int filter_taps = 5;     // Filter Taps: samples per direction (separable) or kernel side (a-trous)
   int debug_mode = 0;
   bvh::DynamicTraceInputs dynamic = {};  // characters (RefitDeformLiveCharacters), count 0 when off
+  uint32_t trace_divisor = 1u;  // Trace Resolution: block side d (1 Full, 2 Half, 4 Quarter)
 };
 
 struct RtaoDispatchResult {
@@ -198,11 +202,20 @@ inline reshade::api::resource_view OutputSrv(const RtaoDeviceData& rd) {
 // Binds, dispatches and unbinds. The AO and the history are written only by a pass that succeeded.
 inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtaoDispatchInputs& in) {
   const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtao_record_us};
+  // Set before any early return, so a skipped dispatch cannot leave the previous trace size in the panel or json.
+  const uint32_t d = in.trace_divisor;
+  const uint32_t trace_w = RtgiTraceExtent(in.width, d);
+  const uint32_t trace_h = RtgiTraceExtent(in.height, d);
+  g_rtao_frame.trace_divisor = d;
+  g_rtao_frame.trace_width = trace_w;
+  g_rtao_frame.trace_height = trace_h;
   auto* bvh_data = bvh::GetBvhDeviceData(device);
   if (bvh_data == nullptr || in.width == 0u || in.height == 0u) return {};
   RtaoDeviceData& data = GetRtaoDeviceData(device);
   if (!EnsureRtaoPipeline(device, &data) || !EnsureRtaoTarget(device, &data, in.width, in.height)
-      || !EnsureRtaoStats(device, &data)) {
+      || !EnsureRtaoStats(device, &data)
+      || (d > 1u && !(EnsureRtaoTraceTarget(device, &data, trace_w, trace_h)
+                      && EnsureRtaoUpsamplePipeline(device, &data)))) {
     return {};
   }
   data.filter_ran = false;
@@ -217,7 +230,8 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   push.size[0] = static_cast<float>(in.width);
   push.size[1] = static_cast<float>(in.height);
   push.size[2] = static_cast<float>(in.dynamic.count);
-  push.size[3] = temporal_run ? 1.f : 0.f;  // output_raw: pass A writes u2 for pass B
+  push.size[3] = (temporal_run || d > 1u) ? 1.f : 0.f;  // output_raw: pass A writes u2 for pass B or the upsample
+  push.trace[0] = static_cast<float>(d);
   std::memcpy(&push.fade[3], &bvh_data->dynamic.instance_count, sizeof(uint32_t));  // P2b records (t19)
   g_rtao_frame.p2b_records = bvh_data->dynamic.instance_count;
   g_rtao_frame.character_objects = in.dynamic.count;
@@ -234,7 +248,8 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[17] = in.mrt_normal_view;
   srvs[18] = in.isfast_view;
   srvs[19] = bvh_data->dynamic.instances_srv;
-  const reshade::api::resource_view uavs[kRtaoUavCount] = {data.ao_uav, data.stats_uav, data.raw_uav[data.raw_index]};
+  const reshade::api::resource_view uavs[kRtaoUavCount] = {
+      data.ao_uav, data.stats_uav, (d > 1u ? data.trace_uav : data.raw_uav[data.raw_index])};
   reshade::api::descriptor_table_update updates[3] = {
       {data.cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &in.scene_cbv_view},
       {data.srv_table, 0, 0, kRtaoSrvCount, reshade::api::descriptor_type::shader_resource_view, srvs},
@@ -246,8 +261,39 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, data.layout, 0, 3, tables);
   cmd_list->push_constants(
       reshade::api::shader_stage::all_compute, data.layout, 3, 0, kRtaoPushConstantCount, &push);
-  cmd_list->dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+  cmd_list->dispatch((trace_w + 7u) / 8u, (trace_h + 7u) / 8u, 1u);
   NullComputeSlots(cmd_list, kRtaoSrvCount, kRtaoUavCount, 0u);
+
+  if (d > 1u) {
+    // Pass A wrote the trace-size raw AO through u2; the upsample reads it through t0 and writes the full-size AO.
+    cmd_list->barrier(data.trace_texture, reshade::api::resource_usage::unordered_access,
+                      reshade::api::resource_usage::shader_resource);
+    const reshade::api::resource_view upsample_srvs[kRtaoUpsampleSrvCount] = {
+        data.trace_srv, in.depth_view, in.mrt_normal_view};
+    const reshade::api::resource_view upsample_uavs[kRtaoUpsampleUavCount] = {
+        data.ao_uav, (temporal_run ? data.raw_uav[data.raw_index] : reshade::api::resource_view{0u})};
+    reshade::api::descriptor_table_update upsample_updates[3] = {
+        {data.upsample_cbv_table, 0, 0, 1, reshade::api::descriptor_type::constant_buffer, &in.scene_cbv_view},
+        {data.upsample_srv_table, 0, 0, kRtaoUpsampleSrvCount, reshade::api::descriptor_type::shader_resource_view,
+         upsample_srvs},
+        {data.upsample_uav_table, 0, 0, kRtaoUpsampleUavCount, reshade::api::descriptor_type::unordered_access_view,
+         upsample_uavs},
+    };
+    device->update_descriptor_tables(3, upsample_updates);
+    const RtaoUpsamplePushConstants upush = {
+        {static_cast<float>(in.width), static_cast<float>(in.height), static_cast<float>(trace_w),
+         static_cast<float>(trace_h)},
+        {static_cast<float>(d), temporal_run ? 1.f : 0.f, 0.f, 0.f}};
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, data.upsample_pipeline);
+    const reshade::api::descriptor_table upsample_tables[3] = {
+        data.upsample_cbv_table, data.upsample_srv_table, data.upsample_uav_table};
+    cmd_list->bind_descriptor_tables(
+        reshade::api::shader_stage::all_compute, data.upsample_layout, 0, 3, upsample_tables);
+    cmd_list->push_constants(
+        reshade::api::shader_stage::all_compute, data.upsample_layout, 3, 0, kRtaoUpsamplePushCount, &upush);
+    cmd_list->dispatch((in.width + 7u) / 8u, (in.height + 7u) / 8u, 1u);
+    NullComputeSlots(cmd_list, kRtaoUpsampleSrvCount, kRtaoUpsampleUavCount, 0u);
+  }
 
   if (temporal_run) {
     // Pass A wrote the raw AO through u2; pass B reads it through t0.
@@ -332,15 +378,22 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
   const double w_dep = den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 1u] / wbase : 0.0;
   const double w_nor = den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 2u] / wbase : 0.0;
   const uint32_t* qv = &v[kRtaoStatQualityBase];
+  // Pass B shares are valid only at Full: at Half and Quarter they are written as null.
+  const auto pass_b_share = [&f](double share) {
+    std::ostringstream out;
+    out << share;
+    return f.trace_divisor == 1u ? out.str() : std::string("null");
+  };
   std::ostringstream diag;
   diag << "{\"traced_pixels\": " << den.traced << ", \"taps_traced\": " << den.taps
        << ", \"reset_traced\": " << den.reset_traced << ", \"pass_b_pixels\": " << tv[kRtaoStatTemporalBase]
        << ", \"moving_pixels\": " << fv[0] << ", \"motion_max_px\": " << fv[1] / 100.0
-       << ", \"mean_motion_px\": " << fv[2] / 100.0 / tpx << ", \"share_moving\": " << fv[0] / tpx
-       << ", \"share_clamp_active\": " << fv[3] / tpx << ", \"mean_clamp_shift\": " << fv[4] / 1000.0 / tpx
+       << ", \"mean_motion_px\": " << fv[2] / 100.0 / tpx << ", \"share_moving\": " << pass_b_share(fv[0] / tpx)
+       << ", \"share_clamp_active\": " << pass_b_share(fv[3] / tpx)
+       << ", \"mean_clamp_shift\": " << fv[4] / 1000.0 / tpx
        << ", \"mean_alpha\": " << fv[5] / 1000.0 / tpx << ", \"mean_abs_raw_minus_ao\": " << fv[6] / 1000.0 / tpx
-       << ", \"share_no_history\": " << fv[7] / tpx
-       << ", \"texel_differs\": " << fv[8] << ", \"share_texel_differs\": " << fv[8] / tpx
+       << ", \"share_no_history\": " << pass_b_share(fv[7] / tpx)
+       << ", \"texel_differs\": " << fv[8] << ", \"share_texel_differs\": " << pass_b_share(fv[8] / tpx)
        << ", \"weighted_shares\": {\"accepted\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase] / (1000.0 * den.traced) : 0.0)
        << ", \"rejected_depth\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 1u] / (1000.0 * den.traced) : 0.0)
        << ", \"rejected_normal\": " << (den.traced > 0u ? 100.0 * v[kRtaoStatWeightBase + 2u] / (1000.0 * den.traced) : 0.0) << "}"
@@ -385,6 +438,9 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
        << ", \"foliage_skip\": " << f.captured.foliage_skip
        << ", \"trace_characters\": " << f.captured.trace_characters
        << ", \"debug\": " << f.captured.debug << "}"
+       << ", \"trace\": {\"resolution\": " << f.captured.trace_resolution << ", \"divisor\": " << f.trace_divisor
+       << ", \"width\": " << f.trace_width << ", \"height\": " << f.trace_height
+       << ", \"counters\": \"per trace pixel at Half and Quarter; Pass B shares are valid only at Full\"}"
        << ", \"frames_without_ao_by_reason\": {";
   bool first_reason = true;
   for (size_t r = 0; r < kReasonCount; ++r) {

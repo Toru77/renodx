@@ -54,19 +54,19 @@ static std::string ReadText(const std::string& path) {
 }
 
 static void TestTraceDivisor() {
-  CHECK(rtgi::RtgiTraceDivisor(-1.f) == 1u, "setting -1 gives 1");
-  CHECK(rtgi::RtgiTraceDivisor(0.f) == 1u, "setting 0 (Full) gives 1");
-  CHECK(rtgi::RtgiTraceDivisor(1.f) == 2u, "setting 1 (Half) gives 2");
-  CHECK(rtgi::RtgiTraceDivisor(2.f) == 4u, "setting 2 (Quarter) gives 4");
-  CHECK(rtgi::RtgiTraceDivisor(3.f) == 4u, "setting 3 clamps to 4");
+  CHECK(falcom_world::rtao::RtgiTraceDivisor(-1.f) == 1u, "setting -1 gives 1");
+  CHECK(falcom_world::rtao::RtgiTraceDivisor(0.f) == 1u, "setting 0 (Full) gives 1");
+  CHECK(falcom_world::rtao::RtgiTraceDivisor(1.f) == 2u, "setting 1 (Half) gives 2");
+  CHECK(falcom_world::rtao::RtgiTraceDivisor(2.f) == 4u, "setting 2 (Quarter) gives 4");
+  CHECK(falcom_world::rtao::RtgiTraceDivisor(3.f) == 4u, "setting 3 clamps to 4");
 }
 
 static void TestTraceExtent() {
-  CHECK(rtgi::RtgiTraceExtent(1920u, 2u) == 960u, "1920 / 2");
-  CHECK(rtgi::RtgiTraceExtent(1919u, 2u) == 960u, "1919 / 2 rounds up");
-  CHECK(rtgi::RtgiTraceExtent(1080u, 4u) == 270u, "1080 / 4");
-  CHECK(rtgi::RtgiTraceExtent(1081u, 4u) == 271u, "1081 / 4 rounds up");
-  CHECK(rtgi::RtgiTraceExtent(7u, 1u) == 7u, "full resolution is unchanged");
+  CHECK(falcom_world::rtao::RtgiTraceExtent(1920u, 2u) == 960u, "1920 / 2");
+  CHECK(falcom_world::rtao::RtgiTraceExtent(1919u, 2u) == 960u, "1919 / 2 rounds up");
+  CHECK(falcom_world::rtao::RtgiTraceExtent(1080u, 4u) == 270u, "1080 / 4");
+  CHECK(falcom_world::rtao::RtgiTraceExtent(1081u, 4u) == 271u, "1081 / 4 rounds up");
+  CHECK(falcom_world::rtao::RtgiTraceExtent(7u, 1u) == 7u, "full resolution is unchanged");
 }
 
 static void TestEffectiveRayMax() {

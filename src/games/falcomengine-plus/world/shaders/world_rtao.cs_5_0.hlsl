@@ -32,7 +32,7 @@ cbuffer cb_scene : register(b0)
     float2 resolutionScaling_g : packoffset(c49);
 };
 
-// Push constants (rtao.hpp fills these; 20 floats).
+// Push constants (rtao.hpp fills these; 24 floats).
 cbuffer cb_rtao : register(b12)
 {
     float4 g_rtao_params : packoffset(c0);    // radius, ray_max, strength, normal_bias
@@ -40,6 +40,7 @@ cbuffer cb_rtao : register(b12)
     float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, flags (z: RTAO_FLAG_* as a float), P2b record count (w, uint bits)
     float4 g_rtao_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtao_size : packoffset(c4); // width, height, character object count, output_raw (1 = u2, not u0)
+    float4 g_rtao_trace : packoffset(c5);  // trace divisor d in x (1 Full, 2 Half, 4 Quarter)
 };
 
 #define RTAO_STAT_RAYS 0u
@@ -71,11 +72,16 @@ void TracePixel(uint2 px)
     const uint spp = max((uint)g_rtao_sampling.x, 1u);
     const float3 region_min = g_rtao_region.xyz;
     const float region_size = g_rtao_region.w;
+    // Trace pixel px is traced at its representative pixel, the block centre min(px * d + d / 2, size - 1)
+    // (px itself at Full).
+    const uint trace_d = max((uint)g_rtao_trace.x, 1u);
+    const uint2 full_size = uint2(g_rtao_size.xy);
+    const uint2 rep = min(px * trace_d + trace_d / 2u, full_size - 1u);
 
     float ao = 1.0;
     bool traced = false;
-    const float depth = g_game_depth.Load(int3(px, 0)).x;
-    const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
+    const float depth = g_game_depth.Load(int3(rep, 0)).x;
+    const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);
 
     if (any(resolutionScaling_g != float2(1.0, 1.0)))
     {
@@ -91,7 +97,7 @@ void TracePixel(uint2 px)
     }
     else
     {
-        const float2 uv = (float2(px) + 0.5) / g_rtao_size.xy;
+        const float2 uv = (float2(rep) + 0.5) / g_rtao_size.xy;
         const float4 world_h = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0), viewProjInv_g);
         const float3 P = world_h.xyz / world_h.w;
         const float3 region_lo = region_min + ray_max;
@@ -194,7 +200,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
     if (group_index < RTAO_DISC_COUNT) gs_disc[group_index] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
-    if (id.x < (uint)g_rtao_size.x && id.y < (uint)g_rtao_size.y) TracePixel(id.xy);
+    const uint trace_d = max((uint)g_rtao_trace.x, 1u);
+    const uint2 trace_size = (uint2(g_rtao_size.xy) + trace_d - 1u) / trace_d;
+    if (all(id.xy < trace_size)) TracePixel(id.xy);
 
     GroupMemoryBarrierWithGroupSync();
     if (group_index < RTAO_STAT_COUNT) InterlockedAdd(g_rtao_stats[group_index], gs_stats[group_index]);
