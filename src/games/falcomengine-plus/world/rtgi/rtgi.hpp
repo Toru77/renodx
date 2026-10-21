@@ -444,6 +444,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       .size = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), static_cast<float>(in.trace_width),
                static_cast<float>(in.trace_height)},
       .params = {in.push.params[3], static_cast<float>(in.debug_mode), g_rtgi_intensity, g_rtgi_char_intensity},
+      .extra = {g_rtgi_saturation, 0.f, 0.f, 0.f},
   };
   cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, upsample.pipeline);
   const reshade::api::descriptor_table upsample_tables[3] = {upsample.cbv_table, upsample.srv_table, upsample.uav_table};
@@ -618,6 +619,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
     out << "  \"game_sun\": {\"captured\": false},\n";
   }
   out << "  \"composite\": {\"intensity\": " << g_rtgi_intensity << ", \"character_intensity\": " << g_rtgi_char_intensity
+      << ", \"saturation\": " << g_rtgi_saturation
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
       << ", \"applied_intensity\": " << f.applied_intensity
       << ", \"subtract_previous\": " << (f.subtracted ? "true" : "false") << "},\n";

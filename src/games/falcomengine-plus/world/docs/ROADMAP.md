@@ -855,3 +855,15 @@ Verification (2026-10-08):
 - Owner test (not run): Foliage skip On, middle-click a plant that still shades in a BVH trace view: the inspect line should show alpha-tested yes; the plant should no longer darken. Foliage skip Off should match the image before this change.
 - Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtao.cs_5_0.hlsl` before M6a (HEAD, 671dbc7b): 0xc0dffe4249dc2227. After M6a: 0x79798e97df9d3210.
 - Harness: test_rtao:1881 still fails with the pass A pin (0xbcf4d7beeb61f2b6), as before (owner decision; the FAIL line prints 0x79798e97df9d3210). test_live 2758, 3009 and 3470 fail as before.
+
+## GI Saturation (rtgi-gi-sat): implemented, not validated in game
+
+- Setting RtgiSaturation "GI Saturation" (RTGI section): range 0 to 2, default 1. Push constant `u_extra.x` (c2; `RtgiUpsamplePushConstants.extra`, still 12 floats). Not in ParameterSnapshot, so changing it does not reset history.
+- Where it applies: the RTGI upsample pass (`world_rtgi_upsample.cs_5_0.hlsl`), after denoise, diffuse GI only. The saturation is applied to the value written to g_final, so Debug 6 and 7 show it too. This pass writes no history; the composite reads g_final and Debug 6 and 7 read `gi`, all after saturation.
+- Formula: luma = dot(gi, (0.2126, 0.7152, 0.0722)); gi = max(0, luma + (gi - luma) x S), S = GI Saturation.
+- Off equals HEAD: the branch is skipped at 1, so the image must match HEAD.
+- Surface colours, the game's lighting, ambient and highlights are not changed; only the bounce light RTGI adds.
+- Owner test (not run):
+  1. In a scene with coloured bounce (red walls, green grass), set GI Saturation 0, take a screenshot and RTGI Debug 7; then 2, the same screenshots; compare with 1.
+  2. Turn RTGI off and compare with vanilla.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtgi_upsample.cs_5_0.hlsl` before (HEAD 20538acc): 0x951afe71b2bd5deb. After: 0x935192aef4161a51.

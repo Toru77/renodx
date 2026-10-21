@@ -47,8 +47,9 @@ inline void DrawRtgiPanel() {
   } else {
     ImGui::TextDisabled("Game sun: not captured");
   }
-  ImGui::Text("Composite: GI Intensity %.2f, Character GI Intensity %.2f, %s; one-bounce correction %s", g_rtgi_intensity,
-              g_rtgi_char_intensity,
+  ImGui::Text("Composite: GI Intensity %.2f, Character GI Intensity %.2f, Saturation %.2f, %s; "
+              "one-bounce correction %s",
+              g_rtgi_intensity, g_rtgi_char_intensity, g_rtgi_saturation,
               frame.applied_frame != UINT64_MAX && frame.applied_frame == frame.dispatched_frame
                   ? "added this frame"
                   : "not added (GI Intensity 0, not Sora 2nd, or not running)",

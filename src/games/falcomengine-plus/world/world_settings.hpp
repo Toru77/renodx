@@ -863,7 +863,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTGI Debug",
       .section = "RTGI",
-      .tooltip = "Views 1 to 9 are drawn over the whole image when the frame is presented, while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End). 3 raw GI: this frame's traced bounce radiance before any denoising, shown as rgb / (1 + rgb). 4 accumulated GI after the temporal pass (needs RTGI Temporal on). 5 history confidence = valid history fraction (needs RTGI Temporal on). 6 final GI after the filter and the upsample, as the composite reads it. 7 applied GI: the bounce the Sora 2nd composite adds (final GI x the surface colour x GI Intensity, Character GI Intensity on character shading pixels), shown as rgb / (1 + rgb); black at GI Intensity 0, dark purple where the surface colour was not captured this frame. The image underneath and the next frame's GI are not affected. 8 pixel classes: grey = scaled frame, dark blue = sky, magenta = no G-buffer normal, dark green = outside the BVH region, dark purple = beyond Fade End, yellow = traced but the normal faces away from the camera, cyan = traced with a hit within 1 cm, black = traced with neither. 9 sun GI estimate: the sun part of each pixel's bounce as the Sun Contribution estimate reads it (surface colour x sun light x the sun diffuse factor x the screen shadow, minus the shadow floor), shown as rgb / (1 + rgb); bright = sunlit surfaces. Sun Contribution is not applied; dark purple = not traced.",
+      .tooltip = "Views 1 to 9 are drawn over the whole image when the frame is presented, while RTGI runs and no BVH GPU debug mode is selected. Off = normal image. 1 hit classes: red = off-screen hits, green = on-screen hits, blue = hits hidden behind other geometry on screen, black = misses (fractions of the samples). 2 hit distance: mean hit distance / effective Max Ray Distance (white = far), black = no hit. Dark purple = not traced (sky, invalid normal, scaled, outside the region or beyond Fade End). 3 raw GI: this frame's traced bounce radiance before any denoising, shown as rgb / (1 + rgb). 4 accumulated GI after the temporal pass (needs RTGI Temporal on). 5 history confidence = valid history fraction (needs RTGI Temporal on). 6 final GI after the filter and the upsample, as the composite reads it. 7 applied GI: the bounce the Sora 2nd composite adds (final GI, after GI Saturation, x the surface colour x GI Intensity, Character GI Intensity on character shading pixels), shown as rgb / (1 + rgb); black at GI Intensity 0, dark purple where the surface colour was not captured this frame. The image underneath and the next frame's GI are not affected. 8 pixel classes: grey = scaled frame, dark blue = sky, magenta = no G-buffer normal, dark green = outside the BVH region, dark purple = beyond Fade End, yellow = traced but the normal faces away from the camera, cyan = traced with a hit within 1 cm, black = traced with neither. 9 sun GI estimate: the sun part of each pixel's bounce as the Sun Contribution estimate reads it (surface colour x sun light x the sun diffuse factor x the screen shadow, minus the shadow floor), shown as rgb / (1 + rgb); bright = sunlit surfaces. Sun Contribution is not applied; dark purple = not traced.",
       .labels = {"Off", "Hit classes", "Hit distance", "Raw GI", "Accumulated GI", "History confidence", "Final GI", "Applied GI", "Pixel classes", "Sun GI estimate"},
       .is_visible = advanced,
   });
@@ -875,6 +875,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "GI Intensity",
       .section = "RTGI",
       .tooltip = "Scales the bounce light added to the image (final GI x the surface colour), Sora 2nd. 0 = nothing is added: the image equals RTGI off.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiSaturation",
+      .binding = &rtgi::g_rtgi_saturation,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "GI Saturation",
+      .section = "RTGI",
+      .tooltip = "Saturation of the bounce light RTGI adds (the diffuse GI that GI Intensity scales). 1 = unchanged, 0 = grey bounce light, 2 = more saturated. Surface colours, the game's own lighting, ambient and highlights are not changed. Also shown in RTGI Debug 6 and 7.",
       .min = 0.f,
       .max = 2.f,
       .format = "%.2f",

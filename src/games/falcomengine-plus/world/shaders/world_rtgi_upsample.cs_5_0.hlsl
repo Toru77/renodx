@@ -31,7 +31,7 @@ cbuffer cb_rtgi_upsample : register(b12)
 {
     float4 u_size : packoffset(c0);      // full width, full height, trace width, trace height
     float4 u_params : packoffset(c1);    // trace divisor d, debug mode, GI Intensity, Character GI Intensity (Debug 7)
-    float4 u_reserved : packoffset(c2);  // unused
+    float4 u_extra : packoffset(c2);     // c2: GI Saturation, unused, unused, unused
 };
 
 [numthreads(8, 8, 1)]
@@ -82,6 +82,11 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             gi = sum_v / sum_w;
         }
+    }
+    if (u_extra.x != 1.0)
+    {
+        float luma = dot(gi, float3(0.2126, 0.7152, 0.0722));
+        gi = max(0.0, luma + (gi - luma) * u_extra.x);
     }
     g_final[px] = float4(gi, 1.0);
     if (debug_mode == 6)

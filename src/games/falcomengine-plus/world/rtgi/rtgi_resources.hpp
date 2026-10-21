@@ -167,7 +167,7 @@ static_assert(sizeof(RtgiFilterPushConstants) == kRtgiFilterPushCount * sizeof(f
 struct RtgiUpsamplePushConstants {
   float size[4];      // c0: full width, full height, trace width, trace height
   float params[4];    // c1: trace divisor, debug mode, GI Intensity, Character GI Intensity (Debug 7)
-  float reserved[4];  // c2: unused
+  float extra[4];     // c2: GI Saturation, unused, unused, unused
 };
 static_assert(sizeof(RtgiUpsamplePushConstants) == kRtgiUpsamplePushCount * sizeof(float), "upsample b12 must be 12 floats");
 

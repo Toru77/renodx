@@ -256,6 +256,7 @@ static void TestJson() {
   CHECK(text.find("\"denoise_gpu_ms\": ") != std::string::npos, "denoise_gpu_ms key");
   CHECK(text.find("\"composite\": {") != std::string::npos, "composite object");
   CHECK(text.find("\"subtract_previous\": false") != std::string::npos, "subtract_previous key");
+  CHECK(text.find("\"saturation\": ") != std::string::npos, "saturation key");
 }
 
 int main() {

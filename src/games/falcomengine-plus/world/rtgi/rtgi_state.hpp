@@ -40,6 +40,7 @@ inline float g_rtgi_filter_taps_separable = 5.f;  // Filter Taps (separable): 3.
 inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
 inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
 inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
+inline float g_rtgi_saturation = 1.f;             // GI Saturation: saturation of the added diffuse GI (upsample pass)
 inline float g_rtgi_trace_characters = 0.f;  // Trace characters: RTGI rays hit this frame's skinned characters
 inline float g_rtgi_rtao_restore = 0.f;           // RTAO value to put back when RTGI is turned off (hidden row RtgiRtaoRestore)
 
