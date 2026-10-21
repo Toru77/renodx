@@ -79,7 +79,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             InterlockedAdd(gs_tstats[0], 1u);
             const bool history_valid_frame = g_t_size.w > 0.5;
             const float depth = g_game_depth.Load(int3(px, 0)).x;
-            const float3 N = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
+            const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
             const float2 uv = (float2(px) + 0.5) / float2(full_size);
             const float4 world_h = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0), viewProjInv_g);
             const float3 P = world_h.xyz / world_h.w;

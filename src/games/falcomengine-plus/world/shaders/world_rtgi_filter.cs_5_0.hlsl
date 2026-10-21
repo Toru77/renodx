@@ -39,7 +39,7 @@ bool RepresentativeSurface(int2 tq, out float3 P, out float3 N)
     const uint2 full_size = uint2(f_full.xy);
     const uint2 px = min(uint2(tq) * d + d / 2u, full_size - 1u);
     const float depth = g_game_depth.Load(int3(px, 0)).x;
-    N = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
+    N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
     const float2 uv = (float2(px) + 0.5) / float2(full_size);
     const float4 h = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0), viewProjInv_g);
     P = h.xyz / h.w;

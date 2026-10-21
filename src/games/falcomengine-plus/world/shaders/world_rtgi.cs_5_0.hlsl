@@ -111,7 +111,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         bool traced = false;
         float3 gi = float3(0.0, 0.0, 0.0);
         const float depth = g_game_depth.Load(int3(px, 0)).x;
-        const float3 N = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
+        const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
         if (any(resolutionScaling_g != float2(1.0, 1.0)))
         {
             InterlockedAdd(gs_stats[RTGI_STAT_SCALED], 1u);

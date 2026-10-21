@@ -45,7 +45,7 @@ void main(uint3 id : SV_DispatchThreadID)
     const int debug_mode = (int)u_params.y;
 
     const float depth = g_game_depth.Load(int3(px, 0)).x;
-    const float3 N = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
+    const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
     const bool surface = depth > 0.0 && dot(N, N) >= 0.5 && all(resolutionScaling_g == float2(1.0, 1.0));
     float3 gi = float3(0.0, 0.0, 0.0);
     if (surface)
@@ -70,7 +70,7 @@ void main(uint3 id : SV_DispatchThreadID)
             if (v.a <= 0.0) continue;
             const uint2 rep = min(uint2(tq) * d + d / 2u, full_size - 1u);
             const float rep_depth = g_game_depth.Load(int3(rep, 0)).x;
-            const float3 Nt = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(rep, 0)).xy);
+            const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(rep, 0)).xy);
             if (rep_depth <= 0.0 || dot(Nt, Nt) < 0.5) continue;
             const float2 rep_uv = (float2(rep) + 0.5) / float2(full_size);
             const float4 rep_h = mul(float4(rep_uv.x * 2.0 - 1.0, 1.0 - rep_uv.y * 2.0, rep_depth, 1.0), viewProjInv_g);

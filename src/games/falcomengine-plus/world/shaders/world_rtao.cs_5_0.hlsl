@@ -75,7 +75,7 @@ void TracePixel(uint2 px)
     float ao = 1.0;
     bool traced = false;
     const float depth = g_game_depth.Load(int3(px, 0)).x;
-    const float3 N = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
+    const float3 N = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
 
     if (any(resolutionScaling_g != float2(1.0, 1.0)))
     {

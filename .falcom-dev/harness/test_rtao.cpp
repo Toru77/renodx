@@ -1879,7 +1879,7 @@ static void TestPassShadersUnchanged() {
     return h;
   };
   CHECK(fnv(pass_a) == 0xbcf4d7beeb61f2b6ull, "pass A harness copy equals the recorded P2b t19 version (%016llx)", static_cast<unsigned long long>(fnv(pass_a)));
-  CHECK(fnv(pass_b) == 0xa3bd847063a8ce53ull, "pass B harness copy equals the M3b shared-include version (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
+  CHECK(fnv(pass_b) == 0x0fc3192d36aba975ull, "pass B harness copy equals the M3b shared-include version (%016llx)", static_cast<unsigned long long>(fnv(pass_b)));
   CHECK(fnv(shared) == 0xc49ca01f813c5510ull, "shared denoise include equals the M3b version (%016llx)", static_cast<unsigned long long>(fnv(shared)));
 }
 

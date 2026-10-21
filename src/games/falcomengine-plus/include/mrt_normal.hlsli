@@ -8,11 +8,10 @@
 // Matches the vanilla lighting decode (see sora2nd/lighting/lighting.asm:
 // `mad r8.zw` -> `sincos` -> `dp3 r3.y, r8.xywx`).
 //
-// Every consumer of the MRT normal goes through here: the GTVBAO passes
-// (gtvbao_common.hlsl) and the shadow passes (shadows/shadows_common.hlsli).
-// The decode is a correctness surface -- if two consumers disagree on the
-// encoding they produce visibly different geometry from the same texel -- so
-// there is one definition rather than one per feature.
+// GTVBAO (gtvbao_common.hlsl) and the shadow passes (shadows/shadows_common.hlsli)
+// use DecodeFalcomMrtNormal. The RT passes use DecodeFalcomMrtNormalAsGame, the
+// game's own decode with no zero case. Both decode the same encoding, so both live
+// here: a second copy elsewhere would be free to drift.
 
 // Normalize with an explicit fallback instead of a NaN. A zero-length input
 // (a cleared G-buffer texel) is a normal condition here, not an exceptional
@@ -26,13 +25,12 @@ float3 FalcomSafeNormalize3(float3 v, float3 fallback)
 // True when a normal is usable geometry rather than a placeholder.
 bool FalcomNormalValid(float3 n) { return dot(n, n) > 1e-5; }
 
-// Returns a ZERO vector for a texel the G-buffer never wrote. A cleared texel is
-// all-zero, which decodes to enc = (-1,-1) and therefore to the world-straight-
-// down normal (0,0,-1): unit length, so it survives a naive validity test and
-// would silently replace the depth normal. A written texel always has
-// raw.y ~= 32767 when N.z == 0, so an exact (0,0) pair can only mean "no
-// g-buffer data here". Callers fall back to the depth-derived normal on a zero
-// result, which is the same path they already use for an unavailable MRT.
+// Returns a ZERO vector for a texel the G-buffer never wrote (GTVBAO and shadows
+// only; DecodeFalcomMrtNormalAsGame has no zero case). A cleared texel is all-zero,
+// which decodes to enc = (-1,-1) and the world-straight-down normal (0,0,-1): unit
+// length, so it would survive a naive validity test. A written texel has
+// raw.y ~= 32767 when N.z == 0, so an exact (0,0) pair can only mean "no g-buffer
+// data here". Callers fall back to the depth-derived normal on a zero result.
 float3 DecodeFalcomMrtNormal(uint2 packed)
 {
   if (packed.x == 0u && packed.y == 0u) return float3(0.0, 0.0, 0.0);
@@ -42,6 +40,16 @@ float3 DecodeFalcomMrtNormal(uint2 packed)
   sincos(3.14159274 * enc.x, sin_a, cos_a);
   float ring = sqrt(saturate(1.0 - enc.y * enc.y));
   return FalcomSafeNormalize3(float3(cos_a * ring, sin_a * ring, enc.y), float3(0.0, 0.0, 0.0));
+}
+
+// Game lighting decode (lighting_0xCA3D8596.ps_5_0.hlsl:774-782). The world is y-up and (0,0) means -Z.
+float3 DecodeFalcomMrtNormalAsGame(uint2 packed)
+{
+  float2 enc = float2((float)packed.x, (float)packed.y) * 3.05180438e-05 + float2(-1.0, -1.0);
+  float sin_a, cos_a;
+  sincos(3.14159274 * enc.x, sin_a, cos_a);
+  float ring = sqrt(1.0 - enc.y * enc.y);
+  return float3(cos_a * ring, sin_a * ring, enc.y);
 }
 
 #endif  // SRC_GAMES_FALCOMENGINE_PLUS_INCLUDE_MRT_NORMAL_HLSI_

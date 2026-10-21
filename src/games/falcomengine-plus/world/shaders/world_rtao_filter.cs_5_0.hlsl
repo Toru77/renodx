@@ -55,7 +55,7 @@ float3 FilterPosition(int2 q, float depth)
 float FilterEdgeWeight(int2 q, float3 Pc, float3 Nc, float dist_c)
 {
     const float depth = g_game_depth.Load(int3(q, 0)).x;
-    const float3 Nt = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(q, 0)).xy);
+    const float3 Nt = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(q, 0)).xy);
     if (depth <= 0.0 || dot(Nt, Nt) < 0.5) return 0.0;
     return FilterPlaneNormalWeight(Pc, Nc, dist_c, FilterPosition(q, depth), Nt);
 }
@@ -88,7 +88,7 @@ void main(uint3 id : SV_DispatchThreadID)
     const int direction = (int)f_pass.x;
 
     const float depth = g_game_depth.Load(int3(px, 0)).x;
-    const float3 Nc = DecodeFalcomMrtNormal(g_mrt_normal.Load(int3(px, 0)).xy);
+    const float3 Nc = DecodeFalcomMrtNormalAsGame(g_mrt_normal.Load(int3(px, 0)).xy);
     const float value = FilterInput(px);
     const bool copy = depth <= 0.0 || dot(Nc, Nc) < 0.5 || any(resolutionScaling_g != float2(1.0, 1.0));
 
