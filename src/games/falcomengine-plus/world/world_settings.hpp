@@ -1005,13 +1005,13 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
-      .key = "RtgiOffscreenNothing",
-      .binding = &rtgi::g_rtgi_offscreen_nothing,
+      .key = "RtgiFallbackNoAlbedo",
+      .binding = &rtgi::g_rtgi_fallback_no_albedo,
       .value_type = SettingValueType::BOOLEAN,
       .default_value = 0.f,
-      .label = "Off-screen Hits Add Nothing",
+      .label = "Off-screen Hits: No Albedo Guess",
       .section = "RTGI",
-      .tooltip = "Hits not read from the screen (hidden, off-screen) add no light: the grey 0.5 albedo guess is dropped. Off = unchanged.",
+      .tooltip = "Hits that RTGI cannot read from the screen (hidden behind other surfaces, off screen, or no screen copy yet) are lit with the sun, the probe ambient and, with Off-screen Dynamic Lights, the lamps, then multiplied by a guessed surface colour of 0.5 grey. On: the guess is not applied (surface colour 1.0), so these hits return the light that reaches them. The sun, ambient and lamp light are computed the same way in both states. Off = unchanged.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

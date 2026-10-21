@@ -53,7 +53,7 @@ inline constexpr float kRtgiLuminanceStatCap = 1000.f;    // per-sample cap of t
 inline constexpr uint32_t kRtgiFlagRadianceValid = 1u;  // b12 c2.z bit (RTGI_FLAG_* in the shader)
 inline constexpr uint32_t kRtgiFlagSubtractPrevious = 2u;  // b12 c2.z bit: subtract last frame's applied bounce from lookups
 inline constexpr uint32_t kRtgiFlagSunCastersOnly = 4u;  // b12 c2.z bit: sun rays hit shadow casters only
-inline constexpr uint32_t kRtgiFlagDropFallback = 8u;    // b12 c2.z bit: fallback hits add no light
+inline constexpr uint32_t kRtgiFlagFallbackNoAlbedo = 8u;  // b12 c2.z bit: fallback hits use albedo 1.0, not RTGI_FALLBACK_ALBEDO
 inline constexpr uint32_t kRtgiFlagDynamicLights = 16u;  // b12 c2.z bit: fallback hits add the lamps of the type pass
 // Temporal pass counters, matching RTGI_STAT_* in world_rtgi_temporal.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;

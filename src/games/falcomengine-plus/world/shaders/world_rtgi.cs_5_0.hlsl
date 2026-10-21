@@ -114,7 +114,7 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_RADIANCE_VALID 1u
 #define RTGI_FLAG_SUBTRACT_PREVIOUS 2u
 #define RTGI_FLAG_SUN_CASTERS_ONLY 4u
-#define RTGI_FLAG_DROP_FALLBACK 8u
+#define RTGI_FLAG_FALLBACK_NO_ALBEDO 8u
 #define RTGI_FLAG_DYNAMIC_LIGHTS 16u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
@@ -308,10 +308,12 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             lookups += 1u;
                         }
                     }
-                    if (!looked_up && (flags & RTGI_FLAG_DROP_FALLBACK) == 0u)
+                    if (!looked_up)
                     {
+                        const float fallback_albedo = (flags & RTGI_FLAG_FALLBACK_NO_ALBEDO) != 0u ? 1.0 : RTGI_FALLBACK_ALBEDO;
                         // Hidden, off screen or no copy: sun with a shadow ray (shadow-only casters block it: hide off) plus
-                        // the game's probe ambient (lighting_0xCA3D8596 lines 827-841), times a grey albedo.
+                        // the game's probe ambient (lighting_0xCA3D8596 lines 827-841) and, with RTGI_FLAG_DYNAMIC_LIGHTS, the
+                        // lamps, times a grey albedo (RTGI_FALLBACK_ALBEDO; 1.0 with RTGI_FLAG_FALLBACK_NO_ALBEDO).
                         const float3 n = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
                         const float3 sun_dir = normalize(-lightDirection_g);
                         const float ndl = saturate(dot(n, sun_dir));
@@ -335,7 +337,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             lightProbe_g[0].xyz + lightProbe_g[1].xyz * n.x + lightProbe_g[2].xyz * n.y + lightProbe_g[3].xyz * n.z
                             + lightProbe_g[4].xyz * (n.z * n.x) + lightProbe_g[5].xyz * (n.y * n.z) + lightProbe_g[6].xyz * (n.y * n.x)
                             + lightProbe_g[7].xyz * (3.0 * n.z * n.z - 1.0) + lightProbe_g[8].xyz * (n.x * n.x - n.y * n.y));
-                        radiance = RTGI_FALLBACK_ALBEDO
+                        radiance = fallback_albedo
                             * (lightColor_g * sun * g_rtgi_sun.z + g_rtgi_shading.x * ambient);
                         if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
                         {
@@ -365,7 +367,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                     lamp_sum += lamp.color * lamp_att * lamp_cone * lamp_ndl;
                                 }
                             }
-                            radiance += RTGI_FALLBACK_ALBEDO * g_rtgi_dynamic.x * lamp_sum;
+                            radiance += fallback_albedo * g_rtgi_dynamic.x * lamp_sum;
                         }
                     }
                     if (any(isnan(radiance)) || any(isinf(radiance)))
