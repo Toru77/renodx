@@ -41,7 +41,7 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
 
 - Three RTGI rows after Sun Shadow Distance (all in the RTGI section, shown when the other RTGI rows are visible). With the defaults (all toggles Off, Sun Contribution 1) the image must match HEAD.
   - Sun Shadows From Shadow Casters Only (RtgiSunCastersOnly, BOOLEAN, default Off): the fallback sun shadow ray in `world_rtgi.cs_5_0.hlsl` sets `WorldCameraView.require_flags = INSTANCE_SHADOW_CASTER` (flag bit 4, `kRtgiFlagSunCastersOnly`). `TraceWorldInstance` hits an instance only when it has every required bit, so characters and moving objects follow the same rule. Off: require 0, as HEAD.
-  - Sun Contribution (RtgiSunContribution, FLOAT 0 to 2, default 1): multiplies the sun term of the fallback radiance; pushed in b12 c6.z (`g_rtgi_sun.z`, previously unused).
+  - Sun Contribution (RtgiSunContribution, FLOAT 0 to 2, default 1): scales only RTGI's bounce light from the sun (sunlight reflected by surfaces the GI rays hit). Fallback hits only for now; the game's lighting and the image are not changed. 1 = unchanged, 0 = no sun bounce, 2 = double. Pushed in b12 c6.z (`g_rtgi_sun.z`, previously unused).
   - Off-screen Hits: No Albedo Guess (RtgiFallbackNoAlbedo, BOOLEAN, default Off): flag bit 8 (`kRtgiFlagFallbackNoAlbedo`). Fallback hits (not read from the screen) are lit the same in both states: sun with a shadow ray, probe ambient and, with Off-screen Dynamic Lights, lamps. The grey 0.5 albedo guess is applied when Off; On uses albedo 1.0, so the fallback light doubles. Miss handling is unchanged.
 - The three values join `ParameterSnapshot` (a change resets RTGI history) and the RTGI JSON (`sun_casters_only`, `sun_contribution`, `fallback_no_albedo`). `WorldCameraView` gained `require_flags` as its last field; every initialiser passes 0 except the RTGI sun ray, which passes INSTANCE_SHADOW_CASTER when Sun Shadows From Shadow Casters Only is On and 0 otherwise (RTAO, the trace shader and the RTGI trace ray pass 0).
 - Off-screen Hits: No Albedo Guess changes only the albedo, so `RTGI_STAT_SUN_RAYS` and `RTGI_STAT_SUN_VISIBLE` count the fallback hits the same in both states; off-screen hits still count in the off-screen share.
@@ -52,7 +52,7 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
   1. All toggles Off, Sun Contribution 1: screenshots match HEAD (same scene, same time of day).
   2. Sun Shadows From Shadow Casters Only On: RTGI sun shadows come only from the game's shadow-map casters (indoors and outdoors); a surface shadowed by a non-caster is now sunlit.
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
-  4. Sun Contribution 0 and 2: the fallback sun light scales with the value; the ambient part does not change.
+  4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
 ## Off-screen dynamic lights (M4, rtgi-m4-lamps): implemented, not validated in game
 
@@ -61,7 +61,7 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
 - Limits: the game loads only lamps that touch the current view. M4 lights hidden and off-screen hits only from those loaded lamps, so lamps behind the camera (not loaded this frame) add nothing. The screen tile lists only classify each lamp as point or spot; they do not limit which loaded lamps count. The owner's buffers showed every loaded lamp is in a screen tile, so the two sets matched in practice. No shadow rays; a lamp lights a hit behind a wall, as the game's own lamp code does (no occlusion); the type comes from the tile lists, so a lamp listed as both point and spot gets both terms, as the game adds both.
 - Two rows (RTGI section, after Off-screen Hits: No Albedo Guess):
   - Off-screen Dynamic Lights (RtgiDynamicLights, BOOLEAN, default Off): flag bit 16 (`kRtgiFlagDynamicLights`). Off: no type pass and no lamp reads, as HEAD.
-  - Dynamic Light Contribution (RtgiDynamicLightContribution, FLOAT 0 to 2, default 1): pushed in b12 c7.x (`g_rtgi_dynamic.x`). The push grows from 28 to 32 floats.
+  - Dynamic Light Contribution (RtgiDynamicLightContribution, FLOAT 0 to 2, default 1): scales only RTGI's bounce light from the game's lamps (lamp light reflected by surfaces the GI rays hit). Fallback hits only for now; the game's lighting and the image are not changed. Pushed in b12 c7.x (`g_rtgi_dynamic.x`). The push grows from 28 to 32 floats.
 - Both values join `ParameterSnapshot` (a change resets RTGI history) and the RTGI JSON (`dynamic_lights`, `dynamic_light_contribution`). Defaults match HEAD: the image must match HEAD with Off.
 - Owner test list (not run):
   1. Stand where a lamp is on screen. Dynamic Light Contribution 1. Toggle Off, take a screenshot; toggle On, take a screenshot. Read RTGI Stats for each. Send back: both screenshots and both stats lines.
