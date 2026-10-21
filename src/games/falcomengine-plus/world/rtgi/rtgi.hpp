@@ -601,6 +601,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"dynamic_lights\": " << g_rtgi_dynamic_lights << ",\n";
   out << "  \"dynamic_light_contribution\": " << g_rtgi_dynamic_light_contribution << ",\n";
   out << "  \"trace_characters\": " << g_rtgi_trace_characters << ",\n";
+  out << "  \"game_sun_floor\": " << g_rtgi_game_sun << ",\n";
   out << "  \"character_objects\": " << f.character_objects << ",\n";
   if (in.camera != nullptr && in.camera->has_sun) {
     const CameraSnapshot& sun = *in.camera;

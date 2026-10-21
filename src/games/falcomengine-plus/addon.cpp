@@ -9350,7 +9350,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
       rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
-      rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution};
+      rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9414,7 +9414,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                        | (subtract ? rtgi::kRtgiFlagSubtractPrevious : 0u)
                        | (rtgi::g_rtgi_sun_casters_only > 0.5f ? rtgi::kRtgiFlagSunCastersOnly : 0u)
                        | (rtgi::g_rtgi_fallback_no_albedo > 0.5f ? rtgi::kRtgiFlagFallbackNoAlbedo : 0u)
-                       | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)),
+                       | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)
+                       | (rtgi::g_rtgi_game_sun > 0.5f ? rtgi::kRtgiFlagGameSun : 0u)),
                    0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},

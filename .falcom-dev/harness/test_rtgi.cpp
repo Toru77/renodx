@@ -143,6 +143,8 @@ static void TestShaderDefines() {
   CHECK(text.find("#define RTGI_FLAG_FALLBACK_NO_ALBEDO " + std::to_string(rtgi::kRtgiFlagFallbackNoAlbedo) + "u")
             != std::string::npos,
         "fallback no albedo flag define matches kRtgiFlagFallbackNoAlbedo");
+  CHECK(text.find("#define RTGI_FLAG_GAME_SUN " + std::to_string(rtgi::kRtgiFlagGameSun) + "u") != std::string::npos,
+        "game sun flag define matches kRtgiFlagGameSun");
   CHECK(text.find("g_rtgi_sun : packoffset(c6)") != std::string::npos, "trace cb_rtgi has c6 (Sun Shadow Distance)");
   CHECK(text.find("RTGI_SUN_RAY_MAX") == std::string::npos, "the fixed sun ray length is gone");
   const std::string temporal = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_temporal.cs_5_0.hlsl");

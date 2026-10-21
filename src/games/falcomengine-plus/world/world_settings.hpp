@@ -1016,6 +1016,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtgiGameSun",
+      .binding = &rtgi::g_rtgi_game_sun,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Game-Style Fallback Sun",
+      .section = "RTGI",
+      .tooltip = "Hits not read from the screen get the game's sun shadow colour as a floor: shadowed and back-facing parts get the scene shadow colour times the sun colour, as the game lights them, instead of no sunlight. The floor is not scaled by Sun Contribution. Off = unchanged. Material shadow colour and cloud shadow are not reproduced.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtgiDynamicLights",
       .binding = &rtgi::g_rtgi_dynamic_lights,
       .value_type = SettingValueType::BOOLEAN,

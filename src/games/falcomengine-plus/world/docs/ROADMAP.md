@@ -832,3 +832,17 @@ Verification (2026-10-08):
 - Counters: at Half and Quarter pass A counters are per trace pixel; the panel and world_rtao.json say so, and at Half and Quarter the Pass B share fields (share_moving, share_clamp_active, share_no_history, share_texel_differs) are null in world_rtao.json; the panel hides the Pass B share lines there.
 - Shader hashes (FNV-1a 64, test_rtao convention, raw bytes): world_rtao.cs_5_0.hlsl old 0xe44796aebc8e1f64, new 0xc0dffe4249dc2227 (test_rtao.cpp:1881 pin 0xbcf4d7beeb61f2b6 left unchanged, owner decision, still fails). New world_rtao_upsample.cs_5_0.hlsl 0x0c8ef7e4e21d059f. Unchanged: world_rtao_temporal.cs_5_0.hlsl 0x0fc3192d36aba975, world_rt_denoise.hlsli 0xc49ca01f813c5510, world_rtgi_upsample.cs_5_0.hlsl 0x951afe71b2bd5deb.
 - Not validated in game. Full identity to HEAD is argued from the math, not measured; the harness does not render.
+
+## Game-style fallback sun (C3, rtgi-c3-gamesun): implemented, not validated in game
+
+- Setting RtgiGameSun "Game-Style Fallback Sun" (RTGI section): Off (default) or On. Flag bit 32 (`RTGI_FLAG_GAME_SUN` in `world_rtgi.cs_5_0.hlsl`, `kRtgiFlagGameSun`). Bits 1, 2, 4, 8 and 16 were already used; 32 is the next free bit. ParameterSnapshot gains `game_sun` at the end; the JSON gains `game_sun_floor`. No stats added.
+- Formula (fallback hits only, flag On): floor = min(1, sceneShadowColor_g) (cb_scene c27); sun term = lightColor_g x (floor + (1 - floor) x sun x g_rtgi_sun.z). `sun` is the existing ndl x shadow ray visibility, unchanged. The floor is not scaled by Sun Contribution; only the (1 - floor) part is. Ambient and lamp terms are unchanged, and the fallback albedo still multiplies the whole result.
+- Flag Off: the sun term is the HEAD expression (`lightColor_g * sun * g_rtgi_sun.z`), with the same sum and albedo multiply, so the image must match HEAD.
+- Limits: the material shadow colour (`shadowColor`) is not added to the floor; cloud shadow is not reproduced; the sun ray length is 64 m by default (Sun Shadow Distance); the diffuse factor is the flat-normal ndl of the GI hit; the game's shadowUVClamp is not matched; on-screen hits (Sora 2nd) keep the O1 estimate from C2b and do not get the floor.
+- Defaults match HEAD: flag Off gives the HEAD expression, so the image and the stats must match HEAD.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtgi.cs_5_0.hlsl` before C3 (HEAD, be31c611): 0xce05b3e780524eec. After C3: 0x2440a6dbc90a8714.
+- Owner test (not run):
+  1. Toggle Game-Style Fallback Sun Off, then On, in an interior and an exterior view; take screenshots of each.
+  2. Read RTGI Stats in each case: the sun rays line must be unchanged between On and Off (the same rays are traced).
+  3. In shadowed interiors the RTGI bounce should be brighter with On; the sunlit areas should not change much.
+  4. Move Sun Contribution with On: the floor part should not change, only the lit part.

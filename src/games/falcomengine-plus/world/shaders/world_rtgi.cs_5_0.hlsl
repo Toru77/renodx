@@ -131,6 +131,7 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_SUN_CASTERS_ONLY 4u
 #define RTGI_FLAG_FALLBACK_NO_ALBEDO 8u
 #define RTGI_FLAG_DYNAMIC_LIGHTS 16u
+#define RTGI_FLAG_GAME_SUN 32u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
 
@@ -433,8 +434,16 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             lightProbe_g[0].xyz + lightProbe_g[1].xyz * n.x + lightProbe_g[2].xyz * n.y + lightProbe_g[3].xyz * n.z
                             + lightProbe_g[4].xyz * (n.z * n.x) + lightProbe_g[5].xyz * (n.y * n.z) + lightProbe_g[6].xyz * (n.y * n.x)
                             + lightProbe_g[7].xyz * (3.0 * n.z * n.z - 1.0) + lightProbe_g[8].xyz * (n.x * n.x - n.y * n.y));
-                        radiance = fallback_albedo
-                            * (lightColor_g * sun * g_rtgi_sun.z + g_rtgi_shading.x * ambient);
+                        float3 sun_light = lightColor_g * sun * g_rtgi_sun.z;
+                        if ((flags & RTGI_FLAG_GAME_SUN) != 0u)
+                        {
+                            // The game's shadow floor (min(1, sceneShadowColor_g) x sun colour) is not scaled by Sun
+                            // Contribution (g_rtgi_sun.z); only the lit part (1 - floor) is.
+                            const float3 shadow_floor = min(float3(1.0, 1.0, 1.0), sceneShadowColor_g);
+                            sun_light = lightColor_g
+                                * (shadow_floor + (float3(1.0, 1.0, 1.0) - shadow_floor) * sun * g_rtgi_sun.z);
+                        }
+                        radiance = fallback_albedo * (sun_light + g_rtgi_shading.x * ambient);
                         if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
                         {
                             radiance += fallback_albedo * g_rtgi_dynamic.x * LampDiffuseSum(hit.position, n);
