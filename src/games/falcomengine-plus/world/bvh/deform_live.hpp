@@ -301,6 +301,7 @@ struct DynamicCapture {
   uint32_t index_count = 0u;
   uint32_t instance_count = 0u;
   uint32_t first_instance = 0u;
+  bool skinned = false;  // VsClass::Skinned: the character set traced by RTAO/RTGI
 };
 
 struct DynamicCaptureShader {
@@ -399,6 +400,9 @@ struct DeformLiveState {
   // Objects of the last present.
   reshade::api::resource objects_buffer = {0u};
   reshade::api::resource_view objects_srv = {0u};
+  // Characters of this frame for RTAO and RTGI (RefitDeformLiveCharacters); the present never writes it.
+  reshade::api::resource lighting_objects_buffer = {0u};
+  reshade::api::resource_view lighting_objects_srv = {0u};
   uint32_t object_count = 0u;
   std::vector<DynamicObjectInfo> object_info;
   // Refit pass.
@@ -416,6 +420,9 @@ struct DeformLiveState {
   std::array<uint64_t, static_cast<size_t>(DynamicSkip::Count)> skips_last = {};  // stats.skips at the previous present
   uint32_t calls_frame = 0u;  // game frame of the last UpdateDeformLive call
   uint32_t calls_in_frame = 0u;
+  // Character refit at lighting time (RefitDeformLiveCharacters), once per frame.
+  uint32_t lighting_frame = UINT32_MAX;  // game frame of the last character refit
+  uint32_t lighting_object_count = 0u;   // characters refit for lighting_frame
   std::vector<DynamicDropout> dropouts;  // last kDynamicDropoutRing
   DeformLiveStats stats;
 };
@@ -566,6 +573,7 @@ inline void OnDeformCaptureDraw(
   capture.index_count = draw.index_count;
   capture.instance_count = instances;
   capture.first_instance = draw.first_instance;
+  capture.skinned = static_cast<contract::VsClass>(traits.cls) == contract::VsClass::Skinned;
   g_deform_live.captures.push_back(capture);
   g_deform_live.frame_keys.insert(key);
   g_deform_live.stats.captures += 1u;
@@ -641,6 +649,7 @@ inline void DestroyDynamicResources(reshade::api::device* device, DeformLiveStat
   DestroyDynamicArena(device, &state.leaves);
   DestroyDynamicArena(device, &state.refit);
   DestroyBuffer(device, &state.objects_srv, &state.objects_buffer);
+  DestroyBuffer(device, &state.lighting_objects_srv, &state.lighting_objects_buffer);
   if (state.refit_pipeline.handle != 0u) device->destroy_pipeline(state.refit_pipeline);
   if (state.refit_srv_table.handle != 0u) device->free_descriptor_table(state.refit_srv_table);
   if (state.refit_uav_table.handle != 0u) device->free_descriptor_table(state.refit_uav_table);
@@ -681,6 +690,12 @@ inline bool CreateDynamicResources(reshade::api::device* device, DeformLiveState
   if (ok) {
     state.objects_buffer = objects.buffer;
     state.objects_srv = objects.srv;
+  }
+  DynamicArena lighting_objects;
+  ok = ok && CreateDynamicBuffer(device, kDynamicMaxObjects, sizeof(DynamicObjectGPU), false, &lighting_objects);
+  if (ok) {
+    state.lighting_objects_buffer = lighting_objects.buffer;
+    state.lighting_objects_srv = lighting_objects.srv;
   }
   if (!ok) DestroyDynamicResources(device, state);
   return ok;
@@ -735,9 +750,10 @@ inline bool EnsureDynamicRefitPipeline(reshade::api::device* device, DeformLiveS
 // Records the refit dispatch for the objects uploaded this present, then
 // unbinds the node UAV so the trace can read the nodes as an SRV.
 inline void DispatchDynamicRefit(reshade::api::device* device, reshade::api::command_list* cmd_list,
-                                 DeformLiveState& state, uint32_t object_count) {
+                                 DeformLiveState& state, reshade::api::resource_view objects_srv,
+                                 uint32_t object_count) {
   if (object_count == 0u || !EnsureDynamicRefitPipeline(device, state)) return;
-  reshade::api::resource_view srvs[4] = {state.arena_srv, state.objects_srv, state.leaves.srv, state.refit.srv};
+  reshade::api::resource_view srvs[4] = {state.arena_srv, objects_srv, state.leaves.srv, state.refit.srv};
   reshade::api::descriptor_table_update srv_update = {
       state.refit_srv_table, 0, 0, 4, reshade::api::descriptor_type::shader_resource_view, srvs};
   device->update_descriptor_tables(1, &srv_update);
@@ -787,6 +803,8 @@ inline void ReleaseDeformLive(reshade::api::device* device) {
     snapshot_holder.refit = g_deform_live.refit;
     snapshot_holder.objects_buffer = g_deform_live.objects_buffer;
     snapshot_holder.objects_srv = g_deform_live.objects_srv;
+    snapshot_holder.lighting_objects_buffer = g_deform_live.lighting_objects_buffer;
+    snapshot_holder.lighting_objects_srv = g_deform_live.lighting_objects_srv;
     snapshot_holder.refit_layout = g_deform_live.refit_layout;
     snapshot_holder.refit_srv_table = g_deform_live.refit_srv_table;
     snapshot_holder.refit_uav_table = g_deform_live.refit_uav_table;
@@ -800,6 +818,8 @@ inline void ReleaseDeformLive(reshade::api::device* device) {
     g_deform_live.refit = DynamicArena{};
     g_deform_live.objects_buffer = {0u};
     g_deform_live.objects_srv = {0u};
+    g_deform_live.lighting_objects_buffer = {0u};
+    g_deform_live.lighting_objects_srv = {0u};
     g_deform_live.refit_layout = {0u};
     g_deform_live.refit_srv_table = {0u};
     g_deform_live.refit_uav_table = {0u};
@@ -812,6 +832,8 @@ inline void ReleaseDeformLive(reshade::api::device* device) {
     g_deform_live.captures.clear();
     g_deform_live.frame_keys.clear();
     g_deform_live.object_count = 0u;
+    g_deform_live.lighting_frame = UINT32_MAX;
+    g_deform_live.lighting_object_count = 0u;
     g_deform_live.object_info.clear();
     g_deform_live.device = nullptr;
   }
@@ -999,6 +1021,19 @@ inline void ResolveDynamicTopology(reshade::api::device* device, reshade::api::c
   (void)frame;
 }
 
+inline DynamicObjectGPU MakeDynamicObjectGPU(const DynamicIdentity& identity, uint32_t vertex_base) {
+  DynamicObjectGPU object;
+  object.node_offset = identity.node_offset;
+  object.leaf_offset = identity.leaf_offset;
+  object.node_count = identity.node_count;
+  object.vertex_base = vertex_base;
+  object.triangle_count = identity.triangles;
+  object.refit_offset = identity.refit_offset;
+  object.level_offset = identity.level_offset;
+  object.level_count = identity.level_count;
+  return object;
+}
+
 // Present, before the trace (OnWorldPresentBvh): turns this frame's captures
 // into traced objects and refits their BLAS on the GPU.
 inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command_queue* queue) {
@@ -1047,6 +1082,8 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
     g_deform_live.refit = created.refit;
     g_deform_live.objects_buffer = created.objects_buffer;
     g_deform_live.objects_srv = created.objects_srv;
+    g_deform_live.lighting_objects_buffer = created.lighting_objects_buffer;
+    g_deform_live.lighting_objects_srv = created.lighting_objects_srv;
     g_deform_live.device = device;
     g_deform_live.captures.clear();
     g_deform_live.frame_keys.clear();
@@ -1126,16 +1163,7 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
             state.stats.object_cap_drops += 1u;
             continue;
           }
-          DynamicObjectGPU object;
-          object.node_offset = identity.node_offset;
-          object.leaf_offset = identity.leaf_offset;
-          object.node_count = identity.node_count;
-          object.vertex_base = capture.vertex_base;
-          object.triangle_count = identity.triangles;
-          object.refit_offset = identity.refit_offset;
-          object.level_offset = identity.level_offset;
-          object.level_count = identity.level_count;
-          objects.push_back(object);
+          objects.push_back(MakeDynamicObjectGPU(identity, capture.vertex_base));
           DynamicObjectInfo entry;
           entry.key = capture.key;
           entry.vs_hash = identity.vs_hash;
@@ -1242,20 +1270,73 @@ inline void UpdateDeformLive(reshade::api::device* device, reshade::api::command
   uint32_t object_count = 0u;
   if (!objects.empty()) {
     reshade::api::resource objects_buffer = {0u};
+    reshade::api::resource_view objects_srv = {0u};
     {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);
       objects_buffer = g_deform_live.objects_buffer;
+      objects_srv = g_deform_live.objects_srv;
     }
     std::string error;
     if (WriteBufferRange(device, cmd_list, objects_buffer, sizeof(DynamicObjectGPU), 0u, objects.data(),
                          objects.size() * sizeof(DynamicObjectGPU), &error)) {
       object_count = static_cast<uint32_t>(objects.size());
     }
+    if (object_count != 0u) DispatchDynamicRefit(device, cmd_list, g_deform_live, objects_srv, object_count);
   }
-  if (object_count != 0u) DispatchDynamicRefit(device, cmd_list, g_deform_live, object_count);
   std::lock_guard<std::mutex> lock(g_deform_live.mutex);
   g_deform_live.object_count = g_deform_live.refit_pipeline.handle != 0u ? object_count : 0u;
   g_deform_live.object_info = std::move(info);
+}
+
+// Lighting time (RTAO and RTGI): refits this frame's skinned characters so their
+// BLAS sits in the trace inputs. Once per frame, shared by both passes.
+inline DynamicTraceInputs RefitDeformLiveCharacters(reshade::api::device* device,
+                                                    reshade::api::command_list* cmd_list) {
+  DynamicTraceInputs inputs;
+  const uint32_t frame = g_state.frame.load();
+  std::vector<DynamicObjectGPU> character_objects;
+  reshade::api::resource objects_buffer = {0u};
+  reshade::api::resource_view objects_srv = {0u};
+  {
+    std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+    if (!g_deform_live.enabled.load(std::memory_order_relaxed) || g_deform_live.device != device) return inputs;
+    inputs.vertices = g_deform_live.arena_srv;
+    inputs.objects = g_deform_live.lighting_objects_srv;
+    inputs.nodes = g_deform_live.nodes.srv;
+    inputs.leaves = g_deform_live.leaves.srv;
+    if (g_deform_live.lighting_frame == frame) {
+      inputs.count = g_deform_live.lighting_object_count;
+      return inputs;
+    }
+    g_deform_live.lighting_frame = frame;
+    g_deform_live.lighting_object_count = 0u;
+    if (g_deform_live.capture_frame != frame) return inputs;
+    for (const DynamicCapture& capture : g_deform_live.captures) {
+      if (!capture.skinned) continue;
+      const auto it = g_deform_live.identities.find(capture.key);
+      if (it == g_deform_live.identities.end() || !it->second.resident) continue;
+      if (character_objects.size() >= kDynamicMaxObjects) break;
+      character_objects.push_back(MakeDynamicObjectGPU(it->second, capture.vertex_base));
+    }
+    objects_buffer = g_deform_live.lighting_objects_buffer;
+    objects_srv = g_deform_live.lighting_objects_srv;
+  }
+  if (character_objects.empty()) return inputs;
+  if (!EnsureDynamicRefitPipeline(device, g_deform_live)) return inputs;
+
+  std::string error;
+  if (!WriteBufferRange(device, cmd_list, objects_buffer, sizeof(DynamicObjectGPU), 0u, character_objects.data(),
+                        character_objects.size() * sizeof(DynamicObjectGPU), &error)) {
+    return inputs;
+  }
+  const uint32_t count = static_cast<uint32_t>(character_objects.size());
+  DispatchDynamicRefit(device, cmd_list, g_deform_live, objects_srv, count);
+
+  std::lock_guard<std::mutex> lock(g_deform_live.mutex);
+  if (g_deform_live.lighting_frame != frame) return inputs;
+  g_deform_live.lighting_object_count = count;
+  inputs.count = count;
+  return inputs;
 }
 
 // Presence diagnostics of the deforming meshes (world_deform_live.json, written with world_pool.json).

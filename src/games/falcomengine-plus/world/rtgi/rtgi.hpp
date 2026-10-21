@@ -37,6 +37,7 @@ struct RtgiFrameState {
   bool fade_valid = false;
   rtao::Fade fade = {};
   float samples = 1.f;
+  uint32_t character_objects = 0u;  // character objects the newest trace used (sun.y)
   bool isfast_used = false;
   uint64_t texture_bytes = 0u;
   bool radiance_valid = false;
@@ -92,6 +93,7 @@ struct RtgiDispatchInputs {
   int filter_taps = 5;    // samples per direction (separable) or kernel side (a-trous)
   reshade::api::resource lights = {0u};         // Sora 2nd dynamicLights_g (t11); copied for the stats request, null otherwise
   reshade::api::resource light_indices = {0u};  // Sora 2nd lightIndices_g (t12); copied for the stats request, null otherwise
+  bvh::DynamicTraceInputs dynamic = {};         // characters (RefitDeformLiveCharacters), count 0 when off
 };
 
 struct RtgiDispatchResult {
@@ -241,6 +243,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   push.size[2] = static_cast<float>(in.full_width);
   push.size[3] = static_cast<float>(in.full_height);
   std::memcpy(&push.fade[3], &bvh_data->dynamic.instance_count, sizeof(uint32_t));  // P2b records (t19)
+  push.sun[1] = static_cast<float>(in.dynamic.count);
 
   // Whole-buffer write (offset 0, full size): see WriteBufferRange in bvh_resources.hpp.
   const uint32_t zeros[kRtgiStatsCount] = {};
@@ -256,7 +259,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   bvh::BeginGpuTimer(device, cmd_list, &data.timer);
   const RtgiPipeline& trace = data.trace_pipeline;
   reshade::api::resource_view srvs[kRtgiSrvCount] = {};
-  bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, bvh::DynamicTraceInputs{}, srvs);
+  bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, in.dynamic, srvs);
   srvs[17] = in.mrt_normal_view;
   srvs[18] = in.isfast_view;
   srvs[19] = bvh_data->dynamic.instances_srv;
@@ -530,6 +533,8 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
   out << "  \"sun_shadow_distance\": " << g_rtgi_sun_distance << ",\n";
+  out << "  \"trace_characters\": " << g_rtgi_trace_characters << ",\n";
+  out << "  \"character_objects\": " << f.character_objects << ",\n";
   if (in.camera != nullptr && in.camera->has_sun) {
     const CameraSnapshot& sun = *in.camera;
     out << "  \"game_sun\": {\"captured\": true, \"light_color\": ";

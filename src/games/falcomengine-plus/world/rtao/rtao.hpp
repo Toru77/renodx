@@ -63,6 +63,7 @@ struct RtaoFrameState {
   ParameterSnapshot captured = {};   // parameters of the last successful dispatch (P0)
   bool captured_isfast_used = false;
   uint32_t p2b_records = 0u;         // P2b records the newest dispatch traced (fade.w)
+  uint32_t character_objects = 0u;   // character objects the newest dispatch traced (size.z)
 };
 
 inline RtaoFrameState g_rtao_frame;
@@ -96,6 +97,7 @@ struct RtaoDispatchInputs {
   int filter_passes = 1;   // Filter Passes: 1..4
   int filter_taps = 5;     // Filter Taps: samples per direction (separable) or kernel side (a-trous)
   int debug_mode = 0;
+  bvh::DynamicTraceInputs dynamic = {};  // characters (RefitDeformLiveCharacters), count 0 when off
 };
 
 struct RtaoDispatchResult {
@@ -214,10 +216,11 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   RtaoPushConstants push = in.push;
   push.size[0] = static_cast<float>(in.width);
   push.size[1] = static_cast<float>(in.height);
-  push.size[2] = 0.f;  // round 1: deforming objects are not traced (t10-t13 null)
+  push.size[2] = static_cast<float>(in.dynamic.count);
   push.size[3] = temporal_run ? 1.f : 0.f;  // output_raw: pass A writes u2 for pass B
   std::memcpy(&push.fade[3], &bvh_data->dynamic.instance_count, sizeof(uint32_t));  // P2b records (t19)
   g_rtao_frame.p2b_records = bvh_data->dynamic.instance_count;
+  g_rtao_frame.character_objects = in.dynamic.count;
 
   // Whole-buffer write (offset 0, full size): see WriteBufferRange in bvh_resources.hpp.
   const uint32_t zeros[kRtaoStatsCount] = {};
@@ -227,7 +230,7 @@ inline RtaoDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
 
   // Pass A.
   reshade::api::resource_view srvs[kRtaoSrvCount] = {};
-  bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, bvh::DynamicTraceInputs{}, srvs);
+  bvh::FillBvhSceneSrvs(*bvh_data, in.depth_view, in.dynamic, srvs);
   srvs[17] = in.mrt_normal_view;
   srvs[18] = in.isfast_view;
   srvs[19] = bvh_data->dynamic.instances_srv;
@@ -380,6 +383,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
        << ", \"radius\": " << f.captured.radius << ", \"ray_max\": " << f.captured.ray_max
        << ", \"strength\": " << f.captured.strength << ", \"normal_bias\": " << f.captured.normal_bias
        << ", \"foliage_skip\": " << f.captured.foliage_skip
+       << ", \"trace_characters\": " << f.captured.trace_characters
        << ", \"debug\": " << f.captured.debug << "}"
        << ", \"frames_without_ao_by_reason\": {";
   bool first_reason = true;
@@ -415,6 +419,7 @@ inline std::string BuildRtaoJson(const RtaoJsonInput& in) {
       << ",\n  \"gpu_ms\": " << f.gpu_ms
       << ",\n  \"texture_bytes\": " << f.texture_bytes
       << ",\n  \"p2b_records\": " << f.p2b_records
+      << ",\n  \"character_objects\": " << f.character_objects
       << ",\n  \"frames_without_ao\": " << f.frames_without_ao
       << ",\n  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
       << ", \"coverage\": " << f.fade.coverage << ", \"requested_start\": " << f.fade.start_req

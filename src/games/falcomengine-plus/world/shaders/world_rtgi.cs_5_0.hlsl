@@ -2,7 +2,7 @@
 //
 // One thread per trace pixel. Trace Resolution sets the block side d (1, 2 or 4): trace pixel tp stands for the d x d
 // block at tp * d and reads the game depth and MRT normal at its representative pixel min(tp * d + d / 2, size - 1).
-// Cosine-hemisphere closest-hit rays through the live BVH (world_bvh_trace.hlsli; deforming objects are not traced,
+// Cosine-hemisphere closest-hit rays through the live BVH (world_bvh_trace.hlsli; characters at t10-t13 when on,
 // the P2b records at t19 are). Each hit is classified as on screen (the game depth at its projected pixel is the hit),
 // hidden on screen or off screen. Each hit gets a radiance. On screen with a valid copy: the previous frame's lighting
 // output at the hit's previous-frame pixel (t20, prevViewProj_g). Otherwise: RTGI_FALLBACK_ALBEDO * (sun * N.L * a sun
@@ -55,7 +55,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
-    float4 g_rtgi_sun : packoffset(c6);       // Sun Shadow Distance (m), unused, unused, unused
+    float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), character object count (t10-t13), unused, unused
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -90,8 +90,8 @@ groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
-    // Deforming objects (characters, water) are not traced: t10-t13 are null. P2b record count: c2.w (uint bits).
-    g_trace_dynamic_count = 0u;
+    // Characters (t10-t13): c6.y objects, 0 unless Trace characters is on. P2b record count: c2.w (uint bits).
+    g_trace_dynamic_count = (uint)g_rtgi_sun.y;
     g_trace_dynamic_instance_count = asuint(g_rtgi_fade.w);
     const uint group_index = gid.y * 8u + gid.x;
     if (group_index < RTGI_STAT_TRACE_COUNT) gs_stats[group_index] = 0u;

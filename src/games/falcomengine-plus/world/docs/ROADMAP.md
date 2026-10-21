@@ -37,6 +37,18 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
 - [ ] Step 4: sign latency. (a) dynamic-only refit in the same present after `DrainPoolScan`; (b) shorter orphan retirement: retire the old pose when a fresher instance of the same key is admitted. Harness: `test_deform_live`/`test_pool` case. Fixes: P-3 (partly). Full per-frame path (P2b) is a separate milestone.
 - [ ] Step 5: foliage sway approach for P-1. Decision after Steps 1 to 4. Options: (a) keep rest pose and say so; (b) per-instance CPU sway approximation through `RefitLiveTlas`; (c) P2b-style draw-time copy. Owner decides.
 
+## Trace characters (rtao-rtgi-chars-1): implemented, not validated in game
+
+- Design: two toggles, RTAO "Trace characters" (RtaoTraceCharacters) and RTGI "Trace characters" (RtgiTraceCharacters), both default Off. When one is On, `RefitDeformLiveCharacters` (bvh/deform_live.hpp) refits this frame's skinned captures (VsClass::Skinned, resident BLAS) at lighting time with the same refit pass as the deforming meshes, into the shared objects buffer. The result is cached per game frame, so RTAO and RTGI share one refit. The RTAO trace reads it at t10-t13 with count size.z; the RTGI trace with count sun.y. Both are null and 0 with the toggles Off, so the image must match HEAD.
+- Limits: water is excluded (VsClass::Animated is not captured as a character). Only characters the game camera draws this frame are traced; a character not drawn this frame is not traced. When either toggle is On there are two refits per frame (the present refit for the deforming meshes and the lighting-time refit for characters).
+- Diagnostics: the RTAO panel line shows "trace characters on/off (N objects)"; the RTGI panel shows "Characters: on/off (N objects traced)"; world_rtao.json and world_rtgi.json carry trace_characters and character_objects.
+- Owner test list:
+  1. Both toggles Off: screenshots match HEAD (same scene, same time of day).
+  2. RTAO Trace characters On: the panel object count is above 0 when a character is on screen; contact AO under the feet and around the character appears.
+  3. RTGI Trace characters On with RTGI Debug 1: the characters show green (traced hits).
+  4. Performance tab, Off vs On: gpu_rtao, gpu_deform_refit and the RTGI GPU ms.
+- Test harness (this round): test_deform_live and test_rtgi pass (test_deform_live expects 6 buffers: arena, 3 topology staging, objects, lighting objects). test_rtao: the snapshot size check is 20 floats and passes; the pass A pin fails as at HEAD. Old computed value c69c9f889a9f87ad (HEAD), new computed value 2a961c2ac65669d6 (after the comment edits in world_rtao.cs_5_0.hlsl). The pin in test_rtao.cpp:1881 still reads 0xbcf4d7beeb61f2b6 and was not changed (owner decision). test_live: wind range (2758), rest wind (3009) and rebuild (3470) goldens fail as at HEAD.
+
 ## RTGI discovery round (rtgi-disc-1): implemented, not validated in game
 
 - A. RTGI Debug 8 "Pixel classes" (diagnostic view, trace pixels): grey = scaled frame, dark blue = sky, magenta = no G-buffer normal, dark green = outside the BVH region, dark purple = beyond Fade End; traced pixels: yellow = the normal faces away from the camera, cyan = a hit within 1 cm, black = traced with neither.

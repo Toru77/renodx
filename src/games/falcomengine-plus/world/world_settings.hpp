@@ -700,6 +700,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtaoTraceCharacters",
+      .binding = &rtao::g_rtao_trace_characters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Trace characters",
+      .section = "RTAO",
+      .tooltip = "RTAO rays hit the characters the game camera draws this frame (skinned meshes from 'Deforming meshes'; water is not traced). Characters then occlude the world. Characters the camera does not draw this frame are not traced. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtaoCharacterIntensity",
       .binding = &rtao::g_rtao_char_intensity,
       .value_type = SettingValueType::FLOAT,
@@ -869,6 +880,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiTraceCharacters",
+      .binding = &rtgi::g_rtgi_trace_characters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Trace characters",
+      .section = "RTGI",
+      .tooltip = "RTGI rays hit the characters the game camera draws this frame (water is not traced): they block bounce light. Off = unchanged.",
+      .labels = {"Off", "On"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{

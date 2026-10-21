@@ -150,10 +150,13 @@ inline void DrawRtaoPanel() {
     ImGui::Text("Last dispatch: spp %.0f, history weight %.2f, depth rejection %.3f, normal rejection %.2f, history clamp %.2f, IS-FAST %s",
                 c.samples, c.history_weight, c.depth_rejection, c.normal_rejection, c.history_clamp,
                 frame.captured_isfast_used ? "used" : "off");
-    ImGui::Text("Last dispatch: radius %.2f, ray max %.2f, strength %.2f, normal bias %.4f, debug %.0f, tests zero motion %s, freeze noise %s, camera matrix %s, foliage skip %s",
+    ImGui::Text("Last dispatch: radius %.2f, ray max %.2f, strength %.2f, normal bias %.4f, debug %.0f, "
+                "tests zero motion %s, freeze noise %s, camera matrix %s, foliage skip %s, "
+                "trace characters %s (%u objects)",
                 c.radius, c.ray_max, c.strength, c.normal_bias, c.debug,
                 c.zero_motion > 0.5f ? "on" : "off", c.freeze_noise > 0.5f ? "on" : "off", c.camera_matrix > 0.5f ? "on" : "off",
-                c.foliage_skip > 0.5f ? "on" : "off");
+                c.foliage_skip > 0.5f ? "on" : "off", c.trace_characters > 0.5f ? "on" : "off",
+                frame.character_objects);
   }
   if (frame.temporal_ran || frame.motion_dims_ok == false) {
     ImGui::Text("Motion dims: RTV4 %ux%u, depth %ux%u (%s)", frame.motion_w, frame.motion_h,

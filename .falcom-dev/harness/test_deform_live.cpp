@@ -360,7 +360,7 @@ int main() {
   // 2. On: resources, then the capture shader, then captures; the tree after the topology read.
   bvh::g_deform_live.enabled.store(true);
   present();
-  CHECK(dev.res.size() == 5u, "arena + 3 staging + objects (%zu)", dev.res.size());
+  CHECK(dev.res.size() == 6u, "arena + 3 staging + objects + lighting objects (%zu)", dev.res.size());
   draw(kSkin, 0x11, 600);
   CHECK(g_created == 1 && cl.calls.empty(), "first draw builds the capture shader");
   CHECK(g_layouts.back().stride == 12u && g_layouts.back().elements.size() == 1u && g_layouts.back().elements[0].semantic == "TEXCOORD"

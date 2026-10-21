@@ -34,6 +34,7 @@ inline float g_rtgi_filter_taps_separable = 5.f;  // Filter Taps (separable): 3.
 inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
 inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
 inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
+inline float g_rtgi_trace_characters = 0.f;  // Trace characters: RTGI rays hit this frame's skinned characters
 inline float g_rtgi_rtao_restore = 0.f;           // RTAO value to put back when RTGI is turned off (hidden row RtgiRtaoRestore)
 
 enum class Reason : uint8_t {
@@ -103,6 +104,7 @@ inline float RtgiRtaoMaxDarkening(float rtao_max_darkening) {
 struct ParameterSnapshot {
   float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
+  float trace_characters;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

@@ -2,7 +2,7 @@
 //
 // One thread per pixel over the game depth size, dispatched inline in the lighting
 // hook. Cosine-hemisphere rays are traced through the live BVH (world_bvh_trace.hlsli
-// with dynamic count 0: characters and water do not occlude yet; the P2b records at t19 do). The AO is
+// with the characters at t10-t13 when Trace characters is on; the P2b records at t19). The AO is
 // written to u0 as a 0..255 texel (255 = neutral). Per-group counters are reduced in
 // groupshared memory and added to u1 (RTAO_STAT_*).
 //
@@ -39,7 +39,7 @@ cbuffer cb_rtao : register(b12)
     float4 g_rtao_sampling : packoffset(c1);  // spp, isfast flag (1 loaded), slice base, seed
     float4 g_rtao_fade : packoffset(c2);      // fade start_eff, fade end_eff, flags (z: RTAO_FLAG_* as a float), P2b record count (w, uint bits)
     float4 g_rtao_region : packoffset(c3);    // region min xyz, region size
-    float4 g_rtao_size : packoffset(c4);      // width, height, dynamic count (0), output_raw (1 = write u2, not u0)
+    float4 g_rtao_size : packoffset(c4); // width, height, character object count, output_raw (1 = u2, not u0)
 };
 
 #define RTAO_STAT_RAYS 0u
@@ -185,7 +185,7 @@ void TracePixel(uint2 px)
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
 {
-    // Round 1: no deforming objects in the RTAO trace (t10-t13 are null).
+    // Characters (t10-t13) while Trace characters is on; count 0 otherwise.
     g_trace_dynamic_count = (uint)g_rtao_size.z;
     g_trace_dynamic_instance_count = asuint(g_rtao_fade.w);
     const uint group_index = gid.y * 8u + gid.x;

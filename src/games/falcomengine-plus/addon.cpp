@@ -9190,7 +9190,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       rtao::g_rtao_fade_end_pct, rtao::g_rtao_temporal_enabled, rtao::g_rtao_history_weight,
       rtao::g_rtao_depth_rejection, rtao::g_rtao_normal_rejection, rtao::g_rtao_history_clamp,
       rtao::g_rtao_debug, rtao::g_test_zero_motion, rtao::g_test_freeze_noise, rtao::g_test_camera_matrix,
-      rtao::g_rtao_foliage_skip};
+      rtao::g_rtao_foliage_skip, rtao::g_rtao_trace_characters};
   const bool params_changed = rf.prev_params_valid && !(params == rf.prev_params);
   if (params_changed) rf.last_parameter_change = rtao::ParameterFieldName(params, rf.prev_params);
   rf.prev_params = params;
@@ -9228,6 +9228,9 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs) prev = *cs;
+  if (rtao::g_rtao_trace_characters > 0.5f) {
+    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
+  }
   const rtao::RtaoDispatchResult result = rtao::Dispatch(dev, cmd_list, in);
   ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
   rf.temporal_ran = result.temporal_ran;
@@ -9344,7 +9347,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_samples, rtgi::g_rtgi_ray_max, rtao::g_rtao_normal_bias, rtgi::g_rtgi_trace_resolution, rtao::g_rtao_isfast,
       rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
       rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
-      rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance};
+      rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9380,7 +9383,12 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
   const bool copy_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
       && rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed);
-  const rtgi::RtgiDispatchInputs in = {
+  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+  renodx::utils::state::CommandListState prev = {};
+  if (cs != nullptr) {
+    prev = *cs;
+  }
+  rtgi::RtgiDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
       .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
@@ -9420,10 +9428,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
       .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
   };
-  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-  renodx::utils::state::CommandListState prev = {};
-  if (cs != nullptr) {
-    prev = *cs;
+  if (rtgi::g_rtgi_trace_characters > 0.5f) {
+    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
   const rtgi::RtgiDispatchResult result = rtgi::Dispatch(dev, cmd_list, in);
   ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
@@ -9449,6 +9455,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.fade_valid = true;
   frame.fade = fade;
   frame.samples = spp;
+  frame.character_objects = in.dynamic.count;
   frame.isfast_used = isfast_used;
   frame.prev_view_proj_register = prev_view_proj_register;
   frame.radiance_valid = radiance_valid;

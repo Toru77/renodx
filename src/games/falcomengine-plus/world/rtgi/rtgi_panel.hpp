@@ -53,6 +53,8 @@ inline void DrawRtgiPanel() {
                   ? "added this frame"
                   : "not added (GI Intensity 0, not Sora 2nd, or not running)",
               frame.subtracted ? "on" : "off");
+  ImGui::Text("Characters: %s (%u objects traced)", g_rtgi_trace_characters > 0.5f ? "on" : "off",
+              frame.character_objects);
   ImGui::Text("RTAO Max Darkening x1.8 = %.2f on bounce draws (RTAO alone %.2f)",
               RtgiRtaoMaxDarkening(rtao::g_rtao_max_darkening), rtao::g_rtao_max_darkening);
   ImGui::Text("Max Ray Distance: requested %.1f m, effective %.1f m", frame.ray_max_requested, frame.ray_max_effective);

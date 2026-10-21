@@ -15,7 +15,8 @@
 
 namespace falcom_world::rtgi {
 
-// t0..t8 BVH, t9 game depth, t10..t13 deforming (null: not traced), t14..t16 alpha, t17 MRT normal, t18 IS-FAST noise,
+// t0..t8 BVH, t9 game depth, t10..t13 characters (null unless Trace characters), t14..t16 alpha,
+// t17 MRT normal, t18 IS-FAST noise,
 // t19 P2b records (the RTAO pass A table), t20 radiance: the previous frame's lighting output, t21 the previous final
 // GI (null unless kRtgiFlagSubtractPrevious) and t22 the G-buffer colour (bound whenever it was captured this frame,
 // read only under kRtgiFlagSubtractPrevious): the one-bounce correction.
@@ -103,7 +104,7 @@ struct RtgiPushConstants {
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
   float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
-  float sun[4];       // c6: Sun Shadow Distance (m), unused, unused, unused
+  float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), unused, unused
 };
 static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 28 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");
