@@ -49,6 +49,7 @@ inline constexpr uint32_t kInstanceNearFade = 1u;       // camera rays apply the
 inline constexpr uint32_t kInstanceCameraVisible = 2u;  // drawn by a camera VS
 inline constexpr uint32_t kInstanceShadowCaster = 4u;   // drawn by a light VS (shadow maps)
 inline constexpr uint32_t kInstanceFoliage = 8u;        // draw key in g_pool.wind_keys (VsClass::Wind): foliage
+inline constexpr uint32_t kInstanceAlphaTested = 16u;   // alpha-tested mesh (LiveTlasInstance::alpha)
 
 struct WorldInstanceGPU {
   float header[4];  // x=mesh_id (live store slot) y=source

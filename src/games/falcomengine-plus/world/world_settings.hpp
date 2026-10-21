@@ -706,7 +706,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Foliage skip",
       .section = "RTAO",
-      .tooltip = "RTAO rays pass through foliage: instances drawn by a wind-sway vertex shader (grass, leaves, branches; recognised from the shader bytecode). Fences and other rigid alpha-tested meshes still occlude. Off = unchanged.",
+      .tooltip = "RTAO rays pass through wind-driven foliage (instances drawn by a wind-sway vertex shader, recognised from the shader bytecode) and alpha-tested meshes, including fences. Static vegetation is pending. Off = unchanged.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });

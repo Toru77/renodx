@@ -132,7 +132,7 @@ void TracePixel(uint2 px)
             const float3 T = normalize(cross(up, N));
             const float3 B = cross(N, T);
             const WorldCameraView view = {true, 1.0,
-                (rtao_flags & RTAO_FLAG_FOLIAGE_SKIP) != 0u ? INSTANCE_FOLIAGE : 0u, 0u};
+                (rtao_flags & RTAO_FLAG_FOLIAGE_SKIP) != 0u ? (INSTANCE_FOLIAGE | INSTANCE_ALPHA_TESTED) : 0u, 0u};
 
             float occ = 0.0;
             uint rays = 0u;

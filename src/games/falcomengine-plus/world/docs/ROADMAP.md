@@ -846,3 +846,12 @@ Verification (2026-10-08):
   2. Read RTGI Stats in each case: the sun rays line must be unchanged between On and Off (the same rays are traced).
   3. In shadowed interiors the RTGI bounce should be brighter with On; the sunlit areas should not change much.
   4. Move Sun Contribution with On: the floor part should not change, only the lit part.
+
+## Foliage skip covers alpha-tested meshes (M6a, rtao-m6a-alpha): implemented, not validated in game
+
+- Flag: `kInstanceAlphaTested` = 16 (`INSTANCE_ALPHA_TESTED` in `world_bvh_types.hlsli`), set in `FillInstanceVisibility` from `LiveTlasInstance::alpha` (alpha-tested mesh). Bits in use before and after: 1 near fade, 2 camera visible, 4 shadow caster, 8 foliage, 16 alpha tested (bit 16 was free in both files).
+- Rule: the RTAO "Foliage skip" toggle (existing row, no new row) sets the RTAO skip mask to `INSTANCE_FOLIAGE | INSTANCE_ALPHA_TESTED`, so wind-driven foliage and alpha-tested meshes (fences included, accepted by the owner) are skipped. No shader hash rule. Foliage skip Off: skip mask 0, same as HEAD. The tooltip is updated; static vegetation is pending.
+- Scope: RTAO occlusion only. RTGI is not changed (its shadow-caster and bounce rays use no skip mask).
+- Owner test (not run): Foliage skip On, middle-click a plant that still shades in a BVH trace view: the inspect line should show alpha-tested yes; the plant should no longer darken. Foliage skip Off should match the image before this change.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtao.cs_5_0.hlsl` before M6a (HEAD, 671dbc7b): 0xc0dffe4249dc2227. After M6a: 0x79798e97df9d3210.
+- Harness: test_rtao:1881 still fails with the pass A pin (0xbcf4d7beeb61f2b6), as before (owner decision; the FAIL line prints 0x79798e97df9d3210). test_live 2758, 3009 and 3470 fail as before.

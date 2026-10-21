@@ -538,7 +538,7 @@ inline bool CameraFadeApplies(const PoolCameraVisibility& visibility) {
          && CameraFadeInputsUsable(visibility.inputs.param[0], visibility.inputs.param[1]);
 }
 
-inline void FillInstanceVisibility(const PoolCameraVisibility& visibility, bool foliage, float out[4]) {
+inline void FillInstanceVisibility(const PoolCameraVisibility& visibility, bool foliage, bool alpha, float out[4]) {
   out[0] = 0.f;
   out[1] = 0.f;
   out[3] = 0.f;
@@ -547,6 +547,9 @@ inline void FillInstanceVisibility(const PoolCameraVisibility& visibility, bool 
   if (visibility.light_seen) flags |= kInstanceShadowCaster;
   if (foliage) {
     flags |= kInstanceFoliage;
+  }
+  if (alpha) {
+    flags |= kInstanceAlphaTested;
   }
   if (CameraFadeApplies(visibility)) {
     flags |= kInstanceNearFade;
@@ -667,7 +670,7 @@ inline WorldInstanceGPU MakeLiveInstanceGPU(const LiveTlasInstance& instance, ui
     descriptor.bounds_min[k] = instance.bounds_min[k];
     descriptor.bounds_max[k] = instance.bounds_max[k];
   }
-  FillInstanceVisibility(instance.visibility, instance.foliage, descriptor.visibility);
+  FillInstanceVisibility(instance.visibility, instance.foliage, instance.alpha, descriptor.visibility);
   return descriptor;
 }
 
