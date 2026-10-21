@@ -915,7 +915,35 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
+      .is_visible = [visible]() {
+        return visible() && rtgi::g_rtgi_extra_bounces > 0.5f && rtgi::g_rtgi_extra_bounce_method < 0.5f;
+      },
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiExtraBounceMethod",
+      .binding = &rtgi::g_rtgi_extra_bounce_method,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "Extra Bounce Method",
+      .section = "RTGI",
+      .tooltip = "Feedback: feeds back last frame's bounce (cheap, screen only). Real Extra Rays: traces one or two extra rays per first-bounce hit (more expensive; reaches off-screen hits through the fallback shading). Use the Performance tab to compare cost.",
+      .labels = {"Feedback", "Real Extra Rays"},
       .is_visible = [visible]() { return visible() && rtgi::g_rtgi_extra_bounces > 0.5f; },
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiExtraBounceRays",
+      .binding = &rtgi::g_rtgi_extra_bounce_rays,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Extra Bounce Rays",
+      .section = "RTGI",
+      .tooltip = "Number of extra bounce rays per first-bounce hit (1 or 2). Each adds roughly the cost of today's RTGI trace.",
+      .min = 1.f,
+      .max = 2.f,
+      .format = "%d",
+      .is_visible = [visible]() {
+        return visible() && rtgi::g_rtgi_extra_bounces > 0.5f && rtgi::g_rtgi_extra_bounce_method > 0.5f;
+      },
   });
   settings->push_back(new Setting{
       .key = "RtgiCharacterIntensity",

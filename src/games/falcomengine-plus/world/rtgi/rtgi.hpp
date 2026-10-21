@@ -624,8 +624,13 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
       << ", \"applied_intensity\": " << f.applied_intensity
       << ", \"subtract_previous\": " << (f.subtracted ? "true" : "false") << "},\n";
   out << "  \"extra_bounces\": {\"on\": " << (g_rtgi_extra_bounces > 0.5f ? "true" : "false")
+      << ", \"method\": \"" << (g_rtgi_extra_bounce_method > 0.5f ? "real_extra_rays" : "feedback") << "\""
       << ", \"feedback_strength\": " << g_rtgi_feedback_strength
-      << ", \"feedback_strength_effective\": " << RtgiFeedbackStrengthEffective() << ", \"rays\": 0},\n";
+      << ", \"feedback_strength_effective\": " << RtgiFeedbackStrengthEffective()
+      << ", \"rays\": " << RtgiExtraBounceRaysEffective()
+      << ", \"note\": \"rays counts primary rays only; hit-class and distance counters count the first bounce; "
+         "sun rays, lookups, invalid refs and stack overflow include extra bounces, so ratios can exceed 1 when "
+         "extra rays are on\"},\n";
   out << "  \"isfast_used\": " << (f.isfast_used ? "true" : "false") << ",\n";
   out << "  \"prev_view_proj_register\": " << f.prev_view_proj_register << ",\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << ",\n";

@@ -100,7 +100,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
     float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, unused
-    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), unused
+    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), Extra Bounce Rays (z, Real Extra Rays only), unused
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -133,6 +133,7 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_DYNAMIC_LIGHTS 16u
 #define RTGI_FLAG_GAME_SUN 32u
 #define RTGI_FLAG_FEEDBACK 64u
+#define RTGI_FLAG_REAL_RAYS 128u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
 
@@ -282,9 +283,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint clamped = 0u;
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
                 const float3 origin = P + N * g_rtgi_params.y;
-                const float3 up = abs(N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
-                const float3 T = normalize(cross(up, N));
-                const float3 B = cross(N, T);
+                // Real Extra Rays: bounces b = 1 .. bounce_rays follow the ray from the previous hit (at most 2).
+                const uint bounce_rays = (flags & RTGI_FLAG_REAL_RAYS) != 0u ? min((uint)g_rtgi_dynamic.z, 2u) : 0u;
                 // GI rays skip surfaces the game camera does not show (shadow-only casters, near-faded surfaces), as RTAO.
                 const WorldCameraView view = {true, 1.0, 0u, 0u};
                 uint hits = 0u;
@@ -298,163 +298,194 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 float min_t = ray_max;
                 for (uint i = 0u; i < spp; ++i)
                 {
-                    float2 u;
-                    if (g_rtgi_sampling.x > 0.5)
+                    float3 ray_origin = origin;
+                    float3 ray_N = N;
+                    float3 throughput = float3(1.0, 1.0, 1.0);
+                    float3 extra = float3(0.0, 0.0, 0.0);
+                    float3 radiance_0 = float3(0.0, 0.0, 0.0);
+                    for (uint b = 0u; b <= bounce_rays; ++b)
                     {
-                        u = g_isfast_noise.Load(int4((tp.x + 64u) % 128u, (tp.y + 64u) % 128u, ((uint)g_rtgi_sampling.y + i) % 32u, 0));
-                    }
-                    else
-                    {
-                        const float2 q = float2(tp) + g_rtgi_sampling.z + 13.0 + float(i) * 7.0;
-                        u = frac(52.9829189 * frac(float2(dot(q, float2(0.06711056, 0.00583715)), dot(q + 47.0, float2(0.06711056, 0.00583715)))));
-                    }
-                    const float r = sqrt(u.x);
-                    const float phi = 6.2831853 * u.y;
-                    const float3 dir = T * (r * cos(phi)) + B * (r * sin(phi)) + N * sqrt(max(0.0, 1.0 - u.x));
-
-                    WorldTraceCounters counters;
-                    const WorldTraceHit hit = TraceWorldClosest(origin, dir, 1e-3, ray_max, view, counters);
-                    invalid_refs += counters.invalid_refs;
-                    stack_overflow += counters.stack_overflow;
-                    if (hit.prim == 0xFFFFFFFFu)
-                    {
-                        continue;
-                    }
-                    hits += 1u;
-                    t_sum += hit.t;
-                    min_t = min(min_t, hit.t);
-                    distance_dm += (uint)(hit.t * 10.0);
-                    // On screen: the hit projects inside the image and the game depth there is the hit (2% or 5 cm, the
-                    // RTAO discovery tolerance). Hidden on screen: it projects inside but another surface is in front.
-                    const float hit_distance = length(hit.position - camera);
-                    const float4 clip = mul(float4(hit.position, 1.0), viewProj_g);
-                    const float2 hit_uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-                    bool visible = false;
-                    if (clip.w <= 1e-6 || any(hit_uv < 0.0) || any(hit_uv >= 1.0))
-                    {
-                        off_screen += 1u;
-                    }
-                    else
-                    {
-                        const uint2 q = min(uint2(hit_uv * float2(full_size)), full_size - 1u);
-                        const float q_depth = g_game_depth.Load(int3(q, 0)).x;
-                        const float2 q_uv = (float2(q) + 0.5) / float2(full_size);
-                        const float4 q_h = mul(float4(q_uv.x * 2.0 - 1.0, 1.0 - q_uv.y * 2.0, q_depth, 1.0), viewProjInv_g);
-                        visible = q_depth > 0.0
-                            && abs(length(q_h.xyz / q_h.w - camera) - hit_distance) <= max(0.02 * hit_distance, 0.05);
-                        if (visible)
+                        const float3 up = abs(ray_N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+                        const float3 T = normalize(cross(up, ray_N));
+                        const float3 B = cross(ray_N, T);
+                        // Bounce b draws its own noise: the sample index is offset by b x spp.
+                        float2 u;
+                        if (g_rtgi_sampling.x > 0.5)
                         {
-                            on_screen += 1u;
+                            u = g_isfast_noise.Load(int4((tp.x + 64u) % 128u, (tp.y + 64u) % 128u,
+                                ((uint)g_rtgi_sampling.y + i + b * spp) % 32u, 0));
                         }
                         else
                         {
-                            occluded += 1u;
+                            const float2 q = float2(tp) + g_rtgi_sampling.z + 13.0 + float(i + b * spp) * 7.0;
+                            u = frac(52.9829189 * frac(float2(dot(q, float2(0.06711056, 0.00583715)), dot(q + 47.0, float2(0.06711056, 0.00583715)))));
                         }
-                    }
-                    const float3 n = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
-                    float3 radiance = float3(0.0, 0.0, 0.0);
-                    bool looked_up = false;
-                    if (visible && (flags & RTGI_FLAG_RADIANCE_VALID) != 0u)
-                    {
-                        // The copy is last frame's lighting output: look the hit up where the previous camera saw it.
-                        // = mul(float4(p, 1), prevViewProj_g): cbuffer matrices are column-major, so register r + j is column j.
-                        const float4 hit_h = float4(hit.position, 1.0);
-                        const float4 prev_clip = float4(dot(hit_h, g_scene_rows[prev_row]), dot(hit_h, g_scene_rows[prev_row + 1u]),
-                                                        dot(hit_h, g_scene_rows[prev_row + 2u]), dot(hit_h, g_scene_rows[prev_row + 3u]));
-                        const float2 prev_uv = float2(prev_clip.x / prev_clip.w * 0.5 + 0.5, 0.5 - prev_clip.y / prev_clip.w * 0.5);
-                        if (prev_clip.w > 1e-6 && all(prev_uv >= 0.0) && all(prev_uv < 1.0))
+                        const float r = sqrt(u.x);
+                        const float phi = 6.2831853 * u.y;
+                        const float3 dir = T * (r * cos(phi)) + B * (r * sin(phi)) + ray_N * sqrt(max(0.0, 1.0 - u.x));
+
+                        WorldTraceCounters counters;
+                        const WorldTraceHit hit = TraceWorldClosest(ray_origin, dir, 1e-3, ray_max, view, counters);
+                        invalid_refs += counters.invalid_refs;
+                        stack_overflow += counters.stack_overflow;
+                        if (hit.prim == 0xFFFFFFFFu)
                         {
-                            uint rw;
-                            uint rh;
-                            g_rtgi_radiance.GetDimensions(rw, rh);
-                            radiance = g_rtgi_radiance.Load(int3(min(uint2(prev_uv * float2(rw, rh)), uint2(rw, rh) - 1u), 0)).rgb;
-                            if ((flags & RTGI_FLAG_SUBTRACT_PREVIOUS) != 0u)
-                            {
-                                // What the composite added here last frame: final GI at the previous pixel x colour at the hit.
-                                uint fw;
-                                uint fh;
-                                g_rtgi_prev_final.GetDimensions(fw, fh);
-                                uint aw;
-                                uint ah;
-                                g_rtgi_albedo.GetDimensions(aw, ah);
-                                const float3 applied = g_rtgi_prev_final.Load(int3(min(uint2(prev_uv * float2(fw, fh)), uint2(fw, fh) - 1u), 0)).rgb
-                                    * g_rtgi_albedo.Load(int3(min(uint2(hit_uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
-                                    * g_rtgi_shading.z;
-                                radiance = max(radiance - applied, 0.0);
-                                if ((flags & RTGI_FLAG_FEEDBACK) != 0u)
-                                {
-                                    // Extra Bounces: keep the feedback share of the subtracted bounce, so it builds up over frames.
-                                    radiance += g_rtgi_dynamic.y * applied;
-                                }
-                            }
-                            // O1: scale this on-screen bounce's sun and lamp parts (Sun / Dynamic Light Contribution).
-                            // Null views (not Sora 2nd, or no G-buffer colour) read 0, so nothing changes there.
-                            if (g_rtgi_sun.z != 1.0 || g_rtgi_dynamic.x != 1.0)
-                            {
-                                const float3 surface = BounceSurfaceAt(hit_uv);
-                                if (g_rtgi_sun.z != 1.0)
-                                {
-                                    radiance += (g_rtgi_sun.z - 1.0) * SunGiAt(hit_uv, surface);
-                                }
-                                if (g_rtgi_dynamic.x != 1.0)
-                                {
-                                    uint mw;
-                                    uint mh;
-                                    g_mrt2.GetDimensions(mw, mh);
-                                    const uint2 material_px = min(uint2(hit_uv * float2(mw, mh)), uint2(mw, mh) - 1u);
-                                    const uint material_index = min(0x4e1fu, g_mrt2.Load(int3(material_px, 0)).x);
-                                    const float dynamic_light_intensity = g_rtgi_deferred[material_index].mid.w;
-                                    radiance += (g_rtgi_dynamic.x - 1.0) * surface * dynamic_light_intensity
-                                        * LampDiffuseSum(hit.position, n);
-                                }
-                            }
-                            looked_up = true;
-                            lookups += 1u;
+                            // A miss ends the sample: a later bounce that misses adds no light.
+                            break;
                         }
-                    }
-                    if (!looked_up)
-                    {
+                        // Hit counters (debug views 1, 2 and 8) describe the first bounce only.
+                        if (b == 0u)
+                        {
+                            hits += 1u;
+                            t_sum += hit.t;
+                            min_t = min(min_t, hit.t);
+                            distance_dm += (uint)(hit.t * 10.0);
+                        }
+                        // On screen: the hit projects inside the image and the game depth there is the hit (2% or 5 cm, the
+                        // RTAO discovery tolerance). Hidden on screen: it projects inside but another surface is in front.
+                        const float hit_distance = length(hit.position - camera);
+                        const float4 clip = mul(float4(hit.position, 1.0), viewProj_g);
+                        const float2 hit_uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+                        bool visible = false;
+                        if (clip.w <= 1e-6 || any(hit_uv < 0.0) || any(hit_uv >= 1.0))
+                        {
+                            if (b == 0u)
+                            {
+                                off_screen += 1u;
+                            }
+                        }
+                        else
+                        {
+                            const uint2 q = min(uint2(hit_uv * float2(full_size)), full_size - 1u);
+                            const float q_depth = g_game_depth.Load(int3(q, 0)).x;
+                            const float2 q_uv = (float2(q) + 0.5) / float2(full_size);
+                            const float4 q_h = mul(float4(q_uv.x * 2.0 - 1.0, 1.0 - q_uv.y * 2.0, q_depth, 1.0), viewProjInv_g);
+                            visible = q_depth > 0.0
+                                && abs(length(q_h.xyz / q_h.w - camera) - hit_distance) <= max(0.02 * hit_distance, 0.05);
+                            if (b == 0u)
+                            {
+                                on_screen += visible ? 1u : 0u;
+                                occluded += visible ? 0u : 1u;
+                            }
+                        }
+                        const float3 n = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
+                        float3 radiance = float3(0.0, 0.0, 0.0);
+                        bool looked_up = false;
                         const float fallback_albedo = (flags & RTGI_FLAG_FALLBACK_NO_ALBEDO) != 0u ? 1.0 : RTGI_FALLBACK_ALBEDO;
-                        // Hidden, off screen or no copy: sun with a shadow ray (shadow-only casters block it: hide off) plus
-                        // the game's probe ambient (lighting_0xCA3D8596 lines 827-841) and, with RTGI_FLAG_DYNAMIC_LIGHTS, the
-                        // lamps, times a grey albedo (RTGI_FALLBACK_ALBEDO; 1.0 with RTGI_FLAG_FALLBACK_NO_ALBEDO).
-                        const float3 sun_dir = normalize(-lightDirection_g);
-                        const float ndl = saturate(dot(n, sun_dir));
-                        float sun = 0.0;
-                        if (ndl > 0.0)
+                        if (visible && (flags & RTGI_FLAG_RADIANCE_VALID) != 0u)
                         {
-                            const WorldCameraView sun_view = {false, 1.0, 0u,
-                                ((flags & RTGI_FLAG_SUN_CASTERS_ONLY) != 0u ? INSTANCE_SHADOW_CASTER : 0u)};
-                            WorldTraceCounters sun_counters;
-                            const WorldTraceHit sun_hit = TraceWorldAny(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, g_rtgi_sun.x, sun_view, sun_counters);
-                            sun_rays += 1u;
-                            invalid_refs += sun_counters.invalid_refs;
-                            stack_overflow += sun_counters.stack_overflow;
-                            if (sun_hit.prim == 0xFFFFFFFFu)
+                            // The copy is last frame's lighting output: look the hit up where the previous camera saw it.
+                            // = mul(float4(p, 1), prevViewProj_g): cbuffer matrices are column-major, so register r + j is column j.
+                            const float4 hit_h = float4(hit.position, 1.0);
+                            const float4 prev_clip = float4(dot(hit_h, g_scene_rows[prev_row]), dot(hit_h, g_scene_rows[prev_row + 1u]),
+                                                            dot(hit_h, g_scene_rows[prev_row + 2u]), dot(hit_h, g_scene_rows[prev_row + 3u]));
+                            const float2 prev_uv = float2(prev_clip.x / prev_clip.w * 0.5 + 0.5, 0.5 - prev_clip.y / prev_clip.w * 0.5);
+                            if (prev_clip.w > 1e-6 && all(prev_uv >= 0.0) && all(prev_uv < 1.0))
                             {
-                                sun = ndl;
-                                sun_visible_count += 1u;
+                                uint rw;
+                                uint rh;
+                                g_rtgi_radiance.GetDimensions(rw, rh);
+                                radiance = g_rtgi_radiance.Load(int3(min(uint2(prev_uv * float2(rw, rh)), uint2(rw, rh) - 1u), 0)).rgb;
+                                if ((flags & RTGI_FLAG_SUBTRACT_PREVIOUS) != 0u)
+                                {
+                                    // What the composite added here last frame: final GI at the previous pixel x colour at the hit.
+                                    uint fw;
+                                    uint fh;
+                                    g_rtgi_prev_final.GetDimensions(fw, fh);
+                                    uint aw;
+                                    uint ah;
+                                    g_rtgi_albedo.GetDimensions(aw, ah);
+                                    const float3 applied = g_rtgi_prev_final.Load(int3(min(uint2(prev_uv * float2(fw, fh)), uint2(fw, fh) - 1u), 0)).rgb
+                                        * g_rtgi_albedo.Load(int3(min(uint2(hit_uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
+                                        * g_rtgi_shading.z;
+                                    radiance = max(radiance - applied, 0.0);
+                                    if ((flags & RTGI_FLAG_FEEDBACK) != 0u)
+                                    {
+                                        // Extra Bounces: keep the feedback share of the subtracted bounce, so it builds up over frames.
+                                        radiance += g_rtgi_dynamic.y * applied;
+                                    }
+                                }
+                                // O1: scale this on-screen bounce's sun and lamp parts (Sun / Dynamic Light Contribution).
+                                // Null views (not Sora 2nd, or no G-buffer colour) read 0, so nothing changes there.
+                                if (g_rtgi_sun.z != 1.0 || g_rtgi_dynamic.x != 1.0)
+                                {
+                                    const float3 surface = BounceSurfaceAt(hit_uv);
+                                    if (g_rtgi_sun.z != 1.0)
+                                    {
+                                        radiance += (g_rtgi_sun.z - 1.0) * SunGiAt(hit_uv, surface);
+                                    }
+                                    if (g_rtgi_dynamic.x != 1.0)
+                                    {
+                                        uint mw;
+                                        uint mh;
+                                        g_mrt2.GetDimensions(mw, mh);
+                                        const uint2 material_px = min(uint2(hit_uv * float2(mw, mh)), uint2(mw, mh) - 1u);
+                                        const uint material_index = min(0x4e1fu, g_mrt2.Load(int3(material_px, 0)).x);
+                                        const float dynamic_light_intensity = g_rtgi_deferred[material_index].mid.w;
+                                        radiance += (g_rtgi_dynamic.x - 1.0) * surface * dynamic_light_intensity
+                                            * LampDiffuseSum(hit.position, n);
+                                    }
+                                }
+                                looked_up = true;
+                                lookups += 1u;
                             }
                         }
-                        const float3 ambient = max(float3(0.0, 0.0, 0.0),
-                            lightProbe_g[0].xyz + lightProbe_g[1].xyz * n.x + lightProbe_g[2].xyz * n.y + lightProbe_g[3].xyz * n.z
-                            + lightProbe_g[4].xyz * (n.z * n.x) + lightProbe_g[5].xyz * (n.y * n.z) + lightProbe_g[6].xyz * (n.y * n.x)
-                            + lightProbe_g[7].xyz * (3.0 * n.z * n.z - 1.0) + lightProbe_g[8].xyz * (n.x * n.x - n.y * n.y));
-                        float3 sun_light = lightColor_g * sun * g_rtgi_sun.z;
-                        if ((flags & RTGI_FLAG_GAME_SUN) != 0u)
+                        if (!looked_up)
                         {
-                            // The game's shadow floor (min(1, sceneShadowColor_g) x sun colour) is not scaled by Sun
-                            // Contribution (g_rtgi_sun.z); only the lit part (1 - floor) is.
-                            const float3 shadow_floor = min(float3(1.0, 1.0, 1.0), sceneShadowColor_g);
-                            sun_light = lightColor_g
-                                * (shadow_floor + (float3(1.0, 1.0, 1.0) - shadow_floor) * sun * g_rtgi_sun.z);
+                            // Hidden, off screen or no copy: sun with a shadow ray (shadow-only casters block it: hide off) plus
+                            // the game's probe ambient (lighting_0xCA3D8596 lines 827-841) and, with RTGI_FLAG_DYNAMIC_LIGHTS, the
+                            // lamps, times a grey albedo (RTGI_FALLBACK_ALBEDO; 1.0 with RTGI_FLAG_FALLBACK_NO_ALBEDO).
+                            const float3 sun_dir = normalize(-lightDirection_g);
+                            const float ndl = saturate(dot(n, sun_dir));
+                            float sun = 0.0;
+                            if (ndl > 0.0)
+                            {
+                                const WorldCameraView sun_view = {false, 1.0, 0u,
+                                    ((flags & RTGI_FLAG_SUN_CASTERS_ONLY) != 0u ? INSTANCE_SHADOW_CASTER : 0u)};
+                                WorldTraceCounters sun_counters;
+                                const WorldTraceHit sun_hit = TraceWorldAny(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, g_rtgi_sun.x, sun_view, sun_counters);
+                                sun_rays += 1u;
+                                invalid_refs += sun_counters.invalid_refs;
+                                stack_overflow += sun_counters.stack_overflow;
+                                if (sun_hit.prim == 0xFFFFFFFFu)
+                                {
+                                    sun = ndl;
+                                    sun_visible_count += 1u;
+                                }
+                            }
+                            const float3 ambient = max(float3(0.0, 0.0, 0.0),
+                                lightProbe_g[0].xyz + lightProbe_g[1].xyz * n.x + lightProbe_g[2].xyz * n.y + lightProbe_g[3].xyz * n.z
+                                + lightProbe_g[4].xyz * (n.z * n.x) + lightProbe_g[5].xyz * (n.y * n.z) + lightProbe_g[6].xyz * (n.y * n.x)
+                                + lightProbe_g[7].xyz * (3.0 * n.z * n.z - 1.0) + lightProbe_g[8].xyz * (n.x * n.x - n.y * n.y));
+                            float3 sun_light = lightColor_g * sun * g_rtgi_sun.z;
+                            if ((flags & RTGI_FLAG_GAME_SUN) != 0u)
+                            {
+                                // The game's shadow floor (min(1, sceneShadowColor_g) x sun colour) is not scaled by Sun
+                                // Contribution (g_rtgi_sun.z); only the lit part (1 - floor) is.
+                                const float3 shadow_floor = min(float3(1.0, 1.0, 1.0), sceneShadowColor_g);
+                                sun_light = lightColor_g
+                                    * (shadow_floor + (float3(1.0, 1.0, 1.0) - shadow_floor) * sun * g_rtgi_sun.z);
+                            }
+                            radiance = fallback_albedo * (sun_light + g_rtgi_shading.x * ambient);
+                            if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
+                            {
+                                radiance += fallback_albedo * g_rtgi_dynamic.x * LampDiffuseSum(hit.position, n);
+                            }
                         }
-                        radiance = fallback_albedo * (sun_light + g_rtgi_shading.x * ambient);
-                        if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
+                        if (b == 0u)
                         {
-                            radiance += fallback_albedo * g_rtgi_dynamic.x * LampDiffuseSum(hit.position, n);
+                            radiance_0 = radiance;
                         }
+                        else
+                        {
+                            extra += throughput * radiance;
+                        }
+                        throughput *= (visible ? BounceSurfaceAt(hit_uv)
+                            : float3(fallback_albedo, fallback_albedo, fallback_albedo));
+                        ray_origin = hit.position + n * g_rtgi_params.y;
+                        ray_N = n;
                     }
+                    float3 radiance = radiance_0 + extra;
                     if (any(isnan(radiance)) || any(isinf(radiance)))
                     {
                         radiance = float3(0.0, 0.0, 0.0);

@@ -884,3 +884,22 @@ Verification (2026-10-08):
   4. GI Intensity 2 with Feedback Strength 1: the cap applies (f_eff 0.45), the image does not run away.
   5. Record RTGI GPU ms (Performance tab) with Extra Bounces Off and On.
 - Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtgi.cs_5_0.hlsl` before (HEAD 85339e81): 0x8946eab9a003a9ae. After: 0xb54fcb7c7d5b4214.
+
+## Extra bounces, Real Extra Rays (bounce-b, rtgi-bounce-rays): implemented, not validated in game
+
+- Settings: RtgiExtraBounceMethod "Extra Bounce Method" (RTGI section, INTEGER: 0 Feedback (default), 1 Real Extra Rays; shown only while Extra Bounces is On) and RtgiExtraBounceRays "Extra Bounce Rays" (RTGI section, INTEGER 1 to 2, default 1; shown only while Extra Bounces is On and the method is Real Extra Rays). Feedback Strength is now shown only while Extra Bounces is On and the method is Feedback.
+- Flag: `RTGI_FLAG_REAL_RAYS` 128 (`kRtgiFlagRealRays`). The feedback flag (64) is set only for the Feedback method, so the two are never set together. Rays are push constant c7.z (`g_rtgi_dynamic.z`), 0 unless Real Extra Rays is on. The shader clamps them to 2. Push stays 32 floats.
+- Loop (world_rtgi.cs_5_0.hlsl, per sample): bounce b = 0 .. rays, with rays = `min(c7.z, 2)` under the flag, else 0. b = 0 is today's first ray and shading, unchanged in its expressions. For b >= 1 the origin is the previous hit plus its normal times the normal bias, the direction is cosine-weighted around that hit's normal, and the noise index is offset by b x spp. The hit is shaded by the same rules as the first hit (on-screen lookup with the subtract rule, otherwise the fallback sun, ambient and lamps).
+- Accumulation: radiance_0 is the first hit. Each later hit adds throughput x radiance_b to extra, then throughput is multiplied by that hit's surface colour (the G-buffer colour when the hit is visible on screen, otherwise the fallback albedo 0.5, or 1.0 with No Albedo Guess). The sample is radiance_0 + extra, then the NaN check, Radiance Clamp and sum run once on that total. Throughput always uses the G-buffer colour of a visible hit; when no copy is bound, the radiance falls back to grey (0.5, or 1.0 with No Albedo Guess) while the throughput still reads the G-buffer.
+- Miss: a miss on any bounce ends the sample; a later miss adds no light.
+- Counters: the hit-class, distance and mean-distance counters (debug views 1, 2, 8) count the first bounce only. The sun-ray, lookup, invalid-ref and stack-overflow counters count all bounces. The RAYS stat counts primary rays only, so with extra rays on, ratios against RAYS can exceed 1. The JSON `extra_bounces` block carries this as its `note` key.
+- Cap: 2 extra bounces (Extra Bounce Rays 1 or 2). Feedback keeps its own safety cap (f_eff x GI Intensity <= 0.9).
+- Off = HEAD: with Extra Bounces Off, or the Feedback method, rays are 0 and the loop runs once.
+- Snapshot: `extra_bounce_method` and `extra_bounce_rays` (raw settings) are appended after `feedback_strength`; the count goes 25 -> 27. Any change resets RTGI history.
+- JSON: `extra_bounces` block gains `method` ("feedback" or "real_extra_rays") and `rays` is the effective count (0 for Feedback or Off). The panel line shows method and rays.
+- Cost estimate: about +100 to 130% of the RTGI trace cost per extra bounce. To be measured.
+- Owner test (not run):
+  1. Extra Bounces On, method Real Extra Rays, Extra Bounce Rays 1: screenshots, RTGI GPU ms (Performance tab), and a short video while walking.
+  2. Same with Extra Bounce Rays 2.
+  3. Compare with Feedback at Feedback Strength 0.5 (screenshots and RTGI GPU ms).
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (HEAD 6329d172): 0xB54FCB7C7D5B4214. After: 0xEA437F3F48D210A7.
