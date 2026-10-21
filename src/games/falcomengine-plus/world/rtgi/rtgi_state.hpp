@@ -21,6 +21,9 @@ inline float g_rtgi_debug = 0.f;               // RTGI Debug (advanced), see the
 inline float g_rtgi_radiance_clamp = 0.f;  // Radiance Clamp: luminance cap per GI sample (0 = off)
 inline float g_rtgi_ambient = 1.f;         // Ambient Contribution: probe ambient weight at hidden and off-screen hits
 inline float g_rtgi_sun_distance = 64.f;   // Sun Shadow Distance (advanced): length of the fallback sun shadow ray, metres
+inline float g_rtgi_sun_casters_only = 0.f;   // Sun Shadows From Shadow Casters Only: sun rays hit shadow casters
+inline float g_rtgi_sun_contribution = 1.f;   // Sun Contribution: scales the sun term of the fallback radiance
+inline float g_rtgi_offscreen_nothing = 0.f;  // Off-screen Hits Add Nothing: fallback hits add no light
 inline float g_rtgi_temporal_enabled = 1.f;
 inline float g_rtgi_history_weight = 0.95f;
 inline float g_rtgi_depth_rejection = 0.05f;
@@ -105,6 +108,7 @@ struct ParameterSnapshot {
   float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
   float trace_characters;
+  float sun_casters_only, sun_contribution, offscreen_nothing;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

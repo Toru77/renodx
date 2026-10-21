@@ -196,6 +196,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint group_index : SV_GroupIndex)
         view.hide = g_camera_view.x > 0.5;
         view.floor_value = g_camera_view.y;
         view.skip_flags = 0u;
+        view.require_flags = 0u;
         WorldTraceCounters counters;
         const WorldTraceHit hit = TraceWorldClosest(origin, direction, 0.001, 1e30, view, counters);
 

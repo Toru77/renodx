@@ -533,6 +533,9 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"radiance_clamp\": " << g_rtgi_radiance_clamp << ",\n";
   out << "  \"ambient_contribution\": " << g_rtgi_ambient << ",\n";
   out << "  \"sun_shadow_distance\": " << g_rtgi_sun_distance << ",\n";
+  out << "  \"sun_casters_only\": " << g_rtgi_sun_casters_only << ",\n";
+  out << "  \"sun_contribution\": " << g_rtgi_sun_contribution << ",\n";
+  out << "  \"offscreen_nothing\": " << g_rtgi_offscreen_nothing << ",\n";
   out << "  \"trace_characters\": " << g_rtgi_trace_characters << ",\n";
   out << "  \"character_objects\": " << f.character_objects << ",\n";
   if (in.camera != nullptr && in.camera->has_sun) {

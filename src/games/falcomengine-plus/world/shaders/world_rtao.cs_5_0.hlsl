@@ -110,7 +110,7 @@ void TracePixel(uint2 px)
             if ((rtao_flags & RTAO_FLAG_DISCOVERY) != 0u)
             {
                 const float3 view_dir = (P - camera) / distance_to_camera;
-                WorldCameraView disc_view = {true, 1.0, 0u};
+                WorldCameraView disc_view = {true, 1.0, 0u, 0u};
                 WorldTraceCounters disc_counters;
                 const WorldTraceHit disc_hit = TraceWorldClosest(camera, view_dir, 1e-3, 1.05 * distance_to_camera, disc_view, disc_counters);
                 if (disc_hit.prim != 0xFFFFFFFFu && abs(disc_hit.t - distance_to_camera) <= max(0.02 * distance_to_camera, 0.05))
@@ -125,7 +125,8 @@ void TracePixel(uint2 px)
             const float3 up = abs(N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
             const float3 T = normalize(cross(up, N));
             const float3 B = cross(N, T);
-            const WorldCameraView view = {true, 1.0, (rtao_flags & RTAO_FLAG_FOLIAGE_SKIP) != 0u ? INSTANCE_FOLIAGE : 0u};
+            const WorldCameraView view = {true, 1.0,
+                (rtao_flags & RTAO_FLAG_FOLIAGE_SKIP) != 0u ? INSTANCE_FOLIAGE : 0u, 0u};
 
             float occ = 0.0;
             uint rays = 0u;

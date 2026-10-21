@@ -969,6 +969,41 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.1f",
       .is_visible = advanced,
   });
+  settings->push_back(new Setting{
+      .key = "RtgiSunCastersOnly",
+      .binding = &rtgi::g_rtgi_sun_casters_only,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Sun Shadows From Shadow Casters Only",
+      .section = "RTGI",
+      .tooltip = "Sun shadow rays hit only what the game draws into its shadow maps. The game's own sun shadows, indoors and outdoors. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiSunContribution",
+      .binding = &rtgi::g_rtgi_sun_contribution,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Sun Contribution",
+      .section = "RTGI",
+      .tooltip = "Scales only the fallback sun light (hits not read from the screen) in RTGI. 1 = unchanged.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiOffscreenNothing",
+      .binding = &rtgi::g_rtgi_offscreen_nothing,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Off-screen Hits Add Nothing",
+      .section = "RTGI",
+      .tooltip = "Hits not read from the screen (hidden, off-screen) add no light: the grey 0.5 albedo guess is dropped. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
   AddTemporalRows(settings, visible, {.prefix = "Rtgi",
                                       .section = "RTGI Temporal Accumulation",
                                       .enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",

@@ -98,6 +98,7 @@ struct WorldCameraView
     bool hide;             // skip surfaces the game camera does not show
     float floor_value;     // cb_scene.disableMapObjNearFade_g
     uint skip_flags;       // INSTANCE_* bits: an instance with any of them is never hit (RTAO Foliage skip); 0 = none
+    uint require_flags;    // INSTANCE_* bits: hit only with all of them; 0 = none (RTGI sun shadow casters)
 };
 
 void TraceResetCounters(out WorldTraceCounters counters)
@@ -493,6 +494,7 @@ bool TraceWorldInstance(
     // Where the game camera shows this instance's surfaces.
     const uint visibility_flags = (uint)(instance.visibility.z + 0.5);
     if ((visibility_flags & view.skip_flags) != 0u) return false;
+    if ((visibility_flags & view.require_flags) != view.require_flags) return false;
     float shown_min = 0.0;
     float shown_max = CAMERA_FADE_NEVER;
     if ((visibility_flags & INSTANCE_CAMERA_VISIBLE) == 0u)

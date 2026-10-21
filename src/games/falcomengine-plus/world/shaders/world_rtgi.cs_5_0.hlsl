@@ -55,7 +55,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
-    float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), character object count (t10-t13), unused, unused
+    float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, unused
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -83,6 +83,8 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_STAT_TRACE_COUNT 20u
 #define RTGI_FLAG_RADIANCE_VALID 1u
 #define RTGI_FLAG_SUBTRACT_PREVIOUS 2u
+#define RTGI_FLAG_SUN_CASTERS_ONLY 4u
+#define RTGI_FLAG_DROP_FALLBACK 8u
 #define RTGI_FALLBACK_ALBEDO 0.5
 
 groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
@@ -175,7 +177,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 const float3 T = normalize(cross(up, N));
                 const float3 B = cross(N, T);
                 // GI rays skip surfaces the game camera does not show (shadow-only casters, near-faded surfaces), as RTAO.
-                const WorldCameraView view = {true, 1.0, 0u};
+                const WorldCameraView view = {true, 1.0, 0u, 0u};
                 uint hits = 0u;
                 uint on_screen = 0u;
                 uint occluded = 0u;
@@ -274,7 +276,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             lookups += 1u;
                         }
                     }
-                    if (!looked_up)
+                    if (!looked_up && (flags & RTGI_FLAG_DROP_FALLBACK) == 0u)
                     {
                         // Hidden, off screen or no copy: sun with a shadow ray (shadow-only casters block it: hide off) plus
                         // the game's probe ambient (lighting_0xCA3D8596 lines 827-841), times a grey albedo.
@@ -284,7 +286,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         float sun = 0.0;
                         if (ndl > 0.0)
                         {
-                            const WorldCameraView sun_view = {false, 1.0, 0u};
+                            const WorldCameraView sun_view = {false, 1.0, 0u,
+                                ((flags & RTGI_FLAG_SUN_CASTERS_ONLY) != 0u ? INSTANCE_SHADOW_CASTER : 0u)};
                             WorldTraceCounters sun_counters;
                             const WorldTraceHit sun_hit = TraceWorldAny(hit.position + n * g_rtgi_params.y, sun_dir, 1e-3, g_rtgi_sun.x, sun_view, sun_counters);
                             sun_rays += 1u;
@@ -300,7 +303,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             lightProbe_g[0].xyz + lightProbe_g[1].xyz * n.x + lightProbe_g[2].xyz * n.y + lightProbe_g[3].xyz * n.z
                             + lightProbe_g[4].xyz * (n.z * n.x) + lightProbe_g[5].xyz * (n.y * n.z) + lightProbe_g[6].xyz * (n.y * n.x)
                             + lightProbe_g[7].xyz * (3.0 * n.z * n.z - 1.0) + lightProbe_g[8].xyz * (n.x * n.x - n.y * n.y));
-                        radiance = RTGI_FALLBACK_ALBEDO * (lightColor_g * sun + g_rtgi_shading.x * ambient);
+                        radiance = RTGI_FALLBACK_ALBEDO
+                            * (lightColor_g * sun * g_rtgi_sun.z + g_rtgi_shading.x * ambient);
                     }
                     if (any(isnan(radiance)) || any(isinf(radiance)))
                     {

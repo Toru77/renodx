@@ -50,6 +50,8 @@ inline constexpr uint32_t kRtgiStatLuminanceSumHi = 23u;  // high word of the lu
 inline constexpr float kRtgiLuminanceStatCap = 1000.f;    // per-sample cap of the luminance statistic (RTGI_LUMINANCE_STAT_CAP)
 inline constexpr uint32_t kRtgiFlagRadianceValid = 1u;  // b12 c2.z bit (RTGI_FLAG_* in the shader)
 inline constexpr uint32_t kRtgiFlagSubtractPrevious = 2u;  // b12 c2.z bit: subtract last frame's applied bounce from lookups
+inline constexpr uint32_t kRtgiFlagSunCastersOnly = 4u;  // b12 c2.z bit: sun rays hit shadow casters only
+inline constexpr uint32_t kRtgiFlagDropFallback = 8u;    // b12 c2.z bit: fallback hits add no light
 // Temporal pass counters, matching RTGI_STAT_* in world_rtgi_temporal.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
 inline constexpr uint32_t kRtgiStatNoHistory = 21u;
@@ -104,7 +106,7 @@ struct RtgiPushConstants {
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
   float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
-  float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), unused, unused
+  float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), Sun Contribution, unused
 };
 static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 28 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");
