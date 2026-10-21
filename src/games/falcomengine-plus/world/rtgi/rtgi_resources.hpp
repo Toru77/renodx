@@ -20,9 +20,11 @@ namespace falcom_world::rtgi {
 // t19 P2b records (the RTAO pass A table), t20 radiance: the previous frame's lighting output, t21 the previous final
 // GI (null unless kRtgiFlagSubtractPrevious) and t22 the G-buffer colour (bound whenever it was captured this frame,
 // read only under kRtgiFlagSubtractPrevious): the one-bounce correction.
-inline constexpr uint32_t kRtgiSrvCount = 23u;
+// t23 the lamps (dynamicLights_g) and t24 the lamp type bits (kRtgiFlagDynamicLights; null unless the lamp type
+// pass ran).
+inline constexpr uint32_t kRtgiSrvCount = 25u;
 inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 3 or 8), u1 stats, u2 raw GI
-inline constexpr uint32_t kRtgiPushConstantCount = 28u;
+inline constexpr uint32_t kRtgiPushConstantCount = 32u;
 inline constexpr uint32_t kRtgiStatsCount = 24u;
 
 // Matching RTGI_STAT_* in world_rtgi.cs_5_0.hlsl.
@@ -52,6 +54,7 @@ inline constexpr uint32_t kRtgiFlagRadianceValid = 1u;  // b12 c2.z bit (RTGI_FL
 inline constexpr uint32_t kRtgiFlagSubtractPrevious = 2u;  // b12 c2.z bit: subtract last frame's applied bounce from lookups
 inline constexpr uint32_t kRtgiFlagSunCastersOnly = 4u;  // b12 c2.z bit: sun rays hit shadow casters only
 inline constexpr uint32_t kRtgiFlagDropFallback = 8u;    // b12 c2.z bit: fallback hits add no light
+inline constexpr uint32_t kRtgiFlagDynamicLights = 16u;  // b12 c2.z bit: fallback hits add the lamps of the type pass
 // Temporal pass counters, matching RTGI_STAT_* in world_rtgi_temporal.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
 inline constexpr uint32_t kRtgiStatNoHistory = 21u;
@@ -76,6 +79,14 @@ inline constexpr uint32_t kLightingLightsRegister = 11u;
 inline constexpr uint32_t kLightingLightIndicesRegister = 12u;
 inline constexpr uint32_t kLightParamBytes = 112u;
 inline constexpr uint32_t kLightIndexDataBytes = 576u;
+// Lamp type pass (world_rtgi_lights.cs_5_0.hlsl): t0 lightIndices_g, u0 one uint per lamp (bit 1 point, bit 2
+// spot), b12 c0.x
+// lamp count. The trace reads the lamps at t23 and the types at t24: kRtgiLampCount entries each.
+inline constexpr uint32_t kRtgiLampTypeSrvCount = 1u;
+inline constexpr uint32_t kRtgiLampTypeUavCount = 1u;
+inline constexpr uint32_t kRtgiLampTypePushCount = 1u;
+inline constexpr uint32_t kRtgiLampCount = 1024u;
+inline constexpr uint32_t kRtgiLightTileCount = 4608u;  // cells of lightIndices_g: 64 per group in the type pass
 
 #if defined(__world_rtgi_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtgiTraceShader = __world_rtgi;
@@ -97,8 +108,13 @@ inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = __world_rtg
 #else
 inline constexpr std::span<const std::uint8_t> kRtgiUpsampleShader = {};
 #endif
+#if defined(__world_rtgi_lights_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kRtgiLampTypeShader = __world_rtgi_lights;
+#else
+inline constexpr std::span<const std::uint8_t> kRtgiLampTypeShader = {};
+#endif
 
-// b12 for the RTGI trace, matching cbuffer cb_rtgi in world_rtgi.cs_5_0.hlsl (seven float4 registers).
+// b12 for the RTGI trace, matching cbuffer cb_rtgi in world_rtgi.cs_5_0.hlsl (eight float4 registers).
 struct RtgiPushConstants {
   float params[4];    // c0: effective ray max, normal bias, spp, trace divisor
   float sampling[4];  // c1: isfast flag (1 loaded), slice base, seed, debug mode
@@ -107,8 +123,9 @@ struct RtgiPushConstants {
   float size[4];      // c4: trace width, trace height, full width, full height
   float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
   float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), Sun Contribution, unused
+  float extra[4];     // c7: x = Dynamic Light Contribution, yzw unused
 };
-static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 28 floats");
+static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 32 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");
 static_assert(offsetof(RtgiPushConstants, fade) == 8 * sizeof(float), "b12 c2 offset");
 static_assert(offsetof(RtgiPushConstants, region) == 12 * sizeof(float), "b12 c3 offset");
@@ -240,10 +257,14 @@ struct RtgiDeviceData {
   RtgiPipeline temporal_pipeline;
   RtgiPipeline filter_pipeline;
   RtgiPipeline upsample_pipeline;
+  RtgiPipeline lamp_type_pipeline;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
   reshade::api::resource stats_buffer = {0u};
   reshade::api::resource_view stats_uav = {0u};
+  reshade::api::resource lamp_types = {0u};  // one uint per lamp: bit 1 point, bit 2 spot (kRtgiLampCount)
+  reshade::api::resource_view lamp_types_uav = {0u};
+  reshade::api::resource_view lamp_types_srv = {0u};
   RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 7
   RtgiTextureSet<1> raw;    // rgba16f, trace size: rgb GI, a = 1 traced, -1 not traced
   RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated GI, a = distance (0 = invalid)
@@ -285,6 +306,8 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   DestroyRtgiTextureSet(device, &data.final_gi);
   bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
+  bvh::DestroyBuffer(device, &data.lamp_types_srv, nullptr);
+  bvh::DestroyBuffer(device, &data.lamp_types_uav, &data.lamp_types);
   bvh::DestroyBuffer(device, nullptr, &data.lights_copy);
   bvh::DestroyBuffer(device, nullptr, &data.light_indices_copy);
   bvh::DestroyGpuTimer(&data.timer);
@@ -303,6 +326,7 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   destroy_pipeline(data.temporal_pipeline);
   destroy_pipeline(data.filter_pipeline);
   destroy_pipeline(data.upsample_pipeline);
+  destroy_pipeline(data.lamp_type_pipeline);
   g_rtgi_devices.erase(found);
 }
 

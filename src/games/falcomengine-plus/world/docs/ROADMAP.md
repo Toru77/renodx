@@ -53,6 +53,19 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
   3. Off-screen Hits Add Nothing On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute no light, the GI on those pixels loses the fallback light.
   4. Sun Contribution 0 and 2: the fallback sun light scales with the value; the ambient part does not change.
 
+## Off-screen dynamic lights (M4, rtgi-m4-lamps): implemented, not validated in game
+
+- Method 1 (no cache): only the lamps the game uploads this frame are used. `world_rtgi_lights.cs_5_0.hlsl` (new) reads the game's per-tile lists (`lightIndices_g`, t12 of Sora 2nd lighting 0xCA3D8596) and sets bit 1 (point) or bit 2 (spot) per lamp in a 1024-entry uint buffer (u0). The host zeroes the buffer each frame. The lamp type comes from these lists only, never from `spot_angle_inv`.
+- The RTGI trace adds, for a fallback hit (not read from the screen, not dropped by Off-screen Hits Add Nothing), the point and spot diffuse of each lamp that has a type bit. The formulas are the game's (`lighting_0xCA3D8596.ps_5_0.hlsl` point 1505-1559, spot 1560-1664, the else path of the tile branch), without the Hammon correction and the shadow maps. The sum is multiplied by RTGI_FALLBACK_ALBEDO (0.5) and Dynamic Light Contribution. Lamps are read from `dynamicLights_g` (t23), type bits from t24. The loop is bounded at 1024 entries; entries with radius <= 0 are skipped.
+- Limits: lamps outside the screen are not used. The type pass takes the lamps named by the game's screen tile lists; this is the working definition, because the owner's buffers showed every valid lamp is used by a screen tile. No shadow rays; a lamp lights a hit behind a wall, as the game's own lamp code does (no occlusion); the type comes from the tile lists, so a lamp listed as both point and spot gets both terms, as the game adds both.
+- Two rows (RTGI section, after Off-screen Hits Add Nothing):
+  - Off-screen Dynamic Lights (RtgiDynamicLights, BOOLEAN, default Off): flag bit 16 (`kRtgiFlagDynamicLights`). Off: no type pass and no lamp reads, as HEAD.
+  - Dynamic Light Contribution (RtgiDynamicLightContribution, FLOAT 0 to 2, default 1): pushed in b12 c7.x (`g_rtgi_dynamic.x`). The push grows from 28 to 32 floats.
+- Both values join `ParameterSnapshot` (a change resets RTGI history) and the RTGI JSON (`dynamic_lights`, `dynamic_light_contribution`). Defaults match HEAD: the image must match HEAD with Off.
+- Owner test list (not run):
+  1. Stand where a lamp is on screen. Dynamic Light Contribution 1. Toggle Off, take a screenshot; toggle On, take a screenshot. Read RTGI Stats for each. Send back: both screenshots and both stats lines.
+  2. Turn so the same lamp is off screen, keep Dynamic Light Contribution 1, and repeat the Off and On screenshots and Read RTGI Stats. Send back the same: both screenshots and both stats lines.
+
 ## Trace characters (rtao-rtgi-chars-1): implemented, not validated in game
 
 - Design: two toggles, RTAO "Trace characters" (RtaoTraceCharacters) and RTGI "Trace characters" (RtgiTraceCharacters), both default Off. When one is On, `RefitDeformLiveCharacters` (bvh/deform_live.hpp) refits this frame's skinned captures (VsClass::Skinned, resident BLAS) at lighting time with the same refit pass as the deforming meshes, into the shared objects buffer. The result is cached per game frame, so RTAO and RTGI share one refit. The RTAO trace reads it at t10-t13 with count size.z; the RTGI trace with count sun.y. Both are null and 0 with the toggles Off, so the image must match HEAD.

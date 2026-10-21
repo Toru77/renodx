@@ -10,6 +10,9 @@
 // distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views 1 to 3 and 8 (u0).
 // One bounce (M4): the copy holds last frame's applied bounce, so with RTGI_FLAG_SUBTRACT_PREVIOUS each lookup subtracts
 // the previous final GI (t21) x the G-buffer colour at the hit (t22) x last frame's GI Intensity (c5.z), clamped at 0.
+// Lamps (M4): with RTGI_FLAG_DYNAMIC_LIGHTS, a fallback hit adds the point and spot diffuse of the lamps uploaded
+// this frame
+// (t23) whose type bit (t24, world_rtgi_lights.cs_5_0.hlsl) is set. No shadow rays.
 // Camera: the game scene CBV (b0). Noise: IS-FAST (t18, Load only) or IGN, offset by 64 px from RTAO's.
 // cb_scene: the shared offsets are named below; prevViewProj_g moves between lighting variants (Sora 1st c74,
 // Sora 2nd c75, Kai c85; rtgi_state.hpp RtgiPrevViewProjRegister), so its four registers are read from the
@@ -21,6 +24,30 @@
 #define WORLD_TRACE_DYNAMIC_SKIP_HIDDEN
 #include "world_bvh_trace.hlsli"
 #include "../../include/mrt_normal.hlsli"
+#include "world_rt_lamps.hlsli"
+
+// The game's LightParam (sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl): 112 bytes. The full layout sets the stride.
+struct LightParam
+{
+    float3 pos;
+    float radius;
+    float3 color;
+    float radiusInv;
+    float3 charaColor;
+    float attenuation;
+    float3 vec;
+    float spotAngleInv;
+    float attenuationAngle;
+    float specularIntensity;
+    float specularGlossiness;
+    float scatterAnisotropy;
+    float3 scatterColor;
+    float scatterDensity;
+    float translucency;
+    int shadowmapIndex;
+    float scatterOffset;
+    float userParam;
+};
 
 Texture2D<float4> g_game_depth : register(t9);
 Texture2D<uint4> g_mrt_normal : register(t17);
@@ -28,6 +55,8 @@ Texture3D<float2> g_isfast_noise : register(t18);
 Texture2D<float4> g_rtgi_radiance : register(t20);
 Texture2D<float4> g_rtgi_prev_final : register(t21);  // last frame's final GI (one-bounce correction)
 Texture2D<float4> g_rtgi_albedo : register(t22);      // this frame's G-buffer colour, the lighting draw's colorTexture
+StructuredBuffer<LightParam> g_rtgi_lamps : register(t23);  // Sora 2nd dynamicLights_g (Off-screen Dynamic Lights)
+StructuredBuffer<uint> g_rtgi_lamp_types : register(t24);  // world_rtgi_lights: bit 1 point, bit 2 spot, per lamp
 
 RWTexture2D<float4> g_rtgi_debug : register(u0);
 RWStructuredBuffer<uint> g_rtgi_stats : register(u1);
@@ -46,7 +75,7 @@ cbuffer cb_scene : register(b0)
 };
 #define RTGI_SCENE_ROWS_FIRST 50u
 
-// Push constants (rtgi.hpp fills these; 28 floats).
+// Push constants (rtgi.hpp fills these; 32 floats).
 cbuffer cb_rtgi : register(b12)
 {
     float4 g_rtgi_params : packoffset(c0);    // effective ray max, normal bias, spp, trace divisor d
@@ -56,6 +85,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
     float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, unused
+    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), unused
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -85,6 +115,8 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_SUBTRACT_PREVIOUS 2u
 #define RTGI_FLAG_SUN_CASTERS_ONLY 4u
 #define RTGI_FLAG_DROP_FALLBACK 8u
+#define RTGI_FLAG_DYNAMIC_LIGHTS 16u
+#define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
 
 groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
@@ -305,6 +337,36 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             + lightProbe_g[7].xyz * (3.0 * n.z * n.z - 1.0) + lightProbe_g[8].xyz * (n.x * n.x - n.y * n.y));
                         radiance = RTGI_FALLBACK_ALBEDO
                             * (lightColor_g * sun * g_rtgi_sun.z + g_rtgi_shading.x * ambient);
+                        if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
+                        {
+                            float3 lamp_sum = float3(0.0, 0.0, 0.0);
+                            for (uint li = 0u; li < RTGI_LAMP_COUNT; ++li)
+                            {
+                                const uint lamp_type = g_rtgi_lamp_types[li];
+                                const LightParam lamp = g_rtgi_lamps[li];
+                                if (lamp.radius <= 0.0 || lamp_type == 0u)
+                                {
+                                    continue;
+                                }
+                                const float3 to_lamp = lamp.pos - hit.position;
+                                const float lamp_att = max(0.0,
+                                    1.0 - pow(abs(length(to_lamp) * lamp.radiusInv), lamp.attenuation));
+                                const float3 lamp_dir = normalize(to_lamp);
+                                const float lamp_ndl = max(lamp.translucency, dot(n, lamp_dir));
+                                if ((lamp_type & RTGI_LAMP_TYPE_POINT) != 0u)
+                                {
+                                    lamp_sum += lamp.color * lamp_att * lamp_ndl;
+                                }
+                                if ((lamp_type & RTGI_LAMP_TYPE_SPOT) != 0u)
+                                {
+                                    const float lamp_cone = max(0.0,
+                                        1.0 - pow((1.0 - max(0.0, dot(lamp_dir, lamp.vec))) * lamp.spotAngleInv,
+                                                  lamp.attenuationAngle));
+                                    lamp_sum += lamp.color * lamp_att * lamp_cone * lamp_ndl;
+                                }
+                            }
+                            radiance += RTGI_FALLBACK_ALBEDO * g_rtgi_dynamic.x * lamp_sum;
+                        }
                     }
                     if (any(isnan(radiance)) || any(isinf(radiance)))
                     {

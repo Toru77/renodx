@@ -1004,6 +1004,30 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
+  settings->push_back(new Setting{
+      .key = "RtgiDynamicLights",
+      .binding = &rtgi::g_rtgi_dynamic_lights,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Off-screen Dynamic Lights",
+      .section = "RTGI",
+      .tooltip = "Lamps that touch the screen this frame (the ones listed in the game's screen tile lists) add light to hits not read from the screen (hidden and off-screen surfaces). Lamps outside the screen are not used. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiDynamicLightContribution",
+      .binding = &rtgi::g_rtgi_dynamic_light_contribution,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Dynamic Light Contribution",
+      .section = "RTGI",
+      .tooltip = "Scales the light from lamps in RTGI off-screen hits. 1 = unchanged.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
   AddTemporalRows(settings, visible, {.prefix = "Rtgi",
                                       .section = "RTGI Temporal Accumulation",
                                       .enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",

@@ -9348,7 +9348,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
       rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
       rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
-      rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_offscreen_nothing};
+      rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_offscreen_nothing,
+      rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9384,6 +9385,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
   const bool copy_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
       && rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed);
+  const bool dynamic_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
+      && rtgi::g_rtgi_dynamic_lights > 0.5f;
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs != nullptr) {
@@ -9408,13 +9411,15 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                    static_cast<float>((radiance_valid ? rtgi::kRtgiFlagRadianceValid : 0u)
                        | (subtract ? rtgi::kRtgiFlagSubtractPrevious : 0u)
                        | (rtgi::g_rtgi_sun_casters_only > 0.5f ? rtgi::kRtgiFlagSunCastersOnly : 0u)
-                       | (rtgi::g_rtgi_offscreen_nothing > 0.5f ? rtgi::kRtgiFlagDropFallback : 0u)),
+                       | (rtgi::g_rtgi_offscreen_nothing > 0.5f ? rtgi::kRtgiFlagDropFallback : 0u)
+                       | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)),
                    0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
           .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, subtract ? frame.applied_intensity : 0.f,
                       static_cast<float>(prev_view_proj_register)},
           .sun = {rtgi::g_rtgi_sun_distance, 0.f, rtgi::g_rtgi_sun_contribution, 0.f},
+          .extra = {rtgi::g_rtgi_dynamic_light_contribution, 0.f, 0.f, 0.f},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
@@ -9431,6 +9436,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .filter_taps = static_cast<int>(rtgi::g_rtgi_filter_type > 0.5f ? rtgi::g_rtgi_filter_taps_atrous : rtgi::g_rtgi_filter_taps_separable),
       .lights = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightsRegister] : reshade::api::resource{0u},
       .light_indices = copy_lights ? world_cl->ps_srv[rtgi::kLightingLightIndicesRegister] : reshade::api::resource{0u},
+      .lights_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister]
+                                    : reshade::api::resource_view{0u},
+      .light_indices_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister]
+                                           : reshade::api::resource_view{0u},
   };
   if (rtgi::g_rtgi_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);

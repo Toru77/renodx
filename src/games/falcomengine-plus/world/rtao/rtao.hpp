@@ -106,7 +106,7 @@ struct RtaoDispatchResult {
 };
 
 // Null-array sizes: upper bounds of the SRV and UAV counts of every pass that calls NullComputeSlots (RTAO and RTGI). 8 is the D3D11 compute UAV slot count.
-inline constexpr uint32_t kNullComputeSrvMax = 24u;
+inline constexpr uint32_t kNullComputeSrvMax = 32u;
 inline constexpr uint32_t kNullComputeUavMax = 8u;
 // NullComputeSlots: nulls the compute slots on the context with push_descriptors (pipeline_layout{0}),
 // which binds directly at the register (table updates do not change the context).

@@ -93,6 +93,8 @@ struct RtgiDispatchInputs {
   int filter_taps = 5;    // samples per direction (separable) or kernel side (a-trous)
   reshade::api::resource lights = {0u};         // Sora 2nd dynamicLights_g (t11); copied for the stats request, null otherwise
   reshade::api::resource light_indices = {0u};  // Sora 2nd lightIndices_g (t12); copied for the stats request, null otherwise
+  reshade::api::resource_view lights_view = {0u};         // t23 lamps (Sora 2nd dynamicLights_g); null: no lamps
+  reshade::api::resource_view light_indices_view = {0u};  // lamp type pass t0 (Sora 2nd lightIndices_g); null: no lamps
   bvh::DynamicTraceInputs dynamic = {};         // characters (RefitDeformLiveCharacters), count 0 when off
 };
 
@@ -184,6 +186,25 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       return {};
     }
   }
+  // Lamps (Off-screen Dynamic Lights): the type pass needs the lamp buffer (t23) and the game tile lists (t12).
+  const bool lamps_run = in.lights_view.handle != 0u && in.light_indices_view.handle != 0u
+      && ensure_pipeline(&data.lamp_type_pipeline,
+                         {.srv_count = kRtgiLampTypeSrvCount, .uav_count = kRtgiLampTypeUavCount,
+                          .sampler_count = 0u, .push_count = kRtgiLampTypePushCount,
+                          .code = kRtgiLampTypeShader, .name = "lamp_types"});
+  if (lamps_run && data.lamp_types.handle == 0u) {
+    const uint32_t zeros[kRtgiLampCount] = {};
+    if (!bvh::CreatePoolBuffer(device, zeros, sizeof(zeros), sizeof(uint32_t), &data.lamp_types, &data.lamp_types_uav,
+                               reshade::api::resource_usage::unordered_access
+                                   | reshade::api::resource_usage::shader_resource)
+        || !device->create_resource_view(
+               data.lamp_types, reshade::api::resource_usage::shader_resource,
+               reshade::api::resource_view_desc(reshade::api::resource_view_type::buffer,
+                                                reshade::api::format::unknown, 0, kRtgiLampCount),
+               &data.lamp_types_srv)) {
+      return {};
+    }
+  }
   bool debug_ready = false;
   if (in.debug_mode >= 1 && in.debug_mode <= 8) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
@@ -255,6 +276,30 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   const uint32_t trace_groups_x = (in.trace_width + 7u) / 8u;
   const uint32_t trace_groups_y = (in.trace_height + 7u) / 8u;
 
+  // Lamp types: u0 is zeroed, then each tile cell of the game light index list sets bit 1 (point) or bit 2 (spot)
+  // for the lamps it lists (world_rtgi_lights.cs_5_0.hlsl). The trace reads t24 only when this pass ran.
+  if (lamps_run) {
+    const uint32_t lamp_zeros[kRtgiLampCount] = {};
+    device->update_buffer_region(lamp_zeros, data.lamp_types, 0u, sizeof(lamp_zeros));
+    const float lamp_count = static_cast<float>((std::min)(
+        device->get_resource_desc(device->get_resource_from_view(in.lights_view)).buffer.size / kLightParamBytes,
+        uint64_t{kRtgiLampCount}));
+    const RtgiPipeline& lamp_types = data.lamp_type_pipeline;
+    reshade::api::descriptor_table_update lamp_updates[2] = {
+        {lamp_types.srv_table, 0, 0, kRtgiLampTypeSrvCount, kSrv, &in.light_indices_view},
+        {lamp_types.uav_table, 0, 0, kRtgiLampTypeUavCount, kUav, &data.lamp_types_uav},
+    };
+    device->update_descriptor_tables(2, lamp_updates);
+    cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, lamp_types.pipeline);
+    const reshade::api::descriptor_table lamp_tables[2] = {lamp_types.srv_table, lamp_types.uav_table};
+    cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, lamp_types.layout, 1, 2, lamp_tables);
+    cmd_list->push_constants(reshade::api::shader_stage::all_compute, lamp_types.layout, 3, 0, kRtgiLampTypePushCount,
+                             &lamp_count);
+    cmd_list->dispatch((kRtgiLightTileCount + 63u) / 64u, 1u, 1u);
+    rtao::NullComputeSlots(cmd_list, kRtgiLampTypeSrvCount, kRtgiLampTypeUavCount, 0u);
+    cmd_list->barrier(data.lamp_types, reshade::api::resource_usage::unordered_access,
+                      reshade::api::resource_usage::shader_resource);
+  }
   // Trace.
   bvh::BeginGpuTimer(device, cmd_list, &data.timer);
   const RtgiPipeline& trace = data.trace_pipeline;
@@ -266,6 +311,8 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[20] = in.radiance_view;
   srvs[21] = in.prev_gi_view;
   srvs[22] = in.albedo_view;
+  srvs[23] = lamps_run ? in.lights_view : reshade::api::resource_view{0u};
+  srvs[24] = lamps_run ? data.lamp_types_srv : reshade::api::resource_view{0u};
   const reshade::api::resource_view uavs[kRtgiUavCount] = {
       trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
   reshade::api::descriptor_table_update updates[3] = {
@@ -445,6 +492,10 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     table_nulls.push_back({data.filter_pipeline.srv_table, 0, 0, kRtgiFilterSrvCount, kSrv, table_null_views});
     table_nulls.push_back({data.filter_pipeline.uav_table, 0, 0, kRtgiFilterUavCount, kUav, table_null_views});
   }
+  if (lamps_run) {
+    table_nulls.push_back({data.lamp_type_pipeline.srv_table, 0, 0, kRtgiLampTypeSrvCount, kSrv, table_null_views});
+    table_nulls.push_back({data.lamp_type_pipeline.uav_table, 0, 0, kRtgiLampTypeUavCount, kUav, table_null_views});
+  }
   device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
   return {.ok = true,
           .debug_written = trace_debug || temporal_debug || upsample_debug,
@@ -536,6 +587,8 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"sun_casters_only\": " << g_rtgi_sun_casters_only << ",\n";
   out << "  \"sun_contribution\": " << g_rtgi_sun_contribution << ",\n";
   out << "  \"offscreen_nothing\": " << g_rtgi_offscreen_nothing << ",\n";
+  out << "  \"dynamic_lights\": " << g_rtgi_dynamic_lights << ",\n";
+  out << "  \"dynamic_light_contribution\": " << g_rtgi_dynamic_light_contribution << ",\n";
   out << "  \"trace_characters\": " << g_rtgi_trace_characters << ",\n";
   out << "  \"character_objects\": " << f.character_objects << ",\n";
   if (in.camera != nullptr && in.camera->has_sun) {

@@ -24,6 +24,8 @@ inline float g_rtgi_sun_distance = 64.f;   // Sun Shadow Distance (advanced): le
 inline float g_rtgi_sun_casters_only = 0.f;   // Sun Shadows From Shadow Casters Only: sun rays hit shadow casters
 inline float g_rtgi_sun_contribution = 1.f;   // Sun Contribution: scales the sun term of the fallback radiance
 inline float g_rtgi_offscreen_nothing = 0.f;  // Off-screen Hits Add Nothing: fallback hits add no light
+inline float g_rtgi_dynamic_lights = 0.f;   // Off-screen Dynamic Lights: lamps add light to fallback hits
+inline float g_rtgi_dynamic_light_contribution = 1.f;  // Dynamic Light Contribution: scales the lamp light
 inline float g_rtgi_temporal_enabled = 1.f;
 inline float g_rtgi_history_weight = 0.95f;
 inline float g_rtgi_depth_rejection = 0.05f;
@@ -108,7 +110,7 @@ struct ParameterSnapshot {
   float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
   float trace_characters;
-  float sun_casters_only, sun_contribution, offscreen_nothing;
+  float sun_casters_only, sun_contribution, offscreen_nothing, dynamic_lights, dynamic_light_contribution;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

@@ -84,7 +84,7 @@ static void TestRtaoMaxDarkening() {
 }
 
 static void TestPushLayout() {
-  CHECK(sizeof(rtgi::RtgiPushConstants) == 28u * sizeof(float), "b12 is 28 floats");
+  CHECK(sizeof(rtgi::RtgiPushConstants) == 32u * sizeof(float), "b12 is 32 floats");
   CHECK(offsetof(rtgi::RtgiPushConstants, shading) == 20u * sizeof(float), "b12 c5 offset");
   CHECK(offsetof(rtgi::RtgiPushConstants, sun) == 24u * sizeof(float), "b12 c6 offset");
   CHECK(sizeof(rtgi::RtgiTemporalPushConstants) == 20u * sizeof(float), "temporal b12 is 20 floats");
