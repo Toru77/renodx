@@ -894,6 +894,30 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtgiExtraBounces",
+      .binding = &rtgi::g_rtgi_extra_bounces,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Extra Bounces",
+      .section = "RTGI",
+      .tooltip = "Adds bounce light by feeding back last frame's bounce from the screen, so light bounces more than once over several frames. Only surfaces visible on screen. Feedback does nothing on a frame when last frame's bounce was not applied. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtgiFeedbackStrength",
+      .binding = &rtgi::g_rtgi_feedback_strength,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.5f,
+      .label = "Feedback Strength",
+      .section = "RTGI",
+      .tooltip = "How much of last frame's bounce is fed back (0 = none, 1 = full). Automatically limited so that Feedback Strength x GI Intensity stays at or below 0.9, to keep the image stable.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = [visible]() { return visible() && rtgi::g_rtgi_extra_bounces > 0.5f; },
+  });
+  settings->push_back(new Setting{
       .key = "RtgiCharacterIntensity",
       .binding = &rtgi::g_rtgi_char_intensity,
       .value_type = SettingValueType::FLOAT,

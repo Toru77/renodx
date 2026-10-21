@@ -867,3 +867,20 @@ Verification (2026-10-08):
   1. In a scene with coloured bounce (red walls, green grass), set GI Saturation 0, take a screenshot and RTGI Debug 7; then 2, the same screenshots; compare with 1.
   2. Turn RTGI off and compare with vanilla.
 - Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtgi_upsample.cs_5_0.hlsl` before (HEAD 20538acc): 0x951afe71b2bd5deb. After: 0x935192aef4161a51.
+
+## Extra bounces, Feedback (bounce-a, rtgi-bounce-feedback): implemented, not validated in game
+
+- Settings: RtgiExtraBounces "Extra Bounces" (RTGI section, Off/On, default Off, always visible) and RtgiFeedbackStrength "Feedback Strength" (RTGI section, 0 to 1, default 0.5, shown only while Extra Bounces is On).
+- Method: the trace subtracts last frame's applied bounce at each on-screen hit (one bounce, as before). With the feedback flag (`RTGI_FLAG_FEEDBACK` 64, `kRtgiFlagFeedback`) it adds back the feedback share of that same subtracted value: radiance = max(copy - A, 0) + f_eff x A, where A = previous final GI x colour at the hit x last frame's GI Intensity. A is computed once and used for both steps. The NaN check, Radiance Clamp and the sum are unchanged.
+- Cap: f_eff = min(Feedback Strength, 0.9 / max(GI Intensity, 0.001)) while Extra Bounces is On, else 0. So f_eff x GI Intensity <= 0.9. The flag is set when f_eff > 0. f_eff is push constant c7.y (`g_rtgi_dynamic.y`).
+- Off equals HEAD: with Extra Bounces Off, f_eff is 0, the flag is not set and the subtract step is the same arithmetic as HEAD. Strength 0 gives the same result as Off.
+- The feedback is added inside the SUBTRACT_PREVIOUS block only, so it is a no-op on a frame where last frame's bounce was not applied (the subtract does not run). Off-screen and hidden hits are not fed back.
+- Snapshot: `extra_bounces` and `feedback_strength` (raw settings) are appended after `game_sun` in ParameterSnapshot and its initializer; the count goes 23 -> 25 (not 24 -> 26 as first planned). Any change to them resets RTGI history.
+- JSON: `extra_bounces` block (on, feedback_strength raw, feedback_strength_effective, rays 0). Rays is the next step (bounce-b).
+- Owner test (not run):
+  1. Extra Bounces Off: screenshots compared with HEAD.
+  2. Extra Bounces On with Feedback Strength 0: same as Off.
+  3. Feedback Strength 0.5 and 1 with GI Intensity 1: the image converges over a few seconds, no flicker.
+  4. GI Intensity 2 with Feedback Strength 1: the cap applies (f_eff 0.45), the image does not run away.
+  5. Record RTGI GPU ms (Performance tab) with Extra Bounces Off and On.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed (as in the C2b section). `world_rtgi.cs_5_0.hlsl` before (HEAD 85339e81): 0x8946eab9a003a9ae. After: 0xb54fcb7c7d5b4214.

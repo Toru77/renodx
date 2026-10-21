@@ -623,6 +623,9 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
       << ", \"dispatched_frame\": " << f.dispatched_frame << ", \"applied_frame\": " << f.applied_frame
       << ", \"applied_intensity\": " << f.applied_intensity
       << ", \"subtract_previous\": " << (f.subtracted ? "true" : "false") << "},\n";
+  out << "  \"extra_bounces\": {\"on\": " << (g_rtgi_extra_bounces > 0.5f ? "true" : "false")
+      << ", \"feedback_strength\": " << g_rtgi_feedback_strength
+      << ", \"feedback_strength_effective\": " << RtgiFeedbackStrengthEffective() << ", \"rays\": 0},\n";
   out << "  \"isfast_used\": " << (f.isfast_used ? "true" : "false") << ",\n";
   out << "  \"prev_view_proj_register\": " << f.prev_view_proj_register << ",\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << ",\n";

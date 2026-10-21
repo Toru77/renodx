@@ -100,7 +100,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
     float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, unused
-    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), unused
+    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), unused
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -132,6 +132,7 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_FALLBACK_NO_ALBEDO 8u
 #define RTGI_FLAG_DYNAMIC_LIGHTS 16u
 #define RTGI_FLAG_GAME_SUN 32u
+#define RTGI_FLAG_FEEDBACK 64u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
 
@@ -376,10 +377,15 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                 uint aw;
                                 uint ah;
                                 g_rtgi_albedo.GetDimensions(aw, ah);
-                                radiance = max(radiance
-                                    - g_rtgi_prev_final.Load(int3(min(uint2(prev_uv * float2(fw, fh)), uint2(fw, fh) - 1u), 0)).rgb
+                                const float3 applied = g_rtgi_prev_final.Load(int3(min(uint2(prev_uv * float2(fw, fh)), uint2(fw, fh) - 1u), 0)).rgb
                                     * g_rtgi_albedo.Load(int3(min(uint2(hit_uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
-                                    * g_rtgi_shading.z, 0.0);
+                                    * g_rtgi_shading.z;
+                                radiance = max(radiance - applied, 0.0);
+                                if ((flags & RTGI_FLAG_FEEDBACK) != 0u)
+                                {
+                                    // Extra Bounces: keep the feedback share of the subtracted bounce, so it builds up over frames.
+                                    radiance += g_rtgi_dynamic.y * applied;
+                                }
                             }
                             // O1: scale this on-screen bounce's sun and lamp parts (Sun / Dynamic Light Contribution).
                             // Null views (not Sora 2nd, or no G-buffer colour) read 0, so nothing changes there.
