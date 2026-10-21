@@ -7,7 +7,9 @@
 // hidden on screen or off screen. Each hit gets a radiance. On screen with a valid copy: the previous frame's lighting
 // output at the hit's previous-frame pixel (t20, prevViewProj_g). Otherwise: RTGI_FALLBACK_ALBEDO * (sun * N.L * a sun
 // shadow ray + Ambient Contribution * the game's probe ambient). The raw GI (u2) is the mean sample radiance times the
-// distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views 1 to 3 and 8 (u0).
+// distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views
+// 1 to 3, 8 and 9 (u0). On screen (O1, Sora 2nd): the sun and lamp parts of the looked-up bounce are scaled by Sun
+// Contribution and Dynamic Light Contribution, estimated from this frame's G-buffer (t25-t28).
 // One bounce (M4): the copy holds last frame's applied bounce, so with RTGI_FLAG_SUBTRACT_PREVIOUS each lookup subtracts
 // the previous final GI (t21) x the G-buffer colour at the hit (t22) x last frame's GI Intensity (c5.z), clamped at 0.
 // Lamps (M4): with RTGI_FLAG_DYNAMIC_LIGHTS, a fallback hit adds the point and spot diffuse of the lamps uploaded
@@ -49,6 +51,14 @@ struct LightParam
     float userParam;
 };
 
+// The game's DeferredParam (144 bytes). Only dynamicLightIntensity (byte offset 76 = .w of mid) is read.
+struct GameDeferredParam
+{
+    float4 head[4];
+    float4 mid;
+    float4 tail[4];
+};
+
 Texture2D<float4> g_game_depth : register(t9);
 Texture2D<uint4> g_mrt_normal : register(t17);
 Texture3D<float2> g_isfast_noise : register(t18);
@@ -57,6 +67,10 @@ Texture2D<float4> g_rtgi_prev_final : register(t21);  // last frame's final GI (
 Texture2D<float4> g_rtgi_albedo : register(t22);      // this frame's G-buffer colour, the lighting draw's colorTexture
 StructuredBuffer<LightParam> g_rtgi_lamps : register(t23);  // Sora 2nd dynamicLights_g (Off-screen Dynamic Lights)
 StructuredBuffer<uint> g_rtgi_lamp_types : register(t24);  // world_rtgi_lights: bit 1 point, bit 2 spot, per lamp
+Texture2D<uint4> g_mrt1 : register(t25);                    // G-buffer mrtTexture1 (Sora 2nd): sun diffuse factor in .w
+Texture2D<float4> g_shadow_mask : register(t26);            // screen shadow map (Sora 2nd shadowTexture)
+Texture2D<uint2> g_mrt2 : register(t27);                    // G-buffer mrtTexture2 (Sora 2nd): material index in .x
+StructuredBuffer<GameDeferredParam> g_rtgi_deferred : register(t28);  // Sora 2nd deferredParams_g
 
 RWTexture2D<float4> g_rtgi_debug : register(u0);
 RWStructuredBuffer<uint> g_rtgi_stats : register(u1);
@@ -70,6 +84,7 @@ cbuffer cb_scene : register(b0)
     float2 resolutionScaling_g : packoffset(c49);
     float3 lightColor_g : packoffset(c25);
     float3 lightDirection_g : packoffset(c26);
+    float3 sceneShadowColor_g : packoffset(c27);
     float4 lightProbe_g[9] : packoffset(c37);
     float4 g_scene_rows[46] : packoffset(c50);  // scene registers c50..c95 (per-variant prevViewProj_g)
 };
@@ -118,6 +133,66 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_DYNAMIC_LIGHTS 16u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
+
+// The G-buffer colour at a screen UV (this frame's lighting colorTexture).
+float3 BounceSurfaceAt(float2 uv)
+{
+    uint aw;
+    uint ah;
+    g_rtgi_albedo.GetDimensions(aw, ah);
+    return g_rtgi_albedo.Load(int3(min(uint2(uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb;
+}
+
+// O1 sun term at a screen UV: the game's sun lerp (lighting lines 1124-1126 and 1219-1221) minus its shadow floor,
+// times the surface colour. k = mrtTexture1.w / 255 (line 782) x the screen shadow (line 770),
+// floor = min(1, sceneShadowColor_g) (lines 140-141; the material shadowColor is not added). Cloud shadow, the
+// shadow UV clamp, the penumbra tint, Hammon and contact shadows are not applied.
+float3 SunGiAt(float2 uv, float3 surface)
+{
+    uint mw;
+    uint mh;
+    g_mrt1.GetDimensions(mw, mh);
+    const float k = (float)g_mrt1.Load(int3(min(uint2(uv * float2(mw, mh)), uint2(mw, mh) - 1u), 0)).w / 255.0;
+    uint sw;
+    uint sh;
+    g_shadow_mask.GetDimensions(sw, sh);
+    const float shadow = g_shadow_mask.Load(int3(min(uint2(uv * float2(sw, sh)), uint2(sw, sh) - 1u), 0)).x;
+    const float3 floor_term = min(float3(1.0, 1.0, 1.0), sceneShadowColor_g);
+    return surface * lightColor_g * (1.0 - floor_term) * (k * shadow);
+}
+
+// Sum of the game's point and spot diffuse of the lamps with a type bit (lighting lines 1505-1664 without the Hammon
+// correction and shadow maps). The caller applies the albedo and the lamp contribution.
+float3 LampDiffuseSum(float3 position, float3 n)
+{
+    float3 lamp_sum = float3(0.0, 0.0, 0.0);
+    for (uint li = 0u; li < RTGI_LAMP_COUNT; ++li)
+    {
+        const uint lamp_type = g_rtgi_lamp_types[li];
+        const LightParam lamp = g_rtgi_lamps[li];
+        if (lamp.radius <= 0.0 || lamp_type == 0u)
+        {
+            continue;
+        }
+        const float3 to_lamp = lamp.pos - position;
+        const float lamp_att = max(0.0,
+            1.0 - pow(abs(length(to_lamp) * lamp.radiusInv), lamp.attenuation));
+        const float3 lamp_dir = normalize(to_lamp);
+        const float lamp_ndl = max(lamp.translucency, dot(n, lamp_dir));
+        if ((lamp_type & RTGI_LAMP_TYPE_POINT) != 0u)
+        {
+            lamp_sum += lamp.color * lamp_att * lamp_ndl;
+        }
+        if ((lamp_type & RTGI_LAMP_TYPE_SPOT) != 0u)
+        {
+            const float lamp_cone = max(0.0,
+                1.0 - pow((1.0 - max(0.0, dot(lamp_dir, lamp.vec))) * lamp.spotAngleInv,
+                          lamp.attenuationAngle));
+            lamp_sum += lamp.color * lamp_att * lamp_cone * lamp_ndl;
+        }
+    }
+    return lamp_sum;
+}
 
 groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
 
@@ -274,6 +349,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             occluded += 1u;
                         }
                     }
+                    const float3 n = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
                     float3 radiance = float3(0.0, 0.0, 0.0);
                     bool looked_up = false;
                     if (visible && (flags & RTGI_FLAG_RADIANCE_VALID) != 0u)
@@ -304,6 +380,27 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                     * g_rtgi_albedo.Load(int3(min(uint2(hit_uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
                                     * g_rtgi_shading.z, 0.0);
                             }
+                            // O1: scale this on-screen bounce's sun and lamp parts (Sun / Dynamic Light Contribution).
+                            // Null views (not Sora 2nd, or no G-buffer colour) read 0, so nothing changes there.
+                            if (g_rtgi_sun.z != 1.0 || g_rtgi_dynamic.x != 1.0)
+                            {
+                                const float3 surface = BounceSurfaceAt(hit_uv);
+                                if (g_rtgi_sun.z != 1.0)
+                                {
+                                    radiance += (g_rtgi_sun.z - 1.0) * SunGiAt(hit_uv, surface);
+                                }
+                                if (g_rtgi_dynamic.x != 1.0)
+                                {
+                                    uint mw;
+                                    uint mh;
+                                    g_mrt2.GetDimensions(mw, mh);
+                                    const uint2 material_px = min(uint2(hit_uv * float2(mw, mh)), uint2(mw, mh) - 1u);
+                                    const uint material_index = min(0x4e1fu, g_mrt2.Load(int3(material_px, 0)).x);
+                                    const float dynamic_light_intensity = g_rtgi_deferred[material_index].mid.w;
+                                    radiance += (g_rtgi_dynamic.x - 1.0) * surface * dynamic_light_intensity
+                                        * LampDiffuseSum(hit.position, n);
+                                }
+                            }
                             looked_up = true;
                             lookups += 1u;
                         }
@@ -314,7 +411,6 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         // Hidden, off screen or no copy: sun with a shadow ray (shadow-only casters block it: hide off) plus
                         // the game's probe ambient (lighting_0xCA3D8596 lines 827-841) and, with RTGI_FLAG_DYNAMIC_LIGHTS, the
                         // lamps, times a grey albedo (RTGI_FALLBACK_ALBEDO; 1.0 with RTGI_FLAG_FALLBACK_NO_ALBEDO).
-                        const float3 n = dot(hit.normal, dir) > 0.0 ? -hit.normal : hit.normal;
                         const float3 sun_dir = normalize(-lightDirection_g);
                         const float ndl = saturate(dot(n, sun_dir));
                         float sun = 0.0;
@@ -341,33 +437,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             * (lightColor_g * sun * g_rtgi_sun.z + g_rtgi_shading.x * ambient);
                         if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
                         {
-                            float3 lamp_sum = float3(0.0, 0.0, 0.0);
-                            for (uint li = 0u; li < RTGI_LAMP_COUNT; ++li)
-                            {
-                                const uint lamp_type = g_rtgi_lamp_types[li];
-                                const LightParam lamp = g_rtgi_lamps[li];
-                                if (lamp.radius <= 0.0 || lamp_type == 0u)
-                                {
-                                    continue;
-                                }
-                                const float3 to_lamp = lamp.pos - hit.position;
-                                const float lamp_att = max(0.0,
-                                    1.0 - pow(abs(length(to_lamp) * lamp.radiusInv), lamp.attenuation));
-                                const float3 lamp_dir = normalize(to_lamp);
-                                const float lamp_ndl = max(lamp.translucency, dot(n, lamp_dir));
-                                if ((lamp_type & RTGI_LAMP_TYPE_POINT) != 0u)
-                                {
-                                    lamp_sum += lamp.color * lamp_att * lamp_ndl;
-                                }
-                                if ((lamp_type & RTGI_LAMP_TYPE_SPOT) != 0u)
-                                {
-                                    const float lamp_cone = max(0.0,
-                                        1.0 - pow((1.0 - max(0.0, dot(lamp_dir, lamp.vec))) * lamp.spotAngleInv,
-                                                  lamp.attenuationAngle));
-                                    lamp_sum += lamp.color * lamp_att * lamp_cone * lamp_ndl;
-                                }
-                            }
-                            radiance += fallback_albedo * g_rtgi_dynamic.x * lamp_sum;
+                            radiance += fallback_albedo * g_rtgi_dynamic.x * LampDiffuseSum(hit.position, n);
                         }
                     }
                     if (any(isnan(radiance)) || any(isinf(radiance)))
@@ -430,10 +500,17 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         debug_color = float3(0.0, 0.0, 0.0);
                     }
                 }
+                else if (debug_mode == 9)
+                {
+                    // O1 sun term of each pixel's own surface, shown as rgb / (1 + rgb); no Sun Contribution applied.
+                    const float2 pixel_uv = (float2(px) + 0.5) / float2(full_size);
+                    const float3 sun_estimate = SunGiAt(pixel_uv, BounceSurfaceAt(pixel_uv));
+                    debug_color = sun_estimate / (1.0 + sun_estimate);
+                }
             }
         }
         InterlockedAdd(gs_stats[RTGI_STAT_PIXELS], 1u);
-        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8)
+        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8 || debug_mode == 9)
         {
             for (uint dy = 0u; dy < d; ++dy)
             {

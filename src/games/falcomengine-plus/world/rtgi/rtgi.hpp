@@ -95,6 +95,12 @@ struct RtgiDispatchInputs {
   reshade::api::resource light_indices = {0u};  // Sora 2nd lightIndices_g (t12); copied for the stats request, null otherwise
   reshade::api::resource_view lights_view = {0u};         // t23 lamps (Sora 2nd dynamicLights_g); null: no lamps
   reshade::api::resource_view light_indices_view = {0u};  // lamp type pass t0 (Sora 2nd lightIndices_g); null: no lamps
+  // Sora 2nd lighting draw views for the O1 estimate (t25 mrtTexture1, t26 shadowTexture, t27 mrtTexture2, t28
+  // deferredParams_g); null otherwise.
+  reshade::api::resource_view mrt1_view = {0u};
+  reshade::api::resource_view shadow_view = {0u};
+  reshade::api::resource_view mrt2_view = {0u};
+  reshade::api::resource_view deferred_view = {0u};
   bvh::DynamicTraceInputs dynamic = {};         // characters (RefitDeformLiveCharacters), count 0 when off
 };
 
@@ -206,14 +212,15 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 8) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 9) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
     }
   }
-  // Views the trace pass writes (modes 1 to 3 and 8); a failed debug texture leaves u0 null and does not fail the dispatch.
-  const bool trace_debug = debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8);
+  // Views the trace pass writes (modes 1 to 3, 8 and 9); a failed debug texture leaves u0 null and does not fail the
+  // dispatch.
+  const bool trace_debug = debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8 || in.debug_mode == 9);
   if (!EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
     renodx::utils::log::w("[world-rtgi] raw GI texture creation failed");
     return {};
@@ -313,6 +320,10 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[22] = in.albedo_view;
   srvs[23] = lamps_run ? in.lights_view : reshade::api::resource_view{0u};
   srvs[24] = lamps_run ? data.lamp_types_srv : reshade::api::resource_view{0u};
+  srvs[25] = in.mrt1_view;
+  srvs[26] = in.shadow_view;
+  srvs[27] = in.mrt2_view;
+  srvs[28] = in.deferred_view;
   const reshade::api::resource_view uavs[kRtgiUavCount] = {
       trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
   reshade::api::descriptor_table_update updates[3] = {

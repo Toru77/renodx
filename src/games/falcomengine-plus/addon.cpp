@@ -9388,6 +9388,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       && rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed);
   const bool dynamic_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
       && rtgi::g_rtgi_dynamic_lights > 0.5f;
+  const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs != nullptr) {
@@ -9441,6 +9442,14 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                                     : reshade::api::resource_view{0u},
       .light_indices_view = dynamic_lights ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister]
                                            : reshade::api::resource_view{0u},
+      .mrt1_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt1Register]
+                                    : reshade::api::resource_view{0u},
+      .shadow_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingShadowRegister]
+                                      : reshade::api::resource_view{0u},
+      .mrt2_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingMrt2Register]
+                                    : reshade::api::resource_view{0u},
+      .deferred_view = sora2nd_bindings ? world_cl->ps_srv_view[rtgi::kLightingDeferredRegister]
+                                        : reshade::api::resource_view{0u},
   };
   if (rtgi::g_rtgi_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);

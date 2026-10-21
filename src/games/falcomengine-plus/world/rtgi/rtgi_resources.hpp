@@ -2,7 +2,7 @@
 
 // RTGI GPU resources: the four compute pipelines (trace world_rtgi, temporal world_rtgi_temporal, spatial filter
 // world_rtgi_filter, upsample world_rtgi_upsample), the stats buffer, the debug texture (r8g8b8a8_unorm at the depth
-// size, created while RTGI Debug is 1 to 7), the raw GI, the history, the filter targets, the final GI and the radiance
+// size, created while RTGI Debug is 1 to 9), the raw GI, the history, the filter targets, the final GI and the radiance
 // copy. Created lazily from the lighting hook (rtgi.hpp); no module mutex is held around any graphics call here.
 
 #include <cstddef>
@@ -22,8 +22,12 @@ namespace falcom_world::rtgi {
 // read only under kRtgiFlagSubtractPrevious): the one-bounce correction.
 // t23 the lamps (dynamicLights_g) and t24 the lamp type bits (kRtgiFlagDynamicLights; null unless the lamp type
 // pass ran).
-inline constexpr uint32_t kRtgiSrvCount = 25u;
-inline constexpr uint32_t kRtgiUavCount = 3u;  // u0 debug texture (null unless RTGI Debug is 1 to 3 or 8), u1 stats, u2 raw GI
+// Sora 2nd only (null otherwise), for the O1 sun and lamp estimate of on-screen bounce: t25 G-buffer mrtTexture1
+// (sun diffuse factor), t26 the screen shadow map (shadowTexture), t27 G-buffer mrtTexture2 (material index) and
+// t28 deferredParams_g (dynamicLightIntensity).
+inline constexpr uint32_t kRtgiSrvCount = 29u;
+// u0 debug texture (null unless RTGI Debug is 1 to 3, 8 or 9), u1 stats, u2 raw GI
+inline constexpr uint32_t kRtgiUavCount = 3u;
 inline constexpr uint32_t kRtgiPushConstantCount = 32u;
 inline constexpr uint32_t kRtgiStatsCount = 24u;
 
@@ -77,6 +81,13 @@ inline constexpr uint32_t kRtgiUpsamplePushCount = 12u;
 // stats request only (rtgi.hpp Dispatch) and read back into world_rtgi_lights.json.
 inline constexpr uint32_t kLightingLightsRegister = 11u;
 inline constexpr uint32_t kLightingLightIndicesRegister = 12u;
+// Sora 2nd lighting 0xCA3D8596 (lighting lines 192, 193, 198, 199): t2 mrtTexture1, t3 mrtTexture2,
+// t6 deferredParams_g, t7 shadowTexture. Bound to RTGI t25..t28 (kRtgiSrvCount) for the O1 on-screen sun and lamp
+// estimate.
+inline constexpr uint32_t kLightingMrt1Register = 2u;
+inline constexpr uint32_t kLightingMrt2Register = 3u;
+inline constexpr uint32_t kLightingDeferredRegister = 6u;
+inline constexpr uint32_t kLightingShadowRegister = 7u;
 inline constexpr uint32_t kLightParamBytes = 112u;
 inline constexpr uint32_t kLightIndexDataBytes = 576u;
 // Lamp type pass (world_rtgi_lights.cs_5_0.hlsl): t0 lightIndices_g, u0 one uint per lamp (bit 1 point, bit 2
@@ -265,7 +276,7 @@ struct RtgiDeviceData {
   reshade::api::resource lamp_types = {0u};  // one uint per lamp: bit 1 point, bit 2 spot (kRtgiLampCount)
   reshade::api::resource_view lamp_types_uav = {0u};
   reshade::api::resource_view lamp_types_srv = {0u};
-  RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 7
+  RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 9
   RtgiTextureSet<1> raw;    // rgba16f, trace size: rgb GI, a = 1 traced, -1 not traced
   RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated GI, a = distance (0 = invalid)
   RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal
