@@ -37,6 +37,10 @@ Status (2026-10-14, implemented; harness green (12 programs PASS, full run); add
 - [ ] Step 4: sign latency. (a) dynamic-only refit in the same present after `DrainPoolScan`; (b) shorter orphan retirement: retire the old pose when a fresher instance of the same key is admitted. Harness: `test_deform_live`/`test_pool` case. Fixes: P-3 (partly). Full per-frame path (P2b) is a separate milestone.
 - [ ] Step 5: foliage sway approach for P-1. Decision after Steps 1 to 4. Options: (a) keep rest pose and say so; (b) per-instance CPU sway approximation through `RefitLiveTlas`; (c) P2b-style draw-time copy. Owner decides.
 
+## Debug 9 overlay fix (rtgi-debug9-gate): implemented, not validated in game
+
+The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the screen; it is now 9.5. Owner check: Debug 6 shows; Debug 9 shows and is bright in sunlit areas, dark in shadow; if Debug 9 is entirely black in sunlit areas, the sun inputs are not bound and that is the next fix.
+
 ## Sun and fallback (M3, rtgi-m3-sun): implemented, not validated in game
 
 - Three RTGI rows after Sun Shadow Distance (all in the RTGI section, shown when the other RTGI rows are visible). With the defaults (all toggles Off, Sun Contribution 1) the image must match HEAD.
