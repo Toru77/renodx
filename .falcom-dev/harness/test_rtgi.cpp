@@ -11,8 +11,10 @@
 #include <cstddef>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <span>
 #include <string>
+#include <vector>
 
 #define __world_rtao_EMBED_FILE
 inline constexpr std::uint8_t __world_rtao_base[] = {0};
@@ -259,7 +261,235 @@ static void TestJson() {
   CHECK(text.find("\"saturation\": ") != std::string::npos, "saturation key");
 }
 
+// ---- Recording mock (rtgi::Dispatch on a device): every call appends its arguments to g_golden_log ----
+static std::vector<uint64_t> g_golden_log;
+
+static void LogWords(const void* values, uint32_t count) {
+  const auto* words = static_cast<const uint32_t*>(values);
+  for (uint32_t i = 0; i < count; ++i) g_golden_log.push_back(words[i]);
+}
+
+static uint64_t Fnv1a64(const std::vector<uint64_t>& words) {
+  uint64_t hash = 1469598103934665603ull;
+  for (const uint64_t word : words) {
+    for (int shift = 0; shift < 64; shift += 8) {
+      hash ^= (word >> shift) & 0xffu;
+      hash *= 1099511628211ull;
+    }
+  }
+  return hash;
+}
+
+struct GoldenDevice : mock::DeviceBase {
+  std::map<uint64_t, resource_desc> res;
+  std::map<uint64_t, uint64_t> view_of;  // resource view -> resource
+  uint64_t next = 0x1000;
+  device_api get_api() const override { return device_api::d3d11; }
+  resource_desc get_resource_desc(resource r) const override { return res.at(r.handle); }
+  resource get_resource_from_view(resource_view view) const override { return {view_of.at(view.handle)}; }
+  bool create_sampler(const sampler_desc &, sampler *out) override {
+    g_golden_log.push_back(7u);
+    out->handle = next;
+    next += 0x100;
+    return true;
+  }
+  bool create_resource(const resource_desc &desc, const subresource_data *, resource_usage, resource *out, void ** = nullptr) override {
+    g_golden_log.push_back(1u);
+    g_golden_log.push_back(static_cast<uint64_t>(desc.type));
+    if (desc.type == resource_type::buffer) {
+      g_golden_log.push_back(desc.buffer.size);
+    } else {
+      g_golden_log.push_back(desc.texture.width);
+      g_golden_log.push_back(desc.texture.height);
+      g_golden_log.push_back(static_cast<uint64_t>(desc.texture.format));
+    }
+    out->handle = next;
+    next += 0x100;
+    res[out->handle] = desc;
+    return true;
+  }
+  bool create_resource_view(resource r, resource_usage, const resource_view_desc &, resource_view *out) override {
+    g_golden_log.push_back(2u);
+    g_golden_log.push_back(r.handle);
+    out->handle = next;
+    next += 0x100;
+    view_of[out->handle] = r.handle;
+    return true;
+  }
+  bool create_pipeline_layout(uint32_t count, const pipeline_layout_param *params, pipeline_layout *out) override {
+    g_golden_log.push_back(4u);
+    g_golden_log.push_back(count);
+    for (uint32_t i = 0; i < count; ++i) g_golden_log.push_back(static_cast<uint64_t>(params[i].type));
+    out->handle = next;
+    next += 0x100;
+    return true;
+  }
+  bool create_pipeline(pipeline_layout layout, uint32_t count, const pipeline_subobject *, pipeline *out) override {
+    g_golden_log.push_back(5u);
+    g_golden_log.push_back(layout.handle);
+    g_golden_log.push_back(count);
+    out->handle = next;
+    next += 0x100;
+    return true;
+  }
+  bool allocate_descriptor_tables(uint32_t count, pipeline_layout layout, uint32_t param, descriptor_table *out) override {
+    g_golden_log.push_back(6u);
+    g_golden_log.push_back(count);
+    g_golden_log.push_back(layout.handle);
+    g_golden_log.push_back(param);
+    for (uint32_t i = 0; i < count; ++i) out[i].handle = next++;
+    return true;
+  }
+  void update_descriptor_tables(uint32_t count, const descriptor_table_update *updates) override {
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto& update = updates[i];
+      g_golden_log.push_back(8u);
+      g_golden_log.push_back(update.table.handle);
+      g_golden_log.push_back(update.binding);
+      g_golden_log.push_back(update.count);
+      g_golden_log.push_back(static_cast<uint64_t>(update.type));
+      for (uint32_t j = 0; j < update.count; ++j) {
+        if (update.type == descriptor_type::sampler) {
+          g_golden_log.push_back(static_cast<const sampler *>(update.descriptors)[j].handle);
+        } else {
+          g_golden_log.push_back(static_cast<const resource_view *>(update.descriptors)[j].handle);
+        }
+      }
+    }
+  }
+  void update_buffer_region(const void *, resource dest, uint64_t offset, uint64_t size) override {
+    g_golden_log.push_back(9u);
+    g_golden_log.push_back(dest.handle);
+    g_golden_log.push_back(offset);
+    g_golden_log.push_back(size);
+  }
+};
+
+struct GoldenCmdList : mock::CommandListBase {
+  GoldenDevice* dev = nullptr;
+  int dispatches = 0;
+  device *get_device() override { return dev; }
+  void barrier(uint32_t count, const resource *resources, const resource_usage *old_states, const resource_usage *new_states) override {
+    g_golden_log.push_back(15u);
+    g_golden_log.push_back(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      g_golden_log.push_back(resources[i].handle);
+      g_golden_log.push_back(static_cast<uint64_t>(old_states[i]));
+      g_golden_log.push_back(static_cast<uint64_t>(new_states[i]));
+    }
+  }
+  void bind_pipeline(pipeline_stage, pipeline pipeline) override {
+    g_golden_log.push_back(10u);
+    g_golden_log.push_back(pipeline.handle);
+  }
+  void bind_descriptor_tables(shader_stage, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table *tables) override {
+    g_golden_log.push_back(11u);
+    g_golden_log.push_back(layout.handle);
+    g_golden_log.push_back(first);
+    g_golden_log.push_back(count);
+    for (uint32_t i = 0; i < count; ++i) g_golden_log.push_back(tables[i].handle);
+  }
+  void push_constants(shader_stage, pipeline_layout layout, uint32_t param, uint32_t first, uint32_t count, const void *values) override {
+    g_golden_log.push_back(12u);
+    g_golden_log.push_back(layout.handle);
+    g_golden_log.push_back(param);
+    g_golden_log.push_back(first);
+    g_golden_log.push_back(count);
+    LogWords(values, count);
+  }
+  void push_descriptors(shader_stage, pipeline_layout layout, uint32_t param, const descriptor_table_update &update) override {
+    g_golden_log.push_back(13u);
+    g_golden_log.push_back(layout.handle);
+    g_golden_log.push_back(param);
+    g_golden_log.push_back(update.binding);
+    g_golden_log.push_back(update.count);
+    g_golden_log.push_back(static_cast<uint64_t>(update.type));
+    for (uint32_t i = 0; i < update.count; ++i) g_golden_log.push_back(static_cast<const resource_view *>(update.descriptors)[i].handle);
+  }
+  void dispatch(uint32_t x, uint32_t y, uint32_t z) override {
+    g_golden_log.push_back(14u);
+    g_golden_log.push_back(x);
+    g_golden_log.push_back(y);
+    g_golden_log.push_back(z);
+    dispatches += 1;
+  }
+  void copy_buffer_region(resource source, uint64_t source_offset, resource dest, uint64_t dest_offset, uint64_t size) override {
+    g_golden_log.push_back(16u);
+    g_golden_log.push_back(source.handle);
+    g_golden_log.push_back(source_offset);
+    g_golden_log.push_back(dest.handle);
+    g_golden_log.push_back(dest_offset);
+    g_golden_log.push_back(size);
+  }
+};
+
+// The command log and dispatch count of five fixed rtgi::Dispatch calls (trace, spatial, temporal, lamps with debug 4,
+// trace debug 9) on the recording mock. Recorded at HEAD; the refactors must reproduce them exactly.
+static constexpr uint64_t kDispatchGoldenHash = 0x22868adf1653e774ull;
+static constexpr int kDispatchGoldenCount = 16;
+
+static void TestDispatchGolden() {
+  GoldenDevice dev;
+  GoldenCmdList cl;
+  cl.dev = &dev;
+  falcom_world::bvh::BvhDeviceData* bvh_data = falcom_world::bvh::GetBvhDeviceData(&dev);
+  bvh_data->dynamic.instances_srv = {0x9400u};
+  bvh_data->dynamic.instance_count = 3u;
+  rtgi::RtgiDispatchInputs in = {};
+  in.depth_view = {0x9000u};
+  in.mrt_normal_view = {0x9200u};
+  in.isfast_view = {0x9300u};
+  in.scene_cbv_view = {0x9100u};
+  in.radiance_view = {0x9500u};
+  in.albedo_view = {0x9600u};
+  in.full_width = 128u;
+  in.full_height = 64u;
+  in.trace_width = 64u;
+  in.trace_height = 32u;
+  in.push.params[0] = 16.f;
+  in.push.params[1] = 0.1f;
+  in.push.params[2] = 2.f;
+  in.push.params[3] = 2.f;
+  in.push.sampling[1] = 0.5f;
+  in.push.shading[0] = 0.25f;
+  in.push.extra[0] = 1.f;
+  // 1. Trace and upsample only.
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 1: trace and upsample");
+  // 2. Plus the spatial filter.
+  in.spatial = true;
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 2: spatial filter");
+  // 3. Plus the temporal pass (motion view set).
+  in.temporal = true;
+  in.motion_view = {0x9700u};
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 3: temporal and spatial");
+  // 4. Lamps (type pass) with the temporal debug view (mode 4), no spatial filter.
+  in.spatial = false;
+  in.debug_mode = 4;
+  in.lights_view = {0x7000u};
+  in.light_indices_view = {0x7100u};
+  dev.view_of[0x7000u] = 0x7200u;
+  resource_desc lights_desc = {};
+  lights_desc.type = resource_type::buffer;
+  lights_desc.buffer.size = 40u * rtgi::kLightParamBytes;
+  dev.res[0x7200u] = lights_desc;
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 4: lamp types, temporal debug");
+  // 5. Trace debug view (mode 9), temporal and lamps off.
+  in.debug_mode = 9;
+  in.temporal = false;
+  in.motion_view = {0u};
+  in.lights_view = {0u};
+  in.light_indices_view = {0u};
+  CHECK(rtgi::Dispatch(&dev, &cl, in).ok, "case 5: trace debug view");
+  const uint64_t hash = Fnv1a64(g_golden_log);
+  CHECK(cl.dispatches == kDispatchGoldenCount, "dispatch count %d (golden %d)", cl.dispatches, kDispatchGoldenCount);
+  CHECK(hash == kDispatchGoldenHash, "command log hash %016llx over %zu words (golden %016llx)",
+        static_cast<unsigned long long>(hash), g_golden_log.size(), static_cast<unsigned long long>(kDispatchGoldenHash));
+  rtgi::DestroyRtgiDeviceData(&dev);
+}
+
 int main() {
+  HStage("dispatch golden");
+  TestDispatchGolden();
   HStage("trace divisor");
   TestTraceDivisor();
   HStage("trace extent");

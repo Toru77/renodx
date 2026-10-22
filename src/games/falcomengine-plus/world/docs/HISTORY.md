@@ -41,6 +41,11 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M1 (RTGI dispatch golden), 2026-10-22
+
+- test_rtgi `TestDispatchGolden` records rtgi::Dispatch's command stream on a recording mock (five cases: temporal and spatial on, history swap, temporal off with debug 3, lamps with debug 4, lamps with debug 6; then destroy). Values recorded at HEAD eff22a05: hash 0x22868adf1653e774, 16 dispatches. Any RTGI refactor must keep both.
+- A staged refactor (EnsureRtgiPipeline, the shared lamp HLSL helpers, RtBvhReady and RtFrameInputsReady, each landing before its second caller) was implemented and then reverted by the owner: docs/CXX_STYLE.md requires a namespace-scope helper to have callers in at least two distinct functions when it is introduced. The extraction moves to M2, in the same change as RTLS's first use.
+
 ## Off-screen dynamic lights (M4, rtgi-m4-lamps): implemented, not validated in game
 
 - Method 1 (no cache): only the lamps the game uploads this frame are used. `world_rtgi_lights.cs_5_0.hlsl` (new) reads the game's per-tile lists (`lightIndices_g`, t12 of Sora 2nd lighting 0xCA3D8596) and sets bit 1 (point) or bit 2 (spot) per lamp in a 1024-entry uint buffer (u0). The host zeroes the buffer each frame. The lamp type comes from these lists only, never from `spot_angle_inv`.
