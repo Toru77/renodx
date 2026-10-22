@@ -19,6 +19,7 @@
 #include "../../../../utils/render.hpp"
 #include "../rtao/rtao.hpp"
 #include "../rtgi/rtgi.hpp"
+#include "../rtls/rtls.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
 #include "deform_probe.hpp"
@@ -260,11 +261,13 @@ inline void OnWorldPresentBvh(
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
     rtgi::ClearRtgiPerfGathered(device);
+    ClearGpuTimerStats(&rtls::GetRtlsDeviceData(device).timer);
+    rtls::g_rtls_frame.gpu_ms = -1.f;
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
   static const bool rtao_startup_enable = [] {
-    if (rtao::RtaoRequested()) RtaoEnableBvhInputs();
+    if (rtao::RtaoRequested() || rtls::RtlsRequested()) RtaoEnableBvhInputs();
     return true;
   }();
   (void)rtao_startup_enable;
@@ -292,7 +295,27 @@ inline void OnWorldPresentBvh(
   UpdateDeformLive(device, queue);
   rtao::MaybeCaptureRtaoStats(device, queue);
   rtgi::MaybeCaptureRtgiStats(device, queue);
+  rtls::MaybeCaptureRtlsStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
+  // Draws a debug texture over the whole backbuffer (RTLS and RTGI debug views).
+  const auto blit_debug = [&](reshade::api::resource_view srv) {
+    const auto backbuffer = swapchain->get_current_back_buffer();
+    if (backbuffer.handle == 0u) return;
+    const auto backbuffer_desc = device->get_resource_desc(backbuffer);
+    if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
+    auto* cmd_list = queue->get_immediate_command_list();
+    if (cmd_list == nullptr) return;
+    BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, srv);
+  };
+  // RTLS Debug 1 to 5, when this frame's trace wrote the debug texture and no BVH GPU debug mode is selected.
+  // RTGI Debug, below, draws over it when both are set.
+  if (rtls::g_rtls_debug > 0.5f && rtls::g_rtls_frame.producing && rtls::g_rtls_frame.debug_written
+      && g_bvh_debug.mode.load(std::memory_order_relaxed) == 0) {
+    const auto found_rtls = rtls::g_rtls_devices.find(device);
+    if (found_rtls != rtls::g_rtls_devices.end() && found_rtls->second.debug.srv[0].handle != 0u) {
+      blit_debug(found_rtls->second.debug.srv[0]);
+    }
+  }
   // RTGI Debug 1 to 10: the RTGI debug texture over the whole backbuffer, when the pass that owns the view wrote it this
   // frame. Skipped while a BVH GPU debug mode is selected (that view owns the backbuffer). Last in this handler: the
   // returns below end only the RTGI blit.
@@ -301,13 +324,7 @@ inline void OnWorldPresentBvh(
   if (g_bvh_debug.mode.load(std::memory_order_relaxed) != 0) return;
   const auto found = rtgi::g_rtgi_devices.find(device);
   if (found == rtgi::g_rtgi_devices.end() || found->second.debug.srv[0].handle == 0u) return;
-  const auto backbuffer = swapchain->get_current_back_buffer();
-  if (backbuffer.handle == 0u) return;
-  const auto backbuffer_desc = device->get_resource_desc(backbuffer);
-  if (backbuffer_desc.type != reshade::api::resource_type::texture_2d) return;
-  auto* cmd_list = queue->get_immediate_command_list();
-  if (cmd_list == nullptr) return;
-  BlitDebugTextureToBackbuffer(device, queue, cmd_list, backbuffer, backbuffer_desc.texture.format, found->second.debug.srv[0]);
+  blit_debug(found->second.debug.srv[0]);
 }
 
 }  // namespace falcom_world::bvh

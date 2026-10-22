@@ -9,17 +9,6 @@
 
 #include "world_rt_lamps.hlsli"
 
-struct LightIndexData
-{
-    int pointLightIndices[63];     // Offset:    0
-    uint pointLightCount;          // Offset:  252
-    int spotLightIndices[63];      // Offset:  256
-    uint spotLightCount;           // Offset:  508
-    int lightProbeIndices[14];     // Offset:  512
-    uint lightProbeCount;          // Offset:  568
-    float tileDepthInv;            // Offset:  572
-};
-
 StructuredBuffer<LightIndexData> g_light_indices : register(t0);
 RWStructuredBuffer<uint> g_lamp_types : register(u0);
 

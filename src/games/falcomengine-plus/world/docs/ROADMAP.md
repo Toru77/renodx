@@ -48,6 +48,7 @@ Implemented, not validated in game. Each feature's owner test list is in its HIS
 | Debug 9 gate, RTGI discovery round | Debug 9 check; discovery list | HISTORY: Debug 9 overlay fix; RTGI discovery round |
 | Perf sampling, block timers, Max 30 column, perf file | Performance tab, 30 s test | HISTORY: CPU spike step 1; Performance tab rows; Performance test and separate dumps |
 | Panel cleanup | Panel lines moved to JSON | HISTORY: Panel cleanup |
+| RT Local Shadows M2 (trace and discovery; image unchanged) | Owner list in HISTORY: RT Local Shadows M2 | Reference: RT Local Shadows |
 | TLAS rebuild reduction (skip no-op, slack TLAS, default OFF) | A/B in game | HISTORY: TLAS rebuild reduction (cache-diag-2) |
 | Cache diagnostics (Phase 0, 0b) | Dump twice; placement compare | HISTORY: Phase 0 cache diagnostics; Step 0b (cache-diag-1) |
 | Refit and drain cleanup; refit diet; rebuild diet; housekeeping | Regression only; no pins changed | HISTORY: Refit and drain cleanup; Rebuild diet; Refit diet; Housekeeping |
@@ -220,11 +221,23 @@ What to send back after a session: the RTAO status panel lines, `world_rtao.json
 
 
 
+### RT Local Shadows: reference
+
+- Code: `world/rtls/` (`rtls_state.hpp` settings and reasons, `rtls_resources.hpp` pipeline and textures, `rtls.hpp` dispatch, stats and JSON, `rtls_panel.hpp` panel). Shader: `world/shaders/world_rtls.cs_5_0.hlsl`. Hook: `RunRtlsInline` in `addon.cpp`, called between `RunRtaoInline` and `RunRtgiInline`.
+- Order RTAO -> RTLS -> RTGI. Independent of RTAO: the shared guards are `RtBvhReady` and `RtFrameInputsReady` (addon.cpp), used by RTAO and RTLS.
+- Lamp selection: all contributing spots of the pixel's tile cell, the first 8 in list order (`RTLS_MAX_SPOTS`); points strongest first, budget Max Point Lights Per Pixel (default 6), hard cap 10. Lamp index at or above the lamp count is counted as out of range.
+- Ratio output: x point shadow and y spot shadow are the weight-averaged share of blocked samples, weighted by each lamp's diffuse weight, times the distance fade z. a = 1 traced, -1 not traced (u2, rgba16f). Lamps over the point budget stay in the denominator and count as unblocked (they keep the game's lighting); M3 scales every lamp of the kind by the same value.
+- Stats layout (u1, 96 uints): 0..19 pixel, lamp and ray counters (`kRtlsStat*`); 20..22 reserved for the RTGI temporal pass (M4b); 23..31 reserved (M3b: 24 character traced, 25 character self-blocked); 32..63 per-lamp rays and 64..95 per-lamp near-light blocked, for lamp index < 32.
+- Debug views (RTLS Debug, session only): 1 shadow term, 2 lamps per pixel, 3 over budget and traced, 4 blocked near the lamp, 5 pixel classes. RTGI Debug draws over RTLS Debug when both are set.
+- `world_rtls.json` is written by Read RTLS Stats (schema 1; stats, per_light, settings, fade and ray max).
+- Not applied to the image until M3.
+
 ## Open decisions
 
 1. Foliage motion (P-1, P-4): option (b), a CPU sway approximation, was chosen on 2026-10-14. It still needs a planner pass and harness tests before code. Options are in HISTORY: Work plan, Step 5.
 2. P-2 (missing_random): the cause is not yet identified. Decide how dynamic buffers are captured before a fix is designed (HISTORY: Owner decisions and dump findings).
-3. Harness pins that fail at HEAD, owner decision: `test_rtao.cpp:1881` pass A FNV pin (0xbcf4d7beeb61f2b6), and `test_live` goldens 2758, 3009 and 3470. The foliage-skip pin procedure is in HISTORY: RTAO Foliage skip.
+3. Harness pins that fail at HEAD, owner decision: `test_rtao.cpp:1881` pass A FNV pin (0xbcf4d7beeb61f2b6), and `test_live` goldens 2758, 3009 and 3470. The foliage-skip pin procedure is in HISTORY: RTAO Foliage skip. When the pass A pin is re-recorded, world_rtao.cs_5_0.hlsl's IGN line moves to TraceIgnNoise2 (world_bvh_trace.hlsli).
+   Also allowed: `test_motion.cpp:1091` ("re-flagged within one capture interval"), which fails on clean HEAD (995ce421 and eff22a05), so it predates RTLS.
 4. Whether `RtaoDebug` and `RtaoTwoSidedDiscovery` stay saved with settings or become session-only (Reference: RTAO round 2).
 5. Classifier reason for `pixel_shaders[]` on non-alpha shaders (HISTORY: Round A3c).
 6. Slack TLAS and skip no-op TLAS stay default OFF until the in-game A/B (HISTORY: TLAS rebuild reduction).

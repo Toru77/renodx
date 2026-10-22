@@ -41,6 +41,14 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M2 (trace and discovery; image unchanged), implemented, not validated in game
+
+- New `world/rtls/` (settings, resources, dispatch and stats, panel) and `world/shaders/world_rtls.cs_5_0.hlsl`. RunRtlsInline runs between RTAO and RTGI and traces the game's point and spot lamps of the pixel's tile cell (shadow rays to a disk of Light Size, IS-FAST or IGN, through the live BVH). It writes the per-pixel shadow term (u2), the debug views 1 to 5 (RTLS Debug, session only), the stats (u1) and world_rtls.json (Read RTLS Stats). Nothing is bound to the lighting draw: the image is unchanged until M3.
+- Shared helpers, each with two callers in distinct functions: `EnsureRtgiPipeline` and `DestroyRtgiPipeline` (RTGI and RTLS); `RtBvhReady` and `RtFrameInputsReady` (RunRtaoInline and RunRtlsInline); the lamp structs and `LampDistanceAttenuation` / `LampSpotCone` in `world_rt_lamps.hlsli` (RTGI's LampDiffuseSum and the RTLS shader).
+- `world_rtgi_lights.json` now has `chara_color` per lamp.
+- Harness: `test_rtls.cpp` (push layout, shader defines and shared lamp text, cell and top-k transcriptions, ratio, JSON, device lifecycle on a recording mock). `test_rtgi` `TestDispatchGolden` is unchanged (hash 0x22868adf1653e774, 16 dispatches). RTGI shader bytecode is identical before and after (FXC `cmp`).
+- Owner list: see the plan's owner checks (in-game): RTAO and RTGI unchanged with RTLS Off; RTLS independent of RTAO; Debug 1 to 5 screenshots; Read RTLS Stats and the `world_rtls.json` and `[world-rtls] stats:` log line; Light Clearance sweep; character occluders; GPU ms at defaults, Max Point Lights 10 and Samples 2.
+
 ## RT Local Shadows: M1 (RTGI dispatch golden), 2026-10-22
 
 - test_rtgi `TestDispatchGolden` records rtgi::Dispatch's command stream on a recording mock (five cases: temporal and spatial on, history swap, temporal off with debug 3, lamps with debug 4, lamps with debug 6; then destroy). Values recorded at HEAD eff22a05: hash 0x22868adf1653e774, 16 dispatches. Any RTGI refactor must keep both.

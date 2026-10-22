@@ -28,29 +28,6 @@
 #include "../../include/mrt_normal.hlsli"
 #include "world_rt_lamps.hlsli"
 
-// The game's LightParam (sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl): 112 bytes. The full layout sets the stride.
-struct LightParam
-{
-    float3 pos;
-    float radius;
-    float3 color;
-    float radiusInv;
-    float3 charaColor;
-    float attenuation;
-    float3 vec;
-    float spotAngleInv;
-    float attenuationAngle;
-    float specularIntensity;
-    float specularGlossiness;
-    float scatterAnisotropy;
-    float3 scatterColor;
-    float scatterDensity;
-    float translucency;
-    int shadowmapIndex;
-    float scatterOffset;
-    float userParam;
-};
-
 // The game's DeferredParam (144 bytes). Only dynamicLightIntensity (byte offset 76 = .w of mid) is read.
 struct GameDeferredParam
 {
@@ -178,8 +155,7 @@ float3 LampDiffuseSum(float3 position, float3 n)
             continue;
         }
         const float3 to_lamp = lamp.pos - position;
-        const float lamp_att = max(0.0,
-            1.0 - pow(abs(length(to_lamp) * lamp.radiusInv), lamp.attenuation));
+        const float lamp_att = LampDistanceAttenuation(lamp, to_lamp);
         const float3 lamp_dir = normalize(to_lamp);
         const float lamp_ndl = max(lamp.translucency, dot(n, lamp_dir));
         if ((lamp_type & RTGI_LAMP_TYPE_POINT) != 0u)
@@ -188,9 +164,7 @@ float3 LampDiffuseSum(float3 position, float3 n)
         }
         if ((lamp_type & RTGI_LAMP_TYPE_SPOT) != 0u)
         {
-            const float lamp_cone = max(0.0,
-                1.0 - pow((1.0 - max(0.0, dot(lamp_dir, lamp.vec))) * lamp.spotAngleInv,
-                          lamp.attenuationAngle));
+            const float lamp_cone = LampSpotCone(lamp, lamp_dir);
             lamp_sum += lamp.color * lamp_att * lamp_cone * lamp_ndl;
         }
     }
@@ -326,7 +300,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         else
                         {
                             const float2 q = float2(tp) + g_rtgi_sampling.z + 13.0 + float(i + b * spp) * 7.0;
-                            u = frac(52.9829189 * frac(float2(dot(q, float2(0.06711056, 0.00583715)), dot(q + 47.0, float2(0.06711056, 0.00583715)))));
+                            u = TraceIgnNoise2(q);
                         }
                         const float r = sqrt(u.x);
                         const float phi = 6.2831853 * u.y;

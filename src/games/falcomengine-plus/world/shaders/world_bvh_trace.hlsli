@@ -746,3 +746,10 @@ WorldTraceHit TraceWorldAny(float3 origin, float3 direction, float t_min, float 
 {
     return TraceWorldRay(origin, direction, t_min, t_max, true, view, counters);
 }
+
+// Interleaved gradient noise pair for ray sampling when IS-FAST is not loaded (RTGI, RTLS). world_rtao.cs_5_0.hlsl keeps
+// its own copy while its source is pinned by hash (test_rtao, ROADMAP Open decision 3).
+float2 TraceIgnNoise2(float2 q)
+{
+    return frac(52.9829189 * frac(float2(dot(q, float2(0.06711056, 0.00583715)), dot(q + 47.0, float2(0.06711056, 0.00583715)))));
+}

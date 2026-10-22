@@ -18,6 +18,8 @@
 #include "rtao/rtao_panel.hpp"
 #include "rtgi/rtgi.hpp"
 #include "rtgi/rtgi_panel.hpp"
+#include "rtls/rtls.hpp"
+#include "rtls/rtls_panel.hpp"
 #include "capture/draw_census.hpp"
 
 namespace falcom_world {
@@ -1177,6 +1179,204 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "Fade End",
       .section = "RTGI Distance Fade",
       .tooltip = "Where RTGI is fully faded out (no GI rays beyond it), as a percent of the BVH range (Region). Capped by the built BVH range at use; the panel shows the effective metres.",
+      .min = 0.f,
+      .max = 100.f,
+      .format = "%.1f%%",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsEnabled",
+      .binding = &rtls::g_rtls_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "RT Local Shadows",
+      .section = "RT Local Shadows",
+      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. Turning it on enables Live BVH and Deforming meshes. M2: traced and shown in RTLS Debug only; the image is not changed yet.",
+      .labels = {"Off", "On"},
+      .on_change_value = [](float, float current) {
+        if (current > 0.5f) {
+          bvh::RtaoEnableBvhInputs();
+        }
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "RTLS status",
+      .section = "RT Local Shadows",
+      .on_draw = []() {
+        rtls::DrawRtlsPanel();
+        return false;
+      },
+      .is_visible = visible,
+  });
+  // Session-only (empty key): not saved.
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtls::g_rtls_debug,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "RTLS Debug",
+      .section = "RT Local Shadows",
+      .tooltip = "Session only (not saved). 1 shadow term (red point, green spot, blue coverage), 2 lamps lighting the pixel (white = 10), 3 red = lamps over the budget, green = lamps traced, 4 red = rays blocked within 0.5 m of the lamp, green = all blocked rays, 5 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond Fade End, white traced with lamps, black traced without). Dark purple = not traced.",
+      .labels = {"Off", "Raw shadow", "Lamps per pixel", "Traced / over budget", "Blocked near lamp", "Pixel classes"},
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsPoint",
+      .binding = &rtls::g_rtls_point,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Point",
+      .section = "RT Local Shadows",
+      .tooltip = "Traces shadows from point lamps on surfaces the game shades with lamp specular.",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsSpot",
+      .binding = &rtls::g_rtls_spot,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Spot",
+      .section = "RT Local Shadows",
+      .tooltip = "Traces shadows from spot lamps on surfaces the game shades with lamp specular.",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsEnvPoint",
+      .binding = &rtls::g_rtls_env_point,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Env Point",
+      .section = "RT Local Shadows",
+      .tooltip = "Traces shadows from point lamps on surfaces the game shades without lamp specular (Env = surfaces the game shades without lamp specular).",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsEnvSpot",
+      .binding = &rtls::g_rtls_env_spot,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Env Spot",
+      .section = "RT Local Shadows",
+      .tooltip = "Traces shadows from spot lamps on surfaces the game shades without lamp specular (Env = surfaces the game shades without lamp specular).",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsSamples",
+      .binding = &rtls::g_rtls_samples,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Samples Per Light",
+      .section = "RT Local Shadows",
+      .min = 1.f,
+      .max = 4.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsMaxPointLights",
+      .binding = &rtls::g_rtls_max_point_lights,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 6.f,
+      .label = "Max Point Lights Per Pixel",
+      .section = "RT Local Shadows",
+      .min = 1.f,
+      .max = 10.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsRayMax",
+      .binding = &rtls::g_rtls_ray_max,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 16.f,
+      .label = "Max Ray Distance",
+      .section = "RT Local Shadows",
+      .tooltip = "Capped at use so no traced pixel reaches the BVH region edge; the panel shows both.",
+      .min = 1.f,
+      .max = 64.f,
+      .format = "%.1f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsLightSize",
+      .binding = &rtls::g_rtls_light_size,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.1f,
+      .label = "Light Size",
+      .section = "RT Local Shadows",
+      .tooltip = "Radius of the lamp for soft shadows; 0 = hard.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsLightClearance",
+      .binding = &rtls::g_rtls_light_clearance,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.2f,
+      .label = "Light Clearance",
+      .section = "RT Local Shadows",
+      .tooltip = "Rays stop this far before the lamp so its own housing does not block it.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsNormalBias",
+      .binding = &rtls::g_rtls_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.004f,
+      .label = "Normal Bias (RTLS)",
+      .section = "RT Local Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.4f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsTraceCharacters",
+      .binding = &rtls::g_rtls_trace_characters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Trace characters",
+      .section = "RT Local Shadows",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsIsfast",
+      .binding = &rtls::g_rtls_isfast,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "IS-FAST Noise",
+      .section = "RT Local Shadows",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsFadeStartPct",
+      .binding = &rtls::g_rtls_fade_start_pct,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 12.5f,
+      .label = "Fade Start",
+      .section = "RTLS Distance Fade",
+      .min = 0.f,
+      .max = 100.f,
+      .format = "%.1f%%",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsFadeEndPct",
+      .binding = &rtls::g_rtls_fade_end_pct,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 25.f,
+      .label = "Fade End",
+      .section = "RTLS Distance Fade",
       .min = 0.f,
       .max = 100.f,
       .format = "%.1f%%",

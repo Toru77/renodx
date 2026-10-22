@@ -8999,6 +8999,50 @@ static bool OnReplaceKaiSSRDraw(reshade::api::command_list* cmd_list) {
   return KaiSSRReplaceActive(cmd_list) || KaiSSRVanillaActive(cmd_list);
 }
 
+// Live BVH readiness for the inline RT passes (RTAO, RT Local Shadows): false with the reason when they cannot trace.
+static bool RtBvhReady(const falcom_world::bvh::BvhDeviceData* bvh_data, falcom_world::rtao::Reason* reason) {
+  if (bvh_data == nullptr) {
+    *reason = falcom_world::rtao::Reason::BvhNotReady;
+    return false;
+  }
+  if (!falcom_world::bvh::g_live_bvh.enabled.load(std::memory_order_relaxed)) {
+    *reason = falcom_world::rtao::Reason::LiveBvhOff;
+    return false;
+  }
+  if (!bvh_data->bvh_ready || !bvh_data->tlas_built) {
+    *reason = falcom_world::rtao::Reason::BvhNotReady;
+    return false;
+  }
+  if (bvh_data->active_count == 0u) {
+    *reason = falcom_world::rtao::Reason::BvhEmpty;
+    return false;
+  }
+  return true;
+}
+
+// This frame's G-buffer and scene inputs for the inline RT passes, and the startup and resize guard: false with the
+// reason when they are missing.
+static bool RtFrameInputsReady(const DeviceData* dd, falcom_world::rtao::Reason* reason) {
+  if (!dd->captured_depth_srv.handle || !dd->captured_depth_live.load()
+      || dd->captured_depth_w == 0u || dd->captured_depth_h == 0u) {
+    *reason = falcom_world::rtao::Reason::NoDepth;
+    return false;
+  }
+  if (!dd->captured_mrt_normal_srv.handle || !dd->captured_mrt_live.load()) {
+    *reason = falcom_world::rtao::Reason::NoNormals;
+    return false;
+  }
+  if (!dd->captured_scene_cbv_view.handle || !dd->captured_scene_cbv_valid || !dd->captured_cbv_live.load()) {
+    *reason = falcom_world::rtao::Reason::NoSceneCbv;
+    return false;
+  }
+  if (dd->frame_index < kGTVBAOStartupGuardFrames || dd->frame_index < dd->resize_guard_until_frame) {
+    *reason = falcom_world::rtao::Reason::StartupOrResizeGuard;
+    return false;
+  }
+  return true;
+}
+
 // RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the micro
 // shadows read this frame's AO. A failed guard leaves the frame on vanilla SSAO and
 // records its reason in rtao::g_rtao_frame.
@@ -9035,22 +9079,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   }
   auto& rd = rtao::GetRtaoDeviceData(dev);
   const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
-  if (bvh_data == nullptr) {
-    frame.reason = rtao::Reason::BvhNotReady;
-    return;
-  }
-  if (!falcom_world::bvh::g_live_bvh.enabled.load(std::memory_order_relaxed)) {
-    frame.reason = rtao::Reason::LiveBvhOff;
-    return;
-  }
-  if (!bvh_data->bvh_ready || !bvh_data->tlas_built) {
-    frame.reason = rtao::Reason::BvhNotReady;
-    return;
-  }
-  if (bvh_data->active_count == 0u) {
-    frame.reason = rtao::Reason::BvhEmpty;
-    return;
-  }
+  if (!RtBvhReady(bvh_data, &frame.reason)) return;
   const auto fade = rtao::RtaoEffectiveFade(
       bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size, rtao::g_rtao_fade_start_pct, rtao::g_rtao_fade_end_pct);
   frame.fade = fade;
@@ -9073,23 +9102,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
     return;
   }
-  if (!dd->captured_depth_srv.handle || !dd->captured_depth_live.load()
-      || dd->captured_depth_w == 0u || dd->captured_depth_h == 0u) {
-    frame.reason = rtao::Reason::NoDepth;
-    return;
-  }
-  if (!dd->captured_mrt_normal_srv.handle || !dd->captured_mrt_live.load()) {
-    frame.reason = rtao::Reason::NoNormals;
-    return;
-  }
-  if (!dd->captured_scene_cbv_view.handle || !dd->captured_scene_cbv_valid || !dd->captured_cbv_live.load()) {
-    frame.reason = rtao::Reason::NoSceneCbv;
-    return;
-  }
-  if (dd->frame_index < kGTVBAOStartupGuardFrames || dd->frame_index < dd->resize_guard_until_frame) {
-    frame.reason = rtao::Reason::StartupOrResizeGuard;
-    return;
-  }
+  if (!RtFrameInputsReady(dd, &frame.reason)) return;
 
   // IS-FAST blue noise is used when its texture is loaded and the IS-FAST master is on; otherwise IGN.
   if (rtao::g_rtao_isfast > 0.5f && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, dd);
@@ -9264,6 +9277,126 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   rf.temporal_bytes = rd.raw_texture[0].handle != 0u ? pixels * (2u * 2u + 2u * 8u) : 0u;
   frame.texture_bytes = pixels * 4u + sizeof(uint32_t) * rtao::kRtaoStatsCount + rf.temporal_bytes;
   PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
+}
+
+// RT Local Shadows (world/rtls): independent of RTAO and RTGI. Traces only in M2; nothing is bound to the lighting draw yet.
+// Kept as a function: its guard returns must end only the RTLS stage, not the lighting hook.
+static void RunRtlsInline(reshade::api::command_list* cmd_list) {
+  namespace rtls = falcom_world::rtls;
+  namespace rtao = falcom_world::rtao;
+  namespace rtgi = falcom_world::rtgi;
+  auto& frame = rtls::g_rtls_frame;
+  frame.producing = false;
+  frame.reason = rtls::Reason::Off;
+  frame.isfast_unavailable = false;
+  if (!rtls::RtlsRequested()) return;
+  if (!IsSora2nd()) {
+    frame.reason = rtls::Reason::NotSora2nd;
+    return;
+  }
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  if (!dd) {
+    frame.reason = rtls::Reason::InputsMissing;
+    frame.input_reason = rtao::Reason::NoDepth;
+    return;
+  }
+  const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
+  if (!RtBvhReady(bvh_data, &frame.input_reason)) {
+    frame.reason = rtls::Reason::InputsMissing;
+    return;
+  }
+  if (cmd_list != dd->immediate_cmd_list) {
+    frame.reason = rtls::Reason::DeferredList;
+    return;
+  }
+  if (frame.dispatched_frame == dd->frame_index) {
+    frame.producing = true;
+    return;
+  }
+  if (!RtFrameInputsReady(dd, &frame.input_reason)) {
+    frame.reason = rtls::Reason::InputsMissing;
+    return;
+  }
+  const rtao::Fade fade = rtao::RtaoEffectiveFade(bvh_data->tlas_region_range, falcom_world::bvh::g_pool.region_size,
+                                                  rtls::g_rtls_fade_start_pct, rtls::g_rtls_fade_end_pct);
+  frame.fade = fade;
+  frame.fade_valid = true;
+  if (fade.coverage < 1.f) {
+    frame.reason = rtls::Reason::RangeTooSmall;
+    return;
+  }
+  const uint32_t kinds = ((rtls::g_rtls_point > 0.5f || rtls::g_rtls_env_point > 0.5f) ? rtls::kRtlsKindPoint : 0u)
+      | ((rtls::g_rtls_spot > 0.5f || rtls::g_rtls_env_spot > 0.5f) ? rtls::kRtlsKindSpot : 0u);
+  if (kinds == 0u) {
+    frame.reason = rtls::Reason::NoKinds;
+    return;
+  }
+  auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
+  const reshade::api::resource_view lights_view =
+      world_cl ? world_cl->ps_srv_view[rtgi::kLightingLightsRegister] : reshade::api::resource_view{0u};
+  const reshade::api::resource_view indices_view =
+      world_cl ? world_cl->ps_srv_view[rtgi::kLightingLightIndicesRegister] : reshade::api::resource_view{0u};
+  if (lights_view.handle == 0u || indices_view.handle == 0u) {
+    frame.reason = rtls::Reason::NoLights;
+    return;
+  }
+  frame.lamp_count = static_cast<uint32_t>(std::min<uint64_t>(
+      dev->get_resource_desc(dev->get_resource_from_view(lights_view)).buffer.size / rtgi::kLightParamBytes, rtgi::kRtgiLampCount));
+  const float ray_max = rtgi::RtgiEffectiveRayMax(rtls::g_rtls_ray_max, fade.coverage, fade.end,
+                                                  falcom_world::bvh::kPoolRegionRayMargin);
+  // RTAO's IS-FAST rule: the texture is loaded when this row and the IS-FAST master are on.
+  if (rtls::g_rtls_isfast > 0.5f && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, dd);
+  const bool isfast_used = rtls::g_rtls_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
+  frame.isfast_unavailable = rtls::g_rtls_isfast > 0.5f && !isfast_used;
+  const float spp = (std::max)(rtls::g_rtls_samples, 1.f);
+  const float max_points = std::clamp(rtls::g_rtls_max_point_lights, 1.f, static_cast<float>(rtls::kRtlsMaxPoints));
+  const rtao::NoiseSample noise =
+      rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>((max_points + rtls::kRtlsMaxSpots) * spp), false);
+  rtls::RtlsDispatchInputs in = {
+      .depth_view = dd->captured_depth_srv,
+      .mrt_normal_view = dd->captured_mrt_normal_srv,
+      .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
+      .scene_cbv_view = dd->captured_scene_cbv_view,
+      .lights_view = lights_view,
+      .light_indices_view = indices_view,
+      .full_width = dd->captured_depth_w,
+      .full_height = dd->captured_depth_h,
+      .push = {
+          .params = {ray_max, rtls::g_rtls_normal_bias, spp, 1.f},
+          .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtls::g_rtls_debug},
+          .fade = {fade.start, fade.end, static_cast<float>(kinds), 0.f},
+          .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
+                     bvh_data->tlas_region_size},
+          .light = {rtls::g_rtls_light_size, rtls::g_rtls_light_clearance, max_points, static_cast<float>(frame.lamp_count)}},
+      .debug_mode = static_cast<int>(rtls::g_rtls_debug)};
+  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
+  renodx::utils::state::CommandListState prev = {};
+  if (cs) prev = *cs;
+  if (rtls::g_rtls_trace_characters > 0.5f) {
+    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
+  }
+  const rtls::RtlsDispatchResult result = rtls::Dispatch(dev, cmd_list, in);
+  ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
+  if (!result.ok) {
+    frame.reason = rtls::Reason::PipelineFailed;
+    return;
+  }
+  auto& rd = rtls::GetRtlsDeviceData(dev);
+  frame.producing = true;
+  frame.debug_written = result.debug_written;
+  frame.dispatched_frame = dd->frame_index;
+  frame.gpu_ms = rd.timer.last_ms;
+  frame.trace_width = dd->captured_depth_w;
+  frame.trace_height = dd->captured_depth_h;
+  frame.ray_max_requested = rtls::g_rtls_ray_max;
+  frame.ray_max_effective = ray_max;
+  frame.kinds = kinds;
+  frame.character_objects = in.dynamic.count;
+  frame.isfast_used = isfast_used;
+  const uint64_t pixels = static_cast<uint64_t>(dd->captured_depth_w) * dd->captured_depth_h;
+  frame.texture_bytes = pixels * 8u + (rd.debug.texture[0].handle != 0u ? pixels * 4u : 0u)
+      + sizeof(uint32_t) * rtls::kRtlsStatsCount;
 }
 
 // RTGI (world/rtgi, ROADMAP "RTGI"). Runs only on a lighting draw where RTAO dispatched this frame on the immediate
@@ -9558,6 +9691,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // RTAO runs before the shadows so micro shadows read this frame's AO.
   RunRtaoInline(cmd_list);
+
+  // RT Local Shadows after RTAO and before RTGI (order RTAO -> RTLS -> RTGI); independent of both.
+  RunRtlsInline(cmd_list);
 
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);

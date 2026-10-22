@@ -229,6 +229,66 @@ struct RtgiPipelineDesc {
   const char* name;                    // log name
 };
 
+// Creates one RTGI-layout compute pipeline on first use (RtgiPipeline layout); a failure is latched and logged once.
+inline bool EnsureRtgiPipeline(reshade::api::device* device, RtgiPipeline* p, const RtgiPipelineDesc& desc) {
+  if (p->pipeline.handle != 0u) return true;
+  if (p->failed) return false;
+  const auto fail = [&](const char* stage) {
+    renodx::utils::log::w("[world-rtgi] ", desc.name, " pipeline creation failed: ", stage);
+    p->failed = true;
+    return false;
+  };
+  if (desc.code.empty()) return fail("shader not embedded");
+  using DR = reshade::api::descriptor_range;
+  using DS = reshade::api::shader_stage;
+  using DT = reshade::api::descriptor_type;
+  using P = reshade::api::pipeline_layout_param;
+  DR cbv_range = {0, 0, 0, 1, DS::all_compute, 1, DT::constant_buffer};
+  DR srv_range = {0, 0, 0, desc.srv_count, DS::all_compute, 1, DT::shader_resource_view};
+  DR uav_range = {0, 0, 0, desc.uav_count, DS::all_compute, 1, DT::unordered_access_view};
+  DR sampler_range = {0, 0, 0, desc.sampler_count, DS::all_compute, 1, DT::sampler};
+  reshade::api::constant_range push_range = {};
+  push_range.binding = 0;
+  push_range.dx_register_index = rtao::kRtaoPushRegister;
+  push_range.dx_register_space = 0;
+  push_range.count = desc.push_count;
+  push_range.visibility = DS::all_compute;
+  const uint32_t push_index = desc.sampler_count > 0u ? 4u : 3u;
+  P params[5] = {};
+  params[0].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[0].descriptor_table.count = 1;
+  params[0].descriptor_table.ranges = &cbv_range;
+  params[1].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[1].descriptor_table.count = 1;
+  params[1].descriptor_table.ranges = &srv_range;
+  params[2].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+  params[2].descriptor_table.count = 1;
+  params[2].descriptor_table.ranges = &uav_range;
+  if (desc.sampler_count > 0u) {
+    params[3].type = reshade::api::pipeline_layout_param_type::descriptor_table;
+    params[3].descriptor_table.count = 1;
+    params[3].descriptor_table.ranges = &sampler_range;
+  }
+  params[push_index].type = reshade::api::pipeline_layout_param_type::push_constants;
+  params[push_index].push_constants = push_range;
+  if (p->layout.handle == 0u && !device->create_pipeline_layout(push_index + 1u, params, &p->layout)) return fail("pipeline layout");
+  if (p->cbv_table.handle == 0u && !device->allocate_descriptor_table(p->layout, 0, &p->cbv_table)) return fail("cbv table");
+  if (p->srv_table.handle == 0u && !device->allocate_descriptor_table(p->layout, 1, &p->srv_table)) return fail("srv table");
+  if (p->uav_table.handle == 0u && !device->allocate_descriptor_table(p->layout, 2, &p->uav_table)) return fail("uav table");
+  if (desc.sampler_count > 0u && p->sampler_table.handle == 0u
+      && !device->allocate_descriptor_table(p->layout, 3, &p->sampler_table)) {
+    return fail("sampler table");
+  }
+  reshade::api::shader_desc shader = {};
+  shader.code = desc.code.data();
+  shader.code_size = desc.code.size();
+  shader.entry_point = "main";
+  reshade::api::pipeline_subobject subobject = {reshade::api::pipeline_subobject_type::compute_shader, 1, &shader};
+  if (!device->create_pipeline(p->layout, 1, &subobject, &p->pipeline)) return fail("compute pipeline");
+  renodx::utils::log::i("[world-rtgi] ", desc.name, " pipeline ready");
+  return true;
+}
+
 // Count textures of one format and size, each with an SRV and a UAV, zero-initialised (rtao::CreateRtaoTexture).
 template <size_t Count>
 struct RtgiTextureSet {
@@ -308,6 +368,16 @@ inline std::unordered_map<reshade::api::device*, RtgiDeviceData> g_rtgi_devices;
 
 inline RtgiDeviceData& GetRtgiDeviceData(reshade::api::device* device) { return g_rtgi_devices[device]; }
 
+// Destroys one RTGI-layout compute pipeline and its descriptor tables.
+inline void DestroyRtgiPipeline(reshade::api::device* device, const RtgiPipeline& p) {
+  if (p.pipeline.handle != 0u) device->destroy_pipeline(p.pipeline);
+  if (p.srv_table.handle != 0u) device->free_descriptor_table(p.srv_table);
+  if (p.uav_table.handle != 0u) device->free_descriptor_table(p.uav_table);
+  if (p.cbv_table.handle != 0u) device->free_descriptor_table(p.cbv_table);
+  if (p.sampler_table.handle != 0u) device->free_descriptor_table(p.sampler_table);
+  if (p.layout.handle != 0u) device->destroy_pipeline_layout(p.layout);
+}
+
 inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   const auto found = g_rtgi_devices.find(device);
   if (found == g_rtgi_devices.end()) return;
@@ -328,19 +398,11 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   bvh::DestroyGpuTimer(&data.denoise_timer);
   if (data.point_sampler.handle != 0u) device->destroy_sampler(data.point_sampler);
   if (data.linear_sampler.handle != 0u) device->destroy_sampler(data.linear_sampler);
-  const auto destroy_pipeline = [device](const RtgiPipeline& p) {
-    if (p.pipeline.handle != 0u) device->destroy_pipeline(p.pipeline);
-    if (p.srv_table.handle != 0u) device->free_descriptor_table(p.srv_table);
-    if (p.uav_table.handle != 0u) device->free_descriptor_table(p.uav_table);
-    if (p.cbv_table.handle != 0u) device->free_descriptor_table(p.cbv_table);
-    if (p.sampler_table.handle != 0u) device->free_descriptor_table(p.sampler_table);
-    if (p.layout.handle != 0u) device->destroy_pipeline_layout(p.layout);
-  };
-  destroy_pipeline(data.trace_pipeline);
-  destroy_pipeline(data.temporal_pipeline);
-  destroy_pipeline(data.filter_pipeline);
-  destroy_pipeline(data.upsample_pipeline);
-  destroy_pipeline(data.lamp_type_pipeline);
+  DestroyRtgiPipeline(device, data.trace_pipeline);
+  DestroyRtgiPipeline(device, data.temporal_pipeline);
+  DestroyRtgiPipeline(device, data.filter_pipeline);
+  DestroyRtgiPipeline(device, data.upsample_pipeline);
+  DestroyRtgiPipeline(device, data.lamp_type_pipeline);
   g_rtgi_devices.erase(found);
 }
 
