@@ -8,7 +8,7 @@
 // output at the hit's previous-frame pixel (t20, prevViewProj_g). Otherwise: RTGI_FALLBACK_ALBEDO * (sun * N.L * a sun
 // shadow ray + Ambient Contribution * the game's probe ambient). The raw GI (u2) is the mean sample radiance times the
 // distance fade; the composite (M4) multiplies it by the receiver's G-buffer colour. Counters (u1) and debug views
-// 1 to 3, 8 and 9 (u0). On screen (O1, Sora 2nd): the sun and lamp parts of the looked-up bounce are scaled by Sun
+// 1 to 3, 8 to 10 (u0). On screen (O1, Sora 2nd): the sun and lamp parts of the looked-up bounce are scaled by Sun
 // Contribution and Dynamic Light Contribution, estimated from this frame's G-buffer (t25-t28).
 // One bounce (M4): the copy holds last frame's applied bounce, so with RTGI_FLAG_SUBTRACT_PREVIOUS each lookup subtracts
 // the previous final GI (t21) x the G-buffer colour at the hit (t22) x last frame's GI Intensity (c5.z), clamped at 0.
@@ -288,6 +288,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint luminance_max = 0u;
                 uint clamped = 0u;
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
+                float3 extra_light_sum = float3(0.0, 0.0, 0.0);
                 const float3 origin = P + N * g_rtgi_params.y;
                 // Real Extra Rays: bounces b = 1 .. bounce_rays follow the ray from the previous hit (at most 2).
                 const uint bounce_rays = (flags & RTGI_FLAG_REAL_RAYS) != 0u ? min((uint)g_rtgi_dynamic.z, 2u) : 0u;
@@ -308,6 +309,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     float3 ray_N = N;
                     float3 throughput = float3(1.0, 1.0, 1.0);
                     float3 extra = float3(0.0, 0.0, 0.0);
+                    float3 fed_back_view = float3(0.0, 0.0, 0.0);
                     float3 radiance_0 = float3(0.0, 0.0, 0.0);
                     for (uint b = 0u; b <= bounce_rays; ++b)
                     {
@@ -414,6 +416,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                             fed_back = BounceSaturate(fed_back, g_rtgi_dynamic.w);
                                         }
                                         radiance += fed_back;
+                                        if (debug_mode == 10)
+                                        {
+                                            fed_back_view += fed_back;
+                                        }
                                     }
                                 }
                                 // O1: scale this on-screen bounce's sun and lamp parts (Sun / Dynamic Light Contribution).
@@ -505,6 +511,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     {
                         radiance = float3(0.0, 0.0, 0.0);
                     }
+                    else if (debug_mode == 10)
+                    {
+                        extra_light_sum += (flags & RTGI_FLAG_REAL_RAYS) != 0u ? extra : fed_back_view;
+                    }
                     radiance = max(radiance, 0.0);
                     const float luminance = dot(radiance, float3(0.2126, 0.7152, 0.0722));
                     luminance_sum += (uint)(min(luminance, RTGI_LUMINANCE_STAT_CAP) * 10.0);
@@ -568,10 +578,16 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     const float3 sun_estimate = SunGiAt(pixel_uv, BounceSurfaceAt(pixel_uv));
                     debug_color = sun_estimate / (1.0 + sun_estimate);
                 }
+                else if (debug_mode == 10)
+                {
+                    // Mean extra bounce light per trace sample, with the distance fade of view 3, shown as rgb / (1 + rgb).
+                    const float3 extra_mean = extra_light_sum / (float)spp * fade;
+                    debug_color = extra_mean / (1.0 + extra_mean);
+                }
             }
         }
         InterlockedAdd(gs_stats[RTGI_STAT_PIXELS], 1u);
-        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8 || debug_mode == 9)
+        if ((debug_mode >= 1 && debug_mode <= 3) || debug_mode == 8 || debug_mode == 9 || debug_mode == 10)
         {
             for (uint dy = 0u; dy < d; ++dy)
             {

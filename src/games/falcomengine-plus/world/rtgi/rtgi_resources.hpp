@@ -2,7 +2,7 @@
 
 // RTGI GPU resources: the four compute pipelines (trace world_rtgi, temporal world_rtgi_temporal, spatial filter
 // world_rtgi_filter, upsample world_rtgi_upsample), the stats buffer, the debug texture (r8g8b8a8_unorm at the depth
-// size, created while RTGI Debug is 1 to 9), the raw GI, the history, the filter targets, the final GI and the radiance
+// size, created while RTGI Debug is 1 to 10), the raw GI, the history, the filter targets, the final GI and the radiance
 // copy. Created lazily from the lighting hook (rtgi.hpp); no module mutex is held around any graphics call here.
 
 #include <cstddef>
@@ -279,7 +279,7 @@ struct RtgiDeviceData {
   reshade::api::resource lamp_types = {0u};  // one uint per lamp: bit 1 point, bit 2 spot (kRtgiLampCount)
   reshade::api::resource_view lamp_types_uav = {0u};
   reshade::api::resource_view lamp_types_srv = {0u};
-  RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 9
+  RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 10
   RtgiTextureSet<1> raw;    // rgba16f, trace size: rgb GI, a = 1 traced, -1 not traced
   RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated GI, a = distance (0 = invalid)
   RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal

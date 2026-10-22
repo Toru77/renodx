@@ -293,10 +293,10 @@ inline void OnWorldPresentBvh(
   rtao::MaybeCaptureRtaoStats(device, queue);
   rtgi::MaybeCaptureRtgiStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
-  // RTGI Debug 1 to 9: the RTGI debug texture over the whole backbuffer, when the pass that owns the view wrote it this
+  // RTGI Debug 1 to 10: the RTGI debug texture over the whole backbuffer, when the pass that owns the view wrote it this
   // frame. Skipped while a BVH GPU debug mode is selected (that view owns the backbuffer). Last in this handler: the
   // returns below end only the RTGI blit.
-  if (rtgi::g_rtgi_debug < 0.5f || rtgi::g_rtgi_debug > 9.5f) return;
+  if (rtgi::g_rtgi_debug < 0.5f || rtgi::g_rtgi_debug > 10.5f) return;
   if (!rtgi::g_rtgi_frame.producing || !rtgi::g_rtgi_frame.debug_written) return;
   if (g_bvh_debug.mode.load(std::memory_order_relaxed) != 0) return;
   const auto found = rtgi::g_rtgi_devices.find(device);

@@ -919,4 +919,17 @@ Verification (2026-10-08):
 - Owner test (not run):
   1. With Extra Bounces On, each method (Feedback, and Real Extra Rays with Extra Bounce Rays 1 and 2), in a scene with coloured walls: set Bounce Saturation 0, 1, 2 and take screenshots. The first bounce must not change: compare with Extra Bounces Off at the same strength (the first bounce is the same in both).
   2. Send the screenshots.
-- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (HEAD c05ef958): 0xEA437F3F48D210A7. After: 0x90F5AD0C13175151.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (c05ef958): 0xFC6660D96DB3619D. After (4e671625): 0x53555A55A4D60013. The values previously written here (0xEA437F3F48D210A7 and 0x90F5AD0C13175151) were wrong.
+
+## Bounce debug view (Debug 10, rtgi-debug10-bounce): implemented, not validated in game
+
+- RTGI Debug 10 "Extra bounce light" shows only the light Extra Bounces adds, per trace pixel, as the mean over samples of that extra light, shown as rgb / (1 + rgb) like Debug 3 (same scale, faded like view 3, not brighter). Raw, at trace resolution, before denoising. Only samples whose total passes the NaN/Inf guard are counted.
+  - Feedback: the add-back `fed_back` (after Bounce Saturation), summed over the on-screen lookups of each sample.
+  - Real Extra Rays: the extra sum (bounces 1 and 2, after Bounce Saturation), before the total `radiance_0 + extra` is formed.
+- Off = black: Extra Bounces Off, or nothing comes back. Dark purple = not traced, as the other views.
+- Cost: the accumulator is updated only when `debug_mode == 10`; views 1 to 9 are unchanged.
+- Owner test (not run):
+  1. Extra Bounces On with each method (Feedback; Real Extra Rays with Extra Bounce Rays 1 and 2), Bounce Saturation 1, in a scene with coloured walls. Debug 10 must show only the extra light: bright where the bounce comes from visible surfaces, black with Extra Bounces Off.
+  2. Debug 3 minus Debug 10 is the first bounce (the light that is not extra).
+  3. Send screenshots of Debug 3, Debug 7 and Debug 10 in the same spot.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (HEAD 4e671625): 0x53555A55A4D60013. After: 0xA5E7DA5627AC8BBF.

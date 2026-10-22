@@ -212,15 +212,16 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
     }
   }
   bool debug_ready = false;
-  if (in.debug_mode >= 1 && in.debug_mode <= 9) {
+  if (in.debug_mode >= 1 && in.debug_mode <= 10) {
     debug_ready = EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height);
     if (!debug_ready) {
       renodx::utils::log::w("[world-rtgi] debug texture creation failed");
     }
   }
-  // Views the trace pass writes (modes 1 to 3, 8 and 9); a failed debug texture leaves u0 null and does not fail the
+  // Views the trace pass writes (modes 1 to 3, 8 to 10); a failed debug texture leaves u0 null and does not fail the
   // dispatch.
-  const bool trace_debug = debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8 || in.debug_mode == 9);
+  const bool trace_debug =
+      debug_ready && (in.debug_mode <= 3 || in.debug_mode == 8 || in.debug_mode == 9 || in.debug_mode == 10);
   if (!EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
     renodx::utils::log::w("[world-rtgi] raw GI texture creation failed");
     return {};
