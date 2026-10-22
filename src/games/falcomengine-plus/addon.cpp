@@ -89,9 +89,9 @@ ShaderInjectData shader_injection = {
   .env_sss_bright_reject_fade = 0.5f,
   .env_sss_csm_gate = 0.f,
   .debug_show_env_sss = 0.f,
-  .local_sss_enabled = 0.f,
-  .local_sss_strength = 1.f,
-  .local_sss_light_type = 2.f,
+  .rtls_flags = 0.f,
+  .rtls_strength = 1.f,
+  .rtls_max_darkening = 1.f,
   .local_sss_sample_count = 24.f,
   .local_sss_hard_shadow_samples = 0.f,
   .local_sss_fade_out_samples = 0.f,
@@ -501,6 +501,7 @@ ShaderInjectData shader_injection = {
 constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister   = 23u;  // t23 = vbgiTexture
 constexpr uint32_t kLightingRtgiRegister   = 37u;  // t37 = rtgiTexture (RTGI final GI, world/rtgi)
+constexpr uint32_t kLightingRtlsRegister   = 38u;  // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
 constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingDepthRegisterKai = 3u; // t3 = depthTexture (Kai)
 constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture (Sora)
@@ -4724,9 +4725,9 @@ renodx::utils::settings::Settings settings = {
       .key = "ContactShadowsLocalEnabled", .binding = &shader_injection.cs_contact_local_enabled,
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f, .label = "Local Lights", .section = "Contact Shadows",
-      .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene.",
+      .tooltip = "Local Light Contact Shadows add subtle shadows around objects and characters where nearby lights would naturally create them, making them feel more grounded in the scene. Greyed out and off while RT Local Shadows is on.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
     new renodx::utils::settings::Setting{
@@ -4738,7 +4739,7 @@ renodx::utils::settings::Settings settings = {
                  "only contact detail. A disabled class marches zero times and spends none of the "
                  "Local Light Budget, so the classes left on get all of it.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4751,7 +4752,7 @@ renodx::utils::settings::Settings settings = {
                  "detail a shadow map cannot. A disabled class marches zero times and spends "
                  "none of the Local Light Budget.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4763,7 +4764,7 @@ renodx::utils::settings::Settings settings = {
                  "The march is identical to Point and costs the same. A disabled class marches "
                  "zero times and spends none of the Local Light Budget.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4774,14 +4775,14 @@ renodx::utils::settings::Settings settings = {
                  "counterpart of Spot. The march is identical and costs the same. A disabled "
                  "class marches zero times and spends none of the Local Light Budget.",
       .labels = {"Off", "On"},
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
       .key = "ContactShadowsLocalStrength", .binding = &shader_injection.cs_contact_local_strength,
       .default_value = 1.f, .label = "Local Strength", .section = "Contact Shadows",
       .min = 0.f, .max = 1.f, .format = "%.2f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4796,7 +4797,7 @@ renodx::utils::settings::Settings settings = {
                  "here than the sun march's equivalents in a crowded scene.",
       .labels = {"Low", "Medium", "High", "Ultra"},
       .min = 0.f,
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .parse = [](float value) { return ContactShadowQualitySamples(value); },
       .is_visible = []() { return !IsKyoto() && !IsDaybreak2(); },
     },
@@ -4806,7 +4807,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "World-space ray length for the local march. Local lights are short-range, "
                  "so this is much smaller than the sun ray length above.",
       .min = 0.1f, .max = 20.f, .format = "%.1f",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
     new renodx::utils::settings::Setting{
@@ -4816,7 +4817,7 @@ renodx::utils::settings::Settings settings = {
       .tooltip = "Per-pixel cap on how many local lights get a march, so a crowded scene "
                  "cannot multiply the cost without limit.",
       .min = 1.f, .max = 16.f, .format = "%d",
-      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f; },
+      .is_enabled = []() { return shader_injection.cs_contact_local_enabled >= 0.5f && !falcom_world::rtls::RtlsRequested(); },
       .is_visible = []() { return IsAdvancedSettingsMode(); },
     },
 
@@ -9279,7 +9280,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   PushRtaoAo(cmd_list, rtao::OutputSrv(rd));
 }
 
-// RT Local Shadows (world/rtls): independent of RTAO and RTGI. Traces only in M2; nothing is bound to the lighting draw yet.
+// RT Local Shadows (world/rtls): independent of RTAO and RTGI. Binds this frame's term at t38 for the Sora 2nd lighting draw.
 // Kept as a function: its guard returns must end only the RTLS stage, not the lighting hook.
 static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   namespace rtls = falcom_world::rtls;
@@ -9289,7 +9290,9 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   frame.producing = false;
   frame.reason = rtls::Reason::Off;
   frame.isfast_unavailable = false;
+  shader_injection.rtls_flags = 0.f;  // set again below: requested (contact march off), and bound when this draw gets the term
   if (!rtls::RtlsRequested()) return;
+  shader_injection.rtls_flags = static_cast<float>(rtls::kRtlsFlagRequested);
   if (!IsSora2nd()) {
     frame.reason = rtls::Reason::NotSora2nd;
     return;
@@ -9310,8 +9313,29 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtls::Reason::DeferredList;
     return;
   }
+  // Binds this frame's RTLS term (the raw texture, Full resolution) at t38 for this lighting draw, also on a second
+  // lighting draw of the frame, with the lighting kind bits and the Strength and Max Darkening values.
+  const auto push_rtls = [&]() {
+    const reshade::api::resource_view term_srv = rtls::GetRtlsDeviceData(dev).raw.srv[0];
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0},
+        0,
+        reshade::api::descriptor_table_update{
+            {}, kLightingRtlsRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
+    shader_injection.rtls_flags = static_cast<float>(
+        rtls::kRtlsFlagRequested | rtls::kRtlsFlagBound
+        | (rtls::g_rtls_point > 0.5f ? rtls::kRtlsFlagPoint : 0u)
+        | (rtls::g_rtls_spot > 0.5f ? rtls::kRtlsFlagSpot : 0u)
+        | (rtls::g_rtls_env_point > 0.5f ? rtls::kRtlsFlagEnvPoint : 0u)
+        | (rtls::g_rtls_env_spot > 0.5f ? rtls::kRtlsFlagEnvSpot : 0u));
+    shader_injection.rtls_strength = rtls::g_rtls_strength;
+    shader_injection.rtls_max_darkening = rtls::g_rtls_max_darkening;
+  };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
+    push_rtls();
     return;
   }
   if (!RtFrameInputsReady(dd, &frame.input_reason)) {
@@ -9397,6 +9421,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   const uint64_t pixels = static_cast<uint64_t>(dd->captured_depth_w) * dd->captured_depth_h;
   frame.texture_bytes = pixels * 8u + (rd.debug.texture[0].handle != 0u ? pixels * 4u : 0u)
       + sizeof(uint32_t) * rtls::kRtlsStatsCount;
+  push_rtls();
 }
 
 // RTGI (world/rtgi, ROADMAP "RTGI"). Runs only on a lighting draw where RTAO dispatched this frame on the immediate

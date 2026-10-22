@@ -18,7 +18,7 @@ inline void DrawRtlsPanel() {
   if (!RtlsRequested()) {
     ImGui::TextDisabled("RTLS: off");
   } else if (frame.producing) {
-    ImGui::Text("RTLS: active (traced this frame; not applied to the image until M3)");
+    ImGui::Text("RTLS: active (traced this frame and applied to the Sora 2nd lighting at t38; full resolution, no denoising)");
   } else if (frame.reason == Reason::InputsMissing) {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTLS: requested, not running (%s / %s)", ReasonName(frame.reason),
                        rtao::ReasonName(frame.input_reason));

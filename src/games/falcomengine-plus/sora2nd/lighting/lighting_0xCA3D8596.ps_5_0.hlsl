@@ -225,6 +225,15 @@ Texture3D<float2> csIsfastNoise : register(t35);
 Texture2D<float4> csDepthTex : register(t36);
 // t37 is the RTGI final GI (r11g11b10_float, depth size; world/rtgi), bound by RunRtgiInline while rtgi_gi_bound.
 Texture2D<float4> rtgiTexture : register(t37);
+// t38 is the RT Local Shadows term (world/rtls; depth size): x point shadow, y spot shadow, z RT coverage (1 inside Fade
+// Start). Bound by RunRtlsInline while rtls_flags has RTLS_FLAG_BOUND. Flag bits mirror rtls::kRtlsFlag*.
+Texture2D<float4> rtlsTexture : register(t38);
+#define RTLS_FLAG_REQUESTED 1u
+#define RTLS_FLAG_BOUND 2u
+#define RTLS_FLAG_POINT 4u
+#define RTLS_FLAG_SPOT 8u
+#define RTLS_FLAG_ENV_POINT 16u
+#define RTLS_FLAG_ENV_SPOT 32u
 
 #include "../../shared.h"
 #include "../../shadows/shadows_common.hlsli"
@@ -1247,11 +1256,25 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = exp2(r0.w);
   r0.w = min(1, r0.w);
   r3.xyz = r12.xyz * r0.www + r11.xyz;
+  // -- RT Local Shadows (world/rtls): x point shadow, y spot shadow, z RT coverage. 0 everywhere = the game's behaviour.
+  // The material path (r20.y) is read here because the spot loop below overwrites r20.xy.
+  const uint rtlsFlags = (uint)shader_injection_data.rtls_flags;
+  float3 rtlsTerm = float3(0, 0, 0);
+  if ((rtlsFlags & RTLS_FLAG_BOUND) != 0u) {
+    rtlsTerm = rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
+  }
+  const bool rtlsPointOn = (rtlsFlags & (r20.y != 0 ? RTLS_FLAG_POINT : RTLS_FLAG_ENV_POINT)) != 0u;
+  const bool rtlsSpotOn = (rtlsFlags & (r20.y != 0 ? RTLS_FLAG_SPOT : RTLS_FLAG_ENV_SPOT)) != 0u;
+  const float rtlsPointVis = rtlsPointOn
+      ? 1.0 - min(rtlsTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
+  const float rtlsSpotVis = rtlsSpotOn
+      ? 1.0 - min(rtlsTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
+  const float rtlsSpotCover = rtlsSpotOn ? rtlsTerm.z : 0.0;
   // -- Local contact shadows: setup shared by all four light loops below --
   // The budget is per pixel and shared by every loop, so a pixel covered by many
   // lights pays for a bounded number of marches rather than one per light. Every
   // value here is loop-invariant; only the budget counter changes per light.
-  const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f;
+  const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f && (rtlsFlags & RTLS_FLAG_REQUESTED) == 0u;
   // Four toggles pick which of the loops below are instrumented. All four march
   // identically -- each derives its direction from the light's position -- so a
   // disabled loop is simply never called and therefore never spends budget.
@@ -1317,6 +1340,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r13.x = dynamicLights_g[r2.w].color.x;
         r13.y = dynamicLights_g[r2.w].color.y;
         r13.z = dynamicLights_g[r2.w].color.z;
+        if (rtlsPointVis < 1.0) {
+          r13.xyz *= rtlsPointVis;
+        }
         if (csLocalPointOn && csLocalBudget > 0.0) {
           csLocalBudget -= 1.0;
           float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
@@ -1415,7 +1441,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].translucency;
           r19.y = dynamicLights_g[r2.w].shadowmapIndex;
           r5.z = cmp((int)r19.y != -1);
-          if (r5.z != 0) {
+          if (r5.z != 0 && rtlsSpotCover < 1.0) {
             r21.xyzw = spotShadowMatrices_g[r19.y]._m00_m10_m20_m30;
             r23.xyzw = spotShadowMatrices_g[r19.y]._m01_m11_m21_m31;
             r24.xyzw = spotShadowMatrices_g[r19.y]._m02_m12_m22_m32;
@@ -1441,6 +1467,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             r20.xy = r21.xy + r12.zw;
             r6.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r20.xyz, r21.z).x;
             r5.z = r6.w * 0.200000003 + r5.z;
+            if (rtlsSpotCover > 0.0) {
+              r5.z = lerp(r5.z, 1.0, rtlsSpotCover);
+            }
             r5.y = r5.y * r5.z;
           }
           r5.z = dot(r16.xyz, r8.xyw);
@@ -1451,6 +1480,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r19.x = dynamicLights_g[r2.w].color.x;
           r19.y = dynamicLights_g[r2.w].color.y;
           r19.z = dynamicLights_g[r2.w].color.z;
+          if (rtlsSpotVis < 1.0) {
+            r19.xyz *= rtlsSpotVis;
+          }
           if (csLocalSpotOn && csLocalBudget > 0.0) {
             csLocalBudget -= 1.0;
             float3 csLightPos = float3(dynamicLights_g[r2.w].pos.x, dynamicLights_g[r2.w].pos.y,
@@ -1537,6 +1569,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
         r11.x = dynamicLights_g[r1.y].color.x;
         r11.y = dynamicLights_g[r1.y].color.y;
         r11.z = dynamicLights_g[r1.y].color.z;
+        if (rtlsPointVis < 1.0) {
+          r11.xyz *= rtlsPointVis;
+        }
         if (csLocalEnvPointOn && csLocalBudget > 0.0) {
           csLocalBudget -= 1.0;
           float3 csLightPos = float3(dynamicLights_g[r1.y].pos.x, dynamicLights_g[r1.y].pos.y,
@@ -1604,7 +1639,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r13.x = dynamicLights_g[r1.y].translucency;
           r13.y = dynamicLights_g[r1.y].shadowmapIndex;
           r5.z = cmp((int)r13.y != -1);
-          if (r5.z != 0) {
+          if (r5.z != 0 && rtlsSpotCover < 1.0) {
             r19.xyzw = spotShadowMatrices_g[r13.y]._m00_m10_m20_m30;
             r21.xyzw = spotShadowMatrices_g[r13.y]._m01_m11_m21_m31;
             r23.xyzw = spotShadowMatrices_g[r13.y]._m02_m12_m22_m32;
@@ -1630,6 +1665,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
             r14.xy = r19.xy + r10.zw;
             r6.w = spotShadowMaps.SampleCmpLevelZero(SmplShadow_s, r14.xyz, r19.z).x;
             r5.z = r6.w * 0.200000003 + r5.z;
+            if (rtlsSpotCover > 0.0) {
+              r5.z = lerp(r5.z, 1.0, rtlsSpotCover);
+            }
             r5.y = r5.y * r5.z;
           }
           r5.z = dot(r12.xyz, r8.xyw);
@@ -1641,6 +1679,9 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
           r12.x = dynamicLights_g[r1.y].color.x;
           r12.y = dynamicLights_g[r1.y].color.y;
           r12.z = dynamicLights_g[r1.y].color.z;
+          if (rtlsSpotVis < 1.0) {
+            r12.xyz *= rtlsSpotVis;
+          }
           if (csLocalEnvSpotOn && csLocalBudget > 0.0) {
             csLocalBudget -= 1.0;
             float3 csLightPos = float3(dynamicLights_g[r1.y].pos.x, dynamicLights_g[r1.y].pos.y,

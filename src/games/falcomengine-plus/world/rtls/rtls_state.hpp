@@ -16,6 +16,8 @@ inline float g_rtls_point = 1.f;               // Point
 inline float g_rtls_spot = 1.f;                // Spot
 inline float g_rtls_env_point = 1.f;           // Env Point
 inline float g_rtls_env_spot = 1.f;            // Env Spot
+inline float g_rtls_strength = 1.f;            // Strength (lighting shader; no history reset)
+inline float g_rtls_max_darkening = 1.f;       // Max Darkening (lighting shader): shadow amount capped at this
 inline float g_rtls_samples = 1.f;             // Samples Per Light
 inline float g_rtls_max_point_lights = 6.f;    // Max Point Lights Per Pixel
 inline float g_rtls_ray_max = 16.f;            // Max Ray Distance
@@ -44,5 +46,15 @@ inline const char* ReasonName(Reason reason) {
 }
 
 inline bool RtlsRequested() { return g_rtls_enabled > 0.5f; }
+
+// Lighting shader flag bits in shader_injection.rtls_flags (RTLS_FLAG_* in lighting_0xCA3D8596.ps_5_0.hlsl).
+// Requested: the local contact march is off. Bound: t38 holds this frame's RTLS term. Point/Spot: the specular material
+// path; EnvPoint/EnvSpot: the diffuse-only material path.
+inline constexpr uint32_t kRtlsFlagRequested = 1u;
+inline constexpr uint32_t kRtlsFlagBound = 2u;
+inline constexpr uint32_t kRtlsFlagPoint = 4u;
+inline constexpr uint32_t kRtlsFlagSpot = 8u;
+inline constexpr uint32_t kRtlsFlagEnvPoint = 16u;
+inline constexpr uint32_t kRtlsFlagEnvSpot = 32u;
 
 }  // namespace falcom_world::rtls

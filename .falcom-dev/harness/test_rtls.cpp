@@ -4,8 +4,8 @@
 // REAL: RtlsPushConstants layout, BuildRtlsJson (the text written to world_rtls.json), the shared lamp helpers in
 //       world_rt_lamps.hlsli (text), the lifecycle of rtls::Dispatch on the recording mock (one dispatch, groups,
 //       texture formats, destroy).
-// TRANSCRIPTION: the cell index (world_rtls.cs_5_0.hlsl main), the point top-k insertion and the spot list-order cap, the shadow ratio and the fade.
-// TEXT: the RTLS_STAT_* / RTLS_KIND_* defines of world_rtls.cs_5_0.hlsl against the kRtls* constants (harness copy).
+// TRANSCRIPTION: the cell index (world_rtls.cs_5_0.hlsl main), the point top-k insertion and the spot list-order cap, the shadow ratio and the fade, the lighting visibility and the spot cover lerp.
+// TEXT: the RTLS_STAT_* / RTLS_KIND_* defines of world_rtls.cs_5_0.hlsl against the kRtls* constants (harness copy); the M3 lighting shader edits (t38, RTLS_FLAG_* against kRtlsFlag*, the four colour sites, the two spot cover sites, the contact gate, no RTLS code in the character branch), shared.h fields.
 // NOT COVERED: the shader on the GPU, RunRtlsInline (addon.cpp),
 //       the per-lamp sample rules (backlit, budget, Light Clearance), the present blit.
 #include <algorithm>
@@ -54,6 +54,7 @@ inline constexpr std::span<const std::uint8_t> __world_rtao_filter{__world_rtao_
 #include "harness_timer.hpp"
 #include "json_check.hpp"
 #include "src/games/falcomengine-plus/world/rtls/rtls.hpp"
+#include "../../src/games/falcomengine-plus/shared.h"  // REAL: compiled; ShaderInjectData rtls_* fields and size
 
 using namespace reshade::api;
 namespace rtls = falcom_world::rtls;
@@ -273,6 +274,79 @@ static void TestSpotCap() {
   CHECK(spot_n - std::min(spot_n, 8u) == 3u, "3 spots over the cap");
 }
 
+// Counts non-overlapping occurrences of needle in text.
+static int Count(const std::string& text, const std::string& needle) {
+  int n = 0;
+  for (size_t p = text.find(needle); p != std::string::npos; p = text.find(needle, p + needle.size())) ++n;
+  return n;
+}
+
+// M3: the lighting shader edits (read from the repo; refresh_world does not copy sora2nd) and the shared.h fields.
+static void TestLightingApply() {
+  const std::string lighting = ReadText("../../src/games/falcomengine-plus/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl");
+  CHECK(!lighting.empty(), "lighting shader readable from the repo");
+  CHECK(Count(lighting, "Texture2D<float4> rtlsTexture : register(t38);") == 1, "t38 declared once");
+  CHECK(Count(lighting, "register(t38)") == 1, "t38 used by one declaration only");
+  const struct {
+    const char* name;
+    uint32_t value;
+  } flags[] = {
+      {"REQUESTED", rtls::kRtlsFlagRequested}, {"BOUND", rtls::kRtlsFlagBound}, {"POINT", rtls::kRtlsFlagPoint},
+      {"SPOT", rtls::kRtlsFlagSpot}, {"ENV_POINT", rtls::kRtlsFlagEnvPoint}, {"ENV_SPOT", rtls::kRtlsFlagEnvSpot},
+  };
+  for (const auto& f : flags) {
+    const std::string line = "#define RTLS_FLAG_" + std::string(f.name) + " " + std::to_string(f.value) + "u";
+    CHECK(Count(lighting, line) == 1, "lighting shader has %s", line.c_str());
+  }
+  CHECK(Count(lighting, "const bool csLocalOn = shader_injection_data.cs_contact_local_enabled > 0.5f && (rtlsFlags & RTLS_FLAG_REQUESTED) == 0u;") == 1,
+        "contact march off while RTLS is requested");
+  CHECK(Count(lighting, "if (r5.z != 0 && rtlsSpotCover < 1.0) {") == 2, "both spot shadow-map blocks skipped under full cover");
+  CHECK(Count(lighting, "r5.z = lerp(r5.z, 1.0, rtlsSpotCover);") == 2, "both spot shadow-map results blend by cover");
+  CHECK(Count(lighting, "r13.xyz *= rtlsPointVis;") == 1 && Count(lighting, "r11.xyz *= rtlsPointVis;") == 1, "point colour sites");
+  CHECK(Count(lighting, "r19.xyz *= rtlsSpotVis;") == 1 && Count(lighting, "r12.xyz *= rtlsSpotVis;") == 1, "spot colour sites");
+  CHECK(Count(lighting, "SampleCmpLevelZero") == 10, "the ten spot shadow-map taps are unchanged");
+  // Character exclusion: no RTLS code in main before the first environment line after the character branch.
+  const size_t main_at = lighting.find("void main(");
+  const size_t env_at = lighting.find("r3.zw = r4.xz * cloudShadowScale_g + cloudShadowOffset_g.xy;");
+  const size_t first_rtls_in_main = lighting.find("rtls", main_at);
+  CHECK(main_at != std::string::npos && env_at != std::string::npos && first_rtls_in_main > env_at,
+        "no RTLS code in the character branch (first use at %zu, environment path at %zu)", first_rtls_in_main, env_at);
+  const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
+  CHECK(!header.empty(), "shared.h readable");
+  for (const char* field : {"float rtls_flags;", "float rtls_strength;", "float rtls_max_darkening;"}) {
+    CHECK(Count(header, field) == 1, "shared.h declares %s once", field);
+  }
+  for (const char* old_name : {"local_sss_enabled", "local_sss_strength", "local_sss_light_type"}) {
+    CHECK(Count(header, old_name) == 0, "shared.h no longer has %s", old_name);
+  }
+  ShaderInjectData injection = {};
+  injection.rtls_flags = 3.f;
+  injection.rtls_strength = 0.5f;
+  injection.rtls_max_darkening = 0.25f;
+  CHECK(injection.rtls_flags == 3.f && injection.rtls_strength == 0.5f && injection.rtls_max_darkening == 0.25f,
+        "ShaderInjectData rtls_* fields compile and hold their values");
+  CHECK(sizeof(ShaderInjectData) == 1756u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
+}
+
+// Transcription of the lighting visibility (F2) and the spot cover lerp (F6, F10).
+static float LampVisibility(float shadow, float strength, float max_darkening) {
+  return 1.f - std::min(shadow * strength, max_darkening);
+}
+
+static void TestLightingMath() {
+  CHECK(LampVisibility(0.f, 1.f, 1.f) == 1.f, "no shadow: visibility 1");
+  CHECK(LampVisibility(0.75f, 1.f, 1.f) == 0.25f, "defaults: visibility = 1 - shadow");
+  CHECK(LampVisibility(1.f, 1.f, 0.5f) == 0.5f, "Max Darkening 0.5 caps a full shadow at half");
+  CHECK(LampVisibility(0.25f, 1.f, 0.5f) == 0.75f, "Max Darkening leaves lighter shadows unchanged");
+  CHECK(LampVisibility(1.f, 0.f, 1.f) == 1.f, "Strength 0: no RT shadow");
+  // lerp(a, 1, c) as HLSL computes it: a + c * (1 - a). Cover 0 must return the game's PCF value bit-exactly.
+  const float pcf[4] = {0.f, 0.2f, 0.6f, 1.f};
+  for (const float a : pcf) {
+    CHECK(a + 0.f * (1.f - a) == a, "cover 0 keeps the game shadow %f", a);
+    CHECK(a + 1.f * (1.f - a) == 1.f, "cover 1 removes the game shadow %f", a);
+  }
+}
+
 static void TestJson() {
   const rtls::RtlsFrameState frame = {};
   const uint32_t values[rtls::kRtlsStatsCount] = {};
@@ -476,6 +550,10 @@ int main() {
   TestSpotCap();
   HStage("ratio transcription");
   TestRatio();
+  HStage("lighting shader apply");
+  TestLightingApply();
+  HStage("lighting math transcription");
+  TestLightingMath();
   HStage("json");
   TestJson();
   HStage("device lifecycle");

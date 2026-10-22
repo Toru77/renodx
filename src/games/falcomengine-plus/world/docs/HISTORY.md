@@ -41,6 +41,25 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M3 (applied in the lighting shader), implemented, not validated in game
+
+- The Sora 2nd lighting shader reads this frame's RTLS term at t38 (the M2 raw texture, full resolution, no denoising): x point shadow, y spot shadow, z RT coverage. RunRtlsInline binds it with `push_rtls` (on the dispatch and on a second lighting draw of the frame) and sets `shader_injection.rtls_flags` (kRtlsFlag*: Requested 1, Bound 2, Point 4, Spot 8, EnvPoint 16, EnvSpot 32), `rtls_strength` and `rtls_max_darkening`. The three fields reuse the retired `local_sss_enabled/strength/light_type` slots; ShaderInjectData stays 439 floats = 1756 bytes (the old "440 floats = 1760 bytes" comment in shared.h was stale and is corrected).
+- Each lamp of a traced kind is scaled at its colour by v = 1 - min(shadow x Strength, Max Darkening): Point and Spot on the specular material path, Env Point and Env Spot on the diffuse-only path. The game's spot shadow maps are skipped where the coverage is 1 and blended by lerp(pcf, 1, coverage) in the fade band; beyond Fade End they are unchanged. Sun, ambient, dynamicLightIntensity, RTAO, micro shadows and RTGI are not changed.
+- While RTLS is on, the Contact Shadows Local Lights row and its 8 sub-rows are greyed out (RtlsRequested) and the local contact march is off in the shader (RTLS_FLAG_REQUESTED), also on frames where RTLS is not producing; the game's spot shadow maps then stay on. Stored contact settings are not changed.
+- Character pixels are not touched: all RTLS code in the lighting shader is after the character branch (character receiving is M3b). RTLS off: rtls_flags 0, every new branch skipped, the image equals HEAD.
+- New rows: Strength and Max Darkening (RT Local Shadows, saved, default 1, applied in the lighting shader only, no history reset).
+- Harness: run_win_all.ps1 (output saved): test_rtls PASS (0 failures), test_rtgi PASS (golden 0x22868adf1653e774 unchanged). Allowed failures only: test_rtao.cpp:1881, test_live.cpp:2758, 3009, 3470, test_motion.cpp:1091. All other programs PASS. test_rtls adds TestLightingApply (t38, flag defines against kRtlsFlag*, the contact gate, the two cover sites, the four colour sites, ten SampleCmpLevelZero taps, no RTLS code in the character branch, shared.h fields and size) and TestLightingMath (visibility and the cover lerp, cover 0 bit-exact). Addon build (release preset) passes; lighting shader compiles with FXC.
+- Owner checks (M0 night scene):
+  1. RTLS Off: image equals the M2 build; the Local Lights rows are enabled as before.
+  2. RTLS On: the Local Lights rows are greyed and the local contact darkening near lamps is gone.
+  3. One kind at a time (Point, Env Point, Spot, Env Spot): each adds shadows only on its own surfaces; point lamps get shadows where the game had none. Screenshot each.
+  4. Spot lamps: inside Fade Start the game's spot shadow is replaced (no double shadow), the fade band blends, beyond Fade End the game's shadow is back.
+  5. Strength 0: no RT shadow (spots inside the RT range unshadowed). Max Darkening 0.5: the darkest shadows are half dark, lighter ones unchanged.
+  6. Characters look the same with RTLS On and Off; shadows cast by characters still appear with Trace characters On.
+  7. Light Size 0.1 gives noisy penumbrae (no denoising until M4b); Light Size 0 gives clean hard shadows. Report whether the noise is acceptable for now.
+  8. With Performance gathering On: RTLS GPU ms and frame time with RTLS Off and On.
+  Send back: screenshots for 1 to 7, the GPU ms values and the RTLS panel text.
+
 ## RT Local Shadows: M2 (trace and discovery; image unchanged), implemented, not validated in game
 
 - New `world/rtls/` (settings, resources, dispatch and stats, panel) and `world/shaders/world_rtls.cs_5_0.hlsl`. RunRtlsInline runs between RTAO and RTGI and traces the game's point and spot lamps of the pixel's tile cell (shadow rays to a disk of Light Size, IS-FAST or IGN, through the live BVH). It writes the per-pixel shadow term (u2), the debug views 1 to 5 (RTLS Debug, session only), the stats (u1) and world_rtls.json (Read RTLS Stats). Nothing is bound to the lighting draw: the image is unchanged until M3.

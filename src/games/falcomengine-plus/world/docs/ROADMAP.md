@@ -49,6 +49,7 @@ Implemented, not validated in game. Each feature's owner test list is in its HIS
 | Perf sampling, block timers, Max 30 column, perf file | Performance tab, 30 s test | HISTORY: CPU spike step 1; Performance tab rows; Performance test and separate dumps |
 | Panel cleanup | Panel lines moved to JSON | HISTORY: Panel cleanup |
 | RT Local Shadows M2 (trace and discovery; image unchanged) | Owner list in HISTORY: RT Local Shadows M2 | Reference: RT Local Shadows |
+| RT Local Shadows M3 (applied in the lighting shader, full resolution, raw) | Owner list in HISTORY: RT Local Shadows M3 | Reference: RT Local Shadows |
 | TLAS rebuild reduction (skip no-op, slack TLAS, default OFF) | A/B in game | HISTORY: TLAS rebuild reduction (cache-diag-2) |
 | Cache diagnostics (Phase 0, 0b) | Dump twice; placement compare | HISTORY: Phase 0 cache diagnostics; Step 0b (cache-diag-1) |
 | Refit and drain cleanup; refit diet; rebuild diet; housekeeping | Regression only; no pins changed | HISTORY: Refit and drain cleanup; Rebuild diet; Refit diet; Housekeeping |
@@ -230,7 +231,7 @@ What to send back after a session: the RTAO status panel lines, `world_rtao.json
 - Stats layout (u1, 96 uints): 0..19 pixel, lamp and ray counters (`kRtlsStat*`); 20..22 reserved for the RTGI temporal pass (M4b); 23..31 reserved (M3b: 24 character traced, 25 character self-blocked); 32..63 per-lamp rays and 64..95 per-lamp near-light blocked, for lamp index < 32.
 - Debug views (RTLS Debug, session only): 1 shadow term, 2 lamps per pixel, 3 over budget and traced, 4 blocked near the lamp, 5 pixel classes. RTGI Debug draws over RTLS Debug when both are set.
 - `world_rtls.json` is written by Read RTLS Stats (schema 1; stats, per_light, settings, fade and ray max).
-- Not applied to the image until M3.
+- M3: applied in the Sora 2nd lighting shader (t38 = the raw term, full resolution, no denoising). Flags in shader_injection.rtls_flags (kRtlsFlag*): Requested turns the local contact march off (the Contact Shadows Local Lights rows are greyed while RTLS is on); Bound, then Point/Spot (specular material path) and EnvPoint/EnvSpot (diffuse-only path) select the kinds. Each lamp of a traced kind is scaled by v = 1 - min(shadow x Strength, Max Darkening) at its colour; the game's spot shadow maps are skipped where the coverage is 1 and blended by lerp(pcf, 1, coverage) in the fade band. Character pixels are not touched (M3b). Off: rtls_flags 0, identical to HEAD.
 
 ## Open decisions
 

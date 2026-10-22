@@ -77,15 +77,14 @@ struct ShaderInjectData {
   float debug_show_env_sss;
 
   // —— Local Screen Space Shadows (Bend_SSS for point/spot lights) ——
-  // 0/1, DEPRECATED and unread. These eleven slots were allocated for a
-  // per-local-light screen-space shadow that was never implemented -- no .hlsl
-  // file in this mod has ever read them. The feature is now covered properly by
-  // the Contact Shadows local-light march (cs_contact_local_*), which reuses the
-  // shared clip-space marcher instead of duplicating it per game. Kept in place
-  // so the packoffset of every field after this one is unchanged.
-  float local_sss_enabled;             // RETIRED: unread
-  float local_sss_strength;            // RETIRED: unread
-  float local_sss_light_type;          // RETIRED: unread
+  // These eleven slots were allocated for a per-local-light screen-space shadow that
+  // was never implemented; that feature is covered by the Contact Shadows local-light
+  // march (cs_contact_local_*). The first three are reused by RT Local Shadows
+  // (rtls_flags, rtls_strength, rtls_max_darkening); the other eight are RETIRED and
+  // unread. All eleven stay in place so the packoffset of every later field is unchanged.
+  float rtls_flags;                    // RT Local Shadows: RTLS_FLAG_* bits for this lighting draw (RunRtlsInline); 0 = game behaviour
+  float rtls_strength;                 // RTLS Strength [0..1]; read only while rtls_flags has RTLS_FLAG_BOUND
+  float rtls_max_darkening;            // RTLS Max Darkening [0..1]: the shadow amount is capped at this
   float local_sss_sample_count;        // RETIRED: unread
   float local_sss_hard_shadow_samples; // RETIRED: unread
   float local_sss_fade_out_samples;    // RETIRED: unread
@@ -747,13 +746,11 @@ struct ShaderInjectData {
   // a pre-scaled vector (the Sora/Kai 10-step march needs it to be), and the Ray
   // Length default should be set against a measured number rather than a guess.
   float char_cam_debug;
-  // The struct must end on a float4 boundary: the host declares this range as a D3D
-  // constant buffer of sizeof(ShaderInjectData) bytes (CreateShadowsPipelinesIfNeeded
-  // and RunShadows) while fxc sizes CB13 from the same struct, so a size that is not a
-  // whole number of float4s makes the shader's own declaration and the host's range
-  // disagree. It is 440 floats = 110 float4s = 1760 bytes, which already satisfies that,
-  // so there is no trailing pad any more. Adding a field means the count has to stay a
-  // multiple of 4: trade it against another float rather than appending past the boundary.
+  // Size: 439 floats = 1756 bytes (measured at cf637e7d). The host declares the range as
+  // sizeof(ShaderInjectData) / 4 push values (CreateShadowsPipelinesIfNeeded and RunShadows);
+  // fxc pads CB13 up to 110 float4s (1760 bytes), so the .w of the last float4 is padding
+  // that no shader reads. One more float fits in that padding; the 441st float starts a new
+  // float4, and the host range grows with sizeof automatically. Prefer reusing a RETIRED slot.
  };
 
 #ifndef __cplusplus

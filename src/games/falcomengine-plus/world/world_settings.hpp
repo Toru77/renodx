@@ -1191,7 +1191,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RT Local Shadows",
       .section = "RT Local Shadows",
-      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. Turning it on enables Live BVH and Deforming meshes. M2: traced and shown in RTLS Debug only; the image is not changed yet.",
+      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. Turning it on enables Live BVH and Deforming meshes. Applied to the image at full resolution with no denoising yet. While on, Contact Shadows Local Lights is greyed out and off, and the game's spot shadow maps are replaced inside the RT range (they return beyond Fade End).",
       .labels = {"Off", "On"},
       .on_change_value = [](float, float current) {
         if (current > 0.5f) {
@@ -1262,6 +1262,32 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .label = "Env Spot",
       .section = "RT Local Shadows",
       .tooltip = "Traces shadows from spot lamps on surfaces the game shades without lamp specular (Env = surfaces the game shades without lamp specular).",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsStrength",
+      .binding = &rtls::g_rtls_strength,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Strength",
+      .section = "RT Local Shadows",
+      .tooltip = "Scales the RT local shadow. 0 = no RT shadow (spot lamps inside the RT range are then unshadowed), 1 = physical.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsMaxDarkening",
+      .binding = &rtls::g_rtls_max_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Max Darkening",
+      .section = "RT Local Shadows",
+      .tooltip = "Caps the darkest RT local shadow: no lamp loses more than this share of its light; lighter shadows are unchanged. 1 = no cap.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
       .is_visible = visible,
   });
   settings->push_back(new Setting{
