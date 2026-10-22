@@ -946,6 +946,19 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       },
   });
   settings->push_back(new Setting{
+      .key = "RtgiBounceSaturation",
+      .binding = &rtgi::g_rtgi_bounce_saturation,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Bounce Saturation",
+      .section = "RTGI",
+      .tooltip = "Saturation of only the extra bounce light (Feedback: the fed-back part; Real Extra Rays: bounces 1 and 2). 1 = unchanged, 0 = grey extra light, 2 = more saturated. The first bounce, GI Saturation and the game's lighting are not changed by this setting. Does nothing with Extra Bounces Off.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_visible = [visible]() { return visible() && rtgi::g_rtgi_extra_bounces > 0.5f; },
+  });
+  settings->push_back(new Setting{
       .key = "RtgiCharacterIntensity",
       .binding = &rtgi::g_rtgi_char_intensity,
       .value_type = SettingValueType::FLOAT,

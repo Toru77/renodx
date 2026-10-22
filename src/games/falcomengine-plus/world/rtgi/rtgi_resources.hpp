@@ -137,7 +137,7 @@ struct RtgiPushConstants {
   float size[4];      // c4: trace width, trace height, full width, full height
   float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
   float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), Sun Contribution, unused
-  float extra[4];     // c7: x = Dynamic Light Contribution, y = effective Feedback Strength, z = Extra Bounce Rays (Real Extra Rays only), w unused
+  float extra[4];     // c7: x = Dynamic Light Contribution, y = effective Feedback Strength, z = Extra Bounce Rays (Real Extra Rays only), w = Bounce Saturation (extra bounce light only)
 };
 static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 32 floats");
 static_assert(offsetof(RtgiPushConstants, sampling) == 4 * sizeof(float), "b12 c1 offset");

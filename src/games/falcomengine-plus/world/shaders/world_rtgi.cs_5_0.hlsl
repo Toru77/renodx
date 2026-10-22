@@ -100,7 +100,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
     float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, unused
-    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), Extra Bounce Rays (z, Real Extra Rays only), unused
+    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), Extra Bounce Rays (z, Real Extra Rays only), Bounce Saturation (w, extra bounce light only)
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -195,6 +195,12 @@ float3 LampDiffuseSum(float3 position, float3 n)
         }
     }
     return lamp_sum;
+}
+
+// Bounce Saturation (c7.w): saturates or desaturates extra bounce light; callers skip it when the setting is 1.
+float3 BounceSaturate(float3 c, float s)
+{
+    return max(0.0, lerp(dot(c, float3(0.2126, 0.7152, 0.0722)), c, s));
 }
 
 groupshared uint gs_stats[RTGI_STAT_TRACE_COUNT];
@@ -402,7 +408,12 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                     if ((flags & RTGI_FLAG_FEEDBACK) != 0u)
                                     {
                                         // Extra Bounces: keep the feedback share of the subtracted bounce, so it builds up over frames.
-                                        radiance += g_rtgi_dynamic.y * applied;
+                                        float3 fed_back = g_rtgi_dynamic.y * applied;
+                                        if (g_rtgi_dynamic.w != 1.0)
+                                        {
+                                            fed_back = BounceSaturate(fed_back, g_rtgi_dynamic.w);
+                                        }
+                                        radiance += fed_back;
                                     }
                                 }
                                 // O1: scale this on-screen bounce's sun and lamp parts (Sun / Dynamic Light Contribution).
@@ -484,6 +495,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             : float3(fallback_albedo, fallback_albedo, fallback_albedo));
                         ray_origin = hit.position + n * g_rtgi_params.y;
                         ray_N = n;
+                    }
+                    if (g_rtgi_dynamic.w != 1.0)
+                    {
+                        extra = BounceSaturate(extra, g_rtgi_dynamic.w);
                     }
                     float3 radiance = radiance_0 + extra;
                     if (any(isnan(radiance)) || any(isinf(radiance)))

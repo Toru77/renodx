@@ -907,3 +907,16 @@ Verification (2026-10-08):
   2. Same with Extra Bounce Rays 2.
   3. Compare with Feedback at Feedback Strength 0.5 (screenshots and RTGI GPU ms).
 - Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (HEAD 6329d172): 0xB54FCB7C7D5B4214. After: 0xEA437F3F48D210A7.
+
+## Bounce Saturation (bounce-c, rtgi-bounce-sat): implemented, not validated in game
+
+- Setting RtgiBounceSaturation "Bounce Saturation" (RTGI section, FLOAT 0 to 2, default 1, shown only while Extra Bounces is On), placed after Extra Bounce Rays. Push constant c7.w (`g_rtgi_dynamic.w`, `RtgiPushConstants.extra[3]`). Push stays 32 floats.
+- Where it applies: only the extra bounce light. (a) Feedback: the add-back is max(copy - A, 0) + sat(f_eff x A, s), where A is the subtracted applied value; the subtract itself is unchanged. (b) Real Extra Rays: the sample is radiance_0 + sat(extra, s). The first bounce (radiance_0) is never touched.
+- Formula: sat(c, s) = max(0, lerp(luma, c, s)), luma = dot(c, (0.2126, 0.7152, 0.0722)). Applied only when s != 1, so 1 keeps the previous expressions exactly.
+- Stacking: GI Saturation (upsample pass, committed in rtgi-gi-sat) still applies to the total GI afterwards; the two stack.
+- Off equals previous commit: with Extra Bounces Off the feedback flag is not set and the extra rays are 0, so no value of Bounce Saturation changes the image. Bounce Saturation 1 with any method equals the previous commit.
+- Snapshot: `bounce_saturation` (raw setting) is appended after `extra_bounce_rays`; the count goes 27 -> 28. Any change resets RTGI history.
+- Owner test (not run):
+  1. With Extra Bounces On, each method (Feedback, and Real Extra Rays with Extra Bounce Rays 1 and 2), in a scene with coloured walls: set Bounce Saturation 0, 1, 2 and take screenshots. The first bounce must not change: compare with Extra Bounces Off at the same strength (the first bounce is the same in both).
+  2. Send the screenshots.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (HEAD c05ef958): 0xEA437F3F48D210A7. After: 0x90F5AD0C13175151.

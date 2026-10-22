@@ -45,6 +45,7 @@ inline float g_rtgi_extra_bounces = 0.f;          // Extra Bounces: feed last fr
 inline float g_rtgi_feedback_strength = 0.5f;     // Feedback Strength: share of last frame's bounce fed back, before the cap
 inline float g_rtgi_extra_bounce_method = 0.f;    // Extra Bounce Method: 0 Feedback, 1 Real Extra Rays
 inline float g_rtgi_extra_bounce_rays = 1.f;      // Extra Bounce Rays: extra rays per first-bounce hit (Real Extra Rays), 1 or 2
+inline float g_rtgi_bounce_saturation = 1.f;      // Bounce Saturation: saturation of the extra bounce light only (Feedback add-back, Real Extra Rays)
 inline float g_rtgi_trace_characters = 0.f;  // Trace characters: RTGI rays hit this frame's skinned characters
 inline float g_rtgi_rtao_restore = 0.f;           // RTAO value to put back when RTGI is turned off (hidden row RtgiRtaoRestore)
 
@@ -127,7 +128,7 @@ struct ParameterSnapshot {
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
   float trace_characters;
   float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun;
-  float extra_bounces, feedback_strength, extra_bounce_method, extra_bounce_rays;
+  float extra_bounces, feedback_strength, extra_bounce_method, extra_bounce_rays, bounce_saturation;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

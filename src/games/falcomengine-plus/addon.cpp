@@ -9352,7 +9352,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
       rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun,
       rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength, rtgi::g_rtgi_extra_bounce_method,
-      rtgi::g_rtgi_extra_bounce_rays};
+      rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9430,7 +9430,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
           .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, subtract ? frame.applied_intensity : 0.f,
                       static_cast<float>(prev_view_proj_register)},
           .sun = {rtgi::g_rtgi_sun_distance, 0.f, rtgi::g_rtgi_sun_contribution, 0.f},
-          .extra = {rtgi::g_rtgi_dynamic_light_contribution, feedback_strength, static_cast<float>(extra_rays), 0.f},
+          .extra = {rtgi::g_rtgi_dynamic_light_contribution, feedback_strength, static_cast<float>(extra_rays),
+                    rtgi::g_rtgi_bounce_saturation},
       },
       .debug_mode = static_cast<int>(rtgi::g_rtgi_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
