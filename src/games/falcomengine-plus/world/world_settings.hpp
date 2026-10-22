@@ -1265,6 +1265,46 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtlsCharacters",
+      .binding = &rtls::g_rtls_characters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Receive on characters",
+      .section = "RT Local Shadows",
+      .tooltip = "Characters get the game's lamp light where RT Local Shadows finds the lamp unblocked (the game gives characters no lamp shadows). Fades out with the RT range. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsCharacterLampLight",
+      .binding = &rtls::g_rtls_character_lamp,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Lamp Light",
+      .section = "RT Local Shadows",
+      .tooltip = "Strength of the lamp light added to characters. 0 = none.",
+      .min = 0.f,
+      .max = 2.f,
+      .format = "%.2f",
+      .is_enabled = []() { return rtls::g_rtls_characters > 0.5f; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsCharacterNormalBias",
+      .binding = &rtls::g_rtls_character_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Character Normal Bias",
+      .section = "RT Local Shadows",
+      .tooltip = "Extra ray offset on character pixels against self-shadowing from their own mesh, in metres.",
+      .min = 0.f,
+      .max = 0.2f,
+      .format = "%.3f",
+      .is_enabled = []() { return rtls::g_rtls_characters > 0.5f; },
+      .is_visible = advanced,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
       .key = "RtlsStrength",
       .binding = &rtls::g_rtls_strength,
       .value_type = SettingValueType::FLOAT,

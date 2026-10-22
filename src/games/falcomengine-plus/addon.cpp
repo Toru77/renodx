@@ -92,7 +92,7 @@ ShaderInjectData shader_injection = {
   .rtls_flags = 0.f,
   .rtls_strength = 1.f,
   .rtls_max_darkening = 1.f,
-  .local_sss_sample_count = 24.f,
+  .rtls_char_lamp = 1.f,
   .local_sss_hard_shadow_samples = 0.f,
   .local_sss_fade_out_samples = 0.f,
   .local_sss_surface_thickness = 0.005f,
@@ -9340,9 +9340,11 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
         | (rtls::g_rtls_point > 0.5f ? rtls::kRtlsFlagPoint : 0u)
         | (rtls::g_rtls_spot > 0.5f ? rtls::kRtlsFlagSpot : 0u)
         | (rtls::g_rtls_env_point > 0.5f ? rtls::kRtlsFlagEnvPoint : 0u)
-        | (rtls::g_rtls_env_spot > 0.5f ? rtls::kRtlsFlagEnvSpot : 0u));
+        | (rtls::g_rtls_env_spot > 0.5f ? rtls::kRtlsFlagEnvSpot : 0u)
+        | (rtls::g_rtls_characters > 0.5f ? rtls::kRtlsFlagCharacter : 0u));
     shader_injection.rtls_strength = rtls::g_rtls_strength;
     shader_injection.rtls_max_darkening = rtls::g_rtls_max_darkening;
+    shader_injection.rtls_char_lamp = rtls::g_rtls_character_lamp;
   };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
@@ -9362,7 +9364,8 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
     return;
   }
   const uint32_t kinds = ((rtls::g_rtls_point > 0.5f || rtls::g_rtls_env_point > 0.5f) ? rtls::kRtlsKindPoint : 0u)
-      | ((rtls::g_rtls_spot > 0.5f || rtls::g_rtls_env_spot > 0.5f) ? rtls::kRtlsKindSpot : 0u);
+      | ((rtls::g_rtls_spot > 0.5f || rtls::g_rtls_env_spot > 0.5f) ? rtls::kRtlsKindSpot : 0u)
+      | (rtls::g_rtls_characters > 0.5f ? rtls::kRtlsKindCharacters : 0u);
   if (kinds == 0u) {
     frame.reason = rtls::Reason::NoKinds;
     return;
@@ -9399,7 +9402,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       rtls::g_rtls_light_clearance, rtls::g_rtls_normal_bias, rtls::g_rtls_trace_characters, rtls::g_rtls_isfast,
       rtls::g_rtls_point, rtls::g_rtls_spot, rtls::g_rtls_env_point, rtls::g_rtls_env_spot, rtls::g_rtls_fade_start_pct,
       rtls::g_rtls_fade_end_pct, rtls::g_rtls_trace_resolution, rtls::g_rtls_temporal_enabled, rtls::g_rtls_history_weight,
-      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_history_clamp, rtls::g_rtls_debug};
+      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_history_clamp, rtls::g_rtls_debug, rtls::g_rtls_characters, rtls::g_rtls_character_normal_bias};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;

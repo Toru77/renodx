@@ -41,6 +41,12 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M3b (characters receive), implemented, not validated in game
+
+- Receive on characters (default Off): character pixels get the game's point and spot lamp light (charaColor, the same falloff and cone) times RTLS visibility and coverage, after charColor. Character Lamp Light (0 to 2) scales it.
+- Trace: character pixels use charaColor weights and Character Normal Bias as a ray offset (world_rtls.cs_5_0.hlsl; the value comes in through the trace push, rtls.hpp). Stats 24 character traced, 25 character self-blocked; Debug 5 shows character pixels orange. Off: every new branch is skipped and the image matches HEAD. RTGI golden unchanged (0x22868adf1653e774).
+- Owner checks (M0 night scene): 1 Off: a character next to a lamp looks as now. 2 On: the lamp-facing side gains light. 3 A pillar or character blocks the lamp: the blocked side stays as in check 1. 4 Character Lamp Light 0 is the same as check 1. 5 Walk past Fade End: the added light fades out. 6 RTLS Debug 1 close to a character: dark speckles? Read character_self_blocked; raise Character Normal Bias in steps of 0.01 if needed. 7 RTLS GPU ms with Receive on characters Off and On.
+
 ## RT Local Shadows: M4b (denoise and trace resolution), implemented, not validated in game
 
 - Trace Resolution (Full, Half, Quarter; default Half): the RTLS trace runs at the trace size and writes the raw term at that size.

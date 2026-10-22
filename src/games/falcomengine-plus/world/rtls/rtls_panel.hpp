@@ -76,6 +76,9 @@ inline void DrawRtlsPanel() {
                 rtao::SharePercent(v[kRtlsStatRaysBlocked], rays), rtao::SharePercent(v[kRtlsStatRaysNearLight], rays),
                 rtao::SharePercent(v[kRtlsStatRaysClipped], rays));
     ImGui::Text("invalid_refs %u, stack_overflow %u", v[kRtlsStatInvalidRefs], v[kRtlsStatStackOverflow]);
+    ImGui::Text("Characters: receive %s, lamp light %.2f, traced %u px, self-blocked %u rays",
+                g_rtls_characters > 0.5f ? "on" : "off", static_cast<double>(g_rtls_character_lamp),
+                v[kRtlsStatCharacterTraced], v[kRtlsStatCharacterSelfBlocked]);
     ImGui::Text("Temporal pixels %u, no history %.1f%%, reset %.1f%%", v[rtgi::kRtgiStatTemporalPixels],
                 rtao::SharePercent(v[rtgi::kRtgiStatNoHistory], v[rtgi::kRtgiStatTemporalPixels]),
                 rtao::SharePercent(v[rtgi::kRtgiStatResetPixels], v[rtgi::kRtgiStatTemporalPixels]));

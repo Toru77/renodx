@@ -308,9 +308,8 @@ static void TestLightingApply() {
   // Character exclusion: no RTLS code in main before the first environment line after the character branch.
   const size_t main_at = lighting.find("void main(");
   const size_t env_at = lighting.find("r3.zw = r4.xz * cloudShadowScale_g + cloudShadowOffset_g.xy;");
-  const size_t first_rtls_in_main = lighting.find("rtls", main_at);
-  CHECK(main_at != std::string::npos && env_at != std::string::npos && first_rtls_in_main > env_at,
-        "no RTLS code in the character branch (first use at %zu, environment path at %zu)", first_rtls_in_main, env_at);
+  const size_t char_term_at = lighting.find("const uint rtlsCharFlags");
+  CHECK(char_term_at != std::string::npos && char_term_at < env_at, "the character lamp term is in the character branch");
   const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
   CHECK(!header.empty(), "shared.h readable");
   for (const char* field : {"float rtls_flags;", "float rtls_strength;", "float rtls_max_darkening;"}) {
@@ -347,6 +346,25 @@ static void TestLightingMath() {
   }
 }
 
+// M3b: the character constants, defines and lighting-shader text.
+static void TestCharacters() {
+  CHECK(rtls::kRtlsFlagCharacter == 64u && rtls::kRtlsKindCharacters == 4u, "character flag 64, kind 4");
+  CHECK(rtls::kRtlsStatCharacterTraced == 24u && rtls::kRtlsStatCharacterSelfBlocked == 25u, "character stats 24, 25");
+  const std::string trace = ReadText("src/games/falcomengine-plus/world/shaders/world_rtls.cs_5_0.hlsl");
+  for (const char* line : {"#define RTLS_KIND_CHARACTERS 4u", "#define RTLS_STAT_CHARACTER_TRACED 24u",
+                           "#define RTLS_STAT_CHARACTER_SELF_BLOCKED 25u", "dot(character ? lamp.charaColor : lamp.color,"}) {
+    CHECK(Count(trace, line) == 1, "trace shader has %s once", line);
+  }
+  const std::string lighting = ReadText("../../src/games/falcomengine-plus/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl");
+  CHECK(Count(lighting, "#include \"../../world/shaders/world_rt_lamps.hlsli\"") == 1, "lighting includes the lamp header once");
+  CHECK(Count(lighting, "struct LightParam") == 0 && Count(lighting, "struct LightIndexData") == 0, "no own lamp structs");
+  CHECK(Count(lighting, "#define RTLS_FLAG_CHARACTER 64u") == 1, "character flag define");
+  CHECK(Count(lighting, "charColor += r0.xyz * rtlsLamp * shader_injection_data.rtls_char_lamp;") == 1, "one character lamp term");
+  const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
+  CHECK(Count(header, "float rtls_char_lamp;") == 1 && Count(header, "local_sss_sample_count") == 0, "shared.h slot renamed");
+  CHECK(sizeof(ShaderInjectData) == 1756u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
+}
+
 static void TestJson() {
   const rtls::RtlsFrameState frame = {};
   const uint32_t values[rtls::kRtlsStatsCount] = {};
@@ -360,6 +378,7 @@ static void TestJson() {
   CHECK(text.find("\"per_light\": [") != std::string::npos, "per_light array");
   CHECK(text.find("\"ray_max\": {") != std::string::npos, "ray_max object");
   CHECK(text.find("\"fade\": {") != std::string::npos, "fade object");
+  CHECK(text.find("\"character_traced\": ") != std::string::npos, "character_traced key");
   CHECK(text.find("\"temporal\": {") != std::string::npos && text.find("\"spatial_filter\": {") != std::string::npos,
         "temporal and spatial_filter objects");
   CHECK(text.find("\"divisor\": ") != std::string::npos && text.find("\"temporal_pixels\": ") != std::string::npos,
@@ -622,10 +641,10 @@ static void TestParameterSnapshot() {
   CHECK(!SnapshotHasMaxDarkening<rtls::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
   CHECK(!SnapshotHasSpatial<rtls::ParameterSnapshot>, "no spatial filter field is in the snapshot");
   // Exactly the 21 float fields of rtls_state.hpp; each one takes part in the comparison.
-  CHECK(sizeof(rtls::ParameterSnapshot) == 21u * sizeof(float), "snapshot is 21 floats (%zu bytes)", sizeof(rtls::ParameterSnapshot));
-  for (size_t i = 0u; i < 21u; ++i) {
+  CHECK(sizeof(rtls::ParameterSnapshot) == 23u * sizeof(float), "snapshot is 23 floats (%zu bytes)", sizeof(rtls::ParameterSnapshot));
+  for (size_t i = 0u; i < 23u; ++i) {
     rtls::ParameterSnapshot changed = {};
-    float fields[21] = {};
+    float fields[23] = {};
     std::memcpy(fields, &changed, sizeof(fields));
     fields[i] = 1.f;
     std::memcpy(&changed, fields, sizeof(fields));
@@ -654,6 +673,8 @@ int main() {
   TestLightingMath();
   HStage("parameter snapshot");
   TestParameterSnapshot();
+  HStage("characters");
+  TestCharacters();
   HStage("json");
   TestJson();
   HStage("device lifecycle");

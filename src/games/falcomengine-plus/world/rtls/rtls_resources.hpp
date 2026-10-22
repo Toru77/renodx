@@ -45,6 +45,9 @@ inline constexpr uint32_t kRtlsStatRaysClipped = 16u;
 inline constexpr uint32_t kRtlsStatInvalidRefs = 17u;
 inline constexpr uint32_t kRtlsStatStackOverflow = 18u;
 inline constexpr uint32_t kRtlsStatIndexOutOfRange = 19u;
+inline constexpr uint32_t kRtlsStatCharacterTraced = 24u;       // character pixels traced (Receive on characters)
+inline constexpr uint32_t kRtlsStatCharacterSelfBlocked = 25u;  // rays from character pixels blocked within 0.1 m
+inline constexpr uint32_t kRtlsKindCharacters = 4u;             // b12 c2.z bit: trace character pixels
 // 20..22: the RTGI temporal pass (M4b); 23..31: reserved (M3b: 24 character traced, 25 character self-blocked).
 inline constexpr uint32_t kRtlsStatPerLightRays = 32u;   // + lamp index, 32 entries
 inline constexpr uint32_t kRtlsStatPerLightNear = 64u;   // + lamp index, 32 entries
@@ -63,7 +66,7 @@ struct RtlsPushConstants {
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
   float light[4];     // c5: light size (m), light clearance (m), max point lights, lamp count
-  float extra[4];     // c6: character object count, 0, 0, 0
+  float extra[4];     // c6: character object count, character normal bias (m), 0, 0
 };
 static_assert(sizeof(RtlsPushConstants) == kRtlsPushConstantCount * sizeof(float), "b12 must be 28 floats");
 static_assert(offsetof(RtlsPushConstants, fade) == 8 * sizeof(float), "b12 c2 offset");

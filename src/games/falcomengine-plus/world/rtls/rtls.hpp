@@ -127,6 +127,7 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   push.size[3] = static_cast<float>(in.full_height);
   std::memcpy(&push.fade[3], &bvh_data->dynamic.instance_count, sizeof(uint32_t));  // P2b records (t19)
   push.extra[0] = static_cast<float>(in.dynamic.count);
+  push.extra[1] = g_rtls_character_normal_bias;
 
   // Whole-buffer write (offset 0, full size): see WriteBufferRange in bvh_resources.hpp.
   const uint32_t zeros[kRtlsStatsCount] = {};
@@ -255,7 +256,9 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
       << ", \"normal_bias\": " << g_rtls_normal_bias << ", \"trace_characters\": " << g_rtls_trace_characters
       << ", \"point\": " << g_rtls_point << ", \"spot\": " << g_rtls_spot << ", \"env_point\": " << g_rtls_env_point
       << ", \"env_spot\": " << g_rtls_env_spot
-      << ", \"trace_resolution\": " << g_rtls_trace_resolution << "},\n";
+      << ", \"trace_resolution\": " << g_rtls_trace_resolution
+      << ", \"characters\": " << g_rtls_characters << ", \"character_lamp\": " << g_rtls_character_lamp
+      << ", \"character_normal_bias\": " << g_rtls_character_normal_bias << "},\n";
   out << "  \"stats\": {\"pixels\": " << v[kRtlsStatPixels] << ", \"traced\": " << v[kRtlsStatTraced]
       << ", \"sky\": " << v[kRtlsStatSky] << ", \"normal\": " << v[kRtlsStatNormal]
       << ", \"region\": " << v[kRtlsStatRegion] << ", \"beyond_fade\": " << v[kRtlsStatBeyondFade]
@@ -266,6 +269,7 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
       << ", \"rays_blocked\": " << v[kRtlsStatRaysBlocked] << ", \"rays_near_light\": " << v[kRtlsStatRaysNearLight]
       << ", \"rays_clipped\": " << v[kRtlsStatRaysClipped] << ", \"invalid_refs\": " << v[kRtlsStatInvalidRefs]
       << ", \"stack_overflow\": " << v[kRtlsStatStackOverflow] << ", \"index_out_of_range\": " << v[kRtlsStatIndexOutOfRange]
+      << ", \"character_traced\": " << v[kRtlsStatCharacterTraced] << ", \"character_self_blocked\": " << v[kRtlsStatCharacterSelfBlocked]
       << ", \"temporal_pixels\": " << v[rtgi::kRtgiStatTemporalPixels] << ", \"no_history\": " << v[rtgi::kRtgiStatNoHistory]
       << ", \"reset_pixels\": " << v[rtgi::kRtgiStatResetPixels]
       << "},\n";

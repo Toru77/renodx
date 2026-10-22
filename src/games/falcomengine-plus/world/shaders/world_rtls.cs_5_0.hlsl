@@ -69,6 +69,9 @@ cbuffer cb_rtls : register(b12)
 #define RTLS_STAT_COUNT 96u
 #define RTLS_KIND_POINT 1u
 #define RTLS_KIND_SPOT 2u
+#define RTLS_KIND_CHARACTERS 4u
+#define RTLS_STAT_CHARACTER_TRACED 24u
+#define RTLS_STAT_CHARACTER_SELF_BLOCKED 25u
 #define RTLS_MAX_POINTS 10u
 #define RTLS_MAX_SPOTS 8u
 #define RTLS_PER_LIGHT_COUNT 32u
@@ -119,7 +122,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             InterlockedAdd(gs_stats[RTLS_STAT_NORMAL], 1u);
             cls = float3(1.0, 0.0, 1.0);
         }
-        else if ((mrt0.w & 8u) == 0u)
+        else if ((mrt0.w & 8u) == 0u && ((uint)g_rtls_fade.z & RTLS_KIND_CHARACTERS) == 0u)
         {
             InterlockedAdd(gs_stats[RTLS_STAT_CHARACTER], 1u);
             cls = float3(0.5, 0.5, 0.0);
@@ -148,6 +151,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             else
             {
                 InterlockedAdd(gs_stats[RTLS_STAT_TRACED], 1u);
+                // Character pixel (Receive on characters): lamps are weighted by charaColor, rays get the character bias.
+                const bool character = (mrt0.w & 8u) == 0u;
+                if (character) InterlockedAdd(gs_stats[RTLS_STAT_CHARACTER_TRACED], 1u);
 
                 // Cell index: the lighting shader's expression, kept word for word for the harness text check.
                 const float view_z = dot(view_g._m02_m12_m22_m32, float4(P, 1.0));
@@ -193,7 +199,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     if (spot) att *= LampSpotCone(lamp, dir);
                     if (att <= 0.0) continue;
                     const float ndl = dot(N, dir);
-                    float w = dot(lamp.color, float3(0.2126, 0.7152, 0.0722)) * att * max(ndl, lamp.translucency);
+                    float w = dot(character ? lamp.charaColor : lamp.color, float3(0.2126, 0.7152, 0.0722)) * att * max(ndl, lamp.translucency);
                     if (w <= 0.0) continue;
                     uint id = li | (ndl <= 0.0 ? RTLS_ID_BACKLIT : 0u);
                     considered++;
@@ -234,7 +240,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 const uint points_over = point_n - point_traced;
 
                 // Trace loop: one trace call site for points and spots.
-                const float ray_bias = g_rtls_params.y;
+                const float ray_bias = g_rtls_params.y + (character ? g_rtls_extra.y : 0.0);
                 const float light_size = g_rtls_light.x;
                 const float clearance = g_rtls_light.y;
                 const uint spp = max((uint)g_rtls_params.z, 1u);
@@ -248,6 +254,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint clipped_rays = 0u;
                 uint invalid = 0u;
                 uint overflow = 0u;
+                uint self_blocked = 0u;
                 [loop] for (uint k = 0u; k < spot_traced + point_traced; ++k)
                 {
                     const bool spot = k < spot_traced;
@@ -304,6 +311,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         else lamp_visible++;
                         const bool near = blocked && !clipped && hit.t > t_max - RTLS_NEAR_LIGHT_BAND;
                         if (near) near_rays++;
+                        if (character && blocked && hit.t < 0.1) self_blocked++;
                         if (li < RTLS_PER_LIGHT_COUNT)
                         {
                             InterlockedAdd(gs_stats[RTLS_STAT_PER_LIGHT_RAYS + li], 1u);
@@ -334,8 +342,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 InterlockedAdd(gs_stats[RTLS_STAT_INVALID_REFS], invalid);
                 InterlockedAdd(gs_stats[RTLS_STAT_STACK_OVERFLOW], overflow);
                 InterlockedAdd(gs_stats[RTLS_STAT_INDEX_OUT_OF_RANGE], out_of_range);
+                InterlockedAdd(gs_stats[RTLS_STAT_CHARACTER_SELF_BLOCKED], self_blocked);
 
-                cls = considered > 0u ? float3(1.0, 1.0, 1.0) : float3(0.0, 0.0, 0.0);
+                cls = character ? float3(1.0, 0.5, 0.0) : (considered > 0u ? float3(1.0, 1.0, 1.0) : float3(0.0, 0.0, 0.0));
                 if (debug_mode == 1) dbg = raw.xyz;
                 else if (debug_mode == 2) dbg = (min(considered, 10u) / 10.0).xxx;
                 else if (debug_mode == 3) dbg = float3(min(points_over + spots_over, 4u) / 4.0, min(traced_lights, 10u) / 10.0, 0.0);

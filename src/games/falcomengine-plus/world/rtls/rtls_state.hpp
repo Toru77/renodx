@@ -18,6 +18,9 @@ inline float g_rtls_env_point = 1.f;           // Env Point
 inline float g_rtls_env_spot = 1.f;            // Env Spot
 inline float g_rtls_strength = 1.f;            // Strength (lighting shader; no history reset)
 inline float g_rtls_max_darkening = 1.f;       // Max Darkening (lighting shader): shadow amount capped at this
+inline float g_rtls_characters = 0.f;              // Receive on characters
+inline float g_rtls_character_lamp = 1.f;          // Character Lamp Light (lighting shader only; no history reset)
+inline float g_rtls_character_normal_bias = 0.02f; // Character Normal Bias: extra ray offset on character pixels
 inline float g_rtls_samples = 1.f;             // Samples Per Light
 inline float g_rtls_max_point_lights = 6.f;    // Max Point Lights Per Pixel
 inline float g_rtls_ray_max = 16.f;            // Max Ray Distance
@@ -68,6 +71,7 @@ inline constexpr uint32_t kRtlsFlagPoint = 4u;
 inline constexpr uint32_t kRtlsFlagSpot = 8u;
 inline constexpr uint32_t kRtlsFlagEnvPoint = 16u;
 inline constexpr uint32_t kRtlsFlagEnvSpot = 32u;
+inline constexpr uint32_t kRtlsFlagCharacter = 64u;  // character pixels get the lamp light term
 
 // RTLS settings that shape the traced term; a change resets the RTLS history for one frame (rtao::TemporalResetReason).
 // Strength, Max Darkening and the spatial filter act after the history and are not part of it.
@@ -75,6 +79,7 @@ struct ParameterSnapshot {
   float samples, max_point_lights, ray_max, light_size, light_clearance, normal_bias, trace_characters, isfast;
   float point, spot, env_point, env_spot, fade_start, fade_end, trace_resolution;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
+  float characters, character_normal_bias;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 
