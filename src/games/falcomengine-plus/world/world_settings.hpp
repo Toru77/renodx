@@ -49,7 +49,7 @@ inline bool IsDevkitPresent() {
 
 // Temporal Accumulation and Denoising rows: one definition for RTAO and RTGI (same algorithm, separate values).
 struct TemporalRows {
-  const char* prefix;  // key prefix: "Rtao" or "Rtgi"
+  const char* prefix;  // key prefix: "Rtao", "Rtgi" or "Rtls"
   const char* section;
   const char* enabled_tooltip;
   float* enabled;
@@ -1191,7 +1191,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RT Local Shadows",
       .section = "RT Local Shadows",
-      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. Turning it on enables Live BVH and Deforming meshes. Applied to the image at full resolution with no denoising yet. While on, Contact Shadows Local Lights is greyed out and off, and the game's spot shadow maps are replaced inside the RT range (they return beyond Fade End).",
+      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. Turning it on enables Live BVH and Deforming meshes. Applied to the image after temporal accumulation, the spatial filter and the upsample. While on, Contact Shadows Local Lights is greyed out and off, and the game's spot shadow maps are replaced inside the RT range (they return beyond Fade End).",
       .labels = {"Off", "On"},
       .on_change_value = [](float, float current) {
         if (current > 0.5f) {
@@ -1220,8 +1220,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTLS Debug",
       .section = "RT Local Shadows",
-      .tooltip = "Session only (not saved). 1 shadow term (red point, green spot, blue coverage), 2 lamps lighting the pixel (white = 10), 3 red = lamps over the budget, green = lamps traced, 4 red = rays blocked within 0.5 m of the lamp, green = all blocked rays, 5 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond Fade End, white traced with lamps, black traced without). Dark purple = not traced.",
-      .labels = {"Off", "Raw shadow", "Lamps per pixel", "Traced / over budget", "Blocked near lamp", "Pixel classes"},
+      .tooltip = "Session only (not saved). 1 shadow term (red point, green spot, blue coverage), 2 lamps lighting the pixel (white = 10), 3 red = lamps over the budget, green = lamps traced, 4 red = rays blocked within 0.5 m of the lamp, green = all blocked rays, 5 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond Fade End, white traced with lamps, black traced without). Dark purple = not traced. 6 accumulated term after the temporal pass, 7 history confidence (both need RTLS Temporal on), 8 final term after the filter and the upsample (the value t38 holds); 6 and 8 show x / (1 + x) of the shadow term, so a full shadow reads 0.5.",
+      .labels = {"Off", "Raw shadow", "Lamps per pixel", "Traced / over budget", "Blocked near lamp", "Pixel classes", "Accumulated", "History confidence", "Final"},
       .is_visible = advanced,
   });
   settings->push_back(new Setting{
@@ -1300,6 +1300,17 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 1.f,
       .max = 4.f,
       .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtlsTraceResolution",
+      .binding = &rtls::g_rtls_trace_resolution,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Trace Resolution",
+      .section = "RT Local Shadows",
+      .tooltip = "Resolution of the RTLS trace: Full = one trace pixel per pixel, Half = one per 2 x 2 block, Quarter = one per 4 x 4 block. The denoiser upsamples to full size.",
+      .labels = {"Full", "Half", "Quarter"},
       .is_visible = visible,
   });
   settings->push_back(new Setting{
@@ -1384,6 +1395,34 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .section = "RT Local Shadows",
       .is_visible = visible,
   });
+  AddTemporalRows(settings, visible, {.prefix = "Rtls",
+                                      .section = "RTLS Temporal Accumulation",
+                                      .enabled_tooltip = "Reprojects the previous frame's RT local shadow term with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",
+                                      .enabled = &rtls::g_rtls_temporal_enabled,
+                                      .enabled_default = 1.f,
+                                      .history_weight = &rtls::g_rtls_history_weight,
+                                      .history_weight_default = 0.9f,
+                                      .depth_rejection = &rtls::g_rtls_depth_rejection,
+                                      .depth_rejection_default = 0.05f,
+                                      .normal_rejection = &rtls::g_rtls_normal_rejection,
+                                      .normal_rejection_default = 0.9f,
+                                      .history_clamp = &rtls::g_rtls_history_clamp,
+                                      .history_clamp_default = 1.f});
+  AddSpatialRows(settings, visible, {.prefix = "Rtls",
+                                     .section = "RTLS Denoising",
+                                     .enabled_tooltip = "Denoises the RT local shadow term at trace resolution with edge-aware weights (depth plane and normal), before the upsample. The history keeps the unfiltered term. Off = no filter.",
+                                     .enabled = &rtls::g_rtls_spatial_enabled,
+                                     .enabled_default = 1.f,
+                                     .filter_type = &rtls::g_rtls_filter_type,
+                                     .filter_type_default = 1.f,
+                                     .filter_radius = &rtls::g_rtls_filter_radius,
+                                     .filter_radius_default = 2.f,
+                                     .filter_passes = &rtls::g_rtls_filter_passes,
+                                     .filter_passes_default = 1.f,
+                                     .taps_separable = &rtls::g_rtls_filter_taps_separable,
+                                     .taps_separable_default = 5.f,
+                                     .taps_atrous = &rtls::g_rtls_filter_taps_atrous,
+                                     .taps_atrous_default = 5.f});
   settings->push_back(new Setting{
       .key = "RtlsFadeStartPct",
       .binding = &rtls::g_rtls_fade_start_pct,

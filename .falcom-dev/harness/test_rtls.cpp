@@ -360,6 +360,10 @@ static void TestJson() {
   CHECK(text.find("\"per_light\": [") != std::string::npos, "per_light array");
   CHECK(text.find("\"ray_max\": {") != std::string::npos, "ray_max object");
   CHECK(text.find("\"fade\": {") != std::string::npos, "fade object");
+  CHECK(text.find("\"temporal\": {") != std::string::npos && text.find("\"spatial_filter\": {") != std::string::npos,
+        "temporal and spatial_filter objects");
+  CHECK(text.find("\"divisor\": ") != std::string::npos && text.find("\"temporal_pixels\": ") != std::string::npos,
+        "trace divisor and temporal counters");
 }
 
 // Recording mock (same shape as test_rtgi's golden device): resource creation, descriptor tables and dispatches.
@@ -383,6 +387,11 @@ struct RecDevice : mock::DeviceBase {
     out->handle = next;
     next += 0x100;
     view_of[out->handle] = r.handle;
+    return true;
+  }
+  bool create_sampler(const sampler_desc &, sampler *out) override {
+    out->handle = next;
+    next += 0x100;
     return true;
   }
   void destroy_resource(resource r) override { res.erase(r.handle); }
@@ -422,10 +431,8 @@ struct RecCmdList : mock::CommandListBase {
   struct Snap { resource_view srv[32]; resource_view uav[8]; };
   std::vector<Snap> snaps;   // the slots at each dispatch
   std::vector<float> push;   // the last push of kRtlsPushConstantCount floats
-  int null_srv_pushes = 0;
-  int null_uav_pushes = 0;
-  uint32_t null_srv_count = 0u;
-  uint32_t null_uav_count = 0u;
+  std::vector<uint32_t> null_srv_counts;  // the count of each all-null SRV push, in order
+  std::vector<uint32_t> null_uav_counts;
   device *get_device() override { return dev; }
   void bind_pipeline(pipeline_stage, pipeline) override {}
   void bind_descriptor_tables(shader_stage, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table *tables) override {
@@ -450,14 +457,8 @@ struct RecCmdList : mock::CommandListBase {
       if (update.type == descriptor_type::texture_shader_resource_view) cs_srv[update.binding + i] = views[i];
       if (update.type == descriptor_type::texture_unordered_access_view) cs_uav[update.binding + i] = views[i];
     }
-    if (all_null && update.type == descriptor_type::texture_shader_resource_view) {
-      null_srv_pushes += 1;
-      null_srv_count = update.count;
-    }
-    if (all_null && update.type == descriptor_type::texture_unordered_access_view) {
-      null_uav_pushes += 1;
-      null_uav_count = update.count;
-    }
+    if (all_null && update.type == descriptor_type::texture_shader_resource_view) null_srv_counts.push_back(update.count);
+    if (all_null && update.type == descriptor_type::texture_unordered_access_view) null_uav_counts.push_back(update.count);
   }
   void barrier(uint32_t, const resource *, const resource_usage *, const resource_usage *) override {}
   void dispatch(uint32_t x, uint32_t y, uint32_t) override {
@@ -486,6 +487,9 @@ static void TestDeviceLifecycle() {
   in.light_indices_view = {0x7100u};
   in.full_width = 64u;
   in.full_height = 32u;
+  in.trace_width = 64u;
+  in.trace_height = 32u;
+  in.push.params[3] = 1.f;
   in.push.params[0] = 16.f;
   in.push.light[2] = 6.f;
   in.push.light[3] = 2.f;
@@ -493,13 +497,13 @@ static void TestDeviceLifecycle() {
   const rtls::RtlsDispatchResult result = rtls::Dispatch(&dev, &cl, in);
   CHECK(result.ok, "dispatch ok");
   CHECK(!result.debug_written, "debug 0: debug not written");
-  CHECK(cl.dispatches == 1, "one dispatch (%d)", cl.dispatches);
+  CHECK(cl.dispatches == 2, "trace and upsample (%d)", cl.dispatches);
   CHECK(cl.groups_x == 8u && cl.groups_y == 4u, "groups 8 x 4 (%u x %u)", cl.groups_x, cl.groups_y);
   const rtls::RtlsDeviceData& data = rtls::GetRtlsDeviceData(&dev);
   CHECK(data.raw.width == 64u && data.raw.height == 32u, "raw texture at trace size");
   CHECK(dev.res[data.raw.texture[0].handle].texture.format == format::r16g16b16a16_float, "raw is rgba16f");
   CHECK(data.debug.texture[0].handle == 0u, "no debug texture at debug 0");
-  CHECK(cl.snaps.size() == 1u, "one slot snapshot (%zu)", cl.snaps.size());
+  CHECK(cl.snaps.size() == 2u, "two slot snapshots (%zu)", cl.snaps.size());
   const RecCmdList::Snap& s0 = cl.snaps[0];
   CHECK(s0.srv[17].handle == 0x9200u, "t17 is the MRT normal");
   CHECK(s0.srv[19].handle == 0x9400u, "t19 is the P2b records view");
@@ -507,10 +511,12 @@ static void TestDeviceLifecycle() {
   CHECK(s0.srv[21].handle == 0x7100u, "t21 is the tile lists");
   CHECK(s0.uav[2].handle == data.raw.uav[0].handle && data.raw.uav[0].handle != 0u, "u2 is the raw UAV");
   CHECK(s0.uav[0].handle == 0u, "u0 null at debug 0");
-  CHECK(cl.null_srv_pushes == 1 && cl.null_srv_count == rtls::kRtlsSrvCount, "SRVs nulled (%d pushes, count %u)",
-        cl.null_srv_pushes, cl.null_srv_count);
-  CHECK(cl.null_uav_pushes == 1 && cl.null_uav_count == rtls::kRtlsUavCount, "UAVs nulled (%d pushes, count %u)",
-        cl.null_uav_pushes, cl.null_uav_count);
+  CHECK(cl.null_srv_counts.size() == 2u && cl.null_srv_counts[0] == rtls::kRtlsSrvCount
+            && cl.null_srv_counts[1] == falcom_world::rtgi::kRtgiUpsampleSrvCount,
+        "trace then upsample SRVs nulled (%zu pushes)", cl.null_srv_counts.size());
+  CHECK(cl.null_uav_counts.size() == 2u && cl.null_uav_counts[0] == rtls::kRtlsUavCount
+            && cl.null_uav_counts[1] == falcom_world::rtgi::kRtgiUpsampleUavCount,
+        "trace then upsample UAVs nulled (%zu pushes)", cl.null_uav_counts.size());
   int left_bound = 0;
   for (uint32_t i = 0; i < rtls::kRtlsSrvCount; ++i) left_bound += cl.cs_srv[i].handle != 0u ? 1 : 0;
   for (uint32_t i = 0; i < rtls::kRtlsUavCount; ++i) left_bound += cl.cs_uav[i].handle != 0u ? 1 : 0;
@@ -520,19 +526,111 @@ static void TestDeviceLifecycle() {
   if (cl.push.size() == rtls::kRtlsPushConstantCount) std::memcpy(&p2b_records, &cl.push[11], sizeof(uint32_t));
   CHECK(p2b_records == 3u, "fade[3] bits are the P2b record count (%u)", p2b_records);
   CHECK(cl.push.size() == rtls::kRtlsPushConstantCount && cl.push[24] == 2.f, "extra[0] is the character object count");
-  CHECK(dev.texture_creates == 1, "one texture at debug 0 (%d)", dev.texture_creates);
+  CHECK(dev.texture_creates == 3, "raw and the two denoise outputs at debug 0 (%d)", dev.texture_creates);
   in.debug_mode = 2;
   const rtls::RtlsDispatchResult debug_result = rtls::Dispatch(&dev, &cl, in);
   CHECK(debug_result.ok && debug_result.debug_written, "debug 2 writes the debug texture");
   CHECK(dev.res[rtls::GetRtlsDeviceData(&dev).debug.texture[0].handle].texture.format == format::r8g8b8a8_unorm,
         "debug texture is rgba8");
-  CHECK(cl.snaps.size() == 2u && cl.snaps[1].uav[0].handle == rtls::GetRtlsDeviceData(&dev).debug.uav[0].handle
-            && cl.snaps[1].uav[0].handle != 0u,
+  CHECK(cl.snaps.size() == 4u && cl.snaps[2].uav[0].handle == rtls::GetRtlsDeviceData(&dev).debug.uav[0].handle
+            && cl.snaps[2].uav[0].handle != 0u,
         "u0 is the debug UAV at debug 2");
-  CHECK(dev.texture_creates == 2, "debug 2 adds one texture, raw reused (%d)", dev.texture_creates);
+  CHECK(dev.texture_creates == 4, "debug 2 adds one texture, raw reused (%d)", dev.texture_creates);
+  CHECK(dev.res[rtls::GetRtlsDeviceData(&dev).denoise.output.texture[0].handle].texture.format == format::r8g8b8a8_unorm,
+        "denoise output is rgba8");
   rtls::DestroyRtlsDeviceData(&dev);
   CHECK(dev.res.empty(), "destroy releases every RTLS object (%zu left)", dev.res.size());
   CHECK(rtls::g_rtls_devices.find(&dev) == rtls::g_rtls_devices.end(), "device entry removed");
+}
+
+// REAL: rtls::Dispatch with the shared denoise chain on the recording mock (Half resolution, temporal and spatial).
+static void TestDenoiseDispatch() {
+  RecDevice dev;
+  RecCmdList cl;
+  cl.dev = &dev;
+  falcom_world::bvh::BvhDeviceData* bvh_data = falcom_world::bvh::GetBvhDeviceData(&dev);
+  bvh_data->dynamic.instances_srv = {0x9400u};
+  bvh_data->dynamic.instance_count = 0u;
+  rtls::RtlsDispatchInputs in = {};
+  in.depth_view = {0x9000u};
+  in.mrt_normal_view = {0x9200u};
+  in.scene_cbv_view = {0x9100u};
+  in.lights_view = {0x7000u};
+  in.light_indices_view = {0x7100u};
+  in.full_width = 64u;
+  in.full_height = 32u;
+  in.trace_width = 32u;
+  in.trace_height = 16u;
+  in.push.params[3] = 2.f;
+  in.motion_view = {0x9800u};
+  in.temporal = true;
+  in.temporal_push.size[3] = 1.f;
+  in.spatial = true;
+  in.filter_type = 1;
+  in.filter_radius = 2;
+  in.filter_passes = 1;
+  in.filter_taps = 5;
+  const rtls::RtlsDispatchResult first = rtls::Dispatch(&dev, &cl, in);
+  const rtls::RtlsDeviceData& data = rtls::GetRtlsDeviceData(&dev);
+  CHECK(first.ok && first.temporal_ran && first.filter_ran, "Half: temporal and filter ran");
+  CHECK(cl.dispatches == 4, "trace, temporal, filter, upsample (%d)", cl.dispatches);
+  CHECK(cl.push.size() == rtls::kRtlsPushConstantCount && cl.push[16] == 32.f && cl.push[17] == 16.f && cl.push[18] == 64.f
+            && cl.push[19] == 32.f && cl.push[3] == 2.f,
+        "trace push: trace 32x16, full 64x32, divisor 2");
+  CHECK(data.raw.width == 32u && data.raw.height == 16u, "raw at trace size");
+  CHECK(data.denoise.history_color.width == 32u && data.denoise.history_color.height == 16u, "history at trace size");
+  CHECK(data.denoise.output.width == 64u && data.denoise.output.height == 32u, "output at full size");
+  CHECK(data.denoise.history_index == 1u && data.denoise.output_index == 1u, "first run writes history 1 and output 1");
+  CHECK(cl.snaps.size() == 4u && cl.snaps[1].srv[0].handle == data.raw.srv[0].handle && cl.snaps[1].srv[3].handle == 0x9800u,
+        "temporal reads the raw term and the motion view");
+  CHECK(cl.snaps[3].srv[2].handle == data.denoise.filter.srv[2].handle, "upsample reads the filter output B");
+  CHECK(cl.snaps[3].uav[0].handle == data.denoise.output.uav[1].handle, "upsample writes output 1");
+  const rtls::RtlsDispatchResult second = rtls::Dispatch(&dev, &cl, in);
+  CHECK(second.ok && data.denoise.history_index == 0u && data.denoise.output_index == 0u, "second run swaps back to 0");
+  in.motion_view = {0u};
+  const rtls::RtlsDispatchResult no_motion = rtls::Dispatch(&dev, &cl, in);
+  CHECK(no_motion.ok && !no_motion.temporal_ran && cl.dispatches == 11, "no motion: trace, filter, upsample (%d)", cl.dispatches);
+  in.motion_view = {0x9800u};
+  in.debug_mode = 6;
+  const size_t debug_at = cl.snaps.size();
+  const rtls::RtlsDispatchResult debug6 = rtls::Dispatch(&dev, &cl, in);
+  CHECK(debug6.ok && debug6.debug_written, "Debug 6 written by the temporal pass");
+  CHECK(cl.snaps.size() == debug_at + 4u && cl.snaps[debug_at].uav[0].handle == 0u
+            && cl.snaps[debug_at + 1u].uav[3].handle == data.debug.uav[0].handle && data.debug.uav[0].handle != 0u,
+        "Debug 6: the trace has no debug UAV, the temporal pass has it at u3");
+  rtls::DestroyRtlsDeviceData(&dev);
+  CHECK(dev.res.empty(), "destroy releases every RTLS object (%zu left)", dev.res.size());
+}
+
+// Fields that must NOT be in rtls::ParameterSnapshot: they act after the history (lighting shader or spatial filter).
+template <typename T> concept SnapshotHasStrength = requires(T t) { t.strength; };
+template <typename T> concept SnapshotHasMaxDarkening = requires(T t) { t.max_darkening; };
+template <typename T> concept SnapshotHasSpatial = requires(T t) { t.spatial_enabled; } || requires(T t) { t.filter_type; }
+    || requires(T t) { t.filter_radius; } || requires(T t) { t.filter_passes; } || requires(T t) { t.filter_taps_separable; }
+    || requires(T t) { t.filter_taps_atrous; };
+
+static void TestParameterSnapshot() {
+  rtls::ParameterSnapshot a = {};
+  rtls::ParameterSnapshot b = {};
+  CHECK(a == b, "equal snapshots compare equal");
+  b.history_weight = 0.5f;
+  CHECK(!(a == b), "a history weight change is a parameter change");
+  b = a;
+  b.trace_resolution = 2.f;
+  CHECK(!(a == b), "a trace resolution change is a parameter change");
+  CHECK(!SnapshotHasStrength<rtls::ParameterSnapshot>, "Strength is not in the snapshot (no history reset)");
+  CHECK(!SnapshotHasMaxDarkening<rtls::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
+  CHECK(!SnapshotHasSpatial<rtls::ParameterSnapshot>, "no spatial filter field is in the snapshot");
+  // Exactly the 21 float fields of rtls_state.hpp; each one takes part in the comparison.
+  CHECK(sizeof(rtls::ParameterSnapshot) == 21u * sizeof(float), "snapshot is 21 floats (%zu bytes)", sizeof(rtls::ParameterSnapshot));
+  for (size_t i = 0u; i < 21u; ++i) {
+    rtls::ParameterSnapshot changed = {};
+    float fields[21] = {};
+    std::memcpy(fields, &changed, sizeof(fields));
+    fields[i] = 1.f;
+    std::memcpy(&changed, fields, sizeof(fields));
+    CHECK(!(changed == rtls::ParameterSnapshot{}), "field %zu takes part in the comparison", i);
+  }
 }
 
 int main() {
@@ -554,10 +652,14 @@ int main() {
   TestLightingApply();
   HStage("lighting math transcription");
   TestLightingMath();
+  HStage("parameter snapshot");
+  TestParameterSnapshot();
   HStage("json");
   TestJson();
   HStage("device lifecycle");
   TestDeviceLifecycle();
+  HStage("denoise dispatch (mock)");
+  TestDenoiseDispatch();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;
 }

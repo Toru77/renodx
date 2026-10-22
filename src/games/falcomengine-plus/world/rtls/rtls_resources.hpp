@@ -75,7 +75,8 @@ struct RtlsDeviceData {
   reshade::api::resource stats_buffer = {0u};
   reshade::api::resource_view stats_uav = {0u};
   rtgi::RtgiTextureSet<1> raw;    // rgba16f, trace size: x point shadow, y spot shadow, z coverage (fade), a 1 traced / -1 not
-  rtgi::RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, trace size; created while RTLS Debug is 1 to 5
+  rtgi::RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, full size; created while RTLS Debug is 1 to 8
+  rtgi::RtgiDenoiseSet denoise;   // output: r8g8b8a8_unorm, full size, read by the lighting shader at t38
   bvh::GpuTimer timer;
 };
 
@@ -89,6 +90,7 @@ inline void DestroyRtlsDeviceData(reshade::api::device* device) {
   RtlsDeviceData& data = found->second;
   rtgi::DestroyRtgiTextureSet(device, &data.raw);
   rtgi::DestroyRtgiTextureSet(device, &data.debug);
+  rtgi::DestroyRtgiDenoiseSet(device, &data.denoise);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
   bvh::DestroyGpuTimer(&data.timer);
   rtgi::DestroyRtgiPipeline(device, data.trace_pipeline);

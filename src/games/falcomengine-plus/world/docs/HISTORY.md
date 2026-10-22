@@ -41,6 +41,21 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M4b (denoise and trace resolution), implemented, not validated in game
+
+- Trace Resolution (Full, Half, Quarter; default Half): the RTLS trace runs at the trace size and writes the raw term at that size.
+- Shared RTGI denoise chain in world/rtgi: RtgiDenoiseSet, EnsureRtgiDenoise, DispatchRtgiDenoise, DestroyRtgiDenoiseSet, kRtgiUpsamplePipelineDesc. RTGI and RTLS both use it; the upsample gives the full-size r8g8b8a8_unorm output that the lighting shader reads at t38.
+- RTLS temporal uses rtao::TemporalResetReason over rtls::ParameterSnapshot (Strength, Max Darkening and the filter are not in it); the spatial filter is the RTAO filter plan.
+- UpdateRtMotion (addon.cpp) is shared by RTAO, RTLS and RTGI.
+- Motion: UpdateRtMotion (addon.cpp) is shared by RTAO, RTLS and RTGI. With RTAO off, RTLS now ensures the RTV4 motion view and sets the motion state in rtao::g_rtao_frame (motion size check, TAA t3 conflict latch); the one-shot "[world-rtao] motion ..." log lines can then come from RTLS (prefix unchanged on purpose). RTGI's call repeats RTAO's update of the same frame and changes nothing.
+- RTLS Debug 6 accumulated, 7 history confidence, 8 final; 1 to 5 fill their trace block.
+- Settings: RTLS Trace Resolution, RTLS Temporal Accumulation rows (History Weight 0.90, Depth Rejection 0.05, Normal Rejection 0.90, History Clamp 1) and RTLS Denoising rows (a-trous, radius 2, 1 pass, 5 taps). RT Local Shadows and its sub-sections are mapped to the Ray Tracing tab (settings_ui.h).
+- Fix (M2 bug, owner report): the "RT Local Shadows" and "RTLS Distance Fade" sections were not in kSectionCategory (settings_ui.h) and appeared under the General tab. All four RTLS sections ("RT Local Shadows", "RTLS Temporal Accumulation", "RTLS Denoising", "RTLS Distance Fade") now map to Ray Tracing. Placement only; saved values unchanged.
+- Fix: RunRtlsInline resets frame.input_reason every call; before, world_rtls.json could keep the guard name of an earlier failure after RTLS recovered. The panel was not affected.
+- test_rtgi golden unchanged (0x22868adf1653e774, 16 dispatches).
+- Harness: test_rtls PASS (0 failures); test_rtgi PASS (0 failures). Allowed failures only: test_rtao.cpp:1881, test_live 2758/3009/3470, test_motion 1091.
+- Owner checks (DevKit build, M0 night scene): 1 RTGI unchanged vs M3 (Debug 6 screenshot, GPU ms); 2 RTAO goes Off to On and reaches active, one "[world-rtao] motion" log line; 3 RTLS defaults, standing still: penumbrae smooth, compare with Temporal Off and Spatial Off; 4 motion: walk past a lamp, rotate the camera, character under a lamp with Trace characters (lower History Weight to 0.8 if ghosting); 5 Trace Resolution Full, Half, Quarter: edge sharpness and RTLS and Denoise GPU ms; 6 Debug 6, 7, 8 screenshots, 1 to 5 fill the screen at Half and Quarter; 7 change Light Size: "parameters" reset briefly; after a map load reset counts show frame_gap or guard; 8 send screenshots, GPU ms at Full, Half, Quarter, world_rtls.json and panel text; 9 Settings: the RT Local Shadows, RTLS Temporal Accumulation, RTLS Denoising and RTLS Distance Fade sections are on the Ray Tracing tab, and no RTLS row is left on General.
+
 ## RT Local Shadows: M3 (applied in the lighting shader), implemented, not validated in game
 
 - The Sora 2nd lighting shader reads this frame's RTLS term at t38 (the M2 raw texture, full resolution, no denoising): x point shadow, y spot shadow, z RT coverage. RunRtlsInline binds it with `push_rtls` (on the dispatch and on a second lighting draw of the frame) and sets `shader_injection.rtls_flags` (kRtlsFlag*: Requested 1, Bound 2, Point 4, Spot 8, EnvPoint 16, EnvSpot 32), `rtls_strength` and `rtls_max_darkening`. The three fields reuse the retired `local_sss_enabled/strength/light_type` slots; ShaderInjectData stays 439 floats = 1756 bytes (the old "440 floats = 1760 bytes" comment in shared.h was stale and is corrected).

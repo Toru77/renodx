@@ -229,6 +229,11 @@ struct RtgiPipelineDesc {
   const char* name;                    // log name
 };
 
+// The upsample pipeline: ensured by the trace owner right after its trace pipeline (RTGI and RTLS keep this order).
+inline constexpr RtgiPipelineDesc kRtgiUpsamplePipelineDesc = {.srv_count = kRtgiUpsampleSrvCount, .uav_count = kRtgiUpsampleUavCount,
+                                                              .sampler_count = 0u, .push_count = kRtgiUpsamplePushCount,
+                                                              .code = kRtgiUpsampleShader, .name = "upsample"};
+
 // Creates one RTGI-layout compute pipeline on first use (RtgiPipeline layout); a failure is latched and logged once.
 inline bool EnsureRtgiPipeline(reshade::api::device* device, RtgiPipeline* p, const RtgiPipelineDesc& desc) {
   if (p->pipeline.handle != 0u) return true;
@@ -326,14 +331,25 @@ inline bool EnsureRtgiTextureSet(reshade::api::device* device, RtgiTextureSet<Co
   return true;
 }
 
-struct RtgiDeviceData {
-  RtgiPipeline trace_pipeline;
+// The objects of the shared denoise chain (temporal, spatial filter, upsample); RTGI and RT Local Shadows each own one.
+struct RtgiDenoiseSet {
   RtgiPipeline temporal_pipeline;
   RtgiPipeline filter_pipeline;
   RtgiPipeline upsample_pipeline;
-  RtgiPipeline lamp_type_pipeline;
   reshade::api::sampler point_sampler = {0u};
   reshade::api::sampler linear_sampler = {0u};
+  RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated value, a = distance (0 = invalid)
+  RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal
+  uint32_t history_index = 0u;       // history[history_index] is read by the temporal pass; the other one is written
+  RtgiTextureSet<3> filter;          // rgba16f, trace size: F0, F1, B; created while the spatial filter is on
+  RtgiTextureSet<2> output;          // full size, the owner's format (RTGI r11g11b10_float, RTLS r8g8b8a8_unorm)
+  uint32_t output_index = 0u;        // output[output_index] is the newest
+  bvh::GpuTimer timer = {};          // temporal, filter and upsample
+};
+
+struct RtgiDeviceData {
+  RtgiPipeline trace_pipeline;
+  RtgiPipeline lamp_type_pipeline;
   reshade::api::resource stats_buffer = {0u};
   reshade::api::resource_view stats_uav = {0u};
   reshade::api::resource lamp_types = {0u};  // one uint per lamp: bit 1 point, bit 2 spot (kRtgiLampCount)
@@ -341,12 +357,7 @@ struct RtgiDeviceData {
   reshade::api::resource_view lamp_types_srv = {0u};
   RtgiTextureSet<1> debug;  // r8g8b8a8_unorm, depth size; created while RTGI Debug is 1 to 10
   RtgiTextureSet<1> raw;    // rgba16f, trace size: rgb GI, a = 1 traced, -1 not traced
-  RtgiTextureSet<2> history_color;   // rgba16f, trace size: rgb accumulated GI, a = distance (0 = invalid)
-  RtgiTextureSet<2> history_normal;  // r16g16_float, trace size: octahedral normal
-  uint32_t history_index = 0u;       // history[history_index] is read by the temporal pass; the other one is written
-  RtgiTextureSet<3> filter;          // rgba16f, trace size: F0, F1, B; created while RTGI Spatial Filter is on
-  RtgiTextureSet<2> final_gi;        // r11g11b10_float, depth size: the upsampled GI
-  uint32_t final_index = 0u;         // final_gi[final_index] is the newest
+  RtgiDenoiseSet denoise;   // output: r11g11b10_float, the upsampled GI
   reshade::api::resource radiance_texture = {0u};
   reshade::api::resource_view radiance_srv = {0u};
   uint32_t radiance_width = 0u;
@@ -360,7 +371,6 @@ struct RtgiDeviceData {
   uint64_t light_indices_copy_bytes = 0u;
   bool lights_copied = false;  // the last dispatch copied both light buffers
   bvh::GpuTimer timer = {};
-  bvh::GpuTimer denoise_timer = {};  // temporal, filter and upsample
 };
 
 // One entry per device (destroyed with the device).
@@ -378,16 +388,27 @@ inline void DestroyRtgiPipeline(reshade::api::device* device, const RtgiPipeline
   if (p.layout.handle != 0u) device->destroy_pipeline_layout(p.layout);
 }
 
+// Destroys a denoise set (DestroyRtgiDeviceData and DestroyRtlsDeviceData).
+inline void DestroyRtgiDenoiseSet(reshade::api::device* device, RtgiDenoiseSet* set) {
+  DestroyRtgiTextureSet(device, &set->history_color);
+  DestroyRtgiTextureSet(device, &set->history_normal);
+  DestroyRtgiTextureSet(device, &set->filter);
+  DestroyRtgiTextureSet(device, &set->output);
+  bvh::DestroyGpuTimer(&set->timer);
+  if (set->point_sampler.handle != 0u) device->destroy_sampler(set->point_sampler);
+  if (set->linear_sampler.handle != 0u) device->destroy_sampler(set->linear_sampler);
+  DestroyRtgiPipeline(device, set->temporal_pipeline);
+  DestroyRtgiPipeline(device, set->filter_pipeline);
+  DestroyRtgiPipeline(device, set->upsample_pipeline);
+}
+
 inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   const auto found = g_rtgi_devices.find(device);
   if (found == g_rtgi_devices.end()) return;
   RtgiDeviceData& data = found->second;
   DestroyRtgiTextureSet(device, &data.debug);
   DestroyRtgiTextureSet(device, &data.raw);
-  DestroyRtgiTextureSet(device, &data.history_color);
-  DestroyRtgiTextureSet(device, &data.history_normal);
-  DestroyRtgiTextureSet(device, &data.filter);
-  DestroyRtgiTextureSet(device, &data.final_gi);
+  DestroyRtgiDenoiseSet(device, &data.denoise);
   bvh::DestroyBuffer(device, &data.radiance_srv, &data.radiance_texture);
   bvh::DestroyBuffer(device, &data.stats_uav, &data.stats_buffer);
   bvh::DestroyBuffer(device, &data.lamp_types_srv, nullptr);
@@ -395,13 +416,7 @@ inline void DestroyRtgiDeviceData(reshade::api::device* device) {
   bvh::DestroyBuffer(device, nullptr, &data.lights_copy);
   bvh::DestroyBuffer(device, nullptr, &data.light_indices_copy);
   bvh::DestroyGpuTimer(&data.timer);
-  bvh::DestroyGpuTimer(&data.denoise_timer);
-  if (data.point_sampler.handle != 0u) device->destroy_sampler(data.point_sampler);
-  if (data.linear_sampler.handle != 0u) device->destroy_sampler(data.linear_sampler);
   DestroyRtgiPipeline(device, data.trace_pipeline);
-  DestroyRtgiPipeline(device, data.temporal_pipeline);
-  DestroyRtgiPipeline(device, data.filter_pipeline);
-  DestroyRtgiPipeline(device, data.upsample_pipeline);
   DestroyRtgiPipeline(device, data.lamp_type_pipeline);
   g_rtgi_devices.erase(found);
 }

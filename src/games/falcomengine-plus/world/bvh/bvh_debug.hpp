@@ -261,8 +261,11 @@ inline void OnWorldPresentBvh(
     ClearPerfGathered(GetBvhDeviceData(device));
     rtao::ClearRtaoPerfGathered(device);
     rtgi::ClearRtgiPerfGathered(device);
-    ClearGpuTimerStats(&rtls::GetRtlsDeviceData(device).timer);
+    rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
+    ClearGpuTimerStats(&rtls_data.timer);
+    ClearGpuTimerStats(&rtls_data.denoise.timer);
     rtls::g_rtls_frame.gpu_ms = -1.f;
+    rtls::g_rtls_frame.denoise_gpu_ms = -1.f;
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
@@ -282,7 +285,7 @@ inline void OnWorldPresentBvh(
     {
       const rtgi::RtgiDeviceData& rtgi_data = rtgi::GetRtgiDeviceData(device);
       extra.rtgi = {rtgi_data.timer.ms_sum, rtgi_data.timer.samples};
-      extra.rtgi_denoise = {rtgi_data.denoise_timer.ms_sum, rtgi_data.denoise_timer.samples};
+      extra.rtgi_denoise = {rtgi_data.denoise.timer.ms_sum, rtgi_data.denoise.timer.samples};
     }
     {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);

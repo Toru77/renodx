@@ -344,7 +344,18 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
         }
         InterlockedAdd(gs_stats[RTLS_STAT_PIXELS], 1u);
         g_rtls_raw[tp] = raw;
-        if (debug_mode >= 1 && debug_mode <= 5) g_rtls_debug[tp] = float4(debug_mode == 5 ? cls : dbg, 1.0);
+        if (debug_mode >= 1 && debug_mode <= 5)
+        {
+            // The debug texture is full size: the trace pixel fills its d x d block.
+            for (uint by = 0u; by < d; ++by)
+            {
+                for (uint bx = 0u; bx < d; ++bx)
+                {
+                    const uint2 block_px = tp * d + uint2(bx, by);
+                    if (all(block_px < full)) g_rtls_debug[block_px] = float4(debug_mode == 5 ? cls : dbg, 1.0);
+                }
+            }
+        }
     }
 
     GroupMemoryBarrierWithGroupSync();

@@ -28,6 +28,18 @@ inline float g_rtls_trace_characters = 1.f;    // Trace characters
 inline float g_rtls_isfast = 1.f;              // IS-FAST Noise
 inline float g_rtls_fade_start_pct = 12.5f;    // Fade Start (RTLS Distance Fade)
 inline float g_rtls_fade_end_pct = 25.f;       // Fade End (RTLS Distance Fade)
+inline float g_rtls_trace_resolution = 1.f;    // Trace Resolution: 0 Full, 1 Half, 2 Quarter
+inline float g_rtls_temporal_enabled = 1.f;    // RTLS Temporal Accumulation rows
+inline float g_rtls_history_weight = 0.9f;
+inline float g_rtls_depth_rejection = 0.05f;
+inline float g_rtls_normal_rejection = 0.9f;
+inline float g_rtls_history_clamp = 1.f;
+inline float g_rtls_spatial_enabled = 1.f;     // RTLS Denoising rows
+inline float g_rtls_filter_type = 1.f;         // 0 separable bilateral, 1 a-trous
+inline float g_rtls_filter_radius = 2.f;
+inline float g_rtls_filter_passes = 1.f;
+inline float g_rtls_filter_taps_separable = 5.f;
+inline float g_rtls_filter_taps_atrous = 5.f;
 
 enum class Reason : uint8_t { Off = 0, NotSora2nd, InputsMissing, DeferredList, RangeTooSmall, NoLights, NoKinds, PipelineFailed };
 
@@ -56,5 +68,14 @@ inline constexpr uint32_t kRtlsFlagPoint = 4u;
 inline constexpr uint32_t kRtlsFlagSpot = 8u;
 inline constexpr uint32_t kRtlsFlagEnvPoint = 16u;
 inline constexpr uint32_t kRtlsFlagEnvSpot = 32u;
+
+// RTLS settings that shape the traced term; a change resets the RTLS history for one frame (rtao::TemporalResetReason).
+// Strength, Max Darkening and the spatial filter act after the history and are not part of it.
+struct ParameterSnapshot {
+  float samples, max_point_lights, ray_max, light_size, light_clearance, normal_bias, trace_characters, isfast;
+  float point, spot, env_point, env_spot, fade_start, fade_end, trace_resolution;
+  float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
+  bool operator==(const ParameterSnapshot&) const = default;
+};
 
 }  // namespace falcom_world::rtls

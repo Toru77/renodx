@@ -14,7 +14,7 @@
 
 #include "../bvh/bvh_trace.hpp"
 #include "../rtao/rtao.hpp"
-#include "../rtgi/rtgi_resources.hpp"
+#include "../rtgi/rtgi.hpp"
 #include "../world_state.hpp"
 #include "rtls_resources.hpp"
 #include "rtls_state.hpp"
@@ -32,6 +32,7 @@ struct RtlsFrameState {
   float gpu_ms = -1.f;
   uint32_t trace_width = 0u;
   uint32_t trace_height = 0u;
+  uint32_t divisor = 1u;
   float ray_max_requested = 0.f;
   float ray_max_effective = 0.f;
   bool fade_valid = false;
@@ -40,6 +41,15 @@ struct RtlsFrameState {
   uint32_t kinds = 0u;
   uint32_t character_objects = 0u;
   uint64_t texture_bytes = 0u;
+  float denoise_gpu_ms = -1.f;        // temporal, filter and upsample (negative: none yet)
+  bool temporal_ran = false;
+  bool temporal_last = false;         // Temporal was on and ran in the last frame that ran the reset rule
+  bool filter_ran = false;
+  rtao::ResetReason reset = rtao::ResetReason::Disabled;
+  rtao::ResetReason last_reset = rtao::ResetReason::Disabled;
+  uint64_t reset_counts[static_cast<size_t>(rtao::ResetReason::Count)] = {};
+  bool prev_params_valid = false;
+  ParameterSnapshot prev_params = {};
 };
 inline RtlsFrameState g_rtls_frame;
 struct RtlsStatsState { std::atomic_bool requested{false}; bool valid = false; uint32_t values[kRtlsStatsCount] = {}; };
@@ -54,22 +64,33 @@ struct RtlsDispatchInputs {
   reshade::api::resource_view light_indices_view = {0u};
   uint32_t full_width = 0u;
   uint32_t full_height = 0u;
-  RtlsPushConstants push = {};
-  int debug_mode = 0;
+  uint32_t trace_width = 0u;
+  uint32_t trace_height = 0u;
+  RtlsPushConstants push = {};      // params[3] is the trace divisor
+  int debug_mode = 0;               // RTLS Debug: 1-5 trace views, 6-8 denoise views
   bvh::DynamicTraceInputs dynamic = {};
+  reshade::api::resource_view motion_view = {0u};  // null: the temporal pass does not run
+  bool temporal = false;
+  rtgi::RtgiTemporalPushConstants temporal_push = {};  // params and size[3] (history valid) set by the caller
+  bool spatial = false;
+  int filter_type = 1;
+  int filter_radius = 2;
+  int filter_passes = 1;
+  int filter_taps = 5;
 };
-struct RtlsDispatchResult { bool ok = false; bool debug_written = false; };
+struct RtlsDispatchResult { bool ok = false; bool debug_written = false; bool temporal_ran = false; bool filter_ran = false; };
 
 inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtlsDispatchInputs& in) {
   auto* bvh_data = bvh::GetBvhDeviceData(device);
   RtlsDeviceData& data = GetRtlsDeviceData(device);
-  if (bvh_data == nullptr || in.full_width == 0u || in.full_height == 0u) return {};
+  if (bvh_data == nullptr || in.full_width == 0u || in.full_height == 0u || in.trace_width == 0u || in.trace_height == 0u) return {};
   if (!rtgi::EnsureRtgiPipeline(device, &data.trace_pipeline, {.srv_count = kRtlsSrvCount, .uav_count = kRtlsUavCount, .sampler_count = 0u,
-                                                               .push_count = kRtlsPushConstantCount, .code = kRtlsTraceShader, .name = "rtls_trace"})) {
+                                                               .push_count = kRtlsPushConstantCount, .code = kRtlsTraceShader, .name = "rtls_trace"})
+      || !rtgi::EnsureRtgiPipeline(device, &data.denoise.upsample_pipeline, rtgi::kRtgiUpsamplePipelineDesc)) {
     return {};
   }
-  const uint32_t zeros[kRtlsStatsCount] = {};
   if (data.stats_buffer.handle == 0u) {
+    const uint32_t zeros[kRtlsStatsCount] = {};
     if (!bvh::CreatePoolBuffer(
             device, zeros, sizeof(zeros), sizeof(uint32_t),
             &data.stats_buffer, &data.stats_uav,
@@ -77,26 +98,38 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
       return {};
     }
   }
-  bool debug_ready = in.debug_mode >= 1 && in.debug_mode <= 5;
+  bool debug_ready = in.debug_mode >= 1 && in.debug_mode <= 8;
   if (debug_ready && !rtgi::EnsureRtgiTextureSet(device, &data.debug, reshade::api::format::r8g8b8a8_unorm, 4u, in.full_width, in.full_height)) {
     renodx::utils::log::w("[world-rtls] debug texture creation failed");
     debug_ready = false;
   }
-  if (!rtgi::EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.full_width, in.full_height)) {
+  const bool trace_debug = debug_ready && in.debug_mode <= 5;
+  if (!rtgi::EnsureRtgiTextureSet(device, &data.raw, reshade::api::format::r16g16b16a16_float, 8u, in.trace_width, in.trace_height)) {
     renodx::utils::log::w("[world-rtls] raw texture creation failed");
     return {};
   }
+  const rtgi::RtgiDenoiseReady denoise = rtgi::EnsureRtgiDenoise(device, &data.denoise,
+                                                                 {.output_format = reshade::api::format::r8g8b8a8_unorm,
+                                                                  .output_bytes_per_pixel = 4u,
+                                                                  .trace_width = in.trace_width,
+                                                                  .trace_height = in.trace_height,
+                                                                  .full_width = in.full_width,
+                                                                  .full_height = in.full_height,
+                                                                  .temporal = in.temporal && in.motion_view.handle != 0u,
+                                                                  .spatial = in.spatial,
+                                                                  .log_prefix = "[world-rtls]"});
+  if (!denoise.ok) return {};
 
   RtlsPushConstants push = in.push;
-  push.size[0] = static_cast<float>(in.full_width);
-  push.size[1] = static_cast<float>(in.full_height);
+  push.size[0] = static_cast<float>(in.trace_width);
+  push.size[1] = static_cast<float>(in.trace_height);
   push.size[2] = static_cast<float>(in.full_width);
   push.size[3] = static_cast<float>(in.full_height);
-  push.params[3] = 1.f;
   std::memcpy(&push.fade[3], &bvh_data->dynamic.instance_count, sizeof(uint32_t));  // P2b records (t19)
   push.extra[0] = static_cast<float>(in.dynamic.count);
 
   // Whole-buffer write (offset 0, full size): see WriteBufferRange in bvh_resources.hpp.
+  const uint32_t zeros[kRtlsStatsCount] = {};
   device->update_buffer_region(zeros, data.stats_buffer, 0u, sizeof(zeros));
 
   bvh::BeginGpuTimer(device, cmd_list, &data.timer);
@@ -109,7 +142,7 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   srvs[20] = in.lights_view;
   srvs[21] = in.light_indices_view;
   const reshade::api::resource_view uavs[kRtlsUavCount] = {
-      debug_ready ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
+      trace_debug ? data.debug.uav[0] : reshade::api::resource_view{0u}, data.stats_uav, data.raw.uav[0]};
   const reshade::api::descriptor_type kCbv = reshade::api::descriptor_type::constant_buffer;
   const reshade::api::descriptor_type kSrv = reshade::api::descriptor_type::shader_resource_view;
   const reshade::api::descriptor_type kUav = reshade::api::descriptor_type::unordered_access_view;
@@ -123,22 +156,59 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
   const reshade::api::descriptor_table tables[3] = {trace.cbv_table, trace.srv_table, trace.uav_table};
   cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, trace.layout, 0, 3, tables);
   cmd_list->push_constants(reshade::api::shader_stage::all_compute, trace.layout, 3, 0, kRtlsPushConstantCount, &push);
-  cmd_list->dispatch((in.full_width + 7u) / 8u, (in.full_height + 7u) / 8u, 1u);
+  cmd_list->dispatch((in.trace_width + 7u) / 8u, (in.trace_height + 7u) / 8u, 1u);
   rtao::NullComputeSlots(cmd_list, kRtlsSrvCount, kRtlsUavCount, 0u);
-  if (debug_ready) {
+  if (trace_debug) {
     cmd_list->barrier(data.debug.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   }
   cmd_list->barrier(data.raw.texture[0], reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::shader_resource);
   bvh::EndGpuTimer(cmd_list, &data.timer);
 
-  // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV table keeps its view.
+  // RTLS Debug 6 to 8 are the chain's views 4 (accumulated), 5 (history confidence) and 6 (final, after the upsample).
+  int denoise_debug = 0;
+  switch (in.debug_mode) {
+    case 6: denoise_debug = 4; break;
+    case 7: denoise_debug = 5; break;
+    case 8: denoise_debug = 6; break;
+    default: break;
+  }
   const reshade::api::resource_view table_null_views[kRtlsSrvCount] = {};
-  const reshade::api::descriptor_table_update table_nulls[2] = {
+  std::vector<reshade::api::descriptor_table_update> table_nulls = {
       {trace.srv_table, 0, 0, kRtlsSrvCount, kSrv, table_null_views},
       {trace.uav_table, 0, 0, kRtlsUavCount, kUav, table_null_views},
   };
-  device->update_descriptor_tables(2, table_nulls);
-  return {.ok = true, .debug_written = debug_ready};
+  const rtgi::RtgiDenoiseResult denoised = rtgi::DispatchRtgiDenoise(
+      device, cmd_list, &data.denoise,
+      {.raw_view = data.raw.srv[0],
+       .depth_view = in.depth_view,
+       .mrt_normal_view = in.mrt_normal_view,
+       .scene_cbv_view = in.scene_cbv_view,
+       .motion_view = in.motion_view,
+       .albedo_view = reshade::api::resource_view{0u},
+       .stats_uav = data.stats_uav,
+       .debug_uav = debug_ready && denoise_debug != 0 ? data.debug.uav[0] : reshade::api::resource_view{0u},
+       .debug_texture = data.debug.texture[0],
+       .trace_width = in.trace_width,
+       .trace_height = in.trace_height,
+       .full_width = in.full_width,
+       .full_height = in.full_height,
+       .divisor = in.push.params[3],
+       .debug_mode = denoise_debug,
+       .temporal_push = in.temporal_push,
+       .filter_type = in.filter_type,
+       .filter_radius = in.filter_radius,
+       .filter_passes = in.filter_passes,
+       .filter_taps = in.filter_taps,
+       .upsample_intensity = 1.f,
+       .upsample_char_intensity = 1.f,
+       .upsample_saturation = 1.f},
+      denoise, &table_nulls);
+  // App-side tables: null contents (ReShade keeps descriptors in the table object). The CBV tables keep their view.
+  device->update_descriptor_tables(static_cast<uint32_t>(table_nulls.size()), table_nulls.data());
+  return {.ok = true,
+          .debug_written = trace_debug || denoised.temporal_debug || denoised.upsample_debug,
+          .temporal_ran = denoise.temporal,
+          .filter_ran = denoise.spatial};
 }
 
 struct RtlsJsonInput {
@@ -158,7 +228,20 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
   out << "  \"input_reason\": \"" << rtao::ReasonName(f.input_reason) << "\",\n";
   out << "  \"producing\": " << (f.producing ? "true" : "false") << ",\n";
   out << "  \"gpu_ms\": " << f.gpu_ms << ",\n";
-  out << "  \"trace\": {\"width\": " << f.trace_width << ", \"height\": " << f.trace_height << "},\n";
+  out << "  \"trace\": {\"divisor\": " << f.divisor << ", \"width\": " << f.trace_width << ", \"height\": " << f.trace_height << "},\n";
+  out << "  \"denoise_gpu_ms\": " << f.denoise_gpu_ms << ",\n";
+  out << "  \"temporal\": {\"on\": " << (g_rtls_temporal_enabled > 0.5f ? "true" : "false")
+      << ", \"ran\": " << (f.temporal_ran ? "true" : "false")
+      << ", \"reset\": \"" << rtao::ResetReasonName(f.reset) << "\""
+      << ", \"last_reset\": \"" << rtao::ResetReasonName(f.last_reset) << "\", \"reset_counts\": [";
+  for (size_t r = 0; r < static_cast<size_t>(rtao::ResetReason::Count); ++r) {
+    out << (r == 0u ? "" : ", ") << f.reset_counts[r];
+  }
+  out << "]},\n";
+  out << "  \"spatial_filter\": {\"on\": " << (g_rtls_spatial_enabled > 0.5f ? "true" : "false")
+      << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"type\": " << g_rtls_filter_type
+      << ", \"radius\": " << g_rtls_filter_radius << ", \"passes\": " << g_rtls_filter_passes
+      << ", \"taps\": " << (g_rtls_filter_type > 0.5f ? g_rtls_filter_taps_atrous : g_rtls_filter_taps_separable) << "},\n";
   out << "  \"ray_max\": {\"requested\": " << f.ray_max_requested << ", \"effective\": " << f.ray_max_effective << "},\n";
   out << "  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
       << ", \"coverage\": " << f.fade.coverage << ", \"requested_start\": " << f.fade.start_req
@@ -171,7 +254,8 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
       << ", \"light_size\": " << g_rtls_light_size << ", \"light_clearance\": " << g_rtls_light_clearance
       << ", \"normal_bias\": " << g_rtls_normal_bias << ", \"trace_characters\": " << g_rtls_trace_characters
       << ", \"point\": " << g_rtls_point << ", \"spot\": " << g_rtls_spot << ", \"env_point\": " << g_rtls_env_point
-      << ", \"env_spot\": " << g_rtls_env_spot << "},\n";
+      << ", \"env_spot\": " << g_rtls_env_spot
+      << ", \"trace_resolution\": " << g_rtls_trace_resolution << "},\n";
   out << "  \"stats\": {\"pixels\": " << v[kRtlsStatPixels] << ", \"traced\": " << v[kRtlsStatTraced]
       << ", \"sky\": " << v[kRtlsStatSky] << ", \"normal\": " << v[kRtlsStatNormal]
       << ", \"region\": " << v[kRtlsStatRegion] << ", \"beyond_fade\": " << v[kRtlsStatBeyondFade]
@@ -182,6 +266,8 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
       << ", \"rays_blocked\": " << v[kRtlsStatRaysBlocked] << ", \"rays_near_light\": " << v[kRtlsStatRaysNearLight]
       << ", \"rays_clipped\": " << v[kRtlsStatRaysClipped] << ", \"invalid_refs\": " << v[kRtlsStatInvalidRefs]
       << ", \"stack_overflow\": " << v[kRtlsStatStackOverflow] << ", \"index_out_of_range\": " << v[kRtlsStatIndexOutOfRange]
+      << ", \"temporal_pixels\": " << v[rtgi::kRtgiStatTemporalPixels] << ", \"no_history\": " << v[rtgi::kRtgiStatNoHistory]
+      << ", \"reset_pixels\": " << v[rtgi::kRtgiStatResetPixels]
       << "},\n";
   out << "  \"per_light\": [";
   bool first = true;

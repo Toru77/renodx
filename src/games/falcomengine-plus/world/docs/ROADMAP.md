@@ -50,6 +50,7 @@ Implemented, not validated in game. Each feature's owner test list is in its HIS
 | Panel cleanup | Panel lines moved to JSON | HISTORY: Panel cleanup |
 | RT Local Shadows M2 (trace and discovery; image unchanged) | Owner list in HISTORY: RT Local Shadows M2 | Reference: RT Local Shadows |
 | RT Local Shadows M3 (applied in the lighting shader, full resolution, raw) | Owner list in HISTORY: RT Local Shadows M3 | Reference: RT Local Shadows |
+| RT Local Shadows M4b (denoise and trace resolution) | Owner list in HISTORY: RT Local Shadows M4b | Reference: RT Local Shadows |
 | TLAS rebuild reduction (skip no-op, slack TLAS, default OFF) | A/B in game | HISTORY: TLAS rebuild reduction (cache-diag-2) |
 | Cache diagnostics (Phase 0, 0b) | Dump twice; placement compare | HISTORY: Phase 0 cache diagnostics; Step 0b (cache-diag-1) |
 | Refit and drain cleanup; refit diet; rebuild diet; housekeeping | Regression only; no pins changed | HISTORY: Refit and drain cleanup; Rebuild diet; Refit diet; Housekeeping |
@@ -232,6 +233,7 @@ What to send back after a session: the RTAO status panel lines, `world_rtao.json
 - Debug views (RTLS Debug, session only): 1 shadow term, 2 lamps per pixel, 3 over budget and traced, 4 blocked near the lamp, 5 pixel classes. RTGI Debug draws over RTLS Debug when both are set.
 - `world_rtls.json` is written by Read RTLS Stats (schema 1; stats, per_light, settings, fade and ray max).
 - M3: applied in the Sora 2nd lighting shader (t38 = the raw term, full resolution, no denoising). Flags in shader_injection.rtls_flags (kRtlsFlag*): Requested turns the local contact march off (the Contact Shadows Local Lights rows are greyed while RTLS is on); Bound, then Point/Spot (specular material path) and EnvPoint/EnvSpot (diffuse-only path) select the kinds. Each lamp of a traced kind is scaled by v = 1 - min(shadow x Strength, Max Darkening) at its colour; the game's spot shadow maps are skipped where the coverage is 1 and blended by lerp(pcf, 1, coverage) in the fade band. Character pixels are not touched (M3b). Off: rtls_flags 0, identical to HEAD.
+- M4b: Trace Resolution (Full, Half, Quarter; default Half) and the shared RTGI denoise chain (RtgiDenoiseSet; EnsureRtgiDenoise, DispatchRtgiDenoise and DestroyRtgiDenoiseSet in world/rtgi, used by RTGI and RTLS): temporal (rtao::TemporalResetReason over rtls::ParameterSnapshot; Strength, Max Darkening and the filter are not in it), spatial filter, joint-bilateral upsample to the full-size r8g8b8a8_unorm output that the lighting shader reads at t38. Motion: UpdateRtMotion (addon.cpp; RTAO, RTLS, RTGI). RTLS Debug 6 accumulated, 7 history confidence, 8 final. Defaults: Temporal on, History Weight 0.90, Depth Rejection 0.05, Normal Rejection 0.90, History Clamp 1; Spatial on, a-trous, radius 2, 1 pass, 5 taps.
 
 ## Open decisions
 

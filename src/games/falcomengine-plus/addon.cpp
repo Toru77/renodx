@@ -9044,6 +9044,50 @@ static bool RtFrameInputsReady(const DeviceData* dd, falcom_world::rtao::Reason*
   return true;
 }
 
+// Motion for the inline RT temporal passes (RTAO, RTLS, RTGI): with Temporal on, ensures the RTV4 owned SRV and checks
+// its size against the depth; checks RTV4 against TAA t3 (a conflict stops Temporal for the session). The state lives in
+// rtao::g_rtao_frame and is logged once. Returns whether the motion view can be used.
+static bool UpdateRtMotion(reshade::api::device* dev, DeviceData* dd, bool temporal_on) {
+  namespace rtao = falcom_world::rtao;
+  auto& rf = rtao::g_rtao_frame;
+  if (temporal_on) MBMotionRtv4Ensure(dev, dd);
+  // Motion source (round 2). TAA t3 and RTV4 are different resources: t3 is not proven to be written before
+  // lighting, so Temporal stops for the session. Unknown on either side: no decision yet.
+  const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, dd->mb_rtv4_res);
+  rf.rcas_res = dd->rcas_motion_res;
+  rf.rtv4_res = dd->mb_rtv4_res;
+  rf.depth_w = dd->captured_depth_w;
+  rf.depth_h = dd->captured_depth_h;
+  if (temporal_on && dd->mb_rtv4_owned_srv.handle != 0u) {
+    const auto motion_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->mb_rtv4_owned_srv));
+    if (motion_desc.type == reshade::api::resource_type::texture_2d) {
+      rf.motion_w = motion_desc.texture.width;
+      rf.motion_h = motion_desc.texture.height;
+      rf.motion_dims_ok = rf.motion_w == dd->captured_depth_w && rf.motion_h == dd->captured_depth_h;
+      static bool dims_logged = false;
+      if (!dims_logged) {
+        dims_logged = true;
+        renodx::utils::log::i("[world-rtao] motion dims ", rf.motion_w, "x", rf.motion_h, ", depth ",
+                              dd->captured_depth_w, "x", dd->captured_depth_h,
+                              rf.motion_dims_ok ? " (match)" : " (MISMATCH: motion treated as unavailable, no_motion)");
+      }
+    }
+  }
+  if (motion_check == rtao::MotionCheck::Conflict && !rf.motion_conflict) {
+    rf.motion_conflict = true;
+    renodx::utils::log::w("[world-rtao] motion CONFLICT: rcas_motion_res=", dd->rcas_motion_res,
+                          " mb_rtv4_res=", dd->mb_rtv4_res,
+                          " differ. TAA t3 is not proven written before lighting; Temporal is off for this session (no_motion, round-1 AO).");
+  }
+  static bool motion_logged = false;
+  if (!motion_logged && motion_check == rtao::MotionCheck::Ok && dd->rcas_motion_res != 0u && dd->mb_rtv4_res != 0u) {
+    motion_logged = true;
+    renodx::utils::log::i("[world-rtao] motion: rcas_motion_res=", dd->rcas_motion_res,
+                          " mb_rtv4_res=", dd->mb_rtv4_res, " same resource: RTV4 owned SRV used");
+  }
+  return dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict && rf.motion_dims_ok;
+}
+
 // RTAO round 1 (world/rtao): dispatched inline before DeployShadows so the micro
 // shadows read this frame's AO. A failed guard leaves the frame on vanilla SSAO and
 // records its reason in rtao::g_rtao_frame.
@@ -9164,41 +9208,7 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
     taa_never_logged = true;
     renodx::utils::log::w("[world-rtao] TAA t3 never captured (rcas_motion_res=0): RTV4 motion convention not verified against TAA");
   }
-  if (temporal_on) MBMotionRtv4Ensure(dev, dd);
-  // Motion source (round 2). TAA t3 and RTV4 are different resources: t3 is not proven to be written before
-  // lighting, so Temporal stops for the session. Unknown on either side: no decision yet.
-  const rtao::MotionCheck motion_check = rtao::CheckMotionResources(dd->rcas_motion_res, dd->mb_rtv4_res);
-  rf.rcas_res = dd->rcas_motion_res;
-  rf.rtv4_res = dd->mb_rtv4_res;
-  rf.depth_w = dd->captured_depth_w;
-  rf.depth_h = dd->captured_depth_h;
-  if (temporal_on && dd->mb_rtv4_owned_srv.handle != 0u) {
-    const auto motion_desc = dev->get_resource_desc(dev->get_resource_from_view(dd->mb_rtv4_owned_srv));
-    if (motion_desc.type == reshade::api::resource_type::texture_2d) {
-      rf.motion_w = motion_desc.texture.width;
-      rf.motion_h = motion_desc.texture.height;
-      rf.motion_dims_ok = rf.motion_w == dd->captured_depth_w && rf.motion_h == dd->captured_depth_h;
-      static bool dims_logged = false;
-      if (!dims_logged) {
-        dims_logged = true;
-        renodx::utils::log::i("[world-rtao] motion dims ", rf.motion_w, "x", rf.motion_h, ", depth ",
-                              dd->captured_depth_w, "x", dd->captured_depth_h,
-                              rf.motion_dims_ok ? " (match)" : " (MISMATCH: motion treated as unavailable, no_motion)");
-      }
-    }
-  }
-  if (motion_check == rtao::MotionCheck::Conflict && !rf.motion_conflict) {
-    rf.motion_conflict = true;
-    renodx::utils::log::w("[world-rtao] motion CONFLICT: rcas_motion_res=", dd->rcas_motion_res,
-                          " mb_rtv4_res=", dd->mb_rtv4_res,
-                          " differ. TAA t3 is not proven written before lighting; Temporal is off for this session (no_motion, round-1 AO).");
-  }
-  static bool motion_logged = false;
-  if (!motion_logged && motion_check == rtao::MotionCheck::Ok && dd->rcas_motion_res != 0u && dd->mb_rtv4_res != 0u) {
-    motion_logged = true;
-    renodx::utils::log::i("[world-rtao] motion: rcas_motion_res=", dd->rcas_motion_res,
-                          " mb_rtv4_res=", dd->mb_rtv4_res, " same resource: RTV4 owned SRV used");
-  }
+  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
   const rtao::ParameterSnapshot params = {
       rtao::g_rtao_radius, rtao::g_rtao_ray_max, rtao::g_rtao_strength, rtao::g_rtao_samples,
       rtao::g_rtao_normal_bias, rtao::g_rtao_two_sided, rtao::g_rtao_isfast, rtao::g_rtao_fade_start_pct,
@@ -9211,7 +9221,6 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
   rf.prev_params = params;
   rf.prev_params_valid = true;
   const bool resized = rd.ao_texture.handle != 0u && (rd.ao_width != in.width || rd.ao_height != in.height);
-  const bool motion_ok = dd->mb_rtv4_owned_srv.handle != 0u && !rf.motion_conflict && rf.motion_dims_ok;
   const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
       temporal_on, rf.temporal_last, resized, dd->frame_index, rf.dispatched_frame,
       dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -9289,6 +9298,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   auto& frame = rtls::g_rtls_frame;
   frame.producing = false;
   frame.reason = rtls::Reason::Off;
+  frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
   frame.isfast_unavailable = false;
   shader_injection.rtls_flags = 0.f;  // set again below: requested (contact march off), and bound when this draw gets the term
   if (!rtls::RtlsRequested()) return;
@@ -9313,10 +9323,11 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtls::Reason::DeferredList;
     return;
   }
-  // Binds this frame's RTLS term (the raw texture, Full resolution) at t38 for this lighting draw, also on a second
+  // Binds this frame's RTLS term (the denoised output, full size) at t38 for this lighting draw, also on a second
   // lighting draw of the frame, with the lighting kind bits and the Strength and Max Darkening values.
   const auto push_rtls = [&]() {
-    const reshade::api::resource_view term_srv = rtls::GetRtlsDeviceData(dev).raw.srv[0];
+    const rtls::RtlsDeviceData& data = rtls::GetRtlsDeviceData(dev);
+    const reshade::api::resource_view term_srv = data.denoise.output.srv[data.denoise.output_index];
     cmd_list->push_descriptors(
         reshade::api::shader_stage::pixel,
         reshade::api::pipeline_layout{0},
@@ -9377,6 +9388,38 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   const float max_points = std::clamp(rtls::g_rtls_max_point_lights, 1.f, static_cast<float>(rtls::kRtlsMaxPoints));
   const rtao::NoiseSample noise =
       rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>((max_points + rtls::kRtlsMaxSpots) * spp), false);
+  const uint32_t divisor = rtao::RtgiTraceDivisor(rtls::g_rtls_trace_resolution);
+  const uint32_t trace_width = rtao::RtgiTraceExtent(dd->captured_depth_w, divisor);
+  const uint32_t trace_height = rtao::RtgiTraceExtent(dd->captured_depth_h, divisor);
+  // RTLS temporal: the reset rule shared with RTAO and RTGI (rtao::TemporalResetReason) over RTLS's own state.
+  const bool temporal_on = rtls::g_rtls_temporal_enabled > 0.5f;
+  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
+  const rtls::ParameterSnapshot params = {
+      rtls::g_rtls_samples, rtls::g_rtls_max_point_lights, rtls::g_rtls_ray_max, rtls::g_rtls_light_size,
+      rtls::g_rtls_light_clearance, rtls::g_rtls_normal_bias, rtls::g_rtls_trace_characters, rtls::g_rtls_isfast,
+      rtls::g_rtls_point, rtls::g_rtls_spot, rtls::g_rtls_env_point, rtls::g_rtls_env_spot, rtls::g_rtls_fade_start_pct,
+      rtls::g_rtls_fade_end_pct, rtls::g_rtls_trace_resolution, rtls::g_rtls_temporal_enabled, rtls::g_rtls_history_weight,
+      rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection, rtls::g_rtls_history_clamp, rtls::g_rtls_debug};
+  const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
+  frame.prev_params = params;
+  frame.prev_params_valid = true;
+  auto& rd = rtls::GetRtlsDeviceData(dev);
+  const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
+      .temporal_on = temporal_on,
+      .was_on = frame.temporal_last,
+      .resized = rd.denoise.history_color.width != 0u
+          && (rd.denoise.history_color.width != trace_width || rd.denoise.history_color.height != trace_height),
+      .frame = dd->frame_index,
+      .last_frame = frame.dispatched_frame,
+      .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
+      .scaled = false,
+      .params_changed = params_changed,
+      .motion_ok = motion_ok});
+  frame.reset = reset;
+  if (temporal_on && reset != rtao::ResetReason::None) {
+    frame.last_reset = reset;
+    frame.reset_counts[static_cast<size_t>(reset)] += 1u;
+  }
   rtls::RtlsDispatchInputs in = {
       .depth_view = dd->captured_depth_srv,
       .mrt_normal_view = dd->captured_mrt_normal_srv,
@@ -9386,14 +9429,27 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .light_indices_view = indices_view,
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
+      .trace_width = trace_width,
+      .trace_height = trace_height,
       .push = {
-          .params = {ray_max, rtls::g_rtls_normal_bias, spp, 1.f},
+          .params = {ray_max, rtls::g_rtls_normal_bias, spp, static_cast<float>(divisor)},
           .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtls::g_rtls_debug},
           .fade = {fade.start, fade.end, static_cast<float>(kinds), 0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
           .light = {rtls::g_rtls_light_size, rtls::g_rtls_light_clearance, max_points, static_cast<float>(frame.lamp_count)}},
-      .debug_mode = static_cast<int>(rtls::g_rtls_debug)};
+      .debug_mode = static_cast<int>(rtls::g_rtls_debug),
+      .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
+      .temporal = temporal_on,
+      .temporal_push = {.params = {rtls::g_rtls_history_weight, rtls::g_rtls_depth_rejection, rtls::g_rtls_normal_rejection,
+                                   rtls::g_rtls_history_clamp},
+                        .size = {0.f, 0.f, 0.f, reset == rtao::ResetReason::None ? 1.f : 0.f}},
+      .spatial = rtls::g_rtls_spatial_enabled > 0.5f,
+      .filter_type = static_cast<int>(rtls::g_rtls_filter_type),
+      .filter_radius = static_cast<int>(rtls::g_rtls_filter_radius),
+      .filter_passes = static_cast<int>(rtls::g_rtls_filter_passes),
+      .filter_taps = static_cast<int>(rtls::g_rtls_filter_type > 0.5f ? rtls::g_rtls_filter_taps_atrous
+                                                                     : rtls::g_rtls_filter_taps_separable)};
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs) prev = *cs;
@@ -9406,20 +9462,28 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtls::Reason::PipelineFailed;
     return;
   }
-  auto& rd = rtls::GetRtlsDeviceData(dev);
   frame.producing = true;
   frame.debug_written = result.debug_written;
   frame.dispatched_frame = dd->frame_index;
   frame.gpu_ms = rd.timer.last_ms;
-  frame.trace_width = dd->captured_depth_w;
-  frame.trace_height = dd->captured_depth_h;
+  frame.trace_width = trace_width;
+  frame.trace_height = trace_height;
+  frame.divisor = divisor;
+  frame.temporal_ran = result.temporal_ran;
+  frame.temporal_last = temporal_on && result.temporal_ran;
+  frame.filter_ran = result.filter_ran;
+  frame.denoise_gpu_ms = rd.denoise.timer.last_ms;
   frame.ray_max_requested = rtls::g_rtls_ray_max;
   frame.ray_max_effective = ray_max;
   frame.kinds = kinds;
   frame.character_objects = in.dynamic.count;
   frame.isfast_used = isfast_used;
-  const uint64_t pixels = static_cast<uint64_t>(dd->captured_depth_w) * dd->captured_depth_h;
-  frame.texture_bytes = pixels * 8u + (rd.debug.texture[0].handle != 0u ? pixels * 4u : 0u)
+  frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
+      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
+      + static_cast<uint64_t>(rd.denoise.history_color.width) * rd.denoise.history_color.height * 8u * 2u
+      + static_cast<uint64_t>(rd.denoise.history_normal.width) * rd.denoise.history_normal.height * 4u * 2u
+      + static_cast<uint64_t>(rd.denoise.filter.width) * rd.denoise.filter.height * 8u * 3u
+      + static_cast<uint64_t>(rd.denoise.output.width) * rd.denoise.output.height * 4u * 2u
       + sizeof(uint32_t) * rtls::kRtlsStatsCount;
   push_rtls();
 }
@@ -9473,7 +9537,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
         0,
         reshade::api::descriptor_table_update{
             {}, kLightingRtgiRegister, 0, 1,
-            reshade::api::descriptor_type::texture_shader_resource_view, &rd.final_gi.srv[rd.final_index]});
+            reshade::api::descriptor_type::texture_shader_resource_view, &rd.denoise.output.srv[rd.denoise.output_index]});
     shader_injection.rtgi_gi_bound = 1.f;
     shader_injection.rtgi_intensity = rtgi::g_rtgi_intensity;
     shader_injection.rtgi_char_intensity = rtgi::g_rtgi_char_intensity;
@@ -9498,10 +9562,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
   // RTGI temporal: the same reset rule as RTAO (rtao::TemporalResetReason) over RTGI's own state and parameters.
   const bool temporal_on = rtgi::g_rtgi_temporal_enabled > 0.5f;
-  if (temporal_on) {
-    MBMotionRtv4Ensure(dev, dd);
-  }
-  const bool motion_ok = dd->mb_rtv4_owned_srv.handle != 0u && !rtao::g_rtao_frame.motion_conflict && rtao::g_rtao_frame.motion_dims_ok;
+  const bool motion_ok = UpdateRtMotion(dev, dd, temporal_on);
   const rtgi::ParameterSnapshot params = {
       rtgi::g_rtgi_samples, rtgi::g_rtgi_ray_max, rtao::g_rtao_normal_bias, rtgi::g_rtgi_trace_resolution, rtao::g_rtao_isfast,
       rtgi::g_rtgi_fade_start_pct, rtgi::g_rtgi_fade_end_pct, rtgi::g_rtgi_radiance_clamp, rtgi::g_rtgi_ambient,
@@ -9519,7 +9580,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const rtao::ResetReason reset = rtao::TemporalResetReason(rtao::TemporalFrame{
       .temporal_on = temporal_on,
       .was_on = frame.temporal_last,
-      .resized = rd.history_color.width != 0u && (rd.history_color.width != trace_width || rd.history_color.height != trace_height),
+      .resized = rd.denoise.history_color.width != 0u && (rd.denoise.history_color.width != trace_width || rd.denoise.history_color.height != trace_height),
       .frame = dd->frame_index,
       .last_frame = frame.dispatched_frame,
       .guard = dd->dyncube_loadingWipePending || dd->frame_index < dd->resize_guard_until_frame,
@@ -9538,8 +9599,8 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   const bool applied_last = frame.applied_frame != UINT64_MAX && frame.applied_frame + 1u == dd->frame_index;
   const bool color_ok = dd->captured_color_srv.handle != 0u && dd->captured_color_live.load()
       && dd->captured_color_frame == dd->frame_index;
-  const bool subtract = applied_last && color_ok && rd.final_gi.width == dd->captured_depth_w
-      && rd.final_gi.height == dd->captured_depth_h;
+  const bool subtract = applied_last && color_ok && rd.denoise.output.width == dd->captured_depth_w
+      && rd.denoise.output.height == dd->captured_depth_h;
   const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
       && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
   // The light buffers are copied only for a stats request (Sora 2nd lighting draw, bound at this draw).
@@ -9562,7 +9623,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
       .scene_cbv_view = dd->captured_scene_cbv_view,
       .radiance_view = radiance_valid ? rd.radiance_srv : reshade::api::resource_view{0u},
-      .prev_gi_view = subtract ? rd.final_gi.srv[rd.final_index] : reshade::api::resource_view{0u},
+      .prev_gi_view = subtract ? rd.denoise.output.srv[rd.denoise.output_index] : reshade::api::resource_view{0u},
       .albedo_view = color_ok ? dd->captured_color_srv : reshade::api::resource_view{0u},
       .full_width = dd->captured_depth_w,
       .full_height = dd->captured_depth_h,
@@ -9633,7 +9694,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.temporal_ran = result.temporal_ran;
   frame.temporal_last = temporal_on && result.temporal_ran;
   frame.filter_ran = result.filter_ran;
-  frame.denoise_gpu_ms = rd.denoise_timer.last_ms;
+  frame.denoise_gpu_ms = rd.denoise.timer.last_ms;
   frame.dispatched_frame = dd->frame_index;
   frame.gpu_ms = rd.timer.last_ms;
   frame.divisor = divisor;
@@ -9657,10 +9718,10 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   frame.texture_bytes = sizeof(uint32_t) * rtgi::kRtgiStatsCount
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u
       + static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
-      + static_cast<uint64_t>(rd.history_color.width) * rd.history_color.height * 8u * 2u
-      + static_cast<uint64_t>(rd.history_normal.width) * rd.history_normal.height * 4u * 2u
-      + static_cast<uint64_t>(rd.filter.width) * rd.filter.height * 8u * 3u
-      + static_cast<uint64_t>(rd.final_gi.width) * rd.final_gi.height * 4u * 2u
+      + static_cast<uint64_t>(rd.denoise.history_color.width) * rd.denoise.history_color.height * 8u * 2u
+      + static_cast<uint64_t>(rd.denoise.history_normal.width) * rd.denoise.history_normal.height * 4u * 2u
+      + static_cast<uint64_t>(rd.denoise.filter.width) * rd.denoise.filter.height * 8u * 3u
+      + static_cast<uint64_t>(rd.denoise.output.width) * rd.denoise.output.height * 4u * 2u
       + (rd.radiance_texture.handle != 0u
              ? static_cast<uint64_t>(reshade::api::format_row_pitch(rd.radiance_format, rd.radiance_width)) * rd.radiance_height
              : 0u);

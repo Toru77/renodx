@@ -18,7 +18,7 @@ inline void DrawRtlsPanel() {
   if (!RtlsRequested()) {
     ImGui::TextDisabled("RTLS: off");
   } else if (frame.producing) {
-    ImGui::Text("RTLS: active (traced this frame and applied to the Sora 2nd lighting at t38; full resolution, no denoising)");
+    ImGui::Text("RTLS: active (traced and denoised this frame; applied to the Sora 2nd lighting at t38)");
   } else if (frame.reason == Reason::InputsMissing) {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTLS: requested, not running (%s / %s)", ReasonName(frame.reason),
                        rtao::ReasonName(frame.input_reason));
@@ -26,7 +26,7 @@ inline void DrawRtlsPanel() {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RTLS: requested, not running (%s)", ReasonName(frame.reason));
   }
   if (frame.trace_width != 0u) {
-    ImGui::Text("Trace: %u x %u", frame.trace_width, frame.trace_height);
+    ImGui::Text("Trace: %u x %u (one per %u x %u block)", frame.trace_width, frame.trace_height, frame.divisor, frame.divisor);
   }
   ImGui::Text("Lamps: %u in the buffer; kinds traced: point %s, spot %s", frame.lamp_count,
               (frame.kinds & kRtlsKindPoint) != 0u ? "on" : "off", (frame.kinds & kRtlsKindSpot) != 0u ? "on" : "off");
@@ -43,6 +43,22 @@ inline void DrawRtlsPanel() {
     ImGui::TextDisabled("Fade: no built BVH region yet");
   }
   ImGui::Text("GPU: %.3f ms (Performance gathering must be on; '--' otherwise)", static_cast<double>(frame.gpu_ms));
+  ImGui::Text("Denoise GPU: %.3f ms", static_cast<double>(frame.denoise_gpu_ms));
+  if (g_rtls_temporal_enabled < 0.5f) {
+    ImGui::TextDisabled("Temporal: off");
+  } else if (frame.temporal_ran) {
+    ImGui::Text("Temporal: on, running (this frame reset: %s; last reset: %s)", rtao::ResetReasonName(frame.reset),
+                rtao::ResetReasonName(frame.last_reset));
+  } else {
+    ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "Temporal: on, not running (%s)", rtao::ResetReasonName(frame.reset));
+  }
+  if (g_rtls_spatial_enabled < 0.5f) {
+    ImGui::TextDisabled("Spatial filter: off");
+  } else if (frame.filter_ran) {
+    ImGui::Text("Spatial filter: on");
+  } else {
+    ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "Spatial filter: on, not run (pipeline or target failed)");
+  }
   ImGui::Text("Texture: %.2f MB", static_cast<double>(frame.texture_bytes) / (1024.0 * 1024.0));
   if (ImGui::Button("Read RTLS Stats")) {
     g_rtls_stats.requested.store(true, std::memory_order_relaxed);
@@ -60,6 +76,9 @@ inline void DrawRtlsPanel() {
                 rtao::SharePercent(v[kRtlsStatRaysBlocked], rays), rtao::SharePercent(v[kRtlsStatRaysNearLight], rays),
                 rtao::SharePercent(v[kRtlsStatRaysClipped], rays));
     ImGui::Text("invalid_refs %u, stack_overflow %u", v[kRtlsStatInvalidRefs], v[kRtlsStatStackOverflow]);
+    ImGui::Text("Temporal pixels %u, no history %.1f%%, reset %.1f%%", v[rtgi::kRtgiStatTemporalPixels],
+                rtao::SharePercent(v[rtgi::kRtgiStatNoHistory], v[rtgi::kRtgiStatTemporalPixels]),
+                rtao::SharePercent(v[rtgi::kRtgiStatResetPixels], v[rtgi::kRtgiStatTemporalPixels]));
     ImGui::Text("Lamps blocked near the source (> 50%% of their rays): ");
     bool any = false;
     for (uint32_t i = 0u; i < kRtlsPerLightCount; ++i) {
