@@ -288,6 +288,11 @@ inline void OnWorldPresentBvh(
       extra.rtgi_denoise = {rtgi_data.denoise.timer.ms_sum, rtgi_data.denoise.timer.samples};
     }
     {
+      const rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
+      extra.rtls = {rtls_data.timer.ms_sum, rtls_data.timer.samples};
+      extra.rtls_denoise = {rtls_data.denoise.timer.ms_sum, rtls_data.denoise.timer.samples};
+    }
+    {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);
       extra.deform_refit = {g_deform_live.refit_timer.ms_sum, g_deform_live.refit_timer.samples};
     }

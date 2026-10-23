@@ -81,6 +81,7 @@ struct RtlsDispatchInputs {
 struct RtlsDispatchResult { bool ok = false; bool debug_written = false; bool temporal_ran = false; bool filter_ran = false; };
 
 inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::command_list* cmd_list, const RtlsDispatchInputs& in) {
+  const bvh::PoolCpuTimer cpu_timer{&bvh::g_perf_gate.rtls_record_us};
   auto* bvh_data = bvh::GetBvhDeviceData(device);
   RtlsDeviceData& data = GetRtlsDeviceData(device);
   if (bvh_data == nullptr || in.full_width == 0u || in.full_height == 0u || in.trace_width == 0u || in.trace_height == 0u) return {};

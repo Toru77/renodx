@@ -41,6 +41,17 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M5 item 1 (Performance tab RTLS rows), implemented, not validated in game
+
+- New Performance rows and perf file keys: `rtls_record_cpu` (rtls::Dispatch command recording, PoolCpuTimer on g_perf_gate.rtls_record_us), `gpu_rtls` (RTLS trace timer) and `gpu_rtls_denoise` (the RTLS denoise set's timer: temporal, filter, upsample). PerfExtraGpu gains rtls and rtls_denoise, filled in OnWorldPresentBvh while gathering is on. The GPU timers measure only while gathering is on; switching it off clears the RTLS GPU timers and frame values in OnWorldPresentBvh, and rtls_record_us in ClearPerfGathered. The Performance GPU column sums every kPerfGpu row: ten after this change (the ROADMAP line said six; corrected).
+- No image change; RTGI and RTAO code paths unchanged; test_rtgi golden unchanged (0x22868adf1653e774, 16 dispatches).
+- Harness: test_rtgi PASS (0 failures, golden holds); test_rtls PASS; test_rtao, test_motion and test_live fail only at the allowed lines (test_rtao.cpp:1881, test_motion.cpp:1091, test_live.cpp:2758/3009/3470); other suites PASS. test_live TestPerfExtraGpu checks that gpu_rtls and gpu_rtls_denoise are "not measured" without samples and that rtls_record_cpu is in the perf file.
+- Owner checks:
+  1. Performance tab, gathering On, RTLS On: the RTLS rows (record CPU, GPU trace, GPU denoise) show values.
+  2. RTLS Off: the three rows show "--".
+  3. Gathering Off, then On again: the RTLS rows clear and refill.
+  4. Run the 30 s test once and send the perf file.
+
 ## RT Local Shadows: M3b (characters receive), implemented, not validated in game
 
 - Receive on characters (default Off): character pixels get the game's point and spot lamp light (charaColor, the same falloff and cone) times RTLS visibility and coverage, after charColor. Character Lamp Light (0 to 2) scales it.

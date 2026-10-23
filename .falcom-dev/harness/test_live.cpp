@@ -4599,6 +4599,9 @@ static void TestPerfExtraGpu(Device* dev) {
   CHECK(text.find("\"gpu_rtao\": {\"basis\": \"measured\", \"avg_per_measured_frame\": {\"value\": 1,") != std::string::npos, "RTAO timer averages 1 ms per measured frame");
   CHECK(text.find("\"gpu_alpha_blit\": {\"basis\": \"measured\", \"avg_per_measured_frame\": {\"value\": 0.5,") != std::string::npos, "alpha blit timer averages 0.5 ms");
   CHECK(text.find("\"gpu_rtao_filter\": {\"basis\": \"not measured\"") != std::string::npos, "RTAO filter without samples is not measured");
+  CHECK(text.find("\"gpu_rtls\": {\"basis\": \"not measured\"") != std::string::npos, "RTLS trace without samples is not measured");
+  CHECK(text.find("\"gpu_rtls_denoise\": {\"basis\": \"not measured\"") != std::string::npos, "RTLS denoise without samples is not measured");
+  CHECK(text.find("\"rtls_record_cpu\"") != std::string::npos, "perf file has rtls_record_cpu");
   CHECK(CountOf(text, "\"value\": ") == CountOf(text, "\"unit\": "), "every value object has a unit (extras)");
   bvh::ResetCacheDiagCounters();
 }
