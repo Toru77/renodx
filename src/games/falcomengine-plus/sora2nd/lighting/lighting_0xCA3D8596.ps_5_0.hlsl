@@ -308,7 +308,8 @@ void main(
   }
 
   // RTGI bounce (world/rtgi): final GI (t37) x the G-buffer colour (r0.xyz, colorTexture above) x GI Intensity. Added
-  // after FalcomApplyShadowTerms at both output sites, so neither RTAO nor the shadow terms darken it.
+  // after FalcomApplyShadowTerms at both output sites, so neither RTAO nor the shadow terms darken it. The non-character
+  // site also attenuates it by the fog and haze transmittance.
   float3 cachedRTGI = float3(0, 0, 0);
   if (shader_injection_data.rtgi_gi_bound > 0.5f) {
     cachedRTGI = rtgiTexture.SampleLevel(samPoint_s, v1.xy, 0).rgb * r0.xyz * shader_injection_data.rtgi_intensity;
@@ -1749,6 +1750,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r1.yz = r1.yy ? r2.xy : r18.wy;
   r1.x = r1.x * r15.x;
   r1.x = r1.x * r1.y;
+  const float rtgiFogKeep = 1.0 - r1.x;
   r2.xyz = fogColor_g.xyz + -r0.xyz;
   r0.xyz = r1.xxx * r2.xyz + r0.xyz;
   r1.x = -r1.w / skyLutCameraFarClip_g;
@@ -1777,7 +1779,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   // RTGI bounce (see cachedRTGI); no character pixel reaches this site. The VBGI block below never runs while RTGI is
   // bound (RTAO on clears gtvbao_vbgi_bound).
   if (shader_injection_data.rtgi_gi_bound > 0.5f) {
-    o0.xyz += cachedRTGI;
+    o0.xyz += cachedRTGI * rtgiFogKeep * r2.xyz * (1.0 - r1.z + r1.z * r7.w);
   }
   if (shader_injection_data.gtvbao_vbgi_bound > 0.5f) {
     float3 giColor = cachedVBGI;
