@@ -41,6 +41,18 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M5 item 2 (penumbra edge stop), implemented, not validated in game
+
+- The RTLS spatial filter now also weights each tap by exp(-k x max(|point - centre point|, |spot - centre spot|)), so penumbra edges stay sharp across flat floors where depth and normal edge stops do nothing. k is the new saved row Penumbra Edge Stop (RtlsFilterValueStop, RTLS Denoising, default 4, range 0 to 32; 0 gives the previous behaviour). It is not part of the history snapshot.
+- Built as world_rtls_filter.cs_5_0.hlsl (defines WORLD_FILTER_VALUE_STOP, includes the shared world_rtgi_filter.cs_5_0.hlsl). RtgiDenoiseRequest gained filter_code (RTGI kRtgiFilterShader, RTLS kRtlsFilterShader) and RtgiDenoiseInputs gained filter_value_stop (filter push c2.w; RTGI 0).
+- RTGI unchanged: world_rtgi_filter bytecode is byte-identical before and after (fc /b), and the test_rtgi golden is unchanged (0x22868adf1653e774, 16 dispatches).
+- Harness: test_rtls and test_rtgi PASS (0 failures). Allowed failures only: test_rtao (1 failure, stage "reset rule"), test_live (3 failures, stage "frame 9010: switch off: start, 120 rays"), test_motion (1 failure, stage "29. Stopped prop: kept while seen; a lone hidden one is kept 70 frames; a new pose retires the old one at 60."). test_rtls adds TestValueStop (guarded blocks in the shared source, the RTLS filter define, the edge stop math) and checks that the filter push c2.w carries k.
+- Owner checks:
+  1. RTLS Debug 8 (final), close to a lamp shadow on a flat floor: compare Penumbra Edge Stop 0 against 4. At 4 the edge is sharper and the rest stays smooth.
+  2. Raise it to 16 and check whether noise comes back in the penumbra.
+  3. RTGI image and RTGI GPU ms are unchanged with RTLS on.
+  4. Send the screenshots and the RTLS Denoise GPU ms from the Performance tab.
+
 ## RT Local Shadows: M5 item 1 (Performance tab RTLS rows), implemented, not validated in game
 
 - New Performance rows and perf file keys: `rtls_record_cpu` (rtls::Dispatch command recording, PoolCpuTimer on g_perf_gate.rtls_record_us), `gpu_rtls` (RTLS trace timer) and `gpu_rtls_denoise` (the RTLS denoise set's timer: temporal, filter, upsample). PerfExtraGpu gains rtls and rtls_denoise, filled in OnWorldPresentBvh while gathering is on. The GPU timers measure only while gathering is on; switching it off clears the RTLS GPU timers and frame values in OnWorldPresentBvh, and rtls_record_us in ClearPerfGathered. The Performance GPU column sums every kPerfGpu row: ten after this change (the ROADMAP line said six; corrected).

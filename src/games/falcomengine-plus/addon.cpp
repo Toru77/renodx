@@ -9452,7 +9452,8 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .filter_radius = static_cast<int>(rtls::g_rtls_filter_radius),
       .filter_passes = static_cast<int>(rtls::g_rtls_filter_passes),
       .filter_taps = static_cast<int>(rtls::g_rtls_filter_type > 0.5f ? rtls::g_rtls_filter_taps_atrous
-                                                                     : rtls::g_rtls_filter_taps_separable)};
+                                                                     : rtls::g_rtls_filter_taps_separable),
+      .filter_value_stop = rtls::g_rtls_filter_value_stop};
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
   if (cs) prev = *cs;

@@ -58,6 +58,12 @@ inline constexpr std::span<const std::uint8_t> kRtlsTraceShader = __world_rtls;
 inline constexpr std::span<const std::uint8_t> kRtlsTraceShader = {};
 #endif
 
+#if defined(__world_rtls_filter_EMBED_FILE)
+inline constexpr std::span<const std::uint8_t> kRtlsFilterShader = __world_rtls_filter;
+#else
+inline constexpr std::span<const std::uint8_t> kRtlsFilterShader = {};
+#endif
+
 // b12 for the RTLS trace, matching cbuffer cb_rtls in world_rtls.cs_5_0.hlsl (seven float4 registers).
 struct RtlsPushConstants {
   float params[4];    // c0: effective ray max (m), normal bias (m), samples per light, trace divisor (1 in M2)

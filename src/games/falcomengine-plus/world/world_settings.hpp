@@ -1464,6 +1464,20 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
                                      .taps_atrous = &rtls::g_rtls_filter_taps_atrous,
                                      .taps_atrous_default = 5.f});
   settings->push_back(new Setting{
+      .key = "RtlsFilterValueStop",
+      .binding = &rtls::g_rtls_filter_value_stop,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 4.f,
+      .label = "Penumbra Edge Stop",
+      .section = "RTLS Denoising",
+      .tooltip = "Keeps shadow edges sharp in the spatial filter: taps whose shadow value differs from the centre count less (weight exp(-k x difference)). 0 = off (depth and normal edges only, as before). Higher = sharper but noisier penumbrae.",
+      .min = 0.f,
+      .max = 32.f,
+      .format = "%.1f",
+      .is_enabled = []() { return rtls::g_rtls_spatial_enabled > 0.5f; },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtlsFadeStartPct",
       .binding = &rtls::g_rtls_fade_start_pct,
       .value_type = SettingValueType::FLOAT,

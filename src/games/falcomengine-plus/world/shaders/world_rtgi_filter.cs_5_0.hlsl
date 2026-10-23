@@ -29,7 +29,7 @@ cbuffer cb_rtgi_filter : register(b12)
 {
     float4 f_size : packoffset(c0);  // trace width, trace height, radius, kind (0 separable, 1 a-trous)
     float4 f_pass : packoffset(c1);  // direction (0 horizontal, 1 vertical, 2 2D), step, taps (odd), last pass
-    float4 f_full : packoffset(c2);  // full width, full height, trace divisor d, unused
+    float4 f_full : packoffset(c2);  // full width, full height, trace divisor d, penumbra edge stop k (RT Local Shadows build only; 0 otherwise)
 };
 
 // World position and MRT normal of trace pixel tq at its representative pixel; false for sky or an invalid normal.
@@ -46,6 +46,11 @@ bool RepresentativeSurface(int2 tq, out float3 P, out float3 N)
     return depth > 0.0 && dot(N, N) >= 0.5;
 }
 
+#if defined(WORLD_FILTER_VALUE_STOP)
+// RT Local Shadows (world_rtls_filter.cs_5_0.hlsl): the centre tap's value (x point, y spot shadow) for the penumbra edge stop.
+static float3 g_filter_centre_value = float3(0.0, 0.0, 0.0);
+#endif
+
 // One tap: kernel weight times the edge stop (1 at the centre). Taps outside the image or not traced are skipped.
 void FilterTap(int2 q, float kernel_w, bool centre, float3 Pc, float3 Nc, float dist_c, inout float sum_w, inout float3 sum_v)
 {
@@ -59,6 +64,11 @@ void FilterTap(int2 q, float kernel_w, bool centre, float3 Pc, float3 Nc, float 
         float3 Nt;
         edge = RepresentativeSurface(q, Pt, Nt) ? FilterPlaneNormalWeight(Pc, Nc, dist_c, Pt, Nt) : 0.0;
     }
+#if defined(WORLD_FILTER_VALUE_STOP)
+    // Penumbra edge stop: f_full.w = k (0 = off). The shadow values are 0..1.
+    const float2 value_diff = abs(t.xy - g_filter_centre_value.xy);
+    edge *= exp(-f_full.w * max(value_diff.x, value_diff.y));
+#endif
     sum_w += kernel_w * edge;
     sum_v += kernel_w * edge * t.rgb;
 }
@@ -76,6 +86,9 @@ void main(uint3 id : SV_DispatchThreadID)
     const int direction = (int)f_pass.x;
 
     const float4 centre = g_in[px];
+#if defined(WORLD_FILTER_VALUE_STOP)
+    g_filter_centre_value = centre.rgb;
+#endif
     float3 Pc;
     float3 Nc;
     const bool surface = RepresentativeSurface(px, Pc, Nc);

@@ -77,6 +77,7 @@ struct RtlsDispatchInputs {
   int filter_radius = 2;
   int filter_passes = 1;
   int filter_taps = 5;
+  float filter_value_stop = 0.f;   // filter c2.w: penumbra edge stop k
 };
 struct RtlsDispatchResult { bool ok = false; bool debug_written = false; bool temporal_ran = false; bool filter_ran = false; };
 
@@ -118,6 +119,7 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                                   .full_height = in.full_height,
                                                                   .temporal = in.temporal && in.motion_view.handle != 0u,
                                                                   .spatial = in.spatial,
+                                                                  .filter_code = kRtlsFilterShader,
                                                                   .log_prefix = "[world-rtls]"});
   if (!denoise.ok) return {};
 
@@ -201,6 +203,7 @@ inline RtlsDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
        .filter_radius = in.filter_radius,
        .filter_passes = in.filter_passes,
        .filter_taps = in.filter_taps,
+       .filter_value_stop = in.filter_value_stop,
        .upsample_intensity = 1.f,
        .upsample_char_intensity = 1.f,
        .upsample_saturation = 1.f},
@@ -243,7 +246,8 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
   out << "  \"spatial_filter\": {\"on\": " << (g_rtls_spatial_enabled > 0.5f ? "true" : "false")
       << ", \"ran\": " << (f.filter_ran ? "true" : "false") << ", \"type\": " << g_rtls_filter_type
       << ", \"radius\": " << g_rtls_filter_radius << ", \"passes\": " << g_rtls_filter_passes
-      << ", \"taps\": " << (g_rtls_filter_type > 0.5f ? g_rtls_filter_taps_atrous : g_rtls_filter_taps_separable) << "},\n";
+      << ", \"taps\": " << (g_rtls_filter_type > 0.5f ? g_rtls_filter_taps_atrous : g_rtls_filter_taps_separable)
+      << ", \"value_stop\": " << g_rtls_filter_value_stop << "},\n";
   out << "  \"ray_max\": {\"requested\": " << f.ray_max_requested << ", \"effective\": " << f.ray_max_effective << "},\n";
   out << "  \"fade\": {\"start_eff\": " << f.fade.start << ", \"end_eff\": " << f.fade.end
       << ", \"coverage\": " << f.fade.coverage << ", \"requested_start\": " << f.fade.start_req

@@ -25,6 +25,9 @@
 #define __world_rtls_EMBED_FILE
 inline constexpr std::uint8_t __world_rtls_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtls{__world_rtls_base};
+#define __world_rtls_filter_EMBED_FILE
+inline constexpr std::uint8_t __world_rtls_filter_base[] = {0};
+inline constexpr std::span<const std::uint8_t> __world_rtls_filter{__world_rtls_filter_base};
 #define __world_rtgi_EMBED_FILE
 inline constexpr std::uint8_t __world_rtgi_base[] = {0};
 inline constexpr std::span<const std::uint8_t> __world_rtgi{__world_rtgi_base};
@@ -450,6 +453,7 @@ struct RecCmdList : mock::CommandListBase {
   struct Snap { resource_view srv[32]; resource_view uav[8]; };
   std::vector<Snap> snaps;   // the slots at each dispatch
   std::vector<float> push;   // the last push of kRtlsPushConstantCount floats
+  std::vector<std::vector<float>> pushes12;  // the 12-float pushes in order (filter passes, then the upsample)
   std::vector<uint32_t> null_srv_counts;  // the count of each all-null SRV push, in order
   std::vector<uint32_t> null_uav_counts;
   device *get_device() override { return dev; }
@@ -463,8 +467,9 @@ struct RecCmdList : mock::CommandListBase {
     }
   }
   void push_constants(shader_stage, pipeline_layout, uint32_t, uint32_t, uint32_t count, const void *values) override {
-    if (count != rtls::kRtlsPushConstantCount) return;
     const float* f = static_cast<const float *>(values);
+    if (count == 12u) pushes12.emplace_back(f, f + count);
+    if (count != rtls::kRtlsPushConstantCount) return;
     push.assign(f, f + count);
   }
   void push_descriptors(shader_stage, pipeline_layout layout, uint32_t, const descriptor_table_update &update) override {
@@ -589,10 +594,12 @@ static void TestDenoiseDispatch() {
   in.filter_radius = 2;
   in.filter_passes = 1;
   in.filter_taps = 5;
+  in.filter_value_stop = 4.f;
   const rtls::RtlsDispatchResult first = rtls::Dispatch(&dev, &cl, in);
   const rtls::RtlsDeviceData& data = rtls::GetRtlsDeviceData(&dev);
   CHECK(first.ok && first.temporal_ran && first.filter_ran, "Half: temporal and filter ran");
   CHECK(cl.dispatches == 4, "trace, temporal, filter, upsample (%d)", cl.dispatches);
+  CHECK(cl.pushes12.size() == 2u && cl.pushes12[0][11] == 4.f, "filter push c2.w carries the penumbra edge stop (%zu pushes)", cl.pushes12.size());
   CHECK(cl.push.size() == rtls::kRtlsPushConstantCount && cl.push[16] == 32.f && cl.push[17] == 16.f && cl.push[18] == 64.f
             && cl.push[19] == 32.f && cl.push[3] == 2.f,
         "trace push: trace 32x16, full 64x32, divisor 2");
@@ -652,6 +659,26 @@ static void TestParameterSnapshot() {
   }
 }
 
+// M5 item 2: the shared filter source has the three guarded blocks, the RTLS filter defines the stop, RTGI does not.
+static void TestValueStop() {
+  const std::string filter = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi_filter.cs_5_0.hlsl");
+  const std::string rtls_filter = ReadText("src/games/falcomengine-plus/world/shaders/world_rtls_filter.cs_5_0.hlsl");
+  CHECK(Count(filter, "#if defined(WORLD_FILTER_VALUE_STOP)") == 3, "three guarded blocks in the shared filter");
+  CHECK(Count(filter, "#define WORLD_FILTER_VALUE_STOP") == 0, "the shared filter does not define the stop itself");
+  CHECK(Count(filter, "edge *= exp(-f_full.w * max(value_diff.x, value_diff.y));") == 1, "one edge stop line");
+  CHECK(Count(rtls_filter, "#define WORLD_FILTER_VALUE_STOP") == 1 && Count(rtls_filter, "#include \"world_rtgi_filter.cs_5_0.hlsl\"") == 1,
+        "the RTLS filter is the shared source with the define");
+  CHECK(Count(filter, "g_filter_centre_value = centre.rgb;") == 1, "the centre value is stored once in main");
+  // k = 0 is the identity: the stop multiplies the weight by exp(0) = 1 only through f_full.w (RTGI pushes 0 in its own build).
+  const std::string rtgi_push = ReadText("src/games/falcomengine-plus/world/rtgi/rtgi.hpp");
+  const std::string rtls_push = ReadText("src/games/falcomengine-plus/world/rtls/rtls.hpp");
+  CHECK(Count(rtgi_push, ".filter_value_stop = 0.f,") == 1, "RTGI dispatch pushes penumbra stop 0");
+  CHECK(Count(rtls_push, ".filter_code = kRtlsFilterShader,") == 1, "RTLS dispatch uses the RTLS filter shader");
+  // The setting is not in the history snapshot (the filter acts after the history).
+  rtls::ParameterSnapshot a = {};
+  CHECK(sizeof(a) == 23u * sizeof(float), "snapshot size unchanged by the edge stop (%zu)", sizeof(a));
+}
+
 int main() {
   HStage("push layout");
   TestPushLayout();
@@ -673,6 +700,8 @@ int main() {
   TestLightingMath();
   HStage("parameter snapshot");
   TestParameterSnapshot();
+  HStage("penumbra edge stop");
+  TestValueStop();
   HStage("characters");
   TestCharacters();
   HStage("json");

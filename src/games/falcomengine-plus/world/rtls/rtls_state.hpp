@@ -43,6 +43,7 @@ inline float g_rtls_filter_radius = 2.f;
 inline float g_rtls_filter_passes = 1.f;
 inline float g_rtls_filter_taps_separable = 5.f;
 inline float g_rtls_filter_taps_atrous = 5.f;
+inline float g_rtls_filter_value_stop = 4.f;   // Penumbra Edge Stop k (spatial filter only; not in the snapshot)
 
 enum class Reason : uint8_t { Off = 0, NotSora2nd, InputsMissing, DeferredList, RangeTooSmall, NoLights, NoKinds, PipelineFailed };
 

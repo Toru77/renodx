@@ -121,6 +121,7 @@ struct RtgiDenoiseRequest {
   uint32_t full_height;
   bool temporal;           // Temporal on and a motion view available
   bool spatial;            // Spatial filter on
+  std::span<const std::uint8_t> filter_code;  // RTGI kRtgiFilterShader; RTLS kRtlsFilterShader (penumbra edge stop)
   const char* log_prefix;  // "[world-rtgi]" or "[world-rtls]"
 };
 
@@ -170,7 +171,7 @@ inline RtgiDenoiseReady EnsureRtgiDenoise(reshade::api::device* device, RtgiDeno
   const bool spatial_run = request.spatial
       && EnsureRtgiPipeline(device, &set->filter_pipeline, {.srv_count = kRtgiFilterSrvCount, .uav_count = kRtgiFilterUavCount,
                                                             .sampler_count = 0u, .push_count = kRtgiFilterPushCount,
-                                                            .code = kRtgiFilterShader, .name = "filter"})
+                                                            .code = request.filter_code, .name = "filter"})
       && EnsureRtgiTextureSet(device, &set->filter, reshade::api::format::r16g16b16a16_float, 8u, request.trace_width, request.trace_height);
   return {.ok = true, .temporal = temporal_run, .spatial = spatial_run};
 }
@@ -197,6 +198,7 @@ struct RtgiDenoiseInputs {
   int filter_radius;
   int filter_passes;
   int filter_taps;
+  float filter_value_stop;                      // filter c2.w: RTLS penumbra edge stop k; RTGI 0
   float upsample_intensity;                     // upsample c1.z (Debug 7 only)
   float upsample_char_intensity;                // upsample c1.w (Debug 7 only)
   float upsample_saturation;                    // upsample c2.x; 1 = unchanged
@@ -291,7 +293,7 @@ inline RtgiDenoiseResult DispatchRtgiDenoise(reshade::api::device* device, resha
                    plan.kind == rtao::FilterKind::Separable ? 0.f : 1.f},
           .pass = {static_cast<float>(pass.direction), static_cast<float>(pass.step), static_cast<float>(plan.taps_side),
                    i + 1u == plan.pass_count ? 1.f : 0.f},
-          .full = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), in.divisor, 0.f},
+          .full = {static_cast<float>(in.full_width), static_cast<float>(in.full_height), in.divisor, in.filter_value_stop},
       };
       const reshade::api::descriptor_table filter_tables[3] = {filter.cbv_table, filter.srv_table, filter.uav_table};
       cmd_list->bind_descriptor_tables(reshade::api::shader_stage::all_compute, filter.layout, 0, 3, filter_tables);
@@ -413,6 +415,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
                                                       .full_height = in.full_height,
                                                       .temporal = in.temporal && in.motion_view.handle != 0u,
                                                       .spatial = in.spatial,
+                                                      .filter_code = kRtgiFilterShader,
                                                       .log_prefix = "[world-rtgi]"});
   if (!denoise.ok) return {};
 
@@ -522,6 +525,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
        .filter_radius = in.filter_radius,
        .filter_passes = in.filter_passes,
        .filter_taps = in.filter_taps,
+       .filter_value_stop = 0.f,
        .upsample_intensity = g_rtgi_intensity,
        .upsample_char_intensity = g_rtgi_char_intensity,
        .upsample_saturation = g_rtgi_saturation},
