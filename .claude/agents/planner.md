@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Use proactively whenever the user asks to plan, design, break down, or figure out how to build something, asks how to approach a change, or asks which option to choose. Also use when the implementer or reviewer reports DECISION NEEDED or PLAN DEVIATION. Planning only; never writes code and never reviews.
-model: claude-opus-5-5
+model: claude-sonnet-5-5
 effort: high
 ---
 
