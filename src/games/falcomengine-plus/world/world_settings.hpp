@@ -902,7 +902,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Extra Bounces",
       .section = "RTGI",
-      .tooltip = "Adds bounce light by feeding back last frame's bounce from the screen, so light bounces more than once over several frames. Only surfaces visible on screen. Feedback does nothing on a frame when last frame's bounce was not applied. Off = unchanged.",
+      .tooltip = "Real Extra Rays: traces extra bounce rays (Extra Bounce Rays, 1 or 2) per first-bounce hit, which also reach off-screen hits through the fallback shading. More expensive; compare cost in the Performance tab. Off = no extra rays. Feedback is always on.",
       .labels = {"Off", "On"},
       .is_visible = visible,
   });
@@ -913,24 +913,11 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.5f,
       .label = "Feedback Strength",
       .section = "RTGI",
-      .tooltip = "How much of last frame's bounce is fed back (0 = none, 1 = full). Automatically limited so that Feedback Strength x GI Intensity stays at or below 0.9, to keep the image stable.",
+      .tooltip = "Always on, with or without Extra Bounces: feeds back last frame's bounce from the screen, so light bounces more than once over several frames. Only surfaces visible on screen; does nothing on a frame when last frame's bounce was not applied. How much is fed back (0 = none, 1 = full). Automatically limited so that Feedback Strength x GI Intensity stays at or below 0.9, to keep the image stable.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
-      .is_visible = [visible]() {
-        return visible() && rtgi::g_rtgi_extra_bounces > 0.5f && rtgi::g_rtgi_extra_bounce_method < 0.5f;
-      },
-  });
-  settings->push_back(new Setting{
-      .key = "RtgiExtraBounceMethod",
-      .binding = &rtgi::g_rtgi_extra_bounce_method,
-      .value_type = SettingValueType::INTEGER,
-      .default_value = 0.f,
-      .label = "Extra Bounce Method",
-      .section = "RTGI",
-      .tooltip = "Feedback: feeds back last frame's bounce (cheap, screen only). Real Extra Rays: traces one or two extra rays per first-bounce hit (more expensive; reaches off-screen hits through the fallback shading). Use the Performance tab to compare cost.",
-      .labels = {"Feedback", "Real Extra Rays"},
-      .is_visible = [visible]() { return visible() && rtgi::g_rtgi_extra_bounces > 0.5f; },
+      .is_visible = visible,
   });
   settings->push_back(new Setting{
       .key = "RtgiExtraBounceRays",
@@ -939,13 +926,11 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Extra Bounce Rays",
       .section = "RTGI",
-      .tooltip = "Number of extra bounce rays per first-bounce hit (1 or 2). Each adds roughly the cost of today's RTGI trace.",
+      .tooltip = "Number of extra bounce rays per first-bounce hit (1 or 2), used while Extra Bounces is On. Each adds roughly the cost of today's RTGI trace.",
       .min = 1.f,
       .max = 2.f,
       .format = "%d",
-      .is_visible = [visible]() {
-        return visible() && rtgi::g_rtgi_extra_bounces > 0.5f && rtgi::g_rtgi_extra_bounce_method > 0.5f;
-      },
+      .is_visible = [visible]() { return visible() && rtgi::g_rtgi_extra_bounces > 0.5f; },
   });
   settings->push_back(new Setting{
       .key = "RtgiBounceSaturation",

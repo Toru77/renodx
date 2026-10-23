@@ -779,3 +779,14 @@ Verification (2026-10-08):
   2. Debug 3 minus Debug 10 is the first bounce (the light that is not extra).
   3. Send screenshots of Debug 3, Debug 7 and Debug 10 in the same spot.
 - Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtgi.cs_5_0.hlsl` before (HEAD 4e671625): 0x53555A55A4D60013. After: 0xA5E7DA5627AC8BBF.
+
+## Extra Bounces: method slider removed, Feedback always on (rtgi-bounce-stack): implemented, not validated in game
+
+- RtgiExtraBounceMethod "Extra Bounce Method" is removed. Feedback Strength (RtgiFeedbackStrength) is always shown and always on, with or without Extra Bounces. Extra Bounces (Off/On) now only turns Real Extra Rays on or off; its tooltip says so.
+- Stacking: the feedback add-back applies to the first bounce only (`b == 0`), as before. The real extra rays add bounces 1 and 2 on top, so both can be active together. Feedback still runs only when last frame's bounce was applied and keeps its cap (f_eff x GI Intensity <= 0.9).
+- Flags: `RTGI_FLAG_FEEDBACK` (64) is set whenever f_eff > 0. `RTGI_FLAG_REAL_RAYS` (128) is set whenever the effective rays > 0 (Extra Bounces On).
+- Snapshot: `extra_bounce_method` removed; the count goes 28 -> 27. Any change resets RTGI history.
+- JSON: the `extra_bounces` block no longer has `method`. The panel line shows on/off, rays and feedback.
+- Debug 10 adds both parts: `extra + fed_back`.
+- Open: Bounce Saturation is still shown only while Extra Bounces is On, and its tooltip still says it does nothing with Extra Bounces Off. Feedback is now always on, so that is no longer accurate. Not changed here.
+- Owner test (not run): Feedback alone with Extra Bounces Off; Extra Bounces On with Feedback Strength 0; both on together.

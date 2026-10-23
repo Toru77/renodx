@@ -77,7 +77,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
     float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, lamp shadow clearance (m; 0 unless RTGI_FLAG_LAMP_SHADOWS)
-    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), Extra Bounce Rays (z, Real Extra Rays only), Bounce Saturation (w, extra bounce light only)
+    float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), Extra Bounce Rays (z, Extra Bounces only), Bounce Saturation (w, extra bounce light only)
 };
 
 #define RTGI_STAT_RAYS 0u
@@ -284,7 +284,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 float3 gi_sum = float3(0.0, 0.0, 0.0);
                 float3 extra_light_sum = float3(0.0, 0.0, 0.0);
                 const float3 origin = P + N * g_rtgi_params.y;
-                // Real Extra Rays: bounces b = 1 .. bounce_rays follow the ray from the previous hit (at most 2).
+                // Extra Bounces: bounces b = 1 .. bounce_rays follow the ray from the previous hit (at most 2).
                 const uint bounce_rays = (flags & RTGI_FLAG_REAL_RAYS) != 0u ? min((uint)g_rtgi_dynamic.z, 2u) : 0u;
                 // GI rays skip surfaces the game camera does not show (shadow-only casters, near-faded surfaces), as RTAO.
                 const WorldCameraView view = {true, 1.0, 0u, 0u};
@@ -401,9 +401,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                         * g_rtgi_albedo.Load(int3(min(uint2(hit_uv * float2(aw, ah)), uint2(aw, ah) - 1u), 0)).rgb
                                         * g_rtgi_shading.z;
                                     radiance = max(radiance - applied, 0.0);
-                                    if ((flags & RTGI_FLAG_FEEDBACK) != 0u)
+                                    if (b == 0u && (flags & RTGI_FLAG_FEEDBACK) != 0u)
                                     {
-                                        // Extra Bounces: keep the feedback share of the subtracted bounce, so it builds up over frames.
+                                        // Feedback (first bounce only): keep the feedback share of the subtracted bounce, so it builds up over frames.
                                         float3 fed_back = g_rtgi_dynamic.y * applied;
                                         if (g_rtgi_dynamic.w != 1.0)
                                         {
@@ -507,7 +507,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     }
                     else if (debug_mode == 10)
                     {
-                        extra_light_sum += (flags & RTGI_FLAG_REAL_RAYS) != 0u ? extra : fed_back_view;
+                        extra_light_sum += extra + fed_back_view;
                     }
                     radiance = max(radiance, 0.0);
                     const float luminance = dot(radiance, float3(0.2126, 0.7152, 0.0722));

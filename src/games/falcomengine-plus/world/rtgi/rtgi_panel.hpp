@@ -54,9 +54,8 @@ inline void DrawRtgiPanel() {
                   ? "added this frame"
                   : "not added (GI Intensity 0, not Sora 2nd, or not running)",
               frame.subtracted ? "on" : "off");
-  ImGui::Text("Extra bounces: %s, method %s, rays %u, feedback %.2f (effective %.2f)",
-              g_rtgi_extra_bounces > 0.5f ? "on" : "off",
-              g_rtgi_extra_bounce_method > 0.5f ? "Real Extra Rays" : "Feedback", RtgiExtraBounceRaysEffective(),
+  ImGui::Text("Extra bounces: %s, rays %u, feedback %.2f (effective %.2f)",
+              g_rtgi_extra_bounces > 0.5f ? "on" : "off", RtgiExtraBounceRaysEffective(),
               g_rtgi_feedback_strength, RtgiFeedbackStrengthEffective());
   ImGui::Text("Characters: %s (%u objects traced)", g_rtgi_trace_characters > 0.5f ? "on" : "off",
               frame.character_objects);

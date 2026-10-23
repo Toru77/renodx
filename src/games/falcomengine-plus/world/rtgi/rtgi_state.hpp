@@ -42,9 +42,8 @@ inline float g_rtgi_filter_taps_atrous = 5.f;     // Filter Taps (a-trous): 3..9
 inline float g_rtgi_intensity = 1.f;              // GI Intensity: scale of the bounce added to the image (0 = none)
 inline float g_rtgi_char_intensity = 1.f;         // Character GI Intensity: on the character shading path
 inline float g_rtgi_saturation = 1.f;             // GI Saturation: saturation of the added diffuse GI (upsample pass)
-inline float g_rtgi_extra_bounces = 0.f;          // Extra Bounces: feed last frame's bounce back from the screen (trace flag)
-inline float g_rtgi_feedback_strength = 0.5f;     // Feedback Strength: share of last frame's bounce fed back, before the cap
-inline float g_rtgi_extra_bounce_method = 0.f;    // Extra Bounce Method: 0 Feedback, 1 Real Extra Rays
+inline float g_rtgi_extra_bounces = 0.f;          // Extra Bounces: real extra bounce rays on top of Feedback (trace flag)
+inline float g_rtgi_feedback_strength = 0.5f;     // Feedback Strength: share of last frame's bounce fed back (always on), before the cap
 inline float g_rtgi_extra_bounce_rays = 1.f;      // Extra Bounce Rays: extra rays per first-bounce hit (Real Extra Rays), 1 or 2
 inline float g_rtgi_bounce_saturation = 1.f;      // Bounce Saturation: saturation of the extra bounce light only (Feedback add-back, Real Extra Rays)
 inline float g_rtgi_trace_characters = 0.f;  // Trace characters: RTGI rays hit this frame's skinned characters
@@ -105,19 +104,14 @@ inline float RtgiRtaoMaxDarkening(float rtao_max_darkening) {
   return std::min(1.f, 1.8f * rtao_max_darkening);
 }
 
-// Effective Feedback Strength (f_eff, push c7.y): 0 while Extra Bounces is off, else the setting limited so that
-// f_eff x GI Intensity stays at or below 0.9.
+// Effective Feedback Strength (f_eff, push c7.y): the setting limited so that f_eff x GI Intensity stays at or below 0.9.
 inline float RtgiFeedbackStrengthEffective() {
-  if (g_rtgi_extra_bounces < 0.5f) {
-    return 0.f;
-  }
   return std::min(g_rtgi_feedback_strength, 0.9f / (std::max)(g_rtgi_intensity, 0.001f));
 }
 
-// Effective Extra Bounce Rays (push c7.z): 0 unless Extra Bounces is on and the method is Real Extra Rays, else the
-// setting limited to 1 or 2.
+// Effective Extra Bounce Rays (push c7.z): 0 unless Extra Bounces is on, else the setting limited to 1 or 2.
 inline uint32_t RtgiExtraBounceRaysEffective() {
-  if (g_rtgi_extra_bounces < 0.5f || g_rtgi_extra_bounce_method < 0.5f) {
+  if (g_rtgi_extra_bounces < 0.5f) {
     return 0u;
   }
   return static_cast<uint32_t>(std::clamp(g_rtgi_extra_bounce_rays, 1.f, 2.f));
@@ -129,7 +123,7 @@ struct ParameterSnapshot {
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
   float trace_characters;
   float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun, lamp_shadows;
-  float extra_bounces, feedback_strength, extra_bounce_method, extra_bounce_rays, bounce_saturation;
+  float extra_bounces, feedback_strength, extra_bounce_rays, bounce_saturation;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

@@ -9568,7 +9568,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
       rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
-      rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength, rtgi::g_rtgi_extra_bounce_method,
+      rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength,
       rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
@@ -9634,9 +9634,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                        | (rtgi::g_rtgi_fallback_no_albedo > 0.5f ? rtgi::kRtgiFlagFallbackNoAlbedo : 0u)
                        | (dynamic_lights ? rtgi::kRtgiFlagDynamicLights : 0u)
                        | (rtgi::g_rtgi_game_sun > 0.5f ? rtgi::kRtgiFlagGameSun : 0u)
-                       | ((feedback_strength > 0.f && rtgi::g_rtgi_extra_bounce_method < 0.5f)
-                              ? rtgi::kRtgiFlagFeedback
-                              : 0u)
+                       | (feedback_strength > 0.f ? rtgi::kRtgiFlagFeedback : 0u)
                        | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)
                        | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)),
                    0.f},
