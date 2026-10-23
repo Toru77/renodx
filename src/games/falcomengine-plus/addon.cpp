@@ -19,6 +19,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
@@ -9249,14 +9250,10 @@ static void RunRtaoInline(reshade::api::command_list* cmd_list) {
       {rf.temporal_last ? 1.f : 0.f, 0.f, 0.f, 0.f},
   };
 
-  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-  renodx::utils::state::CommandListState prev = {};
-  if (cs) prev = *cs;
   if (rtao::g_rtao_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
   const rtao::RtaoDispatchResult result = rtao::Dispatch(dev, cmd_list, in);
-  ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
   rf.temporal_ran = result.temporal_ran;
   rf.temporal_last = temporal_on && result.temporal_ran;
   if (!result.ok) {
@@ -9454,14 +9451,10 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
       .filter_taps = static_cast<int>(rtls::g_rtls_filter_type > 0.5f ? rtls::g_rtls_filter_taps_atrous
                                                                      : rtls::g_rtls_filter_taps_separable),
       .filter_value_stop = rtls::g_rtls_filter_value_stop};
-  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-  renodx::utils::state::CommandListState prev = {};
-  if (cs) prev = *cs;
   if (rtls::g_rtls_trace_characters > 0.5f) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
   const rtls::RtlsDispatchResult result = rtls::Dispatch(dev, cmd_list, in);
-  ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
   if (!result.ok) {
     frame.reason = rtls::Reason::PipelineFailed;
     return;
@@ -9617,11 +9610,6 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       && rtgi::g_rtgi_dynamic_lights > 0.5f;
   const bool lamp_shadows = dynamic_lights && rtgi::g_rtgi_lamp_shadows > 0.5f;
   const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
-  auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
-  renodx::utils::state::CommandListState prev = {};
-  if (cs != nullptr) {
-    prev = *cs;
-  }
   const float feedback_strength = rtgi::RtgiFeedbackStrengthEffective();
   const uint32_t extra_rays = rtgi::RtgiExtraBounceRaysEffective();
   rtgi::RtgiDispatchInputs in = {
@@ -9692,7 +9680,6 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
     in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
   }
   const rtgi::RtgiDispatchResult result = rtgi::Dispatch(dev, cmd_list, in);
-  ApplyGTVBAOCSDispatchFix(cmd_list, cs, prev);
   if (!result.ok) {
     frame.reason = rtgi::Reason::PipelineFailed;
     return;
@@ -9783,6 +9770,12 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   shader_injection.gtvbao_debug_mode = shader_injection.gtvbao_debug_view;
   shader_injection.foliage_debug_mode = shader_injection.debug_show_env_sss;
 
+  // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
+  // once here and restore it after RTGI: the engine's volumetric-fog compute reads those bindings.
+  std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
+  if (falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested()) {
+    game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
+  }
   // RTAO runs before the shadows so micro shadows read this frame's AO.
   RunRtaoInline(cmd_list);
 
@@ -9791,6 +9784,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);
+  if (game_compute_state) {
+    game_compute_state->ApplyCompute(true);
+  }
 
   // Contact / Micro Shadows. Placed here, before the GTVBAO/DynCube early-out
   // below, because those two are entirely independent of the shadow passes: on a
