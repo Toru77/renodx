@@ -147,7 +147,12 @@ float3 SunGiAt(float2 uv, float3 surface)
 float3 LampDiffuseSum(float3 position, float3 n, bool shadow_rays)
 {
     float3 lamp_sum = float3(0.0, 0.0, 0.0);
-    for (uint li = 0u; li < RTGI_LAMP_COUNT; ++li)
+    // The bound is the lamp type buffer's size (1024 entries, kRtgiLampCount; 0 when it is not bound), not a constant:
+    // a constant-bound loop around the shadow ray's inlined BVH traversal makes fxc stall.
+    uint lamp_count;
+    uint lamp_stride;
+    g_rtgi_lamp_types.GetDimensions(lamp_count, lamp_stride);
+    for (uint li = 0u; li < min(RTGI_LAMP_COUNT, lamp_count); ++li)
     {
         const uint lamp_type = g_rtgi_lamp_types[li];
         const LightParam lamp = g_rtgi_lamps[li];
