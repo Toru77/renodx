@@ -1130,6 +1130,18 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .format = "%.2f",
       .is_visible = visible,
   });
+  settings->push_back(new Setting{
+      .key = "RtgiLampShadows",
+      .binding = &rtgi::g_rtgi_lamp_shadows,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "Off-screen Lamp Shadows",
+      .section = "RTGI",
+      .tooltip = "With Off-screen Dynamic Lights on: hidden and off-screen GI hits trace one shadow ray per lamp, so lamps behind walls no longer light them. The ray stops Light Clearance (RT Local Shadows) before the lamp. Off = unchanged.",
+      .labels = {"Off", "On"},
+      .is_enabled = []() { return rtgi::g_rtgi_dynamic_lights > 0.5f; },
+      .is_visible = visible,
+  });
   AddTemporalRows(settings, visible, {.prefix = "Rtgi",
                                       .section = "RTGI Temporal Accumulation",
                                       .enabled_tooltip = "Reprojects the previous frame GI with the game motion (RTV4 target) and blends it in after validation. Resets on camera cuts, frame gaps and parameter changes.",

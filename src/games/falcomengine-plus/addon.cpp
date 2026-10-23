@@ -9498,6 +9498,7 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
 static void RunRtgiInline(reshade::api::command_list* cmd_list) {
   namespace rtao = falcom_world::rtao;
   namespace rtgi = falcom_world::rtgi;
+  namespace rtls = falcom_world::rtls;
   auto& frame = rtgi::g_rtgi_frame;
   frame.producing = false;
   frame.reason = rtgi::Reason::Off;
@@ -9573,7 +9574,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       rtgi::g_rtgi_temporal_enabled, rtgi::g_rtgi_history_weight, rtgi::g_rtgi_depth_rejection, rtgi::g_rtgi_normal_rejection,
       rtgi::g_rtgi_history_clamp, rtgi::g_rtgi_debug, rtgi::g_rtgi_sun_distance, rtgi::g_rtgi_trace_characters,
       rtgi::g_rtgi_sun_casters_only, rtgi::g_rtgi_sun_contribution, rtgi::g_rtgi_fallback_no_albedo,
-      rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun,
+      rtgi::g_rtgi_dynamic_lights, rtgi::g_rtgi_dynamic_light_contribution, rtgi::g_rtgi_game_sun, rtgi::g_rtgi_lamp_shadows,
       rtgi::g_rtgi_extra_bounces, rtgi::g_rtgi_feedback_strength, rtgi::g_rtgi_extra_bounce_method,
       rtgi::g_rtgi_extra_bounce_rays, rtgi::g_rtgi_bounce_saturation};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
@@ -9613,6 +9614,7 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       && rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed);
   const bool dynamic_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
       && rtgi::g_rtgi_dynamic_lights > 0.5f;
+  const bool lamp_shadows = dynamic_lights && rtgi::g_rtgi_lamp_shadows > 0.5f;
   const bool sora2nd_bindings = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr;
   auto* cs = renodx::utils::state::GetCurrentState(cmd_list);
   renodx::utils::state::CommandListState prev = {};
@@ -9646,13 +9648,14 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
                        | ((feedback_strength > 0.f && rtgi::g_rtgi_extra_bounce_method < 0.5f)
                               ? rtgi::kRtgiFlagFeedback
                               : 0u)
-                       | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)),
+                       | (extra_rays > 0u ? rtgi::kRtgiFlagRealRays : 0u)
+                       | (lamp_shadows ? rtgi::kRtgiFlagLampShadows : 0u)),
                    0.f},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
           .shading = {rtgi::g_rtgi_ambient, rtgi::g_rtgi_radiance_clamp, subtract ? frame.applied_intensity : 0.f,
                       static_cast<float>(prev_view_proj_register)},
-          .sun = {rtgi::g_rtgi_sun_distance, 0.f, rtgi::g_rtgi_sun_contribution, 0.f},
+          .sun = {rtgi::g_rtgi_sun_distance, 0.f, rtgi::g_rtgi_sun_contribution, (lamp_shadows ? rtls::g_rtls_light_clearance : 0.f)},
           .extra = {rtgi::g_rtgi_dynamic_light_contribution, feedback_strength, static_cast<float>(extra_rays),
                     rtgi::g_rtgi_bounce_saturation},
       },

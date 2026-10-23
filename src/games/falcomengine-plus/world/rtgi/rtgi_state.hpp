@@ -26,6 +26,7 @@ inline float g_rtgi_sun_contribution = 1.f;   // Sun Contribution: scales only R
 inline float g_rtgi_fallback_no_albedo = 0.f;  // Off-screen Hits: No Albedo Guess: fallback hits use albedo 1.0, not 0.5
 inline float g_rtgi_dynamic_lights = 0.f;   // Off-screen Dynamic Lights: lamps add light to fallback hits
 inline float g_rtgi_dynamic_light_contribution = 1.f;  // Dynamic Light Contribution: scales only RTGI's lamp bounce
+inline float g_rtgi_lamp_shadows = 0.f;  // Off-screen Lamp Shadows: fallback lamp light gets shadow rays
 inline float g_rtgi_game_sun = 0.f;  // Game-Style Fallback Sun: fallback sun gets the game's shadow floor
 inline float g_rtgi_temporal_enabled = 1.f;
 inline float g_rtgi_history_weight = 0.95f;
@@ -127,7 +128,7 @@ struct ParameterSnapshot {
   float samples, ray_max, normal_bias, trace_resolution, isfast, fade_start, fade_end, radiance_clamp, ambient;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug, sun_distance;
   float trace_characters;
-  float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun;
+  float sun_casters_only, sun_contribution, fallback_no_albedo, dynamic_lights, dynamic_light_contribution, game_sun, lamp_shadows;
   float extra_bounces, feedback_strength, extra_bounce_method, extra_bounce_rays, bounce_saturation;
   bool operator==(const ParameterSnapshot&) const = default;
 };

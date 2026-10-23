@@ -52,6 +52,7 @@ Implemented, not validated in game. Each feature's owner test list is in its HIS
 | RT Local Shadows M3 (applied in the lighting shader, full resolution, raw) | Owner list in HISTORY: RT Local Shadows M3 | Reference: RT Local Shadows |
 | RT Local Shadows M4b (denoise and trace resolution) | Owner list in HISTORY: RT Local Shadows M4b | Reference: RT Local Shadows |
 | RT Local Shadows M5 item 2 (penumbra edge stop in the spatial filter) | Owner list in HISTORY: RT Local Shadows M5 item 2 | Reference: RT Local Shadows |
+| RT Local Shadows M5 item 3 (RTGI off-screen lamp shadows) | Owner list in HISTORY: RT Local Shadows M5 item 3 | Reference: RT Local Shadows |
 | TLAS rebuild reduction (skip no-op, slack TLAS, default OFF) | A/B in game | HISTORY: TLAS rebuild reduction (cache-diag-2) |
 | Cache diagnostics (Phase 0, 0b) | Dump twice; placement compare | HISTORY: Phase 0 cache diagnostics; Step 0b (cache-diag-1) |
 | Refit and drain cleanup; refit diet; rebuild diet; housekeeping | Regression only; no pins changed | HISTORY: Refit and drain cleanup; Rebuild diet; Refit diet; Housekeeping |

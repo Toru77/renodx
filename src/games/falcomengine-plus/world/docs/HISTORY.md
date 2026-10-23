@@ -41,6 +41,14 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M5 item 3 (RTGI off-screen lamp shadows), implemented, not validated in game
+
+- New RTGI row Off-screen Lamp Shadows (RtgiLampShadows, section RTGI, default Off, greyed unless Off-screen Dynamic Lights is on; part of the RTGI parameter snapshot, so a change resets RTGI history). With it on, each fallback hit (hidden or off-screen) traces one shadow ray per lamp that lights it, and a blocked lamp adds nothing. The ray ends Light Clearance (the RTLS setting, c6.w; no new row) before the lamp and starts on the back side for back-lit lamps. The on-screen estimate never traces.
+- Flag bit 256 (RTGI_FLAG_LAMP_SHADOWS, kRtgiFlagLampShadows) in b12 c2.z; the lamp shadow clearance goes in c6.w only when the flag is set. With the option Off the push words are unchanged and the branch is skipped, so the output is unchanged.
+- The RTGI shader bytecode changes (new branch). Compiled with the same fxc flags before and after: 64976 bytes before, 83528 bytes after. The test_rtgi golden is unchanged (0x22868adf1653e774, 16 dispatches).
+- Harness: test_rtgi PASS (0 failures); test_rtls PASS (0 failures). Allowed failures only: test_rtao, test_live, test_motion.
+- Owner check: Off-screen Dynamic Lights and Off-screen Lamp Shadows both on: lamp light no longer leaks through a wall in the RTGI bounce.
+
 ## RT Local Shadows: M5 item 2 (penumbra edge stop), implemented, not validated in game
 
 - The RTLS spatial filter now also weights each tap by exp(-k x max(|point - centre point|, |spot - centre spot|)), so penumbra edges stay sharp across flat floors where depth and normal edge stops do nothing. k is the new saved row Penumbra Edge Stop (RtlsFilterValueStop, RTLS Denoising, default 4, range 0 to 32; 0 gives the previous behaviour). It is not part of the history snapshot.

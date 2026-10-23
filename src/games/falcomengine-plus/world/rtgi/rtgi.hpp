@@ -656,6 +656,7 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
   out << "  \"fallback_no_albedo\": " << g_rtgi_fallback_no_albedo << ",\n";
   out << "  \"dynamic_lights\": " << g_rtgi_dynamic_lights << ",\n";
   out << "  \"dynamic_light_contribution\": " << g_rtgi_dynamic_light_contribution << ",\n";
+  out << "  \"lamp_shadows\": " << g_rtgi_lamp_shadows << ",\n";
   out << "  \"trace_characters\": " << g_rtgi_trace_characters << ",\n";
   out << "  \"game_sun_floor\": " << g_rtgi_game_sun << ",\n";
   out << "  \"character_objects\": " << f.character_objects << ",\n";

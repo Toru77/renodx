@@ -76,7 +76,7 @@ cbuffer cb_rtgi : register(b12)
     float4 g_rtgi_region : packoffset(c3);    // region min xyz, region size
     float4 g_rtgi_size : packoffset(c4);      // trace width, trace height, full width, full height
     float4 g_rtgi_shading : packoffset(c5);   // ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity, prevViewProj_g register (per variant)
-    float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, unused
+    float4 g_rtgi_sun : packoffset(c6); // Sun Shadow Distance (m), characters (t10-t13), Sun Contribution, lamp shadow clearance (m; 0 unless RTGI_FLAG_LAMP_SHADOWS)
     float4 g_rtgi_dynamic : packoffset(c7);  // Dynamic Light Contribution (x), Feedback Strength (y, effective), Extra Bounce Rays (z, Real Extra Rays only), Bounce Saturation (w, extra bounce light only)
 };
 
@@ -111,6 +111,7 @@ cbuffer cb_rtgi : register(b12)
 #define RTGI_FLAG_GAME_SUN 32u
 #define RTGI_FLAG_FEEDBACK 64u
 #define RTGI_FLAG_REAL_RAYS 128u
+#define RTGI_FLAG_LAMP_SHADOWS 256u
 #define RTGI_LAMP_COUNT 1024u
 #define RTGI_FALLBACK_ALBEDO 0.5
 
@@ -143,7 +144,7 @@ float3 SunGiAt(float2 uv, float3 surface)
 
 // Sum of the game's point and spot diffuse of the lamps with a type bit (lighting lines 1505-1664 without the Hammon
 // correction and shadow maps). The caller applies the albedo and the lamp contribution.
-float3 LampDiffuseSum(float3 position, float3 n)
+float3 LampDiffuseSum(float3 position, float3 n, bool shadow_rays)
 {
     float3 lamp_sum = float3(0.0, 0.0, 0.0);
     for (uint li = 0u; li < RTGI_LAMP_COUNT; ++li)
@@ -158,6 +159,20 @@ float3 LampDiffuseSum(float3 position, float3 n)
         const float lamp_att = LampDistanceAttenuation(lamp, to_lamp);
         const float3 lamp_dir = normalize(to_lamp);
         const float lamp_ndl = max(lamp.translucency, dot(n, lamp_dir));
+        // Off-screen Lamp Shadows (RTGI_FLAG_LAMP_SHADOWS, fallback hits only): a lamp blocked between the hit and the lamp
+        // (ray ends Light Clearance, c6.w, before it) adds nothing. Back-lit lamps are traced from the back side.
+        if (shadow_rays && lamp_att > 0.0)
+        {
+            const float lamp_reach = length(to_lamp) - g_rtgi_sun.w;
+            if (lamp_reach > 1e-3)
+            {
+                const WorldCameraView lamp_view = {false, 1.0, 0u, 0u};
+                WorldTraceCounters lamp_counters;
+                const float3 lamp_origin = position + n * (dot(n, lamp_dir) > 0.0 ? g_rtgi_params.y : -g_rtgi_params.y);
+                const WorldTraceHit lamp_hit = TraceWorldAny(lamp_origin, lamp_dir, 1e-3, lamp_reach, lamp_view, lamp_counters);
+                if (lamp_hit.prim != 0xFFFFFFFFu) continue;
+            }
+        }
         if ((lamp_type & RTGI_LAMP_TYPE_POINT) != 0u)
         {
             lamp_sum += lamp.color * lamp_att * lamp_ndl;
@@ -414,7 +429,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                                         const uint material_index = min(0x4e1fu, g_mrt2.Load(int3(material_px, 0)).x);
                                         const float dynamic_light_intensity = g_rtgi_deferred[material_index].mid.w;
                                         radiance += (g_rtgi_dynamic.x - 1.0) * surface * dynamic_light_intensity
-                                            * LampDiffuseSum(hit.position, n);
+                                            * LampDiffuseSum(hit.position, n, false);
                                     }
                                 }
                                 looked_up = true;
@@ -460,7 +475,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                             radiance = fallback_albedo * (sun_light + g_rtgi_shading.x * ambient);
                             if ((flags & RTGI_FLAG_DYNAMIC_LIGHTS) != 0u)
                             {
-                                radiance += fallback_albedo * g_rtgi_dynamic.x * LampDiffuseSum(hit.position, n);
+                                radiance += fallback_albedo * g_rtgi_dynamic.x * LampDiffuseSum(hit.position, n, (flags & RTGI_FLAG_LAMP_SHADOWS) != 0u);
                             }
                         }
                         if (b == 0u)

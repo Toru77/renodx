@@ -62,6 +62,7 @@ inline constexpr uint32_t kRtgiFlagDynamicLights = 16u;  // b12 c2.z bit: fallba
 inline constexpr uint32_t kRtgiFlagGameSun = 32u;  // b12 c2.z bit: fallback sun gets the game's shadow floor
 inline constexpr uint32_t kRtgiFlagFeedback = 64u;  // b12 c2.z bit: add back the feedback share (c7.y) of last frame's bounce
 inline constexpr uint32_t kRtgiFlagRealRays = 128u;  // b12 c2.z bit: Real Extra Rays, extra bounce rays from c7.z
+inline constexpr uint32_t kRtgiFlagLampShadows = 256u;  // b12 c2.z bit: fallback lamp light gets a shadow ray per lamp
 // Temporal pass counters, matching RTGI_STAT_* in world_rtgi_temporal.cs_5_0.hlsl.
 inline constexpr uint32_t kRtgiStatTemporalPixels = 20u;
 inline constexpr uint32_t kRtgiStatNoHistory = 21u;
@@ -136,7 +137,7 @@ struct RtgiPushConstants {
   float region[4];    // c3: region min xyz, region size
   float size[4];      // c4: trace width, trace height, full width, full height
   float shading[4];   // c5: ambient contribution, radiance clamp (0 = off), last frame's applied GI Intensity (one bounce), prevViewProj_g register (RtgiPrevViewProjRegister)
-  float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), Sun Contribution, unused
+  float sun[4];       // c6: Sun Shadow Distance (m), character object count (t10-t13), Sun Contribution, lamp shadow clearance (m; 0 unless kRtgiFlagLampShadows)
   float extra[4];     // c7: x = Dynamic Light Contribution, y = effective Feedback Strength, z = Extra Bounce Rays (Real Extra Rays only), w = Bounce Saturation (extra bounce light only)
 };
 static_assert(sizeof(RtgiPushConstants) == kRtgiPushConstantCount * sizeof(float), "b12 must be 32 floats");

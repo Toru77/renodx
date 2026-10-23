@@ -105,6 +105,11 @@ static void TestParameterSnapshot() {
 static void TestShaderDefines() {
   const std::string text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtgi.cs_5_0.hlsl");
   CHECK(!text.empty(), "shader copy readable (run refresh_world.ps1 first)");
+  CHECK(text.find("#define RTGI_FLAG_LAMP_SHADOWS " + std::to_string(rtgi::kRtgiFlagLampShadows) + "u") != std::string::npos,
+        "lamp shadow flag define matches kRtgiFlagLampShadows");
+  CHECK(text.find("LampDiffuseSum(hit.position, n, false)") != std::string::npos
+            && text.find("LampDiffuseSum(hit.position, n, (flags & RTGI_FLAG_LAMP_SHADOWS) != 0u)") != std::string::npos,
+        "on-screen estimate never traces; the fallback traces only under the flag");
   const struct {
     const char* name;
     uint32_t value;
@@ -245,6 +250,7 @@ static void TestJson() {
   CHECK(text.find("\"schema\": 1") != std::string::npos, "schema key");
   CHECK(text.find("\"stats\": {") != std::string::npos, "stats object");
   CHECK(text.find("\"hit_off_screen\": ") != std::string::npos, "hit_off_screen key");
+  CHECK(text.find("\"lamp_shadows\": ") != std::string::npos, "lamp_shadows key");
   CHECK(text.find("\"perf_gather\": false") != std::string::npos, "perf_gather key");
   CHECK(text.find("\"radiance\": {") != std::string::npos, "radiance object");
   CHECK(text.find("\"luminance_max\": ") != std::string::npos, "luminance_max key");
