@@ -62,7 +62,10 @@ inline void DrawRtlsPanel() {
   ImGui::Text("Texture: %.2f MB", static_cast<double>(frame.texture_bytes) / (1024.0 * 1024.0));
   if (ImGui::Button("Read RTLS Stats")) {
     g_rtls_stats.requested.store(true, std::memory_order_relaxed);
+    // Same present as the RTGI stats (both captures run together); the lights file needs RTGI on and Sora 2nd.
+    rtgi::g_rtgi_stats.requested.store(true, std::memory_order_relaxed);
   }
+  ImGui::TextDisabled("Lights file (RTGI): needs RTGI on and the Sora 2nd layout active");
   if (g_rtls_stats.valid) {
     const uint32_t* v = g_rtls_stats.values;
     ImGui::Text("Pixels: traced %u of %u (sky %u, normal %u, character %u, scaled %u, region %u, beyond Fade End %u)",
@@ -79,6 +82,12 @@ inline void DrawRtlsPanel() {
     ImGui::Text("Characters: receive %s, lamp light %.2f, traced %u px, self-blocked %u rays",
                 g_rtls_characters > 0.5f ? "on" : "off", static_cast<double>(g_rtls_character_lamp),
                 v[kRtlsStatCharacterTraced], v[kRtlsStatCharacterSelfBlocked]);
+    ImGui::Text("Mixed lamp visibility (one ratio per kind is approximate): %u of %u multi-lamp pixels (%.1f%%), near-blocked %u, no near %u",
+                v[kRtlsStatMixedPixels], v[kRtlsStatMultiLampPixels],
+                rtao::SharePercent(v[kRtlsStatMixedPixels], v[kRtlsStatMultiLampPixels]), v[kRtlsStatMixedPixelsNear],
+                v[kRtlsStatMixedPixelsNoNear]);
+    ImGui::Text("Error energy (non-near-blocked pixels) / lit total (all traced pixels): %.2f%%",
+                rtao::SharePercent(v[kRtlsStatErrorEnergy], v[kRtlsStatLitTotal]));
     ImGui::Text("Temporal pixels %u, no history %.1f%%, reset %.1f%%", v[rtgi::kRtgiStatTemporalPixels],
                 rtao::SharePercent(v[rtgi::kRtgiStatNoHistory], v[rtgi::kRtgiStatTemporalPixels]),
                 rtao::SharePercent(v[rtgi::kRtgiStatResetPixels], v[rtgi::kRtgiStatTemporalPixels]));

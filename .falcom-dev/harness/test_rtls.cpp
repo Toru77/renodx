@@ -106,7 +106,17 @@ static void TestShaderDefines() {
       {"INDEX_OUT_OF_RANGE", rtls::kRtlsStatIndexOutOfRange},
       {"PER_LIGHT_RAYS", rtls::kRtlsStatPerLightRays},
       {"PER_LIGHT_NEAR", rtls::kRtlsStatPerLightNear},
+      {"MIXED_PIXELS", rtls::kRtlsStatMixedPixels},
+      {"MIXED_PIXELS_NEAR", rtls::kRtlsStatMixedPixelsNear},
+      {"MIXED_PIXELS_NO_NEAR", rtls::kRtlsStatMixedPixelsNoNear},
+      {"MULTI_LAMP_PIXELS", rtls::kRtlsStatMultiLampPixels},
+      {"ERROR_ENERGY", rtls::kRtlsStatErrorEnergy},
+      {"LIT_TOTAL", rtls::kRtlsStatLitTotal},
   };
+  CHECK(rtls::kRtlsStatErrorEnergy == 30u && rtls::kRtlsStatLitTotal == 31u, "error energy and lit total stat slots");
+  CHECK(rtls::kRtlsStatMixedPixels == 26u, "kRtlsStatMixedPixels index");
+  CHECK(rtls::kRtlsStatMixedPixelsNear == 27u && rtls::kRtlsStatMixedPixelsNoNear == 28u && rtls::kRtlsStatMultiLampPixels == 29u,
+        "mixed and multi-lamp stat slots");
   for (const auto& s : stats) {
     const std::string line = "#define RTLS_STAT_" + std::string(s.name) + " " + std::to_string(s.value) + "u";
     CHECK(text.find(line) != std::string::npos, "shader has %s", line.c_str());

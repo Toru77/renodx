@@ -47,8 +47,14 @@ inline constexpr uint32_t kRtlsStatStackOverflow = 18u;
 inline constexpr uint32_t kRtlsStatIndexOutOfRange = 19u;
 inline constexpr uint32_t kRtlsStatCharacterTraced = 24u;       // character pixels traced (Receive on characters)
 inline constexpr uint32_t kRtlsStatCharacterSelfBlocked = 25u;  // rays from character pixels blocked within 0.1 m
+inline constexpr uint32_t kRtlsStatMixedPixels = 26u;  // traced pixels where lamps of one kind differ in visibility by > 0.5
+inline constexpr uint32_t kRtlsStatMixedPixelsNear = 27u;    // mixed pixels with any traced lamp near-light-blocked
+inline constexpr uint32_t kRtlsStatMixedPixelsNoNear = 28u;  // mixed pixels with no traced lamp near-light-blocked
+inline constexpr uint32_t kRtlsStatMultiLampPixels = 29u;    // traced pixels with at least 2 traced lamps of one kind
+inline constexpr uint32_t kRtlsStatErrorEnergy = 30u;  // sum of per-lamp |visible - kind ratio| x weight, x32, per-pixel cap 512 (non-near-blocked pixels only)
+inline constexpr uint32_t kRtlsStatLitTotal = 31u;     // sum of unshadowed point + spot weight, x32, per-pixel cap 512 (all traced pixels with considered > 0, near pixels included)
 inline constexpr uint32_t kRtlsKindCharacters = 4u;             // b12 c2.z bit: trace character pixels
-// 20..22: the RTGI temporal pass (M4b); 23..31: reserved (M3b: 24 character traced, 25 character self-blocked).
+// 20..22: RTGI temporal pass (M4b, written through the stats UAV); 23: unused; 24..25: M3b character; 26..29: M5 4a/4a2 mixed and multi-lamp; 30..31: M5 4a2 error energy and lit total.
 inline constexpr uint32_t kRtlsStatPerLightRays = 32u;   // + lamp index, 32 entries
 inline constexpr uint32_t kRtlsStatPerLightNear = 64u;   // + lamp index, 32 entries
 

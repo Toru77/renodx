@@ -72,6 +72,12 @@ cbuffer cb_rtls : register(b12)
 #define RTLS_KIND_CHARACTERS 4u
 #define RTLS_STAT_CHARACTER_TRACED 24u
 #define RTLS_STAT_CHARACTER_SELF_BLOCKED 25u
+#define RTLS_STAT_MIXED_PIXELS 26u
+#define RTLS_STAT_MIXED_PIXELS_NEAR 27u
+#define RTLS_STAT_MIXED_PIXELS_NO_NEAR 28u
+#define RTLS_STAT_MULTI_LAMP_PIXELS 29u
+#define RTLS_STAT_ERROR_ENERGY 30u
+#define RTLS_STAT_LIT_TOTAL 31u
 #define RTLS_MAX_POINTS 10u
 #define RTLS_MAX_SPOTS 8u
 #define RTLS_PER_LIGHT_COUNT 32u
@@ -172,6 +178,8 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint top_pi[RTLS_MAX_POINTS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                 float top_sw[RTLS_MAX_SPOTS] = {0, 0, 0, 0, 0, 0, 0, 0};
                 uint top_si[RTLS_MAX_SPOTS] = {0, 0, 0, 0, 0, 0, 0, 0};
+                float spot_vis[RTLS_MAX_SPOTS] = {0, 0, 0, 0, 0, 0, 0, 0};
+                float point_vis[RTLS_MAX_POINTS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                 float point_sum = 0.0;
                 float spot_sum = 0.0;
                 uint point_n = 0u;
@@ -255,6 +263,10 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint invalid = 0u;
                 uint overflow = 0u;
                 uint self_blocked = 0u;
+                // Per kind (0 point, 1 spot): visibility extremes across the traced lamps and whether those lamps had a near ray.
+                float vis_min[2] = {1.0, 1.0};
+                float vis_max[2] = {0.0, 0.0};
+                bool pixel_near = false;
                 [loop] for (uint k = 0u; k < spot_traced + point_traced; ++k)
                 {
                     const bool spot = k < spot_traced;
@@ -273,6 +285,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     const float3 B = cross(axis, T);
 
                     uint lamp_visible = 0u;
+                    bool lamp_near = false;
                     for (uint smp = 0u; smp < spp; ++smp)
                     {
                         const uint sample_index = k * spp + smp;
@@ -310,7 +323,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         if (blocked) blocked_rays++;
                         else lamp_visible++;
                         const bool near = blocked && !clipped && hit.t > t_max - RTLS_NEAR_LIGHT_BAND;
-                        if (near) near_rays++;
+                        if (near)
+                        {
+                            near_rays++;
+                            lamp_near = true;
+                        }
                         if (character && blocked && hit.t < 0.1) self_blocked++;
                         if (li < RTLS_PER_LIGHT_COUNT)
                         {
@@ -319,9 +336,29 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                         }
                     }
                     const float visible = float(lamp_visible) / float(spp);
+                    if (lamp_near) pixel_near = true;
+                    const uint kind = spot ? 1u : 0u;
+                    if (spot) spot_vis[slot] = visible;
+                    else point_vis[slot] = visible;
+                    if (visible < vis_min[kind]) vis_min[kind] = visible;
+                    if (visible > vis_max[kind]) vis_max[kind] = visible;
                     if (spot) spot_shadow += w * (1.0 - visible);
                     else point_shadow += w * (1.0 - visible);
                     traced_lights++;
+                }
+
+                // Per-lamp L1 error against the kind's visibility ratio (1 - shadow / sum), before the distance fade.
+                const float point_vis_ratio = (point_sum > 0.0 ? 1.0 - point_shadow / point_sum : 0.0);
+                const float spot_vis_ratio = (spot_sum > 0.0 ? 1.0 - spot_shadow / spot_sum : 0.0);
+                float lamp_error = 0.0;
+                [loop] for (uint k = 0u; k < spot_traced + point_traced; ++k)
+                {
+                    const bool spot = k < spot_traced;
+                    const uint slot = spot ? k : k - spot_traced;
+                    const float w = spot ? top_sw[slot] : top_pw[slot];
+                    const float vis = spot ? spot_vis[slot] : point_vis[slot];
+                    const float ratio = spot ? spot_vis_ratio : point_vis_ratio;
+                    lamp_error += w * abs(vis - ratio);
                 }
 
                 const float fade_start = g_rtls_fade.x;
@@ -343,6 +380,23 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 InterlockedAdd(gs_stats[RTLS_STAT_STACK_OVERFLOW], overflow);
                 InterlockedAdd(gs_stats[RTLS_STAT_INDEX_OUT_OF_RANGE], out_of_range);
                 InterlockedAdd(gs_stats[RTLS_STAT_CHARACTER_SELF_BLOCKED], self_blocked);
+                bool mixed = false;
+                [unroll] for (uint kind_index = 0u; kind_index < 2u; ++kind_index)
+                {
+                    if (vis_max[kind_index] - vis_min[kind_index] > 0.5) mixed = true;
+                }
+                if (mixed)
+                {
+                    InterlockedAdd(gs_stats[RTLS_STAT_MIXED_PIXELS], 1u);
+                    InterlockedAdd(gs_stats[pixel_near ? RTLS_STAT_MIXED_PIXELS_NEAR : RTLS_STAT_MIXED_PIXELS_NO_NEAR], 1u);
+                }
+                if (spot_traced >= 2u || point_traced >= 2u) InterlockedAdd(gs_stats[RTLS_STAT_MULTI_LAMP_PIXELS], 1u);
+                if (considered > 0u)
+                {
+                    // Near pixels are excluded from the error (fixture self-blocking); their unshadowed weight still counts.
+                    if (!pixel_near) InterlockedAdd(gs_stats[RTLS_STAT_ERROR_ENERGY], (uint)min(lamp_error * 32.0 + 0.5, 512.0));
+                    InterlockedAdd(gs_stats[RTLS_STAT_LIT_TOTAL], (uint)min((point_sum + spot_sum) * 32.0 + 0.5, 512.0));
+                }
 
                 cls = character ? float3(1.0, 0.5, 0.0) : (considered > 0u ? float3(1.0, 1.0, 1.0) : float3(0.0, 0.0, 0.0));
                 if (debug_mode == 1) dbg = raw.xyz;

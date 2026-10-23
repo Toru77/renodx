@@ -9608,10 +9608,11 @@ static void RunRtgiInline(reshade::api::command_list* cmd_list) {
       && rd.denoise.output.height == dd->captured_depth_h;
   const bool radiance_valid = rd.radiance_srv.handle != 0u && rd.radiance_frame != UINT64_MAX
       && rd.radiance_frame + 1u == dd->frame_index && (!applied_last || subtract);
-  // The light buffers are copied only for a stats request (Sora 2nd lighting draw, bound at this draw).
+  // The light buffers are copied for a stats request or while a lamp sequence runs (Sora 2nd lighting draw, bound at this draw).
   auto* world_cl = falcom_world::GetWorldCommandListData(cmd_list);
   const bool copy_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
-      && rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed);
+      && (rtgi::g_rtgi_stats.requested.load(std::memory_order_relaxed)
+          || rtgi::g_rtgi_stats.sequence_left.load(std::memory_order_relaxed) > 0u);
   const bool dynamic_lights = scene_layout == rtgi::SceneLayout::Sora2nd && world_cl != nullptr
       && rtgi::g_rtgi_dynamic_lights > 0.5f;
   const bool lamp_shadows = dynamic_lights && rtgi::g_rtgi_lamp_shadows > 0.5f;

@@ -274,7 +274,10 @@ inline std::string BuildRtlsJson(const RtlsJsonInput& in) {
       << ", \"rays_blocked\": " << v[kRtlsStatRaysBlocked] << ", \"rays_near_light\": " << v[kRtlsStatRaysNearLight]
       << ", \"rays_clipped\": " << v[kRtlsStatRaysClipped] << ", \"invalid_refs\": " << v[kRtlsStatInvalidRefs]
       << ", \"stack_overflow\": " << v[kRtlsStatStackOverflow] << ", \"index_out_of_range\": " << v[kRtlsStatIndexOutOfRange]
-      << ", \"character_traced\": " << v[kRtlsStatCharacterTraced] << ", \"character_self_blocked\": " << v[kRtlsStatCharacterSelfBlocked]
+      << ", \"character_traced\": " << v[kRtlsStatCharacterTraced] << ", \"character_self_blocked\": " << v[kRtlsStatCharacterSelfBlocked] << ", \"mixed_pixels\": " << v[kRtlsStatMixedPixels]
+      << ", \"mixed_pixels_near_blocked\": " << v[kRtlsStatMixedPixelsNear] << ", \"mixed_pixels_no_near\": " << v[kRtlsStatMixedPixelsNoNear]
+      << ", \"multi_lamp_pixels\": " << v[kRtlsStatMultiLampPixels]
+      << ", \"error_energy\": " << v[kRtlsStatErrorEnergy] << ", \"lit_total\": " << v[kRtlsStatLitTotal]
       << ", \"temporal_pixels\": " << v[rtgi::kRtgiStatTemporalPixels] << ", \"no_history\": " << v[rtgi::kRtgiStatNoHistory]
       << ", \"reset_pixels\": " << v[rtgi::kRtgiStatResetPixels]
       << "},\n";

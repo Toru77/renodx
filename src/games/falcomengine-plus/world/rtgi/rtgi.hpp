@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -61,8 +62,11 @@ struct RtgiFrameState {
 
 inline RtgiFrameState g_rtgi_frame;
 
+inline constexpr uint32_t kRtgiLightSequenceFrames = 30u;
+
 struct RtgiStatsState {
   std::atomic_bool requested{false};
+  std::atomic_uint32_t sequence_left{0};  // frames still to write in a lamp sequence (world_rtgi_lights_seq_NN.json)
   bool valid = false;
   uint32_t values[kRtgiStatsCount] = {};
 };
@@ -531,7 +535,7 @@ inline RtgiDispatchResult Dispatch(reshade::api::device* device, reshade::api::c
        .upsample_saturation = g_rtgi_saturation},
       denoise, &table_nulls);
 
-  // Light buffers of the game's lighting draw (stats request only): copied now, read back by MaybeCaptureRtgiStats.
+  // Light buffers of the game's lighting draw (stats request or lamp sequence): copied now, read back by MaybeCaptureRtgiStats.
   const auto copy_light_buffer = [&](reshade::api::resource source, reshade::api::resource* copy, uint64_t* copy_bytes) {
     if (source.handle == 0u) return false;
     const reshade::api::resource_desc source_desc = device->get_resource_desc(source);
@@ -735,7 +739,8 @@ inline std::string BuildRtgiJson(const RtgiJsonInput& in) {
 }
 
 inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::command_queue* queue) {
-  if (!g_rtgi_stats.requested.exchange(false, std::memory_order_relaxed)) return;
+  const uint32_t left = g_rtgi_stats.sequence_left.load(std::memory_order_relaxed);
+  if (!g_rtgi_stats.requested.exchange(false, std::memory_order_relaxed) && left == 0u) return;
   const auto found = g_rtgi_devices.find(device);
   if (found == g_rtgi_devices.end() || found->second.stats_buffer.handle == 0u) return;
   RtgiDeviceData& data = found->second;
@@ -877,7 +882,16 @@ inline void MaybeCaptureRtgiStats(reshade::api::device* device, reshade::api::co
                         " cells (", cells_with_lights, " with lights), point refs ", point_refs, ", spot refs ", spot_refs,
                         ", out of range ", index_out_of_range);
   text = lights_out.str();
-  renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / "world_rtgi_lights.json", text);
+  // A lamp sequence writes frame NN (0-based) of kRtgiLightSequenceFrames; the index advances only when a file is written.
+  std::string lights_name = "world_rtgi_lights.json";
+  const uint32_t write_left = g_rtgi_stats.sequence_left.load(std::memory_order_relaxed);
+  if (write_left > 0u) {
+    char seq_name[40];
+    std::snprintf(seq_name, sizeof(seq_name), "world_rtgi_lights_seq_%02u.json", kRtgiLightSequenceFrames - write_left);
+    lights_name = seq_name;
+  }
+  renodx::utils::path::WriteTextFile(bvh::PoolOutputDir() / lights_name, text);
+  if (write_left > 0u) g_rtgi_stats.sequence_left.fetch_sub(1u, std::memory_order_relaxed);
 }
 
 // Gathering was switched OFF: clears the RTGI GPU timers and the newest RTGI frame times (see bvh::ClearPerfGathered).

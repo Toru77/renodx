@@ -41,6 +41,17 @@ The overlay gate in `bvh_debug.hpp` was 8.5, so RTGI Debug 9 never reached the s
   3. Off-screen Hits: No Albedo Guess On with RTGI Debug 3 (GI shading): the hidden and off-screen hits contribute twice the fallback light of Off (albedo 1.0 instead of 0.5); sun rays and sun visible counts are the same as Off.
   4. Sun Contribution 0 and 2: the fallback sun bounce scales with the value; the ambient and lamp bounce do not change.
 
+## RT Local Shadows: M5 item 4a and 4a2 (lamp visibility diagnostics), implemented, not validated in game
+
+- Stats 26-29 added: 26 mixed pixels; 27 mixed pixels with any traced lamp near-light-blocked; 28 mixed pixels with none; 29 traced pixels with at least 2 lamps of one kind.
+- Stats 30 and 31 added: 30 error energy (non-near-blocked pixels only); 31 lit total (all traced pixels with considered > 0, near pixels included). Both are fixed point at x32, with a per-pixel cap of 512; the value is a lower bound if clamped.
+- Read RTLS Stats also requests the RTGI capture, so world_rtls.json and world_rtgi_lights.json share a generated_frame. The RTLS read also rewrites world_rtgi.json.
+- Capture Lamp Sequence (30 frames) writes world_rtgi_lights_seq_00.json to seq_29.json, one per present where lights were copied. It needs RTGI on and the Sora 2nd layout active, and waits while they are not. Pressing it again restarts at 30 and overwrites older files. A button press during the write of a seq file can skip seq_00 of the restarted run; press again.
+- While a sequence runs, Read RTGI Stats writes a seq file and no single world_rtgi_lights.json.
+- Lamp index join: world_rtls.json per_light indices join world_rtgi_lights*.json lamp indices in the same frame. The join is offline.
+- Shader hash, method: FNV-1a 64 with the harness constants, CR bytes removed. `world_rtls.cs_5_0.hlsl` before (HEAD 6b4fc517): 0x88277026FD9B8EBA. After M5 4a2 (error energy stats 30 and 31 at x32 with per-pixel cap 512, a lower bound if clamped; mixed-pixel stats 26-28 per pixel): 0x4B3F1AC75414FD67.
+- Harness: test_rtls RESULT test=test_rtls build_s=0 run_s=0.1 rc=0 slowest_s=0.01 stage="top-k transcription" last="PASS (0 failures)".
+
 ## RT Local Shadows: M5 item 3 (RTGI off-screen lamp shadows), implemented, not validated in game
 
 - New RTGI row Off-screen Lamp Shadows (RtgiLampShadows, section RTGI, default Off, greyed unless Off-screen Dynamic Lights is on; part of the RTGI parameter snapshot, so a change resets RTGI history). With it on, each fallback hit (hidden or off-screen) traces one shadow ray per lamp that lights it, and a blocked lamp adds nothing. The ray ends Light Clearance (the RTLS setting, c6.w; no new row) before the lamp and starts on the back side for back-lit lamps. The on-screen estimate never traces.

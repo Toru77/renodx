@@ -94,6 +94,12 @@ inline void DrawRtgiPanel() {
   if (ImGui::Button("Read RTGI Stats")) {
     g_rtgi_stats.requested.store(true, std::memory_order_relaxed);
   }
+  ImGui::SameLine();
+  if (ImGui::Button("Capture Lamp Sequence (30 frames)")) {
+    g_rtgi_stats.sequence_left.store(kRtgiLightSequenceFrames, std::memory_order_relaxed);
+  }
+  ImGui::Text("Lamp sequence: %u left", g_rtgi_stats.sequence_left.load(std::memory_order_relaxed));
+  ImGui::TextDisabled("Lamp sequence / lights file: needs RTGI on and the Sora 2nd layout active");
   if (g_rtgi_stats.valid) {
     const uint32_t* v = g_rtgi_stats.values;
     const uint32_t hits = v[kRtgiStatHits];
