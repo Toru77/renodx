@@ -215,6 +215,14 @@ static void TestSunDenoiseText() {
   const std::string settings = ReadText("src/games/falcomengine-plus/world/world_settings.hpp");
   CHECK(Count(settings, "\"RtSunReceiveCharacters\"") == 1 && Count(settings, "\"RtSunCharacterNormalBias\"") == 1 && Count(settings, "\"RtSunCharacterIntensity\"") == 1, "R4 rows: receive, character bias, character intensity");
   CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1, "RT sun rows: edge stop and trace resolution");
+  // R5: Performance rows (RTLS pattern) and the GPU column sum by role.
+  const std::string perf = ReadText("src/games/falcomengine-plus/world/bvh/perf_run.hpp");
+  CHECK(Count(perf, "{\"gpu_rtsun\", true, kPerfGpu, true, nullptr}") == 1 && Count(perf, "{\"gpu_rtsun_denoise\", true, kPerfGpu, true, nullptr}") == 1,
+        "R5: gpu_rtsun and gpu_rtsun_denoise rows are GPU rows");
+  CHECK(Count(perf, "{\"rtsun_record_cpu\", true, kPerfDrawTime, false, nullptr}") == 1, "R5: rtsun_record_cpu row");
+  CHECK(Count(perf, "c.cost[kPerfGpuRtsun] = extra.rtsun.ms_sum;") == 1 && Count(perf, "c.cost[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.ms_sum;") == 1,
+        "R5: both GPU timers feed the sample");
+  CHECK(Count(perf, "} else if (role == kPerfGpu && !std::isnan(values[i])) {") == 1, "R5: GPU column sums every kPerfGpu row (rtsun included)");
 }
 
 // R4: the lighting character branch multiplies the RT sun term into the toon lerp factor, gated by rtsun_flags, before the lerp.

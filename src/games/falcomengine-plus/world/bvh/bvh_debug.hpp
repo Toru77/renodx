@@ -289,6 +289,12 @@ inline void OnWorldPresentBvh(
     rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
     ClearGpuTimerStats(&rtls_data.timer);
     ClearGpuTimerStats(&rtls_data.denoise.timer);
+    if (rtsun::RtSunDeviceData* rtsun_data = rtsun::FindRtSunDeviceData(device)) {
+      ClearGpuTimerStats(&rtsun_data->timer);
+      ClearGpuTimerStats(&rtsun_data->denoise.timer);
+      rtsun::g_rtsun_frame.gpu_ms = -1.f;
+      rtsun::g_rtsun_frame.denoise_gpu_ms = -1.f;
+    }
     rtls::g_rtls_frame.gpu_ms = -1.f;
     rtls::g_rtls_frame.denoise_gpu_ms = -1.f;
   }
@@ -311,6 +317,10 @@ inline void OnWorldPresentBvh(
       const rtls::RtlsDeviceData& rtls_data = rtls::GetRtlsDeviceData(device);
       extra.rtls = {rtls_data.timer.ms_sum, rtls_data.timer.samples};
       extra.rtls_denoise = {rtls_data.denoise.timer.ms_sum, rtls_data.denoise.timer.samples};
+    }
+    if (const rtsun::RtSunDeviceData* rtsun_data = rtsun::FindRtSunDeviceData(device)) {
+      extra.rtsun = {rtsun_data->timer.ms_sum, rtsun_data->timer.samples};
+      extra.rtsun_denoise = {rtsun_data->denoise.timer.ms_sum, rtsun_data->denoise.timer.samples};
     }
     {
       std::lock_guard<std::mutex> lock(g_deform_live.mutex);

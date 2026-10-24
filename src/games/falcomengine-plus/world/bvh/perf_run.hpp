@@ -61,6 +61,7 @@ enum PerfCost : size_t {
   kPerfRtaoRecordCpu,
   kPerfRtgiRecordCpu,
   kPerfRtlsRecordCpu,
+  kPerfRtsunRecordCpu,
   kPerfPresentWorldCpu,
   kPerfPresentBvhCpu,
   kPerfGpuTrace,
@@ -73,6 +74,8 @@ enum PerfCost : size_t {
   kPerfGpuRtgiDenoise,
   kPerfGpuRtls,
   kPerfGpuRtlsDenoise,
+  kPerfGpuRtsun,
+  kPerfGpuRtsunDenoise,
   kPerfRebuildPhase0,
   kPerfRebuildPhase1,
   kPerfRebuildPhase2,
@@ -105,6 +108,7 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"rtao_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtgi_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"rtls_record_cpu", true, kPerfDrawTime, false, nullptr},
+    {"rtsun_record_cpu", true, kPerfDrawTime, false, nullptr},
     {"present_world_cpu", true, kPerfBracket, false, nullptr},
     {"present_bvh_cpu", true, kPerfBracket, false, nullptr},
     {"gpu_trace", true, kPerfGpu, true, nullptr},
@@ -117,6 +121,8 @@ inline constexpr PerfCostInfo kPerfCostInfo[kPerfCostCount] = {
     {"gpu_rtgi_denoise", true, kPerfGpu, true, nullptr},
     {"gpu_rtls", true, kPerfGpu, true, nullptr},
     {"gpu_rtls_denoise", true, kPerfGpu, true, nullptr},
+    {"gpu_rtsun", true, kPerfGpu, true, nullptr},
+    {"gpu_rtsun_denoise", true, kPerfGpu, true, nullptr},
     {"rebuild_phase_0", true, kPerfSubset, false, kCachePhaseNames[0]},
     {"rebuild_phase_1", true, kPerfSubset, false, kCachePhaseNames[1]},
     {"rebuild_phase_2", true, kPerfSubset, false, kCachePhaseNames[2]},
@@ -310,7 +316,7 @@ struct PerfTimerSample {
   uint32_t samples = 0u;
 };
 struct PerfExtraGpu {
-  PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, deform_refit;
+  PerfTimerSample rtao, rtao_filter, rtgi, rtgi_denoise, rtls, rtls_denoise, rtsun, rtsun_denoise, deform_refit;
 };
 
 // Performance tab: the last kPerfTabWindow presents. NaN means "--" (no value in the window).
@@ -460,6 +466,7 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.cost[kPerfRtaoRecordCpu] = PerfMsOf(g_perf_gate.rtao_record_us);
   c.cost[kPerfRtgiRecordCpu] = PerfMsOf(g_perf_gate.rtgi_record_us);
   c.cost[kPerfRtlsRecordCpu] = PerfMsOf(g_perf_gate.rtls_record_us);
+  c.cost[kPerfRtsunRecordCpu] = PerfMsOf(g_perf_gate.rtsun_record_us);
   c.cost[kPerfPresentWorldCpu] = PerfMsOf(g_perf_gate.present_world_us);
   c.cost[kPerfPresentBvhCpu] = PerfMsOf(g_perf_gate.present_bvh_us);
   c.cost[kPerfGpuTrace] = data->trace_timer.ms_sum;
@@ -482,6 +489,10 @@ inline PerfCounters ReadPerfCounters(const BvhDeviceData* data, const PerfExtraG
   c.events[kPerfGpuRtls] = extra.rtls.samples;
   c.cost[kPerfGpuRtlsDenoise] = extra.rtls_denoise.ms_sum;
   c.events[kPerfGpuRtlsDenoise] = extra.rtls_denoise.samples;
+  c.cost[kPerfGpuRtsun] = extra.rtsun.ms_sum;
+  c.events[kPerfGpuRtsun] = extra.rtsun.samples;
+  c.cost[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.ms_sum;
+  c.events[kPerfGpuRtsunDenoise] = extra.rtsun_denoise.samples;
   for (size_t p = 0; p < 5u; ++p) c.cost[kPerfRebuildPhase0 + p] = timing.rebuild_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfRefitPhase0 + p] = timing.refit_phase_ms_sum[p];
   for (size_t p = 0; p < 4u; ++p) c.cost[kPerfSlackPhase0 + p] = live.slack_phase_ms_sum[p];

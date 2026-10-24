@@ -72,6 +72,12 @@ inline std::unordered_map<reshade::api::device*, RtSunDeviceData> g_rtsun_device
 
 inline RtSunDeviceData& GetRtSunDeviceData(reshade::api::device* device) { return g_rtsun_devices[device]; }
 
+// Non-creating lookup: null when the device has no RT sun entry.
+inline RtSunDeviceData* FindRtSunDeviceData(reshade::api::device* device) {
+  const auto found = g_rtsun_devices.find(device);
+  return found == g_rtsun_devices.end() ? nullptr : &found->second;
+}
+
 inline void DestroyRtSunDeviceData(reshade::api::device* device) {
   const auto found = g_rtsun_devices.find(device);
   if (found == g_rtsun_devices.end()) return;
