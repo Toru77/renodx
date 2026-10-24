@@ -38,36 +38,57 @@ inline void OnDestroyDeviceBvh(reshade::api::device* device) {
 }
 
 inline void Use(DWORD fdw_reason) {
+  const uint32_t hook_off = HookOffMask();
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
-      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
-      reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegionPool);
-      reshade::register_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommandPool);
-      reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionPool);
-      reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionPool);
-      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
-      reshade::register_event<reshade::addon_event::present>(OnWorldPresentBvh);
-      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeform);
-      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeformLive);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeformLive);
+      if ((hook_off & 128u) == 0u) {
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
+      }
+      if ((hook_off & 32u) == 0u) {
+        reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
+        reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegionPool);
+        reshade::register_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommandPool);
+        reshade::register_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionPool);
+        reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionPool);
+        reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
+      }
+      if ((hook_off & 64u) == 0u) {
+        reshade::register_event<reshade::addon_event::present>(OnWorldPresentBvh);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeform);
+        reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeformLive);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeformLive);
+      }
       break;
     case DLL_PROCESS_DETACH:
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
-      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
-      reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegionPool);
-      reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommandPool);
-      reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionPool);
-      reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionPool);
-      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
-      reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentBvh);
-      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeform);
-      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeformLive);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeformLive);
+      if ((hook_off & 128u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevicePool);
+      }
+      if ((hook_off & 32u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourcePool);
+        reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegionPool);
+        reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(OnUpdateBufferRegionCommandPool);
+        reshade::unregister_event<reshade::addon_event::map_buffer_region>(OnMapBufferRegionPool);
+        reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegionPool);
+        reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourcePool);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceBvh);
+      }
+      if ((hook_off & 64u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::present>(OnWorldPresentBvh);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeform);
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeform);
+        reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineDeformLive);
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceDeformLive);
+      }
       break;
     default:
       break;
@@ -225,6 +246,7 @@ inline void SyncBvhSettings() {
   apply(g_cache_diag.enabled, g_cache_diag.enabled_setting);
   apply(g_crash_log.enabled, g_crash_log.enabled_setting);
   g_bvh_debug.mode.store(static_cast<int>(g_bvh_debug.mode_setting), std::memory_order_relaxed);
+  ApplyBvhInputs();
 }
 
 // Label of the cache diagnostics dump and of the Performance test (file name only).
@@ -395,6 +417,8 @@ inline bool DrawBvhPanel() {
   bool changed = false;
 
   ImGui::TextDisabled("Pool admits draws whose vertex shader the bytecode classifier marks rigid and whose pixel shader does not alpha-test.");
+  static const char* const kBvhInputsText[] = {"idle (nothing runs)", "Pool Scan or debug view (follows the rows below)", "forced on by RT effects"};
+  ImGui::TextDisabled("BVH inputs: %s", kBvhInputsText[g_bvh_debug.inputs.load(std::memory_order_relaxed)]);
 
   bool scan = g_pool.scan_active.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Pool Scan", &scan)) {

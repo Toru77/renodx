@@ -4595,6 +4595,7 @@ inline void NotePoolBufferWrite(uint64_t handle) {
 
 inline bool OnUpdateBufferRegionPool(
     reshade::api::device*, const void*, reshade::api::resource dest, uint64_t, uint64_t) {
+  if (!CaptureActive()) return false;
   g_pool.write_events.update.fetch_add(1u, std::memory_order_relaxed);
   NotePoolBufferWrite(dest.handle);
   return false;
@@ -4602,6 +4603,7 @@ inline bool OnUpdateBufferRegionPool(
 
 inline bool OnUpdateBufferRegionCommandPool(
     reshade::api::command_list*, const void*, reshade::api::resource dest, uint64_t, uint64_t) {
+  if (!CaptureActive()) return false;
   g_pool.write_events.update_cmd.fetch_add(1u, std::memory_order_relaxed);
   NotePoolBufferWrite(dest.handle);
   return false;
@@ -4609,18 +4611,21 @@ inline bool OnUpdateBufferRegionCommandPool(
 
 inline void OnMapBufferRegionPool(
     reshade::api::device*, reshade::api::resource resource, uint64_t, uint64_t, reshade::api::map_access access, void**) {
+  if (!CaptureActive()) return;
   g_pool.write_events.map.fetch_add(1u, std::memory_order_relaxed);
   if (access != reshade::api::map_access::read_only) NotePoolBufferWrite(resource.handle);
 }
 
 inline bool OnCopyBufferRegionPool(
     reshade::api::command_list*, reshade::api::resource, uint64_t, reshade::api::resource dest, uint64_t, uint64_t) {
+  if (!CaptureActive()) return false;
   g_pool.write_events.copy_region.fetch_add(1u, std::memory_order_relaxed);
   NotePoolBufferWrite(dest.handle);
   return false;
 }
 
 inline bool OnCopyResourcePool(reshade::api::command_list*, reshade::api::resource, reshade::api::resource dest) {
+  if (!CaptureActive()) return false;
   g_pool.write_events.copy_resource.fetch_add(1u, std::memory_order_relaxed);
   NotePoolBufferWrite(dest.handle);
   return false;

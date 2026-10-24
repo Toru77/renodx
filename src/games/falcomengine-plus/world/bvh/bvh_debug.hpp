@@ -31,6 +31,7 @@ namespace falcom_world::bvh {
 struct BvhDebugState {
   std::atomic_int mode{0};  // BvhView
   std::atomic<reshade::api::device*> device{nullptr};
+  std::atomic_int inputs{0};  // BVH inputs, set by ApplyBvhInputs: 0 idle, 1 Pool Scan or debug view, 2 forced on by RT effects
   // Mirror bound to the settings system so the GPU Debug mode survives a restart.
   float mode_setting{0.f};
 };
@@ -231,14 +232,30 @@ inline void RefreshPoolCaptureRequest() {
                          || g_deform.enabled.load(std::memory_order_relaxed)
                          || g_deform_live.enabled.load(std::memory_order_relaxed);
   g_state.pool_capture_requested.store(requested, std::memory_order_relaxed);
+  if (!CaptureActive()) {
+    g_state.tracking_epoch.fetch_add(1u, std::memory_order_relaxed);
+  }
 }
 
-// RTAO needs the live BVH and deforming meshes. Turning RTAO on enables them;
-// turning it off leaves them alone. Pool Scan is not enabled here.
-inline void RtaoEnableBvhInputs() {
-  g_live_bvh.enabled.store(true, std::memory_order_relaxed);
-  g_deform.enabled.store(true, std::memory_order_relaxed);
-  g_deform_live.enabled.store(true, std::memory_order_relaxed);
+inline bool RtBvhDemanded() {
+  return rtao::RtaoRequested() || rtgi::g_rtgi_enabled > 0.5f || rtls::RtlsRequested();
+}
+
+inline void ApplyBvhInputs() {
+  const bool demand = RtBvhDemanded();
+  const bool scan_setting = g_pool.scan_active_setting > 0.5f;
+  const bool diagnostic = scan_setting || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0;
+  g_bvh_debug.inputs.store(demand ? 2 : (diagnostic ? 1 : 0), std::memory_order_relaxed);
+  const bool deform_setting = g_deform_live.enabled_setting > 0.5f;
+  auto store = [](std::atomic_bool& flag, bool value) {
+    if (flag.load(std::memory_order_relaxed) != value) {
+      flag.store(value, std::memory_order_relaxed);
+    }
+  };
+  store(g_pool.scan_active, scan_setting || demand);
+  store(g_live_bvh.enabled, demand || (diagnostic && g_live_bvh.enabled_setting > 0.5f));
+  store(g_deform.enabled, demand || (diagnostic && deform_setting));
+  store(g_deform_live.enabled, demand || (diagnostic && deform_setting));
   RefreshPoolCaptureRequest();
 }
 
@@ -268,12 +285,7 @@ inline void OnWorldPresentBvh(
     rtls::g_rtls_frame.denoise_gpu_ms = -1.f;
   }
   g_bvh_debug.device.store(device, std::memory_order_relaxed);
-  RefreshPoolCaptureRequest();
-  static const bool rtao_startup_enable = [] {
-    if (rtao::RtaoRequested() || rtls::RtlsRequested()) RtaoEnableBvhInputs();
-    return true;
-  }();
-  (void)rtao_startup_enable;
+  ApplyBvhInputs();
 
   PerfExtraGpu extra;
   if (g_perf_gate.gather.load(std::memory_order_relaxed)) {

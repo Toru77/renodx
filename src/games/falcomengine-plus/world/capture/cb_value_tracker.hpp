@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -22,20 +23,26 @@
 
 #include <include/reshade.hpp>
 
+#include "../world_state.hpp"
+
 namespace falcom_world {
 
 inline constexpr uint64_t kTrackedCbMaxBytes = 1536u;
 inline constexpr uint32_t kTrackedCbBytes = 768u;  // wind sway reads cb_scene up to byte 752 (windForce_g)
+inline constexpr uint32_t kCbEpochInit = UINT32_MAX;  // mirror holds only the creation data; valid until the first tracked write
 
 struct TrackedCb {
   std::array<uint8_t, kTrackedCbBytes> bytes = {};
   uint64_t size = 0u;
   uint8_t* mapped = nullptr;
   uint64_t valid_bytes = 0u;  // contiguous prefix of the buffer the mirror holds
+  uint32_t epoch = 0u;
 };
 
 struct CbValueTracker {
   std::mutex mutex;
+  std::atomic<uint32_t> mapped_count{0u};  // tracked buffers with a live mapped pointer
+  std::array<std::atomic<uint64_t>, 1024> init_bloom{};
   std::unordered_map<uint64_t, TrackedCb> buffers;
   // command list -> resource -> bytes as that deferred recording wrote them
   std::unordered_map<uint64_t, std::unordered_map<uint64_t, TrackedCb>> deferred;
@@ -46,13 +53,37 @@ inline CbValueTracker& CbTracker() {
   return tracker;
 }
 
+inline bool CbMirrorCurrent(const TrackedCb& tracked, uint32_t epoch) { return tracked.epoch == epoch || tracked.epoch == kCbEpochInit; }
+
+inline uint32_t CbInitBloomBit(uint64_t handle) { return static_cast<uint32_t>((handle * 0x9E3779B97F4A7C15ull) >> 48); }
+
+inline void NoteUntrackedCbWrite(reshade::api::resource resource) {
+  auto& tracker = CbTracker();
+  const uint32_t bit = CbInitBloomBit(resource.handle);
+  if ((tracker.init_bloom[bit >> 6].load(std::memory_order_relaxed) & (uint64_t{1} << (bit & 63u))) == 0u) return;
+  std::lock_guard lock(tracker.mutex);
+  const auto it = tracker.buffers.find(resource.handle);
+  if (it == tracker.buffers.end() || it->second.epoch != kCbEpochInit) return;
+  it->second.valid_bytes = 0u;
+  it->second.epoch = 0u;
+}
+
 // Copies the part of [offset, offset + size) that overlaps the mirrored
 // bytes. `data` points at the start of the written region.
 inline void MirrorCbWrite(TrackedCb* tracked, const void* data, uint64_t offset, uint64_t size) {
   if (data == nullptr || offset >= kTrackedCbBytes) return;
+  const uint32_t epoch = g_state.tracking_epoch.load(std::memory_order_relaxed);
+  if (tracked->epoch != epoch) {
+    if (tracked->epoch != kCbEpochInit) {
+      tracked->valid_bytes = 0u;
+    }
+    tracked->epoch = epoch;
+  }
   const uint64_t count = (std::min)(size, static_cast<uint64_t>(kTrackedCbBytes) - offset);
   std::memcpy(tracked->bytes.data() + offset, data, static_cast<size_t>(count));
-  if (offset <= tracked->valid_bytes && offset + count > tracked->valid_bytes) tracked->valid_bytes = offset + count;
+  if (offset <= tracked->valid_bytes && offset + count > tracked->valid_bytes) {
+    tracked->valid_bytes = offset + count;
+  }
 }
 
 inline void OnInitResourceCbTracker(
@@ -68,17 +99,33 @@ inline void OnInitResourceCbTracker(
   if (desc.buffer.size == 0u || desc.buffer.size > kTrackedCbMaxBytes) return;
   TrackedCb tracked;
   tracked.size = desc.buffer.size;
-  if (initial_data != nullptr) MirrorCbWrite(&tracked, initial_data->data, 0u, desc.buffer.size);
+  if (initial_data != nullptr) {
+    MirrorCbWrite(&tracked, initial_data->data, 0u, desc.buffer.size);
+    tracked.epoch = kCbEpochInit;
+    const uint32_t bit = CbInitBloomBit(resource.handle);
+    CbTracker().init_bloom[bit >> 6].fetch_or(uint64_t{1} << (bit & 63u), std::memory_order_relaxed);
+  }
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
-  tracker.buffers.insert_or_assign(resource.handle, tracked);
+  const auto [it, inserted] = tracker.buffers.try_emplace(resource.handle, tracked);
+  if (!inserted) {
+    if (it->second.mapped != nullptr) {
+      tracker.mapped_count.fetch_sub(1u, std::memory_order_relaxed);
+    }
+    it->second = tracked;
+  }
 }
 
 inline void OnDestroyResourceCbTracker(reshade::api::device* device, reshade::api::resource resource) {
   (void)device;
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
-  tracker.buffers.erase(resource.handle);
+  const auto it = tracker.buffers.find(resource.handle);
+  if (it == tracker.buffers.end()) return;
+  if (it->second.mapped != nullptr) {
+    tracker.mapped_count.fetch_sub(1u, std::memory_order_relaxed);
+  }
+  tracker.buffers.erase(it);
 }
 
 inline void OnMapBufferRegionCbTracker(
@@ -88,6 +135,12 @@ inline void OnMapBufferRegionCbTracker(
     uint64_t size,
     reshade::api::map_access access,
     void** data) {
+  if (!CaptureActive()) {
+    if (access != reshade::api::map_access::read_only) {
+      NoteUntrackedCbWrite(resource);
+    }
+    return;
+  }
   (void)device;
   (void)size;
   if (data == nullptr || *data == nullptr || access == reshade::api::map_access::read_only) return;
@@ -95,17 +148,27 @@ inline void OnMapBufferRegionCbTracker(
   std::lock_guard lock(tracker.mutex);
   const auto it = tracker.buffers.find(resource.handle);
   if (it == tracker.buffers.end() || offset != 0u) return;
+  if (it->second.mapped == nullptr) {
+    tracker.mapped_count.fetch_add(1u, std::memory_order_relaxed);
+  }
   it->second.mapped = static_cast<uint8_t*>(*data);
 }
 
 inline void OnUnmapBufferRegionCbTracker(reshade::api::device* device, reshade::api::resource resource) {
   (void)device;
   auto& tracker = CbTracker();
+  if (tracker.mapped_count.load(std::memory_order_relaxed) == 0u && !CaptureActive()) return;
   std::lock_guard lock(tracker.mutex);
   const auto it = tracker.buffers.find(resource.handle);
   if (it == tracker.buffers.end() || it->second.mapped == nullptr) return;
-  MirrorCbWrite(&it->second, it->second.mapped, 0u, it->second.size);
+  if (CaptureActive()) {
+    MirrorCbWrite(&it->second, it->second.mapped, 0u, it->second.size);
+  } else {
+    it->second.valid_bytes = 0u;
+    it->second.epoch = 0u;
+  }
   it->second.mapped = nullptr;
+  tracker.mapped_count.fetch_sub(1u, std::memory_order_relaxed);
 }
 
 inline void TrackCbUpdate(
@@ -114,12 +177,18 @@ inline void TrackCbUpdate(
     const void* data,
     uint64_t offset,
     uint64_t size) {
+  if (!CaptureActive()) {
+    NoteUntrackedCbWrite(resource);
+    return;
+  }
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
   const auto it = tracker.buffers.find(resource.handle);
   if (it == tracker.buffers.end()) return;
   // UINT64_MAX means "the whole buffer" (UpdateSubresource without a box).
-  if (size == UINT64_MAX) size = it->second.size;
+  if (size == UINT64_MAX) {
+    size = it->second.size;
+  }
   if (cmd_list != nullptr) {
     auto& recorded = tracker.deferred[reinterpret_cast<uintptr_t>(cmd_list)];
     auto [entry, inserted] = recorded.try_emplace(resource.handle, it->second);
@@ -173,18 +242,19 @@ inline bool ReadTrackedCbBytes(reshade::api::command_list* cmd_list, reshade::ap
   if (out == nullptr || resource.handle == 0u || bytes > kTrackedCbBytes) return false;
   auto& tracker = CbTracker();
   std::lock_guard lock(tracker.mutex);
+  const uint32_t epoch = g_state.tracking_epoch.load(std::memory_order_relaxed);
   if (cmd_list != nullptr && !tracker.deferred.empty()) {
     const auto list_it = tracker.deferred.find(reinterpret_cast<uintptr_t>(cmd_list));
     if (list_it != tracker.deferred.end()) {
       const auto entry_it = list_it->second.find(resource.handle);
-      if (entry_it != list_it->second.end() && entry_it->second.valid_bytes >= bytes) {
+      if (entry_it != list_it->second.end() && CbMirrorCurrent(entry_it->second, epoch) && entry_it->second.valid_bytes >= bytes) {
         std::memcpy(out, entry_it->second.bytes.data(), static_cast<size_t>(bytes));
         return true;
       }
     }
   }
   const auto it = tracker.buffers.find(resource.handle);
-  if (it == tracker.buffers.end() || it->second.valid_bytes < bytes) return false;
+  if (it == tracker.buffers.end() || !CbMirrorCurrent(it->second, epoch) || it->second.valid_bytes < bytes) return false;
   std::memcpy(out, it->second.bytes.data(), static_cast<size_t>(bytes));
   return true;
 }
@@ -202,9 +272,10 @@ inline void DescribeTrackedCb(reshade::api::resource resource, TrackedCbInfo* ou
   std::lock_guard lock(tracker.mutex);
   const auto it = tracker.buffers.find(resource.handle);
   if (it == tracker.buffers.end()) return;
+  const uint32_t epoch = g_state.tracking_epoch.load(std::memory_order_relaxed);
   out->tracked = true;
   out->size = it->second.size;
-  out->valid_bytes = it->second.valid_bytes;
+  out->valid_bytes = CbMirrorCurrent(it->second, epoch) ? it->second.valid_bytes : 0u;
 }
 
 // First int of a tracked constant buffer (instanceOffset_g for b1).

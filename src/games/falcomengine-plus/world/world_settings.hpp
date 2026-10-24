@@ -531,13 +531,11 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RTAO",
       .section = "RTAO",
-      .tooltip = "Ray-traced ambient occlusion from the live BVH. Overrides GTVBAO and VBGI while on. Turning it on enables Live BVH and Deforming meshes. Turning it off also turns RTGI off.",
+      .tooltip = "Ray-traced ambient occlusion from the live BVH. Overrides GTVBAO and VBGI while on. While any RT effect is on the BVH inputs run; with all off nothing runs. Turning it off also turns RTGI off.",
       .labels = {"Off", "On"},
       // on_change_value runs after the new value is written (on_change runs before it, with the old value).
       .on_change_value = [](float, float current) {
-        if (current > 0.5f) {
-          bvh::RtaoEnableBvhInputs();
-        } else if (rtgi::g_rtgi_enabled > 0.5f) {
+        if (current <= 0.5f && rtgi::g_rtgi_enabled > 0.5f) {
           renodx::utils::settings::UpdateSetting("RtgiEnabled", 0.f);
         }
       },
@@ -828,7 +826,6 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
           renodx::utils::settings::UpdateSetting("RtgiRtaoRestore", rtao::g_rtao_enabled);
           if (!rtao::RtaoRequested()) {
             renodx::utils::settings::UpdateSetting("RtaoEnabled", 1.f);
-            bvh::RtaoEnableBvhInputs();  // UpdateSetting runs no callbacks, so RTAO's own call does not happen
           }
         } else {
           renodx::utils::settings::UpdateSetting("RtaoEnabled", rtgi::g_rtgi_rtao_restore);
@@ -1188,13 +1185,8 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.f,
       .label = "RT Local Shadows",
       .section = "RT Local Shadows",
-      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. Turning it on enables Live BVH and Deforming meshes. Applied to the image after temporal accumulation, the spatial filter and the upsample. While on, Contact Shadows Local Lights is greyed out and off, and the game's spot shadow maps are replaced inside the RT range (they return beyond Fade End).",
+      .tooltip = "Ray-traced shadows from the game's local lamps (point and spot) using the live BVH. Independent of RTAO and RTGI. While any RT effect is on the BVH inputs run; with all off nothing runs. Applied to the image after temporal accumulation, the spatial filter and the upsample. While on, Contact Shadows Local Lights is greyed out and off, and the game's spot shadow maps are replaced inside the RT range (they return beyond Fade End).",
       .labels = {"Off", "On"},
-      .on_change_value = [](float, float current) {
-        if (current > 0.5f) {
-          bvh::RtaoEnableBvhInputs();
-        }
-      },
       .is_visible = visible,
   });
   settings->push_back(new Setting{

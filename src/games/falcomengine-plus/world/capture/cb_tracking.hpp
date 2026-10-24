@@ -26,11 +26,17 @@ struct __declspec(uuid("e0b7d0f1-3f6a-4b21-9c8e-5a1d2f3b4c50")) WorldCommandList
   std::array<reshade::api::resource_view, kSrvSlotCapacity> vs_srv_view = {};
   std::array<reshade::api::resource, kSrvSlotCapacity> ps_srv = {};
   std::array<reshade::api::resource_view, kSrvSlotCapacity> ps_srv_view = {};
+  uint32_t epoch = 0u;
 };
 
 inline WorldCommandListData* GetWorldCommandListData(reshade::api::command_list* cmd_list) {
   if (cmd_list == nullptr) return nullptr;
-  return renodx::utils::data::Get<WorldCommandListData>(cmd_list);
+  auto* data = renodx::utils::data::Get<WorldCommandListData>(cmd_list);
+  if (data != nullptr && data->epoch != g_state.tracking_epoch.load(std::memory_order_relaxed)) {
+    *data = {};
+    data->epoch = g_state.tracking_epoch.load(std::memory_order_relaxed);
+  }
+  return data;
 }
 
 inline void OnInitWorldCommandList(reshade::api::command_list* cmd_list) {
@@ -45,6 +51,7 @@ inline void OnDestroyWorldCommandList(reshade::api::command_list* cmd_list) {
 }
 
 inline void OnResetWorldCommandList(reshade::api::command_list* cmd_list) {
+  if (!WorldDrawHookNeeded()) return;
   auto* data = GetWorldCommandListData(cmd_list);
   if (data != nullptr) *data = {};
 }
@@ -55,6 +62,7 @@ inline void OnPushDescriptorsWorld(
     reshade::api::pipeline_layout layout,
     uint32_t param_index,
     const reshade::api::descriptor_table_update& update) {
+  if (!WorldDrawHookNeeded()) return;
   (void)layout;
   (void)param_index;
   if (update.count == 0u || update.descriptors == nullptr) return;

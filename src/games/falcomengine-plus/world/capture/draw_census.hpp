@@ -409,6 +409,7 @@ struct WorldDrawCallback {
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<Arguments>>
   Record(renodx::utils::command_action::CommandContext<Arguments>& context, uint8_t method) const {
     if (context.cmd_list == nullptr) return {};
+    if (!WorldDrawHookNeeded()) return {};
     auto* device = context.cmd_list->get_device();
     if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return {};
 

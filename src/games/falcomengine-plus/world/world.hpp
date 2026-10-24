@@ -39,68 +39,118 @@ inline void Use(DWORD fdw_reason, bool supported) {
       g_state.supported = supported && IsDevkitPresent();
       if (!g_state.supported) return;
       attached = true;
+      renodx::utils::log::i("[world] attached, HookOffMask=", HookOffMask());
+
+      const uint32_t hook_off = HookOffMask();
 
       g_state.ring.reserve(kCensusRingSize);
 
       bvh::Use(fdw_reason);
 
-      renodx::utils::scene::Use(fdw_reason);
-      if (renodx::utils::scene::shared.data != nullptr) {
-        renodx::utils::scene::shared.data->enabled.store(false);
+      if ((hook_off & 1u) == 0u) {
+        renodx::utils::scene::Use(fdw_reason);
+        if (renodx::utils::scene::shared.data != nullptr) {
+          renodx::utils::scene::shared.data->enabled.store(false);
+        }
       }
 
-      renodx::utils::constants::capture_constant_buffers = true;
-      renodx::utils::constants::Use(fdw_reason);
-      if (renodx::utils::constants::shared.data != nullptr) {
-        renodx::utils::constants::shared.data->capture_constant_buffers = true;
+      if ((hook_off & 4u) == 0u) {
+        renodx::utils::constants::capture_constant_buffers = true;
+        renodx::utils::constants::Use(fdw_reason);
+        if (renodx::utils::constants::shared.data != nullptr) {
+          renodx::utils::constants::shared.data->capture_constant_buffers = true;
+        }
       }
 
       // Bytecode classifier and b1 mirror: what the BVH pool admits on.
-      contract::RegisterShaderRegistry();
-      RegisterCbTracker();
+      if ((hook_off & 128u) == 0u) {
+        contract::RegisterShaderRegistry();
+      }
+      if ((hook_off & 2u) == 0u) {
+        RegisterCbTracker();
+      }
 
-      RegisterCensus();
-      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
-      reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
-      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourceDepthLog);
-      reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegionDepthLog);
-      reshade::register_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
-      reshade::register_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
-      reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
-      reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
-      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
-      reshade::register_event<reshade::addon_event::present>(OnWorldPresent);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
-      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
-      reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
-      reshade::register_event<reshade::addon_event::present>(OnCrashLogPresent);
+      if ((hook_off & 16u) == 0u) {
+        RegisterCensus();
+      }
+      if ((hook_off & 8u) == 0u) {
+        reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+        reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourceDepthLog);
+        reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegionDepthLog);
+      }
+      if ((hook_off & 8u) == 0u) {
+        reshade::register_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
+        reshade::register_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
+        reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
+        reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
+      }
+      if ((hook_off & 64u) == 0u) {
+        reshade::register_event<reshade::addon_event::present>(OnWorldPresent);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
+        reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
+        reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
+      }
+      if ((hook_off & 64u) == 0u) {
+        reshade::register_event<reshade::addon_event::present>(OnCrashLogPresent);
+      }
       break;
     }
     case DLL_PROCESS_DETACH: {
       if (!attached) return;
       attached = false;
+      const uint32_t hook_off = HookOffMask();
       // The crash handler lives in this module: remove it before unloading.
       SetCrashLogEnabled(false);
       bvh::Use(fdw_reason);
-      contract::UnregisterShaderRegistry();
-      UnregisterCbTracker();
-      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
-      reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
-      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourceDepthLog);
-      reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegionDepthLog);
-      reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
-      reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
-      reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
-      reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
-      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
-      reshade::unregister_event<reshade::addon_event::present>(OnWorldPresent);
-      reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
-      reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
-      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
-      reshade::unregister_event<reshade::addon_event::present>(OnCrashLogPresent);
+      if ((hook_off & 128u) == 0u) {
+        contract::UnregisterShaderRegistry();
+      }
+      if ((hook_off & 2u) == 0u) {
+        UnregisterCbTracker();
+      }
+      if ((hook_off & 8u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+        reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourceDepthLog);
+        reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegionDepthLog);
+      }
+      if ((hook_off & 8u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
+        reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
+        reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::init_pipeline>(OnInitPipelineState);
+        reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipelineState);
+      }
+      if ((hook_off & 64u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::present>(OnWorldPresent);
+      }
+      if ((hook_off & 128u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDeviceWorld);
+        reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResourceWorld);
+        reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceViewWorld);
+      }
+      if ((hook_off & 64u) == 0u) {
+        reshade::unregister_event<reshade::addon_event::present>(OnCrashLogPresent);
+      }
       renodx::utils::command_action::Unregister(WorldDrawCallback{});
-      renodx::utils::constants::Use(fdw_reason);
-      renodx::utils::scene::Use(fdw_reason);
+      if ((hook_off & 4u) == 0u) {
+        renodx::utils::constants::Use(fdw_reason);
+      }
+      if ((hook_off & 1u) == 0u) {
+        renodx::utils::scene::Use(fdw_reason);
+      }
       break;
     }
     default:

@@ -30,6 +30,27 @@ Confirmed in game:
 
 Implemented, not validated in game. Each feature's owner test list is in its HISTORY section. Reference sections are in this file.
 
+R1 (zero-cost BVH gating), implemented, not validated in game: with RTAO, RTGI and RTLS all off, the BVH, pool, deform and census path does not run (`RtBvhDemanded`, `ApplyBvhInputs` in `world/bvh/bvh_debug.hpp`). Owner test list:
+1. RTAO, RTGI and RTLS off, Pool Scan unticked, no debug view: the BVH panel shows "BVH inputs: idle (nothing runs)"; the Pool Scan, Live BVH and Deforming meshes rows are unticked, and the Performance tab (Gather on) shows about zero for the pool and deform CPU rows.
+2. Turn RTAO on: the panel shows "forced on by RT effects" and RTAO works as before. Repeat with RTGI and with RT Local Shadows.
+3. Turn all RT effects off: the panel returns to idle. Restart with an RT effect saved as ON: the inputs are on from the first present at the latest.
+4. Pool Scan on with all RT off: the panel shows "Pool Scan or debug view"; the scan runs.
+5. The M1 census toggle and the depth log still record draws with all RT off.
+6. With all RT effects off, the Live BVH and Deforming meshes rows return to unticked at the next present unless Pool Scan is ticked or a BVH debug view is selected; that is intended.
+
+R1b-0 (diagnostic, startup hook-off mask), implemented, not validated in game: `[FalcomWorldProbe] HookOffMask=<n>` in ReShade.ini skips the listed always-on hook groups at startup. It is read once; absent or 0 keeps every hook on. A nonzero mask logs `[world] probe HookOffMask=<n>`. Measure one bit at a time (set the bit, restart, compare the Performance tab rows).
+
+| Bit | Value | Hook group skipped when the bit is set |
+|---|---|---|
+| 0 | 1 | scene::Use and the enabled store |
+| 1 | 2 | RegisterCbTracker (cb tracker) |
+| 2 | 4 | constants capture and constants::Use |
+| 3 | 8 | push_descriptors and command list init, reset, destroy |
+| 4 | 16 | RegisterCensus |
+| 5 | 32 | BVH pool hooks (destroy resource, buffer updates, map, copy) |
+| 6 | 64 | present handlers (OnWorldPresent, OnCrashLogPresent, OnWorldPresentBvh) |
+| 7 | 128 | everything else: shader registry, depth-log events, pipeline state, resource destroy, remaining BVH events |
+
 | Feature | Owner test list | Where |
 |---|---|---|
 | Path 2: moving objects out of the static pool (P2a, P2a-rev) | Pool Scan near moving objects, rule line, Depth Compare | HISTORY: Path 2, round P2a; round P2a-rev |
@@ -185,7 +206,7 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 ### RTAO (round 1): reference
 
 - Skinned characters in RTAO: dropped by the owner (2026-10-20). Characters as occluders stay out of RTAO. The planned design for the first occlusion effect that needs them (RT shadows) is one per-frame refit of this frame's skinned captures at lighting time, shared by consumers and cached per frame, with RTAO as one consumer switch. Tracked as a future item, not implemented.
-- Known cost to check: with RTAO on, character and water capture and the present refit are switched on (`RtaoEnableBvhInputs`), although RTAO does not trace them. Owner to compare the Performance tab with "Deforming meshes" off.
+- Known cost to check: with RTAO on, character and water capture and the present refit are switched on (`ApplyBvhInputs`, which forces them on while any RT effect is on), although RTAO does not trace them. Owner to compare the Performance tab with "Deforming meshes" off.
 - Code: `world/rtao/` (`rtao_state.hpp` settings, reason codes, `RtaoEffectiveFade`; `rtao_resources.hpp` pipeline, AO target, stats; `rtao.hpp` dispatch and stats readback; `rtao_panel.hpp` panel). Shader: `world/shaders/world_rtao.cs_5_0.hlsl`. Hook wrapper: `RunRtaoInline` in `addon.cpp`, called from `OnBeforeLightingShaderDraw` before `DeployShadows`.
 - Placement: inline in the lighting hook (zero latency). Micro shadows read this frame's RTAO AO when it is produced. The shader reads the game scene CBV (b0), not `g_state.camera`.
 - Early-out: the sample loop stops once the pixel's camera distance reaches Fade End (`g_rtao_fade.y`). Beyond Fade End the fade is 0 and ao is exactly 1.0, so no ray is traced there.
@@ -194,7 +215,7 @@ Owner test order (in game). Since 2026-10-09 the switches start ON; to get a bas
 - Range rule (rt-panel-1): Region is the BVH range R (64-512 m, default 256). Every pooled instance within R of the camera, plus the ray margin `kPoolRegionRayMargin` (10 m), is in the TLAS: the box edge is 3R + 20 m (cell R, camera at least R + 10 m from every face). Only the built BVH range counts (`tlas_region_range`, `tlas_region_size`, `tlas_region_min`). Fade percents (`RtaoFadeStartPct` / `RtaoFadeEndPct`, defaults 15.625 / 31.25, 0-100) are of the slider range: requested = percent * Region / 100; Fade End = min(requested End, built range); Fade Start = min(requested Start, Fade End). Not ready with no built range (`range_too_small`). Stored percents are never rewritten; the panel shows requested and effective metres. A pixel closer than 10 m to any region face is neutral (the shader's `ray_max` margin, `world_rtao.cs_5_0.hlsl`). Coverage tests: `test_live` TestRegionCoverage; fade: `test_rtao` TestFade.
 - Panel (rt-panel-1): the "Ray Tracing" tab starts with "What enters the BVH" (Region, alpha foliage, foliage motion = wind sway only (off freezes foliage in its rest pose), deforming meshes, follow, per-frame P2b, keep moving objects out, scan indirect); "BVH Diagnostics" holds Draw Census, the BVH panel (Advanced keeps the diagnostic switches); "Performance" shows CPU and GPU ms over the last 30 presents and the 30 s test (`test_live` TestPerfTab). The perf file (`perf_*.json`) keys for GPU, all per measured frame: `gpu_trace` (BVH debug view trace only, not RTAO), `gpu_alpha_blit`, `gpu_p2b_expand`, `gpu_deform_refit`, `gpu_rtao`, `gpu_rtao_filter`, `gpu_rtgi`, `gpu_rtgi_denoise`, `gpu_rtls` (RTLS trace), `gpu_rtls_denoise` (RTLS temporal, filter and upsample). The Performance GPU column sums these ten (every kPerfGpu row); "--" when none had a sample. Command-recording CPU rows: `rtao_record_cpu`, `rtgi_record_cpu`, `rtls_record_cpu`.
 - Dynamic objects are not traced in round 1: characters and water do not occlude RTAO (dynamic count 0, t10-t13 null). Round 3 adds them.
-- Auto-enable: turning RTAO on enables Live BVH and Deforming meshes (`RtaoEnableBvhInputs`); Pool Scan is not enabled (the panel shows `bvh_empty` instead). Turning RTAO off leaves them alone. A persisted ON is applied at the first present.
+- Auto-enable: while RTAO, RTGI or RT Local Shadows is on, `ApplyBvhInputs` (`bvh/bvh_debug.hpp`, at startup and every present) forces Pool Scan, Live BVH and Deforming meshes on. With all three off they follow the Pool Scan tick or a BVH debug view and are otherwise off, so turning the last RT effect off switches them off again. A persisted ON is applied by the first present at the latest.
 - Sampling: IS-FAST blue noise (t18, Load only) when the texture is loaded, else IGN (`isfast_unavailable`). Scaled-resolution frames (`resolutionScaling_g != (1,1)`) are neutral and counted by the shader.
 - Diagnostics: panel row "RTAO status" (state and reason code, GPU ms, fade, texture bytes, stats after "Read RTAO Stats"), `[world-rtao]` lines in ReShade.log, `world_rtao.json` on each stats read.
 - Harness: `test_rtao` (gate table, fade rule, region margin, b12 layout, ray rules against a wall reference, pixel classes, mock device lifecycle). Not covered: GPU execution of the shader, FXC runtime, in-game behaviour.

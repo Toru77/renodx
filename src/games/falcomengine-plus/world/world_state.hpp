@@ -190,6 +190,7 @@ struct State {
   std::atomic<uint32_t> depth_log_start_frame{UINT32_MAX};
   // Debug experiment, session only: Record drops the draws bound to the sun cascade array (see draw_census.hpp).
   std::atomic_bool skip_cascade_shadow{false};
+  std::atomic<uint32_t> tracking_epoch{0u};
   uint32_t draw_counter = 0u;
 
   std::mutex mutex;
@@ -206,11 +207,27 @@ struct State {
 
 inline State g_state;
 
+// Diagnostic: [FalcomWorldProbe] HookOffMask in ReShade.ini (bit meanings in world/docs/ROADMAP.md).
+// Read once; absent or 0 keeps every hook on.
+inline uint32_t HookOffMask() {
+  static const int value = [] {
+    int read = 0;
+    reshade::get_config_value(nullptr, "FalcomWorldProbe", "HookOffMask", read);
+    return read;
+  }();
+  return static_cast<uint32_t>(value);
+}
+
 inline bool CensusEnabled() { return g_state.setting_enabled > 0.5f; }
 
 // Draw observation runs when the census or the BVH module needs it.
 inline bool CaptureActive() {
   return CensusEnabled() || g_state.pool_capture_requested.load(std::memory_order_relaxed);
+}
+
+inline bool WorldDrawHookNeeded() {
+  return CaptureActive() || g_state.depth_log_start_frame.load(std::memory_order_relaxed) != UINT32_MAX
+         || g_state.skip_cascade_shadow.load(std::memory_order_relaxed);
 }
 
 inline const char* FamilyLabelName(uint8_t label) {
