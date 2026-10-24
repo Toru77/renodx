@@ -232,8 +232,7 @@ inline void RefreshPoolCaptureRequest() {
   const bool requested = g_pool.scan_active.load(std::memory_order_relaxed)
                          || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0
                          || g_deform.enabled.load(std::memory_order_relaxed)
-                         || g_deform_live.enabled.load(std::memory_order_relaxed)
-                         || g_state.rt_sun_cascades_requested.load(std::memory_order_relaxed) != 0;
+                         || g_deform_live.enabled.load(std::memory_order_relaxed);
   g_state.pool_capture_requested.store(requested, std::memory_order_relaxed);
   if (!CaptureActive()) {
     g_state.tracking_epoch.fetch_add(1u, std::memory_order_relaxed);
@@ -259,8 +258,11 @@ inline void ApplyBvhInputs() {
   store(g_live_bvh.enabled, demand || (diagnostic && g_live_bvh.enabled_setting > 0.5f));
   store(g_deform.enabled, demand || (diagnostic && deform_setting));
   store(g_deform_live.enabled, demand || (diagnostic && deform_setting));
+  // RT sun count latched for the draw hooks (CSM skip) and the trace: nonzero only while RT sun is requested and produced
+  // last frame, with a built BVH range (0 = not ready, never unlimited).
+  const bool rtsun_produced = rtsun::RtSunRequested() && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.built_range > 0.f;
   g_state.rt_sun_cascades.store(
-      rtsun::RtSunEffectiveCascades(g_state.rt_sun_cascades_requested.load(std::memory_order_relaxed), g_state.camera, 0.f),
+      rtsun_produced ? rtsun::RtSunEffectiveCascades(static_cast<int>(rtsun::g_rtsun_cascade_range), g_state.camera, rtsun::g_rtsun_frame.built_range) : 0,
       std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
 }

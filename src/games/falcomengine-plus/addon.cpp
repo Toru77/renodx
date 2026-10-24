@@ -94,10 +94,10 @@ ShaderInjectData shader_injection = {
   .rtls_strength = 1.f,
   .rtls_max_darkening = 1.f,
   .rtls_char_lamp = 1.f,
-  .local_sss_hard_shadow_samples = 0.f,
-  .local_sss_fade_out_samples = 0.f,
-  .local_sss_surface_thickness = 0.005f,
-  .local_sss_contrast = 2.f,
+  .rtsun_flags = 0.f,
+  .rtsun_strength = 1.f,
+  .rtsun_max_darkening = 1.f,
+  .rtsun_spare = 0.f,
   .local_sss_light_fade_start = 0.f,
   .local_sss_light_fade_end = 1.f,
   .local_sss_occluder_depth_scale = 0.f,
@@ -504,6 +504,7 @@ constexpr uint32_t kLightingGtvbaoRegister = 22u;
 constexpr uint32_t kLightingVbgiRegister   = 23u;  // t23 = vbgiTexture
 constexpr uint32_t kLightingRtgiRegister   = 37u;  // t37 = rtgiTexture (RTGI final GI, world/rtgi)
 constexpr uint32_t kLightingRtlsRegister   = 38u;  // t38 = rtlsTexture (RT Local Shadows term, world/rtls)
+constexpr uint32_t kLightingRtSunRegister  = 39u;  // t39 = rtsunTexture (RT Sun Shadows term, world/rtsun)
 constexpr uint32_t kLightingDepthRegister = 4u;   // t4 = depthTexture (Sora)
 constexpr uint32_t kLightingDepthRegisterKai = 3u; // t3 = depthTexture (Kai)
 constexpr uint32_t kLightingSsaoRegister = 5u;    // t5 = ssaoTexture (Sora)
@@ -9498,6 +9499,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   frame.reason = rtsun::Reason::Off;
   frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
   frame.isfast_unavailable = false;
+  shader_injection.rtsun_flags = 0.f;  // set again by push_rtsun when this lighting draw gets the term
   if (!rtsun::RtSunRequested()) return;
   if (!IsSora2nd()) {
     frame.reason = rtsun::Reason::NotSora2nd;
@@ -9524,8 +9526,26 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
     frame.reason = rtsun::Reason::DeferredList;
     return;
   }
+  // Binds this frame's RT sun term (raw, depth size) at t39 for this lighting draw, also on a second lighting draw of the
+  // frame. Only while the latched count is nonzero: the CSM is then skipped in range this frame and the term replaces it.
+  const auto push_rtsun = [&]() {
+    if (falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed) == 0) return;
+    const rtsun::RtSunDeviceData& data = rtsun::GetRtSunDeviceData(dev);
+    const reshade::api::resource_view term_srv = data.raw.srv[0];
+    cmd_list->push_descriptors(
+        reshade::api::shader_stage::pixel,
+        reshade::api::pipeline_layout{0},
+        0,
+        reshade::api::descriptor_table_update{
+            {}, kLightingRtSunRegister, 0, 1,
+            reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
+    shader_injection.rtsun_flags = 1.f;
+    shader_injection.rtsun_strength = rtsun::g_rtsun_strength;
+    shader_injection.rtsun_max_darkening = rtsun::g_rtsun_max_darkening;
+  };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
+    push_rtsun();
     return;
   }
   if (!RtFrameInputsReady(dd, &frame.input_reason)) {
@@ -9535,7 +9555,12 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   const auto& camera = falcom_world::g_state.camera;
   frame.cascades_requested = static_cast<int>(rtsun::g_rtsun_cascade_range);
   frame.cascades_camera = camera.has_sun ? camera.shadow_cascade_count : 0;
-  frame.cascades_effective = rtsun::RtSunEffectiveCascades(frame.cascades_requested, camera, bvh_data->tlas_region_range);
+  // The latched count (set in ApplyBvhInputs from last frame's trace) is the one the CSM skip uses; the trace keeps it
+  // while nonzero, and computes its own count only before a frame has been latched.
+  const int latched_cascades = falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed);
+  frame.cascades_effective = latched_cascades != 0
+      ? latched_cascades
+      : rtsun::RtSunEffectiveCascades(frame.cascades_requested, camera, bvh_data->tlas_region_range);
   if (frame.cascades_effective == 0) {
     frame.reason = rtsun::Reason::NoCascades;
     return;
@@ -9583,6 +9608,7 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
   frame.isfast_used = isfast_used;
   frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
       + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
+  push_rtsun();
 }
 
 // RTGI (world/rtgi, ROADMAP "RTGI"). Runs only on a lighting draw where RTAO dispatched this frame on the immediate

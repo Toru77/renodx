@@ -197,6 +197,9 @@ Texture2D<float4> rtgiTexture : register(t37);
 // t38 is the RT Local Shadows term (world/rtls; depth size): x point shadow, y spot shadow, z RT coverage (1 inside Fade
 // Start). Bound by RunRtlsInline while rtls_flags has RTLS_FLAG_BOUND. Flag bits mirror rtls::kRtlsFlag*.
 Texture2D<float4> rtlsTexture : register(t38);
+// t39 is the RT Sun Shadows term (world/rtsun; depth size): x shadow darkening inside the RT cascade range, already
+// weighted. Bound by RunRtSunInline while rtsun_flags is 1.
+Texture2D<float4> rtsunTexture : register(t39);
 #define RTLS_FLAG_REQUESTED 1u
 #define RTLS_FLAG_BOUND 2u
 #define RTLS_FLAG_POINT 4u
@@ -784,6 +787,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r0.w = r3.w * r0.w + 1;
   r3.zw = min(shadowUVClamp_g.xy, v1.xy);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
+  // RT Sun Shadows (world/rtsun, R3b): inside the RT cascade range the RT sun term replaces the CSM visibility here, before
+  // every reader of r3.z. Non-character pixels only: the character branch returned above.
+  if (shader_injection_data.rtsun_flags > 0.5f) {
+    const float rtsunDarkening = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+    r3.z *= 1.0 - FalcomSoftCapDarkening(rtsunDarkening * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);
+  }
   r3.w = min(r3.z, r0.w);
   r1.xy = (uint2)r1.xy;
   r8.zw = r1.xy * float2(3.05180438e-05,3.05180438e-05) + float2(-1,-1);

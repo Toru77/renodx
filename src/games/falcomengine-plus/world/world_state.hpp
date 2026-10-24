@@ -190,8 +190,7 @@ struct State {
   // observed (pool capture, live camera) without the research census.
   std::atomic_bool pool_capture_requested{false};
   std::atomic<uint32_t> depth_log_start_frame{UINT32_MAX};
-  // Debug experiment, session only: RT sun cascades slider (requested) and the effective count the draw hooks read (rtsun/rtsun_range.hpp).
-  std::atomic_int rt_sun_cascades_requested{0};
+  // RT sun cascades the draw hooks read (rtsun/rtsun_range.hpp): nonzero only while RT sun is requested and produced last frame.
   std::atomic_int rt_sun_cascades{0};
   // Frame index at which each sun cascade slice was last cleared to lit (draw_census.hpp).
   std::atomic<uint32_t> rt_sun_cleared_frame[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};

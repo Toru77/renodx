@@ -1539,6 +1539,32 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .is_visible = visible,
   });
   settings->push_back(new Setting{
+      .key = "RtSunStrength",
+      .binding = &rtsun::g_rtsun_strength,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Strength",
+      .section = "RT Sun Shadows",
+      .tooltip = "Scales only the RT sun shadow inside the RT range. 0 means no RT sun shadow inside the range.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunMaxDarkening",
+      .binding = &rtsun::g_rtsun_max_darkening,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Max Darkening",
+      .section = "RT Sun Shadows",
+      .tooltip = "Soft cap on the darkest RT sun shadow: darkening is unchanged below Max Darkening squared and eases toward it above that, so a fully shadowed sun loses Max Darkening of its light. 1 = no cap.",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
       .key = "RtSunTraceCharacters",
       .binding = &rtsun::g_rtsun_trace_characters,
       .value_type = SettingValueType::BOOLEAN,

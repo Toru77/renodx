@@ -19,8 +19,13 @@ inline void DrawRtSunPanel() {
     ImGui::TextDisabled("RT sun: off");
     return;
   }
+  const int applied = g_state.rt_sun_cascades.load(std::memory_order_relaxed);
   if (frame.producing) {
-    ImGui::Text("RT sun: producing (traced this frame; raw term only, not applied to the image)");
+    if (applied > 0) {
+      ImGui::Text("RT sun: producing (traced this frame; applied to the image)");
+    } else {
+      ImGui::Text("RT sun: producing (traced, not applied (latch 0))");
+    }
   } else if (frame.reason == Reason::InputsMissing) {
     ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "RT sun: requested, not producing (%s / %s)", ReasonName(frame.reason),
                        rtao::ReasonName(frame.input_reason));
@@ -35,8 +40,8 @@ inline void DrawRtSunPanel() {
     const int effective = RtSunEffectiveCascades(static_cast<int>(g_rtsun_cascade_range), camera, frame.built_range);
     const float covered = RtSunBoundary(static_cast<uint32_t>(effective), camera.shadow_cascade_count, camera.shadow_split_distance,
                                         camera.shadow_fade_near, camera.shadow_fade_range_inv);
-    ImGui::Text("RT sun covers %d of %d cascades, to %.1f m, limited by BVH Region %.0f m", effective,
-                camera.shadow_cascade_count, static_cast<double>(covered), static_cast<double>(frame.built_range));
+    ImGui::Text("RT sun covers %d of %d cascades, to %.1f m, limited by BVH Region %.0f m; applied: %d", effective,
+                camera.shadow_cascade_count, static_cast<double>(covered), static_cast<double>(frame.built_range), applied);
   } else {
     ImGui::TextDisabled("RT sun: camera sun data not captured");
   }

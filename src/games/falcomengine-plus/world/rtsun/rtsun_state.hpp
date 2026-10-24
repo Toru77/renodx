@@ -11,6 +11,8 @@ namespace falcom_world::rtsun {
 inline float g_rtsun_enabled = 0.f;           // RT Sun Shadows: BOOLEAN row RtSunEnabled
 inline float g_rtsun_debug = 0.f;             // RT Sun Debug view: 0 Off, 1 Raw shadow, 2 Pixel classes (3 reserved for the range weight; 4 to 6 reserved for R3c denoise views)
 inline float g_rtsun_cascade_range = 2.f;     // Cascade Range: INTEGER 1 to 4, cascades RT owns (capped by the camera's count)
+inline float g_rtsun_strength = 1.f;          // RT Sun Strength [0..1]: scales the RT sun shadow inside the RT range (R3b); 0 = no RT sun shadow there
+inline float g_rtsun_max_darkening = 1.f;     // RT Sun Max Darkening [0..1]: soft cap on the RT sun darkening (R3b)
 inline float g_rtsun_trace_characters = 1.f;  // Trace characters: character casters block the sun; characters do not receive
 inline float g_rtsun_samples = 1.f;           // Samples per pixel
 inline float g_rtsun_ray_max = 100.f;         // Max Ray Distance (m)

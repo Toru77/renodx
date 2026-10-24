@@ -460,28 +460,6 @@ inline bool DrawBvhPanel() {
     ImGui::SetTooltip("Writes depth_targets.log to the pool output folder two frames after the click. Diagnostic only; no rendering change. Tick Gather performance metrics first for GPU times.");
   }
 
-  ImGui::SameLine();
-  int rt_sun_cascades_requested = g_state.rt_sun_cascades_requested.load(std::memory_order_relaxed);
-  if (ImGui::SliderInt("RT sun cascades (experiment)", &rt_sun_cascades_requested, 0, 4)) {
-    g_state.rt_sun_cascades_requested.store(rt_sun_cascades_requested, std::memory_order_relaxed);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("0 = off. Session only, not saved. Measurement only.");
-  }
-  {
-    const auto& camera = g_state.camera;
-    if (camera.has_sun) {
-      ImGui::Text("Effective %d, camera %d cascades", g_state.rt_sun_cascades.load(std::memory_order_relaxed), camera.shadow_cascade_count);
-      for (int n = 1; n <= camera.shadow_cascade_count; ++n) {
-        ImGui::Text("  %d cascade(s) boundary %.1f m", n,
-                    rtsun::RtSunBoundary(static_cast<uint32_t>(n), camera.shadow_cascade_count, camera.shadow_split_distance,
-                                         camera.shadow_fade_near, camera.shadow_fade_range_inv));
-      }
-    } else {
-      ImGui::Text("Effective %d, camera sun data not captured", g_state.rt_sun_cascades.load(std::memory_order_relaxed));
-    }
-  }
-
   bool do_dump_obj = false;
   bool do_trace = false;
   if (ImGui::CollapsingHeader("Advanced")) {
