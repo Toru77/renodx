@@ -150,6 +150,7 @@ static void PruneGolden() {
 }
 
 int main() {
+  falcom_world::g_state.pool_capture_requested.store(true);
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   fixture::RegisterLayout();
 

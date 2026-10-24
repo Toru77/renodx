@@ -3374,6 +3374,7 @@ static void TestWindIndirectDiag(Device& dev, CmdList& cl, Queue& queue) {
 }
 
 int main() {
+  falcom_world::g_state.pool_capture_requested.store(true);
   // Atlas (CPU bookkeeping for the GPU array).
   {
     bvh::AlphaSliceTable table;

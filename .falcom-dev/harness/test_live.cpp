@@ -4607,6 +4607,7 @@ static void TestPerfExtraGpu(Device* dev) {
 }
 
 int main() {
+  falcom_world::g_state.pool_capture_requested.store(true);
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Stage("main start");
   CHECK(!bvh::g_perf_gate.gather.load(), "performance gathering is OFF by default");

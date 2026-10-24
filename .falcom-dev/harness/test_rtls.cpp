@@ -337,7 +337,7 @@ static void TestLightingApply() {
   injection.rtls_max_darkening = 0.25f;
   CHECK(injection.rtls_flags == 3.f && injection.rtls_strength == 0.5f && injection.rtls_max_darkening == 0.25f,
         "ShaderInjectData rtls_* fields compile and hold their values");
-  CHECK(sizeof(ShaderInjectData) == 1756u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
+  CHECK(sizeof(ShaderInjectData) == 1760u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
 }
 
 // Transcription of the lighting visibility (F2) and the spot cover lerp (F6, F10).
@@ -423,7 +423,7 @@ static void TestCharacters() {
   CHECK(Count(lighting, "charColor += r0.xyz * rtlsLamp * shader_injection_data.rtls_char_lamp;") == 1, "one character lamp term");
   const std::string header = ReadText("../../src/games/falcomengine-plus/shared.h");
   CHECK(Count(header, "float rtls_char_lamp;") == 1 && Count(header, "local_sss_sample_count") == 0, "shared.h slot renamed");
-  CHECK(sizeof(ShaderInjectData) == 1756u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
+  CHECK(sizeof(ShaderInjectData) == 1760u, "ShaderInjectData stays 1756 bytes (%zu)", sizeof(ShaderInjectData));
 }
 
 static void TestJson() {

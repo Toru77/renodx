@@ -233,7 +233,7 @@ static void TestComposite() {
   const std::string lighting = ReadText(variants[0].path);
   CHECK(!lighting.empty(), "Sora 2nd lighting shader readable");
   for (const char* line : {"Texture2D<float4> rtgiTexture : register(t37);", "register(t37)", "float3 cachedRTGI = float3(0, 0, 0);",
-                           "o0.xyz += cachedRTGI;",
+                           "o0.xyz += cachedRTGI * rtgiFogKeep * r2.xyz * (1.0 - r1.z + r1.z * r7.w);",
                            "o0.xyz += cachedRTGI * (csCharacterShading ? saturate(shader_injection_data.rtgi_char_intensity) : 1.0);"}) {
     CHECK(lighting.find(line) != std::string::npos && lighting.find(line) == lighting.rfind(line), "lighting shader has %s once", line);
   }

@@ -114,6 +114,7 @@ static bool MeshFor(uint64_t vb, bvh::WorldMesh* out) {
 }
 
 int main() {
+  falcom_world::g_state.pool_capture_requested.store(true);
   Device dev; CmdList cl; cl.dev = &dev; Queue queue; queue.dev = &dev; queue.cl = &cl;
   CmdList deferred_cl; deferred_cl.dev = &dev;
   fixture::RegisterLayout();

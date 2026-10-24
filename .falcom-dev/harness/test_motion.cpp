@@ -200,6 +200,7 @@ static void TestOrphanGolden(bool dense, uint64_t pin) {
 }
 
 int main() {
+  falcom_world::g_state.pool_capture_requested.store(true);
   HStage("0. ULP distance and buckets.");
   // 0. ULP distance and buckets.
   {
