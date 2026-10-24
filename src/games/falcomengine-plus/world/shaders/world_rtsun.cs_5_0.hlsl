@@ -44,6 +44,7 @@ cbuffer cb_rtsun : register(b12)
     float4 g_rtsun_sun : packoffset(c2);      // light size (degrees), character object count, P2b record count (z, uint bits), trace divisor (w)
     float4 g_rtsun_region : packoffset(c3);   // BVH region min xyz, region size
     float4 g_rtsun_size : packoffset(c4);     // full width, full height, region margin (m; kPoolRegionRayMargin), 0
+    float2 g_rtsun_character : packoffset(c5); // Receive on characters (x, 1 on), Character Normal Bias (y, m)
 };
 
 #define RTSUN_STAT_PIXELS 0u
@@ -60,6 +61,8 @@ cbuffer cb_rtsun : register(b12)
 #define RTSUN_STAT_SELF_BLOCKED 11u
 #define RTSUN_STAT_INVALID_REFS 12u
 #define RTSUN_STAT_STACK_OVERFLOW 13u
+#define RTSUN_STAT_CHARACTERS_TRACED 14u
+#define RTSUN_STAT_CHARACTERS_SELF_BLOCKED 15u
 #define RTSUN_STAT_COUNT 32u
 
 groupshared uint gs_stats[RTSUN_STAT_COUNT];
@@ -104,9 +107,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
             InterlockedAdd(gs_stats[RTSUN_STAT_NORMAL], 1u);
             cls = float3(1.0, 0.0, 1.0);
         }
-        else if ((mrt0.w & 8u) == 0u)
+        else if ((mrt0.w & 8u) == 0u && g_rtsun_character.x < 0.5)
         {
-            // Character pixel: not a receiver in R3a. Its raw term stays not traced.
+            // Character pixel with Receive on characters off: not traced. Its raw term stays not traced.
             InterlockedAdd(gs_stats[RTSUN_STAT_CHARACTER], 1u);
             cls = float3(0.5, 0.5, 0.0);
         }
@@ -139,7 +142,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 // Sun direction toward the light (lightDirection_g is the direction the light travels).
                 const float3 sun = normalize(-lightDirection_g);
                 const float ndl = dot(N, sun);
-                const float ray_bias = g_rtsun_params.y * (ndl > 0.0 ? 1.0 : -1.0);
+                const bool receiver_character = (mrt0.w & 8u) == 0u;
+                const float normal_bias = receiver_character ? g_rtsun_character.y : g_rtsun_params.y;
+                const float ray_bias = normal_bias * (ndl > 0.0 ? 1.0 : -1.0);
                 const float3 origin = P + N * ray_bias;
                 const float3 up = abs(sun.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
                 const float3 T = normalize(cross(up, sun));
@@ -152,6 +157,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 uint blocked_rays = 0u;
                 uint character_rays = 0u;
                 uint self_blocked = 0u;
+                uint characters_self_blocked = 0u;
                 uint invalid = 0u;
                 uint overflow = 0u;
                 [loop] for (uint smp = 0u; smp < spp; ++smp)
@@ -179,7 +185,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                     {
                         blocked_rays++;
                         if ((hit.instance & DYNAMIC_INSTANCE_FLAG) != 0u) character_rays++;
-                        if (hit.t < 0.1) self_blocked++;
+                        if (hit.t < 0.1)
+                        {
+                            self_blocked++;
+                            if (receiver_character) characters_self_blocked++;
+                        }
                     }
                     else
                     {
@@ -195,6 +205,11 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
                 InterlockedAdd(gs_stats[RTSUN_STAT_RAYS_BLOCKED], blocked_rays);
                 InterlockedAdd(gs_stats[RTSUN_STAT_CHARACTER_RAYS], character_rays);
                 InterlockedAdd(gs_stats[RTSUN_STAT_SELF_BLOCKED], self_blocked);
+                if (receiver_character)
+                {
+                    InterlockedAdd(gs_stats[RTSUN_STAT_CHARACTERS_TRACED], 1u);
+                    InterlockedAdd(gs_stats[RTSUN_STAT_CHARACTERS_SELF_BLOCKED], characters_self_blocked);
+                }
                 InterlockedAdd(gs_stats[RTSUN_STAT_INVALID_REFS], invalid);
                 InterlockedAdd(gs_stats[RTSUN_STAT_STACK_OVERFLOW], overflow);
             }

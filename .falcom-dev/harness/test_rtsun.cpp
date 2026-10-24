@@ -113,12 +113,14 @@ static size_t Count(const std::string& text, const std::string& needle) {
 
 // R3a: the trace shader defines (character casters in, shadow-only casters in) and the C++ constants of the sun trace.
 static void TestRtSunTrace() {
-  CHECK(rtsun::kRtSunSrvCount == 20u && rtsun::kRtSunUavCount == 3u && rtsun::kRtSunPushConstantCount == 20u, "srv 20, uav 3, push 20 floats");
-  CHECK(sizeof(rtsun::RtSunPushConstants) == 20u * sizeof(float), "b12 is 20 floats (%zu bytes)", sizeof(rtsun::RtSunPushConstants));
+  CHECK(rtsun::kRtSunSrvCount == 20u && rtsun::kRtSunUavCount == 3u && rtsun::kRtSunPushConstantCount == 22u, "srv 20, uav 3, push 22 floats");
+  CHECK(sizeof(rtsun::RtSunPushConstants) == 22u * sizeof(float), "b12 is 22 floats (%zu bytes)", sizeof(rtsun::RtSunPushConstants));
+  CHECK(offsetof(rtsun::RtSunPushConstants, character) == 20u * sizeof(float), "b12 c5 offset (R4 receive flag and character bias)");
   CHECK(offsetof(rtsun::RtSunPushConstants, sun) == 8u * sizeof(float), "b12 c2 offset");
   CHECK(offsetof(rtsun::RtSunPushConstants, region) == 12u * sizeof(float), "b12 c3 offset");
   CHECK(offsetof(rtsun::RtSunPushConstants, size) == 16u * sizeof(float), "b12 c4 offset");
   CHECK(rtsun::kRtSunStatRaysBlocked == 9u && rtsun::kRtSunStatCharacterRays == 10u && rtsun::kRtSunStatSelfBlocked == 11u, "stats 9, 10, 11");
+  CHECK(rtsun::kRtSunStatCharactersTraced == 14u && rtsun::kRtSunStatCharactersSelfBlocked == 15u && rtsun::kRtSunStatCharactersSelfBlocked < rtsun::kRtSunStatsCount, "R4 character stats 14, 15 inside the 32-uint buffer");
   CHECK(rtsun::kRtSunStatsCount == 32u, "stats buffer 32 uints");
   const std::string text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtsun.cs_5_0.hlsl");
   CHECK(!text.empty(), "shader copy readable (run refresh_world.ps1 first)");
@@ -131,6 +133,10 @@ static void TestRtSunTrace() {
   CHECK(Count(text, "#define RTSUN_STAT_COUNT 32u") == 1, "stat count define 32");
   CHECK(Count(text, "g_trace_dynamic_count = (uint)g_rtsun_sun.y;") == 1, "character object count from c2.y");
   CHECK(Count(text, "raw = float4(shadow * w, 0.0, w, 1.0);") == 1, "raw output (shadow * w, 0, w, 1)");
+  CHECK(Count(text, "float2 g_rtsun_character : packoffset(c5);") == 1, "R4: cb_rtsun c5 holds the receive flag and character bias");
+  CHECK(Count(text, "else if ((mrt0.w & 8u) == 0u && g_rtsun_character.x < 0.5)") == 1, "R4: character pixels skipped only while Receive on characters is off");
+  CHECK(Count(text, "const bool receiver_character = (mrt0.w & 8u) == 0u;") == 1, "R4: character identification is MRT0.w bit 3 clear (as the lighting shader)");
+  CHECK(Count(text, "#define RTSUN_STAT_CHARACTERS_TRACED 14u") == 1 && Count(text, "#define RTSUN_STAT_CHARACTERS_SELF_BLOCKED 15u") == 1, "R4: stats 14 and 15 defined");
 }
 
 // R3c: the sun denoise. Fields that must NOT be in rtsun::ParameterSnapshot: they act after the history (lighting shader
@@ -154,10 +160,10 @@ static void TestSunParameterSnapshot() {
   CHECK(!SunSnapshotHasMaxDarkening<rtsun::ParameterSnapshot>, "Max Darkening is not in the snapshot (no history reset)");
   CHECK(!SunSnapshotHasSpatial<rtsun::ParameterSnapshot>, "no spatial filter field or edge stop is in the snapshot");
   // Exactly the 14 float fields listed in rtsun_state.hpp; each one takes part in the comparison.
-  CHECK(sizeof(rtsun::ParameterSnapshot) == 14u * sizeof(float), "snapshot is 14 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
-  for (size_t i = 0u; i < 14u; ++i) {
+  CHECK(sizeof(rtsun::ParameterSnapshot) == 16u * sizeof(float), "snapshot is 16 floats (%zu bytes)", sizeof(rtsun::ParameterSnapshot));
+  for (size_t i = 0u; i < 16u; ++i) {
     rtsun::ParameterSnapshot changed = {};
-    float fields[14] = {};
+    float fields[16] = {};
     std::memcpy(fields, &changed, sizeof(fields));
     fields[i] = 1.f;
     std::memcpy(&changed, fields, sizeof(fields));
@@ -195,6 +201,7 @@ static void TestSunDenoiseText() {
   CHECK(!sun_block.empty(), "RunRtSunInline found in addon.cpp");
   CHECK(Count(sun_block, "rtao::RtgiTraceExtent(dd->captured_depth_w, divisor)") == 1, "addon trace width from the divisor");
   CHECK(Count(sun_block, "data.denoise.output.srv[data.denoise.output_index]") == 1, "lighting binds the denoised output");
+  CHECK(Count(sun_block, "shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;") == 1, "R4: Character Intensity goes to the rtsun_spare slot");
   // The snapshot block of RunRtSunInline must not read Strength or Max Darkening.
   const size_t begin = sun_block.find("const rtsun::ParameterSnapshot params = {");
   const size_t end = sun_block.find("const bool params_changed", begin);
@@ -202,9 +209,54 @@ static void TestSunDenoiseText() {
   if (begin != std::string::npos && end != std::string::npos) {
     const std::string block = sun_block.substr(begin, end - begin);
     CHECK(Count(block, "g_rtsun_strength") == 0 && Count(block, "g_rtsun_max_darkening") == 0, "snapshot block excludes Strength and Max Darkening");
+    CHECK(Count(block, "g_rtsun_character_intensity") == 0, "R4: snapshot block excludes Character Intensity");
+    CHECK(Count(block, "g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias") == 1 || Count(block, "rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias") == 1, "R4: snapshot block has receive and character bias");
   }
   const std::string settings = ReadText("src/games/falcomengine-plus/world/world_settings.hpp");
+  CHECK(Count(settings, "\"RtSunReceiveCharacters\"") == 1 && Count(settings, "\"RtSunCharacterNormalBias\"") == 1 && Count(settings, "\"RtSunCharacterIntensity\"") == 1, "R4 rows: receive, character bias, character intensity");
   CHECK(Count(settings, "\"RtSunFilterValueStop\"") == 1 && Count(settings, "\"RtSunTraceResolution\"") == 1, "RT sun rows: edge stop and trace resolution");
+}
+
+// R4: the lighting character branch multiplies the RT sun term into the toon lerp factor, gated by rtsun_flags, before the lerp.
+static void TestCharacterReceiveText() {
+  const std::string lit = ReadText("../../src/games/falcomengine-plus/sora2nd/lighting/lighting_0xCA3D8596.ps_5_0.hlsl");
+  CHECK(!lit.empty(), "lighting shader readable");
+  const size_t flag = lit.find("const float rtsunCharTerm = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;");
+  const size_t lerp = lit.find("      r5.yzw = -r9.xyz * r8.xyz + r0.xyz;");
+  CHECK(flag != std::string::npos && lerp != std::string::npos && flag < lerp, "R4 character RT term sits before the toon lerp (r5.yzw)");
+  CHECK(Count(lit, "#define RTSUN_FLAG_APPLIED 1u") == 1 && Count(lit, "#define RTSUN_FLAG_RECEIVE 2u") == 1, "R4: shader RTSUN_FLAG defines");
+  CHECK(rtsun::kRtSunFlagApplied == 1u && rtsun::kRtSunFlagReceive == 2u, "R4: C++ kRtSunFlag bit values");
+  CHECK(Count(lit, "#define RTSUN_FLAG_APPLIED " + std::to_string(rtsun::kRtSunFlagApplied) + "u") == 1
+        && Count(lit, "#define RTSUN_FLAG_RECEIVE " + std::to_string(rtsun::kRtSunFlagReceive) + "u") == 1, "R4: C++ bits equal the shader defines");
+  CHECK(Count(lit, "if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {") == 1, "R4: environment path gated by the applied bit only");
+  CHECK(Count(lit, "if (((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {") == 1,
+        "R4: character path runs only with the applied and receive bits");
+  CHECK(Count(lit, "const float rtsunCharVisibility = 1.0 - FalcomSoftCapDarkening(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);") == 1,
+        "R4: character visibility = 1 - soft cap(term x Strength, Max Darkening)");
+  CHECK(Count(lit, "r3.z *= lerp(1.0, rtsunCharVisibility, saturate(shader_injection_data.rtsun_spare));") == 1, "R4: Character Intensity lerps from CSM (0) to RT (1)");
+  CHECK(Count(lit, "rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0)") == 2, "R4: both RT sun samples use samPoint at v1.xy");
+  // Transcription of FalcomSoftCapDarkening (shadows_common.hlsli) and the character lerp (lighting shader).
+  const auto soft_cap = [](float darkening, float max_darkening) {
+    const float d = std::fmin(std::fmax(darkening, 0.f), 1.f);
+    const float m = std::fmin(std::fmax(max_darkening, 0.f), 1.f);
+    if (m >= 1.f) return d;
+    if (m <= 1e-4f) return 0.f;
+    const float s = m * m;
+    if (d <= s) return d;
+    const float t = (d - s) / (1.f - s);
+    return s + (m - s) * (1.f - std::pow(1.f - t, (1.f + m) / m));
+  };
+  const float term = 0.8f, strength = 1.f, max_dark = 0.5f;
+  const float vis = 1.f - soft_cap(term * strength, max_dark);
+  const auto char_term = [&](float intensity) {
+    const float i = std::fmin(std::fmax(intensity, 0.f), 1.f);
+    return 1.f + (vis - 1.f) * i;
+  };
+  CHECK(soft_cap(term, max_dark) < term, "R4 numeric: Max Darkening 0.5 cap is active at term 0.8");
+  CHECK(std::fabs(vis - 0.504741f) < 1e-4f, "R4 numeric: visibility at term 0.8, Max Darkening 0.5 is 0.5047 (got %f)", vis);
+  CHECK(std::fabs(char_term(0.f) - 1.f) < 1e-6f, "R4 numeric: Character Intensity 0 gives 1 (CSM only)");
+  CHECK(std::fabs(char_term(1.f) - vis) < 1e-6f, "R4 numeric: Character Intensity 1 gives the RT visibility");
+  CHECK(std::fabs(char_term(0.5f) - (1.f + vis) / 2.f) < 1e-6f, "R4 numeric: Character Intensity 0.5 gives (1 + vis) / 2");
 }
 
 int main() {
@@ -219,6 +271,7 @@ int main() {
   HStage("sun denoise snapshot and text");
   TestSunParameterSnapshot();
   TestSunDenoiseText();
+  TestCharacterReceiveText();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;
 }

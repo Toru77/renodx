@@ -87,10 +87,10 @@ struct ShaderInjectData {
   float rtls_strength;                 // RTLS Strength [0..1]; read only while rtls_flags has RTLS_FLAG_BOUND
   float rtls_max_darkening;            // RTLS Max Darkening [0..1]: the shadow amount is capped at this
   float rtls_char_lamp;                // RTLS Character Lamp Light [0..2]; read only while rtls_flags has RTLS_FLAG_CHARACTER
-  float rtsun_flags;                   // RT Sun Shadows: 1 = the lighting shader multiplies the RT sun term (t39) into the CSM visibility this draw (RunRtSunInline); 0 = CSM only
+  float rtsun_flags;                   // RT Sun Shadows bits: 1 (applied) = the lighting shader multiplies the RT sun term (t39) into the CSM visibility this draw (RunRtSunInline); 2 (receive) = characters take it too; 0 = CSM only
   float rtsun_strength;                // RTSUN Strength [0..1]; read only while rtsun_flags is 1
   float rtsun_max_darkening;           // RTSUN Max Darkening [0..1]: the RT sun darkening is soft-capped at this
-  float rtsun_spare;                   // RESERVED: unread
+  float rtsun_spare;                   // RT Sun Character Intensity [0..1]: scales the character RT term; read only while rtsun_flags is 1
   float local_sss_light_fade_start;    // RETIRED: unread
   float local_sss_light_fade_end;      // RETIRED: unread
   float local_sss_occluder_depth_scale;// RETIRED: unread

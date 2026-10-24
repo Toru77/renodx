@@ -49,8 +49,8 @@ inline void DrawRtSunPanel() {
     ImGui::Text("Trace: %u x %u (%s), denoised", frame.width, frame.height,
                 frame.divisor == 1u ? "Full" : (frame.divisor == 2u ? "Half" : "Quarter"));
   }
-  ImGui::Text("Characters: casters %s (%u objects traced); not receivers", g_rtsun_trace_characters > 0.5f ? "on" : "off",
-              frame.character_objects);
+  ImGui::Text("Characters: casters %s (%u objects traced); receivers %s", g_rtsun_trace_characters > 0.5f ? "on" : "off",
+              frame.character_objects, g_rtsun_receive_characters > 0.5f ? "on" : "off");
   if (frame.isfast_unavailable) {
     ImGui::TextDisabled("IS-FAST: not loaded; IGN noise used");
   }
@@ -68,6 +68,7 @@ inline void DrawRtSunPanel() {
                 rtao::SharePercent(v[kRtSunStatRaysBlocked], rays), rtao::SharePercent(v[kRtSunStatCharacterRays], rays),
                 v[kRtSunStatSelfBlocked]);
     ImGui::Text("invalid_refs %u, stack_overflow %u", v[kRtSunStatInvalidRefs], v[kRtSunStatStackOverflow]);
+    ImGui::Text("characters_traced %u, characters_self_blocked %u", v[kRtSunStatCharactersTraced], v[kRtSunStatCharactersSelfBlocked]);
   }
 }
 

@@ -200,6 +200,10 @@ Texture2D<float4> rtlsTexture : register(t38);
 // t39 is the RT Sun Shadows term (world/rtsun; depth size): x shadow darkening inside the RT cascade range, already
 // weighted. Bound by RunRtSunInline while rtsun_flags is 1.
 Texture2D<float4> rtsunTexture : register(t39);
+// rtsun_flags bits: RTSUN_FLAG_APPLIED = the RT sun term is bound this draw; RTSUN_FLAG_RECEIVE = Receive on characters (R4).
+// Mirrors rtsun::kRtSunFlagApplied and rtsun::kRtSunFlagReceive.
+#define RTSUN_FLAG_APPLIED 1u
+#define RTSUN_FLAG_RECEIVE 2u
 #define RTLS_FLAG_REQUESTED 1u
 #define RTLS_FLAG_BOUND 2u
 #define RTLS_FLAG_POINT 4u
@@ -440,6 +444,13 @@ void main(
       r3.z = r5.y;
       if (shader_injection_data.char_shadow_mode >= 0.5f) {
         r3.z = r3.z * saturate(r5.z);
+      }
+      // RT Sun Shadows on characters (world/rtsun, R4): the RT sun visibility (denoised, t39) scales the toon lerp factor. Needs
+      // the applied and the Receive bits of rtsun_flags. Character Intensity (rtsun_spare) lerps from the CSM visibility (0) to the RT one (1).
+      if (((uint)shader_injection_data.rtsun_flags & (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) == (RTSUN_FLAG_APPLIED | RTSUN_FLAG_RECEIVE)) {
+        const float rtsunCharTerm = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
+        const float rtsunCharVisibility = 1.0 - FalcomSoftCapDarkening(rtsunCharTerm * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);
+        r3.z *= lerp(1.0, rtsunCharVisibility, saturate(shader_injection_data.rtsun_spare));
       }
       r5.yzw = -r9.xyz * r8.xyz + r0.xyz;
       r9.xyz = r3.zzz * r5.yzw + r10.xyz;
@@ -789,7 +800,7 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   r3.z = shadowTexture.SampleLevel(samLinear_s, r3.zw, 0).x;
   // RT Sun Shadows (world/rtsun, R3b): inside the RT cascade range the RT sun term replaces the CSM visibility here, before
   // every reader of r3.z. Non-character pixels only: the character branch returned above.
-  if (shader_injection_data.rtsun_flags > 0.5f) {
+  if (((uint)shader_injection_data.rtsun_flags & RTSUN_FLAG_APPLIED) != 0u) {
     const float rtsunDarkening = rtsunTexture.SampleLevel(samPoint_s, v1.xy, 0).x;
     r3.z *= 1.0 - FalcomSoftCapDarkening(rtsunDarkening * shader_injection_data.rtsun_strength, shader_injection_data.rtsun_max_darkening);
   }

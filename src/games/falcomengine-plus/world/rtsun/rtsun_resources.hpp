@@ -18,7 +18,7 @@ namespace falcom_world::rtsun {
 // t0..t8 BVH, t9 depth, t10..t13 characters, t14..t16 alpha, t17 MRT0, t18 IS-FAST, t19 P2b records (the dynamic instances).
 inline constexpr uint32_t kRtSunSrvCount = 20u;
 inline constexpr uint32_t kRtSunUavCount = 3u;            // u0 debug (rgba8, null unless RT Sun Debug 1-2), u1 stats, u2 raw (rgba16f)
-inline constexpr uint32_t kRtSunPushConstantCount = 20u;
+inline constexpr uint32_t kRtSunPushConstantCount = 22u;
 inline constexpr uint32_t kRtSunStatsCount = 32u;
 inline constexpr uint32_t kRtSunStatPixels = 0u;
 inline constexpr uint32_t kRtSunStatTraced = 1u;           // environment pixels inside the RT range and the BVH region
@@ -34,6 +34,8 @@ inline constexpr uint32_t kRtSunStatCharacterRays = 10u;   // blocked rays whose
 inline constexpr uint32_t kRtSunStatSelfBlocked = 11u;     // blocked rays with the hit within 0.1 m of the origin
 inline constexpr uint32_t kRtSunStatInvalidRefs = 12u;
 inline constexpr uint32_t kRtSunStatStackOverflow = 13u;
+inline constexpr uint32_t kRtSunStatCharactersTraced = 14u;      // character pixels traced (Receive on characters)
+inline constexpr uint32_t kRtSunStatCharactersSelfBlocked = 15u; // rays of character pixels with the hit within 0.1 m of the origin
 
 #if defined(__world_rtsun_EMBED_FILE)
 inline constexpr std::span<const std::uint8_t> kRtSunTraceShader = __world_rtsun;
@@ -41,18 +43,20 @@ inline constexpr std::span<const std::uint8_t> kRtSunTraceShader = __world_rtsun
 inline constexpr std::span<const std::uint8_t> kRtSunTraceShader = {};
 #endif
 
-// b12 for the RT sun trace, matching cbuffer cb_rtsun in world_rtsun.cs_5_0.hlsl (five float4 registers).
+// b12 for the RT sun trace, matching cbuffer cb_rtsun in world_rtsun.cs_5_0.hlsl (six float4 registers).
 struct RtSunPushConstants {
   float params[4];    // c0: Max Ray Distance (m), normal bias (m), samples per pixel, effective RT cascades
   float sampling[4];  // c1: IS-FAST flag (1 loaded), slice base, IGN seed, debug mode
   float sun[4];       // c2: light size (degrees), character object count, P2b record count (z, uint bits), trace divisor (w)
   float region[4];    // c3: BVH region min xyz, region size
   float size[4];      // c4: full width, full height, region margin (m; kPoolRegionRayMargin), 0
+  float character[2]; // c5: Receive on characters (x, 1 on), Character Normal Bias (y, m)
 };
-static_assert(sizeof(RtSunPushConstants) == kRtSunPushConstantCount * sizeof(float), "b12 must be 20 floats");
+static_assert(sizeof(RtSunPushConstants) == kRtSunPushConstantCount * sizeof(float), "b12 must be 22 floats");
 static_assert(offsetof(RtSunPushConstants, sun) == 8 * sizeof(float), "b12 c2 offset");
 static_assert(offsetof(RtSunPushConstants, region) == 12 * sizeof(float), "b12 c3 offset");
 static_assert(offsetof(RtSunPushConstants, size) == 16 * sizeof(float), "b12 c4 offset");
+static_assert(offsetof(RtSunPushConstants, character) == 20 * sizeof(float), "b12 c5 offset");
 
 struct RtSunDeviceData {
   rtgi::RtgiPipeline trace_pipeline;

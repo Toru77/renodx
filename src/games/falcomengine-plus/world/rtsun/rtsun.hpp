@@ -249,6 +249,7 @@ inline std::string BuildRtSunJson(const RtSunJsonInput& in) {
       << ", \"scaled\": " << v[kRtSunStatScaled] << ", \"character\": " << v[kRtSunStatCharacter]
       << ", \"rays\": " << v[kRtSunStatRays] << ", \"rays_blocked\": " << v[kRtSunStatRaysBlocked]
       << ", \"character_rays\": " << v[kRtSunStatCharacterRays] << ", \"self_blocked\": " << v[kRtSunStatSelfBlocked]
+      << ", \"characters_traced\": " << v[kRtSunStatCharactersTraced] << ", \"characters_self_blocked\": " << v[kRtSunStatCharactersSelfBlocked]
       << ", \"invalid_refs\": " << v[kRtSunStatInvalidRefs] << ", \"stack_overflow\": " << v[kRtSunStatStackOverflow]
       << "},\n";
   out << "  \"texture_bytes\": " << f.texture_bytes << "\n";

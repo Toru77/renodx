@@ -9539,9 +9539,11 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
         reshade::api::descriptor_table_update{
             {}, kLightingRtSunRegister, 0, 1,
             reshade::api::descriptor_type::texture_shader_resource_view, &term_srv});
-    shader_injection.rtsun_flags = 1.f;
+    shader_injection.rtsun_flags = static_cast<float>(rtsun::kRtSunFlagApplied
+        | (rtsun::g_rtsun_receive_characters > 0.5f ? rtsun::kRtSunFlagReceive : 0u));
     shader_injection.rtsun_strength = rtsun::g_rtsun_strength;
     shader_injection.rtsun_max_darkening = rtsun::g_rtsun_max_darkening;
+    shader_injection.rtsun_spare = rtsun::g_rtsun_character_intensity;
   };
   if (frame.dispatched_frame == dd->frame_index) {
     frame.producing = true;
@@ -9584,7 +9586,8 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
       rtsun::g_rtsun_cascade_range, rtsun::g_rtsun_samples, rtsun::g_rtsun_ray_max, rtsun::g_rtsun_light_size,
       rtsun::g_rtsun_normal_bias, rtsun::g_rtsun_trace_characters, rtsun::g_rtsun_isfast, rtsun::g_rtsun_trace_resolution,
       rtsun::g_rtsun_temporal_enabled, rtsun::g_rtsun_history_weight, rtsun::g_rtsun_depth_rejection,
-      rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_history_clamp, rtsun::g_rtsun_debug};
+      rtsun::g_rtsun_normal_rejection, rtsun::g_rtsun_history_clamp, rtsun::g_rtsun_debug,
+      rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias};
   const bool params_changed = frame.prev_params_valid && !(params == frame.prev_params);
   frame.prev_params = params;
   frame.prev_params_valid = true;
@@ -9620,7 +9623,8 @@ static void RunRtSunInline(reshade::api::command_list* cmd_list) {
           .sun = {rtsun::g_rtsun_light_size, 0.f, 0.f, static_cast<float>(divisor)},
           .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
                      bvh_data->tlas_region_size},
-          .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, 0.f}},
+          .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, 0.f},
+          .character = {rtsun::g_rtsun_receive_characters, rtsun::g_rtsun_character_normal_bias}},
       .debug_mode = static_cast<int>(rtsun::g_rtsun_debug),
       .motion_view = motion_ok ? dd->mb_rtv4_owned_srv : reshade::api::resource_view{0u},
       .temporal = temporal_on,

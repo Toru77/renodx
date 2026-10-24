@@ -14,7 +14,10 @@ inline float g_rtsun_debug = 0.f;             // RT Sun Debug view: 0 Off, 1 Raw
 inline float g_rtsun_cascade_range = 2.f;     // Cascade Range: INTEGER 1 to 4, cascades RT owns (capped by the camera's count)
 inline float g_rtsun_strength = 1.f;          // RT Sun Strength [0..1]: scales the RT sun shadow inside the RT range (R3b); 0 = no RT sun shadow there
 inline float g_rtsun_max_darkening = 1.f;     // RT Sun Max Darkening [0..1]: soft cap on the RT sun darkening (R3b)
-inline float g_rtsun_trace_characters = 1.f;  // Trace characters: character casters block the sun; characters do not receive
+inline float g_rtsun_trace_characters = 1.f;  // Trace characters: character casters block the sun
+inline float g_rtsun_receive_characters = 1.f;      // Receive on characters: character pixels take the RT sun term (R4)
+inline float g_rtsun_character_normal_bias = 0.02f; // Character Normal Bias (m): origin offset of character pixels (R4)
+inline float g_rtsun_character_intensity = 1.f;    // Character Intensity [0..1]: scales the character RT term; not in the snapshot (R4)
 inline float g_rtsun_samples = 1.f;           // Samples per pixel
 inline float g_rtsun_ray_max = 100.f;         // Max Ray Distance (m)
 inline float g_rtsun_light_size = 0.53f;      // Light Size (degrees)
@@ -50,11 +53,17 @@ inline const char* ReasonName(Reason reason) {
 
 inline bool RtSunRequested() { return g_rtsun_enabled > 0.5f; }
 
+// ShaderInjection rtsun_flags bits (mirrors RTSUN_FLAG_* in the lighting shader): applied = the RT sun term is bound this draw;
+// receive = characters take the RT sun term (R4).
+inline constexpr uint32_t kRtSunFlagApplied = 1u;
+inline constexpr uint32_t kRtSunFlagReceive = 2u;
+
 // RT sun settings that shape the traced term or its history; a change resets the RT sun history for one frame
 // (rtao::TemporalResetReason). Strength, Max Darkening and the spatial filter act after the history and are not part of it.
 struct ParameterSnapshot {
   float cascade_range, samples, ray_max, light_size, normal_bias, trace_characters, isfast, trace_resolution;
   float temporal_enabled, history_weight, depth_rejection, normal_rejection, history_clamp, debug;
+  float receive_characters, character_normal_bias;
   bool operator==(const ParameterSnapshot&) const = default;
 };
 

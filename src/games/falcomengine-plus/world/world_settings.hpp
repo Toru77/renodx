@@ -1571,7 +1571,42 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Trace characters",
       .section = "RT Sun Shadows",
-      .tooltip = "Character casters block the sun ray. Characters do not receive yet: their pixels are skipped and counted.",
+      .tooltip = "Character casters block the sun ray.",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunReceiveCharacters",
+      .binding = &rtsun::g_rtsun_receive_characters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Receive on characters",
+      .section = "RT Sun Shadows",
+      .tooltip = "Character pixels take the RT sun shadow, traced with the sun direction, so cast and receive agree.",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunCharacterNormalBias",
+      .binding = &rtsun::g_rtsun_character_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Character Normal Bias",
+      .section = "RT Sun Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunCharacterIntensity",
+      .binding = &rtsun::g_rtsun_character_intensity,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 1.f,
+      .label = "Character Intensity",
+      .section = "RT Sun Shadows",
+      .min = 0.f,
+      .max = 1.f,
+      .format = "%.2f",
       .is_visible = visible,
   });
   settings->push_back(new Setting{
