@@ -9487,6 +9487,104 @@ static void RunRtlsInline(reshade::api::command_list* cmd_list) {
   push_rtls();
 }
 
+// RT Sun Shadows (world/rtsun, R3a): traces the sun shadow rays for the cascade range RT owns and records the raw term.
+// The image is not changed. Dispatched inline after RT Local Shadows with the same guards; the guard returns end only this
+// stage.
+static void RunRtSunInline(reshade::api::command_list* cmd_list) {
+  namespace rtsun = falcom_world::rtsun;
+  namespace rtao = falcom_world::rtao;
+  auto& frame = rtsun::g_rtsun_frame;
+  frame.producing = false;
+  frame.reason = rtsun::Reason::Off;
+  frame.input_reason = rtao::Reason::Off;  // set again only by a failing guard this call
+  frame.isfast_unavailable = false;
+  if (!rtsun::RtSunRequested()) return;
+  if (!IsSora2nd()) {
+    frame.reason = rtsun::Reason::NotSora2nd;
+    return;
+  }
+  auto* dev = cmd_list->get_device();
+  auto* dd = dev ? dev->get_private_data<DeviceData>() : nullptr;
+  if (!dd) {
+    frame.reason = rtsun::Reason::InputsMissing;
+    frame.input_reason = rtao::Reason::NoDepth;
+    return;
+  }
+  const auto* bvh_data = falcom_world::bvh::GetBvhDeviceData(dev);
+  if (!RtBvhReady(bvh_data, &frame.input_reason)) {
+    frame.reason = rtsun::Reason::InputsMissing;
+    return;
+  }
+  frame.built_range = bvh_data->tlas_region_range;
+  if (frame.built_range <= 0.f) {
+    frame.reason = rtsun::Reason::NoCascades;  // no built range yet: not ready, so no cascades (not unlimited)
+    return;
+  }
+  if (cmd_list != dd->immediate_cmd_list) {
+    frame.reason = rtsun::Reason::DeferredList;
+    return;
+  }
+  if (frame.dispatched_frame == dd->frame_index) {
+    frame.producing = true;
+    return;
+  }
+  if (!RtFrameInputsReady(dd, &frame.input_reason)) {
+    frame.reason = rtsun::Reason::InputsMissing;
+    return;
+  }
+  const auto& camera = falcom_world::g_state.camera;
+  frame.cascades_requested = static_cast<int>(rtsun::g_rtsun_cascade_range);
+  frame.cascades_camera = camera.has_sun ? camera.shadow_cascade_count : 0;
+  frame.cascades_effective = rtsun::RtSunEffectiveCascades(frame.cascades_requested, camera, bvh_data->tlas_region_range);
+  if (frame.cascades_effective == 0) {
+    frame.reason = rtsun::Reason::NoCascades;
+    return;
+  }
+  frame.covered_m = rtsun::RtSunBoundary(static_cast<uint32_t>(frame.cascades_effective), camera.shadow_cascade_count,
+                                         camera.shadow_split_distance, camera.shadow_fade_near, camera.shadow_fade_range_inv);
+  // RTAO's IS-FAST rule: the texture is loaded when this row and the IS-FAST master are on.
+  if (rtsun::g_rtsun_isfast > 0.5f && g_isfast_enabled > 0.5f) LoadISFASTNoiseTexture(dev, dd);
+  const bool isfast_used = rtsun::g_rtsun_isfast > 0.5f && g_isfast_enabled > 0.5f && dd->isfast_noise_srv.handle != 0u;
+  frame.isfast_unavailable = rtsun::g_rtsun_isfast > 0.5f && !isfast_used;
+  const float spp = (std::max)(rtsun::g_rtsun_samples, 1.f);
+  const rtao::NoiseSample noise = rtao::RtaoNoiseSample(dd->frame_index, static_cast<uint32_t>(spp), false);
+  rtsun::RtSunDispatchInputs in = {
+      .depth_view = dd->captured_depth_srv,
+      .mrt_normal_view = dd->captured_mrt_normal_srv,
+      .isfast_view = isfast_used ? dd->isfast_noise_srv : reshade::api::resource_view{0u},
+      .scene_cbv_view = dd->captured_scene_cbv_view,
+      .full_width = dd->captured_depth_w,
+      .full_height = dd->captured_depth_h,
+      .push = {
+          .params = {rtsun::g_rtsun_ray_max, rtsun::g_rtsun_normal_bias, spp, static_cast<float>(frame.cascades_effective)},
+          .sampling = {isfast_used ? 1.f : 0.f, noise.slice_base, noise.seed, rtsun::g_rtsun_debug},
+          .sun = {rtsun::g_rtsun_light_size, 0.f, 0.f, 0.f},
+          .region = {bvh_data->tlas_region_min[0], bvh_data->tlas_region_min[1], bvh_data->tlas_region_min[2],
+                     bvh_data->tlas_region_size},
+          .size = {0.f, 0.f, falcom_world::bvh::kPoolRegionRayMargin, 0.f}},
+      .debug_mode = static_cast<int>(rtsun::g_rtsun_debug),
+  };
+  if (rtsun::g_rtsun_trace_characters > 0.5f) {
+    in.dynamic = falcom_world::bvh::RefitDeformLiveCharacters(dev, cmd_list);
+  }
+  const rtsun::RtSunDispatchResult result = rtsun::Dispatch(dev, cmd_list, in);
+  if (!result.ok) {
+    frame.reason = rtsun::Reason::PipelineFailed;
+    return;
+  }
+  const auto& rd = rtsun::GetRtSunDeviceData(dev);
+  frame.producing = true;
+  frame.debug_written = result.debug_written;
+  frame.dispatched_frame = dd->frame_index;
+  frame.gpu_ms = rd.timer.last_ms;
+  frame.width = dd->captured_depth_w;
+  frame.height = dd->captured_depth_h;
+  frame.character_objects = in.dynamic.count;
+  frame.isfast_used = isfast_used;
+  frame.texture_bytes = static_cast<uint64_t>(rd.raw.width) * rd.raw.height * 8u
+      + static_cast<uint64_t>(rd.debug.width) * rd.debug.height * 4u + sizeof(uint32_t) * rtsun::kRtSunStatsCount;
+}
+
 // RTGI (world/rtgi, ROADMAP "RTGI"). Runs only on a lighting draw where RTAO dispatched this frame on the immediate
 // list, so RTAO's guards (live BVH, depth, normals, scene CBV, startup and resize guard) hold for it too.
 // Kept as a function: its guard returns must end only the RTGI stage, not the lighting hook.
@@ -9773,7 +9871,7 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
   // RT dispatches null most compute slots and rebind their own. Snapshot the game's compute state
   // once here and restore it after RTGI: the engine's volumetric-fog compute reads those bindings.
   std::optional<renodx::utils::state::CommandListSnapshot> game_compute_state;
-  if (falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested()) {
+  if (falcom_world::rtao::RtaoRequested() || falcom_world::rtls::RtlsRequested() || falcom_world::rtsun::RtSunRequested()) {
     game_compute_state = renodx::utils::state::GetSnapshot(cmd_list);
   }
   // RTAO runs before the shadows so micro shadows read this frame's AO.
@@ -9781,6 +9879,9 @@ static bool OnBeforeLightingShaderDraw(reshade::api::command_list* cmd_list) {
 
   // RT Local Shadows after RTAO and before RTGI (order RTAO -> RTLS -> RTGI); independent of both.
   RunRtlsInline(cmd_list);
+
+  // RT Sun Shadows (R3a): after RT Local Shadows, same guards; the raw term only, the image is not changed.
+  RunRtSunInline(cmd_list);
 
   // RTGI after RTAO: it runs only on a frame where RTAO dispatched.
   RunRtgiInline(cmd_list);

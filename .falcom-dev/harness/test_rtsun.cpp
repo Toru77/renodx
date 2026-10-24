@@ -4,12 +4,20 @@
 // REAL: falcom_world::rtsun::RtSunBoundary, RtSunWeight and RtSunEffectiveCascades (compiled from the repo header).
 // NOT COVERED: the HLSL functions on the GPU (sora2nd shadow resolve), the census skip and DSV clear (draw_census.hpp),
 //       the panel rows (world_bvh.hpp), the camera capture of cb_scene c50.w and c57.w.
+// R3a (world/rtsun trace): TEXT: the world_rtsun.cs_5_0.hlsl defines (character casters in, shadow-only casters in: no
+//       SKIP_HIDDEN), the stat indices and the range include against the kRtSun* constants (harness copy).
+//       REAL: the kRtSun* constants and the RtSunPushConstants layout (rtsun.hpp).
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 #include "gen/mock_base.hpp"
 #include "harness_timer.hpp"
+#include "src/games/falcomengine-plus/world/rtsun/rtsun.hpp"
 #include "src/games/falcomengine-plus/world/rtsun/rtsun_range.hpp"
 
 namespace rtsun = falcom_world::rtsun;
@@ -89,6 +97,39 @@ static void TestEffective() {
   CHECK(rtsun::RtSunEffectiveCascades(4, SunCamera(3, 60.f), 70.f) == 2, "count 3 built range 70 m steps down from 3 to 2");
 }
 
+static std::string ReadText(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static size_t Count(const std::string& text, const std::string& needle) {
+  size_t n = 0;
+  for (size_t p = text.find(needle); p != std::string::npos; p = text.find(needle, p + needle.size())) ++n;
+  return n;
+}
+
+// R3a: the trace shader defines (character casters in, shadow-only casters in) and the C++ constants of the sun trace.
+static void TestRtSunTrace() {
+  CHECK(rtsun::kRtSunSrvCount == 20u && rtsun::kRtSunUavCount == 3u && rtsun::kRtSunPushConstantCount == 20u, "srv 20, uav 3, push 20 floats");
+  CHECK(sizeof(rtsun::RtSunPushConstants) == 20u * sizeof(float), "b12 is 20 floats (%zu bytes)", sizeof(rtsun::RtSunPushConstants));
+  CHECK(offsetof(rtsun::RtSunPushConstants, sun) == 8u * sizeof(float), "b12 c2 offset");
+  CHECK(offsetof(rtsun::RtSunPushConstants, region) == 12u * sizeof(float), "b12 c3 offset");
+  CHECK(offsetof(rtsun::RtSunPushConstants, size) == 16u * sizeof(float), "b12 c4 offset");
+  CHECK(rtsun::kRtSunStatRaysBlocked == 9u && rtsun::kRtSunStatCharacterRays == 10u && rtsun::kRtSunStatSelfBlocked == 11u, "stats 9, 10, 11");
+  CHECK(rtsun::kRtSunStatsCount == 32u, "stats buffer 32 uints");
+  const std::string text = ReadText("src/games/falcomengine-plus/world/shaders/world_rtsun.cs_5_0.hlsl");
+  CHECK(!text.empty(), "shader copy readable (run refresh_world.ps1 first)");
+  CHECK(Count(text, "#define WORLD_TRACE_DYNAMIC_INSTANCES\n") == 1, "character casters: WORLD_TRACE_DYNAMIC_INSTANCES defined once");
+  CHECK(Count(text, "WORLD_TRACE_DYNAMIC_SKIP_HIDDEN") == 0, "shadow-only casters included: no WORLD_TRACE_DYNAMIC_SKIP_HIDDEN");
+  CHECK(Count(text, "#define WORLD_TRACE_DYNAMIC_SLOT t19") == 1, "P2b records at t19");
+  CHECK(Count(text, "#include \"../../include/rt_sun_range.hlsli\"") == 1, "range header included once");
+  CHECK(Count(text, "#define RTSUN_STAT_RAYS_BLOCKED 9u") == 1 && Count(text, "#define RTSUN_STAT_CHARACTER_RAYS 10u") == 1
+            && Count(text, "#define RTSUN_STAT_SELF_BLOCKED 11u") == 1, "stat defines match the C++ indices");
+  CHECK(Count(text, "#define RTSUN_STAT_COUNT 32u") == 1, "stat count define 32");
+  CHECK(Count(text, "g_trace_dynamic_count = (uint)g_rtsun_sun.y;") == 1, "character object count from c2.y");
+  CHECK(Count(text, "raw = float4(shadow * w, 0.0, w, 1.0);") == 1, "raw output (shadow * w, 0, w, 1)");
+}
+
 int main() {
   HStage("boundary transcription");
   TestBoundary();
@@ -96,6 +137,8 @@ int main() {
   TestWeight();
   HStage("effective count");
   TestEffective();
+  HStage("sun trace text and constants");
+  TestRtSunTrace();
   std::printf(g_failures == 0 ? "PASS (0 failures)\n" : "FAILED (%d failures)\n", g_failures);
   return g_failures != 0;
 }

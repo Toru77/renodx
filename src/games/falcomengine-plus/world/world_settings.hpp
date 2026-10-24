@@ -20,6 +20,7 @@
 #include "rtgi/rtgi_panel.hpp"
 #include "rtls/rtls.hpp"
 #include "rtls/rtls_panel.hpp"
+#include "rtsun/rtsun_panel.hpp"
 #include "capture/draw_census.hpp"
 
 namespace falcom_world {
@@ -741,7 +742,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 0.5f,
       .label = "Max Darkening",
       .section = "RTAO",
-      .tooltip = "Caps the darkest RTAO: no pixel goes below 1 - Max Darkening; lighter pixels are unchanged. 1 = no cap. Micro shadows read the uncapped AO.",
+      .tooltip = "Soft cap on the darkest RTAO: darkening is unchanged below Max Darkening squared and eases toward it above that, so a fully occluded pixel reaches 1 - Max Darkening. 1 = no cap. Micro shadows read the uncapped AO.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
@@ -1313,7 +1314,7 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .default_value = 1.f,
       .label = "Max Darkening",
       .section = "RT Local Shadows",
-      .tooltip = "Caps the darkest RT local shadow: no lamp loses more than this share of its light; lighter shadows are unchanged. 1 = no cap.",
+      .tooltip = "Soft cap on the darkest RT local shadow: darkening is unchanged below Max Darkening squared and eases toward it above that, so a fully shadowed lamp loses Max Darkening of its light. 1 = no cap.",
       .min = 0.f,
       .max = 1.f,
       .format = "%.2f",
@@ -1488,6 +1489,122 @@ inline void AddSettings(renodx::utils::settings::Settings* settings, bool suppor
       .min = 0.f,
       .max = 100.f,
       .format = "%.1f%%",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunEnabled",
+      .binding = &rtsun::g_rtsun_enabled,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 0.f,
+      .label = "RT Sun Shadows",
+      .section = "RT Sun Shadows",
+      .tooltip = "Ray-traced sun shadows over the cascade range RT owns (Cascade Range), traced through the live BVH. This stage records the raw sun term and its debug view; the image is not changed yet. Off = no cost. While on, the BVH inputs run.",
+      .labels = {"Off", "On"},
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunStatus",
+      .value_type = SettingValueType::CUSTOM,
+      .can_reset = false,
+      .label = "RT sun status",
+      .section = "RT Sun Shadows",
+      .on_draw = []() {
+        rtsun::DrawRtSunPanel();
+        return false;
+      },
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "",
+      .binding = &rtsun::g_rtsun_debug,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 0.f,
+      .label = "RT Sun Debug",
+      .section = "RT Sun Shadows",
+      .tooltip = "Session only (not saved). 1 raw sun term (grey = shadow x cascade weight). 2 pixel classes (grey scaled, dark blue sky, magenta no normal, olive character, dark green outside the region, dark purple beyond the cascade range, white traced).",
+      .labels = {"Off", "Raw shadow", "Pixel classes"},
+      .is_visible = advanced,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunCascadeRange",
+      .binding = &rtsun::g_rtsun_cascade_range,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 2.f,
+      .label = "Cascade Range",
+      .section = "RT Sun Shadows",
+      .tooltip = "Number of sun cascades RT owns, counted from the nearest. Capped by the camera's cascade count and by the BVH region; the status line shows the effective count.",
+      .min = 1.f,
+      .max = 4.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunTraceCharacters",
+      .binding = &rtsun::g_rtsun_trace_characters,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "Trace characters",
+      .section = "RT Sun Shadows",
+      .tooltip = "Character casters block the sun ray. Characters do not receive yet: their pixels are skipped and counted.",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunSamples",
+      .binding = &rtsun::g_rtsun_samples,
+      .value_type = SettingValueType::INTEGER,
+      .default_value = 1.f,
+      .label = "Samples",
+      .section = "RT Sun Shadows",
+      .min = 1.f,
+      .max = 10.f,
+      .format = "%d",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunRayMax",
+      .binding = &rtsun::g_rtsun_ray_max,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 100.f,
+      .label = "Max Ray Distance",
+      .section = "RT Sun Shadows",
+      .min = 1.f,
+      .max = 500.f,
+      .format = "%.0f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunLightSize",
+      .binding = &rtsun::g_rtsun_light_size,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.53f,
+      .label = "Light Size (degrees)",
+      .section = "RT Sun Shadows",
+      .tooltip = "Full angular diameter of the sun (about 0.53 degrees) for soft shadows; 0 = hard.",
+      .min = 0.f,
+      .max = 5.f,
+      .format = "%.2f",
+      .is_visible = visible,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunNormalBias",
+      .binding = &rtsun::g_rtsun_normal_bias,
+      .value_type = SettingValueType::FLOAT,
+      .default_value = 0.02f,
+      .label = "Normal Bias",
+      .section = "RT Sun Shadows",
+      .min = 0.f,
+      .max = 0.5f,
+      .format = "%.3f",
+      .is_visible = visible,
+      .is_logarithmic = true,
+  });
+  settings->push_back(new Setting{
+      .key = "RtSunIsfast",
+      .binding = &rtsun::g_rtsun_isfast,
+      .value_type = SettingValueType::BOOLEAN,
+      .default_value = 1.f,
+      .label = "IS-FAST Noise",
+      .section = "RT Sun Shadows",
       .is_visible = visible,
   });
 }

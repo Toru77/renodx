@@ -20,6 +20,7 @@
 #include "../rtao/rtao.hpp"
 #include "../rtgi/rtgi.hpp"
 #include "../rtls/rtls.hpp"
+#include "../rtsun/rtsun.hpp"
 #include "../rtsun/rtsun_range.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
@@ -240,7 +241,7 @@ inline void RefreshPoolCaptureRequest() {
 }
 
 inline bool RtBvhDemanded() {
-  return rtao::RtaoRequested() || rtgi::g_rtgi_enabled > 0.5f || rtls::RtlsRequested();
+  return rtao::RtaoRequested() || rtgi::g_rtgi_enabled > 0.5f || rtls::RtlsRequested() || rtsun::RtSunRequested();
 }
 
 inline void ApplyBvhInputs() {
@@ -321,6 +322,7 @@ inline void OnWorldPresentBvh(
   rtao::MaybeCaptureRtaoStats(device, queue);
   rtgi::MaybeCaptureRtgiStats(device, queue);
   rtls::MaybeCaptureRtlsStats(device, queue);
+  rtsun::MaybeCaptureRtSunStats(device, queue);
   RunBvhDebugPass(queue, swapchain);
   // Draws a debug texture over the whole backbuffer (RTLS and RTGI debug views).
   const auto blit_debug = [&](reshade::api::resource_view srv) {
@@ -339,6 +341,14 @@ inline void OnWorldPresentBvh(
     const auto found_rtls = rtls::g_rtls_devices.find(device);
     if (found_rtls != rtls::g_rtls_devices.end() && found_rtls->second.debug.srv[0].handle != 0u) {
       blit_debug(found_rtls->second.debug.srv[0]);
+    }
+  }
+  // RT Sun Debug 1 to 2: the sun trace debug texture, when this frame's trace wrote it and no BVH GPU debug mode is selected.
+  if (rtsun::g_rtsun_debug > 0.5f && rtsun::g_rtsun_frame.producing && rtsun::g_rtsun_frame.debug_written
+      && g_bvh_debug.mode.load(std::memory_order_relaxed) == 0) {
+    const auto found_rtsun = rtsun::g_rtsun_devices.find(device);
+    if (found_rtsun != rtsun::g_rtsun_devices.end() && found_rtsun->second.debug.srv[0].handle != 0u) {
+      blit_debug(found_rtsun->second.debug.srv[0]);
     }
   }
   // RTGI Debug 1 to 10: the RTGI debug texture over the whole backbuffer, when the pass that owns the view wrote it this
