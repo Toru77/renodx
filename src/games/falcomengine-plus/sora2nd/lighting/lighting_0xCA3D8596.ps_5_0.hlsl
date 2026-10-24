@@ -281,7 +281,7 @@ void main(
     }
     // RTAO Max Darkening: only texels darker than the floor change; skipped at 1 so the default output is unchanged.
     if (shader_injection_data.rtao_ao_bound > 0.5f && shader_injection_data.rtao_max_darkening < 1.0f) {
-      ao_sample.x = max(ao_sample.x, 1.0 - saturate(shader_injection_data.rtao_max_darkening));
+      ao_sample.x = 1.0 - FalcomSoftCapDarkening(1.0 - ao_sample.x, shader_injection_data.rtao_max_darkening);
     }
   }
   r5.xyz = ao_sample;
@@ -692,10 +692,12 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
     if ((rtlsCharFlags & (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) == (RTLS_FLAG_BOUND | RTLS_FLAG_CHARACTER)) {
       const float3 rtlsCharTerm = rtlsTexture.SampleLevel(samPoint_s, v1.xy, 0).xyz;
       if (rtlsCharTerm.z > 0.0) {
-        const float rtlsCharPointVis = rtlsCharTerm.z
-            - min(rtlsCharTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
-        const float rtlsCharSpotVis = rtlsCharTerm.z
-            - min(rtlsCharTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z);
+        const float rtlsCharPointVis = shader_injection_data.rtls_max_darkening >= 1.0
+            ? rtlsCharTerm.z - min(rtlsCharTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z)
+            : rtlsCharTerm.z - rtlsCharTerm.z * FalcomSoftCapDarkening(rtlsCharTerm.x * shader_injection_data.rtls_strength / rtlsCharTerm.z, shader_injection_data.rtls_max_darkening);
+        const float rtlsCharSpotVis = shader_injection_data.rtls_max_darkening >= 1.0
+            ? rtlsCharTerm.z - min(rtlsCharTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening * rtlsCharTerm.z)
+            : rtlsCharTerm.z - rtlsCharTerm.z * FalcomSoftCapDarkening(rtlsCharTerm.y * shader_injection_data.rtls_strength / rtlsCharTerm.z, shader_injection_data.rtls_max_darkening);
         const float3 rtlsCharN = DecodeFalcomMrtNormalAsGame((uint2)r1.xy);
         // Tile cell as the environment path computes it (lines 829-840): screen tile, then depth slice from r1.w.
         const uint2 rtlsTile = (uint2)(lightTileSizeInv_g.xy * v0.xy);
@@ -1271,9 +1273,13 @@ r12.xy = float2(maxThickness_g, depthThresholdNear_g);
   const bool rtlsPointOn = (rtlsFlags & (r20.y != 0 ? RTLS_FLAG_POINT : RTLS_FLAG_ENV_POINT)) != 0u;
   const bool rtlsSpotOn = (rtlsFlags & (r20.y != 0 ? RTLS_FLAG_SPOT : RTLS_FLAG_ENV_SPOT)) != 0u;
   const float rtlsPointVis = rtlsPointOn
-      ? 1.0 - min(rtlsTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
+      ? (shader_injection_data.rtls_max_darkening >= 1.0
+          ? 1.0 - min(rtlsTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening)
+          : 1.0 - FalcomSoftCapDarkening(rtlsTerm.x * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening)) : 1.0;
   const float rtlsSpotVis = rtlsSpotOn
-      ? 1.0 - min(rtlsTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening) : 1.0;
+      ? (shader_injection_data.rtls_max_darkening >= 1.0
+          ? 1.0 - min(rtlsTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening)
+          : 1.0 - FalcomSoftCapDarkening(rtlsTerm.y * shader_injection_data.rtls_strength, shader_injection_data.rtls_max_darkening)) : 1.0;
   const float rtlsSpotCover = rtlsSpotOn ? rtlsTerm.z : 0.0;
   // -- Local contact shadows: setup shared by all four light loops below --
   // The budget is per pixel and shared by every loop, so a pixel covered by many
