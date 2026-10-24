@@ -427,6 +427,23 @@ inline bool DrawBvhPanel() {
     const auto folder = PoolOutputDir();
     ShellExecuteA(nullptr, "open", folder.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   }
+  ImGui::SameLine();
+  if (ImGui::Button("Log depth targets (2 frames)")) {
+    g_state.depth_log_start_frame.store(g_state.frame.load() + 1u);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Writes depth_targets.log to the pool output folder two frames after the click. Diagnostic only; no rendering change. Tick Gather performance metrics first for GPU times.");
+  }
+
+  ImGui::SameLine();
+  bool skip_cascade = g_state.skip_cascade_shadow.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Skip sun cascade shadow draws (experiment)", &skip_cascade)) {
+    g_state.skip_cascade_shadow.store(skip_cascade, std::memory_order_relaxed);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Drops every draw into the 4-layer 4096 cascade shadow array (copies and casters) on the immediate list. "
+                      "Sun shadows go stale or missing. Session only, not saved. Census and pool still see the draws. Measurement only.");
+  }
 
   bool do_dump_obj = false;
   bool do_trace = false;

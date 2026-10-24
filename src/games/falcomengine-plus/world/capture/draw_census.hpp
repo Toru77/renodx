@@ -9,7 +9,13 @@
 // and the game depth view.
 
 #include <algorithm>
+#include <array>
+#include <mutex>
+#include <shared_mutex>
+#include <sstream>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 #include "../world_state.hpp"
 #include "../rtao/rtao_state.hpp"
@@ -17,6 +23,7 @@
 #include "../bvh/bvh_live.hpp"
 #include "../bvh/deform_live.hpp"
 #include "../bvh/deform_probe.hpp"
+#include "../bvh/gpu_timer.hpp"
 #include "../bvh/p2b_diag.hpp"
 #include "../capture/buffer_readback.hpp"
 #include "../capture/cb_tracking.hpp"
@@ -256,13 +263,344 @@ inline void FillDrawBindingMasks(DrawRecord* record, const WorldCommandListData*
   }
 }
 
+// Depth-target log (diagnostic only): for two frames after the world panel arms it, records each
+// depth-target change seen by a draw and each depth clear, then writes depth_targets.log once.
+enum class DepthRunKind : uint32_t { kOther, kCopy, kResolve, kBlur, kCaster };
+
+// A run is a maximal sequence of draws with the same frame, kind and DSV. index is the GPU timer slot
+// (-1: untimed).
+struct DepthRun {
+  uint32_t frame = 0u;
+  int32_t index = -1;
+  DepthRunKind kind = DepthRunKind::kOther;
+  uint32_t draws = 0u;
+  reshade::api::resource_view dsv = {};
+  uint32_t first_vs = 0u;
+};
+
+struct DepthLogState {
+  std::shared_mutex mutex;
+  std::string text;
+  uint64_t last_dsv = 0u;
+  bool written = false;
+  uint32_t serial = 0u;
+  uint64_t shadow_dsv = 0u;
+  bool shadow_dsv_sized = false;
+  std::vector<DepthRun> runs;
+  uint32_t run_frame = UINT32_MAX;
+  uint32_t runs_in_frame = 0u;
+  std::array<bvh::GpuTimer, 48> timers;
+};
+
+inline DepthLogState g_depth_log;
+
+inline bool DepthLogActive() {
+  const uint32_t start = g_state.depth_log_start_frame.load();
+  if (start == UINT32_MAX) return false;
+  const uint32_t frame = g_state.frame.load();
+  return frame >= start && frame <= start + 1u;
+}
+
+inline std::string DescribeResource(reshade::api::device* device, reshade::api::resource resource) {
+  std::ostringstream out;
+  out << std::hex << "res=0x" << resource.handle << std::dec << " ";
+  const auto resource_desc = device->get_resource_desc(resource);
+  if (resource_desc.type == reshade::api::resource_type::buffer) {
+    out << "buffer";
+  } else {
+    const auto& texture = resource_desc.texture;
+    out << "texture " << texture.width << " " << texture.height << " " << texture.depth_or_layers << " "
+        << texture.levels << " " << static_cast<uint32_t>(texture.format) << " " << texture.samples;
+  }
+  return out.str();
+}
+
+// Shadow, caster and grid targets all share this description (4096x4096, format 53).
+inline bool IsShadowSizedTexture(reshade::api::device* device, reshade::api::resource resource) {
+  if (resource.handle == 0u) return false;
+  const auto desc = device->get_resource_desc(resource);
+  return desc.type == reshade::api::resource_type::texture_2d && desc.texture.width == 4096u
+         && desc.texture.height == 4096u && static_cast<uint32_t>(desc.texture.format) == 53u;
+}
+
+inline std::string DescribeDepthTarget(reshade::api::device* device, reshade::api::resource_view view) {
+  if (view.handle == 0u) return "dsv=0x0 res=0x0";
+  const auto resource = device->get_resource_from_view(view);
+  std::ostringstream out;
+  out << std::hex << "dsv=0x" << view.handle << std::dec << " " << DescribeResource(device, resource);
+  const auto view_desc = device->get_resource_view_desc(view);
+  out << " view=" << static_cast<uint32_t>(view_desc.type) << " " << view_desc.texture.first_level << " "
+      << view_desc.texture.level_count << " " << view_desc.texture.first_layer << " " << view_desc.texture.layer_count
+      << " " << static_cast<uint32_t>(view_desc.format);
+  return out.str();
+}
+
+inline void DepthLogAppend(const std::string& line) {
+  std::lock_guard<std::shared_mutex> lock(g_depth_log.mutex);
+  if (!DepthLogActive()) return;
+  g_depth_log.text += line;
+}
+
+inline bool OnClearDepthStencilView(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource_view dsv,
+    const float* depth,
+    const uint8_t* stencil,
+    uint32_t rect_count,
+    const reshade::api::rect* rects) {
+  (void)rects;
+  if (DepthLogActive()) {
+    std::ostringstream out;
+    out << "CLEAR frame=" << g_state.frame.load() << " " << DescribeDepthTarget(cmd_list->get_device(), dsv) << " depth=";
+    if (depth != nullptr) {
+      out << *depth;
+    } else {
+      out << "none";
+    }
+    out << " stencil=";
+    if (stencil != nullptr) {
+      out << static_cast<uint32_t>(*stencil);
+    } else {
+      out << "none";
+    }
+    out << " rects=" << rect_count << "\n";
+    DepthLogAppend(out.str());
+  }
+  return false;
+}
+
+inline bool OnCopyResourceDepthLog(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest) {
+  if (DepthLogActive()) {
+    auto* device = cmd_list->get_device();
+    if (IsShadowSizedTexture(device, source) || IsShadowSizedTexture(device, dest)) {
+      std::ostringstream out;
+      out << "COPY frame=" << g_state.frame.load() << " src=" << DescribeResource(device, source)
+          << " dst=" << DescribeResource(device, dest) << "\n";
+      DepthLogAppend(out.str());
+    }
+  }
+  return false;
+}
+
+inline bool OnCopyTextureRegionDepthLog(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource source,
+    uint32_t source_subresource,
+    const reshade::api::subresource_box*,
+    reshade::api::resource dest,
+    uint32_t dest_subresource,
+    const reshade::api::subresource_box*,
+    reshade::api::filter_mode) {
+  if (DepthLogActive()) {
+    auto* device = cmd_list->get_device();
+    if (IsShadowSizedTexture(device, source) || IsShadowSizedTexture(device, dest)) {
+      std::ostringstream out;
+      out << "COPY_REGION frame=" << g_state.frame.load() << " src=" << DescribeResource(device, source)
+          << " src_sub=" << source_subresource << " dst=" << DescribeResource(device, dest)
+          << " dst_sub=" << dest_subresource << "\n";
+      DepthLogAppend(out.str());
+    }
+  }
+  return false;
+}
+
 struct WorldDrawCallback {
   template <typename Arguments>
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<Arguments>>
   Record(renodx::utils::command_action::CommandContext<Arguments>& context, uint8_t method) const {
-    if (!CaptureActive() || context.cmd_list == nullptr) return {};
+    if (context.cmd_list == nullptr) return {};
     auto* device = context.cmd_list->get_device();
     if (device == nullptr || device->get_api() != reshade::api::device_api::d3d11) return {};
+
+    // Depth-log runs and their GPU timers use the immediate command list only; draws on deferred lists are not logged.
+    const uint64_t immediate = bvh::g_pool.immediate_cmd_list.load(std::memory_order_relaxed);
+    const bool on_immediate = immediate != 0u && reinterpret_cast<uint64_t>(context.cmd_list) == immediate;
+    if (on_immediate && DepthLogActive()) {
+      auto* shader_state = renodx::utils::shader::GetCurrentState(context.cmd_list);
+      auto* render_state = renodx::utils::state::GetCurrentState(context.cmd_list);
+      const uint32_t frame = g_state.frame.load();
+      const uint32_t ps_hash = shader_state != nullptr ? renodx::utils::shader::GetCurrentPixelShaderHash(shader_state) : 0u;
+      const uint32_t vs_hash = shader_state != nullptr ? renodx::utils::shader::GetCurrentVertexShaderHash(shader_state) : 0u;
+      const auto dsv = render_state != nullptr ? render_state->depth_stencil : reshade::api::resource_view{};
+      if (IsLightingHash(ps_hash) || ps_hash == 0xF320152Cu) {
+        const auto* cl_data = GetWorldCommandListData(context.cmd_list);
+        if (cl_data != nullptr && cl_data->ps_srv_view[16].handle != 0u) {
+          DepthLogAppend("t16 " + DescribeDepthTarget(device, cl_data->ps_srv_view[16]) + "\n");
+        }
+      }
+
+      bool dsv_changed = false;
+      uint32_t serial = 0u;
+      {
+        std::lock_guard<std::shared_mutex> lock(g_depth_log.mutex);
+        if (g_depth_log.written) {
+          g_depth_log.last_dsv = 0u;
+          g_depth_log.written = false;
+          g_depth_log.serial = 0u;
+          g_depth_log.shadow_dsv = 0u;
+          g_depth_log.shadow_dsv_sized = false;
+          g_depth_log.run_frame = UINT32_MAX;
+          g_depth_log.runs_in_frame = 0u;
+        }
+        serial = g_depth_log.serial++;
+        dsv_changed = dsv.handle != g_depth_log.last_dsv;
+        if (dsv_changed) g_depth_log.last_dsv = dsv.handle;
+      }
+      if (dsv_changed) {
+        reshade::api::depth_stencil_desc ds_desc = {};
+        bool ds_known = false;
+        if (render_state != nullptr) {
+          const auto ds_it = render_state->pipelines.find(reshade::api::pipeline_stage::depth_stencil);
+          ds_known = ds_it != render_state->pipelines.end() && GetDepthStencilDesc(ds_it->second.handle, &ds_desc);
+        }
+        std::ostringstream out;
+        out << "frame=" << frame << " serial=" << serial << " method=" << static_cast<uint32_t>(method) << " "
+            << DescribeDepthTarget(device, dsv) << " ";
+        if (ds_known) {
+          out << "depth_enable=" << ds_desc.depth_enable << " depth_write=" << static_cast<uint32_t>(ds_desc.depth_write_mask)
+              << " depth_func=" << static_cast<uint32_t>(ds_desc.depth_func);
+        } else {
+          out << "ds=unknown";
+        }
+        out << " ps=0x" << std::hex << ps_hash << std::dec << "\n";
+        DepthLogAppend(out.str());
+      }
+
+      // Caster draws are indexed draws into a shadow-sized DSV; the DSV is evaluated only when its handle changes.
+      bool dsv_shadow = false;
+      if (method == 1u) {
+        bool cached = false;
+        {
+          std::lock_guard<std::shared_mutex> lock(g_depth_log.mutex);
+          cached = g_depth_log.shadow_dsv == dsv.handle;
+          dsv_shadow = g_depth_log.shadow_dsv_sized;
+        }
+        if (!cached) {
+          dsv_shadow = dsv.handle != 0u && IsShadowSizedTexture(device, device->get_resource_from_view(dsv));
+          std::lock_guard<std::shared_mutex> lock(g_depth_log.mutex);
+          g_depth_log.shadow_dsv = dsv.handle;
+          g_depth_log.shadow_dsv_sized = dsv_shadow;
+        }
+      }
+      DepthRunKind kind = DepthRunKind::kOther;
+      if (method == 0u && (ps_hash == 0x7ee16ccbu || ps_hash == 0xdb25d13eu || ps_hash == 0x30190562u)) {
+        kind = DepthRunKind::kCopy;
+      } else if (method == 0u && ps_hash == 0xF320152Cu) {
+        kind = DepthRunKind::kResolve;
+      } else if (method == 0u && ps_hash == 0xF1575FE3u) {
+        kind = DepthRunKind::kBlur;
+      } else if (method == 1u && dsv_shadow) {
+        kind = DepthRunKind::kCaster;
+      }
+
+      if (kind == DepthRunKind::kCopy) {
+        const auto* cl_data = GetWorldCommandListData(context.cmd_list);
+        std::ostringstream out;
+        out << "COPYDRAW frame=" << frame << " serial=" << serial << " ps=0x" << std::hex << ps_hash
+            << std::dec << " dst=" << DescribeDepthTarget(device, dsv) << " src0="
+            << (cl_data != nullptr ? DescribeDepthTarget(device, cl_data->ps_srv_view[0]) : std::string("none")) << "\n";
+        DepthLogAppend(out.str());
+      }
+
+      // Runs are timed on the immediate list only. Each timed run is one GPU timer slot: index is
+      // (frame - start) * 24 + the run's position among timed runs in its frame, below 48.
+      const uint32_t start = g_state.depth_log_start_frame.load();
+      int32_t end_index = -1;
+      int32_t begin_index = -1;
+      {
+        std::lock_guard<std::shared_mutex> lock(g_depth_log.mutex);
+        auto& runs = g_depth_log.runs;
+        const bool same_run = !runs.empty() && runs.back().frame == frame && runs.back().kind == kind
+                              && runs.back().dsv.handle == dsv.handle;
+        if (same_run) {
+          runs.back().draws += 1u;
+        } else {
+          if (!runs.empty()) end_index = runs.back().index;
+          if (frame != g_depth_log.run_frame) {
+            g_depth_log.run_frame = frame;
+            g_depth_log.runs_in_frame = 0u;
+          }
+          DepthRun run;
+          run.frame = frame;
+          run.kind = kind;
+          run.draws = 1u;
+          run.dsv = dsv;
+          run.first_vs = vs_hash;
+          const uint32_t index = (frame - start) * 24u + g_depth_log.runs_in_frame;
+          if (kind != DepthRunKind::kOther && g_depth_log.runs_in_frame < 24u
+              && index < g_depth_log.timers.size()) {
+            run.index = static_cast<int32_t>(index);
+            g_depth_log.runs_in_frame += 1u;
+            begin_index = run.index;
+          }
+          runs.push_back(run);
+        }
+      }
+      // Timer calls run outside the lock; the immediate list is the only thread that touches the timers.
+      if (end_index >= 0) EndGpuTimer(context.cmd_list, &g_depth_log.timers[end_index]);
+      if (begin_index >= 0) BeginGpuTimer(device, context.cmd_list, &g_depth_log.timers[begin_index]);
+    } else if (on_immediate) {
+      const uint32_t depth_log_start = g_state.depth_log_start_frame.load();
+      if (depth_log_start != UINT32_MAX && g_state.frame.load() > depth_log_start + 3u) {
+        std::vector<DepthRun> runs;
+        bool pending = false;
+        std::string text;
+        {
+          std::lock_guard<std::shared_mutex> lock(g_depth_log.mutex);
+          pending = !g_depth_log.written;
+          if (pending) {
+            g_depth_log.written = true;
+            text.swap(g_depth_log.text);
+            runs.swap(g_depth_log.runs);
+          }
+        }
+        if (pending) {
+          for (const auto& run : runs) {
+            if (run.index >= 0) bvh::PollGpuTimer(bvh::GpuTimerContext(context.cmd_list), &g_depth_log.timers[run.index]);
+          }
+          std::ostringstream out;
+          out << "RUN note: immediate command list only; ms is GPU time from a run's first draw to the next run's first draw, "
+                 "including non-draw work; needs Gather performance metrics; the final run of the window has no end marker "
+                 "and shows n/a(unread); n/a(untimed) = not timed, n/a(unread) = timed but no result yet\n";
+          for (const auto& run : runs) {
+            out << "RUN frame=" << run.frame << " index=" << run.index << " kind="
+                << (run.kind == DepthRunKind::kCopy       ? "copy"
+                    : run.kind == DepthRunKind::kResolve  ? "resolve"
+                    : run.kind == DepthRunKind::kBlur     ? "blur"
+                    : run.kind == DepthRunKind::kCaster   ? "caster"
+                                                          : "other")
+                << " " << DescribeDepthTarget(device, run.dsv) << " draws=" << run.draws << " first_vs=0x" << std::hex
+                << run.first_vs << std::dec << " ms=";
+            if (run.index < 0) {
+              out << "n/a(untimed)";
+            } else if (g_depth_log.timers[run.index].last_ms >= 0.f) {
+              out << g_depth_log.timers[run.index].last_ms;
+            } else {
+              out << "n/a(unread)";
+            }
+            out << "\n";
+          }
+          text += out.str();
+          const auto path = bvh::PoolOutputDir() / "depth_targets.log";
+          renodx::utils::path::WriteTextFile(path, text);
+          renodx::utils::log::i("[world-depth] wrote ", path.string());
+          for (auto& timer : g_depth_log.timers) bvh::DestroyGpuTimer(&timer);
+          g_state.depth_log_start_frame.store(UINT32_MAX);
+        }
+      }
+    }
+
+    bool skip_cascade_draw = false;
+    if (on_immediate && g_state.skip_cascade_shadow.load(std::memory_order_relaxed)) {
+      auto* render_state = renodx::utils::state::GetCurrentState(context.cmd_list);
+      if (render_state != nullptr && render_state->depth_stencil.handle != 0u) {
+        const auto resource = device->get_resource_from_view(render_state->depth_stencil);
+        skip_cascade_draw = IsShadowSizedTexture(device, resource)
+                            && device->get_resource_desc(resource).texture.depth_or_layers == 4u;
+      }
+    }
+
+    if (!CaptureActive()) return {.bypass = skip_cascade_draw};
 
     DrawRecord record;
     record.method = method;
@@ -291,7 +629,7 @@ struct WorldDrawCallback {
     bvh::OnPoolScanDraw(device, context.cmd_list, record, cl_data);
     bvh::OnDeformProbeDraw(device, context.cmd_list, record);
     bvh::OnDeformCaptureDraw(device, context.cmd_list, record);
-    return {};
+    return {.bypass = skip_cascade_draw};
   }
 
   renodx::utils::command_action::CallbackResult<renodx::utils::command_action::CommandContext<renodx::utils::command_action::DrawArguments>>

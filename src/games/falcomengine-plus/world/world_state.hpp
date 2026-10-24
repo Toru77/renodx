@@ -187,6 +187,9 @@ struct State {
   // Set by the BVH module while Pool Scan or a GPU debug view needs draws
   // observed (pool capture, live camera) without the research census.
   std::atomic_bool pool_capture_requested{false};
+  std::atomic<uint32_t> depth_log_start_frame{UINT32_MAX};
+  // Debug experiment, session only: Record drops the draws bound to the sun cascade array (see draw_census.hpp).
+  std::atomic_bool skip_cascade_shadow{false};
   uint32_t draw_counter = 0u;
 
   std::mutex mutex;

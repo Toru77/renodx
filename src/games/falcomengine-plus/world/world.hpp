@@ -61,6 +61,9 @@ inline void Use(DWORD fdw_reason, bool supported) {
 
       RegisterCensus();
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
+      reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+      reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResourceDepthLog);
+      reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegionDepthLog);
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
@@ -82,6 +85,9 @@ inline void Use(DWORD fdw_reason, bool supported) {
       contract::UnregisterShaderRegistry();
       UnregisterCbTracker();
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsWorld);
+      reshade::unregister_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepthStencilView);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResourceDepthLog);
+      reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegionDepthLog);
       reshade::unregister_event<reshade::addon_event::init_command_list>(OnInitWorldCommandList);
       reshade::unregister_event<reshade::addon_event::reset_command_list>(OnResetWorldCommandList);
       reshade::unregister_event<reshade::addon_event::destroy_command_list>(OnDestroyWorldCommandList);
