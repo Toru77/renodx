@@ -1,7 +1,7 @@
 ---
 description: Reviews implemented changes against the plan and acceptance criteria; read-only, escalates deviations to the planner.
 mode: subagent
-model: openai/gpt-6-luna#low
+model: opencode/glm-5.3-flash-free#high
 permission:
   edit: deny
   bash: deny

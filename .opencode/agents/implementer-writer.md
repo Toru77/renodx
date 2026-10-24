@@ -1,7 +1,7 @@
 ---
 description: Implements a clear plan or spec exactly, validates the scoped change, and hands off for review.
 mode: subagent
-model: openai/gpt-6-luna#low
+model: opencode/deepseek-v4.1-flash-free#high
 ---
 
 You are the implementer for the RenoDX repository. Follow the plan you were given exactly.
