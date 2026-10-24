@@ -142,6 +142,8 @@ struct CameraSnapshot {
   float scene_shadow_color[3] = {};  // sceneShadowColor_g (c27)
   int32_t shadow_cascade_count = 0;  // shadowmapCascadeCount_g (c27.w, int bits; on Kai c27.w is chrLightIntensity_g)
   float shadow_split_distance[3] = {};  // shadowSplitDistance_g (c57)
+  float shadow_fade_near = 0.f;         // shadowFadeNear_g (c50.w)
+  float shadow_fade_range_inv = 0.f;    // shadowFadeRangeInv_g (c57.w)
 };
 
 struct FamilyStats {
@@ -188,8 +190,11 @@ struct State {
   // observed (pool capture, live camera) without the research census.
   std::atomic_bool pool_capture_requested{false};
   std::atomic<uint32_t> depth_log_start_frame{UINT32_MAX};
-  // Debug experiment, session only: Record drops the draws bound to the sun cascade array (see draw_census.hpp).
-  std::atomic_bool skip_cascade_shadow{false};
+  // Debug experiment, session only: RT sun cascades slider (requested) and the effective count the draw hooks read (rtsun/rtsun_range.hpp).
+  std::atomic_int rt_sun_cascades_requested{0};
+  std::atomic_int rt_sun_cascades{0};
+  // Frame index at which each sun cascade slice was last cleared to lit (draw_census.hpp).
+  std::atomic<uint32_t> rt_sun_cleared_frame[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
   std::atomic<uint32_t> tracking_epoch{0u};
   uint32_t draw_counter = 0u;
 
@@ -227,7 +232,7 @@ inline bool CaptureActive() {
 
 inline bool WorldDrawHookNeeded() {
   return CaptureActive() || g_state.depth_log_start_frame.load(std::memory_order_relaxed) != UINT32_MAX
-         || g_state.skip_cascade_shadow.load(std::memory_order_relaxed);
+         || g_state.rt_sun_cascades.load(std::memory_order_relaxed) != 0;
 }
 
 inline const char* FamilyLabelName(uint8_t label) {

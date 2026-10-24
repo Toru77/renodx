@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -323,6 +324,24 @@ inline bool IsShadowSizedTexture(reshade::api::device* device, reshade::api::res
          && desc.texture.height == 4096u && static_cast<uint32_t>(desc.texture.format) == 53u;
 }
 
+// [world-rtsun] One line per distinct (first_layer, layer_count) of the sun cascade DSVs. A layer_count other than 1 warns once.
+inline void LogRtSunCascadeDsv(uint32_t first_layer, uint32_t layer_count) {
+  static std::mutex mutex;
+  static std::set<std::pair<uint32_t, uint32_t>> logged;
+  static bool warned = false;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (layer_count != 1u) {
+    if (!warned) {
+      warned = true;
+      renodx::utils::log::w("[world-rtsun] cascade DSV first_layer=", first_layer, " layer_count=", layer_count, " is not 1; not skipped");
+    }
+    return;
+  }
+  if (logged.insert({first_layer, layer_count}).second) {
+    renodx::utils::log::i("[world-rtsun] cascade DSV first_layer=", first_layer, " layer_count=", layer_count);
+  }
+}
+
 inline std::string DescribeDepthTarget(reshade::api::device* device, reshade::api::resource_view view) {
   if (view.handle == 0u) return "dsv=0x0 res=0x0";
   const auto resource = device->get_resource_from_view(view);
@@ -592,18 +611,27 @@ struct WorldDrawCallback {
     }
 
     bool skip_cascade_draw = false;
-    if (on_immediate && g_state.skip_cascade_shadow.load(std::memory_order_relaxed)) {
+    const int32_t rt_sun_cascades = g_state.rt_sun_cascades.load(std::memory_order_relaxed);
+    if (on_immediate && rt_sun_cascades > 0) {
       ID3D11DepthStencilView* native_dsv = nullptr;
       bvh::GpuTimerContext(context.cmd_list)->OMGetRenderTargets(0u, nullptr, &native_dsv);
       if (native_dsv != nullptr) {
         const reshade::api::resource_view dsv = {reinterpret_cast<uintptr_t>(native_dsv)};
         native_dsv->Release();
         const auto resource = device->get_resource_from_view(dsv);
-        skip_cascade_draw = IsShadowSizedTexture(device, resource)
-                            && device->get_resource_desc(resource).texture.depth_or_layers == 4u;
-        if (skip_cascade_draw && method == 0u) {
-          const float far_depth = 1.0f;
-          context.cmd_list->clear_depth_stencil_view(dsv, &far_depth, nullptr);
+        if (IsShadowSizedTexture(device, resource) && device->get_resource_desc(resource).texture.depth_or_layers == 4u) {
+          const auto view = device->get_resource_view_desc(dsv).texture;
+          LogRtSunCascadeDsv(view.first_layer, view.layer_count);
+          skip_cascade_draw = view.layer_count == 1u && view.first_layer < static_cast<uint32_t>(rt_sun_cascades);
+          if (skip_cascade_draw) {
+            auto& cleared_frame = g_state.rt_sun_cleared_frame[view.first_layer];
+            const uint32_t frame_index = g_state.frame.load(std::memory_order_relaxed);
+            if (cleared_frame.load(std::memory_order_relaxed) != frame_index) {
+              cleared_frame.store(frame_index, std::memory_order_relaxed);
+              const float far_depth = 1.0f;
+              context.cmd_list->clear_depth_stencil_view(dsv, &far_depth, nullptr);
+            }
+          }
         }
       }
     }

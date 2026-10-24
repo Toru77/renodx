@@ -493,7 +493,7 @@ ShaderInjectData shader_injection = {
   .char_cam_max_darkening = 0.6f,
   .char_cam_isfast_enabled = 1.f,
   .char_cam_debug = 0.f,
-  .shadow_csm_off = 0.f,
+  .rt_sun_cascades = 0.f,
   // ShaderInjectData ends on a float4 boundary with no pad field, so every float in the
   // struct needs a default here. See the closing comment in shared.h.
   };
@@ -1697,7 +1697,7 @@ static CapturedViewInfo CSResolveCapture(reshade::api::device* dev, reshade::api
 
 // -- IS-FAST sync helpers (sync g_isfast_* globals ? shader_injection) --
 static void SyncISFASTToShaderInjection(reshade::api::command_list* cmd_list) {
-  shader_injection.shadow_csm_off = falcom_world::g_state.skip_cascade_shadow.load(std::memory_order_relaxed) ? 1.f : 0.f;
+  shader_injection.rt_sun_cascades = static_cast<float>(falcom_world::g_state.rt_sun_cascades.load(std::memory_order_relaxed));
   shader_injection.shadow_isfast_enabled = g_isfast_enabled;
   shader_injection.shadow_isfast_spatial_scale = g_isfast_spatial_scale;
   shader_injection.shadow_isfast_temporal_speed = g_isfast_temporal_speed;

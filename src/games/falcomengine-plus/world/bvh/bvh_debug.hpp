@@ -20,6 +20,7 @@
 #include "../rtao/rtao.hpp"
 #include "../rtgi/rtgi.hpp"
 #include "../rtls/rtls.hpp"
+#include "../rtsun/rtsun_range.hpp"
 #include "bvh_build.hpp"
 #include "bvh_live.hpp"
 #include "deform_probe.hpp"
@@ -230,7 +231,8 @@ inline void RefreshPoolCaptureRequest() {
   const bool requested = g_pool.scan_active.load(std::memory_order_relaxed)
                          || g_bvh_debug.mode.load(std::memory_order_relaxed) != 0
                          || g_deform.enabled.load(std::memory_order_relaxed)
-                         || g_deform_live.enabled.load(std::memory_order_relaxed);
+                         || g_deform_live.enabled.load(std::memory_order_relaxed)
+                         || g_state.rt_sun_cascades_requested.load(std::memory_order_relaxed) != 0;
   g_state.pool_capture_requested.store(requested, std::memory_order_relaxed);
   if (!CaptureActive()) {
     g_state.tracking_epoch.fetch_add(1u, std::memory_order_relaxed);
@@ -256,6 +258,9 @@ inline void ApplyBvhInputs() {
   store(g_live_bvh.enabled, demand || (diagnostic && g_live_bvh.enabled_setting > 0.5f));
   store(g_deform.enabled, demand || (diagnostic && deform_setting));
   store(g_deform_live.enabled, demand || (diagnostic && deform_setting));
+  g_state.rt_sun_cascades.store(
+      rtsun::RtSunEffectiveCascades(g_state.rt_sun_cascades_requested.load(std::memory_order_relaxed), g_state.camera, 0.f),
+      std::memory_order_relaxed);
   RefreshPoolCaptureRequest();
 }
 

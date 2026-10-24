@@ -55,6 +55,7 @@ Texture2D<float4> depthTexture : register(t0);
 Texture2DArray<float4> shadowMaps : register(t16);
 
 #include "../../shared.h"
+#include "../../include/rt_sun_range.hlsli"
 
 // ── IS-FAST noise texture (bound globally by addon) ──
 Texture3D<float2> g_isfastNoiseTexture : register(t3);
@@ -186,8 +187,6 @@ void main(
   uint4 bitmask, uiDest;
   float4 fDest;
 
-  if (shader_injection_data.shadow_csm_off > 0.5f) { o0 = float4(1.0, 1.0, 1.0, 1.0); return; }
-
   // ── CHSS jitter setup ──
   float chss_jitter_angle = 0;
   bool chss_active = shader_injection_data.shadow_filter_method > 1.5f;
@@ -225,6 +224,7 @@ void main(
   r1.xyz = r1.xyz + r0.xyz;
   r1.x = dot(r1.xyz, r1.xyz);
   r1.x = sqrt(r1.x);
+  if (RtSunWeight(r1.x, (uint)shader_injection_data.rt_sun_cascades, shadowmapCascadeCount_g, shadowSplitDistance_g, shadowFadeNear_g, shadowFadeRangeInv_g) >= 1.0) { o0 = float4(1.0, 1.0, 1.0, 1.0); return; }
   r1.y = cmp(4 == shadowmapCascadeCount_g);
   r1.z = shadowSplitDistance_g.z + -5;
   r1.z = cmp(r1.z < r1.x);
